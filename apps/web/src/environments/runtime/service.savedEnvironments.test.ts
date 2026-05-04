@@ -66,10 +66,13 @@ vi.mock("./connection", () => ({
   createEnvironmentConnection: mockCreateEnvironmentConnection,
 }));
 
-vi.mock("@t3tools/client-runtime", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("@t3tools/client-runtime")>()),
-  createWsRpcClient: mockCreateWsRpcClient,
-}));
+vi.mock("@t3tools/client-runtime", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@t3tools/client-runtime")>();
+  return {
+    ...actual,
+    createWsRpcClient: mockCreateWsRpcClient,
+  };
+});
 
 vi.mock("../../rpc/wsTransport", () => ({
   WsTransport: MockWsTransport,
@@ -193,7 +196,7 @@ function createClient() {
       clear: vi.fn(async () => undefined),
       restart: vi.fn(async () => undefined),
       close: vi.fn(async () => undefined),
-      onEvent: vi.fn(() => () => undefined),
+      onMetadata: vi.fn(() => () => undefined),
     },
     projects: {
       searchEntries: vi.fn(async () => []),
