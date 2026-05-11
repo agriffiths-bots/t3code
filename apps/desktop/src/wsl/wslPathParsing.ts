@@ -63,6 +63,11 @@ export function resolveWslPickFolderDefaultPath(
   rawOptions: unknown,
   config: WslConfig,
   distros: readonly WslDistro[],
+  // Absolute Linux path of the user's home dir inside the chosen distro
+  // (e.g. "/home/josh"). When known, `~` and `~/...` expand against this so
+  // we don't open the picker at a non-existent `/home/<rest>`. When null we
+  // fall back to the `/home` parent — wrong directory but at least it exists.
+  userHome: string | null = null,
 ): string | null {
   const homePath = resolveWslHomeUncPath(config, distros);
   if (typeof rawOptions !== "object" || rawOptions === null) {
@@ -90,11 +95,17 @@ export function resolveWslPickFolderDefaultPath(
   const toUncPath = (linuxPath: string) =>
     `\\\\wsl.localhost\\${distroName}${linuxPath.replaceAll("/", "\\")}`;
 
+  const normalizedUserHome = userHome && userHome.startsWith("/") ? userHome : null;
+
   if (trimmedPath === "~") {
-    return homePath;
+    return normalizedUserHome ? toUncPath(normalizedUserHome) : homePath;
   }
   if (trimmedPath.startsWith("~/")) {
-    return homePath ? `${homePath}\\${trimmedPath.slice(2).replaceAll("/", "\\")}` : null;
+    const remainder = trimmedPath.slice(2);
+    if (normalizedUserHome) {
+      return toUncPath(`${normalizedUserHome}/${remainder}`);
+    }
+    return homePath ? `${homePath}\\${remainder.replaceAll("/", "\\")}` : null;
   }
   if (trimmedPath.startsWith("/")) {
     return toUncPath(trimmedPath);

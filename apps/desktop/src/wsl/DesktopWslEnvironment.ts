@@ -20,6 +20,7 @@ const WSLPATH_TIMEOUT = Duration.seconds(10);
 const PROBE_TIMEOUT = Duration.seconds(10);
 const TOOLCHAIN_TIMEOUT = Duration.seconds(10);
 const BUILD_TIMEOUT = Duration.minutes(5);
+const USER_HOME_TIMEOUT = Duration.seconds(5);
 
 export interface EnsureWslNodePtyOptions {
   readonly allowBuild?: boolean;
@@ -38,6 +39,9 @@ export interface DesktopWslEnvironmentShape {
     distro: string | null,
     windowsPath: string,
   ) => Effect.Effect<Option.Option<string>>;
+  // Resolves the user's Linux home dir inside the chosen distro (e.g.
+  // "/home/josh"). Used by the folder picker to expand `~` correctly.
+  readonly getUserHome: (distro: string | null) => Effect.Effect<Option.Option<string>>;
   readonly ensureNodePty: (
     distro: string | null,
     windowsRepoRoot: string,
@@ -375,6 +379,44 @@ const windowsToWslPathImpl = (
   );
 };
 
+const getUserHomeImpl = (
+  distro: string | null,
+): Effect.Effect<Option.Option<string>, never, ChildProcessSpawner.ChildProcessSpawner> =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+      const command = ChildProcess.make(
+        "wsl.exe",
+        // printf so there's no trailing newline noise; getent so we get the
+        // real home from /etc/passwd even if $HOME is unset for some reason.
+        [
+          ...buildDistroArgs(distro),
+          "--",
+          "sh",
+          "-c",
+          'printf "%s" "$(getent passwd "$(id -un)" | cut -d: -f6)"',
+        ],
+        {
+          stdin: "ignore",
+          stdout: "pipe",
+          stderr: "ignore",
+          killSignal: "SIGTERM",
+          forceKillAfter: PROCESS_TERMINATE_GRACE,
+        },
+      );
+      const handle = yield* spawner.spawn(command);
+      const stdoutBytes = yield* Stream.runCollect(handle.stdout);
+      const exitCode = yield* handle.exitCode;
+      if ((exitCode as unknown as number) !== 0) return Option.none<string>();
+      const home = decodeUtf8(concatChunks(stdoutBytes)).trim();
+      return home.startsWith("/") ? Option.some(home) : Option.none<string>();
+    }),
+  ).pipe(
+    Effect.timeoutOption(USER_HOME_TIMEOUT),
+    Effect.map(Option.flatten),
+    Effect.catch(() => Effect.succeed(Option.none<string>())),
+  );
+
 const makeIsAvailable = (
   platform: NodeJS.Platform,
   windir: string,
@@ -391,6 +433,7 @@ export interface DesktopWslEnvironmentTestStub {
   readonly isAvailable?: boolean;
   readonly distros?: ReadonlyArray<WslDistro>;
   readonly windowsToWslPath?: (distro: string | null, windowsPath: string) => Option.Option<string>;
+  readonly getUserHome?: (distro: string | null) => Option.Option<string>;
   readonly ensureNodePty?: (
     distro: string | null,
     windowsRepoRoot: string,
@@ -407,6 +450,7 @@ export const layerTest = (stub: DesktopWslEnvironmentTestStub = {}) =>
       preWarm: () => Effect.void,
       windowsToWslPath: (distro, windowsPath) =>
         Effect.succeed(stub.windowsToWslPath?.(distro, windowsPath) ?? Option.none()),
+      getUserHome: (distro) => Effect.succeed(stub.getUserHome?.(distro) ?? Option.none<string>()),
       ensureNodePty: (distro, windowsRepoRoot, options) =>
         Effect.succeed(
           stub.ensureNodePty?.(distro, windowsRepoRoot, options) ?? {
@@ -441,12 +485,28 @@ export const layer = Layer.effect(
         Effect.withSpan("desktop.wsl.windowsToWslPath"),
       );
 
+    // Cache user-home results per distro key — folder picker can be opened
+    // many times in a session and the value is stable for the life of the
+    // distro. Negative results aren't cached so a transient wsl.exe failure
+    // doesn't permanently disable tilde expansion.
+    const userHomeCache = new Map<string, string>();
+    const getUserHome = (distro: string | null) =>
+      Effect.gen(function* () {
+        const key = distro ?? "__default__";
+        const cached = userHomeCache.get(key);
+        if (cached !== undefined) return Option.some(cached);
+        const resolved = yield* provideSpawner(getUserHomeImpl(distro));
+        if (Option.isSome(resolved)) userHomeCache.set(key, resolved.value);
+        return resolved;
+      }).pipe(Effect.withSpan("desktop.wsl.getUserHome"));
+
     return DesktopWslEnvironment.of({
       isAvailable,
       listDistros: provideSpawner(listDistrosImpl).pipe(Effect.withSpan("desktop.wsl.listDistros")),
       preWarm: (distro) =>
         provideSpawner(preWarmImpl(distro)).pipe(Effect.withSpan("desktop.wsl.preWarm")),
       windowsToWslPath,
+      getUserHome,
       ensureNodePty: (distro, windowsRepoRoot, options) =>
         provideSpawner(ensureNodePtyImpl(distro, windowsRepoRoot, windowsToWslPath, options)).pipe(
           Effect.withSpan("desktop.wsl.ensureNodePty"),

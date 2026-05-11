@@ -86,6 +86,7 @@ export const pickFolder = makeIpcMethod({
             options,
             { enabled: true, distro: settings.wslDistro },
             yield* wslEnvironment.listDistros,
+            Option.getOrNull(yield* wslEnvironment.getUserHome(settings.wslDistro)),
           ),
         )
       : environment.resolvePickFolderDefaultPath(options);

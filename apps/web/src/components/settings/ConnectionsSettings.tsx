@@ -2474,8 +2474,15 @@ export function ConnectionsSettings() {
 
   const renderWslRow = () => {
     if (!desktopWslState || !desktopWslState.available) return null;
-    const currentValue =
-      desktopWslState.mode === "wsl" ? (desktopWslState.distro ?? "__default__") : "__local__";
+    // When distro is null ("track the WSL default"), map to the actual default
+    // distro's name if we know one so the Select highlights a real option
+    // instead of an orphan "__default__" with no matching item. Falls back to
+    // "__default__" only when no distros are listed yet — in that case the
+    // dropdown renders a single placeholder option that matches.
+    const defaultDistroName =
+      desktopWslState.distros.find((distro) => distro.isDefault)?.name ?? null;
+    const wslSelectValue = desktopWslState.distro ?? defaultDistroName ?? "__default__";
+    const currentValue = desktopWslState.mode === "wsl" ? wslSelectValue : "__local__";
     const currentLabel =
       currentValue === "__local__"
         ? "Local (Windows)"

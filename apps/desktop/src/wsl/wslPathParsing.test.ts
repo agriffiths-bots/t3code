@@ -136,7 +136,19 @@ describe("resolveWslPickFolderDefaultPath", () => {
     ).toBe("\\\\wsl.localhost\\Debian\\home\\josh\\project");
   });
 
-  it("maps tilde initial paths under the WSL home UNC path", () => {
+  it("expands ~/path against the user's home dir when known", () => {
+    expect(
+      resolveWslPickFolderDefaultPath({ initialPath: "~/project" }, config, distros, "/home/josh"),
+    ).toBe("\\\\wsl.localhost\\Debian\\home\\josh\\project");
+  });
+
+  it("resolves bare ~ to the user's home dir when known", () => {
+    expect(
+      resolveWslPickFolderDefaultPath({ initialPath: "~" }, config, distros, "/home/josh"),
+    ).toBe("\\\\wsl.localhost\\Debian\\home\\josh");
+  });
+
+  it("falls back to /home parent when the user's home dir isn't known", () => {
     expect(resolveWslPickFolderDefaultPath({ initialPath: "~/project" }, config, distros)).toBe(
       "\\\\wsl.localhost\\Debian\\home\\project",
     );

@@ -97,12 +97,12 @@ export const setWslBackend = makeIpcMethod({
       });
       yield* backendManager.stop();
       yield* backendManager.start;
-      yield* backendManager.waitForReady(SWAP_READINESS_TIMEOUT);
+      const rolledBack = yield* backendManager.waitForReady(SWAP_READINESS_TIMEOUT);
+      const failedTarget = input.mode === "wsl" ? "WSL backend" : "local backend";
       return yield* new WslBackendSwapError({
-        message:
-          input.mode === "wsl"
-            ? "The WSL backend didn't come up. Rolled back to the previous mode — check that the chosen distro is healthy and try again."
-            : "The local backend didn't come up. Rolled back to the previous mode.",
+        message: rolledBack
+          ? `The ${failedTarget} didn't come up. Rolled back to the previous mode — check that the chosen distro is healthy and try again.`
+          : `The ${failedTarget} didn't come up, and the rollback also failed to start. The app is in a degraded state — restart T3 Code to recover.`,
       });
     }
 
