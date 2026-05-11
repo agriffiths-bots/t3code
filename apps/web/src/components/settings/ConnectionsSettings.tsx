@@ -2433,16 +2433,10 @@ export function ConnectionsSettings() {
           window.setTimeout(resolve, 45_000);
         }),
       ]);
-      if (aborted) return;
-
-      if (previousPrimaryEnvId) {
-        useStore.getState().removeEnvironmentState(previousPrimaryEnvId);
-      }
     };
 
     try {
       await suppressReconnect(() => Promise.race([runSwap(), flowTimeout]));
-      if (flowTimeoutHandle !== null) window.clearTimeout(flowTimeoutHandle);
 
       setPendingDesktopWslSelection(null);
       toastManager.add({
@@ -2469,6 +2463,9 @@ export function ConnectionsSettings() {
         .then((state) => setDesktopWslState(state))
         .catch(() => undefined);
     } finally {
+      // Clear the global timer on every path so it can't fire after the flow
+      // has settled and reject an unreferenced promise.
+      if (flowTimeoutHandle !== null) window.clearTimeout(flowTimeoutHandle);
       unsubscribeWelcome();
       setIsUpdatingWslBackend(false);
       setDesktopWslChangeStage(null);
