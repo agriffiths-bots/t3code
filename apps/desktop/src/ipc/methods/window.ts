@@ -80,7 +80,7 @@ export const pickFolder = makeIpcMethod({
     const wslEnvironment = yield* DesktopWslEnvironment.DesktopWslEnvironment;
     const settings = yield* appSettings.get;
     const wslAvailable = yield* wslEnvironment.isAvailable;
-    const useWsl = settings.wslMode === "wsl" && wslAvailable;
+    const useWsl = settings.wslBackendEnabled && wslAvailable;
     const defaultPath = useWsl
       ? Option.fromNullishOr(
           resolveWslPickFolderDefaultPath(

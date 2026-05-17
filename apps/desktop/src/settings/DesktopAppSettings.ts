@@ -1,10 +1,8 @@
 import {
   DesktopServerExposureModeSchema,
   DesktopUpdateChannelSchema,
-  DesktopWslModeSchema,
   type DesktopServerExposureMode,
   type DesktopUpdateChannel,
-  type DesktopWslMode,
 } from "@t3tools/contracts";
 import { fromLenientJson } from "@t3tools/shared/schemaJson";
 import * as Context from "effect/Context";
@@ -29,7 +27,12 @@ export interface DesktopSettings {
   readonly tailscaleServePort: number;
   readonly updateChannel: DesktopUpdateChannel;
   readonly updateChannelConfiguredByUser: boolean;
-  readonly wslMode: DesktopWslMode;
+  // Was a "local" | "wsl" swap mode in an earlier iteration of the WSL
+  // integration. We now run Windows and WSL backends side by side, so the
+  // setting is just whether the WSL backend should be running alongside the
+  // primary. Persisted documents that still carry the legacy `wslMode: "wsl"`
+  // value are migrated to `wslBackendEnabled: true` on load.
+  readonly wslBackendEnabled: boolean;
   readonly wslDistro: string | null;
 }
 
@@ -46,7 +49,7 @@ export const DEFAULT_DESKTOP_SETTINGS: DesktopSettings = {
   tailscaleServePort: DEFAULT_TAILSCALE_SERVE_PORT,
   updateChannel: "latest",
   updateChannelConfiguredByUser: false,
-  wslMode: "local",
+  wslBackendEnabled: false,
   wslDistro: null,
 };
 
@@ -56,7 +59,11 @@ const DesktopSettingsDocument = Schema.Struct({
   tailscaleServePort: Schema.optionalKey(Schema.Number),
   updateChannel: Schema.optionalKey(DesktopUpdateChannelSchema),
   updateChannelConfiguredByUser: Schema.optionalKey(Schema.Boolean),
-  wslMode: Schema.optionalKey(DesktopWslModeSchema),
+  // Newer form of the WSL toggle. `wslMode` is still accepted on load so
+  // existing on-disk settings keep working; on the next persist we write the
+  // new boolean and the legacy key drops out.
+  wslBackendEnabled: Schema.optionalKey(Schema.Boolean),
+  wslMode: Schema.optionalKey(Schema.Literals(["local", "wsl"])),
   wslDistro: Schema.optionalKey(Schema.NullOr(Schema.String)),
 });
 
@@ -93,10 +100,12 @@ export interface DesktopAppSettingsShape {
   readonly setUpdateChannel: (
     channel: DesktopUpdateChannel,
   ) => Effect.Effect<DesktopSettingsChange, DesktopSettingsWriteError>;
-  readonly setWslMode: (input: {
-    readonly mode: DesktopWslMode;
-    readonly distro: string | null;
-  }) => Effect.Effect<DesktopSettingsChange, DesktopSettingsWriteError>;
+  readonly setWslBackendEnabled: (
+    enabled: boolean,
+  ) => Effect.Effect<DesktopSettingsChange, DesktopSettingsWriteError>;
+  readonly setWslDistro: (
+    distro: string | null,
+  ) => Effect.Effect<DesktopSettingsChange, DesktopSettingsWriteError>;
 }
 
 export class DesktopAppSettings extends Context.Service<
@@ -132,6 +141,13 @@ function normalizeDesktopSettingsDocument(
     parsed.updateChannelConfiguredByUser === true ||
     (isLegacySettings && Option.contains(parsedUpdateChannel, "nightly"));
 
+  // Newer form wins when both are present; otherwise fall back to the legacy
+  // `wslMode === "wsl"` signal so users coming off the swap-mode build keep
+  // their WSL backend enabled.
+  const wslBackendEnabled =
+    parsed.wslBackendEnabled === true ||
+    (parsed.wslBackendEnabled === undefined && parsed.wslMode === "wsl");
+
   return {
     serverExposureMode:
       parsed.serverExposureMode === "network-accessible" ? "network-accessible" : "local-only",
@@ -141,7 +157,7 @@ function normalizeDesktopSettingsDocument(
       ? Option.getOrElse(parsedUpdateChannel, () => defaultSettings.updateChannel)
       : defaultSettings.updateChannel,
     updateChannelConfiguredByUser,
-    wslMode: parsed.wslMode === "wsl" ? "wsl" : "local",
+    wslBackendEnabled,
     wslDistro: normalizeWslDistro(parsed.wslDistro),
   };
 }
@@ -167,8 +183,8 @@ function toDesktopSettingsDocument(
   if (settings.updateChannelConfiguredByUser !== defaults.updateChannelConfiguredByUser) {
     document.updateChannelConfiguredByUser = settings.updateChannelConfiguredByUser;
   }
-  if (settings.wslMode !== defaults.wslMode) {
-    document.wslMode = settings.wslMode;
+  if (settings.wslBackendEnabled !== defaults.wslBackendEnabled) {
+    document.wslBackendEnabled = settings.wslBackendEnabled;
   }
   if (settings.wslDistro !== defaults.wslDistro) {
     document.wslDistro = settings.wslDistro;
@@ -219,17 +235,22 @@ function setUpdateChannel(
       };
 }
 
-function setWslMode(
-  settings: DesktopSettings,
-  input: { readonly mode: DesktopWslMode; readonly distro: string | null },
-): DesktopSettings {
-  const distro = normalizeWslDistro(input.distro);
-  return settings.wslMode === input.mode && settings.wslDistro === distro
+function setWslBackendEnabled(settings: DesktopSettings, enabled: boolean): DesktopSettings {
+  return settings.wslBackendEnabled === enabled
     ? settings
     : {
         ...settings,
-        wslMode: input.mode,
-        wslDistro: distro,
+        wslBackendEnabled: enabled,
+      };
+}
+
+function setWslDistro(settings: DesktopSettings, distro: string | null): DesktopSettings {
+  const normalized = normalizeWslDistro(distro);
+  return settings.wslDistro === normalized
+    ? settings
+    : {
+        ...settings,
+        wslDistro: normalized,
       };
 }
 
@@ -324,10 +345,14 @@ export const layer = Layer.effect(
         persist((settings) => setUpdateChannel(settings, channel)).pipe(
           Effect.withSpan("desktop.settings.setUpdateChannel", { attributes: { channel } }),
         ),
-      setWslMode: (input) =>
-        persist((settings) => setWslMode(settings, input)).pipe(
-          Effect.withSpan("desktop.settings.setWslMode", {
-            attributes: { mode: input.mode, distro: input.distro ?? null },
+      setWslBackendEnabled: (enabled) =>
+        persist((settings) => setWslBackendEnabled(settings, enabled)).pipe(
+          Effect.withSpan("desktop.settings.setWslBackendEnabled", { attributes: { enabled } }),
+        ),
+      setWslDistro: (distro) =>
+        persist((settings) => setWslDistro(settings, distro)).pipe(
+          Effect.withSpan("desktop.settings.setWslDistro", {
+            attributes: { distro: distro ?? null },
           }),
         ),
     });
@@ -358,7 +383,9 @@ export const layerTest = (initialSettings: DesktopSettings = DEFAULT_DESKTOP_SET
           update((settings) => setServerExposureMode(settings, mode)),
         setTailscaleServe: (input) => update((settings) => setTailscaleServe(settings, input)),
         setUpdateChannel: (channel) => update((settings) => setUpdateChannel(settings, channel)),
-        setWslMode: (input) => update((settings) => setWslMode(settings, input)),
+        setWslBackendEnabled: (enabled) =>
+          update((settings) => setWslBackendEnabled(settings, enabled)),
+        setWslDistro: (distro) => update((settings) => setWslDistro(settings, distro)),
       });
     }),
   );

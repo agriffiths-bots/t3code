@@ -242,7 +242,7 @@ describe("DesktopBackendConfiguration", () => {
               Layer.provideMerge(
                 DesktopAppSettings.layerTest({
                   ...DesktopAppSettings.DEFAULT_DESKTOP_SETTINGS,
-                  wslMode: "wsl",
+                  wslBackendEnabled: true,
                 }),
               ),
               Layer.provideMerge(

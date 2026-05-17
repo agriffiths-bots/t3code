@@ -143,7 +143,7 @@ const getOrCreateBootstrapToken = Effect.fn("desktop.backendConfiguration.bootst
 interface ResolveBackendStartConfigInput {
   readonly bootstrapToken: string;
   readonly observabilitySettings: BackendObservabilitySettings;
-  readonly wslMode: "local" | "wsl";
+  readonly wslBackendEnabled: boolean;
   readonly wslDistro: string | null;
 }
 
@@ -222,7 +222,7 @@ const resolveBackendStartConfig = Effect.fn("desktop.backendConfiguration.resolv
     const serverExposure = yield* DesktopServerExposure.DesktopServerExposure;
     const backendExposure = yield* serverExposure.backendConfig;
 
-    const useWsl = input.wslMode === "wsl" && environment.platform === "win32";
+    const useWsl = input.wslBackendEnabled && environment.platform === "win32";
 
     const bootstrap = {
       mode: "desktop" as const,
@@ -369,7 +369,7 @@ export const layer = Layer.effect(
         return yield* resolveBackendStartConfig({
           bootstrapToken,
           observabilitySettings,
-          wslMode: settings.wslMode,
+          wslBackendEnabled: settings.wslBackendEnabled,
           wslDistro: settings.wslDistro,
         }).pipe(
           Effect.provideService(DesktopEnvironment.DesktopEnvironment, environment),

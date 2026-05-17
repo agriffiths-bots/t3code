@@ -42,7 +42,7 @@ const readWslState: Effect.Effect<
   // non-WSL host would spawn wsl.exe and hit the timeout for nothing.
   const distros = available ? yield* wslEnvironment.listDistros : [];
   return {
-    mode: settings.wslMode,
+    mode: settings.wslBackendEnabled ? "wsl" : "local",
     distro: settings.wslDistro,
     available,
     distros,
@@ -75,31 +75,31 @@ export const setWslBackend = makeIpcMethod({
     }
 
     const previousSettings = yield* appSettings.get;
-    const change = yield* appSettings.setWslMode({ mode: input.mode, distro: input.distro });
+    const targetEnabled = input.mode === "wsl";
+    const enabledChange = yield* appSettings.setWslBackendEnabled(targetEnabled);
+    const distroChange = yield* appSettings.setWslDistro(input.distro);
 
-    if (!change.changed) {
+    if (!enabledChange.changed && !distroChange.changed) {
       return yield* readWslState;
     }
 
     // In-process swap: stop the running backend, then start it again. The
-    // backend instance re-resolves config on start, so the new wslMode picks
+    // backend instance re-resolves config on start, so the new toggle picks
     // up automatically.
     yield* primaryBackend.stop();
     yield* primaryBackend.start;
 
     // Bounded readiness wait — if the new backend doesn't come up in time
     // (bad distro, missing node-pty, preflight failure that scheduled
-    // restarts forever) revert to the previous mode so the user isn't stuck.
+    // restarts forever) revert to the previous toggle so the user isn't stuck.
     const ready = yield* primaryBackend.waitForReady(SWAP_READINESS_TIMEOUT);
     if (!ready) {
-      yield* appSettings.setWslMode({
-        mode: previousSettings.wslMode,
-        distro: previousSettings.wslDistro,
-      });
+      yield* appSettings.setWslBackendEnabled(previousSettings.wslBackendEnabled);
+      yield* appSettings.setWslDistro(previousSettings.wslDistro);
       yield* primaryBackend.stop();
       yield* primaryBackend.start;
       const rolledBack = yield* primaryBackend.waitForReady(SWAP_READINESS_TIMEOUT);
-      const failedTarget = input.mode === "wsl" ? "WSL backend" : "local backend";
+      const failedTarget = targetEnabled ? "WSL backend" : "local backend";
       return yield* new WslBackendSwapError({
         message: rolledBack
           ? `The ${failedTarget} didn't come up. Rolled back to the previous mode — check that the chosen distro is healthy and try again.`
