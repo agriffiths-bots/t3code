@@ -103,10 +103,10 @@ import { useServerConfig } from "~/rpc/serverState";
 
 const DEFAULT_TAILSCALE_SERVE_PORT = 443;
 
-// Select-value sentinels for the backend-runtime dropdown. The colon is
-// rejected by DISTRO_NAME_PATTERN (validated by the desktop side), so these
-// values can never collide with a real WSL distro name.
-const BACKEND_VALUE_LOCAL = "backend:local";
+// Sentinel for the "track the WSL default distro" option in the
+// distro picker. The colon is rejected by DISTRO_NAME_PATTERN
+// (validated on the desktop side) so it can never collide with a
+// real distro name.
 const BACKEND_VALUE_DEFAULT_WSL = "backend:default-wsl";
 
 const accessTimestampFormatter = new Intl.DateTimeFormat(undefined, {
@@ -1503,10 +1503,6 @@ export function ConnectionsSettings() {
   const [desktopWslState, setDesktopWslState] = useState<DesktopWslState | null>(null);
   const [isUpdatingWslBackend, setIsUpdatingWslBackend] = useState(false);
   const [desktopWslError, setDesktopWslError] = useState<string | null>(null);
-  const [pendingDesktopWslSelection, setPendingDesktopWslSelection] = useState<{
-    readonly enabled: boolean;
-    readonly distro: string | null;
-  } | null>(null);
   const [pendingTailscaleServeEndpoint, setPendingTailscaleServeEndpoint] =
     useState<AdvertisedEndpoint | null>(null);
   const [disableTailscaleServeDialogOpen, setDisableTailscaleServeDialogOpen] = useState(false);
@@ -2356,192 +2352,132 @@ export function ConnectionsSettings() {
           );
         })
       : null;
-  const handleWslSelectionChange = useCallback(
-    (value: string) => {
-      if (!desktopWslState) return;
-      const target =
-        value === BACKEND_VALUE_LOCAL
-          ? { enabled: false, distro: null }
-          : {
-              enabled: true,
-              distro: value === BACKEND_VALUE_DEFAULT_WSL ? null : value,
-            };
-      // The dropdown maps `state.distro: null` to the actual default distro
-      // name so a real option highlights — re-picking the visually-active row
-      // produces `target.distro = "<defaultName>"` while state is still
-      // `null`. Resolve both sides through the same null→default mapping
-      // before comparing so this is a true no-op.
-      const defaultDistroName =
-        desktopWslState.distros.find((distro) => distro.isDefault)?.name ?? null;
-      const resolvedCurrentDistro = desktopWslState.enabled
-        ? (desktopWslState.distro ?? defaultDistroName)
-        : null;
-      const resolvedTargetDistro = target.enabled ? (target.distro ?? defaultDistroName) : null;
-      if (
-        target.enabled === desktopWslState.enabled &&
-        resolvedTargetDistro === resolvedCurrentDistro
-      ) {
-        return;
+  // Apply a setting change immediately. The orchestrator reconciles the
+  // pool in the background and the primary backend is untouched, so we
+  // don't gate this behind a confirmation dialog.
+  const applyWslSettingChange = useCallback(
+    async (apply: () => Promise<DesktopWslState>) => {
+      if (!desktopBridge) return;
+      setIsUpdatingWslBackend(true);
+      setDesktopWslError(null);
+      try {
+        setDesktopWslState(await apply());
+      } catch (error) {
+        const message = error instanceof Error ? error.message : "Failed to update WSL backend.";
+        setDesktopWslError(message);
+        toastManager.add(
+          stackedThreadToast({
+            type: "error",
+            title: "Could not change WSL backend",
+            description: message,
+          }),
+        );
+        await desktopBridge
+          .getWslState()
+          .then((state) => setDesktopWslState(state))
+          .catch(() => undefined);
+      } finally {
+        setIsUpdatingWslBackend(false);
       }
-      setPendingDesktopWslSelection(target);
     },
-    [desktopWslState],
+    [desktopBridge],
   );
 
-  const handleConfirmDesktopWslChange = useCallback(async () => {
-    if (!desktopBridge || !pendingDesktopWslSelection) return;
-    const target = pendingDesktopWslSelection;
-    setIsUpdatingWslBackend(true);
-    setDesktopWslError(null);
+  const handleToggleWslBackend = useCallback(
+    (enabled: boolean) => {
+      if (!desktopBridge || !desktopWslState || desktopWslState.enabled === enabled) return;
+      void applyWslSettingChange(() => desktopBridge.setWslBackendEnabled(enabled));
+    },
+    [applyWslSettingChange, desktopBridge, desktopWslState],
+  );
 
-    // The new IPC is non-destructive: toggling WSL on/off or switching
-    // distros doesn't bounce the primary. The orchestrator picks up
-    // settings changes and reconciles the WSL pool instance in the
-    // background. No reauth dance, no welcome race, no rollback are
-    // needed; the primary stays up either way.
-    try {
-      // Set distro first so when we flip enabled=true the orchestrator
-      // immediately registers the right instance.
-      const afterDistro = await desktopBridge.setWslDistro(target.distro);
-      setDesktopWslState(afterDistro);
-      const afterEnabled = await desktopBridge.setWslBackendEnabled(target.enabled);
-      setDesktopWslState(afterEnabled);
-      setPendingDesktopWslSelection(null);
-    } catch (error) {
-      const message = error instanceof Error ? error.message : "Failed to update WSL backend.";
-      setDesktopWslError(message);
-      toastManager.add(
-        stackedThreadToast({
-          type: "error",
-          title: "Could not change WSL backend",
-          description: message,
-        }),
-      );
-      await desktopBridge
-        .getWslState()
-        .then((state) => setDesktopWslState(state))
-        .catch(() => undefined);
-    } finally {
-      setIsUpdatingWslBackend(false);
-    }
-  }, [desktopBridge, pendingDesktopWslSelection]);
+  const handleSelectWslDistro = useCallback(
+    (value: string) => {
+      if (!desktopBridge || !desktopWslState) return;
+      const nextDistro = value === BACKEND_VALUE_DEFAULT_WSL ? null : value;
+      const defaultDistroName =
+        desktopWslState.distros.find((distro) => distro.isDefault)?.name ?? null;
+      // Treat null and "the actual default distro" as the same selection
+      // so picking the highlighted row doesn't trigger a setting change.
+      const resolvedCurrent = desktopWslState.distro ?? defaultDistroName;
+      const resolvedNext = nextDistro ?? defaultDistroName;
+      if (resolvedCurrent === resolvedNext) return;
+      void applyWslSettingChange(() => desktopBridge.setWslDistro(nextDistro));
+    },
+    [applyWslSettingChange, desktopBridge, desktopWslState],
+  );
 
   const renderWslRow = () => {
     if (!desktopWslState || !desktopWslState.available) return null;
-    // When distro is null ("track the WSL default"), map to the actual default
-    // distro's name if we know one so the Select highlights a real option
-    // instead of an orphan default sentinel with no matching item. Falls back
-    // to BACKEND_VALUE_DEFAULT_WSL only when no distros are listed yet — in
-    // that case the dropdown renders a single placeholder option that matches.
+    // Distro is null when the user wants the WSL default. Map it to the
+    // real default's name so the Select highlights a real option; fall
+    // back to the sentinel only when no distros are listed yet (the
+    // dropdown then renders a single placeholder that matches).
     const defaultDistroName =
       desktopWslState.distros.find((distro) => distro.isDefault)?.name ?? null;
-    const wslSelectValue = desktopWslState.distro ?? defaultDistroName ?? BACKEND_VALUE_DEFAULT_WSL;
-    const currentValue = desktopWslState.enabled ? wslSelectValue : BACKEND_VALUE_LOCAL;
-    const currentLabel =
-      currentValue === BACKEND_VALUE_LOCAL
-        ? "Local (Windows)"
-        : currentValue === BACKEND_VALUE_DEFAULT_WSL
-          ? "WSL: default distro"
-          : `WSL: ${currentValue}`;
-    const pendingTargetLabel = pendingDesktopWslSelection?.enabled
-      ? (pendingDesktopWslSelection.distro ?? "the default WSL distro")
-      : "Windows";
-    const isSwitchingToWsl = pendingDesktopWslSelection?.enabled === true;
+    const distroSelectValue =
+      desktopWslState.distro ?? defaultDistroName ?? BACKEND_VALUE_DEFAULT_WSL;
     return (
-      <SettingsRow
-        title="WSL backend"
-        description={
-          desktopWslState.enabled
-            ? "A second backend is running inside the selected WSL distro alongside the Windows one."
-            : "Run a second backend inside a WSL distro alongside the Windows one."
-        }
-        status={
-          desktopWslError ? <span className="block text-destructive">{desktopWslError}</span> : null
-        }
-        control={
-          <AlertDialog
-            open={pendingDesktopWslSelection !== null}
-            onOpenChange={(open) => {
-              if (isUpdatingWslBackend) return;
-              if (!open) setPendingDesktopWslSelection(null);
-            }}
-          >
-            <Select
-              value={currentValue}
-              onValueChange={(value) => {
-                if (typeof value !== "string") return;
-                handleWslSelectionChange(value);
-              }}
-            >
-              <SelectTrigger
-                className="w-full sm:w-56"
-                aria-label="WSL backend"
-                disabled={isUpdatingWslBackend}
+      <>
+        <SettingsRow
+          title="WSL backend"
+          description="Run a second backend inside a WSL distro alongside the Windows one. Projects opened against the WSL backend live on the Linux side; Windows projects stay where they are."
+          status={
+            desktopWslError ? (
+              <span className="block text-destructive">{desktopWslError}</span>
+            ) : null
+          }
+          control={
+            <Switch
+              checked={desktopWslState.enabled}
+              disabled={isUpdatingWslBackend}
+              onCheckedChange={(checked) => handleToggleWslBackend(checked)}
+              aria-label="Enable WSL backend"
+            />
+          }
+        />
+        {desktopWslState.enabled ? (
+          <SettingsRow
+            title="WSL distro"
+            description="Which WSL distro the second backend runs inside. Changing the selection restarts just the WSL backend; the Windows one is not affected."
+            control={
+              <Select
+                value={distroSelectValue}
+                onValueChange={(value) => {
+                  if (typeof value !== "string") return;
+                  handleSelectWslDistro(value);
+                }}
               >
-                <SelectValue>{currentLabel}</SelectValue>
-              </SelectTrigger>
-              <SelectPopup align="end" alignItemWithTrigger={false}>
-                <SelectItem hideIndicator value={BACKEND_VALUE_LOCAL}>
-                  Local (Windows)
-                </SelectItem>
-                {desktopWslState.distros.length === 0 ? (
-                  <SelectItem hideIndicator value={BACKEND_VALUE_DEFAULT_WSL}>
-                    WSL: default distro
-                  </SelectItem>
-                ) : (
-                  desktopWslState.distros.map((distro) => (
-                    <SelectItem hideIndicator key={distro.name} value={distro.name}>
-                      WSL: {distro.name}
-                      {distro.isDefault ? " (default)" : ""}
-                    </SelectItem>
-                  ))
-                )}
-              </SelectPopup>
-            </Select>
-            <AlertDialogPopup>
-              <AlertDialogHeader>
-                <AlertDialogTitle>
-                  {isSwitchingToWsl
-                    ? desktopWslState.enabled
-                      ? "Switch WSL distro?"
-                      : "Enable WSL backend?"
-                    : "Disable WSL backend?"}
-                </AlertDialogTitle>
-                <AlertDialogDescription>
-                  {isSwitchingToWsl
-                    ? `T3 Code will bring up a backend inside ${pendingTargetLabel}. The Windows backend keeps running so projects you opened against it stay where they are.`
-                    : "T3 Code will stop the WSL backend. The Windows backend keeps running so projects you opened against it stay where they are."}
-                </AlertDialogDescription>
-              </AlertDialogHeader>
-              <AlertDialogFooter>
-                <AlertDialogClose
+                <SelectTrigger
+                  className="w-full sm:w-56"
+                  aria-label="WSL distro"
                   disabled={isUpdatingWslBackend}
-                  render={<Button variant="outline" disabled={isUpdatingWslBackend} />}
                 >
-                  Cancel
-                </AlertDialogClose>
-                <Button
-                  onClick={() => {
-                    void handleConfirmDesktopWslChange();
-                  }}
-                  disabled={pendingDesktopWslSelection === null || isUpdatingWslBackend}
-                >
-                  {isUpdatingWslBackend ? (
-                    <>
-                      <Spinner className="size-3.5" />
-                      Applying…
-                    </>
-                  ) : isSwitchingToWsl ? (
-                    "Enable"
+                  <SelectValue>
+                    {distroSelectValue === BACKEND_VALUE_DEFAULT_WSL
+                      ? "Default distro"
+                      : distroSelectValue}
+                  </SelectValue>
+                </SelectTrigger>
+                <SelectPopup align="end" alignItemWithTrigger={false}>
+                  {desktopWslState.distros.length === 0 ? (
+                    <SelectItem hideIndicator value={BACKEND_VALUE_DEFAULT_WSL}>
+                      Default distro
+                    </SelectItem>
                   ) : (
-                    "Disable"
+                    desktopWslState.distros.map((distro) => (
+                      <SelectItem hideIndicator key={distro.name} value={distro.name}>
+                        {distro.name}
+                        {distro.isDefault ? " (default)" : ""}
+                      </SelectItem>
+                    ))
                   )}
-                </Button>
-              </AlertDialogFooter>
-            </AlertDialogPopup>
-          </AlertDialog>
-        }
-      />
+                </SelectPopup>
+              </Select>
+            }
+          />
+        ) : null}
+      </>
     );
   };
 
