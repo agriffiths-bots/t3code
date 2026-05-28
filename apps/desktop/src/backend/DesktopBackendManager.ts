@@ -175,7 +175,10 @@ export interface DesktopBackendInstance {
 export interface BackendInstanceSpec {
   readonly id: BackendInstanceId;
   readonly label: string;
-  readonly configResolve: Effect.Effect<DesktopBackendStartConfig>;
+  // configResolve can now fail with PlatformError because the
+  // bootstrap-token closure inside DesktopBackendConfiguration uses
+  // crypto.randomBytes (Effect 4 beta.73 migration).
+  readonly configResolve: Effect.Effect<DesktopBackendStartConfig, PlatformError.PlatformError>;
   // Receives the *resolved* httpBaseUrl of the run that just became
   // ready. The window service uses this to decide what URL to load
   // (the WSL backend reports its distro IP, the Windows backend reports
@@ -406,9 +409,19 @@ export const makeBackendInstance = Effect.fn("makeBackendInstance")(function* (
         }
 
         yield* spec.onShutdown?.() ?? Effect.void;
-        const config = yield* spec.configResolve;
+        const config = yield* spec.configResolve.pipe(
+          Effect.tapError((error) =>
+            logInstanceError("failed to generate desktop backend configuration", {
+              cause: error.message,
+            }),
+          ),
+          Effect.option,
+        );
+        if (Option.isNone(config)) {
+          return;
+        }
         const entryExists = yield* fileSystem
-          .exists(config.entryPath)
+          .exists(config.value.entryPath)
           .pipe(Effect.orElseSucceed(() => false));
 
         yield* cancelRestart;
@@ -416,16 +429,16 @@ export const makeBackendInstance = Effect.fn("makeBackendInstance")(function* (
           ...latest,
           desiredRunning: true,
           ready: false,
-          config: Option.some(config),
+          config: Option.some(config.value),
         }));
 
-        if (Option.isSome(config.preflightFailure)) {
-          yield* scheduleRestart(config.preflightFailure.value);
+        if (Option.isSome(config.value.preflightFailure)) {
+          yield* scheduleRestart(config.value.preflightFailure.value);
           return;
         }
 
         if (!entryExists) {
-          yield* scheduleRestart(`missing server entry at ${config.entryPath}`);
+          yield* scheduleRestart(`missing server entry at ${config.value.entryPath}`);
           return;
         }
 
@@ -507,7 +520,7 @@ export const makeBackendInstance = Effect.fn("makeBackendInstance")(function* (
         });
 
         const program = runBackendProcess({
-          ...config,
+          ...config.value,
           onStarted: Effect.fn("desktop.backendInstance.onStarted")(function* (pid) {
             yield* updateActiveRun(runId, (run) => ({
               ...run,
@@ -515,7 +528,7 @@ export const makeBackendInstance = Effect.fn("makeBackendInstance")(function* (
             }));
             yield* backendOutputLog.writeSessionBoundary({
               phase: "START",
-              details: `pid=${pid} port=${config.bootstrap.port} cwd=${config.cwd}`,
+              details: `pid=${pid} port=${config.value.bootstrap.port} cwd=${config.value.cwd}`,
             });
           }),
           onReady: Effect.fn("desktop.backendInstance.onReady")(function* () {
@@ -538,7 +551,7 @@ export const makeBackendInstance = Effect.fn("makeBackendInstance")(function* (
               return;
             }
 
-            yield* spec.onReady?.(config.httpBaseUrl) ?? Effect.void;
+            yield* spec.onReady?.(config.value.httpBaseUrl) ?? Effect.void;
           }),
           onReadinessFailure: (error) =>
             logInstanceWarning("backend readiness check failed during bootstrap", {

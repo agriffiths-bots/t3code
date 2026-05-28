@@ -2,11 +2,13 @@ import * as NodeOS from "node:os";
 
 import { parsePersistedServerObservabilitySettings } from "@t3tools/shared/serverSettings";
 import * as Context from "effect/Context";
+import * as Crypto from "effect/Crypto";
 import * as Effect from "effect/Effect";
+import * as Encoding from "effect/Encoding";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
-import * as Random from "effect/Random";
+import * as PlatformError from "effect/PlatformError";
 import * as Ref from "effect/Ref";
 
 import serverPackageJson from "../../../server/package.json" with { type: "json" };
@@ -20,8 +22,13 @@ import * as DesktopWslEnvironment from "../wsl/DesktopWslEnvironment.ts";
 
 export interface DesktopBackendConfigurationShape {
   // Build the Windows-native primary backend's start config. Reads the
-  // primary's port/host/exposure from DesktopServerExposure.
-  readonly resolvePrimary: Effect.Effect<DesktopBackendManager.DesktopBackendStartConfig>;
+  // primary's port/host/exposure from DesktopServerExposure. Can fail
+  // with PlatformError because bootstrap token generation now uses
+  // crypto.randomBytes under the hood (post Effect 4 migration).
+  readonly resolvePrimary: Effect.Effect<
+    DesktopBackendManager.DesktopBackendStartConfig,
+    PlatformError.PlatformError
+  >;
   // Build a WSL backend start config for the given distro on the given
   // port. The WSL backend is always loopback-only (the primary owns LAN
   // exposure when the user opts in), so this takes the port directly and
@@ -30,7 +37,7 @@ export interface DesktopBackendConfigurationShape {
   readonly resolveWsl: (input: {
     readonly port: number;
     readonly distro: string | null;
-  }) => Effect.Effect<DesktopBackendManager.DesktopBackendStartConfig>;
+  }) => Effect.Effect<DesktopBackendManager.DesktopBackendStartConfig, PlatformError.PlatformError>;
 }
 
 export class DesktopBackendConfiguration extends Context.Service<
@@ -135,23 +142,6 @@ const readPersistedBackendObservabilitySettings: Effect.Effect<
     otlpMetricsUrl: Option.fromNullishOr(parsed.otlpMetricsUrl),
   };
 });
-
-const getOrCreateBootstrapToken = Effect.fn("desktop.backendConfiguration.bootstrapToken")(
-  function* (tokenRef: Ref.Ref<Option.Option<string>>) {
-    const existing = yield* Ref.get(tokenRef);
-    if (Option.isSome(existing)) {
-      return existing.value;
-    }
-
-    let token = "";
-    while (token.length < 48) {
-      token += (yield* Random.nextUUIDv4).replace(/-/g, "");
-    }
-    token = token.slice(0, 48);
-    yield* Ref.set(tokenRef, Option.some(token));
-    return token;
-  },
-);
 
 interface SharedBootstrapInput {
   readonly bootstrapToken: string;
@@ -446,7 +436,18 @@ export const layer = Layer.effect(
     const serverExposure = yield* DesktopServerExposure.DesktopServerExposure;
     const wslEnvironment = yield* DesktopWslEnvironment.DesktopWslEnvironment;
     const settings = yield* DesktopAppSettings.DesktopAppSettings;
+    const crypto = yield* Crypto.Crypto;
     const tokenRef = yield* Ref.make(Option.none<string>());
+    const getOrCreateBootstrapToken = Effect.gen(function* () {
+      const existing = yield* Ref.get(tokenRef);
+      if (Option.isSome(existing)) {
+        return existing.value;
+      }
+
+      const token = Encoding.encodeHex(yield* crypto.randomBytes(24));
+      yield* Ref.set(tokenRef, Option.some(token));
+      return token;
+    });
 
     // Both resolvers share the same bootstrap token: the renderer holds a
     // single token and uses it against whichever backend it's currently
@@ -454,7 +455,7 @@ export const layer = Layer.effect(
     // hot-swap of the server-settings file is picked up on the next
     // restart cycle without having to bounce the desktop process.
     const sharedInputs = Effect.gen(function* () {
-      const bootstrapToken = yield* getOrCreateBootstrapToken(tokenRef);
+      const bootstrapToken = yield* getOrCreateBootstrapToken;
       const observabilitySettings = yield* readPersistedBackendObservabilitySettings.pipe(
         Effect.provideService(FileSystem.FileSystem, fileSystem),
         Effect.provideService(DesktopEnvironment.DesktopEnvironment, environment),
