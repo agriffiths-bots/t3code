@@ -9,6 +9,7 @@ import * as Option from "effect/Option";
 import * as Electron from "electron";
 
 import * as NetService from "@t3tools/shared/Net";
+import * as Cloudflared from "@t3tools/shared/cloudflared";
 import { resolveRemoteT3CliPackageSpec } from "@t3tools/ssh/command";
 import type { RemoteT3RunnerOptions } from "@t3tools/ssh/tunnel";
 import serverPackageJson from "../../server/package.json" with { type: "json" };
@@ -94,6 +95,17 @@ const desktopSshEnvironmentLayer = Layer.unwrap(
   }),
 );
 
+const desktopCloudflaredLayer = Layer.unwrap(
+  Effect.gen(function* () {
+    const environment = yield* DesktopEnvironment.DesktopEnvironment;
+    return Cloudflared.layer({
+      baseDir: environment.baseDir,
+      platform: environment.platform,
+      arch: environment.processArch,
+    });
+  }),
+);
+
 const electronLayer = Layer.mergeAll(
   ElectronApp.layer,
   ElectronDialog.layer,
@@ -141,7 +153,11 @@ const desktopApplicationLayer = Layer.mergeAll(
   DesktopCloudAuth.layer,
   DesktopShellEnvironment.layer,
   desktopSshLayer,
-).pipe(Layer.provideMerge(DesktopUpdates.layer), Layer.provideMerge(desktopBackendLayer));
+).pipe(
+  Layer.provideMerge(DesktopUpdates.layer),
+  Layer.provideMerge(desktopCloudflaredLayer),
+  Layer.provideMerge(desktopBackendLayer),
+);
 
 const desktopRuntimeLayer = ElectronProtocol.layerSchemePrivileges.pipe(
   Layer.flatMap(() =>

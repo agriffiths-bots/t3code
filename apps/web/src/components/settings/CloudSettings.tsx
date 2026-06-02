@@ -64,7 +64,7 @@ export function CloudSettingsPanel() {
         <SettingsSection title="T3 Cloud" icon={<CloudIcon className="size-3.5" />}>
           <SettingsRow
             title="Cloud account"
-            description="Set VITE_CLERK_PUBLISHABLE_KEY to enable optional cloud features."
+            description="Set T3CODE_CLERK_PUBLISHABLE_KEY to enable optional cloud features."
           />
         </SettingsSection>
       </SettingsPageContainer>

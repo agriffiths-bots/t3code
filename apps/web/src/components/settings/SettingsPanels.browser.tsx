@@ -470,6 +470,18 @@ const createDesktopBridgeStub = (overrides?: {
       headers: {},
       body: "",
     }),
+    getCloudflaredStatus: vi.fn().mockResolvedValue({
+      status: "available",
+      executablePath: "/usr/local/bin/cloudflared",
+      source: "path",
+      version: "2026.5.2",
+    }),
+    installCloudflared: vi.fn().mockResolvedValue({
+      status: "available",
+      executablePath: "/usr/local/bin/cloudflared",
+      source: "path",
+      version: "2026.5.2",
+    }),
     onCloudAuthCallback: () => () => {},
     onMenuAction: () => () => {},
     getUpdateState: vi.fn().mockResolvedValue(idleUpdateState),

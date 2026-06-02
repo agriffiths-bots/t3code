@@ -1,8 +1,13 @@
 import type { ExpoConfig } from "expo/config";
 
+import { loadRepoEnv } from "../../scripts/lib/public-config";
+
 type AppVariant = "development" | "preview" | "production";
 
-const APP_VARIANT = resolveAppVariant(process.env.APP_VARIANT);
+const repoEnv = loadRepoEnv();
+Object.assign(process.env, repoEnv);
+
+const APP_VARIANT = resolveAppVariant(repoEnv.APP_VARIANT);
 
 const VARIANT_CONFIG: Record<
   AppVariant,
@@ -150,10 +155,10 @@ const config: ExpoConfig = {
   extra: {
     appVariant: APP_VARIANT,
     relay: {
-      url: process.env.T3_RELAY_URL ?? null,
+      url: repoEnv.T3_RELAY_URL ?? null,
     },
     clerk: {
-      publishableKey: process.env.EXPO_PUBLIC_CLERK_PUBLISHABLE_KEY ?? null,
+      publishableKey: repoEnv.EXPO_PUBLIC_CLERK_PUBLISHABLE_KEY ?? null,
     },
     eas: {
       projectId: "d763fcb8-d37c-41ea-a773-b54a0ab4a454",

@@ -81,6 +81,7 @@ import {
 } from "./serverRuntimeState.ts";
 import { orchestrationHttpApiLayer } from "./orchestration/http.ts";
 import * as NetService from "@t3tools/shared/Net";
+import * as Cloudflared from "@t3tools/shared/cloudflared";
 import { disableTailscaleServe, ensureTailscaleServe } from "@t3tools/tailscale";
 
 const PtyAdapterLive = Layer.unwrap(
@@ -92,6 +93,13 @@ const PtyAdapterLive = Layer.unwrap(
       const NodePTY = yield* Effect.promise(() => import("./terminal/Layers/NodePTY.ts"));
       return NodePTY.layer;
     }
+  }),
+);
+
+const CloudflaredExecutableLive = Layer.unwrap(
+  Effect.gen(function* () {
+    const config = yield* ServerConfig;
+    return Cloudflared.layer({ baseDir: config.baseDir });
   }),
 );
 
@@ -277,7 +285,10 @@ const RuntimeCoreDependenciesLive = ReactorLayerLive.pipe(
   Layer.provideMerge(AuthLayerLive),
   Layer.provideMerge(ServerSecretStore.layer),
   Layer.provideMerge(
-    CloudManagedEndpointRuntime.layer.pipe(Layer.provide(ServerSecretStore.layer)),
+    CloudManagedEndpointRuntime.layer.pipe(
+      Layer.provide(ServerSecretStore.layer),
+      Layer.provide(CloudflaredExecutableLive),
+    ),
   ),
 );
 

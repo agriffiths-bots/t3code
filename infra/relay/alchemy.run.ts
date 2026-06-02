@@ -25,7 +25,7 @@ export default Alchemy.Stack(
   Effect.gen(function* () {
     const db = yield* PlanetscaleDatabase;
     const hyperdrive = yield* RelayHyperdrive;
-    const zone = yield* ManagedEndpointZone;
+    const zone = yield* ManagedEndpointZone.pipe(Effect.orDie);
     const api = yield* Api;
 
     return {

@@ -245,6 +245,18 @@ function makeDesktopBridge(overrides: Partial<DesktopBridge> = {}): DesktopBridg
       headers: {},
       body: "",
     }),
+    getCloudflaredStatus: async () => ({
+      status: "available",
+      executablePath: "/usr/local/bin/cloudflared",
+      source: "path",
+      version: "2026.5.2",
+    }),
+    installCloudflared: async () => ({
+      status: "available",
+      executablePath: "/usr/local/bin/cloudflared",
+      source: "path",
+      version: "2026.5.2",
+    }),
     onCloudAuthCallback: () => () => undefined,
     onMenuAction: () => () => undefined,
     getUpdateState: async () => {

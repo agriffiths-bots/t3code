@@ -394,6 +394,26 @@ export const DesktopCloudAuthFetchResultSchema = Schema.Struct({
 });
 export type DesktopCloudAuthFetchResult = typeof DesktopCloudAuthFetchResultSchema.Type;
 
+export const DesktopCloudflaredStatusSchema = Schema.Union([
+  Schema.Struct({
+    status: Schema.Literal("available"),
+    executablePath: Schema.String,
+    source: Schema.Literals(["override", "managed", "path"]),
+    version: Schema.String,
+  }),
+  Schema.Struct({
+    status: Schema.Literal("missing"),
+    version: Schema.String,
+  }),
+  Schema.Struct({
+    status: Schema.Literal("unsupported"),
+    platform: Schema.String,
+    arch: Schema.String,
+    version: Schema.String,
+  }),
+]);
+export type DesktopCloudflaredStatus = typeof DesktopCloudflaredStatusSchema.Type;
+
 export interface DesktopBridge {
   getAppBranding: () => DesktopAppBranding | null;
   getLocalEnvironmentBootstrap: () => DesktopEnvironmentBootstrap | null;
@@ -444,6 +464,8 @@ export interface DesktopBridge {
   setCloudAuthToken: (token: string) => Promise<boolean>;
   clearCloudAuthToken: () => Promise<void>;
   fetchCloudAuth: (input: DesktopCloudAuthFetchInput) => Promise<DesktopCloudAuthFetchResult>;
+  getCloudflaredStatus: () => Promise<DesktopCloudflaredStatus>;
+  installCloudflared: () => Promise<DesktopCloudflaredStatus>;
   onCloudAuthCallback: (listener: (rawUrl: string) => void) => () => void;
   onMenuAction: (listener: (action: string) => void) => () => void;
   getUpdateState: () => Promise<DesktopUpdateState>;

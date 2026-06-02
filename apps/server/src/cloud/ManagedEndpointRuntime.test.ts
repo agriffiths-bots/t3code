@@ -1,13 +1,35 @@
 import { describe, expect, it } from "@effect/vitest";
+import { vi } from "vitest";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
+import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as PlatformError from "effect/PlatformError";
 import * as Sink from "effect/Sink";
 import * as Stream from "effect/Stream";
 import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process";
+import * as Cloudflared from "@t3tools/shared/cloudflared";
 
 import { makeCloudManagedEndpointRuntime } from "./ManagedEndpointRuntime.ts";
+
+const cloudflaredAvailableLayer = Layer.succeed(
+  Cloudflared.CloudflaredExecutable,
+  Cloudflared.CloudflaredExecutable.of({
+    resolve: Effect.succeed({
+      status: "available",
+      executablePath: "cloudflared",
+      source: "path",
+      version: Cloudflared.CLOUDFLARED_VERSION,
+    }),
+    install: Effect.die("unused"),
+  }),
+);
+
+const runtimeDependencies = (spawner: ReturnType<typeof ChildProcessSpawner.make>) =>
+  Layer.mergeAll(
+    Layer.succeed(ChildProcessSpawner.ChildProcessSpawner, spawner),
+    cloudflaredAvailableLayer,
+  );
 
 function makeHandle(input: {
   readonly pid: number;
@@ -58,7 +80,7 @@ describe("CloudManagedEndpointRuntime", () => {
         }),
       );
       const runtime = yield* makeCloudManagedEndpointRuntime.pipe(
-        Effect.provide(Layer.succeed(ChildProcessSpawner.ChildProcessSpawner, spawner)),
+        Effect.provide(runtimeDependencies(spawner)),
       );
 
       yield* runtime.applyConfig({
@@ -88,6 +110,7 @@ describe("CloudManagedEndpointRuntime", () => {
       ]);
       expect(spawned.map((command) => command.options.stdout)).toEqual(["ignore", "ignore"]);
       expect(spawned.map((command) => command.options.stderr)).toEqual(["ignore", "ignore"]);
+      expect(spawned.map((command) => command.options.detached)).toEqual([false, false]);
       expect(killed).toEqual([100, 101]);
       expect(stopped).toEqual({ status: "disabled" });
     }),
@@ -109,7 +132,7 @@ describe("CloudManagedEndpointRuntime", () => {
         }),
       );
       const runtime = yield* makeCloudManagedEndpointRuntime.pipe(
-        Effect.provide(Layer.succeed(ChildProcessSpawner.ChildProcessSpawner, spawner)),
+        Effect.provide(runtimeDependencies(spawner)),
       );
 
       const started = yield* runtime.applyConfig({
@@ -148,7 +171,7 @@ describe("CloudManagedEndpointRuntime", () => {
         }),
       );
       const runtime = yield* makeCloudManagedEndpointRuntime.pipe(
-        Effect.provide(Layer.succeed(ChildProcessSpawner.ChildProcessSpawner, spawner)),
+        Effect.provide(runtimeDependencies(spawner)),
       );
       const config = {
         providerKind: "cloudflare_tunnel" as const,
@@ -195,7 +218,7 @@ describe("CloudManagedEndpointRuntime", () => {
         }),
       );
       const runtime = yield* makeCloudManagedEndpointRuntime.pipe(
-        Effect.provide(Layer.succeed(ChildProcessSpawner.ChildProcessSpawner, spawner)),
+        Effect.provide(runtimeDependencies(spawner)),
       );
 
       const started = yield* runtime.applyConfig({
@@ -208,7 +231,59 @@ describe("CloudManagedEndpointRuntime", () => {
 
       expect(started).toMatchObject({ status: "running", pid: 400 });
       expect(spawned).toEqual([400, 401]);
-      expect(killed).toEqual([]);
+      expect(killed).toEqual([400]);
+    }),
+  );
+
+  it.effect("serializes concurrent connector config changes", () =>
+    Effect.gen(function* () {
+      const spawned: Array<number> = [];
+      const killed: Array<number> = [];
+      const firstSpawnEntered = yield* Deferred.make<void>();
+      const releaseFirstSpawn = yield* Deferred.make<void>();
+      const spawner = ChildProcessSpawner.make(() =>
+        Effect.gen(function* () {
+          const pid = 500 + spawned.length;
+          spawned.push(pid);
+          if (pid === 500) {
+            yield* Deferred.succeed(firstSpawnEntered, undefined);
+            yield* Deferred.await(releaseFirstSpawn);
+          }
+          const handle = makeHandle({
+            pid,
+            onKill: () => {
+              killed.push(pid);
+            },
+          });
+          yield* Effect.addFinalizer(() => handle.kill().pipe(Effect.ignore));
+          return handle;
+        }),
+      );
+      const runtime = yield* makeCloudManagedEndpointRuntime.pipe(
+        Effect.provide(runtimeDependencies(spawner)),
+      );
+
+      const first = yield* runtime
+        .applyConfig({
+          providerKind: "cloudflare_tunnel",
+          connectorToken: "token-1",
+        })
+        .pipe(Effect.forkChild);
+      yield* Deferred.await(firstSpawnEntered);
+      const second = yield* runtime
+        .applyConfig({
+          providerKind: "cloudflare_tunnel",
+          connectorToken: "token-2",
+        })
+        .pipe(Effect.forkChild);
+      yield* Deferred.succeed(releaseFirstSpawn, undefined);
+
+      yield* Fiber.join(first);
+      const status = yield* Fiber.join(second);
+
+      expect(status).toMatchObject({ status: "running", pid: 501 });
+      expect(spawned).toEqual([500, 501]);
+      expect(killed).toEqual([500]);
     }),
   );
 
@@ -225,7 +300,7 @@ describe("CloudManagedEndpointRuntime", () => {
         ),
       );
       const runtime = yield* makeCloudManagedEndpointRuntime.pipe(
-        Effect.provide(Layer.succeed(ChildProcessSpawner.ChildProcessSpawner, spawner)),
+        Effect.provide(runtimeDependencies(spawner)),
       );
 
       const status = yield* runtime.applyConfig({
@@ -239,6 +314,42 @@ describe("CloudManagedEndpointRuntime", () => {
         providerKind: "cloudflare_tunnel",
         tunnelId: "tunnel-1",
       });
+    }),
+  );
+
+  it.effect("reports a missing cloudflared executable without spawning", () =>
+    Effect.gen(function* () {
+      const spawn = vi.fn();
+      const spawner = ChildProcessSpawner.make(spawn);
+      const runtime = yield* makeCloudManagedEndpointRuntime.pipe(
+        Effect.provide(
+          Layer.mergeAll(
+            Layer.succeed(ChildProcessSpawner.ChildProcessSpawner, spawner),
+            Layer.succeed(
+              Cloudflared.CloudflaredExecutable,
+              Cloudflared.CloudflaredExecutable.of({
+                resolve: Effect.succeed({
+                  status: "missing",
+                  version: Cloudflared.CLOUDFLARED_VERSION,
+                }),
+                install: Effect.die("unused"),
+              }),
+            ),
+          ),
+        ),
+      );
+
+      const status = yield* runtime.applyConfig({
+        providerKind: "cloudflare_tunnel",
+        connectorToken: "token",
+      });
+
+      expect(status).toEqual({
+        status: "failed",
+        providerKind: "cloudflare_tunnel",
+        reason: "cloudflared is not installed.",
+      });
+      expect(spawn).not.toHaveBeenCalled();
     }),
   );
 });

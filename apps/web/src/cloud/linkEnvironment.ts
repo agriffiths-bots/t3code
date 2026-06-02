@@ -55,6 +55,59 @@ export class CloudEnvironmentLinkError extends Data.TaggedError("CloudEnvironmen
   readonly cause?: unknown;
 }> {}
 
+const desktopCloudflaredBridgeError = (cause: unknown) =>
+  new CloudEnvironmentLinkError({
+    message: "Could not prepare Cloudflare Tunnel.",
+    cause,
+  });
+
+export function ensureDesktopCloudflaredAvailable(): Effect.Effect<
+  void,
+  CloudEnvironmentLinkError
+> {
+  const bridge = typeof window === "undefined" ? undefined : window.desktopBridge;
+  if (!bridge) return Effect.void;
+
+  return Effect.gen(function* () {
+    const status = yield* Effect.tryPromise({
+      try: () => bridge.getCloudflaredStatus(),
+      catch: desktopCloudflaredBridgeError,
+    });
+    if (status.status === "available") return;
+    if (status.status === "unsupported") {
+      return yield* new CloudEnvironmentLinkError({
+        message: `T3 Code cannot install cloudflared automatically on ${status.platform}-${status.arch}.`,
+      });
+    }
+
+    const confirmed = yield* Effect.tryPromise({
+      try: () =>
+        bridge.confirm(
+          "T3 Code needs Cloudflare Tunnel to make this environment available through T3 Cloud. Download and install cloudflared now?",
+        ),
+      catch: desktopCloudflaredBridgeError,
+    });
+    if (!confirmed) {
+      return yield* new CloudEnvironmentLinkError({
+        message: "Cloudflare Tunnel installation was cancelled.",
+      });
+    }
+
+    const installed = yield* Effect.tryPromise({
+      try: () => bridge.installCloudflared(),
+      catch: desktopCloudflaredBridgeError,
+    });
+    if (installed.status !== "available") {
+      return yield* new CloudEnvironmentLinkError({
+        message:
+          installed.status === "unsupported"
+            ? `T3 Code cannot install cloudflared automatically on ${installed.platform}-${installed.arch}.`
+            : "cloudflared is still unavailable after installation.",
+      });
+    }
+  });
+}
+
 const isRelayProtectedError = Schema.is(RelayProtectedError);
 const isEnvironmentCloudApiError = Schema.is(
   Schema.Union([
@@ -231,7 +284,7 @@ export function listManagedCloudEnvironments(input: {
     const configuredRelayUrl = relayUrl();
     if (!configuredRelayUrl) {
       return yield* new CloudEnvironmentLinkError({
-        message: "VITE_T3_RELAY_URL is not configured.",
+        message: "T3_RELAY_URL is not configured.",
       });
     }
     const relayClient = yield* ManagedRelayClient;
@@ -261,7 +314,7 @@ export function listCloudDevices(input: {
   return Effect.gen(function* () {
     if (!relayUrl()) {
       return yield* new CloudEnvironmentLinkError({
-        message: "VITE_T3_RELAY_URL is not configured.",
+        message: "T3_RELAY_URL is not configured.",
       });
     }
     const relayClient = yield* ManagedRelayClient;
@@ -290,7 +343,7 @@ export function connectManagedCloudEnvironment(input: {
     const configuredRelayUrl = relayUrl();
     if (!configuredRelayUrl) {
       return yield* new CloudEnvironmentLinkError({
-        message: "VITE_T3_RELAY_URL is not configured.",
+        message: "T3_RELAY_URL is not configured.",
       });
     }
     const persistedRelayUrl = normalizeRelayBaseUrl(input.relayUrl);
@@ -465,7 +518,7 @@ export function linkEnvironmentToCloud(input: {
     const configuredRelayUrl = relayUrl();
     if (!configuredRelayUrl) {
       return yield* new CloudEnvironmentLinkError({
-        message: "VITE_T3_RELAY_URL is not configured.",
+        message: "T3_RELAY_URL is not configured.",
       });
     }
     const relayClient = yield* ManagedRelayClient;
@@ -560,7 +613,7 @@ export function linkPrimaryEnvironmentToCloud(input: {
     const configuredRelayUrl = relayUrl();
     if (!configuredRelayUrl) {
       return yield* new CloudEnvironmentLinkError({
-        message: "VITE_T3_RELAY_URL is not configured.",
+        message: "T3_RELAY_URL is not configured.",
       });
     }
     const relayClient = yield* ManagedRelayClient;
@@ -570,6 +623,7 @@ export function linkPrimaryEnvironmentToCloud(input: {
         message: "Local environment is not ready yet.",
       });
     }
+    yield* ensureDesktopCloudflaredAvailable();
 
     const challenge = yield* relayClient
       .createEnvironmentLinkChallenge({

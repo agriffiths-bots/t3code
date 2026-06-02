@@ -1,6 +1,7 @@
 import { EnvironmentId } from "@t3tools/contracts";
 import { RelayWebClientId } from "@t3tools/contracts/relay";
-import { beforeEach, vi } from "vitest";
+import { afterEach, beforeEach, vi } from "vitest";
+import type { DesktopBridge } from "@t3tools/contracts";
 import { describe, expect, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
@@ -15,6 +16,7 @@ import {
 import type { SavedEnvironmentRecord } from "../environments/runtime";
 import {
   connectManagedCloudEnvironment,
+  ensureDesktopCloudflaredAvailable,
   linkEnvironmentToCloud,
   linkPrimaryEnvironmentToCloud,
   listManagedCloudEnvironments,
@@ -96,6 +98,13 @@ function requestBodyText(body: BodyInit | null | undefined): string {
 }
 
 describe("web cloud link environment client", () => {
+  afterEach(() => {
+    if ("window" in globalThis) {
+      Reflect.deleteProperty(window, "desktopBridge");
+    }
+    vi.unstubAllGlobals();
+  });
+
   beforeEach(() => {
     vi.restoreAllMocks();
     createProofMock.mockClear();
@@ -113,6 +122,48 @@ describe("web cloud link environment client", () => {
       "https://relay.example.test",
     );
     expect(normalizeRelayBaseUrl("   ")).toBeNull();
+  });
+
+  it("installs cloudflared after desktop confirmation", async () => {
+    vi.stubGlobal("window", {});
+    const confirm = vi.fn().mockResolvedValue(true);
+    const installCloudflared = vi.fn().mockResolvedValue({
+      status: "available",
+      executablePath: "/Users/test/.t3/tools/cloudflared/cloudflared",
+      source: "managed",
+      version: "2026.5.2",
+    });
+    window.desktopBridge = {
+      confirm,
+      getCloudflaredStatus: vi.fn().mockResolvedValue({
+        status: "missing",
+        version: "2026.5.2",
+      }),
+      installCloudflared,
+    } as unknown as DesktopBridge;
+
+    await Effect.runPromise(ensureDesktopCloudflaredAvailable());
+
+    expect(confirm).toHaveBeenCalledOnce();
+    expect(installCloudflared).toHaveBeenCalledOnce();
+  });
+
+  it("does not install cloudflared when desktop confirmation is declined", async () => {
+    vi.stubGlobal("window", {});
+    const installCloudflared = vi.fn();
+    window.desktopBridge = {
+      confirm: vi.fn().mockResolvedValue(false),
+      getCloudflaredStatus: vi.fn().mockResolvedValue({
+        status: "missing",
+        version: "2026.5.2",
+      }),
+      installCloudflared,
+    } as unknown as DesktopBridge;
+
+    await expect(Effect.runPromise(ensureDesktopCloudflaredAvailable())).rejects.toMatchObject({
+      message: "Cloudflare Tunnel installation was cancelled.",
+    });
+    expect(installCloudflared).not.toHaveBeenCalled();
   });
 
   it.effect("lists relay-managed environments for hosted and served web clients", () =>

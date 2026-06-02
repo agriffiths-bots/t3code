@@ -6,15 +6,41 @@ audience.
 
 ## Application Keys
 
-Use keys from the same Clerk instance in each location:
+Web, desktop, and mobile use checked-in public development defaults from
+`packages/shared/src/relayAuth.ts`, so a fresh clone can use T3 Cloud without creating local
+environment files. These values are safe to embed in client builds: the Clerk publishable key and
+relay URL are public identifiers, not secrets.
 
-| Consumer                 | Configuration                           | Value                                                 |
-| ------------------------ | --------------------------------------- | ----------------------------------------------------- |
-| Web and desktop renderer | `apps/web/.env`                         | `VITE_CLERK_PUBLISHABLE_KEY=<publishable key>`        |
-| Mobile build             | `apps/mobile/.env` or build environment | `EXPO_PUBLIC_CLERK_PUBLISHABLE_KEY=<publishable key>` |
-| Relay deployment         | Alchemy secret                          | `CLERK_SECRET_KEY=<secret key>`                       |
+To point all clients at another Clerk/relay deployment, add a repository-root `.env` or
+`.env.local` file:
 
-Never put `CLERK_SECRET_KEY` in a client application environment.
+```dotenv
+T3CODE_CLERK_PUBLISHABLE_KEY=<publishable key>
+T3_RELAY_URL=https://relay.example.com
+```
+
+The shared client loader projects these canonical values into the framework-specific
+`VITE_CLERK_PUBLISHABLE_KEY`, `VITE_T3_RELAY_URL`, and
+`EXPO_PUBLIC_CLERK_PUBLISHABLE_KEY` aliases. Existing aliases remain accepted as overrides for
+compatibility, but new client configuration should use the canonical names.
+
+Configuration precedence is:
+
+1. Process or CI environment variables.
+2. Repository-root `.env.local`.
+3. Repository-root `.env`.
+4. Checked-in public development defaults.
+
+Release builds read `T3CODE_CLERK_PUBLISHABLE_KEY` and `T3_RELAY_URL` from GitHub Actions repository
+variables. EAS preview and production builds should define the same client-facing values in their
+EAS environment.
+
+For a hosted relay deployment, copy `infra/relay/.env.example` to `infra/relay/.env`. The relay
+deployment reads `T3_RELAY_DOMAIN` and `T3_RELAY_ZONE_NAME` through Effect `Config`, with the
+checked-in shared values as defaults. `bun --cwd infra/relay run deploy` invokes Alchemy from the
+relay directory, so Alchemy loads `infra/relay/.env`. The relay still requires `CLERK_SECRET_KEY` as
+an Alchemy secret. Never put `CLERK_SECRET_KEY` in a client application environment or commit it to
+the repository.
 
 ## JWT Template
 
@@ -25,8 +51,9 @@ In **Clerk Dashboard > JWT templates**, create a template with:
 | Name    | `t3-relay`                                             |
 | Claims  | `{ "aud": "https://t3code-relay.ineededadomain.com" }` |
 
-The `aud` value must be the deployed relay public URL, with no trailing slash, and must match
-`VITE_T3_RELAY_URL` and `T3_RELAY_URL`. If the relay domain changes, update all three values.
+The `aud` value must be the deployed relay public URL, with no trailing slash. It must match the
+client-facing `T3_RELAY_URL` and the HTTPS URL derived from the deployment's `T3_RELAY_DOMAIN`. If
+the relay domain changes, update both values and the JWT template.
 
 ## Desktop OAuth Redirect Allowlist
 

@@ -57,7 +57,7 @@ export default function SettingsWaitlistRouteScreen() {
                 textAlign: "center",
               }}
             >
-              Add EXPO_PUBLIC_CLERK_PUBLISHABLE_KEY to this build to enable waitlist enrollment.
+              Add T3CODE_CLERK_PUBLISHABLE_KEY to this build to enable waitlist enrollment.
             </Text>
           </View>
         )}

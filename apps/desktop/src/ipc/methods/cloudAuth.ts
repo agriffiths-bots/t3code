@@ -6,7 +6,7 @@ import * as Data from "effect/Data";
 import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
-import { HttpClient, HttpClientRequest } from "effect/unstable/http";
+import { Headers, HttpClient, HttpClientRequest } from "effect/unstable/http";
 
 import * as DesktopCloudAuth from "../../app/DesktopCloudAuth.ts";
 import * as DesktopCloudAuthTokenStore from "../../app/DesktopCloudAuthTokenStore.ts";
@@ -91,11 +91,20 @@ export const fetchCloudAuth = makeIpcMethod({
             }),
     });
 
-    const request = HttpClientRequest.make((input.method ?? "GET") as "GET" | "POST")(url, {
-      headers: input.headers,
-    }).pipe(
-      input.body === undefined ? (request) => request : HttpClientRequest.bodyText(input.body),
+    const requestWithoutBody = HttpClientRequest.make((input.method ?? "GET") as "GET" | "POST")(
+      url,
+      {
+        headers: input.headers,
+      },
     );
+    const request =
+      input.body === undefined
+        ? requestWithoutBody
+        : HttpClientRequest.bodyText(
+            requestWithoutBody,
+            input.body,
+            Option.getOrUndefined(Headers.get(requestWithoutBody.headers, "content-type")),
+          );
 
     const response = yield* HttpClient.execute(request).pipe(
       Effect.mapError(

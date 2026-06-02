@@ -102,6 +102,8 @@ contextBridge.exposeInMainWorld("desktopBridge", {
     ipcRenderer.invoke(IpcChannels.SET_CLOUD_AUTH_TOKEN_CHANNEL, token),
   clearCloudAuthToken: () => ipcRenderer.invoke(IpcChannels.CLEAR_CLOUD_AUTH_TOKEN_CHANNEL),
   fetchCloudAuth: (input) => ipcRenderer.invoke(IpcChannels.FETCH_CLOUD_AUTH_CHANNEL, input),
+  getCloudflaredStatus: () => ipcRenderer.invoke(IpcChannels.GET_CLOUDFLARED_STATUS_CHANNEL),
+  installCloudflared: () => ipcRenderer.invoke(IpcChannels.INSTALL_CLOUDFLARED_CHANNEL),
   onCloudAuthCallback: (listener) => {
     const wrappedListener = (_event: Electron.IpcRendererEvent, rawUrl: unknown) => {
       if (typeof rawUrl !== "string") return;

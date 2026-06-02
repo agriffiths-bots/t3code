@@ -138,6 +138,10 @@
     "./terminalLabels": {
       "types": "./src/terminalLabels.ts",
       "import": "./src/terminalLabels.ts"
+    },
+    "./cloudflared": {
+      "types": "./src/cloudflared.ts",
+      "import": "./src/cloudflared.ts"
     }
   },
   "scripts": {

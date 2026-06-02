@@ -29,7 +29,7 @@ import {
   tokenApi,
   withoutCapturedParentSpan,
 } from "./http/Api.ts";
-import { ManagedEndpointZone, RELAY_PUBLIC_DOMAIN, RELAY_PUBLIC_ORIGIN } from "./zone.ts";
+import { ManagedEndpointZone, RelayDeploymentConfig } from "./zone.ts";
 import { makeRelayTraceLayer, RelayObservability } from "./observability.ts";
 import * as DeliveryAttempts from "./agentActivity/DeliveryAttempts.ts";
 import * as AgentActivityRows from "./agentActivity/AgentActivityRows.ts";
@@ -87,18 +87,22 @@ const ApnsDeliveryJobSigningSecret = Alchemy.makeRandom("ApnsDeliveryJobSigningS
 
 export default class Api extends Cloudflare.Worker<Api>()(
   "Api",
-  {
-    main: import.meta.filename,
-    compatibility: {
-      date: "2026-05-22",
-      flags: ["nodejs_compat"],
-    },
-    domain: RELAY_PUBLIC_DOMAIN,
-  },
+  RelayDeploymentConfig.pipe(
+    Config.map(({ relayPublicDomain }) => ({
+      main: import.meta.filename,
+      compatibility: {
+        date: "2026-05-22",
+        flags: ["nodejs_compat"],
+      },
+      domain: relayPublicDomain,
+    })),
+    Effect.orDie,
+  ),
   Effect.gen(function* () {
     //
     // 1. Provision Infrastructure for the Worker to use
     //
+    const { relayPublicOrigin } = yield* RelayDeploymentConfig;
     const apnsDeliveryQueue = yield* RelayApnsDeliveryQueue;
     const apnsDeliveryDeadLetterQueue = yield* RelayApnsDeliveryDeadLetterQueue;
     const cloudMintKeyPair = yield* CloudMintKeyPair;
@@ -142,7 +146,7 @@ export default class Api extends Cloudflare.Worker<Api>()(
 
     const loadSettings = Effect.gen(function* () {
       return RelayConfiguration.RelayConfiguration.of({
-        relayIssuer: RELAY_PUBLIC_ORIGIN,
+        relayIssuer: relayPublicOrigin,
         apns: {
           environment,
           teamId: apnsTeamId,

@@ -1,10 +1,13 @@
 import type { RelayManagedEndpointRuntimeConfig } from "@t3tools/contracts/relay";
+import * as Cloudflared from "@t3tools/shared/cloudflared";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Ref from "effect/Ref";
+import * as Result from "effect/Result";
+import * as Semaphore from "effect/Semaphore";
 import * as Scope from "effect/Scope";
 import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process";
 
@@ -88,8 +91,11 @@ const stopConnector = (connector: ActiveConnector | null) =>
 
 export const makeCloudManagedEndpointRuntime = Effect.gen(function* () {
   const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+  const cloudflared = yield* Cloudflared.CloudflaredExecutable;
   const activeRef = yield* Ref.make<ActiveConnector | null>(null);
-  let applyConfig: CloudManagedEndpointRuntimeShape["applyConfig"];
+  const desiredConfigRef = yield* Ref.make<RelayManagedEndpointRuntimeConfig | null>(null);
+  const reconcileSemaphore = yield* Semaphore.make(1);
+  let reconcileConfig: CloudManagedEndpointRuntimeShape["applyConfig"];
 
   const stopActive = Effect.gen(function* () {
     const active = yield* Ref.getAndSet(activeRef, null);
@@ -98,26 +104,46 @@ export const makeCloudManagedEndpointRuntime = Effect.gen(function* () {
 
   const superviseConnector = (connector: ActiveConnector) =>
     Effect.gen(function* () {
-      const exitCode = yield* connector.child.exitCode;
-      const active = yield* Ref.get(activeRef);
-      if (active?.child.pid !== connector.child.pid || active.configKey !== connector.configKey) {
-        return;
-      }
-      yield* Ref.set(activeRef, null);
-      yield* Effect.logWarning("Cloudflare managed endpoint connector exited; restarting", {
-        pid: Number(connector.child.pid),
-        exitCode: Number(exitCode),
-        tunnelId: connector.config.tunnelId,
-        tunnelName: connector.config.tunnelName,
-      });
-      yield* applyConfig(connector.config);
+      const result = yield* Effect.result(connector.child.exitCode);
+      yield* reconcileSemaphore.withPermits(1)(
+        Effect.gen(function* () {
+          const active = yield* Ref.get(activeRef);
+          if (
+            active?.child.pid !== connector.child.pid ||
+            active.configKey !== connector.configKey
+          ) {
+            return;
+          }
+          yield* Ref.set(activeRef, null);
+          yield* stopConnector(connector);
+
+          const desiredConfig = yield* Ref.get(desiredConfigRef);
+          if (
+            !desiredConfig ||
+            desiredConfig.providerKind !== "cloudflare_tunnel" ||
+            runtimeConfigKey(desiredConfig) !== connector.configKey
+          ) {
+            return;
+          }
+
+          yield* Effect.logWarning("Cloudflare managed endpoint connector exited; restarting", {
+            pid: Number(connector.child.pid),
+            ...(Result.isSuccess(result)
+              ? { exitCode: Number(result.success) }
+              : { cause: result.failure }),
+            tunnelId: connector.config.tunnelId,
+            tunnelName: connector.config.tunnelName,
+          });
+          yield* reconcileConfig(desiredConfig);
+        }),
+      );
     }).pipe(
-      Effect.catch((cause) =>
+      Effect.catchCause((cause) =>
         Effect.logWarning("Cloudflare managed endpoint connector supervisor failed", { cause }),
       ),
     );
 
-  applyConfig = Effect.fn("CloudManagedEndpointRuntime.applyConfig")(function* (config) {
+  reconcileConfig = Effect.fn("CloudManagedEndpointRuntime.reconcileConfig")(function* (config) {
     if (!config || config.providerKind !== "cloudflare_tunnel") {
       yield* stopActive;
       return config
@@ -144,14 +170,33 @@ export const makeCloudManagedEndpointRuntime = Effect.gen(function* () {
 
     yield* stopActive;
 
+    const executable = yield* cloudflared.resolve;
+    if (executable.status !== "available") {
+      return {
+        status: "failed",
+        providerKind: "cloudflare_tunnel",
+        reason:
+          executable.status === "unsupported"
+            ? `Managed cloudflared is unsupported on ${executable.platform}-${executable.arch}.`
+            : "cloudflared is not installed.",
+        ...(config.tunnelId ? { tunnelId: config.tunnelId } : {}),
+        ...(config.tunnelName ? { tunnelName: config.tunnelName } : {}),
+      } satisfies CloudManagedEndpointRuntimeStatus;
+    }
+
     const connectorScope = yield* Scope.make("sequential");
     const child = yield* spawner
       .spawn(
-        ChildProcess.make("cloudflared", ["tunnel", "run", "--token", config.connectorToken], {
-          shell: process.platform === "win32",
-          stderr: "ignore",
-          stdout: "ignore",
-        }),
+        ChildProcess.make(
+          executable.executablePath,
+          ["tunnel", "run", "--token", config.connectorToken],
+          {
+            detached: false,
+            shell: process.platform === "win32",
+            stderr: "ignore",
+            stdout: "ignore",
+          },
+        ),
       )
       .pipe(
         Effect.provideService(Scope.Scope, connectorScope),
@@ -209,6 +254,13 @@ export const makeCloudManagedEndpointRuntime = Effect.gen(function* () {
       ...(config.tunnelName ? { tunnelName: config.tunnelName } : {}),
     } satisfies CloudManagedEndpointRuntimeStatus;
   });
+
+  const applyConfig = Effect.fn("CloudManagedEndpointRuntime.applyConfig")(
+    (config: RelayManagedEndpointRuntimeConfig | null) =>
+      reconcileSemaphore.withPermits(1)(
+        Ref.set(desiredConfigRef, config).pipe(Effect.andThen(reconcileConfig(config))),
+      ),
+  );
 
   return CloudManagedEndpointRuntime.of({
     applyConfig,
