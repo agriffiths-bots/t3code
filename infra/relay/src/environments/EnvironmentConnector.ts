@@ -36,9 +36,10 @@ import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Redacted from "effect/Redacted";
 import * as Schema from "effect/Schema";
-import { HttpClient } from "effect/unstable/http";
+import { FetchHttpClient, HttpClient } from "effect/unstable/http";
 
 import * as EnvironmentLinks from "./EnvironmentLinks.ts";
+import * as ManagedEndpointAllocations from "./ManagedEndpointAllocations.ts";
 import * as RelayConfiguration from "../Config.ts";
 
 export class EnvironmentConnectNotAuthorized extends Data.TaggedError(
@@ -69,7 +70,8 @@ export type EnvironmentConnectorError =
   | EnvironmentMintRequestFailed
   | EnvironmentMintRequestTimedOut
   | EnvironmentMintResponseInvalid
-  | EnvironmentLinks.EnvironmentLinkLookupPersistenceError;
+  | EnvironmentLinks.EnvironmentLinkLookupPersistenceError
+  | ManagedEndpointAllocations.ManagedEndpointAllocationPersistenceError;
 
 export const ENVIRONMENT_MINT_REQUEST_TIMEOUT_MS = 10_000;
 const ENVIRONMENT_HEALTH_CLOCK_SKEW_MILLIS = 60 * 1_000;
@@ -113,6 +115,9 @@ function environmentHealthRequestFailureMessage(cause: unknown): string {
     ? `Managed endpoint health request failed: ${cause.message}`
     : "Managed endpoint health request failed.";
 }
+
+const withoutRedirects = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
+  effect.pipe(Effect.provideService(FetchHttpClient.RequestInit, { redirect: "manual" }));
 
 const verifyWithEnvironmentKeys = Effect.fnUntraced(function* <A, E>(input: {
   readonly token: string;
@@ -216,6 +221,7 @@ function verifyEnvironmentHealthResponse(input: {
 
 const make = Effect.gen(function* () {
   const links = yield* EnvironmentLinks.EnvironmentLinks;
+  const allocations = yield* ManagedEndpointAllocations.ManagedEndpointAllocations;
   const settings = yield* RelayConfiguration.RelayConfiguration;
   const httpClient = yield* HttpClient.HttpClient;
   const crypto = yield* Crypto.Crypto;
@@ -224,6 +230,38 @@ const make = Effect.gen(function* () {
     makeEnvironmentHttpApiClient(httpBaseUrl).pipe(
       Effect.provideService(HttpClient.HttpClient, httpClient),
     );
+  const resolveManagedEndpoint = Effect.fn("relay.environment_connector.resolve_managed_endpoint")(
+    function* (input: {
+      readonly userId: string;
+      readonly link: EnvironmentLinks.RelayLinkedEnvironmentRecord;
+    }) {
+      if (input.link.endpoint.providerKind !== "cloudflare_tunnel") {
+        return yield* new EnvironmentConnectNotAuthorized({
+          environmentId: input.link.environmentId,
+        });
+      }
+      const allocation = yield* allocations.get({
+        userId: input.userId,
+        environmentId: input.link.environmentId,
+      });
+      const endpoint = allocation
+        ? ManagedEndpointAllocations.resolveReadyManagedEndpoint({
+            allocation,
+            baseDomain: settings.managedEndpointBaseDomain,
+          })
+        : null;
+      if (
+        endpoint === null ||
+        endpoint.httpBaseUrl !== input.link.endpoint.httpBaseUrl ||
+        endpoint.wsBaseUrl !== input.link.endpoint.wsBaseUrl
+      ) {
+        return yield* new EnvironmentConnectNotAuthorized({
+          environmentId: input.link.environmentId,
+        });
+      }
+      return endpoint;
+    },
+  );
 
   return EnvironmentConnector.of({
     status: Effect.fn("relay.environment_connector.status")(function* (input) {
@@ -235,6 +273,7 @@ const make = Effect.gen(function* () {
       if (!link) {
         return yield* new EnvironmentConnectNotAuthorized({ environmentId: input.environmentId });
       }
+      const endpoint = yield* resolveManagedEndpoint({ userId: input.userId, link });
       const now = yield* DateTime.now;
       const expiresAt = DateTime.add(now, { minutes: 2 });
       const nonce = yield* crypto.randomUUIDv4.pipe(
@@ -259,8 +298,9 @@ const make = Effect.gen(function* () {
         payload,
       }).pipe(Effect.mapError((cause) => new EnvironmentMintRequestFailed({ cause })));
       const checkedAt = DateTime.formatIso(now);
-      const environmentClient = yield* makeEnvironmentClient(link.endpoint.httpBaseUrl);
+      const environmentClient = yield* makeEnvironmentClient(endpoint.httpBaseUrl);
       const responseOption = yield* environmentClient.cloud.health({ payload: { proof } }).pipe(
+        withoutRedirects,
         Effect.match({
           onFailure: (cause) => ({ _tag: "Failure" as const, cause }),
           onSuccess: (response) => ({ _tag: "Success" as const, response }),
@@ -270,7 +310,7 @@ const make = Effect.gen(function* () {
       if (Option.isNone(responseOption)) {
         return {
           environmentId: link.environmentId,
-          endpoint: link.endpoint,
+          endpoint,
           status: "offline" as const,
           checkedAt,
           error: "Managed endpoint health request timed out.",
@@ -279,7 +319,7 @@ const make = Effect.gen(function* () {
       if (responseOption.value._tag === "Failure") {
         return {
           environmentId: link.environmentId,
-          endpoint: link.endpoint,
+          endpoint,
           status: "offline" as const,
           checkedAt,
           error: environmentHealthRequestFailureMessage(responseOption.value.cause),
@@ -300,7 +340,7 @@ const make = Effect.gen(function* () {
       }
       return {
         environmentId: link.environmentId,
-        endpoint: link.endpoint,
+        endpoint,
         status: "online" as const,
         checkedAt: decoded.checkedAt,
         descriptor: decoded.descriptor,
@@ -320,6 +360,7 @@ const make = Effect.gen(function* () {
       if (!link) {
         return yield* new EnvironmentConnectNotAuthorized({ environmentId: input.environmentId });
       }
+      const endpoint = yield* resolveManagedEndpoint({ userId: input.userId, link });
       const now = yield* DateTime.now;
       const expiresAt = DateTime.add(now, { minutes: 2 });
       const nonce = yield* crypto.randomUUIDv4.pipe(
@@ -346,8 +387,9 @@ const make = Effect.gen(function* () {
         typ: RELAY_MINT_REQUEST_TYP,
         payload,
       }).pipe(Effect.mapError((cause) => new EnvironmentMintRequestFailed({ cause })));
-      const environmentClient = yield* makeEnvironmentClient(link.endpoint.httpBaseUrl);
+      const environmentClient = yield* makeEnvironmentClient(endpoint.httpBaseUrl);
       const decoded = yield* environmentClient.cloud.t3MintCredential({ payload: { proof } }).pipe(
+        withoutRedirects,
         Effect.mapError((cause) => new EnvironmentMintRequestFailed({ cause })),
         Effect.timeoutOption(Duration.millis(ENVIRONMENT_MINT_REQUEST_TIMEOUT_MS)),
         Effect.flatMap(
@@ -377,7 +419,7 @@ const make = Effect.gen(function* () {
       }
       return {
         environmentId: link.environmentId,
-        endpoint: link.endpoint,
+        endpoint,
         credential: decoded.credential,
         expiresAt: decoded.expiresAt,
       };

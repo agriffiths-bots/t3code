@@ -27,6 +27,7 @@ import { HttpClient, HttpClientRequest, HttpClientResponse } from "effect/unstab
 import * as EnvironmentLinks from "./EnvironmentLinks.ts";
 import * as RelayConfiguration from "../Config.ts";
 import * as EnvironmentConnector from "./EnvironmentConnector.ts";
+import * as ManagedEndpointAllocations from "./ManagedEndpointAllocations.ts";
 
 const cloudKeyPair = NodeCrypto.generateKeyPairSync("ed25519", {
   privateKeyEncoding: { format: "pem", type: "pkcs8" },
@@ -69,7 +70,7 @@ const settings = RelayConfiguration.RelayConfiguration.of({
   clerkJwtAudience: "t3-code-relay",
   cloudMintPrivateKey: Redacted.make(cloudKeyPair.privateKey),
   cloudMintPublicKey: cloudKeyPair.publicKey,
-  managedEndpointBaseDomain: undefined,
+  managedEndpointBaseDomain: "example.test",
   managedEndpointNamespace: undefined,
 });
 
@@ -155,14 +156,42 @@ function connectorTestLayer(
   ) => Effect.Effect<HttpClientResponse.HttpClientResponse>,
   options?: {
     readonly links?: EnvironmentLinks.EnvironmentLinksShape;
+    readonly allocations?: ManagedEndpointAllocations.ManagedEndpointAllocationsShape;
   },
 ) {
   return EnvironmentConnector.layer.pipe(
     Layer.provide(NodeCryptoLayer.layer),
     Layer.provide(Layer.succeed(EnvironmentLinks.EnvironmentLinks, options?.links ?? makeLinks())),
+    Layer.provide(
+      Layer.succeed(
+        ManagedEndpointAllocations.ManagedEndpointAllocations,
+        options?.allocations ?? makeAllocations(),
+      ),
+    ),
     Layer.provide(Layer.succeed(RelayConfiguration.RelayConfiguration, settings)),
     Layer.provide(Layer.succeed(HttpClient.HttpClient, HttpClient.make(execute))),
   );
+}
+
+function makeAllocations(
+  allocation: ManagedEndpointAllocations.ManagedEndpointAllocation | null = {
+    userId: "user_123",
+    environmentId: "env-connector-test",
+    hostname: "env.example.test",
+    tunnelId: "tunnel-id",
+    tunnelName: "tunnel-name",
+    dnsRecordId: "dns-record-id",
+    readyAt: "2026-05-25T00:00:00.000Z",
+  },
+): ManagedEndpointAllocations.ManagedEndpointAllocationsShape {
+  return {
+    get: () => Effect.succeed(allocation),
+    reserve: () => Effect.die("unused"),
+    recordTunnel: () => Effect.die("unused"),
+    recordDns: () => Effect.die("unused"),
+    markReady: () => Effect.die("unused"),
+    remove: () => Effect.die("unused"),
+  };
 }
 
 function makeLinks(
@@ -180,8 +209,8 @@ function makeLinks(
         label: "Connector Test Environment",
         endpoint: {
           httpBaseUrl: "https://env.example.test/",
-          wsBaseUrl: "wss://env.example.test/",
-          providerKind: "manual",
+          wsBaseUrl: "wss://env.example.test/ws",
+          providerKind: "cloudflare_tunnel",
         },
         linkedAt: "2026-05-25T00:00:00.000Z",
         environmentPublicKey: environmentKeyPair.publicKey,
@@ -230,6 +259,120 @@ describe("EnvironmentConnector", () => {
         },
       });
     }).pipe(Effect.provide(connectorTestLayer(execute)));
+  });
+
+  it.effect("rejects manual endpoints before sending a health request", () => {
+    let requestCount = 0;
+    const execute = () =>
+      Effect.sync(() => {
+        requestCount += 1;
+        throw new Error("unexpected request");
+      });
+
+    return Effect.gen(function* () {
+      const connector = yield* EnvironmentConnector.EnvironmentConnector;
+      const result = yield* Effect.result(
+        connector.status({
+          userId: "user_123",
+          environmentId: "env-connector-test",
+        }),
+      );
+
+      expect(Result.isFailure(result)).toBe(true);
+      if (Result.isFailure(result)) {
+        expect(result.failure).toBeInstanceOf(EnvironmentConnector.EnvironmentConnectNotAuthorized);
+      }
+      expect(requestCount).toBe(0);
+    }).pipe(
+      Effect.provide(
+        connectorTestLayer(execute, {
+          links: makeLinks({
+            endpoint: {
+              httpBaseUrl: "https://127.0.0.1/",
+              wsBaseUrl: "wss://127.0.0.1/ws",
+              providerKind: "manual",
+            },
+          }),
+        }),
+      ),
+    );
+  });
+
+  it.effect("rejects stale managed endpoints before sending a mint request", () => {
+    let requestCount = 0;
+    const execute = () =>
+      Effect.sync(() => {
+        requestCount += 1;
+        throw new Error("unexpected request");
+      });
+
+    return Effect.gen(function* () {
+      const connector = yield* EnvironmentConnector.EnvironmentConnector;
+      const result = yield* Effect.result(
+        connector.connect({
+          userId: "user_123",
+          environmentId: "env-connector-test",
+          clientProofKeyThumbprint: "client-proof-key-thumbprint",
+        }),
+      );
+
+      expect(Result.isFailure(result)).toBe(true);
+      if (Result.isFailure(result)) {
+        expect(result.failure).toBeInstanceOf(EnvironmentConnector.EnvironmentConnectNotAuthorized);
+      }
+      expect(requestCount).toBe(0);
+    }).pipe(
+      Effect.provide(
+        connectorTestLayer(execute, {
+          links: makeLinks({
+            endpoint: {
+              httpBaseUrl: "https://attacker.example.test/",
+              wsBaseUrl: "wss://attacker.example.test/ws",
+              providerKind: "cloudflare_tunnel",
+            },
+          }),
+        }),
+      ),
+    );
+  });
+
+  it.effect("rejects unready managed endpoint allocations before sending a request", () => {
+    let requestCount = 0;
+    const execute = () =>
+      Effect.sync(() => {
+        requestCount += 1;
+        throw new Error("unexpected request");
+      });
+
+    return Effect.gen(function* () {
+      const connector = yield* EnvironmentConnector.EnvironmentConnector;
+      const result = yield* Effect.result(
+        connector.status({
+          userId: "user_123",
+          environmentId: "env-connector-test",
+        }),
+      );
+
+      expect(Result.isFailure(result)).toBe(true);
+      if (Result.isFailure(result)) {
+        expect(result.failure).toBeInstanceOf(EnvironmentConnector.EnvironmentConnectNotAuthorized);
+      }
+      expect(requestCount).toBe(0);
+    }).pipe(
+      Effect.provide(
+        connectorTestLayer(execute, {
+          allocations: makeAllocations({
+            userId: "user_123",
+            environmentId: "env-connector-test",
+            hostname: "env.example.test",
+            tunnelId: "tunnel-id",
+            tunnelName: "tunnel-name",
+            dnsRecordId: "dns-record-id",
+            readyAt: null,
+          }),
+        }),
+      ),
+    );
   });
 
   it.effect("rejects signed health responses with stale checkedAt timestamps", () => {
@@ -438,7 +581,7 @@ describe("EnvironmentConnector", () => {
         credential: "pairing_credential",
         endpoint: {
           httpBaseUrl: "https://env.example.test/",
-          wsBaseUrl: "wss://env.example.test/",
+          wsBaseUrl: "wss://env.example.test/ws",
         },
       });
     }).pipe(Effect.provide(connectorTestLayer(execute)));

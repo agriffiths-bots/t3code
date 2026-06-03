@@ -1,3 +1,5 @@
+import type { RelayManagedEndpoint } from "@t3tools/contracts/relay";
+
 const DNS_LABEL_MAX_LENGTH = 63;
 const MANAGED_ENDPOINT_HASH_LENGTH = 16;
 const MANAGED_ENDPOINT_HOST_PREFIX = "tunnels";
@@ -9,6 +11,21 @@ function normalizeZoneName(zoneName: string): string {
     .trim()
     .toLowerCase()
     .replace(/^\.+|\.+$/g, "");
+}
+
+function isDnsName(name: string): boolean {
+  return (
+    name.length > 0 &&
+    name.length <= 253 &&
+    name
+      .split(".")
+      .every(
+        (label) =>
+          label.length > 0 &&
+          label.length <= DNS_LABEL_MAX_LENGTH &&
+          /^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/u.test(label),
+      )
+  );
 }
 
 function stableSuffix(hash: string): string {
@@ -65,6 +82,25 @@ export function managedEndpointHostname(stage: string, baseDomain: string, hash:
     stableSuffix(hash),
   );
   return `${label}.${normalizeZoneName(baseDomain)}`;
+}
+
+export function isManagedEndpointHostname(hostname: string, baseDomain: string): boolean {
+  const normalizedHostname = normalizeZoneName(hostname);
+  const normalizedBaseDomain = normalizeZoneName(baseDomain);
+  return (
+    hostname === normalizedHostname &&
+    isDnsName(normalizedHostname) &&
+    isDnsName(normalizedBaseDomain) &&
+    normalizedHostname.endsWith(`.${normalizedBaseDomain}`)
+  );
+}
+
+export function managedEndpointForHostname(hostname: string): RelayManagedEndpoint {
+  return {
+    httpBaseUrl: `https://${hostname}/`,
+    wsBaseUrl: `wss://${hostname}/ws`,
+    providerKind: "cloudflare_tunnel",
+  };
 }
 
 export function managedEndpointTunnelName(stage: string, hash: string): string {

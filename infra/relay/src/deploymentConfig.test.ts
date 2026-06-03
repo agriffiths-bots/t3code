@@ -2,7 +2,9 @@ import { describe, expect, it } from "vitest";
 
 import {
   managedEndpointDigestInput,
+  managedEndpointForHostname,
   managedEndpointHostname,
+  isManagedEndpointHostname,
   managedEndpointTunnelName,
   relayOwnsManagedEndpointZone,
   relayPublicDomainForStage,
@@ -70,5 +72,22 @@ describe("managed endpoint names", () => {
 
     expect(hostname.split(".")[0]?.length).toBeLessThanOrEqual(63);
     expect(hostname).toMatch(/-a{16}\.example\.com$/);
+  });
+
+  it("accepts allocated hostnames within the relay zone", () => {
+    expect(
+      isManagedEndpointHostname("tunnels-dev-julius-abcdef0123456789.example.com", "example.com"),
+    ).toBe(true);
+    expect(managedEndpointForHostname("tunnels-dev-julius-abcdef0123456789.example.com")).toEqual({
+      httpBaseUrl: "https://tunnels-dev-julius-abcdef0123456789.example.com/",
+      wsBaseUrl: "wss://tunnels-dev-julius-abcdef0123456789.example.com/ws",
+      providerKind: "cloudflare_tunnel",
+    });
+  });
+
+  it("rejects hostnames outside the relay zone", () => {
+    expect(isManagedEndpointHostname("internal.example.net", "example.com")).toBe(false);
+    expect(isManagedEndpointHostname("example.com.attacker.test", "example.com")).toBe(false);
+    expect(isManagedEndpointHostname("tunnels-dev-julius.example.com.", "example.com")).toBe(false);
   });
 });

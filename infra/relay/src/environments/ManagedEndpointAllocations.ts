@@ -1,3 +1,4 @@
+import type { RelayManagedEndpoint } from "@t3tools/contracts/relay";
 import { and, eq } from "drizzle-orm";
 import * as Context from "effect/Context";
 import * as Data from "effect/Data";
@@ -6,6 +7,7 @@ import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 
 import { RelayDb } from "../db.ts";
+import { isManagedEndpointHostname, managedEndpointForHostname } from "../deploymentConfig.ts";
 import { relayManagedEndpointAllocations } from "../persistence/schema.ts";
 
 export interface ManagedEndpointAllocation {
@@ -16,6 +18,22 @@ export interface ManagedEndpointAllocation {
   readonly tunnelName: string;
   readonly dnsRecordId: string | null;
   readonly readyAt: string | null;
+}
+
+export function resolveReadyManagedEndpoint(input: {
+  readonly allocation: ManagedEndpointAllocation;
+  readonly baseDomain: string | undefined;
+}): RelayManagedEndpoint | null {
+  if (
+    !input.baseDomain ||
+    input.allocation.readyAt === null ||
+    input.allocation.tunnelId === null ||
+    input.allocation.dnsRecordId === null ||
+    !isManagedEndpointHostname(input.allocation.hostname, input.baseDomain)
+  ) {
+    return null;
+  }
+  return managedEndpointForHostname(input.allocation.hostname);
 }
 
 export class ManagedEndpointAllocationPersistenceError extends Data.TaggedError(

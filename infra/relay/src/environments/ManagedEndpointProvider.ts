@@ -19,6 +19,7 @@ import type {
 import * as RelayConfiguration from "../Config.ts";
 import {
   managedEndpointDigestInput,
+  managedEndpointForHostname,
   managedEndpointHostname,
   managedEndpointTunnelName,
 } from "../deploymentConfig.ts";
@@ -407,11 +408,7 @@ const make = Effect.gen(function* () {
         .pipe(Effect.mapError((cause) => new ManagedEndpointProvisioningFailed({ cause })));
 
       return {
-        endpoint: {
-          httpBaseUrl: `https://${hostname}/`,
-          wsBaseUrl: `wss://${hostname}/ws`,
-          providerKind: "cloudflare_tunnel",
-        },
+        endpoint: managedEndpointForHostname(hostname),
         runtime: {
           providerKind: "cloudflare_tunnel",
           connectorToken,
