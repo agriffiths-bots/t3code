@@ -12,12 +12,14 @@ import {
   ProviderDriverKind,
   ProviderInstanceId,
   type ServerConfig,
+  type TerminalMetadataStreamEvent,
   type ServerLifecycleWelcomePayload,
   type ThreadId,
   type TurnId,
   WS_METHODS,
   OrchestrationSessionStatus,
   DEFAULT_SERVER_SETTINGS,
+  DEFAULT_TERMINAL_ID,
   ServerConfig as ServerConfigSchema,
 } from "@t3tools/contracts";
 import { scopedThreadKey, scopeThreadRef } from "@t3tools/client-runtime";
@@ -27,8 +29,17 @@ import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 import { HttpResponse, http, ws } from "msw";
 import { setupWorker } from "msw/browser";
-import { page } from "vitest/browser";
-import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { page } from "vite-plus/test/browser";
+import {
+  afterAll,
+  afterEach,
+  beforeAll,
+  beforeEach,
+  describe,
+  expect,
+  it,
+  vi,
+} from "vite-plus/test";
 import { render } from "vitest-browser-react";
 
 import { useCommandPaletteStore } from "../commandPaletteStore";
@@ -55,19 +66,46 @@ import { getServerConfig } from "../rpc/serverState";
 import { getRouter } from "../router";
 import { deriveLogicalProjectKeyFromSettings } from "../logicalProject";
 import { selectBootstrapCompleteForActiveEnvironment, useStore } from "../store";
-import { useTerminalStateStore } from "../terminalStateStore";
+import { terminalSessionManager } from "../terminalSessionState";
+import { useTerminalUiStateStore } from "../terminalUiStateStore";
 import { useUiStateStore } from "../uiStateStore";
 import { createAuthenticatedSessionHandlers } from "../../test/authHttpHandlers";
 import { BrowserWsRpcHarness, type NormalizedWsRpcRequestBody } from "../../test/wsRpcHarness";
 
 import { DEFAULT_CLIENT_SETTINGS } from "@t3tools/contracts/settings";
 
-vi.mock("../lib/gitStatusState", () => ({
-  useGitStatus: () => ({ data: null, error: null, cause: null, isPending: false }),
-  useGitStatuses: () => new Map(),
-  refreshGitStatus: () => Promise.resolve(null),
-  resetGitStatusStateForTests: () => undefined,
-}));
+vi.mock("../lib/vcsStatusState", () => {
+  const status = {
+    data: {
+      isRepo: true,
+      sourceControlProvider: {
+        kind: "github",
+        name: "GitHub",
+        baseUrl: "https://github.com",
+      },
+      hasPrimaryRemote: true,
+      isDefaultRef: true,
+      refName: "main",
+      hasWorkingTreeChanges: false,
+      workingTree: { files: [], insertions: 0, deletions: 0 },
+      hasUpstream: true,
+      aheadCount: 0,
+      behindCount: 0,
+      pr: null,
+    },
+    error: null,
+    cause: null,
+    isPending: false,
+  };
+
+  return {
+    getVcsStatusSnapshot: () => status,
+    useVcsStatus: () => status,
+    useVcsStatuses: () => new Map(),
+    refreshVcsStatus: () => Promise.resolve(null),
+    resetVcsStatusStateForTests: () => undefined,
+  };
+});
 
 const THREAD_ID = "thread-browser-test" as ThreadId;
 const THREAD_TITLE = "Browser test thread";
@@ -101,6 +139,7 @@ interface TestFixture {
   snapshot: OrchestrationReadModel;
   serverConfig: ServerConfig;
   welcome: ServerLifecycleWelcomePayload;
+  terminalMetadataEvents: ReadonlyArray<TerminalMetadataStreamEvent>;
 }
 
 let fixture: TestFixture;
@@ -164,7 +203,7 @@ function createBaseServerConfig(): ServerConfig {
     auth: {
       policy: "loopback-browser",
       bootstrapMethods: ["one-time-token"],
-      sessionMethods: ["browser-session-cookie", "bearer-session-token"],
+      sessionMethods: ["browser-session-cookie", "bearer-access-token"],
       sessionCookieName: "t3_session",
     },
     cwd: "/repo/project",
@@ -213,6 +252,7 @@ function createMockEnvironmentApi(input: {
     sourceControl: {} as EnvironmentApi["sourceControl"],
     vcs: {} as EnvironmentApi["vcs"],
     git: {} as EnvironmentApi["git"],
+    review: {} as EnvironmentApi["review"],
     orchestration: {
       dispatchCommand: input.dispatchCommand,
       getTurnDiff: (() => {
@@ -410,6 +450,7 @@ function buildFixture(snapshot: OrchestrationReadModel): TestFixture {
       bootstrapProjectId: PROJECT_ID,
       bootstrapThreadId: THREAD_ID,
     },
+    terminalMetadataEvents: [],
   };
 }
 
@@ -1080,6 +1121,7 @@ function resolveWsRpc(body: NormalizedWsRpcRequestBody): unknown {
       history: "",
       exitCode: null,
       exitSignal: null,
+      label: "Terminal 1",
       updatedAt: NOW_ISO,
     };
   }
@@ -1703,6 +1745,9 @@ describe("ChatView timeline estimator parity (full app)", () => {
               ]
             : [];
         }
+        if (request._tag === WS_METHODS.subscribeTerminalMetadata) {
+          return fixture.terminalMetadataEvents;
+        }
         return [];
       },
     });
@@ -1736,12 +1781,9 @@ describe("ChatView timeline estimator parity (full app)", () => {
       projectOrder: [],
       threadLastVisitedAtById: {},
     });
-    useTerminalStateStore.persist.clearStorage();
-    useTerminalStateStore.setState({
-      terminalStateByThreadKey: {},
-      terminalLaunchContextByThreadKey: {},
-      terminalEventEntriesByKey: {},
-      nextTerminalEventId: 1,
+    useTerminalUiStateStore.persist.clearStorage();
+    useTerminalUiStateStore.setState({
+      terminalUiStateByThreadKey: {},
     });
   });
 
@@ -1918,22 +1960,15 @@ describe("ChatView timeline estimator parity (full app)", () => {
       });
     }
 
-    useTerminalStateStore.setState({
-      terminalStateByThreadKey: {
+    useTerminalUiStateStore.setState({
+      terminalUiStateByThreadKey: {
         [THREAD_KEY]: {
           terminalOpen: true,
           terminalHeight: 280,
           terminalIds: ["default"],
-          runningTerminalIds: [],
           activeTerminalId: "default",
           terminalGroups: [{ id: "group-default", terminalIds: ["default"] }],
           activeTerminalGroupId: "group-default",
-        },
-      },
-      terminalLaunchContextByThreadKey: {
-        [THREAD_KEY]: {
-          cwd: "/repo/project",
-          worktreePath: null,
         },
       },
     });
@@ -1941,14 +1976,34 @@ describe("ChatView timeline estimator parity (full app)", () => {
     const mounted = await mountChatView({
       viewport: DEFAULT_VIEWPORT,
       snapshot,
+      configureFixture: (nextFixture) => {
+        nextFixture.terminalMetadataEvents = [
+          {
+            type: "upsert",
+            terminal: {
+              threadId: THREAD_ID,
+              terminalId: DEFAULT_TERMINAL_ID,
+              cwd: "/repo/project",
+              worktreePath: null,
+              status: "running",
+              pid: 123,
+              exitCode: null,
+              exitSignal: null,
+              hasRunningSubprocess: false,
+              label: "Terminal 1",
+              updatedAt: isoAt(0),
+            },
+          },
+        ];
+      },
     });
 
     try {
       await vi.waitFor(
         () => {
-          const openRequest = wsRequests.find(
-            (request) => request._tag === WS_METHODS.terminalOpen,
-          ) as
+          const attachRequest = wsRequests
+            .toReversed()
+            .find((request) => request._tag === WS_METHODS.terminalAttach) as
             | {
                 _tag: string;
                 cwd?: string;
@@ -1956,15 +2011,51 @@ describe("ChatView timeline estimator parity (full app)", () => {
                 env?: Record<string, string>;
               }
             | undefined;
-          expect(openRequest).toMatchObject({
-            _tag: WS_METHODS.terminalOpen,
+          expect(attachRequest).toMatchObject({
+            _tag: WS_METHODS.terminalAttach,
             cwd: "/repo/project",
             worktreePath: null,
             env: {
               T3CODE_PROJECT_ROOT: "/repo/project",
             },
           });
-          expect(openRequest?.env?.T3CODE_WORKTREE_PATH).toBeUndefined();
+          expect(attachRequest?.env?.T3CODE_WORKTREE_PATH).toBeUndefined();
+        },
+        { timeout: 8_000, interval: 16 },
+      );
+    } finally {
+      await mounted.cleanup();
+    }
+  });
+
+  it("attaches the default terminal when opening an empty terminal drawer", async () => {
+    const mounted = await mountChatView({
+      viewport: DEFAULT_VIEWPORT,
+      snapshot: createSnapshotForTargetUser({
+        targetMessageId: "msg-user-open-empty-terminal-drawer" as MessageId,
+        targetText: "open empty terminal drawer",
+      }),
+    });
+
+    try {
+      const toggle = await waitForElement(
+        () =>
+          document.querySelector<HTMLButtonElement>('button[aria-label="Toggle terminal drawer"]'),
+        "Unable to find terminal drawer toggle.",
+      );
+      toggle.click();
+
+      await vi.waitFor(
+        () => {
+          const attachRequest = wsRequests.find(
+            (request) => request._tag === WS_METHODS.terminalAttach,
+          );
+          expect(attachRequest).toMatchObject({
+            _tag: WS_METHODS.terminalAttach,
+            threadId: THREAD_ID,
+            terminalId: DEFAULT_TERMINAL_ID,
+            cwd: "/repo/project",
+          });
         },
         { timeout: 8_000, interval: 16 },
       );
@@ -2262,7 +2353,7 @@ describe("ChatView timeline estimator parity (full app)", () => {
       const runButton = await waitForElement(
         () =>
           Array.from(document.querySelectorAll("button")).find(
-            (button) => button.title === "Run Lint",
+            (button) => button.getAttribute("aria-label") === "Run Lint",
           ) as HTMLButtonElement | null,
         "Unable to find Run Lint button.",
       );
@@ -2341,7 +2432,7 @@ describe("ChatView timeline estimator parity (full app)", () => {
       const runButton = await waitForElement(
         () =>
           Array.from(document.querySelectorAll("button")).find(
-            (button) => button.title === "Run Test",
+            (button) => button.getAttribute("aria-label") === "Run Test",
           ) as HTMLButtonElement | null,
         "Unable to find Run Test button.",
       );
@@ -2495,8 +2586,8 @@ describe("ChatView timeline estimator parity (full app)", () => {
   });
 
   it("sends bootstrap turn-starts and waits for server setup on first-send worktree drafts", async () => {
-    useTerminalStateStore.setState({
-      terminalStateByThreadKey: {},
+    useTerminalUiStateStore.setState({
+      terminalUiStateByThreadKey: {},
     });
     useComposerDraftStore.setState({
       draftThreadsByThreadKey: {
@@ -2999,8 +3090,8 @@ describe("ChatView timeline estimator parity (full app)", () => {
   });
 
   it("shows the send state once bootstrap dispatch is in flight", async () => {
-    useTerminalStateStore.setState({
-      terminalStateByThreadKey: {},
+    useTerminalUiStateStore.setState({
+      terminalUiStateByThreadKey: {},
     });
     useComposerDraftStore.setState({
       draftThreadsByThreadKey: {
@@ -3081,7 +3172,8 @@ describe("ChatView timeline estimator parity (full app)", () => {
 
     try {
       const initialModeButton = await waitForInteractionModeButton("Build");
-      expect(initialModeButton.title).toContain("enter plan mode");
+      expect(initialModeButton.getAttribute("aria-label")).toContain("enter plan mode");
+      expect(initialModeButton.hasAttribute("title")).toBe(false);
 
       window.dispatchEvent(
         new KeyboardEvent("keydown", {
@@ -3093,7 +3185,9 @@ describe("ChatView timeline estimator parity (full app)", () => {
       );
       await waitForLayout();
 
-      expect((await waitForInteractionModeButton("Build")).title).toContain("enter plan mode");
+      expect((await waitForInteractionModeButton("Build")).getAttribute("aria-label")).toContain(
+        "enter plan mode",
+      );
 
       const composerEditor = await waitForComposerEditor();
       composerEditor.focus();
@@ -3108,7 +3202,7 @@ describe("ChatView timeline estimator parity (full app)", () => {
 
       await vi.waitFor(
         async () => {
-          expect((await waitForInteractionModeButton("Plan")).title).toContain(
+          expect((await waitForInteractionModeButton("Plan")).getAttribute("aria-label")).toContain(
             "return to normal build mode",
           );
         },
@@ -3126,7 +3220,9 @@ describe("ChatView timeline estimator parity (full app)", () => {
 
       await vi.waitFor(
         async () => {
-          expect((await waitForInteractionModeButton("Build")).title).toContain("enter plan mode");
+          expect(
+            (await waitForInteractionModeButton("Build")).getAttribute("aria-label"),
+          ).toContain("enter plan mode");
         },
         { timeout: 8_000, interval: 16 },
       );
@@ -3508,13 +3604,13 @@ describe("ChatView timeline estimator parity (full app)", () => {
         },
         { timeout: 8_000, interval: 16 },
       );
-      await waitForComposerText("hi @package.json there");
+      await waitForComposerText("hi [package.json](package.json) there");
       await setComposerSelectionByTextOffsets({
         start: "hi package.json ".length,
         end: "hi package.json there".length,
       });
       await pressComposerKey("(");
-      await waitForComposerText("hi @package.json (there)");
+      await waitForComposerText("hi [package.json](package.json) (there)");
     } finally {
       await mounted.cleanup();
     }
@@ -3541,6 +3637,47 @@ describe("ChatView timeline estimator parity (full app)", () => {
       await selectAllComposerContent();
       await pressComposerKey("(");
       await waitForComposerText("(");
+    } finally {
+      await mounted.cleanup();
+    }
+  });
+
+  it("stores selected file tags as markdown links while keeping the composer chip", async () => {
+    useComposerDraftStore.getState().setPrompt(THREAD_REF, "@pack");
+
+    const mounted = await mountChatView({
+      viewport: DEFAULT_VIEWPORT,
+      snapshot: createSnapshotForTargetUser({
+        targetMessageId: "msg-user-file-tag-encoding" as MessageId,
+        targetText: "file tag encoding",
+      }),
+      resolveRpc: (body) => {
+        if (body._tag !== WS_METHODS.projectsSearchEntries) {
+          return undefined;
+        }
+        return {
+          entries: [
+            {
+              path: "path/to/package.json",
+              kind: "file",
+              parentPath: "path/to",
+            },
+          ],
+          truncated: false,
+        };
+      },
+    });
+
+    try {
+      const item = await waitForComposerMenuItem("path:file:path/to/package.json");
+      item.click();
+
+      await waitForComposerText("[package.json](path/to/package.json) ");
+      const chip = await waitForElement(
+        () => document.querySelector<HTMLElement>('[data-composer-mention-chip="true"]'),
+        "Unable to find rendered composer file chip.",
+      );
+      expect(chip.textContent).toContain("package.json");
     } finally {
       await mounted.cleanup();
     }
@@ -3815,6 +3952,68 @@ describe("ChatView timeline estimator parity (full app)", () => {
           const tooltip = document.querySelector<HTMLElement>('[data-slot="tooltip-popup"]');
           expect(tooltip).not.toBeNull();
           expect(tooltip?.textContent).toContain(THREAD_TITLE);
+        },
+        { timeout: 8_000, interval: 16 },
+      );
+    } finally {
+      await mounted.cleanup();
+    }
+  });
+
+  it("shows the sidebar terminal indicator from terminal metadata activity", async () => {
+    const mounted = await mountChatView({
+      viewport: DEFAULT_VIEWPORT,
+      snapshot: createSnapshotForTargetUser({
+        targetMessageId: "msg-user-terminal-metadata-indicator" as MessageId,
+        targetText: "terminal metadata indicator target",
+      }),
+      configureFixture: (nextFixture) => {
+        nextFixture.terminalMetadataEvents = [
+          {
+            type: "upsert",
+            terminal: {
+              threadId: THREAD_ID,
+              terminalId: DEFAULT_TERMINAL_ID,
+              cwd: "/repo/project",
+              worktreePath: null,
+              status: "running",
+              pid: 123,
+              exitCode: null,
+              exitSignal: null,
+              hasRunningSubprocess: true,
+              label: "Terminal 1",
+              updatedAt: isoAt(1_200),
+            },
+          },
+        ];
+      },
+    });
+
+    try {
+      await vi.waitFor(
+        () => {
+          expect(
+            terminalSessionManager.listSessions({
+              environmentId: LOCAL_ENVIRONMENT_ID,
+              threadId: THREAD_ID,
+            }),
+          ).toMatchObject([
+            {
+              state: {
+                hasRunningSubprocess: true,
+              },
+            },
+          ]);
+        },
+        { timeout: 8_000, interval: 16 },
+      );
+
+      await vi.waitFor(
+        () => {
+          const terminalIndicator = document.querySelector<HTMLElement>(
+            '[aria-label="Terminal process running"]',
+          );
+          expect(terminalIndicator).not.toBeNull();
         },
         { timeout: 8_000, interval: 16 },
       );
