@@ -9,6 +9,15 @@ For browser work, first call \`preview_status\`. If no automation-capable previe
 Do not switch to global browser skills, Chrome, Node REPL browser automation, standalone Playwright, or agent-browser merely because the preview is initially closed or a first call fails. Use an alternative browser system only when the T3 preview tools are absent, the user explicitly requests another browser, or \`preview_open\` returns an explicit unsupported/unavailable error. A failed T3 preview tool call should be inspected and retried with corrected arguments when the error is actionable.
 `;
 
+const T3_CODE_THREAD_TOOL_INSTRUCTIONS = `
+
+## T3 Code child threads
+
+When the \`t3-code\` MCP server exposes \`t3_thread_start\`, use it only when the user explicitly asks you to start/spawn/create another T3 Code thread or agent. Do not use it for autonomous delegation, parallel investigation, or background work unless the user's request clearly asks for a separate thread/agent.
+
+The tool always starts the child thread's first turn immediately and returns launch metadata only; it does not wait for child completion. Defaults inherit model/options/runtime/interaction mode from the current thread. Omitted \`mode\` means \`new_worktree\`. Use \`existing_worktree\` only when the user or context names the worktree. Use \`current_checkout\` only when the user explicitly asks for the same checkout; report the returned warning/thread id/path to the user.
+`;
+
 export const CODEX_PLAN_MODE_DEVELOPER_INSTRUCTIONS = `<collaboration_mode># Plan Mode (Conversational)
 
 You work in 3 phases, and you should *chat your way* to a great plan before finalizing it. A great plan is very detailed-intent- and implementation-wise-so that it can be handed to another engineer or agent to be implemented right away. It must be **decision complete**, where the implementer does not need to make any decisions.
@@ -130,6 +139,7 @@ Do not ask "should I proceed?" in the final output. The user can easily switch o
 
 Only produce at most one \`<proposed_plan>\` block per turn, and only when you are presenting a complete spec.
 ${T3_CODE_BROWSER_TOOL_INSTRUCTIONS}
+${T3_CODE_THREAD_TOOL_INSTRUCTIONS}
 </collaboration_mode>`;
 
 export const CODEX_DEFAULT_MODE_DEVELOPER_INSTRUCTIONS = `<collaboration_mode># Collaboration Mode: Default
@@ -144,4 +154,5 @@ The \`request_user_input\` tool is unavailable in Default mode. If you call it w
 
 In Default mode, strongly prefer making reasonable assumptions and executing the user's request rather than stopping to ask questions. If you absolutely must ask a question because the answer cannot be discovered from local context and a reasonable assumption would be risky, ask the user directly with a concise plain-text question. Never write a multiple choice question as a textual assistant message.
 ${T3_CODE_BROWSER_TOOL_INSTRUCTIONS}
+${T3_CODE_THREAD_TOOL_INSTRUCTIONS}
 </collaboration_mode>`;
