@@ -3,7 +3,7 @@ import { PreviewAutomationUnavailableError } from "@t3tools/contracts";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 
-export type McpCapability = "preview";
+export type McpCapability = "preview" | "orchestration";
 
 export interface McpInvocationScope {
   readonly environmentId: EnvironmentId;
