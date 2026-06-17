@@ -612,6 +612,7 @@ const makeOrchestrationProjectionPipeline = Effect.fn("makeOrchestrationProjecti
             pendingUserInputCount: 0,
             hasActionableProposedPlan: 0,
             deletedAt: null,
+            parentThreadId: null,
           });
           return;
 
@@ -799,6 +800,22 @@ const makeOrchestrationProjectionPipeline = Effect.fn("makeOrchestrationProjecti
             updatedAt: event.occurredAt,
           });
           yield* refreshThreadShellSummary(event.payload.threadId);
+          return;
+        }
+
+        case "thread.parent-set": {
+          const existingRow = yield* projectionThreadRepository.getById({
+            threadId: event.payload.threadId,
+          });
+          if (Option.isNone(existingRow)) {
+            return;
+          }
+          // Idempotent: replaying re-applies the same parentThreadId.
+          yield* projectionThreadRepository.upsert({
+            ...existingRow.value,
+            parentThreadId: event.payload.parentThreadId,
+            updatedAt: event.occurredAt,
+          });
           return;
         }
 

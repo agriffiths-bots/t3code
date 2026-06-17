@@ -407,6 +407,7 @@ export const OrchestrationThreadShell = Schema.Struct({
   hasPendingApprovals: Schema.Boolean,
   hasPendingUserInput: Schema.Boolean,
   hasActionableProposedPlan: Schema.Boolean,
+  parentThreadId: Schema.NullOr(ThreadId),
 });
 export type OrchestrationThreadShell = typeof OrchestrationThreadShell.Type;
 
@@ -548,6 +549,16 @@ const ThreadInteractionModeSetCommand = Schema.Struct({
   threadId: ThreadId,
   interactionMode: ProviderInteractionMode,
   createdAt: IsoDateTime,
+});
+
+// Note: command type uses dots ("thread.parent.set"); the resulting event type
+// uses hyphens ("thread.parent-set"), matching the codebase command/event convention.
+const ThreadParentSetCommand = Schema.Struct({
+  type: Schema.Literal("thread.parent.set"),
+  commandId: CommandId,
+  threadId: ThreadId,
+  parentThreadId: ThreadId,
+  createdAt: Schema.optional(IsoDateTime),
 });
 
 const ThreadTurnStartBootstrapCreateThread = Schema.Struct({
@@ -771,6 +782,7 @@ const InternalOrchestrationCommand = Schema.Union([
   ThreadTurnDiffCompleteCommand,
   ThreadActivityAppendCommand,
   ThreadRevertCompleteCommand,
+  ThreadParentSetCommand,
 ]);
 export type InternalOrchestrationCommand = typeof InternalOrchestrationCommand.Type;
 
@@ -803,6 +815,7 @@ export const OrchestrationEventType = Schema.Literals([
   "thread.proposed-plan-upserted",
   "thread.turn-diff-completed",
   "thread.activity-appended",
+  "thread.parent-set",
 ]);
 export type OrchestrationEventType = typeof OrchestrationEventType.Type;
 
@@ -977,6 +990,12 @@ export const ThreadActivityAppendedPayload = Schema.Struct({
   activity: OrchestrationThreadActivity,
 });
 
+export const ThreadParentSetPayload = Schema.Struct({
+  threadId: ThreadId,
+  parentThreadId: ThreadId,
+  updatedAt: IsoDateTime,
+});
+
 export const OrchestrationEventMetadata = Schema.Struct({
   providerTurnId: Schema.optional(TrimmedNonEmptyString),
   providerItemId: Schema.optional(ProviderItemId),
@@ -1108,6 +1127,11 @@ export const OrchestrationEvent = Schema.Union([
     ...EventBaseFields,
     type: Schema.Literal("thread.activity-appended"),
     payload: ThreadActivityAppendedPayload,
+  }),
+  Schema.Struct({
+    ...EventBaseFields,
+    type: Schema.Literal("thread.parent-set"),
+    payload: ThreadParentSetPayload,
   }),
 ]);
 export type OrchestrationEvent = typeof OrchestrationEvent.Type;

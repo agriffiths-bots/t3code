@@ -41,6 +41,7 @@ export const ProjectionThread = Schema.Struct({
   pendingUserInputCount: NonNegativeInt,
   hasActionableProposedPlan: NonNegativeInt,
   deletedAt: Schema.NullOr(IsoDateTime),
+  parentThreadId: Schema.NullOr(ThreadId),
 });
 export type ProjectionThread = typeof ProjectionThread.Type;
 

@@ -67,6 +67,7 @@ async function createOrchestrationSystem() {
   const snapshotQuery = await runtime.runPromise(Effect.service(ProjectionSnapshotQuery));
   return {
     engine,
+    snapshotQuery,
     readModel: () => runtime.runPromise(snapshotQuery.getSnapshot()),
     run: <A, E>(effect: Effect.Effect<A, E>) => runtime.runPromise(effect),
     dispose: () => runtime.dispose(),
@@ -353,6 +354,86 @@ describe("OrchestrationEngine", () => {
       (await system.readModel()).threads.find((thread) => thread.id === "thread-archive")
         ?.archivedAt,
     ).toBeNull();
+
+    await system.dispose();
+  });
+
+  it("links a child thread to its parent through thread.parent.set", async () => {
+    const system = await createOrchestrationSystem();
+    const { engine } = system;
+    const createdAt = now();
+
+    await system.run(
+      engine.dispatch({
+        type: "project.create",
+        commandId: CommandId.make("cmd-project-parent-create"),
+        projectId: asProjectId("project-parent"),
+        title: "Project Parent",
+        workspaceRoot: "/tmp/project-parent",
+        defaultModelSelection: {
+          instanceId: ProviderInstanceId.make("codex"),
+          model: "gpt-5-codex",
+        },
+        createdAt,
+      }),
+    );
+    await system.run(
+      engine.dispatch({
+        type: "thread.create",
+        commandId: CommandId.make("cmd-thread-parent-create"),
+        threadId: ThreadId.make("thread-parent"),
+        projectId: asProjectId("project-parent"),
+        title: "Parent",
+        modelSelection: {
+          instanceId: ProviderInstanceId.make("codex"),
+          model: "gpt-5-codex",
+        },
+        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+        runtimeMode: "full-access",
+        branch: null,
+        worktreePath: null,
+        createdAt,
+      }),
+    );
+    await system.run(
+      engine.dispatch({
+        type: "thread.create",
+        commandId: CommandId.make("cmd-thread-child-create"),
+        threadId: ThreadId.make("thread-child"),
+        projectId: asProjectId("project-parent"),
+        title: "Child",
+        modelSelection: {
+          instanceId: ProviderInstanceId.make("codex"),
+          model: "gpt-5-codex",
+        },
+        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+        runtimeMode: "full-access",
+        branch: null,
+        worktreePath: null,
+        createdAt,
+      }),
+    );
+
+    await system.run(
+      engine.dispatch({
+        type: "thread.parent.set",
+        commandId: CommandId.make("cmd-thread-parent-set"),
+        threadId: ThreadId.make("thread-child"),
+        parentThreadId: ThreadId.make("thread-parent"),
+      }),
+    );
+
+    const shellSnapshot = await system.run(system.snapshotQuery.getShellSnapshot());
+    const childRow = shellSnapshot.threads.find((thread) => thread.id === "thread-child");
+    expect(childRow?.parentThreadId).toBe("thread-parent");
+
+    const childShell = await system.run(
+      system.snapshotQuery.getThreadShellById(ThreadId.make("thread-child")),
+    );
+    expect(Option.isSome(childShell)).toBe(true);
+    if (Option.isSome(childShell)) {
+      expect(childShell.value.parentThreadId).toBe("thread-parent");
+    }
 
     await system.dispose();
   });

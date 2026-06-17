@@ -77,6 +77,19 @@ it.effect("builds MCP endpoints from the bound server host", () =>
   }),
 );
 
+it.effect("issues the thread-management capability so sub-agent tools stay authorized", () =>
+  Effect.gen(function* () {
+    const registry = yield* makeRegistry(() => 1_000);
+    const issued = yield* registry.issue({
+      threadId: ThreadId.make("thread-subagent"),
+      providerInstanceId: ProviderInstanceId.make("claude"),
+    });
+    const token = issued.config.authorizationHeader.replace(/^Bearer\s+/, "");
+    const resolved = yield* registry.resolve(token);
+    expect(resolved?.capabilities.has("thread-management")).toBe(true);
+  }),
+);
+
 it.effect("expires credentials after inactivity", () =>
   Effect.gen(function* () {
     let timestamp = 1_000;
