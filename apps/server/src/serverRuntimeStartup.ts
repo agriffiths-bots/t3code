@@ -35,6 +35,7 @@ import * as ServerEnvironment from "./environment/ServerEnvironment.ts";
 import * as EnvironmentAuth from "./auth/EnvironmentAuth.ts";
 import * as ProviderSessionReaper from "./provider/Services/ProviderSessionReaper.ts";
 import * as ChildThreadCoordinator from "./orchestration/Services/ChildThreadCoordinator.ts";
+import * as ScheduledTasksReactor from "./orchestration/Services/ScheduledTasksReactor.ts";
 import {
   formatHeadlessServeOutput,
   formatHostForUrl,
@@ -295,6 +296,7 @@ export const make = Effect.gen(function* () {
   const orchestrationReactor = yield* OrchestrationReactor.OrchestrationReactor;
   const providerSessionReaper = yield* ProviderSessionReaper.ProviderSessionReaper;
   const childThreadCoordinator = yield* ChildThreadCoordinator.ChildThreadCoordinator;
+  const scheduledTasksReactor = yield* ScheduledTasksReactor.ScheduledTasksReactor;
   const lifecycleEvents = yield* ServerLifecycleEvents.ServerLifecycleEvents;
   const serverSettings = yield* ServerSettings.ServerSettingsService;
   const serverEnvironment = yield* ServerEnvironment.ServerEnvironment;
@@ -348,6 +350,7 @@ export const make = Effect.gen(function* () {
         // Reconcile from the persisted log + fork the hot stream BEFORE any MCP
         // endpoint is live, closing the hot-subscribe race (finalPlan §5/§8).
         yield* childThreadCoordinator.start().pipe(Scope.provide(reactorScope));
+        yield* scheduledTasksReactor.start().pipe(Scope.provide(reactorScope));
       }),
     );
 

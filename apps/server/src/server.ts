@@ -44,12 +44,15 @@ import * as GitManager from "./git/GitManager.ts";
 import * as Keybindings from "./keybindings.ts";
 import * as ServerRuntimeStartup from "./serverRuntimeStartup.ts";
 import { ThreadStartRuntimeLive } from "./mcp/toolkits/thread/handlers.ts";
+import { SubagentRuntimeLive } from "./mcp/toolkits/subagent/handlers.ts";
+import { ScheduledTaskRepositoryLive } from "./persistence/Layers/ScheduledTasks.ts";
 import { OrchestrationReactorLive } from "./orchestration/Layers/OrchestrationReactor.ts";
 import { RuntimeReceiptBusLive } from "./orchestration/Layers/RuntimeReceiptBus.ts";
 import { ProviderRuntimeIngestionLive } from "./orchestration/Layers/ProviderRuntimeIngestion.ts";
 import { ProviderCommandReactorLive } from "./orchestration/Layers/ProviderCommandReactor.ts";
 import { CheckpointReactorLive } from "./orchestration/Layers/CheckpointReactor.ts";
 import { ThreadDeletionReactorLive } from "./orchestration/Layers/ThreadDeletionReactor.ts";
+import { ScheduledTasksReactorLive } from "./orchestration/Layers/ScheduledTasksReactor.ts";
 import {
   ActiveChildThreadCoordinatorLive,
   ChildThreadCoordinatorLive,
@@ -168,6 +171,12 @@ const ReactorLayerLive = Layer.empty.pipe(
   Layer.provideMerge(ProviderCommandReactorLive),
   Layer.provideMerge(CheckpointReactorLive),
   Layer.provideMerge(ThreadDeletionReactorLive),
+  Layer.provideMerge(
+    ScheduledTasksReactorLive.pipe(
+      Layer.provide(BootstrapTurnStartDispatcher.layer),
+      Layer.provide(ScheduledTaskRepositoryLive),
+    ),
+  ),
   Layer.provideMerge(ChildThreadCoordinatorLive),
   Layer.provideMerge(AgentAwarenessRelay.layer.pipe(Layer.provide(ServerSecretStore.layer))),
   Layer.provideMerge(RuntimeReceiptBusLive),
@@ -359,6 +368,7 @@ const ServerApplicationRegistrationsLive = Layer.mergeAll(
   ),
   ThreadStartRuntimeLive,
   ActiveChildThreadCoordinatorLive.pipe(Layer.provide(ChildThreadCoordinatorLive)),
+  SubagentRuntimeLive.pipe(Layer.provide(ScheduledTaskRepositoryLive)),
 );
 
 export const makeRoutesLayer = Layer.mergeAll(

@@ -784,6 +784,10 @@ const make = Effect.gen(function* () {
           worker.enqueue(event),
         ),
       );
+
+      yield* Effect.logInfo("child.thread.coordinator.reactor.started", {
+        reconciledChildren: knownChildIds.size,
+      });
     },
   );
 

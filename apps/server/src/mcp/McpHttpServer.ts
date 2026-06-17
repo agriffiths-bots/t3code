@@ -24,6 +24,8 @@ import {
 } from "./toolkits/preview/tools.ts";
 import { ThreadToolkitHandlersLive } from "./toolkits/thread/handlers.ts";
 import { ThreadToolkit } from "./toolkits/thread/tools.ts";
+import { SubagentToolkitHandlersLive } from "./toolkits/subagent/handlers.ts";
+import { SubagentToolkit } from "./toolkits/subagent/tools.ts";
 
 const unauthorized = HttpServerResponse.jsonUnsafe(
   {
@@ -214,6 +216,10 @@ export const ThreadToolkitRegistrationLive = McpServer.toolkit(ThreadToolkit).pi
   Layer.provide(ThreadToolkitHandlersLive),
 );
 
+export const SubagentToolkitRegistrationLive = McpServer.toolkit(SubagentToolkit).pipe(
+  Layer.provide(SubagentToolkitHandlersLive),
+);
+
 const McpTransportLive = McpServer.layerHttp({
   name: "T3 Code",
   version: packageJson.version,
@@ -223,6 +229,7 @@ const McpTransportLive = McpServer.layerHttp({
 export const ToolkitRegistrationLive = Layer.mergeAll(
   PreviewToolkitRegistrationLive,
   ThreadToolkitRegistrationLive,
+  SubagentToolkitRegistrationLive,
 );
 
 export const layer = ToolkitRegistrationLive.pipe(Layer.provideMerge(McpTransportLive));

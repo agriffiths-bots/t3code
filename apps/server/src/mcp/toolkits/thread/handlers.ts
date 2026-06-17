@@ -49,12 +49,16 @@ const resolveOption = <A>(
 const bytesToHex = (bytes: Uint8Array): string =>
   Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
 
-type ActiveThreadStartRuntime = (
+export type ActiveThreadStartRuntime = (
   input: ThreadStartToolInput,
   invocation: McpInvocationContext.McpInvocationScope,
 ) => Effect.Effect<ThreadStartToolOutput, ThreadStartToolError>;
 
 let activeThreadStartRuntime: ActiveThreadStartRuntime | null = null;
+
+/** Reach the live thread-start runtime from sub-agent tool handlers (mirrors `dispatchActive`). */
+export const activeThreadStartRuntimeOf = (): ActiveThreadStartRuntime | null =>
+  activeThreadStartRuntime;
 
 const makeActiveThreadStartRuntime = Effect.fn("ThreadToolkit.makeActiveRuntime")(function* () {
   const crypto = yield* Crypto.Crypto;
