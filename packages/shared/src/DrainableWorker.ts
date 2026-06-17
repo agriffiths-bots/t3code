@@ -60,10 +60,11 @@ export const makeDrainableWorker = <A, E, R>(
       Effect.tx,
     );
 
-    const enqueue = (element: A): Effect.Effect<boolean, never, never> =>
+    const enqueue = (element: A): Effect.Effect<void> =>
       TxQueue.offer(queue, element).pipe(
         Effect.tap(() => TxRef.update(outstanding, (n) => n + 1)),
         Effect.tx,
+        Effect.asVoid,
       );
 
     return { enqueue, drain } satisfies DrainableWorker<A>;
