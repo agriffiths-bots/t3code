@@ -37,6 +37,10 @@ T3 Code runs as a **Node.js WebSocket server** that wraps `codex app-server` (JS
 
 - **Runtime signals**: The server emits lightweight typed receipts when important async milestones finish, such as checkpoint capture, diff finalization, or a turn becoming fully quiescent. Tests and orchestration code wait on these signals instead of polling internal state.
 
+Related design:
+
+- [Resource telemetry architecture](./resource-telemetry.md)
+
 ## Event Lifecycle
 
 ### Startup and client connect

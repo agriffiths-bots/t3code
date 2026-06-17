@@ -27,6 +27,7 @@ import {
 import * as DesktopBackendConfiguration from "./DesktopBackendConfiguration.ts";
 import * as DesktopObservability from "../app/DesktopObservability.ts";
 import * as DesktopState from "../app/DesktopState.ts";
+import * as DesktopTelemetryPublisher from "../telemetry/DesktopTelemetryPublisher.ts";
 import * as DesktopWindow from "../window/DesktopWindow.ts";
 
 const INITIAL_RESTART_DELAY = Duration.millis(500);
@@ -88,6 +89,7 @@ class BackendProcessSpawnError extends Data.TaggedError("BackendProcessSpawnErro
 type BackendProcessError = BackendProcessBootstrapEncodeError | BackendProcessSpawnError;
 
 interface RunBackendProcessOptions extends DesktopBackendStartConfig {
+  readonly desktopTelemetryStream: Stream.Stream<Uint8Array>;
   readonly readinessTimeout?: Duration.Duration;
   readonly onStarted?: (pid: number) => Effect.Effect<void>;
   readonly onReady?: () => Effect.Effect<void>;
@@ -252,6 +254,10 @@ const runBackendProcess = Effect.fn("runBackendProcess")(function* (
           type: "input",
           stream: Stream.encodeText(Stream.make(`${bootstrapJson}\n`)),
         },
+        fd4: {
+          type: "input",
+          stream: options.desktopTelemetryStream,
+        },
       },
     },
   );
@@ -283,6 +289,7 @@ const makeDesktopBackendManager = Effect.fn("makeDesktopBackendManager")(functio
   const configuration = yield* DesktopBackendConfiguration.DesktopBackendConfiguration;
   const backendOutputLog = yield* DesktopObservability.DesktopBackendOutputLog;
   const desktopState = yield* DesktopState.DesktopState;
+  const desktopTelemetryPublisher = yield* DesktopTelemetryPublisher.DesktopTelemetryPublisher;
   const desktopWindow = yield* DesktopWindow.DesktopWindow;
   const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
   const httpClient = yield* HttpClient.HttpClient;
@@ -436,6 +443,7 @@ const makeDesktopBackendManager = Effect.fn("makeDesktopBackendManager")(functio
 
         const program = runBackendProcess({
           ...config.value,
+          desktopTelemetryStream: desktopTelemetryPublisher.encoded,
           onStarted: Effect.fn("desktop.backendManager.onStarted")(function* (pid) {
             yield* updateActiveRun(runId, (run) => ({
               ...run,

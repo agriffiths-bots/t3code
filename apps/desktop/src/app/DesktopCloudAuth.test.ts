@@ -54,6 +54,7 @@ function makeHarness(input: { readonly isDevelopment: boolean }): CloudAuthHarne
     setAboutPanelOptions: () => Effect.void,
     setAppUserModelId: () => Effect.void,
     requestSingleInstanceLock: Effect.succeed(true),
+    getAppMetrics: Effect.succeed([]),
     isDefaultProtocolClient: () => Effect.succeed(false),
     setAsDefaultProtocolClient: (protocol, path, args) =>
       Effect.sync(() => {

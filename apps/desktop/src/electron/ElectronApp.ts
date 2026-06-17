@@ -30,6 +30,7 @@ export interface ElectronAppShape {
   ) => Effect.Effect<void>;
   readonly setAppUserModelId: (id: string) => Effect.Effect<void>;
   readonly requestSingleInstanceLock: Effect.Effect<boolean>;
+  readonly getAppMetrics: Effect.Effect<ReadonlyArray<Electron.ProcessMetric>>;
   readonly isDefaultProtocolClient: (protocol: string) => Effect.Effect<boolean>;
   readonly setAsDefaultProtocolClient: (
     protocol: string,
@@ -101,6 +102,7 @@ const make = ElectronApp.of({
       Electron.app.setAppUserModelId(id);
     }),
   requestSingleInstanceLock: Effect.sync(() => Electron.app.requestSingleInstanceLock()),
+  getAppMetrics: Effect.sync(() => Electron.app.getAppMetrics()),
   isDefaultProtocolClient: (protocol) =>
     Effect.sync(() => Electron.app.isDefaultProtocolClient(protocol)),
   setAsDefaultProtocolClient: (protocol, path, args) =>

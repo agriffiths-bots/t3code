@@ -56,6 +56,42 @@ const { logWarning: logBackendConfigurationWarning } = DesktopObservability.make
   "desktop-backend-configuration",
 );
 
+function resourceMonitorBinaryName(platform: NodeJS.Platform): string {
+  return platform === "win32" ? "t3-resource-monitor.exe" : "t3-resource-monitor";
+}
+
+const resolveResourceMonitorPath = Effect.fn(
+  "desktop.backendConfiguration.resolveResourceMonitorPath",
+)(function* () {
+  const environment = yield* DesktopEnvironment.DesktopEnvironment;
+  const fileSystem = yield* FileSystem.FileSystem;
+  const binaryName = resourceMonitorBinaryName(environment.platform);
+  const candidates = environment.isDevelopment
+    ? [
+        environment.path.join(
+          environment.rootDir,
+          "native/resource-monitor/target/debug",
+          binaryName,
+        ),
+        environment.path.join(
+          environment.rootDir,
+          "native/resource-monitor/target/release",
+          binaryName,
+        ),
+      ]
+    : environment.resolveResourcePathCandidates(
+        environment.path.join("resource-monitor", binaryName),
+      );
+
+  for (const candidate of candidates) {
+    if (yield* fileSystem.exists(candidate).pipe(Effect.orElseSucceed(() => false))) {
+      return Option.some(candidate);
+    }
+  }
+
+  return Option.none<string>();
+});
+
 const readPersistedBackendObservabilitySettings: Effect.Effect<
   BackendObservabilitySettings,
   never,
@@ -89,6 +125,7 @@ const resolveBackendStartConfig = Effect.fn("desktop.backendConfiguration.resolv
   function* (input: {
     readonly bootstrapToken: string;
     readonly observabilitySettings: BackendObservabilitySettings;
+    readonly resourceMonitorPath: Option.Option<string>;
   }): Effect.fn.Return<
     DesktopBackendManager.DesktopBackendStartConfig,
     never,
@@ -115,6 +152,11 @@ const resolveBackendStartConfig = Effect.fn("desktop.backendConfiguration.resolv
         desktopBootstrapToken: input.bootstrapToken,
         tailscaleServeEnabled: backendExposure.tailscaleServeEnabled,
         tailscaleServePort: backendExposure.tailscaleServePort,
+        desktopTelemetryFd: 4,
+        ...Option.match(input.resourceMonitorPath, {
+          onNone: () => ({}),
+          onSome: (resourceMonitorPath) => ({ resourceMonitorPath }),
+        }),
         ...Option.match(input.observabilitySettings.otlpTracesUrl, {
           onNone: () => ({}),
           onSome: (otlpTracesUrl) => ({ otlpTracesUrl }),
@@ -156,9 +198,14 @@ export const layer = Layer.effect(
           Effect.provideService(FileSystem.FileSystem, fileSystem),
           Effect.provideService(DesktopEnvironment.DesktopEnvironment, environment),
         );
+        const resourceMonitorPath = yield* resolveResourceMonitorPath().pipe(
+          Effect.provideService(FileSystem.FileSystem, fileSystem),
+          Effect.provideService(DesktopEnvironment.DesktopEnvironment, environment),
+        );
         return yield* resolveBackendStartConfig({
           bootstrapToken,
           observabilitySettings,
+          resourceMonitorPath,
         }).pipe(
           Effect.provideService(DesktopEnvironment.DesktopEnvironment, environment),
           Effect.provideService(DesktopServerExposure.DesktopServerExposure, serverExposure),

@@ -9,12 +9,15 @@ import {
   createStageWorkspaceConfig,
   createStagePnpmConfig,
   DESKTOP_ASAR_UNPACK,
+  DESKTOP_EXTRA_RESOURCES,
   resolveDesktopRuntimeDependencies,
   resolveFffNativeDependencies,
   resolveBuildOptions,
   resolveDesktopBuildIconAssets,
   resolveDesktopProductName,
   resolveDesktopUpdateChannel,
+  resolveResourceMonitorRustTargets,
+  resourceMonitorExecutableName,
   resolveGitHubPublishConfig,
   resolveMockUpdateServerPort,
   resolveMockUpdateServerUrl,
@@ -173,6 +176,27 @@ it.layer(NodeServices.layer)("build-desktop-artifact", (it) => {
 
   it("unpacks the fff shared library for filesystem and FFI access", () => {
     assert.deepStrictEqual(DESKTOP_ASAR_UNPACK, ["node_modules/@ff-labs/fff-bin-*/**/*"]);
+  });
+
+  it("stages the resource monitor as an external executable resource", () => {
+    assert.deepStrictEqual(DESKTOP_EXTRA_RESOURCES, [
+      {
+        from: "apps/desktop/prod-resources/resource-monitor",
+        to: "resource-monitor",
+      },
+    ]);
+    assert.deepStrictEqual(resolveResourceMonitorRustTargets("mac", "universal"), [
+      "aarch64-apple-darwin",
+      "x86_64-apple-darwin",
+    ]);
+    assert.deepStrictEqual(resolveResourceMonitorRustTargets("linux", "x64"), [
+      "x86_64-unknown-linux-gnu",
+    ]);
+    assert.deepStrictEqual(resolveResourceMonitorRustTargets("win", "arm64"), [
+      "aarch64-pc-windows-msvc",
+    ]);
+    assert.equal(resourceMonitorExecutableName("mac"), "t3-resource-monitor");
+    assert.equal(resourceMonitorExecutableName("win"), "t3-resource-monitor.exe");
   });
 
   it("promotes target fff binaries to direct staged dependencies", () => {

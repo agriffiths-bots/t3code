@@ -95,6 +95,7 @@ import * as EnvironmentAuth from "./auth/EnvironmentAuth.ts";
 import type { AuthenticatedSession } from "./auth/EnvironmentAuth.ts";
 import * as ProcessDiagnostics from "./diagnostics/ProcessDiagnostics.ts";
 import * as ProcessResourceMonitor from "./diagnostics/ProcessResourceMonitor.ts";
+import * as ResourceTelemetry from "./resourceTelemetry/ResourceTelemetry.ts";
 import * as TraceDiagnostics from "./diagnostics/TraceDiagnostics.ts";
 import * as SourceControlDiscoveryLayer from "./sourceControl/SourceControlDiscovery.ts";
 import { SourceControlRepositoryService } from "./sourceControl/SourceControlRepositoryService.ts";
@@ -159,6 +160,9 @@ const RPC_REQUIRED_SCOPE = new Map<string, AuthEnvironmentScope>([
   [WS_METHODS.serverGetTraceDiagnostics, AuthOrchestrationReadScope],
   [WS_METHODS.serverGetProcessDiagnostics, AuthOrchestrationReadScope],
   [WS_METHODS.serverGetProcessResourceHistory, AuthOrchestrationReadScope],
+  [WS_METHODS.serverGetResourceTelemetry, AuthOrchestrationReadScope],
+  [WS_METHODS.serverGetResourceTelemetryHistory, AuthOrchestrationReadScope],
+  [WS_METHODS.serverRetryResourceTelemetry, AuthOrchestrationOperateScope],
   [WS_METHODS.serverSignalProcess, AuthOrchestrationOperateScope],
   [WS_METHODS.cloudGetRelayClientStatus, AuthRelayWriteScope],
   [WS_METHODS.cloudInstallRelayClient, AuthRelayWriteScope],
@@ -173,6 +177,7 @@ const RPC_REQUIRED_SCOPE = new Map<string, AuthEnvironmentScope>([
   [WS_METHODS.filesystemBrowse, AuthOrchestrationReadScope],
   [WS_METHODS.assetsCreateUrl, AuthOrchestrationReadScope],
   [WS_METHODS.subscribeVcsStatus, AuthOrchestrationReadScope],
+  [WS_METHODS.subscribeResourceTelemetry, AuthOrchestrationReadScope],
   [WS_METHODS.vcsRefreshStatus, AuthOrchestrationReadScope],
   [WS_METHODS.vcsPull, AuthOrchestrationOperateScope],
   [WS_METHODS.gitRunStackedAction, AuthOrchestrationOperateScope],
@@ -298,6 +303,7 @@ const makeWsRpcLayer = (currentSession: AuthenticatedSession) =>
       const sessions = yield* SessionStore.SessionStore;
       const processDiagnostics = yield* ProcessDiagnostics.ProcessDiagnostics;
       const processResourceMonitor = yield* ProcessResourceMonitor.ProcessResourceMonitor;
+      const resourceTelemetry = yield* ResourceTelemetry.ResourceTelemetry;
       const relayClient = yield* RelayClient.RelayClient;
       const authorizationError = (requiredScope: AuthEnvironmentScope) =>
         new EnvironmentAuthorizationError({
@@ -1118,6 +1124,22 @@ const makeWsRpcLayer = (currentSession: AuthenticatedSession) =>
               "rpc.aggregate": "server",
             },
           ),
+        [WS_METHODS.serverGetResourceTelemetry]: (_input) =>
+          observeRpcEffect(WS_METHODS.serverGetResourceTelemetry, resourceTelemetry.latest, {
+            "rpc.aggregate": "server",
+          }),
+        [WS_METHODS.serverGetResourceTelemetryHistory]: (input) =>
+          observeRpcEffect(
+            WS_METHODS.serverGetResourceTelemetryHistory,
+            resourceTelemetry.readHistory(input),
+            {
+              "rpc.aggregate": "server",
+            },
+          ),
+        [WS_METHODS.serverRetryResourceTelemetry]: (_input) =>
+          observeRpcEffect(WS_METHODS.serverRetryResourceTelemetry, resourceTelemetry.retry, {
+            "rpc.aggregate": "server",
+          }),
         [WS_METHODS.serverSignalProcess]: (input) =>
           observeRpcEffect(WS_METHODS.serverSignalProcess, processDiagnostics.signal(input), {
             "rpc.aggregate": "server",
@@ -1666,6 +1688,15 @@ const makeWsRpcLayer = (currentSession: AuthenticatedSession) =>
             Stream.concat(
               Stream.unwrap(Effect.map(backgroundPolicy.snapshot, Stream.make)),
               backgroundPolicy.streamChanges,
+            ),
+            { "rpc.aggregate": "server" },
+          ),
+        [WS_METHODS.subscribeResourceTelemetry]: (_input) =>
+          observeRpcStream(
+            WS_METHODS.subscribeResourceTelemetry,
+            Stream.concat(
+              Stream.unwrap(Effect.map(resourceTelemetry.latest, Stream.make)),
+              resourceTelemetry.changes,
             ),
             { "rpc.aggregate": "server" },
           ),

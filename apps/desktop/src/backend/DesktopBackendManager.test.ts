@@ -23,6 +23,7 @@ import * as DesktopBackendManager from "./DesktopBackendManager.ts";
 import * as DesktopBackendConfiguration from "./DesktopBackendConfiguration.ts";
 import * as DesktopObservability from "../app/DesktopObservability.ts";
 import * as DesktopState from "../app/DesktopState.ts";
+import * as DesktopTelemetryPublisher from "../telemetry/DesktopTelemetryPublisher.ts";
 import * as DesktopWindow from "../window/DesktopWindow.ts";
 
 const decodeDesktopBackendBootstrap = Schema.decodeEffect(
@@ -120,6 +121,11 @@ function makeManagerLayer(input: {
         }),
         input.spawnerLayer,
         input.httpClientLayer ?? healthyHttpClientLayer,
+        Layer.succeed(DesktopTelemetryPublisher.DesktopTelemetryPublisher, {
+          latest: Effect.succeed(Option.none()),
+          changes: Stream.empty,
+          encoded: Stream.empty,
+        }),
         input.desktopState
           ? Layer.succeed(DesktopState.DesktopState, input.desktopState)
           : DesktopState.layer,

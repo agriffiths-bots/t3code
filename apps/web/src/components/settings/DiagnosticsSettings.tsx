@@ -36,6 +36,7 @@ import { Button } from "../ui/button";
 import { ScrollArea } from "../ui/scroll-area";
 import { Tooltip, TooltipPopup, TooltipTrigger } from "../ui/tooltip";
 import { toastManager } from "../ui/toast";
+import { ResourceTelemetryDiagnostics } from "./ResourceTelemetryDiagnostics";
 import { SettingsPageContainer, SettingsSection, useRelativeTimeTick } from "./settingsLayout";
 import { useAtomCommand } from "../../state/use-atom-command";
 
@@ -906,12 +907,16 @@ export function DiagnosticsSettingsPanel() {
       if (environmentId === null) {
         return;
       }
+      const process = processData?.processes.find((entry) => entry.pid === pid);
+      if (process === undefined) {
+        return;
+      }
 
       setSignalingPid(pid);
       void (async () => {
         const result = await signalServerProcess({
           environmentId,
-          input: { pid, signal },
+          input: { pid, startTimeMs: process.startTimeMs, signal },
         });
         setSignalingPid(null);
         if (result._tag === "Failure") {
@@ -948,7 +953,7 @@ export function DiagnosticsSettingsPanel() {
         refreshProcesses();
       })();
     },
-    [environmentId, refreshProcesses, signalServerProcess],
+    [environmentId, processData?.processes, refreshProcesses, signalServerProcess],
   );
 
   const processDiagnosticsError = processData ? Option.getOrNull(processData.error) : null;
@@ -960,6 +965,8 @@ export function DiagnosticsSettingsPanel() {
 
   return (
     <SettingsPageContainer>
+      <ResourceTelemetryDiagnostics />
+
       <SettingsSection
         title="Live Processes"
         headerAction={

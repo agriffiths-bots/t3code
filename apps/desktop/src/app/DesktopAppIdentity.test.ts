@@ -54,6 +54,7 @@ const makeElectronAppLayer = (calls: ElectronAppCalls) =>
       }),
     setAppUserModelId: () => Effect.void,
     requestSingleInstanceLock: Effect.succeed(true),
+    getAppMetrics: Effect.succeed([]),
     isDefaultProtocolClient: () => Effect.succeed(false),
     setAsDefaultProtocolClient: () => Effect.succeed(true),
     setDesktopName: () => Effect.void,

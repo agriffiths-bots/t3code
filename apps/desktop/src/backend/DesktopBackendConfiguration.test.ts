@@ -41,6 +41,7 @@ function makeEnvironmentLayer(
   options?: {
     readonly isPackaged?: boolean;
     readonly devServerUrl?: string;
+    readonly resourcesPath?: string;
   },
 ) {
   return DesktopEnvironment.layer({
@@ -51,7 +52,7 @@ function makeEnvironmentLayer(
     appVersion: "1.2.3",
     appPath: "/repo",
     isPackaged: options?.isPackaged ?? true,
-    resourcesPath: "/missing/resources",
+    resourcesPath: options?.resourcesPath ?? "/missing/resources",
     runningUnderArm64Translation: false,
   }).pipe(
     Layer.provide(
@@ -185,6 +186,40 @@ describe("DesktopBackendConfiguration", () => {
               makeEnvironmentLayer(baseDir, {
                 isPackaged: false,
                 devServerUrl: "http://127.0.0.1:5733",
+              }),
+            ),
+          ),
+        ),
+      );
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+
+  it.effect("passes the packaged resource monitor path to the backend", () =>
+    Effect.gen(function* () {
+      const fileSystem = yield* FileSystem.FileSystem;
+      const baseDir = yield* fileSystem.makeTempDirectoryScoped({
+        prefix: "t3-desktop-backend-config-test-",
+      });
+      const resourcesPath = `${baseDir}/resources`;
+      const monitorPath = `${resourcesPath}/resource-monitor/t3-resource-monitor`;
+      yield* fileSystem.makeDirectory(`${resourcesPath}/resource-monitor`, {
+        recursive: true,
+      });
+      yield* fileSystem.writeFileString(monitorPath, "binary");
+      yield* fileSystem.chmod(monitorPath, 0o755);
+
+      yield* Effect.gen(function* () {
+        const configuration = yield* DesktopBackendConfiguration.DesktopBackendConfiguration;
+        const config = yield* configuration.resolve;
+        assert.equal(config.bootstrap.resourceMonitorPath, monitorPath);
+        assert.equal(config.bootstrap.desktopTelemetryFd, 4);
+      }).pipe(
+        Effect.provide(
+          DesktopBackendConfiguration.layer.pipe(
+            Layer.provideMerge(serverExposureLayer),
+            Layer.provideMerge(
+              makeEnvironmentLayer(baseDir, {
+                resourcesPath,
               }),
             ),
           ),
