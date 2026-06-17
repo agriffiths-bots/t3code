@@ -21,8 +21,10 @@ import * as DesktopEnvironment from "./DesktopEnvironment.ts";
 
 const DESKTOP_LOG_FILE_MAX_BYTES = 10 * 1024 * 1024;
 const DESKTOP_LOG_FILE_MAX_FILES = 10;
+const DESKTOP_BACKEND_OUTPUT_BUFFER_MAX_BYTES = 1024 * 1024;
+const DESKTOP_BACKEND_OUTPUT_BUFFER_MAX_CHUNKS = 256;
 const DESKTOP_BACKEND_CHILD_LOG_FIBER_ID = "#backend-child";
-const DESKTOP_TRACE_BATCH_WINDOW_MS = 200;
+const DESKTOP_TRACE_BATCH_WINDOW_MS = 1_000;
 
 export interface RotatingLogFileWriter {
   readonly writeBytes: (chunk: Uint8Array) => Effect.Effect<void>;
@@ -30,14 +32,13 @@ export interface RotatingLogFileWriter {
 }
 
 export interface DesktopBackendOutputLogShape {
-  readonly writeSessionBoundary: (input: {
-    readonly phase: "START" | "END";
-    readonly details: string;
-  }) => Effect.Effect<void>;
+  readonly beginSession: (input: { readonly details: string }) => Effect.Effect<void>;
   readonly writeOutputChunk: (
     streamName: "stdout" | "stderr",
     chunk: Uint8Array,
   ) => Effect.Effect<void>;
+  readonly persistFailure: (input: { readonly details: string }) => Effect.Effect<void>;
+  readonly discardSession: Effect.Effect<void>;
 }
 
 export class DesktopBackendOutputLog extends Context.Service<
@@ -113,9 +114,83 @@ const encodeDesktopBackendChildLogRecord = Schema.encodeEffect(
 );
 
 const DesktopBackendOutputLogNoop: DesktopBackendOutputLogShape = {
-  writeSessionBoundary: () => Effect.void,
+  beginSession: () => Effect.void,
   writeOutputChunk: () => Effect.void,
+  persistFailure: () => Effect.void,
+  discardSession: Effect.void,
 };
+
+interface BufferedBackendOutputChunk {
+  readonly streamName: "stdout" | "stderr";
+  readonly chunk: Uint8Array;
+}
+
+interface BackendOutputSession {
+  readonly runId: string;
+  readonly startDetails: string;
+  readonly chunks: ReadonlyArray<BufferedBackendOutputChunk>;
+  readonly byteLength: number;
+}
+
+function appendBoundedOutputChunk(
+  session: BackendOutputSession,
+  streamName: "stdout" | "stderr",
+  chunk: Uint8Array,
+): BackendOutputSession {
+  if (chunk.byteLength === 0) {
+    return session;
+  }
+
+  const retainedChunk =
+    chunk.byteLength > DESKTOP_BACKEND_OUTPUT_BUFFER_MAX_BYTES
+      ? chunk.slice(chunk.byteLength - DESKTOP_BACKEND_OUTPUT_BUFFER_MAX_BYTES)
+      : chunk.slice();
+  const chunks = [
+    ...session.chunks,
+    {
+      streamName,
+      chunk: retainedChunk,
+    },
+  ];
+  let byteLength = session.byteLength + retainedChunk.byteLength;
+  let overflow = Math.max(0, byteLength - DESKTOP_BACKEND_OUTPUT_BUFFER_MAX_BYTES);
+  let firstRetainedIndex = 0;
+
+  while (overflow > 0) {
+    const first = chunks[firstRetainedIndex];
+    if (!first) {
+      break;
+    }
+    if (first.chunk.byteLength <= overflow) {
+      overflow -= first.chunk.byteLength;
+      byteLength -= first.chunk.byteLength;
+      firstRetainedIndex += 1;
+      continue;
+    }
+
+    chunks[firstRetainedIndex] = {
+      ...first,
+      chunk: first.chunk.slice(overflow),
+    };
+    byteLength -= overflow;
+    overflow = 0;
+  }
+
+  const excessChunks = Math.max(
+    0,
+    chunks.length - firstRetainedIndex - DESKTOP_BACKEND_OUTPUT_BUFFER_MAX_CHUNKS,
+  );
+  for (let index = firstRetainedIndex; index < firstRetainedIndex + excessChunks; index += 1) {
+    byteLength -= chunks[index]?.chunk.byteLength ?? 0;
+  }
+  firstRetainedIndex += excessChunks;
+
+  return {
+    ...session,
+    chunks: chunks.slice(firstRetainedIndex),
+    byteLength,
+  };
+}
 
 const currentDesktopRunId = Effect.gen(function* () {
   const annotations = yield* References.CurrentLogAnnotations;
@@ -301,45 +376,86 @@ const backendOutputLogLayer = Layer.effect(
     const writer = yield* makeRotatingLogFileWriter({
       filePath: environment.path.join(environment.logDir, "server-child.log"),
     }).pipe(Effect.option);
+    const sessionRef = yield* Ref.make(Option.none<BackendOutputSession>());
 
     return Option.match(writer, {
       onNone: () => DesktopBackendOutputLogNoop,
-      onSome: (logFile) =>
-        ({
-          writeSessionBoundary: Effect.fn(
-            "desktop.observability.backendOutput.writeSessionBoundary",
-          )(function* ({ phase, details }) {
+      onSome: (logFile) => {
+        return {
+          beginSession: Effect.fn("desktop.observability.backendOutput.beginSession")(function* ({
+            details,
+          }) {
             const runId = yield* currentDesktopRunId;
-            yield* writeBackendChildLogRecord(logFile, {
-              message: `backend child process session ${phase.toLowerCase()}`,
-              level: "INFO",
-              annotations: {
-                component: "desktop-backend-child",
+            yield* Ref.set(
+              sessionRef,
+              Option.some({
                 runId,
-                phase,
-                details: sanitizeLogValue(details),
-              },
-            });
+                startDetails: sanitizeLogValue(details),
+                chunks: [],
+                byteLength: 0,
+              }),
+            );
           }),
-          writeOutputChunk: Effect.fn("desktop.observability.backendOutput.writeOutputChunk")(
-            function* (streamName, chunk) {
-              if (environment.isDevelopment) {
-                yield* writeDevelopmentConsoleOutput(streamName, chunk);
+          writeOutputChunk: Effect.fnUntraced(function* (streamName, chunk) {
+            if (environment.isDevelopment) {
+              yield* writeDevelopmentConsoleOutput(streamName, chunk);
+            }
+            yield* Ref.update(
+              sessionRef,
+              Option.map((session) => appendBoundedOutputChunk(session, streamName, chunk)),
+            );
+          }),
+          persistFailure: Effect.fn("desktop.observability.backendOutput.persistFailure")(
+            function* ({ details }) {
+              const session = yield* Ref.modify(sessionRef, (current) => [
+                current,
+                Option.map(current, (value) => ({
+                  ...value,
+                  chunks: [],
+                  byteLength: 0,
+                })),
+              ]);
+              if (Option.isNone(session)) {
+                return;
               }
-              const runId = yield* currentDesktopRunId;
+
               yield* writeBackendChildLogRecord(logFile, {
-                message: "backend child process output",
-                level: streamName === "stderr" ? "ERROR" : "INFO",
+                message: "backend child process failure output start",
+                level: "ERROR",
                 annotations: {
                   component: "desktop-backend-child",
-                  runId,
-                  stream: streamName,
-                  text: textDecoder.decode(chunk),
+                  runId: session.value.runId,
+                  phase: "START",
+                  details: session.value.startDetails,
+                },
+              });
+              for (const output of session.value.chunks) {
+                yield* writeBackendChildLogRecord(logFile, {
+                  message: "backend child process output",
+                  level: output.streamName === "stderr" ? "ERROR" : "INFO",
+                  annotations: {
+                    component: "desktop-backend-child",
+                    runId: session.value.runId,
+                    stream: output.streamName,
+                    text: textDecoder.decode(output.chunk),
+                  },
+                });
+              }
+              yield* writeBackendChildLogRecord(logFile, {
+                message: "backend child process failure output end",
+                level: "ERROR",
+                annotations: {
+                  component: "desktop-backend-child",
+                  runId: session.value.runId,
+                  phase: "END",
+                  details: sanitizeLogValue(details),
                 },
               });
             },
           ),
-        }) satisfies DesktopBackendOutputLogShape,
+          discardSession: Ref.set(sessionRef, Option.none()),
+        } satisfies DesktopBackendOutputLogShape;
+      },
     });
   }),
 );
