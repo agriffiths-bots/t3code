@@ -8,12 +8,12 @@ import * as NodeSqliteClient from "../NodeSqliteClient.ts";
 
 const layer = it.layer(Layer.mergeAll(NodeSqliteClient.layerMemory()));
 
-layer("035_PendingDispatches", (it) => {
+layer("036_PendingDispatches", (it) => {
   it.effect("creates the pending_dispatches table with the expected columns and index", () =>
     Effect.gen(function* () {
       const sql = yield* SqlClient.SqlClient;
 
-      yield* runMigrations({ toMigrationInclusive: 35 });
+      yield* runMigrations({ toMigrationInclusive: 36 });
 
       const columns = yield* sql<{ readonly name: string }>`
         PRAGMA table_info(pending_dispatches)
@@ -45,8 +45,8 @@ layer("035_PendingDispatches", (it) => {
     Effect.gen(function* () {
       const sql = yield* SqlClient.SqlClient;
 
-      yield* runMigrations({ toMigrationInclusive: 35 });
-      yield* runMigrations({ toMigrationInclusive: 35 });
+      yield* runMigrations({ toMigrationInclusive: 36 });
+      yield* runMigrations({ toMigrationInclusive: 36 });
 
       const tables = yield* sql<{ readonly name: string }>`
         SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'pending_dispatches'
@@ -59,7 +59,7 @@ layer("035_PendingDispatches", (it) => {
     Effect.gen(function* () {
       const sql = yield* SqlClient.SqlClient;
 
-      yield* runMigrations({ toMigrationInclusive: 35 });
+      yield* runMigrations({ toMigrationInclusive: 36 });
 
       yield* sql`
         INSERT INTO pending_dispatches (

@@ -35,7 +35,7 @@ healthy. **Always kill any server you start when done.**
 ### `assert.mjs` helpers vs. schema
 
 - `turnCountForThread` / `turnTimestamps` → `projection_turns` (migration 005).
-- `childrenOf` → `projection_threads WHERE parent_thread_id = ?` (migration 033).
+- `childrenOf` → `projection_threads WHERE parent_thread_id = ?` (migration 034).
 - `scheduledTask` / `listScheduledTasks` → `scheduled_tasks` (migration 034).
 - `threadShell` → latest `projection_turns` row + `projection_thread_sessions`.
 - `assistantMessages` → `projection_thread_messages` (pass `role:"user"` to find

@@ -8,12 +8,12 @@ import * as NodeSqliteClient from "../NodeSqliteClient.ts";
 
 const layer = it.layer(Layer.mergeAll(NodeSqliteClient.layerMemory()));
 
-layer("034_ScheduledTasks", (it) => {
+layer("035_ScheduledTasks", (it) => {
   it.effect("creates the scheduled_tasks table with the expected columns and index", () =>
     Effect.gen(function* () {
       const sql = yield* SqlClient.SqlClient;
 
-      yield* runMigrations({ toMigrationInclusive: 34 });
+      yield* runMigrations({ toMigrationInclusive: 35 });
 
       const columns = yield* sql<{ readonly name: string }>`
         PRAGMA table_info(scheduled_tasks)
@@ -54,8 +54,8 @@ layer("034_ScheduledTasks", (it) => {
     Effect.gen(function* () {
       const sql = yield* SqlClient.SqlClient;
 
-      yield* runMigrations({ toMigrationInclusive: 34 });
-      yield* runMigrations({ toMigrationInclusive: 34 });
+      yield* runMigrations({ toMigrationInclusive: 35 });
+      yield* runMigrations({ toMigrationInclusive: 35 });
 
       const tables = yield* sql<{ readonly name: string }>`
         SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'scheduled_tasks'
@@ -68,7 +68,7 @@ layer("034_ScheduledTasks", (it) => {
     Effect.gen(function* () {
       const sql = yield* SqlClient.SqlClient;
 
-      yield* runMigrations({ toMigrationInclusive: 34 });
+      yield* runMigrations({ toMigrationInclusive: 35 });
 
       yield* sql`
         INSERT INTO scheduled_tasks (

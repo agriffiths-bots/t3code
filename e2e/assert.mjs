@@ -3,8 +3,8 @@
 // All e2e assertions derive from observable persisted state. This module opens
 // <T3CODE_HOME>/userdata/state.sqlite in read-only mode (mode=ro) so it never
 // contends with the running server's writer, and exposes typed accessors over
-// the projection tables (migration 005) plus scheduled_tasks (migration 034)
-// and the parent_thread_id linkage (migration 033).
+// the projection tables (migration 005) plus scheduled_tasks (migration 035)
+// and the parent_thread_id linkage (migration 034).
 //
 // Usage:
 //   import { openState, turnCountForThread, childrenOf } from "./assert.mjs";
@@ -63,7 +63,7 @@ export function turnTimestamps(db, threadId) {
 // ---- thread linkage (parent/child) --------------------------------------
 
 /**
- * Child threads of a parent (migration 033 parent_thread_id). Scenario (b)
+ * Child threads of a parent (migration 034 parent_thread_id). Scenario (b)
  * asserts one row per spawned sub-agent with the correct linkage; the `model`
  * column lets it verify per-provider routing. Excludes soft-deleted rows.
  */
@@ -79,7 +79,7 @@ export function childrenOf(db, parentThreadId) {
     .all(parentThreadId);
 }
 
-// ---- scheduled tasks (migration 034) ------------------------------------
+// ---- scheduled tasks (migration 035) ------------------------------------
 
 /** One scheduled task by id (scenario a: next_run_at / last_run_at / status). */
 export function scheduledTask(db, taskId) {

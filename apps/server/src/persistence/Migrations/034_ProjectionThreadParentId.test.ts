@@ -8,13 +8,15 @@ import * as NodeSqliteClient from "../NodeSqliteClient.ts";
 
 const layer = it.layer(Layer.mergeAll(NodeSqliteClient.layerMemory()));
 
-layer("033_ProjectionThreadParentId", (it) => {
+layer("034_ProjectionThreadParentId", (it) => {
   it.effect("adds parent_thread_id column and parent index to projection_threads", () =>
     Effect.gen(function* () {
       const sql = yield* SqlClient.SqlClient;
 
+      // 32 is the last pre-feature (upstream) migration; 34 is the first of our
+      // renumbered feature block and is what adds parent_thread_id.
       yield* runMigrations({ toMigrationInclusive: 32 });
-      yield* runMigrations({ toMigrationInclusive: 33 });
+      yield* runMigrations({ toMigrationInclusive: 34 });
 
       const columns = yield* sql<{ readonly name: string }>`
         PRAGMA table_info(projection_threads)
