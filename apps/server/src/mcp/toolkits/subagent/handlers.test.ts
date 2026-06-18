@@ -222,6 +222,7 @@ const pendingDispatchesLayer = Layer.succeed(PendingDispatchRepository, {
   insert: (row) => Effect.sync(() => void insertedDispatches.push(row)),
   listByTarget: () => Effect.succeed([]),
   listAll: () => Effect.succeed([]),
+  claim: () => Effect.void,
   deleteByIds: () => Effect.void,
 });
 

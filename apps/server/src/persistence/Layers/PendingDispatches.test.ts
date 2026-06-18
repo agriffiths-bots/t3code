@@ -24,6 +24,7 @@ const makeRow = (overrides: Partial<PendingDispatch> = {}): PendingDispatch =>
     text: "child completed",
     error: null,
     status: null,
+    commandId: null,
     createdAt: "2026-06-17T09:00:00.000Z",
     ...overrides,
   }) satisfies PendingDispatch;
@@ -116,6 +117,35 @@ layer("PendingDispatchRepository", (it) => {
         targetThreadId: parent,
       });
       assert.equal(remaining.length, 1);
+    }),
+  );
+
+  it.effect("claim stamps command_id and is a no-op for an empty id list", () =>
+    Effect.gen(function* () {
+      const repository = yield* PendingDispatchRepository;
+      const parent = ThreadId.make("parent-claim");
+
+      yield* repository.insert(
+        makeRow({ id: PendingDispatchId.make("claim-a"), targetThreadId: parent }),
+      );
+      yield* repository.insert(
+        makeRow({ id: PendingDispatchId.make("claim-b"), targetThreadId: parent }),
+      );
+
+      // Empty claim is a no-op (no rows touched).
+      yield* repository.claim({ ids: [], commandId: "server:subagent-wake:noop" });
+      yield* repository.claim({
+        ids: [PendingDispatchId.make("claim-a")],
+        commandId: "server:subagent-wake:claim-a",
+      });
+
+      const rows = yield* repository.listByTarget({
+        kind: "parent_injection",
+        targetThreadId: parent,
+      });
+      const byId = new Map(rows.map((row) => [row.id as string, row]));
+      assert.equal(byId.get("claim-a")?.commandId, "server:subagent-wake:claim-a");
+      assert.equal(byId.get("claim-b")?.commandId, null);
     }),
   );
 

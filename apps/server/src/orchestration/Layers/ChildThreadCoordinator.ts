@@ -76,6 +76,15 @@ interface PendingInjection {
   readonly enqueuedAtMs: number;
   /** The durable `pending_dispatches` row backing this injection (R-B), deleted on drain. */
   readonly dispatchId: PendingDispatchId;
+  /**
+   * The command id this row was already claimed+dispatched under before a crash
+   * (R-B exactly-once). Null for a fresh injection that may be consolidated into
+   * a batch under a fresh deterministic id; non-null means it MUST be
+   * re-dispatched under this exact id so the engine's receipt dedup makes a
+   * landed turn a no-op (no duplicate) and an un-landed turn fire (no loss),
+   * regardless of how the rows happen to re-batch on restart.
+   */
+  readonly claimedCommandId: CommandId | null;
 }
 
 type TurnDiffCompletedEvent = Extract<OrchestrationEvent, { type: "thread.turn-diff-completed" }>;
@@ -151,6 +160,30 @@ const make = Effect.gen(function* () {
   const newCommandId = (tag: string) =>
     randomUUID.pipe(Effect.map((uuid) => CommandId.make(`server:${tag}:${uuid}`)));
 
+  // Exactly-once delivery (closes the crash-between-dispatch-and-delete window):
+  //
+  // The orchestration engine upserts a command receipt in the SAME
+  // sql.withTransaction as the event append and short-circuits any later
+  // dispatch carrying an already-`accepted` commandId
+  // (OrchestrationEngine.processEnvelope). So a re-fire under the IDENTICAL
+  // commandId is a no-op (returns the existing sequence, appends no event).
+  //
+  // To exploit that across a crash we must guarantee the commandId is stable for
+  // a given row REGARDLESS of how it later re-batches. A deterministic batch id
+  // alone is insufficient: a row dispatched in batch [X,Y] then re-batched as
+  // [X,Y,Z] on restart would get a different id and dedup would miss, duplicating
+  // X,Y. We therefore CLAIM the exact commandId onto the rows durably BEFORE the
+  // dispatch (pendingDispatches.claim). On restart a row with a claimed
+  // command_id is re-dispatched under THAT id (landed -> dedup no-op -> no
+  // duplicate; un-landed -> the intended turn fires -> no loss). The row survives
+  // until the delete commits, so nothing is ever lost. Unclaimed rows are free to
+  // consolidate under a fresh deterministic batch id.
+  const dispatchCommandIdFor = (tag: string, dispatchId: PendingDispatchId): CommandId =>
+    CommandId.make(`server:${tag}:${dispatchId}`);
+
+  const batchCommandIdFor = (tag: string, dispatchIds: ReadonlyArray<PendingDispatchId>): CommandId =>
+    CommandId.make(`server:${tag}:${[...dispatchIds].sort().join(",")}`);
+
   const listPersistedChildRows = SqlSchema.findAll({
     Request: Schema.Void,
     Result: ChildRowSchema,
@@ -201,6 +234,7 @@ const make = Effect.gen(function* () {
         text: result.finalAssistantText,
         error: result.error,
         status: result.status,
+        commandId: null,
         createdAt: IsoDateTime.make(createdAt),
       };
       yield* pendingDispatches.insert(row).pipe(Effect.orDie);
@@ -211,11 +245,18 @@ const make = Effect.gen(function* () {
         error: result.error,
         enqueuedAtMs: now,
         dispatchId: id,
+        claimedCommandId: null,
       } satisfies PendingInjection;
     });
 
   const deleteDispatchRows = (ids: ReadonlyArray<PendingDispatchId>) =>
     pendingDispatches.deleteByIds(ids).pipe(Effect.orDie);
+
+  // Durably stamp the commandId a batch is about to be dispatched under, BEFORE
+  // the dispatch, so a crash mid-dispatch leaves a row that re-fires under the
+  // SAME id on restart (engine dedup => exactly-once).
+  const claimDispatchRows = (ids: ReadonlyArray<PendingDispatchId>, commandId: CommandId) =>
+    pendingDispatches.claim({ ids, commandId }).pipe(Effect.orDie);
 
   const depthFor = (parentThreadId: ThreadId): number => {
     const parentRecord = children.get(parentThreadId);
@@ -301,9 +342,14 @@ const make = Effect.gen(function* () {
     return joined;
   };
 
-  const dispatchParentTurn = (shell: OrchestrationThreadShell, text: string) =>
+  // The commandId is derived from the backing dispatch row id so a re-fire after
+  // a crash-between-dispatch-and-delete is deduped by the engine (exactly-once).
+  const dispatchParentTurn = (
+    shell: OrchestrationThreadShell,
+    text: string,
+    commandId: CommandId,
+  ) =>
     Effect.gen(function* () {
-      const commandId = yield* newCommandId("subagent-wake");
       const messageId = MessageId.make(yield* randomUUID);
       const createdAt = yield* nowIso;
       yield* dispatchActive({
@@ -318,9 +364,13 @@ const make = Effect.gen(function* () {
     });
 
   // Dispatch a deferred steer to a now-idle child as a fresh user turn (R-C).
-  const dispatchChildSteer = (shell: OrchestrationThreadShell, text: string) =>
+  // The commandId is derived from the backing row id for the same reason.
+  const dispatchChildSteer = (
+    shell: OrchestrationThreadShell,
+    text: string,
+    commandId: CommandId,
+  ) =>
     Effect.gen(function* () {
-      const commandId = yield* newCommandId("subagent-steer");
       const messageId = MessageId.make(yield* randomUUID);
       const createdAt = yield* nowIso;
       yield* dispatchActive({
@@ -396,7 +446,10 @@ const make = Effect.gen(function* () {
             return;
           }
           if (isThreadIdle(shell)) {
-            yield* dispatchParentTurn(shell, consolidatedInjectionText([entry])).pipe(
+            const commandId =
+              entry.claimedCommandId ?? batchCommandIdFor("subagent-wake", [entry.dispatchId]);
+            yield* claimDispatchRows([entry.dispatchId], commandId).pipe(
+              Effect.andThen(dispatchParentTurn(shell, consolidatedInjectionText([entry]), commandId)),
               Effect.andThen(deleteDispatchRows([entry.dispatchId])),
               Effect.catchCause((cause) => {
                 enqueuePending(parentThreadId, entry);
@@ -447,19 +500,41 @@ const make = Effect.gen(function* () {
           }
           const entries = [...queue];
           pendingInjections.delete(parentThreadId);
-          yield* dispatchParentTurn(shell, consolidatedInjectionText(entries)).pipe(
-            // Delete-on-dispatch within the same per-parent lock: the rows are
-            // gone before the lock releases, so a restart never re-fires them.
-            Effect.andThen(deleteDispatchRows(entries.map((entry) => entry.dispatchId))),
-            Effect.catchCause((cause) => {
-              // Restore the entries so a transient dispatch failure is retried.
-              const restored = pendingInjections.get(parentThreadId) ?? [];
-              pendingInjections.set(parentThreadId, [...entries, ...restored]);
-              return Effect.logWarning("subagent pending drain dispatch failed; re-enqueued", {
-                parentThreadId,
-                cause: Cause.pretty(cause),
-              });
-            }),
+
+          // Drain one batch as a single turn, restoring its entries on a transient
+          // dispatch failure so the never-hang retry contract holds. The rows are
+          // claimed under the dispatch commandId BEFORE dispatch and deleted after,
+          // all inside this per-parent lock (a restart re-fires under the same id).
+          const drainBatch = (batch: ReadonlyArray<PendingInjection>, commandId: CommandId) => {
+            if (batch.length === 0) return Effect.void;
+            const ids = batch.map((entry) => entry.dispatchId);
+            return claimDispatchRows(ids, commandId).pipe(
+              Effect.andThen(dispatchParentTurn(shell, consolidatedInjectionText(batch), commandId)),
+              Effect.andThen(deleteDispatchRows(ids)),
+              Effect.catchCause((cause) => {
+                const restored = pendingInjections.get(parentThreadId) ?? [];
+                pendingInjections.set(parentThreadId, [...batch, ...restored]);
+                return Effect.logWarning("subagent pending drain dispatch failed; re-enqueued", {
+                  parentThreadId,
+                  cause: Cause.pretty(cause),
+                });
+              }),
+            );
+          };
+
+          // A claimed entry (its turn was already dispatched under a fixed id
+          // before a crash) MUST be re-dispatched alone under that exact id so the
+          // engine dedups a landed turn — it can never be folded into a fresh
+          // consolidated batch (which the engine has no receipt for). Unclaimed
+          // entries consolidate into one turn under a fresh deterministic id.
+          const claimed = entries.filter((entry) => entry.claimedCommandId !== null);
+          const fresh = entries.filter((entry) => entry.claimedCommandId === null);
+          for (const entry of claimed) {
+            yield* drainBatch([entry], entry.claimedCommandId as CommandId);
+          }
+          yield* drainBatch(
+            fresh,
+            batchCommandIdFor("subagent-wake", fresh.map((entry) => entry.dispatchId)),
           );
         }),
       );
@@ -505,7 +580,16 @@ const make = Effect.gen(function* () {
           // leave the rows for the next idle transition (still exactly-once).
           if (!isThreadIdle(shell)) return;
           for (const row of rows) {
-            yield* dispatchChildSteer(shell, row.text ?? "").pipe(
+            // commandId is claimed durably before dispatch and re-used verbatim on
+            // restart (row.commandId): a crash before the delete re-fires under the
+            // same id and the engine dedups it (exactly-once). A fresh row uses the
+            // deterministic row-id-derived id.
+            const commandId =
+              row.commandId !== null
+                ? CommandId.make(row.commandId)
+                : dispatchCommandIdFor("subagent-steer", row.id);
+            yield* claimDispatchRows([row.id], commandId).pipe(
+              Effect.andThen(dispatchChildSteer(shell, row.text ?? "", commandId)),
               Effect.andThen(deleteDispatchRows([row.id])),
               Effect.catchCause((cause) =>
                 Effect.logWarning("deferred child steer dispatch failed; will retry on next idle", {
@@ -932,6 +1016,9 @@ const make = Effect.gen(function* () {
           error: row.error,
           enqueuedAtMs: reloadNow,
           dispatchId: row.id,
+          // A claimed row (its turn was dispatched under this exact id before the
+          // crash) must re-fire under that id so the engine dedups a landed turn.
+          claimedCommandId: row.commandId !== null ? CommandId.make(row.commandId) : null,
         });
         pendingInjections.set(parentThreadId, queue);
         yield* wakeLockFor(parentThreadId);

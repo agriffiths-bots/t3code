@@ -30,9 +30,24 @@ export const PendingDispatch = Schema.Struct({
   text: Schema.NullOr(Schema.String),
   error: Schema.NullOr(Schema.String),
   status: Schema.NullOr(Schema.String),
+  /**
+   * The orchestration command id this row's wake/steer turn was dispatched
+   * under, claimed durably BEFORE the dispatch (R-B exactly-once). Null means
+   * the row has not yet been dispatched and is free to be (re)batched under a
+   * fresh deterministic id; non-null means it must be re-dispatched under THIS
+   * exact id on restart so the engine's receipt dedup makes a landed turn a
+   * no-op and an un-landed turn fire — independent of how rows re-batch.
+   */
+  commandId: Schema.NullOr(Schema.String),
   createdAt: IsoDateTime,
 });
 export type PendingDispatch = typeof PendingDispatch.Type;
+
+export const ClaimPendingDispatchesInput = Schema.Struct({
+  ids: Schema.Array(PendingDispatchId),
+  commandId: Schema.String,
+});
+export type ClaimPendingDispatchesInput = typeof ClaimPendingDispatchesInput.Type;
 
 export const ListPendingDispatchesByTargetInput = Schema.Struct({
   kind: PendingDispatchKind,
@@ -60,6 +75,15 @@ export interface PendingDispatchRepositoryShape {
    * List all pending dispatch rows, oldest first.
    */
   readonly listAll: () => Effect.Effect<ReadonlyArray<PendingDispatch>, ProjectionRepositoryError>;
+
+  /**
+   * Durably stamp the command id a batch of rows is being dispatched under,
+   * BEFORE the orchestration dispatch (R-B exactly-once claim). A no-op for an
+   * empty id list.
+   */
+  readonly claim: (
+    input: ClaimPendingDispatchesInput,
+  ) => Effect.Effect<void, ProjectionRepositoryError>;
 
   /**
    * Hard-delete pending dispatch rows by id. A no-op for an empty id list.

@@ -232,6 +232,12 @@ describe("ChildThreadCoordinator", () => {
     }>;
     /** Pending_dispatches rows inserted BEFORE start() (simulated restart). */
     readonly seedPendingDispatches?: ReadonlyArray<PendingDispatch>;
+    /**
+     * Command ids that already have an `accepted` receipt at boot — i.e. their
+     * turn LANDED before a crash. The fake engine dedups a re-fire of these the
+     * same way the real engine's transactional receipt does (exactly-once).
+     */
+    readonly seedAcceptedCommandIds?: ReadonlyArray<string>;
     /** Thread ids whose `getThreadShellById` read sleeps far longer than a slice. */
     readonly slowThreadShellIds?: ReadonlyArray<ThreadId>;
     /**
@@ -256,12 +262,28 @@ describe("ChildThreadCoordinator", () => {
     const enqueueSync = (event: OrchestrationEvent) =>
       Effect.runSync(Queue.offer(eventQueue, event));
 
+    // Mirror the real OrchestrationEngine's transactional commandId dedup: a
+    // command whose commandId already has an `accepted` receipt is NOT appended
+    // again; the existing sequence is returned. This is the property the
+    // exactly-once wake/steer delivery relies on across a crash.
+    const acceptedByCommandId = new Map<string, number>();
+    for (const commandId of input?.seedAcceptedCommandIds ?? []) {
+      // Pre-landed turn (committed before the simulated crash): a re-fire under
+      // this commandId returns the existing sequence without re-appending.
+      acceptedByCommandId.set(commandId, acceptedByCommandId.size + 1);
+    }
     const recordDispatch = (command: OrchestrationCommand) => {
+      const existing = acceptedByCommandId.get(command.commandId);
+      if (existing !== undefined) {
+        return { sequence: existing };
+      }
       dispatched.push(command);
+      const sequence = dispatched.length;
+      acceptedByCommandId.set(command.commandId, sequence);
       if (command.type === "thread.turn.start") {
         input?.onTurnStartDispatch?.(command, enqueueSync);
       }
-      return { sequence: dispatched.length };
+      return { sequence };
     };
 
     const engineLayer = Layer.succeed(
@@ -1031,6 +1053,7 @@ describe("ChildThreadCoordinator", () => {
           text: "reloaded child result",
           error: null,
           status: "completed",
+          commandId: null,
           createdAt: now as unknown as PendingDispatch["createdAt"],
         },
       ],
@@ -1046,6 +1069,185 @@ describe("ChildThreadCoordinator", () => {
     // A second parent turn-completion must NOT re-fire the already-drained row.
     await harness.feed(turnDiffEvent(parent, "ready"));
     expect(harness.dispatched.filter((c) => c.type === "thread.turn.start")).toHaveLength(1);
+  });
+
+  it("R-B exactly-once: a crash between dispatch and delete neither re-fires a landed wake nor loses an un-landed one", async () => {
+    // Simulated crash window: the durable rows survived (delete never ran), and
+    // for one of them the wake turn HAD committed before the crash (its
+    // commandId already has an accepted receipt). On recovery + parent idle:
+    //   - the LANDED wake must NOT re-fire (no duplicate "[sub-agent ...]" turn),
+    //     but its orphaned row must still be cleaned up; and
+    //   - the UN-LANDED wake MUST be delivered (no loss).
+    const landedParent = ThreadId.make("xo-landed-parent");
+    const landedChild = ThreadId.make("xo-landed-child");
+    const lostParent = ThreadId.make("xo-lost-parent");
+    const lostChild = ThreadId.make("xo-lost-child");
+    const landedId = PendingDispatchId.make("pd-xo-landed");
+    const lostId = PendingDispatchId.make("pd-xo-lost");
+    // The coordinator derives the wake commandId deterministically from the row
+    // id: batchCommandIdFor("subagent-wake", [id]) === `server:subagent-wake:${id}`.
+    const landedCommandId = `server:subagent-wake:${landedId}`;
+    const harness = await createHarness({
+      threads: [
+        makeThreadState({
+          threadId: landedParent,
+          latestTurn: makeLatestTurn("completed"),
+          session: makeSession(landedParent, "ready"),
+        }),
+        makeThreadState({
+          threadId: lostParent,
+          latestTurn: makeLatestTurn("completed"),
+          session: makeSession(lostParent, "ready"),
+        }),
+      ],
+      seedPendingDispatches: [
+        {
+          id: landedId,
+          kind: "parent_injection",
+          targetThreadId: landedParent,
+          sourceChildId: landedChild,
+          text: "landed result",
+          error: null,
+          status: "completed",
+          commandId: null,
+          createdAt: now as unknown as PendingDispatch["createdAt"],
+        },
+        {
+          id: lostId,
+          kind: "parent_injection",
+          targetThreadId: lostParent,
+          sourceChildId: lostChild,
+          text: "un-landed result",
+          error: null,
+          status: "completed",
+          commandId: null,
+          createdAt: now as unknown as PendingDispatch["createdAt"],
+        },
+      ],
+      // The landed wake's turn committed before the crash.
+      seedAcceptedCommandIds: [landedCommandId],
+    });
+
+    // Both rows reloaded as pending.
+    expect(await runtimeHasPending(harness, landedParent)).toBe(true);
+    expect(await runtimeHasPending(harness, lostParent)).toBe(true);
+
+    // Recovery: each parent goes idle and drains.
+    await harness.feed(turnDiffEvent(landedParent, "ready"));
+    await harness.feed(turnDiffEvent(lostParent, "ready"));
+
+    // No duplicate: the landed wake re-fired under the same commandId, which the
+    // engine deduped, so NO new turn landed for the landed parent.
+    const landedStarts = harness.dispatched.filter(
+      (c) => c.type === "thread.turn.start" && c.threadId === landedParent,
+    );
+    expect(landedStarts).toHaveLength(0);
+    // No loss: the un-landed wake was delivered as a fresh turn.
+    const lostStarts = harness.dispatched.filter(
+      (c) => c.type === "thread.turn.start" && c.threadId === lostParent,
+    );
+    expect(lostStarts).toHaveLength(1);
+
+    // Both durable rows are cleaned up (the landed row even though it re-fired a
+    // no-op) and neither parent has pending work left to re-load on next restart.
+    expect(await harness.listPendingDispatches()).toHaveLength(0);
+    expect(await runtimeHasPending(harness, landedParent)).toBe(false);
+    expect(await runtimeHasPending(harness, lostParent)).toBe(false);
+  });
+
+  it("R-B exactly-once: a landed-but-undeleted batch is NOT re-delivered when a new row re-batches it", async () => {
+    // The hard case the deterministic-batch-id alone could not cover: rows [X,Y]
+    // were claimed+dispatched as ONE consolidated turn under a fixed commandId and
+    // the turn LANDED, but the delete never ran (crash). Before restart a NEW
+    // child Z completes for the same parent (durable row Z, unclaimed). On restart
+    // + parent idle, the batch composition changes to {X,Y,Z}. A naive fresh batch
+    // id would defeat engine dedup and re-deliver X,Y. The claim makes X,Y re-fire
+    // under their ORIGINAL id (deduped no-op) while only Z is delivered fresh.
+    const parent = ThreadId.make("xo-rebatch-parent");
+    const childX = ThreadId.make("xo-rebatch-x");
+    const childY = ThreadId.make("xo-rebatch-y");
+    const childZ = ThreadId.make("xo-rebatch-z");
+    const idX = PendingDispatchId.make("pd-xo-x");
+    const idY = PendingDispatchId.make("pd-xo-y");
+    const idZ = PendingDispatchId.make("pd-xo-z");
+    // The id [X,Y] were dispatched under before the crash (batchCommandIdFor sorts
+    // the ids), claimed durably onto both rows.
+    const landedBatchCommandId = `server:subagent-wake:${[idX, idY].sort().join(",")}`;
+    const harness = await createHarness({
+      threads: [
+        makeThreadState({
+          threadId: parent,
+          latestTurn: makeLatestTurn("completed"),
+          session: makeSession(parent, "ready"),
+        }),
+      ],
+      seedPendingDispatches: [
+        {
+          id: idX,
+          kind: "parent_injection",
+          targetThreadId: parent,
+          sourceChildId: childX,
+          text: "x result",
+          error: null,
+          status: "completed",
+          // Claimed under the landed batch id before the crash.
+          commandId: landedBatchCommandId,
+          createdAt: now as unknown as PendingDispatch["createdAt"],
+        },
+        {
+          id: idY,
+          kind: "parent_injection",
+          targetThreadId: parent,
+          sourceChildId: childY,
+          text: "y result",
+          error: null,
+          status: "completed",
+          commandId: landedBatchCommandId,
+          createdAt: now as unknown as PendingDispatch["createdAt"],
+        },
+        {
+          // New child completion that arrived after the crash, before restart:
+          // unclaimed, free to consolidate under a fresh id.
+          id: idZ,
+          kind: "parent_injection",
+          targetThreadId: parent,
+          sourceChildId: childZ,
+          text: "z result",
+          error: null,
+          status: "completed",
+          commandId: null,
+          createdAt: now as unknown as PendingDispatch["createdAt"],
+        },
+      ],
+      // The [X,Y] turn committed before the crash.
+      seedAcceptedCommandIds: [landedBatchCommandId],
+    });
+
+    // All three rows reloaded as pending for the parent.
+    expect(await runtimeHasPending(harness, parent)).toBe(true);
+
+    // Parent goes idle and drains.
+    await harness.feed(turnDiffEvent(parent, "ready"));
+
+    // Exactly ONE new turn lands: the X,Y re-fire dedups (no duplicate of x/y),
+    // only Z is delivered fresh. The bug would have produced a turn containing
+    // x/y/z together (X,Y duplicated) under a new id.
+    const starts = harness.dispatched.filter(
+      (c) => c.type === "thread.turn.start" && c.threadId === parent,
+    ) as Array<Extract<OrchestrationCommand, { type: "thread.turn.start" }>>;
+    expect(starts).toHaveLength(1);
+    const text = starts[0]?.message.text ?? "";
+    expect(text).toContain("z result");
+    expect(text).not.toContain("x result");
+    expect(text).not.toContain("y result");
+
+    // Every durable row is cleaned up; nothing re-loads on a further restart.
+    expect(await harness.listPendingDispatches()).toHaveLength(0);
+    expect(await runtimeHasPending(harness, parent)).toBe(false);
+    await harness.feed(turnDiffEvent(parent, "ready"));
+    expect(
+      harness.dispatched.filter((c) => c.type === "thread.turn.start" && c.threadId === parent),
+    ).toHaveLength(1);
   });
 
   it("R-B: a durable injection for a deleted parent is dropped (no orphaned row, no double-fire)", async () => {
@@ -1065,6 +1267,7 @@ describe("ChildThreadCoordinator", () => {
           text: "result for a parent that is gone",
           error: null,
           status: "completed",
+          commandId: null,
           createdAt: now as unknown as PendingDispatch["createdAt"],
         },
       ],
@@ -1116,6 +1319,7 @@ describe("ChildThreadCoordinator", () => {
       text: "do the next thing",
       error: null,
       status: null,
+      commandId: null,
       createdAt: now as unknown as PendingDispatch["createdAt"],
     });
     // The child going idle (turn-diff-completed) drains the steer once.

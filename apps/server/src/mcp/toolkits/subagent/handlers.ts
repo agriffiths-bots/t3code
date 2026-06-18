@@ -325,6 +325,7 @@ const steerSubagent = Effect.fn("SubagentToolkit.steer")(function* (
       text: input.message,
       error: null,
       status: null,
+      commandId: null,
       createdAt: IsoDateTime.make(createdAt),
     };
     yield* runtime.pendingDispatches

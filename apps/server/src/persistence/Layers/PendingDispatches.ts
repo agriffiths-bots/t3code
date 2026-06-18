@@ -6,6 +6,7 @@ import * as Schema from "effect/Schema";
 
 import { toPersistenceSqlError } from "../Errors.ts";
 import {
+  ClaimPendingDispatchesInput,
   ListPendingDispatchesByTargetInput,
   PendingDispatch,
   PendingDispatchRepository,
@@ -27,6 +28,7 @@ const makePendingDispatchRepository = Effect.gen(function* () {
           text,
           error,
           status,
+          command_id,
           created_at
         )
         VALUES (
@@ -37,6 +39,7 @@ const makePendingDispatchRepository = Effect.gen(function* () {
           ${row.text},
           ${row.error},
           ${row.status},
+          ${row.commandId},
           ${row.createdAt}
         )
         ON CONFLICT (id)
@@ -47,6 +50,7 @@ const makePendingDispatchRepository = Effect.gen(function* () {
           text = excluded.text,
           error = excluded.error,
           status = excluded.status,
+          command_id = excluded.command_id,
           created_at = excluded.created_at
       `,
   });
@@ -64,6 +68,7 @@ const makePendingDispatchRepository = Effect.gen(function* () {
           text,
           error,
           status,
+          command_id AS "commandId",
           created_at AS "createdAt"
         FROM pending_dispatches
         WHERE kind = ${kind}
@@ -85,9 +90,20 @@ const makePendingDispatchRepository = Effect.gen(function* () {
           text,
           error,
           status,
+          command_id AS "commandId",
           created_at AS "createdAt"
         FROM pending_dispatches
         ORDER BY created_at ASC, id ASC
+      `,
+  });
+
+  const claimPendingDispatchRows = SqlSchema.void({
+    Request: ClaimPendingDispatchesInput,
+    execute: ({ ids, commandId }) =>
+      sql`
+        UPDATE pending_dispatches
+        SET command_id = ${commandId}
+        WHERE ${sql.in("id", ids)}
       `,
   });
 
@@ -106,6 +122,13 @@ const makePendingDispatchRepository = Effect.gen(function* () {
       Effect.mapError(toPersistenceSqlError("PendingDispatchRepository.listAll:query")),
     );
 
+  const claim: PendingDispatchRepositoryShape["claim"] = (input) =>
+    input.ids.length === 0
+      ? Effect.void
+      : claimPendingDispatchRows(input).pipe(
+          Effect.mapError(toPersistenceSqlError("PendingDispatchRepository.claim:query")),
+        );
+
   const deleteByIds: PendingDispatchRepositoryShape["deleteByIds"] = (ids) =>
     ids.length === 0
       ? Effect.void
@@ -121,6 +144,7 @@ const makePendingDispatchRepository = Effect.gen(function* () {
     insert,
     listByTarget,
     listAll,
+    claim,
     deleteByIds,
   } satisfies PendingDispatchRepositoryShape;
 });
