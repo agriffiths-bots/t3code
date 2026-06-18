@@ -15,6 +15,12 @@ export const WAIT_TIMEOUT_DEFAULT_SECONDS = 600;
 export const WAIT_TIMEOUT_MIN_SECONDS = 1;
 export const WAIT_TIMEOUT_MAX_SECONDS = 3_900;
 
+// Cumulative blocking budget cap for a single `t3_wait_subagent` (across
+// resumeToken re-calls), regardless of the caller's timeoutSeconds (R-A). Once
+// this elapses with children still running, the wait auto-promotes them to
+// wake-on-completion and returns so the model stops polling.
+export const WAIT_AUTO_PROMOTE_SECONDS = 90;
+
 export const SpawnSubagentInput = Schema.Struct({
   ...ThreadStartToolInput.fields,
   detached: Schema.optional(Schema.Boolean),
@@ -43,9 +49,22 @@ export const SteerSubagentInput = Schema.Struct({
 });
 export type SteerSubagentInput = typeof SteerSubagentInput.Type;
 
+export const SteerSubagentApplied = Schema.Literals([
+  "now",
+  "queued-midturn",
+  "deferred-until-idle",
+]);
+export type SteerSubagentApplied = typeof SteerSubagentApplied.Type;
+
 export const SteerSubagentOutput = Schema.Struct({
   childThreadId: ThreadId,
   accepted: Schema.Boolean,
+  // How the steer was applied given the child's provider + turn state (R-C):
+  // "now" (idle, dispatched), "queued-midturn" (a known driver —
+  // claudeAgent/codex/cursor/grok/opencode, all support mid-turn steer — folded
+  // into the running turn), or "deferred-until-idle" (an unknown/future driver
+  // with unverified mid-turn semantics, persisted and dispatched once idle).
+  applied: SteerSubagentApplied,
 });
 export type SteerSubagentOutput = typeof SteerSubagentOutput.Type;
 
@@ -79,6 +98,10 @@ export const WaitSubagentResult = Schema.Struct({
   turnCount: Schema.Int,
   finalAssistantText: Schema.NullOr(Schema.String),
   error: Schema.NullOr(Schema.String),
+  // Present on a still-running child once the wait auto-promoted (R-A): the
+  // child will now notify the parent on completion, so the model should stop
+  // waiting and do other work.
+  note: Schema.optional(Schema.String),
 });
 
 export const WaitSubagentOutput = Schema.Struct({
@@ -87,6 +110,10 @@ export const WaitSubagentOutput = Schema.Struct({
   timedOutCount: Schema.Int,
   pending: Schema.Boolean,
   resumeToken: Schema.String,
+  // True when the ~90s auto-promote budget elapsed with one+ children still
+  // running (R-A): those children were promoted to wake-on-completion and the
+  // model should stop calling wait.
+  promoted: Schema.optional(Schema.Boolean),
 });
 export type WaitSubagentOutput = typeof WaitSubagentOutput.Type;
 
@@ -183,7 +210,7 @@ export const SpawnSubagentTool = Tool.make("t3_spawn_subagent", {
 
 export const SteerSubagentTool = Tool.make("t3_steer_subagent", {
   description:
-    "Send an additional instruction to a sub-agent you spawned. Prefer steering a sub-agent while it is idle (between turns): with Claude the message is safely queued, but mid-turn steering semantics are undefined for Codex and Cursor sub-agents, so steer once the sub-agent is idle when possible. Only the parent that spawned the sub-agent may steer it.",
+    "Send an additional instruction to a sub-agent you spawned. This is provider-safe: the system picks the right mechanism automatically — an idle sub-agent gets the message now, a Claude sub-agent mid-turn safely queues it, and a Codex or Cursor sub-agent mid-turn auto-defers it until the sub-agent goes idle (no mid-turn injection is ever sent to those providers). You do not need to know the provider or check whether the sub-agent is busy; just steer. Only the parent that spawned the sub-agent may steer it.",
   parameters: SteerSubagentInput,
   success: SteerSubagentOutput,
   failure: ThreadStartToolError,
@@ -207,7 +234,7 @@ export const CheckSubagentTool = Tool.make("t3_check_subagent", {
 
 export const WaitSubagentTool = Tool.make("t3_wait_subagent", {
   description:
-    "Wait for one or more sub-agents to finish. This returns quickly with one result row per requested child; a child that has not finished yet has status \"pending\". While pending is true and you still want to wait, re-call this tool with the returned resumeToken (and the same childThreadIds) to keep waiting — never assume a single call blocks until completion. mode \"all\" (default) waits for every child; \"any\" returns as soon as one settles. timeoutSeconds (default 600, clamped to [1,3900]) is the total logical budget; children still unfinished once it is exhausted are returned with status \"timeout\".",
+    "Wait for one or more sub-agents to finish. This returns quickly with one result row per requested child; a child that has not finished yet has status \"pending\". While pending is true and you still want to wait, re-call this tool with the returned resumeToken (and the same childThreadIds) to keep waiting — never assume a single call blocks until completion. This waits at most ~90 seconds in total (across resumeToken re-calls); once that elapses with children still running, it returns promoted=true and those children have status \"running\" — STOP calling wait and go do other work, you will receive a new message automatically when each one finishes. mode \"all\" (default) waits for every child; \"any\" returns as soon as one settles. timeoutSeconds (default 600, clamped to [1,3900]) is the requested logical budget; children still unfinished once it is exhausted are returned with status \"timeout\".",
   parameters: WaitSubagentInput,
   success: WaitSubagentOutput,
   failure: ThreadStartToolError,

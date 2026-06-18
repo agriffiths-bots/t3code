@@ -126,6 +126,18 @@ export interface ChildThreadCoordinatorShape {
     childThreadId: ThreadId,
   ) => Effect.Effect<void, ThreadStartToolError>;
 
+  /**
+   * Promote each still-running child to wake-on-completion (R-A). A waited child
+   * whose waiter stopped (the wait budget elapsed) would otherwise complete with
+   * neither an active waiter nor a wake; promotion flips it onto the same
+   * wake-the-parent path detached children use, satisfying the notify-guarantee.
+   * Already-terminal children are left untouched (their result was/will be
+   * delivered to the waiter). A no-op for unknown ids.
+   */
+  readonly promoteToWake: (
+    childThreadIds: ReadonlyArray<ThreadId>,
+  ) => Effect.Effect<void>;
+
   /** Whether the parent has queued sub-agent completion injections awaiting drain. */
   readonly hasPendingInjections: (parentThreadId: ThreadId) => Effect.Effect<boolean>;
 

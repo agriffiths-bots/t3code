@@ -28,6 +28,12 @@ import { SqlClient } from "effect/unstable/sql/SqlClient";
 import { afterEach, describe, expect, it } from "vite-plus/test";
 
 import { SqlitePersistenceMemory } from "../../persistence/Layers/Sqlite.ts";
+import { PendingDispatchRepositoryLive } from "../../persistence/Layers/PendingDispatches.ts";
+import {
+  PendingDispatchId,
+  PendingDispatchRepository,
+  type PendingDispatch,
+} from "../../persistence/Services/PendingDispatches.ts";
 import { ProviderInstanceRegistry } from "../../provider/Services/ProviderInstanceRegistry.ts";
 import {
   ActiveBootstrapTurnStartDispatcherLive,
@@ -200,7 +206,7 @@ const threadDeletedEvent = (threadId: ThreadId): OrchestrationEvent =>
 
 describe("ChildThreadCoordinator", () => {
   let runtime: ManagedRuntime.ManagedRuntime<
-    ChildThreadCoordinator | SqlClient,
+    ChildThreadCoordinator | SqlClient | PendingDispatchRepository,
     unknown
   > | null = null;
   let scope: Scope.Closeable | null = null;
@@ -224,6 +230,8 @@ describe("ChildThreadCoordinator", () => {
       readonly threadId: ThreadId;
       readonly parentThreadId: ThreadId;
     }>;
+    /** Pending_dispatches rows inserted BEFORE start() (simulated restart). */
+    readonly seedPendingDispatches?: ReadonlyArray<PendingDispatch>;
     /** Thread ids whose `getThreadShellById` read sleeps far longer than a slice. */
     readonly slowThreadShellIds?: ReadonlyArray<ThreadId>;
     /**
@@ -316,6 +324,7 @@ describe("ChildThreadCoordinator", () => {
     );
 
     const layer = ChildThreadCoordinatorLive.pipe(
+      Layer.provideMerge(PendingDispatchRepositoryLive),
       Layer.provideMerge(engineLayer),
       Layer.provideMerge(projectionLayer),
       Layer.provideMerge(registryLayer),
@@ -342,11 +351,34 @@ describe("ChildThreadCoordinator", () => {
       }
     }
 
+    // Pre-populate pending_dispatches BEFORE start() so reconciliation reloads
+    // them (simulated restart).
+    if (input?.seedPendingDispatches) {
+      for (const row of input.seedPendingDispatches) {
+        await activeRuntime.runPromise(
+          Effect.flatMap(Effect.service(PendingDispatchRepository), (repo) => repo.insert(row)),
+        );
+      }
+    }
+
     const coordinator = await activeRuntime.runPromise(Effect.service(ChildThreadCoordinator));
     scope = await Effect.runPromise(Scope.make("sequential"));
     await Effect.runPromise(coordinator.start().pipe(Scope.provide(scope)));
 
     const setThread = (state: ThreadState) => threadStates.set(state.shell.id, state);
+
+    // Simulate a deleted thread: subsequent getThreadShellById reads return none.
+    const removeThread = (threadId: ThreadId) => threadStates.delete(threadId);
+
+    const listPendingDispatches = () =>
+      activeRuntime.runPromise(
+        Effect.flatMap(Effect.service(PendingDispatchRepository), (repo) => repo.listAll()),
+      );
+
+    const insertPendingDispatch = (row: PendingDispatch) =>
+      activeRuntime.runPromise(
+        Effect.flatMap(Effect.service(PendingDispatchRepository), (repo) => repo.insert(row)),
+      );
 
     // Offer an event, then wait until the coordinator has finished processing it.
     const feed = async (event: OrchestrationEvent) => {
@@ -361,7 +393,16 @@ describe("ChildThreadCoordinator", () => {
     const register = (registerInput: Parameters<typeof coordinator.register>[0]) =>
       Effect.runPromise(coordinator.register(registerInput));
 
-    return { coordinator, dispatched, setThread, feed, register };
+    return {
+      coordinator,
+      dispatched,
+      setThread,
+      removeThread,
+      feed,
+      register,
+      listPendingDispatches,
+      insertPendingDispatch,
+    };
   }
 
   it("settles ready turn-diff as completed and captures final assistant text", async () => {
@@ -868,6 +909,227 @@ describe("ChildThreadCoordinator", () => {
     const slice = await runtimeWaitSlice(harness, [child], FAR_FUTURE_MS);
     expect(slice.results[0]!.status).toBe("failed");
     expect(slice.results[0]!.error).toContain("never registered");
+  });
+
+  it("R-A: a promoted child whose waiter stopped wakes the parent on completion", async () => {
+    const child = ThreadId.make("promote-child");
+    const parent = ThreadId.make("promote-parent");
+    const harness = await createHarness({
+      threads: [
+        // Child starts running; it only completes after the wait was abandoned.
+        makeThreadState({
+          threadId: child,
+          parentThreadId: parent,
+          latestTurn: makeLatestTurn("running"),
+          session: makeSession(child, "running", TurnId.make("turn-1")),
+        }),
+        // Idle parent so the wake dispatches a turn (not just enqueues).
+        makeThreadState({
+          threadId: parent,
+          latestTurn: makeLatestTurn("completed"),
+          session: makeSession(parent, "ready"),
+        }),
+      ],
+    });
+    // Foreground (non-detached) child: completion would normally only resolve the
+    // waiter, NOT wake the parent.
+    await harness.register({
+      parentThreadId: parent,
+      childThreadId: child,
+      detached: false,
+      model: codexModel,
+      spawnedAtMs: 0,
+    });
+    // The wait budget elapsed -> the waiter stopped -> promote to wake.
+    await Effect.runPromise(harness.coordinator.promoteToWake([child]));
+    // Now the child completes; the promotion must wake the parent.
+    harness.setThread(
+      makeThreadState({
+        threadId: child,
+        parentThreadId: parent,
+        latestTurn: makeLatestTurn("completed"),
+        assistantText: "promoted result",
+      }),
+    );
+    await harness.feed(turnDiffEvent(child, "ready"));
+    const turnStarts = harness.dispatched.filter((command) => command.type === "thread.turn.start");
+    expect(turnStarts).toHaveLength(1);
+    // The durable wake row was deleted on dispatch (idle parent path).
+    expect(await harness.listPendingDispatches()).toHaveLength(0);
+  });
+
+  it("R-B: a wake enqueued mid-turn persists a durable row, then drains on parent idle and deletes it", async () => {
+    const child = ThreadId.make("durable-child");
+    const parent = ThreadId.make("durable-parent");
+    const harness = await createHarness({
+      threads: [
+        makeThreadState({
+          threadId: child,
+          parentThreadId: parent,
+          latestTurn: makeLatestTurn("completed"),
+          assistantText: "durable result",
+        }),
+        // Parent is MID-TURN -> the wake must enqueue (and persist a durable row),
+        // not dispatch.
+        makeThreadState({
+          threadId: parent,
+          latestTurn: makeLatestTurn("running"),
+          session: makeSession(parent, "running", TurnId.make("turn-9")),
+        }),
+      ],
+    });
+    await harness.register({
+      parentThreadId: parent,
+      childThreadId: child,
+      detached: true,
+      model: codexModel,
+      spawnedAtMs: 0,
+    });
+    await harness.feed(turnDiffEvent(child, "ready"));
+    // Mid-turn -> no dispatch yet, but a durable parent_injection row exists.
+    expect(harness.dispatched.filter((c) => c.type === "thread.turn.start")).toHaveLength(0);
+    const persisted = await harness.listPendingDispatches();
+    expect(persisted).toHaveLength(1);
+    expect(persisted[0]!.kind).toBe("parent_injection");
+    expect(persisted[0]!.targetThreadId).toBe(parent);
+    expect(persisted[0]!.sourceChildId).toBe(child);
+
+    // The parent goes idle and completes a turn -> drain dispatches once and
+    // deletes the row.
+    harness.setThread(
+      makeThreadState({
+        threadId: parent,
+        latestTurn: makeLatestTurn("completed"),
+        session: makeSession(parent, "ready"),
+      }),
+    );
+    await harness.feed(turnDiffEvent(parent, "ready"));
+    expect(harness.dispatched.filter((c) => c.type === "thread.turn.start")).toHaveLength(1);
+    expect(await harness.listPendingDispatches()).toHaveLength(0);
+  });
+
+  it("R-B: a pre-populated durable row is reloaded on restart and drained exactly once on parent idle", async () => {
+    const child = ThreadId.make("restart-child");
+    const parent = ThreadId.make("restart-parent");
+    const dispatchId = PendingDispatchId.make("pd-restart-1");
+    const harness = await createHarness({
+      threads: [
+        makeThreadState({
+          threadId: parent,
+          latestTurn: makeLatestTurn("completed"),
+          session: makeSession(parent, "ready"),
+        }),
+      ],
+      // Simulated restart: a parent_injection row was persisted before the
+      // process died, and must be reloaded by start().
+      seedPendingDispatches: [
+        {
+          id: dispatchId,
+          kind: "parent_injection",
+          targetThreadId: parent,
+          sourceChildId: child,
+          text: "reloaded child result",
+          error: null,
+          status: "completed",
+          createdAt: now as unknown as PendingDispatch["createdAt"],
+        },
+      ],
+    });
+    // The reload made the parent's injection pending.
+    expect(await runtimeHasPending(harness, parent)).toBe(true);
+    // Parent completes a turn (idle) -> the reloaded row drains exactly once.
+    await harness.feed(turnDiffEvent(parent, "ready"));
+    const turnStarts = harness.dispatched.filter((c) => c.type === "thread.turn.start");
+    expect(turnStarts).toHaveLength(1);
+    expect(await runtimeHasPending(harness, parent)).toBe(false);
+    expect(await harness.listPendingDispatches()).toHaveLength(0);
+    // A second parent turn-completion must NOT re-fire the already-drained row.
+    await harness.feed(turnDiffEvent(parent, "ready"));
+    expect(harness.dispatched.filter((c) => c.type === "thread.turn.start")).toHaveLength(1);
+  });
+
+  it("R-B: a durable injection for a deleted parent is dropped (no orphaned row, no double-fire)", async () => {
+    const child = ThreadId.make("orphan-child");
+    const parent = ThreadId.make("orphan-parent");
+    const dispatchId = PendingDispatchId.make("pd-orphan-1");
+    // Restart with a durable parent_injection row whose parent thread no longer
+    // exists (it was deleted before the crash). It must NOT linger forever.
+    const harness = await createHarness({
+      threads: [],
+      seedPendingDispatches: [
+        {
+          id: dispatchId,
+          kind: "parent_injection",
+          targetThreadId: parent,
+          sourceChildId: child,
+          text: "result for a parent that is gone",
+          error: null,
+          status: "completed",
+          createdAt: now as unknown as PendingDispatch["createdAt"],
+        },
+      ],
+    });
+    // The reload made the orphaned injection pending in memory.
+    expect(await runtimeHasPending(harness, parent)).toBe(true);
+    // A drain attempt for the missing parent must delete the orphaned row (so a
+    // restart never re-loads it) and dispatch nothing.
+    await harness.feed(turnDiffEvent(parent, "ready"));
+    expect(harness.dispatched.filter((c) => c.type === "thread.turn.start")).toHaveLength(0);
+    expect(await runtimeHasPending(harness, parent)).toBe(false);
+    expect(await harness.listPendingDispatches()).toHaveLength(0);
+  });
+
+  it("R-C: a persisted child_steer drains exactly once when the child goes idle", async () => {
+    const child = ThreadId.make("steer-child");
+    const parent = ThreadId.make("steer-parent");
+    const harness = await createHarness({
+      threads: [
+        // Child is idle (a turn just completed) so the deferred steer can fire.
+        makeThreadState({
+          threadId: child,
+          parentThreadId: parent,
+          latestTurn: makeLatestTurn("completed"),
+          session: makeSession(child, "ready"),
+        }),
+        // Idle parent so the child's own completion-wake dispatches-and-deletes
+        // its row, leaving the pending_dispatches table clean for the steer assert.
+        makeThreadState({
+          threadId: parent,
+          latestTurn: makeLatestTurn("completed"),
+          session: makeSession(parent, "ready"),
+        }),
+      ],
+    });
+    await harness.register({
+      parentThreadId: parent,
+      childThreadId: child,
+      detached: true,
+      model: codexModel,
+      spawnedAtMs: 0,
+    });
+    // A provider-deferred steer (I3 enqueues this; here we persist it directly).
+    await harness.insertPendingDispatch({
+      id: PendingDispatchId.make("pd-steer-1"),
+      kind: "child_steer",
+      targetThreadId: child,
+      sourceChildId: null,
+      text: "do the next thing",
+      error: null,
+      status: null,
+      createdAt: now as unknown as PendingDispatch["createdAt"],
+    });
+    // The child going idle (turn-diff-completed) drains the steer once.
+    await harness.feed(turnDiffEvent(child, "ready"));
+    const steerStarts = harness.dispatched.filter(
+      (c) => c.type === "thread.turn.start" && c.threadId === child,
+    );
+    expect(steerStarts).toHaveLength(1);
+    expect(await harness.listPendingDispatches()).toHaveLength(0);
+    // A second idle transition must NOT re-dispatch the already-drained steer.
+    await harness.feed(turnDiffEvent(child, "ready"));
+    expect(
+      harness.dispatched.filter((c) => c.type === "thread.turn.start" && c.threadId === child),
+    ).toHaveLength(1);
   });
 });
 

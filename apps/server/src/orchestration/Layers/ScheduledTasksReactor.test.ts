@@ -172,6 +172,7 @@ describe("ScheduledTasksReactor", () => {
       register: () => Effect.void,
       waitSlice: () => unsupported(),
       assertParent: () => Effect.void,
+      promoteToWake: () => Effect.void,
       hasPendingInjections: (parentThreadId) =>
         Effect.succeed(pendingParents.has(String(parentThreadId))),
       listChildren: () => Effect.succeed([]),

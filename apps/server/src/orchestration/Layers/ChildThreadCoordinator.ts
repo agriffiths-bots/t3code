@@ -8,6 +8,7 @@
 import {
   CommandId,
   EventId,
+  IsoDateTime,
   MessageId,
   type ModelSelection,
   type OrchestrationEvent,
@@ -33,6 +34,11 @@ import {
 import { OrchestrationEngineService } from "../Services/OrchestrationEngine.ts";
 import { ProjectionSnapshotQuery } from "../Services/ProjectionSnapshotQuery.ts";
 import { ProviderInstanceRegistry } from "../../provider/Services/ProviderInstanceRegistry.ts";
+import {
+  PendingDispatchRepository,
+  type PendingDispatch,
+  type PendingDispatchId,
+} from "../../persistence/Services/PendingDispatches.ts";
 import { SqlClient } from "effect/unstable/sql/SqlClient";
 import * as SqlSchema from "effect/unstable/sql/SqlSchema";
 import * as Schema from "effect/Schema";
@@ -68,6 +74,8 @@ interface PendingInjection {
   readonly text: string | null;
   readonly error: string | null;
   readonly enqueuedAtMs: number;
+  /** The durable `pending_dispatches` row backing this injection (R-B), deleted on drain. */
+  readonly dispatchId: PendingDispatchId;
 }
 
 type TurnDiffCompletedEvent = Extract<OrchestrationEvent, { type: "thread.turn-diff-completed" }>;
@@ -123,12 +131,19 @@ const make = Effect.gen(function* () {
   const orchestrationEngine = yield* OrchestrationEngineService;
   const projectionSnapshotQuery = yield* ProjectionSnapshotQuery;
   const registry = yield* ProviderInstanceRegistry;
+  const pendingDispatches = yield* PendingDispatchRepository;
   const sql = yield* SqlClient;
 
   const children = new Map<ThreadId, ChildRecord>();
   const byParent = new Map<ThreadId, Set<ThreadId>>();
   const pendingInjections = new Map<ThreadId, Array<PendingInjection>>();
   const parentWakeLocks = new Map<ThreadId, Semaphore.Semaphore>();
+  // Children promoted to wake-on-completion (R-A): a waited child whose waiter
+  // stopped, so its completion must wake the parent like a detached child.
+  const promotedChildren = new Set<ThreadId>();
+  // Per-child guard so a deferred child_steer drain (R-C) is serialised and
+  // never double-dispatches against the same child.
+  const childSteerLocks = new Map<ThreadId, Semaphore.Semaphore>();
 
   const nowMillis = Effect.clockWith((clock) => clock.currentTimeMillis);
   const nowIso = Effect.map(DateTime.now, DateTime.formatIso);
@@ -169,6 +184,38 @@ const make = Effect.gen(function* () {
     queue.push(entry);
     pendingInjections.set(parentThreadId, queue);
   };
+
+  // R-B: persist a durable 'parent_injection' row so a wake survives restart.
+  // The returned in-memory entry carries the row id; the row is deleted on
+  // successful drain/dispatch (delete-on-dispatch => idempotent, no double-fire).
+  const persistInjection = (parentThreadId: ThreadId, result: ChildWaitResult) =>
+    Effect.gen(function* () {
+      const now = yield* nowMillis;
+      const createdAt = yield* nowIso;
+      const id = (yield* randomUUID) as PendingDispatchId;
+      const row: PendingDispatch = {
+        id,
+        kind: "parent_injection",
+        targetThreadId: parentThreadId,
+        sourceChildId: result.childThreadId,
+        text: result.finalAssistantText,
+        error: result.error,
+        status: result.status,
+        createdAt: IsoDateTime.make(createdAt),
+      };
+      yield* pendingDispatches.insert(row).pipe(Effect.orDie);
+      return {
+        childThreadId: result.childThreadId,
+        status: result.status,
+        text: result.finalAssistantText,
+        error: result.error,
+        enqueuedAtMs: now,
+        dispatchId: id,
+      } satisfies PendingInjection;
+    });
+
+  const deleteDispatchRows = (ids: ReadonlyArray<PendingDispatchId>) =>
+    pendingDispatches.deleteByIds(ids).pipe(Effect.orDie);
 
   const depthFor = (parentThreadId: ThreadId): number => {
     const parentRecord = children.get(parentThreadId);
@@ -234,7 +281,10 @@ const make = Effect.gen(function* () {
         finalAssistantText,
         error,
       });
-      if (settled && record.detached) {
+      // A detached child always wakes its parent; a promoted child (R-A: a waited
+      // child whose waiter stopped) must wake too, satisfying the notify-guarantee
+      // that no child completes with neither an active waiter nor a wake.
+      if (settled && (record.detached || promotedChildren.has(childThreadId))) {
         yield* wakeParent(record, { childThreadId, status, finalAssistantText, error });
       }
     });
@@ -254,6 +304,23 @@ const make = Effect.gen(function* () {
   const dispatchParentTurn = (shell: OrchestrationThreadShell, text: string) =>
     Effect.gen(function* () {
       const commandId = yield* newCommandId("subagent-wake");
+      const messageId = MessageId.make(yield* randomUUID);
+      const createdAt = yield* nowIso;
+      yield* dispatchActive({
+        type: "thread.turn.start",
+        commandId,
+        threadId: shell.id,
+        message: { messageId, role: "user", text, attachments: [] },
+        runtimeMode: shell.runtimeMode,
+        interactionMode: shell.interactionMode,
+        createdAt,
+      });
+    });
+
+  // Dispatch a deferred steer to a now-idle child as a fresh user turn (R-C).
+  const dispatchChildSteer = (shell: OrchestrationThreadShell, text: string) =>
+    Effect.gen(function* () {
+      const commandId = yield* newCommandId("subagent-steer");
       const messageId = MessageId.make(yield* randomUUID);
       const createdAt = yield* nowIso;
       yield* dispatchActive({
@@ -311,14 +378,9 @@ const make = Effect.gen(function* () {
       const lock = yield* wakeLockFor(parentThreadId);
       yield* lock.withPermits(1)(
         Effect.gen(function* () {
-          const now = yield* nowMillis;
-          const entry: PendingInjection = {
-            childThreadId: result.childThreadId,
-            status: result.status,
-            text: result.finalAssistantText,
-            error: result.error,
-            enqueuedAtMs: now,
-          };
+          // Persist the durable row up front so the wake survives a restart in
+          // every branch below; it is deleted only after a successful dispatch.
+          const entry = yield* persistInjection(parentThreadId, result);
           const shellOption = yield* getThreadShell(parentThreadId);
           if (Option.isNone(shellOption)) {
             enqueuePending(parentThreadId, entry);
@@ -335,6 +397,7 @@ const make = Effect.gen(function* () {
           }
           if (isThreadIdle(shell)) {
             yield* dispatchParentTurn(shell, consolidatedInjectionText([entry])).pipe(
+              Effect.andThen(deleteDispatchRows([entry.dispatchId])),
               Effect.catchCause((cause) => {
                 enqueuePending(parentThreadId, entry);
                 return Effect.logWarning("subagent wake dispatch failed; enqueued injection", {
@@ -362,7 +425,18 @@ const make = Effect.gen(function* () {
           const queue = pendingInjections.get(parentThreadId);
           if (!queue || queue.length === 0) return;
           const shellOption = yield* getThreadShell(parentThreadId);
-          if (Option.isNone(shellOption)) return;
+          if (Option.isNone(shellOption)) {
+            // Parent no longer exists (deleted): it can never become idle, so an
+            // orphaned durable row would reload forever. Drop the in-memory queue
+            // AND delete the backing rows so a restart never re-loads them.
+            pendingInjections.delete(parentThreadId);
+            yield* deleteDispatchRows(queue.map((entry) => entry.dispatchId));
+            yield* Effect.logWarning("parent gone while draining pending injections; dropped orphaned rows", {
+              parentThreadId,
+              droppedCount: queue.length,
+            });
+            return;
+          }
           const shell = shellOption.value;
           if (isFreshParent(shell)) {
             yield* Effect.logWarning(
@@ -374,6 +448,9 @@ const make = Effect.gen(function* () {
           const entries = [...queue];
           pendingInjections.delete(parentThreadId);
           yield* dispatchParentTurn(shell, consolidatedInjectionText(entries)).pipe(
+            // Delete-on-dispatch within the same per-parent lock: the rows are
+            // gone before the lock releases, so a restart never re-fires them.
+            Effect.andThen(deleteDispatchRows(entries.map((entry) => entry.dispatchId))),
             Effect.catchCause((cause) => {
               // Restore the entries so a transient dispatch failure is retried.
               const restored = pendingInjections.get(parentThreadId) ?? [];
@@ -401,6 +478,48 @@ const make = Effect.gen(function* () {
     yield* Effect.forEach(parents, drainPending, { discard: true });
   });
 
+  const childSteerLockFor = (childThreadId: ThreadId): Effect.Effect<Semaphore.Semaphore> => {
+    const existing = childSteerLocks.get(childThreadId);
+    if (existing) return Effect.succeed(existing);
+    return Semaphore.make(1).pipe(
+      Effect.tap((semaphore) => Effect.sync(() => childSteerLocks.set(childThreadId, semaphore))),
+    );
+  };
+
+  // R-C: a child that just went idle drains any provider-deferred 'child_steer'
+  // rows in created_at order, dispatching thread.turn.start(child, text) under a
+  // per-child guard and deleting each row on dispatch (exactly-once).
+  const drainChildSteers = (childThreadId: ThreadId) =>
+    Effect.gen(function* () {
+      const lock = yield* childSteerLockFor(childThreadId);
+      yield* lock.withPermits(1)(
+        Effect.gen(function* () {
+          const rows = yield* pendingDispatches
+            .listByTarget({ kind: "child_steer", targetThreadId: childThreadId })
+            .pipe(Effect.orDie);
+          if (rows.length === 0) return;
+          const shellOption = yield* getThreadShell(childThreadId);
+          if (Option.isNone(shellOption)) return;
+          const shell = shellOption.value;
+          // Re-check idleness under the lock: a turn may have restarted; if so,
+          // leave the rows for the next idle transition (still exactly-once).
+          if (!isThreadIdle(shell)) return;
+          for (const row of rows) {
+            yield* dispatchChildSteer(shell, row.text ?? "").pipe(
+              Effect.andThen(deleteDispatchRows([row.id])),
+              Effect.catchCause((cause) =>
+                Effect.logWarning("deferred child steer dispatch failed; will retry on next idle", {
+                  childThreadId,
+                  dispatchId: row.id,
+                  cause: Cause.pretty(cause),
+                }),
+              ),
+            );
+          }
+        }),
+      );
+    });
+
   const handleTurnDiffCompleted = (event: TurnDiffCompletedEvent) =>
     Effect.gen(function* () {
       const { threadId, status } = event.payload;
@@ -410,6 +529,10 @@ const make = Effect.gen(function* () {
         } else {
           yield* settleChild(threadId, "failed", `turn diff ${status}`);
         }
+        // A child that went idle drains any provider-deferred steer (R-C). Run
+        // after settle so a terminal child still flushes a queued steer if the
+        // session is somehow re-runnable; the idle re-check guards the dispatch.
+        yield* drainChildSteers(threadId);
       }
       // A parent completing a turn drains its pending injections.
       if (pendingInjections.has(threadId)) {
@@ -535,6 +658,20 @@ const make = Effect.gen(function* () {
       });
       if (matches) return;
       return yield* fail(`Thread ${childThreadId} is not a child of ${parentThreadId}.`);
+    });
+
+  // R-A: flip each still-running requested child onto the wake-on-completion
+  // path. Already-terminal children are skipped (their result was/will be
+  // delivered to the waiter); only a child whose waiter stopped needs the wake.
+  const promoteToWake: ChildThreadCoordinatorShape["promoteToWake"] = (childThreadIds) =>
+    Effect.gen(function* () {
+      for (const childThreadId of childThreadIds) {
+        const record = children.get(childThreadId);
+        if (!record) continue;
+        const done = yield* Deferred.isDone(record.terminal);
+        if (done) continue;
+        promotedChildren.add(childThreadId);
+      }
     });
 
   const hasPendingInjections: ChildThreadCoordinatorShape["hasPendingInjections"] = (
@@ -777,6 +914,29 @@ const make = Effect.gen(function* () {
         }
       }
 
+      // (2b) R-B: load durable 'parent_injection' rows into the in-memory
+      // pendingInjections map so a restart resumes delivery (drained on parent
+      // idle / next turn-completion / age valve as usual). Dedup by dispatchId
+      // against any entry wakeParent already enqueued during reconciliation above.
+      const persisted = yield* pendingDispatches.listAll().pipe(Effect.orDie);
+      const reloadNow = yield* nowMillis;
+      for (const row of persisted) {
+        if (row.kind !== "parent_injection") continue;
+        const parentThreadId = row.targetThreadId;
+        const queue = pendingInjections.get(parentThreadId) ?? [];
+        if (queue.some((entry) => entry.dispatchId === row.id)) continue;
+        queue.push({
+          childThreadId: row.sourceChildId ?? row.targetThreadId,
+          status: (row.status as ChildTerminalStatus | null) ?? "completed",
+          text: row.text,
+          error: row.error,
+          enqueuedAtMs: reloadNow,
+          dispatchId: row.id,
+        });
+        pendingInjections.set(parentThreadId, queue);
+        yield* wakeLockFor(parentThreadId);
+      }
+
       // (3) THEN fork the hot stream (the immutable-log scan above already
       // covered everything up to "now", so a gap event is never missed).
       yield* Effect.forkScoped(
@@ -795,6 +955,7 @@ const make = Effect.gen(function* () {
     register,
     waitSlice,
     assertParent,
+    promoteToWake,
     hasPendingInjections,
     listChildren,
     start,

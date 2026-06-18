@@ -46,6 +46,7 @@ import * as ServerRuntimeStartup from "./serverRuntimeStartup.ts";
 import { ThreadStartRuntimeLive } from "./mcp/toolkits/thread/handlers.ts";
 import { SubagentRuntimeLive } from "./mcp/toolkits/subagent/handlers.ts";
 import { ScheduledTaskRepositoryLive } from "./persistence/Layers/ScheduledTasks.ts";
+import { PendingDispatchRepositoryLive } from "./persistence/Layers/PendingDispatches.ts";
 import { OrchestrationReactorLive } from "./orchestration/Layers/OrchestrationReactor.ts";
 import { RuntimeReceiptBusLive } from "./orchestration/Layers/RuntimeReceiptBus.ts";
 import { ProviderRuntimeIngestionLive } from "./orchestration/Layers/ProviderRuntimeIngestion.ts";
@@ -177,7 +178,9 @@ const ReactorLayerLive = Layer.empty.pipe(
       Layer.provide(ScheduledTaskRepositoryLive),
     ),
   ),
-  Layer.provideMerge(ChildThreadCoordinatorLive),
+  Layer.provideMerge(
+    ChildThreadCoordinatorLive.pipe(Layer.provide(PendingDispatchRepositoryLive)),
+  ),
   Layer.provideMerge(AgentAwarenessRelay.layer.pipe(Layer.provide(ServerSecretStore.layer))),
   Layer.provideMerge(RuntimeReceiptBusLive),
 );
@@ -367,8 +370,13 @@ const ServerApplicationRegistrationsLive = Layer.mergeAll(
     Layer.provide(BootstrapTurnStartDispatcher.layer),
   ),
   ThreadStartRuntimeLive,
-  ActiveChildThreadCoordinatorLive.pipe(Layer.provide(ChildThreadCoordinatorLive)),
-  SubagentRuntimeLive.pipe(Layer.provide(ScheduledTaskRepositoryLive)),
+  ActiveChildThreadCoordinatorLive.pipe(
+    Layer.provide(ChildThreadCoordinatorLive.pipe(Layer.provide(PendingDispatchRepositoryLive))),
+  ),
+  SubagentRuntimeLive.pipe(
+    Layer.provide(ScheduledTaskRepositoryLive),
+    Layer.provide(PendingDispatchRepositoryLive),
+  ),
 );
 
 export const makeRoutesLayer = Layer.mergeAll(

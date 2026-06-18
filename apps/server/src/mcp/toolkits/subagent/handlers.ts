@@ -41,6 +41,12 @@ import {
   type ScheduledTaskId,
   type ScheduledTaskRepositoryShape,
 } from "../../../persistence/Services/ScheduledTasks.ts";
+import {
+  PendingDispatchRepository,
+  type PendingDispatch,
+  type PendingDispatchId,
+  type PendingDispatchRepositoryShape,
+} from "../../../persistence/Services/PendingDispatches.ts";
 import { ProviderInstanceRegistry } from "../../../provider/Services/ProviderInstanceRegistry.ts";
 import * as McpInvocationContext from "../../McpInvocationContext.ts";
 import {
@@ -50,6 +56,7 @@ import {
 import { ThreadStartToolError } from "../thread/tools.ts";
 import {
   SubagentToolkit,
+  WAIT_AUTO_PROMOTE_SECONDS,
   WAIT_TIMEOUT_DEFAULT_SECONDS,
   WAIT_TIMEOUT_MAX_SECONDS,
   WAIT_TIMEOUT_MIN_SECONDS,
@@ -147,6 +154,7 @@ interface SubagentRuntime {
   readonly projectionSnapshotQuery: typeof ProjectionSnapshotQuery.Service;
   readonly providerInstanceRegistry: typeof ProviderInstanceRegistry.Service;
   readonly scheduledTasks: ScheduledTaskRepositoryShape;
+  readonly pendingDispatches: PendingDispatchRepositoryShape;
 }
 
 let activeRuntime: SubagentRuntime | null = null;
@@ -294,6 +302,37 @@ const steerSubagent = Effect.fn("SubagentToolkit.steer")(function* (
     ),
   );
 
+  // R-C: pick a provider-safe mechanism from the child's turn state + driver.
+  // An idle child is steered now; a mid-turn child dispatches now for every known
+  // driver (claudeAgent/codex/cursor/grok/opencode — all support mid-turn steer).
+  // Only an unknown/future driver is deferred to a durable 'child_steer' row that
+  // the coordinator drains when the child idles, since its mid-turn semantics are
+  // unverified.
+  const midTurn = child.latestTurn?.state === "running";
+  const instance = yield* runtime.providerInstanceRegistry.getInstance(child.modelSelection.instanceId);
+  const driverKind = instance?.driverKind;
+  const MIDTURN_STEER_DRIVERS = ["claudeAgent", "codex", "cursor", "grok", "opencode"];
+  const deferMidTurn = midTurn && !MIDTURN_STEER_DRIVERS.includes(driverKind ?? "");
+
+  if (deferMidTurn) {
+    const id = (yield* runtime.crypto.randomUUIDv4.pipe(Effect.orDie)) as PendingDispatchId;
+    const createdAt = yield* nowIso;
+    const row: PendingDispatch = {
+      id,
+      kind: "child_steer",
+      targetThreadId: input.childThreadId,
+      sourceChildId: null,
+      text: input.message,
+      error: null,
+      status: null,
+      createdAt: IsoDateTime.make(createdAt),
+    };
+    yield* runtime.pendingDispatches
+      .insert(row)
+      .pipe(Effect.mapError((error) => toToolError(error, "Failed to defer steer.")));
+    return { childThreadId: input.childThreadId, accepted: true, applied: "deferred-until-idle" as const };
+  }
+
   const uuid = yield* runtime.crypto.randomUUIDv4.pipe(Effect.orDie);
   const messageId = MessageId.make(yield* runtime.crypto.randomUUIDv4.pipe(Effect.orDie));
   const createdAt = yield* nowIso;
@@ -308,7 +347,11 @@ const steerSubagent = Effect.fn("SubagentToolkit.steer")(function* (
     createdAt,
   }).pipe(Effect.mapError((error) => toToolError(error, "Failed to steer sub-agent.")));
 
-  return { childThreadId: input.childThreadId, accepted: true };
+  return {
+    childThreadId: input.childThreadId,
+    accepted: true,
+    applied: midTurn ? ("queued-midturn" as const) : ("now" as const),
+  };
 });
 
 const checkSubagent = Effect.fn("SubagentToolkit.check")(function* (
@@ -334,6 +377,19 @@ const checkSubagent = Effect.fn("SubagentToolkit.check")(function* (
   };
 });
 
+// R-A: the cumulative wait-start epoch ms is carried across resumeToken
+// re-calls by prefixing it onto the coordinator's opaque slice token
+// ("<waitStartMs>:<coordinatorToken>"). The first call (no resumeToken) marks
+// now; subsequent calls recover the marker so the 90s budget spans the whole
+// wait regardless of how many slices the model re-issued.
+const parseWaitStartMs = (resumeToken: string | undefined, nowMs: number): number => {
+  if (resumeToken === undefined) return nowMs;
+  const separator = resumeToken.indexOf(":");
+  if (separator <= 0) return nowMs;
+  const parsed = Number(resumeToken.slice(0, separator));
+  return Number.isFinite(parsed) ? parsed : nowMs;
+};
+
 const waitSubagent = Effect.fn("SubagentToolkit.wait")(function* (
   input: WaitSubagentInput,
 ) {
@@ -347,7 +403,18 @@ const waitSubagent = Effect.fn("SubagentToolkit.wait")(function* (
     WAIT_TIMEOUT_MAX_SECONDS,
   );
   const nowMs = yield* Effect.clockWith((clock) => clock.currentTimeMillis);
-  const budgetDeadlineMs = nowMs + budgetSeconds * 1_000;
+  const waitStartMs = parseWaitStartMs(input.resumeToken, nowMs);
+  // Hand the coordinator only its own opaque token (the part after the marker).
+  const coordinatorToken =
+    input.resumeToken !== undefined && input.resumeToken.indexOf(":") > 0
+      ? input.resumeToken.slice(input.resumeToken.indexOf(":") + 1)
+      : input.resumeToken;
+  // Cap the cumulative blocking budget at WAIT_AUTO_PROMOTE_SECONDS regardless
+  // of the caller's timeoutSeconds; the earlier of the two deadlines bounds the
+  // slice so the slice itself never blocks past the auto-promote horizon.
+  const autoPromoteDeadlineMs = waitStartMs + WAIT_AUTO_PROMOTE_SECONDS * 1_000;
+  const callerDeadlineMs = nowMs + budgetSeconds * 1_000;
+  const budgetDeadlineMs = Math.min(callerDeadlineMs, autoPromoteDeadlineMs);
 
   // One bounded slice per invocation — the agent re-calls with the returned
   // resumeToken while `pending` is true (never one long HTTP hold).
@@ -355,20 +422,42 @@ const waitSubagent = Effect.fn("SubagentToolkit.wait")(function* (
     childThreadIds: input.childThreadIds,
     mode: input.mode ?? "all",
     budgetDeadlineMs,
-    ...(input.resumeToken !== undefined ? { resumeToken: input.resumeToken } : {}),
+    ...(coordinatorToken !== undefined ? { resumeToken: coordinatorToken } : {}),
   });
 
+  const afterSliceMs = yield* Effect.clockWith((clock) => clock.currentTimeMillis);
+  // Auto-promote (R-A): the 90s budget elapsed and one+ children are still
+  // running. Flip them onto the wake-on-completion path so they will NOTIFY the
+  // parent (notify-guarantee), and return promoted so the model stops polling.
+  const autoPromote = slice.pending && afterSliceMs >= autoPromoteDeadlineMs;
+  const stillRunningIds = autoPromote
+    ? slice.results.filter((row) => row.status === "pending").map((row) => row.childThreadId)
+    : [];
+  if (autoPromote && stillRunningIds.length > 0) {
+    yield* coordinator.promoteToWake(stillRunningIds);
+  }
+
   // Enrich each row with a turn count from the projection (the coordinator's
-  // terminal result intentionally does not track it).
+  // terminal result intentionally does not track it). On auto-promote, a still
+  // "pending" child is reported as "running" with a note telling the model to
+  // stop waiting.
   const results: WaitSubagentOutput["results"] = yield* Effect.forEach(slice.results, (row) =>
     loadThreadDetail(runtime, row.childThreadId).pipe(
-      Effect.map((thread) => ({
-        childThreadId: row.childThreadId,
-        status: row.status,
-        turnCount: Option.match(thread, { onNone: () => 0, onSome: turnCountOf }),
-        finalAssistantText: row.finalAssistantText,
-        error: row.error,
-      })),
+      Effect.map((thread) => {
+        const promotedRunning = autoPromote && row.status === "pending";
+        return {
+          childThreadId: row.childThreadId,
+          status: promotedRunning ? "running" : row.status,
+          turnCount: Option.match(thread, { onNone: () => 0, onSome: turnCountOf }),
+          finalAssistantText: row.finalAssistantText,
+          error: row.error,
+          ...(promotedRunning
+            ? {
+                note: "still running — you will be NOTIFIED when it completes; stop calling wait and do other work",
+              }
+            : {}),
+        };
+      }),
     ),
   );
 
@@ -376,8 +465,11 @@ const waitSubagent = Effect.fn("SubagentToolkit.wait")(function* (
     results,
     settledCount: slice.settledCount,
     timedOutCount: slice.timedOutCount,
-    pending: slice.pending,
-    resumeToken: slice.resumeToken,
+    // Auto-promote is a terminal return: the model must stop waiting, so this is
+    // never reported as still-pending even though some children are running.
+    pending: autoPromote ? false : slice.pending,
+    resumeToken: `${waitStartMs}:${slice.resumeToken}`,
+    ...(autoPromote ? { promoted: true } : {}),
   };
 });
 
@@ -648,7 +740,15 @@ const makeSubagentRuntime = Effect.fn("SubagentToolkit.makeActiveRuntime")(funct
   const projectionSnapshotQuery = yield* ProjectionSnapshotQuery;
   const providerInstanceRegistry = yield* ProviderInstanceRegistry;
   const scheduledTasks = yield* ScheduledTaskRepository;
-  return { crypto, orchestrationEngine, projectionSnapshotQuery, providerInstanceRegistry, scheduledTasks };
+  const pendingDispatches = yield* PendingDispatchRepository;
+  return {
+    crypto,
+    orchestrationEngine,
+    projectionSnapshotQuery,
+    providerInstanceRegistry,
+    scheduledTasks,
+    pendingDispatches,
+  };
 });
 
 export const SubagentRuntimeLive = Layer.effectDiscard(
