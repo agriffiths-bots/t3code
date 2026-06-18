@@ -176,19 +176,34 @@ const tryResolveLiveCosExecutionMode = Effect.fn("tryResolveLiveCosExecutionMode
   return Option.none<{ readonly origin: string }>();
 });
 
+// How recently a thread must have been updated to count as genuinely "live".
+// Orphan turns from a prior crash (no terminal event was ever written) keep a
+// "running" session in an offline event-fold forever; this window excludes them
+// while staying generous enough that a real long-running turn (which emits
+// progress events well within 2h) is never mistaken for idle. This is only
+// load-bearing in the offline-fold path; when the live server is reachable the
+// snapshot reflects real session state. Pairs with the restart script's 20s
+// HTTP drain + sub-second recheck.
+const THREAD_BUSY_RECENCY_MS = 2 * 60 * 60 * 1000;
+
 // A thread is "busy" only while it has a LIVE provider session (spinning up or
-// executing a turn). We deliberately do NOT treat `latestTurn.state==="running"`
-// as busy on its own: a turn left "running" with no live session is an orphan
-// from a prior crash/restart (no terminal event was ever written), and such
-// orphans must never block a restart forever. A genuinely long-running turn
-// (e.g. an hour-long sub-agent) keeps its session "running", so it stays busy —
-// orphan-safe and long-turn-safe.
-const isThreadBusy = (thread: OrchestrationThread): boolean => {
+// executing a turn) AND has been active recently. We deliberately do NOT treat
+// `latestTurn.state==="running"` as busy on its own: a turn left "running" with
+// no live session is an orphan from a prior crash/restart and must never block a
+// restart forever. The recency guard additionally drops stale orphans whose
+// session also never received a terminal event in the offline fold. A genuinely
+// long-running turn keeps its session "running" and emits events, so it stays
+// busy — orphan-safe and long-turn-safe.
+const isThreadBusy = (thread: OrchestrationThread, nowMs: number): boolean => {
   if (thread.deletedAt !== null) {
     return false;
   }
   const sessionStatus = thread.session?.status;
-  return sessionStatus === "starting" || sessionStatus === "running";
+  if (sessionStatus !== "starting" && sessionStatus !== "running") {
+    return false;
+  }
+  const updatedMs = thread.updatedAt ? Date.parse(thread.updatedAt) : 0;
+  return Number.isFinite(updatedMs) && nowMs - updatedMs < THREAD_BUSY_RECENCY_MS;
 };
 
 const runCosCommand = Effect.fn("runCosCommand")(function* <A, E>(
@@ -259,7 +274,8 @@ const cosCanRestartCommand = Command.make("can-restart", {
       }: {
         readonly snapshot: OrchestrationReadModel;
       }) {
-        const busy = snapshot.threads.some(isThreadBusy);
+        const nowMs = DateTime.toEpochMillis(yield* DateTime.now);
+        const busy = snapshot.threads.some((thread) => isThreadBusy(thread, nowMs));
         if (busy) {
           yield* Console.log("no");
           return yield* new CosNotSafeToRestartError({
