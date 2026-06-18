@@ -43,7 +43,10 @@ import {
 import { WorkspacePathsLive } from "../workspace/Layers/WorkspacePaths.ts";
 import { type CliAuthLocationFlags, projectLocationFlags, resolveCliAuthConfig } from "./config.ts";
 
-type CosCliDispatchCommand = Extract<OrchestrationCommand, { type: "thread.turn.start" }>;
+type CosCliDispatchCommand = Extract<
+  OrchestrationCommand,
+  { type: "thread.turn.start" } | { type: "thread.parent.set" }
+>;
 
 class CosCommandError extends Data.TaggedError("CosCommandError")<{
   readonly message: string;
@@ -173,14 +176,16 @@ const tryResolveLiveCosExecutionMode = Effect.fn("tryResolveLiveCosExecutionMode
   return Option.none<{ readonly origin: string }>();
 });
 
-// A thread is "busy" while its latest turn is still running, or while its
-// provider session is spinning up or executing a turn.
+// A thread is "busy" only while it has a LIVE provider session (spinning up or
+// executing a turn). We deliberately do NOT treat `latestTurn.state==="running"`
+// as busy on its own: a turn left "running" with no live session is an orphan
+// from a prior crash/restart (no terminal event was ever written), and such
+// orphans must never block a restart forever. A genuinely long-running turn
+// (e.g. an hour-long sub-agent) keeps its session "running", so it stays busy —
+// orphan-safe and long-turn-safe.
 const isThreadBusy = (thread: OrchestrationThread): boolean => {
   if (thread.deletedAt !== null) {
     return false;
-  }
-  if (thread.latestTurn?.state === "running") {
-    return true;
   }
   const sessionStatus = thread.session?.status;
   return sessionStatus === "starting" || sessionStatus === "running";
@@ -316,7 +321,58 @@ const cosWakeCommand = Command.make("wake", {
   ),
 );
 
+// `link-parent` dispatches a `thread.parent.set` through the SAME engine path as the
+// sub-agent spawn handler's dispatchParentSet(). It is used by the update GATE
+// (apps/server/e2e/drive.sh) to exercise the genuine OrchestrationEngine -> decider
+// (requireThread on BOTH child + parent) -> ProjectionPipeline parent_thread_id
+// projection on a RESTORED PROD DB, WITHOUT needing a live AI provider. A broken
+// decider, projector, or missing parent_thread_id migration makes this fail (the gate
+// is fail-closed). It is idempotent: the engine dedupes by the derived commandId.
+const cosLinkParentCommand = Command.make("link-parent", {
+  ...projectLocationFlags,
+  childThreadId: Argument.string("childThreadId").pipe(
+    Argument.withDescription("Child thread to link under a parent."),
+  ),
+  parentThreadId: Argument.string("parentThreadId").pipe(
+    Argument.withDescription("Parent thread the child is linked under."),
+  ),
+}).pipe(
+  Command.withDescription(
+    "Link a child thread under a parent via thread.parent.set (idempotent; gate/spawn linkage path).",
+  ),
+  Command.withHandler((flags) =>
+    runCosCommand(
+      flags,
+      Effect.fn("cosLinkParent")(function* ({
+        dispatch,
+      }: {
+        readonly snapshot: OrchestrationReadModel;
+        readonly dispatch: (
+          command: CosCliDispatchCommand,
+        ) => Effect.Effect<void, Error, FileSystem.FileSystem | HttpClient.HttpClient | Path.Path>;
+      }) {
+        const child = flags.childThreadId.trim();
+        const parent = flags.parentThreadId.trim();
+        if (child.length === 0 || parent.length === 0) {
+          return yield* new CosCommandError({ message: "Child and parent thread ids cannot be empty." });
+        }
+        const childThreadId = ThreadId.make(child);
+        const parentThreadId = ThreadId.make(parent);
+        const commandId = CommandId.make(`server:cos-link-parent:${childThreadId}:${parentThreadId}`);
+        yield* dispatch({
+          type: "thread.parent.set",
+          commandId,
+          threadId: childThreadId,
+          parentThreadId,
+          createdAt: DateTime.formatIso(yield* DateTime.now),
+        });
+        yield* Console.log(`Linked thread ${childThreadId} under ${parentThreadId}.`);
+      }),
+    ),
+  ),
+);
+
 export const cosCommand = Command.make("cos").pipe(
   Command.withDescription("Chief-of-staff orchestration controls."),
-  Command.withSubcommands([cosCanRestartCommand, cosWakeCommand]),
+  Command.withSubcommands([cosCanRestartCommand, cosWakeCommand, cosLinkParentCommand]),
 );
