@@ -12,6 +12,7 @@ const summary = (overrides: Partial<ThreadScheduleSummary> = {}): ThreadSchedule
   overdue: false,
   lastStatusFailed: false,
   count: 1,
+  cadenceLabel: "Every 30 min",
   ...overrides,
 });
 

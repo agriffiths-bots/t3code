@@ -8,6 +8,7 @@ import * as Option from "effect/Option";
 import { Atom } from "effect/unstable/reactivity";
 
 import { connectionAtomRuntime } from "../connection/runtime";
+import { scheduleCadenceLabel } from "../scheduled/formatCadence";
 
 export const environmentScheduledTasks =
   createEnvironmentScheduledTasksAtoms(connectionAtomRuntime);
@@ -60,6 +61,8 @@ export interface ThreadScheduleSummary {
   readonly overdue: boolean;
   readonly lastStatusFailed: boolean;
   readonly count: number;
+  /** Humanized cadence of the representative (earliest) schedule, e.g. "Every 30 min". */
+  readonly cadenceLabel: string;
 }
 
 function compareNextRunAt(a: string | null, b: string | null): number {
@@ -85,22 +88,23 @@ export function reduceSchedulesByThreadId(
         overdue,
         lastStatusFailed,
         count: 1,
+        cadenceLabel: scheduleCadenceLabel(task),
       });
       continue;
     }
     // Prefer the earliest enabled upcoming run; a thread is "enabled" if any of
     // its schedules is enabled, and "overdue" if any enabled schedule is overdue.
-    const nextRunAt =
-      task.enabled && compareNextRunAt(task.nextRunAt, existing.nextRunAt) < 0
-        ? task.nextRunAt
-        : existing.nextRunAt;
+    // The cadence label tracks whichever schedule owns the chosen earliest run.
+    const takesNewRun =
+      task.enabled && compareNextRunAt(task.nextRunAt, existing.nextRunAt) < 0;
     byThread.set(task.threadId, {
       threadId: task.threadId,
-      nextRunAt,
+      nextRunAt: takesNewRun ? task.nextRunAt : existing.nextRunAt,
       enabled: existing.enabled || task.enabled,
       overdue: existing.overdue || overdue,
       lastStatusFailed: existing.lastStatusFailed || lastStatusFailed,
       count: existing.count + 1,
+      cadenceLabel: takesNewRun ? scheduleCadenceLabel(task) : existing.cadenceLabel,
     });
   }
   return byThread;

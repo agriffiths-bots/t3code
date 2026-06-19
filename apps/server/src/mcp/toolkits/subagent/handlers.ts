@@ -516,7 +516,7 @@ const listSubagents = Effect.fn("SubagentToolkit.list")(function* (
   return { parentThreadId, children };
 });
 
-const validateCron =(cronExpr: string, timezone: string): Effect.Effect<void, ThreadStartToolError> =>
+const validateCron = (cronExpr: string, timezone: string): Effect.Effect<void, ThreadStartToolError> =>
   Effect.try({
     try: () => {
       new Cron(cronExpr, { timezone });

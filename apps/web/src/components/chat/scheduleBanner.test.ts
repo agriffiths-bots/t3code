@@ -17,6 +17,7 @@ const summary = (overrides: Partial<ThreadScheduleSummary> = {}): ThreadSchedule
   overdue: false,
   lastStatusFailed: false,
   count: 1,
+  cadenceLabel: "Every 30 min",
   ...overrides,
 });
 
@@ -33,6 +34,7 @@ describe("buildScheduleBanner", () => {
     expect(banner?.dismissKey).toBe("env|T1:2030-01-01T12:30:00.000Z");
     expect(banner?.title).toContain("Scheduled task runs");
     expect(banner?.description).toContain("runs in this thread");
+    expect(banner?.description).toContain("Every 30 min");
   });
 
   it("is suppressed when there is no active thread", () => {

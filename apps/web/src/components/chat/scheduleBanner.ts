@@ -49,6 +49,6 @@ export function buildScheduleBanner(
       : `Scheduled task runs ${formatRelativeTimeUntilLabel(nextRunAt)}`,
     description: overdue
       ? `Was due ${absolute} · will run when this thread is free${moreSuffix}`
-      : `Next at ${absolute} · runs in this thread${moreSuffix}`,
+      : `Next at ${absolute} · ${summary.cadenceLabel} · runs in this thread${moreSuffix}`,
   };
 }
