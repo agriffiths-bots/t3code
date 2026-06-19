@@ -2013,6 +2013,7 @@ export function ConnectionsSettings() {
   const [desktopWslState, setDesktopWslState] = useState<DesktopWslState | null>(null);
   const [isUpdatingWslBackend, setIsUpdatingWslBackend] = useState(false);
   const [desktopWslError, setDesktopWslError] = useState<string | null>(null);
+  const [isLoadingWslState, setIsLoadingWslState] = useState(false);
   // Pending WSL setting change waiting on user confirmation. Set when
   // the user tries a destructive change (disable, switch distro,
   // toggle wsl-only) while the WSL backend has saved-env state on this
@@ -2801,21 +2802,26 @@ export function ConnectionsSettings() {
     [desktopBridge],
   );
 
-  // Load the WSL backend state from the desktop bridge. Clears any prior error
-  // up front so a stale failure message can't linger after a later success, and
-  // is reused by the retry control in renderWslRow.
+  // Load the WSL backend state from the desktop bridge. Clears the error only on
+  // success, so a failed load's message stays visible (including across an
+  // in-flight retry, rather than the row flickering away), and tracks a loading
+  // flag for the retry control. Reused by the retry control in renderWslRow.
   const loadWslState = useCallback(() => {
     if (!desktopBridge) {
       return;
     }
-    setDesktopWslError(null);
+    setIsLoadingWslState(true);
     void desktopBridge
       .getWslState()
       .then((state) => {
         setDesktopWslState(state);
+        setDesktopWslError(null);
       })
       .catch((error: unknown) => {
         setDesktopWslError(error instanceof Error ? error.message : "Failed to load WSL state.");
+      })
+      .finally(() => {
+        setIsLoadingWslState(false);
       });
   }, [desktopBridge]);
 
@@ -2960,9 +2966,11 @@ export function ConnectionsSettings() {
 
   const renderWslRow = () => {
     if (!desktopWslState) {
-      // The initial getWslState() load failed: surface the error with a retry
-      // rather than hiding the section silently. With no error we simply haven't
-      // loaded yet (or WSL management isn't available), so render nothing.
+      // A load failed: keep a recovery row (with retry) visible instead of
+      // silently hiding the section. The error persists across an in-flight
+      // retry so the row doesn't flicker away, and the button reflects the
+      // loading state. With no error we simply haven't loaded yet (or WSL
+      // management isn't available), so render nothing.
       if (desktopWslError && canManageLocalBackend) {
         return (
           <SettingsRow
@@ -2970,8 +2978,13 @@ export function ConnectionsSettings() {
             description="Couldn't load the WSL backend state."
             status={<span className="block text-destructive">{desktopWslError}</span>}
             control={
-              <Button size="xs" variant="outline" onClick={loadWslState}>
-                Retry
+              <Button
+                size="xs"
+                variant="outline"
+                onClick={loadWslState}
+                disabled={isLoadingWslState}
+              >
+                {isLoadingWslState ? "Retrying…" : "Retry"}
               </Button>
             }
           />
