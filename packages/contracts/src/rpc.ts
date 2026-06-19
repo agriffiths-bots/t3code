@@ -57,6 +57,7 @@ import {
   OrchestrationReplayEventsError,
   OrchestrationReplayEventsInput,
   OrchestrationRpcSchemas,
+  OrchestrationScheduledTaskMutationError,
 } from "./orchestration.ts";
 import { ProviderInstanceId } from "./providerInstance.ts";
 import {
@@ -646,6 +647,34 @@ export const WsOrchestrationSubscribeThreadRpc = Rpc.make(
   },
 );
 
+export const WsOrchestrationSubscribeScheduledTasksRpc = Rpc.make(
+  ORCHESTRATION_WS_METHODS.subscribeScheduledTasks,
+  {
+    payload: OrchestrationRpcSchemas.subscribeScheduledTasks.input,
+    success: OrchestrationRpcSchemas.subscribeScheduledTasks.output,
+    error: Schema.Union([OrchestrationGetSnapshotError, EnvironmentAuthorizationError]),
+    stream: true,
+  },
+);
+
+export const WsOrchestrationSetScheduledTaskEnabledRpc = Rpc.make(
+  ORCHESTRATION_WS_METHODS.setScheduledTaskEnabled,
+  {
+    payload: OrchestrationRpcSchemas.setScheduledTaskEnabled.input,
+    success: OrchestrationRpcSchemas.setScheduledTaskEnabled.output,
+    error: Schema.Union([OrchestrationScheduledTaskMutationError, EnvironmentAuthorizationError]),
+  },
+);
+
+export const WsOrchestrationDeleteScheduledTaskRpc = Rpc.make(
+  ORCHESTRATION_WS_METHODS.deleteScheduledTask,
+  {
+    payload: OrchestrationRpcSchemas.deleteScheduledTask.input,
+    success: OrchestrationRpcSchemas.deleteScheduledTask.output,
+    error: Schema.Union([OrchestrationScheduledTaskMutationError, EnvironmentAuthorizationError]),
+  },
+);
+
 export const WsSubscribeTerminalEventsRpc = Rpc.make(WS_METHODS.subscribeTerminalEvents, {
   payload: Schema.Struct({}),
   success: TerminalEvent,
@@ -750,4 +779,7 @@ export const WsRpcGroup = RpcGroup.make(
   WsOrchestrationGetArchivedShellSnapshotRpc,
   WsOrchestrationSubscribeShellRpc,
   WsOrchestrationSubscribeThreadRpc,
+  WsOrchestrationSubscribeScheduledTasksRpc,
+  WsOrchestrationSetScheduledTaskEnabledRpc,
+  WsOrchestrationDeleteScheduledTaskRpc,
 );

@@ -30,6 +30,9 @@ export const ORCHESTRATION_WS_METHODS = {
   getArchivedShellSnapshot: "orchestration.getArchivedShellSnapshot",
   subscribeShell: "orchestration.subscribeShell",
   subscribeThread: "orchestration.subscribeThread",
+  subscribeScheduledTasks: "orchestration.subscribeScheduledTasks",
+  setScheduledTaskEnabled: "orchestration.setScheduledTaskEnabled",
+  deleteScheduledTask: "orchestration.deleteScheduledTask",
 } as const;
 
 export const ProviderApprovalPolicy = Schema.Literals([
@@ -451,6 +454,88 @@ export const OrchestrationShellStreamItem = Schema.Union([
   OrchestrationShellStreamEvent,
 ]);
 export type OrchestrationShellStreamItem = typeof OrchestrationShellStreamItem.Type;
+
+// --- Scheduled tasks -------------------------------------------------------
+//
+// `ScheduledTaskEntry` is the canonical wire shape shared by the MCP toolkit
+// (t3_schedule_*) and the web client subscription. It is lifted here from the
+// server's MCP `ScheduleEntry` so client + MCP decode one schema. The branded
+// `ScheduledTaskId` and `ScheduleBusyPolicy` literals are re-exported by
+// `persistence/Services/ScheduledTasks.ts` so the brand is identical on both
+// sides of the wire.
+export const ScheduledTaskId = Schema.String.pipe(Schema.brand("ScheduledTaskId"));
+export type ScheduledTaskId = typeof ScheduledTaskId.Type;
+
+export const ScheduleBusyPolicy = Schema.Literals(["skip", "queue_once"]);
+export type ScheduleBusyPolicy = typeof ScheduleBusyPolicy.Type;
+
+export const ScheduledTaskEntry = Schema.Struct({
+  taskId: ScheduledTaskId,
+  threadId: ThreadId,
+  prompt: Schema.String,
+  scheduleKind: Schema.String,
+  intervalSeconds: Schema.NullOr(Schema.Int),
+  cronExpr: Schema.NullOr(Schema.String),
+  timezone: Schema.String,
+  enabled: Schema.Boolean,
+  busyPolicy: ScheduleBusyPolicy,
+  nextRunAt: Schema.NullOr(Schema.String),
+  lastRunAt: Schema.NullOr(Schema.String),
+  lastStatus: Schema.NullOr(Schema.String),
+});
+export type ScheduledTaskEntry = typeof ScheduledTaskEntry.Type;
+
+export const ScheduledTasksSnapshot = Schema.Struct({
+  sequence: NonNegativeInt,
+  tasks: Schema.Array(ScheduledTaskEntry),
+});
+export type ScheduledTasksSnapshot = typeof ScheduledTasksSnapshot.Type;
+
+// Monotonic-`sequence` deltas folded on the client exactly like the shell
+// stream (state/shell.ts:119): a delta is applied only when its sequence is
+// strictly greater than the last applied snapshot sequence.
+export const ScheduledTasksStreamEvent = Schema.Union([
+  Schema.Struct({
+    kind: Schema.Literal("task-upserted"),
+    sequence: NonNegativeInt,
+    task: ScheduledTaskEntry,
+  }),
+  Schema.Struct({
+    kind: Schema.Literal("task-removed"),
+    sequence: NonNegativeInt,
+    taskId: ScheduledTaskId,
+  }),
+]);
+export type ScheduledTasksStreamEvent = typeof ScheduledTasksStreamEvent.Type;
+
+export const ScheduledTasksStreamItem = Schema.Union([
+  Schema.Struct({
+    kind: Schema.Literal("snapshot"),
+    snapshot: ScheduledTasksSnapshot,
+  }),
+  ScheduledTasksStreamEvent,
+]);
+export type ScheduledTasksStreamItem = typeof ScheduledTasksStreamItem.Type;
+
+export const OrchestrationSetScheduledTaskEnabledInput = Schema.Struct({
+  taskId: ScheduledTaskId,
+  enabled: Schema.Boolean,
+});
+export type OrchestrationSetScheduledTaskEnabledInput =
+  typeof OrchestrationSetScheduledTaskEnabledInput.Type;
+
+export const OrchestrationDeleteScheduledTaskInput = Schema.Struct({
+  taskId: ScheduledTaskId,
+});
+export type OrchestrationDeleteScheduledTaskInput =
+  typeof OrchestrationDeleteScheduledTaskInput.Type;
+
+export const OrchestrationDeleteScheduledTaskResult = Schema.Struct({
+  taskId: ScheduledTaskId,
+  deleted: Schema.Boolean,
+});
+export type OrchestrationDeleteScheduledTaskResult =
+  typeof OrchestrationDeleteScheduledTaskResult.Type;
 
 export const OrchestrationSubscribeThreadInput = Schema.Struct({
   threadId: ThreadId,
@@ -1271,10 +1356,30 @@ export const OrchestrationRpcSchemas = {
     input: Schema.Struct({}),
     output: OrchestrationShellStreamItem,
   },
+  subscribeScheduledTasks: {
+    input: Schema.Struct({}),
+    output: ScheduledTasksStreamItem,
+  },
+  setScheduledTaskEnabled: {
+    input: OrchestrationSetScheduledTaskEnabledInput,
+    output: ScheduledTaskEntry,
+  },
+  deleteScheduledTask: {
+    input: OrchestrationDeleteScheduledTaskInput,
+    output: OrchestrationDeleteScheduledTaskResult,
+  },
 } as const;
 
 export class OrchestrationGetSnapshotError extends Schema.TaggedErrorClass<OrchestrationGetSnapshotError>()(
   "OrchestrationGetSnapshotError",
+  {
+    message: TrimmedNonEmptyString,
+    cause: Schema.optional(Schema.Defect()),
+  },
+) {}
+
+export class OrchestrationScheduledTaskMutationError extends Schema.TaggedErrorClass<OrchestrationScheduledTaskMutationError>()(
+  "OrchestrationScheduledTaskMutationError",
   {
     message: TrimmedNonEmptyString,
     cause: Schema.optional(Schema.Defect()),

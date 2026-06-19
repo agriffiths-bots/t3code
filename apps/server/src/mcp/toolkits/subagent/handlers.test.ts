@@ -9,6 +9,7 @@ import {
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import * as Stream from "effect/Stream";
 import * as Option from "effect/Option";
 import { McpSchema, McpServer } from "effect/unstable/ai";
 import { describe, expect, it } from "@effect/vitest";
@@ -216,6 +217,7 @@ const scheduledTasksLayer = Layer.succeed(ScheduledTaskRepository, {
   markRun: () => Effect.void,
   listAll: () => Effect.succeed([]),
   listByThread: () => Effect.succeed([]),
+  revisionChanges: Stream.empty,
 });
 
 const pendingDispatchesLayer = Layer.succeed(PendingDispatchRepository, {

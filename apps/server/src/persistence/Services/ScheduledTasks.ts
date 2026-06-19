@@ -6,21 +6,29 @@
  *
  * @module ScheduledTaskRepository
  */
-import { IsoDateTime, NonNegativeInt, ThreadId } from "@t3tools/contracts";
+import {
+  IsoDateTime,
+  NonNegativeInt,
+  ScheduleBusyPolicy,
+  type ScheduledTaskEntry,
+  ScheduledTaskId,
+  ThreadId,
+} from "@t3tools/contracts";
 import * as Context from "effect/Context";
 import type * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
+import type * as Stream from "effect/Stream";
 
 import type { ProjectionRepositoryError } from "../Errors.ts";
 
-export const ScheduledTaskId = Schema.String.pipe(Schema.brand("ScheduledTaskId"));
-export type ScheduledTaskId = typeof ScheduledTaskId.Type;
+// `ScheduledTaskId` and `ScheduleBusyPolicy` are the canonical schemas lifted
+// into `@t3tools/contracts` so the MCP toolkit, the persistence row, and the
+// web client subscription all share one brand. Re-exported here to keep the
+// existing import sites (handlers.ts, tools.ts) unchanged.
+export { ScheduleBusyPolicy, ScheduledTaskId };
 
 export const ScheduleKind = Schema.Literals(["interval", "cron"]);
 export type ScheduleKind = typeof ScheduleKind.Type;
-
-export const ScheduleBusyPolicy = Schema.Literals(["skip", "queue_once"]);
-export type ScheduleBusyPolicy = typeof ScheduleBusyPolicy.Type;
 
 export const ScheduledTask = Schema.Struct({
   taskId: ScheduledTaskId,
@@ -42,6 +50,29 @@ export const ScheduledTask = Schema.Struct({
   createdAt: IsoDateTime,
 });
 export type ScheduledTask = typeof ScheduledTask.Type;
+
+/**
+ * Map a persisted `ScheduledTask` row to the canonical wire `ScheduledTaskEntry`.
+ *
+ * Shared by the MCP toolkit (t3_schedule_*) and the `subscribeScheduledTasks`
+ * WS handler so both surfaces project the row identically: `enabled` 0/1 →
+ * boolean, `timezoneName` → `timezone`, and the internal liveness counters
+ * (skipped/retry/queued, lastError, createdAt) are dropped from the wire shape.
+ */
+export const toScheduleEntry = (task: ScheduledTask): ScheduledTaskEntry => ({
+  taskId: task.taskId,
+  threadId: task.threadId,
+  prompt: task.prompt,
+  scheduleKind: task.scheduleKind,
+  intervalSeconds: task.intervalSeconds,
+  cronExpr: task.cronExpr,
+  timezone: task.timezoneName,
+  enabled: task.enabled !== 0,
+  busyPolicy: task.busyPolicy,
+  nextRunAt: task.nextRunAt,
+  lastRunAt: task.lastRunAt,
+  lastStatus: task.lastStatus,
+});
 
 export const ListDueScheduledTasksInput = Schema.Struct({
   nowIso: IsoDateTime,
@@ -118,6 +149,16 @@ export interface ScheduledTaskRepositoryShape {
   readonly listByThread: (
     input: ListScheduledTasksByThreadInput,
   ) => Effect.Effect<ReadonlyArray<ScheduledTask>, ProjectionRepositoryError>;
+
+  /**
+   * In-process liveness signal. The `scheduled_tasks` table is not
+   * event-sourced and emits no domain events, so this monotonic revision
+   * counter is the smallest native freshness primitive: every write
+   * (insert/update/delete/markRun) bumps it, and the `subscribeScheduledTasks`
+   * WS handler re-reads `listAll()` on each emission. Sub-second freshness,
+   * no polling. The stream replays the current value on subscribe.
+   */
+  readonly revisionChanges: Stream.Stream<number>;
 }
 
 /**

@@ -136,7 +136,7 @@ import { BranchToolbar } from "./BranchToolbar";
 import { resolveShortcutCommand, shortcutLabelForCommand } from "../keybindings";
 import PlanSidebar from "./PlanSidebar";
 import ThreadTerminalDrawer from "./ThreadTerminalDrawer";
-import { ChevronDownIcon, TriangleAlertIcon, WifiOffIcon } from "lucide-react";
+import { ChevronDownIcon, ClockIcon, TriangleAlertIcon, WifiOffIcon } from "lucide-react";
 import { cn, randomHex } from "~/lib/utils";
 import { COLLAPSED_SIDEBAR_TITLEBAR_INSET_CLASS } from "~/workspaceTitlebar";
 import { stackedThreadToast, toastManager } from "./ui/toast";
@@ -247,6 +247,9 @@ import {
   isVersionMismatchDismissed,
   resolveServerConfigVersionMismatch,
 } from "../versionSkew";
+import { dismissScheduleBanner, isScheduleBannerDismissed } from "../scheduleBannerDismissal";
+import { useThreadScheduleSummary } from "../state/schedules";
+import { buildScheduleBanner } from "./chat/scheduleBanner";
 import { useAssetUrls } from "../assets/assetUrls";
 
 const IMAGE_ONLY_BOOTSTRAP_PROMPT =
@@ -1639,6 +1642,7 @@ function ChatViewContent(props: ChatViewProps) {
   const [dismissedVersionMismatchKey, setDismissedVersionMismatchKey] = useState<string | null>(
     null,
   );
+  const [dismissedScheduleBannerKey, setDismissedScheduleBannerKey] = useState<string | null>(null);
   const versionMismatchDismissed =
     versionMismatchDismissKey === dismissedVersionMismatchKey ||
     isVersionMismatchDismissed(versionMismatchDismissKey);
@@ -1649,6 +1653,21 @@ function ChatViewContent(props: ChatViewProps) {
     hasMultipleRegisteredEnvironments && activeThread
       ? `${environmentById.get(activeThread.environmentId)?.label ?? serverConfig?.environment.label ?? activeThread.environmentId} server`
       : "server";
+  const activeScheduleSummary = useThreadScheduleSummary(
+    activeThread?.environmentId ?? null,
+    activeThread?.id ?? null,
+  );
+  // Surface the next scheduled run for the open thread as a dismissible composer
+  // banner (design.md SURFACE 3). Suppressed when disabled/deleted or no upcoming
+  // run; the dismiss key embeds nextRunAt so the banner re-shows for the next run.
+  const scheduleBanner = useMemo(
+    () => buildScheduleBanner(activeThreadKey, activeScheduleSummary),
+    [activeScheduleSummary, activeThreadKey],
+  );
+  const scheduleBannerDismissed =
+    scheduleBanner !== null &&
+    (isScheduleBannerDismissed(scheduleBanner.dismissKey) ||
+      dismissedScheduleBannerKey === scheduleBanner.dismissKey);
   const composerBannerItems = useMemo<ComposerBannerStackItem[]>(() => {
     const items: ComposerBannerStackItem[] = [];
     if (activeEnvironmentUnavailableState) {
@@ -1706,11 +1725,29 @@ function ChatViewContent(props: ChatViewProps) {
         },
       });
     }
+    if (scheduleBanner && !scheduleBannerDismissed) {
+      // Overdue stays variant:"info" (calm, no nag) — only the icon + copy
+      // change (design.md SURFACE 3).
+      items.push({
+        id: scheduleBanner.id,
+        variant: "info",
+        icon: scheduleBanner.overdue ? <TriangleAlertIcon /> : <ClockIcon />,
+        title: scheduleBanner.title,
+        description: scheduleBanner.description,
+        dismissLabel: "Dismiss scheduled task reminder",
+        onDismiss: () => {
+          dismissScheduleBanner(scheduleBanner.dismissKey);
+          setDismissedScheduleBannerKey(scheduleBanner.dismissKey);
+        },
+      });
+    }
     return items;
   }, [
     activeEnvironmentUnavailableState,
     handleReconnectActiveEnvironment,
     navigate,
+    scheduleBanner,
+    scheduleBannerDismissed,
     showVersionMismatchBanner,
     versionMismatch,
     versionMismatchDismissKey,

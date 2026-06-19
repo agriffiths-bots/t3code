@@ -37,6 +37,7 @@ import { OrchestrationEngineService } from "../../../orchestration/Services/Orch
 import { ProjectionSnapshotQuery } from "../../../orchestration/Services/ProjectionSnapshotQuery.ts";
 import {
   ScheduledTaskRepository,
+  toScheduleEntry,
   type ScheduledTask,
   type ScheduledTaskId,
   type ScheduledTaskRepositoryShape,
@@ -67,7 +68,6 @@ import {
   type ScheduleCreateInput,
   type ScheduleDeleteInput,
   type ScheduleDeleteOutput,
-  type ScheduleEntry,
   type ScheduleListInput,
   type ScheduleListOutput,
   type ScheduleUpdateInput,
@@ -516,22 +516,7 @@ const listSubagents = Effect.fn("SubagentToolkit.list")(function* (
   return { parentThreadId, children };
 });
 
-const toScheduleEntry = (task: ScheduledTask): ScheduleEntry => ({
-  taskId: task.taskId,
-  threadId: task.threadId,
-  prompt: task.prompt,
-  scheduleKind: task.scheduleKind,
-  intervalSeconds: task.intervalSeconds,
-  cronExpr: task.cronExpr,
-  timezone: task.timezoneName,
-  enabled: task.enabled !== 0,
-  busyPolicy: task.busyPolicy,
-  nextRunAt: task.nextRunAt,
-  lastRunAt: task.lastRunAt,
-  lastStatus: task.lastStatus,
-});
-
-const validateCron = (cronExpr: string, timezone: string): Effect.Effect<void, ThreadStartToolError> =>
+const validateCron =(cronExpr: string, timezone: string): Effect.Effect<void, ThreadStartToolError> =>
   Effect.try({
     try: () => {
       new Cron(cronExpr, { timezone });

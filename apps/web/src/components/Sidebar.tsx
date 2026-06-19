@@ -1,6 +1,7 @@
 import {
   ArchiveIcon,
   ArrowUpDownIcon,
+  CalendarClockIcon,
   ChevronRightIcon,
   CloudIcon,
   ContainerIcon,
@@ -17,6 +18,7 @@ import {
   ChangeRequestStatusIcon,
   prStatusIndicator,
   resolveThreadPr,
+  ScheduledTaskIcon,
   terminalStatusFromRunningIds,
   ThreadStatusLabel,
   ThreadWorktreeIndicator,
@@ -114,6 +116,7 @@ import { useDesktopUpdateState } from "../state/desktopUpdate";
 
 import { useThreadActions } from "../hooks/useThreadActions";
 import { projectEnvironment } from "../state/projects";
+import { useEnabledScheduleCount, useThreadScheduleSummary } from "../state/schedules";
 import { useEnvironmentQuery } from "../state/query";
 import { threadEnvironment, useEnvironmentThread } from "../state/threads";
 import { vcsEnvironment } from "../state/vcs";
@@ -172,6 +175,7 @@ import {
   SidebarGroup,
   SidebarHeader,
   SidebarMenu,
+  SidebarMenuBadge,
   SidebarMenuButton,
   SidebarMenuItem,
   SidebarMenuSub,
@@ -459,6 +463,7 @@ export const SidebarThreadRow = memo(function SidebarThreadRow(props: SidebarThr
   );
   const isThreadRunning =
     thread.session?.status === "running" && thread.session.activeTurnId != null;
+  const scheduleSummary = useThreadScheduleSummary(thread.environmentId, thread.id);
   const threadStatus = resolveThreadStatusPill({
     thread: {
       ...thread,
@@ -709,6 +714,7 @@ export const SidebarThreadRow = memo(function SidebarThreadRow(props: SidebarThr
             </Tooltip>
           )}
           {threadStatus && <ThreadStatusLabel status={threadStatus} />}
+          <ScheduledTaskIcon summary={scheduleSummary} />
           {renamingThreadKey === threadKey ? (
             <input
               ref={handleRenameInputRef}
@@ -2804,11 +2810,19 @@ function T3Wordmark() {
 const SidebarChromeFooter = memo(function SidebarChromeFooter() {
   const navigate = useNavigate();
   const { isMobile, setOpenMobile } = useSidebar();
+  const primaryEnvironmentId = usePrimaryEnvironmentId();
+  const enabledScheduleCount = useEnabledScheduleCount(primaryEnvironmentId);
   const handleSettingsClick = useCallback(() => {
     if (isMobile) {
       setOpenMobile(false);
     }
     void navigate({ to: "/settings" });
+  }, [isMobile, navigate, setOpenMobile]);
+  const handleScheduledClick = useCallback(() => {
+    if (isMobile) {
+      setOpenMobile(false);
+    }
+    void navigate({ to: "/scheduled" });
   }, [isMobile, navigate, setOpenMobile]);
 
   return (
@@ -2816,6 +2830,19 @@ const SidebarChromeFooter = memo(function SidebarChromeFooter() {
       <SidebarProviderUpdatePill />
       <SidebarUpdatePill />
       <SidebarMenu>
+        <SidebarMenuItem>
+          <SidebarMenuButton
+            size="sm"
+            className="gap-2 px-2 py-1.5 text-muted-foreground/70 hover:bg-accent hover:text-foreground"
+            onClick={handleScheduledClick}
+          >
+            <CalendarClockIcon className="size-3.5" />
+            <span className="text-xs">Scheduled</span>
+          </SidebarMenuButton>
+          {enabledScheduleCount > 0 ? (
+            <SidebarMenuBadge>{enabledScheduleCount}</SidebarMenuBadge>
+          ) : null}
+        </SidebarMenuItem>
         <SidebarMenuItem>
           <SidebarMenuButton
             size="sm"

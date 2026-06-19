@@ -10,8 +10,10 @@
 
 import { Route as rootRouteImport } from './routes/__root'
 import { Route as SettingsRouteImport } from './routes/settings'
+import { Route as ScheduledRouteImport } from './routes/scheduled'
 import { Route as PairRouteImport } from './routes/pair'
 import { Route as ChatRouteImport } from './routes/_chat'
+import { Route as ScheduledIndexRouteImport } from './routes/scheduled.index'
 import { Route as ChatIndexRouteImport } from './routes/_chat.index'
 import { Route as SettingsSourceControlRouteImport } from './routes/settings.source-control'
 import { Route as SettingsProvidersRouteImport } from './routes/settings.providers'
@@ -28,6 +30,11 @@ const SettingsRoute = SettingsRouteImport.update({
   path: '/settings',
   getParentRoute: () => rootRouteImport,
 } as any)
+const ScheduledRoute = ScheduledRouteImport.update({
+  id: '/scheduled',
+  path: '/scheduled',
+  getParentRoute: () => rootRouteImport,
+} as any)
 const PairRoute = PairRouteImport.update({
   id: '/pair',
   path: '/pair',
@@ -36,6 +43,11 @@ const PairRoute = PairRouteImport.update({
 const ChatRoute = ChatRouteImport.update({
   id: '/_chat',
   getParentRoute: () => rootRouteImport,
+} as any)
+const ScheduledIndexRoute = ScheduledIndexRouteImport.update({
+  id: '/',
+  path: '/',
+  getParentRoute: () => ScheduledRoute,
 } as any)
 const ChatIndexRoute = ChatIndexRouteImport.update({
   id: '/',
@@ -92,6 +104,7 @@ const ChatEnvironmentIdThreadIdRoute =
 export interface FileRoutesByFullPath {
   '/': typeof ChatIndexRoute
   '/pair': typeof PairRoute
+  '/scheduled': typeof ScheduledRouteWithChildren
   '/settings': typeof SettingsRouteWithChildren
   '/settings/archived': typeof SettingsArchivedRoute
   '/settings/connections': typeof SettingsConnectionsRoute
@@ -100,6 +113,7 @@ export interface FileRoutesByFullPath {
   '/settings/keybindings': typeof SettingsKeybindingsRoute
   '/settings/providers': typeof SettingsProvidersRoute
   '/settings/source-control': typeof SettingsSourceControlRoute
+  '/scheduled/': typeof ScheduledIndexRoute
   '/$environmentId/$threadId': typeof ChatEnvironmentIdThreadIdRoute
   '/draft/$draftId': typeof ChatDraftDraftIdRoute
 }
@@ -114,6 +128,7 @@ export interface FileRoutesByTo {
   '/settings/providers': typeof SettingsProvidersRoute
   '/settings/source-control': typeof SettingsSourceControlRoute
   '/': typeof ChatIndexRoute
+  '/scheduled': typeof ScheduledIndexRoute
   '/$environmentId/$threadId': typeof ChatEnvironmentIdThreadIdRoute
   '/draft/$draftId': typeof ChatDraftDraftIdRoute
 }
@@ -121,6 +136,7 @@ export interface FileRoutesById {
   __root__: typeof rootRouteImport
   '/_chat': typeof ChatRouteWithChildren
   '/pair': typeof PairRoute
+  '/scheduled': typeof ScheduledRouteWithChildren
   '/settings': typeof SettingsRouteWithChildren
   '/settings/archived': typeof SettingsArchivedRoute
   '/settings/connections': typeof SettingsConnectionsRoute
@@ -130,6 +146,7 @@ export interface FileRoutesById {
   '/settings/providers': typeof SettingsProvidersRoute
   '/settings/source-control': typeof SettingsSourceControlRoute
   '/_chat/': typeof ChatIndexRoute
+  '/scheduled/': typeof ScheduledIndexRoute
   '/_chat/$environmentId/$threadId': typeof ChatEnvironmentIdThreadIdRoute
   '/_chat/draft/$draftId': typeof ChatDraftDraftIdRoute
 }
@@ -138,6 +155,7 @@ export interface FileRouteTypes {
   fullPaths:
     | '/'
     | '/pair'
+    | '/scheduled'
     | '/settings'
     | '/settings/archived'
     | '/settings/connections'
@@ -146,6 +164,7 @@ export interface FileRouteTypes {
     | '/settings/keybindings'
     | '/settings/providers'
     | '/settings/source-control'
+    | '/scheduled/'
     | '/$environmentId/$threadId'
     | '/draft/$draftId'
   fileRoutesByTo: FileRoutesByTo
@@ -160,12 +179,14 @@ export interface FileRouteTypes {
     | '/settings/providers'
     | '/settings/source-control'
     | '/'
+    | '/scheduled'
     | '/$environmentId/$threadId'
     | '/draft/$draftId'
   id:
     | '__root__'
     | '/_chat'
     | '/pair'
+    | '/scheduled'
     | '/settings'
     | '/settings/archived'
     | '/settings/connections'
@@ -175,6 +196,7 @@ export interface FileRouteTypes {
     | '/settings/providers'
     | '/settings/source-control'
     | '/_chat/'
+    | '/scheduled/'
     | '/_chat/$environmentId/$threadId'
     | '/_chat/draft/$draftId'
   fileRoutesById: FileRoutesById
@@ -182,6 +204,7 @@ export interface FileRouteTypes {
 export interface RootRouteChildren {
   ChatRoute: typeof ChatRouteWithChildren
   PairRoute: typeof PairRoute
+  ScheduledRoute: typeof ScheduledRouteWithChildren
   SettingsRoute: typeof SettingsRouteWithChildren
 }
 
@@ -192,6 +215,13 @@ declare module '@tanstack/react-router' {
       path: '/settings'
       fullPath: '/settings'
       preLoaderRoute: typeof SettingsRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/scheduled': {
+      id: '/scheduled'
+      path: '/scheduled'
+      fullPath: '/scheduled'
+      preLoaderRoute: typeof ScheduledRouteImport
       parentRoute: typeof rootRouteImport
     }
     '/pair': {
@@ -207,6 +237,13 @@ declare module '@tanstack/react-router' {
       fullPath: '/'
       preLoaderRoute: typeof ChatRouteImport
       parentRoute: typeof rootRouteImport
+    }
+    '/scheduled/': {
+      id: '/scheduled/'
+      path: '/'
+      fullPath: '/scheduled/'
+      preLoaderRoute: typeof ScheduledIndexRouteImport
+      parentRoute: typeof ScheduledRoute
     }
     '/_chat/': {
       id: '/_chat/'
@@ -295,6 +332,18 @@ const ChatRouteChildren: ChatRouteChildren = {
 
 const ChatRouteWithChildren = ChatRoute._addFileChildren(ChatRouteChildren)
 
+interface ScheduledRouteChildren {
+  ScheduledIndexRoute: typeof ScheduledIndexRoute
+}
+
+const ScheduledRouteChildren: ScheduledRouteChildren = {
+  ScheduledIndexRoute: ScheduledIndexRoute,
+}
+
+const ScheduledRouteWithChildren = ScheduledRoute._addFileChildren(
+  ScheduledRouteChildren,
+)
+
 interface SettingsRouteChildren {
   SettingsArchivedRoute: typeof SettingsArchivedRoute
   SettingsConnectionsRoute: typeof SettingsConnectionsRoute
@@ -322,6 +371,7 @@ const SettingsRouteWithChildren = SettingsRoute._addFileChildren(
 const rootRouteChildren: RootRouteChildren = {
   ChatRoute: ChatRouteWithChildren,
   PairRoute: PairRoute,
+  ScheduledRoute: ScheduledRouteWithChildren,
   SettingsRoute: SettingsRouteWithChildren,
 }
 export const routeTree = rootRouteImport

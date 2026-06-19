@@ -4,8 +4,11 @@ import {
   scopeThreadRef,
 } from "@t3tools/client-runtime/environment";
 import type { VcsStatusResult } from "@t3tools/contracts";
-import { CloudIcon, FolderGit2Icon, GitPullRequestIcon, TerminalIcon } from "lucide-react";
+import { ClockIcon, CloudIcon, FolderGit2Icon, GitPullRequestIcon, TerminalIcon, TriangleAlertIcon } from "lucide-react";
 import { useMemo } from "react";
+import { formatRelativeTimeUntilLabel } from "../timestampFormat";
+import type { ThreadScheduleSummary } from "../state/schedules";
+import { useThreadScheduleSummary } from "../state/schedules";
 import { useEnvironment, usePrimaryEnvironmentId } from "../state/environments";
 import { useProject } from "../state/entities";
 import { useEnvironmentQuery } from "../state/query";
@@ -69,6 +72,71 @@ export function prStatusIndicator(
 
 export function ChangeRequestStatusIcon({ className }: { className?: string }) {
   return <GitPullRequestIcon className={className} />;
+}
+
+/**
+ * Build the leading-icon presentation for a thread row's schedule. State is
+ * always carried by icon SHAPE + color (never color alone), per design.md
+ * ONE ACCENT, ONE GLYPH FAMILY:
+ *   healthy        = ClockIcon, text-info
+ *   overdue/failed = TriangleAlertIcon, text-warning
+ *   paused         = ClockIcon, text-muted-foreground/50
+ * The tooltip/aria-label mirror that state for colorblind + SR users.
+ */
+export function scheduleIconPresentation(summary: ThreadScheduleSummary): {
+  Icon: typeof ClockIcon;
+  colorClass: string;
+  label: string;
+} {
+  if (!summary.enabled) {
+    return { Icon: ClockIcon, colorClass: "text-muted-foreground/50", label: "Scheduled · paused" };
+  }
+  if (summary.overdue) {
+    return {
+      Icon: TriangleAlertIcon,
+      colorClass: "text-warning",
+      label: summary.lastStatusFailed
+        ? "Scheduled · overdue (last run failed)"
+        : "Scheduled · overdue",
+    };
+  }
+  const next = summary.nextRunAt
+    ? `next run ${formatRelativeTimeUntilLabel(summary.nextRunAt)}`
+    : "next run pending";
+  return { Icon: ClockIcon, colorClass: "text-info", label: `Scheduled · ${next}` };
+}
+
+/**
+ * Non-interactive thread-row schedule indicator. Renders a SPAN (not a button)
+ * so the row click still opens the thread (design.md SURFACE 2). Returns null
+ * when the thread has no schedule, for zero layout cost.
+ */
+export function ScheduledTaskIcon({
+  summary,
+  className,
+}: {
+  summary: ThreadScheduleSummary | null | undefined;
+  className?: string;
+}) {
+  if (!summary) {
+    return null;
+  }
+  const { Icon, colorClass, label } = scheduleIconPresentation(summary);
+  return (
+    <Tooltip>
+      <TooltipTrigger
+        render={
+          <span
+            aria-label={label}
+            className={`inline-flex shrink-0 items-center justify-center ${colorClass} ${className ?? ""}`}
+          />
+        }
+      >
+        <Icon className="size-3 shrink-0" />
+      </TooltipTrigger>
+      <TooltipPopup side="top">{label}</TooltipPopup>
+    </Tooltip>
+  );
 }
 
 export function resolveThreadPr(
@@ -208,6 +276,7 @@ export function ThreadRowLeadingStatus({ thread }: { thread: SidebarThreadSummar
   );
   const pr = resolveThreadPr(thread.branch, gitStatus.data);
   const prStatus = prStatusIndicator(pr, gitStatus.data?.sourceControlProvider);
+  const scheduleSummary = useThreadScheduleSummary(thread.environmentId, thread.id);
   const threadStatus = resolveThreadStatusPill({
     thread: {
       ...thread,
@@ -215,12 +284,13 @@ export function ThreadRowLeadingStatus({ thread }: { thread: SidebarThreadSummar
     },
   });
 
-  if (!prStatus && !threadStatus) {
+  if (!prStatus && !threadStatus && !scheduleSummary) {
     return null;
   }
 
   return (
     <span className="inline-flex shrink-0 items-center gap-1.5">
+      <ScheduledTaskIcon summary={scheduleSummary} />
       {prStatus ? (
         <Tooltip>
           <TooltipTrigger

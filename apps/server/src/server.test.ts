@@ -81,6 +81,7 @@ import { OrchestrationListenerCallbackError } from "./orchestration/Errors.ts";
 import * as ProjectionSnapshotQuery from "./orchestration/Services/ProjectionSnapshotQuery.ts";
 import * as BootstrapTurnStartDispatcher from "./orchestration/Services/BootstrapTurnStartDispatcher.ts";
 import { SqlitePersistenceMemory } from "./persistence/Layers/Sqlite.ts";
+import { ScheduledTaskRepository } from "./persistence/Services/ScheduledTasks.ts";
 import { PersistenceSqlError } from "./persistence/Errors.ts";
 import * as ProviderRegistry from "./provider/Services/ProviderRegistry.ts";
 import { makeManualOnlyProviderMaintenanceCapabilities } from "./provider/providerMaintenance.ts";
@@ -721,6 +722,18 @@ const buildAppUnderTest = (options?: {
           getFirstActiveThreadIdByProjectId: () => Effect.succeed(Option.none()),
           getThreadCheckpointContext: () => Effect.succeed(Option.none()),
           ...options?.layers?.projectionSnapshotQuery,
+        }),
+      ),
+      Layer.provide(
+        Layer.mock(ScheduledTaskRepository)({
+          listDue: () => Effect.succeed([]),
+          insert: () => Effect.void,
+          update: () => Effect.void,
+          delete: () => Effect.void,
+          markRun: () => Effect.void,
+          listAll: () => Effect.succeed([]),
+          listByThread: () => Effect.succeed([]),
+          revisionChanges: Stream.empty,
         }),
       ),
       Layer.provide(

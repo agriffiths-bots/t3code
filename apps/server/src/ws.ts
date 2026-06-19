@@ -24,12 +24,14 @@ import {
   type OrchestrationCommand,
   type GitActionProgressEvent,
   type GitManagerServiceError,
+  NonNegativeInt,
   OrchestrationDispatchCommandError,
   type OrchestrationEvent,
   type OrchestrationShellStreamEvent,
   OrchestrationGetFullThreadDiffError,
   OrchestrationGetSnapshotError,
   OrchestrationGetTurnDiffError,
+  OrchestrationScheduledTaskMutationError,
   ORCHESTRATION_WS_METHODS,
   type ProjectEntriesFailure,
   type ProjectFileFailure,
@@ -40,6 +42,7 @@ import {
   ProjectWriteFileError,
   RelayClientInstallFailedError,
   type RelayClientInstallProgressEvent,
+  type ScheduledTaskId,
   OrchestrationReplayEventsError,
   type FilesystemBrowseFailure,
   FilesystemBrowseError,
@@ -65,6 +68,10 @@ import * as ExternalLauncher from "./process/externalLauncher.ts";
 import { normalizeDispatchCommand } from "./orchestration/Normalizer.ts";
 import * as OrchestrationEngine from "./orchestration/Services/OrchestrationEngine.ts";
 import * as ProjectionSnapshotQuery from "./orchestration/Services/ProjectionSnapshotQuery.ts";
+import {
+  ScheduledTaskRepository,
+  toScheduleEntry,
+} from "./persistence/Services/ScheduledTasks.ts";
 import {
   observeRpcEffect as instrumentRpcEffect,
   observeRpcStream as instrumentRpcStream,
@@ -110,6 +117,9 @@ import * as SessionStore from "./auth/SessionStore.ts";
 import { failEnvironmentAuthInvalid, failEnvironmentInternal } from "./auth/http.ts";
 import * as RelayClient from "@t3tools/shared/relayClient";
 const isOrchestrationDispatchCommandError = Schema.is(OrchestrationDispatchCommandError);
+const isOrchestrationScheduledTaskMutationError = Schema.is(
+  OrchestrationScheduledTaskMutationError,
+);
 
 const nowIso = Effect.map(DateTime.now, DateTime.formatIso);
 
@@ -253,6 +263,9 @@ const RPC_REQUIRED_SCOPE = new Map<string, AuthEnvironmentScope>([
   [ORCHESTRATION_WS_METHODS.subscribeShell, AuthOrchestrationReadScope],
   [ORCHESTRATION_WS_METHODS.getArchivedShellSnapshot, AuthOrchestrationReadScope],
   [ORCHESTRATION_WS_METHODS.subscribeThread, AuthOrchestrationReadScope],
+  [ORCHESTRATION_WS_METHODS.subscribeScheduledTasks, AuthOrchestrationReadScope],
+  [ORCHESTRATION_WS_METHODS.setScheduledTaskEnabled, AuthOrchestrationOperateScope],
+  [ORCHESTRATION_WS_METHODS.deleteScheduledTask, AuthOrchestrationOperateScope],
   [WS_METHODS.serverGetConfig, AuthOrchestrationReadScope],
   [WS_METHODS.serverRefreshProviders, AuthOrchestrationOperateScope],
   [WS_METHODS.serverUpdateProvider, AuthOrchestrationOperateScope],
@@ -364,6 +377,7 @@ const makeWsRpcLayer = (
     Effect.gen(function* () {
       const currentSessionId = currentSession.sessionId;
       const projectionSnapshotQuery = yield* ProjectionSnapshotQuery.ProjectionSnapshotQuery;
+      const scheduledTaskRepository = yield* ScheduledTaskRepository;
       const orchestrationEngine = yield* OrchestrationEngine.OrchestrationEngineService;
       const checkpointDiffQuery = yield* CheckpointDiffQuery.CheckpointDiffQuery;
       const keybindings = yield* Keybindings.Keybindings;
@@ -658,6 +672,31 @@ const makeWsRpcLayer = (
           .refreshStatus(cwd)
           .pipe(Effect.ignoreCause({ log: true }), Effect.forkDetach, Effect.asVoid);
 
+      // Enable/disable reuses the same repository update logic the MCP
+      // t3_schedule_update handler calls: load the row, flip `enabled`, write
+      // it back. Cadence is untouched so `next_run_at` is preserved. The
+      // repository write bumps the shared liveness counter, so every surface
+      // (panel, thread icon, banner) refreshes live.
+      const setScheduledTaskEnabled = (input: {
+        readonly taskId: ScheduledTaskId;
+        readonly enabled: boolean;
+      }) =>
+        Effect.gen(function* () {
+          const tasks = yield* scheduledTaskRepository.listAll();
+          const existing = tasks.find((task) => task.taskId === input.taskId);
+          if (existing === undefined) {
+            return yield* new OrchestrationScheduledTaskMutationError({
+              message: `Scheduled task ${input.taskId} was not found`,
+            });
+          }
+          const updated = {
+            ...existing,
+            enabled: NonNegativeInt.make(input.enabled ? 1 : 0),
+          };
+          yield* scheduledTaskRepository.update(updated);
+          return toScheduleEntry(updated);
+        });
+
       return WsRpcGroup.of({
         [ORCHESTRATION_WS_METHODS.dispatchCommand]: (command) =>
           observeRpcEffect(
@@ -884,6 +923,74 @@ const makeWsRpcLayer = (
                 liveStream,
               );
             }),
+            { "rpc.aggregate": "orchestration" },
+          ),
+        // `scheduled_tasks` is not event-sourced, so freshness comes from the
+        // repository's in-process liveness counter (revisionChanges, bumped on
+        // every insert/update/delete/markRun — shared singleton). Each tick
+        // re-reads the table and emits a full snapshot with a monotonic
+        // `sequence`; the client folds snapshots exactly like the shell stream.
+        [ORCHESTRATION_WS_METHODS.subscribeScheduledTasks]: (_input) =>
+          observeRpcStreamEffect(
+            ORCHESTRATION_WS_METHODS.subscribeScheduledTasks,
+            Effect.sync(() => {
+              let sequence = 0;
+              const loadSnapshot = scheduledTaskRepository.listAll().pipe(
+                Effect.map((tasks) => ({
+                  kind: "snapshot" as const,
+                  snapshot: {
+                    sequence: NonNegativeInt.make(sequence++),
+                    tasks: tasks.map(toScheduleEntry),
+                  },
+                })),
+                Effect.tapError((cause) =>
+                  Effect.logError("scheduled tasks snapshot load failed", { cause }),
+                ),
+                Effect.mapError(
+                  (cause) =>
+                    new OrchestrationGetSnapshotError({
+                      message: "Failed to load scheduled tasks snapshot",
+                      cause,
+                    }),
+                ),
+              );
+
+              return scheduledTaskRepository.revisionChanges.pipe(
+                Stream.mapEffect(() => loadSnapshot),
+              );
+            }),
+            { "rpc.aggregate": "orchestration" },
+          ),
+        [ORCHESTRATION_WS_METHODS.setScheduledTaskEnabled]: (input) =>
+          observeRpcEffect(
+            ORCHESTRATION_WS_METHODS.setScheduledTaskEnabled,
+            setScheduledTaskEnabled(input).pipe(
+              Effect.mapError((cause) =>
+                isOrchestrationScheduledTaskMutationError(cause)
+                  ? cause
+                  : new OrchestrationScheduledTaskMutationError({
+                      message: "Failed to update scheduled task",
+                      cause,
+                    }),
+              ),
+            ),
+            { "rpc.aggregate": "orchestration" },
+          ),
+        [ORCHESTRATION_WS_METHODS.deleteScheduledTask]: (input) =>
+          observeRpcEffect(
+            ORCHESTRATION_WS_METHODS.deleteScheduledTask,
+            scheduledTaskRepository
+              .delete({ taskId: input.taskId })
+              .pipe(
+                Effect.as({ taskId: input.taskId, deleted: true }),
+                Effect.mapError(
+                  (cause) =>
+                    new OrchestrationScheduledTaskMutationError({
+                      message: "Failed to delete scheduled task",
+                      cause,
+                    }),
+                ),
+              ),
             { "rpc.aggregate": "orchestration" },
           ),
         [WS_METHODS.serverGetConfig]: (_input) =>

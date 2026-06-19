@@ -173,10 +173,7 @@ const ReactorLayerLive = Layer.empty.pipe(
   Layer.provideMerge(CheckpointReactorLive),
   Layer.provideMerge(ThreadDeletionReactorLive),
   Layer.provideMerge(
-    ScheduledTasksReactorLive.pipe(
-      Layer.provide(BootstrapTurnStartDispatcher.layer),
-      Layer.provide(ScheduledTaskRepositoryLive),
-    ),
+    ScheduledTasksReactorLive.pipe(Layer.provide(BootstrapTurnStartDispatcher.layer)),
   ),
   Layer.provideMerge(
     ChildThreadCoordinatorLive.pipe(Layer.provide(PendingDispatchRepositoryLive)),
@@ -200,7 +197,18 @@ const ProviderLayerLive = ProviderServiceLive.pipe(
   Layer.provideMerge(ProviderSessionDirectoryLayerLive),
 );
 
-const PersistenceLayerLive = Layer.empty.pipe(Layer.provideMerge(SqlitePersistenceLayerLive));
+// `ScheduledTaskRepositoryLive` is hoisted into the shared persistence layer so
+// it builds exactly once. Its in-process liveness SubscriptionRef
+// (revisionChanges) is therefore the SAME instance for the scheduler reactor's
+// markRun, the MCP t3_schedule_* create/update/delete, and the
+// `subscribeScheduledTasks` WS handler — a write on any path is observed live
+// by the subscription. The redundant local `Layer.provide` provisions in the
+// reactor and SubagentRuntime sub-graphs were removed so they resolve this
+// singleton from the surrounding runtime instead of building their own copies.
+const PersistenceLayerLive = Layer.empty.pipe(
+  Layer.provideMerge(ScheduledTaskRepositoryLive),
+  Layer.provideMerge(SqlitePersistenceLayerLive),
+);
 
 const VcsDriverRegistryLayerLive = VcsDriverRegistry.layer.pipe(
   Layer.provide(VcsProjectConfig.layer),
@@ -373,10 +381,7 @@ const ServerApplicationRegistrationsLive = Layer.mergeAll(
   ActiveChildThreadCoordinatorLive.pipe(
     Layer.provide(ChildThreadCoordinatorLive.pipe(Layer.provide(PendingDispatchRepositoryLive))),
   ),
-  SubagentRuntimeLive.pipe(
-    Layer.provide(ScheduledTaskRepositoryLive),
-    Layer.provide(PendingDispatchRepositoryLive),
-  ),
+  SubagentRuntimeLive.pipe(Layer.provide(PendingDispatchRepositoryLive)),
 );
 
 export const makeRoutesLayer = Layer.mergeAll(

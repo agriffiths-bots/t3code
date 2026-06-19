@@ -1,4 +1,4 @@
-import { ProjectId, ThreadId } from "@t3tools/contracts";
+import { ProjectId, ScheduledTaskEntry, ThreadId } from "@t3tools/contracts";
 import * as Schema from "effect/Schema";
 import { Tool, Toolkit } from "effect/unstable/ai";
 
@@ -149,20 +149,11 @@ export const ScheduleCreateInput = Schema.Struct({
 });
 export type ScheduleCreateInput = typeof ScheduleCreateInput.Type;
 
-export const ScheduleEntry = Schema.Struct({
-  taskId: ScheduledTaskId,
-  threadId: ThreadId,
-  prompt: Schema.String,
-  scheduleKind: Schema.String,
-  intervalSeconds: Schema.NullOr(Schema.Int),
-  cronExpr: Schema.NullOr(Schema.String),
-  timezone: Schema.String,
-  enabled: Schema.Boolean,
-  busyPolicy: ScheduleBusyPolicy,
-  nextRunAt: Schema.NullOr(Schema.String),
-  lastRunAt: Schema.NullOr(Schema.String),
-  lastStatus: Schema.NullOr(Schema.String),
-});
+// Canonical schema lifted into `@t3tools/contracts` (`ScheduledTaskEntry`) so
+// the MCP toolkit and the web client subscription share one wire shape.
+// Re-exported under the existing `ScheduleEntry` name to keep tool wiring
+// (ScheduleListOutput, etc.) unchanged.
+export const ScheduleEntry = ScheduledTaskEntry;
 export type ScheduleEntry = typeof ScheduleEntry.Type;
 
 export const ScheduleListInput = Schema.Struct({

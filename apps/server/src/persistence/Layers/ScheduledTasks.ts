@@ -3,6 +3,8 @@ import * as SqlSchema from "effect/unstable/sql/SqlSchema";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Schema from "effect/Schema";
+import * as Stream from "effect/Stream";
+import * as SubscriptionRef from "effect/SubscriptionRef";
 
 import { toPersistenceSqlError } from "../Errors.ts";
 import {
@@ -17,6 +19,11 @@ import {
 
 const makeScheduledTaskRepository = Effect.gen(function* () {
   const sql = yield* SqlClient.SqlClient;
+
+  // Liveness counter (finalPlan: the table emits no domain events). Bumped
+  // after every successful write so `subscribeScheduledTasks` can re-read.
+  const revision = yield* SubscriptionRef.make(0);
+  const bump = SubscriptionRef.update(revision, (n) => n + 1);
 
   const writeScheduledTaskRow = SqlSchema.void({
     Request: ScheduledTask,
@@ -199,16 +206,19 @@ const makeScheduledTaskRepository = Effect.gen(function* () {
   const insert: ScheduledTaskRepositoryShape["insert"] = (task) =>
     writeScheduledTaskRow(task).pipe(
       Effect.mapError(toPersistenceSqlError("ScheduledTaskRepository.insert:query")),
+      Effect.tap(() => bump),
     );
 
   const update: ScheduledTaskRepositoryShape["update"] = (task) =>
     writeScheduledTaskRow(task).pipe(
       Effect.mapError(toPersistenceSqlError("ScheduledTaskRepository.update:query")),
+      Effect.tap(() => bump),
     );
 
   const deleteTask: ScheduledTaskRepositoryShape["delete"] = (input) =>
     deleteScheduledTaskRow(input).pipe(
       Effect.mapError(toPersistenceSqlError("ScheduledTaskRepository.delete:query")),
+      Effect.tap(() => bump),
     );
 
   // markRun and the next_run_at advance are committed in a single
@@ -221,6 +231,7 @@ const makeScheduledTaskRepository = Effect.gen(function* () {
       Effect.catch((error) => sql`ROLLBACK`.pipe(Effect.andThen(Effect.fail(error)))),
       Effect.asVoid,
       Effect.mapError(toPersistenceSqlError("ScheduledTaskRepository.markRun:query")),
+      Effect.tap(() => bump),
     );
 
   const listAll: ScheduledTaskRepositoryShape["listAll"] = () =>
@@ -241,6 +252,7 @@ const makeScheduledTaskRepository = Effect.gen(function* () {
     markRun,
     listAll,
     listByThread,
+    revisionChanges: SubscriptionRef.changes(revision),
   } satisfies ScheduledTaskRepositoryShape;
 });
 
