@@ -183,12 +183,11 @@ export const make = Effect.gen(function* () {
       Stream.map((line) => line.trim()),
       Stream.filter((line) => line.length > 0),
       Stream.runForEach((line) => {
-        const output = line.replaceAll(connector.config.connectorToken, "<redacted>");
         const attributes = {
           pid: Number(connector.child.pid),
           tunnelId: connector.config.tunnelId,
           tunnelName: connector.config.tunnelName,
-          output,
+          outputLength: line.length,
         };
         switch (classifyRelayClientOutput(line)) {
           case "connected":

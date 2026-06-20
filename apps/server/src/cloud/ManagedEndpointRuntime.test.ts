@@ -65,6 +65,7 @@ function makeHandle(input: {
   readonly isRunning?: () => boolean;
   readonly isRunningEffect?: ChildProcessSpawner.ChildProcessHandle["isRunning"];
   readonly exitCode?: Effect.Effect<ChildProcessSpawner.ExitCode>;
+  readonly output?: string;
 }) {
   return ChildProcessSpawner.makeHandle({
     pid: ChildProcessSpawner.ProcessId(input.pid),
@@ -78,7 +79,10 @@ function makeHandle(input: {
     stdin: Sink.drain,
     stdout: Stream.empty,
     stderr: Stream.empty,
-    all: Stream.empty,
+    all:
+      input.output === undefined
+        ? Stream.empty
+        : Stream.make(new TextEncoder().encode(input.output)),
     getInputFd: () => Sink.drain,
     getOutputFd: () => Stream.empty,
   });
@@ -259,6 +263,64 @@ describe("CloudManagedEndpointRuntime", () => {
         tunnelId: "tunnel-1",
       });
       expect((warning[1] as { cause: unknown }).cause).toBe(probeCause);
+    }).pipe(Effect.provide(Logger.layer([logger], { mergeWithExisting: false })));
+  });
+
+  it.effect("does not copy relay client output into log annotations", () => {
+    const connectorToken = "connector-token-sentinel";
+    const signedUrl = "https://user:password@example.com/private?token=secret#fragment";
+    const output = `ERR failed request ${signedUrl} ${connectorToken}`;
+    const logMessages: unknown[] = [];
+    let resolveObserved!: () => void;
+    const observed = new Promise<void>((resolve) => {
+      resolveObserved = resolve;
+    });
+    const logger = Logger.make(({ message }) => {
+      logMessages.push(message);
+      if (Array.isArray(message) && message[0] === "Relay client reported a transport warning") {
+        resolveObserved();
+      }
+    });
+    const spawner = ChildProcessSpawner.make(() =>
+      Effect.gen(function* () {
+        const handle = makeHandle({
+          pid: 350,
+          output,
+          onKill: () => undefined,
+        });
+        yield* Effect.addFinalizer(() => handle.kill().pipe(Effect.ignore));
+        return handle;
+      }),
+    );
+
+    return Effect.gen(function* () {
+      const runtime = yield* buildCloudManagedEndpointRuntime(spawner);
+      yield* runtime.applyConfig({
+        providerKind: "cloudflare_tunnel",
+        connectorToken,
+        tunnelId: "tunnel-1",
+      });
+      yield* Effect.promise(() => observed);
+
+      const warning = logMessages.find(
+        (message) =>
+          Array.isArray(message) && message[0] === "Relay client reported a transport warning",
+      );
+      expect(warning).toBeDefined();
+      if (!Array.isArray(warning)) return;
+      expect(warning[1]).toMatchObject({
+        pid: 350,
+        tunnelId: "tunnel-1",
+        outputLength: output.length,
+      });
+      expect(warning[1]).not.toHaveProperty("output");
+      const diagnosticText = Object.values(warning[1] as Record<string, unknown>)
+        .map(String)
+        .join("\n");
+      expect(diagnosticText).not.toContain(connectorToken);
+      expect(diagnosticText).not.toContain(signedUrl);
+      expect(diagnosticText).not.toContain("user:password");
+      expect(diagnosticText).not.toContain("token=secret");
     }).pipe(Effect.provide(Logger.layer([logger], { mergeWithExisting: false })));
   });
 
