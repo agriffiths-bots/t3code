@@ -21,6 +21,7 @@ import {
   relayEnvironmentAuthLayer,
   relayNotFoundRoute,
   traceRelayHttpRequestWith,
+  verifyRelayDpopTokenExchangeSubject,
   verifyRelayClientBearerToken,
   withoutCapturedParentSpan,
 } from "./Api.ts";
@@ -186,6 +187,57 @@ describe("relay client authentication", () => {
       ),
     ),
   );
+});
+
+describe("relay DPoP token exchange authentication", () => {
+  it.effect("records safe Clerk verification diagnostics before returning invalid bearer", () => {
+    const verificationCause = Object.assign(new Error("private token verification detail"), {
+      reason: "session_invalid",
+    });
+
+    return Effect.gen(function* () {
+      const spans: Array<Tracer.NativeSpan> = [];
+      const tracer = Tracer.make({
+        span: (options) => {
+          const span = new Tracer.NativeSpan(options);
+          spans.push(span);
+          return span;
+        },
+      });
+      vi.mocked(verifyToken).mockRejectedValue(verificationCause);
+
+      const error = yield* Effect.flip(
+        verifyRelayDpopTokenExchangeSubject(relaySettings, "private-subject-token").pipe(
+          Effect.provideService(Tracer.Tracer, tracer),
+        ),
+      );
+
+      expect(Predicate.isTagged(error, "RelayAuthInvalidError")).toBe(true);
+      if (Predicate.isTagged(error, "RelayAuthInvalidError")) {
+        expect(error.reason).toBe("invalid_bearer");
+      }
+      const exchangeSpan = spans.find(
+        (span) => span.name === "relay.auth.dpop_token_exchange_subject",
+      );
+      expect(exchangeSpan?.attributes.get("relay.auth.clerk_verification_failure")).toBe(
+        "session_invalid",
+      );
+      expect(exchangeSpan?.attributes.get("relay.auth.clerk_verification_stage")).toBe(
+        "session-token-verification",
+      );
+      for (const attribute of exchangeSpan?.attributes.values() ?? []) {
+        expect(String(attribute)).not.toContain("private-subject-token");
+        expect(String(attribute)).not.toContain("private token verification detail");
+      }
+    }).pipe(
+      Effect.ensuring(
+        Effect.sync(() => {
+          vi.mocked(verifyToken).mockReset();
+          vi.mocked(createClerkClient).mockReset();
+        }),
+      ),
+    );
+  });
 });
 
 describe("relay environment authentication", () => {

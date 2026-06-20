@@ -586,12 +586,10 @@ export const tokenApi = HttpApiBuilder.group(
           return yield* new HttpApiError.Unauthorized({});
         }
 
-        const verified = yield* verifyClerkBearerToken(config, args.payload.subject_token).pipe(
-          Effect.catch(() => relayAuthInvalidError("invalid_bearer")),
+        const userId = yield* verifyRelayDpopTokenExchangeSubject(
+          config,
+          args.payload.subject_token,
         );
-        if (!verified.sub || !hasExpectedClerkAudience(verified.aud, config.clerkJwtAudience)) {
-          return yield* relayAuthInvalidError("invalid_bearer");
-        }
         const proofKeyThumbprint = yield* requireDpopProof().pipe(
           Effect.provideService(DpopProofs.DpopProofReplay, dpopProofs),
         );
@@ -603,7 +601,7 @@ export const tokenApi = HttpApiBuilder.group(
         return {
           access_token: yield* relayTokens
             .issueDpopAccessToken({
-              userId: verified.sub,
+              userId,
               proofKeyThumbprint,
               jti,
               issuedAtEpochSeconds: Math.floor(now.epochMilliseconds / 1_000),
@@ -1061,6 +1059,26 @@ function hasExpectedClerkAudience(audience: unknown, expectedAudience: string): 
     : Array.isArray(audience) &&
         audience.some((entry) => typeof entry === "string" && entry === expectedAudience);
 }
+
+export const verifyRelayDpopTokenExchangeSubject = Effect.fn(
+  "relay.auth.dpop_token_exchange_subject",
+)(function* (config: RelayConfiguration.RelayConfiguration["Service"], token: string) {
+  const verified = yield* verifyClerkBearerToken(config, token).pipe(
+    Effect.tapErrorTag("ClerkTokenVerificationError", (error) =>
+      Effect.annotateCurrentSpan({
+        "relay.auth.clerk_verification_failure": error.reason,
+        "relay.auth.clerk_verification_stage": error.stage,
+      }),
+    ),
+    Effect.catchTags({
+      ClerkTokenVerificationError: () => relayAuthInvalidError("invalid_bearer"),
+    }),
+  );
+  if (!verified.sub || !hasExpectedClerkAudience(verified.aud, config.clerkJwtAudience)) {
+    return yield* relayAuthInvalidError("invalid_bearer");
+  }
+  return verified.sub;
+});
 
 function verifyClerkBearerToken(
   config: RelayConfiguration.RelayConfiguration["Service"],
