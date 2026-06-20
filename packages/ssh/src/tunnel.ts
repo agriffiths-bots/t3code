@@ -115,15 +115,6 @@ type SshEnvironmentEffectError =
   | SshPasswordPromptError
   | NetService.NetError;
 
-function makeSshTunnelCancelledError(target: DesktopSshEnvironmentTarget): SshCommandError {
-  return new SshCommandCancelledError({
-    command: ["ssh"],
-    exitCode: null,
-    stderr: "",
-    target: target.alias || target.hostname,
-  });
-}
-
 function sshTargetLogFields(target: DesktopSshEnvironmentTarget) {
   return {
     alias: target.alias,
@@ -1271,7 +1262,15 @@ export const make = Effect.fn("ssh/tunnel.SshEnvironmentManager.make")(function*
       return;
     }
     pendingTunnelEntries.delete(key);
-    yield* Deferred.fail(pending, makeSshTunnelCancelledError(target)).pipe(Effect.ignore);
+    yield* Deferred.fail(
+      pending,
+      new SshCommandCancelledError({
+        command: ["ssh"],
+        exitCode: null,
+        stderr: "",
+        target: target.alias || target.hostname,
+      }),
+    ).pipe(Effect.ignore);
   });
 
   yield* Scope.addFinalizer(
