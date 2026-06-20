@@ -5,6 +5,8 @@ import type { ProviderMaintenanceCapabilities } from "../providerMaintenance.ts"
 
 export interface ServerProviderShape {
   readonly maintenanceCapabilities: ProviderMaintenanceCapabilities;
+  /** The pre-probe pending placeholder captured at construction time. */
+  readonly initialSnapshot: ServerProvider;
   readonly getSnapshot: Effect.Effect<ServerProvider>;
   readonly refresh: Effect.Effect<ServerProvider>;
   readonly streamChanges: Stream.Stream<ServerProvider>;

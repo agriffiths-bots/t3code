@@ -118,6 +118,7 @@ const makeFakeInstance = (
         provider: driverKind,
         packageName: null,
       }),
+      initialSnapshot: {} as unknown as ServerProvider,
       getSnapshot: Effect.succeed({} as unknown as ServerProvider),
       refresh: Effect.succeed({} as unknown as ServerProvider),
       streamChanges: Stream.empty,

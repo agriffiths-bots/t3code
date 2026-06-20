@@ -636,15 +636,14 @@ export const make = Effect.gen(function* () {
           Effect.gen(function* () {
             const source = buildSnapshotSource(instance);
             const provider = yield* source.getSnapshot;
-            const bootFallback = fallbackByInstance.get(instanceId);
-            // Keep hydrated cache state when this is still the exact pending
-            // snapshot read during boot. A probe that completed before the
-            // subscription was attached differs here and is applied instead.
+            // Keep hydrated cache state when the snapshot is still the
+            // pre-probe pending placeholder. Compare against the instance's
+            // true initial snapshot — not the boot-time getSnapshot read,
+            // which may already reflect a completed probe.
             if (
               cachedInstanceIds.has(instanceId) &&
               bootInstancesById.get(instanceId) === instance &&
-              bootFallback !== undefined &&
-              Equal.equals(provider, bootFallback)
+              Equal.equals(provider, instance.snapshot.initialSnapshot)
             ) {
               return;
             }
