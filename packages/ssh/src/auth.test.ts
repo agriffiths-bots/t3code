@@ -34,30 +34,35 @@ describe("ssh auth", () => {
   it("only follows causes from SSH process wrappers", () => {
     const authFailure = new Error("Permission denied (publickey,password).");
     const commandFailure = new SshErrors.SshCommandSpawnError({
-      command: ["ssh", "devbox"],
+      command: "ssh",
+      argumentCount: 1,
       exitCode: null,
-      stderr: "",
+      stderrBytes: 0,
       target: "devbox",
       cause: authFailure,
     });
     assert.equal(isSshAuthFailure(commandFailure), true);
 
     const helperFailure = new SshErrors.SshAuthenticationHelperError({
-      command: ["ssh", "devbox"],
+      command: "ssh",
+      argumentCount: 1,
       exitCode: null,
-      stderr: "",
+      stderrBytes: 0,
       target: "devbox",
       cause: authFailure,
     });
     assert.equal(isSshAuthFailure(helperFailure), false);
 
     const readinessFailure = new SshErrors.SshReadinessTimeoutError({
-      baseUrl: "http://127.0.0.1:41773/",
-      requestUrl: "http://127.0.0.1:41773/ready",
+      baseTarget: "http://127.0.0.1:41773/",
+      baseUrlLength: 23,
+      requestTarget: "http://127.0.0.1:41773/ready",
+      requestUrlLength: 28,
       timeoutMs: 1_000,
       attempts: 1,
       cause: new SshErrors.SshReadinessProbeError({
-        requestUrl: "http://127.0.0.1:41773/ready",
+        requestTarget: "http://127.0.0.1:41773/ready",
+        requestUrlLength: 28,
         cause: new Error("HTTP authentication failed."),
       }),
     });

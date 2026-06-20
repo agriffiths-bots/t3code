@@ -20,6 +20,7 @@ import {
   SshHttpBridgeInvalidUrlError,
   SshHttpBridgeMissingUrlError,
   SshHttpBridgeNonLoopbackUrlError,
+  SshPairingOutputParseError,
   SshReadinessProbeTimeoutError,
   SshReadinessTimeoutError,
 } from "./errors.ts";
@@ -259,8 +260,8 @@ describe("ssh tunnel scripts", () => {
       const fiber = yield* Effect.forkChild(
         Effect.result(
           SshTunnel.waitForHttpReady({
-            baseUrl: "http://127.0.0.1:41773/",
-            path: "/ready",
+            baseUrl: "http://127.0.0.1:41773/?token=base-secret#fragment",
+            path: "/ready?credential=request-secret#fragment",
             timeoutMs: 1_000,
             intervalMs: 100,
             probeTimeoutMs: 250,
@@ -276,8 +277,13 @@ describe("ssh tunnel scripts", () => {
       if (Result.isFailure(result)) {
         assert.instanceOf(result.failure, SshReadinessTimeoutError);
         const timeoutError = result.failure as SshReadinessTimeoutError;
-        assert.equal(timeoutError.baseUrl, "http://127.0.0.1:41773/");
-        assert.equal(timeoutError.requestUrl, "http://127.0.0.1:41773/ready");
+        assert.equal(timeoutError.baseTarget, "http://127.0.0.1:41773/");
+        assert.equal(timeoutError.requestTarget, "http://127.0.0.1:41773/ready");
+        assert.isAbove(timeoutError.baseUrlLength, timeoutError.baseTarget.length);
+        assert.isAbove(timeoutError.requestUrlLength, timeoutError.requestTarget.length);
+        assert.isFalse("baseUrl" in timeoutError);
+        assert.isFalse("requestUrl" in timeoutError);
+        assert.notInclude(timeoutError.message, "secret");
         assert.equal(
           timeoutError.message,
           "Timed out waiting 1000ms for backend readiness at http://127.0.0.1:41773/.",
@@ -325,7 +331,7 @@ describe("ssh tunnel scripts", () => {
     }),
   );
 
-  it("preserves primitive readiness reason values in diagnostic output", () => {
+  it("describes readiness causes without copying arbitrary messages", () => {
     assert.deepEqual(
       SshTunnel.describeReadinessCause({
         _tag: "HttpClientError",
@@ -335,9 +341,8 @@ describe("ssh tunnel scripts", () => {
       }),
       {
         _tag: "HttpClientError",
-        message: "Backend readiness probe failed.",
-        reason: "authentication failed",
-        cause: "upstream closed",
+        reason: { type: "string" },
+        cause: { type: "string" },
       },
     );
   });
@@ -346,14 +351,16 @@ describe("ssh tunnel scripts", () => {
     assert.deepEqual(
       SshTunnel.describeReadinessCause(
         new SshReadinessProbeTimeoutError({
-          requestUrl: "http://127.0.0.1:41773/ready",
+          requestTarget: "http://127.0.0.1:41773/ready",
+          requestUrlLength: 28,
           timeoutMs: 250,
           attempt: 3,
         }),
       ),
       {
         _tag: "SshReadinessProbeTimeoutError",
-        requestUrl: "http://127.0.0.1:41773/ready",
+        requestTarget: "http://127.0.0.1:41773/ready",
+        requestUrlLength: 28,
         timeoutMs: 250,
         attempt: 3,
         message: "Backend readiness probe exceeded 250ms at http://127.0.0.1:41773/ready.",
@@ -413,6 +420,33 @@ describe("ssh tunnel scripts", () => {
     return Effect.gen(function* () {
       const result = yield* SshTunnel.issueRemotePairingToken(target);
       assert.equal(result.credential, "LCL4R2TPHDKQ");
+    }).pipe(Effect.provide(processLayer));
+  });
+
+  it.effect("does not copy pairing command output into parse errors", () => {
+    const target = {
+      alias: "devbox",
+      hostname: "devbox.example.com",
+      username: "julius",
+      port: 2222,
+    } as const;
+    const output = '{"credential":"pairing-secret"';
+    const spawner = ChildProcessSpawner.make(() => Effect.succeed(makeSuccessfulProcess(output)));
+    const processLayer = Layer.merge(
+      NodeServices.layer,
+      Layer.succeed(ChildProcessSpawner.ChildProcessSpawner, spawner),
+    );
+
+    return Effect.gen(function* () {
+      const result = yield* Effect.result(SshTunnel.issueRemotePairingToken(target));
+      assert.isTrue(Result.isFailure(result));
+      if (Result.isFailure(result)) {
+        assert.instanceOf(result.failure, SshPairingOutputParseError);
+        assert.equal(result.failure.stdoutBytes, new TextEncoder().encode(output).length);
+        assert.isFalse("stdout" in result.failure);
+        assert.notInclude(result.failure.message, "pairing-secret");
+        assert.exists(result.failure.cause);
+      }
     }).pipe(Effect.provide(processLayer));
   });
 

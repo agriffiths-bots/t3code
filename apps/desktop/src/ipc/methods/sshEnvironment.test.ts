@@ -43,9 +43,10 @@ describe("SSH environment IPC", () => {
   it("presents legacy process causes without weakening structured errors", () => {
     const cause = new Error("ssh executable was not found");
     const structured = new SshCommandSpawnError({
-      command: ["ssh"],
+      command: "ssh",
+      argumentCount: 0,
       exitCode: null,
-      stderr: "",
+      stderrBytes: 0,
       target: "devbox",
       cause,
     });

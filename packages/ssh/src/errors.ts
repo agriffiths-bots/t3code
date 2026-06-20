@@ -42,10 +42,11 @@ export const SshInvalidTargetError = Schema.Union([
 export type SshInvalidTargetError = typeof SshInvalidTargetError.Type;
 
 const SshCommandErrorFields = {
-  command: Schema.Array(Schema.String),
+  command: Schema.String,
+  argumentCount: Schema.Number,
   exitCode: Schema.NullOr(Schema.Number),
-  stderr: Schema.String,
-  stdout: Schema.optional(Schema.String),
+  stderrBytes: Schema.Number,
+  stdoutBytes: Schema.optional(Schema.Number),
   target: Schema.optional(Schema.String),
   timeoutMs: Schema.optional(Schema.Number),
 };
@@ -95,11 +96,7 @@ export class SshCommandExitError extends Schema.TaggedErrorClass<SshCommandExitE
   },
 ) {
   override get message(): string {
-    return (
-      this.stderr.trim() ||
-      this.stdout?.trim() ||
-      `SSH command failed${targetSuffix(this.target)}${exitCodeSuffix(this.exitCode)}.`
-    );
+    return `SSH command failed${targetSuffix(this.target)}${exitCodeSuffix(this.exitCode)}.`;
   }
 }
 
@@ -154,11 +151,7 @@ export class SshTunnelExitError extends Schema.TaggedErrorClass<SshTunnelExitErr
   },
 ) {
   override get message(): string {
-    return (
-      this.stderr.trim() ||
-      this.stdout?.trim() ||
-      `SSH tunnel exited unexpectedly${targetSuffix(this.target)}${exitCodeSuffix(this.exitCode)}.`
-    );
+    return `SSH tunnel exited unexpectedly${targetSuffix(this.target)}${exitCodeSuffix(this.exitCode)}.`;
   }
 }
 
@@ -178,7 +171,7 @@ export type SshCommandError = typeof SshCommandError.Type;
 export class SshLaunchPortMissingError extends Schema.TaggedErrorClass<SshLaunchPortMissingError>()(
   "SshLaunchPortMissingError",
   {
-    stdout: Schema.String,
+    stdoutBytes: Schema.Number,
   },
 ) {
   override get message(): string {
@@ -189,7 +182,7 @@ export class SshLaunchPortMissingError extends Schema.TaggedErrorClass<SshLaunch
 export class SshLaunchOutputParseError extends Schema.TaggedErrorClass<SshLaunchOutputParseError>()(
   "SshLaunchOutputParseError",
   {
-    stdout: Schema.String,
+    stdoutBytes: Schema.Number,
     cause: Schema.Defect(),
   },
 ) {
@@ -201,7 +194,7 @@ export class SshLaunchOutputParseError extends Schema.TaggedErrorClass<SshLaunch
 export class SshLaunchInvalidPortError extends Schema.TaggedErrorClass<SshLaunchInvalidPortError>()(
   "SshLaunchInvalidPortError",
   {
-    stdout: Schema.String,
+    stdoutBytes: Schema.Number,
     remotePort: Schema.optional(Schema.Number),
   },
 ) {
@@ -220,7 +213,7 @@ export type SshLaunchError = typeof SshLaunchError.Type;
 export class SshPairingCredentialMissingError extends Schema.TaggedErrorClass<SshPairingCredentialMissingError>()(
   "SshPairingCredentialMissingError",
   {
-    stdout: Schema.String,
+    stdoutBytes: Schema.Number,
   },
 ) {
   override get message(): string {
@@ -231,7 +224,7 @@ export class SshPairingCredentialMissingError extends Schema.TaggedErrorClass<Ss
 export class SshPairingOutputParseError extends Schema.TaggedErrorClass<SshPairingOutputParseError>()(
   "SshPairingOutputParseError",
   {
-    stdout: Schema.String,
+    stdoutBytes: Schema.Number,
     cause: Schema.Defect(),
   },
 ) {
@@ -243,7 +236,7 @@ export class SshPairingOutputParseError extends Schema.TaggedErrorClass<SshPairi
 export class SshPairingInvalidCredentialError extends Schema.TaggedErrorClass<SshPairingInvalidCredentialError>()(
   "SshPairingInvalidCredentialError",
   {
-    stdout: Schema.String,
+    stdoutBytes: Schema.Number,
   },
 ) {
   override get message(): string {
@@ -299,40 +292,44 @@ export type SshHttpBridgeError = typeof SshHttpBridgeError.Type;
 export class SshReadinessProbeError extends Schema.TaggedErrorClass<SshReadinessProbeError>()(
   "SshReadinessProbeError",
   {
-    requestUrl: Schema.String,
+    requestTarget: Schema.String,
+    requestUrlLength: Schema.Number,
     cause: Schema.Defect(),
   },
 ) {
   override get message(): string {
-    return `Backend readiness probe failed at ${this.requestUrl}.`;
+    return `Backend readiness probe failed at ${this.requestTarget}.`;
   }
 }
 
 export class SshReadinessProbeTimeoutError extends Schema.TaggedErrorClass<SshReadinessProbeTimeoutError>()(
   "SshReadinessProbeTimeoutError",
   {
-    requestUrl: Schema.String,
+    requestTarget: Schema.String,
+    requestUrlLength: Schema.Number,
     timeoutMs: Schema.Number,
     attempt: Schema.Number,
   },
 ) {
   override get message(): string {
-    return `Backend readiness probe exceeded ${this.timeoutMs}ms at ${this.requestUrl}.`;
+    return `Backend readiness probe exceeded ${this.timeoutMs}ms at ${this.requestTarget}.`;
   }
 }
 
 export class SshReadinessTimeoutError extends Schema.TaggedErrorClass<SshReadinessTimeoutError>()(
   "SshReadinessTimeoutError",
   {
-    baseUrl: Schema.String,
-    requestUrl: Schema.String,
+    baseTarget: Schema.String,
+    baseUrlLength: Schema.Number,
+    requestTarget: Schema.String,
+    requestUrlLength: Schema.Number,
     timeoutMs: Schema.Number,
     attempts: Schema.Number,
     cause: Schema.optional(Schema.Defect()),
   },
 ) {
   override get message(): string {
-    return `Timed out waiting ${this.timeoutMs}ms for backend readiness at ${this.baseUrl}.`;
+    return `Timed out waiting ${this.timeoutMs}ms for backend readiness at ${this.baseTarget}.`;
   }
 }
 

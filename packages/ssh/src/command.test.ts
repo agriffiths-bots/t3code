@@ -145,7 +145,7 @@ describe("ssh command", () => {
     }),
   );
 
-  it.effect("includes stdout in non-zero command failures when stderr is empty", () => {
+  it.effect("records bounded output diagnostics for non-zero command failures", () => {
     const spawner = ChildProcessSpawner.make(() =>
       Effect.succeed(makeFailedProcess({ stdout: "Pairing token creation failed\n" })),
     );
@@ -168,16 +168,24 @@ describe("ssh command", () => {
       assert.isTrue(Result.isFailure(result));
       if (Result.isFailure(result)) {
         assert.instanceOf(result.failure, SshCommandExitError);
-        assert.equal(result.failure.message, "Pairing token creation failed");
-        assert.equal(result.failure.stdout, "Pairing token creation failed\n");
-        assert.equal(result.failure.stderr, "");
+        assert.equal(result.failure.message, "SSH command failed for julius@devbox (exit 1).");
+        assert.equal(result.failure.command, "ssh");
+        assert.equal(result.failure.argumentCount, 9);
+        assert.equal(
+          result.failure.stdoutBytes,
+          encoder.encode("Pairing token creation failed\n").length,
+        );
+        assert.equal(result.failure.stderrBytes, 0);
+        assert.isFalse("stdout" in result.failure);
+        assert.isFalse("stderr" in result.failure);
       }
 
       const spawnCause = new Error("ssh executable was not found");
       const spawnError = new SshCommandSpawnError({
-        command: ["ssh"],
+        command: "ssh",
+        argumentCount: 0,
         exitCode: null,
-        stderr: "",
+        stderrBytes: 0,
         target: "devbox",
         cause: spawnCause,
       });
@@ -187,7 +195,7 @@ describe("ssh command", () => {
     }).pipe(Effect.provide(processLayer));
   });
 
-  it.effect("redacts credentials from stdout in non-zero command failures", () => {
+  it.effect("does not expose credentials from non-zero command output", () => {
     const spawner = ChildProcessSpawner.make(() =>
       Effect.succeed(makeFailedProcess({ stdout: '{"credential":"pairing-secret"}\n' })),
     );
@@ -210,8 +218,12 @@ describe("ssh command", () => {
       assert.isTrue(Result.isFailure(result));
       if (Result.isFailure(result)) {
         assert.instanceOf(result.failure, SshCommandExitError);
-        assert.equal(result.failure.message, '{"credential":"[redacted]"}');
-        assert.equal(result.failure.stdout, '{"credential":"[redacted]"}\n');
+        assert.notInclude(result.failure.message, "pairing-secret");
+        assert.equal(
+          result.failure.stdoutBytes,
+          encoder.encode('{"credential":"pairing-secret"}\n').length,
+        );
+        assert.isFalse("stdout" in result.failure);
       }
     }).pipe(Effect.provide(processLayer));
   });
