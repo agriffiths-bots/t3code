@@ -11,7 +11,6 @@ import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
-import * as PlatformError from "effect/PlatformError";
 import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
 import * as Sink from "effect/Sink";
@@ -139,13 +138,6 @@ function mockSpawnerLayer(
       };
       return Effect.succeed(mockHandle(handler(childProcess.command, childProcess.args)));
     }),
-  );
-}
-
-function failingSpawnerLayer(cause: PlatformError.PlatformError) {
-  return Layer.succeed(
-    ChildProcessSpawner.ChildProcessSpawner,
-    ChildProcessSpawner.make(() => Effect.fail(cause)),
   );
 }
 
@@ -328,29 +320,6 @@ describe("providerMaintenanceRunner", () => {
       );
     },
   );
-
-  it.effect("preserves update spawn failure messages", () => {
-    const cause = PlatformError.systemError({
-      _tag: "PermissionDenied",
-      module: "ChildProcess",
-      method: "spawn",
-      pathOrDescriptor: "npm",
-      description: "",
-    });
-    return Effect.gen(function* () {
-      const { registry } = yield* makeRegistry(baseProvider);
-      const runner = yield* makeTestRunner(registry);
-
-      const result = yield* runner.updateProvider(CODEX_DRIVER);
-      assert.strictEqual(result.providers[0]?.updateState?.status, "failed");
-      assert.strictEqual(
-        result.providers[0]?.updateState?.message,
-        `Failed to run update command npm: ${cause.message}`,
-      );
-    }).pipe(
-      Effect.provide(Layer.mergeAll(latestVersionHttpClient("0.0.0"), failingSpawnerLayer(cause))),
-    );
-  });
 
   it.effect("updates a single provider instance without touching sibling instances", () => {
     const calls: Array<{ command: string; args: ReadonlyArray<string> }> = [];

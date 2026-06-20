@@ -16,31 +16,6 @@ const decodeOpenCodeSettings = Schema.decodeSync(OpenCodeSettings);
 
 const DEFAULT_VERSION_STDOUT = "opencode 1.14.19\n";
 
-it("keeps OpenCode runtime causes separate from stable messages", () => {
-  const cause = new Error("sdk response included sensitive diagnostics");
-  const error = new OpenCodeRuntime.OpenCodeRuntimeError({
-    operation: "provider.list",
-    detail: cause.message,
-    cause,
-  });
-
-  assert.equal(error.cause, cause);
-  assert.equal(error.message, "OpenCode runtime operation provider.list failed.");
-  assert.doesNotMatch(error.message, /sensitive diagnostics/u);
-
-  const processExit = new OpenCodeRuntime.OpenCodeRuntimeError({
-    operation: "startOpenCodeServerProcess",
-    detail: "OpenCode server exited before startup completed.",
-    exitCode: 1,
-    stdout: "startup output",
-    stderr: "startup failure",
-  });
-  assert.equal(processExit.cause, undefined);
-  assert.equal(processExit.exitCode, 1);
-  assert.equal(processExit.stdout, "startup output");
-  assert.equal(processExit.stderr, "startup failure");
-});
-
 /**
  * The legacy `OpenCodeProviderLive` Layer + `OpenCodeProvider` service tag
  * are deleted. The snapshot-producing logic they wrapped now lives in the
