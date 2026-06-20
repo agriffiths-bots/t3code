@@ -1,10 +1,12 @@
 import type { RelayManagedEndpointRuntimeConfig } from "@t3tools/contracts/relay";
 import * as RelayClient from "@t3tools/shared/relayClient";
+import * as Cause from "effect/Cause";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
+import * as PlatformError from "effect/PlatformError";
 import * as Ref from "effect/Ref";
 import * as Result from "effect/Result";
 import * as Schema from "effect/Schema";
@@ -16,6 +18,105 @@ import * as ChildProcessSpawner from "effect/unstable/process/ChildProcessSpawne
 
 import * as ServerSecretStore from "../auth/ServerSecretStore.ts";
 import { CLOUD_ENDPOINT_RUNTIME_CONFIG, decodeRuntimeConfig } from "./config.ts";
+
+const MAX_CAUSE_DIAGNOSTIC_TAGS = 8;
+const MAX_DIAGNOSTIC_VALUE_LENGTH = 128;
+
+function boundedDiagnosticValue(value: string): string {
+  return value.slice(0, MAX_DIAGNOSTIC_VALUE_LENGTH);
+}
+
+function diagnosticValueTag(value: unknown): string {
+  try {
+    if (
+      typeof value === "object" &&
+      value !== null &&
+      "_tag" in value &&
+      typeof value._tag === "string"
+    ) {
+      return boundedDiagnosticValue(value._tag);
+    }
+    if (value instanceof Error) {
+      return boundedDiagnosticValue(value.name);
+    }
+    return typeof value;
+  } catch {
+    return "Uninspectable";
+  }
+}
+
+function addUniqueDiagnosticTag(tags: Array<string>, tag: string): void {
+  if (tags.length < MAX_CAUSE_DIAGNOSTIC_TAGS && !tags.includes(tag)) {
+    tags.push(tag);
+  }
+}
+
+export function managedEndpointCauseDiagnostics(cause: Cause.Cause<unknown>) {
+  const failureTags: Array<string> = [];
+  const defectTags: Array<string> = [];
+  let failureCount = 0;
+  let defectCount = 0;
+  let interruptionCount = 0;
+
+  for (const reason of cause.reasons) {
+    if (Cause.isFailReason(reason)) {
+      failureCount += 1;
+      addUniqueDiagnosticTag(failureTags, diagnosticValueTag(reason.error));
+      continue;
+    }
+    if (Cause.isDieReason(reason)) {
+      defectCount += 1;
+      addUniqueDiagnosticTag(defectTags, diagnosticValueTag(reason.defect));
+      continue;
+    }
+    interruptionCount += 1;
+  }
+
+  return {
+    reasonCount: cause.reasons.length,
+    failureCount,
+    failureTags,
+    defectCount,
+    defectTags,
+    interruptionCount,
+  };
+}
+
+function logManagedEndpointCause(
+  message: string,
+  cause: Cause.Cause<unknown>,
+  attributes: Readonly<Record<string, unknown>>,
+) {
+  const interruptionReasons = cause.reasons.filter(Cause.isInterruptReason);
+  if (interruptionReasons.length > 0) {
+    return Effect.failCause(Cause.fromReasons<never>(interruptionReasons));
+  }
+  return Effect.logWarning(message, {
+    ...attributes,
+    ...managedEndpointCauseDiagnostics(cause),
+  });
+}
+
+function platformErrorDiagnostics(error: PlatformError.PlatformError) {
+  return {
+    errorTag: error._tag,
+    reasonTag: error.reason._tag,
+    errorModule: boundedDiagnosticValue(error.reason.module),
+    errorMethod: boundedDiagnosticValue(error.reason.method),
+  };
+}
+
+export class CloudManagedEndpointRuntimeConfigReadError extends Schema.TaggedErrorClass<CloudManagedEndpointRuntimeConfigReadError>()(
+  "CloudManagedEndpointRuntimeConfigReadError",
+  {
+    resource: Schema.Literal(CLOUD_ENDPOINT_RUNTIME_CONFIG),
+    cause: Schema.Defect(),
+  },
+) {
+  override get message(): string {
+    return `Failed to read managed endpoint runtime configuration from ${this.resource}.`;
+  }
+}
 
 export class CloudManagedEndpointRuntimeConfigDecodeError extends Schema.TaggedErrorClass<CloudManagedEndpointRuntimeConfigDecodeError>()(
   "CloudManagedEndpointRuntimeConfigDecodeError",
@@ -35,7 +136,15 @@ function bytesToString(bytes: Uint8Array): string {
 
 const readRuntimeConfig = Effect.gen(function* () {
   const secrets = yield* ServerSecretStore.ServerSecretStore;
-  const bytes = yield* secrets.get(CLOUD_ENDPOINT_RUNTIME_CONFIG);
+  const bytes = yield* secrets.get(CLOUD_ENDPOINT_RUNTIME_CONFIG).pipe(
+    Effect.mapError(
+      (cause) =>
+        new CloudManagedEndpointRuntimeConfigReadError({
+          resource: CLOUD_ENDPOINT_RUNTIME_CONFIG,
+          cause,
+        }),
+    ),
+  );
   if (Option.isNone(bytes)) {
     return null;
   }
@@ -114,8 +223,7 @@ const stopConnector = (connector: ActiveConnector | null) =>
           }),
         ),
         Effect.catchCause((cause) =>
-          Effect.logWarning("Failed to stop relay client", {
-            cause,
+          logManagedEndpointCause("Failed to stop relay client", cause, {
             pid: Number(connector.child.pid),
             tunnelId: connector.config.tunnelId,
             tunnelName: connector.config.tunnelName,
@@ -165,7 +273,12 @@ export const make = Effect.gen(function* () {
             pid: Number(connector.child.pid),
             ...(Result.isSuccess(result)
               ? { exitCode: Number(result.success) }
-              : { cause: result.failure }),
+              : {
+                  exitErrorTag: result.failure._tag,
+                  exitReasonTag: result.failure.reason._tag,
+                  exitErrorModule: boundedDiagnosticValue(result.failure.reason.module),
+                  exitErrorMethod: boundedDiagnosticValue(result.failure.reason.method),
+                }),
             tunnelId: connector.config.tunnelId,
             tunnelName: connector.config.tunnelName,
           });
@@ -173,7 +286,9 @@ export const make = Effect.gen(function* () {
         }),
       );
     }).pipe(
-      Effect.catchCause((cause) => Effect.logWarning("Relay client supervisor failed", { cause })),
+      Effect.catchCause((cause) =>
+        logManagedEndpointCause("Relay client supervisor failed", cause, {}),
+      ),
     );
 
   const observeConnectorOutput = (connector: ActiveConnector) =>
@@ -199,8 +314,7 @@ export const make = Effect.gen(function* () {
         }
       }),
       Effect.catchCause((cause) =>
-        Effect.logWarning("Relay client output observer failed", {
-          cause,
+        logManagedEndpointCause("Relay client output observer failed", cause, {
           pid: Number(connector.child.pid),
           tunnelId: connector.config.tunnelId,
           tunnelName: connector.config.tunnelName,
@@ -220,14 +334,15 @@ export const make = Effect.gen(function* () {
     const active = yield* Ref.get(activeRef);
     if (active?.configKey === nextConfigKey) {
       const isRunning = yield* active.child.isRunning.pipe(
-        Effect.catch((cause) =>
-          Effect.logWarning("Failed to inspect relay client process", {
-            cause,
-            pid: Number(active.child.pid),
-            tunnelId: active.config.tunnelId,
-            tunnelName: active.config.tunnelName,
-          }).pipe(Effect.as(false)),
-        ),
+        Effect.catchTags({
+          PlatformError: (error) =>
+            Effect.logWarning("Failed to inspect relay client process", {
+              ...platformErrorDiagnostics(error),
+              pid: Number(active.child.pid),
+              tunnelId: active.config.tunnelId,
+              tunnelName: active.config.tunnelName,
+            }).pipe(Effect.as(false)),
+        }),
       );
       if (isRunning) {
         return {
@@ -279,22 +394,23 @@ export const make = Effect.gen(function* () {
             tunnelName: config.tunnelName,
           }),
         ),
-        Effect.catch((cause) =>
-          Effect.logWarning("Failed to start relay client", {
-            cause,
-            tunnelId: config.tunnelId,
-            tunnelName: config.tunnelName,
-          }).pipe(
-            Effect.andThen(Scope.close(connectorScope, Exit.void).pipe(Effect.ignore)),
-            Effect.as({
-              status: "failed",
-              providerKind: "cloudflare_tunnel",
-              reason: "Failed to start the relay client.",
-              ...(config.tunnelId ? { tunnelId: config.tunnelId } : {}),
-              ...(config.tunnelName ? { tunnelName: config.tunnelName } : {}),
-            } satisfies CloudManagedEndpointRuntimeStatus),
-          ),
-        ),
+        Effect.catchTags({
+          PlatformError: (error) =>
+            Effect.logWarning("Failed to start relay client", {
+              ...platformErrorDiagnostics(error),
+              tunnelId: config.tunnelId,
+              tunnelName: config.tunnelName,
+            }).pipe(
+              Effect.andThen(Scope.close(connectorScope, Exit.void).pipe(Effect.ignore)),
+              Effect.as({
+                status: "failed",
+                providerKind: "cloudflare_tunnel",
+                reason: "Failed to start the relay client.",
+                ...(config.tunnelId ? { tunnelId: config.tunnelId } : {}),
+                ...(config.tunnelName ? { tunnelName: config.tunnelName } : {}),
+              } satisfies CloudManagedEndpointRuntimeStatus),
+            ),
+        }),
       );
 
     if ("status" in child && child.status === "failed") {
@@ -340,12 +456,21 @@ export const make = Effect.gen(function* () {
     applyConfig,
   });
 
+  const recoverRuntimeConfigError = (
+    error:
+      | CloudManagedEndpointRuntimeConfigReadError
+      | CloudManagedEndpointRuntimeConfigDecodeError,
+  ) =>
+    Effect.logWarning("Failed to read managed endpoint runtime config", {
+      errorTag: error._tag,
+      resource: error.resource,
+      causeTag: diagnosticValueTag(error.cause),
+    }).pipe(Effect.as(null));
   const initialConfig = yield* readRuntimeConfig.pipe(
-    Effect.catch((cause) =>
-      Effect.logWarning("Failed to read managed endpoint runtime config", { cause }).pipe(
-        Effect.as(null),
-      ),
-    ),
+    Effect.catchTags({
+      CloudManagedEndpointRuntimeConfigReadError: recoverRuntimeConfigError,
+      CloudManagedEndpointRuntimeConfigDecodeError: recoverRuntimeConfigError,
+    }),
   );
   yield* runtime.applyConfig(initialConfig);
   yield* Effect.addFinalizer(() => runtime.applyConfig(null));

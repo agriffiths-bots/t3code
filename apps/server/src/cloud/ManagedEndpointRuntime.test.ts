@@ -1,5 +1,6 @@
 import { describe, expect, it } from "@effect/vitest";
 import { vi } from "vite-plus/test";
+import * as Cause from "effect/Cause";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
@@ -66,6 +67,7 @@ function makeHandle(input: {
   readonly isRunningEffect?: ChildProcessSpawner.ChildProcessHandle["isRunning"];
   readonly exitCode?: Effect.Effect<ChildProcessSpawner.ExitCode>;
   readonly output?: string;
+  readonly all?: ChildProcessSpawner.ChildProcessHandle["all"];
 }) {
   return ChildProcessSpawner.makeHandle({
     pid: ChildProcessSpawner.ProcessId(input.pid),
@@ -80,9 +82,10 @@ function makeHandle(input: {
     stdout: Stream.empty,
     stderr: Stream.empty,
     all:
-      input.output === undefined
+      input.all ??
+      (input.output === undefined
         ? Stream.empty
-        : Stream.make(new TextEncoder().encode(input.output)),
+        : Stream.make(new TextEncoder().encode(input.output))),
     getInputFd: () => Sink.drain,
     getOutputFd: () => Stream.empty,
   });
@@ -259,10 +262,52 @@ describe("CloudManagedEndpointRuntime", () => {
       expect(warning).toBeDefined();
       if (!Array.isArray(warning)) return;
       expect(warning[1]).toMatchObject({
+        errorTag: "PlatformError",
+        reasonTag: "PermissionDenied",
+        errorModule: "ChildProcess",
+        errorMethod: "isRunning",
         pid: 301,
         tunnelId: "tunnel-1",
       });
-      expect((warning[1] as { cause: unknown }).cause).toBe(probeCause);
+      expect(warning[1]).not.toHaveProperty("cause");
+      expect(warning[1]).not.toHaveProperty("description");
+    }).pipe(Effect.provide(Logger.layer([logger], { mergeWithExisting: false })));
+  });
+
+  it.effect("does not report connector scope interruption as a runtime failure", () => {
+    const logMessages: unknown[] = [];
+    const logger = Logger.make(({ message }) => {
+      logMessages.push(message);
+    });
+    const spawner = ChildProcessSpawner.make(() =>
+      Effect.gen(function* () {
+        const handle = makeHandle({
+          pid: 325,
+          all: Stream.never,
+          onKill: () => undefined,
+        });
+        yield* Effect.addFinalizer(() => handle.kill().pipe(Effect.ignore));
+        return handle;
+      }),
+    );
+
+    return Effect.gen(function* () {
+      const runtime = yield* buildCloudManagedEndpointRuntime(spawner);
+      yield* runtime.applyConfig({
+        providerKind: "cloudflare_tunnel",
+        connectorToken: "token",
+        tunnelId: "tunnel-1",
+      });
+      yield* runtime.applyConfig(null);
+
+      expect(
+        logMessages.some(
+          (message) =>
+            Array.isArray(message) &&
+            (message[0] === "Relay client supervisor failed" ||
+              message[0] === "Relay client output observer failed"),
+        ),
+      ).toBe(false);
     }).pipe(Effect.provide(Logger.layer([logger], { mergeWithExisting: false })));
   });
 
@@ -417,18 +462,21 @@ describe("CloudManagedEndpointRuntime", () => {
     }),
   );
 
-  it.effect("reports connector spawn failures", () =>
-    Effect.gen(function* () {
-      const spawner = ChildProcessSpawner.make(() =>
-        Effect.fail(
-          PlatformError.systemError({
-            _tag: "NotFound",
-            module: "ChildProcess",
-            method: "spawn",
-            description: "cloudflared missing",
-          }),
-        ),
-      );
+  it.effect("reports connector spawn failures without logging nested details", () => {
+    const logMessages: unknown[] = [];
+    const logger = Logger.make(({ message }) => {
+      logMessages.push(message);
+    });
+    const spawnCause = PlatformError.systemError({
+      _tag: "NotFound",
+      module: "ChildProcess",
+      method: "spawn",
+      description: "private cloudflared path was missing",
+      cause: new Error("private nested spawn failure"),
+    });
+
+    return Effect.gen(function* () {
+      const spawner = ChildProcessSpawner.make(() => Effect.fail(spawnCause));
       const runtime = yield* buildCloudManagedEndpointRuntime(spawner);
 
       const status = yield* runtime.applyConfig({
@@ -443,8 +491,23 @@ describe("CloudManagedEndpointRuntime", () => {
         reason: "Failed to start the relay client.",
         tunnelId: "tunnel-1",
       });
-    }),
-  );
+      const warning = logMessages.find(
+        (message) => Array.isArray(message) && message[0] === "Failed to start relay client",
+      );
+      expect(warning).toEqual([
+        "Failed to start relay client",
+        {
+          errorTag: "PlatformError",
+          reasonTag: "NotFound",
+          errorModule: "ChildProcess",
+          errorMethod: "spawn",
+          tunnelId: "tunnel-1",
+          tunnelName: undefined,
+        },
+      ]);
+      expect(spawnCause.reason.cause).toBeInstanceOf(Error);
+    }).pipe(Effect.provide(Logger.layer([logger], { mergeWithExisting: false })));
+  });
 
   it.effect("retains malformed persisted runtime configuration diagnostics", () => {
     const logMessages: unknown[] = [];
@@ -466,15 +529,56 @@ describe("CloudManagedEndpointRuntime", () => {
       );
       expect(warning).toBeDefined();
       if (!Array.isArray(warning)) return;
-      const cause = (warning[1] as { cause: unknown }).cause;
-      expect(cause).toMatchObject({
-        _tag: "CloudManagedEndpointRuntimeConfigDecodeError",
+      expect(warning[1]).toMatchObject({
+        errorTag: "CloudManagedEndpointRuntimeConfigDecodeError",
         resource: "cloud-endpoint-runtime-config",
+        causeTag: "SchemaError",
       });
-      expect(
-        (cause as ManagedEndpointRuntime.CloudManagedEndpointRuntimeConfigDecodeError).cause,
-      ).toBeDefined();
+      expect(warning[1]).not.toHaveProperty("cause");
     }).pipe(Effect.provide(Logger.layer([logger], { mergeWithExisting: false })));
+  });
+
+  it("retains exact causes on managed endpoint runtime configuration errors", () => {
+    const readCause = new Error("private read failure");
+    const decodeCause = new Error("private decode failure");
+
+    expect(
+      new ManagedEndpointRuntime.CloudManagedEndpointRuntimeConfigReadError({
+        resource: "cloud-endpoint-runtime-config",
+        cause: readCause,
+      }).cause,
+    ).toBe(readCause);
+    expect(
+      new ManagedEndpointRuntime.CloudManagedEndpointRuntimeConfigDecodeError({
+        resource: "cloud-endpoint-runtime-config",
+        cause: decodeCause,
+      }).cause,
+    ).toBe(decodeCause);
+  });
+
+  it("summarizes managed endpoint causes without nested failure details", () => {
+    const nestedCause = new Error("private nested platform failure");
+    const platformFailure = PlatformError.systemError({
+      _tag: "PermissionDenied",
+      module: "ChildProcess",
+      method: "kill",
+      description: "private process description",
+      cause: nestedCause,
+    });
+    const cause = Cause.combine(
+      Cause.fail(platformFailure),
+      Cause.die(new TypeError("private defect detail")),
+    );
+
+    expect(ManagedEndpointRuntime.managedEndpointCauseDiagnostics(cause)).toEqual({
+      reasonCount: 2,
+      failureCount: 1,
+      failureTags: ["PlatformError"],
+      defectCount: 1,
+      defectTags: ["TypeError"],
+      interruptionCount: 0,
+    });
+    expect(platformFailure.reason.cause).toBe(nestedCause);
   });
 
   it.effect("reports a missing relay client executable without spawning", () =>
