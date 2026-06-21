@@ -63,18 +63,29 @@ export const getLocalEnvironmentBootstraps = DesktopIpc.makeSyncIpcMethod({
     const instances = yield* pool.list;
     const bootstraps: DesktopEnvironmentBootstrap[] = [];
     for (const instance of instances) {
+      const isPrimary = instance.id === PRIMARY_LOCAL_ENVIRONMENT_ID;
       const config = yield* instance.currentConfig;
-      // Skip instances that haven't produced a config yet (e.g. WSL
-      // backend mid-registration, before its first start cycle). They'll
-      // appear on the next IPC call once they've started.
-      if (Option.isNone(config)) continue;
-      // Skip instances whose preflight failed (e.g. WSL distro
-      // missing node, the linux server entry was never built). The
-      // backend manager schedules a restart instead of actually
-      // listening, so exposing the bootstrap would point the renderer
-      // at a port nothing is bound to and trigger needless
-      // /api/auth/bootstrap/bearer error cycles.
-      if (Option.isSome(config.value.preflightFailure)) continue;
+      // A secondary backend (e.g. a parallel WSL backend) that hasn't produced
+      // a config yet (mid-registration, before its first start cycle) OR whose
+      // preflight failed (e.g. WSL distro missing node, the linux server entry
+      // was never built) is not listening on a port. We still surface it as a
+      // *pending* bootstrap (null endpoints, no token) so the renderer can show
+      // a "Connecting…" indicator while it retries — but with null endpoints
+      // the renderer will not dial the dead port, avoiding the needless
+      // /api/auth/bootstrap/bearer error cycles that a real endpoint would
+      // trigger. The primary stays skipped while not ready: it is same-origin
+      // and has no "connecting" affordance to surface, so exposing it half-built
+      // would only confuse the same-origin bootstrap path.
+      if (Option.isNone(config) || Option.isSome(config.value.preflightFailure)) {
+        if (isPrimary) continue;
+        bootstraps.push({
+          id: instance.id,
+          label: yield* instance.label,
+          httpBaseUrl: null,
+          wsBaseUrl: null,
+        });
+        continue;
+      }
       const { bootstrap, httpBaseUrl } = config.value;
       bootstraps.push({
         id: instance.id,
