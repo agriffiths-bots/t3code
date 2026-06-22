@@ -12,6 +12,7 @@ import {
   ThreadId,
 } from "@t3tools/contracts";
 import * as Console from "effect/Console";
+import * as Context from "effect/Context";
 import * as Data from "effect/Data";
 import * as DateTime from "effect/DateTime";
 import * as Duration from "effect/Duration";
@@ -30,17 +31,17 @@ import * as HttpApiClient from "effect/unstable/httpapi/HttpApiClient";
 
 import * as EnvironmentAuth from "../auth/EnvironmentAuth.ts";
 
-import { ServerConfig, type ServerConfigShape } from "../config.ts";
+import { ServerConfig } from "../config.ts";
 import { OrchestrationEngineService } from "../orchestration/Services/OrchestrationEngine.ts";
 import { createEmptyReadModel, projectEvent } from "../orchestration/projector.ts";
 import { OrchestrationLayerLive } from "../orchestration/runtimeLayer.ts";
 import { layerConfig as SqlitePersistenceLayerLive } from "../persistence/Layers/Sqlite.ts";
-import { RepositoryIdentityResolverLive } from "../project/Layers/RepositoryIdentityResolver.ts";
+import { layer as RepositoryIdentityResolverLive } from "../project/RepositoryIdentityResolver.ts";
 import {
   clearPersistedServerRuntimeState,
   readPersistedServerRuntimeState,
 } from "../serverRuntimeState.ts";
-import { WorkspacePathsLive } from "../workspace/Layers/WorkspacePaths.ts";
+import { layer as WorkspacePathsLive } from "../workspace/WorkspacePaths.ts";
 import { type CliAuthLocationFlags, projectLocationFlags, resolveCliAuthConfig } from "./config.ts";
 
 type CosCliDispatchCommand = Extract<
@@ -70,7 +71,7 @@ const COS_CLI_LIVE_SERVER_TIMEOUT = Duration.seconds(1);
 const isEnvironmentHttpCommonError = Schema.is(EnvironmentHttpCommonError);
 
 const withCosCliSessionToken = <A, E, R>(
-  environmentAuth: EnvironmentAuth.EnvironmentAuthShape,
+  environmentAuth: Context.Service.Shape<typeof EnvironmentAuth.EnvironmentAuth>,
   run: (token: string) => Effect.Effect<A, E, R>,
 ) =>
   Effect.acquireUseRelease(
@@ -153,8 +154,8 @@ const getOfflineSnapshot = Effect.fn("getOfflineSnapshot")(function* () {
 });
 
 const tryResolveLiveCosExecutionMode = Effect.fn("tryResolveLiveCosExecutionMode")(function* (
-  environmentAuth: EnvironmentAuth.EnvironmentAuthShape,
-  config: ServerConfigShape,
+  environmentAuth: Context.Service.Shape<typeof EnvironmentAuth.EnvironmentAuth>,
+  config: Context.Service.Shape<typeof ServerConfig>,
 ) {
   const runtimeState = yield* readPersistedServerRuntimeState(config.serverRuntimeStatePath);
   if (Option.isNone(runtimeState)) {
