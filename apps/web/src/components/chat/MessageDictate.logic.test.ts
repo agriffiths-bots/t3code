@@ -195,4 +195,36 @@ describe("viewForMessage", () => {
     const view = viewForMessage({ status: "idle", messageId: M }, M);
     expect(view.mode).toBe("idle");
   });
+
+  it("forces idle for a stale playing reducer once another message becomes active", () => {
+    // A was playing; B started, so the singleton's active id is now OTHER. A's
+    // own reducer still reads { playing, M } but its button must render idle.
+    const stalePlaying: DictationState = { status: "playing", messageId: M };
+    const view = viewForMessage(stalePlaying, M, OTHER);
+    expect(view.mode).toBe("idle");
+    expect(view.disabled).toBe(false);
+  });
+
+  it("forces idle for a stale paused reducer once nothing is active", () => {
+    const stalePaused: DictationState = { status: "paused", messageId: M };
+    const view = viewForMessage(stalePaused, M, null);
+    expect(view.mode).toBe("idle");
+  });
+
+  it("keeps the playing view when this message is still the active one", () => {
+    const view = viewForMessage({ status: "playing", messageId: M }, M, M);
+    expect(view.mode).toBe("playing");
+  });
+
+  it("still shows the error view even when no message is active", () => {
+    // error is terminal/local: the singleton is already torn down (active id
+    // null), but the button must still surface the error to the user.
+    const view = viewForMessage(
+      { status: "error", messageId: M, errorMessage: "Voice unavailable" },
+      M,
+      null,
+    );
+    expect(view.mode).toBe("error");
+    expect(view.label).toBe("Voice unavailable");
+  });
 });

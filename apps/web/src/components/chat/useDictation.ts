@@ -275,7 +275,26 @@ export function useDictationController(messageId: string, text: string): Dictati
 
   // Re-render this button when the single active message changes so a button
   // whose message is no longer active falls back to its idle view.
-  useSyncExternalStore(subscribeActiveMessageId, getActiveMessageId, getActiveMessageId);
+  const currentActiveMessageId = useSyncExternalStore(
+    subscribeActiveMessageId,
+    getActiveMessageId,
+    getActiveMessageId,
+  );
+
+  // Reconcile a stale reducer against the singleton. When another message takes
+  // over playback, the singleton tears down our audio but cannot dispatch into
+  // this reducer, so a previously-active button can be left holding a stale
+  // loading/playing/paused state. Reset it so subsequent clicks behave as idle.
+  useEffect(() => {
+    if (
+      state.messageId === messageId &&
+      currentActiveMessageId !== messageId &&
+      state.status !== "idle" &&
+      state.status !== "error"
+    ) {
+      dispatch({ type: "RESET" });
+    }
+  }, [currentActiveMessageId, messageId, state.messageId, state.status]);
 
   useEffect(() => {
     return () => {
@@ -285,7 +304,7 @@ export function useDictationController(messageId: string, text: string): Dictati
     };
   }, [messageId]);
 
-  const view = viewForMessage(state, messageId);
+  const view = viewForMessage(state, messageId, currentActiveMessageId);
 
   const onClick = () => {
     switch (view.mode) {

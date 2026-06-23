@@ -90,8 +90,31 @@ const IDLE_VIEW: DictationView = {
   spinning: false,
 };
 
-export function viewForMessage(state: DictationState, messageId: string): DictationView {
+export function viewForMessage(
+  state: DictationState,
+  messageId: string,
+  activeMessageId: string | null = state.messageId,
+): DictationView {
   if (state.messageId !== messageId) {
+    return IDLE_VIEW;
+  }
+
+  // error is a terminal, local-only state (the singleton has already been torn
+  // down) so it must render regardless of the active-message guard below.
+  if (state.status === "error") {
+    return {
+      mode: "error",
+      label: state.errorMessage ?? "Dictation failed",
+      disabled: false,
+      spinning: false,
+    };
+  }
+
+  // Single-active-playback guard: the loading/playing/paused views depend on a
+  // live singleton. If a different message became active, the singleton tore
+  // down our audio but could not dispatch into our reducer, so our local state
+  // may be stale. Force idle when we are no longer the active message.
+  if (activeMessageId !== messageId) {
     return IDLE_VIEW;
   }
 
@@ -104,12 +127,5 @@ export function viewForMessage(state: DictationState, messageId: string): Dictat
       return { mode: "playing", label: "Pause dictation", disabled: false, spinning: false };
     case "paused":
       return { mode: "paused", label: "Resume dictation", disabled: false, spinning: false };
-    case "error":
-      return {
-        mode: "error",
-        label: state.errorMessage ?? "Dictation failed",
-        disabled: false,
-        spinning: false,
-      };
   }
 }
