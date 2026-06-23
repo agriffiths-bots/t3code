@@ -11,6 +11,7 @@ import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Path from "effect/Path";
+import * as Schema from "effect/Schema";
 import { cast } from "effect/Function";
 import {
   HttpBody,
@@ -41,8 +42,14 @@ import {
 } from "./auth/http.ts";
 import * as ServerEnvironment from "./environment/ServerEnvironment.ts";
 import { browserApiCorsAllowedHeaders, browserApiCorsAllowedMethods } from "./httpCors.ts";
+import {
+  buildElevenLabsRequest,
+  resolveVoiceId,
+  validateTtsText,
+} from "./tts/ttsRequest.logic.ts";
 
 const OTLP_TRACES_PROXY_PATH = "/api/observability/v1/traces";
+const TTS_SPEAK_PATH = "/api/tts/speak";
 const LOOPBACK_HOSTNAMES = new Set(["127.0.0.1", "::1", "localhost"]);
 const DESKTOP_RENDERER_ORIGINS = ["t3code://app", "t3code-dev://app"];
 
@@ -172,6 +179,89 @@ export const otlpTracesProxyRouteLayer = HttpRouter.add(
     }),
   ),
 );
+
+class TtsConfigMissingError extends Data.TaggedError("TtsConfigMissingError")<{}> {}
+
+class TtsTextInvalidError extends Data.TaggedError("TtsTextInvalidError")<{
+  readonly reason: "empty" | "too_long";
+}> {}
+
+class TtsUpstreamError extends Data.TaggedError("TtsUpstreamError")<{
+  readonly status: number;
+}> {}
+
+const TtsSpeakRequest = Schema.Struct({
+  text: Schema.String,
+  voiceId: Schema.optional(Schema.String),
+});
+
+const emptyTtsSpeakRequest: typeof TtsSpeakRequest.Type = { text: "" };
+
+export const ttsSpeakHandler = Effect.gen(function* () {
+  yield* authenticateRawRouteWithScope(AuthOrchestrationOperateScope);
+  const request = yield* HttpServerRequest.HttpServerRequest;
+  const httpClient = yield* HttpClient.HttpClient;
+
+  const apiKey = process.env.ELEVENLABS_API_KEY;
+  const defaultVoiceId = process.env.ELEVENLABS_VOICE_ID;
+  if (!apiKey) {
+    return yield* new TtsConfigMissingError();
+  }
+
+  const body = yield* request.json;
+  const raw = yield* Schema.decodeUnknownEffect(TtsSpeakRequest)(body).pipe(
+    Effect.orElseSucceed(() => emptyTtsSpeakRequest),
+  );
+
+  const validated = validateTtsText(raw.text);
+  if (!validated.ok) {
+    return yield* new TtsTextInvalidError({ reason: validated.reason });
+  }
+
+  const voiceId = resolveVoiceId(raw.voiceId, defaultVoiceId);
+  if (!voiceId) {
+    return yield* new TtsConfigMissingError();
+  }
+
+  const upstream = buildElevenLabsRequest({ text: validated.text, voiceId, apiKey });
+  const response = yield* httpClient
+    .post(upstream.url, {
+      headers: upstream.headers,
+      body: HttpBody.jsonUnsafe(upstream.body),
+    })
+    .pipe(
+      Effect.flatMap(HttpClientResponse.filterStatusOk),
+      Effect.catchTag(
+        "HttpClientError",
+        (cause) => new TtsUpstreamError({ status: cause.response?.status ?? 502 }),
+      ),
+    );
+
+  return HttpServerResponse.stream(response.stream, { contentType: "audio/mpeg" });
+}).pipe(
+  Effect.catchTags({
+    EnvironmentAuthInvalidError: HttpServerRespondable.toResponse,
+    EnvironmentInternalError: HttpServerRespondable.toResponse,
+    EnvironmentScopeRequiredError: HttpServerRespondable.toResponse,
+    TtsConfigMissingError: () =>
+      Effect.succeed(
+        HttpServerResponse.text("Text-to-speech is not configured.", { status: 503 }),
+      ),
+    TtsTextInvalidError: (cause) =>
+      Effect.succeed(
+        HttpServerResponse.text(
+          cause.reason === "too_long" ? "Text too long for dictation." : "No text to dictate.",
+          { status: 400 },
+        ),
+      ),
+    TtsUpstreamError: (cause) =>
+      Effect.logWarning("ElevenLabs TTS upstream failed", { status: cause.status }).pipe(
+        Effect.as(HttpServerResponse.text("Dictation upstream failed.", { status: 502 })),
+      ),
+  }),
+);
+
+export const ttsSpeakRouteLayer = HttpRouter.add("POST", TTS_SPEAK_PATH, ttsSpeakHandler);
 
 export const assetRouteLayer = HttpRouter.add(
   "GET",

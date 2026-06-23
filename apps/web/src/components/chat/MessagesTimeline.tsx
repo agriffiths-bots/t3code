@@ -64,6 +64,9 @@ import { ProposedPlanCard } from "./ProposedPlanCard";
 import { ChangedFilesTree } from "./ChangedFilesTree";
 import { DiffStatLabel, hasNonZeroStat } from "./DiffStatLabel";
 import { MessageCopyButton } from "./MessageCopyButton";
+import { MessageDictateButton } from "./MessageDictateButton";
+import { resolveAssistantMessageDictateState } from "./MessageDictate.logic";
+import { resetDictation } from "./useDictation";
 import {
   computeStableMessagesTimelineRows,
   deriveMessagesTimelineRows,
@@ -206,6 +209,10 @@ export const MessagesTimeline = memo(function MessagesTimeline({
 }: MessagesTimelineProps) {
   const [expandedTurnIds, setExpandedTurnIds] = useState<ReadonlySet<TurnId>>(new Set());
   const [expandedWorkGroupIds, setExpandedWorkGroupIds] = useState<ReadonlySet<string>>(new Set());
+
+  // Tear down any in-flight dictation playback when the timeline unmounts so
+  // audio does not keep playing and the object URL is not leaked.
+  useEffect(() => resetDictation, []);
 
   const onToggleTurnFold = useCallback((turnId: TurnId) => {
     setExpandedTurnIds((existing) => {
@@ -647,6 +654,7 @@ function AssistantTimelineRow({ row }: { row: Extract<TimelineRow, { kind: "mess
         {row.showAssistantMeta ? (
           <div className="mt-1.5 flex items-center gap-2 text-xs tabular-nums opacity-0 transition-opacity duration-200 focus-within:opacity-100 group-hover/assistant:opacity-100">
             <AssistantCopyButton row={row} />
+            <AssistantDictateButton row={row} />
             {!row.message.streaming && (
               <Tooltip>
                 <TooltipTrigger
@@ -678,6 +686,26 @@ function AssistantCopyButton({ row }: { row: Extract<TimelineRow, { kind: "messa
   }
 
   return <MessageCopyButton text={assistantCopyState.text ?? ""} variant="ghost" />;
+}
+
+function AssistantDictateButton({ row }: { row: Extract<TimelineRow, { kind: "message" }> }) {
+  const dictateState = resolveAssistantMessageDictateState({
+    text: row.message.text ?? null,
+    showButton: row.showAssistantCopyButton,
+    streaming: row.assistantCopyStreaming,
+  });
+
+  if (!dictateState.visible) {
+    return null;
+  }
+
+  return (
+    <MessageDictateButton
+      messageId={row.message.id}
+      text={dictateState.text ?? ""}
+      variant="ghost"
+    />
+  );
 }
 
 function ProposedPlanTimelineRow({
