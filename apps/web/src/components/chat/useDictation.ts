@@ -161,8 +161,15 @@ async function pumpStream(input: {
     if (!started) {
       started = true;
       dispatch({ type: "STREAM_READY", messageId });
-      void audio.play().catch(() => {
-        /* autoplay rejection surfaces via the audio error handler */
+      // A rejected play() (autoplay policy, or playback interrupted) is NOT
+      // delivered as an HTMLMediaElement "error" event, so the error listener
+      // never fires for it. Handle it here: drop to the paused view so the
+      // button shows a Resume affordance instead of falsely claiming to play.
+      // The read loop keeps pumping bytes regardless, so resuming is instant.
+      void audio.play().then(undefined, () => {
+        if (active?.messageId === messageId) {
+          dispatch({ type: "PAUSE", messageId });
+        }
       });
     }
   }

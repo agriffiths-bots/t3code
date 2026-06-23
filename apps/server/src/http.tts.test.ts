@@ -1,4 +1,5 @@
 import { AuthOrchestrationOperateScope } from "@t3tools/contracts";
+import { afterEach, beforeEach, describe, expect, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Logger from "effect/Logger";
@@ -8,7 +9,6 @@ import {
   HttpServerRequest,
   HttpServerResponse,
 } from "effect/unstable/http";
-import { afterEach, beforeEach, describe, expect, it } from "vite-plus/test";
 
 import * as EnvironmentAuth from "./auth/EnvironmentAuth.ts";
 import { ttsSpeakHandler } from "./http.ts";
@@ -46,29 +46,18 @@ const mockHttpClientLayer = (respond: () => Response) =>
     HttpClient.make((request) => Effect.succeed(HttpClientResponse.fromWeb(request, respond()))),
   );
 
-interface RunResult {
-  readonly status: number;
-  readonly contentType: string | null;
-  readonly bodyText: string;
-  readonly bodyBytes: Uint8Array;
-  readonly logText: string;
-}
+function runHandler(input: { readonly body: unknown; readonly respond?: () => Response }) {
+  return Effect.gen(function* () {
+    const logs: string[] = [];
+    const captureLogger = Logger.make((options) => {
+      logs.push(JSON.stringify({ message: options.message }));
+    });
 
-async function runHandler(input: {
-  readonly body: unknown;
-  readonly respond?: () => Response;
-}): Promise<RunResult> {
-  const logs: string[] = [];
-  const captureLogger = Logger.make((options) => {
-    logs.push(JSON.stringify({ message: options.message }));
-  });
+    const httpClientLayer = mockHttpClientLayer(
+      input.respond ?? (() => new Response(new Uint8Array(), { status: 200 })),
+    );
 
-  const httpClientLayer = mockHttpClientLayer(
-    input.respond ?? (() => new Response(new Uint8Array(), { status: 200 })),
-  );
-
-  const response = await Effect.runPromise(
-    ttsSpeakHandler.pipe(
+    const response = yield* ttsSpeakHandler.pipe(
       Effect.provide(
         Layer.mergeAll(
           authLayer,
@@ -77,19 +66,19 @@ async function runHandler(input: {
           Logger.layer([captureLogger]),
         ),
       ),
-    ),
-  );
+    );
 
-  const web = HttpServerResponse.toWeb(response);
-  const bodyBytes = new Uint8Array(await web.arrayBuffer());
-  const bodyText = new TextDecoder().decode(bodyBytes);
-  return {
-    status: web.status,
-    contentType: web.headers.get("content-type"),
-    bodyText,
-    bodyBytes,
-    logText: logs.join("\n"),
-  };
+    const web = HttpServerResponse.toWeb(response);
+    const bodyBytes = new Uint8Array(yield* Effect.promise(() => web.arrayBuffer()));
+    const bodyText = new TextDecoder().decode(bodyBytes);
+    return {
+      status: web.status,
+      contentType: web.headers.get("content-type"),
+      bodyText,
+      bodyBytes,
+      logText: logs.join("\n"),
+    };
+  });
 }
 
 describe("ttsSpeakHandler", () => {
@@ -103,44 +92,52 @@ describe("ttsSpeakHandler", () => {
     delete process.env.ELEVENLABS_VOICE_ID;
   });
 
-  it("streams a 200 audio/mpeg response through unchanged", async () => {
-    const audioBytes = new Uint8Array([1, 2, 3, 4, 5]);
-    const result = await runHandler({
-      body: { text: "hello world" },
-      respond: () =>
-        new Response(audioBytes, {
-          status: 200,
-          headers: { "content-type": "audio/mpeg" },
-        }),
-    });
+  it.effect("streams a 200 audio/mpeg response through unchanged", () =>
+    Effect.gen(function* () {
+      const audioBytes = new Uint8Array([1, 2, 3, 4, 5]);
+      const result = yield* runHandler({
+        body: { text: "hello world" },
+        respond: () =>
+          new Response(audioBytes, {
+            status: 200,
+            headers: { "content-type": "audio/mpeg" },
+          }),
+      });
 
-    expect(result.status).toBe(200);
-    expect(result.contentType).toContain("audio/mpeg");
-    expect(Array.from(result.bodyBytes)).toEqual([1, 2, 3, 4, 5]);
-  });
+      expect(result.status).toBe(200);
+      expect(result.contentType).toContain("audio/mpeg");
+      expect(Array.from(result.bodyBytes)).toEqual([1, 2, 3, 4, 5]);
+    }),
+  );
 
-  it("maps an upstream 401 to a 502 without leaking the api key", async () => {
-    const result = await runHandler({
-      body: { text: "hello world" },
-      respond: () => new Response("unauthorized", { status: 401 }),
-    });
+  it.effect("maps an upstream 401 to a 502 without leaking the api key", () =>
+    Effect.gen(function* () {
+      const result = yield* runHandler({
+        body: { text: "hello world" },
+        respond: () => new Response("unauthorized", { status: 401 }),
+      });
 
-    expect(result.status).toBe(502);
-    expect(result.bodyText).not.toContain(SECRET_KEY);
-    expect(result.logText).not.toContain(SECRET_KEY);
-  });
+      expect(result.status).toBe(502);
+      expect(result.bodyText).not.toContain(SECRET_KEY);
+      expect(result.logText).not.toContain(SECRET_KEY);
+    }),
+  );
 
-  it("returns 503 when the api key is unset", async () => {
-    delete process.env.ELEVENLABS_API_KEY;
-    const result = await runHandler({ body: { text: "hello world" } });
+  it.effect("returns 503 when the api key is unset", () =>
+    Effect.gen(function* () {
+      delete process.env.ELEVENLABS_API_KEY;
+      const result = yield* runHandler({ body: { text: "hello world" } });
 
-    expect(result.status).toBe(503);
-    expect(result.bodyText).not.toContain(SECRET_KEY);
-  });
+      expect(result.status).toBe(503);
+      expect(result.bodyText).not.toContain(SECRET_KEY);
+    }),
+  );
 
-  it("returns 400 when the text is empty", async () => {
-    const result = await runHandler({ body: { text: "   " } });
+  it.effect("returns 400 when the text is empty", () =>
+    Effect.gen(function* () {
+      const result = yield* runHandler({ body: { text: "   " } });
 
-    expect(result.status).toBe(400);
-  });
+      expect(result.status).toBe(400);
+    }),
+  );
 });
