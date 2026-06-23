@@ -10,10 +10,7 @@ import * as Schema from "effect/Schema";
 import { Command, Flag } from "effect/unstable/cli";
 import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process";
 
-import {
-  DEVELOPMENT_ICON_OVERRIDES,
-  PUBLISH_ICON_OVERRIDES,
-} from "../../../scripts/lib/brand-assets.ts";
+import { PUBLISH_ICON_OVERRIDES } from "../../../scripts/lib/brand-assets.ts";
 import { resolveCatalogDependencies } from "../../../scripts/lib/resolve-catalog.ts";
 import { fromJsonStringPretty } from "@t3tools/shared/schemaJson";
 import { fromYaml } from "@t3tools/shared/schemaYaml";
@@ -127,14 +124,20 @@ const restorePublishIconOverrides = Effect.fn("restorePublishIconOverrides")(fun
   }
 });
 
-const applyDevelopmentIconOverrides = Effect.fn("applyDevelopmentIconOverrides")(function* (
+// LOCAL-PATCHES DIVERGENCE: upstream applies the DEVELOPMENT (blueprint) icon set to a
+// local `build`, which is right for upstream dev work but wrong for our self-hosted
+// deployment — we run this build in production and want the real prod t3 logo for the
+// browser favicon and the installed (apple-touch / "Add to Home Screen") icon. So the
+// local build here applies PUBLISH_ICON_OVERRIDES (assets/prod/t3-black-web-*) instead.
+// The npm `publish` path is unchanged.
+const applyLocalBuildIconOverrides = Effect.fn("applyLocalBuildIconOverrides")(function* (
   repoRoot: string,
   serverDir: string,
 ) {
   const path = yield* Path.Path;
   const fs = yield* FileSystem.FileSystem;
 
-  for (const override of DEVELOPMENT_ICON_OVERRIDES) {
+  for (const override of PUBLISH_ICON_OVERRIDES) {
     const sourcePath = path.join(repoRoot, override.sourceRelativePath);
     const targetPath = path.join(serverDir, override.targetRelativePath);
 
@@ -148,7 +151,7 @@ const applyDevelopmentIconOverrides = Effect.fn("applyDevelopmentIconOverrides")
     yield* fs.copyFile(sourcePath, targetPath);
   }
 
-  yield* Effect.log("[cli] Applied development icon overrides to dist/client");
+  yield* Effect.log("[cli] Applied production t3 icon overrides to dist/client (local build)");
 });
 
 // ---------------------------------------------------------------------------
@@ -182,7 +185,7 @@ const buildCmd = Command.make(
 
       if (yield* fs.exists(webDist)) {
         yield* fs.copy(webDist, clientTarget);
-        yield* applyDevelopmentIconOverrides(repoRoot, serverDir);
+        yield* applyLocalBuildIconOverrides(repoRoot, serverDir);
         yield* Effect.log("[cli] Bundled web app into dist/client");
       } else {
         yield* Effect.logWarning("[cli] Web dist not found — skipping client bundle.");
