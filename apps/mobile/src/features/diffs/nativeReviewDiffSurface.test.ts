@@ -33,11 +33,14 @@ describe("resolveNativeReviewDiffView", () => {
     expect(expoMocks.requireNativeView).not.toHaveBeenCalled();
   });
 
-  it("returns the native review diff view when the view config is installed", async () => {
+  it("returns the payload bridge when the native review diff view is installed", async () => {
     setExpoViewConfigAvailable();
     expoMocks.requireNativeView.mockReturnValue(nativeView);
     const { resolveNativeReviewDiffView } = await import("./nativeReviewDiffSurface");
-    expect(resolveNativeReviewDiffView()).toBe(nativeView);
+    const resolvedView = resolveNativeReviewDiffView();
+    expect(resolvedView).not.toBeNull();
+    expect(resolvedView).not.toBe(nativeView);
+    expect(resolveNativeReviewDiffView()).toBe(resolvedView);
     expect(expoMocks.requireNativeView).toHaveBeenCalledWith("T3ReviewDiffSurface");
   });
 

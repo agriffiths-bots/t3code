@@ -75,6 +75,7 @@ export interface ThreadComposerProps {
   readonly draftMessage: string;
   readonly draftAttachments: ReadonlyArray<DraftComposerImageAttachment>;
   readonly placeholder: string;
+  readonly contentMaxWidth?: number;
   readonly bottomInset?: number;
   readonly connectionState: RemoteClientConnectionState;
   readonly connectionError: string | null;
@@ -630,7 +631,10 @@ export const ThreadComposer = memo(function ThreadComposer(props: ThreadComposer
           : "linear-gradient(to bottom, rgba(255,255,255,0) 0%, rgba(255,255,255,0.85) 40%, rgba(255,255,255,0.95) 100%)",
       }}
     >
-      <View className="w-full" style={{ position: "relative" }}>
+      <View
+        className="w-full"
+        style={{ alignSelf: "center", maxWidth: props.contentMaxWidth, position: "relative" }}
+      >
         {composerTrigger && composerMenuItems.length > 0 ? (
           <View
             style={{

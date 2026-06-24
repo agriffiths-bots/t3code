@@ -1,8 +1,16 @@
 import Stack from "expo-router/stack";
 import { SymbolView } from "expo-symbols";
 import { useLocalSearchParams, useRouter } from "expo-router";
+import { useHeaderHeight } from "expo-router/build/react-navigation/elements";
 import { useCallback, useMemo, useRef, useState } from "react";
-import { ActivityIndicator, Pressable, ScrollView, Text as RNText, View } from "react-native";
+import {
+  ActivityIndicator,
+  Pressable,
+  ScrollView,
+  Text as RNText,
+  useColorScheme,
+  View,
+} from "react-native";
 import Svg, { Defs, LinearGradient, Rect, Stop } from "react-native-svg";
 import {
   EnvironmentId,
@@ -16,18 +24,28 @@ import { CopyTextButton } from "../../components/CopyTextButton";
 import { EmptyState } from "../../components/EmptyState";
 import { LoadingScreen } from "../../components/LoadingScreen";
 import { cn } from "../../lib/cn";
+import { resolveFileSelectionNavigationAction } from "../../lib/adaptive-navigation";
 import { tryOpenExternalUrl } from "../../lib/openExternalUrl";
-import { buildThreadFilesNavigation } from "../../lib/routes";
+import { buildThreadFilesNavigation, buildThreadRoutePath } from "../../lib/routes";
 import { MOBILE_TYPOGRAPHY } from "../../lib/typography";
 import { useThemeColor } from "../../lib/useThemeColor";
 import { useThreadSelection } from "../../state/use-thread-selection";
 import { useSelectedThreadWorktree } from "../../state/use-selected-thread-worktree";
 import { useEnvironmentQuery } from "../../state/query";
 import { projectEnvironment } from "../../state/projects";
+import { AdaptiveInspectorLayout } from "../layout/adaptive-inspector-layout";
+import {
+  useAdaptiveWorkspaceLayout,
+  useAdaptiveWorkspacePaneRole,
+} from "../layout/AdaptiveWorkspaceLayout";
+import { WorkspaceSidebarToolbar } from "../layout/workspace-sidebar-toolbar";
 import { ReviewHighlighterProvider } from "../review/ReviewHighlighterProvider";
+import { ThreadRouteScreen } from "../threads/ThreadRouteScreen";
 import { FileMarkdownPreview } from "./FileMarkdownPreview";
 import { FileTreeBrowser } from "./FileTreeBrowser";
+import { preloadWorkspaceFileContents } from "./preload-workspace-file";
 import { SourceFileSurface } from "./SourceFileSurface";
+import { ThreadFileNavigatorPane } from "./thread-file-navigator-pane";
 import { WorkspaceFileImagePreview } from "./WorkspaceFileImagePreview";
 import { WorkspaceFileWebPreview } from "./WorkspaceFileWebPreview";
 import {
@@ -443,11 +461,16 @@ function FilesToolbarBottomFade() {
 }
 
 export function ThreadFilesTreeScreen() {
+  useAdaptiveWorkspacePaneRole("inspector");
   const router = useRouter();
+  const headerHeight = useHeaderHeight();
+  const { fileInspector, layout, panes, togglePrimarySidebar } = useAdaptiveWorkspaceLayout();
   const [searchQuery, setSearchQuery] = useState("");
+  const colorScheme = useColorScheme();
+  const highlightTheme = colorScheme === "dark" ? "dark" : "light";
   const { cwd, environmentId, projectName, selectedThread, threadId } = useThreadFilesWorkspace();
   const entriesQuery = useEnvironmentQuery(
-    environmentId !== null && cwd !== null
+    environmentId !== null && cwd !== null && !fileInspector.supported
       ? projectEnvironment.listEntries({
           environmentId,
           input: { cwd },
@@ -455,15 +478,64 @@ export function ThreadFilesTreeScreen() {
       : null,
   );
   const entriesData = entriesQuery.data as ProjectListEntriesResult | null;
+  const handleReturnToThread = useCallback(() => {
+    if (router.canGoBack()) {
+      router.back();
+      return;
+    }
+    if (environmentId !== null && threadId !== null) {
+      router.replace(buildThreadRoutePath({ environmentId, threadId }));
+    }
+  }, [environmentId, router, threadId]);
 
   const handleSelectFile = useCallback(
     (path: string) => {
       if (environmentId === null || threadId === null) {
         return;
       }
-      router.push(buildThreadFilesNavigation({ environmentId, threadId }, path));
+      const destination = buildThreadFilesNavigation({ environmentId, threadId }, path);
+      const navigationAction = resolveFileSelectionNavigationAction({
+        hasPersistentFileInspector: fileInspector.supported,
+      });
+      if (navigationAction === "replace") {
+        router.replace(destination);
+        return;
+      }
+      router.push(destination);
     },
-    [environmentId, router, threadId],
+    [environmentId, fileInspector.supported, router, threadId],
+  );
+  const renderInspector = useCallback(
+    () =>
+      environmentId !== null && cwd !== null ? (
+        <ThreadFileNavigatorPane
+          cwd={cwd}
+          environmentId={environmentId}
+          headerInset={headerHeight}
+          projectName={projectName}
+          selectedPath={null}
+          onSelectFile={handleSelectFile}
+        />
+      ) : null,
+    [cwd, environmentId, handleSelectFile, headerHeight, projectName],
+  );
+  const handlePreviewFile = useCallback(
+    (relativePath: string) => {
+      if (environmentId === null || cwd === null) {
+        return;
+      }
+      preloadWorkspaceFileContents({
+        cwd,
+        environmentId,
+        relativePath,
+        theme: highlightTheme,
+      });
+    },
+    [cwd, environmentId, highlightTheme],
+  );
+  const renderHeaderTitle = useCallback(
+    () => <FilesHeaderTitle projectName={projectName} />,
+    [projectName],
   );
 
   if (selectedThread === null || environmentId === null || threadId === null) {
@@ -472,6 +544,15 @@ export function ThreadFilesTreeScreen() {
 
   if (cwd === null) {
     return <FilesUnavailable />;
+  }
+
+  if (fileInspector.supported) {
+    return (
+      <ThreadRouteScreen
+        onReturnToThread={handleReturnToThread}
+        renderInspector={renderInspector}
+      />
+    );
   }
 
   return (
@@ -483,7 +564,7 @@ export function ThreadFilesTreeScreen() {
           headerTransparent: true,
           headerStyle: { backgroundColor: "transparent" },
           headerShadowVisible: false,
-          headerTitle: () => <FilesHeaderTitle projectName={projectName} />,
+          headerTitle: renderHeaderTitle,
           headerSearchBarOptions: {
             allowToolbarIntegration: true,
             autoCapitalize: "none",
@@ -499,6 +580,18 @@ export function ThreadFilesTreeScreen() {
         }}
       />
       <Stack.Toolbar placement="right">
+        {layout.usesSplitView ? (
+          <Stack.Toolbar.Button
+            accessibilityLabel={
+              panes.primarySidebarVisible ? "Maximize files" : "Show thread sidebar"
+            }
+            icon={
+              panes.primarySidebarVisible ? "arrow.up.left.and.arrow.down.right" : "sidebar.left"
+            }
+            onPress={togglePrimarySidebar}
+            separateBackground
+          />
+        ) : null}
         <Stack.Toolbar.Button
           accessibilityLabel="Refresh files"
           icon="arrow.clockwise"
@@ -514,6 +607,7 @@ export function ThreadFilesTreeScreen() {
         isPending={entriesQuery.isPending}
         searchQuery={searchQuery}
         selectedPath={null}
+        onPreviewFile={handlePreviewFile}
         onRefresh={entriesQuery.refresh}
         onSelectFile={handleSelectFile}
       />
@@ -523,6 +617,9 @@ export function ThreadFilesTreeScreen() {
 }
 
 export function ThreadFileScreen() {
+  useAdaptiveWorkspacePaneRole("inspector");
+  const router = useRouter();
+  const { fileInspector, panes, toggleAuxiliaryPane } = useAdaptiveWorkspaceLayout();
   const params = useLocalSearchParams<{
     line?: string | string[];
     path?: string | string[];
@@ -568,6 +665,33 @@ export function ThreadFileScreen() {
   );
   const fileData = fileQuery.data as ProjectReadFileResult | null;
 
+  const handleSelectFile = useCallback(
+    (path: string) => {
+      // We are already on the catch-all file route. Updating its params keeps
+      // the current native screen mounted while replacing the selected file in
+      // place, avoiding an RNSScreen snapshot/unmount for every tree click.
+      router.setParams({
+        line: undefined,
+        path: path.split("/").filter(Boolean),
+      });
+    },
+    [router],
+  );
+  const renderInspector = useCallback(
+    () =>
+      fileInspector.supported && environmentId !== null && cwd !== null ? (
+        <ThreadFileNavigatorPane
+          cwd={cwd}
+          environmentId={environmentId}
+          headerInset={0}
+          projectName={projectName}
+          selectedPath={relativePath}
+          onSelectFile={handleSelectFile}
+        />
+      ) : undefined,
+    [cwd, environmentId, fileInspector.supported, handleSelectFile, projectName, relativePath],
+  );
+
   if (selectedThread === null || environmentId === null || threadId === null) {
     return <LoadingScreen message="Opening file..." messagePlacement="above-spinner" />;
   }
@@ -588,9 +712,37 @@ export function ThreadFileScreen() {
   return (
     <ReviewHighlighterProvider>
       <View className="flex-1 bg-sheet">
-        <Stack.Screen options={{ title: basename(relativePath) }} />
+        <Stack.Screen
+          options={{ headerTitle: basename(relativePath), title: basename(relativePath) }}
+        />
+        <WorkspaceSidebarToolbar>
+          {fileInspector.supported ? (
+            <Stack.Toolbar.Button
+              accessibilityLabel="Return to chat"
+              icon="chevron.left"
+              onPress={() => {
+                if (router.canGoBack()) {
+                  router.back();
+                  return;
+                }
+                router.replace(buildThreadRoutePath({ environmentId, threadId }));
+              }}
+            />
+          ) : null}
+        </WorkspaceSidebarToolbar>
         <Stack.Toolbar placement="right">
+          {fileInspector.supported ? (
+            <Stack.Toolbar.Button
+              accessibilityLabel={
+                panes.auxiliaryPaneVisible ? "Hide file navigator" : "Show file navigator"
+              }
+              icon="sidebar.right"
+              onPress={toggleAuxiliaryPane}
+              separateBackground
+            />
+          ) : null}
           <Stack.Toolbar.Button
+            accessibilityLabel="Refresh file"
             icon="arrow.clockwise"
             onPress={() => {
               if (resolvedActiveMode === "preview" && (isBrowserFile || isImageFile)) {
@@ -601,25 +753,29 @@ export function ThreadFileScreen() {
             }}
           />
         </Stack.Toolbar>
-        <FilePreviewHeader
-          activeMode={resolvedActiveMode}
-          showModeSelector={canPreview && !isImageFile}
-          externalPreviewUri={isBrowserFile ? assetPreviewUri : undefined}
-          projectName={projectName}
-          relativePath={relativePath}
-          onSetMode={(mode) => {
-            setModeOverride({ path: relativePath, mode });
-          }}
-        />
-        <FileContent
-          activeMode={resolvedActiveMode}
-          previewUri={previewUri}
-          fileContents={fileData?.contents ?? null}
-          fileError={fileQuery.error}
-          initialLine={targetLine}
-          relativePath={relativePath}
-          truncated={fileData?.truncated ?? false}
-        />
+        <AdaptiveInspectorLayout
+          renderInspector={fileInspector.supported ? renderInspector : undefined}
+        >
+          <FilePreviewHeader
+            activeMode={resolvedActiveMode}
+            showModeSelector={canPreview && !isImageFile}
+            externalPreviewUri={isBrowserFile ? assetPreviewUri : undefined}
+            projectName={projectName}
+            relativePath={relativePath}
+            onSetMode={(mode) => {
+              setModeOverride({ path: relativePath, mode });
+            }}
+          />
+          <FileContent
+            activeMode={resolvedActiveMode}
+            previewUri={previewUri}
+            fileContents={fileData?.contents ?? null}
+            fileError={fileQuery.error}
+            initialLine={targetLine}
+            relativePath={relativePath}
+            truncated={fileData?.truncated ?? false}
+          />
+        </AdaptiveInspectorLayout>
       </View>
     </ReviewHighlighterProvider>
   );

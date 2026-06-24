@@ -55,7 +55,7 @@ import {
 } from "../review/nativeReviewDiffAdapter";
 import { buildReviewParsedDiff } from "../review/reviewModel";
 import { cn } from "../../lib/cn";
-import type { LayoutVariant } from "../../lib/layout";
+import { deriveCenteredContentHorizontalPadding, type LayoutVariant } from "../../lib/layout";
 import { buildThreadFilesNavigation } from "../../lib/routes";
 import { MOBILE_CODE_SURFACE, MOBILE_TYPOGRAPHY } from "../../lib/typography";
 import { markdownFileIconSource } from "@t3tools/mobile-markdown-text/file-icons";
@@ -96,6 +96,7 @@ export interface ThreadFeedProps {
   readonly latestTurn: ThreadFeedLatestTurn | null;
   readonly contentTopInset?: number;
   readonly contentBottomInset?: number;
+  readonly contentMaxWidth?: number;
   readonly layoutVariant?: LayoutVariant;
   readonly composerExpanded?: boolean;
   readonly skills?: ReadonlyArray<SelectableMarkdownSkill>;
@@ -1126,6 +1127,8 @@ export const ThreadFeed = memo(function ThreadFeed(props: ThreadFeedProps) {
   const listRef = useRef<LegendListRef>(null);
   const copyFeedbackTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const scrollFrameRef = useRef<number | null>(null);
+  const revealFrameRef = useRef<number | null>(null);
+  const revealSettleFrameRef = useRef<number | null>(null);
   const foldSettleFrameRef = useRef<number | null>(null);
   const foldSettleSecondFrameRef = useRef<number | null>(null);
   const suppressAutoFollowRef = useRef(false);
@@ -1151,8 +1154,14 @@ export const ThreadFeed = memo(function ThreadFeed(props: ThreadFeedProps) {
     uri: string;
     headers?: Record<string, string>;
   } | null>(null);
+  const [revealedThreadId, setRevealedThreadId] = useState<ThreadId | null>(null);
   const horizontalPadding = props.layoutVariant === "split" ? 20 : 16;
-  const contentWidth = Math.max(0, viewportWidth - horizontalPadding * 2);
+  const contentHorizontalPadding = deriveCenteredContentHorizontalPadding({
+    viewportWidth,
+    maxContentWidth: props.contentMaxWidth ?? null,
+    minimumPadding: horizontalPadding,
+  });
+  const contentWidth = Math.max(0, viewportWidth - contentHorizontalPadding * 2);
   const userBubbleMaxWidth = contentWidth * 0.85;
   const reviewCommentBubbleWidth = Math.min(Math.max(280, contentWidth * 0.85), contentWidth);
   const insets = useSafeAreaInsets();
@@ -1282,7 +1291,41 @@ export const ThreadFeed = memo(function ThreadFeed(props: ThreadFeedProps) {
 
   const onListLoad = useCallback(() => {
     initialScrollReadyRef.current = true;
-  }, []);
+    listRef.current?.scrollToEnd({ animated: false });
+
+    // Bottom-aligned initialScrollIndex uses LegendList's multi-frame
+    // convergence loop. Very tall Markdown rows can exhaust that loop and
+    // visibly correct their position for eight frames. Mount offscreen, make
+    // one measured jump, then reveal after the following layout has settled.
+    if (revealFrameRef.current !== null) {
+      cancelAnimationFrame(revealFrameRef.current);
+    }
+    if (revealSettleFrameRef.current !== null) {
+      cancelAnimationFrame(revealSettleFrameRef.current);
+    }
+    revealFrameRef.current = requestAnimationFrame(() => {
+      listRef.current?.scrollToEnd({ animated: false });
+      revealFrameRef.current = null;
+      revealSettleFrameRef.current = requestAnimationFrame(() => {
+        revealSettleFrameRef.current = null;
+        setRevealedThreadId(props.threadId);
+      });
+    });
+  }, [props.threadId]);
+
+  useEffect(() => {
+    if (revealFrameRef.current !== null) {
+      cancelAnimationFrame(revealFrameRef.current);
+      revealFrameRef.current = null;
+    }
+    if (revealSettleFrameRef.current !== null) {
+      cancelAnimationFrame(revealSettleFrameRef.current);
+      revealSettleFrameRef.current = null;
+    }
+    initialScrollReadyRef.current = false;
+    isNearEndRef.current = true;
+    lastContentHeightRef.current = 0;
+  }, [props.threadId]);
 
   useEffect(() => {
     const previous = previousLatestTurnRef.current;
@@ -1317,6 +1360,12 @@ export const ThreadFeed = memo(function ThreadFeed(props: ThreadFeedProps) {
       }
       if (scrollFrameRef.current !== null) {
         cancelAnimationFrame(scrollFrameRef.current);
+      }
+      if (revealFrameRef.current !== null) {
+        cancelAnimationFrame(revealFrameRef.current);
+      }
+      if (revealSettleFrameRef.current !== null) {
+        cancelAnimationFrame(revealSettleFrameRef.current);
       }
       if (foldSettleFrameRef.current !== null) {
         cancelAnimationFrame(foldSettleFrameRef.current);
@@ -1483,7 +1532,7 @@ export const ThreadFeed = memo(function ThreadFeed(props: ThreadFeedProps) {
         <KeyboardAvoidingLegendList
           ref={listRef}
           key={props.threadId}
-          style={{ flex: 1 }}
+          style={{ flex: 1, opacity: revealedThreadId === props.threadId ? 1 : 0 }}
           automaticallyAdjustsScrollIndicatorInsets={false}
           contentInset={{ top: 0, bottom: 0 }}
           scrollIndicatorInsets={{ top: topContentInset, bottom: 0 }}
@@ -1506,7 +1555,6 @@ export const ThreadFeed = memo(function ThreadFeed(props: ThreadFeedProps) {
           keyboardShouldPersistTaps="always"
           keyboardDismissMode="none"
           estimatedItemSize={180}
-          initialScrollAtEnd
           onContentSizeChange={onListContentSizeChange}
           onLoad={onListLoad}
           onScroll={onListScroll}
@@ -1515,7 +1563,7 @@ export const ThreadFeed = memo(function ThreadFeed(props: ThreadFeedProps) {
           contentContainerStyle={{
             paddingTop: 12,
             paddingBottom: bottomContentInset,
-            paddingHorizontal: horizontalPadding,
+            paddingHorizontal: contentHorizontalPadding,
           }}
         />
       </View>

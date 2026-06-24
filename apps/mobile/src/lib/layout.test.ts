@@ -1,6 +1,46 @@
 import { describe, expect, it } from "vite-plus/test";
 
-import { deriveLayout, SPLIT_LAYOUT_MIN_HEIGHT, SPLIT_LAYOUT_MIN_WIDTH } from "./layout";
+import {
+  deriveCenteredContentHorizontalPadding,
+  deriveFileInspectorPaneLayout,
+  deriveLayout,
+  deriveStableFormSheetDetent,
+  deriveWorkspacePaneLayout,
+  SPLIT_LAYOUT_MIN_HEIGHT,
+  SPLIT_LAYOUT_MIN_WIDTH,
+} from "./layout";
+
+describe("deriveCenteredContentHorizontalPadding", () => {
+  it("keeps the minimum padding while the viewport fits the reading width", () => {
+    expect(
+      deriveCenteredContentHorizontalPadding({
+        viewportWidth: 744,
+        maxContentWidth: 960,
+        minimumPadding: 20,
+      }),
+    ).toBe(20);
+  });
+
+  it("centers only the content inside a wider full-width scroll host", () => {
+    expect(
+      deriveCenteredContentHorizontalPadding({
+        viewportWidth: 1_032,
+        maxContentWidth: 960,
+        minimumPadding: 20,
+      }),
+    ).toBe(56);
+  });
+
+  it("supports unconstrained compact content", () => {
+    expect(
+      deriveCenteredContentHorizontalPadding({
+        viewportWidth: 430,
+        maxContentWidth: null,
+        minimumPadding: 16,
+      }),
+    ).toBe(16);
+  });
+});
 
 describe("deriveLayout", () => {
   it.each([
@@ -47,5 +87,190 @@ describe("deriveLayout", () => {
     expect(deriveLayout({ width: 720, height: 1_000 }).listPaneWidth).toBe(280);
     expect(deriveLayout({ width: 1_024, height: 768 }).listPaneWidth).toBe(328);
     expect(deriveLayout({ width: 1_600, height: 1_000 }).listPaneWidth).toBe(380);
+  });
+});
+
+describe("deriveWorkspacePaneLayout", () => {
+  it("keeps the auxiliary pane out of a standard iPad detail column", () => {
+    const layout = deriveLayout({ width: 1_194, height: 834 });
+
+    expect(
+      deriveWorkspacePaneLayout({
+        layout,
+        viewportWidth: 1_194,
+        primarySidebarPreferredVisible: true,
+        auxiliaryPanePreferredVisible: true,
+      }),
+    ).toEqual({
+      primarySidebarVisible: true,
+      primarySidebarSuppressedByAuxiliary: false,
+      contentPaneWidth: 814,
+      supportsAuxiliaryPane: false,
+      auxiliaryPaneVisible: false,
+      auxiliaryPaneWidth: null,
+    });
+  });
+
+  it("offers an auxiliary pane when maximizing a standard iPad landscape window", () => {
+    const layout = deriveLayout({ width: 1_194, height: 834 });
+
+    expect(
+      deriveWorkspacePaneLayout({
+        layout,
+        viewportWidth: 1_194,
+        primarySidebarPreferredVisible: false,
+        auxiliaryPanePreferredVisible: true,
+      }),
+    ).toEqual({
+      primarySidebarVisible: false,
+      primarySidebarSuppressedByAuxiliary: false,
+      contentPaneWidth: 1_194,
+      supportsAuxiliaryPane: true,
+      auxiliaryPaneVisible: true,
+      auxiliaryPaneWidth: 320,
+    });
+  });
+
+  it("prioritizes a trailing file inspector over the thread sidebar at medium widths", () => {
+    const layout = deriveLayout({ width: 1_024, height: 1_366 });
+
+    expect(
+      deriveWorkspacePaneLayout({
+        layout,
+        viewportWidth: 1_024,
+        primarySidebarPreferredVisible: true,
+        auxiliaryPanePreferredVisible: true,
+        auxiliaryPaneRole: "inspector",
+      }),
+    ).toEqual({
+      primarySidebarVisible: false,
+      primarySidebarSuppressedByAuxiliary: true,
+      contentPaneWidth: 1_024,
+      supportsAuxiliaryPane: true,
+      auxiliaryPaneVisible: true,
+      auxiliaryPaneWidth: 287,
+    });
+  });
+
+  it("keeps threads, content, and the file inspector visible in a large landscape window", () => {
+    const layout = deriveLayout({ width: 1_366, height: 1_024 });
+
+    expect(
+      deriveWorkspacePaneLayout({
+        layout,
+        viewportWidth: 1_366,
+        primarySidebarPreferredVisible: true,
+        auxiliaryPanePreferredVisible: true,
+        auxiliaryPaneRole: "inspector",
+      }),
+    ).toEqual({
+      primarySidebarVisible: true,
+      primarySidebarSuppressedByAuxiliary: false,
+      contentPaneWidth: 986,
+      supportsAuxiliaryPane: true,
+      auxiliaryPaneVisible: true,
+      auxiliaryPaneWidth: 320,
+    });
+  });
+
+  it("restores the thread sidebar when the file inspector is hidden", () => {
+    const layout = deriveLayout({ width: 1_024, height: 1_366 });
+
+    expect(
+      deriveWorkspacePaneLayout({
+        layout,
+        viewportWidth: 1_024,
+        primarySidebarPreferredVisible: true,
+        auxiliaryPanePreferredVisible: false,
+        auxiliaryPaneRole: "inspector",
+      }),
+    ).toMatchObject({
+      primarySidebarVisible: true,
+      primarySidebarSuppressedByAuxiliary: false,
+      auxiliaryPaneVisible: false,
+    });
+  });
+
+  it("keeps file navigation on the native stack below the inspector breakpoint", () => {
+    const layout = deriveLayout({ width: 744, height: 1_133 });
+
+    expect(deriveFileInspectorPaneLayout({ layout, viewportWidth: 744 })).toEqual({
+      supported: false,
+      width: null,
+    });
+    expect(
+      deriveWorkspacePaneLayout({
+        layout,
+        viewportWidth: 744,
+        primarySidebarPreferredVisible: true,
+        auxiliaryPanePreferredVisible: true,
+        auxiliaryPaneRole: "inspector",
+      }),
+    ).toMatchObject({
+      primarySidebarVisible: true,
+      supportsAuxiliaryPane: false,
+      auxiliaryPaneVisible: false,
+    });
+  });
+
+  it("supports three visible columns in a sufficiently large window", () => {
+    const layout = deriveLayout({ width: 1_366, height: 1_024 });
+
+    expect(
+      deriveWorkspacePaneLayout({
+        layout,
+        viewportWidth: 1_366,
+        primarySidebarPreferredVisible: true,
+        auxiliaryPanePreferredVisible: true,
+      }),
+    ).toMatchObject({
+      primarySidebarVisible: true,
+      contentPaneWidth: 986,
+      supportsAuxiliaryPane: true,
+      auxiliaryPaneVisible: true,
+      auxiliaryPaneWidth: 276,
+    });
+  });
+
+  it("respects a hidden auxiliary-pane preference", () => {
+    const layout = deriveLayout({ width: 1_366, height: 1_024 });
+
+    expect(
+      deriveWorkspacePaneLayout({
+        layout,
+        viewportWidth: 1_366,
+        primarySidebarPreferredVisible: true,
+        auxiliaryPanePreferredVisible: false,
+      }).auxiliaryPaneVisible,
+    ).toBe(false);
+  });
+
+  it("never exposes workspace panes in compact layouts", () => {
+    const layout = deriveLayout({ width: 430, height: 932 });
+
+    expect(
+      deriveWorkspacePaneLayout({
+        layout,
+        viewportWidth: 430,
+        primarySidebarPreferredVisible: true,
+        auxiliaryPanePreferredVisible: true,
+      }),
+    ).toMatchObject({
+      primarySidebarVisible: false,
+      supportsAuxiliaryPane: false,
+      auxiliaryPaneVisible: false,
+      auxiliaryPaneWidth: null,
+    });
+  });
+});
+
+describe("deriveStableFormSheetDetent", () => {
+  it.each([
+    { height: 1_194, expected: 0.62 },
+    { height: 834, expected: 0.863 },
+    { height: 600, expected: 0.893 },
+    { height: 0, expected: 0.92 },
+  ])("derives a stable sheet detent for height $height", ({ height, expected }) => {
+    expect(deriveStableFormSheetDetent(height)).toBe(expected);
   });
 });

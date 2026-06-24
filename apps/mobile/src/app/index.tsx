@@ -23,6 +23,7 @@ import type { HomeProjectSortOrder } from "../features/home/homeThreadList";
 import { useThreadListActions } from "../features/home/useThreadListActions";
 import { useAdaptiveWorkspaceLayout } from "../features/layout/AdaptiveWorkspaceLayout";
 import { WorkspaceEmptyDetail } from "../features/layout/WorkspaceEmptyDetail";
+import { WorkspaceSidebarToolbar } from "../features/layout/workspace-sidebar-toolbar";
 
 interface HomeListOptions {
   readonly selectedEnvironmentId: EnvironmentId | null;
@@ -94,6 +95,7 @@ export default function HomeRouteScreen() {
             headerTitle: "",
           }}
         />
+        <WorkspaceSidebarToolbar />
         <WorkspaceEmptyDetail />
       </>
     );

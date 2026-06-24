@@ -1,8 +1,10 @@
 import Stack from "expo-router/stack";
 import { StyleSheet } from "react-native";
 import { useResolveClassNames } from "uniwind";
+import { useAdaptiveWorkspaceLayout } from "../../../../features/layout/AdaptiveWorkspaceLayout";
 
 export default function ThreadLayout() {
+  const { fileInspector } = useAdaptiveWorkspaceLayout();
   const sheetStyle = StyleSheet.flatten(useResolveClassNames("bg-sheet"));
   const headerBg = {
     backgroundColor: (sheetStyle as { backgroundColor?: string })?.backgroundColor,
@@ -58,8 +60,9 @@ export default function ThreadLayout() {
       <Stack.Screen
         name="files/index"
         options={{
-          animation: "slide_from_right",
+          animation: fileInspector.supported ? "none" : "slide_from_right",
           contentStyle: sheetStyle,
+          gestureEnabled: true,
           headerBackButtonDisplayMode: "minimal",
           headerShown: true,
           headerTitle: "Files",
@@ -71,8 +74,9 @@ export default function ThreadLayout() {
       <Stack.Screen
         name="files/[...path]"
         options={{
-          animation: "slide_from_right",
+          animation: fileInspector.supported ? "none" : "slide_from_right",
           contentStyle: sheetStyle,
+          gestureEnabled: true,
           headerBackButtonDisplayMode: "minimal",
           headerShown: true,
           headerTitle: "File",

@@ -11,6 +11,7 @@ import { relativeTime } from "../../lib/time";
 import { useThemeColor } from "../../lib/useThemeColor";
 import { useProjects, useThreadShells } from "../../state/entities";
 import { buildThreadNavigationGroups } from "./thread-navigation-groups";
+import { SidebarHeaderActions } from "./sidebar-header-actions";
 import { threadStatusTone } from "./threadPresentation";
 
 export function ThreadNavigationSidebar(props: {
@@ -32,7 +33,6 @@ export function ThreadNavigationSidebar(props: {
   const backgroundColor = useThemeColor("--color-drawer");
   const borderColor = useThemeColor("--color-border");
   const foregroundColor = useThemeColor("--color-foreground");
-  const iconColor = useThemeColor("--color-icon-muted");
   const mutedColor = useThemeColor("--color-foreground-muted");
   const placeholderColor = useThemeColor("--color-placeholder");
   const searchBackgroundColor = useThemeColor("--color-subtle-strong");
@@ -42,42 +42,25 @@ export function ThreadNavigationSidebar(props: {
   return (
     <View
       testID="thread-navigation-sidebar"
-      style={{
-        width: props.width,
-        backgroundColor,
-        borderRightColor: borderColor,
-        borderRightWidth: StyleSheet.hairlineWidth,
-        paddingTop: insets.top + 8,
-      }}
+      style={[
+        styles.container,
+        {
+          width: props.width,
+          backgroundColor,
+          borderRightColor: borderColor,
+          borderRightWidth: StyleSheet.hairlineWidth,
+          paddingTop: insets.top,
+        },
+      ]}
     >
       <View style={styles.header}>
         <Text className="flex-1 text-2xl font-t3-bold" numberOfLines={1}>
           Threads
         </Text>
-        <Pressable
-          accessibilityLabel="Open settings"
-          accessibilityRole="button"
-          hitSlop={4}
-          onPress={props.onOpenSettings}
-          style={({ pressed }) => [
-            styles.headerButton,
-            { backgroundColor: pressed ? pressedBackgroundColor : "transparent" },
-          ]}
-        >
-          <SymbolView name="gearshape" size={18} tintColor={iconColor} type="monochrome" />
-        </Pressable>
-        <Pressable
-          accessibilityLabel="New task"
-          accessibilityRole="button"
-          hitSlop={4}
-          onPress={props.onStartNewTask}
-          style={({ pressed }) => [
-            styles.headerButton,
-            { backgroundColor: pressed ? pressedBackgroundColor : "transparent" },
-          ]}
-        >
-          <SymbolView name="square.and.pencil" size={18} tintColor={iconColor} type="monochrome" />
-        </Pressable>
+        <SidebarHeaderActions
+          onOpenSettings={props.onOpenSettings}
+          onStartNewTask={props.onStartNewTask}
+        />
       </View>
 
       <View style={[styles.searchField, { backgroundColor: searchBackgroundColor }]}>
@@ -96,89 +79,83 @@ export function ThreadNavigationSidebar(props: {
         />
       </View>
 
-      <ScrollView
-        contentContainerStyle={{
-          gap: 18,
-          paddingHorizontal: 10,
-          paddingTop: 16,
-          paddingBottom: Math.max(insets.bottom, 16),
-        }}
-        keyboardDismissMode="on-drag"
-        keyboardShouldPersistTaps="handled"
-        showsVerticalScrollIndicator={false}
-      >
-        {groups.length === 0 ? (
-          <Text className="px-2 py-4 text-sm text-foreground-muted">
-            {searchQuery.trim().length > 0 ? "No matching threads" : "No threads yet"}
-          </Text>
-        ) : (
-          groups.map((group) => (
-            <View key={group.key} style={styles.section}>
-              <Text className="px-2 text-xs font-t3-bold text-foreground-muted" numberOfLines={1}>
-                {group.title}
-              </Text>
+      <View style={{ flex: 1, paddingBottom: insets.bottom }}>
+        <ScrollView
+          contentContainerStyle={styles.threadListContent}
+          keyboardDismissMode="on-drag"
+          keyboardShouldPersistTaps="handled"
+          showsVerticalScrollIndicator={false}
+          style={styles.threadList}
+        >
+          {groups.length === 0 ? (
+            <Text className="px-2 py-4 text-sm text-foreground-muted">
+              {searchQuery.trim().length > 0 ? "No matching threads" : "No threads yet"}
+            </Text>
+          ) : (
+            groups.map((group) => (
+              <View key={group.key} style={styles.section}>
+                <Text className="px-2 text-xs font-t3-bold text-foreground-muted" numberOfLines={1}>
+                  {group.title}
+                </Text>
 
-              {group.threads.length === 0 ? (
-                <Text className="px-2 py-2 text-sm text-foreground-tertiary">No threads yet</Text>
-              ) : (
-                group.threads.map((thread) => {
-                  const threadKey = scopedThreadKey(thread.environmentId, thread.id);
-                  const selected = threadKey === props.selectedThreadKey;
+                {group.threads.length === 0 ? (
+                  <Text className="px-2 py-2 text-sm text-foreground-tertiary">No threads yet</Text>
+                ) : (
+                  group.threads.map((thread) => {
+                    const threadKey = scopedThreadKey(thread.environmentId, thread.id);
+                    const selected = threadKey === props.selectedThreadKey;
 
-                  return (
-                    <Pressable
-                      key={threadKey}
-                      accessibilityLabel={thread.title}
-                      accessibilityRole="button"
-                      accessibilityState={{ selected }}
-                      onPress={() => props.onSelectThread(thread)}
-                      style={({ pressed }) => [
-                        styles.threadRow,
-                        {
-                          backgroundColor: selected
-                            ? selectedBackgroundColor
-                            : pressed
-                              ? pressedBackgroundColor
-                              : "transparent",
-                        },
-                      ]}
-                    >
-                      <View style={styles.threadText}>
-                        <Text className="text-base font-t3-medium" numberOfLines={1}>
-                          {thread.title}
-                        </Text>
-                        <Text className="text-xs text-foreground-muted" numberOfLines={1}>
-                          {relativeTime(thread.updatedAt ?? thread.createdAt)}
-                        </Text>
-                      </View>
-                      <StatusPill {...threadStatusTone(thread)} size="compact" />
-                    </Pressable>
-                  );
-                })
-              )}
-            </View>
-          ))
-        )}
-      </ScrollView>
+                    return (
+                      <Pressable
+                        key={threadKey}
+                        accessibilityLabel={thread.title}
+                        accessibilityRole="button"
+                        accessibilityState={{ selected }}
+                        onPress={() => props.onSelectThread(thread)}
+                        style={({ pressed }) => [
+                          styles.threadRow,
+                          {
+                            backgroundColor: selected
+                              ? selectedBackgroundColor
+                              : pressed
+                                ? pressedBackgroundColor
+                                : "transparent",
+                          },
+                        ]}
+                      >
+                        <View style={styles.threadText}>
+                          <Text className="text-base font-t3-medium" numberOfLines={1}>
+                            {thread.title}
+                          </Text>
+                          <Text className="text-xs text-foreground-muted" numberOfLines={1}>
+                            {relativeTime(thread.updatedAt ?? thread.createdAt)}
+                          </Text>
+                        </View>
+                        <StatusPill {...threadStatusTone(thread)} size="compact" />
+                      </Pressable>
+                    );
+                  })
+                )}
+              </View>
+            ))
+          )}
+        </ScrollView>
+      </View>
     </View>
   );
 }
 
 const styles = StyleSheet.create({
+  container: {
+    flex: 1,
+  },
   header: {
-    minHeight: 48,
+    height: 44,
     paddingLeft: 18,
     paddingRight: 8,
     flexDirection: "row",
     alignItems: "center",
     gap: 2,
-  },
-  headerButton: {
-    width: 44,
-    height: 44,
-    borderRadius: 12,
-    alignItems: "center",
-    justifyContent: "center",
   },
   searchField: {
     height: 36,
@@ -198,6 +175,15 @@ const styles = StyleSheet.create({
     paddingHorizontal: 0,
     fontFamily: "DMSans_400Regular",
     fontSize: 15,
+  },
+  threadList: {
+    flex: 1,
+  },
+  threadListContent: {
+    gap: 18,
+    paddingHorizontal: 10,
+    paddingTop: 16,
+    paddingBottom: 16,
   },
   section: {
     gap: 4,
