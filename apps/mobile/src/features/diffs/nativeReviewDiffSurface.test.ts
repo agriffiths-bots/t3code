@@ -81,3 +81,20 @@ describe("resolveNativeReviewDiffView", () => {
     expect(consoleError).toHaveBeenCalledTimes(1);
   });
 });
+
+describe("isPendingNativeViewRegistration", () => {
+  it("recognizes registration races for the installed native view name", async () => {
+    const { isPendingNativeViewRegistration } = await import("./nativeReviewDiffSurface");
+
+    expect(
+      isPendingNativeViewRegistration(
+        new Error("Unable to find the 'T3ReviewDiffSurface' view for this native tag"),
+      ),
+    ).toBe(true);
+    expect(
+      isPendingNativeViewRegistration(
+        new Error("Unable to find the 'T3ReviewDiffView' view for this native tag"),
+      ),
+    ).toBe(false);
+  });
+});

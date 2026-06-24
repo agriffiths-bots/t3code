@@ -30,8 +30,9 @@ export function buildThreadNavigationGroups(input: {
   readonly searchQuery?: string;
 }): ReadonlyArray<ThreadNavigationGroup> {
   const query = input.searchQuery?.trim().toLocaleLowerCase() ?? "";
+  const activeThreads = input.threads.filter((thread) => thread.archivedAt === null);
 
-  return groupProjectsByRepository(input).flatMap((group) => {
+  return groupProjectsByRepository({ ...input, threads: activeThreads }).flatMap((group) => {
     const threads = Arr.sort(
       group.projects.flatMap((projectGroup) => projectGroup.threads),
       threadActivityOrder,

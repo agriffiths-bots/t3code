@@ -550,6 +550,8 @@ public final class T3ReviewDiffView: ExpoView, UIScrollViewDelegate {
     }
 
     self.contentResetKey = contentResetKey
+    tokensDecodeGeneration += 1
+    contentView.tokensByRowId = [:]
     hasAppliedInitialRowIndex = false
     lastVisibleFileId = nil
     pendingScrollFileId = nil
@@ -684,8 +686,23 @@ public final class T3ReviewDiffView: ExpoView, UIScrollViewDelegate {
     // Keep the explicit destination selected while UIKit animates through the files
     // between the old and new offsets. Emitting every intermediate header forces a
     // React render per crossing and makes the navigator visibly flash.
-    guard !isProgrammaticScrollActive,
-          let fileId = contentView.visibleFileId(atVerticalOffset: scrollView.contentOffset.y),
+    guard !isProgrammaticScrollActive else {
+      return
+    }
+
+    // The top of the combined diff is the explicit "All files" destination.
+    // Treat it as a first-class selection instead of immediately resolving the
+    // first file header and undoing the navigator's optimistic selection.
+    if scrollView.contentOffset.y <= 0.5 {
+      guard lastVisibleFileId != nil else {
+        return
+      }
+      lastVisibleFileId = nil
+      onVisibleFileChange(["fileId": NSNull()])
+      return
+    }
+
+    guard let fileId = contentView.visibleFileId(atVerticalOffset: scrollView.contentOffset.y),
           fileId != lastVisibleFileId else {
       return
     }

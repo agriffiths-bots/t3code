@@ -91,4 +91,21 @@ describe("buildThreadNavigationGroups", () => {
       })[0]?.threads.map((thread) => thread.id),
     ).toEqual(["newer", "older"]);
   });
+
+  it("excludes archived threads from the navigation sidebar", () => {
+    const archived = makeThread({
+      id: ThreadId.make("archived"),
+      projectId: project.id,
+      title: "Archived work",
+      archivedAt: "2026-06-04T00:00:00.000Z",
+      updatedAt: "2026-06-04T00:00:00.000Z",
+    });
+
+    expect(
+      buildThreadNavigationGroups({
+        projects: [project],
+        threads: [...threads, archived],
+      })[0]?.threads.map((thread) => thread.id),
+    ).toEqual(["newer", "older"]);
+  });
 });

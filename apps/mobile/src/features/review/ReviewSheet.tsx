@@ -179,7 +179,7 @@ const ReviewFileNavigatorRow = memo(function ReviewFileNavigatorRow(props: {
 });
 
 interface ReviewFileNavigatorHandle {
-  readonly setVisibleFile: (fileId: string) => void;
+  readonly setVisibleFile: (fileId: string | null) => void;
 }
 
 interface ReviewFileNavigatorProps {
@@ -212,7 +212,7 @@ function ReviewFileNavigator({
     ref,
     () => ({
       setVisibleFile: (fileId) => {
-        if (!availableFileIds.includes(fileId)) {
+        if (fileId !== null && !availableFileIds.includes(fileId)) {
           return;
         }
         setFileSelection((current) => {
@@ -482,12 +482,8 @@ export function ReviewSheet() {
     [collapsedFileIds, commentSelection, toggleExpandedFile],
   );
   const handleVisibleFileChange = useCallback(
-    (event: NativeSyntheticEvent<{ readonly fileId?: string }>) => {
-      const { fileId } = event.nativeEvent;
-      if (!fileId) {
-        return;
-      }
-      reviewFileNavigatorRef.current?.setVisibleFile(fileId);
+    (event: NativeSyntheticEvent<{ readonly fileId?: string | null }>) => {
+      reviewFileNavigatorRef.current?.setVisibleFile(event.nativeEvent.fileId ?? null);
     },
     [],
   );

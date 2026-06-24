@@ -18,6 +18,7 @@ import {
 const fileTreeCache = new WeakMap<ReadonlyArray<ProjectEntry>, ReadonlyArray<FileTreeNode>>();
 const FILE_TREE_INITIAL_RENDER_COUNT = 20;
 const FILE_TREE_RENDER_BATCH_SIZE = 12;
+const OPTIMISTIC_SELECTION_TIMEOUT_MS = 1_000;
 
 function cachedFileTree(entries: ReadonlyArray<ProjectEntry>): ReadonlyArray<FileTreeNode> {
   const cached = fileTreeCache.get(entries);
@@ -120,6 +121,7 @@ export function FileTreeBrowser(props: {
   const iconColor = String(useThemeColor("--color-icon-muted"));
   const { onPreviewFile, onSelectFile, selectedPath: controlledSelectedPath } = props;
   const controlledSelectedPathRef = useRef(controlledSelectedPath);
+  const pendingSelectionTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   controlledSelectedPathRef.current = controlledSelectedPath;
 
   const selectedPath =
@@ -164,6 +166,15 @@ export function FileTreeBrowser(props: {
     });
   }, [controlledSelectedPath]);
 
+  useEffect(
+    () => () => {
+      if (pendingSelectionTimeoutRef.current !== null) {
+        clearTimeout(pendingSelectionTimeoutRef.current);
+      }
+    },
+    [],
+  );
+
   const toggleDirectory = useCallback((path: string) => {
     setExpandedPaths((current) => {
       const next = new Set(current);
@@ -177,10 +188,17 @@ export function FileTreeBrowser(props: {
   }, []);
   const handleSelectFile = useCallback(
     (path: string) => {
+      if (pendingSelectionTimeoutRef.current !== null) {
+        clearTimeout(pendingSelectionTimeoutRef.current);
+      }
       setPendingSelection({
         path,
         selectedPathAtPress: controlledSelectedPathRef.current,
       });
+      pendingSelectionTimeoutRef.current = setTimeout(() => {
+        pendingSelectionTimeoutRef.current = null;
+        setPendingSelection((current) => (current?.path === path ? null : current));
+      }, OPTIMISTIC_SELECTION_TIMEOUT_MS);
       onSelectFile(path);
     },
     [onSelectFile],

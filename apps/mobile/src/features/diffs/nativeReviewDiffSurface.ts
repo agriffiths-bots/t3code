@@ -124,7 +124,7 @@ export interface NativeReviewDiffViewProps extends ViewProps {
   readonly nativeViewRef?: Ref<NativeReviewDiffViewHandle>;
   readonly onDebug?: (event: NativeSyntheticEvent<Record<string, unknown>>) => void;
   readonly onVisibleFileChange?: (
-    event: NativeSyntheticEvent<{ readonly fileId?: string }>,
+    event: NativeSyntheticEvent<{ readonly fileId?: string | null }>,
   ) => void;
   readonly onToggleFile?: (event: NativeSyntheticEvent<{ readonly fileId?: string }>) => void;
   readonly onToggleViewedFile?: (event: NativeSyntheticEvent<{ readonly fileId?: string }>) => void;
@@ -166,9 +166,10 @@ let nativeReviewDiffViewResolutionFailed = false;
 
 type NativeReviewDiffPayloadMethod = "setRowsJson" | "setTokensJson" | "setTokensPatchJson";
 
-function isPendingNativeViewRegistration(error: unknown): boolean {
+export function isPendingNativeViewRegistration(error: unknown): boolean {
   return (
-    error instanceof Error && error.message.includes("Unable to find the 'T3ReviewDiffView' view")
+    error instanceof Error &&
+    error.message.includes(`Unable to find the '${NATIVE_REVIEW_DIFF_MODULE_NAME}' view`)
   );
 }
 

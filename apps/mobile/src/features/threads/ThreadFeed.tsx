@@ -1137,7 +1137,9 @@ export const ThreadFeed = memo(function ThreadFeed(props: ThreadFeedProps) {
   const initialScrollReadyRef = useRef(false);
   const lastContentHeightRef = useRef(0);
   const { width: windowWidth } = useWindowDimensions();
-  const [viewportWidth, setViewportWidth] = useState(windowWidth);
+  const [viewportWidth, setViewportWidth] = useState(() =>
+    props.layoutVariant === "split" ? 0 : windowWidth,
+  );
   const [interactionState, setInteractionState] = useState<{
     readonly copiedRowId: string | null;
     readonly expandedWorkGroups: Record<string, boolean>;
@@ -1215,6 +1217,7 @@ export const ThreadFeed = memo(function ThreadFeed(props: ThreadFeedProps) {
       markdownStyles,
       reviewCommentColors,
       userBubbleColor,
+      viewportWidth,
     }),
     [
       copiedRowId,
@@ -1224,6 +1227,7 @@ export const ThreadFeed = memo(function ThreadFeed(props: ThreadFeedProps) {
       markdownStyles,
       reviewCommentColors,
       userBubbleColor,
+      viewportWidth,
     ],
   );
   const presentedFeed = useMemo(
