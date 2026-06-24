@@ -1403,7 +1403,6 @@ export const ThreadFeed = memo(function ThreadFeed(props: ThreadFeedProps) {
           style={{ flex: 1 }}
           automaticallyAdjustsScrollIndicatorInsets={false}
           scrollIndicatorInsets={{ top: topContentInset, bottom: 0 }}
-          alignItemsAtEnd
           {...(anchoredEndSpace ? { anchoredEndSpace } : {})}
           contentInsetEndAdjustment={props.contentInsetEndAdjustment}
           freeze={props.freeze}

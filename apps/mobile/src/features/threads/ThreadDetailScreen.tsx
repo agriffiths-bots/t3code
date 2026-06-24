@@ -292,6 +292,13 @@ export const ThreadDetailScreen = memo(function ThreadDetailScreen(props: Thread
       }
       lastScrolledAnchorMessageIdRef.current = anchorMessageId;
       void scrollMessageToEnd({ animated: true, closeKeyboard: false }).catch(() => {
+        if (
+          selectedThreadKeyRef.current !== targetThreadKey ||
+          lastScrolledAnchorMessageIdRef.current !== anchorMessageId
+        ) {
+          return;
+        }
+        lastScrolledAnchorMessageIdRef.current = null;
         freeze.set(false);
       });
     });
