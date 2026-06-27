@@ -92,7 +92,7 @@ it.effect("returns rejected when an approved client is rejected before last-seen
   ),
 );
 
-it.effect("returns pending when an approved client is revoked before last-seen update", () =>
+it.effect("returns rejected when an approved client is revoked before last-seen update", () =>
   Effect.gen(function* () {
     const store = yield* ConnectClientStore.ConnectClientStore;
     const authorization = yield* store.requestClient({
@@ -101,9 +101,9 @@ it.effect("returns pending when an approved client is revoked before last-seen u
     });
 
     expect(authorization.mode).toBe("client-approval");
-    expect(authorization.status).toBe("pending");
+    expect(authorization.status).toBe("rejected");
     if (authorization.mode === "client-approval") {
-      expect(authorization.client.status).toBe("pending");
+      expect(authorization.client.status).toBe("rejected");
       expect(authorization.client.approvedAt).toBeNull();
       expect(authorization.client.lastSeenAt).toBeNull();
     }

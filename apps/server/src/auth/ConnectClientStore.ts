@@ -335,10 +335,10 @@ export const make = Effect.gen(function* () {
 
     return {
       mode,
-      status: "pending" as const,
+      status: "rejected" as const,
       client: {
         ...visibleClient,
-        status: "pending" as const,
+        status: "rejected" as const,
         updatedAt: DateTime.toUtc(seenAt),
         approvedAt: null,
         lastSeenAt: null,
