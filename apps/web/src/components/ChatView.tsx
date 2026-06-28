@@ -3273,14 +3273,7 @@ function ChatViewContent(props: ChatViewProps) {
         settledTimelineAnchorRef.current === pending.messageId &&
         pending.userScrollGeneration === anchorUserScrollGenerationRef.current
       ) {
-        const list = legendListRef.current;
-        const currentScrollOffset = list?.getState().scroll;
-        if (
-          typeof currentScrollOffset === "number" &&
-          Math.abs(currentScrollOffset - pending.offset) <= 2
-        ) {
-          void list?.scrollToOffset({ offset: pending.offset, animated: false });
-        }
+        void legendListRef.current?.scrollToOffset({ offset: pending.offset, animated: false });
       }
     });
   }, []);
