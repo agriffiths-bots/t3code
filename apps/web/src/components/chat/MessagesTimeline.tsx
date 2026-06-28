@@ -649,10 +649,10 @@ function TimelineMinimap({
   return (
     <div
       className={cn(
-        "group/minimap pointer-events-auto absolute left-0 z-40 hidden w-18 -translate-y-1/2 py-3 md:block",
+        "group/minimap absolute left-0 z-40 hidden w-18 -translate-y-1/2 py-3 md:block",
         hasPersistentGutter
-          ? "opacity-100"
-          : "opacity-0 transition-opacity duration-150 hover:opacity-100 focus-within:opacity-100",
+          ? "pointer-events-auto opacity-100"
+          : "pointer-events-none opacity-0 transition-opacity duration-150 hover:opacity-100 focus-within:opacity-100",
       )}
       data-testid="timeline-minimap"
       data-persistent-gutter={hasPersistentGutter ? "true" : "false"}
@@ -698,9 +698,18 @@ function TimelineMinimap({
           aria-label={`Jump to message: ${activeItem?.userText ?? "User message"}`}
           className="pointer-events-auto absolute top-0 left-0 h-full w-10 cursor-pointer bg-transparent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/70"
           onBlur={() => setActiveIndex(null)}
-          onClick={() => {
-            if (activeItem) {
-              onSelect(activeItem);
+          onClick={(event) => {
+            const rect = event.currentTarget.getBoundingClientRect();
+            const index = resolveTimelineMinimapIndexFromPointer({
+              itemCount: items.length,
+              railTop: rect.top,
+              railHeight: rect.height,
+              pointerY: event.clientY,
+            });
+            if (index === null) return;
+            const item = items[index];
+            if (item) {
+              onSelect(item);
             }
           }}
           onFocus={() => setActiveIndex((current) => current ?? 0)}
