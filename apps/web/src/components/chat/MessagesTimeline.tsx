@@ -72,7 +72,7 @@ import {
   resolveTimelineIsAtEnd,
   type StableMessagesTimelineRowsState,
   type MessagesTimelineRow,
-  TIMELINE_MINIMAP_HEIGHT,
+  TIMELINE_MINIMAP_ITEM_SPACING,
   TIMELINE_MINIMAP_MIN_ITEMS,
   type TimelineLatestTurn,
 } from "./MessagesTimeline.logic";
@@ -347,13 +347,10 @@ export const MessagesTimeline = memo(function MessagesTimeline({
       return;
     }
 
-    const contentLength = Math.max(1, state.contentLength ?? 0);
     const scrollTop = state.scroll ?? 0;
     const scrollBottom = scrollTop + (state.scrollLength ?? 0);
-    const fallbackStep =
-      minimapItems.length > 1 ? TIMELINE_MINIMAP_HEIGHT / (minimapItems.length - 1) : 0;
 
-    for (const [fallbackIndex, item] of minimapItems.entries()) {
+    for (const item of minimapItems) {
       const strip = minimapStripRefs.current.get(item.id);
       if (!strip) {
         continue;
@@ -361,19 +358,11 @@ export const MessagesTimeline = memo(function MessagesTimeline({
 
       const rowTop = resolveTimelineRowTop(state, item.rowIndex);
       const rowHeight = resolveTimelineRowHeight(state, item.rowIndex);
-      const top =
-        rowTop === null
-          ? fallbackIndex * fallbackStep
-          : Math.min(
-              TIMELINE_MINIMAP_HEIGHT,
-              Math.max(0, (rowTop / contentLength) * TIMELINE_MINIMAP_HEIGHT),
-            );
       const inView =
         rowTop !== null &&
         rowTop < scrollBottom &&
         rowTop + Math.max(1, rowHeight ?? 1) > scrollTop;
 
-      strip.style.top = `${top}px`;
       strip.dataset.inView = inView ? "true" : "false";
     }
   }, [listRef, minimapItems, onIsAtEndChange]);
@@ -573,21 +562,41 @@ function TimelineMinimap({
     return null;
   }
 
-  const fallbackStep = items.length > 1 ? TIMELINE_MINIMAP_HEIGHT / (items.length - 1) : 0;
+  const minimapHeight = Math.max(1, (items.length - 1) * TIMELINE_MINIMAP_ITEM_SPACING);
 
   return (
     <div
-      className="pointer-events-none absolute top-1/2 left-[max(0.5rem,calc(50%-28rem))] z-20 hidden -translate-y-1/2 md:block"
+      className="pointer-events-none absolute top-1/2 left-3 z-20 hidden -translate-y-1/2 md:block"
       data-testid="timeline-minimap"
     >
-      <div className="relative w-12 select-none" style={{ height: TIMELINE_MINIMAP_HEIGHT }}>
+      <style>
+        {`
+          [data-testid="timeline-minimap"] button:hover [data-minimap-strip],
+          [data-testid="timeline-minimap"] button:focus-visible [data-minimap-strip] {
+            width: 1.5rem !important;
+          }
+          [data-testid="timeline-minimap"] button:hover + button [data-minimap-strip],
+          [data-testid="timeline-minimap"] button:has(+ button:hover) [data-minimap-strip],
+          [data-testid="timeline-minimap"] button:focus-visible + button [data-minimap-strip],
+          [data-testid="timeline-minimap"] button:has(+ button:focus-visible) [data-minimap-strip] {
+            width: 1rem !important;
+          }
+          [data-testid="timeline-minimap"] button:hover + button + button [data-minimap-strip],
+          [data-testid="timeline-minimap"] button:has(+ button + button:hover) [data-minimap-strip],
+          [data-testid="timeline-minimap"] button:focus-visible + button + button [data-minimap-strip],
+          [data-testid="timeline-minimap"] button:has(+ button + button:focus-visible) [data-minimap-strip] {
+            width: 0.625rem !important;
+          }
+        `}
+      </style>
+      <div className="relative w-10 select-none" style={{ height: minimapHeight }}>
         <div className="absolute top-0 left-3 h-full w-px bg-border/15" />
         {items.map((item, index) => {
-          const top = index * fallbackStep;
+          const top = index * TIMELINE_MINIMAP_ITEM_SPACING;
           return (
             <button
               aria-label={`Jump to message: ${item.userText ?? "User message"}`}
-              className="pointer-events-auto group absolute left-0 flex h-4 w-12 -translate-y-1/2 cursor-pointer items-center focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/70"
+              className="pointer-events-auto group absolute left-0 flex h-2 w-10 -translate-y-1/2 cursor-pointer items-center focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/70"
               data-in-view="false"
               key={item.id}
               onClick={() => onSelect(item)}
@@ -601,7 +610,10 @@ function TimelineMinimap({
               style={{ top }}
               type="button"
             >
-              <span className="ml-0 h-px w-2.5 rounded-full bg-muted-foreground/35 transition-[background-color,width] duration-150 group-hover:w-7 group-hover:bg-muted-foreground/65 group-data-[in-view=true]:bg-foreground/90" />
+              <span
+                className="ml-0 h-0.5 w-2 rounded-full bg-muted-foreground/35 transition-[background-color,width] duration-150 group-hover:bg-muted-foreground/70 group-data-[in-view=true]:bg-foreground/90"
+                data-minimap-strip
+              />
               <span className="pointer-events-none absolute top-1/2 left-8 hidden w-80 -translate-y-1/2 rounded-xl border border-border/70 bg-popover/95 p-3 text-left text-popover-foreground shadow-xl shadow-black/25 backdrop-blur group-hover:block group-focus-visible:block">
                 <span className="block truncate text-sm font-medium">
                   {item.userText ?? "User message"}
