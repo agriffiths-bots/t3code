@@ -73,6 +73,7 @@ import {
   type StableMessagesTimelineRowsState,
   type MessagesTimelineRow,
   TIMELINE_MINIMAP_ITEM_SPACING,
+  TIMELINE_MINIMAP_MAX_HEIGHT,
   TIMELINE_MINIMAP_MIN_ITEMS,
   type TimelineLatestTurn,
 } from "./MessagesTimeline.logic";
@@ -562,7 +563,10 @@ function TimelineMinimap({
     return null;
   }
 
-  const minimapHeight = Math.max(1, (items.length - 1) * TIMELINE_MINIMAP_ITEM_SPACING);
+  const naturalHeight = Math.max(1, (items.length - 1) * TIMELINE_MINIMAP_ITEM_SPACING);
+  const minimapHeight = Math.min(naturalHeight, TIMELINE_MINIMAP_MAX_HEIGHT);
+  const effectiveSpacing =
+    items.length > 1 ? minimapHeight / (items.length - 1) : 0;
 
   return (
     <div
@@ -592,7 +596,7 @@ function TimelineMinimap({
       <div className="relative w-10 select-none" style={{ height: minimapHeight }}>
         <div className="absolute top-0 left-3 h-full w-px bg-border/15" />
         {items.map((item, index) => {
-          const top = index * TIMELINE_MINIMAP_ITEM_SPACING;
+          const top = index * effectiveSpacing;
           return (
             <button
               aria-label={`Jump to message: ${item.userText ?? "User message"}`}
