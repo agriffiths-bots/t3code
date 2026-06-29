@@ -12,6 +12,7 @@ import * as Layer from "effect/Layer";
 import * as Schema from "effect/Schema";
 import * as TestClock from "effect/testing/TestClock";
 import * as Socket from "effect/unstable/socket/Socket";
+import { afterEach, vi } from "vite-plus/test";
 
 import {
   ConnectionTransientError,
@@ -165,6 +166,10 @@ const makeFactory = Effect.fn("TestRpcSessionFactory.make")(function* () {
   return { factory, sockets };
 });
 
+afterEach(() => {
+  vi.unstubAllGlobals();
+});
+
 const awaitSocket = Effect.fn("TestRpcSessionFactory.awaitSocket")(function* (
   sockets: ReadonlyArray<TestWebSocket>,
 ) {
@@ -242,8 +247,10 @@ describe("RpcSessionFactory", () => {
     }),
   );
 
-  it.effect("passes prepared socket headers to native websocket constructors", () =>
+  it.effect("passes prepared socket headers to React Native websocket constructors", () =>
     Effect.gen(function* () {
+      vi.stubGlobal("window", {});
+      vi.stubGlobal("navigator", { product: "ReactNative" });
       const { factory, sockets } = yield* makeFactory();
       const session = yield* factory.connect({
         ...PREPARED,
@@ -261,6 +268,28 @@ describe("RpcSessionFactory", () => {
           cookie: "CF_Authorization=cf-access-jwt",
         },
       });
+      socket.open();
+      yield* completeInitialConfig(socket);
+      yield* Fiber.join(readyFiber);
+    }),
+  );
+
+  it.effect("uses browser websocket constructors without non-standard header options", () =>
+    Effect.gen(function* () {
+      vi.stubGlobal("window", {});
+      vi.stubGlobal("navigator", { product: "Gecko" });
+      const { factory, sockets } = yield* makeFactory();
+      const session = yield* factory.connect({
+        ...PREPARED,
+        socketHeaders: {
+          "cf-access-jwt-assertion": "cf-access-jwt",
+          cookie: "CF_Authorization=cf-access-jwt",
+        },
+      });
+      const readyFiber = yield* Effect.forkChild(session.ready);
+      const socket = yield* awaitSocket(sockets);
+
+      expect(socket.options).toBeUndefined();
       socket.open();
       yield* completeInitialConfig(socket);
       yield* Fiber.join(readyFiber);

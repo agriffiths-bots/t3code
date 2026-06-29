@@ -68,6 +68,18 @@ jobs:
             esac
           }
 
+          reviewer_is_trusted() {
+            local actor="$1"
+            case "$actor" in
+              greptile-apps|greptile-apps[bot]|chatgpt-codex-connector[bot]|codex|codex[bot])
+                return 0
+                ;;
+              *)
+                actor_is_trusted "$actor" ""
+                ;;
+            esac
+          }
+
           if [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
             should_run=true
             pr_number="$DISPATCH_PR"
@@ -77,7 +89,7 @@ jobs:
               pr_number="$ISSUE_NUMBER"
             fi
           elif [[ "$EVENT_NAME" == "pull_request_review" ]]; then
-            if [[ "$REVIEW_HEAD_REPO" == "$REPOSITORY" && "$REVIEW_AUTHOR" =~ [Cc]odex|[Gg]reptile ]]; then
+            if [[ "$REVIEW_HEAD_REPO" == "$REPOSITORY" ]] && reviewer_is_trusted "$REVIEW_AUTHOR"; then
               should_run=true
               pr_number="$REVIEW_PR_NUMBER"
             fi

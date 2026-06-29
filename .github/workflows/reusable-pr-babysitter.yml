@@ -43,6 +43,31 @@ jobs:
         shell: bash
         run: gh pr checkout "$PR_NUMBER"
 
+      - id: base_ref
+        name: Resolve PR base branch
+        shell: bash
+        run: |
+          set -euo pipefail
+          base_ref="$(gh pr view "$PR_NUMBER" --json baseRefName --jq .baseRefName)"
+          echo "name=$base_ref" >> "$GITHUB_OUTPUT"
+          git fetch origin "$base_ref" --depth=1
+
+      - id: base_state_script
+        name: Read reviewer state script from base branch
+        shell: bash
+        run: |
+          set -euo pipefail
+          script_dir="$RUNNER_TEMP/codex-babysitter"
+          script_path="$script_dir/pr-babysitter-state.mjs"
+          mkdir -p "$script_dir"
+          if git show "origin/${{ steps.base_ref.outputs.name }}:.github/scripts/pr-babysitter-state.mjs" > "$script_path"; then
+            echo "available=true" >> "$GITHUB_OUTPUT"
+            echo "path=$script_path" >> "$GITHUB_OUTPUT"
+          else
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            echo "Base branch does not contain .github/scripts/pr-babysitter-state.mjs; skipping reviewer-state automation."
+          fi
+
       - name: Configure git identity
         shell: bash
         run: |
@@ -52,7 +77,8 @@ jobs:
 
       - id: state_before
         name: Read reviewer state
-        run: node .github/scripts/pr-babysitter-state.mjs
+        if: steps.base_state_script.outputs.available == 'true'
+        run: node "${{ steps.base_state_script.outputs.path }}"
 
       - id: openai_key
         name: Check for OpenAI API key
@@ -78,16 +104,19 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          base_ref="$(gh pr view "$PR_NUMBER" --json baseRefName --jq .baseRefName)"
           prompt_dir="$RUNNER_TEMP/codex-babysitter"
           prompt_path="$prompt_dir/pr-babysit.md"
           mkdir -p "$prompt_dir"
-          git fetch origin "$base_ref" --depth=1
-          git show "origin/$base_ref:.github/codex/prompts/pr-babysit.md" > "$prompt_path"
-          echo "path=$prompt_path" >> "$GITHUB_OUTPUT"
+          if git show "origin/${{ steps.base_ref.outputs.name }}:.github/codex/prompts/pr-babysit.md" > "$prompt_path"; then
+            echo "available=true" >> "$GITHUB_OUTPUT"
+            echo "path=$prompt_path" >> "$GITHUB_OUTPUT"
+          else
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            echo "Base branch does not contain .github/codex/prompts/pr-babysit.md; skipping Codex babysitter execution."
+          fi
 
       - name: Setup Vite+
-        if: steps.state_before.outputs.ready_to_merge != 'true' && steps.openai_key.outputs.present == 'true'
+        if: steps.state_before.outputs.ready_to_merge != 'true' && steps.openai_key.outputs.present == 'true' && steps.base_prompt.outputs.available == 'true'
         uses: voidzero-dev/setup-vp@v1
         with:
           node-version-file: package.json
@@ -95,7 +124,7 @@ jobs:
           run-install: true
 
       - name: Run Codex babysitter
-        if: steps.state_before.outputs.ready_to_merge != 'true' && steps.openai_key.outputs.present == 'true'
+        if: steps.state_before.outputs.ready_to_merge != 'true' && steps.openai_key.outputs.present == 'true' && steps.base_prompt.outputs.available == 'true'
         uses: openai/codex-action@v1
         with:
           openai-api-key: ${{ secrets.OPENAI_API_KEY }}
@@ -105,7 +134,7 @@ jobs:
           output-file: codex-babysitter-output.md
 
       - name: Commit and push Codex changes
-        if: steps.state_before.outputs.ready_to_merge != 'true' && steps.openai_key.outputs.present == 'true'
+        if: steps.state_before.outputs.ready_to_merge != 'true' && steps.openai_key.outputs.present == 'true' && steps.base_prompt.outputs.available == 'true'
         shell: bash
         run: |
           set -euo pipefail
@@ -118,7 +147,7 @@ jobs:
           git push
 
       - name: Ask reviewers to re-check
-        if: steps.state_before.outputs.ready_to_merge != 'true' && steps.openai_key.outputs.present == 'true'
+        if: steps.state_before.outputs.ready_to_merge != 'true' && steps.openai_key.outputs.present == 'true' && steps.base_prompt.outputs.available == 'true'
         shell: bash
         run: |
           gh pr comment "$PR_NUMBER" --body $'@codex review\n\n@greptileai review'

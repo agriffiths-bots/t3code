@@ -43,6 +43,20 @@ type InitialConfigError = Effect.Error<
   ReturnType<WsRpcProtocolClient[typeof WS_METHODS.serverGetConfig]>
 >;
 
+type HeaderOptionsWebSocketConstructor = {
+  new (
+    url: string | URL,
+    protocols?: string | string[],
+    options?: { readonly headers?: Readonly<Record<string, string>> },
+  ): globalThis.WebSocket;
+};
+
+function canPassWebSocketHeaderOptions() {
+  const navigatorProduct = (globalThis.navigator as { readonly product?: string } | undefined)
+    ?.product;
+  return navigatorProduct === "ReactNative" || typeof globalThis.window === "undefined";
+}
+
 function mapInitialConfigError(error: InitialConfigError): ConnectionAttemptError {
   switch (error._tag) {
     case "EnvironmentAuthorizationError":
@@ -93,16 +107,14 @@ export const make = Effect.gen(function* () {
     });
     const socketHeaders = connection.socketHeaders;
     const socketConstructor =
-      socketHeaders === undefined
+      socketHeaders === undefined || !canPassWebSocketHeaderOptions()
         ? webSocketConstructor
         : (((url: string | URL, protocols?: string | string[]) =>
-            new (webSocketConstructor as unknown as {
-              new (
-                url: string | URL,
-                protocols?: string | string[],
-                options?: { readonly headers?: Readonly<Record<string, string>> },
-              ): globalThis.WebSocket;
-            })(url, protocols, { headers: socketHeaders })) as typeof webSocketConstructor);
+            new (webSocketConstructor as unknown as HeaderOptionsWebSocketConstructor)(
+              url,
+              protocols,
+              { headers: socketHeaders },
+            )) as typeof webSocketConstructor);
 
     const socketLayer = Socket.layerWebSocket(connection.socketUrl, {
       openTimeout: SOCKET_OPEN_TIMEOUT,
