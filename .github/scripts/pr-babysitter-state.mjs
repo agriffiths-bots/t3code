@@ -24,12 +24,17 @@ query($owner: String!, $repo: String!, $number: Int!) {
       comments(last: 100) {
         nodes {
           body
+          createdAt
+          updatedAt
           author { login }
         }
       }
       reviews(last: 100) {
         nodes {
           body
+          createdAt
+          submittedAt
+          updatedAt
           state
           author { login }
         }
@@ -83,21 +88,35 @@ const unresolvedCodexThreads = pr.reviewThreads.nodes.filter(
     !thread.isResolved && thread.comments.nodes.some((comment) => isCodex(comment.author?.login)),
 );
 
-const greptileBodies = [
+const greptileSignals = [
   ...pr.comments.nodes
     .filter((comment) => isGreptile(comment.author?.login))
-    .map((comment) => comment.body),
+    .map((comment) => ({
+      body: comment.body,
+      timestamp: Date.parse(comment.updatedAt ?? comment.createdAt ?? ""),
+    })),
   ...pr.reviews.nodes
     .filter((review) => isGreptile(review.author?.login))
-    .map((review) => review.body),
-].join("\n\n");
+    .map((review) => ({
+      body: review.body,
+      timestamp: Date.parse(review.updatedAt ?? review.submittedAt ?? review.createdAt ?? ""),
+    })),
+]
+  .filter((signal) => signal.body.trim().length > 0)
+  .sort((left, right) => {
+    const leftTimestamp = Number.isNaN(left.timestamp) ? 0 : left.timestamp;
+    const rightTimestamp = Number.isNaN(right.timestamp) ? 0 : right.timestamp;
+    return rightTimestamp - leftTimestamp;
+  });
 
-const greptilePassed =
-  /\b5\s*\/\s*5\b/i.test(greptileBodies) ||
-  /\bscore\D+5(?:\.0)?\b/i.test(greptileBodies) ||
-  /\bgrade\D+5(?:\.0)?\b/i.test(greptileBodies);
+const latestGreptileBody = greptileSignals[0]?.body ?? "";
+const greptileScoreMatch = latestGreptileBody.match(
+  /\b(?:confidence\s+score|score|grade)\s*:?\s*(\d+(?:\.\d+)?)\s*(?:\/\s*5)?\b/i,
+);
+const greptileScore = greptileScoreMatch ? Number(greptileScoreMatch[1]) : null;
 
-const hasGreptileSignal = greptileBodies.trim().length > 0;
+const greptilePassed = greptileScore !== null && greptileScore >= 5;
+const hasGreptileSignal = latestGreptileBody.trim().length > 0;
 const readyToMerge =
   !pr.isDraft && unresolvedCodexThreads.length === 0 && hasGreptileSignal && greptilePassed;
 
@@ -107,6 +126,7 @@ const summary = [
   `reviewDecision=${pr.reviewDecision ?? "UNKNOWN"}`,
   `unresolvedCodexThreads=${unresolvedCodexThreads.length}`,
   `greptileSignal=${hasGreptileSignal}`,
+  `greptileScore=${greptileScore ?? "UNKNOWN"}`,
   `greptilePassed=${greptilePassed}`,
 ].join(" ");
 
