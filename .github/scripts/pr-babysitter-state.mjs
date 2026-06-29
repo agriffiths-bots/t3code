@@ -72,8 +72,11 @@ if (!pr) {
   throw new Error(`Pull request #${prNumber} was not found.`);
 }
 
-const isCodex = (login) => /codex/i.test(login ?? "");
-const isGreptile = (login) => /greptile/i.test(login ?? "");
+const codexAuthorLogins = new Set(["chatgpt-codex-connector", "chatgpt-codex-connector[bot]"]);
+const greptileAuthorLogins = new Set(["greptile-apps", "greptile-apps[bot]"]);
+
+const isCodex = (login) => codexAuthorLogins.has(login ?? "");
+const isGreptile = (login) => greptileAuthorLogins.has(login ?? "");
 
 const unresolvedCodexThreads = pr.reviewThreads.nodes.filter(
   (thread) =>
