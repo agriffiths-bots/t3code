@@ -73,7 +73,7 @@ if (!pr) {
 }
 
 const isCodex = (login) => /codex/i.test(login ?? "");
-const isGreptile = (login, body) => /greptile/i.test(login ?? "") || /greptile/i.test(body);
+const isGreptile = (login) => /greptile/i.test(login ?? "");
 
 const unresolvedCodexThreads = pr.reviewThreads.nodes.filter(
   (thread) =>
@@ -82,10 +82,10 @@ const unresolvedCodexThreads = pr.reviewThreads.nodes.filter(
 
 const greptileBodies = [
   ...pr.comments.nodes
-    .filter((comment) => isGreptile(comment.author?.login, comment.body))
+    .filter((comment) => isGreptile(comment.author?.login))
     .map((comment) => comment.body),
   ...pr.reviews.nodes
-    .filter((review) => isGreptile(review.author?.login, review.body))
+    .filter((review) => isGreptile(review.author?.login))
     .map((review) => review.body),
 ].join("\n\n");
 

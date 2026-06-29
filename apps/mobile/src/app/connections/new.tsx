@@ -246,8 +246,8 @@ export default function ConnectionsNewRouteScreen() {
                   isCloudflareAuthenticating
                     ? "Signing in..."
                     : cloudflareAccessToken
-                      ? "Google authenticated"
-                      : "Authenticate with Google"
+                      ? "Access authenticated"
+                      : "Authenticate with Access"
                 }
                 disabled={hostInput.trim().length === 0 || isCloudflareAuthenticating}
                 tone="secondary"
