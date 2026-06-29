@@ -1,5 +1,5 @@
-import { execFileSync } from "node:child_process";
-import { appendFileSync } from "node:fs";
+import * as NodeChildProcess from "node:child_process";
+import * as NodeFS from "node:fs";
 
 const prNumber = Number(process.env.PR_NUMBER ?? "");
 const repository = process.env.GITHUB_REPOSITORY ?? "";
@@ -56,7 +56,7 @@ query($owner: String!, $repo: String!, $number: Int!) {
   }
 }`;
 
-const response = execFileSync(
+const response = NodeChildProcess.execFileSync(
   "gh",
   [
     "api",
@@ -162,6 +162,6 @@ const summary = [
 process.stdout.write(`${summary}\n`);
 
 if (outputPath) {
-  appendFileSync(outputPath, `ready_to_merge=${readyToMerge ? "true" : "false"}\n`);
-  appendFileSync(outputPath, `summary=${summary}\n`);
+  NodeFS.appendFileSync(outputPath, `ready_to_merge=${readyToMerge ? "true" : "false"}\n`);
+  NodeFS.appendFileSync(outputPath, `summary=${summary}\n`);
 }

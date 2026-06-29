@@ -1,4 +1,4 @@
-import { execFileSync } from "node:child_process";
+import * as NodeChildProcess from "node:child_process";
 
 const repository = process.env.GITHUB_REPOSITORY ?? "";
 const prNumber = Number(process.env.PR_NUMBER ?? process.argv[2] ?? "");
@@ -12,7 +12,7 @@ if (!Number.isInteger(prNumber) || prNumber <= 0) {
 }
 
 const ghJson = (args) =>
-  JSON.parse(execFileSync("gh", ["api", ...args], { encoding: "utf8" }));
+  JSON.parse(NodeChildProcess.execFileSync("gh", ["api", ...args], { encoding: "utf8" }));
 
 const [owner, repo] = repository.split("/", 2);
 const pr = ghJson([`repos/${owner}/${repo}/pulls/${prNumber}`]);
@@ -85,12 +85,12 @@ const state =
   latestApprovalForHead !== undefined
     ? "approved"
     : latestForHead !== undefined
-    ? "current"
-    : triggerAccepted
-      ? "trigger-accepted"
-      : stale
-        ? "stale"
-        : "unknown";
+      ? "current"
+      : triggerAccepted
+        ? "trigger-accepted"
+        : stale
+          ? "stale"
+          : "unknown";
 
 const result = {
   pr: prNumber,

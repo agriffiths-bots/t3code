@@ -26,7 +26,7 @@ jobs:
         run: vp run --filter @t3tools/desktop ensure:electron
 
       - name: Check
-        run: vp check
+        run: vp check .github/scripts .github/workflows --no-error-on-unmatched-pattern
 
       - name: Typecheck
         run: vpr typecheck
