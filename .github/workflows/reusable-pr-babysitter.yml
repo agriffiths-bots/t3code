@@ -10,7 +10,7 @@ on:
     secrets:
       OPENAI_API_KEY:
         description: "OpenAI API key used by openai/codex-action"
-        required: true
+        required: false
       WIZZOAPP_GITHUB_TOKEN:
         description: "Optional WizzoApp token used to push babysitter commits"
         required: false
@@ -53,13 +53,26 @@ jobs:
         name: Read reviewer state
         run: node .github/scripts/pr-babysitter-state.mjs
 
+      - id: openai_key
+        name: Check for OpenAI API key
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        shell: bash
+        run: |
+          if [[ -n "$OPENAI_API_KEY" ]]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "OPENAI_API_KEY is not configured; skipping Codex babysitter execution."
+          fi
+
       - name: Enable auto-merge when reviewer gates are already satisfied
         if: steps.state_before.outputs.ready_to_merge == 'true'
         shell: bash
         run: gh pr merge "$PR_NUMBER" --auto --squash --delete-branch
 
       - name: Setup Vite+
-        if: steps.state_before.outputs.ready_to_merge != 'true'
+        if: steps.state_before.outputs.ready_to_merge != 'true' && steps.openai_key.outputs.present == 'true'
         uses: voidzero-dev/setup-vp@v1
         with:
           node-version-file: package.json
@@ -67,7 +80,7 @@ jobs:
           run-install: true
 
       - name: Run Codex babysitter
-        if: steps.state_before.outputs.ready_to_merge != 'true'
+        if: steps.state_before.outputs.ready_to_merge != 'true' && steps.openai_key.outputs.present == 'true'
         uses: openai/codex-action@v1
         with:
           openai-api-key: ${{ secrets.OPENAI_API_KEY }}
@@ -77,7 +90,7 @@ jobs:
           output-file: codex-babysitter-output.md
 
       - name: Commit and push Codex changes
-        if: steps.state_before.outputs.ready_to_merge != 'true'
+        if: steps.state_before.outputs.ready_to_merge != 'true' && steps.openai_key.outputs.present == 'true'
         shell: bash
         run: |
           set -euo pipefail
@@ -90,7 +103,7 @@ jobs:
           git push
 
       - name: Ask reviewers to re-check
-        if: steps.state_before.outputs.ready_to_merge != 'true'
+        if: steps.state_before.outputs.ready_to_merge != 'true' && steps.openai_key.outputs.present == 'true'
         shell: bash
         run: |
           gh pr comment "$PR_NUMBER" --body $'@codex review\n\n@greptileai review'
