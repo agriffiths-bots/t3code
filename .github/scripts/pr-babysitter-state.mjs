@@ -19,6 +19,7 @@ query($owner: String!, $repo: String!, $number: Int!) {
   repository(owner: $owner, name: $repo) {
     pullRequest(number: $number) {
       isDraft
+      headRefOid
       mergeStateStatus
       reviewDecision
       comments(last: 100) {
@@ -36,6 +37,7 @@ query($owner: String!, $repo: String!, $number: Int!) {
           submittedAt
           updatedAt
           state
+          commit { oid }
           author { login }
         }
       }
@@ -84,10 +86,12 @@ const isCodex = (login) => codexAuthorLogins.has(login ?? "");
 const isGreptile = (login) => greptileAuthorLogins.has(login ?? "");
 const readGreptileScore = (body) => {
   const scoreMatch = body.match(
-    /\b(?:confidence\s+score|score|grade)\s*:?\s*(\d+(?:\.\d+)?)\s*(?:\/\s*5)?\b/i,
+    /\b(?:confidence\s+score|score|grade)\s*:?\s*(\d+(?:\.\d+)?)\s*\/\s*5\b/i,
   );
   return scoreMatch ? Number(scoreMatch[1]) : null;
 };
+const readReviewedCommit = (body) =>
+  body.match(/github\.com\/[^/]+\/[^/]+\/commit\/([0-9a-f]{7,40})/i)?.[1] ?? null;
 
 const unresolvedCodexThreads = pr.reviewThreads.nodes.filter(
   (thread) =>
@@ -98,25 +102,35 @@ const greptileSignals = [
   ...pr.comments.nodes
     .filter((comment) => isGreptile(comment.author?.login))
     .map((comment) => ({
+      kind: "comment",
       body: comment.body,
+      state: null,
       score: readGreptileScore(comment.body),
+      reviewedCommit: readReviewedCommit(comment.body),
       timestamp: Date.parse(comment.updatedAt ?? comment.createdAt ?? ""),
     })),
   ...pr.reviews.nodes
     .filter((review) => isGreptile(review.author?.login))
     .map((review) => ({
+      kind: "review",
       body: review.body,
+      state: review.state,
       score: readGreptileScore(review.body),
+      reviewedCommit: review.commit?.oid ?? readReviewedCommit(review.body),
       timestamp: Date.parse(review.updatedAt ?? review.submittedAt ?? review.createdAt ?? ""),
     })),
 ]
-  .filter((signal) => signal.body.trim().length > 0)
+  .filter((signal) => signal.body.trim().length > 0 || signal.state === "APPROVED")
   .map((signal) => ({
     ...signal,
     normalizedTimestamp: Number.isNaN(signal.timestamp) ? 0 : signal.timestamp,
   }));
 
-const latestScoredGreptileSignal = greptileSignals
+const currentGreptileSignals = greptileSignals.filter(
+  (signal) => signal.reviewedCommit === pr.headRefOid,
+);
+
+const latestScoredGreptileSignal = currentGreptileSignals
   .filter((signal) => signal.score !== null)
   .reduce(
     (latest, signal) =>
@@ -125,18 +139,23 @@ const latestScoredGreptileSignal = greptileSignals
   );
 
 const greptileScore = latestScoredGreptileSignal?.score ?? null;
-const greptilePassed = greptileScore !== null && greptileScore >= 5;
-const hasGreptileSignal = latestScoredGreptileSignal !== null;
+const greptileApproved = currentGreptileSignals.some(
+  (signal) => signal.kind === "review" && signal.state === "APPROVED",
+);
+const greptilePassed = greptileApproved || (greptileScore !== null && greptileScore >= 5);
+const hasGreptileSignal = currentGreptileSignals.length > 0;
 const readyToMerge =
   !pr.isDraft && unresolvedCodexThreads.length === 0 && hasGreptileSignal && greptilePassed;
 
 const summary = [
   `draft=${pr.isDraft}`,
+  `head=${pr.headRefOid}`,
   `mergeState=${pr.mergeStateStatus}`,
   `reviewDecision=${pr.reviewDecision ?? "UNKNOWN"}`,
   `unresolvedCodexThreads=${unresolvedCodexThreads.length}`,
   `greptileSignal=${hasGreptileSignal}`,
   `greptileScore=${greptileScore ?? "UNKNOWN"}`,
+  `greptileApproved=${greptileApproved}`,
   `greptilePassed=${greptilePassed}`,
 ].join(" ");
 
