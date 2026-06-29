@@ -199,21 +199,34 @@ describe("serializeRelayClientTracingEnvironment", () => {
   });
 });
 
-describe("release workflow tracing config propagation", () => {
-  it.effect("uses an artifact instead of a masked cross-job token output", () =>
+describe("artifact release workflows", () => {
+  it.effect("publish app artifacts without relay deployment", () =>
     Effect.gen(function* () {
       const fileSystem = yield* FileSystem.FileSystem;
       const path = yield* Path.Path;
-      const workflowPath = yield* path.fromFileUrl(
+      const stableWorkflowPath = yield* path.fromFileUrl(
         new URL("../../../.github/workflows/release.yml", import.meta.url),
       );
-      const workflow = yield* fileSystem.readFileString(workflowPath);
+      const mainWorkflowPath = yield* path.fromFileUrl(
+        new URL("../../../.github/workflows/main-artifacts-release.yml", import.meta.url),
+      );
+      const stableWorkflow = yield* fileSystem.readFileString(stableWorkflowPath);
+      const mainWorkflow = yield* fileSystem.readFileString(mainWorkflowPath);
 
-      expect(workflow).not.toContain("client_tracing_token:");
-      expect(workflow).not.toContain("needs.relay_public_config.outputs.client_tracing_token");
-      expect(workflow).toContain('--github-env-file "$RUNNER_TEMP/relay-client-tracing.env"');
-      expect(workflow).toContain("name: relay-client-tracing-config");
-      expect(workflow).toContain('cat "$config_path" >> "$GITHUB_ENV"');
+      for (const workflow of [stableWorkflow, mainWorkflow]) {
+        expect(workflow).toContain(
+          "uses: ./.github/workflows/reusable-build-release-artifacts.yml",
+        );
+        expect(workflow).not.toContain("relay_public_config");
+        expect(workflow).not.toContain("client_tracing_token:");
+        expect(workflow).not.toContain("deploy-relay");
+      }
+
+      expect(stableWorkflow).toContain("name: Stable Artifact Release");
+      expect(stableWorkflow).toContain("prerelease: false");
+      expect(stableWorkflow).toContain("make_latest: true");
+      expect(mainWorkflow).toContain("name: Main Artifact Release");
+      expect(mainWorkflow).toContain("prerelease: true");
     }).pipe(Effect.provide(NodeServices.layer)),
   );
 });

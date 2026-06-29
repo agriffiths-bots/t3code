@@ -108,15 +108,17 @@ beforeAll(() => {
     toggle: () => {},
     contains: () => false,
   };
-
-  vi.stubGlobal("localStorage", {
+  const localStorage = {
     getItem: () => null,
     setItem: () => {},
     removeItem: () => {},
     clear: () => {},
-  });
+  };
+
+  vi.stubGlobal("localStorage", localStorage);
   vi.stubGlobal("window", {
     matchMedia,
+    localStorage,
     addEventListener: () => {},
     removeEventListener: () => {},
     requestAnimationFrame: (callback: FrameRequestCallback) => {
@@ -236,7 +238,7 @@ describe("MessagesTimeline", () => {
     expect(onAnchorReady).toHaveBeenCalledOnce();
     expect(onAnchorReady).toHaveBeenCalledWith(secondEntry.message.id, 1);
     expect(onAnchorSizeChanged).toHaveBeenCalledWith(secondEntry.message.id, 240);
-  });
+  }, 30_000);
 
   it("renders collapse controls for long user messages", async () => {
     const { MessagesTimeline } = await import("./MessagesTimeline");

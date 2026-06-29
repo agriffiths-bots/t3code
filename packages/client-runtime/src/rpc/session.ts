@@ -54,7 +54,7 @@ type HeaderOptionsWebSocketConstructor = {
 function canPassWebSocketHeaderOptions() {
   const navigatorProduct = (globalThis.navigator as { readonly product?: string } | undefined)
     ?.product;
-  return navigatorProduct === "ReactNative" || typeof globalThis.window === "undefined";
+  return navigatorProduct === "ReactNative" || !("window" in globalThis);
 }
 
 function mapInitialConfigError(error: InitialConfigError): ConnectionAttemptError {
