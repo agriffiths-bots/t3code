@@ -24,12 +24,15 @@ jobs:
         run: |
           set -euo pipefail
 
-          allowed=",adamfgr,app/wizzoapp,wizzoapp[bot],wizzobot,wizzobot[bot],${ALLOWED_PR_AUTHORS:-},"
+          allowed="adamfgr,app/wizzoapp,wizzoapp[bot],wizzobot,wizzobot[bot],${ALLOWED_PR_AUTHORS:-}"
 
-          if [[ "$allowed" == *",$PR_AUTHOR,"* ]]; then
-            echo "PR author '$PR_AUTHOR' is allowed."
-            exit 0
-          fi
+          IFS=',' read -r -a allowed_authors <<< "$allowed"
+          for allowed_author in "${allowed_authors[@]}"; do
+            if [[ -n "$allowed_author" && "$PR_AUTHOR" == "$allowed_author" ]]; then
+              echo "PR author '$PR_AUTHOR' is allowed."
+              exit 0
+            fi
+          done
 
           echo "::warning::Closing PR #$PR_NUMBER from unauthorized author '$PR_AUTHOR'."
           gh pr close "$PR_NUMBER" --repo "$REPOSITORY"
