@@ -54,6 +54,11 @@ function resolveAppVariant(value: string | undefined): AppVariant {
 }
 
 const variant = VARIANT_CONFIG[APP_VARIANT];
+const firstNonEmpty = (...values: ReadonlyArray<string | undefined>): string | undefined =>
+  values.find((value) => value !== undefined && value.trim().length > 0);
+const easProjectId =
+  firstNonEmpty(repoEnv.EXPO_PROJECT_ID, repoEnv.EXPO_PUBLIC_EAS_PROJECT_ID) ??
+  "d763fcb8-d37c-41ea-a773-b54a0ab4a454";
 
 const config: ExpoConfig = {
   name: variant.appName,
@@ -69,7 +74,7 @@ const config: ExpoConfig = {
   userInterfaceStyle: "automatic",
   updates: {
     enabled: true,
-    url: "https://u.expo.dev/d763fcb8-d37c-41ea-a773-b54a0ab4a454",
+    url: firstNonEmpty(repoEnv.EXPO_UPDATES_URL) ?? `https://u.expo.dev/${easProjectId}`,
     checkAutomatically: "ON_LOAD",
     fallbackToCacheTimeout: 0,
   },
@@ -172,10 +177,10 @@ const config: ExpoConfig = {
       tracesToken: repoEnv.EXPO_PUBLIC_OTLP_TRACES_TOKEN ?? null,
     },
     eas: {
-      projectId: "d763fcb8-d37c-41ea-a773-b54a0ab4a454",
+      projectId: easProjectId,
     },
   },
-  owner: "pingdotgg",
+  owner: firstNonEmpty(repoEnv.EXPO_OWNER) ?? "pingdotgg",
 };
 
 export default config;

@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vite-plus/test";
 
 import {
+  buildPairingUrl,
   extractPairingUrlFromQrPayload,
   PairingQrPayloadEmptyError,
   parsePairingUrl,
@@ -38,6 +39,27 @@ describe("parsePairingUrl", () => {
     ).toEqual({
       host: "https://desktop.tailnet.ts.net",
       code: "pairing-token",
+      cloudflareAccessToken: "",
     });
+  });
+
+  it("keeps Cloudflare Access tokens separate from pairing codes", () => {
+    expect(
+      parsePairingUrl(
+        "https://remote.example.com/pair#token=pairing-token&cf_access_token=cf-access-jwt",
+      ),
+    ).toEqual({
+      host: "https://remote.example.com",
+      code: "pairing-token",
+      cloudflareAccessToken: "cf-access-jwt",
+    });
+  });
+});
+
+describe("buildPairingUrl", () => {
+  it("adds Cloudflare Access tokens as hidden fragment state", () => {
+    expect(buildPairingUrl("remote.example.com", "pairing-token", "cf-access-jwt")).toBe(
+      "https://remote.example.com/#token=pairing-token&cf_access_token=cf-access-jwt",
+    );
   });
 });

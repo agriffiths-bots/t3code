@@ -1,6 +1,7 @@
 import * as Schema from "effect/Schema";
 
 const PAIRING_TOKEN_PARAM = "token";
+const CLOUDFLARE_ACCESS_TOKEN_PARAM = "cf_access_token";
 const HOSTED_PAIRING_HOST_PARAM = "host";
 const HOSTED_PAIRING_LABEL_PARAM = "label";
 const SUPPORTED_REMOTE_BACKEND_PROTOCOLS = new Set(["http:", "https:", "ws:", "wss:"]);
@@ -133,6 +134,7 @@ export interface ResolvedRemotePairingTarget {
   readonly credential: string;
   readonly httpBaseUrl: string;
   readonly wsBaseUrl: string;
+  readonly cloudflareAccessToken?: string;
 }
 
 export interface HostedPairingRequest {
@@ -151,6 +153,16 @@ export const getPairingTokenFromUrl = (url: URL): string | null => {
   return searchToken.length > 0 ? searchToken : null;
 };
 
+export const getCloudflareAccessTokenFromUrl = (url: URL): string | null => {
+  const hashToken = readHashParams(url).get(CLOUDFLARE_ACCESS_TOKEN_PARAM)?.trim() ?? "";
+  if (hashToken.length > 0) {
+    return hashToken;
+  }
+
+  const searchToken = url.searchParams.get(CLOUDFLARE_ACCESS_TOKEN_PARAM)?.trim() ?? "";
+  return searchToken.length > 0 ? searchToken : null;
+};
+
 export const stripPairingTokenFromUrl = (url: URL): URL => {
   const next = new URL(url.toString());
   const hashParams = readHashParams(next);
@@ -158,7 +170,12 @@ export const stripPairingTokenFromUrl = (url: URL): URL => {
     hashParams.delete(PAIRING_TOKEN_PARAM);
     next.hash = hashParams.toString();
   }
+  if (hashParams.has(CLOUDFLARE_ACCESS_TOKEN_PARAM)) {
+    hashParams.delete(CLOUDFLARE_ACCESS_TOKEN_PARAM);
+    next.hash = hashParams.toString();
+  }
   next.searchParams.delete(PAIRING_TOKEN_PARAM);
+  next.searchParams.delete(CLOUDFLARE_ACCESS_TOKEN_PARAM);
   return next;
 };
 
@@ -204,6 +221,7 @@ export const resolveRemotePairingTarget = (input: {
       });
     }
     const hostedPairingRequest = readHostedPairingRequest(url);
+    const cloudflareAccessToken = getCloudflareAccessTokenFromUrl(url) ?? undefined;
     if (hostedPairingRequest) {
       const hostedBackendUrl = normalizeRemoteBaseUrl(
         hostedPairingRequest.host,
@@ -213,6 +231,7 @@ export const resolveRemotePairingTarget = (input: {
         credential: hostedPairingRequest.token,
         httpBaseUrl: toHttpBaseUrl(hostedBackendUrl),
         wsBaseUrl: toWsBaseUrl(hostedBackendUrl),
+        ...(cloudflareAccessToken ? { cloudflareAccessToken } : {}),
       };
     }
 
@@ -224,6 +243,7 @@ export const resolveRemotePairingTarget = (input: {
       credential,
       httpBaseUrl: toHttpBaseUrl(url),
       wsBaseUrl: toWsBaseUrl(url),
+      ...(cloudflareAccessToken ? { cloudflareAccessToken } : {}),
     };
   }
 

@@ -126,12 +126,16 @@ const makeBearerBroker = Effect.fn("clientRuntime.connection.broker.makeBearer")
       httpBaseUrl: profile.httpBaseUrl,
       wsBaseUrl: profile.wsBaseUrl,
       bearerToken: credential.token,
+      ...(credential.cloudflareAccessToken
+        ? { cloudflareAccess: { jwt: credential.cloudflareAccessToken } }
+        : {}),
     });
     return {
       environmentId: authorized.environmentId,
       label: authorized.label,
       httpBaseUrl: authorized.httpBaseUrl,
       socketUrl: authorized.socketUrl,
+      ...(authorized.socketHeaders ? { socketHeaders: authorized.socketHeaders } : {}),
       httpAuthorization: authorized.httpAuthorization,
       target,
     } satisfies PreparedConnection;
@@ -235,6 +239,7 @@ const makeSshBroker = Effect.fn("clientRuntime.connection.broker.makeSsh")(funct
       label: authorized.label,
       httpBaseUrl: authorized.httpBaseUrl,
       socketUrl: authorized.socketUrl,
+      ...(authorized.socketHeaders ? { socketHeaders: authorized.socketHeaders } : {}),
       httpAuthorization: authorized.httpAuthorization,
       target,
     } satisfies PreparedConnection;

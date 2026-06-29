@@ -2,6 +2,7 @@ import { readHostedPairingRequest } from "@t3tools/shared/remote";
 import * as Schema from "effect/Schema";
 
 const MOBILE_PAIRING_URL_PARAM = "pairingUrl";
+const CLOUDFLARE_ACCESS_TOKEN_PARAM = "cf_access_token";
 
 export class PairingQrPayloadEmptyError extends Schema.TaggedErrorClass<PairingQrPayloadEmptyError>()(
   "PairingQrPayloadEmptyError",
@@ -12,36 +13,53 @@ export class PairingQrPayloadEmptyError extends Schema.TaggedErrorClass<PairingQ
   }
 }
 
-export function buildPairingUrl(host: string, code: string): string {
+export function buildPairingUrl(
+  host: string,
+  code: string,
+  cloudflareAccessToken?: string,
+): string {
   const h = host.trim();
   const c = code.trim();
+  const cfAccessToken = cloudflareAccessToken?.trim() ?? "";
   if (!h) return "";
   if (!c) return h;
 
   try {
     const url = new URL(h.includes("://") ? h : `https://${h}`);
-    url.hash = new URLSearchParams([["token", c]]).toString();
+    url.hash = new URLSearchParams([
+      ["token", c],
+      ...(cfAccessToken.length > 0 ? [[CLOUDFLARE_ACCESS_TOKEN_PARAM, cfAccessToken]] : []),
+    ]).toString();
     return url.toString();
   } catch {
     return `${h}#token=${c}`;
   }
 }
 
-export function parsePairingUrl(url: string): { host: string; code: string } {
+export function parsePairingUrl(url: string): {
+  host: string;
+  code: string;
+  cloudflareAccessToken: string;
+} {
   const trimmed = url.trim();
-  if (!trimmed) return { host: "", code: "" };
+  if (!trimmed) return { host: "", code: "", cloudflareAccessToken: "" };
 
   try {
     const parsed = new URL(trimmed);
     const hostedPairingRequest = readHostedPairingRequest(parsed);
+    const hashParams = new URLSearchParams(parsed.hash.slice(1));
+    const cloudflareAccessToken =
+      hashParams.get(CLOUDFLARE_ACCESS_TOKEN_PARAM) ||
+      parsed.searchParams.get(CLOUDFLARE_ACCESS_TOKEN_PARAM) ||
+      "";
     if (hostedPairingRequest) {
       return {
         host: hostedPairingRequest.host.replace(/\/$/, ""),
         code: hostedPairingRequest.token,
+        cloudflareAccessToken,
       };
     }
 
-    const hashParams = new URLSearchParams(parsed.hash.slice(1));
     const hashToken = hashParams.get("token");
     const queryToken = parsed.searchParams.get("token");
     const code = hashToken || queryToken || "";
@@ -49,9 +67,9 @@ export function parsePairingUrl(url: string): { host: string; code: string } {
     parsed.hash = "";
     parsed.search = "";
     parsed.pathname = "/";
-    return { host: parsed.toString().replace(/\/$/, ""), code };
+    return { host: parsed.toString().replace(/\/$/, ""), code, cloudflareAccessToken };
   } catch {
-    return { host: trimmed, code: "" };
+    return { host: trimmed, code: "", cloudflareAccessToken: "" };
   }
 }
 

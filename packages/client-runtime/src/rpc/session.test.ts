@@ -12,6 +12,7 @@ import * as Layer from "effect/Layer";
 import * as Schema from "effect/Schema";
 import * as TestClock from "effect/testing/TestClock";
 import * as Socket from "effect/unstable/socket/Socket";
+import { afterEach, vi } from "vite-plus/test";
 
 import {
   ConnectionTransientError,
@@ -38,10 +39,14 @@ class TestWebSocket {
   readyState = TestWebSocket.CONNECTING;
   readonly sent: string[] = [];
   readonly url: string;
+  readonly protocols: string | string[] | undefined;
+  readonly options: unknown;
   private readonly listeners = new Map<SocketEventType, Set<SocketListener>>();
 
-  constructor(url: string) {
+  constructor(url: string, protocols?: string | string[], options?: unknown) {
     this.url = url;
+    this.protocols = protocols;
+    this.options = options;
   }
 
   addEventListener(type: SocketEventType, listener: SocketListener) {
@@ -144,14 +149,25 @@ const encodeServerConfig = Schema.encodeSync(ServerConfig);
 
 const makeFactory = Effect.fn("TestRpcSessionFactory.make")(function* () {
   const sockets: TestWebSocket[] = [];
-  const constructorLayer = Layer.succeed(Socket.WebSocketConstructor, (url) => {
-    const socket = new TestWebSocket(url);
+  function TestWebSocketConstructor(url: string, protocols?: string | string[], options?: unknown) {
+    const socket = new TestWebSocket(url, protocols, options);
     sockets.push(socket);
     return socket as unknown as globalThis.WebSocket;
-  });
+  }
+  const constructorLayer = Layer.succeed(
+    Socket.WebSocketConstructor,
+    TestWebSocketConstructor as unknown as (
+      url: string,
+      protocols?: string | string[],
+    ) => globalThis.WebSocket,
+  );
   const layer = RpcSession.layer.pipe(Layer.provide(constructorLayer));
   const factory = yield* RpcSession.RpcSessionFactory.pipe(Effect.provide(layer));
   return { factory, sockets };
+});
+
+afterEach(() => {
+  vi.unstubAllGlobals();
 });
 
 const awaitSocket = Effect.fn("TestRpcSessionFactory.awaitSocket")(function* (
@@ -228,6 +244,55 @@ describe("RpcSessionFactory", () => {
       });
       yield* Effect.yieldNow;
       expect(sockets).toHaveLength(1);
+    }),
+  );
+
+  it.effect("passes prepared socket headers to React Native websocket constructors", () =>
+    Effect.gen(function* () {
+      vi.stubGlobal("window", {});
+      vi.stubGlobal("navigator", { product: "ReactNative" });
+      const { factory, sockets } = yield* makeFactory();
+      const session = yield* factory.connect({
+        ...PREPARED,
+        socketHeaders: {
+          "cf-access-jwt-assertion": "cf-access-jwt",
+          cookie: "CF_Authorization=cf-access-jwt",
+        },
+      });
+      const readyFiber = yield* Effect.forkChild(session.ready);
+      const socket = yield* awaitSocket(sockets);
+
+      expect(socket.options).toEqual({
+        headers: {
+          "cf-access-jwt-assertion": "cf-access-jwt",
+          cookie: "CF_Authorization=cf-access-jwt",
+        },
+      });
+      socket.open();
+      yield* completeInitialConfig(socket);
+      yield* Fiber.join(readyFiber);
+    }),
+  );
+
+  it.effect("uses browser websocket constructors without non-standard header options", () =>
+    Effect.gen(function* () {
+      vi.stubGlobal("window", {});
+      vi.stubGlobal("navigator", { product: "Gecko" });
+      const { factory, sockets } = yield* makeFactory();
+      const session = yield* factory.connect({
+        ...PREPARED,
+        socketHeaders: {
+          "cf-access-jwt-assertion": "cf-access-jwt",
+          cookie: "CF_Authorization=cf-access-jwt",
+        },
+      });
+      const readyFiber = yield* Effect.forkChild(session.ready);
+      const socket = yield* awaitSocket(sockets);
+
+      expect(socket.options).toBeUndefined();
+      socket.open();
+      yield* completeInitialConfig(socket);
+      yield* Fiber.join(readyFiber);
     }),
   );
 

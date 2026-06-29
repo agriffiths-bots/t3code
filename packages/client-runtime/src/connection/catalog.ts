@@ -45,6 +45,7 @@ export class BearerConnectionCredential extends Schema.TaggedClass<BearerConnect
   "BearerConnectionCredential",
   {
     token: Schema.String,
+    cloudflareAccessToken: Schema.optionalKey(Schema.String),
   },
 ) {}
 

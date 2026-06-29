@@ -1,0 +1,246 @@
+name: Reusable Build Release Artifacts
+
+on:
+  workflow_call:
+    inputs:
+      ref:
+        description: "Git ref or SHA to build"
+        required: true
+        type: string
+      release_tag:
+        description: "GitHub Release tag to create or update"
+        required: true
+        type: string
+      release_name:
+        description: "GitHub Release display name"
+        required: true
+        type: string
+      release_version:
+        description: "Application version passed into packaged artifacts"
+        required: true
+        type: string
+      prerelease:
+        description: "Whether the GitHub Release is a prerelease"
+        required: false
+        default: true
+        type: boolean
+    secrets:
+      EXPO_TOKEN:
+        description: "Expo token used for non-interactive EAS APK builds"
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  android_apk:
+    name: Build Android APK
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      APP_VARIANT: preview
+      MOBILE_VERSION_POLICY: fingerprint
+      NODE_OPTIONS: --max-old-space-size=8192
+      EXPO_OWNER: ${{ vars.EXPO_OWNER }}
+      EXPO_PROJECT_ID: ${{ vars.EXPO_PROJECT_ID }}
+      EXPO_UPDATES_URL: ${{ vars.EXPO_UPDATES_URL }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.ref }}
+          fetch-depth: 0
+
+      - name: Setup Vite+
+        uses: voidzero-dev/setup-vp@v1
+        with:
+          node-version-file: package.json
+          cache: true
+          run-install: true
+
+      - name: Expose pnpm
+        shell: bash
+        run: |
+          pnpm_version="$(node --print "require('./package.json').packageManager.split('@').pop()")"
+          vp_pnpm_bin="$HOME/.vite-plus/package_manager/pnpm/$pnpm_version/pnpm/bin"
+          echo "$vp_pnpm_bin" >> "$GITHUB_PATH"
+          "$vp_pnpm_bin/pnpm" --version
+
+      - name: Setup EAS
+        uses: expo/expo-github-action@v8
+        with:
+          eas-version: latest
+          token: ${{ secrets.EXPO_TOKEN }}
+          packager: pnpm
+
+      - name: Pull preview environment variables
+        working-directory: apps/mobile
+        env:
+          EXPO_TOKEN: ${{ secrets.EXPO_TOKEN }}
+        run: eas env:pull preview --non-interactive
+
+      - name: Build APK with EAS
+        working-directory: apps/mobile
+        env:
+          EXPO_TOKEN: ${{ secrets.EXPO_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          eas build --profile preview --platform android --non-interactive --wait --json > eas-build.json
+          node - <<'NODE'
+          const fs = require("node:fs");
+          const path = require("node:path");
+          const parsed = JSON.parse(fs.readFileSync("eas-build.json", "utf8"));
+          const build = Array.isArray(parsed) ? parsed[0] : parsed;
+          const url =
+            build?.artifacts?.buildUrl ??
+            build?.artifacts?.applicationArchiveUrl ??
+            build?.artifactUrl ??
+            build?.url;
+          if (!url) {
+            console.error(JSON.stringify(parsed, null, 2));
+            throw new Error("EAS build output did not include a downloadable APK URL.");
+          }
+          fs.mkdirSync(path.resolve("release-assets"), { recursive: true });
+          fs.writeFileSync(path.resolve("release-assets", "apk-url.txt"), `${url}\n`);
+          NODE
+          apk_url="$(cat release-assets/apk-url.txt)"
+          curl --fail --location "$apk_url" --output "release-assets/t3-code-preview-android.apk"
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: android-apk
+          path: apps/mobile/release-assets/*
+          if-no-files-found: error
+
+  build_wsl_node_pty:
+    name: Build WSL node-pty linux-x64
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.ref }}
+          fetch-depth: 0
+
+      - name: Setup Vite+
+        uses: voidzero-dev/setup-vp@v1
+        with:
+          node-version-file: package.json
+          cache: true
+          run-install: true
+
+      - name: Build node-pty linux-x64 prebuild
+        shell: bash
+        run: |
+          set -euo pipefail
+          pty_pkg="$(node -e "console.log(require.resolve('node-pty/package.json', { paths: ['$GITHUB_WORKSPACE/apps/server'] }))")"
+          pty_dir="$(dirname "$pty_pkg")"
+          ( cd "$pty_dir" && npx --yes node-gyp rebuild )
+          mkdir -p wsl-prebuild
+          cp "$pty_dir/build/Release/pty.node" wsl-prebuild/pty.node
+          file wsl-prebuild/pty.node
+
+      - name: Upload node-pty prebuild
+        uses: actions/upload-artifact@v7
+        with:
+          name: wsl-node-pty-x64
+          path: wsl-prebuild/pty.node
+          if-no-files-found: error
+
+  windows_x64:
+    name: Build Windows x64
+    needs: build_wsl_node_pty
+    runs-on: windows-2025
+    timeout-minutes: 45
+    env:
+      T3CODE_CLERK_PUBLISHABLE_KEY: ${{ vars.CLERK_PUBLISHABLE_KEY }}
+      T3CODE_CLERK_JWT_TEMPLATE: ${{ vars.CLERK_JWT_TEMPLATE }}
+      T3CODE_CLERK_CLI_OAUTH_CLIENT_ID: ${{ vars.CLERK_CLI_OAUTH_CLIENT_ID }}
+      T3CODE_RELAY_URL: ${{ vars.T3CODE_RELAY_URL }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.ref }}
+          fetch-depth: 0
+
+      - name: Setup Vite+
+        uses: voidzero-dev/setup-vp@v1
+        with:
+          node-version-file: package.json
+          cache: true
+          run-install: true
+
+      - name: Download WSL node-pty prebuild
+        uses: actions/download-artifact@v7
+        with:
+          name: wsl-node-pty-x64
+          path: wsl-prebuild
+
+      - name: Ensure Electron runtime is installed
+        run: vp run --filter @t3tools/desktop ensure:electron
+
+      - name: Build Windows desktop artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          vp run dist:desktop:artifact \
+            --platform win \
+            --target nsis \
+            --arch x64 \
+            --build-version "${{ inputs.release_version }}" \
+            --wsl-prebuild "$GITHUB_WORKSPACE/wsl-prebuild/pty.node" \
+            --verbose
+
+      - name: Collect Windows release assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release-publish
+          shopt -s nullglob
+          for pattern in "release/*.exe" "release/*.blockmap" "release/*.yml"; do
+            for file in $pattern; do
+              cp "$file" release-publish/
+            done
+          done
+
+      - name: Upload Windows artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: windows-x64
+          path: release-publish/*
+          if-no-files-found: error
+
+  publish_release:
+    name: Publish GitHub Release
+    needs: [android_apk, windows_x64]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Download release assets
+        uses: actions/download-artifact@v7
+        with:
+          pattern: "*"
+          merge-multiple: true
+          path: release-assets
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.release_tag }}
+          target_commitish: ${{ inputs.ref }}
+          name: ${{ inputs.release_name }}
+          prerelease: ${{ inputs.prerelease }}
+          make_latest: false
+          files: |
+            release-assets/*.apk
+            release-assets/*.exe
+            release-assets/*.blockmap
+            release-assets/*.yml
+          fail_on_unmatched_files: true
+          token: ${{ github.token }}

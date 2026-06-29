@@ -33,6 +33,20 @@ describe("remote", () => {
     });
   });
 
+  it("carries Cloudflare Access tokens from pairing urls", () => {
+    expect(
+      resolveRemotePairingTarget({
+        pairingUrl:
+          "https://remote.example.com/pair#token=pairing-token&cf_access_token=cloudflare-jwt",
+      }),
+    ).toMatchObject({
+      credential: "pairing-token",
+      cloudflareAccessToken: "cloudflare-jwt",
+      httpBaseUrl: "https://remote.example.com/",
+      wsBaseUrl: "wss://remote.example.com/",
+    });
+  });
+
   it("derives backend urls from hosted app pairing links", () => {
     expect(
       resolveRemotePairingTarget({
