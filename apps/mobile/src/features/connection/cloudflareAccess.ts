@@ -69,31 +69,37 @@ function extractJwtFromResponse(body: string): string {
   throw new CloudflareAccessLoginError("Cloudflare Access did not return a usable JWT.");
 }
 
-function parseAccessAudience(locationHeader: string | null): string {
+export function parseAccessAudienceFromLocation(
+  locationHeader: string | null,
+  baseUrl: string,
+): string | null {
   if (!locationHeader) {
-    throw new CloudflareAccessLoginError(
-      "Could not discover the Cloudflare Access application audience.",
-    );
+    return null;
   }
-  const location = new URL(locationHeader);
+  const location = new URL(locationHeader, baseUrl);
   const aud = location.searchParams.get("kid") ?? location.searchParams.get("aud") ?? "";
   if (aud.length === 0) {
-    throw new CloudflareAccessLoginError(
-      "Cloudflare Access login challenge did not include an application audience.",
-    );
+    return null;
   }
   return aud;
 }
 
 async function discoverAccessAudience(origin: string): Promise<string> {
   const response = await fetch(origin, { method: "HEAD", redirect: "manual" });
+  const aud = parseAccessAudienceFromLocation(response.headers.get("location"), origin);
+  if (aud) {
+    return aud;
+  }
+
   const authenticate = response.headers.get("www-authenticate") ?? "";
   if (!authenticate.toLowerCase().includes("cloudflare-access")) {
     throw new CloudflareAccessLoginError(
       "This host did not return a Cloudflare Access login challenge.",
     );
   }
-  return parseAccessAudience(response.headers.get("location"));
+  throw new CloudflareAccessLoginError(
+    "Cloudflare Access login challenge did not include an application audience.",
+  );
 }
 
 function buildLoginUrl(input: {
