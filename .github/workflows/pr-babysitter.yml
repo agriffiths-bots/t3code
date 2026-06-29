@@ -38,21 +38,46 @@ jobs:
           ISSUE_COMMENT_BODY: ${{ github.event.comment.body }}
           REVIEW_PR_NUMBER: ${{ github.event.pull_request.number }}
           REVIEW_AUTHOR: ${{ github.event.review.user.login }}
+          REVIEW_HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          REPOSITORY: ${{ github.repository }}
+          REPOSITORY_OWNER: ${{ github.repository_owner }}
+          COMMENT_AUTHOR: ${{ github.event.comment.user.login }}
+          COMMENT_AUTHOR_ASSOCIATION: ${{ github.event.comment.author_association }}
+          TRUSTED_BABYSITTER_ACTORS: ${{ vars.CODEX_BABYSITTER_ACTORS }}
         run: |
           set -euo pipefail
           should_run=false
           pr_number=""
+          trusted_actors=",${TRUSTED_BABYSITTER_ACTORS:-},$REPOSITORY_OWNER,wizzoapp[bot],"
+
+          actor_is_trusted() {
+            local actor="$1"
+            local association="$2"
+
+            if [[ -n "$actor" && "$trusted_actors" == *",$actor,"* ]]; then
+              return 0
+            fi
+
+            case "$association" in
+              OWNER|MEMBER|COLLABORATOR)
+                return 0
+                ;;
+              *)
+                return 1
+                ;;
+            esac
+          }
 
           if [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
             should_run=true
             pr_number="$DISPATCH_PR"
           elif [[ "$EVENT_NAME" == "issue_comment" && -n "${ISSUE_PR_URL:-}" ]]; then
-            if [[ "$ISSUE_COMMENT_BODY" == *"/codex-babysit"* ]]; then
+            if [[ "$ISSUE_COMMENT_BODY" == *"/codex-babysit"* ]] && actor_is_trusted "$COMMENT_AUTHOR" "$COMMENT_AUTHOR_ASSOCIATION"; then
               should_run=true
               pr_number="$ISSUE_NUMBER"
             fi
           elif [[ "$EVENT_NAME" == "pull_request_review" ]]; then
-            if [[ "$REVIEW_AUTHOR" =~ [Cc]odex|[Gg]reptile ]]; then
+            if [[ "$REVIEW_HEAD_REPO" == "$REPOSITORY" && "$REVIEW_AUTHOR" =~ [Cc]odex|[Gg]reptile ]]; then
               should_run=true
               pr_number="$REVIEW_PR_NUMBER"
             fi

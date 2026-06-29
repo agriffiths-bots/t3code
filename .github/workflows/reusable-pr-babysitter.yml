@@ -30,6 +30,8 @@ jobs:
     env:
       GH_TOKEN: ${{ secrets.WIZZOAPP_GITHUB_TOKEN || github.token }}
       PR_NUMBER: ${{ inputs.pr_number }}
+      CODEX_BABYSITTER_GIT_NAME: ${{ vars.CODEX_BABYSITTER_GIT_NAME }}
+      CODEX_BABYSITTER_GIT_EMAIL: ${{ vars.CODEX_BABYSITTER_GIT_EMAIL }}
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -45,9 +47,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          login="$(gh api user --jq .login)"
-          git config user.name "$login"
-          git config user.email "$login@users.noreply.github.com"
+          git config user.name "${CODEX_BABYSITTER_GIT_NAME:-wizzoapp[bot]}"
+          git config user.email "${CODEX_BABYSITTER_GIT_EMAIL:-254688279+wizzoapp[bot]@users.noreply.github.com}"
 
       - id: state_before
         name: Read reviewer state
@@ -71,6 +72,20 @@ jobs:
         shell: bash
         run: gh pr merge "$PR_NUMBER" --auto --squash --delete-branch
 
+      - id: base_prompt
+        name: Read Codex prompt from base branch
+        if: steps.state_before.outputs.ready_to_merge != 'true' && steps.openai_key.outputs.present == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          base_ref="$(gh pr view "$PR_NUMBER" --json baseRefName --jq .baseRefName)"
+          prompt_dir="$RUNNER_TEMP/codex-babysitter"
+          prompt_path="$prompt_dir/pr-babysit.md"
+          mkdir -p "$prompt_dir"
+          git fetch origin "$base_ref" --depth=1
+          git show "origin/$base_ref:.github/codex/prompts/pr-babysit.md" > "$prompt_path"
+          echo "path=$prompt_path" >> "$GITHUB_OUTPUT"
+
       - name: Setup Vite+
         if: steps.state_before.outputs.ready_to_merge != 'true' && steps.openai_key.outputs.present == 'true'
         uses: voidzero-dev/setup-vp@v1
@@ -84,7 +99,7 @@ jobs:
         uses: openai/codex-action@v1
         with:
           openai-api-key: ${{ secrets.OPENAI_API_KEY }}
-          prompt-file: .github/codex/prompts/pr-babysit.md
+          prompt-file: ${{ steps.base_prompt.outputs.path }}
           sandbox: workspace-write
           codex-args: '["--full-auto"]'
           output-file: codex-babysitter-output.md
