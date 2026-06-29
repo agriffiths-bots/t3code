@@ -1,0 +1,41 @@
+name: Main Artifact Release
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: write
+
+jobs:
+  metadata:
+    name: Resolve release metadata
+    runs-on: ubuntu-24.04
+    outputs:
+      release_tag: ${{ steps.meta.outputs.release_tag }}
+      release_name: ${{ steps.meta.outputs.release_name }}
+      release_version: ${{ steps.meta.outputs.release_version }}
+    steps:
+      - id: meta
+        name: Resolve main prerelease version
+        shell: bash
+        run: |
+          set -euo pipefail
+          short_sha="${GITHUB_SHA::7}"
+          date_part="$(date -u -d "${{ github.event.head_commit.timestamp }}" +%Y%m%d%H%M%S)"
+          echo "release_tag=main-${date_part}-${short_sha}" >> "$GITHUB_OUTPUT"
+          echo "release_name=T3 Code main ${short_sha}" >> "$GITHUB_OUTPUT"
+          echo "release_version=0.0.0-main.${{ github.run_number }}" >> "$GITHUB_OUTPUT"
+
+  publish_artifacts:
+    name: Build and publish artifacts
+    needs: metadata
+    uses: ./.github/workflows/reusable-build-release-artifacts.yml
+    with:
+      ref: ${{ github.sha }}
+      release_tag: ${{ needs.metadata.outputs.release_tag }}
+      release_name: ${{ needs.metadata.outputs.release_name }}
+      release_version: ${{ needs.metadata.outputs.release_version }}
+      prerelease: true
+    secrets: inherit

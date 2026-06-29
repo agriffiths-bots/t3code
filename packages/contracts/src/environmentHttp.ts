@@ -43,10 +43,14 @@ import {
 
 const OptionalBearerHeaders = Schema.Struct({
   authorization: Schema.optionalKey(Schema.String),
+  "cf-access-jwt-assertion": Schema.optionalKey(Schema.String),
+  cookie: Schema.optionalKey(Schema.String),
   dpop: Schema.optionalKey(Schema.String),
 });
 
 const OptionalDpopProofHeaders = Schema.Struct({
+  "cf-access-jwt-assertion": Schema.optionalKey(Schema.String),
+  cookie: Schema.optionalKey(Schema.String),
   dpop: Schema.optionalKey(Schema.String),
 });
 
@@ -342,6 +346,7 @@ export type AuthOtherClientSessionsRevokeResult = typeof AuthOtherClientSessions
 
 export class EnvironmentMetadataHttpApi extends HttpApiGroup.make("metadata").add(
   HttpApiEndpoint.get("descriptor", "/.well-known/t3/environment", {
+    headers: OptionalBearerHeaders,
     success: ExecutionEnvironmentDescriptor,
   }),
 ) {}

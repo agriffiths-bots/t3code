@@ -91,9 +91,22 @@ export const make = Effect.gen(function* () {
         Effect.asVoid,
       ),
     });
+    const socketHeaders = connection.socketHeaders;
+    const socketConstructor =
+      socketHeaders === undefined
+        ? webSocketConstructor
+        : (((url: string | URL, protocols?: string | string[]) =>
+            new (webSocketConstructor as unknown as {
+              new (
+                url: string | URL,
+                protocols?: string | string[],
+                options?: { readonly headers?: Readonly<Record<string, string>> },
+              ): globalThis.WebSocket;
+            })(url, protocols, { headers: socketHeaders })) as typeof webSocketConstructor);
+
     const socketLayer = Socket.layerWebSocket(connection.socketUrl, {
       openTimeout: SOCKET_OPEN_TIMEOUT,
-    }).pipe(Layer.provide(Layer.succeed(Socket.WebSocketConstructor, webSocketConstructor)));
+    }).pipe(Layer.provide(Layer.succeed(Socket.WebSocketConstructor, socketConstructor)));
     const protocolLayer = Layer.effect(
       RpcClient.Protocol,
       RpcClient.makeProtocolSocket({

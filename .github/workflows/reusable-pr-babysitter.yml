@@ -1,0 +1,104 @@
+name: Reusable PR Babysitter
+
+on:
+  workflow_call:
+    inputs:
+      pr_number:
+        description: "Pull request number to maintain"
+        required: true
+        type: number
+    secrets:
+      OPENAI_API_KEY:
+        description: "OpenAI API key used by openai/codex-action"
+        required: true
+      WIZZOAPP_GITHUB_TOKEN:
+        description: "Optional WizzoApp token used to push babysitter commits"
+        required: false
+
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+  actions: read
+  checks: read
+
+jobs:
+  babysit:
+    name: Babysit PR #${{ inputs.pr_number }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      GH_TOKEN: ${{ secrets.WIZZOAPP_GITHUB_TOKEN || github.token }}
+      PR_NUMBER: ${{ inputs.pr_number }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.WIZZOAPP_GITHUB_TOKEN || github.token }}
+
+      - name: Checkout PR branch
+        shell: bash
+        run: gh pr checkout "$PR_NUMBER"
+
+      - name: Configure git identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          login="$(gh api user --jq .login)"
+          git config user.name "$login"
+          git config user.email "$login@users.noreply.github.com"
+
+      - id: state_before
+        name: Read reviewer state
+        run: node .github/scripts/pr-babysitter-state.mjs
+
+      - name: Enable auto-merge when reviewer gates are already satisfied
+        if: steps.state_before.outputs.ready_to_merge == 'true'
+        shell: bash
+        run: gh pr merge "$PR_NUMBER" --auto --squash --delete-branch
+
+      - name: Setup Vite+
+        if: steps.state_before.outputs.ready_to_merge != 'true'
+        uses: voidzero-dev/setup-vp@v1
+        with:
+          node-version-file: package.json
+          cache: true
+          run-install: true
+
+      - name: Run Codex babysitter
+        if: steps.state_before.outputs.ready_to_merge != 'true'
+        uses: openai/codex-action@v1
+        with:
+          openai-api-key: ${{ secrets.OPENAI_API_KEY }}
+          prompt-file: .github/codex/prompts/pr-babysit.md
+          sandbox: workspace-write
+          codex-args: '["--full-auto"]'
+          output-file: codex-babysitter-output.md
+
+      - name: Commit and push Codex changes
+        if: steps.state_before.outputs.ready_to_merge != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          if git diff --quiet && git diff --cached --quiet; then
+            echo "No changes to commit."
+            exit 0
+          fi
+          git add -A
+          git commit -m "fix: address automated review feedback"
+          git push
+
+      - name: Ask reviewers to re-check
+        if: steps.state_before.outputs.ready_to_merge != 'true'
+        shell: bash
+        run: |
+          gh pr comment "$PR_NUMBER" --body $'@codex review\n\n@greptileai review'
+
+      - name: Upload Codex babysitter output
+        if: always() && steps.state_before.outputs.ready_to_merge != 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: codex-babysitter-output-${{ inputs.pr_number }}
+          path: codex-babysitter-output.md
+          if-no-files-found: ignore

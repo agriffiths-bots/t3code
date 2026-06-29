@@ -24,6 +24,23 @@ export type RemoteEnvironmentAuthError = RemoteEnvironmentRequestError;
 
 const DEFAULT_REMOTE_REQUEST_TIMEOUT_MS = 10_000;
 
+export interface CloudflareAccessAuthorization {
+  readonly jwt: string;
+}
+
+export const cloudflareAccessHeaders = (
+  authorization: CloudflareAccessAuthorization | undefined,
+): Record<string, string> => {
+  const jwt = authorization?.jwt.trim() ?? "";
+  if (jwt.length === 0) {
+    return {};
+  }
+  return {
+    "cf-access-jwt-assertion": jwt,
+    cookie: `CF_Authorization=${jwt}`,
+  };
+};
+
 const clientMetadataTokenExchangeFields = (
   clientMetadata: AuthClientPresentationMetadata | undefined,
 ) => ({
@@ -40,6 +57,7 @@ export const exchangeRemoteDpopAccessToken = Effect.fn(
   readonly scopes?: ReadonlyArray<AuthEnvironmentScope>;
   readonly clientMetadata?: AuthClientPresentationMetadata;
   readonly dpopProof: string;
+  readonly cloudflareAccess?: CloudflareAccessAuthorization;
   readonly timeoutMs?: number;
 }) {
   const client = yield* makeEnvironmentHttpApiClient(input.httpBaseUrl);
@@ -47,7 +65,7 @@ export const exchangeRemoteDpopAccessToken = Effect.fn(
     environmentEndpointUrl(input.httpBaseUrl, "/oauth/token"),
     input.timeoutMs ?? DEFAULT_REMOTE_REQUEST_TIMEOUT_MS,
     client.auth.token({
-      headers: { dpop: input.dpopProof },
+      headers: { ...cloudflareAccessHeaders(input.cloudflareAccess), dpop: input.dpopProof },
       payload: {
         grant_type: AuthTokenExchangeGrantType,
         subject_token: input.credential,
@@ -68,6 +86,7 @@ export const bootstrapRemoteBearerSession = Effect.fn(
   readonly credential: string;
   readonly scopes?: ReadonlyArray<AuthEnvironmentScope>;
   readonly clientMetadata?: AuthClientPresentationMetadata;
+  readonly cloudflareAccess?: CloudflareAccessAuthorization;
   readonly timeoutMs?: number;
 }) {
   const client = yield* makeEnvironmentHttpApiClient(input.httpBaseUrl);
@@ -75,7 +94,7 @@ export const bootstrapRemoteBearerSession = Effect.fn(
     environmentEndpointUrl(input.httpBaseUrl, "/oauth/token"),
     input.timeoutMs ?? DEFAULT_REMOTE_REQUEST_TIMEOUT_MS,
     client.auth.token({
-      headers: {},
+      headers: cloudflareAccessHeaders(input.cloudflareAccess),
       payload: {
         grant_type: AuthTokenExchangeGrantType,
         subject_token: input.credential,
@@ -93,6 +112,7 @@ export const fetchRemoteSessionState = Effect.fn(
 )(function* (input: {
   readonly httpBaseUrl: string;
   readonly bearerToken: string;
+  readonly cloudflareAccess?: CloudflareAccessAuthorization;
   readonly timeoutMs?: number;
 }) {
   const client = yield* makeEnvironmentHttpApiClient(input.httpBaseUrl);
@@ -101,6 +121,7 @@ export const fetchRemoteSessionState = Effect.fn(
     input.timeoutMs ?? DEFAULT_REMOTE_REQUEST_TIMEOUT_MS,
     client.auth.session({
       headers: {
+        ...cloudflareAccessHeaders(input.cloudflareAccess),
         authorization: `Bearer ${input.bearerToken}`,
       },
     }),
@@ -113,6 +134,7 @@ export const fetchRemoteDpopSessionState = Effect.fn(
   readonly httpBaseUrl: string;
   readonly accessToken: string;
   readonly dpopProof: string;
+  readonly cloudflareAccess?: CloudflareAccessAuthorization;
   readonly timeoutMs?: number;
 }) {
   const client = yield* makeEnvironmentHttpApiClient(input.httpBaseUrl);
@@ -121,6 +143,7 @@ export const fetchRemoteDpopSessionState = Effect.fn(
     input.timeoutMs ?? DEFAULT_REMOTE_REQUEST_TIMEOUT_MS,
     client.auth.session({
       headers: {
+        ...cloudflareAccessHeaders(input.cloudflareAccess),
         authorization: `DPoP ${input.accessToken}`,
         dpop: input.dpopProof,
       },
@@ -133,6 +156,7 @@ export const issueRemoteWebSocketTicket = Effect.fn(
 )(function* (input: {
   readonly httpBaseUrl: string;
   readonly bearerToken: string;
+  readonly cloudflareAccess?: CloudflareAccessAuthorization;
   readonly timeoutMs?: number;
 }) {
   const client = yield* makeEnvironmentHttpApiClient(input.httpBaseUrl);
@@ -141,6 +165,7 @@ export const issueRemoteWebSocketTicket = Effect.fn(
     input.timeoutMs ?? DEFAULT_REMOTE_REQUEST_TIMEOUT_MS,
     client.auth.webSocketTicket({
       headers: {
+        ...cloudflareAccessHeaders(input.cloudflareAccess),
         authorization: `Bearer ${input.bearerToken}`,
       },
     }),
@@ -153,6 +178,7 @@ export const issueRemoteDpopWebSocketTicket = Effect.fn(
   readonly httpBaseUrl: string;
   readonly accessToken: string;
   readonly dpopProof: string;
+  readonly cloudflareAccess?: CloudflareAccessAuthorization;
   readonly timeoutMs?: number;
 }) {
   const client = yield* makeEnvironmentHttpApiClient(input.httpBaseUrl);
@@ -161,6 +187,7 @@ export const issueRemoteDpopWebSocketTicket = Effect.fn(
     input.timeoutMs ?? DEFAULT_REMOTE_REQUEST_TIMEOUT_MS,
     client.auth.webSocketTicket({
       headers: {
+        ...cloudflareAccessHeaders(input.cloudflareAccess),
         authorization: `DPoP ${input.accessToken}`,
         dpop: input.dpopProof,
       },
@@ -174,11 +201,13 @@ export const resolveRemoteWebSocketConnectionUrl = Effect.fn(
   readonly wsBaseUrl: string;
   readonly httpBaseUrl: string;
   readonly bearerToken: string;
+  readonly cloudflareAccess?: CloudflareAccessAuthorization;
   readonly timeoutMs?: number;
 }) {
   const issued = yield* issueRemoteWebSocketTicket({
     httpBaseUrl: input.httpBaseUrl,
     bearerToken: input.bearerToken,
+    ...(input.cloudflareAccess ? { cloudflareAccess: input.cloudflareAccess } : {}),
     ...(input.timeoutMs ? { timeoutMs: input.timeoutMs } : {}),
   });
 
@@ -197,12 +226,14 @@ export const resolveRemoteDpopWebSocketConnectionUrl = Effect.fn(
   readonly httpBaseUrl: string;
   readonly accessToken: string;
   readonly dpopProof: string;
+  readonly cloudflareAccess?: CloudflareAccessAuthorization;
   readonly timeoutMs?: number;
 }) {
   const issued = yield* issueRemoteDpopWebSocketTicket({
     httpBaseUrl: input.httpBaseUrl,
     accessToken: input.accessToken,
     dpopProof: input.dpopProof,
+    ...(input.cloudflareAccess ? { cloudflareAccess: input.cloudflareAccess } : {}),
     ...(input.timeoutMs ? { timeoutMs: input.timeoutMs } : {}),
   });
   const url = new URL(input.wsBaseUrl);

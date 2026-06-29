@@ -88,14 +88,18 @@ export const preparePairingRegistration = Effect.fn(
 )(function* (input: PairingConnectionInput) {
   const target = yield* resolvePairingTarget(input);
   const presentation = yield* ClientCapabilities.ClientPresentation;
+  const cloudflareAccess =
+    target.cloudflareAccessToken === undefined ? undefined : { jwt: target.cloudflareAccessToken };
   const descriptor = yield* fetchRemoteEnvironmentDescriptor({
     httpBaseUrl: target.httpBaseUrl,
+    ...(cloudflareAccess ? { cloudflareAccess } : {}),
   }).pipe(Effect.mapError(mapRemoteEnvironmentError));
   const access = yield* bootstrapRemoteBearerSession({
     httpBaseUrl: target.httpBaseUrl,
     credential: target.credential,
     scopes: presentation.scopes,
     clientMetadata: presentation.metadata,
+    ...(cloudflareAccess ? { cloudflareAccess } : {}),
   }).pipe(Effect.mapError(mapRemoteEnvironmentError));
   const connectionId = `bearer:${descriptor.environmentId}`;
 
@@ -114,6 +118,9 @@ export const preparePairingRegistration = Effect.fn(
     }),
     credential: new BearerConnectionCredential({
       token: access.access_token,
+      ...(target.cloudflareAccessToken
+        ? { cloudflareAccessToken: target.cloudflareAccessToken }
+        : {}),
     }),
   });
 });

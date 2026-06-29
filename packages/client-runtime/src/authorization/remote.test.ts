@@ -209,6 +209,39 @@ describe("remote environment authorization", () => {
     }),
   );
 
+  it.effect("attaches Cloudflare Access headers during bearer token exchange", () =>
+    Effect.gen(function* () {
+      const fetch = recordedFetch(
+        Response.json(
+          {
+            access_token: "bearer-token",
+            issued_token_type: "urn:ietf:params:oauth:token-type:access_token",
+            token_type: "Bearer",
+            expires_in: 3600,
+            scope:
+              "orchestration:read orchestration:operate terminal:operate review:write relay:read",
+          },
+          { status: 200 },
+        ),
+      );
+
+      yield* bootstrapRemoteBearerSession({
+        httpBaseUrl: "https://remote.example.com/",
+        credential: "pairing-token",
+        cloudflareAccess: { jwt: "cf-access-jwt" },
+      }).pipe(provideRemoteHttp(fetch.fetchFn));
+
+      expectFetchCall(fetch.calls, 1, {
+        url: "https://remote.example.com/oauth/token",
+        method: "POST",
+        headers: {
+          "cf-access-jwt-assertion": "cf-access-jwt",
+          cookie: "CF_Authorization=cf-access-jwt",
+        },
+      });
+    }),
+  );
+
   it.effect("allows a client to explicitly narrow a pairing grant", () =>
     Effect.gen(function* () {
       const fetch = recordedFetch(

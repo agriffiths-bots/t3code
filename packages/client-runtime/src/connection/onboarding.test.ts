@@ -118,6 +118,29 @@ describe("connection onboarding", () => {
     }),
   );
 
+  it.effect("persists Cloudflare Access credentials from pairing urls", () =>
+    Effect.gen(function* () {
+      const calls: Array<{ readonly url: string; readonly init: RequestInit }> = [];
+      const registration = yield* preparePairingRegistration({
+        pairingUrl:
+          "https://remote.example.test/pair#token=pairing-token&cf_access_token=cf-access-jwt",
+      }).pipe(Effect.provide(Layer.mergeAll(CLIENT_PRESENTATION_LAYER, pairingHttpLayer(calls))));
+
+      expect(registration.credential).toMatchObject({
+        token: "bearer-token",
+        cloudflareAccessToken: "cf-access-jwt",
+      });
+      for (const call of calls) {
+        expect(call.init.headers).toEqual(
+          expect.objectContaining({
+            "cf-access-jwt-assertion": "cf-access-jwt",
+            cookie: "CF_Authorization=cf-access-jwt",
+          }),
+        );
+      }
+    }),
+  );
+
   it.effect("does not consume a pairing credential when descriptor discovery fails", () =>
     Effect.gen(function* () {
       const calls: Array<{ readonly url: string; readonly init: RequestInit }> = [];

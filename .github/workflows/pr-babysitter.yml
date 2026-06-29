@@ -1,0 +1,71 @@
+name: PR Babysitter
+
+on:
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: "Pull request number to maintain"
+        required: true
+        type: number
+  issue_comment:
+    types: [created]
+  pull_request_review:
+    types: [submitted]
+
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+  actions: read
+  checks: read
+
+jobs:
+  resolve:
+    name: Resolve PR
+    runs-on: ubuntu-24.04
+    outputs:
+      pr_number: ${{ steps.resolve.outputs.pr_number }}
+      should_run: ${{ steps.resolve.outputs.should_run }}
+    steps:
+      - id: resolve
+        name: Resolve PR number
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          DISPATCH_PR: ${{ github.event.inputs.pr_number }}
+          ISSUE_PR_URL: ${{ github.event.issue.pull_request.url }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          ISSUE_COMMENT_BODY: ${{ github.event.comment.body }}
+          REVIEW_PR_NUMBER: ${{ github.event.pull_request.number }}
+          REVIEW_AUTHOR: ${{ github.event.review.user.login }}
+        run: |
+          set -euo pipefail
+          should_run=false
+          pr_number=""
+
+          if [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
+            should_run=true
+            pr_number="$DISPATCH_PR"
+          elif [[ "$EVENT_NAME" == "issue_comment" && -n "${ISSUE_PR_URL:-}" ]]; then
+            if [[ "$ISSUE_COMMENT_BODY" == *"/codex-babysit"* ]]; then
+              should_run=true
+              pr_number="$ISSUE_NUMBER"
+            fi
+          elif [[ "$EVENT_NAME" == "pull_request_review" ]]; then
+            if [[ "$REVIEW_AUTHOR" =~ [Cc]odex|[Gg]reptile ]]; then
+              should_run=true
+              pr_number="$REVIEW_PR_NUMBER"
+            fi
+          fi
+
+          echo "should_run=$should_run" >> "$GITHUB_OUTPUT"
+          echo "pr_number=$pr_number" >> "$GITHUB_OUTPUT"
+
+  babysit:
+    name: Babysit PR
+    needs: resolve
+    if: needs.resolve.outputs.should_run == 'true'
+    uses: ./.github/workflows/reusable-pr-babysitter.yml
+    with:
+      pr_number: ${{ fromJSON(needs.resolve.outputs.pr_number) }}
+    secrets: inherit

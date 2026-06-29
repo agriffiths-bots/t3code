@@ -1,7 +1,9 @@
 import { EnvironmentId } from "@t3tools/contracts";
 import type { RelayManagedEndpoint } from "@t3tools/contracts/relay";
 import {
+  cloudflareAccessHeaders,
   exchangeRemoteDpopAccessToken,
+  type CloudflareAccessAuthorization,
   type RemoteEnvironmentAuthError,
   resolveRemoteDpopWebSocketConnectionUrl,
   resolveRemoteWebSocketConnectionUrl,
@@ -35,6 +37,7 @@ export interface AuthorizedRemoteEnvironment {
   readonly label: string;
   readonly httpBaseUrl: string;
   readonly socketUrl: string;
+  readonly socketHeaders?: Readonly<Record<string, string>>;
   readonly httpAuthorization: PreparedHttpAuthorization;
 }
 
@@ -46,6 +49,7 @@ export class RemoteEnvironmentAuthorization extends Context.Service<
       readonly httpBaseUrl: string;
       readonly wsBaseUrl: string;
       readonly bearerToken: string;
+      readonly cloudflareAccess?: CloudflareAccessAuthorization;
     }) => Effect.Effect<AuthorizedRemoteEnvironment, ConnectionAttemptError>;
     readonly authorizeDpop: (input: {
       readonly expectedEnvironmentId: EnvironmentId;
@@ -68,10 +72,12 @@ function mapDpopSocketError(error: RemoteEnvironmentAuthError | ConnectionAttemp
 
 const fetchDescriptor = Effect.fn("clientRuntime.connection.remote.fetchDescriptor")(function* (
   httpBaseUrl: string,
+  cloudflareAccess?: CloudflareAccessAuthorization,
 ) {
-  return yield* fetchRemoteEnvironmentDescriptor({ httpBaseUrl }).pipe(
-    Effect.mapError(mapRemoteEnvironmentError),
-  );
+  return yield* fetchRemoteEnvironmentDescriptor({
+    httpBaseUrl,
+    ...(cloudflareAccess ? { cloudflareAccess } : {}),
+  }).pipe(Effect.mapError(mapRemoteEnvironmentError));
 });
 
 export const make = Effect.gen(function* () {
@@ -107,8 +113,9 @@ export const make = Effect.gen(function* () {
       readonly httpBaseUrl: string;
       readonly wsBaseUrl: string;
       readonly bearerToken: string;
+      readonly cloudflareAccess?: CloudflareAccessAuthorization;
     }) {
-      const descriptor = yield* fetchDescriptor(input.httpBaseUrl).pipe(
+      const descriptor = yield* fetchDescriptor(input.httpBaseUrl, input.cloudflareAccess).pipe(
         Effect.provideService(HttpClient.HttpClient, httpClient),
       );
       if (descriptor.environmentId !== input.expectedEnvironmentId) {
@@ -121,15 +128,18 @@ export const make = Effect.gen(function* () {
         wsBaseUrl: input.wsBaseUrl,
         httpBaseUrl: input.httpBaseUrl,
         bearerToken: input.bearerToken,
+        ...(input.cloudflareAccess ? { cloudflareAccess: input.cloudflareAccess } : {}),
       }).pipe(
         Effect.mapError(mapRemoteEnvironmentError),
         Effect.provideService(HttpClient.HttpClient, httpClient),
       );
+      const socketHeaders = cloudflareAccessHeaders(input.cloudflareAccess);
       return {
         environmentId: descriptor.environmentId,
         label: descriptor.label,
         httpBaseUrl: input.httpBaseUrl,
         socketUrl,
+        ...(Object.keys(socketHeaders).length > 0 ? { socketHeaders } : {}),
         httpAuthorization: {
           _tag: "Bearer" as const,
           token: input.bearerToken,

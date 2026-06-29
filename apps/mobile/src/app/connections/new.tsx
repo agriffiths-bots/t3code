@@ -10,6 +10,7 @@ import { AppText as Text, AppTextInput as TextInput } from "../../components/App
 import { ErrorBanner } from "../../components/ErrorBanner";
 import { dismissRoute } from "../../lib/routes";
 import { ConnectionSheetButton } from "../../features/connection/ConnectionSheetButton";
+import { authenticateCloudflareAccess } from "../../features/connection/cloudflareAccess";
 import { extractPairingUrlFromQrPayload } from "../../features/connection/pairing";
 import { useRemoteConnections } from "../../state/use-remote-environment-registry";
 import { buildPairingUrl, parsePairingUrl } from "../../features/connection/pairing";
@@ -26,7 +27,9 @@ export default function ConnectionsNewRouteScreen() {
   const insets = useSafeAreaInsets();
   const [hostInput, setHostInput] = useState("");
   const [codeInput, setCodeInput] = useState("");
+  const [cloudflareAccessToken, setCloudflareAccessToken] = useState("");
   const [isSubmitting, setIsSubmitting] = useState(false);
+  const [isCloudflareAuthenticating, setIsCloudflareAuthenticating] = useState(false);
   const [showScanner, setShowScanner] = useState(params.mode === "scan_qr");
   const [cameraPermission, requestCameraPermission] = useCameraPermissions();
   const [scannerLocked, setScannerLocked] = useState(false);
@@ -36,9 +39,10 @@ export default function ConnectionsNewRouteScreen() {
   const connectDisabled = isSubmitting || hostInput.trim().length === 0;
 
   useEffect(() => {
-    const { host, code } = parsePairingUrl(connectionPairingUrl);
+    const { host, code, cloudflareAccessToken } = parsePairingUrl(connectionPairingUrl);
     setHostInput(host);
     setCodeInput(code);
+    setCloudflareAccessToken(cloudflareAccessToken);
   }, [connectionPairingUrl]);
 
   useEffect(() => {
@@ -49,6 +53,7 @@ export default function ConnectionsNewRouteScreen() {
 
   const handleHostChange = useCallback((value: string) => {
     setHostInput(value);
+    setCloudflareAccessToken("");
   }, []);
 
   const handleCodeChange = useCallback((value: string) => {
@@ -90,9 +95,10 @@ export default function ConnectionsNewRouteScreen() {
 
       try {
         const pairingUrl = extractPairingUrlFromQrPayload(data);
-        const { host, code } = parsePairingUrl(pairingUrl);
+        const { host, code, cloudflareAccessToken } = parsePairingUrl(pairingUrl);
         setHostInput(host);
         setCodeInput(code);
+        setCloudflareAccessToken(cloudflareAccessToken);
         onChangeConnectionPairingUrl(pairingUrl);
         setShowScanner(false);
       } catch (error) {
@@ -109,10 +115,27 @@ export default function ConnectionsNewRouteScreen() {
     [onChangeConnectionPairingUrl, scannerLocked],
   );
 
+  const handleCloudflareAccessSignIn = useCallback(async () => {
+    setIsCloudflareAuthenticating(true);
+    try {
+      const token = await authenticateCloudflareAccess(hostInput);
+      setCloudflareAccessToken(token);
+      const pairingUrl = buildPairingUrl(hostInput, codeInput, token);
+      onChangeConnectionPairingUrl(pairingUrl);
+    } catch (error) {
+      Alert.alert(
+        "Cloudflare sign-in failed",
+        error instanceof Error ? error.message : "Could not authenticate with Cloudflare Access.",
+      );
+    } finally {
+      setIsCloudflareAuthenticating(false);
+    }
+  }, [codeInput, hostInput, onChangeConnectionPairingUrl]);
+
   const handleSubmit = useCallback(async () => {
     setIsSubmitting(true);
 
-    const pairingUrl = buildPairingUrl(hostInput, codeInput);
+    const pairingUrl = buildPairingUrl(hostInput, codeInput, cloudflareAccessToken);
     onChangeConnectionPairingUrl(pairingUrl);
     const result = await onConnectPress(pairingUrl);
     if (AsyncResult.isSuccess(result)) {
@@ -120,7 +143,14 @@ export default function ConnectionsNewRouteScreen() {
     } else {
       setIsSubmitting(false);
     }
-  }, [codeInput, hostInput, onChangeConnectionPairingUrl, onConnectPress, router]);
+  }, [
+    cloudflareAccessToken,
+    codeInput,
+    hostInput,
+    onChangeConnectionPairingUrl,
+    onConnectPress,
+    router,
+  ]);
 
   return (
     <View collapsable={false} className="flex-1 bg-sheet">
@@ -205,6 +235,26 @@ export default function ConnectionsNewRouteScreen() {
                   className="rounded-[14px] border border-input-border bg-input px-4 py-3.5 text-base text-foreground"
                 />
               </View>
+
+              <ConnectionSheetButton
+                icon={
+                  cloudflareAccessToken
+                    ? "person.crop.circle.badge.checkmark"
+                    : "person.crop.circle"
+                }
+                label={
+                  isCloudflareAuthenticating
+                    ? "Signing in..."
+                    : cloudflareAccessToken
+                      ? "Google authenticated"
+                      : "Authenticate with Google"
+                }
+                disabled={hostInput.trim().length === 0 || isCloudflareAuthenticating}
+                tone="secondary"
+                onPress={() => {
+                  void handleCloudflareAccessSignIn();
+                }}
+              />
 
               <View collapsable={false} className="gap-1.5">
                 <Text
