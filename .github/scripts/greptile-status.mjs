@@ -65,7 +65,7 @@ const signals = [
 let triggerAccepted = false;
 if (triggerCommentId) {
   const reactions = ghJson([
-    `repos/${owner}/${repo}/issues/comments/${triggerCommentId}/reactions`,
+    `repos/${owner}/${repo}/issues/comments/${triggerCommentId}/reactions?per_page=100`,
     "-H",
     "Accept: application/vnd.github+json",
   ]);
@@ -76,33 +76,26 @@ if (triggerCommentId) {
 
 const headSha = pr.head?.sha ?? "";
 const latestForHead = signals.find((signal) => signal.reviewedCommit === headSha);
-const latestApprovalForHead = signals.find(
-  (signal) => signal.reviewedCommit === headSha && signal.state === "APPROVED",
-);
+const latestForHeadApproved = latestForHead?.state === "APPROVED";
 const latestScored = signals.find((signal) => signal.score !== null);
 const stale = latestScored !== undefined && latestScored.reviewedCommit !== headSha;
-const state =
-  latestApprovalForHead !== undefined
-    ? "approved"
-    : latestForHead !== undefined
-      ? "current"
-      : triggerAccepted
-        ? "trigger-accepted"
-        : stale
-          ? "stale"
-          : "unknown";
+const state = latestForHeadApproved
+  ? "approved"
+  : latestForHead !== undefined
+    ? "current"
+    : triggerAccepted
+      ? "trigger-accepted"
+      : stale
+        ? "stale"
+        : "unknown";
 
 const result = {
   pr: prNumber,
   headSha,
   state,
   score: latestForHead?.score ?? latestScored?.score ?? null,
-  approved: latestApprovalForHead !== undefined,
-  latestReviewedCommit:
-    latestApprovalForHead?.reviewedCommit ??
-    latestForHead?.reviewedCommit ??
-    latestScored?.reviewedCommit ??
-    null,
+  approved: latestForHeadApproved,
+  latestReviewedCommit: latestForHead?.reviewedCommit ?? latestScored?.reviewedCommit ?? null,
   triggerAccepted,
   latestGreptileSignalAt: latestForHead?.updatedAt ?? latestScored?.updatedAt ?? null,
 };

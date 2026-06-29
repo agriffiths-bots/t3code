@@ -6,6 +6,7 @@ on:
 
 permissions:
   contents: read
+  issues: write
   pull-requests: write
 
 jobs:
@@ -24,7 +25,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          allowed="adamfgr,app/wizzoapp,wizzoapp[bot],wizzobot,wizzobot[bot],${ALLOWED_PR_AUTHORS:-}"
+          allowed="adamfgr,wizzoapp[bot],wizzobot,wizzobot[bot],${ALLOWED_PR_AUTHORS:-}"
 
           IFS=',' read -r -a allowed_authors <<< "$allowed"
           for allowed_author in "${allowed_authors[@]}"; do
@@ -35,4 +36,5 @@ jobs:
           done
 
           echo "::warning::Closing PR #$PR_NUMBER from unauthorized author '$PR_AUTHOR'."
+          gh pr comment "$PR_NUMBER" --repo "$REPOSITORY" --body "This fork only accepts pull requests from maintainers or approved automation."
           gh pr close "$PR_NUMBER" --repo "$REPOSITORY"

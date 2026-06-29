@@ -130,20 +130,17 @@ const currentGreptileSignals = greptileSignals.filter(
   (signal) => signal.reviewedCommit === pr.headRefOid,
 );
 
-const latestScoredGreptileSignal = currentGreptileSignals
-  .filter((signal) => signal.score !== null)
-  .reduce(
-    (latest, signal) =>
-      latest === null || signal.normalizedTimestamp > latest.normalizedTimestamp ? signal : latest,
-    null,
-  );
-
-const greptileScore = latestScoredGreptileSignal?.score ?? null;
-const greptileApproved = currentGreptileSignals.some(
-  (signal) => signal.kind === "review" && signal.state === "APPROVED",
+const latestGreptileSignal = currentGreptileSignals.reduce(
+  (latest, signal) =>
+    latest === null || signal.normalizedTimestamp > latest.normalizedTimestamp ? signal : latest,
+  null,
 );
+
+const greptileScore = latestGreptileSignal?.score ?? null;
+const greptileApproved =
+  latestGreptileSignal?.kind === "review" && latestGreptileSignal.state === "APPROVED";
 const greptilePassed = greptileApproved || (greptileScore !== null && greptileScore >= 5);
-const hasGreptileSignal = currentGreptileSignals.length > 0;
+const hasGreptileSignal = latestGreptileSignal !== null;
 const readyToMerge =
   !pr.isDraft && unresolvedCodexThreads.length === 0 && hasGreptileSignal && greptilePassed;
 
