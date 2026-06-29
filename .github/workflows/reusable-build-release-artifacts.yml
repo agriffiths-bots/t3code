@@ -59,15 +59,15 @@ jobs:
 
           echo "present=false" >> "$GITHUB_OUTPUT"
           {
-            echo "EXPO_TOKEN is required to build the Android APK release artifact."
+            echo "::warning::EXPO_TOKEN is required to build the Android APK release artifact."
             echo "Create a repository secret named EXPO_TOKEN with access to the EAS project used by apps/mobile."
             echo "Also verify EXPO_OWNER / EXPO_PROJECT_ID repository variables if the defaults are not correct."
-          } >&2
-          exit 1
+          }
 
   android_apk:
     name: Build Android APK
     needs: android_preflight
+    if: needs.android_preflight.outputs.expo_token_present == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     env:
@@ -249,7 +249,17 @@ jobs:
 
   publish_release:
     name: Publish GitHub Release
-    needs: [android_apk, windows_x64]
+    needs: [android_preflight, android_apk, windows_x64]
+    if: >-
+      ${{
+        always() &&
+        needs.android_preflight.result == 'success' &&
+        needs.windows_x64.result == 'success' &&
+        (
+          needs.android_preflight.outputs.expo_token_present == 'false' ||
+          needs.android_apk.result == 'success'
+        )
+      }}
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
@@ -262,6 +272,26 @@ jobs:
           merge-multiple: true
           path: release-assets
 
+      - id: release_files
+        name: Resolve release files
+        shell: bash
+        run: |
+          set -euo pipefail
+          files="$(
+            find release-assets -maxdepth 1 -type f \
+              \( -name '*.apk' -o -name '*.exe' -o -name '*.blockmap' -o -name '*.yml' \) \
+              | sort
+          )"
+          if [[ -z "$files" ]]; then
+            echo "::error::No release assets were downloaded."
+            exit 1
+          fi
+          {
+            echo "files<<EOF"
+            echo "$files"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
       - name: Publish release
         uses: softprops/action-gh-release@v2
         with:
@@ -270,10 +300,6 @@ jobs:
           name: ${{ inputs.release_name }}
           prerelease: ${{ inputs.prerelease }}
           make_latest: ${{ inputs.make_latest }}
-          files: |
-            release-assets/*.apk
-            release-assets/*.exe
-            release-assets/*.blockmap
-            release-assets/*.yml
+          files: ${{ steps.release_files.outputs.files }}
           fail_on_unmatched_files: true
           token: ${{ github.token }}
