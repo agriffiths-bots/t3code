@@ -70,14 +70,13 @@ jobs:
 
           reviewer_is_trusted() {
             local actor="$1"
-            case "$actor" in
-              greptile-apps|greptile-apps[bot]|chatgpt-codex-connector[bot]|codex|codex[bot])
+            local trusted_reviewer
+            for trusted_reviewer in greptile-apps 'greptile-apps[bot]' 'chatgpt-codex-connector[bot]' codex 'codex[bot]'; do
+              if [[ "$actor" == "$trusted_reviewer" ]]; then
                 return 0
-                ;;
-              *)
-                actor_is_trusted "$actor" ""
-                ;;
-            esac
+              fi
+            done
+            actor_is_trusted "$actor" ""
           }
 
           if [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then

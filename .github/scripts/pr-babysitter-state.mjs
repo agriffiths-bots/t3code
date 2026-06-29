@@ -82,6 +82,12 @@ const greptileAuthorLogins = new Set(["greptile-apps", "greptile-apps[bot]"]);
 
 const isCodex = (login) => codexAuthorLogins.has(login ?? "");
 const isGreptile = (login) => greptileAuthorLogins.has(login ?? "");
+const readGreptileScore = (body) => {
+  const scoreMatch = body.match(
+    /\b(?:confidence\s+score|score|grade)\s*:?\s*(\d+(?:\.\d+)?)\s*(?:\/\s*5)?\b/i,
+  );
+  return scoreMatch ? Number(scoreMatch[1]) : null;
+};
 
 const unresolvedCodexThreads = pr.reviewThreads.nodes.filter(
   (thread) =>
@@ -93,30 +99,34 @@ const greptileSignals = [
     .filter((comment) => isGreptile(comment.author?.login))
     .map((comment) => ({
       body: comment.body,
+      score: readGreptileScore(comment.body),
       timestamp: Date.parse(comment.updatedAt ?? comment.createdAt ?? ""),
     })),
   ...pr.reviews.nodes
     .filter((review) => isGreptile(review.author?.login))
     .map((review) => ({
       body: review.body,
+      score: readGreptileScore(review.body),
       timestamp: Date.parse(review.updatedAt ?? review.submittedAt ?? review.createdAt ?? ""),
     })),
 ]
   .filter((signal) => signal.body.trim().length > 0)
-  .sort((left, right) => {
-    const leftTimestamp = Number.isNaN(left.timestamp) ? 0 : left.timestamp;
-    const rightTimestamp = Number.isNaN(right.timestamp) ? 0 : right.timestamp;
-    return rightTimestamp - leftTimestamp;
-  });
+  .map((signal) => ({
+    ...signal,
+    normalizedTimestamp: Number.isNaN(signal.timestamp) ? 0 : signal.timestamp,
+  }));
 
-const latestGreptileBody = greptileSignals[0]?.body ?? "";
-const greptileScoreMatch = latestGreptileBody.match(
-  /\b(?:confidence\s+score|score|grade)\s*:?\s*(\d+(?:\.\d+)?)\s*(?:\/\s*5)?\b/i,
-);
-const greptileScore = greptileScoreMatch ? Number(greptileScoreMatch[1]) : null;
+const latestScoredGreptileSignal = greptileSignals
+  .filter((signal) => signal.score !== null)
+  .reduce(
+    (latest, signal) =>
+      latest === null || signal.normalizedTimestamp > latest.normalizedTimestamp ? signal : latest,
+    null,
+  );
 
+const greptileScore = latestScoredGreptileSignal?.score ?? null;
 const greptilePassed = greptileScore !== null && greptileScore >= 5;
-const hasGreptileSignal = latestGreptileBody.trim().length > 0;
+const hasGreptileSignal = latestScoredGreptileSignal !== null;
 const readyToMerge =
   !pr.isDraft && unresolvedCodexThreads.length === 0 && hasGreptileSignal && greptilePassed;
 
