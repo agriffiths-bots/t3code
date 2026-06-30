@@ -15,33 +15,18 @@ if (!repository.includes("/")) {
 const [owner, repo] = repository.split("/", 2);
 
 const query = `
-query($owner: String!, $repo: String!, $number: Int!) {
+query($owner: String!, $repo: String!, $number: Int!, $reviewThreadsAfter: String) {
   repository(owner: $owner, name: $repo) {
     pullRequest(number: $number) {
       isDraft
       headRefOid
       mergeStateStatus
       reviewDecision
-      comments(last: 100) {
-        nodes {
-          body
-          createdAt
-          updatedAt
-          author { login }
+      reviewThreads(first: 100, after: $reviewThreadsAfter) {
+        pageInfo {
+          hasNextPage
+          endCursor
         }
-      }
-      reviews(last: 100) {
-        nodes {
-          body
-          createdAt
-          submittedAt
-          updatedAt
-          state
-          commit { oid }
-          author { login }
-        }
-      }
-      reviewThreads(first: 100) {
         nodes {
           isResolved
           comments(first: 20) {
@@ -56,28 +41,66 @@ query($owner: String!, $repo: String!, $number: Int!) {
   }
 }`;
 
-const response = NodeChildProcess.execFileSync(
-  "gh",
-  [
-    "api",
-    "graphql",
-    "-f",
-    `query=${query}`,
-    "-F",
-    `owner=${owner}`,
-    "-F",
-    `repo=${repo}`,
-    "-F",
-    `number=${prNumber}`,
-  ],
-  { encoding: "utf8" },
-);
+const ghJson = (args) =>
+  JSON.parse(NodeChildProcess.execFileSync("gh", ["api", ...args], { encoding: "utf8" }));
 
-const parsed = JSON.parse(response);
-const pr = parsed.data?.repository?.pullRequest;
-if (!pr) {
-  throw new Error(`Pull request #${prNumber} was not found.`);
-}
+const ghJsonPages = (path) => {
+  const items = [];
+  for (let page = 1; ; page += 1) {
+    const separator = path.includes("?") ? "&" : "?";
+    const pageItems = ghJson([`${path}${separator}per_page=100&page=${page}`]);
+    if (!Array.isArray(pageItems)) {
+      throw new Error(`Expected ${path} page ${page} to return a JSON array.`);
+    }
+
+    items.push(...pageItems);
+    if (pageItems.length < 100) {
+      return items;
+    }
+  }
+};
+
+const ghGraphql = (graphqlQuery, variables) => {
+  const args = ["graphql", "-f", `query=${graphqlQuery}`];
+  for (const [name, value] of Object.entries(variables)) {
+    if (value !== null && value !== undefined) {
+      args.push("-F", `${name}=${value}`);
+    }
+  }
+
+  return ghJson(args);
+};
+
+const fetchPullRequestState = () => {
+  let prState = null;
+  let reviewThreadsAfter = null;
+  const reviewThreads = [];
+
+  do {
+    const parsed = ghGraphql(query, { owner, repo, number: prNumber, reviewThreadsAfter });
+    const pagePr = parsed.data?.repository?.pullRequest;
+    if (!pagePr) {
+      throw new Error(`Pull request #${prNumber} was not found.`);
+    }
+
+    prState = {
+      isDraft: pagePr.isDraft,
+      headRefOid: pagePr.headRefOid,
+      mergeStateStatus: pagePr.mergeStateStatus,
+      reviewDecision: pagePr.reviewDecision,
+    };
+
+    const pageInfo = pagePr.reviewThreads?.pageInfo;
+    reviewThreads.push(...(pagePr.reviewThreads?.nodes ?? []));
+    reviewThreadsAfter = pageInfo?.hasNextPage ? pageInfo.endCursor : null;
+  } while (reviewThreadsAfter);
+
+  return { ...prState, reviewThreads };
+};
+
+const pr = fetchPullRequestState();
+const comments = ghJsonPages(`repos/${owner}/${repo}/issues/${prNumber}/comments`);
+const reviews = ghJsonPages(`repos/${owner}/${repo}/pulls/${prNumber}/reviews`);
 
 const codexAuthorLogins = new Set(["chatgpt-codex-connector", "chatgpt-codex-connector[bot]"]);
 const greptileAuthorLogins = new Set(["greptile-apps", "greptile-apps[bot]"]);
@@ -93,31 +116,32 @@ const readGreptileScore = (body) => {
 const readReviewedCommit = (body) =>
   body.match(/github\.com\/[^/]+\/[^/]+\/commit\/([0-9a-f]{7,40})/i)?.[1] ?? null;
 
-const unresolvedCodexThreads = pr.reviewThreads.nodes.filter(
+const unresolvedCodexThreads = pr.reviewThreads.filter(
   (thread) =>
-    !thread.isResolved && thread.comments.nodes.some((comment) => isCodex(comment.author?.login)),
+    !thread.isResolved &&
+    (thread.comments?.nodes ?? []).some((comment) => isCodex(comment.author?.login)),
 );
 
 const greptileSignals = [
-  ...pr.comments.nodes
-    .filter((comment) => isGreptile(comment.author?.login))
+  ...comments
+    .filter((comment) => isGreptile(comment.user?.login))
     .map((comment) => ({
       kind: "comment",
-      body: comment.body,
+      body: comment.body ?? "",
       state: null,
-      score: readGreptileScore(comment.body),
-      reviewedCommit: readReviewedCommit(comment.body),
-      timestamp: Date.parse(comment.updatedAt ?? comment.createdAt ?? ""),
+      score: readGreptileScore(comment.body ?? ""),
+      reviewedCommit: readReviewedCommit(comment.body ?? ""),
+      timestamp: Date.parse(comment.updated_at ?? comment.created_at ?? ""),
     })),
-  ...pr.reviews.nodes
-    .filter((review) => isGreptile(review.author?.login))
+  ...reviews
+    .filter((review) => isGreptile(review.user?.login))
     .map((review) => ({
       kind: "review",
-      body: review.body,
-      state: review.state,
-      score: readGreptileScore(review.body),
-      reviewedCommit: review.commit?.oid ?? readReviewedCommit(review.body),
-      timestamp: Date.parse(review.updatedAt ?? review.submittedAt ?? review.createdAt ?? ""),
+      body: review.body ?? "",
+      state: review.state ?? null,
+      score: readGreptileScore(review.body ?? ""),
+      reviewedCommit: review.commit_id ?? readReviewedCommit(review.body ?? ""),
+      timestamp: Date.parse(review.updated_at ?? review.submitted_at ?? ""),
     })),
 ]
   .filter((signal) => signal.body.trim().length > 0 || signal.state === "APPROVED")

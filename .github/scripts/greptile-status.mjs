@@ -14,10 +14,26 @@ if (!Number.isInteger(prNumber) || prNumber <= 0) {
 const ghJson = (args) =>
   JSON.parse(NodeChildProcess.execFileSync("gh", ["api", ...args], { encoding: "utf8" }));
 
+const ghJsonPages = (path, extraArgs = []) => {
+  const items = [];
+  for (let page = 1; ; page += 1) {
+    const separator = path.includes("?") ? "&" : "?";
+    const pageItems = ghJson([`${path}${separator}per_page=100&page=${page}`, ...extraArgs]);
+    if (!Array.isArray(pageItems)) {
+      throw new Error(`Expected ${path} page ${page} to return a JSON array.`);
+    }
+
+    items.push(...pageItems);
+    if (pageItems.length < 100) {
+      return items;
+    }
+  }
+};
+
 const [owner, repo] = repository.split("/", 2);
 const pr = ghJson([`repos/${owner}/${repo}/pulls/${prNumber}`]);
-const comments = ghJson([`repos/${owner}/${repo}/issues/${prNumber}/comments?per_page=100`]);
-const reviews = ghJson([`repos/${owner}/${repo}/pulls/${prNumber}/reviews?per_page=100`]);
+const comments = ghJsonPages(`repos/${owner}/${repo}/issues/${prNumber}/comments`);
+const reviews = ghJsonPages(`repos/${owner}/${repo}/pulls/${prNumber}/reviews`);
 
 const isGreptile = (login) => login === "greptile-apps" || login === "greptile-apps[bot]";
 const scoreOf = (body) => {
@@ -64,11 +80,10 @@ const signals = [
 
 let triggerAccepted = false;
 if (triggerCommentId) {
-  const reactions = ghJson([
-    `repos/${owner}/${repo}/issues/comments/${triggerCommentId}/reactions?per_page=100`,
-    "-H",
-    "Accept: application/vnd.github+json",
-  ]);
+  const reactions = ghJsonPages(
+    `repos/${owner}/${repo}/issues/comments/${triggerCommentId}/reactions`,
+    ["-H", "Accept: application/vnd.github+json"],
+  );
   triggerAccepted = reactions.some(
     (reaction) => isGreptile(reaction.user?.login) && reaction.content === "+1",
   );
