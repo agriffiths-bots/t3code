@@ -95,8 +95,7 @@ export function reduceSchedulesByThreadId(
     // Prefer the earliest enabled upcoming run; a thread is "enabled" if any of
     // its schedules is enabled, and "overdue" if any enabled schedule is overdue.
     // The cadence label tracks whichever schedule owns the chosen earliest run.
-    const takesNewRun =
-      task.enabled && compareNextRunAt(task.nextRunAt, existing.nextRunAt) < 0;
+    const takesNewRun = task.enabled && compareNextRunAt(task.nextRunAt, existing.nextRunAt) < 0;
     byThread.set(task.threadId, {
       threadId: task.threadId,
       nextRunAt: takesNewRun ? task.nextRunAt : existing.nextRunAt,
@@ -122,9 +121,9 @@ function tasksForEnvironment(
 }
 
 export const scheduledTasksForEnvironmentAtom = Atom.family((environmentId: EnvironmentId) =>
-  Atom.make((get) => tasksForEnvironment(get(environmentScheduledTasks.stateValueAtom(environmentId)))).pipe(
-    Atom.withLabel(`scheduled-tasks-for-environment:${environmentId}`),
-  ),
+  Atom.make((get) =>
+    tasksForEnvironment(get(environmentScheduledTasks.stateValueAtom(environmentId))),
+  ).pipe(Atom.withLabel(`scheduled-tasks-for-environment:${environmentId}`)),
 );
 
 export const schedulesByThreadIdAtom = Atom.family((environmentId: EnvironmentId) =>
@@ -134,12 +133,15 @@ export const schedulesByThreadIdAtom = Atom.family((environmentId: EnvironmentId
 );
 
 export const enabledScheduleCountAtom = Atom.family((environmentId: EnvironmentId) =>
-  Atom.make((get) =>
-    get(scheduledTasksForEnvironmentAtom(environmentId)).filter((task) => task.enabled).length,
+  Atom.make(
+    (get) =>
+      get(scheduledTasksForEnvironmentAtom(environmentId)).filter((task) => task.enabled).length,
   ).pipe(Atom.withLabel(`enabled-schedule-count:${environmentId}`)),
 );
 
-export function useScheduledTasks(environmentId: EnvironmentId | null): ReadonlyArray<ScheduledTaskEntry> {
+export function useScheduledTasks(
+  environmentId: EnvironmentId | null,
+): ReadonlyArray<ScheduledTaskEntry> {
   return useAtomValue(
     environmentId !== null
       ? scheduledTasksForEnvironmentAtom(environmentId)
@@ -175,6 +177,4 @@ const EMPTY_SCHEDULED_TASKS_ATOM = Atom.make<ReadonlyArray<ScheduledTaskEntry>>(
 const EMPTY_SCHEDULE_SUMMARY_ATOM = Atom.make<ReadonlyMap<ThreadId, ThreadScheduleSummary>>(
   new Map(),
 ).pipe(Atom.withLabel("schedules-by-thread-id:empty"));
-const EMPTY_SCHEDULE_COUNT_ATOM = Atom.make(0).pipe(
-  Atom.withLabel("enabled-schedule-count:empty"),
-);
+const EMPTY_SCHEDULE_COUNT_ATOM = Atom.make(0).pipe(Atom.withLabel("enabled-schedule-count:empty"));

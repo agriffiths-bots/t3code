@@ -143,14 +143,12 @@ const dispatchLiveOrchestrationCommand = (
 const getOfflineSnapshot = Effect.fn("getOfflineSnapshot")(function* () {
   const orchestrationEngine = yield* OrchestrationEngineService;
   const initial = createEmptyReadModel(DateTime.formatIso(yield* DateTime.now));
-  return yield* orchestrationEngine
-    .readEvents(0)
-    .pipe(
-      Stream.runFoldEffect(
-        () => initial,
-        (model, event) => projectEvent(model, event),
-      ),
-    );
+  return yield* orchestrationEngine.readEvents(0).pipe(
+    Stream.runFoldEffect(
+      () => initial,
+      (model, event) => projectEvent(model, event),
+    ),
+  );
 });
 
 const tryResolveLiveCosExecutionMode = Effect.fn("tryResolveLiveCosExecutionMode")(function* (
@@ -371,11 +369,15 @@ const cosLinkParentCommand = Command.make("link-parent", {
         const child = flags.childThreadId.trim();
         const parent = flags.parentThreadId.trim();
         if (child.length === 0 || parent.length === 0) {
-          return yield* new CosCommandError({ message: "Child and parent thread ids cannot be empty." });
+          return yield* new CosCommandError({
+            message: "Child and parent thread ids cannot be empty.",
+          });
         }
         const childThreadId = ThreadId.make(child);
         const parentThreadId = ThreadId.make(parent);
-        const commandId = CommandId.make(`server:cos-link-parent:${childThreadId}:${parentThreadId}`);
+        const commandId = CommandId.make(
+          `server:cos-link-parent:${childThreadId}:${parentThreadId}`,
+        );
         yield* dispatch({
           type: "thread.parent.set",
           commandId,

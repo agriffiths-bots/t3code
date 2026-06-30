@@ -26,7 +26,7 @@ jobs:
         run: vp run --filter @t3tools/desktop ensure:electron
 
       - name: Check
-        run: vp check .github/scripts .github/workflows --no-error-on-unmatched-pattern
+        run: vp check
 
       - name: Typecheck
         run: vpr typecheck
@@ -60,6 +60,27 @@ jobs:
 
       - name: Test
         run: vp run test
+
+  mobile_native_static_analysis:
+    name: Mobile Native Static Analysis
+    runs-on: macos-15
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Vite+
+        uses: voidzero-dev/setup-vp@v1
+        with:
+          node-version-file: package.json
+          cache: true
+          run-install: true
+
+      - name: Install mobile native static analysis tools
+        run: brew bundle install --file apps/mobile/Brewfile
+
+      - name: Lint mobile native sources
+        run: vp run lint:mobile
 
   release_smoke:
     name: Release Smoke

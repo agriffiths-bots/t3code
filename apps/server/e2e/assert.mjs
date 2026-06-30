@@ -12,11 +12,11 @@
 //   close(db)
 //
 // node:sqlite is the same SQLite the server build uses (node v22 --experimental).
-import { DatabaseSync } from "node:sqlite";
+import * as NodeSqlite from "node:sqlite";
 
 export function openState(dbPath) {
   // readOnly so the gate can never mutate the restored copy it is validating.
-  return new DatabaseSync(dbPath, { readOnly: true });
+  return new NodeSqlite.DatabaseSync(dbPath, { readOnly: true });
 }
 
 export function childrenOf(db, parentThreadId) {

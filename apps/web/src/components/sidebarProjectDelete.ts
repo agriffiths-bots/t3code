@@ -29,11 +29,7 @@ export function isProjectNotEmptyInvariant(error: unknown): boolean {
       return true;
     }
     const text =
-      typeof e.detail === "string"
-        ? e.detail
-        : typeof e.message === "string"
-          ? e.message
-          : "";
+      typeof e.detail === "string" ? e.detail : typeof e.message === "string" ? e.message : "";
     if (PROJECT_NOT_EMPTY_PATTERN.test(text)) {
       return true;
     }

@@ -522,7 +522,9 @@ const buildAppUnderTest = (options?: {
           ...options.layers.vcsStatusBroadcaster,
         })
       : VcsStatusBroadcaster.layer.pipe(Layer.provide(gitWorkflowLayer));
-    const projectSetupScriptRunnerLayer = Layer.mock(ProjectSetupScriptRunner.ProjectSetupScriptRunner)({
+    const projectSetupScriptRunnerLayer = Layer.mock(
+      ProjectSetupScriptRunner.ProjectSetupScriptRunner,
+    )({
       runForThread: () => Effect.succeed({ status: "no-script" as const }),
       ...options?.layers?.projectSetupScriptRunner,
     });

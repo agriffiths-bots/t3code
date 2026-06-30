@@ -4,7 +4,14 @@ import {
   scopeThreadRef,
 } from "@t3tools/client-runtime/environment";
 import type { VcsStatusResult } from "@t3tools/contracts";
-import { ClockIcon, CloudIcon, FolderGit2Icon, GitPullRequestIcon, TerminalIcon, TriangleAlertIcon } from "lucide-react";
+import {
+  ClockIcon,
+  CloudIcon,
+  FolderGit2Icon,
+  GitPullRequestIcon,
+  TerminalIcon,
+  TriangleAlertIcon,
+} from "lucide-react";
 import { useMemo } from "react";
 import { formatRelativeTimeUntilLabel } from "../timestampFormat";
 import type { ThreadScheduleSummary } from "../state/schedules";

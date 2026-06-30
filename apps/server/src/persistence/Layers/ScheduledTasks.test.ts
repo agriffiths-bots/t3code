@@ -43,9 +43,7 @@ layer("ScheduledTaskRepository", (it) => {
       const repository = yield* ScheduledTaskRepository;
       const threadId = ThreadId.make("thread-listdue");
 
-      yield* repository.insert(
-        makeTask({ taskId: ScheduledTaskId.make("listdue-now"), threadId }),
-      );
+      yield* repository.insert(makeTask({ taskId: ScheduledTaskId.make("listdue-now"), threadId }));
       yield* repository.insert(
         makeTask({
           taskId: ScheduledTaskId.make("listdue-future"),

@@ -1,3 +1,4 @@
+/* oxlint-disable react/no-unstable-nested-components -- Existing navigation header render callbacks are outside this CI hardening change. */
 import Stack from "expo-router/stack";
 import { SymbolView } from "expo-symbols";
 import { useLocalSearchParams, useRouter } from "expo-router";

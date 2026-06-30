@@ -68,10 +68,7 @@ import * as ExternalLauncher from "./process/externalLauncher.ts";
 import { normalizeDispatchCommand } from "./orchestration/Normalizer.ts";
 import * as OrchestrationEngine from "./orchestration/Services/OrchestrationEngine.ts";
 import * as ProjectionSnapshotQuery from "./orchestration/Services/ProjectionSnapshotQuery.ts";
-import {
-  ScheduledTaskRepository,
-  toScheduleEntry,
-} from "./persistence/Services/ScheduledTasks.ts";
+import { ScheduledTaskRepository, toScheduleEntry } from "./persistence/Services/ScheduledTasks.ts";
 import {
   observeRpcEffect as instrumentRpcEffect,
   observeRpcStream as instrumentRpcStream,
@@ -979,18 +976,16 @@ const makeWsRpcLayer = (
         [ORCHESTRATION_WS_METHODS.deleteScheduledTask]: (input) =>
           observeRpcEffect(
             ORCHESTRATION_WS_METHODS.deleteScheduledTask,
-            scheduledTaskRepository
-              .delete({ taskId: input.taskId })
-              .pipe(
-                Effect.as({ taskId: input.taskId, deleted: true }),
-                Effect.mapError(
-                  (cause) =>
-                    new OrchestrationScheduledTaskMutationError({
-                      message: "Failed to delete scheduled task",
-                      cause,
-                    }),
-                ),
+            scheduledTaskRepository.delete({ taskId: input.taskId }).pipe(
+              Effect.as({ taskId: input.taskId, deleted: true }),
+              Effect.mapError(
+                (cause) =>
+                  new OrchestrationScheduledTaskMutationError({
+                    message: "Failed to delete scheduled task",
+                    cause,
+                  }),
               ),
+            ),
             { "rpc.aggregate": "orchestration" },
           ),
         [WS_METHODS.serverGetConfig]: (_input) =>

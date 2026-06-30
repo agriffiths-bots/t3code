@@ -50,10 +50,7 @@ import {
 } from "../../../persistence/Services/PendingDispatches.ts";
 import { ProviderInstanceRegistry } from "../../../provider/Services/ProviderInstanceRegistry.ts";
 import * as McpInvocationContext from "../../McpInvocationContext.ts";
-import {
-  activeThreadStartRuntimeOf,
-  type ActiveThreadStartRuntime,
-} from "../thread/handlers.ts";
+import { activeThreadStartRuntimeOf, type ActiveThreadStartRuntime } from "../thread/handlers.ts";
 import { ThreadStartToolError } from "../thread/tools.ts";
 import {
   SubagentToolkit,
@@ -62,19 +59,14 @@ import {
   WAIT_TIMEOUT_MAX_SECONDS,
   WAIT_TIMEOUT_MIN_SECONDS,
   type CheckSubagentInput,
-  type CheckSubagentOutput,
   type ListSubagentsInput,
-  type ListSubagentsOutput,
   type ScheduleCreateInput,
   type ScheduleDeleteInput,
-  type ScheduleDeleteOutput,
   type ScheduleListInput,
-  type ScheduleListOutput,
   type ScheduleUpdateInput,
   type SpawnSubagentInput,
   type SpawnSubagentOutput,
   type SteerSubagentInput,
-  type SteerSubagentOutput,
   type WaitSubagentInput,
   type WaitSubagentOutput,
 } from "./tools.ts";
@@ -85,9 +77,7 @@ const isThreadStartToolError = Schema.is(ThreadStartToolError);
 const fail = (message: string) => new ThreadStartToolError({ message });
 
 const toToolError = (error: unknown, fallback: string): ThreadStartToolError =>
-  isThreadStartToolError(error)
-    ? error
-    : fail(error instanceof Error ? error.message : fallback);
+  isThreadStartToolError(error) ? error : fail(error instanceof Error ? error.message : fallback);
 
 const requireCoordinator = (): Effect.Effect<ChildThreadCoordinatorShape, ThreadStartToolError> => {
   const coordinator = coordinatorActive();
@@ -98,7 +88,9 @@ const requireCoordinator = (): Effect.Effect<ChildThreadCoordinatorShape, Thread
 
 const requireSpawnRuntime = (): Effect.Effect<ActiveThreadStartRuntime, ThreadStartToolError> => {
   const runtime = activeThreadStartRuntimeOf();
-  return runtime ? Effect.succeed(runtime) : Effect.fail(fail("Thread start runtime is not available."));
+  return runtime
+    ? Effect.succeed(runtime)
+    : Effect.fail(fail("Thread start runtime is not available."));
 };
 
 const clamp = (value: number, min: number, max: number): number =>
@@ -160,25 +152,25 @@ interface SubagentRuntime {
 let activeRuntime: SubagentRuntime | null = null;
 
 const requireRuntime = (): Effect.Effect<SubagentRuntime, ThreadStartToolError> =>
-  activeRuntime ? Effect.succeed(activeRuntime) : Effect.fail(fail("Sub-agent runtime is not available."));
+  activeRuntime
+    ? Effect.succeed(activeRuntime)
+    : Effect.fail(fail("Sub-agent runtime is not available."));
 
 const requireInvocation = McpInvocationContext.requireMcpCapability("thread-management").pipe(
   Effect.mapError((error) => fail(error.message)),
 );
 
 const loadThreadShell = (runtime: SubagentRuntime, threadId: ThreadId) =>
-  runtime.projectionSnapshotQuery.getThreadShellById(threadId).pipe(
-    Effect.mapError((error) => toToolError(error, "Failed to load thread.")),
-  );
+  runtime.projectionSnapshotQuery
+    .getThreadShellById(threadId)
+    .pipe(Effect.mapError((error) => toToolError(error, "Failed to load thread.")));
 
 const loadThreadDetail = (runtime: SubagentRuntime, threadId: ThreadId) =>
-  runtime.projectionSnapshotQuery.getThreadDetailById(threadId).pipe(
-    Effect.mapError((error) => toToolError(error, "Failed to load thread detail.")),
-  );
+  runtime.projectionSnapshotQuery
+    .getThreadDetailById(threadId)
+    .pipe(Effect.mapError((error) => toToolError(error, "Failed to load thread detail.")));
 
-const spawnSubagent = Effect.fn("SubagentToolkit.spawn")(function* (
-  input: SpawnSubagentInput,
-) {
+const spawnSubagent = Effect.fn("SubagentToolkit.spawn")(function* (input: SpawnSubagentInput) {
   const invocation = yield* requireInvocation;
   const runtime = yield* requireRuntime();
   const coordinator = yield* requireCoordinator();
@@ -284,9 +276,7 @@ const waitForChildren = (
       ),
     );
 
-const steerSubagent = Effect.fn("SubagentToolkit.steer")(function* (
-  input: SteerSubagentInput,
-) {
+const steerSubagent = Effect.fn("SubagentToolkit.steer")(function* (input: SteerSubagentInput) {
   const invocation = yield* requireInvocation;
   const runtime = yield* requireRuntime();
   const coordinator = yield* requireCoordinator();
@@ -309,7 +299,9 @@ const steerSubagent = Effect.fn("SubagentToolkit.steer")(function* (
   // the coordinator drains when the child idles, since its mid-turn semantics are
   // unverified.
   const midTurn = child.latestTurn?.state === "running";
-  const instance = yield* runtime.providerInstanceRegistry.getInstance(child.modelSelection.instanceId);
+  const instance = yield* runtime.providerInstanceRegistry.getInstance(
+    child.modelSelection.instanceId,
+  );
   const driverKind = instance?.driverKind;
   const MIDTURN_STEER_DRIVERS = ["claudeAgent", "codex", "cursor", "grok", "opencode"];
   const deferMidTurn = midTurn && !MIDTURN_STEER_DRIVERS.includes(driverKind ?? "");
@@ -331,7 +323,11 @@ const steerSubagent = Effect.fn("SubagentToolkit.steer")(function* (
     yield* runtime.pendingDispatches
       .insert(row)
       .pipe(Effect.mapError((error) => toToolError(error, "Failed to defer steer.")));
-    return { childThreadId: input.childThreadId, accepted: true, applied: "deferred-until-idle" as const };
+    return {
+      childThreadId: input.childThreadId,
+      accepted: true,
+      applied: "deferred-until-idle" as const,
+    };
   }
 
   const uuid = yield* runtime.crypto.randomUUIDv4.pipe(Effect.orDie);
@@ -355,9 +351,7 @@ const steerSubagent = Effect.fn("SubagentToolkit.steer")(function* (
   };
 });
 
-const checkSubagent = Effect.fn("SubagentToolkit.check")(function* (
-  input: CheckSubagentInput,
-) {
+const checkSubagent = Effect.fn("SubagentToolkit.check")(function* (input: CheckSubagentInput) {
   yield* requireInvocation;
   const runtime = yield* requireRuntime();
 
@@ -391,9 +385,7 @@ const parseWaitStartMs = (resumeToken: string | undefined, nowMs: number): numbe
   return Number.isFinite(parsed) ? parsed : nowMs;
 };
 
-const waitSubagent = Effect.fn("SubagentToolkit.wait")(function* (
-  input: WaitSubagentInput,
-) {
+const waitSubagent = Effect.fn("SubagentToolkit.wait")(function* (input: WaitSubagentInput) {
   yield* requireInvocation;
   const runtime = yield* requireRuntime();
   const coordinator = yield* requireCoordinator();
@@ -474,9 +466,7 @@ const waitSubagent = Effect.fn("SubagentToolkit.wait")(function* (
   };
 });
 
-const listSubagents = Effect.fn("SubagentToolkit.list")(function* (
-  input: ListSubagentsInput,
-) {
+const listSubagents = Effect.fn("SubagentToolkit.list")(function* (input: ListSubagentsInput) {
   const invocation = yield* requireInvocation;
   const runtime = yield* requireRuntime();
   const coordinator = yield* requireCoordinator();
@@ -516,10 +506,13 @@ const listSubagents = Effect.fn("SubagentToolkit.list")(function* (
   return { parentThreadId, children };
 });
 
-const validateCron = (cronExpr: string, timezone: string): Effect.Effect<void, ThreadStartToolError> =>
+const validateCron = (
+  cronExpr: string,
+  timezone: string,
+): Effect.Effect<void, ThreadStartToolError> =>
   Effect.try({
     try: () => {
-      new Cron(cronExpr, { timezone });
+      const _cron = new Cron(cronExpr, { timezone });
     },
     catch: () => fail(`Invalid cron expression: ${cronExpr}`),
   });
@@ -539,7 +532,9 @@ const computeNextRunIso = (
   const next = new Cron(cronExpr, { timezone }).nextRun(
     DateTime.toDateUtc(Option.getOrThrow(DateTime.make(nowMs))),
   );
-  return next === null ? null : DateTime.formatIso(Option.getOrThrow(DateTime.make(next.getTime())));
+  return next === null
+    ? null
+    : DateTime.formatIso(Option.getOrThrow(DateTime.make(next.getTime())));
 };
 
 const scheduleCreate = Effect.fn("SubagentToolkit.scheduleCreate")(function* (
@@ -624,15 +619,15 @@ const loadTaskById = (
   runtime: SubagentRuntime,
   taskId: ScheduledTaskId,
 ): Effect.Effect<ScheduledTask, ThreadStartToolError> =>
-  runtime.scheduledTasks
-    .listAll()
-    .pipe(
-      Effect.mapError((error) => toToolError(error, "Failed to load scheduled task.")),
-      Effect.flatMap((tasks) => {
-        const found = tasks.find((task) => task.taskId === taskId);
-        return found ? Effect.succeed(found) : Effect.fail(fail(`Scheduled task ${taskId} was not found.`));
-      }),
-    );
+  runtime.scheduledTasks.listAll().pipe(
+    Effect.mapError((error) => toToolError(error, "Failed to load scheduled task.")),
+    Effect.flatMap((tasks) => {
+      const found = tasks.find((task) => task.taskId === taskId);
+      return found
+        ? Effect.succeed(found)
+        : Effect.fail(fail(`Scheduled task ${taskId} was not found.`));
+    }),
+  );
 
 const scheduleUpdate = Effect.fn("SubagentToolkit.scheduleUpdate")(function* (
   input: ScheduleUpdateInput,
@@ -649,7 +644,11 @@ const scheduleUpdate = Effect.fn("SubagentToolkit.scheduleUpdate")(function* (
         ? "interval"
         : existing.scheduleKind;
   const cronExpr =
-    input.cronExpr !== undefined ? input.cronExpr : scheduleKind === "cron" ? existing.cronExpr : null;
+    input.cronExpr !== undefined
+      ? input.cronExpr
+      : scheduleKind === "cron"
+        ? existing.cronExpr
+        : null;
   const intervalSeconds =
     input.intervalSeconds !== undefined
       ? input.intervalSeconds
@@ -678,7 +677,8 @@ const scheduleUpdate = Effect.fn("SubagentToolkit.scheduleUpdate")(function* (
 
   const updated: ScheduledTask = {
     ...existing,
-    enabled: input.enabled === undefined ? existing.enabled : NonNegativeInt.make(input.enabled ? 1 : 0),
+    enabled:
+      input.enabled === undefined ? existing.enabled : NonNegativeInt.make(input.enabled ? 1 : 0),
     busyPolicy: input.busyPolicy ?? existing.busyPolicy,
     scheduleKind,
     intervalSeconds,

@@ -10,11 +10,7 @@
  *
  * @module ChildThreadCoordinator
  */
-import type {
-  ModelSelection,
-  ProviderInstanceId,
-  ThreadId,
-} from "@t3tools/contracts";
+import type { ModelSelection, ProviderInstanceId, ThreadId } from "@t3tools/contracts";
 import * as Context from "effect/Context";
 import type * as Effect from "effect/Effect";
 import type * as Scope from "effect/Scope";
@@ -134,17 +130,13 @@ export interface ChildThreadCoordinatorShape {
    * Already-terminal children are left untouched (their result was/will be
    * delivered to the waiter). A no-op for unknown ids.
    */
-  readonly promoteToWake: (
-    childThreadIds: ReadonlyArray<ThreadId>,
-  ) => Effect.Effect<void>;
+  readonly promoteToWake: (childThreadIds: ReadonlyArray<ThreadId>) => Effect.Effect<void>;
 
   /** Whether the parent has queued sub-agent completion injections awaiting drain. */
   readonly hasPendingInjections: (parentThreadId: ThreadId) => Effect.Effect<boolean>;
 
   /** List the parent's registered children (in-memory view). */
-  readonly listChildren: (
-    parentThreadId: ThreadId,
-  ) => Effect.Effect<ReadonlyArray<ChildListEntry>>;
+  readonly listChildren: (parentThreadId: ThreadId) => Effect.Effect<ReadonlyArray<ChildListEntry>>;
 
   /**
    * Reconcile from the persisted log, then fork the hot event stream. MUST run

@@ -16,13 +16,7 @@ import {
   useScheduledTasks,
 } from "../../state/schedules";
 import { CardFrame } from "../ui/card";
-import {
-  Empty,
-  EmptyDescription,
-  EmptyHeader,
-  EmptyMedia,
-  EmptyTitle,
-} from "../ui/empty";
+import { Empty, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTitle } from "../ui/empty";
 import { Skeleton } from "../ui/skeleton";
 import { ScheduledTaskCard } from "./ScheduledTaskCard";
 
@@ -86,10 +80,7 @@ export function ScheduledTasksPanel() {
   }, [environmentId, projects]);
 
   const threadInfoById = useMemo(() => {
-    const map = new Map<
-      ThreadId,
-      { title: string; projectId: ProjectId; branch: string | null }
-    >();
+    const map = new Map<ThreadId, { title: string; projectId: ProjectId; branch: string | null }>();
     for (const shell of threadShells) {
       if (shell.environmentId === environmentId) {
         map.set(shell.id, {
@@ -140,9 +131,7 @@ export function ScheduledTasksPanel() {
     );
   }
 
-  return (
-    <div className="min-h-0 flex-1 overflow-y-auto px-3 py-4 sm:px-5 sm:py-6">{body}</div>
-  );
+  return <div className="min-h-0 flex-1 overflow-y-auto px-3 py-4 sm:px-5 sm:py-6">{body}</div>;
 }
 
 const EMPTY_STATE_FALLBACK_ATOM = Atom.make(EMPTY_SCHEDULED_TASKS_STATE).pipe(

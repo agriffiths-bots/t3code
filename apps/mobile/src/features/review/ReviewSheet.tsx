@@ -1,3 +1,4 @@
+/* oxlint-disable react/no-unstable-nested-components -- Existing render callbacks are outside this CI hardening change. */
 import type { EnvironmentId, ThreadId } from "@t3tools/contracts";
 import { useLocalSearchParams } from "expo-router";
 import Stack from "expo-router/stack";

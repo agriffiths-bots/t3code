@@ -26,11 +26,11 @@ healthy. **Always kill any server you start when done.**
 
 ## Assets
 
-| File | Purpose |
-|------|---------|
-| `fib-sleep.sh` | Deterministic long-running child. Prints Fibonacci `1 1 2 3 5 8 13 21`, sleeping `n * FIB_SCALE` seconds after each (default `FIB_SCALE=60` => minutes, cumulative **54 min**). Keeps a process — and thus the t3 turn that launched it — alive for the whole budget. `FIB_SCALE=1` => 54s dry-run; `FIB_SCALE=0.05` => ~2.7s smoke. Timestamped heartbeat per step. |
-| `assert.mjs` | Read-only SQLite reader helpers (`node:sqlite`, `mode=ro`): `openState`, `turnCountForThread`, `turnTimestamps`, `childrenOf`, `scheduledTask`, `listScheduledTasks`, `threadShell`, `assistantMessages`. |
-| `drive.mjs` / `drive.sh` | (pre-existing) Programmatically create a project/thread and dispatch a user turn over the Environment HTTP API, then poll projections until the turn settles. Used for bring-up + pre-flight. |
+| File                     | Purpose                                                                                                                                                                                                                                                                                                                                                              |
+| ------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `fib-sleep.sh`           | Deterministic long-running child. Prints Fibonacci `1 1 2 3 5 8 13 21`, sleeping `n * FIB_SCALE` seconds after each (default `FIB_SCALE=60` => minutes, cumulative **54 min**). Keeps a process — and thus the t3 turn that launched it — alive for the whole budget. `FIB_SCALE=1` => 54s dry-run; `FIB_SCALE=0.05` => ~2.7s smoke. Timestamped heartbeat per step. |
+| `assert.mjs`             | Read-only SQLite reader helpers (`node:sqlite`, `mode=ro`): `openState`, `turnCountForThread`, `turnTimestamps`, `childrenOf`, `scheduledTask`, `listScheduledTasks`, `threadShell`, `assistantMessages`.                                                                                                                                                            |
+| `drive.mjs` / `drive.sh` | (pre-existing) Programmatically create a project/thread and dispatch a user turn over the Environment HTTP API, then poll projections until the turn settles. Used for bring-up + pre-flight.                                                                                                                                                                        |
 
 ### `assert.mjs` helpers vs. schema
 
@@ -44,6 +44,7 @@ healthy. **Always kill any server you start when done.**
 ## Scenario → asset/assertion map
 
 ### (a) Same-thread schedule fires repeatedly — `e2ePlan.md` §(a)
+
 - Agent calls `t3_schedule_create({threadId:root, intervalSeconds:60})`.
 - Poll with `turnCountForThread(db, root)` — increases ~1/60s; `scheduledTask`
   shows `next_run_at` advancing, `last_run_at` updating, `last_status='dispatched'`.
@@ -53,6 +54,7 @@ healthy. **Always kill any server you start when done.**
   `last_status='skipped'`, `skipped_count++`, `next_run_at` still advances.
 
 ### (b) Cross-provider spawn (claude+codex+cursor) — `e2ePlan.md` §(b)
+
 - After `t3_spawn_subagent` ×3 (one per provider, `detached:true`):
   `childrenOf(db, root)` returns 3 rows with `parent_thread_id=root`; the
   `model` column verifies per-provider routing.
@@ -64,6 +66,7 @@ healthy. **Always kill any server you start when done.**
   two-child consolidation case.
 
 ### (c) Long wait ~1 hour (opt-in `E2E_ENABLE_1H=1`) — `e2ePlan.md` §(c)
+
 - Child prompt runs `fib-sleep.sh` (default `FIB_SCALE=60`, 54 min cumulative),
   keeping its turn alive script-driven (reliable, not model-driven).
 - Driver loops `t3_wait_subagent(timeoutSeconds:3900)` across ~20s slices.
@@ -75,6 +78,7 @@ healthy. **Always kill any server you start when done.**
   exercise the slice/resumeToken loop without the 1h hold.
 
 ### (d) Killed child → wait returns failure, not hang — `e2ePlan.md` §(d)
+
 - Spawn a ~10 min child (`FIB_SCALE` tuned), start the wait loop.
 - Kill via (i) `thread.delete`, (ii) `kill -9` the provider process,
   (iii) `session.stop`. Assert wait reports `killed`/`failed` within one slice;

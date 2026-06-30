@@ -170,8 +170,7 @@ const projectionLayer = Layer.succeed(ProjectionSnapshotQuery, {
 
 const coordinatorLayer = Layer.succeed(ChildThreadCoordinator, {
   register: () => Effect.void,
-  waitSlice: () =>
-    waitSliceResult ? Effect.succeed(waitSliceResult) : unsupported(),
+  waitSlice: () => (waitSliceResult ? Effect.succeed(waitSliceResult) : unsupported()),
   assertParent: () => Effect.void,
   promoteToWake: (ids) => Effect.sync(() => void promotedCalls.push(ids)),
   hasPendingInjections: () => Effect.succeed(false),
@@ -295,15 +294,13 @@ describe("SubagentToolkit", () => {
     Effect.scoped(
       Effect.gen(function* () {
         const server = yield* McpServer.McpServer;
-        const result = yield* server
-          .callTool({ name: "t3_list_subagents", arguments: {} })
-          .pipe(
-            Effect.provideService(McpInvocationContext.McpInvocationContext, {
-              ...invocation,
-              capabilities: new Set(["preview"] as const),
-            }),
-            Effect.provideService(McpSchema.McpServerClient, client),
-          );
+        const result = yield* server.callTool({ name: "t3_list_subagents", arguments: {} }).pipe(
+          Effect.provideService(McpInvocationContext.McpInvocationContext, {
+            ...invocation,
+            capabilities: new Set(["preview"] as const),
+          }),
+          Effect.provideService(McpSchema.McpServerClient, client),
+        );
         expect(result.isError).toBe(true);
       }),
     ).pipe(Effect.provide(TestLayer)),
@@ -316,9 +313,7 @@ describe("SubagentToolkit", () => {
         promotedCalls.length = 0;
         // The coordinator slice reports the child still pending.
         waitSliceResult = {
-          results: [
-            { childThreadId, status: "pending", finalAssistantText: null, error: null },
-          ],
+          results: [{ childThreadId, status: "pending", finalAssistantText: null, error: null }],
           settledCount: 0,
           timedOutCount: 0,
           pending: true,
@@ -331,7 +326,10 @@ describe("SubagentToolkit", () => {
         const result = yield* server
           .callTool({
             name: "t3_wait_subagent",
-            arguments: { childThreadIds: [childThreadId], resumeToken: "-100000:coordinator-token" },
+            arguments: {
+              childThreadIds: [childThreadId],
+              resumeToken: "-100000:coordinator-token",
+            },
           })
           .pipe(
             Effect.provideService(McpInvocationContext.McpInvocationContext, invocation),

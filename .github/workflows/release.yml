@@ -35,9 +35,102 @@ jobs:
           echo "release_name=T3 Code $version" >> "$GITHUB_OUTPUT"
           echo "release_version=$version" >> "$GITHUB_OUTPUT"
 
+  preflight:
+    name: Preflight
+    needs: metadata
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Setup Vite+
+        uses: voidzero-dev/setup-vp@v1
+        with:
+          node-version-file: package.json
+          cache: true
+          run-install: true
+
+      - name: Ensure Electron runtime is installed
+        run: vp run --filter @t3tools/desktop ensure:electron
+
+      - name: Check
+        run: vp check
+
+      - name: Typecheck
+        run: vp run typecheck
+
+      - name: Test
+        run: vp run test
+
+  public_config:
+    name: Resolve artifact public config
+    needs: preflight
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    environment:
+      name: production
+    outputs:
+      clerk_publishable_key: ${{ steps.public_config.outputs.clerk_publishable_key }}
+      clerk_jwt_template: ${{ steps.public_config.outputs.clerk_jwt_template }}
+      clerk_cli_oauth_client_id: ${{ steps.public_config.outputs.clerk_cli_oauth_client_id }}
+      relay_url: ${{ steps.public_config.outputs.relay_url }}
+    env:
+      T3CODE_RELAY_URL: ${{ vars.T3CODE_RELAY_URL }}
+      RELAY_DOMAIN: ${{ vars.RELAY_DOMAIN }}
+      RELAY_API_ZONE_NAME: ${{ vars.RELAY_API_ZONE_NAME }}
+      CLERK_PUBLISHABLE_KEY: ${{ vars.CLERK_PUBLISHABLE_KEY }}
+      CLERK_JWT_TEMPLATE: ${{ vars.CLERK_JWT_TEMPLATE }}
+      CLERK_CLI_OAUTH_CLIENT_ID: ${{ vars.CLERK_CLI_OAUTH_CLIENT_ID }}
+    steps:
+      - id: public_config
+        name: Resolve build-time cloud config
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          relay_url="${T3CODE_RELAY_URL:-}"
+          if [[ -z "$relay_url" ]]; then
+            relay_domain="${RELAY_DOMAIN:-}"
+            if [[ -z "$relay_domain" && -n "${RELAY_API_ZONE_NAME:-}" ]]; then
+              relay_domain="relay.$RELAY_API_ZONE_NAME"
+            fi
+            if [[ -n "$relay_domain" ]]; then
+              relay_url="https://$relay_domain"
+            fi
+          fi
+
+          required=(
+            relay_url
+            CLERK_PUBLISHABLE_KEY
+            CLERK_JWT_TEMPLATE
+            CLERK_CLI_OAUTH_CLIENT_ID
+          )
+          missing=()
+          for name in "${required[@]}"; do
+            if [[ -z "${!name:-}" ]]; then
+              missing+=("$name")
+            fi
+          done
+          if (( ${#missing[@]} > 0 )); then
+            printf 'Missing required artifact public configuration: %s\n' "${missing[*]}" >&2
+            exit 1
+          fi
+          if [[ ! "$relay_url" =~ ^https:// ]]; then
+            printf 'Artifact relay_url must be an HTTPS URL: %s\n' "$relay_url" >&2
+            exit 1
+          fi
+
+          echo "clerk_publishable_key=$CLERK_PUBLISHABLE_KEY" >> "$GITHUB_OUTPUT"
+          echo "clerk_jwt_template=$CLERK_JWT_TEMPLATE" >> "$GITHUB_OUTPUT"
+          echo "clerk_cli_oauth_client_id=$CLERK_CLI_OAUTH_CLIENT_ID" >> "$GITHUB_OUTPUT"
+          echo "relay_url=$relay_url" >> "$GITHUB_OUTPUT"
+
   publish_artifacts:
     name: Build and publish artifacts
-    needs: metadata
+    needs: [metadata, preflight, public_config]
     uses: ./.github/workflows/reusable-build-release-artifacts.yml
     # This fork intentionally publishes Android APK and Windows x64 artifacts only.
     with:
@@ -45,6 +138,18 @@ jobs:
       release_tag: ${{ needs.metadata.outputs.release_tag }}
       release_name: ${{ needs.metadata.outputs.release_name }}
       release_version: ${{ needs.metadata.outputs.release_version }}
+      android_required: true
+      android_profile: production-apk
+      android_environment: production
+      android_app_variant: production
+      android_artifact_name: t3-code-android.apk
+      android_mobile_version_policy: appVersion
+      android_app_version: ${{ needs.metadata.outputs.release_version }}
+      clerk_publishable_key: ${{ needs.public_config.outputs.clerk_publishable_key }}
+      clerk_jwt_template: ${{ needs.public_config.outputs.clerk_jwt_template }}
+      clerk_cli_oauth_client_id: ${{ needs.public_config.outputs.clerk_cli_oauth_client_id }}
+      relay_url: ${{ needs.public_config.outputs.relay_url }}
       prerelease: false
       make_latest: true
+      windows_signing: true
     secrets: inherit

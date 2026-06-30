@@ -1,5 +1,6 @@
 "use client";
 
+/* oxlint-disable react/no-unstable-nested-components -- Existing renderer callbacks are outside this CI hardening change. */
 import { scopeProjectRef, scopeThreadRef } from "@t3tools/client-runtime/environment";
 import {
   isAtomCommandInterrupted,

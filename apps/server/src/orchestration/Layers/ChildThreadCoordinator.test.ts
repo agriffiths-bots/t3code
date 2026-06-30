@@ -1,5 +1,5 @@
+/* oxlint-disable t3code/no-manual-effect-runtime-in-tests -- These concurrency tests intentionally manage a long-lived runtime, queues, and scopes across helper boundaries. */
 import {
-  CommandId,
   EventId,
   MessageId,
   ProviderInstanceId,
@@ -68,9 +68,7 @@ interface ThreadState {
   readonly detail: OrchestrationThread;
 }
 
-const makeLatestTurn = (
-  state: OrchestrationLatestTurn["state"],
-): OrchestrationLatestTurn => ({
+const makeLatestTurn = (state: OrchestrationLatestTurn["state"]): OrchestrationLatestTurn => ({
   turnId: TurnId.make("turn-1"),
   state,
   requestedAt: now,
@@ -326,9 +324,7 @@ describe("ChildThreadCoordinator", () => {
     const registryLayer = Layer.succeed(ProviderInstanceRegistry, {
       getInstance: (instanceId) =>
         Effect.succeed(
-          knownInstances.has(String(instanceId))
-            ? ({ instanceId } as never)
-            : undefined,
+          knownInstances.has(String(instanceId)) ? ({ instanceId } as never) : undefined,
         ),
       listInstances: Effect.succeed([]),
       listUnavailable: Effect.succeed([]),
@@ -907,9 +903,7 @@ describe("ChildThreadCoordinator", () => {
     });
     // Must complete (not hang) within the test runner timeout.
     await harness.feed(turnDiffEvent(child, "ready"));
-    const turnStarts = harness.dispatched.filter(
-      (command) => command.type === "thread.turn.start",
-    );
+    const turnStarts = harness.dispatched.filter((command) => command.type === "thread.turn.start");
     expect(turnStarts.length).toBeGreaterThanOrEqual(1);
     const result = await runtimeRun(harness, child);
     expect(result.status).toBe("completed");
@@ -1339,7 +1333,9 @@ describe("ChildThreadCoordinator", () => {
 
 // Helpers that run coordinator effects on the harness runtime.
 async function runtimeRun(
-  harness: { readonly coordinator: import("../Services/ChildThreadCoordinator.ts").ChildThreadCoordinatorShape },
+  harness: {
+    readonly coordinator: import("../Services/ChildThreadCoordinator.ts").ChildThreadCoordinatorShape;
+  },
   child: ThreadId,
 ) {
   const slice = await runtimeWaitSlice(harness, [child], FAR_FUTURE_MS);
@@ -1347,7 +1343,9 @@ async function runtimeRun(
 }
 
 async function runtimeWaitSlice(
-  harness: { readonly coordinator: import("../Services/ChildThreadCoordinator.ts").ChildThreadCoordinatorShape },
+  harness: {
+    readonly coordinator: import("../Services/ChildThreadCoordinator.ts").ChildThreadCoordinatorShape;
+  },
   childThreadIds: ReadonlyArray<ThreadId>,
   budgetDeadlineMs: number,
 ) {
@@ -1357,7 +1355,9 @@ async function runtimeWaitSlice(
 }
 
 async function runtimeHasPending(
-  harness: { readonly coordinator: import("../Services/ChildThreadCoordinator.ts").ChildThreadCoordinatorShape },
+  harness: {
+    readonly coordinator: import("../Services/ChildThreadCoordinator.ts").ChildThreadCoordinatorShape;
+  },
   parent: ThreadId,
 ) {
   return Effect.runPromise(harness.coordinator.hasPendingInjections(parent));

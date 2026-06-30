@@ -1,3 +1,4 @@
+/* oxlint-disable react/no-unstable-nested-components -- Existing navigation header render callbacks are outside this CI hardening change. */
 import { Stack, useLocalSearchParams, useRouter } from "expo-router";
 import { useCallback, useMemo, useState } from "react";
 import * as Option from "effect/Option";

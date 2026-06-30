@@ -59,13 +59,15 @@ const firstNonEmpty = (...values: ReadonlyArray<string | undefined>): string | u
 const easProjectId =
   firstNonEmpty(repoEnv.EXPO_PROJECT_ID, repoEnv.EXPO_PUBLIC_EAS_PROJECT_ID) ??
   "d763fcb8-d37c-41ea-a773-b54a0ab4a454";
+const mobileAppVersion =
+  firstNonEmpty(repoEnv.MOBILE_APP_VERSION, repoEnv.EXPO_PUBLIC_APP_VERSION) ?? "0.1.0";
 
 const config: ExpoConfig = {
   name: variant.appName,
   slug: "t3-code",
   platforms: ["ios", "android"],
   scheme: variant.scheme,
-  version: "0.1.0",
+  version: mobileAppVersion,
   runtimeVersion: {
     policy: process.env.MOBILE_VERSION_POLICY ?? "appVersion",
   },

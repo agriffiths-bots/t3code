@@ -29,6 +29,7 @@ query($owner: String!, $repo: String!, $number: Int!, $reviewThreadsAfter: Strin
         }
         nodes {
           isResolved
+          isOutdated
           comments(first: 20) {
             nodes {
               body
@@ -119,6 +120,7 @@ const readReviewedCommit = (body) =>
 const unresolvedCodexThreads = pr.reviewThreads.filter(
   (thread) =>
     !thread.isResolved &&
+    !thread.isOutdated &&
     (thread.comments?.nodes ?? []).some((comment) => isCodex(comment.author?.login)),
 );
 
@@ -154,7 +156,11 @@ const currentGreptileSignals = greptileSignals.filter(
   (signal) => signal.reviewedCommit === pr.headRefOid,
 );
 
-const latestGreptileSignal = currentGreptileSignals.reduce(
+const scoredOrApprovedGreptileSignals = currentGreptileSignals.filter(
+  (signal) => signal.score !== null || (signal.kind === "review" && signal.state === "APPROVED"),
+);
+
+const latestGreptileSignal = scoredOrApprovedGreptileSignals.reduce(
   (latest, signal) =>
     latest === null || signal.normalizedTimestamp > latest.normalizedTimestamp ? signal : latest,
   null,

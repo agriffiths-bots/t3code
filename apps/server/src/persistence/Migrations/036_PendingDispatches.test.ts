@@ -18,7 +18,7 @@ layer("036_PendingDispatches", (it) => {
       const columns = yield* sql<{ readonly name: string }>`
         PRAGMA table_info(pending_dispatches)
       `;
-      const names = columns.map((column) => column.name);
+      const names = new Set(columns.map((column) => column.name));
       for (const expected of [
         "id",
         "kind",
@@ -29,15 +29,13 @@ layer("036_PendingDispatches", (it) => {
         "status",
         "created_at",
       ]) {
-        assert.isTrue(names.includes(expected), `missing column ${expected}`);
+        assert.isTrue(names.has(expected), `missing column ${expected}`);
       }
 
       const indexes = yield* sql<{ readonly name: string }>`
         PRAGMA index_list(pending_dispatches)
       `;
-      assert.isTrue(
-        indexes.some((index) => index.name === "idx_pending_dispatches_kind_target"),
-      );
+      assert.isTrue(indexes.some((index) => index.name === "idx_pending_dispatches_kind_target"));
     }),
   );
 
