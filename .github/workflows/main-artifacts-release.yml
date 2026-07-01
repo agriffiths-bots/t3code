@@ -1,9 +1,14 @@
 name: Main Artifact Release
 
 on:
-  push:
-    branches:
-      - main
+  # Manual only. Nightly automation triggers this via `gh workflow run`; landing
+  # a commit on main no longer auto-publishes a release.
+  workflow_dispatch:
+    inputs:
+      prerelease:
+        description: "Mark the GitHub Release as a prerelease"
+        type: boolean
+        default: true
 
 permissions:
   contents: write
@@ -12,6 +17,9 @@ jobs:
   metadata:
     name: Resolve release metadata
     runs-on: ubuntu-24.04
+    # Releases are built only from main, even though the trigger is manual:
+    # workflow_dispatch can target any ref, so gate every job on the main branch.
+    if: ${{ github.ref == 'refs/heads/main' }}
     outputs:
       release_tag: ${{ steps.meta.outputs.release_tag }}
       release_name: ${{ steps.meta.outputs.release_name }}
@@ -23,7 +31,8 @@ jobs:
         run: |
           set -euo pipefail
           short_sha="${GITHUB_SHA::7}"
-          date_part="$(date -u -d "${{ github.event.head_commit.timestamp }}" +%Y%m%d%H%M%S)"
+          # workflow_dispatch has no head_commit; stamp the release at dispatch time.
+          date_part="$(date -u +%Y%m%d%H%M%S)"
           echo "release_tag=main-${date_part}-${short_sha}" >> "$GITHUB_OUTPUT"
           echo "release_name=T3 Code main ${short_sha}" >> "$GITHUB_OUTPUT"
           echo "release_version=0.0.0-main.${{ github.run_number }}" >> "$GITHUB_OUTPUT"
@@ -31,6 +40,7 @@ jobs:
   public_config:
     name: Resolve artifact public config
     runs-on: ubuntu-24.04
+    if: ${{ github.ref == 'refs/heads/main' }}
     timeout-minutes: 5
     environment:
       name: production
@@ -106,6 +116,7 @@ jobs:
 
   publish_artifacts:
     name: Build and publish artifacts
+    if: ${{ github.ref == 'refs/heads/main' }}
     needs: [metadata, public_config]
     uses: ./.github/workflows/reusable-build-release-artifacts.yml
     with:
@@ -124,6 +135,6 @@ jobs:
       clerk_jwt_template: ${{ needs.public_config.outputs.clerk_jwt_template }}
       clerk_cli_oauth_client_id: ${{ needs.public_config.outputs.clerk_cli_oauth_client_id }}
       relay_url: ${{ needs.public_config.outputs.relay_url }}
-      prerelease: true
+      prerelease: ${{ inputs.prerelease }}
       windows_signing: true
     secrets: inherit
