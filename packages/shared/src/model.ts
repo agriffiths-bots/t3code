@@ -4,6 +4,7 @@ import {
   MODEL_SLUG_ALIASES_BY_PROVIDER,
   type ModelCapabilities,
   type ModelSelection,
+  PROVIDER_INFERENCE_PRIORITY,
   ProviderDriverKind,
   ProviderInstanceId,
   type ProviderOptionDescriptor,
@@ -298,6 +299,113 @@ export function resolveModelSlugForProvider(
   model: string | null | undefined,
 ): string {
   return resolveModelSlug(model, provider);
+}
+
+/** A single model a provider instance serves, plus its default option selections. */
+export interface ProviderModelEntry {
+  readonly slug: string;
+  readonly defaultOptions: ReadonlyArray<ProviderOptionSelection> | undefined;
+}
+
+/**
+ * A live provider instance's model catalog, as seen by the runtime provider
+ * registry: the instance's routing id, its driver kind, and the models it
+ * currently serves (each with its default options). This is the same
+ * upstream-maintained source the model picker uses, so it already includes
+ * newly-added built-in models (e.g. `claude-fable-5`) and any custom models.
+ * Callers should include ENABLED instances only.
+ */
+export interface ProviderModelSource {
+  readonly instanceId: ProviderInstanceId;
+  readonly driverKind: ProviderDriverKind;
+  readonly models: ReadonlyArray<ProviderModelEntry>;
+}
+
+function providerPriorityIndex(driver: ProviderDriverKind): number {
+  const index = PROVIDER_INFERENCE_PRIORITY.indexOf(driver);
+  // Providers not yet ranked sort last, so a newly-introduced provider still
+  // resolves (just at lowest priority) without a code change here.
+  return index === -1 ? PROVIDER_INFERENCE_PRIORITY.length : index;
+}
+
+function makeModelSelection(
+  instanceId: ProviderInstanceId,
+  slug: string,
+  defaultOptions: ReadonlyArray<ProviderOptionSelection> | undefined,
+): ModelSelection {
+  // Preserve the model's default option selections (e.g. reasoning effort) so a
+  // plain-model choice matches what the picker would apply; omit when there are none.
+  return defaultOptions && defaultOptions.length > 0
+    ? { instanceId, model: slug, options: defaultOptions }
+    : { instanceId, model: slug };
+}
+
+/**
+ * Resolve a plain model name to a `ModelSelection` against the LIVE provider
+ * model lists, so a caller never has to know or guess a harness/instance id —
+ * they pass e.g. `claude-opus-4-8`, `gpt-5.4`, or a future `fable-5` and the
+ * official provider is found from the registry data itself (NO hardcoded
+ * model-name patterns). Selection order: the native provider first
+ * (`PROVIDER_INFERENCE_PRIORITY`, so Claude models resolve to `claudeAgent`, not
+ * the Cursor aggregator), and within a provider the `preferInstanceId` (usually
+ * the source thread's instance) wins so a multi-instance setup keeps continuity.
+ * Alias inputs (e.g. `opus`) resolve through the registry alias maps and then
+ * match the live lists; the matched model's default options are preserved.
+ * Returns null when unresolved so callers can fall back to an inherited selection.
+ */
+export function pickModelSelectionFromInstances(
+  model: string | null | undefined,
+  sources: ReadonlyArray<ProviderModelSource>,
+  preferInstanceId?: ProviderInstanceId,
+): ModelSelection | null {
+  const trimmed = typeof model === "string" ? model.trim() : "";
+  if (!trimmed) return null;
+
+  // Lower rank wins: native provider first, then the preferred (source) instance.
+  const rank = (source: ProviderModelSource): number =>
+    providerPriorityIndex(source.driverKind) * 2 +
+    (preferInstanceId !== undefined && source.instanceId === preferInstanceId ? 0 : 1);
+
+  // Best (highest-priority, source-preferred) instance that serves an exact slug.
+  const resolveSlug = (slug: string): ModelSelection | null => {
+    const best = sources
+      .filter((source) => source.models.some((entry) => entry.slug === slug))
+      .sort((a, b) => rank(a) - rank(b))[0];
+    if (best === undefined) return null;
+    const entry = best.models.find((candidate) => candidate.slug === slug);
+    return makeModelSelection(best.instanceId, slug, entry?.defaultOptions);
+  };
+
+  // 1. Direct match against the models each provider actually serves.
+  const direct = resolveSlug(trimmed);
+  if (direct !== null) return direct;
+
+  // 2. Resolve the input through the registry alias maps to its canonical slug(s),
+  // then match each canonical against ALL providers with the same native-priority
+  // preference — so a provider-specific alias (e.g. the Cursor-only
+  // "opus-4.6-thinking") still routes its canonical model to the official
+  // provider rather than the aliasing one.
+  const canonicals = new Set<string>();
+  for (const source of sources) {
+    const aliases = MODEL_SLUG_ALIASES_BY_PROVIDER[source.driverKind] ?? {};
+    const canonical = Object.prototype.hasOwnProperty.call(aliases, trimmed)
+      ? aliases[trimmed]
+      : undefined;
+    if (typeof canonical === "string") canonicals.add(canonical);
+  }
+  let best: ModelSelection | null = null;
+  let bestRank = Number.POSITIVE_INFINITY;
+  for (const canonical of canonicals) {
+    const selection = resolveSlug(canonical);
+    if (selection === null) continue;
+    const chosen = sources.find((source) => source.instanceId === selection.instanceId);
+    const selectionRank = chosen ? rank(chosen) : Number.POSITIVE_INFINITY;
+    if (selectionRank < bestRank) {
+      best = selection;
+      bestRank = selectionRank;
+    }
+  }
+  return best;
 }
 
 /** Trim a string, returning null for empty/missing values. */

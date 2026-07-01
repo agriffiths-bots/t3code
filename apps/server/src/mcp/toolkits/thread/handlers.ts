@@ -7,6 +7,11 @@ import {
   type OrchestrationThreadShell,
 } from "@t3tools/contracts";
 import { buildTemporaryWorktreeBranchName } from "@t3tools/shared/git";
+import {
+  buildProviderOptionSelectionsFromDescriptors,
+  pickModelSelectionFromInstances,
+  type ProviderModelSource,
+} from "@t3tools/shared/model";
 import * as Crypto from "effect/Crypto";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
@@ -17,6 +22,7 @@ import * as Schema from "effect/Schema";
 import * as McpInvocationContext from "../../McpInvocationContext.ts";
 import * as BootstrapTurnStartDispatcher from "../../../orchestration/Services/BootstrapTurnStartDispatcher.ts";
 import { ProjectionSnapshotQuery } from "../../../orchestration/Services/ProjectionSnapshotQuery.ts";
+import { ProviderInstanceRegistry } from "../../../provider/Services/ProviderInstanceRegistry.ts";
 import { GitWorkflowService } from "../../../git/GitWorkflowService.ts";
 import {
   ThreadStartToolError,
@@ -63,6 +69,7 @@ export const activeThreadStartRuntimeOf = (): ActiveThreadStartRuntime | null =>
 const makeActiveThreadStartRuntime = Effect.fn("ThreadToolkit.makeActiveRuntime")(function* () {
   const crypto = yield* Crypto.Crypto;
   const projectionSnapshotQuery = yield* ProjectionSnapshotQuery;
+  const providerInstanceRegistry = yield* ProviderInstanceRegistry;
   const gitWorkflow = yield* GitWorkflowService;
   const uuid = () => crypto.randomUUIDv4.pipe(Effect.orDie);
 
@@ -179,7 +186,22 @@ const makeActiveThreadStartRuntime = Effect.fn("ThreadToolkit.makeActiveRuntime"
     const worktreePath: string | null =
       mode === "existing_worktree" ? (input.worktreePath ?? null) : null;
     const title = input.title ?? truncateTitle(input.prompt);
-    const modelSelection = resolveModelSelection(input, sourceThread);
+    const providerInstances = yield* providerInstanceRegistry.listInstances;
+    const modelSources = yield* Effect.forEach(
+      providerInstances.filter((providerInstance) => providerInstance.enabled),
+      (providerInstance) =>
+        Effect.map(providerInstance.snapshot.getSnapshot, (snapshot) => ({
+          instanceId: providerInstance.instanceId,
+          driverKind: providerInstance.driverKind,
+          models: snapshot.models.map((providerModel) => ({
+            slug: providerModel.slug,
+            defaultOptions: buildProviderOptionSelectionsFromDescriptors(
+              providerModel.capabilities?.optionDescriptors,
+            ),
+          })),
+        })),
+    );
+    const modelSelection = yield* resolveModelSelection(input, sourceThread, modelSources);
     const runtimeMode = input.runtimeMode ?? sourceThread.runtimeMode;
     const interactionMode = input.interactionMode ?? sourceThread.interactionMode;
     const prepareWorktree =
@@ -269,7 +291,29 @@ export const ThreadStartRuntimeLive = Layer.effectDiscard(
 const resolveModelSelection = (
   input: ThreadStartToolInput,
   sourceThread: OrchestrationThreadShell,
-): ModelSelection => input.modelSelection ?? sourceThread.modelSelection;
+  modelSources: ReadonlyArray<ProviderModelSource>,
+): Effect.Effect<ModelSelection, ThreadStartToolError> => {
+  // An explicit bare `model` is resolved against the live provider model lists;
+  // if the caller named a model no provider serves, fail loudly rather than
+  // silently starting the thread on a different (inherited) model.
+  if (input.model !== undefined) {
+    const resolved = pickModelSelectionFromInstances(
+      input.model,
+      modelSources,
+      sourceThread.modelSelection.instanceId,
+    );
+    if (resolved === null) {
+      return Effect.fail(
+        fail(
+          `Model "${input.model}" is not served by any configured provider. Pass a model shown in the model picker, or omit "model" to keep the thread's current model.`,
+        ),
+      );
+    }
+    return Effect.succeed(resolved);
+  }
+  // Otherwise an explicit modelSelection wins, else inherit the source thread.
+  return Effect.succeed(input.modelSelection ?? sourceThread.modelSelection);
+};
 
 const startThread = Effect.fn("ThreadToolkit.startThread")(function* (input: ThreadStartToolInput) {
   const invocation = yield* McpInvocationContext.requireMcpCapability("thread-management").pipe(
