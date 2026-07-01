@@ -1,4 +1,7 @@
+// @effect-diagnostics nodeBuiltinImport:off - Expo config runs in Node and reads a generated release version file.
 import type { ExpoConfig } from "expo/config";
+import * as NodeFS from "node:fs";
+import * as NodePath from "node:path";
 
 import { loadRepoEnv } from "../../scripts/lib/public-config.ts";
 
@@ -60,7 +63,29 @@ const easProjectId =
   firstNonEmpty(repoEnv.EXPO_PROJECT_ID, repoEnv.EXPO_PUBLIC_EAS_PROJECT_ID) ??
   "d763fcb8-d37c-41ea-a773-b54a0ab4a454";
 const mobileAppVersion =
-  firstNonEmpty(repoEnv.MOBILE_APP_VERSION, repoEnv.EXPO_PUBLIC_APP_VERSION) ?? "0.1.0";
+  firstNonEmpty(
+    repoEnv.MOBILE_APP_VERSION,
+    repoEnv.EXPO_PUBLIC_APP_VERSION,
+    readReleaseVersion(),
+  ) ?? "0.1.0";
+
+function readReleaseVersion(): string | undefined {
+  const releaseVersionPath = NodePath.resolve(process.cwd(), "release-version.json");
+
+  try {
+    const parsed: unknown = JSON.parse(NodeFS.readFileSync(releaseVersionPath, "utf8"));
+    const version =
+      typeof parsed === "object" && parsed !== null && "version" in parsed
+        ? parsed.version
+        : undefined;
+    return typeof version === "string" && version.trim().length > 0 ? version.trim() : undefined;
+  } catch (error) {
+    if (error && typeof error === "object" && "code" in error && error.code === "ENOENT") {
+      return undefined;
+    }
+    throw error;
+  }
+}
 
 const config: ExpoConfig = {
   name: variant.appName,

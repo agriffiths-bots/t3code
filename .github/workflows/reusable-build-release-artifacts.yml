@@ -203,6 +203,23 @@ jobs:
           EXPO_TOKEN: ${{ secrets.EXPO_TOKEN }}
         run: eas env:pull "$EAS_ENVIRONMENT" --non-interactive
 
+      - name: Materialize Android app version
+        if: inputs.android_app_version != ''
+        working-directory: apps/mobile
+        env:
+          MOBILE_APP_VERSION: ${{ inputs.android_app_version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          node <<'NODE'
+          const fs = require("node:fs");
+          const version = process.env.MOBILE_APP_VERSION?.trim();
+          if (!version) {
+            throw new Error("MOBILE_APP_VERSION is required when materializing release-version.json.");
+          }
+          fs.writeFileSync("release-version.json", `${JSON.stringify({ version }, null, 2)}\n`);
+          NODE
+
       - name: Build APK with EAS
         working-directory: apps/mobile
         env:

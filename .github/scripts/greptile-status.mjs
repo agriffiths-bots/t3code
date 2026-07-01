@@ -30,6 +30,23 @@ const ghJsonPages = (path, extraArgs = []) => {
   }
 };
 
+const ghJsonObjectPages = (path, arrayKey, extraArgs = []) => {
+  const items = [];
+  for (let page = 1; ; page += 1) {
+    const separator = path.includes("?") ? "&" : "?";
+    const pageJson = ghJson([`${path}${separator}per_page=100&page=${page}`, ...extraArgs]);
+    const pageItems = pageJson[arrayKey];
+    if (!Array.isArray(pageItems)) {
+      throw new Error(`Expected ${path} page ${page} to return a '${arrayKey}' JSON array.`);
+    }
+
+    items.push(...pageItems);
+    if (pageItems.length < 100) {
+      return items;
+    }
+  }
+};
+
 const [owner, repo] = repository.split("/", 2);
 const pr = ghJson([`repos/${owner}/${repo}/pulls/${prNumber}`]);
 const comments = ghJsonPages(`repos/${owner}/${repo}/issues/${prNumber}/comments`);
@@ -94,16 +111,43 @@ const timeline = ghJsonPages(`repos/${owner}/${repo}/issues/${prNumber}/timeline
   "-H",
   "Accept: application/vnd.github+json",
 ]);
-const headRefReachedTimestamp = timeline
-  .filter((event) => event.event === "head_ref_force_pushed" && event.commit_id === headSha)
-  .map((event) => Date.parse(event.created_at ?? ""))
+const headRefReachedEventTimestamp = (event) => {
+  if (event.event === "head_ref_force_pushed" && event.commit_id === headSha) {
+    return Date.parse(event.created_at ?? "");
+  }
+
+  return Number.NaN;
+};
+const headCheckRuns = ghJsonObjectPages(
+  `repos/${owner}/${repo}/commits/${headSha}/check-runs?filter=all`,
+  "check_runs",
+  ["-H", "Accept: application/vnd.github+json"],
+);
+const earliestHeadCheckRunTimestamp = headCheckRuns
+  .map((checkRun) => Date.parse(checkRun.started_at ?? checkRun.completed_at ?? ""))
   .filter((timestamp) => !Number.isNaN(timestamp))
   .reduce(
-    (latest, timestamp) => (latest === null || timestamp > latest ? timestamp : latest),
+    (earliest, timestamp) => (earliest === null || timestamp < earliest ? timestamp : earliest),
     null,
   );
+// Normal `committed` timeline events expose commit author dates, not PR arrival
+// times. Check runs are the safest available proxy; without them, fail closed.
+const headRefReachedTimestamps = timeline
+  .map(headRefReachedEventTimestamp)
+  .filter((timestamp) => !Number.isNaN(timestamp));
+if (earliestHeadCheckRunTimestamp !== null) {
+  headRefReachedTimestamps.push(earliestHeadCheckRunTimestamp);
+}
+const headRefReachedTimestamp = headRefReachedTimestamps.reduce(
+  (latest, timestamp) => (latest === null || timestamp > latest ? timestamp : latest),
+  null,
+);
+const commitMatchesHead = (reviewedCommit) =>
+  typeof reviewedCommit === "string" &&
+  reviewedCommit.length >= 7 &&
+  headSha.startsWith(reviewedCommit);
 const appliesToHead = (signal) =>
-  signal.reviewedCommit === headSha ||
+  commitMatchesHead(signal.reviewedCommit) ||
   (signal.kind === "comment" &&
     signal.score !== null &&
     signal.reviewedCommit === null &&
