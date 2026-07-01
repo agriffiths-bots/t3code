@@ -264,17 +264,22 @@ describe("artifact release workflows", () => {
       expect(reusableWorkflow).toContain("android_public_config:");
       expect(reusableWorkflow).toContain("MOBILE_APP_VERSION: ${{ inputs.android_app_version }}");
       expect(reusableWorkflow).toContain(
-        "T3CODE_CLERK_PUBLISHABLE_KEY: ${{ inputs.android_public_config && (inputs.clerk_publishable_key || vars.CLERK_PUBLISHABLE_KEY) || '' }}",
+        "T3CODE_CLERK_PUBLISHABLE_KEY: ${{ inputs.android_public_config && inputs.clerk_publishable_key || '' }}",
       );
       expect(reusableWorkflow).toContain(
-        "T3CODE_RELAY_URL: ${{ inputs.android_public_config && (inputs.relay_url || vars.T3CODE_RELAY_URL) || '' }}",
+        "T3CODE_RELAY_URL: ${{ inputs.android_public_config && inputs.relay_url || '' }}",
       );
       expect(reusableWorkflow).toContain(
         "MOBILE_VERSION_POLICY: ${{ inputs.android_mobile_version_policy }}",
       );
-      expect(reusableWorkflow).toContain(
-        "T3CODE_RELAY_URL: ${{ inputs.relay_url || vars.T3CODE_RELAY_URL }}",
-      );
+      expect(reusableWorkflow).toContain("T3CODE_RELAY_URL: ${{ inputs.relay_url }}");
+      // Cloud sign-in config must come only from the caller's validated
+      // public_config outputs, never from a raw repo-vars fallback that would
+      // bypass the all-or-nothing / HTTPS validation.
+      expect(reusableWorkflow).not.toContain("|| vars.CLERK_PUBLISHABLE_KEY");
+      expect(reusableWorkflow).not.toContain("|| vars.CLERK_JWT_TEMPLATE");
+      expect(reusableWorkflow).not.toContain("|| vars.CLERK_CLI_OAUTH_CLIENT_ID");
+      expect(reusableWorkflow).not.toContain("|| vars.T3CODE_RELAY_URL");
       expect(reusableWorkflow).toContain(
         'run: node scripts/update-release-package-versions.ts "${{ inputs.release_version }}"',
       );
@@ -283,8 +288,10 @@ describe("artifact release workflows", () => {
       expect(reusableWorkflow).toContain(
         "if: needs.android_preflight.result == 'success' && needs.build_wsl_node_pty.result == 'success'",
       );
-      expect(reusableWorkflow).toContain("!inputs.android_required &&");
-      expect(reusableWorkflow).toContain("needs.android_apk.result == 'skipped'");
+      // Windows is the always-on artifact: publish when it succeeds and Android
+      // either built or is not required, so a failing EAS build never blocks it.
+      expect(reusableWorkflow).toContain("needs.android_apk.result == 'success' ||");
+      expect(reusableWorkflow).toContain("!inputs.android_required");
       expect(ciWorkflow).toContain("mobile_native_static_analysis:");
       expect(ciWorkflow).toContain("brew bundle install --file apps/mobile/Brewfile");
       expect(ciWorkflow).toContain("run: vp run lint:mobile");

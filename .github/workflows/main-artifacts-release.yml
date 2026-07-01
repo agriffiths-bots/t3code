@@ -64,6 +64,15 @@ jobs:
             fi
           fi
 
+          # This fork ships local-only artifacts, so cloud sign-in config is
+          # optional. Embed it only when the full set is present and the relay
+          # URL is HTTPS; otherwise warn and emit empty values so desktop and
+          # mobile builds still succeed with cloud features disabled.
+          clerk_publishable_key=""
+          clerk_jwt_template=""
+          clerk_cli_oauth_client_id=""
+          resolved_relay_url=""
+
           required=(
             relay_url
             CLERK_PUBLISHABLE_KEY
@@ -76,19 +85,24 @@ jobs:
               missing+=("$name")
             fi
           done
+
           if (( ${#missing[@]} > 0 )); then
-            printf 'Missing required artifact public configuration: %s\n' "${missing[*]}" >&2
-            exit 1
-          fi
-          if [[ ! "$relay_url" =~ ^https:// ]]; then
-            printf 'Artifact relay_url must be an HTTPS URL: %s\n' "$relay_url" >&2
-            exit 1
+            echo "::warning::Cloud public config incomplete (${missing[*]}); building local-only artifacts without cloud sign-in."
+          elif [[ ! "$relay_url" =~ ^https:// ]]; then
+            echo "::warning::Ignoring non-HTTPS relay_url ($relay_url); building local-only artifacts."
+          else
+            clerk_publishable_key="$CLERK_PUBLISHABLE_KEY"
+            clerk_jwt_template="$CLERK_JWT_TEMPLATE"
+            clerk_cli_oauth_client_id="$CLERK_CLI_OAUTH_CLIENT_ID"
+            resolved_relay_url="$relay_url"
           fi
 
-          echo "clerk_publishable_key=$CLERK_PUBLISHABLE_KEY" >> "$GITHUB_OUTPUT"
-          echo "clerk_jwt_template=$CLERK_JWT_TEMPLATE" >> "$GITHUB_OUTPUT"
-          echo "clerk_cli_oauth_client_id=$CLERK_CLI_OAUTH_CLIENT_ID" >> "$GITHUB_OUTPUT"
-          echo "relay_url=$relay_url" >> "$GITHUB_OUTPUT"
+          {
+            echo "clerk_publishable_key=$clerk_publishable_key"
+            echo "clerk_jwt_template=$clerk_jwt_template"
+            echo "clerk_cli_oauth_client_id=$clerk_cli_oauth_client_id"
+            echo "relay_url=$resolved_relay_url"
+          } >> "$GITHUB_OUTPUT"
 
   publish_artifacts:
     name: Build and publish artifacts
