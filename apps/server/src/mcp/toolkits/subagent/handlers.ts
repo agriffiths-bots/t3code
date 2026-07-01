@@ -760,18 +760,27 @@ const scheduleUpdate = Effect.fn("SubagentToolkit.scheduleUpdate")(function* (
 
   // Three-way `model` handling: omit (undefined) keeps the current selection;
   // an explicit null un-pins it (runs inherit the thread's model again); a plain
-  // name re-routes, preferring the task's current instance on ties so a
-  // multi-instance setup keeps continuity.
-  const modelSelection =
-    input.model === undefined
-      ? existing.modelSelection
-      : input.model === null
-        ? null
-        : yield* resolveExplicitModelSelection(
-            runtime,
-            input.model,
-            existing.modelSelection?.instanceId,
-          );
+  // name re-routes. On a re-route, prefer the schedule's current instance, or —
+  // when it is still inheriting — the target thread's instance, so a
+  // multi-instance setup keeps continuity (matches create).
+  let modelSelection: ModelSelection | null;
+  if (input.model === undefined) {
+    modelSelection = existing.modelSelection;
+  } else if (input.model === null) {
+    modelSelection = null;
+  } else {
+    const preferInstanceId =
+      existing.modelSelection?.instanceId ??
+      (yield* loadThreadShell(runtime, existing.threadId).pipe(
+        Effect.map((shellOption) =>
+          Option.match(shellOption, {
+            onNone: () => undefined,
+            onSome: (shell) => shell.modelSelection.instanceId,
+          }),
+        ),
+      ));
+    modelSelection = yield* resolveExplicitModelSelection(runtime, input.model, preferInstanceId);
+  }
 
   const updated: ScheduledTask = {
     ...existing,

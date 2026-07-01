@@ -26,6 +26,7 @@ import {
   type BootstrapTurnStartDispatcherShape,
 } from "../Services/BootstrapTurnStartDispatcher.ts";
 import { ProjectionSnapshotQuery } from "../Services/ProjectionSnapshotQuery.ts";
+import { ProviderInstanceRegistry } from "../../provider/Services/ProviderInstanceRegistry.ts";
 import {
   ScheduledTaskRepository,
   type ScheduledTask,
@@ -74,6 +75,7 @@ const makeScheduledTasksReactor = Effect.gen(function* () {
   const projectionSnapshotQuery = yield* ProjectionSnapshotQuery;
   const coordinator = yield* ChildThreadCoordinator;
   const repository = yield* ScheduledTaskRepository;
+  const providerInstanceRegistry = yield* ProviderInstanceRegistry;
   const sql = yield* SqlClient;
 
   const nowMillis = Effect.clockWith((clock) => clock.currentTimeMillis);
@@ -139,10 +141,12 @@ const makeScheduledTasksReactor = Effect.gen(function* () {
         commandId,
         threadId: task.threadId,
         message: { messageId, role: "user", text: task.prompt, attachments: [] },
-        // A schedule may pin its own model/harness (Fix 1); pass it as a per-turn
-        // override. Null inherits the thread's current model, matching the prior
-        // behaviour where the reactor never set a selection.
-        ...(task.modelSelection !== null ? { modelSelection: task.modelSelection } : {}),
+        // A schedule may pin its own model/harness (Fix 1); dispatch it as a
+        // per-turn override. Fall back to the thread's current model so an
+        // unpinned run always re-asserts the thread's model explicitly and never
+        // inherits a selection cached in-process by a different pinned schedule
+        // that fired on the same thread.
+        modelSelection: task.modelSelection ?? shell.modelSelection,
         runtimeMode: shell.runtimeMode,
         interactionMode: shell.interactionMode,
         bootstrap: undefined,
@@ -233,6 +237,40 @@ const makeScheduledTasksReactor = Effect.gen(function* () {
         return;
       }
       const shell = shellOption.value;
+
+      // A pinned schedule whose provider differs from the thread's ACTIVE session
+      // cannot switch drivers mid-session (ProviderCommandReactor hard-rejects the
+      // switch), so dispatching would only error and burn retries. Detect that
+      // guaranteed-rejection case up front and disable with an actionable message
+      // instead. Same-driver instance changes are left to the provider layer
+      // (which restarts the session), and an unpinned schedule is never affected.
+      if (
+        task.modelSelection !== null &&
+        shell.session !== null &&
+        shell.session.status !== "stopped" &&
+        shell.session.providerInstanceId !== undefined &&
+        shell.session.providerInstanceId !== task.modelSelection.instanceId
+      ) {
+        const pinInstance = yield* providerInstanceRegistry.getInstance(
+          task.modelSelection.instanceId,
+        );
+        const sessionInstance = yield* providerInstanceRegistry.getInstance(
+          shell.session.providerInstanceId,
+        );
+        if (
+          pinInstance !== undefined &&
+          sessionInstance !== undefined &&
+          pinInstance.driverKind !== sessionInstance.driverKind
+        ) {
+          yield* disableTask(
+            task,
+            "error",
+            `pinned model '${task.modelSelection.model}' uses provider '${pinInstance.driverKind}', but thread ${task.threadId} has an active '${sessionInstance.driverKind}' session; stop that session or schedule on a dedicated thread`,
+            nowMs,
+          );
+          return;
+        }
+      }
 
       // Avoid racing the coordinator's pending-injection drain on the same
       // thread: skip this tick and nudge forward.
