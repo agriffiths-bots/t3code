@@ -1,14 +1,18 @@
 name: Main Artifact Release
 
 on:
-  # Manual only. Nightly automation triggers this via `gh workflow run`; landing
-  # a commit on main no longer auto-publishes a release.
+  # Manual, plus a nightly build at ~23:17 UTC. Landing a commit on main no longer
+  # auto-publishes a release. (Cron is UTC; adjust for local time / DST.)
+  # Minute offset (17, not 0) avoids GitHub's top-of-hour scheduler congestion,
+  # where minute-zero runs are frequently delayed or dropped.
   workflow_dispatch:
     inputs:
       prerelease:
         description: "Mark the GitHub Release as a prerelease"
         type: boolean
         default: true
+  schedule:
+    - cron: "17 23 * * *"
 
 permissions:
   contents: write
@@ -135,6 +139,39 @@ jobs:
       clerk_jwt_template: ${{ needs.public_config.outputs.clerk_jwt_template }}
       clerk_cli_oauth_client_id: ${{ needs.public_config.outputs.clerk_cli_oauth_client_id }}
       relay_url: ${{ needs.public_config.outputs.relay_url }}
-      prerelease: ${{ inputs.prerelease }}
+      # Nightly (schedule) builds are always prereleases; manual runs honor the input.
+      prerelease: ${{ github.event_name == 'schedule' || inputs.prerelease }}
       windows_signing: true
     secrets: inherit
+
+  prune_nightly:
+    name: Prune old nightly releases
+    needs: publish_artifacts
+    # Only after a successful publish on main; keeps the Releases page from
+    # accumulating a daily nightly prerelease forever. Stable (v*) tags untouched.
+    if: ${{ github.ref == 'refs/heads/main' && needs.publish_artifacts.result == 'success' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Keep only the 14 most recent main-* prereleases
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          stale="$(gh release list --limit 300 \
+            --json tagName,isPrerelease,createdAt \
+            --jq '[.[] | select(.isPrerelease and (.tagName | startswith("main-")))]
+                  | sort_by(.createdAt) | reverse | .[14:] | .[].tagName')"
+          if [[ -z "$stale" ]]; then
+            echo "No stale nightly releases to prune."
+            exit 0
+          fi
+          while IFS= read -r tag; do
+            [[ -n "$tag" ]] || continue
+            echo "Deleting old nightly release $tag"
+            gh release delete "$tag" --cleanup-tag --yes || true
+          done <<< "$stale"

@@ -254,6 +254,10 @@ describe("artifact release workflows", () => {
       // Manual-only: landing on main must not auto-publish a release.
       expect(mainWorkflow).toContain("workflow_dispatch:");
       expect(mainWorkflow).not.toContain("push:");
+      // Nightly build at 23:00 UTC (manual dispatch still supported).
+      // Nightly cron is offset off minute zero to dodge GitHub's top-of-hour
+      // scheduler congestion (minute-zero runs get delayed/dropped under load).
+      expect(mainWorkflow).toContain('cron: "17 23 * * *"');
       // ...but a manual dispatch may only build/publish from main, never an arbitrary ref.
       // All three jobs (metadata, public_config, publish_artifacts) must carry the guard,
       // so count occurrences rather than merely asserting presence.
@@ -265,8 +269,17 @@ describe("artifact release workflows", () => {
       expect(mainWorkflow).toContain("android_artifact_name: t3-code-preview-android.apk");
       expect(mainWorkflow).toContain("android_mobile_version_policy: fingerprint");
       expect(mainWorkflow).toContain("android_public_config: false");
-      expect(mainWorkflow).toContain("prerelease: ${{ inputs.prerelease }}");
+      expect(mainWorkflow).toContain(
+        "prerelease: ${{ github.event_name == 'schedule' || inputs.prerelease }}",
+      );
       expect(mainWorkflow).toContain("windows_signing: true");
+      // Nightly prereleases would otherwise accumulate one release/day forever;
+      // a retention job prunes stale main-* prereleases after a successful publish.
+      expect(mainWorkflow).toContain("prune_nightly:");
+      expect(mainWorkflow).toContain("needs: publish_artifacts");
+      expect(mainWorkflow).toContain(
+        "if: ${{ github.ref == 'refs/heads/main' && needs.publish_artifacts.result == 'success' }}",
+      );
       expect(reusableWorkflow).toContain("android_mobile_version_policy:");
       expect(reusableWorkflow).toContain("android_app_version:");
       expect(reusableWorkflow).toContain("android_public_config:");
@@ -302,6 +315,8 @@ describe("artifact release workflows", () => {
       expect(reusableWorkflow).toContain("!inputs.android_required");
       // An optional Android failure must not turn the whole release run red.
       expect(reusableWorkflow).toContain("continue-on-error: ${{ !inputs.android_required }}");
+      // EAS cloud builds need a generous timeout so the APK isn't cancelled.
+      expect(reusableWorkflow).toContain("timeout-minutes: 90");
       expect(ciWorkflow).toContain("mobile_native_static_analysis:");
       expect(ciWorkflow).toContain("brew bundle install --file apps/mobile/Brewfile");
       expect(ciWorkflow).toContain("run: vp run lint:mobile");
