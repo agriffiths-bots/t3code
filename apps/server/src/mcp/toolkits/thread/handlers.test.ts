@@ -20,6 +20,7 @@ import { GitWorkflowService } from "../../../git/GitWorkflowService.ts";
 import * as BootstrapTurnStartDispatcher from "../../../orchestration/Services/BootstrapTurnStartDispatcher.ts";
 import { OrchestrationEngineService } from "../../../orchestration/Services/OrchestrationEngine.ts";
 import { ProjectionSnapshotQuery } from "../../../orchestration/Services/ProjectionSnapshotQuery.ts";
+import { ProviderInstanceRegistry } from "../../../provider/Services/ProviderInstanceRegistry.ts";
 import * as McpInvocationContext from "../../McpInvocationContext.ts";
 import { ThreadToolkitRegistrationLive } from "../../McpHttpServer.ts";
 import { ThreadStartRuntimeLive } from "./handlers.ts";
@@ -115,6 +116,11 @@ const makeTestLayer = (commands: OrchestrationCommand[]) => {
       Layer.mock(ProjectionSnapshotQuery)({
         getProjectShellById: () => Effect.succeed(Option.some(project)),
         getThreadShellById: () => Effect.succeed(Option.some(sourceThread)),
+      }),
+    ),
+    Layer.provide(
+      Layer.mock(ProviderInstanceRegistry)({
+        listInstances: Effect.succeed([]),
       }),
     ),
     Layer.provide(

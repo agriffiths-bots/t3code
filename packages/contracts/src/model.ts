@@ -206,3 +206,20 @@ export const PROVIDER_DISPLAY_NAMES: Partial<Record<ProviderDriverKind, string>>
   [GROK_DRIVER_KIND]: "Grok",
   [OPENCODE_DRIVER_KIND]: "OpenCode",
 };
+
+/**
+ * Preference order for inferring a model's official provider/harness from its
+ * name (see `inferProviderFromModel`). Native providers come first; aggregator
+ * providers that re-list other providers' models (e.g. Cursor exposes Claude
+ * models) come last, so a model offered by several providers resolves to its
+ * official one — Claude models to `claudeAgent`, not `cursor`. This is an
+ * attribute of provider identity, not of model names, so it needs no change
+ * when new models ship: those are picked up from the registry maps above.
+ */
+export const PROVIDER_INFERENCE_PRIORITY: ReadonlyArray<ProviderDriverKind> = [
+  CODEX_DRIVER_KIND,
+  CLAUDE_DRIVER_KIND,
+  GROK_DRIVER_KIND,
+  OPENCODE_DRIVER_KIND,
+  CURSOR_DRIVER_KIND,
+];

@@ -19,6 +19,10 @@ import {
   type ModelSelection,
   type OrchestrationThread,
 } from "@t3tools/contracts";
+import {
+  buildProviderOptionSelectionsFromDescriptors,
+  pickModelSelectionFromInstances,
+} from "@t3tools/shared/model";
 import { Cron } from "croner";
 import * as Crypto from "effect/Crypto";
 import * as DateTime from "effect/DateTime";
@@ -188,13 +192,53 @@ const spawnSubagent = Effect.fn("SubagentToolkit.spawn")(function* (input: Spawn
       }),
     ),
   );
-  const modelSelection: ModelSelection = threadStartInput.modelSelection ?? source.modelSelection;
+  const providerInstances = yield* runtime.providerInstanceRegistry.listInstances;
+  const modelSources = yield* Effect.forEach(
+    providerInstances.filter((providerInstance) => providerInstance.enabled),
+    (providerInstance) =>
+      Effect.map(providerInstance.snapshot.getSnapshot, (snapshot) => ({
+        instanceId: providerInstance.instanceId,
+        driverKind: providerInstance.driverKind,
+        models: snapshot.models.map((providerModel) => ({
+          slug: providerModel.slug,
+          defaultOptions: buildProviderOptionSelectionsFromDescriptors(
+            providerModel.capabilities?.optionDescriptors,
+          ),
+        })),
+      })),
+  );
+  // An explicit bare `model` resolves against the live provider model lists; a
+  // named model no provider serves fails loudly instead of silently spawning on
+  // a different (inherited) model. Prefer the source thread's instance on ties.
+  let modelSelection: ModelSelection;
+  if (threadStartInput.model !== undefined) {
+    const resolved = pickModelSelectionFromInstances(
+      threadStartInput.model,
+      modelSources,
+      source.modelSelection.instanceId,
+    );
+    if (resolved === null) {
+      return yield* fail(
+        `Model "${threadStartInput.model}" is not served by any configured provider. Pass a model shown in the model picker, or omit "model" to keep the thread's current model.`,
+      );
+    }
+    modelSelection = resolved;
+  } else {
+    modelSelection = threadStartInput.modelSelection ?? source.modelSelection;
+  }
   const instance = yield* runtime.providerInstanceRegistry.getInstance(modelSelection.instanceId);
   if (instance === undefined) {
     return yield* fail(`Provider instance ${modelSelection.instanceId} is not available.`);
   }
 
-  const started = yield* spawnRuntime(threadStartInput, invocation);
+  // Spawn with the ALREADY-resolved selection (drop `model`) so the thread
+  // runtime does not re-resolve against a possibly-different registry snapshot —
+  // the coordinator record and the started thread then share one selection.
+  const { model: _resolvedModel, ...threadStartInputWithSelection } = threadStartInput;
+  const started = yield* spawnRuntime(
+    { ...threadStartInputWithSelection, modelSelection },
+    invocation,
+  );
   const spawnedAtMs = yield* Effect.clockWith((clock) => clock.currentTimeMillis);
 
   yield* coordinator.register({
