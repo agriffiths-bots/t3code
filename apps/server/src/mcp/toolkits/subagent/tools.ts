@@ -179,9 +179,10 @@ export const ScheduleUpdateInput = Schema.Struct({
   busyPolicy: Schema.optional(ScheduleBusyPolicy),
   intervalSeconds: Schema.optional(Schema.Int),
   cronExpr: Schema.optional(Schema.String),
-  // Re-route the schedule to a new plain model name (provider/harness inferred).
-  // Omit to leave the current model unchanged.
-  model: Schema.optional(TrimmedNonEmptyString),
+  // Re-route the schedule to a new plain model name (provider/harness inferred),
+  // or pass null to un-pin and inherit the thread's current model again. Omit to
+  // leave the current model unchanged.
+  model: Schema.optional(Schema.NullOr(TrimmedNonEmptyString)),
 });
 export type ScheduleUpdateInput = typeof ScheduleUpdateInput.Type;
 
@@ -283,7 +284,7 @@ export const ScheduleListTool = Tool.make("t3_schedule_list", {
 
 export const ScheduleUpdateTool = Tool.make("t3_schedule_update", {
   description:
-    "Update a scheduled task: enable/disable it, change its busyPolicy, change its interval or cron expression (cron is re-validated), or re-route it to a new model by passing `model` as a plain model name (provider/harness inferred). Only the supplied fields are changed.",
+    "Update a scheduled task: enable/disable it, change its busyPolicy, change its interval or cron expression (cron is re-validated), re-route it to a new model by passing `model` as a plain model name (provider/harness inferred), or pass `model: null` to un-pin the model so runs inherit the thread's current model again. Only the supplied fields are changed.",
   parameters: ScheduleUpdateInput,
   success: ScheduleEntry,
   failure: ThreadStartToolError,

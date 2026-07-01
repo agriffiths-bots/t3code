@@ -758,17 +758,20 @@ const scheduleUpdate = Effect.fn("SubagentToolkit.scheduleUpdate")(function* (
     nextRunAt = computed === null ? null : IsoDateTime.make(computed);
   }
 
-  // Re-route to a new model only when `model` is supplied; otherwise the spread
-  // of `existing` preserves the current selection. Prefer the task's current
-  // instance on ties so a multi-instance setup keeps continuity.
+  // Three-way `model` handling: omit (undefined) keeps the current selection;
+  // an explicit null un-pins it (runs inherit the thread's model again); a plain
+  // name re-routes, preferring the task's current instance on ties so a
+  // multi-instance setup keeps continuity.
   const modelSelection =
-    input.model !== undefined
-      ? yield* resolveExplicitModelSelection(
-          runtime,
-          input.model,
-          existing.modelSelection?.instanceId,
-        )
-      : existing.modelSelection;
+    input.model === undefined
+      ? existing.modelSelection
+      : input.model === null
+        ? null
+        : yield* resolveExplicitModelSelection(
+            runtime,
+            input.model,
+            existing.modelSelection?.instanceId,
+          );
 
   const updated: ScheduledTask = {
     ...existing,

@@ -1,5 +1,7 @@
 import {
   EnvironmentId,
+  IsoDateTime,
+  NonNegativeInt,
   ProjectId,
   ProviderInstanceId,
   ThreadId,
@@ -30,7 +32,11 @@ import {
   PendingDispatchRepository,
   type PendingDispatch,
 } from "../../../persistence/Services/PendingDispatches.ts";
-import { ScheduledTaskRepository } from "../../../persistence/Services/ScheduledTasks.ts";
+import {
+  ScheduledTaskRepository,
+  ScheduledTaskId,
+  type ScheduledTask,
+} from "../../../persistence/Services/ScheduledTasks.ts";
 import { ProviderInstanceRegistry } from "../../../provider/Services/ProviderInstanceRegistry.ts";
 import { SubagentToolkitRegistrationLive } from "../../McpHttpServer.ts";
 import * as McpInvocationContext from "../../McpInvocationContext.ts";
@@ -151,6 +157,32 @@ const insertedDispatches: Array<PendingDispatch> = [];
 // schedule handlers resolve a plain `model` against, and the tasks they persist.
 let modelInstances: ReadonlyArray<unknown> = [];
 const insertedTasks: Array<{ readonly modelSelection: ModelSelection | null }> = [];
+// Existing scheduled tasks visible to t3_schedule_update (via listAll), and the
+// updated rows it writes back — so a test can assert a model re-route / un-pin.
+let existingTasks: ReadonlyArray<ScheduledTask> = [];
+const updatedTasks: Array<ScheduledTask> = [];
+
+const scheduledTaskId = ScheduledTaskId.make("sched-fix1");
+const makeScheduledTask = (modelSelection: ModelSelection | null): ScheduledTask => ({
+  taskId: scheduledTaskId,
+  threadId: parentThreadId,
+  prompt: "nightly summary",
+  scheduleKind: "interval",
+  intervalSeconds: 3_600,
+  cronExpr: null,
+  timezoneName: "UTC",
+  enabled: NonNegativeInt.make(1),
+  busyPolicy: "skip",
+  nextRunAt: IsoDateTime.make("2026-06-17T10:00:00.000Z"),
+  lastRunAt: null,
+  lastStatus: null,
+  lastError: null,
+  skippedCount: NonNegativeInt.make(0),
+  retryCount: NonNegativeInt.make(0),
+  queuedCount: NonNegativeInt.make(0),
+  modelSelection,
+  createdAt: IsoDateTime.make("2026-06-17T09:00:00.000Z"),
+});
 
 // A minimal provider instance exposing just what buildModelSources reads: an id,
 // a driver kind, enabled=true, and a snapshot whose models list the given slugs.
@@ -244,10 +276,10 @@ const providerRegistryLayer = Layer.succeed(ProviderInstanceRegistry, {
 const scheduledTasksLayer = Layer.succeed(ScheduledTaskRepository, {
   listDue: () => Effect.succeed([]),
   insert: (task) => Effect.sync(() => void insertedTasks.push(task)),
-  update: () => Effect.void,
+  update: (task) => Effect.sync(() => void updatedTasks.push(task)),
   delete: () => Effect.void,
   markRun: () => Effect.void,
-  listAll: () => Effect.succeed([]),
+  listAll: () => Effect.suspend(() => Effect.succeed(existingTasks)),
   listByThread: () => Effect.succeed([]),
   revisionChanges: Stream.empty,
 });
@@ -582,6 +614,68 @@ describe("SubagentToolkit", () => {
         // An unroutable model errors rather than silently inheriting; nothing persisted.
         expect(result.isError).toBe(true);
         expect(insertedTasks).toHaveLength(0);
+      }),
+    ).pipe(Effect.provide(TestLayer)),
+  );
+
+  it.effect("Fix 1: t3_schedule_update with model:null un-pins the model", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const server = yield* McpServer.McpServer;
+        updatedTasks.length = 0;
+        // A task currently pinned to Claude.
+        existingTasks = [
+          makeScheduledTask({
+            instanceId: ProviderInstanceId.make("claudeAgent"),
+            model: "claude-opus-4-8",
+          }),
+        ];
+
+        const result = yield* server
+          .callTool({
+            name: "t3_schedule_update",
+            arguments: { taskId: scheduledTaskId, model: null },
+          })
+          .pipe(
+            Effect.provideService(McpInvocationContext.McpInvocationContext, invocation),
+            Effect.provideService(McpSchema.McpServerClient, client),
+          );
+
+        expect(result.isError).toBe(false);
+        // The pin is cleared on both the returned entry and the persisted row.
+        expect(result.structuredContent).toMatchObject({ modelSelection: null });
+        expect(updatedTasks).toHaveLength(1);
+        expect(updatedTasks[0]!.modelSelection).toBeNull();
+      }),
+    ).pipe(Effect.provide(TestLayer)),
+  );
+
+  it.effect("Fix 1: t3_schedule_update re-routes to a new plain model", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const server = yield* McpServer.McpServer;
+        updatedTasks.length = 0;
+        existingTasks = [makeScheduledTask(null)];
+        modelInstances = [
+          makeModelInstance("codex", "codex", ["gpt-5.4", "gpt-5.4-mini"]),
+          makeModelInstance("claudeAgent", "claudeAgent", ["claude-opus-4-8"]),
+        ];
+
+        const result = yield* server
+          .callTool({
+            name: "t3_schedule_update",
+            arguments: { taskId: scheduledTaskId, model: "gpt-5.4" },
+          })
+          .pipe(
+            Effect.provideService(McpInvocationContext.McpInvocationContext, invocation),
+            Effect.provideService(McpSchema.McpServerClient, client),
+          );
+
+        expect(result.isError).toBe(false);
+        expect(updatedTasks[0]!.modelSelection).toMatchObject({
+          instanceId: "codex",
+          model: "gpt-5.4",
+        });
       }),
     ).pipe(Effect.provide(TestLayer)),
   );
