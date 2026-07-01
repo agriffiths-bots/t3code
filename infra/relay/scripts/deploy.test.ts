@@ -292,6 +292,8 @@ describe("artifact release workflows", () => {
       // either built or is not required, so a failing EAS build never blocks it.
       expect(reusableWorkflow).toContain("needs.android_apk.result == 'success' ||");
       expect(reusableWorkflow).toContain("!inputs.android_required");
+      // An optional Android failure must not turn the whole release run red.
+      expect(reusableWorkflow).toContain("continue-on-error: ${{ !inputs.android_required }}");
       expect(ciWorkflow).toContain("mobile_native_static_analysis:");
       expect(ciWorkflow).toContain("brew bundle install --file apps/mobile/Brewfile");
       expect(ciWorkflow).toContain("run: vp run lint:mobile");

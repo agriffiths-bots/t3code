@@ -156,6 +156,10 @@ jobs:
     if: needs.android_preflight.outputs.expo_token_present == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 45
+    # When Android is optional (main prereleases), a failing EAS build must not
+    # turn the whole release run red — Windows still publishes. Stable releases
+    # keep Android required, so there a failure fails the run as before.
+    continue-on-error: ${{ !inputs.android_required }}
     env:
       APP_VARIANT: ${{ inputs.android_app_variant }}
       MOBILE_APP_VERSION: ${{ inputs.android_app_version }}
