@@ -260,7 +260,7 @@ export const ListSubagentsTool = Tool.make("t3_list_subagents", {
 
 export const ScheduleCreateTool = Tool.make("t3_schedule_create", {
   description:
-    "Schedule a recurring prompt to be sent to a thread (defaults to the calling thread). Provide exactly one of intervalSeconds (fixed interval) or cronExpr (a cron expression, validated on create); optionally a timezone (IANA name, default UTC) and busyPolicy (\"skip\" default, or \"queue_once\"). The same thread is reused on every trigger. To pin the model each run uses, pass `model` as a plain model name (e.g. 'claude-opus-4-8' or 'gpt-5.4'); the provider/harness is inferred automatically, so you never guess a harness/instance id. Omit `model` to inherit the thread's current model on each run.",
+    "Schedule a recurring prompt to be sent to a thread (defaults to the calling thread). Provide exactly one of intervalSeconds (fixed interval) or cronExpr (a cron expression, validated on create); optionally a timezone (IANA name, default UTC) and busyPolicy (\"skip\" default, or \"queue_once\"). The same thread is reused on every trigger. To pin the model each run uses, pass `model` as a plain model name (e.g. 'claude-opus-4-8' or 'gpt-5.4'); the provider/harness is inferred automatically, so you never guess a harness/instance id. Pin a model on the thread's own provider (like the interactive model picker) — pinning a different provider than the thread's active session errors at run time, so prefer a dedicated thread for a cross-provider schedule. Omit `model` to inherit the thread's current model on each run.",
   parameters: ScheduleCreateInput,
   success: ScheduleEntry,
   failure: ThreadStartToolError,

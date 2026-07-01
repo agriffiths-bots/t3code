@@ -196,6 +196,7 @@ const makeModelInstance = (
   enabled: true,
   snapshot: {
     getSnapshot: Effect.succeed({
+      status: "ready",
       models: slugs.map((slug) => ({ slug, capabilities: null })),
     }),
   },

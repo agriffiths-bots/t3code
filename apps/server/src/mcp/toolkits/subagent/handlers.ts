@@ -12,6 +12,7 @@
  */
 import {
   CommandId,
+  isProviderAvailable,
   IsoDateTime,
   MessageId,
   NonNegativeInt,
@@ -176,11 +177,14 @@ const loadThreadDetail = (runtime: SubagentRuntime, threadId: ThreadId) =>
     .pipe(Effect.mapError((error) => toToolError(error, "Failed to load thread detail.")));
 
 /**
- * Snapshot every ENABLED provider instance's live model list into the shape
+ * Snapshot every USABLE provider instance's live model list into the shape
  * `pickModelSelectionFromInstances` consumes (routing id + driver kind + the
  * models it currently serves, each with default options). This is the same
  * upstream-maintained registry the model picker reads, so newly-shipped models
- * are matched without any code change here.
+ * are matched without any code change here. Instances are filtered to those the
+ * picker would expose: enabled, available, and not in an error state — an errored
+ * or unavailable snapshot can still carry built-in models the runtime refuses to
+ * run, so resolving against them would pin a schedule that only ever fails.
  */
 const buildModelSources = (runtime: SubagentRuntime) =>
   runtime.providerInstanceRegistry.listInstances.pipe(
@@ -189,16 +193,24 @@ const buildModelSources = (runtime: SubagentRuntime) =>
         providerInstances.filter((providerInstance) => providerInstance.enabled),
         (providerInstance) =>
           Effect.map(providerInstance.snapshot.getSnapshot, (snapshot) => ({
-            instanceId: providerInstance.instanceId,
-            driverKind: providerInstance.driverKind,
-            models: snapshot.models.map((providerModel) => ({
-              slug: providerModel.slug,
-              defaultOptions: buildProviderOptionSelectionsFromDescriptors(
-                providerModel.capabilities?.optionDescriptors,
-              ),
-            })),
+            providerInstance,
+            snapshot,
           })),
       ),
+    ),
+    Effect.map((pairs) =>
+      pairs
+        .filter(({ snapshot }) => isProviderAvailable(snapshot) && snapshot.status !== "error")
+        .map(({ providerInstance, snapshot }) => ({
+          instanceId: providerInstance.instanceId,
+          driverKind: providerInstance.driverKind,
+          models: snapshot.models.map((providerModel) => ({
+            slug: providerModel.slug,
+            defaultOptions: buildProviderOptionSelectionsFromDescriptors(
+              providerModel.capabilities?.optionDescriptors,
+            ),
+          })),
+        })),
     ),
   );
 

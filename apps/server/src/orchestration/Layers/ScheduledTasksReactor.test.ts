@@ -30,7 +30,6 @@ import {
 import { ChildThreadCoordinator } from "../Services/ChildThreadCoordinator.ts";
 import { BootstrapTurnStartDispatcher } from "../Services/BootstrapTurnStartDispatcher.ts";
 import { ProjectionSnapshotQuery } from "../Services/ProjectionSnapshotQuery.ts";
-import { ProviderInstanceRegistry } from "../../provider/Services/ProviderInstanceRegistry.ts";
 import { ScheduledTasksReactor } from "../Services/ScheduledTasksReactor.ts";
 import { ScheduledTasksReactorLive } from "./ScheduledTasksReactor.ts";
 
@@ -47,12 +46,10 @@ const makeSession = (
   threadId: ThreadId,
   status: OrchestrationSession["status"],
   activeTurnId: TurnId | null = null,
-  providerInstanceId: ProviderInstanceId = ProviderInstanceId.make("codex"),
 ): OrchestrationSession => ({
   threadId,
   status,
   providerName: "codex",
-  providerInstanceId,
   runtimeMode: "full-access",
   activeTurnId,
   lastError: null,
@@ -135,13 +132,7 @@ describe("ScheduledTasksReactor", () => {
     readonly onDispatch?: (
       command: Extract<OrchestrationCommand, { readonly type: "thread.turn.start" }>,
     ) => void;
-    /** Maps a provider-instance id to its driver kind for getInstance lookups. */
-    readonly instanceDrivers?: Record<string, string>;
   }) {
-    const instanceDrivers = input?.instanceDrivers ?? {
-      codex: "codex",
-      claudeAgent: "claudeAgent",
-    };
     const shells = new Map<ThreadId, OrchestrationThreadShell>();
     for (const shell of input?.shells ?? []) shells.set(shell.id, shell);
     const pendingParents = new Set((input?.pendingParents ?? []).map((id) => String(id)));
@@ -191,22 +182,10 @@ describe("ScheduledTasksReactor", () => {
       drain: Effect.void,
     });
 
-    // getInstance resolves an instance id to a driver kind (via instanceDrivers)
-    // so the reactor's cross-driver guard can compare a pin against a session.
-    const providerRegistryLayer = Layer.succeed(ProviderInstanceRegistry, {
-      getInstance: (instanceId: ProviderInstanceId) =>
-        Effect.succeed(
-          instanceDrivers[String(instanceId)] !== undefined
-            ? ({ instanceId, driverKind: instanceDrivers[String(instanceId)] } as never)
-            : undefined,
-        ),
-    } as never);
-
     const layer = ScheduledTasksReactorLive.pipe(
       Layer.provideMerge(dispatcherLayer),
       Layer.provideMerge(projectionLayer),
       Layer.provideMerge(coordinatorLayer),
-      Layer.provideMerge(providerRegistryLayer),
       Layer.provideMerge(ScheduledTaskRepositoryLive),
       Layer.provideMerge(SqlitePersistenceMemory),
       // Deterministic clock so the sweep fires exactly once under our control,
@@ -296,40 +275,6 @@ describe("ScheduledTasksReactor", () => {
     // An unpinned run dispatches the thread's own model explicitly (never
     // undefined) so it can't inherit a pin cached in-process by another schedule.
     expect(turnStarts[0]!.modelSelection).toStrictEqual(codexModel);
-  });
-
-  it("disables a cross-driver pinned schedule against an active session", async () => {
-    const threadId = ThreadId.make("thread-crossdriver");
-    const taskId = ScheduledTaskId.make("task-crossdriver");
-    const pinnedModel: ModelSelection = {
-      instanceId: ProviderInstanceId.make("claudeAgent"),
-      model: "claude-opus-4-8",
-    };
-    // The thread has an idle Codex session; the schedule pins Claude. Switching
-    // drivers mid-session is rejected downstream, so the reactor must disable it.
-    const harness = await createHarness({
-      shells: [
-        makeShell({
-          threadId,
-          session: makeSession(threadId, "ready", null, ProviderInstanceId.make("codex")),
-        }),
-      ],
-    });
-    await harness.activeRuntime.runPromise(
-      harness.repository.insert(makeTask({ taskId, threadId, modelSelection: pinnedModel })),
-    );
-
-    await harness.runOneTick();
-
-    // No turn dispatched; the task is disabled with an actionable error.
-    const turnStarts = harness.dispatched.filter((c) => c.type === "thread.turn.start");
-    expect(turnStarts).toHaveLength(0);
-    const rows = await harness.activeRuntime.runPromise(
-      harness.repository.listByThread({ threadId }),
-    );
-    expect(rows[0]!.enabled).toBe(0);
-    expect(rows[0]!.lastStatus).toBe("error");
-    expect(rows[0]!.lastError).toContain("provider");
   });
 
   it("skips a busy thread without dispatching an extra turn", async () => {
