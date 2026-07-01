@@ -256,13 +256,18 @@ describe("artifact release workflows", () => {
       expect(mainWorkflow).toContain("android_profile: preview");
       expect(mainWorkflow).toContain("android_artifact_name: t3-code-preview-android.apk");
       expect(mainWorkflow).toContain("android_mobile_version_policy: fingerprint");
+      expect(mainWorkflow).toContain("android_public_config: false");
       expect(mainWorkflow).toContain("prerelease: true");
       expect(mainWorkflow).toContain("windows_signing: true");
       expect(reusableWorkflow).toContain("android_mobile_version_policy:");
       expect(reusableWorkflow).toContain("android_app_version:");
+      expect(reusableWorkflow).toContain("android_public_config:");
       expect(reusableWorkflow).toContain("MOBILE_APP_VERSION: ${{ inputs.android_app_version }}");
       expect(reusableWorkflow).toContain(
-        "T3CODE_CLERK_PUBLISHABLE_KEY: ${{ inputs.clerk_publishable_key || vars.CLERK_PUBLISHABLE_KEY }}",
+        "T3CODE_CLERK_PUBLISHABLE_KEY: ${{ inputs.android_public_config && (inputs.clerk_publishable_key || vars.CLERK_PUBLISHABLE_KEY) || '' }}",
+      );
+      expect(reusableWorkflow).toContain(
+        "T3CODE_RELAY_URL: ${{ inputs.android_public_config && (inputs.relay_url || vars.T3CODE_RELAY_URL) || '' }}",
       );
       expect(reusableWorkflow).toContain(
         "MOBILE_VERSION_POLICY: ${{ inputs.android_mobile_version_policy }}",

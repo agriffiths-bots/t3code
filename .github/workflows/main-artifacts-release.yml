@@ -105,6 +105,7 @@ jobs:
       android_app_variant: preview
       android_artifact_name: t3-code-preview-android.apk
       android_mobile_version_policy: fingerprint
+      android_public_config: false
       clerk_publishable_key: ${{ needs.public_config.outputs.clerk_publishable_key }}
       clerk_jwt_template: ${{ needs.public_config.outputs.clerk_jwt_template }}
       clerk_cli_oauth_client_id: ${{ needs.public_config.outputs.clerk_cli_oauth_client_id }}

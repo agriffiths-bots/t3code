@@ -90,10 +90,32 @@ if (triggerCommentId) {
 }
 
 const headSha = pr.head?.sha ?? "";
-const latestForHead = signals.find((signal) => signal.reviewedCommit === headSha);
+const timeline = ghJsonPages(`repos/${owner}/${repo}/issues/${prNumber}/timeline`, [
+  "-H",
+  "Accept: application/vnd.github+json",
+]);
+const headRefReachedTimestamp = timeline
+  .filter((event) => event.event === "head_ref_force_pushed" && event.commit_id === headSha)
+  .map((event) => Date.parse(event.created_at ?? ""))
+  .filter((timestamp) => !Number.isNaN(timestamp))
+  .reduce(
+    (latest, timestamp) => (latest === null || timestamp > latest ? timestamp : latest),
+    null,
+  );
+const appliesToHead = (signal) =>
+  signal.reviewedCommit === headSha ||
+  (signal.kind === "comment" &&
+    signal.score !== null &&
+    signal.reviewedCommit === null &&
+    headRefReachedTimestamp !== null &&
+    signal.timestamp >= headRefReachedTimestamp);
+const latestForHead = signals.find(appliesToHead);
 const latestForHeadApproved = latestForHead?.state === "APPROVED";
 const latestScored = signals.find((signal) => signal.score !== null);
-const stale = latestScored !== undefined && latestScored.reviewedCommit !== headSha;
+const stale =
+  latestScored !== undefined &&
+  latestScored.reviewedCommit !== headSha &&
+  !appliesToHead(latestScored);
 const state = latestForHeadApproved
   ? "approved"
   : latestForHead !== undefined

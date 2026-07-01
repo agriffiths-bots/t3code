@@ -54,6 +54,11 @@ on:
         required: false
         default: ""
         type: string
+      android_public_config:
+        description: "Whether to inject reusable workflow public config into the Android EAS environment"
+        required: false
+        default: true
+        type: boolean
       prerelease:
         description: "Whether the GitHub Release is a prerelease"
         required: false
@@ -159,9 +164,9 @@ jobs:
       EXPO_OWNER: ${{ vars.EXPO_OWNER }}
       EXPO_PROJECT_ID: ${{ vars.EXPO_PROJECT_ID }}
       EXPO_UPDATES_URL: ${{ vars.EXPO_UPDATES_URL }}
-      T3CODE_CLERK_PUBLISHABLE_KEY: ${{ inputs.clerk_publishable_key || vars.CLERK_PUBLISHABLE_KEY }}
-      T3CODE_CLERK_JWT_TEMPLATE: ${{ inputs.clerk_jwt_template || vars.CLERK_JWT_TEMPLATE }}
-      T3CODE_RELAY_URL: ${{ inputs.relay_url || vars.T3CODE_RELAY_URL }}
+      T3CODE_CLERK_PUBLISHABLE_KEY: ${{ inputs.android_public_config && (inputs.clerk_publishable_key || vars.CLERK_PUBLISHABLE_KEY) || '' }}
+      T3CODE_CLERK_JWT_TEMPLATE: ${{ inputs.android_public_config && (inputs.clerk_jwt_template || vars.CLERK_JWT_TEMPLATE) || '' }}
+      T3CODE_RELAY_URL: ${{ inputs.android_public_config && (inputs.relay_url || vars.T3CODE_RELAY_URL) || '' }}
     steps:
       - name: Checkout
         uses: actions/checkout@v6

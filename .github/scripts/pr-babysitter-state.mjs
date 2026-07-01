@@ -45,11 +45,11 @@ query($owner: String!, $repo: String!, $number: Int!, $reviewThreadsAfter: Strin
 const ghJson = (args) =>
   JSON.parse(NodeChildProcess.execFileSync("gh", ["api", ...args], { encoding: "utf8" }));
 
-const ghJsonPages = (path) => {
+const ghJsonPages = (path, extraArgs = []) => {
   const items = [];
   for (let page = 1; ; page += 1) {
     const separator = path.includes("?") ? "&" : "?";
-    const pageItems = ghJson([`${path}${separator}per_page=100&page=${page}`]);
+    const pageItems = ghJson([`${path}${separator}per_page=100&page=${page}`, ...extraArgs]);
     if (!Array.isArray(pageItems)) {
       throw new Error(`Expected ${path} page ${page} to return a JSON array.`);
     }
@@ -100,6 +100,18 @@ const fetchPullRequestState = () => {
 };
 
 const pr = fetchPullRequestState();
+const timeline = ghJsonPages(`repos/${owner}/${repo}/issues/${prNumber}/timeline`, [
+  "-H",
+  "Accept: application/vnd.github+json",
+]);
+const headRefReachedTimestamp = timeline
+  .filter((event) => event.event === "head_ref_force_pushed" && event.commit_id === pr.headRefOid)
+  .map((event) => Date.parse(event.created_at ?? ""))
+  .filter((timestamp) => !Number.isNaN(timestamp))
+  .reduce(
+    (latest, timestamp) => (latest === null || timestamp > latest ? timestamp : latest),
+    null,
+  );
 const comments = ghJsonPages(`repos/${owner}/${repo}/issues/${prNumber}/comments`);
 const reviews = ghJsonPages(`repos/${owner}/${repo}/pulls/${prNumber}/reviews`);
 
@@ -152,9 +164,15 @@ const greptileSignals = [
     normalizedTimestamp: Number.isNaN(signal.timestamp) ? 0 : signal.timestamp,
   }));
 
-const currentGreptileSignals = greptileSignals.filter(
-  (signal) => signal.reviewedCommit === pr.headRefOid,
-);
+const greptileSignalAppliesToHead = (signal) =>
+  signal.reviewedCommit === pr.headRefOid ||
+  (signal.kind === "comment" &&
+    signal.score !== null &&
+    signal.reviewedCommit === null &&
+    headRefReachedTimestamp !== null &&
+    signal.normalizedTimestamp >= headRefReachedTimestamp);
+
+const currentGreptileSignals = greptileSignals.filter(greptileSignalAppliesToHead);
 
 const scoredOrApprovedGreptileSignals = currentGreptileSignals.filter(
   (signal) => signal.score !== null || (signal.kind === "review" && signal.state === "APPROVED"),
