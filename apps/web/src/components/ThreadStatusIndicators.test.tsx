@@ -3,7 +3,11 @@ import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vite-plus/test";
 
 import type { ThreadScheduleSummary } from "../state/schedules";
-import { ScheduledTaskIcon, ThreadWorktreeIndicator, scheduleIconPresentation } from "./ThreadStatusIndicators";
+import {
+  ScheduledTaskIcon,
+  ThreadWorktreeIndicator,
+  scheduleIconPresentation,
+} from "./ThreadStatusIndicators";
 
 const summary = (overrides: Partial<ThreadScheduleSummary> = {}): ThreadScheduleSummary => ({
   threadId: "T1" as ThreadId,

@@ -18,7 +18,7 @@ layer("035_ScheduledTasks", (it) => {
       const columns = yield* sql<{ readonly name: string }>`
         PRAGMA table_info(scheduled_tasks)
       `;
-      const names = columns.map((column) => column.name);
+      const names = new Set(columns.map((column) => column.name));
       for (const expected of [
         "task_id",
         "thread_id",
@@ -38,15 +38,13 @@ layer("035_ScheduledTasks", (it) => {
         "queued_count",
         "created_at",
       ]) {
-        assert.isTrue(names.includes(expected), `missing column ${expected}`);
+        assert.isTrue(names.has(expected), `missing column ${expected}`);
       }
 
       const indexes = yield* sql<{ readonly name: string }>`
         PRAGMA index_list(scheduled_tasks)
       `;
-      assert.isTrue(
-        indexes.some((index) => index.name === "idx_scheduled_tasks_enabled_next_run"),
-      );
+      assert.isTrue(indexes.some((index) => index.name === "idx_scheduled_tasks_enabled_next_run"));
     }),
   );
 

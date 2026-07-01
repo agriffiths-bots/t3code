@@ -116,7 +116,8 @@ export function ScheduledTaskCard({
         stackedThreadToast({
           type: "error",
           title: "Unable to delete schedule",
-          description: error instanceof Error ? error.message : "The schedule could not be deleted.",
+          description:
+            error instanceof Error ? error.message : "The schedule could not be deleted.",
         }),
       );
     })();

@@ -54,7 +54,14 @@ describe("reduceSchedulesByThreadId", () => {
 
   it("marks a thread disabled when its only schedule is disabled", () => {
     const map = reduceSchedulesByThreadId(
-      [task({ taskId: "a", threadId: "T1", enabled: false, nextRunAt: "2026-06-19T13:00:00.000Z" })],
+      [
+        task({
+          taskId: "a",
+          threadId: "T1",
+          enabled: false,
+          nextRunAt: "2026-06-19T13:00:00.000Z",
+        }),
+      ],
       NOW,
     );
     expect(map.get(threadId("T1"))?.enabled).toBe(false);

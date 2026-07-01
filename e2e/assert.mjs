@@ -15,8 +15,8 @@
 // Every helper takes the db handle as its first arg so a single read-only
 // connection can be reused across a polling loop.
 
-import { DatabaseSync } from "node:sqlite";
-import { join } from "node:path";
+import * as NodePath from "node:path";
+import * as NodeSqlite from "node:sqlite";
 
 /**
  * Open the t3 state DB read-only. Accepts either a T3CODE_HOME directory
@@ -26,8 +26,8 @@ import { join } from "node:path";
 export function openState(homeOrDbPath) {
   const dbPath = homeOrDbPath.endsWith(".sqlite")
     ? homeOrDbPath
-    : join(homeOrDbPath, "userdata", "state.sqlite");
-  return new DatabaseSync(dbPath, { readOnly: true });
+    : NodePath.join(homeOrDbPath, "userdata", "state.sqlite");
+  return new NodeSqlite.DatabaseSync(dbPath, { readOnly: true });
 }
 
 // ---- turns ---------------------------------------------------------------
@@ -83,16 +83,12 @@ export function childrenOf(db, parentThreadId) {
 
 /** One scheduled task by id (scenario a: next_run_at / last_run_at / status). */
 export function scheduledTask(db, taskId) {
-  return db
-    .prepare(`SELECT * FROM scheduled_tasks WHERE task_id = ?`)
-    .get(taskId);
+  return db.prepare(`SELECT * FROM scheduled_tasks WHERE task_id = ?`).get(taskId);
 }
 
 /** All scheduled tasks (discovery / counting). */
 export function listScheduledTasks(db) {
-  return db
-    .prepare(`SELECT * FROM scheduled_tasks ORDER BY created_at ASC`)
-    .all();
+  return db.prepare(`SELECT * FROM scheduled_tasks ORDER BY created_at ASC`).all();
 }
 
 // ---- thread shell (latest turn + session) -------------------------------

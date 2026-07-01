@@ -83,76 +83,74 @@ function applyScheduledTasksStreamItem(
   });
 }
 
-export const makeEnvironmentScheduledTasksState = Effect.fn(
-  "EnvironmentScheduledTasksState.make",
-)(function* () {
-  const supervisor = yield* EnvironmentSupervisor;
-  const state = yield* SubscriptionRef.make<EnvironmentScheduledTasksState>(
-    EMPTY_SCHEDULED_TASKS_STATE,
-  );
+export const makeEnvironmentScheduledTasksState = Effect.fn("EnvironmentScheduledTasksState.make")(
+  function* () {
+    const supervisor = yield* EnvironmentSupervisor;
+    const state = yield* SubscriptionRef.make<EnvironmentScheduledTasksState>(
+      EMPTY_SCHEDULED_TASKS_STATE,
+    );
 
-  const setSynchronizing = SubscriptionRef.update(state, (current) => ({
-    ...current,
-    status: current.status === "live" ? ("live" as const) : ("synchronizing" as const),
-    error: Option.none(),
-  }));
-  const setDisconnected = SubscriptionRef.update(state, (current) => ({
-    ...current,
-    status: statusForSnapshot(current.snapshot),
-  }));
-  const setStreamError = (error: unknown) =>
-    SubscriptionRef.update(state, (current) => ({
+    const setSynchronizing = SubscriptionRef.update(state, (current) => ({
+      ...current,
+      status: current.status === "live" ? ("live" as const) : ("synchronizing" as const),
+      error: Option.none(),
+    }));
+    const setDisconnected = SubscriptionRef.update(state, (current) => ({
       ...current,
       status: statusForSnapshot(current.snapshot),
-      error: Option.some(formatError(error)),
     }));
+    const setStreamError = (error: unknown) =>
+      SubscriptionRef.update(state, (current) => ({
+        ...current,
+        status: statusForSnapshot(current.snapshot),
+        error: Option.some(formatError(error)),
+      }));
 
-  const applyItem = Effect.fn("EnvironmentScheduledTasksState.applyItem")(function* (
-    item: ScheduledTasksStreamItem,
-  ) {
-    const current = yield* SubscriptionRef.get(state);
-    const nextSnapshot = applyScheduledTasksStreamItem(current.snapshot, item);
-    if (nextSnapshot === null) {
-      return;
-    }
-    yield* SubscriptionRef.set(state, {
-      snapshot: Option.some(nextSnapshot),
-      status: "live",
-      error: Option.none(),
-    });
-  });
-
-  yield* subscribe(
-    ORCHESTRATION_WS_METHODS.subscribeScheduledTasks,
-    {},
-    {
-      onExpectedFailure: (cause) => setStreamError(Cause.squash(cause)),
-    },
-  ).pipe(Stream.runForEach(applyItem), Effect.forkScoped);
-
-  yield* SubscriptionRef.changes(supervisor.state).pipe(
-    Stream.runForEach((connectionState) => {
-      switch (connectionProjectionPhase(connectionState)) {
-        case "synchronizing":
-          return setSynchronizing;
-        case "disconnected":
-          return setDisconnected;
-        case "ready":
-          return setSynchronizing;
+    const applyItem = Effect.fn("EnvironmentScheduledTasksState.applyItem")(function* (
+      item: ScheduledTasksStreamItem,
+    ) {
+      const current = yield* SubscriptionRef.get(state);
+      const nextSnapshot = applyScheduledTasksStreamItem(current.snapshot, item);
+      if (nextSnapshot === null) {
+        return;
       }
-    }),
-    Effect.forkScoped,
-  );
+      yield* SubscriptionRef.set(state, {
+        snapshot: Option.some(nextSnapshot),
+        status: "live",
+        error: Option.none(),
+      });
+    });
 
-  return state;
-});
+    yield* subscribe(
+      ORCHESTRATION_WS_METHODS.subscribeScheduledTasks,
+      {},
+      {
+        onExpectedFailure: (cause) => setStreamError(Cause.squash(cause)),
+      },
+    ).pipe(Stream.runForEach(applyItem), Effect.forkScoped);
+
+    yield* SubscriptionRef.changes(supervisor.state).pipe(
+      Stream.runForEach((connectionState) => {
+        switch (connectionProjectionPhase(connectionState)) {
+          case "synchronizing":
+            return setSynchronizing;
+          case "disconnected":
+            return setDisconnected;
+          case "ready":
+            return setSynchronizing;
+        }
+      }),
+      Effect.forkScoped,
+    );
+
+    return state;
+  },
+);
 
 export function scheduledTasksStateChanges(environmentId: EnvironmentId) {
   return followStreamInEnvironment(
     environmentId,
-    Stream.unwrap(
-      makeEnvironmentScheduledTasksState().pipe(Effect.map(SubscriptionRef.changes)),
-    ),
+    Stream.unwrap(makeEnvironmentScheduledTasksState().pipe(Effect.map(SubscriptionRef.changes))),
   );
 }
 

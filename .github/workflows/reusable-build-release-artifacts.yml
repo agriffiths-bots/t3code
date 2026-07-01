@@ -19,31 +19,154 @@ on:
         description: "Application version passed into packaged artifacts"
         required: true
         type: string
+      android_required:
+        description: "Whether a missing Android APK should fail the release"
+        required: false
+        default: false
+        type: boolean
+      android_profile:
+        description: "EAS build profile used for the Android APK"
+        required: false
+        default: preview
+        type: string
+      android_environment:
+        description: "EAS environment pulled before the Android APK build"
+        required: false
+        default: preview
+        type: string
+      android_app_variant:
+        description: "APP_VARIANT passed to the Expo app config"
+        required: false
+        default: preview
+        type: string
+      android_artifact_name:
+        description: "Downloaded APK filename to publish"
+        required: false
+        default: t3-code-preview-android.apk
+        type: string
+      android_mobile_version_policy:
+        description: "MOBILE_VERSION_POLICY passed to the Expo app config"
+        required: false
+        default: fingerprint
+        type: string
+      android_app_version:
+        description: "Expo app version passed to the mobile app config"
+        required: false
+        default: ""
+        type: string
+      android_public_config:
+        description: "Whether to inject reusable workflow public config into the Android EAS environment"
+        required: false
+        default: true
+        type: boolean
       prerelease:
         description: "Whether the GitHub Release is a prerelease"
         required: false
         default: true
         type: boolean
+      make_latest:
+        description: "Whether this release should become the repository latest release"
+        required: false
+        default: false
+        type: boolean
+      windows_signing:
+        description: "Enable Windows signing when Azure Trusted Signing secrets are configured"
+        required: false
+        default: false
+        type: boolean
+      clerk_publishable_key:
+        description: "Clerk publishable key embedded into desktop/web bundles"
+        required: false
+        default: ""
+        type: string
+      clerk_jwt_template:
+        description: "Clerk JWT template embedded into web/mobile cloud config"
+        required: false
+        default: ""
+        type: string
+      clerk_cli_oauth_client_id:
+        description: "Clerk OAuth client ID embedded into the desktop server bundle"
+        required: false
+        default: ""
+        type: string
+      relay_url:
+        description: "T3 Connect relay URL embedded into desktop/web bundles"
+        required: false
+        default: ""
+        type: string
     secrets:
       EXPO_TOKEN:
         description: "Expo token used for non-interactive EAS APK builds"
-        required: true
+        required: false
+      AZURE_TENANT_ID:
+        required: false
+      AZURE_CLIENT_ID:
+        required: false
+      AZURE_CLIENT_SECRET:
+        required: false
+      AZURE_TRUSTED_SIGNING_ENDPOINT:
+        required: false
+      AZURE_TRUSTED_SIGNING_ACCOUNT_NAME:
+        required: false
+      AZURE_TRUSTED_SIGNING_CERTIFICATE_PROFILE_NAME:
+        required: false
+      AZURE_TRUSTED_SIGNING_PUBLISHER_NAME:
+        required: false
 
 permissions:
   contents: read
 
 jobs:
+  android_preflight:
+    name: Check Android release credentials
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      expo_token_present: ${{ steps.expo.outputs.present }}
+    steps:
+      - id: expo
+        name: Validate EXPO_TOKEN
+        env:
+          ANDROID_REQUIRED: ${{ inputs.android_required }}
+          EXPO_TOKEN: ${{ secrets.EXPO_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -n "${EXPO_TOKEN:-}" ]]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "present=false" >> "$GITHUB_OUTPUT"
+          if [[ "$ANDROID_REQUIRED" == "true" ]]; then
+            echo "::error::EXPO_TOKEN is required for stable Android APK release artifacts."
+            echo "Create a repository secret named EXPO_TOKEN with access to the EAS production project used by apps/mobile."
+            exit 1
+          fi
+
+          {
+            echo "::warning::EXPO_TOKEN is required to build the Android APK release artifact."
+            echo "Create a repository secret named EXPO_TOKEN with access to the EAS project used by apps/mobile."
+            echo "Also verify EXPO_OWNER / EXPO_PROJECT_ID repository variables if the defaults are not correct."
+          }
+
   android_apk:
     name: Build Android APK
+    needs: android_preflight
+    if: needs.android_preflight.outputs.expo_token_present == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     env:
-      APP_VARIANT: preview
-      MOBILE_VERSION_POLICY: fingerprint
+      APP_VARIANT: ${{ inputs.android_app_variant }}
+      MOBILE_APP_VERSION: ${{ inputs.android_app_version }}
+      MOBILE_VERSION_POLICY: ${{ inputs.android_mobile_version_policy }}
       NODE_OPTIONS: --max-old-space-size=8192
       EXPO_OWNER: ${{ vars.EXPO_OWNER }}
       EXPO_PROJECT_ID: ${{ vars.EXPO_PROJECT_ID }}
       EXPO_UPDATES_URL: ${{ vars.EXPO_UPDATES_URL }}
+      T3CODE_CLERK_PUBLISHABLE_KEY: ${{ inputs.android_public_config && (inputs.clerk_publishable_key || vars.CLERK_PUBLISHABLE_KEY) || '' }}
+      T3CODE_CLERK_JWT_TEMPLATE: ${{ inputs.android_public_config && (inputs.clerk_jwt_template || vars.CLERK_JWT_TEMPLATE) || '' }}
+      T3CODE_RELAY_URL: ${{ inputs.android_public_config && (inputs.relay_url || vars.T3CODE_RELAY_URL) || '' }}
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -73,20 +196,40 @@ jobs:
           token: ${{ secrets.EXPO_TOKEN }}
           packager: pnpm
 
-      - name: Pull preview environment variables
+      - name: Pull Android environment variables
         working-directory: apps/mobile
         env:
+          EAS_ENVIRONMENT: ${{ inputs.android_environment }}
           EXPO_TOKEN: ${{ secrets.EXPO_TOKEN }}
-        run: eas env:pull preview --non-interactive
+        run: eas env:pull "$EAS_ENVIRONMENT" --non-interactive
+
+      - name: Materialize Android app version
+        if: inputs.android_app_version != ''
+        working-directory: apps/mobile
+        env:
+          MOBILE_APP_VERSION: ${{ inputs.android_app_version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          node <<'NODE'
+          const fs = require("node:fs");
+          const version = process.env.MOBILE_APP_VERSION?.trim();
+          if (!version) {
+            throw new Error("MOBILE_APP_VERSION is required when materializing release-version.json.");
+          }
+          fs.writeFileSync("release-version.json", `${JSON.stringify({ version }, null, 2)}\n`);
+          NODE
 
       - name: Build APK with EAS
         working-directory: apps/mobile
         env:
+          APK_ARTIFACT_NAME: ${{ inputs.android_artifact_name }}
+          EAS_PROFILE: ${{ inputs.android_profile }}
           EXPO_TOKEN: ${{ secrets.EXPO_TOKEN }}
         shell: bash
         run: |
           set -euo pipefail
-          eas build --profile preview --platform android --non-interactive --wait --json > eas-build.json
+          eas build --profile "$EAS_PROFILE" --platform android --non-interactive --wait --json > eas-build.json
           node - <<'NODE'
           const fs = require("node:fs");
           const path = require("node:path");
@@ -105,7 +248,7 @@ jobs:
           fs.writeFileSync(path.resolve("release-assets", "apk-url.txt"), `${url}\n`);
           NODE
           apk_url="$(cat release-assets/apk-url.txt)"
-          curl --fail --location "$apk_url" --output "release-assets/t3-code-preview-android.apk"
+          curl --fail --location "$apk_url" --output "release-assets/$APK_ARTIFACT_NAME"
 
       - name: Upload APK artifact
         uses: actions/upload-artifact@v7
@@ -116,6 +259,8 @@ jobs:
 
   build_wsl_node_pty:
     name: Build WSL node-pty linux-x64
+    needs: android_preflight
+    if: needs.android_preflight.result == 'success'
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
@@ -152,14 +297,15 @@ jobs:
 
   windows_x64:
     name: Build Windows x64
-    needs: build_wsl_node_pty
+    needs: [android_preflight, build_wsl_node_pty]
+    if: needs.android_preflight.result == 'success' && needs.build_wsl_node_pty.result == 'success'
     runs-on: windows-2025
     timeout-minutes: 45
     env:
-      T3CODE_CLERK_PUBLISHABLE_KEY: ${{ vars.CLERK_PUBLISHABLE_KEY }}
-      T3CODE_CLERK_JWT_TEMPLATE: ${{ vars.CLERK_JWT_TEMPLATE }}
-      T3CODE_CLERK_CLI_OAUTH_CLIENT_ID: ${{ vars.CLERK_CLI_OAUTH_CLIENT_ID }}
-      T3CODE_RELAY_URL: ${{ vars.T3CODE_RELAY_URL }}
+      T3CODE_CLERK_PUBLISHABLE_KEY: ${{ inputs.clerk_publishable_key || vars.CLERK_PUBLISHABLE_KEY }}
+      T3CODE_CLERK_JWT_TEMPLATE: ${{ inputs.clerk_jwt_template || vars.CLERK_JWT_TEMPLATE }}
+      T3CODE_CLERK_CLI_OAUTH_CLIENT_ID: ${{ inputs.clerk_cli_oauth_client_id || vars.CLERK_CLI_OAUTH_CLIENT_ID }}
+      T3CODE_RELAY_URL: ${{ inputs.relay_url || vars.T3CODE_RELAY_URL }}
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -183,17 +329,116 @@ jobs:
       - name: Ensure Electron runtime is installed
         run: vp run --filter @t3tools/desktop ensure:electron
 
+      - name: Align package versions to release version
+        run: node scripts/update-release-package-versions.ts "${{ inputs.release_version }}"
+
+      - name: Prepare Azure Trusted Signing
+        if: inputs.windows_signing
+        shell: pwsh
+        env:
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+          AZURE_TRUSTED_SIGNING_ENDPOINT: ${{ secrets.AZURE_TRUSTED_SIGNING_ENDPOINT }}
+          AZURE_TRUSTED_SIGNING_ACCOUNT_NAME: ${{ secrets.AZURE_TRUSTED_SIGNING_ACCOUNT_NAME }}
+          AZURE_TRUSTED_SIGNING_CERTIFICATE_PROFILE_NAME: ${{ secrets.AZURE_TRUSTED_SIGNING_CERTIFICATE_PROFILE_NAME }}
+          AZURE_TRUSTED_SIGNING_PUBLISHER_NAME: ${{ secrets.AZURE_TRUSTED_SIGNING_PUBLISHER_NAME }}
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $requiredSecrets = @(
+            $env:AZURE_TENANT_ID,
+            $env:AZURE_CLIENT_ID,
+            $env:AZURE_CLIENT_SECRET,
+            $env:AZURE_TRUSTED_SIGNING_ENDPOINT,
+            $env:AZURE_TRUSTED_SIGNING_ACCOUNT_NAME,
+            $env:AZURE_TRUSTED_SIGNING_CERTIFICATE_PROFILE_NAME,
+            $env:AZURE_TRUSTED_SIGNING_PUBLISHER_NAME
+          )
+          if ($requiredSecrets | Where-Object { [string]::IsNullOrWhiteSpace($_) }) {
+            Write-Host "Azure Trusted Signing disabled; missing one or more signing secrets."
+            exit 0
+          }
+
+          try {
+            Install-PackageProvider `
+              -Name NuGet `
+              -MinimumVersion 2.8.5.201 `
+              -Force `
+              -Scope CurrentUser `
+              -ErrorAction Stop
+          } catch {
+            Write-Warning "Could not bootstrap NuGet package provider. Continuing because the runner may already have a usable provider. $($_.Exception.Message)"
+          }
+
+          Install-Module `
+            -Name TrustedSigning `
+            -MinimumVersion 0.5.0 `
+            -Force `
+            -AllowClobber `
+            -Repository PSGallery `
+            -Scope CurrentUser `
+            -ErrorAction Stop
+
+          Import-Module TrustedSigning -MinimumVersion 0.5.0 -Force
+          Get-Command Invoke-TrustedSigning -ErrorAction Stop
+
+          $moduleRoots = @(
+            [System.IO.Path]::Combine([Environment]::GetFolderPath("MyDocuments"), "PowerShell", "Modules"),
+            [System.IO.Path]::Combine([Environment]::GetFolderPath("MyDocuments"), "WindowsPowerShell", "Modules"),
+            [System.IO.Path]::Combine($env:ProgramFiles, "PowerShell", "Modules"),
+            [System.IO.Path]::Combine($env:ProgramFiles, "WindowsPowerShell", "Modules")
+          )
+          $modulePathEntries = @($moduleRoots + ($env:PSModulePath -split ";")) |
+            Where-Object { $_ -and (Test-Path $_) } |
+            Select-Object -Unique
+          "PSModulePath=$($modulePathEntries -join ';')" >> $env:GITHUB_ENV
+
       - name: Build Windows desktop artifact
         shell: bash
+        env:
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+          AZURE_TRUSTED_SIGNING_ENDPOINT: ${{ secrets.AZURE_TRUSTED_SIGNING_ENDPOINT }}
+          AZURE_TRUSTED_SIGNING_ACCOUNT_NAME: ${{ secrets.AZURE_TRUSTED_SIGNING_ACCOUNT_NAME }}
+          AZURE_TRUSTED_SIGNING_CERTIFICATE_PROFILE_NAME: ${{ secrets.AZURE_TRUSTED_SIGNING_CERTIFICATE_PROFILE_NAME }}
+          AZURE_TRUSTED_SIGNING_PUBLISHER_NAME: ${{ secrets.AZURE_TRUSTED_SIGNING_PUBLISHER_NAME }}
         run: |
           set -euo pipefail
-          vp run dist:desktop:artifact \
+          args=(
             --platform win \
             --target nsis \
             --arch x64 \
             --build-version "${{ inputs.release_version }}" \
             --wsl-prebuild "$GITHUB_WORKSPACE/wsl-prebuild/pty.node" \
             --verbose
+          )
+
+          if [[ "${{ inputs.windows_signing }}" == "true" ]]; then
+            missing=()
+            for name in \
+              AZURE_TENANT_ID \
+              AZURE_CLIENT_ID \
+              AZURE_CLIENT_SECRET \
+              AZURE_TRUSTED_SIGNING_ENDPOINT \
+              AZURE_TRUSTED_SIGNING_ACCOUNT_NAME \
+              AZURE_TRUSTED_SIGNING_CERTIFICATE_PROFILE_NAME \
+              AZURE_TRUSTED_SIGNING_PUBLISHER_NAME; do
+              if [[ -z "${!name:-}" ]]; then
+                missing+=("$name")
+              fi
+            done
+
+            if (( ${#missing[@]} == 0 )); then
+              echo "Windows signing enabled (Azure Trusted Signing)."
+              args+=(--signed)
+            else
+              printf 'Windows signing disabled; missing secrets: %s\n' "${missing[*]}"
+            fi
+          fi
+
+          vp run dist:desktop:artifact "${args[@]}"
 
       - name: Collect Windows release assets
         shell: bash
@@ -216,7 +461,21 @@ jobs:
 
   publish_release:
     name: Publish GitHub Release
-    needs: [android_apk, windows_x64]
+    needs: [android_preflight, android_apk, windows_x64]
+    if: >-
+      ${{
+        always() &&
+        needs.android_preflight.result == 'success' &&
+        needs.windows_x64.result == 'success' &&
+        (
+          (
+            !inputs.android_required &&
+            needs.android_preflight.outputs.expo_token_present == 'false' &&
+            needs.android_apk.result == 'skipped'
+          ) ||
+          needs.android_apk.result == 'success'
+        )
+      }}
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
@@ -229,6 +488,26 @@ jobs:
           merge-multiple: true
           path: release-assets
 
+      - id: release_files
+        name: Resolve release files
+        shell: bash
+        run: |
+          set -euo pipefail
+          files="$(
+            find release-assets -maxdepth 1 -type f \
+              \( -name '*.apk' -o -name '*.exe' -o -name '*.blockmap' -o -name '*.yml' \) \
+              | sort
+          )"
+          if [[ -z "$files" ]]; then
+            echo "::error::No release assets were downloaded."
+            exit 1
+          fi
+          {
+            echo "files<<EOF"
+            echo "$files"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
       - name: Publish release
         uses: softprops/action-gh-release@v2
         with:
@@ -236,11 +515,7 @@ jobs:
           target_commitish: ${{ inputs.ref }}
           name: ${{ inputs.release_name }}
           prerelease: ${{ inputs.prerelease }}
-          make_latest: false
-          files: |
-            release-assets/*.apk
-            release-assets/*.exe
-            release-assets/*.blockmap
-            release-assets/*.yml
+          make_latest: ${{ inputs.make_latest }}
+          files: ${{ steps.release_files.outputs.files }}
           fail_on_unmatched_files: true
           token: ${{ github.token }}

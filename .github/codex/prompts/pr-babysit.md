@@ -13,6 +13,8 @@ Rules:
 - Do not rewrite history.
 - Do not merge the pull request.
 - Do not change repository secrets, workflow credentials, or branch protection.
+- Do not comment to trigger Greptile; Greptile reviews automatically on PR creation and new commits.
+- Do not comment to request Codex review unless the maintainer explicitly asks for a manual retry.
 - Prefer small, reviewable fixes over broad refactors.
 - If a reviewer comment is incorrect, leave a concise PR comment explaining why instead of changing unrelated code.
 - Before finishing, summarize the files changed, checks run, and any reviewer comments that remain unaddressed.

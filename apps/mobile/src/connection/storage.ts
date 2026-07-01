@@ -55,6 +55,12 @@ const LegacyStoredShellSnapshot = Schema.Struct({
   snapshot: OrchestrationShellSnapshot,
 });
 
+const decodeStoredShellSnapshot = Schema.decodeUnknownResult(StoredShellSnapshot);
+const encodeStoredShellSnapshot = Schema.encodeUnknownResult(StoredShellSnapshot);
+const decodeStoredThreadSnapshot = Schema.decodeUnknownResult(StoredThreadSnapshot);
+const encodeStoredThreadSnapshot = Schema.encodeUnknownResult(StoredThreadSnapshot);
+const decodeLegacyStoredShellSnapshot = Schema.decodeUnknownResult(LegacyStoredShellSnapshot);
+
 function catalogError(operation: string, cause: unknown) {
   return new ConnectionTransientError({
     reason: "remote-unavailable",
@@ -289,9 +295,9 @@ export const connectionStorageLayer = Layer.effectContext(
               try: () => JSON.parse(raw) as unknown,
               catch: (cause) => shellPersistenceError("load-shell", cause),
             });
-            const stored = yield* Effect.fromResult(
-              Schema.decodeUnknownResult(StoredShellSnapshot)(parsed),
-            ).pipe(Effect.mapError((cause) => shellPersistenceError("load-shell", cause)));
+            const stored = yield* Effect.fromResult(decodeStoredShellSnapshot(parsed)).pipe(
+              Effect.mapError((cause) => shellPersistenceError("load-shell", cause)),
+            );
             return stored.environmentId === environmentId
               ? Option.some(stored.snapshot)
               : Option.none();
@@ -310,7 +316,7 @@ export const connectionStorageLayer = Layer.effectContext(
             catch: (cause) => shellPersistenceError("load-shell", cause),
           });
           const legacyStored = yield* Effect.fromResult(
-            Schema.decodeUnknownResult(LegacyStoredShellSnapshot)(legacyParsed),
+            decodeLegacyStoredShellSnapshot(legacyParsed),
           ).pipe(Effect.mapError((cause) => shellPersistenceError("load-shell", cause)));
           return legacyStored.environmentId === environmentId
             ? Option.some(legacyStored.snapshot)
@@ -324,9 +330,9 @@ export const connectionStorageLayer = Layer.effectContext(
             environmentId,
             snapshot,
           } as const;
-          const encoded = yield* Effect.fromResult(
-            Schema.encodeUnknownResult(StoredShellSnapshot)(stored),
-          ).pipe(Effect.mapError((cause) => shellPersistenceError("save-shell", cause)));
+          const encoded = yield* Effect.fromResult(encodeStoredShellSnapshot(stored)).pipe(
+            Effect.mapError((cause) => shellPersistenceError("save-shell", cause)),
+          );
           yield* Effect.try({
             try: () => {
               if (!file.exists) {
@@ -351,9 +357,9 @@ export const connectionStorageLayer = Layer.effectContext(
             try: () => JSON.parse(raw) as unknown,
             catch: (cause) => shellPersistenceError("load-thread", cause),
           });
-          const stored = yield* Effect.fromResult(
-            Schema.decodeUnknownResult(StoredThreadSnapshot)(parsed),
-          ).pipe(Effect.mapError((cause) => shellPersistenceError("load-thread", cause)));
+          const stored = yield* Effect.fromResult(decodeStoredThreadSnapshot(parsed)).pipe(
+            Effect.mapError((cause) => shellPersistenceError("load-thread", cause)),
+          );
           return stored.environmentId === environmentId && stored.threadId === threadId
             ? Option.some(stored.thread)
             : Option.none();
@@ -362,7 +368,7 @@ export const connectionStorageLayer = Layer.effectContext(
         Effect.gen(function* () {
           const file = yield* threadSnapshotFile(environmentId, thread.id, "save-thread");
           const encoded = yield* Effect.fromResult(
-            Schema.encodeUnknownResult(StoredThreadSnapshot)({
+            encodeStoredThreadSnapshot({
               schemaVersion: THREAD_SNAPSHOT_CACHE_SCHEMA_VERSION,
               environmentId,
               threadId: thread.id,

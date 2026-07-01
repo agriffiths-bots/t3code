@@ -33,7 +33,11 @@ describe("scheduleBannerDismissal", () => {
 
   it("tolerates malformed localStorage (treated as not dismissed)", () => {
     // Write a shape the dismissals schema cannot decode; reads must not throw.
-    setLocalStorageItem(SCHEDULE_BANNER_DISMISSALS_STORAGE_KEY, "not the right shape", Schema.String);
+    setLocalStorageItem(
+      SCHEDULE_BANNER_DISMISSALS_STORAGE_KEY,
+      "not the right shape",
+      Schema.String,
+    );
     expect(isScheduleBannerDismissed("env|T1:2026-06-19T14:30:00.000Z")).toBe(false);
   });
 });

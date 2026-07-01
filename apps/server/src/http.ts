@@ -42,11 +42,7 @@ import {
 } from "./auth/http.ts";
 import * as ServerEnvironment from "./environment/ServerEnvironment.ts";
 import { browserApiCorsAllowedHeaders, browserApiCorsAllowedMethods } from "./httpCors.ts";
-import {
-  buildElevenLabsRequest,
-  resolveVoiceId,
-  validateTtsText,
-} from "./tts/ttsRequest.logic.ts";
+import { buildElevenLabsRequest, resolveVoiceId, validateTtsText } from "./tts/ttsRequest.logic.ts";
 
 const OTLP_TRACES_PROXY_PATH = "/api/observability/v1/traces";
 const TTS_SPEAK_PATH = "/api/tts/speak";
@@ -195,6 +191,7 @@ const TtsSpeakRequest = Schema.Struct({
   voiceId: Schema.optional(Schema.String),
 });
 
+const decodeTtsSpeakRequest = Schema.decodeUnknownEffect(TtsSpeakRequest);
 const emptyTtsSpeakRequest: typeof TtsSpeakRequest.Type = { text: "" };
 
 export const ttsSpeakHandler = Effect.gen(function* () {
@@ -209,7 +206,7 @@ export const ttsSpeakHandler = Effect.gen(function* () {
   }
 
   const body = yield* request.json;
-  const raw = yield* Schema.decodeUnknownEffect(TtsSpeakRequest)(body).pipe(
+  const raw = yield* decodeTtsSpeakRequest(body).pipe(
     Effect.orElseSucceed(() => emptyTtsSpeakRequest),
   );
 
@@ -244,9 +241,7 @@ export const ttsSpeakHandler = Effect.gen(function* () {
     EnvironmentInternalError: HttpServerRespondable.toResponse,
     EnvironmentScopeRequiredError: HttpServerRespondable.toResponse,
     TtsConfigMissingError: () =>
-      Effect.succeed(
-        HttpServerResponse.text("Text-to-speech is not configured.", { status: 503 }),
-      ),
+      Effect.succeed(HttpServerResponse.text("Text-to-speech is not configured.", { status: 503 })),
     TtsTextInvalidError: (cause) =>
       Effect.succeed(
         HttpServerResponse.text(

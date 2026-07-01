@@ -53,7 +53,6 @@ import {
   type ChildTerminalStatus,
   type ChildThreadCoordinatorShape,
   type ChildWaitResult,
-  type RegisterChildInput,
   type WaitChildResult,
   type WaitSliceInput,
   type WaitSliceResult,
@@ -181,8 +180,10 @@ const make = Effect.gen(function* () {
   const dispatchCommandIdFor = (tag: string, dispatchId: PendingDispatchId): CommandId =>
     CommandId.make(`server:${tag}:${dispatchId}`);
 
-  const batchCommandIdFor = (tag: string, dispatchIds: ReadonlyArray<PendingDispatchId>): CommandId =>
-    CommandId.make(`server:${tag}:${[...dispatchIds].sort().join(",")}`);
+  const batchCommandIdFor = (
+    tag: string,
+    dispatchIds: ReadonlyArray<PendingDispatchId>,
+  ): CommandId => CommandId.make(`server:${tag}:${[...dispatchIds].sort().join(",")}`);
 
   const listPersistedChildRows = SqlSchema.findAll({
     Request: Schema.Void,
@@ -332,7 +333,10 @@ const make = Effect.gen(function* () {
 
   const consolidatedInjectionText = (entries: ReadonlyArray<PendingInjection>): string => {
     const joined = entries
-      .map((entry) => `[sub-agent ${entry.childThreadId} ${entry.status}] ${entry.error ?? entry.text ?? ""}`)
+      .map(
+        (entry) =>
+          `[sub-agent ${entry.childThreadId} ${entry.status}] ${entry.error ?? entry.text ?? ""}`,
+      )
       .join("\n");
     // Guard against unbounded growth when many children settle with large
     // payloads; the full per-child results remain queryable via t3_check.
@@ -449,7 +453,9 @@ const make = Effect.gen(function* () {
             const commandId =
               entry.claimedCommandId ?? batchCommandIdFor("subagent-wake", [entry.dispatchId]);
             yield* claimDispatchRows([entry.dispatchId], commandId).pipe(
-              Effect.andThen(dispatchParentTurn(shell, consolidatedInjectionText([entry]), commandId)),
+              Effect.andThen(
+                dispatchParentTurn(shell, consolidatedInjectionText([entry]), commandId),
+              ),
               Effect.andThen(deleteDispatchRows([entry.dispatchId])),
               Effect.catchCause((cause) => {
                 enqueuePending(parentThreadId, entry);
@@ -462,7 +468,9 @@ const make = Effect.gen(function* () {
             );
             return;
           }
-          yield* appendSubagentActivity(parentThreadId, result).pipe(Effect.ignoreCause({ log: true }));
+          yield* appendSubagentActivity(parentThreadId, result).pipe(
+            Effect.ignoreCause({ log: true }),
+          );
           enqueuePending(parentThreadId, entry);
         }),
       );
@@ -484,10 +492,13 @@ const make = Effect.gen(function* () {
             // AND delete the backing rows so a restart never re-loads them.
             pendingInjections.delete(parentThreadId);
             yield* deleteDispatchRows(queue.map((entry) => entry.dispatchId));
-            yield* Effect.logWarning("parent gone while draining pending injections; dropped orphaned rows", {
-              parentThreadId,
-              droppedCount: queue.length,
-            });
+            yield* Effect.logWarning(
+              "parent gone while draining pending injections; dropped orphaned rows",
+              {
+                parentThreadId,
+                droppedCount: queue.length,
+              },
+            );
             return;
           }
           const shell = shellOption.value;
@@ -509,7 +520,9 @@ const make = Effect.gen(function* () {
             if (batch.length === 0) return Effect.void;
             const ids = batch.map((entry) => entry.dispatchId);
             return claimDispatchRows(ids, commandId).pipe(
-              Effect.andThen(dispatchParentTurn(shell, consolidatedInjectionText(batch), commandId)),
+              Effect.andThen(
+                dispatchParentTurn(shell, consolidatedInjectionText(batch), commandId),
+              ),
               Effect.andThen(deleteDispatchRows(ids)),
               Effect.catchCause((cause) => {
                 const restored = pendingInjections.get(parentThreadId) ?? [];
@@ -534,7 +547,10 @@ const make = Effect.gen(function* () {
           }
           yield* drainBatch(
             fresh,
-            batchCommandIdFor("subagent-wake", fresh.map((entry) => entry.dispatchId)),
+            batchCommandIdFor(
+              "subagent-wake",
+              fresh.map((entry) => entry.dispatchId),
+            ),
           );
         }),
       );
@@ -704,7 +720,9 @@ const make = Effect.gen(function* () {
       }
       const depth = depthFor(input.parentThreadId);
       if (depth >= MAX_DEPTH) {
-        return yield* fail(`Sub-agent depth limit (${MAX_DEPTH}) reached; refusing to spawn deeper.`);
+        return yield* fail(
+          `Sub-agent depth limit (${MAX_DEPTH}) reached; refusing to spawn deeper.`,
+        );
       }
       if (hasAncestryCycle(input.parentThreadId, input.childThreadId)) {
         return yield* fail("Sub-agent spawn would create an ancestry cycle.");
@@ -784,9 +802,7 @@ const make = Effect.gen(function* () {
       return entries;
     });
 
-  const waitForChild = (
-    childThreadId: ThreadId,
-  ): Effect.Effect<WaitChildResult> =>
+  const waitForChild = (childThreadId: ThreadId): Effect.Effect<WaitChildResult> =>
     Effect.gen(function* () {
       if (!children.has(childThreadId)) {
         const shellOption = yield* getThreadShellBounded(childThreadId);
@@ -884,7 +900,10 @@ const make = Effect.gen(function* () {
   // replay readEvents(0), tracking the latest signal per known child id.
   const reconcileFromLog = (knownChildIds: Set<ThreadId>) =>
     Effect.gen(function* () {
-      const terminalByChild = new Map<ThreadId, { status: ChildTerminalStatus; error: string | null }>();
+      const terminalByChild = new Map<
+        ThreadId,
+        { status: ChildTerminalStatus; error: string | null }
+      >();
       const runningByChild = new Map<ThreadId, boolean>();
       let maxSequence = 0;
       yield* Stream.runForEach(orchestrationEngine.readEvents(0), (event) =>
@@ -1027,9 +1046,7 @@ const make = Effect.gen(function* () {
       // (3) THEN fork the hot stream (the immutable-log scan above already
       // covered everything up to "now", so a gap event is never missed).
       yield* Effect.forkScoped(
-        Stream.runForEach(orchestrationEngine.streamDomainEvents, (event) =>
-          worker.enqueue(event),
-        ),
+        Stream.runForEach(orchestrationEngine.streamDomainEvents, (event) => worker.enqueue(event)),
       );
 
       yield* Effect.logInfo("child.thread.coordinator.reactor.started", {

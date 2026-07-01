@@ -199,21 +199,95 @@ describe("serializeRelayClientTracingEnvironment", () => {
   });
 });
 
-describe("release workflow tracing config propagation", () => {
-  it.effect("uses an artifact instead of a masked cross-job token output", () =>
+describe("artifact release workflows", () => {
+  it.effect("publish app artifacts without relay deployment", () =>
     Effect.gen(function* () {
       const fileSystem = yield* FileSystem.FileSystem;
       const path = yield* Path.Path;
-      const workflowPath = yield* path.fromFileUrl(
+      const stableWorkflowPath = yield* path.fromFileUrl(
         new URL("../../../.github/workflows/release.yml", import.meta.url),
       );
-      const workflow = yield* fileSystem.readFileString(workflowPath);
+      const mainWorkflowPath = yield* path.fromFileUrl(
+        new URL("../../../.github/workflows/main-artifacts-release.yml", import.meta.url),
+      );
+      const reusableWorkflowPath = yield* path.fromFileUrl(
+        new URL("../../../.github/workflows/reusable-build-release-artifacts.yml", import.meta.url),
+      );
+      const ciWorkflowPath = yield* path.fromFileUrl(
+        new URL("../../../.github/workflows/ci.yml", import.meta.url),
+      );
+      const stableWorkflow = yield* fileSystem.readFileString(stableWorkflowPath);
+      const mainWorkflow = yield* fileSystem.readFileString(mainWorkflowPath);
+      const reusableWorkflow = yield* fileSystem.readFileString(reusableWorkflowPath);
+      const ciWorkflow = yield* fileSystem.readFileString(ciWorkflowPath);
 
-      expect(workflow).not.toContain("client_tracing_token:");
-      expect(workflow).not.toContain("needs.relay_public_config.outputs.client_tracing_token");
-      expect(workflow).toContain('--github-env-file "$RUNNER_TEMP/relay-client-tracing.env"');
-      expect(workflow).toContain("name: relay-client-tracing-config");
-      expect(workflow).toContain('cat "$config_path" >> "$GITHUB_ENV"');
+      for (const workflow of [stableWorkflow, mainWorkflow]) {
+        expect(workflow).toContain(
+          "uses: ./.github/workflows/reusable-build-release-artifacts.yml",
+        );
+        expect(workflow).not.toContain("relay_public_config");
+        expect(workflow).not.toContain("client_tracing_token:");
+        expect(workflow).not.toContain("deploy-relay");
+      }
+
+      expect(stableWorkflow).toContain("name: Stable Artifact Release");
+      expect(stableWorkflow).toContain("needs: [metadata, preflight, public_config]");
+      expect(stableWorkflow).toContain("run: vp check");
+      expect(stableWorkflow).toContain("run: vp run typecheck");
+      expect(stableWorkflow).toContain("run: vp run test");
+      expect(stableWorkflow).toContain('relay_url="https://$relay_domain"');
+      expect(stableWorkflow).toContain("android_required: true");
+      expect(stableWorkflow).toContain("android_profile: production-apk");
+      expect(stableWorkflow).toContain("android_artifact_name: t3-code-android.apk");
+      expect(stableWorkflow).toContain("android_mobile_version_policy: appVersion");
+      expect(stableWorkflow).toContain(
+        "android_app_version: ${{ needs.metadata.outputs.release_version }}",
+      );
+      expect(stableWorkflow).toContain(
+        "clerk_publishable_key: ${{ needs.public_config.outputs.clerk_publishable_key }}",
+      );
+      expect(stableWorkflow).toContain("relay_url: ${{ needs.public_config.outputs.relay_url }}");
+      expect(stableWorkflow).toContain("prerelease: false");
+      expect(stableWorkflow).toContain("make_latest: true");
+      expect(stableWorkflow).toContain("windows_signing: true");
+      expect(mainWorkflow).toContain("name: Main Artifact Release");
+      expect(mainWorkflow).toContain("needs: [metadata, public_config]");
+      expect(mainWorkflow).toContain("android_required: false");
+      expect(mainWorkflow).toContain("android_profile: preview");
+      expect(mainWorkflow).toContain("android_artifact_name: t3-code-preview-android.apk");
+      expect(mainWorkflow).toContain("android_mobile_version_policy: fingerprint");
+      expect(mainWorkflow).toContain("android_public_config: false");
+      expect(mainWorkflow).toContain("prerelease: true");
+      expect(mainWorkflow).toContain("windows_signing: true");
+      expect(reusableWorkflow).toContain("android_mobile_version_policy:");
+      expect(reusableWorkflow).toContain("android_app_version:");
+      expect(reusableWorkflow).toContain("android_public_config:");
+      expect(reusableWorkflow).toContain("MOBILE_APP_VERSION: ${{ inputs.android_app_version }}");
+      expect(reusableWorkflow).toContain(
+        "T3CODE_CLERK_PUBLISHABLE_KEY: ${{ inputs.android_public_config && (inputs.clerk_publishable_key || vars.CLERK_PUBLISHABLE_KEY) || '' }}",
+      );
+      expect(reusableWorkflow).toContain(
+        "T3CODE_RELAY_URL: ${{ inputs.android_public_config && (inputs.relay_url || vars.T3CODE_RELAY_URL) || '' }}",
+      );
+      expect(reusableWorkflow).toContain(
+        "MOBILE_VERSION_POLICY: ${{ inputs.android_mobile_version_policy }}",
+      );
+      expect(reusableWorkflow).toContain(
+        "T3CODE_RELAY_URL: ${{ inputs.relay_url || vars.T3CODE_RELAY_URL }}",
+      );
+      expect(reusableWorkflow).toContain(
+        'run: node scripts/update-release-package-versions.ts "${{ inputs.release_version }}"',
+      );
+      expect(reusableWorkflow).toContain("needs: android_preflight");
+      expect(reusableWorkflow).toContain("needs: [android_preflight, build_wsl_node_pty]");
+      expect(reusableWorkflow).toContain(
+        "if: needs.android_preflight.result == 'success' && needs.build_wsl_node_pty.result == 'success'",
+      );
+      expect(reusableWorkflow).toContain("!inputs.android_required &&");
+      expect(reusableWorkflow).toContain("needs.android_apk.result == 'skipped'");
+      expect(ciWorkflow).toContain("mobile_native_static_analysis:");
+      expect(ciWorkflow).toContain("brew bundle install --file apps/mobile/Brewfile");
+      expect(ciWorkflow).toContain("run: vp run lint:mobile");
     }).pipe(Effect.provide(NodeServices.layer)),
   );
 });

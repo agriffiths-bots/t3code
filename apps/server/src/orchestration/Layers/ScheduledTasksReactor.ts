@@ -61,7 +61,7 @@ const CLOCK_SKEW_FUTURE_TOLERANCE_MS = 60 * 60 * 1_000;
 const isValidCron = (cronExpr: string | null, timezone: string): boolean => {
   if (cronExpr === null) return false;
   try {
-    new Cron(cronExpr, { timezone });
+    const _cron = new Cron(cronExpr, { timezone });
     return true;
   } catch {
     return false;

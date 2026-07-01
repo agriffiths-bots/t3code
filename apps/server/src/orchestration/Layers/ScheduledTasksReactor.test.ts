@@ -1,3 +1,4 @@
+/* oxlint-disable t3code/no-manual-effect-runtime-in-tests -- These reactor tests intentionally manage a long-lived runtime and scope lifecycle. */
 import {
   ProjectId,
   ProviderInstanceId,
@@ -229,7 +230,9 @@ describe("ScheduledTasksReactor", () => {
     expect(turnStarts).toHaveLength(1);
     expect(turnStarts[0]!.threadId).toBe(threadId);
 
-    const rows = await harness.activeRuntime.runPromise(harness.repository.listByThread({ threadId }));
+    const rows = await harness.activeRuntime.runPromise(
+      harness.repository.listByThread({ threadId }),
+    );
     expect(rows[0]!.lastStatus).toBe("dispatched");
     // next_run_at advanced ~1h (intervalSeconds) past the run instant.
     expect(rows[0]!.nextRunAt).not.toBeNull();
@@ -256,7 +259,9 @@ describe("ScheduledTasksReactor", () => {
     const turnStarts = harness.dispatched.filter((c) => c.type === "thread.turn.start");
     expect(turnStarts).toHaveLength(0);
 
-    const rows = await harness.activeRuntime.runPromise(harness.repository.listByThread({ threadId }));
+    const rows = await harness.activeRuntime.runPromise(
+      harness.repository.listByThread({ threadId }),
+    );
     expect(rows[0]!.lastStatus).toBe("skipped");
     expect(rows[0]!.skippedCount).toBe(1);
   });
@@ -275,7 +280,9 @@ describe("ScheduledTasksReactor", () => {
     const turnStarts = harness.dispatched.filter((c) => c.type === "thread.turn.start");
     expect(turnStarts).toHaveLength(0);
 
-    const rows = await harness.activeRuntime.runPromise(harness.repository.listByThread({ threadId }));
+    const rows = await harness.activeRuntime.runPromise(
+      harness.repository.listByThread({ threadId }),
+    );
     expect(rows[0]!.enabled).toBe(0);
     expect(rows[0]!.lastStatus).toBe("error");
     expect(rows[0]!.lastError).toBe("thread deleted");

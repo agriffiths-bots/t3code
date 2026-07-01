@@ -176,9 +176,7 @@ const ReactorLayerLive = Layer.empty.pipe(
   Layer.provideMerge(
     ScheduledTasksReactorLive.pipe(Layer.provide(BootstrapTurnStartDispatcher.layer)),
   ),
-  Layer.provideMerge(
-    ChildThreadCoordinatorLive.pipe(Layer.provide(PendingDispatchRepositoryLive)),
-  ),
+  Layer.provideMerge(ChildThreadCoordinatorLive.pipe(Layer.provide(PendingDispatchRepositoryLive))),
   Layer.provideMerge(AgentAwarenessRelay.layer.pipe(Layer.provide(ServerSecretStore.layer))),
   Layer.provideMerge(RuntimeReceiptBusLive),
 );

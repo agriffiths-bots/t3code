@@ -17,7 +17,7 @@ on:
 
 permissions:
   contents: write
-  issues: write
+  issues: read
   pull-requests: write
   actions: read
   checks: read
@@ -145,12 +145,6 @@ jobs:
           git add -A
           git commit -m "fix: address automated review feedback"
           git push
-
-      - name: Ask reviewers to re-check
-        if: steps.state_before.outputs.ready_to_merge != 'true' && steps.openai_key.outputs.present == 'true' && steps.base_prompt.outputs.available == 'true'
-        shell: bash
-        run: |
-          gh pr comment "$PR_NUMBER" --body $'@codex review\n\n@greptileai review'
 
       - name: Upload Codex babysitter output
         if: always() && steps.state_before.outputs.ready_to_merge != 'true'

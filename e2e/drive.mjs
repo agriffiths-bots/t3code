@@ -25,8 +25,8 @@
 //
 // Exit 0 on success (turn completed + assistant output captured), 1 otherwise.
 
-import { DatabaseSync } from "node:sqlite";
-import { randomUUID } from "node:crypto";
+import * as NodeCrypto from "node:crypto";
+import * as NodeSqlite from "node:sqlite";
 
 function arg(name, def) {
   const i = process.argv.indexOf(`--${name}`);
@@ -44,7 +44,9 @@ const TIMEOUT_MS = Number(arg("timeout-ms", "180000"));
 const TOKEN = process.env.T3_TOKEN;
 
 if (!TOKEN) {
-  console.error("FATAL: T3_TOKEN env var is required (mint via `t3 auth session issue --token-only`).");
+  console.error(
+    "FATAL: T3_TOKEN env var is required (mint via `t3 auth session issue --token-only`).",
+  );
   process.exit(2);
 }
 
@@ -73,7 +75,7 @@ async function snapshot() {
 
 function openDb() {
   // Read-only is enough to assert; readwrite=false keeps us off the writer's lane.
-  return new DatabaseSync(DB_PATH, { readOnly: true });
+  return new NodeSqlite.DatabaseSync(DB_PATH, { readOnly: true });
 }
 
 async function main() {
@@ -85,10 +87,10 @@ async function main() {
     (p) => p.deletedAt === null && p.workspaceRoot === WORKSPACE,
   );
   if (!project) {
-    const projectId = randomUUID();
+    const projectId = NodeCrypto.randomUUID();
     await dispatch({
       type: "project.create",
-      commandId: randomUUID(),
+      commandId: NodeCrypto.randomUUID(),
       projectId,
       title: TITLE,
       workspaceRoot: WORKSPACE,
@@ -102,10 +104,10 @@ async function main() {
   }
 
   // 2) Create a thread bound to the chosen provider instance + model.
-  const threadId = randomUUID();
+  const threadId = NodeCrypto.randomUUID();
   await dispatch({
     type: "thread.create",
-    commandId: randomUUID(),
+    commandId: NodeCrypto.randomUUID(),
     threadId,
     projectId: project.id,
     title: TITLE,
@@ -119,17 +121,19 @@ async function main() {
   console.log(`[drive] created thread ${threadId}`);
 
   // 3) Send a USER TURN (a prompt) to that thread.
-  const messageId = randomUUID();
+  const messageId = NodeCrypto.randomUUID();
   const startSeq = await dispatch({
     type: "thread.turn.start",
-    commandId: randomUUID(),
+    commandId: NodeCrypto.randomUUID(),
     threadId,
     message: { messageId, role: "user", text: PROMPT, attachments: [] },
     runtimeMode: "full-access",
     interactionMode: "default",
     createdAt: nowIso(),
   });
-  console.log(`[drive] dispatched turn.start (seq=${JSON.stringify(startSeq)}) prompt=${JSON.stringify(PROMPT)}`);
+  console.log(
+    `[drive] dispatched turn.start (seq=${JSON.stringify(startSeq)}) prompt=${JSON.stringify(PROMPT)}`,
+  );
 
   // 4) Poll SQLite projection tables until the turn settles.
   const db = openDb();
@@ -152,10 +156,14 @@ async function main() {
     const turn = turnStmt.get(threadId);
     const sess = sessStmt.get(threadId);
     if (turn && turn.state !== lastState) {
-      console.log(`[drive] turn state=${turn.state} session=${sess?.status ?? "?"}${sess?.last_error ? ` err=${sess.last_error}` : ""}`);
+      console.log(
+        `[drive] turn state=${turn.state} session=${sess?.status ?? "?"}${sess?.last_error ? ` err=${sess.last_error}` : ""}`,
+      );
       lastState = turn.state;
     }
-    const settled = turn && (turn.state === "completed" || turn.state === "failed" || turn.state === "interrupted");
+    const settled =
+      turn &&
+      (turn.state === "completed" || turn.state === "failed" || turn.state === "interrupted");
     if (settled) {
       const asst = asstStmt.get(threadId);
       const ok = turn.state === "completed" && asst && asst.text && asst.text.trim().length > 0;
@@ -167,20 +175,26 @@ async function main() {
       console.log(`session.status      : ${sess?.status}`);
       console.log(`session.last_error  : ${sess?.last_error ?? "(none)"}`);
       console.log(`assistant.message_id: ${asst?.message_id ?? "(none)"}`);
-      console.log(`assistant.text      : ${asst?.text ? JSON.stringify(asst.text.slice(0, 400)) : "(none)"}`);
+      console.log(
+        `assistant.text      : ${asst?.text ? JSON.stringify(asst.text.slice(0, 400)) : "(none)"}`,
+      );
       console.log("============================");
       db.close();
       if (ok) {
         console.log("[drive] SUCCESS: turn completed with assistant output.");
         process.exit(0);
       }
-      console.error(`[drive] FAILURE: turn settled as ${turn.state} without usable assistant output.`);
+      console.error(
+        `[drive] FAILURE: turn settled as ${turn.state} without usable assistant output.`,
+      );
       process.exit(1);
     }
     await new Promise((r) => setTimeout(r, 2000));
   }
   db.close();
-  console.error(`[drive] TIMEOUT after ${TIMEOUT_MS}ms; last turn state=${lastState ?? "(no turn row)"}.`);
+  console.error(
+    `[drive] TIMEOUT after ${TIMEOUT_MS}ms; last turn state=${lastState ?? "(no turn row)"}.`,
+  );
   process.exit(1);
 }
 

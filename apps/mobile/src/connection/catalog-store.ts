@@ -22,22 +22,25 @@ function catalogError(operation: string, cause: unknown) {
   });
 }
 
+const decodeConnectionCatalogDocument = Schema.decodeUnknownResult(ConnectionCatalogDocument);
+const encodeConnectionCatalogDocument = Schema.encodeUnknownResult(ConnectionCatalogDocument);
+
 const decodeCatalog = Effect.fn("mobile.connectionStorage.decodeCatalog")(function* (raw: string) {
   const parsed = yield* Effect.try({
     try: () => JSON.parse(raw) as unknown,
     catch: (cause) => catalogError("decode", cause),
   });
-  return yield* Effect.fromResult(
-    Schema.decodeUnknownResult(ConnectionCatalogDocument)(parsed),
-  ).pipe(Effect.mapError((cause) => catalogError("decode", cause)));
+  return yield* Effect.fromResult(decodeConnectionCatalogDocument(parsed)).pipe(
+    Effect.mapError((cause) => catalogError("decode", cause)),
+  );
 });
 
 const encodeCatalog = Effect.fn("mobile.connectionStorage.encodeCatalog")(function* (
   catalog: ConnectionCatalogDocumentType,
 ) {
-  const encoded = yield* Effect.fromResult(
-    Schema.encodeUnknownResult(ConnectionCatalogDocument)(catalog),
-  ).pipe(Effect.mapError((cause) => catalogError("encode", cause)));
+  const encoded = yield* Effect.fromResult(encodeConnectionCatalogDocument(catalog)).pipe(
+    Effect.mapError((cause) => catalogError("encode", cause)),
+  );
   return JSON.stringify(encoded);
 });
 

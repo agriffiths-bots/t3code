@@ -1,4 +1,10 @@
-import { Outlet, createFileRoute, redirect, useCanGoBack, useNavigate } from "@tanstack/react-router";
+import {
+  Outlet,
+  createFileRoute,
+  redirect,
+  useCanGoBack,
+  useNavigate,
+} from "@tanstack/react-router";
 import { useCallback, useEffect } from "react";
 
 import { SidebarInset, SidebarTrigger } from "../components/ui/sidebar";

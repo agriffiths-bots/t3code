@@ -2,7 +2,10 @@ import { ProjectId, ScheduledTaskEntry, ThreadId } from "@t3tools/contracts";
 import * as Schema from "effect/Schema";
 import { Tool, Toolkit } from "effect/unstable/ai";
 
-import { ScheduleBusyPolicy, ScheduledTaskId } from "../../../persistence/Services/ScheduledTasks.ts";
+import {
+  ScheduleBusyPolicy,
+  ScheduledTaskId,
+} from "../../../persistence/Services/ScheduledTasks.ts";
 import * as McpInvocationContext from "../../McpInvocationContext.ts";
 import { ThreadStartToolError, ThreadStartToolInput, ThreadStartMode } from "../thread/tools.ts";
 
@@ -225,7 +228,7 @@ export const CheckSubagentTool = Tool.make("t3_check_subagent", {
 
 export const WaitSubagentTool = Tool.make("t3_wait_subagent", {
   description:
-    "Wait for one or more sub-agents to finish. This returns quickly with one result row per requested child; a child that has not finished yet has status \"pending\". While pending is true and you still want to wait, re-call this tool with the returned resumeToken (and the same childThreadIds) to keep waiting — never assume a single call blocks until completion. This waits at most ~90 seconds in total (across resumeToken re-calls); once that elapses with children still running, it returns promoted=true and those children have status \"running\" — STOP calling wait and go do other work, you will receive a new message automatically when each one finishes. mode \"all\" (default) waits for every child; \"any\" returns as soon as one settles. timeoutSeconds (default 600, clamped to [1,3900]) is the requested logical budget; children still unfinished once it is exhausted are returned with status \"timeout\".",
+    'Wait for one or more sub-agents to finish. This returns quickly with one result row per requested child; a child that has not finished yet has status "pending". While pending is true and you still want to wait, re-call this tool with the returned resumeToken (and the same childThreadIds) to keep waiting — never assume a single call blocks until completion. This waits at most ~90 seconds in total (across resumeToken re-calls); once that elapses with children still running, it returns promoted=true and those children have status "running" — STOP calling wait and go do other work, you will receive a new message automatically when each one finishes. mode "all" (default) waits for every child; "any" returns as soon as one settles. timeoutSeconds (default 600, clamped to [1,3900]) is the requested logical budget; children still unfinished once it is exhausted are returned with status "timeout".',
   parameters: WaitSubagentInput,
   success: WaitSubagentOutput,
   failure: ThreadStartToolError,
@@ -249,7 +252,7 @@ export const ListSubagentsTool = Tool.make("t3_list_subagents", {
 
 export const ScheduleCreateTool = Tool.make("t3_schedule_create", {
   description:
-    "Schedule a recurring prompt to be sent to a thread (defaults to the calling thread). Provide exactly one of intervalSeconds (fixed interval) or cronExpr (a cron expression, validated on create); optionally a timezone (IANA name, default UTC) and busyPolicy (\"skip\" default, or \"queue_once\"). The same thread is reused on every trigger.",
+    'Schedule a recurring prompt to be sent to a thread (defaults to the calling thread). Provide exactly one of intervalSeconds (fixed interval) or cronExpr (a cron expression, validated on create); optionally a timezone (IANA name, default UTC) and busyPolicy ("skip" default, or "queue_once"). The same thread is reused on every trigger.',
   parameters: ScheduleCreateInput,
   success: ScheduleEntry,
   failure: ThreadStartToolError,
