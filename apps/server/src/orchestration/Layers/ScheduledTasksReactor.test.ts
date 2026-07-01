@@ -98,6 +98,7 @@ const makeTask = (overrides: Partial<ScheduledTask> = {}): ScheduledTask =>
     skippedCount: 0,
     retryCount: 0,
     queuedCount: 0,
+    modelSelection: null,
     createdAt: "2026-06-17T08:00:00.000Z",
     ...overrides,
   }) satisfies ScheduledTask;
@@ -237,6 +238,43 @@ describe("ScheduledTasksReactor", () => {
     // next_run_at advanced ~1h (intervalSeconds) past the run instant.
     expect(rows[0]!.nextRunAt).not.toBeNull();
     expect(Date.parse(rows[0]!.nextRunAt!)).toBeGreaterThan(Date.parse(now));
+  });
+
+  it("dispatches a pinned model as a per-turn override", async () => {
+    const threadId = ThreadId.make("thread-model");
+    const taskId = ScheduledTaskId.make("task-model");
+    const pinnedModel: ModelSelection = {
+      instanceId: ProviderInstanceId.make("claudeAgent"),
+      model: "claude-opus-4-8",
+    };
+    const harness = await createHarness({ shells: [makeShell({ threadId })] });
+    await harness.activeRuntime.runPromise(
+      harness.repository.insert(makeTask({ taskId, threadId, modelSelection: pinnedModel })),
+    );
+
+    await harness.runOneTick();
+
+    const turnStarts = harness.dispatched.filter((c) => c.type === "thread.turn.start");
+    expect(turnStarts).toHaveLength(1);
+    // The schedule's model overrides the thread's default (codexModel) for this run.
+    expect(turnStarts[0]!.modelSelection).toStrictEqual(pinnedModel);
+  });
+
+  it("re-asserts the thread's model when the schedule has no pin", async () => {
+    const threadId = ThreadId.make("thread-nomodel");
+    const taskId = ScheduledTaskId.make("task-nomodel");
+    const harness = await createHarness({ shells: [makeShell({ threadId })] });
+    await harness.activeRuntime.runPromise(
+      harness.repository.insert(makeTask({ taskId, threadId, modelSelection: null })),
+    );
+
+    await harness.runOneTick();
+
+    const turnStarts = harness.dispatched.filter((c) => c.type === "thread.turn.start");
+    expect(turnStarts).toHaveLength(1);
+    // An unpinned run dispatches the thread's own model explicitly (never
+    // undefined) so it can't inherit a pin cached in-process by another schedule.
+    expect(turnStarts[0]!.modelSelection).toStrictEqual(codexModel);
   });
 
   it("skips a busy thread without dispatching an extra turn", async () => {

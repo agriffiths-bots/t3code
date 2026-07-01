@@ -8,6 +8,7 @@
  */
 import {
   IsoDateTime,
+  ModelSelection,
   NonNegativeInt,
   ScheduleBusyPolicy,
   type ScheduledTaskEntry,
@@ -47,6 +48,10 @@ export const ScheduledTask = Schema.Struct({
   skippedCount: NonNegativeInt,
   retryCount: NonNegativeInt,
   queuedCount: NonNegativeInt,
+  // Model/harness each dispatched run uses, or null to inherit the thread's
+  // current model. Persisted as a JSON TEXT column (see the DB-row schema in
+  // Layers/ScheduledTasks.ts); the reactor passes it as a per-turn override.
+  modelSelection: Schema.NullOr(ModelSelection),
   createdAt: IsoDateTime,
 });
 export type ScheduledTask = typeof ScheduledTask.Type;
@@ -72,6 +77,7 @@ export const toScheduleEntry = (task: ScheduledTask): ScheduledTaskEntry => ({
   nextRunAt: task.nextRunAt,
   lastRunAt: task.lastRunAt,
   lastStatus: task.lastStatus,
+  modelSelection: task.modelSelection,
 });
 
 export const ListDueScheduledTasksInput = Schema.Struct({

@@ -20,6 +20,7 @@ const sampleEntry = {
   nextRunAt: "2026-06-19T14:30:00.000Z",
   lastRunAt: null,
   lastStatus: null,
+  modelSelection: null,
 };
 
 describe("ScheduledTaskEntry", () => {
@@ -28,6 +29,17 @@ describe("ScheduledTaskEntry", () => {
     expect(decoded.taskId).toBe("task-1");
     expect(decoded.enabled).toBe(true);
     expect(encodeEntry(decoded)).toStrictEqual(sampleEntry);
+  });
+
+  it("round-trips a pinned modelSelection", () => {
+    const decoded = decodeEntry({
+      ...sampleEntry,
+      modelSelection: { instanceId: "claudeAgent", model: "claude-opus-4-8" },
+    });
+    expect(decoded.modelSelection).toStrictEqual({
+      instanceId: "claudeAgent",
+      model: "claude-opus-4-8",
+    });
   });
 });
 

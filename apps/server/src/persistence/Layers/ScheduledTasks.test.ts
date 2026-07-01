@@ -1,4 +1,4 @@
-import { ThreadId } from "@t3tools/contracts";
+import { ProviderInstanceId, ThreadId } from "@t3tools/contracts";
 import { assert, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
@@ -33,6 +33,7 @@ const makeTask = (overrides: Partial<ScheduledTask> = {}): ScheduledTask =>
     skippedCount: 0,
     retryCount: 0,
     queuedCount: 0,
+    modelSelection: null,
     createdAt: "2026-06-17T09:00:00.000Z",
     ...overrides,
   }) satisfies ScheduledTask;
@@ -130,6 +131,28 @@ layer("ScheduledTaskRepository", (it) => {
 
       const byThread = yield* repository.listByThread({ threadId });
       assert.equal(byThread.length, 0);
+    }),
+  );
+
+  it.effect("round-trips a pinned modelSelection through the JSON column", () =>
+    Effect.gen(function* () {
+      const repository = yield* ScheduledTaskRepository;
+      const threadId = ThreadId.make("thread-model");
+      const taskId = ScheduledTaskId.make("model-task");
+      const modelSelection = {
+        instanceId: ProviderInstanceId.make("claudeAgent"),
+        model: "claude-opus-4-8",
+      };
+
+      yield* repository.insert(makeTask({ taskId, threadId, modelSelection }));
+
+      const [read] = yield* repository.listByThread({ threadId });
+      assert.deepEqual(read?.modelSelection, modelSelection);
+
+      // An update that clears the model persists null (inherit thread model).
+      yield* repository.update(makeTask({ taskId, threadId, modelSelection: null }));
+      const [cleared] = yield* repository.listByThread({ threadId });
+      assert.equal(cleared?.modelSelection, null);
     }),
   );
 });

@@ -49,6 +49,7 @@ import Migration0034 from "./Migrations/034_ProjectionThreadParentId.ts";
 import Migration0035 from "./Migrations/035_ScheduledTasks.ts";
 import Migration0036 from "./Migrations/036_PendingDispatches.ts";
 import Migration0037 from "./Migrations/037_PendingDispatchesCommandId.ts";
+import Migration0038 from "./Migrations/038_ScheduledTasksModelSelection.ts";
 
 /**
  * Migration loader with all migrations defined inline.
@@ -97,6 +98,7 @@ export const migrationEntries = [
   [35, "ScheduledTasks", Migration0035],
   [36, "PendingDispatches", Migration0036],
   [37, "PendingDispatchesCommandId", Migration0037],
+  [38, "ScheduledTasksModelSelection", Migration0038],
 ] as const;
 
 export const makeMigrationLoader = (throughId?: number) =>

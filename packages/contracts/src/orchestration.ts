@@ -482,6 +482,14 @@ export const ScheduledTaskEntry = Schema.Struct({
   nextRunAt: Schema.NullOr(Schema.String),
   lastRunAt: Schema.NullOr(Schema.String),
   lastStatus: Schema.NullOr(Schema.String),
+  // Resolved model/harness this schedule dispatches under, or null to inherit
+  // the target thread's current model on each run. Surfaced so the t3_schedule_*
+  // tool results (and the web UI) confirm which harness a schedule was routed to.
+  // Decodes missing → null so a newer client stays compatible with an older
+  // server (rolling upgrade) that emits schedule entries without this field.
+  modelSelection: Schema.NullOr(ModelSelection).pipe(
+    Schema.withDecodingDefault(Effect.succeed(null)),
+  ),
 });
 export type ScheduledTaskEntry = typeof ScheduledTaskEntry.Type;
 

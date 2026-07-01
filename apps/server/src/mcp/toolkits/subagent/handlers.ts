@@ -12,12 +12,14 @@
  */
 import {
   CommandId,
+  isProviderAvailable,
   IsoDateTime,
   MessageId,
   NonNegativeInt,
   ThreadId,
   type ModelSelection,
   type OrchestrationThread,
+  type ProviderInstanceId,
 } from "@t3tools/contracts";
 import {
   buildProviderOptionSelectionsFromDescriptors,
@@ -174,6 +176,69 @@ const loadThreadDetail = (runtime: SubagentRuntime, threadId: ThreadId) =>
     .getThreadDetailById(threadId)
     .pipe(Effect.mapError((error) => toToolError(error, "Failed to load thread detail.")));
 
+/**
+ * Snapshot every USABLE provider instance's live model list into the shape
+ * `pickModelSelectionFromInstances` consumes (routing id + driver kind + the
+ * models it currently serves, each with default options). This is the same
+ * upstream-maintained registry the model picker reads, so newly-shipped models
+ * are matched without any code change here. Instances are filtered to those the
+ * picker would expose: enabled, available, and not in an error state — an errored
+ * or unavailable snapshot can still carry built-in models the runtime refuses to
+ * run, so resolving against them would pin a schedule that only ever fails.
+ */
+const buildModelSources = (runtime: SubagentRuntime) =>
+  runtime.providerInstanceRegistry.listInstances.pipe(
+    Effect.flatMap((providerInstances) =>
+      Effect.forEach(
+        providerInstances.filter((providerInstance) => providerInstance.enabled),
+        (providerInstance) =>
+          Effect.map(providerInstance.snapshot.getSnapshot, (snapshot) => ({
+            providerInstance,
+            snapshot,
+          })),
+      ),
+    ),
+    Effect.map((pairs) =>
+      pairs
+        .filter(({ snapshot }) => isProviderAvailable(snapshot) && snapshot.status !== "error")
+        .map(({ providerInstance, snapshot }) => ({
+          instanceId: providerInstance.instanceId,
+          driverKind: providerInstance.driverKind,
+          models: snapshot.models.map((providerModel) => ({
+            slug: providerModel.slug,
+            defaultOptions: buildProviderOptionSelectionsFromDescriptors(
+              providerModel.capabilities?.optionDescriptors,
+            ),
+          })),
+        })),
+    ),
+  );
+
+/**
+ * Resolve an explicit plain model name to a `ModelSelection` against the live
+ * provider lists, preferring `preferInstanceId` (usually the target thread's
+ * instance) on ties. Fails loudly when no configured provider serves the model
+ * rather than silently falling back, so a schedule/sub-agent never runs on a
+ * different model than the caller named.
+ */
+const resolveExplicitModelSelection = (
+  runtime: SubagentRuntime,
+  model: string,
+  preferInstanceId: ProviderInstanceId | undefined,
+): Effect.Effect<ModelSelection, ThreadStartToolError> =>
+  buildModelSources(runtime).pipe(
+    Effect.flatMap((modelSources) => {
+      const resolved = pickModelSelectionFromInstances(model, modelSources, preferInstanceId);
+      return resolved === null
+        ? Effect.fail(
+            fail(
+              `Model "${model}" is not served by any configured provider. Pass a model shown in the model picker, or omit "model" to keep the thread's current model.`,
+            ),
+          )
+        : Effect.succeed(resolved);
+    }),
+  );
+
 const spawnSubagent = Effect.fn("SubagentToolkit.spawn")(function* (input: SpawnSubagentInput) {
   const invocation = yield* requireInvocation;
   const runtime = yield* requireRuntime();
@@ -192,40 +257,17 @@ const spawnSubagent = Effect.fn("SubagentToolkit.spawn")(function* (input: Spawn
       }),
     ),
   );
-  const providerInstances = yield* runtime.providerInstanceRegistry.listInstances;
-  const modelSources = yield* Effect.forEach(
-    providerInstances.filter((providerInstance) => providerInstance.enabled),
-    (providerInstance) =>
-      Effect.map(providerInstance.snapshot.getSnapshot, (snapshot) => ({
-        instanceId: providerInstance.instanceId,
-        driverKind: providerInstance.driverKind,
-        models: snapshot.models.map((providerModel) => ({
-          slug: providerModel.slug,
-          defaultOptions: buildProviderOptionSelectionsFromDescriptors(
-            providerModel.capabilities?.optionDescriptors,
-          ),
-        })),
-      })),
-  );
   // An explicit bare `model` resolves against the live provider model lists; a
   // named model no provider serves fails loudly instead of silently spawning on
   // a different (inherited) model. Prefer the source thread's instance on ties.
-  let modelSelection: ModelSelection;
-  if (threadStartInput.model !== undefined) {
-    const resolved = pickModelSelectionFromInstances(
-      threadStartInput.model,
-      modelSources,
-      source.modelSelection.instanceId,
-    );
-    if (resolved === null) {
-      return yield* fail(
-        `Model "${threadStartInput.model}" is not served by any configured provider. Pass a model shown in the model picker, or omit "model" to keep the thread's current model.`,
-      );
-    }
-    modelSelection = resolved;
-  } else {
-    modelSelection = threadStartInput.modelSelection ?? source.modelSelection;
-  }
+  const modelSelection: ModelSelection =
+    threadStartInput.model !== undefined
+      ? yield* resolveExplicitModelSelection(
+          runtime,
+          threadStartInput.model,
+          source.modelSelection.instanceId,
+        )
+      : (threadStartInput.modelSelection ?? source.modelSelection);
   const instance = yield* runtime.providerInstanceRegistry.getInstance(modelSelection.instanceId);
   if (instance === undefined) {
     return yield* fail(`Provider instance ${modelSelection.instanceId} is not available.`);
@@ -603,14 +645,22 @@ const scheduleCreate = Effect.fn("SubagentToolkit.scheduleCreate")(function* (
   const intervalSeconds = input.intervalSeconds ?? null;
   if (cronExpr !== null) yield* validateCron(cronExpr, timezone);
 
-  yield* loadThreadShell(runtime, threadId).pipe(
-    Effect.flatMap((shell) =>
-      Option.match(shell, {
+  const shell = yield* loadThreadShell(runtime, threadId).pipe(
+    Effect.flatMap((shellOption) =>
+      Option.match(shellOption, {
         onNone: () => Effect.fail(fail(`Thread ${threadId} was not found.`)),
-        onSome: () => Effect.void,
+        onSome: Effect.succeed,
       }),
     ),
   );
+
+  // Resolve an explicit plain `model` to a full selection (provider/harness
+  // inferred), preferring the thread's current instance on ties; null inherits
+  // the thread's model on each run.
+  const modelSelection =
+    input.model !== undefined
+      ? yield* resolveExplicitModelSelection(runtime, input.model, shell.modelSelection.instanceId)
+      : null;
 
   const uuid = yield* runtime.crypto.randomUUIDv4.pipe(Effect.orDie);
   const nowMs = yield* Effect.clockWith((clock) => clock.currentTimeMillis);
@@ -634,6 +684,7 @@ const scheduleCreate = Effect.fn("SubagentToolkit.scheduleCreate")(function* (
     skippedCount: NonNegativeInt.make(0),
     retryCount: NonNegativeInt.make(0),
     queuedCount: NonNegativeInt.make(0),
+    modelSelection,
     createdAt: IsoDateTime.make(createdAt),
   };
 
@@ -719,6 +770,30 @@ const scheduleUpdate = Effect.fn("SubagentToolkit.scheduleUpdate")(function* (
     nextRunAt = computed === null ? null : IsoDateTime.make(computed);
   }
 
+  // Three-way `model` handling: omit (undefined) keeps the current selection;
+  // an explicit null un-pins it (runs inherit the thread's model again); a plain
+  // name re-routes. On a re-route, prefer the schedule's current instance, or —
+  // when it is still inheriting — the target thread's instance, so a
+  // multi-instance setup keeps continuity (matches create).
+  let modelSelection: ModelSelection | null;
+  if (input.model === undefined) {
+    modelSelection = existing.modelSelection;
+  } else if (input.model === null) {
+    modelSelection = null;
+  } else {
+    const preferInstanceId =
+      existing.modelSelection?.instanceId ??
+      (yield* loadThreadShell(runtime, existing.threadId).pipe(
+        Effect.map((shellOption) =>
+          Option.match(shellOption, {
+            onNone: () => undefined,
+            onSome: (shell) => shell.modelSelection.instanceId,
+          }),
+        ),
+      ));
+    modelSelection = yield* resolveExplicitModelSelection(runtime, input.model, preferInstanceId);
+  }
+
   const updated: ScheduledTask = {
     ...existing,
     enabled:
@@ -728,6 +803,7 @@ const scheduleUpdate = Effect.fn("SubagentToolkit.scheduleUpdate")(function* (
     intervalSeconds,
     cronExpr,
     nextRunAt,
+    modelSelection,
   };
 
   yield* runtime.scheduledTasks

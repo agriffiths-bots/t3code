@@ -139,6 +139,12 @@ const makeScheduledTasksReactor = Effect.gen(function* () {
         commandId,
         threadId: task.threadId,
         message: { messageId, role: "user", text: task.prompt, attachments: [] },
+        // A schedule may pin its own model/harness (Fix 1); dispatch it as a
+        // per-turn override. Fall back to the thread's current model so an
+        // unpinned run always re-asserts the thread's model explicitly and never
+        // inherits a selection cached in-process by a different pinned schedule
+        // that fired on the same thread.
+        modelSelection: task.modelSelection ?? shell.modelSelection,
         runtimeMode: shell.runtimeMode,
         interactionMode: shell.interactionMode,
         bootstrap: undefined,
