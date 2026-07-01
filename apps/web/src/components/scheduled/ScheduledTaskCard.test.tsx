@@ -36,6 +36,7 @@ const baseTask: ScheduledTaskEntry = {
   nextRunAt: "2030-01-01T00:00:00.000Z",
   lastRunAt: null,
   lastStatus: null,
+  modelSelection: null,
 };
 
 function render(overrides: Partial<ScheduledTaskCardProps> = {}): string {

@@ -1,8 +1,10 @@
+import { ModelSelection } from "@t3tools/contracts";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
 import * as SqlSchema from "effect/unstable/sql/SqlSchema";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Schema from "effect/Schema";
+import * as Struct from "effect/Struct";
 import * as SubscriptionRef from "effect/SubscriptionRef";
 
 import { toPersistenceSqlError } from "../Errors.ts";
@@ -15,6 +17,16 @@ import {
   ScheduledTaskRepository,
   type ScheduledTaskRepositoryShape,
 } from "../Services/ScheduledTasks.ts";
+
+// Read-side row schema: the `model_selection` column is stored as a JSON string,
+// so decoding SELECT results parses it back into a `ModelSelection`. Writes use
+// the base `ScheduledTask` schema and JSON.stringify the field inline (mirrors
+// ProjectionProjects), since a write binds the encoded object, not a string.
+const ScheduledTaskDbRow = ScheduledTask.mapFields(
+  Struct.assign({
+    modelSelection: Schema.NullOr(Schema.fromJsonString(ModelSelection)),
+  }),
+);
 
 const makeScheduledTaskRepository = Effect.gen(function* () {
   const sql = yield* SqlClient.SqlClient;
@@ -45,6 +57,7 @@ const makeScheduledTaskRepository = Effect.gen(function* () {
           skipped_count,
           retry_count,
           queued_count,
+          model_selection,
           created_at
         )
         VALUES (
@@ -64,6 +77,7 @@ const makeScheduledTaskRepository = Effect.gen(function* () {
           ${row.skippedCount},
           ${row.retryCount},
           ${row.queuedCount},
+          ${row.modelSelection !== null ? JSON.stringify(row.modelSelection) : null},
           ${row.createdAt}
         )
         ON CONFLICT (task_id)
@@ -83,13 +97,14 @@ const makeScheduledTaskRepository = Effect.gen(function* () {
           skipped_count = excluded.skipped_count,
           retry_count = excluded.retry_count,
           queued_count = excluded.queued_count,
+          model_selection = excluded.model_selection,
           created_at = excluded.created_at
       `,
   });
 
   const listDueScheduledTaskRows = SqlSchema.findAll({
     Request: ListDueScheduledTasksInput,
-    Result: ScheduledTask,
+    Result: ScheduledTaskDbRow,
     execute: ({ nowIso }) =>
       sql`
         SELECT
@@ -109,6 +124,7 @@ const makeScheduledTaskRepository = Effect.gen(function* () {
           skipped_count AS "skippedCount",
           retry_count AS "retryCount",
           queued_count AS "queuedCount",
+          model_selection AS "modelSelection",
           created_at AS "createdAt"
         FROM scheduled_tasks
         WHERE enabled = 1
@@ -120,7 +136,7 @@ const makeScheduledTaskRepository = Effect.gen(function* () {
 
   const listAllScheduledTaskRows = SqlSchema.findAll({
     Request: Schema.Void,
-    Result: ScheduledTask,
+    Result: ScheduledTaskDbRow,
     execute: () =>
       sql`
         SELECT
@@ -140,6 +156,7 @@ const makeScheduledTaskRepository = Effect.gen(function* () {
           skipped_count AS "skippedCount",
           retry_count AS "retryCount",
           queued_count AS "queuedCount",
+          model_selection AS "modelSelection",
           created_at AS "createdAt"
         FROM scheduled_tasks
         ORDER BY created_at ASC, task_id ASC
@@ -148,7 +165,7 @@ const makeScheduledTaskRepository = Effect.gen(function* () {
 
   const listScheduledTaskRowsByThread = SqlSchema.findAll({
     Request: ListScheduledTasksByThreadInput,
-    Result: ScheduledTask,
+    Result: ScheduledTaskDbRow,
     execute: ({ threadId }) =>
       sql`
         SELECT
@@ -168,6 +185,7 @@ const makeScheduledTaskRepository = Effect.gen(function* () {
           skipped_count AS "skippedCount",
           retry_count AS "retryCount",
           queued_count AS "queuedCount",
+          model_selection AS "modelSelection",
           created_at AS "createdAt"
         FROM scheduled_tasks
         WHERE thread_id = ${threadId}

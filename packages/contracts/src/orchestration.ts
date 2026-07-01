@@ -482,6 +482,10 @@ export const ScheduledTaskEntry = Schema.Struct({
   nextRunAt: Schema.NullOr(Schema.String),
   lastRunAt: Schema.NullOr(Schema.String),
   lastStatus: Schema.NullOr(Schema.String),
+  // Resolved model/harness this schedule dispatches under, or null to inherit
+  // the target thread's current model on each run. Surfaced so the t3_schedule_*
+  // tool results (and the web UI) confirm which harness a schedule was routed to.
+  modelSelection: Schema.NullOr(ModelSelection),
 });
 export type ScheduledTaskEntry = typeof ScheduledTaskEntry.Type;
 

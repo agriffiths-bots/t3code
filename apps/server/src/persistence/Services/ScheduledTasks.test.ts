@@ -1,4 +1,4 @@
-import { ThreadId } from "@t3tools/contracts";
+import { ProviderInstanceId, ThreadId } from "@t3tools/contracts";
 import { describe, expect, it } from "@effect/vitest";
 
 import { ScheduledTask, ScheduledTaskId, toScheduleEntry } from "./ScheduledTasks.ts";
@@ -21,6 +21,7 @@ const makeTask = (overrides: Partial<ScheduledTask> = {}): ScheduledTask =>
     skippedCount: 0,
     retryCount: 0,
     queuedCount: 0,
+    modelSelection: null,
     createdAt: "2026-06-17T09:00:00.000Z",
     ...overrides,
   }) satisfies ScheduledTask;
@@ -59,6 +60,7 @@ describe("toScheduleEntry", () => {
         "intervalSeconds",
         "lastRunAt",
         "lastStatus",
+        "modelSelection",
         "nextRunAt",
         "prompt",
         "scheduleKind",
@@ -102,6 +104,16 @@ describe("toScheduleEntry", () => {
       nextRunAt: "2026-06-18T07:00:00.000Z",
       lastRunAt: "2026-06-17T07:00:00.000Z",
       lastStatus: "ok",
+      modelSelection: null,
     });
+  });
+
+  it("surfaces the pinned modelSelection on the wire entry", () => {
+    const modelSelection = {
+      instanceId: ProviderInstanceId.make("claudeAgent"),
+      model: "claude-opus-4-8",
+    };
+    const entry = toScheduleEntry(makeTask({ modelSelection }));
+    expect(entry.modelSelection).toStrictEqual(modelSelection);
   });
 });

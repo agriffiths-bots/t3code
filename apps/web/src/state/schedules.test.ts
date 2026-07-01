@@ -26,6 +26,7 @@ function task(
     nextRunAt: null,
     lastRunAt: null,
     lastStatus: null,
+    modelSelection: null,
   };
   return {
     ...base,
