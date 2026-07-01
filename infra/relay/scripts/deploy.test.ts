@@ -251,13 +251,21 @@ describe("artifact release workflows", () => {
       expect(stableWorkflow).toContain("make_latest: true");
       expect(stableWorkflow).toContain("windows_signing: true");
       expect(mainWorkflow).toContain("name: Main Artifact Release");
+      // Manual-only: landing on main must not auto-publish a release.
+      expect(mainWorkflow).toContain("workflow_dispatch:");
+      expect(mainWorkflow).not.toContain("push:");
+      // ...but a manual dispatch may only build/publish from main, never an arbitrary ref.
+      // All three jobs (metadata, public_config, publish_artifacts) must carry the guard,
+      // so count occurrences rather than merely asserting presence.
+      const mainRefGuard = "if: ${{ github.ref == 'refs/heads/main' }}";
+      expect(mainWorkflow.split(mainRefGuard).length - 1).toBe(3);
       expect(mainWorkflow).toContain("needs: [metadata, public_config]");
       expect(mainWorkflow).toContain("android_required: false");
       expect(mainWorkflow).toContain("android_profile: preview");
       expect(mainWorkflow).toContain("android_artifact_name: t3-code-preview-android.apk");
       expect(mainWorkflow).toContain("android_mobile_version_policy: fingerprint");
       expect(mainWorkflow).toContain("android_public_config: false");
-      expect(mainWorkflow).toContain("prerelease: true");
+      expect(mainWorkflow).toContain("prerelease: ${{ inputs.prerelease }}");
       expect(mainWorkflow).toContain("windows_signing: true");
       expect(reusableWorkflow).toContain("android_mobile_version_policy:");
       expect(reusableWorkflow).toContain("android_app_version:");
