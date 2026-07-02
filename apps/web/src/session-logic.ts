@@ -291,9 +291,10 @@ export function formatElapsed(startIso: string, endIso: string | undefined): str
 type LatestTurnTiming = Pick<OrchestrationLatestTurn, "turnId" | "startedAt" | "completedAt">;
 type SessionActivityState = Pick<NonNullable<Thread["session"]>, "status" | "activeTurnId">;
 
-function isSessionWorkActive(session: SessionActivityState): boolean {
+export function isThreadSessionActive(session: SessionActivityState | null | undefined): boolean {
   return (
-    session.status === "running" || (session.status === "waiting" && session.activeTurnId !== null)
+    session?.status === "running" ||
+    (session?.status === "waiting" && session.activeTurnId !== null)
   );
 }
 
@@ -304,7 +305,7 @@ export function isLatestTurnSettled(
   if (!latestTurn?.startedAt) return false;
   if (!latestTurn.completedAt) return false;
   if (!session) return true;
-  if (isSessionWorkActive(session)) return false;
+  if (isThreadSessionActive(session)) return false;
   return true;
 }
 
@@ -313,7 +314,7 @@ export function deriveActiveWorkStartedAt(
   session: SessionActivityState | null,
   sendStartedAt: string | null,
 ): string | null {
-  const runningTurnId = session && isSessionWorkActive(session) ? session.activeTurnId : null;
+  const runningTurnId = session && isThreadSessionActive(session) ? session.activeTurnId : null;
   if (runningTurnId !== null) {
     if (latestTurn?.turnId === runningTurnId) {
       return latestTurn.startedAt ?? sendStartedAt;
@@ -1394,6 +1395,6 @@ export function derivePhase(session: ThreadSession | null): SessionPhase {
     return "disconnected";
   }
   if (session.status === "starting") return "connecting";
-  if (isSessionWorkActive(session)) return "running";
+  if (isThreadSessionActive(session)) return "running";
   return "ready";
 }

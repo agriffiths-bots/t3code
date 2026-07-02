@@ -17,6 +17,7 @@ import {
   findLatestProposedPlan,
   findSidebarProposedPlan,
   hasActionableProposedPlan,
+  isThreadSessionActive,
   isLatestTurnSettled,
   workEntryIndicatesToolFailure,
   workEntryIndicatesToolNeutralStatus,
@@ -1575,6 +1576,26 @@ describe("deriveWorkLogEntries context window handling", () => {
 
     expect(entries).toHaveLength(1);
     expect(entries[0]?.label).toBe("Context compacted");
+  });
+});
+
+describe("isThreadSessionActive", () => {
+  it("treats active waiting sessions as active work", () => {
+    expect(
+      isThreadSessionActive({
+        status: "waiting",
+        activeTurnId: TurnId.make("turn-1"),
+      }),
+    ).toBe(true);
+  });
+
+  it("does not treat parked waiting sessions as active work", () => {
+    expect(
+      isThreadSessionActive({
+        status: "waiting",
+        activeTurnId: null,
+      }),
+    ).toBe(false);
   });
 });
 

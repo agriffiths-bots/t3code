@@ -83,6 +83,7 @@ import {
   deriveWorkLogEntries,
   hasActionableProposedPlan,
   isLatestTurnSettled,
+  isThreadSessionActive,
 } from "../session-logic";
 import { type LegendListRef } from "@legendapp/list/react";
 import { getAnchoredTurnMetrics, type TimelineScrollMode } from "./chat/timelineScrollAnchoring";
@@ -5134,7 +5135,7 @@ function ChatViewContent(props: ChatViewProps) {
                 timelineEntries={timelineEntries}
                 latestTurn={activeLatestTurn}
                 runningTurnId={
-                  activeThread.session?.status === "running"
+                  activeThread.session && isThreadSessionActive(activeThread.session)
                     ? activeThread.session.activeTurnId
                     : null
                 }
