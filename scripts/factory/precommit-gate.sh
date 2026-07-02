@@ -2,7 +2,7 @@
 # precommit-gate.sh — the software-factory commit gate.
 #
 # Guarantees every commit (1) was built from a fully-staged tree, (2) passes
-# the repo's static checks, and (3) is clean on a multi-model autoreview panel
+# the repo's static checks, and (3) is clean on autoreview
 # — or carries an explicit, audited dismissal for every finding.
 #
 # Modes:
@@ -157,6 +157,32 @@ refuse() { # refuse <short> <verdict> <detail-json>
 
 head_sha() { git rev-parse -q --verify HEAD 2>/dev/null || git hash-object -t tree /dev/null; }
 
+# Self-heal the out-of-tree hook installation after an installed hook reaches
+# the gate: updated shims in HEAD propagate to the installed dir. This cannot
+# bootstrap a brand-new hook for a sequencer commit that runs before any
+# existing installed hook fires; upgraded clones must run install-hooks.sh once
+# for that first-use case.
+hooks_path="$(git config core.hooksPath 2>/dev/null || true)"
+if [[ "$MODE" != "--status" && -n "$hooks_path" && -d "$hooks_path" && "$hooks_path" = /* && "$hooks_path" != "$REPO_ROOT"/* ]]; then
+  for h in pre-commit pre-merge-commit prepare-commit-msg; do
+    if git cat-file -e "HEAD:.githooks/$h" 2>/dev/null && head_is_regular ".githooks/$h"; then
+      if ! git show "HEAD:.githooks/$h" 2>/dev/null | cmp -s - "$hooks_path/$h" 2>/dev/null; then
+        # Atomic + fail-closed, like the shims' own HEAD materialization: a
+        # truncated live hook or a silently-failed refresh must never persist.
+        tmp_hook="$hooks_path/.$h.$$"
+        if git show "HEAD:.githooks/$h" > "$tmp_hook" 2>/dev/null && [ -s "$tmp_hook" ] \
+           && chmod +x "$tmp_hook" && mv -f "$tmp_hook" "$hooks_path/$h"; then
+          echo "factory-gate: refreshed installed hook '$h' from HEAD" >&2
+        else
+          rm -f "$tmp_hook"
+          echo "factory-gate: FAILED to refresh installed hook '$h'; refusing (stale installed hooks must not persist silently)" >&2
+          exit 2
+        fi
+      fi
+    fi
+  done
+fi
+
 # Dismissals are single-use and bound to the review that prompted them: any
 # leftover file on a pass/skip path is stale and must not survive to cover a
 # future finding that happens to share file/line/title.
@@ -223,7 +249,8 @@ fi
 # may never REMOVE them: a tree without the gate would land judged by the old
 # gate and leave the factory hookless. Applies to every load-bearing file.
 for gf in scripts/factory/precommit-gate.sh scripts/factory/factory.conf \
-          scripts/factory/install-hooks.sh .githooks/pre-commit .githooks/pre-merge-commit; do
+          scripts/factory/install-hooks.sh .githooks/pre-commit \
+          .githooks/pre-merge-commit .githooks/prepare-commit-msg; do
   git cat-file -e "HEAD:$gf" 2>/dev/null || continue
   if ! git rev-parse -q --verify ":$gf" >/dev/null 2>&1; then
     refuse "this commit removes the gate file '$gf'.
@@ -271,9 +298,9 @@ else
     fi
   done
 
-  # ---- autoreview panel over exactly the staged diff ----
+  # ---- autoreview over exactly the staged diff ----
   [ -x "$FACTORY_AUTOREVIEW_BIN" ] || refuse "autoreview helper not found at $FACTORY_AUTOREVIEW_BIN" review-infra '{}'
-  echo "factory-gate: autoreview panel (this can take several minutes; pre-warm next time with scripts/factory/precommit-gate.sh --prepare)" >&2
+  echo "factory-gate: autoreview (this can take several minutes; pre-warm next time with scripts/factory/precommit-gate.sh --prepare)" >&2
   rm -f "$REVIEW_JSON" "$REVIEW_FOR"
   "$FACTORY_AUTOREVIEW_BIN" --mode local "${FACTORY_REVIEW_ARGS[@]}" --json-output "$REVIEW_JSON" 1>&2
   review_rc=$?

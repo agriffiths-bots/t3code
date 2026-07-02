@@ -147,7 +147,12 @@ cleanup_on_abort() {
     wait "$SRV_PID" 2>/dev/null || true
   fi
   rm -rf "$T3_HOME"
-  [[ "$CLAIMED" == "1" ]] && rm -rf "$REG"
+  # Remove the claim ONLY if it is still OURS: a concurrent t3-down + retry
+  # t3-up may have replaced $REG with a fresh claim while we were dying —
+  # deleting that would orphan the replacement's registration.
+  if [[ "$CLAIMED" == "1" && "$(cat "$REG/.owner" 2>/dev/null)" == "$$" ]]; then
+    rm -rf "$REG"
+  fi
 }
 trap cleanup_on_abort EXIT
 trap 'cleanup_on_abort; exit 130' INT
@@ -158,6 +163,7 @@ fail() { exit 1; }
 # concurrent `t3-up --name X` can't both boot and leak the loser's server.
 # Claimed under the abort trap: any early exit releases the claim.
 mkdir "$REG" 2>/dev/null || { echo "t3-up: lost the claim race for '$NAME' (another t3-up just took it)" >&2; exit 1; }
+echo "$$" > "$REG/.owner"
 CLAIMED=1
 
 PORT=""
@@ -173,6 +179,11 @@ for candidate in $(seq 13910 13940); do
     setsid node "$ENTRY" serve --port "$candidate" --host 127.0.0.1 \
     > "$T3_HOME/server.log" 2>&1 < /dev/null &
   SRV_PID=$!
+  # Provisional record: if this script dies uncleanably (SIGKILL/OOM) before
+  # registration, t3-down can still find and reap the detached server.
+  # Written atomically so a reader never sees a partial record.
+  printf "export %s='%s'\n" T3_PID "$SRV_PID" T3_HOME "$T3_HOME" T3_ENTRY "$ENTRY" T3_PORT "$candidate" > "$REG/.boot.env.$$" \
+    && mv -f "$REG/.boot.env.$$" "$REG/boot.env"
   for ((i = 1; i <= BOOT_TIMEOUT; i++)); do
     kill -0 "$SRV_PID" 2>/dev/null || break
     if grep -q "Listening on http://127.0.0.1:$candidate" "$T3_HOME/server.log"; then
@@ -235,6 +246,7 @@ shq() { printf "%s" "$1" | sed "s/'/'\\\\''/g"; }
     T3_PID "$(shq "$SRV_PID")" \
     T3_ENTRY "$(shq "$ENTRY")"
 } > "$REG/instance.env"
+rm -f "$REG/boot.env"   # provisional record superseded by the registration
 ln -sfn "$T3_HOME" "$REG/home"
 # Registered: t3-down.sh owns the lifecycle from here on.
 REGISTERED=1

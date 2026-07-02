@@ -15,9 +15,8 @@ remediation steps.
    staging is rejected with instructions).
 2. **Static checks** — `vp run typecheck` + `vp check` (from
    `factory.conf`; they never modify files).
-3. **Autoreview panel** — Codex `gpt-5.5` (high) + Claude `claude-opus-4-8`
-   (max) over exactly the staged diff (`--mode local`). Clean panel ⇒ commit
-   passes. Findings ⇒ commit refused.
+3. **Autoreview** — Codex `gpt-5.5` (high) over exactly the staged diff
+   (`--mode local`). Clean review ⇒ commit passes. Findings ⇒ commit refused.
 
 A PASS is cached against the `(HEAD, staged-tree)` pair, so retries and the
 `--prepare` pre-warm are instant. Any staged change invalidates the cache.
@@ -32,7 +31,7 @@ git commit -m "..."                            # instant (cached gate result)
 ```
 
 Running `git commit` directly also works — the hook just runs the whole gate
-inline (typecheck + panel review can take several minutes; give the command a
+inline (typecheck + review can take several minutes; give the command a
 generous timeout).
 
 ## Disagreeing with findings
@@ -54,9 +53,13 @@ Write `.git/factory/dismissals.json` (schema in the header of
   the nightly upstream-sync driver (whose PRs merge via the CI-only policy
   dir), which must set it for every commit and sequencer continuation it
   performs. There is no ambient bypass in the gate itself; merge commits are
-  covered via `.githooks/pre-merge-commit`. Note one git-design limit:
-  cherry-pick/rebase sequencer commits run no pre-commit hook at all — those
-  flows are covered by the PR-level gate (CI + Codex via wizzo-approve).
+  covered via `pre-merge-commit`. New installs also include a
+  `prepare-commit-msg` shim for cherry-pick/revert commits (the only hook git
+  runs for them). Existing clones installed before that shim existed must run
+  `scripts/factory/install-hooks.sh` once after upgrading; until then, their
+  first sequencer-created commit can only be caught by the PR-level gate
+  (CI + Codex via wizzo-approve). Rebase continuations remain a git-design
+  gap covered by the same PR-level gate.
 
 Audit trail: `~/.openclaw/audit/factory-precommit.jsonl` (every pass, refusal,
 dismissal, and skip, with finding details).

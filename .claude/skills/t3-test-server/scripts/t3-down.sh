@@ -47,8 +47,9 @@ safe_ephemeral_home() {
 }
 
 down_one() {
-  local reg="$1" name pid home entry port p
+  local reg="$1" name original_name pid home entry port p reap
   name="$(basename "$reg")"
+  original_name="$name"
   if [[ -L "$reg" ]]; then
     # A symlinked entry is never something t3-up created: remove only the
     # link itself (touching "$reg/..." would mutate the symlink's TARGET).
@@ -57,21 +58,72 @@ down_one() {
     return 0
   fi
   if [[ ! -f "$reg/instance.env" ]]; then
-    # Unknown entry: never rm -rf what we didn't create. Drop our own 'home'
-    # symlink if present (only ever a link), then the dir only if empty.
-    # A young empty dir is likely another t3-up's in-flight claim (made
-    # before it writes instance.env) — leave it alone.
+    # A boot.env without instance.env = t3-up died uncleanably mid-boot
+    # (SIGKILL/OOM) or is booting right now. Teardown is explicit intent:
+    # reap the recorded server (identity-checked, incl. surviving group
+    # members) + home. Checked BEFORE the age guard so a fresh aborted boot
+    # is cleanable immediately.
+    if [[ -f "$reg/boot.env" ]]; then
+      # Claim the exact registry entry before reading/deleting it. Without
+      # this, a concurrent abort cleanup + retry can replace $reg between our
+      # read and rm -rf, and we would delete the replacement registration.
+      if [[ "$name" != .reap-* ]]; then
+        reap="$(dirname "$reg")/.reap-$name-down-$$"
+        if ! mv "$reg" "$reap" 2>/dev/null; then
+          echo "t3-down: '$original_name' changed while claiming it; retry teardown if needed" >&2
+          return 0
+        fi
+        reg="$reap"
+      fi
+      pid="$(read_instance_var "$reg/boot.env" T3_PID)"
+      home="$(read_instance_var "$reg/boot.env" T3_HOME)"
+      entry="$(read_instance_var "$reg/boot.env" T3_ENTRY)"
+      port="$(read_instance_var "$reg/boot.env" T3_PORT)"
+      # An unparsable/partial record proves nothing — reaping state on it
+      # could orphan a server we failed to identify. Leave it for inspection.
+      if [[ ! "$pid" =~ ^[0-9]+$ || -z "$home" ]]; then
+        echo "t3-down: '$name' has an unparsable boot.env; SKIPPING (inspect $reg yourself)" >&2
+        return 0
+      fi
+      if pid_is_instance "$pid" "$home" "$entry" "$port"; then
+        kill -9 -- "-$pid" 2>/dev/null || kill -9 "$pid" 2>/dev/null || true
+      else
+        for p in $(pgrep -g "$pid" 2>/dev/null); do
+          if tr '\0' '\n' < "/proc/$p/environ" 2>/dev/null | grep -qxF "T3CODE_HOME=$home"; then
+            kill -9 "$p" 2>/dev/null || true
+          fi
+        done
+      fi
+      safe_ephemeral_home "$home" && rm -rf "$home"
+      rm -rf "$reg"
+      echo "t3-down: '$original_name' had an aborted/in-progress boot; reaped its server and home" >&2
+      return 0
+    fi
+    # Unknown entry: never rm -rf what we didn't create. A young empty dir is
+    # likely another t3-up's just-made claim (pre-boot.env window) — leave it.
     if [[ -n "$(find "$reg" -maxdepth 0 -mmin -10 2>/dev/null)" ]]; then
       echo "t3-down: '$name' looks like an in-flight claim (<10 min old, no instance.env yet); SKIPPING" >&2
       return 0
     fi
     [[ -L "$reg/home" ]] && rm -f "$reg/home"
+    rm -f "$reg/.owner" 2>/dev/null
     if rmdir "$reg" 2>/dev/null; then
       echo "t3-down: '$name' had no instance.env; removed empty registry entry" >&2
     else
       echo "t3-down: '$name' has no instance.env and is not empty; SKIPPING (inspect $reg yourself)" >&2
     fi
     return 0
+  fi
+  # Claim the exact registered entry before reading/deleting it. This mirrors
+  # t3-up's stale-entry reap and prevents a concurrent restart from creating a
+  # fresh $REG that this teardown later removes.
+  if [[ "$name" != .reap-* ]]; then
+    reap="$(dirname "$reg")/.reap-$name-down-$$"
+    if ! mv "$reg" "$reap" 2>/dev/null; then
+      echo "t3-down: '$original_name' changed while claiming it; retry teardown if needed" >&2
+      return 0
+    fi
+    reg="$reap"
   fi
   pid="$(read_instance_var "$reg/instance.env" T3_PID)"
   home="$(read_instance_var "$reg/instance.env" T3_HOME)"
@@ -107,7 +159,7 @@ down_one() {
     echo "t3-down: '$name' home '$home' is not a canonical /tmp/t3-ephemeral-* dir; NOT deleting it" >&2
   fi
   rm -rf "$reg"
-  echo "t3-down: '$name' torn down (pid=${pid:-?} home=${home:-?})" >&2
+  echo "t3-down: '$original_name' torn down (pid=${pid:-?} home=${home:-?})" >&2
 }
 
 if [[ "${1:-}" == "--all" ]]; then

@@ -14,9 +14,12 @@ command -v jq >/dev/null || { echo "install-hooks: jq is required" >&2; exit 1; 
   || echo "install-hooks: WARNING — autoreview helper not found at ~/.claude/skills/autoreview/scripts/autoreview; the gate will refuse commits (review-infra) until it is installed" >&2
 chmod +x "$ROOT/.githooks/"* "$ROOT/scripts/factory/"*.sh
 
-HOOKS_DIR="${FACTORY_HOOKS_DIR:-$HOME/.openclaw/factory-hooks/$(basename "$ROOT")}"
+# Keyed by basename + path hash so two checkouts with the same basename can
+# never overwrite each other's installed shims.
+ROOT_KEY="$(basename "$ROOT")-$(printf %s "$ROOT" | sha256sum | cut -c1-8)"
+HOOKS_DIR="${FACTORY_HOOKS_DIR:-$HOME/.openclaw/factory-hooks/$ROOT_KEY}"
 mkdir -p "$HOOKS_DIR"
-cp "$ROOT/.githooks/pre-commit" "$ROOT/.githooks/pre-merge-commit" "$HOOKS_DIR/"
+cp "$ROOT/.githooks/pre-commit" "$ROOT/.githooks/pre-merge-commit" "$ROOT/.githooks/prepare-commit-msg" "$HOOKS_DIR/"
 chmod +x "$HOOKS_DIR/"*
 git -C "$ROOT" config core.hooksPath "$HOOKS_DIR"
 echo "install-hooks: core.hooksPath=$HOOKS_DIR (out-of-tree) — the factory gate is active."
