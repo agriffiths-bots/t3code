@@ -69,14 +69,26 @@ REVIEW_JSON="$STATE_DIR/last-review.json"
 REVIEW_FOR="$STATE_DIR/review-for"
 DISMISSALS="$STATE_DIR/dismissals.json"
 
+# Gate objects must be REGULAR files wherever we materialize-and-execute (or
+# source) them: `git show` of a symlink blob prints its target text, which
+# would then run as shell.
+head_is_regular() { # head_is_regular <path>
+  local m
+  m="$(git ls-tree HEAD -- "$1" 2>/dev/null | awk '{print $1}')"
+  [ "$m" = "100644" ] || [ "$m" = "100755" ]
+}
+
 # ---- self-protection: a commit must not be judged by gate code/config it
 # modifies itself. When gate files are staged-changed, re-exec the HEAD
 # version of this script (the last landed, already-reviewed gate). ----
 if [ -z "${FACTORY_GATE_FROM_HEAD:-}" ] && [ "$MODE" != "--status" ] \
    && git cat-file -e HEAD:scripts/factory/precommit-gate.sh 2>/dev/null \
    && ! git diff --cached --quiet -- scripts/factory .githooks 2>/dev/null; then
+  head_is_regular scripts/factory/precommit-gate.sh \
+    || { echo "factory-gate: HEAD gate is not a regular file; refusing" >&2; exit 2; }
   echo "factory-gate: this commit modifies gate files — evaluating with the HEAD gate" >&2
-  git show HEAD:scripts/factory/precommit-gate.sh > "$STATE_DIR/gate-head.sh"
+  git show HEAD:scripts/factory/precommit-gate.sh > "$STATE_DIR/gate-head.sh" \
+    || { echo "factory-gate: cannot materialize the HEAD gate; refusing" >&2; exit 2; }
   FACTORY_GATE_FROM_HEAD=1 exec bash "$STATE_DIR/gate-head.sh" "$MODE"
 fi
 
@@ -91,7 +103,10 @@ FACTORY_UPSTREAM_REF="upstream/main"
 FACTORY_AUDIT_LOG="$HOME/.openclaw/audit/factory-precommit.jsonl"
 CONF="$REPO_ROOT/scripts/factory/factory.conf"
 if git cat-file -e HEAD:scripts/factory/factory.conf 2>/dev/null; then
-  git show HEAD:scripts/factory/factory.conf > "$STATE_DIR/factory.conf.head"
+  head_is_regular scripts/factory/factory.conf \
+    || { echo "factory-gate: HEAD factory.conf is not a regular file; refusing" >&2; exit 2; }
+  git show HEAD:scripts/factory/factory.conf > "$STATE_DIR/factory.conf.head" \
+    || { echo "factory-gate: cannot materialize HEAD factory.conf; refusing" >&2; exit 2; }
   # shellcheck source=factory.conf
   . "$STATE_DIR/factory.conf.head"
 elif [ -f "$CONF" ]; then
@@ -166,6 +181,27 @@ $(printf '%s\n' "$untracked" | sed 's/^/    /')
   scope-untracked "$(jq -cn --arg f "$untracked" '{untracked:($f|split("\n"))}')"
 fi
 [ -n "$untracked" ] && audit allow-untracked "$(jq -cn --arg f "$untracked" '{untracked:($f|split("\n"))}')"
+
+# A commit may MODIFY gate files (it is then judged by the HEAD gate), but it
+# may never REMOVE them: a tree without the gate would land judged by the old
+# gate and leave the factory hookless. Applies to every load-bearing file.
+for gf in scripts/factory/precommit-gate.sh scripts/factory/factory.conf \
+          scripts/factory/install-hooks.sh .githooks/pre-commit .githooks/pre-merge-commit; do
+  git cat-file -e "HEAD:$gf" 2>/dev/null || continue
+  if ! git rev-parse -q --verify ":$gf" >/dev/null 2>&1; then
+    refuse "this commit removes the gate file '$gf'.
+  The factory gate cannot be removed by a gated commit; restore the file
+  (git checkout HEAD -- $gf) or change the gate deliberately in a reviewed,
+  non-removing commit." gate-file-removed "$(jq -cn --arg f "$gf" '{removed:$f}')"
+  fi
+  smode="$(git ls-files --stage -- "$gf" 2>/dev/null | awk '{print $1}')"
+  case "$smode" in
+    100644|100755) ;;
+    *) refuse "gate file '$gf' is staged as a non-regular object (mode ${smode:-none}).
+  Gate files must stay regular files (a symlink here would later be executed
+  as its target text)." gate-file-mode "$(jq -cn --arg f "$gf" --arg m "${smode:-none}" '{file:$f,mode:$m}')";;
+  esac
+done
 
 HEAD_SHA="$(head_sha)"
 TREE_SHA="$(git write-tree)" || refuse "git write-tree failed (unmerged index?)" scope-write-tree '{}'

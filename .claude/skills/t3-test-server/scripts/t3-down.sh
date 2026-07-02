@@ -3,6 +3,8 @@
 #
 #   t3-down.sh [NAME]     # default: "default"
 #   t3-down.sh --all      # every registered instance (incl. stale ones)
+#
+# LINUX-ONLY tooling (the factory VPS) — see t3-up.sh.
 set -uo pipefail
 
 # Same private registry as t3-up.sh: per-user, ownership-checked, and PARSED
@@ -69,6 +71,9 @@ down_one() {
     kill -- "-$pid" 2>/dev/null || kill "$pid" 2>/dev/null || true
     for _ in $(seq 1 50); do kill -0 "$pid" 2>/dev/null || break; sleep 0.1; done
     kill -0 "$pid" 2>/dev/null && { kill -9 -- "-$pid" 2>/dev/null || kill -9 "$pid" 2>/dev/null || true; }
+    # The leader can exit while group children (provider CLIs, etc.) linger —
+    # SIGKILL the group if ANY member is still alive before removing state.
+    kill -0 -- "-$pid" 2>/dev/null && { kill -9 -- "-$pid" 2>/dev/null || true; }
   fi
   if safe_ephemeral_home "$home"; then
     rm -rf "$home"

@@ -66,3 +66,10 @@ dismissal, and skip, with finding details).
 ```bash
 scripts/factory/install-hooks.sh
 ```
+
+This copies the hook shims OUT of the worktree (to
+`~/.openclaw/factory-hooks/<repo>`) and points `core.hooksPath` there; the
+shims themselves run the HEAD version of the gate. So neither the hook nor
+the gate/config judging a commit can be altered by that same commit.
+
+Linux-only tooling (flock, /proc, setsid) — the factory runs on the Linux VPS.

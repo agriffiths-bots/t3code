@@ -6,6 +6,9 @@
 # Never touches the live server: fresh temp T3CODE_HOME, loopback-only,
 # ports 13910-13940, exposure/trace env cleared.
 #
+# LINUX-ONLY tooling (the factory VPS): relies on setsid, /proc and GNU
+# readlink -f. Do not expect it to run on stock macOS/BSD.
+#
 # Usage:
 #   t3-up.sh [--name NAME] [--entry PATH] [--boot-timeout SECS]
 #
@@ -95,8 +98,16 @@ if [[ -e "$REG/instance.env" ]]; then
     exit 1
   fi
   echo "t3-up: cleaning stale instance '$NAME'" >&2
-  safe_ephemeral_home "$old_home" && rm -rf "$old_home"
-  rm -rf "$REG"
+  # Atomic reap-claim: rename the stale entry first (only one racer's mv can
+  # succeed), so a slower racer can never rm -rf a winner's fresh registration.
+  reap="$REG_ROOT/.reap-$NAME-$$"
+  if mv "$REG" "$reap" 2>/dev/null; then
+    safe_ephemeral_home "$old_home" && rm -rf "$old_home"
+    rm -rf "$reap"
+  else
+    echo "t3-up: another t3-up is already reaping stale '$NAME'; retry in a moment" >&2
+    exit 1
+  fi
 elif [[ -e "$REG" ]]; then
   # Either junk we didn't create or another t3-up mid-boot: never adopt it.
   echo "t3-up: $REG exists but has no instance.env (another t3-up in flight, or junk); remove it yourself or pick another --name" >&2
