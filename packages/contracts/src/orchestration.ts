@@ -264,6 +264,7 @@ export const OrchestrationSessionStatus = Schema.Literals([
   "idle",
   "starting",
   "running",
+  "waiting",
   "ready",
   "interrupted",
   "stopped",
@@ -1269,6 +1270,7 @@ export const ThreadTurnDiff = TurnCountRange.mapFields(
 export const ProviderSessionRuntimeStatus = Schema.Literals([
   "starting",
   "running",
+  "waiting",
   "stopped",
   "error",
 ]);

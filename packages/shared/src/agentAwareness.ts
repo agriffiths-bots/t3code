@@ -97,7 +97,11 @@ function resolveThreadAwarenessPhase(
   if (thread.session?.status === "starting") {
     return "starting";
   }
-  if (thread.session?.status === "running" || thread.latestTurn?.state === "running") {
+  if (
+    thread.session?.status === "running" ||
+    thread.session?.status === "waiting" ||
+    thread.latestTurn?.state === "running"
+  ) {
     return "running";
   }
   if (thread.latestTurn?.state === "completed") {

@@ -29,6 +29,7 @@ export type ThreadTraversalDirection = "previous" | "next";
 export interface ThreadStatusPill {
   label:
     | "Working"
+    | "Waiting"
     | "Connecting"
     | "Completed"
     | "Pending Approval"
@@ -43,6 +44,7 @@ const THREAD_STATUS_PRIORITY: Record<ThreadStatusPill["label"], number> = {
   "Pending Approval": 5,
   "Awaiting Input": 4,
   Working: 3,
+  Waiting: 3,
   Connecting: 3,
   "Plan Ready": 2,
   Completed: 1,
@@ -380,12 +382,12 @@ export function resolveThreadStatusPill(input: {
     };
   }
 
-  if (thread.session?.status === "running") {
+  if (thread.session?.status === "running" || thread.session?.status === "waiting") {
     return {
-      label: "Working",
+      label: thread.session.status === "waiting" ? "Waiting" : "Working",
       colorClass: "text-sky-600 dark:text-sky-300/80",
       dotClass: "bg-sky-500 dark:bg-sky-300/80",
-      pulse: true,
+      pulse: thread.session.status === "running",
     };
   }
 

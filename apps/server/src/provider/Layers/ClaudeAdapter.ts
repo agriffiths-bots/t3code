@@ -199,6 +199,7 @@ interface ClaudeSessionContext {
   lastKnownTotalProcessedTokens: number | undefined;
   lastAssistantUuid: string | undefined;
   lastThreadStartedId: string | undefined;
+  waitingForWake: boolean;
   stopped: boolean;
 }
 
@@ -714,14 +715,52 @@ function readStringArray(value: unknown): Array<string> {
     : [];
 }
 
-function readClaudeToolUseResult(message: SDKMessage): Record<string, unknown> | undefined {
+function parseJsonRecord(value: string): Record<string, unknown> | undefined {
+  try {
+    const parsed = JSON.parse(value);
+    return parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)
+      ? (parsed as Record<string, unknown>)
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function readClaudeToolUseResult(
+  message: SDKMessage,
+  toolResult?: { readonly block: Record<string, unknown>; readonly text: string },
+): Record<string, unknown> | undefined {
   if (message.type !== "user") {
     return undefined;
   }
   const result = (message as { readonly tool_use_result?: unknown }).tool_use_result;
-  return result !== null && typeof result === "object" && !Array.isArray(result)
-    ? (result as Record<string, unknown>)
-    : undefined;
+  if (result !== null && typeof result === "object" && !Array.isArray(result)) {
+    return result as Record<string, unknown>;
+  }
+
+  const blockContent = toolResult?.block.content;
+  if (blockContent !== null && typeof blockContent === "object" && !Array.isArray(blockContent)) {
+    const direct = blockContent as Record<string, unknown>;
+    if (direct.type !== "text") {
+      return direct;
+    }
+  }
+
+  const text = toolResult?.text.trim();
+  return text && text.length > 0 ? parseJsonRecord(text) : undefined;
+}
+
+function isPromotedSubagentWaitResult(
+  tool: ToolInFlight,
+  result: Record<string, unknown> | undefined,
+): boolean {
+  const normalizedToolName = tool.toolName.toLowerCase();
+  return (
+    (normalizedToolName === "t3_wait_subagent" ||
+      normalizedToolName.endsWith("__t3_wait_subagent") ||
+      normalizedToolName.includes("wait_subagent")) &&
+    result?.promoted === true
+  );
 }
 
 function readClaudeTaskFromResult(
@@ -2355,7 +2394,7 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
 
       const [index, tool] = toolEntry;
       const itemStatus = toolResult.isError ? "failed" : "completed";
-      const toolUseResult = readClaudeToolUseResult(message);
+      const toolUseResult = readClaudeToolUseResult(message, toolResult);
       const toolData = {
         toolName: tool.toolName,
         input: tool.input,
@@ -2449,6 +2488,10 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
           rawMethod: "claude/user",
           rawPayload: message,
         });
+      }
+
+      if (!toolResult.isError && isPromotedSubagentWaitResult(tool, toolUseResult)) {
+        context.waitingForWake = true;
       }
 
       context.inFlightTools.delete(index);
@@ -2596,6 +2639,11 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
         });
         return;
       case "status":
+        context.session = {
+          ...context.session,
+          status: message.status === "compacting" ? "waiting" : "running",
+          updatedAt: stamp.createdAt,
+        };
         yield* offerRuntimeEvent({
           ...base,
           type: "session.state.changed",
@@ -2913,11 +2961,82 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
       ),
     );
 
+  const parkSessionForWake = Effect.fn("parkSessionForWake")(function* (
+    context: ClaudeSessionContext,
+  ) {
+    if (context.stopped) return;
+
+    if (context.turnState) {
+      yield* completeTurn(context, "completed");
+    } else {
+      yield* updateResumeCursor(context);
+    }
+
+    yield* Queue.shutdown(context.promptQueue);
+
+    const streamFiber = context.streamFiber;
+    context.streamFiber = undefined;
+    if (streamFiber && streamFiber.pollUnsafe() === undefined) {
+      yield* Fiber.interrupt(streamFiber);
+    }
+
+    yield* Effect.try({
+      try: () => context.query.close(),
+      catch: (cause) =>
+        new ProviderAdapterProcessError({
+          provider: PROVIDER,
+          threadId: context.session.threadId,
+          detail: "Failed to close Claude runtime query.",
+          cause,
+        }),
+    }).pipe(
+      Effect.catch((error) =>
+        emitRuntimeError(context, "Failed to close Claude runtime query.", {
+          errorTag: error._tag,
+          provider: error.provider,
+          threadId: error.threadId,
+          detail: error.detail,
+        }),
+      ),
+    );
+
+    const updatedAt = yield* nowIso;
+    context.session = {
+      ...context.session,
+      status: "waiting",
+      activeTurnId: undefined,
+      updatedAt,
+    };
+
+    const stamp = yield* makeEventStamp();
+    yield* offerRuntimeEvent({
+      type: "session.state.changed",
+      eventId: stamp.eventId,
+      provider: PROVIDER,
+      createdAt: stamp.createdAt,
+      threadId: context.session.threadId,
+      payload: {
+        state: "waiting",
+        reason: "awaiting-subagent-wake",
+        detail: {
+          waitingForWake: context.waitingForWake,
+          resumeCursor: context.session.resumeCursor,
+        },
+      },
+      providerRefs: nativeProviderRefs(context),
+    });
+  });
+
   const handleStreamExit = Effect.fn("handleStreamExit")(function* (
     context: ClaudeSessionContext,
     exit: Exit.Exit<void, ProviderAdapterProcessError>,
   ) {
     if (context.stopped) {
+      return;
+    }
+
+    if (Exit.isSuccess(exit) && context.waitingForWake) {
+      yield* parkSessionForWake(context);
       return;
     }
 
@@ -3559,6 +3678,7 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
         lastKnownTotalProcessedTokens: undefined,
         lastAssistantUuid: resumeState?.resumeSessionAt,
         lastThreadStartedId: undefined,
+        waitingForWake: false,
         stopped: false,
       };
       yield* Ref.set(contextRef, context);

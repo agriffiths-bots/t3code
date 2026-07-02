@@ -304,6 +304,55 @@ describe("ScheduledTasksReactor", () => {
     expect(rows[0]!.skippedCount).toBe(1);
   });
 
+  it("dispatches when a waiting session is parked without an active turn", async () => {
+    const threadId = ThreadId.make("thread-waiting-parked");
+    const taskId = ScheduledTaskId.make("task-waiting-parked");
+    const harness = await createHarness({
+      shells: [
+        makeShell({
+          threadId,
+          session: makeSession(threadId, "waiting", null),
+        }),
+      ],
+    });
+    await harness.activeRuntime.runPromise(
+      harness.repository.insert(makeTask({ taskId, threadId, busyPolicy: "skip" })),
+    );
+
+    await harness.runOneTick();
+
+    const turnStarts = harness.dispatched.filter((c) => c.type === "thread.turn.start");
+    expect(turnStarts).toHaveLength(1);
+    expect(turnStarts[0]!.threadId).toBe(threadId);
+  });
+
+  it("skips a waiting session with an active turn", async () => {
+    const threadId = ThreadId.make("thread-waiting-active");
+    const taskId = ScheduledTaskId.make("task-waiting-active");
+    const harness = await createHarness({
+      shells: [
+        makeShell({
+          threadId,
+          session: makeSession(threadId, "waiting", TurnId.make("turn-1")),
+        }),
+      ],
+    });
+    await harness.activeRuntime.runPromise(
+      harness.repository.insert(makeTask({ taskId, threadId, busyPolicy: "skip" })),
+    );
+
+    await harness.runOneTick();
+
+    const turnStarts = harness.dispatched.filter((c) => c.type === "thread.turn.start");
+    expect(turnStarts).toHaveLength(0);
+
+    const rows = await harness.activeRuntime.runPromise(
+      harness.repository.listByThread({ threadId }),
+    );
+    expect(rows[0]!.lastStatus).toBe("skipped");
+    expect(rows[0]!.skippedCount).toBe(1);
+  });
+
   it("disables a task whose thread was deleted", async () => {
     const threadId = ThreadId.make("thread-deleted");
     const taskId = ScheduledTaskId.make("task-deleted");

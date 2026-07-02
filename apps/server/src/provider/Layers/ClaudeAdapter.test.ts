@@ -1463,6 +1463,139 @@ describe("ClaudeAdapterLive", () => {
     );
   });
 
+  it.effect("parks promoted subagent waits when the Claude stream ends", () => {
+    const harness = makeHarness();
+    return Effect.gen(function* () {
+      const adapter = yield* ClaudeAdapter;
+      const runtimeEvents: Array<ProviderRuntimeEvent> = [];
+
+      const runtimeEventsFiber = yield* Stream.runForEach(adapter.streamEvents, (event) =>
+        Effect.sync(() => {
+          runtimeEvents.push(event);
+        }),
+      ).pipe(Effect.forkChild);
+
+      const session = yield* adapter.startSession({
+        threadId: THREAD_ID,
+        provider: ProviderDriverKind.make("claudeAgent"),
+        runtimeMode: "full-access",
+      });
+
+      const turn = yield* adapter.sendTurn({
+        threadId: session.threadId,
+        input: "wait for the child",
+        attachments: [],
+      });
+
+      harness.query.emit({
+        type: "stream_event",
+        session_id: "sdk-session-waiting-subagent",
+        uuid: "stream-wait-subagent-start",
+        parent_tool_use_id: null,
+        event: {
+          type: "content_block_start",
+          index: 1,
+          content_block: {
+            type: "mcp_tool_use",
+            id: "tool-wait-subagent-1",
+            name: "t3_wait_subagent",
+            input: {
+              childThreadIds: ["child-thread-1"],
+            },
+          },
+        },
+      } as unknown as SDKMessage);
+
+      harness.query.emit({
+        type: "stream_event",
+        session_id: "sdk-session-waiting-subagent",
+        uuid: "stream-wait-subagent-stop",
+        parent_tool_use_id: null,
+        event: {
+          type: "content_block_stop",
+          index: 1,
+        },
+      } as unknown as SDKMessage);
+
+      harness.query.emit({
+        type: "user",
+        session_id: "sdk-session-waiting-subagent",
+        uuid: "user-wait-subagent-result",
+        parent_tool_use_id: null,
+        message: {
+          role: "user",
+          content: [
+            {
+              type: "tool_result",
+              tool_use_id: "tool-wait-subagent-1",
+              content: {
+                results: [
+                  {
+                    childThreadId: "child-thread-1",
+                    status: "running",
+                    turnCount: 1,
+                    finalAssistantText: null,
+                    error: null,
+                    note: "still running - you will be NOTIFIED when it completes",
+                  },
+                ],
+                settledCount: 0,
+                timedOutCount: 0,
+                pending: false,
+                resumeToken: "0:token",
+                promoted: true,
+              },
+            },
+          ],
+        },
+      } as unknown as SDKMessage);
+
+      harness.query.finish();
+
+      yield* Effect.yieldNow;
+      yield* Effect.yieldNow;
+      yield* Effect.yieldNow;
+      runtimeEventsFiber.interruptUnsafe();
+
+      assert.equal(
+        runtimeEvents.some((event) => event.type === "session.exited"),
+        false,
+      );
+
+      const turnCompleted = runtimeEvents.find((event) => event.type === "turn.completed");
+      assert.equal(turnCompleted?.type, "turn.completed");
+      if (turnCompleted?.type === "turn.completed") {
+        assert.equal(String(turnCompleted.turnId), String(turn.turnId));
+        assert.equal(turnCompleted.payload.state, "completed");
+      }
+
+      let waitingEvent: ProviderRuntimeEvent | undefined;
+      for (let index = runtimeEvents.length - 1; index >= 0; index -= 1) {
+        const event = runtimeEvents[index];
+        if (event?.type === "session.state.changed") {
+          waitingEvent = event;
+          break;
+        }
+      }
+      assert.equal(waitingEvent?.type, "session.state.changed");
+      if (waitingEvent?.type === "session.state.changed") {
+        assert.equal(waitingEvent.payload.state, "waiting");
+        assert.equal(waitingEvent.payload.reason, "awaiting-subagent-wake");
+      }
+
+      assert.equal(yield* adapter.hasSession(THREAD_ID), true);
+      const sessions = yield* adapter.listSessions();
+      assert.equal(sessions.length, 1);
+      assert.equal(sessions[0]?.status, "waiting");
+      assert.equal(sessions[0]?.activeTurnId, undefined);
+      assert.notEqual(sessions[0]?.resumeCursor, undefined);
+      assert.equal(harness.query.closeCalls, 1);
+    }).pipe(
+      Effect.provideService(Random.Random, makeDeterministicRandomService()),
+      Effect.provide(harness.layer),
+    );
+  });
+
   it.effect("keeps Claude stream failure events structural", () => {
     const harness = makeHarness();
     return Effect.gen(function* () {

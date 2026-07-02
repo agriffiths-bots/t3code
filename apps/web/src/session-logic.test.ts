@@ -1612,6 +1612,24 @@ describe("isLatestTurnSettled", () => {
     ).toBe(true);
   });
 
+  it("returns true for parked waiting sessions without an active turn", () => {
+    expect(
+      isLatestTurnSettled(latestTurn, {
+        status: "waiting",
+        activeTurnId: null,
+      }),
+    ).toBe(true);
+  });
+
+  it("returns false for waiting sessions with an active turn", () => {
+    expect(
+      isLatestTurnSettled(latestTurn, {
+        status: "waiting",
+        activeTurnId: TurnId.make("turn-1"),
+      }),
+    ).toBe(false);
+  });
+
   it("returns false when turn timestamps are incomplete", () => {
     expect(
       isLatestTurnSettled(
@@ -1681,6 +1699,19 @@ describe("deriveActiveWorkStartedAt", () => {
           completedAt: "2026-02-27T21:10:06.000Z",
         },
         null,
+        "2026-02-27T21:11:00.000Z",
+      ),
+    ).toBe("2026-02-27T21:11:00.000Z");
+  });
+
+  it("uses sendStartedAt for parked waiting sessions without an active turn", () => {
+    expect(
+      deriveActiveWorkStartedAt(
+        latestTurn,
+        {
+          status: "waiting",
+          activeTurnId: null,
+        },
         "2026-02-27T21:11:00.000Z",
       ),
     ).toBe("2026-02-27T21:11:00.000Z");

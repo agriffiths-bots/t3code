@@ -57,6 +57,7 @@ function settledTurnStateForSessionStatus(
       return "interrupted";
     case "starting":
     case "running":
+    case "waiting":
       return null;
   }
 }
@@ -469,7 +470,8 @@ export function projectEvent(
           threads: updateThread(nextBase.threads, payload.threadId, {
             session,
             latestTurn:
-              session.status === "running" && session.activeTurnId !== null
+              (session.status === "running" || session.status === "waiting") &&
+              session.activeTurnId !== null
                 ? {
                     turnId: session.activeTurnId,
                     state: "running",
@@ -584,7 +586,8 @@ export function projectEvent(
         // Mid-turn diff updates produce placeholder checkpoints; record the
         // checkpoint, but don't settle a turn its session is still running.
         const turnStillRunning =
-          thread.session?.status === "running" && thread.session.activeTurnId === payload.turnId;
+          (thread.session?.status === "running" || thread.session?.status === "waiting") &&
+          thread.session.activeTurnId === payload.turnId;
 
         return {
           ...nextBase,

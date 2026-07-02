@@ -75,6 +75,7 @@ export function ThreadRouteScreen() {
   const gitActions = useSelectedThreadGitActions();
   const requests = useSelectedThreadRequests();
   const interruptThreadTurn = useAtomCommand(threadEnvironment.interruptTurn, "thread interrupt");
+  const stopThreadSession = useAtomCommand(threadEnvironment.stopSession, "thread session stop");
   const router = useRouter();
   const params = useLocalSearchParams<{
     environmentId?: string | string[];
@@ -156,9 +157,18 @@ export function ThreadRouteScreen() {
     if (
       !selectedThread ||
       (selectedThread.session?.status !== "running" &&
+        selectedThread.session?.status !== "waiting" &&
         selectedThread.session?.status !== "starting")
     ) {
       return;
+    }
+    if (selectedThread.session.status === "waiting" && !selectedThread.session.activeTurnId) {
+      return stopThreadSession({
+        environmentId: selectedThread.environmentId,
+        input: {
+          threadId: selectedThread.id,
+        },
+      });
     }
     return interruptThreadTurn({
       environmentId: selectedThread.environmentId,
@@ -169,7 +179,7 @@ export function ThreadRouteScreen() {
           : {}),
       },
     });
-  }, [interruptThreadTurn, selectedThread]);
+  }, [interruptThreadTurn, selectedThread, stopThreadSession]);
 
   const handleOpenTerminal = useCallback(
     (nextTerminalId?: string | null) => {

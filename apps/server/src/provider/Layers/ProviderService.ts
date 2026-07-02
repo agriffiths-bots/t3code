@@ -104,10 +104,14 @@ const decodeInputOrValidationError = <S extends Schema.Top>(input: {
   );
 };
 
-function toRuntimeStatus(session: ProviderSession): "starting" | "running" | "stopped" | "error" {
+function toRuntimeStatus(
+  session: ProviderSession,
+): "starting" | "running" | "waiting" | "stopped" | "error" {
   switch (session.status) {
     case "connecting":
       return "starting";
+    case "waiting":
+      return "waiting";
     case "error":
       return "error";
     case "closed":
@@ -160,6 +164,16 @@ function readPersistedCwd(
   if (typeof rawCwd !== "string") return undefined;
   const trimmed = rawCwd.trim();
   return trimmed.length > 0 ? trimmed : undefined;
+}
+
+function readRecord(value: unknown): Record<string, unknown> | undefined {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : undefined;
+}
+
+function readResumeCursorFromRuntimeDetail(detail: unknown): unknown | undefined {
+  return readRecord(detail)?.resumeCursor;
 }
 
 const dieOnMissingBindingInstanceId = (
@@ -281,6 +295,50 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
       });
     });
 
+  const persistWaitingRuntimeState = (
+    source: {
+      readonly instanceId: ProviderInstanceId;
+      readonly provider: ProviderDriverKind;
+    },
+    event: ProviderRuntimeEvent,
+  ) => {
+    if (event.type !== "session.state.changed" || event.payload.state !== "waiting") {
+      return Effect.void;
+    }
+
+    return Effect.gen(function* () {
+      const binding = Option.getOrUndefined(
+        yield* directory
+          .getBinding(event.threadId)
+          .pipe(
+            Effect.orElseSucceed(() =>
+              Option.none<ProviderSessionDirectory.ProviderRuntimeBinding>(),
+            ),
+          ),
+      );
+      const previousPayload = readRecord(binding?.runtimePayload) ?? {};
+      const resumeCursor = readResumeCursorFromRuntimeDetail(event.payload.detail);
+      yield* directory.upsert({
+        threadId: event.threadId,
+        provider: source.provider,
+        providerInstanceId: source.instanceId,
+        runtimeMode: binding?.runtimeMode ?? "full-access",
+        status: "waiting",
+        ...(resumeCursor !== undefined
+          ? { resumeCursor }
+          : binding?.resumeCursor !== undefined
+            ? { resumeCursor: binding.resumeCursor }
+            : {}),
+        runtimePayload: {
+          ...previousPayload,
+          activeTurnId: event.turnId ?? null,
+          lastRuntimeEvent: event.type,
+          lastRuntimeEventAt: event.createdAt,
+        },
+      });
+    });
+  };
+
   const processRuntimeEvent = (
     source: {
       readonly instanceId: ProviderInstanceId;
@@ -290,10 +348,22 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
   ): Effect.Effect<void> =>
     Effect.sync(() => correlateRuntimeEventWithInstance(source, event)).pipe(
       Effect.flatMap((canonicalEvent) =>
-        increment(providerRuntimeEventsTotal, {
-          provider: canonicalEvent.provider,
-          eventType: canonicalEvent.type,
-        }).pipe(Effect.andThen(publishRuntimeEvent(canonicalEvent))),
+        persistWaitingRuntimeState(source, canonicalEvent).pipe(
+          Effect.catchCause((cause) =>
+            Effect.logWarning("provider.session.waiting-persist-failed", {
+              threadId: canonicalEvent.threadId,
+              provider: canonicalEvent.provider,
+              cause,
+            }),
+          ),
+          Effect.andThen(
+            increment(providerRuntimeEventsTotal, {
+              provider: canonicalEvent.provider,
+              eventType: canonicalEvent.type,
+            }),
+          ),
+          Effect.andThen(publishRuntimeEvent(canonicalEvent)),
+        ),
       ),
     );
 

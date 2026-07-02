@@ -378,9 +378,9 @@ describe("ProviderRuntimeIngestion", () => {
 
     let thread = await waitForThread(
       harness.readModel,
-      (entry) => entry.session?.status === "running" && entry.session?.activeTurnId === null,
+      (entry) => entry.session?.status === "waiting" && entry.session?.activeTurnId === null,
     );
-    expect(thread.session?.status).toBe("running");
+    expect(thread.session?.status).toBe("waiting");
     expect(thread.session?.lastError).toBeNull();
 
     harness.emit({

@@ -219,7 +219,7 @@ export function applyThreadDetailEvent(
       // until the provider reports turn end.
       const turnStillRunning =
         event.payload.turnId !== null &&
-        thread.session?.status === "running" &&
+        (thread.session?.status === "running" || thread.session?.status === "waiting") &&
         thread.session.activeTurnId === event.payload.turnId;
       const settlesTurn = !event.payload.streaming && !turnStillRunning;
       const latestTurn: OrchestrationThread["latestTurn"] =
@@ -280,7 +280,9 @@ export function applyThreadDetailEvent(
       // still-running latest turn so its duration reflects the whole turn.
       const settledTurnState = settledTurnStateForSessionStatus(event.payload.session.status);
       const latestTurn: OrchestrationLatestTurn | null =
-        event.payload.session.status === "running" && event.payload.session.activeTurnId !== null
+        (event.payload.session.status === "running" ||
+          event.payload.session.status === "waiting") &&
+        event.payload.session.activeTurnId !== null
           ? {
               turnId: event.payload.session.activeTurnId,
               state: "running",
@@ -384,7 +386,7 @@ export function applyThreadDetailEvent(
       // Mid-turn diff updates produce placeholder checkpoints; record the
       // checkpoint, but don't settle a turn its session is still running.
       const diffTurnStillRunning =
-        thread.session?.status === "running" &&
+        (thread.session?.status === "running" || thread.session?.status === "waiting") &&
         thread.session.activeTurnId === event.payload.turnId;
       const latestTurn =
         !diffTurnStillRunning &&
@@ -502,6 +504,7 @@ function settledTurnStateForSessionStatus(
       return "interrupted";
     case "starting":
     case "running":
+    case "waiting":
       return null;
   }
 }

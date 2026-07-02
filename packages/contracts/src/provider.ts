@@ -27,6 +27,7 @@ const ProviderSessionStatus = Schema.Literals([
   "connecting",
   "ready",
   "running",
+  "waiting",
   "error",
   "closed",
 ]);
