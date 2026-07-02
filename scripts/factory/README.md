@@ -12,7 +12,10 @@ remediation steps.
 1. **Scope guard** — the index must equal the working tree, and no untracked
    non-ignored files may exist. This makes "what we check" identical to "what
    gets committed" for every staging style (`git add -A`, `commit -a`, partial
-   staging is rejected with instructions).
+   staging is rejected with instructions). Pathspec/`--only` commits that
+   would leave other staged files out of the commit are also refused: Git
+   presents the hook with a temporary commit index, so the excluded staged
+   files show up as unstaged differences and trip the same scope guard.
 2. **Static checks** — `vp run typecheck` + `vp check` (from
    `factory.conf`; they never modify files).
 3. **Autoreview** — Codex `gpt-5.5` (high) over exactly the staged diff
