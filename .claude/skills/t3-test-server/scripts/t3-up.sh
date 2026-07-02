@@ -207,6 +207,9 @@ done
 
 # ($REG was atomically claimed above)
 cat > "$REG/instance.env" <<EOF
+# Consumers shell out to the T3 CLI against this instance: an inherited dev
+# URL would flip the CLI to a different state dir than the server's.
+unset VITE_DEV_SERVER_URL 2>/dev/null || true
 export T3_NAME="$NAME"
 export T3_ORIGIN="$T3_ORIGIN"
 export T3_TOKEN="$T3_TOKEN"

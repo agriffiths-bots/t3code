@@ -77,9 +77,11 @@ Do NOT arm `gh pr merge --auto` — merging is done exclusively by
 `wizzo-approve --apply` after its gate passes.
 
 - Move the issue to "In Review" with the PR link.
-- Babysit to green with the `babysit-pr` skill (bounded foreground polls, not
-  background waits). Address every Codex finding: fix, or resolve the thread
-  with a code-verified rationale.
+- Babysit to green (the machine-level `babysit-pr` skill if available;
+  otherwise inline): poll `gh pr checks <pr#>` and the review threads with
+  bounded foreground `sleep` loops — background waits are unreliable here.
+  Address every Codex finding: fix, or reply + resolve the thread with a
+  code-verified rationale (branch protection requires resolved conversations).
 - Land via the gate: `wizzo-approve agriffiths-bots/t3code <pr#> --apply`
   (never `gh pr review`/`merge` by hand). `approved+merge-failed` is usually
   an auto-merge race — check `gh pr view <pr#> --json state`.

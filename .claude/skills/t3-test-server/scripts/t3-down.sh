@@ -47,7 +47,7 @@ safe_ephemeral_home() {
 }
 
 down_one() {
-  local reg="$1" name pid home entry port
+  local reg="$1" name pid home entry port p
   name="$(basename "$reg")"
   if [[ -L "$reg" ]]; then
     # A symlinked entry is never something t3-up created: remove only the
@@ -72,7 +72,17 @@ down_one() {
   entry="$(read_instance_var "$reg/instance.env" T3_ENTRY)"
   port="$(read_instance_var "$reg/instance.env" T3_PORT)"
   if ! pid_is_instance "$pid" "$home" "$entry" "$port"; then
-    echo "t3-down: '$name' process ${pid:-?} is gone (or the pid was reused); cleaning state only" >&2
+    # The leader is gone (or its pid was reused) — but group members
+    # (provider CLIs, etc.) may survive it. Reap only processes we can PROVE
+    # are ours (environ match); never blind-kill a possibly-reused pgid.
+    if [[ "$pid" =~ ^[0-9]+$ && -n "$home" ]]; then
+      for p in $(pgrep -g "$pid" 2>/dev/null); do
+        if tr '\0' '\n' < "/proc/$p/environ" 2>/dev/null | grep -qxF "T3CODE_HOME=$home"; then
+          kill -9 "$p" 2>/dev/null || true
+        fi
+      done
+    fi
+    echo "t3-down: '$name' leader ${pid:-?} is gone (or the pid was reused); reaped verified orphans, cleaning state" >&2
     pid=""
   fi
   if [[ -n "$pid" ]]; then

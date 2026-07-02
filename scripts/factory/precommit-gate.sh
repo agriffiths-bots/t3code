@@ -69,6 +69,14 @@ REVIEW_JSON="$STATE_DIR/last-review.json"
 REVIEW_FOR="$STATE_DIR/review-for"
 DISMISSALS="$STATE_DIR/dismissals.json"
 
+# FACTORY_GATE_FROM_HEAD may only be trusted when THIS process really is a
+# HEAD materialization (running from the state dir) — an inherited env var
+# must not let the worktree copy skip the HEAD re-exec for gate-file edits.
+case "${BASH_SOURCE[0]}" in
+  "$STATE_DIR"/*) ;;
+  *) FACTORY_GATE_FROM_HEAD="" ;;
+esac
+
 # Gate objects must be REGULAR files wherever we materialize-and-execute (or
 # source) them: `git show` of a symlink blob prints its target text, which
 # would then run as shell.
@@ -207,8 +215,18 @@ HEAD_SHA="$(head_sha)"
 TREE_SHA="$(git write-tree)" || refuse "git write-tree failed (unmerged index?)" scope-write-tree '{}'
 GATE_ID="$HEAD_SHA $TREE_SHA"
 
+# Dismissals are single-use and bound to the review that prompted them: any
+# leftover file on a pass path is stale and must not survive to cover a
+# future finding that happens to share file/line/title.
+discard_stale_dismissals() {
+  [ -f "$DISMISSALS" ] || return 0
+  mv "$DISMISSALS" "$STATE_DIR/dismissals-stale-$(date +%s).json"
+  echo "factory-gate: discarded stale dismissals (review passed without needing them)" >&2
+}
+
 # ---- cached pass ----
 if [ -f "$MARKER" ] && [ "$(cat "$MARKER")" = "$GATE_ID" ]; then
+  discard_stale_dismissals
   echo "factory-gate: PASS (cached for this exact staged tree)" >&2
   audit pass "$(jq -cn --arg g "$GATE_ID" '{gate_id:$g,cached:true}')"
   exit 0
@@ -249,6 +267,7 @@ else
   Check FACTORY_AUTOREVIEW_BIN — refusing to cache a PASS without a clean report." review-infra \
       "$(jq -cn '{review_rc:0,report:"invalid"}')"
     fi
+    discard_stale_dismissals
     echo "$GATE_ID" > "$MARKER"
     echo "factory-gate: PASS (static checks + clean review)" >&2
     audit pass "$(jq -cn --arg g "$GATE_ID" '{gate_id:$g,review:"clean"}')"

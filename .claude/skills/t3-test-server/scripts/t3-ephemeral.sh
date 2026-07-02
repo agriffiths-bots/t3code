@@ -165,6 +165,9 @@ if [[ "$ac" != "200" ]]; then
   exit 1
 fi
 
+# The wrapped command inherits the ephemeral T3CODE_HOME; also drop any
+# inherited dev-server URL so CLI calls it makes hit the same state dir.
+unset VITE_DEV_SERVER_URL
 set +e
 "$@"
 rc=$?

@@ -8,6 +8,10 @@
 set -euo pipefail
 ROOT="$(git rev-parse --show-toplevel)"
 command -v jq >/dev/null || { echo "install-hooks: jq is required" >&2; exit 1; }
+# The review helper is deliberately out-of-repo (private tooling); without it
+# the gate fails CLOSED on every commit, so surface the gap at install time.
+[ -x "$HOME/.claude/skills/autoreview/scripts/autoreview" ] \
+  || echo "install-hooks: WARNING — autoreview helper not found at ~/.claude/skills/autoreview/scripts/autoreview; the gate will refuse commits (review-infra) until it is installed" >&2
 chmod +x "$ROOT/.githooks/"* "$ROOT/scripts/factory/"*.sh
 
 HOOKS_DIR="${FACTORY_HOOKS_DIR:-$HOME/.openclaw/factory-hooks/$(basename "$ROOT")}"
