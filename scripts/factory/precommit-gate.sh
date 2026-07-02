@@ -109,22 +109,29 @@ FACTORY_REVIEW_ARGS=()
 FACTORY_AUTOREVIEW_BIN="$HOME/.claude/skills/autoreview/scripts/autoreview"
 FACTORY_UPSTREAM_REF="upstream/main"
 FACTORY_AUDIT_LOG="$HOME/.openclaw/audit/factory-precommit.jsonl"
+# Config problems are RECORDED here and enforced after the --status /
+# FACTORY_SKIP handling below: a broken landed config must refuse normal
+# commits (never degrade to review-only) while the audited skip hatch stays
+# usable to commit the repair itself.
 CONF="$REPO_ROOT/scripts/factory/factory.conf"
+CONF_ERR=""
 if git cat-file -e HEAD:scripts/factory/factory.conf 2>/dev/null; then
-  head_is_regular scripts/factory/factory.conf \
-    || { echo "factory-gate: HEAD factory.conf is not a regular file; refusing" >&2; exit 2; }
-  git show HEAD:scripts/factory/factory.conf > "$STATE_DIR/factory.conf.head" \
-    || { echo "factory-gate: cannot materialize HEAD factory.conf; refusing" >&2; exit 2; }
+  if ! head_is_regular scripts/factory/factory.conf; then
+    CONF_ERR="HEAD factory.conf is not a regular file"
+  elif ! git show HEAD:scripts/factory/factory.conf > "$STATE_DIR/factory.conf.head"; then
+    CONF_ERR="cannot materialize HEAD factory.conf"
   # shellcheck source=factory.conf
-  . "$STATE_DIR/factory.conf.head" \
-    || { echo "factory-gate: failed to source HEAD factory.conf; refusing" >&2; exit 2; }
+  elif ! . "$STATE_DIR/factory.conf.head"; then
+    CONF_ERR="failed to source HEAD factory.conf"
+  fi
 elif [ -f "$CONF" ]; then
   # shellcheck source=factory.conf
-  . "$CONF" || { echo "factory-gate: failed to source $CONF; refusing" >&2; exit 2; }
+  . "$CONF" || CONF_ERR="failed to source $CONF"
 fi
 # An empty check list means a broken/neutered config — never a silent pass.
-[ "${#FACTORY_STATIC_CHECKS[@]}" -gt 0 ] \
-  || { echo "factory-gate: no static checks configured (bad or missing factory.conf); refusing" >&2; exit 2; }
+if [ -z "$CONF_ERR" ] && [ "${#FACTORY_STATIC_CHECKS[@]}" -eq 0 ]; then
+  CONF_ERR="no static checks configured (bad or missing factory.conf)"
+fi
 
 command -v jq >/dev/null || { echo "factory-gate: jq is required" >&2; exit 2; }
 
@@ -177,6 +184,14 @@ if [ "${FACTORY_SKIP:-0}" = "1" ]; then
   audit skipped "$(jq -cn --arg r "$reason" '{skip_reason:$r}')"
   exit 0
 fi
+
+# Broken config refuses everything past this point (the skip hatch above
+# stays usable to land the config repair, audited).
+[ -z "$CONF_ERR" ] || refuse "gate config unusable: $CONF_ERR.
+  Fix scripts/factory/factory.conf; if the broken config is already in HEAD,
+  commit the repair with the audited escape hatch:
+    FACTORY_SKIP=1 FACTORY_SKIP_REASON=\"config repair: <what broke>\" git commit ..." \
+  config-broken "$(jq -cn --arg e "$CONF_ERR" '{conf_error:$e}')"
 # ---- scope guard: the checked tree must BE the committed tree ----
 staged="$(git diff --cached --name-only)"
 if [ -z "$staged" ]; then
