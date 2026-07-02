@@ -8,9 +8,9 @@ export function threadSortValue(thread: EnvironmentThreadShell): number {
 
 export function threadStatusTone(thread: EnvironmentThreadShell): StatusTone {
   const status = thread.session?.status;
-  if (status === "running") {
+  if (status === "running" || status === "waiting") {
     return {
-      label: "Running",
+      label: status === "waiting" ? "Waiting" : "Running",
       pillClassName: "bg-orange-500/12 dark:bg-orange-500/16",
       textClassName: "text-orange-700 dark:text-orange-300",
     };

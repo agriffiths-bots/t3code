@@ -59,6 +59,7 @@ import {
 } from "../../lib/providerOptions";
 import { useComposerPathSearch } from "../../state/use-composer-path-search";
 import { ComposerCommandPopover, type ComposerCommandItem } from "./ComposerCommandPopover";
+import { shouldShowThreadComposerStopAction } from "./threadComposerLogic";
 
 /**
  * Height of the collapsed composer (pill + vertical padding, excluding safe-area inset).
@@ -239,9 +240,7 @@ export const ThreadComposer = memo(function ThreadComposer(props: ThreadComposer
     setIsFocused(false);
     onExpandedChange?.(false);
   }, [onExpandedChange]);
-  const showStopAction =
-    props.selectedThread.session?.status === "running" ||
-    props.selectedThread.session?.status === "starting";
+  const showStopAction = shouldShowThreadComposerStopAction(props.selectedThread.session);
 
   const sendLabel =
     props.connectionState !== "connected" || props.activeThreadBusy || props.queueCount > 0

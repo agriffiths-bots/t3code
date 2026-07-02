@@ -466,6 +466,78 @@ describe("ProviderCommandReactor", () => {
     expect(thread?.session?.runtimeMode).toBe("approval-required");
   });
 
+  it("restarts a parked waiting Claude session before sending the next turn", async () => {
+    const harness = await createHarness({
+      threadModelSelection: {
+        instanceId: ProviderInstanceId.make("claudeAgent"),
+        model: "claude-opus-4-6",
+      },
+    });
+    const now = "2026-01-01T00:00:00.000Z";
+    const resumeCursor = { resume: "sdk-session-waiting", resumeSessionAt: "assistant-uuid-1" };
+    const providerInstanceId = ProviderInstanceId.make("claudeAgent");
+
+    harness.runtimeSessions.push({
+      provider: ProviderDriverKind.make("claudeAgent"),
+      providerInstanceId,
+      status: "waiting",
+      runtimeMode: "approval-required",
+      model: "claude-opus-4-6",
+      threadId: ThreadId.make("thread-1"),
+      resumeCursor,
+      createdAt: now,
+      updatedAt: now,
+    });
+
+    await runtime!.runPromise(
+      harness.engine.dispatch({
+        type: "thread.session.set",
+        commandId: CommandId.make("cmd-session-set-waiting-claude"),
+        threadId: ThreadId.make("thread-1"),
+        session: {
+          threadId: ThreadId.make("thread-1"),
+          status: "waiting",
+          providerName: "claudeAgent",
+          providerInstanceId,
+          runtimeMode: "approval-required",
+          activeTurnId: null,
+          lastError: null,
+          updatedAt: now,
+        },
+        createdAt: now,
+      }),
+    );
+
+    await runtime!.runPromise(
+      harness.engine.dispatch({
+        type: "thread.turn.start",
+        commandId: CommandId.make("cmd-turn-start-waiting-claude"),
+        threadId: ThreadId.make("thread-1"),
+        message: {
+          messageId: asMessageId("user-message-waiting-claude"),
+          role: "user",
+          text: "child finished, continue",
+          attachments: [],
+        },
+        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+        runtimeMode: "approval-required",
+        createdAt: now,
+      }),
+    );
+
+    await waitFor(() => harness.startSession.mock.calls.length === 1);
+    await waitFor(() => harness.sendTurn.mock.calls.length === 1);
+    expect(harness.startSession.mock.calls[0]?.[1]).toMatchObject({
+      providerInstanceId,
+      resumeCursor,
+      runtimeMode: "approval-required",
+    });
+    expect(harness.sendTurn.mock.calls[0]?.[0]).toMatchObject({
+      threadId: ThreadId.make("thread-1"),
+      input: "child finished, continue",
+    });
+  });
+
   it("generates a thread title on the first turn", async () => {
     const harness = await createHarness();
     const now = "2026-01-01T00:00:00.000Z";

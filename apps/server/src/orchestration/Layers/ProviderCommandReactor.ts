@@ -63,13 +63,15 @@ function toNonEmptyProviderInput(value: string | undefined): string | undefined 
 }
 
 function mapProviderSessionStatusToOrchestrationStatus(
-  status: "connecting" | "ready" | "running" | "error" | "closed",
+  status: "connecting" | "ready" | "running" | "waiting" | "error" | "closed",
 ): OrchestrationSession["status"] {
   switch (status) {
     case "connecting":
       return "starting";
     case "running":
       return "running";
+    case "waiting":
+      return "waiting";
     case "error":
       return "error";
     case "closed":
@@ -530,13 +532,16 @@ const make = Effect.gen(function* () {
         preferredProvider === "claudeAgent" &&
         requestedModelSelection !== undefined &&
         !Equal.equals(previousModelSelection, requestedModelSelection);
+      const shouldRestartWaitingSession =
+        activeSession?.status === "waiting" && activeSession.activeTurnId === undefined;
 
       if (
         !runtimeModeChanged &&
         !cwdChanged &&
         !instanceChanged &&
         !shouldRestartForModelChange &&
-        !shouldRestartForModelSelectionChange
+        !shouldRestartForModelSelectionChange &&
+        !shouldRestartWaitingSession
       ) {
         return existingSessionThreadId;
       }

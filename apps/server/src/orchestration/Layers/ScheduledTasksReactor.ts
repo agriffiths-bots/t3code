@@ -250,8 +250,12 @@ const makeScheduledTasksReactor = Effect.gen(function* () {
         return;
       }
 
-      // Busy check: a running session or an active turn is "busy".
-      const busy = shell.session?.status === "running" || shell.session?.activeTurnId != null;
+      // Busy check: a running session or active turn is "busy". Parked
+      // waiting sessions have no active turn and can be resumed by a new turn.
+      const busy =
+        shell.session?.status === "running" ||
+        (shell.session?.status === "waiting" && shell.session.activeTurnId != null) ||
+        shell.session?.activeTurnId != null;
       if (busy) {
         if (task.busyPolicy === "skip") {
           yield* skipTask(task, "skipped", nowMs, { skippedCount: task.skippedCount + 1 });

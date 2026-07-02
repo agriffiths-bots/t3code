@@ -89,6 +89,7 @@ function settledTurnStateForSessionStatus(
       return "interrupted";
     case "starting":
     case "running":
+    case "waiting":
       return null;
   }
 }
@@ -1041,7 +1042,11 @@ const makeOrchestrationProjectionPipeline = Effect.fn("makeOrchestrationProjecti
 
         case "thread.session-set": {
           const turnId = event.payload.session.activeTurnId;
-          if (turnId === null || event.payload.session.status !== "running") {
+          if (
+            turnId === null ||
+            (event.payload.session.status !== "running" &&
+              event.payload.session.status !== "waiting")
+          ) {
             // Leaving the "running" session status is the turn-end signal:
             // settle still-running turns so their duration reflects the whole
             // turn rather than the last assistant message.
@@ -1181,7 +1186,7 @@ const makeOrchestrationProjectionPipeline = Effect.fn("makeOrchestrationProjecti
           });
           const turnStillRunning =
             Option.isSome(session) &&
-            session.value.status === "running" &&
+            (session.value.status === "running" || session.value.status === "waiting") &&
             session.value.activeTurnId === event.payload.turnId;
           const settlesTurn = !event.payload.streaming && !turnStillRunning;
           const existingTurn = yield* projectionTurnRepository.getByTurnId({
@@ -1271,7 +1276,7 @@ const makeOrchestrationProjectionPipeline = Effect.fn("makeOrchestrationProjecti
           });
           const turnStillRunning =
             Option.isSome(session) &&
-            session.value.status === "running" &&
+            (session.value.status === "running" || session.value.status === "waiting") &&
             session.value.activeTurnId === event.payload.turnId;
           const existingTurn = yield* projectionTurnRepository.getByTurnId({
             threadId: event.payload.threadId,

@@ -78,7 +78,10 @@ export function buildThreadTurnInterruptInput(thread: Pick<Thread, "id" | "sessi
   threadId: ThreadId;
   turnId?: TurnId;
 } {
-  const runningTurnId = thread.session?.status === "running" ? thread.session.activeTurnId : null;
+  const runningTurnId =
+    thread.session?.status === "running" || thread.session?.status === "waiting"
+      ? thread.session.activeTurnId
+      : null;
   return {
     threadId: thread.id,
     ...(runningTurnId !== null ? { turnId: runningTurnId } : {}),

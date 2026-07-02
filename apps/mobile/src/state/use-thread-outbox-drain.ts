@@ -225,7 +225,10 @@ export function useThreadOutboxDrain(): void {
         threadExists: thread !== undefined,
         shellStatus: shellStatuses.get(nextQueuedMessage.environmentId) ?? "empty",
         environmentConnected: environment?.connectionState === "connected",
-        threadBusy: thread?.session?.status === "running" || thread?.session?.status === "starting",
+        threadBusy:
+          thread?.session?.status === "running" ||
+          (thread?.session?.status === "waiting" && thread.session.activeTurnId !== null) ||
+          thread?.session?.status === "starting",
       });
       if (deliveryAction === "wait") {
         continue;

@@ -83,6 +83,7 @@ import {
   deriveWorkLogEntries,
   hasActionableProposedPlan,
   isLatestTurnSettled,
+  isThreadSessionActive,
 } from "../session-logic";
 import { type LegendListRef } from "@legendapp/list/react";
 import { getAnchoredTurnMetrics, type TimelineScrollMode } from "./chat/timelineScrollAnchoring";
@@ -1016,6 +1017,9 @@ function ChatViewContent(props: ChatViewProps) {
   });
   const startThreadTurn = useAtomCommand(threadEnvironment.startTurn, { reportFailure: false });
   const interruptThreadTurn = useAtomCommand(threadEnvironment.interruptTurn, {
+    reportFailure: false,
+  });
+  const stopThreadSession = useAtomCommand(threadEnvironment.stopSession, {
     reportFailure: false,
   });
   const respondToThreadApproval = useAtomCommand(threadEnvironment.respondToApproval, {
@@ -4277,6 +4281,22 @@ function ChatViewContent(props: ChatViewProps) {
 
   const onInterrupt = async () => {
     if (!activeThread) return;
+    if (activeThread.session?.status === "waiting" && !activeThread.session.activeTurnId) {
+      const result = await stopThreadSession({
+        environmentId,
+        input: {
+          threadId: activeThread.id,
+        },
+      });
+      if (result._tag === "Failure" && !isAtomCommandInterrupted(result)) {
+        const error = squashAtomCommandFailure(result);
+        setThreadError(
+          activeThread.id,
+          error instanceof Error ? error.message : "Failed to stop the waiting session.",
+        );
+      }
+      return;
+    }
     const result = await interruptThreadTurn({
       environmentId,
       input: buildThreadTurnInterruptInput(activeThread),
@@ -5115,7 +5135,7 @@ function ChatViewContent(props: ChatViewProps) {
                 timelineEntries={timelineEntries}
                 latestTurn={activeLatestTurn}
                 runningTurnId={
-                  activeThread.session?.status === "running"
+                  activeThread.session && isThreadSessionActive(activeThread.session)
                     ? activeThread.session.activeTurnId
                     : null
                 }

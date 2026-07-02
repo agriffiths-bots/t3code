@@ -123,7 +123,8 @@ const isThreadIdle = (shell: OrchestrationThreadShell): boolean => {
   const session = shell.session;
   if (session === null) return true;
   return (
-    (session.status === "ready" || session.status === "stopped") && session.activeTurnId === null
+    (session.status === "ready" || session.status === "waiting" || session.status === "stopped") &&
+    session.activeTurnId === null
   );
 };
 
