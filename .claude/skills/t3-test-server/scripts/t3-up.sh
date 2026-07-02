@@ -42,13 +42,23 @@ cd "$REPO_ROOT"
 # Ownership + mode are enforced every run; values are PARSED, never sourced,
 # by these scripts.
 REG_ROOT="${T3_EPHEMERAL_REGISTRY:-$HOME/.cache/t3-ephemeral/instances}"
+# The registry marker is what t3-down trusts before sweeping — so it may only
+# be stamped on a directory we created (or one already marked), never on an
+# arbitrary pre-existing dir a mis-set T3_EPHEMERAL_REGISTRY points at.
+if [[ -d "$REG_ROOT" && ! -f "$REG_ROOT/.t3-ephemeral-registry" ]]; then
+  # Emptiness must be PROVEN: a listing failure (e.g. unreadable dir) must
+  # fail closed, not read as "empty".
+  entries="$(ls -A "$REG_ROOT" 2>/dev/null)"; ls_rc=$?
+  if [[ $ls_rc -ne 0 || -n "$entries" ]]; then
+    echo "t3-up: $REG_ROOT exists and is not a provably-empty t3 registry (no marker); refusing — point T3_EPHEMERAL_REGISTRY at a fresh directory" >&2
+    exit 1
+  fi
+fi
 mkdir -p "$REG_ROOT"
 # Symlink/ownership check BEFORE chmod: chmod on a directory symlink would
 # silently change the target's mode.
 [[ -O "$REG_ROOT" && ! -L "$REG_ROOT" ]] || { echo "t3-up: refusing registry $REG_ROOT (not owned by us, or a symlink)" >&2; exit 1; }
 chmod 700 "$REG_ROOT"
-# Marker proving this dir IS a t3 registry — t3-down refuses to touch any
-# directory tree without it (guards a mis-set T3_EPHEMERAL_REGISTRY).
 touch "$REG_ROOT/.t3-ephemeral-registry"
 read_instance_var() { sed -n "s/^export $2=\"\(.*\)\"\$/\1/p" "$1" 2>/dev/null | head -1; }
 # True iff pid is alive AND was started for this instance home — guards

@@ -56,6 +56,14 @@ cd "$REPO_ROOT"
 GIT_DIR="$(git rev-parse --git-dir)"
 STATE_DIR="$GIT_DIR/factory"
 mkdir -p "$STATE_DIR"
+
+# Serialize gate runs per repo: a background --prepare racing a direct commit
+# would otherwise interleave last-review.json / review-for and pair one tree's
+# gate id with another tree's findings. Held (fd 9) for the whole run.
+if [ "$MODE" != "--status" ]; then
+  exec 9>"$STATE_DIR/gate.lock"
+  flock 9 || { echo "factory-gate: cannot acquire gate lock" >&2; exit 2; }
+fi
 MARKER="$STATE_DIR/gate-ok"
 REVIEW_JSON="$STATE_DIR/last-review.json"
 REVIEW_FOR="$STATE_DIR/review-for"
@@ -197,6 +205,14 @@ else
   review_rc=$?
 
   if [ "$review_rc" -eq 0 ]; then
+    # Never cache a PASS on exit code alone: require a parseable report whose
+    # findings are an ACTUAL empty array with a clean verdict (jq's
+    # `null|length` is 0, so `{}`-style output must not slip through).
+    if ! jq -e '(.findings | type == "array") and (.findings | length == 0) and (.overall_correctness == "patch is correct")' "$REVIEW_JSON" >/dev/null 2>&1; then
+      refuse "review exited 0 but $REVIEW_JSON is missing, unparseable, or non-empty.
+  Check FACTORY_AUTOREVIEW_BIN — refusing to cache a PASS without a clean report." review-infra \
+      "$(jq -cn '{review_rc:0,report:"invalid"}')"
+    fi
     echo "$GATE_ID" > "$MARKER"
     echo "factory-gate: PASS (static checks + clean review)" >&2
     audit pass "$(jq -cn --arg g "$GATE_ID" '{gate_id:$g,review:"clean"}')"
