@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+# Merge commits (git merge --no-ff etc.) run pre-merge-commit, NOT pre-commit —
+# without this shim they would bypass the factory gate. Same HEAD-first logic
+# as pre-commit (see that file for the rationale).
+set -uo pipefail
+root="$(git rev-parse --show-toplevel)" || exit 2
+gd="$(git -C "$root" rev-parse --absolute-git-dir)" || exit 2
+if git -C "$root" cat-file -e HEAD:scripts/factory/precommit-gate.sh 2>/dev/null; then
+  # The gate object must be a REGULAR file: `git show` of a symlink blob
+  # prints its target text, which bash would then execute as shell.
+  mode="$(git -C "$root" ls-tree HEAD -- scripts/factory/precommit-gate.sh | awk '{print $1}')"
+  case "$mode" in 100644|100755) ;; *) echo "factory hook: HEAD gate is not a regular file (mode ${mode:-none}); refusing the commit" >&2; exit 2;; esac
+  # Materialize the HEAD gate atomically and FAIL CLOSED on any error — a
+  # stale or truncated cached copy must never judge (or wave through) a commit.
+  mkdir -p "$gd/factory" || exit 2
+  tmp="$gd/factory/gate-hook.sh.$$"
+  if ! git -C "$root" show HEAD:scripts/factory/precommit-gate.sh > "$tmp" 2>/dev/null || ! [ -s "$tmp" ]; then
+    rm -f "$tmp"; echo "factory hook: cannot materialize the HEAD gate; refusing the commit" >&2; exit 2
+  fi
+  mv -f "$tmp" "$gd/factory/gate-hook.sh" || { rm -f "$tmp"; exit 2; }
+  cd "$root" && FACTORY_GATE_FROM_HEAD=1 exec bash "$gd/factory/gate-hook.sh" hook
+fi
+exec "$root/scripts/factory/precommit-gate.sh" hook
