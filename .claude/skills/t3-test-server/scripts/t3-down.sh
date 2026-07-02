@@ -16,14 +16,20 @@ if [[ -e "$REG_ROOT" ]]; then
 fi
 read_instance_var() { sed -n "s/^export $2=\"\(.*\)\"\$/\1/p" "$1" 2>/dev/null | head -1; }
 
-# True iff pid is alive AND was started for this instance home — guards
-# against PID reuse (a crashed instance's recorded pid may now belong to an
-# unrelated process; never signal it).
+# True iff pid is alive AND was started for this instance — guards against
+# PID reuse (a crashed instance's recorded pid may now belong to an unrelated
+# process; never signal it). Prefers /proc environ; falls back to matching the
+# recorded launch args where /proc is unavailable (macOS/BSD).
 pid_is_instance() {
-  local pid="$1" home="$2"
+  local pid="$1" home="$2" entry="${3:-}" port="${4:-}" args
   [[ "$pid" =~ ^[0-9]+$ && -n "$home" ]] || return 1
   kill -0 "$pid" 2>/dev/null || return 1
-  tr '\0' '\n' < "/proc/$pid/environ" 2>/dev/null | grep -qxF "T3CODE_HOME=$home"
+  if [[ -r "/proc/$pid/environ" ]]; then
+    tr '\0' '\n' < "/proc/$pid/environ" 2>/dev/null | grep -qxF "T3CODE_HOME=$home"
+  else
+    args="$(ps -p "$pid" -o args= 2>/dev/null)" || return 1
+    [[ -n "$entry" && -n "$port" && "$args" == *"$entry"* && "$args" == *"--port $port"* ]]
+  fi
 }
 
 # True iff the recorded home is, after canonicalization, a non-symlink direct
@@ -36,7 +42,7 @@ safe_ephemeral_home() {
 }
 
 down_one() {
-  local reg="$1" name pid home
+  local reg="$1" name pid home entry port
   name="$(basename "$reg")"
   if [[ ! -f "$reg/instance.env" ]]; then
     # Unknown entry: never rm -rf what we didn't create. Drop it only if it
@@ -51,7 +57,9 @@ down_one() {
   fi
   pid="$(read_instance_var "$reg/instance.env" T3_PID)"
   home="$(read_instance_var "$reg/instance.env" T3_HOME)"
-  if ! pid_is_instance "$pid" "$home"; then
+  entry="$(read_instance_var "$reg/instance.env" T3_ENTRY)"
+  port="$(read_instance_var "$reg/instance.env" T3_PORT)"
+  if ! pid_is_instance "$pid" "$home" "$entry" "$port"; then
     echo "t3-down: '$name' process ${pid:-?} is gone (or the pid was reused); cleaning state only" >&2
     pid=""
   fi

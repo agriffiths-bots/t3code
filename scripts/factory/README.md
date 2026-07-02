@@ -53,8 +53,10 @@ Write `.git/factory/dismissals.json` (schema in the header of
 - `FACTORY_SKIP=1 FACTORY_SKIP_REASON="..."` — skips the gate; used ONLY by
   the nightly upstream-sync driver (whose PRs merge via the CI-only policy
   dir), which must set it for every commit and sequencer continuation it
-  performs. There is no ambient bypass: merge/cherry-pick/rebase
-  continuations are gated like any other commit.
+  performs. There is no ambient bypass in the gate itself; merge commits are
+  covered via `.githooks/pre-merge-commit`. Note one git-design limit:
+  cherry-pick/rebase sequencer commits run no pre-commit hook at all — those
+  flows are covered by the PR-level gate (CI + Codex via wizzo-approve).
 
 Audit trail: `~/.openclaw/audit/factory-precommit.jsonl` (every pass, refusal,
 dismissal, and skip, with finding details).

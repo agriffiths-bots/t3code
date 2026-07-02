@@ -61,13 +61,20 @@ mkdir -p "$REG_ROOT"
 chmod 700 "$REG_ROOT"
 touch "$REG_ROOT/.t3-ephemeral-registry"
 read_instance_var() { sed -n "s/^export $2=\"\(.*\)\"\$/\1/p" "$1" 2>/dev/null | head -1; }
-# True iff pid is alive AND was started for this instance home — guards
-# against PID reuse (see t3-down.sh, which applies the same check before kill).
+# True iff pid is alive AND was started for this instance — guards against
+# PID reuse (see t3-down.sh, which applies the same check before kill).
+# Prefers /proc environ; falls back to matching the recorded launch args
+# where /proc is unavailable (macOS/BSD).
 pid_is_instance() {
-  local pid="$1" home="$2"
+  local pid="$1" home="$2" entry="${3:-}" port="${4:-}" args
   [[ "$pid" =~ ^[0-9]+$ && -n "$home" ]] || return 1
   kill -0 "$pid" 2>/dev/null || return 1
-  tr '\0' '\n' < "/proc/$pid/environ" 2>/dev/null | grep -qxF "T3CODE_HOME=$home"
+  if [[ -r "/proc/$pid/environ" ]]; then
+    tr '\0' '\n' < "/proc/$pid/environ" 2>/dev/null | grep -qxF "T3CODE_HOME=$home"
+  else
+    args="$(ps -p "$pid" -o args= 2>/dev/null)" || return 1
+    [[ -n "$entry" && -n "$port" && "$args" == *"$entry"* && "$args" == *"--port $port"* ]]
+  fi
 }
 # True iff the recorded home is, after canonicalization, a non-symlink direct
 # child of /tmp matching the mktemp pattern — the only thing we ever rm -rf.
@@ -81,7 +88,9 @@ REG="$REG_ROOT/$NAME"
 if [[ -e "$REG/instance.env" ]]; then
   old_pid="$(read_instance_var "$REG/instance.env" T3_PID)"
   old_home="$(read_instance_var "$REG/instance.env" T3_HOME)"
-  if pid_is_instance "$old_pid" "$old_home"; then
+  old_entry="$(read_instance_var "$REG/instance.env" T3_ENTRY)"
+  old_port="$(read_instance_var "$REG/instance.env" T3_PORT)"
+  if pid_is_instance "$old_pid" "$old_home" "$old_entry" "$old_port"; then
     echo "t3-up: instance '$NAME' already running (pid $old_pid). Use it, or t3-down.sh $NAME first." >&2
     exit 1
   fi
@@ -89,8 +98,8 @@ if [[ -e "$REG/instance.env" ]]; then
   safe_ephemeral_home "$old_home" && rm -rf "$old_home"
   rm -rf "$REG"
 elif [[ -e "$REG" ]]; then
-  # Not something t3-up created (no instance.env): never adopt or delete it.
-  echo "t3-up: $REG exists but is not a t3 instance; remove it yourself or pick another --name" >&2
+  # Either junk we didn't create or another t3-up mid-boot: never adopt it.
+  echo "t3-up: $REG exists but has no instance.env (another t3-up in flight, or junk); remove it yourself or pick another --name" >&2
   exit 1
 fi
 
@@ -103,6 +112,7 @@ fi
 T3_HOME="$(mktemp -d "/tmp/t3-ephemeral-XXXXXX")"
 SRV_PID=""
 REGISTERED=0
+CLAIMED=0
 # Until instance.env is registered, t3-down.sh cannot discover this instance —
 # so any early exit (error, INT/TERM, caller timeout) must reap the server and
 # temp home here. Disarmed once registration succeeds.
@@ -113,11 +123,18 @@ cleanup_on_abort() {
     wait "$SRV_PID" 2>/dev/null || true
   fi
   rm -rf "$T3_HOME"
+  [[ "$CLAIMED" == "1" ]] && rm -rf "$REG"
 }
 trap cleanup_on_abort EXIT
 trap 'cleanup_on_abort; exit 130' INT
 trap 'cleanup_on_abort; exit 143' TERM
 fail() { exit 1; }
+
+# Atomically CLAIM the name before booting (mkdir fails if it exists), so two
+# concurrent `t3-up --name X` can't both boot and leak the loser's server.
+# Claimed under the abort trap: any early exit releases the claim.
+mkdir "$REG" 2>/dev/null || { echo "t3-up: lost the claim race for '$NAME' (another t3-up just took it)" >&2; exit 1; }
+CLAIMED=1
 
 PORT=""
 ready=0
@@ -127,6 +144,7 @@ for candidate in $(seq 13910 13940); do
   # no exposure/trace inheritance, log level pinned so readiness is detectable.
   env -u T3CODE_TAILSCALE_SERVE -u T3CODE_TAILSCALE_SERVE_PORT \
     -u T3CODE_TRACE_FILE -u T3CODE_OTLP_TRACES_URL -u T3CODE_OTLP_METRICS_URL \
+    -u VITE_DEV_SERVER_URL \
     T3CODE_HOME="$T3_HOME" T3CODE_NO_BROWSER=1 T3CODE_LOG_LEVEL=Info \
     setsid node "$ENTRY" serve --port "$candidate" --host 127.0.0.1 \
     > "$T3_HOME/server.log" 2>&1 < /dev/null &
@@ -170,7 +188,7 @@ for _ in $(seq 1 20); do
   sleep 0.2
 done
 
-mkdir -p "$REG"
+# ($REG was atomically claimed above)
 cat > "$REG/instance.env" <<EOF
 export T3_NAME="$NAME"
 export T3_ORIGIN="$T3_ORIGIN"

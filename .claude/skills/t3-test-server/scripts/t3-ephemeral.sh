@@ -93,6 +93,7 @@ for candidate in $(seq 13910 13940); do
   # so the "Listening on ..." readiness line is always emitted.
   env -u T3CODE_TAILSCALE_SERVE -u T3CODE_TAILSCALE_SERVE_PORT \
     -u T3CODE_TRACE_FILE -u T3CODE_OTLP_TRACES_URL -u T3CODE_OTLP_METRICS_URL \
+    -u VITE_DEV_SERVER_URL \
     T3CODE_HOME="$T3_HOME" T3CODE_NO_BROWSER=1 T3CODE_LOG_LEVEL=Info \
     node "$ENTRY" serve --port "$candidate" --host 127.0.0.1 > "$T3_HOME/server.log" 2>&1 &
   SRV_PID=$!

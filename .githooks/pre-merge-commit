@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# Merge commits (git merge --no-ff etc.) run pre-merge-commit, NOT pre-commit —
+# without this shim they would bypass the factory gate entirely.
+exec "$(git rev-parse --show-toplevel)/scripts/factory/precommit-gate.sh" hook
