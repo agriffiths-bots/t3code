@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# Software-factory commit gate: staged-scope guard + static checks + autoreview
+# panel. All logic lives in scripts/factory/precommit-gate.sh (also runnable
+# ahead of time as `scripts/factory/precommit-gate.sh --prepare`).
+exec "$(git rev-parse --show-toplevel)/scripts/factory/precommit-gate.sh" hook
