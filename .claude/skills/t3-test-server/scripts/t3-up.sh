@@ -105,6 +105,16 @@ if [[ -e "$REG/instance.env" ]]; then
   # succeed), so a slower racer can never rm -rf a winner's fresh registration.
   reap="$REG_ROOT/.reap-$NAME-$$"
   if mv "$REG" "$reap" 2>/dev/null; then
+    # The dead leader's group members (provider CLIs, etc.) may still be
+    # running against the old home — reap each one we can PROVE is ours
+    # before deleting that home (same identity check as t3-down).
+    if [[ "$old_pid" =~ ^[0-9]+$ && -n "$old_home" ]]; then
+      for p in $(pgrep -g "$old_pid" 2>/dev/null); do
+        if tr '\0' '\n' < "/proc/$p/environ" 2>/dev/null | grep -qxF "T3CODE_HOME=$old_home"; then
+          kill -9 "$p" 2>/dev/null || true
+        fi
+      done
+    fi
     safe_ephemeral_home "$old_home" && rm -rf "$old_home"
     rm -rf "$reap"
   else
