@@ -10,6 +10,9 @@ set -uo pipefail
 # Same private registry as t3-up.sh: per-user, ownership-checked, and PARSED
 # (never sourced) — see t3-up.sh for the rationale.
 REG_ROOT="${T3_EPHEMERAL_REGISTRY:-$HOME/.cache/t3-ephemeral/instances}"
+# Strip trailing slashes: a slash-qualified path makes bash FOLLOW a symlink
+# in the -L test below, defeating the check.
+while [[ "$REG_ROOT" == */ && "$REG_ROOT" != "/" ]]; do REG_ROOT="${REG_ROOT%/}"; done
 if [[ -e "$REG_ROOT" ]]; then
   [[ -O "$REG_ROOT" && ! -L "$REG_ROOT" ]] || { echo "t3-down: refusing registry $REG_ROOT (not owned by us, or a symlink)" >&2; exit 1; }
   # Fail closed if this isn't a t3 registry (marker is written by t3-up):
@@ -46,10 +49,17 @@ safe_ephemeral_home() {
 down_one() {
   local reg="$1" name pid home entry port
   name="$(basename "$reg")"
+  if [[ -L "$reg" ]]; then
+    # A symlinked entry is never something t3-up created: remove only the
+    # link itself (touching "$reg/..." would mutate the symlink's TARGET).
+    rm -f "$reg"
+    echo "t3-down: '$name' was a symlink, not an instance; removed the link only" >&2
+    return 0
+  fi
   if [[ ! -f "$reg/instance.env" ]]; then
-    # Unknown entry: never rm -rf what we didn't create. Drop it only if it
-    # is trivially empty (plus a possible dangling 'home' symlink).
-    rm -f "$reg/home" 2>/dev/null
+    # Unknown entry: never rm -rf what we didn't create. Drop our own 'home'
+    # symlink if present (only ever a link), then the dir only if empty.
+    [[ -L "$reg/home" ]] && rm -f "$reg/home"
     if rmdir "$reg" 2>/dev/null; then
       echo "t3-down: '$name' had no instance.env; removed empty registry entry" >&2
     else

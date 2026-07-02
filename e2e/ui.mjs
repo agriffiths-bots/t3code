@@ -27,6 +27,11 @@ export function mintPairingToken({
   label = "e2e",
 } = {}) {
   if (!home) throw new Error("mintPairingToken: T3_HOME not set (source instance.env first)");
+  // Same env hygiene as the t3-up launch: an inherited VITE_DEV_SERVER_URL
+  // would flip the CLI to the `dev` state dir and mint a token the server
+  // (running on `userdata`) never sees.
+  const env = { ...process.env, T3CODE_HOME: home };
+  delete env.VITE_DEV_SERVER_URL;
   const out = NodeChildProcess.execFileSync(
     "node",
     [
@@ -40,7 +45,7 @@ export function mintPairingToken({
       "--label",
       label,
     ],
-    { env: { ...process.env, T3CODE_HOME: home }, encoding: "utf8" },
+    { env, encoding: "utf8" },
   );
   const parsed = JSON.parse(out);
   if (!parsed.credential) throw new Error(`pairing create returned no credential: ${out}`);

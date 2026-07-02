@@ -126,7 +126,7 @@ fi
 echo "[t3-ephemeral] ready home=$T3_HOME port=$PORT entry=$ENTRY (http=$code)" >&2
 
 # `|| true` so a non-zero mint doesn't trip `set -e` before we can print diagnostics.
-T3_TOKEN="$(T3CODE_HOME="$T3_HOME" node "$ENTRY" auth session issue --token-only 2>>"$T3_HOME/server.log")" || true
+T3_TOKEN="$(env -u VITE_DEV_SERVER_URL T3CODE_HOME="$T3_HOME" node "$ENTRY" auth session issue --token-only 2>>"$T3_HOME/server.log")" || true
 if [[ -z "$T3_TOKEN" ]]; then
   echo "[t3-ephemeral] failed to mint token; recent server.log:" >&2
   tail -10 "$T3_HOME/server.log" >&2

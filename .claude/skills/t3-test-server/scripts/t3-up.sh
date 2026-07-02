@@ -45,6 +45,9 @@ cd "$REPO_ROOT"
 # Ownership + mode are enforced every run; values are PARSED, never sourced,
 # by these scripts.
 REG_ROOT="${T3_EPHEMERAL_REGISTRY:-$HOME/.cache/t3-ephemeral/instances}"
+# Strip trailing slashes: a slash-qualified path makes bash FOLLOW a symlink
+# in the -L test below, defeating the check.
+while [[ "$REG_ROOT" == */ && "$REG_ROOT" != "/" ]]; do REG_ROOT="${REG_ROOT%/}"; done
 # The registry marker is what t3-down trusts before sweeping — so it may only
 # be stamped on a directory we created (or one already marked), never on an
 # arbitrary pre-existing dir a mis-set T3_EPHEMERAL_REGISTRY points at.
@@ -179,7 +182,10 @@ for candidate in $(seq 13910 13940); do
 done
 [[ "$ready" == "1" ]] || { echo "t3-up: no usable port in 13910-13940 (timeout ${BOOT_TIMEOUT}s)" >&2; fail; }
 
-T3_TOKEN="$(T3CODE_HOME="$T3_HOME" node "$ENTRY" auth session issue --token-only 2>>"$T3_HOME/server.log")" || true
+# Same env hygiene as the server launch: an inherited VITE_DEV_SERVER_URL
+# would flip the CLI to the `dev` state dir and mint a token the server
+# (running on `userdata`) never sees.
+T3_TOKEN="$(env -u VITE_DEV_SERVER_URL T3CODE_HOME="$T3_HOME" node "$ENTRY" auth session issue --token-only 2>>"$T3_HOME/server.log")" || true
 [[ -n "$T3_TOKEN" ]] || { echo "t3-up: failed to mint bearer; recent log:" >&2; tail -10 "$T3_HOME/server.log" >&2; fail; }
 
 T3_ORIGIN="http://127.0.0.1:$PORT"
