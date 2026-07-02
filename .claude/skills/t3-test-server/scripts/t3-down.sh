@@ -19,7 +19,7 @@ if [[ -e "$REG_ROOT" ]]; then
   # never sweep an arbitrary directory tree, e.g. a mis-set T3_EPHEMERAL_REGISTRY.
   [[ -f "$REG_ROOT/.t3-ephemeral-registry" ]] || { echo "t3-down: $REG_ROOT has no .t3-ephemeral-registry marker; refusing" >&2; exit 1; }
 fi
-read_instance_var() { sed -n "s/^export $2=\"\(.*\)\"\$/\1/p" "$1" 2>/dev/null | head -1; }
+read_instance_var() { sed -n -e "s/^export $2='\(.*\)'\$/\1/p" -e "s/^export $2=\"\(.*\)\"\$/\1/p" "$1" 2>/dev/null | head -1; }
 
 # True iff pid is alive AND was started for this instance — guards against
 # PID reuse (a crashed instance's recorded pid may now belong to an unrelated
@@ -59,6 +59,12 @@ down_one() {
   if [[ ! -f "$reg/instance.env" ]]; then
     # Unknown entry: never rm -rf what we didn't create. Drop our own 'home'
     # symlink if present (only ever a link), then the dir only if empty.
+    # A young empty dir is likely another t3-up's in-flight claim (made
+    # before it writes instance.env) — leave it alone.
+    if [[ -n "$(find "$reg" -maxdepth 0 -mmin -10 2>/dev/null)" ]]; then
+      echo "t3-down: '$name' looks like an in-flight claim (<10 min old, no instance.env yet); SKIPPING" >&2
+      return 0
+    fi
     [[ -L "$reg/home" ]] && rm -f "$reg/home"
     if rmdir "$reg" 2>/dev/null; then
       echo "t3-down: '$name' had no instance.env; removed empty registry entry" >&2
@@ -106,7 +112,9 @@ down_one() {
 
 if [[ "${1:-}" == "--all" ]]; then
   found=0
-  for reg in "$REG_ROOT"/*/; do
+  # Include .reap-* entries: a t3-up killed mid-reap leaves its renamed stale
+  # entry there, and it still holds a parseable instance.env + home to clean.
+  for reg in "$REG_ROOT"/*/ "$REG_ROOT"/.reap-*/; do
     [[ -d "$reg" ]] || continue
     found=1
     down_one "${reg%/}"

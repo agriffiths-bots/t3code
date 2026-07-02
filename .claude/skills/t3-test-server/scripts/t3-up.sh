@@ -66,7 +66,7 @@ mkdir -p "$REG_ROOT"
 [[ -O "$REG_ROOT" && ! -L "$REG_ROOT" ]] || { echo "t3-up: refusing registry $REG_ROOT (not owned by us, or a symlink)" >&2; exit 1; }
 chmod 700 "$REG_ROOT"
 touch "$REG_ROOT/.t3-ephemeral-registry"
-read_instance_var() { sed -n "s/^export $2=\"\(.*\)\"\$/\1/p" "$1" 2>/dev/null | head -1; }
+read_instance_var() { sed -n -e "s/^export $2='\(.*\)'\$/\1/p" -e "s/^export $2=\"\(.*\)\"\$/\1/p" "$1" 2>/dev/null | head -1; }
 # True iff pid is alive AND was started for this instance — guards against
 # PID reuse (see t3-down.sh, which applies the same check before kill).
 # Prefers /proc environ; falls back to matching the recorded launch args
@@ -216,20 +216,25 @@ for _ in $(seq 1 20); do
 done
 
 # ($REG was atomically claimed above)
-cat > "$REG/instance.env" <<EOF
-# Consumers shell out to the T3 CLI against this instance: an inherited dev
-# URL would flip the CLI to a different state dir than the server's.
-unset VITE_DEV_SERVER_URL 2>/dev/null || true
-export T3_NAME="$NAME"
-export T3_ORIGIN="$T3_ORIGIN"
-export T3_TOKEN="$T3_TOKEN"
-export T3_DB="$T3_DB"
-export T3_HOME="$T3_HOME"
-export T3CODE_HOME="$T3_HOME"
-export T3_PORT="$PORT"
-export T3_PID="$SRV_PID"
-export T3_ENTRY="$ENTRY"
-EOF
+# Values are SINGLE-quoted with embedded quotes escaped: instance.env is
+# documented for sourcing/eval, so nothing in it may expand or execute
+# (e.g. an --entry path containing $ or backticks).
+shq() { printf "%s" "$1" | sed "s/'/'\\\\''/g"; }
+{
+  echo "# Consumers shell out to the T3 CLI against this instance: an inherited dev"
+  echo "# URL would flip the CLI to a different state dir than the server's."
+  echo "unset VITE_DEV_SERVER_URL 2>/dev/null || true"
+  printf "export %s='%s'\n" \
+    T3_NAME "$(shq "$NAME")" \
+    T3_ORIGIN "$(shq "$T3_ORIGIN")" \
+    T3_TOKEN "$(shq "$T3_TOKEN")" \
+    T3_DB "$(shq "$T3_DB")" \
+    T3_HOME "$(shq "$T3_HOME")" \
+    T3CODE_HOME "$(shq "$T3_HOME")" \
+    T3_PORT "$(shq "$PORT")" \
+    T3_PID "$(shq "$SRV_PID")" \
+    T3_ENTRY "$(shq "$ENTRY")"
+} > "$REG/instance.env"
 ln -sfn "$T3_HOME" "$REG/home"
 # Registered: t3-down.sh owns the lifecycle from here on.
 REGISTERED=1

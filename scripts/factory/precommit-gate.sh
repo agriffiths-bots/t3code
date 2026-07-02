@@ -116,11 +116,15 @@ if git cat-file -e HEAD:scripts/factory/factory.conf 2>/dev/null; then
   git show HEAD:scripts/factory/factory.conf > "$STATE_DIR/factory.conf.head" \
     || { echo "factory-gate: cannot materialize HEAD factory.conf; refusing" >&2; exit 2; }
   # shellcheck source=factory.conf
-  . "$STATE_DIR/factory.conf.head"
+  . "$STATE_DIR/factory.conf.head" \
+    || { echo "factory-gate: failed to source HEAD factory.conf; refusing" >&2; exit 2; }
 elif [ -f "$CONF" ]; then
   # shellcheck source=factory.conf
-  . "$CONF"
+  . "$CONF" || { echo "factory-gate: failed to source $CONF; refusing" >&2; exit 2; }
 fi
+# An empty check list means a broken/neutered config — never a silent pass.
+[ "${#FACTORY_STATIC_CHECKS[@]}" -gt 0 ] \
+  || { echo "factory-gate: no static checks configured (bad or missing factory.conf); refusing" >&2; exit 2; }
 
 command -v jq >/dev/null || { echo "factory-gate: jq is required" >&2; exit 2; }
 
@@ -146,6 +150,15 @@ refuse() { # refuse <short> <verdict> <detail-json>
 
 head_sha() { git rev-parse -q --verify HEAD 2>/dev/null || git hash-object -t tree /dev/null; }
 
+# Dismissals are single-use and bound to the review that prompted them: any
+# leftover file on a pass/skip path is stale and must not survive to cover a
+# future finding that happens to share file/line/title.
+discard_stale_dismissals() {
+  [ -f "$DISMISSALS" ] || return 0
+  mv "$DISMISSALS" "$STATE_DIR/dismissals-stale-$(date +%s).json"
+  echo "factory-gate: discarded stale dismissals (this pass/skip did not consume them)" >&2
+}
+
 # ---- status mode ----
 if [ "$MODE" = "--status" ]; then
   echo "marker:      $( [ -f "$MARKER" ] && cat "$MARKER" || echo '(none)')"
@@ -159,6 +172,7 @@ fi
 if [ "${FACTORY_SKIP:-0}" = "1" ]; then
   reason="${FACTORY_SKIP_REASON:-}"
   [ -n "$reason" ] || refuse "FACTORY_SKIP=1 requires FACTORY_SKIP_REASON" skip-missing-reason '{}'
+  discard_stale_dismissals
   echo "factory-gate: SKIPPED — $reason" >&2
   audit skipped "$(jq -cn --arg r "$reason" '{skip_reason:$r}')"
   exit 0
@@ -214,15 +228,6 @@ done
 HEAD_SHA="$(head_sha)"
 TREE_SHA="$(git write-tree)" || refuse "git write-tree failed (unmerged index?)" scope-write-tree '{}'
 GATE_ID="$HEAD_SHA $TREE_SHA"
-
-# Dismissals are single-use and bound to the review that prompted them: any
-# leftover file on a pass path is stale and must not survive to cover a
-# future finding that happens to share file/line/title.
-discard_stale_dismissals() {
-  [ -f "$DISMISSALS" ] || return 0
-  mv "$DISMISSALS" "$STATE_DIR/dismissals-stale-$(date +%s).json"
-  echo "factory-gate: discarded stale dismissals (review passed without needing them)" >&2
-}
 
 # ---- cached pass ----
 if [ -f "$MARKER" ] && [ "$(cat "$MARKER")" = "$GATE_ID" ]; then
@@ -289,8 +294,12 @@ else
   echo "$GATE_ID" > "$REVIEW_FOR"
 fi
 
+# The helper's validated schema is {file_path, line}; the alternate
+# {absolute_file_path, line_range.start} shape is accepted defensively (it
+# cannot pass the helper's validator today, but parsing it costs nothing and
+# an unknown shape still fails closed as null:null → unmatchable → refused).
 findings="$(jq -c --arg root "$REPO_ROOT/" \
-  '[.findings[] | {file:(.code_location.file_path | ltrimstr($root) | ltrimstr("./")), line:(.code_location.line), title, priority, category}]' "$REVIEW_JSON")"
+  '[.findings[] | {file:((.code_location.file_path // .code_location.absolute_file_path) | ltrimstr($root) | ltrimstr("./")), line:(.code_location.line // .code_location.line_range.start), title, priority, category}]' "$REVIEW_JSON")"
 n_findings="$(jq 'length' <<<"$findings")"
 
 # ---- dismissals: refuse-by-default, dismiss-by-exception ----
