@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+# Sequencer-created commits (cherry-pick/revert) run NO pre-commit hook by
+# git's design — prepare-commit-msg is the only hook that can still refuse
+# them. It runs UNCONDITIONALLY: detecting sequencer state is unreliable
+# (clean `git revert` sets no REVERT_HEAD), and for normal commits the gate
+# just hits the PASS marker pre-commit wrote moments earlier (instant).
+# Bonus: git does not suppress prepare-commit-msg for --no-verify, so even
+# that cannot skip the gate. Same HEAD-first logic as pre-commit.
+set -uo pipefail
+root="$(git rev-parse --show-toplevel)" || exit 2
+gd="$(git -C "$root" rev-parse --absolute-git-dir)" || exit 2
+if git -C "$root" cat-file -e HEAD:scripts/factory/precommit-gate.sh 2>/dev/null; then
+  mode="$(git -C "$root" ls-tree HEAD -- scripts/factory/precommit-gate.sh | awk '{print $1}')"
+  case "$mode" in 100644|100755) ;; *) echo "factory hook: HEAD gate is not a regular file (mode ${mode:-none}); refusing the commit" >&2; exit 2;; esac
+  mkdir -p "$gd/factory" || exit 2
+  tmp="$gd/factory/gate-hook.sh.$$"
+  if ! git -C "$root" show HEAD:scripts/factory/precommit-gate.sh > "$tmp" 2>/dev/null || ! [ -s "$tmp" ]; then
+    rm -f "$tmp"; echo "factory hook: cannot materialize the HEAD gate; refusing the commit" >&2; exit 2
+  fi
+  mv -f "$tmp" "$gd/factory/gate-hook.sh" || { rm -f "$tmp"; exit 2; }
+  cd "$root" && FACTORY_GATE_FROM_HEAD=1 exec bash "$gd/factory/gate-hook.sh" hook
+fi
+exec "$root/scripts/factory/precommit-gate.sh" hook

@@ -93,6 +93,7 @@ for candidate in $(seq 13910 13940); do
   # so the "Listening on ..." readiness line is always emitted.
   env -u T3CODE_TAILSCALE_SERVE -u T3CODE_TAILSCALE_SERVE_PORT \
     -u T3CODE_TRACE_FILE -u T3CODE_OTLP_TRACES_URL -u T3CODE_OTLP_METRICS_URL \
+    -u VITE_DEV_SERVER_URL \
     T3CODE_HOME="$T3_HOME" T3CODE_NO_BROWSER=1 T3CODE_LOG_LEVEL=Info \
     node "$ENTRY" serve --port "$candidate" --host 127.0.0.1 > "$T3_HOME/server.log" 2>&1 &
   SRV_PID=$!
@@ -125,7 +126,7 @@ fi
 echo "[t3-ephemeral] ready home=$T3_HOME port=$PORT entry=$ENTRY (http=$code)" >&2
 
 # `|| true` so a non-zero mint doesn't trip `set -e` before we can print diagnostics.
-T3_TOKEN="$(T3CODE_HOME="$T3_HOME" node "$ENTRY" auth session issue --token-only 2>>"$T3_HOME/server.log")" || true
+T3_TOKEN="$(env -u VITE_DEV_SERVER_URL T3CODE_HOME="$T3_HOME" node "$ENTRY" auth session issue --token-only 2>>"$T3_HOME/server.log")" || true
 if [[ -z "$T3_TOKEN" ]]; then
   echo "[t3-ephemeral] failed to mint token; recent server.log:" >&2
   tail -10 "$T3_HOME/server.log" >&2
@@ -164,6 +165,9 @@ if [[ "$ac" != "200" ]]; then
   exit 1
 fi
 
+# The wrapped command inherits the ephemeral T3CODE_HOME; also drop any
+# inherited dev-server URL so CLI calls it makes hit the same state dir.
+unset VITE_DEV_SERVER_URL
 set +e
 "$@"
 rc=$?

@@ -35,6 +35,28 @@ Flags: `--entry PATH` (default `apps/server/dist/bin.mjs`; use
 `apps/server/src/bin.ts` to run from source), `--boot-timeout SECS` (default 45;
 use ~180 for the source entry, which type-strips on boot and is slow).
 
+## Persistent lifecycle (multi-step / multi-agent testing)
+
+When the server must outlive a single command (e.g. a repro subthread driving
+the web UI with Playwright — see the `t3-e2e-testing` skill), use the up/down
+pair instead:
+
+```bash
+# From the repo root:
+exports="$(.claude/skills/t3-test-server/scripts/t3-up.sh --name MY-TASK)" \
+  || exit 1                                             # errors stay on stderr
+eval "$exports"                                         # exports the T3_* vars
+# ... any number of commands/agents; later shells can reload the env with:
+#     . ~/.cache/t3-ephemeral/instances/MY-TASK/instance.env
+.claude/skills/t3-test-server/scripts/t3-down.sh MY-TASK  # ALWAYS tear down
+.claude/skills/t3-test-server/scripts/t3-down.sh --all    # sweep leaked instances
+```
+
+Same isolation guarantees (fresh temp home, loopback-only, ports 13910–13940).
+`instance.env` additionally records `T3_PID` and `T3_ENTRY`. The web UI is
+served at `$T3_ORIGIN`; authenticate a browser via `e2e/ui.mjs` (`openT3()`),
+which mints a one-time pairing token and lands on the authed app.
+
 ## Testing LOCAL source changes
 
 `dist/bin.mjs` is a build artifact — rebuild it so the ephemeral server runs your

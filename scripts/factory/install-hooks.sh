@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+# One-time per-clone setup for the software-factory commit gate.
+#
+# The hook shims are COPIED OUT OF THE WORKTREE (to ~/.openclaw/factory-hooks/
+# <repo>) and core.hooksPath points there — so a staged edit to .githooks/*
+# can never replace the hook that judges the very commit carrying it. The
+# shims themselves prefer the HEAD version of the gate for the same reason.
+set -euo pipefail
+ROOT="$(git rev-parse --show-toplevel)"
+command -v jq >/dev/null || { echo "install-hooks: jq is required" >&2; exit 1; }
+# The review helper is deliberately out-of-repo (private tooling); without it
+# the gate fails CLOSED on every commit, so surface the gap at install time.
+[ -x "$HOME/.claude/skills/autoreview/scripts/autoreview" ] \
+  || echo "install-hooks: WARNING — autoreview helper not found at ~/.claude/skills/autoreview/scripts/autoreview; the gate will refuse commits (review-infra) until it is installed" >&2
+chmod +x "$ROOT/.githooks/"* "$ROOT/scripts/factory/"*.sh
+
+# Keyed by basename + path hash so two checkouts with the same basename can
+# never overwrite each other's installed shims.
+ROOT_KEY="$(basename "$ROOT")-$(printf %s "$ROOT" | sha256sum | cut -c1-8)"
+HOOKS_DIR="${FACTORY_HOOKS_DIR:-$HOME/.openclaw/factory-hooks/$ROOT_KEY}"
+mkdir -p "$HOOKS_DIR"
+cp "$ROOT/.githooks/pre-commit" "$ROOT/.githooks/pre-merge-commit" "$ROOT/.githooks/prepare-commit-msg" "$HOOKS_DIR/"
+chmod +x "$HOOKS_DIR/"*
+git -C "$ROOT" config core.hooksPath "$HOOKS_DIR"
+echo "install-hooks: core.hooksPath=$HOOKS_DIR (out-of-tree) — the factory gate is active."
+echo "Pre-warm the gate before committing with: scripts/factory/precommit-gate.sh --prepare"
