@@ -43,8 +43,10 @@ cd "$REPO_ROOT"
 # by these scripts.
 REG_ROOT="${T3_EPHEMERAL_REGISTRY:-$HOME/.cache/t3-ephemeral/instances}"
 mkdir -p "$REG_ROOT"
-chmod 700 "$REG_ROOT"
+# Symlink/ownership check BEFORE chmod: chmod on a directory symlink would
+# silently change the target's mode.
 [[ -O "$REG_ROOT" && ! -L "$REG_ROOT" ]] || { echo "t3-up: refusing registry $REG_ROOT (not owned by us, or a symlink)" >&2; exit 1; }
+chmod 700 "$REG_ROOT"
 # Marker proving this dir IS a t3 registry — t3-down refuses to touch any
 # directory tree without it (guards a mis-set T3_EPHEMERAL_REGISTRY).
 touch "$REG_ROOT/.t3-ephemeral-registry"
@@ -76,6 +78,10 @@ if [[ -e "$REG/instance.env" ]]; then
   echo "t3-up: cleaning stale instance '$NAME'" >&2
   safe_ephemeral_home "$old_home" && rm -rf "$old_home"
   rm -rf "$REG"
+elif [[ -e "$REG" ]]; then
+  # Not something t3-up created (no instance.env): never adopt or delete it.
+  echo "t3-up: $REG exists but is not a t3 instance; remove it yourself or pick another --name" >&2
+  exit 1
 fi
 
 if [[ "$ENTRY" == "apps/server/dist/bin.mjs" && ! -f "$ENTRY" ]]; then
@@ -86,11 +92,22 @@ fi
 
 T3_HOME="$(mktemp -d "/tmp/t3-ephemeral-XXXXXX")"
 SRV_PID=""
-fail() {
-  [[ -n "$SRV_PID" ]] && { kill "$SRV_PID" 2>/dev/null || true; wait "$SRV_PID" 2>/dev/null || true; }
+REGISTERED=0
+# Until instance.env is registered, t3-down.sh cannot discover this instance —
+# so any early exit (error, INT/TERM, caller timeout) must reap the server and
+# temp home here. Disarmed once registration succeeds.
+cleanup_on_abort() {
+  [[ "$REGISTERED" == "1" ]] && return 0
+  if [[ -n "$SRV_PID" ]]; then
+    kill -- "-$SRV_PID" 2>/dev/null || kill "$SRV_PID" 2>/dev/null || true
+    wait "$SRV_PID" 2>/dev/null || true
+  fi
   rm -rf "$T3_HOME"
-  exit 1
 }
+trap cleanup_on_abort EXIT
+trap 'cleanup_on_abort; exit 130' INT
+trap 'cleanup_on_abort; exit 143' TERM
+fail() { exit 1; }
 
 PORT=""
 ready=0
@@ -156,6 +173,9 @@ export T3_PID="$SRV_PID"
 export T3_ENTRY="$ENTRY"
 EOF
 ln -sfn "$T3_HOME" "$REG/home"
+# Registered: t3-down.sh owns the lifecycle from here on.
+REGISTERED=1
+trap - EXIT INT TERM
 
 echo "t3-up: ready name=$NAME pid=$SRV_PID port=$PORT home=$T3_HOME" >&2
 echo "t3-up: web UI at $T3_ORIGIN (pair via e2e/ui.mjs or auth pairing create)" >&2

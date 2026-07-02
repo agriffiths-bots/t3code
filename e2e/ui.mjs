@@ -30,7 +30,7 @@ export function mintPairingToken({
   const out = NodeChildProcess.execFileSync(
     "node",
     [
-      NodePath.join(repoRoot, entry),
+      NodePath.isAbsolute(entry) ? entry : NodePath.join(repoRoot, entry),
       "auth",
       "pairing",
       "create",

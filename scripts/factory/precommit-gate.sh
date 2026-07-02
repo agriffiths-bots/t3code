@@ -93,13 +93,17 @@ fi
 
 command -v jq >/dev/null || { echo "factory-gate: jq is required" >&2; exit 2; }
 
-audit() { # audit <verdict> <detail-json-object>
-  mkdir -p "$(dirname "$FACTORY_AUDIT_LOG")"
+audit() { # audit <verdict> <detail-json-object> — the gate's guarantees are
+  # audit-backed, so an unwritable audit log FAILS the gate (never fail-open).
+  mkdir -p "$(dirname "$FACTORY_AUDIT_LOG")" 2>/dev/null
   jq -cn --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg repo "$REPO_ROOT" \
     --arg branch "$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo '?')" \
     --arg mode "$MODE" --arg verdict "$1" --argjson detail "$2" \
     '{ts:$ts,kind:"factory_precommit",repo:$repo,branch:$branch,mode:$mode,verdict:$verdict}+$detail' \
-    >> "$FACTORY_AUDIT_LOG"
+    >> "$FACTORY_AUDIT_LOG" || {
+      echo "factory-gate: FATAL — cannot append to audit log $FACTORY_AUDIT_LOG; refusing" >&2
+      exit 2
+    }
 }
 
 refuse() { # refuse <short> <verdict> <detail-json>
