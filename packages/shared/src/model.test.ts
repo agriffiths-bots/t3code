@@ -242,7 +242,11 @@ describe("pickModelSelectionFromInstances", () => {
   ): ProviderModelSource => ({
     instanceId: ProviderInstanceId.make(id),
     driverKind: ProviderDriverKind.make(driver),
-    models: slugs.map((slug) => ({ slug, defaultOptions: undefined })),
+    models: slugs.map((slug) => ({
+      slug,
+      defaultOptions: undefined,
+      optionDescriptors: undefined,
+    })),
   });
 
   // Mirrors what the runtime registry reports (each provider's live models).
@@ -336,6 +340,7 @@ describe("pickModelSelectionFromInstances", () => {
               { id: "effort", value: "high" },
               { id: "fastMode", value: true },
             ],
+            optionDescriptors: undefined,
           },
         ],
       },
@@ -362,6 +367,17 @@ describe("pickModelSelectionFromInstances", () => {
               { id: "reasoningEffort", value: "medium" },
               { id: "serviceTier", value: "fast" },
             ],
+            optionDescriptors: [
+              {
+                id: "reasoningEffort",
+                label: "Reasoning",
+                type: "select",
+                options: [
+                  { id: "medium", label: "Medium" },
+                  { id: "xhigh", label: "Extra High" },
+                ],
+              },
+            ],
           },
         ],
       },
@@ -369,9 +385,51 @@ describe("pickModelSelectionFromInstances", () => {
         instanceId: ProviderInstanceId.make("claudeAgent"),
         driverKind: ProviderDriverKind.make("claudeAgent"),
         models: [
-          { slug: "claude-opus-4-8", defaultOptions: [{ id: "effort", value: "high" }] },
-          { slug: "claude-sonnet-5", defaultOptions: [{ id: "effort", value: "medium" }] },
-          { slug: "claude-fable-5", defaultOptions: [{ id: "effort", value: "xhigh" }] },
+          {
+            slug: "claude-opus-4-8",
+            defaultOptions: [{ id: "effort", value: "high" }],
+            optionDescriptors: [
+              {
+                id: "effort",
+                label: "Reasoning",
+                type: "select",
+                options: [
+                  { id: "high", label: "High" },
+                  { id: "xhigh", label: "Extra High" },
+                ],
+              },
+            ],
+          },
+          {
+            slug: "claude-sonnet-5",
+            defaultOptions: [{ id: "effort", value: "medium" }],
+            optionDescriptors: [
+              {
+                id: "effort",
+                label: "Reasoning",
+                type: "select",
+                options: [
+                  { id: "medium", label: "Medium" },
+                  { id: "xhigh", label: "Extra High" },
+                ],
+              },
+            ],
+          },
+          {
+            slug: "claude-fable-5",
+            defaultOptions: [{ id: "effort", value: "xhigh" }],
+            optionDescriptors: [
+              {
+                id: "effort",
+                label: "Reasoning",
+                type: "select",
+                options: [
+                  { id: "high", label: "High" },
+                  { id: "xhigh", label: "Extra High" },
+                ],
+              },
+            ],
+          },
         ],
       },
     ];
@@ -413,6 +471,17 @@ describe("pickModelSelectionFromInstances", () => {
               { id: "reasoning", value: "medium" },
               { id: "contextWindow", value: "1m" },
             ],
+            optionDescriptors: [
+              {
+                id: "reasoning",
+                label: "Reasoning",
+                type: "select",
+                options: [
+                  { id: "medium", label: "Medium" },
+                  { id: "xhigh", label: "Extra High" },
+                ],
+              },
+            ],
           },
         ],
       },
@@ -433,7 +502,18 @@ describe("pickModelSelectionFromInstances", () => {
         models: [
           {
             slug: "claude-opus-4-8",
-            defaultOptions: [{ id: "contextWindow", value: "1m" }],
+            defaultOptions: [
+              { id: "reasoning", value: "medium" },
+              { id: "contextWindow", value: "1m" },
+            ],
+            optionDescriptors: [
+              {
+                id: "reasoning",
+                label: "Reasoning",
+                type: "select",
+                options: [{ id: "medium", label: "Medium" }],
+              },
+            ],
           },
         ],
       },
@@ -441,7 +521,10 @@ describe("pickModelSelectionFromInstances", () => {
     expect(pickModelSelectionFromInstances("claude-opus-4-8", withoutAdvertisedEffort)).toEqual({
       instanceId: "cursor",
       model: "claude-opus-4-8",
-      options: [{ id: "contextWindow", value: "1m" }],
+      options: [
+        { id: "reasoning", value: "medium" },
+        { id: "contextWindow", value: "1m" },
+      ],
     });
   });
 

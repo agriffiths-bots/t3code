@@ -305,6 +305,7 @@ export function resolveModelSlugForProvider(
 export interface ProviderModelEntry {
   readonly slug: string;
   readonly defaultOptions: ReadonlyArray<ProviderOptionSelection> | undefined;
+  readonly optionDescriptors: ReadonlyArray<ProviderOptionDescriptor> | undefined;
 }
 
 /**
@@ -333,8 +334,14 @@ function makeModelSelection(
   driverKind: ProviderDriverKind,
   slug: string,
   defaultOptions: ReadonlyArray<ProviderOptionSelection> | undefined,
+  optionDescriptors: ReadonlyArray<ProviderOptionDescriptor> | undefined,
 ): ModelSelection {
-  const options = applyThreadCreationDefaultEffort(driverKind, slug, defaultOptions);
+  const options = applyThreadCreationDefaultEffort(
+    driverKind,
+    slug,
+    defaultOptions,
+    optionDescriptors,
+  );
   // Preserve provider defaults and layer T3's plain-model thread-creation
   // effort defaults on top; omit options when there are none.
   return options && options.length > 0
@@ -359,10 +366,15 @@ function applyThreadCreationDefaultEffort(
   driverKind: ProviderDriverKind,
   slug: string,
   defaultOptions: ReadonlyArray<ProviderOptionSelection> | undefined,
+  optionDescriptors: ReadonlyArray<ProviderOptionDescriptor> | undefined,
 ): Array<ProviderOptionSelection> | undefined {
   const directedValue = THREAD_CREATION_DEFAULT_EFFORT_BY_MODEL[slug];
   const optionId = THREAD_CREATION_EFFORT_OPTION_BY_DRIVER[driverKind];
-  if (!directedValue || !optionId) {
+  if (
+    !directedValue ||
+    !optionId ||
+    !isThreadCreationEffortAdvertised(optionDescriptors, optionId, directedValue)
+  ) {
     return defaultOptions && defaultOptions.length > 0
       ? defaultOptions.map(cloneSelection)
       : undefined;
@@ -376,6 +388,15 @@ function applyThreadCreationDefaultEffort(
   }
   next[existingIndex] = { ...next[existingIndex]!, value: directedValue };
   return next;
+}
+
+function isThreadCreationEffortAdvertised(
+  optionDescriptors: ReadonlyArray<ProviderOptionDescriptor> | undefined,
+  optionId: string,
+  value: string,
+): boolean {
+  const descriptor = optionDescriptors?.find((candidate) => candidate.id === optionId);
+  return descriptor?.type === "select" && descriptor.options.some((option) => option.id === value);
 }
 
 /**
@@ -411,7 +432,13 @@ export function pickModelSelectionFromInstances(
       .sort((a, b) => rank(a) - rank(b))[0];
     if (best === undefined) return null;
     const entry = best.models.find((candidate) => candidate.slug === slug);
-    return makeModelSelection(best.instanceId, best.driverKind, slug, entry?.defaultOptions);
+    return makeModelSelection(
+      best.instanceId,
+      best.driverKind,
+      slug,
+      entry?.defaultOptions,
+      entry?.optionDescriptors,
+    );
   };
 
   // 1. Direct match against the models each provider actually serves.

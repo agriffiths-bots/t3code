@@ -216,7 +216,11 @@ const makeModelInstance = (
                     id: entry.optionId,
                     label: "Reasoning",
                     type: "select" as const,
-                    options: [{ id: entry.value, label: entry.value, isDefault: true }],
+                    options: ["low", "medium", "high", "xhigh", "max"].map((value) => ({
+                      id: value,
+                      label: value,
+                      ...(value === entry.value ? { isDefault: true } : {}),
+                    })),
                     currentValue: entry.value,
                   },
                 ],
