@@ -94,7 +94,19 @@ const TestCryptoLive = Layer.sync(Crypto.Crypto, () => {
   });
 });
 
-const makeModelInstance = (instanceId: string, driverKind: string, slugs: ReadonlyArray<string>) =>
+type ModelFixture =
+  | string
+  | {
+      readonly slug: string;
+      readonly optionId: string;
+      readonly value: string;
+    };
+
+const makeModelInstance = (
+  instanceId: string,
+  driverKind: string,
+  models: ReadonlyArray<ModelFixture>,
+) =>
   ({
     instanceId: ProviderInstanceId.make(instanceId),
     driverKind: ProviderDriverKind.make(driverKind),
@@ -102,7 +114,24 @@ const makeModelInstance = (instanceId: string, driverKind: string, slugs: Readon
     snapshot: {
       getSnapshot: Effect.succeed({
         status: "ready",
-        models: slugs.map((slug) => ({ slug, capabilities: null })),
+        models: models.map((entry) =>
+          typeof entry === "string"
+            ? { slug: entry, capabilities: null }
+            : {
+                slug: entry.slug,
+                capabilities: {
+                  optionDescriptors: [
+                    {
+                      id: entry.optionId,
+                      label: "Reasoning",
+                      type: "select" as const,
+                      options: [{ id: entry.value, label: entry.value, isDefault: true }],
+                      currentValue: entry.value,
+                    },
+                  ],
+                },
+              },
+        ),
       }),
     },
   }) as unknown as ProviderInstance;
@@ -261,7 +290,11 @@ it.effect("applies directive default effort when resolving a plain model", () =>
     const result = yield* callStartTool(
       { prompt: "Investigate flaky tests", model: "claude-opus-4-8" },
       commands,
-      [makeModelInstance("claudeAgent", "claudeAgent", ["claude-opus-4-8"])],
+      [
+        makeModelInstance("claudeAgent", "claudeAgent", [
+          { slug: "claude-opus-4-8", optionId: "effort", value: "high" },
+        ]),
+      ],
     );
 
     expect(result.isError).toBe(false);

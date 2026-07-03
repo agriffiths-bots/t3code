@@ -184,12 +184,20 @@ const makeScheduledTask = (modelSelection: ModelSelection | null): ScheduledTask
   createdAt: IsoDateTime.make("2026-06-17T09:00:00.000Z"),
 });
 
+type ModelFixture =
+  | string
+  | {
+      readonly slug: string;
+      readonly optionId: string;
+      readonly value: string;
+    };
+
 // A minimal provider instance exposing just what buildModelSources reads: an id,
 // a driver kind, enabled=true, and a snapshot whose models list the given slugs.
 const makeModelInstance = (
   instanceId: string,
   driverKind: string,
-  slugs: ReadonlyArray<string>,
+  models: ReadonlyArray<ModelFixture>,
 ) => ({
   instanceId: ProviderInstanceId.make(instanceId),
   driverKind,
@@ -197,7 +205,24 @@ const makeModelInstance = (
   snapshot: {
     getSnapshot: Effect.succeed({
       status: "ready",
-      models: slugs.map((slug) => ({ slug, capabilities: null })),
+      models: models.map((entry) =>
+        typeof entry === "string"
+          ? { slug: entry, capabilities: null }
+          : {
+              slug: entry.slug,
+              capabilities: {
+                optionDescriptors: [
+                  {
+                    id: entry.optionId,
+                    label: "Reasoning",
+                    type: "select" as const,
+                    options: [{ id: entry.value, label: entry.value, isDefault: true }],
+                    currentValue: entry.value,
+                  },
+                ],
+              },
+            },
+      ),
     }),
   },
 });
@@ -559,7 +584,10 @@ describe("SubagentToolkit", () => {
         // priority must win (claudeAgent, not cursor) with no hardcoded names.
         modelInstances = [
           makeModelInstance("cursor", "cursor", ["claude-opus-4-8", "auto"]),
-          makeModelInstance("claudeAgent", "claudeAgent", ["claude-opus-4-8", "claude-sonnet-4-6"]),
+          makeModelInstance("claudeAgent", "claudeAgent", [
+            { slug: "claude-opus-4-8", optionId: "effort", value: "high" },
+            "claude-sonnet-4-6",
+          ]),
         ];
 
         const result = yield* server
@@ -602,11 +630,13 @@ describe("SubagentToolkit", () => {
         const server = yield* McpServer.McpServer;
         insertedTasks.length = 0;
         modelInstances = [
-          makeModelInstance("codex", "codex", ["gpt-5.5"]),
+          makeModelInstance("codex", "codex", [
+            { slug: "gpt-5.5", optionId: "reasoningEffort", value: "medium" },
+          ]),
           makeModelInstance("claudeAgent", "claudeAgent", [
-            "claude-opus-4-8",
-            "claude-sonnet-5",
-            "claude-fable-5",
+            { slug: "claude-opus-4-8", optionId: "effort", value: "high" },
+            { slug: "claude-sonnet-5", optionId: "effort", value: "medium" },
+            { slug: "claude-fable-5", optionId: "effort", value: "xhigh" },
           ]),
         ];
 

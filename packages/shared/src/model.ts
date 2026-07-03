@@ -330,10 +330,11 @@ function providerPriorityIndex(driver: ProviderDriverKind): number {
 
 function makeModelSelection(
   instanceId: ProviderInstanceId,
+  driverKind: ProviderDriverKind,
   slug: string,
   defaultOptions: ReadonlyArray<ProviderOptionSelection> | undefined,
 ): ModelSelection {
-  const options = applyThreadCreationDefaultEffort(slug, defaultOptions);
+  const options = applyThreadCreationDefaultEffort(driverKind, slug, defaultOptions);
   // Preserve provider defaults and layer T3's plain-model thread-creation
   // effort defaults on top; omit options when there are none.
   return options && options.length > 0
@@ -341,22 +342,27 @@ function makeModelSelection(
     : { instanceId, model: slug };
 }
 
-const THREAD_CREATION_DEFAULT_EFFORT_BY_MODEL: Record<
-  string,
-  { readonly optionId: string; readonly value: string }
-> = {
-  "gpt-5.5": { optionId: "reasoningEffort", value: "xhigh" },
-  "claude-opus-4-8": { optionId: "effort", value: "xhigh" },
-  "claude-sonnet-5": { optionId: "effort", value: "xhigh" },
-  "claude-fable-5": { optionId: "effort", value: "high" },
+const THREAD_CREATION_DEFAULT_EFFORT_BY_MODEL: Record<string, string> = {
+  "gpt-5.5": "xhigh",
+  "claude-opus-4-8": "xhigh",
+  "claude-sonnet-5": "xhigh",
+  "claude-fable-5": "high",
+};
+
+const THREAD_CREATION_EFFORT_OPTION_BY_DRIVER: Record<string, string> = {
+  codex: "reasoningEffort",
+  claudeAgent: "effort",
+  cursor: "reasoning",
 };
 
 function applyThreadCreationDefaultEffort(
+  driverKind: ProviderDriverKind,
   slug: string,
   defaultOptions: ReadonlyArray<ProviderOptionSelection> | undefined,
 ): Array<ProviderOptionSelection> | undefined {
-  const directed = THREAD_CREATION_DEFAULT_EFFORT_BY_MODEL[slug];
-  if (!directed) {
+  const directedValue = THREAD_CREATION_DEFAULT_EFFORT_BY_MODEL[slug];
+  const optionId = THREAD_CREATION_EFFORT_OPTION_BY_DRIVER[driverKind];
+  if (!directedValue || !optionId) {
     return defaultOptions && defaultOptions.length > 0
       ? defaultOptions.map(cloneSelection)
       : undefined;
@@ -364,12 +370,11 @@ function applyThreadCreationDefaultEffort(
 
   const next =
     defaultOptions && defaultOptions.length > 0 ? defaultOptions.map(cloneSelection) : [];
-  const existingIndex = next.findIndex((selection) => selection.id === directed.optionId);
-  if (existingIndex >= 0) {
-    next[existingIndex] = { ...next[existingIndex]!, value: directed.value };
-  } else {
-    next.push({ id: directed.optionId, value: directed.value });
+  const existingIndex = next.findIndex((selection) => selection.id === optionId);
+  if (existingIndex < 0) {
+    return next.length > 0 ? next : undefined;
   }
+  next[existingIndex] = { ...next[existingIndex]!, value: directedValue };
   return next;
 }
 
@@ -406,7 +411,7 @@ export function pickModelSelectionFromInstances(
       .sort((a, b) => rank(a) - rank(b))[0];
     if (best === undefined) return null;
     const entry = best.models.find((candidate) => candidate.slug === slug);
-    return makeModelSelection(best.instanceId, slug, entry?.defaultOptions);
+    return makeModelSelection(best.instanceId, best.driverKind, slug, entry?.defaultOptions);
   };
 
   // 1. Direct match against the models each provider actually serves.
