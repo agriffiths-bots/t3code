@@ -1,0 +1,2 @@
+#!/usr/bin/env bash
+exec node "$(git -C "$(dirname "${BASH_SOURCE[0]}")" rev-parse --show-toplevel)/scripts/ops/daily-restart/inject-resume.ts" "$@"
