@@ -570,7 +570,15 @@ interface StagePackageJson {
 }
 
 export const STAGE_INSTALL_ARGS = ["install", "--prod"] as const;
-export const DESKTOP_ASAR_UNPACK = ["node_modules/@ff-labs/fff-bin-*/**/*"] as const;
+export const DESKTOP_MAIN_PROCESS_ASAR_UNPACK = [
+  "node_modules/effect/**/*",
+  "node_modules/fast-check/**/*",
+  "node_modules/pure-rand/**/*",
+] as const;
+export const DESKTOP_ASAR_UNPACK = [
+  ...DESKTOP_MAIN_PROCESS_ASAR_UNPACK,
+  "node_modules/@ff-labs/fff-bin-*/**/*",
+] as const;
 
 export interface MacPasskeySigningConfiguration {
   readonly appId: string;
@@ -1369,7 +1377,9 @@ export const createBuildConfig = Effect.fn("createBuildConfig")(function* (
     // node_modules tree so every import resolves (this also covers the fff native
     // binaries in DESKTOP_ASAR_UNPACK). The Windows primary keeps reading the same
     // files through the asar (transparently redirected to the unpacked copy), so
-    // there's no duplication.
+    // there's no duplication. Keep Effect's fast-check/pure-rand chain explicit
+    // because pure-rand's ESM files use extensionless relative imports that Node
+    // cannot resolve from inside app.asar during desktop main-process startup.
     asarUnpack: [...DESKTOP_ASAR_UNPACK, "apps/server/dist/**", "**/node_modules/**"],
   };
   const updateChannel = resolveDesktopUpdateChannel(version);
