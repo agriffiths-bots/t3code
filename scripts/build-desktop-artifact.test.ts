@@ -13,6 +13,7 @@ import {
   createStageWorkspaceConfig,
   createStagePnpmConfig,
   createBuildConfig,
+  DESKTOP_MAIN_PROCESS_ASAR_UNPACK,
   DESKTOP_ASAR_UNPACK,
   InvalidMacPasskeyRpDomainError,
   InvalidMacPasskeyPublishableKeyError,
@@ -234,8 +235,39 @@ it.layer(NodeServices.layer)("build-desktop-artifact", (it) => {
     });
   });
 
+  it("unpacks desktop main-process packages that require real filesystem ESM resolution", () => {
+    assert.deepStrictEqual(DESKTOP_MAIN_PROCESS_ASAR_UNPACK, [
+      "node_modules/effect/**/*",
+      "node_modules/fast-check/**/*",
+      "node_modules/pure-rand/**/*",
+    ]);
+    assert.includeMembers([...DESKTOP_ASAR_UNPACK], [...DESKTOP_MAIN_PROCESS_ASAR_UNPACK]);
+  });
+
+  it.effect("keeps all staged node_modules unpacked for packaged desktop runtime imports", () =>
+    Effect.gen(function* () {
+      const config = yield* createBuildConfig(
+        "win",
+        "nsis",
+        "1.2.3",
+        false,
+        false,
+        undefined,
+        undefined,
+      );
+
+      const asarUnpack = config.asarUnpack as string[];
+      assert.includeMembers(asarUnpack, [
+        ...DESKTOP_MAIN_PROCESS_ASAR_UNPACK,
+        "node_modules/@ff-labs/fff-bin-*/**/*",
+        "apps/server/dist/**",
+        "**/node_modules/**",
+      ]);
+    }).pipe(Effect.provide(ConfigProvider.layer(ConfigProvider.fromEnv({ env: {} })))),
+  );
+
   it("unpacks the fff shared library for filesystem and FFI access", () => {
-    assert.deepStrictEqual(DESKTOP_ASAR_UNPACK, ["node_modules/@ff-labs/fff-bin-*/**/*"]);
+    assert.includeMembers([...DESKTOP_ASAR_UNPACK], ["node_modules/@ff-labs/fff-bin-*/**/*"]);
   });
 
   it.effect("preserves both Linux icon resize failures with structural context", () => {
