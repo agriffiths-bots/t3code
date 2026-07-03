@@ -47,6 +47,30 @@ describe("remote", () => {
     });
   });
 
+  it("carries Cloudflare Access service tokens from pairing urls", () => {
+    expect(
+      resolveRemotePairingTarget({
+        pairingUrl:
+          "https://remote.example.com/pair#token=pairing-token&cf_access_client_id=client-id&cf_access_client_secret=client-secret",
+      }),
+    ).toMatchObject({
+      credential: "pairing-token",
+      cloudflareAccessClientId: "client-id",
+      cloudflareAccessClientSecret: "client-secret",
+      httpBaseUrl: "https://remote.example.com/",
+      wsBaseUrl: "wss://remote.example.com/",
+    });
+  });
+
+  it("rejects incomplete Cloudflare Access service tokens", () => {
+    expect(() =>
+      resolveRemotePairingTarget({
+        pairingUrl:
+          "https://remote.example.com/pair#token=pairing-token&cf_access_client_id=client-id",
+      }),
+    ).toThrowError(RemotePairingUrlInvalidError);
+  });
+
   it("derives backend urls from hosted app pairing links", () => {
     expect(
       resolveRemotePairingTarget({

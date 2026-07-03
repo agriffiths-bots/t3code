@@ -19,6 +19,7 @@ import {
   ConnectionBlockedError,
   ConnectionTransientError as ConnectionTransientErrorClass,
 } from "../connection/model.ts";
+import { canPassWebSocketHeaderOptions } from "../platform/capabilities.ts";
 
 const SOCKET_OPEN_TIMEOUT = "15 seconds";
 
@@ -50,12 +51,6 @@ type HeaderOptionsWebSocketConstructor = {
     options?: { readonly headers?: Readonly<Record<string, string>> },
   ): globalThis.WebSocket;
 };
-
-function canPassWebSocketHeaderOptions() {
-  const navigatorProduct = (globalThis.navigator as { readonly product?: string } | undefined)
-    ?.product;
-  return navigatorProduct === "ReactNative" || !("window" in globalThis);
-}
 
 function mapInitialConfigError(error: InitialConfigError): ConnectionAttemptError {
   switch (error._tag) {
@@ -107,7 +102,7 @@ export const make = Effect.gen(function* () {
     });
     const socketHeaders = connection.socketHeaders;
     const socketConstructor =
-      socketHeaders === undefined || !canPassWebSocketHeaderOptions()
+      socketHeaders === undefined || !canPassWebSocketHeaderOptions(webSocketConstructor)
         ? webSocketConstructor
         : (((url: string | URL, protocols?: string | string[]) =>
             new (webSocketConstructor as unknown as HeaderOptionsWebSocketConstructor)(

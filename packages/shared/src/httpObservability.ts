@@ -4,5 +4,11 @@ import * as Headers from "effect/unstable/http/Headers";
 
 export const httpHeaderRedactionLayer = Layer.effect(
   Headers.CurrentRedactedNames,
-  Effect.map(Headers.CurrentRedactedNames, (names) => [...names, "dpop"]),
+  Effect.map(Headers.CurrentRedactedNames, (names) => [
+    ...names,
+    "cf-access-client-id",
+    "cf-access-client-secret",
+    "cf-access-jwt-assertion",
+    "dpop",
+  ]),
 );

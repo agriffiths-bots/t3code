@@ -44,12 +44,16 @@ import {
 const OptionalBearerHeaders = Schema.Struct({
   authorization: Schema.optionalKey(Schema.String),
   "cf-access-jwt-assertion": Schema.optionalKey(Schema.String),
+  "cf-access-client-id": Schema.optionalKey(Schema.String),
+  "cf-access-client-secret": Schema.optionalKey(Schema.String),
   cookie: Schema.optionalKey(Schema.String),
   dpop: Schema.optionalKey(Schema.String),
 });
 
 const OptionalDpopProofHeaders = Schema.Struct({
   "cf-access-jwt-assertion": Schema.optionalKey(Schema.String),
+  "cf-access-client-id": Schema.optionalKey(Schema.String),
+  "cf-access-client-secret": Schema.optionalKey(Schema.String),
   cookie: Schema.optionalKey(Schema.String),
   dpop: Schema.optionalKey(Schema.String),
 });

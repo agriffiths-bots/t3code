@@ -7,6 +7,7 @@ import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Ref from "effect/Ref";
 import * as Tracer from "effect/Tracer";
+import { afterEach, vi } from "vite-plus/test";
 
 import * as ManagedRelay from "../relay/managedRelay.ts";
 import * as ConnectionResolver from "./resolver.ts";
@@ -43,6 +44,17 @@ const SSH_TARGET: DesktopSshEnvironmentTarget = {
   username: "developer",
   port: 22,
 };
+
+afterEach(() => {
+  vi.unstubAllGlobals();
+});
+
+function enableHeaderCapableWebSocketRuntime() {
+  vi.stubGlobal(
+    "WebSocket",
+    ClientCapabilities.markWebSocketHeaderOptionsCapable(function WebSocket() {}),
+  );
+}
 
 function catalogEntry(
   target: ConnectionTarget,
@@ -296,6 +308,108 @@ describe("ConnectionResolver", () => {
       ).toContain("wsTicket=ticket");
       expect(yield* Ref.get(bearerInputs)).toEqual(["secret-bearer"]);
     }),
+  );
+
+  it.effect("passes Cloudflare Access service-token credentials during bearer authorization", () =>
+    Effect.gen(function* () {
+      enableHeaderCapableWebSocketRuntime();
+      const accessInputs = yield* Ref.make<ReadonlyArray<unknown>>([]);
+      const target = new BearerConnectionTarget({
+        environmentId: ENVIRONMENT_ID,
+        label: "Saved",
+        connectionId: "saved-1",
+      });
+      const profile = new BearerConnectionProfile({
+        connectionId: "saved-1",
+        environmentId: ENVIRONMENT_ID,
+        label: "Saved",
+        httpBaseUrl: ENDPOINT.httpBaseUrl,
+        wsBaseUrl: ENDPOINT.wsBaseUrl,
+      });
+      const brokerLayer = yield* makeDependencies({
+        credentials: [
+          [
+            "saved-1",
+            new BearerConnectionCredential({
+              token: "secret-bearer",
+              cloudflareAccessClientId: "client-id",
+              cloudflareAccessClientSecret: "client-secret",
+            }),
+          ],
+        ],
+        authorizeBearer: (input) =>
+          Ref.update(accessInputs, (values) => [...values, input.cloudflareAccess]).pipe(
+            Effect.as({
+              environmentId: input.expectedEnvironmentId,
+              label: "Saved",
+              httpBaseUrl: input.httpBaseUrl,
+              socketUrl: "wss://environment.example.test/ws?wsTicket=ticket",
+              httpAuthorization: {
+                _tag: "Bearer" as const,
+                token: input.bearerToken,
+              },
+            }),
+          ),
+      });
+      const broker = yield* ConnectionResolver.ConnectionResolver.pipe(Effect.provide(brokerLayer));
+
+      yield* broker.prepare(catalogEntry(target, Option.some(profile)));
+
+      expect(yield* Ref.get(accessInputs)).toEqual([
+        {
+          _tag: "service-token",
+          clientId: "client-id",
+          clientSecret: "client-secret",
+        },
+      ]);
+    }),
+  );
+
+  it.effect(
+    "blocks saved Cloudflare Access service-token credentials in browser websocket runtimes",
+    () =>
+      Effect.gen(function* () {
+        vi.stubGlobal("window", {});
+        vi.stubGlobal("navigator", { product: "Gecko" });
+        const target = new BearerConnectionTarget({
+          environmentId: ENVIRONMENT_ID,
+          label: "Saved",
+          connectionId: "saved-1",
+        });
+        const profile = new BearerConnectionProfile({
+          connectionId: "saved-1",
+          environmentId: ENVIRONMENT_ID,
+          label: "Saved",
+          httpBaseUrl: ENDPOINT.httpBaseUrl,
+          wsBaseUrl: ENDPOINT.wsBaseUrl,
+        });
+        const brokerLayer = yield* makeDependencies({
+          credentials: [
+            [
+              "saved-1",
+              new BearerConnectionCredential({
+                token: "secret-bearer",
+                cloudflareAccessClientId: "client-id",
+                cloudflareAccessClientSecret: "client-secret",
+              }),
+            ],
+          ],
+          authorizeBearer: () => Effect.die("authorizeBearer should not be called"),
+        });
+        const broker = yield* ConnectionResolver.ConnectionResolver.pipe(
+          Effect.provide(brokerLayer),
+        );
+
+        const error = yield* broker
+          .prepare(catalogEntry(target, Option.some(profile)))
+          .pipe(Effect.flip);
+
+        expect(error).toMatchObject({
+          _tag: "ConnectionBlockedError",
+          reason: "unsupported",
+          message: expect.stringContaining("WebSocket headers"),
+        });
+      }),
   );
 
   it.effect("brokers relay credentials with the current cloud session and device identity", () =>

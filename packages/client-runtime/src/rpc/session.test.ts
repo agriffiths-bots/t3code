@@ -19,6 +19,7 @@ import {
   PrimaryConnectionTarget,
   type PreparedConnection,
 } from "../connection/model.ts";
+import { markWebSocketHeaderOptionsCapable } from "../platform/capabilities.ts";
 import * as RpcSession from "./session.ts";
 
 type SocketEventType = "open" | "message" | "close" | "error";
@@ -147,16 +148,22 @@ const decodeRpcRequest = Schema.decodeUnknownSync(RpcRequest);
 const encodeJson = Schema.encodeUnknownSync(Schema.UnknownFromJsonString);
 const encodeServerConfig = Schema.encodeSync(ServerConfig);
 
-const makeFactory = Effect.fn("TestRpcSessionFactory.make")(function* () {
+const makeFactory = Effect.fn("TestRpcSessionFactory.make")(function* (options?: {
+  readonly headerOptionsCapable?: boolean;
+}) {
   const sockets: TestWebSocket[] = [];
   function TestWebSocketConstructor(url: string, protocols?: string | string[], options?: unknown) {
     const socket = new TestWebSocket(url, protocols, options);
     sockets.push(socket);
     return socket as unknown as globalThis.WebSocket;
   }
+  const webSocketConstructor =
+    options?.headerOptionsCapable === true
+      ? markWebSocketHeaderOptionsCapable(TestWebSocketConstructor)
+      : TestWebSocketConstructor;
   const constructorLayer = Layer.succeed(
     Socket.WebSocketConstructor,
-    TestWebSocketConstructor as unknown as (
+    webSocketConstructor as unknown as (
       url: string,
       protocols?: string | string[],
     ) => globalThis.WebSocket,
@@ -290,6 +297,53 @@ describe("RpcSessionFactory", () => {
       const socket = yield* awaitSocket(sockets);
 
       expect(socket.options).toBeUndefined();
+      socket.open();
+      yield* completeInitialConfig(socket);
+      yield* Fiber.join(readyFiber);
+    }),
+  );
+
+  it.effect(
+    "uses unmarked headless websocket constructors without non-standard header options",
+    () =>
+      Effect.gen(function* () {
+        const { factory, sockets } = yield* makeFactory();
+        const session = yield* factory.connect({
+          ...PREPARED,
+          socketHeaders: {
+            "cf-access-client-id": "client-id",
+            "cf-access-client-secret": "client-secret",
+          },
+        });
+        const readyFiber = yield* Effect.forkChild(session.ready);
+        const socket = yield* awaitSocket(sockets);
+
+        expect(socket.options).toBeUndefined();
+        socket.open();
+        yield* completeInitialConfig(socket);
+        yield* Fiber.join(readyFiber);
+      }),
+  );
+
+  it.effect("passes prepared socket headers to explicitly capable websocket constructors", () =>
+    Effect.gen(function* () {
+      const { factory, sockets } = yield* makeFactory({ headerOptionsCapable: true });
+      const session = yield* factory.connect({
+        ...PREPARED,
+        socketHeaders: {
+          "cf-access-client-id": "client-id",
+          "cf-access-client-secret": "client-secret",
+        },
+      });
+      const readyFiber = yield* Effect.forkChild(session.ready);
+      const socket = yield* awaitSocket(sockets);
+
+      expect(socket.options).toEqual({
+        headers: {
+          "cf-access-client-id": "client-id",
+          "cf-access-client-secret": "client-secret",
+        },
+      });
       socket.open();
       yield* completeInitialConfig(socket);
       yield* Fiber.join(readyFiber);

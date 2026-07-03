@@ -28,6 +28,8 @@ export default function ConnectionsNewRouteScreen() {
   const [hostInput, setHostInput] = useState("");
   const [codeInput, setCodeInput] = useState("");
   const [cloudflareAccessToken, setCloudflareAccessToken] = useState("");
+  const [cloudflareAccessClientId, setCloudflareAccessClientId] = useState("");
+  const [cloudflareAccessClientSecret, setCloudflareAccessClientSecret] = useState("");
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [isCloudflareAuthenticating, setIsCloudflareAuthenticating] = useState(false);
   const [showScanner, setShowScanner] = useState(params.mode === "scan_qr");
@@ -37,12 +39,23 @@ export default function ConnectionsNewRouteScreen() {
   const placeholderColor = useThemeColor("--color-placeholder");
 
   const connectDisabled = isSubmitting || hostInput.trim().length === 0;
+  const hasCloudflareAccessCredential =
+    cloudflareAccessToken.length > 0 ||
+    (cloudflareAccessClientId.length > 0 && cloudflareAccessClientSecret.length > 0);
 
   useEffect(() => {
-    const { host, code, cloudflareAccessToken } = parsePairingUrl(connectionPairingUrl);
+    const {
+      host,
+      code,
+      cloudflareAccessToken,
+      cloudflareAccessClientId,
+      cloudflareAccessClientSecret,
+    } = parsePairingUrl(connectionPairingUrl);
     setHostInput(host);
     setCodeInput(code);
     setCloudflareAccessToken(cloudflareAccessToken);
+    setCloudflareAccessClientId(cloudflareAccessClientId);
+    setCloudflareAccessClientSecret(cloudflareAccessClientSecret);
   }, [connectionPairingUrl]);
 
   useEffect(() => {
@@ -54,6 +67,8 @@ export default function ConnectionsNewRouteScreen() {
   const handleHostChange = useCallback((value: string) => {
     setHostInput(value);
     setCloudflareAccessToken("");
+    setCloudflareAccessClientId("");
+    setCloudflareAccessClientSecret("");
   }, []);
 
   const handleCodeChange = useCallback((value: string) => {
@@ -95,10 +110,18 @@ export default function ConnectionsNewRouteScreen() {
 
       try {
         const pairingUrl = extractPairingUrlFromQrPayload(data);
-        const { host, code, cloudflareAccessToken } = parsePairingUrl(pairingUrl);
+        const {
+          host,
+          code,
+          cloudflareAccessToken,
+          cloudflareAccessClientId,
+          cloudflareAccessClientSecret,
+        } = parsePairingUrl(pairingUrl);
         setHostInput(host);
         setCodeInput(code);
         setCloudflareAccessToken(cloudflareAccessToken);
+        setCloudflareAccessClientId(cloudflareAccessClientId);
+        setCloudflareAccessClientSecret(cloudflareAccessClientSecret);
         onChangeConnectionPairingUrl(pairingUrl);
         setShowScanner(false);
       } catch (error) {
@@ -120,6 +143,8 @@ export default function ConnectionsNewRouteScreen() {
     try {
       const token = await authenticateCloudflareAccess(hostInput);
       setCloudflareAccessToken(token);
+      setCloudflareAccessClientId("");
+      setCloudflareAccessClientSecret("");
       const pairingUrl = buildPairingUrl(hostInput, codeInput, token);
       onChangeConnectionPairingUrl(pairingUrl);
     } catch (error) {
@@ -135,7 +160,11 @@ export default function ConnectionsNewRouteScreen() {
   const handleSubmit = useCallback(async () => {
     setIsSubmitting(true);
 
-    const pairingUrl = buildPairingUrl(hostInput, codeInput, cloudflareAccessToken);
+    const pairingUrl = buildPairingUrl(hostInput, codeInput, {
+      token: cloudflareAccessToken,
+      clientId: cloudflareAccessClientId,
+      clientSecret: cloudflareAccessClientSecret,
+    });
     onChangeConnectionPairingUrl(pairingUrl);
     const result = await onConnectPress(pairingUrl);
     if (AsyncResult.isSuccess(result)) {
@@ -145,6 +174,8 @@ export default function ConnectionsNewRouteScreen() {
     }
   }, [
     cloudflareAccessToken,
+    cloudflareAccessClientId,
+    cloudflareAccessClientSecret,
     codeInput,
     hostInput,
     onChangeConnectionPairingUrl,
@@ -238,14 +269,14 @@ export default function ConnectionsNewRouteScreen() {
 
               <ConnectionSheetButton
                 icon={
-                  cloudflareAccessToken
+                  hasCloudflareAccessCredential
                     ? "person.crop.circle.badge.checkmark"
                     : "person.crop.circle"
                 }
                 label={
                   isCloudflareAuthenticating
                     ? "Signing in..."
-                    : cloudflareAccessToken
+                    : hasCloudflareAccessCredential
                       ? "Access authenticated"
                       : "Authenticate with Access"
                 }

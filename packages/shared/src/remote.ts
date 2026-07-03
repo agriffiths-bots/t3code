@@ -2,6 +2,8 @@ import * as Schema from "effect/Schema";
 
 const PAIRING_TOKEN_PARAM = "token";
 const CLOUDFLARE_ACCESS_TOKEN_PARAM = "cf_access_token";
+const CLOUDFLARE_ACCESS_CLIENT_ID_PARAM = "cf_access_client_id";
+const CLOUDFLARE_ACCESS_CLIENT_SECRET_PARAM = "cf_access_client_secret";
 const HOSTED_PAIRING_HOST_PARAM = "host";
 const HOSTED_PAIRING_LABEL_PARAM = "label";
 const SUPPORTED_REMOTE_BACKEND_PROTOCOLS = new Set(["http:", "https:", "ws:", "wss:"]);
@@ -135,6 +137,8 @@ export interface ResolvedRemotePairingTarget {
   readonly httpBaseUrl: string;
   readonly wsBaseUrl: string;
   readonly cloudflareAccessToken?: string;
+  readonly cloudflareAccessClientId?: string;
+  readonly cloudflareAccessClientSecret?: string;
 }
 
 export interface HostedPairingRequest {
@@ -163,6 +167,28 @@ export const getCloudflareAccessTokenFromUrl = (url: URL): string | null => {
   return searchToken.length > 0 ? searchToken : null;
 };
 
+const getParamFromUrl = (url: URL, key: string): string | null => {
+  const hashValue = readHashParams(url).get(key)?.trim() ?? "";
+  if (hashValue.length > 0) return hashValue;
+
+  const searchValue = url.searchParams.get(key)?.trim() ?? "";
+  return searchValue.length > 0 ? searchValue : null;
+};
+
+const getCloudflareAccessServiceTokenFromUrl = (
+  url: URL,
+): { readonly clientId: string; readonly clientSecret: string } | null => {
+  const clientId = getParamFromUrl(url, CLOUDFLARE_ACCESS_CLIENT_ID_PARAM);
+  const clientSecret = getParamFromUrl(url, CLOUDFLARE_ACCESS_CLIENT_SECRET_PARAM);
+  if (!clientId && !clientSecret) return null;
+  if (!clientId || !clientSecret) {
+    throw new RemotePairingUrlInvalidError({
+      cause: new Error("Cloudflare Access service tokens require both client id and secret."),
+    });
+  }
+  return { clientId, clientSecret };
+};
+
 export const stripPairingTokenFromUrl = (url: URL): URL => {
   const next = new URL(url.toString());
   const hashParams = readHashParams(next);
@@ -174,8 +200,18 @@ export const stripPairingTokenFromUrl = (url: URL): URL => {
     hashParams.delete(CLOUDFLARE_ACCESS_TOKEN_PARAM);
     next.hash = hashParams.toString();
   }
+  if (hashParams.has(CLOUDFLARE_ACCESS_CLIENT_ID_PARAM)) {
+    hashParams.delete(CLOUDFLARE_ACCESS_CLIENT_ID_PARAM);
+    next.hash = hashParams.toString();
+  }
+  if (hashParams.has(CLOUDFLARE_ACCESS_CLIENT_SECRET_PARAM)) {
+    hashParams.delete(CLOUDFLARE_ACCESS_CLIENT_SECRET_PARAM);
+    next.hash = hashParams.toString();
+  }
   next.searchParams.delete(PAIRING_TOKEN_PARAM);
   next.searchParams.delete(CLOUDFLARE_ACCESS_TOKEN_PARAM);
+  next.searchParams.delete(CLOUDFLARE_ACCESS_CLIENT_ID_PARAM);
+  next.searchParams.delete(CLOUDFLARE_ACCESS_CLIENT_SECRET_PARAM);
   return next;
 };
 
@@ -222,6 +258,7 @@ export const resolveRemotePairingTarget = (input: {
     }
     const hostedPairingRequest = readHostedPairingRequest(url);
     const cloudflareAccessToken = getCloudflareAccessTokenFromUrl(url) ?? undefined;
+    const cloudflareAccessServiceToken = getCloudflareAccessServiceTokenFromUrl(url) ?? undefined;
     if (hostedPairingRequest) {
       const hostedBackendUrl = normalizeRemoteBaseUrl(
         hostedPairingRequest.host,
@@ -232,6 +269,12 @@ export const resolveRemotePairingTarget = (input: {
         httpBaseUrl: toHttpBaseUrl(hostedBackendUrl),
         wsBaseUrl: toWsBaseUrl(hostedBackendUrl),
         ...(cloudflareAccessToken ? { cloudflareAccessToken } : {}),
+        ...(cloudflareAccessServiceToken
+          ? {
+              cloudflareAccessClientId: cloudflareAccessServiceToken.clientId,
+              cloudflareAccessClientSecret: cloudflareAccessServiceToken.clientSecret,
+            }
+          : {}),
       };
     }
 
@@ -244,6 +287,12 @@ export const resolveRemotePairingTarget = (input: {
       httpBaseUrl: toHttpBaseUrl(url),
       wsBaseUrl: toWsBaseUrl(url),
       ...(cloudflareAccessToken ? { cloudflareAccessToken } : {}),
+      ...(cloudflareAccessServiceToken
+        ? {
+            cloudflareAccessClientId: cloudflareAccessServiceToken.clientId,
+            cloudflareAccessClientSecret: cloudflareAccessServiceToken.clientSecret,
+          }
+        : {}),
     };
   }
 
