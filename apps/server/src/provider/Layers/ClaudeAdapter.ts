@@ -134,6 +134,7 @@ interface ClaudeTurnState {
   readonly assistantTextBlocks: Map<number, AssistantTextBlockState>;
   readonly assistantTextBlockOrder: Array<AssistantTextBlockState>;
   readonly capturedProposedPlanKeys: Set<string>;
+  readonly runtimeTaskIds: Set<string>;
   nextSyntheticAssistantBlockIndex: number;
 }
 
@@ -176,6 +177,13 @@ interface ClaudeTaskState {
   readonly blockedBy: Set<string>;
 }
 
+interface DeferredRuntimeTaskCompletion {
+  readonly turnId: TurnId;
+  readonly status: Extract<ProviderRuntimeTurnStatus, "completed">;
+  readonly errorMessage?: string;
+  readonly result?: SDKResultMessage;
+}
+
 interface ClaudeSessionContext {
   session: ProviderSession;
   readonly promptQueue: Queue.Queue<PromptQueueItem>;
@@ -194,6 +202,9 @@ interface ClaudeSessionContext {
   }>;
   readonly inFlightTools: Map<number, ToolInFlight>;
   readonly claudeTasks: Map<string, ClaudeTaskState>;
+  readonly activeRuntimeTasks: Set<string>;
+  readonly unownedRuntimeTaskIds: Set<string>;
+  deferredRuntimeTaskCompletion: DeferredRuntimeTaskCompletion | undefined;
   turnState: ClaudeTurnState | undefined;
   lastKnownContextWindow: number | undefined;
   lastKnownTokenUsage: ThreadTokenUsageSnapshot | undefined;
@@ -301,6 +312,25 @@ function resultErrorsText(result: SDKResultMessage): string {
   return "errors" in result && Array.isArray(result.errors)
     ? result.errors.join(" ").toLowerCase()
     : "";
+}
+
+function taskNotificationResultOrigin(
+  result: SDKResultMessage | undefined,
+): Record<string, unknown> | undefined {
+  const origin = (result as { readonly origin?: unknown } | undefined)?.origin;
+  if (
+    origin !== null &&
+    typeof origin === "object" &&
+    !Array.isArray(origin) &&
+    (origin as { readonly kind?: unknown }).kind === "task-notification"
+  ) {
+    return origin as Record<string, unknown>;
+  }
+  return undefined;
+}
+
+function isTaskNotificationResult(result: SDKResultMessage | undefined): boolean {
+  return taskNotificationResultOrigin(result) !== undefined;
 }
 
 function isInterruptedResult(result: SDKResultMessage): boolean {
@@ -756,11 +786,22 @@ function isPromotedSubagentWaitResult(
   result: Record<string, unknown> | undefined,
 ): boolean {
   const normalizedToolName = tool.toolName.toLowerCase();
+  const structuredContent = result?.structuredContent;
+  const structuredResult =
+    structuredContent !== null &&
+    typeof structuredContent === "object" &&
+    !Array.isArray(structuredContent)
+      ? (structuredContent as Record<string, unknown>)
+      : undefined;
+  const contentResult =
+    typeof result?.content === "string" ? parseJsonRecord(result.content) : undefined;
   return (
     (normalizedToolName === "t3_wait_subagent" ||
       normalizedToolName.endsWith("__t3_wait_subagent") ||
       normalizedToolName.includes("wait_subagent")) &&
-    result?.promoted === true
+    (result?.promoted === true ||
+      structuredResult?.promoted === true ||
+      contentResult?.promoted === true)
   );
 }
 
@@ -1775,6 +1816,7 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
     options?: {
       readonly rawMethod?: string;
       readonly rawPayload?: unknown;
+      readonly turnId?: TurnId | null;
     },
   ) {
     if (!usage) {
@@ -1786,6 +1828,7 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
       usage.totalProcessedTokens ?? context.lastKnownTotalProcessedTokens;
 
     const turnState = context.turnState;
+    const turnId = options?.turnId === null ? undefined : (options?.turnId ?? turnState?.turnId);
     const stamp = yield* makeEventStamp();
     yield* offerRuntimeEvent({
       type: "thread.token-usage.updated",
@@ -1793,7 +1836,7 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
       provider: PROVIDER,
       createdAt: stamp.createdAt,
       threadId: context.session.threadId,
-      ...(turnState ? { turnId: turnState.turnId } : {}),
+      ...(turnId ? { turnId } : {}),
       payload: {
         usage,
       },
@@ -1916,12 +1959,68 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
     });
   });
 
-  const completeTurn = Effect.fn("completeTurn")(function* (
+  const hasActiveRuntimeTasksForTurn = (
+    context: ClaudeSessionContext,
+    turnState: ClaudeTurnState,
+  ): boolean => {
+    for (const taskId of turnState.runtimeTaskIds) {
+      if (context.activeRuntimeTasks.has(taskId)) {
+        return true;
+      }
+    }
+    return false;
+  };
+
+  const retireRuntimeTasksForTurn = (
+    context: ClaudeSessionContext,
+    turnState: ClaudeTurnState,
+  ): void => {
+    for (const taskId of turnState.runtimeTaskIds) {
+      context.activeRuntimeTasks.delete(taskId);
+    }
+    turnState.runtimeTaskIds.clear();
+  };
+
+  const turnStateForRuntimeTask = (
+    context: ClaudeSessionContext,
+    taskId: string,
+  ): ClaudeTurnState | undefined => {
+    const turnState = context.turnState;
+    return turnState?.runtimeTaskIds.has(taskId) === true ? turnState : undefined;
+  };
+
+  const completeTurn: (
     context: ClaudeSessionContext,
     status: ProviderRuntimeTurnStatus,
     errorMessage?: string,
     result?: SDKResultMessage,
+    options?: { readonly deferRuntimeTasks?: boolean },
+  ) => Effect.Effect<boolean, ProviderAdapterError> = Effect.fn("completeTurn")(function* (
+    context: ClaudeSessionContext,
+    status: ProviderRuntimeTurnStatus,
+    errorMessage?: string,
+    result?: SDKResultMessage,
+    options?: { readonly deferRuntimeTasks?: boolean },
   ) {
+    const activeTurnState = context.turnState;
+    if (
+      (options?.deferRuntimeTasks ?? true) &&
+      status === "completed" &&
+      activeTurnState !== undefined &&
+      hasActiveRuntimeTasksForTurn(context, activeTurnState) &&
+      !isTaskNotificationResult(result) &&
+      (activeTurnState.synthetic !== true || result !== undefined)
+    ) {
+      context.deferredRuntimeTaskCompletion = {
+        turnId: activeTurnState.turnId,
+        status,
+        ...(errorMessage !== undefined ? { errorMessage } : {}),
+        ...(result !== undefined ? { result } : {}),
+      };
+      return false;
+    }
+    context.deferredRuntimeTaskCompletion = undefined;
+
     const resultContextWindow = maxClaudeContextWindowFromModelUsage(result?.modelUsage);
     if (resultContextWindow !== undefined) {
       context.lastKnownContextWindow = resultContextWindow;
@@ -2018,7 +2117,7 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
         },
         providerRefs: {},
       });
-      return;
+      return true;
     }
 
     for (const [index, tool] of context.inFlightTools.entries()) {
@@ -2095,6 +2194,7 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
     });
 
     const updatedAt = yield* nowIso;
+    retireRuntimeTasksForTurn(context, turnState);
     context.turnState = undefined;
     context.session = {
       ...context.session,
@@ -2104,6 +2204,11 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
       ...(status === "failed" && errorMessage ? { lastError: errorMessage } : {}),
     };
     yield* updateResumeCursor(context);
+
+    if (status === "completed" && context.waitingForWake) {
+      yield* parkSessionForWake(context, { interruptStream: false });
+    }
+    return true;
   });
 
   const handleStreamEvent = Effect.fn("handleStreamEvent")(function* (
@@ -2499,6 +2604,58 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
     }
   });
 
+  const ensureSyntheticTurn = Effect.fn("ensureSyntheticTurn")(function* (
+    context: ClaudeSessionContext,
+    input: {
+      readonly rawMethod: string;
+      readonly rawPayload: unknown;
+    },
+  ) {
+    if (context.turnState) {
+      return;
+    }
+    const turnId = TurnId.make(yield* randomUUIDv4);
+    const startedAt = yield* nowIso;
+    const runtimeTaskIds = new Set(context.unownedRuntimeTaskIds);
+    context.unownedRuntimeTaskIds.clear();
+    context.turnState = {
+      turnId,
+      startedAt,
+      synthetic: true,
+      items: [],
+      assistantTextBlocks: new Map(),
+      assistantTextBlockOrder: [],
+      capturedProposedPlanKeys: new Set(),
+      runtimeTaskIds,
+      nextSyntheticAssistantBlockIndex: -1,
+    };
+    context.session = {
+      ...context.session,
+      status: "running",
+      activeTurnId: turnId,
+      updatedAt: startedAt,
+    };
+    const turnStartedStamp = yield* makeEventStamp();
+    yield* offerRuntimeEvent({
+      type: "turn.started",
+      eventId: turnStartedStamp.eventId,
+      provider: PROVIDER,
+      createdAt: turnStartedStamp.createdAt,
+      threadId: context.session.threadId,
+      turnId,
+      payload: {},
+      providerRefs: {
+        ...nativeProviderRefs(context),
+        providerTurnId: turnId,
+      },
+      raw: {
+        source: "claude.sdk.message",
+        method: input.rawMethod,
+        payload: input.rawPayload,
+      },
+    });
+  });
+
   const handleAssistantMessage = Effect.fn("handleAssistantMessage")(function* (
     context: ClaudeSessionContext,
     message: SDKMessage,
@@ -2509,45 +2666,10 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
 
     // Auto-start a synthetic turn for assistant messages that arrive without
     // an active turn (e.g., background agent/subagent responses between user prompts).
-    if (!context.turnState) {
-      const turnId = TurnId.make(yield* randomUUIDv4);
-      const startedAt = yield* nowIso;
-      context.turnState = {
-        turnId,
-        startedAt,
-        synthetic: true,
-        items: [],
-        assistantTextBlocks: new Map(),
-        assistantTextBlockOrder: [],
-        capturedProposedPlanKeys: new Set(),
-        nextSyntheticAssistantBlockIndex: -1,
-      };
-      context.session = {
-        ...context.session,
-        status: "running",
-        activeTurnId: turnId,
-        updatedAt: startedAt,
-      };
-      const turnStartedStamp = yield* makeEventStamp();
-      yield* offerRuntimeEvent({
-        type: "turn.started",
-        eventId: turnStartedStamp.eventId,
-        provider: PROVIDER,
-        createdAt: turnStartedStamp.createdAt,
-        threadId: context.session.threadId,
-        turnId,
-        payload: {},
-        providerRefs: {
-          ...nativeProviderRefs(context),
-          providerTurnId: turnId,
-        },
-        raw: {
-          source: "claude.sdk.message",
-          method: "claude/synthetic-turn-start",
-          payload: {},
-        },
-      });
-    }
+    yield* ensureSyntheticTurn(context, {
+      rawMethod: "claude/synthetic-turn-start",
+      rawPayload: {},
+    });
 
     const content = message.message?.content;
     if (Array.isArray(content)) {
@@ -2595,6 +2717,10 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
       return;
     }
 
+    if (isTaskNotificationResult(message)) {
+      return;
+    }
+
     const status = turnStatusFromResult(message);
     const errorMessage = message.subtype === "success" ? undefined : message.errors[0];
 
@@ -2605,12 +2731,37 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
     yield* completeTurn(context, status, errorMessage, message);
   });
 
+  const flushDeferredRuntimeTaskCompletion = Effect.fn("flushDeferredRuntimeTaskCompletion")(
+    function* (context: ClaudeSessionContext) {
+      const deferred = context.deferredRuntimeTaskCompletion;
+      if (!deferred) {
+        return false;
+      }
+      const turnState = context.turnState;
+      if (turnState?.turnId !== deferred.turnId) {
+        context.deferredRuntimeTaskCompletion = undefined;
+        return false;
+      }
+      if (hasActiveRuntimeTasksForTurn(context, turnState)) {
+        return false;
+      }
+      return yield* completeTurn(context, deferred.status, deferred.errorMessage, deferred.result);
+    },
+  );
+
   const handleSystemMessage = Effect.fn("handleSystemMessage")(function* (
     context: ClaudeSessionContext,
     message: SDKMessage,
   ) {
     if (message.type !== "system") {
       return;
+    }
+
+    if (message.subtype === "task_started") {
+      yield* ensureSyntheticTurn(context, {
+        rawMethod: "claude/synthetic-turn-start/task_started",
+        rawPayload: message,
+      });
     }
 
     const stamp = yield* makeEventStamp();
@@ -2715,6 +2866,12 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
         });
         return;
       case "task_started":
+        context.activeRuntimeTasks.add(message.task_id);
+        if (context.turnState) {
+          context.turnState.runtimeTaskIds.add(message.task_id);
+        } else {
+          context.unownedRuntimeTaskIds.add(message.task_id);
+        }
         yield* offerRuntimeEvent({
           ...base,
           type: "task.started",
@@ -2725,17 +2882,21 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
           },
         });
         return;
-      case "task_progress":
+      case "task_progress": {
+        const taskTurnState = turnStateForRuntimeTask(context, message.task_id);
+        const { turnId: _baseTurnId, ...taskBase } = base;
         yield* emitThreadTokenUsage(
           context,
           normalizeClaudeTaskProgressTokenUsage(message.usage, context),
           {
             rawMethod: "claude/system/task_progress",
             rawPayload: message,
+            turnId: taskTurnState?.turnId ?? null,
           },
         );
         yield* offerRuntimeEvent({
-          ...base,
+          ...taskBase,
+          ...(taskTurnState ? { turnId: asCanonicalTurnId(taskTurnState.turnId) } : {}),
           type: "task.progress",
           payload: {
             taskId: RuntimeTaskId.make(message.task_id),
@@ -2746,17 +2907,25 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
           },
         });
         return;
-      case "task_notification":
+      }
+      case "task_notification": {
+        const taskTurnState = turnStateForRuntimeTask(context, message.task_id);
+        const { turnId: _baseTurnId, ...taskBase } = base;
+        context.activeRuntimeTasks.delete(message.task_id);
+        context.unownedRuntimeTaskIds.delete(message.task_id);
+        taskTurnState?.runtimeTaskIds.delete(message.task_id);
         yield* emitThreadTokenUsage(
           context,
           normalizeClaudeTaskProgressTokenUsage(message.usage, context),
           {
             rawMethod: "claude/system/task_notification",
             rawPayload: message,
+            turnId: taskTurnState?.turnId ?? null,
           },
         );
         yield* offerRuntimeEvent({
-          ...base,
+          ...taskBase,
+          ...(taskTurnState ? { turnId: asCanonicalTurnId(taskTurnState.turnId) } : {}),
           type: "task.completed",
           payload: {
             taskId: RuntimeTaskId.make(message.task_id),
@@ -2765,7 +2934,9 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
             ...(message.usage ? { usage: message.usage } : {}),
           },
         });
+        yield* flushDeferredRuntimeTaskCompletion(context);
         return;
+      }
       case "files_persisted":
         yield* offerRuntimeEvent({
           ...base,
@@ -2962,13 +3133,19 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
       ),
     );
 
-  const parkSessionForWake = Effect.fn("parkSessionForWake")(function* (
+  const parkSessionForWake: (
     context: ClaudeSessionContext,
+    options?: { readonly interruptStream?: boolean },
+  ) => Effect.Effect<void, ProviderAdapterError> = Effect.fn("parkSessionForWake")(function* (
+    context: ClaudeSessionContext,
+    options?: { readonly interruptStream?: boolean },
   ) {
-    if (context.stopped) return;
+    if (context.stopped || String(context.session.status) === "waiting") return;
 
     if (context.turnState) {
-      yield* completeTurn(context, "completed");
+      const completed = yield* completeTurn(context, "completed");
+      if (!completed) return;
+      if (String(context.session.status) === "waiting") return;
     } else {
       yield* updateResumeCursor(context);
     }
@@ -2977,7 +3154,11 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
 
     const streamFiber = context.streamFiber;
     context.streamFiber = undefined;
-    if (streamFiber && streamFiber.pollUnsafe() === undefined) {
+    if (
+      options?.interruptStream !== false &&
+      streamFiber &&
+      streamFiber.pollUnsafe() === undefined
+    ) {
       yield* Fiber.interrupt(streamFiber);
     }
 
@@ -3034,6 +3215,10 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
   ) {
     if (context.stopped) {
       return;
+    }
+
+    if (Exit.isSuccess(exit)) {
+      yield* flushDeferredRuntimeTaskCompletion(context);
     }
 
     if (Exit.isSuccess(exit) && context.waitingForWake) {
@@ -3677,6 +3862,9 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
         turns: [],
         inFlightTools,
         claudeTasks,
+        activeRuntimeTasks: new Set(),
+        unownedRuntimeTaskIds: new Set(),
+        deferredRuntimeTaskCompletion: undefined,
         turnState: undefined,
         lastKnownContextWindow: initialContextWindow,
         lastKnownTokenUsage: undefined,
@@ -3778,7 +3966,16 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
     const steeringTurnState =
       context.turnState && context.turnState.synthetic !== true ? context.turnState : null;
     if (context.turnState && steeringTurnState === null) {
-      yield* completeTurn(context, "completed");
+      const deferred = context.deferredRuntimeTaskCompletion;
+      if (deferred?.turnId === context.turnState.turnId) {
+        yield* completeTurn(context, deferred.status, deferred.errorMessage, deferred.result, {
+          deferRuntimeTasks: false,
+        });
+      } else {
+        yield* completeTurn(context, "completed", undefined, undefined, {
+          deferRuntimeTasks: false,
+        });
+      }
     }
 
     if (modelSelection?.model) {
@@ -3821,6 +4018,7 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
         assistantTextBlocks: new Map(),
         assistantTextBlockOrder: [],
         capturedProposedPlanKeys: new Set(),
+        runtimeTaskIds: new Set(),
         nextSyntheticAssistantBlockIndex: -1,
       };
 

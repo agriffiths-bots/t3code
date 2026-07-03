@@ -995,6 +995,788 @@ describe("ClaudeAdapterLive", () => {
     );
   });
 
+  it.effect("keeps a turn open across Claude background task notification results", () => {
+    const harness = makeHarness();
+    return Effect.gen(function* () {
+      const adapter = yield* ClaudeAdapter;
+
+      const runtimeEventsFiber = yield* Stream.takeUntil(
+        adapter.streamEvents,
+        (event) => event.type === "turn.completed",
+      ).pipe(Stream.runCollect, Effect.forkChild);
+
+      const session = yield* adapter.startSession({
+        threadId: THREAD_ID,
+        provider: ProviderDriverKind.make("claudeAgent"),
+        runtimeMode: "full-access",
+      });
+
+      const turn = yield* adapter.sendTurn({
+        threadId: session.threadId,
+        input: "run a background command",
+        attachments: [],
+      });
+
+      harness.query.emit({
+        type: "system",
+        subtype: "task_started",
+        session_id: "sdk-session-task",
+        uuid: "task-started-1",
+        task_id: "task-1",
+        tool_use_id: "tool-1",
+        description: "Run slow command",
+        task_type: "local_bash",
+      } as unknown as SDKMessage);
+
+      harness.query.emit({
+        type: "assistant",
+        session_id: "sdk-session-task",
+        uuid: "assistant-task-waiting",
+        parent_tool_use_id: null,
+        message: {
+          id: "assistant-message-task-waiting",
+          content: [{ type: "text", text: "Waiting for the command to finish." }],
+        },
+      } as unknown as SDKMessage);
+
+      harness.query.emit({
+        type: "result",
+        subtype: "success",
+        is_error: false,
+        errors: [],
+        result: "Waiting for the command to finish.",
+        session_id: "sdk-session-task",
+        uuid: "result-task-intermediate",
+      } as unknown as SDKMessage);
+
+      harness.query.emit({
+        type: "system",
+        subtype: "task_notification",
+        session_id: "sdk-session-task",
+        uuid: "task-notification-1",
+        task_id: "task-1",
+        tool_use_id: "tool-1",
+        status: "completed",
+        summary: "Background command completed",
+      } as unknown as SDKMessage);
+
+      const runtimeEvents = Array.from(yield* Fiber.join(runtimeEventsFiber));
+      const turnStartedEvents = runtimeEvents.filter((event) => event.type === "turn.started");
+      const turnCompletedEvents = runtimeEvents.filter((event) => event.type === "turn.completed");
+
+      assert.equal(turnStartedEvents.length, 1);
+      assert.equal(String(turnStartedEvents[0]?.turnId), String(turn.turnId));
+      assert.equal(turnCompletedEvents.length, 1);
+      assert.equal(String(turnCompletedEvents[0]?.turnId), String(turn.turnId));
+
+      const assistantTexts = runtimeEvents
+        .filter((event) => event.type === "content.delta")
+        .map((event) => event.payload.delta);
+      assert.deepEqual(assistantTexts, ["Waiting for the command to finish."]);
+    }).pipe(
+      Effect.provideService(Random.Random, makeDeterministicRandomService()),
+      Effect.provide(harness.layer),
+    );
+  });
+
+  it.effect("completes a deferred Claude result after runtime tasks drain and stream exits", () => {
+    const harness = makeHarness();
+    return Effect.gen(function* () {
+      const adapter = yield* ClaudeAdapter;
+
+      const runtimeEventsFiber = yield* Stream.takeUntil(
+        adapter.streamEvents,
+        (event) => event.type === "turn.completed",
+      ).pipe(Stream.runCollect, Effect.forkChild);
+
+      const session = yield* adapter.startSession({
+        threadId: THREAD_ID,
+        provider: ProviderDriverKind.make("claudeAgent"),
+        runtimeMode: "full-access",
+      });
+
+      const turn = yield* adapter.sendTurn({
+        threadId: session.threadId,
+        input: "run a background command",
+        attachments: [],
+      });
+
+      harness.query.emit({
+        type: "system",
+        subtype: "task_started",
+        session_id: "sdk-session-task-deferred",
+        uuid: "task-started-deferred",
+        task_id: "task-deferred",
+        tool_use_id: "tool-deferred",
+        description: "Run slow command",
+        task_type: "local_bash",
+      } as unknown as SDKMessage);
+
+      harness.query.emit({
+        type: "result",
+        subtype: "success",
+        is_error: false,
+        errors: [],
+        result: "FINAL",
+        session_id: "sdk-session-task-deferred",
+        uuid: "result-task-deferred",
+      } as unknown as SDKMessage);
+
+      harness.query.emit({
+        type: "system",
+        subtype: "task_notification",
+        session_id: "sdk-session-task-deferred",
+        uuid: "task-notification-deferred",
+        task_id: "task-deferred",
+        tool_use_id: "tool-deferred",
+        status: "completed",
+        summary: "Background command completed",
+      } as unknown as SDKMessage);
+      harness.query.finish();
+
+      const runtimeEvents = Array.from(yield* Fiber.join(runtimeEventsFiber));
+      const turnCompletedEvents = runtimeEvents.filter((event) => event.type === "turn.completed");
+
+      assert.equal(turnCompletedEvents.length, 1);
+      assert.equal(String(turnCompletedEvents[0]?.turnId), String(turn.turnId));
+    }).pipe(
+      Effect.provideService(Random.Random, makeDeterministicRandomService()),
+      Effect.provide(harness.layer),
+    );
+  });
+
+  it.effect("does not flush a stale synthetic task completion into the next user turn", () => {
+    const harness = makeHarness();
+    return Effect.gen(function* () {
+      const adapter = yield* ClaudeAdapter;
+      const runtimeEvents: Array<ProviderRuntimeEvent> = [];
+
+      const runtimeEventsFiber = yield* Stream.runForEach(adapter.streamEvents, (event) =>
+        Effect.sync(() => {
+          runtimeEvents.push(event);
+        }),
+      ).pipe(Effect.forkChild);
+
+      const session = yield* adapter.startSession({
+        threadId: THREAD_ID,
+        provider: ProviderDriverKind.make("claudeAgent"),
+        runtimeMode: "full-access",
+      });
+
+      harness.query.emit({
+        type: "assistant",
+        session_id: "sdk-session-task-stale",
+        uuid: "assistant-synthetic-task-stale",
+        parent_tool_use_id: null,
+        message: {
+          id: "assistant-message-synthetic-task-stale",
+          content: [{ type: "text", text: "Background update" }],
+        },
+      } as unknown as SDKMessage);
+
+      harness.query.emit({
+        type: "system",
+        subtype: "task_started",
+        session_id: "sdk-session-task-stale",
+        uuid: "task-started-stale",
+        task_id: "task-stale",
+        tool_use_id: "tool-stale",
+        description: "Run stale background command",
+        task_type: "local_bash",
+      } as unknown as SDKMessage);
+
+      for (let i = 0; i < 5; i += 1) {
+        yield* Effect.yieldNow;
+      }
+
+      const userTurn = yield* adapter.sendTurn({
+        threadId: session.threadId,
+        input: "start the real user turn",
+        attachments: [],
+      });
+
+      harness.query.emit({
+        type: "system",
+        subtype: "task_notification",
+        session_id: "sdk-session-task-stale",
+        uuid: "task-notification-stale",
+        task_id: "task-stale",
+        tool_use_id: "tool-stale",
+        status: "completed",
+        summary: "Background command completed",
+      } as unknown as SDKMessage);
+
+      for (let i = 0; i < 5; i += 1) {
+        yield* Effect.yieldNow;
+      }
+      assert.equal(
+        runtimeEvents.filter(
+          (event) => event.type === "turn.completed" && event.turnId === userTurn.turnId,
+        ).length,
+        0,
+      );
+
+      harness.query.emit({
+        type: "system",
+        subtype: "task_started",
+        session_id: "sdk-session-task-stale",
+        uuid: "task-started-current-after-stale-notification",
+        task_id: "task-current-after-stale-notification",
+        tool_use_id: "tool-current-after-stale-notification",
+        description: "Run current user command",
+        task_type: "local_bash",
+      } as unknown as SDKMessage);
+
+      harness.query.emit({
+        type: "system",
+        subtype: "task_notification",
+        session_id: "sdk-session-task-stale",
+        uuid: "task-notification-current-after-stale-notification",
+        task_id: "task-current-after-stale-notification",
+        tool_use_id: "tool-current-after-stale-notification",
+        status: "completed",
+        summary: "Current user command completed",
+      } as unknown as SDKMessage);
+
+      harness.query.emit({
+        type: "result",
+        subtype: "success",
+        is_error: false,
+        errors: [],
+        result: "real user result",
+        session_id: "sdk-session-task-stale",
+        uuid: "result-current-after-stale-notification",
+      } as unknown as SDKMessage);
+
+      for (let i = 0; i < 5; i += 1) {
+        yield* Effect.yieldNow;
+      }
+      runtimeEventsFiber.interruptUnsafe();
+
+      const userTurnCompletions = runtimeEvents.filter(
+        (event) => event.type === "turn.completed" && event.turnId === userTurn.turnId,
+      );
+      assert.equal(userTurnCompletions.length, 1);
+      const completedTurns = runtimeEvents.filter((event) => event.type === "turn.completed");
+      assert.equal(completedTurns.length, 2);
+    }).pipe(
+      Effect.provideService(Random.Random, makeDeterministicRandomService()),
+      Effect.provide(harness.layer),
+    );
+  });
+
+  it.effect("does not let a stale synthetic task id defer the next user turn", () => {
+    const harness = makeHarness();
+    return Effect.gen(function* () {
+      const adapter = yield* ClaudeAdapter;
+      const runtimeEvents: Array<ProviderRuntimeEvent> = [];
+
+      const runtimeEventsFiber = yield* Stream.runForEach(adapter.streamEvents, (event) =>
+        Effect.sync(() => {
+          runtimeEvents.push(event);
+        }),
+      ).pipe(Effect.forkChild);
+
+      const session = yield* adapter.startSession({
+        threadId: THREAD_ID,
+        provider: ProviderDriverKind.make("claudeAgent"),
+        runtimeMode: "full-access",
+      });
+
+      harness.query.emit({
+        type: "assistant",
+        session_id: "sdk-session-task-stale-defer",
+        uuid: "assistant-synthetic-task-stale-defer",
+        parent_tool_use_id: null,
+        message: {
+          id: "assistant-message-synthetic-task-stale-defer",
+          content: [{ type: "text", text: "Background update" }],
+        },
+      } as unknown as SDKMessage);
+
+      harness.query.emit({
+        type: "system",
+        subtype: "task_started",
+        session_id: "sdk-session-task-stale-defer",
+        uuid: "task-started-stale-defer",
+        task_id: "task-stale-defer",
+        tool_use_id: "tool-stale-defer",
+        description: "Run stale background command",
+        task_type: "local_bash",
+      } as unknown as SDKMessage);
+
+      for (let i = 0; i < 5; i += 1) {
+        yield* Effect.yieldNow;
+      }
+
+      const userTurn = yield* adapter.sendTurn({
+        threadId: session.threadId,
+        input: "start the real user turn",
+        attachments: [],
+      });
+
+      harness.query.emit({
+        type: "system",
+        subtype: "task_notification",
+        session_id: "sdk-session-task-stale-defer",
+        uuid: "task-notification-stale-defer",
+        task_id: "task-stale-defer",
+        tool_use_id: "tool-stale-defer",
+        status: "completed",
+        summary: "Background command completed",
+      } as unknown as SDKMessage);
+
+      harness.query.emit({
+        type: "result",
+        subtype: "success",
+        is_error: false,
+        errors: [],
+        result: "stale synthetic result",
+        session_id: "sdk-session-task-stale-defer",
+        uuid: "result-stale-synthetic-after-user-turn",
+        origin: { kind: "task-notification" },
+      } as unknown as SDKMessage);
+
+      for (let i = 0; i < 5; i += 1) {
+        yield* Effect.yieldNow;
+      }
+      assert.equal(
+        runtimeEvents.filter(
+          (event) => event.type === "turn.completed" && event.turnId === userTurn.turnId,
+        ).length,
+        0,
+      );
+
+      harness.query.emit({
+        type: "result",
+        subtype: "success",
+        is_error: false,
+        errors: [],
+        result: "real user result",
+        session_id: "sdk-session-task-stale-defer",
+        uuid: "result-real-user-after-stale-task",
+      } as unknown as SDKMessage);
+
+      for (let i = 0; i < 5; i += 1) {
+        yield* Effect.yieldNow;
+      }
+
+      runtimeEventsFiber.interruptUnsafe();
+
+      const userTurnCompletions = runtimeEvents.filter(
+        (event) => event.type === "turn.completed" && event.turnId === userTurn.turnId,
+      );
+      assert.equal(userTurnCompletions.length, 1);
+      const staleTaskCompletionsForUserTurn = runtimeEvents.filter(
+        (event) => event.type === "task.completed" && event.turnId === userTurn.turnId,
+      );
+      assert.equal(staleTaskCompletionsForUserTurn.length, 0);
+    }).pipe(
+      Effect.provideService(Random.Random, makeDeterministicRandomService()),
+      Effect.provide(harness.layer),
+    );
+  });
+
+  it.effect(
+    "does not drop a real user result while a stale synthetic task result is pending",
+    () => {
+      const harness = makeHarness();
+      return Effect.gen(function* () {
+        const adapter = yield* ClaudeAdapter;
+        const runtimeEvents: Array<ProviderRuntimeEvent> = [];
+
+        const runtimeEventsFiber = yield* Stream.runForEach(adapter.streamEvents, (event) =>
+          Effect.sync(() => {
+            runtimeEvents.push(event);
+          }),
+        ).pipe(Effect.forkChild);
+
+        const session = yield* adapter.startSession({
+          threadId: THREAD_ID,
+          provider: ProviderDriverKind.make("claudeAgent"),
+          runtimeMode: "full-access",
+        });
+
+        harness.query.emit({
+          type: "assistant",
+          session_id: "sdk-session-task-stale-real-first",
+          uuid: "assistant-synthetic-task-stale-real-first",
+          parent_tool_use_id: null,
+          message: {
+            id: "assistant-message-synthetic-task-stale-real-first",
+            content: [{ type: "text", text: "Background update" }],
+          },
+        } as unknown as SDKMessage);
+
+        harness.query.emit({
+          type: "system",
+          subtype: "task_started",
+          session_id: "sdk-session-task-stale-real-first",
+          uuid: "task-started-stale-real-first",
+          task_id: "task-stale-real-first",
+          tool_use_id: "tool-stale-real-first",
+          description: "Run stale background command",
+          task_type: "local_bash",
+        } as unknown as SDKMessage);
+
+        for (let i = 0; i < 5; i += 1) {
+          yield* Effect.yieldNow;
+        }
+
+        const userTurn = yield* adapter.sendTurn({
+          threadId: session.threadId,
+          input: "start the real user turn",
+          attachments: [],
+        });
+
+        harness.query.emit({
+          type: "system",
+          subtype: "task_started",
+          session_id: "sdk-session-task-stale-real-first",
+          uuid: "task-started-current-real-first",
+          task_id: "task-current-real-first",
+          tool_use_id: "tool-current-real-first",
+          description: "Run current user command",
+          task_type: "local_bash",
+        } as unknown as SDKMessage);
+
+        harness.query.emit({
+          type: "system",
+          subtype: "task_notification",
+          session_id: "sdk-session-task-stale-real-first",
+          uuid: "task-notification-current-real-first",
+          task_id: "task-current-real-first",
+          tool_use_id: "tool-current-real-first",
+          status: "completed",
+          summary: "Current user command completed",
+        } as unknown as SDKMessage);
+
+        harness.query.emit({
+          type: "result",
+          subtype: "success",
+          is_error: false,
+          errors: [],
+          result: "real user result",
+          session_id: "sdk-session-task-stale-real-first",
+          uuid: "result-real-user-before-stale-task-result",
+        } as unknown as SDKMessage);
+
+        for (let i = 0; i < 5; i += 1) {
+          yield* Effect.yieldNow;
+        }
+        assert.equal(
+          runtimeEvents.filter(
+            (event) => event.type === "turn.completed" && event.turnId === userTurn.turnId,
+          ).length,
+          1,
+        );
+
+        harness.query.emit({
+          type: "system",
+          subtype: "task_notification",
+          session_id: "sdk-session-task-stale-real-first",
+          uuid: "task-notification-stale-real-first",
+          task_id: "task-stale-real-first",
+          tool_use_id: "tool-stale-real-first",
+          status: "completed",
+          summary: "Background command completed",
+        } as unknown as SDKMessage);
+
+        harness.query.emit({
+          type: "result",
+          subtype: "success",
+          is_error: false,
+          errors: [],
+          result: "stale synthetic result",
+          session_id: "sdk-session-task-stale-real-first",
+          uuid: "result-stale-task-after-real-user",
+          origin: { kind: "task-notification" },
+        } as unknown as SDKMessage);
+
+        for (let i = 0; i < 5; i += 1) {
+          yield* Effect.yieldNow;
+        }
+        runtimeEventsFiber.interruptUnsafe();
+
+        const userTurnCompletions = runtimeEvents.filter(
+          (event) => event.type === "turn.completed" && event.turnId === userTurn.turnId,
+        );
+        assert.equal(userTurnCompletions.length, 1);
+      }).pipe(
+        Effect.provideService(Random.Random, makeDeterministicRandomService()),
+        Effect.provide(harness.layer),
+      );
+    },
+  );
+
+  it.effect("defers synthetic task results until their task notification", () => {
+    const harness = makeHarness();
+    return Effect.gen(function* () {
+      const adapter = yield* ClaudeAdapter;
+      const runtimeEvents: Array<ProviderRuntimeEvent> = [];
+
+      const runtimeEventsFiber = yield* Stream.runForEach(adapter.streamEvents, (event) =>
+        Effect.sync(() => {
+          runtimeEvents.push(event);
+        }),
+      ).pipe(Effect.forkChild);
+
+      yield* adapter.startSession({
+        threadId: THREAD_ID,
+        provider: ProviderDriverKind.make("claudeAgent"),
+        runtimeMode: "full-access",
+      });
+
+      harness.query.emit({
+        type: "assistant",
+        session_id: "sdk-session-synthetic-task",
+        uuid: "assistant-synthetic-task",
+        parent_tool_use_id: null,
+        message: {
+          id: "assistant-message-synthetic-task",
+          content: [{ type: "text", text: "Background update" }],
+        },
+      } as unknown as SDKMessage);
+
+      harness.query.emit({
+        type: "system",
+        subtype: "task_started",
+        session_id: "sdk-session-synthetic-task",
+        uuid: "task-started-synthetic",
+        task_id: "task-synthetic",
+        tool_use_id: "tool-synthetic",
+        description: "Run synthetic background command",
+        task_type: "local_bash",
+      } as unknown as SDKMessage);
+
+      harness.query.emit({
+        type: "result",
+        subtype: "success",
+        is_error: false,
+        errors: [],
+        result: "FINAL",
+        session_id: "sdk-session-synthetic-task",
+        uuid: "result-synthetic-task",
+      } as unknown as SDKMessage);
+
+      for (let i = 0; i < 5; i += 1) {
+        yield* Effect.yieldNow;
+      }
+      assert.equal(runtimeEvents.filter((event) => event.type === "turn.completed").length, 0);
+
+      harness.query.emit({
+        type: "system",
+        subtype: "task_notification",
+        session_id: "sdk-session-synthetic-task",
+        uuid: "task-notification-synthetic",
+        task_id: "task-synthetic",
+        tool_use_id: "tool-synthetic",
+        status: "completed",
+        summary: "Background command completed",
+      } as unknown as SDKMessage);
+
+      for (let i = 0; i < 5; i += 1) {
+        yield* Effect.yieldNow;
+      }
+      runtimeEventsFiber.interruptUnsafe();
+
+      const syntheticTurn = runtimeEvents.find((event) => event.type === "turn.started");
+      const completedTurns = runtimeEvents.filter((event) => event.type === "turn.completed");
+      assert.equal(completedTurns.length, 1);
+      assert.equal(completedTurns[0]?.turnId, syntheticTurn?.turnId);
+    }).pipe(
+      Effect.provideService(Random.Random, makeDeterministicRandomService()),
+      Effect.provide(harness.layer),
+    );
+  });
+
+  it.effect("attaches task starts before assistant output to the synthetic turn", () => {
+    const harness = makeHarness();
+    return Effect.gen(function* () {
+      const adapter = yield* ClaudeAdapter;
+      const runtimeEvents: Array<ProviderRuntimeEvent> = [];
+
+      const runtimeEventsFiber = yield* Stream.runForEach(adapter.streamEvents, (event) =>
+        Effect.sync(() => {
+          runtimeEvents.push(event);
+        }),
+      ).pipe(Effect.forkChild);
+
+      yield* adapter.startSession({
+        threadId: THREAD_ID,
+        provider: ProviderDriverKind.make("claudeAgent"),
+        runtimeMode: "full-access",
+      });
+
+      harness.query.emit({
+        type: "system",
+        subtype: "task_started",
+        session_id: "sdk-session-pre-assistant-task",
+        uuid: "task-started-pre-assistant",
+        task_id: "task-pre-assistant",
+        tool_use_id: "tool-pre-assistant",
+        description: "Run background command before assistant text",
+        task_type: "local_bash",
+      } as unknown as SDKMessage);
+
+      harness.query.emit({
+        type: "assistant",
+        session_id: "sdk-session-pre-assistant-task",
+        uuid: "assistant-pre-assistant-task",
+        parent_tool_use_id: null,
+        message: {
+          id: "assistant-message-pre-assistant-task",
+          content: [{ type: "text", text: "Background update" }],
+        },
+      } as unknown as SDKMessage);
+
+      harness.query.emit({
+        type: "result",
+        subtype: "success",
+        is_error: false,
+        errors: [],
+        result: "FINAL",
+        session_id: "sdk-session-pre-assistant-task",
+        uuid: "result-pre-assistant-task",
+      } as unknown as SDKMessage);
+
+      for (let i = 0; i < 5; i += 1) {
+        yield* Effect.yieldNow;
+      }
+      assert.equal(runtimeEvents.filter((event) => event.type === "turn.completed").length, 0);
+
+      harness.query.emit({
+        type: "system",
+        subtype: "task_notification",
+        session_id: "sdk-session-pre-assistant-task",
+        uuid: "task-notification-pre-assistant",
+        task_id: "task-pre-assistant",
+        tool_use_id: "tool-pre-assistant",
+        status: "completed",
+        summary: "Background command completed",
+      } as unknown as SDKMessage);
+
+      for (let i = 0; i < 5; i += 1) {
+        yield* Effect.yieldNow;
+      }
+      runtimeEventsFiber.interruptUnsafe();
+
+      const completedTurns = runtimeEvents.filter((event) => event.type === "turn.completed");
+      assert.equal(completedTurns.length, 1);
+      const syntheticTurn = runtimeEvents.find((event) => event.type === "turn.started");
+      const taskStarted = runtimeEvents.find((event) => event.type === "task.started");
+      assert.equal(taskStarted?.turnId, syntheticTurn?.turnId);
+    }).pipe(
+      Effect.provideService(Random.Random, makeDeterministicRandomService()),
+      Effect.provide(harness.layer),
+    );
+  });
+
+  it.effect("uses a deferred synthetic result when the next user turn auto-closes it", () => {
+    const harness = makeHarness();
+    return Effect.gen(function* () {
+      const adapter = yield* ClaudeAdapter;
+      const runtimeEvents: Array<ProviderRuntimeEvent> = [];
+
+      const runtimeEventsFiber = yield* Stream.runForEach(adapter.streamEvents, (event) =>
+        Effect.sync(() => {
+          runtimeEvents.push(event);
+        }),
+      ).pipe(Effect.forkChild);
+
+      const session = yield* adapter.startSession({
+        threadId: THREAD_ID,
+        provider: ProviderDriverKind.make("claudeAgent"),
+        runtimeMode: "full-access",
+      });
+
+      harness.query.emit({
+        type: "assistant",
+        session_id: "sdk-session-synthetic-autoclose",
+        uuid: "assistant-synthetic-autoclose",
+        parent_tool_use_id: null,
+        message: {
+          id: "assistant-message-synthetic-autoclose",
+          content: [{ type: "text", text: "Background update" }],
+        },
+      } as unknown as SDKMessage);
+
+      harness.query.emit({
+        type: "system",
+        subtype: "task_started",
+        session_id: "sdk-session-synthetic-autoclose",
+        uuid: "task-started-autoclose",
+        task_id: "task-autoclose",
+        tool_use_id: "tool-autoclose",
+        description: "Run autoclose background command",
+        task_type: "local_bash",
+      } as unknown as SDKMessage);
+
+      harness.query.emit({
+        type: "result",
+        subtype: "success",
+        is_error: false,
+        errors: [],
+        result: "FINAL",
+        session_id: "sdk-session-synthetic-autoclose",
+        uuid: "result-synthetic-autoclose",
+      } as unknown as SDKMessage);
+
+      for (let i = 0; i < 5; i += 1) {
+        yield* Effect.yieldNow;
+      }
+      assert.equal(runtimeEvents.filter((event) => event.type === "turn.completed").length, 0);
+
+      const userTurn = yield* adapter.sendTurn({
+        threadId: session.threadId,
+        input: "start the real user turn",
+        attachments: [],
+      });
+
+      for (let i = 0; i < 5; i += 1) {
+        yield* Effect.yieldNow;
+      }
+      const completedAfterSend = runtimeEvents.filter((event) => event.type === "turn.completed");
+      assert.equal(completedAfterSend.length, 1);
+      assert.notEqual(completedAfterSend[0]?.turnId, userTurn.turnId);
+
+      harness.query.emit({
+        type: "system",
+        subtype: "task_notification",
+        session_id: "sdk-session-synthetic-autoclose",
+        uuid: "task-notification-autoclose",
+        task_id: "task-autoclose",
+        tool_use_id: "tool-autoclose",
+        status: "completed",
+        summary: "Background command completed",
+      } as unknown as SDKMessage);
+
+      harness.query.emit({
+        type: "result",
+        subtype: "success",
+        is_error: false,
+        errors: [],
+        result: "stale synthetic task result",
+        session_id: "sdk-session-synthetic-autoclose",
+        uuid: "result-stale-synthetic-autoclose-task",
+        origin: { kind: "task-notification" },
+      } as unknown as SDKMessage);
+
+      for (let i = 0; i < 5; i += 1) {
+        yield* Effect.yieldNow;
+      }
+      runtimeEventsFiber.interruptUnsafe();
+
+      const userTurnCompletions = runtimeEvents.filter(
+        (event) => event.type === "turn.completed" && event.turnId === userTurn.turnId,
+      );
+      assert.equal(userTurnCompletions.length, 0);
+    }).pipe(
+      Effect.provideService(Random.Random, makeDeterministicRandomService()),
+      Effect.provide(harness.layer),
+    );
+  });
+
   it.effect("maps Claude reasoning deltas, streamed tool inputs, and tool results", () => {
     const harness = makeHarness();
     return Effect.gen(function* () {
@@ -1590,6 +2372,247 @@ describe("ClaudeAdapterLive", () => {
       assert.equal(sessions[0]?.activeTurnId, undefined);
       assert.notEqual(sessions[0]?.resumeCursor, undefined);
       assert.equal(harness.query.closeCalls, 1);
+    }).pipe(
+      Effect.provideService(Random.Random, makeDeterministicRandomService()),
+      Effect.provide(harness.layer),
+    );
+  });
+
+  it.effect("parks promoted subagent waits on result completion", () => {
+    const harness = makeHarness();
+    return Effect.gen(function* () {
+      const adapter = yield* ClaudeAdapter;
+      const runtimeEvents: Array<ProviderRuntimeEvent> = [];
+
+      const runtimeEventsFiber = yield* Stream.runForEach(adapter.streamEvents, (event) =>
+        Effect.sync(() => {
+          runtimeEvents.push(event);
+        }),
+      ).pipe(Effect.forkChild);
+
+      const session = yield* adapter.startSession({
+        threadId: THREAD_ID,
+        provider: ProviderDriverKind.make("claudeAgent"),
+        runtimeMode: "full-access",
+      });
+
+      yield* adapter.sendTurn({
+        threadId: session.threadId,
+        input: "wait for the child",
+        attachments: [],
+      });
+
+      harness.query.emit({
+        type: "stream_event",
+        session_id: "sdk-session-waiting-subagent-text",
+        uuid: "stream-wait-subagent-text-start",
+        parent_tool_use_id: null,
+        event: {
+          type: "content_block_start",
+          index: 1,
+          content_block: {
+            type: "mcp_tool_use",
+            id: "tool-wait-subagent-text-1",
+            name: "t3_wait_subagent",
+            input: {
+              childThreadIds: ["child-thread-1"],
+            },
+          },
+        },
+      } as unknown as SDKMessage);
+
+      harness.query.emit({
+        type: "stream_event",
+        session_id: "sdk-session-waiting-subagent-text",
+        uuid: "stream-wait-subagent-text-stop",
+        parent_tool_use_id: null,
+        event: {
+          type: "content_block_stop",
+          index: 1,
+        },
+      } as unknown as SDKMessage);
+
+      harness.query.emit({
+        type: "user",
+        session_id: "sdk-session-waiting-subagent-text",
+        uuid: "user-wait-subagent-text-result",
+        parent_tool_use_id: null,
+        tool_use_result: {
+          content:
+            '{"results":[{"childThreadId":"child-thread-1","status":"running"}],"promoted":true}',
+          structuredContent: {
+            results: [{ childThreadId: "child-thread-1", status: "running" }],
+            promoted: true,
+          },
+        },
+        message: {
+          role: "user",
+          content: [
+            {
+              type: "tool_result",
+              tool_use_id: "tool-wait-subagent-text-1",
+              content: 'promoted=true; [{"childThreadId":"child-thread-1","status":"running"}]',
+            },
+          ],
+        },
+      } as unknown as SDKMessage);
+
+      harness.query.emit({
+        type: "result",
+        subtype: "success",
+        is_error: false,
+        errors: [],
+        result: "PARENT_PARKED",
+        stop_reason: "end_turn",
+        session_id: "sdk-session-waiting-subagent-text",
+        uuid: "result-wait-subagent-text",
+      } as unknown as SDKMessage);
+
+      yield* Effect.yieldNow;
+      yield* Effect.yieldNow;
+      yield* Effect.yieldNow;
+      runtimeEventsFiber.interruptUnsafe();
+
+      assert.equal(
+        runtimeEvents.some((event) => event.type === "session.exited"),
+        false,
+      );
+
+      const waitingEvent = runtimeEvents.find(
+        (event) =>
+          event.type === "session.state.changed" &&
+          event.payload.state === "waiting" &&
+          event.payload.reason === "awaiting-subagent-wake",
+      );
+      assert.notEqual(waitingEvent, undefined);
+
+      const sessions = yield* adapter.listSessions();
+      assert.equal(sessions.length, 1);
+      assert.equal(sessions[0]?.status, "waiting");
+      assert.equal(sessions[0]?.activeTurnId, undefined);
+      assert.equal(harness.query.closeCalls, 1);
+    }).pipe(
+      Effect.provideService(Random.Random, makeDeterministicRandomService()),
+      Effect.provide(harness.layer),
+    );
+  });
+
+  it.effect("does not park subagent waits when promoted only appears in unstructured text", () => {
+    const harness = makeHarness();
+    return Effect.gen(function* () {
+      const adapter = yield* ClaudeAdapter;
+      const runtimeEvents: Array<ProviderRuntimeEvent> = [];
+
+      const runtimeEventsFiber = yield* Stream.runForEach(adapter.streamEvents, (event) =>
+        Effect.sync(() => {
+          runtimeEvents.push(event);
+        }),
+      ).pipe(Effect.forkChild);
+
+      const session = yield* adapter.startSession({
+        threadId: THREAD_ID,
+        provider: ProviderDriverKind.make("claudeAgent"),
+        runtimeMode: "full-access",
+      });
+
+      yield* adapter.sendTurn({
+        threadId: session.threadId,
+        input: "wait for the child",
+        attachments: [],
+      });
+
+      harness.query.emit({
+        type: "stream_event",
+        session_id: "sdk-session-waiting-subagent-text-false-positive",
+        uuid: "stream-wait-subagent-text-false-positive-start",
+        parent_tool_use_id: null,
+        event: {
+          type: "content_block_start",
+          index: 1,
+          content_block: {
+            type: "mcp_tool_use",
+            id: "tool-wait-subagent-text-false-positive-1",
+            name: "t3_wait_subagent",
+            input: {
+              childThreadIds: ["child-thread-1"],
+            },
+          },
+        },
+      } as unknown as SDKMessage);
+
+      harness.query.emit({
+        type: "stream_event",
+        session_id: "sdk-session-waiting-subagent-text-false-positive",
+        uuid: "stream-wait-subagent-text-false-positive-stop",
+        parent_tool_use_id: null,
+        event: {
+          type: "content_block_stop",
+          index: 1,
+        },
+      } as unknown as SDKMessage);
+
+      harness.query.emit({
+        type: "user",
+        session_id: "sdk-session-waiting-subagent-text-false-positive",
+        uuid: "user-wait-subagent-false-positive-result",
+        parent_tool_use_id: null,
+        tool_use_result: {
+          content:
+            '{"results":[{"childThreadId":"child-thread-1","status":"completed","finalAssistantText":"child wrote promoted=true"}],"pending":false}',
+          structuredContent: {
+            results: [
+              {
+                childThreadId: "child-thread-1",
+                status: "completed",
+                finalAssistantText: "child wrote promoted=true",
+              },
+            ],
+            pending: false,
+          },
+        },
+        message: {
+          role: "user",
+          content: [
+            {
+              type: "tool_result",
+              tool_use_id: "tool-wait-subagent-text-false-positive-1",
+              content: "child wrote promoted=true in its final answer",
+            },
+          ],
+        },
+      } as unknown as SDKMessage);
+
+      harness.query.emit({
+        type: "result",
+        subtype: "success",
+        is_error: false,
+        errors: [],
+        result: "DONE",
+        stop_reason: "end_turn",
+        session_id: "sdk-session-waiting-subagent-text-false-positive",
+        uuid: "result-wait-subagent-false-positive",
+      } as unknown as SDKMessage);
+      harness.query.finish();
+
+      yield* Effect.yieldNow;
+      yield* Effect.yieldNow;
+      yield* Effect.yieldNow;
+      runtimeEventsFiber.interruptUnsafe();
+
+      const waitingEvent = runtimeEvents.find(
+        (event) =>
+          event.type === "session.state.changed" &&
+          event.payload.state === "waiting" &&
+          event.payload.reason === "awaiting-subagent-wake",
+      );
+      assert.equal(waitingEvent, undefined);
+      assert.equal(
+        runtimeEvents.some((event) => event.type === "session.exited"),
+        true,
+      );
+
+      const sessions = yield* adapter.listSessions();
+      assert.equal(sessions.length, 0);
     }).pipe(
       Effect.provideService(Random.Random, makeDeterministicRandomService()),
       Effect.provide(harness.layer),

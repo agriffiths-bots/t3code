@@ -33,7 +33,10 @@ import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 
-import { coordinatorActive } from "../../../orchestration/Layers/ChildThreadCoordinator.ts";
+import {
+  coordinatorActive,
+  finalAssistantTextFromThread,
+} from "../../../orchestration/Layers/ChildThreadCoordinator.ts";
 import type {
   ChildThreadCoordinatorShape,
   WaitSliceResult,
@@ -79,6 +82,7 @@ import {
 
 const nowIso = Effect.map(DateTime.now, DateTime.formatIso);
 const isThreadStartToolError = Schema.is(ThreadStartToolError);
+const WAIT_PROJECTION_ENRICHMENT_TIMEOUT_MS = 250;
 
 const fail = (message: string) => new ThreadStartToolError({ message });
 
@@ -144,6 +148,45 @@ const statusOf = (thread: Pick<OrchestrationThread, "latestTurn" | "session">): 
     default:
       return session === null ? "idle" : "running";
   }
+};
+
+const hasCurrentProjectedTerminalTurn = (
+  thread: Pick<OrchestrationThread, "latestTurn" | "session">,
+): boolean => {
+  const latestTurn = thread.latestTurn;
+  if (latestTurn === null || latestTurn.state === "running") return false;
+  const session = thread.session;
+  if (session?.activeTurnId != null) return latestTurn.turnId === session.activeTurnId;
+  return (
+    session === null ||
+    session.status === "idle" ||
+    session.status === "ready" ||
+    session.status === "interrupted" ||
+    session.status === "stopped" ||
+    session.status === "error"
+  );
+};
+
+const waitTerminalStatusOf = (
+  thread: Pick<OrchestrationThread, "latestTurn" | "session">,
+): "completed" | "failed" | null => {
+  if (!hasCurrentProjectedTerminalTurn(thread)) return null;
+  const state = thread.latestTurn?.state;
+  if (state === "completed") return "completed";
+  if (state === undefined || state === "running") return null;
+  return "failed";
+};
+
+const isWaitTerminal = (status: string): boolean =>
+  status === "completed" || status === "failed" || status === "killed";
+
+const pendingForMode = (
+  rows: ReadonlyArray<WaitSliceResult["results"][number]>,
+  mode: "all" | "any",
+): boolean => {
+  const settledCount = rows.filter((row) => isWaitTerminal(row.status)).length;
+  const pendingCount = rows.filter((row) => row.status === "pending").length;
+  return mode === "all" ? pendingCount > 0 : settledCount === 0 && pendingCount > 0;
 };
 
 interface SubagentRuntime {
@@ -506,12 +549,68 @@ const waitSubagent = Effect.fn("SubagentToolkit.wait")(function* (input: WaitSub
   });
 
   const afterSliceMs = yield* Effect.clockWith((clock) => clock.currentTimeMillis);
+  const effectiveRows: ReadonlyArray<WaitSliceResult["results"][number]> = yield* Effect.forEach(
+    slice.results,
+    (row) => {
+      if (row.status !== "pending" && row.status !== "timeout") return Effect.succeed(row);
+      return loadThreadDetail(runtime, row.childThreadId).pipe(
+        Effect.timeoutOption(`${WAIT_PROJECTION_ENRICHMENT_TIMEOUT_MS} millis`),
+        Effect.map((thread) =>
+          Option.match(thread, {
+            onNone: () => row,
+            onSome: (detailOption): WaitSliceResult["results"][number] =>
+              Option.match(detailOption, {
+                onNone: () => row,
+                onSome: (detail): WaitSliceResult["results"][number] => {
+                  const projectedStatus = waitTerminalStatusOf(detail);
+                  if (projectedStatus === null) return row;
+                  if (projectedStatus === "completed") {
+                    return {
+                      childThreadId: row.childThreadId,
+                      status: "completed",
+                      finalAssistantText:
+                        row.finalAssistantText ?? finalAssistantTextFromThread(detail),
+                      error: null,
+                    };
+                  }
+                  if (projectedStatus === "failed") {
+                    return {
+                      childThreadId: row.childThreadId,
+                      status: "failed",
+                      finalAssistantText:
+                        row.finalAssistantText ?? finalAssistantTextFromThread(detail),
+                      error: `Child thread ended with status ${projectedStatus}.`,
+                    };
+                  }
+                  return row;
+                },
+              }),
+          }),
+        ),
+      );
+    },
+  );
+  const effectiveSlice: WaitSliceResult = {
+    results: effectiveRows,
+    settledCount: effectiveRows.filter((row) => isWaitTerminal(row.status)).length,
+    timedOutCount: effectiveRows.filter((row) => row.status === "timeout").length,
+    pending: pendingForMode(effectiveRows, input.mode ?? "all"),
+    resumeToken: slice.resumeToken,
+  };
   // Auto-promote (R-A): the 90s budget elapsed and one+ children are still
-  // running. Flip them onto the wake-on-completion path so they will NOTIFY the
-  // parent (notify-guarantee), and return promoted so the model stops polling.
-  const autoPromote = slice.pending && afterSliceMs >= autoPromoteDeadlineMs;
+  // running. The coordinator maps "pending when the supplied deadline elapsed"
+  // to status "timeout"; when the supplied deadline was our auto-promote cap
+  // rather than the caller's requested timeout, those timeout rows are still
+  // running children that must be promoted to wake-on-completion.
+  const autoPromoteDeadlineWasActive = autoPromoteDeadlineMs <= callerDeadlineMs;
+  const autoPromote =
+    autoPromoteDeadlineWasActive &&
+    afterSliceMs >= autoPromoteDeadlineMs &&
+    effectiveSlice.results.some((row) => row.status === "pending" || row.status === "timeout");
   const stillRunningIds = autoPromote
-    ? slice.results.filter((row) => row.status === "pending").map((row) => row.childThreadId)
+    ? effectiveSlice.results
+        .filter((row) => row.status === "pending" || row.status === "timeout")
+        .map((row) => row.childThreadId)
     : [];
   if (autoPromote && stillRunningIds.length > 0) {
     yield* coordinator.promoteToWake(stillRunningIds);
@@ -519,36 +618,44 @@ const waitSubagent = Effect.fn("SubagentToolkit.wait")(function* (input: WaitSub
 
   // Enrich each row with a turn count from the projection (the coordinator's
   // terminal result intentionally does not track it). On auto-promote, a still
-  // "pending" child is reported as "running" with a note telling the model to
-  // stop waiting.
-  const results: WaitSubagentOutput["results"] = yield* Effect.forEach(slice.results, (row) =>
-    loadThreadDetail(runtime, row.childThreadId).pipe(
-      Effect.map((thread) => {
-        const promotedRunning = autoPromote && row.status === "pending";
-        return {
-          childThreadId: row.childThreadId,
-          status: promotedRunning ? "running" : row.status,
-          turnCount: Option.match(thread, { onNone: () => 0, onSome: turnCountOf }),
-          finalAssistantText: row.finalAssistantText,
-          error: row.error,
-          ...(promotedRunning
-            ? {
-                note: "still running — you will be NOTIFIED when it completes; stop calling wait and do other work",
-              }
-            : {}),
-        };
-      }),
-    ),
+  // "pending"/auto-promote "timeout" child is reported as "running" with a note
+  // telling the model to stop waiting.
+  const results: WaitSubagentOutput["results"] = yield* Effect.forEach(
+    effectiveSlice.results,
+    (row) =>
+      loadThreadDetail(runtime, row.childThreadId).pipe(
+        Effect.timeoutOption(`${WAIT_PROJECTION_ENRICHMENT_TIMEOUT_MS} millis`),
+        Effect.map((thread) => {
+          const promotedRunning =
+            autoPromote && (row.status === "pending" || row.status === "timeout");
+          return {
+            childThreadId: row.childThreadId,
+            status: promotedRunning ? "running" : row.status,
+            turnCount: Option.match(thread, {
+              onNone: () => 0,
+              onSome: (detailOption) =>
+                Option.match(detailOption, { onNone: () => 0, onSome: turnCountOf }),
+            }),
+            finalAssistantText: row.finalAssistantText,
+            error: promotedRunning ? null : row.error,
+            ...(promotedRunning
+              ? {
+                  note: "still running — you will be NOTIFIED when it completes; stop calling wait and do other work",
+                }
+              : {}),
+          };
+        }),
+      ),
   );
 
   return {
     results,
-    settledCount: slice.settledCount,
-    timedOutCount: slice.timedOutCount,
+    settledCount: effectiveSlice.settledCount,
+    timedOutCount: autoPromote ? 0 : effectiveSlice.timedOutCount,
     // Auto-promote is a terminal return: the model must stop waiting, so this is
     // never reported as still-pending even though some children are running.
-    pending: autoPromote ? false : slice.pending,
-    resumeToken: `${waitStartMs}:${slice.resumeToken}`,
+    pending: autoPromote ? false : effectiveSlice.pending,
+    resumeToken: `${waitStartMs}:${effectiveSlice.resumeToken}`,
     ...(autoPromote ? { promoted: true } : {}),
   };
 });

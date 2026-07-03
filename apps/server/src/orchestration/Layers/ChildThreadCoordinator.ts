@@ -15,6 +15,7 @@ import {
   type OrchestrationThread,
   type OrchestrationThreadShell,
   type ThreadId,
+  type TurnId,
 } from "@t3tools/contracts";
 import { makeDrainableWorker } from "@t3tools/shared/DrainableWorker";
 import * as Cause from "effect/Cause";
@@ -87,6 +88,7 @@ interface PendingInjection {
 }
 
 type TurnDiffCompletedEvent = Extract<OrchestrationEvent, { type: "thread.turn-diff-completed" }>;
+type TurnStartRequestedEvent = Extract<OrchestrationEvent, { type: "thread.turn-start-requested" }>;
 type SessionSetEvent = Extract<OrchestrationEvent, { type: "thread.session-set" }>;
 type ThreadDeletedEvent = Extract<OrchestrationEvent, { type: "thread.deleted" }>;
 
@@ -105,7 +107,7 @@ const CONSOLIDATED_INJECTION_MAX_CHARS = 2_000;
  * requested (lens-3 guard so a stale assistant message from a prior turn is
  * never reported as this turn's output).
  */
-const finalAssistantTextFromThread = (thread: OrchestrationThread): string | null => {
+export const finalAssistantTextFromThread = (thread: OrchestrationThread): string | null => {
   const latestTurn = thread.latestTurn;
   if (!latestTurn) return null;
   let chosen: string | null = null;
@@ -150,9 +152,20 @@ const make = Effect.gen(function* () {
   // Children promoted to wake-on-completion (R-A): a waited child whose waiter
   // stopped, so its completion must wake the parent like a detached child.
   const promotedChildren = new Set<ThreadId>();
+  // Last active provider turn observed for each child. Session-ready is only
+  // terminal when the projected terminal turn matches this id.
+  const activeTurnByChild = new Map<ThreadId, TurnId>();
+  // A provider turn-start request has no turn id, so it invalidates the prior
+  // active turn until a session-set reports the new active turn id.
+  const pendingTurnStartByChild = new Set<ThreadId>();
+  // A conservative "missing" turn diff while the projection still shows the
+  // turn running is not terminal by itself, but a later stopped/error session
+  // must fail the child instead of leaving the waiter pending forever.
+  const missingDiffWhileRunningByChild = new Set<ThreadId>();
   // Per-child guard so a deferred child_steer drain (R-C) is serialised and
   // never double-dispatches against the same child.
   const childSteerLocks = new Map<ThreadId, Semaphore.Semaphore>();
+  let service: ChildThreadCoordinatorShape;
 
   const nowMillis = Effect.clockWith((clock) => clock.currentTimeMillis);
   const nowIso = Effect.map(DateTime.now, DateTime.formatIso);
@@ -302,6 +315,33 @@ const make = Effect.gen(function* () {
       Effect.map(Option.flatten),
     );
 
+  const completeChild = (
+    childThreadId: ThreadId,
+    status: ChildTerminalStatus,
+    finalAssistantText: string | null,
+    error: string | null,
+  ) =>
+    Effect.gen(function* () {
+      const record = children.get(childThreadId);
+      if (!record) return;
+      const settled = yield* Deferred.succeed(record.terminal, {
+        childThreadId,
+        status,
+        finalAssistantText,
+        error,
+      });
+      if (settled) {
+        activeTurnByChild.delete(childThreadId);
+        pendingTurnStartByChild.delete(childThreadId);
+      }
+      // A detached child always wakes its parent; a promoted child (R-A: a waited
+      // child whose waiter stopped) must wake too, satisfying the notify-guarantee
+      // that no child completes with neither an active waiter nor a wake.
+      if (settled && (record.detached || promotedChildren.has(childThreadId))) {
+        yield* wakeParent(record, { childThreadId, status, finalAssistantText, error });
+      }
+    });
+
   // Settle a child terminal Deferred exactly once. Deferred.succeed is a no-op
   // when already settled, which makes every signal path idempotent.
   const settleChild = (
@@ -311,25 +351,12 @@ const make = Effect.gen(function* () {
     bounded = false,
   ) =>
     Effect.gen(function* () {
-      const record = children.get(childThreadId);
-      if (!record) return;
       const detail = yield* (bounded ? getThreadDetailBounded : getThreadDetail)(childThreadId);
       const finalAssistantText = Option.match(detail, {
         onNone: () => null,
         onSome: finalAssistantTextFromThread,
       });
-      const settled = yield* Deferred.succeed(record.terminal, {
-        childThreadId,
-        status,
-        finalAssistantText,
-        error,
-      });
-      // A detached child always wakes its parent; a promoted child (R-A: a waited
-      // child whose waiter stopped) must wake too, satisfying the notify-guarantee
-      // that no child completes with neither an active waiter nor a wake.
-      if (settled && (record.detached || promotedChildren.has(childThreadId))) {
-        yield* wakeParent(record, { childThreadId, status, finalAssistantText, error });
-      }
+      yield* completeChild(childThreadId, status, finalAssistantText, error);
     });
 
   const consolidatedInjectionText = (entries: ReadonlyArray<PendingInjection>): string => {
@@ -625,10 +652,53 @@ const make = Effect.gen(function* () {
     Effect.gen(function* () {
       const { threadId, status } = event.payload;
       if (children.has(threadId)) {
-        if (status === "ready") {
+        const shellOption = yield* getThreadShellBounded(threadId);
+        if (pendingTurnStartByChild.has(threadId)) {
+          const latestTurn = Option.isSome(shellOption) ? shellOption.value.latestTurn : null;
+          const session = Option.isSome(shellOption) ? shellOption.value.session : null;
+          const sameTurnBecameIdle =
+            latestTurn?.turnId === event.payload.turnId &&
+            latestTurn.state !== "running" &&
+            (session === null || session.activeTurnId === null);
+          if (!sameTurnBecameIdle) return;
+          pendingTurnStartByChild.delete(threadId);
+          activeTurnByChild.set(threadId, event.payload.turnId);
+        }
+        const latestTurn = Option.isSome(shellOption) ? shellOption.value.latestTurn : null;
+        const latestTurnMatchesEvent = latestTurn?.turnId === event.payload.turnId;
+        const turnState = latestTurnMatchesEvent ? latestTurn?.state : null;
+        const expectedTurnId = activeTurnByChild.get(threadId);
+        if (expectedTurnId !== undefined && expectedTurnId !== event.payload.turnId) {
+          return;
+        }
+        if (
+          status === "missing" &&
+          (Option.isNone(shellOption) || !latestTurnMatchesEvent || turnState === "running")
+        ) {
+          missingDiffWhileRunningByChild.add(threadId);
+          return;
+        }
+        if (
+          status === "ready" &&
+          (Option.isNone(shellOption) || !latestTurnMatchesEvent || turnState === "running")
+        ) {
+          return;
+        }
+        if (status !== "missing" && latestTurn !== null && !latestTurnMatchesEvent) {
+          return;
+        }
+        missingDiffWhileRunningByChild.delete(threadId);
+        if (
+          turnState === "completed" ||
+          (turnState !== "error" && turnState !== "interrupted" && status === "ready")
+        ) {
           yield* settleChild(threadId, "completed", null);
         } else {
-          yield* settleChild(threadId, "failed", `turn diff ${status}`);
+          yield* settleChild(
+            threadId,
+            "failed",
+            turnState ? `turn ${turnState}` : `turn diff ${status}`,
+          );
         }
         // A child that went idle drains any provider-deferred steer (R-C). Run
         // after settle so a terminal child still flushes a queued steer if the
@@ -646,13 +716,51 @@ const make = Effect.gen(function* () {
       const { threadId, session } = event.payload;
       const record = children.get(threadId);
       if (!record) return;
-      if (session.status !== "stopped" && session.status !== "error") return;
+      if (
+        (session.status === "running" || session.status === "waiting") &&
+        session.activeTurnId !== null
+      ) {
+        activeTurnByChild.set(threadId, session.activeTurnId);
+        pendingTurnStartByChild.delete(threadId);
+      }
+      if (
+        session.status !== "ready" &&
+        session.status !== "stopped" &&
+        session.status !== "error"
+      ) {
+        return;
+      }
+      if (session.status === "ready") {
+        const expectedTurnId = activeTurnByChild.get(threadId);
+        if (expectedTurnId === undefined) return;
+        for (let attempt = 0; attempt < 6; attempt += 1) {
+          const shellOption = yield* getThreadShellBounded(threadId);
+          const latestTurn = Option.isSome(shellOption) ? shellOption.value.latestTurn : null;
+          const turnState =
+            latestTurn !== null && latestTurn.turnId === expectedTurnId ? latestTurn.state : null;
+          if (turnState === "completed") {
+            yield* settleChild(threadId, "completed", null);
+            yield* drainChildSteers(threadId);
+            return;
+          }
+          if (turnState === "error" || turnState === "interrupted") {
+            yield* settleChild(threadId, "failed", `turn ${turnState}`);
+            yield* drainChildSteers(threadId);
+            return;
+          }
+          if (attempt < 5) {
+            yield* Effect.sleep("200 millis");
+          }
+        }
+        return;
+      }
       const shellOption = yield* getThreadShell(threadId);
       const turnRunning = Option.match(shellOption, {
         onNone: () => false,
         onSome: (shell) => shell.latestTurn?.state === "running",
       });
-      if (turnRunning) return;
+      if (turnRunning && !missingDiffWhileRunningByChild.has(threadId)) return;
+      missingDiffWhileRunningByChild.delete(threadId);
       yield* settleChild(threadId, "failed", `session ${session.status}`);
     });
 
@@ -664,10 +772,21 @@ const make = Effect.gen(function* () {
       }
     });
 
+  const handleTurnStartRequested = (event: TurnStartRequestedEvent) =>
+    Effect.sync(() => {
+      const { threadId } = event.payload;
+      if (!children.has(threadId)) return;
+      activeTurnByChild.delete(threadId);
+      pendingTurnStartByChild.add(threadId);
+      missingDiffWhileRunningByChild.delete(threadId);
+    });
+
   const processEvent = (event: OrchestrationEvent) => {
     switch (event.type) {
       case "thread.turn-diff-completed":
         return handleTurnDiffCompleted(event);
+      case "thread.turn-start-requested":
+        return handleTurnStartRequested(event);
       case "thread.session-set":
         return handleSessionSet(event);
       case "thread.deleted":
@@ -701,18 +820,45 @@ const make = Effect.gen(function* () {
       if (!record) return;
       const done = yield* Deferred.isDone(record.terminal);
       if (done) return;
+      if (pendingTurnStartByChild.has(childThreadId)) return;
       const shellOption = yield* getThreadShellBounded(childThreadId);
       if (Option.isNone(shellOption)) return;
       const shell = shellOption.value;
       if (shell.latestTurn === null) return;
+      const expectedTurnId = activeTurnByChild.get(childThreadId);
+      if (expectedTurnId !== undefined && shell.latestTurn.turnId !== expectedTurnId) {
+        return;
+      }
+      if (
+        shell.session?.activeTurnId != null &&
+        shell.latestTurn.turnId !== shell.session.activeTurnId
+      ) {
+        return;
+      }
       const turnState = shell.latestTurn.state;
       if (turnState === "running") return;
       if (turnState === "completed") {
-        yield* settleChild(childThreadId, "completed", null, true);
+        const detail = yield* getThreadDetailBounded(childThreadId);
+        if (Option.isNone(detail)) return;
+        yield* completeChild(
+          childThreadId,
+          "completed",
+          finalAssistantTextFromThread(detail.value),
+          null,
+        );
       } else {
         yield* settleChild(childThreadId, "failed", `turn ${turnState}`, true);
       }
     });
+
+  const sweepWakeProjectionTerminals = Effect.gen(function* () {
+    for (const [childThreadId, record] of children) {
+      if (!record.detached && !promotedChildren.has(childThreadId)) continue;
+      const done = yield* Deferred.isDone(record.terminal);
+      if (done) continue;
+      yield* oneShotTerminalCheck(childThreadId);
+    }
+  });
 
   const register: ChildThreadCoordinatorShape["register"] = (input) =>
     Effect.gen(function* () {
@@ -771,8 +917,15 @@ const make = Effect.gen(function* () {
       for (const childThreadId of childThreadIds) {
         const record = children.get(childThreadId);
         if (!record) continue;
-        const done = yield* Deferred.isDone(record.terminal);
-        if (done) continue;
+        const completed = yield* Deferred.poll(record.terminal);
+        if (Option.isSome(completed)) {
+          if (!record.detached && !promotedChildren.has(childThreadId)) {
+            promotedChildren.add(childThreadId);
+            const result = yield* completed.value;
+            yield* wakeParent(record, result);
+          }
+          continue;
+        }
         promotedChildren.add(childThreadId);
       }
     });
@@ -906,9 +1059,12 @@ const make = Effect.gen(function* () {
         { status: ChildTerminalStatus; error: string | null }
       >();
       const runningByChild = new Map<ThreadId, boolean>();
+      const activeTurnByReplayedChild = new Map<ThreadId, TurnId>();
+      const pendingTurnStartByReplayedChild = new Set<ThreadId>();
+      const missingDiffWhileRunningByReplayedChild = new Set<ThreadId>();
       let maxSequence = 0;
       yield* Stream.runForEach(orchestrationEngine.readEvents(0), (event) =>
-        Effect.sync(() => {
+        Effect.gen(function* () {
           const sequence = (event as { sequence?: number }).sequence;
           if (typeof sequence === "number" && sequence > maxSequence) {
             maxSequence = sequence;
@@ -917,6 +1073,39 @@ const make = Effect.gen(function* () {
             case "thread.turn-diff-completed": {
               const { threadId, status } = event.payload;
               if (!knownChildIds.has(threadId)) return;
+              if (pendingTurnStartByReplayedChild.has(threadId)) {
+                const shellOption = yield* getThreadShellBounded(threadId);
+                const latestTurn = Option.isSome(shellOption) ? shellOption.value.latestTurn : null;
+                const session = Option.isSome(shellOption) ? shellOption.value.session : null;
+                const sameTurnBecameIdle =
+                  latestTurn?.turnId === event.payload.turnId &&
+                  latestTurn.state !== "running" &&
+                  (session === null || session.activeTurnId === null);
+                if (!sameTurnBecameIdle) return;
+                pendingTurnStartByReplayedChild.delete(threadId);
+                activeTurnByReplayedChild.set(threadId, event.payload.turnId);
+              }
+              const expectedTurnId = activeTurnByReplayedChild.get(threadId);
+              if (expectedTurnId !== undefined && expectedTurnId !== event.payload.turnId) return;
+              if (status === "missing") {
+                if (terminalByChild.get(threadId)?.status === "completed") {
+                  runningByChild.set(threadId, false);
+                  activeTurnByReplayedChild.delete(threadId);
+                  return;
+                }
+                if (runningByChild.get(threadId) === true) {
+                  terminalByChild.delete(threadId);
+                  missingDiffWhileRunningByReplayedChild.add(threadId);
+                  return;
+                }
+                terminalByChild.set(threadId, {
+                  status: "failed",
+                  error: "turn diff missing",
+                });
+                runningByChild.set(threadId, false);
+                missingDiffWhileRunningByReplayedChild.delete(threadId);
+                return;
+              }
               terminalByChild.set(
                 threadId,
                 status === "ready"
@@ -924,6 +1113,8 @@ const make = Effect.gen(function* () {
                   : { status: "failed", error: `turn diff ${status}` },
               );
               runningByChild.set(threadId, false);
+              activeTurnByReplayedChild.delete(threadId);
+              missingDiffWhileRunningByReplayedChild.delete(threadId);
               return;
             }
             case "thread.turn-start-requested": {
@@ -931,19 +1122,34 @@ const make = Effect.gen(function* () {
               if (!knownChildIds.has(threadId)) return;
               runningByChild.set(threadId, true);
               terminalByChild.delete(threadId);
+              activeTurnByReplayedChild.delete(threadId);
+              pendingTurnStartByReplayedChild.add(threadId);
+              missingDiffWhileRunningByReplayedChild.delete(threadId);
               return;
             }
             case "thread.session-set": {
               const { threadId, session } = event.payload;
               if (!knownChildIds.has(threadId)) return;
               if (
+                (session.status === "running" || session.status === "waiting") &&
+                session.activeTurnId !== null
+              ) {
+                activeTurnByReplayedChild.set(threadId, session.activeTurnId);
+                pendingTurnStartByReplayedChild.delete(threadId);
+              }
+              if (
                 (session.status === "stopped" || session.status === "error") &&
-                runningByChild.get(threadId) !== true
+                (runningByChild.get(threadId) !== true ||
+                  missingDiffWhileRunningByReplayedChild.has(threadId))
               ) {
                 terminalByChild.set(threadId, {
                   status: "failed",
                   error: `session ${session.status}`,
                 });
+                runningByChild.set(threadId, false);
+                activeTurnByReplayedChild.delete(threadId);
+                pendingTurnStartByReplayedChild.delete(threadId);
+                missingDiffWhileRunningByReplayedChild.delete(threadId);
               }
               return;
             }
@@ -951,6 +1157,9 @@ const make = Effect.gen(function* () {
               const { threadId } = event.payload;
               if (!knownChildIds.has(threadId)) return;
               terminalByChild.set(threadId, { status: "killed", error: "thread deleted" });
+              activeTurnByReplayedChild.delete(threadId);
+              pendingTurnStartByReplayedChild.delete(threadId);
+              missingDiffWhileRunningByReplayedChild.delete(threadId);
               return;
             }
             default:
@@ -958,11 +1167,20 @@ const make = Effect.gen(function* () {
           }
         }),
       ).pipe(Effect.orDie);
-      return { terminalByChild, maxSequence };
+      return {
+        terminalByChild,
+        activeTurnByReplayedChild,
+        pendingTurnStartByReplayedChild,
+        missingDiffWhileRunningByReplayedChild,
+        maxSequence,
+      };
     });
 
   const start: ChildThreadCoordinatorShape["start"] = Effect.fn("ChildThreadCoordinator.start")(
     function* () {
+      yield* Effect.sync(() => {
+        activeCoordinator = service;
+      });
       // (1) Load all parent-linked children from the projection.
       const rows = yield* listPersistedChildRows().pipe(Effect.orDie);
       const knownChildIds = new Set<ThreadId>();
@@ -994,16 +1212,40 @@ const make = Effect.gen(function* () {
       }
 
       // (2) Determine terminal-ness from the persisted immutable log.
-      const { terminalByChild } = yield* reconcileFromLog(knownChildIds);
+      const {
+        terminalByChild,
+        activeTurnByReplayedChild,
+        pendingTurnStartByReplayedChild,
+        missingDiffWhileRunningByReplayedChild,
+      } = yield* reconcileFromLog(knownChildIds);
+      for (const [childThreadId, turnId] of activeTurnByReplayedChild) {
+        activeTurnByChild.set(childThreadId, turnId);
+      }
+      for (const childThreadId of pendingTurnStartByReplayedChild) {
+        pendingTurnStartByChild.add(childThreadId);
+      }
+      for (const childThreadId of missingDiffWhileRunningByReplayedChild) {
+        missingDiffWhileRunningByChild.add(childThreadId);
+      }
       for (const [childThreadId, outcome] of terminalByChild) {
         yield* settleChild(childThreadId, outcome.status, outcome.error);
       }
 
-      // Non-terminal children: validate the provider instance still exists.
+      // Non-terminal children may still have terminal projection state even when
+      // replay only saw a conservative "missing" diff. Reconcile that before
+      // applying the provider-instance kill path.
+      for (const childThreadId of knownChildIds) {
+        if (terminalByChild.has(childThreadId)) continue;
+        yield* oneShotTerminalCheck(childThreadId);
+      }
+
+      // Remaining non-terminal children: validate the provider instance still exists.
       for (const childThreadId of knownChildIds) {
         if (terminalByChild.has(childThreadId)) continue;
         const record = children.get(childThreadId);
         if (!record) continue;
+        const done = yield* Deferred.isDone(record.terminal);
+        if (done) continue;
         const instance = yield* registry.getInstance(record.model.instanceId);
         if (instance === undefined) {
           yield* Effect.logWarning(
@@ -1050,13 +1292,24 @@ const make = Effect.gen(function* () {
         Stream.runForEach(orchestrationEngine.streamDomainEvents, (event) => worker.enqueue(event)),
       );
 
+      yield* Effect.forever(
+        sweepWakeProjectionTerminals.pipe(
+          Effect.catchCause((cause) =>
+            Effect.logWarning("subagent wake projection sweep failed", {
+              cause: Cause.pretty(cause),
+            }),
+          ),
+          Effect.andThen(Effect.sleep("2 seconds")),
+        ),
+      ).pipe(Effect.forkScoped);
+
       yield* Effect.logInfo("child.thread.coordinator.reactor.started", {
         reconciledChildren: knownChildIds.size,
       });
     },
   );
 
-  return {
+  service = {
     register,
     waitSlice,
     assertParent,
@@ -1066,14 +1319,23 @@ const make = Effect.gen(function* () {
     start,
     drain: worker.drain,
   } satisfies ChildThreadCoordinatorShape;
-});
 
-export const ChildThreadCoordinatorLive = Layer.effect(ChildThreadCoordinator, make);
+  return service;
+});
 
 let activeCoordinator: ChildThreadCoordinatorShape | null = null;
 
 /** Reach the live coordinator from MCP tool handlers (mirrors `dispatchActive`). */
 export const coordinatorActive = (): ChildThreadCoordinatorShape | null => activeCoordinator;
+
+export const ChildThreadCoordinatorLive = Layer.effect(
+  ChildThreadCoordinator,
+  Effect.acquireRelease(make, (coordinator) =>
+    Effect.sync(() => {
+      if (activeCoordinator === coordinator) activeCoordinator = null;
+    }),
+  ),
+);
 
 export const ActiveChildThreadCoordinatorLive = Layer.effectDiscard(
   Effect.acquireRelease(
