@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+set -u
+
+if [[ -n "${T3DR_REAL_INJECT_RESUME:-}" ]]; then
+  exec "$T3DR_REAL_INJECT_RESUME" "$@"
+fi
+
+echo "inject-resume: implementation is supplied by the resume injection slice" >&2
+echo "inject-resume: set T3DR_REAL_INJECT_RESUME to an executable helper until that slice is merged" >&2
+exit 127

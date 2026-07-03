@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+set -u
+
+if [[ -n "${T3DR_REAL_T3_DB_SNAPSHOT:-}" ]]; then
+  exec "$T3DR_REAL_T3_DB_SNAPSHOT" "$@"
+fi
+
+echo "t3-db-snapshot: implementation is supplied by the database snapshot slice" >&2
+echo "t3-db-snapshot: set T3DR_REAL_T3_DB_SNAPSHOT to an executable helper until that slice is merged" >&2
+exit 127

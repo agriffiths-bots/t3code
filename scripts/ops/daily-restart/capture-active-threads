@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+set -u
+
+if [[ -n "${T3DR_REAL_CAPTURE_ACTIVE_THREADS:-}" ]]; then
+  exec "$T3DR_REAL_CAPTURE_ACTIVE_THREADS" "$@"
+fi
+
+echo "capture-active-threads: implementation is supplied by the capture slice" >&2
+echo "capture-active-threads: set T3DR_REAL_CAPTURE_ACTIVE_THREADS to an executable helper until that slice is merged" >&2
+exit 127

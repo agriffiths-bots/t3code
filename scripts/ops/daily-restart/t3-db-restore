@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+set -u
+
+if [[ -n "${T3DR_REAL_T3_DB_RESTORE:-}" ]]; then
+  exec "$T3DR_REAL_T3_DB_RESTORE" "$@"
+fi
+
+echo "t3-db-restore: implementation is supplied by the database restore slice" >&2
+echo "t3-db-restore: set T3DR_REAL_T3_DB_RESTORE to an executable helper until that slice is merged" >&2
+exit 127
