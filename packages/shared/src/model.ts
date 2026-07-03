@@ -333,11 +333,44 @@ function makeModelSelection(
   slug: string,
   defaultOptions: ReadonlyArray<ProviderOptionSelection> | undefined,
 ): ModelSelection {
-  // Preserve the model's default option selections (e.g. reasoning effort) so a
-  // plain-model choice matches what the picker would apply; omit when there are none.
-  return defaultOptions && defaultOptions.length > 0
-    ? { instanceId, model: slug, options: defaultOptions }
+  const options = applyThreadCreationDefaultEffort(slug, defaultOptions);
+  // Preserve provider defaults and layer T3's plain-model thread-creation
+  // effort defaults on top; omit options when there are none.
+  return options && options.length > 0
+    ? { instanceId, model: slug, options }
     : { instanceId, model: slug };
+}
+
+const THREAD_CREATION_DEFAULT_EFFORT_BY_MODEL: Record<
+  string,
+  { readonly optionId: string; readonly value: string }
+> = {
+  "gpt-5.5": { optionId: "reasoningEffort", value: "xhigh" },
+  "claude-opus-4-8": { optionId: "effort", value: "xhigh" },
+  "claude-sonnet-5": { optionId: "effort", value: "xhigh" },
+  "claude-fable-5": { optionId: "effort", value: "high" },
+};
+
+function applyThreadCreationDefaultEffort(
+  slug: string,
+  defaultOptions: ReadonlyArray<ProviderOptionSelection> | undefined,
+): Array<ProviderOptionSelection> | undefined {
+  const directed = THREAD_CREATION_DEFAULT_EFFORT_BY_MODEL[slug];
+  if (!directed) {
+    return defaultOptions && defaultOptions.length > 0
+      ? defaultOptions.map(cloneSelection)
+      : undefined;
+  }
+
+  const next =
+    defaultOptions && defaultOptions.length > 0 ? defaultOptions.map(cloneSelection) : [];
+  const existingIndex = next.findIndex((selection) => selection.id === directed.optionId);
+  if (existingIndex >= 0) {
+    next[existingIndex] = { ...next[existingIndex]!, value: directed.value };
+  } else {
+    next.push({ id: directed.optionId, value: directed.value });
+  }
+  return next;
 }
 
 /**

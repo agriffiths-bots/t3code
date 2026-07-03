@@ -2,6 +2,7 @@ import { expect, it } from "@effect/vitest";
 import {
   EnvironmentId,
   ProjectId,
+  ProviderDriverKind,
   ProviderInstanceId,
   ThreadId,
   type ModelSelection,
@@ -21,6 +22,7 @@ import * as BootstrapTurnStartDispatcher from "../../../orchestration/Services/B
 import { OrchestrationEngineService } from "../../../orchestration/Services/OrchestrationEngine.ts";
 import { ProjectionSnapshotQuery } from "../../../orchestration/Services/ProjectionSnapshotQuery.ts";
 import { ProviderInstanceRegistry } from "../../../provider/Services/ProviderInstanceRegistry.ts";
+import type { ProviderInstance } from "../../../provider/ProviderDriver.ts";
 import * as McpInvocationContext from "../../McpInvocationContext.ts";
 import { ThreadToolkitRegistrationLive } from "../../McpHttpServer.ts";
 import { ThreadStartRuntimeLive } from "./handlers.ts";
@@ -92,7 +94,23 @@ const TestCryptoLive = Layer.sync(Crypto.Crypto, () => {
   });
 });
 
-const makeTestLayer = (commands: OrchestrationCommand[]) => {
+const makeModelInstance = (instanceId: string, driverKind: string, slugs: ReadonlyArray<string>) =>
+  ({
+    instanceId: ProviderInstanceId.make(instanceId),
+    driverKind: ProviderDriverKind.make(driverKind),
+    enabled: true,
+    snapshot: {
+      getSnapshot: Effect.succeed({
+        status: "ready",
+        models: slugs.map((slug) => ({ slug, capabilities: null })),
+      }),
+    },
+  }) as unknown as ProviderInstance;
+
+const makeTestLayer = (
+  commands: OrchestrationCommand[],
+  providerInstances: ReadonlyArray<ProviderInstance> = [],
+) => {
   const bootstrapTurnStartDispatcherLayer = Layer.mock(
     BootstrapTurnStartDispatcher.BootstrapTurnStartDispatcher,
   )({
@@ -120,7 +138,7 @@ const makeTestLayer = (commands: OrchestrationCommand[]) => {
     ),
     Layer.provide(
       Layer.mock(ProviderInstanceRegistry)({
-        listInstances: Effect.succeed([]),
+        listInstances: Effect.succeed(providerInstances),
       }),
     ),
     Layer.provide(
@@ -171,7 +189,11 @@ const makeTestLayer = (commands: OrchestrationCommand[]) => {
   );
 };
 
-const callStartTool = (arguments_: Record<string, unknown>, commands: OrchestrationCommand[]) =>
+const callStartTool = (
+  arguments_: Record<string, unknown>,
+  commands: OrchestrationCommand[],
+  providerInstances: ReadonlyArray<ProviderInstance> = [],
+) =>
   Effect.gen(function* () {
     const server = yield* McpServer.McpServer;
     return yield* server
@@ -180,7 +202,7 @@ const callStartTool = (arguments_: Record<string, unknown>, commands: Orchestrat
         Effect.provideService(McpInvocationContext.McpInvocationContext, invocation),
         Effect.provideService(McpSchema.McpServerClient, client),
       );
-  }).pipe(Effect.provide(makeTestLayer(commands)));
+  }).pipe(Effect.provide(makeTestLayer(commands, providerInstances)));
 
 it.effect("starts a new worktree thread by default and inherits source settings", () =>
   Effect.gen(function* () {
@@ -230,5 +252,28 @@ it.effect("starts current-checkout threads with warning metadata", () =>
     if (command?.type !== "thread.turn.start") return;
     expect(command.bootstrap?.prepareWorktree).toBeUndefined();
     expect(command.bootstrap?.createThread?.worktreePath).toBeNull();
+  }),
+);
+
+it.effect("applies directive default effort when resolving a plain model", () =>
+  Effect.gen(function* () {
+    const commands: OrchestrationCommand[] = [];
+    const result = yield* callStartTool(
+      { prompt: "Investigate flaky tests", model: "claude-opus-4-8" },
+      commands,
+      [makeModelInstance("claudeAgent", "claudeAgent", ["claude-opus-4-8"])],
+    );
+
+    expect(result.isError).toBe(false);
+    const command = commands[0];
+    expect(command?.type).toBe("thread.turn.start");
+    if (command?.type !== "thread.turn.start") return;
+    const expectedSelection = {
+      instanceId: "claudeAgent",
+      model: "claude-opus-4-8",
+      options: [{ id: "effort", value: "xhigh" }],
+    };
+    expect(command.modelSelection).toEqual(expectedSelection);
+    expect(command.bootstrap?.createThread?.modelSelection).toEqual(expectedSelection);
   }),
 );

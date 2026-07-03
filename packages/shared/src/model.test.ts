@@ -252,6 +252,7 @@ describe("pickModelSelectionFromInstances", () => {
       "claude-opus-4-8",
       "claude-opus-4-6",
       "claude-sonnet-4-6",
+      "claude-sonnet-5",
       "claude-haiku-4-5",
       // Present in the live provider list but NOT in the registry alias maps:
       "claude-fable-5",
@@ -265,6 +266,7 @@ describe("pickModelSelectionFromInstances", () => {
     expect(pickModelSelectionFromInstances("claude-opus-4-8", sources)).toEqual({
       instanceId: "claudeAgent",
       model: "claude-opus-4-8",
+      options: [{ id: "effort", value: "xhigh" }],
     });
     expect(pickModelSelectionFromInstances("gpt-5.4", sources)).toEqual({
       instanceId: "codex",
@@ -282,6 +284,7 @@ describe("pickModelSelectionFromInstances", () => {
     expect(pickModelSelectionFromInstances("claude-fable-5", sources)).toEqual({
       instanceId: "claudeAgent",
       model: "claude-fable-5",
+      options: [{ id: "effort", value: "high" }],
     });
   });
 
@@ -289,6 +292,7 @@ describe("pickModelSelectionFromInstances", () => {
     expect(pickModelSelectionFromInstances("opus", sources)).toEqual({
       instanceId: "claudeAgent",
       model: "claude-opus-4-8",
+      options: [{ id: "effort", value: "xhigh" }],
     });
     expect(pickModelSelectionFromInstances("gpt-5-codex", sources)).toEqual({
       instanceId: "codex",
@@ -328,12 +332,74 @@ describe("pickModelSelectionFromInstances", () => {
       {
         instanceId: ProviderInstanceId.make("claudeAgent"),
         driverKind: ProviderDriverKind.make("claudeAgent"),
-        models: [{ slug: "claude-opus-4-8", defaultOptions: [{ id: "effort", value: "high" }] }],
+        models: [
+          {
+            slug: "claude-opus-4-6",
+            defaultOptions: [
+              { id: "effort", value: "high" },
+              { id: "fastMode", value: true },
+            ],
+          },
+        ],
       },
     ];
-    expect(pickModelSelectionFromInstances("claude-opus-4-8", withOptions)).toEqual({
+    expect(pickModelSelectionFromInstances("claude-opus-4-6", withOptions)).toEqual({
+      instanceId: "claudeAgent",
+      model: "claude-opus-4-6",
+      options: [
+        { id: "effort", value: "high" },
+        { id: "fastMode", value: true },
+      ],
+    });
+  });
+
+  it("applies T3 thread-creation default efforts for directive models", () => {
+    const withDirectiveModels: ReadonlyArray<ProviderModelSource> = [
+      {
+        instanceId: ProviderInstanceId.make("codex"),
+        driverKind: ProviderDriverKind.make("codex"),
+        models: [
+          {
+            slug: "gpt-5.5",
+            defaultOptions: [
+              { id: "reasoningEffort", value: "medium" },
+              { id: "serviceTier", value: "fast" },
+            ],
+          },
+        ],
+      },
+      {
+        instanceId: ProviderInstanceId.make("claudeAgent"),
+        driverKind: ProviderDriverKind.make("claudeAgent"),
+        models: [
+          { slug: "claude-opus-4-8", defaultOptions: [{ id: "effort", value: "high" }] },
+          { slug: "claude-sonnet-5", defaultOptions: [{ id: "effort", value: "medium" }] },
+          { slug: "claude-fable-5", defaultOptions: [{ id: "effort", value: "xhigh" }] },
+        ],
+      },
+    ];
+
+    expect(pickModelSelectionFromInstances("gpt-5.5", withDirectiveModels)).toEqual({
+      instanceId: "codex",
+      model: "gpt-5.5",
+      options: [
+        { id: "reasoningEffort", value: "xhigh" },
+        { id: "serviceTier", value: "fast" },
+      ],
+    });
+    expect(pickModelSelectionFromInstances("claude-opus-4-8", withDirectiveModels)).toEqual({
       instanceId: "claudeAgent",
       model: "claude-opus-4-8",
+      options: [{ id: "effort", value: "xhigh" }],
+    });
+    expect(pickModelSelectionFromInstances("claude-sonnet-5", withDirectiveModels)).toEqual({
+      instanceId: "claudeAgent",
+      model: "claude-sonnet-5",
+      options: [{ id: "effort", value: "xhigh" }],
+    });
+    expect(pickModelSelectionFromInstances("claude-fable-5", withDirectiveModels)).toEqual({
+      instanceId: "claudeAgent",
+      model: "claude-fable-5",
       options: [{ id: "effort", value: "high" }],
     });
   });

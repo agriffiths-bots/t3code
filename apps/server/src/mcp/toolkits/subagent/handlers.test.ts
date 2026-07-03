@@ -579,14 +579,84 @@ describe("SubagentToolkit", () => {
         expect(result.isError).toBe(false);
         // The returned entry confirms the routed harness to the caller...
         expect(result.structuredContent).toMatchObject({
-          modelSelection: { instanceId: "claudeAgent", model: "claude-opus-4-8" },
+          modelSelection: {
+            instanceId: "claudeAgent",
+            model: "claude-opus-4-8",
+            options: [{ id: "effort", value: "xhigh" }],
+          },
         });
         // ...and the persisted task carries the same resolved selection.
         expect(insertedTasks).toHaveLength(1);
         expect(insertedTasks[0]!.modelSelection).toMatchObject({
           instanceId: "claudeAgent",
           model: "claude-opus-4-8",
+          options: [{ id: "effort", value: "xhigh" }],
         });
+      }),
+    ).pipe(Effect.provide(TestLayer)),
+  );
+
+  it.effect("t3_schedule_create applies directive default efforts for plain models", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const server = yield* McpServer.McpServer;
+        insertedTasks.length = 0;
+        modelInstances = [
+          makeModelInstance("codex", "codex", ["gpt-5.5"]),
+          makeModelInstance("claudeAgent", "claudeAgent", [
+            "claude-opus-4-8",
+            "claude-sonnet-5",
+            "claude-fable-5",
+          ]),
+        ];
+
+        const cases = [
+          { model: "gpt-5.5", optionId: "reasoningEffort", value: "xhigh" },
+          { model: "claude-opus-4-8", optionId: "effort", value: "xhigh" },
+          { model: "claude-sonnet-5", optionId: "effort", value: "xhigh" },
+          { model: "claude-fable-5", optionId: "effort", value: "high" },
+        ] as const;
+
+        for (const row of cases) {
+          const result = yield* server
+            .callTool({
+              name: "t3_schedule_create",
+              arguments: {
+                prompt: `scheduled ${row.model}`,
+                intervalSeconds: 3_600,
+                model: row.model,
+              },
+            })
+            .pipe(
+              Effect.provideService(McpInvocationContext.McpInvocationContext, invocation),
+              Effect.provideService(McpSchema.McpServerClient, client),
+            );
+
+          expect(result.isError).toBe(false);
+        }
+
+        expect(insertedTasks.map((task) => task.modelSelection)).toEqual([
+          {
+            instanceId: "codex",
+            model: "gpt-5.5",
+            options: [{ id: "reasoningEffort", value: "xhigh" }],
+          },
+          {
+            instanceId: "claudeAgent",
+            model: "claude-opus-4-8",
+            options: [{ id: "effort", value: "xhigh" }],
+          },
+          {
+            instanceId: "claudeAgent",
+            model: "claude-sonnet-5",
+            options: [{ id: "effort", value: "xhigh" }],
+          },
+          {
+            instanceId: "claudeAgent",
+            model: "claude-fable-5",
+            options: [{ id: "effort", value: "high" }],
+          },
+        ]);
       }),
     ).pipe(Effect.provide(TestLayer)),
   );
