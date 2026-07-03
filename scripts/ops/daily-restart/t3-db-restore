@@ -2,6 +2,7 @@
 set -Eeuo pipefail
 
 export PATH="/home/linuxbrew/.linuxbrew/bin:/home/adam/.local/bin:/usr/local/bin:/usr/bin:/bin"
+umask 077
 
 DEFAULT_DB="/home/adam/.t3-vps/userdata/state.sqlite"
 
