@@ -1540,3 +1540,40 @@ index 76a83f3acb6fd3f0af7f027798848b7124100286..9e4499f076f9988e3266df4be7201e13
    | HeaderBarButtonItemSpacing;
  
  /**
+diff --git a/android/src/main/java/com/swmansion/rnscreens/ScreenStackHeaderConfigViewManager.kt b/android/src/main/java/com/swmansion/rnscreens/ScreenStackHeaderConfigViewManager.kt
+index 5e2c40e4a2254f3d5368fe24fbf22de0a58d1f32..5bde39477ed27114c98ea349f4783d83db37e748 100644
+--- a/android/src/main/java/com/swmansion/rnscreens/ScreenStackHeaderConfigViewManager.kt
++++ b/android/src/main/java/com/swmansion/rnscreens/ScreenStackHeaderConfigViewManager.kt
+@@ -295,6 +295,31 @@ class ScreenStackHeaderConfigViewManager :
+         value: ReadableArray?,
+     ) = Unit
+-
++
++    override fun setSubtitle(
++        view: ScreenStackHeaderConfig?,
++        value: String?,
++    ) = Unit
++
++    override fun setLargeSubtitle(
++        view: ScreenStackHeaderConfig?,
++        value: String?,
++    ) = Unit
++
++    override fun setNavigationItemStyle(
++        view: ScreenStackHeaderConfig?,
++        value: String?,
++    ) = Unit
++
++    override fun setHeaderCenterBarButtonItems(
++        view: ScreenStackHeaderConfig?,
++        value: ReadableArray?,
++    ) = Unit
++
++    override fun setHeaderToolbarItems(
++        view: ScreenStackHeaderConfig?,
++        value: ReadableArray?,
++    ) = Unit
++
+     override fun setUserInterfaceStyle(
+         view: ScreenStackHeaderConfig?,
+         value: String?,
