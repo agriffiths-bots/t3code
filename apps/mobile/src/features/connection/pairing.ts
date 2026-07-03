@@ -3,6 +3,8 @@ import * as Schema from "effect/Schema";
 
 const MOBILE_PAIRING_URL_PARAM = "pairingUrl";
 const CLOUDFLARE_ACCESS_TOKEN_PARAM = "cf_access_token";
+const CLOUDFLARE_ACCESS_CLIENT_ID_PARAM = "cf_access_client_id";
+const CLOUDFLARE_ACCESS_CLIENT_SECRET_PARAM = "cf_access_client_secret";
 
 export class PairingQrPayloadEmptyError extends Schema.TaggedErrorClass<PairingQrPayloadEmptyError>()(
   "PairingQrPayloadEmptyError",
@@ -13,14 +15,32 @@ export class PairingQrPayloadEmptyError extends Schema.TaggedErrorClass<PairingQ
   }
 }
 
+export interface CloudflareAccessPairingParams {
+  readonly token?: string;
+  readonly clientId?: string;
+  readonly clientSecret?: string;
+}
+
+function normalizeCloudflareAccessParams(
+  cloudflareAccess?: string | CloudflareAccessPairingParams,
+): CloudflareAccessPairingParams {
+  if (typeof cloudflareAccess === "string") {
+    return { token: cloudflareAccess };
+  }
+  return cloudflareAccess ?? {};
+}
+
 export function buildPairingUrl(
   host: string,
   code: string,
-  cloudflareAccessToken?: string,
+  cloudflareAccess?: string | CloudflareAccessPairingParams,
 ): string {
   const h = host.trim();
   const c = code.trim();
-  const cfAccessToken = cloudflareAccessToken?.trim() ?? "";
+  const cfAccess = normalizeCloudflareAccessParams(cloudflareAccess);
+  const cfAccessToken = cfAccess.token?.trim() ?? "";
+  const cfAccessClientId = cfAccess.clientId?.trim() ?? "";
+  const cfAccessClientSecret = cfAccess.clientSecret?.trim() ?? "";
   if (!h) return "";
   if (!c) return h;
 
@@ -29,6 +49,12 @@ export function buildPairingUrl(
     url.hash = new URLSearchParams([
       ["token", c],
       ...(cfAccessToken.length > 0 ? [[CLOUDFLARE_ACCESS_TOKEN_PARAM, cfAccessToken]] : []),
+      ...(cfAccessClientId.length > 0
+        ? [[CLOUDFLARE_ACCESS_CLIENT_ID_PARAM, cfAccessClientId]]
+        : []),
+      ...(cfAccessClientSecret.length > 0
+        ? [[CLOUDFLARE_ACCESS_CLIENT_SECRET_PARAM, cfAccessClientSecret]]
+        : []),
     ]).toString();
     return url.toString();
   } catch {
@@ -40,9 +66,19 @@ export function parsePairingUrl(url: string): {
   host: string;
   code: string;
   cloudflareAccessToken: string;
+  cloudflareAccessClientId: string;
+  cloudflareAccessClientSecret: string;
 } {
   const trimmed = url.trim();
-  if (!trimmed) return { host: "", code: "", cloudflareAccessToken: "" };
+  if (!trimmed) {
+    return {
+      host: "",
+      code: "",
+      cloudflareAccessToken: "",
+      cloudflareAccessClientId: "",
+      cloudflareAccessClientSecret: "",
+    };
+  }
 
   try {
     const parsed = new URL(trimmed);
@@ -52,11 +88,21 @@ export function parsePairingUrl(url: string): {
       hashParams.get(CLOUDFLARE_ACCESS_TOKEN_PARAM) ||
       parsed.searchParams.get(CLOUDFLARE_ACCESS_TOKEN_PARAM) ||
       "";
+    const cloudflareAccessClientId =
+      hashParams.get(CLOUDFLARE_ACCESS_CLIENT_ID_PARAM) ||
+      parsed.searchParams.get(CLOUDFLARE_ACCESS_CLIENT_ID_PARAM) ||
+      "";
+    const cloudflareAccessClientSecret =
+      hashParams.get(CLOUDFLARE_ACCESS_CLIENT_SECRET_PARAM) ||
+      parsed.searchParams.get(CLOUDFLARE_ACCESS_CLIENT_SECRET_PARAM) ||
+      "";
     if (hostedPairingRequest) {
       return {
         host: hostedPairingRequest.host.replace(/\/$/, ""),
         code: hostedPairingRequest.token,
         cloudflareAccessToken,
+        cloudflareAccessClientId,
+        cloudflareAccessClientSecret,
       };
     }
 
@@ -67,9 +113,21 @@ export function parsePairingUrl(url: string): {
     parsed.hash = "";
     parsed.search = "";
     parsed.pathname = "/";
-    return { host: parsed.toString().replace(/\/$/, ""), code, cloudflareAccessToken };
+    return {
+      host: parsed.toString().replace(/\/$/, ""),
+      code,
+      cloudflareAccessToken,
+      cloudflareAccessClientId,
+      cloudflareAccessClientSecret,
+    };
   } catch {
-    return { host: trimmed, code: "", cloudflareAccessToken: "" };
+    return {
+      host: trimmed,
+      code: "",
+      cloudflareAccessToken: "",
+      cloudflareAccessClientId: "",
+      cloudflareAccessClientSecret: "",
+    };
   }
 }
 

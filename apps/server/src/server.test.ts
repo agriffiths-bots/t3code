@@ -1235,6 +1235,9 @@ const assertBrowserApiCorsPreflightHeaders = (
   assert.deepEqual(splitHeaderTokens(headers["access-control-allow-headers"]), [
     "authorization",
     "b3",
+    "cf-access-client-id",
+    "cf-access-client-secret",
+    "cf-access-jwt-assertion",
     "content-type",
     "dpop",
     "traceparent",
@@ -4004,6 +4007,9 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
       assert.deepEqual(splitHeaderTokens(response.headers["access-control-allow-headers"]), [
         "authorization",
         "b3",
+        "cf-access-client-id",
+        "cf-access-client-secret",
+        "cf-access-jwt-assertion",
         "content-type",
         "dpop",
         "traceparent",

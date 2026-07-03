@@ -102,7 +102,7 @@ export const make = Effect.gen(function* () {
     });
     const socketHeaders = connection.socketHeaders;
     const socketConstructor =
-      socketHeaders === undefined || !canPassWebSocketHeaderOptions()
+      socketHeaders === undefined || !canPassWebSocketHeaderOptions(webSocketConstructor)
         ? webSocketConstructor
         : (((url: string | URL, protocols?: string | string[]) =>
             new (webSocketConstructor as unknown as HeaderOptionsWebSocketConstructor)(

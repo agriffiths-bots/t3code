@@ -6,7 +6,11 @@ import * as Option from "effect/Option";
 import { afterEach, vi } from "vite-plus/test";
 
 import { remoteHttpClientLayer } from "../rpc/http.ts";
-import { ClientPresentation, SshEnvironmentGateway } from "../platform/capabilities.ts";
+import {
+  ClientPresentation,
+  markWebSocketHeaderOptionsCapable,
+  SshEnvironmentGateway,
+} from "../platform/capabilities.ts";
 import { BearerConnectionCredential, BearerConnectionProfile } from "./catalog.ts";
 import { BearerConnectionTarget } from "./model.ts";
 import {
@@ -30,6 +34,13 @@ const CLIENT_PRESENTATION_LAYER = Layer.succeed(
 afterEach(() => {
   vi.unstubAllGlobals();
 });
+
+function enableHeaderCapableWebSocketRuntime() {
+  vi.stubGlobal(
+    "WebSocket",
+    markWebSocketHeaderOptionsCapable(function WebSocket() {}),
+  );
+}
 
 function pairingHttpLayer(
   calls: Array<{ readonly url: string; readonly init: RequestInit }>,
@@ -148,6 +159,7 @@ describe("connection onboarding", () => {
 
   it.effect("persists Cloudflare Access service-token credentials from pairing urls", () =>
     Effect.gen(function* () {
+      enableHeaderCapableWebSocketRuntime();
       const calls: Array<{ readonly url: string; readonly init: RequestInit }> = [];
       const registration = yield* preparePairingRegistration({
         pairingUrl:

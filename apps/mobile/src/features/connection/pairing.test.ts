@@ -40,6 +40,8 @@ describe("parsePairingUrl", () => {
       host: "https://desktop.tailnet.ts.net",
       code: "pairing-token",
       cloudflareAccessToken: "",
+      cloudflareAccessClientId: "",
+      cloudflareAccessClientSecret: "",
     });
   });
 
@@ -52,6 +54,22 @@ describe("parsePairingUrl", () => {
       host: "https://remote.example.com",
       code: "pairing-token",
       cloudflareAccessToken: "cf-access-jwt",
+      cloudflareAccessClientId: "",
+      cloudflareAccessClientSecret: "",
+    });
+  });
+
+  it("keeps Cloudflare Access service-token credentials from pairing urls", () => {
+    expect(
+      parsePairingUrl(
+        "https://remote.example.com/pair#token=pairing-token&cf_access_client_id=client-id&cf_access_client_secret=client-secret",
+      ),
+    ).toEqual({
+      host: "https://remote.example.com",
+      code: "pairing-token",
+      cloudflareAccessToken: "",
+      cloudflareAccessClientId: "client-id",
+      cloudflareAccessClientSecret: "client-secret",
     });
   });
 });
@@ -60,6 +78,17 @@ describe("buildPairingUrl", () => {
   it("adds Cloudflare Access tokens as hidden fragment state", () => {
     expect(buildPairingUrl("remote.example.com", "pairing-token", "cf-access-jwt")).toBe(
       "https://remote.example.com/#token=pairing-token&cf_access_token=cf-access-jwt",
+    );
+  });
+
+  it("adds Cloudflare Access service-token fields as hidden fragment state", () => {
+    expect(
+      buildPairingUrl("remote.example.com", "pairing-token", {
+        clientId: "client-id",
+        clientSecret: "client-secret",
+      }),
+    ).toBe(
+      "https://remote.example.com/#token=pairing-token&cf_access_client_id=client-id&cf_access_client_secret=client-secret",
     );
   });
 });

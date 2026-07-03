@@ -171,6 +171,12 @@ function upsertSchedule({
         enabled = excluded.enabled,
         busy_policy = excluded.busy_policy,
         next_run_at = excluded.next_run_at,
+        last_run_at = NULL,
+        last_status = NULL,
+        last_error = NULL,
+        skipped_count = 0,
+        retry_count = 0,
+        queued_count = 0,
         model_selection = excluded.model_selection`,
     ).run(
       taskId,
@@ -221,7 +227,7 @@ async function main() {
   const snapshot = await requestJson(origin, token, "/api/orchestration/snapshot");
 
   let project = (snapshot.projects ?? []).find(
-    (candidate) => candidate.workspaceRoot === workspace && candidate.deletedAt === null,
+    (candidate) => candidate.workspaceRoot === workspace && (candidate.deletedAt ?? null) === null,
   );
   if (project === undefined) {
     const projectId = NodeCrypto.randomUUID();
@@ -241,7 +247,8 @@ async function main() {
     (candidate) =>
       candidate.projectId === project.id &&
       candidate.title === threadTitle &&
-      candidate.deletedAt === null,
+      (candidate.deletedAt ?? null) === null &&
+      (candidate.archivedAt ?? null) === null,
   );
   if (thread === undefined) {
     const threadId = NodeCrypto.randomUUID();

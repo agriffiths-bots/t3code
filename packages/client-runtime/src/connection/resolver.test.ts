@@ -49,6 +49,13 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
+function enableHeaderCapableWebSocketRuntime() {
+  vi.stubGlobal(
+    "WebSocket",
+    ClientCapabilities.markWebSocketHeaderOptionsCapable(function WebSocket() {}),
+  );
+}
+
 function catalogEntry(
   target: ConnectionTarget,
   profile: Option.Option<ConnectionProfile> = Option.none(),
@@ -305,6 +312,7 @@ describe("ConnectionResolver", () => {
 
   it.effect("passes Cloudflare Access service-token credentials during bearer authorization", () =>
     Effect.gen(function* () {
+      enableHeaderCapableWebSocketRuntime();
       const accessInputs = yield* Ref.make<ReadonlyArray<unknown>>([]);
       const target = new BearerConnectionTarget({
         environmentId: ENVIRONMENT_ID,

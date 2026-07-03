@@ -11,10 +11,42 @@ import type * as Option from "effect/Option";
 
 import type { ConnectionAttemptError } from "../connection/model.ts";
 
-export function canPassWebSocketHeaderOptions() {
+const HEADER_OPTIONS_CAPABLE_WEBSOCKET = Symbol.for(
+  "@t3tools/client-runtime/WebSocket.headerOptionsCapable",
+);
+
+type HeaderOptionsCapableWebSocketConstructor = {
+  readonly [HEADER_OPTIONS_CAPABLE_WEBSOCKET]?: true;
+};
+
+export function markWebSocketHeaderOptionsCapable<T extends object>(constructor: T): T {
+  if (
+    (constructor as HeaderOptionsCapableWebSocketConstructor)[HEADER_OPTIONS_CAPABLE_WEBSOCKET] !==
+    true
+  ) {
+    Object.defineProperty(constructor, HEADER_OPTIONS_CAPABLE_WEBSOCKET, {
+      configurable: false,
+      enumerable: false,
+      value: true,
+    });
+  }
+  return constructor;
+}
+
+export function canPassWebSocketHeaderOptions(
+  webSocketConstructor: unknown = globalThis.WebSocket,
+) {
   const navigatorProduct = (globalThis.navigator as { readonly product?: string } | undefined)
     ?.product;
-  return navigatorProduct === "ReactNative" || !("window" in globalThis);
+  if (navigatorProduct === "ReactNative") {
+    return true;
+  }
+  return (
+    typeof webSocketConstructor === "function" &&
+    (webSocketConstructor as HeaderOptionsCapableWebSocketConstructor)[
+      HEADER_OPTIONS_CAPABLE_WEBSOCKET
+    ] === true
+  );
 }
 
 export interface PreparedSshEnvironment {
