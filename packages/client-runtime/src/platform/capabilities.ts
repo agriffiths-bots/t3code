@@ -11,6 +11,12 @@ import type * as Option from "effect/Option";
 
 import type { ConnectionAttemptError } from "../connection/model.ts";
 
+export function canPassWebSocketHeaderOptions() {
+  const navigatorProduct = (globalThis.navigator as { readonly product?: string } | undefined)
+    ?.product;
+  return navigatorProduct === "ReactNative" || !("window" in globalThis);
+}
+
 export interface PreparedSshEnvironment {
   readonly bootstrap: DesktopSshEnvironmentBootstrap;
   readonly bearerToken: string;

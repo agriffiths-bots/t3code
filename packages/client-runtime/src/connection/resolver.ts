@@ -46,6 +46,38 @@ const isBearerProfile = Schema.is(BearerConnectionProfile);
 const isSshProfile = Schema.is(SshConnectionProfile);
 const isBearerCredential = Schema.is(BearerConnectionCredential);
 
+function cloudflareAccessFromCredential(credential: BearerConnectionCredential) {
+  const clientId = credential.cloudflareAccessClientId?.trim() ?? "";
+  const clientSecret = credential.cloudflareAccessClientSecret?.trim() ?? "";
+  if (clientId.length > 0 && clientSecret.length > 0) {
+    return {
+      _tag: "service-token" as const,
+      clientId,
+      clientSecret,
+    };
+  }
+  const jwt = credential.cloudflareAccessToken?.trim() ?? "";
+  return jwt.length > 0 ? { jwt } : undefined;
+}
+
+function validateCloudflareAccessRuntime(
+  cloudflareAccess: ReturnType<typeof cloudflareAccessFromCredential>,
+) {
+  if (
+    cloudflareAccess?._tag === "service-token" &&
+    !ClientCapabilities.canPassWebSocketHeaderOptions()
+  ) {
+    return Effect.fail(
+      new ConnectionBlockedError({
+        reason: "unsupported",
+        detail:
+          "Cloudflare Access service-token connections require a client that can send WebSocket headers. Use a header-capable desktop or headless client, or save a browser-compatible Cloudflare Access JWT/cookie connection.",
+      }),
+    );
+  }
+  return Effect.void;
+}
+
 function primarySocketUrl(target: PrimaryConnectionTarget): string {
   const url = new URL(target.wsBaseUrl);
   if (url.pathname === "" || url.pathname === "/") {
@@ -121,14 +153,14 @@ const makeBearerBroker = Effect.fn("clientRuntime.connection.broker.makeBearer")
     if (!isBearerCredential(credential)) {
       return yield* credentialMissingError(target.connectionId);
     }
+    const cloudflareAccess = cloudflareAccessFromCredential(credential);
+    yield* validateCloudflareAccessRuntime(cloudflareAccess);
     const authorized = yield* remote.authorizeBearer({
       expectedEnvironmentId: target.environmentId,
       httpBaseUrl: profile.httpBaseUrl,
       wsBaseUrl: profile.wsBaseUrl,
       bearerToken: credential.token,
-      ...(credential.cloudflareAccessToken
-        ? { cloudflareAccess: { jwt: credential.cloudflareAccessToken } }
-        : {}),
+      ...(cloudflareAccess ? { cloudflareAccess } : {}),
     });
     return {
       environmentId: authorized.environmentId,

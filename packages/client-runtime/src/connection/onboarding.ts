@@ -83,13 +83,45 @@ const resolvePairingTarget = Effect.fn("clientRuntime.connection.onboarding.reso
   },
 );
 
+function cloudflareAccessFromPairingTarget(target: ReturnType<typeof resolveRemotePairingTarget>) {
+  const clientId = target.cloudflareAccessClientId?.trim() ?? "";
+  const clientSecret = target.cloudflareAccessClientSecret?.trim() ?? "";
+  if (clientId.length > 0 && clientSecret.length > 0) {
+    return {
+      _tag: "service-token" as const,
+      clientId,
+      clientSecret,
+    };
+  }
+  const jwt = target.cloudflareAccessToken?.trim() ?? "";
+  return jwt.length > 0 ? { jwt } : undefined;
+}
+
+function validateCloudflareAccessRuntime(
+  cloudflareAccess: ReturnType<typeof cloudflareAccessFromPairingTarget>,
+) {
+  if (
+    cloudflareAccess?._tag === "service-token" &&
+    !ClientCapabilities.canPassWebSocketHeaderOptions()
+  ) {
+    return Effect.fail(
+      new ConnectionBlockedError({
+        reason: "unsupported",
+        detail:
+          "Cloudflare Access service-token pairing requires a client that can send WebSocket headers. Use a header-capable desktop or headless client, or pair from a browser with a Cloudflare Access JWT/cookie session.",
+      }),
+    );
+  }
+  return Effect.void;
+}
+
 export const preparePairingRegistration = Effect.fn(
   "clientRuntime.connection.onboarding.preparePairingRegistration",
 )(function* (input: PairingConnectionInput) {
   const target = yield* resolvePairingTarget(input);
   const presentation = yield* ClientCapabilities.ClientPresentation;
-  const cloudflareAccess =
-    target.cloudflareAccessToken === undefined ? undefined : { jwt: target.cloudflareAccessToken };
+  const cloudflareAccess = cloudflareAccessFromPairingTarget(target);
+  yield* validateCloudflareAccessRuntime(cloudflareAccess);
   const descriptor = yield* fetchRemoteEnvironmentDescriptor({
     httpBaseUrl: target.httpBaseUrl,
     ...(cloudflareAccess ? { cloudflareAccess } : {}),
@@ -120,6 +152,12 @@ export const preparePairingRegistration = Effect.fn(
       token: access.access_token,
       ...(target.cloudflareAccessToken
         ? { cloudflareAccessToken: target.cloudflareAccessToken }
+        : {}),
+      ...(target.cloudflareAccessClientId && target.cloudflareAccessClientSecret
+        ? {
+            cloudflareAccessClientId: target.cloudflareAccessClientId,
+            cloudflareAccessClientSecret: target.cloudflareAccessClientSecret,
+          }
         : {}),
     }),
   });

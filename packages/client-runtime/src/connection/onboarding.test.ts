@@ -3,6 +3,7 @@ import { describe, expect, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
+import { afterEach, vi } from "vite-plus/test";
 
 import { remoteHttpClientLayer } from "../rpc/http.ts";
 import { ClientPresentation, SshEnvironmentGateway } from "../platform/capabilities.ts";
@@ -25,6 +26,10 @@ const CLIENT_PRESENTATION_LAYER = Layer.succeed(
     scopes: AuthStandardClientScopes,
   }),
 );
+
+afterEach(() => {
+  vi.unstubAllGlobals();
+});
 
 function pairingHttpLayer(
   calls: Array<{ readonly url: string; readonly init: RequestInit }>,
@@ -138,6 +143,54 @@ describe("connection onboarding", () => {
           }),
         );
       }
+    }),
+  );
+
+  it.effect("persists Cloudflare Access service-token credentials from pairing urls", () =>
+    Effect.gen(function* () {
+      const calls: Array<{ readonly url: string; readonly init: RequestInit }> = [];
+      const registration = yield* preparePairingRegistration({
+        pairingUrl:
+          "https://remote.example.test/pair#token=pairing-token&cf_access_client_id=client-id&cf_access_client_secret=client-secret",
+      }).pipe(Effect.provide(Layer.mergeAll(CLIENT_PRESENTATION_LAYER, pairingHttpLayer(calls))));
+
+      expect(registration.credential).toMatchObject({
+        token: "bearer-token",
+        cloudflareAccessClientId: "client-id",
+        cloudflareAccessClientSecret: "client-secret",
+      });
+      for (const call of calls) {
+        expect(call.init.headers).toEqual(
+          expect.objectContaining({
+            "cf-access-client-id": "client-id",
+            "cf-access-client-secret": "client-secret",
+          }),
+        );
+        expect(call.init.headers).not.toHaveProperty("cf-access-jwt-assertion");
+      }
+    }),
+  );
+
+  it.effect("rejects Cloudflare Access service-token pairing in browser websocket runtimes", () =>
+    Effect.gen(function* () {
+      vi.stubGlobal("window", {});
+      vi.stubGlobal("navigator", { product: "Gecko" });
+      const calls: Array<{ readonly url: string; readonly init: RequestInit }> = [];
+
+      const error = yield* preparePairingRegistration({
+        pairingUrl:
+          "https://remote.example.test/pair#token=pairing-token&cf_access_client_id=client-id&cf_access_client_secret=client-secret",
+      }).pipe(
+        Effect.provide(Layer.mergeAll(CLIENT_PRESENTATION_LAYER, pairingHttpLayer(calls))),
+        Effect.flip,
+      );
+
+      expect(error).toMatchObject({
+        _tag: "ConnectionBlockedError",
+        reason: "unsupported",
+        message: expect.stringContaining("WebSocket headers"),
+      });
+      expect(calls).toEqual([]);
     }),
   );
 

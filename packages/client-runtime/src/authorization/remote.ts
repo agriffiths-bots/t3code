@@ -24,17 +24,35 @@ export type RemoteEnvironmentAuthError = RemoteEnvironmentRequestError;
 
 const DEFAULT_REMOTE_REQUEST_TIMEOUT_MS = 10_000;
 
-export interface CloudflareAccessAuthorization {
-  readonly jwt: string;
-}
+export type CloudflareAccessAuthorization =
+  | {
+      readonly _tag?: "jwt";
+      readonly jwt: string;
+    }
+  | {
+      readonly _tag: "service-token";
+      readonly clientId: string;
+      readonly clientSecret: string;
+    };
 
 export const cloudflareAccessHeaders = (
   authorization: CloudflareAccessAuthorization | undefined,
 ): Record<string, string> => {
-  const jwt = authorization?.jwt.trim() ?? "";
-  if (jwt.length === 0) {
+  if (authorization === undefined) {
     return {};
   }
+  if (authorization._tag === "service-token") {
+    const clientId = authorization.clientId.trim();
+    const clientSecret = authorization.clientSecret.trim();
+    if (clientId.length === 0 || clientSecret.length === 0) return {};
+    return {
+      "cf-access-client-id": clientId,
+      "cf-access-client-secret": clientSecret,
+    };
+  }
+
+  const jwt = authorization.jwt.trim();
+  if (jwt.length === 0) return {};
   return {
     "cf-access-jwt-assertion": jwt,
     cookie: `CF_Authorization=${jwt}`,
