@@ -40,6 +40,36 @@ jobs:
           grep -nE "desktopBridge|getLocalEnvironmentBootstrap|PICK_FOLDER_CHANNEL|wsUrl" apps/desktop/dist-electron/preload.cjs
           grep -n "__clerk_internal_electron_passkeys" apps/desktop/dist-electron/preload.cjs
 
+  desktop_linux_package_smoke:
+    name: Desktop Linux Package Smoke
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install launch smoke dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xvfb libgtk-3-0 libnss3 libasound2t64 libgbm1
+
+      - name: Setup Vite+
+        uses: voidzero-dev/setup-vp@v1
+        with:
+          node-version-file: package.json
+          cache: true
+          run-install: true
+
+      - name: Ensure Electron runtime is installed
+        run: vp run --filter @t3tools/desktop ensure:electron
+
+      - name: Build Linux desktop artifact
+        run: vp run dist:desktop:linux
+
+      - name: Launch packaged Linux desktop app
+        run: xvfb-run -a node scripts/desktop-launch-smoke.mjs --artifact "release/*.AppImage" --timeout-ms 90000
+
   test:
     name: Test
     runs-on: ubuntu-24.04

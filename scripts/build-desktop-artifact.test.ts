@@ -13,7 +13,6 @@ import {
   createStageWorkspaceConfig,
   createStagePnpmConfig,
   createBuildConfig,
-  DESKTOP_MAIN_PROCESS_ASAR_UNPACK,
   DESKTOP_ASAR_UNPACK,
   InvalidMacPasskeyRpDomainError,
   InvalidMacPasskeyPublishableKeyError,
@@ -235,13 +234,8 @@ it.layer(NodeServices.layer)("build-desktop-artifact", (it) => {
     });
   });
 
-  it("unpacks desktop main-process packages that require real filesystem ESM resolution", () => {
-    assert.deepStrictEqual(DESKTOP_MAIN_PROCESS_ASAR_UNPACK, [
-      "node_modules/effect/**/*",
-      "node_modules/fast-check/**/*",
-      "node_modules/pure-rand/**/*",
-    ]);
-    assert.includeMembers([...DESKTOP_ASAR_UNPACK], [...DESKTOP_MAIN_PROCESS_ASAR_UNPACK]);
+  it("unpacks the desktop server bundle and app-root runtime dependencies", () => {
+    assert.deepStrictEqual(DESKTOP_ASAR_UNPACK, ["apps/server/dist/**", "node_modules/**"]);
   });
 
   it.effect("keeps all staged node_modules unpacked for packaged desktop runtime imports", () =>
@@ -257,17 +251,15 @@ it.layer(NodeServices.layer)("build-desktop-artifact", (it) => {
       );
 
       const asarUnpack = config.asarUnpack as string[];
-      assert.includeMembers(asarUnpack, [
-        ...DESKTOP_MAIN_PROCESS_ASAR_UNPACK,
-        "node_modules/@ff-labs/fff-bin-*/**/*",
-        "apps/server/dist/**",
-        "**/node_modules/**",
-      ]);
+      assert.deepStrictEqual(asarUnpack, ["apps/server/dist/**", "node_modules/**"]);
     }).pipe(Effect.provide(ConfigProvider.layer(ConfigProvider.fromEnv({ env: {} })))),
   );
 
-  it("unpacks the fff shared library for filesystem and FFI access", () => {
-    assert.includeMembers([...DESKTOP_ASAR_UNPACK], ["node_modules/@ff-labs/fff-bin-*/**/*"]);
+  it("does not enumerate individual runtime packages in ASAR unpack patterns", () => {
+    const packageSpecificPatterns = DESKTOP_ASAR_UNPACK.filter((pattern) =>
+      /node_modules\/(?:@[^/]+\/)?[^*/]+/.test(pattern),
+    );
+    assert.deepStrictEqual(packageSpecificPatterns, []);
   });
 
   it.effect("preserves both Linux icon resize failures with structural context", () => {
