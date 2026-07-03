@@ -70,8 +70,13 @@ On findings: fix them, or use the audited dismissal mechanism
 git push -u origin wizzo/ada-<n>-<slug>
 gh api repos/agriffiths-bots/t3code/pulls -X POST -f title="fix: ... (ADA-<n>)" \
   -f head=wizzo/ada-<n>-<slug> -f base=main -f body="Fixes ADA-<n>. <summary + repro/verify evidence>"
-gh pr comment <pr#> --repo agriffiths-bots/t3code --body "@codex review"
 ```
+
+Codex reviews start automatically on push. For a fresh review of new commits,
+push the branch again; use an empty commit only when the current HEAD needs a
+new review without code changes. If no eyes reaction or review appears within
+about 5 minutes of the push, stop and ask Adam whether Codex is down or the repo
+is not enabled.
 
 Do NOT arm `gh pr merge --auto` — merging is done exclusively by
 `wizzo-approve --apply` after its gate passes.
