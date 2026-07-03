@@ -111,6 +111,7 @@ export type PreparedHttpAuthorization =
   | {
       readonly _tag: "Dpop";
       readonly accessToken: string;
+      readonly expiresAtEpochMs?: number;
     };
 
 export interface PreparedConnection {

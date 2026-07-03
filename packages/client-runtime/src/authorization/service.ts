@@ -217,6 +217,7 @@ export const make = Effect.gen(function* () {
             httpAuthorization: {
               _tag: "Dpop" as const,
               accessToken: cached.value.accessToken,
+              expiresAtEpochMs: cached.value.expiresAtEpochMs,
             },
           };
         }
@@ -297,6 +298,7 @@ export const make = Effect.gen(function* () {
         httpAuthorization: {
           _tag: "Dpop" as const,
           accessToken: token.accessToken,
+          expiresAtEpochMs: token.expiresAtEpochMs,
         },
       };
     },
