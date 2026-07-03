@@ -73,6 +73,15 @@ function mapInitialConfigError(error: InitialConfigError): ConnectionAttemptErro
   }
 }
 
+function disconnectError(connection: PreparedConnection, wasConnected: boolean) {
+  return new ConnectionTransientErrorClass({
+    reason: "transport",
+    detail: wasConnected
+      ? `${connection.label} disconnected.`
+      : `${connection.label} could not establish a WebSocket connection.`,
+  });
+}
+
 export const make = Effect.gen(function* () {
   const webSocketConstructor = yield* Socket.WebSocketConstructor;
 
@@ -87,15 +96,7 @@ export const make = Effect.gen(function* () {
       onConnect: Deferred.succeed(connected, undefined).pipe(Effect.asVoid),
       onDisconnect: Deferred.isDone(connected).pipe(
         Effect.flatMap((wasConnected) =>
-          Deferred.fail(
-            disconnected,
-            new ConnectionTransientErrorClass({
-              reason: "transport",
-              detail: wasConnected
-                ? `${connection.label} disconnected.`
-                : `${connection.label} could not establish a WebSocket connection.`,
-            }),
-          ),
+          Deferred.fail(disconnected, disconnectError(connection, wasConnected)),
         ),
         Effect.asVoid,
       ),

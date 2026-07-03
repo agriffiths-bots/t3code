@@ -9,6 +9,8 @@ import {
   type AuthClientSession,
   type AuthCreatePairingCredentialInput,
   type AuthEnvironmentScope,
+  EnvironmentAuthInvalidReason,
+  type EnvironmentAuthInvalidReason as EnvironmentAuthInvalidReasonType,
   type AuthPairingLink,
   type AuthPairingCredentialResult,
   type AuthSessionId,
@@ -346,6 +348,7 @@ export class ServerAuthMissingCredentialError extends Schema.TaggedErrorClass<Se
 export class ServerAuthInvalidCredentialError extends Schema.TaggedErrorClass<ServerAuthInvalidCredentialError>()(
   "ServerAuthInvalidCredentialError",
   {
+    reason: Schema.optionalKey(EnvironmentAuthInvalidReason),
     diagnostic: Schema.optional(Schema.String),
     cause: Schema.optional(Schema.Defect()),
   },
@@ -363,8 +366,10 @@ export type ServerAuthCredentialError = typeof ServerAuthCredentialError.Type;
 export const isServerAuthCredentialError = Schema.is(ServerAuthCredentialError);
 export const serverAuthCredentialReason = (
   error: ServerAuthCredentialError,
-): "missing_credential" | "invalid_credential" =>
-  error._tag === "ServerAuthMissingCredentialError" ? "missing_credential" : "invalid_credential";
+): EnvironmentAuthInvalidReasonType =>
+  error._tag === "ServerAuthMissingCredentialError"
+    ? "missing_credential"
+    : (error.reason ?? "invalid_credential");
 
 export class ServerAuthInvalidScopeError extends Schema.TaggedErrorClass<ServerAuthInvalidScopeError>()(
   "ServerAuthInvalidScopeError",
@@ -519,7 +524,14 @@ export function toBootstrapExchangeError(
     return new ServerAuthBootstrapCredentialValidationError({ cause });
   }
 
+  const reason: EnvironmentAuthInvalidReasonType =
+    cause._tag === "ExpiredBootstrapCredentialError"
+      ? "expired_credential"
+      : cause._tag === "ConsumedBootstrapCredentialError"
+        ? "consumed_credential"
+        : "invalid_credential";
   return new ServerAuthInvalidCredentialError({
+    reason,
     cause,
   });
 }
