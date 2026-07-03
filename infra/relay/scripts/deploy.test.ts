@@ -264,7 +264,10 @@ describe("artifact release workflows", () => {
       const mainRefGuard = "if: ${{ github.ref == 'refs/heads/main' }}";
       expect(mainWorkflow.split(mainRefGuard).length - 1).toBe(3);
       expect(mainWorkflow).toContain("needs: [metadata, public_config]");
-      expect(mainWorkflow).toContain("android_required: false");
+      expect(mainWorkflow).toContain("Fail the prerelease unless the Android APK is built");
+      expect(mainWorkflow).toContain(
+        "android_required: ${{ github.event_name == 'workflow_dispatch' && inputs.android_required }}",
+      );
       expect(mainWorkflow).toContain("android_profile: preview");
       expect(mainWorkflow).toContain("android_artifact_name: t3-code-preview-android.apk");
       expect(mainWorkflow).toContain("android_mobile_version_policy: fingerprint");

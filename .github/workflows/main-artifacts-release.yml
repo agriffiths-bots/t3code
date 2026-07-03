@@ -11,6 +11,10 @@ on:
         description: "Mark the GitHub Release as a prerelease"
         type: boolean
         default: true
+      android_required:
+        description: "Fail the prerelease unless the Android APK is built"
+        type: boolean
+        default: true
   schedule:
     - cron: "17 23 * * *"
 
@@ -128,7 +132,7 @@ jobs:
       release_tag: ${{ needs.metadata.outputs.release_tag }}
       release_name: ${{ needs.metadata.outputs.release_name }}
       release_version: ${{ needs.metadata.outputs.release_version }}
-      android_required: false
+      android_required: ${{ github.event_name == 'workflow_dispatch' && inputs.android_required }}
       android_profile: preview
       android_environment: preview
       android_app_variant: preview

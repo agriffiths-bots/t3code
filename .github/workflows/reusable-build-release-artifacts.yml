@@ -236,7 +236,98 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          eas build --profile "$EAS_PROFILE" --platform android --non-interactive --wait --json > eas-build.json
+          mkdir -p release-assets
+
+          eas_status=0
+          eas build --profile "$EAS_PROFILE" --platform android --non-interactive --wait --json > eas-build.json 2> >(tee release-assets/eas-build.stderr >&2) || eas_status=$?
+          cp eas-build.json release-assets/eas-build.json 2>/dev/null || true
+
+          build_id="$(
+            node - <<'NODE'
+          const fs = require("node:fs");
+
+          const readText = (file) => {
+            try {
+              return fs.readFileSync(file, "utf8");
+            } catch {
+              return "";
+            }
+          };
+
+          const findBuild = (value) => {
+            if (Array.isArray(value)) {
+              for (const item of value) {
+                const build = findBuild(item);
+                if (build) return build;
+              }
+              return null;
+            }
+            if (value === null || typeof value !== "object") return null;
+            if (typeof value.id === "string") return value;
+            for (const key of ["build", "data", "result"]) {
+              const build = findBuild(value[key]);
+              if (build) return build;
+            }
+            return null;
+          };
+
+          let id = "";
+          const jsonText = readText("eas-build.json").trim();
+          if (jsonText) {
+            try {
+              id = findBuild(JSON.parse(jsonText))?.id ?? "";
+            } catch {
+              id = "";
+            }
+          }
+
+          if (!id) {
+            const stderr = readText("release-assets/eas-build.stderr");
+            id =
+              stderr.match(/\/builds\/([0-9a-f-]{36})/i)?.[1] ??
+              stderr.match(/\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/i)?.[0] ??
+              "";
+          }
+
+          process.stdout.write(id);
+          NODE
+          )"
+
+          if [[ -n "$build_id" ]]; then
+            echo "EAS build id: $build_id"
+          fi
+
+          if (( eas_status != 0 )); then
+            echo "::error::EAS Android build failed with exit code $eas_status."
+            if [[ -n "$build_id" ]]; then
+              if eas build:view "$build_id" --json > release-assets/eas-build-view.json; then
+                node - <<'NODE'
+          const fs = require("node:fs");
+
+          const build = JSON.parse(fs.readFileSync("release-assets/eas-build-view.json", "utf8"));
+          console.log(`EAS status: ${build.status ?? "unknown"}`);
+          const accountName = build.project?.ownerAccount?.name;
+          const projectSlug = build.project?.slug;
+          const dashboardUrl =
+            typeof accountName === "string" && typeof projectSlug === "string" && typeof build.id === "string"
+              ? `https://expo.dev/accounts/${accountName}/projects/${projectSlug}/builds/${build.id}`
+              : "see the build URL printed above";
+          console.log(`EAS dashboard: ${dashboardUrl}`);
+          if (build.error) {
+            console.log(`EAS error code: ${build.error.errorCode ?? "unknown"}`);
+            console.log(`EAS error message: ${build.error.message ?? "unknown"}`);
+            if (build.error.docsUrl) console.log(`EAS error docs: ${build.error.docsUrl}`);
+          }
+          const logFiles = Array.isArray(build.logFiles) ? build.logFiles : [];
+          console.log(`EAS log files available in Expo: ${logFiles.length}`);
+          NODE
+              else
+                echo "::warning::Failed to fetch EAS build metadata for $build_id."
+              fi
+            fi
+            exit "$eas_status"
+          fi
+
           node - <<'NODE'
           const fs = require("node:fs");
           const path = require("node:path");
