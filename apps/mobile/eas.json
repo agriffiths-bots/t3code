@@ -7,7 +7,10 @@
   "build": {
     "development": {
       "env": {
-        "APP_VARIANT": "development"
+        "APP_VARIANT": "development",
+        "EXPO_OWNER": "adam0410",
+        "EXPO_PROJECT_ID": "c5d56501-d2d8-444d-8b4a-b54ead1ba0f7",
+        "EXPO_UPDATES_URL": "https://u.expo.dev/c5d56501-d2d8-444d-8b4a-b54ead1ba0f7"
       },
       "channel": "development",
       "developmentClient": true,
@@ -15,7 +18,10 @@
     },
     "preview": {
       "env": {
-        "APP_VARIANT": "preview"
+        "APP_VARIANT": "preview",
+        "EXPO_OWNER": "adam0410",
+        "EXPO_PROJECT_ID": "c5d56501-d2d8-444d-8b4a-b54ead1ba0f7",
+        "EXPO_UPDATES_URL": "https://u.expo.dev/c5d56501-d2d8-444d-8b4a-b54ead1ba0f7"
       },
       "channel": "preview",
       "environment": "preview",
@@ -27,6 +33,9 @@
     "preview:dev": {
       "env": {
         "APP_VARIANT": "preview",
+        "EXPO_OWNER": "adam0410",
+        "EXPO_PROJECT_ID": "c5d56501-d2d8-444d-8b4a-b54ead1ba0f7",
+        "EXPO_UPDATES_URL": "https://u.expo.dev/c5d56501-d2d8-444d-8b4a-b54ead1ba0f7",
         "MOBILE_VERSION_POLICY": "fingerprint"
       },
       "channel": "preview",
@@ -39,7 +48,10 @@
     },
     "production": {
       "env": {
-        "APP_VARIANT": "production"
+        "APP_VARIANT": "production",
+        "EXPO_OWNER": "adam0410",
+        "EXPO_PROJECT_ID": "c5d56501-d2d8-444d-8b4a-b54ead1ba0f7",
+        "EXPO_UPDATES_URL": "https://u.expo.dev/c5d56501-d2d8-444d-8b4a-b54ead1ba0f7"
       },
       "channel": "production",
       "environment": "production",
