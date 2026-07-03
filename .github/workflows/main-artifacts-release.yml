@@ -11,24 +11,11 @@ on:
         description: "Mark the GitHub Release as a prerelease"
         type: boolean
         default: true
-      android_required:
-        description: "Fail the prerelease unless the Android APK is built"
-        type: boolean
-        default: true
-      platform:
-        description: "Artifact platform subset to build"
-        type: choice
-        options:
-          - both
-          - android
-          - windows
-        default: both
   schedule:
     - cron: "17 23 * * *"
 
 permissions:
   contents: write
-  actions: write
 
 jobs:
   metadata:
@@ -93,8 +80,8 @@ jobs:
 
           # This fork ships local-only artifacts, so cloud sign-in config is
           # optional. Embed it only when the full set is present and the relay
-          # URL is HTTPS; otherwise warn and emit empty values so desktop and
-          # mobile builds still succeed with cloud features disabled.
+          # URL is HTTPS; otherwise warn and emit empty values so desktop
+          # builds still succeed with cloud features disabled.
           clerk_publishable_key=""
           clerk_jwt_template=""
           clerk_cli_oauth_client_id=""
@@ -141,15 +128,6 @@ jobs:
       release_tag: ${{ needs.metadata.outputs.release_tag }}
       release_name: ${{ needs.metadata.outputs.release_name }}
       release_version: ${{ needs.metadata.outputs.release_version }}
-      android_required: ${{ github.event_name == 'workflow_dispatch' && inputs.android_required }}
-      android_profile: preview
-      android_environment: preview
-      android_app_variant: preview
-      android_artifact_name: t3-code-preview-android.apk
-      android_mobile_version_policy: appVersion
-      android_app_version: ${{ needs.metadata.outputs.release_version }}
-      android_public_config: false
-      platform: ${{ github.event_name == 'workflow_dispatch' && inputs.platform || 'both' }}
       clerk_publishable_key: ${{ needs.public_config.outputs.clerk_publishable_key }}
       clerk_jwt_template: ${{ needs.public_config.outputs.clerk_jwt_template }}
       clerk_cli_oauth_client_id: ${{ needs.public_config.outputs.clerk_cli_oauth_client_id }}

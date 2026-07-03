@@ -236,13 +236,12 @@ describe("artifact release workflows", () => {
       expect(stableWorkflow).toContain("run: vp run typecheck");
       expect(stableWorkflow).toContain("run: vp run test");
       expect(stableWorkflow).toContain('relay_url="https://$relay_domain"');
-      expect(stableWorkflow).toContain("android_required: true");
-      expect(stableWorkflow).toContain("android_profile: production-apk");
-      expect(stableWorkflow).toContain("android_artifact_name: t3-code-android.apk");
-      expect(stableWorkflow).toContain("android_mobile_version_policy: appVersion");
-      expect(stableWorkflow).toContain(
-        "android_app_version: ${{ needs.metadata.outputs.release_version }}",
-      );
+      expect(stableWorkflow).toContain("Mobile app builds are deprecated");
+      expect(stableWorkflow).not.toContain("android_required:");
+      expect(stableWorkflow).not.toContain("android_profile:");
+      expect(stableWorkflow).not.toContain("android_artifact_name:");
+      expect(stableWorkflow).not.toContain("android_mobile_version_policy:");
+      expect(stableWorkflow).not.toContain("android_app_version:");
       expect(stableWorkflow).toContain(
         "clerk_publishable_key: ${{ needs.public_config.outputs.clerk_publishable_key }}",
       );
@@ -264,20 +263,14 @@ describe("artifact release workflows", () => {
       const mainRefGuard = "if: ${{ github.ref == 'refs/heads/main' }}";
       expect(mainWorkflow.split(mainRefGuard).length - 1).toBe(3);
       expect(mainWorkflow).toContain("needs: [metadata, public_config]");
-      expect(mainWorkflow).toContain("Fail the prerelease unless the Android APK is built");
-      expect(mainWorkflow).toContain(
-        "android_required: ${{ github.event_name == 'workflow_dispatch' && inputs.android_required }}",
-      );
-      expect(mainWorkflow).toContain("android_profile: preview");
-      expect(mainWorkflow).toContain("android_artifact_name: t3-code-preview-android.apk");
-      expect(mainWorkflow).toContain("android_mobile_version_policy: appVersion");
-      expect(mainWorkflow).toContain(
-        "android_app_version: ${{ needs.metadata.outputs.release_version }}",
-      );
-      expect(mainWorkflow).toContain("android_public_config: false");
-      expect(mainWorkflow).toContain(
-        "platform: ${{ github.event_name == 'workflow_dispatch' && inputs.platform || 'both' }}",
-      );
+      expect(mainWorkflow).not.toContain("Fail the prerelease unless the Android APK is built");
+      expect(mainWorkflow).not.toContain("android_required:");
+      expect(mainWorkflow).not.toContain("android_profile:");
+      expect(mainWorkflow).not.toContain("android_artifact_name:");
+      expect(mainWorkflow).not.toContain("android_mobile_version_policy:");
+      expect(mainWorkflow).not.toContain("android_app_version:");
+      expect(mainWorkflow).not.toContain("android_public_config:");
+      expect(mainWorkflow).not.toContain("platform:");
       expect(mainWorkflow).toContain(
         "prerelease: ${{ github.event_name == 'schedule' || inputs.prerelease }}",
       );
@@ -289,20 +282,15 @@ describe("artifact release workflows", () => {
       expect(mainWorkflow).toContain(
         "if: ${{ github.ref == 'refs/heads/main' && needs.publish_artifacts.result == 'success' }}",
       );
-      expect(reusableWorkflow).toContain("android_mobile_version_policy:");
-      expect(reusableWorkflow).toContain("android_app_version:");
-      expect(reusableWorkflow).toContain("android_public_config:");
-      expect(reusableWorkflow).toContain("platform:");
-      expect(reusableWorkflow).toContain("MOBILE_APP_VERSION: ${{ inputs.android_app_version }}");
-      expect(reusableWorkflow).toContain(
-        "T3CODE_CLERK_PUBLISHABLE_KEY: ${{ inputs.android_public_config && inputs.clerk_publishable_key || '' }}",
-      );
-      expect(reusableWorkflow).toContain(
-        "T3CODE_RELAY_URL: ${{ inputs.android_public_config && inputs.relay_url || '' }}",
-      );
-      expect(reusableWorkflow).toContain(
-        "MOBILE_VERSION_POLICY: ${{ inputs.android_mobile_version_policy }}",
-      );
+      expect(reusableWorkflow).toContain("Mobile app builds are deprecated");
+      expect(reusableWorkflow).not.toContain("android_mobile_version_policy:");
+      expect(reusableWorkflow).not.toContain("android_app_version:");
+      expect(reusableWorkflow).not.toContain("android_public_config:");
+      expect(reusableWorkflow).not.toContain("android_required:");
+      expect(reusableWorkflow).not.toContain("android_profile:");
+      expect(reusableWorkflow).not.toContain("EXPO_TOKEN:");
+      expect(reusableWorkflow).not.toContain("MOBILE_APP_VERSION:");
+      expect(reusableWorkflow).not.toContain("MOBILE_VERSION_POLICY:");
       expect(reusableWorkflow).toContain("T3CODE_RELAY_URL: ${{ inputs.relay_url }}");
       // Cloud sign-in config must come only from the caller's validated
       // public_config outputs, never from a raw repo-vars fallback that would
@@ -314,27 +302,20 @@ describe("artifact release workflows", () => {
       expect(reusableWorkflow).toContain(
         'run: node scripts/update-release-package-versions.ts "${{ inputs.release_version }}"',
       );
-      expect(reusableWorkflow).toContain("needs: android_preflight");
-      expect(reusableWorkflow).toContain("needs: [android_preflight, build_wsl_node_pty]");
+      expect(reusableWorkflow).toContain("needs: build_wsl_node_pty");
       expect(reusableWorkflow).toContain(
-        "if: inputs.platform != 'android' && needs.android_preflight.result == 'success' && needs.build_wsl_node_pty.result == 'success'",
+        "needs: [server_e2e_gate, windows_x64, windows_launch_smoke]",
       );
-      // Selected platforms publish when their builds succeed. Optional Android
-      // in the default both-platform release still must not block Windows.
-      expect(reusableWorkflow).toContain("inputs.platform == 'windows' ||");
-      expect(reusableWorkflow).toContain("needs.android_apk.result == 'success' ||");
-      expect(reusableWorkflow).toContain("(inputs.platform == 'both' && !inputs.android_required)");
-      expect(reusableWorkflow).toContain("inputs.platform == 'android' ||");
+      expect(reusableWorkflow).not.toContain("android_preflight");
+      expect(reusableWorkflow).not.toContain("android_apk");
+      expect(reusableWorkflow).not.toContain("inputs.platform");
       expect(reusableWorkflow).toContain("needs.windows_x64.result == 'success'");
-      // An optional Android failure must not turn the whole release run red.
-      expect(reusableWorkflow).toContain("continue-on-error: ${{ !inputs.android_required }}");
-      // EAS cloud builds need a generous timeout so the APK isn't cancelled.
-      expect(reusableWorkflow).toContain("timeout-minutes: 90");
-      expect(ciWorkflow).toContain("mobile_native_static_analysis:");
-      expect(ciWorkflow).toContain("brew bundle install --file apps/mobile/Brewfile");
-      expect(ciWorkflow).toContain("run: vp run lint:mobile");
-      expect(ciWorkflow).toContain("Prebuild mobile Android config");
-      expect(ciWorkflow).toContain(
+      expect(reusableWorkflow).toContain("needs.windows_launch_smoke.result == 'success'");
+      expect(ciWorkflow).not.toContain("mobile_native_static_analysis:");
+      expect(ciWorkflow).not.toContain("brew bundle install --file apps/mobile/Brewfile");
+      expect(ciWorkflow).not.toContain("run: vp run lint:mobile");
+      expect(ciWorkflow).not.toContain("Prebuild mobile Android config");
+      expect(ciWorkflow).not.toContain(
         "pnpm exec expo prebuild --clean --platform android --no-install",
       );
     }).pipe(Effect.provide(NodeServices.layer)),
