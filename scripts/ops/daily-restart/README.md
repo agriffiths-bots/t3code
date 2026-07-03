@@ -8,7 +8,7 @@ Both tools export this full PATH before doing any work:
 /home/linuxbrew/.linuxbrew/bin:/home/adam/.local/bin:/usr/local/bin:/usr/bin:/bin
 ```
 
-Both tools also set `umask 077` before creating SQLite outputs or temporary files.
+Both tools also set `umask 077` before creating SQLite outputs or temporary files. Snapshot creation takes an output-directory lock so overlapping cron/manual runs cannot overwrite the same timestamped snapshot.
 
 ## t3-db-snapshot
 
