@@ -384,7 +384,8 @@ function applyThreadCreationDefaultEffort(
     defaultOptions && defaultOptions.length > 0 ? defaultOptions.map(cloneSelection) : [];
   const existingIndex = next.findIndex((selection) => selection.id === optionId);
   if (existingIndex < 0) {
-    return next.length > 0 ? next : undefined;
+    next.push({ id: optionId, value: directedValue });
+    return next;
   }
   next[existingIndex] = { ...next[existingIndex]!, value: directedValue };
   return next;

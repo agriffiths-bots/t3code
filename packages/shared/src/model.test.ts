@@ -495,6 +495,40 @@ describe("pickModelSelectionFromInstances", () => {
       ],
     });
 
+    const withoutDefaultEffortSelection: ReadonlyArray<ProviderModelSource> = [
+      {
+        instanceId: ProviderInstanceId.make("cursor"),
+        driverKind: ProviderDriverKind.make("cursor"),
+        models: [
+          {
+            slug: "claude-opus-4-8",
+            defaultOptions: [{ id: "contextWindow", value: "1m" }],
+            optionDescriptors: [
+              {
+                id: "reasoning",
+                label: "Reasoning",
+                type: "select",
+                options: [
+                  { id: "medium", label: "Medium" },
+                  { id: "xhigh", label: "Extra High" },
+                ],
+              },
+            ],
+          },
+        ],
+      },
+    ];
+    expect(
+      pickModelSelectionFromInstances("claude-opus-4-8", withoutDefaultEffortSelection),
+    ).toEqual({
+      instanceId: "cursor",
+      model: "claude-opus-4-8",
+      options: [
+        { id: "contextWindow", value: "1m" },
+        { id: "reasoning", value: "xhigh" },
+      ],
+    });
+
     const withoutAdvertisedEffort: ReadonlyArray<ProviderModelSource> = [
       {
         instanceId: ProviderInstanceId.make("cursor"),
