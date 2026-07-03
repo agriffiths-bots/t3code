@@ -91,6 +91,17 @@ cleanup() {
 }
 trap cleanup EXIT
 
+rollback_restore() {
+  status="$?"
+  rm -f "$tmp_db"
+  if [[ ! -e "$db_path" && -e "$backup_path" ]]; then
+    mv -- "$shm_backup_path" "$db_path-shm" 2>/dev/null || true
+    mv -- "$wal_backup_path" "$db_path-wal" 2>/dev/null || true
+    mv -- "$backup_path" "$db_path" 2>/dev/null || true
+  fi
+  exit "$status"
+}
+
 if ! sqlite3 "$snapshot_path" <<SQL
 .timeout 5000
 .backup $(sqlite_quote "$tmp_db")
@@ -100,11 +111,19 @@ then
 fi
 chmod 600 "$tmp_db" || die "failed to chmod restored database"
 mv -- "$db_path" "$backup_path" || die "failed to move current database aside"
+chmod 600 "$backup_path" || {
+  mv -- "$backup_path" "$db_path" 2>/dev/null || true
+  die "failed to chmod pre-restore database backup"
+}
+trap rollback_restore EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 if [[ -e "$db_path-wal" ]]; then
   mv -- "$db_path-wal" "$wal_backup_path" || {
     mv -- "$backup_path" "$db_path" 2>/dev/null || true
     die "failed to preserve current WAL file"
   }
+  chmod 600 "$wal_backup_path" || die "failed to chmod pre-restore WAL backup"
 fi
 if [[ -e "$db_path-shm" ]]; then
   mv -- "$db_path-shm" "$shm_backup_path" || {
@@ -112,6 +131,7 @@ if [[ -e "$db_path-shm" ]]; then
     mv -- "$backup_path" "$db_path" 2>/dev/null || true
     die "failed to preserve current SHM file"
   }
+  chmod 600 "$shm_backup_path" || die "failed to chmod pre-restore SHM backup"
 fi
 if ! mv -- "$tmp_db" "$db_path"; then
   mv -- "$shm_backup_path" "$db_path-shm" 2>/dev/null || true
@@ -120,6 +140,8 @@ if ! mv -- "$tmp_db" "$db_path"; then
   die "failed to install restored database"
 fi
 trap - EXIT
+trap - INT
+trap - TERM
 
 rm -f -- "$db_path-wal" "$db_path-shm" || die "failed to remove stale WAL/SHM files"
 

@@ -113,8 +113,11 @@ describe("daily restart database tools", () => {
     const snapshot = run([snapshotTool, "--db", db, "--out-dir", outDir]).stdout.trim();
 
     sqlite(db, "INSERT INTO items(name) VALUES ('after-snapshot');");
+    NodeFS.chmodSync(db, 0o644);
     NodeFS.writeFileSync(`${db}-wal`, "");
     NodeFS.writeFileSync(`${db}-shm`, "");
+    NodeFS.chmodSync(`${db}-wal`, 0o644);
+    NodeFS.chmodSync(`${db}-shm`, 0o644);
 
     const result = run([restoreTool, "--snapshot", snapshot, "--db", db]);
 
@@ -133,6 +136,18 @@ describe("daily restart database tools", () => {
     assert.equal(backups.length, 1);
     assert.equal(NodeFS.existsSync(NodePath.join(dir, `${backups[0]!}-wal`)), true);
     assert.equal(NodeFS.existsSync(NodePath.join(dir, `${backups[0]!}-shm`)), true);
+    assert.equal(
+      (NodeFS.statSync(NodePath.join(dir, backups[0]!)).mode & 0o777).toString(8),
+      "600",
+    );
+    assert.equal(
+      (NodeFS.statSync(NodePath.join(dir, `${backups[0]!}-wal`)).mode & 0o777).toString(8),
+      "600",
+    );
+    assert.equal(
+      (NodeFS.statSync(NodePath.join(dir, `${backups[0]!}-shm`)).mode & 0o777).toString(8),
+      "600",
+    );
     assert.equal(sqlite(NodePath.join(dir, backups[0]!), "SELECT count(*) FROM items;"), "3");
     assert.equal((NodeFS.statSync(db).mode & 0o777).toString(8), "600");
   });
