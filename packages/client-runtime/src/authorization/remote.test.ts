@@ -13,6 +13,7 @@ import {
   fetchRemoteSessionState,
   issueRemoteDpopWebSocketTicket,
   issueRemoteWebSocketTicket,
+  RemoteEnvironmentAccessRejectedError,
   RemoteEnvironmentAuthInvalidJsonError,
   RemoteEnvironmentAuthTimeoutError,
   resolveRemoteWebSocketConnectionUrl,
@@ -37,6 +38,15 @@ const recordedFetch = (...responses: ReadonlyArray<Response>) => {
   }) satisfies typeof fetch;
 
   return { fetchFn, calls };
+};
+
+const opaqueRedirectResponse = (): Response => {
+  const response = new Response(null, { status: 200 });
+  Object.defineProperties(response, {
+    status: { value: 0 },
+    type: { value: "opaqueredirect" },
+  });
+  return response;
 };
 
 const hangingFetch = () => {
@@ -490,6 +500,42 @@ describe("remote environment authorization", () => {
         expect(error.reason).toBe("missing_credential");
         expect(error.traceId).toBe("trace-auth-test");
       }
+    }),
+  );
+
+  it.effect("classifies raw Access redirects before T3 auth as Access rejection", () =>
+    Effect.gen(function* () {
+      const fetch = recordedFetch(
+        Response.redirect("https://example.cloudflareaccess.com/login", 302),
+      );
+
+      const error = yield* fetchRemoteEnvironmentDescriptor({
+        httpBaseUrl: "https://remote.example.com/",
+      }).pipe(provideRemoteHttp(fetch.fetchFn), Effect.flip);
+
+      expect(error).toBeInstanceOf(RemoteEnvironmentAccessRejectedError);
+      expect(error).toMatchObject({
+        status: 302,
+        requestUrl: "https://remote.example.com/.well-known/t3/environment",
+      });
+      expect(fetch.calls[0]?.[1].redirect).toBe("manual");
+    }),
+  );
+
+  it.effect("classifies browser opaque manual redirects before T3 auth as Access rejection", () =>
+    Effect.gen(function* () {
+      const fetch = recordedFetch(opaqueRedirectResponse());
+
+      const error = yield* fetchRemoteEnvironmentDescriptor({
+        httpBaseUrl: "https://remote.example.com/",
+      }).pipe(provideRemoteHttp(fetch.fetchFn), Effect.flip);
+
+      expect(error).toBeInstanceOf(RemoteEnvironmentAccessRejectedError);
+      expect(error).toMatchObject({
+        status: 0,
+        requestUrl: "https://remote.example.com/.well-known/t3/environment",
+      });
+      expect(fetch.calls[0]?.[1].redirect).toBe("manual");
     }),
   );
 

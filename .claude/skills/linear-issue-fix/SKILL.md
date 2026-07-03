@@ -69,9 +69,16 @@ On findings: fix them, or use the audited dismissal mechanism
 ```bash
 git push -u origin wizzo/ada-<n>-<slug>
 gh api repos/agriffiths-bots/t3code/pulls -X POST -f title="fix: ... (ADA-<n>)" \
-  -f head=wizzo/ada-<n>-<slug> -f base=main -f body="Fixes ADA-<n>. <summary + repro/verify evidence>"
-gh pr comment <pr#> --repo agriffiths-bots/t3code --body "@codex review"
+  -f head=wizzo/ada-<n>-<slug> -f base=main -F draft=true \
+  -f body="Fixes ADA-<n>. <summary + repro/verify evidence>"
 ```
+
+Open PRs as drafts, then run `gh pr ready <pr#>` when Codex review should
+start. The connector reacts with eyes when review begins. For a fresh review of
+new commits, cycle draft/ready around the push:
+`gh pr ready <pr#> --undo`, push, then `gh pr ready <pr#>`. If no eyes reaction
+appears within about 5 minutes of marking ready, stop and ask Adam whether Codex
+is down or the repo is not enabled. Never use trigger comments.
 
 Do NOT arm `gh pr merge --auto` — merging is done exclusively by
 `wizzo-approve --apply` after its gate passes.

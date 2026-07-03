@@ -206,6 +206,7 @@ const buildModelSources = (runtime: SubagentRuntime) =>
           driverKind: providerInstance.driverKind,
           models: snapshot.models.map((providerModel) => ({
             slug: providerModel.slug,
+            optionDescriptors: providerModel.capabilities?.optionDescriptors,
             defaultOptions: buildProviderOptionSelectionsFromDescriptors(
               providerModel.capabilities?.optionDescriptors,
             ),

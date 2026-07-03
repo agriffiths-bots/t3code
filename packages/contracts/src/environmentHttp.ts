@@ -68,6 +68,8 @@ export type EnvironmentRequestInvalidReason = typeof EnvironmentRequestInvalidRe
 export const EnvironmentAuthInvalidReason = Schema.Literals([
   "missing_credential",
   "invalid_credential",
+  "expired_credential",
+  "consumed_credential",
 ]);
 export type EnvironmentAuthInvalidReason = typeof EnvironmentAuthInvalidReason.Type;
 

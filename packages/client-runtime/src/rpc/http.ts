@@ -49,6 +49,22 @@ export class RemoteEnvironmentAuthUndeclaredStatusError extends Data.TaggedError
   }
 }
 
+export class RemoteEnvironmentAccessRejectedError extends Data.TaggedError(
+  "RemoteEnvironmentAccessRejectedError",
+)<{
+  readonly message: string;
+  readonly status: number;
+  readonly requestUrl: string;
+}> {
+  constructor(requestUrl: string, status: number) {
+    super({
+      message: `Cloudflare Access rejected remote environment endpoint ${requestUrl} with HTTP ${status}.`,
+      requestUrl,
+      status,
+    });
+  }
+}
+
 export class RemoteEnvironmentAuthTimeoutError extends Data.TaggedError(
   "RemoteEnvironmentAuthTimeoutError",
 )<{
@@ -71,6 +87,7 @@ export type RemoteEnvironmentRequestError =
   | EnvironmentScopeRequiredError
   | EnvironmentOperationForbiddenError
   | EnvironmentInternalError
+  | RemoteEnvironmentAccessRejectedError
   | RemoteEnvironmentAuthFetchError
   | RemoteEnvironmentAuthInvalidJsonError
   | RemoteEnvironmentAuthUndeclaredStatusError
@@ -78,11 +95,17 @@ export type RemoteEnvironmentRequestError =
 
 export const remoteHttpClientLayer = (
   fetchFn: typeof globalThis.fetch,
-): Layer.Layer<HttpClient.HttpClient> =>
-  Layer.merge(
-    FetchHttpClient.layer.pipe(Layer.provide(Layer.succeed(FetchHttpClient.Fetch, fetchFn))),
+): Layer.Layer<HttpClient.HttpClient> => {
+  const fetchWithoutRedirects = ((input, init) =>
+    fetchFn(input, { ...init, redirect: init?.redirect ?? "manual" })) satisfies typeof fetch;
+
+  return Layer.merge(
+    FetchHttpClient.layer.pipe(
+      Layer.provide(Layer.succeed(FetchHttpClient.Fetch, fetchWithoutRedirects)),
+    ),
     httpHeaderRedactionLayer,
   );
+};
 
 const remoteApiBaseUrl = (httpBaseUrl: string): string => {
   const url = new URL(httpBaseUrl);
@@ -118,6 +141,14 @@ const failRemoteRequest = (
   if (HttpClientError.isHttpClientError(cause) && cause.response !== undefined) {
     const response = cause.response;
     if (response.status < 200 || response.status >= 300) {
+      if (
+        response.status === 0 ||
+        response.status === 302 ||
+        response.status === 401 ||
+        response.status === 403
+      ) {
+        return Effect.fail(new RemoteEnvironmentAccessRejectedError(requestUrl, response.status));
+      }
       return Effect.fail(
         new RemoteEnvironmentAuthUndeclaredStatusError(requestUrl, response.status),
       );

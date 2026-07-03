@@ -15,6 +15,7 @@ import {
 } from "../rpc/http.ts";
 
 export {
+  RemoteEnvironmentAccessRejectedError,
   RemoteEnvironmentAuthFetchError,
   RemoteEnvironmentAuthInvalidJsonError,
   RemoteEnvironmentAuthTimeoutError,
