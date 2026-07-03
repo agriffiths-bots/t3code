@@ -60,6 +60,19 @@ it.layer(NodeServices.layer)("EnvironmentAuth.layer", (it) => {
     }),
   );
 
+  it.effect("classifies consumed bootstrap credentials for pairing UX", () =>
+    Effect.sync(() => {
+      const error = EnvironmentAuth.toBootstrapExchangeError(
+        new PairingGrantStore.ConsumedBootstrapCredentialError({}),
+      );
+
+      expect(error).toMatchObject({
+        _tag: "ServerAuthInvalidCredentialError",
+        reason: "consumed_credential",
+      });
+    }),
+  );
+
   it.effect("maps unexpected bootstrap failures to 500", () =>
     Effect.sync(() => {
       const cause = new PairingGrantStore.BootstrapCredentialConsumeError({
@@ -131,6 +144,31 @@ it.layer(NodeServices.layer)("EnvironmentAuth.layer", (it) => {
       );
 
       expect(token.scope).toBe("orchestration:read");
+    }).pipe(Effect.provide(makeEnvironmentAuthLayer())),
+  );
+
+  it.effect("reports a reused one-time pairing credential as consumed", () =>
+    Effect.gen(function* () {
+      const serverAuth = yield* EnvironmentAuth.EnvironmentAuth;
+      const pairingCredential = yield* serverAuth.issuePairingCredential();
+
+      yield* serverAuth.exchangeBootstrapCredentialForAccessToken(
+        pairingCredential.credential,
+        undefined,
+        requestMetadata,
+      );
+      const error = yield* serverAuth
+        .exchangeBootstrapCredentialForAccessToken(
+          pairingCredential.credential,
+          undefined,
+          requestMetadata,
+        )
+        .pipe(Effect.flip);
+
+      expect(error).toMatchObject({
+        _tag: "ServerAuthInvalidCredentialError",
+        reason: "consumed_credential",
+      });
     }).pipe(Effect.provide(makeEnvironmentAuthLayer())),
   );
 

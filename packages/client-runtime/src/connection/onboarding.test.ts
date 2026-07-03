@@ -44,13 +44,16 @@ function enableHeaderCapableWebSocketRuntime() {
 
 function pairingHttpLayer(
   calls: Array<{ readonly url: string; readonly init: RequestInit }>,
-  options?: { readonly failDescriptor?: boolean },
+  options?: { readonly failDescriptor?: boolean; readonly rejectAccess?: boolean },
 ) {
   const fetchFn = ((input, init = {}) => {
     const url = String(input);
     calls.push({ url, init });
 
     if (url.endsWith("/.well-known/t3/environment")) {
+      if (options?.rejectAccess === true) {
+        return Promise.resolve(Response.redirect("https://access.example.test/login", 302));
+      }
       if (options?.failDescriptor === true) {
         return Promise.resolve(
           Response.json({ message: "descriptor unavailable" }, { status: 503 }),
@@ -223,6 +226,35 @@ describe("connection onboarding", () => {
         Effect.flip,
       );
 
+      expect(calls.map((call) => call.url)).toEqual([
+        "https://remote.example.test/.well-known/t3/environment",
+      ]);
+    }),
+  );
+
+  it.effect("reports Cloudflare Access rejection separately from T3 auth failures", () =>
+    Effect.gen(function* () {
+      const calls: Array<{ readonly url: string; readonly init: RequestInit }> = [];
+
+      const error = yield* preparePairingRegistration({
+        host: "remote.example.test",
+        pairingCode: "pairing-token",
+      }).pipe(
+        Effect.provide(
+          Layer.mergeAll(
+            CLIENT_PRESENTATION_LAYER,
+            pairingHttpLayer(calls, { rejectAccess: true }),
+          ),
+        ),
+        Effect.flip,
+      );
+
+      expect(error).toMatchObject({
+        _tag: "ConnectionBlockedError",
+        reason: "permission",
+        message:
+          "Cloudflare Access rejected this device. Re-authenticate Cloudflare Access and try again.",
+      });
       expect(calls.map((call) => call.url)).toEqual([
         "https://remote.example.test/.well-known/t3/environment",
       ]);
