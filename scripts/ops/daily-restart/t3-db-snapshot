@@ -1,0 +1,112 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+export PATH="/home/linuxbrew/.linuxbrew/bin:/home/adam/.local/bin:/usr/local/bin:/usr/bin:/bin"
+
+DEFAULT_DB="/home/adam/.t3-vps/userdata/state.sqlite"
+DEFAULT_SNAPSHOT_DIR="/home/adam/backups/t3-daily"
+
+usage() {
+  cat >&2 <<'USAGE'
+usage: t3-db-snapshot [--db PATH] [--out-dir DIR] [--keep N]
+
+Creates an online-safe SQLite snapshot with sqlite3's .backup command.
+USAGE
+}
+
+die() {
+  echo "t3-db-snapshot: $*" >&2
+  exit 1
+}
+
+sqlite_quote() {
+  printf "'%s'" "${1//\'/\'\'}"
+}
+
+absolute_path() {
+  realpath -m "$1"
+}
+
+db_path="${T3DR_DB:-$DEFAULT_DB}"
+out_dir="${T3DR_SNAPSHOT_DIR:-$DEFAULT_SNAPSHOT_DIR}"
+keep=7
+
+while [[ "$#" -gt 0 ]]; do
+  case "$1" in
+    --db)
+      [[ "$#" -ge 2 ]] || die "--db requires a path"
+      db_path="$2"
+      shift 2
+      ;;
+    --out-dir)
+      [[ "$#" -ge 2 ]] || die "--out-dir requires a directory"
+      out_dir="$2"
+      shift 2
+      ;;
+    --keep)
+      [[ "$#" -ge 2 ]] || die "--keep requires a count"
+      keep="$2"
+      shift 2
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      usage
+      die "unknown argument: $1"
+      ;;
+  esac
+done
+
+[[ "$keep" =~ ^[0-9]+$ ]] || die "--keep must be a non-negative integer"
+[[ "$keep" -ge 1 ]] || die "--keep must be at least 1"
+command -v sqlite3 >/dev/null 2>&1 || die "sqlite3 not found on PATH"
+[[ -f "$db_path" ]] || die "database does not exist: $db_path"
+
+mkdir -p "$out_dir" || die "failed to create output directory: $out_dir"
+db_path="$(absolute_path "$db_path")"
+out_dir="$(absolute_path "$out_dir")"
+
+timestamp="$(date -u +%Y%m%d-%H%M%S)"
+snapshot="$out_dir/t3-state-$timestamp.sqlite"
+if [[ -e "$snapshot" ]]; then
+  sleep 1
+  timestamp="$(date -u +%Y%m%d-%H%M%S)"
+  snapshot="$out_dir/t3-state-$timestamp.sqlite"
+fi
+[[ ! -e "$snapshot" ]] || die "snapshot path already exists: $snapshot"
+
+tmp_snapshot="$out_dir/.t3-state-$timestamp.sqlite.$$"
+cleanup() {
+  rm -f "$tmp_snapshot"
+}
+trap cleanup EXIT
+
+if ! sqlite3 "$db_path" <<SQL
+.timeout 5000
+.backup $(sqlite_quote "$tmp_snapshot")
+SQL
+then
+  die "sqlite backup failed"
+fi
+
+integrity="$(sqlite3 "$tmp_snapshot" 'PRAGMA integrity_check;' 2>&1)" || die "snapshot integrity check failed: $integrity"
+[[ "$integrity" == "ok" ]] || die "snapshot integrity check returned: $integrity"
+
+chmod 600 "$tmp_snapshot" || die "failed to chmod snapshot"
+mv "$tmp_snapshot" "$snapshot" || die "failed to install snapshot"
+trap - EXIT
+
+if [[ "$keep" -gt 0 ]]; then
+  mapfile -d '' snapshots < <(
+    find "$out_dir" -maxdepth 1 -type f -name 't3-state-*.sqlite' -printf '%T@ %p\0' \
+      | sort -z -nr \
+      | cut -z -d' ' -f2-
+  )
+  for ((i = keep; i < ${#snapshots[@]}; i++)); do
+    rm -f -- "${snapshots[$i]}" || die "failed to prune old snapshot: ${snapshots[$i]}"
+  done
+fi
+
+printf '%s\n' "$snapshot"
