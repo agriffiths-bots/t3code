@@ -270,7 +270,10 @@ describe("artifact release workflows", () => {
       );
       expect(mainWorkflow).toContain("android_profile: preview");
       expect(mainWorkflow).toContain("android_artifact_name: t3-code-preview-android.apk");
-      expect(mainWorkflow).toContain("android_mobile_version_policy: fingerprint");
+      expect(mainWorkflow).toContain("android_mobile_version_policy: appVersion");
+      expect(mainWorkflow).toContain(
+        "android_app_version: ${{ needs.metadata.outputs.release_version }}",
+      );
       expect(mainWorkflow).toContain("android_public_config: false");
       expect(mainWorkflow).toContain(
         "prerelease: ${{ github.event_name == 'schedule' || inputs.prerelease }}",
