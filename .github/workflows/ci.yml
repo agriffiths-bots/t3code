@@ -52,7 +52,7 @@ jobs:
       - name: Install launch smoke dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y xvfb libgtk-3-0 libnss3 libasound2t64 libgbm1
+          sudo apt-get install -y xvfb imagemagick libgtk-3-0 libnss3 libasound2t64 libgbm1
 
       - name: Setup Vite+
         uses: voidzero-dev/setup-vp@v1
