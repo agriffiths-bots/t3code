@@ -116,7 +116,12 @@ export function mapRemoteEnvironmentError(
     case "EnvironmentAuthInvalidError":
       return new ConnectionBlockedError({
         reason: "authentication",
-        detail: "The environment credential is invalid.",
+        detail:
+          error.reason === "consumed_credential"
+            ? "That pairing code has already been used. Create a new pairing code on the desktop and try again."
+            : error.reason === "expired_credential"
+              ? "That pairing code has expired. Create a new pairing code on the desktop and try again."
+              : "T3 authentication is invalid. Pair this environment again.",
         traceId: error.traceId,
       });
     case "EnvironmentScopeRequiredError":
@@ -136,6 +141,12 @@ export function mapRemoteEnvironmentError(
       return new ConnectionTransientError({
         reason: "timeout",
         detail: error.message,
+      });
+    case "RemoteEnvironmentAccessRejectedError":
+      return new ConnectionBlockedError({
+        reason: "permission",
+        detail:
+          "Cloudflare Access rejected this device. Re-authenticate Cloudflare Access and try again.",
       });
     case "RemoteEnvironmentAuthFetchError":
       return new ConnectionTransientError({

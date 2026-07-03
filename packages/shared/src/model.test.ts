@@ -242,7 +242,11 @@ describe("pickModelSelectionFromInstances", () => {
   ): ProviderModelSource => ({
     instanceId: ProviderInstanceId.make(id),
     driverKind: ProviderDriverKind.make(driver),
-    models: slugs.map((slug) => ({ slug, defaultOptions: undefined })),
+    models: slugs.map((slug) => ({
+      slug,
+      defaultOptions: undefined,
+      optionDescriptors: undefined,
+    })),
   });
 
   // Mirrors what the runtime registry reports (each provider's live models).
@@ -252,6 +256,7 @@ describe("pickModelSelectionFromInstances", () => {
       "claude-opus-4-8",
       "claude-opus-4-6",
       "claude-sonnet-4-6",
+      "claude-sonnet-5",
       "claude-haiku-4-5",
       // Present in the live provider list but NOT in the registry alias maps:
       "claude-fable-5",
@@ -328,13 +333,232 @@ describe("pickModelSelectionFromInstances", () => {
       {
         instanceId: ProviderInstanceId.make("claudeAgent"),
         driverKind: ProviderDriverKind.make("claudeAgent"),
-        models: [{ slug: "claude-opus-4-8", defaultOptions: [{ id: "effort", value: "high" }] }],
+        models: [
+          {
+            slug: "claude-opus-4-6",
+            defaultOptions: [
+              { id: "effort", value: "high" },
+              { id: "fastMode", value: true },
+            ],
+            optionDescriptors: undefined,
+          },
+        ],
       },
     ];
-    expect(pickModelSelectionFromInstances("claude-opus-4-8", withOptions)).toEqual({
+    expect(pickModelSelectionFromInstances("claude-opus-4-6", withOptions)).toEqual({
+      instanceId: "claudeAgent",
+      model: "claude-opus-4-6",
+      options: [
+        { id: "effort", value: "high" },
+        { id: "fastMode", value: true },
+      ],
+    });
+  });
+
+  it("applies T3 thread-creation default efforts for directive models", () => {
+    const withDirectiveModels: ReadonlyArray<ProviderModelSource> = [
+      {
+        instanceId: ProviderInstanceId.make("codex"),
+        driverKind: ProviderDriverKind.make("codex"),
+        models: [
+          {
+            slug: "gpt-5.5",
+            defaultOptions: [
+              { id: "reasoningEffort", value: "medium" },
+              { id: "serviceTier", value: "fast" },
+            ],
+            optionDescriptors: [
+              {
+                id: "reasoningEffort",
+                label: "Reasoning",
+                type: "select",
+                options: [
+                  { id: "medium", label: "Medium" },
+                  { id: "xhigh", label: "Extra High" },
+                ],
+              },
+            ],
+          },
+        ],
+      },
+      {
+        instanceId: ProviderInstanceId.make("claudeAgent"),
+        driverKind: ProviderDriverKind.make("claudeAgent"),
+        models: [
+          {
+            slug: "claude-opus-4-8",
+            defaultOptions: [{ id: "effort", value: "high" }],
+            optionDescriptors: [
+              {
+                id: "effort",
+                label: "Reasoning",
+                type: "select",
+                options: [
+                  { id: "high", label: "High" },
+                  { id: "xhigh", label: "Extra High" },
+                ],
+              },
+            ],
+          },
+          {
+            slug: "claude-sonnet-5",
+            defaultOptions: [{ id: "effort", value: "medium" }],
+            optionDescriptors: [
+              {
+                id: "effort",
+                label: "Reasoning",
+                type: "select",
+                options: [
+                  { id: "medium", label: "Medium" },
+                  { id: "xhigh", label: "Extra High" },
+                ],
+              },
+            ],
+          },
+          {
+            slug: "claude-fable-5",
+            defaultOptions: [{ id: "effort", value: "xhigh" }],
+            optionDescriptors: [
+              {
+                id: "effort",
+                label: "Reasoning",
+                type: "select",
+                options: [
+                  { id: "high", label: "High" },
+                  { id: "xhigh", label: "Extra High" },
+                ],
+              },
+            ],
+          },
+        ],
+      },
+    ];
+
+    expect(pickModelSelectionFromInstances("gpt-5.5", withDirectiveModels)).toEqual({
+      instanceId: "codex",
+      model: "gpt-5.5",
+      options: [
+        { id: "reasoningEffort", value: "xhigh" },
+        { id: "serviceTier", value: "fast" },
+      ],
+    });
+    expect(pickModelSelectionFromInstances("claude-opus-4-8", withDirectiveModels)).toEqual({
       instanceId: "claudeAgent",
       model: "claude-opus-4-8",
+      options: [{ id: "effort", value: "xhigh" }],
+    });
+    expect(pickModelSelectionFromInstances("claude-sonnet-5", withDirectiveModels)).toEqual({
+      instanceId: "claudeAgent",
+      model: "claude-sonnet-5",
+      options: [{ id: "effort", value: "xhigh" }],
+    });
+    expect(pickModelSelectionFromInstances("claude-fable-5", withDirectiveModels)).toEqual({
+      instanceId: "claudeAgent",
+      model: "claude-fable-5",
       options: [{ id: "effort", value: "high" }],
+    });
+  });
+
+  it("uses the selected provider's advertised effort option for directive defaults", () => {
+    const withCursorOnlyModel: ReadonlyArray<ProviderModelSource> = [
+      {
+        instanceId: ProviderInstanceId.make("cursor"),
+        driverKind: ProviderDriverKind.make("cursor"),
+        models: [
+          {
+            slug: "claude-opus-4-8",
+            defaultOptions: [
+              { id: "reasoning", value: "medium" },
+              { id: "contextWindow", value: "1m" },
+            ],
+            optionDescriptors: [
+              {
+                id: "reasoning",
+                label: "Reasoning",
+                type: "select",
+                options: [
+                  { id: "medium", label: "Medium" },
+                  { id: "xhigh", label: "Extra High" },
+                ],
+              },
+            ],
+          },
+        ],
+      },
+    ];
+    expect(pickModelSelectionFromInstances("claude-opus-4-8", withCursorOnlyModel)).toEqual({
+      instanceId: "cursor",
+      model: "claude-opus-4-8",
+      options: [
+        { id: "reasoning", value: "xhigh" },
+        { id: "contextWindow", value: "1m" },
+      ],
+    });
+
+    const withoutDefaultEffortSelection: ReadonlyArray<ProviderModelSource> = [
+      {
+        instanceId: ProviderInstanceId.make("cursor"),
+        driverKind: ProviderDriverKind.make("cursor"),
+        models: [
+          {
+            slug: "claude-opus-4-8",
+            defaultOptions: [{ id: "contextWindow", value: "1m" }],
+            optionDescriptors: [
+              {
+                id: "reasoning",
+                label: "Reasoning",
+                type: "select",
+                options: [
+                  { id: "medium", label: "Medium" },
+                  { id: "xhigh", label: "Extra High" },
+                ],
+              },
+            ],
+          },
+        ],
+      },
+    ];
+    expect(
+      pickModelSelectionFromInstances("claude-opus-4-8", withoutDefaultEffortSelection),
+    ).toEqual({
+      instanceId: "cursor",
+      model: "claude-opus-4-8",
+      options: [
+        { id: "contextWindow", value: "1m" },
+        { id: "reasoning", value: "xhigh" },
+      ],
+    });
+
+    const withoutAdvertisedEffort: ReadonlyArray<ProviderModelSource> = [
+      {
+        instanceId: ProviderInstanceId.make("cursor"),
+        driverKind: ProviderDriverKind.make("cursor"),
+        models: [
+          {
+            slug: "claude-opus-4-8",
+            defaultOptions: [
+              { id: "reasoning", value: "medium" },
+              { id: "contextWindow", value: "1m" },
+            ],
+            optionDescriptors: [
+              {
+                id: "reasoning",
+                label: "Reasoning",
+                type: "select",
+                options: [{ id: "medium", label: "Medium" }],
+              },
+            ],
+          },
+        ],
+      },
+    ];
+    expect(pickModelSelectionFromInstances("claude-opus-4-8", withoutAdvertisedEffort)).toEqual({
+      instanceId: "cursor",
+      model: "claude-opus-4-8",
+      options: [
+        { id: "reasoning", value: "medium" },
+        { id: "contextWindow", value: "1m" },
+      ],
     });
   });
 

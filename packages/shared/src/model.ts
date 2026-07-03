@@ -305,6 +305,7 @@ export function resolveModelSlugForProvider(
 export interface ProviderModelEntry {
   readonly slug: string;
   readonly defaultOptions: ReadonlyArray<ProviderOptionSelection> | undefined;
+  readonly optionDescriptors: ReadonlyArray<ProviderOptionDescriptor> | undefined;
 }
 
 /**
@@ -330,14 +331,73 @@ function providerPriorityIndex(driver: ProviderDriverKind): number {
 
 function makeModelSelection(
   instanceId: ProviderInstanceId,
+  driverKind: ProviderDriverKind,
   slug: string,
   defaultOptions: ReadonlyArray<ProviderOptionSelection> | undefined,
+  optionDescriptors: ReadonlyArray<ProviderOptionDescriptor> | undefined,
 ): ModelSelection {
-  // Preserve the model's default option selections (e.g. reasoning effort) so a
-  // plain-model choice matches what the picker would apply; omit when there are none.
-  return defaultOptions && defaultOptions.length > 0
-    ? { instanceId, model: slug, options: defaultOptions }
+  const options = applyThreadCreationDefaultEffort(
+    driverKind,
+    slug,
+    defaultOptions,
+    optionDescriptors,
+  );
+  // Preserve provider defaults and layer T3's plain-model thread-creation
+  // effort defaults on top; omit options when there are none.
+  return options && options.length > 0
+    ? { instanceId, model: slug, options }
     : { instanceId, model: slug };
+}
+
+const THREAD_CREATION_DEFAULT_EFFORT_BY_MODEL: Record<string, string> = {
+  "gpt-5.5": "xhigh",
+  "claude-opus-4-8": "xhigh",
+  "claude-sonnet-5": "xhigh",
+  "claude-fable-5": "high",
+};
+
+const THREAD_CREATION_EFFORT_OPTION_BY_DRIVER: Record<string, string> = {
+  codex: "reasoningEffort",
+  claudeAgent: "effort",
+  cursor: "reasoning",
+};
+
+function applyThreadCreationDefaultEffort(
+  driverKind: ProviderDriverKind,
+  slug: string,
+  defaultOptions: ReadonlyArray<ProviderOptionSelection> | undefined,
+  optionDescriptors: ReadonlyArray<ProviderOptionDescriptor> | undefined,
+): Array<ProviderOptionSelection> | undefined {
+  const directedValue = THREAD_CREATION_DEFAULT_EFFORT_BY_MODEL[slug];
+  const optionId = THREAD_CREATION_EFFORT_OPTION_BY_DRIVER[driverKind];
+  if (
+    !directedValue ||
+    !optionId ||
+    !isThreadCreationEffortAdvertised(optionDescriptors, optionId, directedValue)
+  ) {
+    return defaultOptions && defaultOptions.length > 0
+      ? defaultOptions.map(cloneSelection)
+      : undefined;
+  }
+
+  const next =
+    defaultOptions && defaultOptions.length > 0 ? defaultOptions.map(cloneSelection) : [];
+  const existingIndex = next.findIndex((selection) => selection.id === optionId);
+  if (existingIndex < 0) {
+    next.push({ id: optionId, value: directedValue });
+    return next;
+  }
+  next[existingIndex] = { ...next[existingIndex]!, value: directedValue };
+  return next;
+}
+
+function isThreadCreationEffortAdvertised(
+  optionDescriptors: ReadonlyArray<ProviderOptionDescriptor> | undefined,
+  optionId: string,
+  value: string,
+): boolean {
+  const descriptor = optionDescriptors?.find((candidate) => candidate.id === optionId);
+  return descriptor?.type === "select" && descriptor.options.some((option) => option.id === value);
 }
 
 /**
@@ -373,7 +433,13 @@ export function pickModelSelectionFromInstances(
       .sort((a, b) => rank(a) - rank(b))[0];
     if (best === undefined) return null;
     const entry = best.models.find((candidate) => candidate.slug === slug);
-    return makeModelSelection(best.instanceId, slug, entry?.defaultOptions);
+    return makeModelSelection(
+      best.instanceId,
+      best.driverKind,
+      slug,
+      entry?.defaultOptions,
+      entry?.optionDescriptors,
+    );
   };
 
   // 1. Direct match against the models each provider actually serves.

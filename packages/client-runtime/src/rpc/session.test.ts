@@ -19,7 +19,10 @@ import {
   PrimaryConnectionTarget,
   type PreparedConnection,
 } from "../connection/model.ts";
-import { markWebSocketHeaderOptionsCapable } from "../platform/capabilities.ts";
+import {
+  makeHeaderOptionsCapableWebSocketConstructor,
+  markWebSocketHeaderOptionsCapable,
+} from "../platform/capabilities.ts";
 import * as RpcSession from "./session.ts";
 
 type SocketEventType = "open" | "message" | "close" | "error";
@@ -273,6 +276,83 @@ describe("RpcSessionFactory", () => {
         headers: {
           "cf-access-jwt-assertion": "cf-access-jwt",
           cookie: "CF_Authorization=cf-access-jwt",
+        },
+      });
+      socket.open();
+      yield* completeInitialConfig(socket);
+      yield* Fiber.join(readyFiber);
+    }),
+  );
+
+  it.effect("does not treat non-constructable websocket services as header-capable", () =>
+    Effect.gen(function* () {
+      vi.stubGlobal("window", {});
+      vi.stubGlobal("navigator", { product: "ReactNative" });
+      const sockets: TestWebSocket[] = [];
+      function GlobalWebSocket(url: string, protocols?: string | string[], options?: unknown) {
+        const socket = new TestWebSocket(url, protocols, options);
+        sockets.push(socket);
+        return socket as unknown as globalThis.WebSocket;
+      }
+      vi.stubGlobal("WebSocket", GlobalWebSocket);
+      const layer = RpcSession.layer.pipe(Layer.provide(Socket.layerWebSocketConstructorGlobal));
+      const factory = yield* RpcSession.RpcSessionFactory.pipe(Effect.provide(layer));
+      const session = yield* factory.connect({
+        ...PREPARED,
+        socketHeaders: {
+          "cf-access-jwt-assertion": "cf-access-jwt",
+        },
+      });
+      const readyFiber = yield* Effect.forkChild(session.ready);
+      const socket = yield* awaitSocket(sockets);
+
+      expect(socket.options).toBeUndefined();
+      socket.open();
+      yield* completeInitialConfig(socket);
+      yield* Fiber.join(readyFiber);
+    }),
+  );
+
+  it.effect("passes prepared socket headers to explicitly wrapped websocket constructors", () =>
+    Effect.gen(function* () {
+      vi.stubGlobal("window", {});
+      vi.stubGlobal("navigator", { product: "Gecko" });
+      const sockets: TestWebSocket[] = [];
+      function GlobalWebSocket(
+        url: string | URL,
+        protocols?: string | string[],
+        options?: unknown,
+      ) {
+        const socket = new TestWebSocket(String(url), protocols, options);
+        sockets.push(socket);
+        return socket as unknown as globalThis.WebSocket;
+      }
+      const constructorLayer = Layer.succeed(
+        Socket.WebSocketConstructor,
+        makeHeaderOptionsCapableWebSocketConstructor(
+          GlobalWebSocket as unknown as new (
+            url: string | URL,
+            protocols?: string | string[],
+            options?: { readonly headers?: Readonly<Record<string, string>> },
+          ) => globalThis.WebSocket,
+        ) as unknown as (url: string, protocols?: string | string[]) => globalThis.WebSocket,
+      );
+      const layer = RpcSession.layer.pipe(Layer.provide(constructorLayer));
+      const factory = yield* RpcSession.RpcSessionFactory.pipe(Effect.provide(layer));
+      const session = yield* factory.connect({
+        ...PREPARED,
+        socketHeaders: {
+          "cf-access-client-id": "client-id",
+          "cf-access-client-secret": "client-secret",
+        },
+      });
+      const readyFiber = yield* Effect.forkChild(session.ready);
+      const socket = yield* awaitSocket(sockets);
+
+      expect(socket.options).toEqual({
+        headers: {
+          "cf-access-client-id": "client-id",
+          "cf-access-client-secret": "client-secret",
         },
       });
       socket.open();
