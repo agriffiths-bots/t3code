@@ -1,0 +1,355 @@
+#!/usr/bin/env bash
+set -u
+
+PATH="${T3DR_TEST_PATH_PREFIX:+$T3DR_TEST_PATH_PREFIX:}/home/linuxbrew/.linuxbrew/bin:/home/adam/.local/bin:/usr/local/bin:/usr/bin:/bin"
+export PATH
+
+origin=""
+service=""
+timeout_secs="120"
+
+usage() {
+  echo "usage: health-probe --origin URL --service NAME [--timeout SECS]" >&2
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --origin)
+      origin="${2:-}"
+      shift 2
+      ;;
+    --service)
+      service="${2:-}"
+      shift 2
+      ;;
+    --timeout)
+      timeout_secs="${2:-}"
+      shift 2
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      echo "health-probe: unknown arg: $1" >&2
+      usage
+      exit 2
+      ;;
+  esac
+done
+
+if [[ -z "$origin" || -z "$service" ]]; then
+  usage
+  exit 2
+fi
+
+if ! [[ "$timeout_secs" =~ ^[0-9]+$ ]] || [[ "$timeout_secs" -le 0 ]]; then
+  echo "health-probe: --timeout must be a positive integer" >&2
+  exit 2
+fi
+
+print_check() {
+  printf 'CHECK %s %s %s\n' "$1" "$2" "$3"
+}
+
+ensure_user_bus_env() {
+  if [[ -z "${XDG_RUNTIME_DIR:-}" ]]; then
+    XDG_RUNTIME_DIR="/run/user/$(id -u)"
+    export XDG_RUNTIME_DIR
+  fi
+  if [[ -z "${DBUS_SESSION_BUS_ADDRESS:-}" && -S "$XDG_RUNTIME_DIR/bus" ]]; then
+    DBUS_SESSION_BUS_ADDRESS="unix:path=$XDG_RUNTIME_DIR/bus"
+    export DBUS_SESSION_BUS_ADDRESS
+  fi
+}
+
+run_systemd_check() {
+  local output rc
+  ensure_user_bus_env
+  output="$(timeout 60 systemctl --user is-active "$service" 2>&1)"
+  rc=$?
+  if [[ "$rc" -eq 0 && "$output" == "active" ]]; then
+    print_check "systemd" "PASS" "active"
+    return 0
+  fi
+  output="${output//$'\n'/ }"
+  [[ -n "$output" ]] || output="rc=$rc"
+  print_check "systemd" "FAIL" "$output"
+  return 1
+}
+
+run_http_check() {
+  local code rc
+  code="$(timeout "$timeout_secs" curl -fsS -o /dev/null -w '%{http_code}' "$origin" 2>/dev/null)"
+  rc=$?
+  if [[ "$rc" -eq 0 && "$code" == "200" ]]; then
+    print_check "http" "PASS" "200"
+    return 0
+  fi
+  [[ -n "$code" ]] || code="curl_rc=$rc"
+  print_check "http" "FAIL" "$code"
+  return 1
+}
+
+mint_token() {
+  if [[ -n "${T3_TOKEN:-}" ]]; then
+    printf '%s\n' "$T3_TOKEN"
+    printf '\n'
+    return 0
+  fi
+
+  local checkout="${T3DR_CHECKOUT:-/home/adam/t3code}"
+  local db="${T3DR_DB:-/home/adam/.t3-vps/userdata/state.sqlite}"
+  local home="${T3CODE_HOME:-}"
+  local entry json
+  if [[ -z "$home" ]]; then
+    home="$(cd "$(dirname "$db")/.." 2>/dev/null && pwd -P)" || return 1
+  fi
+  if [[ -f "$checkout/apps/server/dist/bin.mjs" ]]; then
+    entry="$checkout/apps/server/dist/bin.mjs"
+  else
+    entry="$checkout/apps/server/src/bin.ts"
+  fi
+  json="$(
+    T3CODE_HOME="$home" timeout 30 node "$entry" auth session issue \
+      --json \
+      --ttl "${T3DR_HEALTH_TOKEN_TTL:-5m}" \
+      --label daily-restart-health-probe \
+      --subject daily-restart-health-probe
+  )" || return 1
+  node -e 'const fs=require("node:fs"); const issued=JSON.parse(fs.readFileSync(0,"utf8")); console.log(issued.token); console.log(issued.sessionId);' <<<"$json"
+}
+
+revoke_session() {
+  local session_id="$1"
+  [[ -n "$session_id" ]] || return 0
+
+  local checkout="${T3DR_CHECKOUT:-/home/adam/t3code}"
+  local db="${T3DR_DB:-/home/adam/.t3-vps/userdata/state.sqlite}"
+  local home="${T3CODE_HOME:-}"
+  local entry
+  if [[ -z "$home" ]]; then
+    home="$(cd "$(dirname "$db")/.." 2>/dev/null && pwd -P)" || return 1
+  fi
+  if [[ -f "$checkout/apps/server/dist/bin.mjs" ]]; then
+    entry="$checkout/apps/server/dist/bin.mjs"
+  else
+    entry="$checkout/apps/server/src/bin.ts"
+  fi
+  T3CODE_HOME="$home" timeout 30 node "$entry" auth session revoke "$session_id" >/dev/null
+}
+
+run_smoke_check() {
+  local minted token session_id rc output token_dir token_file
+  minted="$(mint_token 2>&1)"
+  rc=$?
+  token="$(sed -n '1p' <<<"$minted")"
+  session_id="$(sed -n '2p' <<<"$minted")"
+  if [[ "$rc" -ne 0 || -z "$token" ]]; then
+    minted="${minted//$'\n'/ }"
+    [[ -n "$minted" ]] || minted="token_mint_rc=$rc"
+    print_check "spawn_wake" "FAIL" "$minted"
+    return 1
+  fi
+
+  token_dir="$(mktemp -d)"
+  chmod 700 "$token_dir"
+  token_file="$token_dir/token"
+  printf '%s' "$token" > "$token_file"
+  chmod 600 "$token_file"
+
+  output="$(timeout "$((timeout_secs + 30))" node - "$origin" "$timeout_secs" "$token_file" <<'NODE' 2>&1
+const crypto = require("node:crypto");
+const fs = require("node:fs");
+
+const [origin, timeoutSecsText, tokenPath] = process.argv.slice(2);
+const token = fs.readFileSync(tokenPath, "utf8");
+const timeoutMs = Number(timeoutSecsText) * 1000;
+const deadline = Date.now() + timeoutMs;
+const instanceId = process.env.T3DR_SMOKE_INSTANCE || "claudeAgent";
+const model = process.env.T3DR_SMOKE_MODEL || "claude-sonnet-5";
+const ownsWorkspace = !process.env.T3DR_SMOKE_WORKSPACE;
+const workspaceRoot = process.env.T3DR_SMOKE_WORKSPACE || fs.mkdtempSync("/tmp/t3-health-probe-");
+const projectId = crypto.randomUUID();
+const threadId = crypto.randomUUID();
+let projectCreated = false;
+let threadCreated = false;
+const headers = {
+  "content-type": "application/json",
+  authorization: `Bearer ${token}`,
+};
+const requestTimeoutMs = Math.min(10000, Math.max(2000, Math.floor(timeoutMs / 4)));
+const cleanupTimeoutMs = 5000;
+
+function nowIso() {
+  return new Date().toISOString();
+}
+
+async function fetchWithDeadline(url, options, timeout) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeout);
+  try {
+    return await fetch(url, { ...options, signal: controller.signal });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function isTransientStatus(status) {
+  return status === 408 || status === 409 || status === 425 || status === 429 || status >= 500;
+}
+
+async function requestJson(url, options, description, timeout = requestTimeoutMs, endAt = deadline) {
+  let lastError = null;
+  while (Date.now() < endAt) {
+    try {
+      const res = await fetchWithDeadline(url, options, timeout);
+      const text = await res.text();
+      if (res.ok) return text ? JSON.parse(text) : {};
+      const message = `${description} HTTP ${res.status}: ${text.slice(0, 300)}`;
+      if (!isTransientStatus(res.status)) throw new Error(message);
+      lastError = new Error(message);
+    } catch (error) {
+      if (error && !["AbortError", "TimeoutError"].includes(error.name) && / HTTP 4\d\d:/.test(error.message || "")) {
+        throw error;
+      }
+      lastError = error;
+    }
+    if (Date.now() + 500 >= endAt) break;
+    await sleep(500);
+  }
+  throw lastError || new Error(`${description} timed out`);
+}
+
+async function dispatch(command, timeout = requestTimeoutMs, endAt = deadline) {
+  return requestJson(`${origin}/api/orchestration/dispatch`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify(command),
+  }, `dispatch ${command.type}`, timeout, endAt);
+}
+
+async function snapshot() {
+  return requestJson(`${origin}/api/orchestration/snapshot`, {
+    headers: { authorization: `Bearer ${token}` },
+  }, "snapshot", requestTimeoutMs);
+}
+
+async function sleep(ms) {
+  await new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function main() {
+  await dispatch({
+    type: "project.create",
+    commandId: crypto.randomUUID(),
+    projectId,
+    title: "daily-restart-health",
+    workspaceRoot,
+    createWorkspaceRootIfMissing: true,
+    defaultModelSelection: { instanceId, model },
+    createdAt: nowIso(),
+  });
+  projectCreated = true;
+  await dispatch({
+    type: "thread.create",
+    commandId: crypto.randomUUID(),
+    threadId,
+    projectId,
+    title: "daily-restart-health",
+    modelSelection: { instanceId, model },
+    runtimeMode: "full-access",
+    interactionMode: "default",
+    branch: null,
+    worktreePath: null,
+    createdAt: nowIso(),
+  });
+  threadCreated = true;
+  await dispatch({
+    type: "thread.turn.start",
+    commandId: crypto.randomUUID(),
+    threadId,
+    message: {
+      messageId: crypto.randomUUID(),
+      role: "user",
+      text: "Reply with OK.",
+      attachments: [],
+    },
+    runtimeMode: "full-access",
+    interactionMode: "default",
+    createdAt: nowIso(),
+  });
+
+  let lastState = "missing";
+  while (Date.now() < deadline) {
+    const snap = await snapshot();
+    const thread = (snap.threads || []).find((candidate) => candidate.id === threadId);
+    lastState = thread?.latestTurn?.state || lastState;
+    if (lastState === "completed") {
+      console.log(`completed thread=${threadId}`);
+      return;
+    }
+    if (lastState === "interrupted" || lastState === "error") {
+      throw new Error(`turn ${lastState}`);
+    }
+    await sleep(2000);
+  }
+  throw new Error(`timeout last_state=${lastState}`);
+}
+
+main()
+  .catch((error) => {
+    console.error(error && error.stack ? error.stack : String(error));
+    process.exitCode = 1;
+  })
+  .finally(async () => {
+    try {
+      const cleanupEndAt = Date.now() + cleanupTimeoutMs;
+      if (projectCreated) {
+        await dispatch({
+          type: "project.delete",
+          commandId: crypto.randomUUID(),
+          projectId,
+          force: true,
+        }, cleanupTimeoutMs, cleanupEndAt);
+      } else if (threadCreated) {
+        await dispatch(
+          { type: "thread.delete", commandId: crypto.randomUUID(), threadId },
+          cleanupTimeoutMs,
+          cleanupEndAt,
+        );
+      }
+    } catch (error) {
+      if (!process.exitCode) {
+        console.error(`cleanup failed: ${error && error.message ? error.message : String(error)}`);
+        process.exitCode = 1;
+      }
+    } finally {
+      if (ownsWorkspace && workspaceRoot.startsWith("/tmp/t3-health-probe-")) {
+        fs.rmSync(workspaceRoot, { recursive: true, force: true });
+      }
+    }
+  });
+NODE
+)"
+  rc=$?
+  rm -rf "$token_dir"
+  if [[ -n "$session_id" ]]; then
+    revoke_session "$session_id" || true
+  fi
+  output="${output//$'\n'/ }"
+  if [[ "$rc" -eq 0 ]]; then
+    print_check "spawn_wake" "PASS" "${output:-completed}"
+    return 0
+  fi
+  [[ -n "$output" ]] || output="node_rc=$rc"
+  print_check "spawn_wake" "FAIL" "$output"
+  return 1
+}
+
+failures=0
+run_systemd_check || failures=$((failures + 1))
+run_http_check || failures=$((failures + 1))
+run_smoke_check || failures=$((failures + 1))
+
+[[ "$failures" -eq 0 ]]
