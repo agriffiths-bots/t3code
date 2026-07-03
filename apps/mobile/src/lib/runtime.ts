@@ -2,6 +2,7 @@ import * as Layer from "effect/Layer";
 import * as ManagedRuntime from "effect/ManagedRuntime";
 import * as Socket from "effect/unstable/socket/Socket";
 
+import { makeHeaderOptionsCapableWebSocketConstructor } from "@t3tools/client-runtime/platform";
 import { remoteHttpClientLayer } from "@t3tools/client-runtime/rpc";
 
 import { cryptoLayer } from "../features/cloud/dpop";
@@ -14,17 +15,20 @@ function configuredRelayUrl(): string {
 }
 
 const httpClientLayer = remoteHttpClientLayer(fetch);
+const webSocketConstructorLayer = Layer.sync(Socket.WebSocketConstructor, () =>
+  makeHeaderOptionsCapableWebSocketConstructor(globalThis.WebSocket),
+);
 
 type RuntimeLayerSource =
   | ReturnType<typeof managedRelayClientLayer>
-  | typeof Socket.layerWebSocketConstructorGlobal
+  | typeof webSocketConstructorLayer
   | typeof cryptoLayer
   | typeof httpClientLayer
   | typeof tracingLayer;
 
 const runtimeLayer = Layer.merge(
   managedRelayClientLayer(configuredRelayUrl()),
-  Socket.layerWebSocketConstructorGlobal,
+  webSocketConstructorLayer,
 ).pipe(
   Layer.provideMerge(cryptoLayer),
   Layer.provideMerge(httpClientLayer),
