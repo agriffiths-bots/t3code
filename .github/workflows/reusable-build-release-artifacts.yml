@@ -879,12 +879,14 @@ jobs:
             throw "NSIS installer exited with code $($process.ExitCode)."
           }
 
-          $appExe = Get-ChildItem -Path $installDir -Filter "*.exe" -Recurse |
-            Where-Object { $_.Name -notmatch "uninstall|unins" } |
-            Sort-Object FullName |
+          $expectedExeNames = @("T3 Code (Alpha).exe", "T3 Code (Nightly).exe")
+          $appExe = Get-ChildItem -Path $installDir -Filter "*.exe" -File |
+            Where-Object { $expectedExeNames -contains $_.Name } |
             Select-Object -First 1
           if (-not $appExe) {
-            throw "No installed application executable found under $installDir."
+            $topLevelExecutables = Get-ChildItem -Path $installDir -Filter "*.exe" -File |
+              Select-Object -ExpandProperty Name
+            throw "No expected installed application executable found under $installDir. Expected one of: $($expectedExeNames -join ', '). Top-level executables: $($topLevelExecutables -join ', ')"
           }
 
           "app_exe=$($appExe.FullName)" >> $env:GITHUB_OUTPUT
