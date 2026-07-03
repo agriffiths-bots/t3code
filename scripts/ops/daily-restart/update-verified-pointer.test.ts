@@ -58,9 +58,16 @@ it("verifies a sha with desktop assets and launch smoke, ignoring the pointer re
     client: client({
       releases: [
         { ...release([asset("client-verified-latest.json")]), tag_name: "client-verified-latest" },
+        { ...release(), draft: true },
         release([asset("t3-code-preview-android.apk")]),
-        release(),
+        release([
+          asset("T3-Code-1.0.0-x64.exe"),
+          asset("T3-Code-1.0.0-x64.exe.blockmap"),
+          asset("builder-debug-win.yml"),
+          asset("latest.yml"),
+        ]),
       ],
+      checkRuns: [{ name: "Windows Launch Smoke", conclusion: "skipped" }, ...checks()],
     }),
     now: new Date("2026-07-03T12:00:00.000Z"),
   });
@@ -83,7 +90,9 @@ it("verifies a sha with desktop assets and launch smoke, ignoring the pointer re
 it("rejects smoke-failed and artifact-missing shas", async () => {
   const smokeFailed = await verifyClientArtifacts({
     sha,
-    client: client({ checkRuns: checks({ "Windows Launch Smoke": "failure" }) }),
+    client: client({
+      checkRuns: [{ name: "Windows Launch Smoke", conclusion: "failure" }, ...checks()],
+    }),
   });
   const artifactsMissing = await verifyClientArtifacts({
     sha,

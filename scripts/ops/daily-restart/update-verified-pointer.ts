@@ -23,6 +23,7 @@ export interface GitHubRelease {
   readonly tag_name: string;
   readonly html_url: string;
   readonly target_commitish: string;
+  readonly draft?: boolean;
   readonly assets: ReadonlyArray<GitHubAsset>;
 }
 
@@ -85,7 +86,7 @@ function findWindowsAssets(release: GitHubRelease) {
   return {
     installer: findAsset(release, /\.exe$/i),
     blockmap: findAsset(release, /\.blockmap$/i),
-    manifest: findAsset(release, /\.ya?ml$/i),
+    manifest: findAsset(release, /^(?:latest|nightly)\.ya?ml$/i),
   };
 }
 
@@ -97,9 +98,10 @@ function findCheck(
   checkRuns: ReadonlyArray<GitHubCheckRun>,
   expectedName: (typeof REQUIRED_SMOKE_CHECKS)[number],
 ): GitHubCheckRun | undefined {
-  return checkRuns.find(
+  const matches = checkRuns.filter(
     (check) => check.name === expectedName || check.name.endsWith(` / ${expectedName}`),
   );
+  return matches.find((check) => check.conclusion !== "skipped") ?? matches[0];
 }
 
 function describeMissingChecks(checkRuns: ReadonlyArray<GitHubCheckRun>) {
@@ -133,7 +135,10 @@ export async function verifyClientArtifacts(options: {
   }
 
   const matchingReleases = releases.filter(
-    (candidate) => candidate.tag_name !== POINTER_BRANCH && releaseMatchesSha(candidate, sha),
+    (candidate) =>
+      !candidate.draft &&
+      candidate.tag_name !== POINTER_BRANCH &&
+      releaseMatchesSha(candidate, sha),
   );
   const release = matchingReleases.find((candidate) => {
     const assets = findWindowsAssets(candidate);
@@ -272,7 +277,7 @@ function makeGhVerificationClient(repo: string): VerificationClient {
     listCheckRuns: async (sha) => {
       const response = await ghJson<{ readonly check_runs: ReadonlyArray<GitHubCheckRun> }>(
         repo,
-        `/commits/${sha}/check-runs?per_page=100`,
+        `/commits/${sha}/check-runs?per_page=100&filter=all`,
       );
       return response.check_runs;
     },
