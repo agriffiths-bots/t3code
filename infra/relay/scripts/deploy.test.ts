@@ -276,6 +276,9 @@ describe("artifact release workflows", () => {
       );
       expect(mainWorkflow).toContain("android_public_config: false");
       expect(mainWorkflow).toContain(
+        "platform: ${{ github.event_name == 'workflow_dispatch' && inputs.platform || 'both' }}",
+      );
+      expect(mainWorkflow).toContain(
         "prerelease: ${{ github.event_name == 'schedule' || inputs.prerelease }}",
       );
       expect(mainWorkflow).toContain("windows_signing: true");
@@ -289,6 +292,7 @@ describe("artifact release workflows", () => {
       expect(reusableWorkflow).toContain("android_mobile_version_policy:");
       expect(reusableWorkflow).toContain("android_app_version:");
       expect(reusableWorkflow).toContain("android_public_config:");
+      expect(reusableWorkflow).toContain("platform:");
       expect(reusableWorkflow).toContain("MOBILE_APP_VERSION: ${{ inputs.android_app_version }}");
       expect(reusableWorkflow).toContain(
         "T3CODE_CLERK_PUBLISHABLE_KEY: ${{ inputs.android_public_config && inputs.clerk_publishable_key || '' }}",
@@ -313,12 +317,15 @@ describe("artifact release workflows", () => {
       expect(reusableWorkflow).toContain("needs: android_preflight");
       expect(reusableWorkflow).toContain("needs: [android_preflight, build_wsl_node_pty]");
       expect(reusableWorkflow).toContain(
-        "if: needs.android_preflight.result == 'success' && needs.build_wsl_node_pty.result == 'success'",
+        "if: inputs.platform != 'android' && needs.android_preflight.result == 'success' && needs.build_wsl_node_pty.result == 'success'",
       );
-      // Windows is the always-on artifact: publish when it succeeds and Android
-      // either built or is not required, so a failing EAS build never blocks it.
+      // Selected platforms publish when their builds succeed. Optional Android
+      // in the default both-platform release still must not block Windows.
+      expect(reusableWorkflow).toContain("inputs.platform == 'windows' ||");
       expect(reusableWorkflow).toContain("needs.android_apk.result == 'success' ||");
-      expect(reusableWorkflow).toContain("!inputs.android_required");
+      expect(reusableWorkflow).toContain("(inputs.platform == 'both' && !inputs.android_required)");
+      expect(reusableWorkflow).toContain("inputs.platform == 'android' ||");
+      expect(reusableWorkflow).toContain("needs.windows_x64.result == 'success'");
       // An optional Android failure must not turn the whole release run red.
       expect(reusableWorkflow).toContain("continue-on-error: ${{ !inputs.android_required }}");
       // EAS cloud builds need a generous timeout so the APK isn't cancelled.
@@ -326,6 +333,10 @@ describe("artifact release workflows", () => {
       expect(ciWorkflow).toContain("mobile_native_static_analysis:");
       expect(ciWorkflow).toContain("brew bundle install --file apps/mobile/Brewfile");
       expect(ciWorkflow).toContain("run: vp run lint:mobile");
+      expect(ciWorkflow).toContain("Prebuild mobile Android config");
+      expect(ciWorkflow).toContain(
+        "pnpm exec expo prebuild --clean --platform android --no-install",
+      );
     }).pipe(Effect.provide(NodeServices.layer)),
   );
 });
