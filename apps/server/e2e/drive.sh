@@ -78,9 +78,10 @@ dispatch(){ # $1 = command JSON; retries transient failures, returns 0 on 2xx
   local code attempt=0
   while [ "$attempt" -lt 12 ]; do
     attempt=$((attempt + 1))
-    code="$(curl -sS -o /dev/null -w '%{http_code}' -X POST "$ORIGIN/api/orchestration/dispatch" \
+    code="$(curl --connect-timeout 2 --max-time 5 -sS -o /dev/null -w '%{http_code}' -X POST "$ORIGIN/api/orchestration/dispatch" \
       -H "authorization: Bearer $TOKEN" -H 'content-type: application/json' \
-      -d "$1" 2>/dev/null || echo 000)"
+      -d "$1" 2>/dev/null || true)"
+    [ -n "$code" ] || code=000
     case "$code" in
       2??) return 0 ;;
       000|5??|429) sleep 1 ;;  # transient: connection / not-ready / rate — retry

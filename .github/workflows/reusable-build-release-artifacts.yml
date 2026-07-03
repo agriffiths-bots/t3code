@@ -171,6 +171,125 @@ jobs:
             echo "Also verify EXPO_OWNER / EXPO_PROJECT_ID repository variables if the defaults are not correct."
           }
 
+  server_e2e_gate:
+    name: Server E2E Gate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.ref }}
+          fetch-depth: 0
+
+      - name: Install e2e gate dependencies
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y sqlite3
+
+      - name: Setup Vite+
+        uses: voidzero-dev/setup-vp@v1
+        with:
+          node-version-file: package.json
+          cache: true
+          run-install: true
+
+      - name: Build server bundle
+        run: vp run --filter t3 build
+
+      - name: Run server e2e gate
+        shell: bash
+        run: |
+          set -euo pipefail
+          t3_home="$(mktemp -d)"
+          project_dir="$(mktemp -d)"
+          port="$(
+            node - <<'NODE'
+          const net = require("node:net");
+          const server = net.createServer();
+          server.listen(0, "127.0.0.1", () => {
+            console.log(server.address().port);
+            server.close();
+          });
+          NODE
+          )"
+          origin="http://127.0.0.1:$port"
+          server_log="$t3_home/server.log"
+
+          cleanup() {
+            if [[ -n "${server_pid:-}" ]] && kill -0 "$server_pid" 2>/dev/null; then
+              kill "$server_pid" 2>/dev/null || true
+              wait "$server_pid" 2>/dev/null || true
+            fi
+            if [[ -f "$server_log" ]]; then
+              echo "::group::server e2e gate log"
+              tail -200 "$server_log" || true
+              echo "::endgroup::"
+            fi
+          }
+          trap cleanup EXIT
+
+          T3CODE_HOME="$t3_home" T3CODE_NO_BROWSER=1 \
+            node apps/server/dist/bin.mjs serve \
+              --port "$port" \
+              --host 127.0.0.1 \
+              --base-dir "$t3_home" \
+              "$project_dir" \
+              >"$server_log" 2>&1 &
+          server_pid=$!
+
+          ready=0
+          for _ in $(seq 1 60); do
+            if grep -q "T3 Code server is ready." "$server_log"; then
+              ready=1
+              break
+            fi
+            if ! kill -0 "$server_pid" 2>/dev/null; then
+              echo "::error::Server exited before e2e gate readiness."
+              exit 1
+            fi
+            sleep 1
+          done
+          if [[ "$ready" != "1" ]]; then
+            echo "::error::Timed out waiting for server e2e gate readiness."
+            exit 1
+          fi
+
+          GATE_SRV_PID="$server_pid" SQLITE="$(command -v sqlite3)" \
+            apps/server/e2e/drive.sh \
+              "$t3_home" \
+              "$origin" \
+              "$project_dir" \
+              codex \
+              gpt-5-codex \
+              "Create and link the e2e child thread."
+          server_pid=""
+
+          T3_HOME="$t3_home" node --experimental-sqlite --input-type=module <<'NODE'
+          import * as NodeFS from "node:fs";
+          import * as NodePath from "node:path";
+          import { childrenOf, close, openState } from "./apps/server/e2e/assert.mjs";
+
+          const t3Home = process.env.T3_HOME;
+          const linkagePath = NodePath.join(t3Home, ".gate-linkage");
+          const [parentId, childId] = NodeFS.readFileSync(linkagePath, "utf8").trim().split(/\s+/);
+          if (!parentId || !childId) {
+            throw new Error(`Invalid gate linkage file at ${linkagePath}`);
+          }
+
+          const db = openState(NodePath.join(t3Home, "userdata", "state.sqlite"));
+          try {
+            const children = childrenOf(db, parentId);
+            if (!children.some((child) => child.thread_id === childId && child.parent_thread_id === parentId)) {
+              throw new Error(`Missing projected child ${childId} under parent ${parentId}`);
+            }
+            console.log(`server e2e gate projected child ${childId} under parent ${parentId}`);
+          } finally {
+            close(db);
+          }
+          NODE
+
   android_apk:
     name: Build Android APK
     needs: android_preflight
@@ -709,9 +828,77 @@ jobs:
         shell: bash
         run: gh run cancel "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" || true
 
+  windows_launch_smoke:
+    name: Windows Launch Smoke
+    needs: windows_x64
+    if: inputs.platform != 'android' && needs.windows_x64.result == 'success'
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.ref }}
+          fetch-depth: 0
+
+      - name: Setup Node
+        uses: actions/setup-node@v6
+        with:
+          node-version-file: package.json
+
+      - name: Download Windows artifact
+        uses: actions/download-artifact@v7
+        with:
+          name: windows-x64
+          path: release-assets
+
+      - id: install
+        name: Install Windows desktop artifact
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $installer = Get-ChildItem -Path release-assets -Filter "*.exe" |
+            Sort-Object Length -Descending |
+            Select-Object -First 1
+          if (-not $installer) {
+            throw "No NSIS installer found in release-assets."
+          }
+
+          $installDir = Join-Path $env:RUNNER_TEMP "t3code-install"
+          if (Test-Path $installDir) {
+            Remove-Item -Recurse -Force $installDir
+          }
+          New-Item -ItemType Directory -Force -Path $installDir | Out-Null
+
+          $process = Start-Process `
+            -FilePath $installer.FullName `
+            -ArgumentList @("/S", "/D=$installDir") `
+            -Wait `
+            -PassThru
+          if ($process.ExitCode -ne 0) {
+            throw "NSIS installer exited with code $($process.ExitCode)."
+          }
+
+          $expectedExeNames = @("T3 Code (Alpha).exe", "T3 Code (Nightly).exe")
+          $appExe = Get-ChildItem -Path $installDir -Filter "*.exe" -File |
+            Where-Object { $expectedExeNames -contains $_.Name } |
+            Select-Object -First 1
+          if (-not $appExe) {
+            $topLevelExecutables = Get-ChildItem -Path $installDir -Filter "*.exe" -File |
+              Select-Object -ExpandProperty Name
+            throw "No expected installed application executable found under $installDir. Expected one of: $($expectedExeNames -join ', '). Top-level executables: $($topLevelExecutables -join ', ')"
+          }
+
+          "app_exe=$($appExe.FullName)" >> $env:GITHUB_OUTPUT
+          Write-Host "Installed desktop executable: $($appExe.FullName)"
+
+      - name: Launch installed Windows desktop app
+        shell: pwsh
+        run: node scripts/desktop-launch-smoke.mjs --command "${{ steps.install.outputs.app_exe }}" --timeout-ms 90000
+
   publish_release:
     name: Publish GitHub Release
-    needs: [android_preflight, android_apk, windows_x64]
+    needs: [android_preflight, android_apk, server_e2e_gate, windows_x64, windows_launch_smoke]
     # Windows is the always-on artifact for this fork. Publish whenever the
     # Windows build succeeds and either the Android APK built or Android is not
     # required, so a flaky/misconfigured EAS build never blocks the release.
@@ -719,6 +906,7 @@ jobs:
       ${{
         always() &&
         needs.android_preflight.result == 'success' &&
+        needs.server_e2e_gate.result == 'success' &&
         (
           inputs.platform == 'windows' ||
           needs.android_apk.result == 'success' ||
@@ -727,6 +915,10 @@ jobs:
         (
           inputs.platform == 'android' ||
           needs.windows_x64.result == 'success'
+        ) &&
+        (
+          inputs.platform == 'android' ||
+          needs.windows_launch_smoke.result == 'success'
         )
       }}
     runs-on: ubuntu-24.04
