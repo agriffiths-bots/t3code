@@ -19,6 +19,18 @@ type HeaderOptionsCapableWebSocketConstructor = {
   readonly [HEADER_OPTIONS_CAPABLE_WEBSOCKET]?: true;
 };
 
+type WebSocketHeaderOptions = {
+  readonly headers?: Readonly<Record<string, string>>;
+};
+
+type HeaderOptionsWebSocketConstructor = {
+  new (
+    url: string | URL,
+    protocols?: string | string[],
+    options?: WebSocketHeaderOptions,
+  ): globalThis.WebSocket;
+};
+
 export function markWebSocketHeaderOptionsCapable<T extends object>(constructor: T): T {
   if (
     (constructor as HeaderOptionsCapableWebSocketConstructor)[HEADER_OPTIONS_CAPABLE_WEBSOCKET] !==
@@ -33,20 +45,54 @@ export function markWebSocketHeaderOptionsCapable<T extends object>(constructor:
   return constructor;
 }
 
+function isConstructor(value: unknown): boolean {
+  if (typeof value !== "function") {
+    return false;
+  }
+  try {
+    Reflect.construct(String, [], value);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export function makeHeaderOptionsCapableWebSocketConstructor(
+  webSocketConstructor: HeaderOptionsWebSocketConstructor,
+): (
+  url: string | URL,
+  protocols?: string | string[],
+  options?: WebSocketHeaderOptions,
+) => globalThis.WebSocket {
+  function HeaderOptionsCapableWebSocket(
+    url: string | URL,
+    protocols?: string | string[],
+    options?: WebSocketHeaderOptions,
+  ) {
+    return new webSocketConstructor(url, protocols, options);
+  }
+  return markWebSocketHeaderOptionsCapable(HeaderOptionsCapableWebSocket);
+}
+
 export function canPassWebSocketHeaderOptions(
   webSocketConstructor: unknown = globalThis.WebSocket,
 ) {
+  if (!isConstructor(webSocketConstructor)) {
+    return false;
+  }
+  if (
+    (webSocketConstructor as HeaderOptionsCapableWebSocketConstructor)[
+      HEADER_OPTIONS_CAPABLE_WEBSOCKET
+    ] === true
+  ) {
+    return true;
+  }
   const navigatorProduct = (globalThis.navigator as { readonly product?: string } | undefined)
     ?.product;
   if (navigatorProduct === "ReactNative") {
     return true;
   }
-  return (
-    typeof webSocketConstructor === "function" &&
-    (webSocketConstructor as HeaderOptionsCapableWebSocketConstructor)[
-      HEADER_OPTIONS_CAPABLE_WEBSOCKET
-    ] === true
-  );
+  return false;
 }
 
 export interface PreparedSshEnvironment {
