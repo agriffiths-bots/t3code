@@ -31,9 +31,8 @@ identifiers, not secrets.
 Web, desktop, mobile, and bundled server builds statically inject the values they consume during
 their build step. A built artifact does not need an environment file at runtime. CI release builds
 should set `T3CODE_CLERK_PUBLISHABLE_KEY`, `T3CODE_CLERK_JWT_TEMPLATE`,
-`T3CODE_CLERK_CLI_OAUTH_CLIENT_ID`, and `T3CODE_RELAY_URL` before building. EAS preview and
-production builds only need the Clerk publishable key, JWT template name, and relay URL in their EAS
-environment.
+`T3CODE_CLERK_CLI_OAUTH_CLIENT_ID`, and `T3CODE_RELAY_URL` before building. Native mobile release
+builds are currently deprecated in this fork; see the release checklist for the restore path.
 
 When any client-facing public value is absent, cloud UI is omitted. When the CLI public values are
 absent, the `t3 connect` CLI command group is omitted. The bundled server still accepts runtime
