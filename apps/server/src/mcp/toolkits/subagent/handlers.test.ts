@@ -184,12 +184,20 @@ const makeScheduledTask = (modelSelection: ModelSelection | null): ScheduledTask
   createdAt: IsoDateTime.make("2026-06-17T09:00:00.000Z"),
 });
 
+type ModelFixture =
+  | string
+  | {
+      readonly slug: string;
+      readonly optionId: string;
+      readonly value: string;
+    };
+
 // A minimal provider instance exposing just what buildModelSources reads: an id,
 // a driver kind, enabled=true, and a snapshot whose models list the given slugs.
 const makeModelInstance = (
   instanceId: string,
   driverKind: string,
-  slugs: ReadonlyArray<string>,
+  models: ReadonlyArray<ModelFixture>,
 ) => ({
   instanceId: ProviderInstanceId.make(instanceId),
   driverKind,
@@ -197,7 +205,28 @@ const makeModelInstance = (
   snapshot: {
     getSnapshot: Effect.succeed({
       status: "ready",
-      models: slugs.map((slug) => ({ slug, capabilities: null })),
+      models: models.map((entry) =>
+        typeof entry === "string"
+          ? { slug: entry, capabilities: null }
+          : {
+              slug: entry.slug,
+              capabilities: {
+                optionDescriptors: [
+                  {
+                    id: entry.optionId,
+                    label: "Reasoning",
+                    type: "select" as const,
+                    options: ["low", "medium", "high", "xhigh", "max"].map((value) => ({
+                      id: value,
+                      label: value,
+                      ...(value === entry.value ? { isDefault: true } : {}),
+                    })),
+                    currentValue: entry.value,
+                  },
+                ],
+              },
+            },
+      ),
     }),
   },
 });
@@ -559,7 +588,10 @@ describe("SubagentToolkit", () => {
         // priority must win (claudeAgent, not cursor) with no hardcoded names.
         modelInstances = [
           makeModelInstance("cursor", "cursor", ["claude-opus-4-8", "auto"]),
-          makeModelInstance("claudeAgent", "claudeAgent", ["claude-opus-4-8", "claude-sonnet-4-6"]),
+          makeModelInstance("claudeAgent", "claudeAgent", [
+            { slug: "claude-opus-4-8", optionId: "effort", value: "high" },
+            "claude-sonnet-4-6",
+          ]),
         ];
 
         const result = yield* server
@@ -579,14 +611,86 @@ describe("SubagentToolkit", () => {
         expect(result.isError).toBe(false);
         // The returned entry confirms the routed harness to the caller...
         expect(result.structuredContent).toMatchObject({
-          modelSelection: { instanceId: "claudeAgent", model: "claude-opus-4-8" },
+          modelSelection: {
+            instanceId: "claudeAgent",
+            model: "claude-opus-4-8",
+            options: [{ id: "effort", value: "xhigh" }],
+          },
         });
         // ...and the persisted task carries the same resolved selection.
         expect(insertedTasks).toHaveLength(1);
         expect(insertedTasks[0]!.modelSelection).toMatchObject({
           instanceId: "claudeAgent",
           model: "claude-opus-4-8",
+          options: [{ id: "effort", value: "xhigh" }],
         });
+      }),
+    ).pipe(Effect.provide(TestLayer)),
+  );
+
+  it.effect("t3_schedule_create applies directive default efforts for plain models", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const server = yield* McpServer.McpServer;
+        insertedTasks.length = 0;
+        modelInstances = [
+          makeModelInstance("codex", "codex", [
+            { slug: "gpt-5.5", optionId: "reasoningEffort", value: "medium" },
+          ]),
+          makeModelInstance("claudeAgent", "claudeAgent", [
+            { slug: "claude-opus-4-8", optionId: "effort", value: "high" },
+            { slug: "claude-sonnet-5", optionId: "effort", value: "medium" },
+            { slug: "claude-fable-5", optionId: "effort", value: "xhigh" },
+          ]),
+        ];
+
+        const cases = [
+          { model: "gpt-5.5", optionId: "reasoningEffort", value: "xhigh" },
+          { model: "claude-opus-4-8", optionId: "effort", value: "xhigh" },
+          { model: "claude-sonnet-5", optionId: "effort", value: "xhigh" },
+          { model: "claude-fable-5", optionId: "effort", value: "high" },
+        ] as const;
+
+        for (const row of cases) {
+          const result = yield* server
+            .callTool({
+              name: "t3_schedule_create",
+              arguments: {
+                prompt: `scheduled ${row.model}`,
+                intervalSeconds: 3_600,
+                model: row.model,
+              },
+            })
+            .pipe(
+              Effect.provideService(McpInvocationContext.McpInvocationContext, invocation),
+              Effect.provideService(McpSchema.McpServerClient, client),
+            );
+
+          expect(result.isError).toBe(false);
+        }
+
+        expect(insertedTasks.map((task) => task.modelSelection)).toEqual([
+          {
+            instanceId: "codex",
+            model: "gpt-5.5",
+            options: [{ id: "reasoningEffort", value: "xhigh" }],
+          },
+          {
+            instanceId: "claudeAgent",
+            model: "claude-opus-4-8",
+            options: [{ id: "effort", value: "xhigh" }],
+          },
+          {
+            instanceId: "claudeAgent",
+            model: "claude-sonnet-5",
+            options: [{ id: "effort", value: "xhigh" }],
+          },
+          {
+            instanceId: "claudeAgent",
+            model: "claude-fable-5",
+            options: [{ id: "effort", value: "high" }],
+          },
+        ]);
       }),
     ).pipe(Effect.provide(TestLayer)),
   );
