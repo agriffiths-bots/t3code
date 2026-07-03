@@ -45,6 +45,7 @@ function makeFixtureDb(dir: string): string {
   > = [
     ["active-turn", "Active Turn", null, null, "running", "turn-1"],
     ["running-no-turn", "Running No Turn", null, null, "running", null],
+    ["starting-no-turn", "Starting No Turn", null, null, "starting", null],
     ["waiting", "Waiting Parent", null, null, "waiting", null],
     ["idle", "Idle Thread", null, null, "ready", null],
     ["deleted", "Deleted Thread", "2026-07-03T00:00:00.000Z", null, "running", "turn-2"],
@@ -136,6 +137,15 @@ describe("capture-active-threads", () => {
           injected_at: null,
         },
         {
+          thread_id: "starting-no-turn",
+          role: "active",
+          status: "starting",
+          active_turn_id: null,
+          title: "Starting No Turn",
+          project_id: "project-1",
+          injected_at: null,
+        },
+        {
           thread_id: "waiting",
           role: "waiting",
           status: "waiting",
@@ -170,6 +180,8 @@ describe("capture-active-threads", () => {
           "active-turn",
           "--exclude",
           "running-no-turn",
+          "--exclude",
+          "starting-no-turn",
           "--exclude",
           "waiting",
           "--exclude",

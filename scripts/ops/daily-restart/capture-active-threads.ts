@@ -9,7 +9,7 @@ import * as NodeSqlite from "node:sqlite";
 import * as NodeURL from "node:url";
 
 const DEFAULT_DB_PATH = "/home/adam/.t3-vps/userdata/state.sqlite";
-const WAITING_STATUSES = new Set(["waiting"]);
+const ACTIVE_STATUSES = new Set(["running", "starting"]);
 
 export interface CaptureActiveThreadsOptions {
   readonly dbPath: string;
@@ -81,7 +81,7 @@ export function openCaptureDatabase(dbPath: string): CaptureDatabase {
 }
 
 function roleForRow(row: SessionRow): CapturedThread["role"] {
-  return row.active_turn_id !== null || row.status === "running" ? "active" : "waiting";
+  return row.active_turn_id !== null || ACTIVE_STATUSES.has(row.status) ? "active" : "waiting";
 }
 
 function buildCaptureQuery(excludedThreadIds: ReadonlyArray<string>) {
@@ -104,6 +104,7 @@ function buildCaptureQuery(excludedThreadIds: ReadonlyArray<string>) {
       AND (
         sessions.active_turn_id IS NOT NULL
         OR sessions.status = 'running'
+        OR sessions.status = 'starting'
         OR sessions.status = 'waiting'
       )
       ${excludedClause}
@@ -119,20 +120,15 @@ function readCapturedThreads(
     .prepare(buildCaptureQuery(excludedThreadIds))
     .all(...excludedThreadIds) as unknown as ReadonlyArray<SessionRow>;
 
-  return rows
-    .filter(
-      (row) =>
-        row.active_turn_id !== null || row.status === "running" || WAITING_STATUSES.has(row.status),
-    )
-    .map((row) => ({
-      thread_id: row.thread_id,
-      role: roleForRow(row),
-      status: row.status,
-      active_turn_id: row.active_turn_id,
-      title: row.title,
-      project_id: row.project_id,
-      injected_at: null,
-    }));
+  return rows.map((row) => ({
+    thread_id: row.thread_id,
+    role: roleForRow(row),
+    status: row.status,
+    active_turn_id: row.active_turn_id,
+    title: row.title,
+    project_id: row.project_id,
+    injected_at: null,
+  }));
 }
 
 function writeJsonAtomic(outPath: string, manifest: CaptureManifest): void {
