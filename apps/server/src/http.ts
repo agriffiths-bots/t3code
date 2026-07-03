@@ -3,6 +3,7 @@ import {
   AuthOrchestrationOperateScope,
   AuthOrchestrationReadScope,
   EnvironmentHttpApi,
+  ProviderInstanceId,
 } from "@t3tools/contracts";
 import { decodeOtlpTraceRecords } from "@t3tools/shared/observability";
 import * as Data from "effect/Data";
@@ -26,6 +27,7 @@ import * as HttpApiBuilder from "effect/unstable/httpapi/HttpApiBuilder";
 import { OtlpTracer } from "effect/unstable/observability";
 
 import * as ServerConfig from "./config.ts";
+import * as ServerSettings from "./serverSettings.ts";
 import {
   ASSET_ROUTE_PREFIX,
   FALLBACK_PROJECT_FAVICON_SVG,
@@ -43,9 +45,11 @@ import {
 import * as ServerEnvironment from "./environment/ServerEnvironment.ts";
 import { browserApiCorsAllowedHeaders, browserApiCorsAllowedMethods } from "./httpCors.ts";
 import { buildElevenLabsRequest, resolveVoiceId, validateTtsText } from "./tts/ttsRequest.logic.ts";
+import { loadPlanUsageSnapshot } from "./usage/PlanUsage.ts";
 
 const OTLP_TRACES_PROXY_PATH = "/api/observability/v1/traces";
 const TTS_SPEAK_PATH = "/api/tts/speak";
+const PLAN_USAGE_PATH = "/api/plan-usage";
 const LOOPBACK_HOSTNAMES = new Set(["127.0.0.1", "::1", "localhost"]);
 const DESKTOP_RENDERER_ORIGINS = ["t3code://app", "t3code-dev://app"];
 
@@ -257,6 +261,49 @@ export const ttsSpeakHandler = Effect.gen(function* () {
 );
 
 export const ttsSpeakRouteLayer = HttpRouter.add("POST", TTS_SPEAK_PATH, ttsSpeakHandler);
+
+export const planUsageRouteLayer = HttpRouter.add(
+  "GET",
+  PLAN_USAGE_PATH,
+  Effect.gen(function* () {
+    yield* authenticateRawRouteWithScope(AuthOrchestrationReadScope);
+    const request = yield* HttpServerRequest.HttpServerRequest;
+    const url = HttpServerRequest.toURL(request);
+    if (Option.isNone(url)) {
+      return HttpServerResponse.text("Bad Request", { status: 400 });
+    }
+
+    const decodeProviderInstanceId = Schema.decodeUnknownOption(ProviderInstanceId);
+    const rawProviderInstanceId = url.value.searchParams.get("providerInstanceId");
+    const decodedProviderInstanceId = rawProviderInstanceId
+      ? decodeProviderInstanceId(rawProviderInstanceId)
+      : Option.none();
+    if (rawProviderInstanceId && Option.isNone(decodedProviderInstanceId)) {
+      return HttpServerResponse.text("Bad Request", { status: 400 });
+    }
+    const providerInstanceId = rawProviderInstanceId
+      ? Option.getOrNull(decodedProviderInstanceId)
+      : null;
+    const serverSettings = yield* ServerSettings.ServerSettingsService;
+    const settings = yield* serverSettings.getSettings;
+    const snapshot = yield* Effect.promise(() =>
+      loadPlanUsageSnapshot({ providerInstanceId, settings }),
+    );
+
+    return HttpServerResponse.jsonUnsafe(snapshot, {
+      headers: {
+        "Cache-Control": "private, max-age=30",
+        "X-Content-Type-Options": "nosniff",
+      },
+    });
+  }).pipe(
+    Effect.catchTags({
+      EnvironmentAuthInvalidError: HttpServerRespondable.toResponse,
+      EnvironmentInternalError: HttpServerRespondable.toResponse,
+      EnvironmentScopeRequiredError: HttpServerRespondable.toResponse,
+    }),
+  ),
+);
 
 export const assetRouteLayer = HttpRouter.add(
   "GET",
