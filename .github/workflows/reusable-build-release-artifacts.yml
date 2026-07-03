@@ -59,6 +59,11 @@ on:
         required: false
         default: true
         type: boolean
+      platform:
+        description: "Release artifact platform subset to build"
+        required: false
+        default: both
+        type: string
       prerelease:
         description: "Whether the GitHub Release is a prerelease"
         required: false
@@ -115,6 +120,7 @@ on:
 
 permissions:
   contents: read
+  actions: write
 
 jobs:
   android_preflight:
@@ -129,9 +135,24 @@ jobs:
         env:
           ANDROID_REQUIRED: ${{ inputs.android_required }}
           EXPO_TOKEN: ${{ secrets.EXPO_TOKEN }}
+          PLATFORM: ${{ inputs.platform }}
         shell: bash
         run: |
           set -euo pipefail
+          case "$PLATFORM" in
+            both|android|windows) ;;
+            *)
+              echo "::error::Unsupported platform '$PLATFORM'. Expected both, android, or windows."
+              exit 1
+              ;;
+          esac
+
+          if [[ "$PLATFORM" == "windows" ]]; then
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "Android was not selected; skipping EXPO_TOKEN validation."
+            exit 0
+          fi
+
           if [[ -n "${EXPO_TOKEN:-}" ]]; then
             echo "present=true" >> "$GITHUB_OUTPUT"
             exit 0
@@ -153,7 +174,7 @@ jobs:
   android_apk:
     name: Build Android APK
     needs: android_preflight
-    if: needs.android_preflight.outputs.expo_token_present == 'true'
+    if: inputs.platform != 'windows' && needs.android_preflight.outputs.expo_token_present == 'true'
     runs-on: ubuntu-24.04
     # EAS cloud builds queue + build can exceed 45 min on shared runners.
     timeout-minutes: 90
@@ -299,7 +320,9 @@ jobs:
 
           if (( eas_status != 0 )); then
             echo "::error::EAS Android build failed with exit code $eas_status."
-            if [[ -n "$build_id" ]]; then
+            if [[ -z "${EXPO_TOKEN:-}" ]]; then
+              echo "::warning::EXPO_TOKEN is unavailable; cannot fetch EAS build metadata or logs."
+            elif [[ -n "$build_id" ]]; then
               if eas build:view "$build_id" --json > release-assets/eas-build-view.json; then
                 node - <<'NODE'
           const fs = require("node:fs");
@@ -320,7 +343,119 @@ jobs:
           }
           const logFiles = Array.isArray(build.logFiles) ? build.logFiles : [];
           console.log(`EAS log files available in Expo: ${logFiles.length}`);
+          const logUrls = logFiles.filter((url) => typeof url === "string" && /^https?:\/\//.test(url));
+          fs.writeFileSync(
+            "release-assets/eas-log-urls.txt",
+            logUrls.length > 0 ? `${logUrls.join("\n")}\n` : ""
+          );
           NODE
+                if [[ -s release-assets/eas-log-urls.txt ]]; then
+                  echo "::group::EAS Android build diagnostics"
+                  echo "::notice::Fetched EAS logs are reduced to failure-matching diagnostic excerpts before printing."
+                  log_index=0
+                  while IFS= read -r log_url; do
+                    [[ -n "$log_url" ]] || continue
+                    log_index=$((log_index + 1))
+                    tmp_log="release-assets/eas-log-$log_index"
+                    tmp_log_text="$tmp_log.txt"
+                    echo "::group::EAS log file $log_index"
+                    if curl --fail --location --silent --show-error "$log_url" --output "$tmp_log"; then
+                      if gzip -t "$tmp_log" 2>/dev/null; then
+                        gzip -dc "$tmp_log" > "$tmp_log_text"
+                      else
+                        cp "$tmp_log" "$tmp_log_text"
+                      fi
+                      node - "$tmp_log_text" <<'NODE'
+          const fs = require("node:fs");
+
+          const logPath = process.argv[2];
+          const interestingLine =
+            /\b(?:error|failed|failure|exception|stacktrace|cannot|could not|undefined|invalid|denied|unauthorized|forbidden|config|plugin|project id|app version|gradle|eas build failed)\b/i;
+          const sensitiveName =
+            /(?:TOKEN|SECRET|PASSWORD|PRIVATE|CREDENTIAL|KEY|CERT|AZURE|CLERK|SENTRY|AXIOM|OTLP|GOOGLE|FIREBASE)/i;
+          const redactions = new Set();
+
+          const addRedaction = (value, { force = false } = {}) => {
+            if (typeof value !== "string") return;
+            const trimmed = value.trim();
+            if (trimmed.length < (force ? 8 : 20)) return;
+            if (/^(?:true|false|null|undefined)$/i.test(trimmed)) return;
+            redactions.add(trimmed);
+          };
+
+          for (const [name, value] of Object.entries(process.env)) {
+            addRedaction(value, { force: sensitiveName.test(name) });
+          }
+
+          for (const envPath of [".env", ".env.local", ".env.preview", ".env.production"]) {
+            if (!fs.existsSync(envPath)) continue;
+            for (const line of fs.readFileSync(envPath, "utf8").split(/\r?\n/)) {
+              const match = line.match(/^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)\s*$/);
+              if (!match) continue;
+              const [, name, rawValue] = match;
+              const value = rawValue.trim().replace(/^(['"])(.*)\1$/, "$2");
+              addRedaction(value, { force: sensitiveName.test(name) });
+            }
+          }
+
+          const sanitize = (line) => {
+            let text = line
+              .replace(/\u001b\[[0-9;]*m/g, "")
+              .replace(
+                /\b([A-Z0-9_]*(?:TOKEN|SECRET|PASSWORD|PRIVATE|CREDENTIAL|KEY|CERT)[A-Z0-9_]*)\s*[:=]\s*("[^"]*"|'[^']*'|\S+)/gi,
+                "$1=[redacted]"
+              )
+              .replace(/https?:\/\/\S+/g, (value) => {
+                try {
+                  const url = new URL(value);
+                  return `${url.origin}${url.pathname}${url.search ? "?[redacted]" : ""}`;
+                } catch {
+                  return "[redacted-url]";
+                }
+              })
+              .replace(/\b[0-9a-f]{32,}\b/gi, "[redacted-hex]")
+              .replace(/\b[A-Za-z0-9_+/=-]{24,}\b/g, (value) =>
+                /^[0-9]+$/.test(value) ? value : "[redacted-token]"
+              );
+
+            for (const value of [...redactions].sort((a, b) => b.length - a.length)) {
+              text = text.split(value).join("[redacted]");
+            }
+            return text;
+          };
+
+          const lines = fs.readFileSync(logPath, "utf8").split(/\r?\n/);
+          const keep = new Set();
+          for (let index = 0; index < lines.length; index += 1) {
+            if (!interestingLine.test(lines[index])) continue;
+            for (let offset = -2; offset <= 4; offset += 1) {
+              const keptIndex = index + offset;
+              if (keptIndex >= 0 && keptIndex < lines.length) keep.add(keptIndex);
+            }
+          }
+
+          if (keep.size === 0) {
+            console.log("No failure-matching lines found in this EAS log file.");
+            process.exit(0);
+          }
+
+          let previous = -2;
+          for (const index of [...keep].sort((a, b) => a - b)) {
+            if (index !== previous + 1) console.log("...");
+            previous = index;
+            console.log(`${index + 1}: ${sanitize(lines[index])}`);
+          }
+          NODE
+                    else
+                      echo "::warning::Failed to download EAS log file $log_index."
+                    fi
+                    echo
+                    echo "::endgroup::"
+                  done < release-assets/eas-log-urls.txt
+                  echo "::endgroup::"
+                else
+                  echo "::warning::EAS build metadata did not include downloadable log files."
+                fi
               else
                 echo "::warning::Failed to fetch EAS build metadata for $build_id."
               fi
@@ -348,6 +483,13 @@ jobs:
           apk_url="$(cat release-assets/apk-url.txt)"
           curl --fail --location "$apk_url" --output "release-assets/$APK_ARTIFACT_NAME"
 
+      - name: Cancel paired release jobs
+        if: ${{ failure() && inputs.platform == 'both' && inputs.android_required }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: gh run cancel "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" || true
+
       - name: Upload APK artifact
         uses: actions/upload-artifact@v7
         with:
@@ -358,7 +500,7 @@ jobs:
   build_wsl_node_pty:
     name: Build WSL node-pty linux-x64
     needs: android_preflight
-    if: needs.android_preflight.result == 'success'
+    if: inputs.platform != 'android' && needs.android_preflight.result == 'success'
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
@@ -396,7 +538,7 @@ jobs:
   windows_x64:
     name: Build Windows x64
     needs: [android_preflight, build_wsl_node_pty]
-    if: needs.android_preflight.result == 'success' && needs.build_wsl_node_pty.result == 'success'
+    if: inputs.platform != 'android' && needs.android_preflight.result == 'success' && needs.build_wsl_node_pty.result == 'success'
     runs-on: windows-2025
     timeout-minutes: 45
     env:
@@ -560,6 +702,13 @@ jobs:
           path: release-publish/*
           if-no-files-found: error
 
+      - name: Cancel paired release jobs
+        if: ${{ failure() && inputs.platform == 'both' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: gh run cancel "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" || true
+
   publish_release:
     name: Publish GitHub Release
     needs: [android_preflight, android_apk, windows_x64]
@@ -570,10 +719,14 @@ jobs:
       ${{
         always() &&
         needs.android_preflight.result == 'success' &&
-        needs.windows_x64.result == 'success' &&
         (
+          inputs.platform == 'windows' ||
           needs.android_apk.result == 'success' ||
-          !inputs.android_required
+          (inputs.platform == 'both' && !inputs.android_required)
+        ) &&
+        (
+          inputs.platform == 'android' ||
+          needs.windows_x64.result == 'success'
         )
       }}
     runs-on: ubuntu-24.04

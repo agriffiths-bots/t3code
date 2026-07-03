@@ -15,11 +15,20 @@ on:
         description: "Fail the prerelease unless the Android APK is built"
         type: boolean
         default: true
+      platform:
+        description: "Artifact platform subset to build"
+        type: choice
+        options:
+          - both
+          - android
+          - windows
+        default: both
   schedule:
     - cron: "17 23 * * *"
 
 permissions:
   contents: write
+  actions: write
 
 jobs:
   metadata:
@@ -140,6 +149,7 @@ jobs:
       android_mobile_version_policy: appVersion
       android_app_version: ${{ needs.metadata.outputs.release_version }}
       android_public_config: false
+      platform: ${{ github.event_name == 'workflow_dispatch' && inputs.platform || 'both' }}
       clerk_publishable_key: ${{ needs.public_config.outputs.clerk_publishable_key }}
       clerk_jwt_template: ${{ needs.public_config.outputs.clerk_jwt_template }}
       clerk_cli_oauth_client_id: ${{ needs.public_config.outputs.clerk_cli_oauth_client_id }}
