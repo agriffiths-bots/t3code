@@ -242,10 +242,13 @@ describe("ProviderRuntimeIngestion", () => {
       Layer.provideMerge(ServerConfig.layerTest(process.cwd(), process.cwd())),
       Layer.provideMerge(NodeServices.layer),
     );
-    runtime = ManagedRuntime.make(layer);
-    const engine = await runtime.runPromise(Effect.service(OrchestrationEngineService));
-    const snapshotQuery = await runtime.runPromise(Effect.service(ProjectionSnapshotQuery));
-    const ingestion = await runtime.runPromise(Effect.service(ProviderRuntimeIngestionService));
+    const managedRuntime = ManagedRuntime.make(layer);
+    runtime = managedRuntime;
+    const engine = await managedRuntime.runPromise(Effect.service(OrchestrationEngineService));
+    const snapshotQuery = await managedRuntime.runPromise(Effect.service(ProjectionSnapshotQuery));
+    const ingestion = await managedRuntime.runPromise(
+      Effect.service(ProviderRuntimeIngestionService),
+    );
     scope = await Effect.runPromise(Scope.make("sequential"));
     await Effect.runPromise(ingestion.start().pipe(Scope.provide(scope)));
     const drain = () => Effect.runPromise(ingestion.drain);
@@ -312,6 +315,12 @@ describe("ProviderRuntimeIngestion", () => {
     return {
       engine,
       readModel: () => Effect.runPromise(snapshotQuery.getSnapshot()),
+      readEvents: (fromSequence: number) =>
+        managedRuntime.runPromise(
+          Stream.runCollect(engine.readEvents(fromSequence)).pipe(
+            Effect.map((chunk) => Array.from(chunk)),
+          ),
+        ),
       emit: provider.emit,
       setProviderSession: provider.setSession,
       drain,
@@ -1938,11 +1947,7 @@ describe("ProviderRuntimeIngestion", () => {
     expect(resumedMessage?.text).toBe(" second half");
     expect(resumedMessage?.streaming).toBe(false);
 
-    const events = await Effect.runPromise(
-      Stream.runCollect(harness.engine.readEvents(0)).pipe(
-        Effect.map((chunk) => Array.from(chunk)),
-      ),
-    );
+    const events = await harness.readEvents(0);
     const assistantEvents = events.filter(
       (event): event is Extract<(typeof events)[number], { type: "thread.message-sent" }> =>
         event.type === "thread.message-sent" &&
@@ -2070,6 +2075,208 @@ describe("ProviderRuntimeIngestion", () => {
           message.id === "assistant:item-streaming-request-segment:segment:1",
       )?.text,
     ).toBe(" after approval");
+  });
+
+  it("persists each assistant text block in a multi-block turn", async () => {
+    const harness = await createHarness();
+    const startedAt = "2026-03-28T08:00:00.000Z";
+    const completedAt = "2026-03-28T08:00:03.000Z";
+    const turnId = asTurnId("turn-multi-assistant-blocks");
+    const threadId = asThreadId("thread-1");
+
+    harness.emit({
+      type: "turn.started",
+      eventId: asEventId("evt-turn-started-multi-assistant-blocks"),
+      provider: ProviderDriverKind.make("claudeAgent"),
+      createdAt: startedAt,
+      threadId,
+      turnId,
+    });
+    await waitForThread(
+      harness.readModel,
+      (thread) =>
+        thread.session?.status === "running" &&
+        thread.session?.activeTurnId === "turn-multi-assistant-blocks",
+    );
+
+    const emitAssistantDelta = (eventId: string, itemId: string, delta: string) => {
+      harness.emit({
+        type: "content.delta",
+        eventId: asEventId(eventId),
+        provider: ProviderDriverKind.make("claudeAgent"),
+        createdAt: startedAt,
+        threadId,
+        turnId,
+        itemId: asItemId(itemId),
+        payload: {
+          streamKind: "assistant_text",
+          delta,
+        },
+      });
+    };
+    const emitToolLifecycle = (
+      lifecycle: "item.started" | "item.completed",
+      eventId: string,
+      itemId: string,
+      status: "inProgress" | "completed",
+    ) => {
+      harness.emit({
+        type: lifecycle,
+        eventId: asEventId(eventId),
+        provider: ProviderDriverKind.make("claudeAgent"),
+        createdAt: startedAt,
+        threadId,
+        turnId,
+        itemId: asItemId(itemId),
+        payload: {
+          itemType: "command_execution",
+          status,
+          title: "Ran command",
+          detail: "pwd",
+          data: { toolName: "Bash" },
+        },
+      });
+    };
+
+    emitAssistantDelta("evt-text-block-1-delta", "item-text-block-1", "before tool");
+    emitToolLifecycle("item.started", "evt-tool-1-started", "item-tool-1", "inProgress");
+    emitToolLifecycle("item.completed", "evt-tool-1-completed", "item-tool-1", "completed");
+    emitAssistantDelta("evt-text-block-2-delta", "item-text-block-2", "between tools");
+    emitToolLifecycle("item.started", "evt-tool-2-started", "item-tool-2", "inProgress");
+    emitToolLifecycle("item.completed", "evt-tool-2-completed", "item-tool-2", "completed");
+    emitAssistantDelta("evt-text-block-3-delta", "item-text-block-3", "after tools");
+    harness.emit({
+      type: "turn.completed",
+      eventId: asEventId("evt-turn-completed-multi-assistant-blocks"),
+      provider: ProviderDriverKind.make("claudeAgent"),
+      createdAt: completedAt,
+      threadId,
+      turnId,
+      payload: {
+        state: "completed",
+      },
+    });
+
+    const thread = await waitForThread(
+      harness.readModel,
+      (entry) =>
+        entry.session?.status === "ready" &&
+        entry.messages.filter(
+          (message) =>
+            message.role === "assistant" && message.turnId === turnId && !message.streaming,
+        ).length === 3,
+    );
+    const assistantMessages = thread.messages
+      .filter((message) => message.role === "assistant" && message.turnId === turnId)
+      .map((message) => ({
+        id: message.id,
+        text: message.text,
+        streaming: message.streaming,
+      }));
+    expect(assistantMessages).toEqual([
+      { id: "assistant:item-text-block-1", text: "before tool", streaming: false },
+      { id: "assistant:item-text-block-2", text: "between tools", streaming: false },
+      { id: "assistant:item-text-block-3", text: "after tools", streaming: false },
+    ]);
+  });
+
+  it("flushes buffered assistant text before a pending turn supersedes the active turn", async () => {
+    const harness = await createHarness();
+    const threadId = asThreadId("thread-1");
+    const oldTurnId = asTurnId("turn-interrupted-before-completion");
+    const newTurnId = asTurnId("turn-interrupting-user-message");
+    const createdAt = "2026-03-28T09:00:00.000Z";
+
+    harness.setProviderSession({
+      provider: ProviderDriverKind.make("claudeAgent"),
+      status: "running",
+      runtimeMode: "approval-required",
+      threadId,
+      createdAt,
+      updatedAt: createdAt,
+      activeTurnId: oldTurnId,
+    });
+    harness.emit({
+      type: "turn.started",
+      eventId: asEventId("evt-turn-started-interrupted-before-completion"),
+      provider: ProviderDriverKind.make("claudeAgent"),
+      createdAt,
+      threadId,
+      turnId: oldTurnId,
+    });
+    await waitForThread(
+      harness.readModel,
+      (thread) =>
+        thread.session?.status === "running" &&
+        thread.session?.activeTurnId === "turn-interrupted-before-completion",
+    );
+
+    harness.emit({
+      type: "content.delta",
+      eventId: asEventId("evt-interrupted-text-delta"),
+      provider: ProviderDriverKind.make("claudeAgent"),
+      createdAt,
+      threadId,
+      turnId: oldTurnId,
+      itemId: asItemId("item-interrupted-text"),
+      payload: {
+        streamKind: "assistant_text",
+        delta: "text before interruption",
+      },
+    });
+
+    await Effect.runPromise(
+      harness.engine.dispatch({
+        type: "thread.turn.start",
+        commandId: CommandId.make("cmd-turn-start-interrupting-user-message"),
+        threadId,
+        message: {
+          messageId: asMessageId("msg-interrupting-user-message"),
+          role: "user",
+          text: "interrupt with a new turn",
+          attachments: [],
+        },
+        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+        runtimeMode: "approval-required",
+        createdAt,
+      }),
+    );
+    harness.setProviderSession({
+      provider: ProviderDriverKind.make("claudeAgent"),
+      status: "running",
+      runtimeMode: "approval-required",
+      threadId,
+      createdAt,
+      updatedAt: createdAt,
+      activeTurnId: newTurnId,
+    });
+    harness.emit({
+      type: "turn.started",
+      eventId: asEventId("evt-turn-started-interrupting-user-message"),
+      provider: ProviderDriverKind.make("claudeAgent"),
+      createdAt,
+      threadId,
+      turnId: newTurnId,
+    });
+
+    const thread = await waitForThread(
+      harness.readModel,
+      (entry) =>
+        entry.session?.status === "running" &&
+        entry.session?.activeTurnId === "turn-interrupting-user-message" &&
+        entry.messages.some(
+          (message) =>
+            message.id === "assistant:item-interrupted-text" &&
+            message.turnId === oldTurnId &&
+            message.text === "text before interruption" &&
+            !message.streaming,
+        ),
+    );
+    const interruptedMessage = thread.messages.find(
+      (message) => message.id === "assistant:item-interrupted-text",
+    );
+    expect(interruptedMessage?.turnId).toBe(oldTurnId);
+    expect(interruptedMessage?.streaming).toBe(false);
   });
 
   it("streams assistant deltas when thread.turn.start requests streaming mode", async () => {
@@ -2294,11 +2501,7 @@ describe("ProviderRuntimeIngestion", () => {
         ),
     );
 
-    const events = await Effect.runPromise(
-      Stream.runCollect(harness.engine.readEvents(0)).pipe(
-        Effect.map((chunk) => Array.from(chunk)),
-      ),
-    );
+    const events = await harness.readEvents(0);
     const completionEvents = events.filter((event) => {
       if (event.type !== "thread.message-sent") {
         return false;
