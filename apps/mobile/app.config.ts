@@ -68,6 +68,14 @@ const mobileAppVersion =
     repoEnv.EXPO_PUBLIC_APP_VERSION,
     readReleaseVersion(),
   ) ?? "0.1.0";
+const widgets = [
+  {
+    name: "AgentActivity",
+    displayName: "Agent Activity",
+    description: "Shows the current state of active T3 Code agents.",
+    supportedFamilies: ["systemSmall", "systemMedium", "accessoryRectangular"],
+  },
+] as const;
 
 function readReleaseVersion(): string | undefined {
   const releaseVersionPath = NodePath.resolve(process.cwd(), "release-version.json");
@@ -177,17 +185,12 @@ const config: ExpoConfig = {
         bundleIdentifier: `${variant.iosBundleIdentifier}.widgets`,
         groupIdentifier: `group.${variant.iosBundleIdentifier}`,
         enablePushNotifications: true,
-        widgets: [
-          {
-            name: "AgentActivity",
-            displayName: "Agent Activity",
-            description: "Shows the current state of active T3 Code agents.",
-            supportedFamilies: ["systemSmall", "systemMedium", "accessoryRectangular"],
-          },
-        ],
+        widgets,
       },
     ],
     "./plugins/withAndroidCleartextTraffic.cjs",
+    "./plugins/withAndroidGradleMemory.cjs",
+    ["./plugins/withAndroidWidgetStringResources.cjs", { widgets }],
   ],
   extra: {
     appVariant: APP_VARIANT,
