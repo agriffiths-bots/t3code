@@ -54,10 +54,11 @@ const client = (options?: {
 
 it("verifies a sha with desktop assets and launch smoke, ignoring the pointer release", async () => {
   const result = await verifyClientArtifacts({
-    sha,
+    sha: sha.slice(0, 12),
     client: client({
       releases: [
         { ...release([asset("client-verified-latest.json")]), tag_name: "client-verified-latest" },
+        release([asset("t3-code-preview-android.apk")]),
         release(),
       ],
     }),

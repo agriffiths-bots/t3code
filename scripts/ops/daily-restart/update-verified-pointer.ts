@@ -4,14 +4,12 @@
 
 import * as NodeChildProcess from "node:child_process";
 import * as NodeFS from "node:fs";
-import * as NodeOS from "node:os";
-import * as NodePath from "node:path";
 import * as NodeUtil from "node:util";
 
 const execFile = NodeUtil.promisify(NodeChildProcess.execFile);
 
-export const POINTER_TAG = "client-verified-latest";
-export const POINTER_ASSET = "client-verified-latest.json";
+export const POINTER_BRANCH = "client-verified-latest";
+export const POINTER_PATH = "client-verified-latest.json";
 export const REQUIRED_SMOKE_CHECKS = ["Windows Launch Smoke"] as const;
 
 const SHA_PATTERN = /^[0-9a-f]{7,40}$/i;
@@ -83,6 +81,18 @@ function findAsset(release: GitHubRelease, pattern: RegExp): GitHubAsset | undef
   return release.assets.find((asset) => pattern.test(asset.name));
 }
 
+function findWindowsAssets(release: GitHubRelease) {
+  return {
+    installer: findAsset(release, /\.exe$/i),
+    blockmap: findAsset(release, /\.blockmap$/i),
+    manifest: findAsset(release, /\.ya?ml$/i),
+  };
+}
+
+function releaseMatchesSha(release: GitHubRelease, sha: string) {
+  return release.target_commitish.toLowerCase().startsWith(sha.toLowerCase());
+}
+
 function findCheck(
   checkRuns: ReadonlyArray<GitHubCheckRun>,
   expectedName: (typeof REQUIRED_SMOKE_CHECKS)[number],
@@ -122,16 +132,31 @@ export async function verifyClientArtifacts(options: {
     return { verified: false, reason: checkFailure };
   }
 
-  const release = releases
-    .filter((candidate) => candidate.tag_name !== POINTER_TAG)
-    .find((candidate) => candidate.target_commitish.toLowerCase() === sha.toLowerCase());
+  const matchingReleases = releases.filter(
+    (candidate) => candidate.tag_name !== POINTER_BRANCH && releaseMatchesSha(candidate, sha),
+  );
+  const release = matchingReleases.find((candidate) => {
+    const assets = findWindowsAssets(candidate);
+    return assets.installer && assets.blockmap && assets.manifest;
+  });
   if (!release) {
-    return { verified: false, reason: `missing release targeting ${sha}` };
+    if (matchingReleases.length === 0) {
+      return { verified: false, reason: `missing release targeting ${sha}` };
+    }
+    const assets = findWindowsAssets(matchingReleases[0]!);
+    const missingAssets = [
+      ["windows installer", assets.installer],
+      ["windows blockmap", assets.blockmap],
+      ["windows update manifest", assets.manifest],
+    ].flatMap(([label, asset]) => (asset ? [] : [label]));
+    return { verified: false, reason: `missing desktop artifacts: ${missingAssets.join(", ")}` };
   }
 
-  const windowsInstaller = findAsset(release, /\.exe$/i);
-  const windowsBlockmap = findAsset(release, /\.blockmap$/i);
-  const windowsManifest = findAsset(release, /\.ya?ml$/i);
+  const {
+    installer: windowsInstaller,
+    blockmap: windowsBlockmap,
+    manifest: windowsManifest,
+  } = findWindowsAssets(release);
   const missingAssets = [
     ["windows installer", windowsInstaller],
     ["windows blockmap", windowsBlockmap],
@@ -150,7 +175,7 @@ export async function verifyClientArtifacts(options: {
     verified: true,
     pointer: {
       version: 1,
-      sha,
+      sha: release.target_commitish,
       verified_at: (options.now ?? new Date()).toISOString(),
       desktop: {
         ready: true,
@@ -225,6 +250,14 @@ async function ghJson<T>(repo: string, path: string): Promise<T> {
   return JSON.parse(await run("gh", ["api", `/repos/${repo}${path}`])) as T;
 }
 
+async function ghJsonOptional<T>(repo: string, path: string): Promise<T | undefined> {
+  try {
+    return await ghJson<T>(repo, path);
+  } catch {
+    return undefined;
+  }
+}
+
 async function resolveRepo() {
   return run("gh", ["repo", "view", "--json", "nameWithOwner", "--jq", ".nameWithOwner"]);
 }
@@ -271,92 +304,42 @@ function makeGhPublishClient(repo: string): PublishClient {
       }
     },
     publishPointer: async (pointer) => {
-      const tempDir = NodeFS.mkdtempSync(
-        NodePath.join(NodeOS.tmpdir(), "client-verified-pointer-"),
+      const branch = await ghJsonOptional<{ readonly ref: string }>(
+        repo,
+        `/git/ref/heads/${POINTER_BRANCH}`,
       );
-      const newAssetDir = NodePath.join(tempDir, "new");
-      const previousAssetDir = NodePath.join(tempDir, "previous");
-      NodeFS.mkdirSync(newAssetDir);
-      NodeFS.mkdirSync(previousAssetDir);
-      const assetPath = NodePath.join(newAssetDir, POINTER_ASSET);
-      NodeFS.writeFileSync(assetPath, `${JSON.stringify(pointer, null, 2)}\n`);
-      try {
-        const releaseExists = await execFile(
-          "gh",
-          ["release", "view", POINTER_TAG, "--repo", repo],
-          {
-            maxBuffer: 1024 * 1024,
-          },
-        ).then(
-          () => true,
-          () => false,
-        );
-        if (!releaseExists) {
-          await run("gh", [
-            "release",
-            "create",
-            POINTER_TAG,
-            assetPath,
-            "--repo",
-            repo,
-            "--target",
-            pointer.sha,
-            "--prerelease",
-            "--latest=false",
-            "--title",
-            "Latest verified client pointer",
-            "--notes",
-            "Machine-readable pointer for the latest launch-verified client artifacts.",
-          ]);
-          return;
-        }
-        const hadPreviousAsset = await execFile(
-          "gh",
-          [
-            "release",
-            "download",
-            POINTER_TAG,
-            "--repo",
-            repo,
-            "--pattern",
-            POINTER_ASSET,
-            "--dir",
-            previousAssetDir,
-            "--clobber",
-          ],
-          { maxBuffer: 1024 * 1024 },
-        ).then(
-          () => true,
-          () => false,
-        );
-        const previousAssetPath = NodePath.join(previousAssetDir, POINTER_ASSET);
-        try {
-          await run("gh", [
-            "release",
-            "upload",
-            POINTER_TAG,
-            assetPath,
-            "--repo",
-            repo,
-            "--clobber",
-          ]);
-        } catch (error) {
-          if (hadPreviousAsset && NodeFS.existsSync(previousAssetPath)) {
-            await run("gh", [
-              "release",
-              "upload",
-              POINTER_TAG,
-              previousAssetPath,
-              "--repo",
-              repo,
-              "--clobber",
-            ]);
-          }
-          throw error;
-        }
-      } finally {
-        NodeFS.rmSync(tempDir, { recursive: true, force: true });
+      if (!branch) {
+        await run("gh", [
+          "api",
+          `/repos/${repo}/git/refs`,
+          "-X",
+          "POST",
+          "-f",
+          `ref=refs/heads/${POINTER_BRANCH}`,
+          "-f",
+          `sha=${pointer.sha}`,
+        ]);
       }
+      const existing = await ghJsonOptional<{ readonly sha: string }>(
+        repo,
+        `/contents/${POINTER_PATH}?ref=${POINTER_BRANCH}`,
+      );
+      const args = [
+        "api",
+        `/repos/${repo}/contents/${POINTER_PATH}`,
+        "-X",
+        "PUT",
+        "-f",
+        `message=Update verified client pointer to ${pointer.sha}`,
+        "-f",
+        `content=${Buffer.from(`${JSON.stringify(pointer, null, 2)}\n`).toString("base64")}`,
+        "-f",
+        `branch=${POINTER_BRANCH}`,
+      ];
+      if (existing) {
+        args.push("-f", `sha=${existing.sha}`);
+      }
+      await run("gh", args);
     },
   };
 }
@@ -385,7 +368,7 @@ function parseArgs(argv: ReadonlyArray<string>) {
 export async function main(argv = process.argv.slice(2)) {
   const args = parseArgs(argv);
   const repo = await resolveRepo();
-  const sha = args.sha ?? (await resolveOriginMainSha());
+  const sha = args.sha ? await run("git", ["rev-parse", args.sha]) : await resolveOriginMainSha();
   const result = await updateVerifiedPointer({
     sha,
     verificationClient: makeGhVerificationClient(repo),
