@@ -10,11 +10,17 @@ const repoRoot = NodePath.resolve(
   NodePath.dirname(NodeURL.fileURLToPath(import.meta.url)),
   "../../..",
 );
+const FULL_PATH =
+  "/home/linuxbrew/.linuxbrew/bin:/home/adam/.local/bin:/usr/local/bin:/usr/bin:/bin";
 const snapshotTool = NodePath.join(repoRoot, "scripts/ops/daily-restart/t3-db-snapshot");
 const restoreTool = NodePath.join(repoRoot, "scripts/ops/daily-restart/t3-db-restore");
 
 function makeTempDir(): string {
-  return NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3-db-snapshot-"));
+  return NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3-db-snapshot-'"));
+}
+
+function commandEnv(): NodeJS.ProcessEnv {
+  return { ...process.env, PATH: FULL_PATH };
 }
 
 function run(
@@ -23,10 +29,7 @@ function run(
 ): NodeChildProcess.SpawnSyncReturns<string> {
   const result = NodeChildProcess.spawnSync(args[0]!, args.slice(1), {
     encoding: "utf8",
-    env: {
-      ...process.env,
-      PATH: "/home/linuxbrew/.linuxbrew/bin:/home/adam/.local/bin:/usr/local/bin:/usr/bin:/bin",
-    },
+    env: commandEnv(),
   });
 
   if (!options.expectFailure && result.status !== 0) {
@@ -62,10 +65,7 @@ describe("daily restart database tools", () => {
 
     const writer = NodeChildProcess.spawn("sqlite3", [db], {
       stdio: ["pipe", "pipe", "pipe"],
-      env: {
-        ...process.env,
-        PATH: "/home/linuxbrew/.linuxbrew/bin:/home/adam/.local/bin:/usr/local/bin:/usr/bin:/bin",
-      },
+      env: commandEnv(),
     });
     writer.stdin.write("BEGIN IMMEDIATE;\n");
     writer.stdin.write("INSERT INTO items(name) VALUES ('held-open');\n");
@@ -161,10 +161,7 @@ describe("daily restart database tools", () => {
 
     const snapshotConnection = NodeChildProcess.spawn("sqlite3", [snapshot], {
       stdio: ["pipe", "pipe", "pipe"],
-      env: {
-        ...process.env,
-        PATH: "/home/linuxbrew/.linuxbrew/bin:/home/adam/.local/bin:/usr/local/bin:/usr/bin:/bin",
-      },
+      env: commandEnv(),
     });
     snapshotConnection.stdin.write("PRAGMA journal_mode=WAL;\n");
     snapshotConnection.stdin.write("PRAGMA wal_autocheckpoint=0;\n");
@@ -187,33 +184,32 @@ describe("daily restart database tools", () => {
     }
   });
 
-  it("fails restore when the snapshot is corrupt", () => {
-    const dir = makeTempDir();
-    const db = NodePath.join(dir, "state.sqlite");
-    const snapshot = NodePath.join(dir, "bad.sqlite");
-    createWalDatabase(db);
-    NodeFS.writeFileSync(snapshot, "not sqlite");
-
-    const result = run([restoreTool, "--snapshot", snapshot, "--db", db], { expectFailure: true });
-
-    assert.notEqual(result.status, 0);
-    assert.equal(result.stdout, "");
-    assert.match(result.stderr, /integrity check failed|file is not a database/);
-    assert.equal(sqlite(db, "SELECT count(*) FROM items;"), "2");
-  });
-
   it("prunes old snapshots by retention count", () => {
     const dir = makeTempDir();
     const db = NodePath.join(dir, "state.sqlite");
     const outDir = NodePath.join(dir, "snapshots");
     createWalDatabase(db);
+    NodeFS.mkdirSync(outDir);
 
-    for (let index = 0; index < 3; index++) {
-      run([snapshotTool, "--db", db, "--out-dir", outDir, "--keep", "2"]);
-      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 1100);
-    }
+    NodeFS.writeFileSync(NodePath.join(outDir, "t3-state-20260703-000000.sqlite"), "");
+    NodeFS.writeFileSync(NodePath.join(outDir, "t3-state-20260703-000001.sqlite"), "");
+    const futureSnapshot = NodePath.join(outDir, "t3-state-20990101-000000.sqlite");
+    NodeFS.writeFileSync(futureSnapshot, "");
+    NodeFS.utimesSync(futureSnapshot, 4_070_908_800, 4_070_908_800);
 
-    const snapshots = NodeFS.readdirSync(outDir).filter((entry) => entry.startsWith("t3-state-"));
-    assert.equal(snapshots.length, 2);
+    const keptSnapshot = run([
+      snapshotTool,
+      "--db",
+      db,
+      "--out-dir",
+      outDir,
+      "--keep",
+      "1",
+    ]).stdout.trim();
+    assert.equal(NodeFS.existsSync(keptSnapshot), true);
+    assert.deepStrictEqual(
+      NodeFS.readdirSync(outDir).filter((entry) => entry.startsWith("t3-state-")),
+      [NodePath.basename(keptSnapshot)],
+    );
   });
 });

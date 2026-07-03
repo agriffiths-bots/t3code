@@ -23,8 +23,10 @@ absolute_path() {
   realpath -m "$1"
 }
 
-sqlite_quote() {
-  printf "'%s'" "${1//\'/\'\'}"
+sqlite_cli_quote() {
+  local value="${1//\\/\\\\}"
+  value="${value//\"/\\\"}"
+  printf '"%s"' "$value"
 }
 
 snapshot_path=""
@@ -55,6 +57,7 @@ done
 
 [[ -n "$snapshot_path" ]] || die "--snapshot is required"
 command -v sqlite3 >/dev/null 2>&1 || die "sqlite3 not found on PATH"
+command -v flock >/dev/null 2>&1 || die "flock not found on PATH"
 [[ -f "$snapshot_path" ]] || die "snapshot does not exist: $snapshot_path"
 [[ -f "$db_path" ]] || die "database does not exist: $db_path"
 
@@ -66,6 +69,10 @@ mkdir -p "$db_dir" || die "failed to create database directory: $db_dir"
 if [[ -e "$db_path-wal" || -e "$db_path-shm" ]]; then
   echo "t3-db-restore: warning: WAL/SHM files exist; caller should stop the T3 service before restore" >&2
 fi
+
+lock_file="$db_path.restore.lock"
+exec 9>"$lock_file" || die "failed to open restore lock: $lock_file"
+flock 9 || die "failed to acquire restore lock: $lock_file"
 
 integrity="$(sqlite3 "$snapshot_path" 'PRAGMA integrity_check;' 2>&1)" || die "snapshot integrity check failed: $integrity"
 [[ "$integrity" == "ok" ]] || die "snapshot integrity check returned: $integrity"
@@ -104,7 +111,7 @@ rollback_restore() {
 
 if ! sqlite3 "$snapshot_path" <<SQL
 .timeout 5000
-.backup $(sqlite_quote "$tmp_db")
+.backup $(sqlite_cli_quote "$tmp_db")
 SQL
 then
   die "failed to materialize snapshot for restore"

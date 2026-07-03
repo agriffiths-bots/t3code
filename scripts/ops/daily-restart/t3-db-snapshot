@@ -20,8 +20,10 @@ die() {
   exit 1
 }
 
-sqlite_quote() {
-  printf "'%s'" "${1//\'/\'\'}"
+sqlite_cli_quote() {
+  local value="${1//\\/\\\\}"
+  value="${value//\"/\\\"}"
+  printf '"%s"' "$value"
 }
 
 absolute_path() {
@@ -91,7 +93,7 @@ trap cleanup EXIT
 
 if ! sqlite3 "$db_path" <<SQL
 .timeout 5000
-.backup $(sqlite_quote "$tmp_snapshot")
+.backup $(sqlite_cli_quote "$tmp_snapshot")
 SQL
 then
   die "sqlite backup failed"
@@ -105,12 +107,13 @@ mv "$tmp_snapshot" "$snapshot" || die "failed to install snapshot"
 trap - EXIT
 
 if [[ "$keep" -gt 0 ]]; then
+  retain_other_count=$((keep - 1))
   mapfile -d '' snapshots < <(
-    find "$out_dir" -maxdepth 1 -type f -name 't3-state-*.sqlite' -printf '%T@ %p\0' \
+    find "$out_dir" -maxdepth 1 -type f -name 't3-state-*.sqlite' ! -path "$snapshot" -printf '%T@ %p\0' \
       | sort -z -nr \
       | cut -z -d' ' -f2-
   )
-  for ((i = keep; i < ${#snapshots[@]}; i++)); do
+  for ((i = retain_other_count; i < ${#snapshots[@]}; i++)); do
     rm -f -- "${snapshots[$i]}" || die "failed to prune old snapshot: ${snapshots[$i]}"
   done
 fi
