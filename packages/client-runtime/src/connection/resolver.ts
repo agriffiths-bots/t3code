@@ -56,6 +56,13 @@ function cloudflareAccessFromCredential(credential: BearerConnectionCredential) 
       clientSecret,
     };
   }
+  const cookieValue = credential.cloudflareAccessCookie?.trim() ?? "";
+  if (cookieValue.length > 0) {
+    return {
+      _tag: "cookie" as const,
+      cookieValue,
+    };
+  }
   const jwt = credential.cloudflareAccessToken?.trim() ?? "";
   return jwt.length > 0 ? { jwt } : undefined;
 }
@@ -121,6 +128,7 @@ const makePrimaryBroker = Effect.fn("clientRuntime.connection.broker.makePrimary
 const makeBearerBroker = Effect.fn("clientRuntime.connection.broker.makeBearer")(function* () {
   const credentials = yield* ConnectionCredentialStore.ConnectionCredentialStore;
   const remote = yield* RemoteEnvironmentAuthorization.RemoteEnvironmentAuthorization;
+  const cookieInstaller = yield* ClientCapabilities.CloudflareAccessCookieInstaller;
 
   return Effect.fn("clientRuntime.connection.broker.bearer")(function* (
     entry: ConnectionCatalogEntry & { readonly target: BearerConnectionTarget },
@@ -155,6 +163,13 @@ const makeBearerBroker = Effect.fn("clientRuntime.connection.broker.makeBearer")
     }
     const cloudflareAccess = cloudflareAccessFromCredential(credential);
     yield* validateCloudflareAccessRuntime(cloudflareAccess);
+    const cloudflareAccessCookie = credential.cloudflareAccessCookie?.trim() ?? "";
+    if (cloudflareAccessCookie.length > 0) {
+      yield* cookieInstaller.install({
+        httpBaseUrl: profile.httpBaseUrl,
+        cookieValue: cloudflareAccessCookie,
+      });
+    }
     const authorized = yield* remote.authorizeBearer({
       expectedEnvironmentId: target.environmentId,
       httpBaseUrl: profile.httpBaseUrl,

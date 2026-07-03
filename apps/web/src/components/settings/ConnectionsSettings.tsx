@@ -2090,6 +2090,11 @@ export function ConnectionsSettings() {
   const [savedBackendMode, setSavedBackendMode] = useState<"remote" | "ssh">("remote");
   const [savedBackendHost, setSavedBackendHost] = useState("");
   const [savedBackendPairingCode, setSavedBackendPairingCode] = useState("");
+  const [savedBackendCloudflareAccess, setSavedBackendCloudflareAccess] = useState<{
+    readonly host: string;
+    readonly cookie: string;
+  } | null>(null);
+  const [isAuthenticatingCloudflareAccess, setIsAuthenticatingCloudflareAccess] = useState(false);
   const [savedBackendSshHost, setSavedBackendSshHost] = useState("");
   const [savedBackendSshUsername, setSavedBackendSshUsername] = useState("");
   const [savedBackendSshPort, setSavedBackendSshPort] = useState("");
@@ -2405,6 +2410,53 @@ export function ConnectionsSettings() {
     }
   }, []);
 
+  const handleAuthenticateCloudflareAccess = useCallback(async () => {
+    const authenticateCloudflareAccess = desktopBridge?.authenticateCloudflareAccess;
+    if (!authenticateCloudflareAccess) {
+      const message = "Cloudflare Access sign-in is only available in the desktop app.";
+      setSavedBackendError(message);
+      toastManager.add(
+        stackedThreadToast({
+          type: "error",
+          title: "Could not sign in",
+          description: message,
+        }),
+      );
+      return;
+    }
+
+    const parsedPairingUrl = parsePairingUrlFields(savedBackendHost);
+    const host = (parsedPairingUrl?.host ?? savedBackendHost).trim();
+    if (host.length === 0) {
+      setSavedBackendError("Enter a remote host before signing in with Cloudflare Access.");
+      return;
+    }
+
+    setIsAuthenticatingCloudflareAccess(true);
+    setSavedBackendError(null);
+    try {
+      const result = await authenticateCloudflareAccess({ host });
+      setSavedBackendCloudflareAccess({ host, cookie: result.cookieValue });
+      toastManager.add({
+        type: "success",
+        title: "Cloudflare Access signed in",
+        description: "The Access session will be used when adding this environment.",
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Cloudflare Access sign-in failed.";
+      setSavedBackendError(message);
+      toastManager.add(
+        stackedThreadToast({
+          type: "error",
+          title: "Could not sign in",
+          description: message,
+        }),
+      );
+    } finally {
+      setIsAuthenticatingCloudflareAccess(false);
+    }
+  }, [desktopBridge, savedBackendHost]);
+
   const handleAddSavedBackend = useCallback(async () => {
     if (savedBackendMode === "ssh") {
       setIsAddingSavedBackend(true);
@@ -2433,6 +2485,7 @@ export function ConnectionsSettings() {
 
       setSavedBackendHost("");
       setSavedBackendPairingCode("");
+      setSavedBackendCloudflareAccess(null);
       setSavedBackendSshHost("");
       setSavedBackendSshUsername("");
       setSavedBackendSshPort("");
@@ -2468,7 +2521,14 @@ export function ConnectionsSettings() {
       return;
     }
 
-    const result = await connectPairing(remotePairingInput);
+    const cloudflareAccessCookie =
+      savedBackendCloudflareAccess?.host === remotePairingInput.host
+        ? savedBackendCloudflareAccess.cookie
+        : "";
+    const result = await connectPairing({
+      ...remotePairingInput,
+      ...(cloudflareAccessCookie ? { cloudflareAccessCookie } : {}),
+    });
     if (result._tag === "Failure") {
       if (!isAtomCommandInterrupted(result)) {
         const error = squashAtomCommandFailure(result);
@@ -2488,6 +2548,7 @@ export function ConnectionsSettings() {
 
     setSavedBackendHost("");
     setSavedBackendPairingCode("");
+    setSavedBackendCloudflareAccess(null);
     setSavedBackendSshHost("");
     setSavedBackendSshUsername("");
     setSavedBackendSshPort("");
@@ -2501,6 +2562,7 @@ export function ConnectionsSettings() {
   }, [
     connectPairing,
     connectSshEnvironment,
+    savedBackendCloudflareAccess,
     savedBackendHost,
     savedBackendMode,
     savedBackendPairingCode,
@@ -2636,6 +2698,7 @@ export function ConnectionsSettings() {
     [setDefaultAdvertisedEndpointKey],
   );
   const handleSavedBackendHostChange = useCallback((value: string) => {
+    setSavedBackendCloudflareAccess(null);
     const parsedPairingUrl = parsePairingUrlFields(value);
     if (parsedPairingUrl) {
       setSavedBackendHost(parsedPairingUrl.host);
@@ -2696,7 +2759,7 @@ export function ConnectionsSettings() {
             value={savedBackendHost}
             onChange={(event) => handleSavedBackendHostChange(event.target.value)}
             placeholder="backend.example.com"
-            disabled={isAddingSavedBackend}
+            disabled={isAddingSavedBackend || isAuthenticatingCloudflareAccess}
             spellCheck={false}
           />
         </label>
@@ -2716,6 +2779,32 @@ export function ConnectionsSettings() {
           Paste a full pairing URL here to fill both fields automatically.
         </span>
       </div>
+      {desktopBridge?.authenticateCloudflareAccess ? (
+        <div className="flex flex-wrap items-center gap-2">
+          <Button
+            variant="outline"
+            size="sm"
+            disabled={isAddingSavedBackend || isAuthenticatingCloudflareAccess}
+            onClick={() => void handleAuthenticateCloudflareAccess()}
+          >
+            {isAuthenticatingCloudflareAccess ? (
+              <>
+                <Spinner className="size-3.5" />
+                Signing in…
+              </>
+            ) : savedBackendCloudflareAccess ? (
+              "Cloudflare Access signed in"
+            ) : (
+              "Sign in with Cloudflare Access"
+            )}
+          </Button>
+          {savedBackendCloudflareAccess ? (
+            <span className="text-[11px] text-muted-foreground">
+              Access session ready for this host.
+            </span>
+          ) : null}
+        </div>
+      ) : null}
     </div>
   );
   const renderRemoteModeBody = () => (

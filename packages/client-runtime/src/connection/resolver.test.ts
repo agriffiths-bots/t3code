@@ -108,6 +108,7 @@ const makeDependencies = Effect.fn("TestConnectionResolver.makeDependencies")((o
   readonly authorizeDpop?: RemoteEnvironmentAuthorization.RemoteEnvironmentAuthorization["Service"]["authorizeDpop"];
   readonly primaryBearerToken?: string;
   readonly prepareSsh?: ClientCapabilities.SshEnvironmentGateway["Service"]["prepare"];
+  readonly installCloudflareAccessCookie?: ClientCapabilities.CloudflareAccessCookieInstaller["Service"]["install"];
 }) => {
   const profiles = new Map(
     (options?.profiles ?? []).map((profile) => [profile.connectionId, profile]),
@@ -183,6 +184,12 @@ const makeDependencies = Effect.fn("TestConnectionResolver.makeDependencies")((o
       ClientCapabilities.PrimaryEnvironmentAuth,
       ClientCapabilities.PrimaryEnvironmentAuth.of({
         bearerToken: Effect.succeed(Option.fromNullishOr(options?.primaryBearerToken)),
+      }),
+    ),
+    Layer.succeed(
+      ClientCapabilities.CloudflareAccessCookieInstaller,
+      ClientCapabilities.CloudflareAccessCookieInstaller.of({
+        install: options?.installCloudflareAccessCookie ?? (() => Effect.void),
       }),
     ),
     Layer.succeed(
@@ -360,6 +367,69 @@ describe("ConnectionResolver", () => {
           _tag: "service-token",
           clientId: "client-id",
           clientSecret: "client-secret",
+        },
+      ]);
+    }),
+  );
+
+  it.effect("installs saved Cloudflare Access cookies before bearer authorization", () =>
+    Effect.gen(function* () {
+      const installedCookies = yield* Ref.make<
+        ReadonlyArray<{ readonly httpBaseUrl: string; readonly cookieValue: string }>
+      >([]);
+      const accessInputs = yield* Ref.make<ReadonlyArray<unknown>>([]);
+      const target = new BearerConnectionTarget({
+        environmentId: ENVIRONMENT_ID,
+        label: "Saved",
+        connectionId: "saved-1",
+      });
+      const profile = new BearerConnectionProfile({
+        connectionId: "saved-1",
+        environmentId: ENVIRONMENT_ID,
+        label: "Saved",
+        httpBaseUrl: ENDPOINT.httpBaseUrl,
+        wsBaseUrl: ENDPOINT.wsBaseUrl,
+      });
+      const brokerLayer = yield* makeDependencies({
+        credentials: [
+          [
+            "saved-1",
+            new BearerConnectionCredential({
+              token: "secret-bearer",
+              cloudflareAccessCookie: "cf-access-cookie",
+            }),
+          ],
+        ],
+        installCloudflareAccessCookie: (input) =>
+          Ref.update(installedCookies, (values) => [...values, input]),
+        authorizeBearer: (input) =>
+          Ref.update(accessInputs, (values) => [...values, input.cloudflareAccess]).pipe(
+            Effect.as({
+              environmentId: input.expectedEnvironmentId,
+              label: "Saved",
+              httpBaseUrl: input.httpBaseUrl,
+              socketUrl: "wss://environment.example.test/ws?wsTicket=ticket",
+              httpAuthorization: {
+                _tag: "Bearer" as const,
+                token: input.bearerToken,
+              },
+            }),
+          ),
+      });
+      const broker = yield* ConnectionResolver.ConnectionResolver.pipe(Effect.provide(brokerLayer));
+
+      yield* broker.prepare(catalogEntry(target, Option.some(profile)));
+
+      expect(yield* Ref.get(installedCookies)).toEqual([
+        {
+          httpBaseUrl: ENDPOINT.httpBaseUrl,
+          cookieValue: "cf-access-cookie",
+        },
+      ]);
+      expect(yield* Ref.get(accessInputs)).toEqual([
+        {
+          _tag: "cookie",
+          cookieValue: "cf-access-cookie",
         },
       ]);
     }),
