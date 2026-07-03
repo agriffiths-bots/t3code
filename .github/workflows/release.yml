@@ -11,7 +11,6 @@ on:
 
 permissions:
   contents: write
-  actions: write
 
 jobs:
   metadata:
@@ -107,8 +106,8 @@ jobs:
 
           # This fork ships local-only artifacts, so cloud sign-in config is
           # optional. Embed it only when the full set is present and the relay
-          # URL is HTTPS; otherwise warn and emit empty values so desktop and
-          # mobile builds still succeed with cloud features disabled.
+          # URL is HTTPS; otherwise warn and emit empty values so desktop
+          # builds still succeed with cloud features disabled.
           clerk_publishable_key=""
           clerk_jwt_template=""
           clerk_cli_oauth_client_id=""
@@ -149,19 +148,12 @@ jobs:
     name: Build and publish artifacts
     needs: [metadata, preflight, public_config]
     uses: ./.github/workflows/reusable-build-release-artifacts.yml
-    # This fork intentionally publishes Android APK and Windows x64 artifacts only.
+    # Mobile app builds are deprecated; release artifacts are Windows x64 only.
     with:
       ref: ${{ github.sha }}
       release_tag: ${{ needs.metadata.outputs.release_tag }}
       release_name: ${{ needs.metadata.outputs.release_name }}
       release_version: ${{ needs.metadata.outputs.release_version }}
-      android_required: true
-      android_profile: production-apk
-      android_environment: production
-      android_app_variant: production
-      android_artifact_name: t3-code-android.apk
-      android_mobile_version_policy: appVersion
-      android_app_version: ${{ needs.metadata.outputs.release_version }}
       clerk_publishable_key: ${{ needs.public_config.outputs.clerk_publishable_key }}
       clerk_jwt_template: ${{ needs.public_config.outputs.clerk_jwt_template }}
       clerk_cli_oauth_client_id: ${{ needs.public_config.outputs.clerk_cli_oauth_client_id }}
