@@ -79,6 +79,11 @@ export interface PublishClient {
   readonly publishPointer: (pointer: VerifiedPointer) => Promise<void>;
 }
 
+export interface GitHubJsonClient {
+  readonly json: <T>(repo: string, path: string) => Promise<T>;
+  readonly jsonPages: <T>(repo: string, path: string) => Promise<ReadonlyArray<T>>;
+}
+
 function findAsset(release: GitHubRelease, pattern: RegExp): GitHubAsset | undefined {
   return release.assets.find((asset) => pattern.test(asset.name));
 }
@@ -294,11 +299,25 @@ async function resolveShaArg(shaArg: string) {
   return run("git", ["rev-parse", shaArg]);
 }
 
-function makeGhVerificationClient(repo: string): VerificationClient {
+const defaultGitHubJsonClient: GitHubJsonClient = {
+  json: ghJson,
+  jsonPages: ghJsonPages,
+};
+
+export function makeGhVerificationClient(
+  repo: string,
+  api: GitHubJsonClient = defaultGitHubJsonClient,
+): VerificationClient {
   return {
-    listReleases: () => ghJson<ReadonlyArray<GitHubRelease>>(repo, "/releases?per_page=100"),
+    listReleases: async () => {
+      const pages = await api.jsonPages<ReadonlyArray<GitHubRelease>>(
+        repo,
+        "/releases?per_page=100",
+      );
+      return pages.flat();
+    },
     listCheckRuns: async (sha) => {
-      const pages = await ghJsonPages<{ readonly check_runs: ReadonlyArray<GitHubCheckRun> }>(
+      const pages = await api.jsonPages<{ readonly check_runs: ReadonlyArray<GitHubCheckRun> }>(
         repo,
         `/commits/${sha}/check-runs?per_page=100&filter=all`,
       );

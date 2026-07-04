@@ -6,9 +6,11 @@ import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
 
 import {
+  makeGhVerificationClient,
   updateVerifiedPointer,
   verifyClientArtifacts,
   type GitHubCheckRun,
+  type GitHubJsonClient,
   type GitHubRelease,
   type PublishClient,
   type VerificationClient,
@@ -86,6 +88,40 @@ it("verifies a sha with desktop assets and launch smoke, ignoring the pointer re
   assert.equal(result.pointer.mobile.ota, "unknown");
   assert.equal(result.pointer.mobile.apk, undefined);
   assert.match(result.pointer.mobile.reason, /No Expo OTA publish workflow/);
+});
+
+it("paginates releases before declaring a sha missing", async () => {
+  const paths: Array<string> = [];
+  const api: GitHubJsonClient = {
+    json: async () => {
+      throw new Error("unexpected non-paginated GitHub request");
+    },
+    jsonPages: async <T>(_repo: string, path: string): Promise<ReadonlyArray<T>> => {
+      paths.push(path);
+      if (path === "/releases?per_page=100") {
+        return [
+          [release([asset("t3-code-preview-android.apk")])],
+          [release()],
+        ] as unknown as ReadonlyArray<T>;
+      }
+      if (path === `/commits/${sha.slice(0, 12)}/check-runs?per_page=100&filter=all`) {
+        return [{ check_runs: checks() }] as unknown as ReadonlyArray<T>;
+      }
+      throw new Error(`unexpected GitHub path ${path}`);
+    },
+  };
+
+  const result = await verifyClientArtifacts({
+    sha: sha.slice(0, 12),
+    client: makeGhVerificationClient("agriffiths-bots/t3code", api),
+    now: new Date("2026-07-03T12:00:00.000Z"),
+  });
+
+  assert.equal(result.verified, true);
+  assert.deepStrictEqual(paths, [
+    "/releases?per_page=100",
+    `/commits/${sha.slice(0, 12)}/check-runs?per_page=100&filter=all`,
+  ]);
 });
 
 it("rejects a sha when the latest completed non-skipped launch smoke failed", async () => {

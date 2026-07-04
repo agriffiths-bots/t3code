@@ -99,7 +99,8 @@ Client update agents poll branch `client-verified-latest` / file
 node scripts/ops/daily-restart/update-verified-pointer.ts --sha "$SHA"
 ```
 
-Omit `--sha` for `origin/main`; pass `--dry-run` or `--out FILE`. Final stdout:
+Omit `--sha` to fetch and verify `origin/main`; non-hex `--sha` values are
+resolved locally with `git rev-parse`. Pass `--dry-run` or `--out FILE`. Final stdout:
 `VERIFIED <sha>` or `NOT-VERIFIED <reason>`. Failures exit non-zero and never
 overwrite the previous pointer.
 
