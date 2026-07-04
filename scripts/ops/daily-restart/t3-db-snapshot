@@ -113,7 +113,7 @@ trap - EXIT
 if [[ "$keep" -gt 0 ]]; then
   retain_other_count=$((keep - 1))
   mapfile -d '' snapshots < <(
-    find "$out_dir" -maxdepth 1 -type f -name 't3-state-*.sqlite' ! -path "$snapshot" -printf '%T@ %p\0' \
+    find "$out_dir" -maxdepth 1 -type f -name 't3-state-*.sqlite' ! -samefile "$snapshot" -printf '%T@ %p\0' \
       | sort -z -nr \
       | cut -z -d' ' -f2-
   )

@@ -320,4 +320,29 @@ describe("daily restart database tools", () => {
       [NodePath.basename(keptSnapshot)],
     );
   });
+
+  it("keeps the current snapshot when the output path contains find metacharacters", () => {
+    const dir = makeTempDir();
+    const db = NodePath.join(dir, "state.sqlite");
+    const outDir = NodePath.join(dir, "snapshots-[x]");
+    createWalDatabase(db);
+    NodeFS.mkdirSync(outDir);
+    NodeFS.writeFileSync(NodePath.join(outDir, "t3-state-20260703-000000.sqlite"), "");
+
+    const keptSnapshot = run([
+      snapshotTool,
+      "--db",
+      db,
+      "--out-dir",
+      outDir,
+      "--keep",
+      "1",
+    ]).stdout.trim();
+
+    assert.equal(NodeFS.existsSync(keptSnapshot), true);
+    assert.deepStrictEqual(
+      NodeFS.readdirSync(outDir).filter((entry) => entry.startsWith("t3-state-")),
+      [NodePath.basename(keptSnapshot)],
+    );
+  });
 });
