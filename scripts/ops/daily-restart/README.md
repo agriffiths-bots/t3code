@@ -82,7 +82,8 @@ and exit non-zero on failure. Snapshot runs must execute as root or the database
 owner; root-created snapshot directories are `root:<database group>` with sticky
 mode `1770`, old root-created `0700` database-owned snapshot directories are
 migrated to that layout, and root-created snapshot files are assigned to the
-database owner.
+database owner. Snapshot staging stays inside the snapshot directory so the
+published file is installed with a same-filesystem rename.
 
 ## Integration smoke
 
