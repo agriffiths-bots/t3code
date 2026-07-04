@@ -115,6 +115,17 @@ run_probe_without_supplied_token() {
   echo "$tmp/result"
 }
 
+run_probe_exact() {
+  local tmp out rc
+  tmp="$(mktemp -d)"
+  make_fake_bin "$tmp/bin"
+  FAKE_NODE_LOG="$tmp/node.log" T3DR_TEST_PATH_PREFIX="$tmp/bin" T3_TOKEN=fake-token "$SCRIPT" "$@" >"$tmp/out" 2>"$tmp/err"
+  rc=$?
+  out="$(cat "$tmp/out")"
+  printf '%s\n%s\n%s\n' "$rc" "$out" "$(cat "$tmp/err")" > "$tmp/result"
+  echo "$tmp/result"
+}
+
 assert_contains() {
   local file="$1" needle="$2" label="$3"
   if grep -Fq -- "$needle" "$file"; then
@@ -129,6 +140,12 @@ if [[ "$(sed -n '1p' "$result")" == "0" ]]; then pass "all checks pass exits zer
 assert_contains "$result" "CHECK systemd PASS active" "systemd pass line"
 assert_contains "$result" "CHECK http PASS 200" "http pass line"
 assert_contains "$result" "CHECK spawn_wake PASS completed thread=fake" "spawn pass line"
+
+for flag in --origin --service --timeout; do
+  result="$(run_probe_exact "$flag")"
+  if [[ "$(sed -n '1p' "$result")" == "2" ]]; then pass "$flag missing value exits usage"; else fail "$flag missing value exits usage"; fi
+  assert_contains "$result" "health-probe: $flag requires a value" "$flag missing value message"
+done
 
 result="$(run_probe "trailing slash origin" --origin http://127.0.0.1:1/)"
 node_log="$(dirname "$result")/node.log"

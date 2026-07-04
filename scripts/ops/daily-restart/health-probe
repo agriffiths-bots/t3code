@@ -20,18 +20,30 @@ normalize_origin() {
   printf '%s\n' "$value"
 }
 
+require_value() {
+  local flag="$1"
+  if [[ "$#" -lt 2 || -z "${2:-}" || "${2:-}" == --* ]]; then
+    echo "health-probe: $flag requires a value" >&2
+    usage
+    exit 2
+  fi
+}
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --origin)
-      origin="${2:-}"
+      require_value "$@"
+      origin="$2"
       shift 2
       ;;
     --service)
-      service="${2:-}"
+      require_value "$@"
+      service="$2"
       shift 2
       ;;
     --timeout)
-      timeout_secs="${2:-}"
+      require_value "$@"
+      timeout_secs="$2"
       shift 2
       ;;
     -h|--help)
