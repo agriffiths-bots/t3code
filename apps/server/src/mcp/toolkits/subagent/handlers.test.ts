@@ -73,6 +73,10 @@ const client = McpSchema.McpServerClient.of({
 
 const unsupported = () => Effect.die(new Error("Unsupported call in subagent test")) as never;
 
+let childDetailTurnState: "completed" | "running" | "error" | "interrupted" = "completed";
+let childDetailMessages: OrchestrationThread["messages"] | null = null;
+let childDetailSession: OrchestrationThread["session"] | null = null;
+
 const makeChildDetail = (): OrchestrationThread => ({
   id: childThreadId,
   projectId,
@@ -84,17 +88,17 @@ const makeChildDetail = (): OrchestrationThread => ({
   worktreePath: null,
   latestTurn: {
     turnId: "turn-1" as never,
-    state: "completed",
+    state: childDetailTurnState,
     requestedAt: "2026-06-17T10:00:00.000Z",
     startedAt: "2026-06-17T10:00:00.000Z",
-    completedAt: "2026-06-17T10:01:00.000Z",
+    completedAt: childDetailTurnState === "running" ? null : "2026-06-17T10:01:00.000Z",
     assistantMessageId: null,
   },
   createdAt: "2026-06-17T09:00:00.000Z",
   updatedAt: "2026-06-17T10:01:00.000Z",
   archivedAt: null,
   deletedAt: null,
-  messages: [
+  messages: childDetailMessages ?? [
     {
       id: "msg-1" as never,
       role: "assistant",
@@ -108,7 +112,7 @@ const makeChildDetail = (): OrchestrationThread => ({
   proposedPlans: [],
   activities: [],
   checkpoints: [],
-  session: null,
+  session: childDetailSession,
 });
 
 // A child shell with a configurable turn state. Idle (latestTurn != running)
@@ -146,6 +150,8 @@ const makeChildShell = (turnState: "completed" | "running" = "completed") => ({
 // tool call. Each test sets the slice result / records the side effects it
 // asserts on.
 let waitSliceResult: WaitSliceResult | null = null;
+let childDetailDelayMs = 0;
+let childDetailUnavailable = false;
 // R-C seams: the child's turn state and its provider driver kind drive the
 // idle/mid-turn + defer/dispatch decision. Defaults: idle child, unknown driver.
 let childTurnState: "completed" | "running" = "completed";
@@ -260,7 +266,15 @@ const projectionLayer = Layer.succeed(ProjectionSnapshotQuery, {
           : Option.none(),
     ),
   getThreadDetailById: (threadId) =>
-    Effect.succeed(threadId === childThreadId ? Option.some(makeChildDetail()) : Option.none()),
+    Effect.suspend(() => {
+      const detail =
+        threadId === childThreadId && !childDetailUnavailable
+          ? Option.some(makeChildDetail())
+          : Option.none();
+      return childDetailDelayMs > 0
+        ? Effect.sleep(`${childDetailDelayMs} millis`).pipe(Effect.as(detail))
+        : Effect.succeed(detail);
+    }),
 });
 
 const coordinatorLayer = Layer.succeed(ChildThreadCoordinator, {
@@ -406,6 +420,7 @@ describe("SubagentToolkit", () => {
       Effect.gen(function* () {
         const server = yield* McpServer.McpServer;
         promotedCalls.length = 0;
+        childDetailTurnState = "running";
         // The coordinator slice reports the child still pending.
         waitSliceResult = {
           results: [{ childThreadId, status: "pending", finalAssistantText: null, error: null }],
@@ -443,6 +458,487 @@ describe("SubagentToolkit", () => {
         expect(promotedCalls).toEqual([[childThreadId]]);
       }),
     ).pipe(Effect.provide(TestLayer)),
+  );
+
+  it.effect("R-A: wait auto-promotes timeout rows when the auto-promote deadline was active", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const server = yield* McpServer.McpServer;
+        promotedCalls.length = 0;
+        childDetailTurnState = "running";
+        // waitSlice converts pending children to "timeout" when the supplied
+        // budgetDeadlineMs has elapsed. If that deadline was the 90s
+        // auto-promote cap, the child is still running and must be promoted.
+        waitSliceResult = {
+          results: [
+            {
+              childThreadId,
+              status: "timeout",
+              finalAssistantText: null,
+              error: "wait exceeded budget",
+            },
+          ],
+          settledCount: 0,
+          timedOutCount: 1,
+          pending: false,
+          resumeToken: "coordinator-token",
+        };
+
+        const result = yield* server
+          .callTool({
+            name: "t3_wait_subagent",
+            arguments: {
+              childThreadIds: [childThreadId],
+              resumeToken: "-100000:coordinator-token",
+            },
+          })
+          .pipe(
+            Effect.provideService(McpInvocationContext.McpInvocationContext, invocation),
+            Effect.provideService(McpSchema.McpServerClient, client),
+          );
+
+        expect(result.isError).toBe(false);
+        expect(result.structuredContent).toMatchObject({
+          promoted: true,
+          pending: false,
+          timedOutCount: 0,
+          results: [{ childThreadId, status: "running", error: null }],
+        });
+        const row = (result.structuredContent as { results: ReadonlyArray<{ note?: string }> })
+          .results[0];
+        expect(row?.note).toContain("NOTIFIED");
+        expect(promotedCalls).toEqual([[childThreadId]]);
+      }),
+    ).pipe(Effect.provide(TestLayer)),
+  );
+
+  it.effect("R-A: wait auto-promotes timeout rows when projection enrichment is unavailable", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const server = yield* McpServer.McpServer;
+        promotedCalls.length = 0;
+        childDetailTurnState = "running";
+        childDetailUnavailable = true;
+        waitSliceResult = {
+          results: [
+            {
+              childThreadId,
+              status: "timeout",
+              finalAssistantText: null,
+              error: "wait exceeded budget",
+            },
+          ],
+          settledCount: 0,
+          timedOutCount: 1,
+          pending: false,
+          resumeToken: "coordinator-token",
+        };
+
+        const result = yield* server
+          .callTool({
+            name: "t3_wait_subagent",
+            arguments: {
+              childThreadIds: [childThreadId],
+              resumeToken: "-100000:coordinator-token",
+            },
+          })
+          .pipe(
+            Effect.provideService(McpInvocationContext.McpInvocationContext, invocation),
+            Effect.provideService(McpSchema.McpServerClient, client),
+          );
+
+        expect(result.isError).toBe(false);
+        expect(result.structuredContent).toMatchObject({
+          promoted: true,
+          pending: false,
+          timedOutCount: 0,
+          results: [{ childThreadId, status: "running", turnCount: 0, error: null }],
+        });
+        expect(promotedCalls).toEqual([[childThreadId]]);
+      }),
+    ).pipe(
+      Effect.ensuring(
+        Effect.sync(() => {
+          childDetailUnavailable = false;
+        }),
+      ),
+      Effect.provide(TestLayer),
+    ),
+  );
+
+  it.effect(
+    "keeps any-mode waits pending when rows are timeout plus pending and none settled",
+    () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const server = yield* McpServer.McpServer;
+          const stillPendingChildId = ThreadId.make("thread-subagent-still-pending");
+          waitSliceResult = {
+            results: [
+              {
+                childThreadId,
+                status: "timeout",
+                finalAssistantText: null,
+                error: "wait exceeded budget",
+              },
+              {
+                childThreadId: stillPendingChildId,
+                status: "pending",
+                finalAssistantText: null,
+                error: null,
+              },
+            ],
+            settledCount: 0,
+            timedOutCount: 1,
+            pending: true,
+            resumeToken: "coordinator-token",
+          };
+
+          const result = yield* server
+            .callTool({
+              name: "t3_wait_subagent",
+              arguments: {
+                childThreadIds: [childThreadId, stillPendingChildId],
+                mode: "any",
+                timeoutSeconds: 1,
+              },
+            })
+            .pipe(
+              Effect.provideService(McpInvocationContext.McpInvocationContext, invocation),
+              Effect.provideService(McpSchema.McpServerClient, client),
+            );
+
+          expect(result.isError).toBe(false);
+          expect(result.structuredContent).toMatchObject({
+            pending: true,
+            settledCount: 0,
+            timedOutCount: 1,
+            results: [
+              { childThreadId, status: "timeout" },
+              { childThreadId: stillPendingChildId, status: "pending" },
+            ],
+          });
+          expect(result.structuredContent).not.toHaveProperty("promoted");
+        }),
+      ).pipe(Effect.provide(TestLayer)),
+  );
+
+  it.effect("R-A: wait returns projection-terminal children instead of stale promotion", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const server = yield* McpServer.McpServer;
+        promotedCalls.length = 0;
+        childDetailTurnState = "completed";
+        waitSliceResult = {
+          results: [
+            {
+              childThreadId,
+              status: "timeout",
+              finalAssistantText: null,
+              error: "wait exceeded budget",
+            },
+          ],
+          settledCount: 0,
+          timedOutCount: 1,
+          pending: false,
+          resumeToken: "coordinator-token",
+        };
+
+        const result = yield* server
+          .callTool({
+            name: "t3_wait_subagent",
+            arguments: {
+              childThreadIds: [childThreadId],
+              resumeToken: "-100000:coordinator-token",
+            },
+          })
+          .pipe(
+            Effect.provideService(McpInvocationContext.McpInvocationContext, invocation),
+            Effect.provideService(McpSchema.McpServerClient, client),
+          );
+
+        expect(result.isError).toBe(false);
+        expect(result.structuredContent).toMatchObject({
+          pending: false,
+          settledCount: 1,
+          timedOutCount: 0,
+          results: [
+            {
+              childThreadId,
+              status: "completed",
+              finalAssistantText: "child done",
+              error: null,
+            },
+          ],
+        });
+        expect(result.structuredContent).not.toHaveProperty("promoted");
+        expect(promotedCalls).toEqual([]);
+      }),
+    ).pipe(Effect.provide(TestLayer)),
+  );
+
+  it.effect("R-A: stale completed projection with a newer active turn still auto-promotes", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const server = yield* McpServer.McpServer;
+        promotedCalls.length = 0;
+        childDetailTurnState = "completed";
+        childDetailSession = {
+          threadId: childThreadId,
+          status: "running",
+          providerName: "codex",
+          runtimeMode: "full-access",
+          activeTurnId: "turn-2" as never,
+          lastError: null,
+          updatedAt: "2026-06-17T10:02:00.000Z",
+        };
+        waitSliceResult = {
+          results: [
+            {
+              childThreadId,
+              status: "timeout",
+              finalAssistantText: null,
+              error: "wait exceeded budget",
+            },
+          ],
+          settledCount: 0,
+          timedOutCount: 1,
+          pending: false,
+          resumeToken: "coordinator-token",
+        };
+
+        const result = yield* server
+          .callTool({
+            name: "t3_wait_subagent",
+            arguments: {
+              childThreadIds: [childThreadId],
+              resumeToken: "-100000:coordinator-token",
+            },
+          })
+          .pipe(
+            Effect.provideService(McpInvocationContext.McpInvocationContext, invocation),
+            Effect.provideService(McpSchema.McpServerClient, client),
+          );
+
+        expect(result.isError).toBe(false);
+        expect(result.structuredContent).toMatchObject({
+          promoted: true,
+          pending: false,
+          timedOutCount: 0,
+          results: [{ childThreadId, status: "running", error: null }],
+        });
+        expect(promotedCalls).toEqual([[childThreadId]]);
+      }),
+    ).pipe(
+      Effect.ensuring(
+        Effect.sync(() => {
+          childDetailSession = null;
+        }),
+      ),
+      Effect.provide(TestLayer),
+    ),
+  );
+
+  it.effect("returns completed projection waits when the completed child session has stopped", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const server = yield* McpServer.McpServer;
+        promotedCalls.length = 0;
+        childDetailTurnState = "completed";
+        childDetailSession = {
+          threadId: childThreadId,
+          status: "stopped",
+          providerName: "codex",
+          runtimeMode: "full-access",
+          activeTurnId: null,
+          lastError: null,
+          updatedAt: "2026-06-17T10:02:00.000Z",
+        };
+        waitSliceResult = {
+          results: [
+            {
+              childThreadId,
+              status: "timeout",
+              finalAssistantText: null,
+              error: "wait exceeded budget",
+            },
+          ],
+          settledCount: 0,
+          timedOutCount: 1,
+          pending: false,
+          resumeToken: "coordinator-token",
+        };
+
+        const result = yield* server
+          .callTool({
+            name: "t3_wait_subagent",
+            arguments: {
+              childThreadIds: [childThreadId],
+              resumeToken: "-100000:coordinator-token",
+            },
+          })
+          .pipe(
+            Effect.provideService(McpInvocationContext.McpInvocationContext, invocation),
+            Effect.provideService(McpSchema.McpServerClient, client),
+          );
+
+        expect(result.isError).toBe(false);
+        expect(result.structuredContent).toMatchObject({
+          pending: false,
+          settledCount: 1,
+          timedOutCount: 0,
+          results: [{ childThreadId, status: "completed", error: null }],
+        });
+        expect(result.structuredContent).not.toHaveProperty("promoted");
+        expect(promotedCalls).toEqual([]);
+      }),
+    ).pipe(
+      Effect.ensuring(
+        Effect.sync(() => {
+          childDetailSession = null;
+        }),
+      ),
+      Effect.provide(TestLayer),
+    ),
+  );
+
+  it.effect("does not enrich completed waits with stale prior-turn assistant text", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const server = yield* McpServer.McpServer;
+        childDetailTurnState = "completed";
+        childDetailMessages = [
+          {
+            id: "msg-prior" as never,
+            role: "assistant",
+            text: "stale prior answer",
+            turnId: "turn-prior" as never,
+            streaming: false,
+            createdAt: "2026-06-17T09:59:00.000Z",
+            updatedAt: "2026-06-17T09:59:00.000Z",
+          },
+        ];
+        waitSliceResult = {
+          results: [
+            {
+              childThreadId,
+              status: "timeout",
+              finalAssistantText: null,
+              error: "wait exceeded budget",
+            },
+          ],
+          settledCount: 0,
+          timedOutCount: 1,
+          pending: false,
+          resumeToken: "coordinator-token",
+        };
+
+        const result = yield* server
+          .callTool({
+            name: "t3_wait_subagent",
+            arguments: {
+              childThreadIds: [childThreadId],
+              resumeToken: "-100000:coordinator-token",
+            },
+          })
+          .pipe(
+            Effect.provideService(McpInvocationContext.McpInvocationContext, invocation),
+            Effect.provideService(McpSchema.McpServerClient, client),
+          );
+
+        expect(result.isError).toBe(false);
+        expect(result.structuredContent).toMatchObject({
+          pending: false,
+          settledCount: 1,
+          timedOutCount: 0,
+          results: [
+            {
+              childThreadId,
+              status: "completed",
+              finalAssistantText: null,
+              error: null,
+            },
+          ],
+        });
+      }),
+    ).pipe(
+      Effect.ensuring(
+        Effect.sync(() => {
+          childDetailMessages = null;
+        }),
+      ),
+      Effect.provide(TestLayer),
+    ),
+  );
+
+  it.effect("does not enrich failed waits with stale prior-turn assistant text", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const server = yield* McpServer.McpServer;
+        childDetailTurnState = "error";
+        childDetailMessages = [
+          {
+            id: "msg-prior" as never,
+            role: "assistant",
+            text: "stale prior answer",
+            turnId: "turn-prior" as never,
+            streaming: false,
+            createdAt: "2026-06-17T09:59:00.000Z",
+            updatedAt: "2026-06-17T09:59:00.000Z",
+          },
+        ];
+        waitSliceResult = {
+          results: [
+            {
+              childThreadId,
+              status: "timeout",
+              finalAssistantText: null,
+              error: "wait exceeded budget",
+            },
+          ],
+          settledCount: 0,
+          timedOutCount: 1,
+          pending: false,
+          resumeToken: "coordinator-token",
+        };
+
+        const result = yield* server
+          .callTool({
+            name: "t3_wait_subagent",
+            arguments: {
+              childThreadIds: [childThreadId],
+              resumeToken: "-100000:coordinator-token",
+            },
+          })
+          .pipe(
+            Effect.provideService(McpInvocationContext.McpInvocationContext, invocation),
+            Effect.provideService(McpSchema.McpServerClient, client),
+          );
+
+        expect(result.isError).toBe(false);
+        expect(result.structuredContent).toMatchObject({
+          pending: false,
+          settledCount: 1,
+          timedOutCount: 0,
+          results: [
+            {
+              childThreadId,
+              status: "failed",
+              finalAssistantText: null,
+              error: "Child thread ended with status failed.",
+            },
+          ],
+        });
+      }),
+    ).pipe(
+      Effect.ensuring(
+        Effect.sync(() => {
+          childDetailMessages = null;
+          childDetailTurnState = "completed";
+        }),
+      ),
+      Effect.provide(TestLayer),
+    ),
   );
 
   it.effect("R-C: steer dispatches now for an idle child", () =>
