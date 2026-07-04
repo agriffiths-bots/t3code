@@ -15,6 +15,8 @@ export interface ResumeManifestThread {
   readonly role: "active" | "waiting";
   readonly status?: string;
   readonly active_turn_id?: string | null;
+  readonly runtime_mode?: ResumeRuntimeMode;
+  readonly interaction_mode?: ResumeInteractionMode;
   readonly title?: string | null;
   injected_at: string | null;
 }
@@ -50,6 +52,16 @@ const DISPATCH_RETRY_BASE_MS = 4_000;
 const DISPATCH_RETRY_JITTER = 0.2;
 const DISPATCH_RETRY_SLEEP_BUDGET_MS = 60_000;
 const DISPATCH_ATTEMPT_TIMEOUT_MS = 10_000;
+type ResumeRuntimeMode = "approval-required" | "auto-accept-edits" | "full-access";
+type ResumeInteractionMode = "default" | "plan";
+const DEFAULT_RESUME_RUNTIME_MODE: ResumeRuntimeMode = "full-access";
+const DEFAULT_RESUME_INTERACTION_MODE: ResumeInteractionMode = "default";
+const RESUME_RUNTIME_MODES = new Set<ResumeRuntimeMode>([
+  "approval-required",
+  "auto-accept-edits",
+  "full-access",
+]);
+const RESUME_INTERACTION_MODES = new Set<ResumeInteractionMode>(["default", "plan"]);
 
 function usage(): string {
   return `usage: inject-resume --manifest FILE [--origin URL] [--token TOKEN] [--dry-run]
@@ -118,6 +130,20 @@ export function parseManifest(raw: string): ResumeManifest {
     }
     if (thread.injected_at !== null && typeof thread.injected_at !== "string") {
       throw new Error(`thread ${thread.thread_id} injected_at must be null or a string`);
+    }
+    if (
+      thread.runtime_mode !== undefined &&
+      !RESUME_RUNTIME_MODES.has(thread.runtime_mode as ResumeRuntimeMode)
+    ) {
+      throw new Error(`thread ${thread.thread_id} runtime_mode must be a valid runtime mode`);
+    }
+    if (
+      thread.interaction_mode !== undefined &&
+      !RESUME_INTERACTION_MODES.has(thread.interaction_mode as ResumeInteractionMode)
+    ) {
+      throw new Error(
+        `thread ${thread.thread_id} interaction_mode must be a valid interaction mode`,
+      );
     }
   }
 
@@ -277,21 +303,23 @@ async function dispatchResumeCommands(
   origin: string,
   token: string,
   manifest: ResumeManifest,
-  threadId: string,
+  thread: ResumeManifestThread,
   createdAt: string,
   attemptTimeoutMs: number,
   sleepImpl: (ms: number) => Promise<void>,
   random: () => number,
 ): Promise<void> {
+  const runtimeMode = thread.runtime_mode ?? DEFAULT_RESUME_RUNTIME_MODE;
+  const interactionMode = thread.interaction_mode ?? DEFAULT_RESUME_INTERACTION_MODE;
   await postDispatchCommandWithRetry(
     fetchImpl,
     origin,
     token,
     {
       type: "thread.interaction-mode.set",
-      commandId: stableDispatchId("interaction-mode", manifest, threadId),
-      threadId,
-      interactionMode: "default",
+      commandId: stableDispatchId("interaction-mode", manifest, thread.thread_id),
+      threadId: thread.thread_id,
+      interactionMode,
       createdAt,
     },
     attemptTimeoutMs,
@@ -305,16 +333,16 @@ async function dispatchResumeCommands(
     token,
     {
       type: "thread.turn.start",
-      commandId: stableDispatchId("command", manifest, threadId),
-      threadId,
+      commandId: stableDispatchId("command", manifest, thread.thread_id),
+      threadId: thread.thread_id,
       message: {
-        messageId: stableDispatchId("message", manifest, threadId),
+        messageId: stableDispatchId("message", manifest, thread.thread_id),
         role: "user",
         text: RESUME_MESSAGE,
         attachments: [],
       },
-      runtimeMode: "full-access",
-      interactionMode: "default",
+      runtimeMode,
+      interactionMode,
       createdAt,
     },
     attemptTimeoutMs,
@@ -354,7 +382,7 @@ export async function injectResume(options: InjectResumeOptions): Promise<Inject
         options.origin,
         token,
         manifest,
-        thread.thread_id,
+        thread,
         injectedAt,
         dispatchAttemptTimeoutMs,
         sleepImpl,

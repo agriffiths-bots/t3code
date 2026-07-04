@@ -1,5 +1,6 @@
 import {
   type ApprovalRequestId,
+  CommandId,
   DEFAULT_MODEL,
   defaultInstanceIdForDriver,
   type EnvironmentId,
@@ -52,6 +53,7 @@ import {
   useMemo,
   useRef,
   useState,
+  useSyncExternalStore,
 } from "react";
 import { useNavigate } from "@tanstack/react-router";
 import { useShallow } from "zustand/react/shallow";
@@ -63,7 +65,7 @@ import {
   type AtomCommandResult,
 } from "@t3tools/client-runtime/state/runtime";
 import * as Cause from "effect/Cause";
-import { AsyncResult } from "effect/unstable/reactivity";
+import { AsyncResult, Atom } from "effect/unstable/reactivity";
 import { isElectron } from "../env";
 import { readLocalApi } from "../localApi";
 import { useDiffPanelStore } from "../diffPanelStore";
@@ -83,6 +85,7 @@ import {
   deriveWorkLogEntries,
   hasActionableProposedPlan,
   isLatestTurnSettled,
+  isThreadReadyForQueuedTurn,
   isThreadSessionActive,
 } from "../session-logic";
 import { type LegendListRef } from "@legendapp/list/react";
@@ -199,6 +202,7 @@ import {
   useThread,
   useThreadProposedPlans,
   useThreadRefs,
+  useThreadShells,
 } from "../state/entities";
 import { environmentShell } from "../state/shell";
 import { ChatComposer, type ChatComposerHandle } from "./chat/ChatComposer";
@@ -232,13 +236,17 @@ import {
   readFileAsDataUrl,
   reconcileMountedTerminalThreadIds,
   resolveSendEnvMode,
+  threadHasEstablishedProviderBinding,
   revokeBlobPreviewUrl,
   revokeUserMessagePreviewUrls,
   waitForStartedServerThread,
 } from "./ChatView.logic";
 import { useLocalStorage } from "~/hooks/useLocalStorage";
 import { useComposerHandleContext } from "../composerHandleContext";
-import { sanitizeThreadErrorMessage } from "~/rpc/transportError";
+import {
+  isTransportConnectionErrorMessage,
+  sanitizeThreadErrorMessage,
+} from "~/rpc/transportError";
 import { RightPanelSheet } from "./RightPanelSheet";
 import { previewEnvironment } from "../state/preview";
 import { useAtomCommand } from "../state/use-atom-command";
@@ -253,9 +261,47 @@ import { dismissScheduleBanner, isScheduleBannerDismissed } from "../scheduleBan
 import { useThreadScheduleSummary } from "../state/schedules";
 import { buildScheduleBanner } from "./chat/scheduleBanner";
 import { useAssetUrls } from "../assets/assetUrls";
+import {
+  clientTurnCommandId,
+  getMessageOutboxSnapshot,
+  messageOutboxHasBootstrapSubmissionForThread,
+  messageOutboxHasSessionOnlySubmissionForThread,
+  messageOutboxHasSubmissionForThread,
+  messageOutboxSubmissionIsFirstForThread,
+  messageOutboxSubmissionHasBootstrap,
+  messageOutboxSubmissionHasNonIdempotentDispatchPayload,
+  messageOutboxSubmissionIsDurable,
+  messageOutboxSubmissionIsTerminal,
+  messageOutboxSubmissionRequiresServerShell,
+  outboxSubmissionToChatMessage,
+  outboxSubmissionsForThread,
+  reconcileOutboxWithServerMessages,
+  removeOutboxSubmission,
+  subscribeMessageOutbox,
+  updateOutboxSubmission,
+  updateSessionMessageOutbox,
+  upsertOutboxSubmission,
+  type MessageOutboxDocument,
+  type MessageOutboxSubmission,
+  type MessageOutboxStatus,
+} from "../messageOutbox";
 
 const IMAGE_ONLY_BOOTSTRAP_PROMPT =
   "[User attached one or more images without additional text. Respond using the conversation context and the attached image(s).]";
+const NON_DURABLE_ATTACHMENT_OUTBOX_NOTICE =
+  "Attached images will retry while this app stays open. Reconnect before closing or reloading.";
+const BOOTSTRAP_OUTBOX_NOTICE =
+  "Thread setup will retry while this app stays open. Reconnect before closing or reloading.";
+const DEPENDENT_SESSION_ONLY_OUTBOX_NOTICE =
+  "This send depends on earlier queued work and will retry only while this app stays open.";
+const BOOTSTRAP_UNCERTAIN_OUTBOX_NOTICE =
+  "Connection dropped while preparing this send. Check whether it already started before sending again.";
+const ATTACHMENT_UNCERTAIN_OUTBOX_NOTICE =
+  "Connection dropped while sending attached images. Check whether they already sent before sending again.";
+const DEPENDENT_UNCERTAIN_OUTBOX_NOTICE =
+  "Earlier queued work is unresolved. Check whether it started before sending this follow-up again.";
+const OUTBOX_RETRY_BASE_DELAY_MS = 1_000;
+const OUTBOX_RETRY_MAX_DELAY_MS = 30_000;
 const EMPTY_ACTIVITIES: OrchestrationThreadActivity[] = [];
 const EMPTY_PROVIDERS: ServerProvider[] = [];
 const EMPTY_PROVIDER_SKILLS: ServerProvider["skills"] = [];
@@ -295,6 +341,17 @@ const TYPE_TO_FOCUS_FLOATING_LAYER_SELECTOR = [
   '[data-slot="autocomplete-popup"]',
 ].join(",");
 
+const environmentShellSnapshotSequenceByIdAtom = Atom.make((get) => {
+  const sequenceByEnvironmentId = new Map<EnvironmentId, number>();
+  for (const environmentId of get(environmentCatalog.catalogValueAtom).entries.keys()) {
+    const snapshot = get(environmentShell.stateValueAtom(environmentId)).snapshot;
+    if (snapshot._tag === "Some") {
+      sequenceByEnvironmentId.set(environmentId, snapshot.value.snapshotSequence);
+    }
+  }
+  return sequenceByEnvironmentId;
+}).pipe(Atom.withLabel("chat-view:environment-shell-snapshot-sequences"));
+
 type EnvironmentUnavailableState = {
   readonly environmentId: EnvironmentId;
   readonly label: string;
@@ -302,6 +359,232 @@ type EnvironmentUnavailableState = {
 };
 
 type ThreadPlanCatalogEntry = Pick<Thread, "id" | "proposedPlans">;
+
+type PersistThreadSettingsForNextTurnInput = {
+  readonly threadId: ThreadId;
+  readonly createdAt: string;
+  readonly modelSelection?: ModelSelection;
+  readonly runtimeMode: RuntimeMode;
+  readonly interactionMode: ProviderInteractionMode;
+};
+
+type PersistThreadSettingsForNextTurnSuccess = {
+  readonly sequence: number | null;
+};
+
+type PersistThreadSettingsForNextTurn = (
+  input: PersistThreadSettingsForNextTurnInput,
+) => Promise<AtomCommandResult<PersistThreadSettingsForNextTurnSuccess, unknown>>;
+
+function outboxStatusToDeliveryStatus(
+  status: MessageOutboxStatus,
+): NonNullable<ChatMessage["deliveryStatus"]> {
+  return status === "pending" ? "queued" : status;
+}
+
+function formatFailureForOutbox(failure: AtomCommandResult<unknown, unknown>): {
+  readonly message: string | null;
+  readonly transport: boolean;
+  readonly interrupted: boolean;
+} {
+  if (failure._tag !== "Failure") {
+    return { message: null, transport: false, interrupted: false };
+  }
+  if (isAtomCommandInterrupted(failure)) {
+    return { message: null, transport: true, interrupted: true };
+  }
+  const error = squashAtomCommandFailure(failure);
+  const message = error instanceof Error ? error.message : String(error);
+  return {
+    message,
+    transport: isTransportConnectionErrorMessage(message),
+    interrupted: false,
+  };
+}
+
+function outboxSessionOnlyNotice(submission: MessageOutboxSubmission): string {
+  if (messageOutboxSubmissionHasBootstrap(submission)) {
+    return BOOTSTRAP_OUTBOX_NOTICE;
+  }
+  return submission.input.message.attachments.length > 0
+    ? NON_DURABLE_ATTACHMENT_OUTBOX_NOTICE
+    : DEPENDENT_SESSION_ONLY_OUTBOX_NOTICE;
+}
+
+function outboxFailureState(
+  submission: MessageOutboxSubmission,
+  failure: ReturnType<typeof formatFailureForOutbox>,
+  options?: { readonly turnDispatchAttempted?: boolean },
+): Pick<MessageOutboxSubmission, "status" | "error" | "retryable"> {
+  if (
+    messageOutboxSubmissionHasNonIdempotentDispatchPayload(submission) &&
+    options?.turnDispatchAttempted === true
+  ) {
+    const error = messageOutboxSubmissionHasBootstrap(submission)
+      ? BOOTSTRAP_UNCERTAIN_OUTBOX_NOTICE
+      : ATTACHMENT_UNCERTAIN_OUTBOX_NOTICE;
+    return {
+      status: "failed",
+      error: failure.transport ? error : failure.message,
+      retryable: false,
+    };
+  }
+  if (options?.turnDispatchAttempted === true && !failure.transport) {
+    return { status: "failed", error: failure.message, retryable: false };
+  }
+  if (!failure.transport) {
+    return { status: "failed", error: failure.message, retryable: true };
+  }
+  return {
+    status: "pending",
+    error: messageOutboxSubmissionIsDurable(submission)
+      ? failure.message
+      : outboxSessionOnlyNotice(submission),
+    retryable: true,
+  };
+}
+
+function outboxFailureShouldDiscardLaterSubmissions(
+  submission: MessageOutboxSubmission,
+  failureState: Pick<MessageOutboxSubmission, "retryable">,
+): boolean {
+  return (
+    failureState.retryable === false &&
+    messageOutboxSubmissionHasNonIdempotentDispatchPayload(submission)
+  );
+}
+
+function updateOptimisticMessageDelivery(
+  message: ChatMessage,
+  submission: Pick<MessageOutboxSubmission, "messageId" | "status" | "error" | "retryable">,
+): ChatMessage {
+  if (message.id !== submission.messageId) {
+    return message;
+  }
+  const deliveryStatus = outboxStatusToDeliveryStatus(submission.status);
+  if (message.deliveryStatus === deliveryStatus && message.deliveryError === submission.error) {
+    return message;
+  }
+  return {
+    ...message,
+    deliveryStatus,
+    deliveryError: submission.error,
+    deliveryRetryable: submission.retryable !== false,
+    updatedAt: new Date().toISOString(),
+  };
+}
+
+function outboxAutoRetryDelayMs(submission: MessageOutboxSubmission): number {
+  if (submission.status !== "pending" || submission.attempts <= 0) {
+    return 0;
+  }
+  const exponent = Math.min(submission.attempts - 1, 5);
+  return Math.min(OUTBOX_RETRY_BASE_DELAY_MS * 2 ** exponent, OUTBOX_RETRY_MAX_DELAY_MS);
+}
+
+function outboxUpdatedAtMs(submission: MessageOutboxSubmission): number {
+  const parsed = Date.parse(submission.updatedAt);
+  return Number.isFinite(parsed) ? parsed : Date.now();
+}
+
+function outboxNextAutoRetryAtMs(submission: MessageOutboxSubmission): number {
+  return outboxUpdatedAtMs(submission) + outboxAutoRetryDelayMs(submission);
+}
+
+function outboxSettingsCommandId(
+  messageId: MessageId,
+  kind: "interaction" | "metadata" | "runtime",
+): CommandId {
+  return CommandId.make(`${clientTurnCommandId(messageId)}:${kind}`);
+}
+
+function outboxThreadKey(environmentId: EnvironmentId, threadId: ThreadId): string {
+  return scopedThreadKey(scopeThreadRef(environmentId, threadId));
+}
+
+function outboxSubmissionThreadKey(submission: MessageOutboxSubmission): string {
+  return outboxThreadKey(submission.environmentId, submission.threadId);
+}
+
+function outboxSubmissionIsLaterInSameThread(
+  submission: MessageOutboxSubmission,
+  earlier: MessageOutboxSubmission,
+): boolean {
+  if (
+    submission.environmentId !== earlier.environmentId ||
+    submission.threadId !== earlier.threadId ||
+    submission.messageId === earlier.messageId
+  ) {
+    return false;
+  }
+  const createdAtOrder = submission.createdAt.localeCompare(earlier.createdAt);
+  return createdAtOrder !== 0
+    ? createdAtOrder > 0
+    : submission.messageId.localeCompare(earlier.messageId) > 0;
+}
+
+type OutboxThreadDrainBarrier = {
+  readonly dispatchStartedAt: string;
+  readonly baselineTurnId: TurnId | null;
+  readonly baselineSessionKey: string | null;
+  readonly observedTurn: boolean;
+};
+
+function maxOutboxBaselineSequence(
+  ...sequences: ReadonlyArray<number | null | undefined>
+): number | null {
+  let maxSequence: number | null = null;
+  for (const sequence of sequences) {
+    if (sequence === null || sequence === undefined) {
+      continue;
+    }
+    maxSequence = maxSequence === null ? sequence : Math.max(maxSequence, sequence);
+  }
+  return maxSequence;
+}
+
+function outboxBarrierSessionKey(session: Thread["session"] | null | undefined): string | null {
+  return session ? `${session.status}:${session.activeTurnId ?? ""}:${session.updatedAt}` : null;
+}
+
+function latestTurnIsAfterOutboxBarrierBaseline(
+  latestTurn: Thread["latestTurn"] | null | undefined,
+  barrier: OutboxThreadDrainBarrier,
+): boolean {
+  return latestTurn !== null && latestTurn !== undefined
+    ? latestTurn.turnId !== barrier.baselineTurnId
+    : false;
+}
+
+function terminalSessionSettledAfterOutboxDispatch(
+  session: Thread["session"] | null | undefined,
+  barrier: OutboxThreadDrainBarrier,
+): boolean {
+  if (!session) {
+    return false;
+  }
+  const isTerminal = (() => {
+    switch (session.status) {
+      case "idle":
+      case "ready":
+      case "error":
+      case "interrupted":
+      case "stopped":
+        return true;
+      case "starting":
+      case "running":
+      case "waiting":
+        return false;
+    }
+  })();
+  if (!isTerminal) {
+    return false;
+  }
+  return (
+    session.updatedAt.localeCompare(barrier.dispatchStartedAt) >= 0 ||
+    outboxBarrierSessionKey(session) !== barrier.baselineSessionKey
+  );
+}
 
 function eventPathContainsSelector(event: Event, selector: string): boolean {
   const path = event.composedPath();
@@ -1109,6 +1392,17 @@ function ChatViewContent(props: ChatViewProps) {
   const [optimisticUserMessages, setOptimisticUserMessages] = useState<ChatMessage[]>([]);
   const optimisticUserMessagesRef = useRef(optimisticUserMessages);
   optimisticUserMessagesRef.current = optimisticUserMessages;
+  const messageOutbox = useSyncExternalStore(
+    subscribeMessageOutbox,
+    getMessageOutboxSnapshot,
+    getMessageOutboxSnapshot,
+  );
+  const [outboxRetryClock, setOutboxRetryClock] = useState(0);
+  const messageOutboxRef = useRef(messageOutbox);
+  messageOutboxRef.current = messageOutbox;
+  const outboxRetryInFlightRef = useRef<Set<MessageId>>(new Set());
+  const outboxAutoDrainInFlightRef = useRef(false);
+  const outboxThreadDrainBarriersRef = useRef<Map<string, OutboxThreadDrainBarrier>>(new Map());
   const [localDraftErrorsByDraftId, setLocalDraftErrorsByDraftId] = useState<
     Record<string, string | null>
   >({});
@@ -1162,7 +1456,47 @@ function ChatViewContent(props: ChatViewProps) {
   const attachmentPreviewHandoffByMessageIdRef = useRef<Record<string, string[]>>({});
   const attachmentPreviewPromotionInFlightByMessageIdRef = useRef<Record<string, true>>({});
   const sendInFlightRef = useRef(false);
+  const persistThreadSettingsForNextTurnRef = useRef<PersistThreadSettingsForNextTurn | null>(null);
   const terminalUiOpenByThreadRef = useRef<Record<string, boolean>>({});
+
+  const updateMessageOutbox = useCallback(
+    (updater: (document: MessageOutboxDocument) => MessageOutboxDocument) => {
+      updateSessionMessageOutbox((current) => {
+        const next = updater(current);
+        if (next !== current) {
+          messageOutboxRef.current = next;
+        }
+        return next;
+      });
+    },
+    [],
+  );
+
+  const updateOptimisticOutboxState = useCallback((submission: MessageOutboxSubmission) => {
+    setOptimisticUserMessages((existing) =>
+      existing.map((message) => updateOptimisticMessageDelivery(message, submission)),
+    );
+  }, []);
+
+  const markOutboxSubmission = useCallback(
+    (
+      messageId: MessageId,
+      update: (submission: MessageOutboxSubmission) => MessageOutboxSubmission,
+    ) => {
+      const existingSubmission =
+        messageOutboxRef.current.submissions.find(
+          (submission) => submission.messageId === messageId,
+        ) ?? null;
+      const updatedSubmission = existingSubmission ? update(existingSubmission) : null;
+      updateMessageOutbox((document) =>
+        updateOutboxSubmission(document, messageId, (submission) => update(submission)),
+      );
+      if (updatedSubmission) {
+        updateOptimisticOutboxState(updatedSubmission);
+      }
+    },
+    [updateMessageOutbox, updateOptimisticOutboxState],
+  );
 
   useLayoutEffect(() => {
     if (!composerOverlayElement) return;
@@ -1202,7 +1536,18 @@ function ChatViewContent(props: ChatViewProps) {
   const storeSetActiveTerminal = useTerminalUiStateStore((s) => s.setActiveTerminal);
   const storeCloseTerminal = useTerminalUiStateStore((s) => s.closeTerminal);
   const serverThreadRefs = useThreadRefs();
+  const serverThreadShells = useThreadShells();
   const serverThreadKeys = useMemo(() => serverThreadRefs.map(scopedThreadKey), [serverThreadRefs]);
+  const serverThreadShellByKey = useMemo(
+    () =>
+      new Map(
+        serverThreadShells.map((thread) => [
+          scopedThreadKey(scopeThreadRef(thread.environmentId, thread.id)),
+          thread,
+        ]),
+      ),
+    [serverThreadShells],
+  );
   const draftThreadsByThreadKey = useComposerDraftStore((store) => store.draftThreadsByThreadKey);
   const draftThreadKeys = useMemo(
     () =>
@@ -1294,6 +1639,17 @@ function ChatViewContent(props: ChatViewProps) {
     [activeThread],
   );
   const activeThreadKey = activeThreadRef ? scopedThreadKey(activeThreadRef) : null;
+  const activeOutboxSubmissions = useMemo(
+    () =>
+      activeThread
+        ? outboxSubmissionsForThread(messageOutbox, activeThread.environmentId, activeThread.id)
+        : [],
+    [activeThread, messageOutbox],
+  );
+  const activeOutboxStatusByMessageId = useMemo(
+    () => new Map(activeOutboxSubmissions.map((submission) => [submission.messageId, submission])),
+    [activeOutboxSubmissions],
+  );
   const [timelineAnchor, setTimelineAnchor] = useState<{
     readonly threadKey: string | null;
     readonly messageId: MessageId | null;
@@ -1392,6 +1748,9 @@ function ChatViewContent(props: ChatViewProps) {
     activeThread ? environmentShell.stateAtom(activeThread.environmentId) : null,
   );
   const activeEnvironmentBootstrapComplete = activeEnvironmentShell.data?.snapshot._tag === "Some";
+  const environmentShellSnapshotSequenceById = useAtomValue(
+    environmentShellSnapshotSequenceByIdAtom,
+  );
   const activeProjectKey = activeProject
     ? `${activeProject.environmentId}:${activeProject.workspaceRoot}`
     : null;
@@ -1687,7 +2046,7 @@ function ChatViewContent(props: ChatViewProps) {
         title: `${activeEnvironmentUnavailableState.label}: ${connectionStatusText(connection)}`,
         description:
           connection.error ??
-          "Reconnect this environment before sending messages or running actions.",
+          "Plain text messages queue through reloads. Thread setup and attached images retry only while this app stays open.",
         actions: (
           <>
             <Button
@@ -1892,14 +2251,22 @@ function ChatViewContent(props: ChatViewProps) {
     attachmentPreviewHandoffByMessageIdRef.current = {};
     setAttachmentPreviewHandoffByMessageId({});
   }, []);
+  const revokeOptimisticMessageIfNotOutboxed = useCallback((message: ChatMessage) => {
+    const isQueuedInOutbox = messageOutboxRef.current.submissions.some(
+      (submission) => submission.messageId === message.id,
+    );
+    if (!isQueuedInOutbox) {
+      revokeUserMessagePreviewUrls(message);
+    }
+  }, []);
   useEffect(() => {
     return () => {
       clearAttachmentPreviewHandoffs();
       for (const message of optimisticUserMessagesRef.current) {
-        revokeUserMessagePreviewUrls(message);
+        revokeOptimisticMessageIfNotOutboxed(message);
       }
     };
-  }, [clearAttachmentPreviewHandoffs]);
+  }, [clearAttachmentPreviewHandoffs, revokeOptimisticMessageIfNotOutboxed]);
   const handoffAttachmentPreviews = useCallback((messageId: MessageId, previewUrls: string[]) => {
     if (previewUrls.length === 0) return;
 
@@ -1963,6 +2330,31 @@ function ChatViewContent(props: ChatViewProps) {
       };
     });
   }, [serverAttachmentUrlById, serverMessages]);
+  useEffect(() => {
+    if (displayServerMessages.length === 0) return;
+    const deliveredMessageIds = new Set(displayServerMessages.map((message) => message.id));
+    updateMessageOutbox(
+      (document) => reconcileOutboxWithServerMessages(document, displayServerMessages).document,
+    );
+    setOptimisticUserMessages((existing) => {
+      const next = existing.filter((message) => !deliveredMessageIds.has(message.id));
+      return next.length === existing.length ? existing : next;
+    });
+  }, [displayServerMessages, updateMessageOutbox]);
+  useEffect(() => {
+    if (activeOutboxStatusByMessageId.size === 0) return;
+    setOptimisticUserMessages((existing) => {
+      let changed = false;
+      const next = existing.map((message) => {
+        const submission = activeOutboxStatusByMessageId.get(message.id);
+        if (!submission) return message;
+        const updated = updateOptimisticMessageDelivery(message, submission);
+        changed ||= updated !== message;
+        return updated;
+      });
+      return changed ? next : existing;
+    });
+  }, [activeOutboxStatusByMessageId]);
   useEffect(() => {
     if (typeof Image === "undefined" || displayServerMessages.length === 0) {
       return;
@@ -2090,15 +2482,26 @@ function ChatViewContent(props: ChatViewProps) {
           });
 
     if (optimisticUserMessages.length === 0) {
-      return serverMessagesWithPreviewHandoff;
+      if (activeOutboxSubmissions.length === 0) {
+        return serverMessagesWithPreviewHandoff;
+      }
     }
     const serverIds = new Set(serverMessagesWithPreviewHandoff.map((message) => message.id));
     const pendingMessages = optimisticUserMessages.filter((message) => !serverIds.has(message.id));
-    if (pendingMessages.length === 0) {
+    const pendingMessageIds = new Set(pendingMessages.map((message) => message.id));
+    const outboxMessages = activeOutboxSubmissions
+      .map(outboxSubmissionToChatMessage)
+      .filter((message) => !serverIds.has(message.id) && !pendingMessageIds.has(message.id));
+    if (pendingMessages.length === 0 && outboxMessages.length === 0) {
       return serverMessagesWithPreviewHandoff;
     }
-    return [...serverMessagesWithPreviewHandoff, ...pendingMessages];
-  }, [attachmentPreviewHandoffByMessageId, displayServerMessages, optimisticUserMessages]);
+    return [...serverMessagesWithPreviewHandoff, ...pendingMessages, ...outboxMessages];
+  }, [
+    activeOutboxSubmissions,
+    attachmentPreviewHandoffByMessageId,
+    displayServerMessages,
+    optimisticUserMessages,
+  ]);
   const timelineEntries = useMemo(
     () =>
       deriveTimelineEntries(timelineMessages, activeThread?.proposedPlans ?? [], workLogEntries),
@@ -2297,6 +2700,394 @@ function ChatViewContent(props: ChatViewProps) {
     },
     [draftId, routeThreadKey, routeThreadRef, serverThread],
   );
+
+  const clearOptimisticDeliveryState = useCallback((messageId: MessageId) => {
+    setOptimisticUserMessages((existing) =>
+      existing.map((message) => {
+        if (message.id !== messageId || message.deliveryStatus === undefined) {
+          return message;
+        }
+        const {
+          deliveryStatus: _deliveryStatus,
+          deliveryError: _deliveryError,
+          deliveryRetryable: _deliveryRetryable,
+          ...rest
+        } = message;
+        return rest;
+      }),
+    );
+  }, []);
+
+  const persistInactiveOutboxThreadSettingsForNextTurn = useCallback(
+    async (
+      submission: MessageOutboxSubmission,
+    ): Promise<AtomCommandResult<PersistThreadSettingsForNextTurnSuccess, unknown>> => {
+      const createdAt = submission.input.createdAt ?? submission.createdAt;
+      let latestSequence: number | null = null;
+      if (submission.input.modelSelection !== undefined) {
+        const result = await updateThreadMetadata({
+          environmentId: submission.environmentId,
+          input: {
+            commandId: outboxSettingsCommandId(submission.messageId, "metadata"),
+            threadId: submission.threadId,
+            modelSelection: submission.input.modelSelection,
+          },
+        });
+        if (result._tag === "Failure") {
+          return result;
+        }
+        latestSequence = result.value.sequence;
+      }
+
+      const runtimeResult = await setThreadRuntimeMode({
+        environmentId: submission.environmentId,
+        input: {
+          commandId: outboxSettingsCommandId(submission.messageId, "runtime"),
+          threadId: submission.threadId,
+          runtimeMode: submission.input.runtimeMode,
+          createdAt,
+        },
+      });
+      latestSequence = runtimeResult._tag === "Success" ? runtimeResult.value.sequence : null;
+      const result = runtimeResult;
+      if (result._tag === "Failure") {
+        return result;
+      }
+
+      const interactionResult = await setThreadInteractionMode({
+        environmentId: submission.environmentId,
+        input: {
+          commandId: outboxSettingsCommandId(submission.messageId, "interaction"),
+          threadId: submission.threadId,
+          interactionMode: submission.input.interactionMode,
+          createdAt,
+        },
+      });
+      if (interactionResult._tag === "Failure") {
+        return interactionResult;
+      }
+      return AsyncResult.success({ sequence: interactionResult.value.sequence ?? latestSequence });
+    },
+    [setThreadInteractionMode, setThreadRuntimeMode, updateThreadMetadata],
+  );
+
+  const executeOutboxSubmission = useCallback(
+    async (submission: MessageOutboxSubmission, options?: { manual?: boolean }) => {
+      if (outboxRetryInFlightRef.current.has(submission.messageId)) {
+        return;
+      }
+      if (!messageOutboxSubmissionIsFirstForThread(messageOutboxRef.current, submission)) {
+        const updatedAt = new Date().toISOString();
+        markOutboxSubmission(submission.messageId, (entry) => ({
+          ...entry,
+          error: "Waiting for earlier queued messages to send.",
+          updatedAt,
+        }));
+        return;
+      }
+
+      const submissionConnectionPhase =
+        environmentById.get(submission.environmentId)?.connection.phase ?? "available";
+      const isActiveThreadSubmission =
+        activeThread?.environmentId === submission.environmentId &&
+        activeThread.id === submission.threadId;
+      const threadKey = outboxSubmissionThreadKey(submission);
+      const submissionShell = serverThreadShellByKey.get(threadKey);
+
+      if (submissionConnectionPhase !== "connected") {
+        const updatedAt = new Date().toISOString();
+        markOutboxSubmission(submission.messageId, (entry) => ({
+          ...entry,
+          status: "pending",
+          error: messageOutboxSubmissionIsDurable(submission)
+            ? options?.manual
+              ? "Waiting for the environment to reconnect."
+              : entry.error
+            : outboxSessionOnlyNotice(submission),
+          updatedAt,
+        }));
+        return;
+      }
+      if (messageOutboxSubmissionRequiresServerShell(submission) && submissionShell === undefined) {
+        const updatedAt = new Date().toISOString();
+        markOutboxSubmission(submission.messageId, (entry) => ({
+          ...entry,
+          error: "Waiting for thread state to load before retrying.",
+          updatedAt,
+        }));
+        return;
+      }
+
+      outboxRetryInFlightRef.current.add(submission.messageId);
+      const sendingAt = new Date().toISOString();
+      markOutboxSubmission(submission.messageId, (entry) => ({
+        ...entry,
+        status: "sending",
+        attempts: entry.attempts + 1,
+        error: null,
+        updatedAt: sendingAt,
+      }));
+      if (isActiveThreadSubmission) {
+        beginLocalDispatch({ preparingWorktree: false });
+      }
+
+      const persistThreadSettingsForNextTurn = persistThreadSettingsForNextTurnRef.current;
+      const settingsResult =
+        isActiveThreadSubmission && persistThreadSettingsForNextTurn
+          ? await persistThreadSettingsForNextTurn({
+              threadId: submission.threadId,
+              createdAt: submission.input.createdAt ?? submission.createdAt,
+              ...(submission.input.modelSelection !== undefined
+                ? { modelSelection: submission.input.modelSelection }
+                : {}),
+              runtimeMode: submission.input.runtimeMode,
+              interactionMode: submission.input.interactionMode,
+            })
+          : submission.input.bootstrap?.createThread
+            ? AsyncResult.success({ sequence: null })
+            : await persistInactiveOutboxThreadSettingsForNextTurn(submission);
+      if (settingsResult._tag === "Failure") {
+        const failure = formatFailureForOutbox(settingsResult);
+        const failedAt = new Date().toISOString();
+        const failureState = outboxFailureState(submission, failure);
+        markOutboxSubmission(submission.messageId, (entry) => ({
+          ...entry,
+          ...failureState,
+          updatedAt: failedAt,
+        }));
+        outboxRetryInFlightRef.current.delete(submission.messageId);
+        if (isActiveThreadSubmission) {
+          resetLocalDispatch();
+        }
+        if (isActiveThreadSubmission && !failure.transport && !failure.interrupted) {
+          setThreadError(
+            submission.threadId,
+            failure.message ?? "Failed to update thread settings. Retry when ready.",
+          );
+        }
+        return;
+      }
+
+      const baselineTurnId = submissionShell?.latestTurn?.turnId ?? null;
+      const baselineSessionKey = outboxBarrierSessionKey(submissionShell?.session);
+      const baselineSnapshotSequence = maxOutboxBaselineSequence(
+        environmentShellSnapshotSequenceById.get(submission.environmentId),
+        settingsResult.value.sequence,
+      );
+      const dispatchStartedAt = new Date().toISOString();
+      const result = await startThreadTurn({
+        environmentId: submission.environmentId,
+        input: submission.input,
+      });
+
+      outboxRetryInFlightRef.current.delete(submission.messageId);
+
+      if (result._tag === "Failure") {
+        const failure = formatFailureForOutbox(result);
+        const failedAt = new Date().toISOString();
+        const failureState = outboxFailureState(submission, failure, {
+          turnDispatchAttempted: true,
+        });
+        const dependentSubmissions = outboxFailureShouldDiscardLaterSubmissions(
+          submission,
+          failureState,
+        )
+          ? messageOutboxRef.current.submissions.filter((entry) =>
+              outboxSubmissionIsLaterInSameThread(entry, submission),
+            )
+          : [];
+        markOutboxSubmission(submission.messageId, (entry) => ({
+          ...entry,
+          ...failureState,
+          updatedAt: failedAt,
+        }));
+        if (outboxFailureShouldDiscardLaterSubmissions(submission, failureState)) {
+          for (const dependent of dependentSubmissions) {
+            updateOptimisticOutboxState({
+              ...dependent,
+              status: "failed",
+              retryable: false,
+              error: DEPENDENT_UNCERTAIN_OUTBOX_NOTICE,
+              updatedAt: failedAt,
+            });
+          }
+          updateMessageOutbox((document) =>
+            dependentSubmissions.reduce(
+              (nextDocument, dependent) =>
+                removeOutboxSubmission(nextDocument, dependent.messageId),
+              document,
+            ),
+          );
+        }
+        if (isActiveThreadSubmission) {
+          resetLocalDispatch();
+        }
+        if (isActiveThreadSubmission && !failure.transport && !failure.interrupted) {
+          setThreadError(
+            submission.threadId,
+            failure.message ?? "Failed to send message. Retry when ready.",
+          );
+        }
+        return;
+      }
+
+      const dispatchAdvancedBeyondBaseline =
+        baselineSnapshotSequence !== null && result.value.sequence > baselineSnapshotSequence;
+      if (dispatchAdvancedBeyondBaseline) {
+        outboxThreadDrainBarriersRef.current.set(threadKey, {
+          dispatchStartedAt,
+          baselineTurnId,
+          baselineSessionKey,
+          observedTurn: false,
+        });
+      }
+      setOutboxRetryClock((clock) => clock + 1);
+      updateMessageOutbox((document) => removeOutboxSubmission(document, submission.messageId));
+      clearOptimisticDeliveryState(submission.messageId);
+      if (isActiveThreadSubmission) {
+        setThreadError(submission.threadId, null);
+      }
+    },
+    [
+      activeThread,
+      beginLocalDispatch,
+      clearOptimisticDeliveryState,
+      environmentShellSnapshotSequenceById,
+      environmentById,
+      markOutboxSubmission,
+      persistInactiveOutboxThreadSettingsForNextTurn,
+      resetLocalDispatch,
+      serverThreadShellByKey,
+      setThreadError,
+      startThreadTurn,
+      updateMessageOutbox,
+      updateOptimisticOutboxState,
+    ],
+  );
+
+  useEffect(() => {
+    const barriers = outboxThreadDrainBarriersRef.current;
+    let releasedBarrier = false;
+    for (const [threadKey, barrier] of barriers) {
+      const shell = serverThreadShellByKey.get(threadKey);
+      const latestTurn = shell?.latestTurn ?? null;
+      const session = shell?.session ?? null;
+      if (!latestTurnIsAfterOutboxBarrierBaseline(latestTurn, barrier)) {
+        if (terminalSessionSettledAfterOutboxDispatch(session, barrier)) {
+          barriers.delete(threadKey);
+          releasedBarrier = true;
+        }
+        continue;
+      }
+      if (!latestTurn?.startedAt && terminalSessionSettledAfterOutboxDispatch(session, barrier)) {
+        barriers.delete(threadKey);
+        releasedBarrier = true;
+        continue;
+      }
+      if (!isLatestTurnSettled(latestTurn, session)) {
+        if (!barrier.observedTurn) {
+          barriers.set(threadKey, { ...barrier, observedTurn: true });
+        }
+        continue;
+      }
+      barriers.delete(threadKey);
+      releasedBarrier = true;
+    }
+    if (releasedBarrier) {
+      setOutboxRetryClock((clock) => clock + 1);
+    }
+  }, [outboxRetryClock, serverThreadShellByKey]);
+
+  useEffect(() => {
+    if (outboxAutoDrainInFlightRef.current) {
+      return;
+    }
+    const activeThreadSendBlocked = phase === "running" || isSendBusy || sendInFlightRef.current;
+    const blockedThreadKeys = new Set<string>();
+    const retryable = messageOutbox.submissions
+      .toSorted((left, right) => {
+        const createdAtOrder = left.createdAt.localeCompare(right.createdAt);
+        return createdAtOrder !== 0
+          ? createdAtOrder
+          : left.messageId.localeCompare(right.messageId);
+      })
+      .flatMap((submission) => {
+        const threadKey = outboxSubmissionThreadKey(submission);
+        if (messageOutboxSubmissionIsTerminal(submission)) {
+          return [];
+        }
+        if (blockedThreadKeys.has(threadKey)) {
+          return [];
+        }
+        blockedThreadKeys.add(threadKey);
+        if (
+          submission.retryable === false ||
+          submission.status !== "pending" ||
+          environmentById.get(submission.environmentId)?.connection.phase !== "connected"
+        ) {
+          return [];
+        }
+        const isActiveThreadSubmission =
+          activeThread?.environmentId === submission.environmentId &&
+          activeThread.id === submission.threadId;
+        if (outboxThreadDrainBarriersRef.current.has(threadKey)) {
+          return [];
+        }
+        if (activeThreadSendBlocked && isActiveThreadSubmission) {
+          return [];
+        }
+        const shell = serverThreadShellByKey.get(threadKey);
+        if (!shell && messageOutboxSubmissionRequiresServerShell(submission)) {
+          return [];
+        }
+        if (shell && !isThreadReadyForQueuedTurn(shell.latestTurn, shell.session)) {
+          return [];
+        }
+        return [submission];
+      });
+    if (retryable.length === 0) {
+      return;
+    }
+    const nowMs = Date.now();
+    const readyRetryable = retryable.filter(
+      (submission) => outboxNextAutoRetryAtMs(submission) <= nowMs,
+    );
+    if (readyRetryable.length === 0) {
+      const nextRetryAt = Math.min(...retryable.map(outboxNextAutoRetryAtMs));
+      const retryDelayMs = Math.max(250, nextRetryAt - nowMs);
+      const timeoutId = window.setTimeout(() => {
+        setOutboxRetryClock((clock) => clock + 1);
+      }, retryDelayMs);
+      return () => window.clearTimeout(timeoutId);
+    }
+    const submission = readyRetryable[0];
+    if (!submission) {
+      return;
+    }
+
+    outboxAutoDrainInFlightRef.current = true;
+    void (async () => {
+      try {
+        const latest = messageOutboxRef.current.submissions.find(
+          (entry) => entry.messageId === submission.messageId,
+        );
+        if (latest !== undefined && latest.status === "pending") {
+          await executeOutboxSubmission(latest);
+        }
+      } finally {
+        outboxAutoDrainInFlightRef.current = false;
+      }
+    })();
+  }, [
+    activeThread,
+    environmentById,
+    executeOutboxSubmission,
+    isSendBusy,
+    messageOutbox,
+    outboxRetryClock,
+    phase,
+    serverThreadShellByKey,
+  ]);
 
   const focusComposer = useCallback(() => {
     composerRef.current?.focusAtEnd();
@@ -3115,18 +3906,14 @@ function ChatViewContent(props: ChatViewProps) {
     [togglePreviewPanel],
   );
   const persistThreadSettingsForNextTurn = useCallback(
-    async (input: {
-      threadId: ThreadId;
-      createdAt: string;
-      modelSelection?: ModelSelection;
-      runtimeMode: RuntimeMode;
-      interactionMode: ProviderInteractionMode;
-    }): Promise<AtomCommandResult<void, unknown>> => {
+    async (
+      input: PersistThreadSettingsForNextTurnInput,
+    ): Promise<AtomCommandResult<PersistThreadSettingsForNextTurnSuccess, unknown>> => {
       if (!serverThread) {
-        return AsyncResult.success(undefined);
+        return AsyncResult.success({ sequence: null });
       }
 
-      let result: AtomCommandResult<void, unknown> = AsyncResult.success(undefined);
+      let latestSequence: number | null = null;
       if (
         input.modelSelection !== undefined &&
         (input.modelSelection.model !== serverThread.modelSelection.model ||
@@ -3134,52 +3921,49 @@ function ChatViewContent(props: ChatViewProps) {
           JSON.stringify(input.modelSelection.options ?? null) !==
             JSON.stringify(serverThread.modelSelection.options ?? null))
       ) {
-        result = mapAtomCommandResult(
-          await updateThreadMetadata({
-            environmentId,
-            input: {
-              threadId: input.threadId,
-              modelSelection: input.modelSelection,
-            },
-          }),
-          () => undefined,
-        );
+        const result = await updateThreadMetadata({
+          environmentId,
+          input: {
+            threadId: input.threadId,
+            modelSelection: input.modelSelection,
+          },
+        });
         if (result._tag === "Failure") {
           return result;
         }
+        latestSequence = result.value.sequence;
       }
 
       if (input.runtimeMode !== serverThread.runtimeMode) {
-        result = mapAtomCommandResult(
-          await setThreadRuntimeMode({
-            environmentId,
-            input: {
-              threadId: input.threadId,
-              runtimeMode: input.runtimeMode,
-              createdAt: input.createdAt,
-            },
-          }),
-          () => undefined,
-        );
+        const result = await setThreadRuntimeMode({
+          environmentId,
+          input: {
+            threadId: input.threadId,
+            runtimeMode: input.runtimeMode,
+            createdAt: input.createdAt,
+          },
+        });
         if (result._tag === "Failure") {
           return result;
         }
+        latestSequence = result.value.sequence;
       }
 
       if (input.interactionMode !== serverThread.interactionMode) {
-        result = mapAtomCommandResult(
-          await setThreadInteractionMode({
-            environmentId,
-            input: {
-              threadId: input.threadId,
-              interactionMode: input.interactionMode,
-              createdAt: input.createdAt,
-            },
-          }),
-          () => undefined,
-        );
+        const result = await setThreadInteractionMode({
+          environmentId,
+          input: {
+            threadId: input.threadId,
+            interactionMode: input.interactionMode,
+            createdAt: input.createdAt,
+          },
+        });
+        if (result._tag === "Failure") {
+          return result;
+        }
+        latestSequence = result.value.sequence;
       }
-      return result;
+      return AsyncResult.success({ sequence: latestSequence });
     },
     [
       environmentId,
@@ -3189,6 +3973,7 @@ function ChatViewContent(props: ChatViewProps) {
       updateThreadMetadata,
     ],
   );
+  persistThreadSettingsForNextTurnRef.current = persistThreadSettingsForNextTurn;
 
   // Debounce *showing* the scroll-to-bottom pill so it doesn't flash during
   // thread switches. LegendList fires scroll events with isAtEnd=false while
@@ -3591,13 +4376,13 @@ function ChatViewContent(props: ChatViewProps) {
   useEffect(() => {
     setOptimisticUserMessages((existing) => {
       for (const message of existing) {
-        revokeUserMessagePreviewUrls(message);
+        revokeOptimisticMessageIfNotOutboxed(message);
       }
       return [];
     });
     resetLocalDispatch();
     setExpandedImage(null);
-  }, [draftId, resetLocalDispatch, threadId]);
+  }, [draftId, resetLocalDispatch, revokeOptimisticMessageIfNotOutboxed, threadId]);
 
   const closeExpandedImage = useCallback(() => {
     setExpandedImage(null);
@@ -3633,6 +4418,27 @@ function ChatViewContent(props: ChatViewProps) {
     requestedEnvMode: envMode,
     isGitRepo,
   });
+  const activeThreadHasSessionOnlyOutbox = activeThread
+    ? messageOutboxHasSessionOnlySubmissionForThread(
+        messageOutbox,
+        activeThread.environmentId,
+        activeThread.id,
+      )
+    : false;
+  const nextSendWouldAttachBootstrap = Boolean(
+    activeThread &&
+    (isLocalDraftThread ||
+      (activeThread.messages.length === 0 &&
+        sendEnvMode === "worktree" &&
+        !activeThread.worktreePath)),
+  );
+  const sessionOnlyDisconnectedSendReason = activeEnvironmentUnavailable
+    ? nextSendWouldAttachBootstrap
+      ? "thread-setup"
+      : activeThreadHasSessionOnlyOutbox
+        ? "dependent"
+        : null
+    : null;
 
   useEffect(() => {
     setPendingServerThreadEnvMode(null);
@@ -3918,14 +4724,7 @@ function ChatViewContent(props: ChatViewProps) {
 
   const onSend = async (e?: { preventDefault: () => void }) => {
     e?.preventDefault();
-    if (
-      !activeThread ||
-      isSendBusy ||
-      isConnecting ||
-      activeEnvironmentUnavailable ||
-      sendInFlightRef.current
-    )
-      return;
+    if (!activeThread || isSendBusy || isConnecting || sendInFlightRef.current) return;
     if (activePendingProgress) {
       onAdvanceActivePendingUserInput();
       return;
@@ -4020,6 +4819,31 @@ function ChatViewContent(props: ChatViewProps) {
       setThreadError(threadIdForSend, "Select a base branch before sending in New worktree mode.");
       return;
     }
+    const existingOutboxBeforeSend = messageOutboxRef.current;
+    const hasPriorOutboxForThread = messageOutboxHasSubmissionForThread(
+      existingOutboxBeforeSend,
+      environmentId,
+      threadIdForSend,
+    );
+    const hasPriorSessionOnlyOutboxForThread = messageOutboxHasSessionOnlySubmissionForThread(
+      existingOutboxBeforeSend,
+      environmentId,
+      threadIdForSend,
+    );
+    const hasOutboxBarrierForThread = outboxThreadDrainBarriersRef.current.has(
+      outboxThreadKey(environmentId, threadIdForSend),
+    );
+    const shouldQueueInitialSend =
+      activeEnvironmentUnavailable || hasPriorOutboxForThread || hasOutboxBarrierForThread;
+    const shouldAttachBootstrap =
+      (isLocalDraftThread || baseBranchForWorktree) &&
+      !hasPriorOutboxForThread &&
+      !hasOutboxBarrierForThread &&
+      !messageOutboxHasBootstrapSubmissionForThread(
+        existingOutboxBeforeSend,
+        environmentId,
+        threadIdForSend,
+      );
 
     sendInFlightRef.current = true;
     beginLocalDispatch({ preparingWorktree: Boolean(baseBranchForWorktree) });
@@ -4042,6 +4866,7 @@ function ChatViewContent(props: ChatViewProps) {
       composerReviewCommentsSnapshot,
     );
     const messageIdForSend = newMessageId();
+    const commandIdForSend = clientTurnCommandId(messageIdForSend);
     const messageCreatedAt = new Date().toISOString();
     const outgoingMessageText = formatOutgoingPrompt({
       provider: ctxSelectedProvider,
@@ -4092,6 +4917,8 @@ function ChatViewContent(props: ChatViewProps) {
         createdAt: messageCreatedAt,
         updatedAt: messageCreatedAt,
         streaming: false,
+        deliveryStatus: shouldQueueInitialSend ? "queued" : "sending",
+        deliveryError: null,
       },
     ]);
     setThreadError(threadIdForSend, null);
@@ -4138,139 +4965,212 @@ function ChatViewContent(props: ChatViewProps) {
       ctxSelectedModelSelection.options,
     );
 
-    let failure: AtomCommandResult<unknown, unknown> | null = null;
-    // Auto-title from first message
-    if (isFirstMessage && isServerThread) {
-      const titleResult = await updateThreadMetadata({
-        environmentId,
-        input: {
-          threadId: threadIdForSend,
-          title,
-        },
-      });
-      if (titleResult._tag === "Failure") {
-        failure = titleResult;
-      }
-    }
-
-    if (failure === null && isServerThread) {
-      const settingsResult = await persistThreadSettingsForNextTurn({
-        threadId: threadIdForSend,
-        createdAt: messageCreatedAt,
-        ...(ctxSelectedModel ? { modelSelection: ctxSelectedModelSelection } : {}),
-        runtimeMode,
-        interactionMode,
-      });
-      if (settingsResult._tag === "Failure") {
-        failure = settingsResult;
-      }
-    }
-
     const turnAttachmentsResult = await settlePromise(() => turnAttachmentsPromise);
-    if (failure === null && turnAttachmentsResult._tag === "Failure") {
-      failure = turnAttachmentsResult;
+    if (turnAttachmentsResult._tag === "Failure") {
+      setOptimisticUserMessages((existing) => {
+        const removed = existing.filter((message) => message.id === messageIdForSend);
+        for (const message of removed) {
+          revokeUserMessagePreviewUrls(message);
+        }
+        const next = existing.filter((message) => message.id !== messageIdForSend);
+        return next.length === existing.length ? existing : next;
+      });
+      promptRef.current = promptForSend;
+      const retryComposerImages = composerImagesSnapshot.map(cloneComposerImageForRetry);
+      composerImagesRef.current = retryComposerImages;
+      composerTerminalContextsRef.current = composerTerminalContextsSnapshot;
+      composerElementContextsRef.current = composerElementContextsSnapshot;
+      setComposerDraftPrompt(composerDraftTarget, promptForSend);
+      addComposerDraftImages(composerDraftTarget, retryComposerImages);
+      setComposerDraftTerminalContexts(composerDraftTarget, composerTerminalContextsSnapshot);
+      setComposerDraftElementContexts(composerDraftTarget, composerElementContextsSnapshot);
+      setComposerDraftPreviewAnnotations(composerDraftTarget, composerPreviewAnnotationsSnapshot);
+      setComposerDraftReviewComments(composerDraftTarget, composerReviewCommentsSnapshot);
+      composerRef.current?.resetCursorState({
+        cursor: collapseExpandedComposerCursor(promptForSend, promptForSend.length),
+        prompt: promptForSend,
+        detectTrigger: true,
+      });
+      const error = squashAtomCommandFailure(turnAttachmentsResult);
+      setThreadError(
+        threadIdForSend,
+        error instanceof Error ? error.message : "Failed to read message attachments.",
+      );
+      sendInFlightRef.current = false;
+      resetLocalDispatch();
+      return;
     }
 
+    const bootstrap = shouldAttachBootstrap
+      ? {
+          ...(isLocalDraftThread
+            ? {
+                createThread: {
+                  projectId: activeProject.id,
+                  title,
+                  modelSelection: threadCreateModelSelection,
+                  runtimeMode,
+                  interactionMode,
+                  branch: activeThreadBranch,
+                  worktreePath: activeThread.worktreePath,
+                  createdAt: activeThread.createdAt,
+                },
+              }
+            : {}),
+          ...(baseBranchForWorktree
+            ? {
+                prepareWorktree: {
+                  projectCwd: activeProject.workspaceRoot,
+                  baseBranch: baseBranchForWorktree,
+                  branch: buildTemporaryWorktreeBranchName(randomHex),
+                  ...(startFromOrigin ? { startFromOrigin: true } : {}),
+                },
+                runSetupScript: true,
+              }
+            : {}),
+        }
+      : undefined;
+    const durableOptimisticAttachments: NonNullable<ChatMessage["attachments"]> =
+      turnAttachmentsResult.value.map((attachment, index) => ({
+        type: "image" as const,
+        id: optimisticAttachments[index]?.id ?? `${messageIdForSend}:${index}`,
+        name: attachment.name,
+        mimeType: attachment.mimeType,
+        sizeBytes: attachment.sizeBytes,
+        previewUrl: optimisticAttachments[index]?.previewUrl ?? attachment.dataUrl,
+      }));
+    const startTurnInput = {
+      commandId: commandIdForSend,
+      threadId: threadIdForSend,
+      message: {
+        messageId: messageIdForSend,
+        role: "user" as const,
+        text: outgoingMessageText,
+        attachments: turnAttachmentsResult.value,
+      },
+      modelSelection: ctxSelectedModelSelection,
+      titleSeed: title,
+      runtimeMode,
+      interactionMode,
+      ...(bootstrap ? { bootstrap } : {}),
+      createdAt: messageCreatedAt,
+    };
+    const initialOutboxHasBootstrap = bootstrap !== undefined;
+    const initialOutboxIsDurable =
+      !initialOutboxHasBootstrap &&
+      startTurnInput.message.attachments.length === 0 &&
+      !hasPriorSessionOnlyOutboxForThread;
+    const initialOutboxSessionOnlyNotice = initialOutboxHasBootstrap
+      ? BOOTSTRAP_OUTBOX_NOTICE
+      : startTurnInput.message.attachments.length > 0
+        ? NON_DURABLE_ATTACHMENT_OUTBOX_NOTICE
+        : DEPENDENT_SESSION_ONLY_OUTBOX_NOTICE;
+    const initialOutboxSubmission: MessageOutboxSubmission = {
+      environmentId,
+      threadId: threadIdForSend,
+      messageId: messageIdForSend,
+      commandId: commandIdForSend,
+      input: startTurnInput,
+      optimisticAttachments: durableOptimisticAttachments,
+      durable: initialOutboxIsDurable,
+      status: shouldQueueInitialSend ? "pending" : "sending",
+      attempts: shouldQueueInitialSend ? 0 : 1,
+      error:
+        shouldQueueInitialSend && !initialOutboxIsDurable ? initialOutboxSessionOnlyNotice : null,
+      createdAt: messageCreatedAt,
+      updatedAt: new Date().toISOString(),
+    };
+    updateMessageOutbox((document) => upsertOutboxSubmission(document, initialOutboxSubmission));
+    updateOptimisticOutboxState(initialOutboxSubmission);
+
+    let failure: AtomCommandResult<unknown, unknown> | null = null;
     let turnStartSucceeded = false;
-    if (failure === null && turnAttachmentsResult._tag === "Success") {
-      const bootstrap =
-        isLocalDraftThread || baseBranchForWorktree
-          ? {
-              ...(isLocalDraftThread
-                ? {
-                    createThread: {
-                      projectId: activeProject.id,
-                      title,
-                      modelSelection: threadCreateModelSelection,
-                      runtimeMode,
-                      interactionMode,
-                      branch: activeThreadBranch,
-                      worktreePath: activeThread.worktreePath,
-                      createdAt: activeThread.createdAt,
-                    },
-                  }
-                : {}),
-              ...(baseBranchForWorktree
-                ? {
-                    prepareWorktree: {
-                      projectCwd: activeProject.workspaceRoot,
-                      baseBranch: baseBranchForWorktree,
-                      branch: buildTemporaryWorktreeBranchName(randomHex),
-                      ...(startFromOrigin ? { startFromOrigin: true } : {}),
-                    },
-                    runSetupScript: true,
-                  }
-                : {}),
-            }
-          : undefined;
-      beginLocalDispatch({ preparingWorktree: false });
-      const startResult = await startThreadTurn({
-        environmentId,
-        input: {
-          threadId: threadIdForSend,
-          message: {
-            messageId: messageIdForSend,
-            role: "user",
-            text: outgoingMessageText,
-            attachments: turnAttachmentsResult.value,
+    let turnStartAttempted = false;
+    if (shouldQueueInitialSend) {
+      resetLocalDispatch();
+    } else {
+      // Auto-title from first message
+      if (isFirstMessage && isServerThread) {
+        const titleResult = await updateThreadMetadata({
+          environmentId,
+          input: {
+            threadId: threadIdForSend,
+            title,
           },
-          modelSelection: ctxSelectedModelSelection,
-          titleSeed: title,
+        });
+        if (titleResult._tag === "Failure") {
+          failure = titleResult;
+        }
+      }
+
+      if (failure === null && isServerThread) {
+        const settingsResult = await persistThreadSettingsForNextTurn({
+          threadId: threadIdForSend,
+          createdAt: messageCreatedAt,
+          ...(ctxSelectedModel ? { modelSelection: ctxSelectedModelSelection } : {}),
           runtimeMode,
           interactionMode,
-          ...(bootstrap ? { bootstrap } : {}),
-          createdAt: messageCreatedAt,
-        },
-      });
-      if (startResult._tag === "Failure") {
-        failure = startResult;
-      } else {
-        turnStartSucceeded = true;
+        });
+        if (settingsResult._tag === "Failure") {
+          failure = settingsResult;
+        }
+      }
+
+      beginLocalDispatch({ preparingWorktree: false });
+      if (failure === null) {
+        turnStartAttempted = true;
+        const startResult = await startThreadTurn({
+          environmentId,
+          input: startTurnInput,
+        });
+        if (startResult._tag === "Failure") {
+          failure = startResult;
+        } else {
+          turnStartSucceeded = true;
+          updateMessageOutbox((document) => removeOutboxSubmission(document, messageIdForSend));
+          clearOptimisticDeliveryState(messageIdForSend);
+        }
       }
     }
 
     if (failure !== null) {
-      if (
-        promptRef.current.length === 0 &&
-        composerImagesRef.current.length === 0 &&
-        composerTerminalContextsRef.current.length === 0 &&
-        composerElementContextsRef.current.length === 0 &&
-        (useComposerDraftStore.getState().getComposerDraft(composerDraftTarget)?.previewAnnotations
-          .length ?? 0) === 0 &&
-        (useComposerDraftStore.getState().getComposerDraft(composerDraftTarget)?.reviewComments
-          .length ?? 0) === 0
-      ) {
-        setOptimisticUserMessages((existing) => {
-          const removed = existing.filter((message) => message.id === messageIdForSend);
-          for (const message of removed) {
-            revokeUserMessagePreviewUrls(message);
-          }
-          const next = existing.filter((message) => message.id !== messageIdForSend);
-          return next.length === existing.length ? existing : next;
-        });
-        promptRef.current = promptForSend;
-        const retryComposerImages = composerImagesSnapshot.map(cloneComposerImageForRetry);
-        composerImagesRef.current = retryComposerImages;
-        composerTerminalContextsRef.current = composerTerminalContextsSnapshot;
-        composerElementContextsRef.current = composerElementContextsSnapshot;
-        setComposerDraftPrompt(composerDraftTarget, promptForSend);
-        addComposerDraftImages(composerDraftTarget, retryComposerImages);
-        setComposerDraftTerminalContexts(composerDraftTarget, composerTerminalContextsSnapshot);
-        setComposerDraftElementContexts(composerDraftTarget, composerElementContextsSnapshot);
-        setComposerDraftPreviewAnnotations(composerDraftTarget, composerPreviewAnnotationsSnapshot);
-        setComposerDraftReviewComments(composerDraftTarget, composerReviewCommentsSnapshot);
-        composerRef.current?.resetCursorState({
-          cursor: collapseExpandedComposerCursor(promptForSend, promptForSend.length),
-          prompt: promptForSend,
-          detectTrigger: true,
-        });
-      }
-      if (!isAtomCommandInterrupted(failure)) {
-        const error = squashAtomCommandFailure(failure);
-        setThreadError(
-          threadIdForSend,
-          error instanceof Error ? error.message : "Failed to send message.",
+      const outboxFailure = formatFailureForOutbox(failure);
+      const failureState = outboxFailureState(initialOutboxSubmission, outboxFailure, {
+        turnDispatchAttempted: turnStartAttempted,
+      });
+      const failedAt = new Date().toISOString();
+      const dependentSubmissions = outboxFailureShouldDiscardLaterSubmissions(
+        initialOutboxSubmission,
+        failureState,
+      )
+        ? messageOutboxRef.current.submissions.filter((entry) =>
+            outboxSubmissionIsLaterInSameThread(entry, initialOutboxSubmission),
+          )
+        : [];
+      markOutboxSubmission(messageIdForSend, (entry) => ({
+        ...entry,
+        ...failureState,
+        updatedAt: failedAt,
+      }));
+      if (outboxFailureShouldDiscardLaterSubmissions(initialOutboxSubmission, failureState)) {
+        for (const dependent of dependentSubmissions) {
+          updateOptimisticOutboxState({
+            ...dependent,
+            status: "failed",
+            retryable: false,
+            error: DEPENDENT_UNCERTAIN_OUTBOX_NOTICE,
+            updatedAt: failedAt,
+          });
+        }
+        updateMessageOutbox((document) =>
+          dependentSubmissions.reduce(
+            (nextDocument, dependent) => removeOutboxSubmission(nextDocument, dependent.messageId),
+            document,
+          ),
         );
+      }
+      if (!outboxFailure.transport && !outboxFailure.interrupted) {
+        setThreadError(threadIdForSend, outboxFailure.message ?? "Failed to send message.");
       }
     }
     sendInFlightRef.current = false;
@@ -4451,6 +5351,15 @@ function ChatViewContent(props: ChatViewProps) {
       return;
     }
     if (activePendingProgress.isLastQuestion) {
+      if (activeEnvironmentUnavailable) {
+        setThreadError(
+          activeThread?.id ?? null,
+          activeEnvironmentUnavailableLabel
+            ? `Reconnect ${activeEnvironmentUnavailableLabel} before submitting answers.`
+            : "Reconnect this environment before submitting answers.",
+        );
+        return;
+      }
       if (activePendingResolvedAnswers) {
         void onRespondToUserInput(activePendingUserInput.requestId, activePendingResolvedAnswers);
       }
@@ -4458,10 +5367,14 @@ function ChatViewContent(props: ChatViewProps) {
     }
     setActivePendingUserInputQuestionIndex(activePendingProgress.questionIndex + 1);
   }, [
+    activeEnvironmentUnavailable,
+    activeEnvironmentUnavailableLabel,
     activePendingProgress,
     activePendingResolvedAnswers,
     activePendingUserInput,
+    activeThread?.id,
     onRespondToUserInput,
+    setThreadError,
     setActivePendingUserInputQuestionIndex,
   ]);
 
@@ -4508,7 +5421,21 @@ function ChatViewContent(props: ChatViewProps) {
       } = sendCtx;
 
       const threadIdForSend = activeThread.id;
+      const hasPriorSessionOnlyOutboxForThread = messageOutboxHasSessionOnlySubmissionForThread(
+        messageOutboxRef.current,
+        environmentId,
+        threadIdForSend,
+      );
+      const shouldQueueInitialSend =
+        activeEnvironmentUnavailable ||
+        messageOutboxHasSubmissionForThread(
+          messageOutboxRef.current,
+          environmentId,
+          threadIdForSend,
+        ) ||
+        outboxThreadDrainBarriersRef.current.has(outboxThreadKey(environmentId, threadIdForSend));
       const messageIdForSend = newMessageId();
+      const commandIdForSend = clientTurnCommandId(messageIdForSend);
       const messageCreatedAt = new Date().toISOString();
       const outgoingMessageText = formatOutgoingPrompt({
         provider: ctxSelectedProvider,
@@ -4545,8 +5472,59 @@ function ChatViewContent(props: ChatViewProps) {
           createdAt: messageCreatedAt,
           updatedAt: messageCreatedAt,
           streaming: false,
+          deliveryStatus: shouldQueueInitialSend ? "queued" : "sending",
+          deliveryError: null,
         },
       ]);
+
+      const startTurnInput = {
+        commandId: commandIdForSend,
+        threadId: threadIdForSend,
+        message: {
+          messageId: messageIdForSend,
+          role: "user" as const,
+          text: outgoingMessageText,
+          attachments: [],
+        },
+        modelSelection: ctxSelectedModelSelection,
+        titleSeed: activeThread.title,
+        runtimeMode,
+        interactionMode: nextInteractionMode,
+        ...(nextInteractionMode === "default" && activeProposedPlan
+          ? {
+              sourceProposedPlan: {
+                threadId: activeThread.id,
+                planId: activeProposedPlan.id,
+              },
+            }
+          : {}),
+        createdAt: messageCreatedAt,
+      };
+      const initialOutboxSubmission: MessageOutboxSubmission = {
+        environmentId,
+        threadId: threadIdForSend,
+        messageId: messageIdForSend,
+        commandId: commandIdForSend,
+        input: startTurnInput,
+        optimisticAttachments: [],
+        durable: !hasPriorSessionOnlyOutboxForThread,
+        status: shouldQueueInitialSend ? "pending" : "sending",
+        attempts: shouldQueueInitialSend ? 0 : 1,
+        error:
+          shouldQueueInitialSend && hasPriorSessionOnlyOutboxForThread
+            ? DEPENDENT_SESSION_ONLY_OUTBOX_NOTICE
+            : null,
+        createdAt: messageCreatedAt,
+        updatedAt: new Date().toISOString(),
+      };
+      updateMessageOutbox((document) => upsertOutboxSubmission(document, initialOutboxSubmission));
+      updateOptimisticOutboxState(initialOutboxSubmission);
+
+      if (shouldQueueInitialSend) {
+        sendInFlightRef.current = false;
+        resetLocalDispatch();
+        return;
+      }
 
       const settingsResult = await persistThreadSettingsForNextTurn({
         threadId: threadIdForSend,
@@ -4557,6 +5535,7 @@ function ChatViewContent(props: ChatViewProps) {
       });
       let failure: AtomCommandResult<unknown, unknown> | null =
         settingsResult._tag === "Failure" ? settingsResult : null;
+      let turnStartAttempted = false;
 
       if (failure === null) {
         // Keep the mode toggle and plan-follow-up banner in sync immediately
@@ -4566,30 +5545,10 @@ function ChatViewContent(props: ChatViewProps) {
           nextInteractionMode,
         );
 
+        turnStartAttempted = true;
         const startResult = await startThreadTurn({
           environmentId,
-          input: {
-            threadId: threadIdForSend,
-            message: {
-              messageId: messageIdForSend,
-              role: "user",
-              text: outgoingMessageText,
-              attachments: [],
-            },
-            modelSelection: ctxSelectedModelSelection,
-            titleSeed: activeThread.title,
-            runtimeMode,
-            interactionMode: nextInteractionMode,
-            ...(nextInteractionMode === "default" && activeProposedPlan
-              ? {
-                  sourceProposedPlan: {
-                    threadId: activeThread.id,
-                    planId: activeProposedPlan.id,
-                  },
-                }
-              : {}),
-            createdAt: messageCreatedAt,
-          },
+          input: startTurnInput,
         });
         failure = startResult._tag === "Failure" ? startResult : null;
       }
@@ -4604,19 +5563,49 @@ function ChatViewContent(props: ChatViewProps) {
             useRightPanelStore.getState().open(activeThreadRef, "plan");
           }
         }
+        updateMessageOutbox((document) => removeOutboxSubmission(document, messageIdForSend));
+        clearOptimisticDeliveryState(messageIdForSend);
         sendInFlightRef.current = false;
         return;
       }
 
-      setOptimisticUserMessages((existing) =>
-        existing.filter((message) => message.id !== messageIdForSend),
-      );
-      if (!isAtomCommandInterrupted(failure)) {
-        const error = squashAtomCommandFailure(failure);
-        setThreadError(
-          threadIdForSend,
-          error instanceof Error ? error.message : "Failed to send plan follow-up.",
+      const outboxFailure = formatFailureForOutbox(failure);
+      const failureState = outboxFailureState(initialOutboxSubmission, outboxFailure, {
+        turnDispatchAttempted: turnStartAttempted,
+      });
+      const failedAt = new Date().toISOString();
+      const dependentSubmissions = outboxFailureShouldDiscardLaterSubmissions(
+        initialOutboxSubmission,
+        failureState,
+      )
+        ? messageOutboxRef.current.submissions.filter((entry) =>
+            outboxSubmissionIsLaterInSameThread(entry, initialOutboxSubmission),
+          )
+        : [];
+      markOutboxSubmission(messageIdForSend, (entry) => ({
+        ...entry,
+        ...failureState,
+        updatedAt: failedAt,
+      }));
+      if (outboxFailureShouldDiscardLaterSubmissions(initialOutboxSubmission, failureState)) {
+        for (const dependent of dependentSubmissions) {
+          updateOptimisticOutboxState({
+            ...dependent,
+            status: "failed",
+            retryable: false,
+            error: DEPENDENT_UNCERTAIN_OUTBOX_NOTICE,
+            updatedAt: failedAt,
+          });
+        }
+        updateMessageOutbox((document) =>
+          dependentSubmissions.reduce(
+            (nextDocument, dependent) => removeOutboxSubmission(nextDocument, dependent.messageId),
+            document,
+          ),
         );
+      }
+      if (!outboxFailure.transport && !outboxFailure.interrupted) {
+        setThreadError(threadIdForSend, outboxFailure.message ?? "Failed to send plan follow-up.");
       }
       sendInFlightRef.current = false;
       resetLocalDispatch();
@@ -4624,10 +5613,13 @@ function ChatViewContent(props: ChatViewProps) {
     [
       activeThread,
       activeProposedPlan,
+      activeEnvironmentUnavailable,
       beginLocalDispatch,
+      clearOptimisticDeliveryState,
       isConnecting,
       isSendBusy,
       isServerThread,
+      markOutboxSubmission,
       persistThreadSettingsForNextTurn,
       resetLocalDispatch,
       runtimeMode,
@@ -4637,6 +5629,8 @@ function ChatViewContent(props: ChatViewProps) {
       autoOpenPlanSidebar,
       environmentId,
       composerRef,
+      updateMessageOutbox,
+      updateOptimisticOutboxState,
     ],
   );
 
@@ -4807,7 +5801,7 @@ function ChatViewContent(props: ChatViewProps) {
       }
       const reason = getStartedThreadModelChangeBlockReason({
         providers: providerStatuses,
-        hasStartedSession: activeThread.session !== null,
+        hasStartedSession: threadHasEstablishedProviderBinding(activeThread),
         currentModelSelection: activeThread.modelSelection,
         currentProviderInstanceId: activeThread.session?.providerInstanceId ?? null,
         nextModelSelection: { instanceId, model },
@@ -4862,7 +5856,7 @@ function ChatViewContent(props: ChatViewProps) {
       };
       const modelChangeBlockReason = getStartedThreadModelChangeBlockReason({
         providers: providerStatuses,
-        hasStartedSession: activeThread.session !== null,
+        hasStartedSession: threadHasEstablishedProviderBinding(activeThread),
         currentModelSelection: activeThread.modelSelection,
         currentProviderInstanceId: activeThread.session?.providerInstanceId ?? null,
         nextModelSelection,
@@ -4964,6 +5958,17 @@ function ChatViewContent(props: ChatViewProps) {
       return;
     }
     void onRevertToTurnCountRef.current(targetTurnCount);
+  }, []);
+  const executeOutboxSubmissionRef = useRef(executeOutboxSubmission);
+  executeOutboxSubmissionRef.current = executeOutboxSubmission;
+  const onRetryOutboxMessage = useCallback((messageId: MessageId) => {
+    const submission = messageOutboxRef.current.submissions.find(
+      (entry) => entry.messageId === messageId,
+    );
+    if (!submission || submission.retryable === false) {
+      return;
+    }
+    void executeOutboxSubmissionRef.current(submission, { manual: true });
   }, []);
 
   // Empty state: no active thread
@@ -5145,6 +6150,7 @@ function ChatViewContent(props: ChatViewProps) {
                 onOpenTurnDiff={onOpenTurnDiff}
                 revertTurnCountByUserMessageId={revertTurnCountByUserMessageId}
                 onRevertUserMessage={onRevertUserMessage}
+                onRetryUserMessage={onRetryOutboxMessage}
                 isRevertingCheckpoint={isRevertingCheckpoint}
                 onImageExpand={onExpandTimelineImage}
                 markdownCwd={gitCwd ?? undefined}
@@ -5214,6 +6220,7 @@ function ChatViewContent(props: ChatViewProps) {
                       isConnecting={isConnecting}
                       isSendBusy={isSendBusy}
                       isPreparingWorktree={isPreparingWorktree}
+                      sessionOnlyDisconnectedSendReason={sessionOnlyDisconnectedSendReason}
                       environmentUnavailable={activeEnvironmentUnavailableState}
                       activePendingApproval={activePendingApproval}
                       pendingApprovals={pendingApprovals}

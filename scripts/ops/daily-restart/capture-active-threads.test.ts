@@ -28,6 +28,8 @@ function makeFixtureDb(dir: string): string {
       thread_id TEXT PRIMARY KEY,
       project_id TEXT NOT NULL,
       title TEXT NOT NULL,
+      runtime_mode TEXT NOT NULL DEFAULT 'full-access',
+      interaction_mode TEXT NOT NULL DEFAULT 'default',
       deleted_at TEXT,
       archived_at TEXT
     );
@@ -36,6 +38,7 @@ function makeFixtureDb(dir: string): string {
       thread_id TEXT PRIMARY KEY,
       status TEXT NOT NULL,
       active_turn_id TEXT,
+      runtime_mode TEXT NOT NULL DEFAULT 'full-access',
       updated_at TEXT NOT NULL
     );
   `);
@@ -75,19 +78,34 @@ function insertThread(
       thread_id,
       project_id,
       title,
+      runtime_mode,
+      interaction_mode,
       deleted_at,
       archived_at
-    ) VALUES (?, 'project-1', ?, ?, ?)
-  `).run(threadId, title, deletedAt, archivedAt);
+    ) VALUES (?, 'project-1', ?, ?, ?, ?, ?)
+  `).run(
+    threadId,
+    title,
+    threadId === "waiting" ? "approval-required" : "full-access",
+    threadId === "waiting" ? "plan" : "default",
+    deletedAt,
+    archivedAt,
+  );
 
   db.prepare(`
     INSERT INTO projection_thread_sessions (
       thread_id,
       status,
       active_turn_id,
+      runtime_mode,
       updated_at
-    ) VALUES (?, ?, ?, '2026-07-03T00:00:00.000Z')
-  `).run(threadId, status, activeTurnId);
+    ) VALUES (?, ?, ?, ?, '2026-07-03T00:00:00.000Z')
+  `).run(
+    threadId,
+    status,
+    activeTurnId,
+    threadId === "active-turn" ? "approval-required" : "full-access",
+  );
 }
 
 function readManifest(outPath: string): CaptureManifest {
@@ -125,6 +143,8 @@ describe("capture-active-threads", () => {
           role: "active",
           status: "running",
           active_turn_id: "turn-1",
+          runtime_mode: "approval-required",
+          interaction_mode: "default",
           title: "Active Turn",
           project_id: "project-1",
           injected_at: null,
@@ -134,6 +154,8 @@ describe("capture-active-threads", () => {
           role: "active",
           status: "running",
           active_turn_id: null,
+          runtime_mode: "full-access",
+          interaction_mode: "default",
           title: "Running No Turn",
           project_id: "project-1",
           injected_at: null,
@@ -143,6 +165,8 @@ describe("capture-active-threads", () => {
           role: "active",
           status: "starting",
           active_turn_id: null,
+          runtime_mode: "full-access",
+          interaction_mode: "default",
           title: "Starting No Turn",
           project_id: "project-1",
           injected_at: null,
@@ -152,6 +176,8 @@ describe("capture-active-threads", () => {
           role: "waiting",
           status: "waiting",
           active_turn_id: null,
+          runtime_mode: "full-access",
+          interaction_mode: "plan",
           title: "Waiting Parent",
           project_id: "project-1",
           injected_at: null,

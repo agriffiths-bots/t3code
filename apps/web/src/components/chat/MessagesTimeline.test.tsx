@@ -181,6 +181,7 @@ function buildProps() {
     onOpenTurnDiff: () => {},
     revertTurnCountByUserMessageId: new Map(),
     onRevertUserMessage: () => {},
+    onRetryUserMessage: () => {},
     isRevertingCheckpoint: false,
     onImageExpand: () => {},
     activeThreadEnvironmentId: ACTIVE_THREAD_ENVIRONMENT_ID,
@@ -306,6 +307,51 @@ describe("MessagesTimeline", () => {
     expect(onAnchorReady).toHaveBeenCalledWith(secondEntry.message.id, 1);
     expect(onAnchorSizeChanged).toHaveBeenCalledWith(secondEntry.message.id, 240);
   }, 30_000);
+
+  it("renders delivery error copy for failed optimistic user messages", async () => {
+    const { MessagesTimeline } = await import("./MessagesTimeline");
+    const entry = {
+      ...buildUserTimelineEntry("Image prompt."),
+      message: {
+        ...buildUserTimelineEntry("Image prompt.").message,
+        deliveryStatus: "failed" as const,
+        deliveryError:
+          "Attached images will retry while this app stays open. Reconnect before closing or reloading.",
+      },
+    };
+
+    const markup = renderToStaticMarkup(
+      <MessagesTimeline {...buildProps()} timelineEntries={[entry]} />,
+    );
+
+    expect(markup).toContain(
+      "Attached images will retry while this app stays open. Reconnect before closing or reloading.",
+    );
+    expect(markup).toContain("Failed");
+    expect(markup).toContain("Retry");
+  });
+
+  it("hides retry controls for nonretryable failed optimistic user messages", async () => {
+    const { MessagesTimeline } = await import("./MessagesTimeline");
+    const entry = {
+      ...buildUserTimelineEntry("Thread setup prompt."),
+      message: {
+        ...buildUserTimelineEntry("Thread setup prompt.").message,
+        deliveryStatus: "failed" as const,
+        deliveryError:
+          "Connection dropped while preparing this send. Check whether it already started before sending again.",
+        deliveryRetryable: false,
+      },
+    };
+
+    const markup = renderToStaticMarkup(
+      <MessagesTimeline {...buildProps()} timelineEntries={[entry]} />,
+    );
+
+    expect(markup).toContain("Check whether it already started before sending again.");
+    expect(markup).toContain("Failed");
+    expect(markup).not.toContain("Retry");
+  });
 
   it("renders collapse controls for long user messages", async () => {
     const { MessagesTimeline } = await import("./MessagesTimeline");
