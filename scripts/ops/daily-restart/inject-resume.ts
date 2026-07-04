@@ -5,6 +5,7 @@
 import * as NodeCrypto from "node:crypto";
 import * as NodeFSP from "node:fs/promises";
 import * as NodePath from "node:path";
+import * as NodeTimersPromises from "node:timers/promises";
 
 export const RESUME_MESSAGE =
   "Continue after restart: the T3 server completed its scheduled daily restart/update. Your previous turn may have been interrupted mid-work. Re-read your task brief and ledger memo, reconcile actual state (files, PRs, processes) against your plan, and continue from where you left off. If you had already finished, verify your memo is written and settle.";
@@ -32,6 +33,9 @@ export interface InjectResumeOptions {
   readonly dryRun: boolean;
   readonly now?: () => Date;
   readonly fetchImpl?: typeof fetch;
+  readonly sleep?: (ms: number) => Promise<void>;
+  readonly random?: () => number;
+  readonly dispatchAttemptTimeoutMs?: number;
 }
 
 export interface InjectResumeResult {
@@ -40,6 +44,12 @@ export interface InjectResumeResult {
   readonly failed: number;
   readonly failures: Array<{ readonly threadId: string; readonly error: string }>;
 }
+
+const MAX_DISPATCH_ATTEMPTS = 5;
+const DISPATCH_RETRY_BASE_MS = 4_000;
+const DISPATCH_RETRY_JITTER = 0.2;
+const DISPATCH_RETRY_SLEEP_BUDGET_MS = 60_000;
+const DISPATCH_ATTEMPT_TIMEOUT_MS = 10_000;
 
 function usage(): string {
   return `usage: inject-resume --manifest FILE [--origin URL] [--token TOKEN] [--dry-run]
@@ -127,7 +137,7 @@ async function writeManifestAtomic(path: string, manifest: ResumeManifest): Prom
 }
 
 function stableDispatchId(
-  kind: "command" | "message",
+  kind: "interaction-mode" | "command" | "message",
   manifest: ResumeManifest,
   threadId: string,
 ): string {
@@ -138,24 +148,167 @@ function stableDispatchId(
   return `daily-restart-resume-${kind}-${digest}`;
 }
 
-async function postResumeTurn(
+class DispatchHttpError extends Error {
+  readonly status: number;
+  readonly body: string;
+  readonly retryAfterMs: number | null;
+
+  constructor(status: number, body: string, retryAfterMs: number | null) {
+    super(`HTTP ${status}${body ? ` ${body}` : ""}`);
+    this.status = status;
+    this.body = body;
+    this.retryAfterMs = retryAfterMs;
+  }
+}
+
+function parseRetryAfter(value: string | null): number | null {
+  if (!value) return null;
+  const seconds = Number(value);
+  if (Number.isFinite(seconds) && seconds >= 0) return seconds * 1_000;
+
+  const timestamp = Date.parse(value);
+  if (Number.isNaN(timestamp)) return null;
+  return Math.max(0, timestamp - Date.now());
+}
+
+function isTransientDispatchError(error: unknown): boolean {
+  if (error instanceof DispatchHttpError) {
+    return error.status === 429 || error.status >= 500;
+  }
+
+  if (error instanceof TypeError) return true;
+  if (!isRecord(error)) return false;
+
+  if (error.name === "AbortError") return true;
+
+  const code = error.code;
+  if (code === "ECONNREFUSED" || code === "ECONNRESET" || code === "ETIMEDOUT") return true;
+
+  const cause = error.cause;
+  return isRecord(cause) && isTransientDispatchError(cause);
+}
+
+function dispatchRetryDelayMs(attemptIndex: number, error: unknown, random: () => number): number {
+  const retryAfterMs = error instanceof DispatchHttpError ? error.retryAfterMs : null;
+  const exponentialMs = DISPATCH_RETRY_BASE_MS * 2 ** attemptIndex;
+  const jitter = 1 + (random() * 2 - 1) * DISPATCH_RETRY_JITTER;
+  const backoffMs = Math.round(exponentialMs * jitter);
+  return Math.max(retryAfterMs ?? 0, backoffMs);
+}
+
+function sleep(ms: number): Promise<void> {
+  return NodeTimersPromises.setTimeout(ms);
+}
+
+function clampDelayToBudget(delayMs: number, remainingSleepBudgetMs: number): number {
+  return Math.max(0, Math.min(delayMs, remainingSleepBudgetMs));
+}
+
+async function postDispatchCommand(
   fetchImpl: typeof fetch,
   origin: string,
   token: string,
-  threadId: string,
-  commandId: string,
-  messageId: string,
-  createdAt: string,
+  command: Record<string, unknown>,
+  attemptTimeoutMs: number,
 ): Promise<void> {
-  const response = await fetchImpl(new URL("/api/orchestration/dispatch", origin), {
-    method: "POST",
-    headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
-    body: JSON.stringify({
+  const controller = new AbortController();
+  const timeout = NodeTimersPromises.setTimeout(attemptTimeoutMs, undefined, {
+    signal: controller.signal,
+  })
+    .then(() => controller.abort())
+    .catch(() => undefined);
+
+  try {
+    const response = await fetchImpl(new URL("/api/orchestration/dispatch", origin), {
+      method: "POST",
+      headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+      body: JSON.stringify(command),
+      signal: controller.signal,
+    });
+
+    if (!response.ok) {
+      const body = await response.text().catch(() => "");
+      throw new DispatchHttpError(
+        response.status,
+        body,
+        parseRetryAfter(response.headers.get("retry-after")),
+      );
+    }
+  } finally {
+    controller.abort();
+    await timeout;
+  }
+}
+
+async function postDispatchCommandWithRetry(
+  fetchImpl: typeof fetch,
+  origin: string,
+  token: string,
+  command: Record<string, unknown>,
+  attemptTimeoutMs: number,
+  sleepImpl: (ms: number) => Promise<void>,
+  random: () => number,
+): Promise<void> {
+  let lastError: unknown;
+  let remainingSleepBudgetMs = DISPATCH_RETRY_SLEEP_BUDGET_MS;
+  for (let attempt = 0; attempt < MAX_DISPATCH_ATTEMPTS; attempt += 1) {
+    try {
+      await postDispatchCommand(fetchImpl, origin, token, command, attemptTimeoutMs);
+      return;
+    } catch (error) {
+      lastError = error;
+      if (!isTransientDispatchError(error) || attempt === MAX_DISPATCH_ATTEMPTS - 1) {
+        throw error;
+      }
+      const delayMs = clampDelayToBudget(
+        dispatchRetryDelayMs(attempt, error, random),
+        remainingSleepBudgetMs,
+      );
+      remainingSleepBudgetMs -= delayMs;
+      await sleepImpl(delayMs);
+    }
+  }
+
+  throw lastError;
+}
+
+async function dispatchResumeCommands(
+  fetchImpl: typeof fetch,
+  origin: string,
+  token: string,
+  manifest: ResumeManifest,
+  threadId: string,
+  createdAt: string,
+  attemptTimeoutMs: number,
+  sleepImpl: (ms: number) => Promise<void>,
+  random: () => number,
+): Promise<void> {
+  await postDispatchCommandWithRetry(
+    fetchImpl,
+    origin,
+    token,
+    {
+      type: "thread.interaction-mode.set",
+      commandId: stableDispatchId("interaction-mode", manifest, threadId),
+      threadId,
+      interactionMode: "default",
+      createdAt,
+    },
+    attemptTimeoutMs,
+    sleepImpl,
+    random,
+  );
+
+  await postDispatchCommandWithRetry(
+    fetchImpl,
+    origin,
+    token,
+    {
       type: "thread.turn.start",
-      commandId,
+      commandId: stableDispatchId("command", manifest, threadId),
       threadId,
       message: {
-        messageId,
+        messageId: stableDispatchId("message", manifest, threadId),
         role: "user",
         text: RESUME_MESSAGE,
         attachments: [],
@@ -163,19 +316,20 @@ async function postResumeTurn(
       runtimeMode: "full-access",
       interactionMode: "default",
       createdAt,
-    }),
-  });
-
-  if (!response.ok) {
-    const body = await response.text().catch(() => "");
-    throw new Error(`HTTP ${response.status}${body ? ` ${body}` : ""}`);
-  }
+    },
+    attemptTimeoutMs,
+    sleepImpl,
+    random,
+  );
 }
 
 export async function injectResume(options: InjectResumeOptions): Promise<InjectResumeResult> {
   const manifest = await readManifest(options.manifestPath);
   const fetchImpl = options.fetchImpl ?? fetch;
   const now = options.now ?? (() => new Date());
+  const sleepImpl = options.sleep ?? sleep;
+  const random = options.random ?? Math.random;
+  const dispatchAttemptTimeoutMs = options.dispatchAttemptTimeoutMs ?? DISPATCH_ATTEMPT_TIMEOUT_MS;
   const failures: Array<{ threadId: string; error: string }> = [];
   let injected = 0;
   let skipped = 0;
@@ -195,14 +349,16 @@ export async function injectResume(options: InjectResumeOptions): Promise<Inject
     try {
       const token = options.token;
       if (!token) throw new Error("missing bearer token");
-      await postResumeTurn(
+      await dispatchResumeCommands(
         fetchImpl,
         options.origin,
         token,
+        manifest,
         thread.thread_id,
-        stableDispatchId("command", manifest, thread.thread_id),
-        stableDispatchId("message", manifest, thread.thread_id),
         injectedAt,
+        dispatchAttemptTimeoutMs,
+        sleepImpl,
+        random,
       );
       thread.injected_at = injectedAt;
       await writeManifestAtomic(options.manifestPath, manifest);

@@ -46,7 +46,7 @@ describe("inject-resume", () => {
     );
   });
 
-  it("injects active null entries once, skips waiting/already-injected entries, and retries failures", async () => {
+  it("injects active null entries once and skips waiting/already-injected entries", async () => {
     const manifestPath = await writeManifest([
       { thread_id: "active-ok", role: "active", status: "running", injected_at: null },
       { thread_id: "waiting", role: "waiting", status: "waiting", injected_at: null },
@@ -56,10 +56,8 @@ describe("inject-resume", () => {
         status: "running",
         injected_at: "2026-07-03T12:30:00.000Z",
       },
-      { thread_id: "active-fail", role: "active", status: "running", injected_at: null },
     ]);
     const requests: Array<any> = [];
-    let failActiveFail = true;
     const options = {
       manifestPath,
       origin: "http://127.0.0.1:1",
@@ -69,41 +67,250 @@ describe("inject-resume", () => {
       fetchImpl: async (_url: string | URL | Request, init?: RequestInit) => {
         const body = JSON.parse(String(init?.body));
         requests.push(body);
-        if (body.threadId === "active-fail" && failActiveFail) {
-          return new Response("nope", { status: 500 });
-        }
         return new Response("{}", { status: 200 });
       },
     };
 
-    const first = await injectResume(options);
-    assert.equal(first.injected, 1);
-    assert.equal(first.skipped, 2);
-    assert.equal(first.failed, 1);
-    assert.equal(first.failures[0]?.threadId, "active-fail");
-    assert.equal(requests[0]?.type, "thread.turn.start");
+    const result = await injectResume(options);
+    assert.deepEqual(result, { injected: 1, skipped: 2, failed: 0, failures: [] });
+    assert.equal(requests[0]?.type, "thread.interaction-mode.set");
     assert.equal(requests[0]?.threadId, "active-ok");
-    assert.equal(requests[0]?.message.role, "user");
-    assert.equal(requests[0]?.message.text, RESUME_MESSAGE);
-    assert.deepEqual(requests[0]?.message.attachments, []);
+    assert.equal(requests[0]?.interactionMode, "default");
+    assert.equal(requests[1]?.type, "thread.turn.start");
+    assert.equal(requests[1]?.threadId, "active-ok");
+    assert.equal(requests[1]?.message.role, "user");
+    assert.equal(requests[1]?.message.text, RESUME_MESSAGE);
+    assert.deepEqual(requests[1]?.message.attachments, []);
 
-    let manifest = await readManifest(manifestPath);
+    const manifest = await readManifest(manifestPath);
     assert.equal(manifest.threads[0].injected_at, "2026-07-03T13:00:00.000Z");
     assert.equal(manifest.threads[1].injected_at, null);
     assert.equal(manifest.threads[2].injected_at, "2026-07-03T12:30:00.000Z");
-    assert.equal(manifest.threads[3].injected_at, null);
+  });
 
-    failActiveFail = false;
-    const second = await injectResume(options);
-    assert.deepEqual(second, { injected: 1, skipped: 3, failed: 0, failures: [] });
+  it("retries transient dispatch failures and records one injection after success", async () => {
+    const manifestPath = await writeManifest([
+      { thread_id: "active-retry", role: "active", status: "running", injected_at: null },
+    ]);
+    const requests: Array<any> = [];
+    const delays: Array<number> = [];
+    const result = await injectResume({
+      manifestPath,
+      origin: "http://127.0.0.1:1",
+      token: "test-token",
+      dryRun: false,
+      now: () => new Date("2026-07-03T13:00:00.000Z"),
+      fetchImpl: async (_url: string | URL | Request, init?: RequestInit) => {
+        const body = JSON.parse(String(init?.body));
+        requests.push(body);
+        if (body.type === "thread.turn.start" && requests.length === 2) {
+          return new Response("warming", { status: 503 });
+        }
+        if (body.type === "thread.turn.start" && requests.length === 3) {
+          return new Response("slow", { status: 429 });
+        }
+        return new Response("{}", { status: 200 });
+      },
+      sleep: async (ms) => {
+        delays.push(ms);
+      },
+      random: () => 0.5,
+    });
+
+    assert.deepEqual(result, { injected: 1, skipped: 0, failed: 0, failures: [] });
     assert.deepEqual(
-      requests.map((request) => request.threadId),
-      ["active-ok", "active-fail", "active-fail"],
+      requests.map((request) => request.type),
+      [
+        "thread.interaction-mode.set",
+        "thread.turn.start",
+        "thread.turn.start",
+        "thread.turn.start",
+      ],
     );
-    assert.equal(requests[1]?.commandId, requests[2]?.commandId);
-    assert.equal(requests[1]?.message.messageId, requests[2]?.message.messageId);
-    manifest = await readManifest(manifestPath);
-    assert.equal(manifest.threads[3].injected_at, "2026-07-03T13:00:00.000Z");
+    assert.deepEqual(delays, [4_000, 8_000]);
+    const turnRequests = requests.filter((request) => request.type === "thread.turn.start");
+    assert.equal(new Set(turnRequests.map((request) => request.commandId)).size, 1);
+    assert.equal(new Set(turnRequests.map((request) => request.message.messageId)).size, 1);
+
+    const manifest = await readManifest(manifestPath);
+    assert.equal(manifest.threads[0].injected_at, "2026-07-03T13:00:00.000Z");
+  });
+
+  it("honors Retry-After for transient rate limits", async () => {
+    const manifestPath = await writeManifest([
+      { thread_id: "active-rate-limit", role: "active", status: "running", injected_at: null },
+    ]);
+    const delays: Array<number> = [];
+
+    const result = await injectResume({
+      manifestPath,
+      origin: "http://127.0.0.1:1",
+      token: "test-token",
+      dryRun: false,
+      now: () => new Date("2026-07-03T13:00:00.000Z"),
+      fetchImpl: async (_url: string | URL | Request, init?: RequestInit) => {
+        const body = JSON.parse(String(init?.body));
+        return body.type === "thread.turn.start" && delays.length === 0
+          ? new Response("slow", { status: 429, headers: { "retry-after": "9" } })
+          : new Response("{}", { status: 200 });
+      },
+      sleep: async (ms) => {
+        delays.push(ms);
+      },
+      random: () => 0.5,
+    });
+
+    assert.deepEqual(result, { injected: 1, skipped: 0, failed: 0, failures: [] });
+    assert.deepEqual(delays, [9_000]);
+  });
+
+  it("caps Retry-After delays to the retry sleep budget", async () => {
+    const manifestPath = await writeManifest([
+      { thread_id: "active-rate-limit", role: "active", status: "running", injected_at: null },
+    ]);
+    const delays: Array<number> = [];
+
+    const result = await injectResume({
+      manifestPath,
+      origin: "http://127.0.0.1:1",
+      token: "test-token",
+      dryRun: false,
+      now: () => new Date("2026-07-03T13:00:00.000Z"),
+      fetchImpl: async (_url: string | URL | Request, init?: RequestInit) => {
+        const body = JSON.parse(String(init?.body));
+        return body.type === "thread.turn.start" && delays.length === 0
+          ? new Response("slow", { status: 429, headers: { "retry-after": "3600" } })
+          : new Response("{}", { status: 200 });
+      },
+      sleep: async (ms) => {
+        delays.push(ms);
+      },
+      random: () => 0.5,
+    });
+
+    assert.deepEqual(result, { injected: 1, skipped: 0, failed: 0, failures: [] });
+    assert.deepEqual(delays, [60_000]);
+  });
+
+  it("times out hung dispatch attempts and retries the command", async () => {
+    const manifestPath = await writeManifest([
+      { thread_id: "active-hangs", role: "active", status: "running", injected_at: null },
+    ]);
+    const requests: Array<any> = [];
+    const delays: Array<number> = [];
+
+    const result = await injectResume({
+      manifestPath,
+      origin: "http://127.0.0.1:1",
+      token: "test-token",
+      dryRun: false,
+      now: () => new Date("2026-07-03T13:00:00.000Z"),
+      fetchImpl: async (_url: string | URL | Request, init?: RequestInit) => {
+        const body = JSON.parse(String(init?.body));
+        requests.push(body);
+        if (body.type !== "thread.turn.start" || requests.length > 2) {
+          return new Response("{}", { status: 200 });
+        }
+
+        return new Promise<Response>((_resolve, reject) => {
+          init?.signal?.addEventListener("abort", () => {
+            reject(new DOMException("aborted", "AbortError"));
+          });
+        });
+      },
+      sleep: async (ms) => {
+        delays.push(ms);
+      },
+      random: () => 0.5,
+      dispatchAttemptTimeoutMs: 1,
+    });
+
+    assert.deepEqual(result, { injected: 1, skipped: 0, failed: 0, failures: [] });
+    assert.deepEqual(
+      requests.map((request) => request.type),
+      ["thread.interaction-mode.set", "thread.turn.start", "thread.turn.start"],
+    );
+    assert.deepEqual(delays, [4_000]);
+  });
+
+  it("does not retry hard 400 dispatch failures", async () => {
+    const manifestPath = await writeManifest([
+      { thread_id: "active-bad", role: "active", status: "running", injected_at: null },
+    ]);
+    let requests = 0;
+
+    const result = await injectResume({
+      manifestPath,
+      origin: "http://127.0.0.1:1",
+      token: "test-token",
+      dryRun: false,
+      now: () => new Date("2026-07-03T13:00:00.000Z"),
+      fetchImpl: async (_url: string | URL | Request, init?: RequestInit) => {
+        requests += 1;
+        const body = JSON.parse(String(init?.body));
+        return body.type === "thread.interaction-mode.set"
+          ? new Response("{}", { status: 200 })
+          : new Response("bad request", { status: 400 });
+      },
+      sleep: async () => {
+        throw new Error("sleep should not be called");
+      },
+    });
+
+    assert.equal(requests, 2);
+    assert.equal(result.injected, 0);
+    assert.equal(result.failed, 1);
+    assert.equal(result.failures[0]?.threadId, "active-bad");
+    assert.match(result.failures[0]?.error ?? "", /^HTTP 400 bad request$/u);
+    const manifest = await readManifest(manifestPath);
+    assert.equal(manifest.threads[0].injected_at, null);
+  });
+
+  it("exhausts transient retries per thread while continuing to process other threads", async () => {
+    const manifestPath = await writeManifest([
+      { thread_id: "active-exhausts", role: "active", status: "running", injected_at: null },
+      { thread_id: "active-ok", role: "active", status: "running", injected_at: null },
+    ]);
+    const requests: Array<string> = [];
+    const delays: Array<number> = [];
+
+    const result = await injectResume({
+      manifestPath,
+      origin: "http://127.0.0.1:1",
+      token: "test-token",
+      dryRun: false,
+      now: () => new Date("2026-07-03T13:00:00.000Z"),
+      fetchImpl: async (_url: string | URL | Request, init?: RequestInit) => {
+        const body = JSON.parse(String(init?.body));
+        requests.push(`${body.threadId}:${body.type}`);
+        if (body.threadId === "active-exhausts" && body.type === "thread.turn.start") {
+          return new Response("warming", { status: 503 });
+        }
+        return new Response("{}", { status: 200 });
+      },
+      sleep: async (ms) => {
+        delays.push(ms);
+      },
+      random: () => 0.5,
+    });
+
+    assert.equal(result.injected, 1);
+    assert.equal(result.failed, 1);
+    assert.equal(result.failures[0]?.threadId, "active-exhausts");
+    assert.deepEqual(requests, [
+      "active-exhausts:thread.interaction-mode.set",
+      "active-exhausts:thread.turn.start",
+      "active-exhausts:thread.turn.start",
+      "active-exhausts:thread.turn.start",
+      "active-exhausts:thread.turn.start",
+      "active-exhausts:thread.turn.start",
+      "active-ok:thread.interaction-mode.set",
+      "active-ok:thread.turn.start",
+    ]);
+    assert.deepEqual(delays, [4_000, 8_000, 16_000, 32_000]);
+    const manifest = await readManifest(manifestPath);
+    assert.equal(manifest.threads[0].injected_at, null);
+    assert.equal(manifest.threads[1].injected_at, "2026-07-03T13:00:00.000Z");
   });
 
   it("dry-run counts active null entries without HTTP or manifest writes", async () => {

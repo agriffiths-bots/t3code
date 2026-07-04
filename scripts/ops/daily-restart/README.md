@@ -8,7 +8,7 @@ scripts/ops/daily-restart/inject-resume --manifest resume-manifest.json --origin
 
 `--origin` defaults to `T3DR_ORIGIN`, then `http://127.0.0.1:3773`. `--token` defaults to `T3DR_TOKEN`, then `T3_TOKEN`; the flag wins for ephemeral tests. `--dry-run` reports without posting or mutating.
 
-The script calls `POST /api/orchestration/dispatch` with `orchestration:operate`, sending `thread.turn.start`. After each successful post, it writes `injected_at` using temp-file plus rename; retries reuse stable command/message IDs derived from the manifest capture and thread so server command dedupe can catch a lost-response retry.
+The script calls `POST /api/orchestration/dispatch` with `orchestration:operate`, first sending `thread.interaction-mode.set` to force default mode, then `thread.turn.start`. It retries transient dispatch failures per command (network errors, hung attempts, 5xx, and 429 with bounded `Retry-After`) for up to five attempts with about one minute of total retry sleep; non-transient 4xx failures fail immediately. After each successful resume turn, it writes `injected_at` using temp-file plus rename; retries reuse stable command/message IDs derived from the manifest capture and thread so server command dedupe can catch a lost-response retry.
 
 ## Token source
 
