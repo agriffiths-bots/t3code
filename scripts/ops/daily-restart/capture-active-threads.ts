@@ -10,6 +10,7 @@ import * as NodeURL from "node:url";
 
 const DEFAULT_DB_PATH = "/home/adam/.t3-vps/userdata/state.sqlite";
 const ACTIVE_STATUSES = new Set(["running", "starting"]);
+const TERMINAL_STATUSES = new Set(["error", "interrupted", "stopped"]);
 
 export interface CaptureActiveThreadsOptions {
   readonly dbPath: string;
@@ -61,13 +62,6 @@ interface ParsedArgs {
   readonly excludedThreadIds: ReadonlyArray<string>;
 }
 
-export class CaptureActiveThreadsCliError extends Error {
-  constructor(message: string) {
-    super(message);
-    this.name = "CaptureActiveThreadsCliError";
-  }
-}
-
 function dbFileUri(dbPath: string): string {
   const url = NodeURL.pathToFileURL(NodePath.resolve(dbPath));
   url.searchParams.set("mode", "ro");
@@ -81,7 +75,10 @@ export function openCaptureDatabase(dbPath: string): CaptureDatabase {
 }
 
 function roleForRow(row: SessionRow): CapturedThread["role"] {
-  return row.active_turn_id !== null || ACTIVE_STATUSES.has(row.status) ? "active" : "waiting";
+  return (row.active_turn_id !== null && !TERMINAL_STATUSES.has(row.status)) ||
+    ACTIVE_STATUSES.has(row.status)
+    ? "active"
+    : "waiting";
 }
 
 function buildCaptureQuery(excludedThreadIds: ReadonlyArray<string>) {
@@ -102,7 +99,10 @@ function buildCaptureQuery(excludedThreadIds: ReadonlyArray<string>) {
     WHERE threads.deleted_at IS NULL
       AND threads.archived_at IS NULL
       AND (
-        sessions.active_turn_id IS NOT NULL
+        (
+          sessions.active_turn_id IS NOT NULL
+          AND sessions.status NOT IN ('error', 'interrupted', 'stopped')
+        )
         OR sessions.status = 'running'
         OR sessions.status = 'starting'
         OR sessions.status = 'waiting'
@@ -178,7 +178,7 @@ export function captureActiveThreads(options: CaptureActiveThreadsOptions): Capt
 function requireValue(args: ReadonlyArray<string>, index: number, flag: string): string {
   const value = args[index + 1];
   if (value === undefined || value.startsWith("--")) {
-    throw new CaptureActiveThreadsCliError(`Missing value for ${flag}.`);
+    throw new Error(`Missing value for ${flag}.`);
   }
   return value;
 }
@@ -208,16 +208,16 @@ export function parseArgs(
         break;
       case "--help":
       case "-h":
-        throw new CaptureActiveThreadsCliError(
+        throw new Error(
           "Usage: capture-active-threads --db PATH --out FILE [--exclude THREAD_ID]...",
         );
       default:
-        throw new CaptureActiveThreadsCliError(`Unknown argument: ${arg}`);
+        throw new Error(`Unknown argument: ${arg}`);
     }
   }
 
   if (!outPath) {
-    throw new CaptureActiveThreadsCliError("Missing required --out FILE.");
+    throw new Error("Missing required --out FILE.");
   }
 
   return { dbPath, outPath, excludedThreadIds };

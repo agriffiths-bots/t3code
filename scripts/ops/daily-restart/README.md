@@ -1,5 +1,3 @@
-Run `capture-active-threads` immediately before the graceful daily shutdown, while the server is still up:
-
 ```bash
 node scripts/ops/daily-restart/capture-active-threads.ts \
   --db "${T3DR_DB:-/home/adam/.t3-vps/userdata/state.sqlite}" \

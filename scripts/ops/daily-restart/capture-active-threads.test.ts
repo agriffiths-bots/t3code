@@ -48,6 +48,7 @@ function makeFixtureDb(dir: string): string {
     ["starting-no-turn", "Starting No Turn", null, null, "starting", null],
     ["waiting", "Waiting Parent", null, null, "waiting", null],
     ["idle", "Idle Thread", null, null, "ready", null],
+    ["errored-stale", "Errored Stale", null, null, "error", "turn-error"],
     ["deleted", "Deleted Thread", "2026-07-03T00:00:00.000Z", null, "running", "turn-2"],
     ["archived", "Archived Thread", null, "2026-07-03T00:00:00.000Z", "running", "turn-3"],
     ["excluded", "Excluded Thread", null, null, "running", "turn-4"],
