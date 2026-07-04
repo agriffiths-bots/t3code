@@ -75,7 +75,8 @@ creates an online-safe SQLite snapshot. `--db` defaults to `T3DR_DB`, then
 
 `scripts/ops/daily-restart/t3-db-restore --snapshot FILE [--db PATH]` restores a
 verified snapshot. The caller must stop T3 first; active WAL/SHM files emit a
-warning only. Both tools export the cron PATH, set `umask 077`, use sqlite3
+warning only. Both tools export a cron PATH with trusted system directories first,
+set `umask 077`, use sqlite3
 `.backup` plus `PRAGMA integrity_check`, print only the result path to stdout,
 and exit non-zero on failure.
 

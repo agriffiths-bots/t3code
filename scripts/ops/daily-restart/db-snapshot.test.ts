@@ -11,7 +11,7 @@ const repoRoot = NodePath.resolve(
   "../../..",
 );
 const FULL_PATH =
-  "/home/linuxbrew/.linuxbrew/bin:/home/adam/.local/bin:/usr/local/bin:/usr/bin:/bin";
+  "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/home/linuxbrew/.linuxbrew/bin:/home/adam/.local/bin";
 const snapshotTool = NodePath.join(repoRoot, "scripts/ops/daily-restart/t3-db-snapshot");
 const restoreTool = NodePath.join(repoRoot, "scripts/ops/daily-restart/t3-db-restore");
 
@@ -43,6 +43,70 @@ function run(
 
 function sqlite(db: string, sql: string): string {
   return run(["sqlite3", db, sql]).stdout.trim();
+}
+
+function waitForSqliteOutput(
+  child: NodeChildProcess.ChildProcess,
+  expected: string,
+): Promise<void> {
+  const stdoutStream = child.stdout;
+  const stderrStream = child.stderr;
+  if (!stdoutStream || !stderrStream) {
+    return Promise.reject(new Error("sqlite3 child process did not expose stdout/stderr"));
+  }
+
+  return new Promise((resolve, reject) => {
+    let stdout = "";
+    let stderr = "";
+    let settled = false;
+
+    const cleanup = (): void => {
+      stdoutStream.off("data", onStdout);
+      stderrStream.off("data", onStderr);
+      child.off("error", onError);
+      child.off("exit", onExit);
+    };
+
+    const finish = (error?: Error): void => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      cleanup();
+      if (error) {
+        reject(error);
+      } else {
+        resolve();
+      }
+    };
+
+    const onStdout = (chunk: Buffer | string): void => {
+      stdout += chunk.toString();
+      if (stdout.includes(expected)) {
+        finish();
+      }
+    };
+    const onStderr = (chunk: Buffer | string): void => {
+      stderr += chunk.toString();
+    };
+    const onError = (error: Error): void => {
+      finish(error);
+    };
+    const onExit = (code: number | null, signal: NodeJS.Signals | null): void => {
+      finish(
+        new Error(
+          `sqlite3 exited before ${expected}: code=${code ?? "null"} signal=${
+            signal ?? "null"
+          }\nstdout:\n${stdout}\nstderr:\n${stderr}`,
+        ),
+      );
+    };
+
+    stdoutStream.on("data", onStdout);
+    stderrStream.on("data", onStderr);
+    child.once("error", onError);
+    child.once("exit", onExit);
+  });
 }
 
 function createWalDatabase(db: string): void {
@@ -172,7 +236,7 @@ describe("daily restart database tools", () => {
     assert.equal((NodeFS.statSync(db).mode & 0o777).toString(8), "600");
   });
 
-  it("restores committed frames from a snapshot WAL companion", () => {
+  it("restores committed frames from a snapshot WAL companion", async () => {
     const dir = makeTempDir();
     const db = NodePath.join(dir, "state.sqlite");
     const snapshot = NodePath.join(dir, "snapshot.sqlite");
@@ -183,12 +247,16 @@ describe("daily restart database tools", () => {
       stdio: ["pipe", "pipe", "pipe"],
       env: commandEnv(),
     });
-    snapshotConnection.stdin.write("PRAGMA journal_mode=WAL;\n");
-    snapshotConnection.stdin.write("PRAGMA wal_autocheckpoint=0;\n");
-    snapshotConnection.stdin.write("INSERT INTO items(name) VALUES ('snapshot-wal-only');\n");
-    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 500);
 
     try {
+      const walReady = waitForSqliteOutput(snapshotConnection, "snapshot-wal-ready");
+      snapshotConnection.stdin.write(".bail on\n");
+      snapshotConnection.stdin.write("PRAGMA journal_mode=WAL;\n");
+      snapshotConnection.stdin.write("PRAGMA wal_autocheckpoint=0;\n");
+      snapshotConnection.stdin.write("INSERT INTO items(name) VALUES ('snapshot-wal-only');\n");
+      snapshotConnection.stdin.write("SELECT 'snapshot-wal-ready';\n");
+      await walReady;
+
       assert.equal(NodeFS.existsSync(`${snapshot}-wal`), true);
 
       const result = run([restoreTool, "--snapshot", snapshot, "--db", db]);
