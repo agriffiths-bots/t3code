@@ -264,6 +264,7 @@ import { buildScheduleBanner } from "./chat/scheduleBanner";
 import { useAssetUrls } from "../assets/assetUrls";
 import {
   clientTurnCommandId,
+  compareOutboxSubmissions,
   getMessageOutboxSnapshot,
   messageOutboxHasBootstrapSubmissionForThread,
   messageOutboxHasSessionOnlySubmissionForThread,
@@ -436,7 +437,7 @@ function outboxFailureState(
     return { status: "failed", error: failure.message, retryable: false };
   }
   if (!failure.transport) {
-    return { status: "failed", error: failure.message, retryable: true };
+    return { status: "failed", error: failure.message, retryable: false };
   }
   return {
     status: "pending",
@@ -2996,12 +2997,7 @@ function ChatViewContent(props: ChatViewProps) {
     const activeThreadSendBlocked = phase === "running" || isSendBusy || sendInFlightRef.current;
     const blockedThreadKeys = new Set<string>();
     const retryable = messageOutbox.submissions
-      .toSorted((left, right) => {
-        const createdAtOrder = left.createdAt.localeCompare(right.createdAt);
-        return createdAtOrder !== 0
-          ? createdAtOrder
-          : left.messageId.localeCompare(right.messageId);
-      })
+      .toSorted(compareOutboxSubmissions)
       .flatMap((submission) => {
         const threadKey = outboxSubmissionThreadKey(submission);
         if (messageOutboxSubmissionIsTerminal(submission)) {

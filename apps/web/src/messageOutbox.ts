@@ -385,7 +385,7 @@ export function outboxSubmissionsForThread(
     .toSorted(compareOutboxSubmissions);
 }
 
-function compareOutboxSubmissions(
+export function compareOutboxSubmissions(
   left: MessageOutboxSubmission,
   right: MessageOutboxSubmission,
 ): number {

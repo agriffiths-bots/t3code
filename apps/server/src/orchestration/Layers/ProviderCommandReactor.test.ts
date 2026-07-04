@@ -2122,6 +2122,8 @@ describe("ProviderCommandReactor", () => {
     expect(harness.sendTurn.mock.calls.length).toBe(0);
     const readModel = await harness.readModel();
     const thread = readModel.threads.find((entry) => entry.id === ThreadId.make("thread-1"));
+    expect(thread?.session?.status).toBe("stopped");
+    expect(thread?.session?.lastError).toBeNull();
     expect(
       thread?.activities.find((activity) => activity.kind === "provider.turn.start.failed"),
     ).toMatchObject({
@@ -2129,6 +2131,39 @@ describe("ProviderCommandReactor", () => {
         detail: expect.stringContaining("cannot switch to 'claudeAgent'"),
       },
     });
+
+    await Effect.runPromise(
+      harness.engine.dispatch({
+        type: "thread.turn.start",
+        commandId: CommandId.make("cmd-turn-start-stopped-provider-switch-retry"),
+        threadId: ThreadId.make("thread-1"),
+        message: {
+          messageId: asMessageId("user-message-stopped-provider-switch-retry"),
+          role: "user",
+          text: "try claude again",
+          attachments: [],
+        },
+        modelSelection: {
+          instanceId: ProviderInstanceId.make("claudeAgent"),
+          model: "claude-opus-4-6",
+        },
+        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+        runtimeMode: "approval-required",
+        createdAt: now,
+      }),
+    );
+
+    await waitFor(async () => {
+      const nextReadModel = await harness.readModel();
+      const nextThread = nextReadModel.threads.find(
+        (entry) => entry.id === ThreadId.make("thread-1"),
+      );
+      return (
+        nextThread?.activities.filter((activity) => activity.kind === "provider.turn.start.failed")
+          .length === 2
+      );
+    });
+    expect(harness.startSession.mock.calls.length).toBe(0);
   });
 
   it("reacts to thread.turn.interrupt-requested by calling provider interrupt", async () => {

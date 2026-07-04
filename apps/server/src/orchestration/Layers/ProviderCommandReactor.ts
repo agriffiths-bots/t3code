@@ -348,7 +348,10 @@ const make = Effect.gen(function* () {
             }
           : {}),
         activeTurnId: null,
-        lastError: input.detail,
+        lastError:
+          session.status === "stopped" && !isUnstartedSyntheticSession
+            ? session.lastError
+            : input.detail,
         updatedAt: input.createdAt,
       },
       createdAt: input.createdAt,
