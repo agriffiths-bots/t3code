@@ -58,6 +58,7 @@ done
 [[ -n "$snapshot_path" ]] || die "--snapshot is required"
 command -v sqlite3 >/dev/null 2>&1 || die "sqlite3 not found on PATH"
 command -v flock >/dev/null 2>&1 || die "flock not found on PATH"
+command -v mktemp >/dev/null 2>&1 || die "mktemp not found on PATH"
 [[ -f "$snapshot_path" ]] || die "snapshot does not exist: $snapshot_path"
 
 snapshot_path="$(absolute_path "$snapshot_path")"
@@ -92,7 +93,8 @@ fi
 [[ ! -e "$wal_backup_path" ]] || die "WAL backup path already exists: $wal_backup_path"
 [[ ! -e "$shm_backup_path" ]] || die "SHM backup path already exists: $shm_backup_path"
 
-tmp_db="$db_dir/.restore-$(basename "$db_path").$$"
+tmp_db="$(mktemp --tmpdir="$db_dir" ".restore-$(basename "$db_path").XXXXXXXXXX")" \
+  || die "failed to create restore temporary database"
 cleanup() {
   rm -f "$tmp_db"
 }

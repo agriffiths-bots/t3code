@@ -105,6 +105,26 @@ describe("daily restart database tools", () => {
     );
   });
 
+  it("does not follow a stale snapshot lock symlink", () => {
+    const dir = makeTempDir();
+    const db = NodePath.join(dir, "state.sqlite");
+    const outDir = NodePath.join(dir, "snapshots");
+    createWalDatabase(db);
+    NodeFS.mkdirSync(outDir);
+    NodeFS.symlinkSync(db, NodePath.join(outDir, ".t3-db-snapshot.lock"));
+
+    const snapshot = run([snapshotTool, "--db", db, "--out-dir", outDir]).stdout.trim();
+
+    assert.equal(
+      sqlite(db, "SELECT group_concat(name, ',') FROM items ORDER BY id;"),
+      "alpha,beta",
+    );
+    assert.equal(
+      sqlite(snapshot, "SELECT group_concat(name, ',') FROM items ORDER BY id;"),
+      "alpha,beta",
+    );
+  });
+
   it("restores a verified snapshot and moves the current database aside", () => {
     const dir = makeTempDir();
     const db = NodePath.join(dir, "state.sqlite");
@@ -182,6 +202,26 @@ describe("daily restart database tools", () => {
       snapshotConnection.stdin.end(".quit\n");
       snapshotConnection.kill();
     }
+  });
+
+  it("does not follow stale restore temp symlinks", () => {
+    const dir = makeTempDir();
+    const db = NodePath.join(dir, "state.sqlite");
+    const outDir = NodePath.join(dir, "snapshots");
+    createWalDatabase(db);
+    const snapshot = run([snapshotTool, "--db", db, "--out-dir", outDir]).stdout.trim();
+    NodeFS.symlinkSync(db, NodePath.join(dir, ".restore-state.sqlite.stale"));
+
+    run([restoreTool, "--snapshot", snapshot, "--db", db]);
+
+    assert.equal(
+      sqlite(db, "SELECT group_concat(name, ',') FROM items ORDER BY id;"),
+      "alpha,beta",
+    );
+    assert.equal(
+      NodeFS.lstatSync(NodePath.join(dir, ".restore-state.sqlite.stale")).isSymbolicLink(),
+      true,
+    );
   });
 
   it("prunes old snapshots by retention count", () => {
