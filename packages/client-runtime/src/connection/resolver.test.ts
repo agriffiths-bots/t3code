@@ -374,6 +374,7 @@ describe("ConnectionResolver", () => {
 
   it.effect("installs saved Cloudflare Access cookies before bearer authorization", () =>
     Effect.gen(function* () {
+      const events = yield* Ref.make<ReadonlyArray<string>>([]);
       const installedCookies = yield* Ref.make<
         ReadonlyArray<{ readonly httpBaseUrl: string; readonly cookieValue: string }>
       >([]);
@@ -401,10 +402,15 @@ describe("ConnectionResolver", () => {
           ],
         ],
         installCloudflareAccessCookie: (input) =>
-          Ref.update(installedCookies, (values) => [...values, input]),
+          Effect.gen(function* () {
+            yield* Ref.update(events, (values) => [...values, "install"]);
+            yield* Ref.update(installedCookies, (values) => [...values, input]);
+          }),
         authorizeBearer: (input) =>
-          Ref.update(accessInputs, (values) => [...values, input.cloudflareAccess]).pipe(
-            Effect.as({
+          Effect.gen(function* () {
+            yield* Ref.update(events, (values) => [...values, "authorize"]);
+            yield* Ref.update(accessInputs, (values) => [...values, input.cloudflareAccess]);
+            return {
               environmentId: input.expectedEnvironmentId,
               label: "Saved",
               httpBaseUrl: input.httpBaseUrl,
@@ -413,8 +419,8 @@ describe("ConnectionResolver", () => {
                 _tag: "Bearer" as const,
                 token: input.bearerToken,
               },
-            }),
-          ),
+            };
+          }),
       });
       const broker = yield* ConnectionResolver.ConnectionResolver.pipe(Effect.provide(brokerLayer));
 
@@ -426,6 +432,7 @@ describe("ConnectionResolver", () => {
           cookieValue: "cf-access-cookie",
         },
       ]);
+      expect(yield* Ref.get(events)).toEqual(["install", "authorize"]);
       expect(yield* Ref.get(accessInputs)).toEqual([
         {
           _tag: "cookie",
