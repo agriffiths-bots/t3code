@@ -13,24 +13,38 @@ origin="${T3DR_ORIGIN:-http://127.0.0.1:3773}"
 snapshot_dir="${T3DR_SNAPSHOT_DIR:-/home/adam/backups/t3-daily}"
 ledger="${T3DR_LEDGER:-/home/adam/.openclaw/daily-restart}"
 probe_timeout="${T3DR_PROBE_TIMEOUT:-180}"
+smoke_instance="${T3DR_SMOKE_INSTANCE:-}"
+smoke_model="${T3DR_SMOKE_MODEL:-}"
 
 usage() {
   cat >&2 <<'USAGE'
 usage: t3-daily-restart [--db PATH] [--checkout PATH] [--service NAME]
                         [--origin URL] [--snapshot-dir DIR] [--ledger DIR]
                         [--probe-timeout SECS]
+                        [--smoke-instance INSTANCE] [--smoke-model MODEL]
 USAGE
+}
+
+require_value() {
+  local flag="$1"
+  if [[ "$#" -lt 2 || -z "${2:-}" || "${2:-}" == --* ]]; then
+    echo "t3-daily-restart: $flag requires a value" >&2
+    usage
+    exit 2
+  fi
 }
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --db) db="${2:-}"; shift 2 ;;
-    --checkout) checkout="${2:-}"; shift 2 ;;
-    --service) service="${2:-}"; shift 2 ;;
-    --origin) origin="${2:-}"; shift 2 ;;
-    --snapshot-dir) snapshot_dir="${2:-}"; shift 2 ;;
-    --ledger) ledger="${2:-}"; shift 2 ;;
-    --probe-timeout) probe_timeout="${2:-}"; shift 2 ;;
+    --db) require_value "$@"; db="$2"; shift 2 ;;
+    --checkout) require_value "$@"; checkout="$2"; shift 2 ;;
+    --service) require_value "$@"; service="$2"; shift 2 ;;
+    --origin) require_value "$@"; origin="$2"; shift 2 ;;
+    --snapshot-dir) require_value "$@"; snapshot_dir="$2"; shift 2 ;;
+    --ledger) require_value "$@"; ledger="$2"; shift 2 ;;
+    --probe-timeout) require_value "$@"; probe_timeout="$2"; shift 2 ;;
+    --smoke-instance) require_value "$@"; smoke_instance="$2"; shift 2 ;;
+    --smoke-model) require_value "$@"; smoke_model="$2"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) echo "t3-daily-restart: unknown arg: $1" >&2; usage; exit 2 ;;
   esac
@@ -40,13 +54,27 @@ if [[ -z "$db" || -z "$checkout" || -z "$service" || -z "$origin" || -z "$snapsh
   usage
   exit 2
 fi
-if ! [[ "$probe_timeout" =~ ^[0-9]+$ ]] || [[ "$probe_timeout" -le 0 ]]; then
+if ! [[ "$probe_timeout" =~ ^[0-9]+$ ]]; then
   echo "t3-daily-restart: --probe-timeout must be a positive integer" >&2
+  exit 2
+fi
+probe_timeout="$((10#$probe_timeout))"
+if [[ "$probe_timeout" -le 0 ]]; then
+  echo "t3-daily-restart: --probe-timeout must be a positive integer" >&2
+  exit 2
+fi
+if [[ -z "$smoke_instance" ]]; then
+  echo "t3-daily-restart: --smoke-instance or T3DR_SMOKE_INSTANCE is required" >&2
+  exit 2
+fi
+if [[ -z "$smoke_model" ]]; then
+  echo "t3-daily-restart: --smoke-model or T3DR_SMOKE_MODEL is required" >&2
   exit 2
 fi
 
 export T3DR_DB="$db" T3DR_CHECKOUT="$checkout" T3DR_SERVICE="$service" T3DR_ORIGIN="$origin"
 export T3DR_SNAPSHOT_DIR="$snapshot_dir" T3DR_LEDGER="$ledger"
+export T3DR_SMOKE_INSTANCE="$smoke_instance" T3DR_SMOKE_MODEL="$smoke_model"
 
 utc_date="$(date -u +%F)"
 run_dir="$ledger/$utc_date"
@@ -182,7 +210,8 @@ run_health_probe() {
     echo "health-probe missing" >"$probe_file"
     return 127
   }
-  timeout "$((probe_timeout + 45))" "$probe" --origin "$origin" --service "$service" --timeout "$probe_timeout" \
+  timeout "$((probe_timeout + 45))" "$probe" --origin "$origin" --service "$service" \
+    --instance "$smoke_instance" --model "$smoke_model" --timeout "$probe_timeout" \
     >"$probe_file" 2>>"$log_file"
 }
 
@@ -296,7 +325,7 @@ snapshot_tool="$(resolve_tool t3-db-snapshot)" || {
   record_result "FAILED"
   exit 1
 }
-preflight_snapshot_path="$(run_output 600 "$snapshot_tool" --db "$db" --snapshot-dir "$snapshot_dir")"
+preflight_snapshot_path="$(run_output 600 "$snapshot_tool" --db "$db" --out-dir "$snapshot_dir")"
 if [[ "$?" -ne 0 || -z "$preflight_snapshot_path" ]]; then
   log "snapshot failed; aborting before shutdown"
   record_result "SNAPSHOT-FAILED"
@@ -309,7 +338,7 @@ capture_tool="$(resolve_tool capture-active-threads)" || {
   record_result "FAILED"
   exit 1
 }
-if ! run_capture 300 "$capture_tool" --origin "$origin" --db "$db" --output "$manifest"; then
+if ! run_capture 300 "$capture_tool" --db "$db" --out "$manifest"; then
   log "capture-active-threads failed"
   record_result "FAILED"
   exit 1
@@ -326,7 +355,7 @@ if ! run_capture 90 systemctl --user stop "$service"; then
   exit 1
 fi
 
-snapshot_path="$(run_output 600 "$snapshot_tool" --db "$db" --snapshot-dir "$snapshot_dir")"
+snapshot_path="$(run_output 600 "$snapshot_tool" --db "$db" --out-dir "$snapshot_dir")"
 if [[ "$?" -ne 0 || -z "$snapshot_path" ]]; then
   log "quiesced snapshot failed after stop"
   if run_capture 60 systemctl --user start "$service"; then

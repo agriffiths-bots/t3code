@@ -42,7 +42,7 @@ SH
 #!/usr/bin/env bash
 echo "capture $*" >>"$T_LOG"
 while [[ $# -gt 0 ]]; do
-  if [[ "$1" == "--output" ]]; then
+  if [[ "$1" == "--out" ]]; then
     if [[ "${FAKE_CAPTURE_BAD_JSON:-0}" == "1" ]]; then
       printf '{bad json\n' >"$2"
     else
@@ -106,6 +106,8 @@ run_manager() {
     --snapshot-dir "$tmp/snaps" \
     --ledger "$tmp/ledger" \
     --probe-timeout 1 \
+    --smoke-instance fakeAgent \
+    --smoke-model fake-model \
     "$@" >"$tmp/stdout" 2>"$tmp/stderr"
   echo $? >"$tmp/rc"
 }
@@ -135,6 +137,25 @@ else
   pass "happy path builds before health"
 fi
 grep -Fq '"pre_sha"' "$tmp/ledger/"*/resume-manifest.json && pass "manifest filled" || fail "manifest filled"
+grep -Fq "snapshot --db $tmp/state.sqlite --out-dir $tmp/snaps" "$tmp/calls.log" && pass "snapshot helper receives current flags" || fail "snapshot helper receives current flags"
+grep -Fq "capture --db $tmp/state.sqlite --out $tmp/ledger/" "$tmp/calls.log" && pass "capture helper receives current flags" || fail "capture helper receives current flags"
+grep -Fq "health --origin http://127.0.0.1:1 --service fake.service --instance fakeAgent --model fake-model --timeout 1" "$tmp/calls.log" && pass "health probe receives smoke provider" || fail "health probe receives smoke provider"
+
+tmp="$(mktemp -d)"
+mkdir -p "$tmp/checkout" "$tmp/bin" "$tmp/ledger" "$tmp/snaps"
+make_fake_bin "$tmp/bin"
+T_TMP="$tmp" T_LOG="$tmp/calls.log" T3DR_TEST_PATH_PREFIX="$tmp/bin" "$SCRIPT" \
+  --db "$tmp/state.sqlite" \
+  --checkout "$tmp/checkout" \
+  --service fake.service \
+  --origin http://127.0.0.1:1 \
+  --snapshot-dir "$tmp/snaps" \
+  --ledger "$tmp/ledger" \
+  --probe-timeout 1 \
+  >"$tmp/stdout" 2>"$tmp/stderr"
+echo $? >"$tmp/rc"
+[[ "$(cat "$tmp/rc")" == "2" ]] && pass "smoke provider config is required" || fail "smoke provider config is required"
+grep -Fq "t3-daily-restart: --smoke-instance or T3DR_SMOKE_INSTANCE is required" "$tmp/stderr" && pass "missing smoke provider message" || fail "missing smoke provider message"
 
 tmp="$(mktemp -d)"
 export FAKE_SNAPSHOT_RC=9

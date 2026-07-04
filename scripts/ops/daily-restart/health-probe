@@ -7,23 +7,55 @@ export PATH
 origin=""
 service=""
 timeout_secs="120"
+smoke_instance="${T3DR_SMOKE_INSTANCE:-}"
+smoke_model="${T3DR_SMOKE_MODEL:-}"
 
 usage() {
-  echo "usage: health-probe --origin URL --service NAME [--timeout SECS]" >&2
+  echo "usage: health-probe --origin URL --service NAME --instance INSTANCE --model MODEL [--timeout SECS]" >&2
+}
+
+normalize_origin() {
+  local value="$1"
+  while [[ "$value" == */ && "$value" != "http://" && "$value" != "https://" ]]; do
+    value="${value%/}"
+  done
+  printf '%s\n' "$value"
+}
+
+require_value() {
+  local flag="$1"
+  if [[ "$#" -lt 2 || -z "${2:-}" || "${2:-}" == --* ]]; then
+    echo "health-probe: $flag requires a value" >&2
+    usage
+    exit 2
+  fi
 }
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --origin)
-      origin="${2:-}"
+      require_value "$@"
+      origin="$2"
       shift 2
       ;;
     --service)
-      service="${2:-}"
+      require_value "$@"
+      service="$2"
       shift 2
       ;;
     --timeout)
-      timeout_secs="${2:-}"
+      require_value "$@"
+      timeout_secs="$2"
+      shift 2
+      ;;
+    --instance)
+      require_value "$@"
+      smoke_instance="$2"
+      shift 2
+      ;;
+    --model)
+      require_value "$@"
+      smoke_model="$2"
       shift 2
       ;;
     -h|--help)
@@ -43,13 +75,68 @@ if [[ -z "$origin" || -z "$service" ]]; then
   exit 2
 fi
 
-if ! [[ "$timeout_secs" =~ ^[0-9]+$ ]] || [[ "$timeout_secs" -le 0 ]]; then
+if ! [[ "$timeout_secs" =~ ^[0-9]+$ ]]; then
   echo "health-probe: --timeout must be a positive integer" >&2
+  exit 2
+fi
+timeout_secs="$((10#$timeout_secs))"
+if [[ "$timeout_secs" -le 0 ]]; then
+  echo "health-probe: --timeout must be a positive integer" >&2
+  exit 2
+fi
+
+if [[ -z "$smoke_instance" ]]; then
+  echo "health-probe: --instance or T3DR_SMOKE_INSTANCE is required" >&2
+  exit 2
+fi
+
+if [[ -z "$smoke_model" ]]; then
+  echo "health-probe: --model or T3DR_SMOKE_MODEL is required" >&2
+  exit 2
+fi
+
+origin="$(normalize_origin "$origin")"
+if [[ -z "$origin" ]]; then
+  echo "health-probe: --origin must not normalize to empty" >&2
   exit 2
 fi
 
 print_check() {
   printf 'CHECK %s %s %s\n' "$1" "$2" "$3"
+}
+
+one_line() {
+  local value="$1"
+  value="${value//$'\n'/ }"
+  printf '%s\n' "$value"
+}
+
+remaining_until() {
+  local deadline_at="$1"
+  local remaining=$((deadline_at - SECONDS))
+  if [[ "$remaining" -le 0 ]]; then
+    printf '0\n'
+  else
+    printf '%s\n' "$remaining"
+  fi
+}
+
+bounded_command_timeout() {
+  local remaining="$1"
+  if [[ "$remaining" -le 1 ]]; then
+    printf '1\n'
+  elif [[ "$remaining" -lt 10 ]]; then
+    printf '%s\n' "$remaining"
+  else
+    printf '10\n'
+  fi
+}
+
+sleep_before_retry() {
+  local deadline_at="$1"
+  if [[ "$(remaining_until "$deadline_at")" -gt 1 ]]; then
+    sleep 1
+  fi
 }
 
 ensure_user_bus_env() {
@@ -64,31 +151,56 @@ ensure_user_bus_env() {
 }
 
 run_systemd_check() {
-  local output rc
+  local deadline_at="$1"
+  local output rc remaining attempt_timeout last_output
   ensure_user_bus_env
-  output="$(timeout 60 systemctl --user is-active "$service" 2>&1)"
-  rc=$?
-  if [[ "$rc" -eq 0 && "$output" == "active" ]]; then
-    print_check "systemd" "PASS" "active"
-    return 0
-  fi
-  output="${output//$'\n'/ }"
-  [[ -n "$output" ]] || output="rc=$rc"
-  print_check "systemd" "FAIL" "$output"
+
+  while [[ "$(remaining_until "$deadline_at")" -gt 0 ]]; do
+    remaining="$(remaining_until "$deadline_at")"
+    attempt_timeout="$(bounded_command_timeout "$remaining")"
+    output="$(timeout "$attempt_timeout" systemctl --user is-active "$service" 2>&1)"
+    rc=$?
+    if [[ "$rc" -eq 0 ]]; then
+      print_check "systemd" "PASS" "active"
+      return 0
+    fi
+    last_output="$(one_line "$output")"
+    [[ -n "$last_output" ]] || last_output="rc=$rc"
+    sleep_before_retry "$deadline_at"
+  done
+
+  print_check "systemd" "FAIL" "${last_output:-timeout}"
   return 1
 }
 
 run_http_check() {
-  local code rc
-  code="$(timeout "$timeout_secs" curl -fsS -o /dev/null -w '%{http_code}' "$origin" 2>/dev/null)"
-  rc=$?
-  if [[ "$rc" -eq 0 && "$code" == "200" ]]; then
-    print_check "http" "PASS" "200"
-    return 0
-  fi
-  [[ -n "$code" ]] || code="curl_rc=$rc"
-  print_check "http" "FAIL" "$code"
+  local deadline_at="$1"
+  local code rc remaining attempt_timeout last_code
+
+  while [[ "$(remaining_until "$deadline_at")" -gt 0 ]]; do
+    remaining="$(remaining_until "$deadline_at")"
+    attempt_timeout="$(bounded_command_timeout "$remaining")"
+    code="$(timeout "$attempt_timeout" curl -fsS -o /dev/null -w '%{http_code}' "$origin" 2>/dev/null)"
+    rc=$?
+    if [[ "$rc" -eq 0 && "$code" == "200" ]]; then
+      print_check "http" "PASS" "200"
+      return 0
+    fi
+    last_code="$(one_line "$code")"
+    [[ -n "$last_code" ]] || last_code="curl_rc=$rc"
+    sleep_before_retry "$deadline_at"
+  done
+
+  print_check "http" "FAIL" "${last_code:-timeout}"
   return 1
+}
+
+default_token_ttl() {
+  local ttl_secs=$((timeout_secs + 90))
+  if [[ "$ttl_secs" -lt 300 ]]; then
+    ttl_secs=300
+  fi
+  printf '%ss\n' "$ttl_secs"
 }
 
 mint_token() {
@@ -111,9 +223,9 @@ mint_token() {
     entry="$checkout/apps/server/src/bin.ts"
   fi
   json="$(
-    T3CODE_HOME="$home" timeout 30 node "$entry" auth session issue \
+    env -u VITE_DEV_SERVER_URL T3CODE_HOME="$home" timeout 30 node "$entry" auth session issue \
       --json \
-      --ttl "${T3DR_HEALTH_TOKEN_TTL:-5m}" \
+      --ttl "${T3DR_HEALTH_TOKEN_TTL:-$(default_token_ttl)}" \
       --label daily-restart-health-probe \
       --subject daily-restart-health-probe
   )" || return 1
@@ -136,7 +248,7 @@ revoke_session() {
   else
     entry="$checkout/apps/server/src/bin.ts"
   fi
-  T3CODE_HOME="$home" timeout 30 node "$entry" auth session revoke "$session_id" >/dev/null
+  env -u VITE_DEV_SERVER_URL T3CODE_HOME="$home" timeout 30 node "$entry" auth session revoke "$session_id" >/dev/null
 }
 
 run_smoke_check() {
@@ -158,16 +270,15 @@ run_smoke_check() {
   printf '%s' "$token" > "$token_file"
   chmod 600 "$token_file"
 
-  output="$(timeout "$((timeout_secs + 30))" node - "$origin" "$timeout_secs" "$token_file" <<'NODE' 2>&1
+  output="$(timeout --kill-after=10 "$((timeout_secs + 30))" node - "$origin" "$timeout_secs" "$token_file" "$smoke_instance" "$smoke_model" <<'NODE' 2>&1
 const crypto = require("node:crypto");
 const fs = require("node:fs");
 
-const [origin, timeoutSecsText, tokenPath] = process.argv.slice(2);
+const [origin, timeoutSecsText, tokenPath, instanceId, model] = process.argv.slice(2);
+const baseUrl = new URL(origin);
 const token = fs.readFileSync(tokenPath, "utf8");
 const timeoutMs = Number(timeoutSecsText) * 1000;
 const deadline = Date.now() + timeoutMs;
-const instanceId = process.env.T3DR_SMOKE_INSTANCE || "claudeAgent";
-const model = process.env.T3DR_SMOKE_MODEL || "claude-sonnet-5";
 const ownsWorkspace = !process.env.T3DR_SMOKE_WORKSPACE;
 const workspaceRoot = process.env.T3DR_SMOKE_WORKSPACE || fs.mkdtempSync("/tmp/t3-health-probe-");
 const projectId = crypto.randomUUID();
@@ -180,6 +291,7 @@ const headers = {
 };
 const requestTimeoutMs = Math.min(10000, Math.max(2000, Math.floor(timeoutMs / 4)));
 const cleanupTimeoutMs = 5000;
+let cleanupStarted = false;
 
 function nowIso() {
   return new Date().toISOString();
@@ -221,25 +333,85 @@ async function requestJson(url, options, description, timeout = requestTimeoutMs
   throw lastError || new Error(`${description} timed out`);
 }
 
+function apiUrl(path) {
+  return new URL(path, baseUrl).toString();
+}
+
 async function dispatch(command, timeout = requestTimeoutMs, endAt = deadline) {
-  return requestJson(`${origin}/api/orchestration/dispatch`, {
+  return requestJson(apiUrl("/api/orchestration/dispatch"), {
     method: "POST",
     headers,
     body: JSON.stringify(command),
   }, `dispatch ${command.type}`, timeout, endAt);
 }
 
-async function snapshot() {
-  return requestJson(`${origin}/api/orchestration/snapshot`, {
+async function snapshot(endAt = deadline) {
+  return requestJson(apiUrl("/api/orchestration/snapshot"), {
     headers: { authorization: `Bearer ${token}` },
-  }, "snapshot", requestTimeoutMs);
+  }, "snapshot", requestTimeoutMs, endAt);
 }
 
 async function sleep(ms) {
   await new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function completedWithinDeadline(thread) {
+  if (thread?.latestTurn?.state !== "completed") return false;
+  const completedAt = Date.parse(thread.latestTurn.completedAt || "");
+  if (!Number.isFinite(completedAt)) return Date.now() <= deadline;
+  return completedAt <= deadline;
+}
+
+async function cleanup() {
+  if (cleanupStarted) return;
+  cleanupStarted = true;
+  try {
+    const cleanupEndAt = Date.now() + cleanupTimeoutMs;
+    if (projectCreated) {
+      await dispatch({
+        type: "project.delete",
+        commandId: crypto.randomUUID(),
+        projectId,
+        force: true,
+      }, cleanupTimeoutMs, cleanupEndAt);
+    } else if (threadCreated) {
+      await dispatch(
+        { type: "thread.delete", commandId: crypto.randomUUID(), threadId },
+        cleanupTimeoutMs,
+        cleanupEndAt,
+      );
+    }
+  } catch (error) {
+    if (!process.exitCode) {
+      console.error(`cleanup failed: ${error && error.message ? error.message : String(error)}`);
+      process.exitCode = 1;
+    }
+  } finally {
+    if (ownsWorkspace && workspaceRoot.startsWith("/tmp/t3-health-probe-")) {
+      fs.rmSync(workspaceRoot, { recursive: true, force: true });
+    }
+  }
+}
+
+async function handleSignal(signal) {
+  console.error(`${signal} received; cleaning up health probe state`);
+  process.exitCode = 1;
+  try {
+    await cleanup();
+  } finally {
+    process.exit(1);
+  }
+}
+
+process.once("SIGTERM", () => {
+  void handleSignal("SIGTERM");
+});
+process.once("SIGINT", () => {
+  void handleSignal("SIGINT");
+});
+
 async function main() {
+  projectCreated = true;
   await dispatch({
     type: "project.create",
     commandId: crypto.randomUUID(),
@@ -250,7 +422,6 @@ async function main() {
     defaultModelSelection: { instanceId, model },
     createdAt: nowIso(),
   });
-  projectCreated = true;
   await dispatch({
     type: "thread.create",
     commandId: crypto.randomUUID(),
@@ -285,14 +456,32 @@ async function main() {
     const snap = await snapshot();
     const thread = (snap.threads || []).find((candidate) => candidate.id === threadId);
     lastState = thread?.latestTurn?.state || lastState;
-    if (lastState === "completed") {
+    if (completedWithinDeadline(thread)) {
       console.log(`completed thread=${threadId}`);
       return;
     }
     if (lastState === "interrupted" || lastState === "error") {
       throw new Error(`turn ${lastState}`);
     }
-    await sleep(2000);
+    await sleep(Math.min(2000, Math.max(0, deadline - Date.now())));
+  }
+  let finalThread;
+  try {
+    const snap = await snapshot(Date.now() + requestTimeoutMs);
+    finalThread = (snap.threads || []).find((candidate) => candidate.id === threadId);
+  } catch {
+    // Preserve the last observed state for the timeout error below.
+  }
+  if (finalThread) {
+    const thread = finalThread;
+    lastState = thread?.latestTurn?.state || lastState;
+    if (completedWithinDeadline(thread)) {
+      console.log(`completed thread=${threadId}`);
+      return;
+    }
+    if (lastState === "interrupted" || lastState === "error") {
+      throw new Error(`turn ${lastState}`);
+    }
   }
   throw new Error(`timeout last_state=${lastState}`);
 }
@@ -303,32 +492,7 @@ main()
     process.exitCode = 1;
   })
   .finally(async () => {
-    try {
-      const cleanupEndAt = Date.now() + cleanupTimeoutMs;
-      if (projectCreated) {
-        await dispatch({
-          type: "project.delete",
-          commandId: crypto.randomUUID(),
-          projectId,
-          force: true,
-        }, cleanupTimeoutMs, cleanupEndAt);
-      } else if (threadCreated) {
-        await dispatch(
-          { type: "thread.delete", commandId: crypto.randomUUID(), threadId },
-          cleanupTimeoutMs,
-          cleanupEndAt,
-        );
-      }
-    } catch (error) {
-      if (!process.exitCode) {
-        console.error(`cleanup failed: ${error && error.message ? error.message : String(error)}`);
-        process.exitCode = 1;
-      }
-    } finally {
-      if (ownsWorkspace && workspaceRoot.startsWith("/tmp/t3-health-probe-")) {
-        fs.rmSync(workspaceRoot, { recursive: true, force: true });
-      }
-    }
+    await cleanup();
   });
 NODE
 )"
@@ -348,8 +512,9 @@ NODE
 }
 
 failures=0
-run_systemd_check || failures=$((failures + 1))
-run_http_check || failures=$((failures + 1))
+deadline_at=$((SECONDS + timeout_secs))
+run_systemd_check "$deadline_at" || failures=$((failures + 1))
+run_http_check "$deadline_at" || failures=$((failures + 1))
 run_smoke_check || failures=$((failures + 1))
 
 [[ "$failures" -eq 0 ]]

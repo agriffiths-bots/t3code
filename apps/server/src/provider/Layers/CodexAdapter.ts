@@ -489,6 +489,7 @@ function mapItemLifecycle(
 function mapToRuntimeEvents(
   event: ProviderEvent,
   canonicalThreadId: ThreadId,
+  options: { readonly mcpProviderSessionId?: string } = {},
 ): ReadonlyArray<ProviderRuntimeEvent> {
   if (event.kind === "error") {
     if (!event.message) {
@@ -648,6 +649,9 @@ function mapToRuntimeEvents(
         payload: {
           ...(event.message ? { reason: event.message } : {}),
           ...(event.method === "session/closed" ? { exitKind: "graceful" } : {}),
+          ...(options.mcpProviderSessionId
+            ? { mcpProviderSessionId: options.mcpProviderSessionId }
+            : {}),
         },
       },
     ];
@@ -1441,7 +1445,11 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
         const eventFiber = yield* Stream.runForEach(runtime.events, (event) =>
           Effect.gen(function* () {
             yield* writeNativeEvent(event);
-            const runtimeEvents = mapToRuntimeEvents(event, event.threadId);
+            const runtimeEvents = mapToRuntimeEvents(
+              event,
+              event.threadId,
+              mcpSession ? { mcpProviderSessionId: mcpSession.providerSessionId } : {},
+            );
             if (runtimeEvents.length === 0) {
               yield* Effect.logDebug("ignoring unhandled Codex provider event", {
                 method: event.method,

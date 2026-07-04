@@ -78,6 +78,7 @@ interface OpenCodeSessionContext {
   readonly emittedTextByPartId: Map<string, string>;
   readonly completedAssistantPartIds: Set<string>;
   readonly turns: Array<OpenCodeTurnSnapshot>;
+  readonly mcpProviderSessionId?: string;
   activeTurnId: TurnId | undefined;
   activeAgent: string | undefined;
   activeVariant: string | undefined;
@@ -564,6 +565,9 @@ export function makeOpenCodeAdapter(
           reason: message,
           recoverable: false,
           exitKind: "error",
+          ...(context.mcpProviderSessionId
+            ? { mcpProviderSessionId: context.mcpProviderSessionId }
+            : {}),
         },
       }).pipe(Effect.ignore);
       // Inline the teardown that `stopOpenCodeContext` would do; we can't
@@ -1031,6 +1035,7 @@ export function makeOpenCodeAdapter(
         const serverUrl = openCodeSettings.serverUrl;
         const serverPassword = openCodeSettings.serverPassword;
         const directory = input.cwd ?? serverConfig.cwd;
+        const mcpSession = McpProviderSession.readMcpProviderSession(input.threadId);
         const existing = sessions.get(input.threadId);
         if (existing) {
           yield* stopOpenCodeContext(existing);
@@ -1054,7 +1059,6 @@ export function makeOpenCodeAdapter(
                 directory,
                 ...(server.external && serverPassword ? { serverPassword } : {}),
               });
-              const mcpSession = McpProviderSession.readMcpProviderSession(input.threadId);
               if (mcpSession && !server.external) {
                 yield* runOpenCodeSdk("mcp.add", () =>
                   client.mcp.add({
@@ -1138,6 +1142,7 @@ export function makeOpenCodeAdapter(
           messageRoleById: new Map(),
           completedAssistantPartIds: new Set(),
           turns: [],
+          ...(mcpSession ? { mcpProviderSessionId: mcpSession.providerSessionId } : {}),
           activeTurnId: undefined,
           activeAgent: undefined,
           activeVariant: undefined,
@@ -1372,6 +1377,9 @@ export function makeOpenCodeAdapter(
             reason: "Session stopped.",
             recoverable: false,
             exitKind: "graceful",
+            ...(context.mcpProviderSessionId
+              ? { mcpProviderSessionId: context.mcpProviderSessionId }
+              : {}),
           },
         });
       },

@@ -51,6 +51,10 @@ contextBridge.exposeInMainWorld("desktopBridge", {
   setConnectionCatalog: (catalog) =>
     ipcRenderer.invoke(IpcChannels.SET_CONNECTION_CATALOG_CHANNEL, catalog),
   clearConnectionCatalog: () => ipcRenderer.invoke(IpcChannels.CLEAR_CONNECTION_CATALOG_CHANNEL),
+  authenticateCloudflareAccess: (input) =>
+    ipcRenderer.invoke(IpcChannels.AUTHENTICATE_CLOUDFLARE_ACCESS_CHANNEL, input),
+  installCloudflareAccessCookie: (input) =>
+    ipcRenderer.invoke(IpcChannels.INSTALL_CLOUDFLARE_ACCESS_COOKIE_CHANNEL, input),
   discoverSshHosts: () => ipcRenderer.invoke(IpcChannels.DISCOVER_SSH_HOSTS_CHANNEL),
   ensureSshEnvironment: async (target, options) =>
     unwrapEnsureSshEnvironmentResult(
