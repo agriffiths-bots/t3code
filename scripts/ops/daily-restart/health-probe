@@ -223,7 +223,7 @@ mint_token() {
     entry="$checkout/apps/server/src/bin.ts"
   fi
   json="$(
-    T3CODE_HOME="$home" timeout 30 node "$entry" auth session issue \
+    env -u VITE_DEV_SERVER_URL T3CODE_HOME="$home" timeout 30 node "$entry" auth session issue \
       --json \
       --ttl "${T3DR_HEALTH_TOKEN_TTL:-$(default_token_ttl)}" \
       --label daily-restart-health-probe \
@@ -248,7 +248,7 @@ revoke_session() {
   else
     entry="$checkout/apps/server/src/bin.ts"
   fi
-  T3CODE_HOME="$home" timeout 30 node "$entry" auth session revoke "$session_id" >/dev/null
+  env -u VITE_DEV_SERVER_URL T3CODE_HOME="$home" timeout 30 node "$entry" auth session revoke "$session_id" >/dev/null
 }
 
 run_smoke_check() {
@@ -411,6 +411,7 @@ process.once("SIGINT", () => {
 });
 
 async function main() {
+  projectCreated = true;
   await dispatch({
     type: "project.create",
     commandId: crypto.randomUUID(),
@@ -421,7 +422,6 @@ async function main() {
     defaultModelSelection: { instanceId, model },
     createdAt: nowIso(),
   });
-  projectCreated = true;
   await dispatch({
     type: "thread.create",
     commandId: crypto.randomUUID(),

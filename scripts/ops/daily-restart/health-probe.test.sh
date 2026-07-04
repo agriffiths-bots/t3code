@@ -83,6 +83,7 @@ SH
 #!/usr/bin/env bash
 if [[ -n "${FAKE_NODE_LOG:-}" ]]; then
   printf 'node args=%s\n' "$*" >> "$FAKE_NODE_LOG"
+  printf 'node dev_url=%s args=%s\n' "${VITE_DEV_SERVER_URL-unset}" "$*" >> "$FAKE_NODE_LOG"
 fi
 if [[ "$1" == "-" ]]; then
   cat >/dev/null
@@ -184,9 +185,12 @@ if [[ "$(sed -n '1p' "$result")" == "0" ]]; then pass "zero-padded timeout parse
 assert_contains "$node_log" "node args=- http://127.0.0.1:1 8" "zero-padded timeout normalized before smoke child"
 assert_contains "$node_log" "timeout args=--kill-after=10 38 node -" "zero-padded timeout normalized before process timeout"
 
+export VITE_DEV_SERVER_URL=http://dev.invalid
 result="$(run_probe_without_supplied_token --timeout 301)"
+unset VITE_DEV_SERVER_URL
 node_log="$(dirname "$result")/node.log"
 assert_contains "$node_log" "--ttl 391s" "default minted token ttl scales with timeout"
+assert_contains "$node_log" "node dev_url=unset args=" "token issue/revoke clear dev server URL"
 assert_contains "$result" "CHECK spawn_wake PASS completed thread=fake" "minted token smoke pass line"
 
 sequence_dir="$(mktemp -d)"
