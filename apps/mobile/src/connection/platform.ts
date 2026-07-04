@@ -1,6 +1,7 @@
 import {
   ClientPresentation,
   CloudSession,
+  CloudflareAccessCookieInstaller,
   EnvironmentOwnedDataCleanup,
   PlatformConnectionSource,
   PrimaryEnvironmentAuth,
@@ -117,6 +118,10 @@ const capabilitiesLayer = Layer.succeedContext(
     Context.add(
       PrimaryEnvironmentAuth,
       PrimaryEnvironmentAuth.of({ bearerToken: Effect.succeed(Option.none()) }),
+    ),
+    Context.add(
+      CloudflareAccessCookieInstaller,
+      CloudflareAccessCookieInstaller.of({ install: () => Effect.void }),
     ),
     Context.add(
       RelayDeviceIdentity,

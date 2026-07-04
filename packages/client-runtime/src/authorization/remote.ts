@@ -31,6 +31,10 @@ export type CloudflareAccessAuthorization =
       readonly jwt: string;
     }
   | {
+      readonly _tag: "cookie";
+      readonly cookieValue: string;
+    }
+  | {
       readonly _tag: "service-token";
       readonly clientId: string;
       readonly clientSecret: string;
@@ -52,7 +56,8 @@ export const cloudflareAccessHeaders = (
     };
   }
 
-  const jwt = authorization.jwt.trim();
+  const jwt =
+    authorization._tag === "cookie" ? authorization.cookieValue.trim() : authorization.jwt.trim();
   if (jwt.length === 0) return {};
   return {
     "cf-access-jwt-assertion": jwt,

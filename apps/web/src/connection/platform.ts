@@ -1,6 +1,7 @@
 import {
   ClientPresentation,
   CloudSession,
+  CloudflareAccessCookieInstaller,
   EnvironmentOwnedDataCleanup,
   PlatformConnectionSource,
   PrimaryEnvironmentAuth,
@@ -216,6 +217,27 @@ const capabilitiesLayer = Layer.effectContext(
           }),
       }).pipe(Effect.map(Option.fromNullishOr)),
     });
+    const cloudflareAccessCookieInstaller = CloudflareAccessCookieInstaller.of({
+      install: (input) => {
+        const bridge = window.desktopBridge;
+        const installCloudflareAccessCookie = bridge?.installCloudflareAccessCookie;
+        if (!installCloudflareAccessCookie) {
+          return Effect.void;
+        }
+        return Effect.tryPromise({
+          try: () =>
+            installCloudflareAccessCookie({
+              host: input.httpBaseUrl,
+              cookieValue: input.cookieValue,
+            }),
+          catch: () =>
+            new ConnectionBlockedError({
+              reason: "authentication",
+              detail: "Could not restore the Cloudflare Access session cookie.",
+            }),
+        });
+      },
+    });
     const ssh = SshEnvironmentGateway.of({
       provision: Effect.fn("web.connectionPlatform.ssh.provision")(function* (target) {
         const bridge = window.desktopBridge;
@@ -278,6 +300,7 @@ const capabilitiesLayer = Layer.effectContext(
       Context.add(PrimaryEnvironmentAuth, primaryAuth),
       Context.add(RelayDeviceIdentity, identity),
       Context.add(ClientPresentation, presentation),
+      Context.add(CloudflareAccessCookieInstaller, cloudflareAccessCookieInstaller),
       Context.add(SshEnvironmentGateway, ssh),
     );
   }),

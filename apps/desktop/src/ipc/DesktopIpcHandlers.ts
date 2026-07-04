@@ -3,6 +3,10 @@ import * as Effect from "effect/Effect";
 import * as DesktopIpc from "./DesktopIpc.ts";
 import { getClientSettings, setClientSettings } from "./methods/clientSettings.ts";
 import {
+  authenticateCloudflareAccess,
+  installCloudflareAccessCookie,
+} from "./methods/cloudflareAccess.ts";
+import {
   clearConnectionCatalog,
   getConnectionCatalog,
   setConnectionCatalog,
@@ -56,6 +60,8 @@ export const installDesktopIpcHandlers = Effect.fn("desktop.ipc.installHandlers"
   yield* ipc.handle(getConnectionCatalog);
   yield* ipc.handle(setConnectionCatalog);
   yield* ipc.handle(clearConnectionCatalog);
+  yield* ipc.handle(authenticateCloudflareAccess);
+  yield* ipc.handle(installCloudflareAccessCookie);
 
   yield* ipc.handle(discoverSshHosts);
   yield* ipc.handle(ensureSshEnvironment);
