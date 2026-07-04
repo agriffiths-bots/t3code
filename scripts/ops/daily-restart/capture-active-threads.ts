@@ -143,7 +143,7 @@ function writeJsonAtomic(outPath: string, manifest: CaptureManifest): void {
   const payload = `${JSON.stringify(manifest, null, 2)}\n`;
 
   try {
-    NodeFS.writeFileSync(tempPath, payload, { encoding: "utf8", flag: "wx" });
+    NodeFS.writeFileSync(tempPath, payload, { encoding: "utf8", flag: "wx", mode: 0o600 });
     NodeFS.renameSync(tempPath, outPath);
   } catch (error) {
     try {

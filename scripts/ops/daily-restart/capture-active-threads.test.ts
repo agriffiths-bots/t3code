@@ -113,6 +113,7 @@ describe("capture-active-threads", () => {
       NodeFS.readdirSync(NodePath.dirname(outPath)).filter((entry) => entry.endsWith(".tmp")),
       [],
     );
+    assert.equal((NodeFS.statSync(outPath).mode & 0o777).toString(8), "600");
     assert.deepStrictEqual(manifest, {
       version: 1,
       captured_at: "2026-07-03T21:00:00.000Z",

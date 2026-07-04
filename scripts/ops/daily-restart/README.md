@@ -32,12 +32,13 @@ message to each manifest thread captured as `role:"active"` with
 `injected_at:null`.
 
 ```bash
-scripts/ops/daily-restart/inject-resume --manifest resume-manifest.json --origin "${T3DR_ORIGIN:-http://127.0.0.1:3773}" --token "$T3DR_TOKEN"
+T3DR_TOKEN="$T3DR_TOKEN" scripts/ops/daily-restart/inject-resume --manifest resume-manifest.json --origin "${T3DR_ORIGIN:-http://127.0.0.1:3773}"
 ```
 
 `--origin` defaults to `T3DR_ORIGIN`, then `http://127.0.0.1:3773`. `--token`
-defaults to `T3DR_TOKEN`, then `T3_TOKEN`; the flag wins for ephemeral tests.
-`--dry-run` reports without posting or mutating.
+defaults to `T3DR_TOKEN`, then `T3_TOKEN`; avoid passing live bearer tokens via
+argv. The flag wins for ephemeral tests. `--dry-run` reports without posting or
+mutating.
 
 The script calls `POST /api/orchestration/dispatch` with `orchestration:operate`,
 first sending `thread.interaction-mode.set` to force default mode, then
@@ -63,6 +64,24 @@ env -u VITE_DEV_SERVER_URL T3CODE_HOME="$T3CODE_HOME" node apps/server/dist/bin.
 
 Pass the token as `--token` or `T3DR_TOKEN`. If live runs from source, replace
 the entry with `apps/server/src/bin.ts`; the invariant is shared `T3CODE_HOME`.
+
+## Database snapshots
+
+`scripts/ops/daily-restart/t3-db-snapshot [--db PATH] [--out-dir DIR] [--keep N]`
+creates an online-safe SQLite snapshot. `--db` defaults to `T3DR_DB`, then
+`/home/adam/.t3-vps/userdata/state.sqlite`; `--out-dir` defaults to
+`T3DR_SNAPSHOT_DIR`, then `/home/adam/backups/t3-daily`; `--keep` defaults to
+`7`.
+
+`scripts/ops/daily-restart/t3-db-restore --snapshot FILE [--db PATH]` restores a
+verified snapshot. The caller must stop T3 first; active WAL/SHM files emit a
+warning only. Both tools export a cron PATH with trusted system directories first,
+set `umask 077`, use sqlite3
+`.backup` plus `PRAGMA integrity_check`, print only the result path to stdout,
+and exit non-zero on failure. Both tools must run as the existing database owner;
+root callers should drop privileges to that uid before invoking them. Snapshot
+staging stays inside the snapshot directory so the published file is installed
+with a same-filesystem rename.
 
 ## Integration smoke
 
