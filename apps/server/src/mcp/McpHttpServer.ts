@@ -27,16 +27,20 @@ import { ThreadToolkit } from "./toolkits/thread/tools.ts";
 import { SubagentToolkitHandlersLive } from "./toolkits/subagent/handlers.ts";
 import { SubagentToolkit } from "./toolkits/subagent/tools.ts";
 
+const mcpCredentialRecoveryHint =
+  "T3 Code MCP authentication failed because this provider-session credential is not active. Start a fresh T3 Code provider session; OAuth re-authorization cannot recover this local session credential.";
+
 const unauthorized = HttpServerResponse.jsonUnsafe(
   {
     error: "invalid_mcp_credential",
-    message: "A valid provider-scoped MCP bearer credential is required.",
+    message: mcpCredentialRecoveryHint,
+    recovery: "Start a fresh T3 Code provider session.",
   },
   {
     status: 401,
     headers: {
       "cache-control": "no-store",
-      "www-authenticate": "Bearer",
+      "www-authenticate": `Bearer error="invalid_token", error_description="${mcpCredentialRecoveryHint}"`,
     },
   },
 );
@@ -233,3 +237,7 @@ export const ToolkitRegistrationLive = Layer.mergeAll(
 );
 
 export const layer = ToolkitRegistrationLive.pipe(Layer.provideMerge(McpTransportLive));
+
+export const __testing = {
+  unauthorized,
+};

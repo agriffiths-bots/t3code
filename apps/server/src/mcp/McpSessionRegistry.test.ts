@@ -5,9 +5,11 @@ import * as Effect from "effect/Effect";
 import { HttpServer } from "effect/unstable/http";
 
 import * as ServerEnvironment from "../environment/ServerEnvironment.ts";
+import type { McpCapability } from "./McpInvocationContext.ts";
 import * as McpSessionRegistry from "./McpSessionRegistry.ts";
 
 const environmentId = EnvironmentId.make("environment-1");
+const mcpCapabilities = () => new Set<McpCapability>(["preview", "thread-management"]);
 const makeFakeHttpServer = (hostname: string, port = 43123) =>
   HttpServer.HttpServer.of({
     address: { _tag: "TcpAddress", hostname, port },
@@ -19,13 +21,13 @@ const fakeEnvironment = ServerEnvironment.ServerEnvironment.of({
   getDescriptor: Effect.die("unused"),
 });
 
-const makeRegistry = (now: () => number, httpServer = fakeHttpServer) =>
+const makeRegistry = (
+  now: () => number,
+  httpServer = fakeHttpServer,
+  options: Omit<McpSessionRegistry.McpSessionRegistryOptions, "now"> = {},
+) =>
   McpSessionRegistry.__testing
-    .make({
-      now,
-      idleTimeoutMs: 100,
-      maximumLifetimeMs: 1_000,
-    })
+    .make({ now, ...options })
     .pipe(
       Effect.provideService(HttpServer.HttpServer, httpServer),
       Effect.provideService(ServerEnvironment.ServerEnvironment, fakeEnvironment),
@@ -90,7 +92,7 @@ it.effect("issues the thread-management capability so sub-agent tools stay autho
   }),
 );
 
-it.effect("expires credentials after inactivity", () =>
+it.effect("keeps live provider-session credentials valid past the legacy expiration window", () =>
   Effect.gen(function* () {
     let timestamp = 1_000;
     const registry = yield* makeRegistry(() => timestamp);
@@ -99,7 +101,109 @@ it.effect("expires credentials after inactivity", () =>
       providerInstanceId: ProviderInstanceId.make("claude"),
     });
     const token = issued.config.authorizationHeader.replace(/^Bearer\s+/, "");
-    timestamp += 101;
+    timestamp += 48 * 60 * 60 * 1_000;
+
+    const resolved = yield* registry.resolve(token);
+    expect(resolved?.threadId).toBe(ThreadId.make("thread-2"));
+    expect(resolved?.expiresAt).toBeGreaterThan(timestamp);
+    expect(resolved?.expiresAt).toBeGreaterThan(issued.expiresAt);
+  }),
+);
+
+it.effect("refreshes the idle fallback expiry when a live credential is used", () =>
+  Effect.gen(function* () {
+    let timestamp = 1_000;
+    const registry = yield* makeRegistry(() => timestamp, fakeHttpServer, {
+      idleTimeoutMs: 1_000,
+    });
+    const issued = yield* registry.issue({
+      threadId: ThreadId.make("thread-refresh"),
+      providerInstanceId: ProviderInstanceId.make("claude"),
+    });
+    const token = issued.config.authorizationHeader.replace(/^Bearer\s+/, "");
+
+    timestamp += 900;
+    const firstResolved = yield* registry.resolve(token);
+    expect(firstResolved?.expiresAt).toBe(2_900);
+
+    timestamp += 900;
+    const secondResolved = yield* registry.resolve(token);
+    expect(secondResolved?.threadId).toBe(ThreadId.make("thread-refresh"));
+    expect(secondResolved?.expiresAt).toBe(3_800);
+  }),
+);
+
+it.effect("rejects idle credentials after the fallback expiry", () =>
+  Effect.gen(function* () {
+    let timestamp = 1_000;
+    const registry = yield* makeRegistry(() => timestamp, fakeHttpServer, {
+      idleTimeoutMs: 1_000,
+    });
+    const issued = yield* registry.issue({
+      threadId: ThreadId.make("thread-idle-expired"),
+      providerInstanceId: ProviderInstanceId.make("claude"),
+    });
+    const token = issued.config.authorizationHeader.replace(/^Bearer\s+/, "");
+
+    timestamp += 1_001;
+
+    expect(yield* registry.resolve(token)).toBeUndefined();
+  }),
+);
+
+it("prunes expired credentials before issuing new ones", () => {
+  const liveRecord = {
+    tokenHash: "live-token-hash",
+    lastUsedAt: 1_500,
+    scope: {
+      environmentId,
+      threadId: ThreadId.make("thread-live"),
+      providerSessionId: "provider-session-live",
+      providerInstanceId: ProviderInstanceId.make("claude"),
+      capabilities: mcpCapabilities(),
+      issuedAt: 1_500,
+      expiresAt: 3_000,
+    },
+  };
+  const expiredRecord = {
+    tokenHash: "expired-token-hash",
+    lastUsedAt: 1_000,
+    scope: {
+      environmentId,
+      threadId: ThreadId.make("thread-expired"),
+      providerSessionId: "provider-session-expired",
+      providerInstanceId: ProviderInstanceId.make("codex"),
+      capabilities: mcpCapabilities(),
+      issuedAt: 1_000,
+      expiresAt: 1_999,
+    },
+  };
+
+  const pruned = McpSessionRegistry.__testing.pruneExpired(
+    new Map([
+      [liveRecord.tokenHash, liveRecord],
+      [expiredRecord.tokenHash, expiredRecord],
+    ]),
+    2_000,
+  );
+
+  expect(Array.from(pruned.keys())).toEqual(["live-token-hash"]);
+});
+
+it.effect("rejects provider-session credentials once the session is revoked", () =>
+  Effect.gen(function* () {
+    let timestamp = 1_000;
+    const registry = yield* makeRegistry(() => timestamp);
+    const threadId = ThreadId.make("thread-ended");
+    const issued = yield* registry.issue({
+      threadId,
+      providerInstanceId: ProviderInstanceId.make("claude"),
+    });
+    const token = issued.config.authorizationHeader.replace(/^Bearer\s+/, "");
+    timestamp += 48 * 60 * 60 * 1_000;
+
+    yield* registry.revokeThread(threadId);
+
     expect(yield* registry.resolve(token)).toBeUndefined();
   }),
 );

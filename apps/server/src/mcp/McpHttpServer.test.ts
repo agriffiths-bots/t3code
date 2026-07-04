@@ -51,6 +51,14 @@ it("normalizes empty successful notification responses to accepted", () => {
   expect(resultResponse.status).toBe(200);
 });
 
+it("returns a non-OAuth recovery hint when MCP bearer auth fails", () => {
+  const response = McpHttpServer.__testing.unauthorized;
+  expect(response.status).toBe(401);
+  expect(response.headers["www-authenticate"]).toContain("invalid_token");
+  expect(response.headers["www-authenticate"]).toContain("provider-session credential");
+  expect(response.headers["www-authenticate"]).toContain("OAuth re-authorization cannot recover");
+});
+
 it.effect("returns bounded structural preview snapshot failures", () =>
   Effect.scoped(
     Effect.gen(function* () {

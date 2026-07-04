@@ -213,6 +213,19 @@ const correlateRuntimeEventWithInstance = (
   return { ...event, providerInstanceId: source.instanceId };
 };
 
+const isProviderSessionEndEvent = (event: ProviderRuntimeEvent): boolean =>
+  event.type === "session.exited";
+
+interface AdapterGenerationRecord {
+  readonly currentAdapter: ProviderAdapterShape<ProviderAdapterError>;
+  readonly currentGeneration: number;
+}
+
+interface TrackedMcpSessionRecord {
+  readonly adapterGeneration: number;
+  readonly providerSessionId: string;
+}
+
 const makeProviderService = Effect.fn("makeProviderService")(function* (
   options?: ProviderServiceLiveOptions,
 ) {
@@ -228,18 +241,303 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
   const directory = yield* ProviderSessionDirectory.ProviderSessionDirectory;
   const runtimeEventPubSub = yield* PubSub.unbounded<ProviderRuntimeEvent>();
   const nowIso = Effect.map(DateTime.now, DateTime.formatIso);
+  const mcpEndCleanupRetryDelay = "250 millis";
+  const adapterGenerations = yield* Ref.make(
+    new Map<ProviderInstanceId, AdapterGenerationRecord>(),
+  );
+  const trackedMcpSessions = yield* Ref.make(
+    new Map<ProviderInstanceId, Map<ThreadId, TrackedMcpSessionRecord>>(),
+  );
+  const pendingMcpSessionStarts = yield* Ref.make(new Map<ThreadId, number>());
+  const beginMcpSessionStart = (threadId: ThreadId) =>
+    Ref.update(pendingMcpSessionStarts, (current) => {
+      const next = new Map(current);
+      next.set(threadId, (current.get(threadId) ?? 0) + 1);
+      return next;
+    });
+  const endMcpSessionStart = (threadId: ThreadId) =>
+    Ref.update(pendingMcpSessionStarts, (current) => {
+      const count = current.get(threadId) ?? 0;
+      if (count <= 0) return current;
+      const next = new Map(current);
+      if (count === 1) {
+        next.delete(threadId);
+      } else {
+        next.set(threadId, count - 1);
+      }
+      return next;
+    });
+  const hasPendingMcpSessionStart = (threadId: ThreadId) =>
+    Ref.get(pendingMcpSessionStarts).pipe(Effect.map((current) => current.has(threadId)));
+  const waitForPendingMcpSessionStart = Effect.fn("ProviderService.waitForPendingMcpSessionStart")(
+    function* (threadId: ThreadId) {
+      while (yield* hasPendingMcpSessionStart(threadId)) {
+        yield* Effect.sleep(mcpEndCleanupRetryDelay);
+      }
+    },
+  );
+  const observeAdapterGeneration = (
+    providerInstanceId: ProviderInstanceId,
+    adapter: ProviderAdapterShape<ProviderAdapterError>,
+  ) =>
+    Ref.modify(adapterGenerations, (current) => {
+      const existing = current.get(providerInstanceId);
+      const generation =
+        existing?.currentAdapter === adapter
+          ? existing.currentGeneration
+          : (existing?.currentGeneration ?? 0) + 1;
+      const next = new Map(current);
+      next.set(providerInstanceId, {
+        currentAdapter: adapter,
+        currentGeneration: generation,
+      });
+      return [generation, next] as const;
+    });
+  const getAdapterGenerationForStart = Effect.fn("ProviderService.getAdapterGenerationForStart")(
+    function* (
+      providerInstanceId: ProviderInstanceId,
+      adapter: ProviderAdapterShape<ProviderAdapterError>,
+    ) {
+      const existing = (yield* Ref.get(adapterGenerations)).get(providerInstanceId);
+      if (!existing || existing.currentAdapter === adapter) {
+        return yield* observeAdapterGeneration(providerInstanceId, adapter);
+      }
+
+      const currentAdapter = Option.getOrUndefined(
+        yield* registry.getByInstance(providerInstanceId).pipe(Effect.option),
+      );
+      if (currentAdapter === adapter) {
+        return yield* observeAdapterGeneration(providerInstanceId, adapter);
+      }
+      return 0;
+    },
+  );
+  const getCurrentAdapterGeneration = (providerInstanceId: ProviderInstanceId) =>
+    Ref.get(adapterGenerations).pipe(
+      Effect.map((current) => current.get(providerInstanceId)?.currentGeneration),
+    );
+  const isCurrentAdapterGeneration = (
+    providerInstanceId: ProviderInstanceId,
+    adapterGeneration: number,
+  ) =>
+    Ref.get(adapterGenerations).pipe(
+      Effect.map(
+        (current) => current.get(providerInstanceId)?.currentGeneration === adapterGeneration,
+      ),
+    );
+  const trackMcpSession = (
+    threadId: ThreadId,
+    providerInstanceId: ProviderInstanceId,
+    adapterGeneration: number,
+  ) =>
+    Ref.update(trackedMcpSessions, (current) => {
+      const mcpSession = McpProviderSession.readMcpProviderSession(threadId);
+      if (!mcpSession || mcpSession.providerInstanceId !== providerInstanceId) {
+        return current;
+      }
+      const next = new Map(current);
+      const threads = new Map(next.get(providerInstanceId) ?? []);
+      threads.set(threadId, {
+        adapterGeneration,
+        providerSessionId: mcpSession.providerSessionId,
+      });
+      next.set(providerInstanceId, threads);
+      return next;
+    });
+  const forgetMcpSession = (
+    threadId: ThreadId,
+    providerInstanceId?: ProviderInstanceId,
+    providerSessionId?: string,
+  ) =>
+    Ref.update(trackedMcpSessions, (current) => {
+      let changed = false;
+      const next = new Map<ProviderInstanceId, Map<ThreadId, TrackedMcpSessionRecord>>();
+      for (const [trackedProviderInstanceId, threads] of current) {
+        const tracked = threads.get(threadId);
+        if (
+          (providerInstanceId !== undefined && trackedProviderInstanceId !== providerInstanceId) ||
+          tracked === undefined ||
+          (providerSessionId !== undefined && tracked.providerSessionId !== providerSessionId)
+        ) {
+          next.set(trackedProviderInstanceId, threads);
+          continue;
+        }
+        changed = true;
+        const remaining = new Map(threads);
+        remaining.delete(threadId);
+        if (remaining.size > 0) {
+          next.set(trackedProviderInstanceId, remaining);
+        }
+      }
+      return changed ? next : current;
+    });
   const prepareMcpSession = (threadId: ThreadId, providerInstanceId: ProviderInstanceId) =>
     McpSessionRegistry.issueActiveMcpCredential({ threadId, providerInstanceId }).pipe(
-      Effect.tap((credential) =>
-        credential
-          ? Effect.sync(() => McpProviderSession.setMcpProviderSession(credential.config))
-          : Effect.void,
-      ),
+      Effect.map((credential) => {
+        if (credential) {
+          McpProviderSession.setMcpProviderSession(credential.config);
+          return credential.config;
+        }
+        const currentMcpSession = McpProviderSession.readMcpProviderSession(threadId);
+        return currentMcpSession?.providerInstanceId === providerInstanceId
+          ? currentMcpSession
+          : undefined;
+      }),
     );
   const clearMcpSession = (threadId: ThreadId) =>
     McpSessionRegistry.revokeActiveMcpThread(threadId).pipe(
       Effect.tap(() => Effect.sync(() => McpProviderSession.clearMcpProviderSession(threadId))),
+      Effect.andThen(forgetMcpSession(threadId)),
     );
+  const clearPreparedMcpSession = (
+    threadId: ThreadId,
+    providerInstanceId: ProviderInstanceId,
+    preparedMcpSession: McpProviderSession.McpProviderSessionConfig | undefined,
+  ) =>
+    preparedMcpSession
+      ? clearMcpProviderSession(threadId, providerInstanceId, preparedMcpSession.providerSessionId)
+      : Effect.void;
+  const stopSupersededAdapterSession = (
+    adapter: ProviderAdapterShape<ProviderAdapterError>,
+    threadId: ThreadId,
+    providerInstanceId: ProviderInstanceId,
+  ) =>
+    adapter.stopSession(threadId).pipe(
+      Effect.catchCause((cause) =>
+        Effect.logWarning("provider.session.superseded-stop-failed", {
+          threadId,
+          providerInstanceId,
+          cause,
+        }),
+      ),
+    );
+  const clearMcpProviderSession = (
+    threadId: ThreadId,
+    providerInstanceId: ProviderInstanceId,
+    providerSessionId: string,
+  ) =>
+    McpSessionRegistry.revokeActiveMcpProviderSession(providerSessionId).pipe(
+      Effect.tap(() =>
+        Effect.sync(() =>
+          McpProviderSession.clearMcpProviderSessionIfProviderSessionId(
+            threadId,
+            providerSessionId,
+          ),
+        ),
+      ),
+      Effect.andThen(forgetMcpSession(threadId, providerInstanceId, providerSessionId)),
+    );
+
+  const clearMcpSessionAfterProviderSessionEnds = Effect.fn(
+    "ProviderService.clearMcpSessionAfterProviderSessionEnds",
+  )(function* (
+    source: {
+      readonly instanceId: ProviderInstanceId;
+      readonly provider: ProviderDriverKind;
+      readonly adapterGeneration: number;
+    },
+    event: ProviderRuntimeEvent,
+    observed: {
+      readonly providerSessionId?: string;
+      readonly duringPendingStart: boolean;
+    },
+  ) {
+    if (!isProviderSessionEndEvent(event)) return;
+    const eventProviderSessionId =
+      event.type === "session.exited" ? event.payload.mcpProviderSessionId : undefined;
+    if (event.type === "session.exited" && eventProviderSessionId === undefined) {
+      return;
+    }
+    if (eventProviderSessionId === undefined && observed.duringPendingStart) {
+      return;
+    }
+    const endedProviderSessionId = eventProviderSessionId ?? observed.providerSessionId;
+    if (endedProviderSessionId === undefined) {
+      return;
+    }
+
+    yield* Effect.sleep(mcpEndCleanupRetryDelay);
+    yield* waitForPendingMcpSessionStart(event.threadId);
+
+    const currentMcpSession = McpProviderSession.readMcpProviderSession(event.threadId);
+    if (!currentMcpSession || currentMcpSession.providerInstanceId !== source.instanceId) {
+      return;
+    }
+    if (currentMcpSession.providerSessionId !== endedProviderSessionId) {
+      return;
+    }
+
+    const tracked = (yield* Ref.get(trackedMcpSessions))
+      .get(source.instanceId)
+      ?.get(event.threadId);
+    if (
+      tracked &&
+      (tracked.adapterGeneration !== source.adapterGeneration ||
+        tracked.providerSessionId !== endedProviderSessionId)
+    ) {
+      return;
+    }
+
+    yield* clearMcpProviderSession(event.threadId, source.instanceId, endedProviderSessionId).pipe(
+      Effect.catchCause((cause) =>
+        Effect.logWarning("provider.session.mcp-clear-failed", {
+          threadId: event.threadId,
+          provider: source.provider,
+          cause,
+        }),
+      ),
+    );
+  });
+
+  const clearMcpSessionsForProviderInstance = Effect.fn(
+    "ProviderService.clearMcpSessionsForProviderInstance",
+  )(function* (
+    providerInstanceId: ProviderInstanceId,
+    options?: {
+      readonly retainAdapterGeneration?: number;
+    },
+  ) {
+    const trackedEntries = Array.from(
+      (yield* Ref.get(trackedMcpSessions)).get(providerInstanceId) ?? [],
+    ).filter(
+      ([, tracked]) =>
+        options?.retainAdapterGeneration === undefined ||
+        tracked.adapterGeneration !== options.retainAdapterGeneration,
+    );
+    yield* Effect.forEach(
+      trackedEntries,
+      ([threadId, tracked]) =>
+        Effect.gen(function* () {
+          const currentMcpSession = McpProviderSession.readMcpProviderSession(threadId);
+          if (!currentMcpSession || currentMcpSession.providerInstanceId !== providerInstanceId) {
+            yield* forgetMcpSession(threadId, providerInstanceId, tracked.providerSessionId);
+            return;
+          }
+          if (yield* hasPendingMcpSessionStart(threadId)) {
+            return;
+          }
+          const latestTracked = (yield* Ref.get(trackedMcpSessions))
+            .get(providerInstanceId)
+            ?.get(threadId);
+          if (
+            options?.retainAdapterGeneration !== undefined &&
+            latestTracked?.adapterGeneration === options.retainAdapterGeneration
+          ) {
+            return;
+          }
+          yield* clearMcpProviderSession(threadId, providerInstanceId, tracked.providerSessionId);
+        }).pipe(
+          Effect.catchCause((cause) =>
+            Effect.logWarning("provider.session.mcp-clear-instance-failed", {
+              threadId,
+              providerInstanceId,
+              cause,
+            }),
+          ),
+        ),
+      { discard: true },
+    );
+  });
 
   const publishRuntimeEvent = (event: ProviderRuntimeEvent): Effect.Effect<void> =>
     Effect.succeed(event).pipe(
@@ -343,27 +641,43 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
     source: {
       readonly instanceId: ProviderInstanceId;
       readonly provider: ProviderDriverKind;
+      readonly adapterGeneration: number;
     },
     event: ProviderRuntimeEvent,
   ): Effect.Effect<void> =>
     Effect.sync(() => correlateRuntimeEventWithInstance(source, event)).pipe(
       Effect.flatMap((canonicalEvent) =>
-        persistWaitingRuntimeState(source, canonicalEvent).pipe(
-          Effect.catchCause((cause) =>
-            Effect.logWarning("provider.session.waiting-persist-failed", {
-              threadId: canonicalEvent.threadId,
-              provider: canonicalEvent.provider,
-              cause,
-            }),
-          ),
-          Effect.andThen(
-            increment(providerRuntimeEventsTotal, {
-              provider: canonicalEvent.provider,
-              eventType: canonicalEvent.type,
-            }),
-          ),
-          Effect.andThen(publishRuntimeEvent(canonicalEvent)),
-        ),
+        Effect.gen(function* () {
+          const isSessionEnd = isProviderSessionEndEvent(canonicalEvent);
+          const observedMcpSession = isSessionEnd
+            ? McpProviderSession.readMcpProviderSession(canonicalEvent.threadId)
+            : undefined;
+          const observedDuringPendingStart = isSessionEnd
+            ? yield* hasPendingMcpSessionStart(canonicalEvent.threadId)
+            : false;
+          yield* persistWaitingRuntimeState(source, canonicalEvent).pipe(
+            Effect.catchCause((cause) =>
+              Effect.logWarning("provider.session.waiting-persist-failed", {
+                threadId: canonicalEvent.threadId,
+                provider: canonicalEvent.provider,
+                cause,
+              }),
+            ),
+          );
+          yield* increment(providerRuntimeEventsTotal, {
+            provider: canonicalEvent.provider,
+            eventType: canonicalEvent.type,
+          });
+          if (isSessionEnd) {
+            yield* clearMcpSessionAfterProviderSessionEnds(source, canonicalEvent, {
+              ...(observedMcpSession
+                ? { providerSessionId: observedMcpSession.providerSessionId }
+                : {}),
+              duringPendingStart: observedDuringPendingStart,
+            }).pipe(Effect.forkDetach, Effect.asVoid);
+          }
+          yield* publishRuntimeEvent(canonicalEvent);
+        }),
       ),
     );
 
@@ -399,6 +713,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
         .pipe(Effect.tapError(Effect.logWarning), Effect.option);
       if (Option.isNone(adapterOption)) continue;
       const adapter = adapterOption.value;
+      const adapterGeneration = yield* observeAdapterGeneration(id, adapter);
       next.set(id, adapter);
       if (previous.get(id) !== adapter) {
         yield* Stream.runForEach(adapter.streamEvents, (event) =>
@@ -406,12 +721,39 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
             {
               instanceId: id,
               provider: adapter.provider,
+              adapterGeneration,
             },
             event,
           ),
         ).pipe(Effect.forkScoped);
       }
     }
+    yield* Effect.forEach(
+      previous,
+      ([instanceId, adapter]) => {
+        if (next.get(instanceId) === adapter) return Effect.void;
+        return getCurrentAdapterGeneration(instanceId).pipe(
+          Effect.flatMap((retainAdapterGeneration) =>
+            clearMcpSessionsForProviderInstance(
+              instanceId,
+              next.has(instanceId) && retainAdapterGeneration !== undefined
+                ? { retainAdapterGeneration }
+                : {},
+            ),
+          ),
+        );
+      },
+      { discard: true },
+    );
+    yield* Ref.update(adapterGenerations, (current) => {
+      let changed = false;
+      const pruned = new Map(current);
+      for (const instanceId of previous.keys()) {
+        if (next.has(instanceId)) continue;
+        changed = pruned.delete(instanceId) || changed;
+      }
+      return changed ? pruned : current;
+    });
     yield* Ref.set(subscribedAdapters, next);
   });
 
@@ -435,6 +777,13 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
     });
     return yield* Effect.gen(function* () {
       const adapter = yield* registry.getByInstance(bindingInstanceId);
+      const adapterGeneration = yield* getAdapterGenerationForStart(bindingInstanceId, adapter);
+      if (adapterGeneration === 0) {
+        return yield* toValidationError(
+          input.operation,
+          `Provider instance '${bindingInstanceId}' was replaced before recovering thread '${input.binding.threadId}'. Retry the operation.`,
+        );
+      }
       const hasResumeCursor =
         input.binding.resumeCursor !== null && input.binding.resumeCursor !== undefined;
       const hasActiveSession = yield* adapter.hasSession(input.binding.threadId);
@@ -467,9 +816,11 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
       const persistedCwd = readPersistedCwd(input.binding.runtimePayload);
       const persistedModelSelection = readPersistedModelSelection(input.binding.runtimePayload);
 
-      yield* prepareMcpSession(input.binding.threadId, bindingInstanceId);
-      const resumed = yield* adapter
-        .startSession({
+      yield* beginMcpSessionStart(input.binding.threadId);
+      let preparedMcpSession: McpProviderSession.McpProviderSessionConfig | undefined;
+      const resumed = yield* Effect.gen(function* () {
+        preparedMcpSession = yield* prepareMcpSession(input.binding.threadId, bindingInstanceId);
+        return yield* adapter.startSession({
           threadId: input.binding.threadId,
           provider: input.binding.provider,
           providerInstanceId: bindingInstanceId,
@@ -477,15 +828,37 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
           ...(persistedModelSelection ? { modelSelection: persistedModelSelection } : {}),
           ...(hasResumeCursor ? { resumeCursor: input.binding.resumeCursor } : {}),
           runtimeMode: input.binding.runtimeMode ?? "full-access",
-        })
-        .pipe(Effect.onError(() => clearMcpSession(input.binding.threadId)));
+        });
+      }).pipe(
+        Effect.onError(() =>
+          clearPreparedMcpSession(input.binding.threadId, bindingInstanceId, preparedMcpSession),
+        ),
+        Effect.ensuring(endMcpSessionStart(input.binding.threadId)),
+      );
       if (resumed.provider !== adapter.provider) {
-        yield* clearMcpSession(input.binding.threadId);
+        yield* clearPreparedMcpSession(
+          input.binding.threadId,
+          bindingInstanceId,
+          preparedMcpSession,
+        );
         return yield* toValidationError(
           input.operation,
           `Adapter/provider mismatch while recovering thread '${input.binding.threadId}'. Expected '${adapter.provider}', received '${resumed.provider}'.`,
         );
       }
+      if (!(yield* isCurrentAdapterGeneration(bindingInstanceId, adapterGeneration))) {
+        yield* stopSupersededAdapterSession(adapter, input.binding.threadId, bindingInstanceId);
+        yield* clearPreparedMcpSession(
+          input.binding.threadId,
+          bindingInstanceId,
+          preparedMcpSession,
+        );
+        return yield* toValidationError(
+          input.operation,
+          `Provider instance '${bindingInstanceId}' was replaced while recovering thread '${input.binding.threadId}'. Retry the operation.`,
+        );
+      }
+      yield* trackMcpSession(input.binding.threadId, bindingInstanceId, adapterGeneration);
 
       yield* upsertSessionBinding(
         { ...resumed, providerInstanceId: bindingInstanceId },
@@ -660,23 +1033,46 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
           "provider.cwd.effective": effectiveCwd ?? "",
         });
         const adapter = yield* registry.getByInstance(resolvedInstanceId);
-        yield* prepareMcpSession(threadId, resolvedInstanceId);
-        const session = yield* adapter
-          .startSession({
+        const adapterGeneration = yield* getAdapterGenerationForStart(resolvedInstanceId, adapter);
+        if (adapterGeneration === 0) {
+          return yield* toValidationError(
+            "ProviderService.startSession",
+            `Provider instance '${resolvedInstanceId}' was replaced before starting thread '${threadId}'. Retry the start.`,
+          );
+        }
+        yield* beginMcpSessionStart(threadId);
+        let preparedMcpSession: McpProviderSession.McpProviderSessionConfig | undefined;
+        const session = yield* Effect.gen(function* () {
+          preparedMcpSession = yield* prepareMcpSession(threadId, resolvedInstanceId);
+          return yield* adapter.startSession({
             ...input,
             providerInstanceId: resolvedInstanceId,
             ...(effectiveCwd !== undefined ? { cwd: effectiveCwd } : {}),
             ...(effectiveResumeCursor !== undefined ? { resumeCursor: effectiveResumeCursor } : {}),
-          })
-          .pipe(Effect.onError(() => clearMcpSession(threadId)));
+          });
+        }).pipe(
+          Effect.onError(() =>
+            clearPreparedMcpSession(threadId, resolvedInstanceId, preparedMcpSession),
+          ),
+          Effect.ensuring(endMcpSessionStart(threadId)),
+        );
 
         if (session.provider !== adapter.provider) {
-          yield* clearMcpSession(threadId);
+          yield* clearPreparedMcpSession(threadId, resolvedInstanceId, preparedMcpSession);
           return yield* toValidationError(
             "ProviderService.startSession",
             `Adapter/provider mismatch: requested '${adapter.provider}', received '${session.provider}'.`,
           );
         }
+        if (!(yield* isCurrentAdapterGeneration(resolvedInstanceId, adapterGeneration))) {
+          yield* stopSupersededAdapterSession(adapter, threadId, resolvedInstanceId);
+          yield* clearPreparedMcpSession(threadId, resolvedInstanceId, preparedMcpSession);
+          return yield* toValidationError(
+            "ProviderService.startSession",
+            `Provider instance '${resolvedInstanceId}' was replaced while starting thread '${threadId}'. Retry the start.`,
+          );
+        }
+        yield* trackMcpSession(threadId, resolvedInstanceId, adapterGeneration);
         const sessionWithInstance = {
           ...session,
           providerInstanceId: resolvedInstanceId,
@@ -1102,6 +1498,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
     yield* Effect.forEach(currentAdapters, ([, adapter]) => adapter.stopAll()).pipe(Effect.asVoid);
     yield* McpSessionRegistry.revokeAllActiveMcpCredentials();
     McpProviderSession.clearAllMcpProviderSessions();
+    yield* Ref.set(trackedMcpSessions, new Map());
     const bindings = yield* directory.listBindings().pipe(Effect.orElseSucceed(() => []));
     yield* Effect.forEach(bindings, (binding) =>
       Effect.gen(function* () {
