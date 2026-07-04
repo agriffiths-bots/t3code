@@ -7,9 +7,11 @@ export PATH
 origin=""
 service=""
 timeout_secs="120"
+smoke_instance="${T3DR_SMOKE_INSTANCE:-}"
+smoke_model="${T3DR_SMOKE_MODEL:-}"
 
 usage() {
-  echo "usage: health-probe --origin URL --service NAME [--timeout SECS]" >&2
+  echo "usage: health-probe --origin URL --service NAME --instance INSTANCE --model MODEL [--timeout SECS]" >&2
 }
 
 normalize_origin() {
@@ -46,6 +48,16 @@ while [[ $# -gt 0 ]]; do
       timeout_secs="$2"
       shift 2
       ;;
+    --instance)
+      require_value "$@"
+      smoke_instance="$2"
+      shift 2
+      ;;
+    --model)
+      require_value "$@"
+      smoke_model="$2"
+      shift 2
+      ;;
     -h|--help)
       usage
       exit 0
@@ -65,6 +77,16 @@ fi
 
 if ! [[ "$timeout_secs" =~ ^[0-9]+$ ]] || [[ "$timeout_secs" -le 0 ]]; then
   echo "health-probe: --timeout must be a positive integer" >&2
+  exit 2
+fi
+
+if [[ -z "$smoke_instance" ]]; then
+  echo "health-probe: --instance or T3DR_SMOKE_INSTANCE is required" >&2
+  exit 2
+fi
+
+if [[ -z "$smoke_model" ]]; then
+  echo "health-probe: --model or T3DR_SMOKE_MODEL is required" >&2
   exit 2
 fi
 
@@ -243,17 +265,15 @@ run_smoke_check() {
   printf '%s' "$token" > "$token_file"
   chmod 600 "$token_file"
 
-  output="$(timeout "$((timeout_secs + 30))" node - "$origin" "$timeout_secs" "$token_file" <<'NODE' 2>&1
+  output="$(timeout --kill-after=10 "$((timeout_secs + 30))" node - "$origin" "$timeout_secs" "$token_file" "$smoke_instance" "$smoke_model" <<'NODE' 2>&1
 const crypto = require("node:crypto");
 const fs = require("node:fs");
 
-const [origin, timeoutSecsText, tokenPath] = process.argv.slice(2);
+const [origin, timeoutSecsText, tokenPath, instanceId, model] = process.argv.slice(2);
 const baseUrl = new URL(origin);
 const token = fs.readFileSync(tokenPath, "utf8");
 const timeoutMs = Number(timeoutSecsText) * 1000;
 const deadline = Date.now() + timeoutMs;
-const instanceId = process.env.T3DR_SMOKE_INSTANCE || "claudeAgent";
-const model = process.env.T3DR_SMOKE_MODEL || "claude-sonnet-5";
 const ownsWorkspace = !process.env.T3DR_SMOKE_WORKSPACE;
 const workspaceRoot = process.env.T3DR_SMOKE_WORKSPACE || fs.mkdtempSync("/tmp/t3-health-probe-");
 const projectId = crypto.randomUUID();
@@ -266,6 +286,7 @@ const headers = {
 };
 const requestTimeoutMs = Math.min(10000, Math.max(2000, Math.floor(timeoutMs / 4)));
 const cleanupTimeoutMs = 5000;
+let cleanupStarted = false;
 
 function nowIso() {
   return new Date().toISOString();
@@ -328,6 +349,54 @@ async function snapshot() {
 async function sleep(ms) {
   await new Promise((resolve) => setTimeout(resolve, ms));
 }
+
+async function cleanup() {
+  if (cleanupStarted) return;
+  cleanupStarted = true;
+  try {
+    const cleanupEndAt = Date.now() + cleanupTimeoutMs;
+    if (projectCreated) {
+      await dispatch({
+        type: "project.delete",
+        commandId: crypto.randomUUID(),
+        projectId,
+        force: true,
+      }, cleanupTimeoutMs, cleanupEndAt);
+    } else if (threadCreated) {
+      await dispatch(
+        { type: "thread.delete", commandId: crypto.randomUUID(), threadId },
+        cleanupTimeoutMs,
+        cleanupEndAt,
+      );
+    }
+  } catch (error) {
+    if (!process.exitCode) {
+      console.error(`cleanup failed: ${error && error.message ? error.message : String(error)}`);
+      process.exitCode = 1;
+    }
+  } finally {
+    if (ownsWorkspace && workspaceRoot.startsWith("/tmp/t3-health-probe-")) {
+      fs.rmSync(workspaceRoot, { recursive: true, force: true });
+    }
+  }
+}
+
+async function handleSignal(signal) {
+  console.error(`${signal} received; cleaning up health probe state`);
+  process.exitCode = 1;
+  try {
+    await cleanup();
+  } finally {
+    process.exit(1);
+  }
+}
+
+process.once("SIGTERM", () => {
+  void handleSignal("SIGTERM");
+});
+process.once("SIGINT", () => {
+  void handleSignal("SIGINT");
+});
 
 async function main() {
   await dispatch({
@@ -393,32 +462,7 @@ main()
     process.exitCode = 1;
   })
   .finally(async () => {
-    try {
-      const cleanupEndAt = Date.now() + cleanupTimeoutMs;
-      if (projectCreated) {
-        await dispatch({
-          type: "project.delete",
-          commandId: crypto.randomUUID(),
-          projectId,
-          force: true,
-        }, cleanupTimeoutMs, cleanupEndAt);
-      } else if (threadCreated) {
-        await dispatch(
-          { type: "thread.delete", commandId: crypto.randomUUID(), threadId },
-          cleanupTimeoutMs,
-          cleanupEndAt,
-        );
-      }
-    } catch (error) {
-      if (!process.exitCode) {
-        console.error(`cleanup failed: ${error && error.message ? error.message : String(error)}`);
-        process.exitCode = 1;
-      }
-    } finally {
-      if (ownsWorkspace && workspaceRoot.startsWith("/tmp/t3-health-probe-")) {
-        fs.rmSync(workspaceRoot, { recursive: true, force: true });
-      }
-    }
+    await cleanup();
   });
 NODE
 )"

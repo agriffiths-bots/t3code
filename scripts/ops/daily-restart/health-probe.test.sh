@@ -22,6 +22,22 @@ make_fake_bin() {
   mkdir -p "$dir"
   cat > "$dir/timeout" <<'SH'
 #!/usr/bin/env bash
+if [[ -n "${FAKE_NODE_LOG:-}" ]]; then
+  printf 'timeout args=%s\n' "$*" >> "$FAKE_NODE_LOG"
+fi
+while [[ "${1:-}" == --* ]]; do
+  case "$1" in
+    --kill-after)
+      shift 2
+      ;;
+    --kill-after=*)
+      shift
+      ;;
+    *)
+      shift
+      ;;
+  esac
+done
 shift
 exec "$@"
 SH
@@ -97,7 +113,7 @@ run_probe() {
   local tmp out rc
   tmp="$(mktemp -d)"
   make_fake_bin "$tmp/bin"
-  FAKE_NODE_LOG="$tmp/node.log" T3DR_TEST_PATH_PREFIX="$tmp/bin" T3_TOKEN=fake-token "$SCRIPT" --origin http://127.0.0.1:1 --service fake.service "$@" >"$tmp/out" 2>"$tmp/err"
+  FAKE_NODE_LOG="$tmp/node.log" T3DR_TEST_PATH_PREFIX="$tmp/bin" T3_TOKEN=fake-token "$SCRIPT" --origin http://127.0.0.1:1 --service fake.service --instance fakeAgent --model fake-model "$@" >"$tmp/out" 2>"$tmp/err"
   rc=$?
   out="$(cat "$tmp/out")"
   printf '%s\n%s\n%s\n' "$rc" "$out" "$(cat "$tmp/err")" > "$tmp/result"
@@ -108,7 +124,7 @@ run_probe_without_supplied_token() {
   local tmp out rc
   tmp="$(mktemp -d)"
   make_fake_bin "$tmp/bin"
-  FAKE_NODE_LOG="$tmp/node.log" T3DR_TEST_PATH_PREFIX="$tmp/bin" T3DR_CHECKOUT="$tmp/checkout" T3CODE_HOME="$tmp/state" "$SCRIPT" --origin http://127.0.0.1:1 --service fake.service "$@" >"$tmp/out" 2>"$tmp/err"
+  FAKE_NODE_LOG="$tmp/node.log" T3DR_TEST_PATH_PREFIX="$tmp/bin" T3DR_CHECKOUT="$tmp/checkout" T3CODE_HOME="$tmp/state" "$SCRIPT" --origin http://127.0.0.1:1 --service fake.service --instance fakeAgent --model fake-model "$@" >"$tmp/out" 2>"$tmp/err"
   rc=$?
   out="$(cat "$tmp/out")"
   printf '%s\n%s\n%s\n' "$rc" "$out" "$(cat "$tmp/err")" > "$tmp/result"
@@ -141,15 +157,25 @@ assert_contains "$result" "CHECK systemd PASS active" "systemd pass line"
 assert_contains "$result" "CHECK http PASS 200" "http pass line"
 assert_contains "$result" "CHECK spawn_wake PASS completed thread=fake" "spawn pass line"
 
-for flag in --origin --service --timeout; do
+for flag in --origin --service --timeout --instance --model; do
   result="$(run_probe_exact "$flag")"
   if [[ "$(sed -n '1p' "$result")" == "2" ]]; then pass "$flag missing value exits usage"; else fail "$flag missing value exits usage"; fi
   assert_contains "$result" "health-probe: $flag requires a value" "$flag missing value message"
 done
 
+result="$(run_probe_exact --origin http://127.0.0.1:1 --service fake.service)"
+if [[ "$(sed -n '1p' "$result")" == "2" ]]; then pass "smoke instance is required"; else fail "smoke instance is required"; fi
+assert_contains "$result" "health-probe: --instance or T3DR_SMOKE_INSTANCE is required" "missing smoke instance message"
+
+result="$(run_probe_exact --origin http://127.0.0.1:1 --service fake.service --instance fakeAgent)"
+if [[ "$(sed -n '1p' "$result")" == "2" ]]; then pass "smoke model is required"; else fail "smoke model is required"; fi
+assert_contains "$result" "health-probe: --model or T3DR_SMOKE_MODEL is required" "missing smoke model message"
+
 result="$(run_probe "trailing slash origin" --origin http://127.0.0.1:1/)"
 node_log="$(dirname "$result")/node.log"
 assert_contains "$node_log" "node args=- http://127.0.0.1:1 120" "origin normalized before smoke request construction"
+assert_contains "$node_log" "fakeAgent fake-model" "explicit smoke provider is passed to smoke child"
+assert_contains "$node_log" "timeout args=--kill-after=10 150 node -" "smoke child has process-level timeout"
 assert_contains "$node_log" "curl origin=http://127.0.0.1:1" "origin normalized before http readiness check"
 
 result="$(run_probe_without_supplied_token --timeout 301)"

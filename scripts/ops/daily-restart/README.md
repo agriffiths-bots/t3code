@@ -9,6 +9,8 @@ to run from cron or test harnesses outside the T3 service process tree.
 scripts/ops/daily-restart/health-probe \
   --origin http://127.0.0.1:3773 \
   --service t3code.service \
+  --instance claudeAgent \
+  --model claude-sonnet-5 \
   --timeout 120
 ```
 
@@ -24,6 +26,9 @@ It exits zero only when all checks pass. `T3_TOKEN` may be supplied by tests or
 ephemeral harnesses. Otherwise the probe mints a short-lived local session from
 `T3DR_CHECKOUT` and `T3DR_DB`/`T3CODE_HOME`, stores it only in a private temp
 file for the smoke child, and revokes the session after cleanup.
+
+Set `--instance`/`--model` (or `T3DR_SMOKE_INSTANCE`/`T3DR_SMOKE_MODEL`) to a
+provider and model that are configured on the target service.
 
 ## `capture-active-threads.ts`
 
