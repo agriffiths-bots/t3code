@@ -502,6 +502,44 @@ describe("ChildThreadCoordinator", () => {
     expect(result.status).toBe("failed");
   });
 
+  it("settles error turn-diff as failed even when projection shows completed", async () => {
+    const child = ThreadId.make("child-error-projection-completed");
+    const parent = ThreadId.make("parent-error-projection-completed");
+    const turn1 = TurnId.make("turn-1");
+    const harness = await createHarness({
+      threads: [
+        makeThreadState({
+          threadId: child,
+          parentThreadId: parent,
+          latestTurn: makeLatestTurn("running", turn1),
+          session: makeSession(child, "running", turn1),
+        }),
+      ],
+    });
+    await harness.register({
+      parentThreadId: parent,
+      childThreadId: child,
+      detached: false,
+      model: codexModel,
+      spawnedAtMs: 0,
+    });
+    await harness.feed(sessionSetEvent(child, "running", turn1));
+    harness.setThread(
+      makeThreadState({
+        threadId: child,
+        parentThreadId: parent,
+        latestTurn: makeLatestTurn("completed", turn1),
+        session: makeSession(child, "ready"),
+        assistantText: "stale completed text",
+      }),
+    );
+    await harness.feed(turnDiffEvent(child, "error", turn1));
+
+    const result = await runtimeRun(harness, child);
+    expect(result.status).toBe("failed");
+    expect(result.error).toBe("turn diff error");
+  });
+
   it("does NOT settle missing turn-diff without matching projection evidence", async () => {
     const child = ThreadId.make("child-missing");
     const parent = ThreadId.make("parent-3");

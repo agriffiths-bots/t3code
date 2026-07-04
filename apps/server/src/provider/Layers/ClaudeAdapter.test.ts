@@ -1145,6 +1145,75 @@ describe("ClaudeAdapterLive", () => {
     );
   });
 
+  it.effect("completes a deferred Claude result when the clean stream exits first", () => {
+    const harness = makeHarness();
+    return Effect.gen(function* () {
+      const adapter = yield* ClaudeAdapter;
+
+      const runtimeEventsFiber = yield* Stream.takeUntil(
+        adapter.streamEvents,
+        (event) => event.type === "turn.completed",
+      ).pipe(Stream.runCollect, Effect.forkChild);
+
+      const session = yield* adapter.startSession({
+        threadId: THREAD_ID,
+        provider: ProviderDriverKind.make("claudeAgent"),
+        runtimeMode: "full-access",
+      });
+
+      const turn = yield* adapter.sendTurn({
+        threadId: session.threadId,
+        input: "run a background command",
+        attachments: [],
+      });
+
+      harness.query.emit({
+        type: "system",
+        subtype: "task_started",
+        session_id: "sdk-session-task-deferred-clean-exit",
+        uuid: "task-started-deferred-clean-exit",
+        task_id: "task-deferred-clean-exit",
+        tool_use_id: "tool-deferred-clean-exit",
+        description: "Run slow command",
+        task_type: "local_bash",
+      } as unknown as SDKMessage);
+
+      harness.query.emit({
+        type: "result",
+        subtype: "success",
+        is_error: false,
+        errors: [],
+        result: "FINAL",
+        stop_reason: "end_turn",
+        total_cost_usd: 0.25,
+        usage: {
+          input_tokens: 3,
+          output_tokens: 5,
+        },
+        session_id: "sdk-session-task-deferred-clean-exit",
+        uuid: "result-task-deferred-clean-exit",
+      } as unknown as SDKMessage);
+      harness.query.finish();
+
+      const runtimeEvents = Array.from(yield* Fiber.join(runtimeEventsFiber));
+      const turnCompletedEvents = runtimeEvents.filter((event) => event.type === "turn.completed");
+
+      assert.equal(turnCompletedEvents.length, 1);
+      const completed = turnCompletedEvents[0];
+      assert.equal(String(completed?.turnId), String(turn.turnId));
+      assert.equal(completed?.payload.state, "completed");
+      assert.equal(completed?.payload.stopReason, "end_turn");
+      assert.deepEqual(completed?.payload.usage, {
+        input_tokens: 3,
+        output_tokens: 5,
+      });
+      assert.equal(completed?.payload.totalCostUsd, 0.25);
+    }).pipe(
+      Effect.provideService(Random.Random, makeDeterministicRandomService()),
+      Effect.provide(harness.layer),
+    );
+  });
+
   it.effect("does not flush a stale synthetic task completion into the next user turn", () => {
     const harness = makeHarness();
     return Effect.gen(function* () {

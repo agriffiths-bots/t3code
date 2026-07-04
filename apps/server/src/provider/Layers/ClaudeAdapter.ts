@@ -3229,7 +3229,13 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
     }
 
     if (Exit.isSuccess(exit)) {
-      yield* flushDeferredRuntimeTaskCompletion(context);
+      const flushed = yield* flushDeferredRuntimeTaskCompletion(context);
+      const deferred = context.deferredRuntimeTaskCompletion;
+      if (!flushed && deferred && context.turnState?.turnId === deferred.turnId) {
+        yield* completeTurn(context, deferred.status, deferred.errorMessage, deferred.result, {
+          deferRuntimeTasks: false,
+        });
+      }
     }
 
     if (Exit.isSuccess(exit) && context.waitingForWake) {

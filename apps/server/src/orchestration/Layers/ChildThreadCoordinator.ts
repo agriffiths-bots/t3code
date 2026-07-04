@@ -707,7 +707,7 @@ const make = Effect.gen(function* () {
         }
         missingDiffWhileRunningByChild.delete(threadId);
         if (
-          turnState === "completed" ||
+          (turnState === "completed" && status === "missing") ||
           (turnState !== "error" && turnState !== "interrupted" && status === "ready")
         ) {
           yield* settleChild(threadId, "completed", null);
@@ -715,7 +715,11 @@ const make = Effect.gen(function* () {
           yield* settleChild(
             threadId,
             "failed",
-            turnState ? `turn ${turnState}` : `turn diff ${status}`,
+            status !== "missing" && status !== "ready"
+              ? `turn diff ${status}`
+              : turnState
+                ? `turn ${turnState}`
+                : `turn diff ${status}`,
           );
         }
         // A child that went idle drains any provider-deferred steer (R-C). Run
