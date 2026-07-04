@@ -160,6 +160,30 @@ describe("connection onboarding", () => {
     }),
   );
 
+  it.effect("persists Cloudflare Access cookies from desktop pairing", () =>
+    Effect.gen(function* () {
+      const calls: Array<{ readonly url: string; readonly init: RequestInit }> = [];
+      const registration = yield* preparePairingRegistration({
+        host: "remote.example.test",
+        pairingCode: "pairing-token",
+        cloudflareAccessCookie: "cf-access-cookie",
+      }).pipe(Effect.provide(Layer.mergeAll(CLIENT_PRESENTATION_LAYER, pairingHttpLayer(calls))));
+
+      expect(registration.credential).toMatchObject({
+        token: "bearer-token",
+        cloudflareAccessCookie: "cf-access-cookie",
+      });
+      for (const call of calls) {
+        expect(call.init.headers).toEqual(
+          expect.objectContaining({
+            "cf-access-jwt-assertion": "cf-access-cookie",
+            cookie: "CF_Authorization=cf-access-cookie",
+          }),
+        );
+      }
+    }),
+  );
+
   it.effect("persists Cloudflare Access service-token credentials from pairing urls", () =>
     Effect.gen(function* () {
       enableHeaderCapableWebSocketRuntime();
