@@ -59,6 +59,8 @@ manager stops the service, checks out the pre-restart SHA, restores the DB
 snapshot, starts the service, and probes again. Result and full logs are written
 under `$T3DR_LEDGER/<UTC date>/`. Set `T3DR_SMOKE_INSTANCE` and
 `T3DR_SMOKE_MODEL` to the provider/model pair the health probe should wake.
+For one-off operator runs, `--smoke-instance` and `--smoke-model` override those
+environment defaults.
 
 ## Capture active threads
 
