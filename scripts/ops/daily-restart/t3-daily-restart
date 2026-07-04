@@ -306,13 +306,25 @@ run_health_probe() {
 }
 
 pin_health_probe() {
-  local source_probe pinned_probe
+  local source_probe pinned_probe temp_probe
   source_probe="$(resolve_tool health-probe)" || return 1
-  mkdir -p "$pinned_tools_dir"
-  chmod 700 "$pinned_tools_dir"
+  mkdir -p "$pinned_tools_dir" || return 1
+  chmod 700 "$pinned_tools_dir" || return 1
   pinned_probe="$pinned_tools_dir/health-probe"
-  cp -p -- "$source_probe" "$pinned_probe"
-  chmod 700 "$pinned_probe"
+  temp_probe="$pinned_tools_dir/.health-probe.$$"
+  rm -f -- "$temp_probe" || return 1
+  cp -p -- "$source_probe" "$temp_probe" || {
+    rm -f -- "$temp_probe"
+    return 1
+  }
+  chmod 700 "$temp_probe" || {
+    rm -f -- "$temp_probe"
+    return 1
+  }
+  mv -f -- "$temp_probe" "$pinned_probe" || {
+    rm -f -- "$temp_probe"
+    return 1
+  }
   pinned_health_probe="$pinned_probe"
   log "PINNED health-probe source=$source_probe pinned=$pinned_probe"
 }

@@ -218,6 +218,18 @@ unset FAKE_SNAPSHOT_RC
 if grep -Fq "systemctl --user stop" "$tmp/calls.log" 2>/dev/null; then fail "snapshot failure stopped service"; else pass "snapshot failure aborts before stop"; fi
 
 tmp="$(mktemp -d)"
+mkdir -p "$tmp/ledger/$(date -u +%F)"
+: >"$tmp/ledger/$(date -u +%F)/pinned-tools"
+run_manager "$tmp"
+[[ "$(cat "$tmp/rc")" != "0" ]] && pass "health probe pin failure exits nonzero" || fail "health probe pin failure exits nonzero"
+grep -Fq "RESULT FAILED" "$tmp/ledger/"*/t3-daily-restart.result && pass "health probe pin failure recorded" || fail "health probe pin failure recorded"
+if grep -Fq "systemctl --user stop" "$tmp/calls.log"; then
+  fail "health probe pin failure stopped service"
+else
+  pass "health probe pin failure aborts before stop"
+fi
+
+tmp="$(mktemp -d)"
 export FAKE_SYSTEMCTL_HANG_STOP_N=1
 run_manager "$tmp"
 unset FAKE_SYSTEMCTL_HANG_STOP_N
