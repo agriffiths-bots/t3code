@@ -1,0 +1,561 @@
+#!/usr/bin/env bash
+set -u
+
+PATH="${T3DR_TEST_PATH_PREFIX:+$T3DR_TEST_PATH_PREFIX:}/home/linuxbrew/.linuxbrew/bin:/home/adam/.local/bin:/usr/local/bin:/usr/bin:/bin"
+export PATH
+
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+
+db="${T3DR_DB:-/home/adam/.t3-vps/userdata/state.sqlite}"
+checkout="${T3DR_CHECKOUT:-/home/adam/t3code}"
+service="${T3DR_SERVICE:-t3code.service}"
+origin="${T3DR_ORIGIN:-http://127.0.0.1:3773}"
+snapshot_dir="${T3DR_SNAPSHOT_DIR:-/home/adam/backups/t3-daily}"
+ledger="${T3DR_LEDGER:-/home/adam/.openclaw/daily-restart}"
+probe_timeout="${T3DR_PROBE_TIMEOUT:-180}"
+stop_timeout="${T3DR_STOP_TIMEOUT:-120}"
+kill_timeout="${T3DR_KILL_TIMEOUT:-30}"
+smoke_instance="${T3DR_SMOKE_INSTANCE:-}"
+smoke_model="${T3DR_SMOKE_MODEL:-}"
+
+usage() {
+  cat >&2 <<'USAGE'
+usage: t3-daily-restart [--db PATH] [--checkout PATH] [--service NAME]
+                        [--origin URL] [--snapshot-dir DIR] [--ledger DIR]
+                        [--probe-timeout SECS]
+                        [--smoke-instance INSTANCE] [--smoke-model MODEL]
+USAGE
+}
+
+require_value() {
+  local flag="$1"
+  if [[ "$#" -lt 2 || -z "${2:-}" || "${2:-}" == --* ]]; then
+    echo "t3-daily-restart: $flag requires a value" >&2
+    usage
+    exit 2
+  fi
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --db) require_value "$@"; db="$2"; shift 2 ;;
+    --checkout) require_value "$@"; checkout="$2"; shift 2 ;;
+    --service) require_value "$@"; service="$2"; shift 2 ;;
+    --origin) require_value "$@"; origin="$2"; shift 2 ;;
+    --snapshot-dir) require_value "$@"; snapshot_dir="$2"; shift 2 ;;
+    --ledger) require_value "$@"; ledger="$2"; shift 2 ;;
+    --probe-timeout) require_value "$@"; probe_timeout="$2"; shift 2 ;;
+    --smoke-instance) require_value "$@"; smoke_instance="$2"; shift 2 ;;
+    --smoke-model) require_value "$@"; smoke_model="$2"; shift 2 ;;
+    -h|--help) usage; exit 0 ;;
+    *) echo "t3-daily-restart: unknown arg: $1" >&2; usage; exit 2 ;;
+  esac
+done
+
+if [[ -z "$db" || -z "$checkout" || -z "$service" || -z "$origin" || -z "$snapshot_dir" || -z "$ledger" ]]; then
+  usage
+  exit 2
+fi
+if ! [[ "$probe_timeout" =~ ^[0-9]+$ ]]; then
+  echo "t3-daily-restart: --probe-timeout must be a positive integer" >&2
+  exit 2
+fi
+probe_timeout="$((10#$probe_timeout))"
+if [[ "$probe_timeout" -le 0 ]]; then
+  echo "t3-daily-restart: --probe-timeout must be a positive integer" >&2
+  exit 2
+fi
+if ! [[ "$stop_timeout" =~ ^[0-9]+$ ]] || [[ "$((10#$stop_timeout))" -le 0 ]]; then
+  echo "t3-daily-restart: T3DR_STOP_TIMEOUT must be a positive integer" >&2
+  exit 2
+fi
+stop_timeout="$((10#$stop_timeout))"
+if ! [[ "$kill_timeout" =~ ^[0-9]+$ ]] || [[ "$((10#$kill_timeout))" -le 0 ]]; then
+  echo "t3-daily-restart: T3DR_KILL_TIMEOUT must be a positive integer" >&2
+  exit 2
+fi
+kill_timeout="$((10#$kill_timeout))"
+if [[ -z "$smoke_instance" ]]; then
+  echo "t3-daily-restart: --smoke-instance or T3DR_SMOKE_INSTANCE is required" >&2
+  exit 2
+fi
+if [[ -z "$smoke_model" ]]; then
+  echo "t3-daily-restart: --smoke-model or T3DR_SMOKE_MODEL is required" >&2
+  exit 2
+fi
+
+export T3DR_DB="$db" T3DR_CHECKOUT="$checkout" T3DR_SERVICE="$service" T3DR_ORIGIN="$origin"
+export T3DR_SNAPSHOT_DIR="$snapshot_dir" T3DR_LEDGER="$ledger"
+export T3DR_SMOKE_INSTANCE="$smoke_instance" T3DR_SMOKE_MODEL="$smoke_model"
+
+utc_date="$(date -u +%F)"
+run_dir="$ledger/$utc_date"
+mkdir -p "$run_dir" "$snapshot_dir"
+log_file="$run_dir/t3-daily-restart.log"
+result_file="$run_dir/t3-daily-restart.result"
+manifest="$run_dir/resume-manifest.json"
+lock_file="$ledger/t3-daily-restart.lock"
+pinned_tools_dir="$run_dir/pinned-tools"
+pinned_health_probe=""
+
+exec 9>"$lock_file"
+if ! flock -n 9; then
+  echo "t3-daily-restart: another run is already active" >&2
+  printf '%s RESULT LOCKED service=%s\n' "$(date -u +%FT%TZ)" "$service" >>"$result_file"
+  exit 75
+fi
+
+log() {
+  printf '[%s] %s\n' "$(date -u +%FT%TZ)" "$*" | tee -a "$log_file" >&2
+}
+
+ensure_user_bus_env() {
+  if [[ -z "${XDG_RUNTIME_DIR:-}" ]]; then
+    XDG_RUNTIME_DIR="/run/user/$(id -u)"
+    export XDG_RUNTIME_DIR
+  fi
+  if [[ -z "${DBUS_SESSION_BUS_ADDRESS:-}" && -S "$XDG_RUNTIME_DIR/bus" ]]; then
+    DBUS_SESSION_BUS_ADDRESS="unix:path=$XDG_RUNTIME_DIR/bus"
+    export DBUS_SESSION_BUS_ADDRESS
+  fi
+}
+
+record_result() {
+  printf '%s RESULT %s pre_sha=%s target_sha=%s snapshot=%s manifest=%s\n' \
+    "$(date -u +%FT%TZ)" "$1" "${pre_sha:-unknown}" "${target_sha:-unknown}" \
+    "${snapshot_path:-unknown}" "$manifest" | tee -a "$result_file" >&2
+}
+
+resolve_tool() {
+  local name="$1"
+  if command -v "$name" >/dev/null 2>&1; then
+    command -v "$name"
+    return 0
+  fi
+  if [[ -x "$script_dir/$name" ]]; then
+    printf '%s/%s\n' "$script_dir" "$name"
+    return 0
+  fi
+  if [[ -x "$checkout/scripts/ops/daily-restart/$name" ]]; then
+    printf '%s/scripts/ops/daily-restart/%s\n' "$checkout" "$name"
+    return 0
+  fi
+  return 1
+}
+
+run_capture() {
+  local timeout_secs="$1"
+  shift
+  if [[ "${1:-}" == "systemctl" && "${2:-}" == "--user" ]]; then
+    ensure_user_bus_env
+  fi
+  log "RUN timeout=$timeout_secs $*"
+  timeout "$timeout_secs" "$@" >>"$log_file" 2>&1
+}
+
+run_output() {
+  local timeout_secs="$1"
+  shift
+  log "RUN_CAPTURE timeout=$timeout_secs $*"
+  timeout "$timeout_secs" "$@" 2>>"$log_file"
+}
+
+systemctl_is_inactive_or_failed() {
+  local context="$1"
+  local output rc
+  ensure_user_bus_env
+  log "RUN timeout=10 systemctl --user is-active $service"
+  output="$(timeout 10 systemctl --user is-active "$service" 2>>"$log_file")"
+  rc=$?
+  output="${output//$'\n'/ }"
+  [[ -n "$output" ]] || output="empty"
+  log "$context is-active rc=$rc state=$output"
+  [[ "$output" == "inactive" || "$output" == "failed" ]]
+}
+
+stop_service_or_escalate() {
+  local context="$1"
+  log "$context stop begin service=$service timeout=${stop_timeout}s"
+  if run_capture "$stop_timeout" systemctl --user stop "$service"; then
+    if systemctl_is_inactive_or_failed "$context after stop"; then
+      log "$context stop verified inactive"
+      return 0
+    fi
+    log "$context stop returned success but service is not inactive/failed"
+  else
+    log "$context stop failed or timed out; verifying state before escalation"
+    if systemctl_is_inactive_or_failed "$context after stop failure"; then
+      log "$context stop failure left service inactive"
+      return 0
+    fi
+  fi
+
+  log "$context escalate SIGTERM via systemctl kill"
+  if ! run_capture "$kill_timeout" systemctl --user kill "$service"; then
+    log "$context SIGTERM kill command failed"
+  fi
+  if systemctl_is_inactive_or_failed "$context after SIGTERM"; then
+    log "$context SIGTERM verified inactive"
+    return 0
+  fi
+
+  log "$context escalate SIGKILL via systemctl kill"
+  if ! run_capture "$kill_timeout" systemctl --user kill -s SIGKILL "$service"; then
+    log "$context SIGKILL kill command failed"
+  fi
+  if systemctl_is_inactive_or_failed "$context after SIGKILL"; then
+    log "$context SIGKILL verified inactive"
+    return 0
+  fi
+
+  log "$context stop failed; service is still not inactive/failed after escalation"
+  return 1
+}
+
+json_fill_manifest() {
+  local snapshot="$1"
+  if [[ ! -s "$manifest" ]]; then
+    printf '{}\n' >"$manifest"
+  fi
+  node - "$manifest" "$pre_sha" "$snapshot" <<'NODE'
+const fs = require("node:fs");
+const path = require("node:path");
+const [manifestPath, preSha, snapshotPath] = process.argv.slice(2);
+const data = JSON.parse(fs.readFileSync(manifestPath, "utf8"));
+data.pre_sha = preSha;
+data.db_snapshot = snapshotPath;
+const tempPath = path.join(path.dirname(manifestPath), `.${path.basename(manifestPath)}.${process.pid}.tmp`);
+try {
+  fs.writeFileSync(tempPath, `${JSON.stringify(data, null, 2)}\n`, {
+    encoding: "utf8",
+    flag: "wx",
+    mode: 0o600,
+  });
+  fs.renameSync(tempPath, manifestPath);
+} catch (error) {
+  try {
+    fs.rmSync(tempPath, { force: true });
+  } catch {
+    // Preserve the original write/rename error.
+  }
+  throw error;
+}
+NODE
+}
+
+json_validate_manifest() {
+  if [[ ! -s "$manifest" ]]; then
+    printf '{}\n' >"$manifest"
+  fi
+  node -e 'JSON.parse(require("node:fs").readFileSync(process.argv[1], "utf8"))' "$manifest"
+}
+
+health_is_pass() {
+  local probe_file="$1"
+  grep -Eq '^CHECK [^ ]+ FAIL( |$)' "$probe_file" && return 1
+  grep -Eq '^CHECK systemd PASS( |$)' "$probe_file" || return 1
+  grep -Eq '^CHECK http PASS( |$)' "$probe_file" || return 1
+  grep -Eq '^CHECK spawn_wake PASS( |$)' "$probe_file"
+}
+
+claude_advisory() {
+  local probe_file="$1"
+  local prompt verdict rc
+  if ! command -v claude >/dev/null 2>&1; then
+    log "CLAUDE_ADVISORY unavailable"
+    return 0
+  fi
+  prompt=$'Return exactly one token, HEALTHY or UNHEALTHY, for this health-probe output. Any CHECK FAIL is UNHEALTHY. Output:\n'
+  verdict="$(timeout 45 claude -p --model claude-sonnet-5 "${prompt}$(cat "$probe_file")" 2>>"$log_file")"
+  rc=$?
+  verdict="$(tr -dc 'A-Z_-' <<<"$verdict" | head -c 32)"
+  if [[ "$rc" -ne 0 || ! "$verdict" =~ ^(HEALTHY|UNHEALTHY)$ ]]; then
+    log "CLAUDE_ADVISORY invalid rc=$rc verdict=${verdict:-empty}"
+    return 0
+  fi
+  log "CLAUDE_ADVISORY $verdict"
+}
+
+inject_resume_manifest() {
+  local inject_tool
+  inject_tool="$(resolve_tool inject-resume)" || {
+    log "missing inject-resume"
+    return 1
+  }
+  run_capture 600 "$inject_tool" --origin "$origin" --manifest "$manifest"
+}
+
+run_health_probe() {
+  local probe_file="$1"
+  local probe
+  probe="$pinned_health_probe"
+  if [[ -z "$probe" ]]; then
+    probe="$(resolve_tool health-probe)" || {
+      echo "health-probe missing" >"$probe_file"
+      return 127
+    }
+  fi
+  if [[ ! -x "$probe" ]]; then
+    echo "health-probe missing" >"$probe_file"
+    return 127
+  fi
+  log "HEALTH_PROBE tool=$probe"
+  timeout "$((probe_timeout * 2 + 60))" "$probe" --origin "$origin" --service "$service" \
+    --instance "$smoke_instance" --model "$smoke_model" --timeout "$probe_timeout" \
+    >"$probe_file" 2>>"$log_file"
+}
+
+pin_health_probe() {
+  local source_probe pinned_probe temp_probe
+  source_probe="$(resolve_tool health-probe)" || return 1
+  mkdir -p "$pinned_tools_dir" || return 1
+  chmod 700 "$pinned_tools_dir" || return 1
+  pinned_probe="$pinned_tools_dir/health-probe"
+  temp_probe="$pinned_tools_dir/.health-probe.$$"
+  rm -f -- "$temp_probe" || return 1
+  cp -p -- "$source_probe" "$temp_probe" || {
+    rm -f -- "$temp_probe"
+    return 1
+  }
+  chmod 700 "$temp_probe" || {
+    rm -f -- "$temp_probe"
+    return 1
+  }
+  mv -f -- "$temp_probe" "$pinned_probe" || {
+    rm -f -- "$temp_probe"
+    return 1
+  }
+  pinned_health_probe="$pinned_probe"
+  log "PINNED health-probe source=$source_probe pinned=$pinned_probe"
+}
+
+rollback() {
+  local probe_file="$1"
+  local restore
+  log "ROLLBACK begin"
+  if ! stop_service_or_escalate "ROLLBACK"; then
+    log "ROLLBACK stop failed"
+    record_result "ROLLBACK-FAILED"
+    return 1
+  fi
+  run_capture 60 git -C "$checkout" checkout "$pre_sha" || {
+    log "ROLLBACK git checkout failed"
+    record_result "ROLLBACK-FAILED"
+    return 1
+  }
+  restore="$(resolve_tool t3-db-restore)" || {
+    log "ROLLBACK missing t3-db-restore"
+    record_result "ROLLBACK-FAILED"
+    return 1
+  }
+  run_capture 300 "$restore" --db "$db" --snapshot "$snapshot_path" || {
+    log "ROLLBACK db restore failed"
+    record_result "ROLLBACK-FAILED"
+    return 1
+  }
+  run_capture 900 pnpm -C "$checkout/apps/web" run build || {
+    log "ROLLBACK web rebuild failed"
+    record_result "ROLLBACK-FAILED"
+    return 1
+  }
+  run_capture 900 pnpm -C "$checkout" run build:desktop || {
+    log "ROLLBACK deploy artifact rebuild failed"
+    record_result "ROLLBACK-FAILED"
+    return 1
+  }
+  run_capture 60 systemctl --user start "$service" || {
+    log "ROLLBACK start failed"
+    record_result "ROLLBACK-FAILED"
+    return 1
+  }
+  rollback_probe_rc=0
+  run_health_probe "$probe_file.rollback" || rollback_probe_rc=$?
+  cat "$probe_file.rollback" >>"$log_file"
+  if [[ "$rollback_probe_rc" -eq 0 ]] && health_is_pass "$probe_file.rollback"; then
+    if ! inject_resume_manifest; then
+      log "ROLLBACK inject-resume failed"
+      record_result "ROLLBACK-FAILED"
+      return 1
+    fi
+    record_result "ROLLBACK-OK"
+  else
+    record_result "ROLLBACK-FAILED"
+    return 1
+  fi
+  return 1
+}
+
+code_only_rollback() {
+  local probe_file="$1"
+  log "CODE_ROLLBACK begin"
+  if ! stop_service_or_escalate "CODE_ROLLBACK"; then
+    log "CODE_ROLLBACK stop failed"
+    record_result "CODE-ROLLBACK-FAILED"
+    return 1
+  fi
+  run_capture 60 git -C "$checkout" checkout "$pre_sha" || {
+    log "CODE_ROLLBACK git checkout failed"
+    record_result "CODE-ROLLBACK-FAILED"
+    return 1
+  }
+  run_capture 900 pnpm -C "$checkout/apps/web" run build || {
+    log "CODE_ROLLBACK web rebuild failed"
+    record_result "CODE-ROLLBACK-FAILED"
+    return 1
+  }
+  run_capture 900 pnpm -C "$checkout" run build:desktop || {
+    log "CODE_ROLLBACK deploy artifact rebuild failed"
+    record_result "CODE-ROLLBACK-FAILED"
+    return 1
+  }
+  run_capture 60 systemctl --user start "$service" || {
+    log "CODE_ROLLBACK start failed"
+    record_result "CODE-ROLLBACK-FAILED"
+    return 1
+  }
+  code_probe_rc=0
+  run_health_probe "$probe_file.code-rollback" || code_probe_rc=$?
+  cat "$probe_file.code-rollback" >>"$log_file"
+  if [[ "$code_probe_rc" -eq 0 ]] && health_is_pass "$probe_file.code-rollback"; then
+    if ! inject_resume_manifest; then
+      log "CODE_ROLLBACK inject-resume failed"
+      record_result "CODE-ROLLBACK-FAILED"
+      return 1
+    fi
+    record_result "CODE-ROLLBACK-OK"
+  else
+    record_result "CODE-ROLLBACK-FAILED"
+    return 1
+  fi
+  return 1
+}
+
+pre_sha=""
+target_sha=""
+snapshot_path=""
+
+log "BEGIN service=$service checkout=$checkout origin=$origin"
+
+if ! run_capture 120 git -C "$checkout" fetch origin main:refs/remotes/origin/main; then
+  log "git fetch failed"
+  record_result "FAILED"
+  exit 1
+fi
+pre_sha="$(run_output 30 git -C "$checkout" rev-parse HEAD)" || {
+  log "failed to resolve pre_sha"
+  record_result "FAILED"
+  exit 1
+}
+target_sha="$(run_output 30 git -C "$checkout" rev-parse origin/main)" || {
+  log "failed to resolve origin/main"
+  record_result "FAILED"
+  exit 1
+}
+
+snapshot_tool="$(resolve_tool t3-db-snapshot)" || {
+  log "missing t3-db-snapshot"
+  record_result "FAILED"
+  exit 1
+}
+preflight_snapshot_path="$(run_output 600 "$snapshot_tool" --db "$db" --out-dir "$snapshot_dir")"
+if [[ "$?" -ne 0 || -z "$preflight_snapshot_path" ]]; then
+  log "snapshot failed; aborting before shutdown"
+  record_result "SNAPSHOT-FAILED"
+  exit 1
+fi
+log "preflight_snapshot=$preflight_snapshot_path"
+
+capture_tool="$(resolve_tool capture-active-threads)" || {
+  log "missing capture-active-threads"
+  record_result "FAILED"
+  exit 1
+}
+
+if ! run_capture 300 "$capture_tool" --db "$db" --out "$manifest"; then
+  log "capture-active-threads failed"
+  record_result "FAILED"
+  exit 1
+fi
+if ! json_validate_manifest >>"$log_file" 2>&1; then
+  log "capture manifest was not valid JSON"
+  record_result "FAILED"
+  exit 1
+fi
+
+if ! pin_health_probe; then
+  log "failed to pin pre-update health-probe"
+  record_result "FAILED"
+  exit 1
+fi
+
+if ! stop_service_or_escalate "SHUTDOWN"; then
+  log "systemctl stop failed"
+  record_result "STOP-FAILED"
+  exit 1
+fi
+
+snapshot_path="$(run_output 600 "$snapshot_tool" --db "$db" --out-dir "$snapshot_dir")"
+if [[ "$?" -ne 0 || -z "$snapshot_path" ]]; then
+  log "quiesced snapshot failed after stop"
+  if run_capture 60 systemctl --user start "$service"; then
+    inject_resume_manifest || log "failed to inject resume after quiesced snapshot failure"
+  else
+    log "failed to restart after quiesced snapshot failure"
+  fi
+  record_result "SNAPSHOT-FAILED"
+  exit 1
+fi
+log "quiesced_snapshot=$snapshot_path"
+if ! json_fill_manifest "$snapshot_path" >>"$log_file" 2>&1; then
+  log "failed to write snapshot metadata into capture manifest"
+  if run_capture 60 systemctl --user start "$service"; then
+    inject_resume_manifest || log "failed to inject resume after manifest fill failure"
+  else
+    log "failed to restart after manifest fill failure"
+  fi
+  record_result "FAILED"
+  exit 1
+fi
+
+updated=0
+if [[ "$pre_sha" != "$target_sha" ]]; then
+  if ! run_capture 120 git -C "$checkout" merge --ff-only "$target_sha"; then
+    log "ff-only update failed"
+    rollback "$run_dir/health-probe.after-update" || exit 1
+  fi
+  if ! run_capture 900 pnpm -C "$checkout/apps/web" run build; then
+    log "web rebuild failed before restart"
+    code_only_rollback "$run_dir/health-probe.after-web-build" || exit 1
+  fi
+  if ! run_capture 900 pnpm -C "$checkout" run build:desktop; then
+    log "deploy artifact build failed before restart"
+    code_only_rollback "$run_dir/health-probe.after-deploy-build" || exit 1
+  fi
+  updated=1
+else
+  log "checkout already at target; skipping rebuilds"
+fi
+
+if ! run_capture 60 systemctl --user start "$service"; then
+  log "systemctl start failed"
+  rollback "$run_dir/health-probe.after-start" || exit 1
+fi
+
+probe_file="$run_dir/health-probe.after-start"
+probe_rc=0
+run_health_probe "$probe_file" || probe_rc=$?
+cat "$probe_file" >>"$log_file"
+claude_advisory "$probe_file"
+if [[ "$probe_rc" -ne 0 ]] || ! health_is_pass "$probe_file"; then
+  log "health probe failed; deterministic code+DB rollback"
+  rollback "$probe_file" || exit 1
+fi
+
+if ! inject_resume_manifest; then
+  log "inject-resume failed"
+  record_result "FAILED"
+  exit 1
+fi
+
+record_result "OK"
+log "END OK"

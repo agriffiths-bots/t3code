@@ -35,6 +35,41 @@ file for the smoke child, and revokes the session after cleanup.
 Set `--instance`/`--model` (or `T3DR_SMOKE_INSTANCE`/`T3DR_SMOKE_MODEL`) to a
 provider and model that are configured on the target service.
 
+## Daily restart orchestrator
+
+`scripts/ops/daily-restart/t3-daily-restart` is the cron-safe restart manager.
+It must run outside the T3 service process tree.
+Shutdown waits for `systemctl --user stop` with a hard timeout, escalates to
+SIGTERM and then SIGKILL for the service cgroup if needed, and does not update
+the checkout unless `systemctl --user is-active` reports `inactive` or `failed`.
+
+The manager uses these defaults, all overridable by matching flags:
+
+```text
+T3DR_DB=/home/adam/.t3-vps/userdata/state.sqlite
+T3DR_CHECKOUT=/home/adam/t3code
+T3DR_SERVICE=t3code.service
+T3DR_ORIGIN=http://127.0.0.1:3773
+T3DR_SNAPSHOT_DIR=/home/adam/backups/t3-daily
+T3DR_LEDGER=/home/adam/.openclaw/daily-restart
+T3DR_PROBE_TIMEOUT=180
+T3DR_SMOKE_INSTANCE=(required)
+T3DR_SMOKE_MODEL=(required)
+```
+
+The snapshot is a hard gate before shutdown. Rollbacks before the updated
+service can accept writes restore that DB snapshot after checking out the
+pre-restart SHA. The manager pins the pre-update `health-probe` under
+`$T3DR_LEDGER/<UTC date>/pinned-tools/` before merging the target SHA, then uses
+that pinned probe for post-update health checks and rollback re-probes. If
+post-start health fails after the updated service was started, the manager
+always restores the cycle-start DB snapshot as part of rollback; the current DB
+is moved aside by `t3-db-restore`. Result and full logs are written under
+`$T3DR_LEDGER/<UTC date>/`.
+Set `T3DR_SMOKE_INSTANCE` and `T3DR_SMOKE_MODEL` to the provider/model pair the
+health probe should wake. For one-off operator runs, `--smoke-instance` and
+`--smoke-model` override those environment defaults.
+
 ## Capture active threads
 
 `scripts/ops/daily-restart/capture-active-threads.ts` writes a restart manifest
