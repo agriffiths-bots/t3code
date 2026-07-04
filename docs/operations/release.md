@@ -30,6 +30,8 @@ This document covers the unified release workflow for stable and nightly desktop
   - nightly releases are aliased to the `nightly` hosted app channel
 - Signing is optional and auto-detected per platform from secrets.
 
+Mobile app builds are deprecated in this fork because the supported mobile path is the web PWA. The release workflows no longer build Android APKs with EAS, PR CI no longer runs the Expo Android prebuild preflight, and the factory commit gate no longer runs `vp run lint:mobile`; the `apps/mobile` source tree and EAS config files remain in place so upstream mobile improvements can still be carried. To restore native app builds, reintroduce the Android inputs, credential preflight, EAS APK job, and caller wiring from the workflow history, restore the PR prebuild/static-analysis CI jobs, and add `vp run lint:mobile` back to `scripts/factory/factory.conf`.
+
 ## T3 Connect relay deployment
 
 The relay is a shared control plane versioned separately from client releases. Stable and nightly
