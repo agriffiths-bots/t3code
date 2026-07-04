@@ -49,7 +49,9 @@ type CosCliDispatchCommand = Extract<
 
 export function resolveCosWakeRuntimeMode(thread: OrchestrationThread) {
   const session = thread.session;
-  return session && session.status !== "stopped" && session.status !== "error"
+  return session &&
+    session.status !== "stopped" &&
+    (session.status !== "error" || session.activeTurnId !== null)
     ? session.runtimeMode
     : thread.runtimeMode;
 }

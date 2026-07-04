@@ -24,12 +24,13 @@ describe("resolveCosWakeRuntimeMode", () => {
     assert.equal(resolveCosWakeRuntimeMode(thread), "auto-accept-edits");
   });
 
-  it("ignores stopped or error session runtimes because they can be stale", () => {
+  it("ignores stopped and unstarted error session runtimes because they can be stale", () => {
     assert.equal(
       resolveCosWakeRuntimeMode({
         runtimeMode: "approval-required",
         session: {
           status: "stopped",
+          activeTurnId: "turn-1",
           runtimeMode: "full-access",
         },
       } as OrchestrationThread),
@@ -40,7 +41,22 @@ describe("resolveCosWakeRuntimeMode", () => {
         runtimeMode: "approval-required",
         session: {
           status: "error",
+          activeTurnId: null,
           runtimeMode: "full-access",
+        },
+      } as OrchestrationThread),
+      "approval-required",
+    );
+  });
+
+  it("keeps errored started session runtime for wake retries", () => {
+    assert.equal(
+      resolveCosWakeRuntimeMode({
+        runtimeMode: "full-access",
+        session: {
+          status: "error",
+          activeTurnId: "turn-1",
+          runtimeMode: "approval-required",
         },
       } as OrchestrationThread),
       "approval-required",

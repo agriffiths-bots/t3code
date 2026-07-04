@@ -108,10 +108,16 @@ function buildCaptureQuery(excludedThreadIds: ReadonlyArray<string>) {
     LEFT JOIN projection_turns active_turns
       ON active_turns.thread_id = sessions.thread_id
       AND active_turns.turn_id = sessions.active_turn_id
+    LEFT JOIN projection_turns pending_turns
+      ON pending_turns.thread_id = sessions.thread_id
+      AND sessions.active_turn_id IS NULL
+      AND pending_turns.turn_id IS NULL
+      AND pending_turns.state = 'pending'
     LEFT JOIN orchestration_events turn_start_events
       ON turn_start_events.stream_id = sessions.thread_id
       AND turn_start_events.event_type = 'thread.turn-start-requested'
-      AND json_extract(turn_start_events.payload_json, '$.messageId') = active_turns.pending_message_id
+      AND json_extract(turn_start_events.payload_json, '$.messageId') =
+        COALESCE(active_turns.pending_message_id, pending_turns.pending_message_id)
     WHERE threads.deleted_at IS NULL
       AND threads.archived_at IS NULL
       AND (

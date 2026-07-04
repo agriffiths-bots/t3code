@@ -17,6 +17,7 @@ import {
   messageOutboxHasSubmissionForThread,
   messageOutboxHasSessionOnlySubmissionForThread,
   messageOutboxSubmissionIsFirstForThread,
+  messageOutboxSubmissionIsLaterInSameThread,
   markOutboxSubmissionsFailedNonretryable,
   normalizeMessageOutbox,
   messageOutboxSubmissionHasNonIdempotentDispatchPayload,
@@ -65,6 +66,7 @@ function submission(input: {
   attachments?: MessageOutboxSubmission["input"]["message"]["attachments"];
   bootstrap?: MessageOutboxSubmission["input"]["bootstrap"];
   optimisticAttachments?: MessageOutboxSubmission["optimisticAttachments"];
+  sequence?: number;
 }): MessageOutboxSubmission {
   const messageId = MessageId.make(input.messageId);
   const commandId = CommandId.make(input.commandId ?? `client:turn:${messageId}`);
@@ -81,6 +83,7 @@ function submission(input: {
     error: null,
     createdAt: "2026-07-03T12:00:00.000Z",
     updatedAt: "2026-07-03T12:00:00.000Z",
+    ...(input.sequence !== undefined ? { sequence: input.sequence } : {}),
     optimisticAttachments: input.optimisticAttachments ?? [],
     input: {
       commandId,
@@ -473,6 +476,52 @@ describe("messageOutbox", () => {
 
     expect(messageOutboxSubmissionIsFirstForThread(document, first)).toBe(true);
     expect(messageOutboxSubmissionIsFirstForThread(document, second)).toBe(false);
+  });
+
+  it("preserves insertion order for same-millisecond submissions", () => {
+    const first = submission({ messageId: "z-later-lexical" });
+    const second = submission({ messageId: "a-earlier-lexical" });
+    const document = upsertOutboxSubmission(
+      upsertOutboxSubmission(emptyMessageOutbox(), first),
+      second,
+    );
+
+    expect(
+      outboxSubmissionsForThread(document, first.environmentId, first.threadId).map(
+        (entry) => entry.messageId,
+      ),
+    ).toEqual([first.messageId, second.messageId]);
+    expect(document.submissions.map((entry) => entry.sequence)).toEqual([0, 1]);
+  });
+
+  it("uses insertion order when classifying later same-millisecond submissions", () => {
+    const first = submission({ messageId: "z-later-lexical" });
+    const second = submission({ messageId: "a-earlier-lexical" });
+    const [queuedFirst, queuedSecond] = upsertOutboxSubmission(
+      upsertOutboxSubmission(emptyMessageOutbox(), first),
+      second,
+    ).submissions;
+
+    expect(messageOutboxSubmissionIsLaterInSameThread(queuedSecond!, queuedFirst!)).toBe(true);
+    expect(messageOutboxSubmissionIsLaterInSameThread(queuedFirst!, queuedSecond!)).toBe(false);
+  });
+
+  it("uses persisted order as the sequence fallback for legacy outbox rows", () => {
+    const first = submission({ messageId: "z-later-lexical" });
+    const second = submission({ messageId: "a-earlier-lexical" });
+    const normalized = normalizeMessageOutbox({
+      version: 1,
+      submissions: [
+        { ...first, sequence: undefined },
+        { ...second, sequence: undefined },
+      ],
+    });
+
+    expect(normalized.submissions.map((entry) => entry.messageId)).toEqual([
+      first.messageId,
+      second.messageId,
+    ]);
+    expect(normalized.submissions.map((entry) => entry.sequence)).toEqual([0, 1]);
   });
 
   it("does not let terminal nonretryable failures block later submissions", () => {

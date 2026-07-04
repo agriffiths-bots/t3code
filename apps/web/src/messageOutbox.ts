@@ -29,6 +29,7 @@ export interface MessageOutboxSubmission {
   readonly error: string | null;
   readonly createdAt: string;
   readonly updatedAt: string;
+  readonly sequence?: number;
 }
 
 export interface MessageOutboxDocument {
@@ -93,7 +94,10 @@ function normalizeStartThreadTurnInput(value: unknown): StartThreadTurnInput | n
   return input as StartThreadTurnInput;
 }
 
-function normalizeSubmission(value: unknown): MessageOutboxSubmission | null {
+function normalizeSubmission(
+  value: unknown,
+  fallbackSequence: number,
+): MessageOutboxSubmission | null {
   if (!isRecord(value)) return null;
   const environmentId = stringValue(value.environmentId);
   const threadId = stringValue(value.threadId);
@@ -125,6 +129,10 @@ function normalizeSubmission(value: unknown): MessageOutboxSubmission | null {
     typeof value.attempts === "number" && Number.isFinite(value.attempts)
       ? Math.max(0, Math.trunc(value.attempts))
       : 0;
+  const sequence =
+    typeof value.sequence === "number" && Number.isFinite(value.sequence)
+      ? Math.max(0, Math.trunc(value.sequence))
+      : fallbackSequence;
   const optimisticAttachments = Array.isArray(value.optimisticAttachments)
     ? (value.optimisticAttachments.filter(isRecord) as unknown as ChatAttachment[])
     : [];
@@ -143,6 +151,7 @@ function normalizeSubmission(value: unknown): MessageOutboxSubmission | null {
     error: typeof value.error === "string" && value.error.length > 0 ? value.error : null,
     createdAt,
     updatedAt,
+    sequence,
   };
   return {
     ...submission,
@@ -158,12 +167,12 @@ export function normalizeMessageOutbox(raw: unknown): MessageOutboxDocument {
     return emptyMessageOutbox();
   }
   const deduped = new Map<string, MessageOutboxSubmission>();
-  for (const value of raw.submissions) {
-    const submission = normalizeSubmission(value);
+  raw.submissions.forEach((value, index) => {
+    const submission = normalizeSubmission(value, index);
     if (submission) {
       deduped.set(submission.messageId, submission);
     }
-  }
+  });
   return {
     version: 1,
     submissions: [...deduped.values()].toSorted(compareOutboxSubmissions),
@@ -299,11 +308,28 @@ export function upsertOutboxSubmission(
   submission: MessageOutboxSubmission,
 ): MessageOutboxDocument {
   const byMessageId = new Map(document.submissions.map((entry) => [entry.messageId, entry]));
-  byMessageId.set(submission.messageId, submission);
+  const existing = byMessageId.get(submission.messageId);
+  byMessageId.set(submission.messageId, {
+    ...submission,
+    sequence: existing?.sequence ?? submission.sequence ?? nextOutboxSequence(document),
+  });
   return {
     version: 1,
     submissions: [...byMessageId.values()].toSorted(compareOutboxSubmissions),
   };
+}
+
+function nextOutboxSequence(document: MessageOutboxDocument): number {
+  return document.submissions.reduce(
+    (next, submission, index) =>
+      Math.max(
+        next,
+        typeof submission.sequence === "number" && Number.isFinite(submission.sequence)
+          ? submission.sequence + 1
+          : index + 1,
+      ),
+    0,
+  );
 }
 
 export function updateOutboxSubmission(
@@ -364,7 +390,9 @@ function compareOutboxSubmissions(
   right: MessageOutboxSubmission,
 ): number {
   const createdAtOrder = left.createdAt.localeCompare(right.createdAt);
-  return createdAtOrder !== 0 ? createdAtOrder : left.messageId.localeCompare(right.messageId);
+  if (createdAtOrder !== 0) return createdAtOrder;
+  const sequenceOrder = (left.sequence ?? 0) - (right.sequence ?? 0);
+  return sequenceOrder !== 0 ? sequenceOrder : left.messageId.localeCompare(right.messageId);
 }
 
 export function messageOutboxHasSubmissionForThread(
@@ -412,6 +440,18 @@ export function messageOutboxSubmissionIsFirstForThread(
     outboxSubmissionsForThread(document, submission.environmentId, submission.threadId).find(
       (entry) => !messageOutboxSubmissionIsTerminal(entry),
     )?.messageId === submission.messageId
+  );
+}
+
+export function messageOutboxSubmissionIsLaterInSameThread(
+  submission: MessageOutboxSubmission,
+  earlier: MessageOutboxSubmission,
+): boolean {
+  return (
+    submission.environmentId === earlier.environmentId &&
+    submission.threadId === earlier.threadId &&
+    submission.messageId !== earlier.messageId &&
+    compareOutboxSubmissions(submission, earlier) > 0
   );
 }
 

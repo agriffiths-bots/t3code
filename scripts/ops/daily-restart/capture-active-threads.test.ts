@@ -138,7 +138,9 @@ function insertThread(
     threadId === "active-turn" ? "approval-required" : "full-access",
   );
 
-  if (threadId === "active-turn") {
+  if (threadId === "active-turn" || threadId === "starting-no-turn") {
+    const pendingMessageId =
+      threadId === "active-turn" ? "message-active-turn" : "message-starting-turn";
     db.prepare(`
       INSERT INTO projection_turns (
         thread_id,
@@ -147,8 +149,13 @@ function insertThread(
         state,
         requested_at,
         checkpoint_files_json
-      ) VALUES (?, ?, ?, 'running', '2026-07-03T00:00:01.000Z', '[]')
-    `).run(threadId, activeTurnId, "message-active-turn");
+      ) VALUES (?, ?, ?, ?, '2026-07-03T00:00:01.000Z', '[]')
+    `).run(
+      threadId,
+      activeTurnId,
+      pendingMessageId,
+      threadId === "active-turn" ? "running" : "pending",
+    );
 
     db.prepare(`
       INSERT INTO orchestration_events (
@@ -163,11 +170,11 @@ function insertThread(
         metadata_json
       ) VALUES (?, 'thread', ?, 1, 'thread.turn-start-requested', '2026-07-03T00:00:01.000Z', 'system', ?, '{}')
     `).run(
-      "event-active-turn-start",
+      `event-${threadId}-start`,
       threadId,
       JSON.stringify({
         threadId,
-        messageId: "message-active-turn",
+        messageId: pendingMessageId,
         interactionMode: "plan",
       }),
     );
@@ -232,7 +239,7 @@ describe("capture-active-threads", () => {
           status: "starting",
           active_turn_id: null,
           runtime_mode: "full-access",
-          interaction_mode: "default",
+          interaction_mode: "plan",
           title: "Starting No Turn",
           project_id: "project-1",
           injected_at: null,

@@ -272,6 +272,7 @@ import {
   messageOutboxSubmissionHasBootstrap,
   messageOutboxSubmissionHasNonIdempotentDispatchPayload,
   messageOutboxSubmissionIsDurable,
+  messageOutboxSubmissionIsLaterInSameThread,
   messageOutboxSubmissionIsTerminal,
   messageOutboxSubmissionRequiresServerShell,
   markOutboxSubmissionsFailedNonretryable,
@@ -506,23 +507,6 @@ function outboxThreadKey(environmentId: EnvironmentId, threadId: ThreadId): stri
 
 function outboxSubmissionThreadKey(submission: MessageOutboxSubmission): string {
   return outboxThreadKey(submission.environmentId, submission.threadId);
-}
-
-function outboxSubmissionIsLaterInSameThread(
-  submission: MessageOutboxSubmission,
-  earlier: MessageOutboxSubmission,
-): boolean {
-  if (
-    submission.environmentId !== earlier.environmentId ||
-    submission.threadId !== earlier.threadId ||
-    submission.messageId === earlier.messageId
-  ) {
-    return false;
-  }
-  const createdAtOrder = submission.createdAt.localeCompare(earlier.createdAt);
-  return createdAtOrder !== 0
-    ? createdAtOrder > 0
-    : submission.messageId.localeCompare(earlier.messageId) > 0;
 }
 
 type OutboxThreadDrainBarrier = {
@@ -2895,7 +2879,7 @@ function ChatViewContent(props: ChatViewProps) {
           failureState,
         )
           ? messageOutboxRef.current.submissions.filter((entry) =>
-              outboxSubmissionIsLaterInSameThread(entry, submission),
+              messageOutboxSubmissionIsLaterInSameThread(entry, submission),
             )
           : [];
         markOutboxSubmission(submission.messageId, (entry) => ({
@@ -5151,7 +5135,7 @@ function ChatViewContent(props: ChatViewProps) {
         failureState,
       )
         ? messageOutboxRef.current.submissions.filter((entry) =>
-            outboxSubmissionIsLaterInSameThread(entry, initialOutboxSubmission),
+            messageOutboxSubmissionIsLaterInSameThread(entry, initialOutboxSubmission),
           )
         : [];
       markOutboxSubmission(messageIdForSend, (entry) => ({
@@ -5588,7 +5572,7 @@ function ChatViewContent(props: ChatViewProps) {
         failureState,
       )
         ? messageOutboxRef.current.submissions.filter((entry) =>
-            outboxSubmissionIsLaterInSameThread(entry, initialOutboxSubmission),
+            messageOutboxSubmissionIsLaterInSameThread(entry, initialOutboxSubmission),
           )
         : [];
       markOutboxSubmission(messageIdForSend, (entry) => ({
