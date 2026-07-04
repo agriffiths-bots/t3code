@@ -66,7 +66,11 @@ db_path="$(absolute_path "$db_path")"
 db_dir="$(dirname "$db_path")"
 mkdir -p "$db_dir" || die "failed to create database directory: $db_dir"
 [[ -f "$db_path" ]] || die "database does not exist: $db_path"
-db_owner="$(stat -c '%u:%g' "$db_path")" || die "failed to stat current database owner"
+db_uid="$(stat -c '%u' "$db_path")" || die "failed to stat current database owner"
+current_uid="$(id -u)" || die "failed to determine current user"
+if [[ "$current_uid" -ne "$db_uid" ]]; then
+  die "restore must run as database uid $db_uid, not uid $current_uid"
+fi
 
 if [[ -e "$db_path-wal" || -e "$db_path-shm" ]]; then
   echo "t3-db-restore: warning: WAL/SHM files exist; caller should stop the T3 service before restore" >&2
@@ -119,9 +123,6 @@ then
   die "failed to materialize snapshot for restore"
 fi
 chmod 600 "$tmp_db" || die "failed to chmod restored database"
-if [[ "$(stat -c '%u:%g' "$tmp_db")" != "$db_owner" ]]; then
-  chown "$db_owner" "$tmp_db" || die "failed to restore database ownership"
-fi
 trap rollback_restore EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
