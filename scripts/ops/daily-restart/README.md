@@ -54,13 +54,16 @@ T3DR_SMOKE_INSTANCE=(required)
 T3DR_SMOKE_MODEL=(required)
 ```
 
-The snapshot is a hard gate before shutdown. On post-start health failure the
-manager stops the service, checks out the pre-restart SHA, restores the DB
-snapshot, starts the service, and probes again. Result and full logs are written
-under `$T3DR_LEDGER/<UTC date>/`. Set `T3DR_SMOKE_INSTANCE` and
-`T3DR_SMOKE_MODEL` to the provider/model pair the health probe should wake.
-For one-off operator runs, `--smoke-instance` and `--smoke-model` override those
-environment defaults.
+The snapshot is a hard gate before shutdown. Rollbacks before the updated
+service can accept writes restore that DB snapshot after checking out the
+pre-restart SHA. If post-start health fails after the updated service was
+started, the manager rolls back code without restoring the DB when the update
+did not change server migration files, preserving writes accepted during the
+probe window. Migration-changing updates fail closed to the full code+DB
+rollback path. Result and full logs are written under `$T3DR_LEDGER/<UTC date>/`.
+Set `T3DR_SMOKE_INSTANCE` and `T3DR_SMOKE_MODEL` to the provider/model pair the
+health probe should wake. For one-off operator runs, `--smoke-instance` and
+`--smoke-model` override those environment defaults.
 
 ## Capture active threads
 
