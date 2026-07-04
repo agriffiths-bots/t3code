@@ -66,11 +66,15 @@ done
 [[ "$keep" -ge 1 ]] || die "--keep must be at least 1"
 command -v sqlite3 >/dev/null 2>&1 || die "sqlite3 not found on PATH"
 command -v flock >/dev/null 2>&1 || die "flock not found on PATH"
-[[ -f "$db_path" ]] || die "database does not exist: $db_path"
 
 mkdir -p "$out_dir" || die "failed to create output directory: $out_dir"
 db_path="$(absolute_path "$db_path")"
 out_dir="$(absolute_path "$out_dir")"
+
+db_lock_file="$db_path.t3dr.lock"
+exec 8>"$db_lock_file" || die "failed to open database lock: $db_lock_file"
+flock 8 || die "failed to acquire database lock: $db_lock_file"
+[[ -f "$db_path" ]] || die "database does not exist: $db_path"
 
 lock_file="$out_dir/.t3-db-snapshot.lock"
 exec 9>"$lock_file" || die "failed to open snapshot lock: $lock_file"

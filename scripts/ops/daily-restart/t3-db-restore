@@ -70,7 +70,7 @@ if [[ -e "$db_path-wal" || -e "$db_path-shm" ]]; then
   echo "t3-db-restore: warning: WAL/SHM files exist; caller should stop the T3 service before restore" >&2
 fi
 
-lock_file="$db_path.restore.lock"
+lock_file="$db_path.t3dr.lock"
 exec 9>"$lock_file" || die "failed to open restore lock: $lock_file"
 flock 9 || die "failed to acquire restore lock: $lock_file"
 
@@ -91,6 +91,7 @@ fi
 [[ ! -e "$backup_path" ]] || die "backup path already exists: $backup_path"
 [[ ! -e "$wal_backup_path" ]] || die "WAL backup path already exists: $wal_backup_path"
 [[ ! -e "$shm_backup_path" ]] || die "SHM backup path already exists: $shm_backup_path"
+db_owner="$(stat -c '%u:%g' "$db_path")" || die "failed to stat current database owner"
 
 tmp_db="$db_dir/.restore-$(basename "$db_path").$$"
 cleanup() {
@@ -117,14 +118,17 @@ then
   die "failed to materialize snapshot for restore"
 fi
 chmod 600 "$tmp_db" || die "failed to chmod restored database"
+if [[ "$(stat -c '%u:%g' "$tmp_db")" != "$db_owner" ]]; then
+  chown "$db_owner" "$tmp_db" || die "failed to restore database ownership"
+fi
+trap rollback_restore EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 mv -- "$db_path" "$backup_path" || die "failed to move current database aside"
 chmod 600 "$backup_path" || {
   mv -- "$backup_path" "$db_path" 2>/dev/null || true
   die "failed to chmod pre-restore database backup"
 }
-trap rollback_restore EXIT
-trap 'exit 130' INT
-trap 'exit 143' TERM
 if [[ -e "$db_path-wal" ]]; then
   mv -- "$db_path-wal" "$wal_backup_path" || {
     mv -- "$backup_path" "$db_path" 2>/dev/null || true
