@@ -252,7 +252,11 @@ rollback() {
   local probe_file="$1"
   local restore
   log "ROLLBACK begin"
-  run_capture 90 systemctl --user stop "$service" || log "ROLLBACK stop returned nonzero"
+  if ! run_capture 90 systemctl --user stop "$service"; then
+    log "ROLLBACK stop failed"
+    record_result "ROLLBACK-FAILED"
+    return 1
+  fi
   run_capture 60 git -C "$checkout" checkout "$pre_sha" || {
     log "ROLLBACK git checkout failed"
     record_result "ROLLBACK-FAILED"
@@ -303,7 +307,11 @@ rollback() {
 code_only_rollback() {
   local probe_file="$1"
   log "CODE_ROLLBACK begin"
-  run_capture 90 systemctl --user stop "$service" || log "CODE_ROLLBACK stop returned nonzero"
+  if ! run_capture 90 systemctl --user stop "$service"; then
+    log "CODE_ROLLBACK stop failed"
+    record_result "CODE-ROLLBACK-FAILED"
+    return 1
+  fi
   run_capture 60 git -C "$checkout" checkout "$pre_sha" || {
     log "CODE_ROLLBACK git checkout failed"
     record_result "CODE-ROLLBACK-FAILED"

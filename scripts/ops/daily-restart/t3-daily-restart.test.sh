@@ -26,6 +26,16 @@ SH
   cat >"$dir/systemctl" <<'SH'
 #!/usr/bin/env bash
 echo "systemctl $*" >>"$T_LOG"
+if [[ "$*" == --user\ stop\ * ]]; then
+  stop_count_file="$T_TMP/systemctl-stop-count"
+  stop_count=0
+  [[ -f "$stop_count_file" ]] && stop_count="$(cat "$stop_count_file")"
+  stop_count=$((stop_count + 1))
+  echo "$stop_count" >"$stop_count_file"
+  if [[ -n "${FAKE_SYSTEMCTL_FAIL_STOP_N:-}" && "$stop_count" == "$FAKE_SYSTEMCTL_FAIL_STOP_N" ]]; then
+    exit "${FAKE_SYSTEMCTL_FAIL_RC:-9}"
+  fi
+fi
 exit "${FAKE_SYSTEMCTL_RC:-0}"
 SH
   cat >"$dir/t3-db-snapshot" <<'SH'
@@ -193,6 +203,33 @@ unset FAKE_HEALTH_FAIL_ONCE FAKE_MIGRATION_DIFF_RC
 [[ "$(cat "$tmp/rc")" != "0" ]] && pass "migration health rollback exits nonzero" || fail "migration health rollback exits nonzero"
 assert_order "$tmp/calls.log" "health" "git -C $tmp/checkout diff --quiet" "systemctl --user stop" "git -C" "restore" "pnpm -C $tmp/checkout/apps/web run build" "pnpm -C $tmp/checkout run build:desktop" "systemctl --user start" "health"
 grep -Fq "RESULT ROLLBACK-OK" "$tmp/ledger/"*/t3-daily-restart.result && pass "migration rollback result recorded" || fail "migration rollback result recorded"
+
+tmp="$(mktemp -d)"
+export FAKE_HEALTH_FAIL_ONCE=1
+export FAKE_MIGRATION_DIFF_RC=1
+export FAKE_SYSTEMCTL_FAIL_STOP_N=2
+run_manager "$tmp"
+unset FAKE_HEALTH_FAIL_ONCE FAKE_MIGRATION_DIFF_RC FAKE_SYSTEMCTL_FAIL_STOP_N
+[[ "$(cat "$tmp/rc")" != "0" ]] && pass "migration rollback stop failure exits nonzero" || fail "migration rollback stop failure exits nonzero"
+grep -Fq "RESULT ROLLBACK-FAILED" "$tmp/ledger/"*/t3-daily-restart.result && pass "migration rollback stop failure recorded" || fail "migration rollback stop failure recorded"
+if grep -Fq "restore" "$tmp/calls.log"; then
+  fail "migration rollback stop failure restored db"
+else
+  pass "migration rollback stop failure skips db restore"
+fi
+
+tmp="$(mktemp -d)"
+export FAKE_HEALTH_FAIL_ONCE=1
+export FAKE_SYSTEMCTL_FAIL_STOP_N=2
+run_manager "$tmp"
+unset FAKE_HEALTH_FAIL_ONCE FAKE_SYSTEMCTL_FAIL_STOP_N
+[[ "$(cat "$tmp/rc")" != "0" ]] && pass "code rollback stop failure exits nonzero" || fail "code rollback stop failure exits nonzero"
+grep -Fq "RESULT CODE-ROLLBACK-FAILED" "$tmp/ledger/"*/t3-daily-restart.result && pass "code rollback stop failure recorded" || fail "code rollback stop failure recorded"
+if awk '/systemctl --user stop/ { stops++; if (stops == 2) after=1; next } after && /git -C/ { found=1 } END { exit found ? 0 : 1 }' "$tmp/calls.log"; then
+  fail "code rollback stop failure mutates checkout"
+else
+  pass "code rollback stop failure skips checkout mutation"
+fi
 
 tmp="$(mktemp -d)"
 export FAKE_PNPM_FAIL_ONCE=1
