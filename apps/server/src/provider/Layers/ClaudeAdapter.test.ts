@@ -2434,12 +2434,9 @@ describe("ClaudeAdapterLive", () => {
         assert.equal(waitingEvent.payload.reason, "awaiting-subagent-wake");
       }
 
-      assert.equal(yield* adapter.hasSession(THREAD_ID), true);
+      assert.equal(yield* adapter.hasSession(THREAD_ID), false);
       const sessions = yield* adapter.listSessions();
-      assert.equal(sessions.length, 1);
-      assert.equal(sessions[0]?.status, "waiting");
-      assert.equal(sessions[0]?.activeTurnId, undefined);
-      assert.notEqual(sessions[0]?.resumeCursor, undefined);
+      assert.equal(sessions.length, 0);
       assert.equal(harness.query.closeCalls, 1);
     }).pipe(
       Effect.provideService(Random.Random, makeDeterministicRandomService()),
@@ -2593,10 +2590,9 @@ describe("ClaudeAdapterLive", () => {
       );
       assert.notEqual(waitingEvent, undefined);
 
+      assert.equal(yield* adapter.hasSession(THREAD_ID), false);
       const sessions = yield* adapter.listSessions();
-      assert.equal(sessions.length, 1);
-      assert.equal(sessions[0]?.status, "waiting");
-      assert.equal(sessions[0]?.activeTurnId, undefined);
+      assert.equal(sessions.length, 0);
       assert.equal(harness.query.closeCalls, 1);
     }).pipe(
       Effect.provideService(Random.Random, makeDeterministicRandomService()),
@@ -2712,10 +2708,9 @@ describe("ClaudeAdapterLive", () => {
       );
       assert.notEqual(waitingEvent, undefined);
 
+      assert.equal(yield* adapter.hasSession(THREAD_ID), false);
       const sessions = yield* adapter.listSessions();
-      assert.equal(sessions.length, 1);
-      assert.equal(sessions[0]?.status, "waiting");
-      assert.equal(sessions[0]?.activeTurnId, undefined);
+      assert.equal(sessions.length, 0);
       assert.equal(harness.query.closeCalls, 1);
     }).pipe(
       Effect.provideService(Random.Random, makeDeterministicRandomService()),

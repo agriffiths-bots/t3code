@@ -3218,6 +3218,8 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
       },
       providerRefs: nativeProviderRefs(context),
     });
+    sessions.delete(context.session.threadId);
+    context.stopped = true;
   });
 
   const handleStreamExit = Effect.fn("handleStreamExit")(function* (
