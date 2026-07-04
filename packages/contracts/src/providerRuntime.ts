@@ -284,6 +284,7 @@ const SessionExitedPayload = Schema.Struct({
   reason: Schema.optional(TrimmedNonEmptyStringSchema),
   recoverable: Schema.optional(Schema.Boolean),
   exitKind: Schema.optional(RuntimeSessionExitKind),
+  mcpProviderSessionId: Schema.optional(TrimmedNonEmptyStringSchema),
 });
 export type SessionExitedPayload = typeof SessionExitedPayload.Type;
 

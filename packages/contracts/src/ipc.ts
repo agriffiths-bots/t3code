@@ -944,6 +944,24 @@ export const DesktopPreviewAutomationWaitForInputSchema = Schema.Struct({
   input: PreviewAutomationWaitForInput,
 });
 
+export const DesktopCloudflareAccessLoginInputSchema = Schema.Struct({
+  host: Schema.String,
+});
+export type DesktopCloudflareAccessLoginInput = typeof DesktopCloudflareAccessLoginInputSchema.Type;
+
+export const DesktopCloudflareAccessLoginResultSchema = Schema.Struct({
+  cookieValue: Schema.String,
+});
+export type DesktopCloudflareAccessLoginResult =
+  typeof DesktopCloudflareAccessLoginResultSchema.Type;
+
+export const DesktopCloudflareAccessCookieInstallInputSchema = Schema.Struct({
+  host: Schema.String,
+  cookieValue: Schema.String,
+});
+export type DesktopCloudflareAccessCookieInstallInput =
+  typeof DesktopCloudflareAccessCookieInstallInputSchema.Type;
+
 export interface DesktopBridge {
   getAppBranding: () => DesktopAppBranding | null;
   // One bootstrap per pool instance currently registered with bootstrap
@@ -956,6 +974,12 @@ export interface DesktopBridge {
   getConnectionCatalog?: () => Promise<string | null>;
   setConnectionCatalog?: (catalog: string) => Promise<boolean>;
   clearConnectionCatalog?: () => Promise<void>;
+  authenticateCloudflareAccess?: (
+    input: DesktopCloudflareAccessLoginInput,
+  ) => Promise<DesktopCloudflareAccessLoginResult>;
+  installCloudflareAccessCookie?: (
+    input: DesktopCloudflareAccessCookieInstallInput,
+  ) => Promise<void>;
   discoverSshHosts: () => Promise<readonly DesktopDiscoveredSshHost[]>;
   ensureSshEnvironment: (
     target: DesktopSshEnvironmentTarget,
