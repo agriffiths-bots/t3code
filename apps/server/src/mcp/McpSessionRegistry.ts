@@ -47,18 +47,22 @@ interface RegistryState {
 }
 
 export interface McpSessionRegistryOptions {
-  readonly idleTimeoutMs?: number;
-  readonly maximumLifetimeMs?: number;
   readonly now?: () => number;
+  readonly idleTimeoutMs?: number;
 }
 
-const DEFAULT_IDLE_TIMEOUT_MS = 30 * 60 * 1_000;
-const DEFAULT_MAXIMUM_LIFETIME_MS = 8 * 60 * 60 * 1_000;
+const DEFAULT_MCP_CREDENTIAL_IDLE_TIMEOUT_MS = 30 * 24 * 60 * 60 * 1_000;
 
 const bytesToHex = (bytes: Uint8Array): string =>
   Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
 
 const tokenFromBytes = (bytes: Uint8Array): string => Buffer.from(bytes).toString("base64url");
+
+const pruneExpired = (
+  records: ReadonlyMap<string, CredentialRecord>,
+  timestamp: number,
+): ReadonlyMap<string, CredentialRecord> =>
+  new Map(Array.from(records).filter(([, record]) => record.scope.expiresAt > timestamp));
 
 const getHttpMcpEndpointHost = (hostname: string): string => {
   const normalized = hostname.toLowerCase();
@@ -80,8 +84,7 @@ const makeWithOptions = Effect.fn("McpSessionRegistry.make")(function* (
   const httpServer = yield* HttpServer.HttpServer;
   const state = yield* SynchronizedRef.make<RegistryState>({ records: new Map() });
   const currentTimeMillis = options.now ? Effect.sync(options.now) : Clock.currentTimeMillis;
-  const idleTimeoutMs = options.idleTimeoutMs ?? DEFAULT_IDLE_TIMEOUT_MS;
-  const maximumLifetimeMs = options.maximumLifetimeMs ?? DEFAULT_MAXIMUM_LIFETIME_MS;
+  const idleTimeoutMs = options.idleTimeoutMs ?? DEFAULT_MCP_CREDENTIAL_IDLE_TIMEOUT_MS;
   const endpoint =
     httpServer.address._tag === "TcpAddress"
       ? `http://${getHttpMcpEndpointHost(httpServer.address.hostname)}:${httpServer.address.port}/mcp`
@@ -92,23 +95,13 @@ const makeWithOptions = Effect.fn("McpSessionRegistry.make")(function* (
       .digest("SHA-256", new TextEncoder().encode(token))
       .pipe(Effect.map(bytesToHex), Effect.orDie);
 
-  const pruneExpired = (records: ReadonlyMap<string, CredentialRecord>, timestamp: number) => {
-    const next = new Map(
-      Array.from(records).filter(
-        ([, record]) =>
-          timestamp <= record.scope.expiresAt && timestamp - record.lastUsedAt <= idleTimeoutMs,
-      ),
-    );
-    return next.size === records.size ? records : next;
-  };
-
   const issue: McpSessionRegistryShape["issue"] = Effect.fn("McpSessionRegistry.issue")(
     function* (request) {
       const issuedAt = yield* currentTimeMillis;
       const providerSessionId = yield* crypto.randomUUIDv4.pipe(Effect.orDie);
       const rawToken = yield* crypto.randomBytes(32).pipe(Effect.map(tokenFromBytes), Effect.orDie);
       const tokenHash = yield* hashToken(rawToken);
-      const expiresAt = issuedAt + maximumLifetimeMs;
+      const expiresAt = issuedAt + idleTimeoutMs;
       const scope: McpInvocationContext.McpInvocationScope = {
         environmentId,
         threadId: ThreadId.make(request.threadId),
@@ -143,12 +136,23 @@ const makeWithOptions = Effect.fn("McpSessionRegistry.make")(function* (
       const tokenHash = yield* hashToken(rawToken);
       const timestamp = yield* currentTimeMillis;
       return yield* SynchronizedRef.modify(state, ({ records }) => {
-        const current = pruneExpired(records, timestamp);
-        const record = current.get(tokenHash);
-        if (!record) return [undefined, { records: current }] as const;
-        const next = new Map(current);
-        next.set(tokenHash, { ...record, lastUsedAt: timestamp });
-        return [record.scope, { records: next }] as const;
+        const record = records.get(tokenHash);
+        if (!record) return [undefined, { records }] as const;
+        const next = new Map(records);
+        if (record.scope.expiresAt <= timestamp) {
+          next.delete(tokenHash);
+          return [undefined, { records: next }] as const;
+        }
+        const refreshedScope = {
+          ...record.scope,
+          expiresAt: timestamp + idleTimeoutMs,
+        };
+        next.set(tokenHash, {
+          ...record,
+          scope: refreshedScope,
+          lastUsedAt: timestamp,
+        });
+        return [refreshedScope, { records: next }] as const;
       });
     },
   );
@@ -205,10 +209,17 @@ export const issueActiveMcpCredential = (
 export const revokeActiveMcpThread = (threadId: ThreadId): Effect.Effect<void> =>
   activeMcpSessionRegistry ? activeMcpSessionRegistry.revokeThread(threadId) : Effect.void;
 
+export const revokeActiveMcpProviderSession = (providerSessionId: string): Effect.Effect<void> =>
+  activeMcpSessionRegistry
+    ? activeMcpSessionRegistry.revokeProviderSession(providerSessionId)
+    : Effect.void;
+
 export const revokeAllActiveMcpCredentials = (): Effect.Effect<void> =>
   activeMcpSessionRegistry ? activeMcpSessionRegistry.revokeAll : Effect.void;
 
 /** Exposed for tests. */
 export const __testing = {
+  DEFAULT_MCP_CREDENTIAL_IDLE_TIMEOUT_MS,
   make: makeWithOptions,
+  pruneExpired,
 };

@@ -185,6 +185,7 @@ interface ClaudeSessionContext {
   readonly basePermissionMode: PermissionMode | undefined;
   currentApiModelId: string | undefined;
   resumeSessionId: string | undefined;
+  readonly mcpProviderSessionId?: string;
   readonly pendingApprovals: Map<ApprovalRequestId, PendingApproval>;
   readonly pendingUserInputs: Map<ApprovalRequestId, PendingUserInput>;
   readonly turns: Array<{
@@ -3144,6 +3145,9 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
         payload: {
           reason: "Session stopped",
           exitKind: "graceful",
+          ...(context.mcpProviderSessionId
+            ? { mcpProviderSessionId: context.mcpProviderSessionId }
+            : {}),
         },
         providerRefs: {},
       });
@@ -3667,6 +3671,7 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
         basePermissionMode: permissionMode,
         currentApiModelId: apiModelId,
         resumeSessionId: sessionId,
+        ...(mcpSession ? { mcpProviderSessionId: mcpSession.providerSessionId } : {}),
         pendingApprovals,
         pendingUserInputs,
         turns: [],

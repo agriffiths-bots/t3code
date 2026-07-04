@@ -127,6 +127,7 @@ interface CursorSessionContext {
   session: ProviderSession;
   readonly scope: Scope.Closeable;
   readonly acp: AcpSessionRuntime.AcpSessionRuntime["Service"];
+  readonly mcpProviderSessionId?: string;
   notificationFiber: Fiber.Fiber<void, never> | undefined;
   readonly pendingApprovals: Map<ApprovalRequestId, PendingApproval>;
   readonly pendingUserInputs: Map<ApprovalRequestId, PendingUserInput>;
@@ -472,7 +473,10 @@ export function makeCursorAdapter(
           ...(yield* makeEventStamp()),
           provider: PROVIDER,
           threadId: ctx.threadId,
-          payload: { exitKind: "graceful" },
+          payload: {
+            exitKind: "graceful",
+            ...(ctx.mcpProviderSessionId ? { mcpProviderSessionId: ctx.mcpProviderSessionId } : {}),
+          },
         });
       });
 
@@ -771,6 +775,7 @@ export function makeCursorAdapter(
             session,
             scope: sessionScope,
             acp,
+            ...(mcpSession ? { mcpProviderSessionId: mcpSession.providerSessionId } : {}),
             notificationFiber: undefined,
             pendingApprovals,
             pendingUserInputs,

@@ -12,6 +12,7 @@ import type {
 } from "@t3tools/contracts";
 import {
   ApprovalRequestId,
+  EnvironmentId,
   EventId,
   ProviderDriverKind,
   ProviderInstanceId,
@@ -22,6 +23,7 @@ import {
 import { createModelSelection } from "@t3tools/shared/model";
 import { it, assert, vi } from "@effect/vitest";
 
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
@@ -49,6 +51,7 @@ import * as ProviderSessionDirectory from "../Services/ProviderSessionDirectory.
 import { makeProviderServiceLive } from "./ProviderService.ts";
 import * as ProviderEventLoggers from "./ProviderEventLoggers.ts";
 import { ProviderSessionDirectoryLive } from "./ProviderSessionDirectory.ts";
+import * as McpProviderSession from "../../mcp/McpProviderSession.ts";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import * as ProviderSessionRuntime from "../../persistence/ProviderSessionRuntime.ts";
 import {
@@ -65,6 +68,7 @@ const asRequestId = (value: string): ApprovalRequestId => ApprovalRequestId.make
 const asEventId = (value: string): EventId => EventId.make(value);
 const asThreadId = (value: string): ThreadId => ThreadId.make(value);
 const asTurnId = (value: string): TurnId => TurnId.make(value);
+const environmentId = EnvironmentId.make("environment-provider-service-test");
 const codexInstanceId = ProviderInstanceId.make("codex");
 const claudeAgentInstanceId = ProviderInstanceId.make("claudeAgent");
 const CODEX_DRIVER = ProviderDriverKind.make("codex");
@@ -238,6 +242,7 @@ function makeFakeCodexAdapter(provider: ProviderDriverKind = CODEX_DRIVER) {
   return {
     adapter,
     emit,
+    sessions,
     updateSession,
     startSession,
     sendTurn,
@@ -1489,6 +1494,234 @@ routing.layer("ProviderServiceLive routing", (it) => {
 });
 
 const fanout = makeProviderServiceLayer();
+it.effect("ProviderServiceLive clears MCP credentials when a provider adapter is replaced", () =>
+  Effect.gen(function* () {
+    const firstCodex = makeFakeCodexAdapter();
+    const secondCodex = makeFakeCodexAdapter();
+    let currentAdapter = firstCodex.adapter;
+    const changes = yield* PubSub.unbounded<void>();
+    const registry: ProviderAdapterRegistry.ProviderAdapterRegistry["Service"] = {
+      getByInstance: (instanceId) =>
+        instanceId === codexInstanceId
+          ? Effect.succeed(currentAdapter)
+          : Effect.fail(
+              new ProviderUnsupportedError({
+                provider: ProviderDriverKind.make(instanceId),
+              }),
+            ),
+      getInstanceInfo: (instanceId) =>
+        Effect.succeed({
+          instanceId,
+          driverKind: CODEX_DRIVER,
+          displayName: undefined,
+          enabled: true,
+          continuationIdentity: {
+            driverKind: CODEX_DRIVER,
+            continuationKey: `codex:instance:${instanceId}`,
+          },
+        }),
+      listInstances: () => Effect.succeed([codexInstanceId]),
+      listProviders: () => Effect.succeed([CODEX_DRIVER]),
+      streamChanges: Stream.fromPubSub(changes),
+      subscribeChanges: PubSub.subscribe(changes),
+    };
+    const runtimeRepositoryLayer = ProviderSessionRuntime.layer.pipe(
+      Layer.provide(SqlitePersistenceMemory),
+    );
+    const directoryLayer = ProviderSessionDirectoryLive.pipe(Layer.provide(runtimeRepositoryLayer));
+    const providerLayer = makeProviderServiceLive().pipe(
+      Layer.provide(Layer.succeed(ProviderAdapterRegistry.ProviderAdapterRegistry, registry)),
+      Layer.provide(directoryLayer),
+      Layer.provide(defaultServerSettingsLayer),
+      Layer.provide(AnalyticsService.layerTest),
+      Layer.provide(
+        Layer.succeed(
+          ProviderEventLoggers.ProviderEventLoggers,
+          ProviderEventLoggers.NoOpProviderEventLoggers,
+        ),
+      ),
+    );
+
+    yield* Effect.gen(function* () {
+      const threadId = asThreadId("thread-mcp-adapter-replaced");
+      const provider = yield* ProviderService.ProviderService;
+      McpProviderSession.setMcpProviderSession({
+        environmentId,
+        threadId,
+        providerSessionId: "provider-session-adapter-replaced",
+        providerInstanceId: codexInstanceId,
+        endpoint: "http://127.0.0.1:43123/mcp",
+        authorizationHeader: "Bearer adapter-replaced-token",
+      });
+      const session = yield* provider.startSession(threadId, {
+        provider: CODEX_DRIVER,
+        providerInstanceId: codexInstanceId,
+        threadId,
+        runtimeMode: "full-access",
+      });
+
+      currentAdapter = secondCodex.adapter;
+      yield* PubSub.publish(changes, undefined);
+      yield* advanceTestClock(50);
+
+      assert.equal(McpProviderSession.readMcpProviderSession(session.threadId), undefined);
+    }).pipe(
+      Effect.ensuring(
+        Effect.sync(() =>
+          McpProviderSession.clearMcpProviderSession(asThreadId("thread-mcp-adapter-replaced")),
+        ),
+      ),
+      Effect.provide(
+        Layer.mergeAll(providerLayer, directoryLayer, runtimeRepositoryLayer, NodeServices.layer),
+      ),
+    );
+  }),
+);
+
+it.effect(
+  "ProviderServiceLive clears MCP credentials when an adapter is replaced during start",
+  () =>
+    Effect.gen(function* () {
+      const firstCodex = makeFakeCodexAdapter();
+      const secondCodex = makeFakeCodexAdapter();
+      const startEntered = yield* Deferred.make<void>();
+      const releaseStart = yield* Deferred.make<void>();
+      firstCodex.startSession.mockImplementation((input: ProviderSessionStartInput) =>
+        Effect.gen(function* () {
+          yield* Deferred.succeed(startEntered, undefined);
+          yield* Deferred.await(releaseStart);
+          const now = "2026-01-01T00:00:00.000Z";
+          const session: ProviderSession = {
+            provider: CODEX_DRIVER,
+            ...(input.providerInstanceId !== undefined
+              ? { providerInstanceId: input.providerInstanceId }
+              : {}),
+            status: "ready",
+            runtimeMode: input.runtimeMode,
+            threadId: input.threadId,
+            resumeCursor: input.resumeCursor ?? {
+              opaque: `resume-${String(input.threadId)}`,
+            },
+            cwd: input.cwd ?? process.cwd(),
+            createdAt: now,
+            updatedAt: now,
+          };
+          firstCodex.sessions.set(session.threadId, session);
+          return session;
+        }),
+      );
+
+      let currentAdapter = firstCodex.adapter;
+      const changes = yield* PubSub.unbounded<void>();
+      const registry: ProviderAdapterRegistry.ProviderAdapterRegistry["Service"] = {
+        getByInstance: (instanceId) =>
+          instanceId === codexInstanceId
+            ? Effect.succeed(currentAdapter)
+            : Effect.fail(
+                new ProviderUnsupportedError({
+                  provider: ProviderDriverKind.make(instanceId),
+                }),
+              ),
+        getInstanceInfo: (instanceId) =>
+          Effect.succeed({
+            instanceId,
+            driverKind: CODEX_DRIVER,
+            displayName: undefined,
+            enabled: true,
+            continuationIdentity: {
+              driverKind: CODEX_DRIVER,
+              continuationKey: `codex:instance:${instanceId}`,
+            },
+          }),
+        listInstances: () => Effect.succeed([codexInstanceId]),
+        listProviders: () => Effect.succeed([CODEX_DRIVER]),
+        streamChanges: Stream.fromPubSub(changes),
+        subscribeChanges: PubSub.subscribe(changes),
+      };
+      const runtimeRepositoryLayer = ProviderSessionRuntime.layer.pipe(
+        Layer.provide(SqlitePersistenceMemory),
+      );
+      const directoryLayer = ProviderSessionDirectoryLive.pipe(
+        Layer.provide(runtimeRepositoryLayer),
+      );
+      const providerLayer = makeProviderServiceLive().pipe(
+        Layer.provide(Layer.succeed(ProviderAdapterRegistry.ProviderAdapterRegistry, registry)),
+        Layer.provide(directoryLayer),
+        Layer.provide(defaultServerSettingsLayer),
+        Layer.provide(AnalyticsService.layerTest),
+        Layer.provide(
+          Layer.succeed(
+            ProviderEventLoggers.ProviderEventLoggers,
+            ProviderEventLoggers.NoOpProviderEventLoggers,
+          ),
+        ),
+      );
+
+      yield* Effect.gen(function* () {
+        const threadId = asThreadId("thread-mcp-adapter-replaced-during-start");
+        const provider = yield* ProviderService.ProviderService;
+        McpProviderSession.setMcpProviderSession({
+          environmentId,
+          threadId,
+          providerSessionId: "provider-session-adapter-replaced-during-start-old",
+          providerInstanceId: codexInstanceId,
+          endpoint: "http://127.0.0.1:43123/mcp",
+          authorizationHeader: "Bearer adapter-replaced-during-start-old-token",
+        });
+
+        const startFiber = yield* provider
+          .startSession(threadId, {
+            provider: CODEX_DRIVER,
+            providerInstanceId: codexInstanceId,
+            threadId,
+            runtimeMode: "full-access",
+          })
+          .pipe(Effect.exit, Effect.forkScoped);
+        yield* Deferred.await(startEntered);
+
+        currentAdapter = secondCodex.adapter;
+        yield* PubSub.publish(changes, undefined);
+        yield* advanceTestClock(50);
+        McpProviderSession.setMcpProviderSession({
+          environmentId,
+          threadId,
+          providerSessionId: "provider-session-adapter-replaced-during-start-replacement",
+          providerInstanceId: codexInstanceId,
+          endpoint: "http://127.0.0.1:43123/mcp",
+          authorizationHeader: "Bearer adapter-replaced-during-start-replacement-token",
+        });
+        const replacementSession = yield* provider.startSession(threadId, {
+          provider: CODEX_DRIVER,
+          providerInstanceId: codexInstanceId,
+          threadId,
+          runtimeMode: "full-access",
+        });
+        assert.equal(replacementSession.provider, CODEX_DRIVER);
+
+        yield* Deferred.succeed(releaseStart, undefined);
+
+        const exit = yield* Fiber.join(startFiber);
+        assert.equal(Exit.isFailure(exit), true);
+        assert.deepEqual(firstCodex.stopSession.mock.calls, [[threadId]]);
+        assert.equal(
+          McpProviderSession.readMcpProviderSession(threadId)?.providerSessionId,
+          "provider-session-adapter-replaced-during-start-replacement",
+        );
+      }).pipe(
+        Effect.ensuring(
+          Effect.sync(() =>
+            McpProviderSession.clearMcpProviderSession(
+              asThreadId("thread-mcp-adapter-replaced-during-start"),
+            ),
+          ),
+        ),
+        Effect.provide(
+          Layer.mergeAll(providerLayer, directoryLayer, runtimeRepositoryLayer, NodeServices.layer),
+        ),
+      );
+    }),
+);
+
 fanout.layer("ProviderServiceLive fanout", (it) => {
   it.effect("fans out adapter turn completion events", () =>
     Effect.gen(function* () {
@@ -1590,6 +1823,311 @@ fanout.layer("ProviderServiceLive fanout", (it) => {
         [asEventId("evt-seq-1"), asEventId("evt-seq-2"), asEventId("evt-seq-3")],
       );
     }),
+  );
+
+  it.effect("clears MCP credentials when a provider session exits", () =>
+    Effect.gen(function* () {
+      const threadId = asThreadId("thread-mcp-exit");
+      const provider = yield* ProviderService.ProviderService;
+      McpProviderSession.setMcpProviderSession({
+        environmentId,
+        threadId,
+        providerSessionId: "provider-session-mcp-exit",
+        providerInstanceId: codexInstanceId,
+        endpoint: "http://127.0.0.1:43123/mcp",
+        authorizationHeader: "Bearer test-mcp-token",
+      });
+      const session = yield* provider.startSession(threadId, {
+        provider: ProviderDriverKind.make("codex"),
+        providerInstanceId: codexInstanceId,
+        threadId,
+        runtimeMode: "full-access",
+      });
+
+      fanout.codex.emit({
+        type: "session.exited",
+        eventId: asEventId("evt-mcp-session-exited"),
+        provider: ProviderDriverKind.make("codex"),
+        createdAt: "2026-01-01T00:00:00.000Z",
+        threadId: session.threadId,
+        payload: {
+          exitKind: "error",
+          reason: "provider process exited",
+          mcpProviderSessionId: "provider-session-mcp-exit",
+        },
+      });
+      yield* advanceTestClock(500);
+
+      assert.equal(McpProviderSession.readMcpProviderSession(session.threadId), undefined);
+    }).pipe(
+      Effect.ensuring(
+        Effect.sync(() =>
+          McpProviderSession.clearMcpProviderSession(asThreadId("thread-mcp-exit")),
+        ),
+      ),
+    ),
+  );
+
+  it.effect("clears MCP credentials when a tagged exit arrives before tracking catches up", () =>
+    Effect.gen(function* () {
+      const codex = makeFakeCodexAdapter();
+      codex.startSession.mockImplementation((input: ProviderSessionStartInput) =>
+        Effect.gen(function* () {
+          const mcpSession = McpProviderSession.readMcpProviderSession(input.threadId);
+          if (mcpSession) {
+            codex.emit({
+              type: "session.exited",
+              eventId: asEventId("evt-mcp-exit-before-track"),
+              provider: CODEX_DRIVER,
+              createdAt: "2026-01-01T00:00:00.000Z",
+              threadId: input.threadId,
+              payload: {
+                exitKind: "error",
+                reason: "provider process exited before tracking completed",
+                mcpProviderSessionId: mcpSession.providerSessionId,
+              },
+            });
+          }
+          yield* Effect.sleep("6000 millis");
+          const now = "2026-01-01T00:00:00.000Z";
+          const session: ProviderSession = {
+            provider: CODEX_DRIVER,
+            ...(input.providerInstanceId !== undefined
+              ? { providerInstanceId: input.providerInstanceId }
+              : {}),
+            status: "ready",
+            runtimeMode: input.runtimeMode,
+            threadId: input.threadId,
+            resumeCursor: input.resumeCursor ?? {
+              opaque: `resume-${String(input.threadId)}`,
+            },
+            cwd: input.cwd ?? process.cwd(),
+            createdAt: now,
+            updatedAt: now,
+          };
+          codex.sessions.set(session.threadId, session);
+          return session;
+        }),
+      );
+      const registry = makeAdapterRegistryMock({
+        [ProviderDriverKind.make("codex")]: codex.adapter,
+      });
+      const runtimeRepositoryLayer = ProviderSessionRuntime.layer.pipe(
+        Layer.provide(SqlitePersistenceMemory),
+      );
+      const directoryLayer = ProviderSessionDirectoryLive.pipe(
+        Layer.provide(runtimeRepositoryLayer),
+      );
+      const providerLayer = makeProviderServiceLive().pipe(
+        Layer.provide(Layer.succeed(ProviderAdapterRegistry.ProviderAdapterRegistry, registry)),
+        Layer.provide(directoryLayer),
+        Layer.provide(defaultServerSettingsLayer),
+        Layer.provide(AnalyticsService.layerTest),
+        Layer.provide(
+          Layer.succeed(
+            ProviderEventLoggers.ProviderEventLoggers,
+            ProviderEventLoggers.NoOpProviderEventLoggers,
+          ),
+        ),
+      );
+
+      yield* Effect.gen(function* () {
+        const threadId = asThreadId("thread-mcp-exit-before-track");
+        const provider = yield* ProviderService.ProviderService;
+        McpProviderSession.setMcpProviderSession({
+          environmentId,
+          threadId,
+          providerSessionId: "provider-session-mcp-exit-before-track",
+          providerInstanceId: codexInstanceId,
+          endpoint: "http://127.0.0.1:43123/mcp",
+          authorizationHeader: "Bearer mcp-exit-before-track-token",
+        });
+
+        const startFiber = yield* provider
+          .startSession(threadId, {
+            provider: CODEX_DRIVER,
+            providerInstanceId: codexInstanceId,
+            threadId,
+            runtimeMode: "full-access",
+          })
+          .pipe(Effect.forkScoped);
+
+        yield* advanceTestClock(6_500);
+        yield* Fiber.join(startFiber);
+        yield* advanceTestClock(1_000);
+
+        assert.equal(McpProviderSession.readMcpProviderSession(threadId), undefined);
+      }).pipe(
+        Effect.ensuring(
+          Effect.sync(() =>
+            McpProviderSession.clearMcpProviderSession(asThreadId("thread-mcp-exit-before-track")),
+          ),
+        ),
+        Effect.provide(
+          Layer.mergeAll(providerLayer, directoryLayer, runtimeRepositoryLayer, NodeServices.layer),
+        ),
+      );
+    }),
+  );
+
+  it.effect("keeps MCP credentials when a provider session exit lacks a session id", () =>
+    Effect.gen(function* () {
+      const threadId = asThreadId("thread-mcp-untagged-exit");
+      const provider = yield* ProviderService.ProviderService;
+      McpProviderSession.setMcpProviderSession({
+        environmentId,
+        threadId,
+        providerSessionId: "provider-session-mcp-untagged-exit",
+        providerInstanceId: codexInstanceId,
+        endpoint: "http://127.0.0.1:43123/mcp",
+        authorizationHeader: "Bearer untagged-mcp-token",
+      });
+      const session = yield* provider.startSession(threadId, {
+        provider: ProviderDriverKind.make("codex"),
+        providerInstanceId: codexInstanceId,
+        threadId,
+        runtimeMode: "full-access",
+      });
+
+      fanout.codex.emit({
+        type: "session.exited",
+        eventId: asEventId("evt-mcp-untagged-session-exited"),
+        provider: ProviderDriverKind.make("codex"),
+        createdAt: "2026-01-01T00:00:00.000Z",
+        threadId: session.threadId,
+        payload: { exitKind: "error", reason: "legacy untagged exit" },
+      });
+      yield* advanceTestClock(500);
+
+      assert.equal(
+        McpProviderSession.readMcpProviderSession(session.threadId)?.providerSessionId,
+        "provider-session-mcp-untagged-exit",
+      );
+    }).pipe(
+      Effect.ensuring(
+        Effect.sync(() =>
+          McpProviderSession.clearMcpProviderSession(asThreadId("thread-mcp-untagged-exit")),
+        ),
+      ),
+    ),
+  );
+
+  it.effect("keeps replacement MCP credentials after a stale same-adapter session exit", () =>
+    Effect.gen(function* () {
+      const threadId = asThreadId("thread-mcp-replacement");
+      const provider = yield* ProviderService.ProviderService;
+      McpProviderSession.setMcpProviderSession({
+        environmentId,
+        threadId,
+        providerSessionId: "provider-session-mcp-old",
+        providerInstanceId: codexInstanceId,
+        endpoint: "http://127.0.0.1:43123/mcp",
+        authorizationHeader: "Bearer old-mcp-token",
+      });
+      yield* provider.startSession(threadId, {
+        provider: ProviderDriverKind.make("codex"),
+        providerInstanceId: codexInstanceId,
+        threadId,
+        runtimeMode: "full-access",
+      });
+
+      McpProviderSession.setMcpProviderSession({
+        environmentId,
+        threadId,
+        providerSessionId: "provider-session-mcp-replacement",
+        providerInstanceId: codexInstanceId,
+        endpoint: "http://127.0.0.1:43123/mcp",
+        authorizationHeader: "Bearer replacement-mcp-token",
+      });
+      const session = yield* provider.startSession(threadId, {
+        provider: ProviderDriverKind.make("codex"),
+        providerInstanceId: codexInstanceId,
+        threadId,
+        runtimeMode: "full-access",
+      });
+
+      fanout.codex.emit({
+        type: "session.exited",
+        eventId: asEventId("evt-mcp-stale-session-exited"),
+        provider: ProviderDriverKind.make("codex"),
+        createdAt: "2026-01-01T00:00:00.000Z",
+        threadId: session.threadId,
+        payload: {
+          exitKind: "graceful",
+          reason: "old provider session stopped",
+          mcpProviderSessionId: "provider-session-mcp-old",
+        },
+      });
+      yield* advanceTestClock(500);
+
+      assert.equal(
+        McpProviderSession.readMcpProviderSession(session.threadId)?.providerSessionId,
+        "provider-session-mcp-replacement",
+      );
+    }).pipe(
+      Effect.ensuring(
+        Effect.sync(() =>
+          McpProviderSession.clearMcpProviderSession(asThreadId("thread-mcp-replacement")),
+        ),
+      ),
+    ),
+  );
+
+  it.effect("keeps replacement MCP credentials after a stale stopped state event", () =>
+    Effect.gen(function* () {
+      const threadId = asThreadId("thread-mcp-stopped-state");
+      const provider = yield* ProviderService.ProviderService;
+      McpProviderSession.setMcpProviderSession({
+        environmentId,
+        threadId,
+        providerSessionId: "provider-session-mcp-stopped-old",
+        providerInstanceId: codexInstanceId,
+        endpoint: "http://127.0.0.1:43123/mcp",
+        authorizationHeader: "Bearer old-stopped-mcp-token",
+      });
+      yield* provider.startSession(threadId, {
+        provider: ProviderDriverKind.make("codex"),
+        providerInstanceId: codexInstanceId,
+        threadId,
+        runtimeMode: "full-access",
+      });
+
+      McpProviderSession.setMcpProviderSession({
+        environmentId,
+        threadId,
+        providerSessionId: "provider-session-mcp-stopped-replacement",
+        providerInstanceId: codexInstanceId,
+        endpoint: "http://127.0.0.1:43123/mcp",
+        authorizationHeader: "Bearer replacement-stopped-mcp-token",
+      });
+      const session = yield* provider.startSession(threadId, {
+        provider: ProviderDriverKind.make("codex"),
+        providerInstanceId: codexInstanceId,
+        threadId,
+        runtimeMode: "full-access",
+      });
+
+      fanout.codex.emit({
+        type: "session.state.changed",
+        eventId: asEventId("evt-mcp-stale-stopped-state"),
+        provider: ProviderDriverKind.make("codex"),
+        createdAt: "2026-01-01T00:00:00.000Z",
+        threadId: session.threadId,
+        payload: { state: "stopped", reason: "old provider session stopped" },
+      });
+      yield* advanceTestClock(500);
+
+      assert.equal(
+        McpProviderSession.readMcpProviderSession(session.threadId)?.providerSessionId,
+        "provider-session-mcp-stopped-replacement",
+      );
+    }).pipe(
+      Effect.ensuring(
+        Effect.sync(() =>
+          McpProviderSession.clearMcpProviderSession(asThreadId("thread-mcp-stopped-state")),
+        ),
+      ),
+    ),
   );
 
   it.effect("keeps subscriber delivery ordered and isolates failing subscribers", () =>
