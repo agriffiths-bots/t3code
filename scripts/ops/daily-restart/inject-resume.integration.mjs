@@ -75,7 +75,15 @@ await NodeFSP.writeFile(
 
 await execFile(
   "node",
-  ["scripts/ops/daily-restart/inject-resume.ts", "--manifest", manifestPath, "--origin", T3_ORIGIN],
+  [
+    "scripts/ops/daily-restart/inject-resume.ts",
+    "--manifest",
+    manifestPath,
+    "--origin",
+    T3_ORIGIN,
+    "--token",
+    T3_TOKEN,
+  ],
   {
     env: { ...process.env, T3_TOKEN },
   },
