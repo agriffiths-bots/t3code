@@ -1,0 +1,31 @@
+{
+  "version": 1,
+  "sha": "83ab7aebf3913373461714c11da57e83ffe2b1ad",
+  "verified_at": "2026-07-04T21:29:22.965Z",
+  "desktop": {
+    "ready": true,
+    "artifacts": {
+      "release": "https://github.com/agriffiths-bots/t3code/releases/tag/main-20260704001626-83ab7ae",
+      "windows": {
+        "installer": "https://github.com/agriffiths-bots/t3code/releases/download/main-20260704001626-83ab7ae/T3-Code-0.0.0-main.16-x64.exe",
+        "blockmap": "https://github.com/agriffiths-bots/t3code/releases/download/main-20260704001626-83ab7ae/T3-Code-0.0.0-main.16-x64.exe.blockmap",
+        "manifest": "https://github.com/agriffiths-bots/t3code/releases/download/main-20260704001626-83ab7ae/latest.yml"
+      }
+    },
+    "launch_smoke": "success",
+    "checks": {
+      "Windows Launch Smoke": "https://github.com/agriffiths-bots/t3code/actions/runs/28688993911/job/85087612212"
+    },
+    "linux": {
+      "ready": "unknown",
+      "launch_smoke": "unknown",
+      "artifact": "unknown",
+      "reason": "No main-queryable Linux launch-smoke check or Linux release artifact is currently published by this repository."
+    }
+  },
+  "mobile": {
+    "ready": "unknown",
+    "ota": "unknown",
+    "reason": "No Expo OTA publish workflow is currently queryable from this repository; APK release assets are reported when present."
+  }
+}
