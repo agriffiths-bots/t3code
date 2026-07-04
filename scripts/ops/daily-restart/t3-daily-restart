@@ -218,11 +218,6 @@ run_health_probe() {
 rollback() {
   local probe_file="$1"
   local restore
-  restore="$(resolve_tool t3-db-restore)" || {
-    log "ROLLBACK missing t3-db-restore"
-    record_result "ROLLBACK-FAILED"
-    return 1
-  }
   log "ROLLBACK begin"
   run_capture 90 systemctl --user stop "$service" || log "ROLLBACK stop returned nonzero"
   run_capture 60 git -C "$checkout" checkout "$pre_sha" || {
@@ -230,13 +225,23 @@ rollback() {
     record_result "ROLLBACK-FAILED"
     return 1
   }
-  run_capture 900 pnpm -C "$checkout" run build:desktop || {
-    log "ROLLBACK deploy artifact rebuild failed"
+  restore="$(resolve_tool t3-db-restore)" || {
+    log "ROLLBACK missing t3-db-restore"
     record_result "ROLLBACK-FAILED"
     return 1
   }
   run_capture 300 "$restore" --db "$db" --snapshot "$snapshot_path" || {
     log "ROLLBACK db restore failed"
+    record_result "ROLLBACK-FAILED"
+    return 1
+  }
+  run_capture 900 pnpm -C "$checkout/apps/web" run build || {
+    log "ROLLBACK web rebuild failed"
+    record_result "ROLLBACK-FAILED"
+    return 1
+  }
+  run_capture 900 pnpm -C "$checkout" run build:desktop || {
+    log "ROLLBACK deploy artifact rebuild failed"
     record_result "ROLLBACK-FAILED"
     return 1
   }
@@ -268,6 +273,11 @@ code_only_rollback() {
   run_capture 90 systemctl --user stop "$service" || log "CODE_ROLLBACK stop returned nonzero"
   run_capture 60 git -C "$checkout" checkout "$pre_sha" || {
     log "CODE_ROLLBACK git checkout failed"
+    record_result "CODE-ROLLBACK-FAILED"
+    return 1
+  }
+  run_capture 900 pnpm -C "$checkout/apps/web" run build || {
+    log "CODE_ROLLBACK web rebuild failed"
     record_result "CODE-ROLLBACK-FAILED"
     return 1
   }
@@ -338,6 +348,7 @@ capture_tool="$(resolve_tool capture-active-threads)" || {
   record_result "FAILED"
   exit 1
 }
+
 if ! run_capture 300 "$capture_tool" --db "$db" --out "$manifest"; then
   log "capture-active-threads failed"
   record_result "FAILED"
@@ -384,13 +395,13 @@ if [[ "$pre_sha" != "$target_sha" ]]; then
     log "ff-only update failed"
     rollback "$run_dir/health-probe.after-update" || exit 1
   fi
-  if ! run_capture 900 pnpm -C "$checkout" run build:desktop; then
-    log "deploy artifact build failed before restart"
-    code_only_rollback "$run_dir/health-probe.after-deploy-build" || exit 1
-  fi
   if ! run_capture 900 pnpm -C "$checkout/apps/web" run build; then
     log "web rebuild failed before restart"
     code_only_rollback "$run_dir/health-probe.after-web-build" || exit 1
+  fi
+  if ! run_capture 900 pnpm -C "$checkout" run build:desktop; then
+    log "deploy artifact build failed before restart"
+    code_only_rollback "$run_dir/health-probe.after-deploy-build" || exit 1
   fi
   updated=1
 else

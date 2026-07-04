@@ -131,6 +131,8 @@ tmp="$(mktemp -d)"
 run_manager "$tmp"
 [[ "$(cat "$tmp/rc")" == "0" ]] && pass "happy path exits zero" || fail "happy path exits zero"
 assert_order "$tmp/calls.log" "git -C" "snapshot" "capture" "systemctl --user stop" "snapshot" "git -C" "pnpm -C" "systemctl --user start" "health" "inject"
+assert_order "$tmp/calls.log" "snapshot --db" "capture --db" "systemctl --user stop" "snapshot --db"
+assert_order "$tmp/calls.log" "git -C" "pnpm -C $tmp/checkout/apps/web run build" "pnpm -C $tmp/checkout run build:desktop"
 if awk 'f && /pnpm/ { found=1 } /health/ { f=1 } END { exit found ? 0 : 1 }' "$tmp/calls.log"; then
   fail "happy path built after health"
 else
@@ -169,7 +171,7 @@ export FAKE_HEALTH_FAIL_ONCE=1
 run_manager "$tmp"
 unset FAKE_HEALTH_FAIL_ONCE
 [[ "$(cat "$tmp/rc")" != "0" ]] && pass "health rollback exits nonzero" || fail "health rollback exits nonzero"
-assert_order "$tmp/calls.log" "health" "systemctl --user stop" "git -C" "pnpm -C" "restore" "systemctl --user start" "health"
+assert_order "$tmp/calls.log" "health" "systemctl --user stop" "git -C" "restore" "pnpm -C $tmp/checkout/apps/web run build" "pnpm -C $tmp/checkout run build:desktop" "systemctl --user start" "health"
 grep -Fq "RESULT ROLLBACK-OK" "$tmp/ledger/"*/t3-daily-restart.result && pass "rollback result recorded" || fail "rollback result recorded"
 if awk 'f && /inject/ { found=1 } /restore/ { f=1 } END { exit found ? 0 : 1 }' "$tmp/calls.log"; then
   pass "rollback injects resume"
@@ -182,7 +184,7 @@ export FAKE_PNPM_FAIL_ONCE=1
 run_manager "$tmp"
 unset FAKE_PNPM_FAIL_ONCE
 [[ "$(cat "$tmp/rc")" != "0" ]] && pass "web build failure exits nonzero" || fail "web build failure exits nonzero"
-assert_order "$tmp/calls.log" "pnpm" "systemctl --user stop" "git -C" "pnpm -C" "systemctl --user start" "health"
+assert_order "$tmp/calls.log" "pnpm -C $tmp/checkout/apps/web run build" "systemctl --user stop" "git -C" "pnpm -C $tmp/checkout/apps/web run build" "pnpm -C $tmp/checkout run build:desktop" "systemctl --user start" "health"
 if awk 'f && /restore/ { found=1 } /pnpm/ { f=1 } END { exit found ? 0 : 1 }' "$tmp/calls.log"; then
   fail "web build rollback restored db"
 else
