@@ -66,12 +66,26 @@ done
 [[ "$keep" -ge 1 ]] || die "--keep must be at least 1"
 command -v sqlite3 >/dev/null 2>&1 || die "sqlite3 not found on PATH"
 command -v flock >/dev/null 2>&1 || die "flock not found on PATH"
+command -v install >/dev/null 2>&1 || die "install not found on PATH"
 
-mkdir -p "$out_dir" || die "failed to create output directory: $out_dir"
 db_path="$(absolute_path "$db_path")"
 out_dir="$(absolute_path "$out_dir")"
 [[ -f "$db_path" ]] || die "database does not exist: $db_path"
+db_uid="$(stat -c '%u' "$db_path")" || die "failed to stat database owner"
+db_gid="$(stat -c '%g' "$db_path")" || die "failed to stat database group"
 db_dir="$(dirname "$db_path")"
+
+if [[ ! -d "$out_dir" ]]; then
+  current_uid="$(id -u)" || die "failed to determine current user"
+  if [[ "$current_uid" -eq 0 ]]; then
+    install -d -m 700 -o "$db_uid" -g "$db_gid" "$out_dir" \
+      || die "failed to create output directory for database owner: $out_dir"
+  elif [[ "$current_uid" -eq "$db_uid" ]]; then
+    mkdir -p "$out_dir" || die "failed to create output directory: $out_dir"
+  else
+    die "output directory must be pre-created when running as uid $current_uid for database uid $db_uid: $out_dir"
+  fi
+fi
 
 exec 8<"$db_dir" || die "failed to open database directory lock: $db_dir"
 flock 8 || die "failed to acquire database directory lock: $db_dir"
