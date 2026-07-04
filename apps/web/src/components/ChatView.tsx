@@ -274,6 +274,7 @@ import {
   messageOutboxSubmissionIsDurable,
   messageOutboxSubmissionIsTerminal,
   messageOutboxSubmissionRequiresServerShell,
+  markOutboxSubmissionsFailedNonretryable,
   outboxSubmissionToChatMessage,
   outboxSubmissionsForThread,
   reconcileOutboxWithServerMessages,
@@ -2913,10 +2914,11 @@ function ChatViewContent(props: ChatViewProps) {
             });
           }
           updateMessageOutbox((document) =>
-            dependentSubmissions.reduce(
-              (nextDocument, dependent) =>
-                removeOutboxSubmission(nextDocument, dependent.messageId),
+            markOutboxSubmissionsFailedNonretryable(
               document,
+              dependentSubmissions,
+              DEPENDENT_UNCERTAIN_OUTBOX_NOTICE,
+              failedAt,
             ),
           );
         }
@@ -5168,9 +5170,11 @@ function ChatViewContent(props: ChatViewProps) {
           });
         }
         updateMessageOutbox((document) =>
-          dependentSubmissions.reduce(
-            (nextDocument, dependent) => removeOutboxSubmission(nextDocument, dependent.messageId),
+          markOutboxSubmissionsFailedNonretryable(
             document,
+            dependentSubmissions,
+            DEPENDENT_UNCERTAIN_OUTBOX_NOTICE,
+            failedAt,
           ),
         );
       }
@@ -5603,9 +5607,11 @@ function ChatViewContent(props: ChatViewProps) {
           });
         }
         updateMessageOutbox((document) =>
-          dependentSubmissions.reduce(
-            (nextDocument, dependent) => removeOutboxSubmission(nextDocument, dependent.messageId),
+          markOutboxSubmissionsFailedNonretryable(
             document,
+            dependentSubmissions,
+            DEPENDENT_UNCERTAIN_OUTBOX_NOTICE,
+            failedAt,
           ),
         );
       }

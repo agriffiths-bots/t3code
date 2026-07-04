@@ -41,6 +41,37 @@ function makeFixtureDb(dir: string): string {
       runtime_mode TEXT NOT NULL DEFAULT 'full-access',
       updated_at TEXT NOT NULL
     );
+
+    CREATE TABLE projection_turns (
+      thread_id TEXT NOT NULL,
+      turn_id TEXT,
+      pending_message_id TEXT,
+      state TEXT NOT NULL,
+      requested_at TEXT NOT NULL,
+      started_at TEXT,
+      completed_at TEXT,
+      checkpoint_turn_count INTEGER,
+      checkpoint_ref TEXT,
+      checkpoint_status TEXT,
+      checkpoint_files_json TEXT NOT NULL DEFAULT '[]',
+      UNIQUE(thread_id, turn_id)
+    );
+
+    CREATE TABLE orchestration_events (
+      sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+      event_id TEXT NOT NULL UNIQUE,
+      aggregate_kind TEXT NOT NULL,
+      stream_id TEXT NOT NULL,
+      stream_version INTEGER NOT NULL,
+      event_type TEXT NOT NULL,
+      occurred_at TEXT NOT NULL,
+      command_id TEXT,
+      causation_event_id TEXT,
+      correlation_id TEXT,
+      actor_kind TEXT NOT NULL,
+      payload_json TEXT NOT NULL,
+      metadata_json TEXT NOT NULL
+    );
   `);
 
   const rows: ReadonlyArray<
@@ -106,6 +137,41 @@ function insertThread(
     activeTurnId,
     threadId === "active-turn" ? "approval-required" : "full-access",
   );
+
+  if (threadId === "active-turn") {
+    db.prepare(`
+      INSERT INTO projection_turns (
+        thread_id,
+        turn_id,
+        pending_message_id,
+        state,
+        requested_at,
+        checkpoint_files_json
+      ) VALUES (?, ?, ?, 'running', '2026-07-03T00:00:01.000Z', '[]')
+    `).run(threadId, activeTurnId, "message-active-turn");
+
+    db.prepare(`
+      INSERT INTO orchestration_events (
+        event_id,
+        aggregate_kind,
+        stream_id,
+        stream_version,
+        event_type,
+        occurred_at,
+        actor_kind,
+        payload_json,
+        metadata_json
+      ) VALUES (?, 'thread', ?, 1, 'thread.turn-start-requested', '2026-07-03T00:00:01.000Z', 'system', ?, '{}')
+    `).run(
+      "event-active-turn-start",
+      threadId,
+      JSON.stringify({
+        threadId,
+        messageId: "message-active-turn",
+        interactionMode: "plan",
+      }),
+    );
+  }
 }
 
 function readManifest(outPath: string): CaptureManifest {
@@ -144,7 +210,7 @@ describe("capture-active-threads", () => {
           status: "running",
           active_turn_id: "turn-1",
           runtime_mode: "approval-required",
-          interaction_mode: "default",
+          interaction_mode: "plan",
           title: "Active Turn",
           project_id: "project-1",
           injected_at: null,

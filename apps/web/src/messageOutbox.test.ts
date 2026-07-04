@@ -17,6 +17,7 @@ import {
   messageOutboxHasSubmissionForThread,
   messageOutboxHasSessionOnlySubmissionForThread,
   messageOutboxSubmissionIsFirstForThread,
+  markOutboxSubmissionsFailedNonretryable,
   normalizeMessageOutbox,
   messageOutboxSubmissionHasNonIdempotentDispatchPayload,
   messageOutboxSubmissionHasBootstrap,
@@ -608,6 +609,39 @@ describe("messageOutbox", () => {
 
     expect(message).toMatchObject({
       id: "m-nonretryable",
+      deliveryStatus: "failed",
+      deliveryRetryable: false,
+    });
+  });
+
+  it("preserves dependent failures in the outbox as terminal nonretryable rows", () => {
+    const first = submission({ messageId: "m-1" });
+    const dependent = submission({ messageId: "m-2" });
+    const document = upsertOutboxSubmission(
+      upsertOutboxSubmission(emptyMessageOutbox(), first),
+      dependent,
+    );
+
+    const failed = markOutboxSubmissionsFailedNonretryable(
+      document,
+      [dependent],
+      "Earlier queued work is unresolved.",
+      "2026-07-03T12:00:02.000Z",
+    );
+
+    expect(failed.submissions).toHaveLength(2);
+    expect(failed.submissions[1]).toMatchObject({
+      messageId: dependent.messageId,
+      status: "failed",
+      retryable: false,
+      error: "Earlier queued work is unresolved.",
+      updatedAt: "2026-07-03T12:00:02.000Z",
+    });
+    expect(messageOutboxHasSubmissionForThread(failed, first.environmentId, first.threadId)).toBe(
+      true,
+    );
+    expect(outboxSubmissionToChatMessage(failed.submissions[1]!)).toMatchObject({
+      id: dependent.messageId,
       deliveryStatus: "failed",
       deliveryRetryable: false,
     });

@@ -97,11 +97,21 @@ function buildCaptureQuery(excludedThreadIds: ReadonlyArray<string>) {
       sessions.status,
       sessions.active_turn_id,
       sessions.runtime_mode,
-      threads.interaction_mode,
+      COALESCE(
+        json_extract(turn_start_events.payload_json, '$.interactionMode'),
+        threads.interaction_mode
+      ) AS interaction_mode,
       threads.title,
       threads.project_id
     FROM projection_thread_sessions sessions
     INNER JOIN projection_threads threads ON threads.thread_id = sessions.thread_id
+    LEFT JOIN projection_turns active_turns
+      ON active_turns.thread_id = sessions.thread_id
+      AND active_turns.turn_id = sessions.active_turn_id
+    LEFT JOIN orchestration_events turn_start_events
+      ON turn_start_events.stream_id = sessions.thread_id
+      AND turn_start_events.event_type = 'thread.turn-start-requested'
+      AND json_extract(turn_start_events.payload_json, '$.messageId') = active_turns.pending_message_id
     WHERE threads.deleted_at IS NULL
       AND threads.archived_at IS NULL
       AND (

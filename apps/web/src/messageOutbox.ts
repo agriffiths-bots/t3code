@@ -320,6 +320,25 @@ export function updateOutboxSubmission(
   return changed ? { version: 1, submissions } : document;
 }
 
+export function markOutboxSubmissionsFailedNonretryable(
+  document: MessageOutboxDocument,
+  submissionsToFail: ReadonlyArray<MessageOutboxSubmission>,
+  error: string,
+  updatedAt: string,
+): MessageOutboxDocument {
+  return submissionsToFail.reduce(
+    (nextDocument, submissionToFail) =>
+      updateOutboxSubmission(nextDocument, submissionToFail.messageId, (submission) => ({
+        ...submission,
+        status: "failed",
+        retryable: false,
+        error,
+        updatedAt,
+      })),
+    document,
+  );
+}
+
 export function removeOutboxSubmission(
   document: MessageOutboxDocument,
   messageId: MessageId,
