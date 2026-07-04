@@ -134,6 +134,16 @@ export class PrimaryEnvironmentAuth extends Context.Service<
   }
 >()("@t3tools/client-runtime/platform/capabilities/PrimaryEnvironmentAuth") {}
 
+export class CloudflareAccessCookieInstaller extends Context.Service<
+  CloudflareAccessCookieInstaller,
+  {
+    readonly install: (input: {
+      readonly httpBaseUrl: string;
+      readonly cookieValue: string;
+    }) => Effect.Effect<void, ConnectionAttemptError>;
+  }
+>()("@t3tools/client-runtime/platform/capabilities/CloudflareAccessCookieInstaller") {}
+
 export class SshEnvironmentGateway extends Context.Service<
   SshEnvironmentGateway,
   {

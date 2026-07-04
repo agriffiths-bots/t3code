@@ -36,6 +36,7 @@ export interface PairingConnectionInput {
   readonly pairingUrl?: string;
   readonly host?: string;
   readonly pairingCode?: string;
+  readonly cloudflareAccessCookie?: string;
 }
 
 export interface SshConnectionInput {
@@ -83,7 +84,10 @@ const resolvePairingTarget = Effect.fn("clientRuntime.connection.onboarding.reso
   },
 );
 
-function cloudflareAccessFromPairingTarget(target: ReturnType<typeof resolveRemotePairingTarget>) {
+function cloudflareAccessFromPairingInput(
+  input: PairingConnectionInput,
+  target: ReturnType<typeof resolveRemotePairingTarget>,
+) {
   const clientId = target.cloudflareAccessClientId?.trim() ?? "";
   const clientSecret = target.cloudflareAccessClientSecret?.trim() ?? "";
   if (clientId.length > 0 && clientSecret.length > 0) {
@@ -93,12 +97,19 @@ function cloudflareAccessFromPairingTarget(target: ReturnType<typeof resolveRemo
       clientSecret,
     };
   }
+  const cookieValue = input.cloudflareAccessCookie?.trim() ?? "";
+  if (cookieValue.length > 0) {
+    return {
+      _tag: "cookie" as const,
+      cookieValue,
+    };
+  }
   const jwt = target.cloudflareAccessToken?.trim() ?? "";
   return jwt.length > 0 ? { jwt } : undefined;
 }
 
 function validateCloudflareAccessRuntime(
-  cloudflareAccess: ReturnType<typeof cloudflareAccessFromPairingTarget>,
+  cloudflareAccess: ReturnType<typeof cloudflareAccessFromPairingInput>,
 ) {
   if (
     cloudflareAccess?._tag === "service-token" &&
@@ -120,7 +131,7 @@ export const preparePairingRegistration = Effect.fn(
 )(function* (input: PairingConnectionInput) {
   const target = yield* resolvePairingTarget(input);
   const presentation = yield* ClientCapabilities.ClientPresentation;
-  const cloudflareAccess = cloudflareAccessFromPairingTarget(target);
+  const cloudflareAccess = cloudflareAccessFromPairingInput(input, target);
   yield* validateCloudflareAccessRuntime(cloudflareAccess);
   const descriptor = yield* fetchRemoteEnvironmentDescriptor({
     httpBaseUrl: target.httpBaseUrl,
@@ -152,6 +163,9 @@ export const preparePairingRegistration = Effect.fn(
       token: access.access_token,
       ...(target.cloudflareAccessToken
         ? { cloudflareAccessToken: target.cloudflareAccessToken }
+        : {}),
+      ...(input.cloudflareAccessCookie
+        ? { cloudflareAccessCookie: input.cloudflareAccessCookie }
         : {}),
       ...(target.cloudflareAccessClientId && target.cloudflareAccessClientSecret
         ? {

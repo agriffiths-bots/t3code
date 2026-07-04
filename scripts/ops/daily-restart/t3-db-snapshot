@@ -1,0 +1,142 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/home/linuxbrew/.linuxbrew/bin:/home/adam/.local/bin"
+umask 077
+
+DEFAULT_DB="/home/adam/.t3-vps/userdata/state.sqlite"
+DEFAULT_SNAPSHOT_DIR="/home/adam/backups/t3-daily"
+
+usage() {
+  cat >&2 <<'USAGE'
+usage: t3-db-snapshot [--db PATH] [--out-dir DIR] [--keep N]
+
+Creates an online-safe SQLite snapshot with sqlite3's .backup command.
+USAGE
+}
+
+die() {
+  echo "t3-db-snapshot: $*" >&2
+  exit 1
+}
+
+sqlite_cli_quote() {
+  local value="${1//\\/\\\\}"
+  value="${value//\"/\\\"}"
+  printf '"%s"' "$value"
+}
+
+absolute_path() {
+  realpath -m "$1"
+}
+
+db_path="${T3DR_DB:-$DEFAULT_DB}"
+out_dir="${T3DR_SNAPSHOT_DIR:-$DEFAULT_SNAPSHOT_DIR}"
+keep=7
+
+while [[ "$#" -gt 0 ]]; do
+  case "$1" in
+    --db)
+      [[ "$#" -ge 2 ]] || die "--db requires a path"
+      db_path="$2"
+      shift 2
+      ;;
+    --out-dir)
+      [[ "$#" -ge 2 ]] || die "--out-dir requires a directory"
+      out_dir="$2"
+      shift 2
+      ;;
+    --keep)
+      [[ "$#" -ge 2 ]] || die "--keep requires a count"
+      keep="$2"
+      shift 2
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      usage
+      die "unknown argument: $1"
+      ;;
+  esac
+done
+
+[[ "$keep" =~ ^[0-9]+$ ]] || die "--keep must be a non-negative integer"
+[[ "$keep" -ge 1 ]] || die "--keep must be at least 1"
+command -v sqlite3 >/dev/null 2>&1 || die "sqlite3 not found on PATH"
+command -v flock >/dev/null 2>&1 || die "flock not found on PATH"
+command -v mktemp >/dev/null 2>&1 || die "mktemp not found on PATH"
+
+db_path="$(absolute_path "$db_path")"
+out_dir="$(absolute_path "$out_dir")"
+[[ -f "$db_path" ]] || die "database does not exist: $db_path"
+db_uid="$(stat -c '%u' "$db_path")" || die "failed to stat database owner"
+current_uid="$(id -u)" || die "failed to determine current user"
+if [[ "$current_uid" -ne "$db_uid" ]]; then
+  die "snapshots must run as database uid $db_uid, not uid $current_uid"
+fi
+db_dir="$(dirname "$db_path")"
+
+if [[ ! -d "$out_dir" ]]; then
+  mkdir -p "$out_dir" || die "failed to create output directory: $out_dir"
+fi
+
+[[ -d "$out_dir" && ! -L "$out_dir" ]] || die "output path is not a real directory: $out_dir"
+
+exec 8<"$db_dir" || die "failed to open database directory lock: $db_dir"
+flock 8 || die "failed to acquire database directory lock: $db_dir"
+[[ -f "$db_path" ]] || die "database does not exist: $db_path"
+
+exec 9<"$out_dir" || die "failed to open snapshot directory lock: $out_dir"
+flock 9 || die "failed to acquire snapshot directory lock: $out_dir"
+
+timestamp="$(date -u +%Y%m%d-%H%M%S)"
+snapshot="$out_dir/t3-state-$timestamp.sqlite"
+if [[ -e "$snapshot" ]]; then
+  sleep 1
+  timestamp="$(date -u +%Y%m%d-%H%M%S)"
+  snapshot="$out_dir/t3-state-$timestamp.sqlite"
+fi
+[[ ! -e "$snapshot" ]] || die "snapshot path already exists: $snapshot"
+
+tmp_dir="$(mktemp -d "$out_dir/.t3-db-snapshot.XXXXXXXXXX")" \
+  || die "failed to create private snapshot temporary directory"
+tmp_snapshot="$tmp_dir/t3-state.sqlite"
+cleanup() {
+  rm -f -- "$tmp_snapshot" "$tmp_snapshot-journal" "$tmp_snapshot-wal" "$tmp_snapshot-shm"
+  rmdir -- "$tmp_dir" 2>/dev/null || true
+}
+trap cleanup EXIT
+
+if ! sqlite3 "$db_path" <<SQL
+.timeout 5000
+.backup $(sqlite_cli_quote "$tmp_snapshot")
+SQL
+then
+  die "sqlite backup failed"
+fi
+
+integrity="$(sqlite3 "$tmp_snapshot" 'PRAGMA integrity_check;' 2>&1)" || die "snapshot integrity check failed: $integrity"
+[[ "$integrity" == "ok" ]] || die "snapshot integrity check returned: $integrity"
+
+chmod 600 "$tmp_snapshot" || die "failed to chmod snapshot"
+mv -T -n "$tmp_snapshot" "$snapshot" || die "failed to install snapshot"
+[[ ! -e "$tmp_snapshot" ]] || die "snapshot path already exists: $snapshot"
+[[ -f "$snapshot" && ! -L "$snapshot" ]] || die "installed snapshot is not a regular file: $snapshot"
+rmdir -- "$tmp_dir" || die "failed to remove snapshot temporary directory"
+trap - EXIT
+
+if [[ "$keep" -gt 0 ]]; then
+  retain_other_count=$((keep - 1))
+  mapfile -d '' snapshots < <(
+    find "$out_dir" -maxdepth 1 -type f -name 't3-state-*.sqlite' ! -samefile "$snapshot" -printf '%T@ %p\0' \
+      | sort -z -nr \
+      | cut -z -d' ' -f2-
+  )
+  for ((i = retain_other_count; i < ${#snapshots[@]}; i++)); do
+    rm -f -- "${snapshots[$i]}" || die "failed to prune old snapshot: ${snapshots[$i]}"
+  done
+fi
+
+printf '%s\n' "$snapshot"

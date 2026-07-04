@@ -1,5 +1,5 @@
 import * as ManagedRuntime from "effect/ManagedRuntime";
-import type * as Effect from "effect/Effect";
+import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Socket from "effect/unstable/socket/Socket";
 
