@@ -286,6 +286,14 @@ async function resolveOriginMainSha() {
   return run("git", ["rev-parse", "origin/main"]);
 }
 
+async function resolveShaArg(shaArg: string) {
+  const sha = shaArg.trim();
+  if (SHA_PATTERN.test(sha)) {
+    return sha;
+  }
+  return run("git", ["rev-parse", shaArg]);
+}
+
 function makeGhVerificationClient(repo: string): VerificationClient {
   return {
     listReleases: () => ghJson<ReadonlyArray<GitHubRelease>>(repo, "/releases?per_page=100"),
@@ -388,7 +396,7 @@ function parseArgs(argv: ReadonlyArray<string>) {
 export async function main(argv = process.argv.slice(2)) {
   const args = parseArgs(argv);
   const repo = await resolveRepo();
-  const sha = args.sha ? await run("git", ["rev-parse", args.sha]) : await resolveOriginMainSha();
+  const sha = args.sha ? await resolveShaArg(args.sha) : await resolveOriginMainSha();
   const result = await updateVerifiedPointer({
     sha,
     verificationClient: makeGhVerificationClient(repo),
