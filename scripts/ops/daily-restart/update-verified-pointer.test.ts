@@ -36,6 +36,7 @@ const checks = (
   {
     name: "Build and publish artifacts / Windows Launch Smoke",
     conclusion: overrides["Windows Launch Smoke"] ?? "success",
+    completed_at: "2026-07-03T12:00:00.000Z",
     html_url: "https://github.com/checks/windows",
   },
   {
@@ -87,11 +88,48 @@ it("verifies a sha with desktop assets and launch smoke, ignoring the pointer re
   assert.match(result.pointer.mobile.reason, /No Expo OTA publish workflow/);
 });
 
+it("rejects a sha when the latest completed non-skipped launch smoke failed", async () => {
+  const result = await verifyClientArtifacts({
+    sha,
+    client: client({
+      checkRuns: [
+        {
+          name: "Windows Launch Smoke",
+          conclusion: "success",
+          completed_at: "2026-07-03T12:00:00.000Z",
+        },
+        {
+          name: "Build and publish artifacts / Windows Launch Smoke",
+          conclusion: "failure",
+          completed_at: "2026-07-03T12:05:00.000Z",
+        },
+        {
+          name: "Windows Launch Smoke",
+          conclusion: "skipped",
+          completed_at: "2026-07-03T12:10:00.000Z",
+        },
+      ],
+    }),
+  });
+
+  assert.deepStrictEqual(result, {
+    verified: false,
+    reason: "Windows Launch Smoke concluded failure",
+  });
+});
+
 it("rejects smoke-failed and artifact-missing shas", async () => {
   const smokeFailed = await verifyClientArtifacts({
     sha,
     client: client({
-      checkRuns: [{ name: "Windows Launch Smoke", conclusion: "failure" }, ...checks()],
+      checkRuns: [
+        {
+          name: "Windows Launch Smoke",
+          conclusion: "failure",
+          completed_at: "2026-07-03T12:05:00.000Z",
+        },
+        ...checks(),
+      ],
     }),
   });
   const artifactsMissing = await verifyClientArtifacts({

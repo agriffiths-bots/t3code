@@ -30,6 +30,7 @@ export interface GitHubRelease {
 export interface GitHubCheckRun {
   readonly name: string;
   readonly conclusion: string | null;
+  readonly completed_at?: string | null;
   readonly html_url?: string;
 }
 
@@ -94,6 +95,11 @@ function releaseMatchesSha(release: GitHubRelease, sha: string) {
   return release.target_commitish.toLowerCase().startsWith(sha.toLowerCase());
 }
 
+function checkCompletedTime(check: GitHubCheckRun) {
+  const time = Date.parse(check.completed_at ?? "");
+  return Number.isFinite(time) ? time : 0;
+}
+
 function findCheck(
   checkRuns: ReadonlyArray<GitHubCheckRun>,
   expectedName: (typeof REQUIRED_SMOKE_CHECKS)[number],
@@ -101,7 +107,9 @@ function findCheck(
   const matches = checkRuns.filter(
     (check) => check.name === expectedName || check.name.endsWith(` / ${expectedName}`),
   );
-  return matches.find((check) => check.conclusion !== "skipped") ?? matches[0];
+  return matches
+    .filter((check) => check.conclusion !== "skipped")
+    .toSorted((left, right) => checkCompletedTime(right) - checkCompletedTime(left))[0];
 }
 
 function describeMissingChecks(checkRuns: ReadonlyArray<GitHubCheckRun>) {
@@ -255,6 +263,12 @@ async function ghJson<T>(repo: string, path: string): Promise<T> {
   return JSON.parse(await run("gh", ["api", `/repos/${repo}${path}`])) as T;
 }
 
+async function ghJsonPages<T>(repo: string, path: string): Promise<ReadonlyArray<T>> {
+  return JSON.parse(
+    await run("gh", ["api", "--paginate", "--slurp", `/repos/${repo}${path}`]),
+  ) as ReadonlyArray<T>;
+}
+
 async function ghJsonOptional<T>(repo: string, path: string): Promise<T | undefined> {
   try {
     return await ghJson<T>(repo, path);
@@ -268,6 +282,7 @@ async function resolveRepo() {
 }
 
 async function resolveOriginMainSha() {
+  await run("git", ["fetch", "--quiet", "origin", "main:refs/remotes/origin/main"]);
   return run("git", ["rev-parse", "origin/main"]);
 }
 
@@ -275,11 +290,11 @@ function makeGhVerificationClient(repo: string): VerificationClient {
   return {
     listReleases: () => ghJson<ReadonlyArray<GitHubRelease>>(repo, "/releases?per_page=100"),
     listCheckRuns: async (sha) => {
-      const response = await ghJson<{ readonly check_runs: ReadonlyArray<GitHubCheckRun> }>(
+      const pages = await ghJsonPages<{ readonly check_runs: ReadonlyArray<GitHubCheckRun> }>(
         repo,
         `/commits/${sha}/check-runs?per_page=100&filter=all`,
       );
-      return response.check_runs;
+      return pages.flatMap((page) => page.check_runs);
     },
   };
 }
