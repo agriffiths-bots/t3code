@@ -75,7 +75,12 @@ if [[ -z "$origin" || -z "$service" ]]; then
   exit 2
 fi
 
-if ! [[ "$timeout_secs" =~ ^[0-9]+$ ]] || [[ "$timeout_secs" -le 0 ]]; then
+if ! [[ "$timeout_secs" =~ ^[0-9]+$ ]]; then
+  echo "health-probe: --timeout must be a positive integer" >&2
+  exit 2
+fi
+timeout_secs="$((10#$timeout_secs))"
+if [[ "$timeout_secs" -le 0 ]]; then
   echo "health-probe: --timeout must be a positive integer" >&2
   exit 2
 fi
@@ -155,7 +160,7 @@ run_systemd_check() {
     attempt_timeout="$(bounded_command_timeout "$remaining")"
     output="$(timeout "$attempt_timeout" systemctl --user is-active "$service" 2>&1)"
     rc=$?
-    if [[ "$rc" -eq 0 && "$output" == "active" ]]; then
+    if [[ "$rc" -eq 0 ]]; then
       print_check "systemd" "PASS" "active"
       return 0
     fi
@@ -340,14 +345,21 @@ async function dispatch(command, timeout = requestTimeoutMs, endAt = deadline) {
   }, `dispatch ${command.type}`, timeout, endAt);
 }
 
-async function snapshot() {
+async function snapshot(endAt = deadline) {
   return requestJson(apiUrl("/api/orchestration/snapshot"), {
     headers: { authorization: `Bearer ${token}` },
-  }, "snapshot", requestTimeoutMs);
+  }, "snapshot", requestTimeoutMs, endAt);
 }
 
 async function sleep(ms) {
   await new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function completedWithinDeadline(thread) {
+  if (thread?.latestTurn?.state !== "completed") return false;
+  const completedAt = Date.parse(thread.latestTurn.completedAt || "");
+  if (!Number.isFinite(completedAt)) return Date.now() <= deadline;
+  return completedAt <= deadline;
 }
 
 async function cleanup() {
@@ -444,14 +456,32 @@ async function main() {
     const snap = await snapshot();
     const thread = (snap.threads || []).find((candidate) => candidate.id === threadId);
     lastState = thread?.latestTurn?.state || lastState;
-    if (lastState === "completed") {
+    if (completedWithinDeadline(thread)) {
       console.log(`completed thread=${threadId}`);
       return;
     }
     if (lastState === "interrupted" || lastState === "error") {
       throw new Error(`turn ${lastState}`);
     }
-    await sleep(2000);
+    await sleep(Math.min(2000, Math.max(0, deadline - Date.now())));
+  }
+  let finalThread;
+  try {
+    const snap = await snapshot(Date.now() + requestTimeoutMs);
+    finalThread = (snap.threads || []).find((candidate) => candidate.id === threadId);
+  } catch {
+    // Preserve the last observed state for the timeout error below.
+  }
+  if (finalThread) {
+    const thread = finalThread;
+    lastState = thread?.latestTurn?.state || lastState;
+    if (completedWithinDeadline(thread)) {
+      console.log(`completed thread=${threadId}`);
+      return;
+    }
+    if (lastState === "interrupted" || lastState === "error") {
+      throw new Error(`turn ${lastState}`);
+    }
   }
   throw new Error(`timeout last_state=${lastState}`);
 }

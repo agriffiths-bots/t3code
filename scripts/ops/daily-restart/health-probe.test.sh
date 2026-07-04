@@ -178,6 +178,12 @@ assert_contains "$node_log" "fakeAgent fake-model" "explicit smoke provider is p
 assert_contains "$node_log" "timeout args=--kill-after=10 150 node -" "smoke child has process-level timeout"
 assert_contains "$node_log" "curl origin=http://127.0.0.1:1" "origin normalized before http readiness check"
 
+result="$(run_probe "base-ten timeout" --timeout 08)"
+node_log="$(dirname "$result")/node.log"
+if [[ "$(sed -n '1p' "$result")" == "0" ]]; then pass "zero-padded timeout parses as base ten"; else fail "zero-padded timeout parses as base ten"; fi
+assert_contains "$node_log" "node args=- http://127.0.0.1:1 8" "zero-padded timeout normalized before smoke child"
+assert_contains "$node_log" "timeout args=--kill-after=10 38 node -" "zero-padded timeout normalized before process timeout"
+
 result="$(run_probe_without_supplied_token --timeout 301)"
 node_log="$(dirname "$result")/node.log"
 assert_contains "$node_log" "--ttl 391s" "default minted token ttl scales with timeout"
@@ -192,6 +198,12 @@ if [[ "$(sed -n '1p' "$result")" == "0" ]]; then pass "transient readiness failu
 assert_contains "$result" "CHECK systemd PASS active" "systemd retry pass line"
 assert_contains "$result" "CHECK http PASS 200" "http retry pass line"
 unset FAKE_SYSTEMD_SEQUENCE_FILE FAKE_HTTP_SEQUENCE_FILE
+
+export FAKE_SYSTEMD=$'active\nwarning: ignored diagnostic' FAKE_SYSTEMD_RC=0
+result="$(run_probe "systemd active with diagnostics")"
+if [[ "$(sed -n '1p' "$result")" == "0" ]]; then pass "systemd active exit status passes despite diagnostics"; else fail "systemd active exit status passes despite diagnostics"; fi
+assert_contains "$result" "CHECK systemd PASS active" "systemd diagnostic pass line"
+unset FAKE_SYSTEMD FAKE_SYSTEMD_RC
 
 export FAKE_SYSTEMD=inactive FAKE_SYSTEMD_RC=3
 result="$(run_probe "systemd fails" --timeout 1)"
