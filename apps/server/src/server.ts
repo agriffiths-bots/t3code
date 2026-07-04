@@ -56,10 +56,7 @@ import { ProviderCommandReactorLive } from "./orchestration/Layers/ProviderComma
 import { CheckpointReactorLive } from "./orchestration/Layers/CheckpointReactor.ts";
 import { ThreadDeletionReactorLive } from "./orchestration/Layers/ThreadDeletionReactor.ts";
 import { ScheduledTasksReactorLive } from "./orchestration/Layers/ScheduledTasksReactor.ts";
-import {
-  ActiveChildThreadCoordinatorLive,
-  ChildThreadCoordinatorLive,
-} from "./orchestration/Layers/ChildThreadCoordinator.ts";
+import { ChildThreadCoordinatorLive } from "./orchestration/Layers/ChildThreadCoordinator.ts";
 import * as AgentAwarenessRelay from "./relay/AgentAwarenessRelay.ts";
 import { hasCloudPublicConfig } from "./cloud/publicConfig.ts";
 import { ProviderRegistryLive } from "./provider/Layers/ProviderRegistry.ts";
@@ -378,9 +375,6 @@ const ServerApplicationRegistrationsLive = Layer.mergeAll(
     Layer.provide(BootstrapTurnStartDispatcher.layer),
   ),
   ThreadStartRuntimeLive,
-  ActiveChildThreadCoordinatorLive.pipe(
-    Layer.provide(ChildThreadCoordinatorLive.pipe(Layer.provide(PendingDispatchRepositoryLive))),
-  ),
   SubagentRuntimeLive.pipe(Layer.provide(PendingDispatchRepositoryLive)),
 );
 

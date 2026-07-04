@@ -94,6 +94,22 @@ function settledTurnStateForSessionStatus(
   }
 }
 
+function latestTurnIdForSessionSet(
+  status: OrchestrationSessionStatus,
+  activeTurnId: ProjectionTurn["turnId"],
+  existingLatestTurnId: ProjectionTurn["turnId"],
+): ProjectionTurn["turnId"] {
+  if (activeTurnId !== null) return activeTurnId;
+  switch (status) {
+    case "starting":
+    case "running":
+    case "waiting":
+      return null;
+    default:
+      return existingLatestTurnId;
+  }
+}
+
 interface ProjectorDefinition {
   readonly name: ProjectorName;
   readonly apply: (
@@ -741,9 +757,14 @@ const makeOrchestrationProjectionPipeline = Effect.fn("makeOrchestrationProjecti
           if (Option.isNone(existingRow)) {
             return;
           }
+          const nextLatestTurnId = latestTurnIdForSessionSet(
+            event.payload.session.status,
+            event.payload.session.activeTurnId,
+            existingRow.value.latestTurnId,
+          );
           yield* projectionThreadRepository.upsert({
             ...existingRow.value,
-            latestTurnId: event.payload.session.activeTurnId,
+            latestTurnId: nextLatestTurnId,
             updatedAt: event.occurredAt,
           });
           yield* refreshThreadShellSummary(event.payload.threadId);

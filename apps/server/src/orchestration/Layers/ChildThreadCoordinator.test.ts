@@ -68,8 +68,11 @@ interface ThreadState {
   readonly detail: OrchestrationThread;
 }
 
-const makeLatestTurn = (state: OrchestrationLatestTurn["state"]): OrchestrationLatestTurn => ({
-  turnId: TurnId.make("turn-1"),
+const makeLatestTurn = (
+  state: OrchestrationLatestTurn["state"],
+  turnId: TurnId = TurnId.make("turn-1"),
+): OrchestrationLatestTurn => ({
+  turnId,
   state,
   requestedAt: now,
   startedAt: now,
@@ -160,16 +163,17 @@ const makeThreadState = (input: {
 const turnDiffEvent = (
   threadId: ThreadId,
   status: "ready" | "missing" | "error",
+  turnId: TurnId = TurnId.make("turn-1"),
 ): OrchestrationEvent =>
   ({
-    eventId: EventId.make(`evt-diff-${threadId}-${status}`),
+    eventId: EventId.make(`evt-diff-${threadId}-${turnId}-${status}`),
     type: "thread.turn-diff-completed",
     aggregateKind: "thread",
     aggregateId: threadId,
     occurredAt: now,
     payload: {
       threadId,
-      turnId: TurnId.make("turn-1"),
+      turnId,
       checkpointTurnCount: 1,
       checkpointRef: `thread:${threadId}:turn:1`,
       status,
@@ -179,9 +183,26 @@ const turnDiffEvent = (
     },
   }) as unknown as OrchestrationEvent;
 
+const turnStartRequestedEvent = (threadId: ThreadId): OrchestrationEvent =>
+  ({
+    eventId: EventId.make(`evt-turn-start-${threadId}`),
+    type: "thread.turn-start-requested",
+    aggregateKind: "thread",
+    aggregateId: threadId,
+    occurredAt: now,
+    payload: {
+      threadId,
+      messageId: MessageId.make(`message-${threadId}`),
+      runtimeMode: "full-access",
+      interactionMode: "default",
+      createdAt: now,
+    },
+  }) as unknown as OrchestrationEvent;
+
 const sessionSetEvent = (
   threadId: ThreadId,
   status: OrchestrationSession["status"],
+  activeTurnId: TurnId | null = null,
 ): OrchestrationEvent =>
   ({
     eventId: EventId.make(`evt-session-${threadId}-${status}`),
@@ -189,7 +210,7 @@ const sessionSetEvent = (
     aggregateKind: "thread",
     aggregateId: threadId,
     occurredAt: now,
-    payload: { threadId, session: makeSession(threadId, status) },
+    payload: { threadId, session: makeSession(threadId, status, activeTurnId) },
   }) as unknown as OrchestrationEvent;
 
 const threadDeletedEvent = (threadId: ThreadId): OrchestrationEvent =>
@@ -238,6 +259,8 @@ describe("ChildThreadCoordinator", () => {
     readonly seedAcceptedCommandIds?: ReadonlyArray<string>;
     /** Thread ids whose `getThreadShellById` read sleeps far longer than a slice. */
     readonly slowThreadShellIds?: ReadonlyArray<ThreadId>;
+    /** Thread ids whose `getThreadDetailById` read sleeps far longer than a slice. */
+    readonly slowThreadDetailIds?: ReadonlyArray<ThreadId>;
     /**
      * Invoked synchronously whenever a `thread.turn.start` command is dispatched.
      * Used by the re-entrancy test to enqueue the parent's terminal signal while
@@ -255,6 +278,7 @@ describe("ChildThreadCoordinator", () => {
     const dispatched: Array<OrchestrationCommand> = [];
     const knownInstances = new Set(input?.knownInstances ?? ["codex"]);
     const slowShellIds = new Set((input?.slowThreadShellIds ?? []).map((id) => String(id)));
+    const slowDetailIds = new Set((input?.slowThreadDetailIds ?? []).map((id) => String(id)));
 
     const eventQueue = Effect.runSync(Queue.unbounded<OrchestrationEvent>());
     const enqueueSync = (event: OrchestrationEvent) =>
@@ -315,7 +339,10 @@ describe("ChildThreadCoordinator", () => {
           return state ? Option.some(state.shell) : Option.none();
         }),
       getThreadDetailById: (threadId) =>
-        Effect.sync(() => {
+        Effect.gen(function* () {
+          if (slowDetailIds.has(String(threadId))) {
+            yield* Effect.sleep(`${WAIT_SLICE_SECONDS * 3} seconds`);
+          }
           const state = threadStates.get(threadId);
           return state ? Option.some(state.detail) : Option.none();
         }),
@@ -384,6 +411,13 @@ describe("ChildThreadCoordinator", () => {
     await Effect.runPromise(coordinator.start().pipe(Scope.provide(scope)));
 
     const setThread = (state: ThreadState) => threadStates.set(state.shell.id, state);
+    const setDetailSlow = (threadId: ThreadId, slow: boolean) => {
+      if (slow) {
+        slowDetailIds.add(String(threadId));
+      } else {
+        slowDetailIds.delete(String(threadId));
+      }
+    };
 
     // Simulate a deleted thread: subsequent getThreadShellById reads return none.
     const removeThread = (threadId: ThreadId) => threadStates.delete(threadId);
@@ -415,6 +449,7 @@ describe("ChildThreadCoordinator", () => {
       coordinator,
       dispatched,
       setThread,
+      setDetailSlow,
       removeThread,
       feed,
       register,
@@ -467,7 +502,45 @@ describe("ChildThreadCoordinator", () => {
     expect(result.status).toBe("failed");
   });
 
-  it("settles missing turn-diff as failed", async () => {
+  it("settles error turn-diff as failed even when projection shows completed", async () => {
+    const child = ThreadId.make("child-error-projection-completed");
+    const parent = ThreadId.make("parent-error-projection-completed");
+    const turn1 = TurnId.make("turn-1");
+    const harness = await createHarness({
+      threads: [
+        makeThreadState({
+          threadId: child,
+          parentThreadId: parent,
+          latestTurn: makeLatestTurn("running", turn1),
+          session: makeSession(child, "running", turn1),
+        }),
+      ],
+    });
+    await harness.register({
+      parentThreadId: parent,
+      childThreadId: child,
+      detached: false,
+      model: codexModel,
+      spawnedAtMs: 0,
+    });
+    await harness.feed(sessionSetEvent(child, "running", turn1));
+    harness.setThread(
+      makeThreadState({
+        threadId: child,
+        parentThreadId: parent,
+        latestTurn: makeLatestTurn("completed", turn1),
+        session: makeSession(child, "ready"),
+        assistantText: "stale completed text",
+      }),
+    );
+    await harness.feed(turnDiffEvent(child, "error", turn1));
+
+    const result = await runtimeRun(harness, child);
+    expect(result.status).toBe("failed");
+    expect(result.error).toBe("turn diff error");
+  });
+
+  it("does NOT settle missing turn-diff without matching projection evidence", async () => {
     const child = ThreadId.make("child-missing");
     const parent = ThreadId.make("parent-3");
     const harness = await createHarness({
@@ -481,8 +554,108 @@ describe("ChildThreadCoordinator", () => {
       spawnedAtMs: 0,
     });
     await harness.feed(turnDiffEvent(child, "missing"));
-    const result = await runtimeRun(harness, child);
-    expect(result.status).toBe("failed");
+    const slice = await runtimeWaitSlice(harness, [child], PAST_MS);
+    expect(slice.results[0]!.status).toBe("timeout");
+  });
+
+  it("does NOT settle missing turn-diff while the projection still shows the child running", async () => {
+    const child = ThreadId.make("child-missing-running");
+    const parent = ThreadId.make("parent-missing-running");
+    const harness = await createHarness({
+      threads: [
+        makeThreadState({
+          threadId: child,
+          parentThreadId: parent,
+          latestTurn: makeLatestTurn("running"),
+          session: makeSession(child, "running", TurnId.make("turn-1")),
+        }),
+        makeThreadState({
+          threadId: parent,
+          latestTurn: makeLatestTurn("completed"),
+          session: makeSession(parent, "ready"),
+        }),
+      ],
+    });
+    await harness.register({
+      parentThreadId: parent,
+      childThreadId: child,
+      detached: true,
+      model: codexModel,
+      spawnedAtMs: 0,
+    });
+    await harness.feed(turnDiffEvent(child, "missing"));
+    const slice = await runtimeWaitSlice(harness, [child], PAST_MS);
+    expect(slice.results[0]!.status).toBe("timeout");
+    expect(
+      harness.dispatched.filter((command) => command.type === "thread.turn.start"),
+    ).toHaveLength(0);
+  });
+
+  it("does NOT settle missing turn-diff when the bounded projection read times out", async () => {
+    const child = ThreadId.make("child-missing-slow-projection");
+    const parent = ThreadId.make("parent-missing-slow-projection");
+    const harness = await createHarness({
+      threads: [
+        makeThreadState({
+          threadId: child,
+          parentThreadId: parent,
+          latestTurn: makeLatestTurn("running"),
+          session: makeSession(child, "running", TurnId.make("turn-1")),
+        }),
+        makeThreadState({
+          threadId: parent,
+          latestTurn: makeLatestTurn("completed"),
+          session: makeSession(parent, "ready"),
+        }),
+      ],
+      slowThreadShellIds: [child],
+    });
+    await harness.register({
+      parentThreadId: parent,
+      childThreadId: child,
+      detached: true,
+      model: codexModel,
+      spawnedAtMs: 0,
+    });
+    await harness.feed(turnDiffEvent(child, "missing"));
+    const slice = await runtimeWaitSlice(harness, [child], PAST_MS);
+    expect(slice.results[0]!.status).toBe("timeout");
+    expect(
+      harness.dispatched.filter((command) => command.type === "thread.turn.start"),
+    ).toHaveLength(0);
+  });
+
+  it("does NOT settle missing turn-diff from a stale completed projection for another turn", async () => {
+    const child = ThreadId.make("child-missing-stale-completed");
+    const parent = ThreadId.make("parent-missing-stale-completed");
+    const harness = await createHarness({
+      threads: [
+        makeThreadState({
+          threadId: child,
+          parentThreadId: parent,
+          latestTurn: makeLatestTurn("completed", TurnId.make("previous-turn")),
+          session: makeSession(child, "running", TurnId.make("turn-1")),
+        }),
+        makeThreadState({
+          threadId: parent,
+          latestTurn: makeLatestTurn("completed"),
+          session: makeSession(parent, "ready"),
+        }),
+      ],
+    });
+    await harness.register({
+      parentThreadId: parent,
+      childThreadId: child,
+      detached: true,
+      model: codexModel,
+      spawnedAtMs: 0,
+    });
+    await harness.feed(turnDiffEvent(child, "missing"));
+    const slice = await runtimeWaitSlice(harness, [child], PAST_MS);
+    expect(slice.results[0]!.status).toBe("timeout");
+    expect(
+      harness.dispatched.filter((command) => command.type === "thread.turn.start"),
+    ).toHaveLength(0);
   });
 
   it("settles session-set stopped (idle) as failed", async () => {
@@ -510,6 +683,402 @@ describe("ChildThreadCoordinator", () => {
     expect(result.status).toBe("failed");
   });
 
+  it("settles session-set ready with a completed projected turn as completed", async () => {
+    const child = ThreadId.make("child-ready-completed");
+    const parent = ThreadId.make("parent-ready-completed");
+    const harness = await createHarness({
+      threads: [
+        makeThreadState({
+          threadId: child,
+          parentThreadId: parent,
+          latestTurn: makeLatestTurn("running"),
+          session: makeSession(child, "running", TurnId.make("turn-1")),
+        }),
+      ],
+    });
+    await harness.register({
+      parentThreadId: parent,
+      childThreadId: child,
+      detached: false,
+      model: codexModel,
+      spawnedAtMs: 0,
+    });
+    await harness.feed(sessionSetEvent(child, "running", TurnId.make("turn-1")));
+    harness.setThread(
+      makeThreadState({
+        threadId: child,
+        parentThreadId: parent,
+        latestTurn: makeLatestTurn("completed"),
+        session: makeSession(child, "ready"),
+        assistantText: "ready result",
+      }),
+    );
+    await harness.feed(sessionSetEvent(child, "ready"));
+    const result = await runtimeRun(harness, child);
+    expect(result.status).toBe("completed");
+    expect(result.finalAssistantText).toBe("ready result");
+  });
+
+  it("settles session-set ready after registering against an already-running projected turn", async () => {
+    const child = ThreadId.make("child-ready-projected-running");
+    const parent = ThreadId.make("parent-ready-projected-running");
+    const turn1 = TurnId.make("turn-1");
+    const harness = await createHarness({
+      threads: [
+        makeThreadState({
+          threadId: child,
+          parentThreadId: parent,
+          latestTurn: makeLatestTurn("running", turn1),
+          session: makeSession(child, "running", turn1),
+        }),
+      ],
+    });
+    await harness.register({
+      parentThreadId: parent,
+      childThreadId: child,
+      detached: false,
+      model: codexModel,
+      spawnedAtMs: 0,
+    });
+    harness.setThread(
+      makeThreadState({
+        threadId: child,
+        parentThreadId: parent,
+        latestTurn: makeLatestTurn("completed", turn1),
+        session: makeSession(child, "ready"),
+        assistantText: "projected running completed",
+      }),
+    );
+    await harness.feed(sessionSetEvent(child, "ready"));
+
+    const result = await runtimeRun(harness, child);
+    expect(result.status).toBe("completed");
+    expect(result.finalAssistantText).toBe("projected running completed");
+  });
+
+  it("drains deferred child steers when session-set ready observes a completed projected turn", async () => {
+    const child = ThreadId.make("child-ready-drain-steer");
+    const parent = ThreadId.make("parent-ready-drain-steer");
+    const harness = await createHarness({
+      threads: [
+        makeThreadState({
+          threadId: child,
+          parentThreadId: parent,
+          latestTurn: makeLatestTurn("running"),
+          session: makeSession(child, "running", TurnId.make("turn-1")),
+        }),
+      ],
+    });
+    await harness.register({
+      parentThreadId: parent,
+      childThreadId: child,
+      detached: false,
+      model: codexModel,
+      spawnedAtMs: 0,
+    });
+    await harness.insertPendingDispatch({
+      id: PendingDispatchId.make("pd-ready-steer-1"),
+      kind: "child_steer",
+      targetThreadId: child,
+      sourceChildId: null,
+      text: "continue after ready",
+      error: null,
+      status: null,
+      commandId: null,
+      createdAt: now as unknown as PendingDispatch["createdAt"],
+    });
+
+    await harness.feed(sessionSetEvent(child, "running", TurnId.make("turn-1")));
+    harness.setThread(
+      makeThreadState({
+        threadId: child,
+        parentThreadId: parent,
+        latestTurn: makeLatestTurn("completed"),
+        session: makeSession(child, "ready"),
+        assistantText: "ready result",
+      }),
+    );
+    await harness.feed(sessionSetEvent(child, "ready"));
+
+    const steerStarts = harness.dispatched.filter(
+      (c) => c.type === "thread.turn.start" && c.threadId === child,
+    );
+    expect(steerStarts).toHaveLength(1);
+    expect(await harness.listPendingDispatches()).toHaveLength(0);
+  });
+
+  it("drains deferred child steers when one-shot projection settlement observes idle", async () => {
+    const child = ThreadId.make("child-oneshot-drain-steer");
+    const parent = ThreadId.make("parent-oneshot-drain-steer");
+    const harness = await createHarness({
+      threads: [
+        makeThreadState({
+          threadId: child,
+          parentThreadId: parent,
+          latestTurn: makeLatestTurn("completed"),
+          session: makeSession(child, "ready"),
+          assistantText: "ready result",
+        }),
+      ],
+    });
+    await harness.insertPendingDispatch({
+      id: PendingDispatchId.make("pd-oneshot-steer-1"),
+      kind: "child_steer",
+      targetThreadId: child,
+      sourceChildId: null,
+      text: "continue after one-shot",
+      error: null,
+      status: null,
+      commandId: null,
+      createdAt: now as unknown as PendingDispatch["createdAt"],
+    });
+
+    await harness.register({
+      parentThreadId: parent,
+      childThreadId: child,
+      detached: false,
+      model: codexModel,
+      spawnedAtMs: 0,
+    });
+
+    const steerStarts = harness.dispatched.filter(
+      (c) => c.type === "thread.turn.start" && c.threadId === child,
+    );
+    expect(steerStarts).toHaveLength(1);
+    expect(await harness.listPendingDispatches()).toHaveLength(0);
+  });
+
+  it("does NOT settle session-set ready from a stale completed projection for another turn", async () => {
+    const child = ThreadId.make("child-ready-stale-completed");
+    const parent = ThreadId.make("parent-ready-stale-completed");
+    const harness = await createHarness({
+      threads: [
+        makeThreadState({
+          threadId: child,
+          parentThreadId: parent,
+          latestTurn: makeLatestTurn("running"),
+          session: makeSession(child, "running", TurnId.make("turn-1")),
+        }),
+        makeThreadState({
+          threadId: parent,
+          latestTurn: makeLatestTurn("completed"),
+          session: makeSession(parent, "ready"),
+        }),
+      ],
+    });
+    await harness.register({
+      parentThreadId: parent,
+      childThreadId: child,
+      detached: true,
+      model: codexModel,
+      spawnedAtMs: 0,
+    });
+    await harness.feed(sessionSetEvent(child, "running", TurnId.make("turn-1")));
+    harness.setThread(
+      makeThreadState({
+        threadId: child,
+        parentThreadId: parent,
+        latestTurn: makeLatestTurn("completed", TurnId.make("previous-turn")),
+        session: makeSession(child, "ready"),
+      }),
+    );
+
+    await harness.feed(sessionSetEvent(child, "ready"));
+
+    const slice = await runtimeWaitSlice(harness, [child], PAST_MS);
+    expect(slice.results[0]!.status).toBe("timeout");
+    expect(
+      harness.dispatched.filter((command) => command.type === "thread.turn.start"),
+    ).toHaveLength(0);
+  });
+
+  it("does NOT settle stale ready turn-diff after a newer child turn starts", async () => {
+    const child = ThreadId.make("child-ready-stale-diff");
+    const parent = ThreadId.make("parent-ready-stale-diff");
+    const turn1 = TurnId.make("turn-1");
+    const turn2 = TurnId.make("turn-2");
+    const harness = await createHarness({
+      threads: [
+        makeThreadState({
+          threadId: child,
+          parentThreadId: parent,
+          latestTurn: makeLatestTurn("running", turn1),
+          session: makeSession(child, "running", turn1),
+        }),
+      ],
+    });
+    await harness.register({
+      parentThreadId: parent,
+      childThreadId: child,
+      detached: false,
+      model: codexModel,
+      spawnedAtMs: 0,
+    });
+    await harness.feed(sessionSetEvent(child, "running", turn1));
+    harness.setThread(
+      makeThreadState({
+        threadId: child,
+        parentThreadId: parent,
+        latestTurn: makeLatestTurn("running", turn2),
+        session: makeSession(child, "running", turn2),
+      }),
+    );
+    await harness.feed(sessionSetEvent(child, "running", turn2));
+
+    await harness.feed(turnDiffEvent(child, "ready", turn1));
+
+    const entriesAfterStaleDiff = await runtimeListChildren(harness, parent);
+    expect(entriesAfterStaleDiff.find((entry) => entry.childThreadId === child)?.settled).toBe(
+      false,
+    );
+
+    harness.setThread(
+      makeThreadState({
+        threadId: child,
+        parentThreadId: parent,
+        latestTurn: makeLatestTurn("completed", turn2),
+        session: makeSession(child, "ready"),
+        assistantText: "turn 2 done",
+      }),
+    );
+    await harness.feed(turnDiffEvent(child, "ready", turn2));
+
+    const entriesAfterCurrentDiff = await runtimeListChildren(harness, parent);
+    expect(entriesAfterCurrentDiff.find((entry) => entry.childThreadId === child)?.settled).toBe(
+      true,
+    );
+  });
+
+  it("does NOT settle stale ready turn-diff after turn-start before the new session-set", async () => {
+    const child = ThreadId.make("child-ready-stale-diff-before-session");
+    const parent = ThreadId.make("parent-ready-stale-diff-before-session");
+    const turn1 = TurnId.make("turn-1");
+    const turn2 = TurnId.make("turn-2");
+    const harness = await createHarness({
+      threads: [
+        makeThreadState({
+          threadId: child,
+          parentThreadId: parent,
+          latestTurn: makeLatestTurn("running", turn1),
+          session: makeSession(child, "running", turn1),
+        }),
+      ],
+    });
+    await harness.register({
+      parentThreadId: parent,
+      childThreadId: child,
+      detached: false,
+      model: codexModel,
+      spawnedAtMs: 0,
+    });
+    await harness.feed(sessionSetEvent(child, "running", turn1));
+    await harness.feed(turnStartRequestedEvent(child));
+    harness.setThread(
+      makeThreadState({
+        threadId: child,
+        parentThreadId: parent,
+        latestTurn: makeLatestTurn("completed", turn1),
+        session: makeSession(child, "running", turn1),
+        assistantText: "old turn done",
+      }),
+    );
+
+    await harness.feed(turnDiffEvent(child, "ready", turn1));
+
+    const entriesAfterStaleDiff = await runtimeListChildren(harness, parent);
+    expect(entriesAfterStaleDiff.find((entry) => entry.childThreadId === child)?.settled).toBe(
+      false,
+    );
+
+    harness.setThread(
+      makeThreadState({
+        threadId: child,
+        parentThreadId: parent,
+        latestTurn: makeLatestTurn("running", turn2),
+        session: makeSession(child, "running", turn2),
+      }),
+    );
+    await harness.feed(sessionSetEvent(child, "running", turn2));
+    harness.setThread(
+      makeThreadState({
+        threadId: child,
+        parentThreadId: parent,
+        latestTurn: makeLatestTurn("completed", turn2),
+        session: makeSession(child, "ready"),
+        assistantText: "turn 2 done",
+      }),
+    );
+    await harness.feed(turnDiffEvent(child, "ready", turn2));
+
+    const entriesAfterCurrentDiff = await runtimeListChildren(harness, parent);
+    expect(entriesAfterCurrentDiff.find((entry) => entry.childThreadId === child)?.settled).toBe(
+      true,
+    );
+  });
+
+  it("does NOT replay a stale idle ready diff as the requested new turn", async () => {
+    const child = ThreadId.make("replay-stale-idle-ready-diff");
+    const parent = ThreadId.make("replay-stale-idle-ready-diff-parent");
+    const turn1 = TurnId.make("turn-1");
+    const harness = await createHarness({
+      threads: [
+        makeThreadState({
+          threadId: child,
+          parentThreadId: parent,
+          latestTurn: makeLatestTurn("completed", turn1),
+          session: makeSession(child, "ready"),
+          assistantText: "old turn done",
+        }),
+      ],
+      seedChildRows: [{ threadId: child, parentThreadId: parent }],
+      persistedEvents: [turnStartRequestedEvent(child), turnDiffEvent(child, "ready", turn1)],
+    });
+
+    const slice = await runtimeWaitSlice(harness, [child], PAST_MS);
+    expect(slice.results[0]!.status).toBe("timeout");
+  });
+
+  it("settles same-turn ready diff after a mid-turn steer", async () => {
+    const child = ThreadId.make("child-mid-turn-steer-ready-diff");
+    const parent = ThreadId.make("parent-mid-turn-steer-ready-diff");
+    const turn1 = TurnId.make("turn-1");
+    const harness = await createHarness({
+      threads: [
+        makeThreadState({
+          threadId: child,
+          parentThreadId: parent,
+          latestTurn: makeLatestTurn("running", turn1),
+          session: makeSession(child, "running", turn1),
+        }),
+      ],
+    });
+    await harness.register({
+      parentThreadId: parent,
+      childThreadId: child,
+      detached: false,
+      model: codexModel,
+      spawnedAtMs: 0,
+    });
+    await harness.feed(sessionSetEvent(child, "running", turn1));
+    await harness.feed(turnStartRequestedEvent(child));
+    harness.setThread(
+      makeThreadState({
+        threadId: child,
+        parentThreadId: parent,
+        latestTurn: makeLatestTurn("completed", turn1),
+        session: makeSession(child, "ready"),
+        assistantText: "same turn done",
+      }),
+    );
+
+    await harness.feed(turnDiffEvent(child, "ready", turn1));
+
+    const entriesAfterReadyDiff = await runtimeListChildren(harness, parent);
+    expect(entriesAfterReadyDiff.find((entry) => entry.childThreadId === child)?.settled).toBe(
+      true,
+    );
+  });
+
   it("does NOT settle session-set stopped while the latest turn is still running", async () => {
     const child = ThreadId.make("child-stopped-running");
     const parent = ThreadId.make("parent-4b");
@@ -533,6 +1102,35 @@ describe("ChildThreadCoordinator", () => {
     await harness.feed(sessionSetEvent(child, "stopped"));
     const slice = await runtimeWaitSlice(harness, [child], FAR_FUTURE_MS);
     expect(slice.results[0]!.status).toBe("pending");
+  });
+
+  it("settles stopped after a missing turn-diff while projection remains running", async () => {
+    const child = ThreadId.make("child-missing-running-stopped");
+    const parent = ThreadId.make("parent-missing-running-stopped");
+    const harness = await createHarness({
+      threads: [
+        makeThreadState({
+          threadId: child,
+          parentThreadId: parent,
+          latestTurn: makeLatestTurn("running"),
+          session: makeSession(child, "running", TurnId.make("turn-1")),
+        }),
+      ],
+    });
+    await harness.register({
+      parentThreadId: parent,
+      childThreadId: child,
+      detached: false,
+      model: codexModel,
+      spawnedAtMs: 0,
+    });
+
+    await harness.feed(turnDiffEvent(child, "missing"));
+    await harness.feed(sessionSetEvent(child, "stopped"));
+
+    const result = await runtimeRun(harness, child);
+    expect(result.status).toBe("failed");
+    expect(result.error).toBe("session stopped");
   });
 
   it("settles thread.deleted as killed", async () => {
@@ -577,6 +1175,37 @@ describe("ChildThreadCoordinator", () => {
     const result = await runtimeRun(harness, child);
     expect(result.status).toBe("completed");
     expect(result.finalAssistantText).toBe("finished before subscribe");
+  });
+
+  it("does NOT settle a completed projection until detail is available", async () => {
+    const child = ThreadId.make("child-completed-detail-lag");
+    const parent = ThreadId.make("parent-completed-detail-lag");
+    const harness = await createHarness({
+      threads: [
+        makeThreadState({
+          threadId: child,
+          parentThreadId: parent,
+          latestTurn: makeLatestTurn("completed"),
+          assistantText: "detail arrived later",
+        }),
+      ],
+      slowThreadDetailIds: [child],
+    });
+    await harness.register({
+      parentThreadId: parent,
+      childThreadId: child,
+      detached: false,
+      model: codexModel,
+      spawnedAtMs: 0,
+    });
+
+    const beforeDetail = await runtimeWaitSlice(harness, [child], PAST_MS);
+    expect(beforeDetail.results[0]!.status).toBe("timeout");
+
+    harness.setDetailSlow(child, false);
+    const result = await runtimeRun(harness, child);
+    expect(result.status).toBe("completed");
+    expect(result.finalAssistantText).toBe("detail arrived later");
   });
 
   it("waitSlice never exceeds the slice duration for a running child", async () => {
@@ -815,6 +1444,290 @@ describe("ChildThreadCoordinator", () => {
     expect(slice.results[0]!.finalAssistantText).toBe("reconciled");
   });
 
+  it("does NOT reconcile a running placeholder missing turn-diff as terminal", async () => {
+    const child = ThreadId.make("recon-running-missing");
+    const parent = ThreadId.make("recon-running-missing-parent");
+    const harness = await createHarness({
+      threads: [
+        makeThreadState({
+          threadId: child,
+          parentThreadId: parent,
+          latestTurn: makeLatestTurn("running"),
+          session: makeSession(child, "running", TurnId.make("turn-1")),
+        }),
+      ],
+      seedChildRows: [{ threadId: child, parentThreadId: parent }],
+      persistedEvents: [
+        turnStartRequestedEvent(child),
+        sessionSetEvent(child, "running"),
+        turnDiffEvent(child, "missing"),
+      ],
+    });
+    const slice = await runtimeWaitSlice(harness, [child], PAST_MS);
+    expect(slice.results[0]!.status).toBe("timeout");
+  });
+
+  it("does NOT reconcile a stale diff after a replayed turn-start before session-set", async () => {
+    const child = ThreadId.make("replay-turn-start-stale-diff");
+    const parent = ThreadId.make("replay-turn-start-stale-diff-parent");
+    const turn1 = TurnId.make("turn-1");
+    const turn2 = TurnId.make("turn-2");
+    const harness = await createHarness({
+      threads: [
+        makeThreadState({
+          threadId: child,
+          parentThreadId: parent,
+          latestTurn: makeLatestTurn("completed", turn1),
+          session: makeSession(child, "running", turn1),
+          assistantText: "old replayed turn",
+        }),
+      ],
+      seedChildRows: [{ threadId: child, parentThreadId: parent }],
+      persistedEvents: [
+        sessionSetEvent(child, "running", turn1),
+        turnStartRequestedEvent(child),
+        turnDiffEvent(child, "ready", turn1),
+      ],
+    });
+
+    const beforeSession = await runtimeWaitSlice(harness, [child], PAST_MS);
+    expect(beforeSession.results[0]!.status).toBe("timeout");
+
+    harness.setThread(
+      makeThreadState({
+        threadId: child,
+        parentThreadId: parent,
+        latestTurn: makeLatestTurn("running", turn2),
+        session: makeSession(child, "running", turn2),
+      }),
+    );
+    await harness.feed(sessionSetEvent(child, "running", turn2));
+    harness.setThread(
+      makeThreadState({
+        threadId: child,
+        parentThreadId: parent,
+        latestTurn: makeLatestTurn("completed", turn2),
+        session: makeSession(child, "ready"),
+        assistantText: "turn 2 done",
+      }),
+    );
+    await harness.feed(turnDiffEvent(child, "ready", turn2));
+
+    const result = await runtimeRun(harness, child);
+    expect(result.status).toBe("completed");
+    expect(result.finalAssistantText).toBe("turn 2 done");
+  });
+
+  it("reconciles same-turn ready diff after a replayed mid-turn steer", async () => {
+    const child = ThreadId.make("replay-mid-turn-steer-ready-diff");
+    const parent = ThreadId.make("replay-mid-turn-steer-ready-diff-parent");
+    const turn1 = TurnId.make("turn-1");
+    const harness = await createHarness({
+      threads: [
+        makeThreadState({
+          threadId: child,
+          parentThreadId: parent,
+          latestTurn: makeLatestTurn("completed", turn1),
+          session: makeSession(child, "ready"),
+          assistantText: "same turn replayed",
+        }),
+      ],
+      seedChildRows: [{ threadId: child, parentThreadId: parent }],
+      persistedEvents: [
+        sessionSetEvent(child, "running", turn1),
+        turnStartRequestedEvent(child),
+        turnDiffEvent(child, "ready", turn1),
+      ],
+    });
+
+    const result = await runtimeRun(harness, child);
+    expect(result.status).toBe("completed");
+    expect(result.finalAssistantText).toBe("same turn replayed");
+  });
+
+  it("reconciles stopped after a running placeholder missing turn-diff as failed", async () => {
+    const child = ThreadId.make("recon-running-missing-stopped");
+    const parent = ThreadId.make("recon-running-missing-stopped-parent");
+    const harness = await createHarness({
+      threads: [
+        makeThreadState({
+          threadId: child,
+          parentThreadId: parent,
+          latestTurn: makeLatestTurn("running"),
+          session: makeSession(child, "stopped"),
+        }),
+      ],
+      seedChildRows: [{ threadId: child, parentThreadId: parent }],
+      persistedEvents: [
+        turnStartRequestedEvent(child),
+        sessionSetEvent(child, "running"),
+        turnDiffEvent(child, "missing"),
+        sessionSetEvent(child, "stopped"),
+      ],
+    });
+
+    const result = await runtimeRun(harness, child);
+    expect(result.status).toBe("failed");
+    expect(result.error).toBe("session stopped");
+  });
+
+  it("settles live stopped after replaying a running placeholder missing turn-diff", async () => {
+    const child = ThreadId.make("recon-running-missing-live-stopped");
+    const parent = ThreadId.make("recon-running-missing-live-stopped-parent");
+    const harness = await createHarness({
+      threads: [
+        makeThreadState({
+          threadId: child,
+          parentThreadId: parent,
+          latestTurn: makeLatestTurn("running"),
+          session: makeSession(child, "running", TurnId.make("turn-1")),
+        }),
+      ],
+      seedChildRows: [{ threadId: child, parentThreadId: parent }],
+      persistedEvents: [
+        turnStartRequestedEvent(child),
+        sessionSetEvent(child, "running", TurnId.make("turn-1")),
+        turnDiffEvent(child, "missing"),
+      ],
+    });
+
+    await harness.feed(sessionSetEvent(child, "stopped"));
+
+    const result = await runtimeRun(harness, child);
+    expect(result.status).toBe("failed");
+    expect(result.error).toBe("session stopped");
+  });
+
+  it("does NOT reconcile a startup ready session as terminal while a turn is unresolved", async () => {
+    const child = ThreadId.make("recon-startup-ready-running-child");
+    const parent = ThreadId.make("recon-startup-ready-running-parent");
+    const harness = await createHarness({
+      threads: [
+        makeThreadState({
+          threadId: child,
+          parentThreadId: parent,
+          latestTurn: makeLatestTurn("running"),
+          session: makeSession(child, "running", TurnId.make("turn-1")),
+        }),
+      ],
+      seedChildRows: [{ threadId: child, parentThreadId: parent }],
+      persistedEvents: [
+        turnStartRequestedEvent(child),
+        sessionSetEvent(child, "ready"),
+        sessionSetEvent(child, "running"),
+      ],
+    });
+    const slice = await runtimeWaitSlice(harness, [child], PAST_MS);
+    expect(slice.results[0]!.status).toBe("timeout");
+  });
+
+  it("does NOT reconcile stale ready turn-diff after a newer child turn starts", async () => {
+    const child = ThreadId.make("recon-stale-ready-diff-child");
+    const parent = ThreadId.make("recon-stale-ready-diff-parent");
+    const turn1 = TurnId.make("turn-1");
+    const turn2 = TurnId.make("turn-2");
+    const harness = await createHarness({
+      threads: [
+        makeThreadState({
+          threadId: child,
+          parentThreadId: parent,
+          latestTurn: makeLatestTurn("running", turn2),
+          session: makeSession(child, "running", turn2),
+        }),
+      ],
+      seedChildRows: [{ threadId: child, parentThreadId: parent }],
+      persistedEvents: [
+        turnStartRequestedEvent(child),
+        sessionSetEvent(child, "running", turn1),
+        sessionSetEvent(child, "running", turn2),
+        turnDiffEvent(child, "ready", turn1),
+      ],
+    });
+    const entries = await runtimeListChildren(harness, parent);
+    expect(entries.find((entry) => entry.childThreadId === child)?.settled).toBe(false);
+  });
+
+  it("preserves completed session-set during replay when a later missing turn diff exists", async () => {
+    const child = ThreadId.make("recon-ready-missing-child");
+    const parent = ThreadId.make("recon-ready-missing-parent");
+    const turn1 = TurnId.make("turn-1");
+    const harness = await createHarness({
+      threads: [
+        makeThreadState({
+          threadId: child,
+          parentThreadId: parent,
+          latestTurn: makeLatestTurn("completed", turn1),
+          session: makeSession(child, "ready"),
+          assistantText: "completed before missing diff",
+        }),
+      ],
+      seedChildRows: [{ threadId: child, parentThreadId: parent }],
+      persistedEvents: [
+        turnStartRequestedEvent(child),
+        sessionSetEvent(child, "running", turn1),
+        sessionSetEvent(child, "ready"),
+        turnDiffEvent(child, "missing", turn1),
+      ],
+    });
+
+    const result = await runtimeRun(harness, child);
+    expect(result.status).toBe("completed");
+    expect(result.finalAssistantText).toBe("completed before missing diff");
+  });
+
+  it("does NOT replay stale ready session-set after a pending new turn-start", async () => {
+    const child = ThreadId.make("recon-stale-ready-session-pending-child");
+    const parent = ThreadId.make("recon-stale-ready-session-pending-parent");
+    const turn1 = TurnId.make("turn-1");
+    const harness = await createHarness({
+      threads: [
+        makeThreadState({
+          threadId: child,
+          parentThreadId: parent,
+          latestTurn: makeLatestTurn("completed", turn1),
+          session: makeSession(child, "ready"),
+          assistantText: "old turn done",
+        }),
+      ],
+      seedChildRows: [{ threadId: child, parentThreadId: parent }],
+      persistedEvents: [
+        sessionSetEvent(child, "running", turn1),
+        turnStartRequestedEvent(child),
+        sessionSetEvent(child, "ready"),
+      ],
+    });
+
+    const slice = await runtimeWaitSlice(harness, [child], PAST_MS);
+    expect(slice.results[0]!.status).toBe("timeout");
+  });
+
+  it("reconciles completed projection before killing a missing-diff child whose provider is gone", async () => {
+    const child = ThreadId.make("recon-missing-completed-provider-gone-child");
+    const parent = ThreadId.make("recon-missing-completed-provider-gone-parent");
+    const harness = await createHarness({
+      threads: [
+        makeThreadState({
+          threadId: child,
+          parentThreadId: parent,
+          latestTurn: makeLatestTurn("completed"),
+          session: makeSession(child, "ready"),
+          assistantText: "completed despite missing diff",
+        }),
+      ],
+      seedChildRows: [{ threadId: child, parentThreadId: parent }],
+      persistedEvents: [
+        turnStartRequestedEvent(child),
+        sessionSetEvent(child, "running", TurnId.make("turn-1")),
+        turnDiffEvent(child, "missing"),
+      ],
+      knownInstances: [],
+    });
+
+    const result = await runtimeRun(harness, child);
+    expect(result.status).toBe("completed");
+    expect(result.finalAssistantText).toBe("completed despite missing diff");
+  });
+
   it("settles a reconciled non-terminal child as killed when its provider instance is gone", async () => {
     const child = ThreadId.make("recon-orphan");
     const parent = ThreadId.make("recon-orphan-parent");
@@ -972,6 +1885,91 @@ describe("ChildThreadCoordinator", () => {
     expect(turnStarts).toHaveLength(1);
     // The durable wake row was deleted on dispatch (idle parent path).
     expect(await harness.listPendingDispatches()).toHaveLength(0);
+  });
+
+  it("R-A: promotion wakes a foreground child that completed before promotion landed", async () => {
+    const child = ThreadId.make("promote-race-child");
+    const parent = ThreadId.make("promote-race-parent");
+    const harness = await createHarness({
+      threads: [
+        makeThreadState({
+          threadId: child,
+          parentThreadId: parent,
+          latestTurn: makeLatestTurn("running"),
+          session: makeSession(child, "running", TurnId.make("turn-1")),
+        }),
+        makeThreadState({
+          threadId: parent,
+          latestTurn: makeLatestTurn("completed"),
+          session: makeSession(parent, "ready"),
+        }),
+      ],
+    });
+    await harness.register({
+      parentThreadId: parent,
+      childThreadId: child,
+      detached: false,
+      model: codexModel,
+      spawnedAtMs: 0,
+    });
+    harness.setThread(
+      makeThreadState({
+        threadId: child,
+        parentThreadId: parent,
+        latestTurn: makeLatestTurn("completed"),
+        assistantText: "completed before promote",
+      }),
+    );
+    await harness.feed(turnDiffEvent(child, "ready"));
+    expect(
+      harness.dispatched.filter((command) => command.type === "thread.turn.start"),
+    ).toHaveLength(0);
+
+    await Effect.runPromise(harness.coordinator.promoteToWake([child]));
+    const turnStarts = harness.dispatched.filter((command) => command.type === "thread.turn.start");
+    expect(turnStarts).toHaveLength(1);
+    expect(await harness.listPendingDispatches()).toHaveLength(0);
+  });
+
+  it("treats missing turn diffs as completed child turns when projection is completed", async () => {
+    const child = ThreadId.make("missing-diff-child");
+    const parent = ThreadId.make("missing-diff-parent");
+    const harness = await createHarness({
+      threads: [
+        makeThreadState({
+          threadId: child,
+          parentThreadId: parent,
+          latestTurn: makeLatestTurn("running"),
+          session: makeSession(child, "running", TurnId.make("turn-1")),
+        }),
+        makeThreadState({
+          threadId: parent,
+          latestTurn: makeLatestTurn("completed"),
+          session: makeSession(parent, "ready"),
+        }),
+      ],
+    });
+
+    await harness.register({
+      parentThreadId: parent,
+      childThreadId: child,
+      detached: true,
+      model: codexModel,
+      spawnedAtMs: 0,
+    });
+    harness.setThread(
+      makeThreadState({
+        threadId: child,
+        parentThreadId: parent,
+        latestTurn: makeLatestTurn("completed"),
+        assistantText: "missing diff result",
+      }),
+    );
+
+    await harness.feed(turnDiffEvent(child, "missing"));
+
+    const turnStarts = harness.dispatched.filter((command) => command.type === "thread.turn.start");
+    expect(turnStarts).toHaveLength(1);
   });
 
   it("R-B: a wake enqueued mid-turn persists a durable row, then drains on parent idle and deletes it", async () => {
@@ -1361,4 +2359,13 @@ async function runtimeHasPending(
   parent: ThreadId,
 ) {
   return Effect.runPromise(harness.coordinator.hasPendingInjections(parent));
+}
+
+async function runtimeListChildren(
+  harness: {
+    readonly coordinator: import("../Services/ChildThreadCoordinator.ts").ChildThreadCoordinatorShape;
+  },
+  parent: ThreadId,
+) {
+  return Effect.runPromise(harness.coordinator.listChildren(parent));
 }
