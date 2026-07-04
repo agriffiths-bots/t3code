@@ -153,11 +153,27 @@ json_fill_manifest() {
   fi
   node - "$manifest" "$pre_sha" "$snapshot" <<'NODE'
 const fs = require("node:fs");
+const path = require("node:path");
 const [manifestPath, preSha, snapshotPath] = process.argv.slice(2);
 const data = JSON.parse(fs.readFileSync(manifestPath, "utf8"));
 data.pre_sha = preSha;
 data.db_snapshot = snapshotPath;
-fs.writeFileSync(manifestPath, `${JSON.stringify(data, null, 2)}\n`);
+const tempPath = path.join(path.dirname(manifestPath), `.${path.basename(manifestPath)}.${process.pid}.tmp`);
+try {
+  fs.writeFileSync(tempPath, `${JSON.stringify(data, null, 2)}\n`, {
+    encoding: "utf8",
+    flag: "wx",
+    mode: 0o600,
+  });
+  fs.renameSync(tempPath, manifestPath);
+} catch (error) {
+  try {
+    fs.rmSync(tempPath, { force: true });
+  } catch {
+    // Preserve the original write/rename error.
+  }
+  throw error;
+}
 NODE
 }
 
@@ -174,6 +190,23 @@ health_is_pass() {
   grep -Eq '^CHECK systemd PASS( |$)' "$probe_file" || return 1
   grep -Eq '^CHECK http PASS( |$)' "$probe_file" || return 1
   grep -Eq '^CHECK spawn_wake PASS( |$)' "$probe_file"
+}
+
+migration_changes_present() {
+  local rc
+  git -C "$checkout" diff --quiet "$pre_sha" "$target_sha" -- \
+    apps/server/src/persistence/Migrations \
+    apps/server/src/persistence/Migrations.ts \
+    >>"$log_file" 2>&1
+  rc=$?
+  case "$rc" in
+    0) return 1 ;;
+    1) return 0 ;;
+    *)
+      log "migration diff check failed rc=$rc; assuming migrations may have changed"
+      return 0
+      ;;
+  esac
 }
 
 claude_advisory() {
@@ -210,7 +243,7 @@ run_health_probe() {
     echo "health-probe missing" >"$probe_file"
     return 127
   }
-  timeout "$((probe_timeout + 45))" "$probe" --origin "$origin" --service "$service" \
+  timeout "$((probe_timeout * 2 + 60))" "$probe" --origin "$origin" --service "$service" \
     --instance "$smoke_instance" --model "$smoke_model" --timeout "$probe_timeout" \
     >"$probe_file" 2>>"$log_file"
 }
@@ -419,8 +452,13 @@ run_health_probe "$probe_file" || probe_rc=$?
 cat "$probe_file" >>"$log_file"
 claude_advisory "$probe_file"
 if [[ "$probe_rc" -ne 0 ]] || ! health_is_pass "$probe_file"; then
-  log "health probe failed; deterministic rollback"
-  rollback "$probe_file" || exit 1
+  if migration_changes_present; then
+    log "health probe failed and migration files changed; deterministic rollback"
+    rollback "$probe_file" || exit 1
+  else
+    log "health probe failed without migration changes; preserving live DB and rolling back code only"
+    code_only_rollback "$probe_file" || exit 1
+  fi
 fi
 
 if ! inject_resume_manifest; then

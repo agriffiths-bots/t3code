@@ -19,6 +19,7 @@ echo "git $*" >>"$T_LOG"
 case "$*" in
   *"rev-parse HEAD"*) echo "${FAKE_PRE_SHA:-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}" ;;
   *"rev-parse origin/main"*) echo "${FAKE_TARGET_SHA:-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb}" ;;
+  *"diff --quiet"*) exit "${FAKE_MIGRATION_DIFF_RC:-0}" ;;
   *) exit "${FAKE_GIT_RC:-0}" ;;
 esac
 SH
@@ -170,14 +171,28 @@ tmp="$(mktemp -d)"
 export FAKE_HEALTH_FAIL_ONCE=1
 run_manager "$tmp"
 unset FAKE_HEALTH_FAIL_ONCE
-[[ "$(cat "$tmp/rc")" != "0" ]] && pass "health rollback exits nonzero" || fail "health rollback exits nonzero"
-assert_order "$tmp/calls.log" "health" "systemctl --user stop" "git -C" "restore" "pnpm -C $tmp/checkout/apps/web run build" "pnpm -C $tmp/checkout run build:desktop" "systemctl --user start" "health"
-grep -Fq "RESULT ROLLBACK-OK" "$tmp/ledger/"*/t3-daily-restart.result && pass "rollback result recorded" || fail "rollback result recorded"
-if awk 'f && /inject/ { found=1 } /restore/ { f=1 } END { exit found ? 0 : 1 }' "$tmp/calls.log"; then
-  pass "rollback injects resume"
+[[ "$(cat "$tmp/rc")" != "0" ]] && pass "health code rollback exits nonzero" || fail "health code rollback exits nonzero"
+assert_order "$tmp/calls.log" "health" "git -C $tmp/checkout diff --quiet" "systemctl --user stop" "git -C" "pnpm -C $tmp/checkout/apps/web run build" "pnpm -C $tmp/checkout run build:desktop" "systemctl --user start" "health"
+grep -Fq "RESULT CODE-ROLLBACK-OK" "$tmp/ledger/"*/t3-daily-restart.result && pass "health code rollback result recorded" || fail "health code rollback result recorded"
+if awk 'f && /restore/ { found=1 } /health/ { if (++n == 1) f=1 } END { exit found ? 0 : 1 }' "$tmp/calls.log"; then
+  fail "health code rollback restored db"
 else
-  fail "rollback injects resume"
+  pass "health code rollback preserves db"
 fi
+if awk 'f && /inject/ { found=1 } /pnpm -C .* run build:desktop/ { if (++n == 2) f=1 } END { exit found ? 0 : 1 }' "$tmp/calls.log"; then
+  pass "health code rollback injects resume"
+else
+  fail "health code rollback injects resume"
+fi
+
+tmp="$(mktemp -d)"
+export FAKE_HEALTH_FAIL_ONCE=1
+export FAKE_MIGRATION_DIFF_RC=1
+run_manager "$tmp"
+unset FAKE_HEALTH_FAIL_ONCE FAKE_MIGRATION_DIFF_RC
+[[ "$(cat "$tmp/rc")" != "0" ]] && pass "migration health rollback exits nonzero" || fail "migration health rollback exits nonzero"
+assert_order "$tmp/calls.log" "health" "git -C $tmp/checkout diff --quiet" "systemctl --user stop" "git -C" "restore" "pnpm -C $tmp/checkout/apps/web run build" "pnpm -C $tmp/checkout run build:desktop" "systemctl --user start" "health"
+grep -Fq "RESULT ROLLBACK-OK" "$tmp/ledger/"*/t3-daily-restart.result && pass "migration rollback result recorded" || fail "migration rollback result recorded"
 
 tmp="$(mktemp -d)"
 export FAKE_PNPM_FAIL_ONCE=1
@@ -209,7 +224,7 @@ export FAKE_HEALTH_PARTIAL=1
 run_manager "$tmp"
 unset FAKE_HEALTH_PARTIAL
 [[ "$(cat "$tmp/rc")" != "0" ]] && pass "partial health exits nonzero" || fail "partial health exits nonzero"
-grep -Fq "RESULT ROLLBACK-FAILED" "$tmp/ledger/"*/t3-daily-restart.result && pass "partial health rolled back loudly" || fail "partial health rolled back loudly"
+grep -Fq "RESULT CODE-ROLLBACK-FAILED" "$tmp/ledger/"*/t3-daily-restart.result && pass "partial health rolled back loudly" || fail "partial health rolled back loudly"
 
 tmp="$(mktemp -d)"
 mkdir -p "$tmp/ledger"
