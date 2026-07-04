@@ -35,6 +35,8 @@ export interface CapturedThread {
   readonly role: "active" | "waiting";
   readonly status: string;
   readonly active_turn_id: string | null;
+  readonly runtime_mode: string;
+  readonly interaction_mode: string;
   readonly title: string;
   readonly project_id: string;
   readonly injected_at: null;
@@ -52,6 +54,8 @@ interface SessionRow {
   readonly thread_id: string;
   readonly status: string;
   readonly active_turn_id: string | null;
+  readonly runtime_mode: string;
+  readonly interaction_mode: string;
   readonly title: string;
   readonly project_id: string;
 }
@@ -92,6 +96,8 @@ function buildCaptureQuery(excludedThreadIds: ReadonlyArray<string>) {
       sessions.thread_id,
       sessions.status,
       sessions.active_turn_id,
+      sessions.runtime_mode,
+      threads.interaction_mode,
       threads.title,
       threads.project_id
     FROM projection_thread_sessions sessions
@@ -125,6 +131,8 @@ function readCapturedThreads(
     role: roleForRow(row),
     status: row.status,
     active_turn_id: row.active_turn_id,
+    runtime_mode: row.runtime_mode,
+    interaction_mode: row.interaction_mode,
     title: row.title,
     project_id: row.project_id,
     injected_at: null,

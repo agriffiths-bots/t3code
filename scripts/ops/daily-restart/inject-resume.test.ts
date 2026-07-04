@@ -44,6 +44,38 @@ describe("inject-resume", () => {
         }),
       ),
     );
+    assert.throws(() =>
+      parseManifest(
+        JSON.stringify({
+          version: 1,
+          captured_at: "x",
+          threads: [
+            {
+              thread_id: "thread-1",
+              role: "active",
+              runtime_mode: "read-only",
+              injected_at: null,
+            },
+          ],
+        }),
+      ),
+    );
+    assert.throws(() =>
+      parseManifest(
+        JSON.stringify({
+          version: 1,
+          captured_at: "x",
+          threads: [
+            {
+              thread_id: "thread-1",
+              role: "active",
+              interaction_mode: "ask",
+              injected_at: null,
+            },
+          ],
+        }),
+      ),
+    );
   });
 
   it("injects active null entries once and skips waiting/already-injected entries", async () => {
@@ -81,11 +113,46 @@ describe("inject-resume", () => {
     assert.equal(requests[1]?.message.role, "user");
     assert.equal(requests[1]?.message.text, RESUME_MESSAGE);
     assert.deepEqual(requests[1]?.message.attachments, []);
+    assert.equal(requests[1]?.runtimeMode, "full-access");
+    assert.equal(requests[1]?.interactionMode, "default");
 
     const manifest = await readManifest(manifestPath);
     assert.equal(manifest.threads[0].injected_at, "2026-07-03T13:00:00.000Z");
     assert.equal(manifest.threads[1].injected_at, null);
     assert.equal(manifest.threads[2].injected_at, "2026-07-03T12:30:00.000Z");
+  });
+
+  it("preserves persisted runtime and interaction modes for resume turns", async () => {
+    const manifestPath = await writeManifest([
+      {
+        thread_id: "active-approval",
+        role: "active",
+        status: "running",
+        runtime_mode: "approval-required",
+        interaction_mode: "plan",
+        injected_at: null,
+      },
+    ]);
+    const requests: Array<any> = [];
+
+    const result = await injectResume({
+      manifestPath,
+      origin: "http://127.0.0.1:1",
+      token: "test-token",
+      dryRun: false,
+      now: () => new Date("2026-07-03T13:00:00.000Z"),
+      fetchImpl: async (_url: string | URL | Request, init?: RequestInit) => {
+        requests.push(JSON.parse(String(init?.body)));
+        return new Response("{}", { status: 200 });
+      },
+    });
+
+    assert.deepEqual(result, { injected: 1, skipped: 0, failed: 0, failures: [] });
+    assert.equal(requests[0]?.type, "thread.interaction-mode.set");
+    assert.equal(requests[0]?.interactionMode, "plan");
+    assert.equal(requests[1]?.type, "thread.turn.start");
+    assert.equal(requests[1]?.runtimeMode, "approval-required");
+    assert.equal(requests[1]?.interactionMode, "plan");
   });
 
   it("retries transient dispatch failures and records one injection after success", async () => {

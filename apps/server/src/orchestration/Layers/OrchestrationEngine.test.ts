@@ -293,6 +293,80 @@ describe("OrchestrationEngine", () => {
     await system.dispose();
   });
 
+  it("dedupes repeated turn starts by command id", async () => {
+    const createdAt = now();
+    const system = await createOrchestrationSystem();
+    const { engine } = system;
+
+    await system.run(
+      engine.dispatch({
+        type: "project.create",
+        commandId: CommandId.make("cmd-project-dedupe-create"),
+        projectId: asProjectId("project-dedupe"),
+        title: "Project Dedupe",
+        workspaceRoot: "/tmp/project-dedupe",
+        defaultModelSelection: {
+          instanceId: ProviderInstanceId.make("codex"),
+          model: "gpt-5-codex",
+        },
+        createdAt,
+      }),
+    );
+    await system.run(
+      engine.dispatch({
+        type: "thread.create",
+        commandId: CommandId.make("cmd-thread-dedupe-create"),
+        threadId: ThreadId.make("thread-dedupe"),
+        projectId: asProjectId("project-dedupe"),
+        title: "Dedupe",
+        modelSelection: {
+          instanceId: ProviderInstanceId.make("codex"),
+          model: "gpt-5-codex",
+        },
+        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+        runtimeMode: "approval-required",
+        branch: null,
+        worktreePath: null,
+        createdAt,
+      }),
+    );
+
+    const turnStartCommand = {
+      type: "thread.turn.start" as const,
+      commandId: CommandId.make("client:turn:message-dedupe"),
+      threadId: ThreadId.make("thread-dedupe"),
+      message: {
+        messageId: asMessageId("message-dedupe"),
+        role: "user" as const,
+        text: "hello once",
+        attachments: [],
+      },
+      interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+      runtimeMode: "approval-required" as const,
+      createdAt,
+    };
+
+    const firstResult = await system.run(engine.dispatch(turnStartCommand));
+    const secondResult = await system.run(engine.dispatch(turnStartCommand));
+    const events = await system.run(
+      Stream.runCollect(engine.readEvents(0)).pipe(
+        Effect.map((chunk): OrchestrationEvent[] => Array.from(chunk)),
+      ),
+    );
+
+    expect(secondResult).toEqual(firstResult);
+    expect(events.filter((event) => event.commandId === turnStartCommand.commandId)).toHaveLength(
+      2,
+    );
+    expect(events.map((event) => event.type)).toEqual([
+      "project.created",
+      "thread.created",
+      "thread.message-sent",
+      "thread.turn-start-requested",
+    ]);
+    await system.dispose();
+  });
+
   it("archives and unarchives threads through orchestration commands", async () => {
     const system = await createOrchestrationSystem();
     const { engine } = system;

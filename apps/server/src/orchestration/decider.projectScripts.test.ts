@@ -1,6 +1,7 @@
 import {
   CommandId,
   DEFAULT_PROVIDER_INTERACTION_MODE,
+  DEFAULT_RUNTIME_MODE,
   EventId,
   MessageId,
   ProjectId,
@@ -138,7 +139,7 @@ it.layer(NodeServices.layer)("decider project scripts", (it) => {
             instanceId: ProviderInstanceId.make("codex"),
             model: "gpt-5-codex",
           },
-          interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+          interactionMode: "plan",
           runtimeMode: "approval-required",
           branch: null,
           worktreePath: null,
@@ -163,7 +164,7 @@ it.layer(NodeServices.layer)("decider project scripts", (it) => {
             { id: "fastMode", value: true },
           ]),
           interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
-          runtimeMode: "approval-required",
+          runtimeMode: DEFAULT_RUNTIME_MODE,
           createdAt: now,
         },
         readModel,
@@ -186,7 +187,8 @@ it.layer(NodeServices.layer)("decider project scripts", (it) => {
           { id: "reasoningEffort", value: "high" },
           { id: "fastMode", value: true },
         ]),
-        runtimeMode: "approval-required",
+        runtimeMode: DEFAULT_RUNTIME_MODE,
+        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
       });
     }),
   );
