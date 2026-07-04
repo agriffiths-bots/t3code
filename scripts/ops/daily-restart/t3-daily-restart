@@ -13,6 +13,8 @@ origin="${T3DR_ORIGIN:-http://127.0.0.1:3773}"
 snapshot_dir="${T3DR_SNAPSHOT_DIR:-/home/adam/backups/t3-daily}"
 ledger="${T3DR_LEDGER:-/home/adam/.openclaw/daily-restart}"
 probe_timeout="${T3DR_PROBE_TIMEOUT:-180}"
+stop_timeout="${T3DR_STOP_TIMEOUT:-120}"
+kill_timeout="${T3DR_KILL_TIMEOUT:-30}"
 smoke_instance="${T3DR_SMOKE_INSTANCE:-}"
 smoke_model="${T3DR_SMOKE_MODEL:-}"
 
@@ -63,6 +65,16 @@ if [[ "$probe_timeout" -le 0 ]]; then
   echo "t3-daily-restart: --probe-timeout must be a positive integer" >&2
   exit 2
 fi
+if ! [[ "$stop_timeout" =~ ^[0-9]+$ ]] || [[ "$((10#$stop_timeout))" -le 0 ]]; then
+  echo "t3-daily-restart: T3DR_STOP_TIMEOUT must be a positive integer" >&2
+  exit 2
+fi
+stop_timeout="$((10#$stop_timeout))"
+if ! [[ "$kill_timeout" =~ ^[0-9]+$ ]] || [[ "$((10#$kill_timeout))" -le 0 ]]; then
+  echo "t3-daily-restart: T3DR_KILL_TIMEOUT must be a positive integer" >&2
+  exit 2
+fi
+kill_timeout="$((10#$kill_timeout))"
 if [[ -z "$smoke_instance" ]]; then
   echo "t3-daily-restart: --smoke-instance or T3DR_SMOKE_INSTANCE is required" >&2
   exit 2
@@ -83,6 +95,8 @@ log_file="$run_dir/t3-daily-restart.log"
 result_file="$run_dir/t3-daily-restart.result"
 manifest="$run_dir/resume-manifest.json"
 lock_file="$ledger/t3-daily-restart.lock"
+pinned_tools_dir="$run_dir/pinned-tools"
+pinned_health_probe=""
 
 exec 9>"$lock_file"
 if ! flock -n 9; then
@@ -146,6 +160,58 @@ run_output() {
   timeout "$timeout_secs" "$@" 2>>"$log_file"
 }
 
+systemctl_is_inactive_or_failed() {
+  local context="$1"
+  local output rc
+  ensure_user_bus_env
+  log "RUN timeout=10 systemctl --user is-active $service"
+  output="$(timeout 10 systemctl --user is-active "$service" 2>>"$log_file")"
+  rc=$?
+  output="${output//$'\n'/ }"
+  [[ -n "$output" ]] || output="empty"
+  log "$context is-active rc=$rc state=$output"
+  [[ "$output" == "inactive" || "$output" == "failed" ]]
+}
+
+stop_service_or_escalate() {
+  local context="$1"
+  log "$context stop begin service=$service timeout=${stop_timeout}s"
+  if run_capture "$stop_timeout" systemctl --user stop "$service"; then
+    if systemctl_is_inactive_or_failed "$context after stop"; then
+      log "$context stop verified inactive"
+      return 0
+    fi
+    log "$context stop returned success but service is not inactive/failed"
+  else
+    log "$context stop failed or timed out; verifying state before escalation"
+    if systemctl_is_inactive_or_failed "$context after stop failure"; then
+      log "$context stop failure left service inactive"
+      return 0
+    fi
+  fi
+
+  log "$context escalate SIGTERM via systemctl kill"
+  if ! run_capture "$kill_timeout" systemctl --user kill "$service"; then
+    log "$context SIGTERM kill command failed"
+  fi
+  if systemctl_is_inactive_or_failed "$context after SIGTERM"; then
+    log "$context SIGTERM verified inactive"
+    return 0
+  fi
+
+  log "$context escalate SIGKILL via systemctl kill"
+  if ! run_capture "$kill_timeout" systemctl --user kill -s SIGKILL "$service"; then
+    log "$context SIGKILL kill command failed"
+  fi
+  if systemctl_is_inactive_or_failed "$context after SIGKILL"; then
+    log "$context SIGKILL verified inactive"
+    return 0
+  fi
+
+  log "$context stop failed; service is still not inactive/failed after escalation"
+  return 1
+}
+
 json_fill_manifest() {
   local snapshot="$1"
   if [[ ! -s "$manifest" ]]; then
@@ -192,23 +258,6 @@ health_is_pass() {
   grep -Eq '^CHECK spawn_wake PASS( |$)' "$probe_file"
 }
 
-migration_changes_present() {
-  local rc
-  git -C "$checkout" diff --quiet "$pre_sha" "$target_sha" -- \
-    apps/server/src/persistence/Migrations \
-    apps/server/src/persistence/Migrations.ts \
-    >>"$log_file" 2>&1
-  rc=$?
-  case "$rc" in
-    0) return 1 ;;
-    1) return 0 ;;
-    *)
-      log "migration diff check failed rc=$rc; assuming migrations may have changed"
-      return 0
-      ;;
-  esac
-}
-
 claude_advisory() {
   local probe_file="$1"
   local prompt verdict rc
@@ -239,20 +288,40 @@ inject_resume_manifest() {
 run_health_probe() {
   local probe_file="$1"
   local probe
-  probe="$(resolve_tool health-probe)" || {
+  probe="$pinned_health_probe"
+  if [[ -z "$probe" ]]; then
+    probe="$(resolve_tool health-probe)" || {
+      echo "health-probe missing" >"$probe_file"
+      return 127
+    }
+  fi
+  if [[ ! -x "$probe" ]]; then
     echo "health-probe missing" >"$probe_file"
     return 127
-  }
+  fi
+  log "HEALTH_PROBE tool=$probe"
   timeout "$((probe_timeout * 2 + 60))" "$probe" --origin "$origin" --service "$service" \
     --instance "$smoke_instance" --model "$smoke_model" --timeout "$probe_timeout" \
     >"$probe_file" 2>>"$log_file"
+}
+
+pin_health_probe() {
+  local source_probe pinned_probe
+  source_probe="$(resolve_tool health-probe)" || return 1
+  mkdir -p "$pinned_tools_dir"
+  chmod 700 "$pinned_tools_dir"
+  pinned_probe="$pinned_tools_dir/health-probe"
+  cp -p -- "$source_probe" "$pinned_probe"
+  chmod 700 "$pinned_probe"
+  pinned_health_probe="$pinned_probe"
+  log "PINNED health-probe source=$source_probe pinned=$pinned_probe"
 }
 
 rollback() {
   local probe_file="$1"
   local restore
   log "ROLLBACK begin"
-  if ! run_capture 90 systemctl --user stop "$service"; then
+  if ! stop_service_or_escalate "ROLLBACK"; then
     log "ROLLBACK stop failed"
     record_result "ROLLBACK-FAILED"
     return 1
@@ -307,7 +376,7 @@ rollback() {
 code_only_rollback() {
   local probe_file="$1"
   log "CODE_ROLLBACK begin"
-  if ! run_capture 90 systemctl --user stop "$service"; then
+  if ! stop_service_or_escalate "CODE_ROLLBACK"; then
     log "CODE_ROLLBACK stop failed"
     record_result "CODE-ROLLBACK-FAILED"
     return 1
@@ -401,9 +470,15 @@ if ! json_validate_manifest >>"$log_file" 2>&1; then
   exit 1
 fi
 
-if ! run_capture 90 systemctl --user stop "$service"; then
-  log "systemctl stop failed"
+if ! pin_health_probe; then
+  log "failed to pin pre-update health-probe"
   record_result "FAILED"
+  exit 1
+fi
+
+if ! stop_service_or_escalate "SHUTDOWN"; then
+  log "systemctl stop failed"
+  record_result "STOP-FAILED"
   exit 1
 fi
 
@@ -460,13 +535,8 @@ run_health_probe "$probe_file" || probe_rc=$?
 cat "$probe_file" >>"$log_file"
 claude_advisory "$probe_file"
 if [[ "$probe_rc" -ne 0 ]] || ! health_is_pass "$probe_file"; then
-  if migration_changes_present; then
-    log "health probe failed and migration files changed; deterministic rollback"
-    rollback "$probe_file" || exit 1
-  else
-    log "health probe failed without migration changes; preserving live DB and rolling back code only"
-    code_only_rollback "$probe_file" || exit 1
-  fi
+  log "health probe failed; deterministic code+DB rollback"
+  rollback "$probe_file" || exit 1
 fi
 
 if ! inject_resume_manifest; then
