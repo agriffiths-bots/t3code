@@ -2378,6 +2378,163 @@ describe("ClaudeAdapterLive", () => {
     );
   });
 
+  it.effect("parks compacting promoted waits without dropping deferred result metadata", () => {
+    const harness = makeHarness();
+    return Effect.gen(function* () {
+      const adapter = yield* ClaudeAdapter;
+      const runtimeEvents: Array<ProviderRuntimeEvent> = [];
+
+      const runtimeEventsFiber = yield* Stream.runForEach(adapter.streamEvents, (event) =>
+        Effect.sync(() => {
+          runtimeEvents.push(event);
+        }),
+      ).pipe(Effect.forkChild);
+
+      const session = yield* adapter.startSession({
+        threadId: THREAD_ID,
+        provider: ProviderDriverKind.make("claudeAgent"),
+        runtimeMode: "full-access",
+      });
+
+      const turn = yield* adapter.sendTurn({
+        threadId: session.threadId,
+        input: "wait for the child",
+        attachments: [],
+      });
+
+      harness.query.emit({
+        type: "stream_event",
+        session_id: "sdk-session-waiting-subagent-compacting",
+        uuid: "stream-wait-subagent-compacting-start",
+        parent_tool_use_id: null,
+        event: {
+          type: "content_block_start",
+          index: 1,
+          content_block: {
+            type: "mcp_tool_use",
+            id: "tool-wait-subagent-compacting-1",
+            name: "t3_wait_subagent",
+            input: {
+              childThreadIds: ["child-thread-1"],
+            },
+          },
+        },
+      } as unknown as SDKMessage);
+
+      harness.query.emit({
+        type: "user",
+        session_id: "sdk-session-waiting-subagent-compacting",
+        uuid: "user-wait-subagent-compacting-result",
+        parent_tool_use_id: null,
+        tool_use_result: {
+          content:
+            '{"results":[{"childThreadId":"child-thread-1","status":"running"}],"promoted":true}',
+          structuredContent: {
+            results: [{ childThreadId: "child-thread-1", status: "running" }],
+            promoted: true,
+          },
+        },
+        message: {
+          role: "user",
+          content: [
+            {
+              type: "tool_result",
+              tool_use_id: "tool-wait-subagent-compacting-1",
+              content: 'promoted=true; [{"childThreadId":"child-thread-1","status":"running"}]',
+            },
+          ],
+        },
+      } as unknown as SDKMessage);
+
+      harness.query.emit({
+        type: "system",
+        subtype: "status",
+        session_id: "sdk-session-waiting-subagent-compacting",
+        uuid: "status-compacting-before-park",
+        status: "compacting",
+      } as unknown as SDKMessage);
+
+      harness.query.emit({
+        type: "system",
+        subtype: "task_started",
+        session_id: "sdk-session-waiting-subagent-compacting",
+        uuid: "task-started-before-park",
+        task_id: "task-before-park",
+        tool_use_id: "tool-before-park",
+        description: "Run slow command",
+        task_type: "local_bash",
+      } as unknown as SDKMessage);
+
+      harness.query.emit({
+        type: "result",
+        subtype: "success",
+        is_error: false,
+        errors: [],
+        result: "PARENT_PARKED",
+        stop_reason: "end_turn",
+        total_cost_usd: 0.42,
+        usage: {
+          input_tokens: 4,
+          output_tokens: 2,
+        },
+        modelUsage: {
+          "claude-opus-4-6": {
+            contextWindow: 200000,
+            maxOutputTokens: 64000,
+          },
+        },
+        session_id: "sdk-session-waiting-subagent-compacting",
+        uuid: "result-wait-subagent-compacting",
+      } as unknown as SDKMessage);
+
+      harness.query.finish();
+
+      for (let i = 0; i < 5; i += 1) {
+        yield* Effect.yieldNow;
+      }
+      runtimeEventsFiber.interruptUnsafe();
+
+      assert.equal(
+        runtimeEvents.some((event) => event.type === "session.exited"),
+        false,
+      );
+      const turnCompleted = runtimeEvents.find((event) => event.type === "turn.completed");
+      assert.equal(turnCompleted?.type, "turn.completed");
+      if (turnCompleted?.type === "turn.completed") {
+        assert.equal(String(turnCompleted.turnId), String(turn.turnId));
+        assert.equal(turnCompleted.payload.state, "completed");
+        assert.equal(turnCompleted.payload.stopReason, "end_turn");
+        assert.deepEqual(turnCompleted.payload.usage, {
+          input_tokens: 4,
+          output_tokens: 2,
+        });
+        assert.deepEqual(turnCompleted.payload.modelUsage, {
+          "claude-opus-4-6": {
+            contextWindow: 200000,
+            maxOutputTokens: 64000,
+          },
+        });
+        assert.equal(turnCompleted.payload.totalCostUsd, 0.42);
+      }
+      const waitingEvent = runtimeEvents.find(
+        (event) =>
+          event.type === "session.state.changed" &&
+          event.payload.state === "waiting" &&
+          event.payload.reason === "awaiting-subagent-wake",
+      );
+      assert.notEqual(waitingEvent, undefined);
+
+      const sessions = yield* adapter.listSessions();
+      assert.equal(sessions.length, 1);
+      assert.equal(sessions[0]?.status, "waiting");
+      assert.equal(sessions[0]?.activeTurnId, undefined);
+      assert.equal(harness.query.closeCalls, 1);
+    }).pipe(
+      Effect.provideService(Random.Random, makeDeterministicRandomService()),
+      Effect.provide(harness.layer),
+    );
+  });
+
   it.effect("parks promoted subagent waits on result completion", () => {
     const harness = makeHarness();
     return Effect.gen(function* () {

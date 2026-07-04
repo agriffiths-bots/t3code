@@ -3140,10 +3140,21 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
     context: ClaudeSessionContext,
     options?: { readonly interruptStream?: boolean },
   ) {
-    if (context.stopped || String(context.session.status) === "waiting") return;
+    if (context.stopped) return;
+    if (!context.turnState && String(context.session.status) === "waiting") return;
 
     if (context.turnState) {
-      const completed = yield* completeTurn(context, "completed");
+      const deferred = context.deferredRuntimeTaskCompletion;
+      const activeTurnId = context.turnState.turnId;
+      const completeActiveTurn =
+        deferred?.turnId === activeTurnId
+          ? completeTurn(context, deferred.status, deferred.errorMessage, deferred.result, {
+              deferRuntimeTasks: false,
+            })
+          : completeTurn(context, "completed", undefined, undefined, {
+              deferRuntimeTasks: false,
+            });
+      const completed = yield* completeActiveTurn;
       if (!completed) return;
       if (String(context.session.status) === "waiting") return;
     } else {

@@ -589,6 +589,7 @@ const waitSubagent = Effect.fn("SubagentToolkit.wait")(function* (input: WaitSub
         ),
       );
     },
+    { concurrency: "unbounded" },
   );
   const effectiveSlice: WaitSliceResult = {
     results: effectiveRows,
@@ -646,6 +647,7 @@ const waitSubagent = Effect.fn("SubagentToolkit.wait")(function* (input: WaitSub
           };
         }),
       ),
+    { concurrency: "unbounded" },
   );
 
   return {
