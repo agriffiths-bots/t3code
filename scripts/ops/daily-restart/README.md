@@ -78,9 +78,11 @@ verified snapshot. The caller must stop T3 first; active WAL/SHM files emit a
 warning only. Both tools export a cron PATH with trusted system directories first,
 set `umask 077`, use sqlite3
 `.backup` plus `PRAGMA integrity_check`, print only the result path to stdout,
-and exit non-zero on failure. When root creates a missing snapshot directory, it
-assigns ownership to the current database owner; non-root runs under a different
-uid require the directory to be pre-created.
+and exit non-zero on failure. Snapshot runs must execute as root or the database
+owner; root-created snapshot directories are `root:<database group>` with sticky
+mode `1770`, old root-created `0700` database-owned snapshot directories are
+migrated to that layout, and root-created snapshot files are assigned to the
+database owner.
 
 ## Integration smoke
 

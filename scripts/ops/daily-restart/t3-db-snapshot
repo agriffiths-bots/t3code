@@ -67,23 +67,45 @@ done
 command -v sqlite3 >/dev/null 2>&1 || die "sqlite3 not found on PATH"
 command -v flock >/dev/null 2>&1 || die "flock not found on PATH"
 command -v install >/dev/null 2>&1 || die "install not found on PATH"
+command -v mktemp >/dev/null 2>&1 || die "mktemp not found on PATH"
 
 db_path="$(absolute_path "$db_path")"
 out_dir="$(absolute_path "$out_dir")"
 [[ -f "$db_path" ]] || die "database does not exist: $db_path"
 db_uid="$(stat -c '%u' "$db_path")" || die "failed to stat database owner"
 db_gid="$(stat -c '%g' "$db_path")" || die "failed to stat database group"
+db_owner="$db_uid:$db_gid"
+current_uid="$(id -u)" || die "failed to determine current user"
+if [[ "$current_uid" -ne 0 && "$current_uid" -ne "$db_uid" ]]; then
+  die "snapshots must run as root or database uid $db_uid, not uid $current_uid"
+fi
 db_dir="$(dirname "$db_path")"
 
 if [[ ! -d "$out_dir" ]]; then
-  current_uid="$(id -u)" || die "failed to determine current user"
   if [[ "$current_uid" -eq 0 ]]; then
-    install -d -m 700 -o "$db_uid" -g "$db_gid" "$out_dir" \
-      || die "failed to create output directory for database owner: $out_dir"
-  elif [[ "$current_uid" -eq "$db_uid" ]]; then
-    mkdir -p "$out_dir" || die "failed to create output directory: $out_dir"
+    install -d -m 1770 -o 0 -g "$db_gid" "$out_dir" \
+      || die "failed to create root-owned output directory for database group: $out_dir"
   else
-    die "output directory must be pre-created when running as uid $current_uid for database uid $db_uid: $out_dir"
+    mkdir -p "$out_dir" || die "failed to create output directory: $out_dir"
+  fi
+fi
+
+[[ -d "$out_dir" && ! -L "$out_dir" ]] || die "output path is not a real directory: $out_dir"
+
+if [[ "$current_uid" -eq 0 ]]; then
+  out_dir_uid="$(stat -c '%u' "$out_dir")" || die "failed to stat output directory owner"
+  out_dir_gid="$(stat -c '%g' "$out_dir")" || die "failed to stat output directory group"
+  out_dir_mode="$(stat -c '%a' "$out_dir")" || die "failed to stat output directory mode"
+  out_dir_mode_dec=$((8#$out_dir_mode))
+  if [[ "$out_dir_uid" -eq "$db_uid" && "$out_dir_gid" -eq "$db_gid" && "$out_dir_mode_dec" -eq $((8#700)) ]]; then
+    chown 0:"$db_gid" "$out_dir" || die "failed to migrate output directory owner: $out_dir"
+    chmod 1770 "$out_dir" || die "failed to migrate output directory mode: $out_dir"
+    out_dir_uid=0
+    out_dir_mode_dec=$((8#1770))
+  fi
+  [[ "$out_dir_uid" -eq 0 ]] || die "root snapshots require a root-owned output directory: $out_dir"
+  if (( (out_dir_mode_dec & 0022) != 0 && (out_dir_mode_dec & 01000) == 0 )); then
+    die "root snapshots require sticky bit on group/other-writable output directory: $out_dir"
   fi
 fi
 
@@ -103,9 +125,12 @@ if [[ -e "$snapshot" ]]; then
 fi
 [[ ! -e "$snapshot" ]] || die "snapshot path already exists: $snapshot"
 
-tmp_snapshot="$out_dir/.t3-state-$timestamp.sqlite.$$"
+tmp_dir="$(mktemp -d "$out_dir/.t3-db-snapshot.XXXXXXXXXX")" \
+  || die "failed to create private snapshot temporary directory"
+tmp_snapshot="$tmp_dir/t3-state.sqlite"
 cleanup() {
-  rm -f "$tmp_snapshot"
+  rm -f -- "$tmp_snapshot" "$tmp_snapshot-journal" "$tmp_snapshot-wal" "$tmp_snapshot-shm"
+  rmdir -- "$tmp_dir" 2>/dev/null || true
 }
 trap cleanup EXIT
 
@@ -121,7 +146,13 @@ integrity="$(sqlite3 "$tmp_snapshot" 'PRAGMA integrity_check;' 2>&1)" || die "sn
 [[ "$integrity" == "ok" ]] || die "snapshot integrity check returned: $integrity"
 
 chmod 600 "$tmp_snapshot" || die "failed to chmod snapshot"
-mv "$tmp_snapshot" "$snapshot" || die "failed to install snapshot"
+if [[ "$current_uid" -eq 0 ]]; then
+  chown "$db_owner" "$tmp_snapshot" || die "failed to set snapshot owner"
+fi
+mv -T -n "$tmp_snapshot" "$snapshot" || die "failed to install snapshot"
+[[ ! -e "$tmp_snapshot" ]] || die "snapshot path already exists: $snapshot"
+[[ -f "$snapshot" && ! -L "$snapshot" ]] || die "installed snapshot is not a regular file: $snapshot"
+rmdir -- "$tmp_dir" || die "failed to remove snapshot temporary directory"
 trap - EXIT
 
 if [[ "$keep" -gt 0 ]]; then
