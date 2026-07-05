@@ -1,5 +1,5 @@
 import { memo, type PointerEventHandler } from "react";
-import { ChevronDownIcon, ChevronLeftIcon } from "lucide-react";
+import { ArrowUpIcon, ChevronDownIcon, ChevronLeftIcon } from "lucide-react";
 import { cn } from "~/lib/utils";
 import { Button } from "../ui/button";
 import { Menu, MenuItem, MenuPopup, MenuTrigger } from "../ui/menu";
@@ -29,6 +29,7 @@ interface ComposerPrimaryActionsProps {
   hasImageAttachments: boolean;
   sessionOnlySendReason: SessionOnlySendReason | null;
   preserveComposerFocusOnPointerDown?: boolean;
+  showSendLabel?: boolean;
   onPreviousPendingQuestion: () => void;
   onInterrupt: () => void;
   onImplementPlanInNewThread: () => void;
@@ -70,6 +71,7 @@ export const ComposerPrimaryActions = memo(function ComposerPrimaryActions({
   hasImageAttachments,
   sessionOnlySendReason,
   preserveComposerFocusOnPointerDown = false,
+  showSendLabel = false,
   onPreviousPendingQuestion,
   onInterrupt,
   onImplementPlanInNewThread,
@@ -210,7 +212,10 @@ export const ComposerPrimaryActions = memo(function ComposerPrimaryActions({
   return (
     <button
       type="submit"
-      className="flex h-9 w-9 enabled:cursor-pointer items-center justify-center rounded-full bg-primary/90 text-primary-foreground shadow-xs enabled:shadow-primary/24 enabled:inset-shadow-[0_1px_--theme(--color-white/16%)] transition-all duration-150 hover:bg-primary hover:scale-105 active:inset-shadow-[0_1px_--theme(--color-black/8%)] active:shadow-none disabled:pointer-events-none disabled:opacity-30 disabled:shadow-none disabled:hover:scale-100 sm:h-8 sm:w-8"
+      className={cn(
+        "flex h-9 enabled:cursor-pointer items-center justify-center rounded-full bg-primary/90 text-primary-foreground shadow-xs enabled:shadow-primary/24 enabled:inset-shadow-[0_1px_--theme(--color-white/16%)] transition-all duration-150 hover:bg-primary hover:scale-105 active:inset-shadow-[0_1px_--theme(--color-black/8%)] active:shadow-none disabled:pointer-events-none disabled:opacity-30 disabled:shadow-none disabled:hover:scale-100 sm:h-8",
+        showSendLabel ? "min-w-16 gap-1.5 px-3 text-sm font-medium" : "w-9 sm:w-8",
+      )}
       {...pointerFocusProps}
       disabled={isSendBusy || isConnecting || !hasSendableContent}
       aria-label={
@@ -226,17 +231,15 @@ export const ComposerPrimaryActions = memo(function ComposerPrimaryActions({
       }
     >
       {isConnecting || isSendBusy ? (
-        <Spinner className="size-3.5" aria-hidden="true" />
+        <>
+          <Spinner className="size-3.5" aria-hidden="true" />
+          {showSendLabel ? <span>Sending</span> : null}
+        </>
       ) : (
-        <svg width="14" height="14" viewBox="0 0 14 14" fill="none" aria-hidden="true">
-          <path
-            d="M7 11.5V2.5M7 2.5L3 6.5M7 2.5L11 6.5"
-            stroke="currentColor"
-            strokeWidth="1.8"
-            strokeLinecap="round"
-            strokeLinejoin="round"
-          />
-        </svg>
+        <>
+          <ArrowUpIcon className="size-3.5" aria-hidden="true" strokeWidth={2.4} />
+          {showSendLabel ? <span>Send</span> : null}
+        </>
       )}
     </button>
   );
