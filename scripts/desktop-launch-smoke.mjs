@@ -9,12 +9,15 @@ import * as NodePath from "node:path";
 import * as NodeTimersPromises from "node:timers/promises";
 
 const DEFAULT_TIMEOUT_MS = 90_000;
+const DEFAULT_STABILITY_MS = 5_000;
 const DESCRIPTOR_PATH = "/.well-known/t3/environment";
 const MAX_CAPTURED_OUTPUT_BYTES = 256 * 1024;
 const FATAL_OUTPUT_PATTERNS = [
   /ERR_MODULE_NOT_FOUND/i,
   /\bMODULE_NOT_FOUND\b/i,
   /Cannot find module/i,
+  /uncaughtException/i,
+  /UnhandledPromiseRejection/i,
 ];
 // oxlint-disable-next-line t3code/no-global-process-runtime -- Standalone CI script.
 const hostPlatform = process.platform;
@@ -24,7 +27,7 @@ function usage() {
     "usage: node scripts/desktop-launch-smoke.mjs (--artifact <path-or-glob> | --command <path>) [--timeout-ms <ms>]",
     "",
     "Launches a packaged desktop app with an isolated T3CODE_HOME, waits for",
-    `${DESCRIPTOR_PATH} on a forced loopback port, and fails on module-resolution crashes.`,
+    `${DESCRIPTOR_PATH} on a forced loopback port, and fails on launch-time crashes.`,
   ].join("\n");
 }
 
@@ -33,6 +36,7 @@ function parseArgs(argv) {
     artifact: undefined,
     command: undefined,
     timeoutMs: DEFAULT_TIMEOUT_MS,
+    stabilityMs: DEFAULT_STABILITY_MS,
   };
 
   for (let index = 0; index < argv.length; index += 1) {
@@ -54,6 +58,14 @@ function parseArgs(argv) {
         options.timeoutMs = Number.parseInt(value, 10);
         if (!Number.isInteger(options.timeoutMs) || options.timeoutMs <= 0) {
           throw new Error("--timeout-ms must be a positive integer");
+        }
+        index += 1;
+        break;
+      case "--stability-ms":
+        if (!value) throw new Error("--stability-ms requires a value");
+        options.stabilityMs = Number.parseInt(value, 10);
+        if (!Number.isInteger(options.stabilityMs) || options.stabilityMs < 0) {
+          throw new Error("--stability-ms must be a non-negative integer");
         }
         index += 1;
         break;
@@ -252,6 +264,19 @@ async function collectDiagnostics(tempRoot, output) {
   ].join("");
 }
 
+async function assertHealthy(child, output, serverChildLogPath) {
+  const serverChildLog = await readOptionalText(serverChildLogPath);
+  const fatalPattern = outputHasFatalPattern(`${output()}\n${serverChildLog}`);
+  if (fatalPattern) {
+    throw new Error(`Desktop launch emitted fatal pattern ${fatalPattern}`);
+  }
+  if (child.exitCode !== null || child.signalCode !== null) {
+    throw new Error(
+      `Desktop process exited during launch smoke (code=${child.exitCode ?? "null"}, signal=${child.signalCode ?? "null"})`,
+    );
+  }
+}
+
 async function main() {
   const options = parseArgs(process.argv.slice(2));
   const executablePath = await resolveExecutable(options);
@@ -313,26 +338,30 @@ async function main() {
   const deadline = Date.now() + options.timeoutMs;
   try {
     while (Date.now() < deadline) {
-      const serverChildLog = await readOptionalText(serverChildLogPath);
-      const fatalPattern = outputHasFatalPattern(`${output}\n${serverChildLog}`);
-      if (fatalPattern) {
-        throw new Error(`Desktop launch emitted fatal pattern ${fatalPattern}`);
-      }
-      if (exit) {
-        throw new Error(
-          `Desktop process exited before readiness (code=${exit.code ?? "null"}, signal=${exit.signal ?? "null"})`,
-        );
+      await assertHealthy(child, () => output, serverChildLogPath);
+
+      let descriptor;
+      try {
+        descriptor = await fetchDescriptor(port, 1_000);
+      } catch {
+        if (exit) {
+          throw new Error(
+            `Desktop process exited before readiness (code=${exit.code ?? "null"}, signal=${exit.signal ?? "null"})`,
+          );
+        }
+        await NodeTimersPromises.setTimeout(500);
+        continue;
       }
 
-      try {
-        const descriptor = await fetchDescriptor(port, 1_000);
-        console.log(
-          `[desktop-launch-smoke] Ready: environmentId=${descriptor.environmentId} label=${descriptor.label ?? ""}`,
-        );
-        return;
-      } catch {
+      console.log(
+        `[desktop-launch-smoke] Ready: environmentId=${descriptor.environmentId} label=${descriptor.label ?? ""}`,
+      );
+      const stableUntil = Math.min(deadline, Date.now() + options.stabilityMs);
+      while (Date.now() < stableUntil) {
         await NodeTimersPromises.setTimeout(500);
+        await assertHealthy(child, () => output, serverChildLogPath);
       }
+      return;
     }
 
     throw new Error(`Timed out after ${options.timeoutMs}ms waiting for desktop backend readiness`);

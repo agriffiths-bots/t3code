@@ -1,6 +1,7 @@
 import { getPairingTokenFromUrl, setPairingTokenOnUrl } from "./pairingUrl";
 
 const DEFAULT_HOSTED_APP_URL = "https://app.t3.codes";
+const CLOUDFLARE_PAGES_HOST_SUFFIX = ".pages.dev";
 
 export interface HostedPairingRequest {
   readonly host: string;
@@ -31,6 +32,22 @@ function originFromUrl(value: string): string | null {
   }
 }
 
+function isCloudflarePagesOrigin(url: URL): boolean {
+  return url.protocol === "https:" && url.hostname.endsWith(CLOUDFLARE_PAGES_HOST_SUFFIX);
+}
+
+function currentHostedAppOrigin(): string | null {
+  if (typeof window === "undefined") {
+    return null;
+  }
+  try {
+    const currentUrl = new URL(window.location.href);
+    return isHostedStaticApp(currentUrl) ? currentUrl.origin : null;
+  } catch {
+    return null;
+  }
+}
+
 export function isHostedStaticApp(url: URL = new URL(window.location.href)): boolean {
   if (configuredBackendUrl()) {
     return false;
@@ -41,7 +58,7 @@ export function isHostedStaticApp(url: URL = new URL(window.location.href)): boo
   }
 
   const hostedOrigin = originFromUrl(configuredHostedAppUrl());
-  return hostedOrigin !== null && url.origin === hostedOrigin;
+  return (hostedOrigin !== null && url.origin === hostedOrigin) || isCloudflarePagesOrigin(url);
 }
 
 export function readHostedPairingRequest(url: URL = new URL(window.location.href)) {
@@ -69,7 +86,8 @@ export function buildHostedPairingUrl(input: {
   readonly token: string;
   readonly label?: string | null;
 }): string {
-  const url = new URL("/pair", configuredHostedAppUrl());
+  const baseUrl = currentHostedAppOrigin() ?? configuredHostedAppUrl();
+  const url = new URL("/pair", baseUrl);
   url.searchParams.set("host", input.host);
 
   const label = input.label?.trim();

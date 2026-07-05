@@ -233,7 +233,7 @@ jobs:
     name: Build Windows x64
     needs: build_wsl_node_pty
     if: needs.build_wsl_node_pty.result == 'success'
-    runs-on: windows-2025
+    runs-on: windows-latest
     timeout-minutes: 45
     env:
       # Cloud sign-in config comes only from the caller's validated public_config

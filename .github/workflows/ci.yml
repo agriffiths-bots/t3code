@@ -70,6 +70,154 @@ jobs:
       - name: Launch packaged Linux desktop app
         run: xvfb-run -a node scripts/desktop-launch-smoke.mjs --artifact "release/*.AppImage" --timeout-ms 90000
 
+  desktop_launch_gate_changes:
+    name: Desktop Launch Gate Changes
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      run_desktop_launch_smoke: ${{ steps.filter.outputs.run_desktop_launch_smoke }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node
+        uses: actions/setup-node@v6
+        with:
+          node-version-file: package.json
+
+      - id: filter
+        name: Classify changed files
+        shell: bash
+        run: |
+          set -euo pipefail
+          changed_files="$RUNNER_TEMP/changed-files.txt"
+          git diff --name-only "${{ github.event.pull_request.base.sha }}" "${{ github.sha }}" > "$changed_files"
+          node scripts/desktop-ci-change-gate.ts --files "$changed_files"
+
+  build_wsl_node_pty_for_windows_smoke:
+    name: Build WSL node-pty for Windows Smoke
+    needs: desktop_launch_gate_changes
+    if: needs.desktop_launch_gate_changes.outputs.run_desktop_launch_smoke == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Vite+
+        uses: voidzero-dev/setup-vp@v1
+        with:
+          node-version-file: package.json
+          cache: true
+          run-install: true
+
+      - name: Build node-pty linux-x64 prebuild
+        shell: bash
+        run: |
+          set -euo pipefail
+          pty_pkg="$(node -e "console.log(require.resolve('node-pty/package.json', { paths: ['$GITHUB_WORKSPACE/apps/server'] }))")"
+          pty_dir="$(dirname "$pty_pkg")"
+          ( cd "$pty_dir" && npx --yes node-gyp rebuild )
+          mkdir -p wsl-prebuild
+          cp "$pty_dir/build/Release/pty.node" wsl-prebuild/pty.node
+          file wsl-prebuild/pty.node
+
+      - name: Upload node-pty prebuild
+        uses: actions/upload-artifact@v7
+        with:
+          name: ci-wsl-node-pty-x64
+          path: wsl-prebuild/pty.node
+          if-no-files-found: error
+
+  desktop_windows_package_smoke:
+    name: Desktop Windows Package Smoke
+    needs: [desktop_launch_gate_changes, build_wsl_node_pty_for_windows_smoke]
+    if: >-
+      ${{
+        always() &&
+        needs.desktop_launch_gate_changes.outputs.run_desktop_launch_smoke == 'true' &&
+        needs.build_wsl_node_pty_for_windows_smoke.result == 'success'
+      }}
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Vite+
+        uses: voidzero-dev/setup-vp@v1
+        with:
+          node-version-file: package.json
+          cache: true
+          run-install: true
+
+      - name: Download WSL node-pty prebuild
+        uses: actions/download-artifact@v7
+        with:
+          name: ci-wsl-node-pty-x64
+          path: wsl-prebuild
+
+      - name: Ensure Electron runtime is installed
+        run: vp run --filter @t3tools/desktop ensure:electron
+
+      - name: Build Windows desktop artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          vp run dist:desktop:artifact \
+            --platform win \
+            --target nsis \
+            --arch x64 \
+            --wsl-prebuild "$GITHUB_WORKSPACE/wsl-prebuild/pty.node" \
+            --verbose
+
+      - id: install
+        name: Install Windows desktop artifact
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $installer = Get-ChildItem -Path release -Filter "*.exe" |
+            Sort-Object Length -Descending |
+            Select-Object -First 1
+          if (-not $installer) {
+            throw "No NSIS installer found in release."
+          }
+
+          $installDir = Join-Path $env:RUNNER_TEMP "t3code-install"
+          if (Test-Path $installDir) {
+            Remove-Item -Recurse -Force $installDir
+          }
+          New-Item -ItemType Directory -Force -Path $installDir | Out-Null
+
+          $process = Start-Process `
+            -FilePath $installer.FullName `
+            -ArgumentList @("/S", "/D=$installDir") `
+            -Wait `
+            -PassThru
+          if ($process.ExitCode -ne 0) {
+            throw "NSIS installer exited with code $($process.ExitCode)."
+          }
+
+          $expectedExeNames = @("T3 Code (Alpha).exe", "T3 Code (Nightly).exe")
+          $appExe = Get-ChildItem -Path $installDir -Filter "*.exe" -File |
+            Where-Object { $expectedExeNames -contains $_.Name } |
+            Select-Object -First 1
+          if (-not $appExe) {
+            $topLevelExecutables = Get-ChildItem -Path $installDir -Filter "*.exe" -File |
+              Select-Object -ExpandProperty Name
+            throw "No expected installed application executable found under $installDir. Expected one of: $($expectedExeNames -join ', '). Top-level executables: $($topLevelExecutables -join ', ')"
+          }
+
+          "app_exe=$($appExe.FullName)" >> $env:GITHUB_OUTPUT
+          Write-Host "Installed desktop executable: $($appExe.FullName)"
+
+      - name: Launch installed Windows desktop app
+        shell: pwsh
+        run: node scripts/desktop-launch-smoke.mjs --command "${{ steps.install.outputs.app_exe }}" --timeout-ms 90000
+
   test:
     name: Test
     runs-on: ubuntu-24.04
