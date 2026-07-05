@@ -52,7 +52,7 @@ export function planUsageColor(window: PlanUsageWindow): string {
     case "normal":
     case "info":
     case null:
-      return window.usedPercent > 90 ? "var(--color-red-500)" : "var(--color-blue-500)";
+      return window.usedPercent > 90 ? "var(--color-red-500)" : "var(--color-emerald-500)";
   }
 }
 
@@ -70,5 +70,5 @@ function severityRank(window: PlanUsageWindow): number {
 }
 
 function planUsagePriority(window: PlanUsageWindow): number {
-  return severityRank(window) * 1_000 + Math.max(0, Math.min(100, window.usedPercent));
+  return Math.max(0, Math.min(100, window.usedPercent)) * 1_000 + severityRank(window);
 }

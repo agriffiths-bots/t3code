@@ -246,8 +246,13 @@ function retainProjectionMessagesAfterRevert(
   }
 
   for (const message of messages) {
-    if (message.role === "system") {
-      retainedMessageIds.add(message.messageId);
+    if (message.role === "system" && message.turnId === null) {
+      if (
+        retainedMessageIds.has(message.messageId) ||
+        !isSubAgentWakeSystemMessageText(message.text)
+      ) {
+        retainedMessageIds.add(message.messageId);
+      }
       continue;
     }
     if (message.turnId !== null && retainedTurnIds.has(message.turnId)) {
@@ -302,6 +307,10 @@ function retainProjectionMessagesAfterRevert(
   }
 
   return messages.filter((message) => retainedMessageIds.has(message.messageId));
+}
+
+function isSubAgentWakeSystemMessageText(text: string): boolean {
+  return text.trimStart().startsWith("[sub-agent ");
 }
 
 function retainProjectionActivitiesAfterRevert(
@@ -1126,37 +1135,23 @@ const makeOrchestrationProjectionPipeline = Effect.fn("makeOrchestrationProjecti
           const pendingTurnStart = yield* projectionTurnRepository.getPendingTurnStartByThreadId({
             threadId: event.payload.threadId,
           });
+          let shouldDeletePendingTurnStart = false;
           if (Option.isSome(existingTurn)) {
             const nextState =
               existingTurn.value.state === "completed" || existingTurn.value.state === "error"
                 ? existingTurn.value.state
                 : "running";
+            shouldDeletePendingTurnStart =
+              Option.isSome(pendingTurnStart) &&
+              existingTurn.value.pendingMessageId === pendingTurnStart.value.messageId;
             yield* projectionTurnRepository.upsertByTurnId({
               ...existingTurn.value,
               state: nextState,
-              pendingMessageId:
-                existingTurn.value.pendingMessageId ??
-                (Option.isSome(pendingTurnStart) ? pendingTurnStart.value.messageId : null),
-              sourceProposedPlanThreadId:
-                existingTurn.value.sourceProposedPlanThreadId ??
-                (Option.isSome(pendingTurnStart)
-                  ? pendingTurnStart.value.sourceProposedPlanThreadId
-                  : null),
-              sourceProposedPlanId:
-                existingTurn.value.sourceProposedPlanId ??
-                (Option.isSome(pendingTurnStart)
-                  ? pendingTurnStart.value.sourceProposedPlanId
-                  : null),
-              startedAt:
-                existingTurn.value.startedAt ??
-                (Option.isSome(pendingTurnStart)
-                  ? pendingTurnStart.value.requestedAt
-                  : event.occurredAt),
-              requestedAt:
-                existingTurn.value.requestedAt ??
-                (Option.isSome(pendingTurnStart)
-                  ? pendingTurnStart.value.requestedAt
-                  : event.occurredAt),
+              pendingMessageId: existingTurn.value.pendingMessageId,
+              sourceProposedPlanThreadId: existingTurn.value.sourceProposedPlanThreadId,
+              sourceProposedPlanId: existingTurn.value.sourceProposedPlanId,
+              startedAt: existingTurn.value.startedAt ?? event.occurredAt,
+              requestedAt: existingTurn.value.requestedAt,
             });
           } else {
             yield* projectionTurnRepository.upsertByTurnId({
@@ -1185,11 +1180,14 @@ const makeOrchestrationProjectionPipeline = Effect.fn("makeOrchestrationProjecti
               checkpointStatus: null,
               checkpointFiles: [],
             });
+            shouldDeletePendingTurnStart = true;
           }
 
-          yield* projectionTurnRepository.deletePendingTurnStartByThreadId({
-            threadId: event.payload.threadId,
-          });
+          if (shouldDeletePendingTurnStart) {
+            yield* projectionTurnRepository.deletePendingTurnStartByThreadId({
+              threadId: event.payload.threadId,
+            });
+          }
           return;
         }
 

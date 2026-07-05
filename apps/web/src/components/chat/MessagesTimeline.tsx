@@ -813,6 +813,7 @@ const TimelineRowContent = memo(function TimelineRowContent({ row }: { row: Time
         // Commentary (non-terminal assistant) rows carry no metadata row, so
         // they sit closer to the work that follows them.
         (row.kind === "message" && row.message.role === "assistant" && !row.showAssistantMeta) ||
+          (row.kind === "message" && row.message.role === "system") ||
           row.kind === "work" ||
           row.kind === "work-toggle"
           ? "pb-2"
@@ -830,6 +831,9 @@ const TimelineRowContent = memo(function TimelineRowContent({ row }: { row: Time
       {row.kind === "message" && row.message.role === "user" ? <UserTimelineRow row={row} /> : null}
       {row.kind === "message" && row.message.role === "assistant" ? (
         <AssistantTimelineRow row={row} />
+      ) : null}
+      {row.kind === "message" && row.message.role === "system" ? (
+        <SystemTimelineRow row={row} />
       ) : null}
       {row.kind === "proposed-plan" ? <ProposedPlanTimelineRow row={row} /> : null}
       {row.kind === "working" ? <WorkingTimelineRow row={row} /> : null}
@@ -1117,6 +1121,29 @@ function AssistantDictateButton({ row }: { row: Extract<TimelineRow, { kind: "me
       text={dictateState.text ?? ""}
       variant="ghost"
     />
+  );
+}
+
+function SystemTimelineRow({ row }: { row: Extract<TimelineRow, { kind: "message" }> }) {
+  const ctx = use(TimelineRowCtx);
+  const title = row.message.text.trim().startsWith("[sub-agent") ? "Sub-agent result" : "System";
+
+  return (
+    <div className="flex justify-start px-1 py-0.5">
+      <div className="min-w-0 max-w-[80%] rounded-lg border border-border/70 bg-muted/35 px-3 py-2 text-sm shadow-sm shadow-black/5">
+        <div className="mb-1.5 flex items-center gap-1.5 font-medium text-[11px] text-muted-foreground/80">
+          <HammerIcon className="size-3.5" aria-hidden />
+          <span>{title}</span>
+        </div>
+        <ChatMarkdown
+          text={row.message.text}
+          cwd={ctx.markdownCwd}
+          threadRef={ctx.threadRef ?? undefined}
+          isStreaming={false}
+          skills={ctx.skills}
+        />
+      </div>
+    </div>
   );
 }
 

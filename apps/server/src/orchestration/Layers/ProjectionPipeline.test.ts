@@ -175,6 +175,159 @@ it.layer(BaseTestLayer)("OrchestrationProjectionPipeline", (it) => {
   );
 });
 
+it.layer(Layer.fresh(makeProjectionPipelinePrefixedTestLayer("t3-projection-system-wake-revert-")))(
+  "OrchestrationProjectionPipeline",
+  (it) => {
+    it.effect("prunes sub-agent wake system messages when their turn is reverted", () =>
+      Effect.gen(function* () {
+        const projectionPipeline = yield* OrchestrationProjectionPipeline;
+        const eventStore = yield* OrchestrationEventStore;
+        const sql = yield* SqlClient.SqlClient;
+        const now = "2026-01-01T00:00:00.000Z";
+        const threadId = ThreadId.make("thread-system-wake");
+        const messageId = MessageId.make("message-system-wake");
+        const turnId = TurnId.make("turn-system-wake");
+
+        yield* eventStore.append({
+          type: "thread.created",
+          eventId: EventId.make("evt-system-wake-create"),
+          aggregateKind: "thread",
+          aggregateId: threadId,
+          occurredAt: now,
+          commandId: CommandId.make("cmd-system-wake-create"),
+          causationEventId: null,
+          correlationId: CommandId.make("cmd-system-wake-create"),
+          metadata: {},
+          payload: {
+            threadId,
+            projectId: ProjectId.make("project-1"),
+            title: "Thread 1",
+            modelSelection: {
+              instanceId: ProviderInstanceId.make("codex"),
+              model: "gpt-5-codex",
+            },
+            runtimeMode: "full-access",
+            branch: null,
+            worktreePath: null,
+            createdAt: now,
+            updatedAt: now,
+          },
+        });
+
+        yield* eventStore.append({
+          type: "thread.message-sent",
+          eventId: EventId.make("evt-system-wake-message"),
+          aggregateKind: "thread",
+          aggregateId: threadId,
+          occurredAt: "2026-01-01T00:00:01.000Z",
+          commandId: CommandId.make("cmd-system-wake-message"),
+          causationEventId: null,
+          correlationId: CommandId.make("cmd-system-wake-message"),
+          metadata: {},
+          payload: {
+            threadId,
+            messageId,
+            role: "system",
+            text: "[sub-agent child-1 completed] done",
+            turnId: null,
+            streaming: false,
+            createdAt: "2026-01-01T00:00:01.000Z",
+            updatedAt: "2026-01-01T00:00:01.000Z",
+          },
+        });
+
+        yield* eventStore.append({
+          type: "thread.turn-start-requested",
+          eventId: EventId.make("evt-system-wake-turn-requested"),
+          aggregateKind: "thread",
+          aggregateId: threadId,
+          occurredAt: "2026-01-01T00:00:01.000Z",
+          commandId: CommandId.make("cmd-system-wake-turn-requested"),
+          causationEventId: null,
+          correlationId: CommandId.make("cmd-system-wake-turn-requested"),
+          metadata: {},
+          payload: {
+            threadId,
+            messageId,
+            createdAt: "2026-01-01T00:00:01.000Z",
+          },
+        });
+
+        yield* eventStore.append({
+          type: "thread.session-set",
+          eventId: EventId.make("evt-system-wake-session"),
+          aggregateKind: "thread",
+          aggregateId: threadId,
+          occurredAt: "2026-01-01T00:00:02.000Z",
+          commandId: CommandId.make("cmd-system-wake-session"),
+          causationEventId: null,
+          correlationId: CommandId.make("cmd-system-wake-session"),
+          metadata: {},
+          payload: {
+            threadId,
+            session: {
+              threadId,
+              status: "running",
+              providerName: "codex",
+              runtimeMode: "full-access",
+              activeTurnId: turnId,
+              lastError: null,
+              updatedAt: "2026-01-01T00:00:02.000Z",
+            },
+          },
+        });
+
+        yield* eventStore.append({
+          type: "thread.turn-diff-completed",
+          eventId: EventId.make("evt-system-wake-diff"),
+          aggregateKind: "thread",
+          aggregateId: threadId,
+          occurredAt: "2026-01-01T00:00:03.000Z",
+          commandId: CommandId.make("cmd-system-wake-diff"),
+          causationEventId: null,
+          correlationId: CommandId.make("cmd-system-wake-diff"),
+          metadata: {},
+          payload: {
+            threadId,
+            turnId,
+            checkpointTurnCount: 1,
+            checkpointRef: CheckpointRef.make("refs/t3/checkpoints/thread-system-wake/turn/1"),
+            status: "ready",
+            files: [],
+            assistantMessageId: null,
+            completedAt: "2026-01-01T00:00:03.000Z",
+          },
+        });
+
+        yield* eventStore.append({
+          type: "thread.reverted",
+          eventId: EventId.make("evt-system-wake-revert"),
+          aggregateKind: "thread",
+          aggregateId: threadId,
+          occurredAt: "2026-01-01T00:00:04.000Z",
+          commandId: CommandId.make("cmd-system-wake-revert"),
+          causationEventId: null,
+          correlationId: CommandId.make("cmd-system-wake-revert"),
+          metadata: {},
+          payload: {
+            threadId,
+            turnCount: 0,
+          },
+        });
+
+        yield* projectionPipeline.bootstrap;
+
+        const messageRows = yield* sql<{ readonly messageId: string }>`
+          SELECT message_id AS "messageId"
+          FROM projection_thread_messages
+          WHERE thread_id = ${threadId}
+        `;
+        assert.deepEqual(messageRows, []);
+      }),
+    );
+  },
+);
+
 it.layer(Layer.fresh(makeProjectionPipelinePrefixedTestLayer("t3-base-")))(
   "OrchestrationProjectionPipeline",
   (it) => {

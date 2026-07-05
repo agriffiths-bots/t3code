@@ -412,17 +412,21 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
     execute: () =>
       sql`
         SELECT
-          message_id AS "messageId",
-          thread_id AS "threadId",
-          turn_id AS "turnId",
-          role,
-          text,
-          attachments_json AS "attachments",
-          is_streaming AS "isStreaming",
-          created_at AS "createdAt",
-          updated_at AS "updatedAt"
-        FROM projection_thread_messages
-        ORDER BY thread_id ASC, created_at ASC, message_id ASC
+          messages.message_id AS "messageId",
+          messages.thread_id AS "threadId",
+          COALESCE(messages.turn_id, prompt_turns.turn_id) AS "turnId",
+          messages.role,
+          messages.text,
+          messages.attachments_json AS "attachments",
+          messages.is_streaming AS "isStreaming",
+          messages.created_at AS "createdAt",
+          messages.updated_at AS "updatedAt"
+        FROM projection_thread_messages messages
+        LEFT JOIN projection_turns prompt_turns
+          ON prompt_turns.thread_id = messages.thread_id
+          AND prompt_turns.pending_message_id = messages.message_id
+          AND prompt_turns.turn_id IS NOT NULL
+        ORDER BY messages.thread_id ASC, messages.created_at ASC, messages.message_id ASC
       `,
   });
 
@@ -776,18 +780,22 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
     execute: ({ threadId }) =>
       sql`
         SELECT
-          message_id AS "messageId",
-          thread_id AS "threadId",
-          turn_id AS "turnId",
-          role,
-          text,
-          attachments_json AS "attachments",
-          is_streaming AS "isStreaming",
-          created_at AS "createdAt",
-          updated_at AS "updatedAt"
-        FROM projection_thread_messages
-        WHERE thread_id = ${threadId}
-        ORDER BY created_at ASC, message_id ASC
+          messages.message_id AS "messageId",
+          messages.thread_id AS "threadId",
+          COALESCE(messages.turn_id, prompt_turns.turn_id) AS "turnId",
+          messages.role,
+          messages.text,
+          messages.attachments_json AS "attachments",
+          messages.is_streaming AS "isStreaming",
+          messages.created_at AS "createdAt",
+          messages.updated_at AS "updatedAt"
+        FROM projection_thread_messages messages
+        LEFT JOIN projection_turns prompt_turns
+          ON prompt_turns.thread_id = messages.thread_id
+          AND prompt_turns.pending_message_id = messages.message_id
+          AND prompt_turns.turn_id IS NOT NULL
+        WHERE messages.thread_id = ${threadId}
+        ORDER BY messages.created_at ASC, messages.message_id ASC
       `,
   });
 

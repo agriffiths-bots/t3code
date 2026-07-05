@@ -301,6 +301,58 @@ function legacyDefaultUsageProviderInstance(
   return null;
 }
 
+function isUsageDriverForProvider(driver: string, provider: PlanUsageProvider): boolean {
+  return provider === "codex"
+    ? driver === "codex"
+    : driver === "claudeAgent" || driver === "claude";
+}
+
+function firstEnabledUsageProviderInstance(
+  settings: ServerSettings,
+  provider: PlanUsageProvider,
+): UsageProviderInstance | null {
+  const defaultInstanceId = (provider === "codex" ? "codex" : "claudeAgent") as ProviderInstanceId;
+  const configuredDefault = settings.providerInstances[defaultInstanceId];
+  const explicitSecondaryCandidates = Object.entries(settings.providerInstances)
+    .filter(([instanceId]) => instanceId !== defaultInstanceId)
+    .map(([, instance]) => instance)
+    .filter((instance) => isUsageDriverForProvider(instance.driver, provider));
+  if (configuredDefault) {
+    const explicitProviderCandidates = [configuredDefault, ...explicitSecondaryCandidates].filter(
+      (instance) => isUsageDriverForProvider(instance.driver, provider),
+    );
+    return explicitProviderCandidates.find((instance) => instance.enabled !== false) ?? null;
+  }
+
+  const enabledSecondary = explicitSecondaryCandidates.find(
+    (instance) => instance.enabled !== false,
+  );
+  if (enabledSecondary) {
+    return enabledSecondary;
+  }
+
+  const legacyDefault = legacyDefaultUsageProviderInstance(settings, defaultInstanceId);
+  return legacyDefault?.enabled !== false &&
+    isUsageDriverForProvider(legacyDefault?.driver ?? "", provider)
+    ? legacyDefault
+    : null;
+}
+
+function configuredHomeForProvider(
+  provider: PlanUsageProvider,
+  instance: UsageProviderInstance | null,
+): string {
+  const config = objectValue(instance?.config);
+  if (provider === "codex") {
+    return (
+      configuredPathOrNull(config?.shadowHomePath) ??
+      configuredPathOrNull(config?.homePath) ??
+      defaultCodexHome()
+    );
+  }
+  return configuredPathOrNull(config?.homePath) ?? defaultClaudeHome();
+}
+
 export function resolveUsageCredentialScope(
   options: LoadPlanUsageOptions = {},
 ): UsageCredentialScope {
@@ -319,12 +371,8 @@ export function resolveUsageCredentialScope(
       };
     }
 
-    const config = objectValue(instance.config);
     if (instance.driver === "codex") {
-      const codexHome =
-        configuredPathOrNull(config?.shadowHomePath) ??
-        configuredPathOrNull(config?.homePath) ??
-        defaultCodexHome();
+      const codexHome = configuredHomeForProvider("codex", instance);
       return {
         cacheKey: `instance:${providerInstanceId}:codex:${codexHome}`,
         providers: ["codex"],
@@ -334,7 +382,7 @@ export function resolveUsageCredentialScope(
     }
 
     if (instance.driver === "claudeAgent" || instance.driver === "claude") {
-      const claudeHome = configuredPathOrNull(config?.homePath) ?? defaultClaudeHome();
+      const claudeHome = configuredHomeForProvider("claude", instance);
       return {
         cacheKey: `instance:${providerInstanceId}:claude:${claudeHome}`,
         providers: ["claude"],
@@ -348,6 +396,22 @@ export function resolveUsageCredentialScope(
       providers: [],
       codexHome: null,
       claudeHome: null,
+    };
+  }
+
+  if (settings) {
+    const codexInstance = firstEnabledUsageProviderInstance(settings, "codex");
+    const claudeInstance = firstEnabledUsageProviderInstance(settings, "claude");
+    const providers: PlanUsageProvider[] = [];
+    if (codexInstance) providers.push("codex");
+    if (claudeInstance) providers.push("claude");
+    const codexHome = codexInstance ? configuredHomeForProvider("codex", codexInstance) : null;
+    const claudeHome = claudeInstance ? configuredHomeForProvider("claude", claudeInstance) : null;
+    return {
+      cacheKey: `default:${codexHome ?? "none"}:${claudeHome ?? "none"}`,
+      providers,
+      codexHome,
+      claudeHome,
     };
   }
 
