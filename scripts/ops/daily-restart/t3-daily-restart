@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 set -u
 
-PATH="${T3DR_TEST_PATH_PREFIX:+$T3DR_TEST_PATH_PREFIX:}/home/linuxbrew/.linuxbrew/bin:/home/adam/.local/bin:/usr/local/bin:/usr/bin:/bin"
+caller_path="${PATH:-}"
+PATH="${T3DR_TEST_PATH_PREFIX:+$T3DR_TEST_PATH_PREFIX:}/home/linuxbrew/.linuxbrew/bin:/home/adam/.local/bin:/usr/local/bin:/usr/bin:/bin${caller_path:+:$caller_path}"
 export PATH
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
@@ -126,6 +127,11 @@ manifest="$run_dir/resume-manifest.json"
 lock_file="$ledger/t3-daily-restart.lock"
 pinned_tools_dir="$run_dir/pinned-tools"
 pinned_health_probe=""
+pinned_inject_resume=""
+resume_token=""
+resume_token_session_id=""
+resume_token_dir=""
+resume_token_file=""
 
 exec 9>"$lock_file"
 if ! flock -n 9; then
@@ -157,8 +163,8 @@ record_result() {
 
 resolve_tool() {
   local name="$1"
-  if command -v "$name" >/dev/null 2>&1; then
-    command -v "$name"
+  if [[ -n "${T3DR_TEST_PATH_PREFIX:-}" && -x "$T3DR_TEST_PATH_PREFIX/$name" ]]; then
+    printf '%s/%s\n' "$T3DR_TEST_PATH_PREFIX" "$name"
     return 0
   fi
   if [[ -x "$script_dir/$name" ]]; then
@@ -167,6 +173,10 @@ resolve_tool() {
   fi
   if [[ -x "$checkout/scripts/ops/daily-restart/$name" ]]; then
     printf '%s/scripts/ops/daily-restart/%s\n' "$checkout" "$name"
+    return 0
+  fi
+  if command -v "$name" >/dev/null 2>&1; then
+    command -v "$name"
     return 0
   fi
   return 1
@@ -305,13 +315,146 @@ claude_advisory() {
   log "CLAUDE_ADVISORY $verdict"
 }
 
-inject_resume_manifest() {
-  local inject_tool
-  inject_tool="$(resolve_tool inject-resume)" || {
-    log "missing inject-resume"
-    return 1
+default_resume_token_ttl() {
+  printf '%s\n' "${T3DR_RESUME_TOKEN_TTL:-7200s}"
+}
+
+server_state_home() {
+  local home="${T3CODE_HOME:-}"
+  if [[ -n "$home" ]]; then
+    printf '%s\n' "$home"
+    return 0
+  fi
+  cd "$(dirname "$db")/.." 2>/dev/null && pwd -P
+}
+
+server_entry() {
+  if [[ -f "$checkout/apps/server/dist/bin.mjs" ]]; then
+    printf '%s\n' "$checkout/apps/server/dist/bin.mjs"
+  else
+    printf '%s\n' "$checkout/apps/server/src/bin.ts"
+  fi
+}
+
+mint_resume_token() {
+  local home entry json parsed
+  home="$(server_state_home)" || return 1
+  entry="$(server_entry)" || return 1
+  json="$(
+    env -u VITE_DEV_SERVER_URL T3CODE_HOME="$home" timeout 30 node "$entry" auth session issue \
+      --json \
+      --ttl "$(default_resume_token_ttl)" \
+      --label daily-restart-resume-injection \
+      --subject daily-restart-resume-injection
+  )" || return 1
+  parsed="$(node -e 'const fs=require("node:fs"); const issued=JSON.parse(fs.readFileSync(0,"utf8")); console.log(issued.token || ""); console.log(issued.sessionId || "");' <<<"$json")" || return 1
+  resume_token="$(sed -n '1p' <<<"$parsed")"
+  resume_token_session_id="$(sed -n '2p' <<<"$parsed")"
+  [[ -n "$resume_token" ]]
+}
+
+revoke_resume_session() {
+  local session_id="$1"
+  local home entry
+  [[ -n "$session_id" ]] || return 0
+  home="$(server_state_home)" || return 1
+  entry="$(server_entry)" || return 1
+  env -u VITE_DEV_SERVER_URL T3CODE_HOME="$home" timeout 30 node "$entry" auth session revoke "$session_id" >/dev/null
+}
+
+write_resume_token_file() {
+  resume_token_dir="$(mktemp -d)" || return 1
+  chmod 700 "$resume_token_dir" || return 1
+  resume_token_file="$resume_token_dir/token"
+  printf '%s' "$resume_token" >"$resume_token_file" || return 1
+  chmod 600 "$resume_token_file"
+}
+
+validate_resume_token() {
+  local output rc
+  output="$(timeout 30 node - "$origin" "$resume_token_file" <<'NODE' 2>&1
+const fs = require("node:fs");
+
+const [origin, tokenPath] = process.argv.slice(2);
+async function main() {
+  const token = fs.readFileSync(tokenPath, "utf8");
+  const response = await fetch(new URL("/api/auth/session", origin), {
+    headers: { authorization: `Bearer ${token}` },
+  });
+  if (!response.ok) {
+    const body = await response.text().catch(() => "");
+    throw new Error(`auth session HTTP ${response.status}: ${body.slice(0, 300)}`);
   }
-  run_capture 600 "$inject_tool" --origin "$origin" --manifest "$manifest"
+  const session = await response.json();
+  if (session?.authenticated !== true) {
+    throw new Error("auth session is not authenticated");
+  }
+  const scopes = Array.isArray(session.scopes) ? session.scopes : [];
+  if (!scopes.includes("orchestration:operate")) {
+    throw new Error("auth session missing orchestration:operate");
+  }
+}
+
+main().catch((error) => {
+  console.error(error instanceof Error ? error.message : String(error));
+  process.exit(1);
+});
+NODE
+)"
+  rc=$?
+  if [[ "$rc" -ne 0 ]]; then
+    output="${output//$'\n'/ }"
+    log "resume token validation failed rc=$rc output=${output:-empty}"
+    return 1
+  fi
+}
+
+prepare_resume_token() {
+  if [[ -n "${T3DR_TOKEN:-}" ]]; then
+    resume_token="$T3DR_TOKEN"
+    log "resume token source=T3DR_TOKEN"
+  elif [[ -n "${T3_TOKEN:-}" ]]; then
+    resume_token="$T3_TOKEN"
+    log "resume token source=T3_TOKEN"
+  else
+    log "resume token source=mint ttl=$(default_resume_token_ttl)"
+    mint_resume_token || return 1
+  fi
+  write_resume_token_file || return 1
+  validate_resume_token || return 1
+  log "resume token validated before shutdown"
+}
+
+cleanup_resume_token() {
+  if [[ -n "$resume_token_session_id" ]]; then
+    revoke_resume_session "$resume_token_session_id" || log "failed to revoke minted resume token session"
+    resume_token_session_id=""
+  fi
+  if [[ -n "$resume_token_dir" ]]; then
+    rm -rf -- "$resume_token_dir"
+    resume_token_dir=""
+    resume_token_file=""
+  fi
+}
+
+on_exit() {
+  local rc=$?
+  cleanup_resume_token || true
+  exit "$rc"
+}
+trap on_exit EXIT
+
+inject_resume_manifest() {
+  if [[ -z "$pinned_inject_resume" || ! -x "$pinned_inject_resume" ]]; then
+    log "missing pinned inject-resume"
+    return 1
+  fi
+  if [[ -z "$resume_token" ]]; then
+    log "missing prepared resume token"
+    return 1
+  fi
+  log "RUN timeout=600 $pinned_inject_resume --origin $origin --manifest $manifest"
+  T3DR_TOKEN="$resume_token" timeout 600 "$pinned_inject_resume" --origin "$origin" --manifest "$manifest" >>"$log_file" 2>&1
 }
 
 run_health_probe() {
@@ -361,6 +504,64 @@ pin_health_probe() {
   }
   pinned_health_probe="$pinned_probe"
   log "PINNED health-probe source=$source_probe pinned=$pinned_probe"
+}
+
+pin_inject_resume() {
+  local source_tool pinned_tool temp_tool source_ts pinned_ts temp_ts
+  source_tool="$(resolve_tool inject-resume)" || return 1
+  mkdir -p "$pinned_tools_dir" || return 1
+  chmod 700 "$pinned_tools_dir" || return 1
+  pinned_tool="$pinned_tools_dir/inject-resume"
+  temp_tool="$pinned_tools_dir/.inject-resume.$$"
+  rm -f -- "$temp_tool" || return 1
+
+  if [[ -f "${source_tool}.ts" ]]; then
+    source_ts="${source_tool}.ts"
+    pinned_ts="$pinned_tools_dir/inject-resume.ts"
+    temp_ts="$pinned_tools_dir/.inject-resume.ts.$$"
+    rm -f -- "$temp_ts" || return 1
+    cp -p -- "$source_ts" "$temp_ts" || {
+      rm -f -- "$temp_tool" "$temp_ts"
+      return 1
+    }
+    chmod 600 "$temp_ts" || {
+      rm -f -- "$temp_tool" "$temp_ts"
+      return 1
+    }
+    if ! cat >"$temp_tool" <<'SH'
+#!/usr/bin/env bash
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+exec node "$script_dir/inject-resume.ts" "$@"
+SH
+    then
+      rm -f -- "$temp_tool" "$temp_ts"
+      return 1
+    fi
+    chmod 700 "$temp_tool" || {
+      rm -f -- "$temp_tool" "$temp_ts"
+      return 1
+    }
+    mv -f -- "$temp_ts" "$pinned_ts" || {
+      rm -f -- "$temp_tool" "$temp_ts"
+      return 1
+    }
+  else
+    cp -p -- "$source_tool" "$temp_tool" || {
+      rm -f -- "$temp_tool"
+      return 1
+    }
+    chmod 700 "$temp_tool" || {
+      rm -f -- "$temp_tool"
+      return 1
+    }
+  fi
+
+  mv -f -- "$temp_tool" "$pinned_tool" || {
+    rm -f -- "$temp_tool"
+    return 1
+  }
+  pinned_inject_resume="$pinned_tool"
+  log "PINNED inject-resume source=$source_tool pinned=$pinned_tool"
 }
 
 replace_checkout_dir_from_payload() {
@@ -576,6 +777,16 @@ fi
 
 if ! pin_health_probe; then
   log "failed to pin pre-update health-probe"
+  record_result "FAILED"
+  exit 1
+fi
+if ! pin_inject_resume; then
+  log "failed to pin pre-update inject-resume"
+  record_result "FAILED"
+  exit 1
+fi
+if ! prepare_resume_token; then
+  log "failed to prepare resume-injection token"
   record_result "FAILED"
   exit 1
 fi

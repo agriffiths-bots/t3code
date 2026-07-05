@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/home/linuxbrew/.linuxbrew/bin:/home/adam/.local/bin"
+caller_path="${PATH:-}"
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/home/linuxbrew/.linuxbrew/bin:/home/adam/.local/bin${caller_path:+:$caller_path}"
 umask 077
 
 DEFAULT_DB="/home/adam/.t3-vps/userdata/state.sqlite"

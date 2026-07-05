@@ -59,13 +59,17 @@ T3DR_SMOKE_MODEL=(required)
 
 The snapshot is a hard gate before shutdown. Rollbacks before the updated
 service can accept writes restore that DB snapshot after checking out the
-pre-restart SHA. The manager pins the pre-update `health-probe` under
-`$T3DR_LEDGER/<UTC date>/pinned-tools/` before merging the target SHA, then uses
-that pinned probe for post-update health checks and rollback re-probes. If
-post-start health fails after the updated service was started, the manager
-always restores the cycle-start DB snapshot as part of rollback; the current DB
-is moved aside by `t3-db-restore`. Result and full logs are written under
-`$T3DR_LEDGER/<UTC date>/`.
+pre-restart SHA. The manager pins the pre-update `health-probe` and
+`inject-resume` helper under `$T3DR_LEDGER/<UTC date>/pinned-tools/` before
+merging the target SHA, then uses those pinned tools for post-update health
+checks, rollback re-probes, and resume injection. It also validates that an
+existing `T3DR_TOKEN`/`T3_TOKEN` is authenticated with `orchestration:operate`,
+or mints and validates a short-lived resume-injection token before the service
+is stopped, so auth failures abort while the original service is still
+available. If post-start health fails after the updated service
+was started, the manager always restores the cycle-start DB snapshot as part of
+rollback; the current DB is moved aside by `t3-db-restore`. Result and full logs
+are written under `$T3DR_LEDGER/<UTC date>/`.
 Set `T3DR_SMOKE_INSTANCE` and `T3DR_SMOKE_MODEL` to the provider/model pair the
 health probe should wake. For one-off operator runs, `--smoke-instance` and
 `--smoke-model` override those environment defaults.
@@ -139,8 +143,9 @@ T3DR_TOKEN="$T3DR_TOKEN" scripts/ops/daily-restart/inject-resume --manifest resu
 
 `--origin` defaults to `T3DR_ORIGIN`, then `http://127.0.0.1:3773`. `--token`
 defaults to `T3DR_TOKEN`, then `T3_TOKEN`; avoid passing live bearer tokens via
-argv. The flag wins for ephemeral tests. `--dry-run` reports without posting or
-mutating.
+argv. The restart manager prepares and validates this token before shutdown and
+passes it through `T3DR_TOKEN` to the pinned helper. The flag wins for ephemeral
+tests. `--dry-run` reports without posting or mutating.
 
 The script calls `POST /api/orchestration/dispatch` with `orchestration:operate`,
 first sending `thread.interaction-mode.set` to force default mode, then
@@ -177,13 +182,20 @@ creates an online-safe SQLite snapshot. `--db` defaults to `T3DR_DB`, then
 
 `scripts/ops/daily-restart/t3-db-restore --snapshot FILE [--db PATH]` restores a
 verified snapshot. The caller must stop T3 first; active WAL/SHM files emit a
-warning only. Both tools export a cron PATH with trusted system directories first,
+warning only. Shell entrypoints in this directory export cron-safe PATH prefixes
+first, then append the caller PATH so nonstandard Node/sqlite installs remain
+reachable without taking precedence over trusted locations. Snapshot and restore
 set `umask 077`, use sqlite3
 `.backup` plus `PRAGMA integrity_check`, print only the result path to stdout,
 and exit non-zero on failure. Both tools must run as the existing database owner;
 root callers should drop privileges to that uid before invoking them. Snapshot
 staging stays inside the snapshot directory so the published file is installed
 with a same-filesystem rename.
+
+The restart manager resolves daily-restart helpers from the current script
+directory or checkout before falling back to PATH; inherited PATH is for
+dependencies such as Node, pnpm, curl, and sqlite, not for overriding snapshot,
+capture, health, restore, or resume helper scripts.
 
 ## Integration smoke
 

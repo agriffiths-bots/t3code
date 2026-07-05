@@ -84,6 +84,7 @@ SH
 if [[ -n "${FAKE_NODE_LOG:-}" ]]; then
   printf 'node args=%s\n' "$*" >> "$FAKE_NODE_LOG"
   printf 'node dev_url=%s args=%s\n' "${VITE_DEV_SERVER_URL-unset}" "$*" >> "$FAKE_NODE_LOG"
+  printf 'node path=%s\n' "$PATH" >> "$FAKE_NODE_LOG"
 fi
 if [[ "$1" == "-" ]]; then
   cat >/dev/null
@@ -192,6 +193,15 @@ node_log="$(dirname "$result")/node.log"
 assert_contains "$node_log" "--ttl 391s" "default minted token ttl scales with timeout"
 assert_contains "$node_log" "node dev_url=unset args=" "token issue/revoke clear dev server URL"
 assert_contains "$result" "CHECK spawn_wake PASS completed thread=fake" "minted token smoke pass line"
+
+caller_path="$(mktemp -d)/nonstandard-node"
+mkdir -p "$caller_path"
+old_path="$PATH"
+PATH="$caller_path:$old_path"
+result="$(run_probe "caller path preserved")"
+PATH="$old_path"
+node_log="$(dirname "$result")/node.log"
+assert_contains "$node_log" "$caller_path" "caller PATH is preserved after health trusted prefixes"
 
 sequence_dir="$(mktemp -d)"
 printf 'activating,active\n' > "$sequence_dir/systemd"

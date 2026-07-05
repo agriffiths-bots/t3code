@@ -3,6 +3,7 @@ set -u
 
 ROOT="$(git rev-parse --show-toplevel)"
 SCRIPT="$ROOT/scripts/ops/daily-restart/t3-daily-restart"
+REAL_NODE="$(command -v node)"
 
 pass_count=0
 fail_count=0
@@ -15,6 +16,9 @@ make_fake_bin() {
   mkdir -p "$dir"
   cat >"$dir/git" <<'SH'
 #!/usr/bin/env bash
+if [[ "${FAKE_LOG_PATH:-0}" == "1" ]]; then
+  echo "path=$PATH" >>"$T_LOG"
+fi
 echo "git $*" >>"$T_LOG"
 case "$*" in
   *"rev-parse HEAD"*) echo "${FAKE_PRE_SHA:-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}" ;;
@@ -33,6 +37,13 @@ echo "CHECK http PASS 200"
 echo "CHECK spawn_wake PASS completed"
 WEAK
       chmod +x "$T_TMP/bin/health-probe"
+    fi
+    if [[ "${FAKE_TARGET_WEAKENS_INJECT_RESUME:-0}" == "1" ]]; then
+      cat >"$T_TMP/bin/inject-resume" <<'WEAK'
+#!/usr/bin/env bash
+echo "inject-weakened token=${T3DR_TOKEN:-missing} $*" >>"$T_LOG"
+WEAK
+      chmod +x "$T_TMP/bin/inject-resume"
     fi
     exit "${FAKE_GIT_RC:-0}"
     ;;
@@ -137,7 +148,30 @@ echo "CHECK spawn_wake PASS completed"
 SH
   cat >"$dir/inject-resume" <<'SH'
 #!/usr/bin/env bash
-echo "inject $*" >>"$T_LOG"
+echo "inject token=${T3DR_TOKEN:-missing} $*" >>"$T_LOG"
+SH
+  cat >"$dir/node" <<'SH'
+#!/usr/bin/env bash
+echo "node $*" >>"$T_LOG"
+case "$*" in
+  *"auth session issue"*)
+    echo "mint-resume-token" >>"$T_LOG"
+    printf '{"token":"%s","sessionId":"%s"}\n' "${FAKE_RESUME_TOKEN:-minted-token}" "${FAKE_RESUME_SESSION_ID:-minted-session}"
+    exit "${FAKE_RESUME_TOKEN_MINT_RC:-0}"
+    ;;
+  *"auth session revoke"*)
+    echo "revoke-resume-token ${*: -1}" >>"$T_LOG"
+    exit "${FAKE_RESUME_TOKEN_REVOKE_RC:-0}"
+    ;;
+esac
+if [[ "$1" == "-" && "${2:-}" == http* ]]; then
+  echo "validate-resume-token origin=$2 token_file=$3" >>"$T_LOG"
+  if [[ " ${FAKE_RESUME_TOKEN_SCOPES:-orchestration:operate} " != *" orchestration:operate "* ]]; then
+    exit 9
+  fi
+  exit "${FAKE_RESUME_TOKEN_VALIDATE_RC:-0}"
+fi
+exec "$REAL_NODE" "$@"
 SH
   cat >"$dir/pnpm" <<'SH'
 #!/usr/bin/env bash
@@ -165,7 +199,7 @@ run_manager() {
   printf 'server-client\n' >"$tmp/prebuilt-assets/apps/server/dist/client/index.html"
   printf 'server-bin\n' >"$tmp/prebuilt-assets/apps/server/dist/bin.mjs"
   make_fake_bin "$tmp/bin"
-  T_TMP="$tmp" T_LOG="$tmp/calls.log" T3DR_TEST_PATH_PREFIX="$tmp/bin" T3DR_STOP_TIMEOUT="${T3DR_STOP_TIMEOUT:-1}" T3DR_KILL_TIMEOUT="${T3DR_KILL_TIMEOUT:-1}" \
+  T_TMP="$tmp" T_LOG="$tmp/calls.log" REAL_NODE="$REAL_NODE" T3DR_TEST_PATH_PREFIX="$tmp/bin" T3DR_STOP_TIMEOUT="${T3DR_STOP_TIMEOUT:-1}" T3DR_KILL_TIMEOUT="${T3DR_KILL_TIMEOUT:-1}" \
     T3DR_PREBUILT_ASSETS_DIR="$tmp/prebuilt-assets" "$SCRIPT" \
     --db "$tmp/state.sqlite" \
     --checkout "$tmp/checkout" \
@@ -199,6 +233,9 @@ tmp="$(mktemp -d)"
 run_manager "$tmp"
 [[ "$(cat "$tmp/rc")" == "0" ]] && pass "happy path exits zero" || fail "happy path exits zero"
 assert_order "$tmp/calls.log" "git -C" "snapshot" "capture" "systemctl --user stop" "snapshot" "git -C" "pnpm -C" "systemctl --user start" "health" "inject"
+assert_order "$tmp/calls.log" "mint-resume-token" "validate-resume-token" "systemctl --user stop"
+grep -Fq "inject token=minted-token" "$tmp/calls.log" && pass "resume injection receives preflight token" || fail "resume injection receives preflight token"
+grep -Fq "revoke-resume-token minted-session" "$tmp/calls.log" && pass "minted resume token is revoked" || fail "minted resume token is revoked"
 assert_order "$tmp/calls.log" "snapshot --db" "capture --db" "systemctl --user stop" "snapshot --db"
 assert_order "$tmp/calls.log" "git -C" "pnpm -C $tmp/checkout/apps/web run build" "pnpm -C $tmp/checkout run build:desktop"
 if awk 'f && /pnpm/ { found=1 } /health/ { f=1 } END { exit found ? 0 : 1 }' "$tmp/calls.log"; then
@@ -210,6 +247,16 @@ grep -Fq '"pre_sha"' "$tmp/ledger/"*/resume-manifest.json && pass "manifest fill
 grep -Fq "snapshot --db $tmp/state.sqlite --out-dir $tmp/snaps" "$tmp/calls.log" && pass "snapshot helper receives current flags" || fail "snapshot helper receives current flags"
 grep -Fq "capture --db $tmp/state.sqlite --out $tmp/ledger/" "$tmp/calls.log" && pass "capture helper receives current flags" || fail "capture helper receives current flags"
 grep -Fq "health --origin http://127.0.0.1:1 --service fake.service --instance fakeAgent --model fake-model --timeout 1" "$tmp/calls.log" && pass "health probe receives smoke provider" || fail "health probe receives smoke provider"
+
+tmp="$(mktemp -d)"
+caller_path="$tmp/nonstandard-node"
+mkdir -p "$caller_path"
+old_path="$PATH"
+export FAKE_LOG_PATH=1
+PATH="$caller_path:$old_path" run_manager "$tmp"
+unset FAKE_LOG_PATH
+PATH="$old_path"
+grep -Fq "$caller_path" "$tmp/calls.log" && pass "caller PATH is preserved after trusted prefixes" || fail "caller PATH is preserved after trusted prefixes"
 
 tmp="$(mktemp -d)"
 mkdir -p "$tmp/checkout" "$tmp/bin" "$tmp/ledger" "$tmp/snaps"
@@ -233,6 +280,29 @@ run_manager "$tmp"
 unset FAKE_SNAPSHOT_RC
 [[ "$(cat "$tmp/rc")" != "0" ]] && pass "snapshot failure exits nonzero" || fail "snapshot failure exits nonzero"
 if grep -Fq "systemctl --user stop" "$tmp/calls.log" 2>/dev/null; then fail "snapshot failure stopped service"; else pass "snapshot failure aborts before stop"; fi
+
+tmp="$(mktemp -d)"
+export FAKE_RESUME_TOKEN_VALIDATE_RC=7
+run_manager "$tmp"
+unset FAKE_RESUME_TOKEN_VALIDATE_RC
+[[ "$(cat "$tmp/rc")" != "0" ]] && pass "resume token validation failure exits nonzero" || fail "resume token validation failure exits nonzero"
+if grep -Fq "systemctl --user stop" "$tmp/calls.log"; then
+  fail "resume token validation failure stopped service"
+else
+  pass "resume token validation failure aborts before stop"
+fi
+grep -Fq "RESULT FAILED" "$tmp/ledger/"*/t3-daily-restart.result && pass "resume token validation failure recorded" || fail "resume token validation failure recorded"
+
+tmp="$(mktemp -d)"
+export FAKE_RESUME_TOKEN_SCOPES="orchestration:read"
+run_manager "$tmp"
+unset FAKE_RESUME_TOKEN_SCOPES
+[[ "$(cat "$tmp/rc")" != "0" ]] && pass "read-only resume token exits nonzero" || fail "read-only resume token exits nonzero"
+if grep -Fq "systemctl --user stop" "$tmp/calls.log"; then
+  fail "read-only resume token stopped service"
+else
+  pass "read-only resume token aborts before stop"
+fi
 
 tmp="$(mktemp -d)"
 mkdir -p "$tmp/ledger/$(date -u +%F)"
@@ -296,6 +366,17 @@ if grep -Fq "health-weakened" "$tmp/calls.log"; then
   fail "target health probe was used after update"
 else
   pass "pinned pre-update health probe used after update"
+fi
+
+tmp="$(mktemp -d)"
+export FAKE_TARGET_WEAKENS_INJECT_RESUME=1
+run_manager "$tmp"
+unset FAKE_TARGET_WEAKENS_INJECT_RESUME
+[[ "$(cat "$tmp/rc")" == "0" ]] && pass "weakened target inject-resume still exits zero" || fail "weakened target inject-resume still exits zero"
+if grep -Fq "inject-weakened" "$tmp/calls.log"; then
+  fail "target inject-resume was used after update"
+else
+  pass "pinned pre-update inject-resume used after update"
 fi
 
 tmp="$(mktemp -d)"
