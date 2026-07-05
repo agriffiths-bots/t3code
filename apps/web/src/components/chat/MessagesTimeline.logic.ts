@@ -310,10 +310,41 @@ function deriveUnsettledTurnId(
   return isSettled ? null : latestTurn.turnId;
 }
 
+function deriveFinalAssistantEntryIds(entries: ReadonlyArray<TimelineEntry>): ReadonlySet<string> {
+  const finalEntryIds = new Set<string>();
+  let foundTerminalAssistant = false;
+
+  for (let index = entries.length - 1; index >= 0; index -= 1) {
+    const entry = entries[index];
+    if (!entry) continue;
+
+    if (entry.kind === "work") {
+      if (foundTerminalAssistant) {
+        break;
+      }
+      continue;
+    }
+
+    if (entry.kind === "message" && entry.message.role === "assistant") {
+      foundTerminalAssistant = true;
+      finalEntryIds.add(entry.id);
+      continue;
+    }
+
+    if (foundTerminalAssistant) {
+      break;
+    }
+  }
+
+  return finalEntryIds;
+}
+
 /**
- * Settled turns fold their commentary and tool activity behind a
- * "Worked for ..." row anchored at the turn's first foldable entry; the
- * terminal assistant message stays visible below the fold.
+ * Settled turns fold work activity and assistant commentary that precedes
+ * later work behind a "Worked for ..." row anchored at the turn's first
+ * foldable entry. Contiguous assistant text ending at the terminal assistant
+ * message is the turn-final response and stays visible, even when late
+ * lifecycle/status work rows arrive after it.
  */
 function deriveTurnFolds(input: {
   timelineEntries: ReadonlyArray<TimelineEntry>;
@@ -383,9 +414,10 @@ function deriveTurnFolds(input: {
     if (group.hasStreamingMessage) {
       continue;
     }
+    const finalAssistantEntryIds = deriveFinalAssistantEntryIds(group.entries);
     const hiddenEntryIds = new Set<string>();
     for (const entry of group.entries) {
-      if (entry.id !== group.terminalEntry?.id) {
+      if (entry.kind === "work" || !finalAssistantEntryIds.has(entry.id)) {
         hiddenEntryIds.add(entry.id);
       }
     }

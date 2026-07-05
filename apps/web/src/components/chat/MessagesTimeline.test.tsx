@@ -481,6 +481,104 @@ describe("MessagesTimeline", () => {
     expect(markup).toContain("Work Log");
   });
 
+  it("renders all trailing final assistant text outside the collapsed work fold", async () => {
+    const { MessagesTimeline } = await import("./MessagesTimeline");
+    const markup = renderToStaticMarkup(
+      <MessagesTimeline
+        {...buildProps()}
+        timelineEntries={[
+          {
+            id: "user-entry",
+            kind: "message",
+            createdAt: "2026-03-17T19:12:00.000Z",
+            message: {
+              id: MessageId.make("user-message-1"),
+              role: "user",
+              text: "Answer with evidence",
+              turnId: null,
+              createdAt: "2026-03-17T19:12:00.000Z",
+              updatedAt: "2026-03-17T19:12:00.000Z",
+              streaming: false,
+            },
+          },
+          {
+            id: "assistant-preface-entry",
+            kind: "message",
+            createdAt: "2026-03-17T19:12:04.000Z",
+            message: {
+              id: MessageId.make("assistant-preface"),
+              role: "assistant",
+              text: "I will inspect first.",
+              turnId: "turn-1" as never,
+              createdAt: "2026-03-17T19:12:04.000Z",
+              updatedAt: "2026-03-17T19:12:05.000Z",
+              streaming: false,
+            },
+          },
+          {
+            id: "work-entry-1",
+            kind: "work",
+            createdAt: "2026-03-17T19:12:08.000Z",
+            entry: {
+              id: "work-1",
+              createdAt: "2026-03-17T19:12:08.000Z",
+              turnId: "turn-1" as never,
+              label: "Ran command",
+              tone: "tool",
+            },
+          },
+          {
+            id: "assistant-final-intro-entry",
+            kind: "message",
+            createdAt: "2026-03-17T19:12:20.000Z",
+            message: {
+              id: MessageId.make("assistant-final-intro"),
+              role: "assistant",
+              text: "First final section.",
+              turnId: "turn-1" as never,
+              createdAt: "2026-03-17T19:12:20.000Z",
+              updatedAt: "2026-03-17T19:12:21.000Z",
+              streaming: false,
+            },
+          },
+          {
+            id: "assistant-final-body-entry",
+            kind: "message",
+            createdAt: "2026-03-17T19:12:22.000Z",
+            message: {
+              id: MessageId.make("assistant-final-body"),
+              role: "assistant",
+              text: "Second final section.",
+              turnId: "turn-1" as never,
+              createdAt: "2026-03-17T19:12:22.000Z",
+              updatedAt: "2026-03-17T19:12:23.000Z",
+              streaming: false,
+            },
+          },
+          {
+            id: "late-work-entry",
+            kind: "work",
+            createdAt: "2026-03-17T19:12:24.000Z",
+            entry: {
+              id: "late-work",
+              createdAt: "2026-03-17T19:12:24.000Z",
+              turnId: "turn-1" as never,
+              label: "Late tool status",
+              tone: "tool",
+            },
+          },
+        ]}
+      />,
+    );
+
+    expect(markup).toContain("Worked for");
+    expect(markup).not.toContain("I will inspect first.");
+    expect(markup).not.toContain("Ran command");
+    expect(markup).not.toContain("Late tool status");
+    expect(markup).toContain("First final section.");
+    expect(markup).toContain("Second final section.");
+  });
+
   it("renders sub-agent wake messages as system tool-result rows", async () => {
     const { MessagesTimeline } = await import("./MessagesTimeline");
     const markup = renderToStaticMarkup(
