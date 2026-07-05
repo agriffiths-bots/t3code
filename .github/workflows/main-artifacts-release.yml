@@ -20,8 +20,8 @@ jobs:
     # workflow_dispatch can target any ref, so gate every job on the main branch.
     if: ${{ github.ref == 'refs/heads/main' }}
     outputs:
-      release_tag: ${{ steps.meta.outputs.release_tag }}
-      release_name: ${{ steps.meta.outputs.release_name }}
+      release_tag: ${{ steps.nightly.outputs.tag }}
+      release_name: ${{ steps.nightly.outputs.name }}
       release_version: ${{ steps.nightly.outputs.version }}
     steps:
       - name: Checkout
@@ -37,7 +37,7 @@ jobs:
           run-install: true
 
       - id: nightly
-        name: Resolve nightly prerelease version
+        name: Resolve nightly prerelease metadata
         shell: bash
         run: |
           set -euo pipefail
@@ -47,17 +47,6 @@ jobs:
             --run-number "${{ github.run_number }}" \
             --sha "$GITHUB_SHA" \
             --github-output
-
-      - id: meta
-        name: Resolve main prerelease version
-        shell: bash
-        run: |
-          set -euo pipefail
-          short_sha="${GITHUB_SHA::7}"
-          # workflow_dispatch has no head_commit; stamp the release at dispatch time.
-          date_part="$(date -u +%Y%m%d%H%M%S)"
-          echo "release_tag=main-${date_part}-${short_sha}" >> "$GITHUB_OUTPUT"
-          echo "release_name=T3 Code main ${short_sha}" >> "$GITHUB_OUTPUT"
 
   public_config:
     name: Resolve artifact public config
@@ -160,14 +149,15 @@ jobs:
     name: Prune old nightly releases
     needs: publish_artifacts
     # Only after a successful publish on main; keeps the Releases page from
-    # accumulating a daily nightly prerelease forever. Stable (v*) tags untouched.
+    # accumulating a daily nightly prerelease forever. Stable v* tags without
+    # nightly prerelease metadata are untouched.
     if: ${{ github.ref == 'refs/heads/main' && needs.publish_artifacts.result == 'success' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
       contents: write
     steps:
-      - name: Keep only the 14 most recent main-* prereleases
+      - name: Keep only the 14 most recent nightly prereleases
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
@@ -196,7 +186,7 @@ jobs:
           stale="$(
             gh release list --limit 300 --json tagName,isPrerelease,createdAt \
               | jq -r --arg keep "$pinned_release_tag" \
-                  '[.[] | select(.isPrerelease and (.tagName | startswith("main-")) and .tagName != $keep)]
+                  '[.[] | select(.isPrerelease and ((.tagName | startswith("main-")) or (.tagName | test("^(?:nightly-)?v[0-9]+\\.[0-9]+\\.[0-9]+-nightly\\.[0-9]{8}\\.[0-9]+$"))) and .tagName != $keep)]
                    | sort_by(.createdAt) | reverse | .[14:] | .[].tagName'
           )"
           if [[ -z "$stale" ]]; then
