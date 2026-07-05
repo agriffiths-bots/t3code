@@ -391,6 +391,7 @@ describe("MessagesTimeline", () => {
     const markup = renderToStaticMarkup(
       <MessagesTimeline
         {...buildProps()}
+        revertTurnCountByUserMessageId={new Map([[MessageId.make("system-message-1"), 1]])}
         timelineEntries={[
           buildUserTimelineEntry(
             [
@@ -478,6 +479,38 @@ describe("MessagesTimeline", () => {
 
     expect(markup).toContain("Context compacted");
     expect(markup).toContain("Work Log");
+  });
+
+  it("renders sub-agent wake messages as system tool-result rows", async () => {
+    const { MessagesTimeline } = await import("./MessagesTimeline");
+    const markup = renderToStaticMarkup(
+      <MessagesTimeline
+        {...buildProps()}
+        revertTurnCountByUserMessageId={new Map([[MessageId.make("system-message-1"), 1]])}
+        timelineEntries={[
+          {
+            id: "system-entry-1",
+            kind: "message",
+            createdAt: "2026-03-17T19:12:28.000Z",
+            message: {
+              id: MessageId.make("system-message-1"),
+              role: "system",
+              text: "[sub-agent child-1 completed] done",
+              turnId: null,
+              createdAt: "2026-03-17T19:12:28.000Z",
+              updatedAt: "2026-03-17T19:12:28.000Z",
+              streaming: false,
+            },
+          },
+        ]}
+      />,
+    );
+
+    expect(markup).toContain('data-message-role="system"');
+    expect(markup).toContain("Sub-agent result");
+    expect(markup).toContain("[sub-agent child-1 completed] done");
+    expect(markup).toContain("lucide-hammer");
+    expect(markup).toContain('aria-label="Revert to this message"');
   });
 
   it("formats changed file paths from the workspace root", async () => {

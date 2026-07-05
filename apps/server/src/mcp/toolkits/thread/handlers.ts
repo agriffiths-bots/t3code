@@ -357,6 +357,7 @@ const makeActiveThreadStartRuntime = Effect.fn("ThreadToolkit.makeActiveRuntime"
           : null;
     const worktreeRemovable = mode === "new_worktree";
     const title = input.title ?? truncateTitle(input.prompt);
+    const titleSeed = input.title === undefined ? title : undefined;
     const providerInstances = yield* providerInstanceRegistry.listInstances;
     const modelSources = yield* Effect.forEach(
       providerInstances.filter((providerInstance) => providerInstance.enabled),
@@ -407,7 +408,7 @@ const makeActiveThreadStartRuntime = Effect.fn("ThreadToolkit.makeActiveRuntime"
         attachments: [],
       },
       modelSelection,
-      titleSeed: title,
+      ...(titleSeed !== undefined ? { titleSeed } : {}),
       runtimeMode,
       interactionMode,
       bootstrap: {

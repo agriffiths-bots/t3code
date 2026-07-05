@@ -859,7 +859,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     () => deriveLatestContextWindowSnapshot(activeThreadActivities ?? []),
     [activeThreadActivities],
   );
-  const planUsageSnapshot = usePlanUsage(activeThreadEnvironmentId ?? null, selectedInstanceId);
+  const planUsageSnapshot = usePlanUsage(activeThreadEnvironmentId ?? null, null);
   const activeThreadProviderDisplayName = useMemo(() => {
     if (!activeThreadModelSelection) return null;
     const entry = providerStatuses.find(

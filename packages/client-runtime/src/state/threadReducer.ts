@@ -279,24 +279,33 @@ export function applyThreadDetailEvent(
       // Leaving the "running" session status is the turn-end signal: settle a
       // still-running latest turn so its duration reflects the whole turn.
       const settledTurnState = settledTurnStateForSessionStatus(event.payload.session.status);
-      const latestTurn: OrchestrationLatestTurn | null =
+      const activeTurnId =
         (event.payload.session.status === "running" ||
           event.payload.session.status === "waiting") &&
         event.payload.session.activeTurnId !== null
+          ? event.payload.session.activeTurnId
+          : null;
+      const previousActiveTurnId = thread.session?.activeTurnId ?? null;
+      const messages =
+        activeTurnId === null || activeTurnId === previousActiveTurnId
+          ? thread.messages
+          : bindLatestPendingPromptMessageToTurn(thread.messages, activeTurnId);
+      const latestTurn: OrchestrationLatestTurn | null =
+        activeTurnId !== null
           ? {
-              turnId: event.payload.session.activeTurnId,
+              turnId: activeTurnId,
               state: "running",
               requestedAt:
-                thread.latestTurn?.turnId === event.payload.session.activeTurnId
+                thread.latestTurn?.turnId === activeTurnId
                   ? thread.latestTurn.requestedAt
                   : event.payload.session.updatedAt,
               startedAt:
-                thread.latestTurn?.turnId === event.payload.session.activeTurnId
+                thread.latestTurn?.turnId === activeTurnId
                   ? (thread.latestTurn.startedAt ?? event.payload.session.updatedAt)
                   : event.payload.session.updatedAt,
               completedAt: null,
               assistantMessageId:
-                thread.latestTurn?.turnId === event.payload.session.activeTurnId
+                thread.latestTurn?.turnId === activeTurnId
                   ? thread.latestTurn.assistantMessageId
                   : null,
             }
@@ -318,6 +327,7 @@ export function applyThreadDetailEvent(
         thread: {
           ...thread,
           session: event.payload.session,
+          messages,
           latestTurn,
           updatedAt: event.occurredAt,
         },
@@ -536,15 +546,39 @@ function retainMessagesAfterRevert(
   messages: ReadonlyArray<OrchestrationMessage>,
   retainedTurnIds: ReadonlySet<string>,
 ): OrchestrationMessage[] {
-  // Keep messages that belong to a retained turn, plus system messages and
-  // messages without a turn binding (pre-turn-0 user messages).
+  // Keep messages that belong to a retained turn, plus messages without a
+  // turn binding (pre-turn-0 user messages and permanent system notices).
   return Arr.filter(messages, (message) => {
-    if (message.role === "system") {
-      return true;
-    }
     if (message.turnId === null) {
-      return true;
+      return message.role !== "system" || !isSubAgentWakeSystemMessageText(message.text);
     }
     return retainedTurnIds.has(message.turnId);
   });
+}
+
+function bindLatestPendingPromptMessageToTurn(
+  messages: ReadonlyArray<OrchestrationMessage>,
+  turnId: TurnId,
+): OrchestrationMessage[] {
+  let pendingIndex = -1;
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index];
+    if (
+      message &&
+      message.turnId === null &&
+      (message.role === "user" ||
+        (message.role === "system" && isSubAgentWakeSystemMessageText(message.text)))
+    ) {
+      pendingIndex = index;
+      break;
+    }
+  }
+  if (pendingIndex === -1) return [...messages];
+  return Arr.map(messages, (message, index) =>
+    index === pendingIndex ? { ...message, turnId } : message,
+  );
+}
+
+function isSubAgentWakeSystemMessageText(text: string): boolean {
+  return text.trimStart().startsWith("[sub-agent ");
 }

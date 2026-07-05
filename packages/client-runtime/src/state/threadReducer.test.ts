@@ -409,6 +409,169 @@ describe("applyThreadDetailEvent", () => {
         expect(result.thread.latestTurn?.state).toBe("running");
       }
     });
+
+    it("binds the latest pending system wake message to the running turn", () => {
+      const threadWithSystemWake: OrchestrationThread = {
+        ...baseThread,
+        messages: [
+          {
+            id: MessageId.make("system-wake-1"),
+            role: "system",
+            text: "[sub-agent child-1 completed] done",
+            turnId: null,
+            streaming: false,
+            createdAt: "2026-04-01T07:59:00.000Z",
+            updatedAt: "2026-04-01T07:59:00.000Z",
+          },
+        ],
+      };
+
+      const result = applyThreadDetailEvent(threadWithSystemWake, {
+        ...baseEventFields,
+        sequence: 9,
+        occurredAt: "2026-04-01T08:00:00.000Z",
+        aggregateKind: "thread",
+        aggregateId: ThreadId.make("thread-1"),
+        type: "thread.session-set",
+        payload: {
+          threadId: ThreadId.make("thread-1"),
+          session: {
+            threadId: ThreadId.make("thread-1"),
+            status: "running",
+            providerName: "codex",
+            runtimeMode: "full-access",
+            activeTurnId: TurnId.make("turn-1"),
+            lastError: null,
+            updatedAt: "2026-04-01T08:00:00.000Z",
+          },
+        },
+      });
+
+      expect(result.kind).toBe("updated");
+      if (result.kind === "updated") {
+        expect(result.thread.messages[0]?.turnId).toBe("turn-1");
+      }
+    });
+
+    it("does not bind ordinary pending system notices to the running turn", () => {
+      const threadWithSystemNotice: OrchestrationThread = {
+        ...baseThread,
+        messages: [
+          {
+            id: MessageId.make("system-notice-1"),
+            role: "system",
+            text: "System maintenance",
+            turnId: null,
+            streaming: false,
+            createdAt: "2026-04-01T07:59:00.000Z",
+            updatedAt: "2026-04-01T07:59:00.000Z",
+          },
+        ],
+      };
+
+      const result = applyThreadDetailEvent(threadWithSystemNotice, {
+        ...baseEventFields,
+        sequence: 9,
+        occurredAt: "2026-04-01T08:00:00.000Z",
+        aggregateKind: "thread",
+        aggregateId: ThreadId.make("thread-1"),
+        type: "thread.session-set",
+        payload: {
+          threadId: ThreadId.make("thread-1"),
+          session: {
+            threadId: ThreadId.make("thread-1"),
+            status: "running",
+            providerName: "codex",
+            runtimeMode: "full-access",
+            activeTurnId: TurnId.make("turn-1"),
+            lastError: null,
+            updatedAt: "2026-04-01T08:00:00.000Z",
+          },
+        },
+      });
+
+      expect(result.kind).toBe("updated");
+      if (result.kind === "updated") {
+        expect(result.thread.messages[0]?.turnId).toBeNull();
+      }
+    });
+
+    it("does not bind a pending system wake when the active turn has not changed", () => {
+      const threadWithActiveTurnAndSystemWake: OrchestrationThread = {
+        ...baseThread,
+        session: {
+          threadId: ThreadId.make("thread-1"),
+          status: "running",
+          providerName: "codex",
+          runtimeMode: "full-access",
+          activeTurnId: TurnId.make("turn-old"),
+          lastError: null,
+          updatedAt: "2026-04-01T07:58:00.000Z",
+        },
+        messages: [
+          {
+            id: MessageId.make("system-wake-1"),
+            role: "system",
+            text: "[sub-agent child-1 completed] done",
+            turnId: null,
+            streaming: false,
+            createdAt: "2026-04-01T07:59:00.000Z",
+            updatedAt: "2026-04-01T07:59:00.000Z",
+          },
+        ],
+      };
+
+      const unchangedTurnResult = applyThreadDetailEvent(threadWithActiveTurnAndSystemWake, {
+        ...baseEventFields,
+        sequence: 9,
+        occurredAt: "2026-04-01T08:00:00.000Z",
+        aggregateKind: "thread",
+        aggregateId: ThreadId.make("thread-1"),
+        type: "thread.session-set",
+        payload: {
+          threadId: ThreadId.make("thread-1"),
+          session: {
+            threadId: ThreadId.make("thread-1"),
+            status: "running",
+            providerName: "codex",
+            runtimeMode: "full-access",
+            activeTurnId: TurnId.make("turn-old"),
+            lastError: null,
+            updatedAt: "2026-04-01T08:00:00.000Z",
+          },
+        },
+      });
+
+      expect(unchangedTurnResult.kind).toBe("updated");
+      if (unchangedTurnResult.kind !== "updated") return;
+      expect(unchangedTurnResult.thread.messages[0]?.turnId).toBeNull();
+
+      const changedTurnResult = applyThreadDetailEvent(unchangedTurnResult.thread, {
+        ...baseEventFields,
+        sequence: 10,
+        occurredAt: "2026-04-01T08:00:01.000Z",
+        aggregateKind: "thread",
+        aggregateId: ThreadId.make("thread-1"),
+        type: "thread.session-set",
+        payload: {
+          threadId: ThreadId.make("thread-1"),
+          session: {
+            threadId: ThreadId.make("thread-1"),
+            status: "running",
+            providerName: "codex",
+            runtimeMode: "full-access",
+            activeTurnId: TurnId.make("turn-new"),
+            lastError: null,
+            updatedAt: "2026-04-01T08:00:01.000Z",
+          },
+        },
+      });
+
+      expect(changedTurnResult.kind).toBe("updated");
+      if (changedTurnResult.kind === "updated") {
+        expect(changedTurnResult.thread.messages[0]?.turnId).toBe("turn-new");
+      }
+    });
   });
 
   describe("thread.session-stop-requested", () => {
@@ -674,6 +837,70 @@ describe("applyThreadDetailEvent", () => {
         // msg-3 (turn-2) is filtered, msg-1 (no turn) and msg-2 (turn-1) remain
         expect(result.thread.messages).toHaveLength(2);
         expect(result.thread.latestTurn?.turnId).toBe("turn-1");
+      }
+    });
+
+    it("filters system wake messages bound to removed turns", () => {
+      const threadWithSystemWake: OrchestrationThread = {
+        ...baseThread,
+        messages: [
+          {
+            id: MessageId.make("system-wake-1"),
+            role: "system",
+            text: "[sub-agent child-1 completed] done",
+            turnId: TurnId.make("turn-2"),
+            streaming: false,
+            createdAt: "2026-04-01T02:30:00.000Z",
+            updatedAt: "2026-04-01T02:30:00.000Z",
+          },
+          {
+            id: MessageId.make("msg-2"),
+            role: "assistant",
+            text: "Response 1",
+            turnId: TurnId.make("turn-1"),
+            streaming: false,
+            createdAt: "2026-04-01T02:00:00.000Z",
+            updatedAt: "2026-04-01T02:00:00.000Z",
+          },
+        ],
+        checkpoints: [
+          {
+            turnId: TurnId.make("turn-1"),
+            checkpointTurnCount: 1,
+            checkpointRef: CheckpointRef.make("ref-1"),
+            status: "ready",
+            files: [],
+            assistantMessageId: MessageId.make("msg-2"),
+            completedAt: "2026-04-01T02:00:00.000Z",
+          },
+          {
+            turnId: TurnId.make("turn-2"),
+            checkpointTurnCount: 2,
+            checkpointRef: CheckpointRef.make("ref-2"),
+            status: "ready",
+            files: [],
+            assistantMessageId: null,
+            completedAt: "2026-04-01T02:30:00.000Z",
+          },
+        ],
+      };
+
+      const result = applyThreadDetailEvent(threadWithSystemWake, {
+        ...baseEventFields,
+        sequence: 14,
+        occurredAt: "2026-04-01T04:00:00.000Z",
+        aggregateKind: "thread",
+        aggregateId: ThreadId.make("thread-1"),
+        type: "thread.reverted",
+        payload: {
+          threadId: ThreadId.make("thread-1"),
+          turnCount: 1,
+        },
+      });
+
+      expect(result.kind).toBe("updated");
+      if (result.kind === "updated") {
+        expect(result.thread.messages.map((message) => message.id)).toEqual(["msg-2"]);
       }
     });
   });
