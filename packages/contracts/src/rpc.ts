@@ -127,6 +127,12 @@ import {
   ServerProcessDiagnosticsResult,
   ServerProcessResourceHistoryInput,
   ServerProcessResourceHistoryResult,
+  ServerNotificationAckInput,
+  ServerNotificationAckResult,
+  ServerNotificationConfig,
+  ServerNotificationRegisterInput,
+  ServerNotificationRegisterResult,
+  ServerNotificationStreamEvent,
   ServerSignalProcessInput,
   ServerSignalProcessResult,
   ServerUpsertKeybindingInput,
@@ -214,6 +220,9 @@ export const WS_METHODS = {
   serverGetProcessDiagnostics: "server.getProcessDiagnostics",
   serverGetProcessResourceHistory: "server.getProcessResourceHistory",
   serverSignalProcess: "server.signalProcess",
+  serverGetNotificationConfig: "server.getNotificationConfig",
+  serverRegisterNotificationDevice: "server.registerNotificationDevice",
+  serverAckNotification: "server.ackNotification",
 
   // Cloud environment methods
   cloudGetRelayClientStatus: "cloud.getRelayClientStatus",
@@ -232,6 +241,7 @@ export const WS_METHODS = {
   subscribeDiscoveredLocalServers: "subscribeDiscoveredLocalServers",
   subscribeServerConfig: "subscribeServerConfig",
   subscribeServerLifecycle: "subscribeServerLifecycle",
+  subscribeNotificationEvents: "subscribeNotificationEvents",
   subscribeAuthAccess: "subscribeAuthAccess",
 } as const;
 
@@ -315,6 +325,27 @@ export const WsServerGetProcessResourceHistoryRpc = Rpc.make(
 export const WsServerSignalProcessRpc = Rpc.make(WS_METHODS.serverSignalProcess, {
   payload: ServerSignalProcessInput,
   success: ServerSignalProcessResult,
+  error: EnvironmentAuthorizationError,
+});
+
+export const WsServerGetNotificationConfigRpc = Rpc.make(WS_METHODS.serverGetNotificationConfig, {
+  payload: Schema.Struct({}),
+  success: ServerNotificationConfig,
+  error: EnvironmentAuthorizationError,
+});
+
+export const WsServerRegisterNotificationDeviceRpc = Rpc.make(
+  WS_METHODS.serverRegisterNotificationDevice,
+  {
+    payload: ServerNotificationRegisterInput,
+    success: ServerNotificationRegisterResult,
+    error: EnvironmentAuthorizationError,
+  },
+);
+
+export const WsServerAckNotificationRpc = Rpc.make(WS_METHODS.serverAckNotification, {
+  payload: ServerNotificationAckInput,
+  success: ServerNotificationAckResult,
   error: EnvironmentAuthorizationError,
 });
 
@@ -703,6 +734,13 @@ export const WsSubscribeServerLifecycleRpc = Rpc.make(WS_METHODS.subscribeServer
   stream: true,
 });
 
+export const WsSubscribeNotificationEventsRpc = Rpc.make(WS_METHODS.subscribeNotificationEvents, {
+  payload: Schema.Struct({}),
+  success: ServerNotificationStreamEvent,
+  error: EnvironmentAuthorizationError,
+  stream: true,
+});
+
 export const WsSubscribeAuthAccessRpc = Rpc.make(WS_METHODS.subscribeAuthAccess, {
   payload: Schema.Struct({}),
   success: AuthAccessStreamEvent,
@@ -723,6 +761,9 @@ export const WsRpcGroup = RpcGroup.make(
   WsServerGetProcessDiagnosticsRpc,
   WsServerGetProcessResourceHistoryRpc,
   WsServerSignalProcessRpc,
+  WsServerGetNotificationConfigRpc,
+  WsServerRegisterNotificationDeviceRpc,
+  WsServerAckNotificationRpc,
   WsCloudGetRelayClientStatusRpc,
   WsCloudInstallRelayClientRpc,
   WsSourceControlLookupRepositoryRpc,
@@ -771,6 +812,7 @@ export const WsRpcGroup = RpcGroup.make(
   WsSubscribeDiscoveredLocalServersRpc,
   WsSubscribeServerConfigRpc,
   WsSubscribeServerLifecycleRpc,
+  WsSubscribeNotificationEventsRpc,
   WsSubscribeAuthAccessRpc,
   WsOrchestrationDispatchCommandRpc,
   WsOrchestrationGetTurnDiffRpc,
