@@ -12,6 +12,7 @@ import {
   MessageId,
   type ModelSelection,
   type OrchestrationEvent,
+  type OrchestrationLatestTurn,
   type OrchestrationThread,
   type OrchestrationThreadShell,
   type ThreadId,
@@ -319,6 +320,48 @@ const make = Effect.gen(function* () {
       Effect.timeoutOption(`${PROJECTION_READ_TIMEOUT_MS} millis`),
       Effect.map(Option.flatten),
     );
+
+  const currentProjectedTerminal = (
+    shell: OrchestrationThreadShell,
+    guards: {
+      readonly activeTurnId: TurnId | undefined;
+      readonly pendingTurnStart: boolean;
+      readonly pendingSameTurnId: TurnId | undefined;
+    },
+  ): OrchestrationLatestTurn | null => {
+    const latestTurn = shell.latestTurn;
+    if (latestTurn === null || latestTurn.state === "running") return null;
+    if (shell.session?.status === "error") return null;
+    if (shell.session?.status === "stopped" && shell.latestUserMessageAt !== null) {
+      const terminalAt = latestTurn.completedAt ?? latestTurn.startedAt ?? latestTurn.requestedAt;
+      if (shell.latestUserMessageAt > terminalAt) return null;
+    }
+    if (
+      guards.pendingTurnStart &&
+      (guards.pendingSameTurnId === undefined ||
+        guards.pendingSameTurnId !== latestTurn.turnId ||
+        shell.session?.status !== "stopped")
+    ) {
+      return null;
+    }
+    if (guards.activeTurnId !== undefined && guards.activeTurnId !== latestTurn.turnId) {
+      return null;
+    }
+    if (shell.session?.activeTurnId != null && shell.session.activeTurnId !== latestTurn.turnId) {
+      return null;
+    }
+    return latestTurn;
+  };
+
+  const currentLiveProjectedTerminal = (
+    childThreadId: ThreadId,
+    shell: OrchestrationThreadShell,
+  ): OrchestrationLatestTurn | null =>
+    currentProjectedTerminal(shell, {
+      activeTurnId: activeTurnByChild.get(childThreadId),
+      pendingTurnStart: pendingTurnStartByChild.has(childThreadId),
+      pendingSameTurnId: pendingSameTurnStartByChild.get(childThreadId),
+    });
 
   const completeChild = (
     childThreadId: ThreadId,
@@ -777,7 +820,23 @@ const make = Effect.gen(function* () {
         }
         return;
       }
+      if (session.status === "stopped") {
+        yield* oneShotTerminalCheck(threadId);
+        const settledFromProjection = yield* Deferred.isDone(record.terminal);
+        if (settledFromProjection) {
+          yield* drainChildSteers(threadId);
+          return;
+        }
+      }
       const shellOption = yield* getThreadShell(threadId);
+      if (session.status === "stopped" && Option.isSome(shellOption)) {
+        const terminalTurn = currentLiveProjectedTerminal(threadId, shellOption.value);
+        if (terminalTurn?.state === "completed") {
+          yield* settleChild(threadId, "completed", null);
+          yield* drainChildSteers(threadId);
+          return;
+        }
+      }
       const turnRunning = Option.match(shellOption, {
         onNone: () => false,
         onSome: (shell) => shell.latestTurn?.state === "running",
@@ -849,30 +908,28 @@ const make = Effect.gen(function* () {
       if (!record) return;
       const done = yield* Deferred.isDone(record.terminal);
       if (done) return;
-      if (pendingTurnStartByChild.has(childThreadId)) return;
       const shellOption = yield* getThreadShellBounded(childThreadId);
       if (Option.isNone(shellOption)) return;
       const shell = shellOption.value;
+      if (shell.session?.status === "error") {
+        yield* settleChild(childThreadId, "failed", "session error", true);
+        return;
+      }
       if (shell.latestTurn === null) return;
-      const expectedTurnId = activeTurnByChild.get(childThreadId);
-      if (expectedTurnId !== undefined && shell.latestTurn.turnId !== expectedTurnId) {
-        return;
-      }
-      if (
-        shell.session?.activeTurnId != null &&
-        shell.latestTurn.turnId !== shell.session.activeTurnId
-      ) {
-        return;
-      }
+      const terminalTurn = currentLiveProjectedTerminal(childThreadId, shell);
       const turnState = shell.latestTurn.state;
-      if (turnState === "running") {
+      if (terminalTurn === null) {
+        if (turnState !== "running") return;
         const activeTurnId = shell.session?.activeTurnId ?? null;
         if (activeTurnId !== null && activeTurnId === shell.latestTurn.turnId) {
           activeTurnByChild.set(childThreadId, activeTurnId);
         }
         return;
       }
-      if (turnState === "completed") {
+      pendingTurnStartByChild.delete(childThreadId);
+      pendingSameTurnStartByChild.delete(childThreadId);
+      activeTurnByChild.set(childThreadId, terminalTurn.turnId);
+      if (terminalTurn.state === "completed") {
         const detail = yield* getThreadDetailBounded(childThreadId);
         if (Option.isNone(detail)) return;
         yield* completeChild(
@@ -882,7 +939,7 @@ const make = Effect.gen(function* () {
           null,
         );
       } else {
-        yield* settleChild(childThreadId, "failed", `turn ${turnState}`, true);
+        yield* settleChild(childThreadId, "failed", `turn ${terminalTurn.state}`, true);
       }
       yield* drainChildSteers(childThreadId);
     });
@@ -1237,6 +1294,48 @@ const make = Effect.gen(function* () {
                 (runningByChild.get(threadId) !== true ||
                   missingDiffWhileRunningByReplayedChild.has(threadId))
               ) {
+                const priorTerminal = terminalByChild.get(threadId);
+                if (session.status === "stopped" && priorTerminal?.status === "completed") {
+                  runningByChild.set(threadId, false);
+                  activeTurnByReplayedChild.delete(threadId);
+                  pendingTurnStartByReplayedChild.delete(threadId);
+                  pendingSameTurnStartByReplayedChild.delete(threadId);
+                  missingDiffWhileRunningByReplayedChild.delete(threadId);
+                  return;
+                }
+                if (
+                  priorTerminal?.status === "failed" &&
+                  !missingDiffWhileRunningByReplayedChild.has(threadId)
+                ) {
+                  runningByChild.set(threadId, false);
+                  activeTurnByReplayedChild.delete(threadId);
+                  pendingTurnStartByReplayedChild.delete(threadId);
+                  pendingSameTurnStartByReplayedChild.delete(threadId);
+                  missingDiffWhileRunningByReplayedChild.delete(threadId);
+                  return;
+                }
+                const shellOption = yield* getThreadShellBounded(threadId);
+                const terminalTurn = Option.isSome(shellOption)
+                  ? currentProjectedTerminal(shellOption.value, {
+                      activeTurnId: activeTurnByReplayedChild.get(threadId),
+                      pendingTurnStart: pendingTurnStartByReplayedChild.has(threadId),
+                      pendingSameTurnId: pendingSameTurnStartByReplayedChild.get(threadId),
+                    })
+                  : null;
+                if (
+                  session.status === "stopped" &&
+                  terminalTurn?.state === "completed" &&
+                  (priorTerminal?.status !== "failed" ||
+                    missingDiffWhileRunningByReplayedChild.has(threadId))
+                ) {
+                  terminalByChild.set(threadId, { status: "completed", error: null });
+                  runningByChild.set(threadId, false);
+                  activeTurnByReplayedChild.delete(threadId);
+                  pendingTurnStartByReplayedChild.delete(threadId);
+                  pendingSameTurnStartByReplayedChild.delete(threadId);
+                  missingDiffWhileRunningByReplayedChild.delete(threadId);
+                  return;
+                }
                 terminalByChild.set(threadId, {
                   status: "failed",
                   error: `session ${session.status}`,
