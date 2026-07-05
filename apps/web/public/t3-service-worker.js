@@ -147,7 +147,8 @@ self.addEventListener("fetch", (event) => {
       await cacheShellAndBuildAssets(cache, shellResponse);
     })
     .catch(() => undefined);
+  const cacheCleanup = deleteSupersededCaches().catch(() => undefined);
 
-  event.waitUntil(shellRefresh);
+  event.waitUntil(Promise.all([shellRefresh, cacheCleanup]));
   event.respondWith(networkResponse.then((response) => response).catch(cachedShellOrUnavailable));
 });
