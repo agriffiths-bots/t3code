@@ -556,6 +556,143 @@ it.effect("falls back to the project checkout when the source worktree path is s
   }),
 );
 
+it.effect("resolves current-checkout branch from the project checkout after source fallback", () =>
+  Effect.gen(function* () {
+    const commands: OrchestrationCommand[] = [];
+    const gitCalls: string[] = [];
+    const vcsCalls: string[] = [];
+    const result = yield* callStartTool(
+      { prompt: "Continue in project checkout", mode: "current_checkout" },
+      commands,
+      {
+        project: {
+          ...project,
+          workspaceRoot: "/repo/project",
+        },
+        sourceThread: {
+          ...sourceThread,
+          branch: "feature/removed-worktree",
+          worktreePath: "/repo/missing-worktree",
+        },
+        gitWorkflow: {
+          status: (input) =>
+            Effect.sync(() => {
+              gitCalls.push(`status:${input.cwd}`);
+              return {
+                isRepo: true,
+                hasPrimaryRemote: true,
+                isDefaultRef: input.cwd === "/repo/project",
+                refName: input.cwd === "/repo/project" ? "main" : "feature/removed-worktree",
+                hasWorkingTreeChanges: false,
+                workingTree: {
+                  files: [],
+                  insertions: 0,
+                  deletions: 0,
+                },
+                hasUpstream: true,
+                aheadCount: 0,
+                behindCount: 0,
+                aheadOfDefaultCount: 0,
+                pr: null,
+              };
+            }),
+        },
+        vcsDetect: (input) =>
+          Effect.sync(() => {
+            vcsCalls.push(input.cwd);
+            return input.cwd === "/repo/missing-worktree" ? null : makeGitHandle(input.cwd);
+          }),
+      },
+    );
+
+    expect(result.isError).toBe(false);
+    expect(result.structuredContent).toMatchObject({
+      projectId,
+      mode: "current_checkout",
+      branch: "main",
+      worktreePath: null,
+    });
+    const command = commands[0];
+    expect(command?.type).toBe("thread.turn.start");
+    if (command?.type !== "thread.turn.start") return;
+    expect(command.bootstrap?.createThread?.branch).toBe("main");
+    expect(command.bootstrap?.createThread?.worktreePath).toBeNull();
+    expect(vcsCalls).toEqual(["/repo/missing-worktree"]);
+    expect(gitCalls).toEqual(["status:/repo/project"]);
+  }),
+);
+
+it.effect(
+  "resolves new-worktree fallback branch from the project checkout after source fallback",
+  () =>
+    Effect.gen(function* () {
+      const commands: OrchestrationCommand[] = [];
+      const gitCalls: string[] = [];
+      const vcsCalls: string[] = [];
+      const result = yield* callStartTool({ prompt: "Continue from project branch" }, commands, {
+        project: {
+          ...project,
+          workspaceRoot: "/repo/project",
+        },
+        sourceThread: {
+          ...sourceThread,
+          branch: "feature/removed-worktree",
+          worktreePath: "/repo/missing-worktree",
+        },
+        gitWorkflow: {
+          listRefs: (input) =>
+            Effect.sync(() => {
+              gitCalls.push(`listRefs:${input.cwd}`);
+              return {
+                refs: [],
+                isRepo: true,
+                hasPrimaryRemote: input.cwd === "/repo/project",
+                nextCursor: null,
+                totalCount: 0,
+              };
+            }),
+          status: (input) =>
+            Effect.sync(() => {
+              gitCalls.push(`status:${input.cwd}`);
+              return {
+                isRepo: true,
+                hasPrimaryRemote: true,
+                isDefaultRef: input.cwd === "/repo/project",
+                refName: input.cwd === "/repo/project" ? "main" : "feature/removed-worktree",
+                hasWorkingTreeChanges: false,
+                workingTree: {
+                  files: [],
+                  insertions: 0,
+                  deletions: 0,
+                },
+                hasUpstream: true,
+                aheadCount: 0,
+                behindCount: 0,
+                aheadOfDefaultCount: 0,
+                pr: null,
+              };
+            }),
+        },
+        vcsDetect: (input) =>
+          Effect.sync(() => {
+            vcsCalls.push(input.cwd);
+            return input.cwd === "/repo/missing-worktree" ? null : makeGitHandle(input.cwd);
+          }),
+      });
+
+      expect(result.isError).toBe(false);
+      const command = commands[0];
+      expect(command?.type).toBe("thread.turn.start");
+      if (command?.type !== "thread.turn.start") return;
+      expect(command.bootstrap?.prepareWorktree).toMatchObject({
+        projectCwd: "/repo/project",
+        baseBranch: "main",
+      });
+      expect(vcsCalls).toEqual(["/repo/missing-worktree"]);
+      expect(gitCalls).toEqual(["listRefs:/repo/project", "status:/repo/project"]);
+    }),
+);
+
 it.effect("falls back to the project checkout when the source worktree is a different repo", () =>
   Effect.gen(function* () {
     const commands: OrchestrationCommand[] = [];

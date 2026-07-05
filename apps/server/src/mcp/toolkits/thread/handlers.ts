@@ -165,10 +165,12 @@ const makeActiveThreadStartRuntime = Effect.fn("ThreadToolkit.makeActiveRuntime"
     sourceThread: OrchestrationThreadShell,
   ) {
     const candidate = resolveThreadWorkspaceCwd({ thread: sourceThread, projects: [project] });
-    if (!candidate || candidate === project.workspaceRoot) return project.workspaceRoot;
+    if (!candidate || candidate === project.workspaceRoot) {
+      return { cwd: project.workspaceRoot, canUseSourceBranch: true };
+    }
     return (yield* sourceCwdIsUsable(project.workspaceRoot, candidate))
-      ? candidate
-      : project.workspaceRoot;
+      ? { cwd: candidate, canUseSourceBranch: true }
+      : { cwd: project.workspaceRoot, canUseSourceBranch: false };
   });
 
   const resolveNewWorktreeBaseBranch = Effect.fn("ThreadToolkit.resolveNewWorktreeBaseBranch")(
@@ -177,13 +179,15 @@ const makeActiveThreadStartRuntime = Effect.fn("ThreadToolkit.makeActiveRuntime"
       project: OrchestrationProjectShell,
       sourceThread: OrchestrationThreadShell,
       sourceCwd: string,
+      canUseSourceBranch: boolean,
     ) {
+      const sourceBranch = canUseSourceBranch ? sourceThread.branch : null;
       if (input.baseBranch) return input.baseBranch;
-      if (input.baseBranchSource === "source" && sourceThread.branch) return sourceThread.branch;
+      if (input.baseBranchSource === "source" && sourceBranch) return sourceBranch;
 
       const defaultBranch = yield* resolveDefaultBranch(sourceCwd);
       if (defaultBranch) return defaultBranch;
-      if (sourceThread.branch) return sourceThread.branch;
+      if (sourceBranch) return sourceBranch;
 
       const currentBranch = yield* resolveCurrentBranch(sourceCwd);
       if (currentBranch) return currentBranch;
@@ -205,6 +209,7 @@ const makeActiveThreadStartRuntime = Effect.fn("ThreadToolkit.makeActiveRuntime"
     input: ThreadStartToolInput,
     sourceThread: OrchestrationThreadShell,
     sourceCwd: string,
+    canUseSourceBranch: boolean,
   ) {
     if (input.branch) return input.branch;
     if (mode === "new_worktree") return yield* makeTemporaryBranchName();
@@ -214,7 +219,9 @@ const makeActiveThreadStartRuntime = Effect.fn("ThreadToolkit.makeActiveRuntime"
       }
       return yield* resolveCurrentBranch(input.worktreePath);
     }
-    return sourceThread.branch ?? (yield* resolveCurrentBranch(sourceCwd));
+    return canUseSourceBranch && sourceThread.branch
+      ? sourceThread.branch
+      : yield* resolveCurrentBranch(sourceCwd);
   });
 
   const loadSourceContext = Effect.fn("ThreadToolkit.loadSourceContext")(function* (
@@ -252,10 +259,13 @@ const makeActiveThreadStartRuntime = Effect.fn("ThreadToolkit.makeActiveRuntime"
   ) {
     const { sourceThread, project } = yield* loadSourceContext(invocation);
     const mode = input.mode ?? "new_worktree";
-    const sourceCwd = yield* resolveSourceCwd(project, sourceThread);
+    const sourceCwdContext = yield* resolveSourceCwd(project, sourceThread);
+    const { cwd: sourceCwd, canUseSourceBranch } = sourceCwdContext;
     const ids = yield* makeIds();
     const createdAt = yield* nowIso;
-    const branch = (yield* resolveInitialBranch(mode, input, sourceThread, sourceCwd)) ?? null;
+    const branch =
+      (yield* resolveInitialBranch(mode, input, sourceThread, sourceCwd, canUseSourceBranch)) ??
+      null;
     const worktreePath: string | null =
       mode === "existing_worktree"
         ? (input.worktreePath ?? null)
@@ -291,6 +301,7 @@ const makeActiveThreadStartRuntime = Effect.fn("ThreadToolkit.makeActiveRuntime"
               project,
               sourceThread,
               sourceCwd,
+              canUseSourceBranch,
             ),
             branch: branch ?? undefined,
           }
