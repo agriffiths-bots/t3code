@@ -2,6 +2,7 @@ import { ShieldCheckIcon, SparklesIcon } from "lucide-react";
 import { memo, useMemo } from "react";
 
 import {
+  buildGenUiFenceSource,
   buildGenUiSrcdoc,
   GENUI_DEFAULT_HEIGHT,
   GENUI_MAX_HEIGHT,
@@ -18,11 +19,22 @@ interface GenUiArtifactProps {
   height?: number;
 }
 
-function GenUiArtifactShell({ children }: { children: React.ReactNode }) {
+function GenUiArtifactShell({
+  children,
+  copySource,
+}: {
+  children: React.ReactNode;
+  // Original ```genui fence, so selecting + copying the message preserves the
+  // source markup (see `data-markdown-copy` in markdown-clipboard.ts) rather
+  // than the empty iframe / chrome text. Omitted for oversized markup so a
+  // runaway payload is never serialized into a DOM attribute.
+  copySource?: string | undefined;
+}) {
   return (
     <div
       className="genui-artifact my-2 overflow-hidden rounded-lg border border-border/60 bg-background"
       data-genui-artifact=""
+      data-markdown-copy={copySource}
     >
       <div className="flex items-center justify-between gap-2 border-b border-border/60 bg-muted/40 px-3 py-1.5">
         <span className="flex items-center gap-1.5 text-xs font-medium text-foreground/80">
@@ -66,10 +78,12 @@ function GenUiArtifact({ html, isStreaming, height }: GenUiArtifactProps) {
     [isStreaming, withinCap, trimmed],
   );
   const clampedHeight = Math.min(height ?? GENUI_DEFAULT_HEIGHT, GENUI_MAX_HEIGHT);
+  // null (oversized) → undefined so no data-markdown-copy attribute is written.
+  const copySource = useMemo(() => buildGenUiFenceSource(html) ?? undefined, [html]);
 
   if (isStreaming) {
     return (
-      <GenUiArtifactShell>
+      <GenUiArtifactShell copySource={copySource}>
         <GenUiArtifactNote>Generating UI…</GenUiArtifactNote>
       </GenUiArtifactShell>
     );
@@ -77,7 +91,7 @@ function GenUiArtifact({ html, isStreaming, height }: GenUiArtifactProps) {
 
   if (trimmed.length === 0) {
     return (
-      <GenUiArtifactShell>
+      <GenUiArtifactShell copySource={copySource}>
         <GenUiArtifactNote>Empty generative UI block.</GenUiArtifactNote>
       </GenUiArtifactShell>
     );
@@ -85,7 +99,7 @@ function GenUiArtifact({ html, isStreaming, height }: GenUiArtifactProps) {
 
   if (!withinCap || srcDoc === null) {
     return (
-      <GenUiArtifactShell>
+      <GenUiArtifactShell copySource={copySource}>
         <GenUiArtifactNote>
           Generated UI is too large to render safely and was not displayed.
         </GenUiArtifactNote>
@@ -94,7 +108,7 @@ function GenUiArtifact({ html, isStreaming, height }: GenUiArtifactProps) {
   }
 
   return (
-    <GenUiArtifactShell>
+    <GenUiArtifactShell copySource={copySource}>
       <iframe
         // SECURITY: fully inert sandbox (empty = every restriction on). Do NOT
         // add `allow-scripts` (enables self-navigation exfil of chat-derived

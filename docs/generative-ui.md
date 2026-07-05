@@ -44,9 +44,11 @@ all defined in `apps/web/src/components/chat/GenUiArtifact.logic.ts`:
    `<iframe>`, `<object>`, `<embed>`, `<base>`, `<link>`, `<form>`, `<a>`,
    `<img>`, every `on*` handler, and unsafe-protocol URLs — while keeping
    structural/text elements plus inline `<style>` and `style`/`class`
-   attributes. This is what makes "no egress" hold: with `<meta refresh>` and
-   anchors gone, an untrusted (possibly chat-derived) payload has no way to
-   navigate itself off-origin, statically or otherwise.
+   attributes. URL-bearing CSS (`url(...)`, `@import`) is additionally scrubbed,
+   so CSS-driven loads are blocked here independently of the CSP. This is what
+   makes "no egress" hold: with `<meta refresh>`, anchors, and URL CSS gone, an
+   untrusted (possibly chat-derived) payload has no way to reach the network or
+   navigate itself off-origin.
 
 2. **Fully inert iframe sandbox** (`sandbox=""` — every restriction on) — no
    `allow-same-origin` (opaque origin: no parent DOM, cookies,

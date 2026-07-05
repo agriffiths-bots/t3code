@@ -21,6 +21,9 @@ describe("GenUiArtifact", () => {
     expect(markup).toContain("Weekly deploys");
     // And the CSP travels with it.
     expect(markup).toContain("Content-Security-Policy");
+    // The original fence source is preserved for clipboard serialization.
+    expect(markup.toLowerCase()).toContain("data-markdown-copy=");
+    expect(markup).toContain("```genui");
   });
 
   it("shows a placeholder and no iframe while streaming", () => {
@@ -29,11 +32,14 @@ describe("GenUiArtifact", () => {
     expect(markup).not.toContain("<iframe");
   });
 
-  it("refuses oversized markup instead of rendering it", () => {
+  it("refuses oversized markup and does not serialize it into the DOM", () => {
     const huge = `<div>${"x".repeat(MAX_GENUI_HTML_BYTES + 1)}</div>`;
     const markup = renderToStaticMarkup(<GenUiArtifact html={huge} isStreaming={false} />);
     expect(markup).toContain("too large");
     expect(markup).not.toContain("<iframe");
+    // The runaway payload must not leak into a data-markdown-copy attribute.
+    expect(markup).not.toContain("data-markdown-copy");
+    expect(markup).not.toContain("xxxxxxxxxx");
   });
 
   it("renders a note for an empty block", () => {

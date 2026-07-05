@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vite-plus/test";
 
 import {
+  buildGenUiFenceSource,
   buildGenUiSrcdoc,
   GENUI_CSP,
   GENUI_SANDBOX,
@@ -81,6 +82,20 @@ describe("sanitizeGenUiHtml (primary defense)", () => {
     expect(styled).toContain('style="height:50%"');
     expect(styled).toContain("bar");
   });
+
+  it("scrubs URL-bearing CSS so styles cannot load resources (independent of CSP)", () => {
+    const el = sanitizeGenUiHtml(
+      "<style>.x{background:url(https://attacker.example/beacon.png)}@import url(https://attacker.example/x.css);</style>",
+    );
+    expect(el).not.toContain("attacker.example");
+    expect(el).not.toContain("@import");
+    const attr = sanitizeGenUiHtml(
+      '<div style="background: url(https://attacker.example/b.png); color: red">x</div>',
+    );
+    expect(attr).not.toContain("attacker.example");
+    // Non-URL styling is untouched.
+    expect(attr).toContain("color: red");
+  });
 });
 
 describe("buildGenUiSrcdoc", () => {
@@ -106,6 +121,25 @@ describe("buildGenUiSrcdoc", () => {
     expect(doc).not.toContain("default-src *");
     // Our policy is the only CSP present, exactly once.
     expect(doc.split("Content-Security-Policy").length - 1).toBe(1);
+  });
+});
+
+describe("buildGenUiFenceSource (clipboard round-trip)", () => {
+  it("wraps small markup in a genui fence terminated by a blank line", () => {
+    expect(buildGenUiFenceSource("<p>hi</p>")).toBe("```genui\n<p>hi</p>\n```\n\n");
+  });
+
+  it("uses a longer fence when the payload contains triple backticks", () => {
+    const source = buildGenUiFenceSource("before ``` after");
+    expect(source).not.toBeNull();
+    // Opening fence must be longer than the 3-backtick run in the content.
+    expect(source!.startsWith("````genui\n")).toBe(true);
+    // Closing fence is followed by a blank line so the next block stays separate.
+    expect(source!.endsWith("\n````\n\n")).toBe(true);
+  });
+
+  it("returns null for oversized markup (never serialized into the DOM)", () => {
+    expect(buildGenUiFenceSource("x".repeat(MAX_GENUI_HTML_BYTES + 1))).toBeNull();
   });
 });
 

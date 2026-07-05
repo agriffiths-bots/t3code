@@ -11,6 +11,7 @@ import {
   WrapTextIcon,
 } from "lucide-react";
 import type { ScopedThreadRef, ServerProviderSkill } from "@t3tools/contracts";
+import type { ClientSettings } from "@t3tools/contracts/settings";
 import {
   isAtomCommandInterrupted,
   squashAtomCommandFailure,
@@ -57,7 +58,7 @@ import { resolveDiffThemeName, type DiffThemeName } from "../lib/diffRendering";
 import { fnv1a32 } from "../lib/diffRendering";
 import { LRUCache } from "../lib/lruCache";
 import { useTheme } from "../hooks/useTheme";
-import { getClientSettings, useClientSettings } from "../hooks/useSettings";
+import { getClientSettings, useClientSettingsSelector } from "../hooks/useSettings";
 import {
   chatMarkdownClipboardPayload,
   serializeTableElementToCsv,
@@ -90,6 +91,10 @@ import {
 // the bundle when a ```genui block is actually rendered — the feature is off
 // by default, so this keeps the chat/markdown bundle unchanged for everyone else.
 const GenUiArtifact = lazy(() => import("./chat/GenUiArtifact"));
+
+// Module-level so the store selector identity is stable across renders.
+const selectGenerativeUiEnabled = (settings: ClientSettings): boolean =>
+  settings.enableGenerativeUi;
 
 class CodeHighlightErrorBoundary extends React.Component<
   { fallback: ReactNode; children: ReactNode },
@@ -1247,7 +1252,9 @@ function ChatMarkdown({
   lineBreaks = false,
 }: ChatMarkdownProps) {
   const { resolvedTheme } = useTheme();
-  const generativeUiEnabled = useClientSettings((settings) => settings.enableGenerativeUi);
+  // Equality-aware: re-renders each message only when this flag actually flips,
+  // not on every unrelated client-settings change.
+  const generativeUiEnabled = useClientSettingsSelector(selectGenerativeUiEnabled);
   const createAssetUrl = useAtomQueryRunner(assetEnvironment.createUrl, {
     reportFailure: false,
   });
@@ -1512,10 +1519,15 @@ function ChatMarkdown({
         // (default), it falls through to the normal code-block rendering so
         // the raw markup is still visible and inert.
         if (generativeUiEnabled && language === GENUI_FENCE_LANGUAGE) {
+          // The error boundary catches a failed lazy chunk fetch (e.g. a stale
+          // hashed chunk after deploy) and falls back to the inert code block,
+          // mirroring the Shiki path; Suspense only covers the pending state.
           return (
-            <Suspense fallback={<pre {...props}>{children}</pre>}>
-              <GenUiArtifact html={codeBlock.code} isStreaming={isStreaming} />
-            </Suspense>
+            <CodeHighlightErrorBoundary fallback={<pre {...props}>{children}</pre>}>
+              <Suspense fallback={<pre {...props}>{children}</pre>}>
+                <GenUiArtifact html={codeBlock.code} isStreaming={isStreaming} />
+              </Suspense>
+            </CodeHighlightErrorBoundary>
           );
         }
         const fenceTitle = extractFenceTitle(extractPreCodeMeta(node));

@@ -19,10 +19,13 @@
  *      `<iframe>`, `<object>`, `<embed>`, `<base>`, `<link>`, `<form>`, `<a>`,
  *      `<img>`, and all `on*` event handlers and unsafe-protocol URLs — while
  *      allowing structural/text elements plus inline `<style>` and `style`/
- *      `class` attributes so charts and diagrams still render. This is what
- *      makes the "no network egress" claim hold: with `<meta refresh>` and
- *      anchors removed, an untrusted (possibly chat-derived) payload has no way
- *      to navigate itself off-origin, even statically.
+ *      `class` attributes so charts and diagrams still render. URL-bearing CSS
+ *      (`url(...)`, `@import`) in those styles is additionally scrubbed
+ *      ({@link scrubCssEgress}), so CSS-driven loads are blocked here too, not
+ *      only by the CSP. This is what makes the "no network egress" claim hold:
+ *      with `<meta refresh>`, anchors, and URL CSS removed, an untrusted
+ *      (possibly chat-derived) payload has no way to reach the network or
+ *      navigate itself off-origin, even statically.
  *
  *   2. A FULLY INERT iframe sandbox ({@link GENUI_SANDBOX} = `""`, i.e. every
  *      restriction on): no `allow-same-origin` (opaque, unique origin — no
@@ -47,6 +50,8 @@
 import { fromHtml } from "hast-util-from-html";
 import { type Schema, defaultSchema, sanitize } from "hast-util-sanitize";
 import { toHtml } from "hast-util-to-html";
+
+import { GENUI_FENCE_LANGUAGE } from "./genUiFence";
 
 /**
  * Hard cap on the model-generated markup we will render, in UTF-8 bytes.
@@ -115,6 +120,22 @@ export function isGenUiHtmlWithinCap(html: string): boolean {
 }
 
 /**
+ * The original ```genui fence for the markup, for clipboard round-tripping via
+ * `data-markdown-copy`. The fence length is chosen longer than any backtick run
+ * in the payload so content containing triple backticks still closes correctly,
+ * and it ends with a blank line (matching `serializeCodeBlock`) so a following
+ * block in the copied markdown is not appended onto the closing fence.
+ * Returns `null` for oversized markup — never serialize a runaway payload into a
+ * DOM attribute (that would defeat {@link isGenUiHtmlWithinCap}).
+ */
+export function buildGenUiFenceSource(html: string): string | null {
+  if (!isGenUiHtmlWithinCap(html)) return null;
+  const longestRun = (html.match(/`+/g) ?? []).reduce((max, run) => Math.max(max, run.length), 0);
+  const fence = "`".repeat(Math.max(3, longestRun + 1));
+  return `${fence}${GENUI_FENCE_LANGUAGE}\n${html}\n${fence}\n\n`;
+}
+
+/**
  * Allowlist for {@link sanitizeGenUiHtml}. Starts from the GitHub-derived
  * {@link defaultSchema} (which already strips `<script>`, `<meta>`, `<iframe>`,
  * `<object>`, `<embed>`, `<base>`, `<link>`, `<form>`, `on*` handlers, and
@@ -125,8 +146,9 @@ export function isGenUiHtmlWithinCap(html: string): boolean {
  *     at all. Removed elements are unwrapped, so their inert text survives.
  *   - ADDS `<style>` plus the `style` and `class` attributes on every element,
  *     so artifacts can actually look like charts. Inline CSS is inert (no
- *     scripting, no navigation); external `url(...)`/`@import` loads are blocked
- *     by {@link GENUI_CSP}.
+ *     scripting, no navigation); URL-bearing CSS is additionally scrubbed by
+ *     {@link scrubCssEgress} so it cannot load a resource even independently of
+ *     {@link GENUI_CSP}.
  */
 export const GENUI_SANITIZE_SCHEMA: Schema = {
   ...defaultSchema,
@@ -143,13 +165,53 @@ export const GENUI_SANITIZE_SCHEMA: Schema = {
 };
 
 /**
+ * Neutralize CSS that could load a resource — `url(...)` (backgrounds, fonts,
+ * cursors) and `@import`. `hast-util-sanitize` does not parse CSS, so without
+ * this the only thing stopping CSS-driven egress would be the meta CSP; this
+ * scrub makes the sanitization layer block it independently (defense in depth).
+ * Best-effort on the common textual forms; the CSP remains the hard enforcer.
+ */
+export function scrubCssEgress(css: string): string {
+  return css.replace(/@import[^;}]*;?/gi, "").replace(/url\s*\([^)]*\)/gi, "none");
+}
+
+type MutableHastNode = {
+  type?: string;
+  tagName?: string;
+  value?: string;
+  properties?: Record<string, unknown>;
+  children?: MutableHastNode[];
+};
+
+/** Walk the sanitized tree and scrub CSS in `<style>` text and `style` attributes. */
+function scrubTreeCssEgress(node: MutableHastNode): void {
+  if (node.type === "element") {
+    const style = node.properties?.style;
+    if (typeof style === "string") {
+      node.properties!.style = scrubCssEgress(style);
+    }
+    if (node.tagName === "style") {
+      for (const child of node.children ?? []) {
+        if (child.type === "text" && typeof child.value === "string") {
+          child.value = scrubCssEgress(child.value);
+        }
+      }
+    }
+  }
+  for (const child of node.children ?? []) {
+    scrubTreeCssEgress(child);
+  }
+}
+
+/**
  * Reduce untrusted model markup to a safe, declarative subset — see
  * {@link GENUI_SANITIZE_SCHEMA}. Pure JS (no DOM): parse HTML fragment → HAST,
- * sanitize against the allowlist, serialize back to HTML.
+ * sanitize against the allowlist, scrub URL-bearing CSS, serialize back to HTML.
  */
 export function sanitizeGenUiHtml(html: string): string {
-  const tree = fromHtml(html, { fragment: true });
-  return toHtml(sanitize(tree, GENUI_SANITIZE_SCHEMA));
+  const tree = sanitize(fromHtml(html, { fragment: true }), GENUI_SANITIZE_SCHEMA);
+  scrubTreeCssEgress(tree as MutableHastNode);
+  return toHtml(tree);
 }
 
 /**
