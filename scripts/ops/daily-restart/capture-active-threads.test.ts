@@ -42,6 +42,18 @@ function makeFixtureDb(dir: string): string {
       updated_at TEXT NOT NULL
     );
 
+    CREATE TABLE projection_thread_messages (
+      message_id TEXT PRIMARY KEY,
+      thread_id TEXT NOT NULL,
+      turn_id TEXT,
+      role TEXT NOT NULL,
+      text TEXT NOT NULL,
+      attachments_json TEXT,
+      is_streaming INTEGER NOT NULL DEFAULT 0,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+
     CREATE TABLE projection_turns (
       thread_id TEXT NOT NULL,
       turn_id TEXT,
@@ -78,8 +90,24 @@ function makeFixtureDb(dir: string): string {
     readonly [string, string, string | null, string | null, string, string | null]
   > = [
     ["active-turn", "Active Turn", null, null, "running", "turn-1"],
+    ["pending-no-session", "Pending No Session", null, null, "ready", null],
     ["running-no-turn", "Running No Turn", null, null, "running", null],
     ["starting-no-turn", "Starting No Turn", null, null, "starting", null],
+    ["ready-pending-turn", "Ready Pending Turn", null, null, "ready", null],
+    ["ready-stale-pending-turn", "Ready Stale Pending Turn", null, null, "ready", null],
+    ["terminal-equal-pending-turn", "Terminal Equal Pending Turn", null, null, "error", null],
+    ["terminal-fresh-pending-turn", "Terminal Fresh Pending Turn", null, null, "error", null],
+    ["stopped-running-turn", "Stopped Running Turn", null, null, "stopped", null],
+    ["stopped-completed-turn", "Stopped Completed Turn", null, null, "stopped", null],
+    ["ready-running-projection", "Ready Running Projection", null, null, "ready", null],
+    [
+      "terminal-stale-active-pending-turn",
+      "Terminal Stale Active Pending Turn",
+      null,
+      null,
+      "error",
+      "turn-stale",
+    ],
     ["waiting", "Waiting Parent", null, null, "waiting", null],
     ["idle", "Idle Thread", null, null, "ready", null],
     ["errored-stale", "Errored Stale", null, null, "error", "turn-error"],
@@ -90,6 +118,7 @@ function makeFixtureDb(dir: string): string {
   for (const row of rows) {
     insertThread(db, ...row);
   }
+  db.prepare("DELETE FROM projection_thread_sessions WHERE thread_id = 'pending-no-session'").run();
 
   db.close();
   return dbPath;
@@ -123,6 +152,15 @@ function insertThread(
     archivedAt,
   );
 
+  const sessionUpdatedAt =
+    threadId === "ready-stale-pending-turn"
+      ? "2026-07-03T00:00:02.000Z"
+      : threadId === "starting-no-turn"
+        ? "2026-07-03T00:00:02.000Z"
+        : threadId === "terminal-equal-pending-turn"
+          ? "2026-07-03T00:00:01.000Z"
+          : "2026-07-03T00:00:00.000Z";
+
   db.prepare(`
     INSERT INTO projection_thread_sessions (
       thread_id,
@@ -130,17 +168,60 @@ function insertThread(
       active_turn_id,
       runtime_mode,
       updated_at
-    ) VALUES (?, ?, ?, ?, '2026-07-03T00:00:00.000Z')
+    ) VALUES (?, ?, ?, ?, ?)
   `).run(
     threadId,
     status,
     activeTurnId,
     threadId === "active-turn" ? "approval-required" : "full-access",
+    sessionUpdatedAt,
   );
 
-  if (threadId === "active-turn" || threadId === "starting-no-turn") {
+  if (
+    threadId === "active-turn" ||
+    threadId === "pending-no-session" ||
+    threadId === "starting-no-turn" ||
+    threadId === "ready-pending-turn" ||
+    threadId === "ready-stale-pending-turn" ||
+    threadId === "terminal-equal-pending-turn" ||
+    threadId === "terminal-fresh-pending-turn" ||
+    threadId === "terminal-stale-active-pending-turn" ||
+    threadId === "stopped-running-turn" ||
+    threadId === "stopped-completed-turn" ||
+    threadId === "ready-running-projection"
+  ) {
     const pendingMessageId =
-      threadId === "active-turn" ? "message-active-turn" : "message-starting-turn";
+      threadId === "active-turn" ? "message-active-turn" : `message-${threadId}`;
+    const pendingMessageAttachments =
+      threadId === "ready-pending-turn"
+        ? [
+            {
+              type: "image",
+              id: "ready-pending-turn-image",
+              name: "ready.png",
+              mimeType: "image/png",
+              sizeBytes: 120,
+            },
+          ]
+        : [];
+    db.prepare(`
+      INSERT INTO projection_thread_messages (
+        message_id,
+        thread_id,
+        turn_id,
+        role,
+        text,
+        attachments_json,
+        is_streaming,
+        created_at,
+        updated_at
+      ) VALUES (?, ?, NULL, 'user', ?, ?, 0, '2026-07-03T00:00:01.000Z', '2026-07-03T00:00:01.000Z')
+    `).run(
+      pendingMessageId,
+      threadId,
+      `Pending prompt for ${threadId}`,
+      JSON.stringify(pendingMessageAttachments),
+    );
     db.prepare(`
       INSERT INTO projection_turns (
         thread_id,
@@ -152,13 +233,44 @@ function insertThread(
       ) VALUES (?, ?, ?, ?, '2026-07-03T00:00:01.000Z', '[]')
     `).run(
       threadId,
-      activeTurnId,
+      threadId === "active-turn"
+        ? activeTurnId
+        : threadId === "stopped-running-turn"
+          ? "turn-stopped-running"
+          : threadId === "stopped-completed-turn"
+            ? "turn-stopped-completed"
+            : threadId === "ready-running-projection"
+              ? "turn-ready-running"
+              : null,
       pendingMessageId,
-      threadId === "active-turn" ? "running" : "pending",
+      threadId === "active-turn" ||
+        threadId === "stopped-running-turn" ||
+        threadId === "ready-running-projection"
+        ? "running"
+        : threadId === "stopped-completed-turn"
+          ? "completed"
+          : "pending",
     );
 
+    if (threadId === "terminal-stale-active-pending-turn") {
+      db.prepare(`
+        INSERT INTO projection_turns (
+          thread_id,
+          turn_id,
+          pending_message_id,
+          state,
+          requested_at,
+          checkpoint_files_json
+        ) VALUES (?, ?, 'message-stale-active-turn', 'error', '2026-07-03T00:00:00.000Z', '[]')
+	      `).run(threadId, activeTurnId);
+    }
+
+    const usesApprovalRuntime =
+      threadId === "pending-no-session" ||
+      threadId === "ready-pending-turn" ||
+      threadId === "starting-no-turn";
     db.prepare(`
-      INSERT INTO orchestration_events (
+	      INSERT INTO orchestration_events (
         event_id,
         aggregate_kind,
         stream_id,
@@ -175,10 +287,55 @@ function insertThread(
       JSON.stringify({
         threadId,
         messageId: pendingMessageId,
+        ...(threadId === "active-turn" ? { runtimeMode: "full-access" } : {}),
+        ...(threadId === "ready-pending-turn"
+          ? {
+              modelSelection: { provider: "codex", model: "gpt-5.4" },
+              titleSeed: "Investigate capture",
+              sourceProposedPlan: {
+                threadId: "source-plan-thread",
+                planId: "plan-1",
+              },
+            }
+          : {}),
+        ...(usesApprovalRuntime ? { runtimeMode: "approval-required" } : {}),
         interactionMode: "plan",
       }),
     );
   }
+}
+
+function expectedPendingMessage(threadId: string): {
+  readonly message_id: string;
+  readonly text: string;
+  readonly attachments: ReadonlyArray<unknown>;
+} {
+  return {
+    message_id: `message-${threadId}`,
+    text: `Pending prompt for ${threadId}`,
+    attachments:
+      threadId === "ready-pending-turn"
+        ? [
+            {
+              type: "image",
+              id: "ready-pending-turn-image",
+              name: "ready.png",
+              mimeType: "image/png",
+              sizeBytes: 120,
+            },
+          ]
+        : [],
+    ...(threadId === "ready-pending-turn"
+      ? {
+          model_selection: { provider: "codex", model: "gpt-5.4" },
+          title_seed: "Investigate capture",
+          source_proposed_plan: {
+            threadId: "source-plan-thread",
+            planId: "plan-1",
+          },
+        }
+      : {}),
+  };
 }
 
 function readManifest(outPath: string): CaptureManifest {
@@ -186,7 +343,7 @@ function readManifest(outPath: string): CaptureManifest {
 }
 
 describe("capture-active-threads", () => {
-  it("captures active and waiting sessions while skipping idle, deleted, archived, and excluded threads", () => {
+  it("captures active sessions, pending turn starts, and waiting sessions while skipping idle, deleted, archived, and excluded threads", () => {
     const tempDir = makeTempDir();
     const dbPath = makeFixtureDb(tempDir);
     const outPath = NodePath.join(tempDir, "nested", "resume-manifest.json");
@@ -223,6 +380,30 @@ describe("capture-active-threads", () => {
           injected_at: null,
         },
         {
+          thread_id: "pending-no-session",
+          role: "active",
+          status: "ready",
+          active_turn_id: null,
+          runtime_mode: "approval-required",
+          interaction_mode: "plan",
+          title: "Pending No Session",
+          project_id: "project-1",
+          pending_message: expectedPendingMessage("pending-no-session"),
+          injected_at: null,
+        },
+        {
+          thread_id: "ready-pending-turn",
+          role: "active",
+          status: "ready",
+          active_turn_id: null,
+          runtime_mode: "approval-required",
+          interaction_mode: "plan",
+          title: "Ready Pending Turn",
+          project_id: "project-1",
+          pending_message: expectedPendingMessage("ready-pending-turn"),
+          injected_at: null,
+        },
+        {
           thread_id: "running-no-turn",
           role: "active",
           status: "running",
@@ -238,10 +419,46 @@ describe("capture-active-threads", () => {
           role: "active",
           status: "starting",
           active_turn_id: null,
-          runtime_mode: "full-access",
+          runtime_mode: "approval-required",
           interaction_mode: "plan",
           title: "Starting No Turn",
           project_id: "project-1",
+          pending_message: expectedPendingMessage("starting-no-turn"),
+          injected_at: null,
+        },
+        {
+          thread_id: "stopped-running-turn",
+          role: "active",
+          status: "stopped",
+          active_turn_id: "turn-stopped-running",
+          runtime_mode: "full-access",
+          interaction_mode: "plan",
+          title: "Stopped Running Turn",
+          project_id: "project-1",
+          injected_at: null,
+        },
+        {
+          thread_id: "terminal-fresh-pending-turn",
+          role: "active",
+          status: "error",
+          active_turn_id: null,
+          runtime_mode: "full-access",
+          interaction_mode: "plan",
+          title: "Terminal Fresh Pending Turn",
+          project_id: "project-1",
+          pending_message: expectedPendingMessage("terminal-fresh-pending-turn"),
+          injected_at: null,
+        },
+        {
+          thread_id: "terminal-stale-active-pending-turn",
+          role: "active",
+          status: "error",
+          active_turn_id: "turn-stale",
+          runtime_mode: "full-access",
+          interaction_mode: "plan",
+          title: "Terminal Stale Active Pending Turn",
+          project_id: "project-1",
+          pending_message: expectedPendingMessage("terminal-stale-active-pending-turn"),
           injected_at: null,
         },
         {
@@ -280,9 +497,19 @@ describe("capture-active-threads", () => {
           "--exclude",
           "active-turn",
           "--exclude",
+          "pending-no-session",
+          "--exclude",
           "running-no-turn",
           "--exclude",
           "starting-no-turn",
+          "--exclude",
+          "ready-pending-turn",
+          "--exclude",
+          "terminal-fresh-pending-turn",
+          "--exclude",
+          "stopped-running-turn",
+          "--exclude",
+          "terminal-stale-active-pending-turn",
           "--exclude",
           "waiting",
           "--exclude",
@@ -297,6 +524,57 @@ describe("capture-active-threads", () => {
     } finally {
       NodeProcess.stdout.write = originalStdoutWrite;
     }
+  });
+
+  it("deduplicates replayed turn-start events with the same message id", () => {
+    const tempDir = makeTempDir();
+    const dbPath = makeFixtureDb(tempDir);
+    const db = new NodeSqlite.DatabaseSync(dbPath);
+    try {
+      db.prepare(`
+        INSERT INTO orchestration_events (
+          event_id,
+          aggregate_kind,
+          stream_id,
+          stream_version,
+          event_type,
+          occurred_at,
+          actor_kind,
+          payload_json,
+          metadata_json
+        ) VALUES ('event-active-turn-replayed', 'thread', 'active-turn', 2, 'thread.turn-start-requested', '2026-07-03T00:00:02.000Z', 'system', ?, '{}')
+      `).run(
+        JSON.stringify({
+          threadId: "active-turn",
+          messageId: "message-active-turn",
+          runtimeMode: "full-access",
+          interactionMode: "default",
+        }),
+      );
+    } finally {
+      db.close();
+    }
+
+    const manifest = captureActiveThreads({
+      dbPath,
+      outPath: NodePath.join(tempDir, "resume-manifest.json"),
+      // @effect-diagnostics-next-line globalDate:off - deterministic fixture timestamp.
+      capturedAt: new Date("2026-07-03T21:00:00.000Z"),
+    });
+    const activeTurnRows = manifest.threads.filter((thread) => thread.thread_id === "active-turn");
+
+    assert.equal(activeTurnRows.length, 1);
+    assert.deepStrictEqual(activeTurnRows[0], {
+      thread_id: "active-turn",
+      role: "active",
+      status: "running",
+      active_turn_id: "turn-1",
+      runtime_mode: "approval-required",
+      interaction_mode: "default",
+      title: "Active Turn",
+      project_id: "project-1",
+      injected_at: null,
+    });
   });
 
   it("opens the SQLite database with mode=ro and query_only enabled", () => {

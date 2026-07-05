@@ -104,9 +104,14 @@ SH
   cat >"$dir/capture-active-threads" <<'SH'
 #!/usr/bin/env bash
 echo "capture $*" >>"$T_LOG"
+count_file="$T_TMP/capture-count"
+count=0
+[[ -f "$count_file" ]] && count="$(cat "$count_file")"
+count=$((count + 1))
+echo "$count" >"$count_file"
 while [[ $# -gt 0 ]]; do
   if [[ "$1" == "--out" ]]; then
-    if [[ "${FAKE_CAPTURE_BAD_JSON:-0}" == "1" ]]; then
+    if [[ "${FAKE_CAPTURE_BAD_JSON:-0}" == "1" || ( -n "${FAKE_CAPTURE_BAD_JSON_N:-}" && "$count" == "$FAKE_CAPTURE_BAD_JSON_N" ) ]]; then
       printf '{bad json\n' >"$2"
     else
       printf '{"threads":[]}\n' >"$2"
@@ -198,8 +203,8 @@ assert_order() {
 tmp="$(mktemp -d)"
 run_manager "$tmp"
 [[ "$(cat "$tmp/rc")" == "0" ]] && pass "happy path exits zero" || fail "happy path exits zero"
-assert_order "$tmp/calls.log" "git -C" "snapshot" "capture" "systemctl --user stop" "snapshot" "git -C" "pnpm -C" "systemctl --user start" "health" "inject"
-assert_order "$tmp/calls.log" "snapshot --db" "capture --db" "systemctl --user stop" "snapshot --db"
+assert_order "$tmp/calls.log" "git -C" "snapshot" "capture" "systemctl --user stop" "capture" "snapshot" "git -C" "pnpm -C" "systemctl --user start" "health" "inject"
+assert_order "$tmp/calls.log" "snapshot --db" "capture --db" "systemctl --user stop" "capture --db" "snapshot --db"
 assert_order "$tmp/calls.log" "git -C" "pnpm -C $tmp/checkout/apps/web run build" "pnpm -C $tmp/checkout run build:desktop"
 if awk 'f && /pnpm/ { found=1 } /health/ { f=1 } END { exit found ? 0 : 1 }' "$tmp/calls.log"; then
   fail "happy path built after health"
@@ -251,7 +256,7 @@ export FAKE_SYSTEMCTL_HANG_STOP_N=1
 run_manager "$tmp"
 unset FAKE_SYSTEMCTL_HANG_STOP_N
 [[ "$(cat "$tmp/rc")" == "0" ]] && pass "hung shutdown stop escalates and proceeds" || fail "hung shutdown stop escalates and proceeds"
-assert_order "$tmp/calls.log" "systemctl --user stop fake.service" "systemctl --user kill fake.service" "systemctl --user is-active fake.service" "snapshot --db" "git -C $tmp/checkout merge --ff-only"
+assert_order "$tmp/calls.log" "systemctl --user stop fake.service" "systemctl --user kill fake.service" "systemctl --user is-active fake.service" "capture --db" "snapshot --db" "git -C $tmp/checkout merge --ff-only"
 grep -Fq "RESULT OK" "$tmp/ledger/"*/t3-daily-restart.result && pass "hung shutdown stop records ok after escalation" || fail "hung shutdown stop records ok after escalation"
 
 tmp="$(mktemp -d)"
@@ -351,6 +356,14 @@ unset FAKE_CAPTURE_BAD_JSON
 if grep -Fq "systemctl --user stop" "$tmp/calls.log"; then fail "bad manifest stopped service"; else pass "bad manifest aborts before stop"; fi
 
 tmp="$(mktemp -d)"
+export FAKE_CAPTURE_BAD_JSON_N=2
+run_manager "$tmp"
+unset FAKE_CAPTURE_BAD_JSON_N
+[[ "$(cat "$tmp/rc")" != "0" ]] && pass "post-stop bad manifest exits nonzero" || fail "post-stop bad manifest exits nonzero"
+assert_order "$tmp/calls.log" "systemctl --user stop fake.service" "capture --db" "systemctl --user start fake.service" "inject"
+grep -Fq "inject --origin http://127.0.0.1:1 --manifest $tmp/ledger/" "$tmp/calls.log" && pass "post-stop bad manifest injects pre-stop capture" || fail "post-stop bad manifest injects pre-stop capture"
+
+tmp="$(mktemp -d)"
 export FAKE_HEALTH_PARTIAL=1
 run_manager "$tmp"
 unset FAKE_HEALTH_PARTIAL
@@ -424,7 +437,7 @@ run_manager "$tmp" --prebuilt-target \
   --target-sha bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
 unset FAKE_SNAPSHOT_FAIL_N
 [[ "$(cat "$tmp/rc")" != "0" ]] && pass "prebuilt quiesced snapshot failure exits nonzero" || fail "prebuilt quiesced snapshot failure exits nonzero"
-assert_order "$tmp/calls.log" "systemctl --user stop fake.service" "snapshot --db" "systemctl --user start fake.service" "inject"
+assert_order "$tmp/calls.log" "systemctl --user stop fake.service" "capture --db" "snapshot --db" "systemctl --user start fake.service" "inject"
 if grep -Fq "git -C $tmp/checkout checkout aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" "$tmp/calls.log" || grep -Fq "pnpm -C $tmp/checkout/apps/web run build" "$tmp/calls.log"; then
   fail "prebuilt snapshot failure ran code rollback before update"
 else
