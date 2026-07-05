@@ -715,6 +715,69 @@ it.effect("falls back when source worktree detection fails because the cwd is mi
   }),
 );
 
+it.effect("keeps source package cwd when only the project checkout validation fails", () =>
+  Effect.gen(function* () {
+    const commands: OrchestrationCommand[] = [];
+    const vcsCalls: string[] = [];
+    const projectMissingCause = PlatformError.systemError({
+      _tag: "NotFound",
+      module: "ChildProcess",
+      method: "spawn",
+      syscall: "chdir",
+      pathOrDescriptor: "/repo/packages/app",
+      cause: Object.assign(new Error("spawn ENOENT"), { code: "ENOENT" }),
+    });
+    const result = yield* callStartTool(
+      { prompt: "Continue from valid source package", baseBranch: "main" },
+      commands,
+      {
+        project: {
+          ...project,
+          workspaceRoot: "/repo/packages/app",
+        },
+        sourceThread: {
+          ...sourceThread,
+          worktreePath: "/repo/worktree/packages/app",
+        },
+        vcsDetect: (input) =>
+          Effect.sync(() => {
+            vcsCalls.push(input.cwd);
+            return input.cwd;
+          }).pipe(
+            Effect.flatMap((cwd) =>
+              cwd === "/repo/packages/app"
+                ? Effect.fail(
+                    new VcsProcessSpawnError({
+                      operation: "VcsDriverRegistry.detect",
+                      command: "git",
+                      cwd,
+                      cause: projectMissingCause,
+                    }),
+                  )
+                : Effect.succeed(
+                    makeGitHandle(cwd, {
+                      rootPath: "/repo/worktree",
+                      metadataPath: "/repo/.git",
+                    }),
+                  ),
+            ),
+          ),
+      },
+    );
+
+    expect(result.isError).toBe(false);
+    const command = commands[0];
+    expect(command?.type).toBe("thread.turn.start");
+    if (command?.type !== "thread.turn.start") return;
+    expect(command.bootstrap?.prepareWorktree).toMatchObject({
+      projectCwd: "/repo/worktree/packages/app",
+      baseBranch: "main",
+      workspaceRelativePath: "packages/app",
+    });
+    expect(vcsCalls).toEqual(["/repo/worktree/packages/app", "/repo/packages/app"]);
+  }),
+);
+
 it.effect("resolves current-checkout branch from the project checkout after source fallback", () =>
   Effect.gen(function* () {
     const commands: OrchestrationCommand[] = [];

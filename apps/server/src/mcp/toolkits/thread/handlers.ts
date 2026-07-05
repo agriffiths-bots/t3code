@@ -190,7 +190,20 @@ const makeActiveThreadStartRuntime = Effect.fn("ThreadToolkit.makeActiveRuntime"
       candidate,
     );
 
-    const projectHandle = yield* vcsDriverRegistry.detect({ cwd: projectRoot });
+    const projectDetection = yield* vcsDriverRegistry.detect({ cwd: projectRoot }).pipe(
+      Effect.matchEffect({
+        onFailure: () => Effect.succeed({ _tag: "failure" as const }),
+        onSuccess: (handle) => Effect.succeed({ _tag: "success" as const, handle }),
+      }),
+    );
+    if (projectDetection._tag === "failure") {
+      return {
+        belongsToProject: true,
+        workspaceRelativePath,
+      } satisfies SourceCwdProjectMatch;
+    }
+
+    const projectHandle = projectDetection.handle;
     if (!projectHandle) {
       return {
         belongsToProject: isPathWithin(projectRoot, candidateHandle.repository.rootPath),
