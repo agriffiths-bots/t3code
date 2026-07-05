@@ -17,6 +17,7 @@ export interface CaptureActiveThreadsOptions {
   readonly excludedThreadIds?: ReadonlyArray<string>;
   readonly stoppedSince?: string | null;
   readonly pendingSince?: string | null;
+  readonly includedPendingMessageIds?: ReadonlyArray<string>;
   readonly capturedAt?: Date;
   readonly openDatabase?: (dbPath: string) => CaptureDatabase;
 }
@@ -49,6 +50,8 @@ export interface CapturedPendingMessage {
   readonly role: "user" | "system";
   readonly text: string;
   readonly attachments: ReadonlyArray<unknown>;
+  readonly runtime_mode?: string;
+  readonly interaction_mode?: string;
   readonly model_selection?: unknown;
   readonly title_seed?: string;
   readonly source_proposed_plan?: unknown;
@@ -75,6 +78,8 @@ interface SessionRow {
   readonly pending_message_role: string | null;
   readonly pending_message_text: string | null;
   readonly pending_message_attachments_json: string | null;
+  readonly pending_runtime_mode: string | null;
+  readonly pending_interaction_mode: string | null;
   readonly pending_model_selection_json: string | null;
   readonly pending_title_seed: string | null;
   readonly pending_source_proposed_plan_json: string | null;
@@ -86,6 +91,7 @@ interface ParsedArgs {
   readonly excludedThreadIds: ReadonlyArray<string>;
   readonly stoppedSince: string | null;
   readonly pendingSince: string | null;
+  readonly includedPendingMessageIds: ReadonlyArray<string>;
 }
 
 function dbFileUri(dbPath: string): string {
@@ -108,11 +114,24 @@ function roleForRow(row: SessionRow): CapturedThread["role"] {
     : "waiting";
 }
 
-function buildCaptureQuery(excludedThreadIds: ReadonlyArray<string>) {
+function buildCaptureQuery(
+  excludedThreadIds: ReadonlyArray<string>,
+  includedPendingMessageIds: ReadonlyArray<string>,
+) {
   const excludedClause =
     excludedThreadIds.length > 0
       ? `AND threads.thread_id NOT IN (${excludedThreadIds.map(() => "?").join(", ")})`
       : "";
+  const includedPendingMessageClause =
+    includedPendingMessageIds.length > 0
+      ? "OR pending_turns.pending_message_id IN (SELECT message_id FROM included_pending_messages)"
+      : "";
+  const includedPendingMessagesCte =
+    includedPendingMessageIds.length > 0
+      ? `included_pending_messages(message_id) AS (VALUES ${includedPendingMessageIds
+          .map(() => "(?)")
+          .join(", ")})`
+      : "included_pending_messages(message_id) AS (SELECT NULL WHERE 0)";
   const stoppedDuringCapturePredicate = `(
           capture_options.stopped_since IS NOT NULL
           AND sessions.status = 'stopped'
@@ -121,7 +140,18 @@ function buildCaptureQuery(excludedThreadIds: ReadonlyArray<string>) {
   const stoppedPendingDuringCapturePredicate = `(
           capture_options.pending_since IS NOT NULL
           AND ${stoppedDuringCapturePredicate}
-          AND pending_turns.requested_at >= capture_options.pending_since
+          AND (
+            pending_turns.requested_at >= capture_options.pending_since
+            ${includedPendingMessageClause}
+          )
+        )`;
+  const effectiveActiveTurnId = "COALESCE(sessions.active_turn_id, resumable_turns.turn_id)";
+  const activeCapturePredicate = `(
+          (
+            sessions.active_turn_id IS NOT NULL
+            AND sessions.status NOT IN ('error', 'interrupted', 'stopped')
+          )
+          OR resumable_turns.turn_id IS NOT NULL
         )`;
   const livePendingPredicate = `(
           pending_turns.thread_id IS NOT NULL
@@ -135,40 +165,55 @@ function buildCaptureQuery(excludedThreadIds: ReadonlyArray<string>) {
             OR sessions.status = 'starting'
             OR (
               sessions.status NOT IN ('error', 'interrupted', 'stopped')
+              AND ${activeCapturePredicate}
+            )
+            OR (
+              sessions.status NOT IN ('error', 'interrupted', 'stopped')
               AND pending_turns.requested_at >= sessions.updated_at
             )
           )
         )`;
-  const effectiveActiveTurnId = "COALESCE(sessions.active_turn_id, resumable_turns.turn_id)";
-  const activeCapturePredicate = `(
-          (
-            sessions.active_turn_id IS NOT NULL
-            AND sessions.status NOT IN ('error', 'interrupted', 'stopped')
-          )
-          OR resumable_turns.turn_id IS NOT NULL
-        )`;
 
   return `
-    WITH capture_options(stopped_since, pending_since) AS (VALUES (?, ?))
+    WITH
+      capture_options(stopped_since, pending_since) AS (VALUES (?, ?)),
+      ${includedPendingMessagesCte}
     SELECT
       threads.thread_id,
       COALESCE(sessions.status, 'ready') AS status,
-      ${effectiveActiveTurnId} AS active_turn_id,
+      CASE
+        WHEN ${activeCapturePredicate} THEN ${effectiveActiveTurnId}
+        ELSE NULL
+      END AS active_turn_id,
       CASE
         WHEN ${livePendingPredicate} THEN pending_turns.thread_id
         ELSE NULL
       END AS pending_turn_thread_id,
       COALESCE(
         CASE
-          WHEN ${livePendingPredicate}
-            THEN json_extract(turn_start_events.payload_json, '$.runtimeMode')
+          WHEN NOT (${activeCapturePredicate}) AND ${livePendingPredicate}
+            THEN json_extract(pending_turn_start_events.payload_json, '$.runtimeMode')
           ELSE NULL
         END,
         sessions.runtime_mode,
+        CASE
+          WHEN ${activeCapturePredicate}
+            THEN json_extract(active_turn_start_events.payload_json, '$.runtimeMode')
+          ELSE NULL
+        END,
         threads.runtime_mode
       ) AS runtime_mode,
       COALESCE(
-        json_extract(turn_start_events.payload_json, '$.interactionMode'),
+        CASE
+          WHEN ${activeCapturePredicate}
+            THEN json_extract(active_turn_start_events.payload_json, '$.interactionMode')
+          ELSE NULL
+        END,
+        CASE
+          WHEN NOT (${activeCapturePredicate}) AND ${livePendingPredicate}
+            THEN json_extract(pending_turn_start_events.payload_json, '$.interactionMode')
+          ELSE NULL
+        END,
         threads.interaction_mode
       ) AS interaction_mode,
       threads.title,
@@ -190,15 +235,31 @@ function buildCaptureQuery(excludedThreadIds: ReadonlyArray<string>) {
         ELSE NULL
       END AS pending_message_attachments_json,
       CASE
-        WHEN ${livePendingPredicate} THEN json_extract(turn_start_events.payload_json, '$.modelSelection')
+        WHEN ${activeCapturePredicate} AND ${livePendingPredicate}
+          THEN COALESCE(
+            json_extract(pending_turn_start_events.payload_json, '$.runtimeMode'),
+            threads.runtime_mode
+          )
+        ELSE NULL
+      END AS pending_runtime_mode,
+      CASE
+        WHEN ${activeCapturePredicate} AND ${livePendingPredicate}
+          THEN COALESCE(
+            json_extract(pending_turn_start_events.payload_json, '$.interactionMode'),
+            threads.interaction_mode
+          )
+        ELSE NULL
+      END AS pending_interaction_mode,
+      CASE
+        WHEN ${livePendingPredicate} THEN json_extract(pending_turn_start_events.payload_json, '$.modelSelection')
         ELSE NULL
       END AS pending_model_selection_json,
       CASE
-        WHEN ${livePendingPredicate} THEN json_extract(turn_start_events.payload_json, '$.titleSeed')
+        WHEN ${livePendingPredicate} THEN json_extract(pending_turn_start_events.payload_json, '$.titleSeed')
         ELSE NULL
       END AS pending_title_seed,
       CASE
-        WHEN ${livePendingPredicate} THEN json_extract(turn_start_events.payload_json, '$.sourceProposedPlan')
+        WHEN ${livePendingPredicate} THEN json_extract(pending_turn_start_events.payload_json, '$.sourceProposedPlan')
         ELSE NULL
       END AS pending_source_proposed_plan_json
     FROM projection_threads threads
@@ -213,7 +274,13 @@ function buildCaptureQuery(excludedThreadIds: ReadonlyArray<string>) {
         WHERE candidate_resumable_turns.thread_id = threads.thread_id
           AND candidate_resumable_turns.turn_id IS NOT NULL
           AND (
-            candidate_resumable_turns.state = 'running'
+            (
+              candidate_resumable_turns.state = 'running'
+              AND (
+                sessions.status <> 'stopped'
+                OR ${stoppedDuringCapturePredicate}
+              )
+            )
             OR (
               ${stoppedDuringCapturePredicate}
               AND candidate_resumable_turns.state = 'interrupted'
@@ -232,30 +299,27 @@ function buildCaptureQuery(excludedThreadIds: ReadonlyArray<string>) {
       AND active_turns.turn_id = ${effectiveActiveTurnId}
     LEFT JOIN projection_turns pending_turns
       ON pending_turns.thread_id = threads.thread_id
-      AND (
-        sessions.active_turn_id IS NULL
-        OR sessions.status IN ('error', 'interrupted', 'stopped')
-      )
       AND pending_turns.turn_id IS NULL
       AND pending_turns.state = 'pending'
-    LEFT JOIN orchestration_events turn_start_events
-      ON turn_start_events.sequence = (
+    LEFT JOIN orchestration_events active_turn_start_events
+      ON active_turn_start_events.sequence = (
         SELECT candidate_turn_start_events.sequence
         FROM orchestration_events candidate_turn_start_events
         WHERE candidate_turn_start_events.stream_id = threads.thread_id
           AND candidate_turn_start_events.event_type = 'thread.turn-start-requested'
           AND json_extract(candidate_turn_start_events.payload_json, '$.messageId') =
-            COALESCE(
-              CASE
-                WHEN (
-                  sessions.status NOT IN ('error', 'interrupted', 'stopped')
-                  OR resumable_turns.turn_id IS NOT NULL
-                )
-                  THEN active_turns.pending_message_id
-                ELSE NULL
-              END,
-              CASE WHEN ${livePendingPredicate} THEN pending_turns.pending_message_id ELSE NULL END
-            )
+            active_turns.pending_message_id
+        ORDER BY candidate_turn_start_events.sequence DESC
+        LIMIT 1
+      )
+    LEFT JOIN orchestration_events pending_turn_start_events
+      ON pending_turn_start_events.sequence = (
+        SELECT candidate_turn_start_events.sequence
+        FROM orchestration_events candidate_turn_start_events
+        WHERE candidate_turn_start_events.stream_id = threads.thread_id
+          AND candidate_turn_start_events.event_type = 'thread.turn-start-requested'
+          AND json_extract(candidate_turn_start_events.payload_json, '$.messageId') =
+            pending_turns.pending_message_id
         ORDER BY candidate_turn_start_events.sequence DESC
         LIMIT 1
       )
@@ -336,6 +400,10 @@ function pendingMessageForRow(row: SessionRow): CapturedPendingMessage | undefin
       row.thread_id,
       row.pending_message_attachments_json,
     ),
+    ...(row.pending_runtime_mode !== null ? { runtime_mode: row.pending_runtime_mode } : {}),
+    ...(row.pending_interaction_mode !== null
+      ? { interaction_mode: row.pending_interaction_mode }
+      : {}),
     ...(modelSelection !== undefined ? { model_selection: modelSelection } : {}),
     ...(row.pending_title_seed !== null ? { title_seed: row.pending_title_seed } : {}),
     ...(sourceProposedPlan !== undefined ? { source_proposed_plan: sourceProposedPlan } : {}),
@@ -347,10 +415,16 @@ function readCapturedThreads(
   excludedThreadIds: ReadonlyArray<string>,
   stoppedSince: string | null,
   pendingSince: string | null,
+  includedPendingMessageIds: ReadonlyArray<string>,
 ): ReadonlyArray<CapturedThread> {
   const rows = db
-    .prepare(buildCaptureQuery(excludedThreadIds))
-    .all(stoppedSince, pendingSince, ...excludedThreadIds) as unknown as ReadonlyArray<SessionRow>;
+    .prepare(buildCaptureQuery(excludedThreadIds, includedPendingMessageIds))
+    .all(
+      stoppedSince,
+      pendingSince,
+      ...includedPendingMessageIds,
+      ...excludedThreadIds,
+    ) as unknown as ReadonlyArray<SessionRow>;
 
   return rows.map((row) => {
     const pendingMessage = pendingMessageForRow(row);
@@ -401,6 +475,7 @@ export function captureActiveThreads(options: CaptureActiveThreadsOptions): Capt
       options.excludedThreadIds ?? [],
       options.stoppedSince ?? null,
       options.pendingSince ?? null,
+      options.includedPendingMessageIds ?? [],
     );
     const manifest = {
       version: 1,
@@ -435,6 +510,7 @@ export function parseArgs(
   let stoppedSince: string | null = null;
   let pendingSince: string | null = null;
   const excludedThreadIds: Array<string> = [];
+  const includedPendingMessageIds: Array<string> = [];
 
   for (let index = 0; index < args.length; index += 1) {
     const arg = args[index];
@@ -459,10 +535,14 @@ export function parseArgs(
         pendingSince = requireValue(args, index, arg);
         index += 1;
         break;
+      case "--include-pending-message-id":
+        includedPendingMessageIds.push(requireValue(args, index, arg));
+        index += 1;
+        break;
       case "--help":
       case "-h":
         throw new Error(
-          "Usage: capture-active-threads --db PATH --out FILE [--exclude THREAD_ID]... [--stopped-since ISO_TIME] [--pending-since ISO_TIME]",
+          "Usage: capture-active-threads --db PATH --out FILE [--exclude THREAD_ID]... [--stopped-since ISO_TIME] [--pending-since ISO_TIME] [--include-pending-message-id MESSAGE_ID]...",
         );
       default:
         throw new Error(`Unknown argument: ${arg}`);
@@ -473,7 +553,14 @@ export function parseArgs(
     throw new Error("Missing required --out FILE.");
   }
 
-  return { dbPath, outPath, excludedThreadIds, stoppedSince, pendingSince };
+  return {
+    dbPath,
+    outPath,
+    excludedThreadIds,
+    stoppedSince,
+    pendingSince,
+    includedPendingMessageIds,
+  };
 }
 
 export function runCli(
@@ -488,6 +575,7 @@ export function runCli(
       excludedThreadIds: parsed.excludedThreadIds,
       stoppedSince: parsed.stoppedSince,
       pendingSince: parsed.pendingSince,
+      includedPendingMessageIds: parsed.includedPendingMessageIds,
     });
     const activeCount = manifest.threads.filter((thread) => thread.role === "active").length;
     NodeProcess.stdout.write(`${activeCount}\n`);

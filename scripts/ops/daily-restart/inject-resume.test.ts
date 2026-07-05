@@ -287,6 +287,131 @@ describe("inject-resume", () => {
     assert.equal(requests[1]?.interactionMode, "plan");
   });
 
+  it("resumes interrupted active turns before replaying queued pending messages", async () => {
+    const manifestPath = await writeManifest([
+      {
+        thread_id: "active-with-queued",
+        role: "active",
+        status: "running",
+        active_turn_id: "turn-active",
+        runtime_mode: "approval-required",
+        interaction_mode: "default",
+        pending_message: {
+          message_id: "message-queued",
+          role: "user",
+          text: "Queued prompt",
+          attachments: [],
+          runtime_mode: "full-access",
+          interaction_mode: "plan",
+          model_selection: { provider: "codex", model: "gpt-5.4" },
+          title_seed: "Queued title",
+          source_proposed_plan: {
+            threadId: "source-plan-thread",
+            planId: "plan-queued",
+          },
+        },
+        injected_at: null,
+      },
+    ]);
+    const requests: Array<any> = [];
+
+    const result = await injectResume({
+      manifestPath,
+      origin: "http://127.0.0.1:1",
+      token: "test-token",
+      dryRun: false,
+      now: () => new Date("2026-07-03T13:00:00.000Z"),
+      fetchImpl: async (_url: string | URL | Request, init?: RequestInit) => {
+        requests.push(JSON.parse(String(init?.body)));
+        return new Response("{}", { status: 200 });
+      },
+    });
+
+    assert.deepEqual(result, { injected: 1, skipped: 0, failed: 0, failures: [] });
+    assert.deepEqual(
+      requests.map((request) => request.type),
+      ["thread.interaction-mode.set", "thread.turn.start", "thread.turn.start"],
+    );
+    assert.equal(requests[0]?.interactionMode, "default");
+    assert.equal(requests[1]?.message.role, "user");
+    assert.equal(requests[1]?.message.text, RESUME_MESSAGE);
+    assert.notEqual(requests[1]?.message.messageId, "message-queued");
+    assert.equal(requests[1]?.modelSelection, undefined);
+    assert.equal(requests[1]?.titleSeed, undefined);
+    assert.equal(requests[1]?.sourceProposedPlan, undefined);
+    assert.equal(requests[1]?.runtimeMode, "approval-required");
+    assert.equal(requests[1]?.interactionMode, "default");
+    assert.equal(requests[2]?.message.messageId, "message-queued");
+    assert.equal(requests[2]?.message.text, "Queued prompt");
+    assert.equal(requests[2]?.runtimeMode, "full-access");
+    assert.equal(requests[2]?.interactionMode, "plan");
+    assert.deepEqual(requests[2]?.modelSelection, { provider: "codex", model: "gpt-5.4" });
+    assert.equal(requests[2]?.titleSeed, "Queued title");
+    assert.deepEqual(requests[2]?.sourceProposedPlan, {
+      threadId: "source-plan-thread",
+      planId: "plan-queued",
+    });
+    assert.notEqual(requests[1]?.commandId, requests[2]?.commandId);
+  });
+
+  it("does not let queued attachment failures block interrupted active resumes", async () => {
+    const manifestPath = await writeManifest([
+      {
+        thread_id: "active-with-bad-queued-attachment",
+        role: "active",
+        status: "running",
+        active_turn_id: "turn-active",
+        runtime_mode: "approval-required",
+        interaction_mode: "default",
+        pending_message: {
+          message_id: "message-queued",
+          role: "user",
+          text: "Queued prompt",
+          attachments: [
+            {
+              type: "image",
+              id: "queued-image",
+              name: "queued.png",
+              mimeType: "image/png",
+              sizeBytes: 9,
+            },
+          ],
+          runtime_mode: "full-access",
+          interaction_mode: "plan",
+        },
+        injected_at: null,
+      },
+    ]);
+    const requests: Array<any> = [];
+
+    const result = await injectResume({
+      manifestPath,
+      origin: "http://127.0.0.1:1",
+      token: "test-token",
+      dryRun: false,
+      now: () => new Date("2026-07-03T13:00:00.000Z"),
+      fetchImpl: async (_url: string | URL | Request, init?: RequestInit) => {
+        requests.push(JSON.parse(String(init?.body)));
+        return new Response("{}", { status: 200 });
+      },
+    });
+
+    assert.equal(result.injected, 0);
+    assert.equal(result.failed, 1);
+    assert.equal(result.failures[0]?.threadId, "active-with-bad-queued-attachment");
+    assert.match(result.failures[0]?.error ?? "", /pending attachment replay requires/u);
+    assert.deepEqual(
+      requests.map((request) => request.type),
+      ["thread.interaction-mode.set", "thread.turn.start"],
+    );
+    assert.equal(requests[1]?.message.text, RESUME_MESSAGE);
+    assert.equal(requests[1]?.runtimeMode, "approval-required");
+    assert.equal(requests[1]?.interactionMode, "default");
+
+    const manifest = await readManifest(manifestPath);
+    assert.equal(manifest.threads[0].injected_at, null);
+  });
+
   it("defaults old pending message manifests without roles to user messages", async () => {
     const manifestPath = await writeManifest([
       {

@@ -226,16 +226,17 @@ export FAKE_CAPTURE_PHASE_THREADS=1
 run_manager "$tmp"
 unset FAKE_CAPTURE_PHASE_THREADS
 manifest_path="$(echo "$tmp/ledger/"*/resume-manifest.json)"
+grep -Fq -- "--include-pending-message-id message-pre" "$tmp/calls.log" && pass "post-stop capture receives pre-stop pending ids" || fail "post-stop capture receives pre-stop pending ids"
 if node - "$manifest_path" <<'NODE'
 const fs = require("node:fs");
 const manifest = JSON.parse(fs.readFileSync(process.argv[2], "utf8"));
 const ids = new Set((manifest.threads ?? []).map((thread) => thread.thread_id));
-process.exit(ids.has("pre-pending") && ids.has("post-active") && !ids.has("pre-active") ? 0 : 1);
+process.exit(ids.has("post-active") && !ids.has("pre-pending") && !ids.has("pre-active") ? 0 : 1);
 NODE
 then
-  pass "post-stop merge preserves only pre-stop pending rows"
+  pass "post-stop manifest stays authoritative after pending-id handoff"
 else
-  fail "post-stop merge preserves only pre-stop pending rows"
+  fail "post-stop manifest stays authoritative after pending-id handoff"
 fi
 
 tmp="$(mktemp -d)"

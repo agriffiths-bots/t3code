@@ -90,6 +90,14 @@ function makeFixtureDb(dir: string): string {
     readonly [string, string, string | null, string | null, string, string | null]
   > = [
     ["active-turn", "Active Turn", null, null, "running", "turn-1"],
+    [
+      "active-with-pending-turn",
+      "Active With Pending Turn",
+      null,
+      null,
+      "running",
+      "turn-active-with-pending",
+    ],
     ["pending-no-session", "Pending No Session", null, null, "ready", null],
     ["running-no-turn", "Running No Turn", null, null, "running", null],
     ["starting-no-turn", "Starting No Turn", null, null, "starting", null],
@@ -166,15 +174,17 @@ function insertThread(
   const sessionUpdatedAt =
     threadId === "ready-stale-pending-turn"
       ? "2026-07-03T00:00:02.000Z"
-      : threadId === "starting-no-turn"
-        ? "2026-07-03T00:00:02.000Z"
-        : threadId === "stopped-current-pending-turn" ||
-            threadId === "stopped-stale-pending-turn" ||
-            threadId === "stopped-interrupted-turn"
-          ? "2026-07-03T00:00:03.000Z"
-          : threadId === "terminal-equal-pending-turn"
-            ? "2026-07-03T00:00:01.000Z"
-            : "2026-07-03T00:00:00.000Z";
+      : threadId === "active-with-pending-turn"
+        ? "2026-07-03T00:00:03.000Z"
+        : threadId === "starting-no-turn"
+          ? "2026-07-03T00:00:02.000Z"
+          : threadId === "stopped-current-pending-turn" ||
+              threadId === "stopped-stale-pending-turn" ||
+              threadId === "stopped-interrupted-turn"
+            ? "2026-07-03T00:00:03.000Z"
+            : threadId === "terminal-equal-pending-turn"
+              ? "2026-07-03T00:00:01.000Z"
+              : "2026-07-03T00:00:00.000Z";
 
   db.prepare(`
     INSERT INTO projection_thread_sessions (
@@ -188,7 +198,9 @@ function insertThread(
     threadId,
     status,
     activeTurnId,
-    threadId === "active-turn" ? "approval-required" : "full-access",
+    threadId === "active-turn" || threadId === "active-with-pending-turn"
+      ? "approval-required"
+      : "full-access",
     sessionUpdatedAt,
   );
 
@@ -340,6 +352,58 @@ function insertThread(
       }),
     );
   }
+
+  if (threadId === "active-with-pending-turn") {
+    db.prepare(`
+      INSERT INTO projection_thread_messages (
+        message_id,
+        thread_id,
+        turn_id,
+        role,
+        text,
+        attachments_json,
+        is_streaming,
+        created_at,
+        updated_at
+      ) VALUES
+        ('message-active-with-pending-active', ?, NULL, 'user', 'Active prompt', '[]', 0, '2026-07-03T00:00:00.000Z', '2026-07-03T00:00:00.000Z'),
+        ('message-active-with-pending-queued', ?, NULL, 'user', 'Queued prompt', '[]', 0, '2026-07-03T00:00:02.000Z', '2026-07-03T00:00:02.000Z')
+    `).run(threadId, threadId);
+    db.prepare(`
+      INSERT INTO projection_turns (
+        thread_id,
+        turn_id,
+        pending_message_id,
+        state,
+        requested_at,
+        started_at,
+        checkpoint_files_json
+      ) VALUES
+        (?, 'turn-active-with-pending', 'message-active-with-pending-active', 'running', '2026-07-03T00:00:00.000Z', '2026-07-03T00:00:00.000Z', '[]'),
+        (?, NULL, 'message-active-with-pending-queued', 'pending', '2026-07-03T00:00:02.000Z', NULL, '[]')
+    `).run(threadId, threadId);
+    db.prepare(`
+      INSERT INTO orchestration_events (
+        event_id,
+        aggregate_kind,
+        stream_id,
+        stream_version,
+        event_type,
+        occurred_at,
+        actor_kind,
+        payload_json,
+        metadata_json
+      ) VALUES ('event-active-with-pending-queued-start', 'thread', ?, 1, 'thread.turn-start-requested', '2026-07-03T00:00:02.000Z', 'system', ?, '{}')
+    `).run(
+      threadId,
+      JSON.stringify({
+        threadId,
+        messageId: "message-active-with-pending-queued",
+        runtimeMode: "full-access",
+        interactionMode: "plan",
+      }),
+    );
+  }
 }
 
 function expectedPendingMessage(threadId: string): {
@@ -419,6 +483,25 @@ describe("capture-active-threads", () => {
           injected_at: null,
         },
         {
+          thread_id: "active-with-pending-turn",
+          role: "active",
+          status: "running",
+          active_turn_id: "turn-active-with-pending",
+          runtime_mode: "approval-required",
+          interaction_mode: "default",
+          title: "Active With Pending Turn",
+          project_id: "project-1",
+          pending_message: {
+            message_id: "message-active-with-pending-queued",
+            role: "user",
+            text: "Queued prompt",
+            attachments: [],
+            runtime_mode: "full-access",
+            interaction_mode: "plan",
+          },
+          injected_at: null,
+        },
+        {
           thread_id: "pending-no-session",
           role: "active",
           status: "ready",
@@ -466,17 +549,6 @@ describe("capture-active-threads", () => {
           injected_at: null,
         },
         {
-          thread_id: "stopped-running-turn",
-          role: "active",
-          status: "stopped",
-          active_turn_id: "turn-stopped-running",
-          runtime_mode: "full-access",
-          interaction_mode: "plan",
-          title: "Stopped Running Turn",
-          project_id: "project-1",
-          injected_at: null,
-        },
-        {
           thread_id: "terminal-fresh-pending-turn",
           role: "active",
           status: "error",
@@ -492,7 +564,7 @@ describe("capture-active-threads", () => {
           thread_id: "terminal-stale-active-pending-turn",
           role: "active",
           status: "error",
-          active_turn_id: "turn-stale",
+          active_turn_id: null,
           runtime_mode: "full-access",
           interaction_mode: "plan",
           title: "Terminal Stale Active Pending Turn",
@@ -554,6 +626,33 @@ describe("capture-active-threads", () => {
     });
     assert.equal(threadsById.has("stopped-stale-pending-turn"), false);
     assert.equal(threadsById.has("stopped-stale-interrupted-turn"), false);
+    assert.equal(threadsById.has("stopped-running-turn"), false);
+
+    const includedManifest = captureActiveThreads({
+      dbPath,
+      outPath: NodePath.join(tempDir, "resume-manifest-included.json"),
+      stoppedSince: "2026-07-03T00:00:02.900Z",
+      pendingSince: "2026-07-03T00:00:02.000Z",
+      includedPendingMessageIds: ["message-stopped-stale-pending-turn"],
+      // @effect-diagnostics-next-line globalDate:off - deterministic fixture timestamp.
+      capturedAt: new Date("2026-07-03T21:00:00.000Z"),
+    });
+    const includedThreadsById = new Map(
+      includedManifest.threads.map((thread) => [thread.thread_id, thread]),
+    );
+
+    assert.deepStrictEqual(includedThreadsById.get("stopped-stale-pending-turn"), {
+      thread_id: "stopped-stale-pending-turn",
+      role: "active",
+      status: "stopped",
+      active_turn_id: null,
+      runtime_mode: "full-access",
+      interaction_mode: "plan",
+      title: "Stopped Stale Pending Turn",
+      project_id: "project-1",
+      pending_message: expectedPendingMessage("stopped-stale-pending-turn"),
+      injected_at: null,
+    });
   });
 
   it("writes an empty manifest and exits successfully when no active sessions are captured", () => {
@@ -576,6 +675,8 @@ describe("capture-active-threads", () => {
           outPath,
           "--exclude",
           "active-turn",
+          "--exclude",
+          "active-with-pending-turn",
           "--exclude",
           "pending-no-session",
           "--exclude",
@@ -683,6 +784,7 @@ describe("capture-active-threads", () => {
         excludedThreadIds: [],
         stoppedSince: null,
         pendingSince: null,
+        includedPendingMessageIds: [],
       },
     );
 
@@ -699,6 +801,8 @@ describe("capture-active-threads", () => {
           "2026-07-03T00:00:02.000Z",
           "--pending-since",
           "2026-07-03T00:00:01.000Z",
+          "--include-pending-message-id",
+          "message-1",
         ],
         {
           T3DR_DB: "/tmp/from-env.sqlite",
@@ -710,6 +814,7 @@ describe("capture-active-threads", () => {
         excludedThreadIds: ["thread-1"],
         stoppedSince: "2026-07-03T00:00:02.000Z",
         pendingSince: "2026-07-03T00:00:01.000Z",
+        includedPendingMessageIds: ["message-1"],
       },
     );
   });

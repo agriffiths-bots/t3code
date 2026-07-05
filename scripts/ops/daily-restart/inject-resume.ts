@@ -27,6 +27,8 @@ export interface ResumeManifestPendingMessage {
   readonly role?: "user" | "system";
   readonly text: string;
   readonly attachments?: ReadonlyArray<unknown>;
+  readonly runtime_mode?: ResumeRuntimeMode;
+  readonly interaction_mode?: ResumeInteractionMode;
   readonly model_selection?: unknown;
   readonly title_seed?: string;
   readonly source_proposed_plan?: unknown;
@@ -244,6 +246,24 @@ export function parseManifest(raw: string): ResumeManifest {
         throw new Error(`thread ${thread.thread_id} pending_message.attachments must be an array`);
       }
       if (
+        thread.pending_message.runtime_mode !== undefined &&
+        !RESUME_RUNTIME_MODES.has(thread.pending_message.runtime_mode as ResumeRuntimeMode)
+      ) {
+        throw new Error(
+          `thread ${thread.thread_id} pending_message.runtime_mode must be a valid runtime mode`,
+        );
+      }
+      if (
+        thread.pending_message.interaction_mode !== undefined &&
+        !RESUME_INTERACTION_MODES.has(
+          thread.pending_message.interaction_mode as ResumeInteractionMode,
+        )
+      ) {
+        throw new Error(
+          `thread ${thread.thread_id} pending_message.interaction_mode must be a valid interaction mode`,
+        );
+      }
+      if (
         thread.pending_message.model_selection !== undefined &&
         !isRecord(thread.pending_message.model_selection)
       ) {
@@ -284,7 +304,7 @@ async function writeManifestAtomic(path: string, manifest: ResumeManifest): Prom
 }
 
 function stableDispatchId(
-  kind: "interaction-mode" | "command" | "message",
+  kind: "interaction-mode" | "command" | "queued-command" | "message",
   manifest: ResumeManifest,
   threadId: string,
 ): string {
@@ -413,8 +433,9 @@ async function resumeMessageForThread(
   manifest: ResumeManifest,
   thread: ResumeManifestThread,
   attachmentsDir: string | undefined,
+  usePendingMessage = true,
 ) {
-  if (thread.pending_message !== undefined) {
+  if (usePendingMessage && thread.pending_message !== undefined) {
     return {
       messageId: thread.pending_message.message_id,
       role: thread.pending_message.role ?? "user",
@@ -452,6 +473,10 @@ function pendingTurnMetadataForThread(thread: ResumeManifestThread) {
       ? { sourceProposedPlan: pendingMessage.source_proposed_plan }
       : {}),
   };
+}
+
+function hasActiveTurn(thread: ResumeManifestThread): boolean {
+  return typeof thread.active_turn_id === "string" && thread.active_turn_id.length > 0;
 }
 
 class DispatchHttpError extends Error {
@@ -592,8 +617,9 @@ async function dispatchResumeCommands(
 ): Promise<void> {
   const runtimeMode = thread.runtime_mode ?? DEFAULT_RESUME_RUNTIME_MODE;
   const interactionMode = thread.interaction_mode ?? DEFAULT_RESUME_INTERACTION_MODE;
-  const message = await resumeMessageForThread(manifest, thread, attachmentsDir);
-  const pendingTurnMetadata = pendingTurnMetadataForThread(thread);
+  const pendingRuntimeMode = thread.pending_message?.runtime_mode ?? runtimeMode;
+  const pendingInteractionMode = thread.pending_message?.interaction_mode ?? interactionMode;
+  const hasQueuedPromptAfterActive = hasActiveTurn(thread) && thread.pending_message !== undefined;
   await postDispatchCommandWithRetry(
     fetchImpl,
     origin,
@@ -610,24 +636,55 @@ async function dispatchResumeCommands(
     random,
   );
 
-  await postDispatchCommandWithRetry(
-    fetchImpl,
-    origin,
-    token,
-    {
-      type: "thread.turn.start",
-      commandId: stableDispatchId("command", manifest, thread.thread_id),
-      threadId: thread.thread_id,
-      message,
-      ...pendingTurnMetadata,
-      runtimeMode,
-      interactionMode,
-      createdAt,
-    },
-    attemptTimeoutMs,
-    sleepImpl,
-    random,
-  );
+  const dispatchTurnStart = async (input: {
+    readonly commandId: string;
+    readonly message: Awaited<ReturnType<typeof resumeMessageForThread>>;
+    readonly metadata: Record<string, unknown>;
+    readonly runtimeMode: ResumeRuntimeMode;
+    readonly interactionMode: ResumeInteractionMode;
+  }) => {
+    await postDispatchCommandWithRetry(
+      fetchImpl,
+      origin,
+      token,
+      {
+        type: "thread.turn.start",
+        commandId: input.commandId,
+        threadId: thread.thread_id,
+        message: input.message,
+        ...input.metadata,
+        runtimeMode: input.runtimeMode,
+        interactionMode: input.interactionMode,
+        createdAt,
+      },
+      attemptTimeoutMs,
+      sleepImpl,
+      random,
+    );
+  };
+
+  await dispatchTurnStart({
+    commandId: stableDispatchId("command", manifest, thread.thread_id),
+    message: await resumeMessageForThread(
+      manifest,
+      thread,
+      attachmentsDir,
+      !hasQueuedPromptAfterActive,
+    ),
+    metadata: hasQueuedPromptAfterActive ? {} : pendingTurnMetadataForThread(thread),
+    runtimeMode: hasQueuedPromptAfterActive ? runtimeMode : pendingRuntimeMode,
+    interactionMode: hasQueuedPromptAfterActive ? interactionMode : pendingInteractionMode,
+  });
+
+  if (hasQueuedPromptAfterActive) {
+    await dispatchTurnStart({
+      commandId: stableDispatchId("queued-command", manifest, thread.thread_id),
+      message: await resumeMessageForThread(manifest, thread, attachmentsDir),
+      metadata: pendingTurnMetadataForThread(thread),
+      runtimeMode: pendingRuntimeMode,
+      interactionMode: pendingInteractionMode,
+    });
+  }
 }
 
 export async function injectResume(options: InjectResumeOptions): Promise<InjectResumeResult> {
