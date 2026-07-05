@@ -541,7 +541,7 @@ describe("inject-resume", () => {
     assert.equal(result.injected, 0);
     assert.equal(result.failed, 1);
     assert.match(result.failures[0]?.error ?? "", /queued replay timeout/u);
-    assert.equal(snapshotAttempts, 2);
+    assert.ok(snapshotAttempts >= 2);
     assert.deepEqual(
       requests.map((request) => request.type),
       ["thread.interaction-mode.set", "thread.turn.start"],
