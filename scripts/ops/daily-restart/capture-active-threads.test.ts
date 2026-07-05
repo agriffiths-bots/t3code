@@ -206,6 +206,7 @@ function insertThread(
 
   if (
     threadId === "active-turn" ||
+    threadId === "errored-stale" ||
     threadId === "pending-no-session" ||
     threadId === "starting-no-turn" ||
     threadId === "ready-pending-turn" ||
@@ -272,19 +273,22 @@ function insertThread(
       threadId,
       threadId === "active-turn"
         ? activeTurnId
-        : threadId === "stopped-running-turn"
-          ? "turn-stopped-running"
-          : threadId === "stopped-interrupted-turn"
-            ? "turn-stopped-interrupted"
-            : threadId === "stopped-stale-interrupted-turn"
-              ? "turn-stopped-stale-interrupted"
-              : threadId === "stopped-completed-turn"
-                ? "turn-stopped-completed"
-                : threadId === "ready-running-projection"
-                  ? "turn-ready-running"
-                  : null,
+        : threadId === "errored-stale"
+          ? activeTurnId
+          : threadId === "stopped-running-turn"
+            ? "turn-stopped-running"
+            : threadId === "stopped-interrupted-turn"
+              ? "turn-stopped-interrupted"
+              : threadId === "stopped-stale-interrupted-turn"
+                ? "turn-stopped-stale-interrupted"
+                : threadId === "stopped-completed-turn"
+                  ? "turn-stopped-completed"
+                  : threadId === "ready-running-projection"
+                    ? "turn-ready-running"
+                    : null,
       pendingMessageId,
       threadId === "active-turn" ||
+        threadId === "errored-stale" ||
         threadId === "stopped-running-turn" ||
         threadId === "ready-running-projection"
         ? "running"
@@ -627,6 +631,7 @@ describe("capture-active-threads", () => {
     assert.equal(threadsById.has("stopped-stale-pending-turn"), false);
     assert.equal(threadsById.has("stopped-stale-interrupted-turn"), false);
     assert.equal(threadsById.has("stopped-running-turn"), false);
+    assert.equal(threadsById.has("errored-stale"), false);
 
     const includedManifest = captureActiveThreads({
       dbPath,

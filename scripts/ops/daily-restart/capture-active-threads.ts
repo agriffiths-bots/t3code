@@ -137,6 +137,11 @@ function buildCaptureQuery(
           AND sessions.status = 'stopped'
           AND sessions.updated_at >= capture_options.stopped_since
         )`;
+  const terminalDuringCapturePredicate = `(
+          capture_options.stopped_since IS NOT NULL
+          AND sessions.status IN ('error', 'interrupted', 'stopped')
+          AND sessions.updated_at >= capture_options.stopped_since
+        )`;
   const stoppedPendingDuringCapturePredicate = `(
           capture_options.pending_since IS NOT NULL
           AND ${stoppedDuringCapturePredicate}
@@ -277,8 +282,8 @@ function buildCaptureQuery(
             (
               candidate_resumable_turns.state = 'running'
               AND (
-                sessions.status <> 'stopped'
-                OR ${stoppedDuringCapturePredicate}
+                sessions.status NOT IN ('error', 'interrupted', 'stopped')
+                OR ${terminalDuringCapturePredicate}
               )
             )
             OR (
