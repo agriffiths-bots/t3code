@@ -3,7 +3,6 @@ import {
   MessageId,
   ThreadId,
   type ModelSelection,
-  type OrchestrationProjectShell,
   type OrchestrationThreadShell,
 } from "@t3tools/contracts";
 import { buildTemporaryWorktreeBranchName } from "@t3tools/shared/git";
@@ -20,6 +19,7 @@ import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 
 import * as McpInvocationContext from "../../McpInvocationContext.ts";
+import { resolveThreadWorkspaceCwd } from "../../../checkpointing/Utils.ts";
 import * as BootstrapTurnStartDispatcher from "../../../orchestration/Services/BootstrapTurnStartDispatcher.ts";
 import { ProjectionSnapshotQuery } from "../../../orchestration/Services/ProjectionSnapshotQuery.ts";
 import { ProviderInstanceRegistry } from "../../../provider/Services/ProviderInstanceRegistry.ts";
@@ -111,17 +111,17 @@ const makeActiveThreadStartRuntime = Effect.fn("ThreadToolkit.makeActiveRuntime"
   const resolveNewWorktreeBaseBranch = Effect.fn("ThreadToolkit.resolveNewWorktreeBaseBranch")(
     function* (
       input: ThreadStartToolInput,
-      project: OrchestrationProjectShell,
       sourceThread: OrchestrationThreadShell,
+      sourceCwd: string,
     ) {
       if (input.baseBranch) return input.baseBranch;
       if (input.baseBranchSource === "source" && sourceThread.branch) return sourceThread.branch;
 
-      const defaultBranch = yield* resolveDefaultBranch(project.workspaceRoot);
+      const defaultBranch = yield* resolveDefaultBranch(sourceCwd);
       if (defaultBranch) return defaultBranch;
       if (sourceThread.branch) return sourceThread.branch;
 
-      const currentBranch = yield* resolveCurrentBranch(project.workspaceRoot);
+      const currentBranch = yield* resolveCurrentBranch(sourceCwd);
       if (currentBranch) return currentBranch;
 
       return yield* fail("Could not resolve a base branch for the new worktree.");
@@ -131,8 +131,8 @@ const makeActiveThreadStartRuntime = Effect.fn("ThreadToolkit.makeActiveRuntime"
   const resolveInitialBranch = Effect.fn("ThreadToolkit.resolveInitialBranch")(function* (
     mode: ThreadStartMode,
     input: ThreadStartToolInput,
-    project: OrchestrationProjectShell,
     sourceThread: OrchestrationThreadShell,
+    sourceCwd: string,
   ) {
     if (input.branch) return input.branch;
     if (mode === "new_worktree") return yield* makeTemporaryBranchName();
@@ -142,7 +142,7 @@ const makeActiveThreadStartRuntime = Effect.fn("ThreadToolkit.makeActiveRuntime"
       }
       return yield* resolveCurrentBranch(input.worktreePath);
     }
-    return sourceThread.branch ?? (yield* resolveCurrentBranch(project.workspaceRoot));
+    return sourceThread.branch ?? (yield* resolveCurrentBranch(sourceCwd));
   });
 
   const loadSourceContext = Effect.fn("ThreadToolkit.loadSourceContext")(function* (
@@ -180,9 +180,12 @@ const makeActiveThreadStartRuntime = Effect.fn("ThreadToolkit.makeActiveRuntime"
   ) {
     const { sourceThread, project } = yield* loadSourceContext(invocation);
     const mode = input.mode ?? "new_worktree";
+    const sourceCwd =
+      resolveThreadWorkspaceCwd({ thread: sourceThread, projects: [project] }) ??
+      project.workspaceRoot;
     const ids = yield* makeIds();
     const createdAt = yield* nowIso;
-    const branch = (yield* resolveInitialBranch(mode, input, project, sourceThread)) ?? null;
+    const branch = (yield* resolveInitialBranch(mode, input, sourceThread, sourceCwd)) ?? null;
     const worktreePath: string | null =
       mode === "existing_worktree" ? (input.worktreePath ?? null) : null;
     const title = input.title ?? truncateTitle(input.prompt);
@@ -208,8 +211,8 @@ const makeActiveThreadStartRuntime = Effect.fn("ThreadToolkit.makeActiveRuntime"
     const prepareWorktree =
       mode === "new_worktree"
         ? {
-            projectCwd: project.workspaceRoot,
-            baseBranch: yield* resolveNewWorktreeBaseBranch(input, project, sourceThread),
+            projectCwd: sourceCwd,
+            baseBranch: yield* resolveNewWorktreeBaseBranch(input, sourceThread, sourceCwd),
             branch: branch ?? undefined,
           }
         : undefined;

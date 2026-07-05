@@ -140,10 +140,54 @@ const makeModelInstance = (
     },
   }) as unknown as ProviderInstance;
 
-const makeTestLayer = (
-  commands: OrchestrationCommand[],
-  providerInstances: ReadonlyArray<ProviderInstance> = [],
-) => {
+interface TestLayerOptions {
+  readonly providerInstances?: ReadonlyArray<ProviderInstance>;
+  readonly project?: OrchestrationProjectShell;
+  readonly sourceThread?: OrchestrationThreadShell;
+  readonly gitWorkflow?: Partial<GitWorkflowService["Service"]>;
+}
+
+const defaultGitWorkflow = {
+  listRefs: () =>
+    Effect.succeed({
+      refs: [
+        {
+          name: "main",
+          current: false,
+          isDefault: true,
+          isRemote: false,
+          worktreePath: null,
+        },
+      ],
+      isRepo: true,
+      hasPrimaryRemote: true,
+      nextCursor: null,
+      totalCount: 1,
+    }),
+  status: () =>
+    Effect.succeed({
+      isRepo: true,
+      hasPrimaryRemote: true,
+      isDefaultRef: false,
+      refName: "feature/source",
+      hasWorkingTreeChanges: false,
+      workingTree: {
+        files: [],
+        insertions: 0,
+        deletions: 0,
+      },
+      hasUpstream: true,
+      aheadCount: 0,
+      behindCount: 0,
+      aheadOfDefaultCount: 0,
+      pr: null,
+    }),
+} satisfies Partial<GitWorkflowService["Service"]>;
+
+const makeTestLayer = (commands: OrchestrationCommand[], options: TestLayerOptions = {}) => {
+  const testProject = options.project ?? project;
+  const testSourceThread = options.sourceThread ?? sourceThread;
+  const providerInstances = options.providerInstances ?? [];
   const bootstrapTurnStartDispatcherLayer = Layer.mock(
     BootstrapTurnStartDispatcher.BootstrapTurnStartDispatcher,
   )({
@@ -165,8 +209,8 @@ const makeTestLayer = (
     Layer.provideMerge(McpServer.McpServer.layer),
     Layer.provide(
       Layer.mock(ProjectionSnapshotQuery)({
-        getProjectShellById: () => Effect.succeed(Option.some(project)),
-        getThreadShellById: () => Effect.succeed(Option.some(sourceThread)),
+        getProjectShellById: () => Effect.succeed(Option.some(testProject)),
+        getThreadShellById: () => Effect.succeed(Option.some(testSourceThread)),
       }),
     ),
     Layer.provide(
@@ -176,40 +220,8 @@ const makeTestLayer = (
     ),
     Layer.provide(
       Layer.mock(GitWorkflowService)({
-        listRefs: () =>
-          Effect.succeed({
-            refs: [
-              {
-                name: "main",
-                current: false,
-                isDefault: true,
-                isRemote: false,
-                worktreePath: null,
-              },
-            ],
-            isRepo: true,
-            hasPrimaryRemote: true,
-            nextCursor: null,
-            totalCount: 1,
-          }),
-        status: () =>
-          Effect.succeed({
-            isRepo: true,
-            hasPrimaryRemote: true,
-            isDefaultRef: false,
-            refName: "feature/source",
-            hasWorkingTreeChanges: false,
-            workingTree: {
-              files: [],
-              insertions: 0,
-              deletions: 0,
-            },
-            hasUpstream: true,
-            aheadCount: 0,
-            behindCount: 0,
-            aheadOfDefaultCount: 0,
-            pr: null,
-          }),
+        ...defaultGitWorkflow,
+        ...options.gitWorkflow,
       }),
     ),
     Layer.provide(
@@ -225,7 +237,7 @@ const makeTestLayer = (
 const callStartTool = (
   arguments_: Record<string, unknown>,
   commands: OrchestrationCommand[],
-  providerInstances: ReadonlyArray<ProviderInstance> = [],
+  options: TestLayerOptions = {},
 ) =>
   Effect.gen(function* () {
     const server = yield* McpServer.McpServer;
@@ -235,7 +247,7 @@ const callStartTool = (
         Effect.provideService(McpInvocationContext.McpInvocationContext, invocation),
         Effect.provideService(McpSchema.McpServerClient, client),
       );
-  }).pipe(Effect.provide(makeTestLayer(commands, providerInstances)));
+  }).pipe(Effect.provide(makeTestLayer(commands, options)));
 
 it.effect("starts a new worktree thread by default and inherits source settings", () =>
   Effect.gen(function* () {
@@ -288,17 +300,97 @@ it.effect("starts current-checkout threads with warning metadata", () =>
   }),
 );
 
+it.effect("starts a new worktree from a detached parent using the project default branch", () =>
+  Effect.gen(function* () {
+    const commands: OrchestrationCommand[] = [];
+    const listRefCwds: string[] = [];
+    const result = yield* callStartTool({ prompt: "Continue in isolation" }, commands, {
+      sourceThread: {
+        ...sourceThread,
+        branch: null,
+        worktreePath: "/repo/worktree",
+      },
+      gitWorkflow: {
+        listRefs: (input) =>
+          Effect.sync(() => {
+            listRefCwds.push(input.cwd);
+            return {
+              refs: [
+                {
+                  name: "main",
+                  current: false,
+                  isDefault: true,
+                  isRemote: false,
+                  worktreePath: null,
+                },
+              ],
+              isRepo: true,
+              hasPrimaryRemote: true,
+              nextCursor: null,
+              totalCount: 1,
+            };
+          }),
+      },
+    });
+
+    expect(result.isError).toBe(false);
+    const command = commands[0];
+    expect(command?.type).toBe("thread.turn.start");
+    if (command?.type !== "thread.turn.start") return;
+    expect(command.bootstrap?.prepareWorktree).toMatchObject({
+      projectCwd: "/repo/worktree",
+      baseBranch: "main",
+    });
+    expect(listRefCwds).toEqual(["/repo/worktree"]);
+  }),
+);
+
+it.effect("prepares new worktrees from the source worktree when the project root differs", () =>
+  Effect.gen(function* () {
+    const commands: OrchestrationCommand[] = [];
+    const result = yield* callStartTool(
+      {
+        prompt: "Spawn from project checkout",
+        baseBranch: "main",
+        baseBranchSource: "default",
+      },
+      commands,
+      {
+        project: {
+          ...project,
+          workspaceRoot: "/home/adam",
+        },
+        sourceThread: {
+          ...sourceThread,
+          worktreePath: "/home/adam/wt-t20-worktree-fix",
+        },
+      },
+    );
+
+    expect(result.isError).toBe(false);
+    const command = commands[0];
+    expect(command?.type).toBe("thread.turn.start");
+    if (command?.type !== "thread.turn.start") return;
+    expect(command.bootstrap?.prepareWorktree).toMatchObject({
+      projectCwd: "/home/adam/wt-t20-worktree-fix",
+      baseBranch: "main",
+    });
+  }),
+);
+
 it.effect("applies directive default effort when resolving a plain model", () =>
   Effect.gen(function* () {
     const commands: OrchestrationCommand[] = [];
     const result = yield* callStartTool(
       { prompt: "Investigate flaky tests", model: "claude-opus-4-8" },
       commands,
-      [
-        makeModelInstance("claudeAgent", "claudeAgent", [
-          { slug: "claude-opus-4-8", optionId: "effort", value: "high" },
-        ]),
-      ],
+      {
+        providerInstances: [
+          makeModelInstance("claudeAgent", "claudeAgent", [
+            { slug: "claude-opus-4-8", optionId: "effort", value: "high" },
+          ]),
+        ],
+      },
     );
 
     expect(result.isError).toBe(false);
