@@ -1,4 +1,5 @@
 const CACHE_VERSION = "t3-code-v2";
+const CACHE_PREFIX = "t3-code-";
 const APP_SHELL_URLS = ["/", "/manifest.webmanifest", "/pwa-icon-192.png", "/pwa-icon-512.png"];
 const BUILD_ASSET_PATH_PREFIX = "/assets/";
 
@@ -31,7 +32,8 @@ function shellUnavailableResponse() {
 }
 
 async function cachedShellOrUnavailable() {
-  const cached = await caches.match("/");
+  const cache = await caches.open(CACHE_VERSION);
+  const cached = await cache.match("/");
   return cached ?? shellUnavailableResponse();
 }
 
@@ -82,15 +84,21 @@ self.addEventListener("install", (event) => {
   );
 });
 
-self.addEventListener("activate", (event) => {
-  event.waitUntil(
-    caches
-      .keys()
-      .then((keys) =>
-        Promise.all(keys.filter((key) => key !== CACHE_VERSION).map((key) => caches.delete(key))),
-      )
-      .then(() => self.clients.claim()),
+async function deleteSupersededCaches() {
+  const cacheKeys = await caches.keys();
+  const clients = await self.clients.matchAll({ type: "window", includeUncontrolled: true });
+  // Open tabs can still request lazy chunks from the build that loaded them.
+  const keepPriorAppCaches = clients.length > 0;
+  await Promise.all(
+    cacheKeys
+      .filter((key) => key !== CACHE_VERSION)
+      .filter((key) => !keepPriorAppCaches || !key.startsWith(CACHE_PREFIX))
+      .map((key) => caches.delete(key)),
   );
+}
+
+self.addEventListener("activate", (event) => {
+  event.waitUntil(deleteSupersededCaches().then(() => self.clients.claim()));
 });
 
 self.addEventListener("fetch", (event) => {
@@ -128,12 +136,11 @@ self.addEventListener("fetch", (event) => {
 
   const acceptsHtml = request.headers.get("accept")?.includes("text/html") ?? false;
   if (!acceptsHtml || requestUrl.origin !== self.location.origin) return;
-  const canRefreshShellCache = requestUrl.pathname === "/";
 
   const networkResponse = fetch(request);
   const shellRefresh = networkResponse
     .then(async (response) => {
-      if (!canRefreshShellCache || !isUsableShellResponse(response)) return;
+      if (!isUsableShellResponse(response)) return;
 
       const shellResponse = response.clone();
       const cache = await caches.open(CACHE_VERSION);
@@ -142,14 +149,5 @@ self.addEventListener("fetch", (event) => {
     .catch(() => undefined);
 
   event.waitUntil(shellRefresh);
-  event.respondWith(
-    networkResponse
-      .then(async (response) => {
-        if (canRefreshShellCache && !isUsableShellResponse(response)) {
-          return await cachedShellOrUnavailable();
-        }
-        return response;
-      })
-      .catch(cachedShellOrUnavailable),
-  );
+  event.respondWith(networkResponse.then((response) => response).catch(cachedShellOrUnavailable));
 });
