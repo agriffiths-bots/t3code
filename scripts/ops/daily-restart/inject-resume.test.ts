@@ -115,7 +115,12 @@ describe("inject-resume", () => {
             {
               thread_id: "thread-1",
               role: "active",
-              pending_message: { message_id: "message-1", text: "hello", attachments: {} },
+              pending_message: {
+                message_id: "message-1",
+                role: "user",
+                text: "hello",
+                attachments: {},
+              },
               injected_at: null,
             },
           ],
@@ -224,6 +229,7 @@ describe("inject-resume", () => {
         interaction_mode: "plan",
         pending_message: {
           message_id: "message-pending-start",
+          role: "system",
           text: "Original user request",
           attachments: pendingAttachments,
           model_selection: { provider: "codex", model: "gpt-5.4" },
@@ -259,6 +265,7 @@ describe("inject-resume", () => {
     assert.equal(requests[0]?.interactionMode, "plan");
     assert.equal(requests[1]?.type, "thread.turn.start");
     assert.equal(requests[1]?.message.messageId, "message-pending-start");
+    assert.equal(requests[1]?.message.role, "system");
     assert.equal(requests[1]?.message.text, "Original user request");
     assert.notEqual(requests[1]?.message.text, RESUME_MESSAGE);
     assert.deepEqual(requests[1]?.message.attachments, [
@@ -278,6 +285,41 @@ describe("inject-resume", () => {
     });
     assert.equal(requests[1]?.runtimeMode, "approval-required");
     assert.equal(requests[1]?.interactionMode, "plan");
+  });
+
+  it("defaults old pending message manifests without roles to user messages", async () => {
+    const manifestPath = await writeManifest([
+      {
+        thread_id: "old-pending-start",
+        role: "active",
+        status: "ready",
+        pending_message: {
+          message_id: "message-old-pending-start",
+          text: "Old pending request",
+          attachments: [],
+        },
+        injected_at: null,
+      },
+    ]);
+    const requests: Array<any> = [];
+
+    const result = await injectResume({
+      manifestPath,
+      origin: "http://127.0.0.1:1",
+      token: "test-token",
+      dryRun: false,
+      now: () => new Date("2026-07-03T13:00:00.000Z"),
+      fetchImpl: async (_url: string | URL | Request, init?: RequestInit) => {
+        requests.push(JSON.parse(String(init?.body)));
+        return new Response("{}", { status: 200 });
+      },
+    });
+
+    assert.deepEqual(result, { injected: 1, skipped: 0, failed: 0, failures: [] });
+    const turnStart = requests.find((request) => request.type === "thread.turn.start");
+    assert.equal(turnStart?.message.messageId, "message-old-pending-start");
+    assert.equal(turnStart?.message.role, "user");
+    assert.equal(turnStart?.message.text, "Old pending request");
   });
 
   it("retries transient dispatch failures and records one injection after success", async () => {

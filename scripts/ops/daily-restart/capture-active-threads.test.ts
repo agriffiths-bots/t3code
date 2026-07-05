@@ -98,6 +98,7 @@ function makeFixtureDb(dir: string): string {
     ["terminal-equal-pending-turn", "Terminal Equal Pending Turn", null, null, "error", null],
     ["terminal-fresh-pending-turn", "Terminal Fresh Pending Turn", null, null, "error", null],
     ["stopped-running-turn", "Stopped Running Turn", null, null, "stopped", null],
+    ["stopped-interrupted-turn", "Stopped Interrupted Turn", null, null, "stopped", null],
     ["stopped-completed-turn", "Stopped Completed Turn", null, null, "stopped", null],
     ["ready-running-projection", "Ready Running Projection", null, null, "ready", null],
     [
@@ -187,6 +188,7 @@ function insertThread(
     threadId === "terminal-fresh-pending-turn" ||
     threadId === "terminal-stale-active-pending-turn" ||
     threadId === "stopped-running-turn" ||
+    threadId === "stopped-interrupted-turn" ||
     threadId === "stopped-completed-turn" ||
     threadId === "ready-running-projection"
   ) {
@@ -215,10 +217,11 @@ function insertThread(
         is_streaming,
         created_at,
         updated_at
-      ) VALUES (?, ?, NULL, 'user', ?, ?, 0, '2026-07-03T00:00:01.000Z', '2026-07-03T00:00:01.000Z')
+      ) VALUES (?, ?, NULL, ?, ?, ?, 0, '2026-07-03T00:00:01.000Z', '2026-07-03T00:00:01.000Z')
     `).run(
       pendingMessageId,
       threadId,
+      threadId === "pending-no-session" ? "system" : "user",
       `Pending prompt for ${threadId}`,
       JSON.stringify(pendingMessageAttachments),
     );
@@ -237,19 +240,23 @@ function insertThread(
         ? activeTurnId
         : threadId === "stopped-running-turn"
           ? "turn-stopped-running"
-          : threadId === "stopped-completed-turn"
-            ? "turn-stopped-completed"
-            : threadId === "ready-running-projection"
-              ? "turn-ready-running"
-              : null,
+          : threadId === "stopped-interrupted-turn"
+            ? "turn-stopped-interrupted"
+            : threadId === "stopped-completed-turn"
+              ? "turn-stopped-completed"
+              : threadId === "ready-running-projection"
+                ? "turn-ready-running"
+                : null,
       pendingMessageId,
       threadId === "active-turn" ||
         threadId === "stopped-running-turn" ||
         threadId === "ready-running-projection"
         ? "running"
-        : threadId === "stopped-completed-turn"
-          ? "completed"
-          : "pending",
+        : threadId === "stopped-interrupted-turn"
+          ? "interrupted"
+          : threadId === "stopped-completed-turn"
+            ? "completed"
+            : "pending",
     );
 
     if (threadId === "terminal-stale-active-pending-turn") {
@@ -307,11 +314,13 @@ function insertThread(
 
 function expectedPendingMessage(threadId: string): {
   readonly message_id: string;
+  readonly role: "user" | "system";
   readonly text: string;
   readonly attachments: ReadonlyArray<unknown>;
 } {
   return {
     message_id: `message-${threadId}`,
+    role: threadId === "pending-no-session" ? "system" : "user",
     text: `Pending prompt for ${threadId}`,
     attachments:
       threadId === "ready-pending-turn"
@@ -427,6 +436,17 @@ describe("capture-active-threads", () => {
           injected_at: null,
         },
         {
+          thread_id: "stopped-interrupted-turn",
+          role: "active",
+          status: "stopped",
+          active_turn_id: "turn-stopped-interrupted",
+          runtime_mode: "full-access",
+          interaction_mode: "plan",
+          title: "Stopped Interrupted Turn",
+          project_id: "project-1",
+          injected_at: null,
+        },
+        {
           thread_id: "stopped-running-turn",
           role: "active",
           status: "stopped",
@@ -506,6 +526,8 @@ describe("capture-active-threads", () => {
           "ready-pending-turn",
           "--exclude",
           "terminal-fresh-pending-turn",
+          "--exclude",
+          "stopped-interrupted-turn",
           "--exclude",
           "stopped-running-turn",
           "--exclude",

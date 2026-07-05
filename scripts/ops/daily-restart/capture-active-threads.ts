@@ -44,6 +44,7 @@ export interface CapturedThread {
 
 export interface CapturedPendingMessage {
   readonly message_id: string;
+  readonly role: "user" | "system";
   readonly text: string;
   readonly attachments: ReadonlyArray<unknown>;
   readonly model_selection?: unknown;
@@ -69,6 +70,7 @@ interface SessionRow {
   readonly title: string;
   readonly project_id: string;
   readonly pending_message_id: string | null;
+  readonly pending_message_role: string | null;
   readonly pending_message_text: string | null;
   readonly pending_message_attachments_json: string | null;
   readonly pending_model_selection_json: string | null;
@@ -164,6 +166,10 @@ function buildCaptureQuery(excludedThreadIds: ReadonlyArray<string>) {
         ELSE NULL
       END AS pending_message_text,
       CASE
+        WHEN ${livePendingPredicate} THEN pending_messages.role
+        ELSE NULL
+      END AS pending_message_role,
+      CASE
         WHEN ${livePendingPredicate} THEN pending_messages.attachments_json
         ELSE NULL
       END AS pending_message_attachments_json,
@@ -189,7 +195,13 @@ function buildCaptureQuery(excludedThreadIds: ReadonlyArray<string>) {
         FROM projection_turns candidate_resumable_turns
         WHERE candidate_resumable_turns.thread_id = threads.thread_id
           AND candidate_resumable_turns.turn_id IS NOT NULL
-          AND candidate_resumable_turns.state = 'running'
+          AND (
+            candidate_resumable_turns.state = 'running'
+            OR (
+              sessions.status = 'stopped'
+              AND candidate_resumable_turns.state = 'interrupted'
+            )
+          )
         ORDER BY
           COALESCE(candidate_resumable_turns.started_at, candidate_resumable_turns.requested_at) DESC,
           candidate_resumable_turns.requested_at DESC,
@@ -282,6 +294,9 @@ function pendingMessageForRow(row: SessionRow): CapturedPendingMessage | undefin
   if (row.pending_message_text === null) {
     throw new Error(`thread ${row.thread_id} pending message text was not found`);
   }
+  if (row.pending_message_role !== "user" && row.pending_message_role !== "system") {
+    throw new Error(`thread ${row.thread_id} pending message role must be user or system`);
+  }
 
   const modelSelection = parseOptionalJsonField(
     row.thread_id,
@@ -296,6 +311,7 @@ function pendingMessageForRow(row: SessionRow): CapturedPendingMessage | undefin
 
   return {
     message_id: row.pending_message_id,
+    role: row.pending_message_role,
     text: row.pending_message_text,
     attachments: parsePendingMessageAttachments(
       row.thread_id,

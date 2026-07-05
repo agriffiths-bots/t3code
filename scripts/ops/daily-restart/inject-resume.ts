@@ -24,6 +24,7 @@ export interface ResumeManifestThread {
 
 export interface ResumeManifestPendingMessage {
   readonly message_id: string;
+  readonly role?: "user" | "system";
   readonly text: string;
   readonly attachments?: ReadonlyArray<unknown>;
   readonly model_selection?: unknown;
@@ -230,6 +231,13 @@ export function parseManifest(raw: string): ResumeManifest {
         throw new Error(`thread ${thread.thread_id} pending_message.text must be a string`);
       }
       if (
+        thread.pending_message.role !== undefined &&
+        thread.pending_message.role !== "user" &&
+        thread.pending_message.role !== "system"
+      ) {
+        throw new Error(`thread ${thread.thread_id} pending_message.role must be user or system`);
+      }
+      if (
         thread.pending_message.attachments !== undefined &&
         !Array.isArray(thread.pending_message.attachments)
       ) {
@@ -409,7 +417,7 @@ async function resumeMessageForThread(
   if (thread.pending_message !== undefined) {
     return {
       messageId: thread.pending_message.message_id,
-      role: "user" as const,
+      role: thread.pending_message.role ?? "user",
       text: thread.pending_message.text,
       attachments: await Promise.all(
         (thread.pending_message.attachments ?? []).map((attachment) =>
