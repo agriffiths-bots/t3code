@@ -1,6 +1,7 @@
 import { expect, it } from "@effect/vitest";
 import {
   EnvironmentId,
+  GitCommandError,
   ProjectId,
   ProviderDriverKind,
   ProviderInstanceId,
@@ -341,7 +342,7 @@ it.effect("starts a new worktree from a detached parent using the project defaul
       projectCwd: "/repo/worktree",
       baseBranch: "main",
     });
-    expect(listRefCwds).toEqual(["/repo/worktree"]);
+    expect(listRefCwds).toEqual(["/repo/worktree", "/repo/worktree"]);
   }),
 );
 
@@ -407,11 +408,118 @@ it.effect(
       });
       expect(gitCalls).toEqual([
         "listRefs:/repo/worktree",
+        "listRefs:/repo/worktree",
         "status:/repo/worktree",
         "listRefs:/repo/project",
         "status:/repo/project",
       ]);
     }),
+);
+
+it.effect("falls back to the project checkout when the source worktree path is stale", () =>
+  Effect.gen(function* () {
+    const commands: OrchestrationCommand[] = [];
+    const gitCalls: string[] = [];
+    const result = yield* callStartTool({ prompt: "Continue after cleanup" }, commands, {
+      project: {
+        ...project,
+        workspaceRoot: "/repo/project",
+      },
+      sourceThread: {
+        ...sourceThread,
+        branch: null,
+        worktreePath: "/repo/missing-worktree",
+      },
+      gitWorkflow: {
+        listRefs: (input) =>
+          Effect.sync(() => {
+            gitCalls.push(`listRefs:${input.cwd}`);
+            if (input.cwd === "/repo/missing-worktree") {
+              return {
+                refs: [],
+                isRepo: false,
+                hasPrimaryRemote: false,
+                nextCursor: null,
+                totalCount: 0,
+              };
+            }
+            return {
+              refs: [
+                {
+                  name: "main",
+                  current: false,
+                  isDefault: true,
+                  isRemote: false,
+                  worktreePath: null,
+                },
+              ],
+              isRepo: true,
+              hasPrimaryRemote: true,
+              nextCursor: null,
+              totalCount: 1,
+            };
+          }),
+      },
+    });
+
+    expect(result.isError).toBe(false);
+    const command = commands[0];
+    expect(command?.type).toBe("thread.turn.start");
+    if (command?.type !== "thread.turn.start") return;
+    expect(command.bootstrap?.prepareWorktree).toMatchObject({
+      projectCwd: "/repo/project",
+      baseBranch: "main",
+    });
+    expect(gitCalls).toEqual(["listRefs:/repo/missing-worktree", "listRefs:/repo/project"]);
+  }),
+);
+
+it.effect("keeps the source worktree cwd when validation cannot list refs", () =>
+  Effect.gen(function* () {
+    const commands: OrchestrationCommand[] = [];
+    const gitCalls: string[] = [];
+    const result = yield* callStartTool(
+      { prompt: "Continue despite transient git failure", baseBranch: "main" },
+      commands,
+      {
+        project: {
+          ...project,
+          workspaceRoot: "/repo/project",
+        },
+        sourceThread: {
+          ...sourceThread,
+          worktreePath: "/repo/worktree",
+        },
+        gitWorkflow: {
+          listRefs: (input) =>
+            Effect.sync(() => {
+              gitCalls.push(`listRefs:${input.cwd}`);
+            }).pipe(
+              Effect.flatMap(() =>
+                Effect.fail(
+                  new GitCommandError({
+                    operation: "GitWorkflowService.listRefs",
+                    command: "git",
+                    cwd: input.cwd,
+                    detail: "transient refs lookup failure",
+                  }),
+                ),
+              ),
+            ),
+        },
+      },
+    );
+
+    expect(result.isError).toBe(false);
+    const command = commands[0];
+    expect(command?.type).toBe("thread.turn.start");
+    if (command?.type !== "thread.turn.start") return;
+    expect(command.bootstrap?.prepareWorktree).toMatchObject({
+      projectCwd: "/repo/worktree",
+      baseBranch: "main",
+    });
+    expect(gitCalls).toEqual(["listRefs:/repo/worktree"]);
+  }),
 );
 
 it.effect("prepares new worktrees from the source worktree when the project root differs", () =>

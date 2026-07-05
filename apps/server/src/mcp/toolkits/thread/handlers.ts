@@ -109,6 +109,22 @@ const makeActiveThreadStartRuntime = Effect.fn("ThreadToolkit.makeActiveRuntime"
     );
   });
 
+  const isGitRepository = Effect.fn("ThreadToolkit.isGitRepository")(function* (cwd: string) {
+    return yield* gitWorkflow.listRefs({ cwd, limit: 1 }).pipe(
+      Effect.map((result) => result.isRepo),
+      Effect.orElseSucceed(() => true),
+    );
+  });
+
+  const resolveSourceCwd = Effect.fn("ThreadToolkit.resolveSourceCwd")(function* (
+    project: OrchestrationProjectShell,
+    sourceThread: OrchestrationThreadShell,
+  ) {
+    const candidate = resolveThreadWorkspaceCwd({ thread: sourceThread, projects: [project] });
+    if (!candidate || candidate === project.workspaceRoot) return project.workspaceRoot;
+    return (yield* isGitRepository(candidate)) ? candidate : project.workspaceRoot;
+  });
+
   const resolveNewWorktreeBaseBranch = Effect.fn("ThreadToolkit.resolveNewWorktreeBaseBranch")(
     function* (
       input: ThreadStartToolInput,
@@ -190,9 +206,7 @@ const makeActiveThreadStartRuntime = Effect.fn("ThreadToolkit.makeActiveRuntime"
   ) {
     const { sourceThread, project } = yield* loadSourceContext(invocation);
     const mode = input.mode ?? "new_worktree";
-    const sourceCwd =
-      resolveThreadWorkspaceCwd({ thread: sourceThread, projects: [project] }) ??
-      project.workspaceRoot;
+    const sourceCwd = yield* resolveSourceCwd(project, sourceThread);
     const ids = yield* makeIds();
     const createdAt = yield* nowIso;
     const branch = (yield* resolveInitialBranch(mode, input, sourceThread, sourceCwd)) ?? null;
