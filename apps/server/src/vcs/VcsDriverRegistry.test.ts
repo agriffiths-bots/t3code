@@ -92,4 +92,53 @@ describe("VcsDriverRegistry", () => {
       );
     }).pipe(Effect.provide(layer));
   });
+
+  it.effect("bypasses cached repository detection when requested", () => {
+    const calls: VcsProcess.VcsProcessInput[] = [];
+    const layer = Layer.effect(VcsDriverRegistry.VcsDriverRegistry, VcsDriverRegistry.make).pipe(
+      Layer.provide(NodeServices.layer),
+      Layer.provide(
+        Layer.mock(VcsProjectConfig.VcsProjectConfig)({
+          resolveKind: (input) => Effect.succeed(input.requestedKind ?? "auto"),
+        }),
+      ),
+      Layer.provide(
+        Layer.mock(VcsProcess.VcsProcess)({
+          run: (input) =>
+            Effect.sync(() => {
+              calls.push(input);
+              const command = normalizeGitArgs(input.args).join(" ");
+              if (command === "rev-parse --is-inside-work-tree") {
+                return processOutput("true\n");
+              }
+              if (command === "rev-parse --show-toplevel") {
+                return processOutput("/repo\n");
+              }
+              if (command === "rev-parse --git-common-dir") {
+                return processOutput("/repo/.git\n");
+              }
+              return processOutput("");
+            }),
+        }),
+      ),
+    );
+
+    return Effect.gen(function* () {
+      const registry = yield* VcsDriverRegistry.VcsDriverRegistry;
+      yield* registry.detect({ cwd: "/repo", requestedKind: "git" });
+      yield* registry.detect({ cwd: "/repo", requestedKind: "git", cache: "bypass" });
+
+      assert.deepStrictEqual(
+        calls.map((call) => normalizeGitArgs(call.args).join(" ")),
+        [
+          "rev-parse --is-inside-work-tree",
+          "rev-parse --show-toplevel",
+          "rev-parse --git-common-dir",
+          "rev-parse --is-inside-work-tree",
+          "rev-parse --show-toplevel",
+          "rev-parse --git-common-dir",
+        ],
+      );
+    }).pipe(Effect.provide(layer));
+  });
 });

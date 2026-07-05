@@ -182,7 +182,7 @@ const makeActiveThreadStartRuntime = Effect.fn("ThreadToolkit.makeActiveRuntime"
     projectRoot: string,
     candidate: string,
   ) {
-    const candidateHandle = yield* vcsDriverRegistry.detect({ cwd: candidate });
+    const candidateHandle = yield* vcsDriverRegistry.detect({ cwd: candidate, cache: "bypass" });
     if (!candidateHandle) {
       return {
         belongsToProject: false,
@@ -226,9 +226,9 @@ const makeActiveThreadStartRuntime = Effect.fn("ThreadToolkit.makeActiveRuntime"
   });
 
   const workspaceRelativePathForCwd = Effect.fn("ThreadToolkit.workspaceRelativePathForCwd")(
-    function* (cwd: string) {
+    function* (cwd: string, cache: "allow" | "bypass" = "allow") {
       const handle = yield* vcsDriverRegistry
-        .detect({ cwd })
+        .detect(cache === "bypass" ? { cwd, cache } : { cwd })
         .pipe(Effect.orElseSucceed(() => null));
       return handle
         ? workspaceRelativePathFromRepositoryRoot(handle.repository.rootPath, cwd)
@@ -246,7 +246,7 @@ const makeActiveThreadStartRuntime = Effect.fn("ThreadToolkit.makeActiveRuntime"
           const usable = !isMissingCwdSpawnError(error, candidate);
           const fallback: Effect.Effect<SourceCwdProjectContext> = usable
             ? Effect.map(
-                workspaceRelativePathForCwd(candidate),
+                workspaceRelativePathForCwd(candidate, "bypass"),
                 (workspaceRelativePath) =>
                   ({
                     usable: true,

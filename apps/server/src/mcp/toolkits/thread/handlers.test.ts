@@ -715,6 +715,51 @@ it.effect("falls back when source worktree detection fails because the cwd is mi
   }),
 );
 
+it.effect("bypasses stale cached source worktree detection before reusing its cwd", () =>
+  Effect.gen(function* () {
+    const commands: OrchestrationCommand[] = [];
+    const vcsCalls: {
+      readonly cwd: string;
+      readonly cache: VcsDriverRegistry.VcsDriverResolveInput["cache"];
+    }[] = [];
+    const result = yield* callStartTool(
+      { prompt: "Continue after cached checkout cleanup", baseBranch: "main" },
+      commands,
+      {
+        project: {
+          ...project,
+          workspaceRoot: "/repo/project",
+        },
+        sourceThread: {
+          ...sourceThread,
+          worktreePath: "/repo/missing-worktree",
+        },
+        vcsDetect: (input) =>
+          Effect.sync(() => {
+            vcsCalls.push({ cwd: input.cwd, cache: input.cache });
+            if (input.cwd === "/repo/missing-worktree" && input.cache === "bypass") {
+              return null;
+            }
+            return makeGitHandle(input.cwd);
+          }),
+      },
+    );
+
+    expect(result.isError).toBe(false);
+    const command = commands[0];
+    expect(command?.type).toBe("thread.turn.start");
+    if (command?.type !== "thread.turn.start") return;
+    expect(command.bootstrap?.prepareWorktree).toMatchObject({
+      projectCwd: "/repo/project",
+      baseBranch: "main",
+    });
+    expect(vcsCalls).toEqual([
+      { cwd: "/repo/missing-worktree", cache: "bypass" },
+      { cwd: "/repo/project", cache: undefined },
+    ]);
+  }),
+);
+
 it.effect("keeps source package cwd when only the project checkout validation fails", () =>
   Effect.gen(function* () {
     const commands: OrchestrationCommand[] = [];
