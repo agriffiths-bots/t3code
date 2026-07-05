@@ -71,11 +71,13 @@ health probe should wake. For one-off operator runs, `--smoke-instance` and
 `--smoke-model` override those environment defaults.
 
 `--prebuilt-target --rollback-sha SHA --target-sha SHA` is used by the nightly
-cycle after it has already fast-forwarded and built the checkout while the
-service was still running. In this mode the manager skips checkout update and
-rebuild work during downtime, but still records the rollback SHA and uses the
-same snapshot, stop/start, health, DB restore, and resume-injection rollback
-path if the restarted service is not healthy.
+cycle after it has built the target SHA in a detached staging worktree while the
+service was still running. The live checkout stays on the rollback SHA until
+shutdown; after the quiesced DB snapshot, the manager fast-forwards the checkout
+and promotes the staged web and server dist artifacts. In this mode the manager skips rebuild
+work during downtime, but still records the rollback SHA and uses the same
+snapshot, stop/start, health, DB restore, and resume-injection rollback path if
+the restarted service is not healthy.
 
 ## Nightly cycle
 
@@ -84,13 +86,18 @@ runs:
 
 1. VPS backup (`T3DR_BACKUP_CMD`, default `~/.openclaw/bin/t3-vps-backup`).
 2. Upstream sync (`T3DR_UPSTREAM_SYNC_CMD`, default `~/.openclaw/bin/t3-upstream-sync`).
-3. Fast-forward `T3DR_CHECKOUT` to `origin/main` and run one build pass:
-   `pnpm -C "$T3DR_CHECKOUT" run build:desktop`.
+3. Build `origin/main` in a detached staging worktree and stage the web dist
+   plus server dist payload without mutating the live checkout.
+   Targets that are not fast-forwards from the live checkout, or that change
+   pnpm install inputs (`package.json`, `pnpm-lock.yaml`, `pnpm-workspace.yaml`,
+   `.npmrc`, `pnpmfile.cjs`, or `patches/**`), are rejected before staging so
+   new dist code is never started against rollback dependencies.
 4. Optional desktop artifact hook. Until T1 lands, this is a safe no-op. The
    one-line integration is `T3DR_DESKTOP_ARTIFACT=1`, which runs
-   `pnpm -C "$T3DR_CHECKOUT" run dist:desktop:artifact`.
-5. `t3-daily-restart`, passing the prebuilt target metadata when step 3 updated
-   the checkout.
+   `dist:desktop:artifact` in the staging worktree with
+   `T3CODE_DESKTOP_OUTPUT_DIR=$T3DR_LEDGER/<date>/desktop-artifact`.
+5. `t3-daily-restart`, passing the prebuilt target metadata and staged asset
+   payload when step 3 built a target.
 6. Deadline assertion, default `07:00 Europe/London`.
 
 Machine-readable cycle events are appended to
