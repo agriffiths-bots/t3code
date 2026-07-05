@@ -96,6 +96,10 @@ function deriveRepositoryScopedKey(
   project: Pick<EnvironmentProject, "workspaceRoot" | "repositoryIdentity">,
   groupingMode: SidebarProjectGroupingMode,
 ): string | null {
+  if (project.repositoryIdentity?.locator.source === "git-local") {
+    return null;
+  }
+
   const canonicalKey = project.repositoryIdentity?.canonicalKey;
   if (!canonicalKey) {
     return null;

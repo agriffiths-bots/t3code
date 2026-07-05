@@ -19,6 +19,14 @@ const repositoryIdentity = {
     remoteUrl: "https://github.com/example/shared-repo.git",
   },
 };
+const localRepositoryIdentity = {
+  canonicalKey: "git-local:/workspace/shared-repo",
+  locator: {
+    source: "git-local" as const,
+    rootPath: "/workspace/shared-repo",
+  },
+  rootPath: "/workspace/shared-repo",
+};
 const defaultGroupingSettings = {
   sidebarProjectGroupingMode: "repository" as const,
   sidebarProjectGroupingOverrides: {},
@@ -60,6 +68,23 @@ describe("environment grouping", () => {
     const remote = makeProject({
       id: ProjectId.make("project-remote"),
       environmentId: remoteEnvironmentId,
+    });
+
+    expect(deriveLogicalProjectKey(primary)).toBe(derivePhysicalProjectKey(primary));
+    expect(deriveLogicalProjectKey(remote)).toBe(derivePhysicalProjectKey(remote));
+    expect(deriveLogicalProjectKey(primary)).not.toBe(deriveLogicalProjectKey(remote));
+  });
+
+  it("keeps local repository identities physically scoped across environments", () => {
+    const primary = makeProject({
+      workspaceRoot: "/workspace/shared-repo/packages/app",
+      repositoryIdentity: localRepositoryIdentity,
+    });
+    const remote = makeProject({
+      id: ProjectId.make("project-remote"),
+      environmentId: remoteEnvironmentId,
+      workspaceRoot: "/workspace/shared-repo/packages/app",
+      repositoryIdentity: localRepositoryIdentity,
     });
 
     expect(deriveLogicalProjectKey(primary)).toBe(derivePhysicalProjectKey(primary));

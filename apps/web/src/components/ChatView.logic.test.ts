@@ -18,6 +18,7 @@ import {
   resolveSendEnvMode,
   shouldWriteThreadErrorToCurrentServerThread,
   threadHasEstablishedProviderBinding,
+  workspaceRelativePathFromRepositoryRoot,
 } from "./ChatView.logic";
 
 const environmentId = EnvironmentId.make("environment-local");
@@ -72,6 +73,18 @@ const readySession = {
   lastError: null,
   updatedAt: "2026-03-29T00:00:10.000Z",
 };
+
+describe("workspaceRelativePathFromRepositoryRoot", () => {
+  it("returns the workspace path relative to a repository root", () => {
+    expect(workspaceRelativePathFromRepositoryRoot("/repo", "/repo/packages/app")).toBe(
+      "packages/app",
+    );
+  });
+
+  it("returns null when no repository root is known", () => {
+    expect(workspaceRelativePathFromRepositoryRoot(null, "/repo/packages/app")).toBeNull();
+  });
+});
 
 describe("threadHasEstablishedProviderBinding", () => {
   it("does not treat synthetic first-start errors as established provider bindings", () => {

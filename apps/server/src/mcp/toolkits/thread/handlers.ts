@@ -20,6 +20,7 @@ import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Path from "effect/Path";
+import * as PlatformError from "effect/PlatformError";
 import * as Schema from "effect/Schema";
 
 import * as McpInvocationContext from "../../McpInvocationContext.ts";
@@ -46,7 +47,15 @@ const fail = (message: string) => new ThreadStartToolError({ message });
 const isMissingCwdSpawnError = (error: unknown, cwd: string): boolean => {
   if (!isVcsProcessSpawnError(error) || error.cwd !== cwd) return false;
   const cause = error.cause;
-  return cause instanceof Error && "code" in cause && cause.code === "ENOENT";
+  if (cause instanceof Error && "code" in cause && cause.code === "ENOENT") {
+    return true;
+  }
+  return (
+    cause instanceof PlatformError.PlatformError &&
+    cause.reason._tag === "NotFound" &&
+    cause.reason.module === "ChildProcess" &&
+    (cause.reason.method === "spawn" || cause.reason.syscall === "chdir")
+  );
 };
 
 const truncateTitle = (value: string): string => {

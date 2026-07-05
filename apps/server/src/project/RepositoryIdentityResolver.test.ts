@@ -88,7 +88,7 @@ it.layer(NodeServices.layer)("RepositoryIdentityResolverLive", (it) => {
     }).pipe(Effect.provide(RepositoryIdentityResolver.layer)),
   );
 
-  it.effect("returns null for non-git folders and repos without remotes", () =>
+  it.effect("returns null for non-git folders and local identity for repos without remotes", () =>
     Effect.gen(function* () {
       const fileSystem = yield* FileSystem.FileSystem;
       const nonGitDir = yield* fileSystem.makeTempDirectoryScoped({
@@ -105,7 +105,13 @@ it.layer(NodeServices.layer)("RepositoryIdentityResolverLive", (it) => {
       const noRemoteIdentity = yield* resolver.resolve(gitDir);
 
       expect(nonGitIdentity).toBeNull();
-      expect(noRemoteIdentity).toBeNull();
+      expect(noRemoteIdentity).not.toBeNull();
+      expect(noRemoteIdentity?.canonicalKey).toBe(`git-local:${gitDir}`);
+      expect(noRemoteIdentity?.locator).toEqual({
+        source: "git-local",
+        rootPath: gitDir,
+      });
+      expect(noRemoteIdentity?.rootPath).toBe(gitDir);
     }).pipe(Effect.provide(RepositoryIdentityResolver.layer)),
   );
 
@@ -124,7 +130,9 @@ it.layer(NodeServices.layer)("RepositoryIdentityResolverLive", (it) => {
       const identity = yield* resolver.resolve(cwd);
 
       expect(identity).not.toBeNull();
-      expect(identity?.locator.remoteName).toBe("upstream");
+      expect(identity?.locator.source).toBe("git-remote");
+      if (identity?.locator.source !== "git-remote") return;
+      expect(identity.locator.remoteName).toBe("upstream");
       expect(identity?.canonicalKey).toBe("github.com/t3tools/t3code");
       expect(identity?.displayName).toBe("t3tools/t3code");
     }).pipe(Effect.provide(RepositoryIdentityResolver.layer)),
@@ -152,7 +160,7 @@ it.layer(NodeServices.layer)("RepositoryIdentityResolverLive", (it) => {
   );
 
   it.effect(
-    "keeps null identities cached across repeated resolves until the negative TTL expires",
+    "keeps local identities cached across repeated resolves until the positive TTL expires",
     () =>
       Effect.gen(function* () {
         const fileSystem = yield* FileSystem.FileSystem;
@@ -164,13 +172,15 @@ it.layer(NodeServices.layer)("RepositoryIdentityResolverLive", (it) => {
 
         const resolver = yield* RepositoryIdentityResolver.RepositoryIdentityResolver;
         const initialIdentity = yield* resolver.resolve(cwd);
-        expect(initialIdentity).toBeNull();
+        expect(initialIdentity).not.toBeNull();
+        expect(initialIdentity?.canonicalKey).toBe(`git-local:${cwd}`);
 
         yield* git(cwd, ["remote", "add", "origin", "git@github.com:T3Tools/t3code.git"]);
 
         for (const _attempt of [1, 2, 3]) {
           const cachedIdentity = yield* resolver.resolve(cwd);
-          expect(cachedIdentity).toBeNull();
+          expect(cachedIdentity).not.toBeNull();
+          expect(cachedIdentity?.canonicalKey).toBe(`git-local:${cwd}`);
         }
 
         yield* TestClock.adjust(Duration.millis(120));
@@ -185,7 +195,7 @@ it.layer(NodeServices.layer)("RepositoryIdentityResolverLive", (it) => {
             TestClock.layer(),
             makeRepositoryIdentityResolverTestLayer({
               negativeCacheTtl: Duration.millis(50),
-              positiveCacheTtl: Duration.seconds(1),
+              positiveCacheTtl: Duration.millis(50),
             }),
           ),
         ),

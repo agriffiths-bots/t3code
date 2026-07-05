@@ -29,14 +29,23 @@ function compareIsoDateDescending(left: string, right: string): number {
   return new Date(right).getTime() - new Date(left).getTime();
 }
 
+function groupableRepositoryIdentity(project: EnvironmentProject): RepositoryIdentity | null {
+  const identity = project.repositoryIdentity;
+  if (!identity || identity.locator.source === "git-local") {
+    return null;
+  }
+  return identity;
+}
+
 function deriveRepositoryGroupKey(project: EnvironmentProject): string {
   return (
-    project.repositoryIdentity?.canonicalKey ?? scopedProjectKey(project.environmentId, project.id)
+    groupableRepositoryIdentity(project)?.canonicalKey ??
+    scopedProjectKey(project.environmentId, project.id)
   );
 }
 
 function deriveRepositoryTitle(project: EnvironmentProject): string {
-  const identity = project.repositoryIdentity;
+  const identity = groupableRepositoryIdentity(project);
   return identity?.displayName ?? identity?.name ?? project.title;
 }
 
@@ -78,6 +87,7 @@ export function groupProjectsByRepository(input: {
 
   for (const project of input.projects) {
     const key = deriveRepositoryGroupKey(project);
+    const repositoryIdentity = groupableRepositoryIdentity(project);
     const projectKey = scopedProjectKey(project.environmentId, project.id);
     const threads = Arr.sortWith(
       threadsByProjectKey.get(projectKey) ?? [],
@@ -98,8 +108,8 @@ export function groupProjectsByRepository(input: {
       grouped.set(key, {
         key,
         title: deriveRepositoryTitle(project),
-        subtitle: deriveRepositorySubtitle(project.repositoryIdentity),
-        repositoryIdentity: project.repositoryIdentity ?? null,
+        subtitle: deriveRepositorySubtitle(repositoryIdentity),
+        repositoryIdentity,
         projectCount: 1,
         threadCount: threads.length,
         latestActivityAt,
@@ -111,8 +121,8 @@ export function groupProjectsByRepository(input: {
     grouped.set(key, {
       ...existing,
       title: existing.repositoryIdentity ? existing.title : deriveRepositoryTitle(project),
-      subtitle: existing.subtitle ?? deriveRepositorySubtitle(project.repositoryIdentity),
-      repositoryIdentity: existing.repositoryIdentity ?? project.repositoryIdentity ?? null,
+      subtitle: existing.subtitle ?? deriveRepositorySubtitle(repositoryIdentity),
+      repositoryIdentity: existing.repositoryIdentity ?? repositoryIdentity,
       projectCount: existing.projectCount + 1,
       threadCount: existing.threadCount + threads.length,
       latestActivityAt:

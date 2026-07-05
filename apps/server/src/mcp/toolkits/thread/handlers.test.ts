@@ -18,6 +18,7 @@ import * as Crypto from "effect/Crypto";
 import * as DateTime from "effect/DateTime";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
+import * as PlatformError from "effect/PlatformError";
 import * as Stream from "effect/Stream";
 import { McpSchema, McpServer } from "effect/unstable/ai";
 
@@ -623,7 +624,14 @@ it.effect("falls back when source worktree detection fails because the cwd is mi
   Effect.gen(function* () {
     const commands: OrchestrationCommand[] = [];
     const vcsCalls: string[] = [];
-    const missingCwdCause = Object.assign(new Error("spawn ENOENT"), { code: "ENOENT" });
+    const missingCwdCause = PlatformError.systemError({
+      _tag: "NotFound",
+      module: "ChildProcess",
+      method: "spawn",
+      syscall: "chdir",
+      pathOrDescriptor: "/repo/missing-worktree",
+      cause: Object.assign(new Error("spawn ENOENT"), { code: "ENOENT" }),
+    });
     const result = yield* callStartTool(
       { prompt: "Continue after deleted checkout", baseBranch: "main" },
       commands,

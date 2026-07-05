@@ -122,6 +122,39 @@ describe("groupProjectsByRepository", () => {
     expect(groups[0]?.latestActivityAt).toBe("2026-04-03T12:00:00.000Z");
   });
 
+  it("keeps local repository identities scoped to each project", () => {
+    const localIdentity = {
+      canonicalKey: "git-local:/workspace/t3code",
+      locator: {
+        source: "git-local" as const,
+        rootPath: "/workspace/t3code",
+      },
+      rootPath: "/workspace/t3code",
+      displayName: "/workspace/t3code",
+    };
+
+    const projects = [
+      makeProject({
+        environmentId: EnvironmentId.make("env-local"),
+        id: ProjectId.make("project-local"),
+        title: "Local T3 Code",
+        repositoryIdentity: localIdentity,
+      }),
+      makeProject({
+        environmentId: EnvironmentId.make("env-staging"),
+        id: ProjectId.make("project-staging"),
+        title: "Staging T3 Code",
+        repositoryIdentity: localIdentity,
+      }),
+    ];
+
+    const groups = groupProjectsByRepository({ projects, threads: [] });
+
+    expect(groups).toHaveLength(2);
+    expect(groups.map((group) => group.key)).not.toContain(localIdentity.canonicalKey);
+    expect(groups.map((group) => group.projectCount)).toEqual([1, 1]);
+  });
+
   it("orders threads, projects, and repository groups by latest activity", () => {
     const projects = [
       makeProject({
