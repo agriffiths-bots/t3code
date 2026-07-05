@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 import {
+  buildSidebarThreadTreeRows,
   createThreadJumpHintVisibilityController,
   getSidebarThreadIdsToPrewarm,
   getVisibleSidebarThreadIds,
@@ -20,6 +21,7 @@ import {
   shouldClearThreadSelectionOnMouseDown,
   sortProjectsForSidebar,
   THREAD_JUMP_HINT_SHOW_DELAY_MS,
+  type SidebarThreadTreeInput,
 } from "./Sidebar.logic";
 import {
   EnvironmentId,
@@ -738,6 +740,134 @@ describe("resolveProjectStatusIndicator", () => {
         },
       ]),
     ).toMatchObject({ label: "Plan Ready", dotClass: "bg-violet-500" });
+  });
+});
+
+function makeTreeThread(
+  overrides: Partial<SidebarThreadTreeInput> & Pick<SidebarThreadTreeInput, "id">,
+): SidebarThreadTreeInput {
+  return {
+    id: overrides.id,
+    environmentId: overrides.environmentId ?? localEnvironmentId,
+    hasActionableProposedPlan: overrides.hasActionableProposedPlan ?? false,
+    hasPendingApprovals: overrides.hasPendingApprovals ?? false,
+    hasPendingUserInput: overrides.hasPendingUserInput ?? false,
+    interactionMode: overrides.interactionMode ?? "default",
+    latestTurn: overrides.latestTurn ?? null,
+    parentThreadId: overrides.parentThreadId ?? null,
+    session: overrides.session ?? null,
+  };
+}
+
+describe("buildSidebarThreadTreeRows", () => {
+  it("places child threads directly under their parent with indentation metadata", () => {
+    const parent = makeTreeThread({ id: ThreadId.make("parent") });
+    const unrelated = makeTreeThread({ id: ThreadId.make("unrelated") });
+    const child = makeTreeThread({
+      id: ThreadId.make("child"),
+      parentThreadId: parent.id,
+    });
+
+    const rows = buildSidebarThreadTreeRows([parent, unrelated, child]);
+
+    expect(rows.map((row) => row.thread.id)).toEqual([parent.id, child.id, unrelated.id]);
+    expect(rows.map((row) => row.depth)).toEqual([0, 1, 0]);
+    expect(rows[0]).toMatchObject({
+      directChildCount: 1,
+      descendantCount: 1,
+    });
+  });
+
+  it("rolls descendant running, done, and failed counts onto parent rows", () => {
+    const parent = makeTreeThread({ id: ThreadId.make("parent") });
+    const running = makeTreeThread({
+      id: ThreadId.make("running"),
+      parentThreadId: parent.id,
+      session: {
+        threadId: ThreadId.make("running"),
+        status: "running",
+        providerName: "Codex",
+        providerInstanceId: ProviderInstanceId.make("codex"),
+        runtimeMode: DEFAULT_RUNTIME_MODE,
+        activeTurnId: "turn-running" as never,
+        lastError: null,
+        updatedAt: "2026-03-09T10:00:00.000Z",
+      },
+    });
+    const done = makeTreeThread({
+      id: ThreadId.make("done"),
+      parentThreadId: parent.id,
+      latestTurn: makeLatestTurn(),
+    });
+    const failed = makeTreeThread({
+      id: ThreadId.make("failed"),
+      parentThreadId: parent.id,
+      latestTurn: {
+        ...makeLatestTurn(),
+        state: "error",
+      },
+    });
+
+    const [parentRow] = buildSidebarThreadTreeRows([parent, running, done, failed]);
+
+    expect(parentRow?.rollup).toEqual({
+      running: 1,
+      done: 1,
+      failed: 1,
+    });
+  });
+
+  it("floats needs-you groups and child rows ahead of passive threads", () => {
+    const passiveParent = makeTreeThread({ id: ThreadId.make("passive-parent") });
+    const activeParent = makeTreeThread({ id: ThreadId.make("active-parent") });
+    const passiveChild = makeTreeThread({
+      id: ThreadId.make("passive-child"),
+      parentThreadId: activeParent.id,
+    });
+    const needsYouChild = makeTreeThread({
+      id: ThreadId.make("needs-you-child"),
+      parentThreadId: activeParent.id,
+      hasPendingUserInput: true,
+    });
+
+    const rows = buildSidebarThreadTreeRows([
+      passiveParent,
+      activeParent,
+      passiveChild,
+      needsYouChild,
+    ]);
+
+    expect(rows.map((row) => row.thread.id)).toEqual([
+      activeParent.id,
+      needsYouChild.id,
+      passiveChild.id,
+      passiveParent.id,
+    ]);
+    expect(rows[0]).toMatchObject({
+      hasNeedsYou: false,
+      hasDescendantNeedsYou: true,
+    });
+    expect(rows[1]).toMatchObject({ hasNeedsYou: true });
+  });
+
+  it("keeps orphaned and cyclic child links visible as root rows", () => {
+    const orphan = makeTreeThread({
+      id: ThreadId.make("orphan"),
+      parentThreadId: ThreadId.make("missing-parent"),
+    });
+    const cycleA = makeTreeThread({
+      id: ThreadId.make("cycle-a"),
+      parentThreadId: ThreadId.make("cycle-b"),
+    });
+    const cycleB = makeTreeThread({
+      id: ThreadId.make("cycle-b"),
+      parentThreadId: ThreadId.make("cycle-a"),
+    });
+
+    const rows = buildSidebarThreadTreeRows([orphan, cycleA, cycleB]);
+
+    expect(rows.map((row) => row.thread.id)).toEqual([orphan.id, cycleA.id, cycleB.id]);
+    expect(rows.map((row) => row.depth)).toEqual([0, 0, 1]);
   });
 });
 
