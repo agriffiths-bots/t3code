@@ -6,11 +6,6 @@ on:
   # Minute offset (17, not 0) avoids GitHub's top-of-hour scheduler congestion,
   # where minute-zero runs are frequently delayed or dropped.
   workflow_dispatch:
-    inputs:
-      prerelease:
-        description: "Mark the GitHub Release as a prerelease"
-        type: boolean
-        default: true
   schedule:
     - cron: "17 23 * * *"
 
@@ -27,8 +22,32 @@ jobs:
     outputs:
       release_tag: ${{ steps.meta.outputs.release_tag }}
       release_name: ${{ steps.meta.outputs.release_name }}
-      release_version: ${{ steps.meta.outputs.release_version }}
+      release_version: ${{ steps.nightly.outputs.version }}
     steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.sha }}
+
+      - name: Setup Vite+
+        uses: voidzero-dev/setup-vp@v1
+        with:
+          node-version-file: package.json
+          cache: true
+          run-install: true
+
+      - id: nightly
+        name: Resolve nightly prerelease version
+        shell: bash
+        run: |
+          set -euo pipefail
+          nightly_date="$(date -u +%Y%m%d)"
+          node scripts/resolve-nightly-release.ts \
+            --date "$nightly_date" \
+            --run-number "${{ github.run_number }}" \
+            --sha "$GITHUB_SHA" \
+            --github-output
+
       - id: meta
         name: Resolve main prerelease version
         shell: bash
@@ -39,7 +58,6 @@ jobs:
           date_part="$(date -u +%Y%m%d%H%M%S)"
           echo "release_tag=main-${date_part}-${short_sha}" >> "$GITHUB_OUTPUT"
           echo "release_name=T3 Code main ${short_sha}" >> "$GITHUB_OUTPUT"
-          echo "release_version=0.0.0-main.${{ github.run_number }}" >> "$GITHUB_OUTPUT"
 
   public_config:
     name: Resolve artifact public config
@@ -132,8 +150,9 @@ jobs:
       clerk_jwt_template: ${{ needs.public_config.outputs.clerk_jwt_template }}
       clerk_cli_oauth_client_id: ${{ needs.public_config.outputs.clerk_cli_oauth_client_id }}
       relay_url: ${{ needs.public_config.outputs.relay_url }}
-      # Nightly (schedule) builds are always prereleases; manual runs honor the input.
-      prerelease: ${{ github.event_name == 'schedule' || inputs.prerelease }}
+      # Main artifacts use nightly-channel app versions, so every release must
+      # be a GitHub prerelease for the nightly updater query to discover it.
+      prerelease: true
       windows_signing: true
     secrets: inherit
 
