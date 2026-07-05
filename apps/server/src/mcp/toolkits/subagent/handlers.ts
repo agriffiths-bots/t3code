@@ -111,11 +111,51 @@ const clamp = (value: number, min: number, max: number): number =>
  * or 0 when the thread has not completed a turn yet.
  */
 const turnCountOf = (thread: OrchestrationThread): number => {
-  let count = 0;
+  let checkpointCount = 0;
+  const checkpointTurnIds = new Set<string>();
+  let latestCheckpointCompletedAt: string | null = null;
   for (const checkpoint of thread.checkpoints) {
-    if (checkpoint.checkpointTurnCount > count) count = checkpoint.checkpointTurnCount;
+    checkpointTurnIds.add(checkpoint.turnId);
+    if (
+      checkpoint.checkpointTurnCount > checkpointCount ||
+      (checkpoint.checkpointTurnCount === checkpointCount &&
+        (latestCheckpointCompletedAt === null ||
+          checkpoint.completedAt > latestCheckpointCompletedAt))
+    ) {
+      checkpointCount = checkpoint.checkpointTurnCount;
+      latestCheckpointCompletedAt = checkpoint.completedAt;
+    }
   }
-  return count;
+  const isAfterLatestCheckpoint = (timestamp: string | null): boolean =>
+    timestamp !== null &&
+    (latestCheckpointCompletedAt === null || timestamp > latestCheckpointCompletedAt);
+  const runningTurnId =
+    thread.latestTurn !== null && thread.latestTurn.state === "running"
+      ? thread.latestTurn.turnId
+      : null;
+  const projectedTurnIds = new Set<string>();
+  for (const message of thread.messages) {
+    if (
+      message.turnId !== null &&
+      !message.streaming &&
+      message.turnId !== runningTurnId &&
+      !checkpointTurnIds.has(message.turnId) &&
+      isAfterLatestCheckpoint(message.createdAt)
+    ) {
+      projectedTurnIds.add(message.turnId);
+    }
+  }
+  if (
+    thread.latestTurn !== null &&
+    thread.latestTurn.state !== "running" &&
+    !checkpointTurnIds.has(thread.latestTurn.turnId) &&
+    isAfterLatestCheckpoint(
+      thread.latestTurn.completedAt ?? thread.latestTurn.startedAt ?? thread.latestTurn.requestedAt,
+    )
+  ) {
+    projectedTurnIds.add(thread.latestTurn.turnId);
+  }
+  return checkpointCount + projectedTurnIds.size;
 };
 
 /** Latest assistant message text on a thread, or null. */
@@ -132,15 +172,29 @@ const latestAssistantTextOf = (thread: OrchestrationThread): string | null => {
  * `t3_check_subagent` / `t3_list_subagents` (matches the coordinator's terminal
  * vocabulary where it overlaps).
  */
-const statusOf = (thread: Pick<OrchestrationThread, "latestTurn" | "session">): string => {
+const statusOf = (
+  thread: Pick<OrchestrationThread, "latestTurn" | "messages" | "session">,
+): string => {
   if (thread.latestTurn?.state === "running") return "running";
   const session = thread.session;
-  if (session !== null && (session.status === "stopped" || session.status === "error")) {
+  if (session?.status === "error") {
     return "failed";
   }
+  if (hasCurrentProjectedTerminalTurn(thread)) {
+    if (session?.status === "stopped" && thread.latestTurn?.state !== "completed") {
+      return "failed";
+    }
+    switch (thread.latestTurn?.state) {
+      case "completed":
+        return "completed";
+      case "error":
+        return "failed";
+      case "interrupted":
+        return "interrupted";
+    }
+  }
+  if (session?.status === "stopped") return "failed";
   switch (thread.latestTurn?.state) {
-    case "completed":
-      return "completed";
     case "error":
       return "failed";
     case "interrupted":
@@ -151,25 +205,36 @@ const statusOf = (thread: Pick<OrchestrationThread, "latestTurn" | "session">): 
 };
 
 const hasCurrentProjectedTerminalTurn = (
-  thread: Pick<OrchestrationThread, "latestTurn" | "session">,
+  thread: Pick<OrchestrationThread, "latestTurn" | "messages" | "session">,
 ): boolean => {
   const latestTurn = thread.latestTurn;
   if (latestTurn === null || latestTurn.state === "running") return false;
   const session = thread.session;
   if (session?.activeTurnId != null) return latestTurn.turnId === session.activeTurnId;
+  if (session?.status === "stopped") {
+    const terminalAt = latestTurn.completedAt ?? latestTurn.startedAt ?? latestTurn.requestedAt;
+    return !thread.messages.some(
+      (message) =>
+        !message.streaming &&
+        message.turnId !== latestTurn.turnId &&
+        message.createdAt > terminalAt,
+    );
+  }
+  if (session?.status === "error") {
+    return latestTurn.state !== "completed";
+  }
   return (
     session === null ||
     session.status === "idle" ||
     session.status === "ready" ||
-    session.status === "interrupted" ||
-    session.status === "stopped" ||
-    session.status === "error"
+    session.status === "interrupted"
   );
 };
 
 const waitTerminalStatusOf = (
-  thread: Pick<OrchestrationThread, "latestTurn" | "session">,
+  thread: Pick<OrchestrationThread, "latestTurn" | "messages" | "session">,
 ): "completed" | "failed" | null => {
+  if (thread.session?.status === "error") return "failed";
   if (!hasCurrentProjectedTerminalTurn(thread)) return null;
   const state = thread.latestTurn?.state;
   if (state === "completed") return "completed";
