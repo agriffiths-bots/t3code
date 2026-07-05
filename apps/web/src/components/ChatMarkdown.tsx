@@ -41,6 +41,8 @@ import rehypeSanitize, { defaultSchema } from "rehype-sanitize";
 import remarkBreaks from "remark-breaks";
 import remarkGfm from "remark-gfm";
 import { renderSkillInlineMarkdownChildren } from "./chat/SkillInlineText";
+import GenUiArtifact from "./chat/GenUiArtifact";
+import { GENUI_FENCE_LANGUAGE } from "./chat/genUiArtifact";
 import { CHAT_FILE_TAG_CHIP_CLASS_NAME, FileTagChipContent } from "./chat/FileTagChip";
 import { PierreEntryIcon } from "./chat/PierreEntryIcon";
 import { hasSpecificPierreIconForFileName, syntheticFileNameForLanguageId } from "../pierre-icons";
@@ -55,7 +57,7 @@ import { resolveDiffThemeName, type DiffThemeName } from "../lib/diffRendering";
 import { fnv1a32 } from "../lib/diffRendering";
 import { LRUCache } from "../lib/lruCache";
 import { useTheme } from "../hooks/useTheme";
-import { getClientSettings } from "../hooks/useSettings";
+import { getClientSettings, useClientSettings } from "../hooks/useSettings";
 import {
   chatMarkdownClipboardPayload,
   serializeTableElementToCsv,
@@ -1240,6 +1242,7 @@ function ChatMarkdown({
   lineBreaks = false,
 }: ChatMarkdownProps) {
   const { resolvedTheme } = useTheme();
+  const generativeUiEnabled = useClientSettings((settings) => settings.enableGenerativeUi);
   const createAssetUrl = useAtomQueryRunner(assetEnvironment.createUrl, {
     reportFailure: false,
   });
@@ -1498,6 +1501,14 @@ function ChatMarkdown({
         }
 
         const language = extractFenceLanguage(codeBlock.className);
+        // Prototype: a ```genui fence carries a self-contained visual the
+        // model generated. Render it in a hard-sandboxed iframe instead of a
+        // syntax-highlighted code block. Gated behind a client flag; when off
+        // (default), it falls through to the normal code-block rendering so
+        // the raw markup is still visible and inert.
+        if (generativeUiEnabled && language === GENUI_FENCE_LANGUAGE) {
+          return <GenUiArtifact html={codeBlock.code} isStreaming={isStreaming} />;
+        }
         const fenceTitle = extractFenceTitle(extractPreCodeMeta(node));
         return (
           <MarkdownCodeBlock
@@ -1522,6 +1533,7 @@ function ChatMarkdown({
     }),
     [
       diffThemeName,
+      generativeUiEnabled,
       fileLinkParentSuffixByPath,
       isStreaming,
       markdownFileLinkMetaByHref,
