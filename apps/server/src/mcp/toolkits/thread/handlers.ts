@@ -114,12 +114,15 @@ const makeActiveThreadStartRuntime = Effect.fn("ThreadToolkit.makeActiveRuntime"
     );
   });
 
-  const repositoryIdentityPath = (repository: VcsRepositoryIdentity): string => {
+  const repositoryIdentityPath = (
+    repository: VcsRepositoryIdentity,
+    detectionCwd: string,
+  ): string => {
     const metadataPath = repository.metadataPath?.trim();
     const identityPath =
       metadataPath && metadataPath.length > 0 ? metadataPath : repository.rootPath;
     return path.normalize(
-      path.isAbsolute(identityPath) ? identityPath : path.join(repository.rootPath, identityPath),
+      path.isAbsolute(identityPath) ? identityPath : path.resolve(detectionCwd, identityPath),
     );
   };
 
@@ -143,8 +146,8 @@ const makeActiveThreadStartRuntime = Effect.fn("ThreadToolkit.makeActiveRuntime"
 
     return (
       candidateHandle.kind === projectHandle.kind &&
-      repositoryIdentityPath(candidateHandle.repository) ===
-        repositoryIdentityPath(projectHandle.repository)
+      repositoryIdentityPath(candidateHandle.repository, candidate) ===
+        repositoryIdentityPath(projectHandle.repository, projectRoot)
     );
   });
 

@@ -164,14 +164,20 @@ const repositoryMetadataRootForCwd = (cwd: string): string => {
   return cwd;
 };
 
-const makeGitHandle = (cwd: string): VcsDriverRegistry.VcsDriverHandle => {
+const makeGitHandle = (
+  cwd: string,
+  options: {
+    readonly rootPath?: string;
+    readonly metadataPath?: string;
+  } = {},
+): VcsDriverRegistry.VcsDriverHandle => {
   const metadataRoot = repositoryMetadataRootForCwd(cwd);
   return {
     kind: "git",
     repository: {
       kind: "git",
-      rootPath: cwd,
-      metadataPath: `${metadataRoot}/.git`,
+      rootPath: options.rootPath ?? cwd,
+      metadataPath: options.metadataPath ?? `${metadataRoot}/.git`,
       freshness: vcsFreshness,
     },
     driver: {} as VcsDriverRegistry.VcsDriverHandle["driver"],
@@ -684,6 +690,54 @@ it.effect("falls back when a source worktree is outside a non-repo project conta
     if (command?.type !== "thread.turn.start") return;
     expect(command.bootstrap?.prepareWorktree).toMatchObject({
       projectCwd: "/home/adam",
+      baseBranch: "main",
+    });
+  }),
+);
+
+it.effect("accepts same-repo source worktrees when project detection uses relative metadata", () =>
+  Effect.gen(function* () {
+    const commands: OrchestrationCommand[] = [];
+    const result = yield* callStartTool(
+      {
+        prompt: "Spawn from monorepo package checkout",
+        baseBranch: "main",
+      },
+      commands,
+      {
+        project: {
+          ...project,
+          workspaceRoot: "/repo/packages/app",
+        },
+        sourceThread: {
+          ...sourceThread,
+          worktreePath: "/repo-worktree/packages/app",
+        },
+        vcsDetect: (input) => {
+          if (input.cwd === "/repo/packages/app") {
+            return Effect.succeed(
+              makeGitHandle(input.cwd, {
+                rootPath: "/repo",
+                metadataPath: "../../.git",
+              }),
+            );
+          }
+          return Effect.succeed(
+            makeGitHandle(input.cwd, {
+              rootPath: "/repo-worktree",
+              metadataPath: "/repo/.git",
+            }),
+          );
+        },
+      },
+    );
+
+    expect(result.isError).toBe(false);
+    const command = commands[0];
+    expect(command?.type).toBe("thread.turn.start");
+    if (command?.type !== "thread.turn.start") return;
+    expect(command.bootstrap?.prepareWorktree).toMatchObject({
+      projectCwd: "/repo-worktree/packages/app",
       baseBranch: "main",
     });
   }),
