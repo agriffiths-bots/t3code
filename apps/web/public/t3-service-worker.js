@@ -1,6 +1,7 @@
 const CACHE_VERSION = "t3-code-v2";
 const CACHE_PREFIX = "t3-code-";
 const APP_SHELL_URLS = ["/", "/manifest.webmanifest", "/pwa-icon-192.png", "/pwa-icon-512.png"];
+const DEFAULT_ACK_URL = "/api/notifications/ack";
 const BUILD_ASSET_PATH_PREFIX = "/assets/";
 
 function isBuildAssetUrl(url) {
@@ -151,4 +152,121 @@ self.addEventListener("fetch", (event) => {
 
   event.waitUntil(Promise.all([shellRefresh, cacheCleanup]));
   event.respondWith(networkResponse.then((response) => response).catch(cachedShellOrUnavailable));
+});
+
+function readPushPayload(event) {
+  if (!event.data) return null;
+  try {
+    return event.data.json();
+  } catch {
+    return null;
+  }
+}
+
+function notificationTag(notificationId) {
+  return `t3:${notificationId}`;
+}
+
+async function acknowledge(notification, action) {
+  const data = notification?.data;
+  if (!data?.notificationId || !data?.ackToken) return;
+  const ackUrl =
+    typeof data.ackUrl === "string" && data.ackUrl.length > 0 ? data.ackUrl : DEFAULT_ACK_URL;
+  await fetch(ackUrl, {
+    method: "POST",
+    mode: "cors",
+    credentials: "omit",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      notificationId: data.notificationId,
+      ackToken: data.ackToken,
+      action,
+    }),
+    keepalive: true,
+  }).catch(() => undefined);
+}
+
+async function closeNotification(notificationId) {
+  const notifications = await self.registration.getNotifications({
+    tag: notificationTag(notificationId),
+  });
+  for (const notification of notifications) {
+    notification.close();
+  }
+}
+
+self.addEventListener("push", (event) => {
+  const payload = readPushPayload(event);
+  if (!payload) return;
+
+  if (payload.kind === "dismiss" && typeof payload.notificationId === "string") {
+    event.waitUntil(closeNotification(payload.notificationId));
+    return;
+  }
+
+  const notification = payload.notification;
+  if (payload.kind !== "show" || !notification?.notificationId || !notification?.title) {
+    return;
+  }
+
+  event.waitUntil(
+    self.registration.showNotification(notification.title, {
+      body: notification.body,
+      tag: notificationTag(notification.notificationId),
+      data: {
+        notificationId: notification.notificationId,
+        ackToken: notification.ackToken,
+        ackUrl: typeof payload.ackUrl === "string" ? payload.ackUrl : DEFAULT_ACK_URL,
+        deepLink: notification.deepLink ?? "/",
+      },
+      icon: "/pwa-icon-192.png",
+      badge: "/pwa-icon-192.png",
+      requireInteraction: notification.requireInteraction !== false,
+      actions: [
+        { action: "open", title: "Open" },
+        { action: "dismiss", title: "Dismiss" },
+      ],
+    }),
+  );
+});
+
+self.addEventListener("notificationclick", (event) => {
+  event.notification.close();
+  event.waitUntil(
+    (async () => {
+      const ackPromise = acknowledge(
+        event.notification,
+        event.action === "dismiss" ? "dismissed" : "opened",
+      );
+      if (event.action === "dismiss") {
+        await ackPromise;
+        return;
+      }
+
+      const rawDeepLink = event.notification.data?.deepLink;
+      const deepLink =
+        typeof rawDeepLink === "string" &&
+        rawDeepLink.startsWith("/") &&
+        !rawDeepLink.startsWith("//")
+          ? rawDeepLink
+          : "/";
+      const allClients = await self.clients.matchAll({ type: "window", includeUncontrolled: true });
+      const sameOriginUrl = new URL(deepLink, self.location.origin).toString();
+      for (const client of allClients) {
+        if ("focus" in client && client.url.startsWith(self.location.origin)) {
+          await client.focus();
+          // oxlint-disable-next-line unicorn/require-post-message-target-origin -- Service worker Client.postMessage does not accept a targetOrigin parameter.
+          client.postMessage({ type: "t3-notification-open", deepLink });
+          await ackPromise;
+          return;
+        }
+      }
+      await self.clients.openWindow(sameOriginUrl);
+      await ackPromise;
+    })(),
+  );
+});
+
+self.addEventListener("notificationclose", (event) => {
+  event.waitUntil(acknowledge(event.notification, "closed"));
 });

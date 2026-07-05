@@ -7,7 +7,7 @@ import {
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 
-export type McpCapability = "preview" | "thread-management";
+export type McpCapability = "preview" | "thread-management" | "notification";
 
 export interface McpInvocationScope {
   readonly environmentId: EnvironmentId;
