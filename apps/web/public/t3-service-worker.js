@@ -11,11 +11,28 @@ function isUsableBuildAssetResponse(response) {
   return response.ok && !contentType.includes("text/html");
 }
 
+function isUsableShellResponse(response) {
+  const contentType = response.headers.get("content-type")?.toLowerCase() ?? "";
+  return response.ok && contentType.includes("text/html");
+}
+
 function assetUnavailableResponse() {
   return new Response("T3 Code asset unavailable while offline.", {
     status: 503,
     headers: { "content-type": "text/plain; charset=utf-8" },
   });
+}
+
+function shellUnavailableResponse() {
+  return new Response("T3 Code is offline. Reconnect to continue.", {
+    status: 503,
+    headers: { "content-type": "text/plain; charset=utf-8" },
+  });
+}
+
+async function cachedShellOrUnavailable() {
+  const cached = await caches.match("/");
+  return cached ?? shellUnavailableResponse();
 }
 
 function extractBuildAssetUrls(html) {
@@ -36,6 +53,13 @@ async function cacheRequiredBuildAsset(cache, url) {
     throw new Error(`Build asset did not return a cacheable asset response: ${url}`);
   }
   await cache.put(url, response);
+}
+
+async function cacheShellAndBuildAssets(cache, shellResponse) {
+  const shellForCache = shellResponse.clone();
+  const assetUrls = extractBuildAssetUrls(await shellResponse.text());
+  await Promise.all(assetUrls.map((url) => cacheRequiredBuildAsset(cache, url)));
+  await cache.put("/", shellForCache);
 }
 
 async function cacheBuildAssetsFromShell(cache) {
@@ -109,26 +133,23 @@ self.addEventListener("fetch", (event) => {
   const networkResponse = fetch(request);
   const shellRefresh = networkResponse
     .then(async (response) => {
-      const contentType = response.headers.get("content-type") ?? "";
-      if (!canRefreshShellCache || !response.ok || !contentType.includes("text/html")) return;
+      if (!canRefreshShellCache || !isUsableShellResponse(response)) return;
 
       const shellResponse = response.clone();
       const cache = await caches.open(CACHE_VERSION);
-      await cache.put("/", shellResponse);
+      await cacheShellAndBuildAssets(cache, shellResponse);
     })
     .catch(() => undefined);
 
   event.waitUntil(shellRefresh);
   event.respondWith(
-    networkResponse.catch(async () => {
-      const cached = await caches.match("/");
-      return (
-        cached ??
-        new Response("T3 Code is offline. Reconnect to continue.", {
-          status: 503,
-          headers: { "content-type": "text/plain; charset=utf-8" },
-        })
-      );
-    }),
+    networkResponse
+      .then(async (response) => {
+        if (canRefreshShellCache && !isUsableShellResponse(response)) {
+          return await cachedShellOrUnavailable();
+        }
+        return response;
+      })
+      .catch(cachedShellOrUnavailable),
   );
 });
