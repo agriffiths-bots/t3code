@@ -9,6 +9,15 @@ const publicConfigDefine = {
     repoEnv.T3CODE_CLERK_PUBLISHABLE_KEY?.trim() ?? "",
   ),
 };
+const bundledDesktopMainDependencyPrefixes = ["@effect/", "@pierre/diffs", "@t3tools/"] as const;
+
+export function shouldBundleDesktopMainDependency(id: string): boolean {
+  return (
+    id === "effect" ||
+    id.startsWith("effect/") ||
+    bundledDesktopMainDependencyPrefixes.some((prefix) => id.startsWith(prefix))
+  );
+}
 
 export default defineConfig({
   run: {
@@ -45,7 +54,7 @@ export default defineConfig({
       entry: ["src/main.ts"],
       clean: true,
       deps: {
-        alwaysBundle: (id) => id.startsWith("@t3tools/"),
+        alwaysBundle: shouldBundleDesktopMainDependency,
       },
       ...(shouldLaunchElectronAfterPack ? { onSuccess: "node scripts/dev-electron.mjs" } : {}),
     },

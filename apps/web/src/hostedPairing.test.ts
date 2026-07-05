@@ -11,6 +11,7 @@ import {
 describe("hostedPairing", () => {
   afterEach(() => {
     vi.unstubAllEnvs();
+    vi.unstubAllGlobals();
   });
 
   it("reads hosted pairing host and query token parameters", () => {
@@ -41,6 +42,46 @@ describe("hostedPairing", () => {
     expect(url.searchParams.get("label")).toBe("Workstation");
     expect(url.searchParams.has("token")).toBe(false);
     expect(url.hash).toBe("#token=pairing-token");
+  });
+
+  it("uses the current hosted origin when building pairing links from a Pages deployment", () => {
+    vi.stubEnv("VITE_HOSTED_APP_URL", "https://oc.agriffiths.dev");
+    vi.stubGlobal("window", {
+      location: {
+        href: "https://t3-code-preview.pages.dev/settings",
+      },
+    });
+
+    const url = new URL(
+      buildHostedPairingUrl({
+        host: "https://backend.example.com:3773",
+        token: "pairing-token",
+      }),
+    );
+
+    expect(url.origin).toBe("https://t3-code-preview.pages.dev");
+    expect(url.pathname).toBe("/pair");
+    expect(url.searchParams.get("host")).toBe("https://backend.example.com:3773");
+    expect(url.hash).toBe("#token=pairing-token");
+  });
+
+  it("uses the configured hosted origin when the current window is server-backed", () => {
+    vi.stubEnv("VITE_HOSTED_APP_URL", "https://oc.agriffiths.dev");
+    vi.stubEnv("VITE_HTTP_URL", "http://127.0.0.1:3773");
+    vi.stubGlobal("window", {
+      location: {
+        href: "http://127.0.0.1:5733/settings",
+      },
+    });
+
+    const url = new URL(
+      buildHostedPairingUrl({
+        host: "https://backend.example.com:3773",
+        token: "pairing-token",
+      }),
+    );
+
+    expect(url.origin).toBe("https://oc.agriffiths.dev");
   });
 
   it("builds hosted channel selection URLs through the configured router origin", () => {
@@ -90,5 +131,17 @@ describe("hostedPairing", () => {
 
     vi.stubEnv("VITE_HTTP_URL", "https://backend.example.com");
     expect(isHostedStaticApp(new URL("https://nightly.app.t3.codes/"))).toBe(false);
+  });
+
+  it("detects Cloudflare Pages origins as hosted static apps", () => {
+    vi.stubEnv("VITE_HOSTED_APP_URL", "https://oc.agriffiths.dev");
+    vi.stubEnv("VITE_HTTP_URL", "");
+    vi.stubEnv("VITE_WS_URL", "");
+
+    expect(isHostedStaticApp(new URL("https://t3-code-preview.pages.dev/pair"))).toBe(true);
+    expect(isHostedStaticApp(new URL("https://oc.agriffiths.dev/pair"))).toBe(true);
+
+    vi.stubEnv("VITE_HTTP_URL", "https://backend.example.com");
+    expect(isHostedStaticApp(new URL("https://t3-code-preview.pages.dev/pair"))).toBe(false);
   });
 });
