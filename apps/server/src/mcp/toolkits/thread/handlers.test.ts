@@ -345,6 +345,75 @@ it.effect("starts a new worktree from a detached parent using the project defaul
   }),
 );
 
+it.effect(
+  "falls back to the project checkout branch when a detached worktree has no branch refs",
+  () =>
+    Effect.gen(function* () {
+      const commands: OrchestrationCommand[] = [];
+      const gitCalls: string[] = [];
+      const result = yield* callStartTool({ prompt: "Continue local checkout" }, commands, {
+        project: {
+          ...project,
+          workspaceRoot: "/repo/project",
+        },
+        sourceThread: {
+          ...sourceThread,
+          branch: null,
+          worktreePath: "/repo/worktree",
+        },
+        gitWorkflow: {
+          listRefs: (input) =>
+            Effect.sync(() => {
+              gitCalls.push(`listRefs:${input.cwd}`);
+              return {
+                refs: [],
+                isRepo: true,
+                hasPrimaryRemote: false,
+                nextCursor: null,
+                totalCount: 0,
+              };
+            }),
+          status: (input) =>
+            Effect.sync(() => {
+              gitCalls.push(`status:${input.cwd}`);
+              return {
+                isRepo: true,
+                hasPrimaryRemote: input.cwd === "/repo/project",
+                isDefaultRef: input.cwd === "/repo/project",
+                refName: input.cwd === "/repo/project" ? "main" : null,
+                hasWorkingTreeChanges: false,
+                workingTree: {
+                  files: [],
+                  insertions: 0,
+                  deletions: 0,
+                },
+                hasUpstream: input.cwd === "/repo/project",
+                aheadCount: 0,
+                behindCount: 0,
+                aheadOfDefaultCount: 0,
+                pr: null,
+              };
+            }),
+        },
+      });
+
+      expect(result.isError).toBe(false);
+      const command = commands[0];
+      expect(command?.type).toBe("thread.turn.start");
+      if (command?.type !== "thread.turn.start") return;
+      expect(command.bootstrap?.prepareWorktree).toMatchObject({
+        projectCwd: "/repo/worktree",
+        baseBranch: "main",
+      });
+      expect(gitCalls).toEqual([
+        "listRefs:/repo/worktree",
+        "status:/repo/worktree",
+        "listRefs:/repo/project",
+        "status:/repo/project",
+      ]);
+    }),
+);
+
 it.effect("prepares new worktrees from the source worktree when the project root differs", () =>
   Effect.gen(function* () {
     const commands: OrchestrationCommand[] = [];

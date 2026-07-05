@@ -3,6 +3,7 @@ import {
   MessageId,
   ThreadId,
   type ModelSelection,
+  type OrchestrationProjectShell,
   type OrchestrationThreadShell,
 } from "@t3tools/contracts";
 import { buildTemporaryWorktreeBranchName } from "@t3tools/shared/git";
@@ -111,6 +112,7 @@ const makeActiveThreadStartRuntime = Effect.fn("ThreadToolkit.makeActiveRuntime"
   const resolveNewWorktreeBaseBranch = Effect.fn("ThreadToolkit.resolveNewWorktreeBaseBranch")(
     function* (
       input: ThreadStartToolInput,
+      project: OrchestrationProjectShell,
       sourceThread: OrchestrationThreadShell,
       sourceCwd: string,
     ) {
@@ -123,6 +125,14 @@ const makeActiveThreadStartRuntime = Effect.fn("ThreadToolkit.makeActiveRuntime"
 
       const currentBranch = yield* resolveCurrentBranch(sourceCwd);
       if (currentBranch) return currentBranch;
+
+      if (project.workspaceRoot !== sourceCwd) {
+        const projectDefaultBranch = yield* resolveDefaultBranch(project.workspaceRoot);
+        if (projectDefaultBranch) return projectDefaultBranch;
+
+        const projectCurrentBranch = yield* resolveCurrentBranch(project.workspaceRoot);
+        if (projectCurrentBranch) return projectCurrentBranch;
+      }
 
       return yield* fail("Could not resolve a base branch for the new worktree.");
     },
@@ -212,7 +222,12 @@ const makeActiveThreadStartRuntime = Effect.fn("ThreadToolkit.makeActiveRuntime"
       mode === "new_worktree"
         ? {
             projectCwd: sourceCwd,
-            baseBranch: yield* resolveNewWorktreeBaseBranch(input, sourceThread, sourceCwd),
+            baseBranch: yield* resolveNewWorktreeBaseBranch(
+              input,
+              project,
+              sourceThread,
+              sourceCwd,
+            ),
             branch: branch ?? undefined,
           }
         : undefined;
