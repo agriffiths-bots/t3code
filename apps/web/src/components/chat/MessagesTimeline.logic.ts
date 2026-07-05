@@ -84,6 +84,7 @@ function maxIsoTimestamp(a: string | null, b: string | null): string | null {
 export interface TimelineDurationMessage {
   id: string;
   role: "user" | "assistant" | "system";
+  text?: string | null | undefined;
   createdAt: string;
   updatedAt: string;
   streaming: boolean;
@@ -150,7 +151,7 @@ export function computeMessageDurationStart(
   let lastBoundary: string | null = null;
 
   for (const message of messages) {
-    if (message.role === "user") {
+    if (isTurnPromptMessage(message)) {
       lastBoundary = message.createdAt;
     }
     result.set(message.id, lastBoundary ?? message.createdAt);
@@ -160,6 +161,19 @@ export function computeMessageDurationStart(
   }
 
   return result;
+}
+
+export function isSubAgentWakeSystemMessageText(text: string | null | undefined): boolean {
+  return text?.trimStart().startsWith("[sub-agent ") ?? false;
+}
+
+export function isTurnPromptMessage(
+  message: Pick<TimelineDurationMessage, "role" | "text">,
+): boolean {
+  return (
+    message.role === "user" ||
+    (message.role === "system" && isSubAgentWakeSystemMessageText(message.text))
+  );
 }
 
 export function normalizeCompactToolLabel(value: string): string {
@@ -191,7 +205,7 @@ function deriveTerminalAssistantMessageIds(timelineEntries: ReadonlyArray<Timeli
       continue;
     }
     const { message } = timelineEntry;
-    if (message.role === "user") {
+    if (isTurnPromptMessage(message)) {
       nullTurnResponseIndex += 1;
       continue;
     }
@@ -265,7 +279,7 @@ function deriveTurnFolds(input: {
 
   let pendingUserBoundary: string | null = null;
   for (const entry of input.timelineEntries) {
-    if (entry.kind === "message" && entry.message.role === "user") {
+    if (entry.kind === "message" && isTurnPromptMessage(entry.message)) {
       pendingUserBoundary = entry.message.createdAt;
       continue;
     }
@@ -517,10 +531,9 @@ export function deriveMessagesTimelineRows(input: {
         timelineEntry.message.role === "assistant"
           ? input.turnDiffSummaryByAssistantMessageId.get(timelineEntry.message.id)
           : undefined,
-      revertTurnCount:
-        timelineEntry.message.role === "user"
-          ? input.revertTurnCountByUserMessageId.get(timelineEntry.message.id)
-          : undefined,
+      revertTurnCount: isTurnPromptMessage(timelineEntry.message)
+        ? input.revertTurnCountByUserMessageId.get(timelineEntry.message.id)
+        : undefined,
     });
   }
 

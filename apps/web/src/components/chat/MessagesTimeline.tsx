@@ -71,6 +71,7 @@ import { resetDictation } from "./useDictation";
 import {
   computeStableMessagesTimelineRows,
   deriveMessagesTimelineRows,
+  isTurnPromptMessage,
   normalizeCompactToolLabel,
   resolveAssistantMessageCopyState,
   resolveTimelineIsAtEnd,
@@ -587,7 +588,7 @@ function resolveFinalAssistantTextForTurn(
     if (row?.kind !== "message") {
       continue;
     }
-    if (row.message.role === "user") {
+    if (isTurnPromptMessage(row.message)) {
       break;
     }
     if (row.message.role === "assistant") {
@@ -1127,13 +1128,17 @@ function AssistantDictateButton({ row }: { row: Extract<TimelineRow, { kind: "me
 function SystemTimelineRow({ row }: { row: Extract<TimelineRow, { kind: "message" }> }) {
   const ctx = use(TimelineRowCtx);
   const title = row.message.text.trim().startsWith("[sub-agent") ? "Sub-agent result" : "System";
+  const canRevertAgentWork = typeof row.revertTurnCount === "number";
 
   return (
     <div className="flex justify-start px-1 py-0.5">
       <div className="min-w-0 max-w-[80%] rounded-lg border border-border/70 bg-muted/35 px-3 py-2 text-sm shadow-sm shadow-black/5">
-        <div className="mb-1.5 flex items-center gap-1.5 font-medium text-[11px] text-muted-foreground/80">
-          <HammerIcon className="size-3.5" aria-hidden />
-          <span>{title}</span>
+        <div className="mb-1.5 flex items-center justify-between gap-2">
+          <div className="flex min-w-0 items-center gap-1.5 font-medium text-[11px] text-muted-foreground/80">
+            <HammerIcon className="size-3.5 shrink-0" aria-hidden />
+            <span className="truncate">{title}</span>
+          </div>
+          {canRevertAgentWork && <RevertUserMessageButton messageId={row.message.id} />}
         </div>
         <ChatMarkdown
           text={row.message.text}

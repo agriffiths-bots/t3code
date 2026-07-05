@@ -391,6 +391,7 @@ describe("MessagesTimeline", () => {
     const markup = renderToStaticMarkup(
       <MessagesTimeline
         {...buildProps()}
+        revertTurnCountByUserMessageId={new Map([[MessageId.make("system-message-1"), 1]])}
         timelineEntries={[
           buildUserTimelineEntry(
             [
@@ -485,6 +486,7 @@ describe("MessagesTimeline", () => {
     const markup = renderToStaticMarkup(
       <MessagesTimeline
         {...buildProps()}
+        revertTurnCountByUserMessageId={new Map([[MessageId.make("system-message-1"), 1]])}
         timelineEntries={[
           {
             id: "system-entry-1",
@@ -508,6 +510,7 @@ describe("MessagesTimeline", () => {
     expect(markup).toContain("Sub-agent result");
     expect(markup).toContain("[sub-agent child-1 completed] done");
     expect(markup).toContain("lucide-hammer");
+    expect(markup).toContain('aria-label="Revert to this message"');
   });
 
   it("formats changed file paths from the workspace root", async () => {

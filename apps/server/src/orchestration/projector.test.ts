@@ -944,7 +944,7 @@ describe("orchestration projector", () => {
     }),
   );
 
-  it("does not fallback-retain messages tied to removed turn IDs", async () => {
+  it("does not fallback-retain removed or unrelated prompt messages after revert", async () => {
     const createdAt = "2026-02-26T12:00:00.000Z";
     const model = createEmptyReadModel(createdAt);
 
@@ -1000,6 +1000,24 @@ describe("orchestration projector", () => {
         type: "thread.message-sent",
         aggregateKind: "thread",
         aggregateId: "thread-revert",
+        occurredAt: "2026-02-26T12:00:01.050Z",
+        commandId: "cmd-system-wake-keep",
+        payload: {
+          threadId: "thread-revert",
+          messageId: "system-wake-keep",
+          role: "system",
+          text: "[sub-agent child-1 completed] done",
+          turnId: "turn-1",
+          streaming: false,
+          createdAt: "2026-02-26T12:00:01.050Z",
+          updatedAt: "2026-02-26T12:00:01.050Z",
+        },
+      }),
+      makeEvent({
+        sequence: 4,
+        type: "thread.message-sent",
+        aggregateKind: "thread",
+        aggregateId: "thread-revert",
         occurredAt: "2026-02-26T12:00:01.100Z",
         commandId: "cmd-assistant-keep",
         payload: {
@@ -1014,7 +1032,7 @@ describe("orchestration projector", () => {
         },
       }),
       makeEvent({
-        sequence: 4,
+        sequence: 5,
         type: "thread.turn-diff-completed",
         aggregateKind: "thread",
         aggregateId: "thread-revert",
@@ -1032,7 +1050,7 @@ describe("orchestration projector", () => {
         },
       }),
       makeEvent({
-        sequence: 5,
+        sequence: 6,
         type: "thread.message-sent",
         aggregateKind: "thread",
         aggregateId: "thread-revert",
@@ -1050,7 +1068,7 @@ describe("orchestration projector", () => {
         },
       }),
       makeEvent({
-        sequence: 6,
+        sequence: 7,
         type: "thread.message-sent",
         aggregateKind: "thread",
         aggregateId: "thread-revert",
@@ -1068,7 +1086,25 @@ describe("orchestration projector", () => {
         },
       }),
       makeEvent({
-        sequence: 7,
+        sequence: 8,
+        type: "thread.message-sent",
+        aggregateKind: "thread",
+        aggregateId: "thread-revert",
+        occurredAt: "2026-02-26T12:00:02.200Z",
+        commandId: "cmd-user-unrelated",
+        payload: {
+          threadId: "thread-revert",
+          messageId: "user-unrelated",
+          role: "user",
+          text: "unrelated pending user",
+          turnId: null,
+          streaming: false,
+          createdAt: "2026-02-26T12:00:02.200Z",
+          updatedAt: "2026-02-26T12:00:02.200Z",
+        },
+      }),
+      makeEvent({
+        sequence: 9,
         type: "thread.reverted",
         aggregateKind: "thread",
         aggregateId: "thread-revert",
@@ -1094,7 +1130,10 @@ describe("orchestration projector", () => {
         role: message.role,
         turnId: message.turnId,
       })),
-    ).toEqual([{ id: "assistant-keep", role: "assistant", turnId: "turn-1" }]);
+    ).toEqual([
+      { id: "system-wake-keep", role: "system", turnId: "turn-1" },
+      { id: "assistant-keep", role: "assistant", turnId: "turn-1" },
+    ]);
   });
 
   effectIt.effect("caps message and checkpoint retention for long-lived threads", () =>

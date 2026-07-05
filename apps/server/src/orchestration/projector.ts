@@ -104,11 +104,11 @@ function retainThreadMessagesAfterRevert(
     }
   }
 
-  const retainedUserCount = messages.filter(
-    (message) => message.role === "user" && retainedMessageIds.has(message.id),
+  const retainedPromptCount = messages.filter(
+    (message) => isThreadPromptMessage(message) && retainedMessageIds.has(message.id),
   ).length;
-  const missingUserCount = Math.max(0, turnCount - retainedUserCount);
-  if (missingUserCount > 0) {
+  const missingPromptCount = Math.max(0, turnCount - retainedPromptCount);
+  if (missingPromptCount > 0) {
     const fallbackUserMessages = messages
       .filter(
         (message) =>
@@ -120,7 +120,7 @@ function retainThreadMessagesAfterRevert(
         (left, right) =>
           left.createdAt.localeCompare(right.createdAt) || left.id.localeCompare(right.id),
       )
-      .slice(0, missingUserCount);
+      .slice(0, missingPromptCount);
     for (const message of fallbackUserMessages) {
       retainedMessageIds.add(message.id);
     }
@@ -175,6 +175,13 @@ function bindLatestPendingPromptMessageToTurn(
 
 function isSubAgentWakeSystemMessageText(text: string): boolean {
   return text.trimStart().startsWith("[sub-agent ");
+}
+
+function isThreadPromptMessage(message: Pick<OrchestrationMessage, "role" | "text">): boolean {
+  return (
+    message.role === "user" ||
+    (message.role === "system" && isSubAgentWakeSystemMessageText(message.text))
+  );
 }
 
 function retainThreadActivitiesAfterRevert(

@@ -209,6 +209,7 @@ import { ChatComposer, type ChatComposerHandle } from "./chat/ChatComposer";
 import { ExpandedImageDialog } from "./chat/ExpandedImageDialog";
 import { PullRequestThreadDialog } from "./PullRequestThreadDialog";
 import { MessagesTimeline } from "./chat/MessagesTimeline";
+import { isTurnPromptMessage } from "./chat/MessagesTimeline.logic";
 import { ChatHeader } from "./chat/ChatHeader";
 import { PanelLayoutControls, RightPanelMaximizeControl } from "./chat/PanelLayoutControls";
 import { type ExpandedImagePreview } from "./chat/ExpandedImagePreview";
@@ -2504,7 +2505,7 @@ function ChatViewContent(props: ChatViewProps) {
     const byUserMessageId = new Map<MessageId, number>();
     for (let index = 0; index < timelineEntries.length; index += 1) {
       const entry = timelineEntries[index];
-      if (!entry || entry.kind !== "message" || entry.message.role !== "user") {
+      if (!entry || entry.kind !== "message" || !isTurnPromptMessage(entry.message)) {
         continue;
       }
 
@@ -2513,7 +2514,7 @@ function ChatViewContent(props: ChatViewProps) {
         if (!nextEntry || nextEntry.kind !== "message") {
           continue;
         }
-        if (nextEntry.message.role === "user") {
+        if (isTurnPromptMessage(nextEntry.message)) {
           break;
         }
         const summary = turnDiffSummaryByAssistantMessageId.get(nextEntry.message.id);

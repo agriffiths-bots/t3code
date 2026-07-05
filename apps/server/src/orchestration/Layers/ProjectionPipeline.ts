@@ -260,11 +260,11 @@ function retainProjectionMessagesAfterRevert(
     }
   }
 
-  const retainedUserCount = messages.filter(
-    (message) => message.role === "user" && retainedMessageIds.has(message.messageId),
+  const retainedPromptCount = messages.filter(
+    (message) => isProjectionPromptMessage(message) && retainedMessageIds.has(message.messageId),
   ).length;
-  const missingUserCount = Math.max(0, turnCount - retainedUserCount);
-  if (missingUserCount > 0) {
+  const missingPromptCount = Math.max(0, turnCount - retainedPromptCount);
+  if (missingPromptCount > 0) {
     const fallbackUserMessages = messages
       .filter(
         (message) =>
@@ -277,7 +277,7 @@ function retainProjectionMessagesAfterRevert(
           left.createdAt.localeCompare(right.createdAt) ||
           left.messageId.localeCompare(right.messageId),
       )
-      .slice(0, missingUserCount);
+      .slice(0, missingPromptCount);
     for (const message of fallbackUserMessages) {
       retainedMessageIds.add(message.messageId);
     }
@@ -311,6 +311,15 @@ function retainProjectionMessagesAfterRevert(
 
 function isSubAgentWakeSystemMessageText(text: string): boolean {
   return text.trimStart().startsWith("[sub-agent ");
+}
+
+function isProjectionPromptMessage(
+  message: Pick<ProjectionThreadMessage, "role" | "text">,
+): boolean {
+  return (
+    message.role === "user" ||
+    (message.role === "system" && isSubAgentWakeSystemMessageText(message.text))
+  );
 }
 
 function retainProjectionActivitiesAfterRevert(
@@ -590,7 +599,7 @@ const makeOrchestrationProjectionPipeline = Effect.fn("makeOrchestrationProjecti
       let latestUserMessageAt: string | null = null;
       for (const message of messages) {
         if (
-          message.role === "user" &&
+          isProjectionPromptMessage(message) &&
           (latestUserMessageAt === null || message.createdAt > latestUserMessageAt)
         ) {
           latestUserMessageAt = message.createdAt;
