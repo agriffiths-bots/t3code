@@ -97,7 +97,8 @@ runs:
    `dist:desktop:artifact` in the staging worktree with
    `T3CODE_DESKTOP_OUTPUT_DIR=$T3DR_LEDGER/<date>/desktop-artifact`.
 5. `t3-daily-restart`, passing the prebuilt target metadata and staged asset
-   payload when step 3 built a target.
+   payload when step 3 built a target. Same-SHA no-op restarts are also pinned
+   to the target SHA resolved before staging.
 6. Deadline assertion, default `07:00 Europe/London`.
 
 Machine-readable cycle events are appended to

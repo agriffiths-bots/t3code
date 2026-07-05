@@ -253,6 +253,7 @@ copy_payload_dir() {
 prepare_stage_checkout() {
   local step_log="$1"
   remove_path_under "$stage_root" "$stage_checkout" || return 1
+  run_logged 120 "$step_log" git -C "$checkout" worktree prune || return 1
   run_logged 120 "$step_log" git -C "$checkout" worktree add --detach "$stage_checkout" "$target_sha"
 }
 
@@ -350,7 +351,10 @@ build_release_artifacts() {
       } >"$prebuilt_env"
       log "prebuilt target ready rollback_sha=$rollback_sha target_sha=$target_sha"
     else
-      printf 'T3DR_PREBUILT_TARGET=0\n' >"$prebuilt_env"
+      {
+        printf 'T3DR_PREBUILT_TARGET=0\n'
+        printf 'T3DR_TARGET_SHA=%s\n' "$target_sha"
+      } >"$prebuilt_env"
       printf '[%s] checkout already at target; build skipped\n' "$(date -u +%FT%TZ)" >>"$step_log"
     fi
   fi
@@ -385,7 +389,9 @@ run_restart_step() {
       T3DR_PREBUILT_ASSETS_DIR="$assets" T3DR_PINNED_HEALTH_PROBE="$probe" \
       "$restart_cmd" >>"$step_log" 2>&1
   else
+    target="$(sed -n 's/^T3DR_TARGET_SHA=//p' "$prebuilt_env" 2>/dev/null | head -1)"
     env T3DR_CHECKOUT="$checkout" T3DR_LEDGER="$ledger" \
+      T3DR_TARGET_SHA="$target" \
       "$restart_cmd" >>"$step_log" 2>&1
   fi
   rc=$?

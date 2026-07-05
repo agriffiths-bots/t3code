@@ -496,10 +496,14 @@ snapshot_path=""
 
 log "BEGIN service=$service checkout=$checkout origin=$origin prebuilt_target=$prebuilt_target"
 
-if ! run_capture 120 git -C "$checkout" fetch origin main:refs/remotes/origin/main; then
-  log "git fetch failed"
-  record_result "FAILED"
-  exit 1
+if [[ "$prebuilt_target" == "1" || -n "$target_sha_override" ]]; then
+  log "pinned target supplied; skipping origin fetch"
+else
+  if ! run_capture 120 git -C "$checkout" fetch origin main:refs/remotes/origin/main; then
+    log "git fetch failed"
+    record_result "FAILED"
+    exit 1
+  fi
 fi
 cycle_start_sha="$(run_output 30 git -C "$checkout" rev-parse HEAD)" || {
   log "failed to resolve pre_sha"
@@ -525,11 +529,19 @@ if [[ "$prebuilt_target" == "1" ]]; then
   log "prebuilt target verified rollback_sha=$pre_sha target_sha=$target_sha"
 else
   pre_sha="$cycle_start_sha"
-  target_sha="$(run_output 30 git -C "$checkout" rev-parse origin/main)" || {
-    log "failed to resolve origin/main"
-    record_result "FAILED"
-    exit 1
-  }
+  if [[ -n "$target_sha_override" ]]; then
+    target_sha="$(run_output 30 git -C "$checkout" rev-parse --verify "${target_sha_override}^{commit}")" || {
+      log "failed to resolve target_sha=$target_sha_override"
+      record_result "FAILED"
+      exit 1
+    }
+  else
+    target_sha="$(run_output 30 git -C "$checkout" rev-parse origin/main)" || {
+      log "failed to resolve origin/main"
+      record_result "FAILED"
+      exit 1
+    }
+  fi
 fi
 
 snapshot_tool="$(resolve_tool t3-db-snapshot)" || {

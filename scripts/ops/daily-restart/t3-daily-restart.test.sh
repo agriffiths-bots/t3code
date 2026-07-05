@@ -374,10 +374,26 @@ unset FAKE_PRE_SHA FAKE_TARGET_SHA
 if grep -Fq "pnpm" "$tmp/calls.log"; then fail "same-sha rerun rebuilt web"; else pass "same-sha rerun skips web rebuild"; fi
 
 tmp="$(mktemp -d)"
+export FAKE_PRE_SHA=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+run_manager "$tmp" --target-sha bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+unset FAKE_PRE_SHA
+[[ "$(cat "$tmp/rc")" == "0" ]] && pass "pinned target restart exits zero" || fail "pinned target restart exits zero"
+if grep -Fq "fetch origin" "$tmp/calls.log"; then
+  fail "pinned target restart fetched origin"
+else
+  pass "pinned target restart skips fetch"
+fi
+
+tmp="$(mktemp -d)"
 run_manager "$tmp" --prebuilt-target \
   --rollback-sha aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
   --target-sha bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
 [[ "$(cat "$tmp/rc")" == "0" ]] && pass "prebuilt target exits zero" || fail "prebuilt target exits zero"
+if grep -Fq "fetch origin" "$tmp/calls.log"; then
+  fail "prebuilt target fetched origin"
+else
+  pass "prebuilt target skips fetch"
+fi
 if grep -Fq "git -C $tmp/checkout merge --ff-only bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" "$tmp/calls.log"; then
   pass "prebuilt target merges only after shutdown"
 else

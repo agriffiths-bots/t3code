@@ -21,6 +21,7 @@ case "$*" in
   *"rev-parse origin/main"*) echo "${FAKE_TARGET_SHA:-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb}" ;;
   *"diff --name-only"*) printf '%s\n' "${FAKE_CHANGED_FILES:-}" ;;
   *"merge-base --is-ancestor"*) exit "${FAKE_ANCESTOR_RC:-0}" ;;
+  *"worktree prune"*) exit "${FAKE_GIT_WORKTREE_PRUNE_RC:-0}" ;;
   *"worktree add --detach"*)
     mkdir -p "${*: -2:1}"
     exit "${FAKE_GIT_WORKTREE_RC:-0}"
@@ -116,7 +117,7 @@ tmp="$(mktemp -d)"
 run_cycle "$tmp"
 stage="$tmp/ledger/$(date -u +%F)/prebuilt-stage/checkout"
 [[ "$(cat "$tmp/rc")" == "0" ]] && pass "happy path exits zero" || fail "happy path exits zero"
-assert_order "$tmp/calls.log" "backup" "sync" "git -C" "git -C $tmp/checkout worktree add --detach $stage" "pnpm -C $stage install --frozen-lockfile --prefer-offline" "pnpm -C $stage/apps/web run build" "pnpm -C $stage run build:desktop" "restart prebuilt=1"
+assert_order "$tmp/calls.log" "backup" "sync" "git -C" "git -C $tmp/checkout worktree prune" "git -C $tmp/checkout worktree add --detach $stage" "pnpm -C $stage install --frozen-lockfile --prefer-offline" "pnpm -C $stage/apps/web run build" "pnpm -C $stage run build:desktop" "restart prebuilt=1"
 if grep -Fq "git -C $tmp/checkout merge --ff-only" "$tmp/calls.log" || grep -Fq "pnpm -C $tmp/checkout/apps/web run build" "$tmp/calls.log"; then
   fail "happy path leaves live checkout untouched before restart"
 else
@@ -148,6 +149,7 @@ else
   pass "same sha skips build"
 fi
 grep -Fq "restart prebuilt=0" "$tmp/calls.log" && pass "same sha restart is non-prebuilt" || fail "same sha restart is non-prebuilt"
+grep -Fq "target=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" "$tmp/calls.log" && pass "same sha restart receives pinned target" || fail "same sha restart receives pinned target"
 
 tmp="$(mktemp -d)"
 export FAKE_BACKUP_RC=9
@@ -167,7 +169,7 @@ run_cycle "$tmp"
 unset FAKE_PNPM_RC
 [[ "$(cat "$tmp/rc")" != "0" ]] && pass "build failure exits nonzero" || fail "build failure exits nonzero"
 stage="$tmp/ledger/$(date -u +%F)/prebuilt-stage/checkout"
-assert_order "$tmp/calls.log" "git -C $tmp/checkout worktree add --detach $stage" "pnpm -C $stage install --frozen-lockfile --prefer-offline"
+assert_order "$tmp/calls.log" "git -C $tmp/checkout worktree prune" "git -C $tmp/checkout worktree add --detach $stage" "pnpm -C $stage install --frozen-lockfile --prefer-offline"
 if grep -Fq "git -C $tmp/checkout merge --ff-only" "$tmp/calls.log" || grep -Fq "git -C $tmp/checkout checkout aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" "$tmp/calls.log"; then
   fail "prebuild failure mutated live checkout"
 else
