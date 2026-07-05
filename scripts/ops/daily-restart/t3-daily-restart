@@ -129,6 +129,7 @@ mkdir -p "$run_dir" "$snapshot_dir"
 log_file="$run_dir/t3-daily-restart.log"
 result_file="$run_dir/t3-daily-restart.result"
 manifest="$run_dir/resume-manifest.json"
+pre_stop_manifest="$run_dir/resume-manifest.pre-stop.json"
 lock_file="$ledger/t3-daily-restart.lock"
 pinned_tools_dir="$run_dir/pinned-tools"
 pinned_health_probe=""
@@ -286,14 +287,55 @@ json_validate_manifest() {
   node -e 'JSON.parse(require("node:fs").readFileSync(process.argv[1], "utf8"))' "$target"
 }
 
+merge_capture_manifests() {
+  local base="$1"
+  local overlay="$2"
+  node - "$base" "$overlay" <<'NODE'
+const fs = require("node:fs");
+const path = require("node:path");
+const [basePath, overlayPath] = process.argv.slice(2);
+const base = JSON.parse(fs.readFileSync(basePath, "utf8"));
+const overlay = JSON.parse(fs.readFileSync(overlayPath, "utf8"));
+const threadsById = new Map();
+for (const thread of Array.isArray(base.threads) ? base.threads : []) {
+  if (thread.pending_message !== undefined) {
+    threadsById.set(thread.thread_id, thread);
+  }
+}
+for (const thread of Array.isArray(overlay.threads) ? overlay.threads : []) {
+  threadsById.set(thread.thread_id, thread);
+}
+overlay.threads = Array.from(threadsById.values()).sort((left, right) =>
+  String(left.thread_id).localeCompare(String(right.thread_id)),
+);
+const tempPath = path.join(path.dirname(overlayPath), `.${path.basename(overlayPath)}.${process.pid}.tmp`);
+try {
+  fs.writeFileSync(tempPath, `${JSON.stringify(overlay, null, 2)}\n`, {
+    encoding: "utf8",
+    flag: "wx",
+    mode: 0o600,
+  });
+  fs.renameSync(tempPath, overlayPath);
+} catch (error) {
+  try {
+    fs.rmSync(tempPath, { force: true });
+  } catch {
+    // Preserve the original write/rename error.
+  }
+  throw error;
+}
+NODE
+}
+
 capture_active_manifest() {
   local phase="$1"
+  shift
   local candidate="$manifest.$phase.$$"
   rm -f -- "$candidate" || {
     log "$phase failed to clear stale capture candidate"
     return 1
   }
-  if ! run_capture 300 "$capture_tool" --db "$db" --out "$candidate"; then
+  if ! run_capture 300 "$capture_tool" --db "$db" --out "$candidate" "$@"; then
     log "$phase capture-active-threads failed"
     rm -f -- "$candidate"
     return 1
@@ -596,7 +638,13 @@ capture_tool="$(resolve_tool capture-active-threads)" || {
   exit 1
 }
 
+pre_stop_pending_since="$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)"
 if ! capture_active_manifest "pre-stop"; then
+  record_result "FAILED"
+  exit 1
+fi
+if ! cp -p -- "$manifest" "$pre_stop_manifest"; then
+  log "failed to preserve pre-stop capture manifest"
   record_result "FAILED"
   exit 1
 fi
@@ -607,13 +655,14 @@ if ! pin_health_probe; then
   exit 1
 fi
 
+stop_started_at="$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)"
 if ! stop_service_or_escalate "SHUTDOWN"; then
   log "systemctl stop failed"
   record_result "STOP-FAILED"
   exit 1
 fi
 
-if ! capture_active_manifest "post-stop"; then
+if ! capture_active_manifest "post-stop" --stopped-since "$stop_started_at" --pending-since "$pre_stop_pending_since"; then
   log "post-stop capture failed after service stop"
   record_result "FAILED"
   if run_capture 60 systemctl --user start "$service"; then
@@ -621,6 +670,18 @@ if ! capture_active_manifest "post-stop"; then
     inject_resume_manifest || log "failed to inject pre-stop resume after post-stop capture failure"
   else
     log "failed to restart after post-stop capture failure"
+  fi
+  exit 1
+fi
+if ! merge_capture_manifests "$pre_stop_manifest" "$manifest" >>"$log_file" 2>&1; then
+  log "post-stop capture merge failed"
+  record_result "FAILED"
+  cp -p -- "$pre_stop_manifest" "$manifest" || log "failed to restore pre-stop manifest"
+  if run_capture 60 systemctl --user start "$service"; then
+    log "restarted unchanged service after post-stop merge failure"
+    inject_resume_manifest || log "failed to inject pre-stop resume after post-stop merge failure"
+  else
+    log "failed to restart after post-stop merge failure"
   fi
   exit 1
 fi

@@ -113,6 +113,10 @@ while [[ $# -gt 0 ]]; do
   if [[ "$1" == "--out" ]]; then
     if [[ "${FAKE_CAPTURE_BAD_JSON:-0}" == "1" || ( -n "${FAKE_CAPTURE_BAD_JSON_N:-}" && "$count" == "$FAKE_CAPTURE_BAD_JSON_N" ) ]]; then
       printf '{bad json\n' >"$2"
+    elif [[ "${FAKE_CAPTURE_PHASE_THREADS:-0}" == "1" && "$2" == *.pre-stop.* ]]; then
+      printf '{"threads":[{"thread_id":"pre-active","active_turn_id":"turn-old"},{"thread_id":"pre-pending","pending_message":{"message_id":"message-pre","role":"user","text":"pending","attachments":[]}}]}\n' >"$2"
+    elif [[ "${FAKE_CAPTURE_PHASE_THREADS:-0}" == "1" && "$2" == *.post-stop.* ]]; then
+      printf '{"threads":[{"thread_id":"post-active","active_turn_id":"turn-new"}]}\n' >"$2"
     else
       printf '{"threads":[]}\n' >"$2"
     fi
@@ -214,7 +218,25 @@ fi
 grep -Fq '"pre_sha"' "$tmp/ledger/"*/resume-manifest.json && pass "manifest filled" || fail "manifest filled"
 grep -Fq "snapshot --db $tmp/state.sqlite --out-dir $tmp/snaps" "$tmp/calls.log" && pass "snapshot helper receives current flags" || fail "snapshot helper receives current flags"
 grep -Fq "capture --db $tmp/state.sqlite --out $tmp/ledger/" "$tmp/calls.log" && pass "capture helper receives current flags" || fail "capture helper receives current flags"
+grep -Eq "capture --db $tmp/state.sqlite --out $tmp/ledger/.*/resume-manifest\\.json\\.post-stop\\.[0-9]+ --stopped-since [0-9]{4}-[0-9]{2}-[0-9]{2}T.* --pending-since [0-9]{4}-[0-9]{2}-[0-9]{2}T" "$tmp/calls.log" && pass "post-stop capture receives shutdown boundary" || fail "post-stop capture receives shutdown boundary"
 grep -Fq "health --origin http://127.0.0.1:1 --service fake.service --instance fakeAgent --model fake-model --timeout 1" "$tmp/calls.log" && pass "health probe receives smoke provider" || fail "health probe receives smoke provider"
+
+tmp="$(mktemp -d)"
+export FAKE_CAPTURE_PHASE_THREADS=1
+run_manager "$tmp"
+unset FAKE_CAPTURE_PHASE_THREADS
+manifest_path="$(echo "$tmp/ledger/"*/resume-manifest.json)"
+if node - "$manifest_path" <<'NODE'
+const fs = require("node:fs");
+const manifest = JSON.parse(fs.readFileSync(process.argv[2], "utf8"));
+const ids = new Set((manifest.threads ?? []).map((thread) => thread.thread_id));
+process.exit(ids.has("pre-pending") && ids.has("post-active") && !ids.has("pre-active") ? 0 : 1);
+NODE
+then
+  pass "post-stop merge preserves only pre-stop pending rows"
+else
+  fail "post-stop merge preserves only pre-stop pending rows"
+fi
 
 tmp="$(mktemp -d)"
 mkdir -p "$tmp/checkout" "$tmp/bin" "$tmp/ledger" "$tmp/snaps"

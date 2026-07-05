@@ -15,6 +15,8 @@ export interface CaptureActiveThreadsOptions {
   readonly dbPath: string;
   readonly outPath: string;
   readonly excludedThreadIds?: ReadonlyArray<string>;
+  readonly stoppedSince?: string | null;
+  readonly pendingSince?: string | null;
   readonly capturedAt?: Date;
   readonly openDatabase?: (dbPath: string) => CaptureDatabase;
 }
@@ -82,6 +84,8 @@ interface ParsedArgs {
   readonly dbPath: string;
   readonly outPath: string;
   readonly excludedThreadIds: ReadonlyArray<string>;
+  readonly stoppedSince: string | null;
+  readonly pendingSince: string | null;
 }
 
 function dbFileUri(dbPath: string): string {
@@ -109,10 +113,21 @@ function buildCaptureQuery(excludedThreadIds: ReadonlyArray<string>) {
     excludedThreadIds.length > 0
       ? `AND threads.thread_id NOT IN (${excludedThreadIds.map(() => "?").join(", ")})`
       : "";
+  const stoppedDuringCapturePredicate = `(
+          capture_options.stopped_since IS NOT NULL
+          AND sessions.status = 'stopped'
+          AND sessions.updated_at >= capture_options.stopped_since
+        )`;
+  const stoppedPendingDuringCapturePredicate = `(
+          capture_options.pending_since IS NOT NULL
+          AND ${stoppedDuringCapturePredicate}
+          AND pending_turns.requested_at >= capture_options.pending_since
+        )`;
   const livePendingPredicate = `(
           pending_turns.thread_id IS NOT NULL
           AND (
             sessions.updated_at IS NULL
+            OR ${stoppedPendingDuringCapturePredicate}
             OR (
               sessions.status IN ('error', 'interrupted', 'stopped')
               AND pending_turns.requested_at > sessions.updated_at
@@ -134,6 +149,7 @@ function buildCaptureQuery(excludedThreadIds: ReadonlyArray<string>) {
         )`;
 
   return `
+    WITH capture_options(stopped_since, pending_since) AS (VALUES (?, ?))
     SELECT
       threads.thread_id,
       COALESCE(sessions.status, 'ready') AS status,
@@ -186,6 +202,7 @@ function buildCaptureQuery(excludedThreadIds: ReadonlyArray<string>) {
         ELSE NULL
       END AS pending_source_proposed_plan_json
     FROM projection_threads threads
+    CROSS JOIN capture_options
     LEFT JOIN projection_thread_sessions sessions ON sessions.thread_id = threads.thread_id
     LEFT JOIN projection_turns resumable_turns
       ON resumable_turns.thread_id = threads.thread_id
@@ -198,8 +215,10 @@ function buildCaptureQuery(excludedThreadIds: ReadonlyArray<string>) {
           AND (
             candidate_resumable_turns.state = 'running'
             OR (
-              sessions.status = 'stopped'
+              ${stoppedDuringCapturePredicate}
               AND candidate_resumable_turns.state = 'interrupted'
+              AND candidate_resumable_turns.completed_at IS NOT NULL
+              AND candidate_resumable_turns.completed_at >= capture_options.stopped_since
             )
           )
         ORDER BY
@@ -326,10 +345,12 @@ function pendingMessageForRow(row: SessionRow): CapturedPendingMessage | undefin
 function readCapturedThreads(
   db: CaptureDatabase,
   excludedThreadIds: ReadonlyArray<string>,
+  stoppedSince: string | null,
+  pendingSince: string | null,
 ): ReadonlyArray<CapturedThread> {
   const rows = db
     .prepare(buildCaptureQuery(excludedThreadIds))
-    .all(...excludedThreadIds) as unknown as ReadonlyArray<SessionRow>;
+    .all(stoppedSince, pendingSince, ...excludedThreadIds) as unknown as ReadonlyArray<SessionRow>;
 
   return rows.map((row) => {
     const pendingMessage = pendingMessageForRow(row);
@@ -375,7 +396,12 @@ function writeJsonAtomic(outPath: string, manifest: CaptureManifest): void {
 export function captureActiveThreads(options: CaptureActiveThreadsOptions): CaptureManifest {
   const db = (options.openDatabase ?? openCaptureDatabase)(options.dbPath);
   try {
-    const threads = readCapturedThreads(db, options.excludedThreadIds ?? []);
+    const threads = readCapturedThreads(
+      db,
+      options.excludedThreadIds ?? [],
+      options.stoppedSince ?? null,
+      options.pendingSince ?? null,
+    );
     const manifest = {
       version: 1,
       // @effect-diagnostics-next-line globalDate:off - CLI capture timestamp is an ISO UTC wall-clock value.
@@ -406,6 +432,8 @@ export function parseArgs(
 ): ParsedArgs {
   let dbPath = env.T3DR_DB ?? DEFAULT_DB_PATH;
   let outPath: string | undefined;
+  let stoppedSince: string | null = null;
+  let pendingSince: string | null = null;
   const excludedThreadIds: Array<string> = [];
 
   for (let index = 0; index < args.length; index += 1) {
@@ -423,10 +451,18 @@ export function parseArgs(
         excludedThreadIds.push(requireValue(args, index, arg));
         index += 1;
         break;
+      case "--stopped-since":
+        stoppedSince = requireValue(args, index, arg);
+        index += 1;
+        break;
+      case "--pending-since":
+        pendingSince = requireValue(args, index, arg);
+        index += 1;
+        break;
       case "--help":
       case "-h":
         throw new Error(
-          "Usage: capture-active-threads --db PATH --out FILE [--exclude THREAD_ID]...",
+          "Usage: capture-active-threads --db PATH --out FILE [--exclude THREAD_ID]... [--stopped-since ISO_TIME] [--pending-since ISO_TIME]",
         );
       default:
         throw new Error(`Unknown argument: ${arg}`);
@@ -437,7 +473,7 @@ export function parseArgs(
     throw new Error("Missing required --out FILE.");
   }
 
-  return { dbPath, outPath, excludedThreadIds };
+  return { dbPath, outPath, excludedThreadIds, stoppedSince, pendingSince };
 }
 
 export function runCli(
@@ -450,6 +486,8 @@ export function runCli(
       dbPath: parsed.dbPath,
       outPath: parsed.outPath,
       excludedThreadIds: parsed.excludedThreadIds,
+      stoppedSince: parsed.stoppedSince,
+      pendingSince: parsed.pendingSince,
     });
     const activeCount = manifest.threads.filter((thread) => thread.role === "active").length;
     NodeProcess.stdout.write(`${activeCount}\n`);
