@@ -437,7 +437,7 @@ const make = Effect.gen(function* () {
         type: "thread.turn.start",
         commandId,
         threadId: shell.id,
-        message: { messageId, role: "user", text, attachments: [] },
+        message: { messageId, role: "system", text, attachments: [] },
         runtimeMode: shell.runtimeMode,
         interactionMode: shell.interactionMode,
         createdAt,

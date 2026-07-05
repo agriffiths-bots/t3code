@@ -54,7 +54,7 @@ describe("PlanUsageMeter logic", () => {
     expect(selected?.id).toBe("claude-weekly");
   });
 
-  it("prioritizes critical provider severity in the collapsed meter", () => {
+  it("uses the most-consumed limit for the collapsed meter", () => {
     const selected = selectMostConstrainedPlanUsageWindow({
       updatedAt: "2026-07-03T12:00:00.000Z",
       providers: [
@@ -97,7 +97,7 @@ describe("PlanUsageMeter logic", () => {
       ],
     });
 
-    expect(selected?.id).toBe("claude-weekly-scoped");
+    expect(selected?.id).toBe("codex-weekly");
   });
 
   it("formats reset and absolute usage text", () => {
@@ -141,13 +141,13 @@ describe("PlanUsageMeter logic", () => {
         provider: "codex",
         kind: "weekly",
         title: "Codex weekly",
-        usedPercent: 95,
+        usedPercent: 50,
         resetAt: null,
         used: null,
         limit: null,
         unit: null,
         severity: null,
       }),
-    ).toBe("var(--color-red-500)");
+    ).toBe("var(--color-emerald-500)");
   });
 });

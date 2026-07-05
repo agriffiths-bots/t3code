@@ -3,6 +3,7 @@ import {
   computeStableMessagesTimelineRows,
   computeMessageDurationStart,
   deriveMessagesTimelineRows,
+  deriveRevertTurnCountByPromptMessageId,
   normalizeCompactToolLabel,
   resolveAssistantMessageCopyState,
 } from "./MessagesTimeline.logic";
@@ -191,8 +192,73 @@ describe("computeMessageDurationStart", () => {
     );
   });
 
+  it("uses sub-agent wake system messages as turn boundaries", () => {
+    const result = computeMessageDurationStart([
+      {
+        id: "s1",
+        role: "system",
+        text: "[sub-agent child-1 completed] done",
+        createdAt: "2026-01-01T00:00:10Z",
+        updatedAt: "2026-01-01T00:00:10Z",
+        streaming: false,
+      },
+      {
+        id: "a1",
+        role: "assistant",
+        createdAt: "2026-01-01T00:00:30Z",
+        updatedAt: "2026-01-01T00:00:30Z",
+        streaming: false,
+      },
+    ]);
+
+    expect(result).toEqual(
+      new Map([
+        ["s1", "2026-01-01T00:00:10Z"],
+        ["a1", "2026-01-01T00:00:10Z"],
+      ]),
+    );
+  });
+
   it("returns empty map for empty input", () => {
     expect(computeMessageDurationStart([])).toEqual(new Map());
+  });
+});
+
+describe("deriveRevertTurnCountByPromptMessageId", () => {
+  it("uses a sub-agent wake prompt turn id when no assistant message exists", () => {
+    const checkpointSummary = {
+      turnId: "turn-3" as never,
+      completedAt: "2026-01-01T00:00:30Z",
+      assistantMessageId: null,
+      checkpointTurnCount: 3,
+      checkpointRef: "checkpoint-3" as never,
+      status: "ready" as const,
+      files: [{ path: "src/index.ts", kind: "modified", additions: 3, deletions: 1 }],
+    };
+
+    const result = deriveRevertTurnCountByPromptMessageId({
+      timelineEntries: [
+        {
+          id: "system-entry",
+          kind: "message",
+          createdAt: "2026-01-01T00:00:00Z",
+          message: {
+            id: "system-1" as never,
+            role: "system",
+            text: "[sub-agent child-1 completed] done",
+            turnId: "turn-3" as never,
+            createdAt: "2026-01-01T00:00:00Z",
+            updatedAt: "2026-01-01T00:00:00Z",
+            streaming: false,
+          },
+        },
+      ],
+      turnDiffSummaryByAssistantMessageId: new Map(),
+      turnDiffSummaryByTurnId: new Map([["turn-3" as never, checkpointSummary]]),
+      inferredCheckpointTurnCountByTurnId: {},
+    });
+
+    expect(result).toEqual(new Map([["system-1" as never, 2]]));
   });
 });
 
@@ -438,6 +504,37 @@ describe("deriveMessagesTimelineRows", () => {
 
     expect(userRow?.revertTurnCount).toBe(1);
     expect(assistantRow?.assistantTurnDiffSummary).toBe(assistantTurnDiffSummary);
+  });
+
+  it("attaches revert counts to sub-agent system wake prompt rows", () => {
+    const rows = deriveMessagesTimelineRows({
+      timelineEntries: [
+        {
+          id: "system-entry",
+          kind: "message",
+          createdAt: "2026-01-01T00:00:00Z",
+          message: {
+            id: "system-1" as never,
+            role: "system",
+            text: "[sub-agent child-1 completed] done",
+            turnId: null,
+            createdAt: "2026-01-01T00:00:00Z",
+            updatedAt: "2026-01-01T00:00:00Z",
+            streaming: false,
+          },
+        },
+      ],
+      isWorking: false,
+      activeTurnStartedAt: null,
+      turnDiffSummaryByAssistantMessageId: new Map(),
+      revertTurnCountByUserMessageId: new Map([["system-1" as never, 1]]),
+    });
+
+    const systemRow = rows.find(
+      (row): row is Extract<(typeof rows)[number], { kind: "message" }> =>
+        row.kind === "message" && row.message.role === "system",
+    );
+    expect(systemRow?.revertTurnCount).toBe(1);
   });
 
   it("folds settled-turn commentary and work behind a Worked-for row", () => {

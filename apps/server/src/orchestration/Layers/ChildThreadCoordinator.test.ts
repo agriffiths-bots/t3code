@@ -2408,6 +2408,7 @@ describe("ChildThreadCoordinator", () => {
 
     const turnStarts = harness.dispatched.filter((command) => command.type === "thread.turn.start");
     expect(turnStarts).toHaveLength(1);
+    expect(turnStarts[0]?.message.role).toBe("system");
   });
 
   it("R-B: a wake enqueued mid-turn persists a durable row, then drains on parent idle and deletes it", async () => {
@@ -2457,6 +2458,9 @@ describe("ChildThreadCoordinator", () => {
     );
     await harness.feed(turnDiffEvent(parent, "ready"));
     expect(harness.dispatched.filter((c) => c.type === "thread.turn.start")).toHaveLength(1);
+    expect(harness.dispatched.find((c) => c.type === "thread.turn.start")?.message.role).toBe(
+      "system",
+    );
     expect(await harness.listPendingDispatches()).toHaveLength(0);
   });
 

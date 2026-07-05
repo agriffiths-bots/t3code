@@ -1,4 +1,9 @@
-import type { OrchestrationEvent, OrchestrationReadModel, ThreadId } from "@t3tools/contracts";
+import type {
+  OrchestrationEvent,
+  OrchestrationReadModel,
+  ThreadId,
+  TurnId,
+} from "@t3tools/contracts";
 import {
   OrchestrationCheckpointSummary,
   OrchestrationMessage,
@@ -88,8 +93,10 @@ function retainThreadMessagesAfterRevert(
 ): ReadonlyArray<OrchestrationMessage> {
   const retainedMessageIds = new Set<string>();
   for (const message of messages) {
-    if (message.role === "system") {
-      retainedMessageIds.add(message.id);
+    if (message.role === "system" && message.turnId === null) {
+      if (retainedMessageIds.has(message.id) || !isSubAgentWakeSystemMessageText(message.text)) {
+        retainedMessageIds.add(message.id);
+      }
       continue;
     }
     if (message.turnId !== null && retainedTurnIds.has(message.turnId)) {
@@ -97,11 +104,11 @@ function retainThreadMessagesAfterRevert(
     }
   }
 
-  const retainedUserCount = messages.filter(
-    (message) => message.role === "user" && retainedMessageIds.has(message.id),
+  const retainedPromptCount = messages.filter(
+    (message) => isThreadPromptMessage(message) && retainedMessageIds.has(message.id),
   ).length;
-  const missingUserCount = Math.max(0, turnCount - retainedUserCount);
-  if (missingUserCount > 0) {
+  const missingPromptCount = Math.max(0, turnCount - retainedPromptCount);
+  if (missingPromptCount > 0) {
     const fallbackUserMessages = messages
       .filter(
         (message) =>
@@ -113,7 +120,7 @@ function retainThreadMessagesAfterRevert(
         (left, right) =>
           left.createdAt.localeCompare(right.createdAt) || left.id.localeCompare(right.id),
       )
-      .slice(0, missingUserCount);
+      .slice(0, missingPromptCount);
     for (const message of fallbackUserMessages) {
       retainedMessageIds.add(message.id);
     }
@@ -142,6 +149,39 @@ function retainThreadMessagesAfterRevert(
   }
 
   return messages.filter((message) => retainedMessageIds.has(message.id));
+}
+
+function bindLatestPendingPromptMessageToTurn(
+  messages: ReadonlyArray<OrchestrationMessage>,
+  turnId: TurnId,
+): ReadonlyArray<OrchestrationMessage> {
+  let pendingIndex = -1;
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index];
+    if (
+      message &&
+      message.turnId === null &&
+      (message.role === "user" || message.role === "system")
+    ) {
+      pendingIndex = index;
+      break;
+    }
+  }
+  if (pendingIndex === -1) return messages;
+  return messages.map((message, index) =>
+    index === pendingIndex ? { ...message, turnId } : message,
+  );
+}
+
+function isSubAgentWakeSystemMessageText(text: string): boolean {
+  return text.trimStart().startsWith("[sub-agent ");
+}
+
+function isThreadPromptMessage(message: Pick<OrchestrationMessage, "role" | "text">): boolean {
+  return (
+    message.role === "user" ||
+    (message.role === "system" && isSubAgentWakeSystemMessageText(message.text))
+  );
 }
 
 function retainThreadActivitiesAfterRevert(
@@ -461,6 +501,16 @@ export function projectEvent(
           event.type,
           "session",
         );
+        const activeTurnId =
+          (session.status === "running" || session.status === "waiting") &&
+          session.activeTurnId !== null
+            ? session.activeTurnId
+            : null;
+        const previousActiveTurnId = thread.session?.activeTurnId ?? null;
+        const messages =
+          activeTurnId === null || activeTurnId === previousActiveTurnId
+            ? thread.messages
+            : bindLatestPendingPromptMessageToTurn(thread.messages, activeTurnId);
 
         // Leaving the "running" session status is the turn-end signal: settle
         // a still-running latest turn so its duration reflects the whole turn.
@@ -469,23 +519,23 @@ export function projectEvent(
           ...nextBase,
           threads: updateThread(nextBase.threads, payload.threadId, {
             session,
+            messages,
             latestTurn:
-              (session.status === "running" || session.status === "waiting") &&
-              session.activeTurnId !== null
+              activeTurnId !== null
                 ? {
-                    turnId: session.activeTurnId,
+                    turnId: activeTurnId,
                     state: "running",
                     requestedAt:
-                      thread.latestTurn?.turnId === session.activeTurnId
+                      thread.latestTurn?.turnId === activeTurnId
                         ? thread.latestTurn.requestedAt
                         : session.updatedAt,
                     startedAt:
-                      thread.latestTurn?.turnId === session.activeTurnId
+                      thread.latestTurn?.turnId === activeTurnId
                         ? (thread.latestTurn.startedAt ?? session.updatedAt)
                         : session.updatedAt,
                     completedAt: null,
                     assistantMessageId:
-                      thread.latestTurn?.turnId === session.activeTurnId
+                      thread.latestTurn?.turnId === activeTurnId
                         ? thread.latestTurn.assistantMessageId
                         : null,
                   }
