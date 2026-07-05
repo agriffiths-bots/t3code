@@ -26,13 +26,15 @@ self.addEventListener("fetch", (event) => {
   if (request.method !== "GET") return;
 
   const acceptsHtml = request.headers.get("accept")?.includes("text/html") ?? false;
-  if (!acceptsHtml || new URL(request.url).origin !== self.location.origin) return;
+  const requestUrl = new URL(request.url);
+  if (!acceptsHtml || requestUrl.origin !== self.location.origin) return;
+  const canRefreshShellCache = requestUrl.pathname === "/";
 
   event.respondWith(
     fetch(request)
       .then((response) => {
         const contentType = response.headers.get("content-type") ?? "";
-        if (response.ok && contentType.includes("text/html")) {
+        if (canRefreshShellCache && response.ok && contentType.includes("text/html")) {
           const copy = response.clone();
           caches.open(CACHE_VERSION).then((cache) => cache.put("/", copy));
         }
