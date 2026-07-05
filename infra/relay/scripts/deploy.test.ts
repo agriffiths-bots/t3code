@@ -263,6 +263,10 @@ describe("artifact release workflows", () => {
       const mainRefGuard = "if: ${{ github.ref == 'refs/heads/main' }}";
       expect(mainWorkflow.split(mainRefGuard).length - 1).toBe(3);
       expect(mainWorkflow).toContain("needs: [metadata, public_config]");
+      expect(mainWorkflow).toContain("release_tag: ${{ steps.nightly.outputs.tag }}");
+      expect(mainWorkflow).toContain("release_name: ${{ steps.nightly.outputs.name }}");
+      expect(mainWorkflow).not.toContain("release_tag=main-");
+      expect(mainWorkflow).not.toContain("T3 Code main");
       expect(mainWorkflow).not.toContain("Fail the prerelease unless the Android APK is built");
       expect(mainWorkflow).not.toContain("android_required:");
       expect(mainWorkflow).not.toContain("android_profile:");
@@ -271,17 +275,26 @@ describe("artifact release workflows", () => {
       expect(mainWorkflow).not.toContain("android_app_version:");
       expect(mainWorkflow).not.toContain("android_public_config:");
       expect(mainWorkflow).not.toContain("platform:");
-      expect(mainWorkflow).toContain(
-        "prerelease: ${{ github.event_name == 'schedule' || inputs.prerelease }}",
-      );
+      expect(mainWorkflow).not.toContain("inputs.prerelease");
+      expect(mainWorkflow).toContain("prerelease: true");
       expect(mainWorkflow).toContain("windows_signing: true");
       // Nightly prereleases would otherwise accumulate one release/day forever;
-      // a retention job prunes stale main-* prereleases after a successful publish.
+      // a retention job prunes stale nightly prereleases after a successful publish.
       expect(mainWorkflow).toContain("prune_nightly:");
+      expect(mainWorkflow).toContain("Keep only the 14 most recent nightly prereleases");
+      expect(mainWorkflow).toContain(
+        'test("^(?:nightly-)?v[0-9]+\\\\.[0-9]+\\\\.[0-9]+-nightly\\\\.[0-9]{8}\\\\.[0-9]+$")',
+      );
       expect(mainWorkflow).toContain("needs: publish_artifacts");
       expect(mainWorkflow).toContain(
         "if: ${{ github.ref == 'refs/heads/main' && needs.publish_artifacts.result == 'success' }}",
       );
+      expect(mainWorkflow).toContain(
+        'gh api "repos/$GH_REPO/contents/client-verified-latest.json?ref=client-verified-latest"',
+      );
+      expect(mainWorkflow).toContain("Keeping verified client pointer release");
+      expect(mainWorkflow).toContain('jq -r --arg keep "$pinned_release_tag"');
+      expect(mainWorkflow).toContain("and .tagName != $keep");
       expect(reusableWorkflow).toContain("Mobile app builds are deprecated");
       expect(reusableWorkflow).not.toContain("android_mobile_version_policy:");
       expect(reusableWorkflow).not.toContain("android_app_version:");

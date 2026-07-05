@@ -6,11 +6,6 @@ on:
   # Minute offset (17, not 0) avoids GitHub's top-of-hour scheduler congestion,
   # where minute-zero runs are frequently delayed or dropped.
   workflow_dispatch:
-    inputs:
-      prerelease:
-        description: "Mark the GitHub Release as a prerelease"
-        type: boolean
-        default: true
   schedule:
     - cron: "17 23 * * *"
 
@@ -25,21 +20,33 @@ jobs:
     # workflow_dispatch can target any ref, so gate every job on the main branch.
     if: ${{ github.ref == 'refs/heads/main' }}
     outputs:
-      release_tag: ${{ steps.meta.outputs.release_tag }}
-      release_name: ${{ steps.meta.outputs.release_name }}
-      release_version: ${{ steps.meta.outputs.release_version }}
+      release_tag: ${{ steps.nightly.outputs.tag }}
+      release_name: ${{ steps.nightly.outputs.name }}
+      release_version: ${{ steps.nightly.outputs.version }}
     steps:
-      - id: meta
-        name: Resolve main prerelease version
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.sha }}
+
+      - name: Setup Vite+
+        uses: voidzero-dev/setup-vp@v1
+        with:
+          node-version-file: package.json
+          cache: true
+          run-install: true
+
+      - id: nightly
+        name: Resolve nightly prerelease metadata
         shell: bash
         run: |
           set -euo pipefail
-          short_sha="${GITHUB_SHA::7}"
-          # workflow_dispatch has no head_commit; stamp the release at dispatch time.
-          date_part="$(date -u +%Y%m%d%H%M%S)"
-          echo "release_tag=main-${date_part}-${short_sha}" >> "$GITHUB_OUTPUT"
-          echo "release_name=T3 Code main ${short_sha}" >> "$GITHUB_OUTPUT"
-          echo "release_version=0.0.0-main.${{ github.run_number }}" >> "$GITHUB_OUTPUT"
+          nightly_date="$(date -u +%Y%m%d)"
+          node scripts/resolve-nightly-release.ts \
+            --date "$nightly_date" \
+            --run-number "${{ github.run_number }}" \
+            --sha "$GITHUB_SHA" \
+            --github-output
 
   public_config:
     name: Resolve artifact public config
@@ -132,8 +139,9 @@ jobs:
       clerk_jwt_template: ${{ needs.public_config.outputs.clerk_jwt_template }}
       clerk_cli_oauth_client_id: ${{ needs.public_config.outputs.clerk_cli_oauth_client_id }}
       relay_url: ${{ needs.public_config.outputs.relay_url }}
-      # Nightly (schedule) builds are always prereleases; manual runs honor the input.
-      prerelease: ${{ github.event_name == 'schedule' || inputs.prerelease }}
+      # Main artifacts use nightly-channel app versions, so every release must
+      # be a GitHub prerelease for the nightly updater query to discover it.
+      prerelease: true
       windows_signing: true
     secrets: inherit
 
@@ -141,24 +149,46 @@ jobs:
     name: Prune old nightly releases
     needs: publish_artifacts
     # Only after a successful publish on main; keeps the Releases page from
-    # accumulating a daily nightly prerelease forever. Stable (v*) tags untouched.
+    # accumulating a daily nightly prerelease forever. Stable v* tags without
+    # nightly prerelease metadata are untouched.
     if: ${{ github.ref == 'refs/heads/main' && needs.publish_artifacts.result == 'success' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
       contents: write
     steps:
-      - name: Keep only the 14 most recent main-* prereleases
+      - name: Keep only the 14 most recent nightly prereleases
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         shell: bash
         run: |
           set -euo pipefail
-          stale="$(gh release list --limit 300 \
-            --json tagName,isPrerelease,createdAt \
-            --jq '[.[] | select(.isPrerelease and (.tagName | startswith("main-")))]
-                  | sort_by(.createdAt) | reverse | .[14:] | .[].tagName')"
+          pointer_json="$(
+            gh api "repos/$GH_REPO/contents/client-verified-latest.json?ref=client-verified-latest" \
+              --jq '.content' | base64 -d
+          )" || {
+            echo "::warning::Unable to read client-verified-latest pointer; skipping nightly pruning."
+            exit 0
+          }
+          pinned_release_tag="$(
+            jq -r '(.desktop.artifacts.release // "") | rtrimstr("/") | split("/")[-1]' \
+              <<< "$pointer_json"
+          )" || {
+            echo "::warning::Unable to parse client-verified-latest pointer; skipping nightly pruning."
+            exit 0
+          }
+          if [[ -z "$pinned_release_tag" || "$pinned_release_tag" == "null" ]]; then
+            echo "::warning::No verified client release is pinned; skipping nightly pruning."
+            exit 0
+          fi
+          echo "Keeping verified client pointer release $pinned_release_tag"
+          stale="$(
+            gh release list --limit 300 --json tagName,isPrerelease,createdAt \
+              | jq -r --arg keep "$pinned_release_tag" \
+                  '[.[] | select(.isPrerelease and ((.tagName | startswith("main-")) or (.tagName | test("^(?:nightly-)?v[0-9]+\\.[0-9]+\\.[0-9]+-nightly\\.[0-9]{8}\\.[0-9]+$"))) and .tagName != $keep)]
+                   | sort_by(.createdAt) | reverse | .[14:] | .[].tagName'
+          )"
           if [[ -z "$stale" ]]; then
             echo "No stale nightly releases to prune."
             exit 0
