@@ -1137,21 +1137,38 @@ const makeOrchestrationProjectionPipeline = Effect.fn("makeOrchestrationProjecti
           });
           let shouldDeletePendingTurnStart = false;
           if (Option.isSome(existingTurn)) {
+            const shouldAdoptPendingTurnStart =
+              Option.isSome(pendingTurnStart) &&
+              existingTurn.value.pendingMessageId === null &&
+              pendingTurnStart.value.requestedAt <= existingTurn.value.requestedAt;
             const nextState =
               existingTurn.value.state === "completed" || existingTurn.value.state === "error"
                 ? existingTurn.value.state
                 : "running";
             shouldDeletePendingTurnStart =
-              Option.isSome(pendingTurnStart) &&
-              existingTurn.value.pendingMessageId === pendingTurnStart.value.messageId;
+              shouldAdoptPendingTurnStart ||
+              (Option.isSome(pendingTurnStart) &&
+                existingTurn.value.pendingMessageId === pendingTurnStart.value.messageId);
             yield* projectionTurnRepository.upsertByTurnId({
               ...existingTurn.value,
               state: nextState,
-              pendingMessageId: existingTurn.value.pendingMessageId,
-              sourceProposedPlanThreadId: existingTurn.value.sourceProposedPlanThreadId,
-              sourceProposedPlanId: existingTurn.value.sourceProposedPlanId,
-              startedAt: existingTurn.value.startedAt ?? event.occurredAt,
-              requestedAt: existingTurn.value.requestedAt,
+              pendingMessageId: shouldAdoptPendingTurnStart
+                ? pendingTurnStart.value.messageId
+                : existingTurn.value.pendingMessageId,
+              sourceProposedPlanThreadId: shouldAdoptPendingTurnStart
+                ? (existingTurn.value.sourceProposedPlanThreadId ??
+                  pendingTurnStart.value.sourceProposedPlanThreadId)
+                : existingTurn.value.sourceProposedPlanThreadId,
+              sourceProposedPlanId: shouldAdoptPendingTurnStart
+                ? (existingTurn.value.sourceProposedPlanId ??
+                  pendingTurnStart.value.sourceProposedPlanId)
+                : existingTurn.value.sourceProposedPlanId,
+              startedAt: shouldAdoptPendingTurnStart
+                ? pendingTurnStart.value.requestedAt
+                : (existingTurn.value.startedAt ?? event.occurredAt),
+              requestedAt: shouldAdoptPendingTurnStart
+                ? pendingTurnStart.value.requestedAt
+                : existingTurn.value.requestedAt,
             });
           } else {
             yield* projectionTurnRepository.upsertByTurnId({

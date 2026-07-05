@@ -110,9 +110,7 @@ describe("PlanUsage", () => {
         providerInstanceId: codexInstanceId,
       }),
     ).toMatchObject({
-      providers: ["codex"],
-      codexHome: "/tmp/codex-shadow",
-      claudeHome: null,
+      sources: [{ provider: "codex", instanceId: "codex_work", home: "/tmp/codex-shadow" }],
     });
     expect(
       __testing.resolveUsageCredentialScope({
@@ -120,13 +118,11 @@ describe("PlanUsage", () => {
         providerInstanceId: claudeInstanceId,
       }),
     ).toMatchObject({
-      providers: ["claude"],
-      codexHome: null,
-      claudeHome: "/tmp/claude-home",
+      sources: [{ provider: "claude", instanceId: "claude_work", home: "/tmp/claude-home" }],
     });
   });
 
-  it("uses configured Codex and Claude homes for aggregate usage", () => {
+  it("uses all enabled Codex and Claude homes for aggregate usage", () => {
     const settings = {
       ...DEFAULT_SERVER_SETTINGS,
       providerInstances: {
@@ -147,6 +143,18 @@ describe("PlanUsage", () => {
           },
         },
       },
+      providers: {
+        ...DEFAULT_SERVER_SETTINGS.providers,
+        codex: {
+          ...DEFAULT_SERVER_SETTINGS.providers.codex,
+          homePath: "/tmp/codex-default",
+          shadowHomePath: "",
+        },
+        claudeAgent: {
+          ...DEFAULT_SERVER_SETTINGS.providers.claudeAgent,
+          homePath: "/tmp/claude-default",
+        },
+      },
     };
 
     expect(
@@ -154,9 +162,12 @@ describe("PlanUsage", () => {
         settings,
       }),
     ).toMatchObject({
-      providers: ["codex", "claude"],
-      codexHome: "/tmp/codex-shadow",
-      claudeHome: "/tmp/claude-home",
+      sources: [
+        { provider: "codex", instanceId: "codex_work", home: "/tmp/codex-shadow" },
+        { provider: "codex", instanceId: "codex", home: "/tmp/codex-default" },
+        { provider: "claude", instanceId: "claude_work", home: "/tmp/claude-home" },
+        { provider: "claude", instanceId: "claudeAgent", home: "/tmp/claude-default" },
+      ],
     });
   });
 
@@ -182,9 +193,44 @@ describe("PlanUsage", () => {
         settings,
       }),
     ).toMatchObject({
-      providers: [],
-      codexHome: null,
-      claudeHome: null,
+      sources: [],
+    });
+  });
+
+  it("does not revive legacy defaults when default instance ids are replaced by other drivers", () => {
+    const settings = {
+      ...DEFAULT_SERVER_SETTINGS,
+      providerInstances: {
+        codex: {
+          driver: ProviderDriverKind.make("ollama"),
+          enabled: true,
+          config: {},
+        },
+        claudeAgent: {
+          driver: ProviderDriverKind.make("opencode"),
+          enabled: true,
+          config: {},
+        },
+      },
+      providers: {
+        ...DEFAULT_SERVER_SETTINGS.providers,
+        codex: {
+          ...DEFAULT_SERVER_SETTINGS.providers.codex,
+          homePath: "/tmp/codex-default",
+        },
+        claudeAgent: {
+          ...DEFAULT_SERVER_SETTINGS.providers.claudeAgent,
+          homePath: "/tmp/claude-default",
+        },
+      },
+    };
+
+    expect(
+      __testing.resolveUsageCredentialScope({
+        settings,
+      }),
+    ).toMatchObject({
+      sources: [],
     });
   });
 
@@ -226,9 +272,10 @@ describe("PlanUsage", () => {
         settings,
       }),
     ).toMatchObject({
-      providers: ["codex", "claude"],
-      codexHome: "/tmp/codex-default",
-      claudeHome: "/tmp/claude-default",
+      sources: [
+        { provider: "codex", instanceId: "codex", home: "/tmp/codex-default" },
+        { provider: "claude", instanceId: "claudeAgent", home: "/tmp/claude-default" },
+      ],
     });
   });
 
@@ -252,9 +299,7 @@ describe("PlanUsage", () => {
         providerInstanceId: ProviderInstanceId.make("codex"),
       }),
     ).toMatchObject({
-      providers: ["codex"],
-      codexHome: "/tmp/codex-default",
-      claudeHome: null,
+      sources: [{ provider: "codex", instanceId: "codex", home: "/tmp/codex-default" }],
     });
   });
 });

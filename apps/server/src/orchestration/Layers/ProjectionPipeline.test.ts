@@ -2593,6 +2593,162 @@ it.layer(BaseTestLayer)("OrchestrationProjectionPipeline", (it) => {
   );
 });
 
+it.layer(Layer.fresh(makeProjectionPipelinePrefixedTestLayer("t3-projection-precreated-turn-")))(
+  "OrchestrationProjectionPipeline",
+  (it) => {
+    it.effect("reconciles pending metadata when provider output creates the turn first", () =>
+      Effect.gen(function* () {
+        const projectionPipeline = yield* OrchestrationProjectionPipeline;
+        const eventStore = yield* OrchestrationEventStore;
+        const sql = yield* SqlClient.SqlClient;
+        const appendAndProject = (event: Parameters<typeof eventStore.append>[0]) =>
+          eventStore
+            .append(event)
+            .pipe(Effect.flatMap((savedEvent) => projectionPipeline.projectEvent(savedEvent)));
+
+        const threadId = ThreadId.make("thread-precreated-turn");
+        const turnId = TurnId.make("turn-precreated");
+        const messageId = MessageId.make("message-precreated-prompt");
+        const sourcePlanThreadId = ThreadId.make("thread-source-plan");
+        const sourcePlanId = "plan-source";
+
+        yield* appendAndProject({
+          type: "thread.created",
+          eventId: EventId.make("evt-precreated-create"),
+          aggregateKind: "thread",
+          aggregateId: threadId,
+          occurredAt: "2026-02-26T15:00:00.000Z",
+          commandId: CommandId.make("cmd-precreated-create"),
+          causationEventId: null,
+          correlationId: CorrelationId.make("cmd-precreated-create"),
+          metadata: {},
+          payload: {
+            threadId,
+            projectId: ProjectId.make("project-1"),
+            title: "Thread precreated turn",
+            modelSelection: {
+              instanceId: ProviderInstanceId.make("codex"),
+              model: "gpt-5-codex",
+            },
+            runtimeMode: "full-access",
+            branch: null,
+            worktreePath: null,
+            createdAt: "2026-02-26T15:00:00.000Z",
+            updatedAt: "2026-02-26T15:00:00.000Z",
+          },
+        });
+
+        yield* appendAndProject({
+          type: "thread.turn-start-requested",
+          eventId: EventId.make("evt-precreated-request"),
+          aggregateKind: "thread",
+          aggregateId: threadId,
+          occurredAt: "2026-02-26T15:00:01.000Z",
+          commandId: CommandId.make("cmd-precreated-request"),
+          causationEventId: null,
+          correlationId: CorrelationId.make("cmd-precreated-request"),
+          metadata: {},
+          payload: {
+            threadId,
+            messageId,
+            sourceProposedPlan: {
+              threadId: sourcePlanThreadId,
+              planId: sourcePlanId,
+            },
+            runtimeMode: "full-access",
+            createdAt: "2026-02-26T15:00:01.000Z",
+          },
+        });
+
+        yield* appendAndProject({
+          type: "thread.message-sent",
+          eventId: EventId.make("evt-precreated-assistant"),
+          aggregateKind: "thread",
+          aggregateId: threadId,
+          occurredAt: "2026-02-26T15:00:02.000Z",
+          commandId: CommandId.make("cmd-precreated-assistant"),
+          causationEventId: null,
+          correlationId: CorrelationId.make("cmd-precreated-assistant"),
+          metadata: {},
+          payload: {
+            threadId,
+            messageId: MessageId.make("message-precreated-assistant"),
+            role: "assistant",
+            text: "working",
+            turnId,
+            streaming: true,
+            createdAt: "2026-02-26T15:00:02.000Z",
+            updatedAt: "2026-02-26T15:00:02.000Z",
+          },
+        });
+
+        yield* appendAndProject({
+          type: "thread.session-set",
+          eventId: EventId.make("evt-precreated-session"),
+          aggregateKind: "thread",
+          aggregateId: threadId,
+          occurredAt: "2026-02-26T15:00:03.000Z",
+          commandId: CommandId.make("cmd-precreated-session"),
+          causationEventId: null,
+          correlationId: CorrelationId.make("cmd-precreated-session"),
+          metadata: {},
+          payload: {
+            threadId,
+            session: {
+              threadId,
+              status: "running",
+              providerName: "codex",
+              runtimeMode: "full-access",
+              activeTurnId: turnId,
+              lastError: null,
+              updatedAt: "2026-02-26T15:00:03.000Z",
+            },
+          },
+        });
+
+        const pendingRows = yield* sql<{ readonly count: number }>`
+          SELECT COUNT(*) AS "count"
+          FROM projection_turns
+          WHERE thread_id = ${threadId}
+            AND turn_id IS NULL
+            AND state = 'pending'
+        `;
+        assert.equal(pendingRows[0]?.count ?? 0, 0);
+
+        const turnRows = yield* sql<{
+          readonly turnId: string;
+          readonly pendingMessageId: string | null;
+          readonly sourceProposedPlanThreadId: string | null;
+          readonly sourceProposedPlanId: string | null;
+          readonly requestedAt: string;
+          readonly startedAt: string | null;
+        }>`
+          SELECT
+            turn_id AS "turnId",
+            pending_message_id AS "pendingMessageId",
+            source_proposed_plan_thread_id AS "sourceProposedPlanThreadId",
+            source_proposed_plan_id AS "sourceProposedPlanId",
+            requested_at AS "requestedAt",
+            started_at AS "startedAt"
+          FROM projection_turns
+          WHERE thread_id = ${threadId}
+            AND turn_id = ${turnId}
+        `;
+        assert.deepEqual(turnRows, [
+          {
+            turnId: "turn-precreated",
+            pendingMessageId: "message-precreated-prompt",
+            sourceProposedPlanThreadId: "thread-source-plan",
+            sourceProposedPlanId: "plan-source",
+            requestedAt: "2026-02-26T15:00:01.000Z",
+            startedAt: "2026-02-26T15:00:01.000Z",
+          },
+        ]);
+      }),
+    );
+  },
+);
+
 it.effect("restores pending turn-start metadata across projection pipeline restart", () =>
   Effect.gen(function* () {
     const { dbPath } = yield* ServerConfig;

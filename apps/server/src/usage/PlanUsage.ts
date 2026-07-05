@@ -5,8 +5,11 @@ import type {
   PlanUsageProvider,
   PlanUsageSnapshot,
   PlanUsageWindow,
-  ProviderInstanceId,
   ServerSettings,
+} from "@t3tools/contracts";
+import {
+  ProviderInstanceId,
+  type ProviderInstanceId as ProviderInstanceIdType,
 } from "@t3tools/contracts";
 import * as NodeFSP from "node:fs/promises";
 import * as NodePath from "node:path";
@@ -32,19 +35,24 @@ interface ProviderUsage {
   readonly windows: ReadonlyArray<PlanUsageWindow>;
 }
 
+interface UsageCredentialSource {
+  readonly provider: PlanUsageProvider;
+  readonly instanceId: ProviderInstanceIdType;
+  readonly home: string;
+}
+
 interface UsageCredentialScope {
   readonly cacheKey: string;
-  readonly providers: ReadonlyArray<PlanUsageProvider>;
-  readonly codexHome: string | null;
-  readonly claudeHome: string | null;
+  readonly sources: ReadonlyArray<UsageCredentialSource>;
 }
 
 interface LoadPlanUsageOptions {
   readonly settings?: ServerSettings | undefined;
-  readonly providerInstanceId?: ProviderInstanceId | null | undefined;
+  readonly providerInstanceId?: ProviderInstanceIdType | null | undefined;
 }
 
 interface UsageProviderInstance {
+  readonly instanceId: ProviderInstanceIdType;
   readonly driver: string;
   readonly enabled?: boolean | undefined;
   readonly config?: unknown;
@@ -280,10 +288,11 @@ function configuredPathOrNull(value: unknown): string | null {
 
 function legacyDefaultUsageProviderInstance(
   settings: ServerSettings,
-  providerInstanceId: ProviderInstanceId,
+  providerInstanceId: ProviderInstanceIdType,
 ): UsageProviderInstance | null {
   if (providerInstanceId === "codex") {
     return {
+      instanceId: providerInstanceId,
       driver: "codex",
       enabled: settings.providers.codex.enabled,
       config: settings.providers.codex,
@@ -292,6 +301,7 @@ function legacyDefaultUsageProviderInstance(
 
   if (providerInstanceId === "claudeAgent") {
     return {
+      instanceId: providerInstanceId,
       driver: "claudeAgent",
       enabled: settings.providers.claudeAgent.enabled,
       config: settings.providers.claudeAgent,
@@ -307,35 +317,30 @@ function isUsageDriverForProvider(driver: string, provider: PlanUsageProvider): 
     : driver === "claudeAgent" || driver === "claude";
 }
 
-function firstEnabledUsageProviderInstance(
+function configuredUsageProviderInstances(
   settings: ServerSettings,
   provider: PlanUsageProvider,
-): UsageProviderInstance | null {
-  const defaultInstanceId = (provider === "codex" ? "codex" : "claudeAgent") as ProviderInstanceId;
-  const configuredDefault = settings.providerInstances[defaultInstanceId];
-  const explicitSecondaryCandidates = Object.entries(settings.providerInstances)
-    .filter(([instanceId]) => instanceId !== defaultInstanceId)
-    .map(([, instance]) => instance)
-    .filter((instance) => isUsageDriverForProvider(instance.driver, provider));
-  if (configuredDefault) {
-    const explicitProviderCandidates = [configuredDefault, ...explicitSecondaryCandidates].filter(
-      (instance) => isUsageDriverForProvider(instance.driver, provider),
-    );
-    return explicitProviderCandidates.find((instance) => instance.enabled !== false) ?? null;
-  }
-
-  const enabledSecondary = explicitSecondaryCandidates.find(
-    (instance) => instance.enabled !== false,
+): ReadonlyArray<UsageProviderInstance> {
+  const defaultInstanceId = (
+    provider === "codex" ? "codex" : "claudeAgent"
+  ) as ProviderInstanceIdType;
+  const explicitInstances: UsageProviderInstance[] = Object.entries(settings.providerInstances).map(
+    ([instanceId, instance]) => ({
+      instanceId: ProviderInstanceId.make(instanceId),
+      ...instance,
+    }),
   );
-  if (enabledSecondary) {
-    return enabledSecondary;
+  const explicitCandidates = explicitInstances.filter((instance) =>
+    isUsageDriverForProvider(instance.driver, provider),
+  );
+  if (!explicitInstances.some((instance) => instance.instanceId === defaultInstanceId)) {
+    const legacyDefault = legacyDefaultUsageProviderInstance(settings, defaultInstanceId);
+    if (legacyDefault && isUsageDriverForProvider(legacyDefault.driver, provider)) {
+      explicitCandidates.push(legacyDefault);
+    }
   }
 
-  const legacyDefault = legacyDefaultUsageProviderInstance(settings, defaultInstanceId);
-  return legacyDefault?.enabled !== false &&
-    isUsageDriverForProvider(legacyDefault?.driver ?? "", provider)
-    ? legacyDefault
-    : null;
+  return explicitCandidates.filter((instance) => instance.enabled !== false);
 }
 
 function configuredHomeForProvider(
@@ -353,6 +358,35 @@ function configuredHomeForProvider(
   return configuredPathOrNull(config?.homePath) ?? defaultClaudeHome();
 }
 
+function usageSourceForInstance(
+  provider: PlanUsageProvider,
+  instance: UsageProviderInstance,
+): UsageCredentialSource {
+  return {
+    provider,
+    instanceId: instance.instanceId,
+    home: configuredHomeForProvider(provider, instance),
+  };
+}
+
+function uniqueUsageSources(
+  sources: ReadonlyArray<UsageCredentialSource>,
+): ReadonlyArray<UsageCredentialSource> {
+  const seen = new Set<string>();
+  return sources.filter((source) => {
+    const key = `${source.provider}:${source.home}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+function usageScopeCacheKey(sources: ReadonlyArray<UsageCredentialSource>): string {
+  return `sources:${JSON.stringify(
+    sources.map((source) => [source.provider, source.instanceId, source.home]),
+  )}`;
+}
+
 export function resolveUsageCredentialScope(
   options: LoadPlanUsageOptions = {},
 ): UsageCredentialScope {
@@ -365,63 +399,68 @@ export function resolveUsageCredentialScope(
     if (!instance || instance.enabled === false) {
       return {
         cacheKey: `instance:${providerInstanceId}:disabled-or-missing`,
-        providers: [],
-        codexHome: null,
-        claudeHome: null,
+        sources: [],
       };
     }
 
     if (instance.driver === "codex") {
-      const codexHome = configuredHomeForProvider("codex", instance);
+      const source = usageSourceForInstance("codex", {
+        instanceId: providerInstanceId,
+        ...instance,
+      });
       return {
-        cacheKey: `instance:${providerInstanceId}:codex:${codexHome}`,
-        providers: ["codex"],
-        codexHome,
-        claudeHome: null,
+        cacheKey: usageScopeCacheKey([source]),
+        sources: [source],
       };
     }
 
     if (instance.driver === "claudeAgent" || instance.driver === "claude") {
-      const claudeHome = configuredHomeForProvider("claude", instance);
+      const source = usageSourceForInstance("claude", {
+        instanceId: providerInstanceId,
+        ...instance,
+      });
       return {
-        cacheKey: `instance:${providerInstanceId}:claude:${claudeHome}`,
-        providers: ["claude"],
-        codexHome: null,
-        claudeHome,
+        cacheKey: usageScopeCacheKey([source]),
+        sources: [source],
       };
     }
 
     return {
       cacheKey: `instance:${providerInstanceId}:${instance.driver}`,
-      providers: [],
-      codexHome: null,
-      claudeHome: null,
+      sources: [],
     };
   }
 
   if (settings) {
-    const codexInstance = firstEnabledUsageProviderInstance(settings, "codex");
-    const claudeInstance = firstEnabledUsageProviderInstance(settings, "claude");
-    const providers: PlanUsageProvider[] = [];
-    if (codexInstance) providers.push("codex");
-    if (claudeInstance) providers.push("claude");
-    const codexHome = codexInstance ? configuredHomeForProvider("codex", codexInstance) : null;
-    const claudeHome = claudeInstance ? configuredHomeForProvider("claude", claudeInstance) : null;
+    const sources = uniqueUsageSources([
+      ...configuredUsageProviderInstances(settings, "codex").map((instance) =>
+        usageSourceForInstance("codex", instance),
+      ),
+      ...configuredUsageProviderInstances(settings, "claude").map((instance) =>
+        usageSourceForInstance("claude", instance),
+      ),
+    ]);
     return {
-      cacheKey: `default:${codexHome ?? "none"}:${claudeHome ?? "none"}`,
-      providers,
-      codexHome,
-      claudeHome,
+      cacheKey: usageScopeCacheKey(sources),
+      sources,
     };
   }
 
-  const codexHome = defaultCodexHome();
-  const claudeHome = defaultClaudeHome();
+  const sources = [
+    {
+      provider: "codex",
+      instanceId: ProviderInstanceId.make("codex"),
+      home: defaultCodexHome(),
+    },
+    {
+      provider: "claude",
+      instanceId: ProviderInstanceId.make("claudeAgent"),
+      home: defaultClaudeHome(),
+    },
+  ] satisfies ReadonlyArray<UsageCredentialSource>;
   return {
-    cacheKey: `default:${codexHome}:${claudeHome}`,
-    providers: ["codex", "claude"],
-    codexHome,
-    claudeHome,
+    cacheKey: usageScopeCacheKey(sources),
+    sources,
   };
 }
 
@@ -569,13 +608,26 @@ async function loadClaudeUsage(claudeHome: string): Promise<ProviderUsage | null
 async function loadProviderUsage(
   scope: UsageCredentialScope,
 ): Promise<ReadonlyArray<ProviderUsage>> {
-  const tasks: Array<Promise<ProviderUsage | null>> = [];
-  if (scope.providers.includes("codex") && scope.codexHome) {
-    tasks.push(loadCodexUsage(scope.codexHome));
+  const sourceCounts = new Map<PlanUsageProvider, number>();
+  for (const source of scope.sources) {
+    sourceCounts.set(source.provider, (sourceCounts.get(source.provider) ?? 0) + 1);
   }
-  if (scope.providers.includes("claude") && scope.claudeHome) {
-    tasks.push(loadClaudeUsage(scope.claudeHome));
-  }
+  const tasks = scope.sources.map(async (source): Promise<ProviderUsage | null> => {
+    const usage =
+      source.provider === "codex"
+        ? await loadCodexUsage(source.home)
+        : await loadClaudeUsage(source.home);
+    if (!usage) return null;
+    const includeInstanceLabel = (sourceCounts.get(source.provider) ?? 0) > 1;
+    return {
+      ...usage,
+      windows: usage.windows.map((window) => ({
+        ...window,
+        id: `${source.provider}:${source.instanceId}:${window.id}`,
+        title: includeInstanceLabel ? `${window.title} (${source.instanceId})` : window.title,
+      })),
+    };
+  });
   return (await Promise.all(tasks)).filter(
     (provider): provider is ProviderUsage => provider !== null && provider.windows.length > 0,
   );
