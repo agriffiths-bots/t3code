@@ -497,3 +497,43 @@ export function outboxSubmissionToChatMessage(submission: MessageOutboxSubmissio
     deliveryRetryable: submission.retryable !== false,
   };
 }
+
+export function mergePendingAndOutboxChatMessages(
+  pendingMessages: ReadonlyArray<ChatMessage>,
+  outboxSubmissions: ReadonlyArray<MessageOutboxSubmission>,
+): ChatMessage[] {
+  const pendingByMessageId = new Map(pendingMessages.map((message) => [message.id, message]));
+  const outboxMessageIds = new Set(outboxSubmissions.map((submission) => submission.messageId));
+  const outboxEntries = outboxSubmissions.map((submission, index) => ({
+    kind: "outbox" as const,
+    message:
+      pendingByMessageId.get(submission.messageId) ?? outboxSubmissionToChatMessage(submission),
+    submission,
+    index,
+  }));
+  const localPendingEntries = pendingMessages
+    .filter((message) => !outboxMessageIds.has(message.id))
+    .map((message, index) => ({
+      kind: "pending" as const,
+      message,
+      index,
+    }));
+
+  return [...outboxEntries, ...localPendingEntries]
+    .toSorted((left, right) => {
+      if (left.kind === "outbox" && right.kind === "outbox") {
+        return compareOutboxSubmissions(left.submission, right.submission);
+      }
+      const leftCreatedAt =
+        left.kind === "outbox" ? left.submission.createdAt : (left.message.createdAt ?? "");
+      const rightCreatedAt =
+        right.kind === "outbox" ? right.submission.createdAt : (right.message.createdAt ?? "");
+      const createdAtOrder = leftCreatedAt.localeCompare(rightCreatedAt);
+      if (createdAtOrder !== 0) return createdAtOrder;
+      if (left.kind === right.kind) {
+        return left.index - right.index;
+      }
+      return left.kind === "outbox" ? -1 : 1;
+    })
+    .map((entry) => entry.message);
+}

@@ -24,6 +24,7 @@ import {
   messageOutboxSubmissionHasBootstrap,
   messageOutboxSubmissionIsDurable,
   messageOutboxSubmissionRequiresServerShell,
+  mergePendingAndOutboxChatMessages,
   outboxSubmissionsForThread,
   outboxSubmissionToChatMessage,
   readMessageOutbox,
@@ -67,10 +68,14 @@ function submission(input: {
   bootstrap?: MessageOutboxSubmission["input"]["bootstrap"];
   optimisticAttachments?: MessageOutboxSubmission["optimisticAttachments"];
   sequence?: number;
+  createdAt?: string;
+  updatedAt?: string;
 }): MessageOutboxSubmission {
   const messageId = MessageId.make(input.messageId);
   const commandId = CommandId.make(input.commandId ?? `client:turn:${messageId}`);
   const attachments = input.attachments ?? [];
+  const createdAt = input.createdAt ?? "2026-07-03T12:00:00.000Z";
+  const updatedAt = input.updatedAt ?? createdAt;
   return {
     environmentId: EnvironmentId.make("env-1"),
     threadId: ThreadId.make("thread-1"),
@@ -81,8 +86,8 @@ function submission(input: {
     status: input.status ?? "pending",
     attempts: input.attempts ?? 0,
     error: null,
-    createdAt: "2026-07-03T12:00:00.000Z",
-    updatedAt: "2026-07-03T12:00:00.000Z",
+    createdAt,
+    updatedAt,
     ...(input.sequence !== undefined ? { sequence: input.sequence } : {}),
     optimisticAttachments: input.optimisticAttachments ?? [],
     input: {
@@ -103,7 +108,7 @@ function submission(input: {
       runtimeMode: "full-access",
       interactionMode: "default",
       ...(input.bootstrap !== undefined ? { bootstrap: input.bootstrap } : {}),
-      createdAt: "2026-07-03T12:00:00.000Z",
+      createdAt,
     },
   };
 }
@@ -661,6 +666,49 @@ describe("messageOutbox", () => {
       deliveryStatus: "failed",
       deliveryRetryable: false,
     });
+  });
+
+  it("merges pending and restored outbox messages in submission order", () => {
+    const restoredFirst = submission({
+      messageId: "m-first",
+      createdAt: "2026-07-03T12:00:00.000Z",
+      sequence: 1,
+    });
+    const newSecond = submission({
+      messageId: "m-second",
+      createdAt: "2026-07-03T12:00:01.000Z",
+      sequence: 2,
+    });
+    const pendingSecond = {
+      ...outboxSubmissionToChatMessage(newSecond),
+      deliveryStatus: "queued" as const,
+    };
+
+    expect(mergePendingAndOutboxChatMessages([pendingSecond], [restoredFirst, newSecond])).toEqual([
+      outboxSubmissionToChatMessage(restoredFirst),
+      pendingSecond,
+    ]);
+  });
+
+  it("uses outbox sequence for queued messages created in the same millisecond", () => {
+    const laterPendingSubmission = submission({
+      messageId: "m-second",
+      createdAt: "2026-07-03T12:00:00.000Z",
+      sequence: 2,
+    });
+    const earlierRestoredSubmission = submission({
+      messageId: "m-first",
+      createdAt: "2026-07-03T12:00:00.000Z",
+      sequence: 1,
+    });
+    const pendingSecond = outboxSubmissionToChatMessage(laterPendingSubmission);
+
+    expect(
+      mergePendingAndOutboxChatMessages(
+        [pendingSecond],
+        [laterPendingSubmission, earlierRestoredSubmission],
+      ).map((message) => message.id),
+    ).toEqual(["m-first", "m-second"]);
   });
 
   it("preserves dependent failures in the outbox as terminal nonretryable rows", () => {

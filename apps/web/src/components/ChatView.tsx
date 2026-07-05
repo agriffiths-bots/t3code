@@ -277,7 +277,7 @@ import {
   messageOutboxSubmissionIsTerminal,
   messageOutboxSubmissionRequiresServerShell,
   markOutboxSubmissionsFailedNonretryable,
-  outboxSubmissionToChatMessage,
+  mergePendingAndOutboxChatMessages,
   outboxSubmissionsForThread,
   reconcileOutboxWithServerMessages,
   removeOutboxSubmission,
@@ -513,7 +513,7 @@ function outboxSubmissionThreadKey(submission: MessageOutboxSubmission): string 
 type OutboxThreadDrainBarrier = {
   readonly dispatchStartedAt: string;
   readonly baselineTurnId: TurnId | null;
-  readonly baselineSessionKey: string | null;
+  readonly baselineSessionActiveTurnId: TurnId | null;
   readonly observedTurn: boolean;
 };
 
@@ -528,10 +528,6 @@ function maxOutboxBaselineSequence(
     maxSequence = maxSequence === null ? sequence : Math.max(maxSequence, sequence);
   }
   return maxSequence;
-}
-
-function outboxBarrierSessionKey(session: Thread["session"] | null | undefined): string | null {
-  return session ? `${session.status}:${session.activeTurnId ?? ""}:${session.updatedAt}` : null;
 }
 
 function latestTurnIsAfterOutboxBarrierBaseline(
@@ -569,7 +565,7 @@ function terminalSessionSettledAfterOutboxDispatch(
   }
   return (
     session.updatedAt.localeCompare(barrier.dispatchStartedAt) >= 0 ||
-    outboxBarrierSessionKey(session) !== barrier.baselineSessionKey
+    (session.activeTurnId !== null && session.activeTurnId !== barrier.baselineSessionActiveTurnId)
   );
 }
 
@@ -2475,14 +2471,14 @@ function ChatViewContent(props: ChatViewProps) {
     }
     const serverIds = new Set(serverMessagesWithPreviewHandoff.map((message) => message.id));
     const pendingMessages = optimisticUserMessages.filter((message) => !serverIds.has(message.id));
-    const pendingMessageIds = new Set(pendingMessages.map((message) => message.id));
-    const outboxMessages = activeOutboxSubmissions
-      .map(outboxSubmissionToChatMessage)
-      .filter((message) => !serverIds.has(message.id) && !pendingMessageIds.has(message.id));
-    if (pendingMessages.length === 0 && outboxMessages.length === 0) {
+    const pendingAndOutboxMessages = mergePendingAndOutboxChatMessages(
+      pendingMessages,
+      activeOutboxSubmissions.filter((submission) => !serverIds.has(submission.messageId)),
+    );
+    if (pendingAndOutboxMessages.length === 0) {
       return serverMessagesWithPreviewHandoff;
     }
-    return [...serverMessagesWithPreviewHandoff, ...pendingMessages, ...outboxMessages];
+    return [...serverMessagesWithPreviewHandoff, ...pendingAndOutboxMessages];
   }, [
     activeOutboxSubmissions,
     attachmentPreviewHandoffByMessageId,
@@ -2856,7 +2852,7 @@ function ChatViewContent(props: ChatViewProps) {
       }
 
       const baselineTurnId = submissionShell?.latestTurn?.turnId ?? null;
-      const baselineSessionKey = outboxBarrierSessionKey(submissionShell?.session);
+      const baselineSessionActiveTurnId = submissionShell?.session?.activeTurnId ?? null;
       const baselineSnapshotSequence = maxOutboxBaselineSequence(
         environmentShellSnapshotSequenceById.get(submission.environmentId),
         settingsResult.value.sequence,
@@ -2929,7 +2925,7 @@ function ChatViewContent(props: ChatViewProps) {
         outboxThreadDrainBarriersRef.current.set(threadKey, {
           dispatchStartedAt,
           baselineTurnId,
-          baselineSessionKey,
+          baselineSessionActiveTurnId,
           observedTurn: false,
         });
       }
@@ -5510,6 +5506,10 @@ function ChatViewContent(props: ChatViewProps) {
       updateOptimisticOutboxState(initialOutboxSubmission);
 
       if (shouldQueueInitialSend) {
+        setComposerDraftInteractionMode(
+          scopeThreadRef(activeThread.environmentId, threadIdForSend),
+          nextInteractionMode,
+        );
         sendInFlightRef.current = false;
         resetLocalDispatch();
         return;
