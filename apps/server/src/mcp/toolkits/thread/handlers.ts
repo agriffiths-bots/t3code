@@ -5,6 +5,7 @@ import {
   type ModelSelection,
   type OrchestrationProjectShell,
   type OrchestrationThreadShell,
+  type VcsRepositoryIdentity,
 } from "@t3tools/contracts";
 import { buildTemporaryWorktreeBranchName } from "@t3tools/shared/git";
 import {
@@ -17,6 +18,7 @@ import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
+import * as Path from "effect/Path";
 import * as Schema from "effect/Schema";
 
 import * as McpInvocationContext from "../../McpInvocationContext.ts";
@@ -25,6 +27,7 @@ import * as BootstrapTurnStartDispatcher from "../../../orchestration/Services/B
 import { ProjectionSnapshotQuery } from "../../../orchestration/Services/ProjectionSnapshotQuery.ts";
 import { ProviderInstanceRegistry } from "../../../provider/Services/ProviderInstanceRegistry.ts";
 import { GitWorkflowService } from "../../../git/GitWorkflowService.ts";
+import * as VcsDriverRegistry from "../../../vcs/VcsDriverRegistry.ts";
 import {
   ThreadStartToolError,
   type ThreadStartMode,
@@ -72,6 +75,8 @@ const makeActiveThreadStartRuntime = Effect.fn("ThreadToolkit.makeActiveRuntime"
   const projectionSnapshotQuery = yield* ProjectionSnapshotQuery;
   const providerInstanceRegistry = yield* ProviderInstanceRegistry;
   const gitWorkflow = yield* GitWorkflowService;
+  const vcsDriverRegistry = yield* VcsDriverRegistry.VcsDriverRegistry;
+  const path = yield* Path.Path;
   const uuid = () => crypto.randomUUIDv4.pipe(Effect.orDie);
 
   const makeIds = Effect.fn("ThreadToolkit.makeIds")(function* () {
@@ -109,9 +114,45 @@ const makeActiveThreadStartRuntime = Effect.fn("ThreadToolkit.makeActiveRuntime"
     );
   });
 
-  const isGitRepository = Effect.fn("ThreadToolkit.isGitRepository")(function* (cwd: string) {
-    return yield* gitWorkflow.listRefs({ cwd, limit: 1 }).pipe(
-      Effect.map((result) => result.isRepo),
+  const repositoryIdentityPath = (repository: VcsRepositoryIdentity): string => {
+    const metadataPath = repository.metadataPath?.trim();
+    const identityPath =
+      metadataPath && metadataPath.length > 0 ? metadataPath : repository.rootPath;
+    return path.normalize(
+      path.isAbsolute(identityPath) ? identityPath : path.join(repository.rootPath, identityPath),
+    );
+  };
+
+  const isPathWithin = (parent: string, candidate: string): boolean => {
+    const relative = path.relative(path.normalize(parent), path.normalize(candidate));
+    return (
+      relative === "" ||
+      (relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative))
+    );
+  };
+
+  const sourceCwdBelongsToProject = Effect.fn("ThreadToolkit.sourceCwdBelongsToProject")(function* (
+    projectRoot: string,
+    candidate: string,
+  ) {
+    const candidateHandle = yield* vcsDriverRegistry.detect({ cwd: candidate });
+    if (!candidateHandle) return false;
+
+    const projectHandle = yield* vcsDriverRegistry.detect({ cwd: projectRoot });
+    if (!projectHandle) return isPathWithin(projectRoot, candidateHandle.repository.rootPath);
+
+    return (
+      candidateHandle.kind === projectHandle.kind &&
+      repositoryIdentityPath(candidateHandle.repository) ===
+        repositoryIdentityPath(projectHandle.repository)
+    );
+  });
+
+  const sourceCwdIsUsable = Effect.fn("ThreadToolkit.sourceCwdIsUsable")(function* (
+    projectRoot: string,
+    candidate: string,
+  ) {
+    return yield* sourceCwdBelongsToProject(projectRoot, candidate).pipe(
       Effect.orElseSucceed(() => true),
     );
   });
@@ -122,7 +163,9 @@ const makeActiveThreadStartRuntime = Effect.fn("ThreadToolkit.makeActiveRuntime"
   ) {
     const candidate = resolveThreadWorkspaceCwd({ thread: sourceThread, projects: [project] });
     if (!candidate || candidate === project.workspaceRoot) return project.workspaceRoot;
-    return (yield* isGitRepository(candidate)) ? candidate : project.workspaceRoot;
+    return (yield* sourceCwdIsUsable(project.workspaceRoot, candidate))
+      ? candidate
+      : project.workspaceRoot;
   });
 
   const resolveNewWorktreeBaseBranch = Effect.fn("ThreadToolkit.resolveNewWorktreeBaseBranch")(

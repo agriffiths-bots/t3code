@@ -1,24 +1,27 @@
 import { expect, it } from "@effect/vitest";
 import {
   EnvironmentId,
-  GitCommandError,
   ProjectId,
   ProviderDriverKind,
   ProviderInstanceId,
   ThreadId,
+  VcsUnsupportedOperationError,
   type ModelSelection,
   type OrchestrationCommand,
   type OrchestrationProjectShell,
   type OrchestrationThreadShell,
 } from "@t3tools/contracts";
+import * as NodeServices from "@effect/platform-node/NodeServices";
 import * as Effect from "effect/Effect";
 import * as Crypto from "effect/Crypto";
+import * as DateTime from "effect/DateTime";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Stream from "effect/Stream";
 import { McpSchema, McpServer } from "effect/unstable/ai";
 
 import { GitWorkflowService } from "../../../git/GitWorkflowService.ts";
+import * as VcsDriverRegistry from "../../../vcs/VcsDriverRegistry.ts";
 import * as BootstrapTurnStartDispatcher from "../../../orchestration/Services/BootstrapTurnStartDispatcher.ts";
 import { OrchestrationEngineService } from "../../../orchestration/Services/OrchestrationEngine.ts";
 import { ProjectionSnapshotQuery } from "../../../orchestration/Services/ProjectionSnapshotQuery.ts";
@@ -146,7 +149,34 @@ interface TestLayerOptions {
   readonly project?: OrchestrationProjectShell;
   readonly sourceThread?: OrchestrationThreadShell;
   readonly gitWorkflow?: Partial<GitWorkflowService["Service"]>;
+  readonly vcsDetect?: VcsDriverRegistry.VcsDriverRegistry["Service"]["detect"];
 }
+
+const vcsFreshness = {
+  source: "live-local" as const,
+  observedAt: DateTime.makeUnsafe("1970-01-01T00:00:00.000Z"),
+  expiresAt: Option.none(),
+};
+
+const repositoryMetadataRootForCwd = (cwd: string): string => {
+  if (cwd.startsWith("/home/adam")) return "/home/adam/t3code";
+  if (cwd.startsWith("/repo")) return "/repo";
+  return cwd;
+};
+
+const makeGitHandle = (cwd: string): VcsDriverRegistry.VcsDriverHandle => {
+  const metadataRoot = repositoryMetadataRootForCwd(cwd);
+  return {
+    kind: "git",
+    repository: {
+      kind: "git",
+      rootPath: cwd,
+      metadataPath: `${metadataRoot}/.git`,
+      freshness: vcsFreshness,
+    },
+    driver: {} as VcsDriverRegistry.VcsDriverHandle["driver"],
+  };
+};
 
 const defaultGitWorkflow = {
   listRefs: () =>
@@ -226,12 +256,18 @@ const makeTestLayer = (commands: OrchestrationCommand[], options: TestLayerOptio
       }),
     ),
     Layer.provide(
+      Layer.mock(VcsDriverRegistry.VcsDriverRegistry)({
+        detect: options.vcsDetect ?? ((input) => Effect.succeed(makeGitHandle(input.cwd))),
+      }),
+    ),
+    Layer.provide(
       Layer.mock(OrchestrationEngineService)({
         readEvents: () => Stream.empty,
         dispatch: () => Effect.succeed({ sequence: 1 }),
         streamDomainEvents: Stream.empty,
       }),
     ),
+    Layer.provideMerge(NodeServices.layer),
   );
 };
 
@@ -376,7 +412,7 @@ it.effect("starts a new worktree from a detached parent using the project defaul
       projectCwd: "/repo/worktree",
       baseBranch: "main",
     });
-    expect(listRefCwds).toEqual(["/repo/worktree", "/repo/worktree"]);
+    expect(listRefCwds).toEqual(["/repo/worktree"]);
   }),
 );
 
@@ -442,7 +478,6 @@ it.effect(
       });
       expect(gitCalls).toEqual([
         "listRefs:/repo/worktree",
-        "listRefs:/repo/worktree",
         "status:/repo/worktree",
         "listRefs:/repo/project",
         "status:/repo/project",
@@ -454,6 +489,7 @@ it.effect("falls back to the project checkout when the source worktree path is s
   Effect.gen(function* () {
     const commands: OrchestrationCommand[] = [];
     const gitCalls: string[] = [];
+    const vcsCalls: string[] = [];
     const result = yield* callStartTool({ prompt: "Continue after cleanup" }, commands, {
       project: {
         ...project,
@@ -494,6 +530,11 @@ it.effect("falls back to the project checkout when the source worktree path is s
             };
           }),
       },
+      vcsDetect: (input) =>
+        Effect.sync(() => {
+          vcsCalls.push(input.cwd);
+          return input.cwd === "/repo/missing-worktree" ? null : makeGitHandle(input.cwd);
+        }),
     });
 
     expect(result.isError).toBe(false);
@@ -504,14 +545,40 @@ it.effect("falls back to the project checkout when the source worktree path is s
       projectCwd: "/repo/project",
       baseBranch: "main",
     });
-    expect(gitCalls).toEqual(["listRefs:/repo/missing-worktree", "listRefs:/repo/project"]);
+    expect(vcsCalls).toEqual(["/repo/missing-worktree"]);
+    expect(gitCalls).toEqual(["listRefs:/repo/project"]);
   }),
 );
 
-it.effect("keeps the source worktree cwd when validation cannot list refs", () =>
+it.effect("falls back to the project checkout when the source worktree is a different repo", () =>
   Effect.gen(function* () {
     const commands: OrchestrationCommand[] = [];
-    const gitCalls: string[] = [];
+    const result = yield* callStartTool({ prompt: "Continue from another checkout" }, commands, {
+      project: {
+        ...project,
+        workspaceRoot: "/repo/project",
+      },
+      sourceThread: {
+        ...sourceThread,
+        worktreePath: "/other/worktree",
+      },
+    });
+
+    expect(result.isError).toBe(false);
+    const command = commands[0];
+    expect(command?.type).toBe("thread.turn.start");
+    if (command?.type !== "thread.turn.start") return;
+    expect(command.bootstrap?.prepareWorktree).toMatchObject({
+      projectCwd: "/repo/project",
+      baseBranch: "main",
+    });
+  }),
+);
+
+it.effect("keeps the source worktree cwd when repository validation fails transiently", () =>
+  Effect.gen(function* () {
+    const commands: OrchestrationCommand[] = [];
+    const vcsCalls: string[] = [];
     const result = yield* callStartTool(
       { prompt: "Continue despite transient git failure", baseBranch: "main" },
       commands,
@@ -524,23 +591,20 @@ it.effect("keeps the source worktree cwd when validation cannot list refs", () =
           ...sourceThread,
           worktreePath: "/repo/worktree",
         },
-        gitWorkflow: {
-          listRefs: (input) =>
-            Effect.sync(() => {
-              gitCalls.push(`listRefs:${input.cwd}`);
-            }).pipe(
-              Effect.flatMap(() =>
-                Effect.fail(
-                  new GitCommandError({
-                    operation: "GitWorkflowService.listRefs",
-                    command: "git",
-                    cwd: input.cwd,
-                    detail: "transient refs lookup failure",
-                  }),
-                ),
+        vcsDetect: (input) =>
+          Effect.sync(() => {
+            vcsCalls.push(input.cwd);
+          }).pipe(
+            Effect.flatMap(() =>
+              Effect.fail(
+                new VcsUnsupportedOperationError({
+                  operation: "VcsDriverRegistry.detect",
+                  kind: "git",
+                  detail: "transient repository detection failure",
+                }),
               ),
             ),
-        },
+          ),
       },
     );
 
@@ -552,7 +616,7 @@ it.effect("keeps the source worktree cwd when validation cannot list refs", () =
       projectCwd: "/repo/worktree",
       baseBranch: "main",
     });
-    expect(gitCalls).toEqual(["listRefs:/repo/worktree"]);
+    expect(vcsCalls).toEqual(["/repo/worktree"]);
   }),
 );
 
@@ -575,6 +639,8 @@ it.effect("prepares new worktrees from the source worktree when the project root
           ...sourceThread,
           worktreePath: "/home/adam/wt-t20-worktree-fix",
         },
+        vcsDetect: (input) =>
+          Effect.succeed(input.cwd === "/home/adam" ? null : makeGitHandle(input.cwd)),
       },
     );
 
@@ -584,6 +650,40 @@ it.effect("prepares new worktrees from the source worktree when the project root
     if (command?.type !== "thread.turn.start") return;
     expect(command.bootstrap?.prepareWorktree).toMatchObject({
       projectCwd: "/home/adam/wt-t20-worktree-fix",
+      baseBranch: "main",
+    });
+  }),
+);
+
+it.effect("falls back when a source worktree is outside a non-repo project container", () =>
+  Effect.gen(function* () {
+    const commands: OrchestrationCommand[] = [];
+    const result = yield* callStartTool(
+      {
+        prompt: "Spawn from outside checkout",
+        baseBranch: "main",
+      },
+      commands,
+      {
+        project: {
+          ...project,
+          workspaceRoot: "/home/adam",
+        },
+        sourceThread: {
+          ...sourceThread,
+          worktreePath: "/tmp/other-worktree",
+        },
+        vcsDetect: (input) =>
+          Effect.succeed(input.cwd === "/home/adam" ? null : makeGitHandle(input.cwd)),
+      },
+    );
+
+    expect(result.isError).toBe(false);
+    const command = commands[0];
+    expect(command?.type).toBe("thread.turn.start");
+    if (command?.type !== "thread.turn.start") return;
+    expect(command.bootstrap?.prepareWorktree).toMatchObject({
+      projectCwd: "/home/adam",
       baseBranch: "main",
     });
   }),

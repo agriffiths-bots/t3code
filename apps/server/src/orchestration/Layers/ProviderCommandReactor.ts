@@ -737,6 +737,15 @@ const make = Effect.gen(function* () {
     const cwd = input.worktreePath;
     const attachments = input.attachments ?? [];
     yield* Effect.gen(function* () {
+      const snapshot = yield* projectionSnapshotQuery.getSnapshot();
+      if (
+        snapshot.threads.some(
+          (thread) => thread.id !== input.threadId && thread.worktreePath === input.worktreePath,
+        )
+      ) {
+        return;
+      }
+
       const { textGenerationModelSelection: modelSelection } =
         yield* serverSettingsService.getSettings;
 
