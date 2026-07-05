@@ -81,6 +81,11 @@ interface SourceCwdProjectMatch {
   readonly workspaceRelativePath: string | null;
 }
 
+interface SourceCwdProjectContext {
+  readonly usable: boolean;
+  readonly workspaceRelativePath: string | null;
+}
+
 export type ActiveThreadStartRuntime = (
   input: ThreadStartToolInput,
   invocation: McpInvocationContext.McpInvocationScope,
@@ -237,16 +242,28 @@ const makeActiveThreadStartRuntime = Effect.fn("ThreadToolkit.makeActiveRuntime"
   ) {
     return yield* sourceCwdBelongsToProject(projectRoot, candidate).pipe(
       Effect.matchEffect({
-        onFailure: (error) =>
-          Effect.succeed({
-            usable: !isMissingCwdSpawnError(error, candidate),
-            workspaceRelativePath: null,
-          }),
+        onFailure: (error) => {
+          const usable = !isMissingCwdSpawnError(error, candidate);
+          const fallback: Effect.Effect<SourceCwdProjectContext> = usable
+            ? Effect.map(
+                workspaceRelativePathForCwd(candidate),
+                (workspaceRelativePath) =>
+                  ({
+                    usable: true,
+                    workspaceRelativePath,
+                  }) satisfies SourceCwdProjectContext,
+              )
+            : Effect.succeed({
+                usable: false,
+                workspaceRelativePath: null,
+              } satisfies SourceCwdProjectContext);
+          return fallback;
+        },
         onSuccess: (match) =>
           Effect.succeed({
             usable: match.belongsToProject,
             workspaceRelativePath: match.belongsToProject ? match.workspaceRelativePath : null,
-          }),
+          } satisfies SourceCwdProjectContext),
       }),
     );
   });

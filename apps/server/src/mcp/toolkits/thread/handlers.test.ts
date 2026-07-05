@@ -981,7 +981,61 @@ it.effect("keeps the source worktree cwd when repository validation fails transi
       projectCwd: "/repo/worktree",
       baseBranch: "main",
     });
-    expect(vcsCalls).toEqual(["/repo/worktree"]);
+    expect(vcsCalls).toEqual(["/repo/worktree", "/repo/worktree"]);
+  }),
+);
+
+it.effect("preserves source package cwd when repository validation recovers after failure", () =>
+  Effect.gen(function* () {
+    const commands: OrchestrationCommand[] = [];
+    const vcsCalls: string[] = [];
+    const result = yield* callStartTool(
+      { prompt: "Continue despite transient source failure", baseBranch: "main" },
+      commands,
+      {
+        project: {
+          ...project,
+          workspaceRoot: "/repo/project",
+        },
+        sourceThread: {
+          ...sourceThread,
+          worktreePath: "/repo/worktree/packages/app",
+        },
+        vcsDetect: (input) =>
+          Effect.sync(() => {
+            vcsCalls.push(input.cwd);
+            return vcsCalls.length;
+          }).pipe(
+            Effect.flatMap((callCount) =>
+              callCount === 1
+                ? Effect.fail(
+                    new VcsUnsupportedOperationError({
+                      operation: "VcsDriverRegistry.detect",
+                      kind: "git",
+                      detail: "transient repository detection failure",
+                    }),
+                  )
+                : Effect.succeed(
+                    makeGitHandle(input.cwd, {
+                      rootPath: "/repo/worktree",
+                      metadataPath: "/repo/.git",
+                    }),
+                  ),
+            ),
+          ),
+      },
+    );
+
+    expect(result.isError).toBe(false);
+    const command = commands[0];
+    expect(command?.type).toBe("thread.turn.start");
+    if (command?.type !== "thread.turn.start") return;
+    expect(command.bootstrap?.prepareWorktree).toMatchObject({
+      projectCwd: "/repo/worktree/packages/app",
+      baseBranch: "main",
+      workspaceRelativePath: "packages/app",
+    });
+    expect(vcsCalls).toEqual(["/repo/worktree/packages/app", "/repo/worktree/packages/app"]);
   }),
 );
 
