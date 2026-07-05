@@ -1,11 +1,59 @@
-const CACHE_VERSION = "t3-code-v1";
+const CACHE_VERSION = "t3-code-v2";
 const APP_SHELL_URLS = ["/", "/manifest.webmanifest", "/pwa-icon-192.png", "/pwa-icon-512.png"];
+const BUILD_ASSET_PATH_PREFIX = "/assets/";
+
+function isBuildAssetUrl(url) {
+  return url.origin === self.location.origin && url.pathname.startsWith(BUILD_ASSET_PATH_PREFIX);
+}
+
+function isUsableBuildAssetResponse(response) {
+  const contentType = response.headers.get("content-type")?.toLowerCase() ?? "";
+  return response.ok && !contentType.includes("text/html");
+}
+
+function assetUnavailableResponse() {
+  return new Response("T3 Code asset unavailable while offline.", {
+    status: 503,
+    headers: { "content-type": "text/plain; charset=utf-8" },
+  });
+}
+
+function extractBuildAssetUrls(html) {
+  const urls = new Set();
+  const attributePattern = /\b(?:href|src)="([^"]+)"/g;
+  for (const match of html.matchAll(attributePattern)) {
+    const assetUrl = new URL(match[1], self.location.origin);
+    if (isBuildAssetUrl(assetUrl)) {
+      urls.add(assetUrl.href);
+    }
+  }
+  return [...urls];
+}
+
+async function cacheRequiredBuildAsset(cache, url) {
+  const response = await fetch(url);
+  if (!isUsableBuildAssetResponse(response)) {
+    throw new Error(`Build asset did not return a cacheable asset response: ${url}`);
+  }
+  await cache.put(url, response);
+}
+
+async function cacheBuildAssetsFromShell(cache) {
+  const shell = await cache.match("/");
+  if (!shell) return;
+
+  const assetUrls = extractBuildAssetUrls(await shell.clone().text());
+  await Promise.all(assetUrls.map((url) => cacheRequiredBuildAsset(cache, url)));
+}
 
 self.addEventListener("install", (event) => {
   event.waitUntil(
     caches
       .open(CACHE_VERSION)
-      .then((cache) => cache.addAll(APP_SHELL_URLS))
+      .then(async (cache) => {
+        await cache.addAll(APP_SHELL_URLS);
+        await cacheBuildAssetsFromShell(cache);
+      })
       .then(() => self.skipWaiting()),
   );
 });
@@ -25,8 +73,36 @@ self.addEventListener("fetch", (event) => {
   const request = event.request;
   if (request.method !== "GET") return;
 
-  const acceptsHtml = request.headers.get("accept")?.includes("text/html") ?? false;
   const requestUrl = new URL(request.url);
+  if (isBuildAssetUrl(requestUrl)) {
+    const networkResponse = fetch(request);
+    const cacheRefresh = networkResponse
+      .then(async (response) => {
+        if (!isUsableBuildAssetResponse(response)) return;
+
+        const assetResponse = response.clone();
+        const cache = await caches.open(CACHE_VERSION);
+        await cache.put(request, assetResponse);
+      })
+      .catch(() => undefined);
+
+    event.waitUntil(cacheRefresh);
+    event.respondWith(
+      networkResponse
+        .then(async (response) => {
+          if (isUsableBuildAssetResponse(response)) return response;
+          const cached = await caches.match(request);
+          return cached ?? assetUnavailableResponse();
+        })
+        .catch(async () => {
+          const cached = await caches.match(request);
+          return cached ?? assetUnavailableResponse();
+        }),
+    );
+    return;
+  }
+
+  const acceptsHtml = request.headers.get("accept")?.includes("text/html") ?? false;
   if (!acceptsHtml || requestUrl.origin !== self.location.origin) return;
   const canRefreshShellCache = requestUrl.pathname === "/";
 
