@@ -166,6 +166,14 @@ case "$*" in
 esac
 if [[ "$1" == "-" && "${2:-}" == http* ]]; then
   echo "validate-resume-token origin=$2 token_file=$3" >>"$T_LOG"
+  validate_count_file="$T_TMP/validate-resume-token-count"
+  validate_count=0
+  [[ -f "$validate_count_file" ]] && validate_count="$(cat "$validate_count_file")"
+  validate_count=$((validate_count + 1))
+  echo "$validate_count" >"$validate_count_file"
+  if [[ "${FAKE_RESUME_TOKEN_VALIDATE_UNREACHABLE_ONCE:-0}" == "1" && "$validate_count" == "1" ]]; then
+    exit 2
+  fi
   if [[ " ${FAKE_RESUME_TOKEN_SCOPES:-orchestration:operate} " != *" orchestration:operate "* ]]; then
     exit 9
   fi
@@ -302,6 +310,23 @@ if grep -Fq "systemctl --user stop" "$tmp/calls.log"; then
   fail "read-only resume token stopped service"
 else
   pass "read-only resume token aborts before stop"
+fi
+
+tmp="$(mktemp -d)"
+export FAKE_RESUME_TOKEN_VALIDATE_UNREACHABLE_ONCE=1
+run_manager "$tmp"
+unset FAKE_RESUME_TOKEN_VALIDATE_UNREACHABLE_ONCE
+[[ "$(cat "$tmp/rc")" == "0" ]] && pass "unreachable origin during token validation recovers" || fail "unreachable origin during token validation recovers"
+assert_order "$tmp/calls.log" "validate-resume-token" "systemctl --user stop fake.service" "systemctl --user start fake.service" "validate-resume-token" "inject"
+grep -Fq "RESULT OK" "$tmp/ledger/"*/t3-daily-restart.result && pass "deferred token validation records ok after recovery" || fail "deferred token validation records ok after recovery"
+
+tmp="$(mktemp -d)"
+run_manager "$tmp" --origin not-a-url
+[[ "$(cat "$tmp/rc")" != "0" ]] && pass "malformed origin exits nonzero" || fail "malformed origin exits nonzero"
+if grep -Fq "systemctl --user stop" "$tmp/calls.log"; then
+  fail "malformed origin stopped service"
+else
+  pass "malformed origin aborts before stop"
 fi
 
 tmp="$(mktemp -d)"
