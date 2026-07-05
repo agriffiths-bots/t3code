@@ -301,6 +301,40 @@ it.effect("starts current-checkout threads with warning metadata", () =>
   }),
 );
 
+it.effect("starts current-checkout threads on the source worktree checkout", () =>
+  Effect.gen(function* () {
+    const commands: OrchestrationCommand[] = [];
+    const result = yield* callStartTool(
+      { prompt: "Read current worktree", mode: "current_checkout" },
+      commands,
+      {
+        project: {
+          ...project,
+          workspaceRoot: "/repo/project",
+        },
+        sourceThread: {
+          ...sourceThread,
+          worktreePath: "/repo/worktree",
+        },
+      },
+    );
+
+    expect(result.isError).toBe(false);
+    expect(result.structuredContent).toMatchObject({
+      projectId,
+      mode: "current_checkout",
+      branch: "feature/source",
+      worktreePath: "/repo/worktree",
+    });
+    expect(result.structuredContent).toHaveProperty("warning");
+    const command = commands[0];
+    expect(command?.type).toBe("thread.turn.start");
+    if (command?.type !== "thread.turn.start") return;
+    expect(command.bootstrap?.prepareWorktree).toBeUndefined();
+    expect(command.bootstrap?.createThread?.worktreePath).toBe("/repo/worktree");
+  }),
+);
+
 it.effect("starts a new worktree from a detached parent using the project default branch", () =>
   Effect.gen(function* () {
     const commands: OrchestrationCommand[] = [];

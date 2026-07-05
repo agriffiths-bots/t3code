@@ -211,7 +211,11 @@ const makeActiveThreadStartRuntime = Effect.fn("ThreadToolkit.makeActiveRuntime"
     const createdAt = yield* nowIso;
     const branch = (yield* resolveInitialBranch(mode, input, sourceThread, sourceCwd)) ?? null;
     const worktreePath: string | null =
-      mode === "existing_worktree" ? (input.worktreePath ?? null) : null;
+      mode === "existing_worktree"
+        ? (input.worktreePath ?? null)
+        : mode === "current_checkout" && sourceCwd !== project.workspaceRoot
+          ? sourceCwd
+          : null;
     const title = input.title ?? truncateTitle(input.prompt);
     const providerInstances = yield* providerInstanceRegistry.listInstances;
     const modelSources = yield* Effect.forEach(
