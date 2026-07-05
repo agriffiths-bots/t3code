@@ -1,0 +1,33 @@
+{
+  "name": "T3 Code",
+  "short_name": "T3 Code",
+  "description": "Run and monitor coding agents from a mobile or desktop browser.",
+  "id": "/",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#161616",
+  "theme_color": "#161616",
+  "orientation": "any",
+  "categories": ["developer", "productivity"],
+  "icons": [
+    {
+      "src": "/pwa-icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "/pwa-icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "/pwa-maskable-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "maskable"
+    }
+  ]
+}

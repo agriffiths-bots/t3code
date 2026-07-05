@@ -13,8 +13,11 @@ fail() { echo "not ok - $1" >&2; fail_count=$((fail_count + 1)); }
 make_fake_bin() {
   local dir="$1"
   mkdir -p "$dir"
-  cat >"$dir/git" <<'SH'
+	  cat >"$dir/git" <<'SH'
 #!/usr/bin/env bash
+if [[ "${FAKE_LOG_PATH:-0}" == "1" ]]; then
+  echo "path=$PATH" >>"$T_LOG"
+fi
 echo "git $*" >>"$T_LOG"
 case "$*" in
   *"rev-parse HEAD"*) echo "${FAKE_HEAD_SHA:-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}" ;;
@@ -139,6 +142,16 @@ else
 fi
 grep -Fq "RESULT OK" "$tmp/ledger/"*/t3-nightly-cycle.result && pass "result ok recorded" || fail "result ok recorded"
 test -s "$tmp/ledger/"*/t3-nightly-cycle.jsonl && pass "json ledger written" || fail "json ledger written"
+
+tmp="$(mktemp -d)"
+caller_path="$tmp/nonstandard-node"
+mkdir -p "$caller_path"
+old_path="$PATH"
+export FAKE_LOG_PATH=1
+PATH="$caller_path:$old_path" run_cycle "$tmp"
+unset FAKE_LOG_PATH
+PATH="$old_path"
+grep -Fq "$caller_path" "$tmp/calls.log" && pass "caller PATH is preserved after nightly trusted prefixes" || fail "caller PATH is preserved after nightly trusted prefixes"
 
 tmp="$(mktemp -d)"
 export FAKE_HEAD_SHA=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
