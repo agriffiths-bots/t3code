@@ -1,0 +1,501 @@
+#!/usr/bin/env bash
+set -u
+
+PATH="${T3DR_TEST_PATH_PREFIX:+$T3DR_TEST_PATH_PREFIX:}/home/linuxbrew/.linuxbrew/bin:/home/adam/.local/bin:/home/adam/.openclaw/bin:/usr/local/bin:/usr/bin:/bin"
+export PATH
+
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+
+checkout="${T3DR_CHECKOUT:-/home/adam/t3code}"
+ledger="${T3DR_LEDGER:-/home/adam/.openclaw/daily-restart}"
+backup_cmd="${T3DR_BACKUP_CMD:-/home/adam/.openclaw/bin/t3-vps-backup}"
+upstream_sync_cmd="${T3DR_UPSTREAM_SYNC_CMD:-/home/adam/.openclaw/bin/t3-upstream-sync}"
+restart_cmd="${T3DR_RESTART_CMD:-$script_dir/t3-daily-restart}"
+timezone="${T3DR_TIMEZONE:-Europe/London}"
+deadline_local="${T3DR_DEADLINE_LOCAL:-07:00}"
+backup_timeout="${T3DR_BACKUP_TIMEOUT:-7200}"
+sync_timeout="${T3DR_UPSTREAM_SYNC_TIMEOUT:-12600}"
+build_timeout="${T3DR_BUILD_TIMEOUT:-1800}"
+desktop_artifact="${T3DR_DESKTOP_ARTIFACT:-0}"
+build_always="${T3DR_BUILD_ALWAYS:-0}"
+
+usage() {
+  cat >&2 <<'USAGE'
+usage: t3-nightly-cycle [--checkout PATH] [--ledger DIR]
+                        [--backup-cmd CMD] [--upstream-sync-cmd CMD]
+                        [--restart-cmd PATH] [--deadline-local HH:MM]
+USAGE
+}
+
+require_value() {
+  local flag="$1"
+  if [[ "$#" -lt 2 || -z "${2:-}" || "${2:-}" == --* ]]; then
+    echo "t3-nightly-cycle: $flag requires a value" >&2
+    usage
+    exit 2
+  fi
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --checkout) require_value "$@"; checkout="$2"; shift 2 ;;
+    --ledger) require_value "$@"; ledger="$2"; shift 2 ;;
+    --backup-cmd) require_value "$@"; backup_cmd="$2"; shift 2 ;;
+    --upstream-sync-cmd) require_value "$@"; upstream_sync_cmd="$2"; shift 2 ;;
+    --restart-cmd) require_value "$@"; restart_cmd="$2"; shift 2 ;;
+    --deadline-local) require_value "$@"; deadline_local="$2"; shift 2 ;;
+    -h|--help) usage; exit 0 ;;
+    *) echo "t3-nightly-cycle: unknown arg: $1" >&2; usage; exit 2 ;;
+  esac
+done
+
+case "$desktop_artifact" in
+  1|true|TRUE|yes|YES) desktop_artifact=1 ;;
+  0|false|FALSE|no|NO|"") desktop_artifact=0 ;;
+  *)
+    echo "t3-nightly-cycle: T3DR_DESKTOP_ARTIFACT must be boolean" >&2
+    exit 2
+    ;;
+esac
+case "$build_always" in
+  1|true|TRUE|yes|YES) build_always=1 ;;
+  0|false|FALSE|no|NO|"") build_always=0 ;;
+  *)
+    echo "t3-nightly-cycle: T3DR_BUILD_ALWAYS must be boolean" >&2
+    exit 2
+    ;;
+esac
+
+run_date="$(date -u +%F)"
+run_dir="$ledger/$run_date"
+mkdir -p "$run_dir"
+log_file="$run_dir/t3-nightly-cycle.log"
+jsonl_file="$run_dir/t3-nightly-cycle.jsonl"
+result_file="$run_dir/t3-nightly-cycle.result"
+alert_file="$run_dir/t3-nightly-cycle.alert"
+lock_file="$ledger/t3-nightly-cycle.lock"
+prebuilt_env="$run_dir/prebuilt-target.env"
+stage_root="$run_dir/prebuilt-stage"
+stage_checkout="$stage_root/checkout"
+stage_payload="$stage_root/payload"
+desktop_artifact_dir="$run_dir/desktop-artifact"
+pinned_tools_dir="$run_dir/pinned-tools"
+pinned_rollback_probe="$pinned_tools_dir/health-probe.rollback"
+
+exec 9>"$lock_file"
+if ! flock -n 9; then
+  printf '%s RESULT LOCKED\n' "$(date -u +%FT%TZ)" >>"$result_file"
+  echo "t3-nightly-cycle: another run is already active" >&2
+  exit 75
+fi
+
+log() {
+  printf '[%s] %s\n' "$(date -u +%FT%TZ)" "$*" | tee -a "$log_file" >&2
+}
+
+shell_quote() {
+  printf '%q' "$1"
+}
+
+write_event() {
+  local step="$1" status="$2" rc="${3:-}" duration="${4:-}" step_log="${5:-}"
+  if ! command -v node >/dev/null 2>&1; then
+    printf '{"ts":"%s","step":"%s","status":"%s"}\n' "$(date -u +%FT%TZ)" "$step" "$status" >>"$jsonl_file" 2>/dev/null || true
+    return 0
+  fi
+  node - "$jsonl_file" "$step" "$status" "$rc" "$duration" "$step_log" <<'NODE'
+const fs = require("node:fs");
+const [file, step, status, rc, duration, stepLog] = process.argv.slice(2);
+const event = {
+  ts: new Date().toISOString(),
+  step,
+  status,
+};
+if (rc !== "") event.rc = Number(rc);
+if (duration !== "") event.duration_seconds = Number(duration);
+if (stepLog !== "") event.log = stepLog;
+fs.appendFileSync(file, `${JSON.stringify(event)}\n`);
+NODE
+  local node_rc=$?
+  if [[ "$node_rc" -ne 0 ]]; then
+    printf '[%s] WARNING write_event failed step=%s status=%s rc=%s\n' "$(date -u +%FT%TZ)" "$step" "$status" "$node_rc" >>"$log_file" 2>/dev/null || true
+  fi
+  return 0
+}
+
+deadline_epoch() {
+  local day
+  day="$(TZ="$timezone" date +%F)" || return 1
+  TZ="$timezone" date -d "$day $deadline_local" +%s
+}
+
+record_failure() {
+  local step="$1" rc="$2" step_log="$3"
+  printf '%s FAILURE step=%s rc=%s log=%s\n' "$(date -u +%FT%TZ)" "$step" "$rc" "$step_log" | tee -a "$alert_file" >&2
+  printf '%s RESULT FAILED step=%s rc=%s\n' "$(date -u +%FT%TZ)" "$step" "$rc" | tee -a "$result_file" >&2
+}
+
+run_shell_step() {
+  local step="$1" timeout_secs="$2" cmd="$3"
+  local step_log="$run_dir/$step.log"
+  local started="$SECONDS" rc duration
+  : >"$step_log"
+  write_event "$step" "started" "" "" "$step_log"
+  log "STEP $step start log=$step_log"
+  timeout "$timeout_secs" bash -lc "$cmd" >>"$step_log" 2>&1
+  rc=$?
+  duration=$((SECONDS - started))
+  if [[ "$rc" -eq 0 ]]; then
+    write_event "$step" "ok" "$rc" "$duration" "$step_log"
+    log "STEP $step ok duration=${duration}s"
+    return 0
+  fi
+  write_event "$step" "failed" "$rc" "$duration" "$step_log"
+  record_failure "$step" "$rc" "$step_log"
+  return "$rc"
+}
+
+run_logged() {
+  local timeout_secs="$1" target_log="$2"
+  shift 2
+  {
+    printf '[%s] RUN timeout=%s' "$(date -u +%FT%TZ)" "$timeout_secs"
+    printf ' %q' "$@"
+    printf '\n'
+  } >>"$target_log"
+  timeout "$timeout_secs" "$@" >>"$target_log" 2>&1
+}
+
+capture_logged() {
+  local timeout_secs="$1" target_log="$2"
+  shift 2
+  {
+    printf '[%s] RUN_CAPTURE timeout=%s' "$(date -u +%FT%TZ)" "$timeout_secs"
+    printf ' %q' "$@"
+    printf '\n'
+  } >>"$target_log"
+  timeout "$timeout_secs" "$@" 2>>"$target_log"
+}
+
+changed_dependency_manifests() {
+  local from_sha="$1" to_sha="$2" target_log="$3"
+  local changed file
+  changed="$(capture_logged 60 "$target_log" git -C "$checkout" diff --name-only "$from_sha" "$to_sha")" || return $?
+  while IFS= read -r file; do
+    case "$file" in
+      package.json|*/package.json|pnpm-lock.yaml|pnpm-workspace.yaml|.npmrc|pnpmfile.cjs|.pnpmfile.cjs|patches/*)
+        printf '%s\n' "$file"
+        ;;
+    esac
+  done <<<"$changed"
+}
+
+realpath_m() {
+  realpath -m -- "$1"
+}
+
+remove_path_under() {
+  local parent="$1" target="$2"
+  local parent_real target_real
+  parent_real="$(realpath_m "$parent")" || return 1
+  target_real="$(realpath_m "$target")" || return 1
+  if [[ "$target_real" != "$parent_real"/* ]]; then
+    echo "refusing to remove path outside $parent_real: $target_real" >&2
+    return 1
+  fi
+  rm -rf -- "$target"
+}
+
+pin_rollback_health_probe() {
+  local source_probe temp_probe
+  source_probe="$checkout/scripts/ops/daily-restart/health-probe"
+  if [[ ! -x "$source_probe" ]]; then
+    echo "rollback health-probe missing or not executable: $source_probe" >&2
+    return 1
+  fi
+  mkdir -p "$pinned_tools_dir" || return 1
+  chmod 700 "$pinned_tools_dir" || return 1
+  temp_probe="$pinned_tools_dir/.health-probe.rollback.$$"
+  rm -f -- "$temp_probe" || return 1
+  cp -p -- "$source_probe" "$temp_probe" || {
+    rm -f -- "$temp_probe"
+    return 1
+  }
+  chmod 700 "$temp_probe" || {
+    rm -f -- "$temp_probe"
+    return 1
+  }
+  mv -f -- "$temp_probe" "$pinned_rollback_probe" || {
+    rm -f -- "$temp_probe"
+    return 1
+  }
+}
+
+copy_payload_dir() {
+  local source_root="$1" rel="$2"
+  local source_dir="$source_root/$rel" target_dir="$stage_payload/$rel"
+  if [[ ! -d "$source_dir" ]]; then
+    echo "missing staged artifact directory: $source_dir" >&2
+    return 1
+  fi
+  case "$rel" in
+    apps/web/dist|apps/server/dist) ;;
+    *)
+      echo "refusing unexpected staged artifact path: $rel" >&2
+      return 1
+      ;;
+  esac
+  remove_path_under "$stage_payload" "$target_dir" || return 1
+  mkdir -p "$target_dir" || return 1
+  cp -a "$source_dir/." "$target_dir/"
+}
+
+write_restart_metadata() {
+  local mode="$1" tmp_file="$prebuilt_env.tmp.$$"
+  rm -f "$tmp_file"
+  if [[ -d "$prebuilt_env" ]]; then
+    return 1
+  fi
+  case "$mode" in
+    prebuilt)
+      local rollback_sha="$2" target_sha="$3" assets_dir="$4" probe_path="$5"
+      [[ -n "$rollback_sha" && -n "$target_sha" && -n "$assets_dir" && -n "$probe_path" ]] || return 68
+      {
+        printf 'T3DR_PREBUILT_TARGET=1\n'
+        printf 'T3DR_ROLLBACK_SHA=%s\n' "$rollback_sha"
+        printf 'T3DR_TARGET_SHA=%s\n' "$target_sha"
+        printf 'T3DR_PREBUILT_ASSETS_DIR=%s\n' "$assets_dir"
+        printf 'T3DR_PINNED_HEALTH_PROBE=%s\n' "$probe_path"
+      } >"$tmp_file" || {
+        rm -f "$tmp_file"
+        return 1
+      }
+      ;;
+    no-op)
+      local target_sha="$2"
+      [[ -n "$target_sha" ]] || return 68
+      {
+        printf 'T3DR_PREBUILT_TARGET=0\n'
+        printf 'T3DR_TARGET_SHA=%s\n' "$target_sha"
+      } >"$tmp_file" || {
+        rm -f "$tmp_file"
+        return 1
+      }
+      ;;
+    *) return 68 ;;
+  esac
+  mv -fT -- "$tmp_file" "$prebuilt_env" || {
+    rm -f "$tmp_file"
+    return 1
+  }
+}
+
+prepare_stage_checkout() {
+  local step_log="$1"
+  remove_path_under "$stage_root" "$stage_checkout" || return 1
+  run_logged 120 "$step_log" git -C "$checkout" worktree prune || return 1
+  run_logged 120 "$step_log" git -C "$checkout" worktree add --detach "$stage_checkout" "$target_sha"
+}
+
+cleanup_stage_checkout() {
+  local step_log="$1"
+  if [[ -e "$stage_checkout" ]]; then
+    run_logged 120 "$step_log" git -C "$checkout" worktree remove --force "$stage_checkout" || {
+      printf '[%s] WARNING git worktree remove failed; removing staged checkout path directly\n' "$(date -u +%FT%TZ)" >>"$step_log"
+      remove_path_under "$stage_root" "$stage_checkout" || true
+    }
+  fi
+}
+
+build_release_artifacts() {
+  local step="build-release-artifacts"
+  local step_log="$run_dir/$step.log"
+  local started="$SECONDS" rc=0 duration
+  local rollback_sha target_sha dependency_changes
+  : >"$step_log"
+  write_event "$step" "started" "" "" "$step_log"
+  log "STEP $step start log=$step_log checkout=$checkout"
+
+  run_logged 120 "$step_log" git -C "$checkout" fetch origin main:refs/remotes/origin/main || rc=$?
+  if [[ "$rc" -eq 0 ]]; then
+    rollback_sha="$(capture_logged 30 "$step_log" git -C "$checkout" rev-parse HEAD)" || rc=$?
+  fi
+  if [[ "$rc" -eq 0 ]]; then
+    target_sha="$(capture_logged 30 "$step_log" git -C "$checkout" rev-parse origin/main)" || rc=$?
+  fi
+  if [[ "$rc" -eq 0 && "$rollback_sha" != "$target_sha" ]]; then
+    dependency_changes="$(changed_dependency_manifests "$rollback_sha" "$target_sha" "$step_log")" || rc=$?
+    if [[ "$rc" -eq 0 && -n "$dependency_changes" ]]; then
+      {
+        printf '[%s] dependency manifests changed; refusing prebuilt deploy without live dependency update\n' "$(date -u +%FT%TZ)"
+        printf '%s\n' "$dependency_changes"
+      } >>"$step_log"
+      rc=66
+    fi
+  fi
+  if [[ "$rc" -eq 0 && "$rollback_sha" != "$target_sha" ]]; then
+    if ! run_logged 60 "$step_log" git -C "$checkout" merge-base --is-ancestor "$rollback_sha" "$target_sha"; then
+      printf '[%s] target is not a fast-forward from rollback_sha; refusing prebuilt deploy before downtime\n' "$(date -u +%FT%TZ)" >>"$step_log"
+      rc=67
+    fi
+  fi
+  if [[ "$rc" -eq 0 && ( "$rollback_sha" != "$target_sha" || "$build_always" == "1" ) ]]; then
+    pin_rollback_health_probe >>"$step_log" 2>&1 || rc=$?
+  fi
+  if [[ "$rc" -eq 0 && ( "$rollback_sha" != "$target_sha" || "$build_always" == "1" ) ]]; then
+    mkdir -p "$stage_root" || rc=$?
+  fi
+  if [[ "$rc" -eq 0 && ( "$rollback_sha" != "$target_sha" || "$build_always" == "1" ) ]]; then
+    prepare_stage_checkout "$step_log" || rc=$?
+  fi
+  if [[ "$rc" -eq 0 && ( "$rollback_sha" != "$target_sha" || "$build_always" == "1" ) ]]; then
+    run_logged "$build_timeout" "$step_log" pnpm -C "$stage_checkout" install --frozen-lockfile --prefer-offline || rc=$?
+  fi
+  if [[ "$rc" -eq 0 && ( "$rollback_sha" != "$target_sha" || "$build_always" == "1" ) ]]; then
+    run_logged "$build_timeout" "$step_log" pnpm -C "$stage_checkout/apps/web" run build || rc=$?
+  fi
+  if [[ "$rc" -eq 0 && ( "$rollback_sha" != "$target_sha" || "$build_always" == "1" ) ]]; then
+    run_logged "$build_timeout" "$step_log" pnpm -C "$stage_checkout" run build:desktop || rc=$?
+  fi
+  if [[ "$rc" -eq 0 && ( "$rollback_sha" != "$target_sha" || "$build_always" == "1" ) ]]; then
+    if [[ "$desktop_artifact" == "1" ]]; then
+      mkdir -p "$desktop_artifact_dir" || rc=$?
+      if [[ "$rc" -eq 0 ]]; then
+        run_logged "$build_timeout" "$step_log" env T3CODE_DESKTOP_OUTPUT_DIR="$desktop_artifact_dir" pnpm -C "$stage_checkout" run dist:desktop:artifact || rc=$?
+      fi
+    else
+      printf '[%s] DESKTOP_ARTIFACT TODO no-op: set T3DR_DESKTOP_ARTIFACT=1 after T1 lands to run dist:desktop:artifact into %s\n' "$(date -u +%FT%TZ)" "$desktop_artifact_dir" >>"$step_log"
+    fi
+  fi
+  if [[ "$rc" -eq 0 && ( "$rollback_sha" != "$target_sha" || "$build_always" == "1" ) ]]; then
+    remove_path_under "$stage_root" "$stage_payload" || rc=$?
+    if [[ "$rc" -eq 0 ]]; then
+      mkdir -p "$stage_payload" || rc=$?
+    fi
+    if [[ "$rc" -eq 0 ]]; then
+      copy_payload_dir "$stage_checkout" "apps/web/dist" || rc=$?
+    fi
+    if [[ "$rc" -eq 0 ]]; then
+      copy_payload_dir "$stage_checkout" "apps/server/dist" || rc=$?
+    fi
+  fi
+
+  if [[ "$rc" -eq 0 ]]; then
+    if [[ "$rollback_sha" != "$target_sha" || "$build_always" == "1" ]]; then
+      if write_restart_metadata prebuilt "$rollback_sha" "$target_sha" "$stage_payload" "$pinned_rollback_probe"; then
+        log "prebuilt target ready rollback_sha=$rollback_sha target_sha=$target_sha"
+      else
+        rc=$?
+        printf '[%s] failed to write restart metadata: %s\n' "$(date -u +%FT%TZ)" "$prebuilt_env" >>"$step_log"
+      fi
+    else
+      if write_restart_metadata no-op "$target_sha"; then
+        printf '[%s] checkout already at target; build skipped\n' "$(date -u +%FT%TZ)" >>"$step_log"
+      else
+        rc=$?
+        printf '[%s] failed to write restart metadata: %s\n' "$(date -u +%FT%TZ)" "$prebuilt_env" >>"$step_log"
+      fi
+    fi
+  fi
+  cleanup_stage_checkout "$step_log"
+
+  duration=$((SECONDS - started))
+  if [[ "$rc" -eq 0 ]]; then
+    write_event "$step" "ok" "$rc" "$duration" "$step_log"
+    log "STEP $step ok duration=${duration}s"
+    return 0
+  fi
+  write_event "$step" "failed" "$rc" "$duration" "$step_log"
+  record_failure "$step" "$rc" "$step_log"
+  return "$rc"
+}
+
+run_restart_step() {
+  local step="restart-resume"
+  local step_log="$run_dir/$step.log"
+  local started="$SECONDS" rc duration prebuilt rollback target
+  local assets probe
+  : >"$step_log"
+  write_event "$step" "started" "" "" "$step_log"
+  if [[ -r "$prebuilt_env" ]]; then
+    prebuilt="$(sed -n 's/^T3DR_PREBUILT_TARGET=//p' "$prebuilt_env" 2>/dev/null | head -1)"
+    rollback="$(sed -n 's/^T3DR_ROLLBACK_SHA=//p' "$prebuilt_env" 2>/dev/null | head -1)"
+    target="$(sed -n 's/^T3DR_TARGET_SHA=//p' "$prebuilt_env" 2>/dev/null | head -1)"
+    assets="$(sed -n 's/^T3DR_PREBUILT_ASSETS_DIR=//p' "$prebuilt_env" 2>/dev/null | head -1)"
+    probe="$(sed -n 's/^T3DR_PINNED_HEALTH_PROBE=//p' "$prebuilt_env" 2>/dev/null | head -1)"
+  else
+    prebuilt=""
+    rollback=""
+    target=""
+    assets=""
+    probe=""
+  fi
+  log "STEP $step start log=$step_log prebuilt=${prebuilt:-missing}"
+  rc=0
+  if [[ "$prebuilt" == "1" ]]; then
+    if [[ -z "$rollback" || -z "$target" || -z "$assets" || -z "$probe" ]]; then
+      printf '[%s] invalid prebuilt restart metadata in %s\n' "$(date -u +%FT%TZ)" "$prebuilt_env" >>"$step_log"
+      rc=68
+    else
+      env T3DR_CHECKOUT="$checkout" T3DR_LEDGER="$ledger" \
+        T3DR_PREBUILT_TARGET=1 T3DR_ROLLBACK_SHA="$rollback" T3DR_TARGET_SHA="$target" \
+        T3DR_PREBUILT_ASSETS_DIR="$assets" T3DR_PINNED_HEALTH_PROBE="$probe" \
+        "$restart_cmd" >>"$step_log" 2>&1
+      rc=$?
+    fi
+  elif [[ "$prebuilt" == "0" ]]; then
+    if [[ -z "$target" ]]; then
+      printf '[%s] invalid no-op restart metadata in %s\n' "$(date -u +%FT%TZ)" "$prebuilt_env" >>"$step_log"
+      rc=68
+    else
+      env T3DR_CHECKOUT="$checkout" T3DR_LEDGER="$ledger" \
+        T3DR_TARGET_SHA="$target" \
+        "$restart_cmd" >>"$step_log" 2>&1
+      rc=$?
+    fi
+  else
+    printf '[%s] missing restart metadata in %s\n' "$(date -u +%FT%TZ)" "$prebuilt_env" >>"$step_log"
+    rc=68
+  fi
+  duration=$((SECONDS - started))
+  if [[ "$rc" -eq 0 ]]; then
+    write_event "$step" "ok" "$rc" "$duration" "$step_log"
+    log "STEP $step ok duration=${duration}s"
+    return 0
+  fi
+  write_event "$step" "failed" "$rc" "$duration" "$step_log"
+  record_failure "$step" "$rc" "$step_log"
+  return "$rc"
+}
+
+assert_deadline() {
+  local deadline now
+  deadline="$(deadline_epoch)" || {
+    record_failure "deadline" 2 "$log_file"
+    return 2
+  }
+  now="$(date +%s)"
+  if [[ "$now" -gt "$deadline" ]]; then
+    record_failure "deadline" 1 "$log_file"
+    return 1
+  fi
+  write_event "deadline" "ok" 0 "$((deadline - now))" ""
+}
+
+log "BEGIN checkout=$checkout ledger=$ledger deadline=${deadline_local} timezone=$timezone"
+write_event "cycle" "started" "" "" "$log_file"
+
+if run_shell_step "backup" "$backup_timeout" "$backup_cmd" &&
+  run_shell_step "upstream-sync" "$sync_timeout" "T3_REPO_DIR=$(shell_quote "$checkout") $upstream_sync_cmd" &&
+  build_release_artifacts &&
+  run_restart_step &&
+  assert_deadline; then
+  printf '%s RESULT OK run_dir=%s deadline=%s/%s\n' "$(date -u +%FT%TZ)" "$run_dir" "$timezone" "$deadline_local" | tee -a "$result_file" >&2
+  write_event "cycle" "ok" 0 "" "$log_file"
+  log "END OK"
+  exit 0
+fi
+
+write_event "cycle" "failed" 1 "" "$log_file"
+log "END FAILED"
+exit 1

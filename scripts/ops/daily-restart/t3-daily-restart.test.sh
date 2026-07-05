@@ -19,6 +19,10 @@ echo "git $*" >>"$T_LOG"
 case "$*" in
   *"rev-parse HEAD"*) echo "${FAKE_PRE_SHA:-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}" ;;
   *"rev-parse origin/main"*) echo "${FAKE_TARGET_SHA:-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb}" ;;
+  *"rev-parse --verify"*)
+    value="${*: -1}"
+    echo "${value%%^*}"
+    ;;
   *"merge --ff-only"*)
     if [[ "${FAKE_TARGET_WEAKENS_HEALTH_PROBE:-0}" == "1" ]]; then
       cat >"$T_TMP/bin/health-probe" <<'WEAK'
@@ -81,6 +85,14 @@ SH
   cat >"$dir/t3-db-snapshot" <<'SH'
 #!/usr/bin/env bash
 echo "snapshot $*" >>"$T_LOG"
+count_file="$T_TMP/snapshot-count"
+count=0
+[[ -f "$count_file" ]] && count="$(cat "$count_file")"
+count=$((count + 1))
+echo "$count" >"$count_file"
+if [[ -n "${FAKE_SNAPSHOT_FAIL_N:-}" && "$count" == "$FAKE_SNAPSHOT_FAIL_N" ]]; then
+  exit "${FAKE_SNAPSHOT_RC:-9}"
+fi
 [[ "${FAKE_SNAPSHOT_RC:-0}" == "0" ]] || exit "$FAKE_SNAPSHOT_RC"
 echo "$T_TMP/snapshot.sqlite"
 SH
@@ -148,8 +160,13 @@ run_manager() {
   local tmp="$1"
   shift
   mkdir -p "$tmp/checkout" "$tmp/bin" "$tmp/ledger" "$tmp/snaps"
+  mkdir -p "$tmp/prebuilt-assets/apps/web/dist" "$tmp/prebuilt-assets/apps/server/dist/client"
+  printf 'web\n' >"$tmp/prebuilt-assets/apps/web/dist/index.html"
+  printf 'server-client\n' >"$tmp/prebuilt-assets/apps/server/dist/client/index.html"
+  printf 'server-bin\n' >"$tmp/prebuilt-assets/apps/server/dist/bin.mjs"
   make_fake_bin "$tmp/bin"
-  T_TMP="$tmp" T_LOG="$tmp/calls.log" T3DR_TEST_PATH_PREFIX="$tmp/bin" T3DR_STOP_TIMEOUT="${T3DR_STOP_TIMEOUT:-1}" T3DR_KILL_TIMEOUT="${T3DR_KILL_TIMEOUT:-1}" "$SCRIPT" \
+  T_TMP="$tmp" T_LOG="$tmp/calls.log" T3DR_TEST_PATH_PREFIX="$tmp/bin" T3DR_STOP_TIMEOUT="${T3DR_STOP_TIMEOUT:-1}" T3DR_KILL_TIMEOUT="${T3DR_KILL_TIMEOUT:-1}" \
+    T3DR_PREBUILT_ASSETS_DIR="$tmp/prebuilt-assets" "$SCRIPT" \
     --db "$tmp/state.sqlite" \
     --checkout "$tmp/checkout" \
     --service fake.service \
@@ -355,6 +372,65 @@ run_manager "$tmp"
 unset FAKE_PRE_SHA FAKE_TARGET_SHA
 [[ "$(cat "$tmp/rc")" == "0" ]] && pass "same-sha rerun exits zero" || fail "same-sha rerun exits zero"
 if grep -Fq "pnpm" "$tmp/calls.log"; then fail "same-sha rerun rebuilt web"; else pass "same-sha rerun skips web rebuild"; fi
+
+tmp="$(mktemp -d)"
+export FAKE_PRE_SHA=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+run_manager "$tmp" --target-sha bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+unset FAKE_PRE_SHA
+[[ "$(cat "$tmp/rc")" == "0" ]] && pass "pinned target restart exits zero" || fail "pinned target restart exits zero"
+if grep -Fq "fetch origin" "$tmp/calls.log"; then
+  fail "pinned target restart fetched origin"
+else
+  pass "pinned target restart skips fetch"
+fi
+
+tmp="$(mktemp -d)"
+run_manager "$tmp" --prebuilt-target \
+  --rollback-sha aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+  --target-sha bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+[[ "$(cat "$tmp/rc")" == "0" ]] && pass "prebuilt target exits zero" || fail "prebuilt target exits zero"
+if grep -Fq "fetch origin" "$tmp/calls.log"; then
+  fail "prebuilt target fetched origin"
+else
+  pass "prebuilt target skips fetch"
+fi
+if grep -Fq "git -C $tmp/checkout merge --ff-only bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" "$tmp/calls.log"; then
+  pass "prebuilt target merges only after shutdown"
+else
+  fail "prebuilt target merges only after shutdown"
+fi
+if grep -Fq "pnpm" "$tmp/calls.log"; then
+  fail "prebuilt target rebuilt during downtime"
+else
+  pass "prebuilt target skips rebuild during downtime"
+fi
+grep -Fq "server-client" "$tmp/checkout/apps/server/dist/client/index.html" && pass "prebuilt target promotes server client assets" || fail "prebuilt target promotes server client assets"
+grep -Fq "server-bin" "$tmp/checkout/apps/server/dist/bin.mjs" && pass "prebuilt target promotes server executable" || fail "prebuilt target promotes server executable"
+grep -Fq "web" "$tmp/checkout/apps/web/dist/index.html" && pass "prebuilt target promotes web assets" || fail "prebuilt target promotes web assets"
+
+tmp="$(mktemp -d)"
+export FAKE_HEALTH_FAIL_ONCE=1
+run_manager "$tmp" --prebuilt-target \
+  --rollback-sha aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+  --target-sha bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+unset FAKE_HEALTH_FAIL_ONCE
+[[ "$(cat "$tmp/rc")" != "0" ]] && pass "prebuilt health failure exits nonzero" || fail "prebuilt health failure exits nonzero"
+grep -Fq "git -C $tmp/checkout checkout aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" "$tmp/calls.log" && pass "prebuilt rollback checks out rollback sha" || fail "prebuilt rollback checks out rollback sha"
+
+tmp="$(mktemp -d)"
+export FAKE_SNAPSHOT_FAIL_N=2
+run_manager "$tmp" --prebuilt-target \
+  --rollback-sha aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+  --target-sha bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+unset FAKE_SNAPSHOT_FAIL_N
+[[ "$(cat "$tmp/rc")" != "0" ]] && pass "prebuilt quiesced snapshot failure exits nonzero" || fail "prebuilt quiesced snapshot failure exits nonzero"
+assert_order "$tmp/calls.log" "systemctl --user stop fake.service" "snapshot --db" "systemctl --user start fake.service" "inject"
+if grep -Fq "git -C $tmp/checkout checkout aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" "$tmp/calls.log" || grep -Fq "pnpm -C $tmp/checkout/apps/web run build" "$tmp/calls.log"; then
+  fail "prebuilt snapshot failure ran code rollback before update"
+else
+  pass "prebuilt snapshot failure restarts unchanged checkout"
+fi
+grep -Fq "RESULT SNAPSHOT-FAILED" "$tmp/ledger/"*/t3-daily-restart.result && pass "prebuilt snapshot failure recorded" || fail "prebuilt snapshot failure recorded"
 
 echo "$pass_count passed, $fail_count failed"
 [[ "$fail_count" -eq 0 ]]

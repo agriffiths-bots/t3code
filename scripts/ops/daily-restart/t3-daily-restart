@@ -17,6 +17,11 @@ stop_timeout="${T3DR_STOP_TIMEOUT:-120}"
 kill_timeout="${T3DR_KILL_TIMEOUT:-30}"
 smoke_instance="${T3DR_SMOKE_INSTANCE:-}"
 smoke_model="${T3DR_SMOKE_MODEL:-}"
+prebuilt_target="${T3DR_PREBUILT_TARGET:-0}"
+rollback_sha="${T3DR_ROLLBACK_SHA:-}"
+target_sha_override="${T3DR_TARGET_SHA:-}"
+prebuilt_assets_dir="${T3DR_PREBUILT_ASSETS_DIR:-}"
+pinned_health_probe_source="${T3DR_PINNED_HEALTH_PROBE:-}"
 
 usage() {
   cat >&2 <<'USAGE'
@@ -24,6 +29,7 @@ usage: t3-daily-restart [--db PATH] [--checkout PATH] [--service NAME]
                         [--origin URL] [--snapshot-dir DIR] [--ledger DIR]
                         [--probe-timeout SECS]
                         [--smoke-instance INSTANCE] [--smoke-model MODEL]
+                        [--prebuilt-target --rollback-sha SHA [--target-sha SHA]]
 USAGE
 }
 
@@ -47,6 +53,9 @@ while [[ $# -gt 0 ]]; do
     --probe-timeout) require_value "$@"; probe_timeout="$2"; shift 2 ;;
     --smoke-instance) require_value "$@"; smoke_instance="$2"; shift 2 ;;
     --smoke-model) require_value "$@"; smoke_model="$2"; shift 2 ;;
+    --prebuilt-target) prebuilt_target=1; shift ;;
+    --rollback-sha) require_value "$@"; rollback_sha="$2"; shift 2 ;;
+    --target-sha) require_value "$@"; target_sha_override="$2"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) echo "t3-daily-restart: unknown arg: $1" >&2; usage; exit 2 ;;
   esac
@@ -81,6 +90,26 @@ if [[ -z "$smoke_instance" ]]; then
 fi
 if [[ -z "$smoke_model" ]]; then
   echo "t3-daily-restart: --smoke-model or T3DR_SMOKE_MODEL is required" >&2
+  exit 2
+fi
+case "$prebuilt_target" in
+  1|true|TRUE|yes|YES) prebuilt_target=1 ;;
+  0|false|FALSE|no|NO|"") prebuilt_target=0 ;;
+  *)
+    echo "t3-daily-restart: T3DR_PREBUILT_TARGET must be boolean" >&2
+    exit 2
+    ;;
+esac
+if [[ "$prebuilt_target" == "1" && -z "$rollback_sha" ]]; then
+  echo "t3-daily-restart: --rollback-sha or T3DR_ROLLBACK_SHA is required with --prebuilt-target" >&2
+  exit 2
+fi
+if [[ "$prebuilt_target" == "1" && -z "$target_sha_override" ]]; then
+  echo "t3-daily-restart: --target-sha or T3DR_TARGET_SHA is required with --prebuilt-target" >&2
+  exit 2
+fi
+if [[ "$prebuilt_target" == "1" && ( -z "$prebuilt_assets_dir" || ! -d "$prebuilt_assets_dir" ) ]]; then
+  echo "t3-daily-restart: T3DR_PREBUILT_ASSETS_DIR is required with --prebuilt-target" >&2
   exit 2
 fi
 
@@ -307,7 +336,12 @@ run_health_probe() {
 
 pin_health_probe() {
   local source_probe pinned_probe temp_probe
-  source_probe="$(resolve_tool health-probe)" || return 1
+  if [[ -n "$pinned_health_probe_source" ]]; then
+    source_probe="$pinned_health_probe_source"
+    [[ -x "$source_probe" ]] || return 1
+  else
+    source_probe="$(resolve_tool health-probe)" || return 1
+  fi
   mkdir -p "$pinned_tools_dir" || return 1
   chmod 700 "$pinned_tools_dir" || return 1
   pinned_probe="$pinned_tools_dir/health-probe"
@@ -327,6 +361,32 @@ pin_health_probe() {
   }
   pinned_health_probe="$pinned_probe"
   log "PINNED health-probe source=$source_probe pinned=$pinned_probe"
+}
+
+replace_checkout_dir_from_payload() {
+  local rel="$1"
+  local source_dir="$prebuilt_assets_dir/$rel"
+  local target_dir="$checkout/$rel"
+  case "$rel" in
+    apps/web/dist|apps/server/dist) ;;
+    *)
+      log "refusing unexpected prebuilt asset path: $rel"
+      return 1
+      ;;
+  esac
+  if [[ ! -d "$source_dir" ]]; then
+    log "missing prebuilt asset directory: $source_dir"
+    return 1
+  fi
+  rm -rf -- "$target_dir" || return 1
+  mkdir -p "$target_dir" || return 1
+  cp -a "$source_dir/." "$target_dir/"
+}
+
+promote_prebuilt_assets() {
+  replace_checkout_dir_from_payload "apps/web/dist" || return 1
+  replace_checkout_dir_from_payload "apps/server/dist" || return 1
+  log "promoted prebuilt assets from $prebuilt_assets_dir"
 }
 
 rollback() {
@@ -434,23 +494,55 @@ pre_sha=""
 target_sha=""
 snapshot_path=""
 
-log "BEGIN service=$service checkout=$checkout origin=$origin"
+log "BEGIN service=$service checkout=$checkout origin=$origin prebuilt_target=$prebuilt_target"
 
-if ! run_capture 120 git -C "$checkout" fetch origin main:refs/remotes/origin/main; then
-  log "git fetch failed"
-  record_result "FAILED"
-  exit 1
+if [[ "$prebuilt_target" == "1" || -n "$target_sha_override" ]]; then
+  log "pinned target supplied; skipping origin fetch"
+else
+  if ! run_capture 120 git -C "$checkout" fetch origin main:refs/remotes/origin/main; then
+    log "git fetch failed"
+    record_result "FAILED"
+    exit 1
+  fi
 fi
-pre_sha="$(run_output 30 git -C "$checkout" rev-parse HEAD)" || {
+cycle_start_sha="$(run_output 30 git -C "$checkout" rev-parse HEAD)" || {
   log "failed to resolve pre_sha"
   record_result "FAILED"
   exit 1
 }
-target_sha="$(run_output 30 git -C "$checkout" rev-parse origin/main)" || {
-  log "failed to resolve origin/main"
-  record_result "FAILED"
-  exit 1
-}
+if [[ "$prebuilt_target" == "1" ]]; then
+  pre_sha="$(run_output 30 git -C "$checkout" rev-parse --verify "${rollback_sha}^{commit}")" || {
+    log "failed to resolve rollback_sha=$rollback_sha"
+    record_result "FAILED"
+    exit 1
+  }
+  target_sha="$(run_output 30 git -C "$checkout" rev-parse --verify "${target_sha_override}^{commit}")" || {
+    log "failed to resolve target_sha=$target_sha_override"
+    record_result "FAILED"
+    exit 1
+  }
+  if [[ "$cycle_start_sha" != "$pre_sha" ]]; then
+    log "prebuilt rollback mismatch: checkout_head=$cycle_start_sha rollback_sha=$pre_sha"
+    record_result "FAILED"
+    exit 1
+  fi
+  log "prebuilt target verified rollback_sha=$pre_sha target_sha=$target_sha"
+else
+  pre_sha="$cycle_start_sha"
+  if [[ -n "$target_sha_override" ]]; then
+    target_sha="$(run_output 30 git -C "$checkout" rev-parse --verify "${target_sha_override}^{commit}")" || {
+      log "failed to resolve target_sha=$target_sha_override"
+      record_result "FAILED"
+      exit 1
+    }
+  else
+    target_sha="$(run_output 30 git -C "$checkout" rev-parse origin/main)" || {
+      log "failed to resolve origin/main"
+      record_result "FAILED"
+      exit 1
+    }
+  fi
+fi
 
 snapshot_tool="$(resolve_tool t3-db-snapshot)" || {
   log "missing t3-db-snapshot"
@@ -497,28 +589,39 @@ fi
 snapshot_path="$(run_output 600 "$snapshot_tool" --db "$db" --out-dir "$snapshot_dir")"
 if [[ "$?" -ne 0 || -z "$snapshot_path" ]]; then
   log "quiesced snapshot failed after stop"
+  record_result "SNAPSHOT-FAILED"
   if run_capture 60 systemctl --user start "$service"; then
     inject_resume_manifest || log "failed to inject resume after quiesced snapshot failure"
   else
     log "failed to restart after quiesced snapshot failure"
   fi
-  record_result "SNAPSHOT-FAILED"
   exit 1
 fi
 log "quiesced_snapshot=$snapshot_path"
 if ! json_fill_manifest "$snapshot_path" >>"$log_file" 2>&1; then
   log "failed to write snapshot metadata into capture manifest"
+  record_result "FAILED"
   if run_capture 60 systemctl --user start "$service"; then
     inject_resume_manifest || log "failed to inject resume after manifest fill failure"
   else
     log "failed to restart after manifest fill failure"
   fi
-  record_result "FAILED"
   exit 1
 fi
 
 updated=0
-if [[ "$pre_sha" != "$target_sha" ]]; then
+if [[ "$prebuilt_target" == "1" ]]; then
+  log "prebuilt target supplied; applying checkout update and staged assets"
+  if ! run_capture 120 git -C "$checkout" merge --ff-only "$target_sha"; then
+    log "prebuilt ff-only update failed"
+    code_only_rollback "$run_dir/health-probe.after-prebuilt-update" || exit 1
+  fi
+  if ! promote_prebuilt_assets >>"$log_file" 2>&1; then
+    log "prebuilt asset promotion failed"
+    code_only_rollback "$run_dir/health-probe.after-prebuilt-assets" || exit 1
+  fi
+  updated=1
+elif [[ "$pre_sha" != "$target_sha" ]]; then
   if ! run_capture 120 git -C "$checkout" merge --ff-only "$target_sha"; then
     log "ff-only update failed"
     rollback "$run_dir/health-probe.after-update" || exit 1
