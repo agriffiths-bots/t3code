@@ -50,6 +50,9 @@ for ((i = 0; i < ${#args[@]}; i++)); do
         mkdir -p "$cwd/apps/server/dist/client"
         printf 'server-client\n' >"$cwd/apps/server/dist/client/index.html"
         printf 'server-bin\n' >"$cwd/apps/server/dist/bin.mjs"
+        if [[ "$*" == *" run build:desktop" && "${FAKE_PREBUILT_ENV_AS_DIR_AFTER_BUILD:-0}" == "1" ]]; then
+          mkdir -p "$T3DR_LEDGER/$(date -u +%F)/prebuilt-target.env"
+        fi
         if [[ "$*" == *" run dist:desktop:artifact" && -n "${T3CODE_DESKTOP_OUTPUT_DIR:-}" ]]; then
           mkdir -p "$T3CODE_DESKTOP_OUTPUT_DIR"
           printf 'desktop\n' >"$T3CODE_DESKTOP_OUTPUT_DIR/artifact.txt"
@@ -179,6 +182,18 @@ if grep -Fq "restart" "$tmp/calls.log"; then
   fail "build failure aborts before restart"
 else
   pass "build failure aborts before restart"
+fi
+
+tmp="$(mktemp -d)"
+export FAKE_PREBUILT_ENV_AS_DIR_AFTER_BUILD=1
+run_cycle "$tmp"
+unset FAKE_PREBUILT_ENV_AS_DIR_AFTER_BUILD
+[[ "$(cat "$tmp/rc")" != "0" ]] && pass "metadata write failure exits nonzero" || fail "metadata write failure exits nonzero"
+grep -Fq "failed to write restart metadata" "$tmp/ledger/"*/build-release-artifacts.log && pass "metadata write failure logged" || fail "metadata write failure logged"
+if grep -Fq "restart" "$tmp/calls.log"; then
+  fail "metadata write failure aborts before restart"
+else
+  pass "metadata write failure aborts before restart"
 fi
 
 tmp="$(mktemp -d)"

@@ -250,6 +250,46 @@ copy_payload_dir() {
   cp -a "$source_dir/." "$target_dir/"
 }
 
+write_restart_metadata() {
+  local mode="$1" tmp_file="$prebuilt_env.tmp.$$"
+  rm -f "$tmp_file"
+  if [[ -d "$prebuilt_env" ]]; then
+    return 1
+  fi
+  case "$mode" in
+    prebuilt)
+      local rollback_sha="$2" target_sha="$3" assets_dir="$4" probe_path="$5"
+      [[ -n "$rollback_sha" && -n "$target_sha" && -n "$assets_dir" && -n "$probe_path" ]] || return 68
+      {
+        printf 'T3DR_PREBUILT_TARGET=1\n'
+        printf 'T3DR_ROLLBACK_SHA=%s\n' "$rollback_sha"
+        printf 'T3DR_TARGET_SHA=%s\n' "$target_sha"
+        printf 'T3DR_PREBUILT_ASSETS_DIR=%s\n' "$assets_dir"
+        printf 'T3DR_PINNED_HEALTH_PROBE=%s\n' "$probe_path"
+      } >"$tmp_file" || {
+        rm -f "$tmp_file"
+        return 1
+      }
+      ;;
+    no-op)
+      local target_sha="$2"
+      [[ -n "$target_sha" ]] || return 68
+      {
+        printf 'T3DR_PREBUILT_TARGET=0\n'
+        printf 'T3DR_TARGET_SHA=%s\n' "$target_sha"
+      } >"$tmp_file" || {
+        rm -f "$tmp_file"
+        return 1
+      }
+      ;;
+    *) return 68 ;;
+  esac
+  mv -fT -- "$tmp_file" "$prebuilt_env" || {
+    rm -f "$tmp_file"
+    return 1
+  }
+}
+
 prepare_stage_checkout() {
   local step_log="$1"
   remove_path_under "$stage_root" "$stage_checkout" || return 1
@@ -342,20 +382,19 @@ build_release_artifacts() {
 
   if [[ "$rc" -eq 0 ]]; then
     if [[ "$rollback_sha" != "$target_sha" || "$build_always" == "1" ]]; then
-      {
-        printf 'T3DR_PREBUILT_TARGET=1\n'
-        printf 'T3DR_ROLLBACK_SHA=%s\n' "$rollback_sha"
-        printf 'T3DR_TARGET_SHA=%s\n' "$target_sha"
-        printf 'T3DR_PREBUILT_ASSETS_DIR=%s\n' "$stage_payload"
-        printf 'T3DR_PINNED_HEALTH_PROBE=%s\n' "$pinned_rollback_probe"
-      } >"$prebuilt_env"
-      log "prebuilt target ready rollback_sha=$rollback_sha target_sha=$target_sha"
+      if write_restart_metadata prebuilt "$rollback_sha" "$target_sha" "$stage_payload" "$pinned_rollback_probe"; then
+        log "prebuilt target ready rollback_sha=$rollback_sha target_sha=$target_sha"
+      else
+        rc=$?
+        printf '[%s] failed to write restart metadata: %s\n' "$(date -u +%FT%TZ)" "$prebuilt_env" >>"$step_log"
+      fi
     else
-      {
-        printf 'T3DR_PREBUILT_TARGET=0\n'
-        printf 'T3DR_TARGET_SHA=%s\n' "$target_sha"
-      } >"$prebuilt_env"
-      printf '[%s] checkout already at target; build skipped\n' "$(date -u +%FT%TZ)" >>"$step_log"
+      if write_restart_metadata no-op "$target_sha"; then
+        printf '[%s] checkout already at target; build skipped\n' "$(date -u +%FT%TZ)" >>"$step_log"
+      else
+        rc=$?
+        printf '[%s] failed to write restart metadata: %s\n' "$(date -u +%FT%TZ)" "$prebuilt_env" >>"$step_log"
+      fi
     fi
   fi
   cleanup_stage_checkout "$step_log"
@@ -375,26 +414,49 @@ run_restart_step() {
   local step="restart-resume"
   local step_log="$run_dir/$step.log"
   local started="$SECONDS" rc duration prebuilt rollback target
+  local assets probe
   : >"$step_log"
   write_event "$step" "started" "" "" "$step_log"
-  prebuilt="$(sed -n 's/^T3DR_PREBUILT_TARGET=//p' "$prebuilt_env" 2>/dev/null | head -1)"
-  rollback="$(sed -n 's/^T3DR_ROLLBACK_SHA=//p' "$prebuilt_env" 2>/dev/null | head -1)"
-  target="$(sed -n 's/^T3DR_TARGET_SHA=//p' "$prebuilt_env" 2>/dev/null | head -1)"
-  assets="$(sed -n 's/^T3DR_PREBUILT_ASSETS_DIR=//p' "$prebuilt_env" 2>/dev/null | head -1)"
-  probe="$(sed -n 's/^T3DR_PINNED_HEALTH_PROBE=//p' "$prebuilt_env" 2>/dev/null | head -1)"
-  log "STEP $step start log=$step_log prebuilt=${prebuilt:-0}"
-  if [[ "$prebuilt" == "1" ]]; then
-    env T3DR_CHECKOUT="$checkout" T3DR_LEDGER="$ledger" \
-      T3DR_PREBUILT_TARGET=1 T3DR_ROLLBACK_SHA="$rollback" T3DR_TARGET_SHA="$target" \
-      T3DR_PREBUILT_ASSETS_DIR="$assets" T3DR_PINNED_HEALTH_PROBE="$probe" \
-      "$restart_cmd" >>"$step_log" 2>&1
-  else
+  if [[ -r "$prebuilt_env" ]]; then
+    prebuilt="$(sed -n 's/^T3DR_PREBUILT_TARGET=//p' "$prebuilt_env" 2>/dev/null | head -1)"
+    rollback="$(sed -n 's/^T3DR_ROLLBACK_SHA=//p' "$prebuilt_env" 2>/dev/null | head -1)"
     target="$(sed -n 's/^T3DR_TARGET_SHA=//p' "$prebuilt_env" 2>/dev/null | head -1)"
-    env T3DR_CHECKOUT="$checkout" T3DR_LEDGER="$ledger" \
-      T3DR_TARGET_SHA="$target" \
-      "$restart_cmd" >>"$step_log" 2>&1
+    assets="$(sed -n 's/^T3DR_PREBUILT_ASSETS_DIR=//p' "$prebuilt_env" 2>/dev/null | head -1)"
+    probe="$(sed -n 's/^T3DR_PINNED_HEALTH_PROBE=//p' "$prebuilt_env" 2>/dev/null | head -1)"
+  else
+    prebuilt=""
+    rollback=""
+    target=""
+    assets=""
+    probe=""
   fi
-  rc=$?
+  log "STEP $step start log=$step_log prebuilt=${prebuilt:-missing}"
+  rc=0
+  if [[ "$prebuilt" == "1" ]]; then
+    if [[ -z "$rollback" || -z "$target" || -z "$assets" || -z "$probe" ]]; then
+      printf '[%s] invalid prebuilt restart metadata in %s\n' "$(date -u +%FT%TZ)" "$prebuilt_env" >>"$step_log"
+      rc=68
+    else
+      env T3DR_CHECKOUT="$checkout" T3DR_LEDGER="$ledger" \
+        T3DR_PREBUILT_TARGET=1 T3DR_ROLLBACK_SHA="$rollback" T3DR_TARGET_SHA="$target" \
+        T3DR_PREBUILT_ASSETS_DIR="$assets" T3DR_PINNED_HEALTH_PROBE="$probe" \
+        "$restart_cmd" >>"$step_log" 2>&1
+      rc=$?
+    fi
+  elif [[ "$prebuilt" == "0" ]]; then
+    if [[ -z "$target" ]]; then
+      printf '[%s] invalid no-op restart metadata in %s\n' "$(date -u +%FT%TZ)" "$prebuilt_env" >>"$step_log"
+      rc=68
+    else
+      env T3DR_CHECKOUT="$checkout" T3DR_LEDGER="$ledger" \
+        T3DR_TARGET_SHA="$target" \
+        "$restart_cmd" >>"$step_log" 2>&1
+      rc=$?
+    fi
+  else
+    printf '[%s] missing restart metadata in %s\n' "$(date -u +%FT%TZ)" "$prebuilt_env" >>"$step_log"
+    rc=68
+  fi
   duration=$((SECONDS - started))
   if [[ "$rc" -eq 0 ]]; then
     write_event "$step" "ok" "$rc" "$duration" "$step_log"
