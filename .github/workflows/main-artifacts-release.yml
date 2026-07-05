@@ -155,10 +155,31 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          stale="$(gh release list --limit 300 \
-            --json tagName,isPrerelease,createdAt \
-            --jq '[.[] | select(.isPrerelease and (.tagName | startswith("main-")))]
-                  | sort_by(.createdAt) | reverse | .[14:] | .[].tagName')"
+          pointer_json="$(
+            gh api "repos/$GH_REPO/contents/client-verified-latest.json?ref=client-verified-latest" \
+              --jq '.content' | base64 -d
+          )" || {
+            echo "::warning::Unable to read client-verified-latest pointer; skipping nightly pruning."
+            exit 0
+          }
+          pinned_release_tag="$(
+            jq -r '(.desktop.artifacts.release // "") | rtrimstr("/") | split("/")[-1]' \
+              <<< "$pointer_json"
+          )" || {
+            echo "::warning::Unable to parse client-verified-latest pointer; skipping nightly pruning."
+            exit 0
+          }
+          if [[ -z "$pinned_release_tag" || "$pinned_release_tag" == "null" ]]; then
+            echo "::warning::No verified client release is pinned; skipping nightly pruning."
+            exit 0
+          fi
+          echo "Keeping verified client pointer release $pinned_release_tag"
+          stale="$(
+            gh release list --limit 300 --json tagName,isPrerelease,createdAt \
+              | jq -r --arg keep "$pinned_release_tag" \
+                  '[.[] | select(.isPrerelease and (.tagName | startswith("main-")) and .tagName != $keep)]
+                   | sort_by(.createdAt) | reverse | .[14:] | .[].tagName'
+          )"
           if [[ -z "$stale" ]]; then
             echo "No stale nightly releases to prune."
             exit 0
