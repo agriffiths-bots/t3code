@@ -72,6 +72,12 @@ export const PreviewAutomationStatus = Schema.Struct({
   url: Schema.NullOr(Schema.String),
   title: Schema.NullOr(Schema.String),
   loading: Schema.Boolean,
+  /** Present when the server can answer status without a live renderer host. */
+  hostState: Schema.optional(Schema.Literals(["attached", "missing"])),
+  /** Bounded, non-sensitive explanation for unavailable automation. */
+  unavailableReason: Schema.optional(Schema.String.check(Schema.isMaxLength(512))),
+  /** Bounded, non-sensitive next step for reattaching automation. */
+  recovery: Schema.optional(Schema.String.check(Schema.isMaxLength(512))),
   /** Optional for compatibility with desktop hosts predating viewport sizing. */
   viewportSetting: Schema.optional(PreviewViewportSetting),
   /** Measured guest-page viewport in CSS pixels when a webview is ready. */
@@ -664,12 +670,26 @@ export class PreviewAutomationNoAvailableHostError extends Schema.TaggedErrorCla
     requestId: Schema.optional(TrimmedNonEmptyString),
     tabId: Schema.optional(PreviewTabId),
     timeoutMs: Schema.optional(Schema.Int.check(Schema.isGreaterThan(0))),
+    connectedHostCount: Schema.optional(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))),
+    environmentHostCount: Schema.optional(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))),
+    operationHostCount: Schema.optional(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))),
+    pinnedHostMissingOperation: Schema.optional(Schema.Boolean),
     ...PreviewAutomationOptionalRemoteDiagnosticFields,
   },
 ) {
   override get message(): string {
-    const summary = `No preview automation host is available for ${this.operation} in environment ${this.environmentId}.`;
-    return summary;
+    const recovery =
+      "Open or reload T3 Code Desktop for this environment; the desktop renderer auto-attaches the preview automation host. Browser/PWA sessions cannot host Electron preview automation.";
+    if (this.pinnedHostMissingOperation) {
+      return `The active preview automation host for environment ${this.environmentId} does not support ${this.operation}. Start a fresh provider session after reloading T3 Code Desktop.`;
+    }
+    if ((this.environmentHostCount ?? 0) > 0 && (this.operationHostCount ?? 0) === 0) {
+      return `No preview automation host for environment ${this.environmentId} supports ${this.operation}. Reload or update T3 Code Desktop so the renderer advertises the current preview automation operations.`;
+    }
+    if ((this.connectedHostCount ?? 0) > 0 && (this.environmentHostCount ?? 0) === 0) {
+      return `Preview automation hosts are attached for other environments, but none is attached for environment ${this.environmentId}. ${recovery}`;
+    }
+    return `No preview automation host is attached for ${this.operation} in environment ${this.environmentId}. ${recovery}`;
   }
 }
 

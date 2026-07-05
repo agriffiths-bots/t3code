@@ -453,7 +453,12 @@ it.effect("rejects calls when no connected host exists", () =>
       threadId: scope.threadId,
       providerSessionId: scope.providerSessionId,
       providerInstanceId: scope.providerInstanceId,
+      connectedHostCount: 0,
+      environmentHostCount: 0,
+      operationHostCount: 0,
+      pinnedHostMissingOperation: false,
     });
+    expect(error.message).toContain("Open or reload T3 Code Desktop");
   }),
 );
 
@@ -569,6 +574,36 @@ it.effect("never routes a provider session to a host from another environment", 
       expect(yield* broker.invoke<string>({ scope, operation: "status", input: {} })).toBe(
         "matching",
       );
+    }),
+  ),
+);
+
+it.effect("diagnoses hosts attached only to another environment", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const broker = yield* makeBroker;
+      const foreignRequests = requestsFrom(
+        yield* broker.connect(
+          makeHost({
+            clientId: "client-foreign",
+            environmentId: EnvironmentId.make("environment-foreign"),
+          }),
+        ),
+      );
+      yield* Stream.runDrain(foreignRequests).pipe(Effect.forkScoped);
+      yield* Effect.yieldNow;
+
+      const error = yield* broker
+        .invoke<void>({ scope, operation: "status", input: {} })
+        .pipe(Effect.flip);
+
+      expect(error).toBeInstanceOf(PreviewAutomationNoAvailableHostError);
+      expect(error).toMatchObject({
+        connectedHostCount: 1,
+        environmentHostCount: 0,
+        operationHostCount: 0,
+      });
+      expect(error.message).toContain("hosts are attached for other environments");
     }),
   ),
 );
