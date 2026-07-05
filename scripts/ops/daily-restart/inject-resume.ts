@@ -5,6 +5,7 @@
 import * as NodeCrypto from "node:crypto";
 import * as NodeFSP from "node:fs/promises";
 import * as NodePath from "node:path";
+import * as NodePerfHooks from "node:perf_hooks";
 import * as NodeTimersPromises from "node:timers/promises";
 
 export const RESUME_MESSAGE =
@@ -52,6 +53,8 @@ export interface InjectResumeOptions {
   readonly sleep?: (ms: number) => Promise<void>;
   readonly random?: () => number;
   readonly dispatchAttemptTimeoutMs?: number;
+  readonly resumeStartTimeoutMs?: number;
+  readonly resumeStartPollMs?: number;
 }
 
 export interface InjectResumeResult {
@@ -74,6 +77,8 @@ const DISPATCH_RETRY_BASE_MS = 4_000;
 const DISPATCH_RETRY_JITTER = 0.2;
 const DISPATCH_RETRY_SLEEP_BUDGET_MS = 60_000;
 const DISPATCH_ATTEMPT_TIMEOUT_MS = 10_000;
+const RESUME_START_TIMEOUT_MS = 120_000;
+const RESUME_START_POLL_MS = 1_000;
 type ResumeRuntimeMode = "approval-required" | "auto-accept-edits" | "full-access";
 type ResumeInteractionMode = "default" | "plan";
 const DEFAULT_RESUME_RUNTIME_MODE: ResumeRuntimeMode = "full-access";
@@ -571,6 +576,173 @@ async function postDispatchCommand(
   }
 }
 
+async function fetchOrchestrationSnapshot(
+  fetchImpl: typeof fetch,
+  origin: string,
+  token: string,
+  attemptTimeoutMs: number,
+): Promise<unknown> {
+  const controller = new AbortController();
+  const timeout = NodeTimersPromises.setTimeout(attemptTimeoutMs, undefined, {
+    signal: controller.signal,
+  })
+    .then(() => controller.abort())
+    .catch(() => undefined);
+
+  try {
+    const response = await fetchImpl(new URL("/api/orchestration/snapshot", origin), {
+      method: "GET",
+      headers: { authorization: `Bearer ${token}` },
+      signal: controller.signal,
+    });
+
+    if (!response.ok) {
+      const body = await response.text().catch(() => "");
+      throw new DispatchHttpError(
+        response.status,
+        body,
+        parseRetryAfter(response.headers.get("retry-after")),
+      );
+    }
+
+    return await response.json();
+  } finally {
+    controller.abort();
+    await timeout;
+  }
+}
+
+async function assertQueuedReplaySnapshotReadable(
+  fetchImpl: typeof fetch,
+  origin: string,
+  token: string,
+  attemptTimeoutMs: number,
+  sleepImpl: (ms: number) => Promise<void>,
+  random: () => number,
+): Promise<void> {
+  let remainingSleepBudgetMs = DISPATCH_RETRY_SLEEP_BUDGET_MS;
+  let lastError: unknown;
+
+  for (let attempt = 0; attempt < MAX_DISPATCH_ATTEMPTS; attempt += 1) {
+    try {
+      await fetchOrchestrationSnapshot(fetchImpl, origin, token, attemptTimeoutMs);
+      return;
+    } catch (error) {
+      lastError = error;
+      if (!isTransientDispatchError(error) || attempt === MAX_DISPATCH_ATTEMPTS - 1) break;
+      const delayMs = clampDelayToBudget(
+        dispatchRetryDelayMs(attempt, error, random),
+        remainingSleepBudgetMs,
+      );
+      remainingSleepBudgetMs -= delayMs;
+      await sleepImpl(delayMs);
+    }
+  }
+
+  const message = lastError instanceof Error ? lastError.message : String(lastError);
+  throw new Error(
+    `queued replay requires orchestration snapshot read access before dispatch; snapshot preflight failed: ${message}`,
+    { cause: lastError },
+  );
+}
+
+async function ensureQueuedReplaySnapshotPreflight(input: {
+  readonly alreadyPassed: boolean;
+  readonly fetchImpl: typeof fetch;
+  readonly origin: string;
+  readonly token: string;
+  readonly attemptTimeoutMs: number;
+  readonly sleepImpl: (ms: number) => Promise<void>;
+  readonly random: () => number;
+}): Promise<boolean> {
+  if (input.alreadyPassed) return true;
+  await assertQueuedReplaySnapshotReadable(
+    input.fetchImpl,
+    input.origin,
+    input.token,
+    input.attemptTimeoutMs,
+    input.sleepImpl,
+    input.random,
+  );
+  return true;
+}
+
+function snapshotHasProjectedTurnStart(input: {
+  readonly snapshot: unknown;
+  readonly threadId: string;
+  readonly messageId: string;
+}): boolean {
+  if (!isRecord(input.snapshot) || !Array.isArray(input.snapshot.threads)) return false;
+
+  const thread = input.snapshot.threads.find(
+    (candidate) => isRecord(candidate) && candidate.id === input.threadId,
+  );
+  if (!isRecord(thread) || !Array.isArray(thread.messages)) return false;
+
+  return thread.messages.some(
+    (message) =>
+      isRecord(message) &&
+      message.id === input.messageId &&
+      typeof message.turnId === "string" &&
+      message.turnId.length > 0,
+  );
+}
+
+async function waitForProjectedTurnStart(input: {
+  readonly fetchImpl: typeof fetch;
+  readonly origin: string;
+  readonly token: string;
+  readonly threadId: string;
+  readonly messageId: string;
+  readonly attemptTimeoutMs: number;
+  readonly timeoutMs: number;
+  readonly pollMs: number;
+  readonly sleepImpl: (ms: number) => Promise<void>;
+}): Promise<void> {
+  const deadlineMs = NodePerfHooks.performance.now() + input.timeoutMs;
+  let lastTransientError: unknown;
+
+  while (true) {
+    const remainingMs = deadlineMs - NodePerfHooks.performance.now();
+    if (remainingMs <= 0) break;
+
+    try {
+      const snapshot = await fetchOrchestrationSnapshot(
+        input.fetchImpl,
+        input.origin,
+        input.token,
+        Math.max(1, Math.min(input.attemptTimeoutMs, Math.ceil(remainingMs))),
+      );
+      if (
+        snapshotHasProjectedTurnStart({
+          snapshot,
+          threadId: input.threadId,
+          messageId: input.messageId,
+        })
+      ) {
+        return;
+      }
+      lastTransientError = undefined;
+    } catch (error) {
+      if (!isTransientDispatchError(error)) throw error;
+      lastTransientError = error;
+    }
+
+    const remainingAfterAttemptMs = deadlineMs - NodePerfHooks.performance.now();
+    if (remainingAfterAttemptMs <= 0) break;
+    const delayMs = Math.min(input.pollMs, remainingAfterAttemptMs);
+    await input.sleepImpl(delayMs);
+  }
+
+  const suffix =
+    lastTransientError instanceof Error
+      ? `; last snapshot error: ${lastTransientError.message}`
+      : "";
+  throw new Error(
+    `thread ${input.threadId} resume turn did not start before queued replay timeout${suffix}`,
+  );
+}
+
 async function postDispatchCommandWithRetry(
   fetchImpl: typeof fetch,
   origin: string,
@@ -612,6 +784,8 @@ async function dispatchResumeCommands(
   createdAt: string,
   attachmentsDir: string | undefined,
   attemptTimeoutMs: number,
+  resumeStartTimeoutMs: number,
+  resumeStartPollMs: number,
   sleepImpl: (ms: number) => Promise<void>,
   random: () => number,
 ): Promise<void> {
@@ -663,20 +837,32 @@ async function dispatchResumeCommands(
     );
   };
 
+  const resumeMessage = await resumeMessageForThread(
+    manifest,
+    thread,
+    attachmentsDir,
+    !hasQueuedPromptAfterActive,
+  );
   await dispatchTurnStart({
     commandId: stableDispatchId("command", manifest, thread.thread_id),
-    message: await resumeMessageForThread(
-      manifest,
-      thread,
-      attachmentsDir,
-      !hasQueuedPromptAfterActive,
-    ),
+    message: resumeMessage,
     metadata: hasQueuedPromptAfterActive ? {} : pendingTurnMetadataForThread(thread),
     runtimeMode: hasQueuedPromptAfterActive ? runtimeMode : pendingRuntimeMode,
     interactionMode: hasQueuedPromptAfterActive ? interactionMode : pendingInteractionMode,
   });
 
   if (hasQueuedPromptAfterActive) {
+    await waitForProjectedTurnStart({
+      fetchImpl,
+      origin,
+      token,
+      threadId: thread.thread_id,
+      messageId: resumeMessage.messageId,
+      attemptTimeoutMs,
+      timeoutMs: resumeStartTimeoutMs,
+      pollMs: resumeStartPollMs,
+      sleepImpl,
+    });
     await dispatchTurnStart({
       commandId: stableDispatchId("queued-command", manifest, thread.thread_id),
       message: await resumeMessageForThread(manifest, thread, attachmentsDir),
@@ -694,7 +880,10 @@ export async function injectResume(options: InjectResumeOptions): Promise<Inject
   const sleepImpl = options.sleep ?? sleep;
   const random = options.random ?? Math.random;
   const dispatchAttemptTimeoutMs = options.dispatchAttemptTimeoutMs ?? DISPATCH_ATTEMPT_TIMEOUT_MS;
+  const resumeStartTimeoutMs = options.resumeStartTimeoutMs ?? RESUME_START_TIMEOUT_MS;
+  const resumeStartPollMs = options.resumeStartPollMs ?? RESUME_START_POLL_MS;
   const failures: Array<{ threadId: string; error: string }> = [];
+  let queuedReplaySnapshotPreflightPassed = false;
   let injected = 0;
   let skipped = 0;
 
@@ -713,6 +902,17 @@ export async function injectResume(options: InjectResumeOptions): Promise<Inject
     try {
       const token = options.token;
       if (!token) throw new Error("missing bearer token");
+      if (hasActiveTurn(thread) && thread.pending_message !== undefined) {
+        queuedReplaySnapshotPreflightPassed = await ensureQueuedReplaySnapshotPreflight({
+          alreadyPassed: queuedReplaySnapshotPreflightPassed,
+          fetchImpl,
+          origin: options.origin,
+          token,
+          attemptTimeoutMs: dispatchAttemptTimeoutMs,
+          sleepImpl,
+          random,
+        });
+      }
       await dispatchResumeCommands(
         fetchImpl,
         options.origin,
@@ -722,6 +922,8 @@ export async function injectResume(options: InjectResumeOptions): Promise<Inject
         injectedAt,
         options.attachmentsDir,
         dispatchAttemptTimeoutMs,
+        resumeStartTimeoutMs,
+        resumeStartPollMs,
         sleepImpl,
         random,
       );

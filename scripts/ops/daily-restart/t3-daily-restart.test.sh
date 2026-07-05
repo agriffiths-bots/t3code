@@ -114,7 +114,7 @@ while [[ $# -gt 0 ]]; do
     if [[ "${FAKE_CAPTURE_BAD_JSON:-0}" == "1" || ( -n "${FAKE_CAPTURE_BAD_JSON_N:-}" && "$count" == "$FAKE_CAPTURE_BAD_JSON_N" ) ]]; then
       printf '{bad json\n' >"$2"
     elif [[ "${FAKE_CAPTURE_PHASE_THREADS:-0}" == "1" && "$2" == *.pre-stop.* ]]; then
-      printf '{"threads":[{"thread_id":"pre-active","active_turn_id":"turn-old"},{"thread_id":"pre-pending","pending_message":{"message_id":"message-pre","role":"user","text":"pending","attachments":[]}}]}\n' >"$2"
+      printf '{"threads":[{"thread_id":"pre-active","role":"active","active_turn_id":"turn-old"},{"thread_id":"pre-pending","role":"active","pending_message":{"message_id":"message-pre","role":"user","text":"pending","attachments":[]}}]}\n' >"$2"
     elif [[ "${FAKE_CAPTURE_PHASE_THREADS:-0}" == "1" && "$2" == *.post-stop.* ]]; then
       printf '{"threads":[{"thread_id":"post-active","active_turn_id":"turn-new"}]}\n' >"$2"
     else
@@ -227,6 +227,8 @@ run_manager "$tmp"
 unset FAKE_CAPTURE_PHASE_THREADS
 manifest_path="$(echo "$tmp/ledger/"*/resume-manifest.json)"
 grep -Fq -- "--include-pending-message-id message-pre" "$tmp/calls.log" && pass "post-stop capture receives pre-stop pending ids" || fail "post-stop capture receives pre-stop pending ids"
+grep -Fq -- "--include-active-thread-id pre-active" "$tmp/calls.log" && pass "post-stop capture receives pre-stop active ids" || fail "post-stop capture receives pre-stop active ids"
+if grep -Fq -- "--include-active-thread-id pre-pending" "$tmp/calls.log"; then fail "post-stop capture skips pending-only active ids"; else pass "post-stop capture skips pending-only active ids"; fi
 if node - "$manifest_path" <<'NODE'
 const fs = require("node:fs");
 const manifest = JSON.parse(fs.readFileSync(process.argv[2], "utf8"));

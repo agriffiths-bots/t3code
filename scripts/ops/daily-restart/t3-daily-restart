@@ -619,6 +619,24 @@ for (const thread of Array.isArray(manifest.threads) ? manifest.threads : []) {
 }
 NODE
 )
+mapfile -t pre_stop_active_thread_ids < <(node - "$pre_stop_manifest" <<'NODE'
+const fs = require("node:fs");
+const manifest = JSON.parse(fs.readFileSync(process.argv[2], "utf8"));
+for (const thread of Array.isArray(manifest.threads) ? manifest.threads : []) {
+  const threadId = thread?.thread_id;
+  const activeTurnId = thread?.active_turn_id;
+  if (
+    thread?.role === "active" &&
+    typeof threadId === "string" &&
+    threadId.length > 0 &&
+    typeof activeTurnId === "string" &&
+    activeTurnId.length > 0
+  ) {
+    console.log(threadId);
+  }
+}
+NODE
+)
 
 if ! pin_health_probe; then
   log "failed to pin pre-update health-probe"
@@ -636,6 +654,9 @@ fi
 post_stop_capture_args=(--stopped-since "$stop_started_at" --pending-since "$pre_stop_pending_since")
 for message_id in "${pre_stop_pending_message_ids[@]}"; do
   post_stop_capture_args+=(--include-pending-message-id "$message_id")
+done
+for thread_id in "${pre_stop_active_thread_ids[@]}"; do
+  post_stop_capture_args+=(--include-active-thread-id "$thread_id")
 done
 
 if ! capture_active_manifest "post-stop" "${post_stop_capture_args[@]}"; then

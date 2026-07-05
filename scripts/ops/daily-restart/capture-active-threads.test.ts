@@ -106,8 +106,18 @@ function makeFixtureDb(dir: string): string {
     ["terminal-equal-pending-turn", "Terminal Equal Pending Turn", null, null, "error", null],
     ["terminal-fresh-pending-turn", "Terminal Fresh Pending Turn", null, null, "error", null],
     ["stopped-running-turn", "Stopped Running Turn", null, null, "stopped", null],
+    ["stopped-new-running-turn", "Stopped New Running Turn", null, null, "stopped", null],
     ["stopped-interrupted-turn", "Stopped Interrupted Turn", null, null, "stopped", null],
+    ["interrupted-current-turn", "Interrupted Current Turn", null, null, "interrupted", null],
     ["stopped-current-pending-turn", "Stopped Current Pending Turn", null, null, "stopped", null],
+    [
+      "interrupted-current-pending-turn",
+      "Interrupted Current Pending Turn",
+      null,
+      null,
+      "interrupted",
+      null,
+    ],
     ["stopped-stale-pending-turn", "Stopped Stale Pending Turn", null, null, "stopped", null],
     [
       "stopped-stale-interrupted-turn",
@@ -179,8 +189,11 @@ function insertThread(
         : threadId === "starting-no-turn"
           ? "2026-07-03T00:00:02.000Z"
           : threadId === "stopped-current-pending-turn" ||
+              threadId === "interrupted-current-pending-turn" ||
+              threadId === "stopped-new-running-turn" ||
               threadId === "stopped-stale-pending-turn" ||
-              threadId === "stopped-interrupted-turn"
+              threadId === "stopped-interrupted-turn" ||
+              threadId === "interrupted-current-turn"
             ? "2026-07-03T00:00:03.000Z"
             : threadId === "terminal-equal-pending-turn"
               ? "2026-07-03T00:00:01.000Z"
@@ -215,9 +228,12 @@ function insertThread(
     threadId === "terminal-fresh-pending-turn" ||
     threadId === "terminal-stale-active-pending-turn" ||
     threadId === "stopped-current-pending-turn" ||
+    threadId === "interrupted-current-pending-turn" ||
     threadId === "stopped-stale-pending-turn" ||
     threadId === "stopped-running-turn" ||
+    threadId === "stopped-new-running-turn" ||
     threadId === "stopped-interrupted-turn" ||
+    threadId === "interrupted-current-turn" ||
     threadId === "stopped-stale-interrupted-turn" ||
     threadId === "stopped-completed-turn" ||
     threadId === "ready-running-projection"
@@ -256,7 +272,7 @@ function insertThread(
       JSON.stringify(pendingMessageAttachments),
     );
     const turnRequestedAt =
-      threadId === "stopped-current-pending-turn"
+      threadId === "stopped-current-pending-turn" || threadId === "stopped-new-running-turn"
         ? "2026-07-03T00:00:02.500Z"
         : "2026-07-03T00:00:01.000Z";
     db.prepare(`
@@ -277,22 +293,29 @@ function insertThread(
           ? activeTurnId
           : threadId === "stopped-running-turn"
             ? "turn-stopped-running"
-            : threadId === "stopped-interrupted-turn"
-              ? "turn-stopped-interrupted"
-              : threadId === "stopped-stale-interrupted-turn"
-                ? "turn-stopped-stale-interrupted"
-                : threadId === "stopped-completed-turn"
-                  ? "turn-stopped-completed"
-                  : threadId === "ready-running-projection"
-                    ? "turn-ready-running"
-                    : null,
+            : threadId === "stopped-new-running-turn"
+              ? "turn-stopped-new-running"
+              : threadId === "stopped-interrupted-turn"
+                ? "turn-stopped-interrupted"
+                : threadId === "interrupted-current-turn"
+                  ? "turn-interrupted-current"
+                  : threadId === "stopped-stale-interrupted-turn"
+                    ? "turn-stopped-stale-interrupted"
+                    : threadId === "stopped-completed-turn"
+                      ? "turn-stopped-completed"
+                      : threadId === "ready-running-projection"
+                        ? "turn-ready-running"
+                        : null,
       pendingMessageId,
       threadId === "active-turn" ||
         threadId === "errored-stale" ||
         threadId === "stopped-running-turn" ||
+        threadId === "stopped-new-running-turn" ||
         threadId === "ready-running-projection"
         ? "running"
-        : threadId === "stopped-interrupted-turn" || threadId === "stopped-stale-interrupted-turn"
+        : threadId === "stopped-interrupted-turn" ||
+            threadId === "interrupted-current-turn" ||
+            threadId === "stopped-stale-interrupted-turn"
           ? "interrupted"
           : threadId === "stopped-completed-turn"
             ? "completed"
@@ -300,9 +323,11 @@ function insertThread(
       turnRequestedAt,
       threadId === "stopped-interrupted-turn"
         ? "2026-07-03T00:00:03.000Z"
-        : threadId === "stopped-stale-interrupted-turn"
-          ? "2026-07-03T00:00:00.000Z"
-          : null,
+        : threadId === "interrupted-current-turn"
+          ? "2026-07-03T00:00:03.000Z"
+          : threadId === "stopped-stale-interrupted-turn"
+            ? "2026-07-03T00:00:00.000Z"
+            : null,
     );
 
     if (threadId === "terminal-stale-active-pending-turn") {
@@ -600,6 +625,8 @@ describe("capture-active-threads", () => {
       outPath: NodePath.join(tempDir, "resume-manifest.json"),
       stoppedSince: "2026-07-03T00:00:02.900Z",
       pendingSince: "2026-07-03T00:00:02.000Z",
+      includedPendingMessageIds: ["message-interrupted-current-pending-turn"],
+      includedActiveThreadIds: ["stopped-interrupted-turn", "interrupted-current-turn"],
       // @effect-diagnostics-next-line globalDate:off - deterministic fixture timestamp.
       capturedAt: new Date("2026-07-03T21:00:00.000Z"),
     });
@@ -617,6 +644,17 @@ describe("capture-active-threads", () => {
       pending_message: expectedPendingMessage("stopped-current-pending-turn"),
       injected_at: null,
     });
+    assert.deepStrictEqual(threadsById.get("stopped-new-running-turn"), {
+      thread_id: "stopped-new-running-turn",
+      role: "active",
+      status: "stopped",
+      active_turn_id: "turn-stopped-new-running",
+      runtime_mode: "full-access",
+      interaction_mode: "plan",
+      title: "Stopped New Running Turn",
+      project_id: "project-1",
+      injected_at: null,
+    });
     assert.deepStrictEqual(threadsById.get("stopped-interrupted-turn"), {
       thread_id: "stopped-interrupted-turn",
       role: "active",
@@ -626,6 +664,29 @@ describe("capture-active-threads", () => {
       interaction_mode: "plan",
       title: "Stopped Interrupted Turn",
       project_id: "project-1",
+      injected_at: null,
+    });
+    assert.deepStrictEqual(threadsById.get("interrupted-current-turn"), {
+      thread_id: "interrupted-current-turn",
+      role: "active",
+      status: "interrupted",
+      active_turn_id: "turn-interrupted-current",
+      runtime_mode: "full-access",
+      interaction_mode: "plan",
+      title: "Interrupted Current Turn",
+      project_id: "project-1",
+      injected_at: null,
+    });
+    assert.deepStrictEqual(threadsById.get("interrupted-current-pending-turn"), {
+      thread_id: "interrupted-current-pending-turn",
+      role: "active",
+      status: "interrupted",
+      active_turn_id: null,
+      runtime_mode: "full-access",
+      interaction_mode: "plan",
+      title: "Interrupted Current Pending Turn",
+      project_id: "project-1",
+      pending_message: expectedPendingMessage("interrupted-current-pending-turn"),
       injected_at: null,
     });
     assert.equal(threadsById.has("stopped-stale-pending-turn"), false);
@@ -639,6 +700,7 @@ describe("capture-active-threads", () => {
       stoppedSince: "2026-07-03T00:00:02.900Z",
       pendingSince: "2026-07-03T00:00:02.000Z",
       includedPendingMessageIds: ["message-stopped-stale-pending-turn"],
+      includedActiveThreadIds: ["stopped-interrupted-turn", "interrupted-current-turn"],
       // @effect-diagnostics-next-line globalDate:off - deterministic fixture timestamp.
       capturedAt: new Date("2026-07-03T21:00:00.000Z"),
     });
@@ -658,6 +720,23 @@ describe("capture-active-threads", () => {
       pending_message: expectedPendingMessage("stopped-stale-pending-turn"),
       injected_at: null,
     });
+  });
+
+  it("rejects stopped-only capture without a pre-stop activity boundary", () => {
+    const tempDir = makeTempDir();
+    const dbPath = makeFixtureDb(tempDir);
+
+    assert.throws(
+      () =>
+        captureActiveThreads({
+          dbPath,
+          outPath: NodePath.join(tempDir, "resume-manifest.json"),
+          stoppedSince: "2026-07-03T00:00:02.900Z",
+          // @effect-diagnostics-next-line globalDate:off - deterministic fixture timestamp.
+          capturedAt: new Date("2026-07-03T21:00:00.000Z"),
+        }),
+      /--stopped-since requires --pending-since or at least one --include-active-thread-id/u,
+    );
   });
 
   it("writes an empty manifest and exits successfully when no active sessions are captured", () => {
@@ -790,6 +869,7 @@ describe("capture-active-threads", () => {
         stoppedSince: null,
         pendingSince: null,
         includedPendingMessageIds: [],
+        includedActiveThreadIds: [],
       },
     );
 
@@ -808,6 +888,8 @@ describe("capture-active-threads", () => {
           "2026-07-03T00:00:01.000Z",
           "--include-pending-message-id",
           "message-1",
+          "--include-active-thread-id",
+          "thread-active",
         ],
         {
           T3DR_DB: "/tmp/from-env.sqlite",
@@ -820,6 +902,7 @@ describe("capture-active-threads", () => {
         stoppedSince: "2026-07-03T00:00:02.000Z",
         pendingSince: "2026-07-03T00:00:01.000Z",
         includedPendingMessageIds: ["message-1"],
+        includedActiveThreadIds: ["thread-active"],
       },
     );
   });

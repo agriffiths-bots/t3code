@@ -18,6 +18,7 @@ export interface CaptureActiveThreadsOptions {
   readonly stoppedSince?: string | null;
   readonly pendingSince?: string | null;
   readonly includedPendingMessageIds?: ReadonlyArray<string>;
+  readonly includedActiveThreadIds?: ReadonlyArray<string>;
   readonly capturedAt?: Date;
   readonly openDatabase?: (dbPath: string) => CaptureDatabase;
 }
@@ -92,12 +93,29 @@ interface ParsedArgs {
   readonly stoppedSince: string | null;
   readonly pendingSince: string | null;
   readonly includedPendingMessageIds: ReadonlyArray<string>;
+  readonly includedActiveThreadIds: ReadonlyArray<string>;
 }
 
 function dbFileUri(dbPath: string): string {
   const url = NodeURL.pathToFileURL(NodePath.resolve(dbPath));
   url.searchParams.set("mode", "ro");
   return url.href;
+}
+
+function validateCaptureBoundaries(input: {
+  readonly stoppedSince: string | null;
+  readonly pendingSince: string | null;
+  readonly includedActiveThreadIds: ReadonlyArray<string>;
+}): void {
+  if (
+    input.stoppedSince !== null &&
+    input.pendingSince === null &&
+    input.includedActiveThreadIds.length === 0
+  ) {
+    throw new Error(
+      "--stopped-since requires --pending-since or at least one --include-active-thread-id",
+    );
+  }
 }
 
 export function openCaptureDatabase(dbPath: string): CaptureDatabase {
@@ -117,6 +135,7 @@ function roleForRow(row: SessionRow): CapturedThread["role"] {
 function buildCaptureQuery(
   excludedThreadIds: ReadonlyArray<string>,
   includedPendingMessageIds: ReadonlyArray<string>,
+  includedActiveThreadIds: ReadonlyArray<string>,
 ) {
   const excludedClause =
     excludedThreadIds.length > 0
@@ -132,19 +151,34 @@ function buildCaptureQuery(
           .map(() => "(?)")
           .join(", ")})`
       : "included_pending_messages(message_id) AS (SELECT NULL WHERE 0)";
-  const stoppedDuringCapturePredicate = `(
-          capture_options.stopped_since IS NOT NULL
-          AND sessions.status = 'stopped'
-          AND sessions.updated_at >= capture_options.stopped_since
-        )`;
+  const includedActiveThreadsCte =
+    includedActiveThreadIds.length > 0
+      ? `included_active_threads(thread_id) AS (VALUES ${includedActiveThreadIds
+          .map(() => "(?)")
+          .join(", ")})`
+      : "included_active_threads(thread_id) AS (SELECT NULL WHERE 0)";
   const terminalDuringCapturePredicate = `(
           capture_options.stopped_since IS NOT NULL
           AND sessions.status IN ('error', 'interrupted', 'stopped')
           AND sessions.updated_at >= capture_options.stopped_since
         )`;
-  const stoppedPendingDuringCapturePredicate = `(
+  const terminalTurnAfterPreStopPredicate = `(
           capture_options.pending_since IS NOT NULL
-          AND ${stoppedDuringCapturePredicate}
+          AND (
+            candidate_resumable_turns.requested_at >= capture_options.pending_since
+            OR candidate_resumable_turns.started_at >= capture_options.pending_since
+          )
+        )`;
+  const terminalActiveDuringCapturePredicate = `(
+          ${terminalDuringCapturePredicate}
+          AND (
+            threads.thread_id IN (SELECT thread_id FROM included_active_threads)
+            OR ${terminalTurnAfterPreStopPredicate}
+          )
+        )`;
+  const terminalPendingDuringCapturePredicate = `(
+          capture_options.pending_since IS NOT NULL
+          AND ${terminalDuringCapturePredicate}
           AND (
             pending_turns.requested_at >= capture_options.pending_since
             ${includedPendingMessageClause}
@@ -162,7 +196,7 @@ function buildCaptureQuery(
           pending_turns.thread_id IS NOT NULL
           AND (
             sessions.updated_at IS NULL
-            OR ${stoppedPendingDuringCapturePredicate}
+            OR ${terminalPendingDuringCapturePredicate}
             OR (
               sessions.status IN ('error', 'interrupted', 'stopped')
               AND pending_turns.requested_at > sessions.updated_at
@@ -182,7 +216,8 @@ function buildCaptureQuery(
   return `
     WITH
       capture_options(stopped_since, pending_since) AS (VALUES (?, ?)),
-      ${includedPendingMessagesCte}
+      ${includedPendingMessagesCte},
+      ${includedActiveThreadsCte}
     SELECT
       threads.thread_id,
       COALESCE(sessions.status, 'ready') AS status,
@@ -283,11 +318,11 @@ function buildCaptureQuery(
               candidate_resumable_turns.state = 'running'
               AND (
                 sessions.status NOT IN ('error', 'interrupted', 'stopped')
-                OR ${terminalDuringCapturePredicate}
+                OR ${terminalActiveDuringCapturePredicate}
               )
             )
             OR (
-              ${stoppedDuringCapturePredicate}
+              ${terminalActiveDuringCapturePredicate}
               AND candidate_resumable_turns.state = 'interrupted'
               AND candidate_resumable_turns.completed_at IS NOT NULL
               AND candidate_resumable_turns.completed_at >= capture_options.stopped_since
@@ -421,13 +456,17 @@ function readCapturedThreads(
   stoppedSince: string | null,
   pendingSince: string | null,
   includedPendingMessageIds: ReadonlyArray<string>,
+  includedActiveThreadIds: ReadonlyArray<string>,
 ): ReadonlyArray<CapturedThread> {
   const rows = db
-    .prepare(buildCaptureQuery(excludedThreadIds, includedPendingMessageIds))
+    .prepare(
+      buildCaptureQuery(excludedThreadIds, includedPendingMessageIds, includedActiveThreadIds),
+    )
     .all(
       stoppedSince,
       pendingSince,
       ...includedPendingMessageIds,
+      ...includedActiveThreadIds,
       ...excludedThreadIds,
     ) as unknown as ReadonlyArray<SessionRow>;
 
@@ -473,14 +512,24 @@ function writeJsonAtomic(outPath: string, manifest: CaptureManifest): void {
 }
 
 export function captureActiveThreads(options: CaptureActiveThreadsOptions): CaptureManifest {
+  const stoppedSince = options.stoppedSince ?? null;
+  const pendingSince = options.pendingSince ?? null;
+  const includedActiveThreadIds = options.includedActiveThreadIds ?? [];
+  validateCaptureBoundaries({
+    stoppedSince,
+    pendingSince,
+    includedActiveThreadIds,
+  });
+
   const db = (options.openDatabase ?? openCaptureDatabase)(options.dbPath);
   try {
     const threads = readCapturedThreads(
       db,
       options.excludedThreadIds ?? [],
-      options.stoppedSince ?? null,
-      options.pendingSince ?? null,
+      stoppedSince,
+      pendingSince,
       options.includedPendingMessageIds ?? [],
+      includedActiveThreadIds,
     );
     const manifest = {
       version: 1,
@@ -516,6 +565,7 @@ export function parseArgs(
   let pendingSince: string | null = null;
   const excludedThreadIds: Array<string> = [];
   const includedPendingMessageIds: Array<string> = [];
+  const includedActiveThreadIds: Array<string> = [];
 
   for (let index = 0; index < args.length; index += 1) {
     const arg = args[index];
@@ -544,10 +594,14 @@ export function parseArgs(
         includedPendingMessageIds.push(requireValue(args, index, arg));
         index += 1;
         break;
+      case "--include-active-thread-id":
+        includedActiveThreadIds.push(requireValue(args, index, arg));
+        index += 1;
+        break;
       case "--help":
       case "-h":
         throw new Error(
-          "Usage: capture-active-threads --db PATH --out FILE [--exclude THREAD_ID]... [--stopped-since ISO_TIME] [--pending-since ISO_TIME] [--include-pending-message-id MESSAGE_ID]...",
+          "Usage: capture-active-threads --db PATH --out FILE [--exclude THREAD_ID]... [--stopped-since ISO_TIME (--pending-since ISO_TIME | --include-active-thread-id THREAD_ID...)] [--include-pending-message-id MESSAGE_ID]...",
         );
       default:
         throw new Error(`Unknown argument: ${arg}`);
@@ -565,6 +619,7 @@ export function parseArgs(
     stoppedSince,
     pendingSince,
     includedPendingMessageIds,
+    includedActiveThreadIds,
   };
 }
 
@@ -581,6 +636,7 @@ export function runCli(
       stoppedSince: parsed.stoppedSince,
       pendingSince: parsed.pendingSince,
       includedPendingMessageIds: parsed.includedPendingMessageIds,
+      includedActiveThreadIds: parsed.includedActiveThreadIds,
     });
     const activeCount = manifest.threads.filter((thread) => thread.role === "active").length;
     NodeProcess.stdout.write(`${activeCount}\n`);

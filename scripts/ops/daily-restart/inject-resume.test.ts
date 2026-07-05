@@ -314,6 +314,7 @@ describe("inject-resume", () => {
       },
     ]);
     const requests: Array<any> = [];
+    const events: Array<string> = [];
 
     const result = await injectResume({
       manifestPath,
@@ -322,12 +323,36 @@ describe("inject-resume", () => {
       dryRun: false,
       now: () => new Date("2026-07-03T13:00:00.000Z"),
       fetchImpl: async (_url: string | URL | Request, init?: RequestInit) => {
-        requests.push(JSON.parse(String(init?.body)));
+        if (init?.method === "GET") {
+          events.push("snapshot");
+          const resumeRequest = requests.find((request) => request.type === "thread.turn.start");
+          return new Response(
+            JSON.stringify({
+              threads: [
+                {
+                  id: "active-with-queued",
+                  messages: [{ id: resumeRequest?.message.messageId, turnId: "turn-resume" }],
+                },
+              ],
+            }),
+            { status: 200 },
+          );
+        }
+        const request = JSON.parse(String(init?.body));
+        requests.push(request);
+        events.push(request.type);
         return new Response("{}", { status: 200 });
       },
     });
 
     assert.deepEqual(result, { injected: 1, skipped: 0, failed: 0, failures: [] });
+    assert.deepEqual(events, [
+      "snapshot",
+      "thread.interaction-mode.set",
+      "thread.turn.start",
+      "snapshot",
+      "thread.turn.start",
+    ]);
     assert.deepEqual(
       requests.map((request) => request.type),
       ["thread.interaction-mode.set", "thread.turn.start", "thread.turn.start"],
@@ -352,6 +377,175 @@ describe("inject-resume", () => {
       planId: "plan-queued",
     });
     assert.notEqual(requests[1]?.commandId, requests[2]?.commandId);
+  });
+
+  it("preflights snapshot read access before dispatching queued resumes", async () => {
+    const manifestPath = await writeManifest([
+      {
+        thread_id: "active-with-queued-read-denied",
+        role: "active",
+        status: "running",
+        active_turn_id: "turn-active",
+        pending_message: {
+          message_id: "message-queued",
+          role: "user",
+          text: "Queued prompt",
+          attachments: [],
+        },
+        injected_at: null,
+      },
+    ]);
+    const requests: Array<any> = [];
+
+    const result = await injectResume({
+      manifestPath,
+      origin: "http://127.0.0.1:1",
+      token: "test-token",
+      dryRun: false,
+      now: () => new Date("2026-07-03T13:00:00.000Z"),
+      fetchImpl: async (_url: string | URL | Request, init?: RequestInit) => {
+        if (init?.method === "GET") return new Response("forbidden", { status: 403 });
+        requests.push(JSON.parse(String(init?.body)));
+        return new Response("{}", { status: 200 });
+      },
+    });
+
+    assert.equal(result.injected, 0);
+    assert.equal(result.failed, 1);
+    assert.equal(result.failures[0]?.threadId, "active-with-queued-read-denied");
+    assert.match(
+      result.failures[0]?.error ?? "",
+      /snapshot read access before dispatch.*HTTP 403/u,
+    );
+    assert.deepEqual(requests, []);
+  });
+
+  it("retries transient snapshot preflight failures before queued resumes", async () => {
+    const manifestPath = await writeManifest([
+      {
+        thread_id: "active-with-queued-transient-read",
+        role: "active",
+        status: "running",
+        active_turn_id: "turn-active",
+        pending_message: {
+          message_id: "message-queued",
+          role: "user",
+          text: "Queued prompt",
+          attachments: [],
+        },
+        injected_at: null,
+      },
+    ]);
+    const requests: Array<any> = [];
+    const delays: Array<number> = [];
+    let snapshotAttempts = 0;
+
+    const result = await injectResume({
+      manifestPath,
+      origin: "http://127.0.0.1:1",
+      token: "test-token",
+      dryRun: false,
+      now: () => new Date("2026-07-03T13:00:00.000Z"),
+      fetchImpl: async (_url: string | URL | Request, init?: RequestInit) => {
+        if (init?.method === "GET") {
+          snapshotAttempts += 1;
+          if (snapshotAttempts === 1) return new Response("warming", { status: 503 });
+          const resumeRequest = requests.find((request) => request.type === "thread.turn.start");
+          return new Response(
+            JSON.stringify({
+              threads: [
+                {
+                  id: "active-with-queued-transient-read",
+                  messages: [{ id: resumeRequest?.message.messageId, turnId: "turn-resume" }],
+                },
+              ],
+            }),
+            { status: 200 },
+          );
+        }
+        const request = JSON.parse(String(init?.body));
+        requests.push(request);
+        return new Response("{}", { status: 200 });
+      },
+      sleep: async (ms) => {
+        delays.push(ms);
+      },
+      random: () => 0.5,
+    });
+
+    assert.deepEqual(result, { injected: 1, skipped: 0, failed: 0, failures: [] });
+    assert.equal(snapshotAttempts, 3);
+    assert.deepEqual(delays, [4_000]);
+    assert.deepEqual(
+      requests.map((request) => request.type),
+      ["thread.interaction-mode.set", "thread.turn.start", "thread.turn.start"],
+    );
+  });
+
+  it("bounds queued replay waits by the resume-start timeout", async () => {
+    const manifestPath = await writeManifest([
+      {
+        thread_id: "active-with-hung-snapshot",
+        role: "active",
+        status: "running",
+        active_turn_id: "turn-active",
+        runtime_mode: "approval-required",
+        interaction_mode: "default",
+        pending_message: {
+          message_id: "message-queued",
+          role: "user",
+          text: "Queued prompt",
+          attachments: [],
+        },
+        injected_at: null,
+      },
+    ]);
+    const requests: Array<any> = [];
+    let snapshotAttempts = 0;
+
+    const result = await injectResume({
+      manifestPath,
+      origin: "http://127.0.0.1:1",
+      token: "test-token",
+      dryRun: false,
+      dispatchAttemptTimeoutMs: 50,
+      resumeStartTimeoutMs: 1,
+      resumeStartPollMs: 1,
+      sleep: async () => undefined,
+      now: () => new Date("2026-07-03T13:00:00.000Z"),
+      fetchImpl: async (_url: string | URL | Request, init?: RequestInit) => {
+        if (init?.method === "GET") {
+          snapshotAttempts += 1;
+          if (snapshotAttempts === 1) {
+            return new Response(JSON.stringify({ threads: [] }), { status: 200 });
+          }
+          return await new Promise<Response>((_resolve, reject) => {
+            const abortError = () => {
+              const error = new Error("aborted");
+              error.name = "AbortError";
+              return error;
+            };
+            if (init.signal?.aborted) {
+              reject(abortError());
+              return;
+            }
+            init.signal?.addEventListener("abort", () => reject(abortError()), { once: true });
+          });
+        }
+        const request = JSON.parse(String(init?.body));
+        requests.push(request);
+        return new Response("{}", { status: 200 });
+      },
+    });
+
+    assert.equal(result.injected, 0);
+    assert.equal(result.failed, 1);
+    assert.match(result.failures[0]?.error ?? "", /queued replay timeout/u);
+    assert.equal(snapshotAttempts, 2);
+    assert.deepEqual(
+      requests.map((request) => request.type),
+      ["thread.interaction-mode.set", "thread.turn.start"],
+    );
   });
 
   it("does not let queued attachment failures block interrupted active resumes", async () => {
@@ -383,6 +577,7 @@ describe("inject-resume", () => {
       },
     ]);
     const requests: Array<any> = [];
+    const events: Array<string> = [];
 
     const result = await injectResume({
       manifestPath,
@@ -391,7 +586,24 @@ describe("inject-resume", () => {
       dryRun: false,
       now: () => new Date("2026-07-03T13:00:00.000Z"),
       fetchImpl: async (_url: string | URL | Request, init?: RequestInit) => {
-        requests.push(JSON.parse(String(init?.body)));
+        if (init?.method === "GET") {
+          events.push("snapshot");
+          const resumeRequest = requests.find((request) => request.type === "thread.turn.start");
+          return new Response(
+            JSON.stringify({
+              threads: [
+                {
+                  id: "active-with-bad-queued-attachment",
+                  messages: [{ id: resumeRequest?.message.messageId, turnId: "turn-resume" }],
+                },
+              ],
+            }),
+            { status: 200 },
+          );
+        }
+        const request = JSON.parse(String(init?.body));
+        requests.push(request);
+        events.push(request.type);
         return new Response("{}", { status: 200 });
       },
     });
@@ -404,6 +616,12 @@ describe("inject-resume", () => {
       requests.map((request) => request.type),
       ["thread.interaction-mode.set", "thread.turn.start"],
     );
+    assert.deepEqual(events, [
+      "snapshot",
+      "thread.interaction-mode.set",
+      "thread.turn.start",
+      "snapshot",
+    ]);
     assert.equal(requests[1]?.message.text, RESUME_MESSAGE);
     assert.equal(requests[1]?.runtimeMode, "approval-required");
     assert.equal(requests[1]?.interactionMode, "default");
