@@ -175,6 +175,229 @@ it.layer(BaseTestLayer)("OrchestrationProjectionPipeline", (it) => {
   );
 });
 
+it.layer(Layer.fresh(makeProjectionPipelinePrefixedTestLayer("t3-projection-system-wake-revert-")))(
+  "OrchestrationProjectionPipeline",
+  (it) => {
+    it.effect("prunes sub-agent wake system messages when their turn is reverted", () =>
+      Effect.gen(function* () {
+        const projectionPipeline = yield* OrchestrationProjectionPipeline;
+        const eventStore = yield* OrchestrationEventStore;
+        const sql = yield* SqlClient.SqlClient;
+        const now = "2026-01-01T00:00:00.000Z";
+        const threadId = ThreadId.make("thread-system-wake");
+        const messageId = MessageId.make("message-system-wake");
+        const turnId = TurnId.make("turn-system-wake");
+
+        yield* eventStore.append({
+          type: "thread.created",
+          eventId: EventId.make("evt-system-wake-create"),
+          aggregateKind: "thread",
+          aggregateId: threadId,
+          occurredAt: now,
+          commandId: CommandId.make("cmd-system-wake-create"),
+          causationEventId: null,
+          correlationId: CommandId.make("cmd-system-wake-create"),
+          metadata: {},
+          payload: {
+            threadId,
+            projectId: ProjectId.make("project-1"),
+            title: "Thread 1",
+            modelSelection: {
+              instanceId: ProviderInstanceId.make("codex"),
+              model: "gpt-5-codex",
+            },
+            runtimeMode: "full-access",
+            branch: null,
+            worktreePath: null,
+            createdAt: now,
+            updatedAt: now,
+          },
+        });
+
+        yield* eventStore.append({
+          type: "thread.message-sent",
+          eventId: EventId.make("evt-system-wake-message"),
+          aggregateKind: "thread",
+          aggregateId: threadId,
+          occurredAt: "2026-01-01T00:00:01.000Z",
+          commandId: CommandId.make("cmd-system-wake-message"),
+          causationEventId: null,
+          correlationId: CommandId.make("cmd-system-wake-message"),
+          metadata: {},
+          payload: {
+            threadId,
+            messageId,
+            role: "system",
+            text: "[sub-agent child-1 completed] done",
+            turnId: null,
+            streaming: false,
+            createdAt: "2026-01-01T00:00:01.000Z",
+            updatedAt: "2026-01-01T00:00:01.000Z",
+          },
+        });
+
+        yield* eventStore.append({
+          type: "thread.turn-start-requested",
+          eventId: EventId.make("evt-system-wake-turn-requested"),
+          aggregateKind: "thread",
+          aggregateId: threadId,
+          occurredAt: "2026-01-01T00:00:01.000Z",
+          commandId: CommandId.make("cmd-system-wake-turn-requested"),
+          causationEventId: null,
+          correlationId: CommandId.make("cmd-system-wake-turn-requested"),
+          metadata: {},
+          payload: {
+            threadId,
+            messageId,
+            createdAt: "2026-01-01T00:00:01.000Z",
+          },
+        });
+
+        yield* eventStore.append({
+          type: "thread.session-set",
+          eventId: EventId.make("evt-system-wake-session"),
+          aggregateKind: "thread",
+          aggregateId: threadId,
+          occurredAt: "2026-01-01T00:00:02.000Z",
+          commandId: CommandId.make("cmd-system-wake-session"),
+          causationEventId: null,
+          correlationId: CommandId.make("cmd-system-wake-session"),
+          metadata: {},
+          payload: {
+            threadId,
+            session: {
+              threadId,
+              status: "running",
+              providerName: "codex",
+              runtimeMode: "full-access",
+              activeTurnId: turnId,
+              lastError: null,
+              updatedAt: "2026-01-01T00:00:02.000Z",
+            },
+          },
+        });
+
+        yield* eventStore.append({
+          type: "thread.turn-diff-completed",
+          eventId: EventId.make("evt-system-wake-diff"),
+          aggregateKind: "thread",
+          aggregateId: threadId,
+          occurredAt: "2026-01-01T00:00:03.000Z",
+          commandId: CommandId.make("cmd-system-wake-diff"),
+          causationEventId: null,
+          correlationId: CommandId.make("cmd-system-wake-diff"),
+          metadata: {},
+          payload: {
+            threadId,
+            turnId,
+            checkpointTurnCount: 1,
+            checkpointRef: CheckpointRef.make("refs/t3/checkpoints/thread-system-wake/turn/1"),
+            status: "ready",
+            files: [],
+            assistantMessageId: null,
+            completedAt: "2026-01-01T00:00:03.000Z",
+          },
+        });
+
+        yield* eventStore.append({
+          type: "thread.reverted",
+          eventId: EventId.make("evt-system-wake-revert"),
+          aggregateKind: "thread",
+          aggregateId: threadId,
+          occurredAt: "2026-01-01T00:00:04.000Z",
+          commandId: CommandId.make("cmd-system-wake-revert"),
+          causationEventId: null,
+          correlationId: CommandId.make("cmd-system-wake-revert"),
+          metadata: {},
+          payload: {
+            threadId,
+            turnCount: 0,
+          },
+        });
+
+        yield* projectionPipeline.bootstrap;
+
+        const messageRows = yield* sql<{ readonly messageId: string }>`
+          SELECT message_id AS "messageId"
+          FROM projection_thread_messages
+          WHERE thread_id = ${threadId}
+        `;
+        assert.deepEqual(messageRows, []);
+      }),
+    );
+
+    it.effect("uses sub-agent wake system messages as latest prompt timestamps", () =>
+      Effect.gen(function* () {
+        const projectionPipeline = yield* OrchestrationProjectionPipeline;
+        const eventStore = yield* OrchestrationEventStore;
+        const sql = yield* SqlClient.SqlClient;
+        const now = "2026-01-01T01:00:00.000Z";
+        const wakeAt = "2026-01-01T01:00:03.000Z";
+        const threadId = ThreadId.make("thread-system-wake-recency");
+        const appendAndProject = (event: Parameters<typeof eventStore.append>[0]) =>
+          eventStore
+            .append(event)
+            .pipe(Effect.flatMap((savedEvent) => projectionPipeline.projectEvent(savedEvent)));
+
+        yield* appendAndProject({
+          type: "thread.created",
+          eventId: EventId.make("evt-system-wake-recency-create"),
+          aggregateKind: "thread",
+          aggregateId: threadId,
+          occurredAt: now,
+          commandId: CommandId.make("cmd-system-wake-recency-create"),
+          causationEventId: null,
+          correlationId: CommandId.make("cmd-system-wake-recency-create"),
+          metadata: {},
+          payload: {
+            threadId,
+            projectId: ProjectId.make("project-1"),
+            title: "Thread 1",
+            modelSelection: {
+              instanceId: ProviderInstanceId.make("codex"),
+              model: "gpt-5-codex",
+            },
+            runtimeMode: "full-access",
+            branch: null,
+            worktreePath: null,
+            createdAt: now,
+            updatedAt: now,
+          },
+        });
+
+        yield* appendAndProject({
+          type: "thread.message-sent",
+          eventId: EventId.make("evt-system-wake-recency-message"),
+          aggregateKind: "thread",
+          aggregateId: threadId,
+          occurredAt: wakeAt,
+          commandId: CommandId.make("cmd-system-wake-recency-message"),
+          causationEventId: null,
+          correlationId: CommandId.make("cmd-system-wake-recency-message"),
+          metadata: {},
+          payload: {
+            threadId,
+            messageId: MessageId.make("message-system-wake-recency"),
+            role: "system",
+            text: "[sub-agent child-1 completed] done",
+            turnId: null,
+            streaming: false,
+            createdAt: wakeAt,
+            updatedAt: wakeAt,
+          },
+        });
+
+        const threadRows = yield* sql<{ readonly latestUserMessageAt: string | null }>`
+          SELECT latest_user_message_at AS "latestUserMessageAt"
+          FROM projection_threads
+          WHERE thread_id = ${threadId}
+        `;
+        assert.deepEqual(threadRows, [{ latestUserMessageAt: wakeAt }]);
+      }),
+    );
+  },
+);
+
 it.layer(Layer.fresh(makeProjectionPipelinePrefixedTestLayer("t3-base-")))(
   "OrchestrationProjectionPipeline",
   (it) => {
@@ -2233,7 +2456,7 @@ it.layer(BaseTestLayer)("OrchestrationProjectionPipeline", (it) => {
     }),
   );
 
-  it.effect("does not fallback-retain messages whose turnId is removed by revert", () =>
+  it.effect("does not fallback-retain removed or unrelated prompt messages after revert", () =>
     Effect.gen(function* () {
       const projectionPipeline = yield* OrchestrationProjectionPipeline;
       const eventStore = yield* OrchestrationEventStore;
@@ -2317,10 +2540,32 @@ it.layer(BaseTestLayer)("OrchestrationProjectionPipeline", (it) => {
         eventId: EventId.make("evt-revert-4"),
         aggregateKind: "thread",
         aggregateId: ThreadId.make("thread-revert"),
-        occurredAt: "2026-02-26T12:00:02.100Z",
+        occurredAt: "2026-02-26T12:00:02.050Z",
         commandId: CommandId.make("cmd-revert-4"),
         causationEventId: null,
         correlationId: CorrelationId.make("cmd-revert-4"),
+        metadata: {},
+        payload: {
+          threadId: ThreadId.make("thread-revert"),
+          messageId: MessageId.make("system-wake-keep"),
+          role: "system",
+          text: "[sub-agent child-1 completed] done",
+          turnId: TurnId.make("turn-1"),
+          streaming: false,
+          createdAt: "2026-02-26T12:00:02.050Z",
+          updatedAt: "2026-02-26T12:00:02.050Z",
+        },
+      });
+
+      yield* appendAndProject({
+        type: "thread.message-sent",
+        eventId: EventId.make("evt-revert-5"),
+        aggregateKind: "thread",
+        aggregateId: ThreadId.make("thread-revert"),
+        occurredAt: "2026-02-26T12:00:02.100Z",
+        commandId: CommandId.make("cmd-revert-5"),
+        causationEventId: null,
+        correlationId: CorrelationId.make("cmd-revert-5"),
         metadata: {},
         payload: {
           threadId: ThreadId.make("thread-revert"),
@@ -2336,13 +2581,13 @@ it.layer(BaseTestLayer)("OrchestrationProjectionPipeline", (it) => {
 
       yield* appendAndProject({
         type: "thread.turn-diff-completed",
-        eventId: EventId.make("evt-revert-5"),
+        eventId: EventId.make("evt-revert-6"),
         aggregateKind: "thread",
         aggregateId: ThreadId.make("thread-revert"),
         occurredAt: "2026-02-26T12:00:03.000Z",
-        commandId: CommandId.make("cmd-revert-5"),
+        commandId: CommandId.make("cmd-revert-6"),
         causationEventId: null,
-        correlationId: CorrelationId.make("cmd-revert-5"),
+        correlationId: CorrelationId.make("cmd-revert-6"),
         metadata: {},
         payload: {
           threadId: ThreadId.make("thread-revert"),
@@ -2358,13 +2603,13 @@ it.layer(BaseTestLayer)("OrchestrationProjectionPipeline", (it) => {
 
       yield* appendAndProject({
         type: "thread.message-sent",
-        eventId: EventId.make("evt-revert-6"),
+        eventId: EventId.make("evt-revert-7"),
         aggregateKind: "thread",
         aggregateId: ThreadId.make("thread-revert"),
         occurredAt: "2026-02-26T12:00:03.050Z",
-        commandId: CommandId.make("cmd-revert-6"),
+        commandId: CommandId.make("cmd-revert-7"),
         causationEventId: null,
-        correlationId: CorrelationId.make("cmd-revert-6"),
+        correlationId: CorrelationId.make("cmd-revert-7"),
         metadata: {},
         payload: {
           threadId: ThreadId.make("thread-revert"),
@@ -2380,13 +2625,13 @@ it.layer(BaseTestLayer)("OrchestrationProjectionPipeline", (it) => {
 
       yield* appendAndProject({
         type: "thread.message-sent",
-        eventId: EventId.make("evt-revert-7"),
+        eventId: EventId.make("evt-revert-8"),
         aggregateKind: "thread",
         aggregateId: ThreadId.make("thread-revert"),
         occurredAt: "2026-02-26T12:00:03.100Z",
-        commandId: CommandId.make("cmd-revert-7"),
+        commandId: CommandId.make("cmd-revert-8"),
         causationEventId: null,
-        correlationId: CorrelationId.make("cmd-revert-7"),
+        correlationId: CorrelationId.make("cmd-revert-8"),
         metadata: {},
         payload: {
           threadId: ThreadId.make("thread-revert"),
@@ -2401,14 +2646,36 @@ it.layer(BaseTestLayer)("OrchestrationProjectionPipeline", (it) => {
       });
 
       yield* appendAndProject({
+        type: "thread.message-sent",
+        eventId: EventId.make("evt-revert-9"),
+        aggregateKind: "thread",
+        aggregateId: ThreadId.make("thread-revert"),
+        occurredAt: "2026-02-26T12:00:03.200Z",
+        commandId: CommandId.make("cmd-revert-9"),
+        causationEventId: null,
+        correlationId: CorrelationId.make("cmd-revert-9"),
+        metadata: {},
+        payload: {
+          threadId: ThreadId.make("thread-revert"),
+          messageId: MessageId.make("user-unrelated"),
+          role: "user",
+          text: "unrelated pending user",
+          turnId: null,
+          streaming: false,
+          createdAt: "2026-02-26T12:00:03.200Z",
+          updatedAt: "2026-02-26T12:00:03.200Z",
+        },
+      });
+
+      yield* appendAndProject({
         type: "thread.reverted",
-        eventId: EventId.make("evt-revert-8"),
+        eventId: EventId.make("evt-revert-10"),
         aggregateKind: "thread",
         aggregateId: ThreadId.make("thread-revert"),
         occurredAt: "2026-02-26T12:00:04.000Z",
-        commandId: CommandId.make("cmd-revert-8"),
+        commandId: CommandId.make("cmd-revert-10"),
         causationEventId: null,
-        correlationId: CorrelationId.make("cmd-revert-8"),
+        correlationId: CorrelationId.make("cmd-revert-10"),
         metadata: {},
         payload: {
           threadId: ThreadId.make("thread-revert"),
@@ -2431,6 +2698,11 @@ it.layer(BaseTestLayer)("OrchestrationProjectionPipeline", (it) => {
       `;
       assert.deepEqual(messageRows, [
         {
+          messageId: "system-wake-keep",
+          turnId: "turn-1",
+          role: "system",
+        },
+        {
           messageId: "assistant-keep",
           turnId: "turn-1",
           role: "assistant",
@@ -2439,6 +2711,162 @@ it.layer(BaseTestLayer)("OrchestrationProjectionPipeline", (it) => {
     }),
   );
 });
+
+it.layer(Layer.fresh(makeProjectionPipelinePrefixedTestLayer("t3-projection-precreated-turn-")))(
+  "OrchestrationProjectionPipeline",
+  (it) => {
+    it.effect("reconciles pending metadata when provider output creates the turn first", () =>
+      Effect.gen(function* () {
+        const projectionPipeline = yield* OrchestrationProjectionPipeline;
+        const eventStore = yield* OrchestrationEventStore;
+        const sql = yield* SqlClient.SqlClient;
+        const appendAndProject = (event: Parameters<typeof eventStore.append>[0]) =>
+          eventStore
+            .append(event)
+            .pipe(Effect.flatMap((savedEvent) => projectionPipeline.projectEvent(savedEvent)));
+
+        const threadId = ThreadId.make("thread-precreated-turn");
+        const turnId = TurnId.make("turn-precreated");
+        const messageId = MessageId.make("message-precreated-prompt");
+        const sourcePlanThreadId = ThreadId.make("thread-source-plan");
+        const sourcePlanId = "plan-source";
+
+        yield* appendAndProject({
+          type: "thread.created",
+          eventId: EventId.make("evt-precreated-create"),
+          aggregateKind: "thread",
+          aggregateId: threadId,
+          occurredAt: "2026-02-26T15:00:00.000Z",
+          commandId: CommandId.make("cmd-precreated-create"),
+          causationEventId: null,
+          correlationId: CorrelationId.make("cmd-precreated-create"),
+          metadata: {},
+          payload: {
+            threadId,
+            projectId: ProjectId.make("project-1"),
+            title: "Thread precreated turn",
+            modelSelection: {
+              instanceId: ProviderInstanceId.make("codex"),
+              model: "gpt-5-codex",
+            },
+            runtimeMode: "full-access",
+            branch: null,
+            worktreePath: null,
+            createdAt: "2026-02-26T15:00:00.000Z",
+            updatedAt: "2026-02-26T15:00:00.000Z",
+          },
+        });
+
+        yield* appendAndProject({
+          type: "thread.turn-start-requested",
+          eventId: EventId.make("evt-precreated-request"),
+          aggregateKind: "thread",
+          aggregateId: threadId,
+          occurredAt: "2026-02-26T15:00:01.000Z",
+          commandId: CommandId.make("cmd-precreated-request"),
+          causationEventId: null,
+          correlationId: CorrelationId.make("cmd-precreated-request"),
+          metadata: {},
+          payload: {
+            threadId,
+            messageId,
+            sourceProposedPlan: {
+              threadId: sourcePlanThreadId,
+              planId: sourcePlanId,
+            },
+            runtimeMode: "full-access",
+            createdAt: "2026-02-26T15:00:01.000Z",
+          },
+        });
+
+        yield* appendAndProject({
+          type: "thread.message-sent",
+          eventId: EventId.make("evt-precreated-assistant"),
+          aggregateKind: "thread",
+          aggregateId: threadId,
+          occurredAt: "2026-02-26T15:00:02.000Z",
+          commandId: CommandId.make("cmd-precreated-assistant"),
+          causationEventId: null,
+          correlationId: CorrelationId.make("cmd-precreated-assistant"),
+          metadata: {},
+          payload: {
+            threadId,
+            messageId: MessageId.make("message-precreated-assistant"),
+            role: "assistant",
+            text: "working",
+            turnId,
+            streaming: true,
+            createdAt: "2026-02-26T15:00:02.000Z",
+            updatedAt: "2026-02-26T15:00:02.000Z",
+          },
+        });
+
+        yield* appendAndProject({
+          type: "thread.session-set",
+          eventId: EventId.make("evt-precreated-session"),
+          aggregateKind: "thread",
+          aggregateId: threadId,
+          occurredAt: "2026-02-26T15:00:03.000Z",
+          commandId: CommandId.make("cmd-precreated-session"),
+          causationEventId: null,
+          correlationId: CorrelationId.make("cmd-precreated-session"),
+          metadata: {},
+          payload: {
+            threadId,
+            session: {
+              threadId,
+              status: "running",
+              providerName: "codex",
+              runtimeMode: "full-access",
+              activeTurnId: turnId,
+              lastError: null,
+              updatedAt: "2026-02-26T15:00:03.000Z",
+            },
+          },
+        });
+
+        const pendingRows = yield* sql<{ readonly count: number }>`
+          SELECT COUNT(*) AS "count"
+          FROM projection_turns
+          WHERE thread_id = ${threadId}
+            AND turn_id IS NULL
+            AND state = 'pending'
+        `;
+        assert.equal(pendingRows[0]?.count ?? 0, 0);
+
+        const turnRows = yield* sql<{
+          readonly turnId: string;
+          readonly pendingMessageId: string | null;
+          readonly sourceProposedPlanThreadId: string | null;
+          readonly sourceProposedPlanId: string | null;
+          readonly requestedAt: string;
+          readonly startedAt: string | null;
+        }>`
+          SELECT
+            turn_id AS "turnId",
+            pending_message_id AS "pendingMessageId",
+            source_proposed_plan_thread_id AS "sourceProposedPlanThreadId",
+            source_proposed_plan_id AS "sourceProposedPlanId",
+            requested_at AS "requestedAt",
+            started_at AS "startedAt"
+          FROM projection_turns
+          WHERE thread_id = ${threadId}
+            AND turn_id = ${turnId}
+        `;
+        assert.deepEqual(turnRows, [
+          {
+            turnId: "turn-precreated",
+            pendingMessageId: "message-precreated-prompt",
+            sourceProposedPlanThreadId: "thread-source-plan",
+            sourceProposedPlanId: "plan-source",
+            requestedAt: "2026-02-26T15:00:01.000Z",
+            startedAt: "2026-02-26T15:00:01.000Z",
+          },
+        ]);
+      }),
+    );
+  },
+);
 
 it.effect("restores pending turn-start metadata across projection pipeline restart", () =>
   Effect.gen(function* () {

@@ -395,6 +395,9 @@ export function useSettingsRestore(onRestored?: () => void) {
       ...(settings.diffIgnoreWhitespace !== DEFAULT_UNIFIED_SETTINGS.diffIgnoreWhitespace
         ? ["Diff whitespace changes"]
         : []),
+      ...(settings.enableGenerativeUi !== DEFAULT_UNIFIED_SETTINGS.enableGenerativeUi
+        ? ["Generative UI"]
+        : []),
       ...(settings.autoOpenPlanSidebar !== DEFAULT_UNIFIED_SETTINGS.autoOpenPlanSidebar
         ? ["Auto-open task panel"]
         : []),
@@ -432,6 +435,7 @@ export function useSettingsRestore(onRestored?: () => void) {
       settings.defaultThreadEnvMode,
       settings.newWorktreesStartFromOrigin,
       settings.diffIgnoreWhitespace,
+      settings.enableGenerativeUi,
       settings.automaticGitFetchInterval,
       settings.enableAssistantStreaming,
       settings.sidebarThreadPreviewCount,
@@ -456,6 +460,7 @@ export function useSettingsRestore(onRestored?: () => void) {
       timestampFormat: DEFAULT_UNIFIED_SETTINGS.timestampFormat,
       wordWrap: DEFAULT_UNIFIED_SETTINGS.wordWrap,
       diffIgnoreWhitespace: DEFAULT_UNIFIED_SETTINGS.diffIgnoreWhitespace,
+      enableGenerativeUi: DEFAULT_UNIFIED_SETTINGS.enableGenerativeUi,
       sidebarThreadPreviewCount: DEFAULT_UNIFIED_SETTINGS.sidebarThreadPreviewCount,
       autoOpenPlanSidebar: DEFAULT_UNIFIED_SETTINGS.autoOpenPlanSidebar,
       enableAssistantStreaming: DEFAULT_UNIFIED_SETTINGS.enableAssistantStreaming,
@@ -611,6 +616,32 @@ export function GeneralSettingsPanel() {
               checked={settings.wordWrap}
               onCheckedChange={(checked) => updateSettings({ wordWrap: Boolean(checked) })}
               aria-label="Wrap code, tables, diffs, and file previews by default"
+            />
+          }
+        />
+
+        <SettingsRow
+          title="Generative UI (experimental)"
+          description="Render model-generated ```genui blocks as interactive visuals in a sandboxed iframe. Renders untrusted model output — off by default."
+          resetAction={
+            settings.enableGenerativeUi !== DEFAULT_UNIFIED_SETTINGS.enableGenerativeUi ? (
+              <SettingResetButton
+                label="generative UI"
+                onClick={() =>
+                  updateSettings({
+                    enableGenerativeUi: DEFAULT_UNIFIED_SETTINGS.enableGenerativeUi,
+                  })
+                }
+              />
+            ) : null
+          }
+          control={
+            <Switch
+              checked={settings.enableGenerativeUi}
+              onCheckedChange={(checked) =>
+                updateSettings({ enableGenerativeUi: Boolean(checked) })
+              }
+              aria-label="Render generative UI artifacts in a sandboxed iframe"
             />
           }
         />

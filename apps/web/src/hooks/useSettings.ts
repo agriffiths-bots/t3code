@@ -218,6 +218,21 @@ export function useClientSettings<T = ClientSettings>(
   return useMemo(() => (selector ? selector(settings) : (settings as T)), [selector, settings]);
 }
 
+/**
+ * Subscribe to a single derived client setting. Unlike {@link useClientSettings},
+ * the selector runs INSIDE the store snapshot, so the component re-renders only
+ * when the selected value changes (compared with `Object.is`) — not on every
+ * unrelated client-settings change or hydration. Use for primitive selections
+ * (booleans, strings, numbers) so the snapshot stays referentially stable.
+ */
+export function useClientSettingsSelector<T>(selector: (settings: ClientSettings) => T): T {
+  return useSyncExternalStore(
+    subscribeClientSettings,
+    () => selector(getClientSettingsSnapshot()),
+    () => selector(DEFAULT_CLIENT_SETTINGS),
+  );
+}
+
 /** Read current settings for one environment, merged with client-local preferences. */
 export function useEnvironmentSettings<T = UnifiedSettings>(
   environmentId: EnvironmentId,

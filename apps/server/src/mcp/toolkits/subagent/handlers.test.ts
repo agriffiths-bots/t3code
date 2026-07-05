@@ -74,8 +74,12 @@ const client = McpSchema.McpServerClient.of({
 const unsupported = () => Effect.die(new Error("Unsupported call in subagent test")) as never;
 
 let childDetailTurnState: "completed" | "running" | "error" | "interrupted" = "completed";
+let childDetailLatestTurnId = "turn-1" as never;
+let childDetailLatestTurnRequestedAt = "2026-06-17T10:00:00.000Z";
+let childDetailLatestTurnCompletedAt = "2026-06-17T10:01:00.000Z";
 let childDetailMessages: OrchestrationThread["messages"] | null = null;
 let childDetailSession: OrchestrationThread["session"] | null = null;
+let childDetailCheckpoints: OrchestrationThread["checkpoints"] | null = null;
 
 const makeChildDetail = (): OrchestrationThread => ({
   id: childThreadId,
@@ -87,11 +91,11 @@ const makeChildDetail = (): OrchestrationThread => ({
   branch: null,
   worktreePath: null,
   latestTurn: {
-    turnId: "turn-1" as never,
+    turnId: childDetailLatestTurnId,
     state: childDetailTurnState,
-    requestedAt: "2026-06-17T10:00:00.000Z",
-    startedAt: "2026-06-17T10:00:00.000Z",
-    completedAt: childDetailTurnState === "running" ? null : "2026-06-17T10:01:00.000Z",
+    requestedAt: childDetailLatestTurnRequestedAt,
+    startedAt: childDetailLatestTurnRequestedAt,
+    completedAt: childDetailTurnState === "running" ? null : childDetailLatestTurnCompletedAt,
     assistantMessageId: null,
   },
   createdAt: "2026-06-17T09:00:00.000Z",
@@ -111,7 +115,7 @@ const makeChildDetail = (): OrchestrationThread => ({
   ],
   proposedPlans: [],
   activities: [],
-  checkpoints: [],
+  checkpoints: childDetailCheckpoints ?? [],
   session: childDetailSession,
 });
 
@@ -391,12 +395,361 @@ describe("SubagentToolkit", () => {
               parentThreadId,
               detached: true,
               status: "completed",
-              turnCount: 0,
+              turnCount: 1,
             },
           ],
         });
       }),
     ).pipe(Effect.provide(TestLayer)),
+  );
+
+  it.effect(
+    "checks a current completed stopped child as completed with a checkpointless turn count",
+    () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const server = yield* McpServer.McpServer;
+          childDetailTurnState = "completed";
+          childDetailSession = {
+            threadId: childThreadId,
+            status: "stopped",
+            providerName: "codex",
+            runtimeMode: "full-access",
+            activeTurnId: null,
+            lastError: null,
+            updatedAt: "2026-06-17T10:02:00.000Z",
+          };
+
+          const result = yield* server
+            .callTool({
+              name: "t3_check_subagent",
+              arguments: { childThreadId },
+            })
+            .pipe(
+              Effect.provideService(McpInvocationContext.McpInvocationContext, invocation),
+              Effect.provideService(McpSchema.McpServerClient, client),
+            );
+
+          expect(result.isError).toBe(false);
+          expect(result.structuredContent).toMatchObject({
+            threadId: childThreadId,
+            status: "completed",
+            turnCount: 1,
+            latestAssistantText: "child done",
+          });
+        }),
+      ).pipe(
+        Effect.ensuring(
+          Effect.sync(() => {
+            childDetailSession = null;
+          }),
+        ),
+        Effect.provide(TestLayer),
+      ),
+  );
+
+  it.effect("reports a stopped child with only a stale completed latest turn as failed", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const server = yield* McpServer.McpServer;
+        childDetailTurnState = "completed";
+        childDetailSession = {
+          threadId: childThreadId,
+          status: "stopped",
+          providerName: "codex",
+          runtimeMode: "full-access",
+          activeTurnId: null,
+          lastError: null,
+          updatedAt: "2026-06-17T10:02:00.000Z",
+        };
+        childDetailMessages = [
+          {
+            id: "msg-1" as never,
+            role: "assistant",
+            text: "child done",
+            turnId: "turn-1" as never,
+            streaming: false,
+            createdAt: "2026-06-17T10:01:00.000Z",
+            updatedAt: "2026-06-17T10:01:00.000Z",
+          },
+          {
+            id: "msg-2" as never,
+            role: "user",
+            text: "new attempted turn",
+            turnId: null,
+            streaming: false,
+            createdAt: "2026-06-17T10:02:00.000Z",
+            updatedAt: "2026-06-17T10:02:00.000Z",
+          },
+        ];
+
+        const result = yield* server
+          .callTool({
+            name: "t3_check_subagent",
+            arguments: { childThreadId },
+          })
+          .pipe(
+            Effect.provideService(McpInvocationContext.McpInvocationContext, invocation),
+            Effect.provideService(McpSchema.McpServerClient, client),
+          );
+
+        expect(result.isError).toBe(false);
+        expect(result.structuredContent).toMatchObject({
+          threadId: childThreadId,
+          status: "failed",
+          turnCount: 1,
+        });
+      }),
+    ).pipe(
+      Effect.ensuring(
+        Effect.sync(() => {
+          childDetailMessages = null;
+          childDetailSession = null;
+        }),
+      ),
+      Effect.provide(TestLayer),
+    ),
+  );
+
+  it.effect("reports a stopped interrupted child as failed", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const server = yield* McpServer.McpServer;
+        childDetailTurnState = "interrupted";
+        childDetailSession = {
+          threadId: childThreadId,
+          status: "stopped",
+          providerName: "codex",
+          runtimeMode: "full-access",
+          activeTurnId: null,
+          lastError: null,
+          updatedAt: "2026-06-17T10:02:00.000Z",
+        };
+
+        const checkResult = yield* server
+          .callTool({
+            name: "t3_check_subagent",
+            arguments: { childThreadId },
+          })
+          .pipe(
+            Effect.provideService(McpInvocationContext.McpInvocationContext, invocation),
+            Effect.provideService(McpSchema.McpServerClient, client),
+          );
+        const listResult = yield* server
+          .callTool({ name: "t3_list_subagents", arguments: {} })
+          .pipe(
+            Effect.provideService(McpInvocationContext.McpInvocationContext, invocation),
+            Effect.provideService(McpSchema.McpServerClient, client),
+          );
+
+        expect(checkResult.isError).toBe(false);
+        expect(checkResult.structuredContent).toMatchObject({
+          threadId: childThreadId,
+          status: "failed",
+          turnCount: 1,
+        });
+        expect(listResult.isError).toBe(false);
+        expect(listResult.structuredContent).toMatchObject({
+          children: [{ childThreadId, status: "failed", turnCount: 1 }],
+        });
+      }),
+    ).pipe(
+      Effect.ensuring(
+        Effect.sync(() => {
+          childDetailTurnState = "completed";
+          childDetailSession = null;
+        }),
+      ),
+      Effect.provide(TestLayer),
+    ),
+  );
+
+  it.effect("does not count the active running turn from checkpointless messages", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const server = yield* McpServer.McpServer;
+        childDetailTurnState = "running";
+
+        const result = yield* server
+          .callTool({
+            name: "t3_check_subagent",
+            arguments: { childThreadId },
+          })
+          .pipe(
+            Effect.provideService(McpInvocationContext.McpInvocationContext, invocation),
+            Effect.provideService(McpSchema.McpServerClient, client),
+          );
+
+        expect(result.isError).toBe(false);
+        expect(result.structuredContent).toMatchObject({
+          threadId: childThreadId,
+          status: "running",
+          turnCount: 0,
+        });
+      }),
+    ).pipe(
+      Effect.ensuring(
+        Effect.sync(() => {
+          childDetailTurnState = "completed";
+        }),
+      ),
+      Effect.provide(TestLayer),
+    ),
+  );
+
+  it.effect("increments turn count for a checkpointless latest turn after checkpoints", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const server = yield* McpServer.McpServer;
+        childDetailCheckpoints = [
+          {
+            turnId: "turn-0" as never,
+            checkpointTurnCount: NonNegativeInt.make(1),
+            checkpointRef: "checkpoint-turn-0" as never,
+            status: "ready",
+            files: [],
+            assistantMessageId: null,
+            completedAt: "2026-06-17T09:59:00.000Z",
+          },
+        ];
+
+        const result = yield* server
+          .callTool({
+            name: "t3_check_subagent",
+            arguments: { childThreadId },
+          })
+          .pipe(
+            Effect.provideService(McpInvocationContext.McpInvocationContext, invocation),
+            Effect.provideService(McpSchema.McpServerClient, client),
+          );
+
+        expect(result.isError).toBe(false);
+        expect(result.structuredContent).toMatchObject({
+          threadId: childThreadId,
+          status: "completed",
+          turnCount: 2,
+        });
+      }),
+    ).pipe(
+      Effect.ensuring(
+        Effect.sync(() => {
+          childDetailCheckpoints = null;
+        }),
+      ),
+      Effect.provide(TestLayer),
+    ),
+  );
+
+  it.effect("does not recount retained messages from capped checkpoint history", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const server = yield* McpServer.McpServer;
+        childDetailLatestTurnId = "turn-600" as never;
+        childDetailLatestTurnRequestedAt = "2026-06-17T10:00:00.000Z";
+        childDetailLatestTurnCompletedAt = "2026-06-17T10:00:30.000Z";
+        childDetailCheckpoints = [
+          {
+            turnId: "turn-600" as never,
+            checkpointTurnCount: NonNegativeInt.make(600),
+            checkpointRef: "checkpoint-turn-600" as never,
+            status: "ready",
+            files: [],
+            assistantMessageId: null,
+            completedAt: "2026-06-17T10:00:30.000Z",
+          },
+        ];
+        childDetailMessages = [
+          {
+            id: "msg-old" as never,
+            role: "assistant",
+            text: "old retained message",
+            turnId: "turn-1" as never,
+            streaming: false,
+            createdAt: "2026-06-17T09:00:00.000Z",
+            updatedAt: "2026-06-17T09:00:00.000Z",
+          },
+          {
+            id: "msg-latest" as never,
+            role: "assistant",
+            text: "latest checkpointed message",
+            turnId: "turn-600" as never,
+            streaming: false,
+            createdAt: "2026-06-17T10:00:30.000Z",
+            updatedAt: "2026-06-17T10:00:30.000Z",
+          },
+        ];
+
+        const result = yield* server
+          .callTool({
+            name: "t3_check_subagent",
+            arguments: { childThreadId },
+          })
+          .pipe(
+            Effect.provideService(McpInvocationContext.McpInvocationContext, invocation),
+            Effect.provideService(McpSchema.McpServerClient, client),
+          );
+
+        expect(result.isError).toBe(false);
+        expect(result.structuredContent).toMatchObject({
+          threadId: childThreadId,
+          status: "completed",
+          turnCount: 600,
+        });
+      }),
+    ).pipe(
+      Effect.ensuring(
+        Effect.sync(() => {
+          childDetailLatestTurnId = "turn-1" as never;
+          childDetailLatestTurnRequestedAt = "2026-06-17T10:00:00.000Z";
+          childDetailLatestTurnCompletedAt = "2026-06-17T10:01:00.000Z";
+          childDetailMessages = null;
+          childDetailCheckpoints = null;
+        }),
+      ),
+      Effect.provide(TestLayer),
+    ),
+  );
+
+  it.effect("reports a completed latest turn with an errored session as failed", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const server = yield* McpServer.McpServer;
+        childDetailTurnState = "completed";
+        childDetailSession = {
+          threadId: childThreadId,
+          status: "error",
+          providerName: "codex",
+          runtimeMode: "full-access",
+          activeTurnId: null,
+          lastError: "provider failed",
+          updatedAt: "2026-06-17T10:02:00.000Z",
+        };
+
+        const result = yield* server
+          .callTool({
+            name: "t3_check_subagent",
+            arguments: { childThreadId },
+          })
+          .pipe(
+            Effect.provideService(McpInvocationContext.McpInvocationContext, invocation),
+            Effect.provideService(McpSchema.McpServerClient, client),
+          );
+
+        expect(result.isError).toBe(false);
+        expect(result.structuredContent).toMatchObject({
+          threadId: childThreadId,
+          status: "failed",
+          turnCount: 1,
+        });
+      }),
+    ).pipe(
+      Effect.ensuring(
+        Effect.sync(() => {
+          childDetailSession = null;
+        }),
+      ),
+      Effect.provide(TestLayer),
+    ),
   );
 
   it.effect("rejects a credential without the thread-management capability", () =>
@@ -788,6 +1141,75 @@ describe("SubagentToolkit", () => {
           settledCount: 1,
           timedOutCount: 0,
           results: [{ childThreadId, status: "completed", error: null }],
+        });
+        expect(result.structuredContent).not.toHaveProperty("promoted");
+        expect(promotedCalls).toEqual([]);
+      }),
+    ).pipe(
+      Effect.ensuring(
+        Effect.sync(() => {
+          childDetailSession = null;
+        }),
+      ),
+      Effect.provide(TestLayer),
+    ),
+  );
+
+  it.effect("returns failed projection waits when the completed child session has errored", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const server = yield* McpServer.McpServer;
+        promotedCalls.length = 0;
+        childDetailTurnState = "completed";
+        childDetailSession = {
+          threadId: childThreadId,
+          status: "error",
+          providerName: "codex",
+          runtimeMode: "full-access",
+          activeTurnId: null,
+          lastError: "provider failed",
+          updatedAt: "2026-06-17T10:02:00.000Z",
+        };
+        waitSliceResult = {
+          results: [
+            {
+              childThreadId,
+              status: "timeout",
+              finalAssistantText: null,
+              error: "wait exceeded budget",
+            },
+          ],
+          settledCount: 0,
+          timedOutCount: 1,
+          pending: false,
+          resumeToken: "coordinator-token",
+        };
+
+        const result = yield* server
+          .callTool({
+            name: "t3_wait_subagent",
+            arguments: {
+              childThreadIds: [childThreadId],
+              resumeToken: "-100000:coordinator-token",
+            },
+          })
+          .pipe(
+            Effect.provideService(McpInvocationContext.McpInvocationContext, invocation),
+            Effect.provideService(McpSchema.McpServerClient, client),
+          );
+
+        expect(result.isError).toBe(false);
+        expect(result.structuredContent).toMatchObject({
+          pending: false,
+          settledCount: 1,
+          timedOutCount: 0,
+          results: [
+            {
+              childThreadId,
+              status: "failed",
+              error: "Child thread ended with status failed.",
+            },
+          ],
         });
         expect(result.structuredContent).not.toHaveProperty("promoted");
         expect(promotedCalls).toEqual([]);

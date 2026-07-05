@@ -466,6 +466,43 @@ describe("ProviderCommandReactor", () => {
     expect(thread?.session?.runtimeMode).toBe("approval-required");
   });
 
+  it("accepts server-originated system turn starts as provider input", async () => {
+    const harness = await createHarness();
+    const now = "2026-01-01T00:00:00.000Z";
+
+    await runtime!.runPromise(
+      harness.engine.dispatch({
+        type: "thread.turn.start",
+        commandId: CommandId.make("cmd-turn-start-system-wake"),
+        threadId: ThreadId.make("thread-1"),
+        message: {
+          messageId: asMessageId("system-message-wake"),
+          role: "system",
+          text: "[sub-agent child-1 completed] done",
+          attachments: [],
+        },
+        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+        runtimeMode: "approval-required",
+        createdAt: now,
+      }),
+    );
+
+    await waitFor(() => harness.startSession.mock.calls.length === 1);
+    await waitFor(() => harness.sendTurn.mock.calls.length === 1);
+    expect(harness.generateThreadTitle).not.toHaveBeenCalled();
+    expect(harness.generateBranchName).not.toHaveBeenCalled();
+    expect(harness.sendTurn.mock.calls[0]?.[0]).toMatchObject({
+      input: "[sub-agent child-1 completed] done",
+    });
+
+    const readModel = await harness.readModel();
+    const thread = readModel.threads.find((entry) => entry.id === ThreadId.make("thread-1"));
+    expect(thread?.messages.at(-1)).toMatchObject({
+      role: "system",
+      text: "[sub-agent child-1 completed] done",
+    });
+  });
+
   it("records a shell-visible error session when the first provider session fails to start", async () => {
     const harness = await createHarness();
     const now = "2026-01-01T00:00:00.000Z";

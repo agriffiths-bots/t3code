@@ -253,6 +253,7 @@ it.effect("starts a new worktree thread by default and inherits source settings"
     if (command?.type !== "thread.turn.start") return;
     expect(command.message.text).toBe("Investigate flaky tests");
     expect(command.modelSelection).toEqual(modelSelection);
+    expect(command.titleSeed).toBe("Investigate flaky tests");
     expect(command.runtimeMode).toBe("auto-accept-edits");
     expect(command.interactionMode).toBe("plan");
     expect(command.bootstrap?.createThread?.modelSelection).toEqual(modelSelection);
@@ -261,6 +262,23 @@ it.effect("starts a new worktree thread by default and inherits source settings"
       baseBranch: "main",
     });
     expect(command.bootstrap?.runSetupScript).toBe(true);
+  }),
+);
+
+it.effect("keeps an explicit child title authoritative by not auto-title seeding it", () =>
+  Effect.gen(function* () {
+    const commands: OrchestrationCommand[] = [];
+    const result = yield* callStartTool(
+      { prompt: "Investigate flaky tests", title: "Worker T11 UX" },
+      commands,
+    );
+
+    expect(result.isError).toBe(false);
+    const command = commands[0];
+    expect(command?.type).toBe("thread.turn.start");
+    if (command?.type !== "thread.turn.start") return;
+    expect(command.bootstrap?.createThread?.title).toBe("Worker T11 UX");
+    expect(command.titleSeed).toBeUndefined();
   }),
 );
 

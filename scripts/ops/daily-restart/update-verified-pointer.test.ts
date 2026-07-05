@@ -27,8 +27,8 @@ const fullAssets = [
   asset("latest.yml"),
 ];
 const release = (assets = fullAssets): GitHubRelease => ({
-  tag_name: "main-20260703010101-0123456",
-  html_url: "https://github.com/agriffiths-bots/t3code/releases/tag/main-20260703010101-0123456",
+  tag_name: "v0.0.29-nightly.20260703.123",
+  html_url: "https://github.com/agriffiths-bots/t3code/releases/tag/v0.0.29-nightly.20260703.123",
   target_commitish: sha,
   assets,
 });

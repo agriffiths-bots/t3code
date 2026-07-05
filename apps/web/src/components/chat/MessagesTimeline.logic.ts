@@ -84,6 +84,7 @@ function maxIsoTimestamp(a: string | null, b: string | null): string | null {
 export interface TimelineDurationMessage {
   id: string;
   role: "user" | "assistant" | "system";
+  text?: string | null | undefined;
   createdAt: string;
   updatedAt: string;
   streaming: boolean;
@@ -150,7 +151,7 @@ export function computeMessageDurationStart(
   let lastBoundary: string | null = null;
 
   for (const message of messages) {
-    if (message.role === "user") {
+    if (isTurnPromptMessage(message)) {
       lastBoundary = message.createdAt;
     }
     result.set(message.id, lastBoundary ?? message.createdAt);
@@ -160,6 +161,77 @@ export function computeMessageDurationStart(
   }
 
   return result;
+}
+
+export function isSubAgentWakeSystemMessageText(text: string | null | undefined): boolean {
+  return text?.trimStart().startsWith("[sub-agent ") ?? false;
+}
+
+export function isTurnPromptMessage(
+  message: Pick<TimelineDurationMessage, "role" | "text">,
+): boolean {
+  return (
+    message.role === "user" ||
+    (message.role === "system" && isSubAgentWakeSystemMessageText(message.text))
+  );
+}
+
+export function deriveRevertTurnCountByPromptMessageId(input: {
+  readonly timelineEntries: ReadonlyArray<TimelineEntry>;
+  readonly turnDiffSummaryByAssistantMessageId: ReadonlyMap<MessageId, TurnDiffSummary>;
+  readonly turnDiffSummaryByTurnId: ReadonlyMap<TurnId, TurnDiffSummary>;
+  readonly inferredCheckpointTurnCountByTurnId: Readonly<Record<TurnId, number>>;
+}): Map<MessageId, number> {
+  const byPromptMessageId = new Map<MessageId, number>();
+
+  const resolveTurnCount = (
+    summary: TurnDiffSummary | undefined,
+    turnId: TurnId,
+  ): number | null => {
+    const turnCount =
+      summary?.checkpointTurnCount ?? input.inferredCheckpointTurnCountByTurnId[turnId];
+    return typeof turnCount === "number" ? turnCount : null;
+  };
+
+  for (let index = 0; index < input.timelineEntries.length; index += 1) {
+    const entry = input.timelineEntries[index];
+    if (!entry || entry.kind !== "message" || !isTurnPromptMessage(entry.message)) {
+      continue;
+    }
+
+    if (entry.message.turnId !== null) {
+      const turnCount = resolveTurnCount(
+        input.turnDiffSummaryByTurnId.get(entry.message.turnId),
+        entry.message.turnId,
+      );
+      if (turnCount !== null) {
+        byPromptMessageId.set(entry.message.id, Math.max(0, turnCount - 1));
+        continue;
+      }
+    }
+
+    for (let nextIndex = index + 1; nextIndex < input.timelineEntries.length; nextIndex += 1) {
+      const nextEntry = input.timelineEntries[nextIndex];
+      if (!nextEntry || nextEntry.kind !== "message") {
+        continue;
+      }
+      if (isTurnPromptMessage(nextEntry.message)) {
+        break;
+      }
+      const summary = input.turnDiffSummaryByAssistantMessageId.get(nextEntry.message.id);
+      if (!summary) {
+        continue;
+      }
+      const turnCount = resolveTurnCount(summary, summary.turnId);
+      if (turnCount === null) {
+        break;
+      }
+      byPromptMessageId.set(entry.message.id, Math.max(0, turnCount - 1));
+      break;
+    }
+  }
+
+  return byPromptMessageId;
 }
 
 export function normalizeCompactToolLabel(value: string): string {
@@ -191,7 +263,7 @@ function deriveTerminalAssistantMessageIds(timelineEntries: ReadonlyArray<Timeli
       continue;
     }
     const { message } = timelineEntry;
-    if (message.role === "user") {
+    if (isTurnPromptMessage(message)) {
       nullTurnResponseIndex += 1;
       continue;
     }
@@ -265,7 +337,7 @@ function deriveTurnFolds(input: {
 
   let pendingUserBoundary: string | null = null;
   for (const entry of input.timelineEntries) {
-    if (entry.kind === "message" && entry.message.role === "user") {
+    if (entry.kind === "message" && isTurnPromptMessage(entry.message)) {
       pendingUserBoundary = entry.message.createdAt;
       continue;
     }
@@ -517,10 +589,9 @@ export function deriveMessagesTimelineRows(input: {
         timelineEntry.message.role === "assistant"
           ? input.turnDiffSummaryByAssistantMessageId.get(timelineEntry.message.id)
           : undefined,
-      revertTurnCount:
-        timelineEntry.message.role === "user"
-          ? input.revertTurnCountByUserMessageId.get(timelineEntry.message.id)
-          : undefined,
+      revertTurnCount: isTurnPromptMessage(timelineEntry.message)
+        ? input.revertTurnCountByUserMessageId.get(timelineEntry.message.id)
+        : undefined,
     });
   }
 

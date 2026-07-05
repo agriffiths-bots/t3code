@@ -130,6 +130,29 @@ projectionSnapshotLayer("ProjectionSnapshotQuery", (it) => {
       `;
 
       yield* sql`
+        INSERT INTO projection_thread_messages (
+          message_id,
+          thread_id,
+          turn_id,
+          role,
+          text,
+          is_streaming,
+          created_at,
+          updated_at
+        )
+        VALUES (
+          'message-prompt',
+          'thread-1',
+          NULL,
+          'system',
+          '[sub-agent child-1 completed] done',
+          0,
+          '2026-02-24T00:00:03.500Z',
+          '2026-02-24T00:00:03.500Z'
+        )
+      `;
+
+      yield* sql`
         INSERT INTO projection_thread_proposed_plans (
           plan_id,
           thread_id,
@@ -220,7 +243,7 @@ projectionSnapshotLayer("ProjectionSnapshotQuery", (it) => {
         VALUES (
           'thread-1',
           'turn-1',
-          NULL,
+          'message-prompt',
           'thread-1',
           'plan-1',
           'message-1',
@@ -310,6 +333,15 @@ projectionSnapshotLayer("ProjectionSnapshotQuery", (it) => {
           archivedAt: null,
           deletedAt: null,
           messages: [
+            {
+              id: asMessageId("message-prompt"),
+              role: "system",
+              text: "[sub-agent child-1 completed] done",
+              turnId: asTurnId("turn-1"),
+              streaming: false,
+              createdAt: "2026-02-24T00:00:03.500Z",
+              updatedAt: "2026-02-24T00:00:03.500Z",
+            },
             {
               id: asMessageId("message-1"),
               role: "assistant",

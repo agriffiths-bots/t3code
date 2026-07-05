@@ -10,6 +10,7 @@ export interface ThreadSortInput {
   readonly messages?: ReadonlyArray<{
     readonly createdAt: string;
     readonly role: string;
+    readonly text?: string | null | undefined;
   }>;
 }
 
@@ -38,7 +39,7 @@ function getLatestUserMessageTimestamp(thread: ThreadSortInput): number {
   let latestUserMessageTimestamp: number | null = null;
 
   for (const message of thread.messages ?? []) {
-    if (message.role !== "user") continue;
+    if (!isRecencyPromptMessage(message)) continue;
     const messageTimestamp = toSortableTimestamp(message.createdAt);
     if (messageTimestamp === null) continue;
     latestUserMessageTimestamp =
@@ -52,6 +53,16 @@ function getLatestUserMessageTimestamp(thread: ThreadSortInput): number {
   }
 
   return getFirstSortableTimestamp(thread.updatedAt, thread.createdAt) ?? Number.NEGATIVE_INFINITY;
+}
+
+function isRecencyPromptMessage(message: {
+  readonly role: string;
+  readonly text?: string | null | undefined;
+}): boolean {
+  return (
+    message.role === "user" ||
+    (message.role === "system" && (message.text ?? "").trimStart().startsWith("[sub-agent "))
+  );
 }
 
 export function getThreadSortTimestamp(
