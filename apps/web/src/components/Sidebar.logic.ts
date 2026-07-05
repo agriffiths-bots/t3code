@@ -76,6 +76,7 @@ export type SidebarThreadTreeInput = Pick<
 >;
 
 export interface SidebarThreadRollupCounts {
+  readonly needsYou: number;
   readonly running: number;
   readonly done: number;
   readonly failed: number;
@@ -95,6 +96,7 @@ interface SidebarThreadTreeMetadata {
   readonly descendantCount: number;
   readonly hasNeedsYou: boolean;
   readonly hasDescendantNeedsYou: boolean;
+  readonly bestSortIndex: number;
   readonly rollup: SidebarThreadRollupCounts;
 }
 
@@ -475,7 +477,7 @@ export function isThreadNeedsYou(thread: SidebarThreadTreeInput): boolean {
 }
 
 function emptyRollup(): SidebarThreadRollupCounts {
-  return { running: 0, done: 0, failed: 0 };
+  return { needsYou: 0, running: 0, done: 0, failed: 0 };
 }
 
 function addRollup(
@@ -483,6 +485,7 @@ function addRollup(
   right: SidebarThreadRollupCounts,
 ): SidebarThreadRollupCounts {
   return {
+    needsYou: left.needsYou + right.needsYou,
     running: left.running + right.running,
     done: left.done + right.done,
     failed: left.failed + right.failed,
@@ -509,8 +512,11 @@ function resolveThreadRollupStatus(
     return "failed";
   }
 
+  if (isThreadNeedsYou(thread)) {
+    return "needsYou";
+  }
+
   if (
-    isThreadNeedsYou(thread) ||
     thread.session?.status === "starting" ||
     thread.session?.status === "running" ||
     thread.session?.status === "waiting" ||
@@ -542,6 +548,9 @@ export function buildSidebarThreadTreeRows<TThread extends SidebarThreadTreeInpu
 ): SidebarThreadTreeRow<TThread>[] {
   const threadByKey = new Map(
     sortedThreads.map((thread) => [sidebarThreadTreeKey(thread), thread]),
+  );
+  const sortIndexByKey = new Map(
+    sortedThreads.map((thread, index) => [sidebarThreadTreeKey(thread), index]),
   );
   const childrenByParentKey = new Map<string, TThread[]>();
   const roots: TThread[] = [];
@@ -578,6 +587,7 @@ export function buildSidebarThreadTreeRows<TThread extends SidebarThreadTreeInpu
         descendantCount: 0,
         hasNeedsYou: isThreadNeedsYou(thread),
         hasDescendantNeedsYou: false,
+        bestSortIndex: sortIndexByKey.get(key) ?? Number.MAX_SAFE_INTEGER,
         rollup: emptyRollup(),
       };
       metadataByKey.set(key, cycleSafe);
@@ -587,12 +597,14 @@ export function buildSidebarThreadTreeRows<TThread extends SidebarThreadTreeInpu
     visiting.add(key);
     let descendantCount = 0;
     let hasDescendantNeedsYou = false;
+    let bestSortIndex = sortIndexByKey.get(key) ?? Number.MAX_SAFE_INTEGER;
     let rollup = emptyRollup();
     for (const child of childrenByParentKey.get(key) ?? []) {
       const childMetadata = collectMetadata(child);
       descendantCount += 1 + childMetadata.descendantCount;
       hasDescendantNeedsYou =
         hasDescendantNeedsYou || childMetadata.hasNeedsYou || childMetadata.hasDescendantNeedsYou;
+      bestSortIndex = Math.min(bestSortIndex, childMetadata.bestSortIndex);
       rollup = addRollup(
         incrementRollup(rollup, resolveThreadRollupStatus(child)),
         childMetadata.rollup,
@@ -604,6 +616,7 @@ export function buildSidebarThreadTreeRows<TThread extends SidebarThreadTreeInpu
       descendantCount,
       hasNeedsYou: isThreadNeedsYou(thread),
       hasDescendantNeedsYou,
+      bestSortIndex,
       rollup,
     };
     metadataByKey.set(key, metadata);
@@ -617,7 +630,9 @@ export function buildSidebarThreadTreeRows<TThread extends SidebarThreadTreeInpu
       const leftPriority = leftMetadata.hasNeedsYou || leftMetadata.hasDescendantNeedsYou ? 1 : 0;
       const rightPriority =
         rightMetadata.hasNeedsYou || rightMetadata.hasDescendantNeedsYou ? 1 : 0;
-      return rightPriority - leftPriority;
+      return (
+        rightPriority - leftPriority || leftMetadata.bestSortIndex - rightMetadata.bestSortIndex
+      );
     });
 
   const rows: SidebarThreadTreeRow<TThread>[] = [];

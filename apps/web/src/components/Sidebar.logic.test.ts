@@ -778,6 +778,19 @@ describe("buildSidebarThreadTreeRows", () => {
     });
   });
 
+  it("orders parent groups by the best sorted position among parent and descendants", () => {
+    const parent = makeTreeThread({ id: ThreadId.make("old-parent") });
+    const newerChild = makeTreeThread({
+      id: ThreadId.make("newer-child"),
+      parentThreadId: parent.id,
+    });
+    const middleThread = makeTreeThread({ id: ThreadId.make("middle-thread") });
+
+    const rows = buildSidebarThreadTreeRows([newerChild, middleThread, parent]);
+
+    expect(rows.map((row) => row.thread.id)).toEqual([parent.id, newerChild.id, middleThread.id]);
+  });
+
   it("rolls descendant running, done, and failed counts onto parent rows", () => {
     const parent = makeTreeThread({ id: ThreadId.make("parent") });
     const running = makeTreeThread({
@@ -811,6 +824,7 @@ describe("buildSidebarThreadTreeRows", () => {
     const [parentRow] = buildSidebarThreadTreeRows([parent, running, done, failed]);
 
     expect(parentRow?.rollup).toEqual({
+      needsYou: 0,
       running: 1,
       done: 1,
       failed: 1,
@@ -846,6 +860,10 @@ describe("buildSidebarThreadTreeRows", () => {
     expect(rows[0]).toMatchObject({
       hasNeedsYou: false,
       hasDescendantNeedsYou: true,
+      rollup: {
+        needsYou: 1,
+        running: 0,
+      },
     });
     expect(rows[1]).toMatchObject({ hasNeedsYou: true });
   });

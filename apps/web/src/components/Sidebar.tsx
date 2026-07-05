@@ -254,6 +254,7 @@ type SidebarThreadRowModel = SidebarThreadTreeRow<SidebarThreadSummary>;
 
 function formatThreadRollupLabel(row: SidebarThreadRowModel): string | null {
   const parts = [
+    row.rollup.needsYou > 0 ? `${row.rollup.needsYou} needs you` : null,
     row.rollup.running > 0 ? `${row.rollup.running} running` : null,
     row.rollup.done > 0 ? `${row.rollup.done} done` : null,
     row.rollup.failed > 0 ? `${row.rollup.failed} failed` : null,
@@ -778,7 +779,7 @@ export const SidebarThreadRow = memo(function SidebarThreadRow(props: SidebarThr
           )}
           {threadStatus && <ThreadStatusLabel status={threadStatus} />}
           <ScheduledTaskIcon summary={scheduleSummary} />
-          {row.hasNeedsYou ? <ThreadNeedsYouBadge /> : null}
+          {row.hasNeedsYou || row.hasDescendantNeedsYou ? <ThreadNeedsYouBadge /> : null}
           {renamingThreadKey === threadKey ? (
             <input
               ref={handleRenameInputRef}
