@@ -30,25 +30,29 @@ self.addEventListener("fetch", (event) => {
   if (!acceptsHtml || requestUrl.origin !== self.location.origin) return;
   const canRefreshShellCache = requestUrl.pathname === "/";
 
+  const networkResponse = fetch(request);
+  const shellRefresh = networkResponse
+    .then(async (response) => {
+      const contentType = response.headers.get("content-type") ?? "";
+      if (!canRefreshShellCache || !response.ok || !contentType.includes("text/html")) return;
+
+      const shellResponse = response.clone();
+      const cache = await caches.open(CACHE_VERSION);
+      await cache.put("/", shellResponse);
+    })
+    .catch(() => undefined);
+
+  event.waitUntil(shellRefresh);
   event.respondWith(
-    fetch(request)
-      .then((response) => {
-        const contentType = response.headers.get("content-type") ?? "";
-        if (canRefreshShellCache && response.ok && contentType.includes("text/html")) {
-          const copy = response.clone();
-          caches.open(CACHE_VERSION).then((cache) => cache.put("/", copy));
-        }
-        return response;
-      })
-      .catch(async () => {
-        const cached = await caches.match("/");
-        return (
-          cached ??
-          new Response("T3 Code is offline. Reconnect to continue.", {
-            status: 503,
-            headers: { "content-type": "text/plain; charset=utf-8" },
-          })
-        );
-      }),
+    networkResponse.catch(async () => {
+      const cached = await caches.match("/");
+      return (
+        cached ??
+        new Response("T3 Code is offline. Reconnect to continue.", {
+          status: 503,
+          headers: { "content-type": "text/plain; charset=utf-8" },
+        })
+      );
+    }),
   );
 });

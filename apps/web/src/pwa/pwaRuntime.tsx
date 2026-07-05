@@ -59,6 +59,7 @@ function PwaRuntimeEffects() {
     if (!navigatorWithWakeLock.wakeLock) return;
 
     let cancelled = false;
+    let requestInFlight = false;
     let sentinel: WakeLockSentinelLike | null = null;
 
     const release = () => {
@@ -70,14 +71,27 @@ function PwaRuntimeEffects() {
     };
 
     const acquire = async () => {
-      if (cancelled || document.visibilityState !== "visible" || sentinel) return;
+      if (cancelled || document.visibilityState !== "visible" || sentinel || requestInFlight)
+        return;
+      requestInFlight = true;
       try {
-        sentinel = await navigatorWithWakeLock.wakeLock?.request("screen");
-        sentinel?.addEventListener("release", () => {
-          sentinel = null;
+        const nextSentinel = await navigatorWithWakeLock.wakeLock?.request("screen");
+        if (!nextSentinel) return;
+        if (cancelled || document.visibilityState !== "visible" || sentinel) {
+          void nextSentinel.release().catch(() => undefined);
+          return;
+        }
+
+        sentinel = nextSentinel;
+        nextSentinel.addEventListener("release", () => {
+          if (sentinel === nextSentinel) {
+            sentinel = null;
+          }
         });
       } catch {
         sentinel = null;
+      } finally {
+        requestInFlight = false;
       }
     };
 

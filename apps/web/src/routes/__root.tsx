@@ -100,6 +100,7 @@ function RootRouteView() {
   if (pathname === "/pair") {
     return (
       <>
+        <PwaRuntime />
         <DocumentTitleSync />
         <Outlet />
       </>
@@ -109,6 +110,7 @@ function RootRouteView() {
   if (authGateState.status !== "authenticated" && authGateState.status !== "hosted-static") {
     return (
       <>
+        <PwaRuntime />
         <DocumentTitleSync />
         <Outlet />
       </>
@@ -124,20 +126,22 @@ function RootRouteView() {
   );
 
   return (
-    <ToastProvider>
-      <AnchoredToastProvider>
-        <DocumentTitleSync />
-        {primaryEnvironmentAuthenticated ? <AuthenticatedTracingBootstrap /> : null}
-        <RelayClientInstallDialog />
-        <SshPasswordPromptDialog />
-        <SlowRpcRequestToastCoordinator />
-        <PwaRuntime />
-        <HostedStaticEnvironmentBootstrap />
-        {primaryEnvironmentAuthenticated ? <EventRouter /> : null}
-        {primaryEnvironmentAuthenticated ? <ProviderUpdateLaunchNotification /> : null}
-        {appShell}
-      </AnchoredToastProvider>
-    </ToastProvider>
+    <>
+      <PwaRuntime />
+      <ToastProvider>
+        <AnchoredToastProvider>
+          <DocumentTitleSync />
+          {primaryEnvironmentAuthenticated ? <AuthenticatedTracingBootstrap /> : null}
+          <RelayClientInstallDialog />
+          <SshPasswordPromptDialog />
+          <SlowRpcRequestToastCoordinator />
+          <HostedStaticEnvironmentBootstrap />
+          {primaryEnvironmentAuthenticated ? <EventRouter /> : null}
+          {primaryEnvironmentAuthenticated ? <ProviderUpdateLaunchNotification /> : null}
+          {appShell}
+        </AnchoredToastProvider>
+      </ToastProvider>
+    </>
   );
 }
 
