@@ -271,9 +271,8 @@ describe("artifact release workflows", () => {
       expect(mainWorkflow).not.toContain("android_app_version:");
       expect(mainWorkflow).not.toContain("android_public_config:");
       expect(mainWorkflow).not.toContain("platform:");
-      expect(mainWorkflow).toContain(
-        "prerelease: ${{ github.event_name == 'schedule' || inputs.prerelease }}",
-      );
+      expect(mainWorkflow).not.toContain("inputs.prerelease");
+      expect(mainWorkflow).toContain("prerelease: true");
       expect(mainWorkflow).toContain("windows_signing: true");
       // Nightly prereleases would otherwise accumulate one release/day forever;
       // a retention job prunes stale main-* prereleases after a successful publish.
