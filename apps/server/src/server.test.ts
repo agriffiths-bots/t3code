@@ -6249,6 +6249,7 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
                   baseBranch: "main",
                   branch: "t3code/bootstrap-refName",
                   startFromOrigin: true,
+                  workspaceRelativePath: "packages/app",
                 },
                 runSetupScript: true,
               },
@@ -6293,9 +6294,17 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
           threadId: ThreadId.make("thread-bootstrap"),
           projectId: defaultProjectId,
           projectCwd: "/tmp/project",
-          worktreePath: "/tmp/bootstrap-worktree",
+          worktreePath: "/tmp/bootstrap-worktree/packages/app",
         });
-        assert.deepEqual(refreshStatus.mock.calls[0]?.[0], "/tmp/bootstrap-worktree");
+        assert.deepEqual(refreshStatus.mock.calls[0]?.[0], "/tmp/bootstrap-worktree/packages/app");
+
+        const metaUpdate = dispatchedCommands.find(
+          (command): command is Extract<OrchestrationCommand, { type: "thread.meta.update" }> =>
+            command.type === "thread.meta.update",
+        );
+        assert.equal(metaUpdate?.worktreePath, "/tmp/bootstrap-worktree/packages/app");
+        assert.equal(metaUpdate?.worktreeRemovable, true);
+        assert.equal(metaUpdate?.worktreeRemovalPath, "/tmp/bootstrap-worktree");
 
         const setupActivities = dispatchedCommands.filter(
           (command): command is Extract<OrchestrationCommand, { type: "thread.activity.append" }> =>
@@ -6541,12 +6550,12 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
     }).pipe(Effect.provide(NodeHttpServer.layerTest)),
   );
 
-  it.effect("cleans up created bootstrap threads when worktree creation defects", () =>
+  it.effect("rejects invalid bootstrap workspace paths before creating worktrees", () =>
     Effect.gen(function* () {
       const dispatchedCommands: Array<OrchestrationCommand> = [];
       const createWorktree = vi.fn(
         (_: Parameters<GitVcsDriver.GitVcsDriver["Service"]["createWorktree"]>[0]) =>
-          Effect.die(new Error("worktree exploded")),
+          Effect.die(new Error("unexpected worktree creation")),
       );
 
       yield* buildAppUnderTest({
@@ -6571,10 +6580,10 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
         withWsRpcClient(wsUrl, (client) =>
           client[ORCHESTRATION_WS_METHODS.dispatchCommand]({
             type: "thread.turn.start",
-            commandId: CommandId.make("cmd-bootstrap-turn-start-defect"),
-            threadId: ThreadId.make("thread-bootstrap-defect"),
+            commandId: CommandId.make("cmd-bootstrap-turn-start-invalid-workspace"),
+            threadId: ThreadId.make("thread-bootstrap-invalid-workspace"),
             message: {
-              messageId: MessageId.make("msg-bootstrap-defect"),
+              messageId: MessageId.make("msg-bootstrap-invalid-workspace"),
               role: "user",
               text: "hello",
               attachments: [],
@@ -6597,6 +6606,7 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
                 projectCwd: "/tmp/project",
                 baseBranch: "main",
                 branch: "t3code/bootstrap-refName",
+                workspaceRelativePath: "..",
               },
               runSetupScript: false,
             },
@@ -6607,7 +6617,8 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
 
       assertTrue(result._tag === "Failure");
       assertTrue(result.failure._tag === "OrchestrationDispatchCommandError");
-      assert.include(result.failure.message, "worktree exploded");
+      assert.include(result.failure.message, "Invalid worktree workspace relative path");
+      assert.equal(createWorktree.mock.calls.length, 0);
       assert.deepEqual(
         dispatchedCommands.map((command) => command.type),
         ["thread.create", "thread.delete"],

@@ -239,6 +239,10 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
           interactionMode: command.interactionMode,
           branch: command.branch,
           worktreePath: command.worktreePath,
+          worktreeRemovable: command.worktreeRemovable ?? false,
+          ...(command.worktreeRemovalPath !== undefined
+            ? { worktreeRemovalPath: command.worktreeRemovalPath }
+            : {}),
           createdAt: command.createdAt,
           updatedAt: command.createdAt,
         },
@@ -335,6 +339,12 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
             : {}),
           ...(command.branch !== undefined ? { branch: command.branch } : {}),
           ...(command.worktreePath !== undefined ? { worktreePath: command.worktreePath } : {}),
+          ...(command.worktreeRemovable !== undefined
+            ? { worktreeRemovable: command.worktreeRemovable }
+            : {}),
+          ...(command.worktreeRemovalPath !== undefined
+            ? { worktreeRemovalPath: command.worktreeRemovalPath }
+            : {}),
           updatedAt: occurredAt,
         },
       };

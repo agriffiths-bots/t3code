@@ -296,7 +296,19 @@ const callStartTool = (
 it.effect("starts a new worktree thread by default and inherits source settings", () =>
   Effect.gen(function* () {
     const commands: OrchestrationCommand[] = [];
-    const result = yield* callStartTool({ prompt: "Investigate flaky tests" }, commands);
+    const result = yield* callStartTool({ prompt: "Investigate flaky tests" }, commands, {
+      project: {
+        ...project,
+        workspaceRoot: "/repo/packages/app",
+      },
+      vcsDetect: (input) =>
+        Effect.succeed(
+          makeGitHandle(input.cwd, {
+            rootPath: "/repo",
+            metadataPath: "/repo/.git",
+          }),
+        ),
+    });
 
     expect(result.isError).toBe(false);
     expect(result.structuredContent).toMatchObject({
@@ -313,9 +325,11 @@ it.effect("starts a new worktree thread by default and inherits source settings"
     expect(command.interactionMode).toBe("plan");
     expect(command.bootstrap?.createThread?.modelSelection).toEqual(modelSelection);
     expect(command.bootstrap?.prepareWorktree).toMatchObject({
-      projectCwd: "/repo",
+      projectCwd: "/repo/packages/app",
       baseBranch: "main",
+      workspaceRelativePath: "packages/app",
     });
+    expect(command.bootstrap?.createThread?.worktreeRemovable).toBe(true);
     expect(command.bootstrap?.runSetupScript).toBe(true);
   }),
 );
@@ -341,6 +355,7 @@ it.effect("starts current-checkout threads with warning metadata", () =>
     if (command?.type !== "thread.turn.start") return;
     expect(command.bootstrap?.prepareWorktree).toBeUndefined();
     expect(command.bootstrap?.createThread?.worktreePath).toBeNull();
+    expect(command.bootstrap?.createThread?.worktreeRemovable).toBe(false);
   }),
 );
 
@@ -375,6 +390,29 @@ it.effect("starts current-checkout threads on the source worktree checkout", () 
     if (command?.type !== "thread.turn.start") return;
     expect(command.bootstrap?.prepareWorktree).toBeUndefined();
     expect(command.bootstrap?.createThread?.worktreePath).toBe("/repo/worktree");
+    expect(command.bootstrap?.createThread?.worktreeRemovable).toBe(false);
+  }),
+);
+
+it.effect("does not mark caller-supplied existing worktrees as removable", () =>
+  Effect.gen(function* () {
+    const commands: OrchestrationCommand[] = [];
+    const result = yield* callStartTool(
+      {
+        prompt: "Use existing checkout",
+        mode: "existing_worktree",
+        worktreePath: "/repo/existing-worktree",
+      },
+      commands,
+    );
+
+    expect(result.isError).toBe(false);
+    const command = commands[0];
+    expect(command?.type).toBe("thread.turn.start");
+    if (command?.type !== "thread.turn.start") return;
+    expect(command.bootstrap?.createThread?.worktreePath).toBe("/repo/existing-worktree");
+    expect(command.bootstrap?.createThread?.worktreeRemovable).toBe(false);
+    expect(command.bootstrap?.createThread?.worktreeRemovalPath).toBeNull();
   }),
 );
 
@@ -500,7 +538,7 @@ it.effect("falls back to the project checkout when the source worktree path is s
     const result = yield* callStartTool({ prompt: "Continue after cleanup" }, commands, {
       project: {
         ...project,
-        workspaceRoot: "/repo/project",
+        workspaceRoot: "/repo/packages/app",
       },
       sourceThread: {
         ...sourceThread,
@@ -540,7 +578,12 @@ it.effect("falls back to the project checkout when the source worktree path is s
       vcsDetect: (input) =>
         Effect.sync(() => {
           vcsCalls.push(input.cwd);
-          return input.cwd === "/repo/missing-worktree" ? null : makeGitHandle(input.cwd);
+          return input.cwd === "/repo/missing-worktree"
+            ? null
+            : makeGitHandle(input.cwd, {
+                rootPath: "/repo",
+                metadataPath: "/repo/.git",
+              });
         }),
     });
 
@@ -549,11 +592,12 @@ it.effect("falls back to the project checkout when the source worktree path is s
     expect(command?.type).toBe("thread.turn.start");
     if (command?.type !== "thread.turn.start") return;
     expect(command.bootstrap?.prepareWorktree).toMatchObject({
-      projectCwd: "/repo/project",
+      projectCwd: "/repo/packages/app",
       baseBranch: "main",
+      workspaceRelativePath: "packages/app",
     });
-    expect(vcsCalls).toEqual(["/repo/missing-worktree"]);
-    expect(gitCalls).toEqual(["listRefs:/repo/project"]);
+    expect(vcsCalls).toEqual(["/repo/missing-worktree", "/repo/packages/app"]);
+    expect(gitCalls).toEqual(["listRefs:/repo/packages/app"]);
   }),
 );
 
@@ -603,7 +647,7 @@ it.effect("falls back when source worktree detection fails because the cwd is mi
       projectCwd: "/repo/project",
       baseBranch: "main",
     });
-    expect(vcsCalls).toEqual(["/repo/missing-worktree"]);
+    expect(vcsCalls).toEqual(["/repo/missing-worktree", "/repo/project"]);
   }),
 );
 
@@ -668,7 +712,7 @@ it.effect("resolves current-checkout branch from the project checkout after sour
     if (command?.type !== "thread.turn.start") return;
     expect(command.bootstrap?.createThread?.branch).toBe("main");
     expect(command.bootstrap?.createThread?.worktreePath).toBeNull();
-    expect(vcsCalls).toEqual(["/repo/missing-worktree"]);
+    expect(vcsCalls).toEqual(["/repo/missing-worktree", "/repo/project"]);
     expect(gitCalls).toEqual(["status:/repo/project"]);
   }),
 );
@@ -739,7 +783,7 @@ it.effect(
         projectCwd: "/repo/project",
         baseBranch: "main",
       });
-      expect(vcsCalls).toEqual(["/repo/missing-worktree"]);
+      expect(vcsCalls).toEqual(["/repo/missing-worktree", "/repo/project"]);
       expect(gitCalls).toEqual(["listRefs:/repo/project", "status:/repo/project"]);
     }),
 );
@@ -927,6 +971,7 @@ it.effect("accepts same-repo source worktrees when project detection uses relati
     expect(command.bootstrap?.prepareWorktree).toMatchObject({
       projectCwd: "/repo-worktree/packages/app",
       baseBranch: "main",
+      workspaceRelativePath: "packages/app",
     });
   }),
 );

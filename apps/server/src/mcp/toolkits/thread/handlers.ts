@@ -67,6 +67,11 @@ const resolveOption = <A>(
 const bytesToHex = (bytes: Uint8Array): string =>
   Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
 
+interface SourceCwdProjectMatch {
+  readonly belongsToProject: boolean;
+  readonly workspaceRelativePath: string | null;
+}
+
 export type ActiveThreadStartRuntime = (
   input: ThreadStartToolInput,
   invocation: McpInvocationContext.McpInvocationScope,
@@ -142,31 +147,84 @@ const makeActiveThreadStartRuntime = Effect.fn("ThreadToolkit.makeActiveRuntime"
     );
   };
 
+  const workspaceRelativePathFromRepositoryRoot = (
+    repositoryRoot: string,
+    candidate: string,
+  ): string | null => {
+    const relative = path.relative(path.normalize(repositoryRoot), path.normalize(candidate));
+    if (
+      relative === "" ||
+      relative === "." ||
+      relative === ".." ||
+      relative.startsWith(`..${path.sep}`) ||
+      path.isAbsolute(relative)
+    ) {
+      return null;
+    }
+    return relative;
+  };
+
   const sourceCwdBelongsToProject = Effect.fn("ThreadToolkit.sourceCwdBelongsToProject")(function* (
     projectRoot: string,
     candidate: string,
   ) {
     const candidateHandle = yield* vcsDriverRegistry.detect({ cwd: candidate });
-    if (!candidateHandle) return false;
+    if (!candidateHandle) {
+      return {
+        belongsToProject: false,
+        workspaceRelativePath: null,
+      } satisfies SourceCwdProjectMatch;
+    }
+
+    const workspaceRelativePath = workspaceRelativePathFromRepositoryRoot(
+      candidateHandle.repository.rootPath,
+      candidate,
+    );
 
     const projectHandle = yield* vcsDriverRegistry.detect({ cwd: projectRoot });
-    if (!projectHandle) return isPathWithin(projectRoot, candidateHandle.repository.rootPath);
+    if (!projectHandle) {
+      return {
+        belongsToProject: isPathWithin(projectRoot, candidateHandle.repository.rootPath),
+        workspaceRelativePath,
+      } satisfies SourceCwdProjectMatch;
+    }
 
-    return (
-      candidateHandle.kind === projectHandle.kind &&
-      repositoryIdentityPath(candidateHandle.repository, candidate) ===
-        repositoryIdentityPath(projectHandle.repository, projectRoot)
-    );
+    return {
+      belongsToProject:
+        candidateHandle.kind === projectHandle.kind &&
+        repositoryIdentityPath(candidateHandle.repository, candidate) ===
+          repositoryIdentityPath(projectHandle.repository, projectRoot),
+      workspaceRelativePath,
+    } satisfies SourceCwdProjectMatch;
   });
 
-  const sourceCwdIsUsable = Effect.fn("ThreadToolkit.sourceCwdIsUsable")(function* (
+  const workspaceRelativePathForCwd = Effect.fn("ThreadToolkit.workspaceRelativePathForCwd")(
+    function* (cwd: string) {
+      const handle = yield* vcsDriverRegistry
+        .detect({ cwd })
+        .pipe(Effect.orElseSucceed(() => null));
+      return handle
+        ? workspaceRelativePathFromRepositoryRoot(handle.repository.rootPath, cwd)
+        : null;
+    },
+  );
+
+  const sourceCwdProjectContext = Effect.fn("ThreadToolkit.sourceCwdProjectContext")(function* (
     projectRoot: string,
     candidate: string,
   ) {
     return yield* sourceCwdBelongsToProject(projectRoot, candidate).pipe(
       Effect.matchEffect({
-        onFailure: (error) => Effect.succeed(!isMissingCwdSpawnError(error, candidate)),
-        onSuccess: Effect.succeed,
+        onFailure: (error) =>
+          Effect.succeed({
+            usable: !isMissingCwdSpawnError(error, candidate),
+            workspaceRelativePath: null,
+          }),
+        onSuccess: (match) =>
+          Effect.succeed({
+            usable: match.belongsToProject,
+            workspaceRelativePath: match.belongsToProject ? match.workspaceRelativePath : null,
+          }),
       }),
     );
   });
@@ -177,11 +235,25 @@ const makeActiveThreadStartRuntime = Effect.fn("ThreadToolkit.makeActiveRuntime"
   ) {
     const candidate = resolveThreadWorkspaceCwd({ thread: sourceThread, projects: [project] });
     if (!candidate || candidate === project.workspaceRoot) {
-      return { cwd: project.workspaceRoot, canUseSourceBranch: true };
+      return {
+        cwd: project.workspaceRoot,
+        canUseSourceBranch: true,
+        workspaceRelativePath: yield* workspaceRelativePathForCwd(project.workspaceRoot),
+      };
     }
-    return (yield* sourceCwdIsUsable(project.workspaceRoot, candidate))
-      ? { cwd: candidate, canUseSourceBranch: true }
-      : { cwd: project.workspaceRoot, canUseSourceBranch: false };
+    const sourceContext = yield* sourceCwdProjectContext(project.workspaceRoot, candidate);
+    if (sourceContext.usable) {
+      return {
+        cwd: candidate,
+        canUseSourceBranch: true,
+        workspaceRelativePath: sourceContext.workspaceRelativePath,
+      };
+    }
+    return {
+      cwd: project.workspaceRoot,
+      canUseSourceBranch: false,
+      workspaceRelativePath: yield* workspaceRelativePathForCwd(project.workspaceRoot),
+    };
   });
 
   const resolveNewWorktreeBaseBranch = Effect.fn("ThreadToolkit.resolveNewWorktreeBaseBranch")(
@@ -271,7 +343,7 @@ const makeActiveThreadStartRuntime = Effect.fn("ThreadToolkit.makeActiveRuntime"
     const { sourceThread, project } = yield* loadSourceContext(invocation);
     const mode = input.mode ?? "new_worktree";
     const sourceCwdContext = yield* resolveSourceCwd(project, sourceThread);
-    const { cwd: sourceCwd, canUseSourceBranch } = sourceCwdContext;
+    const { cwd: sourceCwd, canUseSourceBranch, workspaceRelativePath } = sourceCwdContext;
     const ids = yield* makeIds();
     const createdAt = yield* nowIso;
     const branch =
@@ -283,6 +355,7 @@ const makeActiveThreadStartRuntime = Effect.fn("ThreadToolkit.makeActiveRuntime"
         : mode === "current_checkout" && sourceCwd !== project.workspaceRoot
           ? sourceCwd
           : null;
+    const worktreeRemovable = mode === "new_worktree";
     const title = input.title ?? truncateTitle(input.prompt);
     const providerInstances = yield* providerInstanceRegistry.listInstances;
     const modelSources = yield* Effect.forEach(
@@ -315,6 +388,7 @@ const makeActiveThreadStartRuntime = Effect.fn("ThreadToolkit.makeActiveRuntime"
               canUseSourceBranch,
             ),
             branch: branch ?? undefined,
+            ...(workspaceRelativePath !== null ? { workspaceRelativePath } : {}),
           }
         : undefined;
 
@@ -345,6 +419,8 @@ const makeActiveThreadStartRuntime = Effect.fn("ThreadToolkit.makeActiveRuntime"
           interactionMode,
           branch,
           worktreePath,
+          worktreeRemovable,
+          worktreeRemovalPath: worktreeRemovable ? worktreePath : null,
           createdAt,
         },
         ...(prepareWorktree

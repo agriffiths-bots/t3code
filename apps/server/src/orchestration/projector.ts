@@ -283,6 +283,12 @@ export function projectEvent(
             interactionMode: payload.interactionMode,
             branch: payload.branch,
             worktreePath: payload.worktreePath,
+            ...(payload.worktreeRemovable !== undefined
+              ? { worktreeRemovable: payload.worktreeRemovable }
+              : {}),
+            ...(payload.worktreeRemovalPath !== undefined
+              ? { worktreeRemovalPath: payload.worktreeRemovalPath }
+              : {}),
             latestTurn: null,
             createdAt: payload.createdAt,
             updatedAt: payload.updatedAt,
@@ -349,6 +355,12 @@ export function projectEvent(
               : {}),
             ...(payload.branch !== undefined ? { branch: payload.branch } : {}),
             ...(payload.worktreePath !== undefined ? { worktreePath: payload.worktreePath } : {}),
+            ...(payload.worktreeRemovable !== undefined
+              ? { worktreeRemovable: payload.worktreeRemovable }
+              : {}),
+            ...(payload.worktreeRemovalPath !== undefined
+              ? { worktreeRemovalPath: payload.worktreeRemovalPath }
+              : {}),
             updatedAt: payload.updatedAt,
           }),
         })),

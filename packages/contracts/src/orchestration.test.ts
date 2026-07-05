@@ -278,6 +278,7 @@ it.effect("accepts bootstrap metadata in thread.turn.start", () =>
           baseBranch: "main",
           branch: "t3code/example",
           startFromOrigin: true,
+          workspaceRelativePath: "packages/app",
         },
         runSetupScript: true,
       },
@@ -286,6 +287,7 @@ it.effect("accepts bootstrap metadata in thread.turn.start", () =>
     assert.strictEqual(parsed.bootstrap?.createThread?.projectId, "project-1");
     assert.strictEqual(parsed.bootstrap?.prepareWorktree?.baseBranch, "main");
     assert.strictEqual(parsed.bootstrap?.prepareWorktree?.startFromOrigin, true);
+    assert.strictEqual(parsed.bootstrap?.prepareWorktree?.workspaceRelativePath, "packages/app");
     assert.strictEqual(parsed.bootstrap?.runSetupScript, true);
   }),
 );

@@ -11,6 +11,7 @@ import * as Crypto from "effect/Crypto";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import * as Path from "effect/Path";
 import * as Schema from "effect/Schema";
 
 import { GitWorkflowService } from "../../git/GitWorkflowService.ts";
@@ -106,6 +107,7 @@ export const layer = Layer.effect(
     const gitWorkflow = yield* GitWorkflowService;
     const projectSetupScriptRunner = yield* ProjectSetupScriptRunner;
     const vcsStatusBroadcaster = yield* VcsStatusBroadcaster;
+    const path = yield* Path.Path;
 
     const toDispatchCommandError = (cause: unknown, fallbackMessage: string) =>
       isOrchestrationDispatchCommandError(cause)
@@ -169,6 +171,33 @@ export const layer = Layer.effect(
       vcsStatusBroadcaster
         .refreshStatus(cwd)
         .pipe(Effect.ignoreCause({ log: true }), Effect.forkDetach, Effect.asVoid);
+
+    const normalizeWorkspaceRelativePath = (workspaceRelativePath: string | undefined) => {
+      if (!workspaceRelativePath) {
+        return Effect.succeed(null);
+      }
+      const normalizedRelativePath = path.normalize(workspaceRelativePath);
+      if (normalizedRelativePath === "." || normalizedRelativePath.length === 0) {
+        return Effect.succeed(null);
+      }
+      if (
+        path.isAbsolute(normalizedRelativePath) ||
+        normalizedRelativePath === ".." ||
+        normalizedRelativePath.startsWith(`..${path.sep}`)
+      ) {
+        return Effect.fail(
+          new OrchestrationDispatchCommandError({
+            message: `Invalid worktree workspace relative path: ${workspaceRelativePath}`,
+          }),
+        );
+      }
+      return Effect.succeed(normalizedRelativePath);
+    };
+
+    const applyWorkspaceRelativePath = (
+      worktreeRoot: string,
+      workspaceRelativePath: string | null,
+    ) => (workspaceRelativePath ? path.join(worktreeRoot, workspaceRelativePath) : worktreeRoot);
 
     const dispatch = Effect.fn("BootstrapTurnStartDispatcher.dispatch")(function* (
       command: ThreadTurnStartCommand,
@@ -322,12 +351,22 @@ export const layer = Layer.effect(
             interactionMode: bootstrap.createThread.interactionMode,
             branch: bootstrap.createThread.branch,
             worktreePath: bootstrap.createThread.worktreePath,
+            worktreeRemovable:
+              bootstrap.createThread.worktreeRemovable ?? bootstrap.prepareWorktree !== undefined,
+            worktreeRemovalPath:
+              bootstrap.createThread.worktreeRemovalPath ??
+              (bootstrap.prepareWorktree === undefined
+                ? bootstrap.createThread.worktreePath
+                : null),
             createdAt: bootstrap.createThread.createdAt,
           });
           createdThread = true;
         }
 
         if (bootstrap?.prepareWorktree) {
+          const workspaceRelativePath = yield* normalizeWorkspaceRelativePath(
+            bootstrap.prepareWorktree.workspaceRelativePath,
+          );
           let worktreeBaseRef = bootstrap.prepareWorktree.baseBranch;
           if (bootstrap.prepareWorktree.startFromOrigin) {
             yield* gitWorkflow.fetchRemote({
@@ -348,13 +387,18 @@ export const layer = Layer.effect(
             baseRefName: bootstrap.prepareWorktree.baseBranch,
             path: null,
           });
-          targetWorktreePath = worktree.worktree.path;
+          targetWorktreePath = applyWorkspaceRelativePath(
+            worktree.worktree.path,
+            workspaceRelativePath,
+          );
           yield* orchestrationEngine.dispatch({
             type: "thread.meta.update",
             commandId: yield* serverCommandId("bootstrap-thread-meta-update"),
             threadId: command.threadId,
             branch: worktree.worktree.refName,
             worktreePath: targetWorktreePath,
+            worktreeRemovable: true,
+            worktreeRemovalPath: worktree.worktree.path,
           });
           yield* refreshGitStatus(targetWorktreePath);
         }

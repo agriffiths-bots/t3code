@@ -30,6 +30,8 @@ function makeThread(overrides: Partial<Thread> = {}): Thread {
     latestTurn: null,
     branch: null,
     worktreePath: null,
+    worktreeRemovable: true,
+    worktreeRemovalPath: null,
     ...overrides,
   };
 }
@@ -46,10 +48,49 @@ describe("getOrphanedWorktreePathForThread", () => {
     expect(result).toBeNull();
   });
 
-  it("returns the path when no other thread links to that worktree", () => {
-    const threads = [makeThread({ worktreePath: "/tmp/repo/worktrees/feature-a" })];
+  it("returns the removal path when no other thread links to that worktree", () => {
+    const threads = [
+      makeThread({
+        worktreePath: "/tmp/repo/worktrees/feature-a/packages/app",
+        worktreeRemovalPath: "/tmp/repo/worktrees/feature-a",
+      }),
+    ];
     const result = getOrphanedWorktreePathForThread(threads, ThreadId.make("thread-1"));
     expect(result).toBe("/tmp/repo/worktrees/feature-a");
+  });
+
+  it("returns null when the target thread does not own its worktree path", () => {
+    const threads = [
+      makeThread({
+        worktreePath: "/tmp/repo/worktrees/source-checkout",
+        worktreeRemovable: false,
+      }),
+    ];
+    const result = getOrphanedWorktreePathForThread(threads, ThreadId.make("thread-1"));
+    expect(result).toBeNull();
+    expect(
+      getOrphanedWorktreePathForThread(
+        [{ id: ThreadId.make("thread-1"), worktreePath: "/tmp/repo/worktrees/legacy" }],
+        ThreadId.make("thread-1"),
+      ),
+    ).toBeNull();
+  });
+
+  it("returns null when another thread uses a sibling workspace under the removal root", () => {
+    const threads = [
+      makeThread({
+        id: ThreadId.make("thread-1"),
+        worktreePath: "/tmp/repo/worktrees/feature-a/packages/app",
+        worktreeRemovalPath: "/tmp/repo/worktrees/feature-a",
+      }),
+      makeThread({
+        id: ThreadId.make("thread-2"),
+        worktreePath: "/tmp/repo/worktrees/feature-a/packages/lib",
+        worktreeRemovable: false,
+      }),
+    ];
+    const result = getOrphanedWorktreePathForThread(threads, ThreadId.make("thread-1"));
+    expect(result).toBeNull();
   });
 
   it("returns null when another thread links to the same worktree", () => {
