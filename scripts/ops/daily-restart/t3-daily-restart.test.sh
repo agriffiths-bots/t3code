@@ -174,6 +174,12 @@ if [[ "$1" == "-" && "${2:-}" == http* ]]; then
   if [[ "${FAKE_RESUME_TOKEN_VALIDATE_UNREACHABLE_ONCE:-0}" == "1" && "$validate_count" == "1" ]]; then
     exit 2
   fi
+  if [[ -n "${FAKE_RESUME_TOKEN_VALIDATE_HTTP_STATUS:-}" && "$validate_count" == "1" ]]; then
+    case "$FAKE_RESUME_TOKEN_VALIDATE_HTTP_STATUS" in
+      502|503|504) exit 2 ;;
+      *) exit 9 ;;
+    esac
+  fi
   if [[ " ${FAKE_RESUME_TOKEN_SCOPES:-orchestration:operate} " != *" orchestration:operate "* ]]; then
     exit 9
   fi
@@ -319,6 +325,24 @@ unset FAKE_RESUME_TOKEN_VALIDATE_UNREACHABLE_ONCE
 [[ "$(cat "$tmp/rc")" == "0" ]] && pass "unreachable origin during token validation recovers" || fail "unreachable origin during token validation recovers"
 assert_order "$tmp/calls.log" "validate-resume-token" "systemctl --user stop fake.service" "systemctl --user start fake.service" "validate-resume-token" "inject"
 grep -Fq "RESULT OK" "$tmp/ledger/"*/t3-daily-restart.result && pass "deferred token validation records ok after recovery" || fail "deferred token validation records ok after recovery"
+
+tmp="$(mktemp -d)"
+export FAKE_RESUME_TOKEN_VALIDATE_HTTP_STATUS=503
+run_manager "$tmp"
+unset FAKE_RESUME_TOKEN_VALIDATE_HTTP_STATUS
+[[ "$(cat "$tmp/rc")" == "0" ]] && pass "service-unavailable token validation response recovers" || fail "service-unavailable token validation response recovers"
+assert_order "$tmp/calls.log" "validate-resume-token" "systemctl --user stop fake.service" "systemctl --user start fake.service" "validate-resume-token" "inject"
+
+tmp="$(mktemp -d)"
+export FAKE_RESUME_TOKEN_VALIDATE_HTTP_STATUS=401
+run_manager "$tmp"
+unset FAKE_RESUME_TOKEN_VALIDATE_HTTP_STATUS
+[[ "$(cat "$tmp/rc")" != "0" ]] && pass "auth HTTP token validation response exits nonzero" || fail "auth HTTP token validation response exits nonzero"
+if grep -Fq "systemctl --user stop" "$tmp/calls.log"; then
+  fail "auth HTTP token validation response stopped service"
+else
+  pass "auth HTTP token validation response aborts before stop"
+fi
 
 tmp="$(mktemp -d)"
 run_manager "$tmp" --origin not-a-url

@@ -391,6 +391,10 @@ async function main() {
   }
   if (!response.ok) {
     const body = await response.text().catch(() => "");
+    if ([502, 503, 504].includes(response.status)) {
+      console.error(`auth session unavailable HTTP ${response.status}: ${body.slice(0, 300)}`);
+      process.exit(2);
+    }
     throw new Error(`auth session HTTP ${response.status}: ${body.slice(0, 300)}`);
   }
   const session = await response.json();

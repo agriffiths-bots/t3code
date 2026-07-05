@@ -66,12 +66,13 @@ checks, rollback re-probes, and resume injection. It also validates that an
 existing `T3DR_TOKEN`/`T3_TOKEN` is authenticated with `orchestration:operate`,
 or mints and validates a short-lived resume-injection token before the service
 is stopped, so auth failures abort while the original service is still
-available. If the origin is already unreachable before the restart starts, the
-manager keeps the prepared token but defers validation until after the service is
-started again, before any resume injection. If post-start health fails after the
-updated service was started, the manager always restores the cycle-start DB
-snapshot as part of rollback; the current DB is moved aside by `t3-db-restore`.
-Result and full logs are written under `$T3DR_LEDGER/<UTC date>/`.
+available. If the origin is already unreachable or returns a gateway/service
+unavailable response before the restart starts, the manager keeps the prepared
+token but defers validation until after the service is started again, before any
+resume injection. If post-start health fails after the updated service was
+started, the manager always restores the cycle-start DB snapshot as part of
+rollback; the current DB is moved aside by `t3-db-restore`. Result and full logs
+are written under `$T3DR_LEDGER/<UTC date>/`.
 Set `T3DR_SMOKE_INSTANCE` and `T3DR_SMOKE_MODEL` to the provider/model pair the
 health probe should wake. For one-off operator runs, `--smoke-instance` and
 `--smoke-model` override those environment defaults.
