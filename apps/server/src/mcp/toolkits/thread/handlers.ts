@@ -365,6 +365,12 @@ const makeActiveThreadStartRuntime = Effect.fn("ThreadToolkit.makeActiveRuntime"
           ? sourceCwd
           : null;
     const worktreeRemovable = mode === "new_worktree";
+    const worktreeRemovalPath = worktreeRemovable
+      ? worktreePath
+      : mode === "current_checkout" && worktreePath !== null
+        ? (sourceThread.worktreeRemovalPath ??
+          (sourceThread.worktreeRemovable === true ? sourceThread.worktreePath : null))
+        : null;
     const title = input.title ?? truncateTitle(input.prompt);
     const titleSeed = input.title === undefined ? title : undefined;
     const providerInstances = yield* providerInstanceRegistry.listInstances;
@@ -430,7 +436,7 @@ const makeActiveThreadStartRuntime = Effect.fn("ThreadToolkit.makeActiveRuntime"
           branch,
           worktreePath,
           worktreeRemovable,
-          worktreeRemovalPath: worktreeRemovable ? worktreePath : null,
+          worktreeRemovalPath,
           createdAt,
         },
         ...(prepareWorktree

@@ -413,6 +413,44 @@ it.effect("starts current-checkout threads on the source worktree checkout", () 
   }),
 );
 
+it.effect("preserves source worktree removal root for current-checkout subdirectory children", () =>
+  Effect.gen(function* () {
+    const commands: OrchestrationCommand[] = [];
+    const result = yield* callStartTool(
+      { prompt: "Read current worktree package", mode: "current_checkout" },
+      commands,
+      {
+        project: {
+          ...project,
+          workspaceRoot: "/repo/project",
+        },
+        sourceThread: {
+          ...sourceThread,
+          worktreePath: "/repo/worktree/packages/app",
+          worktreeRemovable: true,
+          worktreeRemovalPath: "/repo/worktree",
+        },
+        vcsDetect: (input) =>
+          Effect.succeed(
+            makeGitHandle(input.cwd, {
+              rootPath: input.cwd.startsWith("/repo/worktree") ? "/repo/worktree" : "/repo",
+              metadataPath: "/repo/.git",
+            }),
+          ),
+      },
+    );
+
+    expect(result.isError).toBe(false);
+    const command = commands[0];
+    expect(command?.type).toBe("thread.turn.start");
+    if (command?.type !== "thread.turn.start") return;
+    expect(command.bootstrap?.prepareWorktree).toBeUndefined();
+    expect(command.bootstrap?.createThread?.worktreePath).toBe("/repo/worktree/packages/app");
+    expect(command.bootstrap?.createThread?.worktreeRemovable).toBe(false);
+    expect(command.bootstrap?.createThread?.worktreeRemovalPath).toBe("/repo/worktree");
+  }),
+);
+
 it.effect("does not mark caller-supplied existing worktrees as removable", () =>
   Effect.gen(function* () {
     const commands: OrchestrationCommand[] = [];
