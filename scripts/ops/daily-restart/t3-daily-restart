@@ -7,6 +7,7 @@ export PATH
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 
 db="${T3DR_DB:-/home/adam/.t3-vps/userdata/state.sqlite}"
+attachments_dir="${T3DR_ATTACHMENTS_DIR:-}"
 checkout="${T3DR_CHECKOUT:-/home/adam/t3code}"
 service="${T3DR_SERVICE:-t3code.service}"
 origin="${T3DR_ORIGIN:-http://127.0.0.1:3773}"
@@ -27,6 +28,7 @@ usage() {
   cat >&2 <<'USAGE'
 usage: t3-daily-restart [--db PATH] [--checkout PATH] [--service NAME]
                         [--origin URL] [--snapshot-dir DIR] [--ledger DIR]
+                        [--attachments-dir DIR]
                         [--probe-timeout SECS]
                         [--smoke-instance INSTANCE] [--smoke-model MODEL]
                         [--prebuilt-target --rollback-sha SHA [--target-sha SHA]]
@@ -45,6 +47,7 @@ require_value() {
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --db) require_value "$@"; db="$2"; shift 2 ;;
+    --attachments-dir) require_value "$@"; attachments_dir="$2"; shift 2 ;;
     --checkout) require_value "$@"; checkout="$2"; shift 2 ;;
     --service) require_value "$@"; service="$2"; shift 2 ;;
     --origin) require_value "$@"; origin="$2"; shift 2 ;;
@@ -64,6 +67,9 @@ done
 if [[ -z "$db" || -z "$checkout" || -z "$service" || -z "$origin" || -z "$snapshot_dir" || -z "$ledger" ]]; then
   usage
   exit 2
+fi
+if [[ -z "$attachments_dir" ]]; then
+  attachments_dir="$(dirname "$db")/attachments"
 fi
 if ! [[ "$probe_timeout" =~ ^[0-9]+$ ]]; then
   echo "t3-daily-restart: --probe-timeout must be a positive integer" >&2
@@ -114,7 +120,7 @@ if [[ "$prebuilt_target" == "1" && ( -z "$prebuilt_assets_dir" || ! -d "$prebuil
 fi
 
 export T3DR_DB="$db" T3DR_CHECKOUT="$checkout" T3DR_SERVICE="$service" T3DR_ORIGIN="$origin"
-export T3DR_SNAPSHOT_DIR="$snapshot_dir" T3DR_LEDGER="$ledger"
+export T3DR_ATTACHMENTS_DIR="$attachments_dir" T3DR_SNAPSHOT_DIR="$snapshot_dir" T3DR_LEDGER="$ledger"
 export T3DR_SMOKE_INSTANCE="$smoke_instance" T3DR_SMOKE_MODEL="$smoke_model"
 
 utc_date="$(date -u +%F)"
@@ -273,10 +279,36 @@ NODE
 }
 
 json_validate_manifest() {
-  if [[ ! -s "$manifest" ]]; then
-    printf '{}\n' >"$manifest"
+  local target="${1:-$manifest}"
+  if [[ ! -s "$target" ]]; then
+    printf '{}\n' >"$target"
   fi
-  node -e 'JSON.parse(require("node:fs").readFileSync(process.argv[1], "utf8"))' "$manifest"
+  node -e 'JSON.parse(require("node:fs").readFileSync(process.argv[1], "utf8"))' "$target"
+}
+
+capture_active_manifest() {
+  local phase="$1"
+  local candidate="$manifest.$phase.$$"
+  rm -f -- "$candidate" || {
+    log "$phase failed to clear stale capture candidate"
+    return 1
+  }
+  if ! run_capture 300 "$capture_tool" --db "$db" --out "$candidate"; then
+    log "$phase capture-active-threads failed"
+    rm -f -- "$candidate"
+    return 1
+  fi
+  if ! json_validate_manifest "$candidate" >>"$log_file" 2>&1; then
+    log "$phase capture manifest was not valid JSON"
+    rm -f -- "$candidate"
+    return 1
+  fi
+  if ! mv -f -- "$candidate" "$manifest"; then
+    log "$phase failed to publish capture manifest"
+    rm -f -- "$candidate"
+    return 1
+  fi
+  log "$phase capture_manifest=$manifest"
 }
 
 health_is_pass() {
@@ -311,7 +343,8 @@ inject_resume_manifest() {
     log "missing inject-resume"
     return 1
   }
-  run_capture 600 "$inject_tool" --origin "$origin" --manifest "$manifest"
+  run_capture 600 "$inject_tool" --origin "$origin" --manifest "$manifest" \
+    --attachments-dir "$attachments_dir"
 }
 
 run_health_probe() {
@@ -563,13 +596,7 @@ capture_tool="$(resolve_tool capture-active-threads)" || {
   exit 1
 }
 
-if ! run_capture 300 "$capture_tool" --db "$db" --out "$manifest"; then
-  log "capture-active-threads failed"
-  record_result "FAILED"
-  exit 1
-fi
-if ! json_validate_manifest >>"$log_file" 2>&1; then
-  log "capture manifest was not valid JSON"
+if ! capture_active_manifest "pre-stop"; then
   record_result "FAILED"
   exit 1
 fi
@@ -583,6 +610,18 @@ fi
 if ! stop_service_or_escalate "SHUTDOWN"; then
   log "systemctl stop failed"
   record_result "STOP-FAILED"
+  exit 1
+fi
+
+if ! capture_active_manifest "post-stop"; then
+  log "post-stop capture failed after service stop"
+  record_result "FAILED"
+  if run_capture 60 systemctl --user start "$service"; then
+    log "restarted unchanged service after post-stop capture failure"
+    inject_resume_manifest || log "failed to inject pre-stop resume after post-stop capture failure"
+  else
+    log "failed to restart after post-stop capture failure"
+  fi
   exit 1
 fi
 

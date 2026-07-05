@@ -39,7 +39,17 @@ export interface CapturedThread {
   readonly interaction_mode: string;
   readonly title: string;
   readonly project_id: string;
+  readonly pending_message?: CapturedPendingMessage;
   readonly injected_at: null;
+}
+
+export interface CapturedPendingMessage {
+  readonly message_id: string;
+  readonly text: string;
+  readonly attachments: ReadonlyArray<unknown>;
+  readonly model_selection?: unknown;
+  readonly title_seed?: string;
+  readonly source_proposed_plan?: unknown;
 }
 
 export interface CaptureManifest {
@@ -54,10 +64,17 @@ interface SessionRow {
   readonly thread_id: string;
   readonly status: string;
   readonly active_turn_id: string | null;
+  readonly pending_turn_thread_id: string | null;
   readonly runtime_mode: string;
   readonly interaction_mode: string;
   readonly title: string;
   readonly project_id: string;
+  readonly pending_message_id: string | null;
+  readonly pending_message_text: string | null;
+  readonly pending_message_attachments_json: string | null;
+  readonly pending_model_selection_json: string | null;
+  readonly pending_title_seed: string | null;
+  readonly pending_source_proposed_plan_json: string | null;
 }
 
 interface ParsedArgs {
@@ -80,6 +97,7 @@ export function openCaptureDatabase(dbPath: string): CaptureDatabase {
 
 function roleForRow(row: SessionRow): CapturedThread["role"] {
   return (row.active_turn_id !== null && !TERMINAL_STATUSES.has(row.status)) ||
+    row.pending_turn_thread_id !== null ||
     ACTIVE_STATUSES.has(row.status)
     ? "active"
     : "waiting";
@@ -88,36 +106,100 @@ function roleForRow(row: SessionRow): CapturedThread["role"] {
 function buildCaptureQuery(excludedThreadIds: ReadonlyArray<string>) {
   const excludedClause =
     excludedThreadIds.length > 0
-      ? `AND sessions.thread_id NOT IN (${excludedThreadIds.map(() => "?").join(", ")})`
+      ? `AND threads.thread_id NOT IN (${excludedThreadIds.map(() => "?").join(", ")})`
       : "";
+  const livePendingPredicate = `(
+          pending_turns.thread_id IS NOT NULL
+          AND (
+            sessions.updated_at IS NULL
+            OR (
+              sessions.status IN ('error', 'interrupted', 'stopped')
+              AND pending_turns.requested_at > sessions.updated_at
+            )
+            OR sessions.status = 'starting'
+            OR (
+              sessions.status NOT IN ('error', 'interrupted', 'stopped')
+              AND pending_turns.requested_at >= sessions.updated_at
+            )
+          )
+        )`;
 
   return `
     SELECT
-      sessions.thread_id,
-      sessions.status,
+      threads.thread_id,
+      COALESCE(sessions.status, 'ready') AS status,
       sessions.active_turn_id,
-      sessions.runtime_mode,
+      CASE
+        WHEN ${livePendingPredicate} THEN pending_turns.thread_id
+        ELSE NULL
+      END AS pending_turn_thread_id,
+      COALESCE(
+        CASE
+          WHEN ${livePendingPredicate}
+            THEN json_extract(turn_start_events.payload_json, '$.runtimeMode')
+          ELSE NULL
+        END,
+        sessions.runtime_mode,
+        threads.runtime_mode
+      ) AS runtime_mode,
       COALESCE(
         json_extract(turn_start_events.payload_json, '$.interactionMode'),
         threads.interaction_mode
       ) AS interaction_mode,
       threads.title,
-      threads.project_id
-    FROM projection_thread_sessions sessions
-    INNER JOIN projection_threads threads ON threads.thread_id = sessions.thread_id
+      threads.project_id,
+      CASE
+        WHEN ${livePendingPredicate} THEN pending_turns.pending_message_id
+        ELSE NULL
+      END AS pending_message_id,
+      CASE
+        WHEN ${livePendingPredicate} THEN pending_messages.text
+        ELSE NULL
+      END AS pending_message_text,
+      CASE
+        WHEN ${livePendingPredicate} THEN pending_messages.attachments_json
+        ELSE NULL
+      END AS pending_message_attachments_json,
+      CASE
+        WHEN ${livePendingPredicate} THEN json_extract(turn_start_events.payload_json, '$.modelSelection')
+        ELSE NULL
+      END AS pending_model_selection_json,
+      CASE
+        WHEN ${livePendingPredicate} THEN json_extract(turn_start_events.payload_json, '$.titleSeed')
+        ELSE NULL
+      END AS pending_title_seed,
+      CASE
+        WHEN ${livePendingPredicate} THEN json_extract(turn_start_events.payload_json, '$.sourceProposedPlan')
+        ELSE NULL
+      END AS pending_source_proposed_plan_json
+    FROM projection_threads threads
+    LEFT JOIN projection_thread_sessions sessions ON sessions.thread_id = threads.thread_id
     LEFT JOIN projection_turns active_turns
-      ON active_turns.thread_id = sessions.thread_id
+      ON active_turns.thread_id = threads.thread_id
       AND active_turns.turn_id = sessions.active_turn_id
     LEFT JOIN projection_turns pending_turns
-      ON pending_turns.thread_id = sessions.thread_id
-      AND sessions.active_turn_id IS NULL
+      ON pending_turns.thread_id = threads.thread_id
+      AND (
+        sessions.active_turn_id IS NULL
+        OR sessions.status IN ('error', 'interrupted', 'stopped')
+      )
       AND pending_turns.turn_id IS NULL
       AND pending_turns.state = 'pending'
     LEFT JOIN orchestration_events turn_start_events
-      ON turn_start_events.stream_id = sessions.thread_id
+      ON turn_start_events.stream_id = threads.thread_id
       AND turn_start_events.event_type = 'thread.turn-start-requested'
       AND json_extract(turn_start_events.payload_json, '$.messageId') =
-        COALESCE(active_turns.pending_message_id, pending_turns.pending_message_id)
+        COALESCE(
+          CASE
+            WHEN sessions.status NOT IN ('error', 'interrupted', 'stopped')
+              THEN active_turns.pending_message_id
+            ELSE NULL
+          END,
+          CASE WHEN ${livePendingPredicate} THEN pending_turns.pending_message_id ELSE NULL END
+        )
+    LEFT JOIN projection_thread_messages pending_messages
+      ON pending_messages.thread_id = threads.thread_id
+      AND pending_messages.message_id = pending_turns.pending_message_id
     WHERE threads.deleted_at IS NULL
       AND threads.archived_at IS NULL
       AND (
@@ -128,10 +210,73 @@ function buildCaptureQuery(excludedThreadIds: ReadonlyArray<string>) {
         OR sessions.status = 'running'
         OR sessions.status = 'starting'
         OR sessions.status = 'waiting'
+        OR ${livePendingPredicate}
       )
       ${excludedClause}
-    ORDER BY sessions.thread_id
+    ORDER BY threads.thread_id
   `;
+}
+
+function parsePendingMessageAttachments(
+  threadId: string,
+  attachmentsJson: string | null,
+): ReadonlyArray<unknown> {
+  if (attachmentsJson === null) return [];
+
+  const parsed = JSON.parse(attachmentsJson) as unknown;
+  if (!Array.isArray(parsed)) {
+    throw new Error(`thread ${threadId} pending message attachments must be an array`);
+  }
+  return parsed;
+}
+
+function parseOptionalJsonField(
+  threadId: string,
+  fieldName: string,
+  valueJson: string | null,
+): unknown | undefined {
+  if (valueJson === null) return undefined;
+
+  try {
+    return JSON.parse(valueJson) as unknown;
+  } catch (error) {
+    throw new Error(`thread ${threadId} pending ${fieldName} metadata must be valid JSON`, {
+      cause: error,
+    });
+  }
+}
+
+function pendingMessageForRow(row: SessionRow): CapturedPendingMessage | undefined {
+  if (row.pending_turn_thread_id === null) return undefined;
+  if (row.pending_message_id === null) {
+    throw new Error(`thread ${row.thread_id} pending message id was not found`);
+  }
+  if (row.pending_message_text === null) {
+    throw new Error(`thread ${row.thread_id} pending message text was not found`);
+  }
+
+  const modelSelection = parseOptionalJsonField(
+    row.thread_id,
+    "model_selection",
+    row.pending_model_selection_json,
+  );
+  const sourceProposedPlan = parseOptionalJsonField(
+    row.thread_id,
+    "source_proposed_plan",
+    row.pending_source_proposed_plan_json,
+  );
+
+  return {
+    message_id: row.pending_message_id,
+    text: row.pending_message_text,
+    attachments: parsePendingMessageAttachments(
+      row.thread_id,
+      row.pending_message_attachments_json,
+    ),
+    ...(modelSelection !== undefined ? { model_selection: modelSelection } : {}),
+    ...(row.pending_title_seed !== null ? { title_seed: row.pending_title_seed } : {}),
+    ...(sourceProposedPlan !== undefined ? { source_proposed_plan: sourceProposedPlan } : {}),
+  };
 }
 
 function readCapturedThreads(
@@ -142,17 +287,21 @@ function readCapturedThreads(
     .prepare(buildCaptureQuery(excludedThreadIds))
     .all(...excludedThreadIds) as unknown as ReadonlyArray<SessionRow>;
 
-  return rows.map((row) => ({
-    thread_id: row.thread_id,
-    role: roleForRow(row),
-    status: row.status,
-    active_turn_id: row.active_turn_id,
-    runtime_mode: row.runtime_mode,
-    interaction_mode: row.interaction_mode,
-    title: row.title,
-    project_id: row.project_id,
-    injected_at: null,
-  }));
+  return rows.map((row) => {
+    const pendingMessage = pendingMessageForRow(row);
+    return {
+      thread_id: row.thread_id,
+      role: roleForRow(row),
+      status: row.status,
+      active_turn_id: row.active_turn_id,
+      runtime_mode: row.runtime_mode,
+      interaction_mode: row.interaction_mode,
+      title: row.title,
+      project_id: row.project_id,
+      ...(pendingMessage ? { pending_message: pendingMessage } : {}),
+      injected_at: null,
+    };
+  });
 }
 
 function writeJsonAtomic(outPath: string, manifest: CaptureManifest): void {

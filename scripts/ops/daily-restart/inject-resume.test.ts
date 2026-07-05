@@ -5,7 +5,13 @@ import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
 import { afterEach, assert, describe, it } from "@effect/vitest";
 
-import { RESUME_MESSAGE, injectResume, parseManifest } from "./inject-resume.ts";
+import {
+  RESUME_MESSAGE,
+  injectResume,
+  optionsFromCliArgs,
+  parseArgs,
+  parseManifest,
+} from "./inject-resume.ts";
 
 const tempDirs: Array<string> = [];
 
@@ -31,6 +37,30 @@ async function readManifest(path: string): Promise<any> {
 }
 
 describe("inject-resume", () => {
+  it("keeps parsed attachments dir in CLI options", () => {
+    const args = parseArgs(
+      [
+        "--manifest",
+        "/tmp/resume-manifest.json",
+        "--origin",
+        "http://127.0.0.1:3773",
+        "--token",
+        "test-token",
+        "--attachments-dir",
+        "/tmp/t3/attachments",
+      ],
+      {},
+    );
+
+    assert.deepEqual(optionsFromCliArgs(args), {
+      manifestPath: "/tmp/resume-manifest.json",
+      origin: "http://127.0.0.1:3773",
+      token: "test-token",
+      attachmentsDir: "/tmp/t3/attachments",
+      dryRun: false,
+    });
+  });
+
   it("validates the manifest shape", () => {
     assert.throws(() =>
       parseManifest(JSON.stringify({ version: 2, captured_at: "x", threads: [] })),
@@ -70,6 +100,22 @@ describe("inject-resume", () => {
               thread_id: "thread-1",
               role: "active",
               interaction_mode: "ask",
+              injected_at: null,
+            },
+          ],
+        }),
+      ),
+    );
+    assert.throws(() =>
+      parseManifest(
+        JSON.stringify({
+          version: 1,
+          captured_at: "x",
+          threads: [
+            {
+              thread_id: "thread-1",
+              role: "active",
+              pending_message: { message_id: "message-1", text: "hello", attachments: {} },
               injected_at: null,
             },
           ],
@@ -133,12 +179,16 @@ describe("inject-resume", () => {
         injected_at: null,
       },
     ]);
+    const attachmentsDir = NodePath.join(NodePath.dirname(manifestPath), "attachments");
+    await NodeFSP.mkdir(attachmentsDir);
+    await NodeFSP.writeFile(NodePath.join(attachmentsDir, "pending-image.png"), "png-bytes");
     const requests: Array<any> = [];
 
     const result = await injectResume({
       manifestPath,
       origin: "http://127.0.0.1:1",
       token: "test-token",
+      attachmentsDir,
       dryRun: false,
       now: () => new Date("2026-07-03T13:00:00.000Z"),
       fetchImpl: async (_url: string | URL | Request, init?: RequestInit) => {
@@ -151,6 +201,81 @@ describe("inject-resume", () => {
     assert.equal(requests[0]?.type, "thread.interaction-mode.set");
     assert.equal(requests[0]?.interactionMode, "plan");
     assert.equal(requests[1]?.type, "thread.turn.start");
+    assert.equal(requests[1]?.runtimeMode, "approval-required");
+    assert.equal(requests[1]?.interactionMode, "plan");
+  });
+
+  it("dispatches original pending messages instead of the generic resume prompt", async () => {
+    const pendingAttachments = [
+      {
+        type: "image",
+        id: "pending-image",
+        name: "pending.png",
+        mimeType: "image/png",
+        sizeBytes: 9,
+      },
+    ];
+    const manifestPath = await writeManifest([
+      {
+        thread_id: "pending-start",
+        role: "active",
+        status: "ready",
+        runtime_mode: "approval-required",
+        interaction_mode: "plan",
+        pending_message: {
+          message_id: "message-pending-start",
+          text: "Original user request",
+          attachments: pendingAttachments,
+          model_selection: { provider: "codex", model: "gpt-5.4" },
+          title_seed: "Investigate capture",
+          source_proposed_plan: {
+            threadId: "source-plan-thread",
+            planId: "plan-1",
+          },
+        },
+        injected_at: null,
+      },
+    ]);
+    const attachmentsDir = NodePath.join(NodePath.dirname(manifestPath), "attachments");
+    await NodeFSP.mkdir(attachmentsDir);
+    await NodeFSP.writeFile(NodePath.join(attachmentsDir, "pending-image.png"), "png-bytes");
+    const requests: Array<any> = [];
+
+    const result = await injectResume({
+      manifestPath,
+      origin: "http://127.0.0.1:1",
+      token: "test-token",
+      attachmentsDir,
+      dryRun: false,
+      now: () => new Date("2026-07-03T13:00:00.000Z"),
+      fetchImpl: async (_url: string | URL | Request, init?: RequestInit) => {
+        requests.push(JSON.parse(String(init?.body)));
+        return new Response("{}", { status: 200 });
+      },
+    });
+
+    assert.deepEqual(result, { injected: 1, skipped: 0, failed: 0, failures: [] });
+    assert.equal(requests[0]?.type, "thread.interaction-mode.set");
+    assert.equal(requests[0]?.interactionMode, "plan");
+    assert.equal(requests[1]?.type, "thread.turn.start");
+    assert.equal(requests[1]?.message.messageId, "message-pending-start");
+    assert.equal(requests[1]?.message.text, "Original user request");
+    assert.notEqual(requests[1]?.message.text, RESUME_MESSAGE);
+    assert.deepEqual(requests[1]?.message.attachments, [
+      {
+        type: "image",
+        name: "pending.png",
+        mimeType: "image/png",
+        sizeBytes: 9,
+        dataUrl: "data:image/png;base64,cG5nLWJ5dGVz",
+      },
+    ]);
+    assert.deepEqual(requests[1]?.modelSelection, { provider: "codex", model: "gpt-5.4" });
+    assert.equal(requests[1]?.titleSeed, "Investigate capture");
+    assert.deepEqual(requests[1]?.sourceProposedPlan, {
+      threadId: "source-plan-thread",
+      planId: "plan-1",
+    });
     assert.equal(requests[1]?.runtimeMode, "approval-required");
     assert.equal(requests[1]?.interactionMode, "plan");
   });

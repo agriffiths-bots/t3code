@@ -17,8 +17,18 @@ export interface ResumeManifestThread {
   readonly active_turn_id?: string | null;
   readonly runtime_mode?: ResumeRuntimeMode;
   readonly interaction_mode?: ResumeInteractionMode;
+  readonly pending_message?: ResumeManifestPendingMessage;
   readonly title?: string | null;
   injected_at: string | null;
+}
+
+export interface ResumeManifestPendingMessage {
+  readonly message_id: string;
+  readonly text: string;
+  readonly attachments?: ReadonlyArray<unknown>;
+  readonly model_selection?: unknown;
+  readonly title_seed?: string;
+  readonly source_proposed_plan?: unknown;
 }
 
 export interface ResumeManifest {
@@ -33,6 +43,7 @@ export interface InjectResumeOptions {
   readonly origin: string;
   readonly token?: string;
   readonly dryRun: boolean;
+  readonly attachmentsDir?: string;
   readonly now?: () => Date;
   readonly fetchImpl?: typeof fetch;
   readonly sleep?: (ms: number) => Promise<void>;
@@ -47,6 +58,14 @@ export interface InjectResumeResult {
   readonly failures: Array<{ readonly threadId: string; readonly error: string }>;
 }
 
+export interface InjectResumeCliArgs {
+  readonly manifestPath: string;
+  readonly origin: string;
+  readonly token?: string;
+  readonly attachmentsDir?: string;
+  readonly dryRun: boolean;
+}
+
 const MAX_DISPATCH_ATTEMPTS = 5;
 const DISPATCH_RETRY_BASE_MS = 4_000;
 const DISPATCH_RETRY_JITTER = 0.2;
@@ -56,6 +75,34 @@ type ResumeRuntimeMode = "approval-required" | "auto-accept-edits" | "full-acces
 type ResumeInteractionMode = "default" | "plan";
 const DEFAULT_RESUME_RUNTIME_MODE: ResumeRuntimeMode = "full-access";
 const DEFAULT_RESUME_INTERACTION_MODE: ResumeInteractionMode = "default";
+const IMAGE_EXTENSION_BY_MIME_TYPE: Record<string, string> = {
+  "image/avif": ".avif",
+  "image/bmp": ".bmp",
+  "image/gif": ".gif",
+  "image/heic": ".heic",
+  "image/heif": ".heif",
+  "image/jpeg": ".jpg",
+  "image/jpg": ".jpg",
+  "image/png": ".png",
+  "image/svg+xml": ".svg",
+  "image/tiff": ".tiff",
+  "image/webp": ".webp",
+};
+const ATTACHMENT_FILE_EXTENSIONS = [
+  ".avif",
+  ".bmp",
+  ".gif",
+  ".heic",
+  ".heif",
+  ".ico",
+  ".jpeg",
+  ".jpg",
+  ".png",
+  ".svg",
+  ".tiff",
+  ".webp",
+  ".bin",
+];
 const RESUME_RUNTIME_MODES = new Set<ResumeRuntimeMode>([
   "approval-required",
   "auto-accept-edits",
@@ -64,16 +111,21 @@ const RESUME_RUNTIME_MODES = new Set<ResumeRuntimeMode>([
 const RESUME_INTERACTION_MODES = new Set<ResumeInteractionMode>(["default", "plan"]);
 
 function usage(): string {
-  return `usage: inject-resume --manifest FILE [--origin URL] [--token TOKEN] [--dry-run]
+  return `usage: inject-resume --manifest FILE [--origin URL] [--token TOKEN] [--attachments-dir DIR] [--dry-run]
 
 Defaults: --origin reads T3DR_ORIGIN, then http://127.0.0.1:3773.
-Auth: --token overrides T3DR_TOKEN, then T3_TOKEN.`;
+Auth: --token overrides T3DR_TOKEN, then T3_TOKEN.
+Attachments: --attachments-dir overrides T3DR_ATTACHMENTS_DIR.`;
 }
 
-function parseArgs(argv: ReadonlyArray<string>, env: NodeJS.ProcessEnv) {
+export function parseArgs(
+  argv: ReadonlyArray<string>,
+  env: NodeJS.ProcessEnv,
+): InjectResumeCliArgs {
   let manifestPath: string | undefined;
   let origin = env.T3DR_ORIGIN?.trim() || "http://127.0.0.1:3773";
   let token = env.T3DR_TOKEN?.trim() || env.T3_TOKEN?.trim() || undefined;
+  let attachmentsDir = env.T3DR_ATTACHMENTS_DIR?.trim() || undefined;
   let dryRun = false;
 
   for (let index = 0; index < argv.length; index += 1) {
@@ -87,6 +139,9 @@ function parseArgs(argv: ReadonlyArray<string>, env: NodeJS.ProcessEnv) {
         break;
       case "--token":
         token = argv[++index];
+        break;
+      case "--attachments-dir":
+        attachmentsDir = argv[++index];
         break;
       case "--dry-run":
         dryRun = true;
@@ -105,7 +160,23 @@ function parseArgs(argv: ReadonlyArray<string>, env: NodeJS.ProcessEnv) {
   if (!dryRun && !token)
     throw new Error("--token TOKEN is required unless T3DR_TOKEN or T3_TOKEN is set");
 
-  return { manifestPath, origin, token, dryRun };
+  return {
+    manifestPath,
+    origin,
+    dryRun,
+    ...(token ? { token } : {}),
+    ...(attachmentsDir ? { attachmentsDir } : {}),
+  };
+}
+
+export function optionsFromCliArgs(args: InjectResumeCliArgs): InjectResumeOptions {
+  return {
+    manifestPath: args.manifestPath,
+    origin: args.origin,
+    dryRun: args.dryRun,
+    ...(args.token ? { token: args.token } : {}),
+    ...(args.attachmentsDir ? { attachmentsDir: args.attachmentsDir } : {}),
+  };
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -145,6 +216,48 @@ export function parseManifest(raw: string): ResumeManifest {
         `thread ${thread.thread_id} interaction_mode must be a valid interaction mode`,
       );
     }
+    if (thread.pending_message !== undefined) {
+      if (!isRecord(thread.pending_message)) {
+        throw new Error(`thread ${thread.thread_id} pending_message must be an object`);
+      }
+      if (
+        typeof thread.pending_message.message_id !== "string" ||
+        thread.pending_message.message_id.length === 0
+      ) {
+        throw new Error(`thread ${thread.thread_id} pending_message.message_id must be a string`);
+      }
+      if (typeof thread.pending_message.text !== "string") {
+        throw new Error(`thread ${thread.thread_id} pending_message.text must be a string`);
+      }
+      if (
+        thread.pending_message.attachments !== undefined &&
+        !Array.isArray(thread.pending_message.attachments)
+      ) {
+        throw new Error(`thread ${thread.thread_id} pending_message.attachments must be an array`);
+      }
+      if (
+        thread.pending_message.model_selection !== undefined &&
+        !isRecord(thread.pending_message.model_selection)
+      ) {
+        throw new Error(
+          `thread ${thread.thread_id} pending_message.model_selection must be an object`,
+        );
+      }
+      if (
+        thread.pending_message.title_seed !== undefined &&
+        typeof thread.pending_message.title_seed !== "string"
+      ) {
+        throw new Error(`thread ${thread.thread_id} pending_message.title_seed must be a string`);
+      }
+      if (
+        thread.pending_message.source_proposed_plan !== undefined &&
+        !isRecord(thread.pending_message.source_proposed_plan)
+      ) {
+        throw new Error(
+          `thread ${thread.thread_id} pending_message.source_proposed_plan must be an object`,
+        );
+      }
+    }
   }
 
   return parsed as ResumeManifest;
@@ -172,6 +285,165 @@ function stableDispatchId(
     .digest("hex")
     .slice(0, 32);
   return `daily-restart-resume-${kind}-${digest}`;
+}
+
+interface PersistedImageAttachment {
+  readonly type: "image";
+  readonly id: string;
+  readonly name: string;
+  readonly mimeType: string;
+  readonly sizeBytes: number;
+}
+
+function isPersistedImageAttachment(value: unknown): value is PersistedImageAttachment {
+  return (
+    isRecord(value) &&
+    value.type === "image" &&
+    typeof value.id === "string" &&
+    value.id.length > 0 &&
+    typeof value.name === "string" &&
+    value.name.length > 0 &&
+    typeof value.mimeType === "string" &&
+    value.mimeType.toLowerCase().startsWith("image/") &&
+    typeof value.sizeBytes === "number" &&
+    Number.isInteger(value.sizeBytes) &&
+    value.sizeBytes >= 0
+  );
+}
+
+function inferImageExtension(input: {
+  readonly mimeType: string;
+  readonly fileName: string;
+}): string {
+  const fromMime = IMAGE_EXTENSION_BY_MIME_TYPE[input.mimeType.toLowerCase()];
+  if (fromMime) return fromMime;
+
+  const extensionMatch = /\.([a-z0-9]{1,8})$/i.exec(input.fileName.trim());
+  const fromFileName = extensionMatch ? `.${extensionMatch[1]!.toLowerCase()}` : "";
+  return ATTACHMENT_FILE_EXTENSIONS.includes(fromFileName) ? fromFileName : ".bin";
+}
+
+function safeAttachmentPaths(input: {
+  readonly attachmentsDir: string;
+  readonly attachment: PersistedImageAttachment;
+}): ReadonlyArray<string> {
+  if (!/^[a-z0-9_-]+$/i.test(input.attachment.id) || input.attachment.id.includes(".")) {
+    return [];
+  }
+
+  const root = NodePath.resolve(input.attachmentsDir);
+  const extensions = [
+    inferImageExtension({ mimeType: input.attachment.mimeType, fileName: input.attachment.name }),
+    ...ATTACHMENT_FILE_EXTENSIONS,
+  ];
+  const candidates: Array<string> = [];
+  for (const extension of new Set(extensions)) {
+    const candidate = NodePath.resolve(NodePath.join(root, `${input.attachment.id}${extension}`));
+    if (candidate.startsWith(`${root}${NodePath.sep}`)) {
+      candidates.push(candidate);
+    }
+  }
+  return candidates;
+}
+
+async function readAttachmentUploadPayload(input: {
+  readonly threadId: string;
+  readonly attachmentsDir: string | undefined;
+  readonly attachment: unknown;
+}) {
+  if (!isPersistedImageAttachment(input.attachment)) {
+    throw new Error(`thread ${input.threadId} pending attachment must be a persisted image`);
+  }
+  if (!input.attachmentsDir) {
+    throw new Error(
+      `thread ${input.threadId} pending attachment replay requires --attachments-dir`,
+    );
+  }
+
+  const attachmentPaths = safeAttachmentPaths({
+    attachmentsDir: input.attachmentsDir,
+    attachment: input.attachment,
+  });
+  if (attachmentPaths.length === 0) {
+    throw new Error(`thread ${input.threadId} pending attachment path was not safe`);
+  }
+
+  let bytes: Buffer | null = null;
+  let lastReadError: unknown;
+  for (const attachmentPath of attachmentPaths) {
+    try {
+      bytes = await NodeFSP.readFile(attachmentPath);
+      break;
+    } catch (error) {
+      lastReadError = error;
+      if (!isRecord(error) || error.code !== "ENOENT") {
+        throw new Error(`thread ${input.threadId} pending attachment could not be read`, {
+          cause: error,
+        });
+      }
+    }
+  }
+  if (bytes === null) {
+    throw new Error(`thread ${input.threadId} pending attachment file was not found`, {
+      cause: lastReadError,
+    });
+  }
+  if (bytes.byteLength !== input.attachment.sizeBytes) {
+    throw new Error(`thread ${input.threadId} pending attachment size did not match metadata`);
+  }
+
+  return {
+    type: "image" as const,
+    name: input.attachment.name,
+    mimeType: input.attachment.mimeType,
+    sizeBytes: input.attachment.sizeBytes,
+    dataUrl: `data:${input.attachment.mimeType};base64,${bytes.toString("base64")}`,
+  };
+}
+
+async function resumeMessageForThread(
+  manifest: ResumeManifest,
+  thread: ResumeManifestThread,
+  attachmentsDir: string | undefined,
+) {
+  if (thread.pending_message !== undefined) {
+    return {
+      messageId: thread.pending_message.message_id,
+      role: "user" as const,
+      text: thread.pending_message.text,
+      attachments: await Promise.all(
+        (thread.pending_message.attachments ?? []).map((attachment) =>
+          readAttachmentUploadPayload({
+            threadId: thread.thread_id,
+            attachmentsDir,
+            attachment,
+          }),
+        ),
+      ),
+    };
+  }
+
+  return {
+    messageId: stableDispatchId("message", manifest, thread.thread_id),
+    role: "user" as const,
+    text: RESUME_MESSAGE,
+    attachments: [],
+  };
+}
+
+function pendingTurnMetadataForThread(thread: ResumeManifestThread) {
+  const pendingMessage = thread.pending_message;
+  if (pendingMessage === undefined) return {};
+
+  return {
+    ...(pendingMessage.model_selection !== undefined
+      ? { modelSelection: pendingMessage.model_selection }
+      : {}),
+    ...(pendingMessage.title_seed !== undefined ? { titleSeed: pendingMessage.title_seed } : {}),
+    ...(pendingMessage.source_proposed_plan !== undefined
+      ? { sourceProposedPlan: pendingMessage.source_proposed_plan }
+      : {}),
+  };
 }
 
 class DispatchHttpError extends Error {
@@ -305,12 +577,15 @@ async function dispatchResumeCommands(
   manifest: ResumeManifest,
   thread: ResumeManifestThread,
   createdAt: string,
+  attachmentsDir: string | undefined,
   attemptTimeoutMs: number,
   sleepImpl: (ms: number) => Promise<void>,
   random: () => number,
 ): Promise<void> {
   const runtimeMode = thread.runtime_mode ?? DEFAULT_RESUME_RUNTIME_MODE;
   const interactionMode = thread.interaction_mode ?? DEFAULT_RESUME_INTERACTION_MODE;
+  const message = await resumeMessageForThread(manifest, thread, attachmentsDir);
+  const pendingTurnMetadata = pendingTurnMetadataForThread(thread);
   await postDispatchCommandWithRetry(
     fetchImpl,
     origin,
@@ -335,12 +610,8 @@ async function dispatchResumeCommands(
       type: "thread.turn.start",
       commandId: stableDispatchId("command", manifest, thread.thread_id),
       threadId: thread.thread_id,
-      message: {
-        messageId: stableDispatchId("message", manifest, thread.thread_id),
-        role: "user",
-        text: RESUME_MESSAGE,
-        attachments: [],
-      },
+      message,
+      ...pendingTurnMetadata,
       runtimeMode,
       interactionMode,
       createdAt,
@@ -384,6 +655,7 @@ export async function injectResume(options: InjectResumeOptions): Promise<Inject
         manifest,
         thread,
         injectedAt,
+        options.attachmentsDir,
         dispatchAttemptTimeoutMs,
         sleepImpl,
         random,
@@ -412,15 +684,7 @@ function printSummary(result: InjectResumeResult): void {
 if (import.meta.url === `file://${process.argv[1]}`) {
   try {
     const args = parseArgs(process.argv.slice(2), process.env);
-    const options: InjectResumeOptions = {
-      manifestPath: args.manifestPath,
-      origin: args.origin,
-      dryRun: args.dryRun,
-      ...(args.token ? { token: args.token } : {}),
-    };
-    const result = await injectResume({
-      ...options,
-    });
+    const result = await injectResume(optionsFromCliArgs(args));
     printSummary(result);
     process.exit(result.failed > 0 ? 1 : 0);
   } catch (error) {
