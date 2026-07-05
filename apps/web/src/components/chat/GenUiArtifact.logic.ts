@@ -48,9 +48,6 @@ import { fromHtml } from "hast-util-from-html";
 import { type Schema, defaultSchema, sanitize } from "hast-util-sanitize";
 import { toHtml } from "hast-util-to-html";
 
-/** Fenced code-block language that marks a self-contained generative-UI artifact. */
-export const GENUI_FENCE_LANGUAGE = "genui";
-
 /**
  * Hard cap on the model-generated markup we will render, in UTF-8 bytes.
  * Larger payloads are refused (rendered as an inert fallback) so a runaway

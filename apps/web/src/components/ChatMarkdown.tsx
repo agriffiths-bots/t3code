@@ -24,6 +24,7 @@ import React, {
   type ClipboardEvent as ReactClipboardEvent,
   type MouseEvent as ReactMouseEvent,
   isValidElement,
+  lazy,
   use,
   useCallback,
   memo,
@@ -41,8 +42,7 @@ import rehypeSanitize, { defaultSchema } from "rehype-sanitize";
 import remarkBreaks from "remark-breaks";
 import remarkGfm from "remark-gfm";
 import { renderSkillInlineMarkdownChildren } from "./chat/SkillInlineText";
-import GenUiArtifact from "./chat/GenUiArtifact";
-import { GENUI_FENCE_LANGUAGE } from "./chat/genUiArtifact";
+import { GENUI_FENCE_LANGUAGE } from "./chat/genUiFence";
 import { CHAT_FILE_TAG_CHIP_CLASS_NAME, FileTagChipContent } from "./chat/FileTagChip";
 import { PierreEntryIcon } from "./chat/PierreEntryIcon";
 import { hasSpecificPierreIconForFileName, syntheticFileNameForLanguageId } from "../pierre-icons";
@@ -85,6 +85,11 @@ import {
   openUrlInPreview,
   BrowserPreviewUnavailableError,
 } from "../browser/openFileInPreview";
+
+// Lazy-loaded so the generative-UI renderer and its HTML sanitizer only enter
+// the bundle when a ```genui block is actually rendered — the feature is off
+// by default, so this keeps the chat/markdown bundle unchanged for everyone else.
+const GenUiArtifact = lazy(() => import("./chat/GenUiArtifact"));
 
 class CodeHighlightErrorBoundary extends React.Component<
   { fallback: ReactNode; children: ReactNode },
@@ -1507,7 +1512,11 @@ function ChatMarkdown({
         // (default), it falls through to the normal code-block rendering so
         // the raw markup is still visible and inert.
         if (generativeUiEnabled && language === GENUI_FENCE_LANGUAGE) {
-          return <GenUiArtifact html={codeBlock.code} isStreaming={isStreaming} />;
+          return (
+            <Suspense fallback={<pre {...props}>{children}</pre>}>
+              <GenUiArtifact html={codeBlock.code} isStreaming={isStreaming} />
+            </Suspense>
+          );
         }
         const fenceTitle = extractFenceTitle(extractPreCodeMeta(node));
         return (

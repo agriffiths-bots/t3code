@@ -7,7 +7,7 @@ import {
   GENUI_MAX_HEIGHT,
   GENUI_SANDBOX,
   isGenUiHtmlWithinCap,
-} from "./genUiArtifact";
+} from "./GenUiArtifact.logic";
 
 interface GenUiArtifactProps {
   /** Raw, UNTRUSTED markup from the model's ```genui fenced block. */
@@ -52,7 +52,7 @@ function GenUiArtifactNote({ children }: { children: React.ReactNode }) {
 
 /**
  * Renders untrusted, model-generated markup inside a hard-sandboxed iframe.
- * See `genUiArtifact.ts` for the full security model. The iframe sandbox is
+ * See `GenUiArtifact.logic.ts` for the full security model. The iframe sandbox is
  * fixed to {@link GENUI_SANDBOX} (empty — fully inert: no scripts, no
  * same-origin) and the document carries a strict CSP.
  */

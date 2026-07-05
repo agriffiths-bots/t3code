@@ -36,7 +36,7 @@ an ordinary, inert code block showing its source.
 ## Security model
 
 Model output is untrusted. Rendering is defended in three independent layers,
-all defined in `apps/web/src/components/chat/genUiArtifact.ts`:
+all defined in `apps/web/src/components/chat/GenUiArtifact.logic.ts`:
 
 1. **Allowlist sanitization (primary)** — `sanitizeGenUiHtml` parses the markup
    and reduces it to a safe subset using a GitHub-derived schema. It **drops**

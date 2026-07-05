@@ -8,7 +8,7 @@ import {
   isGenUiHtmlWithinCap,
   MAX_GENUI_HTML_BYTES,
   sanitizeGenUiHtml,
-} from "./genUiArtifact";
+} from "./GenUiArtifact.logic";
 
 describe("genUiArtifact security policy", () => {
   it("keeps the sandbox fully inert (no scripts, no same-origin)", () => {

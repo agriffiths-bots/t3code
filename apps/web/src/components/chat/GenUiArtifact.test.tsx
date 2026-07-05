@@ -2,8 +2,8 @@ import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vite-plus/test";
 
 import GenUiArtifact from "./GenUiArtifact";
-import { MAX_GENUI_HTML_BYTES } from "./genUiArtifact";
-import { SAMPLE_GENUI_CHART } from "./genUiArtifact.sample";
+import { MAX_GENUI_HTML_BYTES } from "./GenUiArtifact.logic";
+import { SAMPLE_GENUI_CHART } from "./GenUiArtifact.sample";
 
 describe("GenUiArtifact", () => {
   it("renders the sample chart in a fully-inert sandboxed iframe", () => {
