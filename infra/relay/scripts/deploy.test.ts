@@ -282,6 +282,12 @@ describe("artifact release workflows", () => {
       expect(mainWorkflow).toContain(
         "if: ${{ github.ref == 'refs/heads/main' && needs.publish_artifacts.result == 'success' }}",
       );
+      expect(mainWorkflow).toContain(
+        'gh api "repos/$GH_REPO/contents/client-verified-latest.json?ref=client-verified-latest"',
+      );
+      expect(mainWorkflow).toContain("Keeping verified client pointer release");
+      expect(mainWorkflow).toContain('jq -r --arg keep "$pinned_release_tag"');
+      expect(mainWorkflow).toContain("and .tagName != $keep");
       expect(reusableWorkflow).toContain("Mobile app builds are deprecated");
       expect(reusableWorkflow).not.toContain("android_mobile_version_policy:");
       expect(reusableWorkflow).not.toContain("android_app_version:");
