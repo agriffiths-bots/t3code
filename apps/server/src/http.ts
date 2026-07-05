@@ -4,6 +4,7 @@ import {
   AuthOrchestrationReadScope,
   EnvironmentHttpApi,
   ProviderInstanceId,
+  ServerNotificationAckAction,
 } from "@t3tools/contracts";
 import { decodeOtlpTraceRecords } from "@t3tools/shared/observability";
 import * as Data from "effect/Data";
@@ -35,6 +36,7 @@ import {
 } from "./assets/AssetAccess.ts";
 import * as BrowserTraceCollector from "./observability/BrowserTraceCollector.ts";
 import * as EnvironmentAuth from "./auth/EnvironmentAuth.ts";
+import * as DeviceNotifications from "./notifications/DeviceNotifications.ts";
 import { traceRelayRequest } from "./cloud/traceRelayRequest.ts";
 import {
   annotateEnvironmentRequest,
@@ -50,6 +52,7 @@ import { loadPlanUsageSnapshot } from "./usage/PlanUsage.ts";
 const OTLP_TRACES_PROXY_PATH = "/api/observability/v1/traces";
 const TTS_SPEAK_PATH = "/api/tts/speak";
 const PLAN_USAGE_PATH = "/api/plan-usage";
+const NOTIFICATION_ACK_PATH = "/api/notifications/ack";
 const LOOPBACK_HOSTNAMES = new Set(["127.0.0.1", "::1", "localhost"]);
 const DESKTOP_RENDERER_ORIGINS = ["t3code://app", "t3code-dev://app"];
 
@@ -198,6 +201,13 @@ const TtsSpeakRequest = Schema.Struct({
 const decodeTtsSpeakRequest = Schema.decodeUnknownEffect(TtsSpeakRequest);
 const emptyTtsSpeakRequest: typeof TtsSpeakRequest.Type = { text: "" };
 
+const NotificationAckRequest = Schema.Struct({
+  notificationId: Schema.String,
+  ackToken: Schema.String,
+  action: ServerNotificationAckAction,
+});
+const decodeNotificationAckRequest = Schema.decodeUnknownEffect(NotificationAckRequest);
+
 export const ttsSpeakHandler = Effect.gen(function* () {
   yield* authenticateRawRouteWithScope(AuthOrchestrationOperateScope);
   const request = yield* HttpServerRequest.HttpServerRequest;
@@ -261,6 +271,34 @@ export const ttsSpeakHandler = Effect.gen(function* () {
 );
 
 export const ttsSpeakRouteLayer = HttpRouter.add("POST", TTS_SPEAK_PATH, ttsSpeakHandler);
+
+export const notificationAckRouteLayer = HttpRouter.add(
+  "POST",
+  NOTIFICATION_ACK_PATH,
+  Effect.gen(function* () {
+    const request = yield* HttpServerRequest.HttpServerRequest;
+    const raw = yield* request.json;
+    const input = yield* decodeNotificationAckRequest(raw).pipe(
+      Effect.mapError(() => "bad_request" as const),
+    );
+    const notifications = yield* DeviceNotifications.DeviceNotifications;
+    const result = yield* notifications.ackNotification(input, { requireAckToken: true });
+    return HttpServerResponse.jsonUnsafe(result, {
+      headers: {
+        "Cache-Control": "no-store",
+        "X-Content-Type-Options": "nosniff",
+      },
+    });
+  }).pipe(
+    Effect.catch((cause) =>
+      cause === "bad_request"
+        ? Effect.succeed(HttpServerResponse.text("Bad Request", { status: 400 }))
+        : Effect.logWarning("Notification acknowledgement failed", { cause }).pipe(
+            Effect.as(HttpServerResponse.text("Internal Server Error", { status: 500 })),
+          ),
+    ),
+  ),
+);
 
 export const planUsageRouteLayer = HttpRouter.add(
   "GET",

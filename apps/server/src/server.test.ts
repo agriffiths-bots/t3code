@@ -15,6 +15,7 @@ import {
   GitCommandError,
   KeybindingRule,
   MessageId,
+  NonNegativeInt,
   ExternalLauncherCommandNotFoundError,
   type OrchestrationThreadShell,
   TerminalNotRunningError,
@@ -114,6 +115,7 @@ import * as CloudCliTokenManager from "./cloud/CliTokenManager.ts";
 import * as ProcessDiagnostics from "./diagnostics/ProcessDiagnostics.ts";
 import * as ProcessResourceMonitor from "./diagnostics/ProcessResourceMonitor.ts";
 import * as TraceDiagnostics from "./diagnostics/TraceDiagnostics.ts";
+import * as DeviceNotifications from "./notifications/DeviceNotifications.ts";
 import * as Data from "effect/Data";
 
 const defaultProjectId = ProjectId.make("project-default");
@@ -350,6 +352,7 @@ const buildAppUnderTest = (options?: {
     >;
     relayClient?: Partial<RelayClient.RelayClient["Service"]>;
     cloudCliTokenManager?: Partial<CloudCliTokenManager.CloudCliTokenManager["Service"]>;
+    deviceNotifications?: Partial<DeviceNotifications.DeviceNotifications["Service"]>;
   };
 }) =>
   Effect.gen(function* () {
@@ -645,6 +648,28 @@ const buildAppUnderTest = (options?: {
               partialFailure: Option.none(),
               error: Option.none(),
             }),
+        }),
+      ),
+      Layer.provide(
+        Layer.mock(DeviceNotifications.DeviceNotifications)({
+          getConfig: Effect.succeed({ vapidPublicKey: "test-vapid-public-key" }),
+          registerDevice: (input) =>
+            Effect.succeed({
+              deviceId: input.deviceId,
+              vapidPublicKey: "test-vapid-public-key",
+            }),
+          ackNotification: (input) =>
+            Effect.succeed({
+              notificationId: input.notificationId,
+              accepted: true,
+            }),
+          notify: () =>
+            Effect.succeed({
+              notificationId: "test-notification",
+              deliveredDevices: NonNegativeInt.make(0),
+            }),
+          events: Stream.empty,
+          ...options?.layers?.deviceNotifications,
         }),
       ),
       Layer.provide(gitManagerLayer),

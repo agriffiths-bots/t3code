@@ -47,10 +47,10 @@ The manager uses these defaults, all overridable by matching flags:
 
 ```text
 T3DR_DB=/home/adam/.t3-vps/userdata/state.sqlite
-T3DR_ATTACHMENTS_DIR=$(dirname "$T3DR_DB")/attachments
 T3DR_CHECKOUT=/home/adam/t3code
 T3DR_SERVICE=t3code.service
 T3DR_ORIGIN=http://127.0.0.1:3773
+T3DR_ATTACHMENTS_DIR=$(dirname "$T3DR_DB")/attachments
 T3DR_SNAPSHOT_DIR=/home/adam/backups/t3-daily
 T3DR_LEDGER=/home/adam/.openclaw/daily-restart
 T3DR_PROBE_TIMEOUT=180
@@ -58,26 +58,32 @@ T3DR_SMOKE_INSTANCE=(required)
 T3DR_SMOKE_MODEL=(required)
 ```
 
-The snapshot is a hard gate before shutdown. The manager also validates an
-active-thread capture before shutdown, then refreshes that capture again after
-the service is stopped and before the quiesced DB snapshot. The refresh is
-captured to a candidate file and only replaces the pre-stop manifest after JSON
-validation. The post-stop manifest is authoritative: live pending rows come from
-the quiesced capture, and shutdown-interrupted active turns are retained by the
-capture query only when the quiesced `projection_turns` row is still running.
-This prevents a pending request that was picked up while shutdown was in
-progress from being replayed as a new turn, and also avoids replaying work that
-completed before shutdown finished. If the post-stop refresh fails, the
-unchanged service is restarted and the validated pre-stop manifest is injected
-instead.
-Rollbacks before the updated service can accept writes restore the preflight DB
+The pre-stop snapshot is a hard gate before shutdown. The manager also captures
+active threads before stopping the service, preserves that pre-stop manifest,
+then refreshes the active-thread capture after the service is stopped and before
+the quiesced DB snapshot. The post-stop manifest is authoritative for resume
+injection; the pre-stop pending message IDs and active turn thread IDs are passed
+to the post-stop capture so pending work and shutdown-interrupted work are not
+lost while stale pre-stop entries are still filtered out. If the post-stop
+capture fails, the manager restarts the unchanged service and injects the
+pre-stop manifest instead of continuing the update.
+
+Rollbacks before the updated service can accept writes restore the pre-stop DB
 snapshot after checking out the pre-restart SHA. The manager pins the pre-update
-`health-probe` under `$T3DR_LEDGER/<UTC date>/pinned-tools/` before merging the
-target SHA, then uses that pinned probe for post-update health checks and
-rollback re-probes. If post-start health fails after the updated service was
-started, the manager always restores the cycle-start DB snapshot as part of
-rollback; the current DB is moved aside by `t3-db-restore`. Result and full logs
-are written under `$T3DR_LEDGER/<UTC date>/`.
+`health-probe` and `inject-resume` helpers under
+`$T3DR_LEDGER/<UTC date>/pinned-tools/` before merging the target SHA, then uses
+those pinned tools for post-update health checks, rollback re-probes, and resume
+injection. It also validates that an existing `T3DR_TOKEN`/`T3_TOKEN` is
+authenticated with `orchestration:operate`, or mints and validates a short-lived
+resume-injection token before the service is stopped, so auth failures abort
+while the original service is still available. If the origin is already
+unreachable or returns a gateway/service unavailable response before the restart
+starts, the manager keeps the prepared token but defers validation until after
+the service is started again, before any resume injection. If post-start health
+fails after the updated service was started, the manager always restores the
+cycle-start DB snapshot as part of rollback; the current DB is moved aside by
+`t3-db-restore`. Result and full logs are written under
+`$T3DR_LEDGER/<UTC date>/`.
 Set `T3DR_SMOKE_INSTANCE` and `T3DR_SMOKE_MODEL` to the provider/model pair the
 health probe should wake. For one-off operator runs, `--smoke-instance` and
 `--smoke-model` override those environment defaults.
@@ -133,11 +139,8 @@ node scripts/ops/daily-restart/capture-active-threads.ts \
 `--out` is required. The tool opens the SQLite state DB read-only with `mode=ro`
 and `PRAGMA query_only = ON`, writes the manifest with a temp-file-plus-rename,
 prints the active thread count, and exits `0` for an empty capture. Captured active
-work includes `running`, `starting`, rows with an `active_turn_id`, and live
-pending turn-start projections, including starting sessions whose session row was
-written after the pending turn-start. Pending-start entries carry the original
-user message payload and turn-start metadata so resume injection can replay
-unsent work; `waiting` sessions are included for observability.
+sessions include `running`, `starting`, and rows with an `active_turn_id`;
+`waiting` sessions are included for observability.
 
 Manifest `pre_sha` and `db_snapshot` are intentionally left empty for the restart
 orchestrator to fill.
@@ -154,22 +157,21 @@ T3DR_TOKEN="$T3DR_TOKEN" scripts/ops/daily-restart/inject-resume --manifest resu
 
 `--origin` defaults to `T3DR_ORIGIN`, then `http://127.0.0.1:3773`. `--token`
 defaults to `T3DR_TOKEN`, then `T3_TOKEN`; avoid passing live bearer tokens via
-argv. `--attachments-dir` defaults to `T3DR_ATTACHMENTS_DIR` when supplied by the
-restart manager. The flag wins for ephemeral tests. `--dry-run` reports without
-posting or mutating.
+argv. The restart manager prepares and validates this token before shutdown and
+passes it through `T3DR_TOKEN` to the pinned helper. `--attachments-dir` defaults
+to `T3DR_ATTACHMENTS_DIR`, which the restart manager sets from the configured DB
+path when not supplied. The flag wins for ephemeral tests. `--dry-run` reports
+without posting or mutating.
 
 The script calls `POST /api/orchestration/dispatch` with `orchestration:operate`,
-first sending `thread.interaction-mode.set` to force the captured mode, then
-`thread.turn.start`. Running/interrupted work receives the pinned resume prompt;
-captured pending-start work reuses the original pending user message id, text,
-attachments, model selection, title seed, and source-plan reference because that
-turn has not reached the provider yet. It retries transient dispatch failures
-per command (network errors, hung attempts, 5xx, and 429 with bounded
-`Retry-After`) for up to five attempts with about one minute of total retry
-sleep; non-transient 4xx failures fail immediately. After each successful resume
-turn, it writes `injected_at` using temp-file plus rename; retries reuse stable
-command IDs derived from the manifest capture and thread so server command
-dedupe can catch a lost-response retry.
+first sending `thread.interaction-mode.set` to force default mode, then
+`thread.turn.start`. It retries transient dispatch failures per command (network
+errors, hung attempts, 5xx, and 429 with bounded `Retry-After`) for up to five
+attempts with about one minute of total retry sleep; non-transient 4xx failures
+fail immediately. After each successful resume turn, it writes `injected_at`
+using temp-file plus rename; retries reuse stable command/message IDs derived
+from the manifest capture and thread so server command dedupe can catch a
+lost-response retry.
 
 ## Token source
 
@@ -196,13 +198,20 @@ creates an online-safe SQLite snapshot. `--db` defaults to `T3DR_DB`, then
 
 `scripts/ops/daily-restart/t3-db-restore --snapshot FILE [--db PATH]` restores a
 verified snapshot. The caller must stop T3 first; active WAL/SHM files emit a
-warning only. Both tools export a cron PATH with trusted system directories first,
+warning only. Shell entrypoints in this directory export cron-safe PATH prefixes
+first, then append the caller PATH so nonstandard Node/sqlite installs remain
+reachable without taking precedence over trusted locations. Snapshot and restore
 set `umask 077`, use sqlite3
 `.backup` plus `PRAGMA integrity_check`, print only the result path to stdout,
 and exit non-zero on failure. Both tools must run as the existing database owner;
 root callers should drop privileges to that uid before invoking them. Snapshot
 staging stays inside the snapshot directory so the published file is installed
 with a same-filesystem rename.
+
+The restart manager resolves daily-restart helpers from the current script
+directory or checkout before falling back to PATH; inherited PATH is for
+dependencies such as Node, pnpm, curl, and sqlite, not for overriding snapshot,
+capture, health, restore, or resume helper scripts.
 
 ## Integration smoke
 

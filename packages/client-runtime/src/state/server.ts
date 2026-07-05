@@ -145,6 +145,10 @@ export function createServerEnvironmentAtoms<R, E>(
       label: "environment-data:server:process-resource-history",
       tag: WS_METHODS.serverGetProcessResourceHistory,
     }),
+    notificationConfig: createEnvironmentRpcQueryAtomFamily(runtime, {
+      label: "environment-data:server:notification-config",
+      tag: WS_METHODS.serverGetNotificationConfig,
+    }),
     configProjection,
     welcome: createEnvironmentRpcSubscriptionAtomFamily(runtime, {
       label: "environment-data:server:welcome",
@@ -189,6 +193,18 @@ export function createServerEnvironmentAtoms<R, E>(
     signalProcess: createEnvironmentRpcCommand(runtime, {
       label: "environment-data:server:signal-process",
       tag: WS_METHODS.serverSignalProcess,
+    }),
+    registerNotificationDevice: createEnvironmentRpcCommand(runtime, {
+      label: "environment-data:server:register-notification-device",
+      tag: WS_METHODS.serverRegisterNotificationDevice,
+    }),
+    ackNotification: createEnvironmentRpcCommand(runtime, {
+      label: "environment-data:server:ack-notification",
+      tag: WS_METHODS.serverAckNotification,
+    }),
+    notificationEvents: createEnvironmentRpcSubscriptionAtomFamily(runtime, {
+      label: "environment-data:server:notification-events",
+      tag: WS_METHODS.subscribeNotificationEvents,
     }),
   };
 }

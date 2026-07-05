@@ -25,11 +25,12 @@ function commandEnv(): NodeJS.ProcessEnv {
 
 function run(
   args: ReadonlyArray<string>,
-  options: { readonly expectFailure?: boolean } = {},
+  options: { readonly expectFailure?: boolean; readonly timeoutMs?: number } = {},
 ): NodeChildProcess.SpawnSyncReturns<string> {
   const result = NodeChildProcess.spawnSync(args[0]!, args.slice(1), {
     encoding: "utf8",
     env: commandEnv(),
+    timeout: options.timeoutMs,
   });
 
   if (!options.expectFailure && result.status !== 0) {
@@ -150,6 +151,43 @@ describe("daily restart database tools", () => {
       writer.stdin.end(".quit\n");
       writer.kill();
     }
+  });
+
+  it("snapshots when the output directory is the database directory", () => {
+    const dir = makeTempDir();
+    const db = NodePath.join(dir, "state.sqlite");
+    createWalDatabase(db);
+
+    const result = run([snapshotTool, "--db", db, "--out-dir", dir], { timeoutMs: 5_000 });
+    const snapshot = result.stdout.trim();
+
+    assert.equal(result.stderr, "");
+    assert.equal(NodePath.dirname(snapshot), dir);
+    assert.equal(
+      sqlite(snapshot, "SELECT group_concat(name, ',') FROM items ORDER BY id;"),
+      "alpha,beta",
+    );
+  });
+
+  it("does not prune the source database when it matches the snapshot glob in the output dir", () => {
+    const dir = makeTempDir();
+    // Basename matches 't3-state-*.sqlite', and the DB lives in the output dir.
+    const db = NodePath.join(dir, "t3-state-live.sqlite");
+    createWalDatabase(db);
+
+    const result = run([snapshotTool, "--db", db, "--out-dir", dir, "--keep", "1"], {
+      timeoutMs: 5_000,
+    });
+    const snapshot = result.stdout.trim();
+
+    assert.equal(result.stderr, "");
+    assert.equal(NodePath.dirname(snapshot), dir);
+    // The live source DB must survive pruning with its contents intact.
+    assert.equal(NodeFS.existsSync(db), true);
+    assert.equal(
+      sqlite(db, "SELECT group_concat(name, ',') FROM items ORDER BY id;"),
+      "alpha,beta",
+    );
   });
 
   it("fails on a corrupt source database", () => {

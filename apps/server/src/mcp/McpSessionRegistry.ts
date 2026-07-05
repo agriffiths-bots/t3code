@@ -107,7 +107,7 @@ const makeWithOptions = Effect.fn("McpSessionRegistry.make")(function* (
         threadId: ThreadId.make(request.threadId),
         providerSessionId,
         providerInstanceId: ProviderInstanceId.make(request.providerInstanceId),
-        capabilities: new Set(["preview", "thread-management"]),
+        capabilities: new Set(["preview", "thread-management", "notification"]),
         issuedAt,
         expiresAt,
       };

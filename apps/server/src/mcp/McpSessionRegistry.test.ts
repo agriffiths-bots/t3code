@@ -9,7 +9,8 @@ import type { McpCapability } from "./McpInvocationContext.ts";
 import * as McpSessionRegistry from "./McpSessionRegistry.ts";
 
 const environmentId = EnvironmentId.make("environment-1");
-const mcpCapabilities = () => new Set<McpCapability>(["preview", "thread-management"]);
+const mcpCapabilities = () =>
+  new Set<McpCapability>(["preview", "thread-management", "notification"]);
 const makeFakeHttpServer = (hostname: string, port = 43123) =>
   HttpServer.HttpServer.of({
     address: { _tag: "TcpAddress", hostname, port },
@@ -51,6 +52,7 @@ it.effect("stores only a token hash, resolves the bearer token, and revokes by t
     expect(resolved?.threadId).toBe(threadId);
     expect(resolved?.capabilities.has("preview")).toBe(true);
     expect(resolved?.capabilities.has("thread-management")).toBe(true);
+    expect(resolved?.capabilities.has("notification")).toBe(true);
 
     yield* registry.revokeThread(threadId);
     expect(yield* registry.resolve(token)).toBeUndefined();
@@ -79,7 +81,7 @@ it.effect("builds MCP endpoints from the bound server host", () =>
   }),
 );
 
-it.effect("issues the thread-management capability so sub-agent tools stay authorized", () =>
+it.effect("issues tool capabilities so model-initiated tools stay authorized", () =>
   Effect.gen(function* () {
     const registry = yield* makeRegistry(() => 1_000);
     const issued = yield* registry.issue({
@@ -89,6 +91,7 @@ it.effect("issues the thread-management capability so sub-agent tools stay autho
     const token = issued.config.authorizationHeader.replace(/^Bearer\s+/, "");
     const resolved = yield* registry.resolve(token);
     expect(resolved?.capabilities.has("thread-management")).toBe(true);
+    expect(resolved?.capabilities.has("notification")).toBe(true);
   }),
 );
 
