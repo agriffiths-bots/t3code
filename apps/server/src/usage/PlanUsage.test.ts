@@ -279,6 +279,61 @@ describe("PlanUsage", () => {
     });
   });
 
+  it("respects driver config disabled flags for aggregate and selected instances", () => {
+    const codexInstanceId = ProviderInstanceId.make("codex_work");
+    const claudeInstanceId = ProviderInstanceId.make("claude_work");
+    const settings = {
+      ...DEFAULT_SERVER_SETTINGS,
+      providerInstances: {
+        [codexInstanceId]: {
+          driver: ProviderDriverKind.make("codex"),
+          config: {
+            enabled: false,
+            shadowHomePath: "/tmp/disabled-codex-shadow",
+          },
+        },
+        [claudeInstanceId]: {
+          driver: ProviderDriverKind.make("claudeAgent"),
+          config: {
+            enabled: false,
+            homePath: "/tmp/disabled-claude-home",
+          },
+        },
+      },
+      providers: {
+        ...DEFAULT_SERVER_SETTINGS.providers,
+        codex: {
+          ...DEFAULT_SERVER_SETTINGS.providers.codex,
+          homePath: "/tmp/codex-default",
+          shadowHomePath: "",
+        },
+        claudeAgent: {
+          ...DEFAULT_SERVER_SETTINGS.providers.claudeAgent,
+          homePath: "/tmp/claude-default",
+        },
+      },
+    };
+
+    expect(
+      __testing.resolveUsageCredentialScope({
+        settings,
+      }),
+    ).toMatchObject({
+      sources: [
+        { provider: "codex", instanceId: "codex", home: "/tmp/codex-default" },
+        { provider: "claude", instanceId: "claudeAgent", home: "/tmp/claude-default" },
+      ],
+    });
+    expect(
+      __testing.resolveUsageCredentialScope({
+        settings,
+        providerInstanceId: codexInstanceId,
+      }),
+    ).toMatchObject({
+      sources: [],
+    });
+  });
+
   it("falls back to legacy provider settings for default synthesized instances", () => {
     const settings = {
       ...DEFAULT_SERVER_SETTINGS,

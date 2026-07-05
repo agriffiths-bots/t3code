@@ -72,6 +72,11 @@ function objectValue(value: unknown): Record<string, unknown> | null {
     : null;
 }
 
+function configEnabled(value: unknown): boolean | undefined {
+  const enabled = objectValue(value)?.enabled;
+  return typeof enabled === "boolean" ? enabled : undefined;
+}
+
 function clampPercent(value: number): number {
   return Math.max(0, Math.min(100, value));
 }
@@ -340,7 +345,9 @@ function configuredUsageProviderInstances(
     }
   }
 
-  return explicitCandidates.filter((instance) => instance.enabled !== false);
+  return explicitCandidates.filter(
+    (instance) => (instance.enabled ?? configEnabled(instance.config) ?? true) !== false,
+  );
 }
 
 function configuredHomeForProvider(
@@ -396,7 +403,7 @@ export function resolveUsageCredentialScope(
     const instance =
       settings.providerInstances[providerInstanceId] ??
       legacyDefaultUsageProviderInstance(settings, providerInstanceId);
-    if (!instance || instance.enabled === false) {
+    if (!instance || (instance.enabled ?? configEnabled(instance.config) ?? true) === false) {
       return {
         cacheKey: `instance:${providerInstanceId}:disabled-or-missing`,
         sources: [],
