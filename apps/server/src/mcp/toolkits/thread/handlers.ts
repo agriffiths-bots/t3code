@@ -2,6 +2,7 @@ import {
   CommandId,
   MessageId,
   ThreadId,
+  VcsProcessSpawnError,
   type ModelSelection,
   type OrchestrationProjectShell,
   type OrchestrationThreadShell,
@@ -38,8 +39,15 @@ import {
 
 const nowIso = Effect.map(DateTime.now, DateTime.formatIso);
 const isThreadStartToolError = Schema.is(ThreadStartToolError);
+const isVcsProcessSpawnError = Schema.is(VcsProcessSpawnError);
 
 const fail = (message: string) => new ThreadStartToolError({ message });
+
+const isMissingCwdSpawnError = (error: unknown, cwd: string): boolean => {
+  if (!isVcsProcessSpawnError(error) || error.cwd !== cwd) return false;
+  const cause = error.cause;
+  return cause instanceof Error && "code" in cause && cause.code === "ENOENT";
+};
 
 const truncateTitle = (value: string): string => {
   const trimmed = value.trim().replace(/\s+/g, " ");
@@ -156,7 +164,10 @@ const makeActiveThreadStartRuntime = Effect.fn("ThreadToolkit.makeActiveRuntime"
     candidate: string,
   ) {
     return yield* sourceCwdBelongsToProject(projectRoot, candidate).pipe(
-      Effect.orElseSucceed(() => true),
+      Effect.matchEffect({
+        onFailure: (error) => Effect.succeed(!isMissingCwdSpawnError(error, candidate)),
+        onSuccess: Effect.succeed,
+      }),
     );
   });
 

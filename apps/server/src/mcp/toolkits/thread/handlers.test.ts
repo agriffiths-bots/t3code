@@ -4,6 +4,7 @@ import {
   ProjectId,
   ProviderDriverKind,
   ProviderInstanceId,
+  VcsProcessSpawnError,
   ThreadId,
   VcsUnsupportedOperationError,
   type ModelSelection,
@@ -553,6 +554,56 @@ it.effect("falls back to the project checkout when the source worktree path is s
     });
     expect(vcsCalls).toEqual(["/repo/missing-worktree"]);
     expect(gitCalls).toEqual(["listRefs:/repo/project"]);
+  }),
+);
+
+it.effect("falls back when source worktree detection fails because the cwd is missing", () =>
+  Effect.gen(function* () {
+    const commands: OrchestrationCommand[] = [];
+    const vcsCalls: string[] = [];
+    const missingCwdCause = Object.assign(new Error("spawn ENOENT"), { code: "ENOENT" });
+    const result = yield* callStartTool(
+      { prompt: "Continue after deleted checkout", baseBranch: "main" },
+      commands,
+      {
+        project: {
+          ...project,
+          workspaceRoot: "/repo/project",
+        },
+        sourceThread: {
+          ...sourceThread,
+          worktreePath: "/repo/missing-worktree",
+        },
+        vcsDetect: (input) =>
+          Effect.sync(() => {
+            vcsCalls.push(input.cwd);
+            return input.cwd;
+          }).pipe(
+            Effect.flatMap((cwd) =>
+              cwd === "/repo/missing-worktree"
+                ? Effect.fail(
+                    new VcsProcessSpawnError({
+                      operation: "VcsDriverRegistry.detect",
+                      command: "git",
+                      cwd,
+                      cause: missingCwdCause,
+                    }),
+                  )
+                : Effect.succeed(makeGitHandle(cwd)),
+            ),
+          ),
+      },
+    );
+
+    expect(result.isError).toBe(false);
+    const command = commands[0];
+    expect(command?.type).toBe("thread.turn.start");
+    if (command?.type !== "thread.turn.start") return;
+    expect(command.bootstrap?.prepareWorktree).toMatchObject({
+      projectCwd: "/repo/project",
+      baseBranch: "main",
+    });
+    expect(vcsCalls).toEqual(["/repo/missing-worktree"]);
   }),
 );
 
