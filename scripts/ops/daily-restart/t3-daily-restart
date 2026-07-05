@@ -17,6 +17,9 @@ stop_timeout="${T3DR_STOP_TIMEOUT:-120}"
 kill_timeout="${T3DR_KILL_TIMEOUT:-30}"
 smoke_instance="${T3DR_SMOKE_INSTANCE:-}"
 smoke_model="${T3DR_SMOKE_MODEL:-}"
+prebuilt_target="${T3DR_PREBUILT_TARGET:-0}"
+rollback_sha="${T3DR_ROLLBACK_SHA:-}"
+target_sha_override="${T3DR_TARGET_SHA:-}"
 
 usage() {
   cat >&2 <<'USAGE'
@@ -24,6 +27,7 @@ usage: t3-daily-restart [--db PATH] [--checkout PATH] [--service NAME]
                         [--origin URL] [--snapshot-dir DIR] [--ledger DIR]
                         [--probe-timeout SECS]
                         [--smoke-instance INSTANCE] [--smoke-model MODEL]
+                        [--prebuilt-target --rollback-sha SHA [--target-sha SHA]]
 USAGE
 }
 
@@ -47,6 +51,9 @@ while [[ $# -gt 0 ]]; do
     --probe-timeout) require_value "$@"; probe_timeout="$2"; shift 2 ;;
     --smoke-instance) require_value "$@"; smoke_instance="$2"; shift 2 ;;
     --smoke-model) require_value "$@"; smoke_model="$2"; shift 2 ;;
+    --prebuilt-target) prebuilt_target=1; shift ;;
+    --rollback-sha) require_value "$@"; rollback_sha="$2"; shift 2 ;;
+    --target-sha) require_value "$@"; target_sha_override="$2"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) echo "t3-daily-restart: unknown arg: $1" >&2; usage; exit 2 ;;
   esac
@@ -81,6 +88,18 @@ if [[ -z "$smoke_instance" ]]; then
 fi
 if [[ -z "$smoke_model" ]]; then
   echo "t3-daily-restart: --smoke-model or T3DR_SMOKE_MODEL is required" >&2
+  exit 2
+fi
+case "$prebuilt_target" in
+  1|true|TRUE|yes|YES) prebuilt_target=1 ;;
+  0|false|FALSE|no|NO|"") prebuilt_target=0 ;;
+  *)
+    echo "t3-daily-restart: T3DR_PREBUILT_TARGET must be boolean" >&2
+    exit 2
+    ;;
+esac
+if [[ "$prebuilt_target" == "1" && -z "$rollback_sha" ]]; then
+  echo "t3-daily-restart: --rollback-sha or T3DR_ROLLBACK_SHA is required with --prebuilt-target" >&2
   exit 2
 fi
 
@@ -434,23 +453,47 @@ pre_sha=""
 target_sha=""
 snapshot_path=""
 
-log "BEGIN service=$service checkout=$checkout origin=$origin"
+log "BEGIN service=$service checkout=$checkout origin=$origin prebuilt_target=$prebuilt_target"
 
 if ! run_capture 120 git -C "$checkout" fetch origin main:refs/remotes/origin/main; then
   log "git fetch failed"
   record_result "FAILED"
   exit 1
 fi
-pre_sha="$(run_output 30 git -C "$checkout" rev-parse HEAD)" || {
+cycle_start_sha="$(run_output 30 git -C "$checkout" rev-parse HEAD)" || {
   log "failed to resolve pre_sha"
   record_result "FAILED"
   exit 1
 }
-target_sha="$(run_output 30 git -C "$checkout" rev-parse origin/main)" || {
-  log "failed to resolve origin/main"
-  record_result "FAILED"
-  exit 1
-}
+if [[ "$prebuilt_target" == "1" ]]; then
+  pre_sha="$(run_output 30 git -C "$checkout" rev-parse --verify "${rollback_sha}^{commit}")" || {
+    log "failed to resolve rollback_sha=$rollback_sha"
+    record_result "FAILED"
+    exit 1
+  }
+  if [[ -n "$target_sha_override" ]]; then
+    target_sha="$(run_output 30 git -C "$checkout" rev-parse --verify "${target_sha_override}^{commit}")" || {
+      log "failed to resolve target_sha=$target_sha_override"
+      record_result "FAILED"
+      exit 1
+    }
+  else
+    target_sha="$cycle_start_sha"
+  fi
+  if [[ "$cycle_start_sha" != "$target_sha" ]]; then
+    log "prebuilt target mismatch: checkout_head=$cycle_start_sha target_sha=$target_sha"
+    record_result "FAILED"
+    exit 1
+  fi
+  log "prebuilt target verified rollback_sha=$pre_sha target_sha=$target_sha"
+else
+  pre_sha="$cycle_start_sha"
+  target_sha="$(run_output 30 git -C "$checkout" rev-parse origin/main)" || {
+    log "failed to resolve origin/main"
+    record_result "FAILED"
+    exit 1
+  }
+fi
 
 snapshot_tool="$(resolve_tool t3-db-snapshot)" || {
   log "missing t3-db-snapshot"
@@ -497,28 +540,38 @@ fi
 snapshot_path="$(run_output 600 "$snapshot_tool" --db "$db" --out-dir "$snapshot_dir")"
 if [[ "$?" -ne 0 || -z "$snapshot_path" ]]; then
   log "quiesced snapshot failed after stop"
+  record_result "SNAPSHOT-FAILED"
+  if [[ "$prebuilt_target" == "1" ]]; then
+    log "prebuilt target was already checked out; code rollback before restart"
+    code_only_rollback "$run_dir/health-probe.after-quiesced-snapshot" || exit 1
+  fi
   if run_capture 60 systemctl --user start "$service"; then
     inject_resume_manifest || log "failed to inject resume after quiesced snapshot failure"
   else
     log "failed to restart after quiesced snapshot failure"
   fi
-  record_result "SNAPSHOT-FAILED"
   exit 1
 fi
 log "quiesced_snapshot=$snapshot_path"
 if ! json_fill_manifest "$snapshot_path" >>"$log_file" 2>&1; then
   log "failed to write snapshot metadata into capture manifest"
+  record_result "FAILED"
+  if [[ "$prebuilt_target" == "1" ]]; then
+    log "prebuilt target was already checked out; code rollback before restart"
+    code_only_rollback "$run_dir/health-probe.after-manifest-fill" || exit 1
+  fi
   if run_capture 60 systemctl --user start "$service"; then
     inject_resume_manifest || log "failed to inject resume after manifest fill failure"
   else
     log "failed to restart after manifest fill failure"
   fi
-  record_result "FAILED"
   exit 1
 fi
 
 updated=0
-if [[ "$pre_sha" != "$target_sha" ]]; then
+if [[ "$prebuilt_target" == "1" ]]; then
+  log "prebuilt target supplied; skipping checkout update and rebuilds"
+elif [[ "$pre_sha" != "$target_sha" ]]; then
   if ! run_capture 120 git -C "$checkout" merge --ff-only "$target_sha"; then
     log "ff-only update failed"
     rollback "$run_dir/health-probe.after-update" || exit 1

@@ -70,6 +70,33 @@ Set `T3DR_SMOKE_INSTANCE` and `T3DR_SMOKE_MODEL` to the provider/model pair the
 health probe should wake. For one-off operator runs, `--smoke-instance` and
 `--smoke-model` override those environment defaults.
 
+`--prebuilt-target --rollback-sha SHA --target-sha SHA` is used by the nightly
+cycle after it has already fast-forwarded and built the checkout while the
+service was still running. In this mode the manager skips checkout update and
+rebuild work during downtime, but still records the rollback SHA and uses the
+same snapshot, stop/start, health, DB restore, and resume-injection rollback
+path if the restarted service is not healthy.
+
+## Nightly cycle
+
+`scripts/ops/daily-restart/t3-nightly-cycle` is the 03:00 cron entrypoint. It
+runs:
+
+1. VPS backup (`T3DR_BACKUP_CMD`, default `~/.openclaw/bin/t3-vps-backup`).
+2. Upstream sync (`T3DR_UPSTREAM_SYNC_CMD`, default `~/.openclaw/bin/t3-upstream-sync`).
+3. Fast-forward `T3DR_CHECKOUT` to `origin/main` and run one build pass:
+   `pnpm -C "$T3DR_CHECKOUT" run build:desktop`.
+4. Optional desktop artifact hook. Until T1 lands, this is a safe no-op. The
+   one-line integration is `T3DR_DESKTOP_ARTIFACT=1`, which runs
+   `pnpm -C "$T3DR_CHECKOUT" run dist:desktop:artifact`.
+5. `t3-daily-restart`, passing the prebuilt target metadata when step 3 updated
+   the checkout.
+6. Deadline assertion, default `07:00 Europe/London`.
+
+Machine-readable cycle events are appended to
+`$T3DR_LEDGER/<UTC date>/t3-nightly-cycle.jsonl`; operator-readable logs and
+alerts live in the same run directory.
+
 ## Capture active threads
 
 `scripts/ops/daily-restart/capture-active-threads.ts` writes a restart manifest
@@ -155,6 +182,20 @@ with a same-filesystem rename.
 Fast unit coverage mocks HTTP. To exercise a disposable real server manually:
 `.claude/skills/t3-test-server/scripts/t3-ephemeral.sh --boot-timeout 240 -- bash -c 'tmp="$(mktemp -d)"; node scripts/ops/daily-restart/inject-resume.integration.mjs "$tmp"'`.
 This stays out of the default gate because source boot can take minutes.
+
+The restart wake gap has an opt-in live-provider harness:
+
+```bash
+exports="$(.claude/skills/t3-test-server/scripts/t3-up.sh --name waiting-resume --entry apps/server/src/bin.ts --boot-timeout 240)"
+eval "$exports"
+T3DR_E2E_LIVE_PROVIDER=1 node scripts/ops/daily-restart/waiting-thread-resume.e2e.mjs \
+  --transcript "$T3_HOME/waiting-thread-resume.log"
+.claude/skills/t3-test-server/scripts/t3-down.sh waiting-resume
+```
+
+Without `T3DR_E2E_LIVE_PROVIDER=1`, the harness exits `75` and writes a
+`BLOCKED_ON_LIVE_PROVIDER` transcript line rather than pretending a fixture
+verified the live provider path.
 
 ## Verified client pointer
 
