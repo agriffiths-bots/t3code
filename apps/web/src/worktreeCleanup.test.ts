@@ -93,6 +93,25 @@ describe("getOrphanedWorktreePathForThread", () => {
     expect(result).toBeNull();
   });
 
+  it("returns null when an active project is rooted in the removable worktree", () => {
+    const threads = [
+      makeThread({
+        id: ThreadId.make("thread-1"),
+        worktreePath: "/tmp/repo/worktrees/feature-a/packages/app",
+        worktreeRemovalPath: "/tmp/repo/worktrees/feature-a",
+      }),
+    ];
+    const result = getOrphanedWorktreePathForThread(threads, ThreadId.make("thread-1"), [
+      { workspaceRoot: "/tmp/repo/worktrees/feature-a" },
+    ]);
+    expect(result).toBeNull();
+    expect(
+      getOrphanedWorktreePathForThread(threads, ThreadId.make("thread-1"), [
+        { workspaceRoot: "/tmp/repo/worktrees/feature-a/packages/lib" },
+      ]),
+    ).toBeNull();
+  });
+
   it("returns null when another thread links to the same worktree", () => {
     const threads = [
       makeThread({

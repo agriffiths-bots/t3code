@@ -190,6 +190,12 @@ export function readEnvironmentThreadRefs(
   return appAtomRegistry.get(environmentThreadShells.environmentThreadRefsAtom(environmentId));
 }
 
+export function readEnvironmentProjectRefs(
+  environmentId: EnvironmentId,
+): ReadonlyArray<ScopedProjectRef> {
+  return appAtomRegistry.get(environmentProjects.environmentProjectRefsAtom(environmentId));
+}
+
 export function readThreadRefs(): ReadonlyArray<ScopedThreadRef> {
   return appAtomRegistry.get(environmentThreadShells.threadRefsAtom);
 }

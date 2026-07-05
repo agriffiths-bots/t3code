@@ -27,6 +27,7 @@ export function getOrphanedWorktreePathForThread(
     Pick<ThreadShell, "id" | "worktreePath" | "worktreeRemovable" | "worktreeRemovalPath">
   >,
   threadId: ThreadShell["id"],
+  projects: ReadonlyArray<{ readonly workspaceRoot: string }> = [],
 ): string | null {
   const targetThread = threads.find((thread) => thread.id === threadId);
   if (!targetThread) {
@@ -59,8 +60,15 @@ export function getOrphanedWorktreePathForThread(
       isSameOrNestedPath(threadWorktreePath, targetRemovalPath)
     );
   });
+  if (isShared) {
+    return null;
+  }
 
-  return isShared ? null : targetRemovalPath;
+  const isProjectRoot = projects.some((project) =>
+    isSameOrNestedPath(normalizeWorktreePath(project.workspaceRoot), targetRemovalPath),
+  );
+
+  return isProjectRoot ? null : targetRemovalPath;
 }
 
 export function formatWorktreePathForDisplay(worktreePath: string): string {
