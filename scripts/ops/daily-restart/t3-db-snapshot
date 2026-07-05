@@ -89,8 +89,10 @@ exec 8<"$db_dir" || die "failed to open database directory lock: $db_dir"
 flock 8 || die "failed to acquire database directory lock: $db_dir"
 [[ -f "$db_path" ]] || die "database does not exist: $db_path"
 
-exec 9<"$out_dir" || die "failed to open snapshot directory lock: $out_dir"
-flock 9 || die "failed to acquire snapshot directory lock: $out_dir"
+if [[ "$out_dir" != "$db_dir" ]]; then
+  exec 9<"$out_dir" || die "failed to open snapshot directory lock: $out_dir"
+  flock 9 || die "failed to acquire snapshot directory lock: $out_dir"
+fi
 
 timestamp="$(date -u +%Y%m%d-%H%M%S)"
 snapshot="$out_dir/t3-state-$timestamp.sqlite"
@@ -131,7 +133,8 @@ trap - EXIT
 if [[ "$keep" -gt 0 ]]; then
   retain_other_count=$((keep - 1))
   mapfile -d '' snapshots < <(
-    find "$out_dir" -maxdepth 1 -type f -name 't3-state-*.sqlite' ! -samefile "$snapshot" -printf '%T@ %p\0' \
+    find "$out_dir" -maxdepth 1 -type f -name 't3-state-*.sqlite' \
+      ! -samefile "$snapshot" ! -samefile "$db_path" -printf '%T@ %p\0' \
       | sort -z -nr \
       | cut -z -d' ' -f2-
   )

@@ -406,6 +406,93 @@ export const ServerSignalProcessResult = Schema.Struct({
 });
 export type ServerSignalProcessResult = typeof ServerSignalProcessResult.Type;
 
+export const ServerNotificationDeviceKind = Schema.Literals(["web-push", "desktop"]);
+export type ServerNotificationDeviceKind = typeof ServerNotificationDeviceKind.Type;
+
+export const ServerWebPushSubscription = Schema.Struct({
+  endpoint: TrimmedNonEmptyString,
+  expirationTime: Schema.NullOr(Schema.Number),
+  keys: Schema.Struct({
+    p256dh: TrimmedNonEmptyString,
+    auth: TrimmedNonEmptyString,
+  }),
+});
+export type ServerWebPushSubscription = typeof ServerWebPushSubscription.Type;
+
+export const ServerNotificationRegisterInput = Schema.Struct({
+  deviceId: TrimmedNonEmptyString,
+  deviceKind: ServerNotificationDeviceKind,
+  deviceLabel: Schema.optional(TrimmedNonEmptyString.check(Schema.isMaxLength(120))),
+  userAgent: Schema.optional(TrimmedNonEmptyString.check(Schema.isMaxLength(500))),
+  ackUrl: Schema.optional(TrimmedNonEmptyString.check(Schema.isMaxLength(2_000))),
+  subscription: Schema.optional(ServerWebPushSubscription),
+});
+export type ServerNotificationRegisterInput = typeof ServerNotificationRegisterInput.Type;
+
+export const ServerNotificationRegisterResult = Schema.Struct({
+  deviceId: TrimmedNonEmptyString,
+  vapidPublicKey: TrimmedNonEmptyString,
+});
+export type ServerNotificationRegisterResult = typeof ServerNotificationRegisterResult.Type;
+
+export const ServerNotificationConfig = Schema.Struct({
+  vapidPublicKey: TrimmedNonEmptyString,
+});
+export type ServerNotificationConfig = typeof ServerNotificationConfig.Type;
+
+export const ServerNotificationAckAction = Schema.Literals(["opened", "dismissed", "closed"]);
+export type ServerNotificationAckAction = typeof ServerNotificationAckAction.Type;
+
+export const ServerNotificationAckInput = Schema.Struct({
+  notificationId: TrimmedNonEmptyString,
+  ackToken: Schema.optional(TrimmedNonEmptyString),
+  action: ServerNotificationAckAction,
+});
+export type ServerNotificationAckInput = typeof ServerNotificationAckInput.Type;
+
+export const ServerNotificationAckResult = Schema.Struct({
+  notificationId: TrimmedNonEmptyString,
+  accepted: Schema.Boolean,
+});
+export type ServerNotificationAckResult = typeof ServerNotificationAckResult.Type;
+
+export const ServerDeviceNotification = Schema.Struct({
+  notificationId: TrimmedNonEmptyString,
+  ackToken: TrimmedNonEmptyString,
+  title: TrimmedNonEmptyString.check(Schema.isMaxLength(120)),
+  body: Schema.optional(Schema.String.check(Schema.isMaxLength(1_500))),
+  deepLink: Schema.optional(TrimmedNonEmptyString.check(Schema.isMaxLength(1_000))),
+  createdAt: IsoDateTime,
+  requireInteraction: Schema.Boolean,
+});
+export type ServerDeviceNotification = typeof ServerDeviceNotification.Type;
+
+export const ServerNotificationStreamEvent = Schema.Union([
+  Schema.Struct({
+    type: Schema.Literal("show"),
+    notification: ServerDeviceNotification,
+  }),
+  Schema.Struct({
+    type: Schema.Literal("dismiss"),
+    notificationId: TrimmedNonEmptyString,
+  }),
+]);
+export type ServerNotificationStreamEvent = typeof ServerNotificationStreamEvent.Type;
+
+export const ServerNotifyInput = Schema.Struct({
+  title: TrimmedNonEmptyString.check(Schema.isMaxLength(120)),
+  body: Schema.optional(Schema.String.check(Schema.isMaxLength(1_500))),
+  deepLink: Schema.optional(TrimmedNonEmptyString.check(Schema.isMaxLength(1_000))),
+  requireInteraction: Schema.optional(Schema.Boolean),
+});
+export type ServerNotifyInput = typeof ServerNotifyInput.Type;
+
+export const ServerNotifyResult = Schema.Struct({
+  notificationId: TrimmedNonEmptyString,
+  deliveredDevices: NonNegativeInt,
+});
+export type ServerNotifyResult = typeof ServerNotifyResult.Type;
+
 export const ServerConfig = Schema.Struct({
   environment: ExecutionEnvironmentDescriptor,
   auth: ServerAuthDescriptor,

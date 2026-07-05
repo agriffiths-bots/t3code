@@ -9,6 +9,7 @@ import {
   otlpTracesProxyRouteLayer,
   planUsageRouteLayer,
   ttsSpeakRouteLayer,
+  notificationAckRouteLayer,
   assetRouteLayer,
   serverEnvironmentHttpApiLayer,
   staticAndDevRouteLayer,
@@ -90,6 +91,7 @@ import * as CloudCliState from "./cloud/CliState.ts";
 import * as ProcessDiagnostics from "./diagnostics/ProcessDiagnostics.ts";
 import * as ProcessResourceMonitor from "./diagnostics/ProcessResourceMonitor.ts";
 import * as TraceDiagnostics from "./diagnostics/TraceDiagnostics.ts";
+import * as DeviceNotifications from "./notifications/DeviceNotifications.ts";
 import { OrchestrationLayerLive } from "./orchestration/runtimeLayer.ts";
 import * as BootstrapTurnStartDispatcher from "./orchestration/Services/BootstrapTurnStartDispatcher.ts";
 import {
@@ -295,6 +297,10 @@ const AuthLayerLive = EnvironmentAuth.layer.pipe(
   Layer.provide(ServerSecretStore.layer),
 );
 
+const DeviceNotificationsLayerLive = DeviceNotifications.layer.pipe(
+  Layer.provide(ServerSecretStore.layer),
+);
+
 const CloudManagedEndpointRuntimeLive = Layer.mergeAll(
   RelayClientLive,
   CloudManagedEndpointRuntime.layer.pipe(
@@ -347,6 +353,7 @@ const RuntimeCoreDependenciesLive = RuntimeCoreDependenciesBaseLive.pipe(
   Layer.provideMerge(ServerEnvironment.layer),
   Layer.provideMerge(AuthLayerLive),
   Layer.provideMerge(ServerSecretStore.layer),
+  Layer.provideMerge(DeviceNotificationsLayerLive),
   Layer.provideMerge(
     Layer.mergeAll(
       CloudCliTokenManager.layer.pipe(Layer.provide(ServerSecretStore.layer)),
@@ -390,6 +397,7 @@ export const makeRoutesLayer = Layer.mergeAll(
     otlpTracesProxyRouteLayer,
     planUsageRouteLayer,
     ttsSpeakRouteLayer,
+    notificationAckRouteLayer,
     assetRouteLayer,
     staticAndDevRouteLayer,
     websocketRpcRouteLayer,

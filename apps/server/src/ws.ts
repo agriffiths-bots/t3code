@@ -98,6 +98,7 @@ import * as EnvironmentAuth from "./auth/EnvironmentAuth.ts";
 import * as ProcessDiagnostics from "./diagnostics/ProcessDiagnostics.ts";
 import * as ProcessResourceMonitor from "./diagnostics/ProcessResourceMonitor.ts";
 import * as TraceDiagnostics from "./diagnostics/TraceDiagnostics.ts";
+import * as DeviceNotifications from "./notifications/DeviceNotifications.ts";
 import * as SourceControlDiscovery from "./sourceControl/SourceControlDiscovery.ts";
 import * as SourceControlRepositoryService from "./sourceControl/SourceControlRepositoryService.ts";
 import * as AzureDevOpsCli from "./sourceControl/AzureDevOpsCli.ts";
@@ -275,6 +276,9 @@ const RPC_REQUIRED_SCOPE = new Map<string, AuthEnvironmentScope>([
   [WS_METHODS.serverGetProcessDiagnostics, AuthOrchestrationReadScope],
   [WS_METHODS.serverGetProcessResourceHistory, AuthOrchestrationReadScope],
   [WS_METHODS.serverSignalProcess, AuthOrchestrationOperateScope],
+  [WS_METHODS.serverGetNotificationConfig, AuthOrchestrationReadScope],
+  [WS_METHODS.serverRegisterNotificationDevice, AuthOrchestrationOperateScope],
+  [WS_METHODS.serverAckNotification, AuthOrchestrationOperateScope],
   [WS_METHODS.cloudGetRelayClientStatus, AuthRelayWriteScope],
   [WS_METHODS.cloudInstallRelayClient, AuthRelayWriteScope],
   [WS_METHODS.sourceControlLookupRepository, AuthOrchestrationReadScope],
@@ -323,6 +327,7 @@ const RPC_REQUIRED_SCOPE = new Map<string, AuthEnvironmentScope>([
   [WS_METHODS.subscribeDiscoveredLocalServers, AuthOrchestrationReadScope],
   [WS_METHODS.subscribeServerConfig, AuthOrchestrationReadScope],
   [WS_METHODS.subscribeServerLifecycle, AuthOrchestrationReadScope],
+  [WS_METHODS.subscribeNotificationEvents, AuthOrchestrationOperateScope],
   [WS_METHODS.subscribeAuthAccess, AuthAccessReadScope],
 ]);
 
@@ -413,6 +418,7 @@ const makeWsRpcLayer = (
       const sessions = yield* SessionStore.SessionStore;
       const processDiagnostics = yield* ProcessDiagnostics.ProcessDiagnostics;
       const processResourceMonitor = yield* ProcessResourceMonitor.ProcessResourceMonitor;
+      const deviceNotifications = yield* DeviceNotifications.DeviceNotifications;
       const relayClient = yield* RelayClient.RelayClient;
       const authorizationError = (requiredScope: AuthEnvironmentScope) =>
         new EnvironmentAuthorizationError({
@@ -1082,6 +1088,26 @@ const makeWsRpcLayer = (
           observeRpcEffect(WS_METHODS.serverSignalProcess, processDiagnostics.signal(input), {
             "rpc.aggregate": "server",
           }),
+        [WS_METHODS.serverGetNotificationConfig]: (_input) =>
+          observeRpcEffect(WS_METHODS.serverGetNotificationConfig, deviceNotifications.getConfig, {
+            "rpc.aggregate": "server",
+          }),
+        [WS_METHODS.serverRegisterNotificationDevice]: (input) =>
+          observeRpcEffect(
+            WS_METHODS.serverRegisterNotificationDevice,
+            deviceNotifications.registerDevice(input),
+            {
+              "rpc.aggregate": "server",
+            },
+          ),
+        [WS_METHODS.serverAckNotification]: (input) =>
+          observeRpcEffect(
+            WS_METHODS.serverAckNotification,
+            deviceNotifications.ackNotification(input),
+            {
+              "rpc.aggregate": "server",
+            },
+          ),
         [WS_METHODS.cloudGetRelayClientStatus]: (_input) =>
           observeRpcEffect(WS_METHODS.cloudGetRelayClientStatus, relayClient.resolve, {
             "rpc.aggregate": "cloud",
@@ -1573,6 +1599,10 @@ const makeWsRpcLayer = (
             }),
             { "rpc.aggregate": "server" },
           ),
+        [WS_METHODS.subscribeNotificationEvents]: (_input) =>
+          observeRpcStream(WS_METHODS.subscribeNotificationEvents, deviceNotifications.events, {
+            "rpc.aggregate": "server",
+          }),
         [WS_METHODS.subscribeAuthAccess]: (_input) =>
           observeRpcStreamEffect(
             WS_METHODS.subscribeAuthAccess,
