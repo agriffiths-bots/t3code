@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 set -u
 
-PATH="${T3DR_TEST_PATH_PREFIX:+$T3DR_TEST_PATH_PREFIX:}/home/linuxbrew/.linuxbrew/bin:/home/adam/.local/bin:/home/adam/.openclaw/bin:/usr/local/bin:/usr/bin:/bin"
+caller_path="${PATH:-}"
+PATH="${T3DR_TEST_PATH_PREFIX:+$T3DR_TEST_PATH_PREFIX:}/home/linuxbrew/.linuxbrew/bin:/home/adam/.local/bin:/home/adam/.openclaw/bin:/usr/local/bin:/usr/bin:/bin${caller_path:+:$caller_path}"
 export PATH
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
