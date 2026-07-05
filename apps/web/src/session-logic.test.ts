@@ -19,6 +19,7 @@ import {
   hasActionableProposedPlan,
   isThreadSessionActive,
   isLatestTurnSettled,
+  isThreadReadyForQueuedTurn,
   workEntryIndicatesToolFailure,
   workEntryIndicatesToolNeutralStatus,
   workEntryIndicatesToolSuccess,
@@ -1661,6 +1662,55 @@ describe("isLatestTurnSettled", () => {
         },
         null,
       ),
+    ).toBe(false);
+  });
+});
+
+describe("isThreadReadyForQueuedTurn", () => {
+  const latestTurn = {
+    turnId: TurnId.make("turn-1"),
+    startedAt: "2026-02-27T21:10:00.000Z",
+    completedAt: "2026-02-27T21:10:06.000Z",
+  } as const;
+
+  it("allows queued sends to drain on empty idle threads", () => {
+    expect(isThreadReadyForQueuedTurn(null, null)).toBe(true);
+    expect(
+      isThreadReadyForQueuedTurn(null, {
+        status: "ready",
+        activeTurnId: null,
+      }),
+    ).toBe(true);
+  });
+
+  it("blocks queued sends while a session is active even without a latest turn", () => {
+    expect(
+      isThreadReadyForQueuedTurn(null, {
+        status: "running",
+        activeTurnId: TurnId.make("turn-1"),
+      }),
+    ).toBe(false);
+    expect(
+      isThreadReadyForQueuedTurn(null, {
+        status: "starting",
+        activeTurnId: null,
+      }),
+    ).toBe(false);
+  });
+
+  it("uses settled latest-turn state when the thread has prior turns", () => {
+    expect(isThreadReadyForQueuedTurn(latestTurn, null)).toBe(true);
+    expect(
+      isThreadReadyForQueuedTurn(latestTurn, {
+        status: "running",
+        activeTurnId: TurnId.make("turn-2"),
+      }),
+    ).toBe(false);
+    expect(
+      isThreadReadyForQueuedTurn(latestTurn, {
+        status: "starting",
+        activeTurnId: null,
+      }),
     ).toBe(false);
   });
 });

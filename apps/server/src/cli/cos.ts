@@ -1,8 +1,6 @@
 import {
   CommandId,
   AuthAdministrativeScopes,
-  DEFAULT_PROVIDER_INTERACTION_MODE,
-  DEFAULT_RUNTIME_MODE,
   EnvironmentHttpApi,
   EnvironmentHttpCommonError,
   MessageId,
@@ -48,6 +46,15 @@ type CosCliDispatchCommand = Extract<
   OrchestrationCommand,
   { type: "thread.turn.start" } | { type: "thread.parent.set" }
 >;
+
+export function resolveCosWakeRuntimeMode(thread: OrchestrationThread) {
+  const session = thread.session;
+  return session &&
+    session.status !== "stopped" &&
+    (session.status !== "error" || session.activeTurnId !== null)
+    ? session.runtimeMode
+    : thread.runtimeMode;
+}
 
 class CosCommandError extends Data.TaggedError("CosCommandError")<{
   readonly message: string;
@@ -317,7 +324,10 @@ const cosWakeCommand = Command.make("wake", {
         // by the engine's command receipts; a LATER wake of a thread that has since
         // run and gone idle again derives a distinct commandId and is not swallowed.
         const thread = snapshot.threads.find((entry) => entry.id === threadId);
-        const wakeDiscriminator = thread?.latestTurn?.turnId ?? `seq:${snapshot.snapshotSequence}`;
+        if (!thread) {
+          return yield* new CosCommandError({ message: `Thread '${threadId}' was not found.` });
+        }
+        const wakeDiscriminator = thread.latestTurn?.turnId ?? `seq:${snapshot.snapshotSequence}`;
         const commandId = CommandId.make(`server:cos-wake:${threadId}:${wakeDiscriminator}`);
         const messageId = MessageId.make(`server:cos-wake:${threadId}:${wakeDiscriminator}`);
         yield* dispatch({
@@ -325,8 +335,8 @@ const cosWakeCommand = Command.make("wake", {
           commandId,
           threadId,
           message: { messageId, role: "user", text: "Resume.", attachments: [] },
-          runtimeMode: DEFAULT_RUNTIME_MODE,
-          interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+          runtimeMode: resolveCosWakeRuntimeMode(thread),
+          interactionMode: thread.interactionMode,
           bootstrap: undefined,
           createdAt: DateTime.formatIso(yield* DateTime.now),
         });

@@ -1,6 +1,7 @@
 import {
   CommandId,
   DEFAULT_PROVIDER_INTERACTION_MODE,
+  DEFAULT_RUNTIME_MODE,
   EventId,
   MessageId,
   ProjectId,
@@ -138,7 +139,7 @@ it.layer(NodeServices.layer)("decider project scripts", (it) => {
             instanceId: ProviderInstanceId.make("codex"),
             model: "gpt-5-codex",
           },
-          interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+          interactionMode: "plan",
           runtimeMode: "approval-required",
           branch: null,
           worktreePath: null,
@@ -163,7 +164,7 @@ it.layer(NodeServices.layer)("decider project scripts", (it) => {
             { id: "fastMode", value: true },
           ]),
           interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
-          runtimeMode: "approval-required",
+          runtimeMode: DEFAULT_RUNTIME_MODE,
           createdAt: now,
         },
         readModel,
@@ -186,8 +187,87 @@ it.layer(NodeServices.layer)("decider project scripts", (it) => {
           { id: "reasoningEffort", value: "high" },
           { id: "fastMode", value: true },
         ]),
-        runtimeMode: "approval-required",
+        runtimeMode: DEFAULT_RUNTIME_MODE,
+        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
       });
+    }),
+  );
+
+  it.effect("inherits thread modes when legacy turn-start commands omit them", () =>
+    Effect.gen(function* () {
+      const now = "2026-01-01T00:00:00.000Z";
+      const initial = createEmptyReadModel(now);
+      const withProject = yield* projectEvent(initial, {
+        sequence: 1,
+        eventId: asEventId("evt-project-create-legacy-turn"),
+        aggregateKind: "project",
+        aggregateId: asProjectId("project-1"),
+        type: "project.created",
+        occurredAt: now,
+        commandId: CommandId.make("cmd-project-create-legacy-turn"),
+        causationEventId: null,
+        correlationId: CommandId.make("cmd-project-create-legacy-turn"),
+        metadata: {},
+        payload: {
+          projectId: asProjectId("project-1"),
+          title: "Project",
+          workspaceRoot: "/tmp/project",
+          defaultModelSelection: null,
+          scripts: [],
+          createdAt: now,
+          updatedAt: now,
+        },
+      });
+      const readModel = yield* projectEvent(withProject, {
+        sequence: 2,
+        eventId: asEventId("evt-thread-create-legacy-turn"),
+        aggregateKind: "thread",
+        aggregateId: ThreadId.make("thread-1"),
+        type: "thread.created",
+        occurredAt: now,
+        commandId: CommandId.make("cmd-thread-create-legacy-turn"),
+        causationEventId: null,
+        correlationId: CommandId.make("cmd-thread-create-legacy-turn"),
+        metadata: {},
+        payload: {
+          threadId: ThreadId.make("thread-1"),
+          projectId: asProjectId("project-1"),
+          title: "Thread",
+          modelSelection: {
+            instanceId: ProviderInstanceId.make("codex"),
+            model: "gpt-5-codex",
+          },
+          interactionMode: "plan",
+          runtimeMode: "approval-required",
+          branch: null,
+          worktreePath: null,
+          createdAt: now,
+          updatedAt: now,
+        },
+      });
+
+      const result = yield* decideOrchestrationCommand({
+        command: {
+          type: "thread.turn.start",
+          commandId: CommandId.make("cmd-turn-start-legacy"),
+          threadId: ThreadId.make("thread-1"),
+          message: {
+            messageId: asMessageId("message-user-legacy"),
+            role: "user",
+            text: "hello",
+            attachments: [],
+          },
+          createdAt: now,
+        } as never,
+        readModel,
+      });
+
+      const events = Array.isArray(result) ? result : [result];
+      const turnStartEvent = events.find((event) => event.type === "thread.turn-start-requested");
+      expect(turnStartEvent?.type).toBe("thread.turn-start-requested");
+      if (turnStartEvent?.type !== "thread.turn-start-requested") return;
+      expect(turnStartEvent.payload.runtimeMode).toBe("approval-required");
+      expect(turnStartEvent.payload.interactionMode).toBe("plan");
     }),
   );
 

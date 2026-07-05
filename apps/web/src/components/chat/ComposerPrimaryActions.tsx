@@ -13,6 +13,8 @@ interface PendingActionState {
   isComplete: boolean;
 }
 
+export type SessionOnlySendReason = "thread-setup" | "dependent";
+
 interface ComposerPrimaryActionsProps {
   compact: boolean;
   pendingAction: PendingActionState | null;
@@ -24,6 +26,8 @@ interface ComposerPrimaryActionsProps {
   isEnvironmentUnavailable: boolean;
   isPreparingWorktree: boolean;
   hasSendableContent: boolean;
+  hasImageAttachments: boolean;
+  sessionOnlySendReason: SessionOnlySendReason | null;
   preserveComposerFocusOnPointerDown?: boolean;
   onPreviousPendingQuestion: () => void;
   onInterrupt: () => void;
@@ -63,6 +67,8 @@ export const ComposerPrimaryActions = memo(function ComposerPrimaryActions({
   isEnvironmentUnavailable,
   isPreparingWorktree,
   hasSendableContent,
+  hasImageAttachments,
+  sessionOnlySendReason,
   preserveComposerFocusOnPointerDown = false,
   onPreviousPendingQuestion,
   onInterrupt,
@@ -147,7 +153,7 @@ export const ComposerPrimaryActions = memo(function ComposerPrimaryActions({
           size="sm"
           className={cn("rounded-full", compact ? "h-9 px-3 sm:h-8" : "h-9 px-4 sm:h-8")}
           {...pointerFocusProps}
-          disabled={isSendBusy || isConnecting || isEnvironmentUnavailable}
+          disabled={isSendBusy || isConnecting}
         >
           {isConnecting || isSendBusy ? "Sending..." : "Refine"}
         </Button>
@@ -161,7 +167,7 @@ export const ComposerPrimaryActions = memo(function ComposerPrimaryActions({
           size="sm"
           className="h-9 rounded-l-full rounded-r-none px-4 sm:h-8"
           {...pointerFocusProps}
-          disabled={isSendBusy || isConnecting || isEnvironmentUnavailable}
+          disabled={isSendBusy || isConnecting}
         >
           {isConnecting || isSendBusy ? "Sending..." : "Implement"}
         </Button>
@@ -174,7 +180,7 @@ export const ComposerPrimaryActions = memo(function ComposerPrimaryActions({
                 className="h-9 rounded-l-none rounded-r-full border-l-white/12 px-2 sm:h-8"
                 aria-label="Implementation actions"
                 {...pointerFocusProps}
-                disabled={isSendBusy || isConnecting || isEnvironmentUnavailable}
+                disabled={isSendBusy || isConnecting}
               />
             }
           >
@@ -193,15 +199,23 @@ export const ComposerPrimaryActions = memo(function ComposerPrimaryActions({
     );
   }
 
+  const disconnectedQueueLabel = hasImageAttachments
+    ? "Queue attachments for this session"
+    : sessionOnlySendReason === "thread-setup"
+      ? "Queue thread setup for this session"
+      : sessionOnlySendReason === "dependent"
+        ? "Queue send after earlier queued work for this session"
+        : "Queue text message";
+
   return (
     <button
       type="submit"
       className="flex h-9 w-9 enabled:cursor-pointer items-center justify-center rounded-full bg-primary/90 text-primary-foreground shadow-xs enabled:shadow-primary/24 enabled:inset-shadow-[0_1px_--theme(--color-white/16%)] transition-all duration-150 hover:bg-primary hover:scale-105 active:inset-shadow-[0_1px_--theme(--color-black/8%)] active:shadow-none disabled:pointer-events-none disabled:opacity-30 disabled:shadow-none disabled:hover:scale-100 sm:h-8 sm:w-8"
       {...pointerFocusProps}
-      disabled={isSendBusy || isConnecting || isEnvironmentUnavailable || !hasSendableContent}
+      disabled={isSendBusy || isConnecting || !hasSendableContent}
       aria-label={
         isEnvironmentUnavailable
-          ? "Environment disconnected"
+          ? disconnectedQueueLabel
           : isConnecting
             ? "Connecting"
             : isPreparingWorktree

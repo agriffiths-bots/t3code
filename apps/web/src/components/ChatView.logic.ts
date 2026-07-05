@@ -269,6 +269,40 @@ export function threadHasStarted(thread: Thread | null | undefined): boolean {
   );
 }
 
+export function hasQueuedSubmissionBeenObservedByShell(input: {
+  readonly submissionCreatedAt: string;
+  readonly latestTurn: Thread["latestTurn"] | null | undefined;
+}): boolean {
+  return (
+    typeof input.latestTurn?.requestedAt === "string" &&
+    input.latestTurn.requestedAt.localeCompare(input.submissionCreatedAt) >= 0
+  );
+}
+
+export function threadHasEstablishedProviderBinding(thread: Thread | null | undefined): boolean {
+  if (!thread?.session) {
+    return false;
+  }
+  if (thread.latestTurn?.startedAt) {
+    return true;
+  }
+  if (thread.session.activeTurnId !== null) {
+    return true;
+  }
+  switch (thread.session.status) {
+    case "idle":
+    case "starting":
+    case "running":
+    case "waiting":
+    case "ready":
+    case "interrupted":
+      return true;
+    case "stopped":
+    case "error":
+      return false;
+  }
+}
+
 // `threadProvider` is the open branded driver kind carried by the session.
 // Unknown driver kinds degrade to `null` (i.e. "unlocked"), which is the safe
 // rollback / fork behavior — the routing layer is the right place to surface
@@ -286,7 +320,7 @@ export function deriveLockedProvider(input: {
   selectedProvider: string | null;
   threadProvider: string | null;
 }): ProviderDriverKind | null {
-  if (!threadHasStarted(input.thread)) {
+  if (!threadHasEstablishedProviderBinding(input.thread)) {
     return null;
   }
   const sessionProvider = input.thread?.session?.providerName ?? null;

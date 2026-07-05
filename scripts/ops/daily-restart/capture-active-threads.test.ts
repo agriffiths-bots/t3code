@@ -28,6 +28,8 @@ function makeFixtureDb(dir: string): string {
       thread_id TEXT PRIMARY KEY,
       project_id TEXT NOT NULL,
       title TEXT NOT NULL,
+      runtime_mode TEXT NOT NULL DEFAULT 'full-access',
+      interaction_mode TEXT NOT NULL DEFAULT 'default',
       deleted_at TEXT,
       archived_at TEXT
     );
@@ -36,7 +38,39 @@ function makeFixtureDb(dir: string): string {
       thread_id TEXT PRIMARY KEY,
       status TEXT NOT NULL,
       active_turn_id TEXT,
+      runtime_mode TEXT NOT NULL DEFAULT 'full-access',
       updated_at TEXT NOT NULL
+    );
+
+    CREATE TABLE projection_turns (
+      thread_id TEXT NOT NULL,
+      turn_id TEXT,
+      pending_message_id TEXT,
+      state TEXT NOT NULL,
+      requested_at TEXT NOT NULL,
+      started_at TEXT,
+      completed_at TEXT,
+      checkpoint_turn_count INTEGER,
+      checkpoint_ref TEXT,
+      checkpoint_status TEXT,
+      checkpoint_files_json TEXT NOT NULL DEFAULT '[]',
+      UNIQUE(thread_id, turn_id)
+    );
+
+    CREATE TABLE orchestration_events (
+      sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+      event_id TEXT NOT NULL UNIQUE,
+      aggregate_kind TEXT NOT NULL,
+      stream_id TEXT NOT NULL,
+      stream_version INTEGER NOT NULL,
+      event_type TEXT NOT NULL,
+      occurred_at TEXT NOT NULL,
+      command_id TEXT,
+      causation_event_id TEXT,
+      correlation_id TEXT,
+      actor_kind TEXT NOT NULL,
+      payload_json TEXT NOT NULL,
+      metadata_json TEXT NOT NULL
     );
   `);
 
@@ -75,19 +109,76 @@ function insertThread(
       thread_id,
       project_id,
       title,
+      runtime_mode,
+      interaction_mode,
       deleted_at,
       archived_at
-    ) VALUES (?, 'project-1', ?, ?, ?)
-  `).run(threadId, title, deletedAt, archivedAt);
+    ) VALUES (?, 'project-1', ?, ?, ?, ?, ?)
+  `).run(
+    threadId,
+    title,
+    threadId === "waiting" ? "approval-required" : "full-access",
+    threadId === "waiting" ? "plan" : "default",
+    deletedAt,
+    archivedAt,
+  );
 
   db.prepare(`
     INSERT INTO projection_thread_sessions (
       thread_id,
       status,
       active_turn_id,
+      runtime_mode,
       updated_at
-    ) VALUES (?, ?, ?, '2026-07-03T00:00:00.000Z')
-  `).run(threadId, status, activeTurnId);
+    ) VALUES (?, ?, ?, ?, '2026-07-03T00:00:00.000Z')
+  `).run(
+    threadId,
+    status,
+    activeTurnId,
+    threadId === "active-turn" ? "approval-required" : "full-access",
+  );
+
+  if (threadId === "active-turn" || threadId === "starting-no-turn") {
+    const pendingMessageId =
+      threadId === "active-turn" ? "message-active-turn" : "message-starting-turn";
+    db.prepare(`
+      INSERT INTO projection_turns (
+        thread_id,
+        turn_id,
+        pending_message_id,
+        state,
+        requested_at,
+        checkpoint_files_json
+      ) VALUES (?, ?, ?, ?, '2026-07-03T00:00:01.000Z', '[]')
+    `).run(
+      threadId,
+      activeTurnId,
+      pendingMessageId,
+      threadId === "active-turn" ? "running" : "pending",
+    );
+
+    db.prepare(`
+      INSERT INTO orchestration_events (
+        event_id,
+        aggregate_kind,
+        stream_id,
+        stream_version,
+        event_type,
+        occurred_at,
+        actor_kind,
+        payload_json,
+        metadata_json
+      ) VALUES (?, 'thread', ?, 1, 'thread.turn-start-requested', '2026-07-03T00:00:01.000Z', 'system', ?, '{}')
+    `).run(
+      `event-${threadId}-start`,
+      threadId,
+      JSON.stringify({
+        threadId,
+        messageId: pendingMessageId,
+        interactionMode: "plan",
+      }),
+    );
+  }
 }
 
 function readManifest(outPath: string): CaptureManifest {
@@ -125,6 +216,8 @@ describe("capture-active-threads", () => {
           role: "active",
           status: "running",
           active_turn_id: "turn-1",
+          runtime_mode: "approval-required",
+          interaction_mode: "plan",
           title: "Active Turn",
           project_id: "project-1",
           injected_at: null,
@@ -134,6 +227,8 @@ describe("capture-active-threads", () => {
           role: "active",
           status: "running",
           active_turn_id: null,
+          runtime_mode: "full-access",
+          interaction_mode: "default",
           title: "Running No Turn",
           project_id: "project-1",
           injected_at: null,
@@ -143,6 +238,8 @@ describe("capture-active-threads", () => {
           role: "active",
           status: "starting",
           active_turn_id: null,
+          runtime_mode: "full-access",
+          interaction_mode: "plan",
           title: "Starting No Turn",
           project_id: "project-1",
           injected_at: null,
@@ -152,6 +249,8 @@ describe("capture-active-threads", () => {
           role: "waiting",
           status: "waiting",
           active_turn_id: null,
+          runtime_mode: "full-access",
+          interaction_mode: "plan",
           title: "Waiting Parent",
           project_id: "project-1",
           injected_at: null,

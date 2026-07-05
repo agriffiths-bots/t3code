@@ -133,6 +133,7 @@ interface TimelineRowSharedState {
   skills: ReadonlyArray<Pick<ServerProviderSkill, "name" | "displayName">>;
   activeThreadEnvironmentId: EnvironmentId;
   onRevertUserMessage: (messageId: MessageId) => void;
+  onRetryUserMessage: (messageId: MessageId) => void;
   onImageExpand: (preview: ExpandedImagePreview) => void;
   onOpenTurnDiff: (turnId: TurnId, filePath?: string) => void;
   onToggleTurnFold: (turnId: TurnId) => void;
@@ -168,6 +169,7 @@ interface MessagesTimelineProps {
   onOpenTurnDiff: (turnId: TurnId, filePath?: string) => void;
   revertTurnCountByUserMessageId: Map<MessageId, number>;
   onRevertUserMessage: (messageId: MessageId) => void;
+  onRetryUserMessage: (messageId: MessageId) => void;
   isRevertingCheckpoint: boolean;
   onImageExpand: (preview: ExpandedImagePreview) => void;
   activeThreadEnvironmentId: EnvironmentId;
@@ -201,6 +203,7 @@ export const MessagesTimeline = memo(function MessagesTimeline({
   onOpenTurnDiff,
   revertTurnCountByUserMessageId,
   onRevertUserMessage,
+  onRetryUserMessage,
   isRevertingCheckpoint,
   onImageExpand,
   activeThreadEnvironmentId,
@@ -424,6 +427,7 @@ export const MessagesTimeline = memo(function MessagesTimeline({
       skills,
       activeThreadEnvironmentId,
       onRevertUserMessage,
+      onRetryUserMessage,
       onImageExpand,
       onOpenTurnDiff,
       onToggleTurnFold,
@@ -438,6 +442,7 @@ export const MessagesTimeline = memo(function MessagesTimeline({
       skills,
       activeThreadEnvironmentId,
       onRevertUserMessage,
+      onRetryUserMessage,
       onImageExpand,
       onOpenTurnDiff,
       onToggleTurnFold,
@@ -853,6 +858,18 @@ function UserTimelineRow({ row }: { row: Extract<TimelineRow, { kind: "message" 
   const previewImages = userImages.filter((image) => image.name.startsWith("preview-annotation-"));
   const regularImages = userImages.filter((image) => !image.name.startsWith("preview-annotation-"));
   const canRevertAgentWork = typeof row.revertTurnCount === "number";
+  const deliveryStatus = row.message.deliveryStatus;
+  const deliveryError = row.message.deliveryError ?? null;
+  const deliveryRetryable = row.message.deliveryRetryable !== false;
+  const deliveryLabel =
+    deliveryStatus === "sending"
+      ? "Sending..."
+      : deliveryStatus === "queued"
+        ? "Queued"
+        : deliveryStatus === "failed"
+          ? "Failed"
+          : null;
+  const showRetry = deliveryStatus === "failed" && deliveryRetryable;
 
   return (
     <div className="group flex flex-col items-end gap-1">
@@ -914,8 +931,29 @@ function UserTimelineRow({ row }: { row: Extract<TimelineRow, { kind: "message" 
           markdownCwd={ctx.markdownCwd}
         />
       </div>
-      <div className="flex w-full max-w-[80%] items-center justify-end pe-1 text-xs tabular-nums opacity-0 transition-opacity duration-200 focus-within:opacity-100 group-hover:opacity-100">
+      <div
+        className={cn(
+          "flex w-full max-w-[80%] flex-wrap items-center justify-end gap-x-2 gap-y-1 pe-1 text-xs tabular-nums transition-opacity duration-200 focus-within:opacity-100 group-hover:opacity-100",
+          deliveryLabel || deliveryError ? "opacity-100" : "opacity-0",
+        )}
+      >
+        {deliveryError ? (
+          <span className="min-w-0 max-w-full text-right leading-snug text-muted-foreground">
+            {deliveryError}
+          </span>
+        ) : null}
         <div className="flex shrink-0 items-center gap-2">
+          {deliveryLabel ? (
+            <span
+              className={cn(
+                "text-xs",
+                deliveryStatus === "failed" ? "text-destructive" : "text-muted-foreground",
+              )}
+            >
+              {deliveryLabel}
+            </span>
+          ) : null}
+          {showRetry ? <RetryUserMessageButton messageId={row.message.id} /> : null}
           <Tooltip>
             <TooltipTrigger render={<p className="text-muted-foreground text-xs tabular-nums" />}>
               {formatShortTimestamp(row.message.createdAt, ctx.timestampFormat)}
@@ -933,6 +971,30 @@ function UserTimelineRow({ row }: { row: Extract<TimelineRow, { kind: "message" 
         </div>
       </div>
     </div>
+  );
+}
+
+function RetryUserMessageButton({ messageId }: { messageId: MessageId }) {
+  const ctx = use(TimelineRowCtx);
+  const activity = use(TimelineRowActivityCtx);
+
+  return (
+    <Tooltip>
+      <TooltipTrigger
+        render={
+          <Button
+            type="button"
+            size="xs"
+            variant="ghost"
+            disabled={activity.isWorking}
+            onClick={() => ctx.onRetryUserMessage(messageId)}
+          />
+        }
+      >
+        Retry
+      </TooltipTrigger>
+      <TooltipPopup side="top">Retry send</TooltipPopup>
+    </Tooltip>
   );
 }
 

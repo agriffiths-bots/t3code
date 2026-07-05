@@ -213,6 +213,11 @@ const make = Effect.gen(function* () {
         Cache.set(handledTurnStartKeys, key, true).pipe(Effect.as(Option.isSome(cached))),
       ),
     );
+  const providerDriverForInstance = (instanceId: ModelSelection["instanceId"]) =>
+    providerService.getInstanceInfo(instanceId).pipe(
+      Effect.map((info) => (isProviderDriverKind(info.driverKind) ? info.driverKind : null)),
+      Effect.catchCause(() => Effect.succeed(null)),
+    );
 
   const threadModelSelections = new Map<string, ModelSelection>();
 
@@ -287,20 +292,66 @@ const make = Effect.gen(function* () {
   const setThreadSessionErrorOnTurnStartFailure = Effect.fnUntraced(function* (input: {
     readonly threadId: ThreadId;
     readonly detail: string;
+    readonly modelSelection?: ModelSelection;
+    readonly runtimeMode?: RuntimeMode;
     readonly createdAt: string;
   }) {
     const thread = yield* resolveThread(input.threadId);
     const session = thread?.session;
+    const failureModelSelection = input.modelSelection ?? thread?.modelSelection;
+    const failureProviderName = failureModelSelection
+      ? yield* providerDriverForInstance(failureModelSelection.instanceId)
+      : null;
     if (!session) {
+      if (!thread) {
+        return;
+      }
+      const modelSelection = failureModelSelection ?? thread.modelSelection;
+      const providerName =
+        failureModelSelection === undefined
+          ? yield* providerDriverForInstance(modelSelection.instanceId)
+          : failureProviderName;
+      yield* setThreadSession({
+        threadId: input.threadId,
+        session: {
+          threadId: input.threadId,
+          status: "error",
+          providerName,
+          providerInstanceId: modelSelection.instanceId,
+          runtimeMode: input.runtimeMode ?? thread.runtimeMode,
+          activeTurnId: null,
+          lastError: input.detail,
+          updatedAt: input.createdAt,
+        },
+        createdAt: input.createdAt,
+      });
       return;
     }
+    const isUnstartedSyntheticSession = isUnstartedSyntheticErrorSession(thread);
     yield* setThreadSession({
       threadId: input.threadId,
       session: {
         ...session,
-        status: session.status === "stopped" ? "stopped" : "ready",
+        status:
+          session.status === "stopped" && !isUnstartedSyntheticSession
+            ? "stopped"
+            : isUnstartedSyntheticSession
+              ? "error"
+              : "ready",
+        ...(isUnstartedSyntheticSession
+          ? {
+              providerName: failureProviderName,
+              ...(input.modelSelection !== undefined
+                ? { providerInstanceId: input.modelSelection.instanceId }
+                : {}),
+              ...(input.runtimeMode !== undefined ? { runtimeMode: input.runtimeMode } : {}),
+            }
+          : {}),
         activeTurnId: null,
-        lastError: input.detail,
+        lastError:
+          session.status === "stopped" && !isUnstartedSyntheticSession
+            ? session.lastError
+            : input.detail,
         updatedAt: input.createdAt,
       },
       createdAt: input.createdAt,
@@ -318,6 +369,21 @@ const make = Effect.gen(function* () {
       .getThreadDetailById(threadId)
       .pipe(Effect.map(Option.getOrUndefined));
   });
+
+  const isUnstartedSyntheticErrorSession = (thread: {
+    readonly latestTurn?: { readonly startedAt: string | null } | null;
+    readonly session: { readonly lastError?: string | null; readonly status: string } | null;
+  }) =>
+    !thread.latestTurn?.startedAt &&
+    (thread.session?.status === "error" ||
+      (thread.session?.status === "stopped" &&
+        typeof thread.session.lastError === "string" &&
+        thread.session.lastError.length > 0));
+
+  const resolveActiveSession = (threadId: ThreadId) =>
+    providerService
+      .listSessions()
+      .pipe(Effect.map((sessions) => sessions.find((session) => session.threadId === threadId)));
 
   const rejectStartedThreadModelChangeIfRequired = Effect.fnUntraced(function* (input: {
     readonly threadId: ThreadId;
@@ -356,6 +422,7 @@ const make = Effect.gen(function* () {
     createdAt: string,
     options?: {
       readonly modelSelection?: ModelSelection;
+      readonly runtimeMode?: RuntimeMode;
     },
   ) {
     const thread = yield* resolveThread(threadId);
@@ -363,18 +430,19 @@ const make = Effect.gen(function* () {
       return yield* Effect.die(new Error(`Thread '${threadId}' was not found in read model.`));
     }
 
-    const desiredRuntimeMode = thread.runtimeMode;
+    const desiredRuntimeMode = options?.runtimeMode ?? thread.runtimeMode;
     const requestedModelSelection = options?.modelSelection;
-    const resolveActiveSession = (threadId: ThreadId) =>
-      providerService
-        .listSessions()
-        .pipe(Effect.map((sessions) => sessions.find((session) => session.threadId === threadId)));
 
     const activeSession = yield* resolveActiveSession(threadId);
     const activeThreadSession =
       thread.session !== null && thread.session.status !== "stopped" && activeSession
         ? thread.session
         : null;
+    const hasEstablishedProviderBinding =
+      thread.session !== null &&
+      (activeSession !== undefined ||
+        Boolean(thread.latestTurn?.startedAt) ||
+        (thread.session.status === "stopped" && !isUnstartedSyntheticErrorSession(thread)));
     if (
       activeThreadSession !== null &&
       activeSession !== undefined &&
@@ -430,7 +498,7 @@ const make = Effect.gen(function* () {
       });
     }
     const preferredProvider: ProviderDriverKind = desiredDriverKind;
-    if (thread.session !== null) {
+    if (hasEstablishedProviderBinding) {
       yield* rejectStartedThreadModelChangeIfRequired({
         threadId,
         currentModelSelection:
@@ -445,7 +513,7 @@ const make = Effect.gen(function* () {
       });
     }
     if (
-      thread.session !== null &&
+      hasEstablishedProviderBinding &&
       requestedModelSelection !== undefined &&
       requestedModelSelection.instanceId !== currentInstanceId
     ) {
@@ -516,7 +584,7 @@ const make = Effect.gen(function* () {
     const existingSessionThreadId =
       thread.session && thread.session.status !== "stopped" && activeSession ? thread.id : null;
     if (existingSessionThreadId) {
-      const runtimeModeChanged = thread.runtimeMode !== thread.session?.runtimeMode;
+      const runtimeModeChanged = desiredRuntimeMode !== thread.session?.runtimeMode;
       const cwdChanged = effectiveCwd !== activeSession?.cwd;
       const sessionModelSwitch = (yield* providerService.getCapabilities(desiredInstanceId))
         .sessionModelSwitch;
@@ -557,7 +625,7 @@ const make = Effect.gen(function* () {
         desiredInstanceId,
         desiredProvider: desiredModelSelection.instanceId,
         currentRuntimeMode: thread.session?.runtimeMode,
-        desiredRuntimeMode: thread.runtimeMode,
+        desiredRuntimeMode,
         runtimeModeChanged,
         previousCwd: activeSession?.cwd,
         desiredCwd: effectiveCwd,
@@ -593,6 +661,7 @@ const make = Effect.gen(function* () {
     readonly messageText: string;
     readonly attachments?: ReadonlyArray<ChatAttachment>;
     readonly modelSelection?: ModelSelection;
+    readonly runtimeMode?: RuntimeMode;
     readonly interactionMode?: "default" | "plan";
     readonly createdAt: string;
   }) {
@@ -602,11 +671,10 @@ const make = Effect.gen(function* () {
         new Error(`Thread '${input.threadId}' was not found in read model.`),
       );
     }
-    yield* ensureSessionForThread(
-      input.threadId,
-      input.createdAt,
-      input.modelSelection !== undefined ? { modelSelection: input.modelSelection } : {},
-    );
+    yield* ensureSessionForThread(input.threadId, input.createdAt, {
+      ...(input.modelSelection !== undefined ? { modelSelection: input.modelSelection } : {}),
+      ...(input.runtimeMode !== undefined ? { runtimeMode: input.runtimeMode } : {}),
+    });
     if (input.modelSelection !== undefined) {
       threadModelSelections.set(input.threadId, input.modelSelection);
     }
@@ -814,6 +882,10 @@ const make = Effect.gen(function* () {
       return setThreadSessionErrorOnTurnStartFailure({
         threadId: event.payload.threadId,
         detail,
+        ...(event.payload.modelSelection !== undefined
+          ? { modelSelection: event.payload.modelSelection }
+          : {}),
+        runtimeMode: event.payload.runtimeMode,
         createdAt: event.payload.createdAt,
       }).pipe(
         Effect.flatMap(() =>
@@ -849,6 +921,7 @@ const make = Effect.gen(function* () {
       ...(event.payload.modelSelection !== undefined
         ? { modelSelection: event.payload.modelSelection }
         : {}),
+      runtimeMode: event.payload.runtimeMode,
       interactionMode: event.payload.interactionMode,
       createdAt: event.payload.createdAt,
     }).pipe(
@@ -872,7 +945,11 @@ const make = Effect.gen(function* () {
     if (!thread) {
       return;
     }
-    const hasSession = thread.session && thread.session.status !== "stopped";
+    const activeSession = yield* resolveActiveSession(event.payload.threadId);
+    const hasSession =
+      thread.session &&
+      thread.session.status !== "stopped" &&
+      !(activeSession === undefined && isUnstartedSyntheticErrorSession(thread));
     if (!hasSession) {
       return yield* appendProviderFailureActivity({
         threadId: event.payload.threadId,
@@ -895,7 +972,11 @@ const make = Effect.gen(function* () {
     if (!thread) {
       return;
     }
-    const hasSession = thread.session && thread.session.status !== "stopped";
+    const activeSession = yield* resolveActiveSession(event.payload.threadId);
+    const hasSession =
+      thread.session &&
+      thread.session.status !== "stopped" &&
+      !(activeSession === undefined && isUnstartedSyntheticErrorSession(thread));
     if (!hasSession) {
       return yield* appendProviderFailureActivity({
         threadId: event.payload.threadId,
@@ -939,7 +1020,11 @@ const make = Effect.gen(function* () {
       if (!thread) {
         return;
       }
-      const hasSession = thread.session && thread.session.status !== "stopped";
+      const activeSession = yield* resolveActiveSession(event.payload.threadId);
+      const hasSession =
+        thread.session &&
+        thread.session.status !== "stopped" &&
+        !(activeSession === undefined && isUnstartedSyntheticErrorSession(thread));
       if (!hasSession) {
         return yield* appendProviderFailureActivity({
           threadId: event.payload.threadId,
@@ -985,7 +1070,12 @@ const make = Effect.gen(function* () {
     }
 
     const now = event.payload.createdAt;
-    if (thread.session && thread.session.status !== "stopped") {
+    const activeSession = yield* resolveActiveSession(thread.id);
+    if (
+      thread.session &&
+      thread.session.status !== "stopped" &&
+      !(activeSession === undefined && isUnstartedSyntheticErrorSession(thread))
+    ) {
       yield* providerService.stopSession({ threadId: thread.id });
     }
 
@@ -1021,15 +1111,21 @@ const make = Effect.gen(function* () {
     switch (event.type) {
       case "thread.runtime-mode-set": {
         const thread = yield* resolveThread(event.payload.threadId);
-        if (!thread?.session || thread.session.status === "stopped") {
+        const activeSession = thread
+          ? yield* resolveActiveSession(event.payload.threadId)
+          : undefined;
+        if (
+          !thread?.session ||
+          thread.session.status === "stopped" ||
+          (activeSession === undefined && isUnstartedSyntheticErrorSession(thread))
+        ) {
           return;
         }
         const cachedModelSelection = threadModelSelections.get(event.payload.threadId);
-        yield* ensureSessionForThread(
-          event.payload.threadId,
-          event.occurredAt,
-          cachedModelSelection !== undefined ? { modelSelection: cachedModelSelection } : {},
-        );
+        yield* ensureSessionForThread(event.payload.threadId, event.occurredAt, {
+          ...(cachedModelSelection !== undefined ? { modelSelection: cachedModelSelection } : {}),
+          runtimeMode: event.payload.runtimeMode,
+        });
         return;
       }
       case "thread.turn-start-requested":

@@ -39,6 +39,9 @@ export type ChatAttachment = ChatImageAttachment;
 
 export interface ChatMessage extends Omit<OrchestrationMessage, "attachments"> {
   readonly attachments?: ReadonlyArray<ChatAttachment> | undefined;
+  readonly deliveryStatus?: "sending" | "queued" | "failed";
+  readonly deliveryError?: string | null;
+  readonly deliveryRetryable?: boolean;
 }
 
 export type ProposedPlan = OrchestrationProposedPlan;

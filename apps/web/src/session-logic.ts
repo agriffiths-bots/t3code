@@ -309,6 +309,19 @@ export function isLatestTurnSettled(
   return true;
 }
 
+export function isThreadReadyForQueuedTurn(
+  latestTurn: LatestTurnTiming | null,
+  session: SessionActivityState | null,
+): boolean {
+  if (session?.status === "starting") {
+    return false;
+  }
+  if (!latestTurn) {
+    return !isThreadSessionActive(session);
+  }
+  return isLatestTurnSettled(latestTurn, session);
+}
+
 export function deriveActiveWorkStartedAt(
   latestTurn: LatestTurnTiming | null,
   session: SessionActivityState | null,

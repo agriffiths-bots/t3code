@@ -9,12 +9,15 @@ import {
   buildThreadTurnInterruptInput,
   createLocalDispatchSnapshot,
   deriveComposerSendState,
+  deriveLockedProvider,
   getStartedThreadModelChangeBlockReason,
+  hasQueuedSubmissionBeenObservedByShell,
   hasServerAcknowledgedLocalDispatch,
   reconcileMountedTerminalThreadIds,
   reconcileRetainedMountedThreadIds,
   resolveSendEnvMode,
   shouldWriteThreadErrorToCurrentServerThread,
+  threadHasEstablishedProviderBinding,
 } from "./ChatView.logic";
 
 const environmentId = EnvironmentId.make("environment-local");
@@ -69,6 +72,102 @@ const readySession = {
   lastError: null,
   updatedAt: "2026-03-29T00:00:10.000Z",
 };
+
+describe("threadHasEstablishedProviderBinding", () => {
+  it("does not treat synthetic first-start errors as established provider bindings", () => {
+    const thread = makeThread({
+      session: {
+        ...readySession,
+        status: "error",
+        activeTurnId: null,
+        lastError: "Provider failed before the turn started.",
+      },
+      latestTurn: {
+        ...completedTurn,
+        state: "running",
+        startedAt: null,
+        completedAt: null,
+      },
+    });
+
+    expect(threadHasEstablishedProviderBinding(thread)).toBe(false);
+    expect(
+      deriveLockedProvider({
+        thread,
+        selectedProvider: "grok",
+        threadProvider: thread.session?.providerName ?? null,
+      }),
+    ).toBeNull();
+  });
+
+  it("treats active sessions and started turns as established provider bindings", () => {
+    expect(
+      threadHasEstablishedProviderBinding(
+        makeThread({
+          session: {
+            ...readySession,
+            status: "running",
+            activeTurnId: TurnId.make("turn-running"),
+          },
+        }),
+      ),
+    ).toBe(true);
+
+    expect(
+      threadHasEstablishedProviderBinding(
+        makeThread({
+          session: {
+            ...readySession,
+            status: "error",
+            lastError: "Provider failed after the turn started.",
+          },
+          latestTurn: completedTurn,
+        }),
+      ),
+    ).toBe(true);
+  });
+});
+
+describe("hasQueuedSubmissionBeenObservedByShell", () => {
+  it("waits when the shell has not observed a turn at or after the queued submission", () => {
+    expect(
+      hasQueuedSubmissionBeenObservedByShell({
+        submissionCreatedAt: "2026-03-29T00:00:05.000Z",
+        latestTurn: null,
+      }),
+    ).toBe(false);
+    expect(
+      hasQueuedSubmissionBeenObservedByShell({
+        submissionCreatedAt: "2026-03-29T00:00:05.000Z",
+        latestTurn: {
+          ...completedTurn,
+          requestedAt: "2026-03-29T00:00:04.000Z",
+        },
+      }),
+    ).toBe(false);
+  });
+
+  it("treats a shell turn requested at or after the queued submission as observed", () => {
+    expect(
+      hasQueuedSubmissionBeenObservedByShell({
+        submissionCreatedAt: "2026-03-29T00:00:05.000Z",
+        latestTurn: {
+          ...completedTurn,
+          requestedAt: "2026-03-29T00:00:05.000Z",
+        },
+      }),
+    ).toBe(true);
+    expect(
+      hasQueuedSubmissionBeenObservedByShell({
+        submissionCreatedAt: "2026-03-29T00:00:05.000Z",
+        latestTurn: {
+          ...completedTurn,
+          requestedAt: "2026-03-29T00:00:06.000Z",
+        },
+      }),
+    ).toBe(true);
+  });
+});
 
 describe("buildThreadTurnInterruptInput", () => {
   it("targets the session's active running turn", () => {

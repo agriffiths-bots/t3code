@@ -35,6 +35,8 @@ export interface CapturedThread {
   readonly role: "active" | "waiting";
   readonly status: string;
   readonly active_turn_id: string | null;
+  readonly runtime_mode: string;
+  readonly interaction_mode: string;
   readonly title: string;
   readonly project_id: string;
   readonly injected_at: null;
@@ -52,6 +54,8 @@ interface SessionRow {
   readonly thread_id: string;
   readonly status: string;
   readonly active_turn_id: string | null;
+  readonly runtime_mode: string;
+  readonly interaction_mode: string;
   readonly title: string;
   readonly project_id: string;
 }
@@ -92,10 +96,28 @@ function buildCaptureQuery(excludedThreadIds: ReadonlyArray<string>) {
       sessions.thread_id,
       sessions.status,
       sessions.active_turn_id,
+      sessions.runtime_mode,
+      COALESCE(
+        json_extract(turn_start_events.payload_json, '$.interactionMode'),
+        threads.interaction_mode
+      ) AS interaction_mode,
       threads.title,
       threads.project_id
     FROM projection_thread_sessions sessions
     INNER JOIN projection_threads threads ON threads.thread_id = sessions.thread_id
+    LEFT JOIN projection_turns active_turns
+      ON active_turns.thread_id = sessions.thread_id
+      AND active_turns.turn_id = sessions.active_turn_id
+    LEFT JOIN projection_turns pending_turns
+      ON pending_turns.thread_id = sessions.thread_id
+      AND sessions.active_turn_id IS NULL
+      AND pending_turns.turn_id IS NULL
+      AND pending_turns.state = 'pending'
+    LEFT JOIN orchestration_events turn_start_events
+      ON turn_start_events.stream_id = sessions.thread_id
+      AND turn_start_events.event_type = 'thread.turn-start-requested'
+      AND json_extract(turn_start_events.payload_json, '$.messageId') =
+        COALESCE(active_turns.pending_message_id, pending_turns.pending_message_id)
     WHERE threads.deleted_at IS NULL
       AND threads.archived_at IS NULL
       AND (
@@ -125,6 +147,8 @@ function readCapturedThreads(
     role: roleForRow(row),
     status: row.status,
     active_turn_id: row.active_turn_id,
+    runtime_mode: row.runtime_mode,
+    interaction_mode: row.interaction_mode,
     title: row.title,
     project_id: row.project_id,
     injected_at: null,
