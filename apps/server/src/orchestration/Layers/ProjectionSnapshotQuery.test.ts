@@ -1002,22 +1002,34 @@ projectionSnapshotLayer("ProjectionSnapshotQuery", (it) => {
         assert.equal(context.value.trackedCheckpointTurnIds?.length, MAX_THREAD_CHECKPOINTS + 5);
         assert.equal(context.value.trackedCheckpointTurnIds?.[0], asTurnId("turn-1"));
         assert.equal(context.value.trackedCheckpointTurnIds?.at(-1), asTurnId("turn-505"));
-        assert.equal(context.value.checkpoints.length, MAX_THREAD_CHECKPOINTS);
-        assert.equal(context.value.checkpoints[0]?.checkpointTurnCount, 6);
+        assert.equal(context.value.checkpoints.length, MAX_THREAD_CHECKPOINTS + 1);
+        assert.equal(context.value.checkpoints[0]?.checkpointTurnCount, 5);
         assert.equal(
           context.value.checkpoints[0]?.checkpointRef,
-          asCheckpointRef("refs/t3/checkpoints/thread-retention/turn/6"),
+          asCheckpointRef("refs/t3/checkpoints/thread-retention/turn/5"),
         );
         assert.equal(context.value.checkpoints.at(-1)?.checkpointTurnCount, 505);
       }
 
       const prunedDiffContext = yield* snapshotQuery.getFullThreadDiffContext(
         ThreadId.make("thread-retention"),
-        5,
+        4,
       );
       assert.equal(prunedDiffContext._tag, "Some");
       if (prunedDiffContext._tag === "Some") {
         assert.equal(prunedDiffContext.value.toCheckpointRef, null);
+      }
+
+      const boundaryDiffContext = yield* snapshotQuery.getFullThreadDiffContext(
+        ThreadId.make("thread-retention"),
+        5,
+      );
+      assert.equal(boundaryDiffContext._tag, "Some");
+      if (boundaryDiffContext._tag === "Some") {
+        assert.equal(
+          boundaryDiffContext.value.toCheckpointRef,
+          asCheckpointRef("refs/t3/checkpoints/thread-retention/turn/5"),
+        );
       }
 
       const retainedDiffContext = yield* snapshotQuery.getFullThreadDiffContext(
