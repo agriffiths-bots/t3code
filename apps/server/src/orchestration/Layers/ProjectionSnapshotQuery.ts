@@ -127,6 +127,9 @@ const ProjectionThreadCheckpointContextThreadRowSchema = Schema.Struct({
   workspaceRoot: Schema.String,
   worktreePath: Schema.NullOr(Schema.String),
 });
+const ProjectionCheckpointTurnIdRowSchema = Schema.Struct({
+  turnId: TurnId,
+});
 const FullThreadDiffContextLookupInput = Schema.Struct({
   threadId: ThreadId,
   checkpointTurnCount: NonNegativeInt,
@@ -947,6 +950,20 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
         ) checkpoint_rows
         WHERE checkpoint_rows.checkpoint_rank <= ${MAX_THREAD_CHECKPOINTS}
         ORDER BY checkpoint_rows.checkpoint_turn_count ASC
+      `,
+  });
+
+  const listCheckpointTurnIdRowsByThread = SqlSchema.findAll({
+    Request: ThreadIdLookupInput,
+    Result: ProjectionCheckpointTurnIdRowSchema,
+    execute: ({ threadId }) =>
+      sql`
+        SELECT
+          turn_id AS "turnId"
+        FROM projection_turns
+        WHERE thread_id = ${threadId}
+          AND checkpoint_turn_count IS NOT NULL
+        ORDER BY checkpoint_turn_count ASC
       `,
   });
 
@@ -1855,20 +1872,31 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
         return Option.none<ProjectionThreadCheckpointContext>();
       }
 
-      const checkpointRows = yield* listCheckpointRowsByThread({ threadId }).pipe(
-        Effect.mapError(
-          toPersistenceSqlOrDecodeError(
-            "ProjectionSnapshotQuery.getThreadCheckpointContext:listCheckpoints:query",
-            "ProjectionSnapshotQuery.getThreadCheckpointContext:listCheckpoints:decodeRows",
+      const [checkpointRows, checkpointTurnIdRows] = yield* Effect.all([
+        listCheckpointRowsByThread({ threadId }).pipe(
+          Effect.mapError(
+            toPersistenceSqlOrDecodeError(
+              "ProjectionSnapshotQuery.getThreadCheckpointContext:listCheckpoints:query",
+              "ProjectionSnapshotQuery.getThreadCheckpointContext:listCheckpoints:decodeRows",
+            ),
           ),
         ),
-      );
+        listCheckpointTurnIdRowsByThread({ threadId }).pipe(
+          Effect.mapError(
+            toPersistenceSqlOrDecodeError(
+              "ProjectionSnapshotQuery.getThreadCheckpointContext:listCheckpointTurnIds:query",
+              "ProjectionSnapshotQuery.getThreadCheckpointContext:listCheckpointTurnIds:decodeRows",
+            ),
+          ),
+        ),
+      ]);
 
       return Option.some({
         threadId: threadRow.value.threadId,
         projectId: threadRow.value.projectId,
         workspaceRoot: threadRow.value.workspaceRoot,
         worktreePath: threadRow.value.worktreePath,
+        trackedCheckpointTurnIds: checkpointTurnIdRows.map((row) => row.turnId),
         checkpoints: checkpointRows.map(
           (row): OrchestrationCheckpointSummary => ({
             turnId: row.turnId,
