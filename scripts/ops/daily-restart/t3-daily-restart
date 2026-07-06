@@ -436,8 +436,10 @@ async function main() {
     throw new Error("auth session is not authenticated");
   }
   const scopes = Array.isArray(session.scopes) ? session.scopes : [];
-  if (!scopes.includes("orchestration:operate")) {
-    throw new Error("auth session missing orchestration:operate");
+  const requiredScopes = ["orchestration:operate", "orchestration:read"];
+  const missingScopes = requiredScopes.filter((scope) => !scopes.includes(scope));
+  if (missingScopes.length > 0) {
+    throw new Error(`auth session missing ${missingScopes.join(", ")}`);
   }
 }
 
@@ -513,6 +515,81 @@ on_exit() {
 }
 trap on_exit EXIT
 
+sanitize_manifest_for_post_stop_capture_failure() {
+  local output
+  output="$(node - "$manifest" <<'NODE'
+const fs = require("node:fs");
+const path = require("node:path");
+
+const manifestPath = process.argv[2];
+const data = JSON.parse(fs.readFileSync(manifestPath, "utf8"));
+const threads = Array.isArray(data.threads) ? data.threads : [];
+let strippedPending = 0;
+let droppedPendingOnly = 0;
+
+data.threads = threads.flatMap((thread) => {
+  if (!thread || typeof thread !== "object") return [];
+  const activeTurnId = thread.active_turn_id;
+  if (
+    thread.role !== "active" ||
+    typeof activeTurnId !== "string" ||
+    activeTurnId.length === 0
+  ) {
+    if (thread.pending_message !== undefined) droppedPendingOnly += 1;
+    return [];
+  }
+
+  const sanitized = { ...thread };
+  if (sanitized.pending_message !== undefined) {
+    delete sanitized.pending_message;
+    strippedPending += 1;
+  }
+  return [sanitized];
+});
+
+const tempPath = path.join(
+  path.dirname(manifestPath),
+  `.${path.basename(manifestPath)}.${process.pid}.tmp`,
+);
+fs.writeFileSync(tempPath, `${JSON.stringify(data, null, 2)}\n`, { mode: 0o600 });
+fs.renameSync(tempPath, manifestPath);
+console.log(
+  `threads=${data.threads.length} stripped_pending=${strippedPending} dropped_pending_only=${droppedPendingOnly}`,
+);
+NODE
+)" || return 1
+  log "post-stop capture failure fallback manifest sanitized $output"
+}
+
+inject_resume_timeout_seconds() {
+  node - "$manifest" <<'NODE'
+const fs = require("node:fs");
+
+const manifestPath = process.argv[2];
+const data = JSON.parse(fs.readFileSync(manifestPath, "utf8"));
+const threads = Array.isArray(data.threads) ? data.threads : [];
+const baseTimeoutSeconds = 600;
+const perQueuedReplaySeconds = 120;
+let queuedReplayThreads = 0;
+
+for (const thread of threads) {
+  if (!thread || typeof thread !== "object") continue;
+  const activeTurnId = thread.active_turn_id;
+  if (
+    thread.role === "active" &&
+    thread.injected_at === null &&
+    typeof activeTurnId === "string" &&
+    activeTurnId.length > 0 &&
+    thread.pending_message !== undefined
+  ) {
+    queuedReplayThreads += 1;
+  }
+}
+
+console.log(baseTimeoutSeconds + queuedReplayThreads * perQueuedReplaySeconds);
+NODE
+}
+
 inject_resume_manifest() {
   if [[ -z "$pinned_inject_resume" || ! -x "$pinned_inject_resume" ]]; then
     log "missing pinned inject-resume"
@@ -526,8 +603,17 @@ inject_resume_manifest() {
     log "deferred resume token validation failed"
     return 1
   fi
-  log "RUN timeout=600 $pinned_inject_resume --origin $origin --manifest $manifest --attachments-dir $attachments_dir"
-  T3DR_TOKEN="$resume_token" timeout 600 "$pinned_inject_resume" --origin "$origin" \
+  local inject_timeout
+  inject_timeout="$(inject_resume_timeout_seconds)" || {
+    log "failed to compute inject-resume timeout"
+    return 1
+  }
+  if ! [[ "$inject_timeout" =~ ^[0-9]+$ ]] || [[ "$inject_timeout" -le 0 ]]; then
+    log "invalid inject-resume timeout=$inject_timeout"
+    return 1
+  fi
+  log "RUN timeout=$inject_timeout $pinned_inject_resume --origin $origin --manifest $manifest --attachments-dir $attachments_dir"
+  T3DR_TOKEN="$resume_token" timeout "$inject_timeout" "$pinned_inject_resume" --origin "$origin" \
     --manifest "$manifest" --attachments-dir "$attachments_dir" >>"$log_file" 2>&1
 }
 
@@ -914,7 +1000,11 @@ if ! capture_active_manifest "post-stop" "${post_stop_capture_args[@]}"; then
   record_result "FAILED"
   if run_capture 60 systemctl --user start "$service"; then
     log "restarted unchanged service after post-stop capture failure"
-    inject_resume_manifest || log "failed to inject pre-stop resume after post-stop capture failure"
+    if sanitize_manifest_for_post_stop_capture_failure; then
+      inject_resume_manifest || log "failed to inject pre-stop resume after post-stop capture failure"
+    else
+      log "failed to sanitize fallback manifest after post-stop capture failure"
+    fi
   else
     log "failed to restart after post-stop capture failure"
   fi
