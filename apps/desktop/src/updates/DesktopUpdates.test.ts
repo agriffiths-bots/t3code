@@ -39,6 +39,7 @@ function makeHarness(options: UpdatesHarnessOptions = {}) {
   let checkCount = 0;
   let verifyCount = 0;
   let allowDowngrade = false;
+  const disableDifferentialDownloadValues: boolean[] = [];
   const feedUrls: ElectronUpdater.ElectronUpdaterFeedUrl[] = [];
   const listeners = new Map<string, Set<(...args: readonly unknown[]) => void>>();
   const sentStates: DesktopUpdateState[] = [];
@@ -74,7 +75,10 @@ function makeHarness(options: UpdatesHarnessOptions = {}) {
       Effect.sync(() => {
         allowDowngrade = value;
       }),
-    setDisableDifferentialDownload: () => options.setDisableDifferentialDownload ?? Effect.void,
+    setDisableDifferentialDownload: (value) =>
+      Effect.sync(() => {
+        disableDifferentialDownloadValues.push(value);
+      }).pipe(Effect.andThen(options.setDisableDifferentialDownload ?? Effect.void)),
     verifyAvailable: Effect.sync(() => {
       verifyCount += 1;
     }),
@@ -191,6 +195,7 @@ function makeHarness(options: UpdatesHarnessOptions = {}) {
     checkCount: () => checkCount,
     feedUrls: () => feedUrls,
     verifyCount: () => verifyCount,
+    disableDifferentialDownloadValues: () => disableDifferentialDownloadValues,
     listenerCount: () =>
       Array.from(listeners.values()).reduce(
         (total, eventListeners) => total + eventListeners.size,
@@ -263,6 +268,7 @@ describe("DesktopUpdates", () => {
           assert.equal(harness.listenerCount(), 6);
           assert.equal(harness.checkCount(), 0);
           assert.equal(harness.verifyCount(), 0);
+          assert.deepEqual(harness.disableDifferentialDownloadValues(), [true]);
 
           yield* TestClock.adjust(Duration.millis(15_000));
           assert.equal(harness.checkCount(), 1);
@@ -449,6 +455,7 @@ describe("DesktopUpdates", () => {
           const retry = yield* updates.download;
           assert.isTrue(retry.accepted);
           assert.isTrue(retry.completed);
+          assert.deepEqual(harness.disableDifferentialDownloadValues(), [true, true, true]);
         }),
       ).pipe(Effect.provide(Layer.merge(TestClock.layer(), harness.layer)));
     }),
@@ -476,6 +483,7 @@ describe("DesktopUpdates", () => {
         assert.equal(failedState.status, "downloaded");
         assert.equal(failedState.errorContext, "install");
         assert.equal(failedState.message, "Desktop update install action failed unexpectedly.");
+        assert.isTrue(harness.sentStates.some((state) => state.status === "installing"));
 
         const changedState = yield* updates.setChannel("nightly");
         assert.equal(changedState.channel, "nightly");

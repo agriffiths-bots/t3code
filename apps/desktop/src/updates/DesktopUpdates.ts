@@ -37,6 +37,7 @@ import {
   reduceDesktopUpdateStateOnDownloadProgress,
   reduceDesktopUpdateStateOnDownloadStart,
   reduceDesktopUpdateStateOnInstallFailure,
+  reduceDesktopUpdateStateOnInstallStart,
   reduceDesktopUpdateStateOnNoUpdate,
   reduceDesktopUpdateStateOnUpdateAvailable,
 } from "./updateMachine.ts";
@@ -346,7 +347,11 @@ export const make = Effect.gen(function* () {
     if (yield* Ref.get(updateCheckInFlightRef)) return false;
 
     const state = yield* Ref.get(updateStateRef);
-    if (state.status === "downloading" || state.status === "downloaded") {
+    if (
+      state.status === "downloading" ||
+      state.status === "downloaded" ||
+      state.status === "installing"
+    ) {
       yield* logUpdaterInfo("skipping update check while update is active", {
         reason,
         status: state.status,
@@ -393,9 +398,7 @@ export const make = Effect.gen(function* () {
     yield* Ref.set(updateDownloadInFlightRef, true);
     return yield* Effect.gen(function* () {
       yield* setState(reduceDesktopUpdateStateOnDownloadStart(state));
-      yield* electronUpdater.setDisableDifferentialDownload(
-        isArm64HostRunningIntelBuild(environment.runtimeInfo),
-      );
+      yield* electronUpdater.setDisableDifferentialDownload(true);
       yield* logUpdaterInfo("downloading update");
       yield* electronUpdater.downloadUpdate;
       return { accepted: true, completed: true };
@@ -456,6 +459,7 @@ export const make = Effect.gen(function* () {
 
     yield* Ref.set(desktopState.quitting, true);
     yield* Ref.set(updateInstallInFlightRef, true);
+    yield* setState(reduceDesktopUpdateStateOnInstallStart(state));
 
     return yield* Effect.gen(function* () {
       // Stop every backend in the pool, not just the primary. With
@@ -727,9 +731,7 @@ export const make = Effect.gen(function* () {
       yield* electronUpdater.setAutoDownload(false);
       yield* electronUpdater.setAutoInstallOnAppQuit(false);
       yield* applyAutoUpdaterChannel(settings.updateChannel);
-      yield* electronUpdater.setDisableDifferentialDownload(
-        isArm64HostRunningIntelBuild(environment.runtimeInfo),
-      );
+      yield* electronUpdater.setDisableDifferentialDownload(true);
 
       if (isArm64HostRunningIntelBuild(environment.runtimeInfo)) {
         yield* logUpdaterInfo(
