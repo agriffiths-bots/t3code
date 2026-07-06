@@ -144,6 +144,28 @@ describe("preview automation tab targeting", () => {
   });
 });
 
+describe("PreviewAutomationStatus", () => {
+  it("accepts missing-host recovery metadata", () => {
+    expect(
+      decodeAutomationStatus({
+        available: false,
+        visible: false,
+        tabId: null,
+        url: null,
+        title: null,
+        loading: false,
+        hostState: "missing",
+        unavailableReason: "No host is attached.",
+        recovery: "Open T3 Code Desktop.",
+      }),
+    ).toMatchObject({
+      available: false,
+      hostState: "missing",
+      recovery: "Open T3 Code Desktop.",
+    });
+  });
+});
+
 describe("PreviewAutomationHost", () => {
   it("accepts legacy hosts and current operation advertisements", () => {
     expect(decodeAutomationHost({ clientId: "legacy", environmentId: "environment-1" })).toEqual({

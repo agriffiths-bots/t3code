@@ -1,5 +1,6 @@
 import * as Effect from "effect/Effect";
 import type {
+  PreviewAutomationNoAvailableHostError,
   PreviewAutomationOperation,
   PreviewAutomationRecordingArtifact,
   PreviewAutomationRecordingStatus,
@@ -46,8 +47,31 @@ const invokeTargeted = <A>(
   return invoke<A>(operation, operationInput, timeoutMs, tabId);
 };
 
+const missingHostStatus = (
+  input: {
+    readonly tabId?: PreviewTabId | undefined;
+  },
+  error: PreviewAutomationNoAvailableHostError,
+): PreviewAutomationStatus => ({
+  available: false,
+  visible: false,
+  tabId: input.tabId ?? null,
+  url: null,
+  title: null,
+  loading: false,
+  hostState: "missing",
+  unavailableReason: error.message,
+  recovery:
+    "Open or reload T3 Code Desktop for this environment; the desktop renderer will attach the preview automation host automatically.",
+});
+
 const handlers = {
-  preview_status: (input) => invokeTargeted<PreviewAutomationStatus>("status", input ?? {}),
+  preview_status: (input) =>
+    invokeTargeted<PreviewAutomationStatus>("status", input ?? {}).pipe(
+      Effect.catchTag("PreviewAutomationNoAvailableHostError", (error) =>
+        Effect.succeed(missingHostStatus(input ?? {}, error)),
+      ),
+    ),
   preview_open: (input) =>
     invokeTargeted<PreviewAutomationStatus>("open", {
       ...input,

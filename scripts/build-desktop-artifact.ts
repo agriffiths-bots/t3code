@@ -9,6 +9,11 @@ import { resolveSpawnCommand } from "@t3tools/shared/shell";
 import rootPackageJson from "../package.json" with { type: "json" };
 import desktopPackageJson from "../apps/desktop/package.json" with { type: "json" };
 import serverPackageJson from "../apps/server/package.json" with { type: "json" };
+import clientRuntimePackageJson from "../packages/client-runtime/package.json" with { type: "json" };
+import contractsPackageJson from "../packages/contracts/package.json" with { type: "json" };
+import sharedPackageJson from "../packages/shared/package.json" with { type: "json" };
+import sshPackageJson from "../packages/ssh/package.json" with { type: "json" };
+import tailscalePackageJson from "../packages/tailscale/package.json" with { type: "json" };
 
 import { BRAND_ASSET_PATHS } from "./lib/brand-assets.ts";
 import { getDefaultBuildArch } from "./lib/build-target-arch.ts";
@@ -54,6 +59,13 @@ const StageWorkspaceConfig = Schema.Struct({
 const RepoRoot = Effect.service(Path.Path).pipe(
   Effect.flatMap((path) => path.fromFileUrl(new URL("..", import.meta.url))),
 );
+const DESKTOP_WORKSPACE_RUNTIME_MANIFESTS = {
+  "@t3tools/client-runtime": clientRuntimePackageJson,
+  "@t3tools/contracts": contractsPackageJson,
+  "@t3tools/shared": sharedPackageJson,
+  "@t3tools/ssh": sshPackageJson,
+  "@t3tools/tailscale": tailscalePackageJson,
+} as const;
 const encodeJsonString = Schema.encodeEffect(Schema.UnknownFromJsonString);
 const decodeWorkspaceConfig = Schema.decodeEffect(fromYaml(WorkspaceConfig));
 const decodeNodePtyManifest = Schema.decodeUnknownEffect(
@@ -1265,17 +1277,51 @@ function validateBundledClientAssets(clientDir: string) {
 export function resolveDesktopRuntimeDependencies(
   dependencies: Record<string, string> | undefined,
   catalog: Record<string, string>,
+  workspaceManifests: Readonly<
+    Record<string, { readonly dependencies?: Record<string, string> }>
+  > = DESKTOP_WORKSPACE_RUNTIME_MANIFESTS,
 ): Record<string, string> {
   if (!dependencies || Object.keys(dependencies).length === 0) {
     return {};
   }
 
-  const runtimeDependencies = Object.fromEntries(
-    Object.entries(dependencies).filter(
-      ([dependencyName, dependencySpec]) =>
-        dependencyName !== "electron" && !dependencySpec.startsWith("workspace:"),
-    ),
-  );
+  const visitedWorkspacePackages = new Set<string>();
+  const runtimeDependencies: Record<string, string> = {};
+
+  const visitDependencies = (
+    manifestPath: string,
+    manifestDependencies: Record<string, string>,
+  ) => {
+    for (const [dependencyName, dependencySpec] of Object.entries(manifestDependencies)) {
+      if (dependencyName === "electron") {
+        continue;
+      }
+
+      if (!dependencySpec.startsWith("workspace:")) {
+        runtimeDependencies[dependencyName] = dependencySpec;
+        continue;
+      }
+
+      if (visitedWorkspacePackages.has(dependencyName)) {
+        continue;
+      }
+
+      const workspaceManifest = workspaceManifests[dependencyName];
+      if (!workspaceManifest) {
+        throw new Error(
+          `Desktop runtime dependency ${manifestPath} -> ${dependencyName} is a workspace package, but no manifest was provided for staged dependency closure resolution.`,
+        );
+      }
+
+      visitedWorkspacePackages.add(dependencyName);
+      visitDependencies(
+        `${manifestPath} -> ${dependencyName}`,
+        workspaceManifest.dependencies ?? {},
+      );
+    }
+  };
+
+  visitDependencies("apps/desktop/package.json", dependencies);
 
   return resolveCatalogDependencies(runtimeDependencies, catalog, "apps/desktop");
 }

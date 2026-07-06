@@ -105,6 +105,44 @@ it.effect("returns bounded structural preview snapshot failures", () =>
   ).pipe(Effect.provide(TestLayer)),
 );
 
+it.effect("reports missing preview automation host as unavailable status", () =>
+  Effect.gen(function* () {
+    const server = yield* McpServer.McpServer;
+
+    const status = yield* server
+      .callTool({ name: "preview_status", arguments: {} })
+      .pipe(
+        Effect.provideService(McpInvocationContext.McpInvocationContext, invocation),
+        Effect.provideService(McpSchema.McpServerClient, client),
+      );
+
+    expect(status.isError).toBe(false);
+    expect(status.structuredContent).toMatchObject({
+      available: false,
+      visible: false,
+      tabId: null,
+      hostState: "missing",
+    });
+    expect((status.structuredContent as { readonly recovery?: unknown }).recovery).toContain(
+      "Open or reload T3 Code Desktop",
+    );
+
+    const open = yield* server
+      .callTool({ name: "preview_open", arguments: {} })
+      .pipe(
+        Effect.provideService(McpInvocationContext.McpInvocationContext, invocation),
+        Effect.provideService(McpSchema.McpServerClient, client),
+      );
+    expect(open.isError).toBe(true);
+    expect(
+      open.content.some(
+        (content) =>
+          content.type === "text" && content.text.includes("Open or reload T3 Code Desktop"),
+      ),
+    ).toBe(true);
+  }).pipe(Effect.provide(TestLayer)),
+);
+
 it.effect("terminates HTTP MCP sessions with DELETE", () =>
   Effect.scoped(
     Effect.gen(function* () {

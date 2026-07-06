@@ -43,6 +43,16 @@ describe("ElectronUpdater", () => {
     autoUpdaterMock.setFeedURL.mockClear();
   });
 
+  it("resolves autoUpdater from CommonJS default interop shape", () => {
+    const resolvedAutoUpdater = autoUpdaterMock as never;
+    assert.strictEqual(
+      ElectronUpdater.resolveAutoUpdaterModule({
+        default: { autoUpdater: resolvedAutoUpdater },
+      }),
+      resolvedAutoUpdater,
+    );
+  });
+
   it.effect("scopes updater event listeners", () =>
     Effect.gen(function* () {
       const listener = vi.fn();

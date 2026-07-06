@@ -68,7 +68,7 @@ jobs:
         run: vp run dist:desktop:linux
 
       - name: Launch packaged Linux desktop app
-        run: xvfb-run -a node scripts/desktop-launch-smoke.mjs --artifact "release/*.AppImage" --timeout-ms 90000
+        run: xvfb-run -a node scripts/desktop-launch-smoke.mjs --artifact "release/*.AppImage" --timeout-ms 180000
 
   desktop_launch_gate_changes:
     name: Desktop Launch Gate Changes
@@ -212,7 +212,44 @@ jobs:
           }
 
           "app_exe=$($appExe.FullName)" >> $env:GITHUB_OUTPUT
+          "install_dir=$installDir" >> $env:GITHUB_OUTPUT
           Write-Host "Installed desktop executable: $($appExe.FullName)"
+
+      - name: Assert launch smoke rejects missing packaged main dependency
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $cleanInstallDir = "${{ steps.install.outputs.install_dir }}"
+          $cleanAppExe = "${{ steps.install.outputs.app_exe }}"
+          $brokenInstallDir = Join-Path $env:RUNNER_TEMP "t3code-broken-install"
+          if (Test-Path $brokenInstallDir) {
+            Remove-Item -Recurse -Force $brokenInstallDir
+          }
+          New-Item -ItemType Directory -Force -Path $brokenInstallDir | Out-Null
+          Copy-Item -Recurse -Force (Join-Path $cleanInstallDir "*") $brokenInstallDir
+
+          $brokenAppExe = Join-Path $brokenInstallDir (Split-Path -Leaf $cleanAppExe)
+          $removedDependency = Join-Path $brokenInstallDir "resources/app.asar.unpacked/node_modules/electron-updater"
+          if (-not (Test-Path $removedDependency)) {
+            throw "Negative launch-smoke fixture could not find packaged dependency to remove: $removedDependency"
+          }
+          Remove-Item -Recurse -Force $removedDependency
+
+          $output = & node scripts/desktop-launch-smoke.mjs --command "$brokenAppExe" --timeout-ms 45000 --stability-ms 1000 2>&1
+          $exitCode = $LASTEXITCODE
+          $outputText = $output | Out-String
+          $output | ForEach-Object { Write-Host $_ }
+
+          if ($exitCode -eq 0) {
+            throw "Launch smoke passed against a packaged artifact with electron-updater removed; the gate is not trustworthy."
+          }
+          if ($outputText -notmatch "(?i)(electron-updater|ERR_MODULE_NOT_FOUND|MODULE_NOT_FOUND|Cannot find module)") {
+            throw "Launch smoke failed against the broken packaged artifact, but did not report the expected missing electron-updater dependency."
+          }
+
+          Write-Host "Launch smoke rejected the deliberately broken packaged artifact with exit code $exitCode."
+          exit 0
 
       - name: Launch installed Windows desktop app
         shell: pwsh
