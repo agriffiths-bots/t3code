@@ -11,9 +11,11 @@ import {
   persistState,
   reorderProjects,
   resolveProjectExpanded,
+  resolveThreadTreeExpanded,
   setDefaultAdvertisedEndpointKey,
   setProjectExpanded,
   setThreadChangedFilesExpanded,
+  setThreadTreeExpanded,
   type UiState,
 } from "./uiStateStore";
 
@@ -22,6 +24,7 @@ function makeUiState(overrides: Partial<UiState> = {}): UiState {
     projectExpandedById: {},
     projectOrder: [],
     threadLastVisitedAtById: {},
+    threadTreeExpandedById: {},
     threadChangedFilesExpandedById: {},
     defaultAdvertisedEndpointKey: null,
     ...overrides,
@@ -131,6 +134,25 @@ describe("uiStateStore pure functions", () => {
     ).toEqual({});
   });
 
+  it("persists parent thread tree expansion with expanded as the default", () => {
+    const threadId = ThreadId.make("parent-thread");
+    const initialState = makeUiState();
+
+    expect(resolveThreadTreeExpanded(initialState.threadTreeExpandedById, threadId)).toBe(true);
+
+    const collapsed = setThreadTreeExpanded(initialState, threadId, false);
+
+    expect(resolveThreadTreeExpanded(collapsed.threadTreeExpandedById, threadId)).toBe(false);
+    expect(setThreadTreeExpanded(collapsed, threadId, false)).toBe(collapsed);
+    expect(
+      resolveThreadTreeExpanded(collapsed.threadTreeExpandedById, ThreadId.make("other")),
+    ).toBe(true);
+
+    const expanded = setThreadTreeExpanded(collapsed, threadId, true);
+
+    expect(resolveThreadTreeExpanded(expanded.threadTreeExpandedById, threadId)).toBe(true);
+  });
+
   it("stores the endpoint preference by stable key", () => {
     const next = setDefaultAdvertisedEndpointKey(makeUiState(), "desktop-core:lan:http");
 
@@ -154,6 +176,11 @@ describe("parsePersistedState", () => {
         "environment:thread-1": "2026-02-25T12:35:00.000Z",
         invalid: "not-a-date",
       },
+      threadTreeExpandedById: {
+        "environment:thread-1": false,
+        "environment:thread-2": true,
+        invalid: "no" as unknown as boolean,
+      },
       defaultAdvertisedEndpointKey: "desktop-core:lan:http",
       threadChangedFilesExpandedById: {
         "environment:thread-1": {
@@ -170,6 +197,10 @@ describe("parsePersistedState", () => {
       projectOrder: ["physical-b", "physical-a"],
       threadLastVisitedAtById: {
         "environment:thread-1": "2026-02-25T12:35:00.000Z",
+      },
+      threadTreeExpandedById: {
+        "environment:thread-1": false,
+        "environment:thread-2": true,
       },
       defaultAdvertisedEndpointKey: "desktop-core:lan:http",
       threadChangedFilesExpandedById: {
@@ -255,6 +286,9 @@ describe("uiStateStore persistence", () => {
       threadLastVisitedAtById: {
         "environment:thread-1": "2026-02-25T12:35:00.000Z",
       },
+      threadTreeExpandedById: {
+        "environment:thread-1": false,
+      },
       threadChangedFilesExpandedById: {
         "environment:thread-1": {
           "turn-1": false,
@@ -276,6 +310,9 @@ describe("uiStateStore persistence", () => {
       projectOrder: ["physical-b", "physical-a"],
       threadLastVisitedAtById: {
         "environment:thread-1": "2026-02-25T12:35:00.000Z",
+      },
+      threadTreeExpandedById: {
+        "environment:thread-1": false,
       },
       defaultAdvertisedEndpointKey: "desktop-core:lan:http",
       threadChangedFilesExpandedById: {
