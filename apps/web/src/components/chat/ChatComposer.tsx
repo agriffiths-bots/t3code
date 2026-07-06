@@ -73,6 +73,12 @@ import { shouldSubmitComposerOnEnter } from "./ChatComposer.logic";
 import { ComposerPendingApprovalPanel } from "./ComposerPendingApprovalPanel";
 import { ComposerPendingUserInputPanel } from "./ComposerPendingUserInputPanel";
 import { ComposerPlanFollowUpBanner } from "./ComposerPlanFollowUpBanner";
+import {
+  COMPOSER_ATTACHMENT_FORMAT_LABEL,
+  COMPOSER_ATTACHMENT_INPUT_ACCEPT,
+  inferComposerImageMimeType,
+  normalizeComposerImageFile,
+} from "./composerAttachments";
 import { resolveComposerMenuActiveItemId } from "./composerMenuHighlight";
 import { searchSlashCommandItems } from "./composerSlashCommandSearch";
 import {
@@ -97,6 +103,7 @@ import {
   ArrowUpIcon,
   CircleAlertIcon,
   ListTodoIcon,
+  PaperclipIcon,
   PencilRulerIcon,
   type LucideIcon,
   LockIcon,
@@ -900,6 +907,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
   // Refs
   // ------------------------------------------------------------------
   const composerEditorRef = useRef<ComposerPromptEditorHandle>(null);
+  const composerFileInputRef = useRef<HTMLInputElement>(null);
   const composerFormRef = useRef<HTMLFormElement>(null);
   const composerSurfaceRef = useRef<HTMLDivElement>(null);
   const composerSelectLockRef = useRef(false);
@@ -1151,6 +1159,12 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
   const collapsedComposerPrimaryActionLabel = "Send message";
   const showMobilePendingAnswerActions =
     isMobileViewport && !isComposerCollapsedMobile && pendingPrimaryAction !== null;
+  const canAttachComposerImages =
+    activeThreadId !== null &&
+    !isComposerApprovalState &&
+    !showPlanFollowUpPrompt &&
+    phase !== "running" &&
+    pendingUserInputs.length === 0;
 
   // ------------------------------------------------------------------
   // Prompt helpers
@@ -1710,7 +1724,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     },
     [blurMobileComposerAfterSend, onSend, shouldBlurMobileComposerOnSubmit],
   );
-  const expandMobileComposer = useCallback(() => {
+  const expandMobileComposer = useCallback((options?: { focusEditor?: boolean }) => {
     if (composerBlurFrameRef.current !== null) {
       window.cancelAnimationFrame(composerBlurFrameRef.current);
       composerBlurFrameRef.current = null;
@@ -1725,7 +1739,9 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     setIsComposerFocused(true);
     mobileComposerExpandFrameRef.current = window.requestAnimationFrame(() => {
       mobileComposerExpandFrameRef.current = null;
-      composerEditorRef.current?.focusAtEnd();
+      if (options?.focusEditor !== false) {
+        composerEditorRef.current?.focusAtEnd();
+      }
       mobileComposerExpandReleaseFrameRef.current = window.requestAnimationFrame(() => {
         mobileComposerExpandReleaseFrameRef.current = null;
         mobileComposerExpandInFlightRef.current = false;
@@ -1775,21 +1791,36 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
   // ------------------------------------------------------------------
   // Callbacks: images
   // ------------------------------------------------------------------
-  const addComposerImages = (files: File[]) => {
-    if (!activeThreadId || files.length === 0) return;
+  const addComposerImages = (files: File[]): number => {
+    if (!activeThreadId || files.length === 0) return 0;
+    if (phase === "running") {
+      toastManager.add({
+        type: "error",
+        title: "Attach images after the current turn finishes.",
+      });
+      return 0;
+    }
     if (pendingUserInputs.length > 0) {
       toastManager.add({
         type: "error",
         title: "Attach images after answering plan questions.",
       });
-      return;
+      return 0;
+    }
+    if (showPlanFollowUpPrompt) {
+      toastManager.add({
+        type: "error",
+        title: "Attach images after submitting the plan follow-up.",
+      });
+      return 0;
     }
     const nextImages: ComposerImageAttachment[] = [];
     let nextImageCount = composerImagesRef.current.length;
     let error: string | null = null;
     for (const file of files) {
-      if (!file.type.startsWith("image/")) {
-        error = `Unsupported file type for '${file.name}'. Please attach image files only.`;
+      const mimeType = inferComposerImageMimeType(file);
+      if (!mimeType) {
+        error = `Unsupported file type for '${file.name}'. Please attach ${COMPOSER_ATTACHMENT_FORMAT_LABEL}.`;
         continue;
       }
       if (file.size > PROVIDER_SEND_TURN_MAX_IMAGE_BYTES) {
@@ -1800,15 +1831,16 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
         error = `You can attach up to ${PROVIDER_SEND_TURN_MAX_ATTACHMENTS} images per message.`;
         break;
       }
-      const previewUrl = URL.createObjectURL(file);
+      const imageFile = normalizeComposerImageFile(file, mimeType);
+      const previewUrl = URL.createObjectURL(imageFile);
       nextImages.push({
         type: "image",
         id: randomUUID(),
-        name: file.name || "image",
-        mimeType: file.type,
-        sizeBytes: file.size,
+        name: imageFile.name || "image",
+        mimeType,
+        sizeBytes: imageFile.size,
         previewUrl,
-        file,
+        file: imageFile,
       });
       nextImageCount += 1;
     }
@@ -1818,10 +1850,25 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
       addComposerImagesToDraft(nextImages);
     }
     setThreadError(activeThreadId, error);
+    return nextImages.length;
   };
 
   const removeComposerImage = (imageId: string) => {
     removeComposerImageFromDraft(imageId);
+  };
+
+  const openComposerFilePicker = useCallback(() => {
+    if (!canAttachComposerImages) return;
+    composerFileInputRef.current?.click();
+  }, [canAttachComposerImages]);
+
+  const onComposerFileInputChange = (event: React.ChangeEvent<HTMLInputElement>) => {
+    const files = Array.from(event.currentTarget.files ?? []);
+    event.currentTarget.value = "";
+    const addedCount = addComposerImages(files);
+    if (addedCount > 0 && isMobileViewport) {
+      expandMobileComposer({ focusEditor: false });
+    }
   };
 
   // ------------------------------------------------------------------
@@ -2054,6 +2101,28 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
 
   // Render
   // ------------------------------------------------------------------
+  const renderAttachmentPickerButton = (className?: string) => (
+    <Tooltip>
+      <TooltipTrigger
+        render={
+          <Button
+            type="button"
+            variant="ghost"
+            size="icon-sm"
+            className={cn("rounded-full text-muted-foreground/80 hover:text-foreground", className)}
+            disabled={!canAttachComposerImages}
+            aria-label="Attach images"
+            onPointerDown={isMobileViewport ? (event) => event.preventDefault() : undefined}
+            onClick={openComposerFilePicker}
+          />
+        }
+      >
+        <PaperclipIcon />
+      </TooltipTrigger>
+      <TooltipPopup side="top">Attach images</TooltipPopup>
+    </Tooltip>
+  );
+
   return (
     <form
       ref={composerFormRef}
@@ -2061,6 +2130,16 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
       className="mx-auto w-full min-w-0 max-w-3xl"
       data-chat-composer-form="true"
     >
+      <input
+        ref={composerFileInputRef}
+        className="hidden"
+        type="file"
+        accept={COMPOSER_ATTACHMENT_INPUT_ACCEPT}
+        multiple
+        tabIndex={-1}
+        aria-hidden="true"
+        onChange={onComposerFileInputChange}
+      />
       <div
         className={cn(
           "group rounded-[22px] p-px transition-colors duration-200",
@@ -2175,7 +2254,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
                       !activePendingProgress?.activeQuestion?.multiSelect && "px-3 py-2",
                     )}
                     onPointerDown={(event) => event.preventDefault()}
-                    onClick={expandMobileComposer}
+                    onClick={() => expandMobileComposer()}
                     aria-label="Write custom answer"
                   >
                     {activePendingProgress?.customAnswer || "Write custom answer"}
@@ -2207,6 +2286,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
 
           {showCollapsedMobilePromptRow ? (
             <div className="flex items-center justify-between gap-2 px-3 py-2">
+              {renderAttachmentPickerButton("size-8")}
               <button
                 type="button"
                 className={cn(
@@ -2216,13 +2296,16 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
                     : "text-muted-foreground/35",
                 )}
                 onPointerDown={(event) => event.preventDefault()}
-                onClick={expandMobileComposer}
+                onClick={() => expandMobileComposer()}
                 aria-label="Expand composer"
               >
                 {activePendingProgress
                   ? activePendingProgress.customAnswer ||
                     "Type your own answer, or leave this blank to use the selected option"
-                  : prompt.trim() || "Ask anything..."}
+                  : prompt.trim() ||
+                    (composerImages.length > 0
+                      ? `${composerImages.length} image${composerImages.length === 1 ? "" : "s"} attached`
+                      : "Ask anything...")}
               </button>
               <button
                 type="button"
@@ -2473,6 +2556,8 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
               )}
             >
               <div className="-m-1 flex min-w-0 flex-1 items-center gap-1 overflow-x-auto p-1 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
+                {renderAttachmentPickerButton()}
+
                 <ProviderModelPicker
                   compact={isComposerFooterCompact}
                   activeInstanceId={selectedInstanceId}
