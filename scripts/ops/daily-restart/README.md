@@ -50,6 +50,7 @@ T3DR_DB=/home/adam/.t3-vps/userdata/state.sqlite
 T3DR_CHECKOUT=/home/adam/t3code
 T3DR_SERVICE=t3code.service
 T3DR_ORIGIN=http://127.0.0.1:3773
+T3DR_ATTACHMENTS_DIR=$(dirname "$T3DR_DB")/attachments
 T3DR_SNAPSHOT_DIR=/home/adam/backups/t3-daily
 T3DR_LEDGER=/home/adam/.openclaw/daily-restart
 T3DR_PROBE_TIMEOUT=180
@@ -57,22 +58,32 @@ T3DR_SMOKE_INSTANCE=(required)
 T3DR_SMOKE_MODEL=(required)
 ```
 
-The snapshot is a hard gate before shutdown. Rollbacks before the updated
-service can accept writes restore that DB snapshot after checking out the
-pre-restart SHA. The manager pins the pre-update `health-probe` and
-`inject-resume` helper under `$T3DR_LEDGER/<UTC date>/pinned-tools/` before
-merging the target SHA, then uses those pinned tools for post-update health
-checks, rollback re-probes, and resume injection. It also validates that an
-existing `T3DR_TOKEN`/`T3_TOKEN` is authenticated with `orchestration:operate`,
-or mints and validates a short-lived resume-injection token before the service
-is stopped, so auth failures abort while the original service is still
-available. If the origin is already unreachable or returns a gateway/service
-unavailable response before the restart starts, the manager keeps the prepared
-token but defers validation until after the service is started again, before any
-resume injection. If post-start health fails after the updated service was
-started, the manager always restores the cycle-start DB snapshot as part of
-rollback; the current DB is moved aside by `t3-db-restore`. Result and full logs
-are written under `$T3DR_LEDGER/<UTC date>/`.
+The pre-stop snapshot is a hard gate before shutdown. The manager also captures
+active threads before stopping the service, preserves that pre-stop manifest,
+then refreshes the active-thread capture after the service is stopped and before
+the quiesced DB snapshot. The post-stop manifest is authoritative for resume
+injection; the pre-stop pending message IDs and active turn thread IDs are passed
+to the post-stop capture so pending work and shutdown-interrupted work are not
+lost while stale pre-stop entries are still filtered out. If the post-stop
+capture fails, the manager restarts the unchanged service and injects the
+pre-stop manifest instead of continuing the update.
+
+Rollbacks before the updated service can accept writes restore the pre-stop DB
+snapshot after checking out the pre-restart SHA. The manager pins the pre-update
+`health-probe` and `inject-resume` helpers under
+`$T3DR_LEDGER/<UTC date>/pinned-tools/` before merging the target SHA, then uses
+those pinned tools for post-update health checks, rollback re-probes, and resume
+injection. It also validates that an existing `T3DR_TOKEN`/`T3_TOKEN` is
+authenticated with `orchestration:operate`, or mints and validates a short-lived
+resume-injection token before the service is stopped, so auth failures abort
+while the original service is still available. If the origin is already
+unreachable or returns a gateway/service unavailable response before the restart
+starts, the manager keeps the prepared token but defers validation until after
+the service is started again, before any resume injection. If post-start health
+fails after the updated service was started, the manager always restores the
+cycle-start DB snapshot as part of rollback; the current DB is moved aside by
+`t3-db-restore`. Result and full logs are written under
+`$T3DR_LEDGER/<UTC date>/`.
 Set `T3DR_SMOKE_INSTANCE` and `T3DR_SMOKE_MODEL` to the provider/model pair the
 health probe should wake. For one-off operator runs, `--smoke-instance` and
 `--smoke-model` override those environment defaults.
@@ -147,8 +158,10 @@ T3DR_TOKEN="$T3DR_TOKEN" scripts/ops/daily-restart/inject-resume --manifest resu
 `--origin` defaults to `T3DR_ORIGIN`, then `http://127.0.0.1:3773`. `--token`
 defaults to `T3DR_TOKEN`, then `T3_TOKEN`; avoid passing live bearer tokens via
 argv. The restart manager prepares and validates this token before shutdown and
-passes it through `T3DR_TOKEN` to the pinned helper. The flag wins for ephemeral
-tests. `--dry-run` reports without posting or mutating.
+passes it through `T3DR_TOKEN` to the pinned helper. `--attachments-dir` defaults
+to `T3DR_ATTACHMENTS_DIR`, which the restart manager sets from the configured DB
+path when not supplied. The flag wins for ephemeral tests. `--dry-run` reports
+without posting or mutating.
 
 The script calls `POST /api/orchestration/dispatch` with `orchestration:operate`,
 first sending `thread.interaction-mode.set` to force default mode, then
