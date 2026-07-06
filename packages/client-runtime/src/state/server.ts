@@ -57,6 +57,8 @@ export function applyServerConfigProjection(
         },
         latestEvent: event,
       }));
+    case "heartbeat":
+      return current;
   }
 }
 
@@ -65,6 +67,12 @@ export function projectServerConfig(
   event: ServerConfigStreamEvent,
 ): readonly [Option.Option<ServerConfigProjection>, ReadonlyArray<ServerConfigProjection>] {
   const next = applyServerConfigProjection(current, event);
+  if (event.type === "heartbeat") {
+    // Heartbeats are transport keepalive only. Never surface a downstream
+    // projection for them — otherwise a quiet session re-emits the unchanged
+    // config every keepalive tick and can wake server-config consumers.
+    return [next, []];
+  }
   return [next, Option.toArray(next)];
 }
 
@@ -84,6 +92,16 @@ export function projectServerWelcome(
   const welcome = event.payload as ServerLifecycleWelcomePayload;
   return [Option.some(welcome), [welcome]];
 }
+
+/**
+ * Shared payload for every `subscribeServerConfig` consumer. The subscription
+ * atom family is keyed on `JSON.stringify([environmentId, input])`, so ALL
+ * consumers must pass this identical value — otherwise the environment ends up
+ * with two independent websocket streams (each running its own
+ * `providerRegistry.refresh()`). `supportsHeartbeat` opts this heartbeat-aware
+ * client build into the server's keepalive frames.
+ */
+export const SERVER_CONFIG_SUBSCRIPTION_INPUT = { supportsHeartbeat: true } as const;
 
 export function createServerEnvironmentAtoms<R, E>(
   runtime: Atom.AtomRuntime<EnvironmentRegistry | R, E>,
@@ -113,7 +131,9 @@ export function createServerEnvironmentAtoms<R, E>(
     }
     return Atom.make((get): ServerConfig | null => {
       const projection = Option.getOrNull(
-        AsyncResult.value(get(configProjection({ environmentId, input: {} }))),
+        AsyncResult.value(
+          get(configProjection({ environmentId, input: SERVER_CONFIG_SUBSCRIPTION_INPUT })),
+        ),
       );
       return projection?.config ?? get(options.initialConfigValueAtom(environmentId));
     }).pipe(Atom.withLabel(`environment-data:server:config:${environmentId}`));

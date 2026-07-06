@@ -1,6 +1,11 @@
 import { describe, expect, it } from "vite-plus/test";
 
-import { isTransportConnectionErrorMessage, sanitizeThreadErrorMessage } from "./transport.ts";
+import {
+  INTERRUPTED_TURN_ERROR_MESSAGE,
+  isClaudeInterruptedTurnDiagnosticMessage,
+  isTransportConnectionErrorMessage,
+  sanitizeThreadErrorMessage,
+} from "./transport.ts";
 
 describe("isTransportConnectionErrorMessage", () => {
   it("returns true for SocketCloseError", () => {
@@ -53,9 +58,39 @@ describe("isTransportConnectionErrorMessage", () => {
   });
 });
 
+describe("isClaudeInterruptedTurnDiagnosticMessage", () => {
+  it("recognizes Claude SDK abort diagnostics", () => {
+    expect(
+      isClaudeInterruptedTurnDiagnosticMessage(
+        "[ede_diagnostic] result_type=user last_content_type=n/a stop_reason=tool_use",
+      ),
+    ).toBe(true);
+    expect(
+      isClaudeInterruptedTurnDiagnosticMessage(
+        "provider result terminal_reason=aborted_streaming stop_reason=tool_use",
+      ),
+    ).toBe(true);
+  });
+
+  it("does not match unrelated provider errors", () => {
+    expect(isClaudeInterruptedTurnDiagnosticMessage("Claude API key missing")).toBe(false);
+  });
+});
+
 describe("sanitizeThreadErrorMessage", () => {
   it("strips transport errors", () => {
     expect(sanitizeThreadErrorMessage("SocketCloseError: oops")).toBeNull();
+  });
+
+  it("replaces raw Claude interrupted-turn diagnostics with friendly copy", () => {
+    expect(
+      sanitizeThreadErrorMessage(
+        "[ede_diagnostic] result_type=user last_content_type=n/a stop_reason=tool_use",
+      ),
+    ).toBe(INTERRUPTED_TURN_ERROR_MESSAGE);
+    expect(sanitizeThreadErrorMessage("Error: Request was aborted.")).toBe(
+      INTERRUPTED_TURN_ERROR_MESSAGE,
+    );
   });
 
   it("preserves non-transport errors", () => {
