@@ -626,12 +626,21 @@ export const installCloudflareAccessCredentials = DesktopIpc.makeIpcMethod({
       try: async () => {
         const session = Electron.session.defaultSession;
         const cookieValue = input.cookieValue?.trim() ?? "";
-        if (input.clearCookies === true || cookieValue.length > 0) {
-          await clearAccessCookies(session, origin);
-        }
-        configureCloudflareAccessHeaders(session, origin, input.headers, cookieValue);
-        if (cookieValue.length > 0) {
-          await installAccessCookie(session, origin, cookieValue);
+        const installingCookie = cookieValue.length > 0;
+        const suspendedAccessHeaders = installingCookie
+          ? suspendCloudflareAccessHeaders(origin)
+          : undefined;
+        try {
+          if (input.clearCookies === true || installingCookie) {
+            await clearAccessCookies(session, origin);
+          }
+          if (installingCookie) {
+            await installAccessCookie(session, origin, cookieValue);
+          }
+          configureCloudflareAccessHeaders(session, origin, input.headers, cookieValue);
+        } catch (cause) {
+          restoreCloudflareAccessHeaders(suspendedAccessHeaders);
+          throw cause;
         }
       },
       catch: (cause) =>

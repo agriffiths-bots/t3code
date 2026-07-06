@@ -424,6 +424,60 @@ describe("desktop Cloudflare Access cookies", () => {
     }),
   );
 
+  it.effect("restores the previous Access header rule when cookie installation fails", () =>
+    Effect.gen(function* () {
+      const staleCookie = accessCookie({
+        value: "stale-cookie",
+        domain: "app.example.test",
+        hostOnly: true,
+        path: "/",
+        secure: true,
+      });
+      electronMock.cookies.get.mockResolvedValueOnce([staleCookie]);
+      electronMock.cookies.remove.mockResolvedValue(undefined);
+      electronMock.cookies.set.mockResolvedValue(undefined);
+
+      yield* installCloudflareAccessCredentials.handler({
+        host: "https://app.example.test",
+        headers: {},
+        clearCookies: true,
+        cookieValue: "stale-cookie",
+      });
+
+      const listener = electronMock.webRequest.onBeforeSendHeaders.mock.calls[0]?.[0];
+      expect(listener).toBeTypeOf("function");
+
+      const installError = new Error("cookie store rejected fresh cookie");
+      electronMock.cookies.get.mockResolvedValueOnce([staleCookie]);
+      electronMock.cookies.set.mockRejectedValueOnce(installError);
+
+      const exit = yield* Effect.exit(
+        installCloudflareAccessCredentials.handler({
+          host: "https://app.example.test",
+          headers: {},
+          clearCookies: true,
+          cookieValue: "fresh-cookie",
+        }),
+      );
+
+      expect(exit._tag).toBe("Failure");
+      const callback = vi.fn();
+      listener(
+        {
+          url: "https://app.example.test/.well-known/t3/environment",
+          requestHeaders: { "user-agent": "t3code" },
+        },
+        callback,
+      );
+      expect(callback).toHaveBeenCalledWith({
+        requestHeaders: {
+          "user-agent": "t3code",
+          Cookie: "CF_Authorization=stale-cookie",
+        },
+      });
+    }),
+  );
+
   it.effect("restores cancelled login cookies with their original scope", () =>
     Effect.gen(function* () {
       const previousCookies = [
