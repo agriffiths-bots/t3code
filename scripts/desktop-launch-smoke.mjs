@@ -7,15 +7,19 @@ import * as NodeNet from "node:net";
 import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
 import * as NodeTimersPromises from "node:timers/promises";
+import * as NodeURL from "node:url";
 
 const DEFAULT_TIMEOUT_MS = 90_000;
 const DEFAULT_STABILITY_MS = 5_000;
 const DESCRIPTOR_PATH = "/.well-known/t3/environment";
+const READY_MARKER_FILE = "main-window-ready.json";
 const MAX_CAPTURED_OUTPUT_BYTES = 256 * 1024;
 const FATAL_OUTPUT_PATTERNS = [
   /ERR_MODULE_NOT_FOUND/i,
   /\bMODULE_NOT_FOUND\b/i,
   /Cannot find module/i,
+  /fatal startup error/i,
+  /failed to open main window/i,
   /uncaughtException/i,
   /UnhandledPromiseRejection/i,
 ];
@@ -27,7 +31,7 @@ function usage() {
     "usage: node scripts/desktop-launch-smoke.mjs (--artifact <path-or-glob> | --command <path>) [--timeout-ms <ms>]",
     "",
     "Launches a packaged desktop app with an isolated T3CODE_HOME, waits for",
-    `${DESCRIPTOR_PATH} on a forced loopback port, and fails on launch-time crashes.`,
+    `${DESCRIPTOR_PATH} plus a loaded main-window ready marker, and fails on launch-time crashes.`,
   ].join("\n");
 }
 
@@ -139,6 +143,26 @@ async function resolveExecutable(options) {
   return matches[0];
 }
 
+function assertPackagedExecutablePath(executablePath) {
+  const normalized = NodePath.normalize(executablePath);
+  const lowerBasename = NodePath.basename(normalized).toLowerCase();
+  if (/\.(?:cjs|mjs|js|ts|tsx)$/u.test(lowerBasename)) {
+    throw new Error(
+      `Launch smoke must run a packaged executable, not a source or build-tree script: ${executablePath}`,
+    );
+  }
+
+  const buildTreeMarkers = [
+    `${NodePath.sep}apps${NodePath.sep}desktop${NodePath.sep}dist-electron${NodePath.sep}`,
+    `${NodePath.sep}apps${NodePath.sep}desktop${NodePath.sep}src${NodePath.sep}`,
+  ];
+  if (buildTreeMarkers.some((marker) => normalized.includes(marker))) {
+    throw new Error(
+      `Launch smoke must run the packaged artifact or installed app, not a desktop build-tree path: ${executablePath}`,
+    );
+  }
+}
+
 function reserveLoopbackPort() {
   return new Promise((resolve, reject) => {
     const server = NodeNet.createServer();
@@ -196,6 +220,50 @@ function fetchDescriptor(port, timeoutMs) {
     });
     request.once("error", reject);
   });
+}
+
+export function validateReadyMarker(parsed, filePath) {
+  if (!parsed || typeof parsed !== "object" || parsed.status !== "main-window-ready") {
+    throw new Error(`main-window ready marker at ${filePath} had invalid status`);
+  }
+  if (typeof parsed.windowId !== "number") {
+    throw new Error(`main-window ready marker at ${filePath} did not include windowId`);
+  }
+  if (typeof parsed.url !== "string" || parsed.url.length === 0) {
+    throw new Error(`main-window ready marker at ${filePath} did not include a loaded window URL`);
+  }
+  let url;
+  try {
+    url = new URL(parsed.url);
+  } catch {
+    throw new Error(
+      `main-window ready marker at ${filePath} had invalid window URL: ${parsed.url}`,
+    );
+  }
+  if (url.protocol !== "t3code:" && url.protocol !== "t3code-dev:") {
+    throw new Error(
+      `main-window ready marker at ${filePath} had unexpected window URL: ${parsed.url}`,
+    );
+  }
+  return parsed;
+}
+
+export async function readReadyMarker(filePath) {
+  let body;
+  try {
+    body = await NodeFSP.readFile(filePath, "utf8");
+  } catch (error) {
+    if (error && typeof error === "object" && error.code === "ENOENT") {
+      return undefined;
+    }
+    throw error;
+  }
+
+  try {
+    return validateReadyMarker(JSON.parse(body), filePath);
+  } catch {
+    return undefined;
+  }
 }
 
 function appendOutput(current, streamName, chunk) {
@@ -257,9 +325,11 @@ async function collectDiagnostics(tempRoot, output) {
   const t3Home = NodePath.join(tempRoot, "t3-home");
   const logDir = NodePath.join(t3Home, "userdata", "logs");
   const serverChildLog = await readOptionalText(NodePath.join(logDir, "server-child.log"));
+  const readyMarker = await readOptionalText(NodePath.join(tempRoot, READY_MARKER_FILE));
   return [
     output.trim() ? `\nProcess output:\n${output.trim()}` : "",
     serverChildLog.trim() ? `\nserver-child.log:\n${serverChildLog.trim()}` : "",
+    readyMarker.trim() ? `\n${READY_MARKER_FILE}:\n${readyMarker.trim()}` : "",
     `\nSmoke temp root: ${tempRoot}`,
   ].join("");
 }
@@ -283,6 +353,7 @@ async function main() {
   if (!NodeFS.existsSync(executablePath)) {
     throw new Error(`Executable does not exist: ${executablePath}`);
   }
+  assertPackagedExecutablePath(executablePath);
 
   if (hostPlatform !== "win32") {
     NodeFS.chmodSync(executablePath, 0o755);
@@ -291,6 +362,7 @@ async function main() {
   const tempRoot = await NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "t3-desktop-smoke-"));
   const t3Home = NodePath.join(tempRoot, "t3-home");
   const appData = NodePath.join(tempRoot, "app-data");
+  const readyMarkerPath = NodePath.join(tempRoot, READY_MARKER_FILE);
   await NodeFSP.mkdir(t3Home, { recursive: true });
   await NodeFSP.mkdir(appData, { recursive: true });
 
@@ -305,6 +377,8 @@ async function main() {
     NO_AT_BRIDGE: "1",
     T3CODE_DISABLE_AUTO_UPDATE: "1",
     T3CODE_HOME: t3Home,
+    T3CODE_DESKTOP_SMOKE_READY_FILE: readyMarkerPath,
+    T3CODE_DESKTOP_VERIFY_RUNTIME_DEPENDENCIES: "1",
     T3CODE_NO_BROWSER: "1",
     T3CODE_PORT: String(port),
     XDG_CONFIG_HOME: appData,
@@ -314,6 +388,7 @@ async function main() {
 
   console.log(`[desktop-launch-smoke] Launching ${executablePath}`);
   console.log(`[desktop-launch-smoke] Waiting for ${DESCRIPTOR_PATH} on 127.0.0.1:${port}`);
+  console.log(`[desktop-launch-smoke] Waiting for main window marker at ${readyMarkerPath}`);
 
   const child = NodeChildProcess.spawn(executablePath, launchArgs, {
     cwd: NodePath.dirname(executablePath),
@@ -336,25 +411,48 @@ async function main() {
   });
 
   const deadline = Date.now() + options.timeoutMs;
+  let backendDescriptor;
+  let loggedBackendReady = false;
   try {
     while (Date.now() < deadline) {
       await assertHealthy(child, () => output, serverChildLogPath);
 
-      let descriptor;
-      try {
-        descriptor = await fetchDescriptor(port, 1_000);
-      } catch {
+      if (!backendDescriptor) {
+        try {
+          backendDescriptor = await fetchDescriptor(port, 1_000);
+        } catch {
+          if (exit) {
+            throw new Error(
+              `Desktop process exited before backend readiness (code=${exit.code ?? "null"}, signal=${exit.signal ?? "null"})`,
+            );
+          }
+          await NodeTimersPromises.setTimeout(500);
+          continue;
+        }
+      }
+
+      if (!loggedBackendReady) {
+        console.log(
+          `[desktop-launch-smoke] Backend ready: environmentId=${backendDescriptor.environmentId} label=${backendDescriptor.label ?? ""}`,
+        );
+        loggedBackendReady = true;
+      }
+
+      const readyMarker = await readReadyMarker(readyMarkerPath);
+      if (!readyMarker) {
         if (exit) {
           throw new Error(
-            `Desktop process exited before readiness (code=${exit.code ?? "null"}, signal=${exit.signal ?? "null"})`,
+            `Desktop process exited before main-window readiness (code=${exit.code ?? "null"}, signal=${exit.signal ?? "null"})`,
           );
         }
         await NodeTimersPromises.setTimeout(500);
         continue;
       }
 
+      const visibleLabel =
+        typeof readyMarker.visible === "boolean" ? ` visible=${readyMarker.visible}` : "";
       console.log(
-        `[desktop-launch-smoke] Ready: environmentId=${descriptor.environmentId} label=${descriptor.label ?? ""}`,
+        `[desktop-launch-smoke] Ready: environmentId=${backendDescriptor.environmentId} windowId=${readyMarker.windowId} url=${readyMarker.url ?? ""}${visibleLabel}`,
       );
       const stableUntil = Math.min(deadline, Date.now() + options.stabilityMs);
       while (Date.now() < stableUntil) {
@@ -364,7 +462,9 @@ async function main() {
       return;
     }
 
-    throw new Error(`Timed out after ${options.timeoutMs}ms waiting for desktop backend readiness`);
+    throw new Error(
+      `Timed out after ${options.timeoutMs}ms waiting for desktop backend and main-window readiness`,
+    );
   } catch (error) {
     const diagnostics = await collectDiagnostics(tempRoot, output);
     throw new Error(`${error instanceof Error ? error.message : String(error)}${diagnostics}`, {
@@ -375,7 +475,9 @@ async function main() {
   }
 }
 
-main().catch((error) => {
-  console.error(error instanceof Error ? error.stack || error.message : String(error));
-  process.exit(1);
-});
+if (process.argv[1] && import.meta.url === NodeURL.pathToFileURL(process.argv[1]).href) {
+  main().catch((error) => {
+    console.error(error instanceof Error ? error.stack || error.message : String(error));
+    process.exit(1);
+  });
+}

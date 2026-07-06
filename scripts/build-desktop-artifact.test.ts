@@ -142,7 +142,7 @@ it.layer(NodeServices.layer)("build-desktop-artifact", (it) => {
     }),
   );
 
-  it("omits bundled workspace packages from staged desktop dependencies", () => {
+  it("resolves the full desktop workspace production dependency closure", () => {
     assert.deepStrictEqual(
       resolveDesktopRuntimeDependencies(
         {
@@ -156,12 +156,51 @@ it.layer(NodeServices.layer)("build-desktop-artifact", (it) => {
         },
         {
           "@effect/platform-node": "4.0.0-beta.59",
+          "@noble/curves": "1.9.1",
+          "@noble/hashes": "1.8.0",
           effect: "4.0.0-beta.59",
+          jose: "6.2.2",
+          yaml: "2.9.0",
+        },
+        {
+          "@t3tools/contracts": {
+            dependencies: {
+              effect: "catalog:",
+            },
+          },
+          "@t3tools/shared": {
+            dependencies: {
+              "@noble/curves": "catalog:",
+              "@noble/hashes": "catalog:",
+              "@t3tools/contracts": "workspace:*",
+              effect: "catalog:",
+              jose: "catalog:",
+              yaml: "catalog:",
+            },
+          },
+          "@t3tools/ssh": {
+            dependencies: {
+              "@t3tools/contracts": "workspace:*",
+              "@t3tools/shared": "workspace:*",
+              effect: "catalog:",
+            },
+          },
+          "@t3tools/tailscale": {
+            dependencies: {
+              "@effect/platform-node": "catalog:",
+              "@t3tools/shared": "workspace:*",
+              effect: "catalog:",
+            },
+          },
         },
       ),
       {
         "@effect/platform-node": "4.0.0-beta.59",
+        "@noble/curves": "1.9.1",
+        "@noble/hashes": "1.8.0",
         effect: "4.0.0-beta.59",
+        jose: "6.2.2",
+        yaml: "2.9.0",
       },
     );
   });

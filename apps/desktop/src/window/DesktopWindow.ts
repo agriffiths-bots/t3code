@@ -1,9 +1,12 @@
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
+import * as FileSystem from "effect/FileSystem";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
+import * as Path from "effect/Path";
 import * as Ref from "effect/Ref";
+import * as Schema from "effect/Schema";
 
 import type * as Electron from "electron";
 
@@ -32,6 +35,16 @@ const DEVELOPMENT_RETRYABLE_LOAD_ERROR_CODES = new Set([
   -106, // ERR_INTERNET_DISCONNECTED
   -118, // ERR_CONNECTION_TIMED_OUT
 ]);
+const DesktopSmokeReadyMarkerJson = Schema.fromJsonString(
+  Schema.Struct({
+    status: Schema.Literal("main-window-ready"),
+    windowId: Schema.Number,
+    title: Schema.String,
+    visible: Schema.Boolean,
+    url: Schema.String,
+  }),
+);
+const encodeDesktopSmokeReadyMarker = Schema.encodeEffect(DesktopSmokeReadyMarkerJson);
 
 type WindowTitleBarOptions = Pick<
   Electron.BrowserWindowConstructorOptions,
@@ -40,6 +53,8 @@ type WindowTitleBarOptions = Pick<
 
 type DesktopWindowRuntimeServices =
   | DesktopEnvironment.DesktopEnvironment
+  | FileSystem.FileSystem
+  | Path.Path
   | DesktopAssets.DesktopAssets
   | ElectronMenu.ElectronMenu
   | ElectronShell.ElectronShell
@@ -176,6 +191,24 @@ function syncWindowAppearance(
     }
   });
 }
+
+const writeSmokeReadyMarker = Effect.fn("desktop.window.writeSmokeReadyMarker")(function* (
+  filePath: string,
+  window: Electron.BrowserWindow,
+  environment: DesktopEnvironment.DesktopEnvironment["Service"],
+) {
+  const fileSystem = yield* FileSystem.FileSystem;
+  const path = yield* Path.Path;
+  const markerJson = yield* encodeDesktopSmokeReadyMarker({
+    status: "main-window-ready",
+    windowId: window.id,
+    title: environment.displayName,
+    visible: !window.isDestroyed() && window.isVisible(),
+    url: window.isDestroyed() ? "" : window.webContents.getURL(),
+  });
+  yield* fileSystem.makeDirectory(path.dirname(filePath), { recursive: true });
+  yield* fileSystem.writeFileString(filePath, `${markerJson}\n`);
+});
 
 type RevealSubscription = (listener: () => void) => void;
 
@@ -456,6 +489,29 @@ export const make = Effect.gen(function* () {
       );
     });
 
+    const revealMainWindow = Effect.andThen(electronWindow.reveal(window), dismissConnectingSplash);
+    const signalSmokeReady = Option.match(environment.smokeReadyFile, {
+      onNone: () => Effect.void,
+      onSome: (filePath) =>
+        writeSmokeReadyMarker(filePath, window, environment).pipe(
+          Effect.catch((error) =>
+            logWindowWarning("failed to write desktop smoke ready marker", {
+              path: filePath,
+              message: error.message,
+            }),
+          ),
+        ),
+    });
+    let didFinishLoad = false;
+    let didReveal = false;
+    let didSignalSmokeReady = false;
+    const maybeSignalSmokeReady = () => {
+      if (!didFinishLoad || !didReveal || didSignalSmokeReady) {
+        return;
+      }
+      didSignalSmokeReady = true;
+      void runPromise(signalSmokeReady);
+    };
     const revealSubscribers: RevealSubscription[] = [(fire) => window.once("ready-to-show", fire)];
     if (environment.platform === "linux") {
       revealSubscribers.push((fire) => window.webContents.once("did-finish-load", fire));
@@ -463,7 +519,20 @@ export const make = Effect.gen(function* () {
     bindFirstRevealTrigger(revealSubscribers, () => {
       // Reveal the real window, then close the connecting splash (if any) so the
       // two don't overlap and there's no blank gap between them.
-      void runPromise(Effect.andThen(electronWindow.reveal(window), dismissConnectingSplash));
+      void runPromise(
+        revealMainWindow.pipe(
+          Effect.andThen(
+            Effect.sync(() => {
+              didReveal = true;
+              maybeSignalSmokeReady();
+            }),
+          ),
+        ),
+      );
+    });
+    window.webContents.once("did-finish-load", () => {
+      didFinishLoad = true;
+      maybeSignalSmokeReady();
     });
 
     loadApplication();

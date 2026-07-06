@@ -47,8 +47,10 @@ export const DesktopConfig = Config.all({
   otlpExportIntervalMs: Config.int("T3CODE_OTLP_EXPORT_INTERVAL_MS").pipe(
     Config.withDefault(10_000),
   ),
+  smokeReadyFile: trimmedString("T3CODE_DESKTOP_SMOKE_READY_FILE"),
   appImagePath: trimmedString("APPIMAGE"),
   disableAutoUpdate: optionalBoolean("T3CODE_DISABLE_AUTO_UPDATE"),
+  verifyRuntimeDependencies: optionalBoolean("T3CODE_DESKTOP_VERIFY_RUNTIME_DEPENDENCIES"),
   mockUpdates: optionalBoolean("T3CODE_DESKTOP_MOCK_UPDATES"),
   mockUpdateServerPort: Config.port("T3CODE_DESKTOP_MOCK_UPDATE_SERVER_PORT").pipe(
     Config.withDefault(3000),
