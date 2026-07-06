@@ -1,0 +1,149 @@
+#!/usr/bin/env bash
+set -u
+
+caller_path="${PATH:-}"
+PATH="${T3DR_TEST_PATH_PREFIX:+$T3DR_TEST_PATH_PREFIX:}/home/linuxbrew/.linuxbrew/bin:/home/adam/.local/bin:/usr/local/bin:/usr/bin:/bin${caller_path:+:$caller_path}"
+export PATH
+
+service="${T3DR_SERVICE:-}"
+origin="${T3DR_ORIGIN:-}"
+checkout="${T3DR_CHECKOUT:-}"
+expected_sha="${T3DR_TARGET_SHA:-}"
+previous_pid="${T3DR_PRE_RESTART_PID:-}"
+timeout_secs="${T3DR_VERIFY_TIMEOUT:-${T3DR_PROBE_TIMEOUT:-60}}"
+
+usage() {
+  cat >&2 <<'USAGE'
+usage: verify-restart --service NAME --origin URL --checkout PATH
+                      --expected-sha SHA --previous-pid PID [--timeout SECS]
+USAGE
+}
+
+require_value() {
+  local flag="$1"
+  if [[ "$#" -lt 2 || -z "${2:-}" || "${2:-}" == --* ]]; then
+    echo "verify-restart: $flag requires a value" >&2
+    usage
+    exit 2
+  fi
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --service) require_value "$@"; service="$2"; shift 2 ;;
+    --origin) require_value "$@"; origin="$2"; shift 2 ;;
+    --checkout) require_value "$@"; checkout="$2"; shift 2 ;;
+    --expected-sha) require_value "$@"; expected_sha="$2"; shift 2 ;;
+    --previous-pid) require_value "$@"; previous_pid="$2"; shift 2 ;;
+    --timeout) require_value "$@"; timeout_secs="$2"; shift 2 ;;
+    -h|--help) usage; exit 0 ;;
+    *) echo "verify-restart: unknown arg: $1" >&2; usage; exit 2 ;;
+  esac
+done
+
+if [[ -z "$service" || -z "$origin" || -z "$checkout" || -z "$expected_sha" || -z "$previous_pid" ]]; then
+  usage
+  exit 2
+fi
+if ! [[ "$previous_pid" =~ ^[0-9]+$ ]]; then
+  echo "verify-restart: --previous-pid must be a non-negative integer" >&2
+  exit 2
+fi
+if ! [[ "$timeout_secs" =~ ^[0-9]+$ ]] || [[ "$((10#$timeout_secs))" -le 0 ]]; then
+  echo "verify-restart: --timeout must be a positive integer" >&2
+  exit 2
+fi
+timeout_secs="$((10#$timeout_secs))"
+origin="${origin%/}"
+
+ensure_user_bus_env() {
+  if [[ -z "${DBUS_SESSION_BUS_ADDRESS:-}" && -n "${XDG_RUNTIME_DIR:-}" && -S "${XDG_RUNTIME_DIR}/bus" ]]; then
+    export DBUS_SESSION_BUS_ADDRESS="unix:path=${XDG_RUNTIME_DIR}/bus"
+  fi
+}
+
+normalize_expected_sha() {
+  git -C "$checkout" rev-parse --verify "${expected_sha}^{commit}" 2>/dev/null | tr '[:upper:]' '[:lower:]'
+}
+
+current_pid() {
+  ensure_user_bus_env
+  systemctl --user show "$service" -p MainPID --value 2>/dev/null | tr -d '[:space:]'
+}
+
+is_active() {
+  ensure_user_bus_env
+  systemctl --user is-active "$service" >/dev/null 2>&1
+}
+
+fetch_descriptor_sha() {
+  curl -fsS --max-time 5 "$origin/.well-known/t3/environment" 2>/dev/null |
+    node -e '
+const chunks = [];
+process.stdin.on("data", (chunk) => chunks.push(chunk));
+process.stdin.on("end", () => {
+  try {
+    const descriptor = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+    const sha = descriptor.serverBuildSha;
+    if (typeof sha !== "string" || sha.trim().length === 0) process.exit(3);
+    process.stdout.write(sha.trim().toLowerCase());
+  } catch {
+    process.exit(2);
+  }
+});
+'
+}
+
+resolved_expected_sha="$(normalize_expected_sha)"
+if [[ -z "$resolved_expected_sha" ]]; then
+  echo "CHECK server_build_sha FAIL could not resolve expected commit expected=$expected_sha checkout=$checkout"
+  exit 1
+fi
+
+deadline=$((SECONDS + timeout_secs))
+last_reason="not checked yet"
+last_pid=""
+last_sha=""
+
+while [[ "$SECONDS" -le "$deadline" ]]; do
+  if ! is_active; then
+    last_reason="service is not active"
+    sleep 1
+    continue
+  fi
+
+  pid="$(current_pid)"
+  last_pid="$pid"
+  if ! [[ "$pid" =~ ^[0-9]+$ ]] || [[ "$pid" -le 0 ]]; then
+    last_reason="service MainPID is not running: ${pid:-empty}"
+    sleep 1
+    continue
+  fi
+  if [[ "$previous_pid" != "0" && "$pid" == "$previous_pid" ]]; then
+    last_reason="service MainPID did not change: previous=$previous_pid current=$pid"
+    sleep 1
+    continue
+  fi
+
+  sha="$(fetch_descriptor_sha)"
+  rc=$?
+  last_sha="$sha"
+  if [[ "$rc" -ne 0 || -z "$sha" ]]; then
+    last_reason="environment descriptor did not include serverBuildSha"
+    sleep 1
+    continue
+  fi
+  if [[ "$sha" != "$resolved_expected_sha" ]]; then
+    last_reason="serverBuildSha mismatch: expected=$resolved_expected_sha actual=$sha"
+    sleep 1
+    continue
+  fi
+
+  echo "CHECK systemd PASS active"
+  echo "CHECK service_pid PASS previous=$previous_pid current=$pid"
+  echo "CHECK server_build_sha PASS expected=$resolved_expected_sha actual=$sha"
+  exit 0
+done
+
+echo "CHECK restart FAIL $last_reason previous_pid=$previous_pid current_pid=${last_pid:-unknown} expected_sha=$resolved_expected_sha actual_sha=${last_sha:-unknown}"
+exit 1

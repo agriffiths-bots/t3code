@@ -70,6 +70,45 @@ it.layer(NodeServices.layer)("ServerEnvironmentLive", (it) => {
     }),
   );
 
+  it.effect("includes the served build sha when one is injected", () =>
+    Effect.gen(function* () {
+      const fileSystem = yield* FileSystem.FileSystem;
+      const baseDir = yield* fileSystem.makeTempDirectoryScoped({
+        prefix: "t3-server-environment-build-sha-test-",
+      });
+      const buildSha = "cccccccccccccccccccccccccccccccccccccccc";
+      const previous = process.env.T3CODE_BUILD_SHA;
+
+      process.env.T3CODE_BUILD_SHA = buildSha.toUpperCase();
+      const descriptor = yield* Effect.gen(function* () {
+        const serverEnvironment = yield* ServerEnvironment.ServerEnvironment;
+        return yield* serverEnvironment.getDescriptor;
+      }).pipe(
+        Effect.provide(makeServerEnvironmentLayer(baseDir)),
+        Effect.ensuring(
+          Effect.sync(() => {
+            if (previous === undefined) {
+              delete process.env.T3CODE_BUILD_SHA;
+            } else {
+              process.env.T3CODE_BUILD_SHA = previous;
+            }
+          }),
+        ),
+      );
+
+      expect(descriptor.serverBuildSha).toBe(buildSha);
+    }),
+  );
+
+  it("ignores empty bundled build sha candidates", () => {
+    const buildSha = "dddddddddddddddddddddddddddddddddddddddd";
+
+    expect(ServerEnvironment.__testing.resolveConfiguredBuildSha(undefined, "")).toBeUndefined();
+    expect(ServerEnvironment.__testing.resolveConfiguredBuildSha("not-a-sha", buildSha)).toBe(
+      buildSha,
+    );
+  });
+
   it.effect("structures persisted environment id filesystem failures", () =>
     Effect.gen(function* () {
       const fileSystem = yield* FileSystem.FileSystem;

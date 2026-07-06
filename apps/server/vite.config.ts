@@ -17,6 +17,13 @@ export function shouldBundleCliDependency(id: string): boolean {
 
 const repoEnv = loadRepoEnv();
 
+function resolveBuildSha(): string {
+  const envSha = process.env.T3CODE_BUILD_SHA?.trim() ?? "";
+  return /^[0-9a-f]{40}$/i.test(envSha) ? envSha.toLowerCase() : "";
+}
+
+const buildSha = resolveBuildSha();
+
 export default mergeConfig(
   baseConfig,
   defineConfig({
@@ -42,6 +49,7 @@ export default mergeConfig(
         js: "#!/usr/bin/env node\n",
       },
       define: {
+        __T3CODE_BUILD_SHA__: JSON.stringify(buildSha),
         __T3CODE_BUILD_RELAY_URL__: JSON.stringify(repoEnv.T3CODE_RELAY_URL?.trim() ?? ""),
         __T3CODE_BUILD_CLERK_PUBLISHABLE_KEY__: JSON.stringify(
           repoEnv.T3CODE_CLERK_PUBLISHABLE_KEY?.trim() ?? "",

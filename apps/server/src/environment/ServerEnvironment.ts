@@ -13,6 +13,8 @@ import * as ServerConfig from "../config.ts";
 import * as ProcessRunner from "../processRunner.ts";
 import { resolveServerEnvironmentLabel } from "./ServerEnvironmentLabel.ts";
 
+declare const __T3CODE_BUILD_SHA__: string | undefined;
+
 export class ServerEnvironmentIdPersistenceError extends Schema.TaggedErrorClass<ServerEnvironmentIdPersistenceError>()(
   "ServerEnvironmentIdPersistenceError",
   {
@@ -58,6 +60,28 @@ function platformArch(
     default:
       return "other";
   }
+}
+
+function normalizeBuildSha(value: string): string | undefined {
+  const trimmed = value.trim();
+  return /^[0-9a-f]{40}$/i.test(trimmed) ? trimmed.toLowerCase() : undefined;
+}
+
+function resolveConfiguredBuildSha(
+  envValue: string | undefined,
+  bundledValue: string | undefined,
+): string | undefined {
+  const envSha = normalizeBuildSha(envValue ?? "");
+  if (envSha !== undefined) {
+    return envSha;
+  }
+
+  const bundledSha = bundledValue !== undefined ? normalizeBuildSha(bundledValue) : undefined;
+  if (bundledSha !== undefined) {
+    return bundledSha;
+  }
+
+  return undefined;
 }
 
 export const make = Effect.gen(function* () {
@@ -124,6 +148,10 @@ export const make = Effect.gen(function* () {
   const environmentId = EnvironmentId.make(environmentIdRaw);
   const cwdBaseName = path.basename(serverConfig.cwd).trim();
   const label = yield* resolveServerEnvironmentLabel({ cwdBaseName });
+  const serverBuildSha = resolveConfiguredBuildSha(
+    process.env.T3CODE_BUILD_SHA,
+    typeof __T3CODE_BUILD_SHA__ !== "undefined" ? __T3CODE_BUILD_SHA__ : undefined,
+  );
 
   const descriptor: ExecutionEnvironmentDescriptor = {
     environmentId,
@@ -133,6 +161,7 @@ export const make = Effect.gen(function* () {
       arch: platformArch(hostArchitecture),
     },
     serverVersion: packageJson.version,
+    ...(serverBuildSha !== undefined ? { serverBuildSha } : {}),
     capabilities: {
       repositoryIdentity: true,
     },
@@ -150,3 +179,7 @@ export const make = Effect.gen(function* () {
  * provide the external platform services and a ServerConfig.
  */
 export const layer = Layer.effect(ServerEnvironment, make).pipe(Layer.provide(ProcessRunner.layer));
+
+export const __testing = {
+  resolveConfiguredBuildSha,
+};

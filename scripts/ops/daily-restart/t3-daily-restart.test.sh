@@ -45,6 +45,13 @@ echo "inject-weakened token=${T3DR_TOKEN:-missing} $*" >>"$T_LOG"
 WEAK
       chmod +x "$T_TMP/bin/inject-resume"
     fi
+    if [[ "${FAKE_TARGET_WEAKENS_VERIFY_RESTART:-0}" == "1" ]]; then
+      cat >"$T_TMP/bin/verify-restart" <<'WEAK'
+#!/usr/bin/env bash
+echo "verify-weakened $*" >>"$T_LOG"
+WEAK
+      chmod +x "$T_TMP/bin/verify-restart"
+    fi
     exit "${FAKE_GIT_RC:-0}"
     ;;
   *"diff --quiet"*) exit "${FAKE_MIGRATION_DIFF_RC:-0}" ;;
@@ -57,6 +64,17 @@ echo "systemctl $*" >>"$T_LOG"
 state_file="$T_TMP/systemctl-state"
 [[ -f "$state_file" ]] || echo active >"$state_file"
 case "$*" in
+  --user\ show\ *)
+    state="$(cat "$state_file")"
+    pid_file="$T_TMP/systemctl-pid"
+    [[ -f "$pid_file" ]] || echo 111 >"$pid_file"
+    if [[ "$state" == "active" ]]; then
+      cat "$pid_file"
+    else
+      echo 0
+    fi
+    exit 0
+    ;;
   --user\ is-active\ *)
     state="$(cat "$state_file")"
     echo "$state"
@@ -81,6 +99,11 @@ case "$*" in
     ;;
   --user\ start\ *)
     echo active >"$state_file"
+    pid_file="$T_TMP/systemctl-pid"
+    pid=111
+    [[ -f "$pid_file" ]] && pid="$(cat "$pid_file")"
+    pid=$((pid + 1))
+    echo "$pid" >"$pid_file"
     exit "${FAKE_SYSTEMCTL_RC:-0}"
     ;;
   --user\ kill\ *|--user\ kill)
@@ -163,6 +186,22 @@ echo "CHECK systemd PASS active"
 echo "CHECK http PASS 200"
 echo "CHECK spawn_wake PASS completed"
 SH
+  cat >"$dir/verify-restart" <<'SH'
+#!/usr/bin/env bash
+echo "verify-restart $*" >>"$T_LOG"
+if [[ "${FAKE_VERIFY_RESTART_RC:-0}" != "0" ]]; then
+  echo "CHECK restart FAIL forced failure"
+  exit "$FAKE_VERIFY_RESTART_RC"
+fi
+if [[ "${FAKE_VERIFY_RESTART_LEGACY_SHA_ONCE:-0}" == "1" && ! -f "$T_TMP/verify-restart-legacy-sha-failed" ]]; then
+  : >"$T_TMP/verify-restart-legacy-sha-failed"
+  echo "CHECK restart FAIL environment descriptor did not include serverBuildSha previous_pid=111 current_pid=112 expected_sha=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb actual_sha=unknown"
+  exit 1
+fi
+echo "CHECK systemd PASS active"
+echo "CHECK service_pid PASS"
+echo "CHECK server_build_sha PASS"
+SH
   cat >"$dir/inject-resume" <<'SH'
 #!/usr/bin/env bash
 echo "inject token=${T3DR_TOKEN:-missing} $*" >>"$T_LOG"
@@ -208,6 +247,7 @@ SH
   cat >"$dir/pnpm" <<'SH'
 #!/usr/bin/env bash
 echo "pnpm $*" >>"$T_LOG"
+[[ -n "${T3CODE_BUILD_SHA:-}" ]] && echo "pnpm-env T3CODE_BUILD_SHA=$T3CODE_BUILD_SHA" >>"$T_LOG"
 if [[ "${FAKE_PNPM_FAIL_ONCE:-0}" == "1" && ! -f "$T_TMP/pnpm-failed" ]]; then
   : >"$T_TMP/pnpm-failed"
   exit 8
@@ -264,7 +304,7 @@ assert_order() {
 tmp="$(mktemp -d)"
 run_manager "$tmp"
 [[ "$(cat "$tmp/rc")" == "0" ]] && pass "happy path exits zero" || fail "happy path exits zero"
-assert_order "$tmp/calls.log" "git -C" "snapshot" "capture" "systemctl --user stop" "capture" "snapshot" "git -C" "pnpm -C" "systemctl --user start" "health" "inject"
+assert_order "$tmp/calls.log" "git -C" "snapshot" "capture" "systemctl --user stop" "capture" "snapshot" "git -C" "pnpm -C" "systemctl --user start" "verify-restart" "health" "inject"
 assert_order "$tmp/calls.log" "mint-resume-token" "validate-resume-token" "systemctl --user stop"
 grep -Fq "inject token=minted-token" "$tmp/calls.log" && pass "resume injection receives preflight token" || fail "resume injection receives preflight token"
 grep -Fq "revoke-resume-token minted-session" "$tmp/calls.log" && pass "minted resume token is revoked" || fail "minted resume token is revoked"
@@ -280,6 +320,15 @@ grep -Fq "snapshot --db $tmp/state.sqlite --out-dir $tmp/snaps" "$tmp/calls.log"
 grep -Fq "capture --db $tmp/state.sqlite --out $tmp/ledger/" "$tmp/calls.log" && pass "capture helper receives current flags" || fail "capture helper receives current flags"
 grep -Eq "capture --db $tmp/state.sqlite --out $tmp/ledger/.*/resume-manifest\\.json\\.post-stop\\.[0-9]+ --stopped-since [0-9]{4}-[0-9]{2}-[0-9]{2}T.* --pending-since [0-9]{4}-[0-9]{2}-[0-9]{2}T" "$tmp/calls.log" && pass "post-stop capture receives shutdown boundary" || fail "post-stop capture receives shutdown boundary"
 grep -Fq "health --origin http://127.0.0.1:1 --service fake.service --instance fakeAgent --model fake-model --timeout 1" "$tmp/calls.log" && pass "health probe receives smoke provider" || fail "health probe receives smoke provider"
+grep -Fq "verify-restart --service fake.service --origin http://127.0.0.1:1 --checkout $tmp/checkout --expected-sha bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb --previous-pid 111 --timeout 1" "$tmp/calls.log" && pass "verify-restart receives pid and target" || fail "verify-restart receives pid and target"
+
+tmp="$(mktemp -d)"
+export FAKE_VERIFY_RESTART_RC=9
+run_manager "$tmp"
+unset FAKE_VERIFY_RESTART_RC
+[[ "$(cat "$tmp/rc")" != "0" ]] && pass "verify-restart failure exits nonzero" || fail "verify-restart failure exits nonzero"
+assert_order "$tmp/calls.log" "systemctl --user start fake.service" "verify-restart" "systemctl --user stop fake.service" "git -C $tmp/checkout checkout aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" "restore" "pnpm -C $tmp/checkout/apps/web run build" "pnpm -C $tmp/checkout run build:desktop" "systemctl --user start fake.service" "health"
+grep -Fq "RESULT ROLLBACK-OK" "$tmp/ledger/"*/t3-daily-restart.result && pass "verify-restart failure rolls back loudly" || fail "verify-restart failure rolls back loudly"
 
 tmp="$(mktemp -d)"
 caller_path="$tmp/nonstandard-node"
@@ -479,6 +528,17 @@ else
 fi
 
 tmp="$(mktemp -d)"
+export FAKE_TARGET_WEAKENS_VERIFY_RESTART=1
+run_manager "$tmp"
+unset FAKE_TARGET_WEAKENS_VERIFY_RESTART
+[[ "$(cat "$tmp/rc")" == "0" ]] && pass "weakened target verify-restart still exits zero" || fail "weakened target verify-restart still exits zero"
+if grep -Fq "verify-weakened" "$tmp/calls.log"; then
+  fail "target verify-restart was used after update"
+else
+  pass "pinned pre-update verify-restart used after update"
+fi
+
+tmp="$(mktemp -d)"
 export FAKE_HEALTH_FAIL_ONCE=1
 export FAKE_SYSTEMCTL_FAIL_STOP_N=2
 export FAKE_SYSTEMCTL_KILL_FAIL=1
@@ -591,6 +651,23 @@ run_manager "$tmp"
 unset FAKE_PRE_SHA FAKE_TARGET_SHA
 [[ "$(cat "$tmp/rc")" == "0" ]] && pass "same-sha rerun exits zero" || fail "same-sha rerun exits zero"
 if grep -Fq "pnpm" "$tmp/calls.log"; then fail "same-sha rerun rebuilt web"; else pass "same-sha rerun skips web rebuild"; fi
+
+tmp="$(mktemp -d)"
+export FAKE_PRE_SHA=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+export FAKE_TARGET_SHA=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+export FAKE_VERIFY_RESTART_LEGACY_SHA_ONCE=1
+run_manager "$tmp"
+unset FAKE_PRE_SHA FAKE_TARGET_SHA FAKE_VERIFY_RESTART_LEGACY_SHA_ONCE
+[[ "$(cat "$tmp/rc")" == "0" ]] && pass "same-sha legacy unstamped rebuild exits zero" || fail "same-sha legacy unstamped rebuild exits zero"
+assert_order "$tmp/calls.log" "systemctl --user start fake.service" "verify-restart" "systemctl --user stop fake.service" "pnpm -C $tmp/checkout run build:desktop" "systemctl --user start fake.service" "verify-restart" "health"
+if grep -Fq "pnpm -C $tmp/checkout/apps/web run build" "$tmp/calls.log"; then
+  fail "same-sha legacy unstamped rebuild rebuilt web"
+else
+  pass "same-sha legacy unstamped rebuild skips web rebuild"
+fi
+grep -Fq "pnpm-env T3CODE_BUILD_SHA=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" "$tmp/calls.log" \
+  && pass "same-sha legacy unstamped rebuild stamps target sha" \
+  || fail "same-sha legacy unstamped rebuild stamps target sha"
 
 tmp="$(mktemp -d)"
 export FAKE_PRE_SHA=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
