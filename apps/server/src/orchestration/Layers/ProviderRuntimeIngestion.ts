@@ -140,12 +140,9 @@ function findProposedPlanById(
   return undefined;
 }
 
-function hasCheckpointForTurn(
-  checkpoints: ReadonlyArray<OrchestrationCheckpointSummary>,
-  turnId: TurnId,
-): boolean {
-  for (let index = 0; index < checkpoints.length; index += 1) {
-    if (checkpoints[index]?.turnId === turnId) {
+function hasTrackedCheckpointTurnId(turnIds: ReadonlyArray<TurnId>, turnId: TurnId): boolean {
+  for (let index = 0; index < turnIds.length; index += 1) {
+    if (turnIds[index] === turnId) {
       return true;
     }
   }
@@ -1725,7 +1722,10 @@ const make = Effect.gen(function* () {
           // (non-placeholder) capture from CheckpointReactor should not
           // be clobbered, and dispatching a duplicate placeholder for the
           // same turnId would produce an unstable checkpointTurnCount.
-          if (hasCheckpointForTurn(checkpointContext.checkpoints, turnId)) {
+          const trackedCheckpointTurnIds =
+            checkpointContext.trackedCheckpointTurnIds ??
+            checkpointContext.checkpoints.map((checkpoint) => checkpoint.turnId);
+          if (hasTrackedCheckpointTurnId(trackedCheckpointTurnIds, turnId)) {
             // Already tracked; no-op.
           } else {
             const assistantMessageId = MessageId.make(

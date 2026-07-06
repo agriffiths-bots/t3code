@@ -113,6 +113,34 @@ describe("selectStaleWorktreeReapCandidates", () => {
     ]);
   });
 
+  it("ignores stale pending counters on deleted threads", () => {
+    expect(
+      selectStaleWorktreeReapCandidates(
+        [
+          row({
+            threadId: "deleted-pending",
+            deletedAt: "2026-07-06T11:30:00.000Z",
+            updatedAt: "2026-07-06T11:30:00.000Z",
+            pendingApprovalCount: 1,
+            pendingUserInputCount: 1,
+          }),
+        ],
+        ["/repo"],
+        NOW,
+        {
+          archivedAgeMs: 20 * 60_000,
+        },
+      ),
+    ).toEqual([
+      {
+        threadId: "deleted-pending",
+        threadIds: ["deleted-pending"],
+        projectCwd: "/repo",
+        path: "/worktrees/deleted-pending",
+      },
+    ]);
+  });
+
   it("keeps active, pending, young, shared, and project-root paths", () => {
     const rows = [
       row({ threadId: "running", sessionStatus: "running" }),

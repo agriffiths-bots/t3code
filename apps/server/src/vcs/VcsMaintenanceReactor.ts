@@ -9,6 +9,7 @@ import * as DateTime from "effect/DateTime";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import * as Result from "effect/Result";
 import * as Schedule from "effect/Schedule";
 import type * as Scope from "effect/Scope";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
@@ -92,6 +93,10 @@ function rowWorktreePath(row: WorktreeMaintenanceRow): string | null {
 }
 
 function isRowActive(row: WorktreeMaintenanceRow): boolean {
+  if (row.deletedAt !== null) {
+    return false;
+  }
+
   const hasLiveSessionStatus =
     (row.sessionStatus !== null && !REAPABLE_SESSION_STATUSES.has(row.sessionStatus)) ||
     (row.runtimeStatus !== null && !REAPABLE_SESSION_STATUSES.has(row.runtimeStatus));
@@ -284,10 +289,20 @@ const make = Effect.gen(function* () {
     const rows = yield* sql<ProjectRootRow>`
       SELECT workspace_root AS "workspaceRoot"
       FROM projection_projects
-      WHERE deleted_at IS NULL
     `;
     return rows.map((row) => row.workspaceRoot);
   });
+
+  const listActiveProjectRoots = Effect.fn("VcsMaintenanceReactor.listActiveProjectRoots")(
+    function* () {
+      const rows = yield* sql<ProjectRootRow>`
+      SELECT workspace_root AS "workspaceRoot"
+      FROM projection_projects
+      WHERE deleted_at IS NULL
+    `;
+      return rows.map((row) => row.workspaceRoot);
+    },
+  );
 
   const listWorktreeRows = Effect.fn("VcsMaintenanceReactor.listWorktreeRows")(function* () {
     const rows = yield* sql<WorktreeRow>`
@@ -308,8 +323,7 @@ const make = Effect.gen(function* () {
       INNER JOIN projection_projects p ON p.project_id = t.project_id
       LEFT JOIN projection_thread_sessions s ON s.thread_id = t.thread_id
       LEFT JOIN provider_session_runtime r ON r.thread_id = t.thread_id
-      WHERE p.deleted_at IS NULL
-        AND t.worktree_path IS NOT NULL
+      WHERE t.worktree_path IS NOT NULL
     `;
     return rows.map(
       (row): WorktreeMaintenanceRow => ({
@@ -317,6 +331,51 @@ const make = Effect.gen(function* () {
         worktreeRemovable: row.worktreeRemovable > 0,
       }),
     );
+  });
+
+  const isWorktreeRegistered = Effect.fn("VcsMaintenanceReactor.isWorktreeRegistered")(function* (
+    candidate: WorktreeReapCandidate,
+  ) {
+    const result = yield* git
+      .execute({
+        operation: "VcsMaintenanceReactor.isWorktreeRegistered",
+        cwd: candidate.projectCwd,
+        args: ["worktree", "list", "--porcelain"],
+        allowNonZeroExit: true,
+        timeoutMs: 5_000,
+      })
+      .pipe(Effect.result);
+
+    if (Result.isFailure(result)) {
+      yield* Effect.logWarning("vcs.maintenance.worktree-list-failed", {
+        threadIds: candidate.threadIds,
+        projectRoot: candidate.projectCwd,
+        path: candidate.path,
+        detail: errorDetail(result.failure),
+      });
+      return true;
+    }
+
+    if (result.success.exitCode !== 0) {
+      yield* Effect.logWarning("vcs.maintenance.worktree-list-failed", {
+        threadIds: candidate.threadIds,
+        projectRoot: candidate.projectCwd,
+        path: candidate.path,
+        detail: result.success.stderr.trim() || "git worktree list failed",
+      });
+      return true;
+    }
+
+    for (const line of result.success.stdout.split("\n")) {
+      if (!line.startsWith("worktree ")) {
+        continue;
+      }
+      if (normalizePath(line.slice("worktree ".length)) === candidate.path) {
+        return true;
+      }
+    }
+
+    return false;
   });
 
   const pruneProjectRepository = Effect.fn("VcsMaintenanceReactor.pruneProjectRepository")(
@@ -372,64 +431,79 @@ const make = Effect.gen(function* () {
       DateTime.toEpochMillis(now),
     );
 
+    const clearCandidateMetadata = Effect.fn("VcsMaintenanceReactor.clearCandidateMetadata")(
+      function* (candidate: WorktreeReapCandidate) {
+        for (const threadId of candidate.threadIds) {
+          const commandId = yield* serverCommandId("vcs-maintenance-worktree-reaped").pipe(
+            Effect.orDie,
+          );
+          yield* orchestrationEngine
+            .dispatch({
+              type: "thread.meta.update",
+              commandId,
+              threadId: ThreadId.make(threadId),
+              worktreePath: null,
+              worktreeRemovable: false,
+              worktreeRemovalPath: null,
+            })
+            .pipe(
+              Effect.tap(() =>
+                Effect.logInfo("vcs.maintenance.worktree-reaped", {
+                  threadId,
+                  projectRoot: candidate.projectCwd,
+                  path: candidate.path,
+                }),
+              ),
+              Effect.catchCause((cause) =>
+                Effect.logWarning("vcs.maintenance.worktree-metadata-clear-failed", {
+                  threadId,
+                  projectRoot: candidate.projectCwd,
+                  path: candidate.path,
+                  cause: Cause.pretty(cause),
+                }),
+              ),
+            );
+        }
+      },
+    );
+
     for (const candidate of candidates) {
-      yield* gitWorkflow
-        .removeWorktree({
-          cwd: candidate.projectCwd,
-          path: candidate.path,
-        })
-        .pipe(
-          Effect.tap(() =>
-            Effect.gen(function* () {
-              for (const threadId of candidate.threadIds) {
-                const commandId = yield* serverCommandId("vcs-maintenance-worktree-reaped").pipe(
-                  Effect.orDie,
-                );
-                yield* orchestrationEngine
-                  .dispatch({
-                    type: "thread.meta.update",
-                    commandId,
-                    threadId: ThreadId.make(threadId),
-                    worktreePath: null,
-                    worktreeRemovable: false,
-                    worktreeRemovalPath: null,
-                  })
-                  .pipe(
-                    Effect.tap(() =>
-                      Effect.logInfo("vcs.maintenance.worktree-reaped", {
-                        threadId,
-                        projectRoot: candidate.projectCwd,
-                        path: candidate.path,
-                      }),
-                    ),
-                    Effect.catchCause((cause) =>
-                      Effect.logWarning("vcs.maintenance.worktree-metadata-clear-failed", {
-                        threadId,
-                        projectRoot: candidate.projectCwd,
-                        path: candidate.path,
-                        cause: Cause.pretty(cause),
-                      }),
-                    ),
-                  );
-              }
-            }),
-          ),
-          Effect.catch((error) =>
-            Effect.logWarning("vcs.maintenance.worktree-reap-skipped", {
-              threadIds: candidate.threadIds,
-              projectRoot: candidate.projectCwd,
-              path: candidate.path,
-              detail: errorDetail(error),
-            }),
-          ),
-        );
+      if (yield* isWorktreeRegistered(candidate)) {
+        const removeResult = yield* gitWorkflow
+          .removeWorktree({
+            cwd: candidate.projectCwd,
+            path: candidate.path,
+          })
+          .pipe(Effect.result);
+        if (Result.isFailure(removeResult)) {
+          yield* Effect.logWarning("vcs.maintenance.worktree-remove-failed", {
+            threadIds: candidate.threadIds,
+            projectRoot: candidate.projectCwd,
+            path: candidate.path,
+            detail: errorDetail(removeResult.failure),
+          });
+          yield* git.pruneWorktrees(candidate.projectCwd).pipe(
+            Effect.catch((error) =>
+              Effect.logWarning("vcs.maintenance.worktree-prune-failed", {
+                projectRoot: candidate.projectCwd,
+                detail: errorDetail(error),
+              }),
+            ),
+          );
+          if (yield* isWorktreeRegistered(candidate)) {
+            continue;
+          }
+        }
+      }
+      yield* clearCandidateMetadata(candidate);
     }
   });
 
   const runSweep = Effect.fn("VcsMaintenanceReactor.runSweep")(function* () {
-    const projectRoots = yield* listProjectRoots();
-    yield* reapWorktrees(projectRoots);
-    for (const projectRoot of projectRoots) {
+    const protectionProjectRoots = yield* listProjectRoots();
+    yield* reapWorktrees(protectionProjectRoots);
+    const activeProjectRoots = yield* listActiveProjectRoots();
+    for (const projectRoot of activeProjectRoots) {
       yield* pruneProjectRepository(projectRoot);
     }
   });
