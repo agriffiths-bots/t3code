@@ -7,6 +7,7 @@ import { beforeEach, vi } from "vite-plus/test";
 
 import * as ElectronWindow from "../../electron/ElectronWindow.ts";
 import {
+  __testing,
   authenticateCloudflareAccess,
   installCloudflareAccessCookie,
   installCloudflareAccessCredentials,
@@ -34,6 +35,7 @@ vi.mock("electron", () => ({
 }));
 
 beforeEach(() => {
+  __testing.resetCloudflareAccessHeaders();
   vi.clearAllMocks();
 });
 
@@ -286,6 +288,138 @@ describe("desktop Cloudflare Access cookies", () => {
       );
       expect(clearedCallback).toHaveBeenCalledWith({
         requestHeaders: { "user-agent": "t3code" },
+      });
+    }),
+  );
+
+  it.effect("suspends saved Cloudflare Access cookies while reauthenticating", () =>
+    Effect.gen(function* () {
+      const staleCookie = accessCookie({
+        value: "stale-cookie",
+        domain: "app.example.test",
+        hostOnly: true,
+        path: "/",
+        secure: true,
+      });
+      electronMock.cookies.get.mockResolvedValueOnce([staleCookie]);
+      electronMock.cookies.remove.mockResolvedValue(undefined);
+      electronMock.cookies.set.mockResolvedValue(undefined);
+
+      yield* installCloudflareAccessCredentials.handler({
+        host: "https://app.example.test",
+        headers: {},
+        clearCookies: true,
+        cookieValue: "stale-cookie",
+      });
+
+      const listener = electronMock.webRequest.onBeforeSendHeaders.mock.calls[0]?.[0];
+      expect(listener).toBeTypeOf("function");
+
+      const authWindow = makeAuthWindow();
+      const authNavigationCallback = vi.fn();
+      authWindow.loadURL.mockImplementation(async () => {
+        listener(
+          {
+            url: "https://app.example.test/",
+            requestHeaders: {
+              Cookie: "application=1",
+            },
+          },
+          authNavigationCallback,
+        );
+        return new Promise<never>(() => {});
+      });
+      electronMock.cookies.get
+        .mockResolvedValueOnce([staleCookie])
+        .mockResolvedValueOnce([staleCookie])
+        .mockResolvedValueOnce([
+          accessCookie({
+            value: "fresh-cookie",
+            domain: "app.example.test",
+            hostOnly: true,
+            path: "/",
+            secure: true,
+          }),
+        ]);
+
+      const result = yield* authenticateCloudflareAccess
+        .handler({ host: "https://app.example.test" })
+        .pipe(
+          Effect.provideService(
+            ElectronWindow.ElectronWindow,
+            electronWindowLayer(authWindow as unknown as Electron.BrowserWindow),
+          ),
+        );
+
+      expect(result).toEqual({ cookieValue: "fresh-cookie" });
+      expect(authNavigationCallback).toHaveBeenCalledWith({
+        requestHeaders: {
+          Cookie: "application=1",
+        },
+      });
+
+      const postAuthCallback = vi.fn();
+      listener(
+        {
+          url: "https://app.example.test/.well-known/t3/environment",
+          requestHeaders: { "user-agent": "t3code" },
+        },
+        postAuthCallback,
+      );
+      expect(postAuthCallback).toHaveBeenCalledWith({
+        requestHeaders: { "user-agent": "t3code" },
+      });
+    }),
+  );
+
+  it.effect("does not restore stale Cloudflare Access headers over a concurrent update", () =>
+    Effect.gen(function* () {
+      const staleCookie = accessCookie({
+        value: "stale-cookie",
+        domain: "app.example.test",
+        hostOnly: true,
+        path: "/",
+        secure: true,
+      });
+      electronMock.cookies.get.mockResolvedValueOnce([staleCookie]);
+      electronMock.cookies.remove.mockResolvedValue(undefined);
+      electronMock.cookies.set.mockResolvedValue(undefined);
+
+      yield* installCloudflareAccessCredentials.handler({
+        host: "https://app.example.test",
+        headers: {},
+        clearCookies: true,
+        cookieValue: "stale-cookie",
+      });
+
+      const listener = electronMock.webRequest.onBeforeSendHeaders.mock.calls[0]?.[0];
+      expect(listener).toBeTypeOf("function");
+
+      const suspendedHeaders = __testing.suspendCloudflareAccessHeaders(
+        "https://app.example.test/",
+      );
+      electronMock.cookies.get.mockResolvedValueOnce([staleCookie]);
+      yield* installCloudflareAccessCredentials.handler({
+        host: "https://app.example.test",
+        headers: {},
+        clearCookies: true,
+        cookieValue: "fresh-cookie",
+      });
+      __testing.restoreCloudflareAccessHeaders(suspendedHeaders);
+
+      const callback = vi.fn();
+      listener(
+        {
+          url: "https://app.example.test/.well-known/t3/environment",
+          requestHeaders: { "user-agent": "t3code" },
+        },
+        callback,
+      );
+      expect(callback).toHaveBeenCalledWith({
+        requestHeaders: {
+          "user-agent": "t3code",
+          Cookie: "CF_Authorization=fresh-cookie",
+        },
       });
     }),
   );

@@ -28,6 +28,7 @@ const CLOUDFLARE_ACCESS_TRANSPORT_HEADER_NAME_SET = new Set<string>(
 const ACCESS_LOGIN_TIMEOUT_MS = 5 * 60 * 1000;
 const COOKIE_POLL_INTERVAL_MS = 500;
 const cloudflareAccessHeaderRules = new Map<string, Readonly<Record<string, string>>>();
+const cloudflareAccessHeaderRuleVersions = new Map<string, number>();
 let cloudflareAccessHeaderHookInstalled = false;
 
 export class DesktopCloudflareAccessLoginError extends Schema.TaggedErrorClass<DesktopCloudflareAccessLoginError>()(
@@ -283,6 +284,12 @@ function installCloudflareAccessHeaderHook(session: Electron.Session) {
   });
 }
 
+function bumpCloudflareAccessHeaderRuleVersion(origin: string): number {
+  const nextVersion = (cloudflareAccessHeaderRuleVersions.get(origin) ?? 0) + 1;
+  cloudflareAccessHeaderRuleVersions.set(origin, nextVersion);
+  return nextVersion;
+}
+
 function configureCloudflareAccessHeaders(
   session: Electron.Session,
   origin: string,
@@ -304,10 +311,51 @@ function configureCloudflareAccessHeaders(
   };
   if (Object.keys(nextHeaders).length === 0) {
     cloudflareAccessHeaderRules.delete(requestOriginKey);
+    bumpCloudflareAccessHeaderRuleVersion(requestOriginKey);
     return;
   }
   cloudflareAccessHeaderRules.set(requestOriginKey, nextHeaders);
+  bumpCloudflareAccessHeaderRuleVersion(requestOriginKey);
   installCloudflareAccessHeaderHook(session);
+}
+
+interface SuspendedCloudflareAccessHeaders {
+  readonly requestOriginKey: string;
+  readonly headers: Readonly<Record<string, string>> | undefined;
+  readonly version: number;
+}
+
+function suspendCloudflareAccessHeaders(
+  origin: string,
+): SuspendedCloudflareAccessHeaders | undefined {
+  const requestOriginKey = cloudflareAccessRuleOrigin(origin);
+  if (requestOriginKey === null) {
+    return undefined;
+  }
+  const previousHeaders = cloudflareAccessHeaderRules.get(requestOriginKey);
+  cloudflareAccessHeaderRules.delete(requestOriginKey);
+  return {
+    requestOriginKey,
+    headers: previousHeaders,
+    version: bumpCloudflareAccessHeaderRuleVersion(requestOriginKey),
+  };
+}
+
+function restoreCloudflareAccessHeaders(suspended: SuspendedCloudflareAccessHeaders | undefined) {
+  if (suspended === undefined) {
+    return;
+  }
+  if (
+    cloudflareAccessHeaderRules.has(suspended.requestOriginKey) ||
+    (cloudflareAccessHeaderRuleVersions.get(suspended.requestOriginKey) ?? 0) !== suspended.version
+  ) {
+    return;
+  }
+  if (suspended.headers === undefined || Object.keys(suspended.headers).length === 0) {
+    return;
+  }
+  cloudflareAccessHeaderRules.set(suspended.requestOriginKey, suspended.headers);
+  bumpCloudflareAccessHeaderRuleVersion(suspended.requestOriginKey);
 }
 
 function errorText(cause: unknown): string {
@@ -384,6 +432,7 @@ function captureCloudflareAccessCookie(options: {
       let observedCloudflareAccessLoginNavigation = false;
       let capturedReplacementCookie = false;
       let previousAccessCookies: ReadonlyArray<Electron.Cookie> = [];
+      const suspendedAccessHeaders = suspendCloudflareAccessHeaders(options.origin);
       const observeNavigation = (_event: Electron.Event, navigationUrl: string) => {
         if (isCloudflareAccessLoginUrl(navigationUrl)) {
           observedCloudflareAccessLoginNavigation = true;
@@ -473,6 +522,7 @@ function captureCloudflareAccessCookie(options: {
         try {
           if (!capturedReplacementCookie) {
             await restoreAccessCookies(session, options.origin, previousAccessCookies);
+            restoreCloudflareAccessHeaders(suspendedAccessHeaders);
           }
         } finally {
           abort.abort();
@@ -595,3 +645,13 @@ export const installCloudflareAccessCredentials = DesktopIpc.makeIpcMethod({
     });
   }),
 });
+
+export const __testing = {
+  resetCloudflareAccessHeaders: () => {
+    cloudflareAccessHeaderRules.clear();
+    cloudflareAccessHeaderRuleVersions.clear();
+    cloudflareAccessHeaderHookInstalled = false;
+  },
+  restoreCloudflareAccessHeaders,
+  suspendCloudflareAccessHeaders,
+};
