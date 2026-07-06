@@ -44,6 +44,10 @@ function preferredPathSeparator(value: string): "/" | "\\" {
   return value.includes("\\") ? "\\" : "/";
 }
 
+function isBareHomePath(value: string): boolean {
+  return value.trim() === "~";
+}
+
 export function hasTrailingPathSeparator(value: string): boolean {
   return (getAbsolutePathKind(value) === "unix" ? /\/$/ : /[\\/]$/).test(value);
 }
@@ -94,12 +98,14 @@ function splitAbsolutePath(value: string): {
 export function isFilesystemBrowseQuery(value: string, platform = ""): boolean {
   const allowWindowsPaths = isWindowsPlatform(platform);
   return (
+    isBareHomePath(value) ||
     value.startsWith("./") ||
     value.startsWith("../") ||
     value.startsWith(".\\") ||
     value.startsWith("..\\") ||
     value.startsWith("/") ||
     value.startsWith("~/") ||
+    value.startsWith("~\\") ||
     (allowWindowsPaths && isWindowsAbsolutePath(value))
   );
 }
@@ -177,11 +183,17 @@ export function appendBrowsePathSegment(currentPath: string, segment: string): s
 }
 
 export function getBrowseLeafPathSegment(currentPath: string): string {
+  if (isBareHomePath(currentPath)) {
+    return "";
+  }
   const lastSeparatorIndex = getLastPathSeparatorIndex(currentPath);
   return currentPath.slice(lastSeparatorIndex + 1);
 }
 
 export function getBrowseDirectoryPath(currentPath: string): string {
+  if (isBareHomePath(currentPath)) {
+    return "~/";
+  }
   if (hasTrailingPathSeparator(currentPath)) {
     return currentPath;
   }

@@ -4762,6 +4762,63 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
     }).pipe(Effect.provide(NodeHttpServer.layerTest)),
   );
 
+  it.effect("normalizes a home workspace root during websocket project.create dispatch", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const homeDir = yield* fs.makeTempDirectoryScoped({ prefix: "t3-ws-project-create-home-" });
+      const dispatchedCommands: Array<OrchestrationCommand> = [];
+      const previousHome = process.env.HOME;
+      process.env.HOME = homeDir;
+      try {
+        yield* buildAppUnderTest({
+          layers: {
+            orchestrationEngine: {
+              dispatch: (command) =>
+                Effect.sync(() => {
+                  dispatchedCommands.push(command);
+                  return { sequence: dispatchedCommands.length };
+                }),
+            },
+          },
+        });
+
+        const wsUrl = yield* getWsServerUrl("/ws");
+        yield* Effect.scoped(
+          withWsRpcClient(wsUrl, (client) =>
+            client[ORCHESTRATION_WS_METHODS.dispatchCommand]({
+              type: "project.create",
+              commandId: CommandId.make("cmd-project-create-home-root"),
+              projectId: ProjectId.make("project-create-home-root"),
+              title: "Home Project",
+              workspaceRoot: "~/",
+              createWorkspaceRootIfMissing: true,
+              defaultModelSelection: {
+                instanceId: ProviderInstanceId.make("codex"),
+                model: "gpt-5-codex",
+              },
+              createdAt: "2026-01-01T00:00:00.000Z",
+            }),
+          ),
+        );
+        const dispatchedCommand = dispatchedCommands[0];
+
+        assert.equal(dispatchedCommand?.type, "project.create");
+        assert.equal(
+          dispatchedCommand && dispatchedCommand.type === "project.create"
+            ? dispatchedCommand.workspaceRoot
+            : null,
+          homeDir,
+        );
+      } finally {
+        if (previousHome === undefined) {
+          delete process.env.HOME;
+        } else {
+          process.env.HOME = previousHome;
+        }
+      }
+    }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+
   it.effect("routes websocket rpc projects.writeFile errors", () =>
     Effect.gen(function* () {
       const fs = yield* FileSystem.FileSystem;

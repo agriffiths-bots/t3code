@@ -3,6 +3,10 @@
 /* oxlint-disable react/no-unstable-nested-components -- Existing renderer callbacks are outside this CI hardening change. */
 import { scopeProjectRef, scopeThreadRef } from "@t3tools/client-runtime/environment";
 import {
+  getAddProjectInitialQuery,
+  isAddProjectHomeRootQuery,
+} from "@t3tools/client-runtime/operations/projects";
+import {
   isAtomCommandInterrupted,
   settlePromise,
   squashAtomCommandFailure,
@@ -68,7 +72,6 @@ import {
 import {
   appendBrowsePathSegment,
   canNavigateUp,
-  ensureBrowseDirectoryPath,
   findProjectByPath,
   getBrowseDirectoryPath,
   getBrowseLeafPathSegment,
@@ -572,11 +575,7 @@ function OpenCommandPaletteDialog(props: {
         (candidate) => candidate.environmentId === environmentId,
       );
       const environmentSettings = environment?.serverConfig?.settings ?? null;
-      const baseDirectory = environmentSettings?.addProjectBaseDirectory?.trim() ?? "";
-      if (baseDirectory.length === 0) {
-        return "~/";
-      }
-      return ensureBrowseDirectoryPath(baseDirectory);
+      return getAddProjectInitialQuery(environmentSettings?.addProjectBaseDirectory);
     },
     [environments],
   );
@@ -602,11 +601,19 @@ function OpenCommandPaletteDialog(props: {
     browseEnvironmentId && currentProjectEnvironmentId === browseEnvironmentId
       ? currentProjectCwd
       : null;
+  const trimmedBrowseQuery = query.trim();
+  const isHomeBrowseQuery = trimmedBrowseQuery === "~";
   const relativePathNeedsActiveProject =
-    isExplicitRelativeProjectPath(query.trim()) && currentProjectCwdForBrowse === null;
-  const browseDirectoryPath = isBrowsing ? getBrowseDirectoryPath(query) : "";
+    isExplicitRelativeProjectPath(trimmedBrowseQuery) && currentProjectCwdForBrowse === null;
+  const browseDirectoryPath = isBrowsing
+    ? isHomeBrowseQuery
+      ? trimmedBrowseQuery
+      : getBrowseDirectoryPath(query)
+    : "";
   const browseFilterQuery =
-    isBrowsing && !hasTrailingPathSeparator(query) ? getBrowseLeafPathSegment(query) : "";
+    isBrowsing && !isHomeBrowseQuery && !hasTrailingPathSeparator(query)
+      ? getBrowseLeafPathSegment(query)
+      : "";
   const browseQuery = useEnvironmentQuery(
     isBrowsing &&
       browseDirectoryPath.length > 0 &&
@@ -1373,8 +1380,10 @@ function OpenCommandPaletteDialog(props: {
   // directory itself. Otherwise the user typed a partial leaf name, so we need
   // the exact browse entry's fullPath or fall back to the raw query.
   const resolvedAddProjectPath = hasTrailingPathSeparator(query)
-    ? (browseResult?.parentPath ?? query.trim())
-    : (exactBrowseEntry?.fullPath ?? query.trim());
+    ? (browseResult?.parentPath ?? trimmedBrowseQuery)
+    : isHomeBrowseQuery
+      ? (browseResult?.parentPath ?? trimmedBrowseQuery)
+      : (exactBrowseEntry?.fullPath ?? trimmedBrowseQuery);
 
   const canBrowseUp =
     isBrowsing && !relativePathNeedsActiveProject && canNavigateUp(browseDirectoryPath);
@@ -1422,7 +1431,10 @@ function OpenCommandPaletteDialog(props: {
     getCommandPaletteInputPlaceholder(paletteMode);
   const isSubmenu = paletteMode === "submenu" || paletteMode === "submenu-browse";
   const hasHighlightedBrowseItem = highlightedItemValue?.startsWith("browse:") ?? false;
-  const canSubmitBrowsePath = isBrowsing && !relativePathNeedsActiveProject;
+  const exactHomeBrowseNeedsParentPath =
+    isAddProjectHomeRootQuery(trimmedBrowseQuery) && browseResult == null;
+  const canSubmitBrowsePath =
+    isBrowsing && !relativePathNeedsActiveProject && !exactHomeBrowseNeedsParentPath;
   const willCreateProjectPath =
     canSubmitBrowsePath &&
     !isBrowsePending &&
@@ -1758,14 +1770,13 @@ function OpenCommandPaletteDialog(props: {
                     )}
                     aria-label={`${submitActionLabel} (${addShortcutLabel})`}
                     disabled={
-                      relativePathNeedsActiveProject ||
-                      (isCloneDestinationStep && isRemoteProjectPending)
+                      !canSubmitBrowsePath || (isCloneDestinationStep && isRemoteProjectPending)
                     }
                     onMouseDown={(event) => {
                       event.preventDefault();
                     }}
                     onClick={() => {
-                      if (relativePathNeedsActiveProject) {
+                      if (!canSubmitBrowsePath) {
                         return;
                       }
                       if (isCloneDestinationStep) {

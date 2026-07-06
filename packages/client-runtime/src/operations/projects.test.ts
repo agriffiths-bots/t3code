@@ -12,6 +12,7 @@ import {
   buildProjectCreateCommand,
   findExistingAddProject,
   getAddProjectInitialQuery,
+  isAddProjectHomeRootQuery,
   resolveAddProjectPath,
   sortAddProjectProviderSources,
 } from "./projects.ts";
@@ -22,6 +23,14 @@ describe("add project shared logic", () => {
     expect(getAddProjectInitialQuery("")).toBe("~/");
     expect(getAddProjectInitialQuery("/work")).toBe("/work/");
     expect(getAddProjectInitialQuery("C:\\work")).toBe("C:\\work\\");
+  });
+
+  it("detects exact home-root inputs that need server browse resolution", () => {
+    expect(isAddProjectHomeRootQuery("~")).toBe(true);
+    expect(isAddProjectHomeRootQuery("~/")).toBe(true);
+    expect(isAddProjectHomeRootQuery("~\\")).toBe(true);
+    expect(isAddProjectHomeRootQuery("~/repo")).toBe(false);
+    expect(isAddProjectHomeRootQuery("/home/adam")).toBe(false);
   });
 
   it("rejects unsupported windows paths on non-windows environments", () => {

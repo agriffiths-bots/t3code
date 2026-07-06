@@ -6,6 +6,7 @@ import {
   buildProjectCreateCommand,
   findExistingAddProject,
   getAddProjectInitialQuery,
+  isAddProjectHomeRootQuery,
   resolveAddProjectPath,
   sortAddProjectProviderSources,
   type AddProjectRemoteSource,
@@ -631,6 +632,13 @@ function FolderBrowser(props: {
   const parentBrowsePath = getBrowseParentPath(browseDirectoryPath);
   const canBrowseUpPath = canNavigateUp(browseDirectoryPath);
 
+  useEffect(() => {
+    if (!browseState.data?.parentPath || !isAddProjectHomeRootQuery(props.pathInput)) {
+      return;
+    }
+    props.setPathInput(ensureBrowseDirectoryPath(browseState.data.parentPath));
+  }, [browseState.data?.parentPath, props.pathInput, props.setPathInput]);
+
   return (
     <>
       <SectionTitle>Browse folders</SectionTitle>
@@ -697,6 +705,10 @@ export function AddProjectLocalFolderScreen(props: { readonly environmentId?: st
   const submitPath = useCallback(async () => {
     if (!environment || isSubmitting) return;
     setError(null);
+    if (isAddProjectHomeRootQuery(pathInput)) {
+      setError("Wait for the home directory to finish loading.");
+      return;
+    }
     const resolved = resolveAddProjectPath({
       rawPath: pathInput,
       currentProjectCwd: null,
@@ -770,6 +782,10 @@ export function AddProjectDestinationScreen(props: {
   const submitPath = useCallback(async () => {
     if (!environment || !remoteUrl || isSubmitting) return;
     setError(null);
+    if (isAddProjectHomeRootQuery(pathInput)) {
+      setError("Wait for the home directory to finish loading.");
+      return;
+    }
     const resolved = resolveAddProjectPath({
       rawPath: pathInput,
       currentProjectCwd: null,
