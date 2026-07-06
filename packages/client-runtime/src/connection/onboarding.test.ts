@@ -157,7 +157,7 @@ describe("connection onboarding", () => {
     }),
   );
 
-  it.effect("clears stale desktop Cloudflare Access headers before plain pairing", () =>
+  it.effect("clears stale desktop Cloudflare Access transport before plain pairing", () =>
     Effect.gen(function* () {
       const calls: Array<{ readonly url: string; readonly init: RequestInit }> = [];
       const installedHeaders: Array<unknown> = [];
@@ -182,6 +182,7 @@ describe("connection onboarding", () => {
         {
           httpBaseUrl: "https://remote.example.test/",
           headers: {},
+          clearCookies: true,
         },
       ]);
     }),

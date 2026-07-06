@@ -135,6 +135,7 @@ const installCloudflareAccessTransport = Effect.fn(
       yield* installer.installRequestHeaders({
         httpBaseUrl,
         headers: {},
+        clearCookies: true,
       });
     }
     return;

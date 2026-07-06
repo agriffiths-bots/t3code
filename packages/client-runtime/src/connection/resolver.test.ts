@@ -329,7 +329,7 @@ describe("ConnectionResolver", () => {
     }),
   );
 
-  it.effect("clears stale desktop Cloudflare Access headers for plain bearer credentials", () =>
+  it.effect("clears stale desktop Cloudflare Access transport for plain bearer credentials", () =>
     Effect.gen(function* () {
       const installedHeaders = yield* Ref.make<ReadonlyArray<unknown>>([]);
       const target = new BearerConnectionTarget({
@@ -357,6 +357,7 @@ describe("ConnectionResolver", () => {
         {
           httpBaseUrl: ENDPOINT.httpBaseUrl,
           headers: {},
+          clearCookies: true,
         },
       ]);
     }),
