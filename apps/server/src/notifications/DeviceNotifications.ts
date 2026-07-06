@@ -2,6 +2,7 @@ import {
   IsoDateTime,
   NonNegativeInt,
   ServerDeviceNotification,
+  ServerNotificationEndpointError,
   type ServerNotificationAckAction,
   type ServerNotificationAckInput,
   type ServerNotificationAckResult,
@@ -33,6 +34,7 @@ import webPush, { type PushSubscription, WebPushError } from "web-push";
 import * as ServerSecretStore from "../auth/ServerSecretStore.ts";
 import * as ServerConfig from "../config.ts";
 import { writeFileStringAtomically } from "../atomicWrite.ts";
+import * as WebPushEndpointGuard from "./WebPushEndpointGuard.ts";
 
 const VAPID_KEYS_SECRET = "web-push-vapid-keys";
 const DEVICE_STORE_FILE = "notification-devices.json";
@@ -87,7 +89,10 @@ export class DeviceNotifications extends Context.Service<
     readonly getConfig: Effect.Effect<ServerNotificationConfig>;
     readonly registerDevice: (
       input: ServerNotificationRegisterInput,
-    ) => Effect.Effect<ServerNotificationRegisterResult, ServerNotificationPersistenceError>;
+    ) => Effect.Effect<
+      ServerNotificationRegisterResult,
+      ServerNotificationEndpointError | ServerNotificationPersistenceError
+    >;
     readonly ackNotification: (
       input: ServerNotificationAckInput,
       options?: { readonly requireAckToken?: boolean },
@@ -320,6 +325,7 @@ export const make = Effect.fn("DeviceNotifications.make")(function* () {
   const fileSystem = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
   const secrets = yield* ServerSecretStore.ServerSecretStore;
+  const endpointGuard = yield* WebPushEndpointGuard.WebPushEndpointGuard;
   const vapidKeys = yield* getOrCreateVapidKeys(secrets);
   webPush.setVapidDetails(VAPID_SUBJECT, vapidKeys.publicKey, vapidKeys.privateKey);
 
@@ -376,9 +382,21 @@ export const make = Effect.fn("DeviceNotifications.make")(function* () {
     if (subscription === null) {
       return false;
     }
+    const guardedEndpoint = yield* endpointGuard.prepare(subscription.endpoint).pipe(
+      Effect.catch((cause) =>
+        Effect.logWarning("Rejected unsafe web push endpoint before send", {
+          cause,
+          deviceId: device.deviceId,
+        }).pipe(Effect.as(null)),
+      ),
+    );
+    if (guardedEndpoint === null) {
+      return false;
+    }
     return yield* Effect.tryPromise({
       try: () =>
         webPush.sendNotification(subscription, payload, {
+          agent: guardedEndpoint.agent,
           TTL: 60 * 60 * 24,
           urgency: "high",
           topic: notificationTopic(notificationId),
@@ -412,6 +430,9 @@ export const make = Effect.fn("DeviceNotifications.make")(function* () {
   const registerDevice: DeviceNotifications["Service"]["registerDevice"] = Effect.fn(
     "DeviceNotifications.registerDevice",
   )(function* (input) {
+    if (input.subscription !== undefined) {
+      yield* endpointGuard.prepare(input.subscription.endpoint);
+    }
     const timestamp = yield* nowIso;
     yield* SynchronizedRef.modifyEffect(state, (current) => {
       const nextDevices = upsertDevice(current.devices, input, timestamp);

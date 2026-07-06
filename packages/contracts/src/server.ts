@@ -419,6 +419,14 @@ export const ServerWebPushSubscription = Schema.Struct({
 });
 export type ServerWebPushSubscription = typeof ServerWebPushSubscription.Type;
 
+export class ServerNotificationEndpointError extends Schema.TaggedErrorClass<ServerNotificationEndpointError>()(
+  "ServerNotificationEndpointError",
+  {
+    message: TrimmedNonEmptyString,
+    endpointHost: Schema.optional(TrimmedNonEmptyString),
+  },
+) {}
+
 export const ServerNotificationRegisterInput = Schema.Struct({
   deviceId: TrimmedNonEmptyString,
   deviceKind: ServerNotificationDeviceKind,
