@@ -220,6 +220,8 @@ import { ThreadErrorBanner } from "./chat/ThreadErrorBanner";
 import { ComposerBannerStack, type ComposerBannerStackItem } from "./chat/ComposerBannerStack";
 import {
   MAX_HIDDEN_MOUNTED_TERMINAL_THREADS,
+  ENVIRONMENT_UNAVAILABLE_BANNER_DEBOUNCE_MS,
+  buildThreadErrorDismissKey,
   buildExpiredTerminalContextToastCopy,
   buildLocalDraftThread,
   buildThreadTurnInterruptInput,
@@ -237,7 +239,9 @@ import {
   hasQueuedSubmissionBeenObservedByShell,
   readFileAsDataUrl,
   reconcileMountedTerminalThreadIds,
+  resolveVisibleServerThreadError,
   resolveSendEnvMode,
+  shouldShowEnvironmentUnavailableBanner,
   threadHasEstablishedProviderBinding,
   revokeBlobPreviewUrl,
   revokeUserMessagePreviewUrls,
@@ -1393,6 +1397,9 @@ function ChatViewContent(props: ChatViewProps) {
   const [localServerErrorsByThreadKey, setLocalServerErrorsByThreadKey] = useState<
     Record<string, string | null>
   >({});
+  const [dismissedServerThreadErrorKeys, setDismissedServerThreadErrorKeys] = useState<
+    Record<string, true>
+  >({});
   const [isConnecting, _setIsConnecting] = useState(false);
   const [isRevertingCheckpoint, setIsRevertingCheckpoint] = useState(false);
   const [maximizedRightPanelThreadKey, setMaximizedRightPanelThreadKey] = useState<string | null>(
@@ -1575,8 +1582,16 @@ function ChatViewContent(props: ChatViewProps) {
   );
   const isServerThread = routeKind === "server" && serverThread !== null;
   const activeThread = isServerThread ? serverThread : localDraftThread;
+  const serverThreadSessionError = sanitizeThreadErrorMessage(serverThread?.session?.lastError);
+  const serverThreadSessionErrorTurnId = serverThread?.latestTurn?.turnId ?? null;
   const threadError = isServerThread
-    ? (localServerError ?? serverThread?.session?.lastError ?? null)
+    ? resolveVisibleServerThreadError({
+        localError: localServerError,
+        sessionError: serverThreadSessionError,
+        dismissedSessionErrorKeys: dismissedServerThreadErrorKeys,
+        threadKey: routeThreadKey,
+        turnId: serverThreadSessionErrorTurnId,
+      })
     : localDraftError;
   const runtimeMode = composerRuntimeMode ?? activeThread?.runtimeMode ?? DEFAULT_RUNTIME_MODE;
   const interactionMode =
@@ -1793,6 +1808,71 @@ function ChatViewContent(props: ChatViewProps) {
       connection: activeEnvironment.connection,
     };
   }, [activeEnvironment, activeEnvironmentUnavailable, activeEnvironmentUnavailableLabel]);
+  const [environmentUnavailableSince, setEnvironmentUnavailableSince] = useState<{
+    readonly environmentId: EnvironmentId;
+    readonly sinceMs: number;
+  } | null>(null);
+  const [environmentUnavailableDebounceClock, setEnvironmentUnavailableDebounceClock] = useState(0);
+  useEffect(() => {
+    if (activeEnvironmentUnavailableState === null) {
+      setEnvironmentUnavailableSince(null);
+      return;
+    }
+
+    setEnvironmentUnavailableSince((existing) =>
+      existing?.environmentId === activeEnvironmentUnavailableState.environmentId
+        ? existing
+        : {
+            environmentId: activeEnvironmentUnavailableState.environmentId,
+            sinceMs: Date.now(),
+          },
+    );
+  }, [activeEnvironmentUnavailableState]);
+  useEffect(() => {
+    if (
+      activeEnvironmentUnavailableState === null ||
+      environmentUnavailableSince === null ||
+      environmentUnavailableSince.environmentId !== activeEnvironmentUnavailableState.environmentId
+    ) {
+      return;
+    }
+
+    const remainingMs =
+      ENVIRONMENT_UNAVAILABLE_BANNER_DEBOUNCE_MS -
+      (Date.now() - environmentUnavailableSince.sinceMs);
+    if (remainingMs <= 0) {
+      return;
+    }
+
+    const timeoutId = window.setTimeout(() => {
+      setEnvironmentUnavailableDebounceClock((clock) => clock + 1);
+    }, remainingMs);
+
+    return () => window.clearTimeout(timeoutId);
+  }, [activeEnvironmentUnavailableState, environmentUnavailableSince]);
+  const debouncedActiveEnvironmentUnavailableState =
+    useMemo<EnvironmentUnavailableState | null>(() => {
+      if (
+        activeEnvironmentUnavailableState === null ||
+        environmentUnavailableSince === null ||
+        environmentUnavailableSince.environmentId !==
+          activeEnvironmentUnavailableState.environmentId
+      ) {
+        return null;
+      }
+
+      return shouldShowEnvironmentUnavailableBanner({
+        connectionPhase: activeEnvironmentUnavailableState.connection.phase,
+        unavailableSinceMs: environmentUnavailableSince.sinceMs,
+        nowMs: Date.now(),
+      })
+        ? activeEnvironmentUnavailableState
+        : null;
+    }, [
+      activeEnvironmentUnavailableState,
+      environmentUnavailableDebounceClock,
+      environmentUnavailableSince,
+    ]);
   const handleReconnectActiveEnvironment = useCallback(
     async (environmentId: EnvironmentId) => {
       const result = await retryEnvironment(environmentId);
@@ -2019,15 +2099,15 @@ function ChatViewContent(props: ChatViewProps) {
       dismissedScheduleBannerKey === scheduleBanner.dismissKey);
   const composerBannerItems = useMemo<ComposerBannerStackItem[]>(() => {
     const items: ComposerBannerStackItem[] = [];
-    if (activeEnvironmentUnavailableState) {
-      const connection = activeEnvironmentUnavailableState.connection;
+    if (debouncedActiveEnvironmentUnavailableState) {
+      const connection = debouncedActiveEnvironmentUnavailableState.connection;
       const isReconnecting =
         connection.phase === "connecting" || connection.phase === "reconnecting";
       items.push({
-        id: `environment-unavailable:${activeEnvironmentUnavailableState.environmentId}`,
+        id: `environment-unavailable:${debouncedActiveEnvironmentUnavailableState.environmentId}`,
         variant: connection.phase === "error" ? "error" : "warning",
         icon: <WifiOffIcon />,
-        title: `${activeEnvironmentUnavailableState.label}: ${connectionStatusText(connection)}`,
+        title: `${debouncedActiveEnvironmentUnavailableState.label}: ${connectionStatusText(connection)}`,
         description:
           connection.error ??
           "Plain text messages queue through reloads. Thread setup and attached images retry only while this app stays open.",
@@ -2038,7 +2118,7 @@ function ChatViewContent(props: ChatViewProps) {
               disabled={isReconnecting}
               onClick={() =>
                 void handleReconnectActiveEnvironment(
-                  activeEnvironmentUnavailableState.environmentId,
+                  debouncedActiveEnvironmentUnavailableState.environmentId,
                 )
               }
             >
@@ -2092,7 +2172,7 @@ function ChatViewContent(props: ChatViewProps) {
     }
     return items;
   }, [
-    activeEnvironmentUnavailableState,
+    debouncedActiveEnvironmentUnavailableState,
     handleReconnectActiveEnvironment,
     navigate,
     scheduleBanner,
@@ -6102,7 +6182,21 @@ function ChatViewContent(props: ChatViewProps) {
         <ProviderStatusBanner status={activeProviderStatus} />
         <ThreadErrorBanner
           error={threadError}
-          onDismiss={() => setThreadError(activeThread.id, null)}
+          onDismiss={() => {
+            if (isServerThread) {
+              const dismissKey = buildThreadErrorDismissKey({
+                threadKey: routeThreadKey,
+                turnId: serverThreadSessionErrorTurnId,
+                error: threadError,
+              });
+              if (dismissKey !== null) {
+                setDismissedServerThreadErrorKeys((existing) =>
+                  existing[dismissKey] ? existing : { ...existing, [dismissKey]: true },
+                );
+              }
+            }
+            setThreadError(activeThread.id, null);
+          }}
         />
         {/* Main content area with optional plan sidebar */}
         <div className="flex min-h-0 min-w-0 flex-1">
@@ -6201,7 +6295,7 @@ function ChatViewContent(props: ChatViewProps) {
                       isSendBusy={isSendBusy}
                       isPreparingWorktree={isPreparingWorktree}
                       sessionOnlyDisconnectedSendReason={sessionOnlyDisconnectedSendReason}
-                      environmentUnavailable={activeEnvironmentUnavailableState}
+                      environmentUnavailable={debouncedActiveEnvironmentUnavailableState}
                       activePendingApproval={activePendingApproval}
                       pendingApprovals={pendingApprovals}
                       pendingUserInputs={pendingUserInputs}

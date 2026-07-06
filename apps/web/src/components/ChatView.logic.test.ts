@@ -3,8 +3,10 @@ import { describe, expect, it } from "vite-plus/test";
 
 import type { Thread } from "../types";
 import {
+  ENVIRONMENT_UNAVAILABLE_BANNER_DEBOUNCE_MS,
   MAX_HIDDEN_MOUNTED_PREVIEW_THREADS,
   MAX_HIDDEN_MOUNTED_TERMINAL_THREADS,
+  buildThreadErrorDismissKey,
   buildExpiredTerminalContextToastCopy,
   buildThreadTurnInterruptInput,
   createLocalDispatchSnapshot,
@@ -15,7 +17,9 @@ import {
   hasServerAcknowledgedLocalDispatch,
   reconcileMountedTerminalThreadIds,
   reconcileRetainedMountedThreadIds,
+  resolveVisibleServerThreadError,
   resolveSendEnvMode,
+  shouldShowEnvironmentUnavailableBanner,
   shouldWriteThreadErrorToCurrentServerThread,
   threadHasEstablishedProviderBinding,
 } from "./ChatView.logic";
@@ -206,6 +210,98 @@ describe("buildThreadTurnInterruptInput", () => {
     expect(buildThreadTurnInterruptInput(makeThread({ session: readySession }))).toEqual({
       threadId,
     });
+  });
+});
+
+describe("shouldShowEnvironmentUnavailableBanner", () => {
+  it("suppresses short reconnect blips", () => {
+    expect(
+      shouldShowEnvironmentUnavailableBanner({
+        connectionPhase: "reconnecting",
+        unavailableSinceMs: 1_000,
+        nowMs: 1_000 + ENVIRONMENT_UNAVAILABLE_BANNER_DEBOUNCE_MS - 1,
+      }),
+    ).toBe(false);
+  });
+
+  it("shows the banner once the connection has stayed unavailable", () => {
+    expect(
+      shouldShowEnvironmentUnavailableBanner({
+        connectionPhase: "reconnecting",
+        unavailableSinceMs: 1_000,
+        nowMs: 1_000 + ENVIRONMENT_UNAVAILABLE_BANNER_DEBOUNCE_MS,
+      }),
+    ).toBe(true);
+  });
+
+  it("clears immediately when the connection is back", () => {
+    expect(
+      shouldShowEnvironmentUnavailableBanner({
+        connectionPhase: "connected",
+        unavailableSinceMs: 1_000,
+        nowMs: 1_000 + ENVIRONMENT_UNAVAILABLE_BANNER_DEBOUNCE_MS,
+      }),
+    ).toBe(false);
+  });
+});
+
+describe("resolveVisibleServerThreadError", () => {
+  it("uses a dismissed key to hide a persisted server error for that turn", () => {
+    const turnId = TurnId.make("turn-dismissed");
+    const dismissKey = buildThreadErrorDismissKey({
+      threadKey: "environment-local:thread-1",
+      turnId,
+      error: "The turn was interrupted. Send your message again to retry.",
+    });
+
+    expect(dismissKey).not.toBeNull();
+    expect(
+      resolveVisibleServerThreadError({
+        localError: null,
+        sessionError: "The turn was interrupted. Send your message again to retry.",
+        dismissedSessionErrorKeys: { [dismissKey!]: true },
+        threadKey: "environment-local:thread-1",
+        turnId,
+      }),
+    ).toBeNull();
+  });
+
+  it("allows the same friendly interruption message to appear on a later turn", () => {
+    const dismissedTurnId = TurnId.make("turn-dismissed");
+    const laterTurnId = TurnId.make("turn-later");
+    const dismissKey = buildThreadErrorDismissKey({
+      threadKey: "environment-local:thread-1",
+      turnId: dismissedTurnId,
+      error: "The turn was interrupted. Send your message again to retry.",
+    });
+
+    expect(
+      resolveVisibleServerThreadError({
+        localError: null,
+        sessionError: "The turn was interrupted. Send your message again to retry.",
+        dismissedSessionErrorKeys: { [dismissKey!]: true },
+        threadKey: "environment-local:thread-1",
+        turnId: laterTurnId,
+      }),
+    ).toBe("The turn was interrupted. Send your message again to retry.");
+  });
+
+  it("keeps local errors visible even when a persisted session error was dismissed", () => {
+    const dismissKey = buildThreadErrorDismissKey({
+      threadKey: "environment-local:thread-1",
+      turnId: null,
+      error: "Persisted error",
+    });
+
+    expect(
+      resolveVisibleServerThreadError({
+        localError: "Select a base branch before sending.",
+        sessionError: "Persisted error",
+        dismissedSessionErrorKeys: { [dismissKey!]: true },
+        threadKey: "environment-local:thread-1",
+        turnId: null,
+      }),
+    ).toBe("Select a base branch before sending.");
   });
 });
 

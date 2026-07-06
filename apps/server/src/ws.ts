@@ -114,6 +114,7 @@ import * as PairingGrantStore from "./auth/PairingGrantStore.ts";
 import * as SessionStore from "./auth/SessionStore.ts";
 import { failEnvironmentAuthInvalid, failEnvironmentInternal } from "./auth/http.ts";
 import * as RelayClient from "@t3tools/shared/relayClient";
+import { makeServerConfigHeartbeatStream } from "./wsKeepalive.ts";
 const isOrchestrationDispatchCommandError = Schema.is(OrchestrationDispatchCommandError);
 const isOrchestrationScheduledTaskMutationError = Schema.is(
   OrchestrationScheduledTaskMutationError,
@@ -1569,8 +1570,8 @@ const makeWsRpcLayer = (
                 .pipe(Effect.ignoreCause({ log: true }), Effect.forkScoped);
 
               const liveUpdates = Stream.merge(
-                keybindingsUpdates,
-                Stream.merge(providerStatuses, settingsUpdates),
+                makeServerConfigHeartbeatStream(),
+                Stream.merge(keybindingsUpdates, Stream.merge(providerStatuses, settingsUpdates)),
               );
 
               return Stream.concat(

@@ -57,6 +57,8 @@ export function applyServerConfigProjection(
         },
         latestEvent: event,
       }));
+    case "heartbeat":
+      return current;
   }
 }
 

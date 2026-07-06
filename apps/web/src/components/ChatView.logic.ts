@@ -9,6 +9,7 @@ import {
   type ThreadId,
   type TurnId,
 } from "@t3tools/contracts";
+import type { EnvironmentConnectionPresentation } from "@t3tools/client-runtime/connection";
 import { type ChatMessage, type SessionPhase, type Thread } from "../types";
 import { type ComposerImageAttachment, type DraftThreadState } from "../composerDraftStore";
 import * as Schema from "effect/Schema";
@@ -24,6 +25,7 @@ import type { DraftThreadEnvMode } from "../composerDraftStore";
 export const LAST_INVOKED_SCRIPT_BY_PROJECT_KEY = "t3code:last-invoked-script-by-project";
 export const MAX_HIDDEN_MOUNTED_TERMINAL_THREADS = 10;
 export const MAX_HIDDEN_MOUNTED_PREVIEW_THREADS = 3;
+export const ENVIRONMENT_UNAVAILABLE_BANNER_DEBOUNCE_MS = 2_000;
 
 export const LastInvokedScriptByProjectSchema = Schema.Record(ProjectId, Schema.String);
 
@@ -72,6 +74,56 @@ export function shouldWriteThreadErrorToCurrentServerThread(input: {
     input.serverThread.environmentId === input.routeThreadRef.environmentId &&
     input.serverThread.id === input.targetThreadId,
   );
+}
+
+export function shouldShowEnvironmentUnavailableBanner(input: {
+  connectionPhase: EnvironmentConnectionPresentation["phase"];
+  unavailableSinceMs: number | null;
+  nowMs: number;
+  debounceMs?: number;
+}): boolean {
+  if (input.connectionPhase === "connected" || input.unavailableSinceMs === null) {
+    return false;
+  }
+
+  const debounceMs = input.debounceMs ?? ENVIRONMENT_UNAVAILABLE_BANNER_DEBOUNCE_MS;
+  return input.nowMs - input.unavailableSinceMs >= debounceMs;
+}
+
+export function buildThreadErrorDismissKey(input: {
+  threadKey: string;
+  turnId: TurnId | null | undefined;
+  error: string | null | undefined;
+}): string | null {
+  const error = input.error?.trim();
+  if (!error) {
+    return null;
+  }
+
+  return `${input.threadKey}:${input.turnId ?? "session"}:${error}`;
+}
+
+export function resolveVisibleServerThreadError(input: {
+  localError: string | null;
+  sessionError: string | null;
+  dismissedSessionErrorKeys: Readonly<Record<string, true | undefined>>;
+  threadKey: string;
+  turnId: TurnId | null | undefined;
+}): string | null {
+  if (input.localError !== null) {
+    return input.localError;
+  }
+
+  const dismissKey = buildThreadErrorDismissKey({
+    threadKey: input.threadKey,
+    turnId: input.turnId,
+    error: input.sessionError,
+  });
+  if (dismissKey !== null && input.dismissedSessionErrorKeys[dismissKey]) {
+    return null;
+  }
+
+  return input.sessionError;
 }
 
 export function buildThreadTurnInterruptInput(thread: Pick<Thread, "id" | "session">): {

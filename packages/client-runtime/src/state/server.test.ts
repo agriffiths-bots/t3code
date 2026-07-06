@@ -33,6 +33,21 @@ describe("server state projection", () => {
     expect(result.latestEvent.type).toBe("settingsUpdated");
   });
 
+  it("keeps websocket heartbeat frames out of the projected server config", () => {
+    const snapshot = applyServerConfigProjection(Option.none(), {
+      version: 1,
+      type: "snapshot",
+      config: CONFIG,
+    });
+
+    expect(
+      applyServerConfigProjection(snapshot, {
+        version: 1,
+        type: "heartbeat",
+      }),
+    ).toBe(snapshot);
+  });
+
   it("retains welcome when a ready event follows in the same stream chunk", () => {
     const welcome = {
       environment: {} as ServerLifecycleWelcomePayload["environment"],
