@@ -51,6 +51,7 @@ describe("projectPaths", () => {
     expect(isFilesystemBrowseQuery("..")).toBe(false);
     expect(isFilesystemBrowseQuery("./")).toBe(true);
     expect(isFilesystemBrowseQuery("../")).toBe(true);
+    expect(isFilesystemBrowseQuery("~")).toBe(true);
     expect(isFilesystemBrowseQuery("~/projects")).toBe(true);
     expect(isFilesystemBrowseQuery("..\\docs")).toBe(true);
     expect(isFilesystemBrowseQuery("notes")).toBe(false);
@@ -83,6 +84,7 @@ describe("projectPaths", () => {
   });
 
   it("navigates browse paths with matching separators", () => {
+    expect(appendBrowsePathSegment("~", "src")).toBe("~/src/");
     expect(appendBrowsePathSegment("/repo/", "src")).toBe("/repo/src/");
     expect(appendBrowsePathSegment("C:\\Work\\", "Repo")).toBe("C:\\Work\\Repo\\");
     expect(appendBrowsePathSegment("/home/user\\project/", "docs")).toBe(
@@ -99,6 +101,8 @@ describe("projectPaths", () => {
   it("detects browse path boundaries", () => {
     expect(hasTrailingPathSeparator("/repo/src/")).toBe(true);
     expect(hasTrailingPathSeparator("/repo/src")).toBe(false);
+    expect(getBrowseDirectoryPath("~")).toBe("~/");
+    expect(getBrowseLeafPathSegment("~")).toBe("");
     expect(getBrowseDirectoryPath("/repo/src")).toBe("/repo/");
     expect(getBrowseDirectoryPath("/repo/src/")).toBe("/repo/src/");
     expect(getBrowseLeafPathSegment("/repo/src")).toBe("src");

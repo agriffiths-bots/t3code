@@ -1,9 +1,15 @@
 import * as Schema from "effect/Schema";
 import { describe, expect, it } from "vite-plus/test";
 
-import { FilesystemBrowseError } from "./filesystem.ts";
+import { FilesystemBrowseError, FilesystemBrowseInput } from "./filesystem.ts";
 
 describe("FilesystemBrowseError", () => {
+  it("allows an empty browse path so the server can choose the default root", () => {
+    const decodeInput = Schema.decodeUnknownSync(FilesystemBrowseInput);
+
+    expect(decodeInput({ partialPath: "   " })).toEqual({ partialPath: "" });
+  });
+
   it("derives a stable message from browse context while retaining the cause", () => {
     const cause = new Error("sensitive filesystem detail");
     const error = new FilesystemBrowseError({

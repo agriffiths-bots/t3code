@@ -20,6 +20,7 @@ import type {
 import { HostProcessPlatform } from "@t3tools/shared/hostProcess";
 import { isExplicitRelativePath, isWindowsAbsolutePath } from "@t3tools/shared/path";
 
+import { expandHomePath } from "../pathExpansion.ts";
 import * as WorkspacePaths from "./WorkspacePaths.ts";
 import * as WorkspaceSearchIndex from "./WorkspaceSearchIndex.ts";
 
@@ -97,14 +98,9 @@ export class WorkspaceEntries extends Context.Service<
   }
 >()("t3/workspace/WorkspaceEntries") {}
 
-function expandHomePath(input: string, path: Path.Path): string {
-  if (input === "~") {
-    return NodeOS.homedir();
-  }
-  if (input.startsWith("~/") || input.startsWith("~\\")) {
-    return path.join(NodeOS.homedir(), input.slice(2));
-  }
-  return input;
+function resolveHomeAwarePath(input: string): string {
+  const trimmed = input.trim();
+  return trimmed.length === 0 ? NodeOS.homedir() : expandHomePath(trimmed);
 }
 
 const resolveBrowseTarget = Effect.fn("WorkspaceEntries.resolveBrowseTarget")(function* (
@@ -112,24 +108,26 @@ const resolveBrowseTarget = Effect.fn("WorkspaceEntries.resolveBrowseTarget")(fu
   path: Path.Path,
 ): Effect.fn.Return<string, WorkspaceEntriesBrowseError> {
   const platform = yield* HostProcessPlatform;
-  if (platform !== "win32" && isWindowsAbsolutePath(input.partialPath)) {
+  const partialPath = input.partialPath.trim();
+
+  if (platform !== "win32" && isWindowsAbsolutePath(partialPath)) {
     return yield* new WorkspaceEntriesWindowsPathUnsupportedError({
       cwd: input.cwd,
-      partialPath: input.partialPath,
+      partialPath,
       platform,
     });
   }
 
-  if (!isExplicitRelativePath(input.partialPath)) {
-    return path.resolve(expandHomePath(input.partialPath, path));
+  if (!isExplicitRelativePath(partialPath)) {
+    return path.resolve(resolveHomeAwarePath(partialPath));
   }
 
   if (!input.cwd) {
     return yield* new WorkspaceEntriesCurrentProjectRequiredError({
-      partialPath: input.partialPath,
+      partialPath,
     });
   }
-  return path.resolve(expandHomePath(input.cwd, path), input.partialPath);
+  return path.resolve(resolveHomeAwarePath(input.cwd), partialPath);
 });
 
 export const make = Effect.gen(function* () {
@@ -180,8 +178,10 @@ export const make = Effect.gen(function* () {
 
   const browse: WorkspaceEntries["Service"]["browse"] = Effect.fn("WorkspaceEntries.browse")(
     function* (input) {
+      const partialPath = input.partialPath.trim();
       const resolvedInputPath = yield* resolveBrowseTarget(input, path);
-      const endsWithSeparator = /[\\/]$/.test(input.partialPath) || input.partialPath === "~";
+      const endsWithSeparator =
+        partialPath.length === 0 || /[\\/]$/.test(partialPath) || partialPath === "~";
       const parentPath = endsWithSeparator ? resolvedInputPath : path.dirname(resolvedInputPath);
       const prefix = endsWithSeparator ? "" : path.basename(resolvedInputPath);
 
@@ -190,7 +190,7 @@ export const make = Effect.gen(function* () {
         catch: (cause) =>
           new WorkspaceEntriesReadDirectoryError({
             cwd: input.cwd,
-            partialPath: input.partialPath,
+            partialPath,
             parentPath,
             cause,
           }),

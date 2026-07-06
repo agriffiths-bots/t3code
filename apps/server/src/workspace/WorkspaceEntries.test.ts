@@ -359,6 +359,39 @@ it.layer(TestLayer, { excludeTestServices: true })("WorkspaceEntries", (it) => {
       }),
     );
 
+    it.effect("resolves home browse queries on the server side", () =>
+      Effect.gen(function* () {
+        const workspaceEntries = yield* WorkspaceEntries.WorkspaceEntries;
+        const path = yield* Path.Path;
+        const homeDir = yield* makeTempDir({ prefix: "t3code-workspace-browse-home-" });
+        const previousHome = process.env.HOME;
+        process.env.HOME = homeDir;
+        yield* writeTextFile(homeDir, "alpha/index.ts", "export {};\n");
+        yield* writeTextFile(homeDir, "beta/index.ts", "export {};\n");
+        yield* writeTextFile(homeDir, "home-file.txt", "ignore me");
+
+        try {
+          for (const partialPath of ["~", "~/", ""]) {
+            const result = yield* workspaceEntries.browse({ partialPath });
+
+            expect(result).toEqual({
+              parentPath: homeDir,
+              entries: [
+                { name: "alpha", fullPath: path.join(homeDir, "alpha") },
+                { name: "beta", fullPath: path.join(homeDir, "beta") },
+              ],
+            });
+          }
+        } finally {
+          if (previousHome === undefined) {
+            delete process.env.HOME;
+          } else {
+            process.env.HOME = previousHome;
+          }
+        }
+      }),
+    );
+
     it.effect("rejects relative paths without cwd", () =>
       Effect.gen(function* () {
         const workspaceEntries = yield* WorkspaceEntries.WorkspaceEntries;

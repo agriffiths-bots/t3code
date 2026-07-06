@@ -79,6 +79,27 @@ it.layer(TestLayer)("WorkspacePathsLive", (it) => {
       }),
     );
 
+    it.effect("expands a leading tilde against the server home directory", () =>
+      Effect.gen(function* () {
+        const workspacePaths = yield* WorkspacePaths.WorkspacePaths;
+        const homeDir = yield* makeTempDir();
+        const previousHome = process.env.HOME;
+        process.env.HOME = homeDir;
+
+        try {
+          const resolved = yield* workspacePaths.normalizeWorkspaceRoot("~/");
+
+          expect(resolved).toBe(homeDir);
+        } finally {
+          if (previousHome === undefined) {
+            delete process.env.HOME;
+          } else {
+            process.env.HOME = previousHome;
+          }
+        }
+      }),
+    );
+
     it.effect("rejects file paths", () =>
       Effect.gen(function* () {
         const workspacePaths = yield* WorkspacePaths.WorkspacePaths;

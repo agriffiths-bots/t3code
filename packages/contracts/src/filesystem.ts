@@ -1,10 +1,10 @@
 import * as Schema from "effect/Schema";
-import { TrimmedNonEmptyString } from "./baseSchemas.ts";
+import { TrimmedNonEmptyString, TrimmedString } from "./baseSchemas.ts";
 
 const FILESYSTEM_PATH_MAX_LENGTH = 512;
 
 export const FilesystemBrowseInput = Schema.Struct({
-  partialPath: TrimmedNonEmptyString.check(Schema.isMaxLength(FILESYSTEM_PATH_MAX_LENGTH)),
+  partialPath: TrimmedString.check(Schema.isMaxLength(FILESYSTEM_PATH_MAX_LENGTH)),
   cwd: Schema.optional(TrimmedNonEmptyString.check(Schema.isMaxLength(FILESYSTEM_PATH_MAX_LENGTH))),
 });
 export type FilesystemBrowseInput = typeof FilesystemBrowseInput.Type;
@@ -36,7 +36,7 @@ function decodedFilesystemBrowseErrorMessage(props: object): string | undefined 
 export class FilesystemBrowseError extends Schema.TaggedErrorClass<FilesystemBrowseError>()(
   "FilesystemBrowseError",
   {
-    partialPath: Schema.optional(TrimmedNonEmptyString),
+    partialPath: Schema.optional(TrimmedString),
     cwd: Schema.optional(TrimmedNonEmptyString),
     failure: Schema.optional(FilesystemBrowseFailure),
     parentPath: Schema.optional(TrimmedNonEmptyString),
