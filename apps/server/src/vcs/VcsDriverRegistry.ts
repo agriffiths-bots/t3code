@@ -17,6 +17,7 @@ const DETECTION_CACHE_TTL = Duration.seconds(2);
 export interface VcsDriverResolveInput {
   readonly cwd: string;
   readonly requestedKind?: VcsDriverKind | "auto";
+  readonly cache?: "allow" | "bypass";
 }
 
 export interface VcsDriverHandle {
@@ -122,6 +123,9 @@ export const make = Effect.gen(function* () {
   const detect: VcsDriverRegistry["Service"]["detect"] = Effect.fn("VcsDriverRegistry.detect")(
     function* (input) {
       const requestedKind = yield* projectConfig.resolveKind(input);
+      if (input.cache === "bypass") {
+        return yield* detectResolvedKind({ cwd: input.cwd, requestedKind });
+      }
       return yield* Cache.get(detectionCache, detectionCacheKey({ cwd: input.cwd, requestedKind }));
     },
   );

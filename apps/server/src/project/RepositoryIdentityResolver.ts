@@ -87,6 +87,18 @@ function buildRepositoryIdentity(input: {
   };
 }
 
+function buildLocalRepositoryIdentity(rootPath: string): RepositoryIdentity {
+  return {
+    canonicalKey: `git-local:${rootPath}`,
+    locator: {
+      source: "git-local",
+      rootPath,
+    },
+    rootPath,
+    displayName: rootPath,
+  };
+}
+
 const resolveRepositoryIdentityCacheKey = Effect.fn("RepositoryIdentityResolver.resolveCacheKey")(
   function* (cwd: string) {
     const processRunner = yield* ProcessRunner.ProcessRunner;
@@ -132,7 +144,9 @@ const resolveRepositoryIdentityFromCacheKey = Effect.fn(
   }
 
   const remote = pickPrimaryRemote(parseRemoteFetchUrls(remoteResult.value.stdout));
-  return remote ? buildRepositoryIdentity({ ...remote, rootPath: cacheKey }) : null;
+  return remote
+    ? buildRepositoryIdentity({ ...remote, rootPath: cacheKey })
+    : buildLocalRepositoryIdentity(cacheKey);
 });
 
 export const make = Effect.fn("RepositoryIdentityResolver.make")(function* (

@@ -50,7 +50,9 @@ import Migration0035 from "./Migrations/035_ScheduledTasks.ts";
 import Migration0036 from "./Migrations/036_PendingDispatches.ts";
 import Migration0037 from "./Migrations/037_PendingDispatchesCommandId.ts";
 import Migration0038 from "./Migrations/038_ScheduledTasksModelSelection.ts";
-import Migration0039 from "./Migrations/039_BackfillProjectionThreadPromptRecency.ts";
+import Migration0039 from "./Migrations/039_ProjectionThreadWorktreeRemovable.ts";
+import Migration0040 from "./Migrations/040_BackfillProjectionThreadPromptRecency.ts";
+import Migration0041 from "./Migrations/041_EnsureProjectionThreadWorktreeRemovable.ts";
 
 /**
  * Migration loader with all migrations defined inline.
@@ -100,7 +102,9 @@ export const migrationEntries = [
   [36, "PendingDispatches", Migration0036],
   [37, "PendingDispatchesCommandId", Migration0037],
   [38, "ScheduledTasksModelSelection", Migration0038],
-  [39, "BackfillProjectionThreadPromptRecency", Migration0039],
+  [39, "ProjectionThreadWorktreeRemovable", Migration0039],
+  [40, "BackfillProjectionThreadPromptRecency", Migration0040],
+  [41, "EnsureProjectionThreadWorktreeRemovable", Migration0041],
 ] as const;
 
 export const makeMigrationLoader = (throughId?: number) =>

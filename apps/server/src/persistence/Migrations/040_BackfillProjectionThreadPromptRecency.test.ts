@@ -8,12 +8,12 @@ import * as NodeSqliteClient from "../NodeSqliteClient.ts";
 
 const layer = it.layer(Layer.mergeAll(NodeSqliteClient.layerMemory()));
 
-layer("039_BackfillProjectionThreadPromptRecency", (it) => {
+layer("040_BackfillProjectionThreadPromptRecency", (it) => {
   it.effect("backfills latest prompt timestamps from sub-agent wake system messages", () =>
     Effect.gen(function* () {
       const sql = yield* SqlClient.SqlClient;
 
-      yield* runMigrations({ toMigrationInclusive: 38 });
+      yield* runMigrations({ toMigrationInclusive: 39 });
 
       yield* sql`
         INSERT INTO projection_threads (
@@ -132,7 +132,7 @@ layer("039_BackfillProjectionThreadPromptRecency", (it) => {
           )
       `;
 
-      yield* runMigrations({ toMigrationInclusive: 39 });
+      yield* runMigrations({ toMigrationInclusive: 40 });
 
       const rows = yield* sql<{
         readonly threadId: string;

@@ -11,12 +11,15 @@ The model emits a self-contained visual as a fenced code block tagged `genui`:
 
 ````markdown
 ```genui
-<style>.bar{fill:#4338ca}</style>
-<svg viewBox="0 0 120 60" width="100%">
-  <rect class="bar" x="8" y="10" width="24" height="40" rx="4" />
-  <rect class="bar" x="48" y="24" width="24" height="26" rx="4" />
-  <rect class="bar" x="88" y="4" width="24" height="46" rx="4" />
-</svg>
+<style>
+  .chart{display:flex;align-items:end;gap:12px;height:96px;padding:12px}
+  .bar{width:28px;border-radius:6px 6px 0 0;background:#4338ca}
+</style>
+<div class="chart">
+  <div class="bar" style="height:72px"></div>
+  <div class="bar" style="height:48px"></div>
+  <div class="bar" style="height:88px"></div>
+</div>
 ```
 ````
 

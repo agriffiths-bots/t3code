@@ -90,6 +90,20 @@ const HANDLED_TURN_START_KEY_TTL = Duration.minutes(30);
 const DEFAULT_RUNTIME_MODE: RuntimeMode = "full-access";
 const DEFAULT_THREAD_TITLE = "New thread";
 
+function normalizeWorktreeIdentityPath(value: string | null | undefined): string | null {
+  const trimmed = value?.trim();
+  if (!trimmed) return null;
+  const normalized = trimmed.replace(/[\\/]+$/, "");
+  return normalized.length > 0 ? normalized : trimmed;
+}
+
+function worktreeIdentityPath(input: {
+  readonly worktreePath: string | null | undefined;
+  readonly worktreeRemovalPath?: string | null | undefined;
+}): string | null {
+  return normalizeWorktreeIdentityPath(input.worktreeRemovalPath ?? input.worktreePath);
+}
+
 export function providerErrorLabel(value: string | undefined): string {
   const normalized = value?.trim();
   return normalized && normalized.length > 0 ? normalized : "unknown";
@@ -737,6 +751,23 @@ const make = Effect.gen(function* () {
     const cwd = input.worktreePath;
     const attachments = input.attachments ?? [];
     yield* Effect.gen(function* () {
+      const snapshot = yield* projectionSnapshotQuery.getSnapshot();
+      const currentThread = snapshot.threads.find((thread) => thread.id === input.threadId);
+      const currentWorktreeIdentity = worktreeIdentityPath({
+        worktreePath: input.worktreePath,
+        worktreeRemovalPath: currentThread?.worktreeRemovalPath,
+      });
+      if (
+        snapshot.threads.some(
+          (thread) =>
+            thread.id !== input.threadId &&
+            currentWorktreeIdentity !== null &&
+            worktreeIdentityPath(thread) === currentWorktreeIdentity,
+        )
+      ) {
+        return;
+      }
+
       const { textGenerationModelSelection: modelSelection } =
         yield* serverSettingsService.getSettings;
 

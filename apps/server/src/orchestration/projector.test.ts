@@ -892,10 +892,32 @@ describe("orchestration projector", () => {
         }),
       );
 
-      const afterUnchangedOldTurn = yield* projectEvent(
+      const afterNoticeMessage = yield* projectEvent(
         afterWakeMessage,
         makeEvent({
           sequence: 4,
+          type: "thread.message-sent",
+          aggregateKind: "thread",
+          aggregateId: "thread-1",
+          occurredAt: "2026-02-23T10:00:02.500Z",
+          commandId: "cmd-system-notice",
+          payload: {
+            threadId: "thread-1",
+            messageId: "system-notice-1",
+            role: "system",
+            text: "System maintenance",
+            turnId: null,
+            streaming: false,
+            createdAt: "2026-02-23T10:00:02.500Z",
+            updatedAt: "2026-02-23T10:00:02.500Z",
+          },
+        }),
+      );
+
+      const afterUnchangedOldTurn = yield* projectEvent(
+        afterNoticeMessage,
+        makeEvent({
+          sequence: 5,
           type: "thread.session-set",
           aggregateKind: "thread",
           aggregateId: "thread-1",
@@ -920,7 +942,7 @@ describe("orchestration projector", () => {
       const afterNewTurn = yield* projectEvent(
         afterUnchangedOldTurn,
         makeEvent({
-          sequence: 5,
+          sequence: 6,
           type: "thread.session-set",
           aggregateKind: "thread",
           aggregateId: "thread-1",
@@ -940,7 +962,13 @@ describe("orchestration projector", () => {
           },
         }),
       );
-      expect(afterNewTurn.threads[0]?.messages[0]?.turnId).toBe("turn-new");
+      expect(
+        afterNewTurn.threads[0]?.messages.find((message) => message.id === "system-wake-1")?.turnId,
+      ).toBe("turn-new");
+      expect(
+        afterNewTurn.threads[0]?.messages.find((message) => message.id === "system-notice-1")
+          ?.turnId,
+      ).toBeNull();
     }),
   );
 

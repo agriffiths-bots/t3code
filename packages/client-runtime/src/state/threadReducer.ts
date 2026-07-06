@@ -566,7 +566,8 @@ function bindLatestPendingPromptMessageToTurn(
     if (
       message &&
       message.turnId === null &&
-      (message.role === "user" || message.role === "system")
+      (message.role === "user" ||
+        (message.role === "system" && isSubAgentWakeSystemMessageText(message.text)))
     ) {
       pendingIndex = index;
       break;

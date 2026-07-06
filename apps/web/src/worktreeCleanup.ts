@@ -8,9 +8,26 @@ function normalizeWorktreePath(path: string | null): string | null {
   return trimmed;
 }
 
+function isSameOrNestedPath(candidate: string | null, root: string): boolean {
+  if (!candidate) {
+    return false;
+  }
+  const normalizedCandidate = candidate.replace(/\\/g, "/").replace(/\/+$/, "");
+  const normalizedRoot = root.replace(/\\/g, "/").replace(/\/+$/, "");
+  return (
+    normalizedCandidate === normalizedRoot ||
+    normalizedCandidate.startsWith(
+      normalizedRoot.endsWith("/") ? normalizedRoot : `${normalizedRoot}/`,
+    )
+  );
+}
+
 export function getOrphanedWorktreePathForThread(
-  threads: ReadonlyArray<Pick<ThreadShell, "id" | "worktreePath">>,
+  threads: ReadonlyArray<
+    Pick<ThreadShell, "id" | "worktreePath" | "worktreeRemovable" | "worktreeRemovalPath">
+  >,
   threadId: ThreadShell["id"],
+  projects: ReadonlyArray<{ readonly workspaceRoot: string }> = [],
 ): string | null {
   const targetThread = threads.find((thread) => thread.id === threadId);
   if (!targetThread) {
@@ -21,15 +38,37 @@ export function getOrphanedWorktreePathForThread(
   if (!targetWorktreePath) {
     return null;
   }
+  if (targetThread.worktreeRemovable !== true) {
+    return null;
+  }
+  const targetRemovalPath = normalizeWorktreePath(
+    targetThread.worktreeRemovalPath ?? targetWorktreePath,
+  );
+  if (!targetRemovalPath) {
+    return null;
+  }
 
   const isShared = threads.some((thread) => {
     if (thread.id === threadId) {
       return false;
     }
-    return normalizeWorktreePath(thread.worktreePath) === targetWorktreePath;
+    const threadWorktreePath = normalizeWorktreePath(thread.worktreePath);
+    return (
+      threadWorktreePath === targetWorktreePath ||
+      normalizeWorktreePath(thread.worktreeRemovalPath ?? thread.worktreePath) ===
+        targetRemovalPath ||
+      isSameOrNestedPath(threadWorktreePath, targetRemovalPath)
+    );
   });
+  if (isShared) {
+    return null;
+  }
 
-  return isShared ? null : targetWorktreePath;
+  const isProjectRoot = projects.some((project) =>
+    isSameOrNestedPath(normalizeWorktreePath(project.workspaceRoot), targetRemovalPath),
+  );
+
+  return isProjectRoot ? null : targetRemovalPath;
 }
 
 export function formatWorktreePathForDisplay(worktreePath: string): string {

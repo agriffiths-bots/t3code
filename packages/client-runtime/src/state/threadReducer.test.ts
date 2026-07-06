@@ -453,6 +453,49 @@ describe("applyThreadDetailEvent", () => {
       }
     });
 
+    it("does not bind ordinary pending system notices to the running turn", () => {
+      const threadWithSystemNotice: OrchestrationThread = {
+        ...baseThread,
+        messages: [
+          {
+            id: MessageId.make("system-notice-1"),
+            role: "system",
+            text: "System maintenance",
+            turnId: null,
+            streaming: false,
+            createdAt: "2026-04-01T07:59:00.000Z",
+            updatedAt: "2026-04-01T07:59:00.000Z",
+          },
+        ],
+      };
+
+      const result = applyThreadDetailEvent(threadWithSystemNotice, {
+        ...baseEventFields,
+        sequence: 9,
+        occurredAt: "2026-04-01T08:00:00.000Z",
+        aggregateKind: "thread",
+        aggregateId: ThreadId.make("thread-1"),
+        type: "thread.session-set",
+        payload: {
+          threadId: ThreadId.make("thread-1"),
+          session: {
+            threadId: ThreadId.make("thread-1"),
+            status: "running",
+            providerName: "codex",
+            runtimeMode: "full-access",
+            activeTurnId: TurnId.make("turn-1"),
+            lastError: null,
+            updatedAt: "2026-04-01T08:00:00.000Z",
+          },
+        },
+      });
+
+      expect(result.kind).toBe("updated");
+      if (result.kind === "updated") {
+        expect(result.thread.messages[0]?.turnId).toBeNull();
+      }
+    });
+
     it("does not bind a pending system wake when the active turn has not changed", () => {
       const threadWithActiveTurnAndSystemWake: OrchestrationThread = {
         ...baseThread,

@@ -140,6 +140,23 @@ export function buildThreadTurnInterruptInput(thread: Pick<Thread, "id" | "sessi
   };
 }
 
+function normalizeWorkspacePath(path: string | null | undefined): string | null {
+  const trimmed = path?.trim();
+  if (!trimmed) return null;
+  return trimmed.replace(/\\/g, "/").replace(/\/+$/, "");
+}
+
+export function workspaceRelativePathFromRepositoryRoot(
+  repositoryRoot: string | null | undefined,
+  workspaceRoot: string,
+): string | null {
+  const root = normalizeWorkspacePath(repositoryRoot);
+  const workspace = normalizeWorkspacePath(workspaceRoot);
+  if (!root || !workspace || root === workspace) return null;
+  const rootPrefix = root.endsWith("/") ? root : `${root}/`;
+  return workspace.startsWith(rootPrefix) ? workspace.slice(rootPrefix.length) : null;
+}
+
 export function reconcileMountedTerminalThreadIds(input: {
   currentThreadIds: ReadonlyArray<string>;
   openThreadIds: ReadonlyArray<string>;

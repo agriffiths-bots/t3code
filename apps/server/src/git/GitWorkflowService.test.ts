@@ -1,6 +1,8 @@
 import { assert, describe, expect, it, vi } from "@effect/vitest";
+import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
 
 import { VcsRepositoryDetectionError } from "@t3tools/contracts";
 
@@ -134,6 +136,68 @@ describe("GitWorkflowService", () => {
       ),
     ),
   );
+
+  it.effect("resolves createWorktree against the requested cwd", () => {
+    const gitHandle: VcsDriverRegistry.VcsDriverHandle = {
+      kind: "git",
+      repository: {
+        kind: "git",
+        rootPath: "/project/repo",
+        metadataPath: "/project/repo/.git",
+        freshness: {
+          source: "live-local",
+          observedAt: DateTime.makeUnsafe("1970-01-01T00:00:00.000Z"),
+          expiresAt: Option.none(),
+        },
+      },
+      driver: {} as VcsDriverRegistry.VcsDriverHandle["driver"],
+    };
+    const resolve = vi.fn((_input: VcsDriverRegistry.VcsDriverResolveInput) =>
+      Effect.succeed(gitHandle),
+    );
+    const createWorktree = vi.fn(
+      (input: Parameters<GitVcsDriver.GitVcsDriver["Service"]["createWorktree"]>[0]) =>
+        Effect.succeed({
+          worktree: {
+            path: "/worktrees/t3code/test-branch",
+            refName: input.newRefName ?? input.refName,
+          },
+        }),
+    );
+    const testLayer = GitWorkflowService.layer.pipe(
+      Layer.provide(
+        Layer.mock(VcsDriverRegistry.VcsDriverRegistry)({
+          resolve,
+        }),
+      ),
+      Layer.provide(
+        Layer.mock(GitVcsDriver.GitVcsDriver)({
+          createWorktree,
+        }),
+      ),
+      Layer.provide(Layer.mock(GitManager.GitManager)({})),
+    );
+
+    return Effect.gen(function* () {
+      const workflow = yield* GitWorkflowService.GitWorkflowService;
+      yield* workflow.createWorktree({
+        cwd: "/project/repo",
+        refName: "main",
+        newRefName: "t3code/test-branch",
+        baseRefName: "main",
+        path: null,
+      });
+
+      expect(resolve).toHaveBeenCalledWith({ cwd: "/project/repo" });
+      expect(createWorktree).toHaveBeenCalledWith({
+        cwd: "/project/repo",
+        refName: "main",
+        newRefName: "t3code/test-branch",
+        baseRefName: "main",
+        path: null,
+      });
+    }).pipe(Effect.provide(testLayer));
+  });
 
   it.effect("structures workflow detection failures without exposing upstream details", () => {
     const cause = new VcsRepositoryDetectionError({

@@ -19,7 +19,12 @@ import { vcsEnvironment } from "../state/vcs";
 import { useNewThreadHandler } from "./useHandleNewThread";
 import { refreshArchivedThreadsForEnvironment } from "../lib/archivedThreadsState";
 import { readLocalApi } from "../localApi";
-import { readEnvironmentThreadRefs, readProject, readThreadShell } from "../state/entities";
+import {
+  readEnvironmentProjectRefs,
+  readEnvironmentThreadRefs,
+  readProject,
+  readThreadShell,
+} from "../state/entities";
 import { useTerminalUiStateStore } from "../terminalUiStateStore";
 import { buildThreadRouteParams, resolveThreadRouteRef } from "../threadRoutes";
 import { formatWorktreePathForDisplay, getOrphanedWorktreePathForThread } from "../worktreeCleanup";
@@ -167,6 +172,10 @@ export function useThreadActions() {
         const shell = readThreadShell(ref);
         return shell === null ? [] : [shell];
       });
+      const projects = readEnvironmentProjectRefs(threadRef.environmentId).flatMap((ref) => {
+        const project = readProject(ref);
+        return project === null ? [] : [project];
+      });
       const threadProject = readProject({
         environmentId: threadRef.environmentId,
         projectId: thread.projectId,
@@ -187,6 +196,7 @@ export function useThreadActions() {
       const orphanedWorktreePath = getOrphanedWorktreePathForThread(
         survivingThreads,
         threadRef.threadId,
+        projects,
       );
       const displayWorktreePath = orphanedWorktreePath
         ? formatWorktreePathForDisplay(orphanedWorktreePath)

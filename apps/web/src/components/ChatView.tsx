@@ -246,6 +246,7 @@ import {
   revokeBlobPreviewUrl,
   revokeUserMessagePreviewUrls,
   waitForStartedServerThread,
+  workspaceRelativePathFromRepositoryRoot,
 } from "./ChatView.logic";
 import { useLocalStorage } from "~/hooks/useLocalStorage";
 import { useComposerHandleContext } from "../composerHandleContext";
@@ -5053,6 +5054,10 @@ function ChatViewContent(props: ChatViewProps) {
       return;
     }
 
+    const worktreeWorkspaceRelativePath = workspaceRelativePathFromRepositoryRoot(
+      activeProject.repositoryIdentity?.rootPath,
+      activeProject.workspaceRoot,
+    );
     const bootstrap = shouldAttachBootstrap
       ? {
           ...(isLocalDraftThread
@@ -5065,6 +5070,8 @@ function ChatViewContent(props: ChatViewProps) {
                   interactionMode,
                   branch: activeThreadBranch,
                   worktreePath: activeThread.worktreePath,
+                  worktreeRemovable: baseBranchForWorktree !== null,
+                  worktreeRemovalPath: null,
                   createdAt: activeThread.createdAt,
                 },
               }
@@ -5076,6 +5083,9 @@ function ChatViewContent(props: ChatViewProps) {
                   baseBranch: baseBranchForWorktree,
                   branch: buildTemporaryWorktreeBranchName(randomHex),
                   ...(startFromOrigin ? { startFromOrigin: true } : {}),
+                  ...(worktreeWorkspaceRelativePath
+                    ? { workspaceRelativePath: worktreeWorkspaceRelativePath }
+                    : {}),
                 },
                 runSetupScript: true,
               }

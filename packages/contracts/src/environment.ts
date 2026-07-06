@@ -43,11 +43,17 @@ export const EnvironmentConnectionState = Schema.Literals([
 ]);
 export type EnvironmentConnectionState = typeof EnvironmentConnectionState.Type;
 
-export const RepositoryIdentityLocator = Schema.Struct({
-  source: Schema.Literal("git-remote"),
-  remoteName: TrimmedNonEmptyString,
-  remoteUrl: TrimmedNonEmptyString,
-});
+export const RepositoryIdentityLocator = Schema.Union([
+  Schema.Struct({
+    source: Schema.Literal("git-remote"),
+    remoteName: TrimmedNonEmptyString,
+    remoteUrl: TrimmedNonEmptyString,
+  }),
+  Schema.Struct({
+    source: Schema.Literal("git-local"),
+    rootPath: TrimmedNonEmptyString,
+  }),
+]);
 export type RepositoryIdentityLocator = typeof RepositoryIdentityLocator.Type;
 
 export const RepositoryIdentity = Schema.Struct({
