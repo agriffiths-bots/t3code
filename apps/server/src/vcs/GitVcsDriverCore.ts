@@ -219,6 +219,22 @@ function parseForEachRefEntries(stdout: string): ReadonlyArray<GitRefListEntry> 
   });
 }
 
+function parseBranchListEntries(stdout: string): ReadonlyArray<GitRefListEntry> {
+  return Arr.filterMap(stdout.split("\n"), (line) => {
+    let branchName = line.trim();
+    if (branchName.startsWith("*") || branchName.startsWith("+")) {
+      branchName = branchName.slice(1).trim();
+    }
+    if (!branchName || branchName.startsWith("(")) {
+      return Result.failVoid;
+    }
+    return Result.succeed({
+      fullName: `refs/heads/${branchName}`,
+      lastCommit: 0,
+    });
+  });
+}
+
 function splitNullSeparatedPaths(input: string, truncated: boolean): string[] {
   const parts = input.split("\0");
   if (parts.length === 0) return [];
@@ -1979,6 +1995,7 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
         }),
       );
 
+      let localRefEntries: ReadonlyArray<GitRefListEntry>;
       if (localRefListResult.exitCode !== 0) {
         const stderr = localRefListResult.stderr.trim();
         if (isNonRepositoryGitStderr(stderr)) {
@@ -1990,17 +2007,46 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
             totalCount: 0,
           };
         }
-        return yield* new GitCommandError({
-          ...gitCommandContext({
-            operation: "GitVcsDriver.listRefs",
-            cwd: input.cwd,
-            args: ["for-each-ref", `--format=${refListFormat}`, "refs/heads"],
-          }),
-          detail: "Git local ref listing failed.",
-          exitCode: localRefListResult.exitCode,
-          stdoutLength: localRefListResult.stdout.length,
-          stderrLength: localRefListResult.stderr.length,
-        });
+
+        yield* Effect.logWarning(
+          `GitVcsDriver.listRefs: local ref lookup returned code ${localRefListResult.exitCode} for ${input.cwd}: ${stderr}. Falling back to git branch.`,
+        );
+
+        const fallbackLocalBranchResult = yield* executeGit(
+          "GitVcsDriver.listRefs.localBranchFallback",
+          input.cwd,
+          ["branch", "--no-color", "--no-column"],
+          {
+            timeoutMs: 10_000,
+            allowNonZeroExit: true,
+          },
+        );
+        if (fallbackLocalBranchResult.exitCode !== 0) {
+          const fallbackStderr = fallbackLocalBranchResult.stderr.trim();
+          if (isNonRepositoryGitStderr(fallbackStderr)) {
+            return {
+              refs: [],
+              isRepo: false,
+              hasPrimaryRemote: false,
+              nextCursor: null,
+              totalCount: 0,
+            };
+          }
+          return yield* new GitCommandError({
+            ...gitCommandContext({
+              operation: "GitVcsDriver.listRefs",
+              cwd: input.cwd,
+              args: ["for-each-ref", `--format=${refListFormat}`, "refs/heads"],
+            }),
+            detail: "Git local ref listing failed.",
+            exitCode: localRefListResult.exitCode,
+            stdoutLength: localRefListResult.stdout.length,
+            stderrLength: localRefListResult.stderr.length,
+          });
+        }
+        localRefEntries = parseBranchListEntries(fallbackLocalBranchResult.stdout);
+      } else {
+        localRefEntries = parseForEachRefEntries(localRefListResult.stdout);
       }
 
       const remoteRefListResultEffect = executeGit(
@@ -2159,7 +2205,6 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
         flushWorktree();
       }
 
-      const localRefEntries = parseForEachRefEntries(localRefListResult.stdout);
       const remoteRefEntries =
         remoteRefListResult.exitCode === 0
           ? parseForEachRefEntries(remoteRefListResult.stdout)

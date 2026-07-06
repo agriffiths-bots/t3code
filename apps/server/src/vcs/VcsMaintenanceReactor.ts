@@ -22,9 +22,10 @@ import { MAX_THREAD_CHECKPOINTS } from "../orchestration/checkpointRetention.ts"
 import { OrchestrationEngineService } from "../orchestration/Services/OrchestrationEngine.ts";
 import * as GitVcsDriver from "./GitVcsDriver.ts";
 
-// The projection exposes the newest positive-turn checkpoints; pruning also
-// preserves turn 0 as the thread baseline when that ref exists.
-export const CHECKPOINT_REFS_KEEP_PER_THREAD = MAX_THREAD_CHECKPOINTS + 1;
+// The projection exposes the newest positive-turn checkpoints. Pruning also
+// preserves turn 0 as the thread baseline and one predecessor for boundary
+// per-turn diffs when those refs exist.
+export const CHECKPOINT_REFS_KEEP_PER_THREAD = MAX_THREAD_CHECKPOINTS + 2;
 const MAINTENANCE_BOOT_DELAY = Duration.seconds(10);
 const MAINTENANCE_SWEEP_INTERVAL = Duration.minutes(30);
 const STOPPED_WORKTREE_REAP_AGE_MS = Duration.toMillis(Duration.hours(12));
@@ -102,6 +103,10 @@ function isRowActive(row: WorktreeMaintenanceRow): boolean {
   const hasLiveSessionStatus =
     (row.sessionStatus !== null && !REAPABLE_SESSION_STATUSES.has(row.sessionStatus)) ||
     (row.runtimeStatus !== null && !REAPABLE_SESSION_STATUSES.has(row.runtimeStatus));
+
+  if (row.archivedAt !== null) {
+    return hasLiveSessionStatus;
+  }
 
   return hasLiveSessionStatus || row.pendingApprovalCount > 0 || row.pendingUserInputCount > 0;
 }
@@ -256,8 +261,19 @@ export function isWorktreePathListed(porcelainOutput: string, worktreePath: stri
 export function shouldRetainWorktreeMetadataAfterListFailure(input: {
   readonly projectRootExists: boolean;
   readonly worktreePathExists: boolean;
+  readonly detail?: string;
 }): boolean {
-  return input.projectRootExists || input.worktreePathExists;
+  if (input.worktreePathExists) {
+    return true;
+  }
+  if (!input.projectRootExists) {
+    return false;
+  }
+  return !isNonRepositoryGitDetail(input.detail ?? "");
+}
+
+function isNonRepositoryGitDetail(detail: string): boolean {
+  return detail.toLowerCase().includes("not a git repository");
 }
 
 export interface VcsMaintenanceReactorShape {
@@ -382,6 +398,7 @@ const make = Effect.gen(function* () {
       return shouldRetainWorktreeMetadataAfterListFailure({
         projectRootExists,
         worktreePathExists,
+        detail,
       });
     });
 

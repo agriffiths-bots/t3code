@@ -31,8 +31,8 @@ function row(
 }
 
 describe("selectStaleWorktreeReapCandidates", () => {
-  it("keeps one extra physical checkpoint ref for the turn zero baseline", () => {
-    expect(CHECKPOINT_REFS_KEEP_PER_THREAD).toBe(MAX_THREAD_CHECKPOINTS + 1);
+  it("keeps physical refs for the turn zero baseline and boundary predecessor", () => {
+    expect(CHECKPOINT_REFS_KEEP_PER_THREAD).toBe(MAX_THREAD_CHECKPOINTS + 2);
   });
 
   it("selects old removable stopped worktrees", () => {
@@ -139,6 +139,34 @@ describe("selectStaleWorktreeReapCandidates", () => {
         threadIds: ["deleted-pending"],
         projectCwd: "/repo",
         path: "/worktrees/deleted-pending",
+      },
+    ]);
+  });
+
+  it("ignores stale pending counters on archived threads", () => {
+    expect(
+      selectStaleWorktreeReapCandidates(
+        [
+          row({
+            threadId: "archived-pending",
+            archivedAt: "2026-07-06T11:30:00.000Z",
+            updatedAt: "2026-07-06T11:30:00.000Z",
+            pendingApprovalCount: 1,
+            pendingUserInputCount: 1,
+          }),
+        ],
+        ["/repo"],
+        NOW,
+        {
+          archivedAgeMs: 20 * 60_000,
+        },
+      ),
+    ).toEqual([
+      {
+        threadId: "archived-pending",
+        threadIds: ["archived-pending"],
+        projectCwd: "/repo",
+        path: "/worktrees/archived-pending",
       },
     ]);
   });
@@ -352,6 +380,20 @@ describe("worktree registration helpers", () => {
       shouldRetainWorktreeMetadataAfterListFailure({
         projectRootExists: false,
         worktreePathExists: true,
+      }),
+    ).toBe(true);
+    expect(
+      shouldRetainWorktreeMetadataAfterListFailure({
+        projectRootExists: true,
+        worktreePathExists: false,
+        detail: "fatal: not a git repository",
+      }),
+    ).toBe(false);
+    expect(
+      shouldRetainWorktreeMetadataAfterListFailure({
+        projectRootExists: true,
+        worktreePathExists: false,
+        detail: "permission denied",
       }),
     ).toBe(true);
   });

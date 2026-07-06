@@ -60,6 +60,8 @@ import {
   type ProjectionSnapshotQueryShape,
 } from "../Services/ProjectionSnapshotQuery.ts";
 
+const CHECKPOINT_DIFF_CONTEXT_KEEP_PER_THREAD = MAX_THREAD_CHECKPOINTS + 1;
+
 const decodeReadModel = Schema.decodeUnknownEffect(OrchestrationReadModel);
 const decodeShellSnapshot = Schema.decodeUnknownEffect(OrchestrationShellSnapshot);
 const decodeThread = Schema.decodeUnknownEffect(OrchestrationThread);
@@ -949,7 +951,7 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
           WHERE thread_id = ${threadId}
             AND checkpoint_turn_count IS NOT NULL
         ) checkpoint_rows
-        WHERE checkpoint_rows.checkpoint_rank <= ${MAX_THREAD_CHECKPOINTS}
+        WHERE checkpoint_rows.checkpoint_rank <= ${CHECKPOINT_DIFF_CONTEXT_KEEP_PER_THREAD}
         ORDER BY checkpoint_rows.checkpoint_turn_count ASC
       `,
   });
@@ -998,7 +1000,7 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
                 AND turns.checkpoint_turn_count IS NOT NULL
             ) checkpoint_rows
             WHERE checkpoint_rows.checkpoint_turn_count = ${checkpointTurnCount}
-              AND checkpoint_rows.checkpoint_rank <= ${MAX_THREAD_CHECKPOINTS}
+              AND checkpoint_rows.checkpoint_rank <= ${CHECKPOINT_DIFF_CONTEXT_KEEP_PER_THREAD}
             LIMIT 1
           ) AS "toCheckpointRef"
         FROM projection_threads AS threads
