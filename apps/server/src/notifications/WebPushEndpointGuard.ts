@@ -3,14 +3,15 @@ import * as NodeDnsPromises from "node:dns/promises";
 import * as NodeHttps from "node:https";
 import type * as NodeNet from "node:net";
 
-import {
-  getWebPushEndpointValidationError,
-  isPublicWebPushIpAddress,
-  ServerNotificationEndpointError,
-} from "@t3tools/contracts";
+import { ServerNotificationEndpointError } from "@t3tools/contracts";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+
+import {
+  getWebPushEndpointValidationError,
+  isPublicWebPushIpAddress,
+} from "./webPushEndpointPolicy.ts";
 
 export interface WebPushEndpointAddress {
   readonly address: string;
