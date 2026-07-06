@@ -118,19 +118,34 @@ function isRowOldEnough(
   return ageMs >= options.stoppedAgeMs;
 }
 
-function isRowReapable(
-  row: WorktreeMaintenanceRow,
-  nowMs: number,
-  options: Required<WorktreeReapOptions>,
-): boolean {
-  return row.worktreeRemovable && !isRowActive(row) && isRowOldEnough(row, nowMs, options);
+function isProtectedProjectPath(path: string, projectRoots: ReadonlyArray<string>): boolean {
+  return (
+    projectRoots.some((projectRoot) => isSameOrNestedPath(projectRoot, path)) ||
+    projectRoots.some((projectRoot) => isSameOrNestedPath(path, projectRoot))
+  );
 }
 
-function rowOverlapsRemovalPath(row: WorktreeMaintenanceRow, removalPath: string): boolean {
-  return (
-    pathsOverlap(rowWorktreePath(row), removalPath) ||
-    pathsOverlap(rowRemovalPath(row), removalPath)
-  );
+function reapEligibility(
+  row: WorktreeMaintenanceRow,
+  normalizedProjectRoots: ReadonlyArray<string>,
+  nowMs: number,
+  options: Required<WorktreeReapOptions>,
+): { readonly path: string; readonly key: string } | null {
+  const removalPath = rowRemovalPath(row);
+  if (
+    !removalPath ||
+    !row.worktreeRemovable ||
+    isRowActive(row) ||
+    !isRowOldEnough(row, nowMs, options) ||
+    isProtectedProjectPath(removalPath, normalizedProjectRoots)
+  ) {
+    return null;
+  }
+
+  return {
+    path: removalPath,
+    key: `${row.projectCwd}\0${removalPath}`,
+  };
 }
 
 export function selectStaleWorktreeReapCandidates(
@@ -149,72 +164,73 @@ export function selectStaleWorktreeReapCandidates(
   });
   const candidates: WorktreeReapCandidate[] = [];
   const selectedPaths = new Set<string>();
+  const eligibilityByThreadId = new Map<string, { readonly path: string; readonly key: string }>();
 
   for (const row of rows) {
-    const removalPath = rowRemovalPath(row);
-    if (!removalPath || selectedPaths.has(removalPath)) {
-      continue;
+    const eligibility = reapEligibility(row, normalizedProjectRoots, nowMs, resolvedOptions);
+    if (eligibility) {
+      eligibilityByThreadId.set(row.threadId, eligibility);
     }
-    if (!isRowReapable(row, nowMs, resolvedOptions)) {
-      continue;
-    }
-    if (
-      normalizedProjectRoots.some((projectRoot) => isSameOrNestedPath(projectRoot, removalPath)) ||
-      normalizedProjectRoots.some((projectRoot) => isSameOrNestedPath(removalPath, projectRoot))
-    ) {
+  }
+
+  for (const row of rows) {
+    const eligibility = eligibilityByThreadId.get(row.threadId);
+    if (!eligibility || selectedPaths.has(eligibility.key)) {
       continue;
     }
 
-    const overlappingRows = rows.filter((other) => rowOverlapsRemovalPath(other, removalPath));
-    const blockedByOverlappingRow = overlappingRows.some((other) => {
+    const coveredKeys = new Set([eligibility.key]);
+    const blockedByRetainedThread = rows.some((other) => {
       if (other.threadId === row.threadId) {
         return false;
       }
-
-      if (other.deletedAt !== null && !isRowReapable(other, nowMs, resolvedOptions)) {
+      if (
+        !pathsOverlap(rowWorktreePath(other), eligibility.path) &&
+        !pathsOverlap(rowRemovalPath(other), eligibility.path)
+      ) {
         return false;
       }
 
-      if (other.projectCwd !== row.projectCwd || !isRowReapable(other, nowMs, resolvedOptions)) {
+      const otherEligibility = eligibilityByThreadId.get(other.threadId);
+      if (!otherEligibility) {
+        return other.deletedAt === null;
+      }
+      if (otherEligibility.key === eligibility.key) {
+        return false;
+      }
+      if (other.projectCwd !== row.projectCwd) {
         return true;
       }
-
-      const otherRemovalPath = rowRemovalPath(other);
-      return (
-        otherRemovalPath !== null &&
-        otherRemovalPath !== removalPath &&
-        isSameOrNestedPath(removalPath, otherRemovalPath)
-      );
+      if (isSameOrNestedPath(eligibility.path, otherEligibility.path)) {
+        return true;
+      }
+      if (isSameOrNestedPath(otherEligibility.path, eligibility.path)) {
+        coveredKeys.add(otherEligibility.key);
+        return false;
+      }
+      return true;
     });
-    if (blockedByOverlappingRow) {
+    if (blockedByRetainedThread) {
       continue;
     }
 
-    const coveredRows = overlappingRows.filter((other) => {
-      if (other.projectCwd !== row.projectCwd || !isRowReapable(other, nowMs, resolvedOptions)) {
-        return false;
-      }
+    const threadIds = Array.from(
+      new Set(
+        rows.flatMap((other) => {
+          const otherEligibility = eligibilityByThreadId.get(other.threadId);
+          return otherEligibility && coveredKeys.has(otherEligibility.key) ? [other.threadId] : [];
+        }),
+      ),
+    );
 
-      const otherRemovalPath = rowRemovalPath(other);
-      const otherWorktreePath = rowWorktreePath(other);
-      return (
-        (otherRemovalPath !== null && isSameOrNestedPath(otherRemovalPath, removalPath)) ||
-        (otherWorktreePath !== null && isSameOrNestedPath(otherWorktreePath, removalPath))
-      );
-    });
-    const threadIds = Array.from(new Set(coveredRows.map((other) => other.threadId)));
-    for (const coveredRow of coveredRows) {
-      const coveredRemovalPath = rowRemovalPath(coveredRow);
-      if (coveredRemovalPath !== null) {
-        selectedPaths.add(coveredRemovalPath);
-      }
+    for (const coveredKey of coveredKeys) {
+      selectedPaths.add(coveredKey);
     }
-
     candidates.push({
       threadId: row.threadId,
       threadIds,
       projectCwd: row.projectCwd,
-      path: removalPath,
+      path: eligibility.path,
     });
   }
 
@@ -312,16 +328,27 @@ const make = Effect.gen(function* () {
         return;
       }
 
-      const checkpointResult = yield* checkpointStore.pruneCheckpointRefs({
-        cwd: projectRoot,
-        keepPerThread: CHECKPOINT_REFS_KEEP_PER_THREAD,
-      });
-      if (checkpointResult.deletedCount > 0) {
-        yield* Effect.logInfo("vcs.maintenance.checkpoint-refs-pruned", {
-          projectRoot,
-          ...checkpointResult,
-        });
-      }
+      yield* checkpointStore
+        .pruneCheckpointRefs({
+          cwd: projectRoot,
+          keepPerThread: CHECKPOINT_REFS_KEEP_PER_THREAD,
+        })
+        .pipe(
+          Effect.tap((checkpointResult) =>
+            checkpointResult.deletedCount > 0
+              ? Effect.logInfo("vcs.maintenance.checkpoint-refs-pruned", {
+                  projectRoot,
+                  ...checkpointResult,
+                })
+              : Effect.void,
+          ),
+          Effect.catch((error) =>
+            Effect.logWarning("vcs.maintenance.checkpoint-refs-prune-failed", {
+              projectRoot,
+              detail: errorDetail(error),
+            }),
+          ),
+        );
 
       yield* git.pruneWorktrees(projectRoot).pipe(
         Effect.catch((error) =>
@@ -389,7 +416,7 @@ const make = Effect.gen(function* () {
           ),
           Effect.catch((error) =>
             Effect.logWarning("vcs.maintenance.worktree-reap-skipped", {
-              threadId: candidate.threadId,
+              threadIds: candidate.threadIds,
               projectRoot: candidate.projectCwd,
               path: candidate.path,
               detail: errorDetail(error),
@@ -401,10 +428,10 @@ const make = Effect.gen(function* () {
 
   const runSweep = Effect.fn("VcsMaintenanceReactor.runSweep")(function* () {
     const projectRoots = yield* listProjectRoots();
+    yield* reapWorktrees(projectRoots);
     for (const projectRoot of projectRoots) {
       yield* pruneProjectRepository(projectRoot);
     }
-    yield* reapWorktrees(projectRoots);
   });
 
   const sweep: VcsMaintenanceReactorShape["sweep"] = () =>

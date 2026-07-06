@@ -48,6 +48,71 @@ describe("selectStaleWorktreeReapCandidates", () => {
     ]);
   });
 
+  it("coalesces shared stale archived worktree paths", () => {
+    expect(
+      selectStaleWorktreeReapCandidates(
+        [
+          row({
+            threadId: "archived-a",
+            worktreePath: "/worktrees/shared-archived",
+            archivedAt: "2026-07-06T11:30:00.000Z",
+            updatedAt: "2026-07-06T11:30:00.000Z",
+          }),
+          row({
+            threadId: "archived-b",
+            worktreePath: "/worktrees/shared-archived",
+            archivedAt: "2026-07-06T11:30:00.000Z",
+            updatedAt: "2026-07-06T11:30:00.000Z",
+          }),
+        ],
+        ["/repo"],
+        NOW,
+        {
+          archivedAgeMs: 20 * 60_000,
+          stoppedAgeMs: 60 * 60_000,
+        },
+      ),
+    ).toEqual([
+      {
+        threadId: "archived-a",
+        threadIds: ["archived-a", "archived-b"],
+        projectCwd: "/repo",
+        path: "/worktrees/shared-archived",
+      },
+    ]);
+  });
+
+  it("does not let deleted metadata rows retain a stale worktree path", () => {
+    expect(
+      selectStaleWorktreeReapCandidates(
+        [
+          row({
+            threadId: "stale",
+            worktreePath: "/worktrees/deleted-row-overlap",
+          }),
+          row({
+            threadId: "deleted-metadata",
+            worktreePath: "/worktrees/deleted-row-overlap",
+            worktreeRemovable: false,
+            deletedAt: "2026-07-06T11:30:00.000Z",
+          }),
+        ],
+        ["/repo"],
+        NOW,
+        {
+          stoppedAgeMs: 60_000,
+        },
+      ),
+    ).toEqual([
+      {
+        threadId: "stale",
+        threadIds: ["stale"],
+        projectCwd: "/repo",
+        path: "/worktrees/deleted-row-overlap",
+      },
+    ]);
+  });
+
   it("keeps active, pending, young, shared, and project-root paths", () => {
     const rows = [
       row({ threadId: "running", sessionStatus: "running" }),
@@ -157,6 +222,33 @@ describe("selectStaleWorktreeReapCandidates", () => {
       {
         threadId: "stale-parent",
         threadIds: ["stale-child", "stale-parent"],
+        projectCwd: "/repo",
+        path: "/worktrees/shared",
+      },
+    ]);
+  });
+
+  it("clears eligible deleted owners under a selected stale parent root", () => {
+    const rows = [
+      row({
+        threadId: "stale-parent",
+        worktreePath: "/worktrees/shared",
+      }),
+      row({
+        threadId: "deleted-child",
+        worktreePath: "/worktrees/shared/deleted",
+        deletedAt: "2026-07-05T00:00:00.000Z",
+      }),
+    ];
+
+    expect(
+      selectStaleWorktreeReapCandidates(rows, ["/repo"], NOW, {
+        stoppedAgeMs: 60_000,
+      }),
+    ).toEqual([
+      {
+        threadId: "stale-parent",
+        threadIds: ["stale-parent", "deleted-child"],
         projectCwd: "/repo",
         path: "/worktrees/shared",
       },

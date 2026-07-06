@@ -212,6 +212,13 @@ function parseForEachRefLine(line: string): GitRefListEntry | null {
   };
 }
 
+function parseForEachRefEntries(stdout: string): ReadonlyArray<GitRefListEntry> {
+  return Arr.filterMap(stdout.split("\n"), (line) => {
+    const parsed = parseForEachRefLine(line);
+    return parsed === null ? Result.failVoid : Result.succeed(parsed);
+  });
+}
+
 function splitNullSeparatedPaths(input: string, truncated: boolean): string[] {
   const parts = input.split("\0");
   if (parts.length === 0) return [];
@@ -1948,15 +1955,11 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
 
   const listRefs: GitVcsDriver.GitVcsDriver["Service"]["listRefs"] = Effect.fn("listRefs")(
     function* (input) {
-      const refListResult = yield* executeGit(
-        "GitVcsDriver.listRefs.forEachRef",
+      const refListFormat = "%(refname)%09%(committerdate:unix)";
+      const localRefListResult = yield* executeGit(
+        "GitVcsDriver.listRefs.localForEachRef",
         input.cwd,
-        [
-          "for-each-ref",
-          "--format=%(refname)%09%(committerdate:unix)",
-          "refs/heads",
-          "refs/remotes",
-        ],
+        ["for-each-ref", `--format=${refListFormat}`, "refs/heads"],
         {
           timeoutMs: 10_000,
           allowNonZeroExit: true,
@@ -1976,8 +1979,8 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
         }),
       );
 
-      if (refListResult.exitCode !== 0) {
-        const stderr = refListResult.stderr.trim();
+      if (localRefListResult.exitCode !== 0) {
+        const stderr = localRefListResult.stderr.trim();
         if (isNonRepositoryGitStderr(stderr)) {
           return {
             refs: [],
@@ -1991,19 +1994,46 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
           ...gitCommandContext({
             operation: "GitVcsDriver.listRefs",
             cwd: input.cwd,
-            args: [
-              "for-each-ref",
-              "--format=%(refname)%09%(committerdate:unix)",
-              "refs/heads",
-              "refs/remotes",
-            ],
+            args: ["for-each-ref", `--format=${refListFormat}`, "refs/heads"],
           }),
-          detail: "Git ref listing failed.",
-          exitCode: refListResult.exitCode,
-          stdoutLength: refListResult.stdout.length,
-          stderrLength: refListResult.stderr.length,
+          detail: "Git local ref listing failed.",
+          exitCode: localRefListResult.exitCode,
+          stdoutLength: localRefListResult.stdout.length,
+          stderrLength: localRefListResult.stderr.length,
         });
       }
+
+      const remoteRefListResultEffect = executeGit(
+        "GitVcsDriver.listRefs.remoteForEachRef",
+        input.cwd,
+        ["for-each-ref", `--format=${refListFormat}`, "refs/remotes"],
+        {
+          timeoutMs: 10_000,
+          allowNonZeroExit: true,
+        },
+      ).pipe(
+        Effect.catchTags({
+          GitCommandError: (error) =>
+            Effect.logWarning(
+              "Git remote ref lookup failed; falling back to an empty remote ref list.",
+              {
+                operation: error.operation,
+                command: error.command,
+                cwd: error.cwd,
+                detail: error.detail,
+                cause: error,
+              },
+            ).pipe(
+              Effect.as({
+                exitCode: ChildProcessSpawner.ExitCode(1),
+                stdout: "",
+                stderr: "",
+                stdoutTruncated: false,
+                stderrTruncated: false,
+              } satisfies GitVcsDriver.ExecuteGitResult),
+            ),
+        }),
+      );
 
       const currentBranchResultEffect = executeGit(
         "GitVcsDriver.listRefs.currentBranch",
@@ -2047,8 +2077,15 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
         }),
       );
 
-      const [currentBranchResult, defaultRef, worktreeList, remoteNamesResult] = yield* Effect.all(
+      const [
+        remoteRefListResult,
+        currentBranchResult,
+        defaultRef,
+        worktreeList,
+        remoteNamesResult,
+      ] = yield* Effect.all(
         [
+          remoteRefListResultEffect,
           currentBranchResultEffect,
           executeGit(
             "GitVcsDriver.listRefs.defaultRef",
@@ -2078,6 +2115,11 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
       if (remoteNamesResult.exitCode !== 0 && remoteNamesResult.stderr.trim().length > 0) {
         yield* Effect.logWarning(
           `GitVcsDriver.listRefs: remote name lookup returned code ${remoteNamesResult.exitCode} for ${input.cwd}: ${remoteNamesResult.stderr.trim()}. Falling back to an empty remote name list.`,
+        );
+      }
+      if (remoteRefListResult.exitCode !== 0 && remoteRefListResult.stderr.trim().length > 0) {
+        yield* Effect.logWarning(
+          `GitVcsDriver.listRefs: remote ref lookup returned code ${remoteRefListResult.exitCode} for ${input.cwd}: ${remoteRefListResult.stderr.trim()}. Falling back to an empty remote ref list.`,
         );
       }
 
@@ -2117,13 +2159,13 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
         flushWorktree();
       }
 
-      const refEntries = Arr.filterMap(refListResult.stdout.split("\n"), (line) => {
-        const parsed = parseForEachRefLine(line);
-        return parsed === null ? Result.failVoid : Result.succeed(parsed);
-      });
+      const localRefEntries = parseForEachRefEntries(localRefListResult.stdout);
+      const remoteRefEntries =
+        remoteRefListResult.exitCode === 0
+          ? parseForEachRefEntries(remoteRefListResult.stdout)
+          : [];
 
-      const localBranches = refEntries
-        .filter((entry) => entry.fullName.startsWith("refs/heads/"))
+      const localBranches = localRefEntries
         .map((entry) => {
           const name = entry.fullName.slice("refs/heads/".length);
           return {
@@ -2151,7 +2193,7 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
           worktreePath: branch.worktreePath,
         }));
 
-      const remoteBranches = refEntries
+      const remoteBranches = remoteRefEntries
         .filter(
           (entry) =>
             entry.fullName.startsWith("refs/remotes/") && !entry.fullName.endsWith("/HEAD"),
