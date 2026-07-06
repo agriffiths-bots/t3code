@@ -171,6 +171,7 @@ function makeTestLayer(input: {
         desktopAssetsLayer,
         desktopEnvironmentLayer,
         desktopServerExposureLayer,
+        NodeServices.layer,
         DesktopState.layer,
         electronMenuLayer,
         Layer.succeed(ElectronShell.ElectronShell, {
@@ -268,6 +269,7 @@ const makeSplashScenario = (createOutcomes: readonly (Electron.BrowserWindow | n
           desktopAssetsLayer,
           desktopEnvironmentLayer,
           desktopServerExposureLayer,
+          NodeServices.layer,
           electronMenuLayer,
           Layer.succeed(ElectronShell.ElectronShell, {
             openExternal: () => Effect.succeed(true),

@@ -37,6 +37,7 @@ const flushCallbacks = Effect.yieldNow;
 
 function makeHarness(options: UpdatesHarnessOptions = {}) {
   let checkCount = 0;
+  let verifyCount = 0;
   let allowDowngrade = false;
   const feedUrls: ElectronUpdater.ElectronUpdaterFeedUrl[] = [];
   const listeners = new Map<string, Set<(...args: readonly unknown[]) => void>>();
@@ -74,6 +75,9 @@ function makeHarness(options: UpdatesHarnessOptions = {}) {
         allowDowngrade = value;
       }),
     setDisableDifferentialDownload: () => options.setDisableDifferentialDownload ?? Effect.void,
+    verifyAvailable: Effect.sync(() => {
+      verifyCount += 1;
+    }),
     checkForUpdates: Effect.sync(() => {
       checkCount += 1;
     }).pipe(Effect.andThen(options.checkForUpdates ?? Effect.void)),
@@ -186,6 +190,7 @@ function makeHarness(options: UpdatesHarnessOptions = {}) {
     layer,
     checkCount: () => checkCount,
     feedUrls: () => feedUrls,
+    verifyCount: () => verifyCount,
     listenerCount: () =>
       Array.from(listeners.values()).reduce(
         (total, eventListeners) => total + eventListeners.size,
@@ -257,6 +262,7 @@ describe("DesktopUpdates", () => {
           ]);
           assert.equal(harness.listenerCount(), 6);
           assert.equal(harness.checkCount(), 0);
+          assert.equal(harness.verifyCount(), 0);
 
           yield* TestClock.adjust(Duration.millis(15_000));
           assert.equal(harness.checkCount(), 1);
@@ -266,6 +272,24 @@ describe("DesktopUpdates", () => {
       assert.equal(harness.listenerCount(), 0);
     }).pipe(Effect.provide(Layer.merge(TestClock.layer(), harness.layer)));
   });
+
+  it.effect(
+    "probes updater availability when the desktop smoke asks for dependency verification",
+    () => {
+      const harness = makeHarness({
+        env: { T3CODE_DESKTOP_VERIFY_RUNTIME_DEPENDENCIES: "1" },
+      });
+
+      return Effect.scoped(
+        Effect.gen(function* () {
+          const updates = yield* DesktopUpdates.DesktopUpdates;
+          yield* updates.configure;
+
+          assert.equal(harness.verifyCount(), 1);
+        }),
+      ).pipe(Effect.provide(Layer.merge(TestClock.layer(), harness.layer)));
+    },
+  );
 
   it.effect("updates and broadcasts state from updater events", () => {
     const harness = makeHarness();
