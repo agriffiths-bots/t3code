@@ -79,6 +79,131 @@ describe("PlanUsage", () => {
     expect(result).toBeNull();
   });
 
+  it("maps official Claude CLI /usage text without requiring token access", () => {
+    const result = __testing.parseClaudeCliUsageText(
+      [
+        "You are currently using your subscription to power your Claude Code usage",
+        "",
+        "Current session: 100% used \u00b7 resets Jul 6, 5pm (Europe/London)",
+        "Current week (all models): 80% used \u00b7 resets Jul 9, 8pm (Europe/London)",
+        "Current week (Fable): 86% used \u00b7 resets Jul 9, 8pm (Europe/London)",
+        "Claude Code/Cowork: 99% used \u00b7 resets Jul 8, 9am (Europe/London)",
+      ].join("\n"),
+      "max",
+      Date.parse("2026-07-06T15:10:00.000Z"),
+    );
+
+    expect(result?.plan).toBe("max");
+    expect(result?.windows.map((window) => window.id)).toEqual([
+      "claude-session-0",
+      "claude-weekly_all-1",
+      "claude-weekly_scoped-2",
+      "claude-claude_code_cowork-3",
+    ]);
+    expect(result?.windows.map((window) => window.title)).toEqual([
+      "Claude Session",
+      "Claude Weekly All",
+      "Claude Weekly Scoped Fable",
+      "Claude Code/Cowork",
+    ]);
+    expect(result?.windows.map((window) => window.resetAt)).toEqual([
+      "2026-07-06T16:00:00.000Z",
+      "2026-07-09T19:00:00.000Z",
+      "2026-07-09T19:00:00.000Z",
+      "2026-07-08T08:00:00.000Z",
+    ]);
+  });
+
+  it("maps split Claude CLI reset lines onto the preceding usage window", () => {
+    const result = __testing.parseClaudeCliUsageText(
+      [
+        "Current session: 100% used",
+        "Resets Jul 6, 5pm (Europe/London)",
+        "Current week (all models): 80% used",
+        "Reset time: Jul 9, 8pm (Europe/London)",
+        "Claude Code/Cowork: 99% used",
+        "Reset at Jul 8, 9am (Europe/London)",
+      ].join("\n"),
+      "max",
+      Date.parse("2026-07-06T15:10:00.000Z"),
+    );
+
+    expect(result?.windows.map((window) => window.resetAt)).toEqual([
+      "2026-07-06T16:00:00.000Z",
+      "2026-07-09T19:00:00.000Z",
+      "2026-07-08T08:00:00.000Z",
+    ]);
+  });
+
+  it("runs Claude usage probes without saved print-mode sessions", () => {
+    expect(__testing.CLAUDE_CLI_USAGE_ARGS).toContain("--no-session-persistence");
+    expect(__testing.CLAUDE_CLI_USAGE_ARGS.indexOf("--no-session-persistence")).toBeLessThan(
+      __testing.CLAUDE_CLI_USAGE_ARGS.indexOf("-p"),
+    );
+  });
+
+  it("scrubs ambient Claude auth overrides before running the official CLI", () => {
+    const env = __testing.claudeCliEnvironment("/tmp/claude-home", {
+      HOME: "/tmp/ambient-home",
+      PATH: "/bin",
+      HTTPS_PROXY: "http://proxy.example",
+      NODE_EXTRA_CA_CERTS: "/tmp/root-ca.pem",
+      ANTHROPIC_BASE_URL: "https://proxy.example",
+      ANTHROPIC_API_KEY: "ambient-api-key",
+      ANTHROPIC_AUTH_TOKEN: "ambient-auth-token",
+      ANTHROPIC_IDENTITY_TOKEN: "ambient-identity-token",
+      ANTHROPIC_ACCESS_TOKEN: "ambient-access-token",
+      CLAUDE_CODE_OAUTH_TOKEN: "ambient-oauth-token",
+      CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR: "7",
+      CLAUDE_CODE_SESSION_ACCESS_TOKEN: "ambient-session-token",
+      CLAUDE_CODE_USE_GATEWAY: "1",
+      CLAUDE_CODE_GATEWAY_URL: "https://gateway.example",
+      CLAUDE_CODE_CERT_STORE: "/tmp/certs.pem",
+      CLAUDE_CODE_CLIENT_CERT: "/tmp/client.pem",
+      CLAUDE_CODE_CLIENT_KEY: "/tmp/client.key",
+      CLAUDE_CODE_CLIENT_KEY_PASSPHRASE: "passphrase",
+      CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1",
+    } as NodeJS.ProcessEnv);
+
+    expect(env.HOME).toBe("/tmp/claude-home");
+    expect(env.PATH).toBe("/bin");
+    expect(env.HTTPS_PROXY).toBe("http://proxy.example");
+    expect(env.NODE_EXTRA_CA_CERTS).toBe("/tmp/root-ca.pem");
+    expect(env.ANTHROPIC_BASE_URL).toBeUndefined();
+    expect(env.ANTHROPIC_API_KEY).toBeUndefined();
+    expect(env.ANTHROPIC_AUTH_TOKEN).toBeUndefined();
+    expect(env.ANTHROPIC_IDENTITY_TOKEN).toBeUndefined();
+    expect(env.ANTHROPIC_ACCESS_TOKEN).toBeUndefined();
+    expect(env.CLAUDE_CODE_OAUTH_TOKEN).toBeUndefined();
+    expect(env.CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR).toBeUndefined();
+    expect(env.CLAUDE_CODE_SESSION_ACCESS_TOKEN).toBeUndefined();
+    expect(env.CLAUDE_CODE_USE_GATEWAY).toBeUndefined();
+    expect(env.CLAUDE_CODE_GATEWAY_URL).toBeUndefined();
+    expect(env.CLAUDE_CODE_CERT_STORE).toBe("/tmp/certs.pem");
+    expect(env.CLAUDE_CODE_CLIENT_CERT).toBe("/tmp/client.pem");
+    expect(env.CLAUDE_CODE_CLIENT_KEY).toBe("/tmp/client.key");
+    expect(env.CLAUDE_CODE_CLIENT_KEY_PASSPHRASE).toBe("passphrase");
+    expect(env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC).toBe("1");
+  });
+
+  it("supports disabling live plan usage polling with environment flags", () => {
+    expect(
+      __testing.isPlanUsagePollingDisabled({
+        T3_DISABLE_PLAN_USAGE_POLLING: "1",
+      } as NodeJS.ProcessEnv),
+    ).toBe(true);
+    expect(
+      __testing.isPlanUsagePollingDisabled({
+        T3_PLAN_USAGE_POLLING: "0",
+      } as NodeJS.ProcessEnv),
+    ).toBe(true);
+    expect(
+      __testing.isPlanUsagePollingDisabled({
+        T3_PLAN_USAGE_POLLING: "1",
+      } as NodeJS.ProcessEnv),
+    ).toBe(false);
+  });
+
   it("scopes credential homes to the selected provider instance", () => {
     const codexInstanceId = ProviderInstanceId.make("codex_work");
     const claudeInstanceId = ProviderInstanceId.make("claude_work");

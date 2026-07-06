@@ -1,6 +1,6 @@
-// @effect-diagnostics nodeBuiltinImport:off - Provider credential discovery reads CLI-owned files.
+// @effect-diagnostics nodeBuiltinImport:off - Provider usage discovery reads CLI-owned files and binaries.
 // @effect-diagnostics globalDate:off - Provider APIs exchange reset timestamps as Unix/ISO dates.
-// @effect-diagnostics globalFetch:off - This boundary calls provider OAuth usage endpoints directly.
+// @effect-diagnostics globalFetch:off - The Codex usage boundary calls provider OAuth usage endpoints directly.
 import type {
   PlanUsageProvider,
   PlanUsageSnapshot,
@@ -11,18 +11,48 @@ import {
   ProviderInstanceId,
   type ProviderInstanceId as ProviderInstanceIdType,
 } from "@t3tools/contracts";
+import { resolveSpawnCommand } from "@t3tools/shared/shell";
+import * as Effect from "effect/Effect";
+import * as NodeChildProcess from "node:child_process";
 import * as NodeFSP from "node:fs/promises";
 import * as NodePath from "node:path";
+import * as NodeUtil from "node:util";
 import { expandHomePath } from "../pathExpansion.ts";
 
 const CODEX_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage";
 const CODEX_REFRESH_URL = "https://auth.openai.com/oauth/token";
 const CODEX_OAUTH_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann";
-const CLAUDE_USAGE_URL = "https://api.anthropic.com/api/oauth/usage";
-const CLAUDE_BETA_HEADER = "oauth-2025-04-20";
+const CLAUDE_CLI_USAGE_ARGS = [
+  "--safe-mode",
+  "--setting-sources",
+  "user",
+  "--no-session-persistence",
+  "-p",
+  "--output-format",
+  "json",
+  "/usage",
+] as const;
+const CLAUDE_CLI_AUTH_STATUS_ARGS = [
+  "--safe-mode",
+  "--setting-sources",
+  "user",
+  "auth",
+  "status",
+  "--json",
+] as const;
 const CACHE_TTL_MS = 60_000;
 const MAX_CACHE_ENTRIES = 32;
 const UPSTREAM_TIMEOUT_MS = 10_000;
+const CLI_MAX_BUFFER_BYTES = 1024 * 1024;
+const CLAUDE_SAFE_TRANSPORT_ENV_KEYS = new Set([
+  "CLAUDE_CODE_CERT_STORE",
+  "CLAUDE_CODE_CLIENT_CERT",
+  "CLAUDE_CODE_CLIENT_KEY",
+  "CLAUDE_CODE_CLIENT_KEY_PASSPHRASE",
+  "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC",
+]);
+
+const execFile = NodeUtil.promisify(NodeChildProcess.execFile);
 
 const cached = new Map<
   string,
@@ -39,6 +69,7 @@ interface UsageCredentialSource {
   readonly provider: PlanUsageProvider;
   readonly instanceId: ProviderInstanceIdType;
   readonly home: string;
+  readonly executable: string | null;
 }
 
 interface UsageCredentialScope {
@@ -92,6 +123,284 @@ function isoDateValue(value: unknown): string | null {
   if (!raw) return null;
   const time = Date.parse(raw);
   return Number.isFinite(time) ? new Date(time).toISOString() : null;
+}
+
+function truthyEnvFlag(value: string | undefined): boolean {
+  if (!value) return false;
+  return /^(1|true|yes|on)$/i.test(value.trim());
+}
+
+function falseyEnvFlag(value: string | undefined): boolean {
+  if (!value) return false;
+  return /^(0|false|no|off)$/i.test(value.trim());
+}
+
+function isPlanUsagePollingDisabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  return (
+    truthyEnvFlag(env.T3_DISABLE_PLAN_USAGE_POLLING) || falseyEnvFlag(env.T3_PLAN_USAGE_POLLING)
+  );
+}
+
+const MONTHS: Readonly<Record<string, number>> = {
+  jan: 0,
+  january: 0,
+  feb: 1,
+  february: 1,
+  mar: 2,
+  march: 2,
+  apr: 3,
+  april: 3,
+  may: 4,
+  jun: 5,
+  june: 5,
+  jul: 6,
+  july: 6,
+  aug: 7,
+  august: 7,
+  sep: 8,
+  sept: 8,
+  september: 8,
+  oct: 9,
+  october: 9,
+  nov: 10,
+  november: 10,
+  dec: 11,
+  december: 11,
+};
+
+function timeZoneDateParts(
+  timeZone: string,
+  instant: Date,
+): {
+  readonly year: number;
+  readonly month: number;
+  readonly day: number;
+  readonly hour: number;
+  readonly minute: number;
+  readonly second: number;
+} | null {
+  try {
+    const formatter = new Intl.DateTimeFormat("en-US", {
+      timeZone,
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit",
+      hourCycle: "h23",
+    });
+    const parts = Object.fromEntries(
+      formatter.formatToParts(instant).map((part) => [part.type, part.value]),
+    );
+    const year = Number(parts.year);
+    const month = Number(parts.month);
+    const day = Number(parts.day);
+    const hour = Number(parts.hour);
+    const minute = Number(parts.minute);
+    const second = Number(parts.second);
+    if (![year, month, day, hour, minute, second].every(Number.isFinite)) return null;
+    return { year, month, day, hour, minute, second };
+  } catch {
+    return null;
+  }
+}
+
+function timeZoneOffsetMs(timeZone: string, utcMillis: number): number | null {
+  const parts = timeZoneDateParts(timeZone, new Date(utcMillis));
+  if (!parts) return null;
+  const asUtc = Date.UTC(
+    parts.year,
+    parts.month - 1,
+    parts.day,
+    parts.hour,
+    parts.minute,
+    parts.second,
+  );
+  return asUtc - utcMillis;
+}
+
+function localTimeInZoneToUtcMillis(input: {
+  readonly year: number;
+  readonly month: number;
+  readonly day: number;
+  readonly hour: number;
+  readonly minute: number;
+  readonly timeZone: string;
+}): number | null {
+  const localAsUtc = Date.UTC(input.year, input.month, input.day, input.hour, input.minute, 0);
+  const firstOffset = timeZoneOffsetMs(input.timeZone, localAsUtc);
+  if (firstOffset === null) return null;
+  let utcMillis = localAsUtc - firstOffset;
+  const secondOffset = timeZoneOffsetMs(input.timeZone, utcMillis);
+  if (secondOffset !== null && secondOffset !== firstOffset) {
+    utcMillis = localAsUtc - secondOffset;
+  }
+  return utcMillis;
+}
+
+function parseClaudeCliResetAt(raw: string | null, now = Date.now()): string | null {
+  if (!raw) return null;
+  const match = raw
+    .trim()
+    .match(/^([A-Za-z]+)\s+(\d{1,2}),\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)?(?:\s+\(([^)]+)\))?$/i);
+  if (!match) return null;
+  const month = MONTHS[match[1]?.toLowerCase() ?? ""];
+  if (month === undefined) return null;
+  const day = Number(match[2]);
+  let hour = Number(match[3]);
+  const minute = match[4] === undefined ? 0 : Number(match[4]);
+  const meridiem = match[5]?.toLowerCase();
+  const timeZone = match[6]?.trim() || Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
+  if (!Number.isFinite(day) || !Number.isFinite(hour) || !Number.isFinite(minute)) return null;
+  if (meridiem === "pm" && hour < 12) hour += 12;
+  if (meridiem === "am" && hour === 12) hour = 0;
+
+  const currentYear =
+    timeZoneDateParts(timeZone, new Date(now))?.year ?? new Date(now).getUTCFullYear();
+  let utcMillis = localTimeInZoneToUtcMillis({
+    year: currentYear,
+    month,
+    day,
+    hour,
+    minute,
+    timeZone,
+  });
+  if (utcMillis === null) return null;
+  if (utcMillis < now - 60 * 60 * 1000) {
+    utcMillis =
+      localTimeInZoneToUtcMillis({
+        year: currentYear + 1,
+        month,
+        day,
+        hour,
+        minute,
+        timeZone,
+      }) ?? utcMillis;
+  }
+  return new Date(utcMillis).toISOString();
+}
+
+function claudeScopeTitle(scope: string): string {
+  return scope
+    .split(/\s+/)
+    .filter(Boolean)
+    .map((part) => part.slice(0, 1).toUpperCase() + part.slice(1))
+    .join(" ");
+}
+
+function claudeCliGenericKind(title: string, index: number): string {
+  const slug = title
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "_")
+    .replace(/^_+|_+$/g, "");
+  return slug || `limit_${index}`;
+}
+
+function claudeCliUsageWindow(input: {
+  readonly kind: string;
+  readonly title: string;
+  readonly percent: number;
+  readonly resetRaw: string | null;
+  readonly index: number;
+  readonly now: number;
+}): PlanUsageWindow {
+  return {
+    id: `claude-${input.kind}-${input.index}`,
+    provider: "claude",
+    kind: input.kind,
+    title: input.title,
+    usedPercent: clampPercent(input.percent),
+    resetAt: parseClaudeCliResetAt(input.resetRaw, input.now),
+    used: null,
+    limit: null,
+    unit: null,
+    severity: null,
+  };
+}
+
+function parseClaudeCliResetLine(line: string): string | null {
+  const match = line.trim().match(/^(?:[·•-]\s*)?reset(?:s)?(?:\s+(?:at|time))?:?\s+(.+)$/i);
+  return match?.[1]?.trim() || null;
+}
+
+function parseClaudeCliUsageText(
+  text: string,
+  plan: string | null,
+  now = Date.now(),
+): ProviderUsage | null {
+  const windows: PlanUsageWindow[] = [];
+  let pendingResetWindowIndex: number | null = null;
+  const applyPendingReset = (line: string): boolean => {
+    if (pendingResetWindowIndex === null) return false;
+    const resetRaw = parseClaudeCliResetLine(line);
+    if (!resetRaw) return false;
+    const pendingWindow = windows[pendingResetWindowIndex];
+    if (pendingWindow) {
+      windows[pendingResetWindowIndex] = {
+        ...pendingWindow,
+        resetAt: parseClaudeCliResetAt(resetRaw, now),
+      };
+    }
+    pendingResetWindowIndex = null;
+    return true;
+  };
+  const pushWindow = (input: {
+    readonly kind: string;
+    readonly title: string;
+    readonly percent: number;
+    readonly resetRaw: string | null;
+  }): void => {
+    const index = windows.length;
+    windows.push(claudeCliUsageWindow({ ...input, index, now }));
+    pendingResetWindowIndex = input.resetRaw ? null : index;
+  };
+
+  for (const line of text.split(/\r?\n/)) {
+    if (applyPendingReset(line)) continue;
+    if (pendingResetWindowIndex !== null && line.trim().length === 0) continue;
+    pendingResetWindowIndex = null;
+
+    const currentMatch = line.match(
+      /^Current\s+(session|week)(?:\s+\(([^)]+)\))?:\s+([0-9]+(?:\.[0-9]+)?)%\s+used(?:\s+.*?\bresets\s+(.+))?$/i,
+    );
+    if (currentMatch) {
+      const scope = currentMatch[2]?.trim() ?? null;
+      const percent = Number(currentMatch[3]);
+      if (!Number.isFinite(percent)) continue;
+      const isSession = currentMatch[1]?.toLowerCase() === "session";
+      const isAllModels = scope?.toLowerCase() === "all models";
+      const kind = isSession ? "session" : isAllModels ? "weekly_all" : "weekly_scoped";
+      const title = isSession
+        ? "Claude Session"
+        : isAllModels || !scope
+          ? "Claude Weekly All"
+          : `Claude Weekly Scoped ${claudeScopeTitle(scope)}`;
+      pushWindow({
+        kind,
+        title,
+        percent,
+        resetRaw: currentMatch[4] ?? null,
+      });
+      continue;
+    }
+
+    const genericMatch = line.match(
+      /^([^:]+):\s+([0-9]+(?:\.[0-9]+)?)%\s+used(?:\s+.*?\bresets\s+(.+))?$/i,
+    );
+    if (!genericMatch) continue;
+    const title = genericMatch[1]?.trim();
+    const percent = Number(genericMatch[2]);
+    if (!title || !Number.isFinite(percent)) continue;
+    pushWindow({
+      kind: claudeCliGenericKind(title, windows.length),
+      title,
+      percent,
+      resetRaw: genericMatch[3] ?? null,
+    });
+  }
+
+  return windows.length > 0 ? { provider: "claude", plan, windows } : null;
 }
 
 function codexWindow(input: {
@@ -291,6 +600,12 @@ function configuredPathOrNull(value: unknown): string | null {
   return raw ? NodePath.resolve(expandHomePath(raw)) : null;
 }
 
+function configuredCommandOrNull(value: unknown): string | null {
+  const raw = stringValue(value)?.trim();
+  if (!raw) return null;
+  return raw.startsWith("~") ? NodePath.resolve(expandHomePath(raw)) : raw;
+}
+
 function legacyDefaultUsageProviderInstance(
   settings: ServerSettings,
   providerInstanceId: ProviderInstanceIdType,
@@ -369,10 +684,12 @@ function usageSourceForInstance(
   provider: PlanUsageProvider,
   instance: UsageProviderInstance,
 ): UsageCredentialSource {
+  const config = objectValue(instance.config);
   return {
     provider,
     instanceId: instance.instanceId,
     home: configuredHomeForProvider(provider, instance),
+    executable: provider === "claude" ? configuredCommandOrNull(config?.binaryPath) : null,
   };
 }
 
@@ -381,7 +698,7 @@ function uniqueUsageSources(
 ): ReadonlyArray<UsageCredentialSource> {
   const seen = new Set<string>();
   return sources.filter((source) => {
-    const key = `${source.provider}:${source.home}`;
+    const key = `${source.provider}:${source.home}:${source.executable ?? ""}`;
     if (seen.has(key)) return false;
     seen.add(key);
     return true;
@@ -390,7 +707,7 @@ function uniqueUsageSources(
 
 function usageScopeCacheKey(sources: ReadonlyArray<UsageCredentialSource>): string {
   return `sources:${JSON.stringify(
-    sources.map((source) => [source.provider, source.instanceId, source.home]),
+    sources.map((source) => [source.provider, source.instanceId, source.home, source.executable]),
   )}`;
 }
 
@@ -458,11 +775,13 @@ export function resolveUsageCredentialScope(
       provider: "codex",
       instanceId: ProviderInstanceId.make("codex"),
       home: defaultCodexHome(),
+      executable: null,
     },
     {
       provider: "claude",
       instanceId: ProviderInstanceId.make("claudeAgent"),
       home: defaultClaudeHome(),
+      executable: null,
     },
   ] satisfies ReadonlyArray<UsageCredentialSource>;
   return {
@@ -577,39 +896,72 @@ async function loadCodexUsage(codexHome: string): Promise<ProviderUsage | null> 
   return parseCodexUsageResponse(response.payload);
 }
 
-async function loadClaudeUsage(claudeHome: string): Promise<ProviderUsage | null> {
-  const readClaudeAuth = async () => {
-    const credentials = await readJsonFile(NodePath.join(claudeHome, ".claude/.credentials.json"));
-    const oauth = objectValue(credentials?.claudeAiOauth) ?? credentials;
-    const accessToken = stringValue(oauth?.accessToken) ?? stringValue(oauth?.access_token);
-    if (!accessToken) return null;
-    const subscriptionType =
-      stringValue(oauth?.subscriptionType) ?? stringValue(oauth?.subscription_type);
-    const rateLimitTier = stringValue(oauth?.rateLimitTier) ?? stringValue(oauth?.rate_limit_tier);
-    const plan = [subscriptionType, rateLimitTier].filter(Boolean).join(" ") || null;
-    return { accessToken, plan };
-  };
+function isClaudeAuthOverrideEnvKey(key: string): boolean {
+  const normalized = key.toUpperCase();
+  if (CLAUDE_SAFE_TRANSPORT_ENV_KEYS.has(normalized)) return false;
+  return normalized.startsWith("ANTHROPIC_") || normalized.startsWith("CLAUDE_CODE_");
+}
 
-  const fetchClaudeUsage = (accessToken: string) =>
-    fetchJsonStatus(CLAUDE_USAGE_URL, {
-      Authorization: `Bearer ${accessToken}`,
-      Accept: "application/json",
-      "Content-Type": "application/json",
-      "anthropic-beta": CLAUDE_BETA_HEADER,
-      "User-Agent": "claude-code/2.1.0",
-    });
-
-  const auth = await readClaudeAuth();
-  if (!auth) return null;
-  let response = await fetchClaudeUsage(auth.accessToken);
-  let plan = auth.plan;
-  if (response.status === 401) {
-    const freshAuth = await readClaudeAuth();
-    if (!freshAuth) return null;
-    plan = freshAuth.plan;
-    response = await fetchClaudeUsage(freshAuth.accessToken);
+function claudeCliEnvironment(
+  home: string,
+  baseEnv: NodeJS.ProcessEnv = process.env,
+): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = { ...baseEnv, HOME: home };
+  for (const key of Object.keys(env)) {
+    if (isClaudeAuthOverrideEnvKey(key)) {
+      delete env[key];
+    }
   }
-  return parseClaudeUsageResponse(response.payload, plan);
+  env.HOME = home;
+  return env;
+}
+
+async function runClaudeCliJson(
+  source: UsageCredentialSource,
+  args: ReadonlyArray<string>,
+): Promise<unknown | null> {
+  const env = claudeCliEnvironment(source.home);
+  try {
+    const spawnCommand = await Effect.runPromise(
+      resolveSpawnCommand(source.executable ?? "claude", args, { env }),
+    );
+    const { stdout } = await execFile(spawnCommand.command, spawnCommand.args, {
+      cwd: source.home || undefined,
+      env,
+      encoding: "utf8",
+      maxBuffer: CLI_MAX_BUFFER_BYTES,
+      shell: spawnCommand.shell,
+      timeout: UPSTREAM_TIMEOUT_MS,
+    });
+    return JSON.parse(stdout);
+  } catch {
+    return null;
+  }
+}
+
+function parseClaudeCliResultText(payload: unknown): string | null {
+  const root = objectValue(payload);
+  if (!root || root.is_error === true) return null;
+  return stringValue(root.result);
+}
+
+function parseClaudeAuthStatusPlan(payload: unknown): string | null {
+  const root = objectValue(payload);
+  if (!root || root.loggedIn === false) return null;
+  const subscriptionType =
+    stringValue(root.subscriptionType) ?? stringValue(root.subscription_type);
+  const rateLimitTier = stringValue(root.rateLimitTier) ?? stringValue(root.rate_limit_tier);
+  return [subscriptionType, rateLimitTier].filter(Boolean).join(" ") || null;
+}
+
+async function loadClaudeUsage(source: UsageCredentialSource): Promise<ProviderUsage | null> {
+  const [usagePayload, authStatusPayload] = await Promise.all([
+    runClaudeCliJson(source, CLAUDE_CLI_USAGE_ARGS),
+    runClaudeCliJson(source, CLAUDE_CLI_AUTH_STATUS_ARGS),
+  ]);
+  const usageText = parseClaudeCliResultText(usagePayload);
+  if (!usageText) return null;
+  return parseClaudeCliUsageText(usageText, parseClaudeAuthStatusPlan(authStatusPayload));
 }
 
 async function loadProviderUsage(
@@ -623,7 +975,7 @@ async function loadProviderUsage(
     const usage =
       source.provider === "codex"
         ? await loadCodexUsage(source.home)
-        : await loadClaudeUsage(source.home);
+        : await loadClaudeUsage(source);
     if (!usage) return null;
     const includeInstanceLabel = (sourceCounts.get(source.provider) ?? 0) > 1;
     return {
@@ -658,6 +1010,13 @@ export async function loadPlanUsageSnapshot(
   options: LoadPlanUsageOptions = {},
   now = Date.now(),
 ): Promise<PlanUsageSnapshot> {
+  if (isPlanUsagePollingDisabled()) {
+    return {
+      updatedAt: new Date(now).toISOString(),
+      providers: [],
+    };
+  }
+
   const scope = resolveUsageCredentialScope(options);
   const existing = cached.get(scope.cacheKey);
   if (existing && existing.expiresAt > now) {
@@ -681,8 +1040,13 @@ export async function loadPlanUsageSnapshot(
 }
 
 export const __testing = {
+  CLAUDE_CLI_USAGE_ARGS,
   parseCodexUsageResponse,
   parseClaudeUsageResponse,
+  parseClaudeCliUsageText,
+  parseClaudeCliResetAt,
+  claudeCliEnvironment,
   claudeLimitWindow,
+  isPlanUsagePollingDisabled,
   resolveUsageCredentialScope,
 };
