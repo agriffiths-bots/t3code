@@ -62,6 +62,26 @@ import { connectionStorageLayer } from "./storage";
 
 let nextObservedRpcRequestId = 0;
 
+function cloudflareAccessTransportHeaders(headers: Readonly<Record<string, string>>): {
+  readonly "cf-access-client-id"?: string;
+  readonly "cf-access-client-secret"?: string;
+  readonly "cf-access-jwt-assertion"?: string;
+} {
+  return {
+    ...readCloudflareAccessTransportHeader(headers, "cf-access-client-id"),
+    ...readCloudflareAccessTransportHeader(headers, "cf-access-client-secret"),
+    ...readCloudflareAccessTransportHeader(headers, "cf-access-jwt-assertion"),
+  };
+}
+
+function readCloudflareAccessTransportHeader<Name extends string>(
+  headers: Readonly<Record<string, string>>,
+  name: Name,
+): Partial<Record<Name, string>> {
+  const value = headers[name]?.trim() ?? "";
+  return value.length === 0 ? {} : ({ [name]: value } as Partial<Record<Name, string>>);
+}
+
 function currentNetworkStatus(): "unknown" | "offline" | "online" {
   if (typeof navigator === "undefined") {
     return "unknown";
@@ -218,6 +238,9 @@ const capabilitiesLayer = Layer.effectContext(
       }).pipe(Effect.map(Option.fromNullishOr)),
     });
     const cloudflareAccessCookieInstaller = CloudflareAccessCookieInstaller.of({
+      supportsCookieInstall: window.desktopBridge?.installCloudflareAccessCookie !== undefined,
+      supportsRequestHeaders:
+        window.desktopBridge?.installCloudflareAccessCredentials !== undefined,
       install: (input) => {
         const bridge = window.desktopBridge;
         const installCloudflareAccessCookie = bridge?.installCloudflareAccessCookie;
@@ -237,6 +260,31 @@ const capabilitiesLayer = Layer.effectContext(
             }),
         });
       },
+      ...(window.desktopBridge?.installCloudflareAccessCredentials
+        ? {
+            installRequestHeaders: (input) => {
+              const installCloudflareAccessCredentials =
+                window.desktopBridge?.installCloudflareAccessCredentials;
+              if (!installCloudflareAccessCredentials) {
+                return Effect.void;
+              }
+              return Effect.tryPromise({
+                try: () =>
+                  installCloudflareAccessCredentials({
+                    host: input.httpBaseUrl,
+                    headers: cloudflareAccessTransportHeaders(input.headers),
+                    ...(input.clearCookies === true ? { clearCookies: true } : {}),
+                    ...(input.cookieValue ? { cookieValue: input.cookieValue } : {}),
+                  }),
+                catch: () =>
+                  new ConnectionBlockedError({
+                    reason: "authentication",
+                    detail: "Could not install the Cloudflare Access transport credentials.",
+                  }),
+              });
+            },
+          }
+        : {}),
     });
     const ssh = SshEnvironmentGateway.of({
       provision: Effect.fn("web.connectionPlatform.ssh.provision")(function* (target) {

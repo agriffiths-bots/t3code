@@ -7,6 +7,7 @@ import { afterEach, vi } from "vite-plus/test";
 
 import { remoteHttpClientLayer } from "../rpc/http.ts";
 import {
+  CloudflareAccessCookieInstaller,
   ClientPresentation,
   markWebSocketHeaderOptionsCapable,
   SshEnvironmentGateway,
@@ -28,6 +29,13 @@ const CLIENT_PRESENTATION_LAYER = Layer.succeed(
       os: "Test OS",
     },
     scopes: AuthStandardClientScopes,
+  }),
+);
+const CLOUDFLARE_ACCESS_INSTALLER_LAYER = Layer.succeed(
+  CloudflareAccessCookieInstaller,
+  CloudflareAccessCookieInstaller.of({
+    supportsCookieInstall: true,
+    install: () => Effect.void,
   }),
 );
 
@@ -93,6 +101,18 @@ function pairingHttpLayer(
   return remoteHttpClientLayer(fetchFn);
 }
 
+function pairingTestLayer(
+  calls: Array<{ readonly url: string; readonly init: RequestInit }>,
+  options?: { readonly failDescriptor?: boolean; readonly rejectAccess?: boolean },
+  installerLayer = CLOUDFLARE_ACCESS_INSTALLER_LAYER,
+) {
+  return Layer.mergeAll(
+    CLIENT_PRESENTATION_LAYER,
+    installerLayer,
+    pairingHttpLayer(calls, options),
+  );
+}
+
 describe("connection onboarding", () => {
   it.effect("prepares a persisted bearer registration from pairing details", () =>
     Effect.gen(function* () {
@@ -100,7 +120,7 @@ describe("connection onboarding", () => {
       const registration = yield* preparePairingRegistration({
         host: "remote.example.test",
         pairingCode: "pairing-token",
-      }).pipe(Effect.provide(Layer.mergeAll(CLIENT_PRESENTATION_LAYER, pairingHttpLayer(calls))));
+      }).pipe(Effect.provide(pairingTestLayer(calls)));
 
       expect(registration).toMatchObject({
         _tag: "BearerConnectionRegistration",
@@ -137,18 +157,69 @@ describe("connection onboarding", () => {
     }),
   );
 
+  it.effect("clears stale desktop Cloudflare Access transport before plain pairing", () =>
+    Effect.gen(function* () {
+      const calls: Array<{ readonly url: string; readonly init: RequestInit }> = [];
+      const installedHeaders: Array<unknown> = [];
+      const installerLayer = Layer.succeed(
+        CloudflareAccessCookieInstaller,
+        CloudflareAccessCookieInstaller.of({
+          supportsRequestHeaders: true,
+          install: () => Effect.void,
+          installRequestHeaders: (input) =>
+            Effect.sync(() => {
+              installedHeaders.push(input);
+            }),
+        }),
+      );
+
+      yield* preparePairingRegistration({
+        host: "remote.example.test",
+        pairingCode: "pairing-token",
+      }).pipe(Effect.provide(pairingTestLayer(calls, undefined, installerLayer)));
+
+      expect(installedHeaders).toEqual([
+        {
+          httpBaseUrl: "https://remote.example.test/",
+          headers: {},
+          clearCookies: true,
+        },
+      ]);
+    }),
+  );
+
   it.effect("persists Cloudflare Access credentials from pairing urls", () =>
     Effect.gen(function* () {
       const calls: Array<{ readonly url: string; readonly init: RequestInit }> = [];
+      const installedCookies: Array<{
+        readonly httpBaseUrl: string;
+        readonly cookieValue: string;
+      }> = [];
+      const installerLayer = Layer.succeed(
+        CloudflareAccessCookieInstaller,
+        CloudflareAccessCookieInstaller.of({
+          supportsCookieInstall: true,
+          install: (input) =>
+            Effect.sync(() => {
+              installedCookies.push(input);
+            }),
+        }),
+      );
       const registration = yield* preparePairingRegistration({
         pairingUrl:
           "https://remote.example.test/pair#token=pairing-token&cf_access_token=cf-access-jwt",
-      }).pipe(Effect.provide(Layer.mergeAll(CLIENT_PRESENTATION_LAYER, pairingHttpLayer(calls))));
+      }).pipe(Effect.provide(pairingTestLayer(calls, undefined, installerLayer)));
 
       expect(registration.credential).toMatchObject({
         token: "bearer-token",
         cloudflareAccessToken: "cf-access-jwt",
       });
+      expect(installedCookies).toEqual([
+        {
+          httpBaseUrl: "https://remote.example.test/",
+          cookieValue: "cf-access-jwt",
+        },
+      ]);
       for (const call of calls) {
         expect(call.init.headers).toEqual(
           expect.objectContaining({
@@ -167,7 +238,7 @@ describe("connection onboarding", () => {
         host: "remote.example.test",
         pairingCode: "pairing-token",
         cloudflareAccessCookie: "cf-access-cookie",
-      }).pipe(Effect.provide(Layer.mergeAll(CLIENT_PRESENTATION_LAYER, pairingHttpLayer(calls))));
+      }).pipe(Effect.provide(pairingTestLayer(calls)));
 
       expect(registration.credential).toMatchObject({
         token: "bearer-token",
@@ -191,7 +262,7 @@ describe("connection onboarding", () => {
       const registration = yield* preparePairingRegistration({
         pairingUrl:
           "https://remote.example.test/pair#token=pairing-token&cf_access_client_id=client-id&cf_access_client_secret=client-secret",
-      }).pipe(Effect.provide(Layer.mergeAll(CLIENT_PRESENTATION_LAYER, pairingHttpLayer(calls))));
+      }).pipe(Effect.provide(pairingTestLayer(calls)));
 
       expect(registration.credential).toMatchObject({
         token: "bearer-token",
@@ -210,6 +281,81 @@ describe("connection onboarding", () => {
     }),
   );
 
+  it.effect("persists Cloudflare Access service-token credentials from manual pairing fields", () =>
+    Effect.gen(function* () {
+      enableHeaderCapableWebSocketRuntime();
+      const calls: Array<{ readonly url: string; readonly init: RequestInit }> = [];
+      const registration = yield* preparePairingRegistration({
+        host: "remote.example.test",
+        pairingCode: "pairing-token",
+        cloudflareAccessClientId: "client-id",
+        cloudflareAccessClientSecret: "client-secret",
+      }).pipe(Effect.provide(pairingTestLayer(calls)));
+
+      expect(registration.credential).toMatchObject({
+        token: "bearer-token",
+        cloudflareAccessClientId: "client-id",
+        cloudflareAccessClientSecret: "client-secret",
+      });
+      for (const call of calls) {
+        expect(call.init.headers).toEqual(
+          expect.objectContaining({
+            "cf-access-client-id": "client-id",
+            "cf-access-client-secret": "client-secret",
+          }),
+        );
+      }
+    }),
+  );
+
+  it.effect(
+    "installs service-token headers when the desktop transport installer is available",
+    () =>
+      Effect.gen(function* () {
+        vi.stubGlobal("window", {});
+        vi.stubGlobal("navigator", { product: "Gecko" });
+        vi.stubGlobal("WebSocket", function WebSocket() {});
+        const calls: Array<{ readonly url: string; readonly init: RequestInit }> = [];
+        const installedHeaders: Array<{
+          readonly httpBaseUrl: string;
+          readonly headers: Readonly<Record<string, string>>;
+        }> = [];
+        const installerLayer = Layer.succeed(
+          CloudflareAccessCookieInstaller,
+          CloudflareAccessCookieInstaller.of({
+            supportsRequestHeaders: true,
+            install: () => Effect.void,
+            installRequestHeaders: (input) =>
+              Effect.sync(() => {
+                installedHeaders.push(input);
+              }),
+          }),
+        );
+        const registration = yield* preparePairingRegistration({
+          host: "remote.example.test",
+          pairingCode: "pairing-token",
+          cloudflareAccessClientId: "client-id",
+          cloudflareAccessClientSecret: "client-secret",
+        }).pipe(Effect.provide(pairingTestLayer(calls, undefined, installerLayer)));
+
+        expect(registration.credential).toMatchObject({
+          token: "bearer-token",
+          cloudflareAccessClientId: "client-id",
+          cloudflareAccessClientSecret: "client-secret",
+        });
+        expect(installedHeaders).toEqual([
+          {
+            httpBaseUrl: "https://remote.example.test/",
+            headers: {
+              "cf-access-client-id": "client-id",
+              "cf-access-client-secret": "client-secret",
+            },
+            clearCookies: true,
+          },
+        ]);
+      }),
+  );
+
   it.effect("rejects Cloudflare Access service-token pairing in browser websocket runtimes", () =>
     Effect.gen(function* () {
       vi.stubGlobal("window", {});
@@ -219,10 +365,7 @@ describe("connection onboarding", () => {
       const error = yield* preparePairingRegistration({
         pairingUrl:
           "https://remote.example.test/pair#token=pairing-token&cf_access_client_id=client-id&cf_access_client_secret=client-secret",
-      }).pipe(
-        Effect.provide(Layer.mergeAll(CLIENT_PRESENTATION_LAYER, pairingHttpLayer(calls))),
-        Effect.flip,
-      );
+      }).pipe(Effect.provide(pairingTestLayer(calls)), Effect.flip);
 
       expect(error).toMatchObject({
         _tag: "ConnectionBlockedError",
@@ -240,15 +383,7 @@ describe("connection onboarding", () => {
       yield* preparePairingRegistration({
         host: "remote.example.test",
         pairingCode: "pairing-token",
-      }).pipe(
-        Effect.provide(
-          Layer.mergeAll(
-            CLIENT_PRESENTATION_LAYER,
-            pairingHttpLayer(calls, { failDescriptor: true }),
-          ),
-        ),
-        Effect.flip,
-      );
+      }).pipe(Effect.provide(pairingTestLayer(calls, { failDescriptor: true })), Effect.flip);
 
       expect(calls.map((call) => call.url)).toEqual([
         "https://remote.example.test/.well-known/t3/environment",
@@ -263,15 +398,7 @@ describe("connection onboarding", () => {
       const error = yield* preparePairingRegistration({
         host: "remote.example.test",
         pairingCode: "pairing-token",
-      }).pipe(
-        Effect.provide(
-          Layer.mergeAll(
-            CLIENT_PRESENTATION_LAYER,
-            pairingHttpLayer(calls, { rejectAccess: true }),
-          ),
-        ),
-        Effect.flip,
-      );
+      }).pipe(Effect.provide(pairingTestLayer(calls, { rejectAccess: true })), Effect.flip);
 
       expect(error).toMatchObject({
         _tag: "ConnectionBlockedError",
@@ -291,10 +418,7 @@ describe("connection onboarding", () => {
       const error = yield* preparePairingRegistration({
         host: "",
         pairingCode: "",
-      }).pipe(
-        Effect.provide(Layer.mergeAll(CLIENT_PRESENTATION_LAYER, pairingHttpLayer(calls))),
-        Effect.flip,
-      );
+      }).pipe(Effect.provide(pairingTestLayer(calls)), Effect.flip);
 
       expect(error).toMatchObject({
         _tag: "ConnectionBlockedError",

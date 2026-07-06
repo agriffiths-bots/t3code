@@ -97,6 +97,25 @@ describe("remote", () => {
     });
   });
 
+  it("carries explicit Cloudflare Access credentials from manual pairing fields", () => {
+    expect(
+      resolveRemotePairingTarget({
+        host: "https://remote.example.com",
+        pairingCode: "pairing-token",
+        cloudflareAccessToken: " cloudflare-jwt ",
+        cloudflareAccessClientId: " client-id ",
+        cloudflareAccessClientSecret: " client-secret ",
+      }),
+    ).toEqual({
+      credential: "pairing-token",
+      httpBaseUrl: "https://remote.example.com/",
+      wsBaseUrl: "wss://remote.example.com/",
+      cloudflareAccessToken: "cloudflare-jwt",
+      cloudflareAccessClientId: "client-id",
+      cloudflareAccessClientSecret: "client-secret",
+    });
+  });
+
   it("preserves host ports when normalizing a bare host input", () => {
     expect(
       resolveRemotePairingTarget({

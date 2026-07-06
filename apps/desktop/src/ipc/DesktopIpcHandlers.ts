@@ -5,6 +5,7 @@ import { getClientSettings, setClientSettings } from "./methods/clientSettings.t
 import {
   authenticateCloudflareAccess,
   installCloudflareAccessCookie,
+  installCloudflareAccessCredentials,
 } from "./methods/cloudflareAccess.ts";
 import {
   clearConnectionCatalog,
@@ -62,6 +63,7 @@ export const installDesktopIpcHandlers = Effect.fn("desktop.ipc.installHandlers"
   yield* ipc.handle(clearConnectionCatalog);
   yield* ipc.handle(authenticateCloudflareAccess);
   yield* ipc.handle(installCloudflareAccessCookie);
+  yield* ipc.handle(installCloudflareAccessCredentials);
 
   yield* ipc.handle(discoverSshHosts);
   yield* ipc.handle(ensureSshEnvironment);

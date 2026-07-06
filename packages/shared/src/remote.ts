@@ -189,6 +189,21 @@ const getCloudflareAccessServiceTokenFromUrl = (
   return { clientId, clientSecret };
 };
 
+const getCloudflareAccessServiceTokenFromInput = (input: {
+  readonly cloudflareAccessClientId?: string;
+  readonly cloudflareAccessClientSecret?: string;
+}): { readonly clientId: string; readonly clientSecret: string } | null => {
+  const clientId = input.cloudflareAccessClientId?.trim() ?? "";
+  const clientSecret = input.cloudflareAccessClientSecret?.trim() ?? "";
+  if (!clientId && !clientSecret) return null;
+  if (!clientId || !clientSecret) {
+    throw new RemotePairingUrlInvalidError({
+      cause: new Error("Cloudflare Access service tokens require both client id and secret."),
+    });
+  }
+  return { clientId, clientSecret };
+};
+
 export const stripPairingTokenFromUrl = (url: URL): URL => {
   const next = new URL(url.toString());
   const hashParams = readHashParams(next);
@@ -242,7 +257,13 @@ export const resolveRemotePairingTarget = (input: {
   readonly pairingUrl?: string;
   readonly host?: string;
   readonly pairingCode?: string;
+  readonly cloudflareAccessToken?: string;
+  readonly cloudflareAccessClientId?: string;
+  readonly cloudflareAccessClientSecret?: string;
 }): ResolvedRemotePairingTarget => {
+  const explicitCloudflareAccessToken = input.cloudflareAccessToken?.trim() || undefined;
+  const explicitCloudflareAccessServiceToken =
+    getCloudflareAccessServiceTokenFromInput(input) ?? undefined;
   const pairingUrl = input.pairingUrl?.trim() ?? "";
   if (pairingUrl.length > 0) {
     let url: URL;
@@ -257,8 +278,10 @@ export const resolveRemotePairingTarget = (input: {
       });
     }
     const hostedPairingRequest = readHostedPairingRequest(url);
-    const cloudflareAccessToken = getCloudflareAccessTokenFromUrl(url) ?? undefined;
-    const cloudflareAccessServiceToken = getCloudflareAccessServiceTokenFromUrl(url) ?? undefined;
+    const cloudflareAccessToken =
+      getCloudflareAccessTokenFromUrl(url) ?? explicitCloudflareAccessToken;
+    const cloudflareAccessServiceToken =
+      getCloudflareAccessServiceTokenFromUrl(url) ?? explicitCloudflareAccessServiceToken;
     if (hostedPairingRequest) {
       const hostedBackendUrl = normalizeRemoteBaseUrl(
         hostedPairingRequest.host,
@@ -310,5 +333,14 @@ export const resolveRemotePairingTarget = (input: {
     credential: pairingCode,
     httpBaseUrl: toHttpBaseUrl(normalizedHost),
     wsBaseUrl: toWsBaseUrl(normalizedHost),
+    ...(explicitCloudflareAccessToken
+      ? { cloudflareAccessToken: explicitCloudflareAccessToken }
+      : {}),
+    ...(explicitCloudflareAccessServiceToken
+      ? {
+          cloudflareAccessClientId: explicitCloudflareAccessServiceToken.clientId,
+          cloudflareAccessClientSecret: explicitCloudflareAccessServiceToken.clientSecret,
+        }
+      : {}),
   };
 };

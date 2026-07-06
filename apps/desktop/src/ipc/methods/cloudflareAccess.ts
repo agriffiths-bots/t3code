@@ -1,5 +1,6 @@
 import {
   DesktopCloudflareAccessCookieInstallInputSchema,
+  DesktopCloudflareAccessCredentialsInstallInputSchema,
   DesktopCloudflareAccessLoginInputSchema,
   DesktopCloudflareAccessLoginResultSchema,
 } from "@t3tools/contracts";
@@ -15,8 +16,18 @@ import * as DesktopIpc from "../DesktopIpc.ts";
 import { normalizeCloudflareAccessOrigin } from "./cloudflareAccessOrigin.ts";
 
 const CLOUDFLARE_ACCESS_COOKIE_NAME = "CF_Authorization";
+const CLOUDFLARE_ACCESS_TRANSPORT_HEADER_NAMES = [
+  "cf-access-client-id",
+  "cf-access-client-secret",
+  "cf-access-jwt-assertion",
+] as const;
+const CLOUDFLARE_ACCESS_TRANSPORT_HEADER_NAME_SET = new Set<string>(
+  CLOUDFLARE_ACCESS_TRANSPORT_HEADER_NAMES,
+);
 const ACCESS_LOGIN_TIMEOUT_MS = 5 * 60 * 1000;
 const COOKIE_POLL_INTERVAL_MS = 500;
+const cloudflareAccessHeaderRules = new Map<string, Readonly<Record<string, string>>>();
+let cloudflareAccessHeaderHookInstalled = false;
 
 export class DesktopCloudflareAccessLoginError extends Schema.TaggedErrorClass<DesktopCloudflareAccessLoginError>()(
   "DesktopCloudflareAccessLoginError",
@@ -145,6 +156,136 @@ function installAccessCookie(
     });
 }
 
+function isCloudflareAccessLoginUrl(value: string): boolean {
+  try {
+    const url = new URL(value);
+    return (
+      url.protocol === "https:" &&
+      (url.hostname === "cloudflareaccess.com" || url.hostname.endsWith(".cloudflareaccess.com")) &&
+      url.pathname.startsWith("/cdn-cgi/access/login")
+    );
+  } catch {
+    return false;
+  }
+}
+
+function cloudflareAccessRuleOrigin(value: string): string | null {
+  try {
+    const url = new URL(value);
+    if (url.protocol === "ws:") {
+      url.protocol = "http:";
+    } else if (url.protocol === "wss:") {
+      url.protocol = "https:";
+    }
+    return url.origin;
+  } catch {
+    return null;
+  }
+}
+
+function filteredHeaders(
+  headers: Readonly<Record<string, string | undefined>>,
+): Readonly<Record<string, string>> {
+  const normalizedHeaders = new Map<string, string>();
+  for (const [rawName, rawValue] of Object.entries(headers)) {
+    const name = rawName.toLowerCase();
+    if (!CLOUDFLARE_ACCESS_TRANSPORT_HEADER_NAME_SET.has(name)) {
+      continue;
+    }
+    const value = rawValue?.trim() ?? "";
+    if (value.length > 0) {
+      normalizedHeaders.set(name, value);
+    }
+  }
+  return Object.fromEntries(
+    CLOUDFLARE_ACCESS_TRANSPORT_HEADER_NAMES.flatMap((name) => {
+      const value = normalizedHeaders.get(name);
+      return value === undefined ? [] : [[name, value] as const];
+    }),
+  );
+}
+
+function installCloudflareAccessHeaderHook(session: Electron.Session) {
+  if (cloudflareAccessHeaderHookInstalled) {
+    return;
+  }
+  cloudflareAccessHeaderHookInstalled = true;
+  session.webRequest.onBeforeSendHeaders((details, callback) => {
+    const origin = cloudflareAccessRuleOrigin(details.url);
+    const headers = origin === null ? undefined : cloudflareAccessHeaderRules.get(origin);
+    if (headers === undefined || Object.keys(headers).length === 0) {
+      callback({ requestHeaders: details.requestHeaders });
+      return;
+    }
+    callback({
+      requestHeaders: {
+        ...details.requestHeaders,
+        ...headers,
+      },
+    });
+  });
+}
+
+function configureCloudflareAccessHeaders(
+  session: Electron.Session,
+  origin: string,
+  headers: Readonly<Record<string, string>>,
+) {
+  const requestOriginKey = cloudflareAccessRuleOrigin(origin);
+  if (requestOriginKey === null) {
+    return;
+  }
+  const nextHeaders = filteredHeaders(headers);
+  if (Object.keys(nextHeaders).length === 0) {
+    cloudflareAccessHeaderRules.delete(requestOriginKey);
+    return;
+  }
+  cloudflareAccessHeaderRules.set(requestOriginKey, nextHeaders);
+  installCloudflareAccessHeaderHook(session);
+}
+
+function errorText(cause: unknown): string {
+  if (cause instanceof Error) {
+    return `${cause.name} ${cause.message}`;
+  }
+  return String(cause);
+}
+
+function errorField(cause: unknown, field: string): string {
+  if (cause === null || typeof cause !== "object" || !(field in cause)) {
+    return "";
+  }
+  const value = (cause as Record<string, unknown>)[field];
+  return typeof value === "string" || typeof value === "number" ? String(value) : "";
+}
+
+function isLoadUrlRedirectInterruption(
+  cause: unknown,
+  observedCloudflareAccessLoginNavigation: boolean,
+): boolean {
+  const text = errorText(cause);
+  const code = errorField(cause, "code");
+  const errno = errorField(cause, "errno");
+  const errorCode = errorField(cause, "errorCode");
+  const combined = `${code} ${errno} ${errorCode} ${text}`;
+  if (
+    combined.includes("ERR_ABORTED") ||
+    errno === "-3" ||
+    errorCode === "-3" ||
+    /(^|[^\d])-3([^\d]|$)/u.test(text)
+  ) {
+    return true;
+  }
+  if (
+    combined.includes("ERR_HTTP_RESPONSE_CODE_FAILURE") &&
+    (observedCloudflareAccessLoginNavigation ||
+      text.includes("cloudflareaccess.com/cdn-cgi/access/login"))
+  ) {
+    return true;
+  }
+  return false;
+}
+
 function captureCloudflareAccessCookie(options: {
   readonly origin: string;
   readonly parent: Electron.BrowserWindow | undefined;
@@ -172,8 +313,17 @@ function captureCloudflareAccessCookie(options: {
       const session = authWindow.webContents.session;
       const abort = new AbortController();
       let closeHandler: (() => void) | undefined;
+      let observedCloudflareAccessLoginNavigation = false;
       let capturedReplacementCookie = false;
       let previousAccessCookies: ReadonlyArray<Electron.Cookie> = [];
+      const observeNavigation = (_event: Electron.Event, navigationUrl: string) => {
+        if (isCloudflareAccessLoginUrl(navigationUrl)) {
+          observedCloudflareAccessLoginNavigation = true;
+        }
+      };
+      authWindow.webContents.on("did-start-navigation", observeNavigation);
+      authWindow.webContents.on("will-redirect", observeNavigation);
+      authWindow.webContents.on("did-redirect-navigation", observeNavigation);
 
       try {
         previousAccessCookies = (await readAccessCookies(session, options.origin)).filter(
@@ -233,6 +383,9 @@ function captureCloudflareAccessCookie(options: {
         const waitForLoadFailure = authWindow.loadURL(options.origin).then(
           () => new Promise<never>(() => {}),
           (cause: unknown) => {
+            if (isLoadUrlRedirectInterruption(cause, observedCloudflareAccessLoginNavigation)) {
+              return new Promise<never>(() => {});
+            }
             throw new DesktopCloudflareAccessLoginError({
               reason: "authentication",
               detail: "Could not open the Cloudflare Access sign-in page.",
@@ -255,6 +408,9 @@ function captureCloudflareAccessCookie(options: {
           }
         } finally {
           abort.abort();
+          authWindow.webContents.removeListener("did-start-navigation", observeNavigation);
+          authWindow.webContents.removeListener("will-redirect", observeNavigation);
+          authWindow.webContents.removeListener("did-redirect-navigation", observeNavigation);
           if (closeHandler !== undefined) {
             authWindow.removeListener("closed", closeHandler);
           }
@@ -327,6 +483,44 @@ export const installCloudflareAccessCookie = DesktopIpc.makeIpcMethod({
           : new DesktopCloudflareAccessLoginError({
               reason: "authentication",
               detail: "Could not restore the Cloudflare Access session cookie.",
+              cause,
+            }),
+    });
+  }),
+});
+
+export const installCloudflareAccessCredentials = DesktopIpc.makeIpcMethod({
+  channel: IpcChannels.INSTALL_CLOUDFLARE_ACCESS_CREDENTIALS_CHANNEL,
+  payload: DesktopCloudflareAccessCredentialsInstallInputSchema,
+  result: Schema.Void,
+  handler: Effect.fn("desktop.ipc.cloudflareAccess.installCredentials")(function* (input) {
+    const origin = yield* Effect.try({
+      try: () => normalizeCloudflareAccessOrigin(input.host),
+      catch: (cause) =>
+        new DesktopCloudflareAccessLoginError({
+          reason: "configuration",
+          detail: "Enter a valid remote host before installing Cloudflare Access credentials.",
+          cause,
+        }),
+    });
+    yield* Effect.tryPromise({
+      try: async () => {
+        const session = Electron.session.defaultSession;
+        const cookieValue = input.cookieValue?.trim() ?? "";
+        if (input.clearCookies === true || cookieValue.length > 0) {
+          await clearAccessCookies(session, origin);
+        }
+        configureCloudflareAccessHeaders(session, origin, input.headers);
+        if (cookieValue.length > 0) {
+          await installAccessCookie(session, origin, cookieValue);
+        }
+      },
+      catch: (cause) =>
+        isDesktopCloudflareAccessLoginError(cause)
+          ? cause
+          : new DesktopCloudflareAccessLoginError({
+              reason: "authentication",
+              detail: "Could not install the Cloudflare Access credentials.",
               cause,
             }),
     });
