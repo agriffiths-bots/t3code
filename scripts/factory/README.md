@@ -18,8 +18,11 @@ remediation steps.
    files show up as unstaged differences and trip the same scope guard.
 2. **Static checks** — `vp run typecheck` + `vp check` (from
    `factory.conf`; they never modify files).
-3. **Autoreview** — Codex `gpt-5.5` (high) over exactly the staged diff
-   (`--mode local`). Clean review ⇒ commit passes. Findings ⇒ commit refused.
+3. **Autoreview panel** — Codex `gpt-5.5` (high) runs first over exactly the
+   staged diff (`--mode local`). Once Codex is clean, or all Codex findings
+   are validly dismissed, Claude `claude-opus-4-8` (high) runs as the
+   confirming reviewer. Clean panel ⇒ commit passes. Findings from either
+   phase ⇒ commit refused.
 
 A PASS is cached against the `(HEAD, staged-tree)` pair, so retries and the
 `--prepare` pre-warm are instant. Any staged change invalidates the cache.
@@ -63,6 +66,10 @@ Write `.git/factory/dismissals.json` (schema in the header of
   first sequencer-created commit can only be caught by the PR-level gate
   (CI + Codex via wizzo-approve). Rebase continuations remain a git-design
   gap covered by the same PR-level gate.
+- `FACTORY_CONFIRM=0` — skips the configured confirming reviewer(s) for a
+  single invocation. This is audited and the cache key records the skip, so a
+  Codex-only pass cannot be reused as a full-panel pass. Use it only when the
+  Claude/Opus budget or availability makes the full panel impractical.
 
 Audit trail: `~/.openclaw/audit/factory-precommit.jsonl` (every pass, refusal,
 dismissal, and skip, with finding details).

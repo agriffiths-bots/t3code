@@ -2,7 +2,7 @@
 # precommit-gate.sh — the software-factory commit gate.
 #
 # Guarantees every commit (1) was built from a fully-staged tree, (2) passes
-# the repo's static checks, and (3) is clean on autoreview
+# the repo's static checks, and (3) is clean on the configured autoreview panel
 # — or carries an explicit, audited dismissal for every finding.
 #
 # Modes:
@@ -44,6 +44,9 @@
 #   FACTORY_SKIP=1 FACTORY_SKIP_REASON="..."   skip the whole gate (upstream-
 #     sync driver only: its PRs merge via the CI-only policy instead, and it
 #     must set this for every commit/continuation it performs)
+#   FACTORY_CONFIRM=0                          skip the confirming reviewer(s),
+#     e.g. Claude/Opus, for this invocation only. The cache key records the
+#     skip so it cannot be reused as a full-panel pass.
 #   FACTORY_ALLOW_UNTRACKED=1                  permit untracked files to remain
 #     (they are NOT in the commit; only set this when that is intentional)
 set -uo pipefail
@@ -67,6 +70,7 @@ fi
 MARKER="$STATE_DIR/gate-ok"
 REVIEW_JSON="$STATE_DIR/last-review.json"
 REVIEW_FOR="$STATE_DIR/review-for"
+CONFIRM_FOR="$STATE_DIR/confirm-for"
 DISMISSALS="$STATE_DIR/dismissals.json"
 
 # FACTORY_GATE_FROM_HEAD may only be trusted when THIS process really is a
@@ -106,6 +110,12 @@ fi
 # yet (first installation commit). ----
 FACTORY_STATIC_CHECKS=()
 FACTORY_REVIEW_ARGS=()
+# Two-phase panel: FACTORY_REVIEW_ARGS is the PRIMARY (iterating) reviewer.
+# FACTORY_REVIEW_CONFIRM_ARGS, if non-empty, names the CONFIRMING reviewer(s),
+# run only once the primary is clean or all its findings are dismissed for the
+# exact staged tree. FACTORY_CONFIRM=0 skips this confirming phase for one
+# invocation and records that in the cache key.
+FACTORY_REVIEW_CONFIRM_ARGS=()
 FACTORY_AUTOREVIEW_BIN="$HOME/.claude/skills/autoreview/scripts/autoreview"
 FACTORY_UPSTREAM_REF="upstream/main"
 FACTORY_AUDIT_LOG="$HOME/.openclaw/audit/factory-precommit.jsonl"
@@ -131,6 +141,9 @@ fi
 # An empty check list means a broken/neutered config — never a silent pass.
 if [ -z "$CONF_ERR" ] && [ "${#FACTORY_STATIC_CHECKS[@]}" -eq 0 ]; then
   CONF_ERR="no static checks configured (bad or missing factory.conf)"
+fi
+if [ -z "$CONF_ERR" ] && [ "${#FACTORY_REVIEW_ARGS[@]}" -eq 0 ]; then
+  CONF_ERR="no autoreview reviewers configured (bad or missing factory.conf)"
 fi
 
 command -v jq >/dev/null || { echo "factory-gate: jq is required" >&2; exit 2; }
@@ -190,6 +203,60 @@ discard_stale_dismissals() {
   [ -f "$DISMISSALS" ] || return 0
   mv "$DISMISSALS" "$STATE_DIR/dismissals-stale-$(date +%s).json"
   echo "factory-gate: discarded stale dismissals (this pass/skip did not consume them)" >&2
+}
+
+review_confirm_enabled() {
+  [ "${#FACTORY_REVIEW_CONFIRM_ARGS[@]}" -gt 0 ] && [ "${FACTORY_CONFIRM:-1}" != "0" ]
+}
+
+review_set_id() {
+  if review_confirm_enabled; then
+    printf '%s' "review-panel:full"
+  elif [ "${#FACTORY_REVIEW_CONFIRM_ARGS[@]}" -gt 0 ]; then
+    printf '%s' "review-panel:confirm-skipped"
+  else
+    printf '%s' "review-panel:single"
+  fi
+}
+
+report_is_clean() {
+  jq -e '(.findings | type == "array") and (.findings | length == 0) and (.overall_correctness == "patch is correct")' "$1" >/dev/null 2>&1
+}
+
+report_has_findings() {
+  jq -e '(.findings | type == "array") and (.findings | length > 0)' "$1" >/dev/null 2>&1
+}
+
+run_confirm_phase() {
+  [ "${#FACTORY_REVIEW_CONFIRM_ARGS[@]}" -gt 0 ] || return 0
+  if [ "${FACTORY_CONFIRM:-1}" = "0" ]; then
+    echo "factory-gate: FACTORY_CONFIRM=0 — skipping the confirming reviewer(s) for this invocation" >&2
+    return 0
+  fi
+  [ -f "$CONFIRM_FOR" ] && [ "$(cat "$CONFIRM_FOR" 2>/dev/null)" = "$GATE_ID" ] && return 0
+  echo "factory-gate: primary phase satisfied — running the confirming reviewer(s)" >&2
+  local out rc
+  out="$STATE_DIR/confirm-review.json"
+  rm -f "$out"
+  "$FACTORY_AUTOREVIEW_BIN" --mode local "${FACTORY_REVIEW_CONFIRM_ARGS[@]}" --json-output "$out" 1>&2
+  rc=$?
+  if [ "$rc" -eq 0 ]; then
+    report_is_clean "$out" \
+      || refuse "confirm review exited 0 but $out is missing, unparseable, or non-empty.
+  Check FACTORY_AUTOREVIEW_BIN — refusing to cache a PASS without a clean report." review-infra \
+      "$(jq -cn '{phase:"confirm",review_rc:0,report:"invalid"}')"
+    echo "$GATE_ID" > "$CONFIRM_FOR"
+    return 0
+  fi
+  report_has_findings "$out" \
+    || refuse "confirm review failed without a findings report (engine failure?).
+  Retry the commit; if it persists, run the helper by hand:
+    $FACTORY_AUTOREVIEW_BIN --mode local ${FACTORY_REVIEW_CONFIRM_ARGS[*]}" review-infra \
+    "$(jq -cn --arg rc "$rc" '{phase:"confirm",review_rc:($rc|tonumber)}')"
+  mv "$out" "$REVIEW_JSON"
+  echo "$GATE_ID" > "$REVIEW_FOR"
+  echo "$GATE_ID" > "$CONFIRM_FOR"
+  return 1
 }
 
 # ---- status mode ----
@@ -269,7 +336,8 @@ done
 
 HEAD_SHA="$(head_sha)"
 TREE_SHA="$(git write-tree)" || refuse "git write-tree failed (unmerged index?)" scope-write-tree '{}'
-GATE_ID="$HEAD_SHA $TREE_SHA"
+REVIEW_SET_ID="$(review_set_id)"
+GATE_ID="$HEAD_SHA $TREE_SHA $REVIEW_SET_ID"
 
 # ---- cached pass ----
 if [ -f "$MARKER" ] && [ "$(cat "$MARKER")" = "$GATE_ID" ]; then
@@ -298,10 +366,12 @@ else
     fi
   done
 
-  # ---- autoreview over exactly the staged diff ----
+  # ---- autoreview, phase 1: the primary reviewer over exactly the staged
+  # diff. Refusal rounds end here; the confirming reviewer runs only after
+  # the primary is clean or fully dismissed. ----
   [ -x "$FACTORY_AUTOREVIEW_BIN" ] || refuse "autoreview helper not found at $FACTORY_AUTOREVIEW_BIN" review-infra '{}'
-  echo "factory-gate: autoreview (this can take several minutes; pre-warm next time with scripts/factory/precommit-gate.sh --prepare)" >&2
-  rm -f "$REVIEW_JSON" "$REVIEW_FOR"
+  echo "factory-gate: autoreview primary phase (minutes; pre-warm next time with scripts/factory/precommit-gate.sh --prepare)" >&2
+  rm -f "$REVIEW_JSON" "$REVIEW_FOR" "$CONFIRM_FOR"
   "$FACTORY_AUTOREVIEW_BIN" --mode local "${FACTORY_REVIEW_ARGS[@]}" --json-output "$REVIEW_JSON" 1>&2
   review_rc=$?
 
@@ -309,39 +379,47 @@ else
     # Never cache a PASS on exit code alone: require a parseable report whose
     # findings are an ACTUAL empty array with a clean verdict (jq's
     # `null|length` is 0, so `{}`-style output must not slip through).
-    if ! jq -e '(.findings | type == "array") and (.findings | length == 0) and (.overall_correctness == "patch is correct")' "$REVIEW_JSON" >/dev/null 2>&1; then
+    if ! report_is_clean "$REVIEW_JSON"; then
       refuse "review exited 0 but $REVIEW_JSON is missing, unparseable, or non-empty.
   Check FACTORY_AUTOREVIEW_BIN — refusing to cache a PASS without a clean report." review-infra \
       "$(jq -cn '{review_rc:0,report:"invalid"}')"
     fi
-    discard_stale_dismissals
-    echo "$GATE_ID" > "$MARKER"
-    echo "factory-gate: PASS (static checks + clean review)" >&2
-    audit pass "$(jq -cn --arg g "$GATE_ID" '{gate_id:$g,review:"clean"}')"
-    exit 0
-  fi
-
-  # Review returned findings (or died). Findings without a parsable report are
-  # an infra failure — never a bypass.
-  if ! jq -e '.findings' "$REVIEW_JSON" >/dev/null 2>&1; then
-    refuse "autoreview did not produce a findings report (engine failure?).
+    if run_confirm_phase; then
+      discard_stale_dismissals
+      echo "$GATE_ID" > "$MARKER"
+      echo "factory-gate: PASS (static checks + clean panel)" >&2
+      audit pass "$(jq -cn --arg g "$GATE_ID" '{gate_id:$g,review:"clean"}')"
+      exit 0
+    fi
+    # The confirming reviewer returned findings; they are now the outstanding
+    # report (REVIEW_JSON/REVIEW_FOR set by run_confirm_phase) and flow into
+    # the findings handling below exactly like a primary refusal.
+  else
+    # Primary returned findings (or died). Findings without a parsable report
+    # are an infra failure — never a bypass.
+    if ! jq -e '.findings' "$REVIEW_JSON" >/dev/null 2>&1; then
+      refuse "autoreview did not produce a findings report (engine failure?).
   Retry the commit; if it persists, run the helper by hand:
     $FACTORY_AUTOREVIEW_BIN --mode local ${FACTORY_REVIEW_ARGS[*]}" review-infra \
-    "$(jq -cn --arg rc "$review_rc" '{review_rc:($rc|tonumber)}')"
-  fi
-  if [ "$(jq '.findings | length' "$REVIEW_JSON")" -eq 0 ]; then
-    refuse "review exited $review_rc with zero findings (overall verdict: $(jq -r '.overall_correctness // "?"' "$REVIEW_JSON")).
+      "$(jq -cn --arg rc "$review_rc" '{review_rc:($rc|tonumber)}')"
+    fi
+    if [ "$(jq '.findings | length' "$REVIEW_JSON")" -eq 0 ]; then
+      refuse "review exited $review_rc with zero findings (overall verdict: $(jq -r '.overall_correctness // "?"' "$REVIEW_JSON")).
   Inspect $REVIEW_JSON and re-run." review-infra "$(jq -cn --arg rc "$review_rc" '{review_rc:($rc|tonumber),findings:0}')"
+    fi
+    echo "$GATE_ID" > "$REVIEW_FOR"
   fi
-  echo "$GATE_ID" > "$REVIEW_FOR"
 fi
 
 # The helper's validated schema is {file_path, line}; the alternate
 # {absolute_file_path, line_range.start} shape is accepted defensively (it
 # cannot pass the helper's validator today, but parsing it costs nothing and
 # an unknown shape still fails closed as null:null → unmatchable → refused).
-findings="$(jq -c --arg root "$REPO_ROOT/" \
-  '[.findings[] | {file:((.code_location.file_path // .code_location.absolute_file_path) | ltrimstr($root) | ltrimstr("./")), line:(.code_location.line // .code_location.line_range.start), title, priority, category}]' "$REVIEW_JSON")"
+norm_findings() {
+  jq -c --arg root "$REPO_ROOT/" \
+    '[.findings[] | {file:((.code_location.file_path // .code_location.absolute_file_path) | ltrimstr($root) | ltrimstr("./")), line:(.code_location.line // .code_location.line_range.start), title, priority, category}]' "$REVIEW_JSON"
+}
+findings="$(norm_findings)"
 n_findings="$(jq 'length' <<<"$findings")"
 
 # ---- dismissals: refuse-by-default, dismiss-by-exception ----
@@ -380,19 +458,11 @@ fi
 uncovered="$(jq -c --argjson dis "$valid_dismissals" \
   '[.[] | . as $f | select(([$dis[] | select(.file == $f.file and .line == $f.line and .title == $f.title)] | length) == 0)]' <<<"$findings")"
 
-if [ "$(jq 'length' <<<"$uncovered")" -eq 0 ]; then
-  audit pass-with-dismissals "$(jq -cn --arg g "$GATE_ID" --argjson f "$findings" --argjson d "$valid_dismissals" \
-    '{gate_id:$g,findings:$f,dismissals:$d}')"
-  mv "$DISMISSALS" "$STATE_DIR/dismissals-used-$(date +%s).json"
-  echo "$GATE_ID" > "$MARKER"
-  echo "factory-gate: PASS — all $n_findings finding(s) covered by valid, audited dismissals" >&2
-  exit 0
-fi
-
-echo "" >&2
-echo "factory-gate: $n_findings review finding(s); $(jq 'length' <<<"$uncovered") not covered by a valid dismissal:" >&2
-jq -r '.[] | "  [\(.priority)] \(.file):\(.line) — \(.title)"' <<<"$uncovered" >&2
-cat >&2 <<EOF
+refuse_outstanding() { # refuse_outstanding <uncovered-json> <n-findings> <valid-dismissals-json>
+  echo "" >&2
+  echo "factory-gate: $2 review finding(s); $(jq 'length' <<<"$1") not covered by a valid dismissal:" >&2
+  jq -r '.[] | "  [\(.priority)] \(.file):\(.line) — \(.title)"' <<<"$1" >&2
+  cat >&2 <<EOF
 
   Next steps (in order of preference):
   1. FIX the findings, git add -A, and retry (full report: $REVIEW_JSON).
@@ -403,5 +473,29 @@ cat >&2 <<EOF
      Dismissals are validated, single-use, and audit-logged; the PR merge gate
      (CI + Codex on HEAD) still applies regardless.
 EOF
-refuse "review findings outstanding" review-findings \
-  "$(jq -cn --arg g "$GATE_ID" --argjson f "$findings" --argjson d "$valid_dismissals" '{gate_id:$g,findings:$f,valid_dismissals:$d}')"
+  refuse "review findings outstanding" review-findings \
+    "$(jq -cn --arg g "$GATE_ID" --argjson f "$1" --argjson d "$3" '{gate_id:$g,findings:$f,valid_dismissals:$d}')"
+}
+
+if [ "$(jq 'length' <<<"$uncovered")" -eq 0 ]; then
+  if run_confirm_phase; then
+    audit pass-with-dismissals "$(jq -cn --arg g "$GATE_ID" --argjson f "$findings" --argjson d "$valid_dismissals" \
+      '{gate_id:$g,findings:$f,dismissals:$d}')"
+    mv "$DISMISSALS" "$STATE_DIR/dismissals-used-$(date +%s).json"
+    echo "$GATE_ID" > "$MARKER"
+    echo "factory-gate: PASS — all $n_findings finding(s) covered by valid, audited dismissals" >&2
+    exit 0
+  fi
+  # The dismissals satisfied the primary phase, but the confirming reviewer
+  # returned fresh findings. Consume the primary dismissals (they did their
+  # job, audited) and refuse with the confirm findings; they need their own
+  # fixes or dismissals.
+  audit dismissals-consumed "$(jq -cn --arg g "$GATE_ID" --argjson f "$findings" --argjson d "$valid_dismissals" \
+    '{gate_id:$g,phase:"pre-confirm",findings:$f,dismissals:$d}')"
+  mv "$DISMISSALS" "$STATE_DIR/dismissals-used-$(date +%s).json"
+  findings="$(norm_findings)"
+  n_findings="$(jq 'length' <<<"$findings")"
+  refuse_outstanding "$findings" "$n_findings" "[]"
+fi
+
+refuse_outstanding "$uncovered" "$n_findings" "$valid_dismissals"
