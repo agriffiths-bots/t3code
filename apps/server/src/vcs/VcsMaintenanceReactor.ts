@@ -46,6 +46,7 @@ export interface WorktreeMaintenanceRow {
 
 export interface WorktreeReapCandidate {
   readonly threadId: string;
+  readonly threadIds: ReadonlyArray<string>;
   readonly projectCwd: string;
   readonly path: string;
 }
@@ -117,6 +118,36 @@ function isRowOldEnough(
   return ageMs >= options.stoppedAgeMs;
 }
 
+function isProtectedProjectPath(path: string, projectRoots: ReadonlyArray<string>): boolean {
+  return (
+    projectRoots.some((projectRoot) => isSameOrNestedPath(projectRoot, path)) ||
+    projectRoots.some((projectRoot) => isSameOrNestedPath(path, projectRoot))
+  );
+}
+
+function reapEligibility(
+  row: WorktreeMaintenanceRow,
+  normalizedProjectRoots: ReadonlyArray<string>,
+  nowMs: number,
+  options: Required<WorktreeReapOptions>,
+): { readonly path: string; readonly key: string } | null {
+  const removalPath = rowRemovalPath(row);
+  if (
+    !removalPath ||
+    !row.worktreeRemovable ||
+    isRowActive(row) ||
+    !isRowOldEnough(row, nowMs, options) ||
+    isProtectedProjectPath(removalPath, normalizedProjectRoots)
+  ) {
+    return null;
+  }
+
+  return {
+    path: removalPath,
+    key: `${row.projectCwd}\0${removalPath}`,
+  };
+}
+
 export function selectStaleWorktreeReapCandidates(
   rows: ReadonlyArray<WorktreeMaintenanceRow>,
   projectRoots: ReadonlyArray<string>,
@@ -133,44 +164,54 @@ export function selectStaleWorktreeReapCandidates(
   });
   const candidates: WorktreeReapCandidate[] = [];
   const selectedPaths = new Set<string>();
+  const eligibilityByThreadId = new Map<string, { readonly path: string; readonly key: string }>();
 
   for (const row of rows) {
-    const removalPath = rowRemovalPath(row);
-    if (!removalPath || selectedPaths.has(removalPath)) {
-      continue;
+    const eligibility = reapEligibility(row, normalizedProjectRoots, nowMs, resolvedOptions);
+    if (eligibility) {
+      eligibilityByThreadId.set(row.threadId, eligibility);
     }
-    if (
-      !row.worktreeRemovable ||
-      isRowActive(row) ||
-      !isRowOldEnough(row, nowMs, resolvedOptions)
-    ) {
-      continue;
-    }
-    if (
-      normalizedProjectRoots.some((projectRoot) => isSameOrNestedPath(projectRoot, removalPath)) ||
-      normalizedProjectRoots.some((projectRoot) => isSameOrNestedPath(removalPath, projectRoot))
-    ) {
+  }
+
+  for (const row of rows) {
+    const eligibility = eligibilityByThreadId.get(row.threadId);
+    if (!eligibility || selectedPaths.has(eligibility.key)) {
       continue;
     }
 
-    const sharedByLiveThread = rows.some((other) => {
+    const sharedByRetainedThread = rows.some((other) => {
       if (other.threadId === row.threadId || other.deletedAt !== null) {
         return false;
       }
-      return (
-        pathsOverlap(rowWorktreePath(other), removalPath) ||
-        pathsOverlap(rowRemovalPath(other), removalPath)
-      );
+      if (
+        !pathsOverlap(rowWorktreePath(other), eligibility.path) &&
+        !pathsOverlap(rowRemovalPath(other), eligibility.path)
+      ) {
+        return false;
+      }
+
+      const otherEligibility = eligibilityByThreadId.get(other.threadId);
+      return otherEligibility?.key !== eligibility.key;
     });
-    if (sharedByLiveThread) {
+    if (sharedByRetainedThread) {
       continue;
     }
 
-    selectedPaths.add(removalPath);
+    const threadIds = Array.from(
+      new Set(
+        rows.flatMap((other) => {
+          const otherEligibility = eligibilityByThreadId.get(other.threadId);
+          return otherEligibility?.key === eligibility.key ? [other.threadId] : [];
+        }),
+      ),
+    );
+
+    selectedPaths.add(eligibility.key);
     candidates.push({
       threadId: row.threadId,
+      threadIds,
       projectCwd: row.projectCwd,
-      path: removalPath,
+      path: eligibility.path,
     });
   }
 
@@ -268,16 +309,27 @@ const make = Effect.gen(function* () {
         return;
       }
 
-      const checkpointResult = yield* checkpointStore.pruneCheckpointRefs({
-        cwd: projectRoot,
-        keepPerThread: CHECKPOINT_REFS_KEEP_PER_THREAD,
-      });
-      if (checkpointResult.deletedCount > 0) {
-        yield* Effect.logInfo("vcs.maintenance.checkpoint-refs-pruned", {
-          projectRoot,
-          ...checkpointResult,
-        });
-      }
+      yield* checkpointStore
+        .pruneCheckpointRefs({
+          cwd: projectRoot,
+          keepPerThread: CHECKPOINT_REFS_KEEP_PER_THREAD,
+        })
+        .pipe(
+          Effect.tap((checkpointResult) =>
+            checkpointResult.deletedCount > 0
+              ? Effect.logInfo("vcs.maintenance.checkpoint-refs-pruned", {
+                  projectRoot,
+                  ...checkpointResult,
+                })
+              : Effect.void,
+          ),
+          Effect.catch((error) =>
+            Effect.logWarning("vcs.maintenance.checkpoint-refs-prune-failed", {
+              projectRoot,
+              detail: errorDetail(error),
+            }),
+          ),
+        );
 
       yield* git.pruneWorktrees(projectRoot).pipe(
         Effect.catch((error) =>
@@ -310,40 +362,42 @@ const make = Effect.gen(function* () {
         .pipe(
           Effect.tap(() =>
             Effect.gen(function* () {
-              const commandId = yield* serverCommandId("vcs-maintenance-worktree-reaped").pipe(
-                Effect.orDie,
-              );
-              yield* orchestrationEngine
-                .dispatch({
-                  type: "thread.meta.update",
-                  commandId,
-                  threadId: ThreadId.make(candidate.threadId),
-                  worktreePath: null,
-                  worktreeRemovable: false,
-                  worktreeRemovalPath: null,
-                })
-                .pipe(
-                  Effect.tap(() =>
-                    Effect.logInfo("vcs.maintenance.worktree-reaped", {
-                      threadId: candidate.threadId,
-                      projectRoot: candidate.projectCwd,
-                      path: candidate.path,
-                    }),
-                  ),
-                  Effect.catchCause((cause) =>
-                    Effect.logWarning("vcs.maintenance.worktree-metadata-clear-failed", {
-                      threadId: candidate.threadId,
-                      projectRoot: candidate.projectCwd,
-                      path: candidate.path,
-                      cause: Cause.pretty(cause),
-                    }),
-                  ),
+              for (const threadId of candidate.threadIds) {
+                const commandId = yield* serverCommandId("vcs-maintenance-worktree-reaped").pipe(
+                  Effect.orDie,
                 );
+                yield* orchestrationEngine
+                  .dispatch({
+                    type: "thread.meta.update",
+                    commandId,
+                    threadId: ThreadId.make(threadId),
+                    worktreePath: null,
+                    worktreeRemovable: false,
+                    worktreeRemovalPath: null,
+                  })
+                  .pipe(
+                    Effect.tap(() =>
+                      Effect.logInfo("vcs.maintenance.worktree-reaped", {
+                        threadId,
+                        projectRoot: candidate.projectCwd,
+                        path: candidate.path,
+                      }),
+                    ),
+                    Effect.catchCause((cause) =>
+                      Effect.logWarning("vcs.maintenance.worktree-metadata-clear-failed", {
+                        threadId,
+                        projectRoot: candidate.projectCwd,
+                        path: candidate.path,
+                        cause: Cause.pretty(cause),
+                      }),
+                    ),
+                  );
+              }
             }),
           ),
           Effect.catch((error) =>
             Effect.logWarning("vcs.maintenance.worktree-reap-skipped", {
-              threadId: candidate.threadId,
+              threadIds: candidate.threadIds,
               projectRoot: candidate.projectCwd,
               path: candidate.path,
               detail: errorDetail(error),
@@ -355,10 +409,10 @@ const make = Effect.gen(function* () {
 
   const runSweep = Effect.fn("VcsMaintenanceReactor.runSweep")(function* () {
     const projectRoots = yield* listProjectRoots();
+    yield* reapWorktrees(projectRoots);
     for (const projectRoot of projectRoots) {
       yield* pruneProjectRepository(projectRoot);
     }
-    yield* reapWorktrees(projectRoots);
   });
 
   const sweep: VcsMaintenanceReactorShape["sweep"] = () =>

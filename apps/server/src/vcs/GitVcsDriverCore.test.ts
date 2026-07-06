@@ -523,6 +523,27 @@ it.layer(TestLayer)("GitVcsDriver core integration", (it) => {
       }),
     );
 
+    it.effect("keeps local refs available when a remote-tracking ref is broken", () =>
+      Effect.gen(function* () {
+        const cwd = yield* makeTmpDir();
+        const { initialBranch } = yield* initRepoWithCommit(cwd);
+        const fileSystem = yield* FileSystem.FileSystem;
+        const pathService = yield* Path.Path;
+        const brokenRefPath = pathService.join(cwd, ".git", "refs", "remotes", "origin", "broken");
+        yield* fileSystem.makeDirectory(pathService.dirname(brokenRefPath), { recursive: true });
+        yield* fileSystem.writeFileString(brokenRefPath, "not-a-commit\n");
+        const driver = yield* GitVcsDriver.GitVcsDriver;
+
+        const refs = yield* driver.listRefs({ cwd, includeMatchingRemoteRefs: true });
+
+        assert.equal(refs.isRepo, true);
+        assert.equal(
+          refs.refs.some((ref) => ref.name === initialBranch && !ref.isRemote),
+          true,
+        );
+      }),
+    );
+
     it.effect("creates, checks out, renames, and lists refs", () =>
       Effect.gen(function* () {
         const cwd = yield* makeTmpDir();

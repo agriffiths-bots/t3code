@@ -41,8 +41,74 @@ describe("selectStaleWorktreeReapCandidates", () => {
     ).toEqual([
       {
         threadId: "thread-old",
+        threadIds: ["thread-old"],
         projectCwd: "/repo",
         path: "/worktrees/thread-old",
+      },
+    ]);
+  });
+
+  it("coalesces shared stale archived worktree paths", () => {
+    expect(
+      selectStaleWorktreeReapCandidates(
+        [
+          row({
+            threadId: "archived-a",
+            worktreePath: "/worktrees/shared-archived",
+            archivedAt: "2026-07-06T11:30:00.000Z",
+            updatedAt: "2026-07-06T11:30:00.000Z",
+          }),
+          row({
+            threadId: "archived-b",
+            worktreePath: "/worktrees/shared-archived",
+            archivedAt: "2026-07-06T11:30:00.000Z",
+            updatedAt: "2026-07-06T11:30:00.000Z",
+          }),
+        ],
+        ["/repo"],
+        NOW,
+        {
+          archivedAgeMs: 20 * 60_000,
+          stoppedAgeMs: 60 * 60_000,
+        },
+      ),
+    ).toEqual([
+      {
+        threadId: "archived-a",
+        threadIds: ["archived-a", "archived-b"],
+        projectCwd: "/repo",
+        path: "/worktrees/shared-archived",
+      },
+    ]);
+  });
+
+  it("does not let deleted metadata rows retain a stale worktree path", () => {
+    expect(
+      selectStaleWorktreeReapCandidates(
+        [
+          row({
+            threadId: "stale",
+            worktreePath: "/worktrees/deleted-row-overlap",
+          }),
+          row({
+            threadId: "deleted-metadata",
+            worktreePath: "/worktrees/deleted-row-overlap",
+            worktreeRemovable: false,
+            deletedAt: "2026-07-06T11:30:00.000Z",
+          }),
+        ],
+        ["/repo"],
+        NOW,
+        {
+          stoppedAgeMs: 60_000,
+        },
+      ),
+    ).toEqual([
+      {
+        threadId: "stale",
+        threadIds: ["stale"],
+        projectCwd: "/repo",
+        path: "/worktrees/deleted-row-overlap",
       },
     ]);
   });
