@@ -962,6 +962,21 @@ export const DesktopCloudflareAccessCookieInstallInputSchema = Schema.Struct({
 export type DesktopCloudflareAccessCookieInstallInput =
   typeof DesktopCloudflareAccessCookieInstallInputSchema.Type;
 
+const DesktopCloudflareAccessCredentialsHeadersSchema = Schema.Struct({
+  "cf-access-client-id": Schema.optionalKey(Schema.String),
+  "cf-access-client-secret": Schema.optionalKey(Schema.String),
+  "cf-access-jwt-assertion": Schema.optionalKey(Schema.String),
+});
+
+export const DesktopCloudflareAccessCredentialsInstallInputSchema = Schema.Struct({
+  host: Schema.String,
+  headers: DesktopCloudflareAccessCredentialsHeadersSchema,
+  clearCookies: Schema.optionalKey(Schema.Boolean),
+  cookieValue: Schema.optionalKey(Schema.String),
+});
+export type DesktopCloudflareAccessCredentialsInstallInput =
+  typeof DesktopCloudflareAccessCredentialsInstallInputSchema.Type;
+
 export interface DesktopBridge {
   getAppBranding: () => DesktopAppBranding | null;
   // One bootstrap per pool instance currently registered with bootstrap
@@ -979,6 +994,9 @@ export interface DesktopBridge {
   ) => Promise<DesktopCloudflareAccessLoginResult>;
   installCloudflareAccessCookie?: (
     input: DesktopCloudflareAccessCookieInstallInput,
+  ) => Promise<void>;
+  installCloudflareAccessCredentials?: (
+    input: DesktopCloudflareAccessCredentialsInstallInput,
   ) => Promise<void>;
   discoverSshHosts: () => Promise<readonly DesktopDiscoveredSshHost[]>;
   ensureSshEnvironment: (

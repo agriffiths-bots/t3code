@@ -1,6 +1,11 @@
 import type { DesktopWslState } from "@t3tools/contracts";
 import { describe, expect, it, vi } from "vite-plus/test";
-import { applyWslEnableSelection } from "./ConnectionsSettings.logic";
+import {
+  applyWslEnableSelection,
+  parsePairingUrlFields,
+  parseRemotePairingHostChange,
+  parseRemotePairingFields,
+} from "./ConnectionsSettings.logic";
 
 const baseWslState: DesktopWslState = {
   enabled: false,
@@ -71,5 +76,81 @@ describe("applyWslEnableSelection", () => {
     expect(calls).toEqual(["setWslOnly:true", "setWslBackendEnabled:true"]);
     expect(setWslDistro).not.toHaveBeenCalled();
     expect(state).toMatchObject({ enabled: true, wslOnly: true });
+  });
+});
+
+describe("remote pairing field parsing", () => {
+  it("preserves Cloudflare Access service-token fields from pairing URL fragments", () => {
+    expect(
+      parsePairingUrlFields(
+        "https://remote.example.test/pair#token=pairing-token&cf_access_client_id=client-id&cf_access_client_secret=client-secret",
+      ),
+    ).toEqual({
+      host: "https://remote.example.test/",
+      pairingCode: "pairing-token",
+      cloudflareAccessClientId: "client-id",
+      cloudflareAccessClientSecret: "client-secret",
+    });
+  });
+
+  it("clears stale Cloudflare Access fields when host changes to a manual host", () => {
+    expect(parseRemotePairingHostChange("remote.example.test")).toEqual({
+      host: "remote.example.test",
+      cloudflareAccessToken: "",
+      cloudflareAccessClientId: "",
+      cloudflareAccessClientSecret: "",
+    });
+  });
+
+  it("repopulates Cloudflare Access fields when host changes to a pairing URL", () => {
+    expect(
+      parseRemotePairingHostChange(
+        "https://remote.example.test/pair#token=pairing-token&cf_access_client_id=client-id&cf_access_client_secret=client-secret",
+      ),
+    ).toEqual({
+      host: "https://remote.example.test/",
+      pairingCode: "pairing-token",
+      cloudflareAccessToken: "",
+      cloudflareAccessClientId: "client-id",
+      cloudflareAccessClientSecret: "client-secret",
+    });
+  });
+
+  it("preserves Cloudflare Access JWT fields from hosted pairing URL fragments", () => {
+    expect(
+      parsePairingUrlFields(
+        "https://app.t3.codes/pair?host=https%3A%2F%2Fdesktop.tailnet.test%3A443#token=pairing-token&cf_access_token=cf-jwt",
+      ),
+    ).toEqual({
+      host: "https://desktop.tailnet.test/",
+      pairingCode: "pairing-token",
+      cloudflareAccessToken: "cf-jwt",
+    });
+  });
+
+  it("passes explicit Cloudflare Access service-token fields with manual host pairing", () => {
+    expect(
+      parseRemotePairingFields({
+        host: "remote.example.test",
+        pairingCode: "pairing-token",
+        cloudflareAccessClientId: " client-id ",
+        cloudflareAccessClientSecret: " client-secret ",
+      }),
+    ).toEqual({
+      host: "remote.example.test",
+      pairingCode: "pairing-token",
+      cloudflareAccessClientId: "client-id",
+      cloudflareAccessClientSecret: "client-secret",
+    });
+  });
+
+  it("rejects incomplete explicit Cloudflare Access service-token fields", () => {
+    expect(() =>
+      parseRemotePairingFields({
+        host: "remote.example.test",
+        pairingCode: "pairing-token",
+        cloudflareAccessClientId: "client-id",
+      }),
+    ).toThrowError("Enter both Cloudflare Access service token fields.");
   });
 });

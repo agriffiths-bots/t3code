@@ -8,7 +8,11 @@ import * as Schema from "effect/Schema";
 import * as SubscriptionRef from "effect/SubscriptionRef";
 import * as HttpClient from "effect/unstable/http/HttpClient";
 
-import { bootstrapRemoteBearerSession } from "../authorization/remote.ts";
+import {
+  bootstrapRemoteBearerSession,
+  cloudflareAccessHeaders,
+  type CloudflareAccessAuthorization,
+} from "../authorization/remote.ts";
 import { deriveWsBaseUrl, normalizeHttpBaseUrl } from "../environment/endpoint.ts";
 import { fetchRemoteEnvironmentDescriptor } from "../environment/descriptor.ts";
 import * as ClientCapabilities from "../platform/capabilities.ts";
@@ -36,6 +40,9 @@ export interface PairingConnectionInput {
   readonly pairingUrl?: string;
   readonly host?: string;
   readonly pairingCode?: string;
+  readonly cloudflareAccessToken?: string;
+  readonly cloudflareAccessClientId?: string;
+  readonly cloudflareAccessClientSecret?: string;
   readonly cloudflareAccessCookie?: string;
 }
 
@@ -110,10 +117,14 @@ function cloudflareAccessFromPairingInput(
 
 function validateCloudflareAccessRuntime(
   cloudflareAccess: ReturnType<typeof cloudflareAccessFromPairingInput>,
+  installer: ClientCapabilities.CloudflareAccessCookieInstaller["Service"],
 ) {
+  const canInstallRequestHeaders =
+    installer.supportsRequestHeaders === true && installer.installRequestHeaders !== undefined;
   if (
     cloudflareAccess?._tag === "service-token" &&
-    !ClientCapabilities.canPassWebSocketHeaderOptions()
+    !ClientCapabilities.canPassWebSocketHeaderOptions() &&
+    !canInstallRequestHeaders
   ) {
     return Effect.fail(
       new ConnectionBlockedError({
@@ -123,16 +134,79 @@ function validateCloudflareAccessRuntime(
       }),
     );
   }
+  if (
+    cloudflareAccess !== undefined &&
+    cloudflareAccess._tag !== "service-token" &&
+    !ClientCapabilities.canPassWebSocketHeaderOptions() &&
+    installer.supportsCookieInstall !== true &&
+    !canInstallRequestHeaders
+  ) {
+    return Effect.fail(
+      new ConnectionBlockedError({
+        reason: "unsupported",
+        detail:
+          "Cloudflare Access JWT/cookie pairing requires a client that can preserve those credentials for WebSocket connections. Use the desktop app, a header-capable client, or sign in interactively before pairing.",
+      }),
+    );
+  }
   return Effect.void;
 }
+
+function cloudflareAccessCookieValue(
+  cloudflareAccess: CloudflareAccessAuthorization | undefined,
+): string | undefined {
+  if (cloudflareAccess === undefined || cloudflareAccess._tag === "service-token") {
+    return undefined;
+  }
+  const value =
+    cloudflareAccess._tag === "cookie" ? cloudflareAccess.cookieValue : cloudflareAccess.jwt;
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : undefined;
+}
+
+const installCloudflareAccessTransport = Effect.fn(
+  "clientRuntime.connection.onboarding.installCloudflareAccessTransport",
+)(function* (
+  installer: ClientCapabilities.CloudflareAccessCookieInstaller["Service"],
+  httpBaseUrl: string,
+  cloudflareAccess: CloudflareAccessAuthorization | undefined,
+) {
+  if (cloudflareAccess === undefined) {
+    if (
+      installer.supportsRequestHeaders === true &&
+      installer.installRequestHeaders !== undefined
+    ) {
+      yield* installer.installRequestHeaders({
+        httpBaseUrl,
+        headers: {},
+      });
+    }
+    return;
+  }
+  const cookieValue = cloudflareAccessCookieValue(cloudflareAccess);
+  if (installer.supportsRequestHeaders === true && installer.installRequestHeaders !== undefined) {
+    yield* installer.installRequestHeaders({
+      httpBaseUrl,
+      headers: cloudflareAccessHeaders(cloudflareAccess),
+      clearCookies: true,
+      ...(cookieValue ? { cookieValue } : {}),
+    });
+    return;
+  }
+  if (cookieValue !== undefined && installer.supportsCookieInstall === true) {
+    yield* installer.install({ httpBaseUrl, cookieValue });
+  }
+});
 
 export const preparePairingRegistration = Effect.fn(
   "clientRuntime.connection.onboarding.preparePairingRegistration",
 )(function* (input: PairingConnectionInput) {
   const target = yield* resolvePairingTarget(input);
   const presentation = yield* ClientCapabilities.ClientPresentation;
+  const installer = yield* ClientCapabilities.CloudflareAccessCookieInstaller;
   const cloudflareAccess = cloudflareAccessFromPairingInput(input, target);
-  yield* validateCloudflareAccessRuntime(cloudflareAccess);
+  yield* validateCloudflareAccessRuntime(cloudflareAccess, installer);
+  yield* installCloudflareAccessTransport(installer, target.httpBaseUrl, cloudflareAccess);
   const descriptor = yield* fetchRemoteEnvironmentDescriptor({
     httpBaseUrl: target.httpBaseUrl,
     ...(cloudflareAccess ? { cloudflareAccess } : {}),
@@ -307,12 +381,17 @@ export const make = Effect.gen(function* () {
   const httpClient = yield* HttpClient.HttpClient;
   const ssh = yield* ClientCapabilities.SshEnvironmentGateway;
   const credentials = yield* ConnectionCredentialStore.ConnectionCredentialStore;
+  const cloudflareAccessInstaller = yield* ClientCapabilities.CloudflareAccessCookieInstaller;
 
   return ConnectionOnboarding.of({
     registerPairing: (input) =>
       registerPairingConnection(input).pipe(
         Effect.provideService(EnvironmentRegistry.EnvironmentRegistry, registry),
         Effect.provideService(ClientCapabilities.ClientPresentation, presentation),
+        Effect.provideService(
+          ClientCapabilities.CloudflareAccessCookieInstaller,
+          cloudflareAccessInstaller,
+        ),
         Effect.provideService(HttpClient.HttpClient, httpClient),
       ),
     registerSsh: (input) =>

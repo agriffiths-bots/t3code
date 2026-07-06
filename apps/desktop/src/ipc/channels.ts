@@ -21,6 +21,8 @@ export const SET_CONNECTION_CATALOG_CHANNEL = "desktop:set-connection-catalog";
 export const CLEAR_CONNECTION_CATALOG_CHANNEL = "desktop:clear-connection-catalog";
 export const AUTHENTICATE_CLOUDFLARE_ACCESS_CHANNEL = "desktop:authenticate-cloudflare-access";
 export const INSTALL_CLOUDFLARE_ACCESS_COOKIE_CHANNEL = "desktop:install-cloudflare-access-cookie";
+export const INSTALL_CLOUDFLARE_ACCESS_CREDENTIALS_CHANNEL =
+  "desktop:install-cloudflare-access-credentials";
 export const DISCOVER_SSH_HOSTS_CHANNEL = "desktop:discover-ssh-hosts";
 export const ENSURE_SSH_ENVIRONMENT_CHANNEL = "desktop:ensure-ssh-environment";
 export const DISCONNECT_SSH_ENVIRONMENT_CHANNEL = "desktop:disconnect-ssh-environment";

@@ -109,6 +109,9 @@ const makeDependencies = Effect.fn("TestConnectionResolver.makeDependencies")((o
   readonly primaryBearerToken?: string;
   readonly prepareSsh?: ClientCapabilities.SshEnvironmentGateway["Service"]["prepare"];
   readonly installCloudflareAccessCookie?: ClientCapabilities.CloudflareAccessCookieInstaller["Service"]["install"];
+  readonly installCloudflareAccessRequestHeaders?: ClientCapabilities.CloudflareAccessCookieInstaller["Service"]["installRequestHeaders"];
+  readonly supportsCloudflareAccessCookieInstall?: boolean;
+  readonly supportsCloudflareAccessRequestHeaders?: boolean;
 }) => {
   const profiles = new Map(
     (options?.profiles ?? []).map((profile) => [profile.connectionId, profile]),
@@ -189,7 +192,16 @@ const makeDependencies = Effect.fn("TestConnectionResolver.makeDependencies")((o
     Layer.succeed(
       ClientCapabilities.CloudflareAccessCookieInstaller,
       ClientCapabilities.CloudflareAccessCookieInstaller.of({
+        supportsCookieInstall:
+          options?.supportsCloudflareAccessCookieInstall ??
+          options?.installCloudflareAccessCookie !== undefined,
+        supportsRequestHeaders:
+          options?.supportsCloudflareAccessRequestHeaders ??
+          options?.installCloudflareAccessRequestHeaders !== undefined,
         install: options?.installCloudflareAccessCookie ?? (() => Effect.void),
+        ...(options?.installCloudflareAccessRequestHeaders
+          ? { installRequestHeaders: options.installCloudflareAccessRequestHeaders }
+          : {}),
       }),
     ),
     Layer.succeed(
@@ -317,6 +329,39 @@ describe("ConnectionResolver", () => {
     }),
   );
 
+  it.effect("clears stale desktop Cloudflare Access headers for plain bearer credentials", () =>
+    Effect.gen(function* () {
+      const installedHeaders = yield* Ref.make<ReadonlyArray<unknown>>([]);
+      const target = new BearerConnectionTarget({
+        environmentId: ENVIRONMENT_ID,
+        label: "Saved",
+        connectionId: "saved-1",
+      });
+      const profile = new BearerConnectionProfile({
+        connectionId: "saved-1",
+        environmentId: ENVIRONMENT_ID,
+        label: "Saved",
+        httpBaseUrl: ENDPOINT.httpBaseUrl,
+        wsBaseUrl: ENDPOINT.wsBaseUrl,
+      });
+      const brokerLayer = yield* makeDependencies({
+        credentials: [["saved-1", new BearerConnectionCredential({ token: "secret-bearer" })]],
+        installCloudflareAccessRequestHeaders: (input) =>
+          Ref.update(installedHeaders, (values) => [...values, input]),
+      });
+      const broker = yield* ConnectionResolver.ConnectionResolver.pipe(Effect.provide(brokerLayer));
+
+      yield* broker.prepare(catalogEntry(target, Option.some(profile)));
+
+      expect(yield* Ref.get(installedHeaders)).toEqual([
+        {
+          httpBaseUrl: ENDPOINT.httpBaseUrl,
+          headers: {},
+        },
+      ]);
+    }),
+  );
+
   it.effect("passes Cloudflare Access service-token credentials during bearer authorization", () =>
     Effect.gen(function* () {
       enableHeaderCapableWebSocketRuntime();
@@ -370,6 +415,64 @@ describe("ConnectionResolver", () => {
         },
       ]);
     }),
+  );
+
+  it.effect(
+    "installs service-token headers when the desktop transport installer is available",
+    () =>
+      Effect.gen(function* () {
+        vi.stubGlobal("window", {});
+        vi.stubGlobal("navigator", { product: "Gecko" });
+        vi.stubGlobal("WebSocket", function WebSocket() {});
+        const installedHeaders = yield* Ref.make<
+          ReadonlyArray<{
+            readonly httpBaseUrl: string;
+            readonly headers: Readonly<Record<string, string>>;
+          }>
+        >([]);
+        const target = new BearerConnectionTarget({
+          environmentId: ENVIRONMENT_ID,
+          label: "Saved",
+          connectionId: "saved-1",
+        });
+        const profile = new BearerConnectionProfile({
+          connectionId: "saved-1",
+          environmentId: ENVIRONMENT_ID,
+          label: "Saved",
+          httpBaseUrl: ENDPOINT.httpBaseUrl,
+          wsBaseUrl: ENDPOINT.wsBaseUrl,
+        });
+        const brokerLayer = yield* makeDependencies({
+          credentials: [
+            [
+              "saved-1",
+              new BearerConnectionCredential({
+                token: "secret-bearer",
+                cloudflareAccessClientId: "client-id",
+                cloudflareAccessClientSecret: "client-secret",
+              }),
+            ],
+          ],
+          installCloudflareAccessRequestHeaders: (input) =>
+            Ref.update(installedHeaders, (values) => [...values, input]),
+        });
+        const broker = yield* ConnectionResolver.ConnectionResolver.pipe(
+          Effect.provide(brokerLayer),
+        );
+
+        yield* broker.prepare(catalogEntry(target, Option.some(profile)));
+
+        expect(yield* Ref.get(installedHeaders)).toEqual([
+          {
+            httpBaseUrl: ENDPOINT.httpBaseUrl,
+            headers: {
+              "cf-access-client-id": "client-id",
+              "cf-access-client-secret": "client-secret",
+            },
+            clearCookies: true,
+          },
+        ]);
+      }),
   );
 
   it.effect("installs saved Cloudflare Access cookies before bearer authorization", () =>
@@ -440,6 +543,53 @@ describe("ConnectionResolver", () => {
         },
       ]);
     }),
+  );
+
+  it.effect(
+    "installs saved Cloudflare Access JWTs as desktop cookies before bearer authorization",
+    () =>
+      Effect.gen(function* () {
+        const installedCookies = yield* Ref.make<
+          ReadonlyArray<{ readonly httpBaseUrl: string; readonly cookieValue: string }>
+        >([]);
+        const target = new BearerConnectionTarget({
+          environmentId: ENVIRONMENT_ID,
+          label: "Saved",
+          connectionId: "saved-1",
+        });
+        const profile = new BearerConnectionProfile({
+          connectionId: "saved-1",
+          environmentId: ENVIRONMENT_ID,
+          label: "Saved",
+          httpBaseUrl: ENDPOINT.httpBaseUrl,
+          wsBaseUrl: ENDPOINT.wsBaseUrl,
+        });
+        const brokerLayer = yield* makeDependencies({
+          credentials: [
+            [
+              "saved-1",
+              new BearerConnectionCredential({
+                token: "secret-bearer",
+                cloudflareAccessToken: "cf-access-jwt",
+              }),
+            ],
+          ],
+          installCloudflareAccessCookie: (input) =>
+            Ref.update(installedCookies, (values) => [...values, input]),
+        });
+        const broker = yield* ConnectionResolver.ConnectionResolver.pipe(
+          Effect.provide(brokerLayer),
+        );
+
+        yield* broker.prepare(catalogEntry(target, Option.some(profile)));
+
+        expect(yield* Ref.get(installedCookies)).toEqual([
+          {
+            httpBaseUrl: ENDPOINT.httpBaseUrl,
+            cookieValue: "cf-access-jwt",
+          },
+        ]);
+      }),
   );
 
   it.effect(

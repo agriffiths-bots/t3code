@@ -7,6 +7,10 @@ import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 
 import * as RemoteEnvironmentAuthorization from "../authorization/service.ts";
+import {
+  cloudflareAccessHeaders,
+  type CloudflareAccessAuthorization,
+} from "../authorization/remote.ts";
 import * as ManagedRelay from "../relay/managedRelay.ts";
 import * as ClientCapabilities from "../platform/capabilities.ts";
 import {
@@ -69,10 +73,14 @@ function cloudflareAccessFromCredential(credential: BearerConnectionCredential) 
 
 function validateCloudflareAccessRuntime(
   cloudflareAccess: ReturnType<typeof cloudflareAccessFromCredential>,
+  installer: ClientCapabilities.CloudflareAccessCookieInstaller["Service"],
 ) {
+  const canInstallRequestHeaders =
+    installer.supportsRequestHeaders === true && installer.installRequestHeaders !== undefined;
   if (
     cloudflareAccess?._tag === "service-token" &&
-    !ClientCapabilities.canPassWebSocketHeaderOptions()
+    !ClientCapabilities.canPassWebSocketHeaderOptions() &&
+    !canInstallRequestHeaders
   ) {
     return Effect.fail(
       new ConnectionBlockedError({
@@ -82,8 +90,69 @@ function validateCloudflareAccessRuntime(
       }),
     );
   }
+  if (
+    cloudflareAccess !== undefined &&
+    cloudflareAccess._tag !== "service-token" &&
+    !ClientCapabilities.canPassWebSocketHeaderOptions() &&
+    installer.supportsCookieInstall !== true &&
+    !canInstallRequestHeaders
+  ) {
+    return Effect.fail(
+      new ConnectionBlockedError({
+        reason: "unsupported",
+        detail:
+          "Cloudflare Access JWT/cookie connections require a client that can preserve those credentials for WebSocket connections. Use the desktop app, a header-capable client, or sign in interactively before connecting.",
+      }),
+    );
+  }
   return Effect.void;
 }
+
+function cloudflareAccessCookieValue(
+  cloudflareAccess: CloudflareAccessAuthorization | undefined,
+): string | undefined {
+  if (cloudflareAccess === undefined || cloudflareAccess._tag === "service-token") {
+    return undefined;
+  }
+  const value =
+    cloudflareAccess._tag === "cookie" ? cloudflareAccess.cookieValue : cloudflareAccess.jwt;
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : undefined;
+}
+
+const installCloudflareAccessTransport = Effect.fn(
+  "clientRuntime.connection.broker.installCloudflareAccessTransport",
+)(function* (
+  installer: ClientCapabilities.CloudflareAccessCookieInstaller["Service"],
+  httpBaseUrl: string,
+  cloudflareAccess: CloudflareAccessAuthorization | undefined,
+) {
+  if (cloudflareAccess === undefined) {
+    if (
+      installer.supportsRequestHeaders === true &&
+      installer.installRequestHeaders !== undefined
+    ) {
+      yield* installer.installRequestHeaders({
+        httpBaseUrl,
+        headers: {},
+      });
+    }
+    return;
+  }
+  const cookieValue = cloudflareAccessCookieValue(cloudflareAccess);
+  if (installer.supportsRequestHeaders === true && installer.installRequestHeaders !== undefined) {
+    yield* installer.installRequestHeaders({
+      httpBaseUrl,
+      headers: cloudflareAccessHeaders(cloudflareAccess),
+      clearCookies: true,
+      ...(cookieValue ? { cookieValue } : {}),
+    });
+    return;
+  }
+  if (cookieValue !== undefined && installer.supportsCookieInstall === true) {
+    yield* installer.install({ httpBaseUrl, cookieValue });
+  }
+});
 
 function primarySocketUrl(target: PrimaryConnectionTarget): string {
   const url = new URL(target.wsBaseUrl);
@@ -162,14 +231,8 @@ const makeBearerBroker = Effect.fn("clientRuntime.connection.broker.makeBearer")
       return yield* credentialMissingError(target.connectionId);
     }
     const cloudflareAccess = cloudflareAccessFromCredential(credential);
-    yield* validateCloudflareAccessRuntime(cloudflareAccess);
-    const cloudflareAccessCookie = credential.cloudflareAccessCookie?.trim() ?? "";
-    if (cloudflareAccessCookie.length > 0) {
-      yield* cookieInstaller.install({
-        httpBaseUrl: profile.httpBaseUrl,
-        cookieValue: cloudflareAccessCookie,
-      });
-    }
+    yield* validateCloudflareAccessRuntime(cloudflareAccess, cookieInstaller);
+    yield* installCloudflareAccessTransport(cookieInstaller, profile.httpBaseUrl, cloudflareAccess);
     const authorized = yield* remote.authorizeBearer({
       expectedEnvironmentId: target.environmentId,
       httpBaseUrl: profile.httpBaseUrl,

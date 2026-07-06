@@ -49,7 +49,12 @@ import { useCopyToClipboard } from "../../hooks/useCopyToClipboard";
 import { cn } from "../../lib/utils";
 import { formatElapsedDurationLabel, formatExpiresInLabel } from "../../timestampFormat";
 import { resolveDesktopPairingUrl, resolveHostedPairingUrl } from "./pairingUrls";
-import { applyWslEnableSelection } from "./ConnectionsSettings.logic";
+import {
+  applyWslEnableSelection,
+  parsePairingUrlFields,
+  parseRemotePairingHostChange,
+  parseRemotePairingFields,
+} from "./ConnectionsSettings.logic";
 import { resolveRelayClerkTokenOptions } from "../../cloud/publicConfig";
 import {
   SettingsPageContainer,
@@ -102,8 +107,7 @@ import {
   MenuTrigger,
 } from "../ui/menu";
 import { Textarea } from "../ui/textarea";
-import { getPairingTokenFromUrl, setPairingTokenOnUrl } from "../../pairingUrl";
-import { readHostedPairingRequest } from "../../hostedPairing";
+import { setPairingTokenOnUrl } from "../../pairingUrl";
 import {
   createServerPairingCredential,
   revokeOtherServerClientSessions,
@@ -375,55 +379,6 @@ function parseManualDesktopSshTarget(input: {
     username,
     port,
   };
-}
-
-function parsePairingUrlFields(
-  input: string,
-): { readonly host: string; readonly pairingCode: string } | null {
-  const trimmed = input.trim();
-  if (!trimmed) return null;
-
-  try {
-    const urlLikeInput =
-      /^[a-zA-Z][a-zA-Z\d+.-]*:\/\//u.test(trimmed) || trimmed.startsWith("//")
-        ? trimmed
-        : `https://${trimmed}`;
-    const url = new URL(urlLikeInput, window.location.origin);
-    const hostedPairingRequest = readHostedPairingRequest(url);
-    if (hostedPairingRequest) {
-      return {
-        host: hostedPairingRequest.host,
-        pairingCode: hostedPairingRequest.token,
-      };
-    }
-
-    const pairingCode = getPairingTokenFromUrl(url);
-    if (!pairingCode) return null;
-    return {
-      host: url.origin,
-      pairingCode,
-    };
-  } catch {
-    return null;
-  }
-}
-
-function parseRemotePairingFields(input: { readonly host: string; readonly pairingCode: string }): {
-  readonly host: string;
-  readonly pairingCode: string;
-} {
-  const parsedPairingUrl = parsePairingUrlFields(input.host);
-  if (parsedPairingUrl) return parsedPairingUrl;
-
-  const host = input.host.trim();
-  const pairingCode = input.pairingCode.trim();
-  if (!host) {
-    throw new Error("Enter a backend host.");
-  }
-  if (!pairingCode) {
-    throw new Error("Enter a pairing code.");
-  }
-  return { host, pairingCode };
 }
 
 function formatDesktopSshConnectionError(error: unknown): string {
@@ -2094,6 +2049,11 @@ export function ConnectionsSettings() {
     readonly host: string;
     readonly cookie: string;
   } | null>(null);
+  const [savedBackendCloudflareAccessToken, setSavedBackendCloudflareAccessToken] = useState("");
+  const [savedBackendCloudflareAccessClientId, setSavedBackendCloudflareAccessClientId] =
+    useState("");
+  const [savedBackendCloudflareAccessClientSecret, setSavedBackendCloudflareAccessClientSecret] =
+    useState("");
   const [isAuthenticatingCloudflareAccess, setIsAuthenticatingCloudflareAccess] = useState(false);
   const [savedBackendSshHost, setSavedBackendSshHost] = useState("");
   const [savedBackendSshUsername, setSavedBackendSshUsername] = useState("");
@@ -2486,6 +2446,9 @@ export function ConnectionsSettings() {
       setSavedBackendHost("");
       setSavedBackendPairingCode("");
       setSavedBackendCloudflareAccess(null);
+      setSavedBackendCloudflareAccessToken("");
+      setSavedBackendCloudflareAccessClientId("");
+      setSavedBackendCloudflareAccessClientSecret("");
       setSavedBackendSshHost("");
       setSavedBackendSshUsername("");
       setSavedBackendSshPort("");
@@ -2506,6 +2469,9 @@ export function ConnectionsSettings() {
       remotePairingInput = parseRemotePairingFields({
         host: savedBackendHost,
         pairingCode: savedBackendPairingCode,
+        cloudflareAccessToken: savedBackendCloudflareAccessToken,
+        cloudflareAccessClientId: savedBackendCloudflareAccessClientId,
+        cloudflareAccessClientSecret: savedBackendCloudflareAccessClientSecret,
       });
     } catch (error) {
       const message = error instanceof Error ? error.message : "Failed to add backend.";
@@ -2549,6 +2515,9 @@ export function ConnectionsSettings() {
     setSavedBackendHost("");
     setSavedBackendPairingCode("");
     setSavedBackendCloudflareAccess(null);
+    setSavedBackendCloudflareAccessToken("");
+    setSavedBackendCloudflareAccessClientId("");
+    setSavedBackendCloudflareAccessClientSecret("");
     setSavedBackendSshHost("");
     setSavedBackendSshUsername("");
     setSavedBackendSshPort("");
@@ -2563,6 +2532,9 @@ export function ConnectionsSettings() {
     connectPairing,
     connectSshEnvironment,
     savedBackendCloudflareAccess,
+    savedBackendCloudflareAccessClientId,
+    savedBackendCloudflareAccessClientSecret,
+    savedBackendCloudflareAccessToken,
     savedBackendHost,
     savedBackendMode,
     savedBackendPairingCode,
@@ -2698,14 +2670,15 @@ export function ConnectionsSettings() {
     [setDefaultAdvertisedEndpointKey],
   );
   const handleSavedBackendHostChange = useCallback((value: string) => {
+    const hostChange = parseRemotePairingHostChange(value);
     setSavedBackendCloudflareAccess(null);
-    const parsedPairingUrl = parsePairingUrlFields(value);
-    if (parsedPairingUrl) {
-      setSavedBackendHost(parsedPairingUrl.host);
-      setSavedBackendPairingCode(parsedPairingUrl.pairingCode);
-      return;
+    setSavedBackendCloudflareAccessToken(hostChange.cloudflareAccessToken);
+    setSavedBackendCloudflareAccessClientId(hostChange.cloudflareAccessClientId);
+    setSavedBackendCloudflareAccessClientSecret(hostChange.cloudflareAccessClientSecret);
+    setSavedBackendHost(hostChange.host);
+    if (hostChange.pairingCode !== undefined) {
+      setSavedBackendPairingCode(hostChange.pairingCode);
     }
-    setSavedBackendHost(value);
   }, []);
 
   const renderConnectionModeCard = (input: {
@@ -2778,6 +2751,36 @@ export function ConnectionsSettings() {
         <span className="mt-1 block text-[11px] text-muted-foreground">
           Paste a full pairing URL here to fill both fields automatically.
         </span>
+      </div>
+      <div className="space-y-2">
+        <span className="block text-xs font-medium text-foreground">
+          Cloudflare Access service token
+        </span>
+        <div className="grid gap-3 sm:grid-cols-2">
+          <label className="block">
+            <span className="mb-1.5 block text-xs text-muted-foreground">Client ID</span>
+            <Input
+              value={savedBackendCloudflareAccessClientId}
+              onChange={(event) => setSavedBackendCloudflareAccessClientId(event.target.value)}
+              placeholder="client-id"
+              disabled={isAddingSavedBackend || isAuthenticatingCloudflareAccess}
+              spellCheck={false}
+              autoComplete="off"
+            />
+          </label>
+          <label className="block">
+            <span className="mb-1.5 block text-xs text-muted-foreground">Client Secret</span>
+            <Input
+              type="password"
+              value={savedBackendCloudflareAccessClientSecret}
+              onChange={(event) => setSavedBackendCloudflareAccessClientSecret(event.target.value)}
+              placeholder="client-secret"
+              disabled={isAddingSavedBackend || isAuthenticatingCloudflareAccess}
+              spellCheck={false}
+              autoComplete="off"
+            />
+          </label>
+        </div>
       </div>
       {desktopBridge?.authenticateCloudflareAccess ? (
         <div className="flex flex-wrap items-center gap-2">

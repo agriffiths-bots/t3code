@@ -137,9 +137,17 @@ export class PrimaryEnvironmentAuth extends Context.Service<
 export class CloudflareAccessCookieInstaller extends Context.Service<
   CloudflareAccessCookieInstaller,
   {
+    readonly supportsCookieInstall?: boolean;
+    readonly supportsRequestHeaders?: boolean;
     readonly install: (input: {
       readonly httpBaseUrl: string;
       readonly cookieValue: string;
+    }) => Effect.Effect<void, ConnectionAttemptError>;
+    readonly installRequestHeaders?: (input: {
+      readonly httpBaseUrl: string;
+      readonly headers: Readonly<Record<string, string>>;
+      readonly clearCookies?: boolean;
+      readonly cookieValue?: string;
     }) => Effect.Effect<void, ConnectionAttemptError>;
   }
 >()("@t3tools/client-runtime/platform/capabilities/CloudflareAccessCookieInstaller") {}
