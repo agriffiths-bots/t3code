@@ -152,10 +152,35 @@ function openDeepLink(deepLink: string | undefined): void {
 
 export function PwaRuntime() {
   const environmentId = usePrimaryEnvironmentId();
-  if (!environmentId || !shouldRunPwaRuntime()) {
+  return <PwaRuntimeView enabled={shouldRunPwaRuntime()} environmentId={environmentId ?? null} />;
+}
+
+export function PwaRuntimeView({
+  enabled,
+  environmentId,
+}: {
+  readonly enabled: boolean;
+  readonly environmentId: EnvironmentId | null;
+}) {
+  if (!enabled) {
     return null;
   }
-  return <PwaRuntimeForEnvironment environmentId={environmentId} />;
+
+  return (
+    <>
+      <PwaServiceWorkerRegistration />
+      {environmentId ? <PwaRuntimeForEnvironment environmentId={environmentId} /> : null}
+    </>
+  );
+}
+
+export function PwaServiceWorkerRegistration() {
+  useEffect(() => {
+    if (!canRegisterServiceWorker()) return;
+    void registerServiceWorker().catch(() => undefined);
+  }, []);
+
+  return null;
 }
 
 function PwaRuntimeForEnvironment({ environmentId }: { readonly environmentId: EnvironmentId }) {
@@ -254,11 +279,6 @@ function PwaRuntimeForEnvironment({ environmentId }: { readonly environmentId: E
     return () => {
       navigator.serviceWorker?.removeEventListener("message", handleMessage);
     };
-  }, []);
-
-  useEffect(() => {
-    if (!canRegisterServiceWorker()) return;
-    void registerServiceWorker().catch(() => undefined);
   }, []);
 
   useEffect(() => {
