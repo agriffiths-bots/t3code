@@ -589,6 +589,11 @@ it.layer(TestLayer)("GitVcsDriver core integration", (it) => {
         assert.equal(created.worktree.path, worktreePath);
         assert.equal(created.worktree.refName, "feature/worktree");
         assert.equal(yield* git(worktreePath, ["branch", "--show-current"]), "feature/worktree");
+        const refs = yield* driver.listRefs({ cwd });
+        assert.equal(
+          refs.refs.find((ref) => ref.name === "feature/worktree")?.worktreePath,
+          worktreePath,
+        );
 
         yield* driver.removeWorktree({ cwd, path: worktreePath });
         const fileSystem = yield* FileSystem.FileSystem;

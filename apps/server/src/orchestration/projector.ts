@@ -14,6 +14,7 @@ import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 
 import { toProjectorDecodeError, type OrchestrationProjectorDecodeError } from "./Errors.ts";
+import { MAX_THREAD_CHECKPOINTS } from "./checkpointRetention.ts";
 import {
   MessageSentPayloadSchema,
   ProjectCreatedPayload,
@@ -35,7 +36,6 @@ import {
 
 type ThreadPatch = Partial<Omit<OrchestrationThread, "id" | "projectId">>;
 const MAX_THREAD_MESSAGES = 2_000;
-const MAX_THREAD_CHECKPOINTS = 500;
 
 function checkpointStatusToLatestTurnState(status: "ready" | "missing" | "error") {
   if (status === "error") return "error" as const;

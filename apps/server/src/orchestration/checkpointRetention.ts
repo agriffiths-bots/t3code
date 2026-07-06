@@ -1,0 +1,1 @@
+export const MAX_THREAD_CHECKPOINTS = 500;

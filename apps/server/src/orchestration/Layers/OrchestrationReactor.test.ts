@@ -12,6 +12,7 @@ import { ThreadDeletionReactor } from "../Services/ThreadDeletionReactor.ts";
 import { OrchestrationReactor } from "../Services/OrchestrationReactor.ts";
 import { makeOrchestrationReactor } from "./OrchestrationReactor.ts";
 import * as AgentAwarenessRelay from "../../relay/AgentAwarenessRelay.ts";
+import * as VcsMaintenanceReactor from "../../vcs/VcsMaintenanceReactor.ts";
 
 describe("OrchestrationReactor", () => {
   let runtime: ManagedRuntime.ManagedRuntime<OrchestrationReactor, never> | null = null;
@@ -23,7 +24,7 @@ describe("OrchestrationReactor", () => {
     runtime = null;
   });
 
-  it("starts provider ingestion, provider command, checkpoint, and thread deletion reactors", async () => {
+  it("starts provider ingestion, provider command, checkpoint, thread deletion, and maintenance reactors", async () => {
     const started: string[] = [];
 
     runtime = ManagedRuntime.make(
@@ -73,6 +74,15 @@ describe("OrchestrationReactor", () => {
             },
           }),
         ),
+        Layer.provideMerge(
+          Layer.succeed(VcsMaintenanceReactor.VcsMaintenanceReactor, {
+            start: () => {
+              started.push("vcs-maintenance-reactor");
+              return Effect.void;
+            },
+            sweep: () => Effect.void,
+          }),
+        ),
       ),
     );
 
@@ -86,6 +96,7 @@ describe("OrchestrationReactor", () => {
       "checkpoint-reactor",
       "thread-deletion-reactor",
       "agent-awareness-relay",
+      "vcs-maintenance-reactor",
     ]);
 
     await Effect.runPromise(Scope.close(scope, Exit.void));

@@ -15,6 +15,7 @@ import * as SqlClient from "effect/unstable/sql/SqlClient";
 
 import { SqlitePersistenceMemory } from "../../persistence/Layers/Sqlite.ts";
 import * as RepositoryIdentityResolver from "../../project/RepositoryIdentityResolver.ts";
+import { MAX_THREAD_CHECKPOINTS } from "../checkpointRetention.ts";
 import { ORCHESTRATION_PROJECTOR_NAMES } from "./ProjectionPipeline.ts";
 import { OrchestrationProjectionSnapshotQueryLive } from "./ProjectionSnapshotQuery.ts";
 import { ProjectionSnapshotQuery } from "../Services/ProjectionSnapshotQuery.ts";
@@ -881,6 +882,150 @@ projectionSnapshotLayer("ProjectionSnapshotQuery", (it) => {
             },
           ],
         });
+      }
+    }),
+  );
+
+  it.effect("exposes only checkpoint refs in the retained tail", () =>
+    Effect.gen(function* () {
+      const snapshotQuery = yield* ProjectionSnapshotQuery;
+      const sql = yield* SqlClient.SqlClient;
+
+      yield* sql`DELETE FROM projection_projects`;
+      yield* sql`DELETE FROM projection_threads`;
+      yield* sql`DELETE FROM projection_turns`;
+
+      yield* sql`
+        INSERT INTO projection_projects (
+          project_id,
+          title,
+          workspace_root,
+          default_model_selection_json,
+          scripts_json,
+          created_at,
+          updated_at,
+          deleted_at
+        )
+        VALUES (
+          'project-retention',
+          'Retention Project',
+          '/tmp/retention-workspace',
+          NULL,
+          '[]',
+          '2026-03-03T00:00:00.000Z',
+          '2026-03-03T00:00:01.000Z',
+          NULL
+        )
+      `;
+
+      yield* sql`
+        INSERT INTO projection_threads (
+          thread_id,
+          project_id,
+          title,
+          model_selection_json,
+          runtime_mode,
+          interaction_mode,
+          branch,
+          worktree_path,
+          latest_turn_id,
+          created_at,
+          updated_at,
+          archived_at,
+          deleted_at
+        )
+        VALUES (
+          'thread-retention',
+          'project-retention',
+          'Retention Thread',
+          '{"provider":"codex","model":"gpt-5-codex"}',
+          'full-access',
+          'default',
+          'feature/retention',
+          '/tmp/retention-worktree',
+          NULL,
+          '2026-03-03T00:00:02.000Z',
+          '2026-03-03T00:00:03.000Z',
+          NULL,
+          NULL
+        )
+      `;
+
+      yield* sql`
+        WITH RECURSIVE checkpoint_counts(checkpoint_turn_count) AS (
+          SELECT 1
+          UNION ALL
+          SELECT checkpoint_turn_count + 1
+          FROM checkpoint_counts
+          WHERE checkpoint_turn_count < ${MAX_THREAD_CHECKPOINTS + 5}
+        )
+        INSERT INTO projection_turns (
+          thread_id,
+          turn_id,
+          pending_message_id,
+          source_proposed_plan_thread_id,
+          source_proposed_plan_id,
+          assistant_message_id,
+          state,
+          requested_at,
+          started_at,
+          completed_at,
+          checkpoint_turn_count,
+          checkpoint_ref,
+          checkpoint_status,
+          checkpoint_files_json
+        )
+        SELECT
+          'thread-retention',
+          'turn-' || checkpoint_turn_count,
+          NULL,
+          NULL,
+          NULL,
+          NULL,
+          'completed',
+          '2026-03-03T00:00:04.000Z',
+          '2026-03-03T00:00:04.000Z',
+          '2026-03-03T00:00:04.000Z',
+          checkpoint_turn_count,
+          'refs/t3/checkpoints/thread-retention/turn/' || checkpoint_turn_count,
+          'ready',
+          '[]'
+        FROM checkpoint_counts
+      `;
+
+      const context = yield* snapshotQuery.getThreadCheckpointContext(
+        ThreadId.make("thread-retention"),
+      );
+      assert.equal(context._tag, "Some");
+      if (context._tag === "Some") {
+        assert.equal(context.value.checkpoints.length, MAX_THREAD_CHECKPOINTS);
+        assert.equal(context.value.checkpoints[0]?.checkpointTurnCount, 6);
+        assert.equal(
+          context.value.checkpoints[0]?.checkpointRef,
+          asCheckpointRef("refs/t3/checkpoints/thread-retention/turn/6"),
+        );
+        assert.equal(context.value.checkpoints.at(-1)?.checkpointTurnCount, 505);
+      }
+
+      const prunedDiffContext = yield* snapshotQuery.getFullThreadDiffContext(
+        ThreadId.make("thread-retention"),
+        5,
+      );
+      assert.equal(prunedDiffContext._tag, "Some");
+      if (prunedDiffContext._tag === "Some") {
+        assert.equal(prunedDiffContext.value.toCheckpointRef, null);
+      }
+
+      const retainedDiffContext = yield* snapshotQuery.getFullThreadDiffContext(
+        ThreadId.make("thread-retention"),
+        6,
+      );
+      assert.equal(retainedDiffContext._tag, "Some");
+      if (retainedDiffContext._tag === "Some") {
+        assert.equal(
+          retainedDiffContext.value.toCheckpointRef,
+          asCheckpointRef("refs/t3/checkpoints/thread-retention/turn/6"),
+        );
       }
     }),
   );
