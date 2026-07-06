@@ -2,7 +2,7 @@ import { describe, expect, it } from "@effect/vitest";
 import * as Cause from "effect/Cause";
 import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
-import type * as Electron from "electron";
+import * as Electron from "electron";
 import { beforeEach, vi } from "vite-plus/test";
 
 import * as ElectronWindow from "../../electron/ElectronWindow.ts";
@@ -73,9 +73,16 @@ function emitWebContentsEvent(
   handler({} as Electron.Event, url);
 }
 
-function electronWindowLayer(authWindow: Electron.BrowserWindow) {
+function electronWindowLayer(
+  authWindow: Electron.BrowserWindow,
+  onCreate?: (options: Electron.BrowserWindowConstructorOptions) => void,
+) {
   return ElectronWindow.ElectronWindow.of({
-    create: () => Effect.succeed(authWindow),
+    create: (options) =>
+      Effect.sync(() => {
+        onCreate?.(options);
+        return authWindow;
+      }),
     main: Effect.succeed(Option.none()),
     currentMainOrFirst: Effect.succeed(Option.none()),
     focusedMainOrFirst: Effect.succeed(Option.none()),
@@ -173,7 +180,7 @@ describe("desktop Cloudflare Access cookies", () => {
     }),
   );
 
-  it.effect("attaches saved service-token headers through the Electron session", () =>
+  it.effect("attaches saved Cloudflare Access transport through the Electron session", () =>
     Effect.gen(function* () {
       const rendererHeaders: Record<string, string> = {
         "cf-access-client-id": " client-id ",
@@ -181,16 +188,18 @@ describe("desktop Cloudflare Access cookies", () => {
         authorization: "Bearer renderer-controlled",
         cookie: "CF_Authorization=renderer-controlled",
       };
-      electronMock.cookies.get.mockResolvedValueOnce([
-        accessCookie({
-          value: "stale-cookie",
-          domain: "app.example.test",
-          hostOnly: true,
-          path: "/",
-          secure: true,
-        }),
-      ]);
+      const staleCookie = accessCookie({
+        value: "stale-cookie",
+        domain: "app.example.test",
+        hostOnly: true,
+        path: "/",
+        secure: true,
+      });
+      electronMock.cookies.get
+        .mockResolvedValueOnce([staleCookie])
+        .mockResolvedValueOnce([staleCookie]);
       electronMock.cookies.remove.mockResolvedValue(undefined);
+      electronMock.cookies.set.mockResolvedValue(undefined);
       yield* installCloudflareAccessCredentials.handler({
         host: "https://app.example.test",
         headers: rendererHeaders,
@@ -227,10 +236,46 @@ describe("desktop Cloudflare Access cookies", () => {
 
       yield* installCloudflareAccessCredentials.handler({
         host: "https://app.example.test",
+        headers: {
+          "cf-access-jwt-assertion": " fresh-access-cookie ",
+        },
+        clearCookies: true,
+        cookieValue: "fresh-access-cookie",
+      });
+
+      expect(electronMock.cookies.set).toHaveBeenCalledWith({
+        url: "https://app.example.test/",
+        name: "CF_Authorization",
+        value: "fresh-access-cookie",
+        httpOnly: true,
+        secure: true,
+        sameSite: "no_restriction",
+      });
+      const pairingCallback = vi.fn();
+      listener(
+        {
+          url: "https://app.example.test/.well-known/t3/environment",
+          requestHeaders: {
+            "user-agent": "t3code",
+            Cookie: "application=1; CF_Authorization=stale-cookie",
+          },
+        },
+        pairingCallback,
+      );
+      expect(pairingCallback).toHaveBeenCalledWith({
+        requestHeaders: {
+          "user-agent": "t3code",
+          "cf-access-jwt-assertion": "fresh-access-cookie",
+          Cookie: "application=1; CF_Authorization=fresh-access-cookie",
+        },
+      });
+
+      yield* installCloudflareAccessCredentials.handler({
+        host: "https://app.example.test",
         headers: {},
       });
-      expect(electronMock.cookies.get).toHaveBeenCalledTimes(1);
-      expect(electronMock.cookies.remove).toHaveBeenCalledTimes(1);
+      expect(electronMock.cookies.get).toHaveBeenCalledTimes(2);
+      expect(electronMock.cookies.remove).toHaveBeenCalledTimes(2);
       const clearedCallback = vi.fn();
       listener(
         {
@@ -323,6 +368,7 @@ describe("desktop Cloudflare Access cookies", () => {
             errno: -3,
           }),
         );
+        const createdWindows: Electron.BrowserWindowConstructorOptions[] = [];
         electronMock.cookies.get
           .mockResolvedValueOnce([])
           .mockResolvedValueOnce([])
@@ -334,11 +380,18 @@ describe("desktop Cloudflare Access cookies", () => {
           .pipe(
             Effect.provideService(
               ElectronWindow.ElectronWindow,
-              electronWindowLayer(authWindow as unknown as Electron.BrowserWindow),
+              electronWindowLayer(authWindow as unknown as Electron.BrowserWindow, (options) => {
+                createdWindows.push(options);
+              }),
             ),
           );
 
         expect(result).toEqual({ cookieValue: "access-cookie" });
+        expect(createdWindows[0]?.webPreferences).toEqual(
+          expect.objectContaining({
+            session: Electron.session.defaultSession,
+          }),
+        );
         expect(electronMock.cookies.set).not.toHaveBeenCalled();
         expect(authWindow.close).toHaveBeenCalledTimes(1);
       }),
