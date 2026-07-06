@@ -16,7 +16,7 @@ const DESCRIPTOR_PATH = "/.well-known/t3/environment";
 const READY_MARKER_FILE = "main-window-ready.json";
 const MAX_CAPTURED_OUTPUT_BYTES = 256 * 1024;
 const BACKEND_LOOPBACK_HOST = "127.0.0.1";
-const UPDATE_SERVER_HOST = "localhost";
+const UPDATE_SERVER_HOST = "127.0.0.1";
 // oxlint-disable-next-line t3code/no-global-process-runtime -- Standalone CI script.
 const hostPlatform = process.platform;
 const repoRoot = NodePath.resolve(

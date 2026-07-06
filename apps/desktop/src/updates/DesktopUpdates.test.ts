@@ -263,7 +263,7 @@ describe("DesktopUpdates", () => {
           assert.equal(state.enabled, true);
           assert.equal(state.status, "idle");
           assert.deepEqual(harness.feedUrls(), [
-            { provider: "generic", url: "http://localhost:4141" },
+            { provider: "generic", url: "http://127.0.0.1:4141" },
           ]);
           assert.equal(harness.listenerCount(), 6);
           assert.equal(harness.checkCount(), 0);
