@@ -333,6 +333,44 @@ function isTaskNotificationResult(result: SDKResultMessage | undefined): boolean
   return taskNotificationResultOrigin(result) !== undefined;
 }
 
+function hasActiveRuntimeTasksForTurn(
+  context: ClaudeSessionContext,
+  turnState: ClaudeTurnState,
+): boolean {
+  for (const taskId of turnState.runtimeTaskIds) {
+    if (context.activeRuntimeTasks.has(taskId)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function sdkMessageTurnId(message: SDKMessage): string | undefined {
+  const record = message as {
+    readonly turnId?: unknown;
+    readonly turn_id?: unknown;
+  };
+  const candidate = record.turnId ?? record.turn_id;
+  return typeof candidate === "string" && candidate.length > 0 ? candidate : undefined;
+}
+
+function taskNotificationResultMatchesActiveTurn(
+  context: ClaudeSessionContext,
+  result: SDKResultMessage,
+): boolean {
+  const turnState = context.turnState;
+  if (!turnState) {
+    return false;
+  }
+
+  const messageTurnId = sdkMessageTurnId(result);
+  return (
+    messageTurnId !== undefined &&
+    messageTurnId === String(turnState.turnId) &&
+    !hasActiveRuntimeTasksForTurn(context, turnState)
+  );
+}
+
 function isInterruptedResult(result: SDKResultMessage): boolean {
   const errors = resultErrorsText(result);
   if (errors.includes("interrupt")) {
@@ -1959,18 +1997,6 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
     });
   });
 
-  const hasActiveRuntimeTasksForTurn = (
-    context: ClaudeSessionContext,
-    turnState: ClaudeTurnState,
-  ): boolean => {
-    for (const taskId of turnState.runtimeTaskIds) {
-      if (context.activeRuntimeTasks.has(taskId)) {
-        return true;
-      }
-    }
-    return false;
-  };
-
   const retireRuntimeTasksForTurn = (
     context: ClaudeSessionContext,
     turnState: ClaudeTurnState,
@@ -2717,7 +2743,10 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
       return;
     }
 
-    if (isTaskNotificationResult(message)) {
+    if (
+      isTaskNotificationResult(message) &&
+      !taskNotificationResultMatchesActiveTurn(context, message)
+    ) {
       return;
     }
 
