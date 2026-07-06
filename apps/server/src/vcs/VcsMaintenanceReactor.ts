@@ -8,7 +8,9 @@ import * as Crypto from "effect/Crypto";
 import * as DateTime from "effect/DateTime";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
+import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
+import * as PlatformError from "effect/PlatformError";
 import * as Result from "effect/Result";
 import * as Schedule from "effect/Schedule";
 import type * as Scope from "effect/Scope";
@@ -242,6 +244,22 @@ export function selectStaleWorktreeReapCandidates(
   return candidates;
 }
 
+export function isWorktreePathListed(porcelainOutput: string, worktreePath: string): boolean {
+  return porcelainOutput.split("\n").some((line) => {
+    if (!line.startsWith("worktree ")) {
+      return false;
+    }
+    return normalizePath(line.slice("worktree ".length)) === worktreePath;
+  });
+}
+
+export function shouldRetainWorktreeMetadataAfterListFailure(input: {
+  readonly projectRootExists: boolean;
+  readonly worktreePathExists: boolean;
+}): boolean {
+  return input.projectRootExists || input.worktreePathExists;
+}
+
 export interface VcsMaintenanceReactorShape {
   readonly start: () => Effect.Effect<void, never, Scope.Scope>;
   readonly sweep: () => Effect.Effect<void>;
@@ -278,6 +296,7 @@ const make = Effect.gen(function* () {
   const git = yield* GitVcsDriver.GitVcsDriver;
   const orchestrationEngine = yield* OrchestrationEngineService;
   const crypto = yield* Crypto.Crypto;
+  const fileSystem = yield* FileSystem.FileSystem;
 
   const serverCommandId = (tag: string) =>
     crypto.randomUUIDv4.pipe(Effect.map((uuid) => CommandId.make(`server:${tag}:${uuid}`)));
@@ -336,6 +355,36 @@ const make = Effect.gen(function* () {
   const isWorktreeRegistered = Effect.fn("VcsMaintenanceReactor.isWorktreeRegistered")(function* (
     candidate: WorktreeReapCandidate,
   ) {
+    const pathExists = (path: string) =>
+      fileSystem.stat(path).pipe(
+        Effect.as(true),
+        Effect.catchTags({
+          PlatformError: (error: PlatformError.PlatformError) =>
+            Effect.succeed(error.reason._tag !== "NotFound"),
+        }),
+      );
+
+    const failClosedUnlessBothPathsAreGone = Effect.fn(
+      "VcsMaintenanceReactor.failClosedUnlessBothPathsAreGone",
+    )(function* (detail: string) {
+      const [projectRootExists, worktreePathExists] = yield* Effect.all([
+        pathExists(candidate.projectCwd),
+        pathExists(candidate.path),
+      ]);
+      if (!projectRootExists && !worktreePathExists) {
+        yield* Effect.logWarning("vcs.maintenance.worktree-list-root-missing", {
+          threadIds: candidate.threadIds,
+          projectRoot: candidate.projectCwd,
+          path: candidate.path,
+          detail,
+        });
+      }
+      return shouldRetainWorktreeMetadataAfterListFailure({
+        projectRootExists,
+        worktreePathExists,
+      });
+    });
+
     const result = yield* git
       .execute({
         operation: "VcsMaintenanceReactor.isWorktreeRegistered",
@@ -353,29 +402,21 @@ const make = Effect.gen(function* () {
         path: candidate.path,
         detail: errorDetail(result.failure),
       });
-      return true;
+      return yield* failClosedUnlessBothPathsAreGone(errorDetail(result.failure));
     }
 
     if (result.success.exitCode !== 0) {
+      const detail = result.success.stderr.trim() || "git worktree list failed";
       yield* Effect.logWarning("vcs.maintenance.worktree-list-failed", {
         threadIds: candidate.threadIds,
         projectRoot: candidate.projectCwd,
         path: candidate.path,
-        detail: result.success.stderr.trim() || "git worktree list failed",
+        detail,
       });
-      return true;
+      return yield* failClosedUnlessBothPathsAreGone(detail);
     }
 
-    for (const line of result.success.stdout.split("\n")) {
-      if (!line.startsWith("worktree ")) {
-        continue;
-      }
-      if (normalizePath(line.slice("worktree ".length)) === candidate.path) {
-        return true;
-      }
-    }
-
-    return false;
+    return isWorktreePathListed(result.success.stdout, candidate.path);
   });
 
   const pruneProjectRepository = Effect.fn("VcsMaintenanceReactor.pruneProjectRepository")(
