@@ -131,6 +131,7 @@ import {
   ServerNotificationAckResult,
   ServerNotificationConfig,
   ServerNotificationEndpointError,
+  ServerNotificationPersistenceError,
   ServerNotificationRegisterInput,
   ServerNotificationRegisterResult,
   ServerNotificationStreamEvent,
@@ -340,7 +341,11 @@ export const WsServerRegisterNotificationDeviceRpc = Rpc.make(
   {
     payload: ServerNotificationRegisterInput,
     success: ServerNotificationRegisterResult,
-    error: Schema.Union([ServerNotificationEndpointError, EnvironmentAuthorizationError]),
+    error: Schema.Union([
+      ServerNotificationEndpointError,
+      ServerNotificationPersistenceError,
+      EnvironmentAuthorizationError,
+    ]),
   },
 );
 
