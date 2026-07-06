@@ -573,12 +573,33 @@ export function compareSidebarThreadActivity(
     return byActive;
   }
 
+  if (leftActive === 1) {
+    return compareSidebarThreadStableOrder(left, right);
+  }
+
   const rightTimestamp = getThreadSortTimestamp(right, sortOrder);
   const leftTimestamp = getThreadSortTimestamp(left, sortOrder);
   const byTimestamp =
     rightTimestamp === leftTimestamp ? 0 : rightTimestamp > leftTimestamp ? 1 : -1;
   if (byTimestamp !== 0) {
     return byTimestamp;
+  }
+
+  return right.id.localeCompare(left.id);
+}
+
+function compareSidebarThreadStableOrder(
+  left: SidebarThreadActivityInput,
+  right: SidebarThreadActivityInput,
+): number {
+  const rightCreatedAt = toSortableTimestamp(right.createdAt);
+  const leftCreatedAt = toSortableTimestamp(left.createdAt);
+  if (rightCreatedAt !== null || leftCreatedAt !== null) {
+    const rightTimestamp = rightCreatedAt ?? Number.NEGATIVE_INFINITY;
+    const leftTimestamp = leftCreatedAt ?? Number.NEGATIVE_INFINITY;
+    if (rightTimestamp !== leftTimestamp) {
+      return rightTimestamp > leftTimestamp ? 1 : -1;
+    }
   }
 
   return right.id.localeCompare(left.id);

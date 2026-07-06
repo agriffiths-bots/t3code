@@ -807,12 +807,30 @@ describe("buildSidebarThreadTreeRows", () => {
     expect(rows.map((row) => row.thread.id)).toEqual([parent.id, newerChild.id, middleThread.id]);
   });
 
-  it("sorts sidebar threads active-first, then by latest activity", () => {
-    const oldActive = makeActivityTreeThread({
-      id: ThreadId.make("old-active"),
+  it("keeps active threads stable, then sorts idle threads by latest activity", () => {
+    const olderActive = makeActivityTreeThread({
+      id: ThreadId.make("older-active"),
+      createdAt: "2026-03-09T10:00:00.000Z",
       updatedAt: "2026-03-09T10:01:00.000Z",
+      latestUserMessageAt: "2026-03-09T10:30:00.000Z",
       session: {
-        threadId: ThreadId.make("old-active"),
+        threadId: ThreadId.make("older-active"),
+        status: "running",
+        providerName: "Codex",
+        providerInstanceId: ProviderInstanceId.make("codex"),
+        runtimeMode: DEFAULT_RUNTIME_MODE,
+        activeTurnId: "turn-running" as never,
+        lastError: null,
+        updatedAt: "2026-03-09T10:01:00.000Z",
+      },
+    });
+    const newerActive = makeActivityTreeThread({
+      id: ThreadId.make("newer-active"),
+      createdAt: "2026-03-09T10:05:00.000Z",
+      updatedAt: "2026-03-09T10:02:00.000Z",
+      latestUserMessageAt: "2026-03-09T10:02:00.000Z",
+      session: {
+        threadId: ThreadId.make("newer-active"),
         status: "running",
         providerName: "Codex",
         providerInstanceId: ProviderInstanceId.make("codex"),
@@ -831,9 +849,14 @@ describe("buildSidebarThreadTreeRows", () => {
       updatedAt: "2026-03-09T10:05:00.000Z",
     });
 
-    const sorted = sortSidebarThreadsByActivity([recentIdle, olderIdle, oldActive]);
+    const sorted = sortSidebarThreadsByActivity([recentIdle, olderIdle, olderActive, newerActive]);
 
-    expect(sorted.map((thread) => thread.id)).toEqual([oldActive.id, recentIdle.id, olderIdle.id]);
+    expect(sorted.map((thread) => thread.id)).toEqual([
+      newerActive.id,
+      olderActive.id,
+      recentIdle.id,
+      olderIdle.id,
+    ]);
   });
 
   it("uses the configured thread sort order after active threads", () => {
