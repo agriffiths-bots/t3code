@@ -74,6 +74,7 @@ export type SidebarThreadTreeInput = Pick<
   | "parentThreadId"
   | "session"
 >;
+export type SidebarThreadActivityInput = SidebarThreadTreeInput & ThreadSortInput;
 
 export interface SidebarThreadRollupCounts {
   readonly needsYou: number;
@@ -536,11 +537,168 @@ function sidebarThreadTreeKey(thread: Pick<SidebarThreadTreeInput, "environmentI
   return `${thread.environmentId}\u0000${thread.id}`;
 }
 
+export function sidebarThreadExpansionKey(
+  thread: Pick<SidebarThreadTreeInput, "environmentId" | "id">,
+): string {
+  return `${thread.environmentId}:${thread.id}`;
+}
+
 function sidebarThreadParentTreeKey(thread: SidebarThreadTreeInput): string | null {
   if (thread.parentThreadId === null) {
     return null;
   }
   return `${thread.environmentId}\u0000${thread.parentThreadId}`;
+}
+
+export function isSidebarThreadActiveForSort(
+  thread: Pick<SidebarThreadTreeInput, "latestTurn" | "session">,
+): boolean {
+  return (
+    thread.session?.status === "starting" ||
+    thread.session?.status === "running" ||
+    (thread.session?.status === "waiting" && thread.session.activeTurnId !== null) ||
+    thread.latestTurn?.state === "running"
+  );
+}
+
+export function compareSidebarThreadActivity(
+  left: SidebarThreadActivityInput,
+  right: SidebarThreadActivityInput,
+  sortOrder: SidebarThreadSortOrder = "updated_at",
+): number {
+  const leftActive = isSidebarThreadActiveForSort(left) ? 1 : 0;
+  const rightActive = isSidebarThreadActiveForSort(right) ? 1 : 0;
+  const byActive = rightActive - leftActive;
+  if (byActive !== 0) {
+    return byActive;
+  }
+
+  const rightTimestamp = getThreadSortTimestamp(right, sortOrder);
+  const leftTimestamp = getThreadSortTimestamp(left, sortOrder);
+  const byTimestamp =
+    rightTimestamp === leftTimestamp ? 0 : rightTimestamp > leftTimestamp ? 1 : -1;
+  if (byTimestamp !== 0) {
+    return byTimestamp;
+  }
+
+  return right.id.localeCompare(left.id);
+}
+
+export function sortSidebarThreadsByActivity<TThread extends SidebarThreadActivityInput>(
+  threads: readonly TThread[],
+  sortOrder: SidebarThreadSortOrder = "updated_at",
+): TThread[] {
+  return [...threads].toSorted((left, right) =>
+    compareSidebarThreadActivity(left, right, sortOrder),
+  );
+}
+
+function getActiveSidebarThreadTreePathIndexes<TThread extends SidebarThreadTreeInput>(
+  rows: readonly SidebarThreadTreeRow<TThread>[],
+  activeThreadKey: string | null | undefined,
+): Set<number> {
+  const pathIndexes = new Set<number>();
+  if (activeThreadKey === null || activeThreadKey === undefined) {
+    return pathIndexes;
+  }
+
+  const activeRowIndex = rows.findIndex(
+    (row) => sidebarThreadExpansionKey(row.thread) === activeThreadKey,
+  );
+  if (activeRowIndex < 0) {
+    return pathIndexes;
+  }
+
+  pathIndexes.add(activeRowIndex);
+  const activeRow = rows[activeRowIndex];
+  if (!activeRow) {
+    return pathIndexes;
+  }
+
+  let nextAncestorDepth = activeRow.depth - 1;
+  for (let index = activeRowIndex - 1; index >= 0 && nextAncestorDepth >= 0; index -= 1) {
+    const row = rows[index];
+    if (row?.depth === nextAncestorDepth) {
+      pathIndexes.add(index);
+      nextAncestorDepth -= 1;
+    }
+  }
+
+  return pathIndexes;
+}
+
+export function filterSidebarThreadTreeRowsByExpansion<TThread extends SidebarThreadTreeInput>(
+  rows: readonly SidebarThreadTreeRow<TThread>[],
+  threadTreeExpandedById: Readonly<Record<string, boolean>>,
+  options: { readonly activeThreadKey?: string | null } = {},
+): SidebarThreadTreeRow<TThread>[] {
+  const forceVisibleIndexes = getActiveSidebarThreadTreePathIndexes(rows, options.activeThreadKey);
+
+  const visibleRows: SidebarThreadTreeRow<TThread>[] = [];
+  let collapsedAncestorDepth: number | null = null;
+
+  for (const [index, row] of rows.entries()) {
+    if (collapsedAncestorDepth !== null) {
+      if (row.depth > collapsedAncestorDepth) {
+        if (!forceVisibleIndexes.has(index)) {
+          continue;
+        }
+      } else {
+        collapsedAncestorDepth = null;
+      }
+    }
+
+    visibleRows.push(row);
+
+    if (
+      row.directChildCount > 0 &&
+      threadTreeExpandedById[sidebarThreadExpansionKey(row.thread)] === false
+    ) {
+      collapsedAncestorDepth =
+        collapsedAncestorDepth === null ? row.depth : Math.min(collapsedAncestorDepth, row.depth);
+    }
+  }
+
+  return visibleRows;
+}
+
+export function getVisibleSidebarThreadTreeRowsForPreview<
+  TThread extends SidebarThreadTreeInput,
+>(input: {
+  readonly rows: readonly SidebarThreadTreeRow<TThread>[];
+  readonly activeThreadKey?: string | null;
+  readonly isThreadListExpanded: boolean;
+  readonly previewLimit: number;
+}): {
+  readonly hasOverflowingThreads: boolean;
+  readonly visibleRows: SidebarThreadTreeRow<TThread>[];
+  readonly hiddenRows: SidebarThreadTreeRow<TThread>[];
+} {
+  const { activeThreadKey, isThreadListExpanded, previewLimit, rows } = input;
+  const hasPreviewOverflow = rows.length > previewLimit;
+
+  if (!hasPreviewOverflow || isThreadListExpanded) {
+    return {
+      hasOverflowingThreads: hasPreviewOverflow,
+      hiddenRows: [],
+      visibleRows: [...rows],
+    };
+  }
+
+  const visibleIndexes = new Set<number>();
+  for (const index of rows.slice(0, previewLimit).keys()) {
+    visibleIndexes.add(index);
+  }
+  for (const index of getActiveSidebarThreadTreePathIndexes(rows, activeThreadKey)) {
+    visibleIndexes.add(index);
+  }
+  const hiddenRows = rows.filter((_, index) => !visibleIndexes.has(index));
+
+  return {
+    hasOverflowingThreads: hiddenRows.length > 0,
+    hiddenRows,
+    visibleRows: rows.filter((_, index) => visibleIndexes.has(index)),
+  };
 }
 
 export function buildSidebarThreadTreeRows<TThread extends SidebarThreadTreeInput>(
@@ -623,16 +781,11 @@ export function buildSidebarThreadTreeRows<TThread extends SidebarThreadTreeInpu
     return metadata;
   };
 
-  const orderByNeedsYou = (threads: readonly TThread[]) =>
+  const orderByTreeSort = (threads: readonly TThread[]) =>
     [...threads].toSorted((left, right) => {
       const leftMetadata = collectMetadata(left);
       const rightMetadata = collectMetadata(right);
-      const leftPriority = leftMetadata.hasNeedsYou || leftMetadata.hasDescendantNeedsYou ? 1 : 0;
-      const rightPriority =
-        rightMetadata.hasNeedsYou || rightMetadata.hasDescendantNeedsYou ? 1 : 0;
-      return (
-        rightPriority - leftPriority || leftMetadata.bestSortIndex - rightMetadata.bestSortIndex
-      );
+      return leftMetadata.bestSortIndex - rightMetadata.bestSortIndex;
     });
 
   const rows: SidebarThreadTreeRow<TThread>[] = [];
@@ -654,12 +807,12 @@ export function buildSidebarThreadTreeRows<TThread extends SidebarThreadTreeInpu
       hasDescendantNeedsYou: metadata.hasDescendantNeedsYou,
       rollup: metadata.rollup,
     });
-    for (const child of orderByNeedsYou(children)) {
+    for (const child of orderByTreeSort(children)) {
       emit(child, depth + 1);
     }
   };
 
-  for (const root of orderByNeedsYou(roots)) {
+  for (const root of orderByTreeSort(roots)) {
     emit(root, 0);
   }
   for (const thread of sortedThreads) {

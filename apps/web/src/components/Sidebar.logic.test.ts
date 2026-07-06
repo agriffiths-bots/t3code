@@ -2,8 +2,10 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test"
 import {
   buildSidebarThreadTreeRows,
   createThreadJumpHintVisibilityController,
+  filterSidebarThreadTreeRowsByExpansion,
   getSidebarThreadIdsToPrewarm,
   getVisibleSidebarThreadIds,
+  getVisibleSidebarThreadTreeRowsForPreview,
   resolveAdjacentThreadId,
   getFallbackThreadIdAfterDelete,
   getVisibleThreadsForProject,
@@ -18,9 +20,12 @@ import {
   resolveSidebarStageBadgeLabel,
   resolveThreadRowClassName,
   resolveThreadStatusPill,
+  sidebarThreadExpansionKey,
   shouldClearThreadSelectionOnMouseDown,
+  sortSidebarThreadsByActivity,
   sortProjectsForSidebar,
   THREAD_JUMP_HINT_SHOW_DELAY_MS,
+  type SidebarThreadActivityInput,
   type SidebarThreadTreeInput,
 } from "./Sidebar.logic";
 import {
@@ -759,6 +764,17 @@ function makeTreeThread(
   };
 }
 
+function makeActivityTreeThread(
+  overrides: Partial<SidebarThreadActivityInput> & Pick<SidebarThreadActivityInput, "id">,
+): SidebarThreadActivityInput {
+  return {
+    ...makeTreeThread(overrides),
+    createdAt: overrides.createdAt ?? "2026-03-09T10:00:00.000Z",
+    updatedAt: overrides.updatedAt ?? "2026-03-09T10:00:00.000Z",
+    latestUserMessageAt: overrides.latestUserMessageAt ?? null,
+  };
+}
+
 describe("buildSidebarThreadTreeRows", () => {
   it("places child threads directly under their parent with indentation metadata", () => {
     const parent = makeTreeThread({ id: ThreadId.make("parent") });
@@ -789,6 +805,89 @@ describe("buildSidebarThreadTreeRows", () => {
     const rows = buildSidebarThreadTreeRows([newerChild, middleThread, parent]);
 
     expect(rows.map((row) => row.thread.id)).toEqual([parent.id, newerChild.id, middleThread.id]);
+  });
+
+  it("sorts sidebar threads active-first, then by latest activity", () => {
+    const oldActive = makeActivityTreeThread({
+      id: ThreadId.make("old-active"),
+      updatedAt: "2026-03-09T10:01:00.000Z",
+      session: {
+        threadId: ThreadId.make("old-active"),
+        status: "running",
+        providerName: "Codex",
+        providerInstanceId: ProviderInstanceId.make("codex"),
+        runtimeMode: DEFAULT_RUNTIME_MODE,
+        activeTurnId: "turn-running" as never,
+        lastError: null,
+        updatedAt: "2026-03-09T10:01:00.000Z",
+      },
+    });
+    const recentIdle = makeActivityTreeThread({
+      id: ThreadId.make("recent-idle"),
+      updatedAt: "2026-03-09T10:10:00.000Z",
+    });
+    const olderIdle = makeActivityTreeThread({
+      id: ThreadId.make("older-idle"),
+      updatedAt: "2026-03-09T10:05:00.000Z",
+    });
+
+    const sorted = sortSidebarThreadsByActivity([recentIdle, olderIdle, oldActive]);
+
+    expect(sorted.map((thread) => thread.id)).toEqual([oldActive.id, recentIdle.id, olderIdle.id]);
+  });
+
+  it("uses the configured thread sort order after active threads", () => {
+    const newerCreated = makeActivityTreeThread({
+      id: ThreadId.make("newer-created"),
+      createdAt: "2026-03-09T10:10:00.000Z",
+      updatedAt: "2026-03-09T10:01:00.000Z",
+    });
+    const olderCreated = makeActivityTreeThread({
+      id: ThreadId.make("older-created"),
+      createdAt: "2026-03-09T10:05:00.000Z",
+      updatedAt: "2026-03-09T10:20:00.000Z",
+    });
+
+    const sorted = sortSidebarThreadsByActivity([olderCreated, newerCreated], "created_at");
+
+    expect(sorted.map((thread) => thread.id)).toEqual([newerCreated.id, olderCreated.id]);
+  });
+
+  it("positions parent groups by the most active descendant and sorts children by activity", () => {
+    const oldParent = makeActivityTreeThread({
+      id: ThreadId.make("old-parent"),
+      updatedAt: "2026-03-09T10:00:00.000Z",
+    });
+    const activeChild = makeActivityTreeThread({
+      id: ThreadId.make("active-child"),
+      parentThreadId: oldParent.id,
+      updatedAt: "2026-03-09T10:01:00.000Z",
+      latestTurn: {
+        ...makeLatestTurn(),
+        state: "running",
+        completedAt: null,
+      },
+    });
+    const recentChild = makeActivityTreeThread({
+      id: ThreadId.make("recent-child"),
+      parentThreadId: oldParent.id,
+      updatedAt: "2026-03-09T10:20:00.000Z",
+    });
+    const recentRoot = makeActivityTreeThread({
+      id: ThreadId.make("recent-root"),
+      updatedAt: "2026-03-09T10:30:00.000Z",
+    });
+
+    const rows = buildSidebarThreadTreeRows(
+      sortSidebarThreadsByActivity([oldParent, recentRoot, recentChild, activeChild]),
+    );
+
+    expect(rows.map((row) => row.thread.id)).toEqual([
+      oldParent.id,
+      activeChild.id,
+      recentChild.id,
+      recentRoot.id,
+    ]);
   });
 
   it("rolls descendant running, done, and failed counts onto parent rows", () => {
@@ -831,7 +930,7 @@ describe("buildSidebarThreadTreeRows", () => {
     });
   });
 
-  it("floats needs-you groups and child rows ahead of passive threads", () => {
+  it("keeps needs-you rollup metadata without overriding activity order", () => {
     const passiveParent = makeTreeThread({ id: ThreadId.make("passive-parent") });
     const activeParent = makeTreeThread({ id: ThreadId.make("active-parent") });
     const passiveChild = makeTreeThread({
@@ -852,12 +951,12 @@ describe("buildSidebarThreadTreeRows", () => {
     ]);
 
     expect(rows.map((row) => row.thread.id)).toEqual([
-      activeParent.id,
-      needsYouChild.id,
-      passiveChild.id,
       passiveParent.id,
+      activeParent.id,
+      passiveChild.id,
+      needsYouChild.id,
     ]);
-    expect(rows[0]).toMatchObject({
+    expect(rows[1]).toMatchObject({
       hasNeedsYou: false,
       hasDescendantNeedsYou: true,
       rollup: {
@@ -865,7 +964,143 @@ describe("buildSidebarThreadTreeRows", () => {
         running: 0,
       },
     });
-    expect(rows[1]).toMatchObject({ hasNeedsYou: true });
+    expect(rows[3]).toMatchObject({ hasNeedsYou: true });
+  });
+
+  it("filters descendants of collapsed parent thread groups", () => {
+    const parent = makeTreeThread({ id: ThreadId.make("parent") });
+    const child = makeTreeThread({
+      id: ThreadId.make("child"),
+      parentThreadId: parent.id,
+    });
+    const grandchild = makeTreeThread({
+      id: ThreadId.make("grandchild"),
+      parentThreadId: child.id,
+    });
+    const sibling = makeTreeThread({ id: ThreadId.make("sibling") });
+    const rows = buildSidebarThreadTreeRows([parent, child, grandchild, sibling]);
+
+    const filtered = filterSidebarThreadTreeRowsByExpansion(rows, {
+      [sidebarThreadExpansionKey(parent)]: false,
+    });
+
+    expect(filtered.map((row) => row.thread.id)).toEqual([parent.id, sibling.id]);
+  });
+
+  it("keeps the active descendant and its ancestors visible through collapsed parent groups", () => {
+    const parent = makeTreeThread({ id: ThreadId.make("parent") });
+    const child = makeTreeThread({
+      id: ThreadId.make("child"),
+      parentThreadId: parent.id,
+    });
+    const grandchild = makeTreeThread({
+      id: ThreadId.make("grandchild"),
+      parentThreadId: child.id,
+    });
+    const siblingChild = makeTreeThread({
+      id: ThreadId.make("sibling-child"),
+      parentThreadId: parent.id,
+    });
+    const rows = buildSidebarThreadTreeRows([parent, child, grandchild, siblingChild]);
+
+    const filtered = filterSidebarThreadTreeRowsByExpansion(
+      rows,
+      {
+        [sidebarThreadExpansionKey(parent)]: false,
+        [sidebarThreadExpansionKey(child)]: false,
+      },
+      { activeThreadKey: sidebarThreadExpansionKey(grandchild) },
+    );
+
+    expect(filtered.map((row) => row.thread.id)).toEqual([parent.id, child.id, grandchild.id]);
+  });
+
+  it("keeps the active tree path visible when the folded preview would slice it out", () => {
+    const earlyRows = Array.from({ length: 5 }, (_, index) =>
+      makeTreeThread({ id: ThreadId.make(`early-${index + 1}`) }),
+    );
+    const parent = makeTreeThread({ id: ThreadId.make("parent") });
+    const child = makeTreeThread({
+      id: ThreadId.make("child"),
+      parentThreadId: parent.id,
+    });
+    const grandchild = makeTreeThread({
+      id: ThreadId.make("grandchild"),
+      parentThreadId: child.id,
+    });
+    const rows = buildSidebarThreadTreeRows([...earlyRows, parent, child, grandchild]);
+    const filtered = filterSidebarThreadTreeRowsByExpansion(
+      rows,
+      {
+        [sidebarThreadExpansionKey(parent)]: false,
+        [sidebarThreadExpansionKey(child)]: false,
+      },
+      { activeThreadKey: sidebarThreadExpansionKey(grandchild) },
+    );
+
+    const preview = getVisibleSidebarThreadTreeRowsForPreview({
+      activeThreadKey: sidebarThreadExpansionKey(grandchild),
+      isThreadListExpanded: false,
+      previewLimit: 3,
+      rows: filtered,
+    });
+
+    expect(preview.hasOverflowingThreads).toBe(true);
+    expect(preview.visibleRows.map((row) => row.thread.id)).toEqual([
+      ThreadId.make("early-1"),
+      ThreadId.make("early-2"),
+      ThreadId.make("early-3"),
+      parent.id,
+      child.id,
+      grandchild.id,
+    ]);
+    expect(preview.hiddenRows.map((row) => row.thread.id)).toEqual([
+      ThreadId.make("early-4"),
+      ThreadId.make("early-5"),
+    ]);
+  });
+
+  it("does not report folded preview overflow when the active path leaves no hidden rows", () => {
+    const threads = Array.from({ length: 7 }, (_, index) =>
+      makeTreeThread({ id: ThreadId.make(`thread-${index + 1}`) }),
+    );
+    const rows = buildSidebarThreadTreeRows(threads);
+
+    const preview = getVisibleSidebarThreadTreeRowsForPreview({
+      activeThreadKey: sidebarThreadExpansionKey(threads[6]!),
+      isThreadListExpanded: false,
+      previewLimit: 6,
+      rows,
+    });
+
+    expect(preview.hasOverflowingThreads).toBe(false);
+    expect(preview.visibleRows.map((row) => row.thread.id)).toEqual(
+      threads.map((thread) => thread.id),
+    );
+    expect(preview.hiddenRows).toEqual([]);
+  });
+
+  it("keeps child siblings visible when only one nested parent is collapsed", () => {
+    const parent = makeTreeThread({ id: ThreadId.make("parent") });
+    const child = makeTreeThread({
+      id: ThreadId.make("child"),
+      parentThreadId: parent.id,
+    });
+    const grandchild = makeTreeThread({
+      id: ThreadId.make("grandchild"),
+      parentThreadId: child.id,
+    });
+    const siblingChild = makeTreeThread({
+      id: ThreadId.make("sibling-child"),
+      parentThreadId: parent.id,
+    });
+    const rows = buildSidebarThreadTreeRows([parent, child, grandchild, siblingChild]);
+
+    const filtered = filterSidebarThreadTreeRowsByExpansion(rows, {
+      [sidebarThreadExpansionKey(child)]: false,
+    });
+
+    expect(filtered.map((row) => row.thread.id)).toEqual([parent.id, child.id, siblingChild.id]);
   });
 
   it("keeps orphaned and cyclic child links visible as root rows", () => {
