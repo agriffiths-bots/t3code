@@ -92,6 +92,7 @@ import * as ProcessDiagnostics from "./diagnostics/ProcessDiagnostics.ts";
 import * as ProcessResourceMonitor from "./diagnostics/ProcessResourceMonitor.ts";
 import * as TraceDiagnostics from "./diagnostics/TraceDiagnostics.ts";
 import * as DeviceNotifications from "./notifications/DeviceNotifications.ts";
+import * as WebPushEndpointGuard from "./notifications/WebPushEndpointGuard.ts";
 import { OrchestrationLayerLive } from "./orchestration/runtimeLayer.ts";
 import * as BootstrapTurnStartDispatcher from "./orchestration/Services/BootstrapTurnStartDispatcher.ts";
 import {
@@ -299,6 +300,7 @@ const AuthLayerLive = EnvironmentAuth.layer.pipe(
 
 const DeviceNotificationsLayerLive = DeviceNotifications.layer.pipe(
   Layer.provide(ServerSecretStore.layer),
+  Layer.provide(WebPushEndpointGuard.layer),
 );
 
 const CloudManagedEndpointRuntimeLive = Layer.mergeAll(

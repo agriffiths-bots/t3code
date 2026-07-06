@@ -419,6 +419,14 @@ export const ServerWebPushSubscription = Schema.Struct({
 });
 export type ServerWebPushSubscription = typeof ServerWebPushSubscription.Type;
 
+export class ServerNotificationEndpointError extends Schema.TaggedErrorClass<ServerNotificationEndpointError>()(
+  "ServerNotificationEndpointError",
+  {
+    message: TrimmedNonEmptyString,
+    endpointHost: Schema.optional(TrimmedNonEmptyString),
+  },
+) {}
+
 export const ServerNotificationRegisterInput = Schema.Struct({
   deviceId: TrimmedNonEmptyString,
   deviceKind: ServerNotificationDeviceKind,
@@ -439,6 +447,19 @@ export const ServerNotificationConfig = Schema.Struct({
   vapidPublicKey: TrimmedNonEmptyString,
 });
 export type ServerNotificationConfig = typeof ServerNotificationConfig.Type;
+
+export class ServerNotificationPersistenceError extends Schema.TaggedErrorClass<ServerNotificationPersistenceError>()(
+  "ServerNotificationPersistenceError",
+  {
+    operation: Schema.Literals(["register-device", "remove-device"]),
+    detail: TrimmedNonEmptyString,
+    cause: Schema.optional(Schema.Defect()),
+  },
+) {
+  override get message(): string {
+    return `Notification device persistence failed during ${this.operation}: ${this.detail}`;
+  }
+}
 
 export const ServerNotificationAckAction = Schema.Literals(["opened", "dismissed", "closed"]);
 export type ServerNotificationAckAction = typeof ServerNotificationAckAction.Type;
