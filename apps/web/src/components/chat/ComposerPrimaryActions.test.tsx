@@ -65,4 +65,16 @@ describe("ComposerPrimaryActions", () => {
     expect(markup).toContain('aria-label="Queue send after earlier queued work for this session"');
     expect(markup).not.toContain(' disabled=""');
   });
+
+  it("can render an explicit send label for mobile", () => {
+    const markup = renderActions({ showSendLabel: true });
+
+    expect(markup).toContain(">Send</span>");
+  });
+
+  it("keeps the default send button icon-only", () => {
+    const markup = renderActions();
+
+    expect(markup).not.toContain(">Send</span>");
+  });
 });
