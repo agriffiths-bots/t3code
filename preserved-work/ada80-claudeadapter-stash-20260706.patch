@@ -1,0 +1,344 @@
+diff --git a/apps/server/src/provider/Layers/ClaudeAdapter.test.ts b/apps/server/src/provider/Layers/ClaudeAdapter.test.ts
+index a56aa6996..4f1f20047 100644
+--- a/apps/server/src/provider/Layers/ClaudeAdapter.test.ts
++++ b/apps/server/src/provider/Layers/ClaudeAdapter.test.ts
+@@ -1278,7 +1278,6 @@ describe("ClaudeAdapterLive", () => {
+         stop_reason: "end_turn",
+         session_id: "sdk-session-current-task-notification-result",
+         uuid: "result-current-task-notification-result",
+-        turnId: String(turn.turnId),
+         origin: { kind: "task-notification" },
+       } as unknown as SDKMessage);
+       harness.query.finish();
+@@ -1448,7 +1447,6 @@ describe("ClaudeAdapterLive", () => {
+         stop_reason: "end_turn",
+         session_id: "sdk-session-task-result-after-new-task",
+         uuid: "result-task-notification-before-new-task",
+-        turnId: String(turn.turnId),
+         origin: { kind: "task-notification" },
+       } as unknown as SDKMessage);
+ 
+@@ -1499,6 +1497,195 @@ describe("ClaudeAdapterLive", () => {
+     );
+   });
+ 
++  it.effect("does not complete from a stale task-notification result in the drain window", () => {
++    const harness = makeHarness();
++    return Effect.gen(function* () {
++      const adapter = yield* ClaudeAdapter;
++      const runtimeEvents: Array<ProviderRuntimeEvent> = [];
++
++      const runtimeEventsFiber = yield* Stream.runForEach(adapter.streamEvents, (event) =>
++        Effect.sync(() => {
++          runtimeEvents.push(event);
++        }),
++      ).pipe(Effect.forkChild);
++
++      const session = yield* adapter.startSession({
++        threadId: THREAD_ID,
++        provider: ProviderDriverKind.make("claudeAgent"),
++        runtimeMode: "full-access",
++      });
++
++      const turn = yield* adapter.sendTurn({
++        threadId: session.threadId,
++        input: "do not complete from a stale drain-window result",
++        attachments: [],
++      });
++
++      harness.query.emit({
++        type: "system",
++        subtype: "task_started",
++        session_id: "sdk-session-drain-window",
++        uuid: "task-started-drain-window",
++        task_id: "task-drain-window",
++        tool_use_id: "tool-drain-window",
++        description: "Run drain-window command",
++        task_type: "local_bash",
++      } as unknown as SDKMessage);
++
++      harness.query.emit({
++        type: "system",
++        subtype: "task_notification",
++        session_id: "sdk-session-drain-window",
++        uuid: "task-notification-drain-window",
++        task_id: "task-drain-window",
++        tool_use_id: "tool-drain-window",
++        status: "completed",
++        summary: "Drain-window command completed",
++      } as unknown as SDKMessage);
++
++      // Stale task-notification result arrives after the turn's task drained
++      // but before its real result. It must be held as a candidate, not
++      // applied, so it cannot prematurely complete the turn with stale data.
++      harness.query.emit({
++        type: "result",
++        subtype: "success",
++        is_error: false,
++        errors: [],
++        result: "stale drain-window answer",
++        stop_reason: "tool_use",
++        session_id: "sdk-session-drain-window",
++        uuid: "result-stale-drain-window",
++        origin: { kind: "task-notification" },
++      } as unknown as SDKMessage);
++
++      for (let i = 0; i < 5; i += 1) {
++        yield* Effect.yieldNow;
++      }
++      assert.equal(
++        runtimeEvents.filter(
++          (event) => event.type === "turn.completed" && event.turnId === turn.turnId,
++        ).length,
++        0,
++      );
++
++      harness.query.emit({
++        type: "result",
++        subtype: "success",
++        is_error: false,
++        errors: [],
++        result: "real drain-window answer",
++        stop_reason: "end_turn",
++        session_id: "sdk-session-drain-window",
++        uuid: "result-real-drain-window",
++      } as unknown as SDKMessage);
++
++      for (let i = 0; i < 5; i += 1) {
++        yield* Effect.yieldNow;
++      }
++      runtimeEventsFiber.interruptUnsafe();
++
++      const turnCompletions = runtimeEvents.filter((event) => event.type === "turn.completed");
++      assert.equal(turnCompletions.length, 1);
++      assert.equal(String(turnCompletions[0]?.turnId), String(turn.turnId));
++      assert.equal(turnCompletions[0]?.payload.state, "completed");
++      assert.equal(turnCompletions[0]?.payload.stopReason, "end_turn");
++    }).pipe(
++      Effect.provideService(Random.Random, makeDeterministicRandomService()),
++      Effect.provide(harness.layer),
++    );
++  });
++
++  it.effect("discards a held task-notification result once a later task starts", () => {
++    const harness = makeHarness();
++    return Effect.gen(function* () {
++      const adapter = yield* ClaudeAdapter;
++      const runtimeEvents: Array<ProviderRuntimeEvent> = [];
++
++      const runtimeEventsFiber = yield* Stream.runForEach(adapter.streamEvents, (event) =>
++        Effect.sync(() => {
++          runtimeEvents.push(event);
++        }),
++      ).pipe(Effect.forkChild);
++
++      const session = yield* adapter.startSession({
++        threadId: THREAD_ID,
++        provider: ProviderDriverKind.make("claudeAgent"),
++        runtimeMode: "full-access",
++      });
++
++      const turn = yield* adapter.sendTurn({
++        threadId: session.threadId,
++        input: "keep running after holding a task-notification result",
++        attachments: [],
++      });
++
++      harness.query.emit({
++        type: "system",
++        subtype: "task_started",
++        session_id: "sdk-session-held-candidate",
++        uuid: "task-started-held-a",
++        task_id: "task-held-a",
++        tool_use_id: "tool-held-a",
++        description: "Run first command",
++        task_type: "local_bash",
++      } as unknown as SDKMessage);
++
++      harness.query.emit({
++        type: "system",
++        subtype: "task_notification",
++        session_id: "sdk-session-held-candidate",
++        uuid: "task-notification-held-a",
++        task_id: "task-held-a",
++        tool_use_id: "tool-held-a",
++        status: "completed",
++        summary: "First command completed",
++      } as unknown as SDKMessage);
++
++      // Held as a candidate now that task A drained...
++      harness.query.emit({
++        type: "result",
++        subtype: "success",
++        is_error: false,
++        errors: [],
++        result: "stale held answer",
++        stop_reason: "tool_use",
++        session_id: "sdk-session-held-candidate",
++        uuid: "result-held-a",
++        origin: { kind: "task-notification" },
++      } as unknown as SDKMessage);
++
++      // ...but a later task starting proves the turn is still running, so the
++      // held candidate must be discarded rather than settling the turn at exit.
++      harness.query.emit({
++        type: "system",
++        subtype: "task_started",
++        session_id: "sdk-session-held-candidate",
++        uuid: "task-started-held-b",
++        task_id: "task-held-b",
++        tool_use_id: "tool-held-b",
++        description: "Run second command",
++        task_type: "local_bash",
++      } as unknown as SDKMessage);
++
++      harness.query.finish();
++
++      for (let i = 0; i < 5; i += 1) {
++        yield* Effect.yieldNow;
++      }
++      runtimeEventsFiber.interruptUnsafe();
++
++      const turnCompletions = runtimeEvents.filter((event) => event.type === "turn.completed");
++      assert.equal(turnCompletions.length, 1);
++      assert.equal(String(turnCompletions[0]?.turnId), String(turn.turnId));
++      // The turn ends via the stream-ended interrupted fallback, NOT completed
++      // with task A's stale success payload.
++      assert.equal(turnCompletions[0]?.payload.state, "interrupted");
++    }).pipe(
++      Effect.provideService(Random.Random, makeDeterministicRandomService()),
++      Effect.provide(harness.layer),
++    );
++  });
++
+   it.effect("does not flush a stale synthetic task completion into the next user turn", () => {
+     const harness = makeHarness();
+     return Effect.gen(function* () {
+diff --git a/apps/server/src/provider/Layers/ClaudeAdapter.ts b/apps/server/src/provider/Layers/ClaudeAdapter.ts
+index f6015f6e0..25a481ed0 100644
+--- a/apps/server/src/provider/Layers/ClaudeAdapter.ts
++++ b/apps/server/src/provider/Layers/ClaudeAdapter.ts
+@@ -135,6 +135,20 @@ interface ClaudeTurnState {
+   readonly assistantTextBlockOrder: Array<AssistantTextBlockState>;
+   readonly capturedProposedPlanKeys: Set<string>;
+   readonly runtimeTaskIds: Set<string>;
++  /**
++   * Set once the turn owns at least one runtime (backgrounded) task. Used to
++   * recognize a later task-notification result as this turn's own settling
++   * completion rather than a stale or foreign wake signal.
++   */
++  hadRuntimeTasks?: boolean;
++  /**
++   * The most recent task-notification-origin result observed for this turn once
++   * its runtime tasks had all settled. Because the SDK does not tag results with
++   * a turn id, this candidate completion is not applied inline (a later real
++   * result would supersede it and a stale one must not win the drain window);
++   * it is settled only at stream exit if nothing else completed the turn first.
++   */
++  pendingTaskNotificationResult?: SDKResultMessage | undefined;
+   nextSyntheticAssistantBlockIndex: number;
+ }
+ 
+@@ -345,30 +359,27 @@ function hasActiveRuntimeTasksForTurn(
+   return false;
+ }
+ 
+-function sdkMessageTurnId(message: SDKMessage): string | undefined {
+-  const record = message as {
+-    readonly turnId?: unknown;
+-    readonly turn_id?: unknown;
+-  };
+-  const candidate = record.turnId ?? record.turn_id;
+-  return typeof candidate === "string" && candidate.length > 0 ? candidate : undefined;
+-}
+-
+-function taskNotificationResultMatchesActiveTurn(
+-  context: ClaudeSessionContext,
+-  result: SDKResultMessage,
+-): boolean {
++function taskNotificationResultSettlesActiveTurn(context: ClaudeSessionContext): boolean {
+   const turnState = context.turnState;
+   if (!turnState) {
+     return false;
+   }
+ 
+-  const messageTurnId = sdkMessageTurnId(result);
+-  return (
+-    messageTurnId !== undefined &&
+-    messageTurnId === String(turnState.turnId) &&
+-    !hasActiveRuntimeTasksForTurn(context, turnState)
+-  );
++  // Subagent-wait wake results (#29) are settled by the park/wake path, not by
++  // turn completion, so leave them to be dropped here.
++  if (context.waitingForWake) {
++    return false;
++  }
++
++  // The Claude Agent SDK does not tag result messages with a turn id, so a
++  // task-notification result cannot be correlated by id. Consider it a
++  // candidate completion for this turn only when the turn actually ran at least
++  // one runtime (backgrounded) task and all of them have since settled; a
++  // result for a turn that never ran a task, or while one is still in flight,
++  // is a stale/mid-flight signal rather than this turn's completion. The
++  // candidate is still not applied inline (see pendingTaskNotificationResult) so
++  // a real result arriving later in the drain window supersedes it.
++  return turnState.hadRuntimeTasks === true && !hasActiveRuntimeTasksForTurn(context, turnState);
+ }
+ 
+ function isInterruptedResult(result: SDKResultMessage): boolean {
+@@ -2743,10 +2754,14 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
+       return;
+     }
+ 
+-    if (
+-      isTaskNotificationResult(message) &&
+-      !taskNotificationResultMatchesActiveTurn(context, message)
+-    ) {
++    if (isTaskNotificationResult(message)) {
++      // Never complete inline from a task-notification result: it carries no
++      // turn id, so a stale one arriving in the drain window must not win over
++      // the turn's real result. Record the latest qualifying one as a candidate
++      // to be settled at stream exit only if nothing else completes the turn.
++      if (taskNotificationResultSettlesActiveTurn(context) && context.turnState) {
++        context.turnState.pendingTaskNotificationResult = message;
++      }
+       return;
+     }
+ 
+@@ -2897,7 +2912,12 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
+       case "task_started":
+         context.activeRuntimeTasks.add(message.task_id);
+         if (context.turnState) {
++          // A new task starting proves the turn is still running, so any
++          // task-notification result held from an earlier drained task is stale
++          // and must not settle the turn at stream exit.
++          context.turnState.pendingTaskNotificationResult = undefined;
+           context.turnState.runtimeTaskIds.add(message.task_id);
++          context.turnState.hadRuntimeTasks = true;
+         } else {
+           context.unownedRuntimeTaskIds.add(message.task_id);
+         }
+@@ -3267,6 +3287,23 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
+           deferRuntimeTasks: false,
+         });
+       }
++
++      // Settle a turn whose final answer only ever arrived as a
++      // task-notification result (no non-origin result) now that the stream has
++      // ended cleanly, rather than letting it fall through to the "stream ended"
++      // interrupted fallback below. This is deferred to stream exit so a real
++      // result earlier in the drain window supersedes any stale candidate.
++      const pending = context.turnState?.pendingTaskNotificationResult;
++      if (pending && context.turnState && !context.waitingForWake) {
++        const pendingStatus = turnStatusFromResult(pending);
++        const pendingError = pending.subtype === "success" ? undefined : pending.errors[0];
++        if (pendingStatus === "failed") {
++          yield* emitRuntimeError(context, pendingError ?? "Claude turn failed.");
++        }
++        yield* completeTurn(context, pendingStatus, pendingError, pending, {
++          deferRuntimeTasks: false,
++        });
++      }
+     }
+ 
+     if (Exit.isSuccess(exit) && context.waitingForWake) {
