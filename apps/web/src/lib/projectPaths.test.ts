@@ -53,6 +53,7 @@ describe("projectPaths", () => {
     expect(isFilesystemBrowseQuery("../")).toBe(true);
     expect(isFilesystemBrowseQuery("~")).toBe(true);
     expect(isFilesystemBrowseQuery("~/projects")).toBe(true);
+    expect(isFilesystemBrowseQuery("~\\")).toBe(true);
     expect(isFilesystemBrowseQuery("..\\docs")).toBe(true);
     expect(isFilesystemBrowseQuery("notes")).toBe(false);
   });

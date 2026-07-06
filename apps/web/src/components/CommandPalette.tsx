@@ -2,7 +2,10 @@
 
 /* oxlint-disable react/no-unstable-nested-components -- Existing renderer callbacks are outside this CI hardening change. */
 import { scopeProjectRef, scopeThreadRef } from "@t3tools/client-runtime/environment";
-import { getAddProjectInitialQuery } from "@t3tools/client-runtime/operations/projects";
+import {
+  getAddProjectInitialQuery,
+  isAddProjectHomeRootQuery,
+} from "@t3tools/client-runtime/operations/projects";
 import {
   isAtomCommandInterrupted,
   settlePromise,
@@ -1428,7 +1431,10 @@ function OpenCommandPaletteDialog(props: {
     getCommandPaletteInputPlaceholder(paletteMode);
   const isSubmenu = paletteMode === "submenu" || paletteMode === "submenu-browse";
   const hasHighlightedBrowseItem = highlightedItemValue?.startsWith("browse:") ?? false;
-  const canSubmitBrowsePath = isBrowsing && !relativePathNeedsActiveProject;
+  const exactHomeBrowseNeedsParentPath =
+    isAddProjectHomeRootQuery(trimmedBrowseQuery) && browseResult == null;
+  const canSubmitBrowsePath =
+    isBrowsing && !relativePathNeedsActiveProject && !exactHomeBrowseNeedsParentPath;
   const willCreateProjectPath =
     canSubmitBrowsePath &&
     !isBrowsePending &&
@@ -1764,14 +1770,13 @@ function OpenCommandPaletteDialog(props: {
                     )}
                     aria-label={`${submitActionLabel} (${addShortcutLabel})`}
                     disabled={
-                      relativePathNeedsActiveProject ||
-                      (isCloneDestinationStep && isRemoteProjectPending)
+                      !canSubmitBrowsePath || (isCloneDestinationStep && isRemoteProjectPending)
                     }
                     onMouseDown={(event) => {
                       event.preventDefault();
                     }}
                     onClick={() => {
-                      if (relativePathNeedsActiveProject) {
+                      if (!canSubmitBrowsePath) {
                         return;
                       }
                       if (isCloneDestinationStep) {

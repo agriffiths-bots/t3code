@@ -170,6 +170,11 @@ export function getAddProjectInitialQuery(baseDirectory: string | null | undefin
   return trimmed.length === 0 ? "~/" : ensureBrowseDirectoryPath(trimmed);
 }
 
+export function isAddProjectHomeRootQuery(rawPath: string): boolean {
+  const trimmed = rawPath.trim();
+  return trimmed === "~" || trimmed === "~/" || trimmed === "~\\";
+}
+
 export function resolveAddProjectPath(input: {
   readonly rawPath: string;
   readonly currentProjectCwd?: string | null;
