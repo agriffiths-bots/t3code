@@ -1,6 +1,7 @@
 import {
   EnvironmentId,
   EventId,
+  MessageId,
   ORCHESTRATION_WS_METHODS,
   ProjectId,
   ProviderInstanceId,
@@ -167,10 +168,13 @@ const makeHarness = Effect.fn("TestEnvironmentThreads.makeHarness")(function* (o
   };
 });
 
-const snapshot = (thread: OrchestrationThread): OrchestrationThreadStreamItem => ({
+const snapshot = (
+  thread: OrchestrationThread,
+  snapshotSequence = 1,
+): OrchestrationThreadStreamItem => ({
   kind: "snapshot",
   snapshot: {
-    snapshotSequence: 1,
+    snapshotSequence,
     thread,
   },
 });
@@ -323,6 +327,63 @@ describe("EnvironmentThreads", () => {
       );
 
       expect(Option.isNone(recovered.error)).toBe(true);
+      expect(yield* Ref.get(harness.subscriptionCount)).toBe(2);
+    }),
+  );
+
+  it.effect("backfills server-persisted assistant messages from a reconnect snapshot", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness();
+      yield* Queue.offer(harness.inputs, snapshot(BASE_THREAD));
+      yield* awaitThreadState(
+        harness.observed,
+        (value) =>
+          value.status === "live" &&
+          Option.isSome(value.data) &&
+          value.data.value.messages.length === 0,
+      );
+
+      yield* SubscriptionRef.set(harness.supervisorSession, Option.none());
+      yield* harness.replaceSession;
+      for (let attempt = 0; attempt < 100; attempt += 1) {
+        if ((yield* Ref.get(harness.subscriptionCount)) >= 2) {
+          break;
+        }
+        yield* Effect.yieldNow;
+      }
+
+      const missedAssistantMessage = {
+        id: MessageId.make("message-assistant-7am"),
+        role: "assistant" as const,
+        text: "Morning report generated while the client was offline.",
+        attachments: [],
+        turnId: null,
+        streaming: false,
+        createdAt: "2026-07-06T06:04:16.000Z",
+        updatedAt: "2026-07-06T06:04:16.000Z",
+      };
+      yield* Queue.offer(
+        harness.inputs,
+        snapshot(
+          {
+            ...BASE_THREAD,
+            updatedAt: missedAssistantMessage.updatedAt,
+            messages: [missedAssistantMessage],
+          },
+          2,
+        ),
+      );
+
+      const recovered = yield* awaitThreadState(
+        harness.observed,
+        (value) =>
+          value.status === "live" &&
+          Option.isSome(value.data) &&
+          value.data.value.messages.some((message) => message.id === missedAssistantMessage.id),
+      );
+
+      const messages = Option.getOrThrow(recovered.data).messages;
+      expect(messages).toEqual([missedAssistantMessage]);
       expect(yield* Ref.get(harness.subscriptionCount)).toBe(2);
     }),
   );
