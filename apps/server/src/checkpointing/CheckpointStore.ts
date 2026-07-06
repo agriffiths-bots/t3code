@@ -46,6 +46,18 @@ export interface DeleteCheckpointRefsInput {
   readonly checkpointRefs: ReadonlyArray<CheckpointRef>;
 }
 
+export interface PruneCheckpointRefsInput {
+  readonly cwd: string;
+  readonly keepPerThread: number;
+}
+
+export interface PruneCheckpointRefsResult {
+  readonly scannedCount: number;
+  readonly keptCount: number;
+  readonly deletedCount: number;
+  readonly threadCount: number;
+}
+
 /** Service tag for checkpoint persistence and restore operations. */
 export class CheckpointStore extends Context.Service<
   CheckpointStore,
@@ -93,6 +105,16 @@ export class CheckpointStore extends Context.Service<
     readonly deleteCheckpointRefs: (
       input: DeleteCheckpointRefsInput,
     ) => Effect.Effect<void, CheckpointStoreError>;
+
+    /**
+     * Prune hidden checkpoint refs, retaining only the bounded tail per thread.
+     *
+     * Turn 0 is preserved as the thread baseline; the remaining budget is spent
+     * on the newest positive turn refs.
+     */
+    readonly pruneCheckpointRefs: (
+      input: PruneCheckpointRefsInput,
+    ) => Effect.Effect<PruneCheckpointRefsResult, CheckpointStoreError>;
   }
 >()("t3/checkpointing/CheckpointStore") {}
 
@@ -157,6 +179,13 @@ export const make = Effect.gen(function* () {
     return yield* checkpoints.deleteCheckpointRefs(input);
   });
 
+  const pruneCheckpointRefs: CheckpointStore["Service"]["pruneCheckpointRefs"] = Effect.fn(
+    "pruneCheckpointRefs",
+  )(function* (input) {
+    const checkpoints = yield* resolveCheckpoints("CheckpointStore.pruneCheckpointRefs", input.cwd);
+    return yield* checkpoints.pruneCheckpointRefs(input);
+  });
+
   return CheckpointStore.of({
     isGitRepository,
     captureCheckpoint,
@@ -164,6 +193,7 @@ export const make = Effect.gen(function* () {
     restoreCheckpoint,
     diffCheckpoints,
     deleteCheckpointRefs,
+    pruneCheckpointRefs,
   });
 });
 
