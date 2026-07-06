@@ -352,10 +352,16 @@ describe("inject-resume", () => {
       "thread.turn.start",
       "snapshot",
       "thread.turn.start",
+      "thread.interaction-mode.set",
     ]);
     assert.deepEqual(
       requests.map((request) => request.type),
-      ["thread.interaction-mode.set", "thread.turn.start", "thread.turn.start"],
+      [
+        "thread.interaction-mode.set",
+        "thread.turn.start",
+        "thread.turn.start",
+        "thread.interaction-mode.set",
+      ],
     );
     assert.equal(requests[0]?.interactionMode, "default");
     assert.equal(requests[1]?.message.role, "user");
@@ -377,6 +383,8 @@ describe("inject-resume", () => {
       planId: "plan-queued",
     });
     assert.notEqual(requests[1]?.commandId, requests[2]?.commandId);
+    assert.equal(requests[3]?.interactionMode, "plan");
+    assert.notEqual(requests[0]?.commandId, requests[3]?.commandId);
   });
 
   it("preflights snapshot read access before dispatching queued resumes", async () => {

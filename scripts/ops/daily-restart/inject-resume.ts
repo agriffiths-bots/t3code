@@ -309,7 +309,7 @@ async function writeManifestAtomic(path: string, manifest: ResumeManifest): Prom
 }
 
 function stableDispatchId(
-  kind: "interaction-mode" | "command" | "queued-command" | "message",
+  kind: "interaction-mode" | "queued-interaction-mode" | "command" | "queued-command" | "message",
   manifest: ResumeManifest,
   threadId: string,
 ): string {
@@ -794,21 +794,28 @@ async function dispatchResumeCommands(
   const pendingRuntimeMode = thread.pending_message?.runtime_mode ?? runtimeMode;
   const pendingInteractionMode = thread.pending_message?.interaction_mode ?? interactionMode;
   const hasQueuedPromptAfterActive = hasActiveTurn(thread) && thread.pending_message !== undefined;
-  await postDispatchCommandWithRetry(
-    fetchImpl,
-    origin,
-    token,
-    {
-      type: "thread.interaction-mode.set",
-      commandId: stableDispatchId("interaction-mode", manifest, thread.thread_id),
-      threadId: thread.thread_id,
-      interactionMode,
-      createdAt,
-    },
-    attemptTimeoutMs,
-    sleepImpl,
-    random,
-  );
+  const dispatchInteractionMode = async (
+    mode: ResumeInteractionMode,
+    kind: "interaction-mode" | "queued-interaction-mode",
+  ) => {
+    await postDispatchCommandWithRetry(
+      fetchImpl,
+      origin,
+      token,
+      {
+        type: "thread.interaction-mode.set",
+        commandId: stableDispatchId(kind, manifest, thread.thread_id),
+        threadId: thread.thread_id,
+        interactionMode: mode,
+        createdAt,
+      },
+      attemptTimeoutMs,
+      sleepImpl,
+      random,
+    );
+  };
+
+  await dispatchInteractionMode(interactionMode, "interaction-mode");
 
   const dispatchTurnStart = async (input: {
     readonly commandId: string;
@@ -863,13 +870,17 @@ async function dispatchResumeCommands(
       pollMs: resumeStartPollMs,
       sleepImpl,
     });
+    const queuedMessage = await resumeMessageForThread(manifest, thread, attachmentsDir);
     await dispatchTurnStart({
       commandId: stableDispatchId("queued-command", manifest, thread.thread_id),
-      message: await resumeMessageForThread(manifest, thread, attachmentsDir),
+      message: queuedMessage,
       metadata: pendingTurnMetadataForThread(thread),
       runtimeMode: pendingRuntimeMode,
       interactionMode: pendingInteractionMode,
     });
+    if (pendingInteractionMode !== interactionMode) {
+      await dispatchInteractionMode(pendingInteractionMode, "queued-interaction-mode");
+    }
   }
 }
 

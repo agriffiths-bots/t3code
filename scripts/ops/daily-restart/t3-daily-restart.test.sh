@@ -124,6 +124,14 @@ while [[ $# -gt 0 ]]; do
   if [[ "$1" == "--out" ]]; then
     if [[ "${FAKE_CAPTURE_BAD_JSON:-0}" == "1" || ( -n "${FAKE_CAPTURE_BAD_JSON_N:-}" && "$count" == "$FAKE_CAPTURE_BAD_JSON_N" ) ]]; then
       printf '{bad json\n' >"$2"
+    elif [[ -n "${FAKE_CAPTURE_QUEUED_COUNT:-}" ]]; then
+      count="$FAKE_CAPTURE_QUEUED_COUNT"
+      printf '{"threads":[' >"$2"
+      for i in $(seq 1 "$count"); do
+        [[ "$i" == "1" ]] || printf ',' >>"$2"
+        printf '{"thread_id":"queued-%s","role":"active","active_turn_id":"turn-%s","pending_message":{"message_id":"message-%s","role":"user","text":"queued","attachments":[]},"injected_at":null}' "$i" "$i" "$i" >>"$2"
+      done
+      printf ']}\n' >>"$2"
     elif [[ "${FAKE_CAPTURE_PHASE_THREADS:-0}" == "1" && "$2" == *.pre-stop.* ]]; then
       printf '{"threads":[{"thread_id":"pre-active","role":"active","active_turn_id":"turn-old"},{"thread_id":"pre-pending","role":"active","pending_message":{"message_id":"message-pre","role":"user","text":"pending","attachments":[]}}]}\n' >"$2"
     elif [[ "${FAKE_CAPTURE_PHASE_THREADS:-0}" == "1" && "$2" == *.post-stop.* ]]; then
@@ -189,7 +197,8 @@ if [[ "$1" == "-" && "${2:-}" == http* ]]; then
       *) exit 9 ;;
     esac
   fi
-  if [[ " ${FAKE_RESUME_TOKEN_SCOPES:-orchestration:operate} " != *" orchestration:operate "* ]]; then
+  scopes=" ${FAKE_RESUME_TOKEN_SCOPES:-orchestration:operate orchestration:read} "
+  if [[ "$scopes" != *" orchestration:operate "* || "$scopes" != *" orchestration:read "* ]]; then
     exit 9
   fi
   exit "${FAKE_RESUME_TOKEN_VALIDATE_RC:-0}"
@@ -336,6 +345,17 @@ else
   pass "resume token validation failure aborts before stop"
 fi
 grep -Fq "RESULT FAILED" "$tmp/ledger/"*/t3-daily-restart.result && pass "resume token validation failure recorded" || fail "resume token validation failure recorded"
+
+tmp="$(mktemp -d)"
+export FAKE_RESUME_TOKEN_SCOPES="orchestration:operate"
+run_manager "$tmp"
+unset FAKE_RESUME_TOKEN_SCOPES
+[[ "$(cat "$tmp/rc")" != "0" ]] && pass "operate-only resume token exits nonzero" || fail "operate-only resume token exits nonzero"
+if grep -Fq "systemctl --user stop" "$tmp/calls.log"; then
+  fail "operate-only resume token stopped service"
+else
+  pass "operate-only resume token aborts before stop"
+fi
 
 tmp="$(mktemp -d)"
 export FAKE_RESUME_TOKEN_SCOPES="orchestration:read"
@@ -504,6 +524,13 @@ else
 fi
 
 tmp="$(mktemp -d)"
+export FAKE_CAPTURE_QUEUED_COUNT=3
+run_manager "$tmp"
+unset FAKE_CAPTURE_QUEUED_COUNT
+[[ "$(cat "$tmp/rc")" == "0" ]] && pass "queued manifest exits zero" || fail "queued manifest exits zero"
+grep -Fq "RUN timeout=960 " "$tmp/ledger/"*/t3-daily-restart.log && pass "inject timeout scales with queued replay waits" || fail "inject timeout scales with queued replay waits"
+
+tmp="$(mktemp -d)"
 export FAKE_CAPTURE_BAD_JSON=1
 run_manager "$tmp"
 unset FAKE_CAPTURE_BAD_JSON
@@ -516,7 +543,31 @@ run_manager "$tmp"
 unset FAKE_CAPTURE_BAD_JSON_N
 [[ "$(cat "$tmp/rc")" != "0" ]] && pass "post-stop bad manifest exits nonzero" || fail "post-stop bad manifest exits nonzero"
 assert_order "$tmp/calls.log" "systemctl --user stop fake.service" "capture --db" "systemctl --user start fake.service" "inject"
-grep -Fq "inject token=minted-token --origin http://127.0.0.1:1 --manifest $tmp/ledger/" "$tmp/calls.log" && pass "post-stop bad manifest injects pre-stop manifest" || fail "post-stop bad manifest injects pre-stop manifest"
+grep -Fq "inject token=minted-token --origin http://127.0.0.1:1 --manifest $tmp/ledger/" "$tmp/calls.log" && pass "post-stop bad manifest injects sanitized fallback manifest" || fail "post-stop bad manifest injects sanitized fallback manifest"
+
+tmp="$(mktemp -d)"
+export FAKE_CAPTURE_PHASE_THREADS=1
+export FAKE_CAPTURE_BAD_JSON_N=2
+run_manager "$tmp"
+unset FAKE_CAPTURE_PHASE_THREADS FAKE_CAPTURE_BAD_JSON_N
+manifest_path="$(echo "$tmp/ledger/"*/resume-manifest.json)"
+if node - "$manifest_path" <<'NODE'
+const fs = require("node:fs");
+const manifest = JSON.parse(fs.readFileSync(process.argv[2], "utf8"));
+const threads = manifest.threads ?? [];
+process.exit(
+  threads.length === 1 &&
+    threads[0]?.thread_id === "pre-active" &&
+    threads[0]?.pending_message === undefined
+    ? 0
+    : 1,
+);
+NODE
+then
+  pass "post-stop capture failure strips pending fallback replay"
+else
+  fail "post-stop capture failure strips pending fallback replay"
+fi
 
 tmp="$(mktemp -d)"
 export FAKE_HEALTH_PARTIAL=1
