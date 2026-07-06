@@ -3,7 +3,9 @@ import { describe, expect, it } from "vite-plus/test";
 import { MAX_THREAD_CHECKPOINTS } from "../orchestration/checkpointRetention.ts";
 import {
   CHECKPOINT_REFS_KEEP_PER_THREAD,
+  isWorktreePathListed,
   selectStaleWorktreeReapCandidates,
+  shouldRetainWorktreeMetadataAfterListFailure,
   type WorktreeMaintenanceRow,
 } from "./VcsMaintenanceReactor.ts";
 
@@ -225,5 +227,50 @@ describe("selectStaleWorktreeReapCandidates", () => {
         stoppedAgeMs: 60 * 60_000,
       }).map((candidate) => candidate.threadId),
     ).toEqual(["archived", "deleted"]);
+  });
+});
+
+describe("worktree registration helpers", () => {
+  it("matches exact normalized paths in git worktree porcelain output", () => {
+    expect(
+      isWorktreePathListed(
+        [
+          "worktree /repo",
+          "HEAD abc",
+          "branch refs/heads/main",
+          "",
+          "worktree /tmp/t3-worktree",
+          "HEAD def",
+          "branch refs/heads/feature",
+          "",
+        ].join("\n"),
+        "/tmp/t3-worktree",
+      ),
+    ).toBe(true);
+
+    expect(isWorktreePathListed("worktree /tmp/t3-worktree-child\n", "/tmp/t3-worktree")).toBe(
+      false,
+    );
+  });
+
+  it("only clears metadata after a failed worktree listing when both paths are gone", () => {
+    expect(
+      shouldRetainWorktreeMetadataAfterListFailure({
+        projectRootExists: false,
+        worktreePathExists: false,
+      }),
+    ).toBe(false);
+    expect(
+      shouldRetainWorktreeMetadataAfterListFailure({
+        projectRootExists: true,
+        worktreePathExists: false,
+      }),
+    ).toBe(true);
+    expect(
+      shouldRetainWorktreeMetadataAfterListFailure({
+        projectRootExists: false,
+        worktreePathExists: true,
+      }),
+    ).toBe(true);
   });
 });
