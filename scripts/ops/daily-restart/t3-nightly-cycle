@@ -9,6 +9,16 @@ script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 
 checkout="${T3DR_CHECKOUT:-/home/adam/t3code}"
 ledger="${T3DR_LEDGER:-/home/adam/.openclaw/daily-restart}"
+db="${T3DR_DB:-/home/adam/.t3-vps/userdata/state.sqlite}"
+attachments_dir="${T3DR_ATTACHMENTS_DIR:-}"
+service="${T3DR_SERVICE:-t3code.service}"
+origin="${T3DR_ORIGIN:-http://127.0.0.1:3773}"
+snapshot_dir="${T3DR_SNAPSHOT_DIR:-/home/adam/backups/t3-daily}"
+probe_timeout="${T3DR_PROBE_TIMEOUT:-180}"
+stop_timeout="${T3DR_STOP_TIMEOUT:-120}"
+kill_timeout="${T3DR_KILL_TIMEOUT:-30}"
+smoke_instance="${T3DR_SMOKE_INSTANCE:-}"
+smoke_model="${T3DR_SMOKE_MODEL:-}"
 backup_cmd="${T3DR_BACKUP_CMD:-/home/adam/.openclaw/bin/t3-vps-backup}"
 upstream_sync_cmd="${T3DR_UPSTREAM_SYNC_CMD:-/home/adam/.openclaw/bin/t3-upstream-sync}"
 restart_cmd="${T3DR_RESTART_CMD:-$script_dir/t3-daily-restart}"
@@ -356,13 +366,13 @@ build_release_artifacts() {
     run_logged "$build_timeout" "$step_log" pnpm -C "$stage_checkout/apps/web" run build || rc=$?
   fi
   if [[ "$rc" -eq 0 && ( "$rollback_sha" != "$target_sha" || "$build_always" == "1" ) ]]; then
-    run_logged "$build_timeout" "$step_log" pnpm -C "$stage_checkout" run build:desktop || rc=$?
+    run_logged "$build_timeout" "$step_log" env T3CODE_BUILD_SHA="$target_sha" pnpm -C "$stage_checkout" run build:desktop || rc=$?
   fi
   if [[ "$rc" -eq 0 && ( "$rollback_sha" != "$target_sha" || "$build_always" == "1" ) ]]; then
     if [[ "$desktop_artifact" == "1" ]]; then
       mkdir -p "$desktop_artifact_dir" || rc=$?
       if [[ "$rc" -eq 0 ]]; then
-        run_logged "$build_timeout" "$step_log" env T3CODE_DESKTOP_OUTPUT_DIR="$desktop_artifact_dir" pnpm -C "$stage_checkout" run dist:desktop:artifact || rc=$?
+        run_logged "$build_timeout" "$step_log" env T3CODE_BUILD_SHA="$target_sha" T3CODE_DESKTOP_OUTPUT_DIR="$desktop_artifact_dir" pnpm -C "$stage_checkout" run dist:desktop:artifact || rc=$?
       fi
     else
       printf '[%s] DESKTOP_ARTIFACT TODO no-op: set T3DR_DESKTOP_ARTIFACT=1 after T1 lands to run dist:desktop:artifact into %s\n' "$(date -u +%FT%TZ)" "$desktop_artifact_dir" >>"$step_log"
@@ -416,6 +426,21 @@ run_restart_step() {
   local step_log="$run_dir/$step.log"
   local started="$SECONDS" rc duration prebuilt rollback target
   local assets probe
+  local -a restart_env
+  restart_env=(
+    T3DR_CHECKOUT="$checkout"
+    T3DR_LEDGER="$ledger"
+    T3DR_DB="$db"
+    T3DR_ATTACHMENTS_DIR="$attachments_dir"
+    T3DR_SERVICE="$service"
+    T3DR_ORIGIN="$origin"
+    T3DR_SNAPSHOT_DIR="$snapshot_dir"
+    T3DR_PROBE_TIMEOUT="$probe_timeout"
+    T3DR_STOP_TIMEOUT="$stop_timeout"
+    T3DR_KILL_TIMEOUT="$kill_timeout"
+    T3DR_SMOKE_INSTANCE="$smoke_instance"
+    T3DR_SMOKE_MODEL="$smoke_model"
+  )
   : >"$step_log"
   write_event "$step" "started" "" "" "$step_log"
   if [[ -r "$prebuilt_env" ]]; then
@@ -438,7 +463,7 @@ run_restart_step() {
       printf '[%s] invalid prebuilt restart metadata in %s\n' "$(date -u +%FT%TZ)" "$prebuilt_env" >>"$step_log"
       rc=68
     else
-      env T3DR_CHECKOUT="$checkout" T3DR_LEDGER="$ledger" \
+      env "${restart_env[@]}" \
         T3DR_PREBUILT_TARGET=1 T3DR_ROLLBACK_SHA="$rollback" T3DR_TARGET_SHA="$target" \
         T3DR_PREBUILT_ASSETS_DIR="$assets" T3DR_PINNED_HEALTH_PROBE="$probe" \
         "$restart_cmd" >>"$step_log" 2>&1
@@ -449,7 +474,7 @@ run_restart_step() {
       printf '[%s] invalid no-op restart metadata in %s\n' "$(date -u +%FT%TZ)" "$prebuilt_env" >>"$step_log"
       rc=68
     else
-      env T3DR_CHECKOUT="$checkout" T3DR_LEDGER="$ledger" \
+      env "${restart_env[@]}" \
         T3DR_TARGET_SHA="$target" \
         "$restart_cmd" >>"$step_log" 2>&1
       rc=$?

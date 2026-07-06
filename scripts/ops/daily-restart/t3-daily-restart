@@ -134,7 +134,9 @@ pre_stop_manifest="$run_dir/resume-manifest.pre-stop.json"
 lock_file="$ledger/t3-daily-restart.lock"
 pinned_tools_dir="$run_dir/pinned-tools"
 pinned_health_probe=""
+pinned_verify_restart=""
 pinned_inject_resume=""
+pre_restart_pid=""
 resume_token=""
 resume_token_session_id=""
 resume_token_dir=""
@@ -205,6 +207,12 @@ run_output() {
   shift
   log "RUN_CAPTURE timeout=$timeout_secs $*"
   timeout "$timeout_secs" "$@" 2>>"$log_file"
+}
+
+service_main_pid() {
+  ensure_user_bus_env
+  timeout 10 systemctl --user show "$service" -p MainPID --value 2>>"$log_file" |
+    tr -d '[:space:]'
 }
 
 systemctl_is_inactive_or_failed() {
@@ -637,6 +645,83 @@ run_health_probe() {
     >"$probe_file" 2>>"$log_file"
 }
 
+run_verify_restart() {
+  local verify_file="$1"
+  local verify_timeout
+  if [[ -z "$pinned_verify_restart" || ! -x "$pinned_verify_restart" ]]; then
+    echo "verify-restart missing" >"$verify_file"
+    return 127
+  fi
+  verify_timeout=$((probe_timeout + 10))
+  log "VERIFY_RESTART tool=$pinned_verify_restart previous_pid=${pre_restart_pid:-unknown} target_sha=$target_sha"
+  ensure_user_bus_env
+  timeout "$verify_timeout" "$pinned_verify_restart" --service "$service" --origin "$origin" \
+    --checkout "$checkout" --expected-sha "$target_sha" \
+    --previous-pid "${pre_restart_pid:-0}" --timeout "$probe_timeout" \
+    >"$verify_file" 2>>"$log_file"
+}
+
+verify_failed_only_server_build_sha() {
+  local verify_file="$1"
+  local saw_build_sha_failure=0
+  local saw_other_failure=0
+  local line
+
+  while IFS= read -r line; do
+    case "$line" in
+      "CHECK restart FAIL environment descriptor did not include serverBuildSha"*) saw_build_sha_failure=1 ;;
+      "CHECK restart FAIL serverBuildSha mismatch:"*) saw_build_sha_failure=1 ;;
+      CHECK\ *\ FAIL*) saw_other_failure=1 ;;
+    esac
+  done <"$verify_file"
+
+  [[ "$saw_build_sha_failure" == "1" && "$saw_other_failure" == "0" ]]
+}
+
+retry_legacy_unstamped_noop_restart() {
+  local verify_file="$1"
+
+  log "legacy unstamped no-op artifact detected; rebuilding deploy artifact with target build sha"
+  if ! stop_service_or_escalate "LEGACY_REBUILD"; then
+    log "LEGACY_REBUILD stop failed"
+    return 1
+  fi
+  if ! run_capture 900 env T3CODE_BUILD_SHA="$target_sha" pnpm -C "$checkout" run build:desktop; then
+    log "LEGACY_REBUILD deploy artifact rebuild failed"
+    run_capture 60 systemctl --user start "$service" || log "LEGACY_REBUILD failed to restart after rebuild failure"
+    return 1
+  fi
+  if ! run_capture 60 systemctl --user start "$service"; then
+    log "LEGACY_REBUILD start failed"
+    return 1
+  fi
+  run_verify_restart "$verify_file"
+}
+
+pin_verify_restart() {
+  local source_tool pinned_tool temp_tool
+  source_tool="$(resolve_tool verify-restart)" || return 1
+  mkdir -p "$pinned_tools_dir" || return 1
+  chmod 700 "$pinned_tools_dir" || return 1
+  pinned_tool="$pinned_tools_dir/verify-restart"
+  temp_tool="$pinned_tools_dir/.verify-restart.$$"
+  rm -f -- "$temp_tool" || return 1
+  cp -p -- "$source_tool" "$temp_tool" || {
+    rm -f -- "$temp_tool"
+    return 1
+  }
+  chmod 700 "$temp_tool" || {
+    rm -f -- "$temp_tool"
+    return 1
+  }
+  mv -f -- "$temp_tool" "$pinned_tool" || {
+    rm -f -- "$temp_tool"
+    return 1
+  }
+  pinned_verify_restart="$pinned_tool"
+  log "PINNED verify-restart source=$source_tool pinned=$pinned_tool"
+}
+
 pin_health_probe() {
   local source_probe pinned_probe temp_probe
   if [[ -n "$pinned_health_probe_source" ]]; then
@@ -779,7 +864,7 @@ rollback() {
     record_result "ROLLBACK-FAILED"
     return 1
   }
-  run_capture 900 pnpm -C "$checkout" run build:desktop || {
+  run_capture 900 env T3CODE_BUILD_SHA="$pre_sha" pnpm -C "$checkout" run build:desktop || {
     log "ROLLBACK deploy artifact rebuild failed"
     record_result "ROLLBACK-FAILED"
     return 1
@@ -824,7 +909,7 @@ code_only_rollback() {
     record_result "CODE-ROLLBACK-FAILED"
     return 1
   }
-  run_capture 900 pnpm -C "$checkout" run build:desktop || {
+  run_capture 900 env T3CODE_BUILD_SHA="$pre_sha" pnpm -C "$checkout" run build:desktop || {
     log "CODE_ROLLBACK deploy artifact rebuild failed"
     record_result "CODE-ROLLBACK-FAILED"
     return 1
@@ -974,11 +1059,22 @@ if ! pin_inject_resume; then
   record_result "FAILED"
   exit 1
 fi
+if ! pin_verify_restart; then
+  log "failed to pin pre-update verify-restart"
+  record_result "FAILED"
+  exit 1
+fi
 if ! prepare_resume_token; then
   log "failed to prepare resume-injection token"
   record_result "FAILED"
   exit 1
 fi
+
+pre_restart_pid="$(service_main_pid || true)"
+if ! [[ "$pre_restart_pid" =~ ^[0-9]+$ ]]; then
+  pre_restart_pid=0
+fi
+log "pre_restart_pid=$pre_restart_pid"
 
 stop_started_at="$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)"
 if ! stop_service_or_escalate "SHUTDOWN"; then
@@ -1055,7 +1151,7 @@ elif [[ "$pre_sha" != "$target_sha" ]]; then
     log "web rebuild failed before restart"
     code_only_rollback "$run_dir/health-probe.after-web-build" || exit 1
   fi
-  if ! run_capture 900 pnpm -C "$checkout" run build:desktop; then
+  if ! run_capture 900 env T3CODE_BUILD_SHA="$target_sha" pnpm -C "$checkout" run build:desktop; then
     log "deploy artifact build failed before restart"
     code_only_rollback "$run_dir/health-probe.after-deploy-build" || exit 1
   fi
@@ -1067,6 +1163,24 @@ fi
 if ! run_capture 60 systemctl --user start "$service"; then
   log "systemctl start failed"
   rollback "$run_dir/health-probe.after-start" || exit 1
+fi
+
+verify_file="$run_dir/verify-restart.after-start"
+verify_rc=0
+run_verify_restart "$verify_file" || verify_rc=$?
+cat "$verify_file" >>"$log_file"
+if [[ "$verify_rc" -ne 0 ]]; then
+  if [[ "$updated" == "0" ]] && verify_failed_only_server_build_sha "$verify_file"; then
+    retry_verify_file="$run_dir/verify-restart.after-legacy-rebuild"
+    retry_verify_rc=0
+    retry_legacy_unstamped_noop_restart "$retry_verify_file" || retry_verify_rc=$?
+    [[ -f "$retry_verify_file" ]] && cat "$retry_verify_file" >>"$log_file"
+    verify_rc="$retry_verify_rc"
+  fi
+fi
+if [[ "$verify_rc" -ne 0 ]]; then
+  log "restart verification failed; deterministic code+DB rollback"
+  rollback "$run_dir/health-probe.after-verify-restart" || exit 1
 fi
 
 probe_file="$run_dir/health-probe.after-start"

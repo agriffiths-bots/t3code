@@ -78,7 +78,7 @@ exit "${FAKE_SYNC_RC:-0}"
 SH
   cat >"$dir/fake-restart" <<'SH'
 #!/usr/bin/env bash
-echo "restart prebuilt=${T3DR_PREBUILT_TARGET:-0} checkout=${T3DR_CHECKOUT:-} ledger=${T3DR_LEDGER:-} rollback=${T3DR_ROLLBACK_SHA:-} target=${T3DR_TARGET_SHA:-} assets=${T3DR_PREBUILT_ASSETS_DIR:-} probe=${T3DR_PINNED_HEALTH_PROBE:-}" >>"$T_LOG"
+echo "restart prebuilt=${T3DR_PREBUILT_TARGET:-0} checkout=${T3DR_CHECKOUT:-} ledger=${T3DR_LEDGER:-} db=${T3DR_DB:-} service=${T3DR_SERVICE:-} origin=${T3DR_ORIGIN:-} snapshot=${T3DR_SNAPSHOT_DIR:-} probe_timeout=${T3DR_PROBE_TIMEOUT:-} smoke_instance=${T3DR_SMOKE_INSTANCE:-} smoke_model=${T3DR_SMOKE_MODEL:-} rollback=${T3DR_ROLLBACK_SHA:-} target=${T3DR_TARGET_SHA:-} assets=${T3DR_PREBUILT_ASSETS_DIR:-} probe=${T3DR_PINNED_HEALTH_PROBE:-}" >>"$T_LOG"
 exit "${FAKE_RESTART_RC:-0}"
 SH
   chmod +x "$dir"/*
@@ -95,6 +95,13 @@ run_cycle() {
   T_TMP="$tmp" T_LOG="$tmp/calls.log" T3DR_TEST_PATH_PREFIX="$tmp/bin" \
     T3DR_CHECKOUT="$tmp/checkout" \
     T3DR_LEDGER="$tmp/ledger" \
+    T3DR_DB="$tmp/state.sqlite" \
+    T3DR_SERVICE="fake.service" \
+    T3DR_ORIGIN="http://127.0.0.1:1" \
+    T3DR_SNAPSHOT_DIR="$tmp/snaps" \
+    T3DR_PROBE_TIMEOUT="7" \
+    T3DR_SMOKE_INSTANCE="fakeAgent" \
+    T3DR_SMOKE_MODEL="fake-model" \
     T3DR_BACKUP_CMD="fake-backup" \
     T3DR_UPSTREAM_SYNC_CMD="fake-sync" \
     T3DR_RESTART_CMD="$tmp/bin/fake-restart" \
@@ -131,6 +138,7 @@ else
 fi
 grep -Fq "sync repo=$tmp/checkout" "$tmp/calls.log" && pass "sync receives checkout repo" || fail "sync receives checkout repo"
 grep -Fq "checkout=$tmp/checkout ledger=$tmp/ledger" "$tmp/calls.log" && pass "restart receives checkout and ledger" || fail "restart receives checkout and ledger"
+grep -Fq "db=$tmp/state.sqlite service=fake.service origin=http://127.0.0.1:1 snapshot=$tmp/snaps probe_timeout=7 smoke_instance=fakeAgent smoke_model=fake-model" "$tmp/calls.log" && pass "restart receives explicit runtime env" || fail "restart receives explicit runtime env"
 grep -Fq "rollback=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa target=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" "$tmp/calls.log" && pass "restart receives prebuilt rollback target" || fail "restart receives prebuilt rollback target"
 grep -Fq "assets=$tmp/ledger/$(date -u +%F)/prebuilt-stage/payload" "$tmp/calls.log" && pass "restart receives staged payload" || fail "restart receives staged payload"
 grep -Fq "probe=$tmp/ledger/$(date -u +%F)/pinned-tools/health-probe.rollback" "$tmp/calls.log" && pass "restart receives rollback probe" || fail "restart receives rollback probe"
