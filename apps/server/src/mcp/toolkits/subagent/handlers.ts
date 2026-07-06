@@ -389,6 +389,7 @@ const spawnSubagent = Effect.fn("SubagentToolkit.spawn")(function* (input: Spawn
   const started = yield* spawnRuntime(
     { ...threadStartInputWithSelection, modelSelection },
     invocation,
+    { providerSessionDetached: detached },
   );
   const spawnedAtMs = yield* Effect.clockWith((clock) => clock.currentTimeMillis);
 

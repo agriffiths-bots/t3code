@@ -127,6 +127,7 @@ function toRuntimePayloadFromSession(
   session: ProviderSession,
   extra?: {
     readonly modelSelection?: unknown;
+    readonly detached?: boolean;
     readonly lastRuntimeEvent?: string;
     readonly lastRuntimeEventAt?: string;
   },
@@ -137,6 +138,7 @@ function toRuntimePayloadFromSession(
     activeTurnId: session.activeTurnId ?? null,
     lastError: session.lastError ?? null,
     ...(extra?.modelSelection !== undefined ? { modelSelection: extra.modelSelection } : {}),
+    ...(extra?.detached !== undefined ? { detached: extra.detached } : {}),
     ...(extra?.lastRuntimeEvent !== undefined ? { lastRuntimeEvent: extra.lastRuntimeEvent } : {}),
     ...(extra?.lastRuntimeEventAt !== undefined
       ? { lastRuntimeEventAt: extra.lastRuntimeEventAt }
@@ -166,10 +168,30 @@ function readPersistedCwd(
   return trimmed.length > 0 ? trimmed : undefined;
 }
 
+function readPersistedDetached(
+  runtimePayload: ProviderSessionDirectory.ProviderRuntimeBinding["runtimePayload"],
+): boolean | undefined {
+  if (!runtimePayload || typeof runtimePayload !== "object" || Array.isArray(runtimePayload)) {
+    return undefined;
+  }
+  const raw = "detached" in runtimePayload ? runtimePayload.detached : undefined;
+  return typeof raw === "boolean" ? raw : undefined;
+}
+
 function readRecord(value: unknown): Record<string, unknown> | undefined {
   return value !== null && typeof value === "object" && !Array.isArray(value)
     ? (value as Record<string, unknown>)
     : undefined;
+}
+
+function mergeRuntimePayload(
+  runtimePayload: ProviderSessionDirectory.ProviderRuntimeBinding["runtimePayload"] | undefined,
+  patch: Record<string, unknown>,
+): ProviderSessionDirectory.ProviderRuntimeBinding["runtimePayload"] {
+  return {
+    ...readRecord(runtimePayload),
+    ...patch,
+  };
 }
 
 function readResumeCursorFromRuntimeDetail(detail: unknown): unknown | undefined {
@@ -573,6 +595,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
     threadId: ThreadId,
     extra?: {
       readonly modelSelection?: unknown;
+      readonly detached?: boolean;
       readonly lastRuntimeEvent?: string;
       readonly lastRuntimeEventAt?: string;
     },
@@ -582,6 +605,19 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
         "ProviderService.upsertSessionBinding",
         session,
       );
+      const binding = Option.getOrUndefined(
+        yield* directory
+          .getBinding(threadId)
+          .pipe(
+            Effect.orElseSucceed(() =>
+              Option.none<ProviderSessionDirectory.ProviderRuntimeBinding>(),
+            ),
+          ),
+      );
+      const reusableRuntimePayload =
+        binding?.provider === session.provider && binding.providerInstanceId === providerInstanceId
+          ? binding.runtimePayload
+          : undefined;
       yield* directory.upsert({
         threadId,
         provider: session.provider,
@@ -589,7 +625,10 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
         runtimeMode: session.runtimeMode,
         status: toRuntimeStatus(session),
         ...(session.resumeCursor !== undefined ? { resumeCursor: session.resumeCursor } : {}),
-        runtimePayload: toRuntimePayloadFromSession(session, extra),
+        runtimePayload: mergeRuntimePayload(
+          reusableRuntimePayload,
+          toRuntimePayloadFromSession(session, extra),
+        ),
       });
     });
 
@@ -815,6 +854,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
 
       const persistedCwd = readPersistedCwd(input.binding.runtimePayload);
       const persistedModelSelection = readPersistedModelSelection(input.binding.runtimePayload);
+      const persistedDetached = readPersistedDetached(input.binding.runtimePayload);
 
       yield* beginMcpSessionStart(input.binding.threadId);
       let preparedMcpSession: McpProviderSession.McpProviderSessionConfig | undefined;
@@ -827,6 +867,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
           ...(persistedCwd ? { cwd: persistedCwd } : {}),
           ...(persistedModelSelection ? { modelSelection: persistedModelSelection } : {}),
           ...(hasResumeCursor ? { resumeCursor: input.binding.resumeCursor } : {}),
+          ...(persistedDetached !== undefined ? { detached: persistedDetached } : {}),
           runtimeMode: input.binding.runtimeMode ?? "full-access",
         });
       }).pipe(
@@ -1013,6 +1054,11 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
           (persistedBinding?.providerInstanceId === resolvedInstanceId
             ? readPersistedCwd(persistedBinding.runtimePayload)
             : undefined);
+        const effectiveDetached =
+          input.detached ??
+          (persistedBinding?.providerInstanceId === resolvedInstanceId
+            ? readPersistedDetached(persistedBinding.runtimePayload)
+            : undefined);
         yield* Effect.annotateCurrentSpan({
           "provider.kind": resolvedProvider,
           "provider.resume_cursor.source":
@@ -1031,6 +1077,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
                 ? "persisted"
                 : "none",
           "provider.cwd.effective": effectiveCwd ?? "",
+          "provider.session.detached": effectiveDetached === true,
         });
         const adapter = yield* registry.getByInstance(resolvedInstanceId);
         const adapterGeneration = yield* getAdapterGenerationForStart(resolvedInstanceId, adapter);
@@ -1049,6 +1096,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
             providerInstanceId: resolvedInstanceId,
             ...(effectiveCwd !== undefined ? { cwd: effectiveCwd } : {}),
             ...(effectiveResumeCursor !== undefined ? { resumeCursor: effectiveResumeCursor } : {}),
+            ...(effectiveDetached !== undefined ? { detached: effectiveDetached } : {}),
           });
         }).pipe(
           Effect.onError(() =>
@@ -1084,6 +1132,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
         });
         yield* upsertSessionBinding(sessionWithInstance, threadId, {
           modelSelection: input.modelSelection,
+          ...(effectiveDetached !== undefined ? { detached: effectiveDetached } : {}),
         });
         yield* analytics.record("provider.session.started", {
           provider: sessionWithInstance.provider,
@@ -1146,18 +1195,27 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
         ...(input.modelSelection?.model ? { "provider.model": input.modelSelection.model } : {}),
       });
       const turn = yield* routed.adapter.sendTurn(input);
+      const binding = Option.getOrUndefined(
+        yield* directory
+          .getBinding(input.threadId)
+          .pipe(
+            Effect.orElseSucceed(() =>
+              Option.none<ProviderSessionDirectory.ProviderRuntimeBinding>(),
+            ),
+          ),
+      );
       yield* directory.upsert({
         threadId: input.threadId,
         provider: routed.adapter.provider,
         providerInstanceId: routed.instanceId,
         status: "running",
         ...(turn.resumeCursor !== undefined ? { resumeCursor: turn.resumeCursor } : {}),
-        runtimePayload: {
+        runtimePayload: mergeRuntimePayload(binding?.runtimePayload, {
           ...(input.modelSelection !== undefined ? { modelSelection: input.modelSelection } : {}),
           activeTurnId: turn.turnId,
           lastRuntimeEvent: "provider.sendTurn",
           lastRuntimeEventAt: yield* nowIso,
-        },
+        }),
       });
       yield* analytics.record("provider.turn.sent", {
         provider: routed.adapter.provider,
@@ -1316,14 +1374,23 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
           yield* routed.adapter.stopSession(routed.threadId);
         }
         yield* clearMcpSession(input.threadId);
+        const binding = Option.getOrUndefined(
+          yield* directory
+            .getBinding(input.threadId)
+            .pipe(
+              Effect.orElseSucceed(() =>
+                Option.none<ProviderSessionDirectory.ProviderRuntimeBinding>(),
+              ),
+            ),
+        );
         yield* directory.upsert({
           threadId: input.threadId,
           provider: routed.adapter.provider,
           providerInstanceId: routed.instanceId,
           status: "stopped",
-          runtimePayload: {
+          runtimePayload: mergeRuntimePayload(binding?.runtimePayload, {
             activeTurnId: null,
-          },
+          }),
         });
         yield* analytics.record("provider.session.stopped", {
           provider: routed.adapter.provider,
@@ -1511,11 +1578,11 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
           provider: binding.provider,
           providerInstanceId,
           status: "stopped",
-          runtimePayload: {
+          runtimePayload: mergeRuntimePayload(binding.runtimePayload, {
             activeTurnId: null,
             lastRuntimeEvent: "provider.stopAll",
             lastRuntimeEventAt: yield* nowIso,
-          },
+          }),
         });
       }),
     ).pipe(Effect.asVoid);
