@@ -1214,7 +1214,7 @@ describe("ClaudeAdapterLive", () => {
     );
   });
 
-  it.effect("completes the active turn from a correlated task-notification result", () => {
+  it.effect("completes a detached active turn from a task-notification result", () => {
     const harness = makeHarness();
     return Effect.gen(function* () {
       const adapter = yield* ClaudeAdapter;
@@ -1228,6 +1228,7 @@ describe("ClaudeAdapterLive", () => {
         threadId: THREAD_ID,
         provider: ProviderDriverKind.make("claudeAgent"),
         runtimeMode: "full-access",
+        detached: true,
       });
 
       const turn = yield* adapter.sendTurn({
@@ -1278,12 +1279,11 @@ describe("ClaudeAdapterLive", () => {
         stop_reason: "end_turn",
         session_id: "sdk-session-current-task-notification-result",
         uuid: "result-current-task-notification-result",
-        turnId: String(turn.turnId),
         origin: { kind: "task-notification" },
       } as unknown as SDKMessage);
-      harness.query.finish();
 
       const runtimeEvents = Array.from(yield* Fiber.join(runtimeEventsFiber));
+      harness.query.finish();
       const turnCompletedEvents = runtimeEvents.filter((event) => event.type === "turn.completed");
 
       assert.equal(turnCompletedEvents.length, 1);
@@ -1296,19 +1296,352 @@ describe("ClaudeAdapterLive", () => {
     );
   });
 
+  it.effect("completes later detached turns from their first task-notification result", () => {
+    const harness = makeHarness();
+    return Effect.gen(function* () {
+      const adapter = yield* ClaudeAdapter;
+      const runtimeEvents: Array<ProviderRuntimeEvent> = [];
+
+      const runtimeEventsFiber = yield* Stream.runForEach(adapter.streamEvents, (event) =>
+        Effect.sync(() => {
+          runtimeEvents.push(event);
+        }),
+      ).pipe(Effect.forkChild);
+
+      const session = yield* adapter.startSession({
+        threadId: THREAD_ID,
+        provider: ProviderDriverKind.make("claudeAgent"),
+        runtimeMode: "full-access",
+        detached: true,
+      });
+
+      const firstTurn = yield* adapter.sendTurn({
+        threadId: session.threadId,
+        input: "finish the first detached turn",
+        attachments: [],
+      });
+
+      harness.query.emit({
+        type: "system",
+        subtype: "task_started",
+        session_id: "sdk-session-detached-later-task-result",
+        uuid: "task-started-detached-later-first",
+        task_id: "task-detached-later-first",
+        tool_use_id: "tool-detached-later-first",
+        description: "Run first detached command",
+        task_type: "local_bash",
+      } as unknown as SDKMessage);
+      harness.query.emit({
+        type: "system",
+        subtype: "task_notification",
+        session_id: "sdk-session-detached-later-task-result",
+        uuid: "task-notification-detached-later-first",
+        task_id: "task-detached-later-first",
+        tool_use_id: "tool-detached-later-first",
+        status: "completed",
+        summary: "First detached command completed",
+      } as unknown as SDKMessage);
+      harness.query.emit({
+        type: "result",
+        subtype: "success",
+        is_error: false,
+        errors: [],
+        result: "first detached result",
+        stop_reason: "end_turn",
+        session_id: "sdk-session-detached-later-task-result",
+        uuid: "result-detached-later-first",
+        origin: { kind: "task-notification" },
+      } as unknown as SDKMessage);
+
+      for (let i = 0; i < 5; i += 1) {
+        yield* Effect.yieldNow;
+      }
+
+      const secondTurn = yield* adapter.sendTurn({
+        threadId: session.threadId,
+        input: "finish the second detached turn",
+        attachments: [],
+      });
+
+      harness.query.emit({
+        type: "system",
+        subtype: "task_started",
+        session_id: "sdk-session-detached-later-task-result",
+        uuid: "task-started-detached-later-second",
+        task_id: "task-detached-later-second",
+        tool_use_id: "tool-detached-later-second",
+        description: "Run second detached command",
+        task_type: "local_bash",
+      } as unknown as SDKMessage);
+      harness.query.emit({
+        type: "system",
+        subtype: "task_notification",
+        session_id: "sdk-session-detached-later-task-result",
+        uuid: "task-notification-detached-later-second",
+        task_id: "task-detached-later-second",
+        tool_use_id: "tool-detached-later-second",
+        status: "completed",
+        summary: "Second detached command completed",
+      } as unknown as SDKMessage);
+      harness.query.emit({
+        type: "result",
+        subtype: "success",
+        is_error: false,
+        errors: [],
+        result: "second detached result",
+        stop_reason: "end_turn",
+        session_id: "sdk-session-detached-later-task-result",
+        uuid: "result-detached-later-second",
+        origin: { kind: "task-notification" },
+      } as unknown as SDKMessage);
+
+      for (let i = 0; i < 5; i += 1) {
+        yield* Effect.yieldNow;
+      }
+      runtimeEventsFiber.interruptUnsafe();
+
+      const completedTurnIds = runtimeEvents
+        .filter((event) => event.type === "turn.completed")
+        .map((event) => event.turnId);
+      assert.deepEqual(completedTurnIds, [firstTurn.turnId, secondTurn.turnId]);
+    }).pipe(
+      Effect.provideService(Random.Random, makeDeterministicRandomService()),
+      Effect.provide(harness.layer),
+    );
+  });
+
+  it.effect("does not complete a detached fresh turn from a stale task-notification result", () => {
+    const harness = makeHarness();
+    return Effect.gen(function* () {
+      const adapter = yield* ClaudeAdapter;
+      const runtimeEvents: Array<ProviderRuntimeEvent> = [];
+
+      const runtimeEventsFiber = yield* Stream.runForEach(adapter.streamEvents, (event) =>
+        Effect.sync(() => {
+          runtimeEvents.push(event);
+        }),
+      ).pipe(Effect.forkChild);
+
+      const session = yield* adapter.startSession({
+        threadId: THREAD_ID,
+        provider: ProviderDriverKind.make("claudeAgent"),
+        runtimeMode: "full-access",
+        detached: true,
+      });
+
+      harness.query.emit({
+        type: "assistant",
+        session_id: "sdk-session-detached-stale-task-result",
+        uuid: "assistant-detached-stale-task-result",
+        parent_tool_use_id: null,
+        message: {
+          id: "assistant-message-detached-stale-task-result",
+          content: [{ type: "text", text: "Background update" }],
+        },
+      } as unknown as SDKMessage);
+
+      harness.query.emit({
+        type: "system",
+        subtype: "task_started",
+        session_id: "sdk-session-detached-stale-task-result",
+        uuid: "task-started-detached-stale",
+        task_id: "task-detached-stale",
+        tool_use_id: "tool-detached-stale",
+        description: "Run stale detached command",
+        task_type: "local_bash",
+      } as unknown as SDKMessage);
+
+      harness.query.emit({
+        type: "system",
+        subtype: "task_notification",
+        session_id: "sdk-session-detached-stale-task-result",
+        uuid: "task-notification-detached-stale",
+        task_id: "task-detached-stale",
+        tool_use_id: "tool-detached-stale",
+        status: "completed",
+        summary: "Stale detached command completed",
+      } as unknown as SDKMessage);
+
+      for (let i = 0; i < 5; i += 1) {
+        yield* Effect.yieldNow;
+      }
+
+      const userTurn = yield* adapter.sendTurn({
+        threadId: session.threadId,
+        input: "start a fresh detached turn",
+        attachments: [],
+      });
+
+      harness.query.emit({
+        type: "result",
+        subtype: "success",
+        is_error: false,
+        errors: [],
+        result: "stale detached task result",
+        stop_reason: "end_turn",
+        session_id: "sdk-session-detached-stale-task-result",
+        uuid: "result-detached-stale-task",
+        origin: { kind: "task-notification" },
+      } as unknown as SDKMessage);
+
+      for (let i = 0; i < 5; i += 1) {
+        yield* Effect.yieldNow;
+      }
+      assert.equal(
+        runtimeEvents.filter(
+          (event) => event.type === "turn.completed" && event.turnId === userTurn.turnId,
+        ).length,
+        0,
+      );
+
+      harness.query.emit({
+        type: "result",
+        subtype: "success",
+        is_error: false,
+        errors: [],
+        result: "real detached user result",
+        stop_reason: "end_turn",
+        session_id: "sdk-session-detached-stale-task-result",
+        uuid: "result-detached-real-user",
+      } as unknown as SDKMessage);
+
+      for (let i = 0; i < 5; i += 1) {
+        yield* Effect.yieldNow;
+      }
+      runtimeEventsFiber.interruptUnsafe();
+
+      const userTurnCompletions = runtimeEvents.filter(
+        (event) => event.type === "turn.completed" && event.turnId === userTurn.turnId,
+      );
+      assert.equal(userTurnCompletions.length, 1);
+      const completed = userTurnCompletions[0];
+      assert.equal(completed?.type, "turn.completed");
+      if (completed?.type === "turn.completed") {
+        assert.equal(completed.payload.state, "completed");
+        assert.equal(completed.payload.stopReason, "end_turn");
+      }
+    }).pipe(
+      Effect.provideService(Random.Random, makeDeterministicRandomService()),
+      Effect.provide(harness.layer),
+    );
+  });
+
+  it.effect("does not complete a foreground turn from a drained task-notification result", () => {
+    const harness = makeHarness();
+    return Effect.gen(function* () {
+      const adapter = yield* ClaudeAdapter;
+      const runtimeEvents: Array<ProviderRuntimeEvent> = [];
+
+      const runtimeEventsFiber = yield* Stream.runForEach(adapter.streamEvents, (event) =>
+        Effect.sync(() => {
+          runtimeEvents.push(event);
+        }),
+      ).pipe(Effect.forkChild);
+
+      const session = yield* adapter.startSession({
+        threadId: THREAD_ID,
+        provider: ProviderDriverKind.make("claudeAgent"),
+        runtimeMode: "full-access",
+      });
+
+      const turn = yield* adapter.sendTurn({
+        threadId: session.threadId,
+        input: "do not finish from a foreground task notification",
+        attachments: [],
+      });
+
+      harness.query.emit({
+        type: "assistant",
+        session_id: "sdk-session-uncorrelated-task-notification-result",
+        uuid: "assistant-uncorrelated-task-notification-result",
+        parent_tool_use_id: null,
+        message: {
+          id: "assistant-message-uncorrelated-task-notification-result",
+          content: [{ type: "text", text: "Still working on it" }],
+        },
+      } as unknown as SDKMessage);
+
+      harness.query.emit({
+        type: "system",
+        subtype: "task_started",
+        session_id: "sdk-session-uncorrelated-task-notification-result",
+        uuid: "task-started-uncorrelated-task-notification-result",
+        task_id: "task-uncorrelated-task-notification-result",
+        tool_use_id: "tool-uncorrelated-task-notification-result",
+        description: "Run foreground command",
+        task_type: "local_bash",
+      } as unknown as SDKMessage);
+
+      harness.query.emit({
+        type: "system",
+        subtype: "task_notification",
+        session_id: "sdk-session-uncorrelated-task-notification-result",
+        uuid: "task-notification-uncorrelated-task-notification-result",
+        task_id: "task-uncorrelated-task-notification-result",
+        tool_use_id: "tool-uncorrelated-task-notification-result",
+        status: "completed",
+        summary: "Foreground command completed",
+      } as unknown as SDKMessage);
+
+      harness.query.emit({
+        type: "result",
+        subtype: "success",
+        is_error: false,
+        errors: [],
+        result: "foreground task-notification result",
+        stop_reason: "end_turn",
+        session_id: "sdk-session-uncorrelated-task-notification-result",
+        uuid: "result-uncorrelated-task-notification-result",
+        origin: { kind: "task-notification" },
+      } as unknown as SDKMessage);
+
+      for (let i = 0; i < 5; i += 1) {
+        yield* Effect.yieldNow;
+      }
+      assert.equal(
+        runtimeEvents.filter(
+          (event) => event.type === "turn.completed" && event.turnId === turn.turnId,
+        ).length,
+        0,
+      );
+
+      harness.query.emit({
+        type: "result",
+        subtype: "success",
+        is_error: false,
+        errors: [],
+        result: "real user result",
+        stop_reason: "end_turn",
+        session_id: "sdk-session-uncorrelated-task-notification-result",
+        uuid: "result-real-after-uncorrelated-task-notification",
+      } as unknown as SDKMessage);
+
+      for (let i = 0; i < 5; i += 1) {
+        yield* Effect.yieldNow;
+      }
+      runtimeEventsFiber.interruptUnsafe();
+
+      const turnCompletions = runtimeEvents.filter(
+        (event) => event.type === "turn.completed" && event.turnId === turn.turnId,
+      );
+      assert.equal(turnCompletions.length, 1);
+    }).pipe(
+      Effect.provideService(Random.Random, makeDeterministicRandomService()),
+      Effect.provide(harness.layer),
+    );
+  });
+
   it.effect(
-    "does not complete the active turn from an uncorrelated task-notification result",
+    "completes a foreground turn from a task-notification result with matching turn id",
     () => {
       const harness = makeHarness();
       return Effect.gen(function* () {
         const adapter = yield* ClaudeAdapter;
-        const runtimeEvents: Array<ProviderRuntimeEvent> = [];
 
-        const runtimeEventsFiber = yield* Stream.runForEach(adapter.streamEvents, (event) =>
-          Effect.sync(() => {
-            runtimeEvents.push(event);
-          }),
-        ).pipe(Effect.forkChild);
+        const runtimeEventsFiber = yield* Stream.takeUntil(
+          adapter.streamEvents,
+          (event) => event.type === "turn.completed",
+        ).pipe(Stream.runCollect, Effect.forkChild);
 
         const session = yield* adapter.startSession({
           threadId: THREAD_ID,
@@ -1318,19 +1651,30 @@ describe("ClaudeAdapterLive", () => {
 
         const turn = yield* adapter.sendTurn({
           threadId: session.threadId,
-          input: "do not finish from a stale task notification",
+          input: "finish from an explicitly correlated task notification",
           attachments: [],
         });
 
         harness.query.emit({
-          type: "assistant",
-          session_id: "sdk-session-uncorrelated-task-notification-result",
-          uuid: "assistant-uncorrelated-task-notification-result",
-          parent_tool_use_id: null,
-          message: {
-            id: "assistant-message-uncorrelated-task-notification-result",
-            content: [{ type: "text", text: "Still working on it" }],
-          },
+          type: "system",
+          subtype: "task_started",
+          session_id: "sdk-session-correlated-task-notification-result",
+          uuid: "task-started-correlated-task-notification-result",
+          task_id: "task-correlated-task-notification-result",
+          tool_use_id: "tool-correlated-task-notification-result",
+          description: "Run correlated foreground command",
+          task_type: "local_bash",
+        } as unknown as SDKMessage);
+
+        harness.query.emit({
+          type: "system",
+          subtype: "task_notification",
+          session_id: "sdk-session-correlated-task-notification-result",
+          uuid: "task-notification-correlated-task-notification-result",
+          task_id: "task-correlated-task-notification-result",
+          tool_use_id: "tool-correlated-task-notification-result",
+          status: "completed",
+          summary: "Correlated foreground command completed",
         } as unknown as SDKMessage);
 
         harness.query.emit({
@@ -1338,49 +1682,138 @@ describe("ClaudeAdapterLive", () => {
           subtype: "success",
           is_error: false,
           errors: [],
-          result: "stale background result",
+          result: "correlated foreground task-notification result",
           stop_reason: "end_turn",
-          session_id: "sdk-session-uncorrelated-task-notification-result",
-          uuid: "result-uncorrelated-task-notification-result",
+          session_id: "sdk-session-correlated-task-notification-result",
+          uuid: "result-correlated-task-notification-result",
+          turnId: String(turn.turnId),
           origin: { kind: "task-notification" },
         } as unknown as SDKMessage);
 
-        for (let i = 0; i < 5; i += 1) {
-          yield* Effect.yieldNow;
-        }
-        assert.equal(
-          runtimeEvents.filter(
-            (event) => event.type === "turn.completed" && event.turnId === turn.turnId,
-          ).length,
-          0,
+        const runtimeEvents = Array.from(yield* Fiber.join(runtimeEventsFiber));
+        harness.query.finish();
+        const turnCompletedEvents = runtimeEvents.filter(
+          (event) => event.type === "turn.completed",
         );
 
-        harness.query.emit({
-          type: "result",
-          subtype: "success",
-          is_error: false,
-          errors: [],
-          result: "real user result",
-          stop_reason: "end_turn",
-          session_id: "sdk-session-uncorrelated-task-notification-result",
-          uuid: "result-real-after-uncorrelated-task-notification",
-        } as unknown as SDKMessage);
-
-        for (let i = 0; i < 5; i += 1) {
-          yield* Effect.yieldNow;
-        }
-        runtimeEventsFiber.interruptUnsafe();
-
-        const turnCompletions = runtimeEvents.filter(
-          (event) => event.type === "turn.completed" && event.turnId === turn.turnId,
-        );
-        assert.equal(turnCompletions.length, 1);
+        assert.equal(turnCompletedEvents.length, 1);
+        assert.equal(String(turnCompletedEvents[0]?.turnId), String(turn.turnId));
+        assert.equal(turnCompletedEvents[0]?.payload.state, "completed");
+        assert.equal(turnCompletedEvents[0]?.payload.stopReason, "end_turn");
       }).pipe(
         Effect.provideService(Random.Random, makeDeterministicRandomService()),
         Effect.provide(harness.layer),
       );
     },
   );
+
+  it.effect("does not complete a correlated task-notification result with active tasks", () => {
+    const harness = makeHarness();
+    return Effect.gen(function* () {
+      const adapter = yield* ClaudeAdapter;
+      const runtimeEvents: Array<ProviderRuntimeEvent> = [];
+
+      const runtimeEventsFiber = yield* Stream.runForEach(adapter.streamEvents, (event) =>
+        Effect.sync(() => {
+          runtimeEvents.push(event);
+        }),
+      ).pipe(Effect.forkChild);
+
+      const session = yield* adapter.startSession({
+        threadId: THREAD_ID,
+        provider: ProviderDriverKind.make("claudeAgent"),
+        runtimeMode: "full-access",
+      });
+
+      const turn = yield* adapter.sendTurn({
+        threadId: session.threadId,
+        input: "wait for all correlated tasks",
+        attachments: [],
+      });
+
+      for (const task of ["first", "second"] as const) {
+        harness.query.emit({
+          type: "system",
+          subtype: "task_started",
+          session_id: "sdk-session-correlated-active-tasks",
+          uuid: `task-started-correlated-active-${task}`,
+          task_id: `task-correlated-active-${task}`,
+          tool_use_id: `tool-correlated-active-${task}`,
+          description: `Run ${task} foreground command`,
+          task_type: "local_bash",
+        } as unknown as SDKMessage);
+      }
+
+      harness.query.emit({
+        type: "system",
+        subtype: "task_notification",
+        session_id: "sdk-session-correlated-active-tasks",
+        uuid: "task-notification-correlated-active-first",
+        task_id: "task-correlated-active-first",
+        tool_use_id: "tool-correlated-active-first",
+        status: "completed",
+        summary: "First foreground command completed",
+      } as unknown as SDKMessage);
+      harness.query.emit({
+        type: "result",
+        subtype: "success",
+        is_error: false,
+        errors: [],
+        result: "first correlated foreground result",
+        stop_reason: "end_turn",
+        session_id: "sdk-session-correlated-active-tasks",
+        uuid: "result-correlated-active-first",
+        turnId: String(turn.turnId),
+        origin: { kind: "task-notification" },
+      } as unknown as SDKMessage);
+
+      for (let i = 0; i < 5; i += 1) {
+        yield* Effect.yieldNow;
+      }
+      assert.equal(
+        runtimeEvents.filter(
+          (event) => event.type === "turn.completed" && event.turnId === turn.turnId,
+        ).length,
+        0,
+      );
+
+      harness.query.emit({
+        type: "system",
+        subtype: "task_notification",
+        session_id: "sdk-session-correlated-active-tasks",
+        uuid: "task-notification-correlated-active-second",
+        task_id: "task-correlated-active-second",
+        tool_use_id: "tool-correlated-active-second",
+        status: "completed",
+        summary: "Second foreground command completed",
+      } as unknown as SDKMessage);
+      harness.query.emit({
+        type: "result",
+        subtype: "success",
+        is_error: false,
+        errors: [],
+        result: "second correlated foreground result",
+        stop_reason: "end_turn",
+        session_id: "sdk-session-correlated-active-tasks",
+        uuid: "result-correlated-active-second",
+        turnId: String(turn.turnId),
+        origin: { kind: "task-notification" },
+      } as unknown as SDKMessage);
+
+      for (let i = 0; i < 5; i += 1) {
+        yield* Effect.yieldNow;
+      }
+      runtimeEventsFiber.interruptUnsafe();
+
+      const turnCompletions = runtimeEvents.filter(
+        (event) => event.type === "turn.completed" && event.turnId === turn.turnId,
+      );
+      assert.equal(turnCompletions.length, 1);
+    }).pipe(
+      Effect.provideService(Random.Random, makeDeterministicRandomService()),
+      Effect.provide(harness.layer),
+    );
+  });
 
   it.effect("does not complete from a task-notification result after a new task starts", () => {
     const harness = makeHarness();
@@ -1398,6 +1831,7 @@ describe("ClaudeAdapterLive", () => {
         threadId: THREAD_ID,
         provider: ProviderDriverKind.make("claudeAgent"),
         runtimeMode: "full-access",
+        detached: true,
       });
 
       const turn = yield* adapter.sendTurn({
@@ -1448,7 +1882,6 @@ describe("ClaudeAdapterLive", () => {
         stop_reason: "end_turn",
         session_id: "sdk-session-task-result-after-new-task",
         uuid: "result-task-notification-before-new-task",
-        turnId: String(turn.turnId),
         origin: { kind: "task-notification" },
       } as unknown as SDKMessage);
 
@@ -1498,6 +1931,175 @@ describe("ClaudeAdapterLive", () => {
       Effect.provide(harness.layer),
     );
   });
+
+  it.effect(
+    "does not complete a detached turn from a stale result after a newer task notification",
+    () => {
+      const harness = makeHarness();
+      return Effect.gen(function* () {
+        const adapter = yield* ClaudeAdapter;
+        const runtimeEvents: Array<ProviderRuntimeEvent> = [];
+
+        const runtimeEventsFiber = yield* Stream.runForEach(adapter.streamEvents, (event) =>
+          Effect.sync(() => {
+            runtimeEvents.push(event);
+          }),
+        ).pipe(Effect.forkChild);
+
+        const session = yield* adapter.startSession({
+          threadId: THREAD_ID,
+          provider: ProviderDriverKind.make("claudeAgent"),
+          runtimeMode: "full-access",
+          detached: true,
+        });
+
+        const turn = yield* adapter.sendTurn({
+          threadId: session.threadId,
+          input: "keep running after a stale result follows a newer notification",
+          attachments: [],
+        });
+
+        harness.query.emit({
+          type: "system",
+          subtype: "task_started",
+          session_id: "sdk-session-stale-after-newer-task-notification",
+          uuid: "task-started-stale-before-newer-notification",
+          task_id: "task-stale-before-newer-notification",
+          tool_use_id: "tool-stale-before-newer-notification",
+          description: "Run first command",
+          task_type: "local_bash",
+        } as unknown as SDKMessage);
+
+        harness.query.emit({
+          type: "system",
+          subtype: "task_notification",
+          session_id: "sdk-session-stale-after-newer-task-notification",
+          uuid: "task-notification-stale-before-newer",
+          task_id: "task-stale-before-newer-notification",
+          tool_use_id: "tool-stale-before-newer-notification",
+          status: "completed",
+          summary: "First command completed",
+        } as unknown as SDKMessage);
+
+        harness.query.emit({
+          type: "system",
+          subtype: "task_started",
+          session_id: "sdk-session-stale-after-newer-task-notification",
+          uuid: "task-started-newer-before-stale-result",
+          task_id: "task-newer-before-stale-result",
+          tool_use_id: "tool-newer-before-stale-result",
+          description: "Run second command",
+          task_type: "local_bash",
+        } as unknown as SDKMessage);
+
+        harness.query.emit({
+          type: "system",
+          subtype: "task_notification",
+          session_id: "sdk-session-stale-after-newer-task-notification",
+          uuid: "task-notification-newer-before-stale-result",
+          task_id: "task-newer-before-stale-result",
+          tool_use_id: "tool-newer-before-stale-result",
+          status: "completed",
+          summary: "Second command completed",
+        } as unknown as SDKMessage);
+
+        harness.query.emit({
+          type: "result",
+          subtype: "success",
+          is_error: false,
+          errors: [],
+          result: "stale first task result",
+          stop_reason: "end_turn",
+          session_id: "sdk-session-stale-after-newer-task-notification",
+          uuid: "result-stale-after-newer-task-notification",
+          origin: { kind: "task-notification" },
+        } as unknown as SDKMessage);
+
+        for (let i = 0; i < 5; i += 1) {
+          yield* Effect.yieldNow;
+        }
+        assert.equal(
+          runtimeEvents.filter(
+            (event) => event.type === "turn.completed" && event.turnId === turn.turnId,
+          ).length,
+          0,
+        );
+
+        harness.query.emit({
+          type: "result",
+          subtype: "success",
+          is_error: false,
+          errors: [],
+          result: "real user result after ambiguous task notification",
+          stop_reason: "end_turn",
+          session_id: "sdk-session-stale-after-newer-task-notification",
+          uuid: "result-real-after-ambiguous-task-notification",
+        } as unknown as SDKMessage);
+
+        for (let i = 0; i < 5; i += 1) {
+          yield* Effect.yieldNow;
+        }
+
+        const turnCompletions = runtimeEvents.filter(
+          (event) => event.type === "turn.completed" && event.turnId === turn.turnId,
+        );
+        assert.equal(turnCompletions.length, 1);
+
+        const laterTurn = yield* adapter.sendTurn({
+          threadId: session.threadId,
+          input: "finish a later detached turn after the stale result drained",
+          attachments: [],
+        });
+
+        harness.query.emit({
+          type: "system",
+          subtype: "task_started",
+          session_id: "sdk-session-stale-after-newer-task-notification",
+          uuid: "task-started-later-after-stale-drain",
+          task_id: "task-later-after-stale-drain",
+          tool_use_id: "tool-later-after-stale-drain",
+          description: "Run later command",
+          task_type: "local_bash",
+        } as unknown as SDKMessage);
+
+        harness.query.emit({
+          type: "system",
+          subtype: "task_notification",
+          session_id: "sdk-session-stale-after-newer-task-notification",
+          uuid: "task-notification-later-after-stale-drain",
+          task_id: "task-later-after-stale-drain",
+          tool_use_id: "tool-later-after-stale-drain",
+          status: "completed",
+          summary: "Later command completed",
+        } as unknown as SDKMessage);
+
+        harness.query.emit({
+          type: "result",
+          subtype: "success",
+          is_error: false,
+          errors: [],
+          result: "later detached result after stale drain",
+          stop_reason: "end_turn",
+          session_id: "sdk-session-stale-after-newer-task-notification",
+          uuid: "result-later-after-stale-drain",
+          origin: { kind: "task-notification" },
+        } as unknown as SDKMessage);
+
+        for (let i = 0; i < 5; i += 1) {
+          yield* Effect.yieldNow;
+        }
+        runtimeEventsFiber.interruptUnsafe();
+
+        const laterTurnCompletions = runtimeEvents.filter(
+          (event) => event.type === "turn.completed" && event.turnId === laterTurn.turnId,
+        );
+        assert.equal(laterTurnCompletions.length, 1);
+      }).pipe(
+        Effect.provideService(Random.Random, makeDeterministicRandomService()),
+        Effect.provide(harness.layer),
+      );
+    },
+  );
 
   it.effect("does not flush a stale synthetic task completion into the next user turn", () => {
     const harness = makeHarness();

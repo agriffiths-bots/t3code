@@ -1054,6 +1054,42 @@ routing.layer("ProviderServiceLive routing", (it) => {
     }),
   );
 
+  it.effect("preserves detached session metadata when sending a turn", () =>
+    Effect.gen(function* () {
+      const provider = yield* ProviderService.ProviderService;
+      const directory = yield* ProviderSessionDirectory.ProviderSessionDirectory;
+      const threadId = asThreadId("thread-detached-send-turn");
+
+      yield* provider.startSession(threadId, {
+        provider: ProviderDriverKind.make("claudeAgent"),
+        providerInstanceId: claudeAgentInstanceId,
+        threadId,
+        cwd: "/tmp/project-detached-send-turn",
+        runtimeMode: "full-access",
+        detached: true,
+      });
+
+      const turn = yield* provider.sendTurn({
+        threadId,
+        input: "hello",
+        attachments: [],
+      });
+
+      const binding = yield* directory.getBinding(threadId);
+      assert.equal(Option.isSome(binding), true);
+      if (Option.isSome(binding)) {
+        const runtimePayload = binding.value.runtimePayload as {
+          readonly activeTurnId?: unknown;
+          readonly detached?: unknown;
+          readonly lastRuntimeEvent?: unknown;
+        };
+        assert.equal(runtimePayload.detached, true);
+        assert.equal(runtimePayload.activeTurnId, turn.turnId);
+        assert.equal(runtimePayload.lastRuntimeEvent, "provider.sendTurn");
+      }
+    }),
+  );
+
   it.effect("dies when an active session conflicts with its persisted binding", () =>
     Effect.gen(function* () {
       const provider = yield* ProviderService.ProviderService;
@@ -1088,6 +1124,7 @@ routing.layer("ProviderServiceLive routing", (it) => {
   it.effect("stops stale sessions in other providers after a successful replacement start", () =>
     Effect.gen(function* () {
       const provider = yield* ProviderService.ProviderService;
+      const directory = yield* ProviderSessionDirectory.ProviderSessionDirectory;
       const threadId = asThreadId("thread-provider-replacement");
 
       const codexSession = yield* provider.startSession(threadId, {
@@ -1096,6 +1133,7 @@ routing.layer("ProviderServiceLive routing", (it) => {
         threadId,
         cwd: "/tmp/project-provider-replacement",
         runtimeMode: "full-access",
+        detached: true,
       });
 
       routing.codex.stopSession.mockClear();
@@ -1121,6 +1159,14 @@ routing.layer("ProviderServiceLive routing", (it) => {
           .map((session) => session.provider),
         ["claudeAgent"],
       );
+      const binding = yield* directory.getBinding(threadId);
+      assert.equal(Option.isSome(binding), true);
+      if (Option.isSome(binding)) {
+        const runtimePayload = binding.value.runtimePayload as {
+          readonly detached?: unknown;
+        };
+        assert.equal(runtimePayload.detached, undefined);
+      }
     }),
   );
 

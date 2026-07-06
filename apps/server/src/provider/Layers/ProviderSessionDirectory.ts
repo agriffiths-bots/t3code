@@ -125,6 +125,11 @@ const makeProviderSessionDirectory = Effect.gen(function* () {
         issue: "providerInstanceId is required for provider session runtime bindings.",
       });
     }
+    const providerInstanceChanged =
+      existingRuntime !== undefined &&
+      existingRuntime.providerInstanceId !== null &&
+      existingRuntime.providerInstanceId !== providerInstanceId;
+    const providerIdentityChanged = providerChanged || providerInstanceChanged;
     yield* repository
       .upsert({
         threadId: resolvedThreadId,
@@ -139,9 +144,11 @@ const makeProviderSessionDirectory = Effect.gen(function* () {
         resumeCursor:
           binding.resumeCursor !== undefined
             ? binding.resumeCursor
-            : (existingRuntime?.resumeCursor ?? null),
+            : providerIdentityChanged
+              ? null
+              : (existingRuntime?.resumeCursor ?? null),
         runtimePayload: mergeRuntimePayload(
-          existingRuntime?.runtimePayload ?? null,
+          providerIdentityChanged ? null : (existingRuntime?.runtimePayload ?? null),
           binding.runtimePayload,
         ),
       })

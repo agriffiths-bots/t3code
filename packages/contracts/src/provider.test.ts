@@ -57,6 +57,7 @@ describe("ProviderSessionStartInput", () => {
       threadId: "thread-1",
       provider: "claudeAgent",
       cwd: "/tmp/workspace",
+      detached: true,
       modelSelection: {
         provider: "claudeAgent",
         model: "claude-sonnet-4-6",
@@ -75,6 +76,7 @@ describe("ProviderSessionStartInput", () => {
     expect(getOptionValue(parsed.modelSelection?.options, "effort")).toBe("max");
     expect(getOptionValue(parsed.modelSelection?.options, "fastMode")).toBe(true);
     expect(parsed.runtimeMode).toBe("full-access");
+    expect(parsed.detached).toBe(true);
   });
 
   it("accepts cursor provider", () => {

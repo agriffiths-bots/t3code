@@ -4,7 +4,7 @@ import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
 
 import * as NodeServices from "@effect/platform-node/NodeServices";
-import { ProviderDriverKind, ThreadId } from "@t3tools/contracts";
+import { ProviderDriverKind, ProviderInstanceId, ThreadId } from "@t3tools/contracts";
 import { it, assert } from "@effect/vitest";
 import { assertSome } from "@effect/vitest/utils";
 import * as Effect from "effect/Effect";
@@ -118,6 +118,47 @@ it.layer(makeDirectoryLayer(SqlitePersistenceMemory))("ProviderSessionDirectoryL
           cwd: "/tmp/project",
           model: "gpt-5-codex",
           activeTurnId: "turn-1",
+        });
+      }
+    }));
+
+  it("replaces runtime payload when provider instance changes", () =>
+    Effect.gen(function* () {
+      const directory = yield* ProviderSessionDirectory;
+      const runtimeRepository = yield* ProviderSessionRuntime.ProviderSessionRuntimeRepository;
+      const threadId = ThreadId.make("thread-instance-change");
+
+      yield* directory.upsert({
+        provider: ProviderDriverKind.make("claudeAgent"),
+        providerInstanceId: ProviderInstanceId.make("claude-old"),
+        threadId,
+        resumeCursor: {
+          opaque: "old-cursor",
+        },
+        runtimePayload: {
+          detached: true,
+          modelSelection: {
+            model: "claude-old-model",
+          },
+        },
+      });
+
+      yield* directory.upsert({
+        provider: ProviderDriverKind.make("claudeAgent"),
+        providerInstanceId: ProviderInstanceId.make("claude-new"),
+        threadId,
+        runtimePayload: {
+          activeTurnId: null,
+        },
+      });
+
+      const runtime = yield* runtimeRepository.getByThreadId({ threadId });
+      assert.equal(Option.isSome(runtime), true);
+      if (Option.isSome(runtime)) {
+        assert.equal(runtime.value.providerInstanceId, "claude-new");
+        assert.equal(runtime.value.resumeCursor, null);
+        assert.deepEqual(runtime.value.runtimePayload, {
+          activeTurnId: null,
         });
       }
     }));
