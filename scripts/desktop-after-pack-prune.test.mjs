@@ -3,7 +3,7 @@ import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
 import { describe, expect, it } from "vite-plus/test";
 
-import afterPack from "./desktop-after-pack-prune.mjs";
+import afterPack, { PACKAGED_INTEGRITY_MANIFEST_FILE_NAME } from "./desktop-after-pack-prune.mjs";
 
 async function touch(path) {
   await NodeFSP.mkdir(NodePath.dirname(path), { recursive: true });
@@ -106,5 +106,21 @@ describe("desktop-after-pack-prune", () => {
     await expect(
       exists(NodePath.join(root, "node-pty/third_party/conpty/1.23/win10-arm64")),
     ).resolves.toBe(false);
+
+    const manifestPath = NodePath.join(tempDir, "resources", PACKAGED_INTEGRITY_MANIFEST_FILE_NAME);
+    await expect(exists(manifestPath)).resolves.toBe(true);
+    const manifest = JSON.parse(await NodeFSP.readFile(manifestPath, "utf8"));
+    expect(manifest.version).toBe(1);
+    expect(manifest.requiredFiles).toContain("node_modules/node-pty/package.json");
+    expect(manifest.requiredFiles).toContain("node_modules/node-pty/prebuilds/win32-x64/pty.node");
+    expect(manifest.requiredFiles).toContain(
+      "node_modules/@ff-labs/fff-bin-linux-x64-gnu/libfff_c.so",
+    );
+    expect(manifest.requiredFiles).not.toContain(
+      "node_modules/node-pty/prebuilds/win32-arm64/pty.node",
+    );
+    expect(manifest.requiredFiles).not.toContain(
+      "node_modules/@ff-labs/fff-bin-linux-x64-musl/libfff_c.so",
+    );
   });
 });

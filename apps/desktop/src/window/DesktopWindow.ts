@@ -38,6 +38,7 @@ const DEVELOPMENT_RETRYABLE_LOAD_ERROR_CODES = new Set([
 const DesktopSmokeReadyMarkerJson = Schema.fromJsonString(
   Schema.Struct({
     status: Schema.Literal("main-window-ready"),
+    appVersion: Schema.String,
     windowId: Schema.Number,
     title: Schema.String,
     visible: Schema.Boolean,
@@ -297,6 +298,7 @@ const writeSmokeReadyMarker = Effect.fn("desktop.window.writeSmokeReadyMarker")(
   const path = yield* Path.Path;
   const markerJson = yield* encodeDesktopSmokeReadyMarker({
     status: "main-window-ready",
+    appVersion: environment.appVersion,
     windowId: window.id,
     title: environment.displayName,
     visible: !window.isDestroyed() && window.isVisible(),

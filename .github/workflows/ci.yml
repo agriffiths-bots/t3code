@@ -225,7 +225,7 @@ jobs:
             --root "$unpackedRoot" `
             --max-files 250
 
-      - name: Assert launch smoke rejects missing unpacked backend entry
+      - name: Assert launch smoke reports missing unpacked runtime file
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
@@ -240,11 +240,11 @@ jobs:
           Copy-Item -Recurse -Force (Join-Path $cleanInstallDir "*") $brokenInstallDir
 
           $brokenAppExe = Join-Path $brokenInstallDir (Split-Path -Leaf $cleanAppExe)
-          $removedBackendEntry = Join-Path $brokenInstallDir "resources/app.asar.unpacked/apps/server/dist/bin.mjs"
-          if (-not (Test-Path $removedBackendEntry)) {
-            throw "Negative launch-smoke fixture could not find packaged backend entry to remove: $removedBackendEntry"
+          $removedRuntimeFile = Join-Path $brokenInstallDir "resources/app.asar.unpacked/apps/server/dist/bin.mjs"
+          if (-not (Test-Path $removedRuntimeFile)) {
+            throw "Negative launch-smoke fixture could not find packaged runtime file to remove: $removedRuntimeFile"
           }
-          Remove-Item -Force $removedBackendEntry
+          Remove-Item -Force $removedRuntimeFile
 
           $output = & node scripts/desktop-launch-smoke.mjs --command "$brokenAppExe" --timeout-ms 45000 --stability-ms 1000 2>&1
           $exitCode = $LASTEXITCODE
@@ -252,10 +252,10 @@ jobs:
           $output | ForEach-Object { Write-Host $_ }
 
           if ($exitCode -eq 0) {
-            throw "Launch smoke passed against a packaged artifact with the backend entry removed; the gate is not trustworthy."
+            throw "Launch smoke passed against a packaged artifact with a required unpacked runtime file removed; the gate is not trustworthy."
           }
-          if ($outputText -notmatch "(?i)(apps/server/dist/bin\.mjs|missing server entry|backend|timed out)") {
-            throw "Launch smoke failed against the broken packaged artifact, but did not report the expected missing backend entry."
+          if ($outputText -notmatch "(?i)(installation is incomplete|apps/server/dist/bin\.mjs)") {
+            throw "Launch smoke failed against the broken packaged artifact, but did not report the expected incomplete-installation diagnostic."
           }
 
           Write-Host "Launch smoke rejected the deliberately broken packaged artifact with exit code $exitCode."
