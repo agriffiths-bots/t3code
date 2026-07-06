@@ -3,9 +3,42 @@ const CACHE_PREFIX = "t3-code-";
 const APP_SHELL_URLS = ["/", "/manifest.webmanifest", "/pwa-icon-192.png", "/pwa-icon-512.png"];
 const DEFAULT_ACK_URL = "/api/notifications/ack";
 const BUILD_ASSET_PATH_PREFIX = "/assets/";
+const BUILD_ASSET_CACHE_PREFIX = `${CACHE_PREFIX}assets-`;
+const NON_SPA_ROUTE_PATH_PREFIXES = [
+  "/.well-known",
+  "/api",
+  "/assets",
+  "/attachments",
+  "/download",
+  "/downloads",
+];
+const STATIC_FILE_PATH_PATTERN = /\/[^/]+\.[^/]+$/;
 
 function isBuildAssetUrl(url) {
   return url.origin === self.location.origin && url.pathname.startsWith(BUILD_ASSET_PATH_PREFIX);
+}
+
+function requestAcceptsHtml(request) {
+  return request.headers.get("accept")?.toLowerCase().includes("text/html") ?? false;
+}
+
+function isExcludedSpaRoutePath(pathname) {
+  return NON_SPA_ROUTE_PATH_PREFIXES.some(
+    (prefix) => pathname === prefix || pathname.startsWith(`${prefix}/`),
+  );
+}
+
+function isSpaRoutePath(pathname) {
+  return !isExcludedSpaRoutePath(pathname) && !STATIC_FILE_PATH_PATTERN.test(pathname);
+}
+
+function isAppShellNavigationRequest(request, url) {
+  return (
+    request.mode === "navigate" &&
+    url.origin === self.location.origin &&
+    requestAcceptsHtml(request) &&
+    isSpaRoutePath(url.pathname)
+  );
 }
 
 function isUsableBuildAssetResponse(response) {
@@ -58,10 +91,29 @@ async function cacheRequiredBuildAsset(cache, url) {
   await cache.put(url, response);
 }
 
+function hashBuildAssetUrls(assetUrls) {
+  let hash = 2166136261;
+  for (const assetUrl of [...assetUrls].sort()) {
+    for (let index = 0; index < assetUrl.length; index += 1) {
+      hash ^= assetUrl.charCodeAt(index);
+      hash = Math.imul(hash, 16777619);
+    }
+    hash ^= 10;
+    hash = Math.imul(hash, 16777619);
+  }
+
+  return (hash >>> 0).toString(36);
+}
+
+function buildAssetCacheNameForAssetUrls(assetUrls) {
+  return `${BUILD_ASSET_CACHE_PREFIX}${hashBuildAssetUrls(assetUrls)}`;
+}
+
 async function cacheShellAndBuildAssets(cache, shellResponse) {
   const shellForCache = shellResponse.clone();
   const assetUrls = extractBuildAssetUrls(await shellResponse.text());
-  await Promise.all(assetUrls.map((url) => cacheRequiredBuildAsset(cache, url)));
+  const assetCache = await caches.open(buildAssetCacheNameForAssetUrls(assetUrls));
+  await Promise.all(assetUrls.map((url) => cacheRequiredBuildAsset(assetCache, url)));
   await cache.put("/", shellForCache);
 }
 
@@ -70,7 +122,20 @@ async function cacheBuildAssetsFromShell(cache) {
   if (!shell) return;
 
   const assetUrls = extractBuildAssetUrls(await shell.clone().text());
-  await Promise.all(assetUrls.map((url) => cacheRequiredBuildAsset(cache, url)));
+  const assetCache = await caches.open(buildAssetCacheNameForAssetUrls(assetUrls));
+  await Promise.all(assetUrls.map((url) => cacheRequiredBuildAsset(assetCache, url)));
+}
+
+async function extractCachedShellBuildAssetUrls(cache) {
+  const shell = await cache.match("/");
+  if (!shell) return [];
+  return extractBuildAssetUrls(await shell.clone().text());
+}
+
+async function currentBuildAssetCacheName() {
+  const cache = await caches.open(CACHE_VERSION);
+  const assetUrls = await extractCachedShellBuildAssetUrls(cache);
+  return buildAssetCacheNameForAssetUrls(assetUrls);
 }
 
 self.addEventListener("install", (event) => {
@@ -87,15 +152,15 @@ self.addEventListener("install", (event) => {
 
 async function deleteSupersededCaches() {
   const cacheKeys = await caches.keys();
+  const buildAssetCacheName = await currentBuildAssetCacheName();
   const clients = await self.clients.matchAll({ type: "window", includeUncontrolled: true });
   // Open tabs can still request lazy chunks from the build that loaded them.
   const keepPriorAppCaches = clients.length > 0;
-  await Promise.all(
-    cacheKeys
-      .filter((key) => key !== CACHE_VERSION)
-      .filter((key) => !keepPriorAppCaches || !key.startsWith(CACHE_PREFIX))
-      .map((key) => caches.delete(key)),
-  );
+  const supersededCacheDeletes = cacheKeys
+    .filter((key) => key !== CACHE_VERSION && key !== buildAssetCacheName)
+    .filter((key) => !keepPriorAppCaches || !key.startsWith(CACHE_PREFIX))
+    .map((key) => caches.delete(key));
+  await Promise.all(supersededCacheDeletes);
 }
 
 self.addEventListener("activate", (event) => {
@@ -115,7 +180,9 @@ self.addEventListener("fetch", (event) => {
 
         const assetResponse = response.clone();
         const cache = await caches.open(CACHE_VERSION);
-        await cache.put(request, assetResponse);
+        const retainedAssetUrls = await extractCachedShellBuildAssetUrls(cache);
+        const assetCache = await caches.open(buildAssetCacheNameForAssetUrls(retainedAssetUrls));
+        await assetCache.put(request, assetResponse);
       })
       .catch(() => undefined);
 
@@ -135,8 +202,7 @@ self.addEventListener("fetch", (event) => {
     return;
   }
 
-  const acceptsHtml = request.headers.get("accept")?.includes("text/html") ?? false;
-  if (!acceptsHtml || requestUrl.origin !== self.location.origin) return;
+  if (!isAppShellNavigationRequest(request, requestUrl)) return;
 
   const networkResponse = fetch(request);
   const shellRefresh = networkResponse
@@ -148,9 +214,9 @@ self.addEventListener("fetch", (event) => {
       await cacheShellAndBuildAssets(cache, shellResponse);
     })
     .catch(() => undefined);
-  const cacheCleanup = deleteSupersededCaches().catch(() => undefined);
+  const cacheCleanup = shellRefresh.then(() => deleteSupersededCaches()).catch(() => undefined);
 
-  event.waitUntil(Promise.all([shellRefresh, cacheCleanup]));
+  event.waitUntil(cacheCleanup);
   event.respondWith(networkResponse.then((response) => response).catch(cachedShellOrUnavailable));
 });
 
