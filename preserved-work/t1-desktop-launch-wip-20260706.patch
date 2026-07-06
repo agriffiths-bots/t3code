@@ -1,0 +1,353 @@
+diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
+index f68ee1cc0..7e16b7745 100644
+--- a/.github/workflows/ci.yml
++++ b/.github/workflows/ci.yml
+@@ -40,6 +40,58 @@ jobs:
+           grep -nE "desktopBridge|getLocalEnvironmentBootstrap|PICK_FOLDER_CHANNEL|wsUrl" apps/desktop/dist-electron/preload.cjs
+           grep -n "__clerk_internal_electron_passkeys" apps/desktop/dist-electron/preload.cjs
+ 
++  desktop_launch_gate_paths:
++    name: Desktop Launch Gate Paths
++    if: github.event_name == 'pull_request'
++    runs-on: ubuntu-24.04
++    timeout-minutes: 5
++    outputs:
++      run_windows_e2e: ${{ steps.classify.outputs.run_windows_e2e }}
++    steps:
++      - name: Checkout
++        uses: actions/checkout@v6
++        with:
++          fetch-depth: 0
++
++      - id: classify
++        name: Classify changed paths
++        shell: bash
++        run: |
++          set -euo pipefail
++
++          git diff --name-only \
++            "${{ github.event.pull_request.base.sha }}" \
++            "${{ github.event.pull_request.head.sha }}" \
++            > changed-files.txt
++
++          is_web_or_docs_only_path() {
++            local path="$1"
++            case "$path" in
++              apps/web/*) return 0 ;;
++              docs/*) return 0 ;;
++              *.md | *.mdx | *.txt) return 0 ;;
++              LICENSE | NOTICE) return 0 ;;
++              .github/ISSUE_TEMPLATE/* | .github/PULL_REQUEST_TEMPLATE*) return 0 ;;
++            esac
++            return 1
++          }
++
++          run_windows_e2e=false
++          while IFS= read -r path; do
++            [[ -n "$path" ]] || continue
++            if ! is_web_or_docs_only_path "$path"; then
++              run_windows_e2e=true
++              break
++            fi
++          done < changed-files.txt
++
++          echo "run_windows_e2e=$run_windows_e2e" >> "$GITHUB_OUTPUT"
++          if [[ "$run_windows_e2e" == "true" ]]; then
++            echo "Windows launch E2E will run; PR changes include desktop/server/shared/release surfaces."
++          else
++            echo "Windows launch E2E skipped; PR changes are limited to apps/web or documentation."
++          fi
++
+   desktop_linux_package_smoke:
+     name: Desktop Linux Package Smoke
+     if: github.event_name == 'pull_request'
+@@ -70,6 +122,84 @@ jobs:
+       - name: Launch packaged Linux desktop app
+         run: xvfb-run -a node scripts/desktop-launch-smoke.mjs --artifact "release/*.AppImage" --timeout-ms 90000
+ 
++  desktop_windows_launch_e2e:
++    name: Desktop Windows Launch E2E
++    needs: desktop_launch_gate_paths
++    if: >-
++      ${{
++        github.event_name == 'pull_request' &&
++        needs.desktop_launch_gate_paths.outputs.run_windows_e2e == 'true'
++      }}
++    runs-on: windows-latest
++    timeout-minutes: 60
++    steps:
++      - name: Checkout
++        uses: actions/checkout@v6
++
++      - name: Setup Vite+
++        uses: voidzero-dev/setup-vp@v1
++        with:
++          node-version-file: package.json
++          cache: true
++          run-install: true
++
++      - name: Ensure Electron runtime is installed
++        run: vp run --filter @t3tools/desktop ensure:electron
++
++      - name: Build Windows desktop artifact
++        shell: bash
++        run: |
++          set -euo pipefail
++          vp run dist:desktop:artifact \
++            --platform win \
++            --target nsis \
++            --arch x64 \
++            --build-version "0.0.0-pr.${{ github.run_number }}"
++
++      - id: install
++        name: Silently install Windows desktop artifact
++        shell: pwsh
++        run: |
++          $ErrorActionPreference = "Stop"
++          $installer = Get-ChildItem -Path release -Filter "*.exe" |
++            Sort-Object Length -Descending |
++            Select-Object -First 1
++          if (-not $installer) {
++            throw "No NSIS installer found in release."
++          }
++
++          $installDir = Join-Path $env:RUNNER_TEMP "t3code-install"
++          if (Test-Path $installDir) {
++            Remove-Item -Recurse -Force $installDir
++          }
++          New-Item -ItemType Directory -Force -Path $installDir | Out-Null
++
++          $process = Start-Process `
++            -FilePath $installer.FullName `
++            -ArgumentList @("/S", "/D=$installDir") `
++            -Wait `
++            -PassThru
++          if ($process.ExitCode -ne 0) {
++            throw "NSIS installer exited with code $($process.ExitCode)."
++          }
++
++          $expectedExeNames = @("T3 Code (Alpha).exe", "T3 Code (Nightly).exe")
++          $appExe = Get-ChildItem -Path $installDir -Filter "*.exe" -File |
++            Where-Object { $expectedExeNames -contains $_.Name } |
++            Select-Object -First 1
++          if (-not $appExe) {
++            $topLevelExecutables = Get-ChildItem -Path $installDir -Filter "*.exe" -File |
++              Select-Object -ExpandProperty Name
++            throw "No expected installed application executable found under $installDir. Expected one of: $($expectedExeNames -join ', '). Top-level executables: $($topLevelExecutables -join ', ')"
++          }
++
++          "app_exe=$($appExe.FullName)" >> $env:GITHUB_OUTPUT
++          Write-Host "Installed desktop executable: $($appExe.FullName)"
++
++      - name: Launch installed Windows desktop app
++        shell: pwsh
++        run: node scripts/desktop-launch-smoke.mjs --command "${{ steps.install.outputs.app_exe }}" --timeout-ms 90000
++
+   test:
+     name: Test
+     runs-on: ubuntu-24.04
+diff --git a/apps/web/src/components/settings/pairingUrls.test.ts b/apps/web/src/components/settings/pairingUrls.test.ts
+index c5c45bcf1..4f5d7f6e6 100644
+--- a/apps/web/src/components/settings/pairingUrls.test.ts
++++ b/apps/web/src/components/settings/pairingUrls.test.ts
+@@ -21,4 +21,19 @@ describe("settings pairing URL helpers", () => {
+       "https://preview.t3.codes/pair?host=https%3A%2F%2Fhost.tailnet.example.ts.net%3A3773#token=PAIRCODE",
+     );
+   });
++
++  it("uses the current hosted channel origin when sharing from pages.dev", () => {
++    vi.stubEnv("VITE_HOSTED_APP_URL", "");
++    vi.stubEnv("VITE_HOSTED_APP_CHANNEL", "nightly");
++
++    expect(
++      resolveHostedPairingUrl(
++        "https://oc.agriffiths.dev",
++        "PAIRCODE",
++        new URL("https://adam-openclaw.pages.dev/settings"),
++      ),
++    ).toBe(
++      "https://adam-openclaw.pages.dev/pair?host=https%3A%2F%2Foc.agriffiths.dev#token=PAIRCODE",
++    );
++  });
+ });
+diff --git a/apps/web/src/components/settings/pairingUrls.ts b/apps/web/src/components/settings/pairingUrls.ts
+index 891fe04ad..3386f0297 100644
+--- a/apps/web/src/components/settings/pairingUrls.ts
++++ b/apps/web/src/components/settings/pairingUrls.ts
+@@ -7,7 +7,11 @@ export function resolveDesktopPairingUrl(endpointUrl: string, credential: string
+   return setPairingTokenOnUrl(url, credential).toString();
+ }
+ 
+-export function resolveHostedPairingUrl(endpointUrl: string, credential: string): string | null {
++export function resolveHostedPairingUrl(
++  endpointUrl: string,
++  credential: string,
++  currentUrl?: URL,
++): string | null {
+   const url = new URL(endpointUrl);
+   if (url.protocol !== "https:") {
+     return null;
+@@ -16,5 +20,6 @@ export function resolveHostedPairingUrl(endpointUrl: string, credential: string)
+   return buildHostedPairingUrl({
+     host: endpointUrl,
+     token: credential,
++    currentUrl,
+   });
+ }
+diff --git a/apps/web/src/hostedPairing.test.ts b/apps/web/src/hostedPairing.test.ts
+index 5bfeadf21..39742a2ce 100644
+--- a/apps/web/src/hostedPairing.test.ts
++++ b/apps/web/src/hostedPairing.test.ts
+@@ -3,6 +3,7 @@ import { afterEach, describe, expect, it, vi } from "vite-plus/test";
+ import {
+   buildHostedChannelSelectionUrl,
+   buildHostedPairingUrl,
++  configuredHostedAppUrl,
+   hasHostedPairingRequest,
+   isHostedStaticApp,
+   readHostedPairingRequest,
+@@ -58,6 +59,15 @@ describe("hostedPairing", () => {
+     expect(url.searchParams.has("next")).toBe(false);
+   });
+ 
++  it("uses the current hosted channel origin when no router origin is configured", () => {
++    vi.stubEnv("VITE_HOSTED_APP_URL", "");
++    vi.stubEnv("VITE_HOSTED_APP_CHANNEL", "nightly");
++
++    expect(configuredHostedAppUrl(new URL("https://adam-openclaw.pages.dev/pair"))).toBe(
++      "https://adam-openclaw.pages.dev",
++    );
++  });
++
+   it("ignores incomplete hosted pairing requests", () => {
+     expect(
+       hasHostedPairingRequest(new URL("https://app.t3.codes/pair?host=backend.example.com")),
+@@ -67,6 +77,23 @@ describe("hostedPairing", () => {
+     );
+   });
+ 
++  it("accepts hosted pairing requests from either canonical or pages.dev origins", () => {
++    const search = "?host=https%3A%2F%2Foc.agriffiths.dev%2F#token=ABCD1234";
++
++    expect(readHostedPairingRequest(new URL(`https://app.t3.codes/pair${search}`))).toEqual({
++      host: "https://oc.agriffiths.dev/",
++      token: "ABCD1234",
++      label: "",
++    });
++    expect(
++      readHostedPairingRequest(new URL(`https://adam-openclaw.pages.dev/pair${search}`)),
++    ).toEqual({
++      host: "https://oc.agriffiths.dev/",
++      token: "ABCD1234",
++      label: "",
++    });
++  });
++
+   it("detects the hosted static app only when no backend URL is configured", () => {
+     vi.stubEnv("VITE_HOSTED_APP_URL", "https://preview.t3.codes");
+     vi.stubEnv("VITE_HTTP_URL", "");
+diff --git a/apps/web/src/hostedPairing.ts b/apps/web/src/hostedPairing.ts
+index 2caf844af..d1789db12 100644
+--- a/apps/web/src/hostedPairing.ts
++++ b/apps/web/src/hostedPairing.ts
+@@ -10,8 +10,27 @@ export interface HostedPairingRequest {
+ 
+ export type HostedAppChannel = "latest" | "nightly";
+ 
+-export function configuredHostedAppUrl(): string {
+-  return import.meta.env.VITE_HOSTED_APP_URL?.trim() || DEFAULT_HOSTED_APP_URL;
++function currentHttpOrigin(currentUrl: URL | undefined): string | null {
++  const origin = currentUrl?.origin ?? "";
++  return origin.startsWith("http://") || origin.startsWith("https://") ? origin : null;
++}
++
++export function configuredHostedAppUrl(currentUrl?: URL): string {
++  const configuredUrl = import.meta.env.VITE_HOSTED_APP_URL?.trim();
++  if (configuredUrl) {
++    return configuredUrl;
++  }
++
++  if (configuredHostedAppChannel()) {
++    const dynamicOrigin =
++      currentHttpOrigin(currentUrl) ??
++      (typeof window === "undefined" ? null : currentHttpOrigin(new URL(window.location.href)));
++    if (dynamicOrigin) {
++      return dynamicOrigin;
++    }
++  }
++
++  return DEFAULT_HOSTED_APP_URL;
+ }
+ 
+ function configuredBackendUrl(): string {
+@@ -68,8 +87,9 @@ export function buildHostedPairingUrl(input: {
+   readonly host: string;
+   readonly token: string;
+   readonly label?: string | null;
++  readonly currentUrl?: URL;
+ }): string {
+-  const url = new URL("/pair", configuredHostedAppUrl());
++  const url = new URL("/pair", configuredHostedAppUrl(input.currentUrl));
+   url.searchParams.set("host", input.host);
+ 
+   const label = input.label?.trim();
+diff --git a/scripts/build-desktop-artifact.test.ts b/scripts/build-desktop-artifact.test.ts
+index a68ef6b73..36e8fafdf 100644
+--- a/scripts/build-desktop-artifact.test.ts
++++ b/scripts/build-desktop-artifact.test.ts
+@@ -7,6 +7,7 @@ import * as Option from "effect/Option";
+ import * as Sink from "effect/Sink";
+ import * as Stream from "effect/Stream";
+ import { ChildProcessSpawner } from "effect/unstable/process";
++import desktopPackageJson from "../apps/desktop/package.json" with { type: "json" };
+ 
+ import {
+   BuildCommandFailedError,
+@@ -166,6 +167,32 @@ it.layer(NodeServices.layer)("build-desktop-artifact", (it) => {
+     );
+   });
+ 
++  it("stages the real desktop main-process runtime dependency closure", () => {
++    const resolvedDependencies = resolveDesktopRuntimeDependencies(
++      desktopPackageJson.dependencies,
++      {
++        "@clerk/electron": "0.0.5",
++        "@clerk/electron-passkeys": "0.0.3",
++        "@effect/platform-node": "4.0.0-beta.78",
++        effect: "4.0.0-beta.78",
++      },
++    );
++
++    assert.deepStrictEqual(Object.keys(resolvedDependencies).sort(), [
++      "@clerk/electron",
++      "@clerk/electron-passkeys",
++      "@effect/platform-node",
++      "effect",
++      "electron-store",
++      "electron-updater",
++      "playwright-core",
++      "react-grab",
++    ]);
++    assert.equal(resolvedDependencies["@effect/platform-node"], "4.0.0-beta.78");
++    assert.equal("electron" in resolvedDependencies, false);
++    assert.equal("@t3tools/shared" in resolvedDependencies, false);
++  });
++
+   it("carries only staged dependency patch metadata into staged desktop installs", () => {
+     assert.deepStrictEqual(
+       createStagePnpmConfig(
+diff --git a/scripts/desktop-launch-smoke.mjs b/scripts/desktop-launch-smoke.mjs
+index fa6b0ee7b..d529f2c4e 100644
+--- a/scripts/desktop-launch-smoke.mjs
++++ b/scripts/desktop-launch-smoke.mjs
+@@ -15,6 +15,10 @@ const FATAL_OUTPUT_PATTERNS = [
+   /ERR_MODULE_NOT_FOUND/i,
+   /\bMODULE_NOT_FOUND\b/i,
+   /Cannot find module/i,
++  /\buncaught exception\b/i,
++  /\buncaught error\b/i,
++  /\bunhandled(?:promise)?rejection\b/i,
++  /\bUncaught (?:Error|TypeError|ReferenceError|SyntaxError|Exception)\b/,
+ ];
+ // oxlint-disable-next-line t3code/no-global-process-runtime -- Standalone CI script.
+ const hostPlatform = process.platform;
