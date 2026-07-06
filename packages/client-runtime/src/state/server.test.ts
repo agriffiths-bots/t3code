@@ -2,7 +2,11 @@ import { type ServerConfig, type ServerLifecycleWelcomePayload } from "@t3tools/
 import { describe, expect, it } from "@effect/vitest";
 import * as Option from "effect/Option";
 
-import { applyServerConfigProjection, projectServerWelcome } from "./server.ts";
+import {
+  applyServerConfigProjection,
+  projectServerConfig,
+  projectServerWelcome,
+} from "./server.ts";
 
 const CONFIG = {
   availableEditors: [],
@@ -46,6 +50,24 @@ describe("server state projection", () => {
         type: "heartbeat",
       }),
     ).toBe(snapshot);
+  });
+
+  it("emits no downstream projection for websocket heartbeat frames", () => {
+    const [snapshotState] = projectServerConfig(Option.none(), {
+      version: 1,
+      type: "snapshot",
+      config: CONFIG,
+    });
+
+    const [nextState, emitted] = projectServerConfig(snapshotState, {
+      version: 1,
+      type: "heartbeat",
+    });
+
+    // State is preserved but nothing is pushed to subscribers, so a quiet
+    // session does not re-emit the unchanged config every keepalive tick.
+    expect(nextState).toBe(snapshotState);
+    expect(emitted).toEqual([]);
   });
 
   it("retains welcome when a ready event follows in the same stream chunk", () => {

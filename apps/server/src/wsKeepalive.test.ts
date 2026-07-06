@@ -5,9 +5,22 @@ import * as Fiber from "effect/Fiber";
 import * as Stream from "effect/Stream";
 import * as TestClock from "effect/testing/TestClock";
 
-import { makeServerConfigHeartbeatStream, WS_KEEPALIVE_INTERVAL_MS } from "./wsKeepalive.ts";
+import {
+  makeServerConfigHeartbeatStream,
+  shouldSendServerConfigHeartbeat,
+  WS_KEEPALIVE_INTERVAL_MS,
+} from "./wsKeepalive.ts";
 
 describe("websocket keepalive", () => {
+  it("only sends heartbeats to clients that opted in", () => {
+    expect(shouldSendServerConfigHeartbeat({ supportsHeartbeat: true })).toBe(true);
+    // Older/version-skewed clients omit the flag and must not receive the new
+    // `heartbeat` union variant they cannot decode.
+    expect(shouldSendServerConfigHeartbeat({ supportsHeartbeat: false })).toBe(false);
+    expect(shouldSendServerConfigHeartbeat({})).toBe(false);
+    expect(shouldSendServerConfigHeartbeat({ supportsHeartbeat: undefined })).toBe(false);
+  });
+
   it.effect("emits application frames well before Cloudflare's idle websocket timeout", () =>
     Effect.gen(function* () {
       expect(WS_KEEPALIVE_INTERVAL_MS).toBeLessThan(100_000);

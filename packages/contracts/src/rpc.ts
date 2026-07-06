@@ -727,7 +727,15 @@ export const WsSubscribeTerminalMetadataRpc = Rpc.make(WS_METHODS.subscribeTermi
 });
 
 export const WsSubscribeServerConfigRpc = Rpc.make(WS_METHODS.subscribeServerConfig, {
-  payload: Schema.Struct({}),
+  // `supportsHeartbeat` is an additive, backward-compatible capability flag.
+  // Clients built before the websocket keepalive omit it (decoded as
+  // `undefined`), and the server only merges `heartbeat` frames into the stream
+  // when a client opts in — so an older client's `ServerConfigStreamEvent` union
+  // decoder never receives a `heartbeat` variant it cannot parse. A newer client
+  // talking to an older server is also safe: the extra field is ignored on decode.
+  payload: Schema.Struct({
+    supportsHeartbeat: Schema.optional(Schema.Boolean),
+  }),
   success: ServerConfigStreamEvent,
   error: Schema.Union([KeybindingsConfigError, ServerSettingsError, EnvironmentAuthorizationError]),
   stream: true,

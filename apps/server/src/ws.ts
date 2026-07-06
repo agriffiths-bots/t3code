@@ -114,7 +114,7 @@ import * as PairingGrantStore from "./auth/PairingGrantStore.ts";
 import * as SessionStore from "./auth/SessionStore.ts";
 import { failEnvironmentAuthInvalid, failEnvironmentInternal } from "./auth/http.ts";
 import * as RelayClient from "@t3tools/shared/relayClient";
-import { makeServerConfigHeartbeatStream } from "./wsKeepalive.ts";
+import { makeServerConfigHeartbeatStream, shouldSendServerConfigHeartbeat } from "./wsKeepalive.ts";
 const isOrchestrationDispatchCommandError = Schema.is(OrchestrationDispatchCommandError);
 const isOrchestrationScheduledTaskMutationError = Schema.is(
   OrchestrationScheduledTaskMutationError,
@@ -1534,7 +1534,7 @@ const makeWsRpcLayer = (
             ),
             { "rpc.aggregate": "preview" },
           ),
-        [WS_METHODS.subscribeServerConfig]: (_input) =>
+        [WS_METHODS.subscribeServerConfig]: (input) =>
           observeRpcStreamEffect(
             WS_METHODS.subscribeServerConfig,
             Effect.gen(function* () {
@@ -1569,10 +1569,16 @@ const makeWsRpcLayer = (
                 .refresh()
                 .pipe(Effect.ignoreCause({ log: true }), Effect.forkScoped);
 
-              const liveUpdates = Stream.merge(
-                makeServerConfigHeartbeatStream(),
-                Stream.merge(keybindingsUpdates, Stream.merge(providerStatuses, settingsUpdates)),
+              const configUpdates = Stream.merge(
+                keybindingsUpdates,
+                Stream.merge(providerStatuses, settingsUpdates),
               );
+              // Only send keepalive heartbeats to clients that declared support
+              // for the `heartbeat` union variant; older/version-skewed clients
+              // would otherwise fail to decode it and lose the subscription.
+              const liveUpdates = shouldSendServerConfigHeartbeat(input)
+                ? Stream.merge(makeServerConfigHeartbeatStream(), configUpdates)
+                : configUpdates;
 
               return Stream.concat(
                 Stream.make({

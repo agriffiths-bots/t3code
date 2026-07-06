@@ -7,7 +7,10 @@ import {
   type ServerProvider,
   type ServerSettings,
 } from "@t3tools/contracts";
-import { createServerEnvironmentAtoms } from "@t3tools/client-runtime/state/server";
+import {
+  createServerEnvironmentAtoms,
+  SERVER_CONFIG_SUBSCRIPTION_INPUT,
+} from "@t3tools/client-runtime/state/server";
 import { createEnvironmentServerConfigsAtom } from "@t3tools/client-runtime/state/shell";
 import { DEFAULT_RESOLVED_KEYBINDINGS } from "@t3tools/shared/keybindings";
 import * as Option from "effect/Option";
@@ -46,11 +49,15 @@ export const primaryServerStateAtom = Atom.make((get): PrimaryServerState => {
     return EMPTY_PRIMARY_SERVER_STATE;
   }
 
-  const target = { environmentId, input: {} };
+  // Must match the input used by `configValueAtom` in client-runtime so both
+  // consumers share a single `subscribeServerConfig` stream per environment.
+  const configTarget = { environmentId, input: SERVER_CONFIG_SUBSCRIPTION_INPUT };
   const configProjection = Option.getOrNull(
-    AsyncResult.value(get(serverEnvironment.configProjection(target))),
+    AsyncResult.value(get(serverEnvironment.configProjection(configTarget))),
   );
-  const welcome = Option.getOrNull(AsyncResult.value(get(serverEnvironment.welcome(target))));
+  const welcome = Option.getOrNull(
+    AsyncResult.value(get(serverEnvironment.welcome({ environmentId, input: {} }))),
+  );
 
   return {
     config: get(serverEnvironment.configValueAtom(environmentId)),
