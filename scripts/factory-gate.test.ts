@@ -92,7 +92,8 @@ JSON
     NodePath.join(repo, "scripts/factory/factory.conf"),
     `FACTORY_STATIC_CHECKS=("true")
 FACTORY_AUTOREVIEW_BIN=${shellQuote(autoreview)}
-FACTORY_REVIEW_ARGS=()
+FACTORY_REVIEW_ARGS=(--reviewers codex)
+FACTORY_REVIEW_CONFIRM_ARGS=()
 FACTORY_UPSTREAM_REF="upstream/main"
 FACTORY_AUDIT_LOG=${shellQuote(audit)}
 `,
