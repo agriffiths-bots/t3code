@@ -9,6 +9,7 @@ import * as Option from "effect/Option";
 import { AsyncResult } from "effect/unstable/reactivity";
 import { useCallback, useEffect, useRef } from "react";
 
+import { isElectron } from "../env";
 import { useEnvironmentHttpBaseUrl, usePrimaryEnvironmentId } from "../state/environments";
 import { serverEnvironment } from "../state/server";
 import { useAtomCommand } from "../state/use-atom-command";
@@ -129,13 +130,24 @@ function deviceLabel(): string {
   return "Web app";
 }
 
-function openDeepLink(deepLink: string | undefined): void {
+type DeepLinkHistoryMode = "browser" | "hash";
+
+export function resolveDeepLinkTarget(
+  deepLink: string | undefined,
+  historyMode: DeepLinkHistoryMode,
+): string | null {
   if (!deepLink || !deepLink.startsWith("/") || deepLink.startsWith("//")) {
-    window.focus();
-    return;
+    return null;
   }
+  return historyMode === "hash" ? `#${deepLink}` : deepLink;
+}
+
+function openDeepLink(deepLink: string | undefined): void {
   window.focus();
-  window.location.assign(deepLink);
+  const target = resolveDeepLinkTarget(deepLink, isElectron ? "hash" : "browser");
+  if (target) {
+    window.location.assign(target);
+  }
 }
 
 export function PwaRuntime() {
