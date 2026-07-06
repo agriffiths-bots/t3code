@@ -593,6 +593,7 @@ export const DESKTOP_PACKAGE_BUILD_ENV = {
 const FFI_RS_VERSION = "1.3.2";
 export const DESKTOP_AFTER_PACK_HOOK_STAGE_PATH = "desktop-after-pack-prune.mjs";
 export const DESKTOP_ASAR_UNPACK_BASE = ["apps/server/dist/**"] as const;
+export const MOCK_UPDATE_SERVER_HOST = "127.0.0.1";
 export const DESKTOP_UNPACKED_FILE_LIMIT = 250;
 export const DESKTOP_NATIVE_ASAR_UNPACK_PACKAGE_PATTERNS = [
   "@anthropic-ai/claude-agent-sdk-*",
@@ -1564,7 +1565,7 @@ export function resolveDesktopBuildIconAssets(version: string): DesktopBuildIcon
 }
 
 export function resolveMockUpdateServerUrl(mockUpdateServerPort: number | undefined): string {
-  return `http://localhost:${mockUpdateServerPort ?? 3000}`;
+  return `http://${MOCK_UPDATE_SERVER_HOST}:${mockUpdateServerPort ?? 3000}`;
 }
 
 export function resolveDesktopProductName(version: string): string {

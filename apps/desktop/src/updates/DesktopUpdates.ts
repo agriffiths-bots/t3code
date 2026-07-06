@@ -44,6 +44,7 @@ import {
 
 const AUTO_UPDATE_STARTUP_DELAY = "15 seconds";
 const AUTO_UPDATE_POLL_INTERVAL = "4 minutes";
+const MOCK_UPDATE_SERVER_HOST = "127.0.0.1";
 
 const AppUpdateYmlConfig = Schema.Record(Schema.String, Schema.String);
 type AppUpdateYmlConfig = typeof AppUpdateYmlConfig.Type;
@@ -716,7 +717,7 @@ export const make = Effect.gen(function* () {
       if (config.mockUpdates) {
         yield* electronUpdater.setFeedURL({
           provider: "generic",
-          url: `http://localhost:${config.mockUpdateServerPort}`,
+          url: `http://${MOCK_UPDATE_SERVER_HOST}:${config.mockUpdateServerPort}`,
         } as ElectronUpdater.ElectronUpdaterFeedUrl);
       }
 

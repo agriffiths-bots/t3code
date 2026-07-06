@@ -140,7 +140,7 @@ const makeMockUpdateServerLayer = (config: MockUpdateServerConfig) =>
   HttpRouter.serve(makeMockUpdateRouteLayer(config.rootRealPath)).pipe(
     Layer.provideMerge(
       NodeHttpServer.layer(NodeHttp.createServer, {
-        host: "localhost",
+        host: "127.0.0.1",
         port: config.port,
       }),
     ),

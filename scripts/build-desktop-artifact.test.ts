@@ -717,8 +717,8 @@ it.layer(NodeServices.layer)("build-desktop-artifact", (it) => {
   });
 
   it("falls back to the default mock update port when the configured port is blank", () => {
-    assert.equal(resolveMockUpdateServerUrl(undefined), "http://localhost:3000");
-    assert.equal(resolveMockUpdateServerUrl(4123), "http://localhost:4123");
+    assert.equal(resolveMockUpdateServerUrl(undefined), "http://127.0.0.1:3000");
+    assert.equal(resolveMockUpdateServerUrl(4123), "http://127.0.0.1:4123");
   });
 
   it.effect("normalizes mock update server ports from env-style strings", () =>
