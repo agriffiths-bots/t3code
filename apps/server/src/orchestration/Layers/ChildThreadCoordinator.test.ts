@@ -355,6 +355,7 @@ describe("ChildThreadCoordinator", () => {
           const state = threadStates.get(threadId);
           return state ? Option.some(state.detail) : Option.none();
         }),
+      getThreadDetailSnapshot: () => Effect.succeed(Option.none()),
     });
 
     const registryLayer = Layer.succeed(ProviderInstanceRegistry, {

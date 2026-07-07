@@ -279,6 +279,7 @@ const projectionLayer = Layer.succeed(ProjectionSnapshotQuery, {
         ? Effect.sleep(`${childDetailDelayMs} millis`).pipe(Effect.as(detail))
         : Effect.succeed(detail);
     }),
+  getThreadDetailSnapshot: () => Effect.succeed(Option.none()),
 });
 
 const coordinatorLayer = Layer.succeed(ChildThreadCoordinator, {
