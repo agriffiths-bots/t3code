@@ -630,10 +630,16 @@ export const make = Effect.fn("EnvironmentSupervisor.make")(function* (
             case "ConnectRequested":
             case "DisconnectRequested":
             case "RetryRequested":
-            case "NetworkChanged":
               return;
+            case "NetworkChanged":
+              if (next.network === "offline") {
+                return;
+              }
+              break;
             case "Wakeup":
-              yield* consumeSuppressedBrowserOnlineWakeup(next.reason);
+              if (yield* consumeSuppressedBrowserOnlineWakeup(next.reason)) {
+                break;
+              }
               return;
           }
         }
