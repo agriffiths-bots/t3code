@@ -521,7 +521,11 @@ const makeActiveThreadStartRuntime = Effect.fn("ThreadToolkit.makeActiveRuntime"
       explicitDirectory !== null
         ? {
             cwd: explicitDirectory,
-            canUseSourceBranch: !explicitForeignDirectory,
+            // Never inherit the source thread's branch for an explicit
+            // directory: it is a different checkout (even when same-repo) and
+            // may be on a different branch, so the branch must be resolved from
+            // the target directory itself (resolveInitialBranch queries cwd).
+            canUseSourceBranch: false,
             workspaceRelativePath: explicitDirectoryContext?.workspaceRelativePath ?? null,
           }
         : yield* resolveSourceCwd(project, sourceThread);

@@ -484,6 +484,43 @@ it.effect("honors explicit existing worktree paths when the project is not a git
   }),
 );
 
+it.effect("resolves the branch from an explicit current-checkout directory, not the source", () =>
+  // A same-repo explicit directory is a different checkout that may be on a
+  // different branch: the child must record the directory's branch, never the
+  // source thread's.
+  Effect.gen(function* () {
+    const commands: OrchestrationCommand[] = [];
+    const repoRoot = yield* makeTempDirectory("t3-branch-repo-");
+    const explicitDir = yield* makeChildDirectory(repoRoot, "pkg");
+    const result = yield* callStartTool(
+      { prompt: "Work in a sibling checkout", directory: explicitDir, mode: "current_checkout" },
+      commands,
+      {
+        project: { ...project, workspaceRoot: repoRoot },
+        vcsDetect: (input) => Effect.succeed(makeGitHandle(input.cwd, { rootPath: repoRoot })),
+        gitWorkflow: {
+          // The target directory is on a DIFFERENT branch than the source thread.
+          status: (input) =>
+            Effect.succeed({
+              ...nonRepoStatus,
+              isRepo: true,
+              refName: input.cwd === explicitDir ? "feature/target" : "feature/source",
+            }),
+        },
+      },
+    );
+
+    expect(result.isError).toBe(false);
+    // sourceThread.branch is "feature/source"; the child must take the
+    // directory's actual branch instead.
+    expect(result.structuredContent).toMatchObject({
+      projectId,
+      mode: "current_checkout",
+      branch: "feature/target",
+    });
+  }),
+);
+
 it.effect("bases the child on an explicit git directory with a new worktree", () =>
   Effect.gen(function* () {
     const commands: OrchestrationCommand[] = [];

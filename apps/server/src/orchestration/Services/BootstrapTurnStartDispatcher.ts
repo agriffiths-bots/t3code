@@ -208,6 +208,11 @@ export const layer = Layer.effect(
       let targetProjectId = bootstrap?.createThread?.projectId;
       let targetProjectCwd = bootstrap?.prepareWorktree?.projectCwd;
       let targetWorktreePath = bootstrap?.createThread?.worktreePath ?? null;
+      // The worktree THIS bootstrap created (if any), for cleanup on failure.
+      // A failed bootstrap must not leave its worktree behind — and for
+      // directory-targeted (non-removable, foreign-repo) worktrees the
+      // projectId-keyed reaper never would, so the dispatcher owns cleanup.
+      let createdWorktree: { readonly cwd: string; readonly path: string } | null = null;
 
       const cleanupCreatedThread = () =>
         createdThread
@@ -221,6 +226,17 @@ export const layer = Layer.effect(
               ),
               Effect.ignoreCause({ log: true }),
             )
+          : Effect.void;
+
+      const cleanupCreatedWorktree = () =>
+        createdWorktree
+          ? gitWorkflow
+              .removeWorktree({
+                cwd: createdWorktree.cwd,
+                path: createdWorktree.path,
+                force: true,
+              })
+              .pipe(Effect.ignoreCause({ log: true }))
           : Effect.void;
 
       const recordSetupScriptLaunchFailure = (input: {
@@ -387,6 +403,10 @@ export const layer = Layer.effect(
             baseRefName: bootstrap.prepareWorktree.baseBranch,
             path: null,
           });
+          createdWorktree = {
+            cwd: bootstrap.prepareWorktree.projectCwd,
+            path: worktree.worktree.path,
+          };
           targetWorktreePath = applyWorkspaceRelativePath(
             worktree.worktree.path,
             workspaceRelativePath,
@@ -419,7 +439,10 @@ export const layer = Layer.effect(
           if (Cause.hasInterruptsOnly(cause)) {
             return Effect.fail(dispatchError);
           }
-          return cleanupCreatedThread().pipe(Effect.flatMap(() => Effect.fail(dispatchError)));
+          return cleanupCreatedThread().pipe(
+            Effect.flatMap(() => cleanupCreatedWorktree()),
+            Effect.flatMap(() => Effect.fail(dispatchError)),
+          );
         }),
       );
     });
