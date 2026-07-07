@@ -61,6 +61,7 @@ interface PendingRetryTrace {
 interface TracedAttemptFailure {
   readonly error: ConnectionAttemptError;
   readonly attemptSpan: Option.Option<Tracer.Span>;
+  readonly ignoreNetworkChangesThroughSequence?: number;
   readonly retryDelayOverrideMs?: number;
 }
 
@@ -550,6 +551,7 @@ export const make = Effect.fn("EnvironmentSupervisor.make")(function* (
             detail: `${target.label} did not respond during connection setup.`,
           }),
           attemptSpan: Option.none(),
+          ignoreNetworkChangesThroughSequence: attemptStartedAfterSignalSequence,
         },
       } satisfies AttemptOutcome;
     }
@@ -569,7 +571,15 @@ export const make = Effect.fn("EnvironmentSupervisor.make")(function* (
           }),
         );
       }
-      return outcome;
+      return outcome._tag === "Failure"
+        ? ({
+            ...outcome,
+            failure: {
+              ...outcome.failure,
+              ignoreNetworkChangesThroughSequence: attemptStartedAfterSignalSequence,
+            },
+          } satisfies AttemptOutcome)
+        : outcome;
     }
 
     const active = establishment.exit.value;
@@ -620,7 +630,10 @@ export const make = Effect.fn("EnvironmentSupervisor.make")(function* (
     return failureFromExit(target, connectedExit, true, connectedForMs >= BACKOFF_RESET_AFTER_MS);
   }, Effect.ensuring(clearLease));
 
-  const waitForRetrySignal = Effect.fnUntraced(function* (delayMs: number) {
+  const waitForRetrySignal = Effect.fnUntraced(function* (
+    delayMs: number,
+    ignoreNetworkChangesThroughSequence: number,
+  ) {
     return yield* Effect.raceFirst(
       Effect.sleep(delayMs),
       Effect.gen(function* () {
@@ -635,7 +648,13 @@ export const make = Effect.fn("EnvironmentSupervisor.make")(function* (
               if (next.network === "offline") {
                 return;
               }
-              break;
+              if (
+                next.sequence <= ignoreNetworkChangesThroughSequence &&
+                (yield* Ref.get(suppressNextBrowserOnlineWakeup))
+              ) {
+                break;
+              }
+              return;
             case "Wakeup":
               if (yield* consumeSuppressedBrowserOnlineWakeup(next.reason)) {
                 break;
@@ -673,7 +692,10 @@ export const make = Effect.fn("EnvironmentSupervisor.make")(function* (
           if (yield* consumeSuppressedBrowserOnlineWakeup(next.reason)) {
             break;
           }
-          if (next.reason === "credentials-changed") {
+          if (next.reason === "browser-online") {
+            break;
+          }
+          if (next.reason === "application-active" || next.reason === "credentials-changed") {
             return;
           }
           break;
@@ -765,7 +787,7 @@ export const make = Effect.fn("EnvironmentSupervisor.make")(function* (
         lastFailure: error,
         retryAt: (yield* Clock.currentTimeMillis) + delayMs,
       });
-      yield* waitForRetrySignal(delayMs);
+      yield* waitForRetrySignal(delayMs, outcome.failure.ignoreNetworkChangesThroughSequence ?? 0);
     }
   });
 
