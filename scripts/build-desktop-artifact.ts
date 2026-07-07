@@ -616,6 +616,7 @@ export const DESKTOP_STAGED_RUNTIME_DEPENDENCY_NAMES = [
   "@clerk/electron-passkeys",
   "@ff-labs/fff-node",
   "node-pty",
+  "playwright-core",
 ] as const;
 
 function toAsarUnpackPackagePatterns(packagePattern: string): readonly string[] {

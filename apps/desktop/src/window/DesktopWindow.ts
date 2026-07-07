@@ -718,6 +718,7 @@ export const make = Effect.gen(function* () {
     if (yield* Ref.get(backendReadyRef)) return;
     const window = yield* ensureMain;
     const shouldUseDarkColors = yield* electronTheme.shouldUseDarkColors;
+    if (yield* Ref.get(backendReadyRef)) return;
     const url = buildBackendStatusDataUrl({
       shouldUseDarkColors,
       title: "Backend still starting",

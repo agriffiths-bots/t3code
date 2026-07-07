@@ -18,6 +18,7 @@ const externalDesktopMainDependencyPackageNames = new Set([
   // Native bridge loaded by @clerk/electron. Keep the binary package external
   // so electron-builder can unpack its .node payload onto the real filesystem.
   "@clerk/electron-passkeys",
+  "playwright-core",
 ]);
 const externalDesktopMainDependencyPackagePrefixes = [
   "@clerk/electron-passkeys-",

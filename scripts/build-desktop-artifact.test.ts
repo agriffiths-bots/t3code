@@ -214,7 +214,7 @@ it.layer(NodeServices.layer)("build-desktop-artifact", (it) => {
     );
   });
 
-  it("resolves only external native and sidecar dependencies for staged desktop installs", () => {
+  it("resolves only external runtime, native, and sidecar dependencies for staged desktop installs", () => {
     assert.deepStrictEqual(
       resolveStagedRuntimeDependencies({
         desktopDependencies: {
@@ -257,6 +257,7 @@ it.layer(NodeServices.layer)("build-desktop-artifact", (it) => {
         "@clerk/electron-passkeys": "0.0.3",
         "@ff-labs/fff-node": "0.9.4",
         "node-pty": "^1.1.0",
+        "playwright-core": "1.60.0",
       },
     );
   });

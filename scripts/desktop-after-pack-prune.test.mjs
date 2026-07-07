@@ -23,6 +23,10 @@ describe("desktop-after-pack-prune", () => {
   it("keeps only Windows x64 and WSL Linux glibc x64 native sidecars", async () => {
     const tempDir = await NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "desktop-prune-"));
     const root = NodePath.join(tempDir, "resources", "app.asar.unpacked", "node_modules");
+    const badFfiTarget = NodePath.join(
+      root,
+      ".pnpm/@yuuang+ffi-rs-win32-ia32-msvc@1.3.2/node_modules/@yuuang/ffi-rs-win32-ia32-msvc",
+    );
 
     await Promise.all([
       touch(NodePath.join(root, "@anthropic-ai/claude-agent-sdk-win32-x64/claude.exe")),
@@ -33,7 +37,7 @@ describe("desktop-after-pack-prune", () => {
       touch(NodePath.join(root, "@ff-labs/fff-bin-linux-x64-gnu/libfff_c.so")),
       touch(NodePath.join(root, "@ff-labs/fff-bin-linux-x64-musl/libfff_c.so")),
       touch(NodePath.join(root, "@yuuang/ffi-rs-win32-x64-msvc/ffi-rs.win32-x64-msvc.node")),
-      touch(NodePath.join(root, "@yuuang/ffi-rs-win32-ia32-msvc/ffi-rs.win32-ia32-msvc.node")),
+      touch(NodePath.join(badFfiTarget, "ffi-rs.win32-ia32-msvc.node")),
       touch(NodePath.join(root, "@yuuang/ffi-rs-linux-x64-gnu/ffi-rs.linux-x64-gnu.node")),
       touch(NodePath.join(root, "@yuuang/ffi-rs-linux-x64-musl/ffi-rs.linux-x64-musl.node")),
       touch(NodePath.join(root, "node-pty/package.json")),
@@ -46,6 +50,12 @@ describe("desktop-after-pack-prune", () => {
       touch(NodePath.join(root, "node-pty/third_party/conpty/1.23/win10-x64/OpenConsole.exe")),
       touch(NodePath.join(root, "node-pty/third_party/conpty/1.23/win10-arm64/OpenConsole.exe")),
     ]);
+    await NodeFSP.mkdir(NodePath.join(root, "@yuuang"), { recursive: true });
+    await NodeFSP.symlink(
+      badFfiTarget,
+      NodePath.join(root, "@yuuang/ffi-rs-win32-ia32-msvc"),
+      "dir",
+    );
 
     await afterPack({
       appOutDir: tempDir,
@@ -77,6 +87,7 @@ describe("desktop-after-pack-prune", () => {
     await expect(exists(NodePath.join(root, "@yuuang/ffi-rs-win32-ia32-msvc"))).resolves.toBe(
       false,
     );
+    await expect(exists(badFfiTarget)).resolves.toBe(false);
     await expect(exists(NodePath.join(root, "@yuuang/ffi-rs-linux-x64-musl"))).resolves.toBe(false);
 
     await expect(exists(NodePath.join(root, "node-pty/lib/index.js"))).resolves.toBe(true);

@@ -32,6 +32,40 @@ async function removePath(path) {
   await NodeFSP.rm(path, { recursive: true, force: true });
 }
 
+function isPathInside(parentPath, childPath) {
+  const relative = NodePath.relative(parentPath, childPath);
+  return relative !== "" && !relative.startsWith("..") && !NodePath.isAbsolute(relative);
+}
+
+async function isDirectoryLike(path, entry) {
+  if (entry.isDirectory()) {
+    return true;
+  }
+  if (!entry.isSymbolicLink()) {
+    return false;
+  }
+  try {
+    return (await NodeFSP.stat(path)).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
+async function removePackageDirectory(path, unpackedRoot) {
+  const stat = await NodeFSP.lstat(path).catch(() => null);
+  if (stat === null) {
+    return;
+  }
+
+  const linkedTarget = stat.isSymbolicLink()
+    ? await NodeFSP.realpath(path).catch(() => null)
+    : null;
+  await removePath(path);
+  if (linkedTarget !== null && isPathInside(unpackedRoot, linkedTarget)) {
+    await removePath(linkedTarget);
+  }
+}
+
 async function listEntries(path) {
   try {
     return await NodeFSP.readdir(path, { withFileTypes: true });
@@ -160,14 +194,14 @@ function shouldKeepNativePackageDirectory(platform, archName, packageName) {
   return true;
 }
 
-async function pruneScopedNativePackages(scopeDir, platform, archName) {
+async function pruneScopedNativePackages(unpackedRoot, scopeDir, platform, archName) {
   for (const entry of await listEntries(scopeDir)) {
     const entryPath = NodePath.join(scopeDir, entry.name);
-    if (!entry.isDirectory()) {
+    if (!(await isDirectoryLike(entryPath, entry))) {
       continue;
     }
     if (!shouldKeepNativePackageDirectory(platform, archName, entry.name)) {
-      await removePath(entryPath);
+      await removePackageDirectory(entryPath, unpackedRoot);
     }
   }
   await removeEmptyDirectories(scopeDir);
@@ -181,9 +215,14 @@ async function pruneNativeSidecars(root, platform, arch) {
 
   const nodeModulesDir = NodePath.join(root, "node_modules");
   await Promise.all([
-    pruneScopedNativePackages(NodePath.join(nodeModulesDir, "@anthropic-ai"), platform, archName),
-    pruneScopedNativePackages(NodePath.join(nodeModulesDir, "@ff-labs"), platform, archName),
-    pruneScopedNativePackages(NodePath.join(nodeModulesDir, "@yuuang"), platform, archName),
+    pruneScopedNativePackages(
+      root,
+      NodePath.join(nodeModulesDir, "@anthropic-ai"),
+      platform,
+      archName,
+    ),
+    pruneScopedNativePackages(root, NodePath.join(nodeModulesDir, "@ff-labs"), platform, archName),
+    pruneScopedNativePackages(root, NodePath.join(nodeModulesDir, "@yuuang"), platform, archName),
   ]);
 }
 

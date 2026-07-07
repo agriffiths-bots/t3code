@@ -14,15 +14,15 @@ describe("desktop Vite packaging", () => {
     expect(shouldBundleDesktopMainDependency("@clerk/electron")).toBe(true);
     expect(shouldBundleDesktopMainDependency("@clerk/electron/storage")).toBe(true);
     expect(shouldBundleDesktopMainDependency("electron-store")).toBe(true);
-    expect(shouldBundleDesktopMainDependency("playwright-core")).toBe(true);
   });
 
-  it("leaves Electron and native runtime packages external", () => {
+  it("leaves Electron and filesystem runtime packages external", () => {
     expect(shouldBundleDesktopMainDependency("electron")).toBe(false);
     expect(shouldBundleDesktopMainDependency("node:fs")).toBe(false);
     expect(shouldBundleDesktopMainDependency("@clerk/electron-passkeys")).toBe(false);
     expect(shouldBundleDesktopMainDependency("@clerk/electron-passkeys-win32-x64-msvc")).toBe(
       false,
     );
+    expect(shouldBundleDesktopMainDependency("playwright-core")).toBe(false);
   });
 });

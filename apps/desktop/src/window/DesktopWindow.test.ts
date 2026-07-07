@@ -133,11 +133,13 @@ const electronMenuLayer = Layer.succeed(ElectronMenu.ElectronMenu, {
   showContextMenu: () => Effect.succeed(Option.none()),
 } satisfies ElectronMenu.ElectronMenu["Service"]);
 
-const electronThemeLayer = Layer.succeed(ElectronTheme.ElectronTheme, {
+const electronThemeService = {
   shouldUseDarkColors: Effect.succeed(false),
   setSource: () => Effect.void,
   onUpdated: () => Effect.void,
-} satisfies ElectronTheme.ElectronTheme["Service"]);
+} satisfies ElectronTheme.ElectronTheme["Service"];
+
+const electronThemeLayer = Layer.succeed(ElectronTheme.ElectronTheme, electronThemeService);
 
 const desktopEnvironmentLayer = DesktopEnvironment.layer(environmentInput).pipe(
   Layer.provide(
@@ -157,6 +159,7 @@ function makeTestLayer(input: {
   readonly mainWindow: Ref.Ref<Option.Option<Electron.BrowserWindow>>;
   readonly createdWindowOptions?: Electron.BrowserWindowConstructorOptions[];
   readonly openedExternalUrls?: unknown[];
+  readonly electronTheme?: ElectronTheme.ElectronTheme["Service"];
 }) {
   const electronWindowLayer = Layer.succeed(ElectronWindow.ElectronWindow, {
     create: (options) =>
@@ -194,7 +197,7 @@ function makeTestLayer(input: {
             }),
           copyText: () => Effect.void,
         } satisfies ElectronShell.ElectronShell["Service"]),
-        electronThemeLayer,
+        Layer.succeed(ElectronTheme.ElectronTheme, input.electronTheme ?? electronThemeService),
         electronWindowLayer,
         Layer.mock(PreviewManager.PreviewManager)({
           getBrowserSession: () => Effect.succeed({} as Electron.Session),
@@ -597,6 +600,46 @@ describe("DesktopWindow", () => {
         assert.deepEqual(fakeWindow.loadURL.mock.calls.at(-1), ["t3code-dev://app/"]);
       }).pipe(Effect.provide(layer));
     }),
+  );
+
+  it.effect(
+    "does not overwrite the app when readiness arrives during backend timeout display",
+    () =>
+      Effect.gen(function* () {
+        const fakeWindow = makeFakeBrowserWindow();
+        const createCount = yield* Ref.make(0);
+        const mainWindow = yield* Ref.make<Option.Option<Electron.BrowserWindow>>(Option.none());
+        let desktopWindowRef: DesktopWindow.DesktopWindow["Service"] | undefined;
+        const layer = makeTestLayer({
+          window: fakeWindow.window,
+          createCount,
+          mainWindow,
+          electronTheme: {
+            shouldUseDarkColors: Effect.gen(function* () {
+              if (desktopWindowRef !== undefined) {
+                yield* desktopWindowRef
+                  .handleBackendReady(new URL("http://127.0.0.1:3773"))
+                  .pipe(Effect.orDie);
+              }
+              return false;
+            }),
+            setSource: () => Effect.void,
+            onUpdated: () => Effect.void,
+          },
+        });
+
+        yield* Effect.gen(function* () {
+          const desktopWindow = yield* DesktopWindow.DesktopWindow;
+
+          yield* desktopWindow.activate;
+          fakeWindow.loadURL.mockClear();
+          desktopWindowRef = desktopWindow;
+
+          yield* desktopWindow.showBackendStartupError("backend timeout");
+
+          assert.deepEqual(fakeWindow.loadURL.mock.calls, [["t3code-dev://app/"]]);
+        }).pipe(Effect.provide(layer));
+      }),
   );
 
   it.effect("does not dispatch menu actions to the splash before the backend is ready", () =>
