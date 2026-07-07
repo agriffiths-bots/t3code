@@ -123,28 +123,16 @@ export function AgentActivity(
       ? phaseTint(failedRow.phase)
       : tint;
 
-  // With nothing active the aggregate only carries recently finished work, so
-  // "0 active agents" (and a lone "0" in the expanded island) read as broken.
-  // Lead with the outcome instead. The outcome is derived here from the rows
-  // rather than taken from the server subtitle (which keys off the newest
-  // terminal row): every presentation — header text, tint, count slots,
-  // minimal glyph — must agree, and a failure anywhere should dominate a
-  // newer success.
-  const allDone = props.activeCount === 0;
-  const doneLabel = failedRow ? "Failed" : "Done";
-  const outcomeLabel = failedRow ? "Agent work failed" : "Agent work completed";
-
   // Header copy: "5 active agents" + (", 1 needs attention"). The banner renders
   // the two parts in-line so the attention half can carry the accent color;
   // `summary` is the short form for tight spots (expanded center, watch card).
   const agentWord = props.activeCount === 1 ? "agent" : "agents";
-  const agentsLabel = allDone ? outcomeLabel : `${props.activeCount} active ${agentWord}`;
+  const agentsLabel = `${props.activeCount} active ${agentWord}`;
   const attentionSuffix =
     attentionRows.length > 0
       ? `${attentionRows.length} need${attentionRows.length === 1 ? "s" : ""} attention`
       : "";
-  const activeLabel = allDone ? doneLabel : `${props.activeCount} active`;
-  const summary = attentionSuffix || activeLabel;
+  const summary = attentionSuffix || `${props.activeCount} active`;
 
   // Any registered scheme variant routes back to this app; taps are delivered
   // to the widget's containing app, so the prod scheme is safe for all builds.
@@ -153,6 +141,8 @@ export function AgentActivity(
     deepLinkRow && deepLinkRow.deepLink.startsWith("/") && !deepLinkRow.deepLink.startsWith("//")
       ? `t3code://${deepLinkRow.deepLink.slice(1)}`
       : null;
+
+  const activeLabel = `${props.activeCount} active`;
 
   // A scannable status glyph per phase — reads faster than colored words and
   // ties the compact / expanded / banner / watch presentations together.
@@ -255,9 +245,7 @@ export function AgentActivity(
             <Text
               modifiers={[
                 font({ weight: "semibold", size: 13 }),
-                // The all-done header carries the outcome tint (emerald /
-                // red) the way the Done/Failed status labels do.
-                foregroundStyle(allDone ? headerTint : primaryForeground),
+                foregroundStyle(primaryForeground),
                 lineLimit(1),
               ]}
             >
@@ -334,17 +322,16 @@ export function AgentActivity(
       </Text>
     ),
     // The shared/minimal form is a ~22pt circle — a single signal reads there,
-    // the wordmark does not. Show the blocking/outcome phase glyph, else the
-    // mark (all-done shows the hero row's checkmark/cross).
+    // the wordmark does not. Show the blocking phase glyph, else the mark.
     minimal:
-      (attentionRow || failedRow || allDone) && heroRow
+      attentionRow || failedRow
         ? renderGlyph(phaseSymbol(heroRow.phase), 13, phaseTint(heroRow.phase))
         : renderLogo(11, tint),
     expandedLeading: (
       <HStack spacing={5} alignment="center" modifiers={[padding({ leading: 4, vertical: 4 })]}>
         {renderLogo(15, tint)}
         <Text modifiers={[font({ weight: "bold", size: 13 }), foregroundStyle(tint)]}>
-          {allDone ? doneLabel : `${props.activeCount}`}
+          {`${props.activeCount}`}
         </Text>
       </HStack>
     ),
