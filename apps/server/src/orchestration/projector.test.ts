@@ -549,10 +549,32 @@ describe("orchestration projector", () => {
         }),
       );
 
-      const afterSecond = yield* projectEvent(
+      const afterFirstCheckpoint = yield* projectEvent(
         afterFirst,
         makeEvent({
           sequence: 3,
+          type: "thread.turn-diff-completed",
+          aggregateKind: "thread",
+          aggregateId: "thread-1",
+          occurredAt: "2026-02-23T09:30:02.000Z",
+          commandId: "cmd-first-checkpoint",
+          payload: {
+            threadId: "thread-1",
+            turnId: "turn-1",
+            checkpointTurnCount: 1,
+            checkpointRef: "refs/t3/checkpoints/thread-1/turn/1",
+            status: "ready",
+            files: [],
+            assistantMessageId: "assistant:session-1:segment:0",
+            completedAt: "2026-02-23T09:30:02.000Z",
+          },
+        }),
+      );
+
+      const afterSecond = yield* projectEvent(
+        afterFirstCheckpoint,
+        makeEvent({
+          sequence: 4,
           type: "thread.message-sent",
           aggregateKind: "thread",
           aggregateId: "thread-1",
@@ -576,6 +598,79 @@ describe("orchestration projector", () => {
       expect(message?.text).toBe("second turn assistant");
       expect(message?.attachments).toBeUndefined();
       expect(message?.createdAt).toBe(secondAt);
+      expect(afterSecond.threads[0]?.checkpoints[0]?.assistantMessageId).toBeNull();
+      expect(afterSecond.threads[0]?.latestTurn?.assistantMessageId).toBeNull();
+
+      const afterSecondSession = yield* projectEvent(
+        afterSecond,
+        makeEvent({
+          sequence: 5,
+          type: "thread.session-set",
+          aggregateKind: "thread",
+          aggregateId: "thread-1",
+          occurredAt: "2026-02-23T09:31:15.000Z",
+          commandId: "cmd-second-session",
+          payload: {
+            threadId: "thread-1",
+            session: {
+              threadId: "thread-1",
+              status: "running",
+              providerName: "cursor",
+              runtimeMode: "full-access",
+              activeTurnId: "turn-2",
+              lastError: null,
+              updatedAt: "2026-02-23T09:31:15.000Z",
+            },
+          },
+        }),
+      );
+
+      const afterDelayedCheckpoint = yield* projectEvent(
+        afterSecondSession,
+        makeEvent({
+          sequence: 6,
+          type: "thread.turn-diff-completed",
+          aggregateKind: "thread",
+          aggregateId: "thread-1",
+          occurredAt: "2026-02-23T09:31:30.000Z",
+          commandId: "cmd-delayed-first-checkpoint",
+          payload: {
+            threadId: "thread-1",
+            turnId: "turn-1",
+            checkpointTurnCount: 1,
+            checkpointRef: "refs/t3/checkpoints/thread-1/turn/1-delayed",
+            status: "ready",
+            files: [],
+            assistantMessageId: "assistant:session-1:segment:0",
+            completedAt: "2026-02-23T09:31:30.000Z",
+          },
+        }),
+      );
+
+      expect(afterDelayedCheckpoint.threads[0]?.checkpoints[0]?.assistantMessageId).toBeNull();
+      expect(afterDelayedCheckpoint.threads[0]?.latestTurn?.turnId).toBe("turn-2");
+      expect(afterDelayedCheckpoint.threads[0]?.latestTurn?.assistantMessageId).toBe(
+        "assistant:session-1:segment:0",
+      );
+
+      const afterRevert = yield* projectEvent(
+        afterDelayedCheckpoint,
+        makeEvent({
+          sequence: 7,
+          type: "thread.reverted",
+          aggregateKind: "thread",
+          aggregateId: "thread-1",
+          occurredAt: "2026-02-23T09:32:00.000Z",
+          commandId: "cmd-revert",
+          payload: {
+            threadId: "thread-1",
+            turnCount: 1,
+          },
+        }),
+      );
+
+      expect(afterRevert.threads[0]?.messages).toHaveLength(0);
+      expect(afterRevert.threads[0]?.latestTurn?.assistantMessageId).toBeNull();
     }),
   );
 

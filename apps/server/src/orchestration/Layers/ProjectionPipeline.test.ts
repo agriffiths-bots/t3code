@@ -248,6 +248,28 @@ it.layer(
       });
 
       yield* eventStore.append({
+        type: "thread.turn-diff-completed",
+        eventId: EventId.make("evt-reused-message-first-checkpoint"),
+        aggregateKind: "thread",
+        aggregateId: threadId,
+        occurredAt: "2026-01-01T00:00:02.000Z",
+        commandId: CommandId.make("cmd-reused-message-first-checkpoint"),
+        causationEventId: null,
+        correlationId: CorrelationId.make("cmd-reused-message-first-checkpoint"),
+        metadata: {},
+        payload: {
+          threadId,
+          turnId: firstTurnId,
+          checkpointTurnCount: 1,
+          checkpointRef: CheckpointRef.make("refs/t3/checkpoints/thread-reused/turn/1"),
+          status: "ready",
+          files: [],
+          assistantMessageId: messageId,
+          completedAt: "2026-01-01T00:00:02.000Z",
+        },
+      });
+
+      yield* eventStore.append({
         type: "thread.message-sent",
         eventId: EventId.make("evt-reused-message-second"),
         aggregateKind: "thread",
@@ -266,6 +288,52 @@ it.layer(
           streaming: true,
           createdAt: secondAt,
           updatedAt: secondAt,
+        },
+      });
+
+      yield* eventStore.append({
+        type: "thread.session-set",
+        eventId: EventId.make("evt-reused-message-second-session"),
+        aggregateKind: "thread",
+        aggregateId: threadId,
+        occurredAt: "2026-01-01T00:01:15.000Z",
+        commandId: CommandId.make("cmd-reused-message-second-session"),
+        causationEventId: null,
+        correlationId: CorrelationId.make("cmd-reused-message-second-session"),
+        metadata: {},
+        payload: {
+          threadId,
+          session: {
+            threadId,
+            status: "running",
+            providerName: "cursor",
+            runtimeMode: "full-access",
+            activeTurnId: secondTurnId,
+            lastError: null,
+            updatedAt: "2026-01-01T00:01:15.000Z",
+          },
+        },
+      });
+
+      yield* eventStore.append({
+        type: "thread.turn-diff-completed",
+        eventId: EventId.make("evt-reused-message-delayed-first-checkpoint"),
+        aggregateKind: "thread",
+        aggregateId: threadId,
+        occurredAt: "2026-01-01T00:01:30.000Z",
+        commandId: CommandId.make("cmd-reused-message-delayed-first-checkpoint"),
+        causationEventId: null,
+        correlationId: CorrelationId.make("cmd-reused-message-delayed-first-checkpoint"),
+        metadata: {},
+        payload: {
+          threadId,
+          turnId: firstTurnId,
+          checkpointTurnCount: 1,
+          checkpointRef: CheckpointRef.make("refs/t3/checkpoints/thread-reused/turn/1-delayed"),
+          status: "ready",
+          files: [],
+          assistantMessageId: messageId,
+          completedAt: "2026-01-01T00:01:30.000Z",
         },
       });
 
@@ -297,6 +365,58 @@ it.layer(
           createdAt: secondAt,
         },
       ]);
+
+      const turnRows = yield* sql<{
+        readonly turnId: string;
+        readonly assistantMessageId: string | null;
+      }>`
+        SELECT
+          turn_id AS "turnId",
+          assistant_message_id AS "assistantMessageId"
+        FROM projection_turns
+        WHERE thread_id = ${threadId}
+        ORDER BY turn_id ASC
+      `;
+      assert.deepEqual(turnRows, [
+        { turnId: "turn-1", assistantMessageId: null },
+        { turnId: "turn-2", assistantMessageId: "assistant:mock-session-1:segment:0" },
+      ]);
+
+      const threadRows = yield* sql<{
+        readonly latestTurnId: string | null;
+      }>`
+        SELECT latest_turn_id AS "latestTurnId"
+        FROM projection_threads
+        WHERE thread_id = ${threadId}
+      `;
+      assert.deepEqual(threadRows, [{ latestTurnId: "turn-2" }]);
+
+      const revertEvent = yield* eventStore.append({
+        type: "thread.reverted",
+        eventId: EventId.make("evt-reused-message-revert"),
+        aggregateKind: "thread",
+        aggregateId: threadId,
+        occurredAt: "2026-01-01T00:02:00.000Z",
+        commandId: CommandId.make("cmd-reused-message-revert"),
+        causationEventId: null,
+        correlationId: CorrelationId.make("cmd-reused-message-revert"),
+        metadata: {},
+        payload: {
+          threadId,
+          turnCount: 1,
+        },
+      });
+      yield* projectionPipeline.projectEvent(revertEvent);
+
+      const rowsAfterRevert = yield* sql<{
+        readonly messageId: string;
+      }>`
+        SELECT message_id AS "messageId"
+        FROM projection_thread_messages
+        WHERE thread_id = ${threadId}
+        ORDER BY message_id ASC
+      `;
+      assert.deepEqual(rowsAfterRevert, []);
     }),
   );
 });
