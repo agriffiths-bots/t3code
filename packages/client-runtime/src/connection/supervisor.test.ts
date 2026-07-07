@@ -605,6 +605,31 @@ describe("EnvironmentSupervisor", () => {
     }),
   );
 
+  it.effect("does not cancel a fresh online reconnect with an already queued active wakeup", () =>
+    Effect.gen(function* () {
+      const firstAttemptStarted = yield* Deferred.make<void>();
+      const harness = yield* makeHarness({
+        networkStatus: "offline",
+        prepare: () =>
+          Deferred.succeed(firstAttemptStarted, undefined).pipe(Effect.andThen(Effect.never)),
+      });
+      const supervisor = yield* EnvironmentSupervisor.make(TARGET_ENTRY, {
+        initiallyDesired: true,
+      }).pipe(Effect.provide(harness.dependencies));
+
+      yield* awaitState(supervisor.state, (state) => state.phase === "offline");
+      yield* Effect.all([harness.setNetworkStatus("online"), harness.wake("application-active")], {
+        concurrency: "unbounded",
+      });
+      yield* Deferred.await(firstAttemptStarted);
+      yield* Effect.yieldNow;
+
+      expect(yield* Ref.get(harness.prepareCount)).toBe(1);
+      expect(yield* Ref.get(harness.sessionCount)).toBe(0);
+      expect((yield* SubscriptionRef.get(supervisor.state)).phase).toBe("connecting");
+    }),
+  );
+
   it.effect("treats an involuntary session close as transient and reconnects", () =>
     Effect.gen(function* () {
       const harness = yield* makeHarness();
