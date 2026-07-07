@@ -3,6 +3,7 @@ import {
   type OrchestrationCommand,
   type OrchestrationEvent,
   type OrchestrationReadModel,
+  type ThreadId,
 } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
 import * as Crypto from "effect/Crypto";
@@ -58,6 +59,45 @@ type PlannedOrchestrationEvent = Omit<OrchestrationEvent, "sequence">;
 type DecideOrchestrationCommandResult =
   | PlannedOrchestrationEvent
   | ReadonlyArray<PlannedOrchestrationEvent>;
+
+/**
+ * Every not-yet-archived descendant of `rootThreadId` (children, grandchildren,
+ * …), for archive cascade. Iterative BFS over `parentThreadId`; guards against
+ * cycles so a malformed parent chain cannot loop forever.
+ *
+ * The parent/child index is built from ALL threads (including archived ones) so
+ * that an already-archived intermediate node does not sever the subtree: we
+ * still traverse THROUGH archived nodes but only emit archive events for the
+ * unarchived descendants below them.
+ */
+function collectUnarchivedDescendantIds(
+  readModel: OrchestrationReadModel,
+  rootThreadId: ThreadId,
+): ReadonlyArray<ThreadId> {
+  const childrenByParent = new Map<ThreadId, ThreadId[]>();
+  const archivedById = new Map<ThreadId, boolean>();
+  for (const thread of readModel.threads) {
+    archivedById.set(thread.id, thread.archivedAt !== null);
+    const parentId = thread.parentThreadId ?? null;
+    if (parentId === null) continue;
+    const siblings = childrenByParent.get(parentId) ?? [];
+    siblings.push(thread.id);
+    childrenByParent.set(parentId, siblings);
+  }
+  const collected: ThreadId[] = [];
+  const seen = new Set<ThreadId>([rootThreadId]);
+  const queue: ThreadId[] = [rootThreadId];
+  while (queue.length > 0) {
+    const current = queue.shift() as ThreadId;
+    for (const childId of childrenByParent.get(current) ?? []) {
+      if (seen.has(childId)) continue;
+      seen.add(childId);
+      queue.push(childId); // traverse through archived nodes too
+      if (archivedById.get(childId) !== true) collected.push(childId);
+    }
+  }
+  return collected;
+}
 
 const decideCommandSequence = Effect.fn("decideCommandSequence")(function* ({
   commands,
@@ -278,20 +318,30 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
         threadId: command.threadId,
       });
       const occurredAt = yield* nowIso;
-      return {
-        ...(yield* withEventBase({
-          aggregateKind: "thread",
-          aggregateId: command.threadId,
-          occurredAt,
-          commandId: command.commandId,
-        })),
-        type: "thread.archived",
-        payload: {
-          threadId: command.threadId,
-          archivedAt: occurredAt,
-          updatedAt: occurredAt,
-        },
-      };
+      // Archiving a parent cascades to every not-yet-archived descendant
+      // (recursive), so a parent and its whole subtree leave the active list in
+      // one command. Already-archived descendants are skipped (idempotent).
+      const descendantIds = collectUnarchivedDescendantIds(readModel, command.threadId);
+      const archivedThreadIds = [command.threadId, ...descendantIds];
+      return yield* Effect.forEach(archivedThreadIds, (threadId) =>
+        Effect.map(
+          withEventBase({
+            aggregateKind: "thread",
+            aggregateId: threadId,
+            occurredAt,
+            commandId: command.commandId,
+          }),
+          (base) => ({
+            ...base,
+            type: "thread.archived" as const,
+            payload: {
+              threadId,
+              archivedAt: occurredAt,
+              updatedAt: occurredAt,
+            },
+          }),
+        ),
+      );
     }
 
     case "thread.unarchive": {

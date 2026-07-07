@@ -362,6 +362,10 @@ export const OrchestrationThread = Schema.Struct({
   createdAt: IsoDateTime,
   updatedAt: IsoDateTime,
   archivedAt: Schema.NullOr(IsoDateTime).pipe(Schema.withDecodingDefault(Effect.succeed(null))),
+  // Parent linkage in the command read model so decider logic (archive cascade)
+  // can walk the thread tree. Optional (like worktreeRemovable) so existing
+  // constructors and older snapshots stay valid; absent/null both mean "root".
+  parentThreadId: Schema.optional(Schema.NullOr(ThreadId)),
   deletedAt: Schema.NullOr(IsoDateTime),
   messages: Schema.Array(OrchestrationMessage),
   proposedPlans: Schema.Array(OrchestrationProposedPlan).pipe(
