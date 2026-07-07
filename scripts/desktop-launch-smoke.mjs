@@ -266,15 +266,60 @@ export async function readReadyMarker(filePath) {
   }
 }
 
-function appendOutput(current, streamName, chunk) {
-  const next = `${current}${streamName}: ${chunk.toString()}`;
-  return next.length > MAX_CAPTURED_OUTPUT_BYTES
-    ? next.slice(next.length - MAX_CAPTURED_OUTPUT_BYTES)
-    : next;
+function formatOutputEntry(streamName, chunk) {
+  const text = Buffer.isBuffer(chunk) ? chunk.toString("utf8") : String(chunk);
+  return `${streamName}: ${text}`;
+}
+
+export function appendOutput(current, streamName, chunk, maxBytes = MAX_CAPTURED_OUTPUT_BYTES) {
+  const entry = formatOutputEntry(streamName, chunk);
+  const next = `${current}${current ? "\n" : ""}${entry}`;
+  return next.length > maxBytes ? next.slice(next.length - maxBytes) : next;
+}
+
+function findFatalOutputMatch(output) {
+  for (const pattern of FATAL_OUTPUT_PATTERNS) {
+    pattern.lastIndex = 0;
+    const match = pattern.exec(output);
+    if (match?.index !== undefined) {
+      return { pattern, index: match.index };
+    }
+  }
+  return undefined;
+}
+
+export function captureFatalOutput(output, maxBytes = MAX_CAPTURED_OUTPUT_BYTES) {
+  const match = findFatalOutputMatch(output);
+  if (!match) {
+    return undefined;
+  }
+  if (output.length <= maxBytes) {
+    return output;
+  }
+
+  const prefix = "[output truncated before fatal]\n";
+  const suffix = "\n[output truncated after fatal]";
+  const markerBytes = prefix.length + suffix.length;
+  const windowBytes = Math.max(1, maxBytes - markerBytes);
+  const contextBeforeBytes = Math.floor(windowBytes / 3);
+  const start = Math.max(0, match.index - contextBeforeBytes);
+  const end = Math.min(output.length, start + windowBytes);
+  const adjustedStart = Math.max(0, end - windowBytes);
+  const truncatedPrefix = adjustedStart > 0 ? prefix : "";
+  const truncatedSuffix = end < output.length ? suffix : "";
+
+  return `${truncatedPrefix}${output.slice(adjustedStart, end)}${truncatedSuffix}`;
 }
 
 function outputHasFatalPattern(output) {
-  return FATAL_OUTPUT_PATTERNS.find((pattern) => pattern.test(output));
+  return findFatalOutputMatch(output)?.pattern;
+}
+
+function appendOutputEntry(current, entry) {
+  const next = `${current}${current ? "\n" : ""}${entry}`;
+  return next.length > MAX_CAPTURED_OUTPUT_BYTES
+    ? next.slice(next.length - MAX_CAPTURED_OUTPUT_BYTES)
+    : next;
 }
 
 function signalProcessTree(child, signal) {
@@ -402,10 +447,14 @@ async function main() {
   let fatalOutput = "";
   let exit = null;
   const recordOutput = (streamName, chunk) => {
-    output = appendOutput(output, streamName, chunk);
-    if (!fatalOutput && outputHasFatalPattern(output)) {
-      fatalOutput = output;
+    const entry = formatOutputEntry(streamName, chunk);
+    if (!fatalOutput) {
+      const candidate = captureFatalOutput(`${output}${output ? "\n" : ""}${entry}`);
+      if (candidate) {
+        fatalOutput = candidate;
+      }
     }
+    output = appendOutputEntry(output, entry);
   };
   const diagnosticOutput = () =>
     fatalOutput
