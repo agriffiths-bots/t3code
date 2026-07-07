@@ -537,7 +537,7 @@ describe("deriveMessagesTimelineRows", () => {
     expect(systemRow?.revertTurnCount).toBe(1);
   });
 
-  it("folds settled-turn commentary and work behind a Worked-for row", () => {
+  it("folds settled-turn work while keeping assistant text visible", () => {
     const timelineEntries = [
       {
         id: "user-entry",
@@ -613,6 +613,7 @@ describe("deriveMessagesTimelineRows", () => {
     expect(foldRow?.label).toBe("Worked for 22s");
     expect(collapsedRows.map((row) => row.id)).toEqual([
       "user-entry",
+      "assistant-thought-entry",
       "turn-fold:turn-1",
       "assistant-final-entry",
     ]);
@@ -628,14 +629,118 @@ describe("deriveMessagesTimelineRows", () => {
 
     expect(expandedRows.map((row) => row.id)).toEqual([
       "user-entry",
-      "turn-fold:turn-1",
       "assistant-thought-entry",
+      "turn-fold:turn-1",
       "work-entry-1",
       "assistant-final-entry",
     ]);
     expect(
       expandedRows.find((row) => row.kind === "turn-fold" && row.expanded === true),
     ).toBeDefined();
+  });
+
+  it("renders every interleaved assistant text block exactly once in order", () => {
+    const timelineEntries = [
+      {
+        id: "user-entry",
+        kind: "message" as const,
+        createdAt: "2026-01-01T00:00:00Z",
+        message: {
+          id: "user-1" as never,
+          role: "user" as const,
+          text: "Diagnose it",
+          turnId: null,
+          createdAt: "2026-01-01T00:00:00Z",
+          updatedAt: "2026-01-01T00:00:00Z",
+          streaming: false,
+        },
+      },
+      {
+        id: "assistant-1-entry",
+        kind: "message" as const,
+        createdAt: "2026-01-01T00:00:05Z",
+        message: {
+          id: "assistant-1" as never,
+          role: "assistant" as const,
+          text: "I will inspect the first path.",
+          turnId: "turn-1" as never,
+          createdAt: "2026-01-01T00:00:05Z",
+          updatedAt: "2026-01-01T00:00:05Z",
+          streaming: false,
+        },
+      },
+      {
+        id: "work-1-entry",
+        kind: "work" as const,
+        createdAt: "2026-01-01T00:00:06Z",
+        entry: {
+          id: "work-1",
+          createdAt: "2026-01-01T00:00:06Z",
+          turnId: "turn-1" as never,
+          label: "Read file",
+          tone: "tool" as const,
+        },
+      },
+      {
+        id: "assistant-2-entry",
+        kind: "message" as const,
+        createdAt: "2026-01-01T00:00:10Z",
+        message: {
+          id: "assistant-2" as never,
+          role: "assistant" as const,
+          text: "That points at the reducer.",
+          turnId: "turn-1" as never,
+          createdAt: "2026-01-01T00:00:10Z",
+          updatedAt: "2026-01-01T00:00:10Z",
+          streaming: false,
+        },
+      },
+      {
+        id: "work-2-entry",
+        kind: "work" as const,
+        createdAt: "2026-01-01T00:00:12Z",
+        entry: {
+          id: "work-2",
+          createdAt: "2026-01-01T00:00:12Z",
+          turnId: "turn-1" as never,
+          label: "Ran test",
+          tone: "tool" as const,
+        },
+      },
+      {
+        id: "assistant-3-entry",
+        kind: "message" as const,
+        createdAt: "2026-01-01T00:00:20Z",
+        message: {
+          id: "assistant-3" as never,
+          role: "assistant" as const,
+          text: "Final answer.",
+          turnId: "turn-1" as never,
+          createdAt: "2026-01-01T00:00:20Z",
+          updatedAt: "2026-01-01T00:00:20Z",
+          streaming: false,
+        },
+      },
+    ];
+
+    const rows = deriveMessagesTimelineRows({
+      timelineEntries,
+      isWorking: false,
+      activeTurnStartedAt: null,
+      turnDiffSummaryByAssistantMessageId: new Map(),
+      revertTurnCountByUserMessageId: new Map(),
+    });
+
+    expect(
+      rows
+        .filter(
+          (row): row is Extract<(typeof rows)[number], { kind: "message" }> =>
+            row.kind === "message" && row.message.role === "assistant",
+        )
+        .map((row) => row.message.text),
+    ).toEqual(["I will inspect the first path.", "That points at the reducer.", "Final answer."]);
+    expect(rows.filter((row) => row.kind === "turn-fold")).toHaveLength(1);
+    expect(rows.some((row) => row.id === "work-1-entry" || row.id === "work-2-entry")).toBe(false);
   });
 
   it("keeps every assistant block visible when a turn has no work entries", () => {
@@ -803,6 +908,7 @@ describe("deriveMessagesTimelineRows", () => {
 
     expect(collapsedRows.map((row) => row.id)).toEqual([
       "user-entry",
+      "assistant-preface-entry",
       "turn-fold:turn-1",
       "assistant-final-intro-entry",
       "assistant-final-body-entry",
@@ -815,6 +921,7 @@ describe("deriveMessagesTimelineRows", () => {
         )
         .map((row) => [row.message.text, row.showAssistantMeta]),
     ).toEqual([
+      ["I will inspect first.", false],
       ["First final section.", false],
       ["Second final section.", true],
     ]);
@@ -830,8 +937,8 @@ describe("deriveMessagesTimelineRows", () => {
 
     expect(expandedRows.map((row) => row.id)).toEqual([
       "user-entry",
-      "turn-fold:turn-1",
       "assistant-preface-entry",
+      "turn-fold:turn-1",
       "work-entry-1",
       "assistant-final-intro-entry",
       "assistant-final-body-entry",
