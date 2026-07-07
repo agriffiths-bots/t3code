@@ -73,6 +73,7 @@ function makePoolLayer(
           revealOrCreateMain: Effect.die("unexpected window reveal"),
           activate: Effect.die("unexpected window activate"),
           createMainIfBackendReady: Effect.die("unexpected window create"),
+          showBackendStartupError: () => Effect.die("unexpected backend startup error"),
           showConnectingSplash: Effect.void,
           handleBackendReady: () => Effect.void,
           handleBackendNotReady: Effect.void,
@@ -113,9 +114,7 @@ describe("DesktopBackendPool", () => {
 
   it.effect("layerTest dies when no instances are supplied", () =>
     Effect.exit(
-      Effect.gen(function* () {
-        yield* DesktopBackendPool.DesktopBackendPool;
-      }).pipe(Effect.provide(DesktopBackendPool.layerTest([]))),
+      DesktopBackendPool.DesktopBackendPool.pipe(Effect.provide(DesktopBackendPool.layerTest([]))),
     ).pipe(Effect.map((exit) => assert.equal(exit._tag, "Failure"))),
   );
 

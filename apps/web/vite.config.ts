@@ -37,6 +37,8 @@ const configuredHostedAppUrl = (() => {
   return undefined;
 })();
 const sourcemapEnv = process.env.T3CODE_WEB_SOURCEMAP?.trim().toLowerCase();
+const desktopPackageBuildEnv = process.env.T3CODE_DESKTOP_PACKAGE?.trim().toLowerCase();
+const desktopPackageBuild = desktopPackageBuildEnv === "1" || desktopPackageBuildEnv === "true";
 
 // Vite 8.1's experimental bundled dev mode: serves rolldown-bundled chunks in
 // dev for much faster startup/reload on large module graphs, with HMR served
@@ -45,11 +47,26 @@ const bundledDevEnv = process.env.T3CODE_BUNDLED_DEV?.trim().toLowerCase();
 const bundledDev = bundledDevEnv === "1" || bundledDevEnv === "true";
 
 const buildSourcemap: boolean | "hidden" =
-  sourcemapEnv === "0" || sourcemapEnv === "false"
+  desktopPackageBuild || sourcemapEnv === "0" || sourcemapEnv === "false"
     ? false
     : sourcemapEnv === "hidden"
       ? "hidden"
       : true;
+
+function desktopPackageManualChunks(id: string): string | undefined {
+  if (!desktopPackageBuild) return undefined;
+  const normalized = id.replaceAll("\\", "/");
+  if (
+    normalized.includes("/node_modules/@shikijs/") ||
+    normalized.includes("/node_modules/shiki/")
+  ) {
+    return "syntax";
+  }
+  if (normalized.includes("/node_modules/@pierre/diffs/")) {
+    return "diffs";
+  }
+  return undefined;
+}
 
 const unitTestProject = {
   extends: true,
@@ -172,6 +189,15 @@ export default defineConfig(() => {
       outDir: "dist",
       emptyOutDir: true,
       sourcemap: buildSourcemap,
+      ...(desktopPackageBuild
+        ? {
+            rollupOptions: {
+              output: {
+                manualChunks: desktopPackageManualChunks,
+              },
+            },
+          }
+        : {}),
     },
     test: {
       projects: [defineProject(unitTestProject)],

@@ -216,7 +216,16 @@ jobs:
           "install_dir=$installDir" >> $env:GITHUB_OUTPUT
           Write-Host "Installed desktop executable: $($appExe.FullName)"
 
-      - name: Assert launch smoke rejects missing packaged main dependency
+      - name: Assert minimal unpacked desktop footprint
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $unpackedRoot = Join-Path "${{ steps.install.outputs.install_dir }}" "resources/app.asar.unpacked"
+          node scripts/desktop-unpacked-footprint.mjs `
+            --root "$unpackedRoot" `
+            --max-files 250
+
+      - name: Assert launch smoke rejects missing unpacked backend entry
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
@@ -231,11 +240,11 @@ jobs:
           Copy-Item -Recurse -Force (Join-Path $cleanInstallDir "*") $brokenInstallDir
 
           $brokenAppExe = Join-Path $brokenInstallDir (Split-Path -Leaf $cleanAppExe)
-          $removedDependency = Join-Path $brokenInstallDir "resources/app.asar.unpacked/node_modules/electron-updater"
-          if (-not (Test-Path $removedDependency)) {
-            throw "Negative launch-smoke fixture could not find packaged dependency to remove: $removedDependency"
+          $removedBackendEntry = Join-Path $brokenInstallDir "resources/app.asar.unpacked/apps/server/dist/bin.mjs"
+          if (-not (Test-Path $removedBackendEntry)) {
+            throw "Negative launch-smoke fixture could not find packaged backend entry to remove: $removedBackendEntry"
           }
-          Remove-Item -Recurse -Force $removedDependency
+          Remove-Item -Force $removedBackendEntry
 
           $output = & node scripts/desktop-launch-smoke.mjs --command "$brokenAppExe" --timeout-ms 45000 --stability-ms 1000 2>&1
           $exitCode = $LASTEXITCODE
@@ -243,10 +252,10 @@ jobs:
           $output | ForEach-Object { Write-Host $_ }
 
           if ($exitCode -eq 0) {
-            throw "Launch smoke passed against a packaged artifact with electron-updater removed; the gate is not trustworthy."
+            throw "Launch smoke passed against a packaged artifact with the backend entry removed; the gate is not trustworthy."
           }
-          if ($outputText -notmatch "(?i)(electron-updater|ERR_MODULE_NOT_FOUND|MODULE_NOT_FOUND|Cannot find module)") {
-            throw "Launch smoke failed against the broken packaged artifact, but did not report the expected missing electron-updater dependency."
+          if ($outputText -notmatch "(?i)(apps/server/dist/bin\.mjs|missing server entry|backend|timed out)") {
+            throw "Launch smoke failed against the broken packaged artifact, but did not report the expected missing backend entry."
           }
 
           Write-Host "Launch smoke rejected the deliberately broken packaged artifact with exit code $exitCode."

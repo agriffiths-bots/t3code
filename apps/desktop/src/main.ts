@@ -53,6 +53,30 @@ import * as DesktopWindow from "./window/DesktopWindow.ts";
 import * as DesktopWslBackend from "./wsl/DesktopWslBackend.ts";
 import * as DesktopWslEnvironment from "./wsl/DesktopWslEnvironment.ts";
 
+type DesktopMainEntryState = {
+  started: boolean;
+};
+
+const DESKTOP_MAIN_ENTRY_STATE_PROPERTY = "__t3toolsDesktopMainEntryState";
+
+function desktopMainEntryState(): DesktopMainEntryState {
+  const globalState = globalThis as typeof globalThis & {
+    [DESKTOP_MAIN_ENTRY_STATE_PROPERTY]?: DesktopMainEntryState;
+  };
+  return (globalState[DESKTOP_MAIN_ENTRY_STATE_PROPERTY] ??= { started: false });
+}
+
+function emitDuplicateMainEntryActivation(): void {
+  setImmediate(() => {
+    const event = { preventDefault: () => {} };
+    (
+      Electron.app as Electron.App & {
+        emit: (eventName: string, ...args: Array<unknown>) => boolean;
+      }
+    ).emit("second-instance", event, process.argv, process.cwd(), {});
+  });
+}
+
 const desktopEnvironmentLayer = Layer.unwrap(
   Effect.gen(function* () {
     const metadata = yield* Effect.service(ElectronApp.ElectronApp).pipe(
@@ -197,4 +221,10 @@ const desktopRuntimeLayer = desktopClerkLayer.pipe(
   ),
 );
 
-DesktopApp.program.pipe(Effect.provide(desktopRuntimeLayer), NodeRuntime.runMain);
+const mainEntryState = desktopMainEntryState();
+if (mainEntryState.started) {
+  emitDuplicateMainEntryActivation();
+} else {
+  mainEntryState.started = true;
+  DesktopApp.program.pipe(Effect.provide(desktopRuntimeLayer), NodeRuntime.runMain);
+}

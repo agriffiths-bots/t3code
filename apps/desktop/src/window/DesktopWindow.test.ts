@@ -47,13 +47,22 @@ const environmentInput = {
 
 function makeFakeBrowserWindow() {
   const webContentsListeners = new Map<string, (...args: readonly unknown[]) => void>();
+  const addWebContentsListener = (
+    eventName: string,
+    listener: (...args: readonly unknown[]) => void,
+  ) => {
+    const previous = webContentsListeners.get(eventName);
+    webContentsListeners.set(eventName, (...args) => {
+      previous?.(...args);
+      listener(...args);
+    });
+  };
+  let currentUrl = "about:blank";
   const webContents = {
     copyImageAt: vi.fn(),
-    getURL: vi.fn(() => "t3code-dev://app/"),
+    getURL: vi.fn(() => currentUrl),
     isLoadingMainFrame: vi.fn(() => false),
-    on: vi.fn((eventName: string, listener: (...args: readonly unknown[]) => void) => {
-      webContentsListeners.set(eventName, listener);
-    }),
+    on: vi.fn(addWebContentsListener),
     once: vi.fn(),
     openDevTools: vi.fn(),
     reload: vi.fn(),
@@ -68,7 +77,10 @@ function makeFakeBrowserWindow() {
     isDestroyed: vi.fn(() => false),
     isMinimized: vi.fn(() => false),
     isVisible: vi.fn(() => true),
-    loadURL: vi.fn(() => Promise.resolve()),
+    loadURL: vi.fn((url: string) => {
+      currentUrl = url;
+      return Promise.resolve();
+    }),
     on: vi.fn(),
     once: vi.fn(),
     restore: vi.fn(),
@@ -121,11 +133,13 @@ const electronMenuLayer = Layer.succeed(ElectronMenu.ElectronMenu, {
   showContextMenu: () => Effect.succeed(Option.none()),
 } satisfies ElectronMenu.ElectronMenu["Service"]);
 
-const electronThemeLayer = Layer.succeed(ElectronTheme.ElectronTheme, {
+const electronThemeService = {
   shouldUseDarkColors: Effect.succeed(false),
   setSource: () => Effect.void,
   onUpdated: () => Effect.void,
-} satisfies ElectronTheme.ElectronTheme["Service"]);
+} satisfies ElectronTheme.ElectronTheme["Service"];
+
+const electronThemeLayer = Layer.succeed(ElectronTheme.ElectronTheme, electronThemeService);
 
 const desktopEnvironmentLayer = DesktopEnvironment.layer(environmentInput).pipe(
   Layer.provide(
@@ -145,6 +159,7 @@ function makeTestLayer(input: {
   readonly mainWindow: Ref.Ref<Option.Option<Electron.BrowserWindow>>;
   readonly createdWindowOptions?: Electron.BrowserWindowConstructorOptions[];
   readonly openedExternalUrls?: unknown[];
+  readonly electronTheme?: ElectronTheme.ElectronTheme["Service"];
 }) {
   const electronWindowLayer = Layer.succeed(ElectronWindow.ElectronWindow, {
     create: (options) =>
@@ -182,7 +197,7 @@ function makeTestLayer(input: {
             }),
           copyText: () => Effect.void,
         } satisfies ElectronShell.ElectronShell["Service"]),
-        electronThemeLayer,
+        Layer.succeed(ElectronTheme.ElectronTheme, input.electronTheme ?? electronThemeService),
         electronWindowLayer,
         Layer.mock(PreviewManager.PreviewManager)({
           getBrowserSession: () => Effect.succeed({} as Electron.Session),
@@ -307,12 +322,18 @@ describe("DesktopWindow", () => {
     assert.isFalse(
       DesktopWindow.isSameOriginRendererNavigation({
         applicationUrl: "t3code://app/",
+        navigationUrl: "data:text/html;charset=utf-8,%3Cp%3EStarting%3C%2Fp%3E",
+      }),
+    );
+    assert.isFalse(
+      DesktopWindow.isSameOriginRendererNavigation({
+        applicationUrl: "t3code://app/",
         navigationUrl: "not a url",
       }),
     );
   });
 
-  it.effect("does not open a development window until the backend is ready", () =>
+  it.effect("opens a development window before the backend and loads the app after readiness", () =>
     Effect.gen(function* () {
       const fakeWindow = makeFakeBrowserWindow();
       const createCount = yield* Ref.make(0);
@@ -328,14 +349,56 @@ describe("DesktopWindow", () => {
       yield* Effect.gen(function* () {
         const desktopWindow = yield* DesktopWindow.DesktopWindow;
         yield* desktopWindow.activate;
-        assert.equal(yield* Ref.get(createCount), 0);
-
-        yield* desktopWindow.handleBackendReady(new URL("http://127.0.0.1:3773"));
         assert.equal(yield* Ref.get(createCount), 1);
         assert.isTrue(createdWindowOptions[0]?.disableAutoHideCursor);
         assert.deepEqual(fakeWindow.setAutoHideCursor.mock.calls, [[false]]);
-        assert.deepEqual(fakeWindow.loadURL.mock.calls[0], ["t3code-dev://app/"]);
+        assert.match(String(fakeWindow.loadURL.mock.calls[0]?.[0]), /^data:text\/html/);
         assert.equal(fakeWindow.openDevTools.mock.calls.length, 1);
+
+        yield* desktopWindow.handleBackendReady(new URL("http://127.0.0.1:3773"));
+        assert.equal(yield* Ref.get(createCount), 1);
+        assert.deepEqual(fakeWindow.loadURL.mock.calls.at(-1), ["t3code-dev://app/"]);
+      }).pipe(Effect.provide(layer));
+    }),
+  );
+
+  it.effect("allows only internally generated status data navigations", () =>
+    Effect.gen(function* () {
+      const fakeWindow = makeFakeBrowserWindow();
+      const createCount = yield* Ref.make(0);
+      const mainWindow = yield* Ref.make<Option.Option<Electron.BrowserWindow>>(Option.none());
+      const openedExternalUrls: unknown[] = [];
+      const layer = makeTestLayer({
+        window: fakeWindow.window,
+        createCount,
+        mainWindow,
+        openedExternalUrls,
+      });
+
+      yield* Effect.gen(function* () {
+        const desktopWindow = yield* DesktopWindow.DesktopWindow;
+        yield* desktopWindow.activate;
+
+        const willNavigate = fakeWindow.webContentsListeners.get("will-navigate");
+        assert.isFunction(willNavigate);
+        const internalStatusUrl = fakeWindow.loadURL.mock.calls[0]?.[0] as string;
+        assert.match(internalStatusUrl, /^data:text\/html/);
+
+        const internalEvent = { preventDefault: vi.fn() };
+        willNavigate?.(internalEvent, internalStatusUrl);
+        assert.equal(internalEvent.preventDefault.mock.calls.length, 0);
+
+        const repeatedInternalEvent = { preventDefault: vi.fn() };
+        willNavigate?.(repeatedInternalEvent, internalStatusUrl);
+        assert.equal(repeatedInternalEvent.preventDefault.mock.calls.length, 1);
+
+        const maliciousEvent = { preventDefault: vi.fn() };
+        willNavigate?.(
+          maliciousEvent,
+          "data:text/html;charset=utf-8,%3Cscript%3Ewindow.desktop%3C%2Fscript%3E",
+        );
+        assert.equal(maliciousEvent.preventDefault.mock.calls.length, 1);
+        assert.deepEqual(openedExternalUrls, []);
       }).pipe(Effect.provide(layer));
     }),
   );
@@ -485,12 +548,12 @@ describe("DesktopWindow", () => {
   );
 
   it.effect(
-    "re-reveals the connecting splash on activate while the backend is still cold-booting",
+    "creates the real main window on activate while the backend is still cold-booting",
     () =>
       Effect.gen(function* () {
         const splash = makeFakeBrowserWindow();
-        // Only the splash is ever created; the backend never reports ready.
-        const scenario = yield* makeSplashScenario([splash.window]);
+        const main = makeFakeBrowserWindow();
+        const scenario = yield* makeSplashScenario([splash.window, main.window]);
 
         yield* Effect.gen(function* () {
           const desktopWindow = yield* DesktopWindow.DesktopWindow;
@@ -498,12 +561,84 @@ describe("DesktopWindow", () => {
           yield* desktopWindow.showConnectingSplash;
           assert.equal(yield* Ref.get(scenario.createCalls), 1);
 
-          // Taskbar/dock activation during cold boot must bring the splash back
-          // rather than no-op and leave it hidden until the backend finishes.
+          // Taskbar/dock activation during cold boot must open the real main
+          // window with its startup status page instead of waiting invisibly for
+          // backend readiness.
           yield* desktopWindow.activate;
-          assert.equal(yield* Ref.get(scenario.createCalls), 1);
-          assert.deepEqual(yield* Ref.get(scenario.revealedWindows), [splash.window]);
+          assert.equal(yield* Ref.get(scenario.createCalls), 2);
+          const registeredMain = yield* Ref.get(scenario.mainWindow);
+          assert.isTrue(Option.isSome(registeredMain));
+          assert.equal(Option.getOrThrow(registeredMain), main.window);
+          assert.deepEqual(yield* Ref.get(scenario.revealedWindows), [main.window]);
         }).pipe(Effect.provide(scenario.layer));
+      }),
+  );
+
+  it.effect("shows a visible backend startup error and recovers when readiness arrives", () =>
+    Effect.gen(function* () {
+      const fakeWindow = makeFakeBrowserWindow();
+      const createCount = yield* Ref.make(0);
+      const mainWindow = yield* Ref.make<Option.Option<Electron.BrowserWindow>>(Option.none());
+      const layer = makeTestLayer({
+        window: fakeWindow.window,
+        createCount,
+        mainWindow,
+      });
+
+      yield* Effect.gen(function* () {
+        const desktopWindow = yield* DesktopWindow.DesktopWindow;
+
+        yield* desktopWindow.activate;
+        assert.match(String(fakeWindow.loadURL.mock.calls[0]?.[0]), /^data:text\/html/);
+
+        yield* desktopWindow.showBackendStartupError("backend timeout");
+        assert.equal(yield* Ref.get(createCount), 1);
+        assert.match(String(fakeWindow.loadURL.mock.calls.at(-1)?.[0]), /^data:text\/html/);
+
+        yield* desktopWindow.handleBackendReady(new URL("http://127.0.0.1:3773"));
+        assert.equal(yield* Ref.get(createCount), 1);
+        assert.deepEqual(fakeWindow.loadURL.mock.calls.at(-1), ["t3code-dev://app/"]);
+      }).pipe(Effect.provide(layer));
+    }),
+  );
+
+  it.effect(
+    "does not overwrite the app when readiness arrives during backend timeout display",
+    () =>
+      Effect.gen(function* () {
+        const fakeWindow = makeFakeBrowserWindow();
+        const createCount = yield* Ref.make(0);
+        const mainWindow = yield* Ref.make<Option.Option<Electron.BrowserWindow>>(Option.none());
+        let desktopWindowRef: DesktopWindow.DesktopWindow["Service"] | undefined;
+        const layer = makeTestLayer({
+          window: fakeWindow.window,
+          createCount,
+          mainWindow,
+          electronTheme: {
+            shouldUseDarkColors: Effect.gen(function* () {
+              if (desktopWindowRef !== undefined) {
+                yield* desktopWindowRef
+                  .handleBackendReady(new URL("http://127.0.0.1:3773"))
+                  .pipe(Effect.orDie);
+              }
+              return false;
+            }),
+            setSource: () => Effect.void,
+            onUpdated: () => Effect.void,
+          },
+        });
+
+        yield* Effect.gen(function* () {
+          const desktopWindow = yield* DesktopWindow.DesktopWindow;
+
+          yield* desktopWindow.activate;
+          fakeWindow.loadURL.mockClear();
+          desktopWindowRef = desktopWindow;
+
+          yield* desktopWindow.showBackendStartupError("backend timeout");
+
+          assert.deepEqual(fakeWindow.loadURL.mock.calls, [["t3code-dev://app/"]]);
+        }).pipe(Effect.provide(layer));
       }),
   );
 
@@ -523,6 +658,29 @@ describe("DesktopWindow", () => {
         assert.equal(splash.send.mock.calls.length, 0);
         assert.equal(main.send.mock.calls.length, 0);
       }).pipe(Effect.provide(scenario.layer));
+    }),
+  );
+
+  it.effect("does not dispatch menu actions to the startup status page before readiness", () =>
+    Effect.gen(function* () {
+      const fakeWindow = makeFakeBrowserWindow();
+      const createCount = yield* Ref.make(0);
+      const mainWindow = yield* Ref.make<Option.Option<Electron.BrowserWindow>>(Option.none());
+      const layer = makeTestLayer({
+        window: fakeWindow.window,
+        createCount,
+        mainWindow,
+      });
+
+      yield* Effect.gen(function* () {
+        const desktopWindow = yield* DesktopWindow.DesktopWindow;
+
+        yield* desktopWindow.activate;
+        yield* desktopWindow.dispatchMenuAction("open-settings");
+
+        assert.equal(yield* Ref.get(createCount), 1);
+        assert.equal(fakeWindow.send.mock.calls.length, 0);
+      }).pipe(Effect.provide(layer));
     }),
   );
 

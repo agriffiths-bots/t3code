@@ -13,7 +13,14 @@ import {
   createStageWorkspaceConfig,
   createStagePnpmConfig,
   createBuildConfig,
+  createDesktopPackageBuildEnv,
+  DESKTOP_AFTER_PACK_HOOK_STAGE_PATH,
+  DESKTOP_ASAR_UNPACK_BASE,
+  DESKTOP_NATIVE_ASAR_UNPACK_PACKAGE_PATTERNS,
+  DESKTOP_NODE_PTY_ASAR_UNPACK_PATTERNS,
+  DESKTOP_PACKAGE_BUILD_ENV,
   DESKTOP_ASAR_UNPACK,
+  DESKTOP_UNPACKED_FILE_LIMIT,
   InvalidMacPasskeyRpDomainError,
   InvalidMacPasskeyPublishableKeyError,
   InvalidMockUpdateServerPortError,
@@ -25,7 +32,9 @@ import {
   resolveClerkPasskeyNativeArtifacts,
   resolveMacPasskeySigningConfiguration,
   resolveDesktopRuntimeDependencies,
+  resolveStagedRuntimeDependencies,
   resolveFffNativeDependencies,
+  resolveClaudeAgentNativeDependencies,
   resolveBuildOptions,
   resolveDesktopBuildIconAssets,
   resolveDesktopProductName,
@@ -205,6 +214,54 @@ it.layer(NodeServices.layer)("build-desktop-artifact", (it) => {
     );
   });
 
+  it("resolves only external runtime, native, and sidecar dependencies for staged desktop installs", () => {
+    assert.deepStrictEqual(
+      resolveStagedRuntimeDependencies({
+        desktopDependencies: {
+          "@clerk/electron": "catalog:",
+          "@clerk/electron-passkeys": "catalog:",
+          "@effect/platform-node": "catalog:",
+          "@t3tools/shared": "workspace:*",
+          effect: "catalog:",
+          electron: "41.5.0",
+          "electron-store": "^8.2.0",
+          "electron-updater": "^6.6.2",
+          "playwright-core": "1.60.0",
+          "react-grab": "^0.1.32",
+        },
+        serverDependencies: {
+          "@anthropic-ai/claude-agent-sdk": "^0.3.170",
+          "@effect/platform-bun": "catalog:",
+          "@effect/platform-node": "catalog:",
+          "@effect/sql-sqlite-bun": "catalog:",
+          "@ff-labs/fff-node": "0.9.4",
+          "@opencode-ai/sdk": "^1.3.15",
+          "@pierre/diffs": "catalog:",
+          croner: "^9.0.0",
+          effect: "catalog:",
+          "node-pty": "^1.1.0",
+          "web-push": "^3.6.7",
+        },
+        catalog: {
+          "@clerk/electron": "0.0.5",
+          "@clerk/electron-passkeys": "0.0.3",
+          "@effect/platform-bun": "4.0.0-beta.78",
+          "@effect/platform-node": "4.0.0-beta.78",
+          "@effect/sql-sqlite-bun": "4.0.0-beta.78",
+          "@pierre/diffs": "1.3.0-beta.5",
+          effect: "4.0.0-beta.78",
+        },
+      }),
+      {
+        "@anthropic-ai/claude-agent-sdk": "^0.3.170",
+        "@clerk/electron-passkeys": "0.0.3",
+        "@ff-labs/fff-node": "0.9.4",
+        "node-pty": "^1.1.0",
+        "playwright-core": "1.60.0",
+      },
+    );
+  });
+
   it("carries only staged dependency patch metadata into staged desktop installs", () => {
     assert.deepStrictEqual(
       createStagePnpmConfig(
@@ -273,11 +330,36 @@ it.layer(NodeServices.layer)("build-desktop-artifact", (it) => {
     });
   });
 
-  it("unpacks the desktop server bundle and app-root runtime dependencies", () => {
-    assert.deepStrictEqual(DESKTOP_ASAR_UNPACK, ["apps/server/dist/**", "node_modules/**"]);
+  it("unpacks only server dist and native runtime package patterns", () => {
+    assert.deepStrictEqual(DESKTOP_ASAR_UNPACK_BASE, ["apps/server/dist/**"]);
+    assert.include([...DESKTOP_NATIVE_ASAR_UNPACK_PACKAGE_PATTERNS], "@ff-labs/fff-node");
+    assert.include([...DESKTOP_NATIVE_ASAR_UNPACK_PACKAGE_PATTERNS], "@clerk/electron-passkeys");
+    assert.include([...DESKTOP_NODE_PTY_ASAR_UNPACK_PATTERNS], "node-pty/lib/**/*.js");
+    assert.notInclude([...DESKTOP_NODE_PTY_ASAR_UNPACK_PATTERNS], "node-pty/**");
+    assert.notInclude([...DESKTOP_ASAR_UNPACK], "node_modules/**");
+    assert.notInclude([...DESKTOP_ASAR_UNPACK], "node_modules/node-pty/**");
+    assert.isAtMost(DESKTOP_UNPACKED_FILE_LIMIT, 250);
   });
 
-  it.effect("keeps all staged node_modules unpacked for packaged desktop runtime imports", () =>
+  it("marks artifact builds as compact desktop package builds", () => {
+    assert.deepStrictEqual(DESKTOP_PACKAGE_BUILD_ENV, {
+      T3CODE_DESKTOP_PACKAGE: "1",
+      T3CODE_WEB_SOURCEMAP: "0",
+    });
+    assert.deepStrictEqual(
+      createDesktopPackageBuildEnv({
+        PATH: "/bin",
+        T3CODE_WEB_SOURCEMAP: "hidden",
+      }),
+      {
+        PATH: "/bin",
+        T3CODE_DESKTOP_PACKAGE: "1",
+        T3CODE_WEB_SOURCEMAP: "0",
+      },
+    );
+  });
+
+  it.effect("keeps the static build config on the minimal unpack set", () =>
     Effect.gen(function* () {
       const config = yield* createBuildConfig(
         "win",
@@ -290,15 +372,26 @@ it.layer(NodeServices.layer)("build-desktop-artifact", (it) => {
       );
 
       const asarUnpack = config.asarUnpack as string[];
-      assert.deepStrictEqual(asarUnpack, ["apps/server/dist/**", "node_modules/**"]);
+      assert.deepStrictEqual(asarUnpack, [...DESKTOP_ASAR_UNPACK]);
+      assert.equal(config.afterPack, `./${DESKTOP_AFTER_PACK_HOOK_STAGE_PATH}`);
     }).pipe(Effect.provide(ConfigProvider.layer(ConfigProvider.fromEnv({ env: {} })))),
   );
 
-  it("does not enumerate individual runtime packages in ASAR unpack patterns", () => {
-    const packageSpecificPatterns = DESKTOP_ASAR_UNPACK.filter((pattern) =>
-      /node_modules\/(?:@[^/]+\/)?[^*/]+/.test(pattern),
+  it("does not allow a broad node_modules ASAR unpack regression", () => {
+    const broadPatterns = DESKTOP_ASAR_UNPACK.filter((pattern) =>
+      /^node_modules(?:\/\*\*)?$/u.test(pattern),
     );
-    assert.deepStrictEqual(packageSpecificPatterns, []);
+    assert.deepStrictEqual(broadPatterns, []);
+    assert.isTrue(
+      DESKTOP_ASAR_UNPACK.every(
+        (pattern) =>
+          pattern === "apps/server/dist/**" ||
+          pattern.startsWith("node_modules/.pnpm/**/node_modules/") ||
+          pattern.startsWith("node_modules/@") ||
+          pattern.startsWith("node_modules/ffi-rs") ||
+          pattern.startsWith("node_modules/node-pty"),
+      ),
+    );
   });
 
   it.effect("preserves both Linux icon resize failures with structural context", () => {
@@ -505,11 +598,22 @@ it.layer(NodeServices.layer)("build-desktop-artifact", (it) => {
     });
     assert.deepStrictEqual(resolveFffNativeDependencies("linux", "x64", "0.9.4"), {
       "@ff-labs/fff-bin-linux-x64-gnu": "0.9.4",
-      "@ff-labs/fff-bin-linux-x64-musl": "0.9.4",
     });
     assert.deepStrictEqual(resolveFffNativeDependencies("linux", "arm64", "0.9.4"), {
       "@ff-labs/fff-bin-linux-arm64-gnu": "0.9.4",
-      "@ff-labs/fff-bin-linux-arm64-musl": "0.9.4",
+    });
+  });
+
+  it("promotes target Claude agent native sidecars to direct staged dependencies", () => {
+    assert.deepStrictEqual(resolveClaudeAgentNativeDependencies("mac", "universal", "^0.3.170"), {
+      "@anthropic-ai/claude-agent-sdk-darwin-arm64": "^0.3.170",
+      "@anthropic-ai/claude-agent-sdk-darwin-x64": "^0.3.170",
+    });
+    assert.deepStrictEqual(resolveClaudeAgentNativeDependencies("win", "x64", "^0.3.170"), {
+      "@anthropic-ai/claude-agent-sdk-win32-x64": "^0.3.170",
+    });
+    assert.deepStrictEqual(resolveClaudeAgentNativeDependencies("linux", "x64", "^0.3.170"), {
+      "@anthropic-ai/claude-agent-sdk-linux-x64": "^0.3.170",
     });
   });
 

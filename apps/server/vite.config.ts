@@ -2,17 +2,34 @@ import "vite-plus/test/config";
 import { defineConfig, mergeConfig } from "vite-plus";
 
 import baseConfig from "../../vite.config.ts";
+import {
+  packageNameMatchesPrefix,
+  resolveBarePackageName,
+} from "../../scripts/lib/package-names.ts";
 import { loadRepoEnv } from "../../scripts/lib/public-config.ts";
 
-const bundledPackagePrefixes = [
-  "@pierre/diffs",
-  "@t3tools/",
-  "effect-acp",
-  "effect-codex-app-server",
-];
+const externalRuntimePackageNames = new Set([
+  "@effect/platform-bun",
+  "@effect/sql-sqlite-bun",
+  "@ff-labs/fff-node",
+  "ffi-rs",
+  "node-pty",
+]);
+const externalRuntimePackagePrefixes = [
+  "@anthropic-ai/claude-agent-sdk-",
+  "@ff-labs/fff-bin-",
+  "@msgpackr-extract/",
+  "@yuuang/ffi-rs-",
+] as const;
 
 export function shouldBundleCliDependency(id: string): boolean {
-  return bundledPackagePrefixes.some((prefix) => id.startsWith(prefix));
+  const packageName = resolveBarePackageName(id);
+  if (packageName === undefined) return false;
+  if (externalRuntimePackageNames.has(packageName)) return false;
+  if (packageNameMatchesPrefix(packageName, externalRuntimePackagePrefixes)) {
+    return false;
+  }
+  return true;
 }
 
 const repoEnv = loadRepoEnv();

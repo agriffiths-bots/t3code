@@ -170,6 +170,22 @@ export const make = DesktopLifecycle.of({
     const context = yield* Effect.context<DesktopLifecycleRuntimeServices>();
     const runEffect = Effect.runPromiseWith(context);
     let quitAllowed = false;
+
+    if (!(yield* electronApp.requestSingleInstanceLock)) {
+      yield* logLifecycleInfo("single-instance lock denied");
+      yield* electronApp.quit;
+      return yield* Effect.interrupt;
+    }
+
+    yield* electronApp.on("second-instance", () => {
+      void runEffect(
+        electronApp.whenReady.pipe(
+          Effect.andThen(desktopWindow.activate),
+          Effect.withSpan("desktop.lifecycle.secondInstance"),
+        ),
+      );
+    });
+
     yield* electronTheme.onUpdated(() => {
       void runEffect(
         desktopWindow.syncAppearance.pipe(Effect.withSpan("desktop.lifecycle.themeUpdated")),
