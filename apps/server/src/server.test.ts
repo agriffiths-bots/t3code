@@ -866,28 +866,35 @@ const buildAppUnderTest = (options?: {
 
 const parseSessionCookieFromWsUrl = (
   wsUrl: string,
-): { readonly cookie: string | null; readonly url: string } => {
+): { readonly cookie: string | null; readonly origin: string | null; readonly url: string } => {
   const next = new URL(wsUrl);
-  const cookie = next.hash.startsWith("#cookie=")
-    ? decodeURIComponent(next.hash.slice("#cookie=".length))
-    : null;
+  const hash = next.hash.startsWith("#") ? next.hash.slice(1) : next.hash;
+  const params = new URLSearchParams(hash);
+  const cookie = params.get("cookie");
+  const origin = params.get("origin");
   next.hash = "";
   return {
     cookie,
+    origin,
     url: next.toString(),
   };
 };
 
 const wsRpcProtocolLayer = (wsUrl: string) => {
-  const { cookie, url } = parseSessionCookieFromWsUrl(wsUrl);
+  const { cookie, origin, url } = parseSessionCookieFromWsUrl(wsUrl);
   const webSocketConstructorLayer = Layer.succeed(
     Socket.WebSocketConstructor,
-    (socketUrl, protocols) =>
-      new NodeSocket.NodeWS.WebSocket(
+    (socketUrl, protocols) => {
+      const headers = {
+        ...(cookie ? { cookie } : {}),
+        ...(origin ? { origin } : {}),
+      };
+      return new NodeSocket.NodeWS.WebSocket(
         socketUrl,
         protocols,
-        cookie ? { headers: { cookie } } : undefined,
-      ) as unknown as globalThis.WebSocket,
+        Object.keys(headers).length > 0 ? { headers } : undefined,
+      ) as unknown as globalThis.WebSocket;
+    },
   );
 
   return RpcClient.layerProtocolSocket().pipe(
@@ -905,10 +912,18 @@ const withWsRpcClient = <A, E, R>(
   f: (client: WsRpcClient) => Effect.Effect<A, E, R>,
 ) => makeWsRpcClient.pipe(Effect.flatMap(f), Effect.provide(wsRpcProtocolLayer(wsUrl)));
 
-const appendSessionCookieToWsUrl = (url: string, sessionCookieHeader: string) => {
+const appendSessionCookieToWsUrl = (
+  url: string,
+  sessionCookieHeader: string,
+  options?: { readonly origin?: string },
+) => {
   const isAbsoluteUrl = /^[a-zA-Z][a-zA-Z\d+.-]*:/.test(url);
   const next = new URL(url, "http://localhost");
-  next.hash = `cookie=${encodeURIComponent(sessionCookieHeader)}`;
+  const hash = new URLSearchParams([["cookie", sessionCookieHeader]]);
+  if (options?.origin) {
+    hash.set("origin", options.origin);
+  }
+  next.hash = hash.toString();
   return isAbsoluteUrl ? next.toString() : `${next.pathname}${next.search}${next.hash}`;
 };
 
@@ -1394,6 +1409,8 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
       assert.equal(bootstrapBody.sessionMethod, "browser-session-cookie");
       assert.isUndefined((bootstrapBody as { readonly sessionToken?: string }).sessionToken);
       assert.isDefined(setCookie);
+      assert.include(setCookie ?? "", "SameSite=Lax");
+      assert.notInclude(setCookie ?? "", "SameSite=None");
 
       const sessionUrl = yield* getHttpServerUrl("/api/auth/session");
       const sessionResponse = yield* fetchEffect(sessionUrl, {
@@ -3268,6 +3285,93 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
       }).pipe(Effect.provide(NodeHttpServer.layerTest)),
   );
 
+  it.effect("allows browser-session credentials from hosted app origins", () =>
+    Effect.gen(function* () {
+      yield* buildAppUnderTest();
+
+      const origin = "https://dl5-5uq.pages.dev";
+      const { response: bootstrapResponse, cookie } = yield* bootstrapBrowserSession(
+        defaultDesktopBootstrapToken,
+        {
+          headers: { origin },
+        },
+      );
+      assert.equal(bootstrapResponse.status, 200);
+      assert.isDefined(cookie);
+      assertBrowserApiCorsResponseHeaders(bootstrapResponse.headers, {
+        origin,
+        credentials: true,
+      });
+      assert.include(cookie ?? "", "SameSite=None");
+      assert.include(cookie ?? "", "Secure");
+
+      const wsTicketUrl = yield* getHttpServerUrl("/api/auth/websocket-ticket");
+      const preflightResponse = yield* fetchEffect(wsTicketUrl, {
+        method: "OPTIONS",
+        headers: {
+          origin,
+          "access-control-request-method": "POST",
+          "access-control-request-headers": "content-type",
+        },
+      });
+
+      assert.equal(preflightResponse.status, 204);
+      assertBrowserApiCorsPreflightHeaders(preflightResponse.headers, {
+        origin,
+        credentials: true,
+      });
+
+      const wsTicketResponse = yield* fetchEffect(wsTicketUrl, {
+        method: "POST",
+        headers: {
+          origin,
+          cookie: cookie?.split(";")[0] ?? "",
+        },
+      });
+      const wsTicketBody = yield* responseJsonEffect<{
+        readonly ticket: string;
+      }>(wsTicketResponse);
+
+      assert.equal(wsTicketResponse.status, 200);
+      assertBrowserApiCorsResponseHeaders(wsTicketResponse.headers, {
+        origin,
+        credentials: true,
+      });
+      assert.equal(typeof wsTicketBody.ticket, "string");
+    }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+
+  it.effect("rejects untrusted cross-site cookie-authenticated mutations", () =>
+    Effect.gen(function* () {
+      yield* buildAppUnderTest();
+
+      const { cookie } = yield* bootstrapBrowserSession(defaultDesktopBootstrapToken, {
+        headers: { origin: "https://dl5-5uq.pages.dev" },
+      });
+      assert.isDefined(cookie);
+
+      const revokeOthersUrl = yield* getHttpServerUrl("/api/auth/clients/revoke-others");
+      const response = yield* fetchEffect(revokeOthersUrl, {
+        method: "POST",
+        headers: {
+          origin: "https://attacker.example",
+          cookie: cookie?.split(";")[0] ?? "",
+        },
+      });
+      const body = yield* responseJsonEffect<{
+        readonly _tag?: string;
+        readonly code?: string;
+        readonly reason?: string;
+      }>(response);
+
+      assert.equal(response.status, 401);
+      assertBrowserApiCorsResponseHeaders(response.headers);
+      assert.equal(body._tag, "EnvironmentAuthInvalidError");
+      assert.equal(body.code, "auth_invalid");
+      assert.equal(body.reason, "invalid_credential");
+    }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+
   it.effect("allows credentialed cloud link proof preflights from the configured dev UI", () =>
     Effect.gen(function* () {
       yield* buildAppUnderTest({
@@ -3776,6 +3880,32 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
     }).pipe(Effect.provide(NodeHttpServer.layerTest)),
   );
 
+  it.effect("rejects websocket rpc cookie handshakes from untrusted cross-site origins", () =>
+    Effect.gen(function* () {
+      yield* buildAppUnderTest();
+
+      const { response: bootstrapResponse, cookie } = yield* bootstrapBrowserSession(
+        defaultDesktopBootstrapToken,
+        { headers: { origin: "https://dl5-5uq.pages.dev" } },
+      );
+
+      assert.equal(bootstrapResponse.status, 200);
+      assert.isDefined(cookie);
+
+      const wsUrl = appendSessionCookieToWsUrl(
+        yield* getWsServerUrl("/ws", { authenticated: false }),
+        cookie?.split(";")[0] ?? "",
+        { origin: "https://attacker.example" },
+      );
+      const error = yield* Effect.flip(
+        Effect.scoped(withWsRpcClient(wsUrl, (client) => client[WS_METHODS.serverGetConfig]({}))),
+      );
+
+      assert.equal(error._tag, "RpcClientError");
+      assertInclude(String(error), "SocketOpenError");
+    }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+
   it.effect(
     "rejects websocket rpc handshake when a session token is only provided via query string",
     () =>
@@ -3940,6 +4070,7 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
 
       yield* buildAppUnderTest({
         config: {
+          devUrl: new URL("http://localhost:5733"),
           otlpTracesUrl: collector.url,
         },
         layers: {
@@ -3963,7 +4094,10 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
       });
 
       assert.equal(response.status, 204);
-      assert.equal(response.headers["access-control-allow-origin"], "*");
+      assertBrowserApiCorsResponseHeaders(response.headers, {
+        origin: "http://localhost:5733",
+        credentials: true,
+      });
       assert.deepEqual(localTraceRecords, [
         {
           type: "otlp-span",
@@ -4008,6 +4142,50 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
           contentType: "application/json",
         },
       ]);
+    }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+
+  it.effect("rejects untrusted cross-site cookie-authenticated browser OTLP trace posts", () =>
+    Effect.gen(function* () {
+      const localTraceRecords: Array<unknown> = [];
+      const payload = yield* makeBrowserOtlpPayload("client.test");
+
+      yield* buildAppUnderTest({
+        layers: {
+          browserTraceCollector: {
+            record: (records) =>
+              Effect.sync(() => {
+                localTraceRecords.push(...records);
+              }),
+          },
+        },
+      });
+
+      const { cookie } = yield* bootstrapBrowserSession(defaultDesktopBootstrapToken, {
+        headers: { origin: "https://dl5-5uq.pages.dev" },
+      });
+      assert.isDefined(cookie);
+
+      const response = yield* HttpClient.post("/api/observability/v1/traces", {
+        headers: {
+          cookie: cookie?.split(";")[0] ?? "",
+          "content-type": "application/json",
+          origin: "https://attacker.example",
+        },
+        // @effect-diagnostics-next-line preferSchemaOverJson:off
+        body: HttpBody.text(JSON.stringify(payload), "application/json"),
+      });
+      const body = yield* responseJsonEffect<{
+        readonly _tag?: string;
+        readonly code?: string;
+        readonly reason?: string;
+      }>(response);
+
+      assert.equal(response.status, 401);
+      assert.equal(body._tag, "EnvironmentAuthInvalidError");
+      assert.equal(body.code, "auth_invalid");
+      assert.equal(body.reason, "invalid_credential");
+      assert.deepEqual(localTraceRecords, []);
     }).pipe(Effect.provide(NodeHttpServer.layerTest)),
   );
 

@@ -43,9 +43,16 @@ import {
   failEnvironmentScopeRequired,
   failEnvironmentAuthInvalid,
   failEnvironmentInternal,
+  requireCookieAuthCsrfOrigin,
+  configuredCookieAuthCsrfOriginsEffect,
 } from "./auth/http.ts";
 import * as ServerEnvironment from "./environment/ServerEnvironment.ts";
-import { browserApiCorsAllowedHeaders, browserApiCorsAllowedMethods } from "./httpCors.ts";
+import {
+  browserApiCorsAllowedHeaders,
+  browserApiCorsAllowedMethods,
+  hostedBrowserApiCredentialOrigins,
+  normalizeCorsOrigin,
+} from "./httpCors.ts";
 import { buildElevenLabsRequest, resolveVoiceId, validateTtsText } from "./tts/ttsRequest.logic.ts";
 import { loadPlanUsageSnapshot } from "./usage/PlanUsage.ts";
 
@@ -55,21 +62,61 @@ const PLAN_USAGE_PATH = "/api/plan-usage";
 const NOTIFICATION_ACK_PATH = "/api/notifications/ack";
 const LOOPBACK_HOSTNAMES = new Set(["127.0.0.1", "::1", "localhost"]);
 const DESKTOP_RENDERER_ORIGINS = ["t3code://app", "t3code-dev://app"];
+const BROWSER_API_CORS_MAX_AGE_SECONDS = 600;
+
+function browserApiCredentialedCorsOrigins(config: ServerConfig.ServerConfig["Service"]) {
+  const origins = new Set<string>(hostedBrowserApiCredentialOrigins);
+  const devOrigin = config.devUrl?.origin;
+  if (devOrigin) {
+    origins.add(devOrigin);
+    for (const desktopOrigin of DESKTOP_RENDERER_ORIGINS) {
+      origins.add(desktopOrigin);
+    }
+  }
+  return origins;
+}
+
+function browserApiCorsHeaders(input: {
+  readonly origin: string | undefined;
+  readonly credentialedOrigins: ReadonlySet<string>;
+  readonly preflight: boolean;
+}) {
+  const origin = normalizeCorsOrigin(input.origin);
+  const credentialed = origin !== null && input.credentialedOrigins.has(origin);
+  return {
+    "access-control-allow-origin": credentialed ? origin : "*",
+    ...(credentialed ? { "access-control-allow-credentials": "true", vary: "Origin" } : {}),
+    ...(input.preflight
+      ? {
+          "access-control-allow-methods": browserApiCorsAllowedMethods.join(", "),
+          "access-control-allow-headers": browserApiCorsAllowedHeaders.join(", "),
+          "access-control-max-age": String(BROWSER_API_CORS_MAX_AGE_SECONDS),
+        }
+      : {}),
+  };
+}
 
 export const browserApiCorsLayer = Layer.unwrap(
   Effect.gen(function* () {
     const config = yield* ServerConfig.ServerConfig;
-    const devOrigin = config.devUrl?.origin;
-    // Dev uses credentialed requests from Vite or the Electron custom origin, so both must be
-    // explicit. Packaged desktop omits credentials and uses Effect's default wildcard origin.
-    return HttpRouter.cors({
-      ...(devOrigin
-        ? { allowedOrigins: [devOrigin, ...DESKTOP_RENDERER_ORIGINS], credentials: true }
-        : {}),
-      allowedMethods: browserApiCorsAllowedMethods,
-      allowedHeaders: browserApiCorsAllowedHeaders,
-      maxAge: 600,
-    });
+    const credentialedOrigins = browserApiCredentialedCorsOrigins(config);
+    return HttpRouter.middleware(
+      <E, R>(httpApp: Effect.Effect<HttpServerResponse.HttpServerResponse, E, R>) =>
+        Effect.flatMap(HttpServerRequest.HttpServerRequest, (request) => {
+          const headers = browserApiCorsHeaders({
+            origin: request.headers.origin,
+            credentialedOrigins,
+            preflight: request.method === "OPTIONS",
+          });
+          if (request.method === "OPTIONS") {
+            return Effect.succeed(HttpServerResponse.empty({ status: 204, headers }));
+          }
+          return Effect.map(httpApp, (response) =>
+            HttpServerResponse.setHeaders(response, headers),
+          );
+        }),
+      { global: true },
+    );
   }),
 );
 
@@ -95,6 +142,7 @@ const authenticateRawRouteWithScope = (
   Effect.gen(function* () {
     const request = yield* HttpServerRequest.HttpServerRequest;
     const serverAuth = yield* EnvironmentAuth.EnvironmentAuth;
+    const trustedOrigins = yield* configuredCookieAuthCsrfOriginsEffect;
     const session = yield* serverAuth.authenticateHttpRequest(request).pipe(
       Effect.catchIf(EnvironmentAuth.isServerAuthCredentialError, (error) =>
         failEnvironmentAuthInvalid(EnvironmentAuth.serverAuthCredentialReason(error)),
@@ -103,6 +151,7 @@ const authenticateRawRouteWithScope = (
         failEnvironmentInternal("internal_error", error),
       ),
     );
+    yield* requireCookieAuthCsrfOrigin({ request, session, trustedOrigins });
     if (!session.scopes.includes(scope)) {
       return yield* failEnvironmentScopeRequired(scope);
     }
