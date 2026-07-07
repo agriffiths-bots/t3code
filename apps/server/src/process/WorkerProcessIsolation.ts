@@ -196,6 +196,27 @@ fi
 exec "$real_command" "$@"
 `;
 
+const writeExecutableFileAtomically = (input: {
+  readonly filePath: string;
+  readonly contents: string;
+}) =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const targetDirectory = path.dirname(input.filePath);
+      yield* fs.makeDirectory(targetDirectory, { recursive: true });
+      const tempDirectory = yield* fs.makeTempDirectoryScoped({
+        directory: targetDirectory,
+        prefix: `${path.basename(input.filePath)}.`,
+      });
+      const tempPath = path.join(tempDirectory, "contents.tmp");
+      yield* fs.writeFileString(tempPath, input.contents);
+      yield* fs.chmod(tempPath, 0o755);
+      yield* fs.rename(tempPath, input.filePath);
+    }),
+  );
+
 const makeWithConfig = (config: WorkerProcessIsolationConfig) =>
   Effect.gen(function* () {
     const platform = yield* HostProcessPlatform;
@@ -261,12 +282,12 @@ const makeWithConfig = (config: WorkerProcessIsolationConfig) =>
           } satisfies WorkerLaunchExecutable;
         }
 
-        const fs = yield* FileSystem.FileSystem;
         const path = yield* Path.Path;
-        yield* fs.makeDirectory(input.directory, { recursive: true });
         const executablePath = path.join(input.directory, "t3-worker-systemd-run");
-        yield* fs.writeFileString(executablePath, wrapperScript);
-        yield* fs.chmod(executablePath, 0o755);
+        yield* writeExecutableFileAtomically({
+          filePath: executablePath,
+          contents: wrapperScript,
+        });
         return {
           executablePath,
           env: {

@@ -1450,6 +1450,8 @@ const make = Effect.gen(function* () {
       }
 
       // Remaining non-terminal children: validate the provider instance still exists.
+      // Seed the dispatch limiter for survivors so a restart cannot launch a
+      // full new cap on top of already-running sub-agents.
       for (const childThreadId of knownChildIds) {
         if (terminalByChild.has(childThreadId)) continue;
         const record = children.get(childThreadId);
@@ -1467,7 +1469,9 @@ const make = Effect.gen(function* () {
             },
           );
           yield* settleChild(childThreadId, "killed", "provider instance removed");
+          continue;
         }
+        yield* dispatchLimiter.seedChild(childThreadId);
       }
 
       // (2b) R-B: load durable 'parent_injection' rows into the in-memory
