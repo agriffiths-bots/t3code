@@ -201,9 +201,15 @@ const config: ExpoConfig = {
         bundleIdentifier: `${variant.iosBundleIdentifier}.widgets`,
         groupIdentifier: `group.${variant.iosBundleIdentifier}`,
         enablePushNotifications: true,
+        // Agent activity can update many times an hour; without the
+        // frequent-updates entitlement iOS throttles the update budget sooner.
+        frequentUpdates: true,
         widgets,
       },
     ],
+    // Must run after expo-widgets so the widget target exists when it wires in
+    // the branded logo asset catalog.
+    "./plugins/withWidgetLogoAsset.cjs",
     "./plugins/withIosSceneLifecycle.cjs",
     "./plugins/withAndroidCleartextTraffic.cjs",
     "./plugins/withAndroidGradleMemory.cjs",
