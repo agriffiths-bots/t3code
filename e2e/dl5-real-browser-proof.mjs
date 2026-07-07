@@ -245,6 +245,19 @@ async function writeScreenshot(page, path, options = {}) {
   NodeFS.chmodSync(path, PRIVATE_FILE_MODE);
 }
 
+async function waitForPairingPrompt(page, target) {
+  await page.goto(target.url, { waitUntil: "commit", timeout: timeoutMs });
+  await page.waitForURL((url) => url.pathname === "/pair", { timeout: timeoutMs });
+  await page.locator("#pairing-token").waitFor({ state: "visible", timeout: timeoutMs });
+}
+
+async function assertNoPairingPrompt(page, stage) {
+  const promptCount = await page.locator("#pairing-token").count();
+  if (promptCount > 0) {
+    throw new Error(`${stage}: paired browser was prompted for a pairing token again`);
+  }
+}
+
 async function obtainCloudflareCookie(target, headers) {
   const response = await fetch(target.url, {
     redirect: "manual",
@@ -441,6 +454,15 @@ async function runTarget(target, headers) {
       }
     });
 
+    await waitForPairingPrompt(page, target);
+    const unpairedPromptUrl = sanitizeUrl(page.url());
+    const unpairedPromptScreenshotPath = NodePath.join(
+      artifactDir,
+      `${targetArtifactPrefix}-unpaired-prompt-${Date.now()}.png`,
+    );
+    await writeScreenshot(page, unpairedPromptScreenshotPath, { fullPage: true });
+
+    await page.goto("about:blank", { waitUntil: "commit", timeout: timeoutMs });
     await page.goto(`${target.url}/pair#token=${encodeURIComponent(pairingToken)}`, {
       waitUntil: "commit",
       timeout: timeoutMs,
@@ -449,6 +471,11 @@ async function runTarget(target, headers) {
 
     await waitForWebSocket(events);
     await waitForProjectsInDom(page);
+    await assertNoPairingPrompt(page, "paired-load");
+
+    await page.goto(target.url, { waitUntil: "commit", timeout: timeoutMs });
+    await waitForProjectsInDom(page);
+    await assertNoPairingPrompt(page, "already-paired-root");
 
     const screenshotPath = NodePath.join(
       artifactDir,
@@ -472,6 +499,19 @@ async function runTarget(target, headers) {
       t3SessionCookies: cookies
         .filter((cookie) => cookie.name.startsWith("t3_session"))
         .map((cookie) => cookieMetadata(cookie)),
+      unpairedPrompt: {
+        appeared: true,
+        url: unpairedPromptUrl,
+        screenshotPath: unpairedPromptScreenshotPath,
+      },
+      pairedLoad: {
+        appeared: true,
+        promptedAgain: false,
+      },
+      alreadyPairedRoot: {
+        promptedAgain: false,
+        url: sanitizeUrl(page.url()),
+      },
       projectCount: domEvidence.projectRows.length,
       projectNames: domEvidence.projectRows.slice(0, 10),
       threadCount: domEvidence.threadRows.length,
