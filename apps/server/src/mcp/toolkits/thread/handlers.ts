@@ -231,13 +231,10 @@ const makeActiveThreadStartRuntime = Effect.fn("ThreadToolkit.makeActiveRuntime"
     } satisfies SourceCwdProjectMatch;
   });
 
-  const projectHasGitRepository = Effect.fn("ThreadToolkit.projectHasGitRepository")(function* (
-    project: OrchestrationProjectShell,
+  const cwdHasGitRepository = Effect.fn("ThreadToolkit.cwdHasGitRepository")(function* (
+    cwd: string,
   ) {
-    if (project.repositoryIdentity !== undefined) {
-      return project.repositoryIdentity !== null;
-    }
-    return yield* vcsDriverRegistry.detect({ cwd: project.workspaceRoot, cache: "bypass" }).pipe(
+    return yield* vcsDriverRegistry.detect({ cwd, cache: "bypass" }).pipe(
       Effect.map((handle) => handle?.kind === "git"),
       Effect.orElseSucceed(() => true),
     );
@@ -405,7 +402,7 @@ const makeActiveThreadStartRuntime = Effect.fn("ThreadToolkit.makeActiveRuntime"
     const sourceCwdContext = yield* resolveSourceCwd(project, sourceThread);
     const { cwd: sourceCwd, canUseSourceBranch, workspaceRelativePath } = sourceCwdContext;
     const shouldUseCurrentCheckout =
-      requestedMode !== "current_checkout" && !(yield* projectHasGitRepository(project));
+      requestedMode !== "current_checkout" && !(yield* cwdHasGitRepository(sourceCwd));
     const mode: ThreadStartMode = shouldUseCurrentCheckout ? "current_checkout" : requestedMode;
     const ids = yield* makeIds();
     const createdAt = yield* nowIso;
