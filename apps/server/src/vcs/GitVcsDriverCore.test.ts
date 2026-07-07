@@ -527,6 +527,7 @@ it.layer(TestLayer)("GitVcsDriver core integration", (it) => {
       Effect.gen(function* () {
         const cwd = yield* makeTmpDir();
         const { initialBranch } = yield* initRepoWithCommit(cwd);
+        yield* git(cwd, ["update-ref", `refs/remotes/origin/${initialBranch}`, "HEAD"]);
         const fileSystem = yield* FileSystem.FileSystem;
         const pathService = yield* Path.Path;
         const brokenRefPath = pathService.join(cwd, ".git", "refs", "remotes", "origin", "broken");
@@ -542,6 +543,10 @@ it.layer(TestLayer)("GitVcsDriver core integration", (it) => {
         assert.equal(refs.isRepo, true);
         assert.equal(
           refs.refs.some((ref) => ref.name === initialBranch && !ref.isRemote),
+          true,
+        );
+        assert.equal(
+          refs.refs.some((ref) => ref.name === `origin/${initialBranch}` && ref.isRemote),
           true,
         );
       }),

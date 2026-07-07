@@ -956,6 +956,42 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
       `,
   });
 
+  const listDetailCheckpointRowsByThread = SqlSchema.findAll({
+    Request: ThreadIdLookupInput,
+    Result: ProjectionCheckpointDbRowSchema,
+    execute: ({ threadId }) =>
+      sql`
+        SELECT
+          checkpoint_rows.thread_id AS "threadId",
+          checkpoint_rows.turn_id AS "turnId",
+          checkpoint_rows.checkpoint_turn_count AS "checkpointTurnCount",
+          checkpoint_rows.checkpoint_ref AS "checkpointRef",
+          checkpoint_rows.checkpoint_status AS "status",
+          checkpoint_rows.checkpoint_files_json AS "files",
+          checkpoint_rows.assistant_message_id AS "assistantMessageId",
+          checkpoint_rows.completed_at AS "completedAt"
+        FROM (
+          SELECT
+            thread_id,
+            turn_id,
+            checkpoint_turn_count,
+            checkpoint_ref,
+            checkpoint_status,
+            checkpoint_files_json,
+            assistant_message_id,
+            completed_at,
+            ROW_NUMBER() OVER (
+              ORDER BY checkpoint_turn_count DESC
+            ) AS checkpoint_rank
+          FROM projection_turns
+          WHERE thread_id = ${threadId}
+            AND checkpoint_turn_count IS NOT NULL
+        ) checkpoint_rows
+        WHERE checkpoint_rows.checkpoint_rank <= ${MAX_THREAD_CHECKPOINTS}
+        ORDER BY checkpoint_rows.checkpoint_turn_count ASC
+      `,
+  });
+
   const listCheckpointTurnIdRowsByThread = SqlSchema.findAll({
     Request: ThreadIdLookupInput,
     Result: ProjectionCheckpointTurnIdRowSchema,
@@ -2043,7 +2079,7 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
             ),
           ),
         ),
-        listCheckpointRowsByThread({ threadId }).pipe(
+        listDetailCheckpointRowsByThread({ threadId }).pipe(
           Effect.mapError(
             toPersistenceSqlOrDecodeError(
               "ProjectionSnapshotQuery.getThreadDetailById:listCheckpoints:query",

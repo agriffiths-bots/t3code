@@ -1011,6 +1011,14 @@ projectionSnapshotLayer("ProjectionSnapshotQuery", (it) => {
         assert.equal(context.value.checkpoints.at(-1)?.checkpointTurnCount, 505);
       }
 
+      const detail = yield* snapshotQuery.getThreadDetailById(ThreadId.make("thread-retention"));
+      assert.equal(detail._tag, "Some");
+      if (detail._tag === "Some") {
+        assert.equal(detail.value.checkpoints.length, MAX_THREAD_CHECKPOINTS);
+        assert.equal(detail.value.checkpoints[0]?.checkpointTurnCount, 6);
+        assert.equal(detail.value.checkpoints.at(-1)?.checkpointTurnCount, 505);
+      }
+
       const prunedDiffContext = yield* snapshotQuery.getFullThreadDiffContext(
         ThreadId.make("thread-retention"),
         4,

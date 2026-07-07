@@ -235,6 +235,22 @@ function parseBranchListEntries(stdout: string): ReadonlyArray<GitRefListEntry> 
   });
 }
 
+function parseRemoteBranchListEntries(stdout: string): ReadonlyArray<GitRefListEntry> {
+  return Arr.filterMap(stdout.split("\n"), (line) => {
+    let branchName = line.trim();
+    if (branchName.startsWith("*") || branchName.startsWith("+")) {
+      branchName = branchName.slice(1).trim();
+    }
+    if (!branchName || branchName.startsWith("(") || branchName.includes(" -> ")) {
+      return Result.failVoid;
+    }
+    return Result.succeed({
+      fullName: `refs/remotes/${branchName}`,
+      lastCommit: 0,
+    });
+  });
+}
+
 function splitNullSeparatedPaths(input: string, truncated: boolean): string[] {
   const parts = input.split("\0");
   if (parts.length === 0) return [];
@@ -2163,10 +2179,35 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
           `GitVcsDriver.listRefs: remote name lookup returned code ${remoteNamesResult.exitCode} for ${input.cwd}: ${remoteNamesResult.stderr.trim()}. Falling back to an empty remote name list.`,
         );
       }
-      if (remoteRefListResult.exitCode !== 0 && remoteRefListResult.stderr.trim().length > 0) {
-        yield* Effect.logWarning(
-          `GitVcsDriver.listRefs: remote ref lookup returned code ${remoteRefListResult.exitCode} for ${input.cwd}: ${remoteRefListResult.stderr.trim()}. Falling back to an empty remote ref list.`,
+      let remoteRefEntries: ReadonlyArray<GitRefListEntry>;
+      if (remoteRefListResult.exitCode === 0) {
+        remoteRefEntries = parseForEachRefEntries(remoteRefListResult.stdout);
+      } else {
+        if (remoteRefListResult.stderr.trim().length > 0) {
+          yield* Effect.logWarning(
+            `GitVcsDriver.listRefs: remote ref lookup returned code ${remoteRefListResult.exitCode} for ${input.cwd}: ${remoteRefListResult.stderr.trim()}. Falling back to git branch --remotes.`,
+          );
+        }
+        const fallbackRemoteBranchResult = yield* executeGit(
+          "GitVcsDriver.listRefs.remoteBranchFallback",
+          input.cwd,
+          ["branch", "--remotes", "--no-color", "--no-column"],
+          {
+            timeoutMs: 10_000,
+            allowNonZeroExit: true,
+          },
         );
+        if (fallbackRemoteBranchResult.exitCode === 0) {
+          remoteRefEntries = parseRemoteBranchListEntries(fallbackRemoteBranchResult.stdout);
+        } else {
+          const fallbackStderr = fallbackRemoteBranchResult.stderr.trim();
+          if (fallbackStderr.length > 0) {
+            yield* Effect.logWarning(
+              `GitVcsDriver.listRefs: remote branch fallback returned code ${fallbackRemoteBranchResult.exitCode} for ${input.cwd}: ${fallbackStderr}. Falling back to an empty remote ref list.`,
+            );
+          }
+          remoteRefEntries = [];
+        }
       }
 
       const defaultBranch =
@@ -2204,11 +2245,6 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
         }
         flushWorktree();
       }
-
-      const remoteRefEntries =
-        remoteRefListResult.exitCode === 0
-          ? parseForEachRefEntries(remoteRefListResult.stdout)
-          : [];
 
       const localBranches = localRefEntries
         .map((entry) => {
