@@ -1819,9 +1819,12 @@ const buildDesktopArtifact = Effect.fn("buildDesktopArtifact")(function* (
   const iconAssets = resolveDesktopBuildIconAssets(appVersion);
   const commitHash = yield* resolveGitCommitHash(repoRoot);
   const mkdir = options.keepStage ? fs.makeTempDirectory : fs.makeTempDirectoryScoped;
-  const stageRoot = yield* mkdir({
+  const createdStageRoot = yield* mkdir({
     prefix: `t3code-desktop-${options.platform}-stage-`,
   });
+  const stageRoot = yield* fs
+    .realPath(createdStageRoot)
+    .pipe(Effect.orElseSucceed(() => createdStageRoot));
 
   const stageAppDir = path.join(stageRoot, "app");
   const stageResourcesDir = path.join(stageAppDir, "apps/desktop/resources");

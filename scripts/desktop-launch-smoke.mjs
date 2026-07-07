@@ -399,12 +399,23 @@ async function main() {
   });
 
   let output = "";
+  let fatalOutput = "";
   let exit = null;
+  const recordOutput = (streamName, chunk) => {
+    output = appendOutput(output, streamName, chunk);
+    if (!fatalOutput && outputHasFatalPattern(output)) {
+      fatalOutput = output;
+    }
+  };
+  const diagnosticOutput = () =>
+    fatalOutput
+      ? `Fatal output snapshot:\n${fatalOutput}\n\nLatest process output:\n${output}`
+      : output;
   child.stdout.on("data", (chunk) => {
-    output = appendOutput(output, "stdout", chunk);
+    recordOutput("stdout", chunk);
   });
   child.stderr.on("data", (chunk) => {
-    output = appendOutput(output, "stderr", chunk);
+    recordOutput("stderr", chunk);
   });
   child.once("exit", (code, signal) => {
     exit = { code, signal };
@@ -415,7 +426,7 @@ async function main() {
   let loggedBackendReady = false;
   try {
     while (Date.now() < deadline) {
-      await assertHealthy(child, () => output, serverChildLogPath);
+      await assertHealthy(child, diagnosticOutput, serverChildLogPath);
 
       if (!backendDescriptor) {
         try {
@@ -457,7 +468,7 @@ async function main() {
       const stableUntil = Math.min(deadline, Date.now() + options.stabilityMs);
       while (Date.now() < stableUntil) {
         await NodeTimersPromises.setTimeout(500);
-        await assertHealthy(child, () => output, serverChildLogPath);
+        await assertHealthy(child, diagnosticOutput, serverChildLogPath);
       }
       return;
     }
@@ -466,7 +477,7 @@ async function main() {
       `Timed out after ${options.timeoutMs}ms waiting for desktop backend and main-window readiness`,
     );
   } catch (error) {
-    const diagnostics = await collectDiagnostics(tempRoot, output);
+    const diagnostics = await collectDiagnostics(tempRoot, diagnosticOutput());
     throw new Error(`${error instanceof Error ? error.message : String(error)}${diagnostics}`, {
       cause: error,
     });
