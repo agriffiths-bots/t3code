@@ -35,6 +35,11 @@ import * as PairingGrantStore from "./PairingGrantStore.ts";
 import * as ServerSecretStore from "./ServerSecretStore.ts";
 import * as SessionStore from "./SessionStore.ts";
 import { verifyRequestDpopProof } from "./dpop.ts";
+import * as ServerConfig from "../config.ts";
+import {
+  browserCookieCredentialOriginAllowed,
+  configuredBrowserCookieCredentialOrigins,
+} from "../httpCors.ts";
 import { layerConfig as SqlitePersistenceLayer } from "../persistence/Layers/Sqlite.ts";
 
 export const DEFAULT_SESSION_SUBJECT = "cli-issued-session";
@@ -572,6 +577,13 @@ export const make = Effect.gen(function* () {
   const secretStore = yield* ServerSecretStore.ServerSecretStore;
   const crypto = yield* Crypto.Crypto;
   const descriptor = yield* policy.getDescriptor();
+  const cookieCredentialTrustedOrigins = Option.match(
+    yield* Effect.serviceOption(ServerConfig.ServerConfig),
+    {
+      onNone: () => new Set<string>(),
+      onSome: configuredBrowserCookieCredentialOrigins,
+    },
+  );
 
   const authenticateToken = (
     token: string,
@@ -964,7 +976,23 @@ export const make = Effect.gen(function* () {
         }
       }
 
-      return yield* authenticateRequest(request);
+      const session = yield* authenticateRequest(request);
+      if (session.method === "browser-session-cookie") {
+        const allowed = browserCookieCredentialOriginAllowed({
+          origin: request.headers.origin,
+          requestOrigin: Option.match(requestUrl, {
+            onNone: () => undefined,
+            onSome: (url) => url.origin,
+          }),
+          trustedOrigins: cookieCredentialTrustedOrigins,
+        });
+        if (!allowed) {
+          return yield* new ServerAuthInvalidCredentialError({
+            diagnostic: "Browser session cookie WebSocket origin is not trusted.",
+          });
+        }
+      }
+      return session;
     });
 
   return EnvironmentAuth.of({

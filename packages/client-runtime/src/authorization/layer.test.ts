@@ -155,6 +155,44 @@ const makeHarness = Effect.fn("TestRemoteAuthorization.makeHarness")(function* (
 });
 
 describe("RemoteEnvironmentAuthorization", () => {
+  it.effect("authorizes a browser-session environment by issuing a websocket ticket", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness({
+        responses: [Response.json(DESCRIPTOR), websocketTicket("browser-session-ticket")],
+      });
+
+      const authorized = yield* Effect.gen(function* () {
+        const remote = yield* RemoteEnvironmentAuthorization.RemoteEnvironmentAuthorization;
+        return yield* remote.authorizeBrowserSession({
+          expectedEnvironmentId: ENVIRONMENT_ID,
+          httpBaseUrl: ENDPOINT.httpBaseUrl,
+          wsBaseUrl: ENDPOINT.wsBaseUrl,
+        });
+      }).pipe(Effect.provide(harness.layer));
+
+      expect(authorized).toMatchObject({
+        environmentId: ENVIRONMENT_ID,
+        label: DESCRIPTOR.label,
+        httpBaseUrl: ENDPOINT.httpBaseUrl,
+        socketUrl: "wss://environment.example.test/ws?wsTicket=browser-session-ticket",
+        httpAuthorization: null,
+      });
+      expect(harness.fetch.calls).toHaveLength(2);
+      expect(String(harness.fetch.calls[0]?.[0])).toBe(
+        "https://environment.example.test/.well-known/t3/environment",
+      );
+      expect(String(harness.fetch.calls[1]?.[0])).toBe(
+        "https://environment.example.test/api/auth/websocket-ticket",
+      );
+      expect(new Request(harness.fetch.calls[1]![0], harness.fetch.calls[1]![1]).credentials).toBe(
+        "include",
+      );
+      expect(new Request(harness.fetch.calls[0]![0], harness.fetch.calls[0]![1]).credentials).toBe(
+        "include",
+      );
+    }),
+  );
+
   it.effect("reuses a valid persisted environment token without contacting the relay", () =>
     Effect.gen(function* () {
       const cached = new TokenStore.RemoteDpopAccessToken({

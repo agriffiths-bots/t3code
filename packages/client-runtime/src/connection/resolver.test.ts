@@ -112,6 +112,7 @@ const makeDependencies = Effect.fn("TestConnectionResolver.makeDependencies")((o
   readonly installCloudflareAccessRequestHeaders?: ClientCapabilities.CloudflareAccessCookieInstaller["Service"]["installRequestHeaders"];
   readonly supportsCloudflareAccessCookieInstall?: boolean;
   readonly supportsCloudflareAccessRequestHeaders?: boolean;
+  readonly authorizeBrowserSession?: RemoteEnvironmentAuthorization.RemoteEnvironmentAuthorization["Service"]["authorizeBrowserSession"];
 }) => {
   const profiles = new Map(
     (options?.profiles ?? []).map((profile) => [profile.connectionId, profile]),
@@ -130,6 +131,16 @@ const makeDependencies = Effect.fn("TestConnectionResolver.makeDependencies")((o
     remove: (connectionId) => Effect.sync(() => void credentials.delete(connectionId)),
   });
   const remote = RemoteEnvironmentAuthorization.RemoteEnvironmentAuthorization.of({
+    authorizeBrowserSession:
+      options?.authorizeBrowserSession ??
+      ((input) =>
+        Effect.succeed({
+          environmentId: input.expectedEnvironmentId,
+          label: "Authorized browser environment",
+          httpBaseUrl: input.httpBaseUrl,
+          socketUrl: "wss://authorized.example.test/ws?wsTicket=browser-session",
+          httpAuthorization: null,
+        })),
     authorizeBearer:
       options?.authorizeBearer ??
       ((input) =>
@@ -231,26 +242,56 @@ const makeDependencies = Effect.fn("TestConnectionResolver.makeDependencies")((o
 });
 
 describe("ConnectionResolver", () => {
-  it.effect("prepares a primary environment without remote capabilities", () =>
-    Effect.gen(function* () {
-      const brokerLayer = yield* makeDependencies();
-      const broker = yield* ConnectionResolver.ConnectionResolver.pipe(Effect.provide(brokerLayer));
-      const target = new PrimaryConnectionTarget({
-        environmentId: ENVIRONMENT_ID,
-        label: "Primary",
-        httpBaseUrl: "http://127.0.0.1:3777",
-        wsBaseUrl: "ws://127.0.0.1:3777",
-      });
+  it.effect(
+    "authorizes a browser-session primary environment without a platform bearer token",
+    () =>
+      Effect.gen(function* () {
+        const browserSessionInputs = yield* Ref.make<
+          ReadonlyArray<{
+            readonly httpBaseUrl: string;
+            readonly wsBaseUrl: string;
+          }>
+        >([]);
+        const brokerLayer = yield* makeDependencies({
+          authorizeBrowserSession: (input) =>
+            Ref.update(browserSessionInputs, (values) => [
+              ...values,
+              { httpBaseUrl: input.httpBaseUrl, wsBaseUrl: input.wsBaseUrl },
+            ]).pipe(
+              Effect.as({
+                environmentId: input.expectedEnvironmentId,
+                label: "Primary",
+                httpBaseUrl: input.httpBaseUrl,
+                socketUrl: "ws://127.0.0.1:3777/ws?wsTicket=browser-session",
+                httpAuthorization: null,
+              }),
+            ),
+        });
+        const broker = yield* ConnectionResolver.ConnectionResolver.pipe(
+          Effect.provide(brokerLayer),
+        );
+        const target = new PrimaryConnectionTarget({
+          environmentId: ENVIRONMENT_ID,
+          label: "Primary",
+          httpBaseUrl: "http://127.0.0.1:3777",
+          wsBaseUrl: "ws://127.0.0.1:3777",
+        });
 
-      expect(yield* broker.prepare(catalogEntry(target))).toEqual({
-        environmentId: ENVIRONMENT_ID,
-        label: "Primary",
-        httpBaseUrl: "http://127.0.0.1:3777",
-        socketUrl: "ws://127.0.0.1:3777/ws",
-        httpAuthorization: null,
-        target,
-      });
-    }),
+        expect(yield* broker.prepare(catalogEntry(target))).toEqual({
+          environmentId: ENVIRONMENT_ID,
+          label: "Primary",
+          httpBaseUrl: "http://127.0.0.1:3777",
+          socketUrl: "ws://127.0.0.1:3777/ws?wsTicket=browser-session",
+          httpAuthorization: null,
+          target,
+        });
+        expect(yield* Ref.get(browserSessionInputs)).toEqual([
+          {
+            httpBaseUrl: "http://127.0.0.1:3777",
+            wsBaseUrl: "ws://127.0.0.1:3777",
+          },
+        ]);
+      }),
   );
 
   it.effect("authorizes a desktop primary environment with its platform bearer token", () =>

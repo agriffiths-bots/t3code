@@ -5,6 +5,7 @@ import {
   exchangeRemoteDpopAccessToken,
   type CloudflareAccessAuthorization,
   type RemoteEnvironmentAuthError,
+  resolveBrowserSessionWebSocketConnectionUrl,
   resolveRemoteDpopWebSocketConnectionUrl,
   resolveRemoteWebSocketConnectionUrl,
 } from "./remote.ts";
@@ -38,12 +39,18 @@ export interface AuthorizedRemoteEnvironment {
   readonly httpBaseUrl: string;
   readonly socketUrl: string;
   readonly socketHeaders?: Readonly<Record<string, string>>;
-  readonly httpAuthorization: PreparedHttpAuthorization;
+  readonly httpAuthorization: PreparedHttpAuthorization | null;
 }
 
 export class RemoteEnvironmentAuthorization extends Context.Service<
   RemoteEnvironmentAuthorization,
   {
+    readonly authorizeBrowserSession: (input: {
+      readonly expectedEnvironmentId: EnvironmentId;
+      readonly httpBaseUrl: string;
+      readonly wsBaseUrl: string;
+      readonly cloudflareAccess?: CloudflareAccessAuthorization;
+    }) => Effect.Effect<AuthorizedRemoteEnvironment, ConnectionAttemptError>;
     readonly authorizeBearer: (input: {
       readonly expectedEnvironmentId: EnvironmentId;
       readonly httpBaseUrl: string;
@@ -73,10 +80,12 @@ function mapDpopSocketError(error: RemoteEnvironmentAuthError | ConnectionAttemp
 const fetchDescriptor = Effect.fn("clientRuntime.connection.remote.fetchDescriptor")(function* (
   httpBaseUrl: string,
   cloudflareAccess?: CloudflareAccessAuthorization,
+  credentials?: RequestCredentials,
 ) {
   return yield* fetchRemoteEnvironmentDescriptor({
     httpBaseUrl,
     ...(cloudflareAccess ? { cloudflareAccess } : {}),
+    ...(credentials ? { credentials } : {}),
   }).pipe(Effect.mapError(mapRemoteEnvironmentError));
 });
 
@@ -147,6 +156,46 @@ export const make = Effect.gen(function* () {
       };
     },
   );
+
+  const authorizeBrowserSession = Effect.fn(
+    "clientRuntime.connection.remote.authorizeBrowserSession",
+  )(function* (input: {
+    readonly expectedEnvironmentId: Parameters<
+      RemoteEnvironmentAuthorization["Service"]["authorizeBrowserSession"]
+    >[0]["expectedEnvironmentId"];
+    readonly httpBaseUrl: string;
+    readonly wsBaseUrl: string;
+    readonly cloudflareAccess?: CloudflareAccessAuthorization;
+  }) {
+    const descriptor = yield* fetchDescriptor(
+      input.httpBaseUrl,
+      input.cloudflareAccess,
+      "include",
+    ).pipe(Effect.provideService(HttpClient.HttpClient, httpClient));
+    if (descriptor.environmentId !== input.expectedEnvironmentId) {
+      return yield* environmentMismatchError({
+        expected: input.expectedEnvironmentId,
+        actual: descriptor.environmentId,
+      });
+    }
+    const socketUrl = yield* resolveBrowserSessionWebSocketConnectionUrl({
+      wsBaseUrl: input.wsBaseUrl,
+      httpBaseUrl: input.httpBaseUrl,
+      ...(input.cloudflareAccess ? { cloudflareAccess: input.cloudflareAccess } : {}),
+    }).pipe(
+      Effect.mapError(mapRemoteEnvironmentError),
+      Effect.provideService(HttpClient.HttpClient, httpClient),
+    );
+    const socketHeaders = cloudflareAccessHeaders(input.cloudflareAccess);
+    return {
+      environmentId: descriptor.environmentId,
+      label: descriptor.label,
+      httpBaseUrl: input.httpBaseUrl,
+      socketUrl,
+      ...(Object.keys(socketHeaders).length > 0 ? { socketHeaders } : {}),
+      httpAuthorization: null,
+    };
+  });
 
   const createDpopSocketUrl = Effect.fn("clientRuntime.connection.remote.createDpopSocketUrl")(
     function* (token: TokenStore.RemoteDpopAccessToken) {
@@ -305,6 +354,7 @@ export const make = Effect.gen(function* () {
   );
 
   return RemoteEnvironmentAuthorization.of({
+    authorizeBrowserSession,
     authorizeBearer,
     authorizeDpop: (input) =>
       authorizeDpop(input).pipe(Effect.withSpan("environment.authorization")),

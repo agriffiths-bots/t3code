@@ -6,6 +6,7 @@ import {
   type CloudflareAccessAuthorization,
 } from "../authorization/remote.ts";
 import { executeEnvironmentHttpRequest, makeEnvironmentHttpApiClient } from "../rpc/http.ts";
+import { FetchHttpClient } from "effect/unstable/http";
 
 const DEFAULT_REMOTE_REQUEST_TIMEOUT_MS = 10_000;
 
@@ -14,14 +15,22 @@ export const fetchRemoteEnvironmentDescriptor = Effect.fn(
 )(function* (input: {
   readonly httpBaseUrl: string;
   readonly cloudflareAccess?: CloudflareAccessAuthorization;
+  readonly credentials?: RequestCredentials;
   readonly timeoutMs?: number;
 }) {
   const client = yield* makeEnvironmentHttpApiClient(input.httpBaseUrl);
+  const request = client.metadata.descriptor({
+    headers: cloudflareAccessHeaders(input.cloudflareAccess),
+  });
   return yield* executeEnvironmentHttpRequest(
     environmentEndpointUrl(input.httpBaseUrl, "/.well-known/t3/environment"),
     input.timeoutMs ?? DEFAULT_REMOTE_REQUEST_TIMEOUT_MS,
-    client.metadata.descriptor({
-      headers: cloudflareAccessHeaders(input.cloudflareAccess),
-    }),
+    input.credentials === undefined
+      ? request
+      : request.pipe(
+          Effect.provideService(FetchHttpClient.RequestInit, {
+            credentials: input.credentials,
+          }),
+        ),
   );
 });

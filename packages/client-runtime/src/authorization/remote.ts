@@ -7,6 +7,7 @@ import {
 } from "@t3tools/contracts";
 import { encodeOAuthScope } from "@t3tools/shared/oauthScope";
 import * as Effect from "effect/Effect";
+import { FetchHttpClient } from "effect/unstable/http";
 import { environmentEndpointUrl } from "../environment/endpoint.ts";
 import {
   executeEnvironmentHttpRequest,
@@ -196,6 +197,25 @@ export const issueRemoteWebSocketTicket = Effect.fn(
   );
 });
 
+export const issueBrowserSessionWebSocketTicket = Effect.fn(
+  "clientRuntime.authorization.issueBrowserSessionWebSocketTicket",
+)(function* (input: {
+  readonly httpBaseUrl: string;
+  readonly cloudflareAccess?: CloudflareAccessAuthorization;
+  readonly timeoutMs?: number;
+}) {
+  const client = yield* makeEnvironmentHttpApiClient(input.httpBaseUrl);
+  return yield* executeEnvironmentHttpRequest(
+    environmentEndpointUrl(input.httpBaseUrl, "/api/auth/websocket-ticket"),
+    input.timeoutMs ?? DEFAULT_REMOTE_REQUEST_TIMEOUT_MS,
+    client.auth
+      .webSocketTicket({
+        headers: cloudflareAccessHeaders(input.cloudflareAccess),
+      })
+      .pipe(Effect.provideService(FetchHttpClient.RequestInit, { credentials: "include" })),
+  );
+});
+
 export const issueRemoteDpopWebSocketTicket = Effect.fn(
   "clientRuntime.authorization.issueRemoteDpopWebSocketTicket",
 )(function* (input: {
@@ -231,6 +251,28 @@ export const resolveRemoteWebSocketConnectionUrl = Effect.fn(
   const issued = yield* issueRemoteWebSocketTicket({
     httpBaseUrl: input.httpBaseUrl,
     bearerToken: input.bearerToken,
+    ...(input.cloudflareAccess ? { cloudflareAccess: input.cloudflareAccess } : {}),
+    ...(input.timeoutMs ? { timeoutMs: input.timeoutMs } : {}),
+  });
+
+  const url = new URL(input.wsBaseUrl);
+  if (url.pathname === "" || url.pathname === "/") {
+    url.pathname = "/ws";
+  }
+  url.searchParams.set("wsTicket", issued.ticket);
+  return url.toString();
+});
+
+export const resolveBrowserSessionWebSocketConnectionUrl = Effect.fn(
+  "clientRuntime.authorization.resolveBrowserSessionWebSocketConnectionUrl",
+)(function* (input: {
+  readonly wsBaseUrl: string;
+  readonly httpBaseUrl: string;
+  readonly cloudflareAccess?: CloudflareAccessAuthorization;
+  readonly timeoutMs?: number;
+}) {
+  const issued = yield* issueBrowserSessionWebSocketTicket({
+    httpBaseUrl: input.httpBaseUrl,
     ...(input.cloudflareAccess ? { cloudflareAccess: input.cloudflareAccess } : {}),
     ...(input.timeoutMs ? { timeoutMs: input.timeoutMs } : {}),
   });

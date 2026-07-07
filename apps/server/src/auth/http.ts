@@ -29,6 +29,7 @@ import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import { identity } from "effect/Function";
 import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
 import * as Cookies from "effect/unstable/http/Cookies";
 import * as HttpEffect from "effect/unstable/http/HttpEffect";
 import { HttpServerRequest, HttpServerResponse } from "effect/unstable/http";
@@ -37,13 +38,20 @@ import * as HttpApiBuilder from "effect/unstable/httpapi/HttpApiBuilder";
 import * as EnvironmentAuth from "./EnvironmentAuth.ts";
 import * as SessionStore from "./SessionStore.ts";
 import { traceAuthenticatedRelayRequest, traceRelayRequest } from "../cloud/traceRelayRequest.ts";
+import * as ServerConfig from "../config.ts";
 import { deriveAuthClientMetadata } from "./utils.ts";
 import { verifyRequestDpopProof } from "./dpop.ts";
+import {
+  browserCookieCredentialOriginAllowed,
+  configuredBrowserCookieCredentialOrigins,
+  configuredHostedBrowserApiCredentialOrigins,
+} from "../httpCors.ts";
 
 const CREDENTIAL_RESPONSE_HEADERS = {
   "cache-control": "no-store",
   pragma: "no-cache",
 } as const;
+const SAFE_BROWSER_SESSION_METHODS = new Set(["GET", "HEAD", "OPTIONS"]);
 
 const appendCredentialResponseHeaders = HttpEffect.appendPreResponseHandler((_request, response) =>
   Effect.succeed(HttpServerResponse.setHeaders(response, CREDENTIAL_RESPONSE_HEADERS)),
@@ -64,6 +72,63 @@ const appendDpopChallengeOnUnauthorized = (error: EnvironmentAuthInvalidError) =
     }
     return yield* error;
   });
+
+function browserSessionCookieOptions(input: {
+  readonly request: HttpServerRequest.HttpServerRequest;
+  readonly expiresAt: DateTime.Utc;
+  readonly hostedOrigins: ReadonlySet<string>;
+}) {
+  const hostedOrigin =
+    input.request.headers.origin !== undefined &&
+    browserCookieCredentialOriginAllowed({
+      origin: input.request.headers.origin,
+      trustedOrigins: input.hostedOrigins,
+    });
+  return {
+    expires: DateTime.toDate(input.expiresAt),
+    httpOnly: true,
+    path: "/",
+    sameSite: hostedOrigin ? ("none" as const) : ("lax" as const),
+    ...(hostedOrigin ? { secure: true } : {}),
+  };
+}
+
+export function configuredCookieAuthCsrfOrigins(config: ServerConfig.ServerConfig["Service"]) {
+  return configuredBrowserCookieCredentialOrigins(config);
+}
+
+export const configuredCookieAuthCsrfOriginsEffect = Effect.map(
+  Effect.serviceOption(ServerConfig.ServerConfig),
+  Option.match({
+    onNone: () => new Set<string>(),
+    onSome: configuredCookieAuthCsrfOrigins,
+  }),
+);
+
+function csrfOriginAllowedForCookieAuth(
+  request: HttpServerRequest.HttpServerRequest,
+  trustedOrigins: ReadonlySet<string>,
+): boolean {
+  if (SAFE_BROWSER_SESSION_METHODS.has(request.method)) {
+    return true;
+  }
+  const requestUrl = HttpServerRequest.toURL(request);
+  return browserCookieCredentialOriginAllowed({
+    origin: request.headers.origin,
+    requestOrigin: requestUrl._tag === "Some" ? requestUrl.value.origin : undefined,
+    trustedOrigins,
+  });
+}
+
+export const requireCookieAuthCsrfOrigin = (input: {
+  readonly request: HttpServerRequest.HttpServerRequest;
+  readonly session: EnvironmentAuth.AuthenticatedSession;
+  readonly trustedOrigins?: ReadonlySet<string>;
+}) =>
+  input.session.method === "browser-session-cookie" &&
+  !csrfOriginAllowedForCookieAuth(input.request, input.trustedOrigins ?? new Set())
+    ? failEnvironmentAuthInvalid("invalid_credential")
+    : Effect.void;
 
 export const currentEnvironmentTraceId = Effect.currentParentSpan.pipe(
   Effect.map((span) => span.traceId),
@@ -175,6 +240,7 @@ export const environmentAuthenticatedAuthLayer = Layer.effect(
   EnvironmentAuthenticatedAuth,
   Effect.gen(function* () {
     const serverAuth = yield* EnvironmentAuth.EnvironmentAuth;
+    const trustedOrigins = yield* configuredCookieAuthCsrfOriginsEffect;
     return (httpEffect) =>
       Effect.gen(function* () {
         const request = yield* HttpServerRequest.HttpServerRequest;
@@ -186,6 +252,7 @@ export const environmentAuthenticatedAuthLayer = Layer.effect(
             failEnvironmentInternal("internal_error", error),
           ),
         );
+        yield* requireCookieAuthCsrfOrigin({ request, session, trustedOrigins });
         return yield* httpEffect.pipe(
           Effect.provideService(EnvironmentAuthenticatedPrincipal, {
             ...session,
@@ -203,6 +270,13 @@ export const authHttpApiLayer = HttpApiBuilder.group(
   Effect.fnUntraced(function* (handlers) {
     const serverAuth = yield* EnvironmentAuth.EnvironmentAuth;
     const sessions = yield* SessionStore.SessionStore;
+    const hostedOrigins = yield* Effect.map(
+      Effect.serviceOption(ServerConfig.ServerConfig),
+      Option.match({
+        onNone: () => new Set<string>(),
+        onSome: configuredHostedBrowserApiCredentialOrigins,
+      }),
+    );
 
     return handlers
       .handle(
@@ -229,12 +303,16 @@ export const authHttpApiLayer = HttpApiBuilder.group(
               deriveAuthClientMetadata({ request }),
             );
             const sessionCookies = yield* Effect.fromResult(
-              Cookies.set(Cookies.empty, sessions.cookieName, result.sessionToken, {
-                expires: DateTime.toDate(result.response.expiresAt),
-                httpOnly: true,
-                path: "/",
-                sameSite: "lax",
-              }),
+              Cookies.set(
+                Cookies.empty,
+                sessions.cookieName,
+                result.sessionToken,
+                browserSessionCookieOptions({
+                  request,
+                  expiresAt: result.response.expiresAt,
+                  hostedOrigins,
+                }),
+              ),
             ).pipe(Effect.catch(() => failEnvironmentInternal("browser_session_cookie_failed")));
 
             yield* HttpEffect.appendPreResponseHandler((_request, response) =>

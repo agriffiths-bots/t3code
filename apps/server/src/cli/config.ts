@@ -104,6 +104,10 @@ const EnvServerConfig = Config.all({
   host: Config.string("T3CODE_HOST").pipe(Config.option, Config.map(Option.getOrUndefined)),
   t3Home: Config.string("T3CODE_HOME").pipe(Config.option, Config.map(Option.getOrUndefined)),
   devUrl: Config.url("VITE_DEV_SERVER_URL").pipe(Config.option, Config.map(Option.getOrUndefined)),
+  hostedAppUrl: Config.url("VITE_HOSTED_APP_URL").pipe(
+    Config.option,
+    Config.map(Option.getOrUndefined),
+  ),
   noBrowser: Config.boolean("T3CODE_NO_BROWSER").pipe(
     Config.option,
     Config.map(Option.getOrUndefined),
@@ -359,6 +363,7 @@ export const resolveServerConfig = (
       host,
       staticDir,
       devUrl,
+      hostedAppUrl: env.hostedAppUrl,
       noBrowser,
       startupPresentation,
       desktopBootstrapToken,
