@@ -713,11 +713,37 @@ describe("EnvironmentSupervisor", () => {
     }),
   );
 
+  it.effect("retries backoff when connectivity becomes online from unknown", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness({
+        networkStatus: "unknown",
+        prepare: (attempt) =>
+          attempt === 1
+            ? Effect.fail(transient("Connectivity is not ready yet."))
+            : Effect.succeed(PREPARED_CONNECTION),
+      });
+      const supervisor = yield* EnvironmentSupervisor.make(TARGET_ENTRY, {
+        initiallyDesired: true,
+      }).pipe(Effect.provide(harness.dependencies));
+
+      yield* awaitState(
+        supervisor.state,
+        (state) => state.phase === "backoff" && state.attempt === 1,
+      );
+      yield* harness.setNetworkStatus("online");
+      yield* awaitState(supervisor.state, (state) => state.phase === "connected");
+
+      expect(yield* Ref.get(harness.prepareCount)).toBe(2);
+      expect(yield* Ref.get(harness.sessionCount)).toBe(1);
+    }),
+  );
+
   it.effect("keeps a blocked recovery idle when the delayed online wakeup arrives", () =>
     Effect.gen(function* () {
       const harness = yield* makeHarness({
         networkStatus: "offline",
-        prepare: () => Effect.fail(blocked()),
+        prepare: (attempt) =>
+          attempt === 1 ? Effect.fail(blocked()) : Effect.succeed(PREPARED_CONNECTION),
       });
       const supervisor = yield* EnvironmentSupervisor.make(TARGET_ENTRY, {
         initiallyDesired: true,
@@ -735,6 +761,12 @@ describe("EnvironmentSupervisor", () => {
       expect(yield* Ref.get(harness.prepareCount)).toBe(1);
       expect(yield* Ref.get(harness.sessionCount)).toBe(0);
       expect((yield* SubscriptionRef.get(supervisor.state)).phase).toBe("blocked");
+
+      yield* harness.wake("application-active");
+      yield* awaitState(supervisor.state, (state) => state.phase === "connected");
+
+      expect(yield* Ref.get(harness.prepareCount)).toBe(2);
+      expect(yield* Ref.get(harness.sessionCount)).toBe(1);
     }),
   );
 

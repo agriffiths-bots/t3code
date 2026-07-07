@@ -635,7 +635,10 @@ export const make = Effect.fn("EnvironmentSupervisor.make")(function* (
               if (next.network === "offline") {
                 return;
               }
-              break;
+              if (yield* Ref.get(suppressNextBrowserOnlineWakeup)) {
+                break;
+              }
+              return;
             case "Wakeup":
               if (yield* consumeSuppressedBrowserOnlineWakeup(next.reason)) {
                 break;
@@ -673,7 +676,10 @@ export const make = Effect.fn("EnvironmentSupervisor.make")(function* (
           if (yield* consumeSuppressedBrowserOnlineWakeup(next.reason)) {
             break;
           }
-          if (next.reason === "credentials-changed") {
+          if (next.reason === "browser-online") {
+            break;
+          }
+          if (next.reason === "application-active" || next.reason === "credentials-changed") {
             return;
           }
           break;
