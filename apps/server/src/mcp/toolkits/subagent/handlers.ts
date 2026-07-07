@@ -404,6 +404,13 @@ const spawnSubagent = Effect.fn("SubagentToolkit.spawn")(function* (input: Spawn
       yield* runtime.dispatchLimiter.bindChild(dispatchLease, started.threadId);
       const spawnedAtMs = yield* Effect.clockWith((clock) => clock.currentTimeMillis);
 
+      // Persist the parent linkage before registration relies on the in-memory
+      // limiter binding; restart reconciliation seeds running children from
+      // this durable link.
+      yield* dispatchParentSet(runtime, started.threadId, invocation.threadId).pipe(
+        Effect.mapError((error) => toToolError(error, "Failed to link sub-agent to parent.")),
+        Effect.onError(() => releaseDispatchLease),
+      );
       yield* coordinator
         .register({
           parentThreadId: invocation.threadId,
@@ -415,12 +422,6 @@ const spawnSubagent = Effect.fn("SubagentToolkit.spawn")(function* (input: Spawn
         .pipe(Effect.onError(() => releaseDispatchLease));
       return { started, spawnedAtMs };
     }),
-  );
-
-  // Persist the parent linkage so the coordinator's reconciliation (and the web
-  // tree) can recover it across restarts.
-  yield* dispatchParentSet(runtime, started.threadId, invocation.threadId).pipe(
-    Effect.mapError((error) => toToolError(error, "Failed to link sub-agent to parent.")),
   );
 
   const base: SpawnSubagentOutput = {

@@ -344,7 +344,7 @@ systemd_supports_expand_environment() {
 run_systemd_scope() {
   unit="t3-worker-$$-$(date +%s 2>/dev/null || echo 0).scope"
   if systemd_supports_expand_environment; then
-    "$systemd_run" --user --scope --quiet --collect --expand-environment=no "--unit=$unit" "--slice=$slice" "--nice=$nice" -- "$real_command" "$@" &
+    "$systemd_run" --user --scope --quiet --collect --expand-environment=no "--unit=$unit" "--slice=$slice" "--nice=$nice" -- "$real_command" "$@" <&0 &
   else
     escaped_command="$(escape_systemd_arg "$real_command")"
     first=1
@@ -360,7 +360,7 @@ run_systemd_scope() {
     if [ "$first" = 1 ]; then
       set --
     fi
-    "$systemd_run" --user --scope --quiet --collect "--unit=$unit" "--slice=$slice" "--nice=$nice" -- "$escaped_command" "$@" &
+    "$systemd_run" --user --scope --quiet --collect "--unit=$unit" "--slice=$slice" "--nice=$nice" -- "$escaped_command" "$@" <&0 &
   fi
 
   systemd_pid=$!

@@ -288,6 +288,7 @@ describe("WorkerProcessIsolation", () => {
       expect(contents).toContain("systemd-run");
       expect(contents).toContain("--expand-environment=no");
       expect(contents).toContain("--unit=$unit");
+      expect(contents).toContain('"$@" <&0 &');
       expect(contents).toContain('systemctl" --user kill --signal=TERM "$unit"');
       expect(contents).toContain('systemctl" --user kill --signal=KILL "$unit"');
       expect(contents).toContain("sed 's/\\$/\\$\\$/g'");
