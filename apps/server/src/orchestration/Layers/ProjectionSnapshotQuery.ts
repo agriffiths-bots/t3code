@@ -41,6 +41,7 @@ import {
   toPersistenceSqlError,
   type ProjectionRepositoryError,
 } from "../../persistence/Errors.ts";
+import { MAX_THREAD_CHECKPOINTS } from "../checkpointRetention.ts";
 import { ProjectionCheckpoint } from "../../persistence/Services/ProjectionCheckpoints.ts";
 import { ProjectionProject } from "../../persistence/Services/ProjectionProjects.ts";
 import { ProjectionState } from "../../persistence/Services/ProjectionState.ts";
@@ -58,6 +59,8 @@ import {
   type ProjectionThreadCheckpointContext,
   type ProjectionSnapshotQueryShape,
 } from "../Services/ProjectionSnapshotQuery.ts";
+
+const CHECKPOINT_DIFF_CONTEXT_KEEP_PER_THREAD = MAX_THREAD_CHECKPOINTS + 1;
 
 const decodeReadModel = Schema.decodeUnknownEffect(OrchestrationReadModel);
 const decodeShellSnapshot = Schema.decodeUnknownEffect(OrchestrationShellSnapshot);
@@ -126,6 +129,13 @@ const ProjectionThreadCheckpointContextThreadRowSchema = Schema.Struct({
   projectId: ProjectId,
   workspaceRoot: Schema.String,
   worktreePath: Schema.NullOr(Schema.String),
+});
+const ProjectionCheckpointTurnIdRowSchema = Schema.Struct({
+  turnId: TurnId,
+});
+const CheckpointTurnIdLookupInput = Schema.Struct({
+  threadId: ThreadId,
+  turnId: TurnId,
 });
 const FullThreadDiffContextLookupInput = Schema.Struct({
   threadId: ThreadId,
@@ -557,16 +567,32 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
     execute: () =>
       sql`
         SELECT
-          thread_id AS "threadId",
-          turn_id AS "turnId",
-          checkpoint_turn_count AS "checkpointTurnCount",
-          checkpoint_ref AS "checkpointRef",
-          checkpoint_status AS "status",
-          checkpoint_files_json AS "files",
-          assistant_message_id AS "assistantMessageId",
-          completed_at AS "completedAt"
-        FROM projection_turns
-        WHERE checkpoint_turn_count IS NOT NULL
+          checkpoint_rows.thread_id AS "threadId",
+          checkpoint_rows.turn_id AS "turnId",
+          checkpoint_rows.checkpoint_turn_count AS "checkpointTurnCount",
+          checkpoint_rows.checkpoint_ref AS "checkpointRef",
+          checkpoint_rows.checkpoint_status AS "status",
+          checkpoint_rows.checkpoint_files_json AS "files",
+          checkpoint_rows.assistant_message_id AS "assistantMessageId",
+          checkpoint_rows.completed_at AS "completedAt"
+        FROM (
+          SELECT
+            thread_id,
+            turn_id,
+            checkpoint_turn_count,
+            checkpoint_ref,
+            checkpoint_status,
+            checkpoint_files_json,
+            assistant_message_id,
+            completed_at,
+            ROW_NUMBER() OVER (
+              PARTITION BY thread_id
+              ORDER BY checkpoint_turn_count DESC
+            ) AS checkpoint_rank
+          FROM projection_turns
+          WHERE checkpoint_turn_count IS NOT NULL
+        ) checkpoint_rows
+        WHERE checkpoint_rows.checkpoint_rank <= ${MAX_THREAD_CHECKPOINTS}
         ORDER BY thread_id ASC, checkpoint_turn_count ASC
       `,
   });
@@ -904,18 +930,84 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
     execute: ({ threadId }) =>
       sql`
         SELECT
-          thread_id AS "threadId",
-          turn_id AS "turnId",
-          checkpoint_turn_count AS "checkpointTurnCount",
-          checkpoint_ref AS "checkpointRef",
-          checkpoint_status AS "status",
-          checkpoint_files_json AS "files",
-          assistant_message_id AS "assistantMessageId",
-          completed_at AS "completedAt"
+          checkpoint_rows.thread_id AS "threadId",
+          checkpoint_rows.turn_id AS "turnId",
+          checkpoint_rows.checkpoint_turn_count AS "checkpointTurnCount",
+          checkpoint_rows.checkpoint_ref AS "checkpointRef",
+          checkpoint_rows.checkpoint_status AS "status",
+          checkpoint_rows.checkpoint_files_json AS "files",
+          checkpoint_rows.assistant_message_id AS "assistantMessageId",
+          checkpoint_rows.completed_at AS "completedAt"
+        FROM (
+          SELECT
+            thread_id,
+            turn_id,
+            checkpoint_turn_count,
+            checkpoint_ref,
+            checkpoint_status,
+            checkpoint_files_json,
+            assistant_message_id,
+            completed_at,
+            ROW_NUMBER() OVER (
+              ORDER BY checkpoint_turn_count DESC
+            ) AS checkpoint_rank
+          FROM projection_turns
+          WHERE thread_id = ${threadId}
+            AND checkpoint_turn_count IS NOT NULL
+        ) checkpoint_rows
+        WHERE checkpoint_rows.checkpoint_rank <= ${CHECKPOINT_DIFF_CONTEXT_KEEP_PER_THREAD}
+        ORDER BY checkpoint_rows.checkpoint_turn_count ASC
+      `,
+  });
+
+  const listDetailCheckpointRowsByThread = SqlSchema.findAll({
+    Request: ThreadIdLookupInput,
+    Result: ProjectionCheckpointDbRowSchema,
+    execute: ({ threadId }) =>
+      sql`
+        SELECT
+          checkpoint_rows.thread_id AS "threadId",
+          checkpoint_rows.turn_id AS "turnId",
+          checkpoint_rows.checkpoint_turn_count AS "checkpointTurnCount",
+          checkpoint_rows.checkpoint_ref AS "checkpointRef",
+          checkpoint_rows.checkpoint_status AS "status",
+          checkpoint_rows.checkpoint_files_json AS "files",
+          checkpoint_rows.assistant_message_id AS "assistantMessageId",
+          checkpoint_rows.completed_at AS "completedAt"
+        FROM (
+          SELECT
+            thread_id,
+            turn_id,
+            checkpoint_turn_count,
+            checkpoint_ref,
+            checkpoint_status,
+            checkpoint_files_json,
+            assistant_message_id,
+            completed_at,
+            ROW_NUMBER() OVER (
+              ORDER BY checkpoint_turn_count DESC
+            ) AS checkpoint_rank
+          FROM projection_turns
+          WHERE thread_id = ${threadId}
+            AND checkpoint_turn_count IS NOT NULL
+        ) checkpoint_rows
+        WHERE checkpoint_rows.checkpoint_rank <= ${MAX_THREAD_CHECKPOINTS}
+        ORDER BY checkpoint_rows.checkpoint_turn_count ASC
+      `,
+  });
+
+  const listCheckpointTurnIdRowsByThread = SqlSchema.findAll({
+    Request: CheckpointTurnIdLookupInput,
+    Result: ProjectionCheckpointTurnIdRowSchema,
+    execute: ({ threadId, turnId }) =>
+      sql`
+        SELECT
+          turn_id AS "turnId"
         FROM projection_turns
         WHERE thread_id = ${threadId}
+          AND turn_id = ${turnId}
           AND checkpoint_turn_count IS NOT NULL
-        ORDER BY checkpoint_turn_count ASC
+        LIMIT 1
       `,
   });
 
@@ -936,10 +1028,20 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
               AND turns.checkpoint_turn_count IS NOT NULL
           ) AS "latestCheckpointTurnCount",
           (
-            SELECT turns.checkpoint_ref
-            FROM projection_turns AS turns
-            WHERE turns.thread_id = threads.thread_id
-              AND turns.checkpoint_turn_count = ${checkpointTurnCount}
+            SELECT checkpoint_rows.checkpoint_ref
+            FROM (
+              SELECT
+                turns.checkpoint_turn_count,
+                turns.checkpoint_ref,
+                ROW_NUMBER() OVER (
+                  ORDER BY turns.checkpoint_turn_count DESC
+                ) AS checkpoint_rank
+              FROM projection_turns AS turns
+              WHERE turns.thread_id = threads.thread_id
+                AND turns.checkpoint_turn_count IS NOT NULL
+            ) checkpoint_rows
+            WHERE checkpoint_rows.checkpoint_turn_count = ${checkpointTurnCount}
+              AND checkpoint_rows.checkpoint_rank <= ${CHECKPOINT_DIFF_CONTEXT_KEEP_PER_THREAD}
             LIMIT 1
           ) AS "toCheckpointRef"
         FROM projection_threads AS threads
@@ -1800,6 +1902,7 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
 
   const getThreadCheckpointContext: ProjectionSnapshotQueryShape["getThreadCheckpointContext"] = (
     threadId,
+    options,
   ) =>
     Effect.gen(function* () {
       const threadRow = yield* getThreadCheckpointContextThreadRow({ threadId }).pipe(
@@ -1823,11 +1926,28 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
         ),
       );
 
+      const trackedCheckpointTurnIds =
+        options?.trackedTurnId !== undefined
+          ? yield* listCheckpointTurnIdRowsByThread({
+              threadId,
+              turnId: options.trackedTurnId,
+            }).pipe(
+              Effect.mapError(
+                toPersistenceSqlOrDecodeError(
+                  "ProjectionSnapshotQuery.getThreadCheckpointContext:listCheckpointTurnId:query",
+                  "ProjectionSnapshotQuery.getThreadCheckpointContext:listCheckpointTurnId:decodeRows",
+                ),
+              ),
+              Effect.map((rows) => rows.map((row) => row.turnId)),
+            )
+          : undefined;
+
       return Option.some({
         threadId: threadRow.value.threadId,
         projectId: threadRow.value.projectId,
         workspaceRoot: threadRow.value.workspaceRoot,
         worktreePath: threadRow.value.worktreePath,
+        ...(trackedCheckpointTurnIds ? { trackedCheckpointTurnIds } : {}),
         checkpoints: checkpointRows.map(
           (row): OrchestrationCheckpointSummary => ({
             turnId: row.turnId,
@@ -1971,7 +2091,7 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
             ),
           ),
         ),
-        listCheckpointRowsByThread({ threadId }).pipe(
+        listDetailCheckpointRowsByThread({ threadId }).pipe(
           Effect.mapError(
             toPersistenceSqlOrDecodeError(
               "ProjectionSnapshotQuery.getThreadDetailById:listCheckpoints:query",

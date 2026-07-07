@@ -253,6 +253,7 @@ export class GitVcsDriver extends Context.Service<
     readonly removeWorktree: (
       input: VcsRemoveWorktreeInput,
     ) => Effect.Effect<void, GitCommandError>;
+    readonly pruneWorktrees: (cwd: string) => Effect.Effect<void, GitCommandError>;
     readonly renameBranch: (
       input: GitRenameBranchInput,
     ) => Effect.Effect<GitRenameBranchResult, GitCommandError>;
@@ -270,6 +271,8 @@ export class GitVcsDriver extends Context.Service<
 const WORKSPACE_FILES_MAX_OUTPUT_BYTES = 16 * 1024 * 1024;
 const GIT_CHECK_IGNORE_MAX_STDIN_BYTES = 256 * 1024;
 const CHECKPOINT_DIFF_MAX_OUTPUT_BYTES = 10_000_000;
+export const CHECKPOINT_REF_LIST_MAX_OUTPUT_BYTES = 64 * 1024 * 1024;
+const CHECKPOINT_REFS_PREFIX = "refs/t3/checkpoints";
 const WORKSPACE_GIT_HARDENED_CONFIG_ARGS = [
   "-c",
   "core.fsmonitor=false",
@@ -325,6 +328,96 @@ function chunkPathsForGitCheckIgnore(relativePaths: ReadonlyArray<string>): stri
   }
 
   return chunks;
+}
+
+interface CheckpointRefEntry {
+  readonly refName: string;
+  readonly threadSegment: string;
+  readonly turnCount: number;
+}
+
+function parseCheckpointRefEntry(refName: string): CheckpointRefEntry | null {
+  const prefix = `${CHECKPOINT_REFS_PREFIX}/`;
+  if (!refName.startsWith(prefix)) {
+    return null;
+  }
+
+  const rest = refName.slice(prefix.length);
+  const match = /^([^/]+)\/turn\/(\d+)$/.exec(rest);
+  if (!match) {
+    return null;
+  }
+
+  const threadSegment = match[1];
+  const turnCount = Number.parseInt(match[2] ?? "", 10);
+  if (!threadSegment || !Number.isSafeInteger(turnCount) || turnCount < 0) {
+    return null;
+  }
+
+  return { refName, threadSegment, turnCount };
+}
+
+function selectCheckpointRefsToPrune(
+  entries: ReadonlyArray<CheckpointRefEntry>,
+  keepPerThread: number,
+): {
+  readonly refsToDelete: ReadonlyArray<string>;
+  readonly keptCount: number;
+  readonly threadCount: number;
+} {
+  const boundedKeepPerThread = Math.max(1, Math.floor(keepPerThread));
+  const keepPositiveTurnCount = Math.max(0, boundedKeepPerThread - 1);
+  const byThread = new Map<string, CheckpointRefEntry[]>();
+
+  for (const entry of entries) {
+    const threadEntries = byThread.get(entry.threadSegment);
+    if (threadEntries) {
+      threadEntries.push(entry);
+    } else {
+      byThread.set(entry.threadSegment, [entry]);
+    }
+  }
+
+  const refsToDelete: string[] = [];
+  let keptCount = 0;
+
+  for (const threadEntries of byThread.values()) {
+    const baseline = threadEntries
+      .filter((entry) => entry.turnCount === 0)
+      .toSorted((left, right) => left.refName.localeCompare(right.refName));
+    const firstBaseline = baseline[0];
+    const positiveTurnKeepCount =
+      firstBaseline === undefined ? boundedKeepPerThread : keepPositiveTurnCount;
+    const newestPositiveTurns = threadEntries
+      .filter((entry) => entry.turnCount > 0)
+      .toSorted((left, right) => {
+        if (left.turnCount !== right.turnCount) {
+          return right.turnCount - left.turnCount;
+        }
+        return left.refName.localeCompare(right.refName);
+      });
+
+    const keptRefs = new Set<string>();
+    if (firstBaseline) {
+      keptRefs.add(firstBaseline.refName);
+    }
+    for (const entry of newestPositiveTurns.slice(0, positiveTurnKeepCount)) {
+      keptRefs.add(entry.refName);
+    }
+
+    keptCount += keptRefs.size;
+    for (const entry of threadEntries) {
+      if (!keptRefs.has(entry.refName)) {
+        refsToDelete.push(entry.refName);
+      }
+    }
+  }
+
+  return {
+    refsToDelete,
+    keptCount,
+    threadCount: byThread.size,
+  };
 }
 
 function parseGitRemoteVerboseOutput(
@@ -846,6 +939,58 @@ export const makeVcsDriverShape = Effect.fn("makeGitVcsDriverShape")(function* (
             }),
           { discard: true },
         );
+      },
+    ),
+
+    pruneCheckpointRefs: Effect.fn("GitVcsDriver.checkpoints.pruneCheckpointRefs")(
+      function* (input) {
+        const result = yield* execute({
+          operation: "GitVcsDriver.checkpoints.pruneCheckpointRefs.list",
+          cwd: input.cwd,
+          args: ["for-each-ref", "--format=%(refname)", CHECKPOINT_REFS_PREFIX],
+          allowNonZeroExit: true,
+          timeoutMs: 10_000,
+          maxOutputBytes: CHECKPOINT_REF_LIST_MAX_OUTPUT_BYTES,
+        });
+
+        if (result.exitCode !== 0) {
+          return yield* new VcsProcessExitError({
+            operation: "GitVcsDriver.checkpoints.pruneCheckpointRefs.list",
+            command: "git for-each-ref",
+            cwd: input.cwd,
+            exitCode: result.exitCode,
+            detail: result.stderr.trim() || "Checkpoint ref listing failed.",
+          });
+        }
+
+        const checkpointRefs = result.stdout
+          .split("\n")
+          .map((line) => line.trim())
+          .filter((line) => line.length > 0)
+          .flatMap((line) => {
+            const entry = parseCheckpointRefEntry(line);
+            return entry ? [entry] : [];
+          });
+        const selected = selectCheckpointRefsToPrune(checkpointRefs, input.keepPerThread);
+
+        yield* Effect.forEach(
+          selected.refsToDelete,
+          (checkpointRef) =>
+            execute({
+              operation: "GitVcsDriver.checkpoints.pruneCheckpointRefs.delete",
+              cwd: input.cwd,
+              args: ["update-ref", "-d", checkpointRef],
+              timeoutMs: 5_000,
+            }),
+          { discard: true },
+        );
+
+        return {
+          scannedCount: checkpointRefs.length,
+          keptCount: selected.keptCount,
+          deletedCount: selected.refsToDelete.length,
+          threadCount: selected.threadCount,
+        };
       },
     ),
   };

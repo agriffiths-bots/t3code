@@ -18,6 +18,7 @@ import type {
   OrchestrationThreadShell,
   ProjectId,
   ThreadId,
+  TurnId,
 } from "@t3tools/contracts";
 import * as Context from "effect/Context";
 import type * as Option from "effect/Option";
@@ -40,6 +41,11 @@ export interface ProjectionThreadCheckpointContext {
   readonly workspaceRoot: string;
   readonly worktreePath: string | null;
   readonly checkpoints: ReadonlyArray<OrchestrationCheckpointSummary>;
+  readonly trackedCheckpointTurnIds?: ReadonlyArray<TurnId>;
+}
+
+export interface ProjectionThreadCheckpointContextOptions {
+  readonly trackedTurnId?: TurnId;
 }
 
 export interface ProjectionFullThreadDiffContext {
@@ -134,6 +140,7 @@ export interface ProjectionSnapshotQueryShape {
    */
   readonly getThreadCheckpointContext: (
     threadId: ThreadId,
+    options?: ProjectionThreadCheckpointContextOptions,
   ) => Effect.Effect<Option.Option<ProjectionThreadCheckpointContext>, ProjectionRepositoryError>;
 
   /**

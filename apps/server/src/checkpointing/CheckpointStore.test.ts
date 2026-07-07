@@ -114,6 +114,98 @@ it.layer(TestLayer)("CheckpointStore.layer", (it) => {
     );
   });
 
+  describe("pruneCheckpointRefs", () => {
+    it.effect("keeps turn zero and the newest tail per thread", () =>
+      Effect.gen(function* () {
+        const tmp = yield* makeTmpDir();
+        yield* initRepoWithCommit(tmp);
+        const checkpointStore = yield* CheckpointStore.CheckpointStore;
+        const threadId = ThreadId.make("thread-checkpoint-prune");
+        const refs = [0, 1, 2, 3, 4].map((turn) => checkpointRefForThreadTurn(threadId, turn));
+
+        for (const [index, checkpointRef] of refs.entries()) {
+          yield* writeTextFile(NodePath.join(tmp, "README.md"), `# turn ${index}\n`);
+          yield* checkpointStore.captureCheckpoint({
+            cwd: tmp,
+            checkpointRef,
+          });
+        }
+
+        const result = yield* checkpointStore.pruneCheckpointRefs({
+          cwd: tmp,
+          keepPerThread: 3,
+        });
+
+        expect(result).toMatchObject({
+          scannedCount: 5,
+          keptCount: 3,
+          deletedCount: 2,
+          threadCount: 1,
+        });
+        expect(yield* checkpointStore.hasCheckpointRef({ cwd: tmp, checkpointRef: refs[0]! })).toBe(
+          true,
+        );
+        expect(yield* checkpointStore.hasCheckpointRef({ cwd: tmp, checkpointRef: refs[1]! })).toBe(
+          false,
+        );
+        expect(yield* checkpointStore.hasCheckpointRef({ cwd: tmp, checkpointRef: refs[2]! })).toBe(
+          false,
+        );
+        expect(yield* checkpointStore.hasCheckpointRef({ cwd: tmp, checkpointRef: refs[3]! })).toBe(
+          true,
+        );
+        expect(yield* checkpointStore.hasCheckpointRef({ cwd: tmp, checkpointRef: refs[4]! })).toBe(
+          true,
+        );
+      }),
+    );
+
+    it.effect("uses the full keep budget when a thread has no turn zero", () =>
+      Effect.gen(function* () {
+        const tmp = yield* makeTmpDir();
+        yield* initRepoWithCommit(tmp);
+        const checkpointStore = yield* CheckpointStore.CheckpointStore;
+        const threadId = ThreadId.make("thread-checkpoint-prune-no-baseline");
+        const refs = [1, 2, 3, 4, 5].map((turn) => checkpointRefForThreadTurn(threadId, turn));
+
+        for (const [index, checkpointRef] of refs.entries()) {
+          yield* writeTextFile(NodePath.join(tmp, "README.md"), `# turn ${index + 1}\n`);
+          yield* checkpointStore.captureCheckpoint({
+            cwd: tmp,
+            checkpointRef,
+          });
+        }
+
+        const result = yield* checkpointStore.pruneCheckpointRefs({
+          cwd: tmp,
+          keepPerThread: 3,
+        });
+
+        expect(result).toMatchObject({
+          scannedCount: 5,
+          keptCount: 3,
+          deletedCount: 2,
+          threadCount: 1,
+        });
+        expect(yield* checkpointStore.hasCheckpointRef({ cwd: tmp, checkpointRef: refs[0]! })).toBe(
+          false,
+        );
+        expect(yield* checkpointStore.hasCheckpointRef({ cwd: tmp, checkpointRef: refs[1]! })).toBe(
+          false,
+        );
+        expect(yield* checkpointStore.hasCheckpointRef({ cwd: tmp, checkpointRef: refs[2]! })).toBe(
+          true,
+        );
+        expect(yield* checkpointStore.hasCheckpointRef({ cwd: tmp, checkpointRef: refs[3]! })).toBe(
+          true,
+        );
+        expect(yield* checkpointStore.hasCheckpointRef({ cwd: tmp, checkpointRef: refs[4]! })).toBe(
+          true,
+        );
+      }),
+    );
+  });
+
   describe("diffCheckpoints", () => {
     it.effect("returns full oversized checkpoint diffs without truncation", () =>
       Effect.gen(function* () {

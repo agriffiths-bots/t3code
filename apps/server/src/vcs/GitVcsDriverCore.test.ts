@@ -523,6 +523,58 @@ it.layer(TestLayer)("GitVcsDriver core integration", (it) => {
       }),
     );
 
+    it.effect("keeps local refs available when a remote-tracking ref is broken", () =>
+      Effect.gen(function* () {
+        const cwd = yield* makeTmpDir();
+        const { initialBranch } = yield* initRepoWithCommit(cwd);
+        yield* git(cwd, ["update-ref", `refs/remotes/origin/${initialBranch}`, "HEAD"]);
+        const fileSystem = yield* FileSystem.FileSystem;
+        const pathService = yield* Path.Path;
+        const brokenRefPath = pathService.join(cwd, ".git", "refs", "remotes", "origin", "broken");
+        yield* fileSystem.makeDirectory(pathService.dirname(brokenRefPath), { recursive: true });
+        yield* fileSystem.writeFileString(
+          brokenRefPath,
+          "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n",
+        );
+        const driver = yield* GitVcsDriver.GitVcsDriver;
+
+        const refs = yield* driver.listRefs({ cwd, includeMatchingRemoteRefs: true });
+
+        assert.equal(refs.isRepo, true);
+        assert.equal(
+          refs.refs.some((ref) => ref.name === initialBranch && !ref.isRemote),
+          true,
+        );
+        assert.equal(
+          refs.refs.some((ref) => ref.name === `origin/${initialBranch}` && ref.isRemote),
+          true,
+        );
+      }),
+    );
+
+    it.effect("keeps healthy local refs available when a local ref target is missing", () =>
+      Effect.gen(function* () {
+        const cwd = yield* makeTmpDir();
+        const { initialBranch } = yield* initRepoWithCommit(cwd);
+        const fileSystem = yield* FileSystem.FileSystem;
+        const pathService = yield* Path.Path;
+        const brokenRefPath = pathService.join(cwd, ".git", "refs", "heads", "broken");
+        yield* fileSystem.writeFileString(
+          brokenRefPath,
+          "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n",
+        );
+        const driver = yield* GitVcsDriver.GitVcsDriver;
+
+        const refs = yield* driver.listRefs({ cwd });
+
+        assert.equal(refs.isRepo, true);
+        assert.equal(
+          refs.refs.some((ref) => ref.name === initialBranch && !ref.isRemote),
+          true,
+        );
+      }),
+    );
+
     it.effect("creates, checks out, renames, and lists refs", () =>
       Effect.gen(function* () {
         const cwd = yield* makeTmpDir();
@@ -589,8 +641,39 @@ it.layer(TestLayer)("GitVcsDriver core integration", (it) => {
         assert.equal(created.worktree.path, worktreePath);
         assert.equal(created.worktree.refName, "feature/worktree");
         assert.equal(yield* git(worktreePath, ["branch", "--show-current"]), "feature/worktree");
+        const refs = yield* driver.listRefs({ cwd });
+        assert.equal(
+          refs.refs.find((ref) => ref.name === "feature/worktree")?.worktreePath,
+          worktreePath,
+        );
 
         yield* driver.removeWorktree({ cwd, path: worktreePath });
+        const fileSystem = yield* FileSystem.FileSystem;
+        assert.equal(yield* fileSystem.exists(worktreePath), false);
+      }),
+    );
+
+    it.effect("force-removes a dirty worktree", () =>
+      Effect.gen(function* () {
+        const cwd = yield* makeTmpDir();
+        const { initialBranch } = yield* initRepoWithCommit(cwd);
+        const pathService = yield* Path.Path;
+        const worktreePath = pathService.join(
+          yield* makeTmpDir("git-worktrees-"),
+          "dirty-worktree",
+        );
+        const driver = yield* GitVcsDriver.GitVcsDriver;
+
+        yield* driver.createWorktree({
+          cwd,
+          path: worktreePath,
+          refName: initialBranch,
+          newRefName: "feature/dirty-worktree",
+        });
+        yield* writeTextFile(worktreePath, "dirty.txt", "dirty\n");
+
+        yield* driver.removeWorktree({ cwd, path: worktreePath }).pipe(Effect.flip);
+        yield* driver.removeWorktree({ cwd, path: worktreePath, force: true });
         const fileSystem = yield* FileSystem.FileSystem;
         assert.equal(yield* fileSystem.exists(worktreePath), false);
       }),
