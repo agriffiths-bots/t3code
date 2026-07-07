@@ -404,15 +404,15 @@ const spawnSubagent = Effect.fn("SubagentToolkit.spawn")(function* (input: Spawn
       yield* runtime.dispatchLimiter.bindChild(dispatchLease, started.threadId);
       const spawnedAtMs = yield* Effect.clockWith((clock) => clock.currentTimeMillis);
 
-      yield* restore(
-        coordinator.register({
+      yield* coordinator
+        .register({
           parentThreadId: invocation.threadId,
           childThreadId: started.threadId,
           detached,
           model: modelSelection,
           spawnedAtMs,
-        }),
-      ).pipe(Effect.onError(() => releaseDispatchLease));
+        })
+        .pipe(Effect.onError(() => releaseDispatchLease));
       return { started, spawnedAtMs };
     }),
   );

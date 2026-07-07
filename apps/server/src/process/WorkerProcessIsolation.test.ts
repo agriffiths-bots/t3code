@@ -61,6 +61,7 @@ describe("WorkerProcessIsolation", () => {
         "--scope",
         "--quiet",
         "--collect",
+        "--expand-environment=no",
         "--slice=factory-workers.slice",
         "--nice=10",
         "--",
@@ -78,6 +79,7 @@ describe("WorkerProcessIsolation", () => {
         "--scope",
         "--quiet",
         "--collect",
+        "--expand-environment=no",
         "--slice=factory-workers.slice",
         "--nice=10",
         "--",
@@ -176,6 +178,7 @@ describe("WorkerProcessIsolation", () => {
       expect(executable.executablePath).toBe(path.join(directory, "t3-worker-systemd-run"));
       expect(executable.env.T3_WORKER_REAL_COMMAND).toBe("/usr/bin/claude");
       expect(contents).toContain("systemd-run");
+      expect(contents).toContain("--expand-environment=no");
       expect(contents).toContain("CPUQuota=$quota");
       expect(contents).toContain("/bin/true");
     }).pipe(

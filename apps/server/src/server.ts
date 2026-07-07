@@ -321,7 +321,6 @@ const ProviderRuntimeLayerLive = ProviderSessionReaperLive.pipe(
 const RuntimeCoreDependenciesBaseLive = ReactorLayerLive.pipe(
   // Core Services
   Layer.provideMerge(SubagentDispatchLimiter.layer),
-  Layer.provideMerge(WorkerProcessIsolation.layer),
   Layer.provideMerge(CheckpointingLayerLive),
   Layer.provideMerge(SourceControlProviderRegistryLayerLive),
   Layer.provideMerge(GitLayerLive),
@@ -343,6 +342,9 @@ const RuntimeCoreDependenciesBaseLive = ReactorLayerLive.pipe(
   // Provided once at the runtime level so every consumer sees the same
   // logger instances.
   Layer.provideMerge(ProviderEventLoggers.ProviderEventLoggersLive),
+  // Keep this outside provider runtime/hydration so Codex/Claude adapter
+  // construction sees the optional WorkerProcessIsolation service.
+  Layer.provideMerge(WorkerProcessIsolation.layer),
 );
 
 const RuntimeCoreDependenciesLive = RuntimeCoreDependenciesBaseLive.pipe(

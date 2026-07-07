@@ -127,6 +127,7 @@ const runScopeProbe = (
         "--scope",
         "--quiet",
         "--collect",
+        "--expand-environment=no",
         `--slice=${config.slice}`,
         `--nice=${String(config.nice)}`,
         "--",
@@ -147,6 +148,7 @@ const wrapCommand = (
     "--scope",
     "--quiet",
     "--collect",
+    "--expand-environment=no",
     `--slice=${config.slice}`,
     `--nice=${String(config.nice)}`,
     "--",
@@ -190,8 +192,8 @@ case "$enabled" in
     exec "$real_command" "$@"
     ;;
 esac
-if command -v "$systemd_run" >/dev/null 2>&1 && command -v "$systemctl" >/dev/null 2>&1 && "$systemd_run" --user --scope --quiet --collect "--slice=$slice" "--nice=$nice" -- /bin/true >/dev/null 2>&1 && "$systemctl" --user set-property --runtime "$slice" "CPUQuota=$quota" >/dev/null 2>&1; then
-  exec "$systemd_run" --user --scope --quiet --collect "--slice=$slice" "--nice=$nice" -- "$real_command" "$@"
+if command -v "$systemd_run" >/dev/null 2>&1 && command -v "$systemctl" >/dev/null 2>&1 && "$systemd_run" --user --scope --quiet --collect --expand-environment=no "--slice=$slice" "--nice=$nice" -- /bin/true >/dev/null 2>&1 && "$systemctl" --user set-property --runtime "$slice" "CPUQuota=$quota" >/dev/null 2>&1; then
+  exec "$systemd_run" --user --scope --quiet --collect --expand-environment=no "--slice=$slice" "--nice=$nice" -- "$real_command" "$@"
 fi
 exec "$real_command" "$@"
 `;
