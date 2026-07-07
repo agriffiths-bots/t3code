@@ -485,6 +485,14 @@ export const make = Effect.fn("EnvironmentSupervisor.make")(function* (
                 case "ConnectRequested":
                   break;
                 case "Wakeup":
+                  if (
+                    probeEvent.signal.reason === "credentials-changed" &&
+                    target._tag === "RelayConnectionTarget"
+                  ) {
+                    yield* logManagedRelayAccountChange;
+                    yield* Fiber.interrupt(probe);
+                    return;
+                  }
                   yield* consumeSuppressedBrowserOnlineWakeup(probeEvent.signal.reason);
                   break;
               }
@@ -633,7 +641,41 @@ export const make = Effect.fn("EnvironmentSupervisor.make")(function* (
     );
   });
 
-  const waitForSignal = Queue.take(signals);
+  const waitForSignal = Effect.fnUntraced(function* () {
+    for (;;) {
+      const next = yield* Queue.take(signals);
+      if (next._tag === "Wakeup" && (yield* consumeSuppressedBrowserOnlineWakeup(next.reason))) {
+        continue;
+      }
+      return next;
+    }
+  });
+
+  const waitForBlockedSignal = Effect.fnUntraced(function* () {
+    for (;;) {
+      const next = yield* Queue.take(signals);
+      switch (next._tag) {
+        case "DisconnectRequested":
+        case "RetryRequested":
+          return;
+        case "NetworkChanged":
+          if (next.network === "offline") {
+            return;
+          }
+          break;
+        case "Wakeup":
+          if (yield* consumeSuppressedBrowserOnlineWakeup(next.reason)) {
+            break;
+          }
+          if (next.reason === "credentials-changed") {
+            return;
+          }
+          break;
+        case "ConnectRequested":
+          break;
+      }
+    }
+  });
 
   const run = Effect.fnUntraced(function* () {
     let failureCount = 0;
@@ -650,14 +692,14 @@ export const make = Effect.fn("EnvironmentSupervisor.make")(function* (
         yield* Ref.set(suppressNextBrowserOnlineWakeup, false);
         yield* clearLease;
         yield* setState(availableState(currentIntent, generation));
-        yield* waitForSignal;
+        yield* waitForSignal();
         continue;
       }
       if (currentIntent.network === "offline") {
         yield* Ref.set(suppressNextBrowserOnlineWakeup, false);
         yield* clearLease;
         yield* setState(offlineState(currentIntent, generation, failureCount + 1, latestFailure));
-        yield* waitForSignal;
+        yield* waitForSignal();
         continue;
       }
 
@@ -694,7 +736,7 @@ export const make = Effect.fn("EnvironmentSupervisor.make")(function* (
           lastFailure: error,
           retryAt: null,
         });
-        yield* waitForSignal;
+        yield* waitForBlockedSignal();
         continue;
       }
 
