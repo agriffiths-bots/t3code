@@ -1,7 +1,13 @@
 import { expect, it } from "@effect/vitest";
 import { NodeHttpServer } from "@effect/platform-node";
 import * as NodeServices from "@effect/platform-node/NodeServices";
-import { EnvironmentId, PreviewTabId, ProviderInstanceId, ThreadId } from "@t3tools/contracts";
+import {
+  EnvironmentId,
+  PreviewAutomationTimeoutError,
+  PreviewTabId,
+  ProviderInstanceId,
+  ThreadId,
+} from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Stream from "effect/Stream";
@@ -37,6 +43,32 @@ const client = McpSchema.McpServerClient.of({
 const TestLayer = McpHttpServer.PreviewToolkitRegistrationLive.pipe(
   Layer.provideMerge(McpServer.McpServer.layer),
   Layer.provideMerge(PreviewAutomationBroker.layer.pipe(Layer.provide(NodeServices.layer))),
+);
+const timeoutPreviewBroker = PreviewAutomationBroker.PreviewAutomationBroker.of({
+  connect: () => Effect.die("unused"),
+  focusHost: () => Effect.void,
+  respond: () => Effect.void,
+  invoke: (request) =>
+    Effect.fail(
+      new PreviewAutomationTimeoutError({
+        operation: request.operation,
+        environmentId: request.scope.environmentId,
+        threadId: request.scope.threadId,
+        providerSessionId: request.scope.providerSessionId,
+        providerInstanceId: request.scope.providerInstanceId,
+        clientId: "mcp-unresponsive-client",
+        connectionId: "connection-timeout",
+        requestId: "preview-timeout",
+        ...(request.tabId === undefined ? {} : { tabId: request.tabId }),
+        timeoutMs: request.timeoutMs ?? 15_000,
+      }),
+    ),
+});
+const TimeoutTestLayer = McpHttpServer.PreviewToolkitRegistrationLive.pipe(
+  Layer.provideMerge(McpServer.McpServer.layer),
+  Layer.provideMerge(
+    Layer.succeed(PreviewAutomationBroker.PreviewAutomationBroker, timeoutPreviewBroker),
+  ),
 );
 
 it("normalizes empty successful notification responses to accepted", () => {
@@ -141,6 +173,30 @@ it.effect("reports missing preview automation host as unavailable status", () =>
       ),
     ).toBe(true);
   }).pipe(Effect.provide(TestLayer)),
+);
+
+it.effect("reports unresponsive preview automation host as unavailable status", () =>
+  Effect.gen(function* () {
+    const server = yield* McpServer.McpServer;
+
+    const status = yield* server
+      .callTool({ name: "preview_status", arguments: {} })
+      .pipe(
+        Effect.provideService(McpInvocationContext.McpInvocationContext, invocation),
+        Effect.provideService(McpSchema.McpServerClient, client),
+      );
+
+    expect(status.isError).toBe(false);
+    expect(status.structuredContent).toMatchObject({
+      available: false,
+      visible: false,
+      tabId: null,
+      hostState: "missing",
+    });
+    expect(
+      (status.structuredContent as { readonly unavailableReason?: unknown }).unavailableReason,
+    ).toBe("Preview automation status timed out after 15000ms.");
+  }).pipe(Effect.provide(TimeoutTestLayer)),
 );
 
 it.effect("terminates HTTP MCP sessions with DELETE", () =>

@@ -7,6 +7,7 @@ import {
   PreviewAutomationMalformedResponseError,
   PreviewAutomationNoAvailableHostError,
   PreviewAutomationTargetNotEditableError,
+  PreviewAutomationTimeoutError,
   PreviewTabId,
   ProviderInstanceId,
   ThreadId,
@@ -19,6 +20,7 @@ import * as Deferred from "effect/Deferred";
 import * as Fiber from "effect/Fiber";
 import * as Result from "effect/Result";
 import * as Stream from "effect/Stream";
+import * as TestClock from "effect/testing/TestClock";
 
 import * as PreviewAutomationBroker from "./PreviewAutomationBroker.ts";
 
@@ -497,6 +499,47 @@ it.effect("removes host availability when the authoritative request stream disco
         .invoke<void>({ scope, operation: "status", input: {} })
         .pipe(Effect.flip);
       expect(error).toBeInstanceOf(PreviewAutomationNoAvailableHostError);
+    }),
+  ),
+);
+
+it.effect("keeps a connected host available after an operation timeout", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const broker = yield* makeBroker;
+      const connected = yield* Deferred.make<void>();
+      const routed = yield* Deferred.make<void>();
+      const events = yield* broker.connect(makeHost());
+      yield* Stream.runForEach(events, (event) => {
+        if (event.type === "connected") return Deferred.succeed(connected, undefined);
+        if (event.request.operation === "status") return Deferred.succeed(routed, undefined);
+        return broker.respond({
+          clientId: "client-1",
+          connectionId: event.connectionId,
+          requestId: event.request.requestId,
+          ok: true,
+          result: "still-connected",
+        });
+      }).pipe(Effect.forkScoped);
+      yield* Deferred.await(connected);
+
+      const timedOut = yield* broker
+        .invoke<void>({ scope, operation: "status", input: {}, timeoutMs: 5 })
+        .pipe(Effect.flip, Effect.forkScoped);
+      yield* Deferred.await(routed);
+      yield* TestClock.adjust("5 millis");
+      const error = yield* Fiber.join(timedOut);
+      expect(error).toBeInstanceOf(PreviewAutomationTimeoutError);
+      expect(error).toMatchObject({
+        operation: "status",
+        clientId: "client-1",
+        requestId: "preview-0",
+        timeoutMs: 5,
+      });
+
+      expect(
+        yield* broker.invoke<string>({ scope, operation: "open", input: {}, timeoutMs: 5 }),
+      ).toBe("still-connected");
     }),
   ),
 );
