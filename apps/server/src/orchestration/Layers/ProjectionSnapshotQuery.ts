@@ -1943,6 +1943,7 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
         createdAt: threadRow.value.createdAt,
         updatedAt: threadRow.value.updatedAt,
         archivedAt: threadRow.value.archivedAt,
+        parentThreadId: threadRow.value.parentThreadId ?? null,
         deletedAt: null,
         messages: messageRows.map((row) => {
           const message = {
