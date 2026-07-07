@@ -65,10 +65,13 @@ type DecideOrchestrationCommandResult =
  * …), for archive cascade. Iterative BFS over `parentThreadId`; guards against
  * cycles so a malformed parent chain cannot loop forever.
  *
- * The parent/child index is built from ALL threads (including archived ones) so
- * that an already-archived intermediate node does not sever the subtree: we
- * still traverse THROUGH archived nodes but only emit archive events for the
- * unarchived descendants below them.
+ * The parent/child index includes archived (but not deleted) threads so that an
+ * already-archived intermediate node does not sever the subtree: we traverse
+ * THROUGH archived nodes but only emit archive events for the unarchived
+ * descendants below them. DELETED threads are excluded entirely — a deleted
+ * parent re-roots its children in the UI (they render as roots, not under the
+ * deleted node), so the cascade must not reach a live grandchild through a
+ * deleted link.
  */
 function collectUnarchivedDescendantIds(
   readModel: OrchestrationReadModel,
@@ -77,6 +80,7 @@ function collectUnarchivedDescendantIds(
   const childrenByParent = new Map<ThreadId, ThreadId[]>();
   const archivedById = new Map<ThreadId, boolean>();
   for (const thread of readModel.threads) {
+    if (thread.deletedAt !== null) continue; // deleted threads are outside the tree
     archivedById.set(thread.id, thread.archivedAt !== null);
     const parentId = thread.parentThreadId ?? null;
     if (parentId === null) continue;

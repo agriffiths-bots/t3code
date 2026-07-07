@@ -223,4 +223,37 @@ it.layer(NodeServices.layer)("archive cascade decider", (it) => {
       expect(archivedIds).toEqual(["childB", "grandchild", "parent"]);
     }),
   );
+
+  it.effect("does NOT traverse through a deleted child to a re-rooted grandchild", () =>
+    // A deleted childA re-roots its grandchild in the UI, so archiving the
+    // parent must not reach the live grandchild through the deleted link.
+    Effect.gen(function* () {
+      let readModel = yield* seedTree;
+      readModel = yield* apply(readModel, 10, {
+        eventId: asEventId("evt-delete-childA"),
+        aggregateKind: "thread",
+        aggregateId: asThreadId("childA"),
+        type: "thread.deleted",
+        occurredAt: now,
+        commandId: asCommandId("cmd-delete-childA"),
+        causationEventId: null,
+        correlationId: asCommandId("cmd-delete-childA"),
+        metadata: {},
+        payload: { threadId: asThreadId("childA"), deletedAt: now },
+      });
+
+      const decided = yield* decideOrchestrationCommand({
+        command: {
+          type: "thread.archive",
+          commandId: asCommandId("cmd-archive-parent-4"),
+          threadId: asThreadId("parent"),
+        },
+        readModel,
+      });
+      const events = (Array.isArray(decided) ? decided : [decided]) as PlannedEvent[];
+      const archivedIds = events.map((e) => (e.payload as { threadId: string }).threadId).sort();
+      // childA deleted -> not archived; grandchild unreachable through it -> not archived.
+      expect(archivedIds).toEqual(["childB", "parent"]);
+    }),
+  );
 });
