@@ -2,7 +2,7 @@ import * as Context from "effect/Context";
 import * as Layer from "effect/Layer";
 import type * as Stream from "effect/Stream";
 
-export type ConnectionWakeup = "application-active" | "credentials-changed";
+export type ConnectionWakeup = "application-active" | "browser-online" | "credentials-changed";
 
 export class ConnectionWakeups extends Context.Service<
   ConnectionWakeups,
