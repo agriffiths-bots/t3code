@@ -1,5 +1,9 @@
 import { defineConfig } from "vite-plus";
 
+import {
+  packageNameMatchesPrefix,
+  resolveBarePackageName,
+} from "../../scripts/lib/package-names.ts";
 import { loadRepoEnv } from "../../scripts/lib/public-config.ts";
 
 const repoEnv = loadRepoEnv();
@@ -9,14 +13,28 @@ const publicConfigDefine = {
     repoEnv.T3CODE_CLERK_PUBLISHABLE_KEY?.trim() ?? "",
   ),
 };
-const bundledDesktopMainDependencyPrefixes = ["@effect/", "@pierre/diffs", "@t3tools/"] as const;
+const externalDesktopMainDependencyPackageNames = new Set([
+  "electron",
+  // Native bridge loaded by @clerk/electron. Keep the binary package external
+  // so electron-builder can unpack its .node payload onto the real filesystem.
+  "@clerk/electron-passkeys",
+]);
+const externalDesktopMainDependencyPackagePrefixes = [
+  "@clerk/electron-passkeys-",
+  "@ff-labs/fff-bin-",
+  "@msgpackr-extract/",
+  "@yuuang/ffi-rs-",
+] as const;
 
 export function shouldBundleDesktopMainDependency(id: string): boolean {
-  return (
-    id === "effect" ||
-    id.startsWith("effect/") ||
-    bundledDesktopMainDependencyPrefixes.some((prefix) => id.startsWith(prefix))
-  );
+  const packageName = resolveBarePackageName(id);
+  if (packageName === undefined) return false;
+  if (externalDesktopMainDependencyPackageNames.has(packageName)) return false;
+  if (packageNameMatchesPrefix(packageName, externalDesktopMainDependencyPackagePrefixes)) {
+    return false;
+  }
+
+  return true;
 }
 
 export default defineConfig({

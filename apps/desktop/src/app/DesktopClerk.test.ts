@@ -25,9 +25,9 @@ vi.mock("@clerk/electron/storage", () => ({
 import * as DesktopClerk from "./DesktopClerk.ts";
 import * as DesktopEnvironment from "./DesktopEnvironment.ts";
 
-const makeDesktopClerkLayer = (isDevelopment = true) => {
+const makeDesktopClerkLayer = (isDevelopment = true, stateDir = "/tmp/t3-state") => {
   const environment = DesktopEnvironment.DesktopEnvironment.of({
-    stateDir: "/tmp/t3-state",
+    stateDir,
     isDevelopment,
   } as unknown as DesktopEnvironment.DesktopEnvironment["Service"]);
 
@@ -59,7 +59,12 @@ describe("DesktopClerk", () => {
     createClerkBridgeMock.mockReturnValue({ cleanup });
 
     return Effect.gen(function* () {
-      yield* Effect.scoped(Layer.build(makeDesktopClerkLayer()));
+      yield* Effect.scoped(
+        Effect.gen(function* () {
+          yield* Layer.build(makeDesktopClerkLayer());
+          yield* Layer.build(makeDesktopClerkLayer());
+        }),
+      );
 
       assert.deepEqual(createClerkBridgeMock.mock.calls, [
         [
@@ -67,6 +72,34 @@ describe("DesktopClerk", () => {
             storage: storageAdapter,
             passkeys: true,
             renderer: { scheme: "t3code-dev", host: "app" },
+          },
+        ],
+      ]);
+      assert.equal(cleanup.mock.calls.length, 1);
+      storageMock.mockClear();
+      createClerkBridgeMock.mockClear();
+    });
+  });
+
+  it.effect("reuses one process bridge across duplicate environment layers", () => {
+    const cleanup = vi.fn();
+    storageMock.mockReturnValue(storageAdapter);
+    createClerkBridgeMock.mockReturnValue({ cleanup });
+
+    return Effect.gen(function* () {
+      yield* Effect.scoped(
+        Effect.gen(function* () {
+          yield* Layer.build(makeDesktopClerkLayer(false, "/tmp/t3-state-a"));
+          yield* Layer.build(makeDesktopClerkLayer(false, "/tmp/t3-state-b"));
+        }),
+      );
+
+      assert.deepEqual(createClerkBridgeMock.mock.calls, [
+        [
+          {
+            storage: storageAdapter,
+            passkeys: true,
+            renderer: { scheme: "t3code", host: "app" },
           },
         ],
       ]);

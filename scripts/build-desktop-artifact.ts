@@ -582,7 +582,67 @@ interface StagePackageJson {
 }
 
 export const STAGE_INSTALL_ARGS = ["install", "--prod"] as const;
-export const DESKTOP_ASAR_UNPACK = ["apps/server/dist/**", "node_modules/**"] as const;
+export const DESKTOP_PACKAGE_BUILD_ENV = {
+  T3CODE_DESKTOP_PACKAGE: "1",
+  T3CODE_WEB_SOURCEMAP: "0",
+} as const;
+export const DESKTOP_AFTER_PACK_HOOK_STAGE_PATH = "desktop-after-pack-prune.mjs";
+export const DESKTOP_ASAR_UNPACK_BASE = ["apps/server/dist/**"] as const;
+export const DESKTOP_UNPACKED_FILE_LIMIT = 250;
+export const DESKTOP_NATIVE_ASAR_UNPACK_PACKAGE_PATTERNS = [
+  "@anthropic-ai/claude-agent-sdk-*",
+  "@clerk/electron-passkeys",
+  "@clerk/electron-passkeys-*",
+  "@ff-labs/fff-bin-*",
+  "@ff-labs/fff-node",
+  "@msgpackr-extract/*",
+  "@yuuang/ffi-rs-*",
+  "ffi-rs",
+] as const;
+export const DESKTOP_NODE_PTY_ASAR_UNPACK_PATTERNS = [
+  "node-pty/LICENSE",
+  "node-pty/package.json",
+  "node-pty/lib/**/*.js",
+  "node-pty/build/Release/*.node",
+  "node-pty/prebuilds/darwin-*/*.node",
+  "node-pty/prebuilds/darwin-*/spawn-helper",
+  "node-pty/prebuilds/linux-*/*",
+  "node-pty/prebuilds/win32-*/*.dll",
+  "node-pty/prebuilds/win32-*/*.exe",
+  "node-pty/prebuilds/win32-*/*.node",
+] as const;
+export const DESKTOP_STAGED_RUNTIME_DEPENDENCY_NAMES = [
+  "@anthropic-ai/claude-agent-sdk",
+  "@clerk/electron-passkeys",
+  "@ff-labs/fff-node",
+  "node-pty",
+] as const;
+
+function toAsarUnpackPackagePatterns(packagePattern: string): readonly string[] {
+  return [
+    `node_modules/${packagePattern}/**`,
+    `node_modules/.pnpm/**/node_modules/${packagePattern}/**`,
+  ];
+}
+
+function toAsarUnpackPathPatterns(pathPattern: string): readonly string[] {
+  return [`node_modules/${pathPattern}`, `node_modules/.pnpm/**/node_modules/${pathPattern}`];
+}
+
+export const DESKTOP_ASAR_UNPACK = [
+  ...DESKTOP_ASAR_UNPACK_BASE,
+  ...DESKTOP_NATIVE_ASAR_UNPACK_PACKAGE_PATTERNS.flatMap(toAsarUnpackPackagePatterns),
+  ...DESKTOP_NODE_PTY_ASAR_UNPACK_PATTERNS.flatMap(toAsarUnpackPathPatterns),
+] as const;
+
+export function createDesktopPackageBuildEnv(
+  env: NodeJS.ProcessEnv = process.env,
+): NodeJS.ProcessEnv {
+  return {
+    ...env,
+    ...DESKTOP_PACKAGE_BUILD_ENV,
+  };
+}
 
 export interface MacPasskeySigningConfiguration {
   readonly appId: string;
@@ -823,6 +883,41 @@ export function resolveFffNativeDependencies(
   return Object.fromEntries(
     architectures.flatMap((architecture) =>
       ["gnu", "musl"].map((libc) => [`@ff-labs/fff-bin-linux-${architecture}-${libc}`, version]),
+    ),
+  );
+}
+
+export function resolveClaudeAgentNativeDependencies(
+  platform: typeof BuildPlatform.Type,
+  arch: typeof BuildArch.Type,
+  version: string,
+): Record<string, string> {
+  const architectures = arch === "universal" ? (["arm64", "x64"] as const) : [arch];
+
+  if (platform === "mac") {
+    return Object.fromEntries(
+      architectures.map((architecture) => [
+        `@anthropic-ai/claude-agent-sdk-darwin-${architecture}`,
+        version,
+      ]),
+    );
+  }
+
+  if (platform === "win") {
+    return Object.fromEntries(
+      architectures.map((architecture) => [
+        `@anthropic-ai/claude-agent-sdk-win32-${architecture}`,
+        version,
+      ]),
+    );
+  }
+
+  return Object.fromEntries(
+    architectures.flatMap((architecture) =>
+      ["", "-musl"].map((libc) => [
+        `@anthropic-ai/claude-agent-sdk-linux-${architecture}${libc}`,
+        version,
+      ]),
     ),
   );
 }
@@ -1097,6 +1192,38 @@ const runCommand = Effect.fn("runCommand")(function* (
   }
 });
 
+const removeSourceMapFiles = Effect.fn("removeSourceMapFiles")(function* (
+  directory: string,
+): Effect.fn.Return<void, never, FileSystem.FileSystem | Path.Path> {
+  const fs = yield* FileSystem.FileSystem;
+  const path = yield* Path.Path;
+  const exists = yield* fs.exists(directory).pipe(Effect.orElseSucceed(() => false));
+  if (!exists) {
+    return;
+  }
+
+  const visit: (currentDirectory: string) => Effect.Effect<void> = (currentDirectory) =>
+    Effect.gen(function* () {
+      const entries = yield* fs
+        .readDirectory(currentDirectory)
+        .pipe(Effect.orElseSucceed(() => []));
+      for (const entry of entries) {
+        const entryPath = path.join(currentDirectory, entry);
+        const stat = yield* fs.stat(entryPath).pipe(Effect.orElseSucceed(() => null));
+        if (!stat) {
+          continue;
+        }
+        if (stat.type === "Directory") {
+          yield* visit(entryPath);
+        } else if (stat.type === "File" && entry.endsWith(".map")) {
+          yield* fs.remove(entryPath, { force: true }).pipe(Effect.ignore);
+        }
+      }
+    });
+
+  yield* visit(directory);
+});
+
 function generateMacIconSet(
   sourcePng: string,
   targetIcns: string,
@@ -1326,6 +1453,26 @@ export function resolveDesktopRuntimeDependencies(
   return resolveCatalogDependencies(runtimeDependencies, catalog, "apps/desktop");
 }
 
+export function resolveStagedRuntimeDependencies(input: {
+  readonly desktopDependencies: Record<string, string> | undefined;
+  readonly serverDependencies: Record<string, string> | undefined;
+  readonly catalog: Record<string, string>;
+}): Record<string, string> {
+  const dependencySpecs: Record<string, string> = {};
+  const manifests = [input.desktopDependencies ?? {}, input.serverDependencies ?? {}] as const;
+
+  for (const packageName of DESKTOP_STAGED_RUNTIME_DEPENDENCY_NAMES) {
+    for (const manifest of manifests) {
+      const dependencySpec = manifest[packageName];
+      if (dependencySpec === undefined) continue;
+      dependencySpecs[packageName] = dependencySpec;
+      break;
+    }
+  }
+
+  return resolveCatalogDependencies(dependencySpecs, input.catalog, "desktop staged runtime");
+}
+
 export const resolveGitHubPublishConfig = Effect.fn("resolveGitHubPublishConfig")(function* (
   updateChannel: "latest" | "nightly",
 ) {
@@ -1395,6 +1542,7 @@ export const createBuildConfig = Effect.fn("createBuildConfig")(function* (
         readonly provisioningProfilePath: string;
       }
     | undefined,
+  afterPackHookPath = `./${DESKTOP_AFTER_PACK_HOOK_STAGE_PATH}`,
 ) {
   const buildConfig: Record<string, unknown> = {
     appId: DESKTOP_APP_ID,
@@ -1403,14 +1551,13 @@ export const createBuildConfig = Effect.fn("createBuildConfig")(function* (
     directories: {
       buildResources: "apps/desktop/resources",
     },
-    // Keep all packaged runtime imports on the real filesystem. The desktop
-    // main process and Windows primary backend are asar-aware, but Effect's ESM
-    // graph uses extensionless relative imports that Node cannot resolve from
-    // inside app.asar. The WSL backend also launches plain `node`, which cannot
-    // read app.asar at all. A single app-root node_modules pattern covers every
-    // staged package, including scoped @effect/* dependencies and native
-    // optional packages, without package-by-package whack-a-mole.
+    // Keep only the runtime that must live on the real filesystem unpacked:
+    // the WSL backend entry/client assets plus native packages whose .node or
+    // sidecar binary payloads cannot be loaded from app.asar. JavaScript
+    // Electron main dependencies are bundled into main.cjs, and server
+    // JavaScript dependencies are bundled into apps/server/dist for WSL.
     asarUnpack: DESKTOP_ASAR_UNPACK,
+    afterPack: afterPackHookPath,
   };
   const updateChannel = resolveDesktopUpdateChannel(version);
   const publishConfig = yield* resolveGitHubPublishConfig(updateChannel);
@@ -1607,21 +1754,17 @@ const buildDesktopArtifact = Effect.fn("buildDesktopArtifact")(function* (
       }),
   });
 
-  const resolvedServerDependencies = yield* Effect.try({
-    try: () => resolveCatalogDependencies(serverDependencies, workspaceCatalog, "apps/server"),
-    catch: (cause) =>
-      new DesktopBuildDependencyResolutionError({
-        kind: "server-production",
-        manifestPath: "apps/server/package.json",
-        cause,
+  const resolvedStagedRuntimeDependencies = yield* Effect.try({
+    try: () =>
+      resolveStagedRuntimeDependencies({
+        desktopDependencies: desktopPackageJson.dependencies,
+        serverDependencies,
+        catalog: workspaceCatalog,
       }),
-  });
-  const resolvedDesktopRuntimeDependencies = yield* Effect.try({
-    try: () => resolveDesktopRuntimeDependencies(desktopPackageJson.dependencies, workspaceCatalog),
     catch: (cause) =>
       new DesktopBuildDependencyResolutionError({
         kind: "desktop-runtime",
-        manifestPath: "apps/desktop/package.json",
+        manifestPath: "apps/desktop/package.json + apps/server/package.json",
         cause,
       }),
   });
@@ -1645,10 +1788,14 @@ const buildDesktopArtifact = Effect.fn("buildDesktopArtifact")(function* (
 
   if (!options.skipBuild) {
     yield* Effect.log("[desktop-artifact] Building desktop/server/web artifacts...");
-    const spawnCommand = yield* resolveSpawnCommand("vp", ["run", "build:desktop"]);
+    const packageBuildEnv = createDesktopPackageBuildEnv();
+    const spawnCommand = yield* resolveSpawnCommand("vp", ["run", "build:desktop"], {
+      env: packageBuildEnv,
+    });
     yield* runCommand(
       ChildProcess.make(spawnCommand.command, spawnCommand.args, {
         cwd: repoRoot,
+        env: packageBuildEnv,
         shell: spawnCommand.shell,
       }),
       { label: "vp run build:desktop", verbose: options.verbose },
@@ -1683,9 +1830,14 @@ const buildDesktopArtifact = Effect.fn("buildDesktopArtifact")(function* (
   yield* fs.makeDirectory(path.join(stageAppDir, "apps/server"), { recursive: true });
 
   yield* Effect.log("[desktop-artifact] Staging release app...");
+  yield* fs.copyFile(
+    path.join(repoRoot, "scripts/desktop-after-pack-prune.mjs"),
+    path.join(stageAppDir, DESKTOP_AFTER_PACK_HOOK_STAGE_PATH),
+  );
   yield* fs.copy(distDirs.desktopDist, path.join(stageAppDir, "apps/desktop/dist-electron"));
   yield* fs.copy(distDirs.desktopResources, stageResourcesDir);
   yield* fs.copy(distDirs.serverDist, path.join(stageAppDir, "apps/server/dist"));
+  yield* removeSourceMapFiles(path.join(stageAppDir, "apps/server/dist"));
 
   yield* assertPlatformBuildResources(
     options.platform,
@@ -1730,8 +1882,12 @@ const buildDesktopArtifact = Effect.fn("buildDesktopArtifact")(function* (
   }
 
   const stageDependencies = {
-    ...resolvedServerDependencies,
-    ...resolvedDesktopRuntimeDependencies,
+    ...resolvedStagedRuntimeDependencies,
+    ...resolveClaudeAgentNativeDependencies(
+      options.platform,
+      options.arch,
+      serverPackageJson.dependencies["@anthropic-ai/claude-agent-sdk"],
+    ),
     ...resolveFffNativeDependencies(
       options.platform,
       options.arch,
@@ -1742,11 +1898,18 @@ const buildDesktopArtifact = Effect.fn("buildDesktopArtifact")(function* (
     // host's (win32), so promote the matching Linux fff binaries too; without
     // them file-finding in WSL fails to load its Linux native package.
     ...(options.platform === "win"
-      ? resolveFffNativeDependencies(
-          "linux",
-          options.arch,
-          serverPackageJson.dependencies["@ff-labs/fff-node"],
-        )
+      ? {
+          ...resolveClaudeAgentNativeDependencies(
+            "linux",
+            options.arch,
+            serverPackageJson.dependencies["@anthropic-ai/claude-agent-sdk"],
+          ),
+          ...resolveFffNativeDependencies(
+            "linux",
+            options.arch,
+            serverPackageJson.dependencies["@ff-labs/fff-node"],
+          ),
+        }
       : {}),
   };
   const stagePnpmConfig = createStagePnpmConfig(workspacePatchedDependencies, stageDependencies);
@@ -1773,6 +1936,7 @@ const buildDesktopArtifact = Effect.fn("buildDesktopArtifact")(function* (
             provisioningProfilePath: macPasskeySigning.provisioningProfilePath,
           }
         : undefined,
+      path.join(stageAppDir, DESKTOP_AFTER_PACK_HOOK_STAGE_PATH),
     ),
     dependencies: stageDependencies,
     devDependencies: {

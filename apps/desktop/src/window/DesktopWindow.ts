@@ -74,6 +74,7 @@ export class DesktopWindow extends Context.Service<
     readonly revealOrCreateMain: Effect.Effect<Electron.BrowserWindow, DesktopWindowError>;
     readonly activate: Effect.Effect<void, DesktopWindowError>;
     readonly createMainIfBackendReady: Effect.Effect<void, DesktopWindowError>;
+    readonly showBackendStartupError: (message: string) => Effect.Effect<void, DesktopWindowError>;
     // Show a lightweight "Connecting to WSL" splash window immediately (wsl-only
     // mode), before the WSL backend that serves the renderer is ready. It is
     // dismissed automatically once the real main window reveals.
@@ -86,9 +87,8 @@ export class DesktopWindow extends Context.Service<
     // readiness log and to preserve the callback contract the backend pool drives.
     readonly handleBackendReady: (httpBaseUrl: URL) => Effect.Effect<void, DesktopWindowError>;
     // Called when the backend transitions back to "not ready" (clean stop,
-    // restart, crash). Clears the latch that lets `activate` auto-create a
-    // window so a "macOS dock click" while the backend is down doesn't
-    // produce a stranded window pointing at nothing.
+    // restart, crash). Clears the latch so menu IPC stops targeting the
+    // renderer while the local backend is unavailable.
     readonly handleBackendNotReady: Effect.Effect<void>;
     readonly dispatchMenuAction: (action: string) => Effect.Effect<void, DesktopWindowError>;
     readonly syncAppearance: Effect.Effect<void>;
@@ -114,16 +114,104 @@ function getInitialWindowBackgroundColor(shouldUseDarkColors: boolean): string {
   return shouldUseDarkColors ? "#0a0a0a" : "#ffffff";
 }
 
+function buildBackendStatusDataUrl(input: {
+  readonly shouldUseDarkColors: boolean;
+  readonly title: string;
+  readonly message: string;
+  readonly tone: "loading" | "error";
+}): string {
+  const background = getInitialWindowBackgroundColor(input.shouldUseDarkColors);
+  const label = input.shouldUseDarkColors ? "#9ca3af" : "#6b7280";
+  const accent =
+    input.tone === "error"
+      ? input.shouldUseDarkColors
+        ? "#fca5a5"
+        : "#b91c1c"
+      : input.shouldUseDarkColors
+        ? "#f8fafc"
+        : "#1f2937";
+  const track = input.shouldUseDarkColors ? "rgba(248,250,252,0.18)" : "rgba(31,41,55,0.18)";
+  const spinner =
+    input.tone === "loading"
+      ? `<div class="spinner" aria-hidden="true"></div>`
+      : `<div class="mark" aria-hidden="true">!</div>`;
+  const html = `<!doctype html><html><head><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'"><style>html,body{margin:0;height:100%}body{background:${background};color:${label};font-family:system-ui,-apple-system,'Segoe UI',sans-serif;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:14px;-webkit-user-select:none;user-select:none;-webkit-app-region:drag;text-align:center}.spinner{width:26px;height:26px;border:3px solid ${track};border-top-color:${accent};border-radius:50%;animation:spin .8s linear infinite}.mark{width:28px;height:28px;border:2px solid ${accent};border-radius:50%;color:${accent};display:grid;place-items:center;font-weight:700;font-size:18px}.title{color:${accent};font-size:15px;font-weight:600}.label{font-size:13px;line-height:1.45;max-width:420px;padding:0 24px}@keyframes spin{to{transform:rotate(360deg)}}</style></head><body>${spinner}<div class="title">${escapeHtml(input.title)}</div><div class="label">${escapeHtml(input.message)}</div></body></html>`;
+  return `data:text/html;charset=utf-8,${encodeURIComponent(html)}`;
+}
+
+function escapeHtml(value: string): string {
+  return value
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#39;");
+}
+
 // A self-contained "Connecting to WSL" splash, shown immediately in wsl-only
 // mode while the WSL backend (which serves the renderer) cold-boots. Inlined as
 // a data URL so it needs no bundled asset and no backend — pure CSS, no JS.
 function buildConnectingSplashDataUrl(shouldUseDarkColors: boolean): string {
-  const background = getInitialWindowBackgroundColor(shouldUseDarkColors);
-  const label = shouldUseDarkColors ? "#9ca3af" : "#6b7280";
-  const accent = shouldUseDarkColors ? "#f8fafc" : "#1f2937";
-  const track = shouldUseDarkColors ? "rgba(248,250,252,0.18)" : "rgba(31,41,55,0.18)";
-  const html = `<!doctype html><html><head><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'"><style>html,body{margin:0;height:100%}body{background:${background};color:${label};font-family:system-ui,-apple-system,'Segoe UI',sans-serif;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:18px;-webkit-user-select:none;user-select:none;-webkit-app-region:drag}.spinner{width:26px;height:26px;border:3px solid ${track};border-top-color:${accent};border-radius:50%;animation:spin .8s linear infinite}.label{font-size:13px}@keyframes spin{to{transform:rotate(360deg)}}</style></head><body><div class="spinner"></div><div class="label">Connecting to WSL…</div></body></html>`;
-  return `data:text/html;charset=utf-8,${encodeURIComponent(html)}`;
+  return buildBackendStatusDataUrl({
+    shouldUseDarkColors,
+    title: "Connecting to WSL",
+    message: "Preparing the WSL backend...",
+    tone: "loading",
+  });
+}
+
+const allowedInternalNavigationUrls = new WeakMap<Electron.BrowserWindow, Set<string>>();
+
+function allowInternalWindowNavigation(window: Electron.BrowserWindow, url: string): void {
+  const urls = allowedInternalNavigationUrls.get(window) ?? new Set<string>();
+  urls.add(url);
+  allowedInternalNavigationUrls.set(window, urls);
+}
+
+function consumeAllowedInternalWindowNavigation(
+  window: Electron.BrowserWindow,
+  url: string,
+): boolean {
+  const urls = allowedInternalNavigationUrls.get(window);
+  if (!urls?.delete(url)) {
+    return false;
+  }
+  if (urls.size === 0) {
+    allowedInternalNavigationUrls.delete(window);
+  }
+  return true;
+}
+
+function clearAllowedInternalWindowNavigation(window: Electron.BrowserWindow, url: string): void {
+  const urls = allowedInternalNavigationUrls.get(window);
+  if (!urls) {
+    return;
+  }
+  urls.delete(url);
+  if (urls.size === 0) {
+    allowedInternalNavigationUrls.delete(window);
+  }
+}
+
+function loadWindowUrl(
+  window: Electron.BrowserWindow,
+  url: string,
+  options: { readonly internalNavigation?: boolean } = {},
+): void {
+  if (window.isDestroyed()) {
+    return;
+  }
+  if (options.internalNavigation === true) {
+    allowInternalWindowNavigation(window, url);
+  }
+  void window
+    .loadURL(url)
+    .catch(() => undefined)
+    .finally(() => {
+      if (options.internalNavigation === true) {
+        clearAllowedInternalWindowNavigation(window, url);
+      }
+    });
 }
 
 export function isSameOriginRendererNavigation(input: {
@@ -131,7 +219,15 @@ export function isSameOriginRendererNavigation(input: {
   readonly navigationUrl: string;
 }): boolean {
   try {
-    return new URL(input.applicationUrl).origin === new URL(input.navigationUrl).origin;
+    const applicationUrl = new URL(input.applicationUrl);
+    const navigationUrl = new URL(input.navigationUrl);
+    if (applicationUrl.protocol !== navigationUrl.protocol) {
+      return false;
+    }
+    if (applicationUrl.origin !== "null" || navigationUrl.origin !== "null") {
+      return applicationUrl.origin === navigationUrl.origin;
+    }
+    return applicationUrl.host === navigationUrl.host;
   } catch {
     return false;
   }
@@ -237,10 +333,11 @@ export const make = Effect.gen(function* () {
   const previewManager = yield* PreviewManager.PreviewManager;
   // Window-side latch for the primary backend's readiness. Set by
   // handleBackendReady (driven by the pool's onReady callback), cleared
-  // by handleBackendNotReady (driven by onShutdown). Only consumed by
-  // createMainIfBackendReady, which gates the post-readiness window
-  // open in development and the macOS "activate without windows" path.
+  // by handleBackendNotReady (driven by onShutdown). It controls whether the
+  // main window loads the renderer app or the local backend-starting status
+  // page, and it blocks menu IPC while the status page is visible.
   const backendReadyRef = yield* Ref.make(false);
+  const applicationUrl = getDesktopUrl(environment.isDevelopment);
   // The transient "Connecting to WSL" splash window, tracked separately so it
   // is never mistaken for the real main window.
   const splashWindowRef = yield* Ref.make<Option.Option<Electron.BrowserWindow>>(Option.none());
@@ -279,7 +376,6 @@ export const make = Effect.gen(function* () {
     DesktopWindowError
   > {
     yield* previewManager.getBrowserSession();
-    const applicationUrl = getDesktopUrl(environment.isDevelopment);
     const iconPaths = yield* assets.iconPaths;
     const iconOption = getIconOption(iconPaths, environment.platform);
     const shouldUseDarkColors = yield* electronTheme.shouldUseDarkColors;
@@ -379,6 +475,7 @@ export const make = Effect.gen(function* () {
     });
     window.webContents.on("will-navigate", (event, url) => {
       if (
+        consumeAllowedInternalWindowNavigation(window, url) ||
         isSameOriginRendererNavigation({
           applicationUrl,
           navigationUrl: url,
@@ -409,10 +506,19 @@ export const make = Effect.gen(function* () {
       runFork(Fiber.interrupt(retryFiber));
     };
     const loadApplication = () => {
-      if (window.isDestroyed()) {
-        return;
-      }
-      void window.loadURL(applicationUrl).catch(() => undefined);
+      loadWindowUrl(window, applicationUrl);
+    };
+    const loadBackendStatus = (title: string, message: string, tone: "loading" | "error") => {
+      loadWindowUrl(
+        window,
+        buildBackendStatusDataUrl({
+          shouldUseDarkColors,
+          title,
+          message,
+          tone,
+        }),
+        { internalNavigation: true },
+      );
     };
     const scheduleDevelopmentLoadRetry = () => {
       if (developmentLoadRetryFiber !== undefined || window.isDestroyed()) {
@@ -442,7 +548,6 @@ export const make = Effect.gen(function* () {
 
     window.webContents.on("did-finish-load", () => {
       if (
-        environment.isDevelopment &&
         !isSameOriginRendererNavigation({
           applicationUrl,
           navigationUrl: window.webContents.getURL(),
@@ -530,12 +635,28 @@ export const make = Effect.gen(function* () {
         ),
       );
     });
-    window.webContents.once("did-finish-load", () => {
+    window.webContents.on("did-finish-load", () => {
+      if (
+        !isSameOriginRendererNavigation({
+          applicationUrl,
+          navigationUrl: window.webContents.getURL(),
+        })
+      ) {
+        return;
+      }
       didFinishLoad = true;
       maybeSignalSmokeReady();
     });
 
-    loadApplication();
+    if (yield* Ref.get(backendReadyRef)) {
+      loadApplication();
+    } else {
+      loadBackendStatus(
+        "Starting T3 Code",
+        "Preparing the local backend. The app will open automatically when it is ready.",
+        "loading",
+      );
+    }
     if (environment.isDevelopment) {
       window.webContents.openDevTools({ mode: "detach" });
     }
@@ -576,6 +697,38 @@ export const make = Effect.gen(function* () {
     if (Option.isSome(existingWindow)) return;
     yield* createMain;
   }).pipe(Effect.withSpan("desktop.window.createMainIfBackendReady"));
+
+  const loadApplicationIfNeeded = (window: Electron.BrowserWindow) =>
+    Effect.sync(() => {
+      if (window.isDestroyed()) return;
+      if (
+        isSameOriginRendererNavigation({
+          applicationUrl,
+          navigationUrl: window.webContents.getURL(),
+        })
+      ) {
+        return;
+      }
+      loadWindowUrl(window, applicationUrl);
+    });
+
+  const showBackendStartupError = Effect.fn("desktop.window.showBackendStartupError")(function* (
+    message: string,
+  ) {
+    if (yield* Ref.get(backendReadyRef)) return;
+    const window = yield* ensureMain;
+    const shouldUseDarkColors = yield* electronTheme.shouldUseDarkColors;
+    const url = buildBackendStatusDataUrl({
+      shouldUseDarkColors,
+      title: "Backend still starting",
+      message,
+      tone: "error",
+    });
+    yield* Effect.sync(() => {
+      loadWindowUrl(window, url, { internalNavigation: true });
+    });
+    yield* logWindowWarning("backend startup timeout visible in main window", { message });
+  });
 
   const showConnectingSplash = Effect.gen(function* () {
     // Only when nothing is shown yet: no real window, no existing splash.
@@ -633,37 +786,26 @@ export const make = Effect.gen(function* () {
         yield* electronWindow.reveal(existingWindow.value);
         return;
       }
-      // No real main window yet. While the backend is still cold-booting,
-      // re-reveal the connecting splash so taskbar/dock activation brings it
-      // back instead of doing nothing. Once the backend is ready we fall
-      // through to (re)create the real main -- including retrying a previously
-      // failed open the pool swallowed -- rather than latching onto the splash.
-      const backendReady = yield* Ref.get(backendReadyRef);
-      if (!backendReady) {
-        const splash = yield* Ref.get(splashWindowRef);
-        if (Option.isSome(splash)) {
-          yield* electronWindow.reveal(splash.value);
-          return;
-        }
-      }
-      yield* createMainIfBackendReady;
+      yield* revealOrCreateMain;
     }).pipe(Effect.withSpan("desktop.window.activate")),
     createMainIfBackendReady,
+    showBackendStartupError,
     showConnectingSplash,
     handleBackendReady: Effect.fn("desktop.window.handleBackendReady")(function* (httpBaseUrl) {
       yield* Ref.set(backendReadyRef, true);
       yield* logWindowInfo("backend ready", { source: "http", url: httpBaseUrl.href });
-      yield* createMainIfBackendReady;
+      const window = yield* ensureMain;
+      yield* loadApplicationIfNeeded(window);
     }),
     handleBackendNotReady: Ref.set(backendReadyRef, false).pipe(
       Effect.withSpan("desktop.window.handleBackendNotReady"),
     ),
     dispatchMenuAction: Effect.fn("desktop.window.dispatchMenuAction")(function* (action) {
       yield* Effect.annotateCurrentSpan({ action });
-      const existingWindow = yield* focusedMainWindow;
-      if (Option.isNone(existingWindow) && !(yield* Ref.get(backendReadyRef))) {
+      if (!(yield* Ref.get(backendReadyRef))) {
         return;
       }
+      const existingWindow = yield* focusedMainWindow;
       const targetWindow = Option.isSome(existingWindow) ? existingWindow.value : yield* ensureMain;
 
       const send = () => {
