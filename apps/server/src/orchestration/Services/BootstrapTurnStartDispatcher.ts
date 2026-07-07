@@ -1,6 +1,7 @@
 import {
   CommandId,
   EventId,
+  type OrchestrationThread,
   OrchestrationDispatchCommandError,
   type OrchestrationCommand,
   type ThreadId,
@@ -11,19 +12,32 @@ import * as Crypto from "effect/Crypto";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 import * as Schema from "effect/Schema";
+import * as Semaphore from "effect/Semaphore";
+import * as SynchronizedRef from "effect/SynchronizedRef";
 
 import { GitWorkflowService } from "../../git/GitWorkflowService.ts";
+import { OrchestrationCommandReceiptRepository } from "../../persistence/Services/OrchestrationCommandReceipts.ts";
 import {
   ProjectSetupScriptRunner,
   type ProjectSetupScriptRunnerError,
 } from "../../project/ProjectSetupScriptRunner.ts";
 import { VcsStatusBroadcaster } from "../../vcs/VcsStatusBroadcaster.ts";
+import { OrchestrationCommandInvariantError } from "../Errors.ts";
 import { OrchestrationEngineService } from "./OrchestrationEngine.ts";
+import { ProjectionSnapshotQuery } from "./ProjectionSnapshotQuery.ts";
 
 type ThreadTurnStartCommand = Extract<OrchestrationCommand, { type: "thread.turn.start" }>;
+type BootstrapCreateThreadCommand = NonNullable<
+  NonNullable<ThreadTurnStartCommand["bootstrap"]>["createThread"]
+>;
+type BootstrapPrepareWorktreeCommand = NonNullable<
+  NonNullable<ThreadTurnStartCommand["bootstrap"]>["prepareWorktree"]
+>;
 
+const isOrchestrationCommandInvariantError = Schema.is(OrchestrationCommandInvariantError);
 const isOrchestrationDispatchCommandError = Schema.is(OrchestrationDispatchCommandError);
 
 const nowIso = Effect.map(DateTime.now, DateTime.formatIso);
@@ -54,6 +68,83 @@ function projectSetupScriptCompatibilityDetail(error: ProjectSetupScriptRunnerEr
     default:
       return unexpectedCompatibilityError(error);
   }
+}
+
+function threadAlreadyExistsDetail(threadId: ThreadId): string {
+  return `Thread '${threadId}' already exists and cannot be created twice.`;
+}
+
+function isDuplicateThreadCreateError(
+  error: OrchestrationDispatchCommandError,
+  threadId: ThreadId,
+) {
+  const detail = threadAlreadyExistsDetail(threadId);
+  const cause = error.cause;
+  if (isOrchestrationCommandInvariantError(cause)) {
+    return cause.commandType === "thread.create" && cause.detail === detail;
+  }
+  return error.message === `Orchestration command invariant failed (thread.create): ${detail}`;
+}
+
+function toCanonicalJson(value: unknown): string {
+  return JSON.stringify(toCanonicalJsonValue(value));
+}
+
+function toCanonicalJsonValue(value: unknown): unknown {
+  if (Array.isArray(value)) {
+    return value.map(toCanonicalJsonValue);
+  }
+  if (typeof value !== "object" || value === null) {
+    return value;
+  }
+  return Object.fromEntries(
+    Object.entries(value)
+      .filter(([, entryValue]) => entryValue !== undefined)
+      .sort(([leftKey], [rightKey]) => leftKey.localeCompare(rightKey))
+      .map(([entryKey, entryValue]) => [entryKey, toCanonicalJsonValue(entryValue)]),
+  );
+}
+
+function threadMatchesBootstrapCreate(
+  thread: OrchestrationThread,
+  createThread: BootstrapCreateThreadCommand,
+  hasPrepareWorktree: boolean,
+) {
+  if (thread.deletedAt !== null) return false;
+  if (thread.messages.length > 0 || thread.latestTurn !== null) return false;
+  if (thread.projectId !== createThread.projectId) return false;
+  if (thread.createdAt !== createThread.createdAt) return false;
+  if (toCanonicalJson(thread.modelSelection) !== toCanonicalJson(createThread.modelSelection)) {
+    return false;
+  }
+  if (thread.runtimeMode !== createThread.runtimeMode) return false;
+  if (thread.interactionMode !== createThread.interactionMode) return false;
+  if (!hasPrepareWorktree && thread.branch !== createThread.branch) return false;
+  if (!hasPrepareWorktree && thread.worktreePath !== createThread.worktreePath) return false;
+  return true;
+}
+
+function threadHasPreparedBootstrapWorktree(
+  thread: OrchestrationThread,
+  createThread: BootstrapCreateThreadCommand | undefined,
+  prepareWorktree: BootstrapPrepareWorktreeCommand,
+) {
+  if (thread.deletedAt !== null || thread.worktreePath === null) return false;
+  if (prepareWorktree.branch !== undefined) {
+    if (thread.branch !== prepareWorktree.branch) {
+      return false;
+    }
+  } else if (!createThread) {
+    return false;
+  }
+  if (
+    createThread &&
+    thread.branch === createThread.branch &&
+    thread.worktreePath === createThread.worktreePath
+  ) {
+    return false;
+  }
+  return true;
 }
 
 export interface BootstrapTurnStartDispatcherShape {
@@ -104,10 +195,13 @@ export const layer = Layer.effect(
   Effect.gen(function* () {
     const crypto = yield* Crypto.Crypto;
     const orchestrationEngine = yield* OrchestrationEngineService;
+    const commandReceiptRepository = yield* OrchestrationCommandReceiptRepository;
+    const projectionSnapshotQuery = yield* ProjectionSnapshotQuery;
     const gitWorkflow = yield* GitWorkflowService;
     const projectSetupScriptRunner = yield* ProjectSetupScriptRunner;
     const vcsStatusBroadcaster = yield* VcsStatusBroadcaster;
     const path = yield* Path.Path;
+    const bootstrapLocksRef = yield* SynchronizedRef.make(new Map<string, Semaphore.Semaphore>());
 
     const toDispatchCommandError = (cause: unknown, fallbackMessage: string) =>
       isOrchestrationDispatchCommandError(cause)
@@ -199,6 +293,30 @@ export const layer = Layer.effect(
       workspaceRelativePath: string | null,
     ) => (workspaceRelativePath ? path.join(worktreeRoot, workspaceRelativePath) : worktreeRoot);
 
+    const getThreadBootstrapSemaphore = (threadId: ThreadId) =>
+      SynchronizedRef.modifyEffect(bootstrapLocksRef, (current) => {
+        const existing = Option.fromNullishOr(current.get(threadId));
+        return Option.match(existing, {
+          onNone: () =>
+            Semaphore.make(1).pipe(
+              Effect.map((semaphore) => {
+                const next = new Map(current);
+                next.set(threadId, semaphore);
+                return [semaphore, next] as const;
+              }),
+            ),
+          onSome: (semaphore) => Effect.succeed([semaphore, current] as const),
+        });
+      });
+
+    const withThreadBootstrapLock = <A, E, R>(
+      threadId: ThreadId,
+      effect: Effect.Effect<A, E, R>,
+    ): Effect.Effect<A, E, R> =>
+      Effect.flatMap(getThreadBootstrapSemaphore(threadId), (semaphore) =>
+        semaphore.withPermit(effect),
+      );
+
     const dispatch = Effect.fn("BootstrapTurnStartDispatcher.dispatch")(function* (
       command: ThreadTurnStartCommand,
     ) {
@@ -208,6 +326,7 @@ export const layer = Layer.effect(
       let targetProjectId = bootstrap?.createThread?.projectId;
       let targetProjectCwd = bootstrap?.prepareWorktree?.projectCwd;
       let targetWorktreePath = bootstrap?.createThread?.worktreePath ?? null;
+      let skipWorktreePreparation = false;
 
       const cleanupCreatedThread = () =>
         createdThread
@@ -300,9 +419,22 @@ export const layer = Layer.effect(
           );
         });
 
+      const getFinalTurnReceipt = () =>
+        commandReceiptRepository
+          .getByCommandId({ commandId: command.commandId })
+          .pipe(
+            Effect.mapError((cause) =>
+              toDispatchCommandError(cause, "Failed to read bootstrap turn command receipt."),
+            ),
+          );
+
       const runSetupProgram = () =>
         Effect.gen(function* () {
           if (!bootstrap?.runSetupScript || !targetWorktreePath) {
+            return;
+          }
+          const finalTurnReceipt = yield* getFinalTurnReceipt();
+          if (Option.isSome(finalTurnReceipt)) {
             return;
           }
           const worktreePath = targetWorktreePath;
@@ -338,32 +470,135 @@ export const layer = Layer.effect(
             );
         });
 
+      const getCompatibleExistingThread = (createThread: BootstrapCreateThreadCommand) =>
+        projectionSnapshotQuery.getThreadDetailById(command.threadId).pipe(
+          Effect.map((maybeThread) => {
+            if (
+              Option.isSome(maybeThread) &&
+              threadMatchesBootstrapCreate(
+                maybeThread.value,
+                createThread,
+                bootstrap?.prepareWorktree !== undefined,
+              )
+            ) {
+              return Option.some(maybeThread.value);
+            }
+            return Option.none<OrchestrationThread>();
+          }),
+        );
+
+      const reuseExistingThread = (thread: OrchestrationThread) => {
+        targetWorktreePath = thread.worktreePath ?? targetWorktreePath;
+        if (
+          bootstrap?.prepareWorktree &&
+          threadHasPreparedBootstrapWorktree(
+            thread,
+            bootstrap.createThread,
+            bootstrap.prepareWorktree,
+          )
+        ) {
+          skipWorktreePreparation = true;
+        }
+      };
+
+      const reusePreparedWorktreeIfPresent = () =>
+        Effect.gen(function* () {
+          if (!bootstrap?.prepareWorktree || skipWorktreePreparation) {
+            return;
+          }
+          const finalTurnReceipt = yield* getFinalTurnReceipt();
+          if (Option.isSome(finalTurnReceipt)) {
+            skipWorktreePreparation = true;
+            return;
+          }
+          const existingThread = yield* projectionSnapshotQuery
+            .getThreadDetailById(command.threadId)
+            .pipe(
+              Effect.mapError((cause) =>
+                toDispatchCommandError(cause, "Failed to read bootstrap thread projection."),
+              ),
+            );
+          if (
+            Option.isSome(existingThread) &&
+            threadHasPreparedBootstrapWorktree(
+              existingThread.value,
+              bootstrap.createThread,
+              bootstrap.prepareWorktree,
+            )
+          ) {
+            reuseExistingThread(existingThread.value);
+          }
+        });
+
+      const dispatchCreateThread = (createThread: BootstrapCreateThreadCommand) =>
+        Effect.gen(function* () {
+          const existingThread = yield* getCompatibleExistingThread(createThread);
+          if (Option.isSome(existingThread)) {
+            reuseExistingThread(existingThread.value);
+            return;
+          }
+
+          yield* orchestrationEngine
+            .dispatch({
+              type: "thread.create",
+              commandId: yield* serverCommandId("bootstrap-thread-create"),
+              threadId: command.threadId,
+              projectId: createThread.projectId,
+              title: createThread.title,
+              modelSelection: createThread.modelSelection,
+              runtimeMode: createThread.runtimeMode,
+              interactionMode: createThread.interactionMode,
+              branch: createThread.branch,
+              worktreePath: createThread.worktreePath,
+              worktreeRemovable:
+                createThread.worktreeRemovable ?? bootstrap?.prepareWorktree !== undefined,
+              worktreeRemovalPath:
+                createThread.worktreeRemovalPath ??
+                (bootstrap?.prepareWorktree === undefined ? createThread.worktreePath : null),
+              createdAt: createThread.createdAt,
+            })
+            .pipe(
+              Effect.matchEffect({
+                onFailure: (error) => {
+                  const dispatchError = toDispatchCommandError(
+                    error,
+                    "Failed to create bootstrap thread.",
+                  );
+                  if (!isDuplicateThreadCreateError(dispatchError, command.threadId)) {
+                    return Effect.fail(dispatchError);
+                  }
+                  return getCompatibleExistingThread(createThread).pipe(
+                    Effect.mapError(() => dispatchError),
+                    Effect.flatMap((currentThread) => {
+                      if (Option.isNone(currentThread)) {
+                        return Effect.fail(dispatchError);
+                      }
+                      reuseExistingThread(currentThread.value);
+                      return Effect.void;
+                    }),
+                  );
+                },
+                onSuccess: () =>
+                  Effect.sync(() => {
+                    createdThread = true;
+                  }),
+              }),
+            );
+        });
+
       const bootstrapProgram = Effect.gen(function* () {
-        if (bootstrap?.createThread) {
-          yield* orchestrationEngine.dispatch({
-            type: "thread.create",
-            commandId: yield* serverCommandId("bootstrap-thread-create"),
-            threadId: command.threadId,
-            projectId: bootstrap.createThread.projectId,
-            title: bootstrap.createThread.title,
-            modelSelection: bootstrap.createThread.modelSelection,
-            runtimeMode: bootstrap.createThread.runtimeMode,
-            interactionMode: bootstrap.createThread.interactionMode,
-            branch: bootstrap.createThread.branch,
-            worktreePath: bootstrap.createThread.worktreePath,
-            worktreeRemovable:
-              bootstrap.createThread.worktreeRemovable ?? bootstrap.prepareWorktree !== undefined,
-            worktreeRemovalPath:
-              bootstrap.createThread.worktreeRemovalPath ??
-              (bootstrap.prepareWorktree === undefined
-                ? bootstrap.createThread.worktreePath
-                : null),
-            createdAt: bootstrap.createThread.createdAt,
-          });
-          createdThread = true;
+        const existingFinalTurnReceipt = yield* getFinalTurnReceipt();
+        if (Option.isSome(existingFinalTurnReceipt)) {
+          return yield* orchestrationEngine.dispatch(finalTurnStartCommand);
         }
 
-        if (bootstrap?.prepareWorktree) {
+        if (bootstrap?.createThread) {
+          yield* dispatchCreateThread(bootstrap.createThread);
+        }
+
+        yield* reusePreparedWorktreeIfPresent();
+
+        if (bootstrap?.prepareWorktree && !skipWorktreePreparation) {
           const workspaceRelativePath = yield* normalizeWorkspaceRelativePath(
             bootstrap.prepareWorktree.workspaceRelativePath,
           );
@@ -408,7 +643,7 @@ export const layer = Layer.effect(
         return yield* orchestrationEngine.dispatch(finalTurnStartCommand);
       });
 
-      return yield* bootstrapProgram.pipe(
+      const guardedBootstrapProgram = bootstrapProgram.pipe(
         Effect.catchCause((cause) => {
           const dispatchError = toBootstrapDispatchCommandCauseError(cause);
           if (Cause.hasInterruptsOnly(cause)) {
@@ -417,6 +652,8 @@ export const layer = Layer.effect(
           return cleanupCreatedThread().pipe(Effect.flatMap(() => Effect.fail(dispatchError)));
         }),
       );
+
+      return yield* withThreadBootstrapLock(command.threadId, guardedBootstrapProgram);
     });
 
     return BootstrapTurnStartDispatcher.of({ dispatch });
