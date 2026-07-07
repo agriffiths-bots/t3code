@@ -58,7 +58,7 @@ const dependencies = [McpInvocationContext.McpInvocationContext];
 
 export const ThreadStartTool = Tool.make("t3_thread_start", {
   description:
-    "Start a new T3 Code thread with the supplied initial prompt, only when the user explicitly asks to start/spawn/create another thread or agent. Do not use for autonomous delegation or background parallel work. Defaults to creating a new Git worktree from the repository default branch. Use current_checkout only when the user explicitly asks for the same checkout. To choose the model, pass `model` as a plain model name (e.g. 'claude-opus-4-8' or 'gpt-5.4') — the provider/harness is inferred automatically, so you never need to know or pass a harness/instance id. This tool launches the child turn and returns metadata without waiting for completion.",
+    "Start a new T3 Code thread with the supplied initial prompt, only when the user explicitly asks to start/spawn/create another thread or agent. Do not use for autonomous delegation or background parallel work. Defaults to creating a new Git worktree from the repository default branch when the project directory is a Git repository; non-Git projects start in the current directory with warning metadata. Use current_checkout only when the user explicitly asks for the same checkout. To choose the model, pass `model` as a plain model name (e.g. 'claude-opus-4-8' or 'gpt-5.4') — the provider/harness is inferred automatically, so you never need to know or pass a harness/instance id. This tool launches the child turn and returns metadata without waiting for completion.",
   parameters: ThreadStartToolInput,
   success: ThreadStartToolOutput,
   failure: ThreadStartToolError,

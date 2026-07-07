@@ -64,6 +64,14 @@ const project: OrchestrationProjectShell = {
   id: projectId,
   title: "Project",
   workspaceRoot: "/repo",
+  repositoryIdentity: {
+    canonicalKey: "git-local:/repo",
+    locator: {
+      source: "git-local",
+      rootPath: "/repo",
+    },
+    rootPath: "/repo",
+  },
   defaultModelSelection: modelSelection,
   scripts: [],
   createdAt: "2026-06-16T00:00:00.000Z",
@@ -223,6 +231,24 @@ const defaultGitWorkflow = {
     }),
 } satisfies Partial<GitWorkflowService["Service"]>;
 
+const nonRepoStatus = {
+  isRepo: false,
+  hasPrimaryRemote: false,
+  isDefaultRef: false,
+  refName: null,
+  hasWorkingTreeChanges: false,
+  workingTree: {
+    files: [],
+    insertions: 0,
+    deletions: 0,
+  },
+  hasUpstream: false,
+  aheadCount: 0,
+  behindCount: 0,
+  aheadOfDefaultCount: 0,
+  pr: null,
+};
+
 const makeTestLayer = (commands: OrchestrationCommand[], options: TestLayerOptions = {}) => {
   const testProject = options.project ?? project;
   const testSourceThread = options.sourceThread ?? sourceThread;
@@ -333,6 +359,142 @@ it.effect("starts a new worktree thread by default and inherits source settings"
     });
     expect(command.bootstrap?.createThread?.worktreeRemovable).toBe(true);
     expect(command.bootstrap?.runSetupScript).toBe(true);
+  }),
+);
+
+it.effect(
+  "degrades default worktree mode to current checkout when the project is not a git repo",
+  () =>
+    Effect.gen(function* () {
+      const commands: OrchestrationCommand[] = [];
+      const vcsCalls: string[] = [];
+      const gitCalls: string[] = [];
+      const result = yield* callStartTool({ prompt: "Run dispatch probe" }, commands, {
+        project: {
+          ...project,
+          workspaceRoot: "/home/adam",
+          repositoryIdentity: null,
+        },
+        sourceThread: {
+          ...sourceThread,
+          branch: null,
+        },
+        gitWorkflow: {
+          status: (input) =>
+            Effect.sync(() => {
+              gitCalls.push(input.cwd);
+              return nonRepoStatus;
+            }),
+        },
+        vcsDetect: (input) =>
+          Effect.sync(() => {
+            vcsCalls.push(`${input.cwd}:${input.cache ?? "allow"}`);
+            return null;
+          }),
+      });
+
+      expect(result.isError).toBe(false);
+      expect(result.structuredContent).toMatchObject({
+        projectId,
+        mode: "current_checkout",
+        branch: null,
+        worktreePath: null,
+      });
+      expect(result.structuredContent).toHaveProperty("warning");
+      expect(String(result.structuredContent?.warning)).toContain("not a Git repository");
+      const command = commands[0];
+      expect(command?.type).toBe("thread.turn.start");
+      if (command?.type !== "thread.turn.start") return;
+      expect(command.bootstrap?.prepareWorktree).toBeUndefined();
+      expect(command.bootstrap?.createThread?.worktreePath).toBeNull();
+      expect(command.bootstrap?.createThread?.worktreeRemovable).toBe(false);
+      expect(command.bootstrap?.createThread?.branch).toBeNull();
+      expect(vcsCalls).toEqual(["/home/adam:allow", "/home/adam:bypass"]);
+      expect(gitCalls).toEqual(["/home/adam"]);
+    }),
+);
+
+it.effect("ignores explicit worktree requests when the project is not a git repo", () =>
+  Effect.gen(function* () {
+    const commands: OrchestrationCommand[] = [];
+    const result = yield* callStartTool(
+      {
+        prompt: "Run current-directory worker",
+        mode: "existing_worktree",
+        worktreePath: "/repo/elsewhere",
+      },
+      commands,
+      {
+        project: {
+          ...project,
+          workspaceRoot: "/home/adam",
+          repositoryIdentity: null,
+        },
+        sourceThread: {
+          ...sourceThread,
+          branch: null,
+        },
+        gitWorkflow: {
+          status: () => Effect.succeed(nonRepoStatus),
+        },
+        vcsDetect: () => Effect.succeed(null),
+      },
+    );
+
+    expect(result.isError).toBe(false);
+    expect(result.structuredContent).toMatchObject({
+      projectId,
+      mode: "current_checkout",
+      branch: null,
+      worktreePath: null,
+    });
+    const command = commands[0];
+    expect(command?.type).toBe("thread.turn.start");
+    if (command?.type !== "thread.turn.start") return;
+    expect(command.bootstrap?.prepareWorktree).toBeUndefined();
+    expect(command.bootstrap?.createThread?.worktreePath).toBeNull();
+    expect(command.bootstrap?.createThread?.worktreeRemovable).toBe(false);
+  }),
+);
+
+it.effect("degrades worktree mode when VCS detection reports an unsupported backend", () =>
+  Effect.gen(function* () {
+    const commands: OrchestrationCommand[] = [];
+    const result = yield* callStartTool({ prompt: "Run under unsupported vcs" }, commands, {
+      project: {
+        ...project,
+        workspaceRoot: "/repo-jj",
+        repositoryIdentity: null,
+      },
+      sourceThread: {
+        ...sourceThread,
+        branch: null,
+      },
+      gitWorkflow: {
+        status: () => Effect.succeed(nonRepoStatus),
+      },
+      vcsDetect: () =>
+        Effect.fail(
+          new VcsUnsupportedOperationError({
+            operation: "VcsDriverRegistry.detect",
+            kind: "jj",
+            detail: "Driver 'jj' is not registered.",
+          }),
+        ),
+    });
+
+    expect(result.isError).toBe(false);
+    expect(result.structuredContent).toMatchObject({
+      projectId,
+      mode: "current_checkout",
+      worktreePath: null,
+    });
+    expect(result.structuredContent).toHaveProperty("warning");
+    const command = commands[0];
+    expect(command?.type).toBe("thread.turn.start");
+    if (command?.type !== "thread.turn.start") return;
+    expect(command.bootstrap?.prepareWorktree).toBeUndefined();
+    expect(command.bootstrap?.createThread?.worktreeRemovable).toBe(false);
   }),
 );
 
@@ -653,7 +815,11 @@ it.effect("falls back to the project checkout when the source worktree path is s
       baseBranch: "main",
       workspaceRelativePath: "packages/app",
     });
-    expect(vcsCalls).toEqual(["/repo/missing-worktree", "/repo/packages/app"]);
+    expect(vcsCalls).toEqual([
+      "/repo/missing-worktree",
+      "/repo/packages/app",
+      "/repo/packages/app",
+    ]);
     expect(gitCalls).toEqual(["listRefs:/repo/packages/app"]);
   }),
 );
@@ -711,7 +877,7 @@ it.effect("falls back when source worktree detection fails because the cwd is mi
       projectCwd: "/repo/project",
       baseBranch: "main",
     });
-    expect(vcsCalls).toEqual(["/repo/missing-worktree", "/repo/project"]);
+    expect(vcsCalls).toEqual(["/repo/missing-worktree", "/repo/project", "/repo/project"]);
   }),
 );
 
@@ -756,6 +922,7 @@ it.effect("bypasses stale cached source worktree detection before reusing its cw
     expect(vcsCalls).toEqual([
       { cwd: "/repo/missing-worktree", cache: "bypass" },
       { cwd: "/repo/project", cache: undefined },
+      { cwd: "/repo/project", cache: "bypass" },
     ]);
   }),
 );
@@ -819,7 +986,11 @@ it.effect("keeps source package cwd when only the project checkout validation fa
       baseBranch: "main",
       workspaceRelativePath: "packages/app",
     });
-    expect(vcsCalls).toEqual(["/repo/worktree/packages/app", "/repo/packages/app"]);
+    expect(vcsCalls).toEqual([
+      "/repo/worktree/packages/app",
+      "/repo/packages/app",
+      "/repo/worktree/packages/app",
+    ]);
   }),
 );
 
@@ -955,7 +1126,7 @@ it.effect(
         projectCwd: "/repo/project",
         baseBranch: "main",
       });
-      expect(vcsCalls).toEqual(["/repo/missing-worktree", "/repo/project"]);
+      expect(vcsCalls).toEqual(["/repo/missing-worktree", "/repo/project", "/repo/project"]);
       expect(gitCalls).toEqual(["listRefs:/repo/project", "status:/repo/project"]);
     }),
 );
@@ -1007,10 +1178,11 @@ it.effect("keeps the source worktree cwd when repository validation fails transi
           }).pipe(
             Effect.flatMap(() =>
               Effect.fail(
-                new VcsUnsupportedOperationError({
+                new VcsProcessSpawnError({
                   operation: "VcsDriverRegistry.detect",
-                  kind: "git",
-                  detail: "transient repository detection failure",
+                  command: "git",
+                  cwd: input.cwd,
+                  cause: new Error("transient repository detection failure"),
                 }),
               ),
             ),
@@ -1026,7 +1198,7 @@ it.effect("keeps the source worktree cwd when repository validation fails transi
       projectCwd: "/repo/worktree",
       baseBranch: "main",
     });
-    expect(vcsCalls).toEqual(["/repo/worktree", "/repo/worktree"]);
+    expect(vcsCalls).toEqual(["/repo/worktree", "/repo/worktree", "/repo/worktree"]);
   }),
 );
 
@@ -1080,11 +1252,15 @@ it.effect("preserves source package cwd when repository validation recovers afte
       baseBranch: "main",
       workspaceRelativePath: "packages/app",
     });
-    expect(vcsCalls).toEqual(["/repo/worktree/packages/app", "/repo/worktree/packages/app"]);
+    expect(vcsCalls).toEqual([
+      "/repo/worktree/packages/app",
+      "/repo/worktree/packages/app",
+      "/repo/worktree/packages/app",
+    ]);
   }),
 );
 
-it.effect("prepares new worktrees from the source worktree when the project root differs", () =>
+it.effect("preserves source git worktrees under non-repo projects", () =>
   Effect.gen(function* () {
     const commands: OrchestrationCommand[] = [];
     const result = yield* callStartTool(
@@ -1098,6 +1274,7 @@ it.effect("prepares new worktrees from the source worktree when the project root
         project: {
           ...project,
           workspaceRoot: "/home/adam",
+          repositoryIdentity: null,
         },
         sourceThread: {
           ...sourceThread,
@@ -1109,6 +1286,11 @@ it.effect("prepares new worktrees from the source worktree when the project root
     );
 
     expect(result.isError).toBe(false);
+    expect(result.structuredContent).toMatchObject({
+      projectId,
+      mode: "new_worktree",
+      worktreePath: null,
+    });
     const command = commands[0];
     expect(command?.type).toBe("thread.turn.start");
     if (command?.type !== "thread.turn.start") return;
@@ -1116,41 +1298,92 @@ it.effect("prepares new worktrees from the source worktree when the project root
       projectCwd: "/home/adam/wt-t20-worktree-fix",
       baseBranch: "main",
     });
+    expect(command.bootstrap?.createThread?.worktreePath).toBeNull();
+    expect(command.bootstrap?.createThread?.worktreeRemovable).toBe(true);
   }),
 );
 
-it.effect("falls back when a source worktree is outside a non-repo project container", () =>
+it.effect("re-detects before trusting a cached null project repository identity", () =>
   Effect.gen(function* () {
     const commands: OrchestrationCommand[] = [];
+    const vcsCalls: Array<{ readonly cwd: string; readonly cache?: string }> = [];
     const result = yield* callStartTool(
       {
-        prompt: "Spawn from outside checkout",
+        prompt: "Spawn after git init",
         baseBranch: "main",
       },
       commands,
       {
         project: {
           ...project,
-          workspaceRoot: "/home/adam",
-        },
-        sourceThread: {
-          ...sourceThread,
-          worktreePath: "/tmp/other-worktree",
+          workspaceRoot: "/repo",
+          repositoryIdentity: null,
         },
         vcsDetect: (input) =>
-          Effect.succeed(input.cwd === "/home/adam" ? null : makeGitHandle(input.cwd)),
+          Effect.sync(() => {
+            vcsCalls.push(input);
+            return makeGitHandle(input.cwd);
+          }),
       },
     );
 
     expect(result.isError).toBe(false);
+    expect(result.structuredContent).toMatchObject({
+      projectId,
+      mode: "new_worktree",
+      worktreePath: null,
+    });
     const command = commands[0];
     expect(command?.type).toBe("thread.turn.start");
     if (command?.type !== "thread.turn.start") return;
     expect(command.bootstrap?.prepareWorktree).toMatchObject({
-      projectCwd: "/home/adam",
+      projectCwd: "/repo",
       baseBranch: "main",
     });
+    expect(vcsCalls).toContainEqual({ cwd: "/repo", cache: "bypass" });
   }),
+);
+
+it.effect(
+  "degrades to the project checkout when a source worktree is outside a non-repo project",
+  () =>
+    Effect.gen(function* () {
+      const commands: OrchestrationCommand[] = [];
+      const result = yield* callStartTool(
+        {
+          prompt: "Spawn from outside checkout",
+          baseBranch: "main",
+        },
+        commands,
+        {
+          project: {
+            ...project,
+            workspaceRoot: "/home/adam",
+            repositoryIdentity: null,
+          },
+          sourceThread: {
+            ...sourceThread,
+            worktreePath: "/tmp/other-worktree",
+          },
+          vcsDetect: (input) =>
+            Effect.succeed(input.cwd === "/home/adam" ? null : makeGitHandle(input.cwd)),
+        },
+      );
+
+      expect(result.isError).toBe(false);
+      expect(result.structuredContent).toMatchObject({
+        projectId,
+        mode: "current_checkout",
+        worktreePath: null,
+      });
+      expect(result.structuredContent).toHaveProperty("warning");
+      const command = commands[0];
+      expect(command?.type).toBe("thread.turn.start");
+      if (command?.type !== "thread.turn.start") return;
+      expect(command.bootstrap?.prepareWorktree).toBeUndefined();
+      expect(command.bootstrap?.createThread?.worktreePath).toBeNull();
+      expect(command.bootstrap?.createThread?.worktreeRemovable).toBe(false);
+    }),
 );
 
 it.effect("accepts same-repo source worktrees when project detection uses relative metadata", () =>
