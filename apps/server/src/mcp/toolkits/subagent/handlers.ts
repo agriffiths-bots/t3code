@@ -26,6 +26,7 @@ import {
   pickModelSelectionFromInstances,
 } from "@t3tools/shared/model";
 import { Cron } from "croner";
+import * as Cause from "effect/Cause";
 import * as Crypto from "effect/Crypto";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
@@ -395,13 +396,16 @@ const spawnSubagent = Effect.fn("SubagentToolkit.spawn")(function* (input: Spawn
   const { started, spawnedAtMs } = yield* Effect.uninterruptibleMask((restore) =>
     Effect.gen(function* () {
       const dispatchLease = yield* restore(runtime.dispatchLimiter.acquire);
-      const releaseDispatchLease = runtime.dispatchLimiter.release(dispatchLease);
+      const releaseDispatchLease: Effect.Effect<void, never, never> =
+        runtime.dispatchLimiter.release(dispatchLease);
       const started = yield* restore(
         spawnRuntime({ ...threadStartInputWithSelection, modelSelection }, invocation, {
           providerSessionDetached: detached,
         }),
       ).pipe(Effect.onError(() => releaseDispatchLease));
       yield* runtime.dispatchLimiter.bindChild(dispatchLease, started.threadId);
+      const cleanupAndReleaseFromDelete = (reason: string) =>
+        cleanupStartedChild(runtime, started.threadId, reason, releaseDispatchLease);
       const spawnedAtMs = yield* Effect.clockWith((clock) => clock.currentTimeMillis);
 
       // Persist the parent linkage before registration relies on the in-memory
@@ -409,7 +413,7 @@ const spawnSubagent = Effect.fn("SubagentToolkit.spawn")(function* (input: Spawn
       // this durable link.
       yield* dispatchParentSet(runtime, started.threadId, invocation.threadId).pipe(
         Effect.mapError((error) => toToolError(error, "Failed to link sub-agent to parent.")),
-        Effect.onError(() => releaseDispatchLease),
+        Effect.onError(() => cleanupAndReleaseFromDelete("parent link failed")),
       );
       yield* coordinator
         .register({
@@ -419,7 +423,7 @@ const spawnSubagent = Effect.fn("SubagentToolkit.spawn")(function* (input: Spawn
           model: modelSelection,
           spawnedAtMs,
         })
-        .pipe(Effect.onError(() => releaseDispatchLease));
+        .pipe(Effect.onError(() => cleanupAndReleaseFromDelete("coordinator register failed")));
       return { started, spawnedAtMs };
     }),
   );
@@ -466,6 +470,33 @@ const dispatchParentSet = Effect.fn("SubagentToolkit.dispatchParentSet")(functio
     createdAt,
   });
 });
+
+const dispatchStartedChildDelete = Effect.fn("SubagentToolkit.dispatchStartedChildDelete")(
+  function* (runtime: SubagentRuntime, childThreadId: ThreadId) {
+    const uuid = yield* runtime.crypto.randomUUIDv4.pipe(Effect.orDie);
+    yield* runtime.orchestrationEngine.dispatch({
+      type: "thread.delete",
+      commandId: CommandId.make(`server:subagent-cleanup:${uuid}`),
+      threadId: childThreadId,
+    });
+  },
+);
+
+const cleanupStartedChild = (
+  runtime: SubagentRuntime,
+  childThreadId: ThreadId,
+  reason: string,
+  releaseDispatchLease: Effect.Effect<void, never, never>,
+): Effect.Effect<void, never, never> =>
+  dispatchStartedChildDelete(runtime, childThreadId).pipe(
+    Effect.catchCause((cause) =>
+      Effect.logWarning("failed to delete sub-agent after spawn registration failure", {
+        childThreadId,
+        reason,
+        cause: Cause.pretty(cause),
+      }).pipe(Effect.andThen(releaseDispatchLease)),
+    ),
+  );
 
 /**
  * Re-call the coordinator's bounded `waitSlice` until every requested child is

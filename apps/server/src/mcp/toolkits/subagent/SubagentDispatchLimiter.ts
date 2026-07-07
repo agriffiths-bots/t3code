@@ -146,10 +146,11 @@ const makeWithMax = (maxConcurrentDispatches: number) =>
           ] as const;
         });
         if (granted !== null) return granted;
-        return yield* restore(Deferred.await(waiter.deferred)).pipe(
-          Effect.tap(() => clearWaiterHandoff(waiter.id)),
+        const lease = yield* restore(Deferred.await(waiter.deferred)).pipe(
           Effect.onInterrupt(() => cancelWaiter(waiter)),
         );
+        yield* clearWaiterHandoff(waiter.id);
+        return lease;
       }),
     );
 

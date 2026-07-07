@@ -852,6 +852,7 @@ const make = Effect.gen(function* () {
   const handleThreadDeleted = (event: ThreadDeletedEvent) =>
     Effect.gen(function* () {
       const { threadId } = event.payload;
+      yield* dispatchLimiter.releaseForChild(threadId);
       if (children.has(threadId)) {
         yield* settleChild(threadId, "killed", "thread deleted");
       }
