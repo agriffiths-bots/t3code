@@ -13,7 +13,7 @@ const DEFAULT_TIMEOUT_MS = 90_000;
 const DEFAULT_STABILITY_MS = 5_000;
 const DESCRIPTOR_PATH = "/.well-known/t3/environment";
 const READY_MARKER_FILE = "main-window-ready.json";
-const MAX_CAPTURED_OUTPUT_BYTES = 256 * 1024;
+const MAX_CAPTURED_OUTPUT_BYTES = 2 * 1024 * 1024;
 const FATAL_OUTPUT_PATTERNS = [
   /ERR_MODULE_NOT_FOUND/i,
   /\bMODULE_NOT_FOUND\b/i,
