@@ -162,14 +162,16 @@ export interface ProjectionSnapshotQueryShape {
   ) => Effect.Effect<Option.Option<OrchestrationThreadShell>, ProjectionRepositoryError>;
 
   /**
-   * Read a single active thread detail snapshot by id.
+   * Read a single non-deleted thread detail snapshot by id. Archived threads are
+   * included so active detail clients can observe archive/unarchive transitions
+   * without treating archive as a terminal delete.
    */
   readonly getThreadDetailById: (
     threadId: ThreadId,
   ) => Effect.Effect<Option.Option<OrchestrationThread>, ProjectionRepositoryError>;
 
   /**
-   * Read a single active thread detail together with the projection snapshot
+   * Read a single non-deleted thread detail together with the projection snapshot
    * sequence in one consistent transaction, so the returned `snapshotSequence`
    * exactly matches the state reflected in `thread` (no interleaving projector
    * update between the two reads).

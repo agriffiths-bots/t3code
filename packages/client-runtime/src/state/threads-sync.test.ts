@@ -344,7 +344,7 @@ const unarchived = (sequence = 4): OrchestrationThreadStreamItem => ({
   event: {
     eventId: EventId.make("event-unarchived"),
     sequence,
-    occurredAt: "2026-04-01T03:00:00.000Z",
+    occurredAt: "2026-04-01T02:01:00.000Z",
     commandId: null,
     causationEventId: null,
     correlationId: null,
@@ -354,7 +354,7 @@ const unarchived = (sequence = 4): OrchestrationThreadStreamItem => ({
     type: "thread.unarchived",
     payload: {
       threadId: THREAD_ID,
-      updatedAt: "2026-04-01T03:00:00.000Z",
+      updatedAt: "2026-04-01T02:01:00.000Z",
     },
   },
 });
@@ -511,53 +511,32 @@ describe("EnvironmentThreads", () => {
     }),
   );
 
-  it.effect("removes active detail data when the thread is archived", () =>
+  it.effect("retains reversible active detail data when the thread is archived", () =>
     Effect.gen(function* () {
       const harness = yield* makeHarness({ cached: BASE_THREAD });
       yield* Queue.offer(harness.inputs, snapshot(BASE_THREAD, CACHED_SNAPSHOT_SEQUENCE + 1));
       yield* Queue.offer(harness.inputs, archived(CACHED_SNAPSHOT_SEQUENCE + 2));
 
-      const state = yield* awaitThreadState(
+      const archivedState = yield* awaitThreadState(
         harness.observed,
-        (value) => value.status === "deleted",
+        (value) =>
+          value.status === "live" &&
+          Option.isSome(value.data) &&
+          value.data.value.archivedAt === "2026-04-01T02:00:00.000Z",
       );
 
-      expect(Option.isNone(state.data)).toBe(true);
-      expect(yield* Ref.get(harness.removedThreads)).toEqual([THREAD_ID]);
-      yield* TestClock.adjust("500 millis");
-      yield* Effect.yieldNow;
-      expect(yield* Ref.get(harness.savedThreads)).toEqual([]);
-    }),
-  );
+      expect(Option.getOrThrow(archivedState.data).archivedAt).toBe("2026-04-01T02:00:00.000Z");
+      expect(yield* Ref.get(harness.removedThreads)).toEqual([]);
 
-  it.effect("reloads the detail when an archived thread is unarchived", () =>
-    Effect.gen(function* () {
-      const harness = yield* makeHarness({ cached: BASE_THREAD });
-      yield* Queue.offer(harness.inputs, snapshot(BASE_THREAD, CACHED_SNAPSHOT_SEQUENCE + 1));
-      yield* Queue.offer(harness.inputs, archived(CACHED_SNAPSHOT_SEQUENCE + 2));
-
-      yield* awaitThreadState(harness.observed, (value) => value.status === "deleted");
-
-      // The server-side projection now holds the unarchived thread at a later
-      // sequence; the unarchive event alone carries no thread data, so the
-      // detail must be reloaded through the reconcile path.
-      yield* Ref.set(
-        harness.httpSnapshot,
-        Option.some({
-          snapshotSequence: CACHED_SNAPSHOT_SEQUENCE + 3,
-          thread: { ...BASE_THREAD, updatedAt: "2026-04-01T03:00:00.000Z" },
-        }),
-      );
       yield* Queue.offer(harness.inputs, unarchived(CACHED_SNAPSHOT_SEQUENCE + 3));
-
-      const restored = yield* awaitThreadState(
+      const unarchivedState = yield* awaitThreadState(
         harness.observed,
-        (value) => value.status === "live" && Option.isSome(value.data),
+        (value) =>
+          value.status === "live" &&
+          Option.isSome(value.data) &&
+          value.data.value.archivedAt === null,
       );
-      expect(Option.isSome(restored.data)).toBe(true);
-      if (Option.isSome(restored.data)) {
-        expect(restored.data.value.archivedAt).toBeNull();
-      }
+      expect(Option.getOrThrow(unarchivedState.data).archivedAt).toBeNull();
     }),
   );
 

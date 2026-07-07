@@ -602,6 +602,15 @@ projectionSnapshotLayer("ProjectionSnapshotQuery", (it) => {
         [ThreadId.make("thread-archived")],
       );
       assert.equal(archivedShellSnapshot.threads[0]?.archivedAt, "2026-04-06T00:00:06.000Z");
+
+      const archivedDetailSnapshot = yield* snapshotQuery.getThreadDetailSnapshot(
+        ThreadId.make("thread-archived"),
+      );
+      assert.equal(archivedDetailSnapshot._tag, "Some");
+      if (archivedDetailSnapshot._tag === "Some") {
+        assert.equal(archivedDetailSnapshot.value.thread.id, "thread-archived");
+        assert.equal(archivedDetailSnapshot.value.thread.archivedAt, "2026-04-06T00:00:06.000Z");
+      }
     }),
   );
 

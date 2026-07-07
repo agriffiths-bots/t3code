@@ -55,7 +55,7 @@ function threadProjectionMatches(left: OrchestrationThread, right: Orchestration
 }
 
 function threadBelongsInActiveDetail(thread: OrchestrationThread): boolean {
-  return thread.deletedAt === null && thread.archivedAt === null;
+  return thread.deletedAt === null;
 }
 
 function formatThreadError(cause: Cause.Cause<unknown>): string {
