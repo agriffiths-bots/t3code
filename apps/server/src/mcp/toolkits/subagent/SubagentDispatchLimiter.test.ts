@@ -90,4 +90,21 @@ describe("SubagentDispatchLimiter", () => {
       yield* limiter.release(next);
     }).pipe(Effect.provide(layerTest(1))),
   );
+
+  it.effect("cleans up an interrupted queued acquire restored inside a masked handoff", () =>
+    Effect.gen(function* () {
+      const limiter = yield* SubagentDispatchLimiter;
+      const first = yield* limiter.acquire;
+      const interruptedFiber = yield* Effect.uninterruptibleMask((restore) =>
+        restore(limiter.acquire),
+      ).pipe(Effect.forkChild);
+
+      yield* Effect.yieldNow;
+      yield* Fiber.interrupt(interruptedFiber);
+      yield* limiter.release(first);
+
+      const next = yield* limiter.acquire;
+      yield* limiter.release(next);
+    }).pipe(Effect.provide(layerTest(1))),
+  );
 });

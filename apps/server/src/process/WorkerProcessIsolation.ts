@@ -1,3 +1,5 @@
+import * as NodeCrypto from "node:crypto";
+
 import { HostProcessPlatform } from "@t3tools/shared/hostProcess";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
@@ -22,6 +24,11 @@ export interface WorkerProcessIsolationConfig {
 export interface WorkerLaunchExecutable {
   readonly executablePath: string;
   readonly env: Readonly<Record<string, string>>;
+}
+
+interface SystemdAvailability {
+  readonly available: boolean;
+  readonly expandEnvironmentFlag: boolean;
 }
 
 export interface WorkerProcessIsolationShape {
@@ -49,6 +56,8 @@ const DEFAULT_CONFIG: WorkerProcessIsolationConfig = {
   systemctlPath: "systemctl",
 };
 
+let nextScopeId = 0;
+
 const truthy = (value: string): boolean => {
   const normalized = value.trim().toLowerCase();
   return (
@@ -68,6 +77,41 @@ const trimOr = (value: string, fallback: string): string => {
 };
 
 const supportsSystemdIsolation = (platform: NodeJS.Platform): boolean => platform === "linux";
+
+const makeScopeUnitName = (): string => {
+  nextScopeId += 1;
+  return `t3-worker-${process.pid}-${nextScopeId}-${NodeCrypto.randomUUID().replaceAll("-", "")}.scope`;
+};
+
+const escapeSystemdEnvironmentExpansion = (value: string): string => value.split("$").join("$$");
+
+const maybeEscapeSystemdArgument = (value: string, expandEnvironmentFlag: boolean): string =>
+  expandEnvironmentFlag ? value : escapeSystemdEnvironmentExpansion(value);
+
+const FREEZE_SIGNALS = new Set<ChildProcess.Signal>(["SIGSTOP", "SIGTSTP", "SIGTTIN", "SIGTTOU"]);
+
+const normalizeKillOptions = (
+  options: ChildProcess.KillOptions | undefined,
+): ChildProcess.KillOptions | undefined => {
+  if (options?.killSignal === undefined || !FREEZE_SIGNALS.has(options.killSignal)) return options;
+  return {
+    ...options,
+    killSignal: "SIGTERM",
+  };
+};
+
+const mergeKillOptions = (
+  defaults: ChildProcess.KillOptions | undefined,
+  options: ChildProcess.KillOptions | undefined,
+): ChildProcess.KillOptions | undefined => {
+  const killSignal = options?.killSignal ?? defaults?.killSignal;
+  const forceKillAfter = options?.forceKillAfter ?? defaults?.forceKillAfter;
+  if (killSignal === undefined && forceKillAfter === undefined) return undefined;
+  return normalizeKillOptions({
+    ...(killSignal !== undefined ? { killSignal } : {}),
+    ...(forceKillAfter !== undefined ? { forceKillAfter } : {}),
+  });
+};
 
 const EnvConfig = Config.all({
   enabled: Config.string("T3CODE_WORKER_SYSTEMD_ENABLED").pipe(Config.withDefault("1")),
@@ -116,49 +160,144 @@ const runSetProperty = (
       Effect.orElseSucceed(() => false),
     );
 
+const makeSystemdRunArgs = (input: {
+  readonly config: WorkerProcessIsolationConfig;
+  readonly expandEnvironmentFlag: boolean;
+  readonly unitName?: string;
+  readonly command: string;
+  readonly args: ReadonlyArray<string>;
+}): ReadonlyArray<string> => [
+  "--user",
+  "--scope",
+  "--quiet",
+  "--collect",
+  ...(input.expandEnvironmentFlag ? ["--expand-environment=no"] : []),
+  ...(input.unitName ? [`--unit=${input.unitName}`] : []),
+  `--slice=${input.config.slice}`,
+  `--nice=${String(input.config.nice)}`,
+  "--",
+  maybeEscapeSystemdArgument(input.command, input.expandEnvironmentFlag),
+  ...input.args.map((arg) => maybeEscapeSystemdArgument(arg, input.expandEnvironmentFlag)),
+];
+
 const runScopeProbe = (
   spawner: ChildProcessSpawner.ChildProcessSpawner["Service"],
   config: WorkerProcessIsolationConfig,
+  expandEnvironmentFlag: boolean,
 ): Effect.Effect<boolean> =>
   spawner
     .exitCode(
-      ChildProcess.make(config.systemdRunPath, [
-        "--user",
-        "--scope",
-        "--quiet",
-        "--collect",
-        "--expand-environment=no",
-        `--slice=${config.slice}`,
-        `--nice=${String(config.nice)}`,
-        "--",
-        "/bin/true",
-      ]),
+      ChildProcess.make(
+        config.systemdRunPath,
+        makeSystemdRunArgs({
+          config,
+          expandEnvironmentFlag,
+          command: "/bin/true",
+          args: [],
+        }),
+      ),
     )
     .pipe(
       Effect.map((code) => Number(code) === 0),
       Effect.orElseSucceed(() => false),
     );
 
+const probeSystemdAvailability = (
+  spawner: ChildProcessSpawner.ChildProcessSpawner["Service"],
+  config: WorkerProcessIsolationConfig,
+): Effect.Effect<SystemdAvailability> =>
+  runScopeProbe(spawner, config, true).pipe(
+    Effect.flatMap((modernAvailable) => {
+      if (modernAvailable) {
+        return Effect.succeed({ available: true, expandEnvironmentFlag: true });
+      }
+      return runScopeProbe(spawner, config, false).pipe(
+        Effect.map(
+          (legacyAvailable): SystemdAvailability => ({
+            available: legacyAvailable,
+            expandEnvironmentFlag: false,
+          }),
+        ),
+      );
+    }),
+  );
+
+const signalScopeUnit = (
+  spawner: ChildProcessSpawner.ChildProcessSpawner["Service"],
+  config: WorkerProcessIsolationConfig,
+  unitName: string,
+  signal: ChildProcess.Signal,
+): Effect.Effect<void> => {
+  return spawner
+    .exitCode(
+      ChildProcess.make(config.systemctlPath, ["--user", "kill", `--signal=${signal}`, unitName]),
+    )
+    .pipe(Effect.asVoid, Effect.ignore);
+};
+
+const scheduleScopeForceKill = (
+  spawner: ChildProcessSpawner.ChildProcessSpawner["Service"],
+  config: WorkerProcessIsolationConfig,
+  unitName: string,
+  options: ChildProcess.KillOptions | undefined,
+  signal: ChildProcess.Signal,
+): Effect.Effect<void> => {
+  if (options?.forceKillAfter === undefined || signal === "SIGKILL") return Effect.void;
+  return Effect.sleep(options.forceKillAfter).pipe(
+    Effect.andThen(signalScopeUnit(spawner, config, unitName, "SIGKILL")),
+    Effect.forkDetach,
+    Effect.asVoid,
+  );
+};
+
+const wrapScopeHandle = (
+  handle: ChildProcessSpawner.ChildProcessHandle,
+  spawner: ChildProcessSpawner.ChildProcessSpawner["Service"],
+  config: WorkerProcessIsolationConfig,
+  unitName: string,
+  killDefaults: ChildProcess.KillOptions | undefined,
+): ChildProcessSpawner.ChildProcessHandle =>
+  ChildProcessSpawner.makeHandle({
+    pid: handle.pid,
+    exitCode: handle.exitCode,
+    isRunning: handle.isRunning,
+    kill: (options) => {
+      const mergedOptions = mergeKillOptions(killDefaults, options);
+      const signal = mergedOptions?.killSignal ?? "SIGTERM";
+      return signalScopeUnit(spawner, config, unitName, signal).pipe(
+        Effect.andThen(scheduleScopeForceKill(spawner, config, unitName, mergedOptions, signal)),
+        Effect.andThen(handle.kill(mergedOptions).pipe(Effect.ignore)),
+      );
+    },
+    stdin: handle.stdin,
+    stdout: handle.stdout,
+    stderr: handle.stderr,
+    all: handle.all,
+    getInputFd: handle.getInputFd,
+    getOutputFd: handle.getOutputFd,
+    unref: handle.unref,
+  });
+
 const wrapCommand = (
   command: ChildProcess.StandardCommand,
   config: WorkerProcessIsolationConfig,
+  expandEnvironmentFlag: boolean,
+  unitName: string,
 ): ChildProcess.StandardCommand => {
-  const systemdArgs = [
-    "--user",
-    "--scope",
-    "--quiet",
-    "--collect",
-    "--expand-environment=no",
-    `--slice=${config.slice}`,
-    `--nice=${String(config.nice)}`,
-    "--",
-    command.command,
-    ...command.args,
-  ];
-  return ChildProcess.make(config.systemdRunPath, systemdArgs, {
-    ...command.options,
-    shell: false,
-  });
+  return ChildProcess.make(
+    config.systemdRunPath,
+    makeSystemdRunArgs({
+      config,
+      expandEnvironmentFlag,
+      unitName,
+      command: command.command,
+      args: command.args,
+    }),
+    {
+      ...command.options,
+      shell: false,
+    },
+  );
 };
 
 const shouldWrapCommand = (
@@ -187,13 +326,66 @@ quota="\${T3CODE_WORKER_SYSTEMD_CPU_QUOTA:-200%}"
 nice="\${T3CODE_WORKER_NICE:-10}"
 systemd_run="\${T3CODE_WORKER_SYSTEMD_RUN:-systemd-run}"
 systemctl="\${T3CODE_WORKER_SYSTEMCTL:-systemctl}"
+force_kill_after="\${T3CODE_WORKER_SYSTEMD_FORCE_KILL_AFTER_SECONDS:-2}"
 case "$enabled" in
   0|false|FALSE|no|NO|off|OFF)
     exec "$real_command" "$@"
     ;;
 esac
-if command -v "$systemd_run" >/dev/null 2>&1 && command -v "$systemctl" >/dev/null 2>&1 && "$systemd_run" --user --scope --quiet --collect --expand-environment=no "--slice=$slice" "--nice=$nice" -- /bin/true >/dev/null 2>&1 && "$systemctl" --user set-property --runtime "$slice" "CPUQuota=$quota" >/dev/null 2>&1; then
-  exec "$systemd_run" --user --scope --quiet --collect --expand-environment=no "--slice=$slice" "--nice=$nice" -- "$real_command" "$@"
+
+escape_systemd_arg() {
+  printf '%s\\n' "$1" | sed 's/\\$/\\$\\$/g'
+}
+
+systemd_supports_expand_environment() {
+  "$systemd_run" --help 2>/dev/null | grep -q -- '--expand-environment='
+}
+
+run_systemd_scope() {
+  unit="t3-worker-$$-$(date +%s 2>/dev/null || echo 0).scope"
+  if systemd_supports_expand_environment; then
+    "$systemd_run" --user --scope --quiet --collect --expand-environment=no "--unit=$unit" "--slice=$slice" "--nice=$nice" -- "$real_command" "$@" &
+  else
+    escaped_command="$(escape_systemd_arg "$real_command")"
+    first=1
+    for arg do
+      escaped_arg="$(escape_systemd_arg "$arg")"
+      if [ "$first" = 1 ]; then
+        set -- "$escaped_arg"
+        first=0
+      else
+        set -- "$@" "$escaped_arg"
+      fi
+    done
+    if [ "$first" = 1 ]; then
+      set --
+    fi
+    "$systemd_run" --user --scope --quiet --collect "--unit=$unit" "--slice=$slice" "--nice=$nice" -- "$escaped_command" "$@" &
+  fi
+
+  systemd_pid=$!
+  stop_scope() {
+    "$systemctl" --user kill --signal=TERM "$unit" >/dev/null 2>&1 || kill "$systemd_pid" >/dev/null 2>&1 || true
+    ( sleep "$force_kill_after"; "$systemctl" --user kill --signal=KILL "$unit" >/dev/null 2>&1 || true ) &
+  }
+  trap 'stop_scope; wait "$systemd_pid"; exit $?' INT TERM HUP
+  wait "$systemd_pid"
+  status=$?
+  trap - INT TERM HUP
+  exit "$status"
+}
+
+if command -v "$systemd_run" >/dev/null 2>&1 && command -v "$systemctl" >/dev/null 2>&1; then
+  if systemd_supports_expand_environment; then
+    "$systemd_run" --user --scope --quiet --collect --expand-environment=no "--slice=$slice" "--nice=$nice" -- /bin/true >/dev/null 2>&1
+    probe_status=$?
+  else
+    "$systemd_run" --user --scope --quiet --collect "--slice=$slice" "--nice=$nice" -- /bin/true >/dev/null 2>&1
+    probe_status=$?
+  fi
+  if [ "$probe_status" = 0 ] && "$systemctl" --user set-property --runtime "$slice" "CPUQuota=$quota" >/dev/null 2>&1; then
+    run_systemd_scope "$@"
+  fi
 fi
 exec "$real_command" "$@"
 `;
@@ -223,27 +415,35 @@ const makeWithConfig = (config: WorkerProcessIsolationConfig) =>
   Effect.gen(function* () {
     const platform = yield* HostProcessPlatform;
     const systemdIsolationSupported = supportsSystemdIsolation(platform);
-    const availabilityRef = yield* Ref.make<Option.Option<boolean>>(Option.none());
+    const availabilityRef = yield* Ref.make<Option.Option<SystemdAvailability>>(Option.none());
 
     const ensureAvailable = (
       spawner: ChildProcessSpawner.ChildProcessSpawner["Service"],
-    ): Effect.Effect<boolean> =>
+    ): Effect.Effect<SystemdAvailability> =>
       Ref.get(availabilityRef).pipe(
         Effect.flatMap((cached) =>
           Option.match(cached, {
             onSome: Effect.succeed,
             onNone: () =>
-              runScopeProbe(spawner, config).pipe(
-                Effect.flatMap((scopeAvailable) =>
-                  scopeAvailable ? runSetProperty(spawner, config) : Effect.succeed(false),
+              probeSystemdAvailability(spawner, config).pipe(
+                Effect.flatMap((availability) =>
+                  availability.available
+                    ? runSetProperty(spawner, config).pipe(
+                        Effect.map((quotaAvailable) => ({
+                          available: quotaAvailable,
+                          expandEnvironmentFlag: availability.expandEnvironmentFlag,
+                        })),
+                      )
+                    : Effect.succeed(availability),
                 ),
                 Effect.tap((available) => Ref.set(availabilityRef, Option.some(available))),
                 Effect.tap((available) =>
-                  available
+                  available.available
                     ? Effect.logInfo("worker.process.isolation.enabled", {
                         slice: config.slice,
                         cpuQuota: config.cpuQuota,
                         nice: config.nice,
+                        expandEnvironmentFlag: available.expandEnvironmentFlag,
                       })
                     : Effect.logWarning("worker.process.isolation.unavailable", {
                         slice: config.slice,
@@ -262,15 +462,21 @@ const makeWithConfig = (config: WorkerProcessIsolationConfig) =>
         }
         return ensureAvailable(spawner).pipe(
           Effect.flatMap((available) => {
-            if (!available) return spawner.spawn(command);
-            return spawner.spawn(wrapCommand(command, config)).pipe(
-              Effect.catch(() =>
-                Effect.logWarning("worker.process.isolation.spawn-fallback", {
-                  slice: config.slice,
-                  command: command.command,
-                }).pipe(Effect.flatMap(() => spawner.spawn(command))),
-              ),
-            );
+            if (!available.available) return spawner.spawn(command);
+            const unitName = makeScopeUnitName();
+            return spawner
+              .spawn(wrapCommand(command, config, available.expandEnvironmentFlag, unitName))
+              .pipe(
+                Effect.map((handle) =>
+                  wrapScopeHandle(handle, spawner, config, unitName, command.options),
+                ),
+                Effect.catch(() =>
+                  Effect.logWarning("worker.process.isolation.spawn-fallback", {
+                    slice: config.slice,
+                    command: command.command,
+                  }).pipe(Effect.flatMap(() => spawner.spawn(command))),
+                ),
+              );
           }),
         );
       });

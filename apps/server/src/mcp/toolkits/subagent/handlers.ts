@@ -394,7 +394,7 @@ const spawnSubagent = Effect.fn("SubagentToolkit.spawn")(function* (input: Spawn
   const { model: _resolvedModel, ...threadStartInputWithSelection } = threadStartInput;
   const { started, spawnedAtMs } = yield* Effect.uninterruptibleMask((restore) =>
     Effect.gen(function* () {
-      const dispatchLease = yield* runtime.dispatchLimiter.acquire;
+      const dispatchLease = yield* restore(runtime.dispatchLimiter.acquire);
       const releaseDispatchLease = runtime.dispatchLimiter.release(dispatchLease);
       const started = yield* restore(
         spawnRuntime({ ...threadStartInputWithSelection, modelSelection }, invocation, {
