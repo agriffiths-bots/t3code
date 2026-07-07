@@ -33,6 +33,7 @@ const RETRY_DELAYS_MS = [1_000, 2_000, 4_000, 8_000, 16_000] as const;
 const CONNECTION_ESTABLISHMENT_TIMEOUT = "15 seconds";
 const CONNECTION_PROBE_TIMEOUT = "15 seconds";
 const BACKOFF_RESET_AFTER_MS = 30_000;
+const RESUME_RETRY_DELAY_MS = 100;
 
 interface SupervisorIntent {
   readonly desired: boolean;
@@ -56,6 +57,7 @@ interface PendingRetryTrace {
 interface TracedAttemptFailure {
   readonly error: ConnectionAttemptError;
   readonly attemptSpan: Option.Option<Tracer.Span>;
+  readonly retryDelayOverrideMs?: number;
 }
 
 type AttemptOutcome =
@@ -378,6 +380,9 @@ export const make = Effect.fn("EnvironmentSupervisor.make")(function* (
             yield* logManagedRelayAccountChange;
             return;
           }
+          if (next.reason === "application-active") {
+            return;
+          }
           break;
       }
     }
@@ -555,6 +560,7 @@ export const make = Effect.fn("EnvironmentSupervisor.make")(function* (
           (error): TracedAttemptFailure => ({
             error,
             attemptSpan: active.attemptSpan,
+            retryDelayOverrideMs: RESUME_RETRY_DELAY_MS,
           }),
         ),
       ),
@@ -645,7 +651,7 @@ export const make = Effect.fn("EnvironmentSupervisor.make")(function* (
       }
 
       failureCount += 1;
-      const delayMs = retryDelayMs(failureCount - 1);
+      const delayMs = outcome.failure.retryDelayOverrideMs ?? retryDelayMs(failureCount - 1);
       pendingRetry = Option.map(attemptSpan, (previousAttempt) => ({
         previousAttempt,
         failureCount,

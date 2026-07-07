@@ -545,7 +545,7 @@ describe("EnvironmentSupervisor", () => {
     }),
   );
 
-  it.effect("does not let platform wakeups reset an in-flight attempt", () =>
+  it.effect("does not let primary credential wakeups reset an in-flight attempt", () =>
     Effect.gen(function* () {
       const firstAttemptStarted = yield* Deferred.make<void>();
       const harness = yield* makeHarness({
@@ -558,11 +558,7 @@ describe("EnvironmentSupervisor", () => {
 
       yield* Deferred.await(firstAttemptStarted);
       yield* Effect.all(
-        [
-          harness.wake("credentials-changed"),
-          harness.wake("application-active"),
-          harness.wake("credentials-changed"),
-        ],
+        [harness.wake("credentials-changed"), harness.wake("credentials-changed")],
         { concurrency: "unbounded" },
       );
       yield* Effect.yieldNow;
@@ -585,6 +581,28 @@ describe("EnvironmentSupervisor", () => {
       expect(yield* Ref.get(harness.prepareCount)).toBe(1);
       expect(yield* Ref.get(harness.sessionCount)).toBe(0);
     }).pipe(Effect.provide(TestClock.layer())),
+  );
+
+  it.effect("restarts a stale in-flight setup when the application becomes active", () =>
+    Effect.gen(function* () {
+      const firstAttemptStarted = yield* Deferred.make<void>();
+      const harness = yield* makeHarness({
+        prepare: (attempt) =>
+          attempt === 1
+            ? Deferred.succeed(firstAttemptStarted, undefined).pipe(Effect.andThen(Effect.never))
+            : Effect.succeed(PREPARED_CONNECTION),
+      });
+      const supervisor = yield* EnvironmentSupervisor.make(TARGET_ENTRY, {
+        initiallyDesired: true,
+      }).pipe(Effect.provide(harness.dependencies));
+
+      yield* Deferred.await(firstAttemptStarted);
+      yield* harness.wake("application-active");
+      yield* awaitState(supervisor.state, (state) => state.phase === "connected");
+
+      expect(yield* Ref.get(harness.prepareCount)).toBe(2);
+      expect(yield* Ref.get(harness.sessionCount)).toBe(1);
+    }),
   );
 
   it.effect("treats an involuntary session close as transient and reconnects", () =>
@@ -690,7 +708,9 @@ describe("EnvironmentSupervisor", () => {
       yield* awaitState(supervisor.state, (state) => state.phase === "connected");
       yield* harness.wake("application-active");
       yield* awaitState(supervisor.state, (state) => state.phase === "backoff");
-      yield* TestClock.adjust("1 second");
+      yield* TestClock.adjust(99);
+      expect(yield* Ref.get(harness.sessionCount)).toBe(1);
+      yield* TestClock.adjust(1);
       yield* eventuallyState(
         supervisor.state,
         (state) => state.phase === "connected" && state.generation === 2,
@@ -717,7 +737,7 @@ describe("EnvironmentSupervisor", () => {
         supervisor.state,
         (state) => state.phase === "backoff" && state.lastFailure?.reason === "timeout",
       );
-      yield* TestClock.adjust("1 second");
+      yield* TestClock.adjust(100);
       yield* eventuallyState(
         supervisor.state,
         (state) => state.phase === "connected" && state.generation === 2,
