@@ -798,7 +798,7 @@ export const make = Effect.fn("EnvironmentSupervisor.make")(function* (
         return [
           {
             changed,
-            recoveredFromOffline: current.network === "offline" && network !== "offline",
+            recoveredFromOffline: current.network === "offline" && network === "online",
           },
           changed ? { ...current, network } : current,
         ] as const;
