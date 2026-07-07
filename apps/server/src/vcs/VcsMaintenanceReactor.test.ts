@@ -179,6 +179,61 @@ describe("selectStaleWorktreeReapCandidates", () => {
     ]);
   });
 
+  it("reaps archived ready, idle, and interrupted sessions after the archived age", () => {
+    expect(
+      selectStaleWorktreeReapCandidates(
+        [
+          row({
+            threadId: "archived-ready",
+            archivedAt: "2026-07-06T11:30:00.000Z",
+            updatedAt: "2026-07-06T11:30:00.000Z",
+            sessionStatus: "ready",
+            runtimeStatus: "ready",
+          }),
+          row({
+            threadId: "archived-idle",
+            archivedAt: "2026-07-06T11:30:00.000Z",
+            updatedAt: "2026-07-06T11:30:00.000Z",
+            sessionStatus: "idle",
+          }),
+          row({
+            threadId: "archived-interrupted",
+            archivedAt: "2026-07-06T11:30:00.000Z",
+            updatedAt: "2026-07-06T11:30:00.000Z",
+            sessionStatus: "interrupted",
+          }),
+        ],
+        ["/repo"],
+        NOW,
+        {
+          archivedAgeMs: 20 * 60_000,
+        },
+      ),
+    ).toEqual([
+      {
+        threadId: "archived-ready",
+        threadIds: ["archived-ready"],
+        projectCwd: "/repo",
+        path: "/worktrees/archived-ready",
+        forceRemove: true,
+      },
+      {
+        threadId: "archived-idle",
+        threadIds: ["archived-idle"],
+        projectCwd: "/repo",
+        path: "/worktrees/archived-idle",
+        forceRemove: true,
+      },
+      {
+        threadId: "archived-interrupted",
+        threadIds: ["archived-interrupted"],
+        projectCwd: "/repo",
+        path: "/worktrees/archived-interrupted",
+        forceRemove: true,
+      },
+    ]);
+  });
+
   it("keeps active, pending, young, shared, and project-root paths", () => {
     const rows = [
       row({ threadId: "running", sessionStatus: "running" }),
@@ -263,6 +318,37 @@ describe("selectStaleWorktreeReapCandidates", () => {
         threadId: "shared-a",
         threadIds: ["shared-a", "shared-b"],
         projectCwd: "/repo",
+        path: "/worktrees/shared",
+      },
+    ]);
+  });
+
+  it("coalesces exact shared removal roots across project roots", () => {
+    const rows = [
+      row({
+        threadId: "shared-a",
+        projectCwd: "/repo-a",
+        worktreePath: "/worktrees/shared/a",
+        worktreeRemovalPath: "/worktrees/shared",
+      }),
+      row({
+        threadId: "shared-b",
+        projectCwd: "/repo-b",
+        worktreePath: "/worktrees/shared/b",
+        worktreeRemovalPath: "/worktrees/shared",
+      }),
+    ];
+
+    expect(
+      selectStaleWorktreeReapCandidates(rows, ["/repo-a", "/repo-b"], NOW, {
+        stoppedAgeMs: 60_000,
+      }),
+    ).toEqual([
+      {
+        threadId: "shared-a",
+        threadIds: ["shared-a", "shared-b"],
+        projectCwd: "/repo-a",
+        projectCwds: ["/repo-a", "/repo-b"],
         path: "/worktrees/shared",
       },
     ]);

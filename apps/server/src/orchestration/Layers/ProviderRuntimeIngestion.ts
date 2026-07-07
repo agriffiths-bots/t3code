@@ -1712,7 +1712,7 @@ const make = Effect.gen(function* () {
         const turnId = toTurnId(event.turnId);
         const checkpointContext = turnId
           ? yield* projectionSnapshotQuery
-              .getThreadCheckpointContext(thread.id)
+              .getThreadCheckpointContext(thread.id, { trackedTurnId: turnId })
               .pipe(Effect.map(Option.getOrUndefined))
           : undefined;
         const workspaceCwd =

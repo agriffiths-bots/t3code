@@ -32,6 +32,12 @@ const STOPPED_WORKTREE_REAP_AGE_MS = Duration.toMillis(Duration.hours(12));
 const ARCHIVED_WORKTREE_REAP_AGE_MS = Duration.toMillis(Duration.hours(1));
 
 const REAPABLE_SESSION_STATUSES = new Set(["stopped", "error"]);
+const REAPABLE_ARCHIVED_SESSION_STATUSES = new Set([
+  ...REAPABLE_SESSION_STATUSES,
+  "idle",
+  "ready",
+  "interrupted",
+]);
 
 export interface WorktreeMaintenanceRow {
   readonly threadId: string;
@@ -52,6 +58,7 @@ export interface WorktreeReapCandidate {
   readonly threadId: string;
   readonly threadIds: ReadonlyArray<string>;
   readonly projectCwd: string;
+  readonly projectCwds?: ReadonlyArray<string>;
   readonly path: string;
   readonly forceRemove?: boolean;
 }
@@ -102,14 +109,29 @@ type WorktreeReapEligibility = {
   readonly forceRemove: boolean;
 };
 
+type WorktreeRegistrationStatus =
+  | {
+      readonly _tag: "registered";
+      readonly projectCwd: string;
+    }
+  | {
+      readonly _tag: "blocked";
+      readonly projectCwd: string;
+    }
+  | {
+      readonly _tag: "notRegistered";
+    };
+
 function isRowActive(row: WorktreeMaintenanceRow): boolean {
   if (row.deletedAt !== null) {
     return false;
   }
 
+  const reapableSessionStatuses =
+    row.archivedAt !== null ? REAPABLE_ARCHIVED_SESSION_STATUSES : REAPABLE_SESSION_STATUSES;
   const hasLiveSessionStatus =
-    (row.sessionStatus !== null && !REAPABLE_SESSION_STATUSES.has(row.sessionStatus)) ||
-    (row.runtimeStatus !== null && !REAPABLE_SESSION_STATUSES.has(row.runtimeStatus));
+    (row.sessionStatus !== null && !reapableSessionStatuses.has(row.sessionStatus)) ||
+    (row.runtimeStatus !== null && !reapableSessionStatuses.has(row.runtimeStatus));
 
   if (row.archivedAt !== null) {
     return hasLiveSessionStatus;
@@ -163,7 +185,7 @@ function reapEligibility(
 
   return {
     path: removalPath,
-    key: `${row.projectCwd}\0${removalPath}`,
+    key: removalPath,
     forceRemove: row.deletedAt !== null || row.archivedAt !== null,
   };
 }
@@ -234,14 +256,12 @@ export function selectStaleWorktreeReapCandidates(
       continue;
     }
 
-    const threadIds = Array.from(
-      new Set(
-        rows.flatMap((other) => {
-          const otherEligibility = eligibilityByThreadId.get(other.threadId);
-          return otherEligibility && coveredKeys.has(otherEligibility.key) ? [other.threadId] : [];
-        }),
-      ),
-    );
+    const coveredRows = rows.filter((other) => {
+      const otherEligibility = eligibilityByThreadId.get(other.threadId);
+      return otherEligibility && coveredKeys.has(otherEligibility.key);
+    });
+    const threadIds = Array.from(new Set(coveredRows.map((other) => other.threadId)));
+    const projectCwds = Array.from(new Set(coveredRows.map((other) => other.projectCwd)));
     const forceRemove = threadIds.every(
       (threadId) => eligibilityByThreadId.get(threadId)?.forceRemove === true,
     );
@@ -253,6 +273,7 @@ export function selectStaleWorktreeReapCandidates(
       threadId: row.threadId,
       threadIds,
       projectCwd: row.projectCwd,
+      ...(projectCwds.length > 1 ? { projectCwds } : {}),
       path: eligibility.path,
       ...(forceRemove ? { forceRemove: true } : {}),
     });
@@ -380,73 +401,102 @@ const make = Effect.gen(function* () {
     );
   });
 
-  const isWorktreeRegistered = Effect.fn("VcsMaintenanceReactor.isWorktreeRegistered")(function* (
-    candidate: WorktreeReapCandidate,
-  ) {
-    const pathExists = (path: string) =>
-      fileSystem.stat(path).pipe(
-        Effect.as(true),
-        Effect.catchTags({
-          PlatformError: (error: PlatformError.PlatformError) =>
-            Effect.succeed(error.reason._tag !== "NotFound"),
-        }),
-      );
+  const checkWorktreeRegistration = Effect.fn("VcsMaintenanceReactor.checkWorktreeRegistration")(
+    function* (candidate: WorktreeReapCandidate, projectCwd: string) {
+      const pathExists = (path: string) =>
+        fileSystem.stat(path).pipe(
+          Effect.as(true),
+          Effect.catchTags({
+            PlatformError: (error: PlatformError.PlatformError) =>
+              Effect.succeed(error.reason._tag !== "NotFound"),
+          }),
+        );
 
-    const failClosedUnlessBothPathsAreGone = Effect.fn(
-      "VcsMaintenanceReactor.failClosedUnlessBothPathsAreGone",
-    )(function* (detail: string) {
-      const [projectRootExists, worktreePathExists] = yield* Effect.all([
-        pathExists(candidate.projectCwd),
-        pathExists(candidate.path),
-      ]);
-      if (!projectRootExists && !worktreePathExists) {
-        yield* Effect.logWarning("vcs.maintenance.worktree-list-root-missing", {
+      const failClosedUnlessBothPathsAreGone = Effect.fn(
+        "VcsMaintenanceReactor.failClosedUnlessBothPathsAreGone",
+      )(function* (detail: string) {
+        const [projectRootExists, worktreePathExists] = yield* Effect.all([
+          pathExists(projectCwd),
+          pathExists(candidate.path),
+        ]);
+        if (!projectRootExists && !worktreePathExists) {
+          yield* Effect.logWarning("vcs.maintenance.worktree-list-root-missing", {
+            threadIds: candidate.threadIds,
+            projectRoot: projectCwd,
+            path: candidate.path,
+            detail,
+          });
+        }
+        return shouldRetainWorktreeMetadataAfterListFailure({
+          projectRootExists,
+          worktreePathExists,
+          detail,
+        });
+      });
+
+      const result = yield* git
+        .execute({
+          operation: "VcsMaintenanceReactor.isWorktreeRegistered",
+          cwd: projectCwd,
+          args: ["worktree", "list", "--porcelain"],
+          allowNonZeroExit: true,
+          timeoutMs: 5_000,
+        })
+        .pipe(Effect.result);
+
+      if (Result.isFailure(result)) {
+        yield* Effect.logWarning("vcs.maintenance.worktree-list-failed", {
           threadIds: candidate.threadIds,
-          projectRoot: candidate.projectCwd,
+          projectRoot: projectCwd,
+          path: candidate.path,
+          detail: errorDetail(result.failure),
+        });
+        const shouldRetainMetadata = yield* failClosedUnlessBothPathsAreGone(
+          errorDetail(result.failure),
+        );
+        return shouldRetainMetadata
+          ? ({ _tag: "blocked", projectCwd } satisfies WorktreeRegistrationStatus)
+          : ({ _tag: "notRegistered" } satisfies WorktreeRegistrationStatus);
+      }
+
+      if (result.success.exitCode !== 0) {
+        const detail = result.success.stderr.trim() || "git worktree list failed";
+        yield* Effect.logWarning("vcs.maintenance.worktree-list-failed", {
+          threadIds: candidate.threadIds,
+          projectRoot: projectCwd,
           path: candidate.path,
           detail,
         });
+        const shouldRetainMetadata = yield* failClosedUnlessBothPathsAreGone(detail);
+        return shouldRetainMetadata
+          ? ({ _tag: "blocked", projectCwd } satisfies WorktreeRegistrationStatus)
+          : ({ _tag: "notRegistered" } satisfies WorktreeRegistrationStatus);
       }
-      return shouldRetainWorktreeMetadataAfterListFailure({
-        projectRootExists,
-        worktreePathExists,
-        detail,
-      });
-    });
 
-    const result = yield* git
-      .execute({
-        operation: "VcsMaintenanceReactor.isWorktreeRegistered",
-        cwd: candidate.projectCwd,
-        args: ["worktree", "list", "--porcelain"],
-        allowNonZeroExit: true,
-        timeoutMs: 5_000,
-      })
-      .pipe(Effect.result);
+      return isWorktreePathListed(result.success.stdout, candidate.path)
+        ? ({ _tag: "registered", projectCwd } satisfies WorktreeRegistrationStatus)
+        : ({ _tag: "notRegistered" } satisfies WorktreeRegistrationStatus);
+    },
+  );
 
-    if (Result.isFailure(result)) {
-      yield* Effect.logWarning("vcs.maintenance.worktree-list-failed", {
-        threadIds: candidate.threadIds,
-        projectRoot: candidate.projectCwd,
-        path: candidate.path,
-        detail: errorDetail(result.failure),
-      });
-      return yield* failClosedUnlessBothPathsAreGone(errorDetail(result.failure));
-    }
-
-    if (result.success.exitCode !== 0) {
-      const detail = result.success.stderr.trim() || "git worktree list failed";
-      yield* Effect.logWarning("vcs.maintenance.worktree-list-failed", {
-        threadIds: candidate.threadIds,
-        projectRoot: candidate.projectCwd,
-        path: candidate.path,
-        detail,
-      });
-      return yield* failClosedUnlessBothPathsAreGone(detail);
-    }
-
-    return isWorktreePathListed(result.success.stdout, candidate.path);
-  });
+  const findWorktreeRegistration = Effect.fn("VcsMaintenanceReactor.findWorktreeRegistration")(
+    function* (candidate: WorktreeReapCandidate) {
+      let blockedProjectCwd: string | null = null;
+      const projectCwds = candidate.projectCwds ?? [candidate.projectCwd];
+      for (const projectCwd of projectCwds) {
+        const registration = yield* checkWorktreeRegistration(candidate, projectCwd);
+        if (registration._tag === "registered") {
+          return registration;
+        }
+        if (registration._tag === "blocked" && blockedProjectCwd === null) {
+          blockedProjectCwd = registration.projectCwd;
+        }
+      }
+      return blockedProjectCwd === null
+        ? ({ _tag: "notRegistered" } satisfies WorktreeRegistrationStatus)
+        : ({ _tag: "blocked", projectCwd: blockedProjectCwd } satisfies WorktreeRegistrationStatus);
+    },
+  );
 
   const pruneProjectRepository = Effect.fn("VcsMaintenanceReactor.pruneProjectRepository")(
     function* (projectRoot: string) {
@@ -538,10 +588,14 @@ const make = Effect.gen(function* () {
     );
 
     for (const candidate of candidates) {
-      if (yield* isWorktreeRegistered(candidate)) {
+      const registration = yield* findWorktreeRegistration(candidate);
+      if (registration._tag === "blocked") {
+        continue;
+      }
+      if (registration._tag === "registered") {
         const removeResult = yield* gitWorkflow
           .removeWorktree({
-            cwd: candidate.projectCwd,
+            cwd: registration.projectCwd,
             path: candidate.path,
             ...(candidate.forceRemove === true ? { force: true } : {}),
           })
@@ -549,19 +603,19 @@ const make = Effect.gen(function* () {
         if (Result.isFailure(removeResult)) {
           yield* Effect.logWarning("vcs.maintenance.worktree-remove-failed", {
             threadIds: candidate.threadIds,
-            projectRoot: candidate.projectCwd,
+            projectRoot: registration.projectCwd,
             path: candidate.path,
             detail: errorDetail(removeResult.failure),
           });
-          yield* git.pruneWorktrees(candidate.projectCwd).pipe(
+          yield* git.pruneWorktrees(registration.projectCwd).pipe(
             Effect.catch((error) =>
               Effect.logWarning("vcs.maintenance.worktree-prune-failed", {
-                projectRoot: candidate.projectCwd,
+                projectRoot: registration.projectCwd,
                 detail: errorDetail(error),
               }),
             ),
           );
-          if (yield* isWorktreeRegistered(candidate)) {
+          if ((yield* findWorktreeRegistration(candidate))._tag !== "notRegistered") {
             continue;
           }
         }

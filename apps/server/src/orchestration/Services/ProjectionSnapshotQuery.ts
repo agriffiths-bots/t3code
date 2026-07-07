@@ -44,6 +44,10 @@ export interface ProjectionThreadCheckpointContext {
   readonly trackedCheckpointTurnIds?: ReadonlyArray<TurnId>;
 }
 
+export interface ProjectionThreadCheckpointContextOptions {
+  readonly trackedTurnId?: TurnId;
+}
+
 export interface ProjectionFullThreadDiffContext {
   readonly threadId: ThreadId;
   readonly projectId: ProjectId;
@@ -136,6 +140,7 @@ export interface ProjectionSnapshotQueryShape {
    */
   readonly getThreadCheckpointContext: (
     threadId: ThreadId,
+    options?: ProjectionThreadCheckpointContextOptions,
   ) => Effect.Effect<Option.Option<ProjectionThreadCheckpointContext>, ProjectionRepositoryError>;
 
   /**

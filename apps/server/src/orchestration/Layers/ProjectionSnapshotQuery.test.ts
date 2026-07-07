@@ -853,6 +853,7 @@ projectionSnapshotLayer("ProjectionSnapshotQuery", (it) => {
 
       const context = yield* snapshotQuery.getThreadCheckpointContext(
         ThreadId.make("thread-context"),
+        { trackedTurnId: asTurnId("turn-2") },
       );
       assert.equal(context._tag, "Some");
       if (context._tag === "Some") {
@@ -861,7 +862,7 @@ projectionSnapshotLayer("ProjectionSnapshotQuery", (it) => {
           projectId: asProjectId("project-context"),
           workspaceRoot: "/tmp/context-workspace",
           worktreePath: "/tmp/context-worktree",
-          trackedCheckpointTurnIds: [asTurnId("turn-1"), asTurnId("turn-2")],
+          trackedCheckpointTurnIds: [asTurnId("turn-2")],
           checkpoints: [
             {
               turnId: asTurnId("turn-1"),
@@ -996,12 +997,12 @@ projectionSnapshotLayer("ProjectionSnapshotQuery", (it) => {
 
       const context = yield* snapshotQuery.getThreadCheckpointContext(
         ThreadId.make("thread-retention"),
+        { trackedTurnId: asTurnId("turn-1") },
       );
       assert.equal(context._tag, "Some");
       if (context._tag === "Some") {
-        assert.equal(context.value.trackedCheckpointTurnIds?.length, MAX_THREAD_CHECKPOINTS + 5);
+        assert.equal(context.value.trackedCheckpointTurnIds?.length, 1);
         assert.equal(context.value.trackedCheckpointTurnIds?.[0], asTurnId("turn-1"));
-        assert.equal(context.value.trackedCheckpointTurnIds?.at(-1), asTurnId("turn-505"));
         assert.equal(context.value.checkpoints.length, MAX_THREAD_CHECKPOINTS + 1);
         assert.equal(context.value.checkpoints[0]?.checkpointTurnCount, 5);
         assert.equal(
