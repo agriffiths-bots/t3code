@@ -391,14 +391,19 @@ export const layer = Layer.effect(
             worktree.worktree.path,
             workspaceRelativePath,
           );
+          // An explicit cleanup policy from createThread survives worktree
+          // preparation: cross-repo (directory-targeted) worktrees are marked
+          // non-removable there because the projectId-keyed reaper cannot see
+          // their repository and would orphan them.
+          const preparedWorktreeRemovable = bootstrap.createThread?.worktreeRemovable ?? true;
           yield* orchestrationEngine.dispatch({
             type: "thread.meta.update",
             commandId: yield* serverCommandId("bootstrap-thread-meta-update"),
             threadId: command.threadId,
             branch: worktree.worktree.refName,
             worktreePath: targetWorktreePath,
-            worktreeRemovable: true,
-            worktreeRemovalPath: worktree.worktree.path,
+            worktreeRemovable: preparedWorktreeRemovable,
+            worktreeRemovalPath: preparedWorktreeRemovable ? worktree.worktree.path : null,
           });
           yield* refreshGitStatus(targetWorktreePath);
         }

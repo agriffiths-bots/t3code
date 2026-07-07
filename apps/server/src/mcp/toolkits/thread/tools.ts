@@ -25,6 +25,10 @@ export const ThreadStartToolInput = Schema.Struct({
   prompt: TrimmedNonEmptyString.check(Schema.isMaxLength(PROVIDER_SEND_TURN_MAX_INPUT_CHARS)),
   title: Schema.optional(TrimmedNonEmptyString.check(Schema.isMaxLength(255))),
   mode: Schema.optional(ThreadStartMode),
+  // Absolute path overriding the spawn base directory: VCS detection, worktree
+  // creation, and current-checkout runs all resolve against it instead of the
+  // source thread's cwd/project root. Mutually exclusive with worktreePath.
+  directory: Schema.optional(TrimmedNonEmptyString),
   worktreePath: Schema.optional(TrimmedNonEmptyString),
   branch: Schema.optional(TrimmedNonEmptyString),
   baseBranch: Schema.optional(TrimmedNonEmptyString),
@@ -58,7 +62,7 @@ const dependencies = [McpInvocationContext.McpInvocationContext];
 
 export const ThreadStartTool = Tool.make("t3_thread_start", {
   description:
-    "Start a new T3 Code thread with the supplied initial prompt, only when the user explicitly asks to start/spawn/create another thread or agent. Do not use for autonomous delegation or background parallel work. Defaults to creating a new Git worktree from the repository default branch when the project directory is a Git repository; non-Git projects start in the current directory with warning metadata. Use current_checkout only when the user explicitly asks for the same checkout. To choose the model, pass `model` as a plain model name (e.g. 'claude-opus-4-8' or 'gpt-5.4') — the provider/harness is inferred automatically, so you never need to know or pass a harness/instance id. This tool launches the child turn and returns metadata without waiting for completion.",
+    "Start a new T3 Code thread with the supplied initial prompt, only when the user explicitly asks to start/spawn/create another thread or agent. Do not use for autonomous delegation or background parallel work. Defaults to creating a new Git worktree from the repository default branch when the project directory is a Git repository; non-Git projects start in the current directory with warning metadata. Pass `directory` (absolute path) to base the thread somewhere else entirely: a Git directory gets a new worktree off that repository, a non-Git directory runs in place. Use current_checkout only when the user explicitly asks for the same checkout. To choose the model, pass `model` as a plain model name (e.g. 'claude-opus-4-8' or 'gpt-5.4') — the provider/harness is inferred automatically, so you never need to know or pass a harness/instance id. This tool launches the child turn and returns metadata without waiting for completion.",
   parameters: ThreadStartToolInput,
   success: ThreadStartToolOutput,
   failure: ThreadStartToolError,

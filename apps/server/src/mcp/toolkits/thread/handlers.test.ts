@@ -14,6 +14,7 @@ import {
 } from "@t3tools/contracts";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import * as Effect from "effect/Effect";
+import * as FileSystem from "effect/FileSystem";
 import * as Crypto from "effect/Crypto";
 import * as DateTime from "effect/DateTime";
 import * as Layer from "effect/Layer";
@@ -95,6 +96,20 @@ const client = McpSchema.McpServerClient.of({
   },
   getClient: Effect.die("unused"),
 });
+
+const makeTempDirectory = (prefix: string) =>
+  Effect.gen(function* () {
+    const fileSystem = yield* FileSystem.FileSystem;
+    return yield* fileSystem.makeTempDirectory({ prefix });
+  }).pipe(Effect.provide(NodeServices.layer), Effect.orDie);
+
+const errorText = (content: ReadonlyArray<unknown> | undefined): string =>
+  (content ?? [])
+    .map((entry) => {
+      const text = (entry as { readonly text?: unknown }).text;
+      return typeof text === "string" ? text : "";
+    })
+    .join(" ");
 
 const TestCryptoLive = Layer.sync(Crypto.Crypto, () => {
   let nextByte = 0;
@@ -414,14 +429,18 @@ it.effect(
     }),
 );
 
-it.effect("ignores explicit worktree requests when the project is not a git repo", () =>
+it.effect("honors explicit existing worktree paths when the project is not a git repo", () =>
+  // ADA-97: existing_worktree runs in an existing directory and creates nothing,
+  // so a non-git project must not silently reroute an explicit path to the
+  // project root.
   Effect.gen(function* () {
     const commands: OrchestrationCommand[] = [];
+    const explicitPath = yield* makeTempDirectory("t3-existing-wt-");
     const result = yield* callStartTool(
       {
         prompt: "Run current-directory worker",
         mode: "existing_worktree",
-        worktreePath: "/repo/elsewhere",
+        worktreePath: explicitPath,
       },
       commands,
       {
@@ -444,16 +463,188 @@ it.effect("ignores explicit worktree requests when the project is not a git repo
     expect(result.isError).toBe(false);
     expect(result.structuredContent).toMatchObject({
       projectId,
-      mode: "current_checkout",
+      mode: "existing_worktree",
       branch: null,
-      worktreePath: null,
+      worktreePath: explicitPath,
     });
     const command = commands[0];
     expect(command?.type).toBe("thread.turn.start");
     if (command?.type !== "thread.turn.start") return;
     expect(command.bootstrap?.prepareWorktree).toBeUndefined();
-    expect(command.bootstrap?.createThread?.worktreePath).toBeNull();
+    expect(command.bootstrap?.createThread?.worktreePath).toBe(explicitPath);
     expect(command.bootstrap?.createThread?.worktreeRemovable).toBe(false);
+  }),
+);
+
+it.effect("bases the child on an explicit git directory with a new worktree", () =>
+  Effect.gen(function* () {
+    const commands: OrchestrationCommand[] = [];
+    const explicitDir = yield* makeTempDirectory("t3-dir-git-");
+    const result = yield* callStartTool(
+      { prompt: "Work in the other repository", directory: explicitDir },
+      commands,
+      {},
+    );
+
+    expect(result.isError).toBe(false);
+    expect(result.structuredContent).toMatchObject({
+      projectId,
+      mode: "new_worktree",
+      worktreePath: null,
+    });
+    const command = commands[0];
+    expect(command?.type).toBe("thread.turn.start");
+    if (command?.type !== "thread.turn.start") return;
+    expect(command.bootstrap?.prepareWorktree).toMatchObject({
+      projectCwd: explicitDir,
+      baseBranch: "main",
+    });
+    // Cross-repo worktrees are user-managed: the reaper resolves repositories
+    // via the caller's projectId and would orphan them if marked removable.
+    expect(command.bootstrap?.createThread?.worktreeRemovable).toBe(false);
+    expect(String(result.structuredContent?.warning)).toContain("not auto-cleaned");
+    // The caller project's setup script must never run inside an explicitly
+    // targeted other repository.
+    expect(command.bootstrap?.runSetupScript).toBe(false);
+  }),
+);
+
+it.effect("rejects runSetupScript with an explicit directory", () =>
+  Effect.gen(function* () {
+    const commands: OrchestrationCommand[] = [];
+    const explicitDir = yield* makeTempDirectory("t3-dir-setup-");
+    const result = yield* callStartTool(
+      { prompt: "Setup elsewhere", directory: explicitDir, runSetupScript: true },
+      commands,
+      {},
+    );
+    expect(result.isError).toBe(true);
+    expect(errorText(result.content)).toContain("runSetupScript is not supported with directory");
+    expect(commands).toHaveLength(0);
+  }),
+);
+
+it.effect("runs in place with a warning for an explicit non-git directory", () =>
+  Effect.gen(function* () {
+    const commands: OrchestrationCommand[] = [];
+    const explicitDir = yield* makeTempDirectory("t3-dir-plain-");
+    const result = yield* callStartTool(
+      { prompt: "Work in the plain directory", directory: explicitDir },
+      commands,
+      {
+        sourceThread: {
+          ...sourceThread,
+          worktreePath: "/repo/wt-source",
+          worktreeRemovalPath: "/repo/wt-source",
+          worktreeRemovable: true,
+        },
+        gitWorkflow: {
+          status: () => Effect.succeed(nonRepoStatus),
+        },
+        vcsDetect: () => Effect.succeed(null),
+      },
+    );
+
+    expect(result.isError).toBe(false);
+    expect(result.structuredContent).toMatchObject({
+      projectId,
+      mode: "current_checkout",
+      worktreePath: explicitDir,
+    });
+    expect(String(result.structuredContent?.warning)).toContain("not a Git repository");
+    const command = commands[0];
+    expect(command?.type).toBe("thread.turn.start");
+    if (command?.type !== "thread.turn.start") return;
+    expect(command.bootstrap?.prepareWorktree).toBeUndefined();
+    expect(command.bootstrap?.createThread?.worktreePath).toBe(explicitDir);
+    // The child was directed elsewhere: it must not inherit the source thread's
+    // worktree removal root (cleanup would remove the source's worktree).
+    expect(command.bootstrap?.createThread?.worktreeRemovalPath).toBeNull();
+  }),
+);
+
+it.effect("never borrows the caller project's branch for an explicit directory", () =>
+  // The explicit directory may be a different repository: when its own refs
+  // cannot resolve a base branch, the spawn must fail instead of falling back
+  // to the caller project's checkout (an unrelated ref could share a name).
+  Effect.gen(function* () {
+    const commands: OrchestrationCommand[] = [];
+    const explicitDir = yield* makeTempDirectory("t3-dir-norefs-");
+    const result = yield* callStartTool(
+      { prompt: "Work in the detached repository", directory: explicitDir },
+      commands,
+      {
+        gitWorkflow: {
+          // The target repo resolves no default/current branch (e.g. detached
+          // HEAD, remote-only refs); the caller project would resolve "main".
+          listRefs: (input) =>
+            input.cwd === explicitDir
+              ? Effect.succeed({
+                  refs: [],
+                  isRepo: true,
+                  hasPrimaryRemote: false,
+                  nextCursor: null,
+                  totalCount: 0,
+                })
+              : defaultGitWorkflow.listRefs(),
+          status: (input) =>
+            input.cwd === explicitDir
+              ? Effect.succeed({ ...nonRepoStatus, isRepo: true })
+              : defaultGitWorkflow.status(),
+        },
+      },
+    );
+    expect(result.isError).toBe(true);
+    expect(errorText(result.content)).toContain("Could not resolve a base branch in directory");
+    expect(commands).toHaveLength(0);
+  }),
+);
+
+it.effect("rejects a relative directory", () =>
+  Effect.gen(function* () {
+    const commands: OrchestrationCommand[] = [];
+    const result = yield* callStartTool(
+      { prompt: "Bad directory", directory: "relative/path" },
+      commands,
+      {},
+    );
+    expect(result.isError).toBe(true);
+    expect(errorText(result.content)).toContain("absolute path");
+    expect(commands).toHaveLength(0);
+  }),
+);
+
+it.effect("rejects a directory that does not exist", () =>
+  Effect.gen(function* () {
+    const commands: OrchestrationCommand[] = [];
+    const result = yield* callStartTool(
+      { prompt: "Bad directory", directory: "/nonexistent-t3-directory-test-8f2c" },
+      commands,
+      {},
+    );
+    expect(result.isError).toBe(true);
+    expect(errorText(result.content)).toContain("does not exist");
+    expect(commands).toHaveLength(0);
+  }),
+);
+
+it.effect("rejects directory combined with worktreePath", () =>
+  Effect.gen(function* () {
+    const commands: OrchestrationCommand[] = [];
+    const explicitDir = yield* makeTempDirectory("t3-dir-conflict-");
+    const result = yield* callStartTool(
+      {
+        prompt: "Ambiguous target",
+        mode: "existing_worktree",
+        directory: explicitDir,
+        worktreePath: explicitDir,
+      },
+      commands,
+      {},
+    );
+    expect(result.isError).toBe(true);
+    expect(errorText(result.content)).toContain("not both");
+    expect(commands).toHaveLength(0);
   }),
 );
 
@@ -616,11 +807,12 @@ it.effect("preserves source worktree removal root for current-checkout subdirect
 it.effect("does not mark caller-supplied existing worktrees as removable", () =>
   Effect.gen(function* () {
     const commands: OrchestrationCommand[] = [];
+    const existingWorktree = yield* makeTempDirectory("t3-existing-keep-");
     const result = yield* callStartTool(
       {
         prompt: "Use existing checkout",
         mode: "existing_worktree",
-        worktreePath: "/repo/existing-worktree",
+        worktreePath: existingWorktree,
       },
       commands,
     );
@@ -629,7 +821,7 @@ it.effect("does not mark caller-supplied existing worktrees as removable", () =>
     const command = commands[0];
     expect(command?.type).toBe("thread.turn.start");
     if (command?.type !== "thread.turn.start") return;
-    expect(command.bootstrap?.createThread?.worktreePath).toBe("/repo/existing-worktree");
+    expect(command.bootstrap?.createThread?.worktreePath).toBe(existingWorktree);
     expect(command.bootstrap?.createThread?.worktreeRemovable).toBe(false);
     expect(command.bootstrap?.createThread?.worktreeRemovalPath).toBeNull();
   }),

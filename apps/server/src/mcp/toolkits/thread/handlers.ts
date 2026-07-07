@@ -18,6 +18,7 @@ import {
 import * as Crypto from "effect/Crypto";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
+import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Path from "effect/Path";
@@ -112,7 +113,31 @@ const makeActiveThreadStartRuntime = Effect.fn("ThreadToolkit.makeActiveRuntime"
   const gitWorkflow = yield* GitWorkflowService;
   const vcsDriverRegistry = yield* VcsDriverRegistry.VcsDriverRegistry;
   const path = yield* Path.Path;
+  const fileSystem = yield* FileSystem.FileSystem;
   const uuid = () => crypto.randomUUIDv4.pipe(Effect.orDie);
+
+  // Explicit spawn-base override (`directory` input): the caller directs where the
+  // child runs, so validation is strict and failures are agent-legible instead of
+  // silently degrading to the project root.
+  const validateExplicitDirectory = Effect.fn("ThreadToolkit.validateExplicitDirectory")(function* (
+    directory: string,
+  ) {
+    if (!path.isAbsolute(directory)) {
+      return yield* fail(`directory must be an absolute path (got "${directory}").`);
+    }
+    const normalized = path.normalize(directory);
+    const info = yield* fileSystem
+      .stat(normalized)
+      .pipe(
+        Effect.mapError(() =>
+          fail(`directory "${normalized}" does not exist or is not accessible.`),
+        ),
+      );
+    if (info.type !== "Directory") {
+      return yield* fail(`directory "${normalized}" is not a directory.`);
+    }
+    return normalized;
+  });
 
   const makeIds = Effect.fn("ThreadToolkit.makeIds")(function* () {
     return {
@@ -319,6 +344,11 @@ const makeActiveThreadStartRuntime = Effect.fn("ThreadToolkit.makeActiveRuntime"
       sourceThread: OrchestrationThreadShell,
       sourceCwd: string,
       canUseSourceBranch: boolean,
+      // An explicit `directory` may name a DIFFERENT repository than the caller's
+      // project; falling back to the project checkout there could select an
+      // unrelated ref that happens to share a name. Explicit directories must
+      // resolve their base branch from the target repository alone.
+      allowProjectFallback: boolean,
     ) {
       const sourceBranch = canUseSourceBranch ? sourceThread.branch : null;
       if (input.baseBranch) return input.baseBranch;
@@ -331,7 +361,7 @@ const makeActiveThreadStartRuntime = Effect.fn("ThreadToolkit.makeActiveRuntime"
       const currentBranch = yield* resolveCurrentBranch(sourceCwd);
       if (currentBranch) return currentBranch;
 
-      if (project.workspaceRoot !== sourceCwd) {
+      if (allowProjectFallback && project.workspaceRoot !== sourceCwd) {
         const projectDefaultBranch = yield* resolveDefaultBranch(project.workspaceRoot);
         if (projectDefaultBranch) return projectDefaultBranch;
 
@@ -339,7 +369,11 @@ const makeActiveThreadStartRuntime = Effect.fn("ThreadToolkit.makeActiveRuntime"
         if (projectCurrentBranch) return projectCurrentBranch;
       }
 
-      return yield* fail("Could not resolve a base branch for the new worktree.");
+      return yield* fail(
+        allowProjectFallback
+          ? "Could not resolve a base branch for the new worktree."
+          : `Could not resolve a base branch in directory "${sourceCwd}"; pass baseBranch explicitly.`,
+      );
     },
   );
 
@@ -401,10 +435,44 @@ const makeActiveThreadStartRuntime = Effect.fn("ThreadToolkit.makeActiveRuntime"
   ) {
     const { sourceThread, project } = yield* loadSourceContext(invocation);
     const requestedMode = input.mode ?? "new_worktree";
-    const sourceCwdContext = yield* resolveSourceCwd(project, sourceThread);
+    if (input.directory !== undefined && input.worktreePath !== undefined) {
+      return yield* fail(
+        "Pass either directory or worktreePath, not both: worktreePath already names the exact run directory for existing_worktree mode.",
+      );
+    }
+    if (input.directory !== undefined && input.runSetupScript === true) {
+      return yield* fail(
+        "runSetupScript is not supported with directory: setup scripts belong to the calling project and must not run inside an explicitly targeted repository.",
+      );
+    }
+    const explicitDirectory =
+      input.directory !== undefined ? yield* validateExplicitDirectory(input.directory) : null;
+    // An explicit directory overrides the source-thread cwd resolution entirely:
+    // the caller directed the spawn base, so project-membership degradation must
+    // not silently reroute it. Branch inheritance from the source thread is
+    // disabled because the target may be a different repository.
+    const sourceCwdContext =
+      explicitDirectory !== null
+        ? {
+            cwd: explicitDirectory,
+            canUseSourceBranch: false,
+            workspaceRelativePath: yield* workspaceRelativePathForCwd(explicitDirectory, "bypass"),
+          }
+        : yield* resolveSourceCwd(project, sourceThread);
     const { cwd: sourceCwd, canUseSourceBranch, workspaceRelativePath } = sourceCwdContext;
+    if (requestedMode === "existing_worktree" && input.worktreePath !== undefined) {
+      // ADA-97: an explicit existing_worktree path is honored even when the
+      // project (or the path itself) is not a Git repository — the mode runs in
+      // an existing directory and creates nothing, so there is nothing to
+      // degrade. Validate it exists instead of silently rerouting to the
+      // project root.
+      yield* validateExplicitDirectory(input.worktreePath);
+    }
+    // Only a mode that would CREATE a worktree degrades on a non-Git base
+    // (Adam's rule: never create a worktree for a non-Git directory, even if
+    // requested). existing_worktree and current_checkout create nothing.
     const shouldUseCurrentCheckout =
-      requestedMode !== "current_checkout" && !(yield* cwdHasGitRepository(sourceCwd));
+      requestedMode === "new_worktree" && !(yield* cwdHasGitRepository(sourceCwd));
     const mode: ThreadStartMode = shouldUseCurrentCheckout ? "current_checkout" : requestedMode;
     const ids = yield* makeIds();
     const createdAt = yield* nowIso;
@@ -417,10 +485,19 @@ const makeActiveThreadStartRuntime = Effect.fn("ThreadToolkit.makeActiveRuntime"
         : mode === "current_checkout" && sourceCwd !== project.workspaceRoot
           ? sourceCwd
           : null;
-    const worktreeRemovable = mode === "new_worktree";
+    // Cross-repo worktrees (explicit directory) must not be marked removable:
+    // the stale-worktree reaper resolves the repository via the caller's
+    // projectId and would never find them there — it would clear the thread
+    // metadata and orphan the actual worktree. They are user-managed until
+    // cleanup understands foreign repositories.
+    const worktreeRemovable = mode === "new_worktree" && explicitDirectory === null;
+    // Removal-root inheritance only applies to children running inside the
+    // SOURCE thread's worktree; a child directed to an explicit other directory
+    // must never carry the source's removal path (cleaning it up would remove
+    // the source's worktree).
     const worktreeRemovalPath = worktreeRemovable
       ? worktreePath
-      : mode === "current_checkout" && worktreePath !== null
+      : mode === "current_checkout" && worktreePath !== null && explicitDirectory === null
         ? (sourceThread.worktreeRemovalPath ??
           (sourceThread.worktreeRemovable === true ? sourceThread.worktreePath : null))
         : null;
@@ -455,6 +532,7 @@ const makeActiveThreadStartRuntime = Effect.fn("ThreadToolkit.makeActiveRuntime"
               sourceThread,
               sourceCwd,
               canUseSourceBranch,
+              explicitDirectory === null,
             ),
             branch: branch ?? undefined,
             ...(workspaceRelativePath !== null ? { workspaceRelativePath } : {}),
@@ -498,7 +576,11 @@ const makeActiveThreadStartRuntime = Effect.fn("ThreadToolkit.makeActiveRuntime"
         ...(prepareWorktree
           ? {
               prepareWorktree,
-              runSetupScript: input.runSetupScript ?? true,
+              // Setup scripts are resolved by the CALLER's projectId; running one
+              // inside an explicitly targeted other repository would execute an
+              // unrelated project's setup command there. Suppressed for
+              // directory targets (explicit true is rejected at input).
+              runSetupScript: explicitDirectory === null && (input.runSetupScript ?? true),
             }
           : {}),
       },
@@ -524,7 +606,12 @@ const makeActiveThreadStartRuntime = Effect.fn("ThreadToolkit.makeActiveRuntime"
               warning:
                 "Child thread was started on the current checkout and may conflict with concurrent writes.",
             }
-          : {}),
+          : mode === "new_worktree" && explicitDirectory !== null
+            ? {
+                warning:
+                  "Worktree was created in an explicitly targeted repository and is not auto-cleaned; remove it manually when the work is done.",
+              }
+            : {}),
     };
   });
 });
