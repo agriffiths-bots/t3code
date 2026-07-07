@@ -133,13 +133,16 @@ it.effect("reports missing preview automation host as unavailable status", () =>
         Effect.provideService(McpInvocationContext.McpInvocationContext, invocation),
         Effect.provideService(McpSchema.McpServerClient, client),
       );
-    expect(open.isError).toBe(true);
-    expect(
-      open.content.some(
-        (content) =>
-          content.type === "text" && content.text.includes("Open or reload T3 Code Desktop"),
-      ),
-    ).toBe(true);
+    expect(open.isError).toBe(false);
+    expect(open.structuredContent).toMatchObject({
+      available: false,
+      visible: false,
+      tabId: null,
+      hostState: "missing",
+    });
+    expect((open.structuredContent as { readonly recovery?: unknown }).recovery).toContain(
+      "Open or reload T3 Code Desktop",
+    );
   }).pipe(Effect.provide(TestLayer)),
 );
 
