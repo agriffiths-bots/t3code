@@ -3,7 +3,11 @@ import type { EnvironmentId } from "@t3tools/contracts";
 export interface PairingCredentialSubmitDependencies {
   readonly submitServerAuthCredential: (credential: string) => Promise<void>;
   readonly retryPrimaryEnvironment: (environmentId: EnvironmentId) => Promise<unknown>;
-  readonly primaryEnvironmentId: EnvironmentId | null;
+  // Read as a getter, not a captured value: a pairing submit can begin before
+  // the platform poll has registered the primary environment, so the id must be
+  // re-read AFTER the credential exchange to catch a primary that parked
+  // (blocked) while the exchange was in flight.
+  readonly getPrimaryEnvironmentId: () => EnvironmentId | null;
   readonly errorMessageFromUnknown: (error: unknown) => string;
 }
 
@@ -24,8 +28,11 @@ export async function submitPairingCredentialAndUnblock(
     return deps.errorMessageFromUnknown(error);
   }
 
-  if (deps.primaryEnvironmentId !== null) {
-    await deps.retryPrimaryEnvironment(deps.primaryEnvironmentId);
+  // Re-read after the exchange: the poll may have registered (and parked) the
+  // primary supervisor while submitServerAuthCredential was in flight.
+  const primaryEnvironmentId = deps.getPrimaryEnvironmentId();
+  if (primaryEnvironmentId !== null) {
+    await deps.retryPrimaryEnvironment(primaryEnvironmentId);
   }
 
   return null;

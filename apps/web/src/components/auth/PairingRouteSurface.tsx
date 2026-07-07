@@ -59,6 +59,10 @@ export function PairingRouteSurface({
   const [isSubmitting, setIsSubmitting] = useState(false);
   const autoSubmitAttemptedRef = useRef(false);
   const primaryEnvironmentId = usePrimaryEnvironmentId();
+  // Keep the latest primary id in a ref so the submit handler re-reads it after
+  // the credential exchange, catching a primary registered mid-exchange.
+  const primaryEnvironmentIdRef = useRef(primaryEnvironmentId);
+  primaryEnvironmentIdRef.current = primaryEnvironmentId;
   const retryPrimaryEnvironment = useAtomCommand(environmentCatalog.retryNow, {
     reportFailure: false,
   });
@@ -72,7 +76,7 @@ export function PairingRouteSurface({
         {
           submitServerAuthCredential,
           retryPrimaryEnvironment,
-          primaryEnvironmentId,
+          getPrimaryEnvironmentId: () => primaryEnvironmentIdRef.current,
           errorMessageFromUnknown,
         },
         nextCredential,
@@ -89,7 +93,7 @@ export function PairingRouteSurface({
         onAuthenticated();
       });
     },
-    [onAuthenticated, primaryEnvironmentId, retryPrimaryEnvironment],
+    [onAuthenticated, retryPrimaryEnvironment],
   );
 
   const handleSubmit = useCallback(

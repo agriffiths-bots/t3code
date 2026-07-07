@@ -32,7 +32,7 @@ function makeDeps(overrides?: {
       calls.retried.push(environmentId);
       return Promise.resolve();
     },
-    primaryEnvironmentId:
+    getPrimaryEnvironmentId: () =>
       overrides && "primaryEnvironmentId" in overrides
         ? (overrides.primaryEnvironmentId ?? null)
         : PRIMARY_ID,
@@ -59,6 +59,33 @@ describe("submitPairingCredentialAndUnblock", () => {
 
     expect(error).toBeNull();
     expect(calls.retried).toEqual([]);
+  });
+
+  it("re-reads the primary id after the exchange, retrying one registered mid-flight", async () => {
+    // Primary is null when the submit starts, then the platform poll registers
+    // it while submitServerAuthCredential is in flight. The getter must observe
+    // the late value and still kick the parked supervisor.
+    const calls = { submitted: [] as string[], retried: [] as EnvironmentId[] };
+    let currentPrimaryId: EnvironmentId | null = null;
+    const error = await submitPairingCredentialAndUnblock(
+      {
+        submitServerAuthCredential: (credential) => {
+          calls.submitted.push(credential);
+          currentPrimaryId = PRIMARY_ID; // registered mid-exchange
+          return Promise.resolve();
+        },
+        retryPrimaryEnvironment: (environmentId) => {
+          calls.retried.push(environmentId);
+          return Promise.resolve();
+        },
+        getPrimaryEnvironmentId: () => currentPrimaryId,
+        errorMessageFromUnknown,
+      },
+      "PAIRME12345",
+    );
+
+    expect(error).toBeNull();
+    expect(calls.retried).toEqual([PRIMARY_ID]);
   });
 
   it("returns the credential error and does not retry when the submit is rejected", async () => {
