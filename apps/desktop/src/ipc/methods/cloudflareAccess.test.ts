@@ -372,6 +372,74 @@ describe("desktop Cloudflare Access cookies", () => {
     }),
   );
 
+  it.effect("restores suspended Access headers when cancelled login cookie rollback fails", () =>
+    Effect.gen(function* () {
+      const staleCookie = accessCookie({
+        value: "stale-cookie",
+        domain: "app.example.test",
+        hostOnly: true,
+        path: "/",
+        secure: true,
+      });
+      const restoreError = new Error("cookie restore failed");
+      electronMock.cookies.get
+        .mockResolvedValueOnce([staleCookie])
+        .mockResolvedValueOnce([staleCookie])
+        .mockResolvedValueOnce([staleCookie])
+        .mockResolvedValueOnce([]);
+      electronMock.cookies.remove.mockResolvedValue(undefined);
+      electronMock.cookies.set.mockResolvedValueOnce(undefined).mockRejectedValueOnce(restoreError);
+
+      yield* installCloudflareAccessCredentials.handler({
+        host: "https://app.example.test",
+        headers: {},
+        clearCookies: true,
+        cookieValue: "stale-cookie",
+      });
+
+      const listener = electronMock.webRequest.onBeforeSendHeaders.mock.calls[0]?.[0];
+      expect(listener).toBeTypeOf("function");
+
+      const authWindow = makeAuthWindow();
+      authWindow.loadURL.mockRejectedValue(new Error("load failed"));
+
+      const exit = yield* Effect.exit(
+        authenticateCloudflareAccess
+          .handler({ host: "https://app.example.test" })
+          .pipe(
+            Effect.provideService(
+              ElectronWindow.ElectronWindow,
+              electronWindowLayer(authWindow as unknown as Electron.BrowserWindow),
+            ),
+          ),
+      );
+
+      expect(exit._tag).toBe("Failure");
+      if (exit._tag === "Success") {
+        return;
+      }
+      expect(Cause.squash(exit.cause)).toMatchObject({
+        reason: "authentication",
+        cause: restoreError,
+      });
+
+      const callback = vi.fn();
+      listener(
+        {
+          url: "https://app.example.test/.well-known/t3/environment",
+          requestHeaders: { "user-agent": "t3code" },
+        },
+        callback,
+      );
+      expect(callback).toHaveBeenCalledWith({
+        requestHeaders: {
+          "user-agent": "t3code",
+          Cookie: "CF_Authorization=stale-cookie",
+        },
+      });
+    }),
+  );
+
   it.effect("does not restore stale Cloudflare Access headers over a concurrent update", () =>
     Effect.gen(function* () {
       const staleCookie = accessCookie({

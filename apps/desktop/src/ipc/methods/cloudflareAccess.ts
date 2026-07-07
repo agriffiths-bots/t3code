@@ -521,8 +521,11 @@ function captureCloudflareAccessCookie(options: {
       } finally {
         try {
           if (!capturedReplacementCookie) {
-            await restoreAccessCookies(session, options.origin, previousAccessCookies);
-            restoreCloudflareAccessHeaders(suspendedAccessHeaders);
+            try {
+              await restoreAccessCookies(session, options.origin, previousAccessCookies);
+            } finally {
+              restoreCloudflareAccessHeaders(suspendedAccessHeaders);
+            }
           }
         } finally {
           abort.abort();
