@@ -79,6 +79,15 @@ export interface RegisterChildInput {
   readonly spawnedAtMs: number;
 }
 
+export interface ValidateChildSpawnInput {
+  readonly parentThreadId: ThreadId;
+  readonly model: ModelSelection;
+}
+
+export interface ValidatedChildSpawn {
+  readonly depth: number;
+}
+
 export type WaitMode = "all" | "any";
 
 export interface WaitSliceInput {
@@ -100,6 +109,15 @@ export interface ChildListEntry {
 }
 
 export interface ChildThreadCoordinatorShape {
+  /**
+   * Validate spawn constraints that do not require the child id before starting
+   * the provider process. `register` repeats these checks and adds the
+   * child-id ancestry guard for recovery/concurrent safety.
+   */
+  readonly validateSpawn: (
+    input: ValidateChildSpawnInput,
+  ) => Effect.Effect<ValidatedChildSpawn, ThreadStartToolError>;
+
   /**
    * Register a freshly spawned child. Fail-fast validates the provider
    * instance, enforces the depth/cycle guard, and performs a synchronous

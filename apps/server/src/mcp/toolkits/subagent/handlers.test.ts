@@ -40,6 +40,7 @@ import {
 import { ProviderInstanceRegistry } from "../../../provider/Services/ProviderInstanceRegistry.ts";
 import { SubagentToolkitRegistrationLive } from "../../McpHttpServer.ts";
 import * as McpInvocationContext from "../../McpInvocationContext.ts";
+import * as SubagentDispatchLimiter from "./SubagentDispatchLimiter.ts";
 import { SubagentRuntimeLive } from "./handlers.ts";
 
 const environmentId = EnvironmentId.make("environment-subagent-test");
@@ -283,6 +284,7 @@ const projectionLayer = Layer.succeed(ProjectionSnapshotQuery, {
 });
 
 const coordinatorLayer = Layer.succeed(ChildThreadCoordinator, {
+  validateSpawn: () => Effect.succeed({ depth: 1 }),
   register: () => Effect.void,
   waitSlice: () => (waitSliceResult ? Effect.succeed(waitSliceResult) : unsupported()),
   assertParent: () => Effect.void,
@@ -363,6 +365,7 @@ const RuntimeActivationLive = Layer.mergeAll(
   Layer.provideMerge(providerRegistryLayer),
   Layer.provideMerge(scheduledTasksLayer),
   Layer.provideMerge(pendingDispatchesLayer),
+  Layer.provideMerge(SubagentDispatchLimiter.layerTest()),
   Layer.provideMerge(NodeServices.layer),
 );
 

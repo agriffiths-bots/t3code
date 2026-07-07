@@ -172,6 +172,7 @@ describe("ScheduledTasksReactor", () => {
     });
 
     const coordinatorLayer = Layer.succeed(ChildThreadCoordinator, {
+      validateSpawn: () => Effect.succeed({ depth: 1 }),
       register: () => Effect.void,
       waitSlice: () => unsupported(),
       assertParent: () => Effect.void,

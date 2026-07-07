@@ -48,6 +48,7 @@ import * as Keybindings from "./keybindings.ts";
 import * as ServerRuntimeStartup from "./serverRuntimeStartup.ts";
 import { ThreadStartRuntimeLive } from "./mcp/toolkits/thread/handlers.ts";
 import { SubagentRuntimeLive } from "./mcp/toolkits/subagent/handlers.ts";
+import * as SubagentDispatchLimiter from "./mcp/toolkits/subagent/SubagentDispatchLimiter.ts";
 import { ScheduledTaskRepositoryLive } from "./persistence/Layers/ScheduledTasks.ts";
 import { PendingDispatchRepositoryLive } from "./persistence/Layers/PendingDispatches.ts";
 import { OrchestrationReactorLive } from "./orchestration/Layers/OrchestrationReactor.ts";
@@ -91,6 +92,7 @@ import * as CloudCliState from "./cloud/CliState.ts";
 import * as ProcessDiagnostics from "./diagnostics/ProcessDiagnostics.ts";
 import * as ProcessResourceMonitor from "./diagnostics/ProcessResourceMonitor.ts";
 import * as TraceDiagnostics from "./diagnostics/TraceDiagnostics.ts";
+import * as WorkerProcessIsolation from "./process/WorkerProcessIsolation.ts";
 import * as DeviceNotifications from "./notifications/DeviceNotifications.ts";
 import * as WebPushEndpointGuard from "./notifications/WebPushEndpointGuard.ts";
 import { OrchestrationLayerLive } from "./orchestration/runtimeLayer.ts";
@@ -318,6 +320,8 @@ const ProviderRuntimeLayerLive = ProviderSessionReaperLive.pipe(
 
 const RuntimeCoreDependenciesBaseLive = ReactorLayerLive.pipe(
   // Core Services
+  Layer.provideMerge(SubagentDispatchLimiter.layer),
+  Layer.provideMerge(WorkerProcessIsolation.layer),
   Layer.provideMerge(CheckpointingLayerLive),
   Layer.provideMerge(SourceControlProviderRegistryLayerLive),
   Layer.provideMerge(GitLayerLive),

@@ -46,6 +46,7 @@ import {
   MAX_DEPTH,
   WAIT_SLICE_SECONDS,
 } from "../Services/ChildThreadCoordinator.ts";
+import * as SubagentDispatchLimiter from "../../mcp/toolkits/subagent/SubagentDispatchLimiter.ts";
 import { ChildThreadCoordinatorLive } from "./ChildThreadCoordinator.ts";
 
 const now = "2026-06-17T10:00:00.000Z";
@@ -384,6 +385,7 @@ describe("ChildThreadCoordinator", () => {
       Layer.provideMerge(projectionLayer),
       Layer.provideMerge(registryLayer),
       Layer.provideMerge(activeDispatcherLayer),
+      Layer.provideMerge(SubagentDispatchLimiter.layerTest()),
       Layer.provideMerge(SqlitePersistenceMemory),
       Layer.provideMerge(NodeServices.layer),
     );
@@ -1587,6 +1589,14 @@ describe("ChildThreadCoordinator", () => {
       parent = childThreadId;
     }
     // The next spawn would be at depth MAX_DEPTH -> rejected.
+    const preflightExit = await Effect.runPromiseExit(
+      harness.coordinator.validateSpawn({
+        parentThreadId: parent,
+        model: codexModel,
+      }),
+    );
+    expect(Exit.isFailure(preflightExit)).toBe(true);
+
     const exit = await Effect.runPromiseExit(
       harness.coordinator.register({
         parentThreadId: parent,
