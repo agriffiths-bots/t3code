@@ -139,6 +139,38 @@ const makeActiveThreadStartRuntime = Effect.fn("ThreadToolkit.makeActiveRuntime"
     return normalized;
   });
 
+  // Fail-CLOSED same-repository check for explicit directories: any detection
+  // failure counts as foreign, because the foreign-directory restrictions
+  // (no setup script, no auto-cleanup, no project branch fallback) are the safe
+  // side. The fail-open semantics of sourceCwdProjectContext are only
+  // appropriate for the source thread's own cwd.
+  const explicitDirectoryRepositoryContext = Effect.fn(
+    "ThreadToolkit.explicitDirectoryRepositoryContext",
+  )(function* (projectRoot: string, candidate: string) {
+    const candidateHandle = yield* vcsDriverRegistry
+      .detect({ cwd: candidate, cache: "bypass" })
+      .pipe(Effect.orElseSucceed(() => null));
+    if (!candidateHandle) {
+      return { sameRepository: false, workspaceRelativePath: null };
+    }
+    const workspaceRelativePath = workspaceRelativePathFromRepositoryRoot(
+      candidateHandle.repository.rootPath,
+      candidate,
+    );
+    const projectHandle = yield* vcsDriverRegistry
+      .detect({ cwd: projectRoot })
+      .pipe(Effect.orElseSucceed(() => null));
+    if (!projectHandle) {
+      return { sameRepository: false, workspaceRelativePath };
+    }
+    return {
+      sameRepository:
+        repositoryIdentityPath(candidateHandle.repository, candidate) ===
+        repositoryIdentityPath(projectHandle.repository, projectRoot),
+      workspaceRelativePath,
+    };
+  });
+
   const makeIds = Effect.fn("ThreadToolkit.makeIds")(function* () {
     return {
       commandId: CommandId.make(yield* uuid()),
@@ -440,23 +472,57 @@ const makeActiveThreadStartRuntime = Effect.fn("ThreadToolkit.makeActiveRuntime"
         "Pass either directory or worktreePath, not both: worktreePath already names the exact run directory for existing_worktree mode.",
       );
     }
-    if (input.directory !== undefined && input.runSetupScript === true) {
-      return yield* fail(
-        "runSetupScript is not supported with directory: setup scripts belong to the calling project and must not run inside an explicitly targeted repository.",
-      );
-    }
     const explicitDirectory =
       input.directory !== undefined ? yield* validateExplicitDirectory(input.directory) : null;
+    const explicitDirectoryContext =
+      explicitDirectory !== null
+        ? yield* explicitDirectoryRepositoryContext(project.workspaceRoot, explicitDirectory)
+        : null;
+    // A FOREIGN explicit directory (different repository than the caller's
+    // project, fail-closed) gets the cross-repo restrictions; a same-repo
+    // explicit directory keeps cleanup and branch behavior (worktrees are
+    // repo-global, so the projectId-keyed reaper still sees them).
+    const explicitForeignDirectory =
+      explicitDirectory !== null && !(explicitDirectoryContext?.sameRepository ?? false);
+    // Setup scripts are stricter than cleanup: they are resolved by the
+    // caller's projectId, so they may only run when the directory is BOTH the
+    // same repository AND inside the caller project's own workspace. Each
+    // condition alone is insufficient: a same-repo monorepo SIBLING package
+    // is outside the workspace, and a NESTED foreign checkout (vendored repo /
+    // submodule) is inside the workspace but a different repository.
+    // Containment is checked on RESOLVED paths (fail-closed on resolution
+    // errors) so a symlink under the workspace cannot smuggle the setup script
+    // into a target outside it.
+    const explicitDirectoryAllowsSetupScript =
+      explicitDirectory === null ||
+      (!explicitForeignDirectory &&
+        (yield* Effect.gen(function* () {
+          const realWorkspaceRoot = yield* fileSystem
+            .realPath(project.workspaceRoot)
+            .pipe(Effect.orElseSucceed(() => null));
+          const realDirectory = yield* fileSystem
+            .realPath(explicitDirectory)
+            .pipe(Effect.orElseSucceed(() => null));
+          return (
+            realWorkspaceRoot !== null &&
+            realDirectory !== null &&
+            isPathWithin(realWorkspaceRoot, realDirectory)
+          );
+        })));
+    if (!explicitDirectoryAllowsSetupScript && input.runSetupScript === true) {
+      return yield* fail(
+        "runSetupScript is not supported when directory is outside the calling project's workspace or in a different repository: setup scripts belong to the calling project and must not run in other checkouts.",
+      );
+    }
     // An explicit directory overrides the source-thread cwd resolution entirely:
     // the caller directed the spawn base, so project-membership degradation must
-    // not silently reroute it. Branch inheritance from the source thread is
-    // disabled because the target may be a different repository.
+    // not silently reroute it.
     const sourceCwdContext =
       explicitDirectory !== null
         ? {
             cwd: explicitDirectory,
-            canUseSourceBranch: false,
-            workspaceRelativePath: yield* workspaceRelativePathForCwd(explicitDirectory, "bypass"),
+            canUseSourceBranch: !explicitForeignDirectory,
+            workspaceRelativePath: explicitDirectoryContext?.workspaceRelativePath ?? null,
           }
         : yield* resolveSourceCwd(project, sourceThread);
     const { cwd: sourceCwd, canUseSourceBranch, workspaceRelativePath } = sourceCwdContext;
@@ -490,16 +556,24 @@ const makeActiveThreadStartRuntime = Effect.fn("ThreadToolkit.makeActiveRuntime"
     // projectId and would never find them there — it would clear the thread
     // metadata and orphan the actual worktree. They are user-managed until
     // cleanup understands foreign repositories.
-    const worktreeRemovable = mode === "new_worktree" && explicitDirectory === null;
-    // Removal-root inheritance only applies to children running inside the
-    // SOURCE thread's worktree; a child directed to an explicit other directory
-    // must never carry the source's removal path (cleaning it up would remove
-    // the source's worktree).
+    const worktreeRemovable = mode === "new_worktree" && !explicitForeignDirectory;
+    // Removal-root inheritance only applies to children actually running
+    // inside the SOURCE thread's worktree: an explicit directory (even
+    // same-repo) inherits only when it lies under the source removal root,
+    // otherwise a sibling checkout would carry the source worktree's cleanup
+    // identity — suppressing first-turn branch renaming and corrupting removal
+    // metadata. Downstream prefers worktreeRemovalPath for shared-worktree
+    // decisions, so a wrong inherit is worse than none.
+    const sourceRemovalRoot =
+      sourceThread.worktreeRemovalPath ??
+      (sourceThread.worktreeRemovable === true ? sourceThread.worktreePath : null);
     const worktreeRemovalPath = worktreeRemovable
       ? worktreePath
-      : mode === "current_checkout" && worktreePath !== null && explicitDirectory === null
-        ? (sourceThread.worktreeRemovalPath ??
-          (sourceThread.worktreeRemovable === true ? sourceThread.worktreePath : null))
+      : mode === "current_checkout" &&
+          worktreePath !== null &&
+          (explicitDirectory === null ||
+            (sourceRemovalRoot !== null && isPathWithin(sourceRemovalRoot, explicitDirectory)))
+        ? sourceRemovalRoot
         : null;
     const title = input.title ?? truncateTitle(input.prompt);
     const titleSeed = input.title === undefined ? title : undefined;
@@ -532,7 +606,7 @@ const makeActiveThreadStartRuntime = Effect.fn("ThreadToolkit.makeActiveRuntime"
               sourceThread,
               sourceCwd,
               canUseSourceBranch,
-              explicitDirectory === null,
+              !explicitForeignDirectory,
             ),
             branch: branch ?? undefined,
             ...(workspaceRelativePath !== null ? { workspaceRelativePath } : {}),
@@ -580,7 +654,7 @@ const makeActiveThreadStartRuntime = Effect.fn("ThreadToolkit.makeActiveRuntime"
               // inside an explicitly targeted other repository would execute an
               // unrelated project's setup command there. Suppressed for
               // directory targets (explicit true is rejected at input).
-              runSetupScript: explicitDirectory === null && (input.runSetupScript ?? true),
+              runSetupScript: explicitDirectoryAllowsSetupScript && (input.runSetupScript ?? true),
             }
           : {}),
       },
@@ -606,7 +680,7 @@ const makeActiveThreadStartRuntime = Effect.fn("ThreadToolkit.makeActiveRuntime"
               warning:
                 "Child thread was started on the current checkout and may conflict with concurrent writes.",
             }
-          : mode === "new_worktree" && explicitDirectory !== null
+          : mode === "new_worktree" && explicitForeignDirectory
             ? {
                 warning:
                   "Worktree was created in an explicitly targeted repository and is not auto-cleaned; remove it manually when the work is done.",

@@ -103,6 +103,14 @@ const makeTempDirectory = (prefix: string) =>
     return yield* fileSystem.makeTempDirectory({ prefix });
   }).pipe(Effect.provide(NodeServices.layer), Effect.orDie);
 
+const makeChildDirectory = (parent: string, name: string) =>
+  Effect.gen(function* () {
+    const fileSystem = yield* FileSystem.FileSystem;
+    const child = `${parent}/${name}`;
+    yield* fileSystem.makeDirectory(child, { recursive: true });
+    return child;
+  }).pipe(Effect.provide(NodeServices.layer), Effect.orDie);
+
 const errorText = (content: ReadonlyArray<unknown> | undefined): string =>
   (content ?? [])
     .map((entry) => {
@@ -519,7 +527,7 @@ it.effect("rejects runSetupScript with an explicit directory", () =>
       {},
     );
     expect(result.isError).toBe(true);
-    expect(errorText(result.content)).toContain("runSetupScript is not supported with directory");
+    expect(errorText(result.content)).toContain("runSetupScript is not supported");
     expect(commands).toHaveLength(0);
   }),
 );
@@ -597,6 +605,141 @@ it.effect("never borrows the caller project's branch for an explicit directory",
     expect(result.isError).toBe(true);
     expect(errorText(result.content)).toContain("Could not resolve a base branch in directory");
     expect(commands).toHaveLength(0);
+  }),
+);
+
+it.effect("keeps cleanup and setup for a directory inside the project workspace", () =>
+  // A directory that resolves to the caller project's own repository AND lies
+  // inside its workspace gets no restrictions: the reaper sees same-repo
+  // worktrees and the project's setup script runs in its own workspace.
+  Effect.gen(function* () {
+    const commands: OrchestrationCommand[] = [];
+    const repoRoot = yield* makeTempDirectory("t3-same-repo-");
+    const explicitDir = yield* makeChildDirectory(repoRoot, "pkg");
+    const result = yield* callStartTool(
+      { prompt: "Work in a subdir of our own repo", directory: explicitDir },
+      commands,
+      {
+        project: { ...project, workspaceRoot: repoRoot },
+        vcsDetect: (input) =>
+          Effect.succeed(
+            makeGitHandle(input.cwd, {
+              rootPath: repoRoot,
+              metadataPath: `${repoRoot}/.git`,
+            }),
+          ),
+      },
+    );
+
+    expect(result.isError).toBe(false);
+    expect(result.structuredContent).toMatchObject({
+      projectId,
+      mode: "new_worktree",
+      worktreePath: null,
+    });
+    expect(result.structuredContent).not.toHaveProperty("warning");
+    const command = commands[0];
+    expect(command?.type).toBe("thread.turn.start");
+    if (command?.type !== "thread.turn.start") return;
+    expect(command.bootstrap?.prepareWorktree).toMatchObject({
+      projectCwd: explicitDir,
+      baseBranch: "main",
+      workspaceRelativePath: "pkg",
+    });
+    expect(command.bootstrap?.createThread?.worktreeRemovable).toBe(true);
+    expect(command.bootstrap?.runSetupScript).toBe(true);
+  }),
+);
+
+it.effect("suppresses setup scripts for same-repo monorepo sibling directories", () =>
+  // Same repository but OUTSIDE the caller project's workspace (a monorepo
+  // sibling package): cleanup stays enabled (worktrees are repo-global), but
+  // the caller project's setup script must not run in the sibling's checkout.
+  Effect.gen(function* () {
+    const commands: OrchestrationCommand[] = [];
+    const repoRoot = yield* makeTempDirectory("t3-monorepo-");
+    const appDir = yield* makeChildDirectory(repoRoot, "packages/app");
+    const otherDir = yield* makeChildDirectory(repoRoot, "packages/other");
+    const layerOptions = {
+      project: { ...project, workspaceRoot: appDir },
+      vcsDetect: (input: { readonly cwd: string }) =>
+        Effect.succeed(
+          makeGitHandle(input.cwd, {
+            rootPath: repoRoot,
+            metadataPath: `${repoRoot}/.git`,
+          }),
+        ),
+    };
+    const result = yield* callStartTool(
+      { prompt: "Work in the sibling package", directory: otherDir },
+      commands,
+      layerOptions,
+    );
+
+    expect(result.isError).toBe(false);
+    expect(result.structuredContent).toMatchObject({
+      projectId,
+      mode: "new_worktree",
+    });
+    const command = commands[0];
+    expect(command?.type).toBe("thread.turn.start");
+    if (command?.type !== "thread.turn.start") return;
+    expect(command.bootstrap?.createThread?.worktreeRemovable).toBe(true);
+    expect(command.bootstrap?.runSetupScript).toBe(false);
+
+    const rejected = yield* callStartTool(
+      { prompt: "Setup in the sibling", directory: otherDir, runSetupScript: true },
+      [],
+      layerOptions,
+    );
+    expect(rejected.isError).toBe(true);
+    expect(errorText(rejected.content)).toContain("outside the calling project's workspace");
+  }),
+);
+
+it.effect("suppresses setup scripts for nested foreign checkouts inside the workspace", () =>
+  // A vendored repository / submodule under the workspace root is inside the
+  // workspace but a DIFFERENT repository: the caller's setup script must not
+  // run there (and it gets the full foreign-repo restrictions).
+  Effect.gen(function* () {
+    const commands: OrchestrationCommand[] = [];
+    const repoRoot = yield* makeTempDirectory("t3-nested-");
+    const vendorDir = yield* makeChildDirectory(repoRoot, "vendor/other");
+    const layerOptions = {
+      project: { ...project, workspaceRoot: repoRoot },
+      vcsDetect: (input: { readonly cwd: string }) =>
+        Effect.succeed(
+          input.cwd.startsWith(vendorDir)
+            ? makeGitHandle(input.cwd, {
+                rootPath: vendorDir,
+                metadataPath: `${vendorDir}/.git`,
+              })
+            : makeGitHandle(input.cwd, {
+                rootPath: repoRoot,
+                metadataPath: `${repoRoot}/.git`,
+              }),
+        ),
+    };
+    const result = yield* callStartTool(
+      { prompt: "Work in the vendored checkout", directory: vendorDir },
+      commands,
+      layerOptions,
+    );
+
+    expect(result.isError).toBe(false);
+    const command = commands[0];
+    expect(command?.type).toBe("thread.turn.start");
+    if (command?.type !== "thread.turn.start") return;
+    expect(command.bootstrap?.runSetupScript).toBe(false);
+    expect(command.bootstrap?.createThread?.worktreeRemovable).toBe(false);
+
+    const rejected = yield* callStartTool(
+      { prompt: "Setup in the vendored checkout", directory: vendorDir, runSetupScript: true },
+      [],
+      layerOptions,
+    );
+    expect(rejected.isError).toBe(true);
+    expect(errorText(rejected.content)).toContain("different repository");
   }),
 );
 
