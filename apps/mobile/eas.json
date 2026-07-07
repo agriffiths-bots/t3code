@@ -6,6 +6,7 @@
   },
   "build": {
     "development": {
+      "corepack": true,
       "env": {
         "APP_VARIANT": "development",
         "EXPO_OWNER": "adam0410",
@@ -17,6 +18,7 @@
       "distribution": "internal"
     },
     "preview": {
+      "corepack": true,
       "env": {
         "APP_VARIANT": "preview",
         "EXPO_OWNER": "adam0410",
@@ -31,6 +33,7 @@
       }
     },
     "preview:dev": {
+      "corepack": true,
       "env": {
         "APP_VARIANT": "preview",
         "EXPO_OWNER": "adam0410",
@@ -47,6 +50,7 @@
       }
     },
     "production": {
+      "corepack": true,
       "env": {
         "APP_VARIANT": "production",
         "EXPO_OWNER": "adam0410",
@@ -68,7 +72,10 @@
   "submit": {
     "production": {
       "ios": {
-        "ascAppId": "6761315631"
+        "ascAppId": "6787819824"
+      },
+      "android": {
+        "track": "internal"
       }
     }
   }

@@ -25,6 +25,7 @@ import {
   type ViewStyle,
 } from "react-native";
 import ImageViewing from "react-native-image-viewing";
+import Animated, { FadeIn, FadeOut, LinearTransition } from "react-native-reanimated";
 import { useThemeColor } from "../../lib/useThemeColor";
 import { scopedThreadKey } from "../../lib/scopedEntities";
 
@@ -113,6 +114,10 @@ export interface ThreadComposerProps {
  * The pill / card container — renders as LiquidGlassView on supported
  * iOS 26+ devices (progressive blur, native morph), opaque View otherwise.
  */
+// One timing for every piece of the expanded↔compact morph so the surface,
+// toolbar, and siblings move together instead of popping between layouts.
+const COMPOSER_LAYOUT_TRANSITION = LinearTransition.duration(220);
+
 function ComposerSurface(props: {
   readonly children: ReactNode;
   readonly style: ViewStyle;
@@ -131,7 +136,7 @@ function ComposerSurface(props: {
 
   if (isLiquidGlassSupported) {
     return (
-      <View style={shadowStyle}>
+      <Animated.View layout={COMPOSER_LAYOUT_TRANSITION} style={shadowStyle}>
         <LiquidGlassView
           effect="regular"
           interactive
@@ -140,12 +145,12 @@ function ComposerSurface(props: {
         >
           {props.children}
         </LiquidGlassView>
-      </View>
+      </Animated.View>
     );
   }
 
   return (
-    <View style={shadowStyle}>
+    <Animated.View layout={COMPOSER_LAYOUT_TRANSITION} style={shadowStyle}>
       <View
         style={[
           props.style,
@@ -158,7 +163,7 @@ function ComposerSurface(props: {
       >
         {props.children}
       </View>
-    </View>
+    </Animated.View>
   );
 }
 
@@ -668,7 +673,8 @@ export const ThreadComposer = memo(function ThreadComposer(props: ThreadComposer
   }
 
   return (
-    <View
+    <Animated.View
+      layout={COMPOSER_LAYOUT_TRANSITION}
       style={{
         paddingHorizontal: 16,
         paddingTop: isExpanded ? 8 : 6,
@@ -678,8 +684,9 @@ export const ThreadComposer = memo(function ThreadComposer(props: ThreadComposer
           : "linear-gradient(to bottom, rgba(255,255,255,0) 0%, rgba(255,255,255,0.6) 55%, rgba(255,255,255,0.9) 100%)",
       }}
     >
-      <View
+      <Animated.View
         className="w-full"
+        layout={COMPOSER_LAYOUT_TRANSITION}
         style={{ alignSelf: "center", maxWidth: props.contentMaxWidth, position: "relative" }}
       >
         {composerTrigger && composerMenuItems.length > 0 ? (
@@ -732,13 +739,17 @@ export const ThreadComposer = memo(function ThreadComposer(props: ThreadComposer
         >
           {/* Attachment strip — inside the card, above the text input */}
           {isExpanded ? (
-            <View style={{ paddingBottom: props.draftAttachments.length > 0 ? 10 : 0 }}>
+            <Animated.View
+              entering={FadeIn.duration(160)}
+              exiting={FadeOut.duration(120)}
+              style={{ paddingBottom: props.draftAttachments.length > 0 ? 10 : 0 }}
+            >
               <ComposerAttachmentStrip
                 attachments={props.draftAttachments}
                 onRemove={props.onRemoveDraftImage}
                 onPressImage={onPressImage}
               />
-            </View>
+            </Animated.View>
           ) : null}
 
           <View style={isExpanded ? undefined : { flex: 1, minWidth: 0 }}>
@@ -811,81 +822,87 @@ export const ThreadComposer = memo(function ThreadComposer(props: ThreadComposer
             </View>
           ) : null}
           {!isExpanded ? (
-            showStopAction ? (
-              <ControlPill icon="stop.fill" variant="danger" onPress={props.onStopThread} />
-            ) : (
-              <ControlPill
-                icon="arrow.up"
-                variant="primary"
-                disabled={!canSend}
-                onPress={handleSend}
-              />
-            )
+            <Animated.View entering={FadeIn.duration(180)} exiting={FadeOut.duration(100)}>
+              {showStopAction ? (
+                <ControlPill icon="stop.fill" variant="danger" onPress={props.onStopThread} />
+              ) : (
+                <ControlPill
+                  icon="arrow.up"
+                  variant="primary"
+                  disabled={!canSend}
+                  onPress={handleSend}
+                />
+              )}
+            </Animated.View>
           ) : null}
         </ComposerSurface>
 
         {/* Toolbar row — matches draft page layout (expanded only) */}
         {isExpanded ? (
-          <ComposerToolbarRow paddingBottom={8} paddingHorizontal={0} paddingTop={8}>
-            <ComposerToolbarScroller
-              fadeOpaque={toolbarFadeOpaque}
-              fadeTransparent={toolbarFadeTransparent}
-            >
-              <ComposerToolbarButton
-                icon="plus"
-                onPress={() => void props.onPickDraftImages()}
-                showChevron={false}
-              />
-              <ControlPillMenu
-                actions={modelMenuActions}
-                onPressAction={({ nativeEvent }) => handleModelMenuAction(nativeEvent.event)}
+          <Animated.View entering={FadeIn.duration(160)} exiting={FadeOut.duration(120)}>
+            <ComposerToolbarRow paddingBottom={8} paddingHorizontal={0} paddingTop={8}>
+              <ComposerToolbarScroller
+                fadeOpaque={toolbarFadeOpaque}
+                fadeTransparent={toolbarFadeTransparent}
               >
-                <ComposerToolbarTrigger
-                  accessibilityLabel="Model"
-                  iconNode={
-                    <ProviderIcon provider={currentModelOption?.providerDriver} size={16} />
-                  }
-                  label={currentModelOption?.label ?? currentModelSelection.model}
-                />
-              </ControlPillMenu>
-              <ControlPillMenu
-                actions={optionsMenuActions}
-                onPressAction={({ nativeEvent }) => handleOptionsMenuAction(nativeEvent.event)}
-              >
-                <ComposerToolbarTrigger
-                  accessibilityLabel="Configuration"
-                  icon="slider.horizontal.3"
-                  label={configurationLabel}
-                />
-              </ControlPillMenu>
-              {showStopAction ? (
                 <ComposerToolbarButton
-                  icon="stop.fill"
-                  variant="danger"
-                  onPress={props.onStopThread}
+                  icon="plus"
+                  onPress={() => void props.onPickDraftImages()}
                   showChevron={false}
                 />
-              ) : null}
-            </ComposerToolbarScroller>
-            <ComposerToolbarButton
-              accessibilityLabel={sendLabel}
-              icon="arrow.up"
-              variant="primary"
-              disabled={!canSend}
-              onPress={handleSend}
-              showChevron={false}
-            />
-          </ComposerToolbarRow>
+                <ControlPillMenu
+                  actions={modelMenuActions}
+                  onPressAction={({ nativeEvent }) => handleModelMenuAction(nativeEvent.event)}
+                >
+                  <ComposerToolbarTrigger
+                    accessibilityLabel="Model"
+                    iconNode={
+                      <ProviderIcon provider={currentModelOption?.providerDriver} size={16} />
+                    }
+                    label={currentModelOption?.label ?? currentModelSelection.model}
+                  />
+                </ControlPillMenu>
+                <ControlPillMenu
+                  actions={optionsMenuActions}
+                  onPressAction={({ nativeEvent }) => handleOptionsMenuAction(nativeEvent.event)}
+                >
+                  <ComposerToolbarTrigger
+                    accessibilityLabel="Configuration"
+                    icon="slider.horizontal.3"
+                    label={configurationLabel}
+                  />
+                </ControlPillMenu>
+                {showStopAction ? (
+                  <ComposerToolbarButton
+                    icon="stop.fill"
+                    variant="danger"
+                    onPress={props.onStopThread}
+                    showChevron={false}
+                  />
+                ) : null}
+              </ComposerToolbarScroller>
+              <ComposerToolbarButton
+                accessibilityLabel={sendLabel}
+                icon="arrow.up"
+                variant="primary"
+                disabled={!canSend}
+                onPress={handleSend}
+                showChevron={false}
+              />
+            </ComposerToolbarRow>
+          </Animated.View>
         ) : null}
 
         {/* Queue count */}
         {props.queueCount > 0 ? (
-          <Text className="text-xs text-foreground-muted" style={{ paddingTop: 8 }}>
-            {props.queueCount} queued message{props.queueCount === 1 ? "" : "s"} will send
-            automatically.
-          </Text>
+          <Animated.View entering={FadeIn.duration(180)} exiting={FadeOut.duration(120)}>
+            <Text className="text-xs text-foreground-muted" style={{ paddingTop: 8 }}>
+              {props.queueCount} queued message{props.queueCount === 1 ? "" : "s"} will send
+              automatically.
+            </Text>
+          </Animated.View>
         ) : null}
-      </View>
+      </Animated.View>
 
       <ImageViewing
         images={previewImageUri ? [{ uri: previewImageUri }] : []}
@@ -895,6 +912,6 @@ export const ThreadComposer = memo(function ThreadComposer(props: ThreadComposer
         swipeToCloseEnabled
         doubleTapToZoomEnabled
       />
-    </View>
+    </Animated.View>
   );
 });

@@ -168,6 +168,7 @@ describe("ScheduledTasksReactor", () => {
           return shell ? Option.some(shell) : Option.none();
         }),
       getThreadDetailById: () => unsupported(),
+      getThreadDetailSnapshot: () => unsupported(),
     });
 
     const coordinatorLayer = Layer.succeed(ChildThreadCoordinator, {
