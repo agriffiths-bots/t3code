@@ -3,6 +3,7 @@ import {
   MessageId,
   ThreadId,
   VcsProcessSpawnError,
+  VcsUnsupportedOperationError,
   type ModelSelection,
   type OrchestrationProjectShell,
   type OrchestrationThreadShell,
@@ -41,6 +42,7 @@ import {
 const nowIso = Effect.map(DateTime.now, DateTime.formatIso);
 const isThreadStartToolError = Schema.is(ThreadStartToolError);
 const isVcsProcessSpawnError = Schema.is(VcsProcessSpawnError);
+const isVcsUnsupportedOperationError = Schema.is(VcsUnsupportedOperationError);
 
 const fail = (message: string) => new ThreadStartToolError({ message });
 
@@ -236,7 +238,7 @@ const makeActiveThreadStartRuntime = Effect.fn("ThreadToolkit.makeActiveRuntime"
   ) {
     return yield* vcsDriverRegistry.detect({ cwd, cache: "bypass" }).pipe(
       Effect.map((handle) => handle?.kind === "git"),
-      Effect.orElseSucceed(() => true),
+      Effect.catch((error) => Effect.succeed(!isVcsUnsupportedOperationError(error))),
     );
   });
 

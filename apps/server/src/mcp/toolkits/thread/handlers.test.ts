@@ -457,6 +457,47 @@ it.effect("ignores explicit worktree requests when the project is not a git repo
   }),
 );
 
+it.effect("degrades worktree mode when VCS detection reports an unsupported backend", () =>
+  Effect.gen(function* () {
+    const commands: OrchestrationCommand[] = [];
+    const result = yield* callStartTool({ prompt: "Run under unsupported vcs" }, commands, {
+      project: {
+        ...project,
+        workspaceRoot: "/repo-jj",
+        repositoryIdentity: null,
+      },
+      sourceThread: {
+        ...sourceThread,
+        branch: null,
+      },
+      gitWorkflow: {
+        status: () => Effect.succeed(nonRepoStatus),
+      },
+      vcsDetect: () =>
+        Effect.fail(
+          new VcsUnsupportedOperationError({
+            operation: "VcsDriverRegistry.detect",
+            kind: "jj",
+            detail: "Driver 'jj' is not registered.",
+          }),
+        ),
+    });
+
+    expect(result.isError).toBe(false);
+    expect(result.structuredContent).toMatchObject({
+      projectId,
+      mode: "current_checkout",
+      worktreePath: null,
+    });
+    expect(result.structuredContent).toHaveProperty("warning");
+    const command = commands[0];
+    expect(command?.type).toBe("thread.turn.start");
+    if (command?.type !== "thread.turn.start") return;
+    expect(command.bootstrap?.prepareWorktree).toBeUndefined();
+    expect(command.bootstrap?.createThread?.worktreeRemovable).toBe(false);
+  }),
+);
+
 it.effect("keeps an explicit child title authoritative by not auto-title seeding it", () =>
   Effect.gen(function* () {
     const commands: OrchestrationCommand[] = [];
@@ -1137,10 +1178,11 @@ it.effect("keeps the source worktree cwd when repository validation fails transi
           }).pipe(
             Effect.flatMap(() =>
               Effect.fail(
-                new VcsUnsupportedOperationError({
+                new VcsProcessSpawnError({
                   operation: "VcsDriverRegistry.detect",
-                  kind: "git",
-                  detail: "transient repository detection failure",
+                  command: "git",
+                  cwd: input.cwd,
+                  cause: new Error("transient repository detection failure"),
                 }),
               ),
             ),
