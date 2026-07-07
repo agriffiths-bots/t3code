@@ -80,10 +80,12 @@ function mapDpopSocketError(error: RemoteEnvironmentAuthError | ConnectionAttemp
 const fetchDescriptor = Effect.fn("clientRuntime.connection.remote.fetchDescriptor")(function* (
   httpBaseUrl: string,
   cloudflareAccess?: CloudflareAccessAuthorization,
+  credentials?: RequestCredentials,
 ) {
   return yield* fetchRemoteEnvironmentDescriptor({
     httpBaseUrl,
     ...(cloudflareAccess ? { cloudflareAccess } : {}),
+    ...(credentials ? { credentials } : {}),
   }).pipe(Effect.mapError(mapRemoteEnvironmentError));
 });
 
@@ -165,9 +167,11 @@ export const make = Effect.gen(function* () {
     readonly wsBaseUrl: string;
     readonly cloudflareAccess?: CloudflareAccessAuthorization;
   }) {
-    const descriptor = yield* fetchDescriptor(input.httpBaseUrl, input.cloudflareAccess).pipe(
-      Effect.provideService(HttpClient.HttpClient, httpClient),
-    );
+    const descriptor = yield* fetchDescriptor(
+      input.httpBaseUrl,
+      input.cloudflareAccess,
+      "include",
+    ).pipe(Effect.provideService(HttpClient.HttpClient, httpClient));
     if (descriptor.environmentId !== input.expectedEnvironmentId) {
       return yield* environmentMismatchError({
         expected: input.expectedEnvironmentId,

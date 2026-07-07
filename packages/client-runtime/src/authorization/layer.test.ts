@@ -187,6 +187,9 @@ describe("RemoteEnvironmentAuthorization", () => {
       expect(new Request(harness.fetch.calls[1]![0], harness.fetch.calls[1]![1]).credentials).toBe(
         "include",
       );
+      expect(new Request(harness.fetch.calls[0]![0], harness.fetch.calls[0]![1]).credentials).toBe(
+        "include",
+      );
     }),
   );
 

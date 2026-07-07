@@ -4,9 +4,8 @@ import * as Layer from "effect/Layer";
 import { FetchHttpClient, HttpClient, HttpClientRequest } from "effect/unstable/http";
 
 import { readDesktopPrimaryBearerToken } from "./desktopAuth";
-import { resolvePrimaryEnvironmentHttpUrl } from "./target";
 
-function isSameOriginBrowserPrimary(): boolean {
+function isBrowserCookiePrimary(): boolean {
   if (
     typeof window === "undefined" ||
     window.desktopBridge !== undefined ||
@@ -16,7 +15,7 @@ function isSameOriginBrowserPrimary(): boolean {
     return false;
   }
 
-  return new URL(resolvePrimaryEnvironmentHttpUrl("/")).origin === window.location.origin;
+  return true;
 }
 
 function withPrimaryBearerToken(client: HttpClient.HttpClient): HttpClient.HttpClient {
@@ -35,7 +34,7 @@ export function makePrimaryEnvironmentHttpLayer() {
   return Layer.unwrap(
     Effect.sync(() => {
       const baseLayer = remoteHttpClientLayer(globalThis.fetch);
-      if (isSameOriginBrowserPrimary()) {
+      if (isBrowserCookiePrimary()) {
         return Layer.merge(
           baseLayer,
           Layer.succeed(FetchHttpClient.RequestInit, { credentials: "include" }),

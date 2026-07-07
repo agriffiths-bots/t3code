@@ -387,6 +387,7 @@ const buildAppUnderTest = (options?: {
       logWebSocketEvents: false,
       tailscaleServeEnabled: false,
       tailscaleServePort: 443,
+      hostedAppUrl: undefined,
       ...options?.config,
     };
     const layerConfig = ServerConfig.layer(config);
@@ -3338,6 +3339,85 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
         credentials: true,
       });
       assert.equal(typeof wsTicketBody.ticket, "string");
+    }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+
+  it.effect("allows browser-session credentials from configured hosted app origins", () =>
+    Effect.gen(function* () {
+      yield* buildAppUnderTest({
+        config: { hostedAppUrl: new URL("https://preview-custom.example") },
+      });
+
+      const origin = "https://preview-custom.example";
+      const { response: bootstrapResponse, cookie } = yield* bootstrapBrowserSession(
+        defaultDesktopBootstrapToken,
+        {
+          headers: { origin },
+        },
+      );
+
+      assert.equal(bootstrapResponse.status, 200);
+      assert.isDefined(cookie);
+      assertBrowserApiCorsResponseHeaders(bootstrapResponse.headers, {
+        origin,
+        credentials: true,
+      });
+      assert.include(cookie ?? "", "SameSite=None");
+      assert.include(cookie ?? "", "Secure");
+
+      const wsTicketUrl = yield* getHttpServerUrl("/api/auth/websocket-ticket");
+      const preflightResponse = yield* fetchEffect(wsTicketUrl, {
+        method: "OPTIONS",
+        headers: {
+          origin,
+          "access-control-request-method": "POST",
+          "access-control-request-headers": "content-type",
+        },
+      });
+
+      assert.equal(preflightResponse.status, 204);
+      assertBrowserApiCorsPreflightHeaders(preflightResponse.headers, {
+        origin,
+        credentials: true,
+      });
+    }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+
+  it.effect("keeps dev-origin browser-session cookies lax while allowing credentialed CORS", () =>
+    Effect.gen(function* () {
+      const devUrl = new URL("http://remote-client.test:3773");
+      yield* buildAppUnderTest({ config: { devUrl } });
+
+      const { response: bootstrapResponse, cookie } = yield* bootstrapBrowserSession(
+        defaultDesktopBootstrapToken,
+        {
+          headers: { origin: devUrl.origin },
+        },
+      );
+
+      assert.equal(bootstrapResponse.status, 200);
+      assertBrowserApiCorsResponseHeaders(bootstrapResponse.headers, {
+        origin: devUrl.origin,
+        credentials: true,
+      });
+      assert.include(cookie ?? "", "SameSite=Lax");
+      assert.notInclude(cookie ?? "", "SameSite=None");
+      assert.notInclude(cookie ?? "", "Secure");
+    }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+
+  it.effect("does not trust non-HTTPS hosted app origins for credentialed browser APIs", () =>
+    Effect.gen(function* () {
+      const hostedAppUrl = new URL("http://hosted-insecure.example");
+      yield* buildAppUnderTest({ config: { hostedAppUrl } });
+
+      const response = yield* fetchEffect(yield* getHttpServerUrl("/api/auth/session"), {
+        method: "GET",
+        headers: { origin: hostedAppUrl.origin },
+      });
+
+      assert.equal(response.status, 200);
+      assertBrowserApiCorsResponseHeaders(response.headers);
     }).pipe(Effect.provide(NodeHttpServer.layerTest)),
   );
 

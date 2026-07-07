@@ -68,6 +68,7 @@ export class ServerConfig extends Context.Service<
     readonly baseDir: string;
     readonly staticDir: string | undefined;
     readonly devUrl: URL | undefined;
+    readonly hostedAppUrl: URL | undefined;
     readonly noBrowser: boolean;
     readonly startupPresentation: StartupPresentation;
     readonly desktopBootstrapToken: string | undefined;
@@ -179,6 +180,7 @@ const makeTest = Effect.fn("ServerConfig.makeTest")(function* (
     desktopBootstrapToken: undefined,
     staticDir: undefined,
     devUrl,
+    hostedAppUrl: undefined,
     noBrowser: false,
     startupPresentation: "browser",
   });

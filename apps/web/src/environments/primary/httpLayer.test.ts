@@ -35,6 +35,29 @@ describe.sequential("primary environment HTTP layer", () => {
     }).pipe(Effect.provide(makePrimaryEnvironmentHttpLayer()));
   });
 
+  it.effect("uses cookie credentials for hosted browser primary environments", () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response(null, { status: 200 }));
+    vi.stubGlobal("fetch", fetchMock);
+    vi.stubEnv("VITE_API_BASE_URL", "https://backend.example");
+    Object.defineProperty(globalThis, "window", {
+      configurable: true,
+      value: {
+        location: {
+          href: "https://hosted.example/settings",
+          origin: "https://hosted.example",
+        },
+      },
+    });
+
+    return Effect.gen(function* () {
+      yield* HttpClient.post("https://backend.example/api/auth/browser-session");
+
+      const request = new Request(fetchMock.mock.calls[0]?.[0], fetchMock.mock.calls[0]?.[1]);
+      expect(request.credentials).toBe("include");
+      expect(request.headers.get("authorization")).toBeNull();
+    }).pipe(Effect.provide(makePrimaryEnvironmentHttpLayer()));
+  });
+
   it.effect("uses bearer auth without cookies for desktop-managed primaries", () => {
     const fetchMock = vi.fn().mockResolvedValue(new Response(null, { status: 200 }));
     vi.stubGlobal("fetch", fetchMock);

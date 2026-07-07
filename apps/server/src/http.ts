@@ -50,7 +50,7 @@ import * as ServerEnvironment from "./environment/ServerEnvironment.ts";
 import {
   browserApiCorsAllowedHeaders,
   browserApiCorsAllowedMethods,
-  hostedBrowserApiCredentialOrigins,
+  configuredBrowserCookieCredentialOrigins,
   normalizeCorsOrigin,
 } from "./httpCors.ts";
 import { buildElevenLabsRequest, resolveVoiceId, validateTtsText } from "./tts/ttsRequest.logic.ts";
@@ -65,7 +65,7 @@ const DESKTOP_RENDERER_ORIGINS = ["t3code://app", "t3code-dev://app"];
 const BROWSER_API_CORS_MAX_AGE_SECONDS = 600;
 
 function browserApiCredentialedCorsOrigins(config: ServerConfig.ServerConfig["Service"]) {
-  const origins = new Set<string>(hostedBrowserApiCredentialOrigins);
+  const origins = new Set<string>(configuredBrowserCookieCredentialOrigins(config));
   const devOrigin = config.devUrl?.origin;
   if (devOrigin) {
     origins.add(devOrigin);

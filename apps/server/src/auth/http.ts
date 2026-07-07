@@ -44,7 +44,7 @@ import { verifyRequestDpopProof } from "./dpop.ts";
 import {
   browserCookieCredentialOriginAllowed,
   configuredBrowserCookieCredentialOrigins,
-  isHostedBrowserApiCredentialOrigin,
+  configuredHostedBrowserApiCredentialOrigins,
 } from "../httpCors.ts";
 
 const CREDENTIAL_RESPONSE_HEADERS = {
@@ -76,8 +76,14 @@ const appendDpopChallengeOnUnauthorized = (error: EnvironmentAuthInvalidError) =
 function browserSessionCookieOptions(input: {
   readonly request: HttpServerRequest.HttpServerRequest;
   readonly expiresAt: DateTime.Utc;
+  readonly hostedOrigins: ReadonlySet<string>;
 }) {
-  const hostedOrigin = isHostedBrowserApiCredentialOrigin(input.request.headers.origin);
+  const hostedOrigin =
+    input.request.headers.origin !== undefined &&
+    browserCookieCredentialOriginAllowed({
+      origin: input.request.headers.origin,
+      trustedOrigins: input.hostedOrigins,
+    });
   return {
     expires: DateTime.toDate(input.expiresAt),
     httpOnly: true,
@@ -264,6 +270,13 @@ export const authHttpApiLayer = HttpApiBuilder.group(
   Effect.fnUntraced(function* (handlers) {
     const serverAuth = yield* EnvironmentAuth.EnvironmentAuth;
     const sessions = yield* SessionStore.SessionStore;
+    const hostedOrigins = yield* Effect.map(
+      Effect.serviceOption(ServerConfig.ServerConfig),
+      Option.match({
+        onNone: () => new Set<string>(),
+        onSome: configuredHostedBrowserApiCredentialOrigins,
+      }),
+    );
 
     return handlers
       .handle(
@@ -294,7 +307,11 @@ export const authHttpApiLayer = HttpApiBuilder.group(
                 Cookies.empty,
                 sessions.cookieName,
                 result.sessionToken,
-                browserSessionCookieOptions({ request, expiresAt: result.response.expiresAt }),
+                browserSessionCookieOptions({
+                  request,
+                  expiresAt: result.response.expiresAt,
+                  hostedOrigins,
+                }),
               ),
             ).pipe(Effect.catch(() => failEnvironmentInternal("browser_session_cookie_failed")));
 

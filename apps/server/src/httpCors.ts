@@ -31,19 +31,25 @@ export function normalizeCorsOrigin(value: string | undefined): string | null {
   }
 }
 
-export function isHostedBrowserApiCredentialOrigin(value: string | undefined): boolean {
-  const origin = normalizeCorsOrigin(value);
-  return (
-    origin !== null && (hostedBrowserApiCredentialOrigins as readonly string[]).includes(origin)
-  );
-}
-
 export function configuredBrowserCookieCredentialOrigins(
   config: ServerConfig.ServerConfig["Service"],
 ) {
-  const origins = new Set<string>();
+  const origins = new Set<string>(hostedBrowserApiCredentialOrigins);
   if (config.devUrl?.origin) {
     origins.add(config.devUrl.origin);
+  }
+  if (config.hostedAppUrl?.protocol === "https:") {
+    origins.add(config.hostedAppUrl.origin);
+  }
+  return origins;
+}
+
+export function configuredHostedBrowserApiCredentialOrigins(
+  config: ServerConfig.ServerConfig["Service"],
+) {
+  const origins = new Set<string>(hostedBrowserApiCredentialOrigins);
+  if (config.hostedAppUrl?.protocol === "https:") {
+    origins.add(config.hostedAppUrl.origin);
   }
   return origins;
 }
