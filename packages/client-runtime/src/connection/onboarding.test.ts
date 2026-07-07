@@ -255,6 +255,58 @@ describe("connection onboarding", () => {
     }),
   );
 
+  it.effect("installs a captured desktop Access cookie before pairing requests", () =>
+    Effect.gen(function* () {
+      const calls: Array<{ readonly url: string; readonly init: RequestInit }> = [];
+      const installedHeaders: Array<{
+        readonly httpBaseUrl: string;
+        readonly headers: Readonly<Record<string, string>>;
+        readonly clearCookies?: boolean;
+        readonly cookieValue?: string;
+      }> = [];
+      let requestCountAtInstall: number | undefined;
+      const installerLayer = Layer.succeed(
+        CloudflareAccessCookieInstaller,
+        CloudflareAccessCookieInstaller.of({
+          supportsRequestHeaders: true,
+          install: () => Effect.void,
+          installRequestHeaders: (input) =>
+            Effect.sync(() => {
+              requestCountAtInstall = calls.length;
+              installedHeaders.push(input);
+            }),
+        }),
+      );
+
+      yield* preparePairingRegistration({
+        host: "remote.example.test",
+        pairingCode: "pairing-token",
+        cloudflareAccessCookie: "cf-access-cookie",
+      }).pipe(Effect.provide(pairingTestLayer(calls, undefined, installerLayer)));
+
+      expect(installedHeaders).toEqual([
+        {
+          httpBaseUrl: "https://remote.example.test/",
+          headers: {
+            "cf-access-jwt-assertion": "cf-access-cookie",
+            cookie: "CF_Authorization=cf-access-cookie",
+          },
+          clearCookies: true,
+          cookieValue: "cf-access-cookie",
+        },
+      ]);
+      expect(requestCountAtInstall).toBe(0);
+      for (const call of calls) {
+        expect(call.init.headers).toEqual(
+          expect.objectContaining({
+            "cf-access-jwt-assertion": "cf-access-cookie",
+            cookie: "CF_Authorization=cf-access-cookie",
+          }),
+        );
+      }
+    }),
+  );
+
   it.effect("persists Cloudflare Access service-token credentials from pairing urls", () =>
     Effect.gen(function* () {
       enableHeaderCapableWebSocketRuntime();

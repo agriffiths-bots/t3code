@@ -155,14 +155,6 @@ const installCloudflareAccessTransport = Effect.fn(
   }
 });
 
-function primarySocketUrl(target: PrimaryConnectionTarget): string {
-  const url = new URL(target.wsBaseUrl);
-  if (url.pathname === "" || url.pathname === "/") {
-    url.pathname = "/ws";
-  }
-  return url.toString();
-}
-
 const makePrimaryBroker = Effect.fn("clientRuntime.connection.broker.makePrimary")(function* () {
   const auth = yield* ClientCapabilities.PrimaryEnvironmentAuth;
   const remote = yield* RemoteEnvironmentAuthorization.RemoteEnvironmentAuthorization;
@@ -172,12 +164,13 @@ const makePrimaryBroker = Effect.fn("clientRuntime.connection.broker.makePrimary
   ) {
     const bearerToken = yield* auth.bearerToken;
     if (Option.isNone(bearerToken)) {
-      return {
-        environmentId: target.environmentId,
-        label: target.label,
+      const authorized = yield* remote.authorizeBrowserSession({
+        expectedEnvironmentId: target.environmentId,
         httpBaseUrl: target.httpBaseUrl,
-        socketUrl: primarySocketUrl(target),
-        httpAuthorization: null,
+        wsBaseUrl: target.wsBaseUrl,
+      });
+      return {
+        ...authorized,
         target,
       } satisfies PreparedConnection;
     }

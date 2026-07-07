@@ -2,6 +2,7 @@ import { getPairingTokenFromUrl, setPairingTokenOnUrl } from "./pairingUrl";
 
 const DEFAULT_HOSTED_APP_URL = "https://app.t3.codes";
 const CLOUDFLARE_PAGES_HOST_SUFFIX = ".pages.dev";
+const DEFAULT_SERVER_BACKED_CLOUDFLARE_PAGES_HOSTS = ["dl5-5uq.pages.dev"];
 
 export interface HostedPairingRequest {
   readonly host: string;
@@ -36,13 +37,31 @@ function isCloudflarePagesOrigin(url: URL): boolean {
   return url.protocol === "https:" && url.hostname.endsWith(CLOUDFLARE_PAGES_HOST_SUFFIX);
 }
 
+function configuredServerBackedCloudflarePagesHosts(): Set<string> {
+  const configured = import.meta.env.VITE_SERVER_BACKED_PAGES_HOSTS?.trim() || "";
+  return new Set(
+    [...DEFAULT_SERVER_BACKED_CLOUDFLARE_PAGES_HOSTS, ...configured.split(",")]
+      .map((host) => host.trim().toLowerCase())
+      .filter(Boolean),
+  );
+}
+
+function isServerBackedCloudflarePagesOrigin(url: URL): boolean {
+  return (
+    isCloudflarePagesOrigin(url) &&
+    configuredServerBackedCloudflarePagesHosts().has(url.hostname.toLowerCase())
+  );
+}
+
 function currentHostedAppOrigin(): string | null {
   if (typeof window === "undefined") {
     return null;
   }
   try {
     const currentUrl = new URL(window.location.href);
-    return isHostedStaticApp(currentUrl) ? currentUrl.origin : null;
+    return isHostedStaticApp(currentUrl) || isCloudflarePagesOrigin(currentUrl)
+      ? currentUrl.origin
+      : null;
   } catch {
     return null;
   }
@@ -53,12 +72,20 @@ export function isHostedStaticApp(url: URL = new URL(window.location.href)): boo
     return false;
   }
 
+  if (isServerBackedCloudflarePagesOrigin(url)) {
+    return false;
+  }
+
   if (configuredHostedAppChannel()) {
     return true;
   }
 
   const hostedOrigin = originFromUrl(configuredHostedAppUrl());
-  return (hostedOrigin !== null && url.origin === hostedOrigin) || isCloudflarePagesOrigin(url);
+  if (hostedOrigin !== null && url.origin === hostedOrigin) {
+    return true;
+  }
+
+  return isCloudflarePagesOrigin(url) && !isServerBackedCloudflarePagesOrigin(url);
 }
 
 export function readHostedPairingRequest(url: URL = new URL(window.location.href)) {
