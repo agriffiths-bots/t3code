@@ -53,6 +53,7 @@ export interface WorktreeReapCandidate {
   readonly threadIds: ReadonlyArray<string>;
   readonly projectCwd: string;
   readonly path: string;
+  readonly forceRemove?: boolean;
 }
 
 export interface WorktreeReapOptions {
@@ -94,6 +95,12 @@ function rowRemovalPath(row: WorktreeMaintenanceRow): string | null {
 function rowWorktreePath(row: WorktreeMaintenanceRow): string | null {
   return normalizePath(row.worktreePath);
 }
+
+type WorktreeReapEligibility = {
+  readonly path: string;
+  readonly key: string;
+  readonly forceRemove: boolean;
+};
 
 function isRowActive(row: WorktreeMaintenanceRow): boolean {
   if (row.deletedAt !== null) {
@@ -142,7 +149,7 @@ function reapEligibility(
   normalizedProjectRoots: ReadonlyArray<string>,
   nowMs: number,
   options: Required<WorktreeReapOptions>,
-): { readonly path: string; readonly key: string } | null {
+): WorktreeReapEligibility | null {
   const removalPath = rowRemovalPath(row);
   if (
     !removalPath ||
@@ -157,6 +164,7 @@ function reapEligibility(
   return {
     path: removalPath,
     key: `${row.projectCwd}\0${removalPath}`,
+    forceRemove: row.deletedAt !== null || row.archivedAt !== null,
   };
 }
 
@@ -176,7 +184,7 @@ export function selectStaleWorktreeReapCandidates(
   });
   const candidates: WorktreeReapCandidate[] = [];
   const selectedPaths = new Set<string>();
-  const eligibilityByThreadId = new Map<string, { readonly path: string; readonly key: string }>();
+  const eligibilityByThreadId = new Map<string, WorktreeReapEligibility>();
 
   for (const row of rows) {
     const eligibility = reapEligibility(row, normalizedProjectRoots, nowMs, resolvedOptions);
@@ -234,6 +242,9 @@ export function selectStaleWorktreeReapCandidates(
         }),
       ),
     );
+    const forceRemove = threadIds.every(
+      (threadId) => eligibilityByThreadId.get(threadId)?.forceRemove === true,
+    );
 
     for (const coveredKey of coveredKeys) {
       selectedPaths.add(coveredKey);
@@ -243,6 +254,7 @@ export function selectStaleWorktreeReapCandidates(
       threadIds,
       projectCwd: row.projectCwd,
       path: eligibility.path,
+      ...(forceRemove ? { forceRemove: true } : {}),
     });
   }
 
@@ -531,6 +543,7 @@ const make = Effect.gen(function* () {
           .removeWorktree({
             cwd: candidate.projectCwd,
             path: candidate.path,
+            ...(candidate.forceRemove === true ? { force: true } : {}),
           })
           .pipe(Effect.result);
         if (Result.isFailure(removeResult)) {

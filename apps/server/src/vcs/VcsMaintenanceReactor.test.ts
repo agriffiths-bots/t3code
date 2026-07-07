@@ -80,6 +80,7 @@ describe("selectStaleWorktreeReapCandidates", () => {
         threadIds: ["archived-a", "archived-b"],
         projectCwd: "/repo",
         path: "/worktrees/shared-archived",
+        forceRemove: true,
       },
     ]);
   });
@@ -139,6 +140,7 @@ describe("selectStaleWorktreeReapCandidates", () => {
         threadIds: ["deleted-pending"],
         projectCwd: "/repo",
         path: "/worktrees/deleted-pending",
+        forceRemove: true,
       },
     ]);
   });
@@ -167,6 +169,7 @@ describe("selectStaleWorktreeReapCandidates", () => {
         threadIds: ["archived-pending"],
         projectCwd: "/repo",
         path: "/worktrees/archived-pending",
+        forceRemove: true,
       },
     ]);
   });
@@ -337,6 +340,45 @@ describe("selectStaleWorktreeReapCandidates", () => {
         stoppedAgeMs: 60 * 60_000,
       }).map((candidate) => candidate.threadId),
     ).toEqual(["archived", "deleted"]);
+  });
+
+  it("only marks archived and deleted worktrees for forced removal", () => {
+    expect(
+      selectStaleWorktreeReapCandidates(
+        [
+          row({ threadId: "stopped" }),
+          row({ threadId: "archived", archivedAt: "2026-07-05T00:00:00.000Z" }),
+          row({ threadId: "deleted", deletedAt: "2026-07-05T00:00:00.000Z" }),
+        ],
+        ["/repo"],
+        NOW,
+        {
+          stoppedAgeMs: 60_000,
+          archivedAgeMs: 60_000,
+        },
+      ),
+    ).toEqual([
+      {
+        threadId: "stopped",
+        threadIds: ["stopped"],
+        projectCwd: "/repo",
+        path: "/worktrees/stopped",
+      },
+      {
+        threadId: "archived",
+        threadIds: ["archived"],
+        projectCwd: "/repo",
+        path: "/worktrees/archived",
+        forceRemove: true,
+      },
+      {
+        threadId: "deleted",
+        threadIds: ["deleted"],
+        projectCwd: "/repo",
+        path: "/worktrees/deleted",
+        forceRemove: true,
+      },
+    ]);
   });
 });
 

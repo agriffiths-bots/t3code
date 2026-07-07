@@ -647,6 +647,32 @@ it.layer(TestLayer)("GitVcsDriver core integration", (it) => {
         assert.equal(yield* fileSystem.exists(worktreePath), false);
       }),
     );
+
+    it.effect("force-removes a dirty worktree", () =>
+      Effect.gen(function* () {
+        const cwd = yield* makeTmpDir();
+        const { initialBranch } = yield* initRepoWithCommit(cwd);
+        const pathService = yield* Path.Path;
+        const worktreePath = pathService.join(
+          yield* makeTmpDir("git-worktrees-"),
+          "dirty-worktree",
+        );
+        const driver = yield* GitVcsDriver.GitVcsDriver;
+
+        yield* driver.createWorktree({
+          cwd,
+          path: worktreePath,
+          refName: initialBranch,
+          newRefName: "feature/dirty-worktree",
+        });
+        yield* writeTextFile(worktreePath, "dirty.txt", "dirty\n");
+
+        yield* driver.removeWorktree({ cwd, path: worktreePath }).pipe(Effect.flip);
+        yield* driver.removeWorktree({ cwd, path: worktreePath, force: true });
+        const fileSystem = yield* FileSystem.FileSystem;
+        assert.equal(yield* fileSystem.exists(worktreePath), false);
+      }),
+    );
   });
 
   describe("commit context", () => {
