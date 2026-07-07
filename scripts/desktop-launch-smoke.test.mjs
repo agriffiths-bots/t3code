@@ -87,6 +87,30 @@ describe("desktop-launch-smoke output diagnostics", () => {
     expect(snapshot.length).toBeLessThanOrEqual(220);
   });
 
+  it("focuses a fatal snapshot on the matching output line", () => {
+    const snapshot = captureFatalOutput(
+      `${"stdout: /tmp/appimage_extracted/path/node_modules/react-native/File.cpp\n".repeat(
+        200,
+      )}stderr: UnhandledPromiseRejection: missing packaged module\n${"tail\n".repeat(200)}`,
+      260,
+    );
+
+    expect(snapshot).toContain("UnhandledPromiseRejection");
+    expect(snapshot).toContain("missing packaged module");
+    expect(snapshot).not.toContain("react-native/File.cpp");
+    expect(snapshot.length).toBeLessThanOrEqual(260);
+  });
+
+  it("keeps single-line fatal snapshots inside the requested cap", () => {
+    const snapshot = captureFatalOutput(
+      `${"prefix ".repeat(80)}ERR_MODULE_NOT_FOUND${" tail".repeat(120)}`,
+      220,
+    );
+
+    expect(snapshot).toContain("ERR_MODULE_NOT_FOUND");
+    expect(snapshot.length).toBeLessThanOrEqual(220);
+  });
+
   it("keeps context around a fatal pattern after earlier output is truncated", () => {
     const snapshot = captureFatalOutput(
       `${"prefix\n".repeat(200)}stderr: ERR_MODULE_NOT_FOUND: missing package\nstdout: done`,
