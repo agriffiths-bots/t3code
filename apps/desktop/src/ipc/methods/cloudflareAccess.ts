@@ -517,6 +517,12 @@ function captureCloudflareAccessCookie(options: {
           waitForLoadFailure,
         ]);
         capturedReplacementCookie = true;
+        configureCloudflareAccessHeaders(
+          session,
+          options.origin,
+          { "cf-access-jwt-assertion": cookieValue },
+          cookieValue,
+        );
         return cookieValue;
       } finally {
         try {

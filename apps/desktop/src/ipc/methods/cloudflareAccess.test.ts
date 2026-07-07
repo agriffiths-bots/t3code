@@ -367,7 +367,11 @@ describe("desktop Cloudflare Access cookies", () => {
         postAuthCallback,
       );
       expect(postAuthCallback).toHaveBeenCalledWith({
-        requestHeaders: { "user-agent": "t3code" },
+        requestHeaders: {
+          "user-agent": "t3code",
+          "cf-access-jwt-assertion": "fresh-cookie",
+          Cookie: "CF_Authorization=fresh-cookie",
+        },
       });
     }),
   );

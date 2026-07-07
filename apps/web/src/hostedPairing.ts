@@ -59,10 +59,7 @@ function currentHostedAppOrigin(): string | null {
   }
   try {
     const currentUrl = new URL(window.location.href);
-    return isHostedStaticApp(currentUrl) ||
-      (isCloudflarePagesOrigin(currentUrl) && !isServerBackedCloudflarePagesOrigin(currentUrl))
-      ? currentUrl.origin
-      : null;
+    return isHostedStaticApp(currentUrl) ? currentUrl.origin : null;
   } catch {
     return null;
   }

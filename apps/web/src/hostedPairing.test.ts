@@ -107,6 +107,26 @@ describe("hostedPairing", () => {
     expect(url.hash).toBe("#token=pairing-token");
   });
 
+  it("uses the configured hosted origin for Pages builds with a configured backend", () => {
+    vi.stubEnv("VITE_HOSTED_APP_URL", "https://oc.agriffiths.dev");
+    vi.stubEnv("VITE_HTTP_URL", "https://backend.example.com");
+    vi.stubEnv("VITE_WS_URL", "");
+    vi.stubGlobal("window", {
+      location: {
+        href: "https://preview-three.pages.dev/settings",
+      },
+    });
+
+    const url = new URL(
+      buildHostedPairingUrl({
+        host: "https://backend.example.com:3773",
+        token: "pairing-token",
+      }),
+    );
+
+    expect(url.origin).toBe("https://oc.agriffiths.dev");
+  });
+
   it("builds hosted channel selection URLs through the configured router origin", () => {
     vi.stubEnv("VITE_HOSTED_APP_URL", "https://app.t3.codes");
 
