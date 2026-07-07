@@ -1,10 +1,14 @@
 import {
   EventId,
   MessageId,
+  ProjectId,
+  ProviderInstanceId,
   ThreadId,
   TurnId,
+  type OrchestrationThread,
   type OrchestrationThreadActivity,
 } from "@t3tools/contracts";
+import { applyThreadDetailEvent } from "@t3tools/client-runtime/state/threads";
 import { describe, expect, it } from "vite-plus/test";
 
 import {
@@ -1589,6 +1593,87 @@ describe("deriveTimelineEntries", () => {
       "assistant-turn-1",
       "user-turn-2",
       "assistant-reused-segment-turn-2",
+    ]);
+  });
+
+  it("exposes a running-turn assistant message-sent event immediately", () => {
+    const threadId = ThreadId.make("thread-live-assistant");
+    const turnId = TurnId.make("turn-live-assistant");
+    const baseThread: OrchestrationThread = {
+      id: threadId,
+      projectId: ProjectId.make("project-live-assistant"),
+      title: "Live assistant delivery",
+      modelSelection: { instanceId: ProviderInstanceId.make("claudeAgent"), model: "claude" },
+      runtimeMode: "full-access",
+      interactionMode: "default",
+      branch: "main",
+      worktreePath: null,
+      latestTurn: {
+        turnId,
+        state: "running",
+        requestedAt: "2026-07-07T21:00:00.000Z",
+        startedAt: "2026-07-07T21:00:01.000Z",
+        completedAt: null,
+        assistantMessageId: null,
+      },
+      createdAt: "2026-07-07T21:00:00.000Z",
+      updatedAt: "2026-07-07T21:00:01.000Z",
+      archivedAt: null,
+      deletedAt: null,
+      messages: [],
+      proposedPlans: [],
+      activities: [],
+      checkpoints: [],
+      session: {
+        threadId,
+        status: "running",
+        providerName: "claudeAgent",
+        runtimeMode: "full-access",
+        activeTurnId: turnId,
+        lastError: null,
+        updatedAt: "2026-07-07T21:00:01.000Z",
+      },
+    };
+
+    const result = applyThreadDetailEvent(baseThread, {
+      eventId: EventId.make("event-live-assistant"),
+      sequence: 42,
+      occurredAt: "2026-07-07T21:00:03.000Z",
+      commandId: null,
+      causationEventId: null,
+      correlationId: null,
+      metadata: {},
+      aggregateKind: "thread",
+      aggregateId: threadId,
+      type: "thread.message-sent",
+      payload: {
+        threadId,
+        messageId: MessageId.make("message-live-assistant"),
+        role: "assistant",
+        text: "INTERIM text visible before the turn settles.",
+        turnId,
+        streaming: false,
+        createdAt: "2026-07-07T21:00:03.000Z",
+        updatedAt: "2026-07-07T21:00:03.000Z",
+      },
+    });
+
+    expect(result.kind).toBe("updated");
+    if (result.kind !== "updated") {
+      return;
+    }
+    expect(result.thread.latestTurn?.state).toBe("running");
+
+    const entries = deriveTimelineEntries(result.thread.messages, [], []);
+    expect(entries).toEqual([
+      expect.objectContaining({
+        kind: "message",
+        message: expect.objectContaining({
+          role: "assistant",
+          text: "INTERIM text visible before the turn settles.",
+          turnId,
+        }),
+      }),
     ]);
   });
 });
