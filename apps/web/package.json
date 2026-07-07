@@ -5,7 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "vp dev",
-    "build": "vp build",
+    "build": "vp build && node ../../scripts/assert-web-build-output.ts dist",
     "preview": "vp preview",
     "typecheck": "tsgo --noEmit",
     "test": "vp test run --passWithNoTests --project unit"

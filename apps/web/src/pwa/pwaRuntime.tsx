@@ -14,7 +14,7 @@ import { useEnvironmentHttpBaseUrl, usePrimaryEnvironmentId } from "../state/env
 import { serverEnvironment } from "../state/server";
 import { useAtomCommand } from "../state/use-atom-command";
 
-const SERVICE_WORKER_URL = "/t3-service-worker.js";
+const SERVICE_WORKER_URL = "/sw.js";
 const SERVICE_WORKER_SCOPE = "/";
 const DEVICE_ID_STORAGE_KEY = "t3code:pwa-device-id";
 const REGISTRATION_REFRESH_MS = 4 * 60 * 1_000;

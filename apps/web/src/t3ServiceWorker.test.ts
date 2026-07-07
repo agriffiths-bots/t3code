@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vite-plus/test";
 
-import serviceWorkerSource from "../public/t3-service-worker.js?raw";
+import serviceWorkerSource from "../public/sw.js?raw";
 
 const ORIGIN = "https://app.test";
 const CACHE_VERSION = "t3-code-v2";
