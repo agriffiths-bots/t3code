@@ -3,6 +3,7 @@ import { squashAtomCommandFailure } from "@t3tools/client-runtime/state/runtime"
 import React, { startTransition, useEffect, useRef, useState, useCallback } from "react";
 
 import { APP_DISPLAY_NAME } from "../../branding";
+import { environmentCatalog } from "../../connection/catalog";
 import { connectPairing } from "../../connection/onboarding";
 import {
   peekPairingTokenFromUrl,
@@ -10,9 +11,14 @@ import {
   submitServerAuthCredential,
 } from "../../environments/primary";
 import { readHostedPairingRequest } from "../../hostedPairing";
+import { usePrimaryEnvironmentId } from "../../state/environments";
 import { Button } from "../ui/button";
 import { Input } from "../ui/input";
 import { useAtomCommand } from "../../state/use-atom-command";
+import {
+  errorMessageFromUnknown,
+  submitPairingCredentialAndUnblock,
+} from "./PairingRouteSurface.logic";
 
 export function PairingPendingSurface() {
   return (
@@ -52,15 +58,24 @@ export function PairingRouteSurface({
   const [errorMessage, setErrorMessage] = useState(initialErrorMessage ?? "");
   const [isSubmitting, setIsSubmitting] = useState(false);
   const autoSubmitAttemptedRef = useRef(false);
+  const primaryEnvironmentId = usePrimaryEnvironmentId();
+  const retryPrimaryEnvironment = useAtomCommand(environmentCatalog.retryNow, {
+    reportFailure: false,
+  });
 
   const submitCredential = useCallback(
     async (nextCredential: string) => {
       setIsSubmitting(true);
       setErrorMessage("");
 
-      const submitError = await submitServerAuthCredential(nextCredential).then(
-        () => null,
-        (error) => errorMessageFromUnknown(error),
+      const submitError = await submitPairingCredentialAndUnblock(
+        {
+          submitServerAuthCredential,
+          retryPrimaryEnvironment,
+          primaryEnvironmentId,
+          errorMessageFromUnknown,
+        },
+        nextCredential,
       );
 
       setIsSubmitting(false);
@@ -74,7 +89,7 @@ export function PairingRouteSurface({
         onAuthenticated();
       });
     },
-    [onAuthenticated],
+    [onAuthenticated, primaryEnvironmentId, retryPrimaryEnvironment],
   );
 
   const handleSubmit = useCallback(
@@ -285,18 +300,6 @@ export function HostedPairingRouteSurface() {
       </section>
     </div>
   );
-}
-
-function errorMessageFromUnknown(error: unknown): string {
-  if (error instanceof Error && error.message.trim().length > 0) {
-    return error.message;
-  }
-
-  if (typeof error === "string" && error.trim().length > 0) {
-    return error;
-  }
-
-  return "Authentication failed.";
 }
 
 function describeAuthGate(bootstrapMethods: ReadonlyArray<string>): string {
