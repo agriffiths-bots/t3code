@@ -28,6 +28,8 @@ import { SubagentToolkitHandlersLive } from "./toolkits/subagent/handlers.ts";
 import { SubagentToolkit } from "./toolkits/subagent/tools.ts";
 import { NotifyToolkitHandlersLive } from "./toolkits/notify/handlers.ts";
 import { NotifyToolkit } from "./toolkits/notify/tools.ts";
+import { VisibilityToolkitHandlersLive } from "./toolkits/visibility/handlers.ts";
+import { VisibilityToolkit } from "./toolkits/visibility/tools.ts";
 
 const mcpCredentialRecoveryHint =
   "T3 Code MCP authentication failed because this provider-session credential is not active. Start a fresh T3 Code provider session; OAuth re-authorization cannot recover this local session credential.";
@@ -230,6 +232,10 @@ export const NotifyToolkitRegistrationLive = McpServer.toolkit(NotifyToolkit).pi
   Layer.provide(NotifyToolkitHandlersLive),
 );
 
+export const VisibilityToolkitRegistrationLive = McpServer.toolkit(VisibilityToolkit).pipe(
+  Layer.provide(VisibilityToolkitHandlersLive),
+);
+
 const McpTransportLive = McpServer.layerHttp({
   name: "T3 Code",
   version: packageJson.version,
@@ -241,6 +247,7 @@ export const ToolkitRegistrationLive = Layer.mergeAll(
   ThreadToolkitRegistrationLive,
   SubagentToolkitRegistrationLive,
   NotifyToolkitRegistrationLive,
+  VisibilityToolkitRegistrationLive,
 );
 
 export const layer = ToolkitRegistrationLive.pipe(Layer.provideMerge(McpTransportLive));
