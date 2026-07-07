@@ -680,39 +680,6 @@ describe("EnvironmentSupervisor", () => {
     }),
   );
 
-  it.effect("keeps backoff idle when it consumes the delayed online wakeup", () =>
-    Effect.gen(function* () {
-      const harness = yield* makeHarness({
-        networkStatus: "offline",
-        prepare: (attempt) =>
-          attempt === 1
-            ? Effect.fail(transient("Recovery attempt failed."))
-            : Effect.succeed(PREPARED_CONNECTION),
-      });
-      const supervisor = yield* EnvironmentSupervisor.make(TARGET_ENTRY, {
-        initiallyDesired: true,
-      }).pipe(Effect.provide(harness.dependencies));
-
-      yield* awaitState(supervisor.state, (state) => state.phase === "offline");
-      yield* harness.setNetworkStatus("online");
-      yield* awaitState(
-        supervisor.state,
-        (state) => state.phase === "backoff" && state.attempt === 1,
-      );
-      yield* harness.wake("browser-online");
-      yield* Effect.yieldNow;
-
-      expect(yield* Ref.get(harness.prepareCount)).toBe(1);
-      expect((yield* SubscriptionRef.get(supervisor.state)).phase).toBe("backoff");
-
-      yield* harness.wake("browser-online");
-      yield* eventuallyState(supervisor.state, (state) => state.phase === "connected");
-
-      expect(yield* Ref.get(harness.prepareCount)).toBe(2);
-      expect(yield* Ref.get(harness.sessionCount)).toBe(1);
-    }),
-  );
-
   it.effect("retries backoff when connectivity becomes online from unknown", () =>
     Effect.gen(function* () {
       const harness = yield* makeHarness({
