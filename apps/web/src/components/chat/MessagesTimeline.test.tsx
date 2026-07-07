@@ -572,7 +572,7 @@ describe("MessagesTimeline", () => {
     );
 
     expect(markup).toContain("Worked for");
-    expect(markup).not.toContain("I will inspect first.");
+    expect(markup).toContain("I will inspect first.");
     expect(markup).not.toContain("Ran command");
     expect(markup).not.toContain("Late tool status");
     expect(markup).toContain("First final section.");
