@@ -14,6 +14,7 @@ const DEFAULT_STABILITY_MS = 5_000;
 const DESCRIPTOR_PATH = "/.well-known/t3/environment";
 const READY_MARKER_FILE = "main-window-ready.json";
 const MAX_CAPTURED_OUTPUT_BYTES = 2 * 1024 * 1024;
+const FATAL_OUTPUT_SNAPSHOT_BYTES = 16 * 1024;
 const FATAL_OUTPUT_PATTERNS = [
   /ERR_MODULE_NOT_FOUND/i,
   /\bMODULE_NOT_FOUND\b/i,
@@ -282,13 +283,13 @@ function findFatalOutputMatch(output) {
     pattern.lastIndex = 0;
     const match = pattern.exec(output);
     if (match?.index !== undefined) {
-      return { pattern, index: match.index };
+      return { pattern, index: match.index, length: match[0]?.length ?? 0 };
     }
   }
   return undefined;
 }
 
-export function captureFatalOutput(output, maxBytes = MAX_CAPTURED_OUTPUT_BYTES) {
+export function captureFatalOutput(output, maxBytes = FATAL_OUTPUT_SNAPSHOT_BYTES) {
   const match = findFatalOutputMatch(output);
   if (!match) {
     return undefined;
@@ -301,14 +302,51 @@ export function captureFatalOutput(output, maxBytes = MAX_CAPTURED_OUTPUT_BYTES)
   const suffix = "\n[output truncated after fatal]";
   const markerBytes = prefix.length + suffix.length;
   const windowBytes = Math.max(1, maxBytes - markerBytes);
-  const contextBeforeBytes = Math.floor(windowBytes / 3);
-  const start = Math.max(0, match.index - contextBeforeBytes);
-  const end = Math.min(output.length, start + windowBytes);
-  const adjustedStart = Math.max(0, end - windowBytes);
-  const truncatedPrefix = adjustedStart > 0 ? prefix : "";
-  const truncatedSuffix = end < output.length ? suffix : "";
+  const contextBeforeBytes = Math.floor(windowBytes / 4);
+  const contextAfterBytes = windowBytes - contextBeforeBytes;
+  const preferredStart = Math.max(0, match.index - contextBeforeBytes);
+  const preferredEnd = Math.min(
+    output.length,
+    match.index + Math.max(match.length, 1) + contextAfterBytes,
+  );
+  const lineStart = output.lastIndexOf("\n", match.index);
+  const lineEnd = output.indexOf("\n", match.index + Math.max(match.length, 1));
+  const start = lineStart >= preferredStart ? lineStart + 1 : preferredStart;
+  const end = lineEnd !== -1 && lineEnd <= preferredEnd ? lineEnd : preferredEnd;
 
-  return `${truncatedPrefix}${output.slice(adjustedStart, end)}${truncatedSuffix}`;
+  const formatSnapshot = (sliceStart, sliceEnd) => {
+    const truncatedPrefix = sliceStart > 0 ? prefix : "";
+    const truncatedSuffix = sliceEnd < output.length ? suffix : "";
+    return `${truncatedPrefix}${output.slice(sliceStart, sliceEnd)}${truncatedSuffix}`;
+  };
+
+  const snapshot = formatSnapshot(start, end);
+  if (snapshot.length <= maxBytes) {
+    return snapshot;
+  }
+
+  const truncatedPrefix = start > 0 ? prefix : "";
+  const truncatedSuffix = end < output.length ? suffix : "";
+  const bodyBudget = maxBytes - truncatedPrefix.length - truncatedSuffix.length;
+  if (bodyBudget <= 0) {
+    return output.slice(match.index, Math.min(output.length, match.index + maxBytes));
+  }
+
+  const matchStart = Math.min(Math.max(match.index, start), end);
+  const matchEnd = Math.min(end, matchStart + Math.max(match.length, 1));
+  const matchBytes = matchEnd - matchStart;
+  const beforeBudget = Math.min(
+    matchStart - start,
+    Math.max(0, Math.floor((bodyBudget - matchBytes) / 4)),
+  );
+  let clampedStart = matchStart - beforeBudget;
+  let clampedEnd = Math.min(end, clampedStart + bodyBudget);
+  if (clampedEnd <= matchEnd) {
+    clampedEnd = Math.min(end, matchEnd);
+    clampedStart = Math.max(start, clampedEnd - bodyBudget);
+  }
+
+  return formatSnapshot(clampedStart, clampedEnd);
 }
 
 function outputHasFatalPattern(output) {
@@ -381,9 +419,15 @@ async function collectDiagnostics(tempRoot, output) {
 
 async function assertHealthy(child, output, serverChildLogPath) {
   const serverChildLog = await readOptionalText(serverChildLogPath);
-  const fatalPattern = outputHasFatalPattern(`${output()}\n${serverChildLog}`);
+  const diagnosticOutput = `${output()}\n${serverChildLog}`;
+  const fatalPattern = outputHasFatalPattern(diagnosticOutput);
   if (fatalPattern) {
-    throw new Error(`Desktop launch emitted fatal pattern ${fatalPattern}`);
+    const fatalSnapshot = captureFatalOutput(diagnosticOutput);
+    throw new Error(
+      `Desktop launch emitted fatal pattern ${fatalPattern}${
+        fatalSnapshot ? `\nFatal output snapshot:\n${fatalSnapshot}` : ""
+      }`,
+    );
   }
   if (child.exitCode !== null || child.signalCode !== null) {
     throw new Error(
