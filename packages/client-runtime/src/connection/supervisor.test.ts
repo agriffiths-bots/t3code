@@ -680,23 +680,14 @@ describe("EnvironmentSupervisor", () => {
     }),
   );
 
-  it.effect("clears online wakeup suppression when backoff consumes the delayed wakeup", () =>
+  it.effect("keeps backoff idle when it consumes the delayed online wakeup", () =>
     Effect.gen(function* () {
-      const retryAttemptStarted = yield* Deferred.make<void>();
       const harness = yield* makeHarness({
         networkStatus: "offline",
-        prepare: (attempt) => {
-          switch (attempt) {
-            case 1:
-              return Effect.fail(transient("Recovery attempt failed."));
-            case 2:
-              return Deferred.succeed(retryAttemptStarted, undefined).pipe(
-                Effect.andThen(Effect.never),
-              );
-            default:
-              return Effect.succeed(PREPARED_CONNECTION);
-          }
-        },
+        prepare: (attempt) =>
+          attempt === 1
+            ? Effect.fail(transient("Recovery attempt failed."))
+            : Effect.succeed(PREPARED_CONNECTION),
       });
       const supervisor = yield* EnvironmentSupervisor.make(TARGET_ENTRY, {
         initiallyDesired: true,
@@ -709,11 +700,15 @@ describe("EnvironmentSupervisor", () => {
         (state) => state.phase === "backoff" && state.attempt === 1,
       );
       yield* harness.wake("browser-online");
-      yield* Deferred.await(retryAttemptStarted);
+      yield* Effect.yieldNow;
+
+      expect(yield* Ref.get(harness.prepareCount)).toBe(1);
+      expect((yield* SubscriptionRef.get(supervisor.state)).phase).toBe("backoff");
+
       yield* harness.wake("browser-online");
       yield* eventuallyState(supervisor.state, (state) => state.phase === "connected");
 
-      expect(yield* Ref.get(harness.prepareCount)).toBe(3);
+      expect(yield* Ref.get(harness.prepareCount)).toBe(2);
       expect(yield* Ref.get(harness.sessionCount)).toBe(1);
     }),
   );
