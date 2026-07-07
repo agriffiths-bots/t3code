@@ -28,6 +28,8 @@ import { SubagentToolkitHandlersLive } from "./toolkits/subagent/handlers.ts";
 import { SubagentToolkit } from "./toolkits/subagent/tools.ts";
 import { NotifyToolkitHandlersLive } from "./toolkits/notify/handlers.ts";
 import { NotifyToolkit } from "./toolkits/notify/tools.ts";
+import { UsageToolkitHandlersLive } from "./toolkits/usage/handlers.ts";
+import { UsageToolkit } from "./toolkits/usage/tools.ts";
 import { VisibilityToolkitHandlersLive } from "./toolkits/visibility/handlers.ts";
 import { VisibilityToolkit } from "./toolkits/visibility/tools.ts";
 
@@ -232,6 +234,10 @@ export const NotifyToolkitRegistrationLive = McpServer.toolkit(NotifyToolkit).pi
   Layer.provide(NotifyToolkitHandlersLive),
 );
 
+export const UsageToolkitRegistrationLive = McpServer.toolkit(UsageToolkit).pipe(
+  Layer.provide(UsageToolkitHandlersLive),
+);
+
 export const VisibilityToolkitRegistrationLive = McpServer.toolkit(VisibilityToolkit).pipe(
   Layer.provide(VisibilityToolkitHandlersLive),
 );
@@ -247,6 +253,7 @@ export const ToolkitRegistrationLive = Layer.mergeAll(
   ThreadToolkitRegistrationLive,
   SubagentToolkitRegistrationLive,
   NotifyToolkitRegistrationLive,
+  UsageToolkitRegistrationLive,
   VisibilityToolkitRegistrationLive,
 );
 
