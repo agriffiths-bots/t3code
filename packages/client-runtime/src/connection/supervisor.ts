@@ -235,7 +235,7 @@ export const make = Effect.fn("EnvironmentSupervisor.make")(function* (
   };
   const intent = yield* Ref.make(initialIntent);
   const signalSequence = yield* Ref.make(0);
-  const suppressBrowserOnlineWakeupForNextAttempt = yield* Ref.make(false);
+  const suppressNextBrowserOnlineWakeup = yield* Ref.make(false);
   const signals = yield* Queue.unbounded<SequencedSupervisorSignal>();
   const state = yield* SubscriptionRef.make<SupervisorConnectionState>(
     !initialIntent.desired
@@ -271,6 +271,20 @@ export const make = Effect.fn("EnvironmentSupervisor.make")(function* (
       "environment.label": target.label,
     }),
   );
+
+  const consumeSuppressedBrowserOnlineWakeup = Effect.fnUntraced(function* (
+    reason: ConnectionWakeups.ConnectionWakeup,
+  ) {
+    if (reason !== "browser-online") {
+      return false;
+    }
+    const shouldSuppress = yield* Ref.get(suppressNextBrowserOnlineWakeup);
+    if (!shouldSuppress) {
+      return false;
+    }
+    yield* Ref.set(suppressNextBrowserOnlineWakeup, false);
+    return true;
+  });
 
   const reportProgress = Effect.fn("EnvironmentSupervisor.reportProgress")(function* (
     attempt: number,
@@ -370,7 +384,6 @@ export const make = Effect.fn("EnvironmentSupervisor.make")(function* (
 
   const waitForEstablishmentInterrupt = Effect.fnUntraced(function* (input: {
     readonly attemptStartedAfterSignalSequence: number;
-    readonly suppressBrowserOnlineWakeupInterrupt: boolean;
   }) {
     for (;;) {
       const next = yield* Queue.take(signals);
@@ -390,9 +403,16 @@ export const make = Effect.fn("EnvironmentSupervisor.make")(function* (
             yield* logManagedRelayAccountChange;
             return;
           }
+          if (next.reason === "browser-online") {
+            if (yield* consumeSuppressedBrowserOnlineWakeup(next.reason)) {
+              break;
+            }
+            if (next.sequence > input.attemptStartedAfterSignalSequence) {
+              return;
+            }
+          }
           if (
-            (next.reason === "application-active" ||
-              (next.reason === "browser-online" && !input.suppressBrowserOnlineWakeupInterrupt)) &&
+            next.reason === "application-active" &&
             next.sequence > input.attemptStartedAfterSignalSequence
           ) {
             return;
@@ -420,6 +440,9 @@ export const make = Effect.fn("EnvironmentSupervisor.make")(function* (
           if (next.reason === "credentials-changed" && target._tag === "RelayConnectionTarget") {
             yield* logManagedRelayAccountChange;
             return;
+          }
+          if (yield* consumeSuppressedBrowserOnlineWakeup(next.reason)) {
+            break;
           }
           if (next.reason === "application-active" || next.reason === "browser-online") {
             const probe = yield* lease.session.probe.pipe(
@@ -460,7 +483,9 @@ export const make = Effect.fn("EnvironmentSupervisor.make")(function* (
                   }
                   break;
                 case "ConnectRequested":
+                  break;
                 case "Wakeup":
+                  yield* consumeSuppressedBrowserOnlineWakeup(probeEvent.signal.reason);
                   break;
               }
             }
@@ -478,10 +503,6 @@ export const make = Effect.fn("EnvironmentSupervisor.make")(function* (
     lastFailure: ConnectionAttemptError | null,
     pendingRetry: Option.Option<PendingRetryTrace>,
   ) {
-    const suppressBrowserOnlineWakeupInterrupt = yield* Ref.getAndSet(
-      suppressBrowserOnlineWakeupForNextAttempt,
-      false,
-    );
     const attemptStartedAfterSignalSequence = yield* Ref.get(signalSequence);
     yield* SubscriptionRef.set(prepared, Option.none());
     const establishment = yield* Effect.raceAllFirst([
@@ -497,7 +518,6 @@ export const make = Effect.fn("EnvironmentSupervisor.make")(function* (
       ),
       waitForEstablishmentInterrupt({
         attemptStartedAfterSignalSequence,
-        suppressBrowserOnlineWakeupInterrupt,
       }).pipe(Effect.as<EstablishmentEvent>({ _tag: "Interrupted" })),
       Effect.sleep(CONNECTION_ESTABLISHMENT_TIMEOUT).pipe(
         Effect.as<EstablishmentEvent>({ _tag: "TimedOut" }),
@@ -557,6 +577,7 @@ export const make = Effect.fn("EnvironmentSupervisor.make")(function* (
     const connectedAt = yield* Clock.currentTimeMillis;
     yield* SubscriptionRef.set(prepared, Option.some(active.lease.prepared));
     yield* SubscriptionRef.set(session, Option.some(active.lease.session));
+    yield* Ref.set(suppressNextBrowserOnlineWakeup, false);
     yield* setState({
       desired: true,
       network: currentIntent.network,
@@ -602,7 +623,9 @@ export const make = Effect.fn("EnvironmentSupervisor.make")(function* (
             case "DisconnectRequested":
             case "RetryRequested":
             case "NetworkChanged":
+              return;
             case "Wakeup":
+              yield* consumeSuppressedBrowserOnlineWakeup(next.reason);
               return;
           }
         }
@@ -624,13 +647,14 @@ export const make = Effect.fn("EnvironmentSupervisor.make")(function* (
         failureCount = 0;
         latestFailure = null;
         pendingRetry = Option.none();
-        yield* Ref.set(suppressBrowserOnlineWakeupForNextAttempt, false);
+        yield* Ref.set(suppressNextBrowserOnlineWakeup, false);
         yield* clearLease;
         yield* setState(availableState(currentIntent, generation));
         yield* waitForSignal;
         continue;
       }
       if (currentIntent.network === "offline") {
+        yield* Ref.set(suppressNextBrowserOnlineWakeup, false);
         yield* clearLease;
         yield* setState(offlineState(currentIntent, generation, failureCount + 1, latestFailure));
         yield* waitForSignal;
@@ -710,7 +734,7 @@ export const make = Effect.fn("EnvironmentSupervisor.make")(function* (
       }).pipe(
         Effect.flatMap(({ changed, recoveredFromOffline }) =>
           (recoveredFromOffline
-            ? Ref.set(suppressBrowserOnlineWakeupForNextAttempt, true)
+            ? Ref.set(suppressNextBrowserOnlineWakeup, true)
             : Effect.void
           ).pipe(
             Effect.andThen(changed ? signal({ _tag: "NetworkChanged", network }) : Effect.void),
