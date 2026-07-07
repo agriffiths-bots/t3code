@@ -124,17 +124,7 @@ export function CloudEnvironmentRows(props: {
             Loading linked cloud environments.
           </Text>
         </View>
-      ) : controller.relayDiscovery.error ? null : (
-        <View collapsable={false} className="rounded-[24px] bg-card p-5">
-          <Text className="text-sm leading-normal text-foreground-muted">
-            No additional linked cloud environments.
-          </Text>
-        </View>
-      )}
-
-      {/* Rendered alongside any connected rows — a failed discovery must not
-          hide behind an otherwise-healthy list. */}
-      {controller.relayDiscovery.error && !controller.relayDiscovery.isRefreshing ? (
+      ) : controller.relayDiscovery.error ? (
         <View collapsable={false} className="gap-3 rounded-[24px] bg-card p-5">
           <Text className="text-base font-t3-bold text-foreground">
             Could not load T3 Connect environments
@@ -143,17 +133,14 @@ export function CloudEnvironmentRows(props: {
           {controller.relayDiscovery.errorTraceId ? (
             <CopyTraceIdButton traceId={controller.relayDiscovery.errorTraceId} />
           ) : null}
-          <Pressable
-            accessibilityRole="button"
-            onPress={() => {
-              void controller.refreshRelayEnvironments();
-            }}
-            className="self-start rounded-full bg-subtle px-3.5 py-2 active:opacity-70"
-          >
-            <Text className="text-xs font-t3-bold text-foreground">Try again</Text>
-          </Pressable>
         </View>
-      ) : null}
+      ) : (
+        <View collapsable={false} className="rounded-[24px] bg-card p-5">
+          <Text className="text-sm leading-normal text-foreground-muted">
+            No additional linked cloud environments.
+          </Text>
+        </View>
+      )}
     </View>
   );
 }

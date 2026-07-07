@@ -2,7 +2,6 @@ import { useAtomValue } from "@effect/atom-react";
 import { useNavigation } from "@react-navigation/native";
 import { useEffect } from "react";
 
-import { appAtomRegistry } from "../../state/atom-registry";
 import { clearConnectOnboardingRequest, connectOnboardingRequestAtom } from "./connectOnboarding";
 import { isConnectOnboardingOptedOut } from "./connectOnboardingOptOut";
 
@@ -29,10 +28,7 @@ export function useConnectOnboardingNavigation(): void {
       void (async () => {
         // A failed preference read prefers showing the sheet.
         const optedOut = await isConnectOnboardingOptedOut(requestedAccountId).catch(() => false);
-        // The cancelled flag covers effect re-runs, but a sign-out can clear
-        // the request atom moments before this render commits — re-check the
-        // atom so a stale request never presents the sheet.
-        if (cancelled || appAtomRegistry.get(connectOnboardingRequestAtom) !== requestedAccountId) {
+        if (cancelled) {
           return;
         }
         clearConnectOnboardingRequest();

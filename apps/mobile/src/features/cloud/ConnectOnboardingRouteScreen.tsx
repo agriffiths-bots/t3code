@@ -1,7 +1,7 @@
 import { NativeHeaderToolbar } from "../../native/StackHeader";
 import { useAuth } from "@clerk/expo";
-import { StackActions, useNavigation } from "@react-navigation/native";
-import { useCallback, useEffect, useState } from "react";
+import { useNavigation } from "@react-navigation/native";
+import { useCallback, useState } from "react";
 import { Pressable, RefreshControl, ScrollView, View } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 
@@ -22,21 +22,6 @@ import { hasCloudPublicConfig } from "./publicConfig";
  * clears the connected environments, so each new session starts from zero.
  */
 export function ConnectOnboardingRouteScreen() {
-  const navigation = useNavigation();
-
-  // The route is deep-linkable; without cloud config the sheet would present
-  // empty with no chrome to dismiss it, so bail back out instead.
-  useEffect(() => {
-    if (hasCloudPublicConfig()) {
-      return;
-    }
-    if (navigation.canGoBack()) {
-      navigation.goBack();
-    } else {
-      navigation.dispatch(StackActions.replace("Home"));
-    }
-  }, [navigation]);
-
   return hasCloudPublicConfig() ? <ConfiguredConnectOnboardingRouteScreen /> : null;
 }
 
@@ -67,16 +52,14 @@ function ConfiguredConnectOnboardingRouteScreen() {
     navigation.goBack();
   }, [navigation]);
 
-  // Persist before dismissing so a quick sign-out/sign-in cannot race ahead
-  // of the preference write; the write is a local secure-store update.
   const handleDontShowAgain = useCallback(() => {
-    void (async () => {
-      if (userId) {
+    if (userId) {
+      void (async () => {
         const result = await settlePromise(() => optOutOfConnectOnboarding(userId));
         reportAtomCommandResult(result, { label: "connect onboarding opt-out" });
-      }
-      navigation.goBack();
-    })();
+      })();
+    }
+    navigation.goBack();
   }, [navigation, userId]);
 
   return (
@@ -85,7 +68,6 @@ function ConfiguredConnectOnboardingRouteScreen() {
         <NativeHeaderToolbar.Button icon="xmark" onPress={handleClose} separateBackground />
       </NativeHeaderToolbar>
       <ScrollView
-        alwaysBounceVertical
         contentInsetAdjustmentBehavior="automatic"
         showsVerticalScrollIndicator={false}
         style={{ flex: 1 }}

@@ -299,10 +299,15 @@ export const make = Effect.fn("RelayEnvironmentDiscovery.make")(function* () {
           if ((yield* Ref.get(accountGeneration)) !== generation) {
             return;
           }
+          // Signed out is the idle state, not a failure: the proactive
+          // refresh on credentials-changed also runs on sign-out and must
+          // settle back to a clean empty list.
+          const signedOut =
+            error._tag === "ConnectionBlockedError" && error.reason === "authentication";
           yield* SubscriptionRef.update(state, (current) => ({
             ...current,
             refreshing: false,
-            error: Option.some(error),
+            error: signedOut ? Option.none() : Option.some(error),
           }));
         }),
       ),
