@@ -605,7 +605,7 @@ describe("EnvironmentSupervisor", () => {
     }),
   );
 
-  it.effect("does not cancel a fresh online reconnect with an already queued active wakeup", () =>
+  it.effect("does not cancel a fresh online reconnect with a delayed active wakeup", () =>
     Effect.gen(function* () {
       const firstAttemptStarted = yield* Deferred.make<void>();
       const harness = yield* makeHarness({
@@ -618,10 +618,9 @@ describe("EnvironmentSupervisor", () => {
       }).pipe(Effect.provide(harness.dependencies));
 
       yield* awaitState(supervisor.state, (state) => state.phase === "offline");
-      yield* Effect.all([harness.setNetworkStatus("online"), harness.wake("application-active")], {
-        concurrency: "unbounded",
-      });
+      yield* harness.setNetworkStatus("online");
       yield* Deferred.await(firstAttemptStarted);
+      yield* harness.wake("application-active");
       yield* Effect.yieldNow;
 
       expect(yield* Ref.get(harness.prepareCount)).toBe(1);

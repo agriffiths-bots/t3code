@@ -235,6 +235,7 @@ export const make = Effect.fn("EnvironmentSupervisor.make")(function* (
   };
   const intent = yield* Ref.make(initialIntent);
   const signalSequence = yield* Ref.make(0);
+  const suppressActiveWakeupForNextAttempt = yield* Ref.make(false);
   const signals = yield* Queue.unbounded<SequencedSupervisorSignal>();
   const state = yield* SubscriptionRef.make<SupervisorConnectionState>(
     !initialIntent.desired
@@ -367,9 +368,10 @@ export const make = Effect.fn("EnvironmentSupervisor.make")(function* (
     );
   });
 
-  const waitForEstablishmentInterrupt = Effect.fnUntraced(function* (
-    attemptStartedAfterSignalSequence: number,
-  ) {
+  const waitForEstablishmentInterrupt = Effect.fnUntraced(function* (input: {
+    readonly attemptStartedAfterSignalSequence: number;
+    readonly suppressActiveWakeupInterrupt: boolean;
+  }) {
     for (;;) {
       const next = yield* Queue.take(signals);
       switch (next._tag) {
@@ -390,7 +392,8 @@ export const make = Effect.fn("EnvironmentSupervisor.make")(function* (
           }
           if (
             next.reason === "application-active" &&
-            next.sequence > attemptStartedAfterSignalSequence
+            !input.suppressActiveWakeupInterrupt &&
+            next.sequence > input.attemptStartedAfterSignalSequence
           ) {
             return;
           }
@@ -475,6 +478,10 @@ export const make = Effect.fn("EnvironmentSupervisor.make")(function* (
     lastFailure: ConnectionAttemptError | null,
     pendingRetry: Option.Option<PendingRetryTrace>,
   ) {
+    const suppressActiveWakeupInterrupt = yield* Ref.getAndSet(
+      suppressActiveWakeupForNextAttempt,
+      false,
+    );
     const attemptStartedAfterSignalSequence = yield* Ref.get(signalSequence);
     yield* SubscriptionRef.set(prepared, Option.none());
     const establishment = yield* Effect.raceAllFirst([
@@ -488,9 +495,10 @@ export const make = Effect.fn("EnvironmentSupervisor.make")(function* (
           }),
         ),
       ),
-      waitForEstablishmentInterrupt(attemptStartedAfterSignalSequence).pipe(
-        Effect.as<EstablishmentEvent>({ _tag: "Interrupted" }),
-      ),
+      waitForEstablishmentInterrupt({
+        attemptStartedAfterSignalSequence,
+        suppressActiveWakeupInterrupt,
+      }).pipe(Effect.as<EstablishmentEvent>({ _tag: "Interrupted" })),
       Effect.sleep(CONNECTION_ESTABLISHMENT_TIMEOUT).pipe(
         Effect.as<EstablishmentEvent>({ _tag: "TimedOut" }),
       ),
@@ -616,6 +624,7 @@ export const make = Effect.fn("EnvironmentSupervisor.make")(function* (
         failureCount = 0;
         latestFailure = null;
         pendingRetry = Option.none();
+        yield* Ref.set(suppressActiveWakeupForNextAttempt, false);
         yield* clearLease;
         yield* setState(availableState(currentIntent, generation));
         yield* waitForSignal;
@@ -689,11 +698,23 @@ export const make = Effect.fn("EnvironmentSupervisor.make")(function* (
 
   yield* connectivity.changes.pipe(
     Stream.runForEach((network) =>
-      Ref.modify(intent, (current) =>
-        current.network === network ? [false, current] : ([true, { ...current, network }] as const),
-      ).pipe(
-        Effect.flatMap((changed) =>
-          changed ? signal({ _tag: "NetworkChanged", network }) : Effect.void,
+      Ref.modify(intent, (current) => {
+        const changed = current.network !== network;
+        return [
+          {
+            changed,
+            recoveredFromOffline: current.network === "offline" && network !== "offline",
+          },
+          changed ? { ...current, network } : current,
+        ] as const;
+      }).pipe(
+        Effect.flatMap(({ changed, recoveredFromOffline }) =>
+          (recoveredFromOffline
+            ? Ref.set(suppressActiveWakeupForNextAttempt, true)
+            : Effect.void
+          ).pipe(
+            Effect.andThen(changed ? signal({ _tag: "NetworkChanged", network }) : Effect.void),
+          ),
         ),
       ),
     ),
