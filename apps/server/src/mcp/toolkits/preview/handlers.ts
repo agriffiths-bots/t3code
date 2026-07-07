@@ -72,12 +72,18 @@ const handlers = {
         Effect.succeed(missingHostStatus(input ?? {}, error)),
       ),
     ),
-  preview_open: (input) =>
-    invokeTargeted<PreviewAutomationStatus>("open", {
+  preview_open: (input) => {
+    const openInput = {
       ...input,
       show: input.show ?? true,
       reuseExistingTab: input.reuseExistingTab ?? true,
-    }),
+    };
+    return invokeTargeted<PreviewAutomationStatus>("open", openInput).pipe(
+      Effect.catchTag("PreviewAutomationNoAvailableHostError", (error) =>
+        Effect.succeed(missingHostStatus(openInput, error)),
+      ),
+    );
+  },
   preview_navigate: (input) =>
     invokeTargeted<PreviewAutomationStatus>("navigate", input, input.timeoutMs),
   preview_resize: (input) =>
