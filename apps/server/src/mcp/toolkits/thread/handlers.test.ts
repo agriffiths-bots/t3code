@@ -64,6 +64,14 @@ const project: OrchestrationProjectShell = {
   id: projectId,
   title: "Project",
   workspaceRoot: "/repo",
+  repositoryIdentity: {
+    canonicalKey: "git-local:/repo",
+    locator: {
+      source: "git-local",
+      rootPath: "/repo",
+    },
+    rootPath: "/repo",
+  },
   defaultModelSelection: modelSelection,
   scripts: [],
   createdAt: "2026-06-16T00:00:00.000Z",
@@ -223,6 +231,24 @@ const defaultGitWorkflow = {
     }),
 } satisfies Partial<GitWorkflowService["Service"]>;
 
+const nonRepoStatus = {
+  isRepo: false,
+  hasPrimaryRemote: false,
+  isDefaultRef: false,
+  refName: null,
+  hasWorkingTreeChanges: false,
+  workingTree: {
+    files: [],
+    insertions: 0,
+    deletions: 0,
+  },
+  hasUpstream: false,
+  aheadCount: 0,
+  behindCount: 0,
+  aheadOfDefaultCount: 0,
+  pr: null,
+};
+
 const makeTestLayer = (commands: OrchestrationCommand[], options: TestLayerOptions = {}) => {
   const testProject = options.project ?? project;
   const testSourceThread = options.sourceThread ?? sourceThread;
@@ -333,6 +359,101 @@ it.effect("starts a new worktree thread by default and inherits source settings"
     });
     expect(command.bootstrap?.createThread?.worktreeRemovable).toBe(true);
     expect(command.bootstrap?.runSetupScript).toBe(true);
+  }),
+);
+
+it.effect(
+  "degrades default worktree mode to current checkout when the project is not a git repo",
+  () =>
+    Effect.gen(function* () {
+      const commands: OrchestrationCommand[] = [];
+      const vcsCalls: string[] = [];
+      const gitCalls: string[] = [];
+      const result = yield* callStartTool({ prompt: "Run dispatch probe" }, commands, {
+        project: {
+          ...project,
+          workspaceRoot: "/home/adam",
+          repositoryIdentity: null,
+        },
+        sourceThread: {
+          ...sourceThread,
+          branch: null,
+        },
+        gitWorkflow: {
+          status: (input) =>
+            Effect.sync(() => {
+              gitCalls.push(input.cwd);
+              return nonRepoStatus;
+            }),
+        },
+        vcsDetect: (input) =>
+          Effect.sync(() => {
+            vcsCalls.push(`${input.cwd}:${input.cache ?? "allow"}`);
+            return null;
+          }),
+      });
+
+      expect(result.isError).toBe(false);
+      expect(result.structuredContent).toMatchObject({
+        projectId,
+        mode: "current_checkout",
+        branch: null,
+        worktreePath: null,
+      });
+      expect(result.structuredContent).toHaveProperty("warning");
+      expect(String(result.structuredContent?.warning)).toContain("not a Git repository");
+      const command = commands[0];
+      expect(command?.type).toBe("thread.turn.start");
+      if (command?.type !== "thread.turn.start") return;
+      expect(command.bootstrap?.prepareWorktree).toBeUndefined();
+      expect(command.bootstrap?.createThread?.worktreePath).toBeNull();
+      expect(command.bootstrap?.createThread?.worktreeRemovable).toBe(false);
+      expect(command.bootstrap?.createThread?.branch).toBeNull();
+      expect(vcsCalls).toEqual(["/home/adam:allow"]);
+      expect(gitCalls).toEqual(["/home/adam"]);
+    }),
+);
+
+it.effect("ignores explicit worktree requests when the project is not a git repo", () =>
+  Effect.gen(function* () {
+    const commands: OrchestrationCommand[] = [];
+    const result = yield* callStartTool(
+      {
+        prompt: "Run current-directory worker",
+        mode: "existing_worktree",
+        worktreePath: "/repo/elsewhere",
+      },
+      commands,
+      {
+        project: {
+          ...project,
+          workspaceRoot: "/home/adam",
+          repositoryIdentity: null,
+        },
+        sourceThread: {
+          ...sourceThread,
+          branch: null,
+        },
+        gitWorkflow: {
+          status: () => Effect.succeed(nonRepoStatus),
+        },
+        vcsDetect: () => Effect.succeed(null),
+      },
+    );
+
+    expect(result.isError).toBe(false);
+    expect(result.structuredContent).toMatchObject({
+      projectId,
+      mode: "current_checkout",
+      branch: null,
+      worktreePath: null,
+    });
+    const command = commands[0];
+    expect(command?.type).toBe("thread.turn.start");
+    if (command?.type !== "thread.turn.start") return;
+    expect(command.bootstrap?.prepareWorktree).toBeUndefined();
+    expect(command.bootstrap?.createThread?.worktreePath).toBeNull();
+    expect(command.bootstrap?.createThread?.worktreeRemovable).toBe(false);
   }),
 );
 
@@ -1084,7 +1205,7 @@ it.effect("preserves source package cwd when repository validation recovers afte
   }),
 );
 
-it.effect("prepares new worktrees from the source worktree when the project root differs", () =>
+it.effect("degrades source worktrees under non-repo projects to current checkout", () =>
   Effect.gen(function* () {
     const commands: OrchestrationCommand[] = [];
     const result = yield* callStartTool(
@@ -1098,6 +1219,7 @@ it.effect("prepares new worktrees from the source worktree when the project root
         project: {
           ...project,
           workspaceRoot: "/home/adam",
+          repositoryIdentity: null,
         },
         sourceThread: {
           ...sourceThread,
@@ -1109,48 +1231,61 @@ it.effect("prepares new worktrees from the source worktree when the project root
     );
 
     expect(result.isError).toBe(false);
+    expect(result.structuredContent).toMatchObject({
+      projectId,
+      mode: "current_checkout",
+      worktreePath: "/home/adam/wt-t20-worktree-fix",
+    });
+    expect(result.structuredContent).toHaveProperty("warning");
     const command = commands[0];
     expect(command?.type).toBe("thread.turn.start");
     if (command?.type !== "thread.turn.start") return;
-    expect(command.bootstrap?.prepareWorktree).toMatchObject({
-      projectCwd: "/home/adam/wt-t20-worktree-fix",
-      baseBranch: "main",
-    });
+    expect(command.bootstrap?.prepareWorktree).toBeUndefined();
+    expect(command.bootstrap?.createThread?.worktreePath).toBe("/home/adam/wt-t20-worktree-fix");
+    expect(command.bootstrap?.createThread?.worktreeRemovable).toBe(false);
   }),
 );
 
-it.effect("falls back when a source worktree is outside a non-repo project container", () =>
-  Effect.gen(function* () {
-    const commands: OrchestrationCommand[] = [];
-    const result = yield* callStartTool(
-      {
-        prompt: "Spawn from outside checkout",
-        baseBranch: "main",
-      },
-      commands,
-      {
-        project: {
-          ...project,
-          workspaceRoot: "/home/adam",
+it.effect(
+  "degrades to the project checkout when a source worktree is outside a non-repo project",
+  () =>
+    Effect.gen(function* () {
+      const commands: OrchestrationCommand[] = [];
+      const result = yield* callStartTool(
+        {
+          prompt: "Spawn from outside checkout",
+          baseBranch: "main",
         },
-        sourceThread: {
-          ...sourceThread,
-          worktreePath: "/tmp/other-worktree",
+        commands,
+        {
+          project: {
+            ...project,
+            workspaceRoot: "/home/adam",
+            repositoryIdentity: null,
+          },
+          sourceThread: {
+            ...sourceThread,
+            worktreePath: "/tmp/other-worktree",
+          },
+          vcsDetect: (input) =>
+            Effect.succeed(input.cwd === "/home/adam" ? null : makeGitHandle(input.cwd)),
         },
-        vcsDetect: (input) =>
-          Effect.succeed(input.cwd === "/home/adam" ? null : makeGitHandle(input.cwd)),
-      },
-    );
+      );
 
-    expect(result.isError).toBe(false);
-    const command = commands[0];
-    expect(command?.type).toBe("thread.turn.start");
-    if (command?.type !== "thread.turn.start") return;
-    expect(command.bootstrap?.prepareWorktree).toMatchObject({
-      projectCwd: "/home/adam",
-      baseBranch: "main",
-    });
-  }),
+      expect(result.isError).toBe(false);
+      expect(result.structuredContent).toMatchObject({
+        projectId,
+        mode: "current_checkout",
+        worktreePath: null,
+      });
+      expect(result.structuredContent).toHaveProperty("warning");
+      const command = commands[0];
+      expect(command?.type).toBe("thread.turn.start");
+      if (command?.type !== "thread.turn.start") return;
+      expect(command.bootstrap?.prepareWorktree).toBeUndefined();
+      expect(command.bootstrap?.createThread?.worktreePath).toBeNull();
+      expect(command.bootstrap?.createThread?.worktreeRemovable).toBe(false);
+    }),
 );
 
 it.effect("accepts same-repo source worktrees when project detection uses relative metadata", () =>

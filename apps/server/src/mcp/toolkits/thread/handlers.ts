@@ -76,6 +76,9 @@ const resolveOption = <A>(
 const bytesToHex = (bytes: Uint8Array): string =>
   Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
 
+const WORKTREE_DEGRADE_WARNING =
+  "Project directory is not a Git repository; requested worktree mode was ignored and the child was started on the current checkout without a worktree. Concurrent writes may conflict.";
+
 interface SourceCwdProjectMatch {
   readonly belongsToProject: boolean;
   readonly workspaceRelativePath: string | null;
@@ -226,6 +229,18 @@ const makeActiveThreadStartRuntime = Effect.fn("ThreadToolkit.makeActiveRuntime"
           repositoryIdentityPath(projectHandle.repository, projectRoot),
       workspaceRelativePath,
     } satisfies SourceCwdProjectMatch;
+  });
+
+  const projectHasGitRepository = Effect.fn("ThreadToolkit.projectHasGitRepository")(function* (
+    project: OrchestrationProjectShell,
+  ) {
+    if (project.repositoryIdentity !== undefined) {
+      return project.repositoryIdentity !== null;
+    }
+    return yield* vcsDriverRegistry.detect({ cwd: project.workspaceRoot, cache: "bypass" }).pipe(
+      Effect.map((handle) => handle?.kind === "git"),
+      Effect.orElseSucceed(() => true),
+    );
   });
 
   const workspaceRelativePathForCwd = Effect.fn("ThreadToolkit.workspaceRelativePathForCwd")(
@@ -386,9 +401,12 @@ const makeActiveThreadStartRuntime = Effect.fn("ThreadToolkit.makeActiveRuntime"
     },
   ) {
     const { sourceThread, project } = yield* loadSourceContext(invocation);
-    const mode = input.mode ?? "new_worktree";
+    const requestedMode = input.mode ?? "new_worktree";
     const sourceCwdContext = yield* resolveSourceCwd(project, sourceThread);
     const { cwd: sourceCwd, canUseSourceBranch, workspaceRelativePath } = sourceCwdContext;
+    const shouldUseCurrentCheckout =
+      requestedMode !== "current_checkout" && !(yield* projectHasGitRepository(project));
+    const mode: ThreadStartMode = shouldUseCurrentCheckout ? "current_checkout" : requestedMode;
     const ids = yield* makeIds();
     const createdAt = yield* nowIso;
     const branch =
@@ -498,12 +516,16 @@ const makeActiveThreadStartRuntime = Effect.fn("ThreadToolkit.makeActiveRuntime"
       mode,
       branch,
       worktreePath,
-      ...(mode === "current_checkout"
+      ...(shouldUseCurrentCheckout
         ? {
-            warning:
-              "Child thread was started on the current checkout and may conflict with concurrent writes.",
+            warning: WORKTREE_DEGRADE_WARNING,
           }
-        : {}),
+        : mode === "current_checkout"
+          ? {
+              warning:
+                "Child thread was started on the current checkout and may conflict with concurrent writes.",
+            }
+          : {}),
     };
   });
 });
