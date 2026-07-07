@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vite-plus/test";
 
 import { MAX_THREAD_CHECKPOINTS } from "../orchestration/checkpointRetention.ts";
+import { CHECKPOINT_REF_LIST_MAX_OUTPUT_BYTES } from "./GitVcsDriver.ts";
 import {
   CHECKPOINT_REFS_KEEP_PER_THREAD,
   isWorktreePathListed,
@@ -33,6 +34,10 @@ function row(
 describe("selectStaleWorktreeReapCandidates", () => {
   it("keeps physical refs for the turn zero baseline and boundary predecessor", () => {
     expect(CHECKPOINT_REFS_KEEP_PER_THREAD).toBe(MAX_THREAD_CHECKPOINTS + 2);
+  });
+
+  it("allows checkpoint cleanup to scan oversized ref namespaces", () => {
+    expect(CHECKPOINT_REF_LIST_MAX_OUTPUT_BYTES).toBeGreaterThanOrEqual(64 * 1024 * 1024);
   });
 
   it("selects old removable stopped worktrees", () => {

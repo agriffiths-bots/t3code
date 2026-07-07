@@ -271,6 +271,7 @@ export class GitVcsDriver extends Context.Service<
 const WORKSPACE_FILES_MAX_OUTPUT_BYTES = 16 * 1024 * 1024;
 const GIT_CHECK_IGNORE_MAX_STDIN_BYTES = 256 * 1024;
 const CHECKPOINT_DIFF_MAX_OUTPUT_BYTES = 10_000_000;
+export const CHECKPOINT_REF_LIST_MAX_OUTPUT_BYTES = 64 * 1024 * 1024;
 const CHECKPOINT_REFS_PREFIX = "refs/t3/checkpoints";
 const WORKSPACE_GIT_HARDENED_CONFIG_ARGS = [
   "-c",
@@ -949,7 +950,7 @@ export const makeVcsDriverShape = Effect.fn("makeGitVcsDriverShape")(function* (
           args: ["for-each-ref", "--format=%(refname)", CHECKPOINT_REFS_PREFIX],
           allowNonZeroExit: true,
           timeoutMs: 10_000,
-          maxOutputBytes: 2_000_000,
+          maxOutputBytes: CHECKPOINT_REF_LIST_MAX_OUTPUT_BYTES,
         });
 
         if (result.exitCode !== 0) {
