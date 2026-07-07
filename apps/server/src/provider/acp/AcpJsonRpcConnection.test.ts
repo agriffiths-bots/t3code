@@ -492,6 +492,58 @@ describe("AcpSessionRuntime", () => {
     ),
   );
 
+  it.effect("clears session/load replay segment state before a startup retry", () =>
+    Effect.gen(function* () {
+      const runtime = yield* AcpSessionRuntime.AcpSessionRuntime;
+      const firstError = yield* runtime.start().pipe(Effect.flip);
+      expect(firstError._tag).toBe("AcpRequestError");
+
+      const started = yield* runtime.start();
+      expect(started.sessionId).toBe("mock-session-1");
+
+      yield* runtime.prompt({
+        prompt: [{ type: "text", text: "hi after retry" }],
+      });
+      const notes = Array.from(yield* Stream.runCollect(Stream.take(runtime.getEvents(), 4)));
+      expect(notes.map((note) => note._tag)).toEqual([
+        "PlanUpdated",
+        "AssistantItemStarted",
+        "ContentDelta",
+        "AssistantItemCompleted",
+      ]);
+      const assistantStarted = notes.find((note) => note._tag === "AssistantItemStarted");
+      const contentDelta = notes.find((note) => note._tag === "ContentDelta");
+
+      expect(assistantStarted?._tag).toBe("AssistantItemStarted");
+      if (assistantStarted?._tag === "AssistantItemStarted") {
+        expect(assistantStarted.itemId).toBe("assistant:mock-session-1:segment:0");
+      }
+      expect(contentDelta?._tag).toBe("ContentDelta");
+      if (contentDelta?._tag === "ContentDelta") {
+        expect(contentDelta.itemId).toBe("assistant:mock-session-1:segment:0");
+        expect(contentDelta.text).toBe("hello from mock");
+      }
+    }).pipe(
+      Effect.provide(
+        AcpSessionRuntime.layer({
+          authMethodId: "test",
+          spawn: {
+            command: mockAgentCommand,
+            args: mockAgentArgs,
+            env: {
+              T3_ACP_FAIL_FIRST_LOAD_SESSION_AFTER_REPLAY: "1",
+            },
+          },
+          cwd: process.cwd(),
+          resumeSessionId: "mock-session-1",
+          clientInfo: { name: "t3-test", version: "0.0.0" },
+        }),
+      ),
+      Effect.scoped,
+      Effect.provide(NodeServices.layer),
+    ),
+  );
+
   it.effect("ignores session/update replay notifications during session/load", () =>
     Effect.gen(function* () {
       const runtime = yield* AcpSessionRuntime.AcpSessionRuntime;
@@ -559,6 +611,47 @@ describe("AcpSessionRuntime", () => {
             env: {
               T3_ACP_EMIT_LOAD_REPLAY: "1",
               T3_ACP_EMIT_LOAD_REPLAY_MULTI_SEGMENT: "1",
+            },
+          },
+          cwd: process.cwd(),
+          resumeSessionId: "mock-session-1",
+          clientInfo: { name: "t3-test", version: "0.0.0" },
+        }),
+      ),
+      Effect.scoped,
+      Effect.provide(NodeServices.layer),
+    ),
+  );
+
+  it.effect("keeps an unfinished session/load assistant segment active for live continuation", () =>
+    Effect.gen(function* () {
+      const runtime = yield* AcpSessionRuntime.AcpSessionRuntime;
+      yield* runtime.start();
+
+      const notes = Array.from(yield* Stream.runCollect(Stream.take(runtime.getEvents(), 2)));
+      expect(notes.map((note) => note._tag)).toEqual(["AssistantItemStarted", "ContentDelta"]);
+
+      const assistantStarted = notes[0];
+      expect(assistantStarted?._tag).toBe("AssistantItemStarted");
+      if (assistantStarted?._tag === "AssistantItemStarted") {
+        expect(assistantStarted.itemId).toBe("assistant:mock-session-1:segment:0");
+      }
+      const contentDelta = notes[1];
+      expect(contentDelta?._tag).toBe("ContentDelta");
+      if (contentDelta?._tag === "ContentDelta") {
+        expect(contentDelta.itemId).toBe("assistant:mock-session-1:segment:0");
+        expect(contentDelta.text).toBe(" live continuation");
+      }
+    }).pipe(
+      Effect.provide(
+        AcpSessionRuntime.layer({
+          authMethodId: "test",
+          spawn: {
+            command: mockAgentCommand,
+            args: mockAgentArgs,
+            env: {
+              T3_ACP_EMIT_LOAD_REPLAY_LIVE_CONTINUATION: "1",
+              T3_ACP_LOAD_REPLAY_LIVE_CONTINUATION_DELAY_MS: "0",
             },
           },
           cwd: process.cwd(),

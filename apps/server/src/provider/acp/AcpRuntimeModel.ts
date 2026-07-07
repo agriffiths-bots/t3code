@@ -463,6 +463,7 @@ export interface SessionLoadGate {
   readonly lastActivityAtMillis: number | undefined;
   readonly idleGap: Duration.Duration;
   readonly initializeResult: EffectAcpSchema.InitializeResponse;
+  readonly bufferedLiveUpdates: ReadonlyArray<EffectAcpSchema.SessionNotification>;
 }
 
 export const waitForSessionLoadReplayIdle = (input: {
