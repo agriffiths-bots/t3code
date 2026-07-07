@@ -327,6 +327,11 @@ export const layer = Layer.effect(
       let targetProjectCwd = bootstrap?.prepareWorktree?.projectCwd;
       let targetWorktreePath = bootstrap?.createThread?.worktreePath ?? null;
       let skipWorktreePreparation = false;
+      // The worktree THIS bootstrap created (if any), for cleanup on failure.
+      // A failed bootstrap must not leave its worktree behind — and for
+      // directory-targeted (non-removable, foreign-repo) worktrees the
+      // projectId-keyed reaper never would, so the dispatcher owns cleanup.
+      let createdWorktree: { readonly cwd: string; readonly path: string } | null = null;
 
       const cleanupCreatedThread = () =>
         createdThread
@@ -340,6 +345,17 @@ export const layer = Layer.effect(
               ),
               Effect.ignoreCause({ log: true }),
             )
+          : Effect.void;
+
+      const cleanupCreatedWorktree = () =>
+        createdWorktree
+          ? gitWorkflow
+              .removeWorktree({
+                cwd: createdWorktree.cwd,
+                path: createdWorktree.path,
+                force: true,
+              })
+              .pipe(Effect.ignoreCause({ log: true }))
           : Effect.void;
 
       const recordSetupScriptLaunchFailure = (input: {
@@ -622,18 +638,27 @@ export const layer = Layer.effect(
             baseRefName: bootstrap.prepareWorktree.baseBranch,
             path: null,
           });
+          createdWorktree = {
+            cwd: bootstrap.prepareWorktree.projectCwd,
+            path: worktree.worktree.path,
+          };
           targetWorktreePath = applyWorkspaceRelativePath(
             worktree.worktree.path,
             workspaceRelativePath,
           );
+          // An explicit cleanup policy from createThread survives worktree
+          // preparation: cross-repo (directory-targeted) worktrees are marked
+          // non-removable there because the projectId-keyed reaper cannot see
+          // their repository and would orphan them.
+          const preparedWorktreeRemovable = bootstrap.createThread?.worktreeRemovable ?? true;
           yield* orchestrationEngine.dispatch({
             type: "thread.meta.update",
             commandId: yield* serverCommandId("bootstrap-thread-meta-update"),
             threadId: command.threadId,
             branch: worktree.worktree.refName,
             worktreePath: targetWorktreePath,
-            worktreeRemovable: true,
-            worktreeRemovalPath: worktree.worktree.path,
+            worktreeRemovable: preparedWorktreeRemovable,
+            worktreeRemovalPath: preparedWorktreeRemovable ? worktree.worktree.path : null,
           });
           yield* refreshGitStatus(targetWorktreePath);
         }
@@ -649,7 +674,10 @@ export const layer = Layer.effect(
           if (Cause.hasInterruptsOnly(cause)) {
             return Effect.fail(dispatchError);
           }
-          return cleanupCreatedThread().pipe(Effect.flatMap(() => Effect.fail(dispatchError)));
+          return cleanupCreatedThread().pipe(
+            Effect.flatMap(() => cleanupCreatedWorktree()),
+            Effect.flatMap(() => Effect.fail(dispatchError)),
+          );
         }),
       );
 
