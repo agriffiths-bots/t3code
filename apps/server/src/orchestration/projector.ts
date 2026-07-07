@@ -169,6 +169,35 @@ function bindLatestPendingPromptMessageToTurn(
   );
 }
 
+function updateExistingMessageForMessageSent(
+  entry: OrchestrationMessage,
+  message: OrchestrationMessage,
+): OrchestrationMessage {
+  const sameTurn = entry.turnId === message.turnId;
+  const text = sameTurn
+    ? message.streaming
+      ? `${entry.text}${message.text}`
+      : message.text.length > 0
+        ? message.text
+        : entry.text
+    : message.text;
+
+  return {
+    id: entry.id,
+    role: message.role,
+    text,
+    ...(message.attachments !== undefined
+      ? { attachments: message.attachments }
+      : sameTurn && entry.attachments !== undefined
+        ? { attachments: entry.attachments }
+        : {}),
+    turnId: message.turnId,
+    streaming: message.streaming,
+    createdAt: sameTurn ? entry.createdAt : message.createdAt,
+    updatedAt: message.updatedAt,
+  };
+}
+
 function isSubAgentWakeSystemMessageText(text: string): boolean {
   return text.trimStart().startsWith("[sub-agent ");
 }
@@ -461,22 +490,7 @@ export function projectEvent(
         const existingMessage = thread.messages.find((entry) => entry.id === message.id);
         const messages = existingMessage
           ? thread.messages.map((entry) =>
-              entry.id === message.id
-                ? {
-                    ...entry,
-                    text: message.streaming
-                      ? `${entry.text}${message.text}`
-                      : message.text.length > 0
-                        ? message.text
-                        : entry.text,
-                    streaming: message.streaming,
-                    updatedAt: message.updatedAt,
-                    turnId: message.turnId,
-                    ...(message.attachments !== undefined
-                      ? { attachments: message.attachments }
-                      : {}),
-                  }
-                : entry,
+              entry.id === message.id ? updateExistingMessageForMessageSent(entry, message) : entry,
             )
           : [...thread.messages, message];
         const cappedMessages = messages.slice(-MAX_THREAD_MESSAGES);

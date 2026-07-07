@@ -28,6 +28,7 @@ const omitXAiPromptCompleteStopReason =
   process.env.T3_ACP_OMIT_XAI_PROMPT_COMPLETE_STOP_REASON === "1";
 const failLoadSession = process.env.T3_ACP_FAIL_LOAD_SESSION === "1";
 const emitLoadReplay = process.env.T3_ACP_EMIT_LOAD_REPLAY === "1";
+const emitLoadReplayMultiSegment = process.env.T3_ACP_EMIT_LOAD_REPLAY_MULTI_SEGMENT === "1";
 const hangLoadSessionAfterReplay = process.env.T3_ACP_HANG_LOAD_SESSION_AFTER_REPLAY === "1";
 const delayLoadSessionAfterReplay = process.env.T3_ACP_DELAY_LOAD_SESSION_AFTER_REPLAY === "1";
 const loadSessionDelayMs = Number(process.env.T3_ACP_LOAD_SESSION_DELAY_MS ?? "5000");
@@ -319,6 +320,56 @@ const program = Effect.gen(function* () {
   );
 
   const emitLoadReplayNotifications = (requestedSessionId: string) => {
+    if (emitLoadReplayMultiSegment) {
+      writeJsonRpcNotification("session/update", {
+        _meta: { isReplay: true },
+        sessionId: requestedSessionId,
+        update: {
+          sessionUpdate: "agent_message_chunk",
+          content: { type: "text", text: "replayed segment 0" },
+        },
+      });
+      writeJsonRpcNotification("session/update", {
+        _meta: { isReplay: true },
+        sessionId: requestedSessionId,
+        update: {
+          sessionUpdate: "tool_call",
+          toolCallId: "replay-tool-1",
+          title: "Replay tool 1",
+          kind: "search",
+          status: "completed",
+        },
+      });
+      writeJsonRpcNotification("session/update", {
+        _meta: { isReplay: true },
+        sessionId: requestedSessionId,
+        update: {
+          sessionUpdate: "agent_message_chunk",
+          content: { type: "text", text: "replayed segment 1" },
+        },
+      });
+      writeJsonRpcNotification("session/update", {
+        _meta: { isReplay: true },
+        sessionId: requestedSessionId,
+        update: {
+          sessionUpdate: "tool_call",
+          toolCallId: "replay-tool-2",
+          title: "Replay tool 2",
+          kind: "search",
+          status: "completed",
+        },
+      });
+      writeJsonRpcNotification("session/update", {
+        _meta: { isReplay: true },
+        sessionId: requestedSessionId,
+        update: {
+          sessionUpdate: "agent_message_chunk",
+          content: { type: "text", text: "replayed segment 2" },
+        },
+      });
+      return;
+    }
+
     writeJsonRpcNotification("session/update", {
       _meta: { isReplay: true },
       sessionId: requestedSessionId,

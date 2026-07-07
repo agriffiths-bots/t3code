@@ -35,6 +35,35 @@ const activityOrder = O.combineAll<OrchestrationThreadActivity>([
   O.mapInput(O.String, (a) => a.id),
 ]);
 
+function updateExistingMessageForMessageSent(
+  entry: OrchestrationMessage,
+  message: OrchestrationMessage,
+): OrchestrationMessage {
+  const sameTurn = entry.turnId === message.turnId;
+  const text = sameTurn
+    ? message.streaming
+      ? `${entry.text}${message.text}`
+      : message.text.length > 0
+        ? message.text
+        : entry.text
+    : message.text;
+
+  return {
+    id: entry.id,
+    role: message.role,
+    text,
+    ...(message.attachments !== undefined
+      ? { attachments: message.attachments }
+      : sameTurn && entry.attachments !== undefined
+        ? { attachments: entry.attachments }
+        : {}),
+    turnId: message.turnId,
+    streaming: message.streaming,
+    createdAt: sameTurn ? entry.createdAt : message.createdAt,
+    updatedAt: message.streaming && sameTurn ? entry.updatedAt : message.updatedAt,
+  };
+}
+
 /**
  * Apply a single orchestration event to an `OrchestrationThread`, returning
  * the updated thread, a deletion signal, or an "unchanged" marker when the
@@ -194,22 +223,7 @@ export function applyThreadDetailEvent(
       const existingMessage = thread.messages.find((entry) => entry.id === message.id);
       const messages = existingMessage
         ? Arr.map(thread.messages, (entry) =>
-            entry.id !== message.id
-              ? entry
-              : {
-                  ...entry,
-                  text: message.streaming
-                    ? `${entry.text}${message.text}`
-                    : message.text.length > 0
-                      ? message.text
-                      : entry.text,
-                  streaming: message.streaming,
-                  ...(message.turnId !== undefined ? { turnId: message.turnId } : {}),
-                  ...(message.streaming ? {} : { updatedAt: message.updatedAt }),
-                  ...(message.attachments !== undefined
-                    ? { attachments: message.attachments }
-                    : {}),
-                },
+            entry.id !== message.id ? entry : updateExistingMessageForMessageSent(entry, message),
           )
         : Arr.append(thread.messages, message);
       // Update latestTurn for assistant messages bound to a turn. A completed

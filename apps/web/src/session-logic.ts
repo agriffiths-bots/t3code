@@ -1357,6 +1357,117 @@ function compareActivityLifecycleRank(kind: string): number {
   return 1;
 }
 
+function timelineEntryTurnId(entry: TimelineEntry): string | null {
+  switch (entry.kind) {
+    case "message":
+      return entry.message.turnId === null ? null : String(entry.message.turnId);
+    case "proposed-plan":
+      return entry.proposedPlan.turnId === null ? null : String(entry.proposedPlan.turnId);
+    case "work":
+      return entry.entry.turnId === undefined || entry.entry.turnId === null
+        ? null
+        : String(entry.entry.turnId);
+  }
+}
+
+function chatMessageIsPrompt(message: ChatMessage): boolean {
+  return (
+    message.role === "user" ||
+    (message.role === "system" && message.text.trimStart().startsWith("[sub-agent "))
+  );
+}
+
+function timelineEntryIsPrompt(entry: TimelineEntry): boolean {
+  return entry.kind === "message" && chatMessageIsPrompt(entry.message);
+}
+
+function compareTimelineEntryTimestamp(left: TimelineEntry, right: TimelineEntry): number {
+  const createdAtComparison = left.createdAt.localeCompare(right.createdAt);
+  if (createdAtComparison !== 0) {
+    return createdAtComparison;
+  }
+  return left.id.localeCompare(right.id);
+}
+
+function deriveTimelineTurnOrder(
+  rows: ReadonlyArray<TimelineEntry>,
+): ReadonlyMap<string, { readonly createdAt: string; readonly firstIndex: number }> {
+  const grouped = new Map<
+    string,
+    Array<{ readonly entry: TimelineEntry; readonly index: number }>
+  >();
+  rows.forEach((entry, index) => {
+    const turnId = timelineEntryTurnId(entry);
+    if (turnId === null) {
+      return;
+    }
+    const existing = grouped.get(turnId);
+    if (existing) {
+      existing.push({ entry, index });
+    } else {
+      grouped.set(turnId, [{ entry, index }]);
+    }
+  });
+
+  const order = new Map<string, { readonly createdAt: string; readonly firstIndex: number }>();
+  for (const [turnId, entries] of grouped.entries()) {
+    const promptEntry = entries
+      .map(({ entry }) => entry)
+      .filter(timelineEntryIsPrompt)
+      .toSorted(compareTimelineEntryTimestamp)[0];
+    const firstEntry = entries.map(({ entry }) => entry).toSorted(compareTimelineEntryTimestamp)[0];
+    const firstIndex = Math.min(...entries.map(({ index }) => index));
+    order.set(turnId, {
+      createdAt: (promptEntry ?? firstEntry)?.createdAt ?? "",
+      firstIndex,
+    });
+  }
+  return order;
+}
+
+function compareTimelineEntriesByTurnOrder(
+  turnOrder: ReadonlyMap<string, { readonly createdAt: string; readonly firstIndex: number }>,
+  inputIndex: ReadonlyMap<string, number>,
+  left: TimelineEntry,
+  right: TimelineEntry,
+): number {
+  const leftTurnId = timelineEntryTurnId(left);
+  const rightTurnId = timelineEntryTurnId(right);
+  const leftOrder =
+    leftTurnId === null
+      ? { createdAt: left.createdAt, firstIndex: inputIndex.get(left.id) ?? 0 }
+      : (turnOrder.get(leftTurnId) ?? {
+          createdAt: left.createdAt,
+          firstIndex: inputIndex.get(left.id) ?? 0,
+        });
+  const rightOrder =
+    rightTurnId === null
+      ? { createdAt: right.createdAt, firstIndex: inputIndex.get(right.id) ?? 0 }
+      : (turnOrder.get(rightTurnId) ?? {
+          createdAt: right.createdAt,
+          firstIndex: inputIndex.get(right.id) ?? 0,
+        });
+
+  const turnCreatedAtComparison = leftOrder.createdAt.localeCompare(rightOrder.createdAt);
+  if (turnCreatedAtComparison !== 0) {
+    return turnCreatedAtComparison;
+  }
+
+  if (leftOrder.firstIndex !== rightOrder.firstIndex) {
+    return leftOrder.firstIndex - rightOrder.firstIndex;
+  }
+
+  if (leftTurnId !== null && leftTurnId === rightTurnId) {
+    const promptRankComparison =
+      Number(timelineEntryIsPrompt(left) ? 0 : 1) - Number(timelineEntryIsPrompt(right) ? 0 : 1);
+    if (promptRankComparison !== 0) {
+      return promptRankComparison;
+    }
+  }
+
+  return compareTimelineEntryTimestamp(left, right);
+}
+
 export function deriveTimelineEntries(
   messages: ReadonlyArray<ChatMessage>,
   proposedPlans: ReadonlyArray<ProposedPlan>,
@@ -1380,9 +1491,10 @@ export function deriveTimelineEntries(
     createdAt: entry.createdAt,
     entry,
   }));
-  return [...messageRows, ...proposedPlanRows, ...workRows].toSorted((a, b) =>
-    a.createdAt.localeCompare(b.createdAt),
-  );
+  const rows = [...messageRows, ...proposedPlanRows, ...workRows];
+  const inputIndex = new Map(rows.map((entry, index) => [entry.id, index] as const));
+  const turnOrder = deriveTimelineTurnOrder(rows);
+  return rows.toSorted((a, b) => compareTimelineEntriesByTurnOrder(turnOrder, inputIndex, a, b));
 }
 
 export function inferCheckpointTurnCountByTurnId(

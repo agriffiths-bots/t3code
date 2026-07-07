@@ -1539,6 +1539,58 @@ describe("deriveTimelineEntries", () => {
       },
     });
   });
+
+  it("keeps resumed-turn assistant messages after their user prompt when segment ids were reused", () => {
+    const entries = deriveTimelineEntries(
+      [
+        {
+          id: MessageId.make("user-turn-1"),
+          role: "user",
+          text: "first prompt",
+          createdAt: "2026-02-23T00:00:00.000Z",
+          turnId: TurnId.make("turn-1"),
+          updatedAt: "2026-02-23T00:00:00.000Z",
+          streaming: false,
+        },
+        {
+          id: MessageId.make("assistant-turn-1"),
+          role: "assistant",
+          text: "first response",
+          createdAt: "2026-02-23T00:00:01.000Z",
+          turnId: TurnId.make("turn-1"),
+          updatedAt: "2026-02-23T00:00:01.000Z",
+          streaming: false,
+        },
+        {
+          id: MessageId.make("assistant-reused-segment-turn-2"),
+          role: "assistant",
+          text: "second response with stale timestamp",
+          createdAt: "2026-02-23T00:00:01.500Z",
+          turnId: TurnId.make("turn-2"),
+          updatedAt: "2026-02-23T00:01:01.500Z",
+          streaming: false,
+        },
+        {
+          id: MessageId.make("user-turn-2"),
+          role: "user",
+          text: "second prompt",
+          createdAt: "2026-02-23T00:01:00.000Z",
+          turnId: TurnId.make("turn-2"),
+          updatedAt: "2026-02-23T00:01:00.000Z",
+          streaming: false,
+        },
+      ],
+      [],
+      [],
+    );
+
+    expect(entries.map((entry) => entry.id)).toEqual([
+      "user-turn-1",
+      "assistant-turn-1",
+      "user-turn-2",
+      "assistant-reused-segment-turn-2",
+    ]);
+  });
 });
 
 describe("deriveWorkLogEntries context window handling", () => {

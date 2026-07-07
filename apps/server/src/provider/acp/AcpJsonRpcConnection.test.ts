@@ -529,6 +529,48 @@ describe("AcpSessionRuntime", () => {
     ),
   );
 
+  it.effect("continues assistant segment ids after session/load replay", () =>
+    Effect.gen(function* () {
+      const runtime = yield* AcpSessionRuntime.AcpSessionRuntime;
+      yield* runtime.start();
+
+      yield* runtime.prompt({
+        prompt: [{ type: "text", text: "hi" }],
+      });
+      const notes = Array.from(yield* Stream.runCollect(Stream.take(runtime.getEvents(), 4)));
+      const assistantStarted = notes.find((note) => note._tag === "AssistantItemStarted");
+      const contentDelta = notes.find((note) => note._tag === "ContentDelta");
+
+      expect(assistantStarted?._tag).toBe("AssistantItemStarted");
+      if (assistantStarted?._tag === "AssistantItemStarted") {
+        expect(assistantStarted.itemId).toBe("assistant:mock-session-1:segment:3");
+      }
+      expect(contentDelta?._tag).toBe("ContentDelta");
+      if (contentDelta?._tag === "ContentDelta") {
+        expect(contentDelta.itemId).toBe("assistant:mock-session-1:segment:3");
+      }
+    }).pipe(
+      Effect.provide(
+        AcpSessionRuntime.layer({
+          authMethodId: "test",
+          spawn: {
+            command: mockAgentCommand,
+            args: mockAgentArgs,
+            env: {
+              T3_ACP_EMIT_LOAD_REPLAY: "1",
+              T3_ACP_EMIT_LOAD_REPLAY_MULTI_SEGMENT: "1",
+            },
+          },
+          cwd: process.cwd(),
+          resumeSessionId: "mock-session-1",
+          clientInfo: { name: "t3-test", version: "0.0.0" },
+        }),
+      ),
+      Effect.scoped,
+      Effect.provide(NodeServices.layer),
+    ),
+  );
+
   it.effect("completes session/load after replay becomes idle while its RPC stays pending", () =>
     Effect.gen(function* () {
       const runtime = yield* AcpSessionRuntime.AcpSessionRuntime;

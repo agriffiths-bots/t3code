@@ -261,6 +261,62 @@ describe("applyThreadDetailEvent", () => {
       }
     });
 
+    it("replaces message state when an existing message id moves to another turn", () => {
+      const threadWithMessage: OrchestrationThread = {
+        ...baseThread,
+        messages: [
+          {
+            id: MessageId.make("assistant:session-1:segment:0"),
+            role: "assistant",
+            text: "first turn assistant",
+            attachments: [
+              {
+                type: "image",
+                id: "thread-reused-message-att-1",
+                name: "first-turn.png",
+                mimeType: "image/png",
+                sizeBytes: 5,
+              },
+            ],
+            turnId: TurnId.make("turn-1"),
+            streaming: false,
+            createdAt: "2026-04-01T06:00:00.000Z",
+            updatedAt: "2026-04-01T06:00:00.000Z",
+          },
+        ],
+      };
+
+      const result = applyThreadDetailEvent(threadWithMessage, {
+        ...baseEventFields,
+        sequence: 8,
+        occurredAt: "2026-04-01T06:05:00.000Z",
+        aggregateKind: "thread",
+        aggregateId: ThreadId.make("thread-1"),
+        type: "thread.message-sent",
+        payload: {
+          threadId: ThreadId.make("thread-1"),
+          messageId: MessageId.make("assistant:session-1:segment:0"),
+          role: "assistant",
+          text: "second turn assistant",
+          turnId: TurnId.make("turn-2"),
+          streaming: true,
+          createdAt: "2026-04-01T06:05:00.000Z",
+          updatedAt: "2026-04-01T06:05:00.000Z",
+        },
+      });
+
+      expect(result.kind).toBe("updated");
+      if (result.kind === "updated") {
+        expect(result.thread.messages).toHaveLength(1);
+        expect(result.thread.messages[0]).toMatchObject({
+          text: "second turn assistant",
+          turnId: "turn-2",
+          createdAt: "2026-04-01T06:05:00.000Z",
+        });
+        expect(result.thread.messages[0]?.attachments).toBeUndefined();
+      }
+    });
+
     it("updates latestTurn for assistant messages with a turn", () => {
       const result = applyThreadDetailEvent(baseThread, {
         ...baseEventFields,

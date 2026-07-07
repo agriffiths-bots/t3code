@@ -360,6 +360,12 @@ export const make = (
       Effect.gen(function* () {
         const gate = yield* Ref.get(sessionLoadGateRef);
         if (Option.isSome(gate) && gate.value.active) {
+          if (notification.sessionId === options.resumeSessionId) {
+            yield* observeSessionLoadAssistantSegments({
+              assistantSegmentRef,
+              params: notification,
+            });
+          }
           const lastActivityAtMillis = yield* Clock.currentTimeMillis;
           yield* Ref.set(
             sessionLoadGateRef,
@@ -617,7 +623,16 @@ export const make = (
           );
 
           return loaded;
-        }).pipe(Effect.ensuring(Ref.set(sessionLoadGateRef, Option.none())));
+        }).pipe(
+          Effect.ensuring(
+            Effect.gen(function* () {
+              yield* closeActiveAssistantSegmentState({
+                assistantSegmentRef,
+              });
+              yield* Ref.set(sessionLoadGateRef, Option.none());
+            }),
+          ),
+        );
       } else {
         const createPayload = {
           cwd: options.cwd,
@@ -926,6 +941,69 @@ function shouldEmitToolCallUpdate(
 
 const assistantItemId = (sessionId: string, segmentIndex: number) =>
   `assistant:${sessionId}:segment:${segmentIndex}`;
+
+const ensureActiveAssistantSegmentState = ({
+  assistantSegmentRef,
+  sessionId,
+}: {
+  readonly assistantSegmentRef: Ref.Ref<AcpAssistantSegmentState>;
+  readonly sessionId: string;
+}) =>
+  Ref.update(assistantSegmentRef, (current) => {
+    if (current.activeItemId) {
+      return current;
+    }
+    const itemId = assistantItemId(sessionId, current.nextSegmentIndex);
+    return {
+      nextSegmentIndex: current.nextSegmentIndex + 1,
+      activeItemId: itemId,
+    } satisfies AcpAssistantSegmentState;
+  });
+
+const closeActiveAssistantSegmentState = ({
+  assistantSegmentRef,
+}: {
+  readonly assistantSegmentRef: Ref.Ref<AcpAssistantSegmentState>;
+}) =>
+  Ref.update(assistantSegmentRef, (current) =>
+    current.activeItemId
+      ? ({
+          nextSegmentIndex: current.nextSegmentIndex,
+        } satisfies AcpAssistantSegmentState)
+      : current,
+  );
+
+const observeSessionLoadAssistantSegments = ({
+  assistantSegmentRef,
+  params,
+}: {
+  readonly assistantSegmentRef: Ref.Ref<AcpAssistantSegmentState>;
+  readonly params: EffectAcpSchema.SessionNotification;
+}): Effect.Effect<void> =>
+  Effect.gen(function* () {
+    const parsed = parseSessionUpdateEvent(params);
+    for (const event of parsed.events) {
+      if (event._tag === "ToolCallUpdated") {
+        yield* closeActiveAssistantSegmentState({
+          assistantSegmentRef,
+        });
+        continue;
+      }
+      if (event._tag !== "ContentDelta") {
+        continue;
+      }
+      if (event.text.trim().length === 0) {
+        const assistantSegmentState = yield* Ref.get(assistantSegmentRef);
+        if (!assistantSegmentState.activeItemId) {
+          continue;
+        }
+      }
+      yield* ensureActiveAssistantSegmentState({
+        assistantSegmentRef,
+        sessionId: params.sessionId,
+      });
+    }
+  });
 
 const ensureActiveAssistantSegment = ({
   queue,
