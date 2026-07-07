@@ -111,22 +111,39 @@ const connectivityLayer = Connectivity.layer({
 
 const wakeupsLayer = Wakeups.layer({
   changes: Stream.merge(
-    Stream.callback<"application-active">((queue) =>
-      Effect.acquireRelease(
-        Effect.sync(() => {
-          const listener = () => {
-            if (document.visibilityState === "visible") {
-              Queue.offerUnsafe(queue, "application-active");
-            }
-          };
-          document.addEventListener("visibilitychange", listener);
-          return listener;
-        }),
-        (listener) =>
+    Stream.merge(
+      Stream.callback<"application-active">((queue) =>
+        Effect.acquireRelease(
           Effect.sync(() => {
-            document.removeEventListener("visibilitychange", listener);
+            const listener = () => {
+              if (document.visibilityState === "visible") {
+                Queue.offerUnsafe(queue, "application-active");
+              }
+            };
+            document.addEventListener("visibilitychange", listener);
+            return listener;
           }),
-      ).pipe(Effect.asVoid),
+          (listener) =>
+            Effect.sync(() => {
+              document.removeEventListener("visibilitychange", listener);
+            }),
+        ).pipe(Effect.asVoid),
+      ),
+      Stream.callback<"application-active">((queue) =>
+        Effect.acquireRelease(
+          Effect.sync(() => {
+            const listener = () => {
+              Queue.offerUnsafe(queue, "application-active");
+            };
+            window.addEventListener("online", listener);
+            return listener;
+          }),
+          (listener) =>
+            Effect.sync(() => {
+              window.removeEventListener("online", listener);
+            }),
+        ).pipe(Effect.asVoid),
+      ),
     ),
     managedRelayAccountChanges(appAtomRegistry).pipe(
       Stream.map(() => "credentials-changed" as const),
