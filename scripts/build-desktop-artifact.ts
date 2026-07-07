@@ -881,9 +881,7 @@ export function resolveFffNativeDependencies(
   }
 
   return Object.fromEntries(
-    architectures.flatMap((architecture) =>
-      ["gnu", "musl"].map((libc) => [`@ff-labs/fff-bin-linux-${architecture}-${libc}`, version]),
-    ),
+    architectures.map((architecture) => [`@ff-labs/fff-bin-linux-${architecture}-gnu`, version]),
   );
 }
 
@@ -913,12 +911,10 @@ export function resolveClaudeAgentNativeDependencies(
   }
 
   return Object.fromEntries(
-    architectures.flatMap((architecture) =>
-      ["", "-musl"].map((libc) => [
-        `@anthropic-ai/claude-agent-sdk-linux-${architecture}${libc}`,
-        version,
-      ]),
-    ),
+    architectures.map((architecture) => [
+      `@anthropic-ai/claude-agent-sdk-linux-${architecture}`,
+      version,
+    ]),
   );
 }
 

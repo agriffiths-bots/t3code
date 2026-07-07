@@ -11,6 +11,13 @@ const NODE_PTY_KEEP_PREBUILD_FILE_NAMES = new Set([
   "spawn-helper",
   "t3code-wsl-node-pty.json",
 ]);
+const ELECTRON_BUILDER_ARCH_NAMES = new Map([
+  [0, "ia32"],
+  [1, "x64"],
+  [2, "armv7l"],
+  [3, "arm64"],
+  [4, "universal"],
+]);
 
 async function pathExists(path) {
   try {
@@ -82,17 +89,105 @@ async function pruneNodePtyBuild(nodePtyDir) {
   await visit(buildDir);
 }
 
-function shouldKeepPrebuildDirectory(platform, directoryName) {
+function shouldKeepPrebuildDirectory(platform, archName, directoryName) {
+  const linuxArch = linuxArchFor(archName);
   if (platform === "darwin") {
-    return directoryName.startsWith("darwin-");
+    return directoryName === `darwin-${archName}`;
   }
   if (platform === "win32") {
-    return directoryName.startsWith("win32-") || directoryName.startsWith("linux-");
+    return (
+      directoryName === `win32-${archName}` ||
+      (linuxArch !== null && directoryName === `linux-${linuxArch}`)
+    );
   }
-  return directoryName.startsWith("linux-");
+  return linuxArch !== null && directoryName === `linux-${linuxArch}`;
 }
 
-async function pruneNodePtyPrebuilds(nodePtyDir, platform) {
+function resolveArchName(arch) {
+  if (typeof arch === "string") {
+    return arch;
+  }
+  return ELECTRON_BUILDER_ARCH_NAMES.get(arch) ?? null;
+}
+
+function linuxArchFor(archName) {
+  return archName === "arm64" ? "arm64" : archName === "x64" ? "x64" : null;
+}
+
+function shouldKeepNativePackageDirectory(platform, archName, packageName) {
+  if (packageName.startsWith("claude-agent-sdk-")) {
+    const linuxArch = linuxArchFor(archName);
+    if (platform === "win32") {
+      return (
+        packageName === `claude-agent-sdk-win32-${archName}` ||
+        (linuxArch !== null && packageName === `claude-agent-sdk-linux-${linuxArch}`)
+      );
+    }
+    if (platform === "darwin") {
+      return packageName === `claude-agent-sdk-darwin-${archName}`;
+    }
+    return linuxArch !== null && packageName === `claude-agent-sdk-linux-${linuxArch}`;
+  }
+
+  if (packageName.startsWith("fff-bin-")) {
+    const linuxArch = linuxArchFor(archName);
+    if (platform === "win32") {
+      return (
+        packageName === `fff-bin-win32-${archName}` ||
+        (linuxArch !== null && packageName === `fff-bin-linux-${linuxArch}-gnu`)
+      );
+    }
+    if (platform === "darwin") {
+      return packageName === `fff-bin-darwin-${archName}`;
+    }
+    return linuxArch !== null && packageName === `fff-bin-linux-${linuxArch}-gnu`;
+  }
+
+  if (packageName.startsWith("ffi-rs-")) {
+    const linuxArch = linuxArchFor(archName);
+    if (platform === "win32") {
+      return (
+        packageName === `ffi-rs-win32-${archName}-msvc` ||
+        (linuxArch !== null && packageName === `ffi-rs-linux-${linuxArch}-gnu`)
+      );
+    }
+    if (platform === "darwin") {
+      return packageName === `ffi-rs-darwin-${archName}`;
+    }
+    return linuxArch !== null && packageName === `ffi-rs-linux-${linuxArch}-gnu`;
+  }
+
+  return true;
+}
+
+async function pruneScopedNativePackages(scopeDir, platform, archName) {
+  for (const entry of await listEntries(scopeDir)) {
+    const entryPath = NodePath.join(scopeDir, entry.name);
+    if (!entry.isDirectory()) {
+      continue;
+    }
+    if (!shouldKeepNativePackageDirectory(platform, archName, entry.name)) {
+      await removePath(entryPath);
+    }
+  }
+  await removeEmptyDirectories(scopeDir);
+}
+
+async function pruneNativeSidecars(root, platform, arch) {
+  const archName = resolveArchName(arch);
+  if (archName === null || archName === "universal") {
+    return;
+  }
+
+  const nodeModulesDir = NodePath.join(root, "node_modules");
+  await Promise.all([
+    pruneScopedNativePackages(NodePath.join(nodeModulesDir, "@anthropic-ai"), platform, archName),
+    pruneScopedNativePackages(NodePath.join(nodeModulesDir, "@ff-labs"), platform, archName),
+    pruneScopedNativePackages(NodePath.join(nodeModulesDir, "@yuuang"), platform, archName),
+  ]);
+}
+
+async function pruneNodePtyPrebuilds(nodePtyDir, platform, archName) {
   const prebuildsDir = NodePath.join(nodePtyDir, "prebuilds");
   for (const entry of await listEntries(prebuildsDir)) {
     const entryPath = NodePath.join(prebuildsDir, entry.name);
@@ -100,7 +195,7 @@ async function pruneNodePtyPrebuilds(nodePtyDir, platform) {
       await removePath(entryPath);
       continue;
     }
-    if (!shouldKeepPrebuildDirectory(platform, entry.name)) {
+    if (!shouldKeepPrebuildDirectory(platform, archName, entry.name)) {
       await removePath(entryPath);
       continue;
     }
@@ -114,8 +209,42 @@ async function pruneNodePtyPrebuilds(nodePtyDir, platform) {
   await removeEmptyDirectories(prebuildsDir);
 }
 
-async function pruneNodePty(nodePtyDir, platform) {
+async function pruneNodePtyThirdParty(nodePtyDir, platform, archName) {
+  const thirdPartyDir = NodePath.join(nodePtyDir, "third_party");
+  if (platform !== "win32") {
+    await removePath(thirdPartyDir);
+    return;
+  }
+
+  const conptyDir = NodePath.join(thirdPartyDir, "conpty");
+  for (const version of await listEntries(conptyDir)) {
+    const versionPath = NodePath.join(conptyDir, version.name);
+    if (!version.isDirectory()) {
+      await removePath(versionPath);
+      continue;
+    }
+    for (const entry of await listEntries(versionPath)) {
+      const entryPath = NodePath.join(versionPath, entry.name);
+      if (!entry.isDirectory()) {
+        await removePath(entryPath);
+        continue;
+      }
+      if (entry.name !== `win10-${archName}`) {
+        await removePath(entryPath);
+      }
+    }
+    await removeEmptyDirectories(versionPath);
+  }
+  await removeEmptyDirectories(conptyDir);
+  await removeEmptyDirectories(thirdPartyDir);
+}
+
+async function pruneNodePty(nodePtyDir, platform, arch) {
   if (!(await pathExists(nodePtyDir))) {
+    return;
+  }
+  const archName = resolveArchName(arch);
+  if (archName === null || archName === "universal") {
     return;
   }
 
@@ -129,7 +258,8 @@ async function pruneNodePty(nodePtyDir, platform) {
   ]);
   await pruneNodePtyLib(nodePtyDir);
   await pruneNodePtyBuild(nodePtyDir);
-  await pruneNodePtyPrebuilds(nodePtyDir, platform);
+  await pruneNodePtyPrebuilds(nodePtyDir, platform, archName);
+  await pruneNodePtyThirdParty(nodePtyDir, platform, archName);
 }
 
 function resolveAppAsarUnpackedRoots(appOutDir) {
@@ -141,9 +271,11 @@ function resolveAppAsarUnpackedRoots(appOutDir) {
 
 export default async function afterPack(context) {
   for (const root of resolveAppAsarUnpackedRoots(context.appOutDir)) {
+    await pruneNativeSidecars(root, context.electronPlatformName, context.arch);
     await pruneNodePty(
       NodePath.join(root, "node_modules", "node-pty"),
       context.electronPlatformName,
+      context.arch,
     );
   }
 }
