@@ -47,6 +47,10 @@ type SupervisorSignal =
   | { readonly _tag: "NetworkChanged"; readonly network: NetworkStatus }
   | { readonly _tag: "Wakeup"; readonly reason: ConnectionWakeups.ConnectionWakeup };
 
+type SequencedSupervisorSignal = SupervisorSignal & {
+  readonly sequence: number;
+};
+
 interface PendingRetryTrace {
   readonly previousAttempt: Tracer.Span;
   readonly failureCount: number;
@@ -230,7 +234,8 @@ export const make = Effect.fn("EnvironmentSupervisor.make")(function* (
     network: yield* connectivity.status,
   };
   const intent = yield* Ref.make(initialIntent);
-  const signals = yield* Queue.unbounded<SupervisorSignal>();
+  const signalSequence = yield* Ref.make(0);
+  const signals = yield* Queue.unbounded<SequencedSupervisorSignal>();
   const state = yield* SubscriptionRef.make<SupervisorConnectionState>(
     !initialIntent.desired
       ? availableState(initialIntent, 0)
@@ -253,7 +258,8 @@ export const make = Effect.fn("EnvironmentSupervisor.make")(function* (
   });
 
   const signal = Effect.fn("EnvironmentSupervisor.signal")(function* (next: SupervisorSignal) {
-    yield* Queue.offer(signals, next);
+    const sequence = yield* Ref.updateAndGet(signalSequence, (current) => current + 1);
+    yield* Queue.offer(signals, { ...next, sequence });
   });
 
   const logManagedRelayAccountChange = Effect.logInfo(
@@ -361,7 +367,9 @@ export const make = Effect.fn("EnvironmentSupervisor.make")(function* (
     );
   });
 
-  const waitForEstablishmentInterrupt = Effect.fnUntraced(function* () {
+  const waitForEstablishmentInterrupt = Effect.fnUntraced(function* (
+    attemptStartedAfterSignalSequence: number,
+  ) {
     for (;;) {
       const next = yield* Queue.take(signals);
       switch (next._tag) {
@@ -380,7 +388,10 @@ export const make = Effect.fn("EnvironmentSupervisor.make")(function* (
             yield* logManagedRelayAccountChange;
             return;
           }
-          if (next.reason === "application-active") {
+          if (
+            next.reason === "application-active" &&
+            next.sequence > attemptStartedAfterSignalSequence
+          ) {
             return;
           }
           break;
@@ -464,6 +475,7 @@ export const make = Effect.fn("EnvironmentSupervisor.make")(function* (
     lastFailure: ConnectionAttemptError | null,
     pendingRetry: Option.Option<PendingRetryTrace>,
   ) {
+    const attemptStartedAfterSignalSequence = yield* Ref.get(signalSequence);
     yield* SubscriptionRef.set(prepared, Option.none());
     const establishment = yield* Effect.raceAllFirst([
       exitUnlessInterrupted(
@@ -476,7 +488,9 @@ export const make = Effect.fn("EnvironmentSupervisor.make")(function* (
           }),
         ),
       ),
-      waitForEstablishmentInterrupt().pipe(Effect.as<EstablishmentEvent>({ _tag: "Interrupted" })),
+      waitForEstablishmentInterrupt(attemptStartedAfterSignalSequence).pipe(
+        Effect.as<EstablishmentEvent>({ _tag: "Interrupted" }),
+      ),
       Effect.sleep(CONNECTION_ESTABLISHMENT_TIMEOUT).pipe(
         Effect.as<EstablishmentEvent>({ _tag: "TimedOut" }),
       ),
