@@ -129,11 +129,11 @@ const wakeupsLayer = Wakeups.layer({
             }),
         ).pipe(Effect.asVoid),
       ),
-      Stream.callback<"application-active">((queue) =>
+      Stream.callback<"browser-online">((queue) =>
         Effect.acquireRelease(
           Effect.sync(() => {
             const listener = () => {
-              Queue.offerUnsafe(queue, "application-active");
+              Queue.offerUnsafe(queue, "browser-online");
             };
             window.addEventListener("online", listener);
             return listener;
