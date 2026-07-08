@@ -5,6 +5,7 @@ import {
   resolveTerminalSelectionActionPosition,
   shouldHandleTerminalSelectionMouseUp,
   terminalSelectionActionDelayForClickCount,
+  terminalStatusNeedsLocalRemoval,
 } from "./ThreadTerminalDrawer";
 import {
   TERMINAL_RESET_SEQUENCE,
@@ -17,8 +18,14 @@ class FakeTerminalWriteTarget {
   readonly writes: string[] = [];
   readonly callbacks: Array<() => void> = [];
   error: unknown;
+  failNext: unknown;
 
   write(data: string, callback?: () => void): void {
+    if (this.failNext !== undefined) {
+      const error = this.failNext;
+      this.failNext = undefined;
+      throw error;
+    }
     if (this.error !== undefined) {
       throw this.error;
     }
@@ -41,15 +48,24 @@ describe("resolveTerminalSelectionActionPosition", () => {
     expect(passiveTerminalStatusEffect("closed")).toEqual({
       message: "Terminal closed",
       closeRemoteSession: false,
+      removeLocalSession: true,
     });
     expect(passiveTerminalStatusEffect("exited")).toEqual({
       message: "Process exited",
       closeRemoteSession: false,
+      removeLocalSession: false,
     });
     expect(passiveTerminalStatusEffect("running")).toEqual({
       message: null,
       closeRemoteSession: false,
+      removeLocalSession: false,
     });
+  });
+
+  it("removes a terminal when closed after an exited status", () => {
+    expect(terminalStatusNeedsLocalRemoval("closed", "exited")).toBe(true);
+    expect(terminalStatusNeedsLocalRemoval("closed", "closed")).toBe(false);
+    expect(terminalStatusNeedsLocalRemoval("exited", "running")).toBe(false);
   });
 
   it("prefers the selection rect over the last pointer position", () => {
@@ -223,5 +239,24 @@ describe("TerminalWriteQueue", () => {
     expect(terminal.writes).toEqual([TERMINAL_RESET_SEQUENCE]);
     terminal.drainNext();
     expect(terminal.writes).toEqual([TERMINAL_RESET_SEQUENCE, "replayed"]);
+  });
+
+  it("drops the snapshot when the reset write for a full resync fails", () => {
+    const terminal = new FakeTerminalWriteTarget();
+    const failures: unknown[] = [];
+    const error = new Error("write data discarded during reset");
+    terminal.failNext = error;
+    const queue = new TerminalWriteQueue(terminal, {
+      chunkSize: 20,
+      onWriteFailure: (failure) => failures.push(failure),
+      scheduleDrain: (drain) => drain(),
+    });
+
+    expect(() => queue.writeTerminalBuffer("full-state")).not.toThrow();
+    expect(failures).toEqual([error]);
+    expect(terminal.writes).toEqual([]);
+
+    queue.enqueue("next-delta");
+    expect(terminal.writes).toEqual(["next-delta"]);
   });
 });

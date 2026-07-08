@@ -81,6 +81,7 @@ type TerminalViewportStatus = TerminalSessionSnapshot["status"] | "closed";
 export interface PassiveTerminalStatusEffect {
   readonly message: string | null;
   readonly closeRemoteSession: false;
+  readonly removeLocalSession: boolean;
 }
 
 export function passiveTerminalStatusEffect(
@@ -88,14 +89,24 @@ export function passiveTerminalStatusEffect(
 ): PassiveTerminalStatusEffect {
   switch (status) {
     case "closed":
-      return { message: "Terminal closed", closeRemoteSession: false };
+      return { message: "Terminal closed", closeRemoteSession: false, removeLocalSession: true };
     case "exited":
-      return { message: "Process exited", closeRemoteSession: false };
+      return { message: "Process exited", closeRemoteSession: false, removeLocalSession: false };
     case "starting":
     case "running":
     case "error":
-      return { message: null, closeRemoteSession: false };
+      return { message: null, closeRemoteSession: false, removeLocalSession: false };
   }
+}
+
+export function terminalStatusNeedsLocalRemoval(
+  currentStatus: TerminalViewportStatus,
+  previousStatus: TerminalViewportStatus,
+): boolean {
+  return (
+    currentStatus !== previousStatus &&
+    passiveTerminalStatusEffect(currentStatus).removeLocalSession
+  );
 }
 
 function maxDrawerHeight(): number {
@@ -301,6 +312,7 @@ interface TerminalViewportProps {
   cwd: string;
   worktreePath?: string | null;
   runtimeEnv?: Record<string, string>;
+  onSessionClosed: (terminalId: string) => void;
   onAddTerminalContext: (selection: TerminalContextSelection) => void;
   focusRequestId: number;
   autoFocus: boolean;
@@ -323,6 +335,7 @@ export function TerminalViewport({
   cwd,
   worktreePath,
   runtimeEnv,
+  onSessionClosed,
   onAddTerminalContext,
   focusRequestId,
   autoFocus,
@@ -362,6 +375,9 @@ export function TerminalViewport({
   const runtimeEnvKey = useMemo(() => runtimeEnvSignature(runtimeEnv), [runtimeEnv]);
   const handleAddTerminalContext = useEffectEvent((selection: TerminalContextSelection) => {
     onAddTerminalContext(selection);
+  });
+  const handleSessionClosed = useEffectEvent((closedTerminalId: string) => {
+    onSessionClosed(closedTerminalId);
   });
   const requestTerminalResync = useEffectEvent(() => {
     needsFullResyncRef.current = true;
@@ -816,11 +832,18 @@ export function TerminalViewport({
 
     if (current.status === "running") {
       hasHandledExitRef.current = false;
-    } else if (current.status !== previous.status && !hasHandledExitRef.current) {
+    } else if (current.status !== previous.status) {
       const statusEffect = passiveTerminalStatusEffect(current.status);
-      if (statusEffect.message) {
+      if (statusEffect.message && !hasHandledExitRef.current) {
         hasHandledExitRef.current = true;
         writeSystemMessage(terminalWriter, statusEffect.message);
+      }
+      if (terminalStatusNeedsLocalRemoval(current.status, previous.status)) {
+        window.setTimeout(() => {
+          if (previousSessionRef.current.status === "closed") {
+            handleSessionClosed(terminalId);
+          }
+        }, 0);
       }
     }
 
@@ -898,6 +921,7 @@ interface ThreadTerminalDrawerProps {
   closeShortcutLabel?: string | undefined;
   onActiveTerminalChange: (terminalId: string) => void;
   onCloseTerminal: (terminalId: string) => void;
+  onTerminalSessionClosed: (terminalId: string) => void;
   onHeightChange: (height: number) => void;
   onAddTerminalContext: (selection: TerminalContextSelection) => void;
   keybindings: ResolvedKeybindingsConfig;
@@ -959,6 +983,7 @@ export default function ThreadTerminalDrawer({
   closeShortcutLabel,
   onActiveTerminalChange,
   onCloseTerminal,
+  onTerminalSessionClosed,
   onHeightChange,
   onAddTerminalContext,
   keybindings,
@@ -1414,6 +1439,7 @@ export default function ThreadTerminalDrawer({
                             ? { runtimeEnv: terminalLaunchLocation.runtimeEnv }
                             : {})}
                           onAddTerminalContext={onAddTerminalContext}
+                          onSessionClosed={onTerminalSessionClosed}
                           focusRequestId={focusRequestId}
                           autoFocus={terminalId === resolvedActiveTerminalId}
                           resizeEpoch={resizeEpoch}
@@ -1441,6 +1467,7 @@ export default function ThreadTerminalDrawer({
                     ? { runtimeEnv: activeTerminalLaunchLocation.runtimeEnv }
                     : {})}
                   onAddTerminalContext={onAddTerminalContext}
+                  onSessionClosed={onTerminalSessionClosed}
                   focusRequestId={focusRequestId}
                   autoFocus
                   resizeEpoch={resizeEpoch}

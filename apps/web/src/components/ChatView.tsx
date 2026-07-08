@@ -239,6 +239,8 @@ import {
   hasQueuedSubmissionBeenObservedByShell,
   readFileAsDataUrl,
   reconcileMountedTerminalThreadIds,
+  reconcilePendingLocalTerminalIds,
+  reconcileTerminalIdsFromServerMetadata,
   resolveVisibleServerThreadError,
   resolveSendEnvMode,
   shouldShowEnvironmentUnavailableBanner,
@@ -696,45 +698,6 @@ function useLocalDispatchState(input: {
   };
 }
 
-/** Same terminal ids (order ignored) — avoids reconcile when only server session ordering differs. */
-function terminalIdListsEqual(left: readonly string[], right: readonly string[]): boolean {
-  if (left.length !== right.length) {
-    return false;
-  }
-  if (left.length === 0) {
-    return true;
-  }
-  const sortedLeft = left.toSorted((a, b) => a.localeCompare(b));
-  const sortedRight = right.toSorted((a, b) => a.localeCompare(b));
-  for (let index = 0; index < sortedLeft.length; index += 1) {
-    if (sortedLeft[index] !== sortedRight[index]) {
-      return false;
-    }
-  }
-  return true;
-}
-
-/**
- * Server knows about fewer sessions than the client, but every server id still exists locally.
- * Typical right after `terminal.open`: known-session list lags; reconciling would drop the new id
- * and later re-add it as a separate group (no split layout).
- */
-function serverTerminalIdsStrictSubsetOfClient(
-  serverIds: readonly string[],
-  clientIds: readonly string[],
-): boolean {
-  if (serverIds.length >= clientIds.length || clientIds.length === 0) {
-    return false;
-  }
-  const clientSet = new Set(clientIds);
-  for (const id of serverIds) {
-    if (!clientSet.has(id)) {
-      return false;
-    }
-  }
-  return true;
-}
-
 interface PersistentThreadTerminalDrawerProps {
   threadRef: { environmentId: EnvironmentId; threadId: ThreadId };
   threadId: ThreadId;
@@ -843,6 +806,9 @@ const PersistentThreadTerminalDrawer = memo(function PersistentThreadTerminalDra
     () => drawerTerminalSessions.map((session) => session.target.terminalId),
     [drawerTerminalSessions],
   );
+  const seenServerTerminalIdsRef = useRef<Set<string>>(new Set());
+  const pendingLocalTerminalIdsRef = useRef<Set<string>>(new Set());
+  const previousClientTerminalIdsRef = useRef<readonly string[]>([]);
   const storeSetTerminalHeight = useTerminalUiStateStore((state) => state.setTerminalHeight);
   const storeSplitTerminal = useTerminalUiStateStore((state) => state.splitTerminal);
   const storeSplitTerminalVertical = useTerminalUiStateStore(
@@ -851,18 +817,37 @@ const PersistentThreadTerminalDrawer = memo(function PersistentThreadTerminalDra
   const storeNewTerminal = useTerminalUiStateStore((state) => state.newTerminal);
   const storeSetActiveTerminal = useTerminalUiStateStore((state) => state.setActiveTerminal);
   const storeCloseTerminal = useTerminalUiStateStore((state) => state.closeTerminal);
+  const storeRemoveTerminalSession = useTerminalUiStateStore(
+    (state) => state.removeTerminalSession,
+  );
   const reconcileTerminalIds = useTerminalUiStateStore((state) => state.reconcileTerminalIds);
 
   useEffect(() => {
-    if (terminalIdListsEqual(serverOrderedTerminalIds, terminalUiState.terminalIds)) {
+    const seenServerTerminalIds = seenServerTerminalIdsRef.current;
+    const serverTerminalIdSet = new Set(serverOrderedTerminalIds);
+    for (const terminalId of serverOrderedTerminalIds) {
+      seenServerTerminalIds.add(terminalId);
+    }
+
+    const pendingLocalTerminalIds = reconcilePendingLocalTerminalIds({
+      pendingLocalIds: pendingLocalTerminalIdsRef.current,
+      previousClientIds: previousClientTerminalIdsRef.current,
+      clientIds: terminalUiState.terminalIds,
+      serverIds: serverTerminalIdSet,
+    });
+    pendingLocalTerminalIdsRef.current = pendingLocalTerminalIds;
+    previousClientTerminalIdsRef.current = terminalUiState.terminalIds;
+
+    const nextTerminalIds = reconcileTerminalIdsFromServerMetadata({
+      serverIds: serverOrderedTerminalIds,
+      clientIds: terminalUiState.terminalIds,
+      seenServerIds: seenServerTerminalIds,
+      pendingLocalIds: pendingLocalTerminalIds,
+    });
+    if (nextTerminalIds === null) {
       return;
     }
-    if (
-      serverTerminalIdsStrictSubsetOfClient(serverOrderedTerminalIds, terminalUiState.terminalIds)
-    ) {
-      return;
-    }
-    reconcileTerminalIds(threadRef, serverOrderedTerminalIds);
+    reconcileTerminalIds(threadRef, nextTerminalIds);
   }, [reconcileTerminalIds, serverOrderedTerminalIds, terminalUiState.terminalIds, threadRef]);
   const [localFocusRequestId, setLocalFocusRequestId] = useState(0);
   const worktreePath = serverThread?.worktreePath ?? draftThread?.worktreePath ?? null;
@@ -1037,6 +1022,14 @@ const PersistentThreadTerminalDrawer = memo(function PersistentThreadTerminalDra
     ],
   );
 
+  const closeTerminalLocally = useCallback(
+    (terminalId: string) => {
+      storeRemoveTerminalSession(threadRef, terminalId);
+      bumpFocusRequestId();
+    },
+    [bumpFocusRequestId, storeRemoveTerminalSession, threadRef],
+  );
+
   const handleAddTerminalContext = useCallback(
     (selection: TerminalContextSelection) => {
       if (!visible) {
@@ -1077,6 +1070,7 @@ const PersistentThreadTerminalDrawer = memo(function PersistentThreadTerminalDra
         keybindings={keybindings}
         onActiveTerminalChange={activateTerminal}
         onCloseTerminal={closeTerminal}
+        onTerminalSessionClosed={closeTerminalLocally}
         onHeightChange={setTerminalHeight}
         onAddTerminalContext={handleAddTerminalContext}
         terminalLabelsById={terminalLabelsById}
@@ -1098,6 +1092,7 @@ interface PersistentThreadTerminalPanelProps {
   onNewTerminal: () => void;
   onActiveTerminalChange: (terminalId: string) => void;
   onCloseTerminal: (terminalId: string) => void;
+  onTerminalSessionClosed: (terminalId: string) => void;
   splitShortcutLabel?: string | undefined;
   splitVerticalShortcutLabel?: string | undefined;
   newShortcutLabel?: string | undefined;
@@ -1116,6 +1111,7 @@ const PersistentThreadTerminalPanel = memo(function PersistentThreadTerminalPane
   onNewTerminal,
   onActiveTerminalChange,
   onCloseTerminal,
+  onTerminalSessionClosed,
   splitShortcutLabel,
   splitVerticalShortcutLabel,
   newShortcutLabel,
@@ -1133,6 +1129,16 @@ const PersistentThreadTerminalPanel = memo(function PersistentThreadTerminalPane
     environmentId: threadRef.environmentId,
     threadId: threadRef.threadId,
   });
+  const terminalObservationKey = useMemo(
+    () => `${scopedThreadKey(threadRef)}:${surface.id}`,
+    [surface.id, threadRef],
+  );
+  const seenServerTerminalIdsRef = useRef<{
+    readonly key: string;
+    seenServerIds: Set<string>;
+    pendingLocalIds: Set<string>;
+    previousClientIds: readonly string[];
+  } | null>(null);
   const threadWorktreePath = serverThread?.worktreePath ?? draftThread?.worktreePath ?? null;
   const activeSummary =
     knownTerminalSessions.find((session) => session.target.terminalId === surface.activeTerminalId)
@@ -1215,6 +1221,51 @@ const PersistentThreadTerminalPanel = memo(function PersistentThreadTerminalPane
     threadWorktreePath,
   ]);
 
+  useEffect(() => {
+    let seenServerTerminalIds = seenServerTerminalIdsRef.current;
+    if (seenServerTerminalIds?.key !== terminalObservationKey) {
+      seenServerTerminalIds = {
+        key: terminalObservationKey,
+        seenServerIds: new Set(),
+        pendingLocalIds: new Set(),
+        previousClientIds: [],
+      };
+      seenServerTerminalIdsRef.current = seenServerTerminalIds;
+    }
+
+    const serverTerminalIds = new Set(
+      knownTerminalSessions.map((session) => session.target.terminalId),
+    );
+    for (const terminalId of serverTerminalIds) {
+      seenServerTerminalIds.seenServerIds.add(terminalId);
+    }
+    const pendingLocalIds = reconcilePendingLocalTerminalIds({
+      pendingLocalIds: seenServerTerminalIds.pendingLocalIds,
+      previousClientIds: seenServerTerminalIds.previousClientIds,
+      clientIds: surface.terminalIds,
+      serverIds: serverTerminalIds,
+    });
+    seenServerTerminalIds.pendingLocalIds = pendingLocalIds;
+    seenServerTerminalIds.previousClientIds = surface.terminalIds;
+
+    const nextTerminalIds = reconcileTerminalIdsFromServerMetadata({
+      serverIds: surface.terminalIds.filter((terminalId) => serverTerminalIds.has(terminalId)),
+      clientIds: surface.terminalIds,
+      seenServerIds: seenServerTerminalIds.seenServerIds,
+      pendingLocalIds,
+    });
+    if (nextTerminalIds === null) {
+      return;
+    }
+
+    const nextTerminalIdSet = new Set(nextTerminalIds);
+    for (const terminalId of surface.terminalIds) {
+      if (!nextTerminalIdSet.has(terminalId)) {
+        onTerminalSessionClosed(terminalId);
+      }
+    }
+  }, [knownTerminalSessions, onTerminalSessionClosed, surface.terminalIds, terminalObservationKey]);
+
   if (!project || !cwd) return null;
 
   return (
@@ -1246,6 +1297,7 @@ const PersistentThreadTerminalPanel = memo(function PersistentThreadTerminalPane
       closeShortcutLabel={closeShortcutLabel}
       onActiveTerminalChange={onActiveTerminalChange}
       onCloseTerminal={onCloseTerminal}
+      onTerminalSessionClosed={onTerminalSessionClosed}
       onHeightChange={() => undefined}
       onAddTerminalContext={onAddTerminalContext}
       terminalLabelsById={terminalLabelsById}
@@ -1527,6 +1579,7 @@ function ChatViewContent(props: ChatViewProps) {
   const storeNewTerminal = useTerminalUiStateStore((s) => s.newTerminal);
   const storeSetActiveTerminal = useTerminalUiStateStore((s) => s.setActiveTerminal);
   const storeCloseTerminal = useTerminalUiStateStore((s) => s.closeTerminal);
+  const storeRemoveTerminalSession = useTerminalUiStateStore((s) => s.removeTerminalSession);
   const serverThreadRefs = useThreadRefs();
   const serverThreadShells = useThreadShells();
   const serverThreadKeys = useMemo(() => serverThreadRefs.map(scopedThreadKey), [serverThreadRefs]);
@@ -3788,6 +3841,17 @@ function ChatViewContent(props: ChatViewProps) {
       setTerminalFocusRequestId((value) => value + 1);
     },
     [activeRightPanelSurface, activeThreadRef, closeTerminalMutation, storeCloseTerminal],
+  );
+  const closePanelTerminalLocally = useCallback(
+    (terminalId: string) => {
+      if (!activeThreadRef || activeRightPanelSurface?.kind !== "terminal") return;
+      storeRemoveTerminalSession(activeThreadRef, terminalId);
+      useRightPanelStore
+        .getState()
+        .closeTerminal(activeThreadRef, activeRightPanelSurface.id, terminalId);
+      setTerminalFocusRequestId((value) => value + 1);
+    },
+    [activeRightPanelSurface, activeThreadRef, storeRemoveTerminalSession],
   );
   const activateRightPanelSurface = useCallback(
     (surface: RightPanelSurface) => {
@@ -6093,6 +6157,7 @@ function ChatViewContent(props: ChatViewProps) {
         onNewTerminal={addTerminalSurface}
         onActiveTerminalChange={activatePanelTerminal}
         onCloseTerminal={closePanelTerminal}
+        onTerminalSessionClosed={closePanelTerminalLocally}
         splitShortcutLabel={splitTerminalShortcutLabel ?? undefined}
         splitVerticalShortcutLabel={splitTerminalVerticalShortcutLabel ?? undefined}
         newShortcutLabel={newTerminalShortcutLabel ?? undefined}

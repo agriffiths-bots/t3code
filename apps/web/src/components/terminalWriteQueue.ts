@@ -63,17 +63,14 @@ export class TerminalWriteQueue {
 
   enqueue(data: string): void {
     if (this.disposed || data.length === 0) return;
-    for (let offset = 0; offset < data.length; offset += this.chunkSize) {
-      this.chunks.push(data.slice(offset, offset + this.chunkSize));
-    }
+    this.chunks.push(...this.chunksFor(data));
     this.drain();
   }
 
   writeTerminalBuffer(buffer: string): void {
     if (this.disposed) return;
-    this.chunks = [];
-    this.enqueue(TERMINAL_RESET_SEQUENCE);
-    this.enqueue(buffer);
+    this.chunks = [...this.chunksFor(TERMINAL_RESET_SEQUENCE), ...this.chunksFor(buffer)];
+    this.drain();
   }
 
   dispose(): void {
@@ -99,5 +96,13 @@ export class TerminalWriteQueue {
       this.chunks = [];
       this.onWriteFailure(error);
     }
+  }
+
+  private chunksFor(data: string): string[] {
+    const chunks: string[] = [];
+    for (let offset = 0; offset < data.length; offset += this.chunkSize) {
+      chunks.push(data.slice(offset, offset + this.chunkSize));
+    }
+    return chunks;
   }
 }
