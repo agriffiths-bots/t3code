@@ -247,7 +247,7 @@ SH
   cat >"$dir/pnpm" <<'SH'
 #!/usr/bin/env bash
 echo "pnpm $*" >>"$T_LOG"
-[[ -n "${T3CODE_BUILD_SHA:-}" ]] && echo "pnpm-env T3CODE_BUILD_SHA=$T3CODE_BUILD_SHA" >>"$T_LOG"
+[[ -n "${T3CODE_BUILD_SHA:-}" ]] && echo "pnpm-env T3CODE_BUILD_SHA=$T3CODE_BUILD_SHA cmd=$*" >>"$T_LOG"
 if [[ "${FAKE_PNPM_FAIL_ONCE:-0}" == "1" && ! -f "$T_TMP/pnpm-failed" ]]; then
   : >"$T_TMP/pnpm-failed"
   exit 8
@@ -310,6 +310,12 @@ grep -Fq "inject token=minted-token" "$tmp/calls.log" && pass "resume injection 
 grep -Fq "revoke-resume-token minted-session" "$tmp/calls.log" && pass "minted resume token is revoked" || fail "minted resume token is revoked"
 assert_order "$tmp/calls.log" "snapshot --db" "capture --db" "systemctl --user stop" "capture --db" "snapshot --db"
 assert_order "$tmp/calls.log" "git -C" "pnpm -C $tmp/checkout/apps/web run build" "pnpm -C $tmp/checkout run build:desktop"
+grep -Fq "pnpm-env T3CODE_BUILD_SHA=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb cmd=-C $tmp/checkout/apps/web run build" "$tmp/calls.log" \
+  && pass "happy path stamps standalone web build" \
+  || fail "happy path stamps standalone web build"
+grep -Fq "pnpm-env T3CODE_BUILD_SHA=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb cmd=-C $tmp/checkout run build:desktop" "$tmp/calls.log" \
+  && pass "happy path stamps desktop/server build" \
+  || fail "happy path stamps desktop/server build"
 if awk 'f && /pnpm/ { found=1 } /health/ { f=1 } END { exit found ? 0 : 1 }' "$tmp/calls.log"; then
   fail "happy path built after health"
 else
@@ -659,15 +665,13 @@ export FAKE_VERIFY_RESTART_LEGACY_SHA_ONCE=1
 run_manager "$tmp"
 unset FAKE_PRE_SHA FAKE_TARGET_SHA FAKE_VERIFY_RESTART_LEGACY_SHA_ONCE
 [[ "$(cat "$tmp/rc")" == "0" ]] && pass "same-sha legacy unstamped rebuild exits zero" || fail "same-sha legacy unstamped rebuild exits zero"
-assert_order "$tmp/calls.log" "systemctl --user start fake.service" "verify-restart" "systemctl --user stop fake.service" "pnpm -C $tmp/checkout run build:desktop" "systemctl --user start fake.service" "verify-restart" "health"
-if grep -Fq "pnpm -C $tmp/checkout/apps/web run build" "$tmp/calls.log"; then
-  fail "same-sha legacy unstamped rebuild rebuilt web"
-else
-  pass "same-sha legacy unstamped rebuild skips web rebuild"
-fi
-grep -Fq "pnpm-env T3CODE_BUILD_SHA=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" "$tmp/calls.log" \
-  && pass "same-sha legacy unstamped rebuild stamps target sha" \
-  || fail "same-sha legacy unstamped rebuild stamps target sha"
+assert_order "$tmp/calls.log" "systemctl --user start fake.service" "verify-restart" "systemctl --user stop fake.service" "pnpm -C $tmp/checkout/apps/web run build" "pnpm -C $tmp/checkout run build:desktop" "systemctl --user start fake.service" "verify-restart" "health"
+grep -Fq "pnpm-env T3CODE_BUILD_SHA=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb cmd=-C $tmp/checkout/apps/web run build" "$tmp/calls.log" \
+  && pass "same-sha legacy unstamped rebuild stamps web target sha" \
+  || fail "same-sha legacy unstamped rebuild stamps web target sha"
+grep -Fq "pnpm-env T3CODE_BUILD_SHA=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb cmd=-C $tmp/checkout run build:desktop" "$tmp/calls.log" \
+  && pass "same-sha legacy unstamped rebuild stamps deploy target sha" \
+  || fail "same-sha legacy unstamped rebuild stamps deploy target sha"
 
 tmp="$(mktemp -d)"
 export FAKE_PRE_SHA=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb

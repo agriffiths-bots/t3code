@@ -363,7 +363,7 @@ build_release_artifacts() {
     run_logged "$build_timeout" "$step_log" pnpm -C "$stage_checkout" install --frozen-lockfile --prefer-offline || rc=$?
   fi
   if [[ "$rc" -eq 0 && ( "$rollback_sha" != "$target_sha" || "$build_always" == "1" ) ]]; then
-    run_logged "$build_timeout" "$step_log" pnpm -C "$stage_checkout/apps/web" run build || rc=$?
+    run_logged "$build_timeout" "$step_log" env T3CODE_BUILD_SHA="$target_sha" pnpm -C "$stage_checkout/apps/web" run build || rc=$?
   fi
   if [[ "$rc" -eq 0 && ( "$rollback_sha" != "$target_sha" || "$build_always" == "1" ) ]]; then
     run_logged "$build_timeout" "$step_log" env T3CODE_BUILD_SHA="$target_sha" pnpm -C "$stage_checkout" run build:desktop || rc=$?

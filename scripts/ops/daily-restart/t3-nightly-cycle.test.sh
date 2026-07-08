@@ -39,6 +39,7 @@ exit "${FAKE_GIT_RC:-0}"
 SH
   cat >"$dir/pnpm" <<'SH'
 #!/usr/bin/env bash
+[[ -n "${T3CODE_BUILD_SHA:-}" ]] && echo "pnpm-env T3CODE_BUILD_SHA=$T3CODE_BUILD_SHA cmd=$*" >>"$T_LOG"
 echo "pnpm $*" >>"$T_LOG"
 args=("$@")
 for ((i = 0; i < ${#args[@]}; i++)); do
@@ -131,6 +132,12 @@ run_cycle "$tmp"
 stage="$tmp/ledger/$(date -u +%F)/prebuilt-stage/checkout"
 [[ "$(cat "$tmp/rc")" == "0" ]] && pass "happy path exits zero" || fail "happy path exits zero"
 assert_order "$tmp/calls.log" "backup" "sync" "git -C" "git -C $tmp/checkout worktree prune" "git -C $tmp/checkout worktree add --detach $stage" "pnpm -C $stage install --frozen-lockfile --prefer-offline" "pnpm -C $stage/apps/web run build" "pnpm -C $stage run build:desktop" "restart prebuilt=1"
+grep -Fq "pnpm-env T3CODE_BUILD_SHA=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb cmd=-C $stage/apps/web run build" "$tmp/calls.log" \
+  && pass "happy path stamps standalone web build" \
+  || fail "happy path stamps standalone web build"
+grep -Fq "pnpm-env T3CODE_BUILD_SHA=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb cmd=-C $stage run build:desktop" "$tmp/calls.log" \
+  && pass "happy path stamps desktop/server build" \
+  || fail "happy path stamps desktop/server build"
 if grep -Fq "git -C $tmp/checkout merge --ff-only" "$tmp/calls.log" || grep -Fq "pnpm -C $tmp/checkout/apps/web run build" "$tmp/calls.log"; then
   fail "happy path leaves live checkout untouched before restart"
 else

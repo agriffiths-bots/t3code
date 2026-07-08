@@ -1,13 +1,21 @@
 import type { EnvironmentId, ServerConfig } from "@t3tools/contracts";
 import * as Schema from "effect/Schema";
 
-import { APP_VERSION } from "./branding";
+import { APP_BUILD_SHA, APP_VERSION } from "./branding";
 import { getLocalStorageItem, setLocalStorageItem } from "./hooks/useLocalStorage";
 
 export interface VersionMismatch {
   readonly clientVersion: string;
   readonly serverVersion: string;
+  readonly clientBuildSha?: string;
+  readonly serverBuildSha?: string;
   readonly hint: string;
+}
+
+export interface VersionMismatchOptions {
+  readonly clientVersion?: string | null | undefined;
+  readonly clientBuildSha?: string | null | undefined;
+  readonly serverBuildSha?: string | null | undefined;
 }
 
 export const VERSION_MISMATCH_DISMISSALS_STORAGE_KEY = "t3code:version-mismatch-dismissals:v1";
@@ -23,37 +31,89 @@ function normalizeVersion(version: string | null | undefined): string | null {
   return trimmed && trimmed.length > 0 ? trimmed : null;
 }
 
-export function resolveVersionMismatch(
-  serverVersion: string | null | undefined,
-): VersionMismatch | null {
-  const normalizedClientVersion = normalizeVersion(APP_VERSION);
-  const normalizedServerVersion = normalizeVersion(serverVersion);
-  if (
-    !normalizedClientVersion ||
-    !normalizedServerVersion ||
-    normalizedClientVersion === normalizedServerVersion
-  ) {
-    return null;
-  }
+function normalizeBuildSha(sha: string | null | undefined): string | null {
+  const trimmed = sha?.trim();
+  return trimmed && /^[0-9a-f]{40}$/i.test(trimmed) ? trimmed.toLowerCase() : null;
+}
 
+function makeVersionMismatch(
+  clientVersion: string,
+  serverVersion: string,
+  clientBuildSha: string | null,
+  serverBuildSha: string | null,
+): VersionMismatch {
   return {
-    clientVersion: normalizedClientVersion,
-    serverVersion: normalizedServerVersion,
+    clientVersion,
+    serverVersion,
+    ...(clientBuildSha !== null ? { clientBuildSha } : {}),
+    ...(serverBuildSha !== null ? { serverBuildSha } : {}),
     hint: "Version mismatch. Try syncing the client and server to the same T3 Code version.",
   };
 }
 
+export function resolveVersionMismatch(
+  serverVersion: string | null | undefined,
+  options: VersionMismatchOptions = {},
+): VersionMismatch | null {
+  const normalizedClientVersion = normalizeVersion(options.clientVersion ?? APP_VERSION);
+  const normalizedServerVersion = normalizeVersion(serverVersion);
+  if (!normalizedClientVersion || !normalizedServerVersion) {
+    return null;
+  }
+
+  const normalizedClientBuildSha = normalizeBuildSha(options.clientBuildSha ?? APP_BUILD_SHA);
+  const normalizedServerBuildSha = normalizeBuildSha(options.serverBuildSha);
+  if (normalizedClientBuildSha !== null && normalizedServerBuildSha !== null) {
+    return normalizedClientBuildSha === normalizedServerBuildSha
+      ? null
+      : makeVersionMismatch(
+          normalizedClientVersion,
+          normalizedServerVersion,
+          normalizedClientBuildSha,
+          normalizedServerBuildSha,
+        );
+  }
+
+  return normalizedClientVersion === normalizedServerVersion
+    ? null
+    : makeVersionMismatch(
+        normalizedClientVersion,
+        normalizedServerVersion,
+        normalizedClientBuildSha,
+        normalizedServerBuildSha,
+      );
+}
+
 export function resolveServerConfigVersionMismatch(
   serverConfig: Pick<ServerConfig, "environment"> | null | undefined,
+  options: Omit<VersionMismatchOptions, "serverBuildSha"> = {},
 ): VersionMismatch | null {
-  return resolveVersionMismatch(serverConfig?.environment.serverVersion);
+  return resolveVersionMismatch(serverConfig?.environment.serverVersion, {
+    ...options,
+    serverBuildSha: serverConfig?.environment.serverBuildSha,
+  });
 }
 
 export function buildVersionMismatchDismissalKey(
   environmentId: EnvironmentId,
-  mismatch: Pick<VersionMismatch, "clientVersion" | "serverVersion">,
+  mismatch: Pick<
+    VersionMismatch,
+    "clientVersion" | "serverVersion" | "clientBuildSha" | "serverBuildSha"
+  >,
 ): string {
-  return `${environmentId}:${mismatch.clientVersion}:${mismatch.serverVersion}`;
+  const clientIdentity =
+    mismatch.clientBuildSha !== undefined
+      ? `${mismatch.clientVersion}@${mismatch.clientBuildSha}`
+      : mismatch.clientVersion;
+  const serverIdentity =
+    mismatch.serverBuildSha !== undefined
+      ? `${mismatch.serverVersion}@${mismatch.serverBuildSha}`
+      : mismatch.serverVersion;
+  return `${environmentId}:${clientIdentity}:${serverIdentity}`;
+}
+
+export function formatVersionWithBuildSha(version: string, buildSha: string | undefined): string {
+  return buildSha === undefined ? version : `${version} (sha ${buildSha.slice(0, 8)})`;
 }
 
 function readVersionMismatchDismissals(): VersionMismatchDismissals {

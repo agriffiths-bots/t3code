@@ -263,6 +263,7 @@ import { Button } from "./ui/button";
 import {
   buildVersionMismatchDismissalKey,
   dismissVersionMismatch,
+  formatVersionWithBuildSha,
   isVersionMismatchDismissed,
   resolveServerConfigVersionMismatch,
 } from "../versionSkew";
@@ -2197,8 +2198,17 @@ function ChatViewContent(props: ChatViewProps) {
         title: "Client and server versions differ",
         description: (
           <>
-            Client {versionMismatch.clientVersion} is connected to {versionMismatchServerLabel}{" "}
-            {versionMismatch.serverVersion}. Sync them if RPC calls or reconnects fail.
+            Client{" "}
+            {formatVersionWithBuildSha(
+              versionMismatch.clientVersion,
+              versionMismatch.clientBuildSha,
+            )}{" "}
+            is connected to {versionMismatchServerLabel}{" "}
+            {formatVersionWithBuildSha(
+              versionMismatch.serverVersion,
+              versionMismatch.serverBuildSha,
+            )}
+            {". Sync them if RPC calls or reconnects fail."}
           </>
         ),
         dismissLabel: "Dismiss version mismatch warning",

@@ -6,6 +6,7 @@ import {
   appendVersionMismatchHint,
   buildVersionMismatchDismissalKey,
   dismissVersionMismatch,
+  formatVersionWithBuildSha,
   isVersionMismatchDismissed,
   resolveServerConfigVersionMismatch,
   resolveVersionMismatch,
@@ -21,6 +22,36 @@ describe("versionSkew", () => {
       clientVersion: APP_VERSION,
       serverVersion: "9.9.9",
       hint: "Version mismatch. Try syncing the client and server to the same T3 Code version.",
+    });
+  });
+
+  it("does not warn when stamped client and server builds share the same sha", () => {
+    const buildSha = "d7b6e15ecd7b6e15ecd7b6e15ecd7b6e15ecd7b6";
+
+    expect(
+      resolveVersionMismatch("0.0.28", {
+        clientVersion: "0.0.29-nightly.20260708.26",
+        clientBuildSha: buildSha,
+        serverBuildSha: buildSha,
+      }),
+    ).toBeNull();
+  });
+
+  it("warns when stamped client and server builds have different shas", () => {
+    const clientBuildSha = "d7b6e15ecd7b6e15ecd7b6e15ecd7b6e15ecd7b6";
+    const serverBuildSha = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+
+    expect(
+      resolveVersionMismatch("0.0.29-nightly.20260708.26", {
+        clientVersion: "0.0.29-nightly.20260708.26",
+        clientBuildSha,
+        serverBuildSha,
+      }),
+    ).toMatchObject({
+      clientVersion: "0.0.29-nightly.20260708.26",
+      serverVersion: "0.0.29-nightly.20260708.26",
+      clientBuildSha,
+      serverBuildSha,
     });
   });
 
@@ -66,6 +97,30 @@ describe("versionSkew", () => {
         }),
       ),
     ).toBe(false);
+  });
+
+  it("includes build shas in dismissal keys when present", () => {
+    const environmentId = EnvironmentId.make("environment-build-dismissal");
+    const clientBuildSha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const serverBuildSha = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    expect(
+      buildVersionMismatchDismissalKey(environmentId, {
+        clientVersion: "1.0.0",
+        serverVersion: "1.0.0",
+        clientBuildSha,
+        serverBuildSha,
+      }),
+    ).toBe(`${environmentId}:1.0.0@${clientBuildSha}:1.0.0@${serverBuildSha}`);
+  });
+
+  it("formats versions with short build shas", () => {
+    expect(
+      formatVersionWithBuildSha(
+        "0.0.29-nightly.20260708.26",
+        "d7b6e15ecd7b6e15ecd7b6e15ecd7b6e15ecd7b6",
+      ),
+    ).toBe("0.0.29-nightly.20260708.26 (sha d7b6e15e)");
   });
 
   it("appends a hint to connection errors when versions differ", () => {
