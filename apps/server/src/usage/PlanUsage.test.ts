@@ -1,11 +1,83 @@
+// @effect-diagnostics nodeBuiltinImport:off
 import { describe, expect, it } from "@effect/vitest";
+import * as NodeFSP from "node:fs/promises";
+import * as NodeOS from "node:os";
+import * as NodePath from "node:path";
 import {
   DEFAULT_SERVER_SETTINGS,
   ProviderDriverKind,
   ProviderInstanceId,
+  type ProviderInstanceEnvironment,
+  type ServerSettings,
 } from "@t3tools/contracts";
 
-import { __testing } from "./PlanUsage.ts";
+import { __testing, loadPlanUsageSnapshot } from "./PlanUsage.ts";
+
+async function makeFakeClaude(input: {
+  readonly usageTexts: ReadonlyArray<string>;
+  readonly usageDelaysMs?: ReadonlyArray<number>;
+  readonly requiredEnv?: Readonly<Record<string, string>>;
+  readonly forbiddenEnv?: ReadonlyArray<string>;
+}): Promise<{ readonly binaryPath: string; readonly homePath: string }> {
+  const homePath = await NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "t3-usage-claude-home-"));
+  const statePath = NodePath.join(homePath, "usage-index");
+  const binaryPath = NodePath.join(homePath, "claude-fake");
+  const script = `#!/usr/bin/env node
+const fs = require("node:fs");
+const args = process.argv.slice(2);
+const requiredEnv = ${JSON.stringify(input.requiredEnv ?? {})};
+const forbiddenEnv = ${JSON.stringify(input.forbiddenEnv ?? [])};
+for (const [key, value] of Object.entries(requiredEnv)) {
+  if (process.env[key] !== value) {
+    console.error(\`missing required env \${key}\`);
+    process.exit(2);
+  }
+}
+for (const key of forbiddenEnv) {
+  if (process.env[key] !== undefined) {
+    console.error(\`forbidden env \${key}\`);
+    process.exit(3);
+  }
+}
+if (args.includes("auth") && args.includes("status")) {
+  console.log(JSON.stringify({ loggedIn: true, subscriptionType: "max" }));
+  process.exit(0);
+}
+const usageTexts = ${JSON.stringify(input.usageTexts)};
+const usageDelaysMs = ${JSON.stringify(input.usageDelaysMs ?? [])};
+const statePath = ${JSON.stringify(statePath)};
+const current = Number(fs.existsSync(statePath) ? fs.readFileSync(statePath, "utf8") : "0");
+fs.writeFileSync(statePath, String(current + 1));
+const delayMs = usageDelaysMs[Math.min(current, usageDelaysMs.length - 1)] ?? 0;
+if (delayMs > 0) {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, delayMs);
+}
+console.log(JSON.stringify({ is_error: false, result: usageTexts[Math.min(current, usageTexts.length - 1)] ?? "" }));
+`;
+  await NodeFSP.writeFile(binaryPath, script, { mode: 0o700 });
+  await NodeFSP.chmod(binaryPath, 0o700);
+  return { binaryPath, homePath };
+}
+
+function fakeClaudeSettings(input: {
+  readonly binaryPath: string;
+  readonly homePath: string;
+  readonly environment?: ProviderInstanceEnvironment;
+}): ServerSettings {
+  return {
+    ...DEFAULT_SERVER_SETTINGS,
+    providerInstances: {
+      [ProviderInstanceId.make("claudeAgent")]: {
+        driver: ProviderDriverKind.make("claudeAgent"),
+        config: {
+          binaryPath: input.binaryPath,
+          homePath: input.homePath,
+        },
+        environment: input.environment ?? [],
+      },
+    },
+  };
+}
 
 describe("PlanUsage", () => {
   it("maps Codex primary and weekly windows and ignores additional Spark limits", () => {
@@ -135,6 +207,79 @@ describe("PlanUsage", () => {
     ]);
   });
 
+  it("parses time-only Claude CLI reset strings", () => {
+    const result = __testing.parseClaudeCliUsageText(
+      "Current session: 28% used \u00b7 resets 4:10am (Europe/London)",
+      "max",
+      Date.parse("2026-07-06T01:00:00.000Z"),
+    );
+
+    expect(result?.windows[0]?.resetAt).toBe("2026-07-06T03:10:00.000Z");
+  });
+
+  it("serves stale Claude windows when a later CLI report has no percent windows", async () => {
+    const now = Date.parse("2026-07-06T15:10:00.000Z");
+    const fake = await makeFakeClaude({
+      usageTexts: [
+        "Current session: 64% used \u00b7 resets Jul 6, 5pm (Europe/London)",
+        [
+          "You are currently using your subscription to power your Claude Code usage",
+          "",
+          "What's contributing to your limits usage?",
+          "Last 24h \u00b7 1361 requests \u00b7 22 sessions",
+        ].join("\n"),
+      ],
+    });
+    const settings = fakeClaudeSettings(fake);
+
+    const first = await loadPlanUsageSnapshot(
+      { settings, providerInstanceId: ProviderInstanceId.make("claudeAgent") },
+      now,
+    );
+    const second = await loadPlanUsageSnapshot(
+      { settings, providerInstanceId: ProviderInstanceId.make("claudeAgent") },
+      now + 61_000,
+    );
+
+    expect(first.providers[0]?.windows[0]?.usedPercent).toBe(64);
+    expect(first.providers[0]?.windows[0]?.staleAt).toBeUndefined();
+    expect(second.providers.map((provider) => provider.provider)).toEqual(["claude"]);
+    expect(second.providers[0]?.windows[0]).toMatchObject({
+      provider: "claude",
+      usedPercent: 64,
+      staleAt: "2026-07-06T15:10:00.000Z",
+    });
+  });
+
+  it("does not let a slower stale fallback overwrite a concurrent fresh usage result", async () => {
+    const now = Date.parse("2026-07-06T15:10:00.000Z");
+    const fake = await makeFakeClaude({
+      usageTexts: [
+        "Current session: 64% used \u00b7 resets Jul 6, 5pm (Europe/London)",
+        "Current session: 42% used \u00b7 resets Jul 6, 6pm (Europe/London)",
+        [
+          "You are currently using your subscription to power your Claude Code usage",
+          "",
+          "What's contributing to your limits usage?",
+          "Last 24h \u00b7 1361 requests \u00b7 22 sessions",
+        ].join("\n"),
+      ],
+      usageDelaysMs: [0, 0, 250],
+    });
+    const settings = fakeClaudeSettings(fake);
+    const options = { settings, providerInstanceId: ProviderInstanceId.make("claudeAgent") };
+
+    await loadPlanUsageSnapshot(options, now);
+    await Promise.all([
+      loadPlanUsageSnapshot(options, now + 61_000),
+      loadPlanUsageSnapshot(options, now + 61_001),
+    ]);
+    const cachedAfterRace = await loadPlanUsageSnapshot(options, now + 62_000);
+
+    expect(cachedAfterRace.providers[0]?.windows[0]?.usedPercent).toBe(42);
+    expect(cachedAfterRace.providers[0]?.windows[0]?.staleAt).toBeUndefined();
+  });
+
   it("runs Claude usage probes without saved print-mode sessions", () => {
     expect(__testing.CLAUDE_CLI_USAGE_ARGS).toContain("--no-session-persistence");
     expect(__testing.CLAUDE_CLI_USAGE_ARGS.indexOf("--no-session-persistence")).toBeLessThan(
@@ -143,27 +288,33 @@ describe("PlanUsage", () => {
   });
 
   it("scrubs ambient Claude auth overrides before running the official CLI", () => {
-    const env = __testing.claudeCliEnvironment("/tmp/claude-home", {
-      HOME: "/tmp/ambient-home",
-      PATH: "/bin",
-      HTTPS_PROXY: "http://proxy.example",
-      NODE_EXTRA_CA_CERTS: "/tmp/root-ca.pem",
-      ANTHROPIC_BASE_URL: "https://proxy.example",
-      ANTHROPIC_API_KEY: "ambient-api-key",
-      ANTHROPIC_AUTH_TOKEN: "ambient-auth-token",
-      ANTHROPIC_IDENTITY_TOKEN: "ambient-identity-token",
-      ANTHROPIC_ACCESS_TOKEN: "ambient-access-token",
-      CLAUDE_CODE_OAUTH_TOKEN: "ambient-oauth-token",
-      CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR: "7",
-      CLAUDE_CODE_SESSION_ACCESS_TOKEN: "ambient-session-token",
-      CLAUDE_CODE_USE_GATEWAY: "1",
-      CLAUDE_CODE_GATEWAY_URL: "https://gateway.example",
-      CLAUDE_CODE_CERT_STORE: "/tmp/certs.pem",
-      CLAUDE_CODE_CLIENT_CERT: "/tmp/client.pem",
-      CLAUDE_CODE_CLIENT_KEY: "/tmp/client.key",
-      CLAUDE_CODE_CLIENT_KEY_PASSPHRASE: "passphrase",
-      CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1",
-    } as NodeJS.ProcessEnv);
+    const env = __testing.claudeCliEnvironment(
+      "/tmp/claude-home",
+      [
+        { name: "HTTPS_PROXY", value: "http://proxy.example", sensitive: false },
+        { name: "NODE_EXTRA_CA_CERTS", value: "/tmp/root-ca.pem", sensitive: false },
+        { name: "ANTHROPIC_API_KEY", value: "instance-api-key", sensitive: true },
+      ],
+      {
+        HOME: "/tmp/ambient-home",
+        PATH: "/bin",
+        ANTHROPIC_BASE_URL: "https://proxy.example",
+        ANTHROPIC_API_KEY: "ambient-api-key",
+        ANTHROPIC_AUTH_TOKEN: "ambient-auth-token",
+        ANTHROPIC_IDENTITY_TOKEN: "ambient-identity-token",
+        ANTHROPIC_ACCESS_TOKEN: "ambient-access-token",
+        CLAUDE_CODE_OAUTH_TOKEN: "ambient-oauth-token",
+        CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR: "7",
+        CLAUDE_CODE_SESSION_ACCESS_TOKEN: "ambient-session-token",
+        CLAUDE_CODE_USE_GATEWAY: "1",
+        CLAUDE_CODE_GATEWAY_URL: "https://gateway.example",
+        CLAUDE_CODE_CERT_STORE: "/tmp/certs.pem",
+        CLAUDE_CODE_CLIENT_CERT: "/tmp/client.pem",
+        CLAUDE_CODE_CLIENT_KEY: "/tmp/client.key",
+        CLAUDE_CODE_CLIENT_KEY_PASSPHRASE: "passphrase",
+        CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1",
+      } as NodeJS.ProcessEnv,
+    );
 
     expect(env.HOME).toBe("/tmp/claude-home");
     expect(env.PATH).toBe("/bin");
@@ -184,6 +335,84 @@ describe("PlanUsage", () => {
     expect(env.CLAUDE_CODE_CLIENT_KEY).toBe("/tmp/client.key");
     expect(env.CLAUDE_CODE_CLIENT_KEY_PASSPHRASE).toBe("passphrase");
     expect(env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC).toBe("1");
+  });
+
+  it("uses provider-instance transport env while stripping API keys for Claude probes", async () => {
+    const fake = await makeFakeClaude({
+      usageTexts: ["Current session: 32% used \u00b7 resets Jul 6, 5pm (Europe/London)"],
+      requiredEnv: {
+        HTTPS_PROXY: "http://proxy.example",
+        NODE_EXTRA_CA_CERTS: "/tmp/root-ca.pem",
+      },
+      forbiddenEnv: ["ANTHROPIC_API_KEY"],
+    });
+    const settings = fakeClaudeSettings({
+      ...fake,
+      environment: [
+        { name: "HTTPS_PROXY", value: "http://proxy.example", sensitive: false },
+        { name: "NODE_EXTRA_CA_CERTS", value: "/tmp/root-ca.pem", sensitive: false },
+        { name: "ANTHROPIC_API_KEY", value: "poison-api-key", sensitive: true },
+      ],
+    });
+
+    const snapshot = await loadPlanUsageSnapshot(
+      { settings, providerInstanceId: ProviderInstanceId.make("claudeAgent") },
+      Date.parse("2026-07-06T15:10:00.000Z"),
+    );
+
+    expect(snapshot.providers[0]?.provider).toBe("claude");
+    expect(snapshot.providers[0]?.windows[0]?.usedPercent).toBe(32);
+  });
+
+  it("deduplicates equivalent Claude probes after endpoint and auth env are scrubbed", () => {
+    const settings = {
+      ...DEFAULT_SERVER_SETTINGS,
+      providerInstances: {
+        [ProviderInstanceId.make("claudeAgent")]: {
+          driver: ProviderDriverKind.make("claudeAgent"),
+          enabled: false,
+          config: {},
+        },
+        [ProviderInstanceId.make("claude_one")]: {
+          driver: ProviderDriverKind.make("claudeAgent"),
+          config: {
+            binaryPath: "/usr/bin/claude",
+            homePath: "/tmp/claude-home",
+          },
+          environment: [
+            { name: "ANTHROPIC_API_KEY", value: "first-key", sensitive: true },
+            { name: "ANTHROPIC_BASE_URL", value: "https://proxy-one.example", sensitive: false },
+          ],
+        },
+        [ProviderInstanceId.make("claude_two")]: {
+          driver: ProviderDriverKind.make("claudeAgent"),
+          config: {
+            binaryPath: "/usr/bin/claude",
+            homePath: "/tmp/claude-home",
+          },
+          environment: [
+            { name: "ANTHROPIC_API_KEY", value: "second-key", sensitive: true },
+            { name: "CLAUDE_CODE_GATEWAY_URL", value: "https://gateway.example", sensitive: false },
+          ],
+        },
+        [ProviderInstanceId.make("claude_proxy")]: {
+          driver: ProviderDriverKind.make("claudeAgent"),
+          config: {
+            binaryPath: "/usr/bin/claude",
+            homePath: "/tmp/claude-home",
+          },
+          environment: [{ name: "HTTPS_PROXY", value: "http://proxy.example", sensitive: false }],
+        },
+      },
+    } satisfies ServerSettings;
+
+    const scope = __testing.resolveUsageCredentialScope({ settings });
+
+    expect(scope.sources).toMatchObject([
+      { instanceId: "codex", provider: "codex" },
+      { instanceId: "claude_one", provider: "claude" },
+      { instanceId: "claude_proxy", provider: "claude" },
+    ]);
   });
 
   it("supports disabling live plan usage polling with environment flags", () => {

@@ -5,6 +5,7 @@ import { Popover, PopoverPopup, PopoverTrigger } from "../ui/popover";
 import {
   flattenPlanUsageWindows,
   formatPlanUsageReset,
+  formatPlanUsageStaleAt,
   formatPlanUsageValue,
   planUsageColor,
   selectMostConstrainedPlanUsageWindow,
@@ -80,6 +81,7 @@ export function PlanUsageMeter(props: { snapshot: PlanUsageSnapshot | null }) {
             {windows.map((window) => {
               const percent = Math.max(0, Math.min(100, window.usedPercent));
               const color = planUsageColor(window);
+              const staleLabel = formatPlanUsageStaleAt(window.staleAt);
               return (
                 <div key={window.id} className="flex flex-col gap-1.5">
                   <div className="flex items-center justify-between gap-3 text-[11px] leading-4">
@@ -102,7 +104,9 @@ export function PlanUsageMeter(props: { snapshot: PlanUsageSnapshot | null }) {
                     />
                   </div>
                   <div className="text-[11px] leading-4 text-muted-foreground/60">
-                    {formatPlanUsageReset(window.resetAt)}
+                    {staleLabel
+                      ? `${staleLabel} · ${formatPlanUsageReset(window.resetAt)}`
+                      : formatPlanUsageReset(window.resetAt)}
                   </div>
                 </div>
               );

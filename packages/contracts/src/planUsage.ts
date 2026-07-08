@@ -17,6 +17,7 @@ export const PlanUsageWindowSchema = Schema.Struct({
   limit: Schema.NullOr(Schema.Number),
   unit: Schema.NullOr(Schema.String),
   severity: Schema.NullOr(PlanUsageSeveritySchema),
+  staleAt: Schema.optionalKey(Schema.String),
 });
 export type PlanUsageWindow = typeof PlanUsageWindowSchema.Type;
 

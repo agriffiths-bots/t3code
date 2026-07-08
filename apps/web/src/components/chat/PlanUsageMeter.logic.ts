@@ -31,6 +31,23 @@ export function formatPlanUsageReset(resetAt: string | null, now = Date.now()): 
   return `Resets in ${days}d`;
 }
 
+export function formatPlanUsageStaleAt(
+  staleAt: string | undefined,
+  now = Date.now(),
+): string | null {
+  if (!staleAt) return null;
+  const time = Date.parse(staleAt);
+  if (!Number.isFinite(time)) return "Last good snapshot";
+  const deltaMs = Math.max(0, now - time);
+  const minutes = Math.floor(deltaMs / 60_000);
+  if (minutes < 1) return "Last good just now";
+  if (minutes < 60) return `Last good ${minutes}m ago`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 48) return `Last good ${hours}h ago`;
+  const days = Math.floor(hours / 24);
+  return `Last good ${days}d ago`;
+}
+
 export function formatPlanUsageValue(window: PlanUsageWindow): string {
   const percent =
     window.usedPercent < 10
@@ -70,5 +87,8 @@ function severityRank(window: PlanUsageWindow): number {
 }
 
 function planUsagePriority(window: PlanUsageWindow): number {
-  return Math.max(0, Math.min(100, window.usedPercent)) * 1_000 + severityRank(window);
+  const stalePenalty = window.staleAt ? -10_000 : 0;
+  return (
+    Math.max(0, Math.min(100, window.usedPercent)) * 1_000 + severityRank(window) + stalePenalty
+  );
 }

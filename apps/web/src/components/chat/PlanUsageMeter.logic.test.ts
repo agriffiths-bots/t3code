@@ -2,6 +2,7 @@ import { describe, expect, it } from "vite-plus/test";
 
 import {
   formatPlanUsageReset,
+  formatPlanUsageStaleAt,
   formatPlanUsageValue,
   planUsageColor,
   selectMostConstrainedPlanUsageWindow,
@@ -118,6 +119,13 @@ describe("PlanUsageMeter logic", () => {
         severity: null,
       }),
     ).toBe("7.5% · 3/10 credits");
+  });
+
+  it("formats stale usage snapshots", () => {
+    expect(
+      formatPlanUsageStaleAt("2026-07-03T11:42:00.000Z", Date.parse("2026-07-03T12:00:00.000Z")),
+    ).toBe("Last good 18m ago");
+    expect(formatPlanUsageStaleAt(undefined, Date.parse("2026-07-03T12:00:00.000Z"))).toBeNull();
   });
 
   it("prefers provider severity for usage colors", () => {
