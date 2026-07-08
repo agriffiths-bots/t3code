@@ -396,6 +396,12 @@ export const make = Effect.fn("EnvironmentSupervisor.make")(function* (
           if (next.network === "offline") {
             return;
           }
+          if (
+            next.network === "online" &&
+            next.sequence > input.attemptStartedAfterSignalSequence
+          ) {
+            return;
+          }
           break;
         case "ConnectRequested":
           break;

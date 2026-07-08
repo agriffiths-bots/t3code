@@ -627,6 +627,29 @@ describe("EnvironmentSupervisor", () => {
     }),
   );
 
+  it.effect("restarts a stale in-flight setup when connectivity becomes online", () =>
+    Effect.gen(function* () {
+      const firstAttemptStarted = yield* Deferred.make<void>();
+      const harness = yield* makeHarness({
+        networkStatus: "unknown",
+        prepare: (attempt) =>
+          attempt === 1
+            ? Deferred.succeed(firstAttemptStarted, undefined).pipe(Effect.andThen(Effect.never))
+            : Effect.succeed(PREPARED_CONNECTION),
+      });
+      const supervisor = yield* EnvironmentSupervisor.make(TARGET_ENTRY, {
+        initiallyDesired: true,
+      }).pipe(Effect.provide(harness.dependencies));
+
+      yield* Deferred.await(firstAttemptStarted);
+      yield* harness.setNetworkStatus("online");
+      yield* awaitState(supervisor.state, (state) => state.phase === "connected");
+
+      expect(yield* Ref.get(harness.prepareCount)).toBe(2);
+      expect(yield* Ref.get(harness.sessionCount)).toBe(1);
+    }),
+  );
+
   it.effect("does not cancel a fresh online reconnect with a delayed browser-online wakeup", () =>
     Effect.gen(function* () {
       const firstAttemptStarted = yield* Deferred.make<void>();
@@ -643,6 +666,30 @@ describe("EnvironmentSupervisor", () => {
       yield* harness.setNetworkStatus("online");
       yield* Deferred.await(firstAttemptStarted);
       yield* harness.wake("browser-online");
+      yield* Effect.yieldNow;
+
+      expect(yield* Ref.get(harness.prepareCount)).toBe(1);
+      expect(yield* Ref.get(harness.sessionCount)).toBe(0);
+      expect((yield* SubscriptionRef.get(supervisor.state)).phase).toBe("connecting");
+    }),
+  );
+
+  it.effect("does not cancel a fresh online reconnect when browser-online arrives first", () =>
+    Effect.gen(function* () {
+      const firstAttemptStarted = yield* Deferred.make<void>();
+      const harness = yield* makeHarness({
+        networkStatus: "offline",
+        prepare: () =>
+          Deferred.succeed(firstAttemptStarted, undefined).pipe(Effect.andThen(Effect.never)),
+      });
+      const supervisor = yield* EnvironmentSupervisor.make(TARGET_ENTRY, {
+        initiallyDesired: true,
+      }).pipe(Effect.provide(harness.dependencies));
+
+      yield* awaitState(supervisor.state, (state) => state.phase === "offline");
+      yield* harness.wake("browser-online");
+      yield* harness.setNetworkStatus("online");
+      yield* Deferred.await(firstAttemptStarted);
       yield* Effect.yieldNow;
 
       expect(yield* Ref.get(harness.prepareCount)).toBe(1);
