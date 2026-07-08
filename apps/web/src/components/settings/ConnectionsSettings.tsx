@@ -111,7 +111,7 @@ import {
 } from "~/environments/primary";
 import { isDesktopLocalConnectionTarget } from "~/connection/desktopLocal";
 import { useUiStateStore } from "~/uiStateStore";
-import { resolveServerConfigVersionMismatch } from "~/versionSkew";
+import { formatVersionWithBuildSha, resolveServerConfigVersionMismatch } from "~/versionSkew";
 import { hasCloudPublicConfig } from "~/cloud/publicConfig";
 import { useCloudLinkController } from "~/cloud/useCloudLinkController";
 import { authEnvironment } from "~/state/auth";
@@ -1383,8 +1383,17 @@ function SavedBackendListRow({
           {versionMismatch ? (
             <p className="flex items-center gap-1 text-warning text-xs">
               <TriangleAlertIcon className="size-3.5 shrink-0" />
-              Version drift: client {versionMismatch.clientVersion}, server{" "}
-              {versionMismatch.serverVersion}.
+              Version drift: client{" "}
+              {formatVersionWithBuildSha(
+                versionMismatch.clientVersion,
+                versionMismatch.clientBuildSha,
+              )}
+              {", server "}
+              {formatVersionWithBuildSha(
+                versionMismatch.serverVersion,
+                versionMismatch.serverBuildSha,
+              )}
+              {"."}
             </p>
           ) : null}
           {environment.connection.error ? (
@@ -3062,9 +3071,17 @@ export function ConnectionsSettings() {
                 description={
                   <span className="flex items-center gap-1 text-warning">
                     <TriangleAlertIcon className="size-3.5 shrink-0" />
-                    Client {primaryVersionMismatch.clientVersion}, server{" "}
-                    {primaryVersionMismatch.serverVersion}. Sync them if RPC calls or reconnects
-                    fail.
+                    Client{" "}
+                    {formatVersionWithBuildSha(
+                      primaryVersionMismatch.clientVersion,
+                      primaryVersionMismatch.clientBuildSha,
+                    )}
+                    {", server "}
+                    {formatVersionWithBuildSha(
+                      primaryVersionMismatch.serverVersion,
+                      primaryVersionMismatch.serverBuildSha,
+                    )}
+                    {". Sync them if RPC calls or reconnects fail."}
                   </span>
                 }
               />
