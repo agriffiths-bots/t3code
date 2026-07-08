@@ -15,6 +15,7 @@ import {
 import {
   type ResolvedKeybindingsConfig,
   type ScopedThreadRef,
+  type TerminalSessionSnapshot,
   type ThreadId,
 } from "@t3tools/contracts";
 import { getTerminalLabel } from "@t3tools/shared/terminalLabels";
@@ -65,10 +66,48 @@ import { previewEnvironment } from "../state/preview";
 import { terminalEnvironment } from "../state/terminal";
 import { openTerminalLinkInPreview } from "./preview/openTerminalLinkInPreview";
 import { useAtomCommand } from "../state/use-atom-command";
+import {
+  TerminalWriteQueue,
+  terminalBufferDelta,
+  terminalBufferNeedsFullResync,
+} from "./terminalWriteQueue";
 
 const MIN_DRAWER_HEIGHT = 180;
 const MAX_DRAWER_HEIGHT_RATIO = 0.75;
 const MULTI_CLICK_SELECTION_ACTION_DELAY_MS = 260;
+
+type TerminalViewportStatus = TerminalSessionSnapshot["status"] | "closed";
+
+export interface PassiveTerminalStatusEffect {
+  readonly message: string | null;
+  readonly closeRemoteSession: false;
+  readonly removeLocalSession: boolean;
+}
+
+export function passiveTerminalStatusEffect(
+  status: TerminalViewportStatus,
+): PassiveTerminalStatusEffect {
+  switch (status) {
+    case "closed":
+      return { message: "Terminal closed", closeRemoteSession: false, removeLocalSession: true };
+    case "exited":
+      return { message: "Process exited", closeRemoteSession: false, removeLocalSession: false };
+    case "starting":
+    case "running":
+    case "error":
+      return { message: null, closeRemoteSession: false, removeLocalSession: false };
+  }
+}
+
+export function terminalStatusNeedsLocalRemoval(
+  currentStatus: TerminalViewportStatus,
+  previousStatus: TerminalViewportStatus,
+): boolean {
+  return (
+    currentStatus !== previousStatus &&
+    passiveTerminalStatusEffect(currentStatus).removeLocalSession
+  );
+}
 
 function maxDrawerHeight(): number {
   if (typeof window === "undefined") return DEFAULT_THREAD_TERMINAL_HEIGHT;
@@ -81,15 +120,12 @@ function clampDrawerHeight(height: number): number {
   return Math.min(Math.max(Math.round(safeHeight), MIN_DRAWER_HEIGHT), maxHeight);
 }
 
-function writeSystemMessage(terminal: Terminal, message: string): void {
-  terminal.write(`\r\n[terminal] ${message}\r\n`);
+function isDocumentHidden(): boolean {
+  return typeof document !== "undefined" && document.hidden;
 }
 
-function writeTerminalBuffer(terminal: Terminal, buffer: string): void {
-  terminal.write("\u001bc");
-  if (buffer.length > 0) {
-    terminal.write(buffer);
-  }
+function writeSystemMessage(writer: TerminalWriteQueue | null, message: string): void {
+  writer?.enqueue(`\r\n[terminal] ${message}\r\n`);
 }
 
 function fitTerminalSafely(fitAddon: FitAddon): boolean {
@@ -276,7 +312,7 @@ interface TerminalViewportProps {
   cwd: string;
   worktreePath?: string | null;
   runtimeEnv?: Record<string, string>;
-  onSessionExited: () => void;
+  onSessionClosed: (terminalId: string) => void;
   onAddTerminalContext: (selection: TerminalContextSelection) => void;
   focusRequestId: number;
   autoFocus: boolean;
@@ -299,7 +335,7 @@ export function TerminalViewport({
   cwd,
   worktreePath,
   runtimeEnv,
-  onSessionExited,
+  onSessionClosed,
   onAddTerminalContext,
   focusRequestId,
   autoFocus,
@@ -309,6 +345,7 @@ export function TerminalViewport({
 }: TerminalViewportProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const terminalRef = useRef<Terminal | null>(null);
+  const terminalWriterRef = useRef<TerminalWriteQueue | null>(null);
   const fitAddonRef = useRef<FitAddon | null>(null);
   const environmentId = threadRef.environmentId;
   const serverConfig = useAtomValue(serverEnvironment.configValueAtom(environmentId));
@@ -327,6 +364,8 @@ export function TerminalViewport({
     reportFailure: false,
   });
   const hasHandledExitRef = useRef(false);
+  const needsFullResyncRef = useRef(false);
+  const [terminalResyncEpoch, setTerminalResyncEpoch] = useState(0);
   const selectionPointerRef = useRef<{ x: number; y: number } | null>(null);
   const selectionGestureActiveRef = useRef(false);
   const selectionActionRequestIdRef = useRef(0);
@@ -334,11 +373,17 @@ export function TerminalViewport({
   const selectionActionTimerRef = useRef<number | null>(null);
   const keybindingsRef = useRef(keybindings);
   const runtimeEnvKey = useMemo(() => runtimeEnvSignature(runtimeEnv), [runtimeEnv]);
-  const handleSessionExited = useEffectEvent(() => {
-    onSessionExited();
-  });
   const handleAddTerminalContext = useEffectEvent((selection: TerminalContextSelection) => {
     onAddTerminalContext(selection);
+  });
+  const handleSessionClosed = useEffectEvent((closedTerminalId: string) => {
+    onSessionClosed(closedTerminalId);
+  });
+  const requestTerminalResync = useEffectEvent(() => {
+    needsFullResyncRef.current = true;
+    if (!isDocumentHidden()) {
+      setTerminalResyncEpoch((value) => value + 1);
+    }
   });
   const readTerminalLabel = useEffectEvent(() => terminalLabel);
   const terminalSession = useAttachedTerminalSession({
@@ -397,8 +442,12 @@ export function TerminalViewport({
     terminal.loadAddon(fitAddon);
     terminal.open(mount);
     fitTerminalSafely(fitAddon);
+    const terminalWriter = new TerminalWriteQueue(terminal, {
+      onWriteFailure: requestTerminalResync,
+    });
 
     terminalRef.current = terminal;
+    terminalWriterRef.current = terminalWriter;
     fitAddonRef.current = fitAddon;
     previousSessionRef.current = {
       buffer: "",
@@ -492,7 +541,10 @@ export function TerminalViewport({
       const result = await writeTerminal(data);
       if (result._tag === "Failure" && !isAtomCommandInterrupted(result)) {
         const error = squashAtomCommandFailure(result);
-        writeSystemMessage(activeTerminal, error instanceof Error ? error.message : fallbackError);
+        writeSystemMessage(
+          terminalWriterRef.current,
+          error instanceof Error ? error.message : fallbackError,
+        );
       }
     };
 
@@ -575,7 +627,7 @@ export function TerminalViewport({
               if (match.kind === "url") {
                 if (!localApi) {
                   writeSystemMessage(
-                    latestTerminal,
+                    terminalWriterRef.current,
                     "Opening links is unavailable in this browser.",
                   );
                   return;
@@ -583,7 +635,7 @@ export function TerminalViewport({
                 const fallbackToBrowser = () => {
                   void localApi.shell.openExternal(match.text).catch((error: unknown) => {
                     writeSystemMessage(
-                      latestTerminal,
+                      terminalWriterRef.current,
                       error instanceof Error ? error.message : "Unable to open link",
                     );
                   });
@@ -607,7 +659,7 @@ export function TerminalViewport({
                 }
                 const error = squashAtomCommandFailure(result);
                 writeSystemMessage(
-                  latestTerminal,
+                  terminalWriterRef.current,
                   error instanceof Error ? error.message : "Unable to open path",
                 );
               })();
@@ -625,7 +677,7 @@ export function TerminalViewport({
         }
         const error = squashAtomCommandFailure(result);
         writeSystemMessage(
-          terminal,
+          terminalWriterRef.current,
           error instanceof Error ? error.message : "Terminal write failed",
         );
       })();
@@ -699,7 +751,9 @@ export function TerminalViewport({
       mount.removeEventListener("pointerdown", handlePointerDown);
       themeObserver.disconnect();
       terminalRef.current = null;
+      terminalWriterRef.current = null;
       fitAddonRef.current = null;
+      terminalWriter.dispose();
       terminal.dispose();
     };
     // autoFocus is intentionally omitted;
@@ -708,54 +762,89 @@ export function TerminalViewport({
   }, [cwd, environmentId, runtimeEnvKey, terminalId, threadId, worktreePath]);
 
   useEffect(() => {
+    if (typeof document === "undefined") return;
+
+    const handleVisibilityChange = () => {
+      needsFullResyncRef.current = true;
+      if (!document.hidden) {
+        setTerminalResyncEpoch((value) => value + 1);
+      }
+    };
+
+    document.addEventListener("visibilitychange", handleVisibilityChange);
+    return () => {
+      document.removeEventListener("visibilitychange", handleVisibilityChange);
+    };
+  }, []);
+
+  useEffect(() => {
     const terminal = terminalRef.current;
+    const terminalWriter = terminalWriterRef.current;
     const current = {
       buffer: terminalBuffer,
       error: terminalError,
       status: terminalStatus,
       version: terminalVersion,
     };
-    if (!terminal) {
+    if (!terminal || !terminalWriter) {
       previousSessionRef.current = current;
       return;
     }
 
+    if (isDocumentHidden()) {
+      needsFullResyncRef.current = true;
+      return;
+    }
+
     const previous = previousSessionRef.current;
-    if (current.version === previous.version) {
+    const forceFullResync = needsFullResyncRef.current;
+    if (
+      current.version === previous.version &&
+      current.error === previous.error &&
+      current.status === previous.status &&
+      !forceFullResync
+    ) {
       return;
     }
 
     if (
-      current.buffer.length >= previous.buffer.length &&
-      current.buffer.startsWith(previous.buffer)
+      terminalBufferNeedsFullResync({
+        currentBuffer: current.buffer,
+        previousBuffer: previous.buffer,
+        force: forceFullResync,
+      })
     ) {
-      terminal.write(current.buffer.slice(previous.buffer.length));
+      needsFullResyncRef.current = false;
+      terminalWriter.writeTerminalBuffer(current.buffer);
     } else {
-      writeTerminalBuffer(terminal, current.buffer);
+      terminalWriter.enqueue(
+        terminalBufferDelta({
+          currentBuffer: current.buffer,
+          previousBuffer: previous.buffer,
+        }),
+      );
     }
     terminal.clearSelection();
 
     if (current.error !== null && current.error !== previous.error) {
-      writeSystemMessage(terminal, current.error);
+      writeSystemMessage(terminalWriter, current.error);
     }
 
     if (current.status === "running") {
       hasHandledExitRef.current = false;
-    } else if (
-      (current.status === "closed" || current.status === "exited") &&
-      current.status !== previous.status &&
-      !hasHandledExitRef.current
-    ) {
-      hasHandledExitRef.current = true;
-      writeSystemMessage(
-        terminal,
-        current.status === "closed" ? "Terminal closed" : "Process exited",
-      );
-      window.setTimeout(() => {
-        if (hasHandledExitRef.current) {
-          handleSessionExited();
-        }
-      }, 0);
+    } else if (current.status !== previous.status) {
+      const statusEffect = passiveTerminalStatusEffect(current.status);
+      if (statusEffect.message && !hasHandledExitRef.current) {
+        hasHandledExitRef.current = true;
+        writeSystemMessage(terminalWriter, statusEffect.message);
+      }
+      if (terminalStatusNeedsLocalRemoval(current.status, previous.status)) {
+        window.setTimeout(() => {
+          if (previousSessionRef.current.status === "closed") {
+            handleSessionClosed(terminalId);
+          }
+        }, 0);
+      }
     }
 
     if (previous.version === 0 && autoFocus) {
@@ -764,7 +853,14 @@ export function TerminalViewport({
       });
     }
     previousSessionRef.current = current;
-  }, [autoFocus, terminalBuffer, terminalError, terminalStatus, terminalVersion]);
+  }, [
+    autoFocus,
+    terminalBuffer,
+    terminalError,
+    terminalResyncEpoch,
+    terminalStatus,
+    terminalVersion,
+  ]);
 
   useEffect(() => {
     if (!autoFocus) return;
@@ -825,6 +921,7 @@ interface ThreadTerminalDrawerProps {
   closeShortcutLabel?: string | undefined;
   onActiveTerminalChange: (terminalId: string) => void;
   onCloseTerminal: (terminalId: string) => void;
+  onTerminalSessionClosed: (terminalId: string) => void;
   onHeightChange: (height: number) => void;
   onAddTerminalContext: (selection: TerminalContextSelection) => void;
   keybindings: ResolvedKeybindingsConfig;
@@ -886,6 +983,7 @@ export default function ThreadTerminalDrawer({
   closeShortcutLabel,
   onActiveTerminalChange,
   onCloseTerminal,
+  onTerminalSessionClosed,
   onHeightChange,
   onAddTerminalContext,
   keybindings,
@@ -1340,8 +1438,8 @@ export default function ThreadTerminalDrawer({
                           {...(terminalLaunchLocation.runtimeEnv
                             ? { runtimeEnv: terminalLaunchLocation.runtimeEnv }
                             : {})}
-                          onSessionExited={() => onCloseTerminal(terminalId)}
                           onAddTerminalContext={onAddTerminalContext}
+                          onSessionClosed={onTerminalSessionClosed}
                           focusRequestId={focusRequestId}
                           autoFocus={terminalId === resolvedActiveTerminalId}
                           resizeEpoch={resizeEpoch}
@@ -1368,8 +1466,8 @@ export default function ThreadTerminalDrawer({
                   {...(activeTerminalLaunchLocation.runtimeEnv
                     ? { runtimeEnv: activeTerminalLaunchLocation.runtimeEnv }
                     : {})}
-                  onSessionExited={() => onCloseTerminal(resolvedActiveTerminalId)}
                   onAddTerminalContext={onAddTerminalContext}
+                  onSessionClosed={onTerminalSessionClosed}
                   focusRequestId={focusRequestId}
                   autoFocus
                   resizeEpoch={resizeEpoch}

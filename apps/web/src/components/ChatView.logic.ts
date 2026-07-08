@@ -90,6 +90,68 @@ export function shouldShowEnvironmentUnavailableBanner(input: {
   return input.nowMs - input.unavailableSinceMs >= debounceMs;
 }
 
+/** Same terminal ids (order ignored) — avoids reconcile when only server session ordering differs. */
+export function terminalIdListsEqual(left: readonly string[], right: readonly string[]): boolean {
+  if (left.length !== right.length) {
+    return false;
+  }
+  if (left.length === 0) {
+    return true;
+  }
+  const sortedLeft = left.toSorted((a, b) => a.localeCompare(b));
+  const sortedRight = right.toSorted((a, b) => a.localeCompare(b));
+  for (let index = 0; index < sortedLeft.length; index += 1) {
+    if (sortedLeft[index] !== sortedRight[index]) {
+      return false;
+    }
+  }
+  return true;
+}
+
+export function reconcileTerminalIdsFromServerMetadata(input: {
+  readonly serverIds: readonly string[];
+  readonly clientIds: readonly string[];
+  readonly seenServerIds: ReadonlySet<string>;
+  readonly pendingLocalIds?: ReadonlySet<string>;
+}): string[] | null {
+  if (terminalIdListsEqual(input.serverIds, input.clientIds)) {
+    return null;
+  }
+
+  const serverIdSet = new Set(input.serverIds);
+  const protectedLocalIds = input.clientIds.filter(
+    (id) =>
+      !serverIdSet.has(id) && (input.pendingLocalIds?.has(id) || !input.seenServerIds.has(id)),
+  );
+  const nextIds = [...input.serverIds, ...protectedLocalIds];
+  return terminalIdListsEqual(nextIds, input.clientIds) ? null : nextIds;
+}
+
+export function reconcilePendingLocalTerminalIds(input: {
+  readonly pendingLocalIds: ReadonlySet<string>;
+  readonly previousClientIds: readonly string[];
+  readonly clientIds: readonly string[];
+  readonly serverIds: ReadonlySet<string>;
+}): Set<string> {
+  const nextPendingIds = new Set(input.pendingLocalIds);
+  const previousClientIds = new Set(input.previousClientIds);
+  const clientIds = new Set(input.clientIds);
+
+  for (const terminalId of nextPendingIds) {
+    if (input.serverIds.has(terminalId) || !clientIds.has(terminalId)) {
+      nextPendingIds.delete(terminalId);
+    }
+  }
+
+  for (const terminalId of clientIds) {
+    if (!previousClientIds.has(terminalId) && !input.serverIds.has(terminalId)) {
+      nextPendingIds.add(terminalId);
+    }
+  }
+
+  return nextPendingIds;
+}
+
 export function buildThreadErrorDismissKey(input: {
   threadKey: string;
   turnId: TurnId | null | undefined;

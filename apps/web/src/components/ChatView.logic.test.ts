@@ -16,6 +16,8 @@ import {
   hasQueuedSubmissionBeenObservedByShell,
   hasServerAcknowledgedLocalDispatch,
   reconcileMountedTerminalThreadIds,
+  reconcilePendingLocalTerminalIds,
+  reconcileTerminalIdsFromServerMetadata,
   reconcileRetainedMountedThreadIds,
   resolveVisibleServerThreadError,
   resolveSendEnvMode,
@@ -77,6 +79,81 @@ const readySession = {
   lastError: null,
   updatedAt: "2026-03-29T00:00:10.000Z",
 };
+
+describe("reconcileTerminalIdsFromServerMetadata", () => {
+  it("preserves optimistic local opens that have not appeared in server metadata yet", () => {
+    expect(
+      reconcileTerminalIdsFromServerMetadata({
+        serverIds: ["terminal-1"],
+        clientIds: ["terminal-1", "terminal-2"],
+        seenServerIds: new Set(["terminal-1"]),
+      }),
+    ).toBeNull();
+  });
+
+  it("removes terminals that disappear after being observed in server metadata", () => {
+    expect(
+      reconcileTerminalIdsFromServerMetadata({
+        serverIds: ["terminal-1"],
+        clientIds: ["terminal-1", "terminal-2"],
+        seenServerIds: new Set(["terminal-1", "terminal-2"]),
+      }),
+    ).toEqual(["terminal-1"]);
+  });
+
+  it("removes observed missing terminals while preserving unseen local opens", () => {
+    expect(
+      reconcileTerminalIdsFromServerMetadata({
+        serverIds: ["terminal-1"],
+        clientIds: ["terminal-1", "terminal-2", "terminal-3"],
+        seenServerIds: new Set(["terminal-1", "terminal-2"]),
+      }),
+    ).toEqual(["terminal-1", "terminal-3"]);
+  });
+
+  it("preserves a reused terminal id while its fresh local open is pending", () => {
+    expect(
+      reconcileTerminalIdsFromServerMetadata({
+        serverIds: [],
+        clientIds: ["terminal-1"],
+        seenServerIds: new Set(["terminal-1"]),
+        pendingLocalIds: new Set(["terminal-1"]),
+      }),
+    ).toBeNull();
+  });
+});
+
+describe("reconcilePendingLocalTerminalIds", () => {
+  it("tracks local additions until the server acknowledges them", () => {
+    const pending = reconcilePendingLocalTerminalIds({
+      pendingLocalIds: new Set(),
+      previousClientIds: [],
+      clientIds: ["terminal-1"],
+      serverIds: new Set(),
+    });
+    expect([...pending]).toEqual(["terminal-1"]);
+
+    expect(
+      reconcilePendingLocalTerminalIds({
+        pendingLocalIds: pending,
+        previousClientIds: ["terminal-1"],
+        clientIds: ["terminal-1"],
+        serverIds: new Set(["terminal-1"]),
+      }).has("terminal-1"),
+    ).toBe(false);
+  });
+
+  it("clears pending ids that the client removes before server acknowledgement", () => {
+    expect(
+      reconcilePendingLocalTerminalIds({
+        pendingLocalIds: new Set(["terminal-1"]),
+        previousClientIds: ["terminal-1"],
+        clientIds: [],
+        serverIds: new Set(),
+      }).has("terminal-1"),
+    ).toBe(false);
+  });
+});
 
 describe("workspaceRelativePathFromRepositoryRoot", () => {
   it("returns the workspace path relative to a repository root", () => {
