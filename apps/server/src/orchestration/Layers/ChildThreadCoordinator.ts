@@ -36,6 +36,7 @@ import {
 import { OrchestrationEngineService } from "../Services/OrchestrationEngine.ts";
 import { ProjectionSnapshotQuery } from "../Services/ProjectionSnapshotQuery.ts";
 import { ProviderInstanceRegistry } from "../../provider/Services/ProviderInstanceRegistry.ts";
+import { SubagentDispatchLimiter } from "../../mcp/toolkits/subagent/SubagentDispatchLimiter.ts";
 import {
   PendingDispatchRepository,
   type PendingDispatch,
@@ -143,6 +144,7 @@ const make = Effect.gen(function* () {
   const orchestrationEngine = yield* OrchestrationEngineService;
   const projectionSnapshotQuery = yield* ProjectionSnapshotQuery;
   const registry = yield* ProviderInstanceRegistry;
+  const dispatchLimiter = yield* SubagentDispatchLimiter;
   const pendingDispatches = yield* PendingDispatchRepository;
   const sql = yield* SqlClient;
 
@@ -379,6 +381,7 @@ const make = Effect.gen(function* () {
         error,
       });
       if (settled) {
+        yield* dispatchLimiter.releaseForChild(childThreadId);
         activeTurnByChild.delete(childThreadId);
         pendingTurnStartByChild.delete(childThreadId);
         pendingSameTurnStartByChild.delete(childThreadId);
@@ -849,6 +852,7 @@ const make = Effect.gen(function* () {
   const handleThreadDeleted = (event: ThreadDeletedEvent) =>
     Effect.gen(function* () {
       const { threadId } = event.payload;
+      yield* dispatchLimiter.releaseForChild(threadId);
       if (children.has(threadId)) {
         yield* settleChild(threadId, "killed", "thread deleted");
       }
@@ -953,23 +957,29 @@ const make = Effect.gen(function* () {
     }
   });
 
-  const register: ChildThreadCoordinatorShape["register"] = (input) =>
+  const validateSpawn: ChildThreadCoordinatorShape["validateSpawn"] = (input) =>
     Effect.gen(function* () {
-      if (children.has(input.childThreadId)) {
-        return;
-      }
       const depth = depthFor(input.parentThreadId);
       if (depth >= MAX_DEPTH) {
         return yield* fail(
           `Sub-agent depth limit (${MAX_DEPTH}) reached; refusing to spawn deeper.`,
         );
       }
-      if (hasAncestryCycle(input.parentThreadId, input.childThreadId)) {
-        return yield* fail("Sub-agent spawn would create an ancestry cycle.");
-      }
       const instance = yield* registry.getInstance(input.model.instanceId);
       if (instance === undefined) {
         return yield* fail(`Provider instance "${input.model.instanceId}" is not available.`);
+      }
+      return { depth };
+    });
+
+  const register: ChildThreadCoordinatorShape["register"] = (input) =>
+    Effect.gen(function* () {
+      if (children.has(input.childThreadId)) {
+        return;
+      }
+      const { depth } = yield* validateSpawn(input);
+      if (hasAncestryCycle(input.parentThreadId, input.childThreadId)) {
+        return yield* fail("Sub-agent spawn would create an ancestry cycle.");
       }
       const terminal = yield* Deferred.make<ChildWaitResult>();
       const record: ChildRecord = {
@@ -1441,6 +1451,8 @@ const make = Effect.gen(function* () {
       }
 
       // Remaining non-terminal children: validate the provider instance still exists.
+      // Seed the dispatch limiter for survivors so a restart cannot launch a
+      // full new cap on top of already-running sub-agents.
       for (const childThreadId of knownChildIds) {
         if (terminalByChild.has(childThreadId)) continue;
         const record = children.get(childThreadId);
@@ -1458,7 +1470,9 @@ const make = Effect.gen(function* () {
             },
           );
           yield* settleChild(childThreadId, "killed", "provider instance removed");
+          continue;
         }
+        yield* dispatchLimiter.seedChild(childThreadId);
       }
 
       // (2b) R-B: load durable 'parent_injection' rows into the in-memory
@@ -1511,6 +1525,7 @@ const make = Effect.gen(function* () {
   );
 
   service = {
+    validateSpawn,
     register,
     waitSlice,
     assertParent,

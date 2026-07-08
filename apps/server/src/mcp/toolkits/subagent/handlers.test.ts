@@ -6,10 +6,16 @@ import {
   ProviderInstanceId,
   ThreadId,
   type ModelSelection,
+  type OrchestrationCommand,
+  type OrchestrationProjectShell,
   type OrchestrationThread,
 } from "@t3tools/contracts";
 import * as NodeServices from "@effect/platform-node/NodeServices";
+import * as Crypto from "effect/Crypto";
+import * as DateTime from "effect/DateTime";
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
+import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as Stream from "effect/Stream";
 import * as Option from "effect/Option";
@@ -21,6 +27,7 @@ import {
   type ChildThreadCoordinatorShape,
   type WaitSliceResult,
 } from "../../../orchestration/Services/ChildThreadCoordinator.ts";
+import { GitWorkflowService } from "../../../git/GitWorkflowService.ts";
 import { ActiveChildThreadCoordinatorLive } from "../../../orchestration/Layers/ChildThreadCoordinator.ts";
 import {
   ActiveBootstrapTurnStartDispatcherLive,
@@ -38,8 +45,12 @@ import {
   type ScheduledTask,
 } from "../../../persistence/Services/ScheduledTasks.ts";
 import { ProviderInstanceRegistry } from "../../../provider/Services/ProviderInstanceRegistry.ts";
+import * as VcsDriverRegistry from "../../../vcs/VcsDriverRegistry.ts";
 import { SubagentToolkitRegistrationLive } from "../../McpHttpServer.ts";
 import * as McpInvocationContext from "../../McpInvocationContext.ts";
+import { ThreadStartRuntimeLive } from "../thread/handlers.ts";
+import { ThreadStartToolError } from "../thread/tools.ts";
+import * as SubagentDispatchLimiter from "./SubagentDispatchLimiter.ts";
 import { SubagentRuntimeLive } from "./handlers.ts";
 
 const environmentId = EnvironmentId.make("environment-subagent-test");
@@ -49,6 +60,23 @@ const childThreadId = ThreadId.make("thread-subagent-child");
 const codexModel: ModelSelection = {
   instanceId: ProviderInstanceId.make("codex"),
   model: "gpt-5-codex",
+};
+const parentProject: OrchestrationProjectShell = {
+  id: projectId,
+  title: "Project",
+  workspaceRoot: "/repo",
+  repositoryIdentity: {
+    canonicalKey: "git-local:/repo",
+    locator: {
+      source: "git-local",
+      rootPath: "/repo",
+    },
+    rootPath: "/repo",
+  },
+  defaultModelSelection: codexModel,
+  scripts: [],
+  createdAt: "2026-06-17T09:00:00.000Z",
+  updatedAt: "2026-06-17T09:00:00.000Z",
 };
 
 const invocation = {
@@ -72,6 +100,18 @@ const client = McpSchema.McpServerClient.of({
 });
 
 const unsupported = () => Effect.die(new Error("Unsupported call in subagent test")) as never;
+
+const TestCryptoLive = Layer.sync(Crypto.Crypto, () => {
+  let nextByte = 0;
+  return Crypto.make({
+    randomBytes: (size) =>
+      Uint8Array.from({ length: size }, () => {
+        nextByte = (nextByte + 1) % 256;
+        return nextByte;
+      }),
+    digest: (_algorithm, data) => Effect.succeed(data),
+  });
+});
 
 let childDetailTurnState: "completed" | "running" | "error" | "interrupted" = "completed";
 let childDetailLatestTurnId = "turn-1" as never;
@@ -154,6 +194,8 @@ const makeChildShell = (turnState: "completed" | "running" = "completed") => ({
 // tool call. Each test sets the slice result / records the side effects it
 // asserts on.
 let waitSliceResult: WaitSliceResult | null = null;
+let failCoordinatorRegister = false;
+const engineCommands: OrchestrationCommand[] = [];
 let childDetailDelayMs = 0;
 let childDetailUnavailable = false;
 // R-C seams: the child's turn state and its provider driver kind drive the
@@ -257,7 +299,8 @@ const projectionLayer = Layer.succeed(ProjectionSnapshotQuery, {
   getSnapshotSequence: () => unsupported(),
   getCounts: () => unsupported(),
   getActiveProjectByWorkspaceRoot: () => unsupported(),
-  getProjectShellById: () => unsupported(),
+  getProjectShellById: (id) =>
+    Effect.succeed(id === projectId ? Option.some(parentProject) : Option.none()),
   getFirstActiveThreadIdByProjectId: () => unsupported(),
   getThreadCheckpointContext: () => unsupported(),
   getFullThreadDiffContext: () => unsupported(),
@@ -283,7 +326,11 @@ const projectionLayer = Layer.succeed(ProjectionSnapshotQuery, {
 });
 
 const coordinatorLayer = Layer.succeed(ChildThreadCoordinator, {
-  register: () => Effect.void,
+  validateSpawn: () => Effect.succeed({ depth: 1 }),
+  register: () =>
+    failCoordinatorRegister
+      ? Effect.fail(new ThreadStartToolError({ message: "register failed" }))
+      : Effect.void,
   waitSlice: () => (waitSliceResult ? Effect.succeed(waitSliceResult) : unsupported()),
   assertParent: () => Effect.void,
   promoteToWake: (ids) => Effect.sync(() => void promotedCalls.push(ids)),
@@ -310,7 +357,11 @@ const coordinatorLayer = Layer.succeed(ChildThreadCoordinator, {
 
 const engineLayer = Layer.succeed(OrchestrationEngineService, {
   readEvents: () => unsupported(),
-  dispatch: () => unsupported(),
+  dispatch: (command) =>
+    Effect.sync(() => {
+      engineCommands.push(command);
+      return { sequence: engineCommands.length };
+    }),
   streamDomainEvents: unsupported(),
 });
 
@@ -341,6 +392,63 @@ const pendingDispatchesLayer = Layer.succeed(PendingDispatchRepository, {
   deleteByIds: () => Effect.void,
 });
 
+const gitWorkflowLayer = Layer.mock(GitWorkflowService)({
+  listRefs: () =>
+    Effect.succeed({
+      refs: [
+        {
+          name: "main",
+          current: false,
+          isDefault: true,
+          isRemote: false,
+          worktreePath: null,
+        },
+      ],
+      isRepo: true,
+      hasPrimaryRemote: true,
+      nextCursor: null,
+      totalCount: 1,
+    }),
+  status: () =>
+    Effect.succeed({
+      isRepo: true,
+      hasPrimaryRemote: true,
+      isDefaultRef: false,
+      refName: "main",
+      hasWorkingTreeChanges: false,
+      workingTree: {
+        files: [],
+        insertions: 0,
+        deletions: 0,
+      },
+      hasUpstream: true,
+      aheadCount: 0,
+      behindCount: 0,
+      aheadOfDefaultCount: 0,
+      pr: null,
+    }),
+});
+
+const vcsFreshness = {
+  source: "live-local" as const,
+  observedAt: DateTime.makeUnsafe("1970-01-01T00:00:00.000Z"),
+  expiresAt: Option.none(),
+};
+
+const vcsDriverRegistryLayer = Layer.mock(VcsDriverRegistry.VcsDriverRegistry)({
+  detect: () =>
+    Effect.succeed({
+      kind: "git",
+      repository: {
+        kind: "git",
+        rootPath: "/repo",
+        metadataPath: "/repo/.git",
+        freshness: vcsFreshness,
+      },
+      driver: {} as VcsDriverRegistry.VcsDriverHandle["driver"],
+    } satisfies VcsDriverRegistry.VcsDriverHandle),
+});
+
 // Recording bootstrap dispatcher: the R-C "now"/"queued" steer path goes through
 // dispatchActive -> this dispatcher, so the test can assert a turn was started.
 const dispatcherLayer = Layer.succeed(BootstrapTurnStartDispatcher, {
@@ -353,6 +461,7 @@ const dispatcherLayer = Layer.succeed(BootstrapTurnStartDispatcher, {
 
 const RuntimeActivationLive = Layer.mergeAll(
   SubagentRuntimeLive,
+  ThreadStartRuntimeLive,
   ActiveChildThreadCoordinatorLive,
   ActiveBootstrapTurnStartDispatcherLive,
 ).pipe(
@@ -363,6 +472,10 @@ const RuntimeActivationLive = Layer.mergeAll(
   Layer.provideMerge(providerRegistryLayer),
   Layer.provideMerge(scheduledTasksLayer),
   Layer.provideMerge(pendingDispatchesLayer),
+  Layer.provideMerge(gitWorkflowLayer),
+  Layer.provideMerge(vcsDriverRegistryLayer),
+  Layer.provideMerge(SubagentDispatchLimiter.layerTest(1)),
+  Layer.provideMerge(TestCryptoLive),
   Layer.provideMerge(NodeServices.layer),
 );
 
@@ -767,6 +880,66 @@ describe("SubagentToolkit", () => {
         expect(result.isError).toBe(true);
       }),
     ).pipe(Effect.provide(TestLayer)),
+  );
+
+  it.effect("releases the dispatch lease when cleanup delete succeeds after register failure", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const server = yield* McpServer.McpServer;
+        const limiter = yield* SubagentDispatchLimiter.SubagentDispatchLimiter;
+        childDriverKind = "codex";
+        failCoordinatorRegister = true;
+        engineCommands.length = 0;
+        dispatchedTurns.length = 0;
+
+        const result = yield* server
+          .callTool({
+            name: "t3_spawn_subagent",
+            arguments: {
+              prompt: "cleanup after failed registration",
+              title: "cleanup after failed registration",
+              mode: "current_checkout",
+            },
+          })
+          .pipe(
+            Effect.provideService(McpInvocationContext.McpInvocationContext, invocation),
+            Effect.provideService(McpSchema.McpServerClient, client),
+          );
+
+        expect(result.isError).toBe(true);
+        expect(dispatchedTurns.length).toBe(1);
+        expect(engineCommands.map((command) => command.type)).toEqual([
+          "thread.parent.set",
+          "thread.delete",
+        ]);
+
+        const acquired = yield* Deferred.make<SubagentDispatchLimiter.SubagentDispatchLease>();
+        const acquireFiber = yield* limiter.acquire.pipe(
+          Effect.flatMap((lease) => Deferred.succeed(acquired, lease)),
+          Effect.forkChild,
+        );
+        yield* Effect.yieldNow;
+        const acquiredLease = yield* Deferred.poll(acquired);
+        if (Option.isSome(acquiredLease)) {
+          const lease = yield* acquiredLease.value;
+          yield* limiter.release(lease);
+          yield* Fiber.join(acquireFiber);
+        } else {
+          yield* Fiber.interrupt(acquireFiber);
+        }
+        expect(Option.isSome(acquiredLease)).toBe(true);
+      }),
+    ).pipe(
+      Effect.ensuring(
+        Effect.sync(() => {
+          childDriverKind = undefined;
+          failCoordinatorRegister = false;
+          engineCommands.length = 0;
+          dispatchedTurns.length = 0;
+        }),
+      ),
+      Effect.provide(TestLayer),
+    ),
   );
 
   it.effect("R-A: wait auto-promotes a still-running child once the budget elapses", () =>
