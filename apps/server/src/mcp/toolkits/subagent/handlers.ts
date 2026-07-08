@@ -85,6 +85,8 @@ import {
 const nowIso = Effect.map(DateTime.now, DateTime.formatIso);
 const isThreadStartToolError = Schema.is(ThreadStartToolError);
 const WAIT_PROJECTION_ENRICHMENT_TIMEOUT_MS = 250;
+const FOREGROUND_SPAWN_PENDING_WARNING =
+  "Sub-agent is still running after the initial foreground wait; returning launch metadata now. Use t3_wait_subagent to wait for terminal delivery, or stop polling and let the parent wake automatically when it completes.";
 
 const fail = (message: string) => new ThreadStartToolError({ message });
 
@@ -107,6 +109,9 @@ const requireSpawnRuntime = (): Effect.Effect<ActiveThreadStartRuntime, ThreadSt
 
 const clamp = (value: number, min: number, max: number): number =>
   value < min ? min : value > max ? max : value;
+
+const appendWarning = (existing: string | undefined, warning: string): string =>
+  existing === undefined ? warning : `${existing} ${warning}`;
 
 /**
  * Derive a turn count from a thread detail: the highest checkpoint turn count,
@@ -242,6 +247,19 @@ const waitTerminalStatusOf = (
   if (state === "completed") return "completed";
   if (state === undefined || state === "running") return null;
   return "failed";
+};
+
+const reliableWaitTerminalStatusOf = (
+  thread: Pick<OrchestrationThread, "latestTurn" | "messages" | "session">,
+): "completed" | "failed" | null => {
+  const projectedStatus = waitTerminalStatusOf(thread);
+  if (projectedStatus === null) return null;
+  const session = thread.session;
+  if (session?.status === "stopped" || session?.status === "error") return projectedStatus;
+  if (session?.activeTurnId != null && thread.latestTurn?.turnId === session.activeTurnId) {
+    return projectedStatus;
+  }
+  return null;
 };
 
 const isWaitTerminal = (status: string): boolean =>
@@ -393,41 +411,42 @@ const spawnSubagent = Effect.fn("SubagentToolkit.spawn")(function* (input: Spawn
   // runtime does not re-resolve against a possibly-different registry snapshot —
   // the coordinator record and the started thread then share one selection.
   const { model: _resolvedModel, ...threadStartInputWithSelection } = threadStartInput;
-  const { started, spawnedAtMs } = yield* Effect.uninterruptibleMask((restore) =>
-    Effect.gen(function* () {
-      const dispatchLease = yield* restore(runtime.dispatchLimiter.acquire);
-      const releaseDispatchLease: Effect.Effect<void, never, never> =
-        runtime.dispatchLimiter.release(dispatchLease);
-      const started = yield* spawnRuntime(
-        { ...threadStartInputWithSelection, modelSelection },
-        invocation,
-        {
-          providerSessionDetached: detached,
-        },
-      ).pipe(Effect.onError(() => releaseDispatchLease));
-      yield* runtime.dispatchLimiter.bindChild(dispatchLease, started.threadId);
-      const cleanupAndReleaseFromDelete = (reason: string) =>
-        cleanupStartedChild(runtime, started.threadId, reason, releaseDispatchLease);
-      const spawnedAtMs = yield* Effect.clockWith((clock) => clock.currentTimeMillis);
+  const { started, spawnedAtMs, cleanupAndReleaseFromDelete } = yield* Effect.uninterruptibleMask(
+    (restore) =>
+      Effect.gen(function* () {
+        const dispatchLease = yield* restore(runtime.dispatchLimiter.acquire);
+        const releaseDispatchLease: Effect.Effect<void, never, never> =
+          runtime.dispatchLimiter.release(dispatchLease);
+        const started = yield* spawnRuntime(
+          { ...threadStartInputWithSelection, modelSelection },
+          invocation,
+          {
+            providerSessionDetached: detached,
+          },
+        ).pipe(Effect.onError(() => releaseDispatchLease));
+        yield* runtime.dispatchLimiter.bindChild(dispatchLease, started.threadId);
+        const cleanupAndReleaseFromDelete = (reason: string) =>
+          cleanupStartedChild(runtime, started.threadId, reason, releaseDispatchLease);
+        const spawnedAtMs = yield* Effect.clockWith((clock) => clock.currentTimeMillis);
 
-      // Persist the parent linkage before registration relies on the in-memory
-      // limiter binding; restart reconciliation seeds running children from
-      // this durable link.
-      yield* dispatchParentSet(runtime, started.threadId, invocation.threadId).pipe(
-        Effect.mapError((error) => toToolError(error, "Failed to link sub-agent to parent.")),
-        Effect.onError(() => cleanupAndReleaseFromDelete("parent link failed")),
-      );
-      yield* coordinator
-        .register({
-          parentThreadId: invocation.threadId,
-          childThreadId: started.threadId,
-          detached,
-          model: modelSelection,
-          spawnedAtMs,
-        })
-        .pipe(Effect.onError(() => cleanupAndReleaseFromDelete("coordinator register failed")));
-      return { started, spawnedAtMs };
-    }),
+        // Persist the parent linkage before registration relies on the in-memory
+        // limiter binding; restart reconciliation seeds running children from
+        // this durable link.
+        yield* dispatchParentSet(runtime, started.threadId, invocation.threadId).pipe(
+          Effect.mapError((error) => toToolError(error, "Failed to link sub-agent to parent.")),
+          Effect.onError(() => cleanupAndReleaseFromDelete("parent link failed")),
+        );
+        yield* coordinator
+          .register({
+            parentThreadId: invocation.threadId,
+            childThreadId: started.threadId,
+            detached,
+            model: modelSelection,
+            spawnedAtMs,
+          })
+          .pipe(Effect.onError(() => cleanupAndReleaseFromDelete("coordinator register failed")));
+        return { started, spawnedAtMs, cleanupAndReleaseFromDelete };
+      }),
   );
 
   const base: SpawnSubagentOutput = {
@@ -448,12 +467,28 @@ const spawnSubagent = Effect.fn("SubagentToolkit.spawn")(function* (input: Spawn
     WAIT_TIMEOUT_MAX_SECONDS,
   );
   const budgetDeadlineMs = spawnedAtMs + budgetSeconds * 1_000;
-  const settled = yield* waitForChildren(coordinator, [started.threadId], "all", budgetDeadlineMs);
-  const row = settled.results[0];
+  const initialSlice = yield* coordinator.waitSlice({
+    childThreadIds: [started.threadId],
+    mode: "all",
+    budgetDeadlineMs,
+  });
+  const row = initialSlice.results[0];
+  if (row !== undefined && isWaitTerminal(row.status)) {
+    return {
+      ...base,
+      status: row.status,
+      finalAssistantText: row.finalAssistantText ?? null,
+    };
+  }
+
+  yield* coordinator
+    .promoteToWake([started.threadId])
+    .pipe(Effect.onError(() => cleanupAndReleaseFromDelete("foreground promotion failed")));
   return {
     ...base,
-    status: row?.status ?? "timeout",
-    finalAssistantText: row?.finalAssistantText ?? null,
+    warning: appendWarning(base.warning, FOREGROUND_SPAWN_PENDING_WARNING),
+    status: "running",
+    finalAssistantText: null,
   };
 });
 
@@ -501,28 +536,6 @@ const cleanupStartedChild = (
     Effect.ensuring(releaseDispatchLease),
   );
 
-/**
- * Re-call the coordinator's bounded `waitSlice` until every requested child is
- * settled, the wait mode is satisfied, or the logical budget is exhausted. Each
- * slice is bounded (never a single long HTTP hold); this loop is server-side so
- * a foreground spawn returns one consolidated result.
- */
-const waitForChildren = (
-  coordinator: ChildThreadCoordinatorShape,
-  childThreadIds: ReadonlyArray<ThreadId>,
-  mode: "all" | "any",
-  budgetDeadlineMs: number,
-): Effect.Effect<WaitSliceResult> =>
-  coordinator
-    .waitSlice({ childThreadIds, mode, budgetDeadlineMs })
-    .pipe(
-      Effect.flatMap((result) =>
-        result.pending
-          ? waitForChildren(coordinator, childThreadIds, mode, budgetDeadlineMs)
-          : Effect.succeed(result),
-      ),
-    );
-
 const steerSubagent = Effect.fn("SubagentToolkit.steer")(function* (input: SteerSubagentInput) {
   const invocation = yield* requireInvocation;
   const runtime = yield* requireRuntime();
@@ -565,6 +578,8 @@ const steerSubagent = Effect.fn("SubagentToolkit.steer")(function* (input: Steer
       error: null,
       status: null,
       commandId: null,
+      deliveredByWait: false,
+      waitCancellable: false,
       createdAt: IsoDateTime.make(createdAt),
     };
     yield* runtime.pendingDispatches
@@ -633,9 +648,15 @@ const parseWaitStartMs = (resumeToken: string | undefined, nowMs: number): numbe
 };
 
 const waitSubagent = Effect.fn("SubagentToolkit.wait")(function* (input: WaitSubagentInput) {
-  yield* requireInvocation;
+  const invocation = yield* requireInvocation;
   const runtime = yield* requireRuntime();
   const coordinator = yield* requireCoordinator();
+
+  yield* Effect.forEach(
+    input.childThreadIds,
+    (childThreadId) => coordinator.assertParent(invocation.threadId, childThreadId),
+    { discard: true },
+  );
 
   const budgetSeconds = clamp(
     input.timeoutSeconds ?? WAIT_TIMEOUT_DEFAULT_SECONDS,
@@ -666,40 +687,67 @@ const waitSubagent = Effect.fn("SubagentToolkit.wait")(function* (input: WaitSub
   });
 
   const afterSliceMs = yield* Effect.clockWith((clock) => clock.currentTimeMillis);
-  const effectiveRows: ReadonlyArray<WaitSliceResult["results"][number]> = yield* Effect.forEach(
+  const enrichedRows = yield* Effect.forEach(
     slice.results,
-    (row) => {
-      if (row.status !== "pending" && row.status !== "timeout") return Effect.succeed(row);
+    (
+      row,
+    ): Effect.Effect<
+      {
+        readonly row: WaitSliceResult["results"][number];
+        readonly projectionTerminal: boolean;
+      },
+      ThreadStartToolError,
+      never
+    > => {
+      if (row.status !== "pending" && row.status !== "timeout") {
+        return Effect.succeed({ row, projectionTerminal: false });
+      }
       return loadThreadDetail(runtime, row.childThreadId).pipe(
         Effect.timeoutOption(`${WAIT_PROJECTION_ENRICHMENT_TIMEOUT_MS} millis`),
         Effect.map((thread) =>
           Option.match(thread, {
-            onNone: () => row,
-            onSome: (detailOption): WaitSliceResult["results"][number] =>
+            onNone: () => ({ row, projectionTerminal: false }),
+            onSome: (
+              detailOption,
+            ): {
+              readonly row: WaitSliceResult["results"][number];
+              readonly projectionTerminal: boolean;
+            } =>
               Option.match(detailOption, {
-                onNone: () => row,
-                onSome: (detail): WaitSliceResult["results"][number] => {
-                  const projectedStatus = waitTerminalStatusOf(detail);
-                  if (projectedStatus === null) return row;
+                onNone: () => ({ row, projectionTerminal: false }),
+                onSome: (
+                  detail,
+                ): {
+                  readonly row: WaitSliceResult["results"][number];
+                  readonly projectionTerminal: boolean;
+                } => {
+                  const projectedStatus = reliableWaitTerminalStatusOf(detail);
+                  if (projectedStatus === null) return { row, projectionTerminal: false };
                   if (projectedStatus === "completed") {
                     return {
-                      childThreadId: row.childThreadId,
-                      status: "completed",
-                      finalAssistantText:
-                        row.finalAssistantText ?? finalAssistantTextFromThread(detail),
-                      error: null,
+                      row: {
+                        childThreadId: row.childThreadId,
+                        status: "completed",
+                        finalAssistantText:
+                          row.finalAssistantText ?? finalAssistantTextFromThread(detail),
+                        error: null,
+                      },
+                      projectionTerminal: true,
                     };
                   }
                   if (projectedStatus === "failed") {
                     return {
-                      childThreadId: row.childThreadId,
-                      status: "failed",
-                      finalAssistantText:
-                        row.finalAssistantText ?? finalAssistantTextFromThread(detail),
-                      error: `Child thread ended with status ${projectedStatus}.`,
+                      row: {
+                        childThreadId: row.childThreadId,
+                        status: "failed",
+                        finalAssistantText:
+                          row.finalAssistantText ?? finalAssistantTextFromThread(detail),
+                        error: `Child thread ended with status ${projectedStatus}.`,
+                      },
+                      projectionTerminal: true,
                     };
                   }
-                  return row;
+                  return { row, projectionTerminal: false };
                 },
               }),
           }),
@@ -708,6 +756,9 @@ const waitSubagent = Effect.fn("SubagentToolkit.wait")(function* (input: WaitSub
     },
     { concurrency: "unbounded" },
   );
+  const effectiveRows: ReadonlyArray<WaitSliceResult["results"][number]> = enrichedRows.map(
+    (entry) => entry.row,
+  );
   const effectiveSlice: WaitSliceResult = {
     results: effectiveRows,
     settledCount: effectiveRows.filter((row) => isWaitTerminal(row.status)).length,
@@ -715,6 +766,22 @@ const waitSubagent = Effect.fn("SubagentToolkit.wait")(function* (input: WaitSub
     pending: pendingForMode(effectiveRows, input.mode ?? "all"),
     resumeToken: slice.resumeToken,
   };
+  const coordinatorTerminalIds = new Set(
+    slice.results
+      .filter((row) => isWaitTerminal(row.status))
+      .map((row) => String(row.childThreadId)),
+  );
+  const projectionTerminalIds = new Set(
+    enrichedRows
+      .filter((entry) => entry.projectionTerminal)
+      .map((entry) => String(entry.row.childThreadId)),
+  );
+  const waitDeliveredRows = effectiveSlice.results.filter(
+    (row) =>
+      isWaitTerminal(row.status) &&
+      (coordinatorTerminalIds.has(String(row.childThreadId)) ||
+        projectionTerminalIds.has(String(row.childThreadId))),
+  );
   // Auto-promote (R-A): the 90s budget elapsed and one+ children are still
   // running. The coordinator maps "pending when the supplied deadline elapsed"
   // to status "timeout"; when the supplied deadline was our auto-promote cap
@@ -766,6 +833,10 @@ const waitSubagent = Effect.fn("SubagentToolkit.wait")(function* (input: WaitSub
       ),
     { concurrency: "unbounded" },
   );
+
+  if (waitDeliveredRows.length > 0) {
+    yield* coordinator.markWaitDelivered(waitDeliveredRows);
+  }
 
   return {
     results,

@@ -71,6 +71,8 @@ export interface WaitSliceResult {
   readonly resumeToken: string;
 }
 
+export type WaitDeliveredMark = ThreadId | WaitChildResult;
+
 export interface RegisterChildInput {
   readonly parentThreadId: ThreadId;
   readonly childThreadId: ThreadId;
@@ -149,6 +151,13 @@ export interface ChildThreadCoordinatorShape {
    * delivered to the waiter). A no-op for unknown ids.
    */
   readonly promoteToWake: (childThreadIds: ReadonlyArray<ThreadId>) => Effect.Effect<void>;
+
+  /**
+   * Mark promoted wake fallbacks as already delivered by an explicit waiter.
+   * Used when a terminal result is returned outside the coordinator's Deferred
+   * path, such as handler-side projection enrichment.
+   */
+  readonly markWaitDelivered: (children: ReadonlyArray<WaitDeliveredMark>) => Effect.Effect<void>;
 
   /** Whether the parent has queued sub-agent completion injections awaiting drain. */
   readonly hasPendingInjections: (parentThreadId: ThreadId) => Effect.Effect<boolean>;

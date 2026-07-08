@@ -25,6 +25,8 @@ const makeRow = (overrides: Partial<PendingDispatch> = {}): PendingDispatch =>
     error: null,
     status: null,
     commandId: null,
+    deliveredByWait: false,
+    waitCancellable: false,
     createdAt: "2026-06-17T09:00:00.000Z",
     ...overrides,
   }) satisfies PendingDispatch;
@@ -146,6 +148,31 @@ layer("PendingDispatchRepository", (it) => {
       const byId = new Map(rows.map((row) => [row.id as string, row]));
       assert.equal(byId.get("claim-a")?.commandId, "server:subagent-wake:claim-a");
       assert.equal(byId.get("claim-b")?.commandId, null);
+    }),
+  );
+
+  it.effect("markWaitDelivered stamps delivered_by_wait and is a no-op for an empty id list", () =>
+    Effect.gen(function* () {
+      const repository = yield* PendingDispatchRepository;
+      const parent = ThreadId.make("parent-delivered");
+
+      yield* repository.insert(
+        makeRow({ id: PendingDispatchId.make("delivered-a"), targetThreadId: parent }),
+      );
+      yield* repository.insert(
+        makeRow({ id: PendingDispatchId.make("delivered-b"), targetThreadId: parent }),
+      );
+
+      yield* repository.markWaitDelivered({ ids: [] });
+      yield* repository.markWaitDelivered({ ids: [PendingDispatchId.make("delivered-a")] });
+
+      const rows = yield* repository.listByTarget({
+        kind: "parent_injection",
+        targetThreadId: parent,
+      });
+      const byId = new Map(rows.map((row) => [row.id as string, row]));
+      assert.equal(byId.get("delivered-a")?.deliveredByWait, true);
+      assert.equal(byId.get("delivered-b")?.deliveredByWait, false);
     }),
   );
 
