@@ -1,4 +1,5 @@
 import {
+  EnvironmentAuthorizationError,
   ORCHESTRATION_WS_METHODS,
   type EnvironmentId,
   type OrchestrationShellSnapshot,
@@ -9,6 +10,8 @@ import * as Cause from "effect/Cause";
 import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
 import * as Queue from "effect/Queue";
+import * as Ref from "effect/Ref";
+import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 import * as SubscriptionRef from "effect/SubscriptionRef";
 import { AsyncResult, Atom } from "effect/unstable/reactivity";
@@ -44,7 +47,25 @@ function shellStatusForSnapshot(
   return Option.isSome(snapshot) ? "cached" : "empty";
 }
 
+function synchronizingStatusForSnapshot(
+  snapshot: Option.Option<OrchestrationShellSnapshot>,
+): EnvironmentShellStatus {
+  return Option.isSome(snapshot) ? "synchronizing" : "empty";
+}
+
 const SHELL_SYNCHRONIZATION_ERROR_MESSAGE = "Could not synchronize environment data.";
+const SHELL_REPLAY_STALL_TIMEOUT = "5 seconds";
+const SHELL_EXPECTED_FAILURE_RETRY_DELAY = "250 millis";
+const isEnvironmentAuthorizationError = Schema.is(EnvironmentAuthorizationError);
+
+function isTerminalShellSubscriptionFailure(cause: Cause.Cause<unknown>): boolean {
+  return (
+    cause.reasons.length > 0 &&
+    cause.reasons.every(
+      (reason) => reason._tag === "Fail" && isEnvironmentAuthorizationError(reason.error),
+    )
+  );
+}
 
 export const makeEnvironmentShellState = Effect.fn("EnvironmentShellState.make")(function* () {
   const supervisor = yield* EnvironmentSupervisor;
@@ -68,6 +89,9 @@ export const makeEnvironmentShellState = Effect.fn("EnvironmentShellState.make")
     error: Option.none(),
   });
   const persistence = yield* Queue.sliding<OrchestrationShellSnapshot>(1);
+  const serverItemSeen = yield* Ref.make(false);
+  const replayWatchdogEpoch = yield* Ref.make(0);
+  const subscribeInput: { afterSequence?: number } = {};
 
   const persist = Effect.fn("EnvironmentShellState.persist")(function* (
     snapshot: OrchestrationShellSnapshot,
@@ -117,19 +141,60 @@ export const makeEnvironmentShellState = Effect.fn("EnvironmentShellState.make")
       Effect.andThen(
         SubscriptionRef.update(state, (current) => ({
           ...current,
-          status: shellStatusForSnapshot(current.snapshot),
+          status: synchronizingStatusForSnapshot(current.snapshot),
           error: Option.some(SHELL_SYNCHRONIZATION_ERROR_MESSAGE),
         })),
       ),
     );
 
+  const setExpectedStreamError = Effect.fn("EnvironmentShellState.setExpectedStreamError")(
+    function* (cause: Cause.Cause<unknown>) {
+      yield* setStreamError(Cause.squash(cause));
+      if (isTerminalShellSubscriptionFailure(cause)) {
+        return yield* Effect.never;
+      }
+    },
+  );
+
   const applyItem = Effect.fn("EnvironmentShellState.applyItem")(function* (
     item: OrchestrationShellStreamItem,
   ) {
+    if (item.kind === "caught-up") {
+      const current = yield* SubscriptionRef.get(state);
+      if (Option.isNone(current.snapshot)) {
+        yield* SubscriptionRef.set(state, {
+          ...current,
+          error: Option.none(),
+        });
+        return;
+      }
+
+      const nextSnapshot =
+        item.sequence > current.snapshot.value.snapshotSequence
+          ? { ...current.snapshot.value, snapshotSequence: item.sequence }
+          : current.snapshot.value;
+      yield* SubscriptionRef.set(state, {
+        snapshot: Option.some(nextSnapshot),
+        status: "live",
+        error: Option.none(),
+      });
+      subscribeInput.afterSequence = nextSnapshot.snapshotSequence;
+      if (nextSnapshot !== current.snapshot.value) {
+        yield* Queue.offer(persistence, nextSnapshot);
+      }
+      return;
+    }
+
     const current = yield* SubscriptionRef.get(state);
     const nextSnapshot =
       item.kind === "snapshot"
-        ? item.snapshot
+        ? Option.match(current.snapshot, {
+            onNone: () => item.snapshot,
+            onSome: (snapshot) =>
+              item.force === true || item.snapshot.snapshotSequence >= snapshot.snapshotSequence
+                ? item.snapshot
+                : snapshot,
+          })
         : Option.match(current.snapshot, {
             onNone: () => null,
             onSome: (snapshot) =>
@@ -146,7 +211,75 @@ export const makeEnvironmentShellState = Effect.fn("EnvironmentShellState.make")
       status: "live",
       error: Option.none(),
     });
+    subscribeInput.afterSequence = nextSnapshot.snapshotSequence;
     yield* Queue.offer(persistence, nextSnapshot);
+  });
+
+  const applyRecoverySnapshot = Effect.fn("EnvironmentShellState.applyRecoverySnapshot")(function* (
+    snapshot: OrchestrationShellSnapshot,
+  ) {
+    const current = yield* SubscriptionRef.get(state);
+    const nextSnapshot = Option.match(current.snapshot, {
+      onNone: () => snapshot,
+      onSome: (currentSnapshot) =>
+        snapshot.snapshotSequence >= currentSnapshot.snapshotSequence ? snapshot : currentSnapshot,
+    });
+
+    yield* SubscriptionRef.set(state, {
+      snapshot: Option.some(nextSnapshot),
+      status: "synchronizing",
+      error: Option.none(),
+    });
+    subscribeInput.afterSequence = nextSnapshot.snapshotSequence;
+    if (Option.isNone(current.snapshot) || nextSnapshot !== current.snapshot.value) {
+      yield* Queue.offer(persistence, nextSnapshot);
+    }
+  });
+
+  const recoverFromStalledReplay = Effect.fn("EnvironmentShellState.recoverFromStalledReplay")(
+    function* (epoch: number) {
+      if ((yield* Ref.get(replayWatchdogEpoch)) !== epoch || (yield* Ref.get(serverItemSeen))) {
+        return;
+      }
+
+      yield* SubscriptionRef.update(state, (current) => ({
+        ...current,
+        status: Option.isSome(current.snapshot) ? "synchronizing" : current.status,
+      }));
+
+      const prepared = yield* SubscriptionRef.get(supervisor.prepared);
+      if (Option.isNone(prepared)) {
+        yield* setStreamError(new Error("Shell replay stalled before the server caught up."));
+        return;
+      }
+
+      const snapshot = yield* snapshotLoader.load(prepared.value);
+      if ((yield* Ref.get(replayWatchdogEpoch)) !== epoch || (yield* Ref.get(serverItemSeen))) {
+        return;
+      }
+      if (Option.isSome(snapshot)) {
+        yield* applyRecoverySnapshot(snapshot.value);
+        return;
+      }
+
+      yield* setStreamError(
+        new Error("Shell replay stalled and snapshot refresh was unavailable."),
+      );
+    },
+  );
+
+  const armReplayWatchdog = Effect.fn("EnvironmentShellState.armReplayWatchdog")(function* () {
+    const current = yield* SubscriptionRef.get(state);
+    if (Option.isNone(current.snapshot)) {
+      return;
+    }
+
+    const epoch = yield* Ref.updateAndGet(replayWatchdogEpoch, (value) => value + 1);
+    yield* Ref.set(serverItemSeen, false);
+    yield* Effect.sleep(SHELL_REPLAY_STALL_TIMEOUT).pipe(
+      Effect.andThen(recoverFromStalledReplay(epoch)),
+      Effect.forkScoped,
+    );
   });
 
   yield* Effect.forkScoped(
@@ -176,23 +309,35 @@ export const makeEnvironmentShellState = Effect.fn("EnvironmentShellState.make")
 
       if (Option.isSome(base)) {
         yield* applyItem({ kind: "snapshot", snapshot: base.value });
+        yield* armReplayWatchdog();
       }
 
-      const subscribeInput = Option.match(base, {
-        onNone: () => ({}),
-        onSome: (snapshot) => ({ afterSequence: snapshot.snapshotSequence }),
+      Option.match(base, {
+        onNone: () => {
+          delete subscribeInput.afterSequence;
+        },
+        onSome: (snapshot) => {
+          subscribeInput.afterSequence = snapshot.snapshotSequence;
+        },
       });
 
       yield* subscribe(ORCHESTRATION_WS_METHODS.subscribeShell, subscribeInput, {
-        onExpectedFailure: (cause) => setStreamError(Cause.squash(cause)),
-      }).pipe(Stream.runForEach(applyItem));
+        onExpectedFailure: setExpectedStreamError,
+        retryExpectedFailureAfter: SHELL_EXPECTED_FAILURE_RETRY_DELAY,
+      }).pipe(
+        Stream.tap(() => Ref.set(serverItemSeen, true)),
+        Stream.catchCause((cause) =>
+          Stream.fromEffect(setStreamError(Cause.squash(cause))).pipe(Stream.drain),
+        ),
+        Stream.runForEach(applyItem),
+      );
     }),
   );
   yield* SubscriptionRef.changes(supervisor.state).pipe(
     Stream.runForEach((connectionState) => {
       switch (connectionProjectionPhase(connectionState)) {
         case "synchronizing":
-          return setSynchronizing;
+          return setSynchronizing.pipe(Effect.andThen(armReplayWatchdog()));
         case "disconnected":
           return setDisconnected;
         case "ready":
