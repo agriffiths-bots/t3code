@@ -3,15 +3,31 @@ import * as SqlSchema from "effect/unstable/sql/SqlSchema";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Schema from "effect/Schema";
+import * as Struct from "effect/Struct";
 
 import { toPersistenceSqlError } from "../Errors.ts";
 import {
   ClaimPendingDispatchesInput,
+  MarkPendingDispatchesWaitDeliveredInput,
   ListPendingDispatchesByTargetInput,
   PendingDispatch,
   PendingDispatchRepository,
   type PendingDispatchRepositoryShape,
 } from "../Services/PendingDispatches.ts";
+
+const PendingDispatchDbRow = PendingDispatch.mapFields(
+  Struct.assign({
+    deliveredByWait: Schema.Number,
+    waitCancellable: Schema.Number,
+  }),
+);
+
+const toPendingDispatch = (row: Schema.Schema.Type<typeof PendingDispatchDbRow>): PendingDispatch =>
+  ({
+    ...row,
+    deliveredByWait: row.deliveredByWait === 1,
+    waitCancellable: row.waitCancellable === 1,
+  }) satisfies PendingDispatch;
 
 const makePendingDispatchRepository = Effect.gen(function* () {
   const sql = yield* SqlClient.SqlClient;
@@ -29,6 +45,8 @@ const makePendingDispatchRepository = Effect.gen(function* () {
           error,
           status,
           command_id,
+          delivered_by_wait,
+          wait_cancellable,
           created_at
         )
         VALUES (
@@ -40,6 +58,8 @@ const makePendingDispatchRepository = Effect.gen(function* () {
           ${row.error},
           ${row.status},
           ${row.commandId},
+          ${row.deliveredByWait ? 1 : 0},
+          ${row.waitCancellable ? 1 : 0},
           ${row.createdAt}
         )
         ON CONFLICT (id)
@@ -51,13 +71,15 @@ const makePendingDispatchRepository = Effect.gen(function* () {
           error = excluded.error,
           status = excluded.status,
           command_id = excluded.command_id,
+          delivered_by_wait = excluded.delivered_by_wait,
+          wait_cancellable = excluded.wait_cancellable,
           created_at = excluded.created_at
       `,
   });
 
   const listPendingDispatchRowsByTarget = SqlSchema.findAll({
     Request: ListPendingDispatchesByTargetInput,
-    Result: PendingDispatch,
+    Result: PendingDispatchDbRow,
     execute: ({ kind, targetThreadId }) =>
       sql`
         SELECT
@@ -69,6 +91,8 @@ const makePendingDispatchRepository = Effect.gen(function* () {
           error,
           status,
           command_id AS "commandId",
+          delivered_by_wait AS "deliveredByWait",
+          wait_cancellable AS "waitCancellable",
           created_at AS "createdAt"
         FROM pending_dispatches
         WHERE kind = ${kind}
@@ -79,7 +103,7 @@ const makePendingDispatchRepository = Effect.gen(function* () {
 
   const listAllPendingDispatchRows = SqlSchema.findAll({
     Request: Schema.Void,
-    Result: PendingDispatch,
+    Result: PendingDispatchDbRow,
     execute: () =>
       sql`
         SELECT
@@ -91,6 +115,8 @@ const makePendingDispatchRepository = Effect.gen(function* () {
           error,
           status,
           command_id AS "commandId",
+          delivered_by_wait AS "deliveredByWait",
+          wait_cancellable AS "waitCancellable",
           created_at AS "createdAt"
         FROM pending_dispatches
         ORDER BY created_at ASC, id ASC
@@ -107,6 +133,16 @@ const makePendingDispatchRepository = Effect.gen(function* () {
       `,
   });
 
+  const markPendingDispatchRowsWaitDelivered = SqlSchema.void({
+    Request: MarkPendingDispatchesWaitDeliveredInput,
+    execute: ({ ids }) =>
+      sql`
+        UPDATE pending_dispatches
+        SET delivered_by_wait = 1
+        WHERE ${sql.in("id", ids)}
+      `,
+  });
+
   const insert: PendingDispatchRepositoryShape["insert"] = (row) =>
     writePendingDispatchRow(row).pipe(
       Effect.mapError(toPersistenceSqlError("PendingDispatchRepository.insert:query")),
@@ -114,11 +150,13 @@ const makePendingDispatchRepository = Effect.gen(function* () {
 
   const listByTarget: PendingDispatchRepositoryShape["listByTarget"] = (input) =>
     listPendingDispatchRowsByTarget(input).pipe(
+      Effect.map((rows) => rows.map(toPendingDispatch)),
       Effect.mapError(toPersistenceSqlError("PendingDispatchRepository.listByTarget:query")),
     );
 
   const listAll: PendingDispatchRepositoryShape["listAll"] = () =>
     listAllPendingDispatchRows().pipe(
+      Effect.map((rows) => rows.map(toPendingDispatch)),
       Effect.mapError(toPersistenceSqlError("PendingDispatchRepository.listAll:query")),
     );
 
@@ -127,6 +165,15 @@ const makePendingDispatchRepository = Effect.gen(function* () {
       ? Effect.void
       : claimPendingDispatchRows(input).pipe(
           Effect.mapError(toPersistenceSqlError("PendingDispatchRepository.claim:query")),
+        );
+
+  const markWaitDelivered: PendingDispatchRepositoryShape["markWaitDelivered"] = (input) =>
+    input.ids.length === 0
+      ? Effect.void
+      : markPendingDispatchRowsWaitDelivered(input).pipe(
+          Effect.mapError(
+            toPersistenceSqlError("PendingDispatchRepository.markWaitDelivered:query"),
+          ),
         );
 
   const deleteByIds: PendingDispatchRepositoryShape["deleteByIds"] = (ids) =>
@@ -145,6 +192,7 @@ const makePendingDispatchRepository = Effect.gen(function* () {
     listByTarget,
     listAll,
     claim,
+    markWaitDelivered,
     deleteByIds,
   } satisfies PendingDispatchRepositoryShape;
 });

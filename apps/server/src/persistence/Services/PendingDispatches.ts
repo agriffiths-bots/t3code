@@ -39,6 +39,17 @@ export const PendingDispatch = Schema.Struct({
    * no-op and an un-landed turn fire — independent of how rows re-batch.
    */
   commandId: Schema.NullOr(Schema.String),
+  /**
+   * True when a foreground promoted child result has already been returned by
+   * t3_wait_subagent. The row remains durable until the parent turn completes;
+   * then the coordinator prunes it instead of dispatching a duplicate wake.
+   */
+  deliveredByWait: Schema.Boolean,
+  /**
+   * True only for parent wakes created when a foreground wait is promoted to the
+   * wake-on-completion path. Detached child wakes remain non-cancellable by wait.
+   */
+  waitCancellable: Schema.Boolean,
   createdAt: IsoDateTime,
 });
 export type PendingDispatch = typeof PendingDispatch.Type;
@@ -48,6 +59,12 @@ export const ClaimPendingDispatchesInput = Schema.Struct({
   commandId: Schema.String,
 });
 export type ClaimPendingDispatchesInput = typeof ClaimPendingDispatchesInput.Type;
+
+export const MarkPendingDispatchesWaitDeliveredInput = Schema.Struct({
+  ids: Schema.Array(PendingDispatchId),
+});
+export type MarkPendingDispatchesWaitDeliveredInput =
+  typeof MarkPendingDispatchesWaitDeliveredInput.Type;
 
 export const ListPendingDispatchesByTargetInput = Schema.Struct({
   kind: PendingDispatchKind,
@@ -83,6 +100,14 @@ export interface PendingDispatchRepositoryShape {
    */
   readonly claim: (
     input: ClaimPendingDispatchesInput,
+  ) => Effect.Effect<void, ProjectionRepositoryError>;
+
+  /**
+   * Durably mark rows whose child result was delivered through t3_wait_subagent
+   * before the parent turn committed. A no-op for an empty id list.
+   */
+  readonly markWaitDelivered: (
+    input: MarkPendingDispatchesWaitDeliveredInput,
   ) => Effect.Effect<void, ProjectionRepositoryError>;
 
   /**

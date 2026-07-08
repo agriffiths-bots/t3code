@@ -53,6 +53,10 @@ import Migration0038 from "./Migrations/038_ScheduledTasksModelSelection.ts";
 import Migration0039 from "./Migrations/039_ProjectionThreadWorktreeRemovable.ts";
 import Migration0040 from "./Migrations/040_BackfillProjectionThreadPromptRecency.ts";
 import Migration0041 from "./Migrations/041_EnsureProjectionThreadWorktreeRemovable.ts";
+import Migration0042 from "./Migrations/042_PendingDispatchesDeliveredByWait.ts";
+import Migration0043 from "./Migrations/043_SubagentWaitDeliveries.ts";
+import Migration0044 from "./Migrations/044_SubagentWaitDeliveriesParentTurn.ts";
+import Migration0045 from "./Migrations/045_SubagentPromotedChildren.ts";
 
 /**
  * Migration loader with all migrations defined inline.
@@ -105,6 +109,10 @@ export const migrationEntries = [
   [39, "ProjectionThreadWorktreeRemovable", Migration0039],
   [40, "BackfillProjectionThreadPromptRecency", Migration0040],
   [41, "EnsureProjectionThreadWorktreeRemovable", Migration0041],
+  [42, "PendingDispatchesDeliveredByWait", Migration0042],
+  [43, "SubagentWaitDeliveries", Migration0043],
+  [44, "SubagentWaitDeliveriesParentTurn", Migration0044],
+  [45, "SubagentPromotedChildren", Migration0045],
 ] as const;
 
 export const makeMigrationLoader = (throughId?: number) =>
