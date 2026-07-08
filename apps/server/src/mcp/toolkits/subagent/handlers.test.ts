@@ -2431,6 +2431,87 @@ describe("SubagentToolkit", () => {
     ),
   );
 
+  it.effect("returns failed projection waits when the child session is interrupted", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const server = yield* McpServer.McpServer;
+        promotedCalls.length = 0;
+        markWaitDeliveredCalls.length = 0;
+        childDetailTurnState = "interrupted";
+        childDetailSession = {
+          threadId: childThreadId,
+          status: "interrupted",
+          providerName: "codex",
+          runtimeMode: "full-access",
+          activeTurnId: null,
+          lastError: null,
+          updatedAt: "2026-06-17T10:02:00.000Z",
+        };
+        waitSliceResult = {
+          results: [
+            {
+              childThreadId,
+              status: "timeout",
+              finalAssistantText: null,
+              error: "wait exceeded budget",
+            },
+          ],
+          settledCount: 0,
+          timedOutCount: 1,
+          pending: false,
+          resumeToken: "coordinator-token",
+        };
+
+        const result = yield* server
+          .callTool({
+            name: "t3_wait_subagent",
+            arguments: {
+              childThreadIds: [childThreadId],
+              resumeToken: "-100000:coordinator-token",
+            },
+          })
+          .pipe(
+            Effect.provideService(McpInvocationContext.McpInvocationContext, invocation),
+            Effect.provideService(McpSchema.McpServerClient, client),
+          );
+
+        expect(result.isError).toBe(false);
+        expect(result.structuredContent).toMatchObject({
+          pending: false,
+          settledCount: 1,
+          timedOutCount: 0,
+          results: [
+            {
+              childThreadId,
+              status: "failed",
+              error: "Child thread ended with status failed.",
+            },
+          ],
+        });
+        expect(result.structuredContent).not.toHaveProperty("promoted");
+        expect(promotedCalls).toEqual([]);
+        expect(markWaitDeliveredCalls).toEqual([
+          [
+            {
+              childThreadId,
+              status: "failed",
+              finalAssistantText: "child done",
+              error: "Child thread ended with status failed.",
+            },
+          ],
+        ]);
+      }),
+    ).pipe(
+      Effect.ensuring(
+        Effect.sync(() => {
+          childDetailSession = null;
+          childDetailTurnState = "completed";
+        }),
+      ),
+      Effect.provide(TestLayer),
+    ),
+  );
+
   it.effect("does not enrich completed waits with stale prior-turn assistant text", () =>
     Effect.scoped(
       Effect.gen(function* () {

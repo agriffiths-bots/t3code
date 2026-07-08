@@ -272,7 +272,12 @@ const reliableWaitTerminalStatusOf = (
   if (session === null) {
     return hasNoNewerMessageAfterTerminalTurn(thread) ? projectedStatus : null;
   }
-  if (session?.status === "stopped" || session?.status === "idle" || session?.status === "ready") {
+  if (
+    session?.status === "stopped" ||
+    session?.status === "idle" ||
+    session?.status === "ready" ||
+    session?.status === "interrupted"
+  ) {
     return hasNoNewerMessageAfterTerminalTurn(thread) ? projectedStatus : null;
   }
   if (session?.activeTurnId != null && thread.latestTurn?.turnId === session.activeTurnId) {
