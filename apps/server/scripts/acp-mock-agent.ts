@@ -3,6 +3,7 @@
 import * as NodeFS from "node:fs";
 
 import * as Effect from "effect/Effect";
+import * as Scope from "effect/Scope";
 
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import * as NodeRuntime from "@effect/platform-node/NodeRuntime";
@@ -27,7 +28,15 @@ const emitLateUpdateAfterCancel = process.env.T3_ACP_EMIT_LATE_UPDATE_AFTER_CANC
 const omitXAiPromptCompleteStopReason =
   process.env.T3_ACP_OMIT_XAI_PROMPT_COMPLETE_STOP_REASON === "1";
 const failLoadSession = process.env.T3_ACP_FAIL_LOAD_SESSION === "1";
+const failFirstLoadSessionAfterReplay =
+  process.env.T3_ACP_FAIL_FIRST_LOAD_SESSION_AFTER_REPLAY === "1";
 const emitLoadReplay = process.env.T3_ACP_EMIT_LOAD_REPLAY === "1";
+const emitLoadReplayMultiSegment = process.env.T3_ACP_EMIT_LOAD_REPLAY_MULTI_SEGMENT === "1";
+const emitLoadReplayLiveContinuation =
+  process.env.T3_ACP_EMIT_LOAD_REPLAY_LIVE_CONTINUATION === "1";
+const loadReplayLiveContinuationDelayMs = Number(
+  process.env.T3_ACP_LOAD_REPLAY_LIVE_CONTINUATION_DELAY_MS ?? "20",
+);
 const hangLoadSessionAfterReplay = process.env.T3_ACP_HANG_LOAD_SESSION_AFTER_REPLAY === "1";
 const delayLoadSessionAfterReplay = process.env.T3_ACP_DELAY_LOAD_SESSION_AFTER_REPLAY === "1";
 const loadSessionDelayMs = Number(process.env.T3_ACP_LOAD_SESSION_DELAY_MS ?? "5000");
@@ -36,10 +45,19 @@ const emitStaleXAiPromptCompleteBeforeSecondHang =
 const emitOverlappingXAiPromptCompleteOutOfOrder =
   process.env.T3_ACP_EMIT_OVERLAPPING_XAI_PROMPT_COMPLETE_OUT_OF_ORDER === "1";
 const failPrompt = process.env.T3_ACP_FAIL_PROMPT === "1";
+const failFirstPrompt = process.env.T3_ACP_FAIL_FIRST_PROMPT === "1";
 const failSetConfigOption = process.env.T3_ACP_FAIL_SET_CONFIG_OPTION === "1";
 const exitOnSetConfigOption = process.env.T3_ACP_EXIT_ON_SET_CONFIG_OPTION === "1";
 const promptResponseText = process.env.T3_ACP_PROMPT_RESPONSE_TEXT;
 const promptDelayMs = Number(process.env.T3_ACP_PROMPT_DELAY_MS ?? "0");
+const firstPromptDelayMs =
+  process.env.T3_ACP_FIRST_PROMPT_DELAY_MS === undefined
+    ? undefined
+    : Number(process.env.T3_ACP_FIRST_PROMPT_DELAY_MS);
+const secondPromptDelayMs =
+  process.env.T3_ACP_SECOND_PROMPT_DELAY_MS === undefined
+    ? undefined
+    : Number(process.env.T3_ACP_SECOND_PROMPT_DELAY_MS);
 const permissionOptionIds = {
   allowOnce: process.env.T3_ACP_ALLOW_ONCE_OPTION_ID ?? "allow-once",
   allowAlways: process.env.T3_ACP_ALLOW_ALWAYS_OPTION_ID ?? "allow-always",
@@ -54,6 +72,7 @@ let currentReasoning = "medium";
 let currentContext = "272k";
 let currentFast = false;
 let promptCount = 0;
+let loadSessionCount = 0;
 let overlappingFirstPromptId: string | undefined;
 const cancelledSessions = new Set<string>();
 
@@ -294,6 +313,7 @@ function modelState(): AcpSchema.SessionModelState {
 }
 
 const program = Effect.gen(function* () {
+  const programScope = yield* Scope.Scope;
   const agent = yield* EffectAcpAgent.AcpAgent;
 
   yield* agent.handleInitialize((request) =>
@@ -319,6 +339,67 @@ const program = Effect.gen(function* () {
   );
 
   const emitLoadReplayNotifications = (requestedSessionId: string) => {
+    if (emitLoadReplayMultiSegment) {
+      writeJsonRpcNotification("session/update", {
+        _meta: { isReplay: true },
+        sessionId: requestedSessionId,
+        update: {
+          sessionUpdate: "agent_message_chunk",
+          content: { type: "text", text: "replayed segment 0" },
+        },
+      });
+      writeJsonRpcNotification("session/update", {
+        _meta: { isReplay: true },
+        sessionId: requestedSessionId,
+        update: {
+          sessionUpdate: "tool_call",
+          toolCallId: "replay-tool-1",
+          title: "Replay tool 1",
+          kind: "search",
+          status: "completed",
+        },
+      });
+      writeJsonRpcNotification("session/update", {
+        _meta: { isReplay: true },
+        sessionId: requestedSessionId,
+        update: {
+          sessionUpdate: "agent_message_chunk",
+          content: { type: "text", text: "replayed segment 1" },
+        },
+      });
+      writeJsonRpcNotification("session/update", {
+        _meta: { isReplay: true },
+        sessionId: requestedSessionId,
+        update: {
+          sessionUpdate: "tool_call",
+          toolCallId: "replay-tool-2",
+          title: "Replay tool 2",
+          kind: "search",
+          status: "completed",
+        },
+      });
+      writeJsonRpcNotification("session/update", {
+        _meta: { isReplay: true },
+        sessionId: requestedSessionId,
+        update: {
+          sessionUpdate: "agent_message_chunk",
+          content: { type: "text", text: "replayed segment 2" },
+        },
+      });
+      writeJsonRpcNotification("session/update", {
+        _meta: { isReplay: true },
+        sessionId: requestedSessionId,
+        update: {
+          sessionUpdate: "tool_call",
+          toolCallId: "replay-tool-3",
+          title: "Replay tool 3",
+          kind: "search",
+          status: "completed",
+        },
+      });
+      return;
+    }
+
     writeJsonRpcNotification("session/update", {
       _meta: { isReplay: true },
       sessionId: requestedSessionId,
@@ -343,8 +424,43 @@ const program = Effect.gen(function* () {
   yield* agent.handleLoadSession((request) =>
     Effect.gen(function* () {
       const requestedSessionId = String(request.sessionId ?? sessionId);
+      loadSessionCount += 1;
       if (failLoadSession) {
         return yield* AcpError.AcpRequestError.internalError("Mock load session failure");
+      }
+      if (failFirstLoadSessionAfterReplay && loadSessionCount === 1) {
+        emitLoadReplayNotifications(requestedSessionId);
+        writeJsonRpcNotification("session/update", {
+          sessionId: requestedSessionId,
+          update: {
+            sessionUpdate: "agent_message_chunk",
+            content: { type: "text", text: "stale live load update" },
+          },
+        });
+        return yield* AcpError.AcpRequestError.internalError(
+          "Mock first load session failure after replay",
+        );
+      }
+      if (emitLoadReplayLiveContinuation) {
+        emitLoadReplayNotifications(requestedSessionId);
+        yield* Effect.forkIn(
+          Effect.gen(function* () {
+            yield* Effect.sleep(loadReplayLiveContinuationDelayMs);
+            writeJsonRpcNotification("session/update", {
+              sessionId: requestedSessionId,
+              update: {
+                sessionUpdate: "agent_message_chunk",
+                content: { type: "text", text: " live continuation" },
+              },
+            });
+          }),
+          programScope,
+        );
+        return {
+          modes: modeState(),
+          models: modelState(),
+          configOptions: configOptions(),
+        };
       }
       if (hangLoadSessionAfterReplay || delayLoadSessionAfterReplay) {
         emitLoadReplayNotifications(requestedSessionId);
@@ -457,11 +573,17 @@ const program = Effect.gen(function* () {
       const requestedSessionId = String(request.sessionId ?? sessionId);
       promptCount += 1;
 
-      if (Number.isFinite(promptDelayMs) && promptDelayMs > 0) {
-        yield* Effect.sleep(`${promptDelayMs} millis`);
+      const effectivePromptDelayMs =
+        promptCount === 1 && firstPromptDelayMs !== undefined
+          ? firstPromptDelayMs
+          : promptCount === 2 && secondPromptDelayMs !== undefined
+            ? secondPromptDelayMs
+            : promptDelayMs;
+      if (Number.isFinite(effectivePromptDelayMs) && effectivePromptDelayMs > 0) {
+        yield* Effect.sleep(`${effectivePromptDelayMs} millis`);
       }
 
-      if (failPrompt) {
+      if (failPrompt || (failFirstPrompt && promptCount === 1)) {
         return yield* AcpError.AcpRequestError.internalError("Mock prompt failure");
       }
 

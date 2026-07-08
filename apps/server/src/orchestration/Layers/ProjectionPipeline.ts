@@ -804,9 +804,21 @@ const makeOrchestrationProjectionPipeline = Effect.fn("makeOrchestrationProjecti
           if (Option.isNone(existingRow)) {
             return;
           }
+          const projectedAssistantMessage =
+            event.payload.assistantMessageId === null
+              ? Option.none()
+              : yield* projectionThreadMessageRepository.getByMessageId({
+                  messageId: event.payload.assistantMessageId,
+                });
+          const shouldAdvanceLatestTurn =
+            event.payload.assistantMessageId === null ||
+            Option.isNone(projectedAssistantMessage) ||
+            projectedAssistantMessage.value.turnId === event.payload.turnId;
           yield* projectionThreadRepository.upsert({
             ...existingRow.value,
-            latestTurnId: event.payload.turnId,
+            latestTurnId: shouldAdvanceLatestTurn
+              ? event.payload.turnId
+              : existingRow.value.latestTurnId,
             updatedAt: event.occurredAt,
           });
           yield* refreshThreadShellSummary(event.payload.threadId);
@@ -881,24 +893,26 @@ const makeOrchestrationProjectionPipeline = Effect.fn("makeOrchestrationProjecti
             messageId: event.payload.messageId,
           });
           const previousMessage = Option.getOrUndefined(existingMessage);
-          const nextText = Option.match(existingMessage, {
-            onNone: () => event.payload.text,
-            onSome: (message) => {
-              if (event.payload.streaming) {
-                return `${message.text}${event.payload.text}`;
-              }
-              if (event.payload.text.length === 0) {
-                return message.text;
-              }
-              return event.payload.text;
-            },
-          });
+          const previousMessageForSameTurn =
+            previousMessage?.turnId === event.payload.turnId ? previousMessage : undefined;
+          const nextText =
+            previousMessageForSameTurn === undefined
+              ? event.payload.text
+              : event.payload.streaming
+                ? `${previousMessageForSameTurn.text}${event.payload.text}`
+                : event.payload.text.length === 0
+                  ? previousMessageForSameTurn.text
+                  : event.payload.text;
           const nextAttachments =
             event.payload.attachments !== undefined
               ? yield* materializeAttachmentsForProjection({
                   attachments: event.payload.attachments,
                 })
-              : previousMessage?.attachments;
+              : previousMessageForSameTurn !== undefined
+                ? previousMessageForSameTurn.attachments
+                : previousMessage !== undefined
+                  ? []
+                  : undefined;
           yield* projectionThreadMessageRepository.upsert({
             messageId: event.payload.messageId,
             threadId: event.payload.threadId,
@@ -907,7 +921,10 @@ const makeOrchestrationProjectionPipeline = Effect.fn("makeOrchestrationProjecti
             text: nextText,
             ...(nextAttachments !== undefined ? { attachments: [...nextAttachments] } : {}),
             isStreaming: event.payload.streaming,
-            createdAt: previousMessage?.createdAt ?? event.payload.createdAt,
+            createdAt:
+              previousMessageForSameTurn === undefined
+                ? event.payload.createdAt
+                : previousMessageForSameTurn.createdAt,
             updatedAt: event.payload.updatedAt,
           });
           return;
@@ -1242,6 +1259,11 @@ const makeOrchestrationProjectionPipeline = Effect.fn("makeOrchestrationProjecti
             (session.value.status === "running" || session.value.status === "waiting") &&
             session.value.activeTurnId === event.payload.turnId;
           const settlesTurn = !event.payload.streaming && !turnStillRunning;
+          yield* projectionTurnRepository.clearAssistantMessageIdConflict({
+            threadId: event.payload.threadId,
+            turnId: event.payload.turnId,
+            assistantMessageId: event.payload.messageId,
+          });
           const existingTurn = yield* projectionTurnRepository.getByTurnId({
             threadId: event.payload.threadId,
             turnId: event.payload.turnId,
@@ -1336,16 +1358,35 @@ const makeOrchestrationProjectionPipeline = Effect.fn("makeOrchestrationProjecti
             turnId: event.payload.turnId,
           });
           const nextState = event.payload.status === "error" ? "error" : "completed";
+          const projectedAssistantMessage =
+            event.payload.assistantMessageId === null
+              ? Option.none()
+              : yield* projectionThreadMessageRepository.getByMessageId({
+                  messageId: event.payload.assistantMessageId,
+                });
+          const nextAssistantMessageId =
+            event.payload.assistantMessageId !== null &&
+            (Option.isNone(projectedAssistantMessage) ||
+              projectedAssistantMessage.value.turnId === event.payload.turnId)
+              ? event.payload.assistantMessageId
+              : null;
           yield* projectionTurnRepository.clearCheckpointTurnConflict({
             threadId: event.payload.threadId,
             turnId: event.payload.turnId,
             checkpointTurnCount: event.payload.checkpointTurnCount,
           });
+          if (nextAssistantMessageId !== null) {
+            yield* projectionTurnRepository.clearAssistantMessageIdConflict({
+              threadId: event.payload.threadId,
+              turnId: event.payload.turnId,
+              assistantMessageId: nextAssistantMessageId,
+            });
+          }
 
           if (Option.isSome(existingTurn)) {
             yield* projectionTurnRepository.upsertByTurnId({
               ...existingTurn.value,
-              assistantMessageId: event.payload.assistantMessageId,
+              assistantMessageId: nextAssistantMessageId,
               state: turnStillRunning ? existingTurn.value.state : nextState,
               checkpointTurnCount: event.payload.checkpointTurnCount,
               checkpointRef: event.payload.checkpointRef,
@@ -1363,7 +1404,7 @@ const makeOrchestrationProjectionPipeline = Effect.fn("makeOrchestrationProjecti
             pendingMessageId: null,
             sourceProposedPlanThreadId: null,
             sourceProposedPlanId: null,
-            assistantMessageId: event.payload.assistantMessageId,
+            assistantMessageId: nextAssistantMessageId,
             state: turnStillRunning ? "running" : nextState,
             requestedAt: event.payload.completedAt,
             startedAt: event.payload.completedAt,

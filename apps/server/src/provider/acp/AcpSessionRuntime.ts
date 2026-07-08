@@ -258,12 +258,18 @@ type AcpStartState =
 interface AcpAssistantSegmentState {
   readonly nextSegmentIndex: number;
   readonly activeItemId?: string;
+  readonly activeItemReplayOnly?: boolean;
 }
 
 interface EnsureActiveAssistantSegmentResult {
   readonly itemId: string;
   readonly startedEvent?: Extract<AcpParsedSessionEvent, { readonly _tag: "AssistantItemStarted" }>;
 }
+
+type SessionLoadGateNotificationAction =
+  | { readonly _tag: "GateClosed" }
+  | { readonly _tag: "GateHandled" }
+  | { readonly _tag: "ObserveReplay" };
 
 export const make = (
   options: AcpSessionRuntimeOptions,
@@ -281,6 +287,7 @@ export const make = (
     const assistantSegmentRef = yield* Ref.make<AcpAssistantSegmentState>({ nextSegmentIndex: 0 });
     const configOptionsRef = yield* Ref.make(sessionConfigOptionsFromSetup(undefined));
     const startStateRef = yield* Ref.make<AcpStartState>({ _tag: "NotStarted" });
+    const startupSessionIdRef = yield* Ref.make<Option.Option<string>>(Option.none());
     const promptSerializationSemaphore = yield* Semaphore.make(1);
     const activePromptFiberRef = yield* Ref.make<
       Option.Option<Fiber.Fiber<EffectAcpSchema.PromptResponse, EffectAcpErrors.AcpError>>
@@ -361,25 +368,54 @@ export const make = (
         const gate = yield* Ref.get(sessionLoadGateRef);
         if (Option.isSome(gate) && gate.value.active) {
           const lastActivityAtMillis = yield* Clock.currentTimeMillis;
-          yield* Ref.set(
-            sessionLoadGateRef,
-            Option.some({
-              ...gate.value,
+          const action = yield* Ref.modify<
+            Option.Option<SessionLoadGate>,
+            SessionLoadGateNotificationAction
+          >(sessionLoadGateRef, (currentGate) => {
+            if (Option.isNone(currentGate) || !currentGate.value.active) {
+              return [{ _tag: "GateClosed" }, currentGate] as const;
+            }
+            const nextGate = {
+              ...currentGate.value,
               lastActivityAtMillis,
-            }),
-          );
-          return;
+            } satisfies SessionLoadGate;
+            if (notification.sessionId !== options.resumeSessionId) {
+              return [{ _tag: "GateHandled" }, Option.some(nextGate)] as const;
+            }
+            if (sessionUpdateIsReplay(notification)) {
+              return [{ _tag: "ObserveReplay" }, Option.some(nextGate)] as const;
+            }
+            return [
+              { _tag: "GateHandled" },
+              Option.some({
+                ...nextGate,
+                bufferedLiveUpdates: [...nextGate.bufferedLiveUpdates, notification],
+              }),
+            ] as const;
+          });
+          if (action._tag === "ObserveReplay") {
+            yield* observeSessionLoadAssistantSegments({
+              assistantSegmentRef,
+              params: notification,
+            });
+            return;
+          }
+          if (action._tag === "GateHandled") {
+            return;
+          }
         }
         if (sessionUpdateIsReplay(notification)) {
           return;
         }
         const startState = yield* Ref.get(startStateRef);
+        const startupSessionId = yield* Ref.get(startupSessionIdRef);
+        const activeSessionId =
+          startState._tag === "Started"
+            ? startState.result.sessionId
+            : Option.getOrUndefined(startupSessionId);
         // One runtime projects one root ACP session. Child-session updates need
         // explicit lineage routing and must never be flattened into this stream.
-        if (
-          startState._tag !== "Started" ||
-          notification.sessionId !== startState.result.sessionId
-        ) {
+        if (activeSessionId === undefined || notification.sessionId !== activeSessionId) {
           return;
         }
         yield* handleSessionUpdate({
@@ -564,10 +600,12 @@ export const make = (
             lastActivityAtMillis: undefined,
             idleGap: sessionLoadReplayIdleGap,
             initializeResult,
+            bufferedLiveUpdates: [],
           }),
         );
 
         sessionId = options.resumeSessionId;
+        yield* Ref.set(startupSessionIdRef, Option.some(sessionId));
         sessionSetupResult = yield* Effect.gen(function* () {
           yield* logRequest({
             method: "session/load",
@@ -612,12 +650,19 @@ export const make = (
                 payload: loadPayload,
                 status: "failed",
                 cause,
-              }),
+              }).pipe(
+                Effect.andThen(
+                  Ref.set(assistantSegmentRef, {
+                    nextSegmentIndex: 0,
+                  } satisfies AcpAssistantSegmentState),
+                ),
+                Effect.andThen(Ref.set(sessionLoadGateRef, Option.none())),
+              ),
             ),
           );
 
           return loaded;
-        }).pipe(Effect.ensuring(Ref.set(sessionLoadGateRef, Option.none())));
+        });
       } else {
         const createPayload = {
           cwd: options.cwd,
@@ -629,11 +674,27 @@ export const make = (
           acp.agent.createSession(createPayload),
         );
         sessionId = created.sessionId;
+        yield* Ref.set(startupSessionIdRef, Option.some(sessionId));
         sessionSetupResult = created;
       }
 
       yield* Ref.set(modeStateRef, parseSessionModeState(sessionSetupResult));
       yield* Ref.set(configOptionsRef, sessionConfigOptionsFromSetup(sessionSetupResult));
+      const bufferedLoadUpdates = yield* Ref.modify(sessionLoadGateRef, (gate) =>
+        Option.match(gate, {
+          onNone: () => [[], Option.none()] as const,
+          onSome: (currentGate) => [currentGate.bufferedLiveUpdates, Option.none()] as const,
+        }),
+      );
+      for (const notification of bufferedLoadUpdates) {
+        yield* handleSessionUpdate({
+          queue: eventQueue,
+          modeStateRef,
+          toolCallsRef,
+          assistantSegmentRef,
+          params: notification,
+        });
+      }
 
       const nextState = {
         sessionId,
@@ -660,11 +721,13 @@ export const make = (
               startOnce.pipe(
                 Effect.tap((result) =>
                   Ref.set(startStateRef, { _tag: "Started", result }).pipe(
+                    Effect.andThen(Ref.set(startupSessionIdRef, Option.none())),
                     Effect.andThen(Deferred.succeed(deferred, result)),
                   ),
                 ),
                 Effect.onError((cause) =>
                   Deferred.failCause(deferred, cause).pipe(
+                    Effect.andThen(Ref.set(startupSessionIdRef, Option.none())),
                     Effect.andThen(Ref.set(startStateRef, { _tag: "NotStarted" })),
                   ),
                 ),
@@ -927,6 +990,73 @@ function shouldEmitToolCallUpdate(
 const assistantItemId = (sessionId: string, segmentIndex: number) =>
   `assistant:${sessionId}:segment:${segmentIndex}`;
 
+const ensureActiveAssistantSegmentState = ({
+  assistantSegmentRef,
+  sessionId,
+  replayOnly = false,
+}: {
+  readonly assistantSegmentRef: Ref.Ref<AcpAssistantSegmentState>;
+  readonly sessionId: string;
+  readonly replayOnly?: boolean;
+}) =>
+  Ref.update(assistantSegmentRef, (current) => {
+    if (current.activeItemId) {
+      return current;
+    }
+    const itemId = assistantItemId(sessionId, current.nextSegmentIndex);
+    return {
+      nextSegmentIndex: current.nextSegmentIndex + 1,
+      activeItemId: itemId,
+      activeItemReplayOnly: replayOnly,
+    } satisfies AcpAssistantSegmentState;
+  });
+
+const closeActiveAssistantSegmentState = ({
+  assistantSegmentRef,
+}: {
+  readonly assistantSegmentRef: Ref.Ref<AcpAssistantSegmentState>;
+}) =>
+  Ref.update(assistantSegmentRef, (current) =>
+    current.activeItemId
+      ? ({
+          nextSegmentIndex: current.nextSegmentIndex,
+        } satisfies AcpAssistantSegmentState)
+      : current,
+  );
+
+const observeSessionLoadAssistantSegments = ({
+  assistantSegmentRef,
+  params,
+}: {
+  readonly assistantSegmentRef: Ref.Ref<AcpAssistantSegmentState>;
+  readonly params: EffectAcpSchema.SessionNotification;
+}): Effect.Effect<void> =>
+  Effect.gen(function* () {
+    const parsed = parseSessionUpdateEvent(params);
+    for (const event of parsed.events) {
+      if (event._tag === "ToolCallUpdated") {
+        yield* closeActiveAssistantSegmentState({
+          assistantSegmentRef,
+        });
+        continue;
+      }
+      if (event._tag !== "ContentDelta") {
+        continue;
+      }
+      if (event.text.trim().length === 0) {
+        const assistantSegmentState = yield* Ref.get(assistantSegmentRef);
+        if (!assistantSegmentState.activeItemId) {
+          continue;
+        }
+      }
+      yield* ensureActiveAssistantSegmentState({
+        assistantSegmentRef,
+        sessionId: params.sessionId,
+        replayOnly: true,
+      });
+    }
+  });
+
 const ensureActiveAssistantSegment = ({
   queue,
   assistantSegmentRef,
@@ -940,7 +1070,18 @@ const ensureActiveAssistantSegment = ({
     assistantSegmentRef,
     (current) => {
       if (current.activeItemId) {
-        return [{ itemId: current.activeItemId }, current] as const;
+        const startedEvent = current.activeItemReplayOnly
+          ? ({
+              _tag: "AssistantItemStarted",
+              itemId: current.activeItemId,
+            } satisfies Extract<AcpParsedSessionEvent, { readonly _tag: "AssistantItemStarted" }>)
+          : undefined;
+        return [
+          startedEvent
+            ? { itemId: current.activeItemId, startedEvent }
+            : { itemId: current.activeItemId },
+          current.activeItemReplayOnly ? { ...current, activeItemReplayOnly: false } : current,
+        ] as const;
       }
       const itemId = assistantItemId(sessionId, current.nextSegmentIndex);
       return [
@@ -954,6 +1095,7 @@ const ensureActiveAssistantSegment = ({
         {
           nextSegmentIndex: current.nextSegmentIndex + 1,
           activeItemId: itemId,
+          activeItemReplayOnly: false,
         } satisfies AcpAssistantSegmentState,
       ] as const;
     },
@@ -975,6 +1117,14 @@ const closeActiveAssistantSegment = ({
   Ref.modify(assistantSegmentRef, (current) => {
     if (!current.activeItemId) {
       return [undefined, current] as const;
+    }
+    if (current.activeItemReplayOnly) {
+      return [
+        undefined,
+        {
+          nextSegmentIndex: current.nextSegmentIndex,
+        } satisfies AcpAssistantSegmentState,
+      ] as const;
     }
     return [
       {
