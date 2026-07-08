@@ -33,6 +33,7 @@ const RETRY_DELAYS_MS = [1_000, 2_000, 4_000, 8_000, 16_000] as const;
 const CONNECTION_ESTABLISHMENT_TIMEOUT = "15 seconds";
 const CONNECTION_PROBE_TIMEOUT = "15 seconds";
 const BACKOFF_RESET_AFTER_MS = 30_000;
+const RESUME_RETRY_DELAY_MS = 100;
 
 interface SupervisorIntent {
   readonly desired: boolean;
@@ -46,6 +47,10 @@ type SupervisorSignal =
   | { readonly _tag: "NetworkChanged"; readonly network: NetworkStatus }
   | { readonly _tag: "Wakeup"; readonly reason: ConnectionWakeups.ConnectionWakeup };
 
+type SequencedSupervisorSignal = SupervisorSignal & {
+  readonly sequence: number;
+};
+
 interface PendingRetryTrace {
   readonly previousAttempt: Tracer.Span;
   readonly failureCount: number;
@@ -56,6 +61,8 @@ interface PendingRetryTrace {
 interface TracedAttemptFailure {
   readonly error: ConnectionAttemptError;
   readonly attemptSpan: Option.Option<Tracer.Span>;
+  readonly ignoreNetworkChangesThroughSequence?: number;
+  readonly retryDelayOverrideMs?: number;
 }
 
 type AttemptOutcome =
@@ -228,7 +235,9 @@ export const make = Effect.fn("EnvironmentSupervisor.make")(function* (
     network: yield* connectivity.status,
   };
   const intent = yield* Ref.make(initialIntent);
-  const signals = yield* Queue.unbounded<SupervisorSignal>();
+  const signalSequence = yield* Ref.make(0);
+  const suppressNextBrowserOnlineWakeup = yield* Ref.make(false);
+  const signals = yield* Queue.unbounded<SequencedSupervisorSignal>();
   const state = yield* SubscriptionRef.make<SupervisorConnectionState>(
     !initialIntent.desired
       ? availableState(initialIntent, 0)
@@ -251,7 +260,8 @@ export const make = Effect.fn("EnvironmentSupervisor.make")(function* (
   });
 
   const signal = Effect.fn("EnvironmentSupervisor.signal")(function* (next: SupervisorSignal) {
-    yield* Queue.offer(signals, next);
+    const sequence = yield* Ref.updateAndGet(signalSequence, (current) => current + 1);
+    yield* Queue.offer(signals, { ...next, sequence });
   });
 
   const logManagedRelayAccountChange = Effect.logInfo(
@@ -262,6 +272,20 @@ export const make = Effect.fn("EnvironmentSupervisor.make")(function* (
       "environment.label": target.label,
     }),
   );
+
+  const consumeSuppressedBrowserOnlineWakeup = Effect.fnUntraced(function* (
+    reason: ConnectionWakeups.ConnectionWakeup,
+  ) {
+    if (reason !== "browser-online") {
+      return false;
+    }
+    const shouldSuppress = yield* Ref.get(suppressNextBrowserOnlineWakeup);
+    if (!shouldSuppress) {
+      return false;
+    }
+    yield* Ref.set(suppressNextBrowserOnlineWakeup, false);
+    return true;
+  });
 
   const reportProgress = Effect.fn("EnvironmentSupervisor.reportProgress")(function* (
     attempt: number,
@@ -359,7 +383,9 @@ export const make = Effect.fn("EnvironmentSupervisor.make")(function* (
     );
   });
 
-  const waitForEstablishmentInterrupt = Effect.fnUntraced(function* () {
+  const waitForEstablishmentInterrupt = Effect.fnUntraced(function* (input: {
+    readonly attemptStartedAfterSignalSequence: number;
+  }) {
     for (;;) {
       const next = yield* Queue.take(signals);
       switch (next._tag) {
@@ -370,12 +396,32 @@ export const make = Effect.fn("EnvironmentSupervisor.make")(function* (
           if (next.network === "offline") {
             return;
           }
+          if (
+            next.network === "online" &&
+            next.sequence > input.attemptStartedAfterSignalSequence
+          ) {
+            return;
+          }
           break;
         case "ConnectRequested":
           break;
         case "Wakeup":
           if (next.reason === "credentials-changed" && target._tag === "RelayConnectionTarget") {
             yield* logManagedRelayAccountChange;
+            return;
+          }
+          if (next.reason === "browser-online") {
+            if (yield* consumeSuppressedBrowserOnlineWakeup(next.reason)) {
+              break;
+            }
+            if (next.sequence > input.attemptStartedAfterSignalSequence) {
+              return;
+            }
+          }
+          if (
+            next.reason === "application-active" &&
+            next.sequence > input.attemptStartedAfterSignalSequence
+          ) {
             return;
           }
           break;
@@ -402,7 +448,10 @@ export const make = Effect.fn("EnvironmentSupervisor.make")(function* (
             yield* logManagedRelayAccountChange;
             return;
           }
-          if (next.reason === "application-active") {
+          if (yield* consumeSuppressedBrowserOnlineWakeup(next.reason)) {
+            break;
+          }
+          if (next.reason === "application-active" || next.reason === "browser-online") {
             const probe = yield* lease.session.probe.pipe(
               Effect.timeoutOrElse({
                 duration: CONNECTION_PROBE_TIMEOUT,
@@ -441,7 +490,17 @@ export const make = Effect.fn("EnvironmentSupervisor.make")(function* (
                   }
                   break;
                 case "ConnectRequested":
+                  break;
                 case "Wakeup":
+                  if (
+                    probeEvent.signal.reason === "credentials-changed" &&
+                    target._tag === "RelayConnectionTarget"
+                  ) {
+                    yield* logManagedRelayAccountChange;
+                    yield* Fiber.interrupt(probe);
+                    return;
+                  }
+                  yield* consumeSuppressedBrowserOnlineWakeup(probeEvent.signal.reason);
                   break;
               }
             }
@@ -459,6 +518,7 @@ export const make = Effect.fn("EnvironmentSupervisor.make")(function* (
     lastFailure: ConnectionAttemptError | null,
     pendingRetry: Option.Option<PendingRetryTrace>,
   ) {
+    const attemptStartedAfterSignalSequence = yield* Ref.get(signalSequence);
     yield* SubscriptionRef.set(prepared, Option.none());
     const establishment = yield* Effect.raceAllFirst([
       exitUnlessInterrupted(
@@ -471,7 +531,9 @@ export const make = Effect.fn("EnvironmentSupervisor.make")(function* (
           }),
         ),
       ),
-      waitForEstablishmentInterrupt().pipe(Effect.as<EstablishmentEvent>({ _tag: "Interrupted" })),
+      waitForEstablishmentInterrupt({
+        attemptStartedAfterSignalSequence,
+      }).pipe(Effect.as<EstablishmentEvent>({ _tag: "Interrupted" })),
       Effect.sleep(CONNECTION_ESTABLISHMENT_TIMEOUT).pipe(
         Effect.as<EstablishmentEvent>({ _tag: "TimedOut" }),
       ),
@@ -495,6 +557,7 @@ export const make = Effect.fn("EnvironmentSupervisor.make")(function* (
             detail: `${target.label} did not respond during connection setup.`,
           }),
           attemptSpan: Option.none(),
+          ignoreNetworkChangesThroughSequence: attemptStartedAfterSignalSequence,
         },
       } satisfies AttemptOutcome;
     }
@@ -514,7 +577,15 @@ export const make = Effect.fn("EnvironmentSupervisor.make")(function* (
           }),
         );
       }
-      return outcome;
+      return outcome._tag === "Failure"
+        ? ({
+            ...outcome,
+            failure: {
+              ...outcome.failure,
+              ignoreNetworkChangesThroughSequence: attemptStartedAfterSignalSequence,
+            },
+          } satisfies AttemptOutcome)
+        : outcome;
     }
 
     const active = establishment.exit.value;
@@ -530,6 +601,7 @@ export const make = Effect.fn("EnvironmentSupervisor.make")(function* (
     const connectedAt = yield* Clock.currentTimeMillis;
     yield* SubscriptionRef.set(prepared, Option.some(active.lease.prepared));
     yield* SubscriptionRef.set(session, Option.some(active.lease.session));
+    yield* Ref.set(suppressNextBrowserOnlineWakeup, false);
     yield* setState({
       desired: true,
       network: currentIntent.network,
@@ -555,6 +627,7 @@ export const make = Effect.fn("EnvironmentSupervisor.make")(function* (
           (error): TracedAttemptFailure => ({
             error,
             attemptSpan: active.attemptSpan,
+            retryDelayOverrideMs: RESUME_RETRY_DELAY_MS,
           }),
         ),
       ),
@@ -563,7 +636,10 @@ export const make = Effect.fn("EnvironmentSupervisor.make")(function* (
     return failureFromExit(target, connectedExit, true, connectedForMs >= BACKOFF_RESET_AFTER_MS);
   }, Effect.ensuring(clearLease));
 
-  const waitForRetrySignal = Effect.fnUntraced(function* (delayMs: number) {
+  const waitForRetrySignal = Effect.fnUntraced(function* (
+    delayMs: number,
+    ignoreNetworkChangesThroughSequence: number,
+  ) {
     return yield* Effect.raceFirst(
       Effect.sleep(delayMs),
       Effect.gen(function* () {
@@ -573,8 +649,22 @@ export const make = Effect.fn("EnvironmentSupervisor.make")(function* (
             case "ConnectRequested":
             case "DisconnectRequested":
             case "RetryRequested":
+              return;
             case "NetworkChanged":
+              if (next.network === "offline") {
+                return;
+              }
+              if (
+                next.sequence <= ignoreNetworkChangesThroughSequence &&
+                (yield* Ref.get(suppressNextBrowserOnlineWakeup))
+              ) {
+                break;
+              }
+              return;
             case "Wakeup":
+              if (yield* consumeSuppressedBrowserOnlineWakeup(next.reason)) {
+                break;
+              }
               return;
           }
         }
@@ -582,7 +672,44 @@ export const make = Effect.fn("EnvironmentSupervisor.make")(function* (
     );
   });
 
-  const waitForSignal = Queue.take(signals);
+  const waitForSignal = Effect.fnUntraced(function* () {
+    for (;;) {
+      const next = yield* Queue.take(signals);
+      if (next._tag === "Wakeup" && (yield* consumeSuppressedBrowserOnlineWakeup(next.reason))) {
+        continue;
+      }
+      return next;
+    }
+  });
+
+  const waitForBlockedSignal = Effect.fnUntraced(function* () {
+    for (;;) {
+      const next = yield* Queue.take(signals);
+      switch (next._tag) {
+        case "DisconnectRequested":
+        case "RetryRequested":
+          return;
+        case "NetworkChanged":
+          if (next.network === "offline") {
+            return;
+          }
+          break;
+        case "Wakeup":
+          if (yield* consumeSuppressedBrowserOnlineWakeup(next.reason)) {
+            break;
+          }
+          if (next.reason === "browser-online") {
+            break;
+          }
+          if (next.reason === "application-active" || next.reason === "credentials-changed") {
+            return;
+          }
+          break;
+        case "ConnectRequested":
+          break;
+      }
+    }
+  });
 
   const run = Effect.fnUntraced(function* () {
     let failureCount = 0;
@@ -596,15 +723,17 @@ export const make = Effect.fn("EnvironmentSupervisor.make")(function* (
         failureCount = 0;
         latestFailure = null;
         pendingRetry = Option.none();
+        yield* Ref.set(suppressNextBrowserOnlineWakeup, false);
         yield* clearLease;
         yield* setState(availableState(currentIntent, generation));
-        yield* waitForSignal;
+        yield* waitForSignal();
         continue;
       }
       if (currentIntent.network === "offline") {
+        yield* Ref.set(suppressNextBrowserOnlineWakeup, false);
         yield* clearLease;
         yield* setState(offlineState(currentIntent, generation, failureCount + 1, latestFailure));
-        yield* waitForSignal;
+        yield* waitForSignal();
         continue;
       }
 
@@ -630,6 +759,7 @@ export const make = Effect.fn("EnvironmentSupervisor.make")(function* (
       latestFailure = error;
       if (error._tag === "ConnectionBlockedError") {
         const blockedIntent = yield* Ref.get(intent);
+        yield* Ref.set(suppressNextBrowserOnlineWakeup, false);
         yield* setState({
           desired: blockedIntent.desired,
           network: blockedIntent.network,
@@ -640,12 +770,12 @@ export const make = Effect.fn("EnvironmentSupervisor.make")(function* (
           lastFailure: error,
           retryAt: null,
         });
-        yield* waitForSignal;
+        yield* waitForBlockedSignal();
         continue;
       }
 
       failureCount += 1;
-      const delayMs = retryDelayMs(failureCount - 1);
+      const delayMs = outcome.failure.retryDelayOverrideMs ?? retryDelayMs(failureCount - 1);
       pendingRetry = Option.map(attemptSpan, (previousAttempt) => ({
         previousAttempt,
         failureCount,
@@ -663,17 +793,29 @@ export const make = Effect.fn("EnvironmentSupervisor.make")(function* (
         lastFailure: error,
         retryAt: (yield* Clock.currentTimeMillis) + delayMs,
       });
-      yield* waitForRetrySignal(delayMs);
+      yield* waitForRetrySignal(delayMs, outcome.failure.ignoreNetworkChangesThroughSequence ?? 0);
     }
   });
 
   yield* connectivity.changes.pipe(
     Stream.runForEach((network) =>
-      Ref.modify(intent, (current) =>
-        current.network === network ? [false, current] : ([true, { ...current, network }] as const),
-      ).pipe(
-        Effect.flatMap((changed) =>
-          changed ? signal({ _tag: "NetworkChanged", network }) : Effect.void,
+      Ref.modify(intent, (current) => {
+        const changed = current.network !== network;
+        return [
+          {
+            changed,
+            recoveredFromOffline: current.network === "offline" && network === "online",
+          },
+          changed ? { ...current, network } : current,
+        ] as const;
+      }).pipe(
+        Effect.flatMap(({ changed, recoveredFromOffline }) =>
+          (recoveredFromOffline
+            ? Ref.set(suppressNextBrowserOnlineWakeup, true)
+            : Effect.void
+          ).pipe(
+            Effect.andThen(changed ? signal({ _tag: "NetworkChanged", network }) : Effect.void),
+          ),
         ),
       ),
     ),
