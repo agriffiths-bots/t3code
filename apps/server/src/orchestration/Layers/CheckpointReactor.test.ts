@@ -49,6 +49,7 @@ import {
 } from "../Services/OrchestrationEngine.ts";
 import { CheckpointReactor } from "../Services/CheckpointReactor.ts";
 import { ProjectionSnapshotQuery } from "../Services/ProjectionSnapshotQuery.ts";
+import { readDetailedReadModel } from "../testUtils/readModel.ts";
 import {
   ProviderService,
   type ProviderServiceShape,
@@ -413,7 +414,7 @@ describe("CheckpointReactor", () => {
 
     return {
       engine,
-      readModel: () => Effect.runPromise(snapshotQuery.getSnapshot()),
+      readModel: () => readDetailedReadModel(snapshotQuery),
       provider,
       cwd,
       drain,

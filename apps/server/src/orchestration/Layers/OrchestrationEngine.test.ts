@@ -37,6 +37,7 @@ import {
   type OrchestrationProjectionPipelineShape,
 } from "../Services/ProjectionPipeline.ts";
 import { ProjectionSnapshotQuery } from "../Services/ProjectionSnapshotQuery.ts";
+import { readDetailedReadModel } from "../testUtils/readModel.ts";
 import { ServerConfig } from "../../config.ts";
 
 const asProjectId = (value: string): ProjectId => ProjectId.make(value);
@@ -68,7 +69,7 @@ async function createOrchestrationSystem() {
   return {
     engine,
     snapshotQuery,
-    readModel: () => runtime.runPromise(snapshotQuery.getSnapshot()),
+    readModel: () => readDetailedReadModel(snapshotQuery),
     run: <A, E>(effect: Effect.Effect<A, E>) => runtime.runPromise(effect),
     dispose: () => runtime.dispose(),
   };
