@@ -5,6 +5,7 @@ import type {
   PlanUsageProvider,
   PlanUsageSnapshot,
   PlanUsageWindow,
+  ProviderInstanceEnvironment,
   ServerSettings,
 } from "@t3tools/contracts";
 import {
@@ -14,10 +15,12 @@ import {
 import { resolveSpawnCommand } from "@t3tools/shared/shell";
 import * as Effect from "effect/Effect";
 import * as NodeChildProcess from "node:child_process";
+import * as NodeCrypto from "node:crypto";
 import * as NodeFSP from "node:fs/promises";
 import * as NodePath from "node:path";
 import * as NodeUtil from "node:util";
 import { expandHomePath } from "../pathExpansion.ts";
+import { mergeProviderInstanceEnvironment } from "../provider/ProviderInstanceEnvironment.ts";
 
 const CODEX_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage";
 const CODEX_REFRESH_URL = "https://auth.openai.com/oauth/token";
@@ -43,6 +46,7 @@ const CLAUDE_CLI_AUTH_STATUS_ARGS = [
 const CACHE_TTL_MS = 60_000;
 const MAX_CACHE_ENTRIES = 32;
 const UPSTREAM_TIMEOUT_MS = 10_000;
+const CLAUDE_CLI_TIMEOUT_MS = 30_000;
 const CLI_MAX_BUFFER_BYTES = 1024 * 1024;
 const CLAUDE_SAFE_TRANSPORT_ENV_KEYS = new Set([
   "CLAUDE_CODE_CERT_STORE",
@@ -56,20 +60,29 @@ const execFile = NodeUtil.promisify(NodeChildProcess.execFile);
 
 const cached = new Map<
   string,
-  { readonly expiresAt: number; readonly snapshot: PlanUsageSnapshot }
+  {
+    readonly expiresAt: number;
+    readonly providers: ReadonlyArray<ProviderUsage>;
+    readonly snapshot: PlanUsageSnapshot;
+  }
 >();
 
 interface ProviderUsage {
+  readonly sourceKey: string;
   readonly provider: PlanUsageProvider;
   readonly plan: string | null;
+  readonly fetchedAt: string;
   readonly windows: ReadonlyArray<PlanUsageWindow>;
 }
+
+type ParsedProviderUsage = Omit<ProviderUsage, "fetchedAt" | "sourceKey">;
 
 interface UsageCredentialSource {
   readonly provider: PlanUsageProvider;
   readonly instanceId: ProviderInstanceIdType;
   readonly home: string;
   readonly executable: string | null;
+  readonly environment?: ProviderInstanceEnvironment | undefined;
 }
 
 interface UsageCredentialScope {
@@ -86,6 +99,7 @@ interface UsageProviderInstance {
   readonly instanceId: ProviderInstanceIdType;
   readonly driver: string;
   readonly enabled?: boolean | undefined;
+  readonly environment?: ProviderInstanceEnvironment | undefined;
   readonly config?: unknown;
 }
 
@@ -241,20 +255,72 @@ function localTimeInZoneToUtcMillis(input: {
 
 function parseClaudeCliResetAt(raw: string | null, now = Date.now()): string | null {
   if (!raw) return null;
-  const match = raw
-    .trim()
-    .match(/^([A-Za-z]+)\s+(\d{1,2}),\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)?(?:\s+\(([^)]+)\))?$/i);
-  if (!match) return null;
+  const trimmed = raw.trim();
+  const match = trimmed.match(
+    /^([A-Za-z]+)\s+(\d{1,2}),\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)?(?:\s+\(([^)]+)\))?$/i,
+  );
+  const timeOnlyMatch = trimmed.match(/^(\d{1,2})(?::(\d{2}))?\s*(am|pm)?(?:\s+\(([^)]+)\))?$/i);
+  const parseTime = (input: {
+    readonly hour: number;
+    readonly minute: number;
+    readonly meridiem: string | undefined;
+  }): { readonly hour: number; readonly minute: number } | null => {
+    if (!Number.isInteger(input.hour) || !Number.isInteger(input.minute)) return null;
+    if (input.minute < 0 || input.minute > 59) return null;
+    if (input.meridiem) {
+      if (input.hour < 1 || input.hour > 12) return null;
+      let hour = input.hour;
+      if (input.meridiem === "pm" && hour < 12) hour += 12;
+      if (input.meridiem === "am" && hour === 12) hour = 0;
+      return { hour, minute: input.minute };
+    }
+    if (input.hour < 0 || input.hour > 23) return null;
+    return { hour: input.hour, minute: input.minute };
+  };
+
+  if (!match) {
+    if (!timeOnlyMatch) return null;
+    const hour = Number(timeOnlyMatch[1]);
+    const minute = timeOnlyMatch[2] === undefined ? 0 : Number(timeOnlyMatch[2]);
+    const meridiem = timeOnlyMatch[3]?.toLowerCase();
+    const time = parseTime({ hour, minute, meridiem });
+    if (!time) return null;
+    const timeZone =
+      timeOnlyMatch[4]?.trim() || Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
+    const parts = timeZoneDateParts(timeZone, new Date(now));
+    if (!parts) return null;
+    let utcMillis = localTimeInZoneToUtcMillis({
+      year: parts.year,
+      month: parts.month - 1,
+      day: parts.day,
+      hour: time.hour,
+      minute: time.minute,
+      timeZone,
+    });
+    if (utcMillis === null) return null;
+    if (utcMillis < now - 60 * 60 * 1000) {
+      utcMillis =
+        localTimeInZoneToUtcMillis({
+          year: parts.year,
+          month: parts.month - 1,
+          day: parts.day + 1,
+          hour: time.hour,
+          minute: time.minute,
+          timeZone,
+        }) ?? utcMillis;
+    }
+    return new Date(utcMillis).toISOString();
+  }
+
   const month = MONTHS[match[1]?.toLowerCase() ?? ""];
   if (month === undefined) return null;
   const day = Number(match[2]);
-  let hour = Number(match[3]);
+  const hour = Number(match[3]);
   const minute = match[4] === undefined ? 0 : Number(match[4]);
   const meridiem = match[5]?.toLowerCase();
+  const time = parseTime({ hour, minute, meridiem });
   const timeZone = match[6]?.trim() || Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
-  if (!Number.isFinite(day) || !Number.isFinite(hour) || !Number.isFinite(minute)) return null;
-  if (meridiem === "pm" && hour < 12) hour += 12;
-  if (meridiem === "am" && hour === 12) hour = 0;
+  if (!Number.isFinite(day) || !time) return null;
 
   const currentYear =
     timeZoneDateParts(timeZone, new Date(now))?.year ?? new Date(now).getUTCFullYear();
@@ -262,8 +328,8 @@ function parseClaudeCliResetAt(raw: string | null, now = Date.now()): string | n
     year: currentYear,
     month,
     day,
-    hour,
-    minute,
+    hour: time.hour,
+    minute: time.minute,
     timeZone,
   });
   if (utcMillis === null) return null;
@@ -273,8 +339,8 @@ function parseClaudeCliResetAt(raw: string | null, now = Date.now()): string | n
         year: currentYear + 1,
         month,
         day,
-        hour,
-        minute,
+        hour: time.hour,
+        minute: time.minute,
         timeZone,
       }) ?? utcMillis;
   }
@@ -328,7 +394,7 @@ function parseClaudeCliUsageText(
   text: string,
   plan: string | null,
   now = Date.now(),
-): ProviderUsage | null {
+): ParsedProviderUsage | null {
   const windows: PlanUsageWindow[] = [];
   let pendingResetWindowIndex: number | null = null;
   const applyPendingReset = (line: string): boolean => {
@@ -426,7 +492,7 @@ function codexWindow(input: {
   };
 }
 
-function parseCodexUsageResponse(payload: unknown): ProviderUsage | null {
+function parseCodexUsageResponse(payload: unknown): ParsedProviderUsage | null {
   const root = objectValue(payload);
   const rateLimit = objectValue(root?.rate_limit);
   if (!root || !rateLimit) return null;
@@ -500,7 +566,10 @@ function claudeLimitWindow(limit: unknown, index: number): PlanUsageWindow | nul
   };
 }
 
-function parseClaudeUsageResponse(payload: unknown, plan: string | null): ProviderUsage | null {
+function parseClaudeUsageResponse(
+  payload: unknown,
+  plan: string | null,
+): ParsedProviderUsage | null {
   const root = objectValue(payload);
   if (!root) return null;
   const limits = Array.isArray(root.limits) ? root.limits : [];
@@ -690,6 +759,7 @@ function usageSourceForInstance(
     instanceId: instance.instanceId,
     home: configuredHomeForProvider(provider, instance),
     executable: provider === "claude" ? configuredCommandOrNull(config?.binaryPath) : null,
+    environment: instance.environment,
   };
 }
 
@@ -698,17 +768,55 @@ function uniqueUsageSources(
 ): ReadonlyArray<UsageCredentialSource> {
   const seen = new Set<string>();
   return sources.filter((source) => {
-    const key = `${source.provider}:${source.home}:${source.executable ?? ""}`;
+    const key = usageProbeKey(source);
     if (seen.has(key)) return false;
     seen.add(key);
     return true;
   });
 }
 
+function usageEnvironmentKeyFromEnv(
+  environment: NodeJS.ProcessEnv,
+): ReadonlyArray<readonly [string, string]> {
+  return Object.entries(environment)
+    .filter((entry): entry is [string, string] => entry[0] !== "HOME" && entry[1] !== undefined)
+    .sort(([left], [right]) => left.localeCompare(right))
+    .map(
+      ([name, value]) =>
+        [name, NodeCrypto.createHash("sha256").update(value).digest("base64url")] as const,
+    );
+}
+
+function usageEffectiveEnvironmentKey(
+  source: UsageCredentialSource,
+): ReadonlyArray<readonly [string, string]> {
+  if (source.provider !== "claude") return [];
+  return usageEnvironmentKeyFromEnv(
+    claudeCliEnvironment(source.home, source.environment, {} as NodeJS.ProcessEnv),
+  );
+}
+
+function usageProbeKey(source: UsageCredentialSource): string {
+  return JSON.stringify([
+    source.provider,
+    source.home,
+    source.executable,
+    usageEffectiveEnvironmentKey(source),
+  ]);
+}
+
+function usageSourceKey(source: UsageCredentialSource): string {
+  return JSON.stringify([
+    source.provider,
+    source.instanceId,
+    source.home,
+    source.executable,
+    usageEffectiveEnvironmentKey(source),
+  ]);
+}
+
 function usageScopeCacheKey(sources: ReadonlyArray<UsageCredentialSource>): string {
-  return `sources:${JSON.stringify(
-    sources.map((source) => [source.provider, source.instanceId, source.home, source.executable]),
-  )}`;
+  return `sources:${JSON.stringify(sources.map((source) => usageSourceKey(source)))}`;
 }
 
 export function resolveUsageCredentialScope(
@@ -884,7 +992,7 @@ const codexUsageHeaders = (auth: Pick<CodexAuth, "accessToken" | "accountId">) =
   ...(auth.accountId ? { "ChatGPT-Account-Id": auth.accountId } : {}),
 });
 
-async function loadCodexUsage(codexHome: string): Promise<ProviderUsage | null> {
+async function loadCodexUsage(codexHome: string): Promise<ParsedProviderUsage | null> {
   const auth = await readCodexAuth(codexHome);
   if (!auth) return null;
   let response = await fetchJsonStatus(CODEX_USAGE_URL, codexUsageHeaders(auth));
@@ -904,9 +1012,13 @@ function isClaudeAuthOverrideEnvKey(key: string): boolean {
 
 function claudeCliEnvironment(
   home: string,
+  environment?: ProviderInstanceEnvironment | undefined,
   baseEnv: NodeJS.ProcessEnv = process.env,
 ): NodeJS.ProcessEnv {
-  const env: NodeJS.ProcessEnv = { ...baseEnv, HOME: home };
+  const env: NodeJS.ProcessEnv = {
+    ...mergeProviderInstanceEnvironment(environment, baseEnv),
+    HOME: home,
+  };
   for (const key of Object.keys(env)) {
     if (isClaudeAuthOverrideEnvKey(key)) {
       delete env[key];
@@ -920,7 +1032,7 @@ async function runClaudeCliJson(
   source: UsageCredentialSource,
   args: ReadonlyArray<string>,
 ): Promise<unknown | null> {
-  const env = claudeCliEnvironment(source.home);
+  const env = claudeCliEnvironment(source.home, source.environment);
   try {
     const spawnCommand = await Effect.runPromise(
       resolveSpawnCommand(source.executable ?? "claude", args, { env }),
@@ -931,7 +1043,7 @@ async function runClaudeCliJson(
       encoding: "utf8",
       maxBuffer: CLI_MAX_BUFFER_BYTES,
       shell: spawnCommand.shell,
-      timeout: UPSTREAM_TIMEOUT_MS,
+      timeout: CLAUDE_CLI_TIMEOUT_MS,
     });
     return JSON.parse(stdout);
   } catch {
@@ -954,7 +1066,7 @@ function parseClaudeAuthStatusPlan(payload: unknown): string | null {
   return [subscriptionType, rateLimitTier].filter(Boolean).join(" ") || null;
 }
 
-async function loadClaudeUsage(source: UsageCredentialSource): Promise<ProviderUsage | null> {
+async function loadClaudeUsage(source: UsageCredentialSource): Promise<ParsedProviderUsage | null> {
   const [usagePayload, authStatusPayload] = await Promise.all([
     runClaudeCliJson(source, CLAUDE_CLI_USAGE_ARGS),
     runClaudeCliJson(source, CLAUDE_CLI_AUTH_STATUS_ARGS),
@@ -966,11 +1078,13 @@ async function loadClaudeUsage(source: UsageCredentialSource): Promise<ProviderU
 
 async function loadProviderUsage(
   scope: UsageCredentialScope,
+  now: number,
 ): Promise<ReadonlyArray<ProviderUsage>> {
   const sourceCounts = new Map<PlanUsageProvider, number>();
   for (const source of scope.sources) {
     sourceCounts.set(source.provider, (sourceCounts.get(source.provider) ?? 0) + 1);
   }
+  const fetchedAt = new Date(now).toISOString();
   const tasks = scope.sources.map(async (source): Promise<ProviderUsage | null> => {
     const usage =
       source.provider === "codex"
@@ -980,6 +1094,8 @@ async function loadProviderUsage(
     const includeInstanceLabel = (sourceCounts.get(source.provider) ?? 0) > 1;
     return {
       ...usage,
+      fetchedAt,
+      sourceKey: usageSourceKey(source),
       windows: usage.windows.map((window) => ({
         ...window,
         id: `${source.provider}:${source.instanceId}:${window.id}`,
@@ -990,6 +1106,56 @@ async function loadProviderUsage(
   return (await Promise.all(tasks)).filter(
     (provider): provider is ProviderUsage => provider !== null && provider.windows.length > 0,
   );
+}
+
+function staleProviderUsage(provider: ProviderUsage): ProviderUsage {
+  return {
+    ...provider,
+    windows: provider.windows.map((window) => ({
+      ...window,
+      staleAt: window.staleAt ?? provider.fetchedAt,
+    })),
+  };
+}
+
+function mergeProviderUsageWithFallback(input: {
+  readonly sources: ReadonlyArray<UsageCredentialSource>;
+  readonly freshProviders: ReadonlyArray<ProviderUsage>;
+  readonly currentCachedProviders: ReadonlyArray<ProviderUsage>;
+  readonly staleProviders: ReadonlyArray<ProviderUsage>;
+}): ReadonlyArray<ProviderUsage> {
+  const freshBySource = new Map(
+    input.freshProviders.map((provider) => [provider.sourceKey, provider]),
+  );
+  const currentCachedBySource = new Map(
+    input.currentCachedProviders.map((provider) => [provider.sourceKey, provider]),
+  );
+  const staleBySource = new Map(
+    input.staleProviders.map((provider) => [provider.sourceKey, provider]),
+  );
+  return input.sources.flatMap((source) => {
+    const sourceKey = usageSourceKey(source);
+    const fresh = freshBySource.get(sourceKey);
+    if (fresh) return [fresh];
+    const currentCached = currentCachedBySource.get(sourceKey);
+    if (currentCached) return [currentCached];
+    const stale = staleBySource.get(sourceKey);
+    return stale ? [staleProviderUsage(stale)] : [];
+  });
+}
+
+function providerUsageSnapshot(
+  providers: ReadonlyArray<ProviderUsage>,
+  now: number,
+): PlanUsageSnapshot {
+  return {
+    updatedAt: new Date(now).toISOString(),
+    providers: providers.map((provider) => ({
+      provider: provider.provider,
+      plan: provider.plan,
+      windows: [...provider.windows],
+    })),
+  };
 }
 
 function pruneUsageCache(now: number): void {
@@ -1023,24 +1189,32 @@ export async function loadPlanUsageSnapshot(
     return existing.snapshot;
   }
 
-  const providers = await loadProviderUsage(scope);
-  const snapshot: PlanUsageSnapshot = {
-    updatedAt: new Date(now).toISOString(),
-    providers: providers.map((provider) => ({
-      provider: provider.provider,
-      plan: provider.plan,
-      windows: [...provider.windows],
-    })),
-  };
+  const freshProviders = await loadProviderUsage(scope, now);
+  const latest = cached.get(scope.cacheKey);
+  const currentCachedProviders =
+    latest && latest !== existing && latest.expiresAt > now ? latest.providers : [];
+  if (freshProviders.length === 0 && currentCachedProviders.length > 0 && latest) {
+    return latest.snapshot;
+  }
+
+  const providers = mergeProviderUsageWithFallback({
+    sources: scope.sources,
+    freshProviders,
+    currentCachedProviders,
+    staleProviders: existing?.providers ?? [],
+  });
+  const snapshot = providerUsageSnapshot(providers, now);
   if (providers.length > 0) {
     pruneUsageCache(now);
-    cached.set(scope.cacheKey, { expiresAt: now + CACHE_TTL_MS, snapshot });
+    cached.set(scope.cacheKey, { expiresAt: now + CACHE_TTL_MS, providers, snapshot });
   }
   return snapshot;
 }
 
 export const __testing = {
   CLAUDE_CLI_USAGE_ARGS,
+  CLAUDE_CLI_TIMEOUT_MS,
+  UPSTREAM_TIMEOUT_MS,
   parseCodexUsageResponse,
   parseClaudeUsageResponse,
   parseClaudeCliUsageText,
