@@ -40,6 +40,12 @@ function updateExistingMessageForMessageSent(
   message: OrchestrationMessage,
 ): OrchestrationMessage {
   const sameTurn = entry.turnId === message.turnId;
+  // Delivery healing can replay events out of order: an older streaming chunk
+  // for the same turn must not clobber newer text. Accepted chunks advance
+  // `updatedAt` below so the watermark tracks the newest applied chunk.
+  if (message.streaming && sameTurn && entry.updatedAt > message.updatedAt) {
+    return entry;
+  }
   const text = sameTurn
     ? message.streaming
       ? `${entry.text}${message.text}`
@@ -60,7 +66,7 @@ function updateExistingMessageForMessageSent(
     turnId: message.turnId,
     streaming: message.streaming,
     createdAt: sameTurn ? entry.createdAt : message.createdAt,
-    updatedAt: message.streaming && sameTurn ? entry.updatedAt : message.updatedAt,
+    updatedAt: message.updatedAt,
   };
 }
 
@@ -239,6 +245,15 @@ export function applyThreadDetailEvent(
       };
 
       const existingMessage = thread.messages.find((entry) => entry.id === message.id);
+      // A replayed chunk rejected by the watermark guard must leave the thread
+      // fully untouched — advancing thread.updatedAt (or rolling it back to the
+      // replay's timestamp) would distort the snapshot freshness comparison.
+      if (
+        existingMessage !== undefined &&
+        updateExistingMessageForMessageSent(existingMessage, message) === existingMessage
+      ) {
+        return { kind: "unchanged" };
+      }
       const messages = existingMessage
         ? Arr.map(thread.messages, (entry) =>
             entry.id !== message.id ? entry : updateExistingMessageForMessageSent(entry, message),

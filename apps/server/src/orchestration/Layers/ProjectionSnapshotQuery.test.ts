@@ -567,7 +567,7 @@ projectionSnapshotLayer("ProjectionSnapshotQuery", (it) => {
             'default',
             NULL,
             NULL,
-            NULL,
+            'turn-archived',
             NULL,
             0,
             0,
@@ -577,6 +577,41 @@ projectionSnapshotLayer("ProjectionSnapshotQuery", (it) => {
             '2026-04-06T00:00:06.000Z',
             NULL
           )
+      `;
+
+      yield* sql`
+        INSERT INTO projection_turns (
+          thread_id,
+          turn_id,
+          pending_message_id,
+          source_proposed_plan_thread_id,
+          source_proposed_plan_id,
+          assistant_message_id,
+          state,
+          requested_at,
+          started_at,
+          completed_at,
+          checkpoint_turn_count,
+          checkpoint_ref,
+          checkpoint_status,
+          checkpoint_files_json
+        )
+        VALUES (
+          'thread-archived',
+          'turn-archived',
+          NULL,
+          NULL,
+          NULL,
+          NULL,
+          'completed',
+          '2026-04-06T00:00:04.000Z',
+          '2026-04-06T00:00:04.500Z',
+          '2026-04-06T00:00:05.000Z',
+          NULL,
+          NULL,
+          NULL,
+          '[]'
+        )
       `;
 
       yield* sql`
@@ -603,6 +638,21 @@ projectionSnapshotLayer("ProjectionSnapshotQuery", (it) => {
         [ThreadId.make("thread-archived")],
       );
       assert.equal(archivedShellSnapshot.threads[0]?.archivedAt, "2026-04-06T00:00:06.000Z");
+
+      const archivedDetailSnapshot = yield* snapshotQuery.getThreadDetailSnapshot(
+        ThreadId.make("thread-archived"),
+      );
+      assert.equal(archivedDetailSnapshot._tag, "Some");
+      if (archivedDetailSnapshot._tag === "Some") {
+        assert.equal(archivedDetailSnapshot.value.thread.id, "thread-archived");
+        assert.equal(archivedDetailSnapshot.value.thread.archivedAt, "2026-04-06T00:00:06.000Z");
+        assert.equal(archivedDetailSnapshot.value.thread.latestTurn?.turnId, "turn-archived");
+      }
+
+      const activeShellForArchived = yield* snapshotQuery.getThreadShellById(
+        ThreadId.make("thread-archived"),
+      );
+      assert.equal(activeShellForArchived._tag, "None");
     }),
   );
 

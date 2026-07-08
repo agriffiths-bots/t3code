@@ -334,6 +334,105 @@ describe("applyThreadDetailEvent", () => {
       }
     });
 
+    it("appends same-timestamp streaming chunks", () => {
+      const threadWithMessage: OrchestrationThread = {
+        ...baseThread,
+        messages: [
+          {
+            id: MessageId.make("msg-same-ms"),
+            role: "assistant",
+            text: "first",
+            turnId: TurnId.make("turn-1"),
+            streaming: true,
+            createdAt: "2026-04-01T06:00:00.000Z",
+            updatedAt: "2026-04-01T06:00:00.000Z",
+          },
+        ],
+      };
+
+      const result = applyThreadDetailEvent(threadWithMessage, {
+        ...baseEventFields,
+        sequence: 7,
+        occurredAt: "2026-04-01T06:00:00.000Z",
+        aggregateKind: "thread",
+        aggregateId: ThreadId.make("thread-1"),
+        type: "thread.message-sent",
+        payload: {
+          threadId: ThreadId.make("thread-1"),
+          messageId: MessageId.make("msg-same-ms"),
+          role: "assistant",
+          text: " second",
+          turnId: TurnId.make("turn-1"),
+          streaming: true,
+          createdAt: "2026-04-01T06:00:00.000Z",
+          updatedAt: "2026-04-01T06:00:00.000Z",
+        },
+      });
+
+      expect(result.kind).toBe("updated");
+      if (result.kind === "updated") {
+        expect(result.thread.messages[0]?.text).toBe("first second");
+      }
+    });
+
+    it("rejects replayed streaming chunks older than the newest accepted chunk", () => {
+      const threadWithMessage: OrchestrationThread = {
+        ...baseThread,
+        messages: [
+          {
+            id: MessageId.make("msg-watermark"),
+            role: "assistant",
+            text: "first",
+            turnId: TurnId.make("turn-1"),
+            streaming: true,
+            createdAt: "2026-04-01T06:00:00.000Z",
+            updatedAt: "2026-04-01T06:00:00.000Z",
+          },
+        ],
+      };
+
+      const chunk = (text: string, at: string, sequence: number) =>
+        ({
+          ...baseEventFields,
+          sequence,
+          occurredAt: at,
+          aggregateKind: "thread",
+          aggregateId: ThreadId.make("thread-1"),
+          type: "thread.message-sent",
+          payload: {
+            threadId: ThreadId.make("thread-1"),
+            messageId: MessageId.make("msg-watermark"),
+            role: "assistant",
+            text,
+            turnId: TurnId.make("turn-1"),
+            streaming: true,
+            createdAt: at,
+            updatedAt: at,
+          },
+        }) as const;
+
+      const afterNewest = applyThreadDetailEvent(
+        threadWithMessage,
+        chunk(" third", "2026-04-01T06:00:10.000Z", 7),
+      );
+      expect(afterNewest.kind).toBe("updated");
+      if (afterNewest.kind !== "updated") {
+        return;
+      }
+      // The accepted chunk advances the watermark, so a replayed chunk that is
+      // older than the newest accepted one (but newer than the original
+      // message) must be dropped instead of appended again.
+      const replayed = applyThreadDetailEvent(
+        afterNewest.thread,
+        chunk(" second", "2026-04-01T06:00:05.000Z", 8),
+      );
+      // The rejected replay must leave the thread fully untouched — including
+      // thread.updatedAt, which must not roll back to the replay's timestamp.
+      expect(replayed.kind).toBe("unchanged");
+      expect(afterNewest.thread.messages[0]?.text).toBe("first third");
+      expect(afterNewest.thread.messages[0]?.updatedAt).toBe("2026-04-01T06:00:10.000Z");
+    });
+
     it("updates latestTurn for assistant messages with a turn", () => {
       const result = applyThreadDetailEvent(baseThread, {
         ...baseEventFields,
