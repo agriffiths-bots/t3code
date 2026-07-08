@@ -3,8 +3,9 @@ import * as Schema from "effect/Schema";
 import { Tool, Toolkit } from "effect/unstable/ai";
 
 import { ServerSettingsService } from "../../../serverSettings.ts";
+import * as McpInvocationContext from "../../McpInvocationContext.ts";
 
-const dependencies = [ServerSettingsService];
+const dependencies = [ServerSettingsService, McpInvocationContext.McpInvocationContext];
 
 export const GetUsageInput = Schema.Struct({
   providerInstanceId: Schema.optional(ProviderInstanceId),

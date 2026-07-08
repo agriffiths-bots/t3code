@@ -36,7 +36,7 @@ import * as SynchronizedRef from "effect/SynchronizedRef";
 import * as McpInvocationContext from "./McpInvocationContext.ts";
 
 export interface PreviewAutomationInvokeInput {
-  readonly scope: McpInvocationContext.McpInvocationScope;
+  readonly scope: McpInvocationContext.ProviderMcpInvocationScope;
   readonly operation: PreviewAutomationOperation;
   readonly input: unknown;
   readonly tabId?: PreviewTabId;
@@ -86,10 +86,10 @@ interface HostAssignment {
 
 interface PreviewAutomationRequestErrorContext {
   readonly operation: PreviewAutomationOperation;
-  readonly environmentId: McpInvocationContext.McpInvocationScope["environmentId"];
-  readonly threadId: McpInvocationContext.McpInvocationScope["threadId"];
+  readonly environmentId: McpInvocationContext.ProviderMcpInvocationScope["environmentId"];
+  readonly threadId: McpInvocationContext.ProviderMcpInvocationScope["threadId"];
   readonly providerSessionId: string;
-  readonly providerInstanceId: McpInvocationContext.McpInvocationScope["providerInstanceId"];
+  readonly providerInstanceId: McpInvocationContext.ProviderMcpInvocationScope["providerInstanceId"];
   readonly clientId: string;
   readonly connectionId: ClientConnection["connectionId"];
   readonly requestId: string;
@@ -160,7 +160,7 @@ const selectorDiagnosticsFromInput = (
   return {};
 };
 
-const hostAssignmentKey = (scope: McpInvocationContext.McpInvocationScope): string =>
+const hostAssignmentKey = (scope: McpInvocationContext.ProviderMcpInvocationScope): string =>
   `${scope.environmentId}\u0000${scope.providerSessionId}`;
 
 const isPreviewTabId = Schema.is(PreviewTabId);

@@ -80,6 +80,7 @@ const parentProject: OrchestrationProjectShell = {
 };
 
 const invocation = {
+  credentialKind: "provider-session" as const,
   environmentId,
   threadId: parentThreadId,
   providerSessionId: "provider-session-subagent-test",
@@ -87,6 +88,20 @@ const invocation = {
   capabilities: new Set(["thread-management"] as const),
   issuedAt: 1,
   expiresAt: Number.MAX_SAFE_INTEGER,
+};
+const peerInvocation: McpInvocationContext.PeerMcpInvocationScope = {
+  credentialKind: "peer",
+  environmentId,
+  peerTokenId: "peer-subagent-test",
+  capabilities: new Set(["subagent:spawn", "subagent:check", "subagent:wait", "subagent:list"]),
+  issuedAt: 1,
+  expiresAt: null,
+};
+const entitledPeerInvocation: McpInvocationContext.PeerMcpInvocationScope = {
+  ...peerInvocation,
+  peerTokenId: "peer-subagent-entitled-test",
+  allowedParentThreadIds: new Set([parentThreadId]),
+  allowedChildThreadIds: new Set([childThreadId]),
 };
 
 const client = McpSchema.McpServerClient.of({
@@ -572,6 +587,88 @@ describe("SubagentToolkit", () => {
     ),
   );
 
+  it.effect("allows peer-scoped list when the parent thread is explicit", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const server = yield* McpServer.McpServer;
+
+        const result = yield* server
+          .callTool({
+            name: "t3_list_subagents",
+            arguments: { parentThreadId },
+          })
+          .pipe(
+            Effect.provideService(
+              McpInvocationContext.McpInvocationContext,
+              entitledPeerInvocation,
+            ),
+            Effect.provideService(McpSchema.McpServerClient, client),
+          );
+
+        expect(result.isError).toBe(false);
+        expect(result.structuredContent).toMatchObject({
+          parentThreadId,
+          children: [
+            {
+              childThreadId,
+              parentThreadId,
+              detached: true,
+            },
+          ],
+        });
+      }),
+    ).pipe(Effect.provide(TestLayer)),
+  );
+
+  it.effect("rejects peer-scoped list without an explicit parent thread", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const server = yield* McpServer.McpServer;
+
+        const result = yield* server
+          .callTool({ name: "t3_list_subagents", arguments: {} })
+          .pipe(
+            Effect.provideService(McpInvocationContext.McpInvocationContext, peerInvocation),
+            Effect.provideService(McpSchema.McpServerClient, client),
+          );
+
+        expect(result.isError).toBe(true);
+        const content = result.content?.[0];
+        expect(content?.type).toBe("text");
+        if (content?.type !== "text") throw new Error("Expected text error content.");
+        expect(content.text).toContain(
+          "parentThreadId is required when listing with a peer-scoped credential",
+        );
+      }),
+    ).pipe(Effect.provide(TestLayer)),
+  );
+
+  it.effect("rejects peer-scoped list for an unauthorized parent thread", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const server = yield* McpServer.McpServer;
+
+        const result = yield* server
+          .callTool({
+            name: "t3_list_subagents",
+            arguments: { parentThreadId },
+          })
+          .pipe(
+            Effect.provideService(McpInvocationContext.McpInvocationContext, peerInvocation),
+            Effect.provideService(McpSchema.McpServerClient, client),
+          );
+
+        expect(result.isError).toBe(true);
+        const content = result.content?.[0];
+        expect(content?.type).toBe("text");
+        if (content?.type !== "text") throw new Error("Expected text error content.");
+        expect(content.text).toContain(
+          `Peer-scoped sub-agent credential is not authorized for parent thread ${parentThreadId}`,
+        );
+      }),
+    ).pipe(Effect.provide(TestLayer)),
+  );
+
   it.effect(
     "checks a current completed stopped child as completed with a checkpointless turn count",
     () =>
@@ -615,6 +712,87 @@ describe("SubagentToolkit", () => {
         ),
         Effect.provide(TestLayer),
       ),
+  );
+
+  it.effect("allows peer-scoped check for an authorized child thread", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const server = yield* McpServer.McpServer;
+
+        const result = yield* server
+          .callTool({
+            name: "t3_check_subagent",
+            arguments: { childThreadId },
+          })
+          .pipe(
+            Effect.provideService(
+              McpInvocationContext.McpInvocationContext,
+              entitledPeerInvocation,
+            ),
+            Effect.provideService(McpSchema.McpServerClient, client),
+          );
+
+        expect(result.isError).toBe(false);
+        expect(result.structuredContent).toMatchObject({
+          threadId: childThreadId,
+          latestAssistantText: "child done",
+        });
+      }),
+    ).pipe(Effect.provide(TestLayer)),
+  );
+
+  it.effect("rejects peer-scoped check for an unauthorized child thread", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const server = yield* McpServer.McpServer;
+
+        const result = yield* server
+          .callTool({
+            name: "t3_check_subagent",
+            arguments: { childThreadId },
+          })
+          .pipe(
+            Effect.provideService(McpInvocationContext.McpInvocationContext, peerInvocation),
+            Effect.provideService(McpSchema.McpServerClient, client),
+          );
+
+        expect(result.isError).toBe(true);
+        const content = result.content?.[0];
+        expect(content?.type).toBe("text");
+        if (content?.type !== "text") throw new Error("Expected text error content.");
+        expect(content.text).toContain(
+          `Peer-scoped sub-agent credential is not authorized for child thread ${childThreadId}`,
+        );
+        expect(content.text).not.toContain("child done");
+      }),
+    ).pipe(Effect.provide(TestLayer)),
+  );
+
+  it.effect("rejects peer-scoped wait for an unauthorized child thread", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const server = yield* McpServer.McpServer;
+
+        const result = yield* server
+          .callTool({
+            name: "t3_wait_subagent",
+            arguments: { childThreadIds: [childThreadId] },
+          })
+          .pipe(
+            Effect.provideService(McpInvocationContext.McpInvocationContext, peerInvocation),
+            Effect.provideService(McpSchema.McpServerClient, client),
+          );
+
+        expect(result.isError).toBe(true);
+        const content = result.content?.[0];
+        expect(content?.type).toBe("text");
+        if (content?.type !== "text") throw new Error("Expected text error content.");
+        expect(content.text).toContain(
+          `Peer-scoped sub-agent credential is not authorized for child thread ${childThreadId}`,
+        );
+        expect(content.text).not.toContain("child done");
+      }),
+    ).pipe(Effect.provide(TestLayer)),
   );
 
   it.effect("reports a stopped child with only a stale completed latest turn as failed", () =>

@@ -3,6 +3,7 @@ import * as Layer from "effect/Layer";
 
 import { ServerSettingsService } from "../../../serverSettings.ts";
 import { loadPlanUsageSnapshot } from "../../../usage/PlanUsage.ts";
+import * as McpInvocationContext from "../../McpInvocationContext.ts";
 import { GetUsageToolError, UsageToolkit, type GetUsageInput } from "./tools.ts";
 
 const toToolError = (message: string, error: unknown): GetUsageToolError =>
@@ -14,17 +15,22 @@ const makeHandlers = Effect.fn("UsageToolkit.makeHandlers")(function* () {
   const serverSettings = yield* ServerSettingsService;
 
   const getUsage = (input: GetUsageInput) =>
-    serverSettings.getSettings.pipe(
-      Effect.mapError((error) => toToolError("Failed to read server settings", error)),
-      Effect.flatMap((settings) =>
-        Effect.tryPromise({
-          try: () =>
-            loadPlanUsageSnapshot({
-              settings,
-              providerInstanceId: input.providerInstanceId ?? null,
+    McpInvocationContext.requireProviderMcpCapability("thread-management").pipe(
+      Effect.mapError((error) => toToolError("MCP credential is not authorized for usage", error)),
+      Effect.andThen(
+        serverSettings.getSettings.pipe(
+          Effect.mapError((error) => toToolError("Failed to read server settings", error)),
+          Effect.flatMap((settings) =>
+            Effect.tryPromise({
+              try: () =>
+                loadPlanUsageSnapshot({
+                  settings,
+                  providerInstanceId: input.providerInstanceId ?? null,
+                }),
+              catch: (error) => toToolError("Failed to load provider usage", error),
             }),
-          catch: (error) => toToolError("Failed to load provider usage", error),
-        }),
+          ),
+        ),
       ),
     );
 
