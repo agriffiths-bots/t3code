@@ -14,7 +14,13 @@ import { ProviderRegistry } from "../../../provider/Services/ProviderRegistry.ts
 
 const dependencies = [ProviderRegistry, ProjectionSnapshotQuery];
 
-export const ListBackendsInput = Schema.Struct({});
+// This tool takes no arguments. `Schema.Struct({})` must NOT be used here: its
+// JSON Schema emits `anyOf: [{type:"object"},{type:"array"}]` with no top-level
+// `type`, and the OpenAI function-calling API rejects the ENTIRE request with
+// HTTP 400 `invalid_function_parameters` when any attached tool's schema lacks
+// top-level `type: "object"` — killing every Codex turn on its first call.
+// `Schema.Record(String, Never)` emits `{type:"object",additionalProperties:false}`.
+export const ListBackendsInput = Schema.Record(Schema.String, Schema.Never);
 export type ListBackendsInput = typeof ListBackendsInput.Type;
 
 const BackendProjectFields = {

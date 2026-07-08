@@ -242,11 +242,35 @@ export const VisibilityToolkitRegistrationLive = McpServer.toolkit(VisibilityToo
   Layer.provide(VisibilityToolkitHandlersLive),
 );
 
+const MCP_PATH = "/mcp";
+
 const McpTransportLive = McpServer.layerHttp({
   name: "T3 Code",
   version: packageJson.version,
-  path: "/mcp",
+  path: MCP_PATH,
 }).pipe(Layer.provide(McpAuthMiddlewareLive));
+
+// The Streamable-HTTP transport above registers POST (JSON-RPC) and DELETE
+// (session termination) on MCP_PATH — but no GET route. Without an explicit
+// GET handler the request falls through to the SPA fallback, which serves
+// index.html with 200. MCP clients open GET as the optional server-initiated
+// SSE stream and treat that instant-closing HTML response as a broken stream,
+// so they reconnect in a tight loop and the transport never settles — tools
+// never surface (observed live: thousands of sub-10ms `GET /mcp` 200s per
+// session while the agent reports "still connecting"). We do not offer a
+// server-initiated stream, and the MCP spec requires servers that don't to
+// answer GET with 405 Method Not Allowed; conformant clients then settle into
+// POST-only operation.
+const mcpGetMethodNotAllowed = HttpServerResponse.empty({
+  status: 405,
+  headers: { allow: "POST, DELETE" },
+});
+export const McpGetMethodNotAllowedLive = Layer.effectDiscard(
+  Effect.gen(function* () {
+    const router = yield* HttpRouter.HttpRouter;
+    yield* router.add("GET", MCP_PATH, Effect.succeed(mcpGetMethodNotAllowed));
+  }),
+);
 
 export const ToolkitRegistrationLive = Layer.mergeAll(
   PreviewToolkitRegistrationLive,
@@ -257,7 +281,10 @@ export const ToolkitRegistrationLive = Layer.mergeAll(
   VisibilityToolkitRegistrationLive,
 );
 
-export const layer = ToolkitRegistrationLive.pipe(Layer.provideMerge(McpTransportLive));
+export const layer = Layer.mergeAll(
+  ToolkitRegistrationLive.pipe(Layer.provideMerge(McpTransportLive)),
+  McpGetMethodNotAllowedLive,
+);
 
 export const __testing = {
   unauthorized,
