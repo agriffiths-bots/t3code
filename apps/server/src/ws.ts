@@ -118,6 +118,7 @@ import { failEnvironmentAuthInvalid, failEnvironmentInternal } from "./auth/http
 import * as RelayClient from "@t3tools/shared/relayClient";
 import { makeServerConfigHeartbeatStream, shouldSendServerConfigHeartbeat } from "./wsKeepalive.ts";
 const isOrchestrationDispatchCommandError = Schema.is(OrchestrationDispatchCommandError);
+const isOrchestrationGetSnapshotError = Schema.is(OrchestrationGetSnapshotError);
 const isOrchestrationScheduledTaskMutationError = Schema.is(
   OrchestrationScheduledTaskMutationError,
 );
@@ -559,7 +560,11 @@ const makeWsRpcLayer = (
 
       const toShellStreamEvent = (
         event: OrchestrationEvent,
-      ): Effect.Effect<Option.Option<OrchestrationShellStreamEvent>, never, never> => {
+      ): Effect.Effect<
+        Option.Option<OrchestrationShellStreamEvent>,
+        OrchestrationGetSnapshotError,
+        never
+      > => {
         switch (event.type) {
           case "project.created":
           case "project.meta-updated":
@@ -571,7 +576,13 @@ const makeWsRpcLayer = (
                   project: nextProject,
                 })),
               ),
-              Effect.orElseSucceed(() => Option.none()),
+              Effect.mapError(
+                (cause) =>
+                  new OrchestrationGetSnapshotError({
+                    message: "Failed to load orchestration project shell",
+                    cause,
+                  }),
+              ),
             );
           case "project.deleted":
             return Effect.succeed(
@@ -599,7 +610,13 @@ const makeWsRpcLayer = (
                   thread: nextThread,
                 })),
               ),
-              Effect.orElseSucceed(() => Option.none()),
+              Effect.mapError(
+                (cause) =>
+                  new OrchestrationGetSnapshotError({
+                    message: "Failed to load orchestration thread shell",
+                    cause,
+                  }),
+              ),
             );
           default:
             if (event.aggregateKind !== "thread") {
@@ -615,7 +632,13 @@ const makeWsRpcLayer = (
                     thread: nextThread,
                   })),
                 ),
-                Effect.orElseSucceed(() => Option.none()),
+                Effect.mapError(
+                  (cause) =>
+                    new OrchestrationGetSnapshotError({
+                      message: "Failed to load orchestration thread shell",
+                      cause,
+                    }),
+                ),
               );
         }
       };
@@ -832,7 +855,10 @@ const makeWsRpcLayer = (
           observeRpcStreamEffect(
             ORCHESTRATION_WS_METHODS.subscribeShell,
             Effect.gen(function* () {
-              const liveStream = orchestrationEngine.streamDomainEvents.pipe(
+              const liveStream: Stream.Stream<
+                OrchestrationShellStreamItem,
+                OrchestrationGetSnapshotError
+              > = orchestrationEngine.streamDomainEvents.pipe(
                 Stream.mapEffect(toShellStreamEvent),
                 Stream.flatMap((event) =>
                   Option.isSome(event) ? Stream.succeed(event.value) : Stream.empty,
@@ -852,9 +878,38 @@ const makeWsRpcLayer = (
                 const afterSequence = input.afterSequence;
                 return Stream.unwrap(
                   Effect.gen(function* () {
-                    const liveBuffer = yield* Queue.unbounded<OrchestrationShellStreamItem>();
+                    const liveBuffer = yield* Queue.unbounded<
+                      | {
+                          readonly _tag: "item";
+                          readonly item: OrchestrationShellStreamItem;
+                        }
+                      | {
+                          readonly _tag: "error";
+                          readonly error: OrchestrationGetSnapshotError;
+                        }
+                    >();
+                    const liveBufferStream = Stream.fromQueue(liveBuffer).pipe(
+                      Stream.mapEffect((entry) =>
+                        entry._tag === "item"
+                          ? Effect.succeed(entry.item)
+                          : Effect.fail(entry.error),
+                      ),
+                    );
                     yield* Effect.forkScoped(
-                      liveStream.pipe(Stream.runForEach((item) => Queue.offer(liveBuffer, item))),
+                      liveStream.pipe(
+                        Stream.runForEach((item) =>
+                          Queue.offer(liveBuffer, {
+                            _tag: "item" as const,
+                            item,
+                          }),
+                        ),
+                        Effect.catch((error) =>
+                          Queue.offer(liveBuffer, {
+                            _tag: "error" as const,
+                            error,
+                          }),
+                        ),
+                      ),
                     );
                     const currentSequence = yield* projectionSnapshotQuery
                       .getSnapshotSequence()
@@ -870,9 +925,11 @@ const makeWsRpcLayer = (
                             }),
                         ),
                       );
+                    const isClientCursorAhead = afterSequence > currentSequence.snapshotSequence;
                     if (
+                      isClientCursorAhead ||
                       currentSequence.snapshotSequence - afterSequence >
-                      SHELL_REPLAY_SNAPSHOT_GAP_THRESHOLD
+                        SHELL_REPLAY_SNAPSHOT_GAP_THRESHOLD
                     ) {
                       const snapshot = yield* projectionSnapshotQuery.getShellSnapshot().pipe(
                         Effect.tapError((cause) =>
@@ -890,8 +947,9 @@ const makeWsRpcLayer = (
                         Stream.make({
                           kind: "snapshot" as const,
                           snapshot,
+                          ...(isClientCursorAhead ? { force: true } : {}),
                         }),
-                        Stream.fromQueue(liveBuffer),
+                        liveBufferStream,
                       );
                     }
                     const catchUpStream = orchestrationEngine
@@ -901,12 +959,13 @@ const makeWsRpcLayer = (
                         Stream.flatMap((event) =>
                           Option.isSome(event) ? Stream.succeed(event.value) : Stream.empty,
                         ),
-                        Stream.mapError(
-                          (cause) =>
-                            new OrchestrationGetSnapshotError({
-                              message: "Failed to replay orchestration shell events",
-                              cause,
-                            }),
+                        Stream.mapError((cause) =>
+                          isOrchestrationGetSnapshotError(cause)
+                            ? cause
+                            : new OrchestrationGetSnapshotError({
+                                message: "Failed to replay orchestration shell events",
+                                cause,
+                              }),
                         ),
                       );
                     return Stream.concat(
@@ -916,7 +975,7 @@ const makeWsRpcLayer = (
                           kind: "caught-up" as const,
                           sequence: currentSequence.snapshotSequence,
                         }),
-                        Stream.fromQueue(liveBuffer),
+                        liveBufferStream,
                       ),
                     );
                   }),

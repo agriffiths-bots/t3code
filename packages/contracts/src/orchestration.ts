@@ -465,6 +465,7 @@ export const OrchestrationShellStreamItem = Schema.Union([
   Schema.Struct({
     kind: Schema.Literal("snapshot"),
     snapshot: OrchestrationShellSnapshot,
+    force: Schema.optional(Schema.Boolean),
   }),
   OrchestrationShellCaughtUp,
   OrchestrationShellStreamEvent,

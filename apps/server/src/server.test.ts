@@ -46,12 +46,14 @@ import * as Deferred from "effect/Deferred";
 import * as DateTime from "effect/DateTime";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
+import * as Fiber from "effect/Fiber";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as ManagedRuntime from "effect/ManagedRuntime";
 import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 import * as PubSub from "effect/PubSub";
+import * as Queue from "effect/Queue";
 import * as Stream from "effect/Stream";
 import * as TestClock from "effect/testing/TestClock";
 import { ChildProcessSpawner } from "effect/unstable/process";
@@ -6079,6 +6081,167 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
 
       assert.deepEqual(Array.from(items), [{ kind: "caught-up", sequence: 2_500 }]);
       assert.equal(shellSnapshotCalled, false);
+    }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+
+  it.effect("serves an authoritative shell snapshot when the client cursor is ahead", () =>
+    Effect.gen(function* () {
+      const snapshot = {
+        snapshotSequence: 25,
+        projects: [],
+        threads: [
+          makeDefaultOrchestrationThreadShell({
+            id: ThreadId.make("thread-reset-shell"),
+            title: "Reset shell thread",
+          }),
+        ],
+        updatedAt: "2026-07-08T16:00:00.000Z",
+      };
+      let readEventsCalled = false;
+
+      yield* buildAppUnderTest({
+        layers: {
+          projectionSnapshotQuery: {
+            getSnapshotSequence: () =>
+              Effect.succeed({ snapshotSequence: snapshot.snapshotSequence }),
+            getShellSnapshot: () => Effect.succeed(snapshot),
+          },
+          orchestrationEngine: {
+            readEvents: () => {
+              readEventsCalled = true;
+              return Stream.empty;
+            },
+          },
+        },
+      });
+
+      const wsUrl = yield* getWsServerUrl("/ws");
+      const items = yield* Effect.scoped(
+        withWsRpcClient(wsUrl, (client) =>
+          client[ORCHESTRATION_WS_METHODS.subscribeShell]({ afterSequence: 250 }).pipe(
+            Stream.take(1),
+            Stream.runCollect,
+          ),
+        ),
+      );
+
+      assert.deepEqual(Array.from(items), [{ kind: "snapshot", snapshot, force: true }]);
+      assert.equal(readEventsCalled, false);
+    }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+
+  it.effect("fails shell replay instead of acknowledging dropped projection lookups", () =>
+    Effect.gen(function* () {
+      const projectionError = new PersistenceSqlError({
+        operation: "ProjectionSnapshotQuery.getProjectShellById:test",
+        detail: "failed to read replayed project shell",
+      });
+
+      yield* buildAppUnderTest({
+        layers: {
+          projectionSnapshotQuery: {
+            getSnapshotSequence: () => Effect.succeed({ snapshotSequence: 1 }),
+            getProjectShellById: () => Effect.fail(projectionError),
+          },
+          orchestrationEngine: {
+            readEvents: () =>
+              Stream.make({
+                sequence: 1,
+                eventId: EventId.make("event-shell-projection-failure"),
+                aggregateKind: "project",
+                aggregateId: defaultProjectId,
+                occurredAt: "2026-04-05T00:00:00.000Z",
+                commandId: null,
+                causationEventId: null,
+                correlationId: null,
+                metadata: {},
+                type: "project.created",
+                payload: {
+                  projectId: defaultProjectId,
+                  title: "Default Project",
+                  workspaceRoot: "/tmp/default-project",
+                  defaultModelSelection,
+                  scripts: [],
+                  createdAt: "2026-04-05T00:00:00.000Z",
+                  updatedAt: "2026-04-05T00:00:00.000Z",
+                },
+              } satisfies Extract<OrchestrationEvent, { type: "project.created" }>),
+          },
+        },
+      });
+
+      const wsUrl = yield* getWsServerUrl("/ws");
+      const result = yield* Effect.scoped(
+        withWsRpcClient(wsUrl, (client) =>
+          client[ORCHESTRATION_WS_METHODS.subscribeShell]({ afterSequence: 0 }).pipe(
+            Stream.runCollect,
+          ),
+        ).pipe(Effect.result),
+      );
+
+      assertTrue(result._tag === "Failure");
+      assertTrue(result.failure._tag === "OrchestrationGetSnapshotError");
+      assert.include(result.failure.message, "Failed to load orchestration project shell");
+    }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+
+  it.effect("propagates live shell projection failures from the replay buffer", () =>
+    Effect.gen(function* () {
+      const liveEvents = yield* Queue.unbounded<OrchestrationEvent>();
+      const projectionError = new PersistenceSqlError({
+        operation: "ProjectionSnapshotQuery.getProjectShellById:live",
+        detail: "failed to read live project shell",
+      });
+
+      yield* buildAppUnderTest({
+        layers: {
+          projectionSnapshotQuery: {
+            getSnapshotSequence: () => Effect.succeed({ snapshotSequence: 1 }),
+            getProjectShellById: () => Effect.fail(projectionError),
+          },
+          orchestrationEngine: {
+            readEvents: () => Stream.empty,
+            streamDomainEvents: Stream.fromQueue(liveEvents),
+          },
+        },
+      });
+
+      const wsUrl = yield* getWsServerUrl("/ws");
+      const result = yield* Effect.scoped(
+        withWsRpcClient(wsUrl, (client) =>
+          Effect.gen(function* () {
+            const fiber = yield* client[ORCHESTRATION_WS_METHODS.subscribeShell]({
+              afterSequence: 1,
+            }).pipe(Stream.runCollect, Effect.result, Effect.forkScoped);
+            yield* Queue.offer(liveEvents, {
+              sequence: 2,
+              eventId: EventId.make("event-live-shell-projection-failure"),
+              aggregateKind: "project",
+              aggregateId: defaultProjectId,
+              occurredAt: "2026-04-05T00:00:00.000Z",
+              commandId: null,
+              causationEventId: null,
+              correlationId: null,
+              metadata: {},
+              type: "project.created",
+              payload: {
+                projectId: defaultProjectId,
+                title: "Default Project",
+                workspaceRoot: "/tmp/default-project",
+                defaultModelSelection,
+                scripts: [],
+                createdAt: "2026-04-05T00:00:00.000Z",
+                updatedAt: "2026-04-05T00:00:00.000Z",
+              },
+            } satisfies Extract<OrchestrationEvent, { type: "project.created" }>);
+            return yield* Fiber.join(fiber);
+          }),
+        ),
+      );
+
+      assertTrue(result._tag === "Failure");
+      assertTrue(result.failure._tag === "OrchestrationGetSnapshotError");
+      assert.include(result.failure.message, "Failed to load orchestration project shell");
     }).pipe(Effect.provide(NodeHttpServer.layerTest)),
   );
 
