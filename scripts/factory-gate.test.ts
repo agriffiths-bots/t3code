@@ -53,7 +53,15 @@ function copyRepoFile(root: string, relativePath: string): void {
   NodeFS.chmodSync(destination, 0o755);
 }
 
-function installFactoryFixture(root: string): { readonly audit: string; readonly repo: string } {
+interface FactoryFixtureOptions {
+  readonly parallelStaticChecks?: boolean;
+  readonly staticChecks?: ReadonlyArray<string>;
+}
+
+function installFactoryFixture(
+  root: string,
+  options: FactoryFixtureOptions = {},
+): { readonly audit: string; readonly repo: string } {
   const repo = NodePath.join(root, "repo");
   const hooks = NodePath.join(root, "hooks");
   const autoreview = NodePath.join(root, "autoreview-stub.sh");
@@ -88,9 +96,13 @@ JSON
   copyRepoFile(repo, ".githooks/pre-merge-commit");
   copyRepoFile(repo, ".githooks/prepare-commit-msg");
 
+  const staticChecks = options.staticChecks ?? ["true"];
+  const staticChecksConfig = staticChecks.map(shellQuote).join(" ");
+
   NodeFS.writeFileSync(
     NodePath.join(repo, "scripts/factory/factory.conf"),
-    `FACTORY_STATIC_CHECKS=("true")
+    `FACTORY_STATIC_CHECKS=(${staticChecksConfig})
+FACTORY_STATIC_CHECKS_PARALLEL=${options.parallelStaticChecks ? "1" : "0"}
 FACTORY_AUTOREVIEW_BIN=${shellQuote(autoreview)}
 FACTORY_REVIEW_ARGS=()
 FACTORY_UPSTREAM_REF="upstream/main"
@@ -131,6 +143,14 @@ function createTrackedFiles(repo: string): void {
   run(repo, ["git", "commit", "-qm", "add tracked files"]);
 }
 
+function readAuditRecords(audit: string): ReadonlyArray<Record<string, unknown>> {
+  return NodeFS.readFileSync(audit, "utf8")
+    .trim()
+    .split("\n")
+    .filter(Boolean)
+    .map((line) => JSON.parse(line) as Record<string, unknown>);
+}
+
 function expectPartialTreeCommitRefused(args: ReadonlyArray<string>): void {
   const root = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3-factory-gate-"));
   try {
@@ -167,5 +187,75 @@ describe("factory pre-commit gate", () => {
 
   it("refuses --only commits that would exclude staged files from the commit tree", () => {
     expectPartialTreeCommitRefused(["--only", "a.txt"]);
+  });
+
+  it("records phase timings and static check results in audit records", () => {
+    const root = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3-factory-gate-"));
+    try {
+      const { audit, repo } = installFactoryFixture(root, {
+        staticChecks: ["true", "true"],
+      });
+      NodeFS.writeFileSync(NodePath.join(repo, "timed.txt"), "timed\n");
+      run(repo, ["git", "add", "-A"]);
+
+      run(repo, ["scripts/factory/precommit-gate.sh", "--prepare"]);
+
+      const records = readAuditRecords(audit);
+      const pass = records.at(-1);
+      assert.equal(pass?.verdict, "pass");
+      assert.equal(
+        typeof (pass?.timings as { readonly total_secs?: unknown })?.total_secs,
+        "number",
+      );
+      assert.equal(
+        typeof (pass?.timings as { readonly scope_secs?: unknown })?.scope_secs,
+        "number",
+      );
+      assert.equal(
+        typeof (pass?.timings as { readonly static_secs?: unknown })?.static_secs,
+        "number",
+      );
+      assert.equal(
+        typeof (pass?.timings as { readonly review_secs?: unknown })?.review_secs,
+        "number",
+      );
+      assert.deepStrictEqual(
+        (
+          pass?.timings as { readonly static_checks?: ReadonlyArray<{ readonly cmd: string }> }
+        )?.static_checks?.map((check) => check.cmd),
+        ["true", "true"],
+      );
+    } finally {
+      NodeFS.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("runs static checks in parallel when configured", () => {
+    const root = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3-factory-gate-"));
+    try {
+      const firstReady = NodePath.join(root, "first.ready");
+      const secondReady = NodePath.join(root, "second.ready");
+      const waitForPeer = (own: string, peer: string) =>
+        `touch ${shellQuote(own)}; for i in $(seq 1 200); do [ -f ${shellQuote(peer)} ] && exit 0; sleep 0.01; done; exit 17`;
+      const { audit, repo } = installFactoryFixture(root, {
+        parallelStaticChecks: true,
+        staticChecks: [waitForPeer(firstReady, secondReady), waitForPeer(secondReady, firstReady)],
+      });
+      NodeFS.writeFileSync(NodePath.join(repo, "parallel.txt"), "parallel\n");
+      run(repo, ["git", "add", "-A"]);
+
+      run(repo, ["scripts/factory/precommit-gate.sh", "--prepare"]);
+
+      const pass = readAuditRecords(audit).at(-1);
+      assert.equal(pass?.verdict, "pass");
+      assert.deepStrictEqual(
+        (
+          pass?.timings as { readonly static_checks?: ReadonlyArray<{ readonly rc: number }> }
+        )?.static_checks?.map((check) => check.rc),
+        [0, 0],
+      );
+    } finally {
+      NodeFS.rmSync(root, { recursive: true, force: true });
+    }
   });
 });
