@@ -202,6 +202,36 @@ it.effect("reports unresponsive preview automation host as unavailable status", 
   }).pipe(Effect.provide(TimeoutTestLayer)),
 );
 
+it.effect("answers GET /mcp with 405 so it cannot fall through to the SPA fallback", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const serverLayer = Layer.mergeAll(
+        McpServer.layerHttp({
+          name: "MCP GET test",
+          version: "1.0.0",
+          path: "/mcp",
+        }),
+        McpHttpServer.McpGetMethodNotAllowedLive,
+      );
+      yield* HttpRouter.serve(serverLayer, {
+        disableListenLog: true,
+        disableLogger: true,
+      }).pipe(Layer.build);
+      const httpClient = yield* HttpClient.HttpClient;
+
+      // MCP clients probe GET as the optional server-initiated SSE stream. A
+      // 405 tells them no stream is offered and they settle into POST-only
+      // mode; anything else (like the SPA's index.html 200) reads as a broken
+      // stream and triggers a reconnect storm that keeps tools from loading.
+      const getResponse = yield* httpClient.get("/mcp", {
+        headers: { accept: "text/event-stream" },
+      });
+      expect(getResponse.status).toBe(405);
+      expect(getResponse.headers["allow"]).toBe("POST, DELETE");
+    }),
+  ).pipe(Effect.provide(NodeHttpServer.layerTest)),
+);
+
 it.effect("terminates HTTP MCP sessions with DELETE", () =>
   Effect.scoped(
     Effect.gen(function* () {
