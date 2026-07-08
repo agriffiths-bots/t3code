@@ -5997,6 +5997,91 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
     }).pipe(Effect.provide(NodeHttpServer.layerTest)),
   );
 
+  it.effect("serves a fresh shell snapshot instead of replaying an ancient cursor", () =>
+    Effect.gen(function* () {
+      const snapshot = {
+        snapshotSequence: 2_500,
+        projects: [],
+        threads: [
+          makeDefaultOrchestrationThreadShell({
+            id: ThreadId.make("thread-fresh-shell"),
+            title: "Fresh shell thread",
+          }),
+        ],
+        updatedAt: "2026-07-08T16:00:00.000Z",
+      };
+      let readEventsCalled = false;
+
+      yield* buildAppUnderTest({
+        layers: {
+          projectionSnapshotQuery: {
+            getSnapshotSequence: () =>
+              Effect.succeed({ snapshotSequence: snapshot.snapshotSequence }),
+            getShellSnapshot: () => Effect.succeed(snapshot),
+          },
+          orchestrationEngine: {
+            readEvents: () => {
+              readEventsCalled = true;
+              return Stream.empty;
+            },
+          },
+        },
+      });
+
+      const wsUrl = yield* getWsServerUrl("/ws");
+      const items = yield* Effect.scoped(
+        withWsRpcClient(wsUrl, (client) =>
+          client[ORCHESTRATION_WS_METHODS.subscribeShell]({ afterSequence: 1 }).pipe(
+            Stream.take(1),
+            Stream.runCollect,
+          ),
+        ),
+      );
+
+      assert.deepEqual(Array.from(items), [{ kind: "snapshot", snapshot }]);
+      assert.equal(readEventsCalled, false);
+    }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+
+  it.effect("acknowledges an up-to-date shell replay with no emitted events", () =>
+    Effect.gen(function* () {
+      let shellSnapshotCalled = false;
+
+      yield* buildAppUnderTest({
+        layers: {
+          projectionSnapshotQuery: {
+            getSnapshotSequence: () => Effect.succeed({ snapshotSequence: 2_500 }),
+            getShellSnapshot: () => {
+              shellSnapshotCalled = true;
+              return Effect.succeed({
+                snapshotSequence: 2_500,
+                projects: [],
+                threads: [],
+                updatedAt: "2026-07-08T16:00:00.000Z",
+              });
+            },
+          },
+          orchestrationEngine: {
+            readEvents: () => Stream.empty,
+          },
+        },
+      });
+
+      const wsUrl = yield* getWsServerUrl("/ws");
+      const items = yield* Effect.scoped(
+        withWsRpcClient(wsUrl, (client) =>
+          client[ORCHESTRATION_WS_METHODS.subscribeShell]({ afterSequence: 2_499 }).pipe(
+            Stream.take(1),
+            Stream.runCollect,
+          ),
+        ),
+      );
+
+      assert.deepEqual(Array.from(items), [{ kind: "caught-up", sequence: 2_500 }]);
+      assert.equal(shellSnapshotCalled, false);
+    }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+
   it.effect("enriches replayed project events with repository identity metadata", () =>
     Effect.gen(function* () {
       const repositoryIdentity = {

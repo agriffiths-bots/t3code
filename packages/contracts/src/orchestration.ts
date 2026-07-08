@@ -455,11 +455,18 @@ export const OrchestrationShellStreamEvent = Schema.Union([
 ]);
 export type OrchestrationShellStreamEvent = typeof OrchestrationShellStreamEvent.Type;
 
+export const OrchestrationShellCaughtUp = Schema.Struct({
+  kind: Schema.Literal("caught-up"),
+  sequence: NonNegativeInt,
+});
+export type OrchestrationShellCaughtUp = typeof OrchestrationShellCaughtUp.Type;
+
 export const OrchestrationShellStreamItem = Schema.Union([
   Schema.Struct({
     kind: Schema.Literal("snapshot"),
     snapshot: OrchestrationShellSnapshot,
   }),
+  OrchestrationShellCaughtUp,
   OrchestrationShellStreamEvent,
 ]);
 export type OrchestrationShellStreamItem = typeof OrchestrationShellStreamItem.Type;

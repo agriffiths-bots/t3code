@@ -123,6 +123,7 @@ const isOrchestrationScheduledTaskMutationError = Schema.is(
 );
 
 const nowIso = Effect.map(DateTime.now, DateTime.formatIso);
+const SHELL_REPLAY_SNAPSHOT_GAP_THRESHOLD = 1_000;
 
 function unexpectedCompatibilityError(error: never): never {
   throw new Error(`Unhandled compatibility error: ${String(error)}`);
@@ -855,6 +856,44 @@ const makeWsRpcLayer = (
                     yield* Effect.forkScoped(
                       liveStream.pipe(Stream.runForEach((item) => Queue.offer(liveBuffer, item))),
                     );
+                    const currentSequence = yield* projectionSnapshotQuery
+                      .getSnapshotSequence()
+                      .pipe(
+                        Effect.tapError((cause) =>
+                          Effect.logError("orchestration shell sequence load failed", { cause }),
+                        ),
+                        Effect.mapError(
+                          (cause) =>
+                            new OrchestrationGetSnapshotError({
+                              message: "Failed to load orchestration shell sequence",
+                              cause,
+                            }),
+                        ),
+                      );
+                    if (
+                      currentSequence.snapshotSequence - afterSequence >
+                      SHELL_REPLAY_SNAPSHOT_GAP_THRESHOLD
+                    ) {
+                      const snapshot = yield* projectionSnapshotQuery.getShellSnapshot().pipe(
+                        Effect.tapError((cause) =>
+                          Effect.logError("orchestration shell snapshot load failed", { cause }),
+                        ),
+                        Effect.mapError(
+                          (cause) =>
+                            new OrchestrationGetSnapshotError({
+                              message: "Failed to load orchestration shell snapshot",
+                              cause,
+                            }),
+                        ),
+                      );
+                      return Stream.concat(
+                        Stream.make({
+                          kind: "snapshot" as const,
+                          snapshot,
+                        }),
+                        Stream.fromQueue(liveBuffer),
+                      );
+                    }
                     const catchUpStream = orchestrationEngine
                       .readEvents(afterSequence, Number.MAX_SAFE_INTEGER)
                       .pipe(
@@ -870,7 +909,16 @@ const makeWsRpcLayer = (
                             }),
                         ),
                       );
-                    return Stream.concat(catchUpStream, Stream.fromQueue(liveBuffer));
+                    return Stream.concat(
+                      catchUpStream,
+                      Stream.concat(
+                        Stream.make({
+                          kind: "caught-up" as const,
+                          sequence: currentSequence.snapshotSequence,
+                        }),
+                        Stream.fromQueue(liveBuffer),
+                      ),
+                    );
                   }),
                 );
               }
