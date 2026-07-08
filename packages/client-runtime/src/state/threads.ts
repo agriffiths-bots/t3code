@@ -58,6 +58,70 @@ function threadBelongsInActiveDetail(thread: OrchestrationThread): boolean {
   return thread.deletedAt === null;
 }
 
+function compareString(left: string, right: string): number {
+  if (left < right) return -1;
+  if (left > right) return 1;
+  return 0;
+}
+
+function mergeKeyedCollection<T>(
+  current: ReadonlyArray<T>,
+  snapshot: ReadonlyArray<T>,
+  keyOf: (entry: T) => string,
+  mergeEntry: (current: T, snapshot: T) => T,
+  sortEntries: (left: T, right: T) => number,
+): ReadonlyArray<T> {
+  const merged = new Map<string, T>();
+  for (const entry of current) {
+    merged.set(keyOf(entry), entry);
+  }
+  for (const entry of snapshot) {
+    const key = keyOf(entry);
+    const existing = merged.get(key);
+    merged.set(key, existing === undefined ? entry : mergeEntry(existing, entry));
+  }
+  return Array.from(merged.values()).sort(sortEntries);
+}
+
+function mergeMessage(
+  current: OrchestrationThread["messages"][number],
+  snapshot: OrchestrationThread["messages"][number],
+): OrchestrationThread["messages"][number] {
+  const updatedAtOrder = compareString(current.updatedAt, snapshot.updatedAt);
+  if (updatedAtOrder < 0) return snapshot;
+  if (updatedAtOrder > 0) return current;
+  if (!current.streaming && snapshot.streaming) return current;
+  if (current.streaming && !snapshot.streaming) {
+    return {
+      ...snapshot,
+      text: snapshot.text.length > 0 ? snapshot.text : current.text,
+    };
+  }
+  return snapshot.text.length >= current.text.length ? snapshot : current;
+}
+
+function mergeNonAdvancingSnapshotThread(
+  current: OrchestrationThread,
+  snapshot: OrchestrationThread,
+): OrchestrationThread {
+  // A non-advancing snapshot has a global min sequence that is not newer than
+  // the stream cursor, so absence in its collections is not authoritative.
+  // Use it only as an additive message recovery source; advancing snapshots
+  // and live events remain responsible for scalar updates and destructive
+  // collection changes such as reverts.
+  return {
+    ...current,
+    messages: mergeKeyedCollection(
+      current.messages,
+      snapshot.messages.filter((message) => !message.streaming),
+      (message) => message.id,
+      mergeMessage,
+      (left, right) =>
+        compareString(left.createdAt, right.createdAt) || compareString(left.id, right.id),
+    ),
+  };
+}
+
 function formatThreadError(cause: Cause.Cause<unknown>): string {
   const error = Cause.squash(cause);
   return error instanceof Error && error.message.trim().length > 0
@@ -97,6 +161,10 @@ export const makeEnvironmentThreadState = Effect.fn("EnvironmentThreadState.make
   );
   const persistence = yield* Queue.sliding<OrchestrationThreadDetailSnapshot>(1);
   const reconcileUntil = yield* Ref.make(0);
+  // Sequence of the last applied destructive collection change (revert). A
+  // non-advancing snapshot taken before this point may still contain pruned
+  // messages, so it must not be used as an additive recovery source.
+  const lastRevertSequence = yield* Ref.make(0);
   const applyLock = yield* Semaphore.make(1);
 
   const persist = Effect.fn("EnvironmentThreadState.persist")(function* (
@@ -160,6 +228,9 @@ export const makeEnvironmentThreadState = Effect.fn("EnvironmentThreadState.make
 
   const setThread = Effect.fn("EnvironmentThreadState.setThread")(function* (
     thread: OrchestrationThread,
+    options?: {
+      readonly persist?: boolean;
+    },
   ) {
     if (!threadBelongsInActiveDetail(thread)) {
       yield* setDeleted();
@@ -172,6 +243,9 @@ export const makeEnvironmentThreadState = Effect.fn("EnvironmentThreadState.make
     });
     // Persist the thread together with the sequence it reflects so the next warm
     // cache can resume from exactly here.
+    if (options?.persist === false) {
+      return;
+    }
     const snapshotSequence = yield* SubscriptionRef.get(lastSequence);
     yield* Queue.offer(persistence, { snapshotSequence, thread });
   });
@@ -217,33 +291,57 @@ export const makeEnvironmentThreadState = Effect.fn("EnvironmentThreadState.make
     snapshot: OrchestrationThreadDetailSnapshot,
     options?: {
       readonly allowCurrentSequence?: boolean;
+      readonly allowOlderFreshThread?: boolean;
+      readonly mergeNonAdvancingSnapshot?: boolean;
       readonly skipMatchingCurrentSequence?: boolean;
     },
   ) {
     const sequence = yield* SubscriptionRef.get(lastSequence);
+    const current = yield* SubscriptionRef.get(state);
+    const olderSequence = snapshot.snapshotSequence < sequence;
+    const olderReconcileSnapshot = olderSequence && options?.mergeNonAdvancingSnapshot === true;
+    // A snapshot taken before the last applied revert may still contain the
+    // messages that revert pruned; using it additively would resurrect them.
     if (
-      snapshot.snapshotSequence < sequence ||
-      (snapshot.snapshotSequence === sequence && options?.allowCurrentSequence !== true)
+      olderReconcileSnapshot &&
+      snapshot.snapshotSequence < (yield* Ref.get(lastRevertSequence))
     ) {
       return;
     }
-
-    const current = yield* SubscriptionRef.get(state);
+    if (olderSequence && options?.allowOlderFreshThread !== true) {
+      return;
+    }
     if (
-      snapshot.snapshotSequence === sequence &&
+      olderSequence &&
+      (Option.isNone(current.data) || snapshot.thread.updatedAt < current.data.value.updatedAt)
+    ) {
+      return;
+    }
+    if (snapshot.snapshotSequence === sequence && options?.allowCurrentSequence !== true) {
+      return;
+    }
+
+    const thread =
+      olderReconcileSnapshot && Option.isSome(current.data)
+        ? mergeNonAdvancingSnapshotThread(current.data.value, snapshot.thread)
+        : snapshot.thread;
+
+    if (
+      snapshot.snapshotSequence <= sequence &&
       options?.skipMatchingCurrentSequence === true &&
       Option.isSome(current.data) &&
-      threadProjectionMatches(current.data.value, snapshot.thread)
+      threadProjectionMatches(current.data.value, thread)
     ) {
       return;
     }
 
-    yield* SubscriptionRef.set(lastSequence, snapshot.snapshotSequence);
-    yield* setThread(snapshot.thread);
-    if (
-      threadBelongsInActiveDetail(snapshot.thread) &&
-      threadNeedsProjectionReconcile(snapshot.thread)
-    ) {
+    if (snapshot.snapshotSequence > sequence) {
+      yield* SubscriptionRef.set(lastSequence, snapshot.snapshotSequence);
+    }
+    yield* setThread(thread, {
+      persist: !olderReconcileSnapshot,
+    });
+    if (threadBelongsInActiveDetail(thread) && threadNeedsProjectionReconcile(thread)) {
       yield* markThreadRecentlyActive();
     }
   });
@@ -268,17 +366,15 @@ export const makeEnvironmentThreadState = Effect.fn("EnvironmentThreadState.make
       return;
     }
     yield* SubscriptionRef.set(lastSequence, item.event.sequence);
+    if (item.event.type === "thread.reverted") {
+      yield* Ref.set(lastRevertSequence, item.event.sequence);
+    }
     yield* markThreadRecentlyActive();
 
     const current = yield* SubscriptionRef.get(state);
     if (Option.isNone(current.data)) {
       if (item.event.type === "thread.deleted") {
         yield* setDeleted();
-      } else if (item.event.type === "thread.unarchived") {
-        // Archiving tears the detail down to `deleted` with no data, and the
-        // unarchive event alone cannot rebuild it — reload the full detail.
-        // Forked because reconcile re-enters the (non-reentrant) apply lock.
-        yield* Effect.forkScoped(reconcileFromProjection());
       }
       return;
     }
@@ -311,7 +407,9 @@ export const makeEnvironmentThreadState = Effect.fn("EnvironmentThreadState.make
         return;
       }
       yield* applySnapshot(result.snapshot, {
+        allowOlderFreshThread: true,
         allowCurrentSequence: true,
+        mergeNonAdvancingSnapshot: true,
         skipMatchingCurrentSequence: true,
       });
     },

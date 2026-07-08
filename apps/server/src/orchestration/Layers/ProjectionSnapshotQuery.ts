@@ -718,6 +718,40 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
         FROM projection_threads
         WHERE thread_id = ${threadId}
           AND deleted_at IS NULL
+          AND archived_at IS NULL
+        LIMIT 1
+      `,
+  });
+
+  const getNonDeletedThreadRowById = SqlSchema.findOneOption({
+    Request: ThreadIdLookupInput,
+    Result: ProjectionThreadDbRowSchema,
+    execute: ({ threadId }) =>
+      sql`
+        SELECT
+          thread_id AS "threadId",
+          project_id AS "projectId",
+          title,
+          model_selection_json AS "modelSelection",
+          runtime_mode AS "runtimeMode",
+          interaction_mode AS "interactionMode",
+          branch,
+          worktree_path AS "worktreePath",
+          worktree_removable AS "worktreeRemovable",
+          worktree_removal_path AS "worktreeRemovalPath",
+          latest_turn_id AS "latestTurnId",
+          created_at AS "createdAt",
+          updated_at AS "updatedAt",
+          archived_at AS "archivedAt",
+          latest_user_message_at AS "latestUserMessageAt",
+          pending_approval_count AS "pendingApprovalCount",
+          pending_user_input_count AS "pendingUserInputCount",
+          has_actionable_proposed_plan AS "hasActionableProposedPlan",
+          deleted_at AS "deletedAt",
+          parent_thread_id AS "parentThreadId"
+        FROM projection_threads
+        WHERE thread_id = ${threadId}
+          AND deleted_at IS NULL
         LIMIT 1
       `,
   });
@@ -832,7 +866,6 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
           AND turns.turn_id = threads.latest_turn_id
         WHERE threads.thread_id = ${threadId}
           AND threads.deleted_at IS NULL
-          AND threads.archived_at IS NULL
         LIMIT 1
       `,
   });
@@ -1863,7 +1896,7 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
         latestTurnRow,
         sessionRow,
       ] = yield* Effect.all([
-        getActiveThreadRowById({ threadId }).pipe(
+        getNonDeletedThreadRowById({ threadId }).pipe(
           Effect.mapError(
             toPersistenceSqlOrDecodeError(
               "ProjectionSnapshotQuery.getThreadDetailById:getThread:query",
