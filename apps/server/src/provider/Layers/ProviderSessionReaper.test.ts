@@ -347,7 +347,7 @@ describe("ProviderSessionReaper", () => {
     expect(Option.isSome(remaining)).toBe(true);
   });
 
-  it("reconciles terminal active-turn projections when no provider session is alive", async () => {
+  it("skips terminal active-turn projections instead of reconciling them", async () => {
     const threadId = ThreadId.make("thread-reaper-terminal-active-turn");
     const turnId = TurnId.make("turn-reaper-terminal");
     const now = "2026-01-01T00:00:00.000Z";
@@ -398,23 +398,12 @@ describe("ProviderSessionReaper", () => {
     const reaper = await runtime!.runPromise(Effect.service(ProviderSessionReaper));
     scope = await runtime!.runPromise(Scope.make("sequential"));
     await runtime!.runPromise(reaper.start().pipe(Scope.provide(scope)));
+    await runtime!.runPromise(drainFibers);
 
-    await waitFor(() => harness.dispatch.mock.calls.length === 1);
-
+    expect(harness.dispatch).not.toHaveBeenCalled();
     expect(harness.stopSession).not.toHaveBeenCalled();
-    const command = harness.dispatchedCommands[0];
-    expect(command).toMatchObject({
-      type: "thread.session.set",
-      threadId,
-      session: {
-        threadId,
-        status: "stopped",
-        activeTurnId: null,
-        providerName: "claudeAgent",
-      },
-    });
     const remaining = await runtime!.runPromise(repository.getByThreadId({ threadId }));
-    expect(Option.getOrThrow(remaining).status).toBe("stopped");
+    expect(Option.getOrThrow(remaining).status).toBe("running");
   });
 
   it("does not reconcile terminal active-turn projections while the provider session is alive", async () => {
@@ -489,17 +478,13 @@ describe("ProviderSessionReaper", () => {
     expect(Option.getOrThrow(remaining).status).toBe("running");
   });
 
-  it("continues reconciling other terminal active turns when one reconciliation defects", async () => {
+  it("skips multiple terminal active-turn projections without reconciling", async () => {
     const defectThreadId = ThreadId.make("thread-reaper-reconcile-defect");
     const reconciledThreadId = ThreadId.make("thread-reaper-reconcile-after-defect");
     const defectTurnId = TurnId.make("turn-reaper-reconcile-defect");
     const reconciledTurnId = TurnId.make("turn-reaper-reconcile-after-defect");
     const now = "2026-01-01T00:00:00.000Z";
     const harness = await createHarness({
-      dispatchImplementation: (command) =>
-        command.type === "thread.session.set" && command.threadId === defectThreadId
-          ? Effect.die(new Error("simulated reconcile defect"))
-          : Effect.succeed({ sequence: 1 }),
       readModel: makeReadModel([
         {
           id: defectThreadId,
@@ -577,9 +562,10 @@ describe("ProviderSessionReaper", () => {
     const reaper = await runtime!.runPromise(Effect.service(ProviderSessionReaper));
     scope = await runtime!.runPromise(Scope.make("sequential"));
     await runtime!.runPromise(reaper.start().pipe(Scope.provide(scope)));
+    await runtime!.runPromise(drainFibers);
 
-    await waitFor(() => harness.dispatch.mock.calls.length === 2);
-
+    expect(harness.dispatch).not.toHaveBeenCalled();
+    expect(harness.stopSession).not.toHaveBeenCalled();
     const defectRuntime = await runtime!.runPromise(
       repository.getByThreadId({ threadId: defectThreadId }),
     );
@@ -587,7 +573,7 @@ describe("ProviderSessionReaper", () => {
       repository.getByThreadId({ threadId: reconciledThreadId }),
     );
     expect(Option.getOrThrow(defectRuntime).status).toBe("running");
-    expect(Option.getOrThrow(reconciledRuntime).status).toBe("stopped");
+    expect(Option.getOrThrow(reconciledRuntime).status).toBe("running");
   });
 
   it("does not reap sessions that are still within the inactivity threshold", async () => {

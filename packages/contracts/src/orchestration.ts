@@ -733,7 +733,6 @@ export const ThreadTurnStartCommand = Schema.Struct({
   interactionMode: ProviderInteractionMode.pipe(
     Schema.withDecodingDefault(Effect.succeed(DEFAULT_PROVIDER_INTERACTION_MODE)),
   ),
-  providerSessionDetached: Schema.optional(Schema.Boolean),
   bootstrap: Schema.optional(ThreadTurnStartBootstrap),
   sourceProposedPlan: Schema.optional(SourceProposedPlanReference),
   createdAt: IsoDateTime,
@@ -1059,7 +1058,6 @@ export const ThreadTurnStartRequestedPayload = Schema.Struct({
   interactionMode: ProviderInteractionMode.pipe(
     Schema.withDecodingDefault(Effect.succeed(DEFAULT_PROVIDER_INTERACTION_MODE)),
   ),
-  providerSessionDetached: Schema.optional(Schema.Boolean),
   sourceProposedPlan: Schema.optional(SourceProposedPlanReference),
   createdAt: IsoDateTime,
 });
