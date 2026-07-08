@@ -1621,6 +1621,7 @@ describe("deriveTimelineEntries", () => {
       archivedAt: null,
       deletedAt: null,
       messages: [],
+      turns: [],
       proposedPlans: [],
       activities: [],
       checkpoints: [],

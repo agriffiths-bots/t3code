@@ -69,6 +69,7 @@ const BASE_THREAD: OrchestrationThread = {
   branch: "main",
   worktreePath: null,
   latestTurn: null,
+  turns: [],
   createdAt: "2026-04-01T00:00:00.000Z",
   updatedAt: "2026-04-01T00:00:00.000Z",
   archivedAt: null,
@@ -1227,6 +1228,69 @@ describe("EnvironmentThreads", () => {
       );
 
       expect(Option.getOrThrow(recovered.data).messages).toEqual([missedAssistantMessage]);
+    }),
+  );
+
+  it.effect("does not regress turn state from a non-advancing reconcile snapshot", () =>
+    Effect.gen(function* () {
+      const runningThread = makeRunningThread();
+      const runningTurn = runningThread.latestTurn;
+      if (runningTurn === null) {
+        throw new Error("test fixture must have a running latestTurn");
+      }
+      const harness = yield* makeHarness({
+        cached: {
+          ...runningThread,
+          turns: [runningTurn],
+        },
+      });
+      yield* awaitThreadState(
+        harness.observed,
+        (value) =>
+          value.status === "live" &&
+          Option.isSome(value.data) &&
+          value.data.value.turns.at(0)?.state === "running",
+      );
+      yield* Queue.offer(harness.inputs, sessionReady(CACHED_SNAPSHOT_SEQUENCE + 1));
+      const completed = yield* awaitThreadState(
+        harness.observed,
+        (value) =>
+          value.status === "live" &&
+          Option.isSome(value.data) &&
+          value.data.value.latestTurn?.state === "completed" &&
+          value.data.value.turns.at(0)?.state === "completed",
+      );
+
+      const completedThread = Option.getOrThrow(completed.data);
+      const staleRunningTurn = {
+        ...runningTurn,
+        assistantMessageId: MessageId.make("assistant-stale-boundary"),
+      };
+      const loaderCallsBeforeReconcile = yield* Ref.get(harness.loaderCalls);
+      yield* Ref.set(
+        harness.httpSnapshot,
+        Option.some({
+          snapshotSequence: CACHED_SNAPSHOT_SEQUENCE,
+          thread: {
+            ...completedThread,
+            latestTurn: staleRunningTurn,
+            turns: [staleRunningTurn],
+          },
+        }),
+      );
+
+      yield* advanceActiveReconcileInterval;
+      for (let ticks = 0; ticks < 50; ticks += 1) {
+        if ((yield* Ref.get(harness.loaderCalls)) > loaderCallsBeforeReconcile) {
+          break;
+        }
+        yield* Effect.yieldNow;
+      }
+
+      expect(yield* Ref.get(harness.loaderCalls)).toBeGreaterThan(loaderCallsBeforeReconcile);
+      const thread = Option.getOrThrow((yield* Ref.get(harness.latest)).data);
+      expect(thread.turns).toEqual(completedThread.turns);
+      expect(thread.latestTurn).toEqual(completedThread.latestTurn);
     }),
   );
 

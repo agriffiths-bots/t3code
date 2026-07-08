@@ -359,6 +359,7 @@ export const OrchestrationThread = Schema.Struct({
   worktreeRemovable: Schema.optional(Schema.Boolean),
   worktreeRemovalPath: Schema.optional(Schema.NullOr(TrimmedNonEmptyString)),
   latestTurn: Schema.NullOr(OrchestrationLatestTurn),
+  turns: Schema.Array(OrchestrationLatestTurn).pipe(Schema.withDecodingDefault(Effect.succeed([]))),
   createdAt: IsoDateTime,
   updatedAt: IsoDateTime,
   archivedAt: Schema.NullOr(IsoDateTime).pipe(Schema.withDecodingDefault(Effect.succeed(null))),

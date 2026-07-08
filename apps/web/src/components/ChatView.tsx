@@ -6288,12 +6288,14 @@ function ChatViewContent(props: ChatViewProps) {
                 listRef={legendListRef}
                 timelineEntries={timelineEntries}
                 latestTurn={activeLatestTurn}
+                turns={activeThread.turns}
                 runningTurnId={
                   activeThread.session && isThreadSessionActive(activeThread.session)
                     ? activeThread.session.activeTurnId
                     : null
                 }
                 turnDiffSummaryByAssistantMessageId={turnDiffSummaryByAssistantMessageId}
+                turnDiffSummaryByTurnId={turnDiffSummaryByTurnId}
                 activeThreadEnvironmentId={activeThread.environmentId}
                 routeThreadKey={routeThreadKey}
                 onOpenTurnDiff={onOpenTurnDiff}

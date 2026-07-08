@@ -154,6 +154,7 @@ const makeThreadState = (input: {
     archivedAt: null,
     deletedAt: null,
     messages,
+    turns: [],
     proposedPlans: [],
     activities: [],
     checkpoints: [],

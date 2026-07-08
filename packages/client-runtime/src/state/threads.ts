@@ -119,6 +119,15 @@ function mergeNonAdvancingSnapshotThread(
       (left, right) =>
         compareString(left.createdAt, right.createdAt) || compareString(left.id, right.id),
     ),
+    turns: mergeKeyedCollection(
+      current.turns,
+      snapshot.turns,
+      (turn) => turn.turnId,
+      (existing) => existing,
+      (left, right) =>
+        compareString(left.requestedAt, right.requestedAt) ||
+        compareString(left.turnId, right.turnId),
+    ),
   };
 }
 

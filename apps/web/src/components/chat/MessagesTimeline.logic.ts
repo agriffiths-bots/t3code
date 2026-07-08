@@ -93,7 +93,8 @@ export interface TimelineDurationMessage {
 export type TimelineLatestTurn = Pick<
   OrchestrationLatestTurn,
   "turnId" | "state" | "startedAt" | "completedAt"
->;
+> &
+  Partial<Pick<OrchestrationLatestTurn, "assistantMessageId">>;
 
 export type MessagesTimelineRow =
   | {
@@ -254,9 +255,65 @@ export function resolveAssistantMessageCopyState({
   };
 }
 
-function deriveTerminalAssistantMessageIds(timelineEntries: ReadonlyArray<TimelineEntry>) {
-  const lastAssistantMessageIdByResponseKey = new Map<string, string>();
-  let nullTurnResponseIndex = 0;
+function deriveFinalAssistantBoundariesByTurnId(input: {
+  readonly latestTurn: TimelineLatestTurn | null;
+  readonly turns: ReadonlyArray<TimelineLatestTurn>;
+  readonly turnDiffSummaryByAssistantMessageId: ReadonlyMap<MessageId, TurnDiffSummary>;
+  readonly turnDiffSummaryByTurnId: ReadonlyMap<TurnId, TurnDiffSummary>;
+}): ReadonlyMap<string, ReadonlySet<string>> {
+  const boundariesByTurnId = new Map<string, Set<string>>();
+  const ensureBoundary = (turnId: TurnId): Set<string> => {
+    const key = String(turnId);
+    let boundary = boundariesByTurnId.get(key);
+    if (!boundary) {
+      boundary = new Set<string>();
+      boundariesByTurnId.set(key, boundary);
+    }
+    return boundary;
+  };
+
+  const addTurnBoundary = (turn: TimelineLatestTurn): void => {
+    if (
+      turn.completedAt === null ||
+      turn.state === "running" ||
+      turn.assistantMessageId === undefined
+    ) {
+      return;
+    }
+    const boundary = ensureBoundary(turn.turnId);
+    if (turn.assistantMessageId !== null) {
+      boundary.add(String(turn.assistantMessageId));
+    }
+  };
+
+  for (const turn of input.turns) {
+    addTurnBoundary(turn);
+  }
+
+  for (const summary of input.turnDiffSummaryByTurnId.values()) {
+    const boundary = ensureBoundary(summary.turnId);
+    if (summary.assistantMessageId !== null) {
+      boundary.add(String(summary.assistantMessageId));
+    }
+  }
+
+  for (const [assistantMessageId, summary] of input.turnDiffSummaryByAssistantMessageId) {
+    ensureBoundary(summary.turnId).add(String(assistantMessageId));
+  }
+
+  const latestTurn = input.latestTurn;
+  if (latestTurn) {
+    addTurnBoundary(latestTurn);
+  }
+
+  return boundariesByTurnId;
+}
+
+function deriveTerminalNullTurnAssistantMessageIds(
+  timelineEntries: ReadonlyArray<TimelineEntry>,
+): ReadonlySet<string> {
+  const terminalAssistantMessageIdByResponseIndex = new Map<number, string>();
+  let responseIndex = 0;
 
   for (const timelineEntry of timelineEntries) {
     if (timelineEntry.kind !== "message") {
@@ -264,20 +321,52 @@ function deriveTerminalAssistantMessageIds(timelineEntries: ReadonlyArray<Timeli
     }
     const { message } = timelineEntry;
     if (isTurnPromptMessage(message)) {
-      nullTurnResponseIndex += 1;
+      responseIndex += 1;
       continue;
     }
-    if (message.role !== "assistant") {
-      continue;
+    if (message.role === "assistant" && message.turnId === null) {
+      terminalAssistantMessageIdByResponseIndex.set(responseIndex, message.id);
     }
-
-    const responseKey = message.turnId
-      ? `turn:${message.turnId}`
-      : `unkeyed:${nullTurnResponseIndex}`;
-    lastAssistantMessageIdByResponseKey.set(responseKey, message.id);
   }
 
-  return new Set(lastAssistantMessageIdByResponseKey.values());
+  return new Set(terminalAssistantMessageIdByResponseIndex.values());
+}
+
+function deriveFinalAssistantEntryIds(
+  entries: ReadonlyArray<TimelineEntry>,
+  finalAssistantMessageIds: ReadonlySet<string>,
+): ReadonlySet<string> {
+  const finalEntryIds = new Set<string>();
+  let foundTerminalAssistant = false;
+
+  for (let index = entries.length - 1; index >= 0; index -= 1) {
+    const entry = entries[index];
+    if (!entry) continue;
+
+    if (entry.kind === "work") {
+      if (foundTerminalAssistant) {
+        break;
+      }
+      continue;
+    }
+
+    if (entry.kind === "message" && entry.message.role === "assistant") {
+      if (!foundTerminalAssistant) {
+        if (!finalAssistantMessageIds.has(String(entry.message.id))) {
+          continue;
+        }
+        foundTerminalAssistant = true;
+      }
+      finalEntryIds.add(entry.id);
+      continue;
+    }
+
+    if (foundTerminalAssistant) {
+      break;
+    }
+  }
+
+  return finalEntryIds;
 }
 
 interface TurnFold {
@@ -317,7 +406,7 @@ function deriveUnsettledTurnId(
  */
 function deriveTurnFolds(input: {
   timelineEntries: ReadonlyArray<TimelineEntry>;
-  terminalAssistantMessageIds: ReadonlySet<string>;
+  finalAssistantBoundariesByTurnId: ReadonlyMap<string, ReadonlySet<string>>;
   latestTurn: TimelineLatestTurn | null;
   unsettledTurnId: TurnId | null;
 }): ReadonlyMap<string, TurnFold> {
@@ -366,9 +455,6 @@ function deriveTurnFolds(input: {
     }
     group.entries.push(entry);
     if (entry.kind === "message") {
-      if (input.terminalAssistantMessageIds.has(entry.message.id)) {
-        group.terminalEntry = entry;
-      }
       if (entry.message.streaming) {
         group.hasStreamingMessage = true;
       }
@@ -383,10 +469,29 @@ function deriveTurnFolds(input: {
     if (group.hasStreamingMessage) {
       continue;
     }
+    const finalAssistantBoundary = input.finalAssistantBoundariesByTurnId.get(String(turnId));
+    const hasExplicitFinalBoundary = finalAssistantBoundary !== undefined;
+    const finalAssistantEntryIds = hasExplicitFinalBoundary
+      ? deriveFinalAssistantEntryIds(group.entries, finalAssistantBoundary)
+      : new Set<string>();
     const hiddenEntryIds = new Set<string>();
     for (const entry of group.entries) {
-      if (entry.kind === "work") {
+      if (
+        entry.kind === "work" ||
+        (hasExplicitFinalBoundary &&
+          entry.kind === "message" &&
+          entry.message.role === "assistant" &&
+          !finalAssistantEntryIds.has(entry.id))
+      ) {
         hiddenEntryIds.add(entry.id);
+        continue;
+      }
+      if (
+        entry.kind === "message" &&
+        entry.message.role === "assistant" &&
+        finalAssistantEntryIds.has(entry.id)
+      ) {
+        group.terminalEntry = entry;
       }
     }
     if (hiddenEntryIds.size === 0) {
@@ -439,25 +544,35 @@ export function deriveMessagesTimelineRows(input: {
   timelineEntries: ReadonlyArray<TimelineEntry>;
   latestTurn?: TimelineLatestTurn | null;
   runningTurnId?: TurnId | null;
+  turns?: ReadonlyArray<TimelineLatestTurn>;
   expandedTurnIds?: ReadonlySet<TurnId>;
   expandedWorkGroupIds?: ReadonlySet<string>;
   isWorking: boolean;
   activeTurnStartedAt: string | null;
   turnDiffSummaryByAssistantMessageId: ReadonlyMap<MessageId, TurnDiffSummary>;
+  turnDiffSummaryByTurnId?: ReadonlyMap<TurnId, TurnDiffSummary>;
   revertTurnCountByUserMessageId: ReadonlyMap<MessageId, number>;
 }): MessagesTimelineRow[] {
   const nextRows: MessagesTimelineRow[] = [];
   const durationStartByMessageId = computeMessageDurationStart(
     input.timelineEntries.flatMap((entry) => (entry.kind === "message" ? [entry.message] : [])),
   );
-  const terminalAssistantMessageIds = deriveTerminalAssistantMessageIds(input.timelineEntries);
+  const finalAssistantBoundariesByTurnId = deriveFinalAssistantBoundariesByTurnId({
+    latestTurn: input.latestTurn ?? null,
+    turns: input.turns ?? [],
+    turnDiffSummaryByAssistantMessageId: input.turnDiffSummaryByAssistantMessageId,
+    turnDiffSummaryByTurnId: input.turnDiffSummaryByTurnId ?? new Map(),
+  });
+  const terminalNullTurnAssistantMessageIds = deriveTerminalNullTurnAssistantMessageIds(
+    input.timelineEntries,
+  );
   const unsettledTurnId = deriveUnsettledTurnId(
     input.latestTurn ?? null,
     input.runningTurnId ?? null,
   );
   const foldsByAnchorEntryId = deriveTurnFolds({
     timelineEntries: input.timelineEntries,
-    terminalAssistantMessageIds,
+    finalAssistantBoundariesByTurnId,
     latestTurn: input.latestTurn ?? null,
     unsettledTurnId,
   });
@@ -567,13 +682,22 @@ export function deriveMessagesTimelineRows(input: {
 
     const durationStart =
       durationStartByMessageId.get(timelineEntry.message.id) ?? timelineEntry.message.createdAt;
+    const finalAssistantBoundary =
+      timelineEntry.message.turnId !== null
+        ? finalAssistantBoundariesByTurnId.get(String(timelineEntry.message.turnId))
+        : undefined;
+    const isFinalAssistantMessage =
+      timelineEntry.message.turnId === null
+        ? terminalNullTurnAssistantMessageIds.has(String(timelineEntry.message.id))
+        : finalAssistantBoundary !== undefined &&
+          finalAssistantBoundary.has(String(timelineEntry.message.id));
 
     // While the turn is still running, the latest assistant message is only
     // provisionally terminal — withhold the metadata row until the turn
     // settles so commentary doesn't flash timestamps mid-work.
     const showAssistantMeta =
       timelineEntry.message.role === "assistant" &&
-      terminalAssistantMessageIds.has(timelineEntry.message.id) &&
+      isFinalAssistantMessage &&
       !assistantTurnStillInProgress;
 
     nextRows.push({

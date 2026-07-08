@@ -333,6 +333,7 @@ projectionSnapshotLayer("ProjectionSnapshotQuery", (it) => {
               planId: "plan-1",
             },
           },
+          turns: [],
           createdAt: "2026-02-24T00:00:02.000Z",
           updatedAt: "2026-02-24T00:00:03.000Z",
           archivedAt: null,
@@ -486,6 +487,35 @@ projectionSnapshotLayer("ProjectionSnapshotQuery", (it) => {
     }),
   );
 
+  it.effect("requires thread turn projector state for snapshot sequence", () =>
+    Effect.gen(function* () {
+      const snapshotQuery = yield* ProjectionSnapshotQuery;
+      const sql = yield* SqlClient.SqlClient;
+
+      yield* sql`DELETE FROM projection_state`;
+      yield* sql`
+        INSERT INTO projection_state (projector, last_applied_sequence, updated_at)
+        VALUES
+          (${ORCHESTRATION_PROJECTOR_NAMES.projects}, 9, '2026-04-09T00:00:00.000Z'),
+          (${ORCHESTRATION_PROJECTOR_NAMES.threads}, 9, '2026-04-09T00:00:00.000Z'),
+          (${ORCHESTRATION_PROJECTOR_NAMES.threadMessages}, 9, '2026-04-09T00:00:00.000Z'),
+          (${ORCHESTRATION_PROJECTOR_NAMES.threadProposedPlans}, 9, '2026-04-09T00:00:00.000Z'),
+          (${ORCHESTRATION_PROJECTOR_NAMES.threadActivities}, 9, '2026-04-09T00:00:00.000Z'),
+          (${ORCHESTRATION_PROJECTOR_NAMES.threadSessions}, 9, '2026-04-09T00:00:00.000Z'),
+          (${ORCHESTRATION_PROJECTOR_NAMES.checkpoints}, 9, '2026-04-09T00:00:00.000Z')
+      `;
+
+      assert.equal((yield* snapshotQuery.getSnapshot()).snapshotSequence, 0);
+
+      yield* sql`
+        INSERT INTO projection_state (projector, last_applied_sequence, updated_at)
+        VALUES (${ORCHESTRATION_PROJECTOR_NAMES.threadTurns}, 7, '2026-04-09T00:00:01.000Z')
+      `;
+
+      assert.equal((yield* snapshotQuery.getSnapshot()).snapshotSequence, 7);
+    }),
+  );
+
   it.effect("keeps archived threads out of the main shell snapshot", () =>
     Effect.gen(function* () {
       const snapshotQuery = yield* ProjectionSnapshotQuery;
@@ -623,6 +653,7 @@ projectionSnapshotLayer("ProjectionSnapshotQuery", (it) => {
           (${ORCHESTRATION_PROJECTOR_NAMES.threadProposedPlans}, 4, '2026-04-06T00:00:07.000Z'),
           (${ORCHESTRATION_PROJECTOR_NAMES.threadActivities}, 4, '2026-04-06T00:00:07.000Z'),
           (${ORCHESTRATION_PROJECTOR_NAMES.threadSessions}, 4, '2026-04-06T00:00:07.000Z'),
+          (${ORCHESTRATION_PROJECTOR_NAMES.threadTurns}, 4, '2026-04-06T00:00:07.000Z'),
           (${ORCHESTRATION_PROJECTOR_NAMES.checkpoints}, 4, '2026-04-06T00:00:07.000Z')
       `;
 
@@ -813,6 +844,7 @@ projectionSnapshotLayer("ProjectionSnapshotQuery", (it) => {
           (${ORCHESTRATION_PROJECTOR_NAMES.threadProposedPlans}, 8, '2026-04-07T00:00:10.000Z'),
           (${ORCHESTRATION_PROJECTOR_NAMES.threadActivities}, 8, '2026-04-07T00:00:10.000Z'),
           (${ORCHESTRATION_PROJECTOR_NAMES.threadSessions}, 8, '2026-04-07T00:00:10.000Z'),
+          (${ORCHESTRATION_PROJECTOR_NAMES.threadTurns}, 8, '2026-04-07T00:00:10.000Z'),
           (${ORCHESTRATION_PROJECTOR_NAMES.checkpoints}, 8, '2026-04-07T00:00:10.000Z')
       `;
 
@@ -1593,6 +1625,25 @@ projectionSnapshotLayer("ProjectionSnapshotQuery", (it) => {
         assert.equal(threadDetail.value.latestTurn?.turnId, asTurnId("turn-running"));
         assert.equal(threadDetail.value.latestTurn?.state, "running");
         assert.equal(threadDetail.value.latestTurn?.startedAt, "2026-04-02T00:00:30.000Z");
+        assert.deepEqual(
+          threadDetail.value.turns.map((turn) => ({
+            turnId: turn.turnId,
+            state: turn.state,
+            assistantMessageId: turn.assistantMessageId,
+          })),
+          [
+            {
+              turnId: asTurnId("turn-completed"),
+              state: "completed",
+              assistantMessageId: asMessageId("message-assistant-1"),
+            },
+            {
+              turnId: asTurnId("turn-running"),
+              state: "running",
+              assistantMessageId: null,
+            },
+          ],
+        );
       }
     }),
   );
@@ -1732,6 +1783,7 @@ projectionSnapshotLayer("ProjectionSnapshotQuery", (it) => {
           (${ORCHESTRATION_PROJECTOR_NAMES.threadProposedPlans}, 3, '2026-04-03T00:00:40.000Z'),
           (${ORCHESTRATION_PROJECTOR_NAMES.threadActivities}, 3, '2026-04-03T00:00:40.000Z'),
           (${ORCHESTRATION_PROJECTOR_NAMES.threadSessions}, 3, '2026-04-03T00:00:40.000Z'),
+          (${ORCHESTRATION_PROJECTOR_NAMES.threadTurns}, 3, '2026-04-03T00:00:40.000Z'),
           (${ORCHESTRATION_PROJECTOR_NAMES.checkpoints}, 3, '2026-04-03T00:00:40.000Z')
       `;
 
