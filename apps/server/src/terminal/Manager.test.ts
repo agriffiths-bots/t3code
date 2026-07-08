@@ -322,6 +322,68 @@ it.layer(
     }),
   );
 
+  it.effect("keeps a running PTY alive and replayable when an attach stream detaches", () =>
+    Effect.gen(function* () {
+      const { manager, ptyAdapter, getEvents } = yield* createManager();
+
+      yield* manager.open(openInput());
+      const process = ptyAdapter.processes[0];
+      expect(process).toBeDefined();
+      if (!process) return;
+
+      const firstAttachEvents = yield* Ref.make<ReadonlyArray<TerminalAttachStreamEvent>>([]);
+      const unsubscribe = yield* manager.attachStream(openInput(), (event) =>
+        Ref.update(firstAttachEvents, (events) => [...events, event]),
+      );
+
+      process.emitData("before detach\n");
+      yield* waitFor(
+        Effect.map(getEvents, (events) =>
+          events.some((event) => event.type === "output" && event.data === "before detach\n"),
+        ),
+        "1200 millis",
+      );
+
+      unsubscribe();
+      process.emitData("after detach\n");
+      yield* waitFor(
+        Effect.map(getEvents, (events) =>
+          events.some((event) => event.type === "output" && event.data === "after detach\n"),
+        ),
+        "1200 millis",
+      );
+
+      expect(process.killed).toBe(false);
+      expect(process.killSignals).toEqual([]);
+      yield* manager.write({
+        threadId: "thread-1",
+        terminalId: DEFAULT_TERMINAL_ID,
+        data: "still attached to pty\n",
+      });
+      expect(process.writes).toEqual(["still attached to pty\n"]);
+
+      const secondAttachEvents = yield* Ref.make<ReadonlyArray<TerminalAttachStreamEvent>>([]);
+      const unsubscribeSecond = yield* manager.attachStream(
+        {
+          threadId: "thread-1",
+          terminalId: DEFAULT_TERMINAL_ID,
+        },
+        (event) => Ref.update(secondAttachEvents, (events) => [...events, event]),
+      );
+      yield* Effect.addFinalizer(() => Effect.sync(unsubscribeSecond));
+
+      const snapshot = (yield* Ref.get(secondAttachEvents)).find(
+        (event) => event.type === "snapshot",
+      );
+      expect(snapshot).toBeDefined();
+      if (!snapshot || snapshot.type !== "snapshot") return;
+      expect(snapshot.snapshot.status).toBe("running");
+      expect(snapshot.snapshot.history).toContain("before detach\n");
+      expect(snapshot.snapshot.history).toContain("after detach\n");
+      expect(ptyAdapter.spawnInputs).toHaveLength(1);
+    }),
+  );
+
   it.effect("keeps attach streams live when a terminal id is closed and reopened", () =>
     Effect.gen(function* () {
       const { manager, ptyAdapter } = yield* createManager();

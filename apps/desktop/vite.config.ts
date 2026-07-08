@@ -70,7 +70,7 @@ export default defineConfig({
       sourcemap: true,
       outExtensions: () => ({ js: ".cjs" }),
       define: publicConfigDefine,
-      entry: ["src/main.ts"],
+      entry: ["src/bootstrap.ts", "src/main.ts"],
       clean: true,
       deps: {
         alwaysBundle: shouldBundleDesktopMainDependency,

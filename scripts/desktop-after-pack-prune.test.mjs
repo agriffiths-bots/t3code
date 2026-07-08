@@ -3,7 +3,11 @@ import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
 import { describe, expect, it } from "vite-plus/test";
 
-import afterPack from "./desktop-after-pack-prune.mjs";
+import afterPack, {
+  createPackagedIntegrityManifest,
+  PACKAGED_INTEGRITY_MANIFEST_FILE_NAME,
+  resolveAppAsarUnpackedRoots,
+} from "./desktop-after-pack-prune.mjs";
 
 async function touch(path) {
   await NodeFSP.mkdir(NodePath.dirname(path), { recursive: true });
@@ -106,5 +110,64 @@ describe("desktop-after-pack-prune", () => {
     await expect(
       exists(NodePath.join(root, "node-pty/third_party/conpty/1.23/win10-arm64")),
     ).resolves.toBe(false);
+
+    const manifestPath = NodePath.join(tempDir, "resources", PACKAGED_INTEGRITY_MANIFEST_FILE_NAME);
+    await expect(exists(manifestPath)).resolves.toBe(true);
+    const manifest = JSON.parse(await NodeFSP.readFile(manifestPath, "utf8"));
+    expect(manifest.version).toBe(1);
+    expect(manifest.requiredFiles).toContain("node_modules/node-pty/package.json");
+    expect(manifest.requiredFiles).toContain("node_modules/node-pty/prebuilds/win32-x64/pty.node");
+    expect(manifest.requiredFiles).toContain(
+      "node_modules/@ff-labs/fff-bin-linux-x64-gnu/libfff_c.so",
+    );
+    expect(manifest.requiredFiles).not.toContain(
+      "node_modules/node-pty/prebuilds/win32-arm64/pty.node",
+    );
+    expect(manifest.requiredFiles).not.toContain(
+      "node_modules/@ff-labs/fff-bin-linux-x64-musl/libfff_c.so",
+    );
+  });
+
+  it("breaks directory symlink cycles while collecting manifest entries", async () => {
+    const tempDir = await NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "desktop-prune-cycle-"));
+    const root = NodePath.join(tempDir, "resources", "app.asar.unpacked");
+    const packageRoot = NodePath.join(root, "node_modules", "cycle-package");
+    await touch(NodePath.join(packageRoot, "package.json"));
+    await NodeFSP.symlink(packageRoot, NodePath.join(packageRoot, "loop"), "dir");
+
+    const manifest = await createPackagedIntegrityManifest(root);
+
+    expect(manifest.requiredFiles).toContain("node_modules/cycle-package/package.json");
+    expect(manifest.requiredFiles.some((file) => file.includes("/loop/loop/"))).toBe(false);
+  });
+
+  it("writes the packaged integrity manifest inside macOS app bundles", async () => {
+    const tempDir = await NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "desktop-prune-mac-"));
+    const unpackedRoot = NodePath.join(
+      tempDir,
+      "T3 Code.app",
+      "Contents",
+      "Resources",
+      "app.asar.unpacked",
+    );
+    await touch(NodePath.join(unpackedRoot, "node_modules/runtime/package.json"));
+
+    await expect(resolveAppAsarUnpackedRoots(tempDir)).resolves.toContain(unpackedRoot);
+    await afterPack({
+      appOutDir: tempDir,
+      electronPlatformName: "darwin",
+      arch: 1,
+    });
+
+    const manifestPath = NodePath.join(
+      tempDir,
+      "T3 Code.app",
+      "Contents",
+      "Resources",
+      PACKAGED_INTEGRITY_MANIFEST_FILE_NAME,
+    );
+    await expect(exists(manifestPath)).resolves.toBe(true);
+    const manifest = JSON.parse(await NodeFSP.readFile(manifestPath, "utf8"));
+    expect(manifest.requiredFiles).toContain("node_modules/runtime/package.json");
   });
 });

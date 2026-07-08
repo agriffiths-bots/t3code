@@ -1,7 +1,13 @@
 import { expect, it } from "@effect/vitest";
 import { NodeHttpServer } from "@effect/platform-node";
 import * as NodeServices from "@effect/platform-node/NodeServices";
-import { EnvironmentId, PreviewTabId, ProviderInstanceId, ThreadId } from "@t3tools/contracts";
+import {
+  EnvironmentId,
+  PreviewAutomationTimeoutError,
+  PreviewTabId,
+  ProviderInstanceId,
+  ThreadId,
+} from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Stream from "effect/Stream";
@@ -37,6 +43,32 @@ const client = McpSchema.McpServerClient.of({
 const TestLayer = McpHttpServer.PreviewToolkitRegistrationLive.pipe(
   Layer.provideMerge(McpServer.McpServer.layer),
   Layer.provideMerge(PreviewAutomationBroker.layer.pipe(Layer.provide(NodeServices.layer))),
+);
+const timeoutPreviewBroker = PreviewAutomationBroker.PreviewAutomationBroker.of({
+  connect: () => Effect.die("unused"),
+  focusHost: () => Effect.void,
+  respond: () => Effect.void,
+  invoke: (request) =>
+    Effect.fail(
+      new PreviewAutomationTimeoutError({
+        operation: request.operation,
+        environmentId: request.scope.environmentId,
+        threadId: request.scope.threadId,
+        providerSessionId: request.scope.providerSessionId,
+        providerInstanceId: request.scope.providerInstanceId,
+        clientId: "mcp-unresponsive-client",
+        connectionId: "connection-timeout",
+        requestId: "preview-timeout",
+        ...(request.tabId === undefined ? {} : { tabId: request.tabId }),
+        timeoutMs: request.timeoutMs ?? 15_000,
+      }),
+    ),
+});
+const TimeoutTestLayer = McpHttpServer.PreviewToolkitRegistrationLive.pipe(
+  Layer.provideMerge(McpServer.McpServer.layer),
+  Layer.provideMerge(
+    Layer.succeed(PreviewAutomationBroker.PreviewAutomationBroker, timeoutPreviewBroker),
+  ),
 );
 
 it("normalizes empty successful notification responses to accepted", () => {
@@ -144,6 +176,60 @@ it.effect("reports missing preview automation host as unavailable status", () =>
       "Open or reload T3 Code Desktop",
     );
   }).pipe(Effect.provide(TestLayer)),
+);
+
+it.effect("reports unresponsive preview automation host as unavailable status", () =>
+  Effect.gen(function* () {
+    const server = yield* McpServer.McpServer;
+
+    const status = yield* server
+      .callTool({ name: "preview_status", arguments: {} })
+      .pipe(
+        Effect.provideService(McpInvocationContext.McpInvocationContext, invocation),
+        Effect.provideService(McpSchema.McpServerClient, client),
+      );
+
+    expect(status.isError).toBe(false);
+    expect(status.structuredContent).toMatchObject({
+      available: false,
+      visible: false,
+      tabId: null,
+      hostState: "missing",
+    });
+    expect(
+      (status.structuredContent as { readonly unavailableReason?: unknown }).unavailableReason,
+    ).toBe("Preview automation status timed out after 15000ms.");
+  }).pipe(Effect.provide(TimeoutTestLayer)),
+);
+
+it.effect("answers GET /mcp with 405 so it cannot fall through to the SPA fallback", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const serverLayer = Layer.mergeAll(
+        McpServer.layerHttp({
+          name: "MCP GET test",
+          version: "1.0.0",
+          path: "/mcp",
+        }),
+        McpHttpServer.McpGetMethodNotAllowedLive,
+      );
+      yield* HttpRouter.serve(serverLayer, {
+        disableListenLog: true,
+        disableLogger: true,
+      }).pipe(Layer.build);
+      const httpClient = yield* HttpClient.HttpClient;
+
+      // MCP clients probe GET as the optional server-initiated SSE stream. A
+      // 405 tells them no stream is offered and they settle into POST-only
+      // mode; anything else (like the SPA's index.html 200) reads as a broken
+      // stream and triggers a reconnect storm that keeps tools from loading.
+      const getResponse = yield* httpClient.get("/mcp", {
+        headers: { accept: "text/event-stream" },
+      });
+      expect(getResponse.status).toBe(405);
+      expect(getResponse.headers["allow"]).toBe("POST, DELETE");
+    }),
+  ).pipe(Effect.provide(NodeHttpServer.layerTest)),
 );
 
 it.effect("terminates HTTP MCP sessions with DELETE", () =>

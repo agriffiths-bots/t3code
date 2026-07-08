@@ -29,6 +29,7 @@ import {
   ThreadMetaUpdatedPayload,
   ThreadProposedPlanUpsertedPayload,
   ThreadRuntimeModeSetPayload,
+  ThreadParentSetPayload,
   ThreadUnarchivedPayload,
   ThreadRevertedPayload,
   ThreadSessionSetPayload,
@@ -483,6 +484,20 @@ export function projectEvent(
           ...nextBase,
           threads: updateThread(nextBase.threads, payload.threadId, {
             archivedAt: null,
+            updatedAt: payload.updatedAt,
+          }),
+        })),
+      );
+
+    case "thread.parent-set":
+      // Keep the command read model's parentThreadId current so decider logic
+      // that walks parent links (e.g. archive cascade) sees children linked at
+      // runtime, not only those present at the last bootstrap from sqlite.
+      return decodeForEvent(ThreadParentSetPayload, event.payload, event.type, "payload").pipe(
+        Effect.map((payload) => ({
+          ...nextBase,
+          threads: updateThread(nextBase.threads, payload.threadId, {
+            parentThreadId: payload.parentThreadId,
             updatedAt: payload.updatedAt,
           }),
         })),

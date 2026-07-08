@@ -433,9 +433,6 @@ const spawnSubagent = Effect.fn("SubagentToolkit.spawn")(function* (input: Spawn
         const started = yield* spawnRuntime(
           { ...threadStartInputWithSelection, modelSelection },
           invocation,
-          {
-            providerSessionDetached: detached,
-          },
         ).pipe(Effect.onError(() => releaseDispatchLease));
         yield* runtime.dispatchLimiter.bindChild(dispatchLease, started.threadId);
         const cleanupAndReleaseFromDelete = (reason: string) =>

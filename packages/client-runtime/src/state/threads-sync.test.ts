@@ -1,4 +1,5 @@
 import {
+  CheckpointRef,
   EnvironmentId,
   EventId,
   MessageId,
@@ -6,6 +7,8 @@ import {
   ProjectId,
   ProviderInstanceId,
   ThreadId,
+  TurnId,
+  type OrchestrationMessage,
   type OrchestrationThread,
   type OrchestrationThreadDetailSnapshot,
   type OrchestrationThreadStreamItem,
@@ -34,6 +37,7 @@ import {
   makeEnvironmentThreadState,
   ThreadSnapshotLoader,
   type EnvironmentThreadState,
+  type ThreadSnapshotLoadResult,
 } from "./threads.ts";
 
 const TARGET = new PrimaryConnectionTarget({
@@ -76,6 +80,35 @@ const BASE_THREAD: OrchestrationThread = {
   session: null,
 };
 
+const RUNNING_TURN_ID = TurnId.make("turn-running-1");
+
+function makeRunningThread(
+  messages: ReadonlyArray<OrchestrationMessage> = [],
+): OrchestrationThread {
+  return {
+    ...BASE_THREAD,
+    updatedAt: "2026-07-07T21:00:00.000Z",
+    latestTurn: {
+      turnId: RUNNING_TURN_ID,
+      state: "running",
+      requestedAt: "2026-07-07T21:00:00.000Z",
+      startedAt: "2026-07-07T21:00:01.000Z",
+      completedAt: null,
+      assistantMessageId: null,
+    },
+    messages,
+    session: {
+      threadId: THREAD_ID,
+      status: "running",
+      providerName: "claudeAgent",
+      runtimeMode: "full-access",
+      activeTurnId: RUNNING_TURN_ID,
+      lastError: null,
+      updatedAt: "2026-07-07T21:00:01.000Z",
+    },
+  };
+}
+
 type TestThreadInput = OrchestrationThreadStreamItem | Error;
 
 function testSession(client: WsRpcProtocolClient): RpcSession.RpcSession {
@@ -99,6 +132,12 @@ function awaitThreadState(
   );
 }
 
+const advanceActiveReconcileInterval = Effect.gen(function* () {
+  yield* Effect.yieldNow;
+  yield* TestClock.adjust("2 seconds");
+  yield* Effect.yieldNow;
+});
+
 const makeHarness = Effect.fn("TestEnvironmentThreads.makeHarness")(function* (options?: {
   readonly cached?: OrchestrationThread;
   readonly httpSnapshot?: Option.Option<OrchestrationThreadDetailSnapshot>;
@@ -109,6 +148,12 @@ const makeHarness = Effect.fn("TestEnvironmentThreads.makeHarness")(function* (o
   const retryCount = yield* Ref.make(0);
   const subscriptionCount = yield* Ref.make(0);
   const loaderCalls = yield* Ref.make(0);
+  const httpSnapshot = yield* Ref.make(
+    options?.httpSnapshot ?? Option.none<OrchestrationThreadDetailSnapshot>(),
+  );
+  const httpReconcileResult = yield* Ref.make<Option.Option<ThreadSnapshotLoadResult>>(
+    Option.none(),
+  );
   const lastSubscribeAfterSequence = yield* Ref.make<number | undefined>(undefined);
   const savedThreads = yield* Ref.make<ReadonlyArray<OrchestrationThreadDetailSnapshot>>([]);
   const removedThreads = yield* Ref.make<ReadonlyArray<ThreadId>>([]);
@@ -139,10 +184,29 @@ const makeHarness = Effect.fn("TestEnvironmentThreads.makeHarness")(function* (o
   const snapshotLoader = ThreadSnapshotLoader.of({
     load: (_prepared, threadId) =>
       Ref.update(loaderCalls, (count) => count + 1).pipe(
-        Effect.as(
+        Effect.andThen(() =>
           threadId === THREAD_ID
-            ? (options?.httpSnapshot ?? Option.none<OrchestrationThreadDetailSnapshot>())
-            : Option.none<OrchestrationThreadDetailSnapshot>(),
+            ? Ref.get(httpSnapshot)
+            : Effect.succeed(Option.none<OrchestrationThreadDetailSnapshot>()),
+        ),
+      ),
+    loadForReconcile: (_prepared, threadId) =>
+      Ref.update(loaderCalls, (count) => count + 1).pipe(
+        Effect.andThen(
+          Effect.gen(function* () {
+            if (threadId !== THREAD_ID) {
+              return { kind: "unavailable" } as const;
+            }
+            const explicit = yield* Ref.get(httpReconcileResult);
+            if (Option.isSome(explicit)) {
+              return explicit.value;
+            }
+            const snapshot = yield* Ref.get(httpSnapshot);
+            return Option.match(snapshot, {
+              onNone: () => ({ kind: "unavailable" }) as const,
+              onSome: (value) => ({ kind: "found", snapshot: value }) as const,
+            });
+          }),
         ),
       ),
   });
@@ -192,6 +256,8 @@ const makeHarness = Effect.fn("TestEnvironmentThreads.makeHarness")(function* (o
     retryCount,
     subscriptionCount,
     loaderCalls,
+    httpSnapshot,
+    httpReconcileResult,
     lastSubscribeAfterSequence,
     supervisorState,
     supervisorSession,
@@ -233,11 +299,40 @@ const titleUpdated = (title: string, sequence = 2): OrchestrationThreadStreamIte
   },
 });
 
-const deleted = (): OrchestrationThreadStreamItem => ({
+const activityAppended = (summary: string, sequence = 3): OrchestrationThreadStreamItem => ({
+  kind: "event",
+  event: {
+    eventId: EventId.make(`event-activity-${sequence}`),
+    sequence,
+    occurredAt: "2026-07-07T21:00:02.500Z",
+    commandId: null,
+    causationEventId: null,
+    correlationId: null,
+    metadata: {},
+    aggregateKind: "thread",
+    aggregateId: THREAD_ID,
+    type: "thread.activity-appended",
+    payload: {
+      threadId: THREAD_ID,
+      activity: {
+        id: EventId.make(`activity-${sequence}`),
+        tone: "info",
+        kind: "test.activity",
+        summary,
+        payload: {},
+        turnId: RUNNING_TURN_ID,
+        sequence,
+        createdAt: "2026-07-07T21:00:02.500Z",
+      },
+    },
+  },
+});
+
+const deleted = (sequence = 3): OrchestrationThreadStreamItem => ({
   kind: "event",
   event: {
     eventId: EventId.make("event-deleted"),
-    sequence: 3,
+    sequence,
     occurredAt: "2026-04-01T02:00:00.000Z",
     commandId: null,
     causationEventId: null,
@@ -249,6 +344,75 @@ const deleted = (): OrchestrationThreadStreamItem => ({
     payload: {
       threadId: THREAD_ID,
       deletedAt: "2026-04-01T02:00:00.000Z",
+    },
+  },
+});
+
+const archived = (sequence = 3): OrchestrationThreadStreamItem => ({
+  kind: "event",
+  event: {
+    eventId: EventId.make("event-archived"),
+    sequence,
+    occurredAt: "2026-04-01T02:00:00.000Z",
+    commandId: null,
+    causationEventId: null,
+    correlationId: null,
+    metadata: {},
+    aggregateKind: "thread",
+    aggregateId: THREAD_ID,
+    type: "thread.archived",
+    payload: {
+      threadId: THREAD_ID,
+      archivedAt: "2026-04-01T02:00:00.000Z",
+      updatedAt: "2026-04-01T02:00:00.000Z",
+    },
+  },
+});
+
+const unarchived = (sequence = 4): OrchestrationThreadStreamItem => ({
+  kind: "event",
+  event: {
+    eventId: EventId.make("event-unarchived"),
+    sequence,
+    occurredAt: "2026-04-01T02:01:00.000Z",
+    commandId: null,
+    causationEventId: null,
+    correlationId: null,
+    metadata: {},
+    aggregateKind: "thread",
+    aggregateId: THREAD_ID,
+    type: "thread.unarchived",
+    payload: {
+      threadId: THREAD_ID,
+      updatedAt: "2026-04-01T02:01:00.000Z",
+    },
+  },
+});
+
+const sessionReady = (sequence = 3): OrchestrationThreadStreamItem => ({
+  kind: "event",
+  event: {
+    eventId: EventId.make("event-session-ready"),
+    sequence,
+    occurredAt: "2026-07-07T21:00:04.000Z",
+    commandId: null,
+    causationEventId: null,
+    correlationId: null,
+    metadata: {},
+    aggregateKind: "thread",
+    aggregateId: THREAD_ID,
+    type: "thread.session-set",
+    payload: {
+      threadId: THREAD_ID,
+      session: {
+        threadId: THREAD_ID,
+        status: "ready",
+        providerName: "claudeAgent",
+        runtimeMode: "full-access",
+        activeTurnId: null,
+        lastError: null,
+        updatedAt: "2026-07-07T21:00:04.000Z",
+      },
     },
   },
 });
@@ -289,8 +453,8 @@ describe("EnvironmentThreads", () => {
   it.effect("reduces live events and persists the latest thread", () =>
     Effect.gen(function* () {
       const harness = yield* makeHarness({ cached: BASE_THREAD });
-      yield* Queue.offer(harness.inputs, snapshot(BASE_THREAD));
-      yield* Queue.offer(harness.inputs, titleUpdated("Live title"));
+      yield* Queue.offer(harness.inputs, snapshot(BASE_THREAD, CACHED_SNAPSHOT_SEQUENCE + 1));
+      yield* Queue.offer(harness.inputs, titleUpdated("Live title", CACHED_SNAPSHOT_SEQUENCE + 2));
 
       const state = yield* awaitThreadState(
         harness.observed,
@@ -304,7 +468,9 @@ describe("EnvironmentThreads", () => {
 
       expect(Option.getOrThrow(state.data).title).toBe("Live title");
       expect((yield* Ref.get(harness.savedThreads)).at(-1)?.thread.title).toBe("Live title");
-      expect((yield* Ref.get(harness.savedThreads)).at(-1)?.snapshotSequence).toBe(2);
+      expect((yield* Ref.get(harness.savedThreads)).at(-1)?.snapshotSequence).toBe(
+        CACHED_SNAPSHOT_SEQUENCE + 2,
+      );
     }),
   );
 
@@ -337,9 +503,12 @@ describe("EnvironmentThreads", () => {
   it.effect("ignores replayed thread events at or below the snapshot sequence", () =>
     Effect.gen(function* () {
       const harness = yield* makeHarness({ cached: BASE_THREAD });
-      yield* Queue.offer(harness.inputs, snapshot(BASE_THREAD));
-      yield* Queue.offer(harness.inputs, titleUpdated("Replayed title", 1));
-      yield* Queue.offer(harness.inputs, titleUpdated("Live title", 2));
+      yield* Queue.offer(harness.inputs, snapshot(BASE_THREAD, CACHED_SNAPSHOT_SEQUENCE + 1));
+      yield* Queue.offer(
+        harness.inputs,
+        titleUpdated("Replayed title", CACHED_SNAPSHOT_SEQUENCE + 1),
+      );
+      yield* Queue.offer(harness.inputs, titleUpdated("Live title", CACHED_SNAPSHOT_SEQUENCE + 2));
 
       const state = yield* awaitThreadState(
         harness.observed,
@@ -356,8 +525,8 @@ describe("EnvironmentThreads", () => {
   it.effect("removes cached data when the thread is deleted", () =>
     Effect.gen(function* () {
       const harness = yield* makeHarness({ cached: BASE_THREAD });
-      yield* Queue.offer(harness.inputs, snapshot(BASE_THREAD));
-      yield* Queue.offer(harness.inputs, deleted());
+      yield* Queue.offer(harness.inputs, snapshot(BASE_THREAD, CACHED_SNAPSHOT_SEQUENCE + 1));
+      yield* Queue.offer(harness.inputs, deleted(CACHED_SNAPSHOT_SEQUENCE + 2));
 
       const state = yield* awaitThreadState(
         harness.observed,
@@ -366,13 +535,45 @@ describe("EnvironmentThreads", () => {
 
       expect(Option.isNone(state.data)).toBe(true);
       expect(yield* Ref.get(harness.removedThreads)).toEqual([THREAD_ID]);
+      yield* TestClock.adjust("500 millis");
+      yield* Effect.yieldNow;
+      expect(yield* Ref.get(harness.savedThreads)).toEqual([]);
+    }),
+  );
+
+  it.effect("retains reversible active detail data when the thread is archived", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness({ cached: BASE_THREAD });
+      yield* Queue.offer(harness.inputs, snapshot(BASE_THREAD, CACHED_SNAPSHOT_SEQUENCE + 1));
+      yield* Queue.offer(harness.inputs, archived(CACHED_SNAPSHOT_SEQUENCE + 2));
+
+      const archivedState = yield* awaitThreadState(
+        harness.observed,
+        (value) =>
+          value.status === "live" &&
+          Option.isSome(value.data) &&
+          value.data.value.archivedAt === "2026-04-01T02:00:00.000Z",
+      );
+
+      expect(Option.getOrThrow(archivedState.data).archivedAt).toBe("2026-04-01T02:00:00.000Z");
+      expect(yield* Ref.get(harness.removedThreads)).toEqual([]);
+
+      yield* Queue.offer(harness.inputs, unarchived(CACHED_SNAPSHOT_SEQUENCE + 3));
+      const unarchivedState = yield* awaitThreadState(
+        harness.observed,
+        (value) =>
+          value.status === "live" &&
+          Option.isSome(value.data) &&
+          value.data.value.archivedAt === null,
+      );
+      expect(Option.getOrThrow(unarchivedState.data).archivedAt).toBeNull();
     }),
   );
 
   it.effect("preserves data after a domain failure and resumes on a replacement session", () =>
     Effect.gen(function* () {
       const harness = yield* makeHarness({ cached: BASE_THREAD });
-      yield* Queue.offer(harness.inputs, snapshot(BASE_THREAD));
+      yield* Queue.offer(harness.inputs, snapshot(BASE_THREAD, CACHED_SNAPSHOT_SEQUENCE + 1));
       yield* Queue.offer(harness.inputs, new Error("stream failed"));
 
       const state = yield* awaitThreadState(harness.observed, (value) =>
@@ -392,10 +593,13 @@ describe("EnvironmentThreads", () => {
       }
       yield* Queue.offer(
         harness.inputs,
-        snapshot({
-          ...BASE_THREAD,
-          title: "Recovered thread",
-        }),
+        snapshot(
+          {
+            ...BASE_THREAD,
+            title: "Recovered thread",
+          },
+          CACHED_SNAPSHOT_SEQUENCE + 2,
+        ),
       );
       const recovered = yield* awaitThreadState(
         harness.observed,
@@ -464,6 +668,663 @@ describe("EnvironmentThreads", () => {
       const messages = Option.getOrThrow(recovered.data).messages;
       expect(messages).toEqual([missedAssistantMessage]);
       expect(yield* Ref.get(harness.subscriptionCount)).toBe(2);
+    }),
+  );
+
+  it.effect("reconciles a running turn from projection when a live message frame is missed", () =>
+    Effect.gen(function* () {
+      const runningThread = makeRunningThread();
+      const harness = yield* makeHarness({ cached: runningThread });
+      yield* awaitThreadState(
+        harness.observed,
+        (value) =>
+          value.status === "live" &&
+          Option.isSome(value.data) &&
+          value.data.value.latestTurn?.state === "running" &&
+          value.data.value.messages.length === 0,
+      );
+
+      const missedAssistantMessage: OrchestrationMessage = {
+        id: MessageId.make("message-live-frame-missed"),
+        role: "assistant",
+        text: "This assistant update was persisted while the socket frame was missed.",
+        attachments: [],
+        turnId: RUNNING_TURN_ID,
+        streaming: false,
+        createdAt: "2026-07-07T21:00:03.000Z",
+        updatedAt: "2026-07-07T21:00:03.000Z",
+      };
+      yield* Ref.set(
+        harness.httpSnapshot,
+        Option.some({
+          snapshotSequence: CACHED_SNAPSHOT_SEQUENCE + 1,
+          thread: makeRunningThread([missedAssistantMessage]),
+        }),
+      );
+
+      yield* advanceActiveReconcileInterval;
+      const recovered = yield* awaitThreadState(
+        harness.observed,
+        (value) =>
+          value.status === "live" &&
+          Option.isSome(value.data) &&
+          value.data.value.messages.some((message) => message.id === missedAssistantMessage.id),
+      );
+
+      expect(Option.getOrThrow(recovered.data).messages).toEqual([missedAssistantMessage]);
+      expect(yield* Ref.get(harness.subscriptionCount)).toBe(1);
+      expect(yield* Ref.get(harness.loaderCalls)).toBeGreaterThanOrEqual(1);
+    }),
+  );
+
+  it.effect("applies an equal-sequence projection snapshot when it contains a missed message", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness({ cached: makeRunningThread() });
+      yield* Queue.offer(harness.inputs, titleUpdated("Live title", CACHED_SNAPSHOT_SEQUENCE + 1));
+      yield* awaitThreadState(
+        harness.observed,
+        (value) =>
+          value.status === "live" &&
+          Option.isSome(value.data) &&
+          value.data.value.title === "Live title",
+      );
+
+      const missedAssistantMessage: OrchestrationMessage = {
+        id: MessageId.make("message-equal-sequence-missed"),
+        role: "assistant",
+        text: "This assistant update shares the current projection sequence.",
+        attachments: [],
+        turnId: RUNNING_TURN_ID,
+        streaming: false,
+        createdAt: "2026-07-07T21:00:03.000Z",
+        updatedAt: "2026-07-07T21:00:03.000Z",
+      };
+      yield* Ref.set(
+        harness.httpSnapshot,
+        Option.some({
+          snapshotSequence: CACHED_SNAPSHOT_SEQUENCE + 1,
+          thread: { ...makeRunningThread([missedAssistantMessage]), title: "Live title" },
+        }),
+      );
+
+      yield* advanceActiveReconcileInterval;
+      const recovered = yield* awaitThreadState(
+        harness.observed,
+        (value) =>
+          value.status === "live" &&
+          Option.isSome(value.data) &&
+          value.data.value.messages.some((message) => message.id === missedAssistantMessage.id),
+      );
+
+      expect(Option.getOrThrow(recovered.data).messages).toEqual([missedAssistantMessage]);
+    }),
+  );
+
+  it.effect("applies an older global-sequence projection snapshot when thread data is fresh", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness({ cached: makeRunningThread() });
+      yield* Queue.offer(harness.inputs, titleUpdated("Live title", CACHED_SNAPSHOT_SEQUENCE + 2));
+      const current = yield* awaitThreadState(
+        harness.observed,
+        (value) =>
+          value.status === "live" &&
+          Option.isSome(value.data) &&
+          value.data.value.title === "Live title",
+      );
+
+      const missedAssistantMessage: OrchestrationMessage = {
+        id: MessageId.make("message-older-global-sequence-missed"),
+        role: "assistant",
+        text: "This assistant update arrived while an unrelated projector lagged.",
+        attachments: [],
+        turnId: RUNNING_TURN_ID,
+        streaming: false,
+        createdAt: "2026-07-07T21:00:03.000Z",
+        updatedAt: "2026-07-07T21:00:03.000Z",
+      };
+      const currentThread = Option.getOrThrow(current.data);
+      yield* Ref.set(
+        harness.httpSnapshot,
+        Option.some({
+          snapshotSequence: CACHED_SNAPSHOT_SEQUENCE + 1,
+          thread: {
+            ...currentThread,
+            messages: [missedAssistantMessage],
+          },
+        }),
+      );
+
+      yield* advanceActiveReconcileInterval;
+      const recovered = yield* awaitThreadState(
+        harness.observed,
+        (value) =>
+          value.status === "live" &&
+          Option.isSome(value.data) &&
+          value.data.value.messages.some((message) => message.id === missedAssistantMessage.id),
+      );
+
+      expect(Option.getOrThrow(recovered.data).messages).toEqual([missedAssistantMessage]);
+      yield* Queue.offer(
+        harness.inputs,
+        titleUpdated("Replayed after reconcile", CACHED_SNAPSHOT_SEQUENCE + 2),
+      );
+      yield* Effect.yieldNow;
+      expect(Option.getOrThrow((yield* Ref.get(harness.latest)).data).title).toBe("Live title");
+    }),
+  );
+
+  it.effect("merges older projection snapshots without dropping newer live collections", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness({ cached: makeRunningThread() });
+      yield* Queue.offer(
+        harness.inputs,
+        activityAppended(
+          "This live activity is already past the snapshot cursor.",
+          CACHED_SNAPSHOT_SEQUENCE + 2,
+        ),
+      );
+      const current = yield* awaitThreadState(
+        harness.observed,
+        (value) =>
+          value.status === "live" &&
+          Option.isSome(value.data) &&
+          value.data.value.activities.some(
+            (activity) =>
+              activity.summary === "This live activity is already past the snapshot cursor.",
+          ),
+      );
+
+      const missedAssistantMessage: OrchestrationMessage = {
+        id: MessageId.make("message-older-snapshot-preserves-live-activity"),
+        role: "assistant",
+        text: "This message arrived through projection while another projector lagged.",
+        attachments: [],
+        turnId: RUNNING_TURN_ID,
+        streaming: false,
+        createdAt: "2026-07-07T21:00:03.000Z",
+        updatedAt: "2026-07-07T21:00:03.000Z",
+      };
+      yield* Ref.set(
+        harness.httpSnapshot,
+        Option.some({
+          snapshotSequence: CACHED_SNAPSHOT_SEQUENCE + 1,
+          thread: {
+            ...Option.getOrThrow(current.data),
+            updatedAt: "2026-07-07T21:00:03.000Z",
+            messages: [missedAssistantMessage],
+            activities: [],
+          },
+        }),
+      );
+
+      yield* advanceActiveReconcileInterval;
+      const recovered = yield* awaitThreadState(
+        harness.observed,
+        (value) =>
+          value.status === "live" &&
+          Option.isSome(value.data) &&
+          value.data.value.messages.some((message) => message.id === missedAssistantMessage.id) &&
+          value.data.value.activities.some(
+            (activity) =>
+              activity.summary === "This live activity is already past the snapshot cursor.",
+          ),
+      );
+
+      const thread = Option.getOrThrow(recovered.data);
+      expect(thread.messages).toEqual([missedAssistantMessage]);
+      expect(thread.activities.map((activity) => activity.summary)).toEqual([
+        "This live activity is already past the snapshot cursor.",
+      ]);
+      yield* Queue.offer(
+        harness.inputs,
+        activityAppended("Replayed activity should remain deduped.", CACHED_SNAPSHOT_SEQUENCE + 2),
+      );
+      yield* Effect.yieldNow;
+      expect(Option.getOrThrow((yield* Ref.get(harness.latest)).data).activities).toHaveLength(1);
+    }),
+  );
+
+  it.effect(
+    "preserves current scalar fields when an older projection snapshot has the same timestamp",
+    () =>
+      Effect.gen(function* () {
+        const archivedAt = "2026-07-07T21:00:02.000Z";
+        const currentThread: OrchestrationThread = {
+          ...makeRunningThread(),
+          updatedAt: archivedAt,
+          archivedAt,
+        };
+        const harness = yield* makeHarness({ cached: currentThread });
+        yield* awaitThreadState(
+          harness.observed,
+          (value) =>
+            value.status === "live" &&
+            Option.isSome(value.data) &&
+            value.data.value.archivedAt === archivedAt,
+        );
+
+        const missedAssistantMessage: OrchestrationMessage = {
+          id: MessageId.make("message-equal-timestamp-scalar"),
+          role: "assistant",
+          text: "Projection recovered a missed row without rolling back archive state.",
+          attachments: [],
+          turnId: RUNNING_TURN_ID,
+          streaming: false,
+          createdAt: archivedAt,
+          updatedAt: archivedAt,
+        };
+        yield* Ref.set(
+          harness.httpSnapshot,
+          Option.some({
+            snapshotSequence: CACHED_SNAPSHOT_SEQUENCE - 1,
+            thread: {
+              ...currentThread,
+              archivedAt: null,
+              messages: [missedAssistantMessage],
+            },
+          }),
+        );
+
+        yield* advanceActiveReconcileInterval;
+        const recovered = yield* awaitThreadState(
+          harness.observed,
+          (value) =>
+            value.status === "live" &&
+            Option.isSome(value.data) &&
+            value.data.value.messages.some((message) => message.id === missedAssistantMessage.id),
+        );
+
+        expect(Option.getOrThrow(recovered.data).archivedAt).toBe(archivedAt);
+      }),
+  );
+
+  it.effect("does not prune collections solely from a lower-checkpoint older snapshot", () =>
+    Effect.gen(function* () {
+      const retainedTurnId = TurnId.make("turn-retained");
+      const prunedTurnId = TurnId.make("turn-pruned");
+      const retainedMessage: OrchestrationMessage = {
+        id: MessageId.make("message-retained-after-revert"),
+        role: "assistant",
+        text: "Retained turn output.",
+        attachments: [],
+        turnId: retainedTurnId,
+        streaming: false,
+        createdAt: "2026-07-07T21:00:01.000Z",
+        updatedAt: "2026-07-07T21:00:01.000Z",
+      };
+      const prunedMessage: OrchestrationMessage = {
+        id: MessageId.make("message-pruned-after-revert"),
+        role: "assistant",
+        text: "This turn was reverted.",
+        attachments: [],
+        turnId: prunedTurnId,
+        streaming: false,
+        createdAt: "2026-07-07T21:00:02.000Z",
+        updatedAt: "2026-07-07T21:00:02.000Z",
+      };
+      const retainedCheckpoint = {
+        turnId: retainedTurnId,
+        checkpointTurnCount: 1,
+        checkpointRef: CheckpointRef.make("refs/t3/checkpoints/thread-1/turn/1"),
+        status: "ready" as const,
+        files: [],
+        assistantMessageId: retainedMessage.id,
+        completedAt: "2026-07-07T21:00:01.500Z",
+      };
+      const prunedCheckpoint = {
+        turnId: prunedTurnId,
+        checkpointTurnCount: 2,
+        checkpointRef: CheckpointRef.make("refs/t3/checkpoints/thread-1/turn/2"),
+        status: "ready" as const,
+        files: [],
+        assistantMessageId: prunedMessage.id,
+        completedAt: "2026-07-07T21:00:02.500Z",
+      };
+      const currentThread: OrchestrationThread = {
+        ...makeRunningThread([retainedMessage, prunedMessage]),
+        updatedAt: "2026-07-07T21:00:02.500Z",
+        proposedPlans: [
+          {
+            id: "plan-pruned-after-revert",
+            turnId: prunedTurnId,
+            planMarkdown: "Remove this reverted plan.",
+            implementedAt: null,
+            implementationThreadId: null,
+            createdAt: "2026-07-07T21:00:02.000Z",
+            updatedAt: "2026-07-07T21:00:02.000Z",
+          },
+        ],
+        activities: [
+          {
+            id: EventId.make("activity-pruned-after-revert"),
+            tone: "info",
+            kind: "test.activity",
+            summary: "This reverted activity should disappear.",
+            payload: {},
+            turnId: prunedTurnId,
+            sequence: CACHED_SNAPSHOT_SEQUENCE + 2,
+            createdAt: "2026-07-07T21:00:02.000Z",
+          },
+        ],
+        checkpoints: [retainedCheckpoint, prunedCheckpoint],
+      };
+      const harness = yield* makeHarness({ cached: currentThread });
+      yield* awaitThreadState(
+        harness.observed,
+        (value) =>
+          value.status === "live" &&
+          Option.isSome(value.data) &&
+          value.data.value.checkpoints.length === 2,
+      );
+
+      yield* Ref.set(
+        harness.httpSnapshot,
+        Option.some({
+          snapshotSequence: CACHED_SNAPSHOT_SEQUENCE - 1,
+          thread: {
+            ...currentThread,
+            updatedAt: "2026-07-07T21:00:03.000Z",
+            messages: [retainedMessage],
+            proposedPlans: [],
+            activities: [],
+            checkpoints: [retainedCheckpoint],
+          },
+        }),
+      );
+
+      yield* advanceActiveReconcileInterval;
+      yield* Effect.yieldNow;
+
+      const thread = Option.getOrThrow((yield* Ref.get(harness.latest)).data);
+      expect(thread.messages.map((message) => message.id)).toEqual([
+        retainedMessage.id,
+        prunedMessage.id,
+      ]);
+      expect(thread.proposedPlans).toHaveLength(1);
+      expect(thread.activities).toHaveLength(1);
+      expect(thread.checkpoints.map((checkpoint) => checkpoint.turnId)).toEqual([
+        retainedTurnId,
+        prunedTurnId,
+      ]);
+    }),
+  );
+
+  it.effect(
+    "does not resurrect revert-pruned messages from a pre-revert non-advancing snapshot",
+    () =>
+      Effect.gen(function* () {
+        const retainedTurnId = TurnId.make("turn-kept");
+        const revertedTurnId = TurnId.make("turn-reverted");
+        const keptMessage: OrchestrationMessage = {
+          id: MessageId.make("message-kept-through-revert"),
+          role: "assistant",
+          text: "Retained turn output.",
+          attachments: [],
+          turnId: retainedTurnId,
+          streaming: false,
+          createdAt: "2026-07-07T21:00:01.000Z",
+          updatedAt: "2026-07-07T21:00:01.000Z",
+        };
+        const revertPrunedMessage: OrchestrationMessage = {
+          id: MessageId.make("message-pruned-by-revert"),
+          role: "assistant",
+          text: "This turn was reverted.",
+          attachments: [],
+          turnId: revertedTurnId,
+          streaming: false,
+          createdAt: "2026-07-07T21:00:02.000Z",
+          updatedAt: "2026-07-07T21:00:02.000Z",
+        };
+        const keptCheckpoint = {
+          turnId: retainedTurnId,
+          checkpointTurnCount: 1,
+          checkpointRef: CheckpointRef.make("refs/t3/checkpoints/thread-1/turn/1"),
+          status: "ready" as const,
+          files: [],
+          assistantMessageId: keptMessage.id,
+          completedAt: "2026-07-07T21:00:01.500Z",
+        };
+        const revertedCheckpoint = {
+          turnId: revertedTurnId,
+          checkpointTurnCount: 2,
+          checkpointRef: CheckpointRef.make("refs/t3/checkpoints/thread-1/turn/2"),
+          status: "ready" as const,
+          files: [],
+          assistantMessageId: revertPrunedMessage.id,
+          completedAt: "2026-07-07T21:00:02.500Z",
+        };
+        const currentThread: OrchestrationThread = {
+          ...makeRunningThread([keptMessage, revertPrunedMessage]),
+          updatedAt: "2026-07-07T21:00:02.500Z",
+          checkpoints: [keptCheckpoint, revertedCheckpoint],
+        };
+        const harness = yield* makeHarness({ cached: currentThread });
+        yield* awaitThreadState(
+          harness.observed,
+          (value) =>
+            value.status === "live" &&
+            Option.isSome(value.data) &&
+            value.data.value.checkpoints.length === 2,
+        );
+
+        yield* Queue.offer(harness.inputs, {
+          kind: "event",
+          event: {
+            eventId: EventId.make("event-reverted"),
+            sequence: CACHED_SNAPSHOT_SEQUENCE + 2,
+            occurredAt: "2026-07-07T21:00:03.000Z",
+            commandId: null,
+            causationEventId: null,
+            correlationId: null,
+            metadata: {},
+            aggregateKind: "thread",
+            aggregateId: THREAD_ID,
+            type: "thread.reverted",
+            payload: {
+              threadId: THREAD_ID,
+              turnCount: 1,
+            },
+          },
+        });
+        yield* awaitThreadState(
+          harness.observed,
+          (value) =>
+            value.status === "live" &&
+            Option.isSome(value.data) &&
+            value.data.value.messages.length === 1,
+        );
+
+        // A reconcile snapshot taken BEFORE the revert still contains the pruned
+        // message; the non-advancing additive merge must not resurrect it.
+        const loaderCallsBeforeReconcile = yield* Ref.get(harness.loaderCalls);
+        yield* Ref.set(
+          harness.httpSnapshot,
+          Option.some({
+            snapshotSequence: CACHED_SNAPSHOT_SEQUENCE + 1,
+            thread: {
+              ...currentThread,
+              updatedAt: "2026-07-07T21:00:05.000Z",
+            },
+          }),
+        );
+
+        // Drive several reconcile intervals so at least one load observes the
+        // pre-revert snapshot, and watch whether the pruned message ever
+        // (incorrectly) reappears.
+        let maxMessages = 0;
+        for (let rounds = 0; rounds < 5; rounds += 1) {
+          yield* advanceActiveReconcileInterval;
+          for (let ticks = 0; ticks < 50; ticks += 1) {
+            const observedNow = Option.getOrThrow((yield* Ref.get(harness.latest)).data);
+            maxMessages = Math.max(maxMessages, observedNow.messages.length);
+            yield* Effect.yieldNow;
+          }
+        }
+        expect(yield* Ref.get(harness.loaderCalls)).toBeGreaterThan(loaderCallsBeforeReconcile);
+        expect(maxMessages).toBe(1);
+
+        const thread = Option.getOrThrow((yield* Ref.get(harness.latest)).data);
+        expect(thread.messages.map((message) => message.id)).toEqual([keptMessage.id]);
+      }),
+  );
+
+  it.effect("keeps a recent turn completion eligible for projection reconciliation", () =>
+    Effect.gen(function* () {
+      const runningThread = makeRunningThread();
+      const harness = yield* makeHarness({ cached: runningThread });
+      yield* awaitThreadState(
+        harness.observed,
+        (value) =>
+          value.status === "live" &&
+          Option.isSome(value.data) &&
+          value.data.value.latestTurn?.state === "running",
+      );
+      yield* Queue.offer(harness.inputs, sessionReady(CACHED_SNAPSHOT_SEQUENCE + 1));
+      yield* awaitThreadState(
+        harness.observed,
+        (value) =>
+          value.status === "live" &&
+          Option.isSome(value.data) &&
+          value.data.value.latestTurn?.state === "completed" &&
+          value.data.value.messages.length === 0,
+      );
+
+      const missedAssistantMessage: OrchestrationMessage = {
+        id: MessageId.make("message-completed-turn-missed"),
+        role: "assistant",
+        text: "This assistant update was missed before the turn completed.",
+        attachments: [],
+        turnId: RUNNING_TURN_ID,
+        streaming: false,
+        createdAt: "2026-07-07T21:00:03.000Z",
+        updatedAt: "2026-07-07T21:00:03.000Z",
+      };
+      const completedThread = Option.getOrThrow((yield* Ref.get(harness.latest)).data);
+      yield* Ref.set(
+        harness.httpSnapshot,
+        Option.some({
+          snapshotSequence: CACHED_SNAPSHOT_SEQUENCE + 1,
+          thread: {
+            ...completedThread,
+            messages: [missedAssistantMessage],
+            latestTurn: completedThread.latestTurn
+              ? {
+                  ...completedThread.latestTurn,
+                  assistantMessageId: missedAssistantMessage.id,
+                }
+              : completedThread.latestTurn,
+          },
+        }),
+      );
+
+      yield* advanceActiveReconcileInterval;
+      const recovered = yield* awaitThreadState(
+        harness.observed,
+        (value) =>
+          value.status === "live" &&
+          Option.isSome(value.data) &&
+          value.data.value.messages.some((message) => message.id === missedAssistantMessage.id),
+      );
+
+      expect(Option.getOrThrow(recovered.data).messages).toEqual([missedAssistantMessage]);
+    }),
+  );
+
+  it.effect("does not poll parked waiting sessions without an active turn", () =>
+    Effect.gen(function* () {
+      const parkedWaitingThread: OrchestrationThread = {
+        ...BASE_THREAD,
+        latestTurn: {
+          turnId: RUNNING_TURN_ID,
+          state: "completed",
+          requestedAt: "2026-07-07T21:00:00.000Z",
+          startedAt: "2026-07-07T21:00:01.000Z",
+          completedAt: "2026-07-07T21:00:04.000Z",
+          assistantMessageId: null,
+        },
+        session: {
+          threadId: THREAD_ID,
+          status: "waiting",
+          providerName: "claudeAgent",
+          runtimeMode: "full-access",
+          activeTurnId: null,
+          lastError: null,
+          updatedAt: "2026-07-07T21:00:04.000Z",
+        },
+      };
+      const harness = yield* makeHarness({ cached: parkedWaitingThread });
+      yield* awaitThreadState(
+        harness.observed,
+        (value) =>
+          value.status === "live" &&
+          Option.isSome(value.data) &&
+          value.data.value.session?.status === "waiting",
+      );
+
+      yield* advanceActiveReconcileInterval;
+
+      expect(yield* Ref.get(harness.loaderCalls)).toBe(0);
+    }),
+  );
+
+  it.effect("treats a missing active-turn reconcile snapshot as a deleted thread", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness({ cached: makeRunningThread() });
+      yield* awaitThreadState(
+        harness.observed,
+        (value) =>
+          value.status === "live" &&
+          Option.isSome(value.data) &&
+          value.data.value.latestTurn?.state === "running",
+      );
+      yield* Ref.set(harness.httpReconcileResult, Option.some({ kind: "missing" }));
+
+      yield* advanceActiveReconcileInterval;
+      const deletedState = yield* awaitThreadState(
+        harness.observed,
+        (value) => value.status === "deleted",
+      );
+
+      expect(Option.isNone(deletedState.data)).toBe(true);
+      expect(yield* Ref.get(harness.removedThreads)).toEqual([THREAD_ID]);
+    }),
+  );
+
+  it.effect("ignores stale snapshots after a newer live event advances the cursor", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness({ cached: BASE_THREAD });
+      yield* Queue.offer(
+        harness.inputs,
+        snapshot({ ...BASE_THREAD, title: "Snapshot title" }, CACHED_SNAPSHOT_SEQUENCE + 1),
+      );
+      yield* awaitThreadState(
+        harness.observed,
+        (value) =>
+          value.status === "live" &&
+          Option.isSome(value.data) &&
+          value.data.value.title === "Snapshot title",
+      );
+
+      yield* Queue.offer(
+        harness.inputs,
+        titleUpdated("Newer live title", CACHED_SNAPSHOT_SEQUENCE + 2),
+      );
+      yield* awaitThreadState(
+        harness.observed,
+        (value) =>
+          value.status === "live" &&
+          Option.isSome(value.data) &&
+          value.data.value.title === "Newer live title",
+      );
+
+      yield* Queue.offer(
+        harness.inputs,
+        snapshot({ ...BASE_THREAD, title: "Stale snapshot title" }, CACHED_SNAPSHOT_SEQUENCE + 1),
+      );
+      yield* Effect.yieldNow;
+
+      const latest = yield* Ref.get(harness.latest);
+      expect(Option.getOrThrow(latest.data).title).toBe("Newer live title");
     }),
   );
 

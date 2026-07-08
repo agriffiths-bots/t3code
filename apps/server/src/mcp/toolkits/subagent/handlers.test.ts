@@ -223,6 +223,8 @@ const assertParentCalls: Array<{
 }> = [];
 let assertParentFailureChild: ThreadId | null = null;
 const dispatchedTurns: Array<ThreadId> = [];
+const dispatchedTurnCommands: Array<Extract<OrchestrationCommand, { type: "thread.turn.start" }>> =
+  [];
 const insertedDispatches: Array<PendingDispatch> = [];
 // Fix 1 seams: the enabled provider instances (with their live model lists) the
 // schedule handlers resolve a plain `model` against, and the tasks they persist.
@@ -518,6 +520,7 @@ const dispatcherLayer = Layer.succeed(BootstrapTurnStartDispatcher, {
   dispatch: (command) =>
     Effect.sync(() => {
       dispatchedTurns.push(command.threadId);
+      dispatchedTurnCommands.push(command);
       return { sequence: dispatchedTurns.length };
     }),
 });
@@ -578,6 +581,51 @@ describe("SubagentToolkit", () => {
         });
       }),
     ).pipe(Effect.provide(TestLayer)),
+  );
+
+  it.effect("spawns a detached child as a plain thread turn start", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const server = yield* McpServer.McpServer;
+        childDriverKind = "codex";
+        dispatchedTurns.length = 0;
+        dispatchedTurnCommands.length = 0;
+        registeredChildren.length = 0;
+
+        const result = yield* server
+          .callTool({
+            name: "t3_spawn_subagent",
+            arguments: {
+              prompt: "run as a normal thread",
+              title: "plain child",
+              mode: "current_checkout",
+              detached: true,
+            },
+          })
+          .pipe(
+            Effect.provideService(McpInvocationContext.McpInvocationContext, invocation),
+            Effect.provideService(McpSchema.McpServerClient, client),
+          );
+
+        expect(result.isError).toBe(false);
+        expect(dispatchedTurnCommands).toHaveLength(1);
+        const command = dispatchedTurnCommands[0];
+        if (!command) throw new Error("Expected spawn to dispatch a child turn start.");
+        expect(command.type).toBe("thread.turn.start");
+        expect("providerSessionDetached" in command).toBe(false);
+        expect(registeredChildren).toEqual([{ childThreadId: command.threadId, parentThreadId }]);
+      }),
+    ).pipe(
+      Effect.ensuring(
+        Effect.sync(() => {
+          childDriverKind = undefined;
+          dispatchedTurns.length = 0;
+          dispatchedTurnCommands.length = 0;
+          registeredChildren.length = 0;
+        }),
+      ),
+      Effect.provide(TestLayer),
+    ),
   );
 
   it.effect(

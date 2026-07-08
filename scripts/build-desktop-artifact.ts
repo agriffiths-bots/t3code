@@ -45,6 +45,7 @@ const WorkspaceConfig = Schema.Struct({
   catalog: Schema.optional(Schema.Record(Schema.String, Schema.String)),
   overrides: Schema.optional(Schema.Record(Schema.String, Schema.String)),
   patchedDependencies: Schema.optional(Schema.Record(Schema.String, Schema.String)),
+  allowBuilds: Schema.optional(Schema.Record(Schema.String, Schema.Boolean)),
 });
 type WorkspaceConfig = typeof WorkspaceConfig.Type;
 
@@ -54,7 +55,14 @@ const StageWorkspaceConfig = Schema.Struct({
     cpu: Schema.Array(Schema.String),
     libc: Schema.optional(Schema.Array(Schema.String)),
   }),
+  // pnpm 11 only reads these from pnpm-workspace.yaml (not package.json#pnpm).
+  // Without allowBuilds the staged `vp install --prod` fails with
+  // ERR_PNPM_IGNORED_BUILDS for packages that have lifecycle scripts.
+  allowBuilds: Schema.optional(Schema.Record(Schema.String, Schema.Boolean)),
+  patchedDependencies: Schema.optional(Schema.Record(Schema.String, Schema.String)),
+  overrides: Schema.optional(Schema.Record(Schema.String, Schema.String)),
 });
+type StageWorkspaceConfig = typeof StageWorkspaceConfig.Type;
 
 const RepoRoot = Effect.service(Path.Path).pipe(
   Effect.flatMap((path) => path.fromFileUrl(new URL("..", import.meta.url))),
@@ -575,10 +583,6 @@ interface StagePackageJson {
   readonly devDependencies: {
     readonly electron: string;
   };
-  readonly overrides: Record<string, unknown>;
-  readonly pnpm?: {
-    readonly patchedDependencies?: Record<string, string>;
-  };
 }
 
 export const STAGE_INSTALL_ARGS = ["install", "--prod"] as const;
@@ -586,8 +590,10 @@ export const DESKTOP_PACKAGE_BUILD_ENV = {
   T3CODE_DESKTOP_PACKAGE: "1",
   T3CODE_WEB_SOURCEMAP: "0",
 } as const;
+const FFI_RS_VERSION = "1.3.2";
 export const DESKTOP_AFTER_PACK_HOOK_STAGE_PATH = "desktop-after-pack-prune.mjs";
 export const DESKTOP_ASAR_UNPACK_BASE = ["apps/server/dist/**"] as const;
+export const MOCK_UPDATE_SERVER_HOST = "127.0.0.1";
 export const DESKTOP_UNPACKED_FILE_LIMIT = 250;
 export const DESKTOP_NATIVE_ASAR_UNPACK_PACKAGE_PATTERNS = [
   "@anthropic-ai/claude-agent-sdk-*",
@@ -643,6 +649,19 @@ export function createDesktopPackageBuildEnv(
     ...env,
     ...DESKTOP_PACKAGE_BUILD_ENV,
   };
+}
+
+export function createElectronBuilderEnv(env: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+  const nextEnv: NodeJS.ProcessEnv = { ...env };
+  if (rootPackageJson.packageManager.startsWith("pnpm@")) {
+    const pnpmVersion = rootPackageJson.packageManager.slice("pnpm@".length);
+    // On Windows, electron-builder's pnpm workspace probe can return a Git-Bash
+    // /c/... path that its Node-side file detection cannot read, so it falls
+    // back to npm_config_user_agent. Keep that fallback on pnpm for the staged app.
+    nextEnv.npm_config_user_agent = `pnpm/${pnpmVersion}`;
+    nextEnv.npm_execpath = "pnpm";
+  }
+  return nextEnv;
 }
 
 export interface MacPasskeySigningConfiguration {
@@ -886,6 +905,30 @@ export function resolveFffNativeDependencies(
   );
 }
 
+export function resolveFfiRsNativeDependencies(
+  platform: typeof BuildPlatform.Type,
+  arch: typeof BuildArch.Type,
+  version: string,
+): Record<string, string> {
+  const architectures = arch === "universal" ? (["arm64", "x64"] as const) : [arch];
+
+  if (platform === "mac") {
+    return Object.fromEntries(
+      architectures.map((architecture) => [`@yuuang/ffi-rs-darwin-${architecture}`, version]),
+    );
+  }
+
+  if (platform === "win") {
+    return Object.fromEntries(
+      architectures.map((architecture) => [`@yuuang/ffi-rs-win32-${architecture}-msvc`, version]),
+    );
+  }
+
+  return Object.fromEntries(
+    architectures.map((architecture) => [`@yuuang/ffi-rs-linux-${architecture}-gnu`, version]),
+  );
+}
+
 export function resolveClaudeAgentNativeDependencies(
   platform: typeof BuildPlatform.Type,
   arch: typeof BuildArch.Type,
@@ -980,10 +1023,14 @@ const stageClerkPasskeyNativeBinaries = Effect.fn("stageClerkPasskeyNativeBinari
   }
 });
 
-export function createStageWorkspaceConfig(
-  platform: typeof BuildPlatform.Type,
-  arch: typeof BuildArch.Type,
-): typeof StageWorkspaceConfig.Type {
+export function createStageWorkspaceConfig(input: {
+  readonly platform: typeof BuildPlatform.Type;
+  readonly arch: typeof BuildArch.Type;
+  readonly allowBuilds?: Record<string, boolean>;
+  readonly patchedDependencies?: Record<string, string>;
+  readonly overrides?: Record<string, string>;
+}): StageWorkspaceConfig {
+  const { platform, arch, allowBuilds, patchedDependencies, overrides } = input;
   const hostOs = platform === "mac" ? "darwin" : platform === "win" ? "win32" : "linux";
   const hostCpu = arch === "universal" ? ["arm64", "x64"] : [arch];
   // Windows artifacts also bundle the same-architecture WSL Linux backend, which loads
@@ -991,36 +1038,37 @@ export function createStageWorkspaceConfig(
   // Pull the Linux (glibc) variants in addition to the host platform's so
   // they ship in the asar; without them the WSL backend crash-loops on require
   // ("Cannot find module '@yuuang/ffi-rs-linux-x64-gnu'").
-  if (platform === "win") {
-    return {
-      supportedArchitectures: {
-        os: Array.from(new Set([hostOs, "linux"])),
-        cpu: hostCpu,
-        libc: ["glibc"],
-      },
-    };
-  }
+  const supportedArchitectures =
+    platform === "win"
+      ? {
+          os: Array.from(new Set([hostOs, "linux"])),
+          cpu: hostCpu,
+          libc: ["glibc"],
+        }
+      : {
+          os: [hostOs],
+          cpu: hostCpu,
+        };
+
   return {
-    supportedArchitectures: {
-      os: [hostOs],
-      cpu: hostCpu,
-    },
+    supportedArchitectures,
+    ...(allowBuilds && Object.keys(allowBuilds).length > 0 ? { allowBuilds } : {}),
+    ...(patchedDependencies && Object.keys(patchedDependencies).length > 0
+      ? { patchedDependencies }
+      : {}),
+    ...(overrides && Object.keys(overrides).length > 0 ? { overrides } : {}),
   };
 }
 
-export function createStagePnpmConfig(
+export function createStagePatchedDependencies(
   patchedDependencies: Record<string, string>,
   dependencies: Record<string, unknown>,
-): StagePackageJson["pnpm"] | undefined {
-  const stagePatchedDependencies = Object.fromEntries(
+): Record<string, string> {
+  return Object.fromEntries(
     Object.entries(patchedDependencies).filter(([patchKey]) =>
       Object.hasOwn(dependencies, getPatchedDependencyPackageName(patchKey)),
     ),
   );
-
-  return Object.keys(stagePatchedDependencies).length > 0
-    ? { patchedDependencies: stagePatchedDependencies }
-    : undefined;
 }
 
 function getPatchedDependencyPackageName(patchKey: string): string {
@@ -1517,7 +1565,7 @@ export function resolveDesktopBuildIconAssets(version: string): DesktopBuildIcon
 }
 
 export function resolveMockUpdateServerUrl(mockUpdateServerPort: number | undefined): string {
-  return `http://localhost:${mockUpdateServerPort ?? 3000}`;
+  return `http://${MOCK_UPDATE_SERVER_HOST}:${mockUpdateServerPort ?? 3000}`;
 }
 
 export function resolveDesktopProductName(version: string): string {
@@ -1724,6 +1772,7 @@ const buildDesktopArtifact = Effect.fn("buildDesktopArtifact")(function* (
   const workspaceCatalog = workspaceConfig.catalog ?? {};
   const workspaceOverrides = workspaceConfig.overrides ?? {};
   const workspacePatchedDependencies = workspaceConfig.patchedDependencies ?? {};
+  const workspaceAllowBuilds = workspaceConfig.allowBuilds ?? {};
 
   const platformConfig = PLATFORM_CONFIG[options.platform];
   if (!platformConfig) {
@@ -1770,9 +1819,12 @@ const buildDesktopArtifact = Effect.fn("buildDesktopArtifact")(function* (
   const iconAssets = resolveDesktopBuildIconAssets(appVersion);
   const commitHash = yield* resolveGitCommitHash(repoRoot);
   const mkdir = options.keepStage ? fs.makeTempDirectory : fs.makeTempDirectoryScoped;
-  const stageRoot = yield* mkdir({
+  const createdStageRoot = yield* mkdir({
     prefix: `t3code-desktop-${options.platform}-stage-`,
   });
+  const stageRoot = yield* fs
+    .realPath(createdStageRoot)
+    .pipe(Effect.orElseSucceed(() => createdStageRoot));
 
   const stageAppDir = path.join(stageRoot, "app");
   const stageResourcesDir = path.join(stageAppDir, "apps/desktop/resources");
@@ -1890,10 +1942,11 @@ const buildDesktopArtifact = Effect.fn("buildDesktopArtifact")(function* (
       options.arch,
       serverPackageJson.dependencies["@ff-labs/fff-node"],
     ),
+    ...resolveFfiRsNativeDependencies(options.platform, options.arch, FFI_RS_VERSION),
     // Windows artifacts also bundle the same-architecture WSL Linux backend, which loads the
     // fff native binary through ffi-rs. The platform fff binary above is the
-    // host's (win32), so promote the matching Linux fff binaries too; without
-    // them file-finding in WSL fails to load its Linux native package.
+    // host's (win32), so promote the matching Linux fff/ffi-rs binaries too; without
+    // them file-finding in WSL fails to load its Linux native packages.
     ...(options.platform === "win"
       ? {
           ...resolveClaudeAgentNativeDependencies(
@@ -1906,10 +1959,14 @@ const buildDesktopArtifact = Effect.fn("buildDesktopArtifact")(function* (
             options.arch,
             serverPackageJson.dependencies["@ff-labs/fff-node"],
           ),
+          ...resolveFfiRsNativeDependencies("linux", options.arch, FFI_RS_VERSION),
         }
       : {}),
   };
-  const stagePnpmConfig = createStagePnpmConfig(workspacePatchedDependencies, stageDependencies);
+  const stagePatchedDependencies = createStagePatchedDependencies(
+    workspacePatchedDependencies,
+    stageDependencies,
+  );
   const stagePackageJson: StagePackageJson = {
     name: "t3code",
     version: appVersion,
@@ -1919,7 +1976,7 @@ const buildDesktopArtifact = Effect.fn("buildDesktopArtifact")(function* (
     packageManager: rootPackageJson.packageManager,
     description: "T3 Code desktop build",
     author: "T3 Tools",
-    main: "apps/desktop/dist-electron/main.cjs",
+    main: "apps/desktop/dist-electron/bootstrap.cjs",
     build: yield* createBuildConfig(
       options.platform,
       options.target,
@@ -1939,20 +1996,24 @@ const buildDesktopArtifact = Effect.fn("buildDesktopArtifact")(function* (
     devDependencies: {
       electron: electronVersion,
     },
-    overrides: resolvedOverrides,
-    ...(stagePnpmConfig ? { pnpm: stagePnpmConfig } : {}),
   };
 
   const stagePackageJsonString = yield* encodeJsonString(stagePackageJson);
   yield* fs.writeFileString(path.join(stageAppDir, "package.json"), `${stagePackageJsonString}\n`);
-  const stageWorkspaceConfig = createStageWorkspaceConfig(options.platform, options.arch);
+  const stageWorkspaceConfig = createStageWorkspaceConfig({
+    platform: options.platform,
+    arch: options.arch,
+    allowBuilds: workspaceAllowBuilds,
+    patchedDependencies: stagePatchedDependencies,
+    overrides: resolvedOverrides,
+  });
   const stageWorkspaceConfigString = yield* encodeStageWorkspaceConfig(stageWorkspaceConfig);
   yield* fs.writeFileString(
     path.join(stageAppDir, "pnpm-workspace.yaml"),
     stageWorkspaceConfigString,
   );
 
-  if (Object.keys(workspacePatchedDependencies).length > 0) {
+  if (Object.keys(stagePatchedDependencies).length > 0) {
     yield* fs.copy(path.join(repoRoot, "patches"), path.join(stageAppDir, "patches"));
   }
 
@@ -1980,9 +2041,7 @@ const buildDesktopArtifact = Effect.fn("buildDesktopArtifact")(function* (
   // electron-builder treats several set-but-empty variables (e.g. CSC_LINK="")
   // as enabled, so copy the host env and scrub empty values instead of relying
   // on `extendEnv` merging.
-  const buildEnv: NodeJS.ProcessEnv = {
-    ...process.env,
-  };
+  const buildEnv = createElectronBuilderEnv();
   for (const [key, value] of Object.entries(buildEnv)) {
     if (value === "") {
       delete buildEnv[key];

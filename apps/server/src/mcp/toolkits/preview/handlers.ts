@@ -1,9 +1,12 @@
 import * as Effect from "effect/Effect";
 import type {
+  PreviewAutomationClientDisconnectedError,
   PreviewAutomationNoAvailableHostError,
   PreviewAutomationOperation,
+  PreviewAutomationRequestQueueClosedError,
   PreviewAutomationRecordingArtifact,
   PreviewAutomationRecordingStatus,
+  PreviewAutomationTimeoutError,
   PreviewAutomationResizeResult,
   PreviewAutomationSnapshot,
   PreviewAutomationStatus,
@@ -51,7 +54,11 @@ const missingHostStatus = (
   input: {
     readonly tabId?: PreviewTabId | undefined;
   },
-  error: PreviewAutomationNoAvailableHostError,
+  error:
+    | PreviewAutomationNoAvailableHostError
+    | PreviewAutomationTimeoutError
+    | PreviewAutomationClientDisconnectedError
+    | PreviewAutomationRequestQueueClosedError,
 ): PreviewAutomationStatus => ({
   available: false,
   visible: false,
@@ -71,6 +78,14 @@ const handlers = {
       Effect.catchTag("PreviewAutomationNoAvailableHostError", (error) =>
         Effect.succeed(missingHostStatus(input ?? {}, error)),
       ),
+      Effect.catchTags({
+        PreviewAutomationClientDisconnectedError: (error) =>
+          Effect.succeed(missingHostStatus(input ?? {}, error)),
+        PreviewAutomationRequestQueueClosedError: (error) =>
+          Effect.succeed(missingHostStatus(input ?? {}, error)),
+        PreviewAutomationTimeoutError: (error) =>
+          Effect.succeed(missingHostStatus(input ?? {}, error)),
+      }),
     ),
   preview_open: (input) => {
     const openInput = {

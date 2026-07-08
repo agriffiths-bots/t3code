@@ -73,8 +73,10 @@ export interface ProjectionSnapshotQueryShape {
   /**
    * Read the latest orchestration projection snapshot.
    *
-   * Rehydrates from projection tables and derives snapshot sequence from
-   * projector cursor state.
+   * Returns project and lightweight thread metadata only. Per-thread messages,
+   * activities, proposed plans, and checkpoint summaries are intentionally
+   * omitted from this global snapshot and must be loaded through the targeted
+   * thread detail query.
    */
   readonly getSnapshot: () => Effect.Effect<OrchestrationReadModel, ProjectionRepositoryError>;
 
@@ -160,14 +162,16 @@ export interface ProjectionSnapshotQueryShape {
   ) => Effect.Effect<Option.Option<OrchestrationThreadShell>, ProjectionRepositoryError>;
 
   /**
-   * Read a single active thread detail snapshot by id.
+   * Read a single non-deleted thread detail snapshot by id. Archived threads are
+   * included so active detail clients can observe archive/unarchive transitions
+   * without treating archive as a terminal delete.
    */
   readonly getThreadDetailById: (
     threadId: ThreadId,
   ) => Effect.Effect<Option.Option<OrchestrationThread>, ProjectionRepositoryError>;
 
   /**
-   * Read a single active thread detail together with the projection snapshot
+   * Read a single non-deleted thread detail together with the projection snapshot
    * sequence in one consistent transaction, so the returned `snapshotSequence`
    * exactly matches the state reflected in `thread` (no interleaving projector
    * update between the two reads).

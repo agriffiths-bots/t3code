@@ -9,6 +9,7 @@ import {
   reduceDesktopUpdateStateOnDownloadProgress,
   reduceDesktopUpdateStateOnDownloadStart,
   reduceDesktopUpdateStateOnInstallFailure,
+  reduceDesktopUpdateStateOnInstallStart,
   reduceDesktopUpdateStateOnNoUpdate,
   reduceDesktopUpdateStateOnUpdateAvailable,
 } from "./updateMachine.ts";
@@ -93,6 +94,22 @@ describe("updateMachine", () => {
     expect(failedInstall.status).toBe("downloaded");
     expect(failedInstall.errorContext).toBe("install");
     expect(failedInstall.canRetry).toBe(true);
+  });
+
+  it("surfaces an installing state before handing off to the installer", () => {
+    const installing = reduceDesktopUpdateStateOnInstallStart({
+      ...createInitialDesktopUpdateState("1.0.0", runtimeInfo, "latest"),
+      enabled: true,
+      status: "downloaded",
+      availableVersion: "1.1.0",
+      downloadedVersion: "1.1.0",
+      canRetry: true,
+    });
+
+    expect(installing.status).toBe("installing");
+    expect(installing.message).toBeNull();
+    expect(installing.errorContext).toBeNull();
+    expect(installing.canRetry).toBe(false);
   });
 
   it("clears stale download state when no update is available", () => {

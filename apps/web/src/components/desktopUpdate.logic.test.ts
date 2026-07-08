@@ -104,6 +104,20 @@ describe("desktop update button state", () => {
     expect(isDesktopUpdateButtonDisabled(state)).toBe(true);
     expect(getDesktopUpdateButtonTooltip(state)).toContain("42%");
   });
+
+  it("keeps the update control visible but disabled while installing", () => {
+    const state: DesktopUpdateState = {
+      ...baseState,
+      status: "installing",
+      availableVersion: "1.1.0",
+      downloadedVersion: "1.1.0",
+      message: null,
+    };
+
+    expect(shouldShowDesktopUpdateButton(state)).toBe(true);
+    expect(isDesktopUpdateButtonDisabled(state)).toBe(true);
+    expect(getDesktopUpdateButtonTooltip(state)).toContain("Installing update");
+  });
 });
 
 describe("getDesktopUpdateActionError", () => {
@@ -154,6 +168,21 @@ describe("getDesktopUpdateActionError", () => {
     };
     expect(getDesktopUpdateActionError(result)).toBeNull();
   });
+
+  it("ignores non-error progress states for accepted handoffs", () => {
+    const result: DesktopUpdateActionResult = {
+      accepted: true,
+      completed: false,
+      state: {
+        ...baseState,
+        status: "installing",
+        downloadedVersion: "1.1.0",
+        message: "Installing update. T3 Code will restart when installation is ready.",
+        errorContext: null,
+      },
+    };
+    expect(getDesktopUpdateActionError(result)).toBeNull();
+  });
 });
 
 describe("desktop update UI helpers", () => {
@@ -162,7 +191,7 @@ describe("desktop update UI helpers", () => {
       shouldToastDesktopUpdateActionResult({
         accepted: true,
         completed: false,
-        state: { ...baseState, message: "checksum mismatch" },
+        state: { ...baseState, message: "checksum mismatch", errorContext: "download" },
       }),
     ).toBe(true);
     expect(
@@ -250,6 +279,17 @@ describe("canCheckForUpdate", () => {
       canCheckForUpdate({
         ...baseState,
         status: "downloaded",
+        availableVersion: "1.1.0",
+        downloadedVersion: "1.1.0",
+      }),
+    ).toBe(false);
+  });
+
+  it("returns false while installing", () => {
+    expect(
+      canCheckForUpdate({
+        ...baseState,
+        status: "installing",
         availableVersion: "1.1.0",
         downloadedVersion: "1.1.0",
       }),
