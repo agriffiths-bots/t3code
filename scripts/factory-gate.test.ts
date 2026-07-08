@@ -29,12 +29,12 @@ function shellQuote(value: string): string {
 function run(
   cwd: string,
   args: ReadonlyArray<string>,
-  options: { readonly expectFailure?: boolean } = {},
+  options: { readonly env?: NodeJS.ProcessEnv; readonly expectFailure?: boolean } = {},
 ): NodeChildProcess.SpawnSyncReturns<string> {
   const result = NodeChildProcess.spawnSync(args[0]!, args.slice(1), {
     cwd,
     encoding: "utf8",
-    env: cleanGitEnvironment(),
+    env: { ...cleanGitEnvironment(), ...options.env },
   });
 
   if (!options.expectFailure && result.status !== 0) {
@@ -253,6 +253,47 @@ describe("factory pre-commit gate", () => {
           pass?.timings as { readonly static_checks?: ReadonlyArray<{ readonly rc: number }> }
         )?.static_checks?.map((check) => check.rc),
         [0, 0],
+      );
+    } finally {
+      NodeFS.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("falls back when date does not support nanosecond formatting", () => {
+    const root = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3-factory-gate-"));
+    try {
+      const fakeBin = NodePath.join(root, "fake-bin");
+      NodeFS.mkdirSync(fakeBin, { recursive: true });
+      const realDate = NodeChildProcess.spawnSync("bash", ["-lc", "command -v date"], {
+        encoding: "utf8",
+        env: cleanGitEnvironment(),
+      }).stdout.trim();
+      assert.notEqual(realDate, "");
+      NodeFS.writeFileSync(
+        NodePath.join(fakeBin, "date"),
+        `#!/usr/bin/env bash
+if [[ "\${1:-}" == "+%s%N" ]]; then
+  echo "1760000000N"
+  exit 0
+fi
+exec ${shellQuote(realDate)} "$@"
+`,
+      );
+      NodeFS.chmodSync(NodePath.join(fakeBin, "date"), 0o755);
+
+      const { audit, repo } = installFactoryFixture(root);
+      NodeFS.writeFileSync(NodePath.join(repo, "date-fallback.txt"), "date fallback\n");
+      run(repo, ["git", "add", "-A"]);
+
+      run(repo, ["scripts/factory/precommit-gate.sh", "--prepare"], {
+        env: { PATH: `${fakeBin}:${process.env.PATH ?? ""}` },
+      });
+
+      const pass = readAuditRecords(audit).at(-1);
+      assert.equal(pass?.verdict, "pass");
+      assert.equal(
+        typeof (pass?.timings as { readonly total_secs?: unknown })?.total_secs,
+        "number",
       );
     } finally {
       NodeFS.rmSync(root, { recursive: true, force: true });

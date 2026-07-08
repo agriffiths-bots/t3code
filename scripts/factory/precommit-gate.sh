@@ -138,8 +138,20 @@ command -v jq >/dev/null || { echo "factory-gate: jq is required" >&2; exit 2; }
 
 now_ms() {
   local ns
-  ns="$(date +%s%N)"
-  echo "$((ns / 1000000))"
+  ns="$(date +%s%N 2>/dev/null || true)"
+  if [[ "$ns" =~ ^[0-9]+$ ]]; then
+    echo "$((ns / 1000000))"
+    return 0
+  fi
+  if command -v node >/dev/null 2>&1; then
+    node -e 'process.stdout.write(String(Date.now()))'
+    return 0
+  fi
+  if command -v python3 >/dev/null 2>&1; then
+    python3 -c 'import time; print(int(time.time() * 1000))'
+    return 0
+  fi
+  echo "$(($(date +%s) * 1000))"
 }
 
 GATE_START_MS="$(now_ms)"
