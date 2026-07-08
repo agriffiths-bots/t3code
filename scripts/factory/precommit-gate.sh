@@ -105,6 +105,7 @@ fi
 # Bootstrap fallback to the worktree copy only while the gate isn't in HEAD
 # yet (first installation commit). ----
 FACTORY_STATIC_CHECKS=()
+FACTORY_STATIC_CHECKS_PARALLEL=0
 FACTORY_REVIEW_ARGS=()
 FACTORY_AUTOREVIEW_BIN="$HOME/.claude/skills/autoreview/scripts/autoreview"
 FACTORY_UPSTREAM_REF="upstream/main"
@@ -135,12 +136,72 @@ fi
 
 command -v jq >/dev/null || { echo "factory-gate: jq is required" >&2; exit 2; }
 
+now_ms() {
+  local ns
+  ns="$(date +%s%N 2>/dev/null || true)"
+  if [[ "$ns" =~ ^[0-9]+$ ]]; then
+    echo "$((ns / 1000000))"
+    return 0
+  fi
+  if command -v node >/dev/null 2>&1; then
+    node -e 'process.stdout.write(String(Date.now()))'
+    return 0
+  fi
+  if command -v python3 >/dev/null 2>&1; then
+    python3 -c 'import time; print(int(time.time() * 1000))'
+    return 0
+  fi
+  echo "$(($(date +%s) * 1000))"
+}
+
+GATE_START_MS="$(now_ms)"
+SCOPE_DONE_MS=""
+STATIC_START_MS=""
+STATIC_END_MS=""
+REVIEW_START_MS=""
+REVIEW_END_MS=""
+STATIC_CHECKS_JSON="[]"
+
+timings_json() {
+  local end_ms scope_end static_start static_end review_start review_end
+  end_ms="${1:-$(now_ms)}"
+  scope_end="${SCOPE_DONE_MS:-$end_ms}"
+  static_start="${STATIC_START_MS:-$scope_end}"
+  static_end="${STATIC_END_MS:-$static_start}"
+  review_start="${REVIEW_START_MS:-$static_end}"
+  review_end="${REVIEW_END_MS:-$review_start}"
+  jq -cn \
+    --argjson total_ms "$((end_ms - GATE_START_MS))" \
+    --argjson scope_ms "$((scope_end - GATE_START_MS))" \
+    --argjson static_ms "$((static_end - static_start))" \
+    --argjson review_ms "$((review_end - review_start))" \
+    --argjson checks "$STATIC_CHECKS_JSON" \
+    '{
+      total_secs: ($total_ms / 1000),
+      scope_secs: ($scope_ms / 1000),
+      static_secs: ($static_ms / 1000),
+      review_secs: ($review_ms / 1000),
+      static_checks: $checks
+    }'
+}
+
 audit() { # audit <verdict> <detail-json-object> — the gate's guarantees are
   # audit-backed, so an unwritable audit log FAILS the gate (never fail-open).
+  local end_ms timings detail
+  end_ms="$(now_ms)"
+  timings="$(timings_json "$end_ms")" || {
+    echo "factory-gate: FATAL — cannot build audit timing payload; refusing" >&2
+    exit 2
+  }
+  detail="$(jq -cn --argjson detail "$2" --argjson timings "$timings" \
+    '$detail + {timings:$timings}')" || {
+      echo "factory-gate: FATAL — cannot build audit detail payload; refusing" >&2
+      exit 2
+    }
   mkdir -p "$(dirname "$FACTORY_AUDIT_LOG")" 2>/dev/null
   jq -cn --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg repo "$REPO_ROOT" \
     --arg branch "$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo '?')" \
-    --arg mode "$MODE" --arg verdict "$1" --argjson detail "$2" \
+    --arg mode "$MODE" --arg verdict "$1" --argjson detail "$detail" \
     '{ts:$ts,kind:"factory_precommit",repo:$repo,branch:$branch,mode:$mode,verdict:$verdict}+$detail' \
     >> "$FACTORY_AUDIT_LOG" || {
       echo "factory-gate: FATAL — cannot append to audit log $FACTORY_AUDIT_LOG; refusing" >&2
@@ -270,6 +331,99 @@ done
 HEAD_SHA="$(head_sha)"
 TREE_SHA="$(git write-tree)" || refuse "git write-tree failed (unmerged index?)" scope-write-tree '{}'
 GATE_ID="$HEAD_SHA $TREE_SHA"
+SCOPE_DONE_MS="$(now_ms)"
+
+append_static_check_result() { # append_static_check_result <cmd> <rc> <elapsed-ms>
+  STATIC_CHECKS_JSON="$(jq -c --arg cmd "$1" --argjson rc "$2" --argjson elapsed_ms "$3" \
+    '. + [{cmd:$cmd, rc:$rc, secs:($elapsed_ms / 1000)}]' <<<"$STATIC_CHECKS_JSON")"
+}
+
+run_static_checks_sequential() {
+  local cmd check_start check_end check_rc
+  for cmd in "${FACTORY_STATIC_CHECKS[@]}"; do
+    echo "factory-gate: static check: $cmd" >&2
+    check_start="$(now_ms)"
+    if bash -c "$cmd" 1>&2; then
+      check_rc=0
+    else
+      check_rc=$?
+    fi
+    check_end="$(now_ms)"
+    append_static_check_result "$cmd" "$check_rc" "$((check_end - check_start))"
+    if [ "$check_rc" -ne 0 ]; then
+      STATIC_END_MS="$(now_ms)"
+      refuse "static check failed: $cmd
+  Fix the errors (for formatting, run the repo formatter's --fix mode), then
+  re-stage with git add -A and retry." static-failed \
+      "$(jq -cn --arg c "$cmd" '{failed_check:$c}')"
+    fi
+  done
+}
+
+run_static_check_capture() { # run_static_check_capture <cmd> <log> <meta>
+  local cmd log meta check_start check_end check_rc
+  cmd="$1"
+  log="$2"
+  meta="$3"
+  check_start="$(now_ms)"
+  if bash -c "$cmd" >"$log" 2>&1; then
+    check_rc=0
+  else
+    check_rc=$?
+  fi
+  check_end="$(now_ms)"
+  jq -cn --arg cmd "$cmd" --argjson rc "$check_rc" --argjson elapsed_ms "$((check_end - check_start))" \
+    '{cmd:$cmd, rc:$rc, secs:($elapsed_ms / 1000)}' > "$meta"
+  exit "$check_rc"
+}
+
+run_static_checks_parallel() {
+  local run_dir failed_cmd failed_rc i cmd log meta rc
+  local -a pids
+  run_dir="$STATE_DIR/static-checks.$$"
+  rm -rf "$run_dir"
+  mkdir -p "$run_dir"
+  echo "factory-gate: static checks: running ${#FACTORY_STATIC_CHECKS[@]} checks in parallel" >&2
+  for i in "${!FACTORY_STATIC_CHECKS[@]}"; do
+    cmd="${FACTORY_STATIC_CHECKS[$i]}"
+    echo "factory-gate: static check: $cmd" >&2
+    run_static_check_capture "$cmd" "$run_dir/$i.log" "$run_dir/$i.json" &
+    pids[$i]=$!
+  done
+
+  failed_cmd=""
+  failed_rc=0
+  for i in "${!pids[@]}"; do
+    wait "${pids[$i]}"
+    rc=$?
+    if [ "$rc" -ne 0 ] && [ -z "$failed_cmd" ]; then
+      failed_cmd="${FACTORY_STATIC_CHECKS[$i]}"
+      failed_rc="$rc"
+    fi
+  done
+
+  for i in "${!FACTORY_STATIC_CHECKS[@]}"; do
+    log="$run_dir/$i.log"
+    meta="$run_dir/$i.json"
+    [ ! -s "$log" ] || cat "$log" >&2
+    if [ -s "$meta" ]; then
+      STATIC_CHECKS_JSON="$(jq -cs '.[0] + [.[1]]' <(printf '%s\n' "$STATIC_CHECKS_JSON") "$meta")"
+    else
+      append_static_check_result "${FACTORY_STATIC_CHECKS[$i]}" 127 0
+      [ -n "$failed_cmd" ] || failed_cmd="${FACTORY_STATIC_CHECKS[$i]}"
+      [ "$failed_rc" -ne 0 ] || failed_rc=127
+    fi
+  done
+  rm -rf "$run_dir"
+
+  if [ -n "$failed_cmd" ]; then
+    STATIC_END_MS="$(now_ms)"
+    refuse "static check failed: $failed_cmd
+  Fix the errors (for formatting, run the repo formatter's --fix mode), then
+  re-stage with git add -A and retry." static-failed \
+      "$(jq -cn --arg c "$failed_cmd" --argjson rc "$failed_rc" '{failed_check:$c,rc:$rc}')"
+  fi
+}
 
 # ---- cached pass ----
 if [ -f "$MARKER" ] && [ "$(cat "$MARKER")" = "$GATE_ID" ]; then
@@ -288,22 +442,22 @@ if [ -f "$REVIEW_FOR" ] && [ "$(cat "$REVIEW_FOR" 2>/dev/null)" = "$GATE_ID" ] \
   echo "factory-gate: reusing the review result for this exact staged tree (static checks already passed for it)" >&2
 else
   # ---- static checks ----
-  for cmd in "${FACTORY_STATIC_CHECKS[@]}"; do
-    echo "factory-gate: static check: $cmd" >&2
-    if ! bash -c "$cmd" 1>&2; then
-      refuse "static check failed: $cmd
-  Fix the errors (for formatting, run the repo formatter's --fix mode), then
-  re-stage with git add -A and retry." static-failed \
-      "$(jq -cn --arg c "$cmd" '{failed_check:$c}')"
-    fi
-  done
+  STATIC_START_MS="$(now_ms)"
+  if [ "${FACTORY_STATIC_CHECKS_PARALLEL:-0}" = "1" ] && [ "${#FACTORY_STATIC_CHECKS[@]}" -gt 1 ]; then
+    run_static_checks_parallel
+  else
+    run_static_checks_sequential
+  fi
+  STATIC_END_MS="$(now_ms)"
 
   # ---- autoreview over exactly the staged diff ----
   [ -x "$FACTORY_AUTOREVIEW_BIN" ] || refuse "autoreview helper not found at $FACTORY_AUTOREVIEW_BIN" review-infra '{}'
   echo "factory-gate: autoreview (this can take several minutes; pre-warm next time with scripts/factory/precommit-gate.sh --prepare)" >&2
   rm -f "$REVIEW_JSON" "$REVIEW_FOR"
+  REVIEW_START_MS="$(now_ms)"
   "$FACTORY_AUTOREVIEW_BIN" --mode local "${FACTORY_REVIEW_ARGS[@]}" --json-output "$REVIEW_JSON" 1>&2
   review_rc=$?
+  REVIEW_END_MS="$(now_ms)"
 
   if [ "$review_rc" -eq 0 ]; then
     # Never cache a PASS on exit code alone: require a parseable report whose
