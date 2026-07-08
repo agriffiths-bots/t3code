@@ -3,6 +3,7 @@ import { expect, it } from "@effect/vitest";
 import { EnvironmentId, ProviderInstanceId, ThreadId } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
+import * as Schema from "effect/Schema";
 import { HttpServer } from "effect/unstable/http";
 
 import * as ServerEnvironment from "../environment/ServerEnvironment.ts";
@@ -22,6 +23,27 @@ const fakeEnvironment = ServerEnvironment.ServerEnvironment.of({
   getEnvironmentId: Effect.succeed(environmentId),
   getDescriptor: Effect.die("unused"),
 });
+const PersistedPeerTokenStoreFixture = Schema.Struct({
+  version: Schema.Literal(1),
+  records: Schema.Array(
+    Schema.Struct({
+      tokenHash: Schema.String,
+      peerTokenId: Schema.String,
+      environmentId: Schema.String,
+      capabilities: Schema.Array(Schema.String),
+      allowedParentThreadIds: Schema.optionalKey(Schema.Array(Schema.String)),
+      allowedChildThreadIds: Schema.optionalKey(Schema.Array(Schema.String)),
+      issuedAt: Schema.Number,
+      lastUsedAt: Schema.Number,
+    }),
+  ),
+});
+const decodePeerTokenStoreFixture = Schema.decodeEffect(
+  Schema.fromJsonString(PersistedPeerTokenStoreFixture),
+);
+const encodePeerTokenStoreFixture = Schema.encodeEffect(
+  Schema.fromJsonString(PersistedPeerTokenStoreFixture),
+);
 
 const makeRegistry = (
   now: () => number,
@@ -305,6 +327,50 @@ it.effect("resolves peer tokens after registry reload without persisting raw bea
     expect(resolved.capabilities.has("subagent:spawn")).toBe(true);
     expect(persisted).toContain(issued.peerTokenId);
     expect(persisted).not.toContain(issued.token);
+  }).pipe(Effect.provide(NodeServices.layer)),
+);
+
+it.effect("starts with no peer tokens when the persisted token store is corrupt", () =>
+  Effect.gen(function* () {
+    const fs = yield* FileSystem.FileSystem;
+    const baseDir = yield* fs.makeTempDirectoryScoped({ prefix: "t3-mcp-peer-corrupt-" });
+    const peerTokenStorePath = `${baseDir}/mcp-peer-tokens.json`;
+    yield* fs.writeFileString(peerTokenStorePath, "{not-json");
+
+    const registry = yield* makeRegistry(() => 1_000, fakeHttpServer, {
+      peerTokenStorePath,
+    });
+    const issued = yield* registry.issuePeerToken();
+
+    expect((yield* registry.resolve(issued.token))?.credentialKind).toBe("peer");
+  }).pipe(Effect.provide(NodeServices.layer)),
+);
+
+it.effect("rejects persisted peer tokens from a previous server environment", () =>
+  Effect.gen(function* () {
+    const fs = yield* FileSystem.FileSystem;
+    const baseDir = yield* fs.makeTempDirectoryScoped({ prefix: "t3-mcp-peer-env-" });
+    const peerTokenStorePath = `${baseDir}/mcp-peer-tokens.json`;
+    const firstRegistry = yield* makeRegistry(() => 1_000, fakeHttpServer, {
+      peerTokenStorePath,
+    });
+    const issued = yield* firstRegistry.issuePeerToken();
+    const persisted = yield* fs.readFileString(peerTokenStorePath);
+    const parsed = yield* decodePeerTokenStoreFixture(persisted);
+    const rewritten = {
+      ...parsed,
+      records: parsed.records.map((record) => ({
+        ...record,
+        environmentId: EnvironmentId.make("environment-previous"),
+      })),
+    };
+    yield* fs.writeFileString(peerTokenStorePath, yield* encodePeerTokenStoreFixture(rewritten));
+
+    const secondRegistry = yield* makeRegistry(() => 2_000, fakeHttpServer, {
+      peerTokenStorePath,
+    });
+
+    expect(yield* secondRegistry.resolve(issued.token)).toBeUndefined();
   }).pipe(Effect.provide(NodeServices.layer)),
 );
 

@@ -202,31 +202,36 @@ const makeWithOptions = Effect.fn("McpSessionRegistry.make")(function* (
       return new Map<string, CredentialRecord>();
     }
     const persisted = yield* decodePersistedPeerTokens(raw.value).pipe(
-      Effect.mapError((cause) => peerTokenStoreError("decode", cause)),
+      Effect.matchEffect({
+        onFailure: () => Effect.succeed({ version: 1, records: [] } satisfies PersistedPeerTokens),
+        onSuccess: (decoded) => Effect.succeed(decoded),
+      }),
     );
     return new Map<string, CredentialRecord>(
-      persisted.records.map((record) => [
-        record.tokenHash,
-        {
-          credentialKind: "peer" as const,
-          tokenHash: record.tokenHash,
-          scope: {
+      persisted.records
+        .filter((record) => record.environmentId === environmentId)
+        .map((record) => [
+          record.tokenHash,
+          {
             credentialKind: "peer" as const,
-            environmentId: record.environmentId,
-            peerTokenId: record.peerTokenId,
-            capabilities: new Set(record.capabilities),
-            ...(record.allowedParentThreadIds
-              ? { allowedParentThreadIds: new Set(record.allowedParentThreadIds) }
-              : {}),
-            ...(record.allowedChildThreadIds
-              ? { allowedChildThreadIds: new Set(record.allowedChildThreadIds) }
-              : {}),
-            issuedAt: record.issuedAt,
-            expiresAt: null,
+            tokenHash: record.tokenHash,
+            scope: {
+              credentialKind: "peer" as const,
+              environmentId: record.environmentId,
+              peerTokenId: record.peerTokenId,
+              capabilities: new Set(record.capabilities),
+              ...(record.allowedParentThreadIds
+                ? { allowedParentThreadIds: new Set(record.allowedParentThreadIds) }
+                : {}),
+              ...(record.allowedChildThreadIds
+                ? { allowedChildThreadIds: new Set(record.allowedChildThreadIds) }
+                : {}),
+              issuedAt: record.issuedAt,
+              expiresAt: null,
+            },
+            lastUsedAt: record.lastUsedAt,
           },
-          lastUsedAt: record.lastUsedAt,
-        },
-      ]),
+        ]),
     );
   });
 
