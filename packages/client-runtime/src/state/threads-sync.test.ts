@@ -1505,6 +1505,11 @@ describe("EnvironmentThreads", () => {
           thread: {
             ...runningThread,
             updatedAt: runningThread.updatedAt,
+            latestTurn: {
+              ...placeholderTurn,
+              state: "completed",
+              completedAt: "2026-07-07T21:00:04.000Z",
+            },
             turns: [
               {
                 ...placeholderTurn,
@@ -1522,12 +1527,13 @@ describe("EnvironmentThreads", () => {
         (value) =>
           value.status === "live" &&
           Option.isSome(value.data) &&
+          value.data.value.latestTurn?.state === "completed" &&
           value.data.value.turns.at(0)?.state === "completed",
       );
 
-      expect(Option.getOrThrow(recovered.data).turns.at(0)?.completedAt).toBe(
-        "2026-07-07T21:00:04.000Z",
-      );
+      const thread = Option.getOrThrow(recovered.data);
+      expect(thread.latestTurn?.completedAt).toBe("2026-07-07T21:00:04.000Z");
+      expect(thread.turns.at(0)?.completedAt).toBe("2026-07-07T21:00:04.000Z");
     }),
   );
 

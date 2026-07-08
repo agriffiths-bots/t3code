@@ -150,26 +150,36 @@ function mergeNonAdvancingSnapshotThread(
       .map((message) => String(message.id)),
   );
 
+  const messages = mergeKeyedCollection(
+    current.messages,
+    snapshot.messages.filter((message) => !message.streaming),
+    (message) => message.id,
+    mergeMessage,
+    (left, right) =>
+      compareString(left.createdAt, right.createdAt) || compareString(left.id, right.id),
+  );
+  const turns = mergeKeyedCollection(
+    current.turns,
+    snapshot.turns,
+    (turn) => turn.turnId,
+    (currentTurn, snapshotTurn) =>
+      mergeTurnBoundary(currentTurn, snapshotTurn, availableAssistantMessageIds),
+    (left, right) =>
+      compareString(left.requestedAt, right.requestedAt) ||
+      compareString(left.turnId, right.turnId),
+  );
+  const latestTurn =
+    current.latestTurn !== null &&
+    snapshot.latestTurn !== null &&
+    current.latestTurn.turnId === snapshot.latestTurn.turnId
+      ? mergeTurnBoundary(current.latestTurn, snapshot.latestTurn, availableAssistantMessageIds)
+      : current.latestTurn;
+
   return {
     ...current,
-    messages: mergeKeyedCollection(
-      current.messages,
-      snapshot.messages.filter((message) => !message.streaming),
-      (message) => message.id,
-      mergeMessage,
-      (left, right) =>
-        compareString(left.createdAt, right.createdAt) || compareString(left.id, right.id),
-    ),
-    turns: mergeKeyedCollection(
-      current.turns,
-      snapshot.turns,
-      (turn) => turn.turnId,
-      (currentTurn, snapshotTurn) =>
-        mergeTurnBoundary(currentTurn, snapshotTurn, availableAssistantMessageIds),
-      (left, right) =>
-        compareString(left.requestedAt, right.requestedAt) ||
-        compareString(left.turnId, right.turnId),
-    ),
+    messages,
+    latestTurn,
+    turns,
   };
 }
 
