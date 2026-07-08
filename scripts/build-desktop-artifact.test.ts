@@ -13,6 +13,7 @@ import {
   createStageWorkspaceConfig,
   createStagePatchedDependencies,
   createBuildConfig,
+  createElectronBuilderEnv,
   createDesktopPackageBuildEnv,
   DESKTOP_AFTER_PACK_HOOK_STAGE_PATH,
   DESKTOP_ASAR_UNPACK_BASE,
@@ -33,6 +34,7 @@ import {
   resolveMacPasskeySigningConfiguration,
   resolveDesktopRuntimeDependencies,
   resolveStagedRuntimeDependencies,
+  resolveFfiRsNativeDependencies,
   resolveFffNativeDependencies,
   resolveClaudeAgentNativeDependencies,
   resolveBuildOptions,
@@ -357,6 +359,16 @@ it.layer(NodeServices.layer)("build-desktop-artifact", (it) => {
     );
   });
 
+  it("keeps electron-builder dependency collection on pnpm for staged apps", () => {
+    const env = createElectronBuilderEnv({
+      npm_config_user_agent: "npm/11.0.0 node/v24.0.0 win32 x64 workspaces/false",
+      npm_execpath: "C:\\Program Files\\nodejs\\node_modules\\npm\\bin\\npm-cli.js",
+    });
+
+    assert.match(env.npm_config_user_agent ?? "", /^pnpm\/11\.10\.0$/u);
+    assert.equal(env.npm_execpath, "pnpm");
+  });
+
   it("stages pnpm 11 allowBuilds and patchedDependencies in the workspace yaml", () => {
     assert.deepStrictEqual(
       createStageWorkspaceConfig({
@@ -655,6 +667,19 @@ it.layer(NodeServices.layer)("build-desktop-artifact", (it) => {
     });
     assert.deepStrictEqual(resolveFffNativeDependencies("linux", "arm64", "0.9.4"), {
       "@ff-labs/fff-bin-linux-arm64-gnu": "0.9.4",
+    });
+  });
+
+  it("promotes target ffi-rs native sidecars to direct staged dependencies", () => {
+    assert.deepStrictEqual(resolveFfiRsNativeDependencies("mac", "universal", "1.3.2"), {
+      "@yuuang/ffi-rs-darwin-arm64": "1.3.2",
+      "@yuuang/ffi-rs-darwin-x64": "1.3.2",
+    });
+    assert.deepStrictEqual(resolveFfiRsNativeDependencies("win", "x64", "1.3.2"), {
+      "@yuuang/ffi-rs-win32-x64-msvc": "1.3.2",
+    });
+    assert.deepStrictEqual(resolveFfiRsNativeDependencies("linux", "x64", "1.3.2"), {
+      "@yuuang/ffi-rs-linux-x64-gnu": "1.3.2",
     });
   });
 

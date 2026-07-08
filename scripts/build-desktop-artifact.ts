@@ -590,6 +590,7 @@ export const DESKTOP_PACKAGE_BUILD_ENV = {
   T3CODE_DESKTOP_PACKAGE: "1",
   T3CODE_WEB_SOURCEMAP: "0",
 } as const;
+const FFI_RS_VERSION = "1.3.2";
 export const DESKTOP_AFTER_PACK_HOOK_STAGE_PATH = "desktop-after-pack-prune.mjs";
 export const DESKTOP_ASAR_UNPACK_BASE = ["apps/server/dist/**"] as const;
 export const DESKTOP_UNPACKED_FILE_LIMIT = 250;
@@ -647,6 +648,19 @@ export function createDesktopPackageBuildEnv(
     ...env,
     ...DESKTOP_PACKAGE_BUILD_ENV,
   };
+}
+
+export function createElectronBuilderEnv(env: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+  const nextEnv: NodeJS.ProcessEnv = { ...env };
+  if (rootPackageJson.packageManager.startsWith("pnpm@")) {
+    const pnpmVersion = rootPackageJson.packageManager.slice("pnpm@".length);
+    // On Windows, electron-builder's pnpm workspace probe can return a Git-Bash
+    // /c/... path that its Node-side file detection cannot read, so it falls
+    // back to npm_config_user_agent. Keep that fallback on pnpm for the staged app.
+    nextEnv.npm_config_user_agent = `pnpm/${pnpmVersion}`;
+    nextEnv.npm_execpath = "pnpm";
+  }
+  return nextEnv;
 }
 
 export interface MacPasskeySigningConfiguration {
@@ -887,6 +901,30 @@ export function resolveFffNativeDependencies(
 
   return Object.fromEntries(
     architectures.map((architecture) => [`@ff-labs/fff-bin-linux-${architecture}-gnu`, version]),
+  );
+}
+
+export function resolveFfiRsNativeDependencies(
+  platform: typeof BuildPlatform.Type,
+  arch: typeof BuildArch.Type,
+  version: string,
+): Record<string, string> {
+  const architectures = arch === "universal" ? (["arm64", "x64"] as const) : [arch];
+
+  if (platform === "mac") {
+    return Object.fromEntries(
+      architectures.map((architecture) => [`@yuuang/ffi-rs-darwin-${architecture}`, version]),
+    );
+  }
+
+  if (platform === "win") {
+    return Object.fromEntries(
+      architectures.map((architecture) => [`@yuuang/ffi-rs-win32-${architecture}-msvc`, version]),
+    );
+  }
+
+  return Object.fromEntries(
+    architectures.map((architecture) => [`@yuuang/ffi-rs-linux-${architecture}-gnu`, version]),
   );
 }
 
@@ -1900,10 +1938,11 @@ const buildDesktopArtifact = Effect.fn("buildDesktopArtifact")(function* (
       options.arch,
       serverPackageJson.dependencies["@ff-labs/fff-node"],
     ),
+    ...resolveFfiRsNativeDependencies(options.platform, options.arch, FFI_RS_VERSION),
     // Windows artifacts also bundle the same-architecture WSL Linux backend, which loads the
     // fff native binary through ffi-rs. The platform fff binary above is the
-    // host's (win32), so promote the matching Linux fff binaries too; without
-    // them file-finding in WSL fails to load its Linux native package.
+    // host's (win32), so promote the matching Linux fff/ffi-rs binaries too; without
+    // them file-finding in WSL fails to load its Linux native packages.
     ...(options.platform === "win"
       ? {
           ...resolveClaudeAgentNativeDependencies(
@@ -1916,6 +1955,7 @@ const buildDesktopArtifact = Effect.fn("buildDesktopArtifact")(function* (
             options.arch,
             serverPackageJson.dependencies["@ff-labs/fff-node"],
           ),
+          ...resolveFfiRsNativeDependencies("linux", options.arch, FFI_RS_VERSION),
         }
       : {}),
   };
@@ -1997,9 +2037,7 @@ const buildDesktopArtifact = Effect.fn("buildDesktopArtifact")(function* (
   // electron-builder treats several set-but-empty variables (e.g. CSC_LINK="")
   // as enabled, so copy the host env and scrub empty values instead of relying
   // on `extendEnv` merging.
-  const buildEnv: NodeJS.ProcessEnv = {
-    ...process.env,
-  };
+  const buildEnv = createElectronBuilderEnv();
   for (const [key, value] of Object.entries(buildEnv)) {
     if (value === "") {
       delete buildEnv[key];
