@@ -1473,6 +1473,64 @@ describe("EnvironmentThreads", () => {
     }),
   );
 
+  it.effect("uses snapshot completion time when settling placeholder running turns", () =>
+    Effect.gen(function* () {
+      const runningThread = makeRunningThread();
+      const runningTurn = runningThread.latestTurn;
+      if (runningTurn === null) {
+        throw new Error("test fixture must have a running latestTurn");
+      }
+      const placeholderTurn = {
+        ...runningTurn,
+        completedAt: "2026-07-07T21:00:02.000Z",
+      };
+      const harness = yield* makeHarness({
+        cached: {
+          ...runningThread,
+          turns: [placeholderTurn],
+        },
+      });
+      yield* awaitThreadState(
+        harness.observed,
+        (value) =>
+          value.status === "live" &&
+          Option.isSome(value.data) &&
+          value.data.value.turns.at(0)?.completedAt === placeholderTurn.completedAt,
+      );
+
+      yield* Ref.set(
+        harness.httpSnapshot,
+        Option.some({
+          snapshotSequence: CACHED_SNAPSHOT_SEQUENCE,
+          thread: {
+            ...runningThread,
+            updatedAt: runningThread.updatedAt,
+            turns: [
+              {
+                ...placeholderTurn,
+                state: "completed",
+                completedAt: "2026-07-07T21:00:04.000Z",
+              },
+            ],
+          },
+        }),
+      );
+
+      yield* advanceActiveReconcileInterval;
+      const recovered = yield* awaitThreadState(
+        harness.observed,
+        (value) =>
+          value.status === "live" &&
+          Option.isSome(value.data) &&
+          value.data.value.turns.at(0)?.state === "completed",
+      );
+
+      expect(Option.getOrThrow(recovered.data).turns.at(0)?.completedAt).toBe(
+        "2026-07-07T21:00:04.000Z",
+      );
+    }),
+  );
+
   it.effect("does not poll parked waiting sessions without an active turn", () =>
     Effect.gen(function* () {
       const parkedWaitingThread: OrchestrationThread = {

@@ -1186,6 +1186,164 @@ describe("applyThreadDetailEvent", () => {
         expect(result.thread.latestTurn?.assistantMessageId).toBe("assistant:session-1:segment:0");
       }
     });
+
+    it("does not let a delayed older checkpoint move a same-turn boundary backward", () => {
+      const laterAssistantMessageId = MessageId.make("assistant-later");
+      const threadWithLaterBoundary: OrchestrationThread = {
+        ...baseThread,
+        latestTurn: {
+          turnId: TurnId.make("turn-1"),
+          state: "running",
+          requestedAt: "2026-04-01T12:00:00.000Z",
+          startedAt: "2026-04-01T12:00:00.000Z",
+          completedAt: null,
+          assistantMessageId: laterAssistantMessageId,
+        },
+        turns: [
+          {
+            turnId: TurnId.make("turn-1"),
+            state: "running",
+            requestedAt: "2026-04-01T12:00:00.000Z",
+            startedAt: "2026-04-01T12:00:00.000Z",
+            completedAt: null,
+            assistantMessageId: laterAssistantMessageId,
+          },
+        ],
+        messages: [
+          {
+            id: MessageId.make("assistant-older"),
+            role: "assistant",
+            text: "I will inspect first.",
+            turnId: TurnId.make("turn-1"),
+            streaming: false,
+            createdAt: "2026-04-01T12:00:01.000Z",
+            updatedAt: "2026-04-01T12:00:01.000Z",
+          },
+          {
+            id: laterAssistantMessageId,
+            role: "assistant",
+            text: "Final response.",
+            turnId: TurnId.make("turn-1"),
+            streaming: false,
+            createdAt: "2026-04-01T12:00:05.000Z",
+            updatedAt: "2026-04-01T12:00:05.000Z",
+          },
+        ],
+      };
+
+      const result = applyThreadDetailEvent(threadWithLaterBoundary, {
+        ...baseEventFields,
+        sequence: 16,
+        occurredAt: "2026-04-01T12:06:00.000Z",
+        aggregateKind: "thread",
+        aggregateId: ThreadId.make("thread-1"),
+        type: "thread.turn-diff-completed",
+        payload: {
+          threadId: ThreadId.make("thread-1"),
+          turnId: TurnId.make("turn-1"),
+          checkpointTurnCount: 1,
+          checkpointRef: CheckpointRef.make("ref-1-delayed"),
+          status: "ready",
+          files: [],
+          assistantMessageId: MessageId.make("assistant-pruned-older"),
+          completedAt: "2026-04-01T12:06:00.000Z",
+        },
+      });
+
+      expect(result.kind).toBe("updated");
+      if (result.kind === "updated") {
+        expect(result.thread.latestTurn?.state).toBe("completed");
+        expect(result.thread.latestTurn?.completedAt).toBe("2026-04-01T12:06:00.000Z");
+        expect(result.thread.latestTurn?.assistantMessageId).toBe(laterAssistantMessageId);
+        expect(result.thread.turns[0]?.state).toBe("completed");
+        expect(result.thread.turns[0]?.completedAt).toBe("2026-04-01T12:06:00.000Z");
+        expect(result.thread.turns[0]?.assistantMessageId).toBe(laterAssistantMessageId);
+        expect(result.thread.checkpoints[0]?.assistantMessageId).toBe("assistant-pruned-older");
+      }
+    });
+
+    it("uses checkpoint boundaries when a cached snapshot has no turns", () => {
+      const laterAssistantMessageId = MessageId.make("assistant-later");
+      const threadWithCheckpointBoundary: OrchestrationThread = {
+        ...baseThread,
+        latestTurn: {
+          turnId: TurnId.make("turn-2"),
+          state: "completed",
+          requestedAt: "2026-04-01T12:10:00.000Z",
+          startedAt: "2026-04-01T12:10:00.000Z",
+          completedAt: "2026-04-01T12:11:00.000Z",
+          assistantMessageId: MessageId.make("assistant-turn-2"),
+        },
+        turns: [],
+        checkpoints: [
+          {
+            turnId: TurnId.make("turn-1"),
+            checkpointTurnCount: 1,
+            checkpointRef: CheckpointRef.make("ref-1"),
+            status: "ready",
+            files: [],
+            assistantMessageId: laterAssistantMessageId,
+            completedAt: "2026-04-01T12:06:00.000Z",
+          },
+          {
+            turnId: TurnId.make("turn-2"),
+            checkpointTurnCount: 2,
+            checkpointRef: CheckpointRef.make("ref-2"),
+            status: "ready",
+            files: [],
+            assistantMessageId: MessageId.make("assistant-turn-2"),
+            completedAt: "2026-04-01T12:11:00.000Z",
+          },
+        ],
+        messages: [
+          {
+            id: MessageId.make("assistant-older"),
+            role: "assistant",
+            text: "I will inspect first.",
+            turnId: TurnId.make("turn-1"),
+            streaming: false,
+            createdAt: "2026-04-01T12:00:01.000Z",
+            updatedAt: "2026-04-01T12:00:01.000Z",
+          },
+          {
+            id: laterAssistantMessageId,
+            role: "assistant",
+            text: "Final response.",
+            turnId: TurnId.make("turn-1"),
+            streaming: false,
+            createdAt: "2026-04-01T12:00:05.000Z",
+            updatedAt: "2026-04-01T12:00:05.000Z",
+          },
+        ],
+      };
+
+      const result = applyThreadDetailEvent(threadWithCheckpointBoundary, {
+        ...baseEventFields,
+        sequence: 17,
+        occurredAt: "2026-04-01T12:06:30.000Z",
+        aggregateKind: "thread",
+        aggregateId: ThreadId.make("thread-1"),
+        type: "thread.turn-diff-completed",
+        payload: {
+          threadId: ThreadId.make("thread-1"),
+          turnId: TurnId.make("turn-1"),
+          checkpointTurnCount: 1,
+          checkpointRef: CheckpointRef.make("ref-1-delayed"),
+          status: "ready",
+          files: [],
+          assistantMessageId: MessageId.make("assistant-pruned-older"),
+          completedAt: "2026-04-01T12:06:30.000Z",
+        },
+      });
+
+      expect(result.kind).toBe("updated");
+      if (result.kind === "updated") {
+        expect(result.thread.latestTurn?.turnId).toBe("turn-2");
+        expect(result.thread.latestTurn?.assistantMessageId).toBe("assistant-turn-2");
+        expect(result.thread.turns[0]?.turnId).toBe("turn-1");
+        expect(result.thread.turns[0]?.assistantMessageId).toBe(laterAssistantMessageId);
+      }
+    });
   });
 
   describe("thread.reverted", () => {

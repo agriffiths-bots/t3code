@@ -335,10 +335,14 @@ function deriveEffectiveFinalAssistantBoundariesByTurnId(
 
   const effectiveBoundariesByTurnId = new Map<string, ReadonlySet<string>>(boundariesByTurnId);
   for (const [turnId, boundary] of boundariesByTurnId) {
+    const entries = entriesByTurnId.get(turnId) ?? [];
     if (boundary.size === 0) {
+      const fallbackAssistantMessageId = findTerminalAssistantAfterLastWork(entries);
+      if (fallbackAssistantMessageId !== null) {
+        effectiveBoundariesByTurnId.set(turnId, new Set([fallbackAssistantMessageId]));
+      }
       continue;
     }
-    const entries = entriesByTurnId.get(turnId) ?? [];
     const matchingAssistantEntry = entries.some(
       (entry) =>
         entry.kind === "message" &&
@@ -348,16 +352,40 @@ function deriveEffectiveFinalAssistantBoundariesByTurnId(
     if (matchingAssistantEntry) {
       continue;
     }
-    for (let index = entries.length - 1; index >= 0; index -= 1) {
-      const entry = entries[index];
-      if (entry?.kind === "message" && entry.message.role === "assistant") {
-        effectiveBoundariesByTurnId.set(turnId, new Set([String(entry.message.id)]));
-        break;
-      }
+    const fallbackAssistantMessageId = findLastAssistantMessageId(entries);
+    if (fallbackAssistantMessageId !== null) {
+      effectiveBoundariesByTurnId.set(turnId, new Set([fallbackAssistantMessageId]));
     }
   }
 
   return effectiveBoundariesByTurnId;
+}
+
+function findLastAssistantMessageId(entries: ReadonlyArray<TimelineEntry>): string | null {
+  for (let index = entries.length - 1; index >= 0; index -= 1) {
+    const entry = entries[index];
+    if (entry?.kind === "message" && entry.message.role === "assistant") {
+      return String(entry.message.id);
+    }
+  }
+  return null;
+}
+
+function findTerminalAssistantAfterLastWork(entries: ReadonlyArray<TimelineEntry>): string | null {
+  let lastWorkIndex = -1;
+  for (let index = entries.length - 1; index >= 0; index -= 1) {
+    if (entries[index]?.kind === "work") {
+      lastWorkIndex = index;
+      break;
+    }
+  }
+  for (let index = entries.length - 1; index > lastWorkIndex; index -= 1) {
+    const entry = entries[index];
+    if (entry?.kind === "message" && entry.message.role === "assistant") {
+      return String(entry.message.id);
+    }
+  }
+  return null;
 }
 
 function deriveTerminalNullTurnAssistantMessageIds(

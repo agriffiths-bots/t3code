@@ -127,11 +127,9 @@ function mergeTurnBoundary(
     state: shouldUseSnapshotSettlement ? snapshot.state : current.state,
     requestedAt: current.requestedAt || snapshot.requestedAt,
     startedAt: current.startedAt ?? snapshot.startedAt,
-    completedAt:
-      current.completedAt ??
-      (shouldUseSnapshotSettlement || (!currentSettled && snapshotSettled)
-        ? snapshot.completedAt
-        : null),
+    completedAt: shouldUseSnapshotSettlement
+      ? snapshot.completedAt
+      : (current.completedAt ?? (!currentSettled && snapshotSettled ? snapshot.completedAt : null)),
     assistantMessageId,
     ...(sourceProposedPlan !== undefined ? { sourceProposedPlan } : {}),
   };
