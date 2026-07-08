@@ -4409,6 +4409,56 @@ describe("ChildThreadCoordinator", () => {
     expect(await runtimeHasPending(harness, parent)).toBe(false);
   });
 
+  it("R-A: restart defers restored-child wait-cancellable wake rows before idle drain", async () => {
+    const child = ThreadId.make("promote-wait-cancellable-restart-known-child");
+    const parent = ThreadId.make("promote-wait-cancellable-restart-known-parent");
+    const dispatchId = PendingDispatchId.make("pd-wait-cancellable-restart-known");
+    const harness = await createHarness({
+      threads: [
+        makeThreadState({
+          threadId: child,
+          parentThreadId: parent,
+          latestTurn: makeLatestTurn("completed"),
+          assistantText: "known child wait result survived waiter crash",
+        }),
+        makeThreadState({
+          threadId: parent,
+          latestTurn: makeLatestTurn("completed", TurnId.make("turn-parent")),
+          session: makeSession(parent, "ready"),
+        }),
+      ],
+      seedChildRows: [{ threadId: child, parentThreadId: parent }],
+      seedPendingDispatches: [
+        {
+          id: dispatchId,
+          kind: "parent_injection",
+          targetThreadId: parent,
+          sourceChildId: child,
+          text: "known child wait result survived waiter crash",
+          error: null,
+          status: "completed",
+          commandId: null,
+          deliveredByWait: false,
+          waitCancellable: true,
+          createdAt: now as unknown as PendingDispatch["createdAt"],
+        },
+      ],
+    });
+
+    expect(
+      harness.dispatched.filter((command) => command.type === "thread.turn.start"),
+    ).toHaveLength(0);
+    expect(await harness.listPendingDispatches()).toHaveLength(1);
+    await Effect.runPromise(Effect.sleep("2600 millis"));
+    const turnStarts = harness.dispatched.filter(
+      (command) => command.type === "thread.turn.start" && command.threadId === parent,
+    ) as Array<Extract<OrchestrationCommand, { type: "thread.turn.start" }>>;
+    expect(turnStarts).toHaveLength(1);
+    expect(turnStarts[0]?.message.text).toContain("known child wait result survived waiter crash");
+    expect(await harness.listPendingDispatches()).toHaveLength(0);
+    expect(await runtimeHasPending(harness, parent)).toBe(false);
+  });
+
   it("R-A: restart retries idle-only wait-cancellable drains after a parent shell timeout", async () => {
     const child = ThreadId.make("promote-wait-cancellable-restart-retry-child");
     const parent = ThreadId.make("promote-wait-cancellable-restart-retry-parent");

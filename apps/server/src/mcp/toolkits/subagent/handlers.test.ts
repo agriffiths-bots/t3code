@@ -1821,6 +1821,123 @@ describe("SubagentToolkit", () => {
     ).pipe(Effect.provide(TestLayer)),
   );
 
+  it.effect("R-A: parent-authorized peer waits mark the parent wake delivered", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const server = yield* McpServer.McpServer;
+        assertParentCalls.length = 0;
+        markWaitDeliveredCalls.length = 0;
+        abandonWaitDeliveryCalls.length = 0;
+        waitSliceResult = {
+          results: [
+            {
+              childThreadId,
+              status: "completed",
+              finalAssistantText: "parent-authorized peer result",
+              error: null,
+            },
+          ],
+          settledCount: 1,
+          timedOutCount: 0,
+          pending: false,
+          resumeToken: "coordinator-token",
+        };
+
+        const result = yield* server
+          .callTool({
+            name: "t3_wait_subagent",
+            arguments: {
+              childThreadIds: [childThreadId],
+              resumeToken: "-100000:coordinator-token",
+            },
+          })
+          .pipe(
+            Effect.provideService(
+              McpInvocationContext.McpInvocationContext,
+              entitledPeerInvocation,
+            ),
+            Effect.provideService(McpSchema.McpServerClient, client),
+          );
+
+        expect(result.isError).toBe(false);
+        expect(result.structuredContent).toMatchObject({
+          pending: false,
+          settledCount: 1,
+          results: [{ childThreadId, status: "completed", error: null }],
+        });
+        expect(assertParentCalls).toEqual([{ parentThreadId, childThreadId }]);
+        expect(markWaitDeliveredCalls).toEqual([[waitSliceResult.results[0]!]]);
+        expect(abandonWaitDeliveryCalls).toEqual([]);
+      }),
+    ).pipe(Effect.provide(TestLayer)),
+  );
+
+  it.effect("R-A: mixed-authority peer waits mark only parent-authorized rows", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const server = yield* McpServer.McpServer;
+        const otherChildThreadId = ThreadId.make("thread-subagent-other-parent-child");
+        const mixedPeerInvocation: McpInvocationContext.PeerMcpInvocationScope = {
+          ...peerInvocation,
+          peerTokenId: "peer-subagent-mixed-authority-test",
+          allowedParentThreadIds: new Set([parentThreadId]),
+          allowedChildThreadIds: new Set([childThreadId, otherChildThreadId]),
+        };
+        assertParentCalls.length = 0;
+        markWaitDeliveredCalls.length = 0;
+        abandonWaitDeliveryCalls.length = 0;
+        assertParentFailureChild = otherChildThreadId;
+        waitSliceResult = {
+          results: [
+            {
+              childThreadId,
+              status: "completed",
+              finalAssistantText: "authorized parent result",
+              error: null,
+            },
+            {
+              childThreadId: otherChildThreadId,
+              status: "completed",
+              finalAssistantText: "child-only result",
+              error: null,
+            },
+          ],
+          settledCount: 2,
+          timedOutCount: 0,
+          pending: false,
+          resumeToken: "coordinator-token",
+        };
+
+        const result = yield* server
+          .callTool({
+            name: "t3_wait_subagent",
+            arguments: {
+              childThreadIds: [childThreadId, otherChildThreadId],
+              resumeToken: "-100000:coordinator-token",
+            },
+          })
+          .pipe(
+            Effect.provideService(McpInvocationContext.McpInvocationContext, mixedPeerInvocation),
+            Effect.provideService(McpSchema.McpServerClient, client),
+          );
+
+        expect(result.isError).toBe(false);
+        expect(assertParentCalls.map((call) => call.childThreadId).sort()).toEqual(
+          [childThreadId, otherChildThreadId].sort(),
+        );
+        expect(markWaitDeliveredCalls).toEqual([[waitSliceResult.results[0]!]]);
+        expect(abandonWaitDeliveryCalls).toEqual([[otherChildThreadId]]);
+      }),
+    ).pipe(
+      Effect.ensuring(
+        Effect.sync(() => {
+          assertParentFailureChild = null;
+        }),
+      ),
+      Effect.provide(TestLayer),
+    ),
+  );
+
   it.effect("R-A: wait accepts current ready/idle projection-terminal children", () =>
     Effect.scoped(
       Effect.gen(function* () {

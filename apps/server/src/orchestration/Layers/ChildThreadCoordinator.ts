@@ -2203,6 +2203,7 @@ const make = Effect.gen(function* () {
       // against any entry wakeParent already enqueued during reconciliation above.
       const reloadNow = yield* nowMillis;
       const parentsWithRestartDrainRows = new Set<ThreadId>();
+      const parentsWithDeferredRestartDrainRows = new Set<ThreadId>();
       for (const row of persisted) {
         if (row.kind !== "parent_injection") continue;
         const createdAtMs = Date.parse(String(row.createdAt));
@@ -2210,8 +2211,13 @@ const make = Effect.gen(function* () {
         const deliveredByWait =
           row.deliveredByWait ||
           (row.sourceChildId !== null && waitDeliveredChildIds.has(row.sourceChildId));
-        if (deliveredByWait || row.waitCancellable) {
+        const hasRestoredChild =
+          row.sourceChildId !== null && children.has(row.sourceChildId as ThreadId);
+        const restartShouldDrain = deliveredByWait || (row.waitCancellable && !hasRestoredChild);
+        if (restartShouldDrain) {
           parentsWithRestartDrainRows.add(parentThreadId);
+        } else if (row.waitCancellable) {
+          parentsWithDeferredRestartDrainRows.add(parentThreadId);
         }
         const queue = pendingInjections.get(parentThreadId) ?? [];
         if (queue.some((entry) => entry.dispatchId === row.id)) continue;
@@ -2243,6 +2249,17 @@ const make = Effect.gen(function* () {
       yield* Effect.forEach(parentsWithRestartDrainRows, drainPendingWhenParentIdle, {
         discard: true,
       });
+      if (parentsWithDeferredRestartDrainRows.size > 0) {
+        yield* Effect.forkScoped(
+          Effect.sleep("2 seconds").pipe(
+            Effect.andThen(
+              Effect.forEach(parentsWithDeferredRestartDrainRows, drainPendingWhenParentIdle, {
+                discard: true,
+              }),
+            ),
+          ),
+        );
+      }
 
       yield* Effect.forever(
         drainRetriedPending.pipe(

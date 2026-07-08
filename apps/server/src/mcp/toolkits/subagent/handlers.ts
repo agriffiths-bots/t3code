@@ -365,6 +365,34 @@ const requirePeerParentAccess = (
         ),
       );
 
+const markableWaitDeliveredRows = (
+  invocation: McpInvocationContext.McpInvocationScope,
+  coordinator: ChildThreadCoordinatorShape,
+  rows: ReadonlyArray<WaitSliceResult["results"][number]>,
+): Effect.Effect<ReadonlyArray<WaitSliceResult["results"][number]>> => {
+  if (McpInvocationContext.isProviderInvocationScope(invocation)) return Effect.succeed(rows);
+  const allowedParents = [...(invocation.allowedParentThreadIds ?? [])];
+  if (allowedParents.length === 0) return Effect.succeed([]);
+  return Effect.forEach(
+    rows,
+    (row) =>
+      Effect.forEach(
+        allowedParents,
+        (parentThreadId) =>
+          coordinator.assertParent(parentThreadId, row.childThreadId).pipe(
+            Effect.as(true),
+            Effect.orElseSucceed(() => false),
+          ),
+        { concurrency: "unbounded" },
+      ).pipe(Effect.map((matches) => ({ row, markable: matches.some(Boolean) }))),
+    { concurrency: "unbounded" },
+  ).pipe(
+    Effect.map((results) =>
+      results.filter((result) => result.markable).map((result) => result.row),
+    ),
+  );
+};
+
 const loadThreadShell = (runtime: SubagentRuntime, threadId: ThreadId) =>
   runtime.projectionSnapshotQuery
     .getThreadShellById(threadId)
@@ -928,10 +956,20 @@ const waitSubagent = Effect.fn("SubagentToolkit.wait")(function* (input: WaitSub
     );
 
     if (waitDeliveredRows.length > 0) {
-      if (McpInvocationContext.isProviderInvocationScope(invocation)) {
-        yield* coordinator.markWaitDelivered(waitDeliveredRows);
-      } else {
-        yield* coordinator.abandonWaitDelivery(waitDeliveredRows.map((row) => row.childThreadId));
+      const markableRows = yield* markableWaitDeliveredRows(
+        invocation,
+        coordinator,
+        waitDeliveredRows,
+      );
+      if (markableRows.length > 0) {
+        yield* coordinator.markWaitDelivered(markableRows);
+      }
+      const markableChildIds = new Set(markableRows.map((row) => String(row.childThreadId)));
+      const abandonedChildIds = waitDeliveredRows
+        .filter((row) => !markableChildIds.has(String(row.childThreadId)))
+        .map((row) => row.childThreadId);
+      if (abandonedChildIds.length > 0) {
+        yield* coordinator.abandonWaitDelivery(abandonedChildIds);
       }
       terminalWaitChildIds.clear();
     }
