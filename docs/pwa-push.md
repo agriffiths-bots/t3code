@@ -1,7 +1,7 @@
 # PWA Installability, Keep-Alive, and Push
 
 T3 Code's web app is installable from Android Chrome through `apps/web/public/manifest.webmanifest`
-and the scoped service worker at `/t3-service-worker.js`.
+and the scoped service worker at `/sw.js`.
 
 The manifest declares a stable `id`, `start_url`, `/` scope, standalone display mode, theme and
 background colors, and 192 px, 512 px, and maskable icons. The document head links the manifest and
