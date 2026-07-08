@@ -585,6 +585,14 @@ it.effect("rejects route-minted peer tokens when source session confirmation fai
         Layer.build,
       );
 
+      const existingPeerToken = yield* McpSessionRegistry.issueActiveMcpPeerCredential({
+        sourceSessionId: AuthSessionId.make("peer-client-route-racing-session"),
+        expiresAt: DateTime.makeUnsafe("2036-07-08T10:00:00.000Z").epochMilliseconds,
+      });
+      if (existingPeerToken === undefined) {
+        assert.fail("Expected active MCP registry to mint an existing peer token");
+      }
+
       const httpClient = yield* HttpClient.HttpClient;
       lastAuthenticatedHttpRequestAuthorization = undefined;
       const tokenResponse = yield* httpClient.post(SUBAGENT_PEER_MCP_TOKEN_PATH, {
@@ -595,6 +603,20 @@ it.effect("rejects route-minted peer tokens when source session confirmation fai
       assert.equal(lastAuthenticatedHttpRequestAuthorization, "Bearer racing-env-access-token");
       assert.equal(authCalls, 1);
       assert.equal(confirmCalls, 1);
+
+      const session = yield* McpPeerClient.connect({
+        ...bearerPeer,
+        mcpEndpoint: "/mcp",
+        credential: new SubagentPeerRegistry.SubagentPeerBearerCredential({
+          token: existingPeerToken.token,
+        }),
+      });
+      const result = yield* session.callTool({
+        name: "t3_peer_ping",
+        arguments: { message: "existing token survived" },
+      });
+      assert.equal(result.isError, false);
+      assert.deepStrictEqual(result.structuredContent, { echoed: "existing token survived" });
     }),
   ).pipe(Effect.provide(NodeHttpServer.layerTest)),
 );

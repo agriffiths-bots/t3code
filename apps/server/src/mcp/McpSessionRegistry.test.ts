@@ -490,6 +490,34 @@ it.effect("revokes source-session-bound peer tokens and updates the persisted st
   }).pipe(Effect.provide(NodeServices.layer)),
 );
 
+it.effect("revokes one peer token by id without clearing other tokens for the same session", () =>
+  Effect.gen(function* () {
+    const fs = yield* FileSystem.FileSystem;
+    const baseDir = yield* fs.makeTempDirectoryScoped({ prefix: "t3-mcp-peer-id-revoke-" });
+    const peerTokenStorePath = `${baseDir}/mcp-peer-tokens.json`;
+    const registry = yield* makeRegistry(() => 1_000, fakeHttpServer, {
+      peerTokenStorePath,
+    });
+    const sessionId = AuthSessionId.make("auth-session-shared");
+    const retainedPeer = yield* registry.issuePeerToken({
+      sourceSessionId: sessionId,
+      expiresAt: 30_000,
+    });
+    const revokedPeer = yield* registry.issuePeerToken({
+      sourceSessionId: sessionId,
+      expiresAt: 30_000,
+    });
+
+    yield* registry.revokePeerToken(revokedPeer.peerTokenId);
+
+    const persisted = yield* fs.readFileString(peerTokenStorePath);
+    expect((yield* registry.resolve(retainedPeer.token))?.credentialKind).toBe("peer");
+    expect(yield* registry.resolve(revokedPeer.token)).toBeUndefined();
+    expect(persisted).toContain(retainedPeer.peerTokenId);
+    expect(persisted).not.toContain(revokedPeer.peerTokenId);
+  }).pipe(Effect.provide(NodeServices.layer)),
+);
+
 it.effect(
   "rejects source-session-bound peer tokens after the source auth session is inactive",
   () =>

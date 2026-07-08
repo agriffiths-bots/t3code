@@ -71,6 +71,7 @@ export interface McpSessionRegistryShape {
   readonly revokePeerTokensBySourceSession: (
     sessionId: AuthSessionId,
   ) => Effect.Effect<void, McpPeerTokenStoreError>;
+  readonly revokePeerToken: (peerTokenId: string) => Effect.Effect<void, McpPeerTokenStoreError>;
   readonly revokePeerTokensExceptSourceSession: (
     sessionId: AuthSessionId,
   ) => Effect.Effect<void, McpPeerTokenStoreError>;
@@ -519,6 +520,11 @@ const makeWithOptions = Effect.fn("McpSessionRegistry.make")(function* (
         (record) => record.credentialKind === "peer" && record.scope.sourceSessionId === sessionId,
       );
     }),
+    revokePeerToken: Effect.fn("McpSessionRegistry.revokePeerToken")(function* (peerTokenId) {
+      yield* revokeWhereAndPersist(
+        (record) => record.credentialKind === "peer" && record.scope.peerTokenId === peerTokenId,
+      );
+    }),
     revokePeerTokensExceptSourceSession: Effect.fn(
       "McpSessionRegistry.revokePeerTokensExceptSourceSession",
     )(function* (sessionId) {
@@ -608,6 +614,11 @@ export const revokeActiveMcpPeerCredentialsForAuthSession = (
   activeMcpSessionRegistry
     ? activeMcpSessionRegistry.revokePeerTokensBySourceSession(sessionId)
     : Effect.void;
+
+export const revokeActiveMcpPeerCredential = (
+  peerTokenId: string,
+): Effect.Effect<void, McpPeerTokenStoreError> =>
+  activeMcpSessionRegistry ? activeMcpSessionRegistry.revokePeerToken(peerTokenId) : Effect.void;
 
 export const revokeActiveMcpPeerCredentialsExceptAuthSession = (
   sessionId: AuthSessionId,

@@ -280,18 +280,18 @@ export const mcpPeerTokenRouteLayer = HttpRouter.add(
     if (issued === undefined) {
       return yield* failEnvironmentInternal("internal_error");
     }
-    const revokeIssuedPeerTokens = McpSessionRegistry.revokeActiveMcpPeerCredentialsForAuthSession(
-      session.sessionId,
+    const revokeIssuedPeerToken = McpSessionRegistry.revokeActiveMcpPeerCredential(
+      issued.peerTokenId,
     ).pipe(
       Effect.catchTag("McpPeerTokenStoreError", (error) =>
         failEnvironmentInternal("internal_error", error),
       ),
     );
     const confirmedSession = yield* confirmRawRequestSessionActive(request, session.sessionId).pipe(
-      Effect.catch((error) => revokeIssuedPeerTokens.pipe(Effect.andThen(Effect.fail(error)))),
+      Effect.catch((error) => revokeIssuedPeerToken.pipe(Effect.andThen(Effect.fail(error)))),
     );
     if (confirmedSession.sessionId !== session.sessionId) {
-      yield* revokeIssuedPeerTokens;
+      yield* revokeIssuedPeerToken;
       return yield* failEnvironmentAuthInvalid("invalid_credential");
     }
     const response: SubagentPeerMcpTokenResult = {
