@@ -6,6 +6,7 @@ import { describe, expect, it } from "vite-plus/test";
 import afterPack, {
   createPackagedIntegrityManifest,
   PACKAGED_INTEGRITY_MANIFEST_FILE_NAME,
+  resolveAppAsarUnpackedRoots,
 } from "./desktop-after-pack-prune.mjs";
 
 async function touch(path) {
@@ -138,5 +139,35 @@ describe("desktop-after-pack-prune", () => {
 
     expect(manifest.requiredFiles).toContain("node_modules/cycle-package/package.json");
     expect(manifest.requiredFiles.some((file) => file.includes("/loop/loop/"))).toBe(false);
+  });
+
+  it("writes the packaged integrity manifest inside macOS app bundles", async () => {
+    const tempDir = await NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "desktop-prune-mac-"));
+    const unpackedRoot = NodePath.join(
+      tempDir,
+      "T3 Code.app",
+      "Contents",
+      "Resources",
+      "app.asar.unpacked",
+    );
+    await touch(NodePath.join(unpackedRoot, "node_modules/runtime/package.json"));
+
+    await expect(resolveAppAsarUnpackedRoots(tempDir)).resolves.toContain(unpackedRoot);
+    await afterPack({
+      appOutDir: tempDir,
+      electronPlatformName: "darwin",
+      arch: 1,
+    });
+
+    const manifestPath = NodePath.join(
+      tempDir,
+      "T3 Code.app",
+      "Contents",
+      "Resources",
+      PACKAGED_INTEGRITY_MANIFEST_FILE_NAME,
+    );
+    await expect(exists(manifestPath)).resolves.toBe(true);
+    const manifest = JSON.parse(await NodeFSP.readFile(manifestPath, "utf8"));
+    expect(manifest.requiredFiles).toContain("node_modules/runtime/package.json");
   });
 });

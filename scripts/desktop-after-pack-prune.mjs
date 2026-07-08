@@ -370,15 +370,22 @@ async function pruneNodePty(nodePtyDir, platform, arch) {
   await pruneNodePtyThirdParty(nodePtyDir, platform, archName);
 }
 
-function resolveAppAsarUnpackedRoots(appOutDir) {
-  return [
+export async function resolveAppAsarUnpackedRoots(appOutDir) {
+  const roots = [
     NodePath.join(appOutDir, "resources", "app.asar.unpacked"),
     NodePath.join(appOutDir, "Contents", "Resources", "app.asar.unpacked"),
   ];
+  for (const entry of await listEntries(appOutDir)) {
+    if (!entry.isDirectory() || !entry.name.endsWith(".app")) {
+      continue;
+    }
+    roots.push(NodePath.join(appOutDir, entry.name, "Contents", "Resources", "app.asar.unpacked"));
+  }
+  return [...new Set(roots)];
 }
 
 export default async function afterPack(context) {
-  for (const root of resolveAppAsarUnpackedRoots(context.appOutDir)) {
+  for (const root of await resolveAppAsarUnpackedRoots(context.appOutDir)) {
     if (!(await pathExists(root))) {
       continue;
     }

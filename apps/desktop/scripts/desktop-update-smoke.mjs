@@ -19,6 +19,8 @@ const BACKEND_LOOPBACK_HOST = "127.0.0.1";
 const UPDATE_SERVER_HOST = "127.0.0.1";
 // oxlint-disable-next-line t3code/no-global-process-runtime -- Standalone CI script.
 const hostPlatform = process.platform;
+// oxlint-disable-next-line t3code/no-global-process-runtime -- Standalone CI script.
+const hostArchitecture = process.arch;
 const repoRoot = NodePath.resolve(
   NodePath.dirname(NodeURL.fileURLToPath(import.meta.url)),
   "../../..",
@@ -165,7 +167,7 @@ function fetchText(hostname, port, path, timeoutMs) {
 async function waitForUpdateServer(hostname, port, deadline) {
   let lastError;
   while (Date.now() < deadline) {
-    for (const channelFile of ["/latest.yml", "/nightly.yml"]) {
+    for (const channelFile of resolveUpdateChannelFiles()) {
       try {
         const text = await fetchText(hostname, port, channelFile, 1_000);
         return { channelFile, text };
@@ -181,6 +183,26 @@ async function waitForUpdateServer(hostname, port, deadline) {
       lastError instanceof Error ? lastError.message : String(lastError)
     }`,
   );
+}
+
+export function resolveUpdateChannelFiles(platform = hostPlatform, arch = hostArchitecture) {
+  const legacyFiles = ["/latest.yml", "/nightly.yml"];
+  if (platform === "darwin") {
+    return ["/latest-mac.yml", "/nightly-mac.yml", ...legacyFiles];
+  }
+  if (platform === "linux") {
+    if (arch !== "x64") {
+      return [
+        `/latest-linux-${arch}.yml`,
+        `/nightly-linux-${arch}.yml`,
+        "/latest-linux.yml",
+        "/nightly-linux.yml",
+        ...legacyFiles,
+      ];
+    }
+    return ["/latest-linux.yml", "/nightly-linux.yml", ...legacyFiles];
+  }
+  return legacyFiles;
 }
 
 function startMockUpdateServer(updateRoot, port) {
@@ -261,7 +283,38 @@ async function waitForReadyMarker(filePath, expectedVersion, deadline) {
     const marker = await readReadyMarker(filePath);
     if (marker) {
       lastMarker = marker;
-      if (expectedVersion === undefined || marker.appVersion === expectedVersion) {
+      if (readyMarkerMatchesExpectedVersion(marker, expectedVersion)) {
+        return marker;
+      }
+    }
+    await NodeTimersPromises.setTimeout(500);
+  }
+
+  throw new Error(
+    `Timed out waiting for ${READY_MARKER_FILE}${
+      expectedVersion ? ` with appVersion ${expectedVersion}` : ""
+    }. Last marker: ${lastMarker ? JSON.stringify(lastMarker) : "none"}`,
+  );
+}
+
+export function readyMarkerMatchesExpectedVersion(marker, expectedVersion, options = {}) {
+  if (expectedVersion === undefined || marker.appVersion === expectedVersion) {
+    return true;
+  }
+  return options.allowMissingVersion === true && marker.appVersion === undefined;
+}
+
+async function waitForInitialReadyMarker(filePath, expectedVersion, deadline) {
+  let lastMarker;
+  while (Date.now() < deadline) {
+    const marker = await readReadyMarker(filePath);
+    if (marker) {
+      lastMarker = marker;
+      if (
+        readyMarkerMatchesExpectedVersion(marker, expectedVersion, {
+          allowMissingVersion: true,
+        })
+      ) {
         return marker;
       }
     }
@@ -351,11 +404,13 @@ async function waitForUpdateState(page, predicate, description, deadline) {
   );
 }
 
-function makeDesktopEnv(input) {
+export function makeDesktopEnv(input) {
   const env = {
     ...process.env,
     APPDATA: input.appData,
+    APPIMAGE_EXTRACT_AND_RUN: "1",
     ELECTRON_ENABLE_LOGGING: "1",
+    HOME: input.homeDir,
     NO_AT_BRIDGE: "1",
     T3CODE_HOME: input.t3Home,
     T3CODE_DESKTOP_MOCK_UPDATES: "1",
@@ -536,9 +591,11 @@ async function main() {
   );
   const t3Home = NodePath.join(tempRoot, "t3-home");
   const appData = NodePath.join(tempRoot, "app-data");
+  const homeDir = NodePath.join(tempRoot, "home");
   const readyMarkerPath = NodePath.join(tempRoot, READY_MARKER_FILE);
   await NodeFSP.mkdir(t3Home, { recursive: true });
   await NodeFSP.mkdir(appData, { recursive: true });
+  await NodeFSP.mkdir(homeDir, { recursive: true });
 
   const deadline = Date.now() + options.timeoutMs;
   const updateServer = startMockUpdateServer(options.updateRoot, updateServerPort);
@@ -558,6 +615,7 @@ async function main() {
     const env = makeDesktopEnv({
       appData,
       backendPort,
+      homeDir,
       readyMarkerPath,
       t3Home,
       updateServerPort,
@@ -574,7 +632,7 @@ async function main() {
     }
 
     const descriptor = await waitForDescriptor(BACKEND_LOOPBACK_HOST, backendPort, deadline);
-    const readyMarker = await waitForReadyMarker(
+    const readyMarker = await waitForInitialReadyMarker(
       readyMarkerPath,
       options.expectedFromVersion,
       deadline,
