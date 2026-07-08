@@ -1,4 +1,5 @@
 import * as Effect from "effect/Effect";
+import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 import { HttpClient, HttpClientRequest, type HttpClientResponse } from "effect/unstable/http";
 import { McpSchema } from "effect/unstable/ai";
@@ -12,6 +13,11 @@ const JsonRpcId = Schema.Union([Schema.Number, Schema.String]);
 const JsonRpcRequest = Schema.Struct({
   jsonrpc: Schema.Literal("2.0"),
   id: JsonRpcId,
+  method: Schema.String,
+  params: Schema.Unknown,
+});
+const JsonRpcNotification = Schema.Struct({
+  jsonrpc: Schema.Literal("2.0"),
   method: Schema.String,
   params: Schema.Unknown,
 });
@@ -36,6 +42,7 @@ const JsonRpcResponse = Schema.Union([
 type JsonRpcResponse = typeof JsonRpcResponse.Type;
 
 const encodeJsonRpcRequest = Schema.encodeEffect(Schema.fromJsonString(JsonRpcRequest));
+const encodeJsonRpcNotification = Schema.encodeEffect(Schema.fromJsonString(JsonRpcNotification));
 const decodeJsonRpcResponse = Schema.decodeEffect(Schema.fromJsonString(JsonRpcResponse));
 const decodeInitializeResult = Schema.decodeUnknownEffect(McpSchema.InitializeResult);
 const decodeCallToolResult = Schema.decodeUnknownEffect(McpSchema.CallToolResult);
@@ -78,7 +85,7 @@ export interface McpPeerCallToolInput {
 
 export interface McpPeerClientSession {
   readonly peer: SubagentPeer;
-  readonly sessionId: string;
+  readonly sessionId?: string | undefined;
   readonly protocolVersion: string;
   readonly initializeResult: McpSchema.InitializeResult;
   readonly callTool: (
@@ -123,6 +130,92 @@ const authorizationHeader = (peer: SubagentPeer): Effect.Effect<string, McpPeerC
   );
 };
 
+const MCP_HTTP_ACCEPT = "application/json, text/event-stream";
+
+const jsonRpcHeaders = (input: {
+  readonly authorizationHeader: string;
+  readonly cfAccessHeaders: Record<string, string>;
+  readonly sessionId?: string | undefined;
+  readonly protocolVersion?: string | undefined;
+}) => ({
+  accept: MCP_HTTP_ACCEPT,
+  authorization: input.authorizationHeader,
+  ...input.cfAccessHeaders,
+  ...(input.sessionId === undefined ? {} : { "mcp-session-id": input.sessionId }),
+  ...(input.protocolVersion === undefined ? {} : { "mcp-protocol-version": input.protocolVersion }),
+});
+
+const sseDataPayloads = (text: string): ReadonlyArray<string> => {
+  const normalized = text.replace(/\r\n/g, "\n");
+  const payloads: Array<string> = [];
+  for (const event of normalized.split("\n\n")) {
+    const data = event
+      .split("\n")
+      .filter((line) => line.startsWith("data:"))
+      .map((line) => line.slice("data:".length).trimStart())
+      .join("\n")
+      .trim();
+    if (data.length > 0 && data !== "[DONE]") {
+      payloads.push(data);
+    }
+  }
+  return payloads;
+};
+
+const matchingSseResponseJsonText = Effect.fn("McpPeerClient.matchingSseResponseJsonText")(
+  function* (input: {
+    readonly text: string;
+    readonly method: string;
+    readonly id: number;
+  }): Effect.fn.Return<string, McpPeerClientError> {
+    const payloads = sseDataPayloads(input.text);
+    if (payloads.length === 0) {
+      return yield* error("decode-response", {
+        method: input.method,
+        detail: "MCP peer SSE response did not include a JSON-RPC data event.",
+        cause: input.text,
+      });
+    }
+    for (const payload of payloads) {
+      const decoded = yield* decodeJsonRpcResponse(payload).pipe(Effect.option);
+      if (Option.isSome(decoded) && decoded.value.id === input.id) {
+        return payload;
+      }
+    }
+    return yield* error("decode-response", {
+      method: input.method,
+      detail: "MCP peer SSE response did not include a matching JSON-RPC response.",
+      cause: input.text,
+    });
+  },
+);
+
+const jsonRpcResponseIdMatches = (response: JsonRpcResponse, id: number) => {
+  return response.id === id;
+};
+
+const responseJsonText = (
+  response: HttpClientResponse.HttpClientResponse,
+  method: string,
+  id: number,
+): Effect.Effect<string, McpPeerClientError> =>
+  response.text.pipe(
+    Effect.mapError((cause) =>
+      error("decode-response", {
+        method,
+        detail: "Could not read MCP peer response body.",
+        cause,
+      }),
+    ),
+    Effect.flatMap((text) => {
+      const contentType = response.headers["content-type"] ?? "";
+      if (!contentType.toLowerCase().includes("text/event-stream")) {
+        return Effect.succeed(text);
+      }
+      return matchingSseResponseJsonText({ text, method, id });
+    }),
+  );
+
 const postJsonRpc = Effect.fn("McpPeerClient.postJsonRpc")(function* (input: {
   readonly client: HttpClient.HttpClient;
   readonly endpoint: string;
@@ -148,15 +241,12 @@ const postJsonRpc = Effect.fn("McpPeerClient.postJsonRpc")(function* (input: {
       }),
     ),
   );
-  const headers = {
-    accept: "application/json",
-    authorization: input.authorizationHeader,
-    ...input.cfAccessHeaders,
-    ...(input.sessionId === undefined ? {} : { "mcp-session-id": input.sessionId }),
-    ...(input.protocolVersion === undefined
-      ? {}
-      : { "mcp-protocol-version": input.protocolVersion }),
-  };
+  const headers = jsonRpcHeaders({
+    authorizationHeader: input.authorizationHeader,
+    cfAccessHeaders: input.cfAccessHeaders,
+    sessionId: input.sessionId,
+    protocolVersion: input.protocolVersion,
+  });
   const request = HttpClientRequest.post(input.endpoint, { headers }).pipe(
     HttpClientRequest.bodyText(encoded, "application/json"),
   );
@@ -177,15 +267,7 @@ const postJsonRpc = Effect.fn("McpPeerClient.postJsonRpc")(function* (input: {
       cause: response.status,
     });
   }
-  const text = yield* response.text.pipe(
-    Effect.mapError((cause) =>
-      error("decode-response", {
-        method: input.method,
-        detail: "Could not read MCP peer response body.",
-        cause,
-      }),
-    ),
-  );
+  const text = yield* responseJsonText(response, input.method, input.id);
   const decoded = yield* decodeJsonRpcResponse(text).pipe(
     Effect.mapError((cause) =>
       error("decode-response", {
@@ -195,6 +277,13 @@ const postJsonRpc = Effect.fn("McpPeerClient.postJsonRpc")(function* (input: {
       }),
     ),
   );
+  if (!jsonRpcResponseIdMatches(decoded, input.id)) {
+    return yield* error("decode-response", {
+      method: input.method,
+      detail: "MCP peer JSON-RPC response id did not match the request id.",
+      cause: decoded,
+    });
+  }
   if ("error" in decoded) {
     return yield* error("json-rpc", {
       method: input.method,
@@ -204,6 +293,59 @@ const postJsonRpc = Effect.fn("McpPeerClient.postJsonRpc")(function* (input: {
   }
   return { result: decoded.result, response };
 });
+
+const postJsonRpcNotification = Effect.fn("McpPeerClient.postJsonRpcNotification")(
+  function* (input: {
+    readonly client: HttpClient.HttpClient;
+    readonly endpoint: string;
+    readonly authorizationHeader: string;
+    readonly cfAccessHeaders: Record<string, string>;
+    readonly sessionId?: string | undefined;
+    readonly protocolVersion?: string | undefined;
+    readonly method: string;
+    readonly params: unknown;
+  }): Effect.fn.Return<void, McpPeerClientError> {
+    const encoded = yield* encodeJsonRpcNotification({
+      jsonrpc: "2.0",
+      method: input.method,
+      params: input.params,
+    }).pipe(
+      Effect.mapError((cause) =>
+        error("encode-request", {
+          method: input.method,
+          detail: "Could not encode JSON-RPC notification.",
+          cause,
+        }),
+      ),
+    );
+    const headers = jsonRpcHeaders({
+      authorizationHeader: input.authorizationHeader,
+      cfAccessHeaders: input.cfAccessHeaders,
+      sessionId: input.sessionId,
+      protocolVersion: input.protocolVersion,
+    });
+    const request = HttpClientRequest.post(input.endpoint, { headers }).pipe(
+      HttpClientRequest.bodyText(encoded, "application/json"),
+    );
+    const response = yield* input.client.execute(request).pipe(
+      Effect.mapError((cause) =>
+        error("http-request", {
+          method: input.method,
+          detail: "Could not reach MCP peer.",
+          cause,
+        }),
+      ),
+    );
+    if (response.status < 200 || response.status >= 300) {
+      return yield* error("http-status", {
+        method: input.method,
+        status: response.status,
+        detail: "MCP peer returned a non-success status.",
+        cause: response.status,
+      });
+    }
+  },
+);
 
 export const connect = Effect.fn("McpPeerClient.connect")(function* (
   peer: SubagentPeer,
@@ -238,16 +380,21 @@ export const connect = Effect.fn("McpPeerClient.connect")(function* (
       }),
     ),
   );
-  const sessionId = initialized.response.headers["mcp-session-id"];
-  if (sessionId === undefined || sessionId.trim().length === 0) {
-    return yield* error("initialize", {
-      method: "initialize",
-      detail: "MCP peer did not return an mcp-session-id header.",
-      cause: initialized.response.headers,
-    });
-  }
+  const rawSessionId = initialized.response.headers["mcp-session-id"]?.trim();
+  const sessionId = rawSessionId && rawSessionId.length > 0 ? rawSessionId : undefined;
   const protocolVersion =
     initialized.response.headers["mcp-protocol-version"] ?? initializeResult.protocolVersion;
+
+  yield* postJsonRpcNotification({
+    client,
+    endpoint: peer.mcpEndpoint,
+    authorizationHeader: auth,
+    cfAccessHeaders: cfHeaders,
+    sessionId,
+    protocolVersion,
+    method: "notifications/initialized",
+    params: {},
+  });
 
   return {
     peer,

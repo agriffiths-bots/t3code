@@ -21,7 +21,7 @@ import * as SubagentPeerRegistry from "./SubagentPeerRegistry.ts";
 
 const JsonRpcRequest = Schema.Struct({
   jsonrpc: Schema.Literal("2.0"),
-  id: Schema.Union([Schema.Number, Schema.String]),
+  id: Schema.optional(Schema.Union([Schema.Number, Schema.String])),
   method: Schema.String,
   params: Schema.Unknown,
 });
@@ -29,6 +29,7 @@ type JsonRpcRequest = typeof JsonRpcRequest.Type;
 type CapturedHttpRequest = Parameters<Parameters<typeof HttpClient.make>[0]>[0];
 
 const decodeJsonRpcRequest = Schema.decodeUnknownSync(Schema.fromJsonString(JsonRpcRequest));
+const encodeUnknownJson = Schema.encodeSync(Schema.UnknownFromJsonString);
 
 const bearerPeer: SubagentPeerRegistry.SubagentPeer = {
   alias: "vps",
@@ -180,6 +181,9 @@ it.effect("initializes a peer session and sends tools/call over MCP HTTP", () =>
             ),
           );
         }
+        if (rpc.method === "notifications/initialized") {
+          return HttpClientResponse.fromWeb(request, new Response(null, { status: 202 }));
+        }
         assert.equal(rpc.method, "tools/call");
         return HttpClientResponse.fromWeb(
           request,
@@ -214,17 +218,24 @@ it.effect("initializes a peer session and sends tools/call over MCP HTTP", () =>
 
     assert.equal(result.isError, false);
     assert.deepStrictEqual(result.structuredContent, { state: "complete" });
-    assert.equal(requests.length, 2);
+    assert.equal(requests.length, 3);
 
     const initializeRequest = requests[0];
-    const toolRequest = requests[1];
+    const initializedRequest = requests[1];
+    const toolRequest = requests[2];
     assert.ok(initializeRequest);
+    assert.ok(initializedRequest);
     assert.ok(toolRequest);
 
     assert.equal(initializeRequest.headers.authorization, "Bearer peer-token");
+    assert.equal(initializeRequest.headers.accept, "application/json, text/event-stream");
     assert.equal(initializeRequest.headers["cf-access-client-id"], "cf-client-id");
     assert.equal(initializeRequest.headers["cf-access-client-secret"], "cf-client-secret");
     assert.equal(initializeRequest.headers["mcp-session-id"], undefined);
+
+    assert.equal(initializedRequest.headers.authorization, "Bearer peer-token");
+    assert.equal(initializedRequest.headers["mcp-session-id"], "session-1");
+    assert.equal(initializedRequest.headers["mcp-protocol-version"], "2025-06-18");
 
     assert.equal(toolRequest.headers.authorization, "Bearer peer-token");
     assert.equal(toolRequest.headers["mcp-session-id"], "session-1");
@@ -241,12 +252,148 @@ it.effect("initializes a peer session and sends tools/call over MCP HTTP", () =>
       },
     });
 
+    const initializedRpc = decodeRequestBody(initializedRequest);
+    assert.equal(initializedRpc.method, "notifications/initialized");
+    assert.deepStrictEqual(initializedRpc.params, {});
+    assert.equal(initializedRpc.id, undefined);
+
     const callRpc = decodeRequestBody(toolRequest);
     assert.equal(callRpc.method, "tools/call");
     assert.deepStrictEqual(callRpc.params, {
       name: "t3_check_subagent",
       arguments: { childThreadId: "child-thread-1" },
     });
+  });
+});
+
+it.effect("supports stateless MCP peers that do not return an MCP session id", () => {
+  const requests: Array<CapturedHttpRequest> = [];
+  const httpLayer = Layer.succeed(
+    HttpClient.HttpClient,
+    HttpClient.make((request) =>
+      Effect.sync(() => {
+        requests.push(request);
+        const rpc = decodeRequestBody(request);
+        if (rpc.method === "initialize") {
+          return HttpClientResponse.fromWeb(
+            request,
+            Response.json({
+              jsonrpc: "2.0",
+              id: rpc.id,
+              result: {
+                protocolVersion: "2025-06-18",
+                capabilities: { tools: {} },
+                serverInfo: { name: "peer-test", version: "1.0.0" },
+              },
+            }),
+          );
+        }
+        if (rpc.method === "notifications/initialized") {
+          return HttpClientResponse.fromWeb(request, new Response(null, { status: 202 }));
+        }
+        assert.equal(rpc.method, "tools/call");
+        return HttpClientResponse.fromWeb(
+          request,
+          Response.json({
+            jsonrpc: "2.0",
+            id: rpc.id,
+            result: {
+              content: [{ type: "text", text: "stateless-ok" }],
+              structuredContent: { state: "stateless-ok" },
+              isError: false,
+            },
+          }),
+        );
+      }),
+    ),
+  );
+
+  return Effect.gen(function* () {
+    const session = yield* McpPeerClient.connect(bearerPeer).pipe(Effect.provide(httpLayer));
+
+    assert.equal(session.sessionId, undefined);
+    const result = yield* session.callTool({
+      name: "t3_check_subagent",
+      arguments: { childThreadId: "child-thread-1" },
+    });
+
+    assert.equal(result.isError, false);
+    assert.deepStrictEqual(result.structuredContent, { state: "stateless-ok" });
+    assert.equal(requests.length, 3);
+    assert.equal(requests[1]?.headers["mcp-session-id"], undefined);
+    assert.equal(requests[2]?.headers["mcp-session-id"], undefined);
+  });
+});
+
+it.effect("decodes JSON-RPC responses delivered as finite SSE events", () => {
+  const requests: Array<CapturedHttpRequest> = [];
+  const httpLayer = Layer.succeed(
+    HttpClient.HttpClient,
+    HttpClient.make((request) =>
+      Effect.sync(() => {
+        requests.push(request);
+        const rpc = decodeRequestBody(request);
+        if (rpc.method === "initialize") {
+          return HttpClientResponse.fromWeb(
+            request,
+            Response.json(
+              {
+                jsonrpc: "2.0",
+                id: rpc.id,
+                result: {
+                  protocolVersion: "2025-06-18",
+                  capabilities: { tools: {} },
+                  serverInfo: { name: "peer-test", version: "1.0.0" },
+                },
+              },
+              {
+                headers: {
+                  "mcp-session-id": "session-sse",
+                  "mcp-protocol-version": "2025-06-18",
+                },
+              },
+            ),
+          );
+        }
+        if (rpc.method === "notifications/initialized") {
+          return HttpClientResponse.fromWeb(request, new Response(null, { status: 202 }));
+        }
+        assert.equal(rpc.method, "tools/call");
+        const notificationPayload = encodeUnknownJson({
+          jsonrpc: "2.0",
+          method: "notifications/progress",
+          params: { progressToken: "peer-progress", progress: 1, total: 2 },
+        });
+        const payload = encodeUnknownJson({
+          jsonrpc: "2.0",
+          id: rpc.id,
+          result: {
+            content: [{ type: "text", text: "sse-ok" }],
+            structuredContent: { state: "sse-ok" },
+            isError: false,
+          },
+        });
+        return HttpClientResponse.fromWeb(
+          request,
+          new Response(`event: message\ndata: ${notificationPayload}\n\ndata: ${payload}\n\n`, {
+            headers: { "content-type": "text/event-stream" },
+          }),
+        );
+      }),
+    ),
+  );
+
+  return Effect.gen(function* () {
+    const session = yield* McpPeerClient.connect(bearerPeer).pipe(Effect.provide(httpLayer));
+    const result = yield* session.callTool({
+      name: "t3_check_subagent",
+      arguments: { childThreadId: "child-thread-1" },
+    });
+
+    assert.equal(result.isError, false);
+    assert.deepStrictEqual(result.content, [{ type: "text", text: "sse-ok" }]);
+    assert.deepStrictEqual(result.structuredContent, { state: "sse-ok" });
+    assert.equal(requests.length, 3);
   });
 });
 

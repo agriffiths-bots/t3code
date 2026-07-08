@@ -437,15 +437,19 @@ const makeWithOptions = Effect.fn("McpSessionRegistry.make")(function* (
             return refreshPeerRecord;
           }
           return sessions.value.isActive(record.scope.sourceSessionId).pipe(
+            Effect.map(Option.some),
             Effect.catch((error) =>
               Effect.logWarning("Failed to validate MCP peer token source session.", {
                 peerTokenId: record.scope.peerTokenId,
                 sourceSessionId: record.scope.sourceSessionId,
                 error,
-              }).pipe(Effect.as(false)),
+              }).pipe(Effect.as(Option.none<boolean>())),
             ),
             Effect.flatMap((active) => {
-              if (active) return refreshPeerRecord;
+              if (Option.isNone(active)) {
+                return Effect.succeed([undefined, { records }] as const);
+              }
+              if (active.value) return refreshPeerRecord;
               next.delete(tokenHash);
               return persistPeerRecords(next).pipe(
                 Effect.catch((error) =>

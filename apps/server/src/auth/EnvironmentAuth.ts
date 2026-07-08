@@ -881,6 +881,9 @@ export const make = Effect.gen(function* () {
   const revokePeerCredentialsForInactiveSessions = (activeSessionIds: ReadonlySet<AuthSessionId>) =>
     McpSessionRegistry.revokeActiveMcpPeerCredentialsForInactiveAuthSessions(activeSessionIds);
 
+  const mapOtherSessionsRevocationError = (cause: unknown) =>
+    new ServerAuthOtherSessionsRevocationError({ cause });
+
   const revokeSession: EnvironmentAuth["Service"]["revokeSession"] = (sessionId) =>
     sessions.revoke(sessionId).pipe(
       Effect.mapError((cause) => new ServerAuthSessionRevocationError({ cause })),
@@ -892,41 +895,15 @@ export const make = Effect.gen(function* () {
       Effect.withSpan("EnvironmentAuth.revokeSession"),
     );
 
-  const revokeOtherSessionsExcept: EnvironmentAuth["Service"]["revokeOtherSessionsExcept"] = (
-    sessionId,
-  ) =>
-    Effect.gen(function* () {
-      const activeSessions = yield* sessions
-        .listActive()
-        .pipe(Effect.mapError((cause) => new ServerAuthOtherSessionsRevocationError({ cause })));
-      const targetSessionIds = activeSessions
-        .map((session) => session.sessionId)
-        .filter((activeSessionId) => activeSessionId !== sessionId);
-      const revoked = yield* Effect.forEach(
-        targetSessionIds,
-        (revokedSessionId) =>
-          sessions.revoke(revokedSessionId).pipe(
-            Effect.mapError((cause) => new ServerAuthOtherSessionsRevocationError({ cause })),
-            Effect.tap((wasRevoked) =>
-              wasRevoked
-                ? revokePeerCredentialsForSession(revokedSessionId).pipe(
-                    Effect.mapError(
-                      (cause) => new ServerAuthOtherSessionsRevocationError({ cause }),
-                    ),
-                  )
-                : Effect.void,
-            ),
-          ),
-        { concurrency: "unbounded" },
-      );
-      const remainingActiveSessions = yield* sessions
-        .listActive()
-        .pipe(Effect.mapError((cause) => new ServerAuthOtherSessionsRevocationError({ cause })));
+  const revokeOtherSessionsExcept: EnvironmentAuth["Service"]["revokeOtherSessionsExcept"] =
+    Effect.fn("EnvironmentAuth.revokeOtherSessionsExcept")(function* (sessionId) {
+      const revokedCount = yield* sessions.revokeAllExcept(sessionId);
+      const remainingActiveSessions = yield* sessions.listActive();
       yield* revokePeerCredentialsForInactiveSessions(
         new Set(remainingActiveSessions.map((session) => session.sessionId)),
-      ).pipe(Effect.mapError((cause) => new ServerAuthOtherSessionsRevocationError({ cause })));
-      return revoked.filter(Boolean).length;
-    }).pipe(Effect.withSpan("EnvironmentAuth.revokeOtherSessionsExcept"));
+      );
+      return revokedCount;
+    }, Effect.mapError(mapOtherSessionsRevocationError));
 
   const issuePairingCredential: EnvironmentAuth["Service"]["issuePairingCredential"] = (input) =>
     issuePairingCredentialForSubject({
