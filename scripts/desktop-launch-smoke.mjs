@@ -13,7 +13,8 @@ const DEFAULT_TIMEOUT_MS = 90_000;
 const DEFAULT_STABILITY_MS = 5_000;
 const DESCRIPTOR_PATH = "/.well-known/t3/environment";
 const READY_MARKER_FILE = "main-window-ready.json";
-const MAX_CAPTURED_OUTPUT_BYTES = 256 * 1024;
+const MAX_CAPTURED_OUTPUT_BYTES = 2 * 1024 * 1024;
+const FATAL_OUTPUT_SNAPSHOT_BYTES = 16 * 1024;
 const FATAL_OUTPUT_PATTERNS = [
   /ERR_MODULE_NOT_FOUND/i,
   /\bMODULE_NOT_FOUND\b/i,
@@ -266,15 +267,97 @@ export async function readReadyMarker(filePath) {
   }
 }
 
-function appendOutput(current, streamName, chunk) {
-  const next = `${current}${streamName}: ${chunk.toString()}`;
-  return next.length > MAX_CAPTURED_OUTPUT_BYTES
-    ? next.slice(next.length - MAX_CAPTURED_OUTPUT_BYTES)
-    : next;
+function formatOutputEntry(streamName, chunk) {
+  const text = Buffer.isBuffer(chunk) ? chunk.toString("utf8") : String(chunk);
+  return `${streamName}: ${text}`;
+}
+
+export function appendOutput(current, streamName, chunk, maxBytes = MAX_CAPTURED_OUTPUT_BYTES) {
+  const entry = formatOutputEntry(streamName, chunk);
+  const next = `${current}${current ? "\n" : ""}${entry}`;
+  return next.length > maxBytes ? next.slice(next.length - maxBytes) : next;
+}
+
+function findFatalOutputMatch(output) {
+  for (const pattern of FATAL_OUTPUT_PATTERNS) {
+    pattern.lastIndex = 0;
+    const match = pattern.exec(output);
+    if (match?.index !== undefined) {
+      return { pattern, index: match.index, length: match[0]?.length ?? 0 };
+    }
+  }
+  return undefined;
+}
+
+export function captureFatalOutput(output, maxBytes = FATAL_OUTPUT_SNAPSHOT_BYTES) {
+  const match = findFatalOutputMatch(output);
+  if (!match) {
+    return undefined;
+  }
+  if (output.length <= maxBytes) {
+    return output;
+  }
+
+  const prefix = "[output truncated before fatal]\n";
+  const suffix = "\n[output truncated after fatal]";
+  const markerBytes = prefix.length + suffix.length;
+  const windowBytes = Math.max(1, maxBytes - markerBytes);
+  const contextBeforeBytes = Math.floor(windowBytes / 4);
+  const contextAfterBytes = windowBytes - contextBeforeBytes;
+  const preferredStart = Math.max(0, match.index - contextBeforeBytes);
+  const preferredEnd = Math.min(
+    output.length,
+    match.index + Math.max(match.length, 1) + contextAfterBytes,
+  );
+  const lineStart = output.lastIndexOf("\n", match.index);
+  const lineEnd = output.indexOf("\n", match.index + Math.max(match.length, 1));
+  const start = lineStart >= preferredStart ? lineStart + 1 : preferredStart;
+  const end = lineEnd !== -1 && lineEnd <= preferredEnd ? lineEnd : preferredEnd;
+
+  const formatSnapshot = (sliceStart, sliceEnd) => {
+    const truncatedPrefix = sliceStart > 0 ? prefix : "";
+    const truncatedSuffix = sliceEnd < output.length ? suffix : "";
+    return `${truncatedPrefix}${output.slice(sliceStart, sliceEnd)}${truncatedSuffix}`;
+  };
+
+  const snapshot = formatSnapshot(start, end);
+  if (snapshot.length <= maxBytes) {
+    return snapshot;
+  }
+
+  const truncatedPrefix = start > 0 ? prefix : "";
+  const truncatedSuffix = end < output.length ? suffix : "";
+  const bodyBudget = maxBytes - truncatedPrefix.length - truncatedSuffix.length;
+  if (bodyBudget <= 0) {
+    return output.slice(match.index, Math.min(output.length, match.index + maxBytes));
+  }
+
+  const matchStart = Math.min(Math.max(match.index, start), end);
+  const matchEnd = Math.min(end, matchStart + Math.max(match.length, 1));
+  const matchBytes = matchEnd - matchStart;
+  const beforeBudget = Math.min(
+    matchStart - start,
+    Math.max(0, Math.floor((bodyBudget - matchBytes) / 4)),
+  );
+  let clampedStart = matchStart - beforeBudget;
+  let clampedEnd = Math.min(end, clampedStart + bodyBudget);
+  if (clampedEnd <= matchEnd) {
+    clampedEnd = Math.min(end, matchEnd);
+    clampedStart = Math.max(start, clampedEnd - bodyBudget);
+  }
+
+  return formatSnapshot(clampedStart, clampedEnd);
 }
 
 function outputHasFatalPattern(output) {
-  return FATAL_OUTPUT_PATTERNS.find((pattern) => pattern.test(output));
+  return findFatalOutputMatch(output)?.pattern;
+}
+
+function appendOutputEntry(current, entry) {
+  const next = `${current}${current ? "\n" : ""}${entry}`;
+  return next.length > MAX_CAPTURED_OUTPUT_BYTES
+    ? next.slice(next.length - MAX_CAPTURED_OUTPUT_BYTES)
+    : next;
 }
 
 function signalProcessTree(child, signal) {
@@ -336,9 +419,15 @@ async function collectDiagnostics(tempRoot, output) {
 
 async function assertHealthy(child, output, serverChildLogPath) {
   const serverChildLog = await readOptionalText(serverChildLogPath);
-  const fatalPattern = outputHasFatalPattern(`${output()}\n${serverChildLog}`);
+  const diagnosticOutput = `${output()}\n${serverChildLog}`;
+  const fatalPattern = outputHasFatalPattern(diagnosticOutput);
   if (fatalPattern) {
-    throw new Error(`Desktop launch emitted fatal pattern ${fatalPattern}`);
+    const fatalSnapshot = captureFatalOutput(diagnosticOutput);
+    throw new Error(
+      `Desktop launch emitted fatal pattern ${fatalPattern}${
+        fatalSnapshot ? `\nFatal output snapshot:\n${fatalSnapshot}` : ""
+      }`,
+    );
   }
   if (child.exitCode !== null || child.signalCode !== null) {
     throw new Error(
@@ -399,12 +488,27 @@ async function main() {
   });
 
   let output = "";
+  let fatalOutput = "";
   let exit = null;
+  const recordOutput = (streamName, chunk) => {
+    const entry = formatOutputEntry(streamName, chunk);
+    if (!fatalOutput) {
+      const candidate = captureFatalOutput(`${output}${output ? "\n" : ""}${entry}`);
+      if (candidate) {
+        fatalOutput = candidate;
+      }
+    }
+    output = appendOutputEntry(output, entry);
+  };
+  const diagnosticOutput = () =>
+    fatalOutput
+      ? `Fatal output snapshot:\n${fatalOutput}\n\nLatest process output:\n${output}`
+      : output;
   child.stdout.on("data", (chunk) => {
-    output = appendOutput(output, "stdout", chunk);
+    recordOutput("stdout", chunk);
   });
   child.stderr.on("data", (chunk) => {
-    output = appendOutput(output, "stderr", chunk);
+    recordOutput("stderr", chunk);
   });
   child.once("exit", (code, signal) => {
     exit = { code, signal };
@@ -415,7 +519,7 @@ async function main() {
   let loggedBackendReady = false;
   try {
     while (Date.now() < deadline) {
-      await assertHealthy(child, () => output, serverChildLogPath);
+      await assertHealthy(child, diagnosticOutput, serverChildLogPath);
 
       if (!backendDescriptor) {
         try {
@@ -457,7 +561,7 @@ async function main() {
       const stableUntil = Math.min(deadline, Date.now() + options.stabilityMs);
       while (Date.now() < stableUntil) {
         await NodeTimersPromises.setTimeout(500);
-        await assertHealthy(child, () => output, serverChildLogPath);
+        await assertHealthy(child, diagnosticOutput, serverChildLogPath);
       }
       return;
     }
@@ -466,7 +570,7 @@ async function main() {
       `Timed out after ${options.timeoutMs}ms waiting for desktop backend and main-window readiness`,
     );
   } catch (error) {
-    const diagnostics = await collectDiagnostics(tempRoot, output);
+    const diagnostics = await collectDiagnostics(tempRoot, diagnosticOutput());
     throw new Error(`${error instanceof Error ? error.message : String(error)}${diagnostics}`, {
       cause: error,
     });

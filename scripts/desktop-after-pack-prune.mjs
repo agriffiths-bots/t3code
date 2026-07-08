@@ -1,6 +1,7 @@
 import * as NodeFSP from "node:fs/promises";
 import * as NodePath from "node:path";
 
+export const PACKAGED_INTEGRITY_MANIFEST_FILE_NAME = "packaged-integrity-manifest.json";
 const RUNTIME_NODE_PTY_BUILD_FILE = NodePath.normalize("Release/pty.node");
 const NODE_PTY_KEEP_PREBUILD_FILE_NAMES = new Set([
   "pty.node",
@@ -84,6 +85,74 @@ async function removeEmptyDirectories(path) {
   if (remaining.length === 0) {
     await removePath(path);
   }
+}
+
+function toPosixPath(path) {
+  return path.split(NodePath.sep).join("/");
+}
+
+async function collectRelativeFiles(input) {
+  const { root, current, logicalRoot, files, activeDirectories } = input;
+  const realCurrent = await NodeFSP.realpath(current).catch(() => current);
+  if (activeDirectories.has(realCurrent)) {
+    return;
+  }
+  activeDirectories.add(realCurrent);
+
+  try {
+    for (const entry of await listEntries(current)) {
+      const entryPath = NodePath.join(current, entry.name);
+      const logicalPath = logicalRoot ? `${logicalRoot}/${entry.name}` : entry.name;
+      const targetStat = entry.isSymbolicLink()
+        ? await NodeFSP.stat(entryPath).catch(() => null)
+        : null;
+
+      if (entry.isDirectory() || targetStat?.isDirectory()) {
+        await collectRelativeFiles({
+          root,
+          current: entryPath,
+          logicalRoot: logicalPath,
+          files,
+          activeDirectories,
+        });
+        continue;
+      }
+
+      if (entry.isFile() || targetStat?.isFile()) {
+        files.add(toPosixPath(NodePath.relative(root, entryPath)));
+      }
+    }
+  } finally {
+    activeDirectories.delete(realCurrent);
+  }
+}
+
+export async function createPackagedIntegrityManifest(unpackedRoot) {
+  const requiredFiles = new Set();
+  await collectRelativeFiles({
+    root: unpackedRoot,
+    current: unpackedRoot,
+    logicalRoot: "",
+    files: requiredFiles,
+    activeDirectories: new Set(),
+  });
+
+  return {
+    version: 1,
+    generatedAt: new Date().toISOString(),
+    requiredFiles: [...requiredFiles].sort(),
+  };
+}
+
+async function writePackagedIntegrityManifest(resourcesDir, unpackedRoot) {
+  const manifest = await createPackagedIntegrityManifest(unpackedRoot);
+  await NodeFSP.writeFile(
+    NodePath.join(resourcesDir, PACKAGED_INTEGRITY_MANIFEST_FILE_NAME),
+    `${JSON.stringify(manifest, null, 2)}\n`,
+  );
+  console.log(
+    `[desktop-after-pack-prune] wrote ${manifest.requiredFiles.length} packaged integrity entries`,
+  );
 }
 
 async function pruneNodePtyLibDirectory(directory) {
@@ -301,20 +370,31 @@ async function pruneNodePty(nodePtyDir, platform, arch) {
   await pruneNodePtyThirdParty(nodePtyDir, platform, archName);
 }
 
-function resolveAppAsarUnpackedRoots(appOutDir) {
-  return [
+export async function resolveAppAsarUnpackedRoots(appOutDir) {
+  const roots = [
     NodePath.join(appOutDir, "resources", "app.asar.unpacked"),
     NodePath.join(appOutDir, "Contents", "Resources", "app.asar.unpacked"),
   ];
+  for (const entry of await listEntries(appOutDir)) {
+    if (!entry.isDirectory() || !entry.name.endsWith(".app")) {
+      continue;
+    }
+    roots.push(NodePath.join(appOutDir, entry.name, "Contents", "Resources", "app.asar.unpacked"));
+  }
+  return [...new Set(roots)];
 }
 
 export default async function afterPack(context) {
-  for (const root of resolveAppAsarUnpackedRoots(context.appOutDir)) {
+  for (const root of await resolveAppAsarUnpackedRoots(context.appOutDir)) {
+    if (!(await pathExists(root))) {
+      continue;
+    }
     await pruneNativeSidecars(root, context.electronPlatformName, context.arch);
     await pruneNodePty(
       NodePath.join(root, "node_modules", "node-pty"),
       context.electronPlatformName,
       context.arch,
     );
+    await writePackagedIntegrityManifest(NodePath.dirname(root), root);
   }
 }

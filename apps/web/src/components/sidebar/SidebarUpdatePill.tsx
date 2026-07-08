@@ -127,7 +127,12 @@ export function SidebarUpdatePill() {
                   className="update-main relative flex h-full flex-1 items-center gap-2 px-2 enabled:cursor-pointer"
                   onClick={handleAction}
                 >
-                  {action === "install" ? (
+                  {state?.status === "installing" ? (
+                    <>
+                      <RotateCwIcon className="size-3.5 animate-spin" />
+                      <span>Installing update</span>
+                    </>
+                  ) : action === "install" ? (
                     <>
                       <RotateCwIcon className="size-3.5" />
                       <span>Restart to update</span>

@@ -276,6 +276,7 @@ function AboutVersionSection() {
   const statusLabel: Record<string, string> = {
     checking: "Checking…",
     downloading: "Downloading…",
+    installing: "Installing…",
     "up-to-date": "Up to Date",
   };
   const buttonLabel =
