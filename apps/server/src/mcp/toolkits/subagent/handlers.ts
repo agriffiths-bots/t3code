@@ -304,9 +304,60 @@ const requireRuntime = (): Effect.Effect<SubagentRuntime, ThreadStartToolError> 
     ? Effect.succeed(activeRuntime)
     : Effect.fail(fail("Sub-agent runtime is not available."));
 
-const requireInvocation = McpInvocationContext.requireMcpCapability("thread-management").pipe(
-  Effect.mapError((error) => fail(error.message)),
-);
+const requireProviderInvocation = McpInvocationContext.requireProviderMcpCapability(
+  "thread-management",
+).pipe(Effect.mapError((error) => fail(error.message)));
+
+const requireSubagentCapability = (capability: McpInvocationContext.McpCapability) =>
+  McpInvocationContext.requireAnyMcpCapability(["thread-management", capability]).pipe(
+    Effect.mapError((error) => fail(error.message)),
+  );
+
+const requireProviderSubagentInvocation = (capability: McpInvocationContext.McpCapability) =>
+  requireSubagentCapability(capability).pipe(
+    Effect.flatMap((invocation) =>
+      McpInvocationContext.isProviderInvocationScope(invocation)
+        ? Effect.succeed(invocation)
+        : Effect.fail(
+            fail(
+              "Peer-scoped sub-agent spawn requires remote parent context; retry after the remote spawn target is resolved by the caller.",
+            ),
+          ),
+    ),
+  );
+
+const peerSetHas = (set: ReadonlySet<ThreadId> | undefined, threadId: ThreadId): boolean =>
+  set?.has(threadId) === true;
+
+const requirePeerChildAccess = (
+  invocation: McpInvocationContext.McpInvocationScope,
+  childThreadIds: ReadonlyArray<ThreadId>,
+): Effect.Effect<void, ThreadStartToolError> => {
+  if (McpInvocationContext.isProviderInvocationScope(invocation)) return Effect.void;
+  const unauthorized = childThreadIds.find(
+    (childThreadId) => !peerSetHas(invocation.allowedChildThreadIds, childThreadId),
+  );
+  return unauthorized === undefined
+    ? Effect.void
+    : Effect.fail(
+        fail(
+          `Peer-scoped sub-agent credential is not authorized for child thread ${unauthorized}.`,
+        ),
+      );
+};
+
+const requirePeerParentAccess = (
+  invocation: McpInvocationContext.McpInvocationScope,
+  parentThreadId: ThreadId,
+): Effect.Effect<void, ThreadStartToolError> =>
+  McpInvocationContext.isProviderInvocationScope(invocation) ||
+  peerSetHas(invocation.allowedParentThreadIds, parentThreadId)
+    ? Effect.void
+    : Effect.fail(
+        fail(
+          `Peer-scoped sub-agent credential is not authorized for parent thread ${parentThreadId}.`,
+        ),
+      );
 
 const loadThreadShell = (runtime: SubagentRuntime, threadId: ThreadId) =>
   runtime.projectionSnapshotQuery
@@ -383,7 +434,7 @@ const resolveExplicitModelSelection = (
   );
 
 const spawnSubagent = Effect.fn("SubagentToolkit.spawn")(function* (input: SpawnSubagentInput) {
-  const invocation = yield* requireInvocation;
+  const invocation = yield* requireProviderSubagentInvocation("subagent:spawn");
   const runtime = yield* requireRuntime();
   const coordinator = yield* requireCoordinator();
   const spawnRuntime = yield* requireSpawnRuntime();
@@ -547,7 +598,7 @@ const cleanupStartedChild = (
   );
 
 const steerSubagent = Effect.fn("SubagentToolkit.steer")(function* (input: SteerSubagentInput) {
-  const invocation = yield* requireInvocation;
+  const invocation = yield* requireProviderInvocation;
   const runtime = yield* requireRuntime();
   const coordinator = yield* requireCoordinator();
 
@@ -624,8 +675,9 @@ const steerSubagent = Effect.fn("SubagentToolkit.steer")(function* (input: Steer
 });
 
 const checkSubagent = Effect.fn("SubagentToolkit.check")(function* (input: CheckSubagentInput) {
-  yield* requireInvocation;
+  const invocation = yield* requireSubagentCapability("subagent:check");
   const runtime = yield* requireRuntime();
+  yield* requirePeerChildAccess(invocation, [input.childThreadId]);
 
   const detail = yield* loadThreadDetail(runtime, input.childThreadId).pipe(
     Effect.flatMap((thread) =>
@@ -658,16 +710,19 @@ const parseWaitStartMs = (resumeToken: string | undefined, nowMs: number): numbe
 };
 
 const waitSubagent = Effect.fn("SubagentToolkit.wait")(function* (input: WaitSubagentInput) {
-  const invocation = yield* requireInvocation;
+  const invocation = yield* requireSubagentCapability("subagent:wait");
   const runtime = yield* requireRuntime();
   const coordinator = yield* requireCoordinator();
   const childThreadIds = Array.from(new Set(input.childThreadIds));
 
-  yield* Effect.forEach(
-    childThreadIds,
-    (childThreadId) => coordinator.assertParent(invocation.threadId, childThreadId),
-    { discard: true },
-  );
+  yield* requirePeerChildAccess(invocation, childThreadIds);
+  if (McpInvocationContext.isProviderInvocationScope(invocation)) {
+    yield* Effect.forEach(
+      childThreadIds,
+      (childThreadId) => coordinator.assertParent(invocation.threadId, childThreadId),
+      { discard: true },
+    );
+  }
 
   const budgetSeconds = clamp(
     input.timeoutSeconds ?? WAIT_TIMEOUT_DEFAULT_SECONDS,
@@ -885,11 +940,16 @@ const waitSubagent = Effect.fn("SubagentToolkit.wait")(function* (input: WaitSub
 });
 
 const listSubagents = Effect.fn("SubagentToolkit.list")(function* (input: ListSubagentsInput) {
-  const invocation = yield* requireInvocation;
+  const invocation = yield* requireSubagentCapability("subagent:list");
   const runtime = yield* requireRuntime();
   const coordinator = yield* requireCoordinator();
 
-  const parentThreadId = input.parentThreadId ?? invocation.threadId;
+  const parentThreadId =
+    input.parentThreadId ??
+    (McpInvocationContext.isProviderInvocationScope(invocation)
+      ? invocation.threadId
+      : yield* fail("parentThreadId is required when listing with a peer-scoped credential."));
+  yield* requirePeerParentAccess(invocation, parentThreadId);
   const registered = yield* coordinator.listChildren(parentThreadId);
 
   const children = yield* Effect.forEach(registered, (entry) =>
@@ -958,7 +1018,7 @@ const computeNextRunIso = (
 const scheduleCreate = Effect.fn("SubagentToolkit.scheduleCreate")(function* (
   input: ScheduleCreateInput,
 ) {
-  const invocation = yield* requireInvocation;
+  const invocation = yield* requireProviderInvocation;
   const runtime = yield* requireRuntime();
 
   const threadId = input.threadId ?? invocation.threadId;
@@ -1030,7 +1090,7 @@ const scheduleCreate = Effect.fn("SubagentToolkit.scheduleCreate")(function* (
 const scheduleList = Effect.fn("SubagentToolkit.scheduleList")(function* (
   input: ScheduleListInput,
 ) {
-  yield* requireInvocation;
+  yield* requireProviderInvocation;
   const runtime = yield* requireRuntime();
 
   const tasks = yield* (
@@ -1059,7 +1119,7 @@ const loadTaskById = (
 const scheduleUpdate = Effect.fn("SubagentToolkit.scheduleUpdate")(function* (
   input: ScheduleUpdateInput,
 ) {
-  yield* requireInvocation;
+  yield* requireProviderInvocation;
   const runtime = yield* requireRuntime();
 
   const existing = yield* loadTaskById(runtime, input.taskId);
@@ -1148,7 +1208,7 @@ const scheduleUpdate = Effect.fn("SubagentToolkit.scheduleUpdate")(function* (
 const scheduleDelete = Effect.fn("SubagentToolkit.scheduleDelete")(function* (
   input: ScheduleDeleteInput,
 ) {
-  yield* requireInvocation;
+  yield* requireProviderInvocation;
   const runtime = yield* requireRuntime();
 
   yield* runtime.scheduledTasks

@@ -4,6 +4,7 @@ import * as Layer from "effect/Layer";
 
 import { ProjectionSnapshotQuery } from "../../../orchestration/Services/ProjectionSnapshotQuery.ts";
 import { ProviderRegistry } from "../../../provider/Services/ProviderRegistry.ts";
+import * as McpInvocationContext from "../../McpInvocationContext.ts";
 import {
   ListBackendsToolError,
   VisibilityToolkit,
@@ -45,6 +46,9 @@ const makeHandlers = Effect.fn("VisibilityToolkit.makeHandlers")(function* () {
 
   const listBackends = () =>
     Effect.gen(function* () {
+      yield* McpInvocationContext.requireProviderMcpCapability("thread-management").pipe(
+        Effect.mapError(toToolError),
+      );
       const [providers, shellSnapshot] = yield* Effect.all(
         [providerRegistry.getProviders, projectionSnapshotQuery.getShellSnapshot()],
         { concurrency: "unbounded" },
