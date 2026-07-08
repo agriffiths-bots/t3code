@@ -10,7 +10,8 @@ import * as Effect from "effect/Effect";
 import * as McpInvocationContext from "./McpInvocationContext.ts";
 
 it.effect("reports the scoped credential context when preview capability is unavailable", () => {
-  const invocation: McpInvocationContext.McpInvocationScope = {
+  const invocation: McpInvocationContext.ProviderMcpInvocationScope = {
+    credentialKind: "provider-session",
     environmentId: EnvironmentId.make("environment-1"),
     threadId: ThreadId.make("thread-1"),
     providerSessionId: "provider-session-1",
@@ -33,6 +34,32 @@ it.effect("reports the scoped credential context when preview capability is unav
       threadId: invocation.threadId,
       providerSessionId: invocation.providerSessionId,
       providerInstanceId: invocation.providerInstanceId,
+    });
+    expect(error.message).toBe("MCP credential does not grant the preview capability.");
+  });
+});
+
+it.effect("reports generic capability denial for peer-scoped credentials", () => {
+  const invocation: McpInvocationContext.PeerMcpInvocationScope = {
+    credentialKind: "peer",
+    environmentId: EnvironmentId.make("environment-1"),
+    peerTokenId: "peer-token-1",
+    capabilities: new Set(["subagent:spawn"]),
+    issuedAt: 1,
+    expiresAt: null,
+  };
+
+  return Effect.gen(function* () {
+    const error = yield* McpInvocationContext.requireMcpCapability("preview").pipe(
+      Effect.provideService(McpInvocationContext.McpInvocationContext, invocation),
+      Effect.flip,
+    );
+
+    expect(error).toBeInstanceOf(McpInvocationContext.McpCapabilityUnavailableError);
+    expect(error).toMatchObject({
+      capability: "preview",
+      environmentId: invocation.environmentId,
+      credentialKind: "peer",
     });
     expect(error.message).toBe("MCP credential does not grant the preview capability.");
   });

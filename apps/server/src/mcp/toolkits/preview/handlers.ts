@@ -15,7 +15,12 @@ import type {
 
 import * as McpInvocationContext from "../../McpInvocationContext.ts";
 import * as PreviewAutomationBroker from "../../PreviewAutomationBroker.ts";
-import { PreviewSnapshotToolkit, PreviewStandardToolkit, PreviewToolkit } from "./tools.ts";
+import {
+  PreviewSnapshotToolkit,
+  PreviewStandardToolkit,
+  PreviewToolkit,
+  type PreviewToolError,
+} from "./tools.ts";
 
 const invoke = Effect.fn("PreviewToolkit.invoke")(function* <A>(
   operation: PreviewAutomationOperation,
@@ -24,10 +29,10 @@ const invoke = Effect.fn("PreviewToolkit.invoke")(function* <A>(
   tabId?: PreviewTabId,
 ): Effect.fn.Return<
   A,
-  import("@t3tools/contracts").PreviewAutomationError,
+  PreviewToolError,
   McpInvocationContext.McpInvocationContext | PreviewAutomationBroker.PreviewAutomationBroker
 > {
-  const scope = yield* McpInvocationContext.requireMcpCapability("preview");
+  const scope = yield* McpInvocationContext.requireProviderMcpCapability("preview");
   const broker = yield* PreviewAutomationBroker.PreviewAutomationBroker;
   return yield* broker.invoke<A>({
     scope,

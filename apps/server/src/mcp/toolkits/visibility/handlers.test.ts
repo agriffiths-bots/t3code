@@ -1,8 +1,10 @@
 import { expect, it } from "@effect/vitest";
 import {
+  EnvironmentId,
   ProjectId,
   ProviderDriverKind,
   ProviderInstanceId,
+  ThreadId,
   type OrchestrationProjectShell,
   type ServerProvider,
 } from "@t3tools/contracts";
@@ -14,6 +16,7 @@ import { McpSchema, McpServer } from "effect/unstable/ai";
 import { ProjectionSnapshotQuery } from "../../../orchestration/Services/ProjectionSnapshotQuery.ts";
 import { ProviderRegistry } from "../../../provider/Services/ProviderRegistry.ts";
 import { makeProviderRegistryMock } from "../../../provider/testUtils/providerRegistryMock.ts";
+import * as McpInvocationContext from "../../McpInvocationContext.ts";
 import { VisibilityToolkitRegistrationLive } from "../../McpHttpServer.ts";
 
 const client = McpSchema.McpServerClient.of({
@@ -27,6 +30,25 @@ const client = McpSchema.McpServerClient.of({
 });
 
 const timestamp = "2026-07-07T00:00:00.000Z";
+const invocation: McpInvocationContext.ProviderMcpInvocationScope = {
+  credentialKind: "provider-session",
+  environmentId: EnvironmentId.make("environment-visibility-test"),
+  threadId: ThreadId.make("thread-visibility-test"),
+  providerSessionId: "provider-session-visibility-test",
+  providerInstanceId: ProviderInstanceId.make("codex"),
+  capabilities: new Set(["thread-management"]),
+  issuedAt: 1,
+  expiresAt: Number.MAX_SAFE_INTEGER,
+};
+
+const peerInvocation: McpInvocationContext.PeerMcpInvocationScope = {
+  credentialKind: "peer",
+  environmentId: EnvironmentId.make("environment-visibility-test"),
+  peerTokenId: "peer-visibility-test",
+  capabilities: new Set(["subagent:list"]),
+  issuedAt: 1,
+  expiresAt: null,
+};
 
 const makeProvider = (input: {
   readonly instanceId: string;
@@ -114,15 +136,21 @@ const makeLayer = (input: {
     ),
   );
 
-const callListBackends = (input: {
-  readonly providers: ReadonlyArray<ServerProvider>;
-  readonly projects: ReadonlyArray<OrchestrationProjectShell>;
-}) =>
+const callListBackends = (
+  input: {
+    readonly providers: ReadonlyArray<ServerProvider>;
+    readonly projects: ReadonlyArray<OrchestrationProjectShell>;
+  },
+  scope: McpInvocationContext.McpInvocationScope = invocation,
+) =>
   Effect.gen(function* () {
     const server = yield* McpServer.McpServer;
     return yield* server
       .callTool({ name: "t3_list_backends", arguments: {} })
-      .pipe(Effect.provideService(McpSchema.McpServerClient, client));
+      .pipe(
+        Effect.provideService(McpInvocationContext.McpInvocationContext, scope),
+        Effect.provideService(McpSchema.McpServerClient, client),
+      );
   }).pipe(Effect.provide(makeLayer(input)));
 
 it.effect("lists configured backends with exact instance ids and grouped projects", () =>
@@ -243,5 +271,25 @@ it.effect("surfaces unassigned projects and projects that reference missing back
         },
       ],
     });
+  }),
+);
+
+it.effect("rejects peer-scoped credentials", () =>
+  Effect.gen(function* () {
+    const result = yield* callListBackends(
+      {
+        providers: [],
+        projects: [],
+      },
+      peerInvocation,
+    );
+
+    expect(result.isError).toBe(true);
+    const content = result.content?.[0];
+    expect(content?.type).toBe("text");
+    if (content?.type !== "text") throw new Error("Expected text error content.");
+    expect(content.text).toContain(
+      "MCP credential does not grant the thread-management capability",
+    );
   }),
 );

@@ -78,7 +78,8 @@ const project: OrchestrationProjectShell = {
   createdAt: "2026-06-16T00:00:00.000Z",
   updatedAt: "2026-06-16T00:00:00.000Z",
 };
-const invocation: McpInvocationContext.McpInvocationScope = {
+const invocation: McpInvocationContext.ProviderMcpInvocationScope = {
+  credentialKind: "provider-session",
   environmentId: EnvironmentId.make("environment-thread-mcp"),
   threadId: sourceThreadId,
   providerSessionId: "provider-session-thread-mcp",

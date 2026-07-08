@@ -94,7 +94,7 @@ interface SourceCwdProjectContext {
 
 export type ActiveThreadStartRuntime = (
   input: ThreadStartToolInput,
-  invocation: McpInvocationContext.McpInvocationScope,
+  invocation: McpInvocationContext.ProviderMcpInvocationScope,
   options?: {
     readonly providerSessionDetached?: boolean;
   },
@@ -430,7 +430,7 @@ const makeActiveThreadStartRuntime = Effect.fn("ThreadToolkit.makeActiveRuntime"
   });
 
   const loadSourceContext = Effect.fn("ThreadToolkit.loadSourceContext")(function* (
-    invocation: McpInvocationContext.McpInvocationScope,
+    invocation: McpInvocationContext.ProviderMcpInvocationScope,
   ) {
     const sourceThread = yield* projectionSnapshotQuery
       .getThreadShellById(invocation.threadId)
@@ -460,7 +460,7 @@ const makeActiveThreadStartRuntime = Effect.fn("ThreadToolkit.makeActiveRuntime"
 
   return Effect.fn("ThreadToolkit.startThread")(function* (
     input: ThreadStartToolInput,
-    invocation: McpInvocationContext.McpInvocationScope,
+    invocation: McpInvocationContext.ProviderMcpInvocationScope,
     options?: {
       readonly providerSessionDetached?: boolean;
     },
@@ -738,9 +738,9 @@ const resolveModelSelection = (
 };
 
 const startThread = Effect.fn("ThreadToolkit.startThread")(function* (input: ThreadStartToolInput) {
-  const invocation = yield* McpInvocationContext.requireMcpCapability("thread-management").pipe(
-    Effect.mapError((error) => fail(error.message)),
-  );
+  const invocation = yield* McpInvocationContext.requireProviderMcpCapability(
+    "thread-management",
+  ).pipe(Effect.mapError((error) => fail(error.message)));
   const runtime = activeThreadStartRuntime;
   if (!runtime) return yield* fail("Thread start runtime is not available.");
   return yield* runtime(input, invocation);

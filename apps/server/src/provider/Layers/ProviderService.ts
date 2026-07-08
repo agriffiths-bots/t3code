@@ -1939,7 +1939,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
       ),
     ).pipe(Effect.asVoid);
     yield* Effect.forEach(currentAdapters, ([, adapter]) => adapter.stopAll()).pipe(Effect.asVoid);
-    yield* McpSessionRegistry.revokeAllActiveMcpCredentials();
+    yield* McpSessionRegistry.revokeAllActiveMcpProviderCredentials();
     McpProviderSession.clearAllMcpProviderSessions();
     yield* Ref.set(trackedMcpSessions, new Map());
     const bindings = yield* directory.listBindings().pipe(Effect.orElseSucceed(() => []));

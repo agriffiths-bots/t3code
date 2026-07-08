@@ -14,11 +14,11 @@ const fail = (message: string) => new ThreadStartToolError({ message });
 const toToolError = (error: unknown, fallback: string): ThreadStartToolError =>
   isThreadStartToolError(error) ? error : fail(error instanceof Error ? error.message : fallback);
 
-const requireInvocation = McpInvocationContext.requireMcpCapability("notification").pipe(
+const requireInvocation = McpInvocationContext.requireProviderMcpCapability("notification").pipe(
   Effect.mapError((error) => fail(error.message)),
 );
 
-function threadDeepLink(invocation: McpInvocationContext.McpInvocationScope): string {
+function threadDeepLink(invocation: McpInvocationContext.ProviderMcpInvocationScope): string {
   return `/${encodeURIComponent(invocation.environmentId)}/${encodeURIComponent(
     invocation.threadId,
   )}`;

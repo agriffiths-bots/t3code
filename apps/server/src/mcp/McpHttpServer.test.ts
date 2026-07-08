@@ -23,6 +23,7 @@ const threadId = ThreadId.make("thread-mcp-test");
 const tabId = PreviewTabId.make("tab-mcp-test");
 const alternateTabId = PreviewTabId.make("tab-mcp-alternate");
 const invocation = {
+  credentialKind: "provider-session" as const,
   environmentId,
   threadId,
   providerSessionId: "provider-session-mcp-test",
@@ -30,6 +31,14 @@ const invocation = {
   capabilities: new Set(["preview"] as const),
   issuedAt: 1,
   expiresAt: Number.MAX_SAFE_INTEGER,
+};
+const peerInvocation: McpInvocationContext.PeerMcpInvocationScope = {
+  credentialKind: "peer",
+  environmentId,
+  peerTokenId: "peer-mcp-test",
+  capabilities: new Set(["subagent:check"]),
+  issuedAt: 1,
+  expiresAt: null,
 };
 const client = McpSchema.McpServerClient.of({
   clientId: 1,
@@ -175,6 +184,25 @@ it.effect("reports missing preview automation host as unavailable status", () =>
     expect((open.structuredContent as { readonly recovery?: unknown }).recovery).toContain(
       "Open or reload T3 Code Desktop",
     );
+  }).pipe(Effect.provide(TestLayer)),
+);
+
+it.effect("reports peer preview authorization failures as tool errors", () =>
+  Effect.gen(function* () {
+    const server = yield* McpServer.McpServer;
+
+    const status = yield* server
+      .callTool({ name: "preview_status", arguments: {} })
+      .pipe(
+        Effect.provideService(McpInvocationContext.McpInvocationContext, peerInvocation),
+        Effect.provideService(McpSchema.McpServerClient, client),
+      );
+
+    expect(status.isError).toBe(true);
+    const content = status.content?.[0];
+    expect(content?.type).toBe("text");
+    if (content?.type !== "text") throw new Error("Expected text error content.");
+    expect(content.text).toContain("MCP credential does not grant the preview capability");
   }).pipe(Effect.provide(TestLayer)),
 );
 

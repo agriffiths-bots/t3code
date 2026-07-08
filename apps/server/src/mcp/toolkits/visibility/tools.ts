@@ -11,8 +11,13 @@ import { Tool, Toolkit } from "effect/unstable/ai";
 
 import { ProjectionSnapshotQuery } from "../../../orchestration/Services/ProjectionSnapshotQuery.ts";
 import { ProviderRegistry } from "../../../provider/Services/ProviderRegistry.ts";
+import * as McpInvocationContext from "../../McpInvocationContext.ts";
 
-const dependencies = [ProviderRegistry, ProjectionSnapshotQuery];
+const dependencies = [
+  ProviderRegistry,
+  ProjectionSnapshotQuery,
+  McpInvocationContext.McpInvocationContext,
+];
 
 // This tool takes no arguments. `Schema.Struct({})` must NOT be used here: its
 // JSON Schema emits `anyOf: [{type:"object"},{type:"array"}]` with no top-level
