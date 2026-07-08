@@ -3,7 +3,10 @@ import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
 import { describe, expect, it } from "vite-plus/test";
 
-import afterPack, { PACKAGED_INTEGRITY_MANIFEST_FILE_NAME } from "./desktop-after-pack-prune.mjs";
+import afterPack, {
+  createPackagedIntegrityManifest,
+  PACKAGED_INTEGRITY_MANIFEST_FILE_NAME,
+} from "./desktop-after-pack-prune.mjs";
 
 async function touch(path) {
   await NodeFSP.mkdir(NodePath.dirname(path), { recursive: true });
@@ -122,5 +125,18 @@ describe("desktop-after-pack-prune", () => {
     expect(manifest.requiredFiles).not.toContain(
       "node_modules/@ff-labs/fff-bin-linux-x64-musl/libfff_c.so",
     );
+  });
+
+  it("breaks directory symlink cycles while collecting manifest entries", async () => {
+    const tempDir = await NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "desktop-prune-cycle-"));
+    const root = NodePath.join(tempDir, "resources", "app.asar.unpacked");
+    const packageRoot = NodePath.join(root, "node_modules", "cycle-package");
+    await touch(NodePath.join(packageRoot, "package.json"));
+    await NodeFSP.symlink(packageRoot, NodePath.join(packageRoot, "loop"), "dir");
+
+    const manifest = await createPackagedIntegrityManifest(root);
+
+    expect(manifest.requiredFiles).toContain("node_modules/cycle-package/package.json");
+    expect(manifest.requiredFiles.some((file) => file.includes("/loop/loop/"))).toBe(false);
   });
 });

@@ -92,35 +92,38 @@ function toPosixPath(path) {
 }
 
 async function collectRelativeFiles(input) {
-  const { root, current, logicalRoot, files, visited } = input;
+  const { root, current, logicalRoot, files, activeDirectories } = input;
   const realCurrent = await NodeFSP.realpath(current).catch(() => current);
-  const visitedKey = `${realCurrent}\0${logicalRoot}`;
-  if (visited.has(visitedKey)) {
+  if (activeDirectories.has(realCurrent)) {
     return;
   }
-  visited.add(visitedKey);
+  activeDirectories.add(realCurrent);
 
-  for (const entry of await listEntries(current)) {
-    const entryPath = NodePath.join(current, entry.name);
-    const logicalPath = logicalRoot ? `${logicalRoot}/${entry.name}` : entry.name;
-    const targetStat = entry.isSymbolicLink()
-      ? await NodeFSP.stat(entryPath).catch(() => null)
-      : null;
+  try {
+    for (const entry of await listEntries(current)) {
+      const entryPath = NodePath.join(current, entry.name);
+      const logicalPath = logicalRoot ? `${logicalRoot}/${entry.name}` : entry.name;
+      const targetStat = entry.isSymbolicLink()
+        ? await NodeFSP.stat(entryPath).catch(() => null)
+        : null;
 
-    if (entry.isDirectory() || targetStat?.isDirectory()) {
-      await collectRelativeFiles({
-        root,
-        current: entryPath,
-        logicalRoot: logicalPath,
-        files,
-        visited,
-      });
-      continue;
+      if (entry.isDirectory() || targetStat?.isDirectory()) {
+        await collectRelativeFiles({
+          root,
+          current: entryPath,
+          logicalRoot: logicalPath,
+          files,
+          activeDirectories,
+        });
+        continue;
+      }
+
+      if (entry.isFile() || targetStat?.isFile()) {
+        files.add(toPosixPath(NodePath.relative(root, entryPath)));
+      }
     }
-
-    if (entry.isFile() || targetStat?.isFile()) {
-      files.add(toPosixPath(NodePath.relative(root, entryPath)));
-    }
+  } finally {
+    activeDirectories.delete(realCurrent);
   }
 }
 
@@ -131,7 +134,7 @@ export async function createPackagedIntegrityManifest(unpackedRoot) {
     current: unpackedRoot,
     logicalRoot: "",
     files: requiredFiles,
-    visited: new Set(),
+    activeDirectories: new Set(),
   });
 
   return {

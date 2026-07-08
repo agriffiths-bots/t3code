@@ -388,7 +388,113 @@ async function launchInstalledApp(executablePath, env, timeoutMs) {
   return app;
 }
 
-function terminateInstalledExecutable(executablePath) {
+function resolveRealPath(path) {
+  try {
+    return NodeFS.realpathSync.native(path);
+  } catch {
+    try {
+      return NodeFS.realpathSync(path);
+    } catch {
+      return NodePath.resolve(path);
+    }
+  }
+}
+
+function escapeRegexLiteral(value) {
+  return value.replace(/[\\^$.*+?()[\]{}|]/g, "\\$&");
+}
+
+export function buildPosixExecutablePattern(executablePath) {
+  return `^${escapeRegexLiteral(resolveRealPath(executablePath))}([[:space:]]|$)`;
+}
+
+export function listLinuxSmokeProcessIds(input) {
+  const procRoot = input.procRoot ?? "/proc";
+  const processIds = [];
+  let entries;
+  try {
+    entries = NodeFS.readdirSync(procRoot, { withFileTypes: true });
+  } catch {
+    return processIds;
+  }
+
+  const requiredHomeEntry = `T3CODE_HOME=${input.t3Home}\0`;
+  for (const entry of entries) {
+    if (!entry.isDirectory() || !/^\d+$/.test(entry.name)) {
+      continue;
+    }
+    const pid = Number.parseInt(entry.name, 10);
+    if (!Number.isInteger(pid) || pid === process.pid) {
+      continue;
+    }
+    let environ;
+    try {
+      environ = NodeFS.readFileSync(NodePath.join(procRoot, entry.name, "environ"), "utf8");
+    } catch {
+      continue;
+    }
+    if (
+      environ.includes(requiredHomeEntry) &&
+      environ.includes("T3CODE_DESKTOP_MOCK_UPDATES=1\0")
+    ) {
+      processIds.push(pid);
+    }
+  }
+  return processIds;
+}
+
+function processExists(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function sleepSync(ms) {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+function terminateProcessIds(processIds) {
+  for (const pid of processIds) {
+    try {
+      process.kill(pid, "SIGTERM");
+    } catch {
+      // Ignore processes that already exited.
+    }
+  }
+  if (processIds.length > 0) {
+    sleepSync(1_000);
+  }
+  for (const pid of processIds) {
+    if (!processExists(pid)) {
+      continue;
+    }
+    try {
+      process.kill(pid, "SIGKILL");
+    } catch {
+      // Ignore processes that exited between the liveness probe and SIGKILL.
+    }
+  }
+}
+
+function terminatePosixInstalledExecutable(executablePath, options) {
+  if (hostPlatform === "linux" && options.t3Home) {
+    terminateProcessIds(listLinuxSmokeProcessIds({ t3Home: options.t3Home }));
+  }
+
+  const pattern = buildPosixExecutablePattern(executablePath);
+  NodeChildProcess.spawnSync("pkill", ["-TERM", "-f", pattern], {
+    stdio: "ignore",
+  });
+  sleepSync(1_000);
+  NodeChildProcess.spawnSync("pkill", ["-KILL", "-f", pattern], {
+    stdio: "ignore",
+  });
+}
+
+function terminateInstalledExecutable(executablePath, options = {}) {
   if (hostPlatform === "win32") {
     const script = [
       "$ErrorActionPreference = 'SilentlyContinue'",
@@ -405,6 +511,11 @@ function terminateInstalledExecutable(executablePath) {
       stdio: "ignore",
       windowsHide: true,
     });
+    return;
+  }
+
+  if (hostPlatform === "darwin" || hostPlatform === "linux") {
+    terminatePosixInstalledExecutable(executablePath, options);
   }
 }
 
@@ -552,7 +663,7 @@ async function main() {
     if (electronApp) {
       await electronApp.close().catch(() => undefined);
     }
-    terminateInstalledExecutable(options.command);
+    terminateInstalledExecutable(options.command, { t3Home });
     await updateServer.stop();
   }
 }
