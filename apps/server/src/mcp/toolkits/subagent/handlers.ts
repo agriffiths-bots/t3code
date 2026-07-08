@@ -250,6 +250,18 @@ const waitTerminalStatusOf = (
   return "failed";
 };
 
+const hasNoNewerMessageAfterTerminalTurn = (
+  thread: Pick<OrchestrationThread, "latestTurn" | "messages">,
+): boolean => {
+  const latestTurn = thread.latestTurn;
+  if (latestTurn === null) return false;
+  const terminalAt = latestTurn.completedAt ?? latestTurn.startedAt ?? latestTurn.requestedAt;
+  return !thread.messages.some(
+    (message) =>
+      !message.streaming && message.turnId !== latestTurn.turnId && message.createdAt > terminalAt,
+  );
+};
+
 const reliableWaitTerminalStatusOf = (
   thread: Pick<OrchestrationThread, "latestTurn" | "messages" | "session">,
 ): "completed" | "failed" | null => {
@@ -257,17 +269,11 @@ const reliableWaitTerminalStatusOf = (
   if (projectedStatus === null) return null;
   const session = thread.session;
   if (session?.status === "error") return projectedStatus;
+  if (session === null) {
+    return hasNoNewerMessageAfterTerminalTurn(thread) ? projectedStatus : null;
+  }
   if (session?.status === "stopped" || session?.status === "idle" || session?.status === "ready") {
-    const latestTurn = thread.latestTurn;
-    if (latestTurn === null) return null;
-    const terminalAt = latestTurn.completedAt ?? latestTurn.startedAt ?? latestTurn.requestedAt;
-    const hasNewerMessage = thread.messages.some(
-      (message) =>
-        !message.streaming &&
-        message.turnId !== latestTurn.turnId &&
-        message.createdAt > terminalAt,
-    );
-    return hasNewerMessage ? null : projectedStatus;
+    return hasNoNewerMessageAfterTerminalTurn(thread) ? projectedStatus : null;
   }
   if (session?.activeTurnId != null && thread.latestTurn?.turnId === session.activeTurnId) {
     return projectedStatus;
@@ -922,7 +928,11 @@ const waitSubagent = Effect.fn("SubagentToolkit.wait")(function* (input: WaitSub
     );
 
     if (waitDeliveredRows.length > 0) {
-      yield* coordinator.markWaitDelivered(waitDeliveredRows);
+      if (McpInvocationContext.isProviderInvocationScope(invocation)) {
+        yield* coordinator.markWaitDelivered(waitDeliveredRows);
+      } else {
+        yield* coordinator.abandonWaitDelivery(waitDeliveredRows.map((row) => row.childThreadId));
+      }
       terminalWaitChildIds.clear();
     }
 

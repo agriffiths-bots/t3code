@@ -173,6 +173,7 @@ const make = Effect.gen(function* () {
   const byParent = new Map<ThreadId, Set<ThreadId>>();
   const pendingInjections = new Map<ThreadId, Array<PendingInjection>>();
   const pendingDrainRetryParents = new Set<ThreadId>();
+  const pendingIdleDrainRetryParents = new Set<ThreadId>();
   const parentWakeLocks = new Map<ThreadId, Semaphore.Semaphore>();
   // Children promoted to wake-on-completion (R-A): a waited child whose waiter
   // stopped, so its completion must wake the parent like a detached child.
@@ -1051,7 +1052,7 @@ const make = Effect.gen(function* () {
 
   // Drain pending injections for a parent that just completed a turn (or whose
   // oldest entry has aged past PENDING_MAX_AGE_MS). One consolidated turn.
-  const drainPending = (parentThreadId: ThreadId) =>
+  const drainPending = (parentThreadId: ThreadId, options?: { readonly requireIdle?: boolean }) =>
     Effect.gen(function* () {
       const lock = yield* wakeLockFor(parentThreadId);
       yield* lock.withPermits(1)(
@@ -1059,11 +1060,16 @@ const make = Effect.gen(function* () {
           const queue = pendingInjections.get(parentThreadId);
           if (!queue || queue.length === 0) {
             pendingDrainRetryParents.delete(parentThreadId);
+            pendingIdleDrainRetryParents.delete(parentThreadId);
             return;
           }
           const shellRead = yield* getThreadShellForDrain(parentThreadId);
           if (Option.isNone(shellRead)) {
-            pendingDrainRetryParents.add(parentThreadId);
+            if (options?.requireIdle === true) {
+              pendingIdleDrainRetryParents.add(parentThreadId);
+            } else {
+              pendingDrainRetryParents.add(parentThreadId);
+            }
             yield* Effect.logWarning(
               "parent shell read timed out while draining pending injections",
               {
@@ -1101,6 +1107,7 @@ const make = Effect.gen(function* () {
             entry.deliveredByWait || waitDeliveredPromotedChildren.has(entry.childThreadId);
           const deliveredByWaitEntries = queue.filter((entry) => isDeliveredByWait(entry));
           const idle = isThreadIdle(shell);
+          if (options?.requireIdle === true && !idle) return;
           const prunedDeliveredByWaitEntries = idle
             ? deliveredByWaitEntries.filter((entry) =>
                 parentCompletedAfterWaitDelivery(shell, entry.childThreadId),
@@ -1177,6 +1184,9 @@ const make = Effect.gen(function* () {
       );
     });
 
+  const drainPendingWhenParentIdle = (parentThreadId: ThreadId) =>
+    drainPending(parentThreadId, { requireIdle: true });
+
   // Safety valve: flush any parent whose oldest pending entry has aged out, even
   // if that parent never completes another turn.
   const drainAgedPending = Effect.gen(function* () {
@@ -1187,13 +1197,20 @@ const make = Effect.gen(function* () {
         parents.push(parentThreadId);
       }
     }
-    yield* Effect.forEach(parents, drainPending, { discard: true });
+    yield* Effect.forEach(parents, (parentThreadId) => drainPending(parentThreadId), {
+      discard: true,
+    });
   });
 
   const drainRetriedPending = Effect.gen(function* () {
     const parents = Array.from(pendingDrainRetryParents);
+    const idleParents = Array.from(pendingIdleDrainRetryParents);
     pendingDrainRetryParents.clear();
-    yield* Effect.forEach(parents, drainPending, { discard: true });
+    pendingIdleDrainRetryParents.clear();
+    yield* Effect.forEach(parents, (parentThreadId) => drainPending(parentThreadId), {
+      discard: true,
+    });
+    yield* Effect.forEach(idleParents, drainPendingWhenParentIdle, { discard: true });
   });
 
   const childSteerLockFor = (childThreadId: ThreadId): Effect.Effect<Semaphore.Semaphore> => {
@@ -1638,7 +1655,7 @@ const make = Effect.gen(function* () {
           return !hasActivePromotedWait(childThreadId);
         }).pipe(
           Effect.flatMap((shouldDrain) =>
-            shouldDrain ? drainPending(record.parentThreadId) : Effect.void,
+            shouldDrain ? drainPendingWhenParentIdle(record.parentThreadId) : Effect.void,
           ),
         );
       },
@@ -2185,7 +2202,7 @@ const make = Effect.gen(function* () {
       // idle / next turn-completion / age valve as usual). Dedup by dispatchId
       // against any entry wakeParent already enqueued during reconciliation above.
       const reloadNow = yield* nowMillis;
-      const parentsWithWaitDeliveredRows = new Set<ThreadId>();
+      const parentsWithRestartDrainRows = new Set<ThreadId>();
       for (const row of persisted) {
         if (row.kind !== "parent_injection") continue;
         const createdAtMs = Date.parse(String(row.createdAt));
@@ -2193,8 +2210,8 @@ const make = Effect.gen(function* () {
         const deliveredByWait =
           row.deliveredByWait ||
           (row.sourceChildId !== null && waitDeliveredChildIds.has(row.sourceChildId));
-        if (deliveredByWait) {
-          parentsWithWaitDeliveredRows.add(parentThreadId);
+        if (deliveredByWait || row.waitCancellable) {
+          parentsWithRestartDrainRows.add(parentThreadId);
         }
         const queue = pendingInjections.get(parentThreadId) ?? [];
         if (queue.some((entry) => entry.dispatchId === row.id)) continue;
@@ -2223,7 +2240,9 @@ const make = Effect.gen(function* () {
       );
       yield* Effect.yieldNow;
 
-      yield* Effect.forEach(parentsWithWaitDeliveredRows, drainPending, { discard: true });
+      yield* Effect.forEach(parentsWithRestartDrainRows, drainPendingWhenParentIdle, {
+        discard: true,
+      });
 
       yield* Effect.forever(
         drainRetriedPending.pipe(

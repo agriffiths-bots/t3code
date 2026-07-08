@@ -106,6 +106,11 @@ const entitledPeerInvocation: McpInvocationContext.PeerMcpInvocationScope = {
   allowedParentThreadIds: new Set([parentThreadId]),
   allowedChildThreadIds: new Set([childThreadId]),
 };
+const childOnlyPeerInvocation: McpInvocationContext.PeerMcpInvocationScope = {
+  ...peerInvocation,
+  peerTokenId: "peer-subagent-child-only-test",
+  allowedChildThreadIds: new Set([childThreadId]),
+};
 
 const client = McpSchema.McpServerClient.of({
   clientId: 1,
@@ -1626,7 +1631,7 @@ describe("SubagentToolkit", () => {
       ).pipe(Effect.provide(TestLayer)),
   );
 
-  it.effect("R-A: wait keeps ambiguous projection-terminal children on the promoted path", () =>
+  it.effect("R-A: wait accepts sessionless projection-terminal children", () =>
     Effect.scoped(
       Effect.gen(function* () {
         const server = yield* McpServer.McpServer;
@@ -1663,21 +1668,155 @@ describe("SubagentToolkit", () => {
 
         expect(result.isError).toBe(false);
         expect(result.structuredContent).toMatchObject({
-          promoted: true,
           pending: false,
-          settledCount: 0,
+          settledCount: 1,
           timedOutCount: 0,
           results: [
             {
               childThreadId,
-              status: "running",
-              finalAssistantText: null,
+              status: "completed",
+              finalAssistantText: "child done",
               error: null,
             },
           ],
         });
+        expect(result.structuredContent).not.toHaveProperty("promoted");
+        expect(promotedCalls).toEqual([]);
+        expect(markWaitDeliveredCalls).toEqual([
+          [
+            {
+              childThreadId,
+              status: "completed",
+              finalAssistantText: "child done",
+              error: null,
+            },
+          ],
+        ]);
+      }),
+    ).pipe(Effect.provide(TestLayer)),
+  );
+
+  it.effect("R-A: wait rejects stale sessionless projection-terminal children", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const server = yield* McpServer.McpServer;
+        promotedCalls.length = 0;
+        markWaitDeliveredCalls.length = 0;
+        childDetailTurnState = "completed";
+        childDetailMessages = [
+          {
+            id: "msg-1" as never,
+            role: "assistant",
+            text: "old child result",
+            turnId: "turn-1" as never,
+            streaming: false,
+            createdAt: "2026-06-17T10:01:00.000Z",
+            updatedAt: "2026-06-17T10:01:00.000Z",
+          },
+          {
+            id: "msg-2" as never,
+            role: "user",
+            text: "newer queued child work",
+            turnId: "turn-2" as never,
+            streaming: false,
+            createdAt: "2026-06-17T10:02:00.000Z",
+            updatedAt: "2026-06-17T10:02:00.000Z",
+          },
+        ];
+        waitSliceResult = {
+          results: [
+            {
+              childThreadId,
+              status: "timeout",
+              finalAssistantText: null,
+              error: "wait exceeded budget",
+            },
+          ],
+          settledCount: 0,
+          timedOutCount: 1,
+          pending: false,
+          resumeToken: "coordinator-token",
+        };
+
+        const result = yield* server
+          .callTool({
+            name: "t3_wait_subagent",
+            arguments: {
+              childThreadIds: [childThreadId],
+              resumeToken: "-100000:coordinator-token",
+            },
+          })
+          .pipe(
+            Effect.provideService(McpInvocationContext.McpInvocationContext, invocation),
+            Effect.provideService(McpSchema.McpServerClient, client),
+          );
+
+        expect(result.isError).toBe(false);
+        expect(result.structuredContent).toMatchObject({
+          promoted: true,
+          pending: false,
+          settledCount: 0,
+          timedOutCount: 0,
+          results: [{ childThreadId, status: "running", error: null }],
+        });
         expect(promotedCalls).toEqual([[childThreadId]]);
         expect(markWaitDeliveredCalls).toEqual([]);
+      }),
+    ).pipe(
+      Effect.ensuring(
+        Effect.sync(() => {
+          childDetailMessages = null;
+        }),
+      ),
+      Effect.provide(TestLayer),
+    ),
+  );
+
+  it.effect("R-A: child-only peer waits do not mark the parent wake delivered", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const server = yield* McpServer.McpServer;
+        markWaitDeliveredCalls.length = 0;
+        abandonWaitDeliveryCalls.length = 0;
+        waitSliceResult = {
+          results: [
+            {
+              childThreadId,
+              status: "completed",
+              finalAssistantText: "peer visible result",
+              error: null,
+            },
+          ],
+          settledCount: 1,
+          timedOutCount: 0,
+          pending: false,
+          resumeToken: "coordinator-token",
+        };
+
+        const result = yield* server
+          .callTool({
+            name: "t3_wait_subagent",
+            arguments: {
+              childThreadIds: [childThreadId],
+              resumeToken: "-100000:coordinator-token",
+            },
+          })
+          .pipe(
+            Effect.provideService(
+              McpInvocationContext.McpInvocationContext,
+              childOnlyPeerInvocation,
+            ),
+            Effect.provideService(McpSchema.McpServerClient, client),
+          );
+
+        expect(result.isError).toBe(false);
+        expect(result.structuredContent).toMatchObject({
+          pending: false,
+          settledCount: 1,
+          results: [{ childThreadId, status: "completed", error: null }],
+        });
+        expect(markWaitDeliveredCalls).toEqual([]);
+        expect(abandonWaitDeliveryCalls).toEqual([[childThreadId]]);
       }),
     ).pipe(Effect.provide(TestLayer)),
   );
