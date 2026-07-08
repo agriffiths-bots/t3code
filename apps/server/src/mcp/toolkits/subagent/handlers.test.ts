@@ -216,6 +216,7 @@ let childDriverKind: string | undefined = undefined;
 const promotedCalls: Array<ReadonlyArray<ThreadId>> = [];
 let promoteToWakeDefect: unknown | null = null;
 const markWaitDeliveredCalls: Array<ReadonlyArray<WaitDeliveredMark>> = [];
+const abandonWaitDeliveryCalls: Array<ReadonlyArray<ThreadId>> = [];
 const assertParentCalls: Array<{
   readonly parentThreadId: ThreadId;
   readonly childThreadId: ThreadId;
@@ -394,6 +395,7 @@ const coordinatorLayer = Layer.succeed(ChildThreadCoordinator, {
       ),
     ),
   markWaitDelivered: (marks) => Effect.sync(() => void markWaitDeliveredCalls.push(marks)),
+  abandonWaitDelivery: (ids) => Effect.sync(() => void abandonWaitDeliveryCalls.push(ids)),
   hasPendingInjections: () => Effect.succeed(false),
   listChildren: (parent) =>
     Effect.succeed(
@@ -1454,11 +1456,86 @@ describe("SubagentToolkit", () => {
     ).pipe(Effect.provide(TestLayer)),
   );
 
+  it.effect("R-A: wait accepts current ready/idle projection-terminal children", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const server = yield* McpServer.McpServer;
+        promotedCalls.length = 0;
+        markWaitDeliveredCalls.length = 0;
+        childDetailTurnState = "completed";
+        childDetailSession = {
+          threadId: childThreadId,
+          status: "ready",
+          providerName: "codex",
+          runtimeMode: "full-access",
+          activeTurnId: null,
+          lastError: null,
+          updatedAt: "2026-06-17T10:02:00.000Z",
+        };
+        waitSliceResult = {
+          results: [
+            {
+              childThreadId,
+              status: "timeout",
+              finalAssistantText: null,
+              error: "wait exceeded budget",
+            },
+          ],
+          settledCount: 0,
+          timedOutCount: 1,
+          pending: false,
+          resumeToken: "coordinator-token",
+        };
+
+        const result = yield* server
+          .callTool({
+            name: "t3_wait_subagent",
+            arguments: {
+              childThreadIds: [childThreadId],
+              resumeToken: "-100000:coordinator-token",
+            },
+          })
+          .pipe(
+            Effect.provideService(McpInvocationContext.McpInvocationContext, invocation),
+            Effect.provideService(McpSchema.McpServerClient, client),
+          );
+
+        expect(result.isError).toBe(false);
+        expect(result.structuredContent).toMatchObject({
+          pending: false,
+          settledCount: 1,
+          timedOutCount: 0,
+          results: [{ childThreadId, status: "completed", error: null }],
+        });
+        expect(result.structuredContent).not.toHaveProperty("promoted");
+        expect(promotedCalls).toEqual([]);
+        expect(markWaitDeliveredCalls).toEqual([
+          [
+            {
+              childThreadId,
+              status: "completed",
+              finalAssistantText: "child done",
+              error: null,
+            },
+          ],
+        ]);
+      }),
+    ).pipe(
+      Effect.ensuring(
+        Effect.sync(() => {
+          childDetailSession = null;
+        }),
+      ),
+      Effect.provide(TestLayer),
+    ),
+  );
+
   it.effect("R-A: wait does not mark delivered when final response enrichment fails", () =>
     Effect.scoped(
       Effect.gen(function* () {
         const server = yield* McpServer.McpServer;
         markWaitDeliveredCalls.length = 0;
+        abandonWaitDeliveryCalls.length = 0;
         childDetailCallCount = 0;
         childDetailFailOnCall = 1;
         waitSliceResult = {
@@ -1491,6 +1568,7 @@ describe("SubagentToolkit", () => {
 
         expect(result.isError).toBe(true);
         expect(markWaitDeliveredCalls).toEqual([]);
+        expect(abandonWaitDeliveryCalls).toEqual([[childThreadId]]);
       }),
     ).pipe(
       Effect.ensuring(
@@ -1501,6 +1579,107 @@ describe("SubagentToolkit", () => {
       ),
       Effect.provide(TestLayer),
     ),
+  );
+
+  it.effect("R-A: wait abandons coordinator terminals when earlier enrichment fails", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const server = yield* McpServer.McpServer;
+        const terminalChildId = ThreadId.make("thread-subagent-terminal-before-enrichment");
+        markWaitDeliveredCalls.length = 0;
+        abandonWaitDeliveryCalls.length = 0;
+        childDetailCallCount = 0;
+        childDetailFailOnCall = 1;
+        waitSliceResult = {
+          results: [
+            {
+              childThreadId: terminalChildId,
+              status: "completed",
+              finalAssistantText: "coordinator terminal",
+              error: null,
+            },
+            {
+              childThreadId,
+              status: "pending",
+              finalAssistantText: null,
+              error: null,
+            },
+          ],
+          settledCount: 1,
+          timedOutCount: 0,
+          pending: true,
+          resumeToken: "coordinator-token",
+        };
+
+        const result = yield* server
+          .callTool({
+            name: "t3_wait_subagent",
+            arguments: {
+              childThreadIds: [terminalChildId, childThreadId],
+              resumeToken: "-100000:coordinator-token",
+            },
+          })
+          .pipe(
+            Effect.provideService(McpInvocationContext.McpInvocationContext, invocation),
+            Effect.provideService(McpSchema.McpServerClient, client),
+          );
+
+        expect(result.isError).toBe(true);
+        expect(markWaitDeliveredCalls).toEqual([]);
+        expect(abandonWaitDeliveryCalls).toEqual([[terminalChildId]]);
+      }),
+    ).pipe(
+      Effect.ensuring(
+        Effect.sync(() => {
+          childDetailFailOnCall = null;
+          childDetailCallCount = 0;
+        }),
+      ),
+      Effect.provide(TestLayer),
+    ),
+  );
+
+  it.effect("R-A: wait dedupes duplicate child ids before coordinator wait", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const server = yield* McpServer.McpServer;
+        assertParentCalls.length = 0;
+        waitSliceCalls.length = 0;
+        markWaitDeliveredCalls.length = 0;
+        waitSliceResult = {
+          results: [
+            {
+              childThreadId,
+              status: "completed",
+              finalAssistantText: "deduped result",
+              error: null,
+            },
+          ],
+          settledCount: 1,
+          timedOutCount: 0,
+          pending: false,
+          resumeToken: "coordinator-token",
+        };
+
+        const result = yield* server
+          .callTool({
+            name: "t3_wait_subagent",
+            arguments: {
+              childThreadIds: [childThreadId, childThreadId],
+              resumeToken: "-100000:coordinator-token",
+            },
+          })
+          .pipe(
+            Effect.provideService(McpInvocationContext.McpInvocationContext, invocation),
+            Effect.provideService(McpSchema.McpServerClient, client),
+          );
+
+        expect(result.isError).toBe(false);
+        expect(assertParentCalls).toEqual([{ parentThreadId, childThreadId }]);
+        expect(waitSliceCalls.map((call) => call.childThreadIds)).toEqual([[childThreadId]]);
+        expect(markWaitDeliveredCalls).toEqual([[waitSliceResult.results[0]!]]);
+      }),
+    ).pipe(Effect.provide(TestLayer)),
   );
 
   it.effect("R-A: wait refuses to deliver a child owned by another parent", () =>

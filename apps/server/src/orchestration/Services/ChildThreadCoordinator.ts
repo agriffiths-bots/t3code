@@ -10,7 +10,7 @@
  *
  * @module ChildThreadCoordinator
  */
-import type { ModelSelection, ProviderInstanceId, ThreadId } from "@t3tools/contracts";
+import type { ModelSelection, ProviderInstanceId, ThreadId, TurnId } from "@t3tools/contracts";
 import * as Context from "effect/Context";
 import type * as Effect from "effect/Effect";
 import type * as Scope from "effect/Scope";
@@ -61,6 +61,7 @@ export interface WaitChildResult {
   readonly status: WaitChildStatus;
   readonly finalAssistantText: string | null;
   readonly error: string | null;
+  readonly parentTurnIdAtWait?: TurnId | null;
 }
 
 export interface WaitSliceResult {
@@ -158,6 +159,12 @@ export interface ChildThreadCoordinatorShape {
    * path, such as handler-side projection enrichment.
    */
   readonly markWaitDelivered: (children: ReadonlyArray<WaitDeliveredMark>) => Effect.Effect<void>;
+
+  /**
+   * Clear in-flight promoted wait markers when a waiter fails before it can mark
+   * terminal rows delivered. Any queued fallback becomes eligible to drain.
+   */
+  readonly abandonWaitDelivery: (childThreadIds: ReadonlyArray<ThreadId>) => Effect.Effect<void>;
 
   /** Whether the parent has queued sub-agent completion injections awaiting drain. */
   readonly hasPendingInjections: (parentThreadId: ThreadId) => Effect.Effect<boolean>;

@@ -537,14 +537,31 @@ const make = Effect.gen(function* () {
     parentThreadId: ThreadId,
     childThreadId: ThreadId,
     dispatchIds: ReadonlyArray<PendingDispatchId>,
-  ) =>
+    expectedParentTurnId: TurnId | null,
+  ): Effect.Effect<"committed" | "refused-drain" | "refused-retain"> =>
     Effect.gen(function* () {
       const existing = waitDeliveryMarkedAt.get(childThreadId);
       const shellOption =
         existing === undefined ? yield* getThreadShellBounded(parentThreadId) : Option.none();
+      const shell = Option.isSome(shellOption) ? shellOption.value : null;
       const latestTurn = Option.isSome(shellOption) ? shellOption.value.latestTurn : null;
+      if (existing === undefined && expectedParentTurnId !== null) {
+        const sameRunningTurn =
+          latestTurn?.state === "running" && latestTurn.turnId === expectedParentTurnId;
+        if (!sameRunningTurn) {
+          return shell !== null && isThreadIdle(shell) ? "refused-drain" : "refused-retain";
+        }
+      }
+      if (
+        existing === undefined &&
+        expectedParentTurnId === null &&
+        (latestTurn?.state === "error" || latestTurn?.state === "interrupted")
+      ) {
+        return shell !== null && isThreadIdle(shell) ? "refused-drain" : "refused-retain";
+      }
       const parentTurnIdAtDelivery =
-        latestTurn?.state === "running" ? String(latestTurn.turnId) : null;
+        expectedParentTurnId ??
+        (latestTurn?.state === "running" ? String(latestTurn.turnId) : null);
       const deliveredAt = existing ?? (yield* nowIso);
 
       yield* sql.withTransaction(
@@ -567,7 +584,7 @@ const make = Effect.gen(function* () {
           waitDeliveryParentTurnAt.set(childThreadId, parentTurnIdAtDelivery as TurnId);
         }
       }
-      return deliveredAt;
+      return "committed";
     }).pipe(Effect.orDie);
 
   const parentTerminalAfterWaitDelivery = (
@@ -629,14 +646,18 @@ const make = Effect.gen(function* () {
       error: mark.error,
     };
   };
+  const parentTurnIdAtWaitFromMark = (mark: WaitDeliveredMark): TurnId | null =>
+    typeof mark === "string" ? null : (mark.parentTurnIdAtWait ?? null);
 
   const markPromotedWakeDeliveredByWait = (
     record: ChildRecord,
     childThreadId: ThreadId,
+    expectedParentTurnId: TurnId | null,
     deliveredResult?: ChildWaitResult,
   ) =>
     Effect.gen(function* () {
       if (record.detached || !promotedChildren.has(childThreadId)) return;
+      let drainAfterRefusedDelivery = false;
       let terminalResult = deliveredResult ?? null;
       if (terminalResult === null) {
         const completed = yield* Deferred.poll(record.terminal);
@@ -651,11 +672,12 @@ const make = Effect.gen(function* () {
           activePromotedWaitChildren.delete(childThreadId);
           let queue = pendingInjections.get(record.parentThreadId) ?? [];
           const deliveredIds: Array<PendingDispatchId> = [];
-          let updated = queue.map((entry) => {
-            if (entry.childThreadId !== childThreadId) return entry;
-            deliveredIds.push(entry.dispatchId);
-            return { ...entry, deliveredByWait: true };
-          });
+          let updated = queue;
+          for (const entry of queue) {
+            if (entry.childThreadId === childThreadId) {
+              deliveredIds.push(entry.dispatchId);
+            }
+          }
           if (terminalResult !== null && deliveredIds.length === 0) {
             const entry = yield* persistInjection(
               record.parentThreadId,
@@ -668,11 +690,20 @@ const make = Effect.gen(function* () {
             deliveredIds.push(entry.dispatchId);
           }
           if (deliveredIds.length > 0) {
-            yield* commitWaitDelivery(record.parentThreadId, childThreadId, deliveredIds);
-            waitDeliveredPromotedChildren.add(childThreadId);
-            updated = updated.map((entry) =>
-              entry.childThreadId === childThreadId ? { ...entry, deliveredByWait: true } : entry,
+            const committed = yield* commitWaitDelivery(
+              record.parentThreadId,
+              childThreadId,
+              deliveredIds,
+              expectedParentTurnId,
             );
+            if (committed === "committed") {
+              waitDeliveredPromotedChildren.add(childThreadId);
+              updated = updated.map((entry) =>
+                entry.childThreadId === childThreadId ? { ...entry, deliveredByWait: true } : entry,
+              );
+            } else if (committed === "refused-drain") {
+              drainAfterRefusedDelivery = true;
+            }
           }
           if (updated.length === 0) {
             return;
@@ -680,6 +711,9 @@ const make = Effect.gen(function* () {
           pendingInjections.set(record.parentThreadId, updated);
         }),
       );
+      if (drainAfterRefusedDelivery) {
+        yield* drainPending(record.parentThreadId);
+      }
     });
 
   // Durably stamp the commandId a batch is about to be dispatched under, BEFORE
@@ -721,6 +755,15 @@ const make = Effect.gen(function* () {
     getThreadShell(threadId).pipe(
       Effect.timeoutOption(`${PROJECTION_READ_TIMEOUT_MS} millis`),
       Effect.map(Option.flatten),
+    );
+
+  const runningParentTurnIdForWait = (parentThreadId: ThreadId): Effect.Effect<TurnId | null> =>
+    getThreadShellBounded(parentThreadId).pipe(
+      Effect.map((shellOption) => {
+        if (Option.isNone(shellOption)) return null;
+        const latestTurn = shellOption.value.latestTurn;
+        return latestTurn?.state === "running" ? latestTurn.turnId : null;
+      }),
     );
 
   const getThreadShellForDrain = (threadId: ThreadId) =>
@@ -1575,7 +1618,28 @@ const make = Effect.gen(function* () {
         return markPromotedWakeDeliveredByWait(
           record,
           childThreadId,
+          parentTurnIdAtWaitFromMark(mark),
           childWaitResultFromMark(mark),
+        );
+      },
+      { discard: true },
+    );
+
+  const abandonWaitDelivery: ChildThreadCoordinatorShape["abandonWaitDelivery"] = (
+    childThreadIds,
+  ) =>
+    Effect.forEach(
+      childThreadIds,
+      (childThreadId) => {
+        const record = children.get(childThreadId);
+        if (!record) return Effect.void;
+        return Effect.sync(() => {
+          endActivePromotedWait(childThreadId);
+          return !hasActivePromotedWait(childThreadId);
+        }).pipe(
+          Effect.flatMap((shouldDrain) =>
+            shouldDrain ? drainPending(record.parentThreadId) : Effect.void,
+          ),
         );
       },
       { discard: true },
@@ -1644,41 +1708,48 @@ const make = Effect.gen(function* () {
         } satisfies WaitChildResult;
       }
       const protectPromotedWait = !record.detached && promotedChildren.has(childThreadId);
+      const parentTurnIdAtWait = protectPromotedWait
+        ? yield* runningParentTurnIdForWait(record.parentThreadId)
+        : null;
       if (protectPromotedWait) {
         beginActivePromotedWait(childThreadId);
       }
-      // Re-check the projection in case it caught up after the hot-subscribe gap.
-      // The active promoted-wait marker must cover this bounded read too: a live
-      // completion can arrive while the projection check is in flight.
-      yield* oneShotTerminalCheck(childThreadId, { prepareWaitFallback: true });
-      const timeoutSentinel = Symbol.for("t3/subagent/wait-slice-timeout");
-      const raced = yield* Effect.race(
-        Deferred.await(record.terminal),
-        Effect.sleep(`${WAIT_SLICE_SECONDS} seconds`).pipe(Effect.as(timeoutSentinel)),
-      ).pipe(
+      return yield* Effect.gen(function* () {
+        // Re-check the projection in case it caught up after the hot-subscribe gap.
+        // The active promoted-wait marker must cover this bounded read too: a live
+        // completion can arrive while the projection check is in flight.
+        yield* oneShotTerminalCheck(childThreadId, { prepareWaitFallback: true });
+        const timeoutSentinel = Symbol.for("t3/subagent/wait-slice-timeout");
+        const raced = yield* Effect.race(
+          Deferred.await(record.terminal),
+          Effect.sleep(`${WAIT_SLICE_SECONDS} seconds`).pipe(Effect.as(timeoutSentinel)),
+        );
+        if (raced === timeoutSentinel) {
+          if (protectPromotedWait) {
+            endActivePromotedWait(childThreadId);
+          }
+          return {
+            childThreadId,
+            status: "pending" as const,
+            finalAssistantText: null,
+            error: null,
+            parentTurnIdAtWait,
+          } satisfies WaitChildResult;
+        }
+        return {
+          childThreadId,
+          status: raced.status,
+          finalAssistantText: raced.finalAssistantText,
+          error: raced.error,
+          parentTurnIdAtWait,
+        } satisfies WaitChildResult;
+      }).pipe(
         Effect.onInterrupt(() =>
           Effect.sync(() => {
             if (protectPromotedWait) endActivePromotedWait(childThreadId);
           }),
         ),
       );
-      if (raced === timeoutSentinel) {
-        if (protectPromotedWait) {
-          endActivePromotedWait(childThreadId);
-        }
-        return {
-          childThreadId,
-          status: "pending" as const,
-          finalAssistantText: null,
-          error: null,
-        } satisfies WaitChildResult;
-      }
-      return {
-        childThreadId,
-        status: raced.status,
-        finalAssistantText: raced.finalAssistantText,
-        error: raced.error,
-      } satisfies WaitChildResult;
     });
 
   const waitSlice: ChildThreadCoordinatorShape["waitSlice"] = (input: WaitSliceInput) =>
@@ -1695,6 +1766,9 @@ const make = Effect.gen(function* () {
             status: "timeout" as const,
             finalAssistantText: null,
             error: `wait exceeded budget`,
+            ...(result.parentTurnIdAtWait === undefined
+              ? {}
+              : { parentTurnIdAtWait: result.parentTurnIdAtWait }),
           } satisfies WaitChildResult;
         }
         return result;
@@ -2177,6 +2251,7 @@ const make = Effect.gen(function* () {
     assertParent,
     promoteToWake,
     markWaitDelivered,
+    abandonWaitDelivery,
     hasPendingInjections,
     listChildren,
     start,

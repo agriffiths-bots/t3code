@@ -2937,6 +2937,67 @@ describe("ChildThreadCoordinator", () => {
     expect(await runtimeHasPending(harness, parent)).toBe(false);
   });
 
+  it("R-A: parent failure before wait delivery keeps the fallback dispatchable", async () => {
+    const child = ThreadId.make("promote-wait-parent-failed-child");
+    const parent = ThreadId.make("promote-wait-parent-failed-parent");
+    const parentTurn = TurnId.make("turn-parent");
+    const childTurn = TurnId.make("turn-child");
+    const harness = await createHarness({
+      threads: [
+        makeThreadState({
+          threadId: child,
+          parentThreadId: parent,
+          latestTurn: makeLatestTurn("running", childTurn),
+          session: makeSession(child, "running", childTurn),
+        }),
+        makeThreadState({
+          threadId: parent,
+          latestTurn: makeLatestTurn("running", parentTurn),
+          session: makeSession(parent, "running", parentTurn),
+        }),
+      ],
+    });
+    await harness.register({
+      parentThreadId: parent,
+      childThreadId: child,
+      detached: false,
+      model: codexModel,
+      spawnedAtMs: 0,
+    });
+    await Effect.runPromise(harness.coordinator.promoteToWake([child]));
+
+    harness.setThread(
+      makeThreadState({
+        threadId: child,
+        parentThreadId: parent,
+        latestTurn: makeLatestTurn("completed", childTurn),
+        session: makeSession(child, "ready"),
+        assistantText: "deliver after parent failure",
+      }),
+    );
+    await harness.feed(turnDiffEvent(child, "ready", childTurn));
+    expect(await harness.listPendingDispatches()).toHaveLength(1);
+
+    const result = await runtimeRun(harness, child);
+    harness.setThread(
+      makeThreadState({
+        threadId: parent,
+        latestTurn: makeLatestTurn("interrupted", parentTurn, now),
+        session: makeSession(parent, "ready"),
+      }),
+    );
+    await Effect.runPromise(harness.coordinator.markWaitDelivered([result]));
+
+    const pendingRows = await harness.listPendingDispatches();
+    expect(pendingRows).toHaveLength(0);
+    expect(await harness.listWaitDeliveries()).toEqual([]);
+    const turnStarts = harness.dispatched.filter(
+      (command) => command.type === "thread.turn.start" && command.threadId === parent,
+    ) as Array<Extract<OrchestrationCommand, { type: "thread.turn.start" }>>;
+    expect(turnStarts).toHaveLength(1);
+    expect(turnStarts[0]?.message.text).toContain("deliver after parent failure");
+  });
+
   it("R-A: projection-enriched wait delivery persists a fallback before child settlement", async () => {
     const child = ThreadId.make("promote-wait-enriched-no-row-child");
     const parent = ThreadId.make("promote-wait-enriched-no-row-parent");
@@ -2990,6 +3051,59 @@ describe("ChildThreadCoordinator", () => {
     expect(
       harness.dispatched.filter((command) => command.type === "thread.turn.start"),
     ).toHaveLength(0);
+  });
+
+  it("R-A: interrupted promoted waits clear their active marker", async () => {
+    const child = ThreadId.make("promote-wait-interrupted-marker-child");
+    const parent = ThreadId.make("promote-wait-interrupted-marker-parent");
+    const childTurn = TurnId.make("turn-child");
+    const harness = await createHarness({
+      threads: [
+        makeThreadState({
+          threadId: child,
+          parentThreadId: parent,
+          latestTurn: makeLatestTurn("running", childTurn),
+          session: makeSession(child, "running", childTurn),
+        }),
+        makeThreadState({
+          threadId: parent,
+          latestTurn: makeLatestTurn("completed", TurnId.make("turn-parent")),
+          session: makeSession(parent, "ready"),
+        }),
+      ],
+    });
+    await harness.register({
+      parentThreadId: parent,
+      childThreadId: child,
+      detached: false,
+      model: codexModel,
+      spawnedAtMs: 0,
+    });
+    await Effect.runPromise(harness.coordinator.promoteToWake([child]));
+
+    harness.setThread(
+      makeThreadState({
+        threadId: child,
+        parentThreadId: parent,
+        latestTurn: makeLatestTurn("completed", childTurn),
+        session: makeSession(child, "ready"),
+        assistantText: "completed after interrupted wait",
+      }),
+    );
+    harness.setDetailSlow(child, true);
+    const interrupted = await Effect.runPromise(
+      harness.coordinator
+        .waitSlice({ childThreadIds: [child], mode: "all", budgetDeadlineMs: FAR_FUTURE_MS })
+        .pipe(Effect.timeoutOption("100 millis")),
+    );
+    expect(Option.isNone(interrupted)).toBe(true);
+
+    harness.setDetailSlow(child, false);
+    await harness.feed(turnDiffEvent(child, "ready", childTurn));
+    expect(
+      harness.dispatched.filter((command) => command.type === "thread.turn.start"),
+    ).toHaveLength(1);
+    expect(await harness.listPendingDispatches()).toHaveLength(0);
   });
 
   it("R-A: wait delivery bounds the parent snapshot read", async () => {
@@ -3440,6 +3554,204 @@ describe("ChildThreadCoordinator", () => {
     ).toHaveLength(0);
     expect(await harness.listPendingDispatches()).toHaveLength(0);
     expect(await runtimeHasPending(harness, parent)).toBe(false);
+  });
+
+  it("R-A: abandoning one overlapping wait keeps another active waiter protected", async () => {
+    const child = ThreadId.make("promote-wait-overlap-abandon-child");
+    const parent = ThreadId.make("promote-wait-overlap-abandon-parent");
+    const harness = await createHarness({
+      threads: [
+        makeThreadState({
+          threadId: child,
+          parentThreadId: parent,
+          latestTurn: makeLatestTurn("running"),
+          session: makeSession(child, "running", TurnId.make("turn-1")),
+        }),
+        makeThreadState({
+          threadId: parent,
+          latestTurn: makeLatestTurn("completed", TurnId.make("turn-parent")),
+          session: makeSession(parent, "ready"),
+        }),
+      ],
+    });
+    await harness.register({
+      parentThreadId: parent,
+      childThreadId: child,
+      detached: false,
+      model: codexModel,
+      spawnedAtMs: 0,
+    });
+    await Effect.runPromise(harness.coordinator.promoteToWake([child]));
+
+    const firstWait = runtimeWaitSlice(harness, [child], FAR_FUTURE_MS);
+    await Effect.runPromise(Effect.sleep("10 millis"));
+    const secondWait = runtimeWaitSlice(harness, [child], FAR_FUTURE_MS);
+    await Effect.runPromise(Effect.sleep("10 millis"));
+
+    harness.setThread(
+      makeThreadState({
+        threadId: child,
+        parentThreadId: parent,
+        latestTurn: makeLatestTurn("completed"),
+        assistantText: "still protected by the second wait",
+      }),
+    );
+    await harness.feed(turnDiffEvent(child, "ready"));
+    expect(
+      harness.dispatched.filter((command) => command.type === "thread.turn.start"),
+    ).toHaveLength(0);
+    let pendingRows = await harness.listPendingDispatches();
+    expect(pendingRows).toHaveLength(1);
+    expect(pendingRows[0]?.deliveredByWait).toBe(false);
+    expect(pendingRows[0]?.waitCancellable).toBe(true);
+
+    const [firstSlice, secondSlice] = await Promise.all([firstWait, secondWait]);
+    const firstResult = firstSlice.results[0]!;
+    const secondResult = secondSlice.results[0]!;
+    expect(firstResult.status).toBe("completed");
+    expect(secondResult.status).toBe("completed");
+
+    await Effect.runPromise(harness.coordinator.abandonWaitDelivery([child]));
+    expect(
+      harness.dispatched.filter((command) => command.type === "thread.turn.start"),
+    ).toHaveLength(0);
+    pendingRows = await harness.listPendingDispatches();
+    expect(pendingRows).toHaveLength(1);
+    expect(pendingRows[0]?.deliveredByWait).toBe(false);
+
+    await Effect.runPromise(harness.coordinator.markWaitDelivered([secondResult]));
+    pendingRows = await harness.listPendingDispatches();
+    expect(pendingRows).toHaveLength(1);
+    expect(pendingRows[0]?.deliveredByWait).toBe(true);
+
+    harness.setThread(
+      makeThreadState({
+        threadId: parent,
+        latestTurn: makeLatestTurn("completed", TurnId.make("turn-parent-2"), afterWaitDelivery),
+        session: makeSession(parent, "ready"),
+      }),
+    );
+    await harness.feed(turnDiffEvent(parent, "ready", TurnId.make("turn-parent-2")));
+    expect(
+      harness.dispatched.filter((command) => command.type === "thread.turn.start"),
+    ).toHaveLength(0);
+    expect(await harness.listPendingDispatches()).toHaveLength(0);
+  });
+
+  it("R-A: wait delivery refuses to credit a newer parent turn", async () => {
+    const child = ThreadId.make("promote-wait-parent-advanced-child");
+    const parent = ThreadId.make("promote-wait-parent-advanced-parent");
+    const waitingParentTurn = TurnId.make("turn-parent-waiting");
+    const newerParentTurn = TurnId.make("turn-parent-newer");
+    const harness = await createHarness({
+      threads: [
+        makeThreadState({
+          threadId: child,
+          parentThreadId: parent,
+          latestTurn: makeLatestTurn("running"),
+          session: makeSession(child, "running", TurnId.make("turn-1")),
+        }),
+        makeThreadState({
+          threadId: parent,
+          latestTurn: makeLatestTurn("running", waitingParentTurn),
+          session: makeSession(parent, "running", waitingParentTurn),
+        }),
+      ],
+    });
+    await harness.register({
+      parentThreadId: parent,
+      childThreadId: child,
+      detached: false,
+      model: codexModel,
+      spawnedAtMs: 0,
+    });
+    await Effect.runPromise(harness.coordinator.promoteToWake([child]));
+
+    const waitPromise = runtimeWaitSlice(harness, [child], FAR_FUTURE_MS);
+    await Effect.runPromise(Effect.sleep("10 millis"));
+    harness.setThread(
+      makeThreadState({
+        threadId: child,
+        parentThreadId: parent,
+        latestTurn: makeLatestTurn("completed"),
+        assistantText: "not delivered to the newer parent turn",
+      }),
+    );
+    await harness.feed(turnDiffEvent(child, "ready"));
+    const slice = await waitPromise;
+    const result = slice.results[0]!;
+    expect(result.status).toBe("completed");
+    expect(result.parentTurnIdAtWait).toBe(waitingParentTurn);
+
+    harness.setThread(
+      makeThreadState({
+        threadId: parent,
+        latestTurn: makeLatestTurn("running", newerParentTurn),
+        session: makeSession(parent, "running", newerParentTurn),
+      }),
+    );
+    await Effect.runPromise(harness.coordinator.markWaitDelivered([result]));
+
+    let pendingRows = await harness.listPendingDispatches();
+    expect(pendingRows).toHaveLength(1);
+    expect(pendingRows[0]?.deliveredByWait).toBe(false);
+    expect(await harness.listWaitDeliveries()).toEqual([]);
+    expect(
+      harness.dispatched.filter((command) => command.type === "thread.turn.start"),
+    ).toHaveLength(0);
+
+    harness.setThread(
+      makeThreadState({
+        threadId: parent,
+        latestTurn: makeLatestTurn("completed", newerParentTurn, afterWaitDelivery),
+        session: makeSession(parent, "ready"),
+      }),
+    );
+    await harness.feed(turnDiffEvent(parent, "ready", newerParentTurn));
+
+    const turnStarts = harness.dispatched.filter(
+      (command) => command.type === "thread.turn.start" && command.threadId === parent,
+    ) as Array<Extract<OrchestrationCommand, { type: "thread.turn.start" }>>;
+    expect(turnStarts).toHaveLength(1);
+    expect(turnStarts[0]?.message.text).toContain("not delivered to the newer parent turn");
+    pendingRows = await harness.listPendingDispatches();
+    expect(pendingRows).toHaveLength(0);
+  });
+
+  it("R-A: timeout rows preserve the waiting parent turn guard", async () => {
+    const child = ThreadId.make("promote-wait-timeout-parent-turn-child");
+    const parent = ThreadId.make("promote-wait-timeout-parent-turn-parent");
+    const waitingParentTurn = TurnId.make("turn-parent-waiting");
+    const harness = await createHarness({
+      threads: [
+        makeThreadState({
+          threadId: child,
+          parentThreadId: parent,
+          latestTurn: makeLatestTurn("running"),
+          session: makeSession(child, "running", TurnId.make("turn-1")),
+        }),
+        makeThreadState({
+          threadId: parent,
+          latestTurn: makeLatestTurn("running", waitingParentTurn),
+          session: makeSession(parent, "running", waitingParentTurn),
+        }),
+      ],
+    });
+    await harness.register({
+      parentThreadId: parent,
+      childThreadId: child,
+      detached: false,
+      model: codexModel,
+      spawnedAtMs: 0,
+    });
+    await Effect.runPromise(harness.coordinator.promoteToWake([child]));
+
+    const slice = await runtimeWaitSlice(harness, [child], PAST_MS);
+    expect(slice.results[0]).toMatchObject({
+      childThreadId: child,
+      status: "timeout",
+      parentTurnIdAtWait: waitingParentTurn,
+    });
   });
 
   it("R-A: one-shot wait delivery dispatches the fallback after a failed parent turn", async () => {
