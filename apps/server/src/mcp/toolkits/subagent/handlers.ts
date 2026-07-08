@@ -496,8 +496,9 @@ const cleanupStartedChild = (
         childThreadId,
         reason,
         cause: Cause.pretty(cause),
-      }).pipe(Effect.andThen(releaseDispatchLease)),
+      }),
     ),
+    Effect.ensuring(releaseDispatchLease),
   );
 
 /**
