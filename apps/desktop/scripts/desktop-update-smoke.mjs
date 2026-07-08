@@ -164,12 +164,21 @@ function fetchText(hostname, port, path, timeoutMs) {
   });
 }
 
-async function waitForUpdateServer(hostname, port, deadline) {
+export function manifestAdvertisesVersion(text, expectedVersion) {
+  return expectedVersion === undefined || text.includes(`version: ${expectedVersion}`);
+}
+
+export async function waitForUpdateServer(hostname, port, deadline, expectedVersion) {
   let lastError;
+  let lastWrongVersion;
   while (Date.now() < deadline) {
     for (const channelFile of resolveUpdateChannelFiles()) {
       try {
         const text = await fetchText(hostname, port, channelFile, 1_000);
+        if (!manifestAdvertisesVersion(text, expectedVersion)) {
+          lastWrongVersion = `${channelFile} did not advertise expected version ${expectedVersion}.`;
+          continue;
+        }
         return { channelFile, text };
       } catch (error) {
         lastError = error;
@@ -180,7 +189,7 @@ async function waitForUpdateServer(hostname, port, deadline) {
 
   throw new Error(
     `Timed out waiting for mock update server on ${hostname}:${port}: ${
-      lastError instanceof Error ? lastError.message : String(lastError)
+      lastWrongVersion ?? (lastError instanceof Error ? lastError.message : String(lastError))
     }`,
   );
 }
@@ -411,6 +420,7 @@ export function makeDesktopEnv(input) {
     APPIMAGE_EXTRACT_AND_RUN: "1",
     ELECTRON_ENABLE_LOGGING: "1",
     HOME: input.homeDir,
+    LOCALAPPDATA: input.localAppData,
     NO_AT_BRIDGE: "1",
     T3CODE_HOME: input.t3Home,
     T3CODE_DESKTOP_MOCK_UPDATES: "1",
@@ -425,6 +435,13 @@ export function makeDesktopEnv(input) {
   delete env.VITE_DEV_SERVER_URL;
   delete env.T3CODE_DISABLE_AUTO_UPDATE;
   return env;
+}
+
+export function prepareInstalledExecutableForLaunch(executablePath, platform = hostPlatform) {
+  if (platform === "win32") {
+    return;
+  }
+  NodeFS.chmodSync(executablePath, 0o755);
 }
 
 async function launchInstalledApp(executablePath, env, timeoutMs) {
@@ -592,22 +609,24 @@ async function main() {
   const t3Home = NodePath.join(tempRoot, "t3-home");
   const appData = NodePath.join(tempRoot, "app-data");
   const homeDir = NodePath.join(tempRoot, "home");
+  const localAppData = NodePath.join(tempRoot, "local-app-data");
   const readyMarkerPath = NodePath.join(tempRoot, READY_MARKER_FILE);
   await NodeFSP.mkdir(t3Home, { recursive: true });
   await NodeFSP.mkdir(appData, { recursive: true });
   await NodeFSP.mkdir(homeDir, { recursive: true });
+  await NodeFSP.mkdir(localAppData, { recursive: true });
 
   const deadline = Date.now() + options.timeoutMs;
   const updateServer = startMockUpdateServer(options.updateRoot, updateServerPort);
   let electronApp;
 
   try {
-    const updateFeed = await waitForUpdateServer(UPDATE_SERVER_HOST, updateServerPort, deadline);
-    if (!updateFeed.text.includes(`version: ${options.expectedToVersion}`)) {
-      throw new Error(
-        `${updateFeed.channelFile} did not advertise expected version ${options.expectedToVersion}.`,
-      );
-    }
+    const updateFeed = await waitForUpdateServer(
+      UPDATE_SERVER_HOST,
+      updateServerPort,
+      deadline,
+      options.expectedToVersion,
+    );
     console.log(
       `[desktop-update-smoke] Mock update server ready on port ${updateServerPort} (${updateFeed.channelFile})`,
     );
@@ -616,12 +635,14 @@ async function main() {
       appData,
       backendPort,
       homeDir,
+      localAppData,
       readyMarkerPath,
       t3Home,
       updateServerPort,
     });
 
     console.log(`[desktop-update-smoke] Launching installed app ${options.command}`);
+    prepareInstalledExecutableForLaunch(options.command);
     electronApp = await launchInstalledApp(options.command, env, options.timeoutMs);
     const page = await waitForDesktopBridgePage(electronApp, deadline);
     const appVersion = await electronApp.evaluate(({ app }) => app.getVersion());
