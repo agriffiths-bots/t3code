@@ -71,6 +71,7 @@ const asTurnId = (value: string): TurnId => TurnId.make(value);
 const environmentId = EnvironmentId.make("environment-provider-service-test");
 const codexInstanceId = ProviderInstanceId.make("codex");
 const claudeAgentInstanceId = ProviderInstanceId.make("claudeAgent");
+const cursorInstanceId = ProviderInstanceId.make("cursor");
 const CODEX_DRIVER = ProviderDriverKind.make("codex");
 const CLAUDE_AGENT_DRIVER = ProviderDriverKind.make("claudeAgent");
 const CURSOR_DRIVER = ProviderDriverKind.make("cursor");
@@ -100,7 +101,7 @@ function makeFakeCodexAdapter(provider: ProviderDriverKind = CODEX_DRIVER) {
         ...(input.providerInstanceId !== undefined
           ? { providerInstanceId: input.providerInstanceId }
           : {}),
-        status: "ready",
+        status: input.activeTurnId !== undefined ? "running" : "ready",
         runtimeMode: input.runtimeMode,
         threadId: input.threadId,
         resumeCursor: input.resumeCursor ?? {
@@ -109,6 +110,7 @@ function makeFakeCodexAdapter(provider: ProviderDriverKind = CODEX_DRIVER) {
         cwd: input.cwd ?? process.cwd(),
         createdAt: now,
         updatedAt: now,
+        ...(input.activeTurnId !== undefined ? { activeTurnId: input.activeTurnId } : {}),
       };
       sessions.set(session.threadId, session);
       return session;
@@ -119,7 +121,8 @@ function makeFakeCodexAdapter(provider: ProviderDriverKind = CODEX_DRIVER) {
     (
       input: ProviderSendTurnInput,
     ): Effect.Effect<ProviderTurnStartResult, ProviderAdapterError> => {
-      if (!sessions.has(input.threadId)) {
+      const session = sessions.get(input.threadId);
+      if (!session) {
         return Effect.fail(
           new ProviderAdapterSessionNotFoundError({
             provider,
@@ -128,9 +131,18 @@ function makeFakeCodexAdapter(provider: ProviderDriverKind = CODEX_DRIVER) {
         );
       }
 
-      return Effect.succeed({
-        threadId: input.threadId,
-        turnId: TurnId.make(`turn-${String(input.threadId)}`),
+      return Effect.sync(() => {
+        const turnId = TurnId.make(`turn-${String(input.threadId)}`);
+        sessions.set(input.threadId, {
+          ...session,
+          status: "running",
+          activeTurnId: turnId,
+          updatedAt: "2026-01-01T00:00:01.000Z",
+        });
+        return {
+          threadId: input.threadId,
+          turnId,
+        };
       });
     },
   );
@@ -1090,6 +1102,530 @@ routing.layer("ProviderServiceLive routing", (it) => {
     }),
   );
 
+  it.effect("clears persisted active turn state on matching terminal turn events", () =>
+    Effect.gen(function* () {
+      const provider = yield* ProviderService.ProviderService;
+      const directory = yield* ProviderSessionDirectory.ProviderSessionDirectory;
+      const threadId = asThreadId("thread-terminal-active-turn");
+
+      yield* provider.startSession(threadId, {
+        provider: ProviderDriverKind.make("codex"),
+        providerInstanceId: codexInstanceId,
+        threadId,
+        cwd: "/tmp/project-terminal-active-turn",
+        runtimeMode: "full-access",
+      });
+
+      const turn = yield* provider.sendTurn({
+        threadId,
+        input: "hello",
+        attachments: [],
+      });
+
+      const staleCompletedEventId = asEventId("evt-stale-turn-completed");
+      const staleCompletedFiber = yield* provider.streamEvents.pipe(
+        Stream.filter((event) => event.eventId === staleCompletedEventId),
+        Stream.take(1),
+        Stream.runCollect,
+        Effect.forkChild,
+      );
+      yield* advanceTestClock(50);
+      routing.codex.emit({
+        type: "turn.completed",
+        eventId: staleCompletedEventId,
+        provider: ProviderDriverKind.make("codex"),
+        threadId,
+        turnId: asTurnId("turn-stale"),
+        createdAt: "2026-01-01T00:00:02.000Z",
+        payload: { state: "completed" },
+      });
+      yield* Fiber.join(staleCompletedFiber);
+
+      const staleBinding = yield* directory.getBinding(threadId);
+      assert.equal(Option.isSome(staleBinding), true);
+      if (Option.isSome(staleBinding)) {
+        const runtimePayload = staleBinding.value.runtimePayload as {
+          readonly activeTurnId?: unknown;
+        };
+        assert.equal(runtimePayload.activeTurnId, turn.turnId);
+        assert.equal(staleBinding.value.status, "running");
+      }
+
+      const activeCompletedEventId = asEventId("evt-active-turn-completed");
+      const activeCompletedFiber = yield* provider.streamEvents.pipe(
+        Stream.filter((event) => event.eventId === activeCompletedEventId),
+        Stream.take(1),
+        Stream.runCollect,
+        Effect.forkChild,
+      );
+      yield* advanceTestClock(50);
+      routing.codex.emit({
+        type: "turn.completed",
+        eventId: activeCompletedEventId,
+        provider: ProviderDriverKind.make("codex"),
+        threadId,
+        turnId: turn.turnId,
+        createdAt: "2026-01-01T00:00:03.000Z",
+        payload: { state: "completed" },
+      });
+      const activeCompletedEvents = Array.from(yield* Fiber.join(activeCompletedFiber));
+      assert.equal(activeCompletedEvents[0]?.type, "turn.completed");
+      assert.equal(activeCompletedEvents[0]?.threadId, threadId);
+      assert.equal(activeCompletedEvents[0]?.turnId, turn.turnId);
+
+      const completedBinding = yield* directory.getBinding(threadId);
+      assert.equal(Option.isSome(completedBinding), true);
+      if (Option.isSome(completedBinding)) {
+        const runtimePayload = completedBinding.value.runtimePayload as {
+          readonly activeTurnId?: unknown;
+          readonly lastRuntimeEvent?: unknown;
+        };
+        assert.equal(runtimePayload.lastRuntimeEvent, "turn.completed");
+        assert.equal(runtimePayload.activeTurnId, null);
+        assert.equal(completedBinding.value.status, "running");
+      }
+    }),
+  );
+
+  it.effect("does not let stale turn.started events replace the persisted active turn", () =>
+    Effect.gen(function* () {
+      const provider = yield* ProviderService.ProviderService;
+      const directory = yield* ProviderSessionDirectory.ProviderSessionDirectory;
+      const threadId = asThreadId("thread-stale-started-active-turn");
+
+      yield* provider.startSession(threadId, {
+        provider: ProviderDriverKind.make("codex"),
+        providerInstanceId: codexInstanceId,
+        threadId,
+        cwd: "/tmp/project-stale-started-active-turn",
+        runtimeMode: "full-access",
+      });
+
+      const turn = yield* provider.sendTurn({
+        threadId,
+        input: "hello",
+        attachments: [],
+      });
+
+      const staleStartedEventId = asEventId("evt-stale-turn-started");
+      const staleStartedFiber = yield* provider.streamEvents.pipe(
+        Stream.filter((event) => event.eventId === staleStartedEventId),
+        Stream.take(1),
+        Stream.runCollect,
+        Effect.forkChild,
+      );
+      yield* advanceTestClock(50);
+      routing.codex.emit({
+        type: "turn.started",
+        eventId: staleStartedEventId,
+        provider: ProviderDriverKind.make("codex"),
+        threadId,
+        turnId: asTurnId("turn-stale-started"),
+        createdAt: "2026-01-01T00:00:03.500Z",
+        payload: {},
+      });
+      yield* Fiber.join(staleStartedFiber);
+
+      const staleBinding = yield* directory.getBinding(threadId);
+      assert.equal(Option.isSome(staleBinding), true);
+      if (Option.isSome(staleBinding)) {
+        const runtimePayload = staleBinding.value.runtimePayload as {
+          readonly activeTurnId?: unknown;
+          readonly lastRuntimeEvent?: unknown;
+        };
+        assert.equal(runtimePayload.activeTurnId, turn.turnId);
+        assert.equal(runtimePayload.lastRuntimeEvent, "provider.sendTurn");
+      }
+
+      const activeCompletedEventId = asEventId("evt-active-after-stale-started-completed");
+      const activeCompletedFiber = yield* provider.streamEvents.pipe(
+        Stream.filter((event) => event.eventId === activeCompletedEventId),
+        Stream.take(1),
+        Stream.runCollect,
+        Effect.forkChild,
+      );
+      yield* advanceTestClock(50);
+      routing.codex.emit({
+        type: "turn.completed",
+        eventId: activeCompletedEventId,
+        provider: ProviderDriverKind.make("codex"),
+        threadId,
+        turnId: turn.turnId,
+        createdAt: "2026-01-01T00:00:04.000Z",
+        payload: { state: "completed" },
+      });
+      yield* Fiber.join(activeCompletedFiber);
+
+      const completedBinding = yield* directory.getBinding(threadId);
+      assert.equal(Option.isSome(completedBinding), true);
+      if (Option.isSome(completedBinding)) {
+        const runtimePayload = completedBinding.value.runtimePayload as {
+          readonly activeTurnId?: unknown;
+          readonly lastRuntimeEvent?: unknown;
+        };
+        assert.equal(runtimePayload.activeTurnId, null);
+        assert.equal(runtimePayload.lastRuntimeEvent, "turn.completed");
+      }
+    }),
+  );
+
+  it.effect("does not let late turn.started events resurrect completed turns", () =>
+    Effect.gen(function* () {
+      const provider = yield* ProviderService.ProviderService;
+      const directory = yield* ProviderSessionDirectory.ProviderSessionDirectory;
+      const threadId = asThreadId("thread-late-started-after-completed");
+
+      yield* provider.startSession(threadId, {
+        provider: ProviderDriverKind.make("codex"),
+        providerInstanceId: codexInstanceId,
+        threadId,
+        cwd: "/tmp/project-late-started-after-completed",
+        runtimeMode: "full-access",
+      });
+
+      const turn = yield* provider.sendTurn({
+        threadId,
+        input: "hello",
+        attachments: [],
+      });
+
+      const completedEventId = asEventId("evt-completed-before-late-started");
+      const completedFiber = yield* provider.streamEvents.pipe(
+        Stream.filter((event) => event.eventId === completedEventId),
+        Stream.take(1),
+        Stream.runCollect,
+        Effect.forkChild,
+      );
+      yield* advanceTestClock(50);
+      routing.codex.emit({
+        type: "turn.completed",
+        eventId: completedEventId,
+        provider: ProviderDriverKind.make("codex"),
+        threadId,
+        turnId: turn.turnId,
+        createdAt: "2026-01-01T00:00:04.250Z",
+        payload: { state: "completed" },
+      });
+      yield* Fiber.join(completedFiber);
+
+      const lateStartedEventId = asEventId("evt-late-started-after-completed");
+      const lateStartedFiber = yield* provider.streamEvents.pipe(
+        Stream.filter((event) => event.eventId === lateStartedEventId),
+        Stream.take(1),
+        Stream.runCollect,
+        Effect.forkChild,
+      );
+      yield* advanceTestClock(50);
+      routing.codex.emit({
+        type: "turn.started",
+        eventId: lateStartedEventId,
+        provider: ProviderDriverKind.make("codex"),
+        threadId,
+        turnId: turn.turnId,
+        createdAt: "2026-01-01T00:00:04.500Z",
+        payload: {},
+      });
+      yield* Fiber.join(lateStartedFiber);
+
+      const binding = yield* directory.getBinding(threadId);
+      assert.equal(Option.isSome(binding), true);
+      if (Option.isSome(binding)) {
+        const runtimePayload = binding.value.runtimePayload as {
+          readonly activeTurnId?: unknown;
+          readonly lastRuntimeEvent?: unknown;
+          readonly lastTerminalTurnId?: unknown;
+        };
+        assert.equal(runtimePayload.activeTurnId, null);
+        assert.equal(runtimePayload.lastRuntimeEvent, "turn.completed");
+        assert.equal(runtimePayload.lastTerminalTurnId, turn.turnId);
+      }
+    }),
+  );
+
+  it.effect("clears persisted active turn state when sendTurn fails after turn.started", () =>
+    Effect.gen(function* () {
+      const provider = yield* ProviderService.ProviderService;
+      const directory = yield* ProviderSessionDirectory.ProviderSessionDirectory;
+      const threadId = asThreadId("thread-started-then-send-failed");
+      const turnId = asTurnId("turn-started-then-send-failed");
+
+      yield* provider.startSession(threadId, {
+        provider: ProviderDriverKind.make("codex"),
+        providerInstanceId: codexInstanceId,
+        threadId,
+        cwd: "/tmp/project-started-then-send-failed",
+        runtimeMode: "full-access",
+      });
+
+      const startedEventId = asEventId("evt-started-before-send-failed");
+      const startedFiber = yield* provider.streamEvents.pipe(
+        Stream.filter((event) => event.eventId === startedEventId),
+        Stream.take(1),
+        Stream.runCollect,
+        Effect.forkChild,
+      );
+      yield* advanceTestClock(50);
+      routing.codex.sendTurn.mockImplementationOnce((input) =>
+        Effect.gen(function* () {
+          routing.codex.emit({
+            type: "turn.started",
+            eventId: startedEventId,
+            provider: ProviderDriverKind.make("codex"),
+            threadId: input.threadId,
+            turnId,
+            createdAt: "2026-01-01T00:00:04.500Z",
+            payload: {},
+          });
+          yield* Fiber.join(startedFiber);
+          routing.codex.updateSession(input.threadId, (session) => {
+            const { activeTurnId: _activeTurnId, ...sessionWithoutActiveTurn } = session;
+            return {
+              ...sessionWithoutActiveTurn,
+              status: "ready",
+              updatedAt: "2026-01-01T00:00:04.550Z",
+            };
+          });
+          return yield* new ProviderAdapterRequestError({
+            provider: String(CODEX_DRIVER),
+            method: "sendTurn",
+            detail: "simulated send failure",
+          });
+        }),
+      );
+
+      const exit = yield* provider
+        .sendTurn({
+          threadId,
+          input: "hello",
+          attachments: [],
+        })
+        .pipe(Effect.exit);
+      assert.equal(Exit.isFailure(exit), true);
+
+      const binding = yield* directory.getBinding(threadId);
+      assert.equal(Option.isSome(binding), true);
+      if (Option.isSome(binding)) {
+        const runtimePayload = binding.value.runtimePayload as {
+          readonly activeTurnId?: unknown;
+          readonly lastRuntimeEvent?: unknown;
+        };
+        assert.equal(runtimePayload.activeTurnId, null);
+        assert.equal(runtimePayload.lastRuntimeEvent, "provider.sendTurn.failed");
+      }
+    }),
+  );
+
+  it.effect("keeps persisted active turn state when a failed send is still live", () =>
+    Effect.gen(function* () {
+      const provider = yield* ProviderService.ProviderService;
+      const directory = yield* ProviderSessionDirectory.ProviderSessionDirectory;
+      const threadId = asThreadId("thread-started-failed-but-live");
+      const turnId = asTurnId("turn-started-failed-but-live");
+
+      yield* provider.startSession(threadId, {
+        provider: ProviderDriverKind.make("codex"),
+        providerInstanceId: codexInstanceId,
+        threadId,
+        cwd: "/tmp/project-started-failed-but-live",
+        runtimeMode: "full-access",
+      });
+
+      const startedEventId = asEventId("evt-started-before-live-send-failed");
+      const startedFiber = yield* provider.streamEvents.pipe(
+        Stream.filter((event) => event.eventId === startedEventId),
+        Stream.take(1),
+        Stream.runCollect,
+        Effect.forkChild,
+      );
+      yield* advanceTestClock(50);
+      routing.codex.sendTurn.mockImplementationOnce((input) =>
+        Effect.gen(function* () {
+          routing.codex.emit({
+            type: "turn.started",
+            eventId: startedEventId,
+            provider: ProviderDriverKind.make("codex"),
+            threadId: input.threadId,
+            turnId,
+            createdAt: "2026-01-01T00:00:04.750Z",
+            payload: {},
+          });
+          yield* Fiber.join(startedFiber);
+          routing.codex.updateSession(input.threadId, (session) => ({
+            ...session,
+            status: "running",
+            activeTurnId: turnId,
+            updatedAt: "2026-01-01T00:00:04.800Z",
+          }));
+          return yield* new ProviderAdapterRequestError({
+            provider: String(CODEX_DRIVER),
+            method: "sendTurn",
+            detail: "simulated send failure with live steer",
+          });
+        }),
+      );
+
+      const exit = yield* provider
+        .sendTurn({
+          threadId,
+          input: "hello",
+          attachments: [],
+        })
+        .pipe(Effect.exit);
+      assert.equal(Exit.isFailure(exit), true);
+
+      const binding = yield* directory.getBinding(threadId);
+      assert.equal(Option.isSome(binding), true);
+      if (Option.isSome(binding)) {
+        const runtimePayload = binding.value.runtimePayload as {
+          readonly activeTurnId?: unknown;
+          readonly lastRuntimeEvent?: unknown;
+        };
+        assert.equal(runtimePayload.activeTurnId, turnId);
+        assert.equal(runtimePayload.lastRuntimeEvent, "turn.started");
+      }
+    }),
+  );
+
+  it.effect("ignores terminal turn events from stale provider bindings", () =>
+    Effect.gen(function* () {
+      const provider = yield* ProviderService.ProviderService;
+      const directory = yield* ProviderSessionDirectory.ProviderSessionDirectory;
+      const threadId = asThreadId("thread-terminal-stale-provider");
+
+      yield* provider.startSession(threadId, {
+        provider: ProviderDriverKind.make("codex"),
+        providerInstanceId: codexInstanceId,
+        threadId,
+        cwd: "/tmp/project-terminal-stale-provider",
+        runtimeMode: "full-access",
+      });
+      const turn = yield* provider.sendTurn({
+        threadId,
+        input: "hello",
+        attachments: [],
+      });
+
+      yield* directory.upsert({
+        threadId,
+        provider: ProviderDriverKind.make("claudeAgent"),
+        providerInstanceId: claudeAgentInstanceId,
+        runtimeMode: "full-access",
+        status: "running",
+        runtimePayload: {
+          activeTurnId: turn.turnId,
+          lastRuntimeEvent: "provider.replacement",
+        },
+      });
+
+      const staleProviderEventId = asEventId("evt-stale-provider-turn-completed");
+      const staleProviderFiber = yield* provider.streamEvents.pipe(
+        Stream.filter((event) => event.eventId === staleProviderEventId),
+        Stream.take(1),
+        Stream.runCollect,
+        Effect.forkChild,
+      );
+      yield* advanceTestClock(50);
+      routing.codex.emit({
+        type: "turn.completed",
+        eventId: staleProviderEventId,
+        provider: ProviderDriverKind.make("codex"),
+        threadId,
+        turnId: turn.turnId,
+        createdAt: "2026-01-01T00:00:04.000Z",
+        payload: { state: "completed" },
+      });
+      yield* Fiber.join(staleProviderFiber);
+
+      const binding = yield* directory.getBinding(threadId);
+      assert.equal(Option.isSome(binding), true);
+      if (Option.isSome(binding)) {
+        const runtimePayload = binding.value.runtimePayload as {
+          readonly activeTurnId?: unknown;
+          readonly lastRuntimeEvent?: unknown;
+        };
+        assert.equal(binding.value.provider, ProviderDriverKind.make("claudeAgent"));
+        assert.equal(binding.value.providerInstanceId, claudeAgentInstanceId);
+        assert.equal(runtimePayload.activeTurnId, turn.turnId);
+        assert.equal(runtimePayload.lastRuntimeEvent, "provider.replacement");
+      }
+      yield* routing.codex.stopSession(threadId);
+    }),
+  );
+
+  it.effect("does not repersist active turn state after synchronous terminal events", () =>
+    Effect.gen(function* () {
+      const provider = yield* ProviderService.ProviderService;
+      const directory = yield* ProviderSessionDirectory.ProviderSessionDirectory;
+      const threadId = asThreadId("thread-sync-terminal-turn");
+      const turnId = asTurnId("turn-sync-terminal");
+
+      yield* provider.startSession(threadId, {
+        provider: ProviderDriverKind.make("codex"),
+        providerInstanceId: codexInstanceId,
+        threadId,
+        cwd: "/tmp/project-sync-terminal-turn",
+        runtimeMode: "full-access",
+      });
+
+      routing.codex.sendTurn.mockImplementationOnce((input) =>
+        Effect.sync(() => {
+          routing.codex.emit({
+            type: "turn.started",
+            eventId: asEventId("evt-sync-terminal-started"),
+            provider: ProviderDriverKind.make("codex"),
+            threadId: input.threadId,
+            turnId,
+            createdAt: "2026-01-01T00:00:05.000Z",
+            payload: {},
+          });
+          routing.codex.emit({
+            type: "turn.completed",
+            eventId: asEventId("evt-sync-terminal-completed"),
+            provider: ProviderDriverKind.make("codex"),
+            threadId: input.threadId,
+            turnId,
+            createdAt: "2026-01-01T00:00:06.000Z",
+            payload: { state: "completed" },
+          });
+          return {
+            threadId: input.threadId,
+            turnId,
+          };
+        }),
+      );
+
+      const terminalFiber = yield* provider.streamEvents.pipe(
+        Stream.filter((event) => event.eventId === asEventId("evt-sync-terminal-completed")),
+        Stream.take(1),
+        Stream.runCollect,
+        Effect.forkChild,
+      );
+      yield* advanceTestClock(50);
+
+      const turn = yield* provider.sendTurn({
+        threadId,
+        input: "hello",
+        attachments: [],
+      });
+      yield* Fiber.join(terminalFiber);
+
+      assert.equal(turn.turnId, turnId);
+      const binding = yield* directory.getBinding(threadId);
+      assert.equal(Option.isSome(binding), true);
+      if (Option.isSome(binding)) {
+        const runtimePayload = binding.value.runtimePayload as {
+          readonly activeTurnId?: unknown;
+          readonly lastRuntimeEvent?: unknown;
+          readonly lastTerminalTurnId?: unknown;
+        };
+        assert.equal(runtimePayload.activeTurnId, null);
+        assert.equal(runtimePayload.lastRuntimeEvent, "turn.completed");
+        assert.equal(runtimePayload.lastTerminalTurnId, turnId);
+      }
+      yield* routing.codex.stopSession(threadId);
+    }),
+  );
+
   it.effect("dies when an active session conflicts with its persisted binding", () =>
     Effect.gen(function* () {
       const provider = yield* ProviderService.ProviderService;
@@ -1334,7 +1870,7 @@ routing.layer("ProviderServiceLive routing", (it) => {
     }),
   );
 
-  it.effect("reuses persisted resume cursor when startSession is called after a restart", () =>
+  it.effect("reuses persisted resume cursor and active turn when startSession restarts", () =>
     Effect.gen(function* () {
       const tempDir = NodeFS.mkdtempSync(
         NodePath.join(NodeOS.tmpdir(), "t3-provider-service-start-"),
@@ -1345,9 +1881,9 @@ routing.layer("ProviderServiceLive routing", (it) => {
         Layer.provide(persistenceLayer),
       );
 
-      const firstClaude = makeFakeCodexAdapter(CLAUDE_AGENT_DRIVER);
+      const firstCursor = makeFakeCodexAdapter(CURSOR_DRIVER);
       const firstRegistry = makeAdapterRegistryMock({
-        [ProviderDriverKind.make("claudeAgent")]: firstClaude.adapter,
+        [ProviderDriverKind.make("cursor")]: firstCursor.adapter,
       });
       const firstDirectoryLayer = ProviderSessionDirectoryLive.pipe(
         Layer.provide(runtimeRepositoryLayer),
@@ -1369,23 +1905,35 @@ routing.layer("ProviderServiceLive routing", (it) => {
 
       const initial = yield* Effect.gen(function* () {
         const provider = yield* ProviderService.ProviderService;
-        return yield* provider.startSession(asThreadId("thread-claude-start"), {
-          provider: ProviderDriverKind.make("claudeAgent"),
-          providerInstanceId: claudeAgentInstanceId,
-          threadId: asThreadId("thread-claude-start"),
-          cwd: "/tmp/project-claude-start",
+        return yield* provider.startSession(asThreadId("thread-cursor-start"), {
+          provider: ProviderDriverKind.make("cursor"),
+          providerInstanceId: cursorInstanceId,
+          threadId: asThreadId("thread-cursor-start"),
+          cwd: "/tmp/project-cursor-start",
           runtimeMode: "full-access",
         });
       }).pipe(Effect.provide(firstProviderLayer));
 
+      const persistedActiveTurnId = asTurnId(`turn-${String(initial.threadId)}`);
       yield* Effect.gen(function* () {
-        const provider = yield* ProviderService.ProviderService;
-        yield* provider.listSessions();
-      }).pipe(Effect.provide(firstProviderLayer));
+        const directory = yield* ProviderSessionDirectory.ProviderSessionDirectory;
+        yield* directory.upsert({
+          threadId: initial.threadId,
+          provider: ProviderDriverKind.make("cursor"),
+          providerInstanceId: cursorInstanceId,
+          runtimeMode: "full-access",
+          status: "running",
+          resumeCursor: initial.resumeCursor,
+          runtimePayload: {
+            cwd: "/tmp/project-cursor-start",
+            activeTurnId: persistedActiveTurnId,
+          },
+        });
+      }).pipe(Effect.provide(firstDirectoryLayer));
 
-      const secondClaude = makeFakeCodexAdapter(CLAUDE_AGENT_DRIVER);
+      const secondCursor = makeFakeCodexAdapter(CURSOR_DRIVER);
       const secondRegistry = makeAdapterRegistryMock({
-        [ProviderDriverKind.make("claudeAgent")]: secondClaude.adapter,
+        [ProviderDriverKind.make("cursor")]: secondCursor.adapter,
       });
       const secondDirectoryLayer = ProviderSessionDirectoryLive.pipe(
         Layer.provide(runtimeRepositoryLayer),
@@ -1405,21 +1953,25 @@ routing.layer("ProviderServiceLive routing", (it) => {
         ),
       );
 
-      secondClaude.startSession.mockClear();
+      secondCursor.startSession.mockClear();
 
-      yield* Effect.gen(function* () {
+      const resumedResult = yield* Effect.gen(function* () {
         const provider = yield* ProviderService.ProviderService;
-        yield* provider.startSession(initial.threadId, {
-          provider: ProviderDriverKind.make("claudeAgent"),
-          providerInstanceId: claudeAgentInstanceId,
+        const resumed = yield* provider.startSession(initial.threadId, {
+          provider: ProviderDriverKind.make("cursor"),
+          providerInstanceId: cursorInstanceId,
           threadId: initial.threadId,
-          cwd: "/tmp/project-claude-start",
+          cwd: "/tmp/project-cursor-start",
           runtimeMode: "full-access",
         });
+        const directory = yield* ProviderSessionDirectory.ProviderSessionDirectory;
+        const binding = yield* directory.getBinding(initial.threadId);
+        const sessions = yield* provider.listSessions();
+        return { binding, resumed, sessions };
       }).pipe(Effect.provide(secondProviderLayer));
 
-      assert.equal(secondClaude.startSession.mock.calls.length, 1);
-      const resumedStartInput = secondClaude.startSession.mock.calls[0]?.[0];
+      assert.equal(secondCursor.startSession.mock.calls.length, 1);
+      const resumedStartInput = secondCursor.startSession.mock.calls[0]?.[0];
       assert.equal(typeof resumedStartInput === "object" && resumedStartInput !== null, true);
       if (resumedStartInput && typeof resumedStartInput === "object") {
         const startPayload = resumedStartInput as {
@@ -1427,15 +1979,208 @@ routing.layer("ProviderServiceLive routing", (it) => {
           cwd?: string;
           resumeCursor?: unknown;
           threadId?: string;
+          activeTurnId?: string;
         };
-        assert.equal(startPayload.provider, "claudeAgent");
-        assert.equal(startPayload.cwd, "/tmp/project-claude-start");
+        assert.equal(startPayload.provider, "cursor");
+        assert.equal(startPayload.cwd, "/tmp/project-cursor-start");
         assert.deepEqual(startPayload.resumeCursor, initial.resumeCursor);
         assert.equal(startPayload.threadId, initial.threadId);
+        assert.equal(startPayload.activeTurnId, persistedActiveTurnId);
+      }
+      assert.equal(resumedResult.resumed.activeTurnId, persistedActiveTurnId);
+      assert.equal(resumedResult.resumed.status, "running");
+      assert.equal(
+        resumedResult.sessions.find((session) => session.threadId === initial.threadId)
+          ?.activeTurnId,
+        persistedActiveTurnId,
+      );
+      assert.equal(
+        resumedResult.sessions.find((session) => session.threadId === initial.threadId)?.status,
+        "running",
+      );
+      assert.equal(Option.isSome(resumedResult.binding), true);
+      if (Option.isSome(resumedResult.binding)) {
+        const runtimePayload = resumedResult.binding.value.runtimePayload as {
+          readonly activeTurnId?: unknown;
+        };
+        assert.equal(runtimePayload.activeTurnId, persistedActiveTurnId);
+        assert.equal(resumedResult.binding.value.status, "running");
+      }
+
+      const replacementCursorAdapter = makeFakeCodexAdapter(CURSOR_DRIVER);
+      const replacementRegistry = makeAdapterRegistryMock({
+        [ProviderDriverKind.make("cursor")]: replacementCursorAdapter.adapter,
+      });
+      const replacementProviderLayer = makeProviderServiceLive().pipe(
+        Layer.provide(
+          Layer.succeed(ProviderAdapterRegistry.ProviderAdapterRegistry, replacementRegistry),
+        ),
+        Layer.provide(secondDirectoryLayer),
+        Layer.provide(defaultServerSettingsLayer),
+        Layer.provide(AnalyticsService.layerTest),
+        Layer.provide(
+          Layer.succeed(
+            ProviderEventLoggers.ProviderEventLoggers,
+            ProviderEventLoggers.NoOpProviderEventLoggers,
+          ),
+        ),
+      );
+      const replacementCursor = { opaque: "replacement-cursor" };
+
+      yield* Effect.gen(function* () {
+        const provider = yield* ProviderService.ProviderService;
+        yield* provider.startSession(initial.threadId, {
+          provider: ProviderDriverKind.make("cursor"),
+          providerInstanceId: cursorInstanceId,
+          threadId: initial.threadId,
+          cwd: "/tmp/project-cursor-start",
+          resumeCursor: replacementCursor,
+          runtimeMode: "full-access",
+        });
+      }).pipe(Effect.provide(replacementProviderLayer));
+
+      assert.equal(replacementCursorAdapter.startSession.mock.calls.length, 1);
+      const replacementStartInput = replacementCursorAdapter.startSession.mock.calls[0]?.[0];
+      assert.equal(
+        typeof replacementStartInput === "object" && replacementStartInput !== null,
+        true,
+      );
+      if (replacementStartInput && typeof replacementStartInput === "object") {
+        const startPayload = replacementStartInput as {
+          resumeCursor?: unknown;
+          activeTurnId?: string;
+        };
+        assert.deepEqual(startPayload.resumeCursor, replacementCursor);
+        assert.equal(startPayload.activeTurnId, undefined);
       }
 
       NodeFS.rmSync(tempDir, { recursive: true, force: true });
     }).pipe(Effect.provide(NodeServices.layer)),
+  );
+
+  it.effect("does not resume persisted active turns for adapters without active-turn resume", () =>
+    Effect.gen(function* () {
+      const tempDir = NodeFS.mkdtempSync(
+        NodePath.join(NodeOS.tmpdir(), "t3-provider-service-unsupported-active-"),
+      );
+      const dbPath = NodePath.join(tempDir, "orchestration.sqlite");
+      const persistenceLayer = makeSqlitePersistenceLive(dbPath);
+      const runtimeRepositoryLayer = ProviderSessionRuntime.layer.pipe(
+        Layer.provide(persistenceLayer),
+      );
+      const directoryLayer = ProviderSessionDirectoryLive.pipe(
+        Layer.provide(runtimeRepositoryLayer),
+      );
+      const claude = makeFakeCodexAdapter(CLAUDE_AGENT_DRIVER);
+      const registry = makeAdapterRegistryMock({
+        [ProviderDriverKind.make("claudeAgent")]: claude.adapter,
+      });
+      const providerLayer = makeProviderServiceLive().pipe(
+        Layer.provide(Layer.succeed(ProviderAdapterRegistry.ProviderAdapterRegistry, registry)),
+        Layer.provide(directoryLayer),
+        Layer.provide(defaultServerSettingsLayer),
+        Layer.provide(AnalyticsService.layerTest),
+        Layer.provide(
+          Layer.succeed(
+            ProviderEventLoggers.ProviderEventLoggers,
+            ProviderEventLoggers.NoOpProviderEventLoggers,
+          ),
+        ),
+      );
+      const threadId = asThreadId("thread-unsupported-active-resume");
+      const resumeCursor = { opaque: "resume-unsupported-active" };
+      const persistedActiveTurnId = asTurnId("turn-unsupported-active");
+
+      yield* Effect.gen(function* () {
+        const directory = yield* ProviderSessionDirectory.ProviderSessionDirectory;
+        yield* directory.upsert({
+          threadId,
+          provider: ProviderDriverKind.make("claudeAgent"),
+          providerInstanceId: claudeAgentInstanceId,
+          runtimeMode: "full-access",
+          status: "running",
+          resumeCursor,
+          runtimePayload: {
+            cwd: "/tmp/project-unsupported-active",
+            activeTurnId: persistedActiveTurnId,
+          },
+        });
+      }).pipe(Effect.provide(directoryLayer));
+
+      const resumedResult = yield* Effect.gen(function* () {
+        const provider = yield* ProviderService.ProviderService;
+        const resumed = yield* provider.startSession(threadId, {
+          provider: ProviderDriverKind.make("claudeAgent"),
+          providerInstanceId: claudeAgentInstanceId,
+          threadId,
+          cwd: "/tmp/project-unsupported-active",
+          runtimeMode: "full-access",
+        });
+        const directory = yield* ProviderSessionDirectory.ProviderSessionDirectory;
+        const binding = yield* directory.getBinding(threadId);
+        const sessions = yield* provider.listSessions();
+        return { binding, resumed, sessions };
+      }).pipe(Effect.provide(providerLayer));
+
+      assert.equal(claude.startSession.mock.calls.length, 1);
+      const startInput = claude.startSession.mock.calls[0]?.[0];
+      assert.equal(typeof startInput === "object" && startInput !== null, true);
+      if (startInput && typeof startInput === "object") {
+        const startPayload = startInput as {
+          readonly activeTurnId?: unknown;
+          readonly resumeCursor?: unknown;
+        };
+        assert.deepEqual(startPayload.resumeCursor, resumeCursor);
+        assert.equal(startPayload.activeTurnId, undefined);
+      }
+      assert.equal(resumedResult.resumed.status, "ready");
+      assert.equal(resumedResult.resumed.activeTurnId, undefined);
+      const listed = resumedResult.sessions.find((session) => session.threadId === threadId);
+      assert.equal(listed?.status, "ready");
+      assert.equal(listed?.activeTurnId, undefined);
+      assert.equal(Option.isSome(resumedResult.binding), true);
+      if (Option.isSome(resumedResult.binding)) {
+        const runtimePayload = resumedResult.binding.value.runtimePayload as {
+          readonly activeTurnId?: unknown;
+        };
+        assert.equal(runtimePayload.activeTurnId, null);
+      }
+
+      NodeFS.rmSync(tempDir, { recursive: true, force: true });
+    }).pipe(Effect.provide(NodeServices.layer)),
+  );
+
+  it.effect("does not resurrect persisted active turns over ready live sessions", () =>
+    Effect.gen(function* () {
+      const provider = yield* ProviderService.ProviderService;
+      const directory = yield* ProviderSessionDirectory.ProviderSessionDirectory;
+      const threadId = asThreadId("thread-live-ready-stale-active");
+      const session = yield* provider.startSession(threadId, {
+        provider: ProviderDriverKind.make("cursor"),
+        providerInstanceId: cursorInstanceId,
+        threadId,
+        cwd: "/tmp/project-live-ready-stale-active",
+        runtimeMode: "full-access",
+      });
+
+      yield* directory.upsert({
+        threadId,
+        provider: ProviderDriverKind.make("cursor"),
+        providerInstanceId: cursorInstanceId,
+        runtimeMode: "full-access",
+        status: "running",
+        resumeCursor: session.resumeCursor,
+        runtimePayload: {
+          cwd: "/tmp/project-live-ready-stale-active",
+          activeTurnId: asTurnId("turn-stale-persisted-active"),
+        },
+      });
+
+      const sessions = yield* provider.listSessions();
+      const listed = sessions.find((candidate) => candidate.threadId === threadId);
+      assert.equal(listed?.status, "ready");
+      assert.equal(listed?.activeTurnId, undefined);
+    }),
   );
 
   it.effect(

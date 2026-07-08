@@ -757,7 +757,7 @@ export function makeCursorAdapter(
           const session: ProviderSession = {
             provider: PROVIDER,
             providerInstanceId: boundInstanceId,
-            status: "ready",
+            status: input.activeTurnId !== undefined ? "running" : "ready",
             runtimeMode: input.runtimeMode,
             cwd,
             model: cursorModelSelection?.model,
@@ -766,6 +766,7 @@ export function makeCursorAdapter(
               schemaVersion: CURSOR_RESUME_VERSION,
               sessionId: started.sessionId,
             },
+            ...(input.activeTurnId !== undefined ? { activeTurnId: input.activeTurnId } : {}),
             createdAt: now,
             updatedAt: now,
           };
@@ -781,7 +782,7 @@ export function makeCursorAdapter(
             pendingUserInputs,
             turns: [],
             lastPlanFingerprint: undefined,
-            activeTurnId: undefined,
+            activeTurnId: input.activeTurnId,
             promptsInFlight: 0,
             stopped: false,
           };
@@ -897,7 +898,10 @@ export function makeCursorAdapter(
             ...(yield* makeEventStamp()),
             provider: PROVIDER,
             threadId: input.threadId,
-            payload: { state: "ready", reason: "Cursor ACP session ready" },
+            payload:
+              input.activeTurnId !== undefined
+                ? { state: "running", reason: "Cursor ACP session resumed with active turn" }
+                : { state: "ready", reason: "Cursor ACP session ready" },
           });
           yield* offerRuntimeEvent({
             type: "thread.started",
@@ -914,11 +918,18 @@ export function makeCursorAdapter(
     const sendTurn: CursorAdapterShape["sendTurn"] = (input) =>
       Effect.gen(function* () {
         const ctx = yield* requireSession(input.threadId);
-        // A sendTurn while a prompt is in flight is a steer: the agent folds
-        // the new prompt into the ongoing work, so the active turn id is
-        // reused instead of opening a new turn.
-        const steeringTurnId = ctx.promptsInFlight > 0 ? ctx.activeTurnId : undefined;
+        // A sendTurn during active work is a steer: the agent folds the new
+        // prompt into the ongoing work, so the active turn id is reused
+        // instead of opening a new turn.
+        const steeringTurnId =
+          ctx.promptsInFlight > 0 || ctx.session.status === "running"
+            ? ctx.activeTurnId
+            : undefined;
         const turnId = steeringTurnId ?? TurnId.make(yield* randomUUIDv4);
+        const previousActiveTurnId = ctx.activeTurnId;
+        const previousSession = ctx.session;
+        const previousLastPlanFingerprint = ctx.lastPlanFingerprint;
+        let activeStateApplied = false;
         // Count this prompt immediately so a superseded in-flight prompt
         // resolving from here on does not settle the turn; the matching
         // decrement is the `ensuring` below.
@@ -949,9 +960,11 @@ export function makeCursorAdapter(
           }
           ctx.session = {
             ...ctx.session,
+            status: "running",
             activeTurnId: turnId,
             updatedAt: yield* nowIso,
           };
+          activeStateApplied = true;
 
           if (steeringTurnId === undefined) {
             yield* offerRuntimeEvent({
@@ -1024,17 +1037,19 @@ export function makeCursorAdapter(
           } else {
             ctx.turns.push({ id: turnId, items: [{ prompt: promptParts, result }] });
           }
-          ctx.session = {
-            ...ctx.session,
-            activeTurnId: turnId,
-            updatedAt: yield* nowIso,
-            model: resolvedModel,
-          };
-
           // Only the last remaining prompt settles the turn — a steer-
           // superseded prompt resolving (usually cancelled) while another is
           // in flight or pending must leave the merged turn running.
           if (ctx.promptsInFlight === 1) {
+            const { activeTurnId: _completedActiveTurnId, ...sessionWithoutActiveTurn } =
+              ctx.session;
+            ctx.activeTurnId = undefined;
+            ctx.session = {
+              ...sessionWithoutActiveTurn,
+              status: "ready",
+              updatedAt: yield* nowIso,
+              model: resolvedModel,
+            };
             yield* offerRuntimeEvent({
               type: "turn.completed",
               ...(yield* makeEventStamp()),
@@ -1046,6 +1061,14 @@ export function makeCursorAdapter(
                 stopReason: result.stopReason ?? null,
               },
             });
+          } else {
+            ctx.session = {
+              ...ctx.session,
+              status: "running",
+              activeTurnId: turnId,
+              updatedAt: yield* nowIso,
+              model: resolvedModel,
+            };
           }
 
           return {
@@ -1054,6 +1077,20 @@ export function makeCursorAdapter(
             resumeCursor: ctx.session.resumeCursor,
           };
         }).pipe(
+          Effect.onError(() =>
+            Effect.sync(() => {
+              if (
+                activeStateApplied &&
+                ctx.promptsInFlight === 1 &&
+                ctx.activeTurnId === turnId &&
+                ctx.session.activeTurnId === turnId
+              ) {
+                ctx.activeTurnId = previousActiveTurnId;
+                ctx.session = previousSession;
+                ctx.lastPlanFingerprint = previousLastPlanFingerprint;
+              }
+            }),
+          ),
           Effect.ensuring(
             Effect.sync(() => {
               ctx.promptsInFlight = Math.max(0, ctx.promptsInFlight - 1);
@@ -1065,6 +1102,10 @@ export function makeCursorAdapter(
     const interruptTurn: CursorAdapterShape["interruptTurn"] = (threadId) =>
       Effect.gen(function* () {
         const ctx = yield* requireSession(threadId);
+        const resumedTurnToCancel =
+          ctx.promptsInFlight === 0 && ctx.activeTurnId !== undefined
+            ? ctx.activeTurnId
+            : undefined;
         yield* settlePendingApprovalsAsCancelled(ctx.pendingApprovals);
         yield* settlePendingUserInputsAsEmptyAnswers(ctx.pendingUserInputs);
         yield* Effect.ignore(
@@ -1074,6 +1115,30 @@ export function makeCursorAdapter(
             ),
           ),
         );
+        if (
+          resumedTurnToCancel !== undefined &&
+          ctx.promptsInFlight === 0 &&
+          ctx.activeTurnId === resumedTurnToCancel
+        ) {
+          const { activeTurnId: _cancelledActiveTurnId, ...sessionWithoutActiveTurn } = ctx.session;
+          ctx.activeTurnId = undefined;
+          ctx.session = {
+            ...sessionWithoutActiveTurn,
+            status: "ready",
+            updatedAt: yield* nowIso,
+          };
+          yield* offerRuntimeEvent({
+            type: "turn.completed",
+            ...(yield* makeEventStamp()),
+            provider: PROVIDER,
+            threadId,
+            turnId: resumedTurnToCancel,
+            payload: {
+              state: "cancelled",
+              stopReason: "cancelled",
+            },
+          });
+        }
       });
 
     const respondToRequest: CursorAdapterShape["respondToRequest"] = (

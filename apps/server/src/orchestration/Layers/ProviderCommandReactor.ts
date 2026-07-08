@@ -558,6 +558,7 @@ const make = Effect.gen(function* () {
 
     const startProviderSession = (input?: {
       readonly resumeCursor?: unknown;
+      readonly activeTurnId?: TurnId;
       readonly provider?: ProviderDriverKind;
     }) =>
       providerService.startSession(threadId, {
@@ -567,6 +568,7 @@ const make = Effect.gen(function* () {
         ...(effectiveCwd ? { cwd: effectiveCwd } : {}),
         modelSelection: desiredModelSelection,
         ...(input?.resumeCursor !== undefined ? { resumeCursor: input.resumeCursor } : {}),
+        ...(input?.activeTurnId !== undefined ? { activeTurnId: input.activeTurnId } : {}),
         runtimeMode: desiredRuntimeMode,
         ...(options?.providerSessionDetached !== undefined
           ? { detached: options.providerSessionDetached }
@@ -590,8 +592,11 @@ const make = Effect.gen(function* () {
             providerName: session.provider,
             providerInstanceId: session.providerInstanceId,
             runtimeMode: desiredRuntimeMode,
-            // Provider turn ids are not orchestration turn ids.
-            activeTurnId: null,
+            // Preserve only active orchestration turn ids carried by provider sessions.
+            activeTurnId:
+              session.status === "running" && session.activeTurnId !== undefined
+                ? session.activeTurnId
+                : null,
             lastError: session.lastError ?? null,
             updatedAt: session.updatedAt,
           },
@@ -635,6 +640,8 @@ const make = Effect.gen(function* () {
       const resumeCursor = shouldRestartForModelChange
         ? undefined
         : (activeSession?.resumeCursor ?? undefined);
+      const restartActiveTurnId =
+        activeSession?.status === "running" ? activeSession.activeTurnId : undefined;
       yield* Effect.logInfo("provider command reactor restarting provider session", {
         threadId,
         existingSessionThreadId,
@@ -653,9 +660,15 @@ const make = Effect.gen(function* () {
         shouldRestartForModelChange,
         shouldRestartForModelSelectionChange,
         hasResumeCursor: resumeCursor !== undefined,
+        hasActiveTurn: restartActiveTurnId !== undefined,
       });
       const restartedSession = yield* startProviderSession(
-        resumeCursor !== undefined ? { resumeCursor } : undefined,
+        resumeCursor !== undefined
+          ? {
+              resumeCursor,
+              ...(restartActiveTurnId !== undefined ? { activeTurnId: restartActiveTurnId } : {}),
+            }
+          : undefined,
       );
       yield* Effect.logInfo("provider command reactor restarted provider session", {
         threadId,

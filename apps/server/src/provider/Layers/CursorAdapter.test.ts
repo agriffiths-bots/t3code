@@ -22,6 +22,7 @@ import {
   ProviderDriverKind,
   type ProviderRuntimeEvent,
   ThreadId,
+  TurnId,
   ProviderInstanceId,
 } from "@t3tools/contracts";
 
@@ -246,6 +247,11 @@ cursorAdapterTestLayer("CursorAdapterLive", (it) => {
         ]);
       }
 
+      const completedSessions = yield* adapter.listSessions();
+      const completedSession = completedSessions.find((entry) => entry.threadId === threadId);
+      assert.equal(completedSession?.status, "ready");
+      assert.equal(completedSession?.activeTurnId, undefined);
+
       yield* adapter.stopSession(threadId);
     }),
   );
@@ -321,6 +327,305 @@ cursorAdapterTestLayer("CursorAdapterLive", (it) => {
       assert.equal(String(turnStartedEvents[0]?.turnId), String(firstTurn.turnId));
       assert.equal(turnCompletedEvents.length, 1);
       assert.equal(String(turnCompletedEvents[0]?.turnId), String(firstTurn.turnId));
+
+      yield* adapter.stopSession(threadId);
+    }),
+  );
+
+  it.effect("keeps a steered turn active when an earlier prompt fails", () =>
+    Effect.gen(function* () {
+      const adapter = yield* CursorAdapter;
+      const settings = yield* ServerSettingsService;
+      const threadId = ThreadId.make("cursor-steer-first-fails-thread");
+
+      const wrapperPath = yield* Effect.promise(() =>
+        makeMockAgentWrapper({
+          T3_ACP_FAIL_FIRST_PROMPT: "1",
+          T3_ACP_FIRST_PROMPT_DELAY_MS: "100",
+          T3_ACP_SECOND_PROMPT_DELAY_MS: "1000",
+        }),
+      );
+      yield* settings.updateSettings({ providers: { cursor: { binaryPath: wrapperPath } } });
+
+      yield* adapter.startSession({
+        threadId,
+        provider: ProviderDriverKind.make("cursor"),
+        cwd: process.cwd(),
+        runtimeMode: "full-access",
+        modelSelection: { instanceId: ProviderInstanceId.make("cursor"), model: "default" },
+      });
+
+      const firstTurnFiber = yield* adapter
+        .sendTurn({
+          threadId,
+          input: "start a turn that will fail",
+          attachments: [],
+        })
+        .pipe(Effect.exit, Effect.forkChild);
+
+      let activeTurnId: TurnId | undefined;
+      yield* Effect.gen(function* () {
+        for (let attempt = 0; attempt < 200; attempt += 1) {
+          const sessions = yield* adapter.listSessions();
+          const session = sessions.find((entry) => entry.threadId === threadId);
+          if (session?.activeTurnId !== undefined) {
+            activeTurnId = session.activeTurnId;
+            return;
+          }
+          yield* TestClock.adjust("10 millis");
+        }
+        throw new Error("Timed out waiting for the first prompt to be in flight.");
+      });
+
+      const steeredTurnFiber = yield* adapter
+        .sendTurn({
+          threadId,
+          input: "keep working on the same turn",
+          attachments: [],
+        })
+        .pipe(Effect.forkChild);
+
+      const firstExit = yield* Fiber.join(firstTurnFiber);
+      assert.equal(firstExit._tag, "Failure");
+
+      const runningSessions = yield* adapter.listSessions();
+      const runningSession = runningSessions.find((entry) => entry.threadId === threadId);
+      assert.equal(runningSession?.status, "running");
+      assert.equal(String(runningSession?.activeTurnId), String(activeTurnId));
+
+      const steeredTurn = yield* Fiber.join(steeredTurnFiber);
+      assert.equal(String(steeredTurn.turnId), String(activeTurnId));
+
+      const completedSessions = yield* adapter.listSessions();
+      const completedSession = completedSessions.find((entry) => entry.threadId === threadId);
+      assert.equal(completedSession?.status, "ready");
+      assert.equal(completedSession?.activeTurnId, undefined);
+
+      yield* adapter.stopSession(threadId);
+    }),
+  );
+
+  it.effect("rolls back active session state when sendTurn fails during prompt preparation", () =>
+    Effect.gen(function* () {
+      const adapter = yield* CursorAdapter;
+      const settings = yield* ServerSettingsService;
+      const threadId = ThreadId.make("cursor-send-turn-rollback");
+
+      const wrapperPath = yield* Effect.promise(() => makeMockAgentWrapper());
+      yield* settings.updateSettings({ providers: { cursor: { binaryPath: wrapperPath } } });
+
+      yield* adapter.startSession({
+        threadId,
+        provider: ProviderDriverKind.make("cursor"),
+        cwd: process.cwd(),
+        runtimeMode: "full-access",
+        modelSelection: { instanceId: ProviderInstanceId.make("cursor"), model: "default" },
+      });
+
+      yield* Effect.flip(
+        adapter.sendTurn({
+          threadId,
+          input: "send a missing image",
+          attachments: [
+            {
+              type: "image",
+              id: "missing-image",
+              name: "missing.png",
+              mimeType: "image/png",
+              sizeBytes: 1,
+            },
+          ],
+        }),
+      );
+
+      const sessions = yield* adapter.listSessions();
+      const session = sessions.find((entry) => entry.threadId === threadId);
+      assert.equal(session?.status, "ready");
+      assert.equal(session?.activeTurnId, undefined);
+
+      yield* adapter.stopSession(threadId);
+    }),
+  );
+
+  it.effect("steers a resumed active turn before idle settlement", () =>
+    Effect.gen(function* () {
+      const adapter = yield* CursorAdapter;
+      const settings = yield* ServerSettingsService;
+      const threadId = ThreadId.make("cursor-resume-steer-thread");
+      const activeTurnId = TurnId.make("turn-cursor-resume-steer");
+
+      const wrapperPath = yield* Effect.promise(() => makeMockAgentWrapper());
+      yield* settings.updateSettings({ providers: { cursor: { binaryPath: wrapperPath } } });
+
+      const runtimeEventsFiber = yield* adapter.streamEvents.pipe(
+        Stream.filter((event) => event.threadId === threadId),
+        Stream.takeUntil((event) => event.type === "turn.completed"),
+        Stream.runCollect,
+        Effect.forkChild,
+      );
+
+      yield* adapter.startSession({
+        threadId,
+        provider: ProviderDriverKind.make("cursor"),
+        cwd: process.cwd(),
+        runtimeMode: "full-access",
+        modelSelection: { instanceId: ProviderInstanceId.make("cursor"), model: "default" },
+        resumeCursor: {
+          schemaVersion: 1,
+          sessionId: "mock-session-1",
+        },
+        activeTurnId,
+      });
+
+      const turn = yield* adapter.sendTurn({
+        threadId,
+        input: "continue the resumed turn",
+        attachments: [],
+      });
+      assert.equal(String(turn.turnId), String(activeTurnId));
+
+      const runtimeEvents = Array.from(yield* Fiber.join(runtimeEventsFiber));
+      const turnStartedEvents = runtimeEvents.filter((event) => event.type === "turn.started");
+      assert.equal(turnStartedEvents.length, 0);
+      const completed = runtimeEvents.find((event) => event.type === "turn.completed");
+      assert.isDefined(completed);
+      if (completed?.type === "turn.completed") {
+        assert.equal(String(completed.turnId), String(activeTurnId));
+      }
+
+      const sessions = yield* adapter.listSessions();
+      const settledSession = sessions.find((entry) => entry.threadId === threadId);
+      assert.equal(settledSession?.status, "ready");
+      assert.equal(settledSession?.activeTurnId, undefined);
+
+      yield* adapter.stopSession(threadId);
+    }),
+  );
+
+  it.effect("clears a resumed active turn when interrupted before a local prompt", () =>
+    Effect.gen(function* () {
+      const adapter = yield* CursorAdapter;
+      const settings = yield* ServerSettingsService;
+      const threadId = ThreadId.make("cursor-resume-interrupt-thread");
+      const activeTurnId = TurnId.make("turn-cursor-resume-interrupt");
+
+      const wrapperPath = yield* Effect.promise(() => makeMockAgentWrapper());
+      yield* settings.updateSettings({ providers: { cursor: { binaryPath: wrapperPath } } });
+
+      const completionFiber = yield* adapter.streamEvents.pipe(
+        Stream.filter((event) => event.threadId === threadId),
+        Stream.filter((event) => event.type === "turn.completed"),
+        Stream.take(1),
+        Stream.runCollect,
+        Effect.forkChild,
+      );
+
+      yield* adapter.startSession({
+        threadId,
+        provider: ProviderDriverKind.make("cursor"),
+        cwd: process.cwd(),
+        runtimeMode: "full-access",
+        modelSelection: { instanceId: ProviderInstanceId.make("cursor"), model: "default" },
+        resumeCursor: {
+          schemaVersion: 1,
+          sessionId: "mock-session-1",
+        },
+        activeTurnId,
+      });
+
+      yield* adapter.interruptTurn(threadId);
+      const completionEvents = Array.from(yield* Fiber.join(completionFiber));
+      const completion = completionEvents[0];
+      assert.equal(completion?.type, "turn.completed");
+      if (completion?.type === "turn.completed") {
+        assert.equal(String(completion.turnId), String(activeTurnId));
+        assert.equal(completion.payload.state, "cancelled");
+      }
+
+      const interruptedSessions = yield* adapter.listSessions();
+      const interruptedSession = interruptedSessions.find((entry) => entry.threadId === threadId);
+      assert.equal(interruptedSession?.status, "ready");
+      assert.equal(interruptedSession?.activeTurnId, undefined);
+
+      const nextTurn = yield* adapter.sendTurn({
+        threadId,
+        input: "start fresh after interrupt",
+        attachments: [],
+      });
+      assert.notEqual(String(nextTurn.turnId), String(activeTurnId));
+
+      yield* adapter.stopSession(threadId);
+    }),
+  );
+
+  it.effect("binds session/load live continuations to the resumed active turn", () =>
+    Effect.gen(function* () {
+      const adapter = yield* CursorAdapter;
+      const settings = yield* ServerSettingsService;
+      const threadId = ThreadId.make("cursor-resume-live-continuation");
+      const activeTurnId = TurnId.make("turn-cursor-resume-live");
+
+      const wrapperPath = yield* Effect.promise(() =>
+        makeMockAgentWrapper({
+          T3_ACP_EMIT_LOAD_REPLAY_LIVE_CONTINUATION: "1",
+          T3_ACP_LOAD_REPLAY_LIVE_CONTINUATION_DELAY_MS: "0",
+        }),
+      );
+      yield* settings.updateSettings({ providers: { cursor: { binaryPath: wrapperPath } } });
+
+      const runtimeEventsFiber = yield* adapter.streamEvents.pipe(
+        Stream.filter((event) => event.threadId === threadId),
+        Stream.takeUntil(
+          (event) => event.type === "content.delta" && event.payload.delta === " live continuation",
+        ),
+        Stream.runCollect,
+        Effect.forkChild,
+      );
+
+      const session = yield* adapter.startSession({
+        threadId,
+        provider: ProviderDriverKind.make("cursor"),
+        cwd: process.cwd(),
+        runtimeMode: "full-access",
+        modelSelection: { instanceId: ProviderInstanceId.make("cursor"), model: "default" },
+        resumeCursor: {
+          schemaVersion: 1,
+          sessionId: "mock-session-1",
+        },
+        activeTurnId,
+      });
+
+      assert.equal(String(session.activeTurnId), String(activeTurnId));
+      assert.equal(session.status, "running");
+      const runtimeEvents = Array.from(yield* Fiber.join(runtimeEventsFiber));
+      const sessionState = runtimeEvents.find((event) => event.type === "session.state.changed");
+      assert.isDefined(sessionState);
+      if (sessionState?.type === "session.state.changed") {
+        assert.equal(sessionState.payload.state, "running");
+      }
+      const assistantStarted = runtimeEvents.find(
+        (event) => event.type === "item.started" && event.payload.itemType === "assistant_message",
+      );
+      assert.isDefined(assistantStarted);
+      if (assistantStarted?.type === "item.started") {
+        assert.equal(String(assistantStarted.turnId), String(activeTurnId));
+        assert.equal(assistantStarted.itemId, "assistant:mock-session-1:segment:0");
+      }
+
+      const delta = runtimeEvents.find((event) => event.type === "content.delta");
+      assert.isDefined(delta);
+      if (delta?.type === "content.delta") {
+        assert.equal(String(delta.turnId), String(activeTurnId));
+        assert.equal(delta.itemId, "assistant:mock-session-1:segment:0");
+        assert.equal(delta.payload.delta, " live continuation");
+      }
+
+      assert.isUndefined(runtimeEvents.find((event) => event.type === "turn.completed"));
+
+      const sessions = yield* adapter.listSessions();
+      const resumedSession = sessions.find((entry) => entry.threadId === threadId);
+      assert.equal(resumedSession?.status, "running");
+      assert.equal(String(resumedSession?.activeTurnId), String(activeTurnId));
 
       yield* adapter.stopSession(threadId);
     }),

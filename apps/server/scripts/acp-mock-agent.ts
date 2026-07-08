@@ -45,10 +45,19 @@ const emitStaleXAiPromptCompleteBeforeSecondHang =
 const emitOverlappingXAiPromptCompleteOutOfOrder =
   process.env.T3_ACP_EMIT_OVERLAPPING_XAI_PROMPT_COMPLETE_OUT_OF_ORDER === "1";
 const failPrompt = process.env.T3_ACP_FAIL_PROMPT === "1";
+const failFirstPrompt = process.env.T3_ACP_FAIL_FIRST_PROMPT === "1";
 const failSetConfigOption = process.env.T3_ACP_FAIL_SET_CONFIG_OPTION === "1";
 const exitOnSetConfigOption = process.env.T3_ACP_EXIT_ON_SET_CONFIG_OPTION === "1";
 const promptResponseText = process.env.T3_ACP_PROMPT_RESPONSE_TEXT;
 const promptDelayMs = Number(process.env.T3_ACP_PROMPT_DELAY_MS ?? "0");
+const firstPromptDelayMs =
+  process.env.T3_ACP_FIRST_PROMPT_DELAY_MS === undefined
+    ? undefined
+    : Number(process.env.T3_ACP_FIRST_PROMPT_DELAY_MS);
+const secondPromptDelayMs =
+  process.env.T3_ACP_SECOND_PROMPT_DELAY_MS === undefined
+    ? undefined
+    : Number(process.env.T3_ACP_SECOND_PROMPT_DELAY_MS);
 const permissionOptionIds = {
   allowOnce: process.env.T3_ACP_ALLOW_ONCE_OPTION_ID ?? "allow-once",
   allowAlways: process.env.T3_ACP_ALLOW_ALWAYS_OPTION_ID ?? "allow-always",
@@ -564,11 +573,17 @@ const program = Effect.gen(function* () {
       const requestedSessionId = String(request.sessionId ?? sessionId);
       promptCount += 1;
 
-      if (Number.isFinite(promptDelayMs) && promptDelayMs > 0) {
-        yield* Effect.sleep(`${promptDelayMs} millis`);
+      const effectivePromptDelayMs =
+        promptCount === 1 && firstPromptDelayMs !== undefined
+          ? firstPromptDelayMs
+          : promptCount === 2 && secondPromptDelayMs !== undefined
+            ? secondPromptDelayMs
+            : promptDelayMs;
+      if (Number.isFinite(effectivePromptDelayMs) && effectivePromptDelayMs > 0) {
+        yield* Effect.sleep(`${effectivePromptDelayMs} millis`);
       }
 
-      if (failPrompt) {
+      if (failPrompt || (failFirstPrompt && promptCount === 1)) {
         return yield* AcpError.AcpRequestError.internalError("Mock prompt failure");
       }
 
