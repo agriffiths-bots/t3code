@@ -309,6 +309,57 @@ function deriveFinalAssistantBoundariesByTurnId(input: {
   return boundariesByTurnId;
 }
 
+function deriveEffectiveFinalAssistantBoundariesByTurnId(
+  timelineEntries: ReadonlyArray<TimelineEntry>,
+  boundariesByTurnId: ReadonlyMap<string, ReadonlySet<string>>,
+): ReadonlyMap<string, ReadonlySet<string>> {
+  const entriesByTurnId = new Map<string, TimelineEntry[]>();
+  for (const entry of timelineEntries) {
+    const turnId =
+      entry.kind === "message" && entry.message.role === "assistant"
+        ? (entry.message.turnId ?? null)
+        : entry.kind === "work"
+          ? (entry.entry.turnId ?? null)
+          : null;
+    if (turnId === null) {
+      continue;
+    }
+    const key = String(turnId);
+    const entries = entriesByTurnId.get(key);
+    if (entries) {
+      entries.push(entry);
+    } else {
+      entriesByTurnId.set(key, [entry]);
+    }
+  }
+
+  const effectiveBoundariesByTurnId = new Map<string, ReadonlySet<string>>(boundariesByTurnId);
+  for (const [turnId, boundary] of boundariesByTurnId) {
+    if (boundary.size === 0) {
+      continue;
+    }
+    const entries = entriesByTurnId.get(turnId) ?? [];
+    const matchingAssistantEntry = entries.some(
+      (entry) =>
+        entry.kind === "message" &&
+        entry.message.role === "assistant" &&
+        boundary.has(String(entry.message.id)),
+    );
+    if (matchingAssistantEntry) {
+      continue;
+    }
+    for (let index = entries.length - 1; index >= 0; index -= 1) {
+      const entry = entries[index];
+      if (entry?.kind === "message" && entry.message.role === "assistant") {
+        effectiveBoundariesByTurnId.set(turnId, new Set([String(entry.message.id)]));
+        break;
+      }
+    }
+  }
+
+  return effectiveBoundariesByTurnId;
+}
+
 function deriveTerminalNullTurnAssistantMessageIds(
   timelineEntries: ReadonlyArray<TimelineEntry>,
 ): ReadonlySet<string> {
@@ -557,12 +608,16 @@ export function deriveMessagesTimelineRows(input: {
   const durationStartByMessageId = computeMessageDurationStart(
     input.timelineEntries.flatMap((entry) => (entry.kind === "message" ? [entry.message] : [])),
   );
-  const finalAssistantBoundariesByTurnId = deriveFinalAssistantBoundariesByTurnId({
+  const explicitFinalAssistantBoundariesByTurnId = deriveFinalAssistantBoundariesByTurnId({
     latestTurn: input.latestTurn ?? null,
     turns: input.turns ?? [],
     turnDiffSummaryByAssistantMessageId: input.turnDiffSummaryByAssistantMessageId,
     turnDiffSummaryByTurnId: input.turnDiffSummaryByTurnId ?? new Map(),
   });
+  const finalAssistantBoundariesByTurnId = deriveEffectiveFinalAssistantBoundariesByTurnId(
+    input.timelineEntries,
+    explicitFinalAssistantBoundariesByTurnId,
+  );
   const terminalNullTurnAssistantMessageIds = deriveTerminalNullTurnAssistantMessageIds(
     input.timelineEntries,
   );
@@ -711,7 +766,10 @@ export function deriveMessagesTimelineRows(input: {
       assistantCopyStreaming: timelineEntry.message.streaming || assistantTurnStillInProgress,
       assistantTurnDiffSummary:
         timelineEntry.message.role === "assistant"
-          ? input.turnDiffSummaryByAssistantMessageId.get(timelineEntry.message.id)
+          ? (input.turnDiffSummaryByAssistantMessageId.get(timelineEntry.message.id) ??
+            (isFinalAssistantMessage && timelineEntry.message.turnId !== null
+              ? input.turnDiffSummaryByTurnId?.get(timelineEntry.message.turnId)
+              : undefined))
           : undefined,
       revertTurnCount: isTurnPromptMessage(timelineEntry.message)
         ? input.revertTurnCountByUserMessageId.get(timelineEntry.message.id)

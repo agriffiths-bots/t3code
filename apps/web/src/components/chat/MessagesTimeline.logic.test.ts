@@ -960,6 +960,102 @@ describe("deriveMessagesTimelineRows", () => {
     },
   );
 
+  it("falls back to the terminal assistant when a non-null final boundary is not projected", () => {
+    const turnSummary = {
+      turnId: "turn-1" as never,
+      completedAt: "2026-01-01T00:00:20Z",
+      assistantMessageId: "assistant:turn-1" as never,
+      checkpointTurnCount: 1,
+      checkpointRef: "checkpoint-1" as never,
+      status: "ready" as const,
+      files: [{ path: "src/index.ts", kind: "modified" as const, additions: 1, deletions: 0 }],
+    };
+
+    const rows = deriveMessagesTimelineRows({
+      timelineEntries: [
+        {
+          id: "user-entry",
+          kind: "message",
+          createdAt: "2026-01-01T00:00:00Z",
+          message: {
+            id: "user-1" as never,
+            role: "user",
+            text: "Do the thing",
+            turnId: null,
+            createdAt: "2026-01-01T00:00:00Z",
+            updatedAt: "2026-01-01T00:00:00Z",
+            streaming: false,
+          },
+        },
+        {
+          id: "assistant-mid-entry",
+          kind: "message",
+          createdAt: "2026-01-01T00:00:05Z",
+          message: {
+            id: "assistant-mid" as never,
+            role: "assistant",
+            text: "I will inspect first.",
+            turnId: "turn-1" as never,
+            createdAt: "2026-01-01T00:00:05Z",
+            updatedAt: "2026-01-01T00:00:05Z",
+            streaming: false,
+          },
+        },
+        {
+          id: "work-entry",
+          kind: "work",
+          createdAt: "2026-01-01T00:00:06Z",
+          entry: {
+            id: "work-1",
+            createdAt: "2026-01-01T00:00:06Z",
+            turnId: "turn-1" as never,
+            label: "Read file",
+            tone: "tool",
+          },
+        },
+        {
+          id: "assistant-final-entry",
+          kind: "message",
+          createdAt: "2026-01-01T00:00:20Z",
+          message: {
+            id: "assistant-final-visible" as never,
+            role: "assistant",
+            text: "Final answer.",
+            turnId: "turn-1" as never,
+            createdAt: "2026-01-01T00:00:20Z",
+            updatedAt: "2026-01-01T00:00:20Z",
+            streaming: false,
+          },
+        },
+      ],
+      latestTurn: {
+        turnId: "turn-1" as never,
+        state: "completed",
+        startedAt: "2026-01-01T00:00:00Z",
+        completedAt: "2026-01-01T00:00:20Z",
+        assistantMessageId: "assistant:turn-1" as never,
+      },
+      isWorking: false,
+      activeTurnStartedAt: null,
+      turnDiffSummaryByAssistantMessageId: new Map(),
+      turnDiffSummaryByTurnId: new Map([["turn-1" as never, turnSummary]]),
+      revertTurnCountByUserMessageId: new Map(),
+    });
+
+    expect(rows.map((row) => row.id)).toEqual([
+      "user-entry",
+      "turn-fold:turn-1",
+      "assistant-final-entry",
+    ]);
+    const assistantRow = rows.find(
+      (row): row is Extract<(typeof rows)[number], { kind: "message" }> =>
+        row.kind === "message" && row.message.role === "assistant",
+    );
+    expect(assistantRow?.message.text).toBe("Final answer.");
+    expect(assistantRow?.showAssistantMeta).toBe(true);
+    expect(assistantRow?.assistantTurnDiffSummary).toBe(turnSummary);
+  });
+
   it("uses checkpoint boundaries to contain mid-turn text for non-latest turns", () => {
     const turnSummary = {
       turnId: "turn-1" as never,
