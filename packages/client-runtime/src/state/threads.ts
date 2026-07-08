@@ -100,6 +100,43 @@ function mergeMessage(
   return snapshot.text.length >= current.text.length ? snapshot : current;
 }
 
+function mergeTurnBoundary(
+  current: OrchestrationThread["turns"][number],
+  snapshot: OrchestrationThread["turns"][number],
+  availableAssistantMessageIds: ReadonlySet<string>,
+): OrchestrationThread["turns"][number] {
+  const snapshotSettled = snapshot.state !== "running" && snapshot.completedAt !== null;
+  const currentSettled = current.state !== "running" && current.completedAt !== null;
+  const shouldUseSnapshotSettlement = current.state === "running" && snapshotSettled;
+  const snapshotAssistantMessageId =
+    snapshot.assistantMessageId !== null &&
+    availableAssistantMessageIds.has(String(snapshot.assistantMessageId))
+      ? snapshot.assistantMessageId
+      : null;
+  const snapshotHasAuthoritativeBoundary =
+    snapshotSettled &&
+    snapshotAssistantMessageId !== null &&
+    (current.completedAt === null || snapshot.completedAt >= current.completedAt);
+  const assistantMessageId = snapshotHasAuthoritativeBoundary
+    ? snapshotAssistantMessageId
+    : (current.assistantMessageId ?? snapshotAssistantMessageId);
+  const sourceProposedPlan = current.sourceProposedPlan ?? snapshot.sourceProposedPlan;
+
+  return {
+    ...current,
+    state: shouldUseSnapshotSettlement ? snapshot.state : current.state,
+    requestedAt: current.requestedAt || snapshot.requestedAt,
+    startedAt: current.startedAt ?? snapshot.startedAt,
+    completedAt:
+      current.completedAt ??
+      (shouldUseSnapshotSettlement || (!currentSettled && snapshotSettled)
+        ? snapshot.completedAt
+        : null),
+    assistantMessageId,
+    ...(sourceProposedPlan !== undefined ? { sourceProposedPlan } : {}),
+  };
+}
+
 function mergeNonAdvancingSnapshotThread(
   current: OrchestrationThread,
   snapshot: OrchestrationThread,
@@ -109,6 +146,12 @@ function mergeNonAdvancingSnapshotThread(
   // Use it only as an additive message recovery source; advancing snapshots
   // and live events remain responsible for scalar updates and destructive
   // collection changes such as reverts.
+  const availableAssistantMessageIds = new Set(
+    [...current.messages, ...snapshot.messages]
+      .filter((message) => message.role === "assistant" && !message.streaming)
+      .map((message) => String(message.id)),
+  );
+
   return {
     ...current,
     messages: mergeKeyedCollection(
@@ -123,7 +166,8 @@ function mergeNonAdvancingSnapshotThread(
       current.turns,
       snapshot.turns,
       (turn) => turn.turnId,
-      (existing) => existing,
+      (currentTurn, snapshotTurn) =>
+        mergeTurnBoundary(currentTurn, snapshotTurn, availableAssistantMessageIds),
       (left, right) =>
         compareString(left.requestedAt, right.requestedAt) ||
         compareString(left.turnId, right.turnId),
