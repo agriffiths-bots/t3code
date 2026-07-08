@@ -134,9 +134,10 @@ it.layer(NodeServices.layer)("peers CLI helpers", (it) => {
     assert.equal(__testing.peerPairingFetchRequestInit.redirect, "manual");
   });
 
-  it.effect("passes MCP endpoint overrides through pairing registration", () =>
+  it.effect("mints and stores MCP peer tokens while passing endpoint overrides", () =>
     Effect.gen(function* () {
       let capturedAdd: SubagentPeerRegistry.SubagentPeerAddInput | undefined;
+      const requestedUrls: Array<string> = [];
       const registry = registryService({
         getByAlias: () => Effect.succeed(Option.none()),
         add: (input) =>
@@ -156,21 +157,56 @@ it.layer(NodeServices.layer)("peers CLI helpers", (it) => {
       const httpLayer = Layer.succeed(
         HttpClient.HttpClient,
         HttpClient.make((request) => {
-          const response = request.url.endsWith("/.well-known/t3/environment")
-            ? Response.json({
-                environmentId: "env-peer",
-                label: "Peer",
-                platform: { os: "linux", arch: "x64" },
-                serverVersion: "0.0.0-test",
-                capabilities: { repositoryIdentity: true },
-              })
-            : Response.json({
-                access_token: "peer-access-token",
-                issued_token_type: AuthAccessTokenType,
-                token_type: "Bearer",
-                expires_in: 3600,
-                scope: "standard",
-              });
+          requestedUrls.push(request.url);
+          if (request.url.endsWith("/.well-known/t3/environment")) {
+            return Effect.succeed(
+              HttpClientResponse.fromWeb(
+                request,
+                Response.json({
+                  environmentId: "env-peer",
+                  label: "Peer",
+                  platform: { os: "linux", arch: "x64" },
+                  serverVersion: "0.0.0-test",
+                  capabilities: { repositoryIdentity: true },
+                }),
+              ),
+            );
+          }
+          if (request.url.endsWith("/oauth/token")) {
+            return Effect.succeed(
+              HttpClientResponse.fromWeb(
+                request,
+                Response.json({
+                  access_token: "peer-access-token",
+                  issued_token_type: AuthAccessTokenType,
+                  token_type: "Bearer",
+                  expires_in: 3600,
+                  scope: "standard",
+                }),
+              ),
+            );
+          }
+          if (request.url.endsWith("/api/mcp/peer-token")) {
+            assert.equal(request.headers.authorization, "Bearer peer-access-token");
+            return Effect.succeed(
+              HttpClientResponse.fromWeb(
+                request,
+                Response.json({
+                  peerTokenId: "peer-token-id",
+                  token: "mcp-peer-token",
+                  authorizationHeader: "Bearer mcp-peer-token",
+                  issuedAt: 1_725_000_000_000,
+                  capabilities: [
+                    "subagent:spawn",
+                    "subagent:check",
+                    "subagent:wait",
+                    "subagent:list",
+                  ],
+                }),
+              ),
+            );
+          }
+          const response = Response.json({ error: "unexpected request" }, { status: 404 });
           return Effect.succeed(HttpClientResponse.fromWeb(request, response));
         }),
       );
@@ -182,6 +218,16 @@ it.layer(NodeServices.layer)("peers CLI helpers", (it) => {
       }).pipe(Effect.provide(httpLayer));
 
       assert.equal(capturedAdd?.mcpEndpoint, "https://peer.example/custom-mcp");
+      assert.deepEqual(requestedUrls, [
+        "https://peer.example/.well-known/t3/environment",
+        "https://peer.example/oauth/token",
+        "https://peer.example/api/mcp/peer-token",
+      ]);
+      assert.equal(capturedAdd?.credential._tag, "bearer");
+      assert.equal(
+        capturedAdd?.credential._tag === "bearer" ? capturedAdd.credential.token : undefined,
+        "mcp-peer-token",
+      );
     }),
   );
 

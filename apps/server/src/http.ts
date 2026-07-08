@@ -1,5 +1,6 @@
 import Mime from "@effect/platform-node/Mime";
 import {
+  type AuthSessionId,
   AuthOrchestrationOperateScope,
   AuthOrchestrationReadScope,
   EnvironmentHttpApi,
@@ -37,6 +38,7 @@ import {
 import * as BrowserTraceCollector from "./observability/BrowserTraceCollector.ts";
 import * as EnvironmentAuth from "./auth/EnvironmentAuth.ts";
 import * as DeviceNotifications from "./notifications/DeviceNotifications.ts";
+import * as McpSessionRegistry from "./mcp/McpSessionRegistry.ts";
 import { traceRelayRequest } from "./cloud/traceRelayRequest.ts";
 import {
   annotateEnvironmentRequest,
@@ -55,6 +57,10 @@ import {
 } from "./httpCors.ts";
 import { buildElevenLabsRequest, resolveVoiceId, validateTtsText } from "./tts/ttsRequest.logic.ts";
 import { loadPlanUsageSnapshot } from "./usage/PlanUsage.ts";
+import {
+  SUBAGENT_PEER_MCP_TOKEN_PATH,
+  type SubagentPeerMcpTokenResult,
+} from "./subagents/SubagentPeerHttp.ts";
 
 const OTLP_TRACES_PROXY_PATH = "/api/observability/v1/traces";
 const TTS_SPEAK_PATH = "/api/tts/speak";
@@ -136,11 +142,11 @@ export function resolveDevRedirectUrl(devUrl: URL, requestUrl: URL): string {
   return redirectUrl.toString();
 }
 
-const authenticateRawRouteWithScope = (
+const authenticateRawRequestWithScope = (
+  request: HttpServerRequest.HttpServerRequest,
   scope: typeof AuthOrchestrationReadScope | typeof AuthOrchestrationOperateScope,
 ) =>
   Effect.gen(function* () {
-    const request = yield* HttpServerRequest.HttpServerRequest;
     const serverAuth = yield* EnvironmentAuth.EnvironmentAuth;
     const trustedOrigins = yield* configuredCookieAuthCsrfOriginsEffect;
     const session = yield* serverAuth.authenticateHttpRequest(request).pipe(
@@ -155,6 +161,31 @@ const authenticateRawRouteWithScope = (
     if (!session.scopes.includes(scope)) {
       return yield* failEnvironmentScopeRequired(scope);
     }
+    return session;
+  });
+
+const authenticateRawRouteWithScope = (
+  scope: typeof AuthOrchestrationReadScope | typeof AuthOrchestrationOperateScope,
+) =>
+  Effect.gen(function* () {
+    const request = yield* HttpServerRequest.HttpServerRequest;
+    return yield* authenticateRawRequestWithScope(request, scope);
+  });
+
+const confirmRawRequestSessionActive = (
+  request: HttpServerRequest.HttpServerRequest,
+  sessionId: AuthSessionId,
+) =>
+  Effect.gen(function* () {
+    const serverAuth = yield* EnvironmentAuth.EnvironmentAuth;
+    return yield* serverAuth.confirmHttpRequestSessionActive(request, sessionId).pipe(
+      Effect.catchIf(EnvironmentAuth.isServerAuthCredentialError, (error) =>
+        failEnvironmentAuthInvalid(EnvironmentAuth.serverAuthCredentialReason(error)),
+      ),
+      Effect.catchIf(EnvironmentAuth.isServerAuthInternalError, (error) =>
+        failEnvironmentInternal("internal_error", error),
+      ),
+    );
   });
 
 export const serverEnvironmentHttpApiLayer = HttpApiBuilder.group(
@@ -223,6 +254,56 @@ export const otlpTracesProxyRouteLayer = HttpRouter.add(
           HttpServerResponse.text("Trace export failed.", { status: 502 }),
         ),
       );
+  }).pipe(
+    Effect.catchTags({
+      EnvironmentAuthInvalidError: HttpServerRespondable.toResponse,
+      EnvironmentInternalError: HttpServerRespondable.toResponse,
+      EnvironmentScopeRequiredError: HttpServerRespondable.toResponse,
+    }),
+  ),
+);
+
+export const mcpPeerTokenRouteLayer = HttpRouter.add(
+  "POST",
+  SUBAGENT_PEER_MCP_TOKEN_PATH,
+  Effect.gen(function* () {
+    const request = yield* HttpServerRequest.HttpServerRequest;
+    const session = yield* authenticateRawRequestWithScope(request, AuthOrchestrationOperateScope);
+    const issued = yield* McpSessionRegistry.issueActiveMcpPeerCredential({
+      sourceSessionId: session.sessionId,
+      ...(session.expiresAt ? { expiresAt: session.expiresAt.epochMilliseconds } : {}),
+    }).pipe(
+      Effect.catchTag("McpPeerTokenStoreError", (error) =>
+        failEnvironmentInternal("internal_error", error),
+      ),
+    );
+    if (issued === undefined) {
+      return yield* failEnvironmentInternal("internal_error");
+    }
+    const revokeIssuedPeerToken = McpSessionRegistry.revokeActiveMcpPeerCredential(
+      issued.peerTokenId,
+    ).pipe(
+      Effect.catchTag("McpPeerTokenStoreError", (error) =>
+        failEnvironmentInternal("internal_error", error),
+      ),
+    );
+    const confirmedSession = yield* confirmRawRequestSessionActive(request, session.sessionId).pipe(
+      Effect.catch((error) => revokeIssuedPeerToken.pipe(Effect.andThen(Effect.fail(error)))),
+    );
+    if (confirmedSession.sessionId !== session.sessionId) {
+      yield* revokeIssuedPeerToken;
+      return yield* failEnvironmentAuthInvalid("invalid_credential");
+    }
+    const response: SubagentPeerMcpTokenResult = {
+      peerTokenId: issued.peerTokenId,
+      token: issued.token,
+      authorizationHeader: issued.authorizationHeader,
+      issuedAt: issued.issuedAt,
+      capabilities: issued.capabilities,
+    };
+    return HttpServerResponse.jsonUnsafe(response, {
+      headers: { "cache-control": "no-store" },
+    });
   }).pipe(
     Effect.catchTags({
       EnvironmentAuthInvalidError: HttpServerRespondable.toResponse,

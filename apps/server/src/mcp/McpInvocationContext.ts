@@ -1,4 +1,5 @@
 import {
+  type AuthSessionId,
   type EnvironmentId,
   PreviewAutomationUnavailableError,
   type ProviderInstanceId,
@@ -37,9 +38,10 @@ export interface ProviderMcpInvocationScope extends McpInvocationScopeBase {
 export interface PeerMcpInvocationScope extends McpInvocationScopeBase {
   readonly credentialKind: "peer";
   readonly peerTokenId: string;
+  readonly sourceSessionId?: AuthSessionId;
   readonly allowedParentThreadIds?: ReadonlySet<ThreadId>;
   readonly allowedChildThreadIds?: ReadonlySet<ThreadId>;
-  readonly expiresAt: null;
+  readonly expiresAt: number | null;
 }
 
 export type McpInvocationScope = ProviderMcpInvocationScope | PeerMcpInvocationScope;

@@ -97,6 +97,16 @@ const peerInvocation: McpInvocationContext.PeerMcpInvocationScope = {
   environmentId,
   peerTokenId: "peer-subagent-test",
   capabilities: new Set(["subagent:spawn", "subagent:check", "subagent:wait", "subagent:list"]),
+  allowedParentThreadIds: new Set(),
+  allowedChildThreadIds: new Set(),
+  issuedAt: 1,
+  expiresAt: null,
+};
+const unrestrictedPeerInvocation: McpInvocationContext.PeerMcpInvocationScope = {
+  credentialKind: "peer",
+  environmentId,
+  peerTokenId: "peer-subagent-unrestricted-test",
+  capabilities: new Set(["subagent:spawn", "subagent:check", "subagent:wait", "subagent:list"]),
   issuedAt: 1,
   expiresAt: null,
 };
@@ -681,6 +691,39 @@ describe("SubagentToolkit", () => {
     ).pipe(Effect.provide(TestLayer)),
   );
 
+  it.effect("allows unrestricted peer-scoped list when the parent thread is explicit", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const server = yield* McpServer.McpServer;
+
+        const result = yield* server
+          .callTool({
+            name: "t3_list_subagents",
+            arguments: { parentThreadId },
+          })
+          .pipe(
+            Effect.provideService(
+              McpInvocationContext.McpInvocationContext,
+              unrestrictedPeerInvocation,
+            ),
+            Effect.provideService(McpSchema.McpServerClient, client),
+          );
+
+        expect(result.isError).toBe(false);
+        expect(result.structuredContent).toMatchObject({
+          parentThreadId,
+          children: [
+            {
+              childThreadId,
+              parentThreadId,
+              detached: true,
+            },
+          ],
+        });
+      }),
+    ).pipe(Effect.provide(TestLayer)),
+  );
+
   it.effect("rejects peer-scoped list without an explicit parent thread", () =>
     Effect.scoped(
       Effect.gen(function* () {
@@ -789,6 +832,33 @@ describe("SubagentToolkit", () => {
             Effect.provideService(
               McpInvocationContext.McpInvocationContext,
               entitledPeerInvocation,
+            ),
+            Effect.provideService(McpSchema.McpServerClient, client),
+          );
+
+        expect(result.isError).toBe(false);
+        expect(result.structuredContent).toMatchObject({
+          threadId: childThreadId,
+          latestAssistantText: "child done",
+        });
+      }),
+    ).pipe(Effect.provide(TestLayer)),
+  );
+
+  it.effect("allows unrestricted peer-scoped check for any child thread", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const server = yield* McpServer.McpServer;
+
+        const result = yield* server
+          .callTool({
+            name: "t3_check_subagent",
+            arguments: { childThreadId },
+          })
+          .pipe(
+            Effect.provideService(
+              McpInvocationContext.McpInvocationContext,
+              unrestrictedPeerInvocation,
             ),
             Effect.provideService(McpSchema.McpServerClient, client),
           );

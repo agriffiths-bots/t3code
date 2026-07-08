@@ -387,6 +387,9 @@ export class SessionStore extends Context.Service<
       ReadonlyArray<AuthClientSession>,
       SessionCredentialInternalError
     >;
+    readonly isActive: (
+      sessionId: AuthSessionId,
+    ) => Effect.Effect<boolean, SessionCredentialInternalError>;
     readonly streamChanges: Stream.Stream<SessionCredentialChange>;
     readonly revoke: (
       sessionId: AuthSessionId,
@@ -840,6 +843,22 @@ export const make = Effect.gen(function* () {
     Effect.mapError((cause) => new ActiveSessionsListError({ cause })),
   );
 
+  const isActive: SessionStore["Service"]["isActive"] = Effect.fn("SessionStore.isActive")(
+    function* (sessionId) {
+      const now = yield* DateTime.now;
+      const row = yield* authSessions
+        .getById({ sessionId })
+        .pipe(
+          Effect.mapError((cause) => new SessionCredentialVerificationError({ sessionId, cause })),
+        );
+      return (
+        Option.isSome(row) &&
+        row.value.revokedAt === null &&
+        row.value.expiresAt.epochMilliseconds > now.epochMilliseconds
+      );
+    },
+  );
+
   const revoke: SessionStore["Service"]["revoke"] = Effect.fn("SessionStore.revoke")(
     function* (sessionId) {
       const revokedAt = yield* DateTime.now;
@@ -902,6 +921,7 @@ export const make = Effect.gen(function* () {
     issueWebSocketToken,
     verifyWebSocketToken,
     listActive,
+    isActive,
     get streamChanges() {
       return Stream.fromPubSub(changesPubSub);
     },
