@@ -1,4 +1,4 @@
-import { EnvironmentId, ProviderInstanceId, ThreadId } from "@t3tools/contracts";
+import { AuthSessionId, EnvironmentId, ProviderInstanceId, ThreadId } from "@t3tools/contracts";
 import * as Clock from "effect/Clock";
 import * as Context from "effect/Context";
 import * as Crypto from "effect/Crypto";
@@ -12,6 +12,7 @@ import * as Schema from "effect/Schema";
 import * as SynchronizedRef from "effect/SynchronizedRef";
 import { HttpServer } from "effect/unstable/http";
 
+import * as SessionStore from "../auth/SessionStore.ts";
 import * as ServerConfig from "../config.ts";
 import * as ServerEnvironment from "../environment/ServerEnvironment.ts";
 import * as McpInvocationContext from "./McpInvocationContext.ts";
@@ -29,6 +30,8 @@ export interface McpIssuedCredential {
 
 export interface McpPeerCredentialRequest {
   readonly label?: string;
+  readonly sourceSessionId?: AuthSessionId;
+  readonly expiresAt?: number;
   readonly allowedParentThreadIds?: ReadonlyArray<ThreadId>;
   readonly allowedChildThreadIds?: ReadonlyArray<ThreadId>;
 }
@@ -38,6 +41,7 @@ export interface McpIssuedPeerCredential {
   readonly token: string;
   readonly authorizationHeader: string;
   readonly issuedAt: number;
+  readonly expiresAt: number | null;
   readonly capabilities: ReadonlyArray<McpInvocationContext.McpCapability>;
 }
 
@@ -64,6 +68,15 @@ export interface McpSessionRegistryShape {
   ) => Effect.Effect<McpInvocationContext.McpInvocationScope | undefined>;
   readonly revokeProviderSession: (providerSessionId: string) => Effect.Effect<void>;
   readonly revokeThread: (threadId: ThreadId) => Effect.Effect<void>;
+  readonly revokePeerTokensBySourceSession: (
+    sessionId: AuthSessionId,
+  ) => Effect.Effect<void, McpPeerTokenStoreError>;
+  readonly revokePeerTokensExceptSourceSession: (
+    sessionId: AuthSessionId,
+  ) => Effect.Effect<void, McpPeerTokenStoreError>;
+  readonly revokePeerTokensNotInSourceSessions: (
+    activeSessionIds: ReadonlySet<AuthSessionId>,
+  ) => Effect.Effect<void, McpPeerTokenStoreError>;
   readonly revokeAllProviderSessions: Effect.Effect<void>;
   readonly revokeAll: Effect.Effect<void, McpPeerTokenStoreError>;
 }
@@ -110,11 +123,13 @@ const PEER_TOKEN_CAPABILITIES: ReadonlyArray<McpInvocationContext.McpCapability>
 const PersistedPeerTokenRecord = Schema.Struct({
   tokenHash: Schema.String,
   peerTokenId: Schema.String,
+  sourceSessionId: Schema.optionalKey(AuthSessionId),
   environmentId: EnvironmentId,
   capabilities: Schema.Array(McpInvocationContext.McpCapability),
   allowedParentThreadIds: Schema.optionalKey(Schema.Array(ThreadId)),
   allowedChildThreadIds: Schema.optionalKey(Schema.Array(ThreadId)),
   issuedAt: Schema.Number,
+  expiresAt: Schema.optionalKey(Schema.Number),
   lastUsedAt: Schema.Number,
 });
 type PersistedPeerTokenRecord = typeof PersistedPeerTokenRecord.Type;
@@ -135,7 +150,7 @@ const bytesToHex = (bytes: Uint8Array): string =>
 const tokenFromBytes = (bytes: Uint8Array): string => Buffer.from(bytes).toString("base64url");
 
 const isExpired = (record: CredentialRecord, timestamp: number): boolean =>
-  record.credentialKind === "provider-session" && record.scope.expiresAt <= timestamp;
+  record.scope.expiresAt !== null && record.scope.expiresAt <= timestamp;
 
 const pruneExpired = (
   records: ReadonlyMap<string, CredentialRecord>,
@@ -162,6 +177,7 @@ const makeWithOptions = Effect.fn("McpSessionRegistry.make")(function* (
   const path = yield* Path.Path;
   const environment = yield* ServerEnvironment.ServerEnvironment;
   const config = yield* Effect.serviceOption(ServerConfig.ServerConfig);
+  const sessions = yield* Effect.serviceOption(SessionStore.SessionStore);
   const environmentId = yield* environment.getEnvironmentId;
   const httpServer = yield* HttpServer.HttpServer;
   const peerTokenStorePath =
@@ -207,9 +223,14 @@ const makeWithOptions = Effect.fn("McpSessionRegistry.make")(function* (
         onSuccess: (decoded) => Effect.succeed(decoded),
       }),
     );
+    const timestamp = yield* currentTimeMillis;
     return new Map<string, CredentialRecord>(
       persisted.records
-        .filter((record) => record.environmentId === environmentId)
+        .filter(
+          (record) =>
+            record.environmentId === environmentId &&
+            (record.expiresAt === undefined || record.expiresAt > timestamp),
+        )
         .map((record) => [
           record.tokenHash,
           {
@@ -219,6 +240,7 @@ const makeWithOptions = Effect.fn("McpSessionRegistry.make")(function* (
               credentialKind: "peer" as const,
               environmentId: record.environmentId,
               peerTokenId: record.peerTokenId,
+              ...(record.sourceSessionId ? { sourceSessionId: record.sourceSessionId } : {}),
               capabilities: new Set(record.capabilities),
               ...(record.allowedParentThreadIds
                 ? { allowedParentThreadIds: new Set(record.allowedParentThreadIds) }
@@ -227,7 +249,7 @@ const makeWithOptions = Effect.fn("McpSessionRegistry.make")(function* (
                 ? { allowedChildThreadIds: new Set(record.allowedChildThreadIds) }
                 : {}),
               issuedAt: record.issuedAt,
-              expiresAt: null,
+              expiresAt: record.expiresAt ?? null,
             },
             lastUsedAt: record.lastUsedAt,
           },
@@ -240,6 +262,7 @@ const makeWithOptions = Effect.fn("McpSessionRegistry.make")(function* (
   ): PersistedPeerTokenRecord => ({
     tokenHash: record.tokenHash,
     peerTokenId: record.scope.peerTokenId,
+    ...(record.scope.sourceSessionId ? { sourceSessionId: record.scope.sourceSessionId } : {}),
     environmentId: record.scope.environmentId,
     capabilities: [...record.scope.capabilities].toSorted(),
     ...(record.scope.allowedParentThreadIds
@@ -249,6 +272,7 @@ const makeWithOptions = Effect.fn("McpSessionRegistry.make")(function* (
       ? { allowedChildThreadIds: [...record.scope.allowedChildThreadIds].toSorted() }
       : {}),
     issuedAt: record.scope.issuedAt,
+    ...(record.scope.expiresAt !== null ? { expiresAt: record.scope.expiresAt } : {}),
     lastUsedAt: record.lastUsedAt,
   });
 
@@ -350,6 +374,7 @@ const makeWithOptions = Effect.fn("McpSessionRegistry.make")(function* (
       credentialKind: "peer",
       environmentId,
       peerTokenId,
+      ...(request.sourceSessionId ? { sourceSessionId: request.sourceSessionId } : {}),
       capabilities: new Set(PEER_TOKEN_CAPABILITIES),
       ...(request.allowedParentThreadIds
         ? { allowedParentThreadIds: new Set(request.allowedParentThreadIds) }
@@ -358,7 +383,7 @@ const makeWithOptions = Effect.fn("McpSessionRegistry.make")(function* (
         ? { allowedChildThreadIds: new Set(request.allowedChildThreadIds) }
         : {}),
       issuedAt,
-      expiresAt: null,
+      expiresAt: request.expiresAt ?? null,
     };
     const issued = yield* SynchronizedRef.modifyEffect(state, ({ records }) => {
       const next = new Map(pruneExpired(records, issuedAt));
@@ -375,6 +400,7 @@ const makeWithOptions = Effect.fn("McpSessionRegistry.make")(function* (
             token: rawToken,
             authorizationHeader: `Bearer ${rawToken}`,
             issuedAt,
+            expiresAt: scope.expiresAt,
             capabilities: PEER_TOKEN_CAPABILITIES,
           } satisfies McpIssuedPeerCredential,
           { records: next },
@@ -389,37 +415,62 @@ const makeWithOptions = Effect.fn("McpSessionRegistry.make")(function* (
       if (rawToken.length === 0) return undefined;
       const tokenHash = yield* hashToken(rawToken);
       const timestamp = yield* currentTimeMillis;
-      return yield* SynchronizedRef.modify(
-        state,
-        ({
-          records,
-        }): readonly [McpInvocationContext.McpInvocationScope | undefined, RegistryState] => {
-          const record = records.get(tokenHash);
-          if (!record) return [undefined, { records }] as const;
-          const next = new Map(records);
-          if (isExpired(record, timestamp)) {
-            next.delete(tokenHash);
-            return [undefined, { records: next }] as const;
+      return yield* SynchronizedRef.modifyEffect(state, ({ records }) => {
+        const record = records.get(tokenHash);
+        if (!record) return Effect.succeed([undefined, { records }] as const);
+        const next = new Map(records);
+        if (isExpired(record, timestamp)) {
+          next.delete(tokenHash);
+          return Effect.succeed([undefined, { records: next }] as const);
+        }
+        if (record.credentialKind === "peer") {
+          const refreshPeerRecord = Effect.sync(
+            (): readonly [McpInvocationContext.McpInvocationScope | undefined, RegistryState] => {
+              next.set(tokenHash, {
+                ...record,
+                lastUsedAt: timestamp,
+              });
+              return [record.scope, { records: next }] as const;
+            },
+          );
+          if (record.scope.sourceSessionId === undefined || Option.isNone(sessions)) {
+            return refreshPeerRecord;
           }
-          if (record.credentialKind === "peer") {
-            next.set(tokenHash, {
-              ...record,
-              lastUsedAt: timestamp,
-            });
-            return [record.scope, { records: next }] as const;
-          }
-          const refreshedScope = {
-            ...record.scope,
-            expiresAt: timestamp + idleTimeoutMs,
-          };
-          next.set(tokenHash, {
-            ...record,
-            scope: refreshedScope,
-            lastUsedAt: timestamp,
-          });
-          return [refreshedScope, { records: next }] as const;
-        },
-      );
+          return sessions.value.isActive(record.scope.sourceSessionId).pipe(
+            Effect.catch((error) =>
+              Effect.logWarning("Failed to validate MCP peer token source session.", {
+                peerTokenId: record.scope.peerTokenId,
+                sourceSessionId: record.scope.sourceSessionId,
+                error,
+              }).pipe(Effect.as(false)),
+            ),
+            Effect.flatMap((active) => {
+              if (active) return refreshPeerRecord;
+              next.delete(tokenHash);
+              return persistPeerRecords(next).pipe(
+                Effect.catch((error) =>
+                  Effect.logWarning("Failed to persist inactive MCP peer token removal.", {
+                    peerTokenId: record.scope.peerTokenId,
+                    sourceSessionId: record.scope.sourceSessionId,
+                    error,
+                  }),
+                ),
+                Effect.as([undefined, { records: next }] as const),
+              );
+            }),
+          );
+        }
+        const refreshedScope = {
+          ...record.scope,
+          expiresAt: timestamp + idleTimeoutMs,
+        };
+        next.set(tokenHash, {
+          ...record,
+          scope: refreshedScope,
+          lastUsedAt: timestamp,
+        });
+        return Effect.succeed([refreshedScope, { records: next }] as const);
+      });
     },
   );
 
@@ -427,6 +478,22 @@ const makeWithOptions = Effect.fn("McpSessionRegistry.make")(function* (
     SynchronizedRef.update(state, ({ records }) => ({
       records: new Map(Array.from(records).filter(([, record]) => !predicate(record))),
     }));
+
+  const revokeWhereAndPersist = (predicate: (record: CredentialRecord) => boolean) =>
+    SynchronizedRef.modifyEffect(state, ({ records }) => {
+      const entries = Array.from(records);
+      const hasMatchingRecord = entries.some(([, record]) => predicate(record));
+      if (!hasMatchingRecord) {
+        return Effect.succeed([Option.none<McpPeerTokenStoreError>(), { records }] as const);
+      }
+      const next = new Map(entries.filter(([, record]) => !predicate(record)));
+      return persistPeerRecords(next).pipe(
+        Effect.as([Option.none<McpPeerTokenStoreError>(), { records: next }] as const),
+        Effect.catch((error) => Effect.succeed([Option.some(error), { records: next }] as const)),
+      );
+    }).pipe(
+      Effect.flatMap((error) => (Option.isSome(error) ? Effect.fail(error.value) : Effect.void)),
+    );
 
   return McpSessionRegistry.of({
     issue,
@@ -441,6 +508,33 @@ const makeWithOptions = Effect.fn("McpSessionRegistry.make")(function* (
         );
       },
     ),
+    revokePeerTokensBySourceSession: Effect.fn(
+      "McpSessionRegistry.revokePeerTokensBySourceSession",
+    )(function* (sessionId) {
+      yield* revokeWhereAndPersist(
+        (record) => record.credentialKind === "peer" && record.scope.sourceSessionId === sessionId,
+      );
+    }),
+    revokePeerTokensExceptSourceSession: Effect.fn(
+      "McpSessionRegistry.revokePeerTokensExceptSourceSession",
+    )(function* (sessionId) {
+      yield* revokeWhereAndPersist(
+        (record) =>
+          record.credentialKind === "peer" &&
+          record.scope.sourceSessionId !== undefined &&
+          record.scope.sourceSessionId !== sessionId,
+      );
+    }),
+    revokePeerTokensNotInSourceSessions: Effect.fn(
+      "McpSessionRegistry.revokePeerTokensNotInSourceSessions",
+    )(function* (activeSessionIds) {
+      yield* revokeWhereAndPersist(
+        (record) =>
+          record.credentialKind === "peer" &&
+          record.scope.sourceSessionId !== undefined &&
+          !activeSessionIds.has(record.scope.sourceSessionId),
+      );
+    }),
     revokeThread: Effect.fn("McpSessionRegistry.revokeThread")(function* (threadId) {
       yield* revokeWhere(
         (record) =>
@@ -502,6 +596,27 @@ export const revokeActiveMcpThread = (threadId: ThreadId): Effect.Effect<void> =
 export const revokeActiveMcpProviderSession = (providerSessionId: string): Effect.Effect<void> =>
   activeMcpSessionRegistry
     ? activeMcpSessionRegistry.revokeProviderSession(providerSessionId)
+    : Effect.void;
+
+export const revokeActiveMcpPeerCredentialsForAuthSession = (
+  sessionId: AuthSessionId,
+): Effect.Effect<void, McpPeerTokenStoreError> =>
+  activeMcpSessionRegistry
+    ? activeMcpSessionRegistry.revokePeerTokensBySourceSession(sessionId)
+    : Effect.void;
+
+export const revokeActiveMcpPeerCredentialsExceptAuthSession = (
+  sessionId: AuthSessionId,
+): Effect.Effect<void, McpPeerTokenStoreError> =>
+  activeMcpSessionRegistry
+    ? activeMcpSessionRegistry.revokePeerTokensExceptSourceSession(sessionId)
+    : Effect.void;
+
+export const revokeActiveMcpPeerCredentialsForInactiveAuthSessions = (
+  activeSessionIds: ReadonlySet<AuthSessionId>,
+): Effect.Effect<void, McpPeerTokenStoreError> =>
+  activeMcpSessionRegistry
+    ? activeMcpSessionRegistry.revokePeerTokensNotInSourceSessions(activeSessionIds)
     : Effect.void;
 
 export const revokeAllActiveMcpProviderCredentials = (): Effect.Effect<void> =>

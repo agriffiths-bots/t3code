@@ -26,6 +26,11 @@ import {
 
 import * as ServerConfig from "../config.ts";
 import * as SubagentPeerRegistry from "../subagents/SubagentPeerRegistry.ts";
+import {
+  cloudflareAccessHeaders,
+  SUBAGENT_PEER_MCP_TOKEN_PATH,
+  SubagentPeerMcpTokenResult,
+} from "../subagents/SubagentPeerHttp.ts";
 import { authLocationFlags, type CliAuthLocationFlags, resolveCliAuthConfig } from "./config.ts";
 
 export class PeerCommandInputError extends CliError.UserError {
@@ -37,7 +42,12 @@ export class PeerCommandInputError extends CliError.UserError {
 export class PeerPairingError extends Schema.TaggedErrorClass<PeerPairingError>()(
   "PeerPairingError",
   {
-    operation: Schema.Literals(["resolve-pairing-target", "fetch-descriptor", "exchange-token"]),
+    operation: Schema.Literals([
+      "resolve-pairing-target",
+      "fetch-descriptor",
+      "exchange-token",
+      "mint-peer-token",
+    ]),
     status: Schema.optional(Schema.Number),
     cause: Schema.Defect(),
   },
@@ -65,23 +75,6 @@ const PEER_PAIRING_REQUEST_TIMEOUT = Duration.seconds(5);
 const PEER_PAIRING_FETCH_REQUEST_INIT = { redirect: "manual" } satisfies RequestInit;
 
 const decodeSubagentPeerAlias = Schema.decodeUnknownEffect(SubagentPeerRegistry.SubagentPeerAlias);
-
-const cloudflareAccessHeaders = (
-  access: PeerCloudflareAccess | undefined,
-): Record<string, string> => {
-  if (access === undefined) return {};
-  if (access._tag === "service-token") {
-    return {
-      "cf-access-client-id": access.clientId,
-      "cf-access-client-secret": access.clientSecret,
-    };
-  }
-  const jwt = access._tag === "cookie" ? access.cookieValue : access.jwt;
-  return {
-    "cf-access-jwt-assertion": jwt,
-    cookie: `CF_Authorization=${jwt}`,
-  };
-};
 
 const cloudflareAccessFromInput = Effect.fn("peers.cloudflareAccessFromInput")(function* (input: {
   readonly cloudflareAccessToken?: string | undefined;
@@ -255,6 +248,16 @@ export const pairPeer = Effect.fn("peers.pairPeer")(function* (
     AuthAccessTokenResult,
     "exchange-token",
   );
+  const peerToken = yield* responseJson(
+    HttpClientRequest.post(environmentUrl(target.httpBaseUrl, SUBAGENT_PEER_MCP_TOKEN_PATH)).pipe(
+      HttpClientRequest.setHeaders({
+        ...headers,
+        authorization: `${access.token_type} ${access.access_token}`,
+      }),
+    ),
+    SubagentPeerMcpTokenResult,
+    "mint-peer-token",
+  );
 
   return yield* registry.add({
     alias,
@@ -262,7 +265,7 @@ export const pairPeer = Effect.fn("peers.pairPeer")(function* (
     httpBaseUrl: target.httpBaseUrl,
     ...(mcpEndpoint !== undefined ? { mcpEndpoint } : {}),
     credential: new SubagentPeerRegistry.SubagentPeerBearerCredential({
-      token: access.access_token,
+      token: peerToken.token,
     }),
     ...(cfAccess ? { cfAccess } : {}),
   });

@@ -10,6 +10,7 @@ import {
   planUsageRouteLayer,
   ttsSpeakRouteLayer,
   notificationAckRouteLayer,
+  mcpPeerTokenRouteLayer,
   assetRouteLayer,
   serverEnvironmentHttpApiLayer,
   staticAndDevRouteLayer,
@@ -395,6 +396,10 @@ const ServerApplicationRegistrationsLive = Layer.mergeAll(
   SubagentRuntimeLive.pipe(Layer.provide(PendingDispatchRepositoryLive)),
 );
 
+const McpRoutesLayer = Layer.mergeAll(mcpPeerTokenRouteLayer, McpHttpServer.layer).pipe(
+  Layer.provide(McpSessionRegistry.layer),
+);
+
 export const makeRoutesLayer = Layer.mergeAll(
   Layer.mergeAll(
     HttpApiBuilder.layer(EnvironmentHttpApi).pipe(
@@ -412,7 +417,7 @@ export const makeRoutesLayer = Layer.mergeAll(
     staticAndDevRouteLayer,
     websocketRpcRouteLayer,
   ),
-  McpHttpServer.layer.pipe(Layer.provide(McpSessionRegistry.layer)),
+  McpRoutesLayer,
 ).pipe(Layer.provide(PreviewAutomationBroker.layer), Layer.provide(browserApiCorsLayer));
 
 export const makeServerLayer = Layer.unwrap(

@@ -295,8 +295,8 @@ const requireProviderSubagentInvocation = (capability: McpInvocationContext.McpC
     ),
   );
 
-const peerSetHas = (set: ReadonlySet<ThreadId> | undefined, threadId: ThreadId): boolean =>
-  set?.has(threadId) === true;
+const peerSetAllows = (set: ReadonlySet<ThreadId> | undefined, threadId: ThreadId): boolean =>
+  set === undefined || set.has(threadId);
 
 const requirePeerChildAccess = (
   invocation: McpInvocationContext.McpInvocationScope,
@@ -304,7 +304,7 @@ const requirePeerChildAccess = (
 ): Effect.Effect<void, ThreadStartToolError> => {
   if (McpInvocationContext.isProviderInvocationScope(invocation)) return Effect.void;
   const unauthorized = childThreadIds.find(
-    (childThreadId) => !peerSetHas(invocation.allowedChildThreadIds, childThreadId),
+    (childThreadId) => !peerSetAllows(invocation.allowedChildThreadIds, childThreadId),
   );
   return unauthorized === undefined
     ? Effect.void
@@ -320,7 +320,7 @@ const requirePeerParentAccess = (
   parentThreadId: ThreadId,
 ): Effect.Effect<void, ThreadStartToolError> =>
   McpInvocationContext.isProviderInvocationScope(invocation) ||
-  peerSetHas(invocation.allowedParentThreadIds, parentThreadId)
+  peerSetAllows(invocation.allowedParentThreadIds, parentThreadId)
     ? Effect.void
     : Effect.fail(
         fail(

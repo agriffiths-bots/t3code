@@ -287,5 +287,6 @@ export const layer = Layer.mergeAll(
 );
 
 export const __testing = {
+  McpAuthMiddlewareLive,
   unauthorized,
 };

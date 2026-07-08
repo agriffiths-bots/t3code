@@ -40,6 +40,7 @@ import {
   browserCookieCredentialOriginAllowed,
   configuredBrowserCookieCredentialOrigins,
 } from "../httpCors.ts";
+import * as McpSessionRegistry from "../mcp/McpSessionRegistry.ts";
 import { layerConfig as SqlitePersistenceLayer } from "../persistence/Layers/Sqlite.ts";
 
 export const DEFAULT_SESSION_SUBJECT = "cli-issued-session";
@@ -489,6 +490,10 @@ export class EnvironmentAuth extends Context.Service<
     readonly authenticateHttpRequest: (
       request: HttpServerRequest.HttpServerRequest,
     ) => Effect.Effect<AuthenticatedSession, ServerAuthCredentialError | ServerAuthInternalError>;
+    readonly confirmHttpRequestSessionActive: (
+      request: HttpServerRequest.HttpServerRequest,
+      sessionId: AuthSessionId,
+    ) => Effect.Effect<AuthenticatedSession, ServerAuthCredentialError | ServerAuthInternalError>;
     readonly authenticateWebSocketUpgrade: (
       request: HttpServerRequest.HttpServerRequest,
     ) => Effect.Effect<AuthenticatedSession, ServerAuthCredentialError | ServerAuthInternalError>;
@@ -870,19 +875,58 @@ export const make = Effect.gen(function* () {
       Effect.withSpan("EnvironmentAuth.listSessions"),
     );
 
+  const revokePeerCredentialsForSession = (sessionId: AuthSessionId) =>
+    McpSessionRegistry.revokeActiveMcpPeerCredentialsForAuthSession(sessionId);
+
+  const revokePeerCredentialsForInactiveSessions = (activeSessionIds: ReadonlySet<AuthSessionId>) =>
+    McpSessionRegistry.revokeActiveMcpPeerCredentialsForInactiveAuthSessions(activeSessionIds);
+
   const revokeSession: EnvironmentAuth["Service"]["revokeSession"] = (sessionId) =>
     sessions.revoke(sessionId).pipe(
       Effect.mapError((cause) => new ServerAuthSessionRevocationError({ cause })),
+      Effect.tap(() =>
+        revokePeerCredentialsForSession(sessionId).pipe(
+          Effect.mapError((cause) => new ServerAuthSessionRevocationError({ cause })),
+        ),
+      ),
       Effect.withSpan("EnvironmentAuth.revokeSession"),
     );
 
   const revokeOtherSessionsExcept: EnvironmentAuth["Service"]["revokeOtherSessionsExcept"] = (
     sessionId,
   ) =>
-    sessions.revokeAllExcept(sessionId).pipe(
-      Effect.mapError((cause) => new ServerAuthOtherSessionsRevocationError({ cause })),
-      Effect.withSpan("EnvironmentAuth.revokeOtherSessionsExcept"),
-    );
+    Effect.gen(function* () {
+      const activeSessions = yield* sessions
+        .listActive()
+        .pipe(Effect.mapError((cause) => new ServerAuthOtherSessionsRevocationError({ cause })));
+      const targetSessionIds = activeSessions
+        .map((session) => session.sessionId)
+        .filter((activeSessionId) => activeSessionId !== sessionId);
+      const revoked = yield* Effect.forEach(
+        targetSessionIds,
+        (revokedSessionId) =>
+          sessions.revoke(revokedSessionId).pipe(
+            Effect.mapError((cause) => new ServerAuthOtherSessionsRevocationError({ cause })),
+            Effect.tap((wasRevoked) =>
+              wasRevoked
+                ? revokePeerCredentialsForSession(revokedSessionId).pipe(
+                    Effect.mapError(
+                      (cause) => new ServerAuthOtherSessionsRevocationError({ cause }),
+                    ),
+                  )
+                : Effect.void,
+            ),
+          ),
+        { concurrency: "unbounded" },
+      );
+      const remainingActiveSessions = yield* sessions
+        .listActive()
+        .pipe(Effect.mapError((cause) => new ServerAuthOtherSessionsRevocationError({ cause })));
+      yield* revokePeerCredentialsForInactiveSessions(
+        new Set(remainingActiveSessions.map((session) => session.sessionId)),
+      ).pipe(Effect.mapError((cause) => new ServerAuthOtherSessionsRevocationError({ cause })));
+      return revoked.filter(Boolean).length;
+    }).pipe(Effect.withSpan("EnvironmentAuth.revokeOtherSessionsExcept"));
 
   const issuePairingCredential: EnvironmentAuth["Service"]["issuePairingCredential"] = (input) =>
     issuePairingCredentialForSubject({
@@ -957,6 +1001,29 @@ export const make = Effect.gen(function* () {
   ) =>
     authenticateRequest(request).pipe(Effect.withSpan("EnvironmentAuth.authenticateHttpRequest"));
 
+  const confirmHttpRequestSessionActive: EnvironmentAuth["Service"]["confirmHttpRequestSessionActive"] =
+    (request, sessionId) => {
+      const cookieToken = request.cookies[sessions.cookieName];
+      const bearerToken = parseBearerToken(request);
+      const dpopToken = parseDpopToken(request);
+      const credential = cookieToken ?? bearerToken ?? dpopToken;
+      if (!credential) {
+        return Effect.fail(new ServerAuthMissingCredentialError({}));
+      }
+      return authenticateToken(credential).pipe(
+        Effect.flatMap((session) =>
+          session.sessionId === sessionId
+            ? Effect.succeed(session)
+            : Effect.fail(
+                new ServerAuthInvalidCredentialError({
+                  diagnostic: "Authenticated session changed during request confirmation.",
+                }),
+              ),
+        ),
+        Effect.withSpan("EnvironmentAuth.confirmHttpRequestSessionActive"),
+      );
+    };
+
   const authenticateWebSocketUpgrade: EnvironmentAuth["Service"]["authenticateWebSocketUpgrade"] =
     Effect.fn("EnvironmentAuth.authenticateWebSocketUpgrade")(function* (request) {
       const requestUrl = HttpServerRequest.toURL(request);
@@ -1014,6 +1081,7 @@ export const make = Effect.gen(function* () {
     revokeClientSession,
     revokeOtherClientSessions,
     authenticateHttpRequest,
+    confirmHttpRequestSessionActive,
     authenticateWebSocketUpgrade,
     issueWebSocketTicket,
     issueStartupPairingUrl,
