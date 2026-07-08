@@ -73,8 +73,10 @@ export interface ProjectionSnapshotQueryShape {
   /**
    * Read the latest orchestration projection snapshot.
    *
-   * Rehydrates from projection tables and derives snapshot sequence from
-   * projector cursor state.
+   * Returns project and lightweight thread metadata only. Per-thread messages,
+   * activities, proposed plans, and checkpoint summaries are intentionally
+   * omitted from this global snapshot and must be loaded through the targeted
+   * thread detail query.
    */
   readonly getSnapshot: () => Effect.Effect<OrchestrationReadModel, ProjectionRepositoryError>;
 
