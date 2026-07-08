@@ -1116,6 +1116,7 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
               updatedAt: row.updatedAt,
               archivedAt: row.archivedAt,
               deletedAt: row.deletedAt,
+              parentThreadId: row.parentThreadId ?? null,
               messages: [],
               proposedPlans: [],
               activities: [],
@@ -1316,6 +1317,7 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
                   updatedAt: row.updatedAt,
                   archivedAt: row.archivedAt,
                   deletedAt: row.deletedAt,
+                  parentThreadId: row.parentThreadId,
                   messages: [],
                   proposedPlans: proposedPlansByThread.get(row.threadId) ?? [],
                   activities: [],
@@ -1941,6 +1943,7 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
         createdAt: threadRow.value.createdAt,
         updatedAt: threadRow.value.updatedAt,
         archivedAt: threadRow.value.archivedAt,
+        parentThreadId: threadRow.value.parentThreadId ?? null,
         deletedAt: null,
         messages: messageRows.map((row) => {
           const message = {
