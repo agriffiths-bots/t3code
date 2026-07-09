@@ -3004,6 +3004,30 @@ describe("ChildThreadCoordinator", () => {
     expect(await harness.canAcquireDispatchLease()).toBe(false);
   });
 
+  it("keeps replayed active archive sticky against late ready diffs", async () => {
+    const child = ThreadId.make("recon-active-archive-late-ready-child");
+    const parent = ThreadId.make("recon-active-archive-late-ready-parent");
+    const turn1 = TurnId.make("turn-1");
+    const harness = await createHarness({
+      threads: [
+        makeThreadState({
+          threadId: child,
+          parentThreadId: parent,
+          latestTurn: makeLatestTurn("running", turn1),
+          session: makeSession(child, "running", turn1),
+          archivedAt: now,
+        }),
+      ],
+      seedChildRows: [{ threadId: child, parentThreadId: parent }],
+      persistedEvents: [threadArchivedEvent(child), turnDiffEvent(child, "ready", turn1)],
+    });
+
+    const result = await runtimeRun(harness, child);
+    expect(result.status).toBe("killed");
+    expect(result.error).toBe("thread archived");
+    expect(await harness.canAcquireDispatchLease()).toBe(true);
+  });
+
   it("does not seed leases for archived stopped children with stale running turns", async () => {
     const parent = ThreadId.make("recon-archive-stale-running-parent");
     const childIds = Array.from({ length: 6 }, (_, index) =>
@@ -3503,6 +3527,47 @@ describe("ChildThreadCoordinator", () => {
       });
       await harness.seedDispatchLease(childThreadId);
       await harness.feed(threadArchivedEvent(childThreadId));
+    }
+    expect(await harness.canAcquireDispatchLease()).toBe(true);
+
+    for (const childThreadId of childIds) {
+      await harness.feed(threadUnarchivedEvent(childThreadId));
+    }
+
+    const entries = await runtimeListChildren(harness, parent);
+    expect(entries).toHaveLength(6);
+    expect(entries.every((entry) => !entry.settled)).toBe(true);
+    expect(await harness.canAcquireDispatchLease()).toBe(false);
+  });
+
+  it("keeps active archive capacity marker through late diffs until unarchive", async () => {
+    const parent = ThreadId.make("live-unarchive-after-late-diff-parent");
+    const childIds = Array.from({ length: 6 }, (_, index) =>
+      ThreadId.make(`live-unarchive-after-late-diff-child-${index + 1}`),
+    );
+    const turn1 = TurnId.make("turn-1");
+    const harness = await createHarness({
+      threads: childIds.map((threadId) =>
+        makeThreadState({
+          threadId,
+          parentThreadId: parent,
+          latestTurn: makeLatestTurn("running", turn1),
+          session: makeSession(threadId, "running", turn1),
+        }),
+      ),
+    });
+    for (const childThreadId of childIds) {
+      await harness.register({
+        parentThreadId: parent,
+        childThreadId,
+        detached: false,
+        model: codexModel,
+        spawnedAtMs: 0,
+      });
+      await harness.seedDispatchLease(childThreadId);
+      await harness.feed(threadArchivedEvent(childThreadId));
+      await harness.feed(turnDiffEvent(childThreadId, "ready", turn1));
+      harness.removeThread(childThreadId);
     }
     expect(await harness.canAcquireDispatchLease()).toBe(true);
 
