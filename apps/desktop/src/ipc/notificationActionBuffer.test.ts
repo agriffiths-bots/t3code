@@ -16,7 +16,9 @@ describe("createDesktopNotificationActionBuffer", () => {
     const buffer = createDesktopNotificationActionBuffer();
     const received: DesktopNotificationActionEvent[] = [];
 
+    assert.equal(buffer.hasListeners(), false);
     buffer.subscribe((event) => received.push(event));
+    assert.equal(buffer.hasListeners(), true);
     buffer.dispatch(action(1));
 
     assert.deepEqual(received, [action(1)]);

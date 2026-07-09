@@ -38,6 +38,7 @@ import {
 import {
   confirm,
   closeNotification,
+  drainNotificationActions,
   getAppBranding,
   getLocalEnvironmentBootstraps,
   getLocalEnvironmentBearerToken,
@@ -95,6 +96,7 @@ export const installDesktopIpcHandlers = Effect.fn("desktop.ipc.installHandlers"
   yield* ipc.handle(isNotificationSupported);
   yield* ipc.handle(showNotification);
   yield* ipc.handle(closeNotification);
+  yield* ipc.handle(drainNotificationActions);
   yield* ipc.handle(getUpdateState);
   yield* ipc.handle(setUpdateChannel);
   yield* ipc.handle(downloadUpdate);

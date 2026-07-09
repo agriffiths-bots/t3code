@@ -22,8 +22,11 @@ export class ElectronNotification extends Context.Service<
     readonly isSupported: Effect.Effect<boolean>;
     readonly show: (notification: ServerDeviceNotification) => Effect.Effect<boolean>;
     readonly close: (notificationId: string) => Effect.Effect<void>;
+    readonly drainActions: Effect.Effect<readonly DesktopNotificationActionEvent[]>;
   }
 >()("@t3tools/desktop/electron/ElectronNotification") {}
+
+const MAX_PENDING_NOTIFICATION_ACTIONS = 32;
 
 function canShowNativeNotifications(): boolean {
   const notificationConstructor = Electron.Notification as typeof Electron.Notification & {
@@ -43,6 +46,7 @@ export const make = Effect.gen(function* () {
   const desktopWindow = yield* DesktopWindow.DesktopWindow;
   const httpClient = yield* HttpClient.HttpClient;
   const activeNotifications = yield* Ref.make(new Map<string, NativeNotificationEntry>());
+  const pendingActions = yield* Ref.make<DesktopNotificationActionEvent[]>([]);
   const suppressedCloseNotifications = new Set<string>();
   const context = yield* Effect.context();
   const runFork = Effect.runForkWith(context);
@@ -84,15 +88,20 @@ export const make = Effect.gen(function* () {
     );
   });
 
-  const sendActionToWindow = Effect.fn("desktop.notification.sendActionToWindow")(function* (
-    window: Electron.BrowserWindow,
-    event: DesktopNotificationActionEvent,
-  ) {
+  const enqueueAction = (event: DesktopNotificationActionEvent) =>
+    Ref.update(pendingActions, (current) => {
+      const next = [...current, event];
+      return next.slice(Math.max(0, next.length - MAX_PENDING_NOTIFICATION_ACTIONS));
+    });
+
+  const signalActionAvailableToWindow = Effect.fn(
+    "desktop.notification.signalActionAvailableToWindow",
+  )(function* (window: Electron.BrowserWindow) {
     const send = Effect.sync(() => {
       if (window.isDestroyed()) {
         return;
       }
-      window.webContents.send(IpcChannels.NOTIFICATION_ACTION_CHANNEL, event);
+      window.webContents.send(IpcChannels.NOTIFICATION_ACTION_CHANNEL);
     });
 
     if (window.isDestroyed()) {
@@ -110,12 +119,13 @@ export const make = Effect.gen(function* () {
   const emitAction = Effect.fn("desktop.notification.emitAction")(function* (
     event: DesktopNotificationActionEvent,
   ) {
+    yield* enqueueAction(event);
     if (event.action === "opened") {
       const window = yield* desktopWindow.revealOrCreateMain;
-      yield* sendActionToWindow(window, event);
+      yield* signalActionAvailableToWindow(window);
       return;
     }
-    yield* electronWindow.sendAll(IpcChannels.NOTIFICATION_ACTION_CHANNEL, event);
+    yield* electronWindow.sendAll(IpcChannels.NOTIFICATION_ACTION_CHANNEL);
   });
 
   const forgetNotification = (notificationId: string) =>
@@ -198,6 +208,7 @@ export const make = Effect.gen(function* () {
     isSupported: Effect.sync(canShowNativeNotifications),
     show,
     close: (notificationId) => closeNotification(notificationId, true),
+    drainActions: Ref.getAndSet(pendingActions, []),
   });
 });
 

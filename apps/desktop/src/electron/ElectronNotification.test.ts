@@ -175,7 +175,7 @@ function makeLayer(
             setMain: () => Effect.void,
             clearMain: () => Effect.void,
             reveal: () => Effect.die("unused"),
-            sendAll: (channel, event) => Effect.sync(() => sendAllMock(channel, event)),
+            sendAll: (channel, ...args) => Effect.sync(() => sendAllMock(channel, ...args)),
             destroyAll: Effect.void,
             syncAllAppearance: () => Effect.void,
           }),
@@ -218,14 +218,14 @@ describe("ElectronNotification", () => {
 
       assert.equal(revealOrCreateMainMock.mock.calls.length, 1);
       assert.deepEqual(targetWindow.webContents.send.mock.calls, [
-        [
-          IpcChannels.NOTIFICATION_ACTION_CHANNEL,
-          {
-            notificationId: "notification-1",
-            action: "opened",
-            deepLink: "/environment/thread",
-          },
-        ],
+        [IpcChannels.NOTIFICATION_ACTION_CHANNEL],
+      ]);
+      assert.deepEqual(yield* notifications.drainActions, [
+        {
+          notificationId: "notification-1",
+          action: "opened",
+          deepLink: "/environment/thread",
+        },
       ]);
     }).pipe(Effect.provide(makeLayer({ targetWindow })));
   });
@@ -252,14 +252,14 @@ describe("ElectronNotification", () => {
       yield* Effect.yieldNow;
 
       assert.deepEqual(targetWindow.webContents.send.mock.calls, [
-        [
-          IpcChannels.NOTIFICATION_ACTION_CHANNEL,
-          {
-            notificationId: "notification-1",
-            action: "opened",
-            deepLink: "/environment/thread",
-          },
-        ],
+        [IpcChannels.NOTIFICATION_ACTION_CHANNEL],
+      ]);
+      assert.deepEqual(yield* notifications.drainActions, [
+        {
+          notificationId: "notification-1",
+          action: "opened",
+          deepLink: "/environment/thread",
+        },
       ]);
     }).pipe(Effect.provide(makeLayer({ targetWindow })));
   });
@@ -277,14 +277,14 @@ describe("ElectronNotification", () => {
 
       assert.equal(ackRequests.length, 1);
       assert.deepEqual(targetWindow.webContents.send.mock.calls, [
-        [
-          IpcChannels.NOTIFICATION_ACTION_CHANNEL,
-          {
-            notificationId: "notification-1",
-            action: "opened",
-            deepLink: "/environment/thread",
-          },
-        ],
+        [IpcChannels.NOTIFICATION_ACTION_CHANNEL],
+      ]);
+      assert.deepEqual(yield* notifications.drainActions, [
+        {
+          notificationId: "notification-1",
+          action: "opened",
+          deepLink: "/environment/thread",
+        },
       ]);
     }).pipe(
       Effect.provide(
@@ -315,8 +315,36 @@ describe("ElectronNotification", () => {
         ackToken: "ack-token",
         action: "closed",
       });
+      assert.deepEqual(sendAllMock.mock.calls, [[IpcChannels.NOTIFICATION_ACTION_CHANNEL]]);
+      assert.deepEqual(yield* notifications.drainActions, [
+        {
+          notificationId: "notification-1",
+          action: "closed",
+          deepLink: "/environment/thread",
+        },
+      ]);
     }).pipe(Effect.provide(makeLayer({ ackRequests })));
   });
+
+  it.effect("keeps action payloads in main until the renderer drains them", () =>
+    Effect.gen(function* () {
+      const notifications = yield* ElectronNotification.ElectronNotification;
+
+      yield* notifications.show(notification);
+      notificationInstances[0]!.listeners.get("click")?.();
+      yield* Effect.yieldNow;
+      yield* Effect.yieldNow;
+
+      assert.deepEqual(yield* notifications.drainActions, [
+        {
+          notificationId: "notification-1",
+          action: "opened",
+          deepLink: "/environment/thread",
+        },
+      ]);
+      assert.deepEqual(yield* notifications.drainActions, []);
+    }).pipe(Effect.provide(makeLayer())),
+  );
 
   it.effect("does not claim delivery when native notifications are unsupported", () =>
     Effect.gen(function* () {

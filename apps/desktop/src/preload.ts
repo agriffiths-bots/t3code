@@ -15,9 +15,23 @@ exposeClerkBridge({ passkeys: true });
 
 const notificationActionBuffer = createDesktopNotificationActionBuffer();
 
-ipcRenderer.on(IpcChannels.NOTIFICATION_ACTION_CHANNEL, (_event, actionEvent: unknown) => {
-  if (typeof actionEvent !== "object" || actionEvent === null) return;
-  notificationActionBuffer.dispatch(actionEvent as DesktopNotificationActionEvent);
+async function drainNotificationActions() {
+  const actions = await ipcRenderer.invoke(IpcChannels.DRAIN_NOTIFICATION_ACTIONS_CHANNEL);
+  if (!Array.isArray(actions)) return;
+  for (const actionEvent of actions) {
+    if (typeof actionEvent !== "object" || actionEvent === null) continue;
+    notificationActionBuffer.dispatch(actionEvent as DesktopNotificationActionEvent);
+  }
+}
+
+function requestNotificationActionDrain() {
+  void drainNotificationActions().catch(() => undefined);
+}
+
+ipcRenderer.on(IpcChannels.NOTIFICATION_ACTION_CHANNEL, () => {
+  if (notificationActionBuffer.hasListeners()) {
+    requestNotificationActionDrain();
+  }
 });
 
 function unwrapEnsureSshEnvironmentResult(result: unknown) {
@@ -125,7 +139,11 @@ contextBridge.exposeInMainWorld("desktopBridge", {
     ipcRenderer.invoke(IpcChannels.SHOW_NOTIFICATION_CHANNEL, notification),
   closeNotification: (notificationId) =>
     ipcRenderer.invoke(IpcChannels.CLOSE_NOTIFICATION_CHANNEL, notificationId),
-  onNotificationAction: (listener) => notificationActionBuffer.subscribe(listener),
+  onNotificationAction: (listener) => {
+    const unsubscribe = notificationActionBuffer.subscribe(listener);
+    requestNotificationActionDrain();
+    return unsubscribe;
+  },
   onMenuAction: (listener) => {
     const wrappedListener = (_event: Electron.IpcRendererEvent, action: unknown) => {
       if (typeof action !== "string") return;

@@ -30,5 +30,9 @@ export function createDesktopNotificationActionBuffer() {
     };
   };
 
-  return { dispatch, subscribe };
+  return {
+    dispatch,
+    subscribe,
+    hasListeners: () => listeners.size > 0,
+  };
 }
