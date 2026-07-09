@@ -346,6 +346,584 @@ describe("orchestration projector", () => {
     expect(settledThread?.turns[0]?.completedAt).toBe(settledAt);
   });
 
+  it("binds immediate subagent steer prompts to the active turn", async () => {
+    const createdAt = "2026-02-23T08:10:00.000Z";
+    let model = createEmptyReadModel(createdAt);
+    const project = (event: OrchestrationEvent) => Effect.runPromise(projectEvent(model, event));
+
+    model = await project(
+      makeEvent({
+        sequence: 1,
+        type: "thread.created",
+        aggregateKind: "thread",
+        aggregateId: "thread-1",
+        occurredAt: createdAt,
+        commandId: "cmd-create",
+        payload: {
+          threadId: "thread-1",
+          projectId: "project-1",
+          title: "demo",
+          modelSelection: {
+            provider: ProviderDriverKind.make("codex"),
+            model: "gpt-5.3-codex",
+          },
+          runtimeMode: "full-access",
+          branch: null,
+          worktreePath: null,
+          createdAt,
+          updatedAt: createdAt,
+        },
+      }),
+    );
+    model = await project(
+      makeEvent({
+        sequence: 2,
+        type: "thread.message-sent",
+        aggregateKind: "thread",
+        aggregateId: "thread-1",
+        occurredAt: "2026-02-23T08:10:01.000Z",
+        commandId: "cmd-first-message",
+        payload: {
+          threadId: "thread-1",
+          messageId: "message-first",
+          role: "user",
+          text: "first prompt",
+          turnId: null,
+          streaming: false,
+          createdAt: "2026-02-23T08:10:01.000Z",
+          updatedAt: "2026-02-23T08:10:01.000Z",
+        },
+      }),
+    );
+    model = await project(
+      makeEvent({
+        sequence: 3,
+        type: "thread.session-set",
+        aggregateKind: "thread",
+        aggregateId: "thread-1",
+        occurredAt: "2026-02-23T08:10:02.000Z",
+        commandId: "cmd-first-running",
+        payload: {
+          threadId: "thread-1",
+          session: {
+            threadId: "thread-1",
+            status: "running",
+            providerName: "codex",
+            providerSessionId: "session-1",
+            providerThreadId: "provider-thread-1",
+            runtimeMode: "full-access",
+            activeTurnId: "turn-1",
+            lastError: null,
+            updatedAt: "2026-02-23T08:10:02.000Z",
+          },
+        },
+      }),
+    );
+    model = await project(
+      makeEvent({
+        sequence: 4,
+        type: "thread.message-sent",
+        aggregateKind: "thread",
+        aggregateId: "thread-1",
+        occurredAt: "2026-02-23T08:10:03.000Z",
+        commandId: "server:subagent-steer-immediate:test",
+        payload: {
+          threadId: "thread-1",
+          messageId: "message-steer",
+          role: "user",
+          text: "same-turn steer",
+          turnId: null,
+          streaming: false,
+          createdAt: "2026-02-23T08:10:03.000Z",
+          updatedAt: "2026-02-23T08:10:03.000Z",
+        },
+      }),
+    );
+    model = await project(
+      makeEvent({
+        sequence: 5,
+        type: "thread.turn-start-requested",
+        aggregateKind: "thread",
+        aggregateId: "thread-1",
+        occurredAt: "2026-02-23T08:10:03.000Z",
+        commandId: "server:subagent-steer-immediate:test",
+        payload: {
+          threadId: "thread-1",
+          messageId: "message-steer",
+          runtimeMode: "full-access",
+          createdAt: "2026-02-23T08:10:03.000Z",
+        },
+      }),
+    );
+    model = await project(
+      makeEvent({
+        sequence: 6,
+        type: "thread.message-sent",
+        aggregateKind: "thread",
+        aggregateId: "thread-1",
+        occurredAt: "2026-02-23T08:10:04.000Z",
+        commandId: "cmd-follow-up-message",
+        payload: {
+          threadId: "thread-1",
+          messageId: "message-follow-up",
+          role: "user",
+          text: "queued follow-up",
+          turnId: null,
+          streaming: false,
+          createdAt: "2026-02-23T08:10:04.000Z",
+          updatedAt: "2026-02-23T08:10:04.000Z",
+        },
+      }),
+    );
+    model = await project(
+      makeEvent({
+        sequence: 7,
+        type: "thread.session-set",
+        aggregateKind: "thread",
+        aggregateId: "thread-1",
+        occurredAt: "2026-02-23T08:10:05.000Z",
+        commandId: "cmd-ready",
+        payload: {
+          threadId: "thread-1",
+          session: {
+            threadId: "thread-1",
+            status: "ready",
+            providerName: "codex",
+            providerSessionId: "session-1",
+            providerThreadId: "provider-thread-1",
+            runtimeMode: "full-access",
+            activeTurnId: null,
+            lastError: null,
+            updatedAt: "2026-02-23T08:10:05.000Z",
+          },
+        },
+      }),
+    );
+    model = await project(
+      makeEvent({
+        sequence: 8,
+        type: "thread.session-set",
+        aggregateKind: "thread",
+        aggregateId: "thread-1",
+        occurredAt: "2026-02-23T08:10:06.000Z",
+        commandId: "cmd-follow-up-running",
+        payload: {
+          threadId: "thread-1",
+          session: {
+            threadId: "thread-1",
+            status: "running",
+            providerName: "codex",
+            providerSessionId: "session-1",
+            providerThreadId: "provider-thread-1",
+            runtimeMode: "full-access",
+            activeTurnId: "turn-2",
+            lastError: null,
+            updatedAt: "2026-02-23T08:10:06.000Z",
+          },
+        },
+      }),
+    );
+
+    const messageTurns = new Map(
+      model.threads[0]?.messages.map((message) => [String(message.id), message.turnId]) ?? [],
+    );
+    expect(messageTurns.get("message-first")).toBe("turn-1");
+    expect(messageTurns.get("message-steer")).toBe("turn-1");
+    expect(messageTurns.get("message-follow-up")).toBe("turn-2");
+  });
+
+  it("unbinds immediate subagent steer markers when their pending anchor fails", async () => {
+    const createdAt = "2026-02-23T08:20:00.000Z";
+    let model = createEmptyReadModel(createdAt);
+    const project = (event: OrchestrationEvent) => Effect.runPromise(projectEvent(model, event));
+
+    model = await project(
+      makeEvent({
+        sequence: 1,
+        type: "thread.created",
+        aggregateKind: "thread",
+        aggregateId: "thread-1",
+        occurredAt: createdAt,
+        commandId: "cmd-create",
+        payload: {
+          threadId: "thread-1",
+          projectId: "project-1",
+          title: "demo",
+          modelSelection: {
+            provider: ProviderDriverKind.make("codex"),
+            model: "gpt-5.3-codex",
+          },
+          runtimeMode: "full-access",
+          branch: null,
+          worktreePath: null,
+          createdAt,
+          updatedAt: createdAt,
+        },
+      }),
+    );
+    model = await project(
+      makeEvent({
+        sequence: 2,
+        type: "thread.message-sent",
+        aggregateKind: "thread",
+        aggregateId: "thread-1",
+        occurredAt: "2026-02-23T08:20:01.000Z",
+        commandId: "cmd-anchor-message",
+        payload: {
+          threadId: "thread-1",
+          messageId: "message-anchor",
+          role: "user",
+          text: "anchor prompt fails",
+          turnId: null,
+          streaming: false,
+          createdAt: "2026-02-23T08:20:01.000Z",
+          updatedAt: "2026-02-23T08:20:01.000Z",
+        },
+      }),
+    );
+    model = await project(
+      makeEvent({
+        sequence: 3,
+        type: "thread.message-sent",
+        aggregateKind: "thread",
+        aggregateId: "thread-1",
+        occurredAt: "2026-02-23T08:20:02.000Z",
+        commandId: "server:subagent-steer-immediate:anchor-failed",
+        payload: {
+          threadId: "thread-1",
+          messageId: "message-steer",
+          role: "user",
+          text: "steer survives failed anchor",
+          turnId: null,
+          streaming: false,
+          createdAt: "2026-02-23T08:20:02.000Z",
+          updatedAt: "2026-02-23T08:20:02.000Z",
+        },
+      }),
+    );
+    expect(
+      model.threads[0]?.messages.find((message) => message.id === "message-steer")?.turnId,
+    ).toBe("pending-same-turn-steer:message-anchor");
+    model = await project(
+      makeEvent({
+        sequence: 4,
+        type: "thread.activity-appended",
+        aggregateKind: "thread",
+        aggregateId: "thread-1",
+        occurredAt: "2026-02-23T08:20:03.000Z",
+        commandId: "cmd-anchor-failed",
+        payload: {
+          threadId: "thread-1",
+          activity: {
+            id: "activity-anchor-failed",
+            tone: "error",
+            kind: "provider.turn.start.failed",
+            summary: "Provider turn start failed",
+            payload: {
+              detail: "anchor failed before materializing",
+              messageId: "message-anchor",
+            },
+            turnId: null,
+            createdAt: "2026-02-23T08:20:03.000Z",
+          },
+        },
+      }),
+    );
+    model = await project(
+      makeEvent({
+        sequence: 5,
+        type: "thread.session-set",
+        aggregateKind: "thread",
+        aggregateId: "thread-1",
+        occurredAt: "2026-02-23T08:20:04.000Z",
+        commandId: "cmd-steer-running",
+        payload: {
+          threadId: "thread-1",
+          session: {
+            threadId: "thread-1",
+            status: "running",
+            providerName: "codex",
+            providerSessionId: "session-1",
+            providerThreadId: "provider-thread-1",
+            runtimeMode: "full-access",
+            activeTurnId: "turn-steer",
+            lastError: null,
+            updatedAt: "2026-02-23T08:20:04.000Z",
+          },
+        },
+      }),
+    );
+
+    const messageTurns = new Map(
+      model.threads[0]?.messages.map((message) => [String(message.id), message.turnId]) ?? [],
+    );
+    expect(messageTurns.get("message-anchor")).toBeNull();
+    expect(messageTurns.get("message-steer")).toBe("turn-steer");
+  });
+
+  effectIt.effect(
+    "does not unbind immediate subagent steer markers when their pending anchor is canceled",
+    () =>
+      Effect.gen(function* () {
+        const createdAt = "2026-02-23T08:25:00.000Z";
+        let model = createEmptyReadModel(createdAt);
+        const project = (event: OrchestrationEvent) => projectEvent(model, event);
+
+        model = yield* project(
+          makeEvent({
+            sequence: 1,
+            type: "thread.created",
+            aggregateKind: "thread",
+            aggregateId: "thread-1",
+            occurredAt: createdAt,
+            commandId: "cmd-create",
+            payload: {
+              threadId: "thread-1",
+              projectId: "project-1",
+              title: "demo",
+              modelSelection: {
+                provider: ProviderDriverKind.make("codex"),
+                model: "gpt-5.3-codex",
+              },
+              runtimeMode: "full-access",
+              branch: null,
+              worktreePath: null,
+              createdAt,
+              updatedAt: createdAt,
+            },
+          }),
+        );
+        model = yield* project(
+          makeEvent({
+            sequence: 2,
+            type: "thread.message-sent",
+            aggregateKind: "thread",
+            aggregateId: "thread-1",
+            occurredAt: "2026-02-23T08:25:01.000Z",
+            commandId: "cmd-anchor-message",
+            payload: {
+              threadId: "thread-1",
+              messageId: "message-anchor",
+              role: "user",
+              text: "anchor prompt is canceled",
+              turnId: null,
+              streaming: false,
+              createdAt: "2026-02-23T08:25:01.000Z",
+              updatedAt: "2026-02-23T08:25:01.000Z",
+            },
+          }),
+        );
+        model = yield* project(
+          makeEvent({
+            sequence: 3,
+            type: "thread.message-sent",
+            aggregateKind: "thread",
+            aggregateId: "thread-1",
+            occurredAt: "2026-02-23T08:25:02.000Z",
+            commandId: "server:subagent-steer-immediate:anchor-canceled",
+            payload: {
+              threadId: "thread-1",
+              messageId: "message-steer",
+              role: "user",
+              text: "steer canceled with anchor",
+              turnId: null,
+              streaming: false,
+              createdAt: "2026-02-23T08:25:02.000Z",
+              updatedAt: "2026-02-23T08:25:02.000Z",
+            },
+          }),
+        );
+        expect(
+          model.threads[0]?.messages.find((message) => message.id === "message-steer")?.turnId,
+        ).toBe("pending-same-turn-steer:message-anchor");
+        model = yield* project(
+          makeEvent({
+            sequence: 4,
+            type: "thread.activity-appended",
+            aggregateKind: "thread",
+            aggregateId: "thread-1",
+            occurredAt: "2026-02-23T08:25:03.000Z",
+            commandId: "cmd-anchor-canceled",
+            payload: {
+              threadId: "thread-1",
+              activity: {
+                id: "activity-anchor-canceled",
+                tone: "info",
+                kind: "provider.turn.start.failed",
+                summary: "Queued turn canceled",
+                payload: {
+                  detail: "anchor was canceled before materializing",
+                  messageId: "message-anchor",
+                  canceled: true,
+                },
+                turnId: null,
+                createdAt: "2026-02-23T08:25:03.000Z",
+              },
+            },
+          }),
+        );
+        model = yield* project(
+          makeEvent({
+            sequence: 5,
+            type: "thread.session-set",
+            aggregateKind: "thread",
+            aggregateId: "thread-1",
+            occurredAt: "2026-02-23T08:25:04.000Z",
+            commandId: "cmd-later-running",
+            payload: {
+              threadId: "thread-1",
+              session: {
+                threadId: "thread-1",
+                status: "running",
+                providerName: "codex",
+                providerSessionId: "session-1",
+                providerThreadId: "provider-thread-1",
+                runtimeMode: "full-access",
+                activeTurnId: "turn-later",
+                lastError: null,
+                updatedAt: "2026-02-23T08:25:04.000Z",
+              },
+            },
+          }),
+        );
+
+        const messageTurns = new Map(
+          model.threads[0]?.messages.map((message) => [String(message.id), message.turnId]) ?? [],
+        );
+        expect(messageTurns.get("message-anchor")).toBeNull();
+        expect(messageTurns.get("message-steer")).toBe("pending-same-turn-steer:message-anchor");
+      }),
+  );
+
+  it("does not anchor immediate subagent steers to already failed prompts", async () => {
+    const createdAt = "2026-02-23T08:30:00.000Z";
+    let model = createEmptyReadModel(createdAt);
+    const project = (event: OrchestrationEvent) => Effect.runPromise(projectEvent(model, event));
+
+    model = await project(
+      makeEvent({
+        sequence: 1,
+        type: "thread.created",
+        aggregateKind: "thread",
+        aggregateId: "thread-1",
+        occurredAt: createdAt,
+        commandId: "cmd-create",
+        payload: {
+          threadId: "thread-1",
+          projectId: "project-1",
+          title: "demo",
+          modelSelection: {
+            provider: ProviderDriverKind.make("codex"),
+            model: "gpt-5.3-codex",
+          },
+          runtimeMode: "full-access",
+          branch: null,
+          worktreePath: null,
+          createdAt,
+          updatedAt: createdAt,
+        },
+      }),
+    );
+    model = await project(
+      makeEvent({
+        sequence: 2,
+        type: "thread.message-sent",
+        aggregateKind: "thread",
+        aggregateId: "thread-1",
+        occurredAt: "2026-02-23T08:30:01.000Z",
+        commandId: "cmd-failed-message",
+        payload: {
+          threadId: "thread-1",
+          messageId: "message-failed",
+          role: "user",
+          text: "failed prompt",
+          turnId: null,
+          streaming: false,
+          createdAt: "2026-02-23T08:30:01.000Z",
+          updatedAt: "2026-02-23T08:30:01.000Z",
+        },
+      }),
+    );
+    model = await project(
+      makeEvent({
+        sequence: 3,
+        type: "thread.activity-appended",
+        aggregateKind: "thread",
+        aggregateId: "thread-1",
+        occurredAt: "2026-02-23T08:30:02.000Z",
+        commandId: "cmd-failed-activity",
+        payload: {
+          threadId: "thread-1",
+          activity: {
+            id: "activity-failed",
+            tone: "error",
+            kind: "provider.turn.start.failed",
+            summary: "Provider turn start failed",
+            payload: {
+              detail: "failed before steer arrived",
+              messageId: "message-failed",
+            },
+            turnId: null,
+            createdAt: "2026-02-23T08:30:02.000Z",
+          },
+        },
+      }),
+    );
+    model = await project(
+      makeEvent({
+        sequence: 4,
+        type: "thread.message-sent",
+        aggregateKind: "thread",
+        aggregateId: "thread-1",
+        occurredAt: "2026-02-23T08:30:03.000Z",
+        commandId: "server:subagent-steer-immediate:after-failure",
+        payload: {
+          threadId: "thread-1",
+          messageId: "message-steer",
+          role: "user",
+          text: "steer after failed prompt",
+          turnId: null,
+          streaming: false,
+          createdAt: "2026-02-23T08:30:03.000Z",
+          updatedAt: "2026-02-23T08:30:03.000Z",
+        },
+      }),
+    );
+    expect(
+      model.threads[0]?.messages.find((message) => message.id === "message-steer")?.turnId,
+    ).toBe(null);
+    model = await project(
+      makeEvent({
+        sequence: 5,
+        type: "thread.session-set",
+        aggregateKind: "thread",
+        aggregateId: "thread-1",
+        occurredAt: "2026-02-23T08:30:04.000Z",
+        commandId: "cmd-steer-running",
+        payload: {
+          threadId: "thread-1",
+          session: {
+            threadId: "thread-1",
+            status: "running",
+            providerName: "codex",
+            providerSessionId: "session-1",
+            providerThreadId: "provider-thread-1",
+            runtimeMode: "full-access",
+            activeTurnId: "turn-steer",
+            lastError: null,
+            updatedAt: "2026-02-23T08:30:04.000Z",
+          },
+        },
+      }),
+    );
+
+    const messageTurns = new Map(
+      model.threads[0]?.messages.map((message) => [String(message.id), message.turnId]) ?? [],
+    );
+    expect(messageTurns.get("message-failed")).toBeNull();
+    expect(messageTurns.get("message-steer")).toBe("turn-steer");
+  });
+
   it("updates canonical thread runtime mode from thread.runtime-mode-set", async () => {
     const createdAt = "2026-02-23T08:00:00.000Z";
     const updatedAt = "2026-02-23T08:00:05.000Z";

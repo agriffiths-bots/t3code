@@ -5,6 +5,7 @@ import {
   type OrchestrationEvent,
   type OrchestrationSessionStatus,
   ThreadId,
+  TurnId,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
@@ -55,6 +56,8 @@ import {
   parseThreadSegmentFromAttachmentId,
   toSafeThreadAttachmentSegment,
 } from "../../attachmentStore.ts";
+
+const IMMEDIATE_SUBAGENT_STEER_COMMAND_PREFIX = "server:subagent-steer-immediate:";
 
 export const ORCHESTRATION_PROJECTOR_NAMES = {
   projects: "projection.projects",
@@ -111,6 +114,18 @@ function latestTurnIdForSessionSet(
   }
 }
 
+function isImmediateSubagentSteerCommandId(commandId: OrchestrationEvent["commandId"]): boolean {
+  return (
+    commandId !== null && String(commandId).startsWith(IMMEDIATE_SUBAGENT_STEER_COMMAND_PREFIX)
+  );
+}
+
+function pendingSameTurnSteerMarkerTurnId(
+  messageId: MessageId,
+): NonNullable<ProjectionTurn["turnId"]> {
+  return TurnId.make(`pending-same-turn-steer:${messageId}`);
+}
+
 interface ProjectorDefinition {
   readonly name: ProjectorName;
   readonly apply: (
@@ -143,6 +158,14 @@ function extractActivityMessageId(payload: unknown): MessageId | null {
   }
   const messageId = (payload as Record<string, unknown>).messageId;
   return typeof messageId === "string" ? MessageId.make(messageId) : null;
+}
+
+function isCanceledTurnStartFailurePayload(payload: unknown): boolean {
+  return (
+    typeof payload === "object" &&
+    payload !== null &&
+    (payload as Record<string, unknown>).canceled === true
+  );
 }
 
 function isStalePendingApprovalFailureDetail(detail: string | null): boolean {
@@ -586,6 +609,89 @@ const makeOrchestrationProjectionPipeline = Effect.fn("makeOrchestrationProjecti
     const path = yield* Path.Path;
     const serverConfig = yield* ServerConfig;
 
+    const currentRunningTurnIdByThreadId = Effect.fn("currentRunningTurnIdByThreadId")(function* (
+      threadId: ThreadId,
+    ) {
+      const turns = yield* projectionTurnRepository.listByThreadId({ threadId });
+      let activeTurnId: ProjectionTurn["turnId"] = null;
+      for (const turn of turns) {
+        if (turn.turnId !== null && turn.state === "running") {
+          activeTurnId = turn.turnId;
+        }
+      }
+      return activeTurnId;
+    });
+
+    const bindPromptMessagesToTurn = Effect.fn("bindPromptMessagesToTurn")(function* (input: {
+      readonly threadId: ThreadId;
+      readonly turnId: NonNullable<ProjectionTurn["turnId"]>;
+      readonly messageIds: ReadonlyArray<MessageId>;
+    }) {
+      yield* Effect.forEach(
+        input.messageIds,
+        (messageId) =>
+          Effect.gen(function* () {
+            const projectedMessage = yield* projectionThreadMessageRepository.getByMessageId({
+              messageId,
+            });
+            if (
+              Option.isSome(projectedMessage) &&
+              projectedMessage.value.threadId === input.threadId &&
+              projectedMessage.value.turnId !== input.turnId &&
+              isProjectionPromptMessage(projectedMessage.value)
+            ) {
+              yield* projectionThreadMessageRepository.upsert({
+                ...projectedMessage.value,
+                turnId: input.turnId,
+              });
+            }
+          }),
+        { concurrency: 1, discard: true },
+      );
+    });
+
+    const messageIdsWithTurnMarker = Effect.fn("messageIdsWithTurnMarker")(function* (input: {
+      readonly threadId: ThreadId;
+      readonly markerTurnId: NonNullable<ProjectionTurn["turnId"]>;
+    }) {
+      const messages = yield* projectionThreadMessageRepository.listByThreadId({
+        threadId: input.threadId,
+      });
+      return messages
+        .filter((message) => message.turnId === input.markerTurnId)
+        .map((message) => message.messageId);
+    });
+
+    const promoteSameTurnSteersAfterPendingStartDelete = Effect.fn(
+      "promoteSameTurnSteersAfterPendingStartDelete",
+    )(function* (input: { readonly threadId: ThreadId; readonly messageId: MessageId }) {
+      const markerTurnId = pendingSameTurnSteerMarkerTurnId(input.messageId);
+      const messages = yield* projectionThreadMessageRepository.listByThreadId({
+        threadId: input.threadId,
+      });
+      const markerMessages = messages.filter(
+        (message) => message.turnId === markerTurnId && isProjectionPromptMessage(message),
+      );
+      yield* Effect.forEach(
+        markerMessages,
+        (message) =>
+          Effect.gen(function* () {
+            yield* projectionThreadMessageRepository.upsert({
+              ...message,
+              turnId: null,
+            });
+            yield* projectionTurnRepository.replacePendingTurnStart({
+              threadId: input.threadId,
+              messageId: message.messageId,
+              sourceProposedPlanThreadId: null,
+              sourceProposedPlanId: null,
+              requestedAt: message.createdAt,
+            });
+          }),
+        { concurrency: 1, discard: true },
+      );
+    });
+
     const applyProjectsProjection: ProjectorDefinition["apply"] = Effect.fn(
       "applyProjectsProjection",
     )(function* (event, _attachmentSideEffects) {
@@ -975,9 +1081,15 @@ const makeOrchestrationProjectionPipeline = Effect.fn("makeOrchestrationProjecti
           const existingMessage = yield* projectionThreadMessageRepository.getByMessageId({
             messageId: event.payload.messageId,
           });
+          const projectedTurnId =
+            event.payload.turnId === null &&
+            isImmediateSubagentSteerCommandId(event.commandId) &&
+            isProjectionPromptMessage(event.payload)
+              ? yield* currentRunningTurnIdByThreadId(event.payload.threadId)
+              : event.payload.turnId;
           const previousMessage = Option.getOrUndefined(existingMessage);
           const previousMessageForSameTurn =
-            previousMessage?.turnId === event.payload.turnId ? previousMessage : undefined;
+            previousMessage?.turnId === projectedTurnId ? previousMessage : undefined;
           const nextText =
             previousMessageForSameTurn === undefined
               ? event.payload.text
@@ -999,7 +1111,7 @@ const makeOrchestrationProjectionPipeline = Effect.fn("makeOrchestrationProjecti
           yield* projectionThreadMessageRepository.upsert({
             messageId: event.payload.messageId,
             threadId: event.payload.threadId,
-            turnId: event.payload.turnId,
+            turnId: projectedTurnId,
             role: event.payload.role,
             text: nextText,
             ...(nextAttachments !== undefined ? { attachments: [...nextAttachments] } : {}),
@@ -1177,6 +1289,29 @@ const makeOrchestrationProjectionPipeline = Effect.fn("makeOrchestrationProjecti
     )(function* (event, _attachmentSideEffects) {
       switch (event.type) {
         case "thread.turn-start-requested": {
+          if (isImmediateSubagentSteerCommandId(event.commandId)) {
+            const activeTurnId = yield* currentRunningTurnIdByThreadId(event.payload.threadId);
+            if (activeTurnId !== null) {
+              yield* bindPromptMessagesToTurn({
+                threadId: event.payload.threadId,
+                turnId: activeTurnId,
+                messageIds: [event.payload.messageId],
+              });
+              return;
+            }
+            const pendingTurnStart = yield* projectionTurnRepository.getPendingTurnStartByThreadId({
+              threadId: event.payload.threadId,
+            });
+            if (Option.isSome(pendingTurnStart)) {
+              yield* bindPromptMessagesToTurn({
+                threadId: event.payload.threadId,
+                turnId: pendingSameTurnSteerMarkerTurnId(pendingTurnStart.value.messageId),
+                messageIds: [event.payload.messageId],
+              });
+              return;
+            }
+          }
+
           yield* projectionTurnRepository.replacePendingTurnStart({
             threadId: event.payload.threadId,
             messageId: event.payload.messageId,
@@ -1318,6 +1453,17 @@ const makeOrchestrationProjectionPipeline = Effect.fn("makeOrchestrationProjecti
           }
 
           if (shouldDeletePendingTurnStart) {
+            if (Option.isSome(pendingTurnStart)) {
+              const immediateSteerMessageIds = yield* messageIdsWithTurnMarker({
+                threadId: event.payload.threadId,
+                markerTurnId: pendingSameTurnSteerMarkerTurnId(pendingTurnStart.value.messageId),
+              });
+              yield* bindPromptMessagesToTurn({
+                threadId: event.payload.threadId,
+                turnId,
+                messageIds: immediateSteerMessageIds,
+              });
+            }
             yield* projectionTurnRepository.deletePendingTurnStartByThreadId({
               threadId: event.payload.threadId,
             });
@@ -1329,13 +1475,29 @@ const makeOrchestrationProjectionPipeline = Effect.fn("makeOrchestrationProjecti
           if (event.payload.activity.kind !== "provider.turn.start.failed") {
             return;
           }
+          const failureCanceled = isCanceledTurnStartFailurePayload(event.payload.activity.payload);
           const messageId = extractActivityMessageId(event.payload.activity.payload);
           if (messageId !== null) {
+            if (!failureCanceled) {
+              yield* promoteSameTurnSteersAfterPendingStartDelete({
+                threadId: event.payload.threadId,
+                messageId,
+              });
+            }
             yield* projectionTurnRepository.deletePendingTurnStartByMessageId({
               threadId: event.payload.threadId,
               messageId,
             });
           } else {
+            const pendingTurnStart = yield* projectionTurnRepository.getPendingTurnStartByThreadId({
+              threadId: event.payload.threadId,
+            });
+            if (!failureCanceled && Option.isSome(pendingTurnStart)) {
+              yield* promoteSameTurnSteersAfterPendingStartDelete({
+                threadId: event.payload.threadId,
+                messageId: pendingTurnStart.value.messageId,
+              });
+            }
             yield* projectionTurnRepository.deletePendingTurnStartByThreadId({
               threadId: event.payload.threadId,
             });

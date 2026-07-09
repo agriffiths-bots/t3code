@@ -1,16 +1,16 @@
 import type {
-  MessageId,
   OrchestrationEvent,
   OrchestrationLatestTurn,
   OrchestrationReadModel,
   ThreadId,
-  TurnId,
 } from "@t3tools/contracts";
 import {
+  MessageId,
   OrchestrationCheckpointSummary,
   OrchestrationMessage,
   OrchestrationSession,
   OrchestrationThread,
+  TurnId,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
@@ -39,6 +39,7 @@ import {
 
 type ThreadPatch = Partial<Omit<OrchestrationThread, "id" | "projectId">>;
 const MAX_THREAD_MESSAGES = 2_000;
+const IMMEDIATE_SUBAGENT_STEER_COMMAND_PREFIX = "server:subagent-steer-immediate:";
 
 function checkpointStatusToLatestTurnState(status: "ready" | "missing" | "error") {
   if (status === "error") return "error" as const;
@@ -68,6 +69,27 @@ function settledTurnStateForSessionStatus(
     case "waiting":
       return null;
   }
+}
+
+function isImmediateSubagentSteerCommandId(commandId: OrchestrationEvent["commandId"]): boolean {
+  return (
+    commandId !== null && String(commandId).startsWith(IMMEDIATE_SUBAGENT_STEER_COMMAND_PREFIX)
+  );
+}
+
+function activeSessionTurnId(session: OrchestrationThread["session"]): TurnId | null {
+  if (
+    session === null ||
+    (session.status !== "running" && session.status !== "waiting") ||
+    session.activeTurnId === null
+  ) {
+    return null;
+  }
+  return session.activeTurnId;
+}
+
+function pendingSameTurnSteerMarkerTurnId(messageId: MessageId): TurnId {
+  return TurnId.make(`pending-same-turn-steer:${messageId}`);
 }
 
 function upsertCheckpointRebindingAssistantMessage(
@@ -224,15 +246,65 @@ function bindNextPendingPromptMessageToTurn(
   turnId: TurnId,
   failedPromptMessageIds: ReadonlySet<string>,
 ): ReadonlyArray<OrchestrationMessage> {
-  const pendingIndex = messages.findIndex((message) => {
+  const pendingMessage = nextPendingPromptMessage(messages, failedPromptMessageIds);
+  if (pendingMessage === undefined) return messages;
+  return messages.map((message) =>
+    message.id === pendingMessage.id ? { ...message, turnId } : message,
+  );
+}
+
+function nextPendingPromptMessage(
+  messages: ReadonlyArray<OrchestrationMessage>,
+  failedPromptMessageIds: ReadonlySet<string>,
+): OrchestrationMessage | undefined {
+  return messages.find((message) => {
     if (message.turnId !== null || !isThreadPromptMessage(message)) {
       return false;
     }
     return !failedPromptMessageIds.has(message.id);
   });
-  if (pendingIndex === -1) return messages;
-  return messages.map((message, index) =>
-    index === pendingIndex ? { ...message, turnId } : message,
+}
+
+function rebindPromptMessagesFromMarkerTurn(
+  messages: ReadonlyArray<OrchestrationMessage>,
+  markerTurnId: TurnId,
+  turnId: TurnId,
+): ReadonlyArray<OrchestrationMessage> {
+  return messages.map((message) =>
+    message.turnId === markerTurnId && isThreadPromptMessage(message)
+      ? { ...message, turnId }
+      : message,
+  );
+}
+
+function unbindPromptMessagesFromMarkerTurn(
+  messages: ReadonlyArray<OrchestrationMessage>,
+  markerTurnId: TurnId,
+): ReadonlyArray<OrchestrationMessage> {
+  return messages.map((message) =>
+    message.turnId === markerTurnId && isThreadPromptMessage(message)
+      ? { ...message, turnId: null }
+      : message,
+  );
+}
+
+function extractTurnStartFailureMessageId(
+  payload: OrchestrationThread["activities"][number]["payload"],
+): MessageId | null {
+  if (typeof payload !== "object" || payload === null) {
+    return null;
+  }
+  const messageId = (payload as Record<string, unknown>).messageId;
+  return typeof messageId === "string" ? MessageId.make(messageId) : null;
+}
+
+function isCanceledTurnStartFailurePayload(
+  payload: OrchestrationThread["activities"][number]["payload"],
+): boolean {
+  return (
+    typeof payload === "object" &&
+    payload !== null &&
+    (payload as Record<string, unknown>).canceled === true
   );
 }
 
@@ -254,12 +326,9 @@ function failedTurnStartPromptMessageIds(
     if (activity.kind !== "provider.turn.start.failed") {
       continue;
     }
-    const payload =
-      typeof activity.payload === "object" && activity.payload !== null
-        ? (activity.payload as Record<string, unknown>)
-        : null;
-    if (typeof payload?.messageId === "string") {
-      ids.add(payload.messageId);
+    const messageId = extractTurnStartFailureMessageId(activity.payload);
+    if (messageId !== null) {
+      ids.add(messageId);
       continue;
     }
     const legacyPrompt = pendingPromptMessages.find(
@@ -766,6 +835,29 @@ export function projectEvent(
           return nextBase;
         }
 
+        const failedPromptMessageIds = failedTurnStartPromptMessageIds(
+          thread.messages,
+          thread.activities,
+        );
+        const activeTurnId =
+          payload.turnId === null &&
+          isImmediateSubagentSteerCommandId(event.commandId) &&
+          isThreadPromptMessage(payload)
+            ? activeSessionTurnId(thread.session)
+            : null;
+        const pendingSameTurnPrompt =
+          activeTurnId === null &&
+          payload.turnId === null &&
+          isImmediateSubagentSteerCommandId(event.commandId) &&
+          isThreadPromptMessage(payload)
+            ? nextPendingPromptMessage(thread.messages, failedPromptMessageIds)
+            : undefined;
+        const projectedTurnId =
+          activeTurnId ??
+          (pendingSameTurnPrompt !== undefined
+            ? pendingSameTurnSteerMarkerTurnId(pendingSameTurnPrompt.id)
+            : payload.turnId);
+
         const message: OrchestrationMessage = yield* decodeForEvent(
           OrchestrationMessage,
           {
@@ -773,7 +865,7 @@ export function projectEvent(
             role: payload.role,
             text: payload.text,
             ...(payload.attachments !== undefined ? { attachments: payload.attachments } : {}),
-            turnId: payload.turnId,
+            turnId: projectedTurnId,
             streaming: payload.streaming,
             createdAt: payload.createdAt,
             updatedAt: payload.updatedAt,
@@ -843,13 +935,23 @@ export function projectEvent(
           thread.messages,
           thread.activities,
         );
+        const pendingPromptMessage =
+          activeTurnId === null || activeTurnId === previousActiveTurnId
+            ? undefined
+            : nextPendingPromptMessage(thread.messages, failedPromptMessageIds);
         const messages =
           activeTurnId === null || activeTurnId === previousActiveTurnId
             ? thread.messages
-            : bindNextPendingPromptMessageToTurn(
-                thread.messages,
+            : rebindPromptMessagesFromMarkerTurn(
+                bindNextPendingPromptMessageToTurn(
+                  thread.messages,
+                  activeTurnId,
+                  failedPromptMessageIds,
+                ),
+                pendingPromptMessage === undefined
+                  ? activeTurnId
+                  : pendingSameTurnSteerMarkerTurnId(pendingPromptMessage.id),
                 activeTurnId,
-                failedPromptMessageIds,
               );
         const activeTurnAssistantMessageId =
           activeTurnId === null ? null : latestAssistantMessageIdForTurn(messages, activeTurnId);
@@ -1178,10 +1280,27 @@ export function projectEvent(
           ]
             .toSorted(compareThreadActivities)
             .slice(-500);
+          const failureMessageId =
+            payload.activity.kind === "provider.turn.start.failed"
+              ? (extractTurnStartFailureMessageId(payload.activity.payload) ??
+                nextPendingPromptMessage(
+                  thread.messages,
+                  failedTurnStartPromptMessageIds(thread.messages, thread.activities),
+                )?.id ??
+                null)
+              : null;
+          const messages =
+            failureMessageId === null || isCanceledTurnStartFailurePayload(payload.activity.payload)
+              ? thread.messages
+              : unbindPromptMessagesFromMarkerTurn(
+                  thread.messages,
+                  pendingSameTurnSteerMarkerTurnId(failureMessageId),
+                );
 
           return {
             ...nextBase,
             threads: updateThread(nextBase.threads, payload.threadId, {
+              messages,
               activities,
               updatedAt: event.occurredAt,
             }),

@@ -1664,7 +1664,7 @@ const steerSubagent = Effect.fn("SubagentToolkit.steer")(function* (input: Steer
   const createdAt = yield* nowIso;
   yield* dispatchActive({
     type: "thread.turn.start",
-    commandId: CommandId.make(`server:subagent-steer:${uuid}`),
+    commandId: CommandId.make(`server:subagent-steer-immediate:${uuid}`),
     threadId: input.childThreadId,
     message: { messageId, role: "user", text: input.message, attachments: [] },
     runtimeMode: child.runtimeMode,

@@ -3563,6 +3563,864 @@ it.effect("restores pending turn-start metadata across projection pipeline resta
   ),
 );
 
+it.effect("binds immediate subagent steers to the active turn without leaving pending starts", () =>
+  Effect.gen(function* () {
+    const projectionPipeline = yield* OrchestrationProjectionPipeline;
+    const eventStore = yield* OrchestrationEventStore;
+    const sql = yield* SqlClient.SqlClient;
+    const threadId = ThreadId.make("thread-immediate-steer-projection");
+    const firstMessageId = MessageId.make("message-immediate-steer-first");
+    const steerMessageId = MessageId.make("message-immediate-steer-same-turn");
+    const followUpMessageId = MessageId.make("message-immediate-steer-follow-up");
+    const firstTurnId = TurnId.make("turn-immediate-steer-first");
+    const followUpTurnId = TurnId.make("turn-immediate-steer-follow-up");
+    const appendAndProject = (event: Parameters<typeof eventStore.append>[0]) =>
+      eventStore
+        .append(event)
+        .pipe(Effect.flatMap((savedEvent) => projectionPipeline.projectEvent(savedEvent)));
+    const appendPrompt = (
+      eventId: string,
+      commandId: string,
+      messageId: MessageId,
+      text: string,
+      createdAt: string,
+    ) =>
+      appendAndProject({
+        type: "thread.message-sent",
+        eventId: EventId.make(eventId),
+        aggregateKind: "thread",
+        aggregateId: threadId,
+        occurredAt: createdAt,
+        commandId: CommandId.make(commandId),
+        causationEventId: null,
+        correlationId: CorrelationId.make(commandId),
+        metadata: {},
+        payload: {
+          threadId,
+          messageId,
+          role: "user",
+          text,
+          turnId: null,
+          streaming: false,
+          createdAt,
+          updatedAt: createdAt,
+        },
+      });
+    const appendTurnStart = (
+      eventId: string,
+      commandId: string,
+      messageId: MessageId,
+      createdAt: string,
+    ) =>
+      appendAndProject({
+        type: "thread.turn-start-requested",
+        eventId: EventId.make(eventId),
+        aggregateKind: "thread",
+        aggregateId: threadId,
+        occurredAt: createdAt,
+        commandId: CommandId.make(commandId),
+        causationEventId: null,
+        correlationId: CorrelationId.make(commandId),
+        metadata: {},
+        payload: {
+          threadId,
+          messageId,
+          runtimeMode: "full-access",
+          createdAt,
+        },
+      });
+    const appendSession = (
+      eventId: string,
+      commandId: string,
+      status: "running" | "ready",
+      activeTurnId: TurnId | null,
+      updatedAt: string,
+    ) =>
+      appendAndProject({
+        type: "thread.session-set",
+        eventId: EventId.make(eventId),
+        aggregateKind: "thread",
+        aggregateId: threadId,
+        occurredAt: updatedAt,
+        commandId: CommandId.make(commandId),
+        causationEventId: null,
+        correlationId: CorrelationId.make(commandId),
+        metadata: {},
+        payload: {
+          threadId,
+          session: {
+            threadId,
+            status,
+            providerName: "codex",
+            runtimeMode: "full-access",
+            activeTurnId,
+            lastError: null,
+            updatedAt,
+          },
+        },
+      });
+
+    yield* appendAndProject({
+      type: "thread.created",
+      eventId: EventId.make("evt-immediate-steer-create"),
+      aggregateKind: "thread",
+      aggregateId: threadId,
+      occurredAt: "2026-02-26T15:30:00.000Z",
+      commandId: CommandId.make("cmd-immediate-steer-create"),
+      causationEventId: null,
+      correlationId: CorrelationId.make("cmd-immediate-steer-create"),
+      metadata: {},
+      payload: {
+        threadId,
+        projectId: ProjectId.make("project-1"),
+        title: "Thread immediate steer",
+        modelSelection: {
+          instanceId: ProviderInstanceId.make("codex"),
+          model: "gpt-5-codex",
+        },
+        runtimeMode: "full-access",
+        branch: null,
+        worktreePath: null,
+        createdAt: "2026-02-26T15:30:00.000Z",
+        updatedAt: "2026-02-26T15:30:00.000Z",
+      },
+    });
+    yield* appendPrompt(
+      "evt-immediate-steer-first-message",
+      "cmd-immediate-steer-first",
+      firstMessageId,
+      "first prompt",
+      "2026-02-26T15:30:01.000Z",
+    );
+    yield* appendTurnStart(
+      "evt-immediate-steer-first-start",
+      "cmd-immediate-steer-first",
+      firstMessageId,
+      "2026-02-26T15:30:01.000Z",
+    );
+    yield* appendSession(
+      "evt-immediate-steer-first-running",
+      "cmd-immediate-steer-first-running",
+      "running",
+      firstTurnId,
+      "2026-02-26T15:30:02.000Z",
+    );
+
+    yield* appendPrompt(
+      "evt-immediate-steer-message",
+      "server:subagent-steer-immediate:test",
+      steerMessageId,
+      "same turn steer",
+      "2026-02-26T15:30:03.000Z",
+    );
+    yield* appendTurnStart(
+      "evt-immediate-steer-start",
+      "server:subagent-steer-immediate:test",
+      steerMessageId,
+      "2026-02-26T15:30:03.000Z",
+    );
+    yield* appendPrompt(
+      "evt-immediate-steer-follow-up-message",
+      "cmd-immediate-steer-follow-up",
+      followUpMessageId,
+      "queued follow-up",
+      "2026-02-26T15:30:04.000Z",
+    );
+    yield* appendTurnStart(
+      "evt-immediate-steer-follow-up-start",
+      "cmd-immediate-steer-follow-up",
+      followUpMessageId,
+      "2026-02-26T15:30:04.000Z",
+    );
+    yield* appendSession(
+      "evt-immediate-steer-ready",
+      "cmd-immediate-steer-ready",
+      "ready",
+      null,
+      "2026-02-26T15:30:05.000Z",
+    );
+    yield* appendSession(
+      "evt-immediate-steer-follow-up-running",
+      "cmd-immediate-steer-follow-up-running",
+      "running",
+      followUpTurnId,
+      "2026-02-26T15:30:06.000Z",
+    );
+
+    const pendingRows = yield* sql<{ readonly messageId: string }>`
+      SELECT pending_message_id AS "messageId"
+      FROM projection_turns
+      WHERE thread_id = ${threadId}
+        AND turn_id IS NULL
+        AND state = 'pending'
+      ORDER BY row_id ASC
+    `;
+    assert.deepEqual(pendingRows, []);
+
+    const messageRows = yield* sql<{ readonly messageId: string; readonly turnId: string | null }>`
+      SELECT message_id AS "messageId", turn_id AS "turnId"
+      FROM projection_thread_messages
+      WHERE message_id = ${steerMessageId}
+      ORDER BY created_at ASC
+    `;
+    assert.deepEqual(messageRows, [
+      { messageId: "message-immediate-steer-same-turn", turnId: "turn-immediate-steer-first" },
+    ]);
+
+    const followUpTurnRows = yield* sql<{
+      readonly turnId: string;
+      readonly pendingMessageId: string | null;
+    }>`
+      SELECT turn_id AS "turnId", pending_message_id AS "pendingMessageId"
+      FROM projection_turns
+      WHERE thread_id = ${threadId}
+        AND turn_id = ${followUpTurnId}
+    `;
+    assert.deepEqual(followUpTurnRows, [
+      {
+        turnId: "turn-immediate-steer-follow-up",
+        pendingMessageId: "message-immediate-steer-follow-up",
+      },
+    ]);
+  }).pipe(
+    Effect.provide(
+      Layer.fresh(makeProjectionPipelinePrefixedTestLayer("t3-projection-immediate-steer-")),
+    ),
+  ),
+);
+
+it.effect("binds immediate subagent steers queued before the first turn materializes", () =>
+  Effect.gen(function* () {
+    const projectionPipeline = yield* OrchestrationProjectionPipeline;
+    const eventStore = yield* OrchestrationEventStore;
+    const sql = yield* SqlClient.SqlClient;
+    const threadId = ThreadId.make("thread-immediate-steer-inflight-projection");
+    const firstMessageId = MessageId.make("message-immediate-steer-inflight-first");
+    const steerMessageId = MessageId.make("message-immediate-steer-inflight-same-turn");
+    const followUpMessageId = MessageId.make("message-immediate-steer-inflight-follow-up");
+    const firstTurnId = TurnId.make("turn-immediate-steer-inflight-first");
+    const followUpTurnId = TurnId.make("turn-immediate-steer-inflight-follow-up");
+    const appendAndProject = (event: Parameters<typeof eventStore.append>[0]) =>
+      eventStore
+        .append(event)
+        .pipe(Effect.flatMap((savedEvent) => projectionPipeline.projectEvent(savedEvent)));
+    const appendPrompt = (
+      eventId: string,
+      commandId: string,
+      messageId: MessageId,
+      text: string,
+      createdAt: string,
+    ) =>
+      appendAndProject({
+        type: "thread.message-sent",
+        eventId: EventId.make(eventId),
+        aggregateKind: "thread",
+        aggregateId: threadId,
+        occurredAt: createdAt,
+        commandId: CommandId.make(commandId),
+        causationEventId: null,
+        correlationId: CorrelationId.make(commandId),
+        metadata: {},
+        payload: {
+          threadId,
+          messageId,
+          role: "user",
+          text,
+          turnId: null,
+          streaming: false,
+          createdAt,
+          updatedAt: createdAt,
+        },
+      });
+    const appendTurnStart = (
+      eventId: string,
+      commandId: string,
+      messageId: MessageId,
+      createdAt: string,
+    ) =>
+      appendAndProject({
+        type: "thread.turn-start-requested",
+        eventId: EventId.make(eventId),
+        aggregateKind: "thread",
+        aggregateId: threadId,
+        occurredAt: createdAt,
+        commandId: CommandId.make(commandId),
+        causationEventId: null,
+        correlationId: CorrelationId.make(commandId),
+        metadata: {},
+        payload: {
+          threadId,
+          messageId,
+          runtimeMode: "full-access",
+          createdAt,
+        },
+      });
+    const appendSession = (
+      eventId: string,
+      commandId: string,
+      status: "running" | "ready",
+      activeTurnId: TurnId | null,
+      updatedAt: string,
+    ) =>
+      appendAndProject({
+        type: "thread.session-set",
+        eventId: EventId.make(eventId),
+        aggregateKind: "thread",
+        aggregateId: threadId,
+        occurredAt: updatedAt,
+        commandId: CommandId.make(commandId),
+        causationEventId: null,
+        correlationId: CorrelationId.make(commandId),
+        metadata: {},
+        payload: {
+          threadId,
+          session: {
+            threadId,
+            status,
+            providerName: "codex",
+            runtimeMode: "full-access",
+            activeTurnId,
+            lastError: null,
+            updatedAt,
+          },
+        },
+      });
+
+    yield* appendAndProject({
+      type: "thread.created",
+      eventId: EventId.make("evt-immediate-steer-inflight-create"),
+      aggregateKind: "thread",
+      aggregateId: threadId,
+      occurredAt: "2026-02-26T15:40:00.000Z",
+      commandId: CommandId.make("cmd-immediate-steer-inflight-create"),
+      causationEventId: null,
+      correlationId: CorrelationId.make("cmd-immediate-steer-inflight-create"),
+      metadata: {},
+      payload: {
+        threadId,
+        projectId: ProjectId.make("project-1"),
+        title: "Thread immediate steer in flight",
+        modelSelection: {
+          instanceId: ProviderInstanceId.make("codex"),
+          model: "gpt-5-codex",
+        },
+        runtimeMode: "full-access",
+        branch: null,
+        worktreePath: null,
+        createdAt: "2026-02-26T15:40:00.000Z",
+        updatedAt: "2026-02-26T15:40:00.000Z",
+      },
+    });
+    yield* appendPrompt(
+      "evt-immediate-steer-inflight-first-message",
+      "server:subagent-steer-immediate:first",
+      firstMessageId,
+      "first immediate steer opens the turn",
+      "2026-02-26T15:40:01.000Z",
+    );
+    yield* appendTurnStart(
+      "evt-immediate-steer-inflight-first-start",
+      "server:subagent-steer-immediate:first",
+      firstMessageId,
+      "2026-02-26T15:40:01.000Z",
+    );
+    yield* appendPrompt(
+      "evt-immediate-steer-inflight-second-message",
+      "server:subagent-steer-immediate:second",
+      steerMessageId,
+      "second immediate steer joins the first turn",
+      "2026-02-26T15:40:02.000Z",
+    );
+    yield* appendTurnStart(
+      "evt-immediate-steer-inflight-second-start",
+      "server:subagent-steer-immediate:second",
+      steerMessageId,
+      "2026-02-26T15:40:02.000Z",
+    );
+    yield* appendSession(
+      "evt-immediate-steer-inflight-first-running",
+      "cmd-immediate-steer-inflight-first-running",
+      "running",
+      firstTurnId,
+      "2026-02-26T15:40:03.000Z",
+    );
+    yield* appendPrompt(
+      "evt-immediate-steer-inflight-follow-up-message",
+      "cmd-immediate-steer-inflight-follow-up",
+      followUpMessageId,
+      "queued follow-up after first turn",
+      "2026-02-26T15:40:04.000Z",
+    );
+    yield* appendTurnStart(
+      "evt-immediate-steer-inflight-follow-up-start",
+      "cmd-immediate-steer-inflight-follow-up",
+      followUpMessageId,
+      "2026-02-26T15:40:04.000Z",
+    );
+    yield* appendSession(
+      "evt-immediate-steer-inflight-ready",
+      "cmd-immediate-steer-inflight-ready",
+      "ready",
+      null,
+      "2026-02-26T15:40:05.000Z",
+    );
+    yield* appendSession(
+      "evt-immediate-steer-inflight-follow-up-running",
+      "cmd-immediate-steer-inflight-follow-up-running",
+      "running",
+      followUpTurnId,
+      "2026-02-26T15:40:06.000Z",
+    );
+
+    const pendingRows = yield* sql<{ readonly messageId: string }>`
+      SELECT pending_message_id AS "messageId"
+      FROM projection_turns
+      WHERE thread_id = ${threadId}
+        AND turn_id IS NULL
+        AND state = 'pending'
+      ORDER BY row_id ASC
+    `;
+    assert.deepEqual(pendingRows, []);
+
+    const messageRows = yield* sql<{ readonly messageId: string; readonly turnId: string | null }>`
+      SELECT messages.message_id AS "messageId", COALESCE(messages.turn_id, turns.turn_id) AS "turnId"
+      FROM projection_thread_messages messages
+      LEFT JOIN projection_turns turns
+        ON turns.thread_id = messages.thread_id
+        AND turns.pending_message_id = messages.message_id
+        AND turns.turn_id IS NOT NULL
+      WHERE messages.message_id IN (${firstMessageId}, ${steerMessageId}, ${followUpMessageId})
+      ORDER BY messages.created_at ASC
+    `;
+    assert.deepEqual(messageRows, [
+      {
+        messageId: "message-immediate-steer-inflight-first",
+        turnId: "turn-immediate-steer-inflight-first",
+      },
+      {
+        messageId: "message-immediate-steer-inflight-same-turn",
+        turnId: "turn-immediate-steer-inflight-first",
+      },
+      {
+        messageId: "message-immediate-steer-inflight-follow-up",
+        turnId: "turn-immediate-steer-inflight-follow-up",
+      },
+    ]);
+  }).pipe(
+    Effect.provide(
+      Layer.fresh(
+        makeProjectionPipelinePrefixedTestLayer("t3-projection-immediate-steer-inflight-"),
+      ),
+    ),
+  ),
+);
+
+it.effect("promotes immediate subagent steers when their pending anchor fails", () =>
+  Effect.gen(function* () {
+    const projectionPipeline = yield* OrchestrationProjectionPipeline;
+    const eventStore = yield* OrchestrationEventStore;
+    const sql = yield* SqlClient.SqlClient;
+    const threadId = ThreadId.make("thread-immediate-steer-anchor-failed");
+    const firstMessageId = MessageId.make("message-anchor-failed-first");
+    const steerMessageId = MessageId.make("message-anchor-failed-steer");
+    const followUpMessageId = MessageId.make("message-anchor-failed-follow-up");
+    const turnId = TurnId.make("turn-anchor-failed-promoted-steer");
+    const appendAndProject = (event: Parameters<typeof eventStore.append>[0]) =>
+      eventStore
+        .append(event)
+        .pipe(Effect.flatMap((savedEvent) => projectionPipeline.projectEvent(savedEvent)));
+    const appendPrompt = (
+      eventId: string,
+      commandId: string,
+      messageId: MessageId,
+      text: string,
+      createdAt: string,
+    ) =>
+      appendAndProject({
+        type: "thread.message-sent",
+        eventId: EventId.make(eventId),
+        aggregateKind: "thread",
+        aggregateId: threadId,
+        occurredAt: createdAt,
+        commandId: CommandId.make(commandId),
+        causationEventId: null,
+        correlationId: CorrelationId.make(commandId),
+        metadata: {},
+        payload: {
+          threadId,
+          messageId,
+          role: "user",
+          text,
+          turnId: null,
+          streaming: false,
+          createdAt,
+          updatedAt: createdAt,
+        },
+      });
+    const appendTurnStart = (
+      eventId: string,
+      commandId: string,
+      messageId: MessageId,
+      createdAt: string,
+    ) =>
+      appendAndProject({
+        type: "thread.turn-start-requested",
+        eventId: EventId.make(eventId),
+        aggregateKind: "thread",
+        aggregateId: threadId,
+        occurredAt: createdAt,
+        commandId: CommandId.make(commandId),
+        causationEventId: null,
+        correlationId: CorrelationId.make(commandId),
+        metadata: {},
+        payload: {
+          threadId,
+          messageId,
+          runtimeMode: "full-access",
+          createdAt,
+        },
+      });
+
+    yield* appendAndProject({
+      type: "thread.created",
+      eventId: EventId.make("evt-anchor-failed-create"),
+      aggregateKind: "thread",
+      aggregateId: threadId,
+      occurredAt: "2026-02-26T15:50:00.000Z",
+      commandId: CommandId.make("cmd-anchor-failed-create"),
+      causationEventId: null,
+      correlationId: CorrelationId.make("cmd-anchor-failed-create"),
+      metadata: {},
+      payload: {
+        threadId,
+        projectId: ProjectId.make("project-1"),
+        title: "Thread anchor failed",
+        modelSelection: {
+          instanceId: ProviderInstanceId.make("codex"),
+          model: "gpt-5-codex",
+        },
+        runtimeMode: "full-access",
+        branch: null,
+        worktreePath: null,
+        createdAt: "2026-02-26T15:50:00.000Z",
+        updatedAt: "2026-02-26T15:50:00.000Z",
+      },
+    });
+    yield* appendPrompt(
+      "evt-anchor-failed-first-message",
+      "cmd-anchor-failed-first",
+      firstMessageId,
+      "first turn fails before materializing",
+      "2026-02-26T15:50:01.000Z",
+    );
+    yield* appendTurnStart(
+      "evt-anchor-failed-first-start",
+      "cmd-anchor-failed-first",
+      firstMessageId,
+      "2026-02-26T15:50:01.000Z",
+    );
+    yield* appendPrompt(
+      "evt-anchor-failed-steer-message",
+      "server:subagent-steer-immediate:anchor-failed",
+      steerMessageId,
+      "immediate steer survives failed anchor",
+      "2026-02-26T15:50:02.000Z",
+    );
+    yield* appendTurnStart(
+      "evt-anchor-failed-steer-start",
+      "server:subagent-steer-immediate:anchor-failed",
+      steerMessageId,
+      "2026-02-26T15:50:02.000Z",
+    );
+    yield* appendPrompt(
+      "evt-anchor-failed-follow-up-message",
+      "cmd-anchor-failed-follow-up",
+      followUpMessageId,
+      "follow-up remains behind promoted steer",
+      "2026-02-26T15:50:03.000Z",
+    );
+    yield* appendTurnStart(
+      "evt-anchor-failed-follow-up-start",
+      "cmd-anchor-failed-follow-up",
+      followUpMessageId,
+      "2026-02-26T15:50:03.000Z",
+    );
+    yield* appendAndProject({
+      type: "thread.activity-appended",
+      eventId: EventId.make("evt-anchor-failed-activity"),
+      aggregateKind: "thread",
+      aggregateId: threadId,
+      occurredAt: "2026-02-26T15:50:04.000Z",
+      commandId: CommandId.make("cmd-anchor-failed-activity"),
+      causationEventId: null,
+      correlationId: CorrelationId.make("cmd-anchor-failed-activity"),
+      metadata: {},
+      payload: {
+        threadId,
+        activity: {
+          id: EventId.make("activity-anchor-failed"),
+          tone: "info",
+          kind: "provider.turn.start.failed",
+          summary: "Provider turn start failed",
+          payload: {
+            detail: "anchor failed before materializing",
+            messageId: firstMessageId,
+          },
+          turnId: null,
+          createdAt: "2026-02-26T15:50:04.000Z",
+        },
+      },
+    });
+    yield* appendAndProject({
+      type: "thread.session-set",
+      eventId: EventId.make("evt-anchor-failed-promoted-running"),
+      aggregateKind: "thread",
+      aggregateId: threadId,
+      occurredAt: "2026-02-26T15:50:05.000Z",
+      commandId: CommandId.make("cmd-anchor-failed-promoted-running"),
+      causationEventId: null,
+      correlationId: CorrelationId.make("cmd-anchor-failed-promoted-running"),
+      metadata: {},
+      payload: {
+        threadId,
+        session: {
+          threadId,
+          status: "running",
+          providerName: "codex",
+          runtimeMode: "full-access",
+          activeTurnId: turnId,
+          lastError: null,
+          updatedAt: "2026-02-26T15:50:05.000Z",
+        },
+      },
+    });
+
+    const turnRows = yield* sql<{
+      readonly turnId: string;
+      readonly pendingMessageId: string | null;
+    }>`
+      SELECT turn_id AS "turnId", pending_message_id AS "pendingMessageId"
+      FROM projection_turns
+      WHERE thread_id = ${threadId}
+        AND turn_id = ${turnId}
+    `;
+    assert.deepEqual(turnRows, [
+      {
+        turnId: "turn-anchor-failed-promoted-steer",
+        pendingMessageId: "message-anchor-failed-steer",
+      },
+    ]);
+
+    const pendingRows = yield* sql<{ readonly messageId: string }>`
+      SELECT pending_message_id AS "messageId"
+      FROM projection_turns
+      WHERE thread_id = ${threadId}
+        AND turn_id IS NULL
+        AND state = 'pending'
+      ORDER BY requested_at ASC, row_id ASC
+    `;
+    assert.deepEqual(pendingRows, [{ messageId: "message-anchor-failed-follow-up" }]);
+  }).pipe(
+    Effect.provide(
+      Layer.fresh(makeProjectionPipelinePrefixedTestLayer("t3-projection-anchor-failed-")),
+    ),
+  ),
+);
+
+it.effect("does not promote immediate subagent steers when their pending anchor is canceled", () =>
+  Effect.gen(function* () {
+    const projectionPipeline = yield* OrchestrationProjectionPipeline;
+    const eventStore = yield* OrchestrationEventStore;
+    const sql = yield* SqlClient.SqlClient;
+    const threadId = ThreadId.make("thread-immediate-steer-anchor-canceled");
+    const anchorMessageId = MessageId.make("message-anchor-canceled-first");
+    const steerMessageId = MessageId.make("message-anchor-canceled-steer");
+    const laterTurnId = TurnId.make("turn-anchor-canceled-later");
+    const appendAndProject = (event: Parameters<typeof eventStore.append>[0]) =>
+      eventStore
+        .append(event)
+        .pipe(Effect.flatMap((savedEvent) => projectionPipeline.projectEvent(savedEvent)));
+    const appendPrompt = (
+      eventId: string,
+      commandId: string,
+      messageId: MessageId,
+      text: string,
+      createdAt: string,
+    ) =>
+      appendAndProject({
+        type: "thread.message-sent",
+        eventId: EventId.make(eventId),
+        aggregateKind: "thread",
+        aggregateId: threadId,
+        occurredAt: createdAt,
+        commandId: CommandId.make(commandId),
+        causationEventId: null,
+        correlationId: CorrelationId.make(commandId),
+        metadata: {},
+        payload: {
+          threadId,
+          messageId,
+          role: "user",
+          text,
+          turnId: null,
+          streaming: false,
+          createdAt,
+          updatedAt: createdAt,
+        },
+      });
+    const appendTurnStart = (
+      eventId: string,
+      commandId: string,
+      messageId: MessageId,
+      createdAt: string,
+    ) =>
+      appendAndProject({
+        type: "thread.turn-start-requested",
+        eventId: EventId.make(eventId),
+        aggregateKind: "thread",
+        aggregateId: threadId,
+        occurredAt: createdAt,
+        commandId: CommandId.make(commandId),
+        causationEventId: null,
+        correlationId: CorrelationId.make(commandId),
+        metadata: {},
+        payload: {
+          threadId,
+          messageId,
+          runtimeMode: "full-access",
+          createdAt,
+        },
+      });
+
+    yield* appendAndProject({
+      type: "thread.created",
+      eventId: EventId.make("evt-anchor-canceled-create"),
+      aggregateKind: "thread",
+      aggregateId: threadId,
+      occurredAt: "2026-02-26T16:10:00.000Z",
+      commandId: CommandId.make("cmd-anchor-canceled-create"),
+      causationEventId: null,
+      correlationId: CorrelationId.make("cmd-anchor-canceled-create"),
+      metadata: {},
+      payload: {
+        threadId,
+        projectId: ProjectId.make("project-1"),
+        title: "Thread anchor canceled",
+        modelSelection: {
+          instanceId: ProviderInstanceId.make("codex"),
+          model: "gpt-5-codex",
+        },
+        runtimeMode: "full-access",
+        branch: null,
+        worktreePath: null,
+        createdAt: "2026-02-26T16:10:00.000Z",
+        updatedAt: "2026-02-26T16:10:00.000Z",
+      },
+    });
+    yield* appendPrompt(
+      "evt-anchor-canceled-first-message",
+      "cmd-anchor-canceled-first",
+      anchorMessageId,
+      "first turn is stopped before materializing",
+      "2026-02-26T16:10:01.000Z",
+    );
+    yield* appendTurnStart(
+      "evt-anchor-canceled-first-start",
+      "cmd-anchor-canceled-first",
+      anchorMessageId,
+      "2026-02-26T16:10:01.000Z",
+    );
+    yield* appendPrompt(
+      "evt-anchor-canceled-steer-message",
+      "server:subagent-steer-immediate:anchor-canceled",
+      steerMessageId,
+      "immediate steer should be canceled with anchor",
+      "2026-02-26T16:10:02.000Z",
+    );
+    yield* appendTurnStart(
+      "evt-anchor-canceled-steer-start",
+      "server:subagent-steer-immediate:anchor-canceled",
+      steerMessageId,
+      "2026-02-26T16:10:02.000Z",
+    );
+    yield* appendAndProject({
+      type: "thread.activity-appended",
+      eventId: EventId.make("evt-anchor-canceled-activity"),
+      aggregateKind: "thread",
+      aggregateId: threadId,
+      occurredAt: "2026-02-26T16:10:03.000Z",
+      commandId: CommandId.make("cmd-anchor-canceled-activity"),
+      causationEventId: null,
+      correlationId: CorrelationId.make("cmd-anchor-canceled-activity"),
+      metadata: {},
+      payload: {
+        threadId,
+        activity: {
+          id: EventId.make("activity-anchor-canceled"),
+          tone: "info",
+          kind: "provider.turn.start.failed",
+          summary: "Queued turn canceled",
+          payload: {
+            detail: "queued prompt was canceled",
+            messageId: anchorMessageId,
+            canceled: true,
+          },
+          turnId: null,
+          createdAt: "2026-02-26T16:10:03.000Z",
+        },
+      },
+    });
+    yield* appendAndProject({
+      type: "thread.session-set",
+      eventId: EventId.make("evt-anchor-canceled-later-running"),
+      aggregateKind: "thread",
+      aggregateId: threadId,
+      occurredAt: "2026-02-26T16:10:04.000Z",
+      commandId: CommandId.make("cmd-anchor-canceled-later-running"),
+      causationEventId: null,
+      correlationId: CorrelationId.make("cmd-anchor-canceled-later-running"),
+      metadata: {},
+      payload: {
+        threadId,
+        session: {
+          threadId,
+          status: "running",
+          providerName: "codex",
+          runtimeMode: "full-access",
+          activeTurnId: laterTurnId,
+          lastError: null,
+          updatedAt: "2026-02-26T16:10:04.000Z",
+        },
+      },
+    });
+
+    const promotedRows = yield* sql<{ readonly turnId: string | null }>`
+      SELECT turn_id AS "turnId"
+      FROM projection_turns
+      WHERE thread_id = ${threadId}
+        AND pending_message_id = ${steerMessageId}
+    `;
+    assert.deepEqual(promotedRows, []);
+
+    const messageRows = yield* sql<{ readonly messageId: string; readonly turnId: string | null }>`
+      SELECT message_id AS "messageId", turn_id AS "turnId"
+      FROM projection_thread_messages
+      WHERE thread_id = ${threadId}
+        AND message_id = ${steerMessageId}
+    `;
+    assert.deepEqual(messageRows, [
+      {
+        messageId: "message-anchor-canceled-steer",
+        turnId: "pending-same-turn-steer:message-anchor-canceled-first",
+      },
+    ]);
+  }).pipe(
+    Effect.provide(
+      Layer.fresh(makeProjectionPipelinePrefixedTestLayer("t3-projection-anchor-canceled-")),
+    ),
+  ),
+);
+
 it.effect("deletes failed pending turn starts by message id", () =>
   Effect.gen(function* () {
     const projectionPipeline = yield* OrchestrationProjectionPipeline;

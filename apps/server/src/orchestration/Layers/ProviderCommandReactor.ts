@@ -56,6 +56,8 @@ import {
   PendingDispatchRepository,
   type PendingDispatch,
 } from "../../persistence/Services/PendingDispatches.ts";
+import { ProjectionTurnRepository } from "../../persistence/Services/ProjectionTurns.ts";
+import { ProjectionTurnRepositoryLive } from "../../persistence/Layers/ProjectionTurns.ts";
 const isProviderAdapterRequestError = Schema.is(ProviderAdapterRequestError);
 const isProviderDriverKind = Schema.is(ProviderDriverKind);
 
@@ -101,6 +103,9 @@ const QueuedThreadTurnPayload = Schema.Struct({
   interactionMode: Schema.optional(ProviderInteractionMode),
   createdAt: IsoDateTime,
   sourceSequence: Schema.optional(Schema.Number),
+  providerSafeSubagentSteer: Schema.optional(Schema.Boolean),
+  waitForEarlierPromptBinding: Schema.optional(Schema.Boolean),
+  waitForEarlierPromptMessageIds: Schema.optional(Schema.Array(MessageId)),
 });
 type QueuedThreadTurnPayload = typeof QueuedThreadTurnPayload.Type;
 const QueuedThreadTurnPayloadJson = Schema.fromJsonString(QueuedThreadTurnPayload);
@@ -166,11 +171,32 @@ const HANDLED_TURN_START_KEY_TTL = Duration.minutes(30);
 const DEFAULT_RUNTIME_MODE: RuntimeMode = "full-access";
 const DEFAULT_THREAD_TITLE = "New thread";
 const THREAD_TURN_PENDING_KIND = "thread_turn" as const;
+const PENDING_SAME_TURN_STEER_MARKER_PREFIX = "pending-same-turn-steer:";
 
 const pendingThreadTurnIdForMessage = (messageId: MessageId): PendingDispatchId =>
   PendingDispatchId.make(`thread-turn:${messageId}`);
 
-const pendingThreadTurnRowForEvent = (event: TurnStartRequestedEvent): PendingDispatch => {
+const isProviderSafeSubagentSteerTurnStart = (event: TurnStartRequestedEvent): boolean =>
+  event.commandId !== null &&
+  String(event.commandId).startsWith("server:subagent-steer-immediate:");
+
+const pendingSameTurnSteerMarkerMessageId = (turnId: TurnId): MessageId | null => {
+  const rawTurnId = String(turnId);
+  return rawTurnId.startsWith(PENDING_SAME_TURN_STEER_MARKER_PREFIX)
+    ? MessageId.make(rawTurnId.slice(PENDING_SAME_TURN_STEER_MARKER_PREFIX.length))
+    : null;
+};
+
+const isPendingSameTurnSteerMarkerTurnId = (turnId: TurnId): boolean =>
+  pendingSameTurnSteerMarkerMessageId(turnId) !== null;
+
+const pendingThreadTurnRowForEvent = (
+  event: TurnStartRequestedEvent,
+  options?: {
+    readonly waitForEarlierPromptBinding?: boolean;
+    readonly waitForEarlierPromptMessageIds?: ReadonlyArray<MessageId>;
+  },
+): PendingDispatch => {
   const payload = event.payload;
   return {
     id: pendingThreadTurnIdForMessage(payload.messageId),
@@ -184,6 +210,14 @@ const pendingThreadTurnRowForEvent = (event: TurnStartRequestedEvent): PendingDi
       interactionMode: payload.interactionMode,
       createdAt: payload.createdAt,
       sourceSequence: event.sequence,
+      ...(isProviderSafeSubagentSteerTurnStart(event) ? { providerSafeSubagentSteer: true } : {}),
+      ...(options?.waitForEarlierPromptBinding === true
+        ? { waitForEarlierPromptBinding: true }
+        : {}),
+      ...(options?.waitForEarlierPromptMessageIds !== undefined &&
+      options.waitForEarlierPromptMessageIds.length > 0
+        ? { waitForEarlierPromptMessageIds: [...options.waitForEarlierPromptMessageIds] }
+        : {}),
     }),
     error: null,
     status: null,
@@ -241,6 +275,80 @@ function failedProviderTurnStartMessageIds(thread: OrchestrationThread): Readonl
     }
   }
   return ids;
+}
+
+function queuedThreadTurnRowsInStartOrder(rows: ReadonlyArray<PendingDispatch>): ReadonlyArray<{
+  readonly row: PendingDispatch;
+  readonly payload: QueuedThreadTurnPayload;
+  readonly rowOrder: number;
+}> {
+  return rows
+    .flatMap((row, rowOrder) => {
+      const payload = parseQueuedThreadTurnPayload(row);
+      return payload === null ? [] : [{ row, payload, rowOrder }];
+    })
+    .toSorted((left, right) => {
+      if (
+        left.payload.sourceSequence !== undefined &&
+        right.payload.sourceSequence !== undefined &&
+        left.payload.sourceSequence !== right.payload.sourceSequence
+      ) {
+        return left.payload.sourceSequence - right.payload.sourceSequence;
+      }
+      return left.rowOrder - right.rowOrder;
+    });
+}
+
+function hasUnresolvedPromptMessages(
+  thread: OrchestrationThread,
+  messageIds: ReadonlyArray<MessageId>,
+): boolean {
+  const failedMessageIds = failedProviderTurnStartMessageIds(thread);
+  for (const messageId of messageIds) {
+    const message = thread.messages.find((candidate) => candidate.id === messageId);
+    if (
+      message !== undefined &&
+      message.turnId === null &&
+      (message.role === "user" || message.role === "system") &&
+      !failedMessageIds.has(message.id)
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function hasEarlierUnresolvedQueuedThreadTurn(input: {
+  readonly thread: OrchestrationThread;
+  readonly rows: ReadonlyArray<PendingDispatch>;
+  readonly rowId: PendingDispatchId;
+  readonly waitForEarlierPromptMessageIds?: ReadonlyArray<MessageId>;
+}): boolean {
+  if (
+    input.waitForEarlierPromptMessageIds !== undefined &&
+    input.waitForEarlierPromptMessageIds.length > 0
+  ) {
+    return hasUnresolvedPromptMessages(input.thread, input.waitForEarlierPromptMessageIds);
+  }
+
+  const failedMessageIds = failedProviderTurnStartMessageIds(input.thread);
+  for (const entry of queuedThreadTurnRowsInStartOrder(input.rows)) {
+    if (entry.row.id === input.rowId) {
+      return false;
+    }
+    const message = input.thread.messages.find(
+      (candidate) => candidate.id === entry.payload.messageId,
+    );
+    if (
+      message !== undefined &&
+      message.turnId === null &&
+      (message.role === "user" || message.role === "system") &&
+      !failedMessageIds.has(message.id)
+    ) {
+      return true;
+    }
+  }
+  return false;
 }
 
 function isThreadProviderIdle(thread: OrchestrationThread): boolean {
@@ -390,6 +498,7 @@ const make = Effect.gen(function* () {
   const textGeneration = yield* TextGeneration;
   const serverSettingsService = yield* ServerSettingsService;
   const pendingDispatches = yield* PendingDispatchRepository;
+  const projectionTurns = yield* ProjectionTurnRepository;
   const serverCommandId = (tag: string) =>
     crypto.randomUUIDv4.pipe(Effect.map((uuid) => CommandId.make(`server:${tag}:${uuid}`)));
   const serverEventId = () => crypto.randomUUIDv4.pipe(Effect.map(EventId.make));
@@ -1293,7 +1402,11 @@ const make = Effect.gen(function* () {
   const claimedThreadTurnCanSend = (input: {
     readonly threadId: ThreadId;
     readonly rowId: PendingDispatchId;
+    readonly waitForEarlierPromptBinding?: boolean;
+    readonly waitForEarlierPromptMessageIds?: ReadonlyArray<MessageId>;
     readonly sourceSequence?: number;
+    readonly allowActiveProviderTurn?: boolean;
+    readonly requiredActiveTurnId?: TurnId;
   }) =>
     Effect.gen(function* () {
       const stopRequest = stopRequestByThreadId.get(input.threadId);
@@ -1311,6 +1424,7 @@ const make = Effect.gen(function* () {
         return false;
       }
       const canSendForThread =
+        input.allowActiveProviderTurn === true ||
         canAutoDrainQueuedThreadTurns(thread) ||
         (thread.session?.status === "stopped" &&
           stopRequest !== undefined &&
@@ -1320,8 +1434,16 @@ const make = Effect.gen(function* () {
       }
       const activeProviderSession = yield* resolveActiveSession(input.threadId);
       if (
-        activeProviderSession?.status === "running" ||
-        activeProviderSession?.activeTurnId !== undefined
+        input.allowActiveProviderTurn === true &&
+        input.requiredActiveTurnId !== undefined &&
+        activeProviderSession?.activeTurnId !== input.requiredActiveTurnId
+      ) {
+        return false;
+      }
+      if (
+        input.allowActiveProviderTurn !== true &&
+        (activeProviderSession?.status === "running" ||
+          activeProviderSession?.activeTurnId !== undefined)
       ) {
         return false;
       }
@@ -1329,7 +1451,24 @@ const make = Effect.gen(function* () {
       if (!latestThread) {
         return false;
       }
+      const rows = yield* pendingDispatches
+        .listByTarget({ kind: THREAD_TURN_PENDING_KIND, targetThreadId: input.threadId })
+        .pipe(Effect.orDie);
+      if (
+        input.waitForEarlierPromptBinding === true &&
+        hasEarlierUnresolvedQueuedThreadTurn({
+          thread: latestThread,
+          rows,
+          rowId: input.rowId,
+          ...(input.waitForEarlierPromptMessageIds !== undefined
+            ? { waitForEarlierPromptMessageIds: input.waitForEarlierPromptMessageIds }
+            : {}),
+        })
+      ) {
+        return false;
+      }
       const canSendForLatestThread =
+        input.allowActiveProviderTurn === true ||
         canAutoDrainQueuedThreadTurns(latestThread) ||
         (latestThread.session?.status === "stopped" &&
           stopRequest !== undefined &&
@@ -1337,9 +1476,6 @@ const make = Effect.gen(function* () {
       if (!canSendForLatestThread) {
         return false;
       }
-      const rows = yield* pendingDispatches
-        .listByTarget({ kind: THREAD_TURN_PENDING_KIND, targetThreadId: input.threadId })
-        .pipe(Effect.orDie);
       return (
         rows.some((row) => row.id === input.rowId) &&
         !canceledThreadTurnDispatchIds.has(input.rowId)
@@ -1396,7 +1532,19 @@ const make = Effect.gen(function* () {
           }
           const message = thread.messages.find((entry) => entry.id === payload.messageId);
           if (message !== undefined && message.turnId !== null) {
-            rowsToDelete.push(row);
+            if (payload.providerSafeSubagentSteer === true) {
+              const isMarkerBound = isPendingSameTurnSteerMarkerTurnId(message.turnId);
+              const activeProviderSession = isMarkerBound
+                ? undefined
+                : yield* resolveActiveSession(threadId);
+              if (isMarkerBound || activeProviderSession?.activeTurnId === message.turnId) {
+                rowsToRetry.push(row);
+              } else {
+                rowsToDelete.push(row);
+              }
+            } else {
+              rowsToDelete.push(row);
+            }
           } else {
             rowsToRetry.push(row);
           }
@@ -1427,18 +1575,30 @@ const make = Effect.gen(function* () {
         return;
       }
       const activeProviderSession = yield* resolveActiveSession(threadId);
-      if (
+      const hasActiveProviderTurn =
         activeProviderSession?.status === "running" ||
-        activeProviderSession?.activeTurnId !== undefined
-      ) {
-        return;
+        activeProviderSession?.activeTurnId !== undefined;
+      if (hasActiveProviderTurn) {
+        rows = rows.filter(
+          (row) => parseQueuedThreadTurnPayload(row)?.providerSafeSubagentSteer === true,
+        );
+        if (rows.length === 0) {
+          return;
+        }
       }
       const stopRequest = stopRequestByThreadId.get(threadId);
       const hasPostStopQueuedRow =
         thread.session?.status === "stopped" &&
         stopRequest !== undefined &&
         rows.some((row) => !stopRequestSupersedesQueuedRow(stopRequest, row));
-      if (!canAutoDrainQueuedThreadTurns(thread) && !hasPostStopQueuedRow) {
+      const canDrainProviderSafeSubagentSteer =
+        hasActiveProviderTurn &&
+        rows.some((row) => parseQueuedThreadTurnPayload(row)?.providerSafeSubagentSteer === true);
+      if (
+        !canAutoDrainQueuedThreadTurns(thread) &&
+        !hasPostStopQueuedRow &&
+        !canDrainProviderSafeSubagentSteer
+      ) {
         return;
       }
 
@@ -1472,11 +1632,49 @@ const make = Effect.gen(function* () {
           );
           continue;
         }
-        if (message.turnId !== null) {
+        if (
+          payload.providerSafeSubagentSteer === true &&
+          message.turnId !== null &&
+          isPendingSameTurnSteerMarkerTurnId(message.turnId)
+        ) {
+          yield* releaseThreadTurnDispatchClaim(row.id);
+          return;
+        }
+        const requiredActiveTurnId =
+          payload.providerSafeSubagentSteer === true && message.turnId !== null
+            ? message.turnId
+            : undefined;
+        if (requiredActiveTurnId !== undefined) {
+          const activeProviderSession = yield* resolveActiveSession(threadId);
+          if (activeProviderSession?.activeTurnId !== requiredActiveTurnId) {
+            yield* deletePendingThreadTurnRows([row.id]).pipe(
+              Effect.ensuring(releaseThreadTurnDispatchClaim(row.id)),
+            );
+            continue;
+          }
+        }
+        if (message.turnId !== null && payload.providerSafeSubagentSteer !== true) {
           yield* deletePendingThreadTurnRows([row.id]).pipe(
             Effect.ensuring(releaseThreadTurnDispatchClaim(row.id)),
           );
           continue;
+        }
+        const latestQueuedRows = yield* pendingDispatches
+          .listByTarget({ kind: THREAD_TURN_PENDING_KIND, targetThreadId: threadId })
+          .pipe(Effect.orDie);
+        if (
+          payload.waitForEarlierPromptBinding === true &&
+          hasEarlierUnresolvedQueuedThreadTurn({
+            thread,
+            rows: latestQueuedRows,
+            rowId: row.id,
+            ...(payload.waitForEarlierPromptMessageIds !== undefined
+              ? { waitForEarlierPromptMessageIds: payload.waitForEarlierPromptMessageIds }
+              : {}),
+          })
+        ) {
+          yield* releaseThreadTurnDispatchClaim(row.id);
+          return;
         }
 
         const sendTurnRequestExit = yield* buildSendTurnRequestForThread({
@@ -1523,9 +1721,17 @@ const make = Effect.gen(function* () {
         const canSend = yield* claimedThreadTurnCanSend({
           threadId,
           rowId: row.id,
+          ...(payload.waitForEarlierPromptBinding === true
+            ? { waitForEarlierPromptBinding: true }
+            : {}),
+          ...(payload.waitForEarlierPromptMessageIds !== undefined
+            ? { waitForEarlierPromptMessageIds: payload.waitForEarlierPromptMessageIds }
+            : {}),
           ...(payload.sourceSequence !== undefined
             ? { sourceSequence: payload.sourceSequence }
             : {}),
+          ...(payload.providerSafeSubagentSteer === true ? { allowActiveProviderTurn: true } : {}),
+          ...(requiredActiveTurnId !== undefined ? { requiredActiveTurnId } : {}),
         });
         if (!canSend) {
           yield* releaseThreadTurnDispatchClaim(row.id);
@@ -1539,9 +1745,17 @@ const make = Effect.gen(function* () {
         const canSendAfterClaim = yield* claimedThreadTurnCanSend({
           threadId,
           rowId: row.id,
+          ...(payload.waitForEarlierPromptBinding === true
+            ? { waitForEarlierPromptBinding: true }
+            : {}),
+          ...(payload.waitForEarlierPromptMessageIds !== undefined
+            ? { waitForEarlierPromptMessageIds: payload.waitForEarlierPromptMessageIds }
+            : {}),
           ...(payload.sourceSequence !== undefined
             ? { sourceSequence: payload.sourceSequence }
             : {}),
+          ...(payload.providerSafeSubagentSteer === true ? { allowActiveProviderTurn: true } : {}),
+          ...(requiredActiveTurnId !== undefined ? { requiredActiveTurnId } : {}),
         });
         if (!canSendAfterClaim) {
           yield* resetAndReleaseThreadTurnDispatchClaim(row.id);
@@ -1566,6 +1780,11 @@ const make = Effect.gen(function* () {
             }),
           ),
           Effect.ensuring(releaseThreadTurnDispatchClaim(row.id)),
+          Effect.andThen(
+            payload.providerSafeSubagentSteer === true
+              ? drainPendingThreadTurns(threadId)
+              : Effect.void,
+          ),
           Effect.forkScoped,
         );
         const stillClaimed = yield* Effect.sync(() => {
@@ -1582,9 +1801,19 @@ const make = Effect.gen(function* () {
           (yield* claimedThreadTurnCanSend({
             threadId,
             rowId: row.id,
+            ...(payload.waitForEarlierPromptBinding === true
+              ? { waitForEarlierPromptBinding: true }
+              : {}),
+            ...(payload.waitForEarlierPromptMessageIds !== undefined
+              ? { waitForEarlierPromptMessageIds: payload.waitForEarlierPromptMessageIds }
+              : {}),
             ...(payload.sourceSequence !== undefined
               ? { sourceSequence: payload.sourceSequence }
               : {}),
+            ...(payload.providerSafeSubagentSteer === true
+              ? { allowActiveProviderTurn: true }
+              : {}),
+            ...(requiredActiveTurnId !== undefined ? { requiredActiveTurnId } : {}),
           }));
         if (!canReleaseQueuedSend) {
           yield* Fiber.interrupt(sendFiber).pipe(Effect.ignore);
@@ -1650,7 +1879,7 @@ const make = Effect.gen(function* () {
             if (
               stopRequest !== undefined &&
               event.sequence > stopRequest.sequence &&
-              event.payload.session.updatedAt > stopRequest.createdAt
+              event.payload.session.updatedAt >= stopRequest.createdAt
             ) {
               effectiveStopRequestByThread.delete(key);
               effectiveStopEventByThread.delete(key);
@@ -1698,11 +1927,26 @@ const make = Effect.gen(function* () {
       }
       const thread = yield* resolveThreadCached(row.targetThreadId);
       const message = thread?.messages.find((entry) => entry.id === payload.messageId);
+      const providerSafeSubagentSteer = payload.providerSafeSubagentSteer === true;
+      const markerBoundProviderSafeSubagentSteer =
+        providerSafeSubagentSteer &&
+        message?.turnId !== null &&
+        message?.turnId !== undefined &&
+        isPendingSameTurnSteerMarkerTurnId(message.turnId);
+      const activeProviderSession =
+        providerSafeSubagentSteer &&
+        !markerBoundProviderSafeSubagentSteer &&
+        message !== undefined &&
+        message.turnId !== null
+          ? yield* resolveActiveSession(row.targetThreadId)
+          : undefined;
       if (
         thread === undefined ||
         message === undefined ||
         (message.role !== "user" && message.role !== "system") ||
-        message.turnId !== null ||
+        (message.turnId !== null &&
+          !markerBoundProviderSafeSubagentSteer &&
+          (!providerSafeSubagentSteer || activeProviderSession?.activeTurnId !== message.turnId)) ||
         failedProviderTurnStartMessageIds(thread).has(payload.messageId)
       ) {
         staleKnownRows.push(row);
@@ -1744,6 +1988,53 @@ const make = Effect.gen(function* () {
     };
     const historicalSessionByThread = new Map<string, HistoricalThreadSessionState>();
     const unsettledStopRequestByThread = new Map<string, StopRequestMarker>();
+    const priorOpenProjectedPendingStartMessageIdsByThread = new Map<string, Set<string>>();
+    const projectedPendingStartMessageIdsByThread = new Map<string, Set<string>>();
+    const projectedPendingStartMessageIdsForThread = (threadId: ThreadId) =>
+      Effect.gen(function* () {
+        const key = String(threadId);
+        const cached = projectedPendingStartMessageIdsByThread.get(key);
+        if (cached !== undefined) {
+          return cached;
+        }
+        const rows = yield* projectionTurns.listByThreadId({ threadId }).pipe(Effect.orDie);
+        const pendingMessageIds = new Set<string>();
+        for (const row of rows) {
+          if (
+            row.turnId === null &&
+            row.state === "pending" &&
+            row.pendingMessageId !== null &&
+            row.checkpointTurnCount === null
+          ) {
+            pendingMessageIds.add(String(row.pendingMessageId));
+          }
+        }
+        projectedPendingStartMessageIdsByThread.set(key, pendingMessageIds);
+        return pendingMessageIds;
+      });
+    const dropProjectedPendingStartMessageId = (threadId: ThreadId, messageId: MessageId) => {
+      const key = String(threadId);
+      const rawMessageId = String(messageId);
+      const pendingMessageIds = projectedPendingStartMessageIdsByThread.get(key);
+      pendingMessageIds?.delete(String(messageId));
+      if (pendingMessageIds?.size === 0) {
+        projectedPendingStartMessageIdsByThread.delete(key);
+      }
+      const priorMessageIds = priorOpenProjectedPendingStartMessageIdsByThread.get(key);
+      priorMessageIds?.delete(rawMessageId);
+      if (priorMessageIds?.size === 0) {
+        priorOpenProjectedPendingStartMessageIdsByThread.delete(key);
+      }
+    };
+    const rememberOpenProjectedPendingStart = (threadId: ThreadId, messageId: MessageId) => {
+      const key = String(threadId);
+      const existing = priorOpenProjectedPendingStartMessageIdsByThread.get(key);
+      if (existing !== undefined) {
+        existing.add(String(messageId));
+        return;
+      }
+      priorOpenProjectedPendingStartMessageIdsByThread.set(key, new Set([String(messageId)]));
+    };
 
     yield* orchestrationEngine.readEvents(0, Number.MAX_SAFE_INTEGER).pipe(
       Stream.runForEach((event) =>
@@ -1767,7 +2058,7 @@ const make = Effect.gen(function* () {
               stopRequest !== undefined &&
               event.sequence > stopRequest.sequence &&
               (event.payload.session.status === "stopped" ||
-                event.payload.session.updatedAt > stopRequest.createdAt)
+                event.payload.session.updatedAt >= stopRequest.createdAt)
             ) {
               unsettledStopRequestByThread.delete(key);
             }
@@ -1798,6 +2089,15 @@ const make = Effect.gen(function* () {
                     : {}),
                   createdAt: payload.createdAt,
                   sourceSequence: event.sequence,
+                  ...(payload.providerSafeSubagentSteer === true
+                    ? { providerSafeSubagentSteer: true }
+                    : {}),
+                  ...(payload.waitForEarlierPromptBinding === true
+                    ? { waitForEarlierPromptBinding: true }
+                    : {}),
+                  ...(payload.waitForEarlierPromptMessageIds !== undefined
+                    ? { waitForEarlierPromptMessageIds: payload.waitForEarlierPromptMessageIds }
+                    : {}),
                 }),
               } satisfies PendingDispatch;
               yield* pendingDispatches.insert(backfilledRow).pipe(Effect.orDie);
@@ -1815,12 +2115,14 @@ const make = Effect.gen(function* () {
               }
               if (message !== undefined && message.turnId !== null) {
                 yield* deletePendingThreadTurnRows([existingRow.id]);
+                dropProjectedPendingStartMessageId(event.payload.threadId, event.payload.messageId);
               } else {
                 yield* cancelPendingThreadTurnRows({
                   threadId: event.payload.threadId,
                   rows: [existingRow],
                   createdAt: stopRequest.createdAt,
                 });
+                dropProjectedPendingStartMessageId(event.payload.threadId, event.payload.messageId);
               }
               knownThreadTurnRows.delete(rowId);
               unmarkQueuedRowEvidence(existingRow);
@@ -1840,6 +2142,7 @@ const make = Effect.gen(function* () {
                   messageId: event.payload.messageId,
                   createdAt: stopRequest.createdAt,
                 });
+                dropProjectedPendingStartMessageId(event.payload.threadId, event.payload.messageId);
               }
             }
             return;
@@ -1863,7 +2166,11 @@ const make = Effect.gen(function* () {
           if (!message || (message.role !== "user" && message.role !== "system")) {
             return;
           }
-          if (message.turnId !== null) {
+          const markerAnchorMessageId =
+            message.turnId !== null && isProviderSafeSubagentSteerTurnStart(event)
+              ? pendingSameTurnSteerMarkerMessageId(message.turnId)
+              : null;
+          if (message.turnId !== null && markerAnchorMessageId === null) {
             return;
           }
           if (failedProviderTurnStartMessageIds(thread).has(event.payload.messageId)) {
@@ -1871,19 +2178,55 @@ const make = Effect.gen(function* () {
           }
 
           const threadKey = String(event.payload.threadId);
+          const projectedPendingStartMessageIds = yield* projectedPendingStartMessageIdsForThread(
+            event.payload.threadId,
+          );
+          const hasOpenProjectedPendingStart = projectedPendingStartMessageIds.has(
+            String(event.payload.messageId),
+          );
+          const hasProviderSafeProjectedPendingStartEvidence =
+            isProviderSafeSubagentSteerTurnStart(event) && hasOpenProjectedPendingStart;
+          const earlierOpenProjectedPendingStartMessageIds = [
+            ...(priorOpenProjectedPendingStartMessageIdsByThread.get(threadKey) ?? []),
+          ].map((messageId) => MessageId.make(messageId));
+          const hasProjectedPendingStartOrderingEvidence =
+            hasOpenProjectedPendingStart && earlierOpenProjectedPendingStartMessageIds.length > 0;
           const hasQueuedRecoveryEvidence =
             (queuedRowCountByThread.get(threadKey) ?? 0) > 0 ||
             historicalSessionBlocksImmediateSend(historicalSessionByThread.get(threadKey)) ||
-            unsettledStopRequestByThread.has(threadKey);
+            unsettledStopRequestByThread.has(threadKey) ||
+            hasProjectedPendingStartOrderingEvidence ||
+            markerAnchorMessageId !== null ||
+            hasProviderSafeProjectedPendingStartEvidence;
           if (!hasQueuedRecoveryEvidence) {
+            if (hasOpenProjectedPendingStart) {
+              rememberOpenProjectedPendingStart(event.payload.threadId, event.payload.messageId);
+            }
             return;
           }
 
           if (yield* claimTurnStartHandling(key)) {
             return;
           }
+          if (hasOpenProjectedPendingStart) {
+            rememberOpenProjectedPendingStart(event.payload.threadId, event.payload.messageId);
+          }
           yield* startFirstUserTurnSideEffects({ event, thread, message });
-          const row = pendingThreadTurnRowForEvent(event);
+          const waitForEarlierPromptMessageIds =
+            markerAnchorMessageId !== null
+              ? [markerAnchorMessageId]
+              : hasProjectedPendingStartOrderingEvidence
+                ? earlierOpenProjectedPendingStartMessageIds
+                : undefined;
+          const row = pendingThreadTurnRowForEvent(
+            event,
+            waitForEarlierPromptMessageIds !== undefined
+              ? {
+                  waitForEarlierPromptBinding: true,
+                  waitForEarlierPromptMessageIds,
+                }
+              : undefined,
+          );
           yield* pendingDispatches.insert(row).pipe(Effect.orDie);
           knownThreadTurnRows.set(row.id, row);
           markQueuedRowEvidence(row);
@@ -1961,11 +2304,21 @@ const make = Effect.gen(function* () {
     const hasImmediateSendInFlight = inFlightImmediateThreadTurnThreadIds.has(
       event.payload.threadId,
     );
-    if (
+    const isProviderSafeSubagentSteer = isProviderSafeSubagentSteerTurnStart(event);
+    const hasQueuedProviderSafeSubagentSteer = pendingThreadTurns.some(
+      (row) => parseQueuedThreadTurnPayload(row)?.providerSafeSubagentSteer === true,
+    );
+    const shouldQueueProviderSafeSubagentSteer =
+      hasImmediateSendInFlight ||
+      hasQueuedProviderSafeSubagentSteer ||
+      (!hasLiveProviderTurn && (!isThreadProviderIdle(thread) || pendingThreadTurns.length > 0));
+    const shouldQueueRegularTurn =
       !isThreadProviderIdle(thread) ||
       hasLiveProviderTurn ||
       hasImmediateSendInFlight ||
-      pendingThreadTurns.length > 0
+      pendingThreadTurns.length > 0;
+    if (
+      isProviderSafeSubagentSteer ? shouldQueueProviderSafeSubagentSteer : shouldQueueRegularTurn
     ) {
       yield* enqueueThreadTurnUntilIdle({ event });
       if (canAutoDrainQueuedThreadTurns(thread)) {
@@ -2305,7 +2658,7 @@ const make = Effect.gen(function* () {
         if (
           stopRequest !== undefined &&
           event.sequence > stopRequest.sequence &&
-          event.payload.session.updatedAt > stopRequest.createdAt
+          event.payload.session.updatedAt >= stopRequest.createdAt
         ) {
           yield* Effect.sync(() => {
             stopRequestByThreadId.delete(event.payload.threadId);
@@ -2384,4 +2737,6 @@ const make = Effect.gen(function* () {
   } satisfies ProviderCommandReactorShape;
 });
 
-export const ProviderCommandReactorLive = Layer.effect(ProviderCommandReactor, make);
+export const ProviderCommandReactorLive = Layer.effect(ProviderCommandReactor, make).pipe(
+  Layer.provide(ProjectionTurnRepositoryLive),
+);

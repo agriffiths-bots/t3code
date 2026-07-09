@@ -17,6 +17,7 @@ import {
   CommandId,
   DEFAULT_PROVIDER_INTERACTION_MODE,
   EventId,
+  IsoDateTime,
   MessageId,
   ProjectId,
   ThreadId,
@@ -38,11 +39,15 @@ import { ProviderAdapterRequestError } from "../../provider/Errors.ts";
 import { OrchestrationEventStoreLive } from "../../persistence/Layers/OrchestrationEventStore.ts";
 import { OrchestrationCommandReceiptRepositoryLive } from "../../persistence/Layers/OrchestrationCommandReceipts.ts";
 import { PendingDispatchRepositoryLive } from "../../persistence/Layers/PendingDispatches.ts";
+import { ProjectionThreadMessageRepositoryLive } from "../../persistence/Layers/ProjectionThreadMessages.ts";
+import { ProjectionThreadSessionRepositoryLive } from "../../persistence/Layers/ProjectionThreadSessions.ts";
 import { SqlitePersistenceMemory } from "../../persistence/Layers/Sqlite.ts";
 import {
   PendingDispatchId,
   PendingDispatchRepository,
 } from "../../persistence/Services/PendingDispatches.ts";
+import { ProjectionThreadMessageRepository } from "../../persistence/Services/ProjectionThreadMessages.ts";
+import { ProjectionThreadSessionRepository } from "../../persistence/Services/ProjectionThreadSessions.ts";
 import {
   ProviderService,
   type ProviderServiceShape,
@@ -102,7 +107,9 @@ describe("ProviderCommandReactor", () => {
     | OrchestrationEngineService
     | ProviderCommandReactor
     | ProjectionSnapshotQuery
-    | PendingDispatchRepository,
+    | PendingDispatchRepository
+    | ProjectionThreadMessageRepository
+    | ProjectionThreadSessionRepository,
     unknown
   > | null = null;
   let scope: Scope.Closeable | null = null;
@@ -366,6 +373,8 @@ describe("ProviderCommandReactor", () => {
     );
     const layer = ProviderCommandReactorLive.pipe(
       Layer.provideMerge(PendingDispatchRepositoryLive),
+      Layer.provideMerge(ProjectionThreadMessageRepositoryLive),
+      Layer.provideMerge(ProjectionThreadSessionRepositoryLive),
       Layer.provideMerge(orchestrationLayer),
       Layer.provideMerge(projectionSnapshotLayer),
       Layer.provideMerge(Layer.succeed(ProviderService, service)),
@@ -613,7 +622,129 @@ describe("ProviderCommandReactor", () => {
     expect(await harness.listPendingDispatches()).toHaveLength(0);
   });
 
-  it("does not let a skipped idle recovery marker requeue later idle starts", async () => {
+  it("recovers marker-bound immediate steers queued before their anchor binds", async () => {
+    const harness = await createHarness({ startReactor: false });
+    const now = "2026-01-01T00:00:00.000Z";
+    const steerAt = "2026-01-01T00:00:01.000Z";
+
+    await runtime!.runPromise(
+      harness.engine.dispatch({
+        type: "thread.turn.start",
+        commandId: CommandId.make("cmd-turn-start-marker-anchor-before-recovery"),
+        threadId: ThreadId.make("thread-1"),
+        message: {
+          messageId: asMessageId("user-message-marker-anchor-before-recovery"),
+          role: "user",
+          text: "anchor prompt not yet materialized",
+          attachments: [],
+        },
+        titleSeed: "Thread",
+        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+        runtimeMode: "approval-required",
+        createdAt: now,
+      }),
+    );
+    await runtime!.runPromise(
+      harness.engine.dispatch({
+        type: "thread.turn.start",
+        commandId: CommandId.make("server:subagent-steer-immediate:marker-before-recovery"),
+        threadId: ThreadId.make("thread-1"),
+        message: {
+          messageId: asMessageId("user-message-marker-steer-before-recovery"),
+          role: "user",
+          text: "marker-bound steer should recover",
+          attachments: [],
+        },
+        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+        runtimeMode: "approval-required",
+        createdAt: steerAt,
+      }),
+    );
+
+    await harness.startReactor();
+    await waitFor(async () => (await harness.listPendingDispatches()).length === 1);
+    await harness.drain();
+
+    expect(harness.sendTurn).not.toHaveBeenCalled();
+    const [pendingRow] = await harness.listPendingDispatches();
+    expect(JSON.parse(pendingRow?.text ?? "{}")).toMatchObject({
+      messageId: "user-message-marker-steer-before-recovery",
+      providerSafeSubagentSteer: true,
+      waitForEarlierPromptBinding: true,
+      waitForEarlierPromptMessageIds: ["user-message-marker-anchor-before-recovery"],
+    });
+  });
+
+  it("recovers promoted immediate steers after their pending anchor fails", async () => {
+    const harness = await createHarness({ startReactor: false });
+    const now = "2026-01-01T00:00:00.000Z";
+    const steerAt = "2026-01-01T00:00:01.000Z";
+    const failedAt = "2026-01-01T00:00:02.000Z";
+
+    await runtime!.runPromise(
+      harness.engine.dispatch({
+        type: "thread.turn.start",
+        commandId: CommandId.make("cmd-turn-start-promoted-anchor-before-recovery"),
+        threadId: ThreadId.make("thread-1"),
+        message: {
+          messageId: asMessageId("user-message-promoted-anchor-before-recovery"),
+          role: "user",
+          text: "anchor prompt fails before materializing",
+          attachments: [],
+        },
+        titleSeed: "Thread",
+        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+        runtimeMode: "approval-required",
+        createdAt: now,
+      }),
+    );
+    await runtime!.runPromise(
+      harness.engine.dispatch({
+        type: "thread.turn.start",
+        commandId: CommandId.make("server:subagent-steer-immediate:promoted-before-recovery"),
+        threadId: ThreadId.make("thread-1"),
+        message: {
+          messageId: asMessageId("user-message-promoted-steer-before-recovery"),
+          role: "user",
+          text: "promoted steer should recover",
+          attachments: [],
+        },
+        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+        runtimeMode: "approval-required",
+        createdAt: steerAt,
+      }),
+    );
+    await runtime!.runPromise(
+      harness.engine.dispatch({
+        type: "thread.activity.append",
+        commandId: CommandId.make("cmd-activity-promoted-anchor-failed-before-recovery"),
+        threadId: ThreadId.make("thread-1"),
+        activity: {
+          id: EventId.make("activity-promoted-anchor-failed-before-recovery"),
+          tone: "error",
+          kind: "provider.turn.start.failed",
+          summary: "Provider turn start failed",
+          payload: {
+            detail: "anchor failed before materializing",
+            messageId: asMessageId("user-message-promoted-anchor-before-recovery"),
+          },
+          turnId: null,
+          createdAt: failedAt,
+        },
+        createdAt: failedAt,
+      }),
+    );
+
+    await harness.startReactor();
+    await waitFor(() => harness.sendTurn.mock.calls.length === 1);
+
+    expect(harness.sendTurn.mock.calls[0]?.[0]).toMatchObject({
+      input: "promoted steer should recover",
+    });
+    await waitFor(async () => (await harness.listPendingDispatches()).length === 0);
+  });
+
+  it("keeps ready-before-running follow-ups queued until the earlier start binds", async () => {
     const harness = await createHarness({ startReactor: false });
     const now = "2026-01-01T00:00:00.000Z";
     const readyAt = "2026-01-01T00:00:01.000Z";
@@ -674,17 +805,29 @@ describe("ProviderCommandReactor", () => {
     );
 
     await harness.startReactor();
+    await waitFor(async () => (await harness.listPendingDispatches()).length === 1);
     await harness.drain();
 
     expect(harness.sendTurn).not.toHaveBeenCalled();
-    expect(await harness.listPendingDispatches()).toHaveLength(0);
+    const pendingRows = await harness.listPendingDispatches();
+    expect(pendingRows).toHaveLength(1);
+    expect(JSON.parse(pendingRows[0]!.text ?? "{}")).toMatchObject({
+      messageId: "user-message-later-idle-before-recovery",
+      waitForEarlierPromptBinding: true,
+      waitForEarlierPromptMessageIds: ["user-message-first-idle-before-recovery"],
+    });
   });
 
-  it("does not recover consecutive idle turn starts without queued evidence", async () => {
+  it("recovers rapid follow-up starts queued behind an immediate send after the earlier start binds", async () => {
     const harness = await createHarness({ startReactor: false });
     const now = "2026-01-01T00:00:00.000Z";
-    const laterAt = "2026-01-01T00:00:01.000Z";
-    harness.generateThreadTitle.mockReturnValue(Effect.succeed({ title: "Idle prompt" }));
+    const laterAt = now;
+    const runningAt = "2026-01-01T00:00:02.000Z";
+    const readyAt = "2026-01-01T00:00:03.000Z";
+    const firstMessageId = asMessageId("user-message-consecutive-idle-z");
+    const secondMessageId = asMessageId("user-message-consecutive-idle-a");
+    const firstTurnId = asTurnId("turn-consecutive-idle-1");
+    harness.generateThreadTitle.mockReturnValue(Effect.succeed({ title: "Queued follow-up" }));
 
     await runtime!.runPromise(
       harness.engine.dispatch({
@@ -692,7 +835,7 @@ describe("ProviderCommandReactor", () => {
         commandId: CommandId.make("cmd-turn-start-consecutive-idle-1"),
         threadId: ThreadId.make("thread-1"),
         message: {
-          messageId: asMessageId("user-message-consecutive-idle-1"),
+          messageId: firstMessageId,
           role: "user",
           text: "first consecutive idle prompt",
           attachments: [],
@@ -709,7 +852,7 @@ describe("ProviderCommandReactor", () => {
         commandId: CommandId.make("cmd-turn-start-consecutive-idle-2"),
         threadId: ThreadId.make("thread-1"),
         message: {
-          messageId: asMessageId("user-message-consecutive-idle-2"),
+          messageId: secondMessageId,
           role: "user",
           text: "second consecutive idle prompt",
           attachments: [],
@@ -722,10 +865,70 @@ describe("ProviderCommandReactor", () => {
     );
 
     await harness.startReactor();
+    await waitFor(async () => (await harness.listPendingDispatches()).length === 1);
     await harness.drain();
 
     expect(harness.sendTurn).not.toHaveBeenCalled();
-    expect(await harness.listPendingDispatches()).toHaveLength(0);
+    const pendingRows = await harness.listPendingDispatches();
+    expect(pendingRows).toHaveLength(1);
+    expect(JSON.parse(pendingRows[0]!.text ?? "{}")).toMatchObject({
+      messageId: secondMessageId,
+      sourceSequence: expect.any(Number),
+      waitForEarlierPromptBinding: true,
+      waitForEarlierPromptMessageIds: [firstMessageId],
+    });
+
+    await runtime!.runPromise(
+      harness.engine.dispatch({
+        type: "thread.session.set",
+        commandId: CommandId.make("cmd-session-set-consecutive-first-running"),
+        threadId: ThreadId.make("thread-1"),
+        session: {
+          threadId: ThreadId.make("thread-1"),
+          status: "running",
+          providerName: "codex",
+          providerInstanceId: ProviderInstanceId.make("codex"),
+          runtimeMode: "approval-required",
+          activeTurnId: firstTurnId,
+          lastError: null,
+          updatedAt: runningAt,
+        },
+        createdAt: runningAt,
+      }),
+    );
+    await harness.drain();
+    expect(harness.sendTurn).not.toHaveBeenCalled();
+    expect(await harness.listPendingDispatches()).toHaveLength(1);
+
+    await runtime!.runPromise(
+      harness.engine.dispatch({
+        type: "thread.session.set",
+        commandId: CommandId.make("cmd-session-set-consecutive-ready"),
+        threadId: ThreadId.make("thread-1"),
+        session: {
+          threadId: ThreadId.make("thread-1"),
+          status: "ready",
+          providerName: "codex",
+          providerInstanceId: ProviderInstanceId.make("codex"),
+          runtimeMode: "approval-required",
+          activeTurnId: null,
+          lastError: null,
+          updatedAt: readyAt,
+        },
+        createdAt: readyAt,
+      }),
+    );
+
+    await waitFor(() => harness.sendTurn.mock.calls.length === 1);
+    expect(harness.sendTurn.mock.calls[0]?.[0]).toMatchObject({
+      input: "second consecutive idle prompt",
+    });
+    await waitFor(async () => (await harness.listPendingDispatches()).length === 0);
+    const readModel = await harness.readModel();
+    const thread = readModel.threads.find((entry) => entry.id === ThreadId.make("thread-1"));
+    expect(thread?.messages.find((message) => message.id === firstMessageId)?.turnId).toBe(
+      firstTurnId,
+    );
   });
 
   it("does not use future queued rows as evidence for earlier idle turn starts", async () => {
@@ -954,6 +1157,547 @@ describe("ProviderCommandReactor", () => {
       thread?.activities.some((activity) => activity.kind === "provider.turn.start.failed") ??
         false,
     ).toBe(false);
+  });
+
+  it("sends provider-safe subagent steers immediately while a provider turn is running", async () => {
+    const harness = await createHarness();
+    const now = "2026-01-01T00:00:00.000Z";
+
+    harness.runtimeSessions.push({
+      provider: ProviderDriverKind.make("codex"),
+      providerInstanceId: ProviderInstanceId.make("codex"),
+      status: "running",
+      runtimeMode: "approval-required",
+      model: "gpt-5-codex",
+      threadId: ThreadId.make("thread-1"),
+      resumeCursor: { opaque: "resume-running-subagent-steer" },
+      activeTurnId: asTurnId("turn-running-subagent-steer"),
+      createdAt: now,
+      updatedAt: now,
+    });
+
+    await runtime!.runPromise(
+      harness.engine.dispatch({
+        type: "thread.session.set",
+        commandId: CommandId.make("cmd-session-set-running-subagent-steer"),
+        threadId: ThreadId.make("thread-1"),
+        session: {
+          threadId: ThreadId.make("thread-1"),
+          status: "running",
+          providerName: "codex",
+          providerInstanceId: ProviderInstanceId.make("codex"),
+          runtimeMode: "approval-required",
+          activeTurnId: asTurnId("turn-running-subagent-steer"),
+          lastError: null,
+          updatedAt: now,
+        },
+        createdAt: now,
+      }),
+    );
+    await runtime!.runPromise(
+      harness.engine.dispatch({
+        type: "thread.turn.start",
+        commandId: CommandId.make("server:subagent-steer-immediate:test"),
+        threadId: ThreadId.make("thread-1"),
+        message: {
+          messageId: asMessageId("user-message-subagent-steer-midturn"),
+          role: "user",
+          text: "steer while running",
+          attachments: [],
+        },
+        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+        runtimeMode: "approval-required",
+        createdAt: now,
+      }),
+    );
+
+    await waitFor(() => harness.sendTurn.mock.calls.length === 1);
+    await harness.drain();
+
+    expect(harness.sendTurn.mock.calls[0]?.[0]).toMatchObject({
+      input: "steer while running",
+    });
+    expect(await harness.listPendingDispatches()).toHaveLength(0);
+  });
+
+  it("queues provider-safe subagent steers while an immediate send is still in flight", async () => {
+    const harness = await createHarness();
+    const now = "2026-01-01T00:00:00.000Z";
+    const defaultSendTurn = harness.sendTurn.getMockImplementation();
+    expect(defaultSendTurn).toBeDefined();
+    const firstSendEntered = Effect.runSync(Deferred.make<void>());
+    const releaseFirstSend = Effect.runSync(Deferred.make<void>());
+
+    harness.sendTurn.mockImplementationOnce((input) =>
+      Effect.gen(function* () {
+        yield* Deferred.succeed(firstSendEntered, undefined);
+        yield* Deferred.await(releaseFirstSend);
+        harness.runtimeSessions.splice(0, 1, {
+          provider: ProviderDriverKind.make("codex"),
+          providerInstanceId: ProviderInstanceId.make("codex"),
+          status: "running",
+          runtimeMode: "approval-required",
+          model: "gpt-5-codex",
+          threadId: ThreadId.make("thread-1"),
+          resumeCursor: { opaque: "resume-running-after-immediate-send" },
+          activeTurnId: asTurnId("turn-running-after-immediate-send"),
+          createdAt: now,
+          updatedAt: now,
+        });
+        yield* harness.engine
+          .dispatch({
+            type: "thread.session.set",
+            commandId: CommandId.make("cmd-session-set-running-after-immediate-send"),
+            threadId: ThreadId.make("thread-1"),
+            session: {
+              threadId: ThreadId.make("thread-1"),
+              status: "running",
+              providerName: "codex",
+              providerInstanceId: ProviderInstanceId.make("codex"),
+              runtimeMode: "approval-required",
+              activeTurnId: asTurnId("turn-running-after-immediate-send"),
+              lastError: null,
+              updatedAt: now,
+            },
+            createdAt: now,
+          })
+          .pipe(Effect.orDie);
+        return yield* defaultSendTurn!(input);
+      }),
+    );
+
+    await runtime!.runPromise(
+      harness.engine.dispatch({
+        type: "thread.turn.start",
+        commandId: CommandId.make("cmd-turn-start-before-immediate-steer"),
+        threadId: ThreadId.make("thread-1"),
+        message: {
+          messageId: asMessageId("user-message-before-immediate-steer"),
+          role: "user",
+          text: "hold immediate send before steer",
+          attachments: [],
+        },
+        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+        runtimeMode: "approval-required",
+        createdAt: now,
+      }),
+    );
+    await Effect.runPromise(Deferred.await(firstSendEntered));
+
+    await runtime!.runPromise(
+      harness.engine.dispatch({
+        type: "thread.turn.start",
+        commandId: CommandId.make("server:subagent-steer-immediate:inflight"),
+        threadId: ThreadId.make("thread-1"),
+        message: {
+          messageId: asMessageId("user-message-immediate-steer-while-send-inflight"),
+          role: "user",
+          text: "steer while immediate send is still in flight",
+          attachments: [],
+        },
+        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+        runtimeMode: "approval-required",
+        createdAt: now,
+      }),
+    );
+
+    await waitFor(async () => (await harness.listPendingDispatches()).length === 1);
+    expect(harness.sendTurn).toHaveBeenCalledTimes(1);
+    expect(harness.sendTurn.mock.calls[0]?.[0]).toMatchObject({
+      input: "hold immediate send before steer",
+    });
+
+    await Effect.runPromise(Deferred.succeed(releaseFirstSend, undefined));
+    await waitFor(() => harness.sendTurn.mock.calls.length === 2);
+    await harness.drain();
+
+    expect(harness.sendTurn.mock.calls[1]?.[0]).toMatchObject({
+      input: "steer while immediate send is still in flight",
+    });
+    await waitFor(async () => (await harness.listPendingDispatches()).length === 0);
+  });
+
+  it("queues provider-safe subagent steers behind older provider-safe queued rows", async () => {
+    const harness = await createHarness();
+    const now = "2026-01-01T00:00:00.000Z";
+
+    harness.runtimeSessions.push({
+      provider: ProviderDriverKind.make("codex"),
+      providerInstanceId: ProviderInstanceId.make("codex"),
+      status: "running",
+      runtimeMode: "approval-required",
+      model: "gpt-5-codex",
+      threadId: ThreadId.make("thread-1"),
+      resumeCursor: { opaque: "resume-running-provider-safe-order" },
+      activeTurnId: asTurnId("turn-running-provider-safe-order"),
+      createdAt: now,
+      updatedAt: now,
+    });
+    await runtime!.runPromise(
+      Effect.flatMap(Effect.service(ProjectionThreadSessionRepository), (repository) =>
+        repository.upsert({
+          threadId: ThreadId.make("thread-1"),
+          status: "running",
+          providerName: "codex",
+          providerInstanceId: ProviderInstanceId.make("codex"),
+          runtimeMode: "approval-required",
+          activeTurnId: asTurnId("turn-running-provider-safe-order"),
+          lastError: null,
+          updatedAt: IsoDateTime.make(now),
+        }),
+      ),
+    );
+    await runtime!.runPromise(
+      Effect.flatMap(Effect.service(ProjectionThreadMessageRepository), (repository) =>
+        repository.upsert({
+          messageId: asMessageId("user-message-provider-safe-order-a"),
+          threadId: ThreadId.make("thread-1"),
+          turnId: asTurnId("turn-running-provider-safe-order"),
+          role: "user",
+          text: "provider-safe steer A is already queued",
+          attachments: [],
+          isStreaming: false,
+          createdAt: IsoDateTime.make(now),
+          updatedAt: IsoDateTime.make(now),
+        }),
+      ),
+    );
+    await runtime!.runPromise(
+      Effect.flatMap(Effect.service(PendingDispatchRepository), (repository) =>
+        repository.insert({
+          id: asPendingDispatchId("thread-turn:user-message-provider-safe-order-a"),
+          kind: "thread_turn",
+          targetThreadId: ThreadId.make("thread-1"),
+          sourceChildId: null,
+          text: JSON.stringify({
+            messageId: asMessageId("user-message-provider-safe-order-a"),
+            runtimeMode: "approval-required",
+            interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+            createdAt: now,
+            sourceSequence: 2,
+            providerSafeSubagentSteer: true,
+          }),
+          error: null,
+          status: null,
+          commandId: null,
+          deliveredByWait: false,
+          waitCancellable: false,
+          createdAt: IsoDateTime.make(now),
+        }),
+      ),
+    );
+
+    await runtime!.runPromise(
+      harness.engine.dispatch({
+        type: "thread.turn.start",
+        commandId: CommandId.make("server:subagent-steer-immediate:provider-safe-order-b"),
+        threadId: ThreadId.make("thread-1"),
+        message: {
+          messageId: asMessageId("user-message-provider-safe-order-b"),
+          role: "user",
+          text: "provider-safe steer B must wait for A",
+          attachments: [],
+        },
+        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+        runtimeMode: "approval-required",
+        createdAt: now,
+      }),
+    );
+
+    await waitFor(async () => (await harness.listPendingDispatches()).length === 2);
+    expect(harness.sendTurn).not.toHaveBeenCalled();
+    expect((await harness.listPendingDispatches()).map((row) => row.id)).toEqual([
+      asPendingDispatchId("thread-turn:user-message-provider-safe-order-a"),
+      asPendingDispatchId("thread-turn:user-message-provider-safe-order-b"),
+    ]);
+  });
+
+  it("drains consecutive provider-safe queued rows during an active turn", async () => {
+    const harness = await createHarness({ startReactor: false });
+    const now = "2026-01-01T00:00:00.000Z";
+    const laterAt = "2026-01-01T00:00:01.000Z";
+    const activeTurnId = asTurnId("turn-running-provider-safe-drain");
+
+    harness.runtimeSessions.push({
+      provider: ProviderDriverKind.make("codex"),
+      providerInstanceId: ProviderInstanceId.make("codex"),
+      status: "running",
+      runtimeMode: "approval-required",
+      model: "gpt-5-codex",
+      threadId: ThreadId.make("thread-1"),
+      resumeCursor: { opaque: "resume-running-provider-safe-drain" },
+      activeTurnId,
+      createdAt: now,
+      updatedAt: now,
+    });
+    await runtime!.runPromise(
+      harness.engine.dispatch({
+        type: "thread.session.set",
+        commandId: CommandId.make("cmd-session-set-running-provider-safe-drain"),
+        threadId: ThreadId.make("thread-1"),
+        session: {
+          threadId: ThreadId.make("thread-1"),
+          status: "running",
+          providerName: "codex",
+          providerInstanceId: ProviderInstanceId.make("codex"),
+          runtimeMode: "approval-required",
+          activeTurnId,
+          lastError: null,
+          updatedAt: now,
+        },
+        createdAt: now,
+      }),
+    );
+    await runtime!.runPromise(
+      harness.engine.dispatch({
+        type: "thread.turn.start",
+        commandId: CommandId.make("server:subagent-steer-immediate:provider-safe-drain-a"),
+        threadId: ThreadId.make("thread-1"),
+        message: {
+          messageId: asMessageId("user-message-provider-safe-drain-a"),
+          role: "user",
+          text: "provider-safe drain A",
+          attachments: [],
+        },
+        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+        runtimeMode: "approval-required",
+        createdAt: now,
+      }),
+    );
+    await runtime!.runPromise(
+      harness.engine.dispatch({
+        type: "thread.turn.start",
+        commandId: CommandId.make("server:subagent-steer-immediate:provider-safe-drain-b"),
+        threadId: ThreadId.make("thread-1"),
+        message: {
+          messageId: asMessageId("user-message-provider-safe-drain-b"),
+          role: "user",
+          text: "provider-safe drain B",
+          attachments: [],
+        },
+        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+        runtimeMode: "approval-required",
+        createdAt: laterAt,
+      }),
+    );
+    await runtime!.runPromise(
+      Effect.flatMap(Effect.service(PendingDispatchRepository), (repository) =>
+        Effect.all([
+          repository.insert({
+            id: asPendingDispatchId("thread-turn:user-message-provider-safe-drain-a"),
+            kind: "thread_turn",
+            targetThreadId: ThreadId.make("thread-1"),
+            sourceChildId: null,
+            text: JSON.stringify({
+              messageId: asMessageId("user-message-provider-safe-drain-a"),
+              runtimeMode: "approval-required",
+              interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+              createdAt: now,
+              sourceSequence: 2,
+              providerSafeSubagentSteer: true,
+            }),
+            error: null,
+            status: null,
+            commandId: null,
+            deliveredByWait: false,
+            waitCancellable: false,
+            createdAt: IsoDateTime.make(now),
+          }),
+          repository.insert({
+            id: asPendingDispatchId("thread-turn:user-message-provider-safe-drain-b"),
+            kind: "thread_turn",
+            targetThreadId: ThreadId.make("thread-1"),
+            sourceChildId: null,
+            text: JSON.stringify({
+              messageId: asMessageId("user-message-provider-safe-drain-b"),
+              runtimeMode: "approval-required",
+              interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+              createdAt: laterAt,
+              sourceSequence: 3,
+              providerSafeSubagentSteer: true,
+            }),
+            error: null,
+            status: null,
+            commandId: null,
+            deliveredByWait: false,
+            waitCancellable: false,
+            createdAt: IsoDateTime.make(laterAt),
+          }),
+        ]),
+      ),
+    );
+
+    await harness.startReactor();
+    await waitFor(() => harness.sendTurn.mock.calls.length === 2);
+
+    expect(harness.sendTurn.mock.calls[0]?.[0]).toMatchObject({
+      input: "provider-safe drain A",
+    });
+    expect(harness.sendTurn.mock.calls[1]?.[0]).toMatchObject({
+      input: "provider-safe drain B",
+    });
+    await waitFor(async () => (await harness.listPendingDispatches()).length === 0);
+  });
+
+  it("retries claimed provider-safe subagent steers after their target turn binds", async () => {
+    const harness = await createHarness();
+    const now = "2026-01-01T00:00:00.000Z";
+    const defaultSendTurn = harness.sendTurn.getMockImplementation();
+    expect(defaultSendTurn).toBeDefined();
+    const firstSendEntered = Effect.runSync(Deferred.make<void>());
+    const releaseFirstSend = Effect.runSync(Deferred.make<void>());
+
+    harness.sendTurn.mockImplementationOnce((input) =>
+      Effect.gen(function* () {
+        yield* Deferred.succeed(firstSendEntered, undefined);
+        yield* Deferred.await(releaseFirstSend);
+        harness.runtimeSessions.splice(0, 1, {
+          provider: ProviderDriverKind.make("codex"),
+          providerInstanceId: ProviderInstanceId.make("codex"),
+          status: "running",
+          runtimeMode: "approval-required",
+          model: "gpt-5-codex",
+          threadId: ThreadId.make("thread-1"),
+          resumeCursor: { opaque: "resume-running-after-claimed-provider-safe-steer" },
+          activeTurnId: asTurnId("turn-running-after-claimed-provider-safe-steer"),
+          createdAt: now,
+          updatedAt: now,
+        });
+        yield* harness.engine
+          .dispatch({
+            type: "thread.session.set",
+            commandId: CommandId.make("cmd-session-set-running-after-claimed-provider-safe-steer"),
+            threadId: ThreadId.make("thread-1"),
+            session: {
+              threadId: ThreadId.make("thread-1"),
+              status: "running",
+              providerName: "codex",
+              providerInstanceId: ProviderInstanceId.make("codex"),
+              runtimeMode: "approval-required",
+              activeTurnId: asTurnId("turn-running-after-claimed-provider-safe-steer"),
+              lastError: null,
+              updatedAt: now,
+            },
+            createdAt: now,
+          })
+          .pipe(Effect.orDie);
+        return yield* defaultSendTurn!(input);
+      }),
+    );
+
+    await runtime!.runPromise(
+      harness.engine.dispatch({
+        type: "thread.turn.start",
+        commandId: CommandId.make("cmd-turn-start-before-claimed-provider-safe-steer"),
+        threadId: ThreadId.make("thread-1"),
+        message: {
+          messageId: asMessageId("user-message-before-claimed-provider-safe-steer"),
+          role: "user",
+          text: "hold immediate send before claimed steer",
+          attachments: [],
+        },
+        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+        runtimeMode: "approval-required",
+        createdAt: now,
+      }),
+    );
+    await Effect.runPromise(Deferred.await(firstSendEntered));
+
+    await runtime!.runPromise(
+      harness.engine.dispatch({
+        type: "thread.turn.start",
+        commandId: CommandId.make("server:subagent-steer-immediate:claimed-inflight"),
+        threadId: ThreadId.make("thread-1"),
+        message: {
+          messageId: asMessageId("user-message-claimed-provider-safe-steer"),
+          role: "user",
+          text: "claimed provider-safe steer",
+          attachments: [],
+        },
+        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+        runtimeMode: "approval-required",
+        createdAt: now,
+      }),
+    );
+
+    await waitFor(async () => (await harness.listPendingDispatches()).length === 1);
+    const [queuedRow] = await harness.listPendingDispatches();
+    expect(queuedRow).toBeDefined();
+    await runtime!.runPromise(
+      Effect.flatMap(Effect.service(PendingDispatchRepository), (repository) =>
+        repository.claim({
+          ids: [queuedRow!.id],
+          commandId: "server:queued-turn-send:claimed-provider-safe-steer",
+        }),
+      ),
+    );
+
+    await Effect.runPromise(Deferred.succeed(releaseFirstSend, undefined));
+    await waitFor(() => harness.sendTurn.mock.calls.length === 2);
+
+    expect(harness.sendTurn.mock.calls[1]?.[0]).toMatchObject({
+      input: "claimed provider-safe steer",
+    });
+    await waitFor(async () => (await harness.listPendingDispatches()).length === 0);
+  });
+
+  it("keeps deferred subagent steer replays queued if a provider turn restarts first", async () => {
+    const harness = await createHarness();
+    const now = "2026-01-01T00:00:00.000Z";
+
+    harness.runtimeSessions.push({
+      provider: ProviderDriverKind.make("codex"),
+      providerInstanceId: ProviderInstanceId.make("codex"),
+      status: "running",
+      runtimeMode: "approval-required",
+      model: "gpt-5-codex",
+      threadId: ThreadId.make("thread-1"),
+      resumeCursor: { opaque: "resume-running-deferred-subagent-steer" },
+      activeTurnId: asTurnId("turn-running-deferred-subagent-steer"),
+      createdAt: now,
+      updatedAt: now,
+    });
+
+    await runtime!.runPromise(
+      harness.engine.dispatch({
+        type: "thread.session.set",
+        commandId: CommandId.make("cmd-session-set-running-deferred-subagent-steer"),
+        threadId: ThreadId.make("thread-1"),
+        session: {
+          threadId: ThreadId.make("thread-1"),
+          status: "running",
+          providerName: "codex",
+          providerInstanceId: ProviderInstanceId.make("codex"),
+          runtimeMode: "approval-required",
+          activeTurnId: asTurnId("turn-running-deferred-subagent-steer"),
+          lastError: null,
+          updatedAt: now,
+        },
+        createdAt: now,
+      }),
+    );
+    await runtime!.runPromise(
+      harness.engine.dispatch({
+        type: "thread.turn.start",
+        commandId: CommandId.make("server:subagent-steer:deferred-row"),
+        threadId: ThreadId.make("thread-1"),
+        message: {
+          messageId: asMessageId("user-message-deferred-subagent-steer-midturn"),
+          role: "user",
+          text: "deferred steer while running",
+          attachments: [],
+        },
+        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+        runtimeMode: "approval-required",
+        createdAt: now,
+      }),
+    );
+    await harness.drain();
+
+    expect(harness.sendTurn).not.toHaveBeenCalled();
+    const rows = await harness.listPendingDispatches();
+    expect(rows).toHaveLength(1);
+    expect(rows[0]?.id).toBe("thread-turn:user-message-deferred-subagent-steer-midturn");
   });
 
   it("recovers queued turn starts committed before the reactor could persist a dispatch row", async () => {
@@ -1654,7 +2398,7 @@ describe("ProviderCommandReactor", () => {
   it("does not treat queued rows after a resumed session as post-stop recovery rows", async () => {
     const harness = await createHarness({ startReactor: false });
     const stoppedAt = "2026-01-01T00:00:01.000Z";
-    const resumedAt = "2026-01-01T00:00:02.000Z";
+    const resumedAt = stoppedAt;
     const closedAt = "2026-01-01T00:00:03.000Z";
     const promptAt = "2026-01-01T00:00:04.000Z";
     const messageId = asMessageId("user-message-after-resumed-session-close");

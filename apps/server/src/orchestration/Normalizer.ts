@@ -13,7 +13,47 @@ import { ServerConfig } from "../config.ts";
 import { parseBase64DataUrl } from "../imageMime.ts";
 import * as WorkspacePaths from "../workspace/WorkspacePaths.ts";
 
-export const normalizeDispatchCommand = (command: ClientOrchestrationCommand) =>
+const CLIENT_FORBIDDEN_COMMAND_ID_PREFIXES = ["server:subagent-steer-immediate:"] as const;
+type NormalizeDispatchCommandRequirements =
+  | FileSystem.FileSystem
+  | Path.Path
+  | ServerConfig
+  | WorkspacePaths.WorkspacePaths;
+
+export const rejectReservedClientCommandId = (
+  commandId: ClientOrchestrationCommand["commandId"],
+): Effect.Effect<void, OrchestrationDispatchCommandError> => {
+  if (
+    !CLIENT_FORBIDDEN_COMMAND_ID_PREFIXES.some((prefix) => String(commandId).startsWith(prefix))
+  ) {
+    return Effect.void;
+  }
+  return Effect.fail(
+    new OrchestrationDispatchCommandError({
+      message: `Command id '${commandId}' uses a reserved server namespace.`,
+    }),
+  );
+};
+
+export const normalizeDispatchCommand = (
+  command: ClientOrchestrationCommand,
+): Effect.Effect<
+  OrchestrationCommand,
+  OrchestrationDispatchCommandError,
+  NormalizeDispatchCommandRequirements
+> =>
+  Effect.gen(function* () {
+    yield* rejectReservedClientCommandId(command.commandId);
+    return yield* normalizeDispatchCommandUnchecked(command);
+  });
+
+const normalizeDispatchCommandUnchecked = (
+  command: ClientOrchestrationCommand,
+): Effect.Effect<
+  OrchestrationCommand,
+  OrchestrationDispatchCommandError,
+  NormalizeDispatchCommandRequirements
+> =>
   Effect.gen(function* () {
     const fileSystem = yield* FileSystem.FileSystem;
     const path = yield* Path.Path;
