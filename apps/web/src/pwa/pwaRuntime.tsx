@@ -135,6 +135,21 @@ export async function canUseNativeDesktopNotifications(
   }
 }
 
+export async function shouldRegisterDesktopNotifications(input: {
+  readonly bridge: Pick<DesktopBridge, "isNotificationSupported" | "showNotification"> | undefined;
+  readonly isCancelled: () => boolean;
+  readonly requestPermission: () => Promise<NotificationPermission>;
+}): Promise<boolean> {
+  if (await canUseNativeDesktopNotifications(input.bridge)) {
+    return !input.isCancelled();
+  }
+  if (input.isCancelled()) {
+    return false;
+  }
+  const permission = await input.requestPermission();
+  return !input.isCancelled() && permission === "granted";
+}
+
 interface DesktopNotificationDeliveryHost {
   readonly showNative: (notification: ServerDeviceNotification) => Promise<boolean>;
   readonly closeNative: (notificationId: string) => void;
@@ -462,11 +477,12 @@ function PwaRuntimeForEnvironment({ environmentId }: { readonly environmentId: E
     }
 
     async function registerDesktop(): Promise<void> {
-      if (!(await canUseNativeDesktopNotifications(window.desktopBridge))) {
-        if (!("Notification" in window)) return;
-        const permission = await requestPermissionAfterGesture();
-        if (cancelled || permission !== "granted") return;
-      }
+      const shouldRegister = await shouldRegisterDesktopNotifications({
+        bridge: window.desktopBridge,
+        isCancelled: () => cancelled,
+        requestPermission: requestPermissionAfterGesture,
+      });
+      if (!shouldRegister) return;
 
       await registerDevice({
         environmentId,

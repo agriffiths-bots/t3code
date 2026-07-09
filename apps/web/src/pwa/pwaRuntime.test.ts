@@ -8,6 +8,7 @@ import {
   PwaRuntimeView,
   PwaServiceWorkerRegistration,
   resolveDeepLinkTarget,
+  shouldRegisterDesktopNotifications,
 } from "./pwaRuntime";
 
 const notification: ServerDeviceNotification = {
@@ -145,5 +146,33 @@ describe("canUseNativeDesktopNotifications", () => {
         },
       }),
     ).resolves.toBe(false);
+  });
+});
+
+describe("shouldRegisterDesktopNotifications", () => {
+  it("stops after the native support probe when registration was cancelled", async () => {
+    let resolveProbe!: (supported: boolean) => void;
+    let cancelled = false;
+    let permissionRequests = 0;
+    const registrationAllowed = shouldRegisterDesktopNotifications({
+      bridge: {
+        showNotification: async () => true,
+        isNotificationSupported: () =>
+          new Promise<boolean>((resolve) => {
+            resolveProbe = resolve;
+          }),
+      },
+      isCancelled: () => cancelled,
+      requestPermission: async () => {
+        permissionRequests += 1;
+        return "granted";
+      },
+    });
+
+    cancelled = true;
+    resolveProbe(false);
+
+    await expect(registrationAllowed).resolves.toBe(false);
+    expect(permissionRequests).toBe(0);
   });
 });
