@@ -273,10 +273,19 @@ export const mcpPeerTokenRouteLayer = HttpRouter.add(
       Effect.flatMap(Schema.decodeUnknownEffect(SubagentPeerMcpTokenRequest)),
       Effect.orElseSucceed(() => ({}) as SubagentPeerMcpTokenRequest),
     );
+    if (body.sourceEnvironmentId === undefined) {
+      return HttpServerResponse.jsonUnsafe(
+        {
+          error: "invalid_request",
+          message: "sourceEnvironmentId is required when minting a subagent peer token.",
+        },
+        { status: 400 },
+      );
+    }
     const session = yield* authenticateRawRequestWithScope(request, AuthOrchestrationOperateScope);
     const issued = yield* McpSessionRegistry.issueActiveMcpPeerCredential({
       sourceSessionId: session.sessionId,
-      ...(body.sourceEnvironmentId ? { sourceEnvironmentId: body.sourceEnvironmentId } : {}),
+      sourceEnvironmentId: body.sourceEnvironmentId,
       ...(session.expiresAt ? { expiresAt: session.expiresAt.epochMilliseconds } : {}),
     }).pipe(
       Effect.catchTag("McpPeerTokenStoreError", (error) =>

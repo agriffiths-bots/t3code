@@ -24,6 +24,12 @@ export const RemoteChildStatus = Schema.Literals([
   "unknown",
 ]);
 export type RemoteChildStatus = typeof RemoteChildStatus.Type;
+export const REMOTE_CHILD_TERMINAL_STATUSES = [
+  "completed",
+  "failed",
+  "interrupted",
+  "killed",
+] as const satisfies ReadonlyArray<RemoteChildStatus>;
 
 export const RemoteChild = Schema.Struct({
   parentThreadId: ThreadId,
@@ -64,6 +70,31 @@ export const UpdateRemoteChildStatusInput = Schema.Struct({
 });
 export type UpdateRemoteChildStatusInput = typeof UpdateRemoteChildStatusInput.Type;
 
+export const ClaimRemoteChildTerminalDeliveryInput = Schema.Struct({
+  ...RemoteChildKey.fields,
+  claimId: TrimmedNonEmptyString,
+  claimedAt: IsoDateTime,
+  claimStaleBefore: IsoDateTime,
+  lastPolledAt: Schema.optional(Schema.NullOr(IsoDateTime)),
+  updatedAt: IsoDateTime,
+});
+export type ClaimRemoteChildTerminalDeliveryInput =
+  typeof ClaimRemoteChildTerminalDeliveryInput.Type;
+
+export const ReleaseRemoteChildTerminalDeliveryClaimInput = Schema.Struct({
+  ...RemoteChildKey.fields,
+  claimId: TrimmedNonEmptyString,
+  updatedAt: IsoDateTime,
+});
+export type ReleaseRemoteChildTerminalDeliveryClaimInput =
+  typeof ReleaseRemoteChildTerminalDeliveryClaimInput.Type;
+
+export const MarkRemoteChildTerminalStatusInput = Schema.Struct({
+  ...UpdateRemoteChildStatusInput.fields,
+  claimId: TrimmedNonEmptyString,
+});
+export type MarkRemoteChildTerminalStatusInput = typeof MarkRemoteChildTerminalStatusInput.Type;
+
 export interface RemoteChildRepositoryShape {
   readonly upsert: (row: RemoteChild) => Effect.Effect<void, ProjectionRepositoryError>;
   readonly getByChild: (
@@ -76,6 +107,15 @@ export interface RemoteChildRepositoryShape {
   readonly updateStatus: (
     input: UpdateRemoteChildStatusInput,
   ) => Effect.Effect<void, ProjectionRepositoryError>;
+  readonly claimTerminalDelivery: (
+    input: ClaimRemoteChildTerminalDeliveryInput,
+  ) => Effect.Effect<Option.Option<RemoteChild>, ProjectionRepositoryError>;
+  readonly releaseTerminalDeliveryClaim: (
+    input: ReleaseRemoteChildTerminalDeliveryClaimInput,
+  ) => Effect.Effect<void, ProjectionRepositoryError>;
+  readonly markTerminalStatus: (
+    input: MarkRemoteChildTerminalStatusInput,
+  ) => Effect.Effect<Option.Option<RemoteChild>, ProjectionRepositoryError>;
 }
 
 export class RemoteChildRepository extends Context.Service<

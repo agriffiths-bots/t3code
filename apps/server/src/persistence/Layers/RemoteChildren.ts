@@ -8,10 +8,14 @@ import * as SqlSchema from "effect/unstable/sql/SqlSchema";
 
 import { toPersistenceSqlError } from "../Errors.ts";
 import {
+  ClaimRemoteChildTerminalDeliveryInput,
   ListRemoteChildrenByParentInput,
+  MarkRemoteChildTerminalStatusInput,
+  REMOTE_CHILD_TERMINAL_STATUSES,
   RemoteChild,
   RemoteChildRepository,
   RemoteChildThreadKey,
+  ReleaseRemoteChildTerminalDeliveryClaimInput,
   UpdateRemoteChildStatusInput,
   type RemoteChildRepositoryShape,
 } from "../Services/RemoteChildren.ts";
@@ -153,6 +157,102 @@ const makeRemoteChildRepository = Effect.gen(function* () {
       `,
   });
 
+  const claimRemoteChildTerminalDeliveryRow = SqlSchema.findOneOption({
+    Request: ClaimRemoteChildTerminalDeliveryInput,
+    Result: RemoteChildDbRow,
+    execute: ({
+      parentThreadId,
+      childEnvironmentId,
+      childThreadId,
+      claimId,
+      claimedAt,
+      claimStaleBefore,
+      lastPolledAt,
+      updatedAt,
+    }) =>
+      sql`
+        UPDATE remote_children
+        SET
+          terminal_delivery_claim_id = ${claimId},
+          terminal_delivery_claimed_at = ${claimedAt},
+          last_polled_at = ${lastPolledAt ?? null},
+          updated_at = ${updatedAt}
+        WHERE parent_thread_id = ${parentThreadId}
+          AND child_env_id = ${childEnvironmentId}
+          AND child_thread_id = ${childThreadId}
+          AND NOT ${sql.in("status", REMOTE_CHILD_TERMINAL_STATUSES)}
+          AND (
+            terminal_delivery_claim_id IS NULL
+            OR terminal_delivery_claimed_at IS NULL
+            OR terminal_delivery_claimed_at <= ${claimStaleBefore}
+          )
+        RETURNING
+          parent_thread_id AS "parentThreadId",
+          child_env_id AS "childEnvironmentId",
+          child_thread_id AS "childThreadId",
+          alias,
+          spawn_params_json AS "spawnParams",
+          status,
+          last_polled_at AS "lastPolledAt",
+          created_at AS "createdAt",
+          updated_at AS "updatedAt"
+      `,
+  });
+
+  const releaseRemoteChildTerminalDeliveryClaimRow = SqlSchema.void({
+    Request: ReleaseRemoteChildTerminalDeliveryClaimInput,
+    execute: ({ parentThreadId, childEnvironmentId, childThreadId, claimId, updatedAt }) =>
+      sql`
+        UPDATE remote_children
+        SET
+          terminal_delivery_claim_id = NULL,
+          terminal_delivery_claimed_at = NULL,
+          updated_at = ${updatedAt}
+        WHERE parent_thread_id = ${parentThreadId}
+          AND child_env_id = ${childEnvironmentId}
+          AND child_thread_id = ${childThreadId}
+          AND terminal_delivery_claim_id = ${claimId}
+      `,
+  });
+
+  const markRemoteChildTerminalRow = SqlSchema.findOneOption({
+    Request: MarkRemoteChildTerminalStatusInput,
+    Result: RemoteChildDbRow,
+    execute: ({
+      parentThreadId,
+      childEnvironmentId,
+      childThreadId,
+      claimId,
+      status,
+      lastPolledAt,
+      updatedAt,
+    }) =>
+      sql`
+        UPDATE remote_children
+        SET
+          status = ${status},
+          terminal_delivery_claim_id = NULL,
+          terminal_delivery_claimed_at = NULL,
+          last_polled_at = ${lastPolledAt ?? null},
+          updated_at = ${updatedAt}
+        WHERE parent_thread_id = ${parentThreadId}
+          AND child_env_id = ${childEnvironmentId}
+          AND child_thread_id = ${childThreadId}
+          AND NOT ${sql.in("status", REMOTE_CHILD_TERMINAL_STATUSES)}
+          AND terminal_delivery_claim_id = ${claimId}
+        RETURNING
+          parent_thread_id AS "parentThreadId",
+          child_env_id AS "childEnvironmentId",
+          child_thread_id AS "childThreadId",
+          alias,
+          spawn_params_json AS "spawnParams",
+          status,
+          last_polled_at AS "lastPolledAt",
+          created_at AS "createdAt",
+          updated_at AS "updatedAt"
+      `,
+  });
+
   const upsert: RemoteChildRepositoryShape["upsert"] = (row) =>
     writeRemoteChildRow(row).pipe(
       Effect.mapError(toPersistenceSqlError("RemoteChildRepository.upsert:query")),
@@ -181,12 +281,36 @@ const makeRemoteChildRepository = Effect.gen(function* () {
       Effect.mapError(toPersistenceSqlError("RemoteChildRepository.updateStatus:query")),
     );
 
+  const claimTerminalDelivery: RemoteChildRepositoryShape["claimTerminalDelivery"] = (input) =>
+    claimRemoteChildTerminalDeliveryRow(input).pipe(
+      Effect.map(Option.map(toRemoteChild)),
+      Effect.mapError(toPersistenceSqlError("RemoteChildRepository.claimTerminalDelivery:query")),
+    );
+
+  const releaseTerminalDeliveryClaim: RemoteChildRepositoryShape["releaseTerminalDeliveryClaim"] = (
+    input,
+  ) =>
+    releaseRemoteChildTerminalDeliveryClaimRow(input).pipe(
+      Effect.mapError(
+        toPersistenceSqlError("RemoteChildRepository.releaseTerminalDeliveryClaim:query"),
+      ),
+    );
+
+  const markTerminalStatus: RemoteChildRepositoryShape["markTerminalStatus"] = (input) =>
+    markRemoteChildTerminalRow(input).pipe(
+      Effect.map(Option.map(toRemoteChild)),
+      Effect.mapError(toPersistenceSqlError("RemoteChildRepository.markTerminalStatus:query")),
+    );
+
   return {
     upsert,
     getByChild,
     listByParent,
     listAll,
     updateStatus,
+    claimTerminalDelivery,
+    releaseTerminalDeliveryClaim,
+    markTerminalStatus,
   } satisfies RemoteChildRepositoryShape;
 });
 

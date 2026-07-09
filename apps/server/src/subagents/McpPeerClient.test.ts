@@ -8,7 +8,7 @@ import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Schema from "effect/Schema";
 import { McpSchema, McpServer } from "effect/unstable/ai";
-import { HttpClient, HttpClientResponse, HttpRouter } from "effect/unstable/http";
+import { HttpBody, HttpClient, HttpClientResponse, HttpRouter } from "effect/unstable/http";
 
 import * as EnvironmentAuth from "../auth/EnvironmentAuth.ts";
 import * as ServerEnvironment from "../environment/ServerEnvironment.ts";
@@ -545,6 +545,7 @@ it.effect("uses route-minted peer tokens for authenticated MCP calls", () =>
       lastAuthenticatedHttpRequestAuthorization = undefined;
       const tokenResponse = yield* httpClient.post(SUBAGENT_PEER_MCP_TOKEN_PATH, {
         headers: { authorization: "Bearer env-access-token" },
+        body: HttpBody.jsonUnsafe({ sourceEnvironmentId: "environment-source-a" }),
       });
       if (tokenResponse.status !== 200) {
         const body = yield* tokenResponse.text;
@@ -651,6 +652,7 @@ it.effect("rejects route-minted peer tokens when source session confirmation fai
       lastAuthenticatedHttpRequestAuthorization = undefined;
       const tokenResponse = yield* httpClient.post(SUBAGENT_PEER_MCP_TOKEN_PATH, {
         headers: { authorization: "Bearer racing-env-access-token" },
+        body: HttpBody.jsonUnsafe({ sourceEnvironmentId: "environment-source-a" }),
       });
 
       assert.equal(tokenResponse.status, 401);
@@ -671,6 +673,41 @@ it.effect("rejects route-minted peer tokens when source session confirmation fai
       });
       assert.equal(result.isError, false);
       assert.deepStrictEqual(result.structuredContent, { echoed: "existing token survived" });
+    }),
+  ).pipe(Effect.provide(NodeHttpServer.layerTest)),
+);
+
+it.effect("rejects route-minted peer tokens without a source environment", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const serverLayer = Layer.mergeAll(
+        mcpPeerTokenRouteLayer,
+        registerPeerPingTool.pipe(Layer.provideMerge(authenticatedTestMcpTransportLayer)),
+        McpHttpServer.McpGetMethodNotAllowedLive,
+      ).pipe(Layer.provide(McpSessionRegistry.layer));
+      yield* HttpRouter.serve(serverLayer, {
+        disableListenLog: true,
+        disableLogger: true,
+      }).pipe(
+        Layer.provide(Layer.succeed(EnvironmentAuth.EnvironmentAuth, fakeEnvironmentAuth)),
+        Layer.provide(Layer.succeed(ServerEnvironment.ServerEnvironment, fakeEnvironment)),
+        Layer.provide(NodeServices.layer),
+        Layer.build,
+      );
+
+      const httpClient = yield* HttpClient.HttpClient;
+      lastAuthenticatedHttpRequestAuthorization = undefined;
+      const tokenResponse = yield* httpClient.post(SUBAGENT_PEER_MCP_TOKEN_PATH, {
+        headers: { authorization: "Bearer env-access-token" },
+      });
+
+      assert.equal(tokenResponse.status, 400);
+      assert.equal(lastAuthenticatedHttpRequestAuthorization, undefined);
+      const body = yield* tokenResponse.json;
+      assert.deepEqual(body, {
+        error: "invalid_request",
+        message: "sourceEnvironmentId is required when minting a subagent peer token.",
+      });
     }),
   ).pipe(Effect.provide(NodeHttpServer.layerTest)),
 );

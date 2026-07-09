@@ -58,6 +58,7 @@ import Migration0043 from "./Migrations/043_SubagentWaitDeliveries.ts";
 import Migration0044 from "./Migrations/044_SubagentWaitDeliveriesParentTurn.ts";
 import Migration0045 from "./Migrations/045_SubagentPromotedChildren.ts";
 import Migration0046 from "./Migrations/046_RemoteSubagentChildren.ts";
+import Migration0047 from "./Migrations/047_RemoteChildTerminalDeliveryClaims.ts";
 
 /**
  * Migration loader with all migrations defined inline.
@@ -115,6 +116,7 @@ export const migrationEntries = [
   [44, "SubagentWaitDeliveriesParentTurn", Migration0044],
   [45, "SubagentPromotedChildren", Migration0045],
   [46, "RemoteSubagentChildren", Migration0046],
+  [47, "RemoteChildTerminalDeliveryClaims", Migration0047],
 ] as const;
 
 export const makeMigrationLoader = (throughId?: number) =>

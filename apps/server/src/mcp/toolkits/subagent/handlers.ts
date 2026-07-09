@@ -110,6 +110,7 @@ const PEER_SPAWN_PROBE_TIMEOUT = Duration.seconds(5);
 const PEER_TOOL_CALL_TIMEOUT_SECONDS = 5;
 const PEER_TOOL_CALL_TIMEOUT = Duration.seconds(PEER_TOOL_CALL_TIMEOUT_SECONDS);
 const PEER_SESSION_CLOSE_TIMEOUT = Duration.seconds(2);
+const REMOTE_TERMINAL_DELIVERY_CLAIM_TTL_MS = 5 * 60 * 1_000;
 const FOREGROUND_SPAWN_PENDING_WARNING =
   "Sub-agent is still running after the initial foreground wait; returning launch metadata now. Use t3_wait_subagent to wait for terminal delivery, or stop polling and let the parent wake automatically when it completes.";
 
@@ -740,13 +741,12 @@ const remoteChildrenByIdForParent = (
     }),
   );
 
-const enqueueRemoteCompletion = (
+const deliverRemoteCompletion = (
   runtime: SubagentRuntime,
   child: RemoteChild,
   check: CheckSubagentOutputType,
 ) =>
   Effect.gen(function* () {
-    if (isRemoteTerminalStatus(child.status)) return;
     if (!isRemoteTerminalStatus(check.status)) return;
     const terminalStatus = childTerminalStatusFromRemoteStatus(check.status);
     const error =
@@ -760,6 +760,32 @@ const enqueueRemoteCompletion = (
       error,
     });
   });
+
+const releaseRemoteCompletionClaim = (
+  runtime: SubagentRuntime,
+  input: {
+    readonly child: RemoteChild;
+    readonly claimId: string;
+    readonly updatedAt: IsoDateTime;
+  },
+) =>
+  runtime.remoteChildren
+    .releaseTerminalDeliveryClaim({
+      parentThreadId: input.child.parentThreadId,
+      childEnvironmentId: input.child.childEnvironmentId,
+      childThreadId: input.child.childThreadId,
+      claimId: input.claimId,
+      updatedAt: input.updatedAt,
+    })
+    .pipe(
+      Effect.catch((error) =>
+        Effect.logWarning("failed to release remote terminal delivery claim", {
+          childThreadId: input.child.childThreadId,
+          childEnvironmentId: input.child.childEnvironmentId,
+          cause: error.message,
+        }),
+      ),
+    );
 
 const pollRemoteChild = Effect.fn("SubagentToolkit.pollRemoteChild")(function* (
   runtime: SubagentRuntime,
@@ -775,21 +801,90 @@ const pollRemoteChild = Effect.fn("SubagentToolkit.pollRemoteChild")(function* (
       `Remote peer returned check result for ${check.threadId}, expected ${child.childThreadId}.`,
     );
   }
-  const updatedAt = yield* nowIso;
+  const now = yield* DateTime.now;
+  const updatedAt = DateTime.formatIso(now);
+  const claimStaleBefore = DateTime.formatIso(
+    DateTime.makeUnsafe(now.epochMilliseconds - REMOTE_TERMINAL_DELIVERY_CLAIM_TTL_MS),
+  );
   const nextStatus = remoteChildStatusFromToolStatus(check.status);
-  yield* enqueueRemoteCompletion(runtime, child, check);
+  const update = {
+    parentThreadId: child.parentThreadId,
+    childEnvironmentId: child.childEnvironmentId,
+    childThreadId: child.childThreadId,
+    status: nextStatus,
+    lastPolledAt: IsoDateTime.make(updatedAt),
+    updatedAt: IsoDateTime.make(updatedAt),
+  } as const;
+  if (isRemoteTerminalStatus(nextStatus)) {
+    if (!isRemoteTerminalStatus(child.status)) {
+      const claimId = yield* runtime.crypto.randomUUIDv4.pipe(Effect.orDie);
+      const claimed = yield* runtime.remoteChildren
+        .claimTerminalDelivery({
+          parentThreadId: child.parentThreadId,
+          childEnvironmentId: child.childEnvironmentId,
+          childThreadId: child.childThreadId,
+          claimId,
+          claimedAt: IsoDateTime.make(updatedAt),
+          claimStaleBefore: IsoDateTime.make(claimStaleBefore),
+          lastPolledAt: IsoDateTime.make(updatedAt),
+          updatedAt: IsoDateTime.make(updatedAt),
+        })
+        .pipe(
+          Effect.mapError((error) =>
+            toToolError(error, "Failed to claim remote child completion delivery."),
+          ),
+        );
+      if (Option.isSome(claimed)) {
+        yield* Effect.uninterruptible(
+          deliverRemoteCompletion(runtime, child, check).pipe(
+            Effect.catch((error) =>
+              releaseRemoteCompletionClaim(runtime, {
+                child,
+                claimId,
+                updatedAt: IsoDateTime.make(updatedAt),
+              }).pipe(Effect.andThen(Effect.fail(error))),
+            ),
+            Effect.andThen(
+              runtime.remoteChildren.markTerminalStatus({ ...update, claimId }).pipe(
+                Effect.mapError((error) => toToolError(error, "Failed to update remote child.")),
+                Effect.flatMap((marked) =>
+                  Option.isSome(marked)
+                    ? Effect.void
+                    : Effect.fail(
+                        fail("Remote child completion claim was lost before status update."),
+                      ),
+                ),
+              ),
+            ),
+          ),
+        );
+      }
+    }
+    return check;
+  }
   yield* runtime.remoteChildren
-    .updateStatus({
-      parentThreadId: child.parentThreadId,
-      childEnvironmentId: child.childEnvironmentId,
-      childThreadId: child.childThreadId,
-      status: nextStatus,
-      lastPolledAt: IsoDateTime.make(updatedAt),
-      updatedAt: IsoDateTime.make(updatedAt),
-    })
+    .updateStatus(update)
     .pipe(Effect.mapError((error) => toToolError(error, "Failed to update remote child.")));
   return check;
 });
+
+const callRemoteSpawnTool = (
+  runtime: SubagentRuntime,
+  peer: SubagentPeerRegistry.SubagentPeer,
+  session: McpPeerClient.McpPeerClientSession,
+  arguments_: SpawnSubagentInput,
+) =>
+  Effect.gen(function* () {
+    yield* runtime.peerRegistry
+      .updateLastSeen(peer.alias)
+      .pipe(Effect.mapError((error) => fail(error.message)));
+    return yield* session
+      .callTool({
+        name: "t3_spawn_subagent",
+        arguments: arguments_,
+      })
+      .pipe(Effect.mapError((error) => fail(error.message)));
+  }).pipe(Effect.ensuring(closePeerSession(session, peer)));
 
 const remoteWaitRow = (input: {
   readonly child: RemoteChild;
@@ -945,16 +1040,7 @@ const spawnSubagent = Effect.fn("SubagentToolkit.spawn")(function* (input: Spawn
       remoteParentEnvironmentId: invocation.environmentId,
     } satisfies SpawnSubagentInput;
     const session = yield* connectPeerWithTimeout(runtime, peer, `Remote peer '${peer.alias}'`);
-    const callResult = yield* Effect.gen(function* () {
-      yield* runtime.peerRegistry.updateLastSeen(peer.alias);
-      return yield* session.callTool({
-        name: "t3_spawn_subagent",
-        arguments: remoteArguments,
-      });
-    }).pipe(
-      Effect.mapError((error) => fail(error.message)),
-      Effect.ensuring(closePeerSession(session, peer)),
-    );
+    const callResult = yield* callRemoteSpawnTool(runtime, peer, session, remoteArguments);
     const started = yield* decodeRemoteSpawnResult(callResult);
     const createdAt = yield* nowIso;
     yield* runtime.remoteChildren

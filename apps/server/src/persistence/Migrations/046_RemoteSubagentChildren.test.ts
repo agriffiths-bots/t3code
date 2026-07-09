@@ -13,7 +13,7 @@ layer("046_RemoteSubagentChildren", (it) => {
     Effect.gen(function* () {
       const sql = yield* SqlClient.SqlClient;
 
-      yield* runMigrations({ toMigrationInclusive: 46 });
+      yield* runMigrations({ toMigrationInclusive: 47 });
 
       const projectionColumns = yield* sql<{ readonly name: string }>`
         PRAGMA table_info(projection_threads)
@@ -34,6 +34,8 @@ layer("046_RemoteSubagentChildren", (it) => {
         "spawn_params_json",
         "status",
         "last_polled_at",
+        "terminal_delivery_claim_id",
+        "terminal_delivery_claimed_at",
       ]) {
         assert.isTrue(
           remoteColumns.some((column) => column.name === name),

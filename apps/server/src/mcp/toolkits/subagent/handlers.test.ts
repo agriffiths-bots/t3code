@@ -275,6 +275,10 @@ const dispatchedTurnCommands: Array<Extract<OrchestrationCommand, { type: "threa
 const insertedDispatches: Array<PendingDispatch> = [];
 const insertedRemoteChildren: Array<RemoteChild> = [];
 let remoteChildRows: ReadonlyArray<RemoteChild> = [];
+const remoteTerminalDeliveryEvents: Array<"claim" | "enqueue" | "mark" | "release"> = [];
+const remoteTerminalDeliveryClaims = new Map<string, string>();
+let remoteTerminalDeliveryEntered: Deferred.Deferred<void> | null = null;
+let remoteTerminalDeliveryGate: Deferred.Deferred<void> | null = null;
 const updatedRemoteChildren: Array<{
   readonly parentThreadId: ThreadId;
   readonly childEnvironmentId: EnvironmentId;
@@ -323,6 +327,12 @@ const remoteChildRow = (status: RemoteChild["status"] = "running"): RemoteChild 
   createdAt: IsoDateTime.make("2026-07-08T09:02:00.000Z"),
   updatedAt: IsoDateTime.make("2026-07-08T09:02:00.000Z"),
 });
+
+const remoteChildKey = (input: {
+  readonly parentThreadId: ThreadId;
+  readonly childEnvironmentId: EnvironmentId;
+  readonly childThreadId: ThreadId;
+}) => `${input.parentThreadId}:${input.childEnvironmentId}:${input.childThreadId}`;
 
 const jsonRpcResponse = (id: number, result: unknown) => ({
   jsonrpc: "2.0",
@@ -585,7 +595,13 @@ const coordinatorLayer = Layer.succeed(ChildThreadCoordinator, {
   abandonWaitDelivery: (ids) => Effect.sync(() => void abandonWaitDeliveryCalls.push(ids)),
   hasPendingInjections: () => Effect.succeed(false),
   enqueueParentInjection: (input) =>
-    Effect.sync(() => {
+    Effect.gen(function* () {
+      if (remoteTerminalDeliveryEntered !== null) {
+        yield* Deferred.succeed(remoteTerminalDeliveryEntered, void 0);
+      }
+      if (remoteTerminalDeliveryGate !== null) {
+        yield* Deferred.await(remoteTerminalDeliveryGate);
+      }
       if (
         enqueuedParentInjections.some(
           (row) =>
@@ -595,6 +611,7 @@ const coordinatorLayer = Layer.succeed(ChildThreadCoordinator, {
       ) {
         return;
       }
+      remoteTerminalDeliveryEvents.push("enqueue");
       enqueuedParentInjections.push(input);
     }),
   listChildren: (parent) =>
@@ -664,6 +681,72 @@ const remoteChildrenLayer = Layer.succeed(RemoteChildRepository, {
   updateStatus: (input) =>
     Effect.sync(() => {
       updatedRemoteChildren.push(input);
+    }),
+  claimTerminalDelivery: (input) =>
+    Effect.sync(() => {
+      const index = remoteChildRows.findIndex(
+        (row) =>
+          row.parentThreadId === input.parentThreadId &&
+          row.childEnvironmentId === input.childEnvironmentId &&
+          row.childThreadId === input.childThreadId,
+      );
+      if (index < 0) return Option.none();
+      const current = remoteChildRows[index]!;
+      if (
+        current.status === "completed" ||
+        current.status === "failed" ||
+        current.status === "interrupted" ||
+        current.status === "killed"
+      ) {
+        return Option.none();
+      }
+      const key = remoteChildKey(input);
+      if (remoteTerminalDeliveryClaims.has(key)) return Option.none();
+      remoteTerminalDeliveryEvents.push("claim");
+      remoteTerminalDeliveryClaims.set(key, input.claimId);
+      return Option.some(current);
+    }),
+  releaseTerminalDeliveryClaim: (input) =>
+    Effect.sync(() => {
+      const key = remoteChildKey(input);
+      if (remoteTerminalDeliveryClaims.get(key) === input.claimId) {
+        remoteTerminalDeliveryEvents.push("release");
+        remoteTerminalDeliveryClaims.delete(key);
+      }
+    }),
+  markTerminalStatus: (input) =>
+    Effect.sync(() => {
+      const index = remoteChildRows.findIndex(
+        (row) =>
+          row.parentThreadId === input.parentThreadId &&
+          row.childEnvironmentId === input.childEnvironmentId &&
+          row.childThreadId === input.childThreadId,
+      );
+      if (index < 0) return Option.none();
+      const current = remoteChildRows[index]!;
+      if (
+        current.status === "completed" ||
+        current.status === "failed" ||
+        current.status === "interrupted" ||
+        current.status === "killed"
+      ) {
+        return Option.none();
+      }
+      const key = remoteChildKey(input);
+      if (remoteTerminalDeliveryClaims.get(key) !== input.claimId) return Option.none();
+      remoteTerminalDeliveryEvents.push("mark");
+      updatedRemoteChildren.push(input);
+      remoteTerminalDeliveryClaims.delete(key);
+      const updated = {
+        ...current,
+        status: input.status,
+        lastPolledAt: input.lastPolledAt ?? null,
+        updatedAt: input.updatedAt,
+      };
+      remoteChildRows = remoteChildRows.map((row, rowIndex) =>
+        rowIndex === index ? updated : row,
+      );
+      return Option.some(updated);
     }),
 });
 
@@ -1031,7 +1114,7 @@ describe("SubagentToolkit", () => {
     ),
   );
 
-  it.effect("does not timeout a side-effecting remote spawn tools call", () =>
+  it.effect("does not locally timeout a side-effecting remote spawn tools call", () =>
     Effect.scoped(
       Effect.gen(function* () {
         const server = yield* McpServer.McpServer;
@@ -1084,7 +1167,7 @@ describe("SubagentToolkit", () => {
               }
               if (body.method === "tools/call") {
                 yield* Deferred.succeed(toolCallStarted, void 0);
-                yield* TestClock.adjust(Duration.seconds(6));
+                yield* Effect.sleep(Duration.seconds(6));
                 return HttpClientResponse.fromWeb(
                   request,
                   Response.json(
@@ -1132,6 +1215,7 @@ describe("SubagentToolkit", () => {
             Effect.forkScoped,
           );
         yield* Deferred.await(toolCallStarted);
+        yield* TestClock.adjust(Duration.seconds(6));
         const result = yield* Fiber.join(fiber);
 
         expect(result.isError).toBe(false);
@@ -1324,7 +1408,7 @@ describe("SubagentToolkit", () => {
     ),
   );
 
-  it.effect("checks a remote child through its recorded peer and enqueues terminal wake", () =>
+  it.effect("checks a remote child through its recorded peer and enqueues terminal wake once", () =>
     Effect.scoped(
       Effect.gen(function* () {
         const server = yield* McpServer.McpServer;
@@ -1333,6 +1417,8 @@ describe("SubagentToolkit", () => {
         peerHttpRequests.length = 0;
         updatedRemoteChildren.length = 0;
         enqueuedParentInjections.length = 0;
+        remoteTerminalDeliveryEvents.length = 0;
+        remoteTerminalDeliveryClaims.clear();
         peerHttpHandler = remoteCheckPeerHandler({
           status: "completed",
           turnCount: 3,
@@ -1375,9 +1461,25 @@ describe("SubagentToolkit", () => {
             }),
           ]),
         );
+        expect(remoteTerminalDeliveryEvents).toEqual(["claim", "enqueue", "mark"]);
         expect(peerHttpRequests).toEqual(
           expect.arrayContaining([{ method: "DELETE", url: "https://peer.example/mcp" }]),
         );
+
+        const duplicate = yield* server
+          .callTool({
+            name: "t3_check_subagent",
+            arguments: { childThreadId: remoteChildThreadId },
+          })
+          .pipe(
+            Effect.provideService(McpInvocationContext.McpInvocationContext, invocation),
+            Effect.provideService(McpSchema.McpServerClient, client),
+          );
+
+        expect(duplicate.isError).toBe(false);
+        expect(enqueuedParentInjections).toHaveLength(1);
+        expect(updatedRemoteChildren).toHaveLength(1);
+        expect(remoteTerminalDeliveryEvents).toEqual(["claim", "enqueue", "mark"]);
       }),
     ).pipe(
       Effect.ensuring(
@@ -1387,6 +1489,87 @@ describe("SubagentToolkit", () => {
           peerHttpRequests.length = 0;
           updatedRemoteChildren.length = 0;
           enqueuedParentInjections.length = 0;
+          remoteTerminalDeliveryEvents.length = 0;
+          remoteTerminalDeliveryClaims.clear();
+          peerHttpHandler = null;
+        }),
+      ),
+      Effect.provide(TestLayer),
+    ),
+  );
+
+  it.effect("does not duplicate a remote terminal wake while another poller holds the claim", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const server = yield* McpServer.McpServer;
+        const deliveryEntered = yield* Deferred.make<void>();
+        const releaseDelivery = yield* Deferred.make<void>();
+        peerRegistryPeers = [bearerPeer()];
+        remoteChildRows = [remoteChildRow("running")];
+        peerHttpRequests.length = 0;
+        updatedRemoteChildren.length = 0;
+        enqueuedParentInjections.length = 0;
+        remoteTerminalDeliveryEvents.length = 0;
+        remoteTerminalDeliveryClaims.clear();
+        remoteTerminalDeliveryEntered = deliveryEntered;
+        remoteTerminalDeliveryGate = releaseDelivery;
+        peerHttpHandler = remoteCheckPeerHandler({
+          status: "completed",
+          turnCount: 3,
+          latestAssistantText: "remote done",
+        });
+
+        const first = yield* server
+          .callTool({
+            name: "t3_check_subagent",
+            arguments: { childThreadId: remoteChildThreadId },
+          })
+          .pipe(
+            Effect.provideService(McpInvocationContext.McpInvocationContext, invocation),
+            Effect.provideService(McpSchema.McpServerClient, client),
+            Effect.forkScoped,
+          );
+        yield* Deferred.await(deliveryEntered);
+
+        expect(remoteTerminalDeliveryEvents).toEqual(["claim"]);
+        expect(enqueuedParentInjections).toHaveLength(0);
+        expect(updatedRemoteChildren).toHaveLength(0);
+
+        const second = yield* server
+          .callTool({
+            name: "t3_check_subagent",
+            arguments: { childThreadId: remoteChildThreadId },
+          })
+          .pipe(
+            Effect.provideService(McpInvocationContext.McpInvocationContext, invocation),
+            Effect.provideService(McpSchema.McpServerClient, client),
+          );
+
+        expect(second.isError).toBe(false);
+        expect(remoteTerminalDeliveryEvents).toEqual(["claim"]);
+        expect(enqueuedParentInjections).toHaveLength(0);
+        expect(updatedRemoteChildren).toHaveLength(0);
+
+        yield* Deferred.succeed(releaseDelivery, void 0);
+        const firstResult = yield* Fiber.join(first);
+
+        expect(firstResult.isError).toBe(false);
+        expect(enqueuedParentInjections).toHaveLength(1);
+        expect(updatedRemoteChildren).toHaveLength(1);
+        expect(remoteTerminalDeliveryEvents).toEqual(["claim", "enqueue", "mark"]);
+      }),
+    ).pipe(
+      Effect.ensuring(
+        Effect.sync(() => {
+          peerRegistryPeers = [];
+          remoteChildRows = [];
+          peerHttpRequests.length = 0;
+          updatedRemoteChildren.length = 0;
+          enqueuedParentInjections.length = 0;
+          remoteTerminalDeliveryEvents.length = 0;
+          remoteTerminalDeliveryClaims.clear();
+          remoteTerminalDeliveryEntered = null;
+          remoteTerminalDeliveryGate = null;
           peerHttpHandler = null;
         }),
       ),
