@@ -1009,15 +1009,28 @@ export function makeCursorAdapter(
           threadId: input.threadId,
           payload: { resume: started.initializeResult },
         });
+        const sessionStatePayload =
+          input.activeTurnId !== undefined
+            ? {
+                state: "running" as const,
+                reason: "Cursor ACP session resumed with active turn",
+              }
+            : {
+                state: "ready" as const,
+                reason: "Cursor ACP session ready",
+              };
         yield* offerRuntimeEvent({
           type: "session.state.changed",
           ...(yield* makeEventStamp()),
           provider: PROVIDER,
           threadId: input.threadId,
           payload:
-            input.activeTurnId !== undefined
-              ? { state: "running", reason: "Cursor ACP session resumed with active turn" }
-              : { state: "ready", reason: "Cursor ACP session ready" },
+            internalOptions?.replaceExistingAfterStart === true
+              ? {
+                  ...sessionStatePayload,
+                  detail: { resumeCursor: session.resumeCursor },
+                }
+              : sessionStatePayload,
         });
         yield* offerRuntimeEvent({
           type: "thread.started",
@@ -1233,8 +1246,9 @@ export function makeCursorAdapter(
           // Only the last remaining prompt settles the turn — a steer-
           // superseded prompt resolving (usually cancelled) while another is
           // in flight or pending must leave the merged turn running.
-          const cancelledResult = result.stopReason === "cancelled";
-          if (ctx.locallyCancelledPromptsInFlight > 0) {
+          const locallyCancelledPrompt = ctx.locallyCancelledPromptsInFlight > 0;
+          const cancelledResult = result.stopReason === "cancelled" || locallyCancelledPrompt;
+          if (locallyCancelledPrompt) {
             yield* drainEventsOrSessionEnd(ctx);
             ctx.locallyCancelledPromptsInFlight = Math.max(
               0,
@@ -1275,8 +1289,8 @@ export function makeCursorAdapter(
               threadId: input.threadId,
               turnId,
               payload: {
-                state: result.stopReason === "cancelled" ? "cancelled" : "completed",
-                stopReason: result.stopReason ?? null,
+                state: cancelledResult ? "cancelled" : "completed",
+                stopReason: cancelledResult ? "cancelled" : (result.stopReason ?? null),
               },
             });
             ctx.activeTurnId = undefined;
@@ -1337,6 +1351,13 @@ export function makeCursorAdapter(
           ctx.promptsInFlight === 0 && ctx.activeTurnId !== undefined
             ? ctx.activeTurnId
             : undefined;
+        const hasPendingInteraction =
+          ctx.pendingApprovals.size > 0 || ctx.pendingUserInputs.size > 0;
+        const hasActiveWorkToCancel =
+          ctx.promptsInFlight > 0 || resumedTurnToCancel !== undefined || hasPendingInteraction;
+        if (!hasActiveWorkToCancel) {
+          return;
+        }
         ctx.dropAcpUpdatesAfterLocalCancel = true;
         if (ctx.notificationTurnId !== undefined) {
           ctx.suppressedNotificationTurnIds.add(String(ctx.notificationTurnId));
@@ -1350,8 +1371,6 @@ export function makeCursorAdapter(
         ctx.restartBeforeNextPrompt = true;
         ctx.localCancelRequestsInFlight += 1;
         const promptsToSuppress = ctx.promptsInFlight;
-        const hasPendingInteraction =
-          ctx.pendingApprovals.size > 0 || ctx.pendingUserInputs.size > 0;
         ctx.locallyCancelledPromptsInFlight = Math.max(
           ctx.locallyCancelledPromptsInFlight,
           promptsToSuppress,

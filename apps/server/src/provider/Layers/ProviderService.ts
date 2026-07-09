@@ -714,18 +714,26 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
       });
     });
 
-  const persistWaitingRuntimeState = (
+  const persistSessionStateRuntimeState = (
     source: {
       readonly instanceId: ProviderInstanceId;
       readonly provider: ProviderDriverKind;
+      readonly adapterGeneration: number;
     },
     event: ProviderRuntimeEvent,
   ) => {
-    if (event.type !== "session.state.changed" || event.payload.state !== "waiting") {
+    if (event.type !== "session.state.changed") {
+      return Effect.void;
+    }
+    const resumeCursor = readResumeCursorFromRuntimeDetail(event.payload.detail);
+    if (event.payload.state !== "waiting" && resumeCursor === undefined) {
       return Effect.void;
     }
 
     return Effect.gen(function* () {
+      if (!(yield* isCurrentAdapterGeneration(source.instanceId, source.adapterGeneration))) {
+        return;
+      }
       const binding = Option.getOrUndefined(
         yield* directory
           .getBinding(event.threadId)
@@ -735,14 +743,19 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
             ),
           ),
       );
+      if (
+        binding !== undefined &&
+        (binding.provider !== source.provider || binding.providerInstanceId !== source.instanceId)
+      ) {
+        return;
+      }
       const previousPayload = readRecord(binding?.runtimePayload) ?? {};
-      const resumeCursor = readResumeCursorFromRuntimeDetail(event.payload.detail);
       yield* directory.upsert({
         threadId: event.threadId,
         provider: source.provider,
         providerInstanceId: source.instanceId,
         runtimeMode: binding?.runtimeMode ?? "full-access",
-        status: "waiting",
+        status: event.payload.state === "waiting" ? "waiting" : (binding?.status ?? "running"),
         ...(resumeCursor !== undefined
           ? { resumeCursor }
           : binding?.resumeCursor !== undefined
@@ -750,7 +763,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
             : {}),
         runtimePayload: {
           ...previousPayload,
-          activeTurnId: event.turnId ?? null,
+          ...(event.payload.state === "waiting" ? { activeTurnId: event.turnId ?? null } : {}),
           lastRuntimeEvent: event.type,
           lastRuntimeEventAt: event.createdAt,
         },
@@ -986,9 +999,9 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
           const observedDuringPendingStart = isSessionEnd
             ? yield* hasPendingMcpSessionStart(canonicalEvent.threadId)
             : false;
-          yield* persistWaitingRuntimeState(source, canonicalEvent).pipe(
+          yield* persistSessionStateRuntimeState(source, canonicalEvent).pipe(
             Effect.catchCause((cause) =>
-              Effect.logWarning("provider.session.waiting-persist-failed", {
+              Effect.logWarning("provider.session.state-persist-failed", {
                 threadId: canonicalEvent.threadId,
                 provider: canonicalEvent.provider,
                 cause,

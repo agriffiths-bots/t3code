@@ -1870,6 +1870,208 @@ routing.layer("ProviderServiceLive routing", (it) => {
     }),
   );
 
+  it.effect("persists replacement resume cursor from session state before sendTurn returns", () =>
+    Effect.gen(function* () {
+      const provider = yield* ProviderService.ProviderService;
+      const runtimeRepository = yield* ProviderSessionRuntime.ProviderSessionRuntimeRepository;
+
+      const threadId = asThreadId("thread-replacement-resume-before-send");
+      const session = yield* provider.startSession(threadId, {
+        provider: CURSOR_DRIVER,
+        providerInstanceId: cursorInstanceId,
+        threadId,
+        runtimeMode: "full-access",
+      });
+      const replacementResumeCursor = {
+        schemaVersion: 1,
+        sessionId: "mock-replacement-cursor-session",
+      };
+
+      routing.cursor.emit({
+        type: "session.state.changed",
+        eventId: asEventId("evt-cursor-replacement-resume-ready"),
+        provider: CURSOR_DRIVER,
+        createdAt: "2026-01-01T00:00:01.000Z",
+        threadId,
+        payload: {
+          state: "ready",
+          detail: { resumeCursor: replacementResumeCursor },
+        },
+      });
+      yield* advanceTestClock(50);
+
+      yield* provider.sendTurn({
+        threadId: session.threadId,
+        input: "follow up on replacement Cursor session",
+        attachments: [],
+      });
+
+      const runtime = yield* runtimeRepository.getByThreadId({ threadId });
+      assert.equal(Option.isSome(runtime), true);
+      if (Option.isSome(runtime)) {
+        assert.deepEqual(runtime.value.resumeCursor, replacementResumeCursor);
+        const payload = runtime.value.runtimePayload;
+        assert.equal(payload !== null && typeof payload === "object", true);
+        if (payload !== null && typeof payload === "object" && !Array.isArray(payload)) {
+          const runtimePayload = payload as {
+            activeTurnId: string | null;
+            lastRuntimeEvent: string | null;
+          };
+          assert.equal(runtimePayload.activeTurnId, `turn-${String(threadId)}`);
+          assert.equal(runtimePayload.lastRuntimeEvent, "provider.sendTurn");
+        }
+      }
+    }),
+  );
+
+  it.effect("ignores replacement resume cursor state from a different provider binding", () =>
+    Effect.gen(function* () {
+      const provider = yield* ProviderService.ProviderService;
+      const runtimeRepository = yield* ProviderSessionRuntime.ProviderSessionRuntimeRepository;
+
+      const threadId = asThreadId("thread-ignore-other-provider-state-resume");
+      const session = yield* provider.startSession(threadId, {
+        provider: CODEX_DRIVER,
+        providerInstanceId: codexInstanceId,
+        threadId,
+        runtimeMode: "full-access",
+      });
+      const staleCursorResume = {
+        schemaVersion: 1,
+        sessionId: "stale-cursor-session",
+      };
+
+      routing.cursor.emit({
+        type: "session.state.changed",
+        eventId: asEventId("evt-stale-cursor-resume-ready"),
+        provider: CURSOR_DRIVER,
+        createdAt: "2026-01-01T00:00:01.000Z",
+        threadId,
+        payload: {
+          state: "ready",
+          detail: { resumeCursor: staleCursorResume },
+        },
+      });
+      yield* advanceTestClock(50);
+
+      const runtime = yield* runtimeRepository.getByThreadId({ threadId });
+      assert.equal(Option.isSome(runtime), true);
+      if (Option.isSome(runtime)) {
+        assert.equal(runtime.value.providerName, CODEX_DRIVER);
+        assert.equal(runtime.value.providerInstanceId, codexInstanceId);
+        assert.deepEqual(runtime.value.resumeCursor, session.resumeCursor);
+      }
+    }),
+  );
+
+  it.effect("ignores replacement resume cursor state from stale adapter generations", () =>
+    Effect.gen(function* () {
+      const firstCursor = makeFakeCodexAdapter(CURSOR_DRIVER);
+      const secondCursor = makeFakeCodexAdapter(CURSOR_DRIVER);
+      let currentAdapter = firstCursor.adapter;
+      const changes = yield* PubSub.unbounded<void>();
+      const registry: ProviderAdapterRegistry.ProviderAdapterRegistry["Service"] = {
+        getByInstance: (instanceId) =>
+          instanceId === cursorInstanceId
+            ? Effect.succeed(currentAdapter)
+            : Effect.fail(
+                new ProviderUnsupportedError({
+                  provider: ProviderDriverKind.make(instanceId),
+                }),
+              ),
+        getInstanceInfo: (instanceId) =>
+          Effect.succeed({
+            instanceId,
+            driverKind: CURSOR_DRIVER,
+            displayName: undefined,
+            enabled: true,
+            continuationIdentity: {
+              driverKind: CURSOR_DRIVER,
+              continuationKey: `cursor:instance:${instanceId}`,
+            },
+          }),
+        listInstances: () => Effect.succeed([cursorInstanceId]),
+        listProviders: () => Effect.succeed([CURSOR_DRIVER]),
+        streamChanges: Stream.fromPubSub(changes),
+        subscribeChanges: PubSub.subscribe(changes),
+      };
+      const runtimeRepositoryLayer = ProviderSessionRuntime.layer.pipe(
+        Layer.provide(SqlitePersistenceMemory),
+      );
+      const directoryLayer = ProviderSessionDirectoryLive.pipe(
+        Layer.provide(runtimeRepositoryLayer),
+      );
+      const providerLayer = makeProviderServiceLive().pipe(
+        Layer.provide(Layer.succeed(ProviderAdapterRegistry.ProviderAdapterRegistry, registry)),
+        Layer.provide(directoryLayer),
+        Layer.provide(defaultServerSettingsLayer),
+        Layer.provide(AnalyticsService.layerTest),
+        Layer.provide(
+          Layer.succeed(
+            ProviderEventLoggers.ProviderEventLoggers,
+            ProviderEventLoggers.NoOpProviderEventLoggers,
+          ),
+        ),
+      );
+
+      yield* Effect.gen(function* () {
+        const provider = yield* ProviderService.ProviderService;
+        const runtimeRepository = yield* ProviderSessionRuntime.ProviderSessionRuntimeRepository;
+        const threadId = asThreadId("thread-ignore-stale-generation-state-resume");
+        yield* provider.startSession(threadId, {
+          provider: CURSOR_DRIVER,
+          providerInstanceId: cursorInstanceId,
+          threadId,
+          runtimeMode: "full-access",
+        });
+
+        currentAdapter = secondCursor.adapter;
+        yield* PubSub.publish(changes, undefined);
+        yield* advanceTestClock(50);
+
+        const currentResumeCursor = {
+          schemaVersion: 1,
+          sessionId: "current-cursor-session",
+        };
+        secondCursor.emit({
+          type: "session.state.changed",
+          eventId: asEventId("evt-current-cursor-resume-ready"),
+          provider: CURSOR_DRIVER,
+          createdAt: "2026-01-01T00:00:01.000Z",
+          threadId,
+          payload: {
+            state: "ready",
+            detail: { resumeCursor: currentResumeCursor },
+          },
+        });
+        yield* advanceTestClock(50);
+
+        const staleResumeCursor = {
+          schemaVersion: 1,
+          sessionId: "stale-cursor-session",
+        };
+        firstCursor.emit({
+          type: "session.state.changed",
+          eventId: asEventId("evt-stale-generation-cursor-resume-ready"),
+          provider: CURSOR_DRIVER,
+          createdAt: "2026-01-01T00:00:02.000Z",
+          threadId,
+          payload: {
+            state: "ready",
+            detail: { resumeCursor: staleResumeCursor },
+          },
+        });
+        yield* advanceTestClock(50);
+
+        const runtime = yield* runtimeRepository.getByThreadId({ threadId });
+        assert.equal(Option.isSome(runtime), true);
+        if (Option.isSome(runtime)) {
+          assert.deepEqual(runtime.value.resumeCursor, currentResumeCursor);
+        }
+      }).pipe(Effect.provide(Layer.mergeAll(providerLayer, runtimeRepositoryLayer)));
+    }),
+  );
+
   it.effect("reuses persisted resume cursor and active turn when startSession restarts", () =>
     Effect.gen(function* () {
       const tempDir = NodeFS.mkdtempSync(

@@ -28,6 +28,11 @@ const emitLateUpdateAfterCancel = process.env.T3_ACP_EMIT_LATE_UPDATE_AFTER_CANC
 const exitAfterPromptReturn = process.env.T3_ACP_EXIT_AFTER_PROMPT_RETURN === "1";
 const emitDetachedLateUpdateAfterCancel =
   process.env.T3_ACP_EMIT_DETACHED_LATE_UPDATE_AFTER_CANCEL === "1";
+const emitDetachedLateUpdateAfterPromptReturn =
+  process.env.T3_ACP_EMIT_DETACHED_LATE_UPDATE_AFTER_PROMPT_RETURN === "1";
+const detachedLateUpdateAfterPromptReturnDelayMs = Number(
+  process.env.T3_ACP_DETACHED_LATE_UPDATE_AFTER_PROMPT_RETURN_DELAY_MS ?? "200",
+);
 const emitLateCursorExtensionAfterCancel =
   process.env.T3_ACP_EMIT_LATE_CURSOR_EXTENSION_AFTER_CANCEL === "1";
 const omitXAiPromptCompleteStopReason =
@@ -1074,6 +1079,22 @@ const program = Effect.gen(function* () {
           content: { type: "text", text: promptResponseText ?? "hello from mock" },
         },
       });
+
+      if (emitDetachedLateUpdateAfterPromptReturn) {
+        yield* Effect.forkIn(
+          Effect.gen(function* () {
+            yield* Effect.sleep(`${detachedLateUpdateAfterPromptReturnDelayMs} millis`);
+            writeJsonRpcNotification("session/update", {
+              sessionId: requestedSessionId,
+              update: {
+                sessionUpdate: "agent_message_chunk",
+                content: { type: "text", text: "detached late after completion" },
+              },
+            });
+          }),
+          programScope,
+        );
+      }
 
       return { stopReason: "end_turn" };
     }),

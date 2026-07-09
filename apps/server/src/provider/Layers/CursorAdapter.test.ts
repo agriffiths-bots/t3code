@@ -1645,6 +1645,65 @@ cursorAdapterTestLayer("CursorAdapterLive", (it) => {
     }).pipe(TestClock.withLive),
   );
 
+  it.effect("keeps late completed-turn notifications when an idle interrupt arrives", () =>
+    Effect.gen(function* () {
+      const adapter = yield* CursorAdapter;
+      const serverSettings = yield* ServerSettingsService;
+      const threadId = ThreadId.make("cursor-idle-interrupt-keeps-late-completed-output");
+      const wrapperPath = yield* Effect.promise(() =>
+        makeMockAgentWrapper({
+          T3_ACP_EMIT_DETACHED_LATE_UPDATE_AFTER_PROMPT_RETURN: "1",
+          T3_ACP_DETACHED_LATE_UPDATE_AFTER_PROMPT_RETURN_DELAY_MS: "150",
+        }),
+      );
+      yield* serverSettings.updateSettings({ providers: { cursor: { binaryPath: wrapperPath } } });
+
+      const turnCompleted =
+        yield* Deferred.make<Extract<ProviderRuntimeEvent, { type: "turn.completed" }>>();
+      const lateDelta =
+        yield* Deferred.make<Extract<ProviderRuntimeEvent, { type: "content.delta" }>>();
+      const runtimeEventsFiber = yield* Stream.runForEach(adapter.streamEvents, (event) =>
+        Effect.gen(function* () {
+          if (String(event.threadId) !== String(threadId)) {
+            return;
+          }
+          if (event.type === "turn.completed") {
+            yield* Deferred.succeed(turnCompleted, event).pipe(Effect.ignore);
+            return;
+          }
+          if (
+            event.type === "content.delta" &&
+            event.payload.delta === "detached late after completion"
+          ) {
+            yield* Deferred.succeed(lateDelta, event).pipe(Effect.ignore);
+          }
+        }),
+      ).pipe(Effect.forkChild);
+
+      yield* adapter.startSession({
+        threadId,
+        provider: ProviderDriverKind.make("cursor"),
+        cwd: process.cwd(),
+        runtimeMode: "full-access",
+        modelSelection: { instanceId: ProviderInstanceId.make("cursor"), model: "default" },
+      });
+
+      const sendTurnFiber = yield* adapter
+        .sendTurn({ threadId, input: "complete before idle interrupt", attachments: [] })
+        .pipe(Effect.forkChild);
+      const completed = yield* Deferred.await(turnCompleted).pipe(Effect.timeout("2 seconds"));
+      yield* Fiber.join(sendTurnFiber).pipe(Effect.timeout("2 seconds"));
+      yield* adapter.interruptTurn(threadId).pipe(Effect.timeout("2 seconds"));
+      const delta = yield* Deferred.await(lateDelta).pipe(Effect.timeout("2 seconds"));
+
+      assert.equal(completed.payload.state, "completed");
+      assert.equal(delta.payload.delta, "detached late after completion");
+
+      yield* Fiber.interrupt(runtimeEventsFiber);
+      yield* adapter.stopSession(threadId);
+    }).pipe(TestClock.withLive),
+  );
+
   it.effect("keeps no-pending cancelled turns suppressing detached late ACP updates", () =>
     Effect.gen(function* () {
       const adapter = yield* CursorAdapter;
@@ -2023,18 +2082,28 @@ cursorAdapterTestLayer("CursorAdapterLive", (it) => {
       const serverSettings = yield* ServerSettingsService;
       const threadId = ThreadId.make("cursor-interrupt-pending-user-input");
       const userInputRequested = yield* Deferred.make<void>();
+      const turnCompleted =
+        yield* Deferred.make<Extract<ProviderRuntimeEvent, { type: "turn.completed" }>>();
 
       const wrapperPath = yield* Effect.promise(() =>
         makeMockAgentWrapper({ T3_ACP_EMIT_ASK_QUESTION: "1" }),
       );
       yield* serverSettings.updateSettings({ providers: { cursor: { binaryPath: wrapperPath } } });
 
-      yield* Stream.runForEach(adapter.streamEvents, (event) => {
-        if (String(event.threadId) !== String(threadId) || event.type !== "user-input.requested") {
-          return Effect.void;
-        }
-        return Deferred.succeed(userInputRequested, undefined).pipe(Effect.ignore);
-      }).pipe(Effect.forkChild);
+      yield* Stream.runForEach(adapter.streamEvents, (event) =>
+        Effect.gen(function* () {
+          if (String(event.threadId) !== String(threadId)) {
+            return;
+          }
+          if (event.type === "user-input.requested") {
+            yield* Deferred.succeed(userInputRequested, undefined).pipe(Effect.ignore);
+            return;
+          }
+          if (event.type === "turn.completed") {
+            yield* Deferred.succeed(turnCompleted, event).pipe(Effect.ignore);
+          }
+        }),
+      ).pipe(Effect.forkChild);
 
       yield* adapter.startSession({
         threadId,
@@ -2054,8 +2123,11 @@ cursorAdapterTestLayer("CursorAdapterLive", (it) => {
 
       yield* Deferred.await(userInputRequested);
       yield* adapter.interruptTurn(threadId);
+      const completed = yield* Deferred.await(turnCompleted).pipe(Effect.timeout("2 seconds"));
       yield* Fiber.await(sendTurnFiber);
 
+      assert.equal(completed.payload.state, "cancelled");
+      assert.equal(completed.payload.stopReason, "cancelled");
       assert.equal(yield* adapter.hasSession(threadId), true);
       yield* adapter.stopSession(threadId);
     }).pipe(TestClock.withLive),
