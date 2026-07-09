@@ -349,7 +349,8 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
           pending_user_input_count AS "pendingUserInputCount",
           has_actionable_proposed_plan AS "hasActionableProposedPlan",
           deleted_at AS "deletedAt",
-          parent_thread_id AS "parentThreadId"
+          parent_thread_id AS "parentThreadId",
+          parent_environment_id AS "parentEnvironmentId"
         FROM projection_threads
         ORDER BY created_at ASC, thread_id ASC
       `,
@@ -380,7 +381,8 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
           pending_user_input_count AS "pendingUserInputCount",
           has_actionable_proposed_plan AS "hasActionableProposedPlan",
           deleted_at AS "deletedAt",
-          parent_thread_id AS "parentThreadId"
+          parent_thread_id AS "parentThreadId",
+          parent_environment_id AS "parentEnvironmentId"
         FROM projection_threads
         WHERE deleted_at IS NULL
           AND archived_at IS NULL
@@ -413,7 +415,8 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
           pending_user_input_count AS "pendingUserInputCount",
           has_actionable_proposed_plan AS "hasActionableProposedPlan",
           deleted_at AS "deletedAt",
-          parent_thread_id AS "parentThreadId"
+          parent_thread_id AS "parentThreadId",
+          parent_environment_id AS "parentEnvironmentId"
         FROM projection_threads
         WHERE deleted_at IS NULL
           AND archived_at IS NOT NULL
@@ -714,7 +717,8 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
           pending_user_input_count AS "pendingUserInputCount",
           has_actionable_proposed_plan AS "hasActionableProposedPlan",
           deleted_at AS "deletedAt",
-          parent_thread_id AS "parentThreadId"
+          parent_thread_id AS "parentThreadId",
+          parent_environment_id AS "parentEnvironmentId"
         FROM projection_threads
         WHERE thread_id = ${threadId}
           AND deleted_at IS NULL
@@ -748,7 +752,8 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
           pending_user_input_count AS "pendingUserInputCount",
           has_actionable_proposed_plan AS "hasActionableProposedPlan",
           deleted_at AS "deletedAt",
-          parent_thread_id AS "parentThreadId"
+          parent_thread_id AS "parentThreadId",
+          parent_environment_id AS "parentEnvironmentId"
         FROM projection_threads
         WHERE thread_id = ${threadId}
           AND deleted_at IS NULL
@@ -1149,6 +1154,7 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
               archivedAt: row.archivedAt,
               deletedAt: row.deletedAt,
               parentThreadId: row.parentThreadId ?? null,
+              parentEnvironmentId: row.parentEnvironmentId ?? null,
               messages: [],
               proposedPlans: [],
               activities: [],
@@ -1350,6 +1356,7 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
                   archivedAt: row.archivedAt,
                   deletedAt: row.deletedAt,
                   parentThreadId: row.parentThreadId,
+                  parentEnvironmentId: row.parentEnvironmentId ?? null,
                   messages: [],
                   proposedPlans: proposedPlansByThread.get(row.threadId) ?? [],
                   activities: [],
@@ -1486,6 +1493,7 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
                       hasPendingUserInput: row.pendingUserInputCount > 0,
                       hasActionableProposedPlan: row.hasActionableProposedPlan > 0,
                       parentThreadId: row.parentThreadId,
+                      parentEnvironmentId: row.parentEnvironmentId ?? null,
                     } satisfies OrchestrationThreadShell)
                   : Result.failVoid,
               ),
@@ -1623,6 +1631,7 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
                   hasPendingUserInput: row.pendingUserInputCount > 0,
                   hasActionableProposedPlan: row.hasActionableProposedPlan > 0,
                   parentThreadId: row.parentThreadId,
+                  parentEnvironmentId: row.parentEnvironmentId ?? null,
                 }),
               ),
               updatedAt: updatedAt ?? "1970-01-01T00:00:00.000Z",
@@ -1884,6 +1893,7 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
         hasPendingUserInput: threadRow.value.pendingUserInputCount > 0,
         hasActionableProposedPlan: threadRow.value.hasActionableProposedPlan > 0,
         parentThreadId: threadRow.value.parentThreadId,
+        parentEnvironmentId: threadRow.value.parentEnvironmentId ?? null,
       } satisfies OrchestrationThreadShell);
     });
 
@@ -1976,6 +1986,7 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
         updatedAt: threadRow.value.updatedAt,
         archivedAt: threadRow.value.archivedAt,
         parentThreadId: threadRow.value.parentThreadId ?? null,
+        parentEnvironmentId: threadRow.value.parentEnvironmentId ?? null,
         deletedAt: null,
         messages: messageRows.map((row) => {
           const message = {

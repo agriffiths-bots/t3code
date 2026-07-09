@@ -14,12 +14,16 @@ import * as NodeServices from "@effect/platform-node/NodeServices";
 import * as Crypto from "effect/Crypto";
 import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
+import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
+import * as FileSystem from "effect/FileSystem";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as Stream from "effect/Stream";
 import * as Option from "effect/Option";
+import * as TestClock from "effect/testing/TestClock";
 import { McpSchema, McpServer } from "effect/unstable/ai";
+import { HttpClient, HttpClientRequest, HttpClientResponse } from "effect/unstable/http";
 import { describe, expect, it } from "@effect/vitest";
 
 import {
@@ -41,6 +45,10 @@ import {
   PendingDispatchRepository,
   type PendingDispatch,
 } from "../../../persistence/Services/PendingDispatches.ts";
+import {
+  RemoteChildRepository,
+  type RemoteChild,
+} from "../../../persistence/Services/RemoteChildren.ts";
 import { PersistenceSqlError } from "../../../persistence/Errors.ts";
 import {
   ScheduledTaskRepository,
@@ -51,6 +59,7 @@ import { ProviderInstanceRegistry } from "../../../provider/Services/ProviderIns
 import * as VcsDriverRegistry from "../../../vcs/VcsDriverRegistry.ts";
 import { SubagentToolkitRegistrationLive } from "../../McpHttpServer.ts";
 import * as McpInvocationContext from "../../McpInvocationContext.ts";
+import * as SubagentPeerRegistry from "../../../subagents/SubagentPeerRegistry.ts";
 import { ThreadStartRuntimeLive } from "../thread/handlers.ts";
 import { ThreadStartToolError } from "../thread/tools.ts";
 import * as SubagentDispatchLimiter from "./SubagentDispatchLimiter.ts";
@@ -81,6 +90,7 @@ const parentProject: OrchestrationProjectShell = {
   createdAt: "2026-06-17T09:00:00.000Z",
   updatedAt: "2026-06-17T09:00:00.000Z",
 };
+let activeProjectShell: OrchestrationProjectShell = parentProject;
 
 const invocation = {
   credentialKind: "provider-session" as const,
@@ -247,6 +257,13 @@ const promotedCalls: Array<ReadonlyArray<ThreadId>> = [];
 let promoteToWakeDefect: unknown | null = null;
 const markWaitDeliveredCalls: Array<ReadonlyArray<WaitDeliveredMark>> = [];
 const abandonWaitDeliveryCalls: Array<ReadonlyArray<ThreadId>> = [];
+const enqueuedParentInjections: Array<{
+  readonly parentThreadId: ThreadId;
+  readonly childThreadId: ThreadId;
+  readonly status: string;
+  readonly finalAssistantText: string | null;
+  readonly error: string | null;
+}> = [];
 const assertParentCalls: Array<{
   readonly parentThreadId: ThreadId;
   readonly childThreadId: ThreadId;
@@ -256,6 +273,21 @@ const dispatchedTurns: Array<ThreadId> = [];
 const dispatchedTurnCommands: Array<Extract<OrchestrationCommand, { type: "thread.turn.start" }>> =
   [];
 const insertedDispatches: Array<PendingDispatch> = [];
+const insertedRemoteChildren: Array<RemoteChild> = [];
+let remoteChildRows: ReadonlyArray<RemoteChild> = [];
+const updatedRemoteChildren: Array<{
+  readonly parentThreadId: ThreadId;
+  readonly childEnvironmentId: EnvironmentId;
+  readonly childThreadId: ThreadId;
+  readonly status: string;
+}> = [];
+let peerRegistryPeers: ReadonlyArray<SubagentPeerRegistry.SubagentPeer> = [];
+const peerHttpRequests: Array<{ readonly method: string; readonly url: string }> = [];
+let peerHttpHandler:
+  | ((
+      request: HttpClientRequest.HttpClientRequest,
+    ) => Effect.Effect<HttpClientResponse.HttpClientResponse>)
+  | null = null;
 // Fix 1 seams: the enabled provider instances (with their live model lists) the
 // schedule handlers resolve a plain `model` against, and the tasks they persist.
 let modelInstances: ReadonlyArray<unknown> = [];
@@ -264,6 +296,123 @@ const insertedTasks: Array<{ readonly modelSelection: ModelSelection | null }> =
 // updated rows it writes back — so a test can assert a model re-route / un-pin.
 let existingTasks: ReadonlyArray<ScheduledTask> = [];
 const updatedTasks: Array<ScheduledTask> = [];
+
+const peerEnvironmentId = EnvironmentId.make("environment-peer-b");
+const remoteChildThreadId = ThreadId.make("thread-remote-child");
+const remoteProjectId = ProjectId.make("project-remote-child");
+const bearerPeer = (): SubagentPeerRegistry.SubagentPeer => ({
+  alias: "peer-b",
+  environmentId: peerEnvironmentId,
+  httpBaseUrl: "https://peer.example/",
+  mcpEndpoint: "https://peer.example/mcp",
+  credential: new SubagentPeerRegistry.SubagentPeerBearerCredential({
+    token: "peer-token",
+  }),
+  pairedAt: "2026-07-08T09:00:00.000Z",
+  lastSeenAt: "2026-07-08T09:01:00.000Z",
+});
+
+const remoteChildRow = (status: RemoteChild["status"] = "running"): RemoteChild => ({
+  parentThreadId,
+  childEnvironmentId: peerEnvironmentId,
+  childThreadId: remoteChildThreadId,
+  alias: "peer-b",
+  spawnParams: { prompt: "remote", directory: "/remote/repo", detached: true },
+  status,
+  lastPolledAt: null,
+  createdAt: IsoDateTime.make("2026-07-08T09:02:00.000Z"),
+  updatedAt: IsoDateTime.make("2026-07-08T09:02:00.000Z"),
+});
+
+const jsonRpcResponse = (id: number, result: unknown) => ({
+  jsonrpc: "2.0",
+  id,
+  result,
+});
+
+type RemoteCheckFixture = {
+  readonly threadId?: ThreadId;
+  readonly status: string;
+  readonly turnCount: number;
+  readonly latestAssistantText: string | null;
+};
+
+const decodeHttpClientRequestJson = (request: HttpClientRequest.HttpClientRequest) => {
+  const rawBody = (request.body as { readonly body?: Uint8Array }).body;
+  if (rawBody === undefined) throw new Error("Expected request body.");
+  return JSON.parse(new TextDecoder().decode(rawBody)) as {
+    readonly id?: number;
+    readonly method: string;
+    readonly params?: { readonly arguments?: Record<string, unknown> };
+  };
+};
+
+const remoteCheckPeerHandlerWith =
+  (resolveCheck: (body: ReturnType<typeof decodeHttpClientRequestJson>) => RemoteCheckFixture) =>
+  (request: HttpClientRequest.HttpClientRequest) => {
+    if (request.url === "https://peer.example/mcp" && request.method === "DELETE") {
+      return Effect.succeed(
+        HttpClientResponse.fromWeb(request, new Response(null, { status: 204 })),
+      );
+    }
+    if (request.url === "https://peer.example/mcp" && request.method === "POST") {
+      return Effect.sync(() => {
+        const body = decodeHttpClientRequestJson(request);
+        if (body.method === "initialize") {
+          return HttpClientResponse.fromWeb(
+            request,
+            Response.json(
+              jsonRpcResponse(body.id ?? 1, {
+                protocolVersion: "2025-06-18",
+                capabilities: { tools: {} },
+                serverInfo: { name: "peer", version: "0.0.0-test" },
+              }),
+              {
+                headers: {
+                  "mcp-session-id": "session-remote-check",
+                  "mcp-protocol-version": "2025-06-18",
+                },
+              },
+            ),
+          );
+        }
+        if (body.method === "notifications/initialized") {
+          return HttpClientResponse.fromWeb(request, new Response(null, { status: 202 }));
+        }
+        if (body.method === "tools/call") {
+          const check = resolveCheck(body);
+          return HttpClientResponse.fromWeb(
+            request,
+            Response.json(
+              jsonRpcResponse(body.id ?? 2, {
+                content: [{ type: "text", text: "checked" }],
+                structuredContent: {
+                  threadId: check.threadId ?? remoteChildThreadId,
+                  status: check.status,
+                  turnCount: check.turnCount,
+                  latestAssistantText: check.latestAssistantText,
+                },
+                isError: false,
+              }),
+            ),
+          );
+        }
+        return HttpClientResponse.fromWeb(
+          request,
+          Response.json({ error: "unexpected method" }, { status: 500 }),
+        );
+      });
+    }
+    return Effect.succeed(
+      HttpClientResponse.fromWeb(
+        request,
+        Response.json({ error: "unexpected request" }, { status: 404 }),
+      ),
+    );
+  };
+
+const remoteCheckPeerHandler = (check: RemoteCheckFixture) =>
+  remoteCheckPeerHandlerWith(() => check);
 
 const scheduledTaskId = ScheduledTaskId.make("sched-fix1");
 const makeScheduledTask = (modelSelection: ModelSelection | null): ScheduledTask => ({
@@ -345,13 +494,19 @@ const makeParentShell = () => ({
 const projectionLayer = Layer.succeed(ProjectionSnapshotQuery, {
   getCommandReadModel: () => unsupported(),
   getSnapshot: () => unsupported(),
-  getShellSnapshot: () => unsupported(),
+  getShellSnapshot: () =>
+    Effect.succeed({
+      snapshotSequence: 1,
+      projects: [activeProjectShell],
+      threads: [makeParentShell(), makeChildShell(childTurnState)],
+      updatedAt: "2026-06-17T09:00:00.000Z",
+    }),
   getArchivedShellSnapshot: () => unsupported(),
   getSnapshotSequence: () => unsupported(),
   getCounts: () => unsupported(),
   getActiveProjectByWorkspaceRoot: () => unsupported(),
   getProjectShellById: (id) =>
-    Effect.succeed(id === projectId ? Option.some(parentProject) : Option.none()),
+    Effect.succeed(id === activeProjectShell.id ? Option.some(activeProjectShell) : Option.none()),
   getFirstActiveThreadIdByProjectId: () => unsupported(),
   getThreadCheckpointContext: () => unsupported(),
   getFullThreadDiffContext: () => unsupported(),
@@ -429,6 +584,19 @@ const coordinatorLayer = Layer.succeed(ChildThreadCoordinator, {
   markWaitDelivered: (marks) => Effect.sync(() => void markWaitDeliveredCalls.push(marks)),
   abandonWaitDelivery: (ids) => Effect.sync(() => void abandonWaitDeliveryCalls.push(ids)),
   hasPendingInjections: () => Effect.succeed(false),
+  enqueueParentInjection: (input) =>
+    Effect.sync(() => {
+      if (
+        enqueuedParentInjections.some(
+          (row) =>
+            row.parentThreadId === input.parentThreadId &&
+            row.childThreadId === input.childThreadId,
+        )
+      ) {
+        return;
+      }
+      enqueuedParentInjections.push(input);
+    }),
   listChildren: (parent) =>
     Effect.succeed(
       parent === parentThreadId
@@ -486,6 +654,58 @@ const pendingDispatchesLayer = Layer.succeed(PendingDispatchRepository, {
   markWaitDelivered: () => Effect.void,
   deleteByIds: () => Effect.void,
 });
+
+const remoteChildrenLayer = Layer.succeed(RemoteChildRepository, {
+  upsert: (row) => Effect.sync(() => void insertedRemoteChildren.push(row)),
+  getByChild: () => Effect.succeed(Option.none()),
+  listByParent: ({ parentThreadId }) =>
+    Effect.succeed(remoteChildRows.filter((row) => row.parentThreadId === parentThreadId)),
+  listAll: () => Effect.succeed(remoteChildRows),
+  updateStatus: (input) =>
+    Effect.sync(() => {
+      updatedRemoteChildren.push(input);
+    }),
+});
+
+const peerRegistryLayer = Layer.succeed(SubagentPeerRegistry.SubagentPeerRegistry, {
+  add: () => unsupported(),
+  list: Effect.suspend(() => Effect.succeed(peerRegistryPeers)),
+  remove: () => unsupported(),
+  getByAlias: (alias) =>
+    Effect.suspend(() =>
+      Effect.succeed(
+        Option.fromUndefinedOr(peerRegistryPeers.find((peer) => peer.alias === alias)),
+      ),
+    ),
+  resolveTarget: (target) =>
+    Effect.suspend(() => {
+      const peer =
+        peerRegistryPeers.find((candidate) => candidate.alias === target) ??
+        peerRegistryPeers.find((candidate) => candidate.environmentId === target);
+      return peer
+        ? Effect.succeed(peer)
+        : Effect.fail(
+            new SubagentPeerRegistry.SubagentPeerTargetNotFoundError({
+              target,
+              knownAliases: peerRegistryPeers.map((candidate) => candidate.alias),
+            }),
+          );
+    }),
+  updateLastSeen: (alias) =>
+    Effect.suspend(() =>
+      Effect.succeed(
+        Option.fromUndefinedOr(peerRegistryPeers.find((peer) => peer.alias === alias)),
+      ),
+    ),
+});
+
+const peerHttpClientLayer = Layer.succeed(
+  HttpClient.HttpClient,
+  HttpClient.make((request) => {
+    peerHttpRequests.push({ method: request.method, url: request.url });
+    return peerHttpHandler ? peerHttpHandler(request) : Effect.die("unexpected peer HTTP call");
+  }),
+);
 
 const gitWorkflowLayer = Layer.mock(GitWorkflowService)({
   listRefs: () =>
@@ -568,6 +788,9 @@ const RuntimeActivationLive = Layer.mergeAll(
   Layer.provideMerge(providerRegistryLayer),
   Layer.provideMerge(scheduledTasksLayer),
   Layer.provideMerge(pendingDispatchesLayer),
+  Layer.provideMerge(remoteChildrenLayer),
+  Layer.provideMerge(peerRegistryLayer),
+  Layer.provideMerge(peerHttpClientLayer),
   Layer.provideMerge(gitWorkflowLayer),
   Layer.provideMerge(vcsDriverRegistryLayer),
   Layer.provideMerge(SubagentDispatchLimiter.layerTest(1)),
@@ -621,6 +844,8 @@ describe("SubagentToolkit", () => {
         dispatchedTurns.length = 0;
         dispatchedTurnCommands.length = 0;
         registeredChildren.length = 0;
+        peerHttpRequests.length = 0;
+        insertedRemoteChildren.length = 0;
 
         const result = yield* server
           .callTool({
@@ -644,6 +869,8 @@ describe("SubagentToolkit", () => {
         expect(command.type).toBe("thread.turn.start");
         expect("providerSessionDetached" in command).toBe(false);
         expect(registeredChildren).toEqual([{ childThreadId: command.threadId, parentThreadId }]);
+        expect(peerHttpRequests).toEqual([]);
+        expect(insertedRemoteChildren).toEqual([]);
       }),
     ).pipe(
       Effect.ensuring(
@@ -652,8 +879,1050 @@ describe("SubagentToolkit", () => {
           dispatchedTurns.length = 0;
           dispatchedTurnCommands.length = 0;
           registeredChildren.length = 0;
+          peerHttpRequests.length = 0;
+          insertedRemoteChildren.length = 0;
         }),
       ),
+      Effect.provide(TestLayer),
+    ),
+  );
+
+  it.effect("spawns a remote child through a resolved peer target and records it", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const server = yield* McpServer.McpServer;
+        peerRegistryPeers = [bearerPeer()];
+        peerHttpRequests.length = 0;
+        insertedRemoteChildren.length = 0;
+        registeredChildren.length = 0;
+        let capturedRemoteArguments: Record<string, unknown> | undefined;
+        peerHttpHandler = (request) => {
+          if (request.url === "https://peer.example/.well-known/t3/environment") {
+            return Effect.succeed(
+              HttpClientResponse.fromWeb(
+                request,
+                Response.json({
+                  environmentId: peerEnvironmentId,
+                  label: "Peer B",
+                  platform: { os: "linux", arch: "x64" },
+                  serverVersion: "0.0.0-test",
+                  capabilities: { repositoryIdentity: true },
+                }),
+              ),
+            );
+          }
+          if (request.url === "https://peer.example/mcp" && request.method === "DELETE") {
+            return Effect.succeed(
+              HttpClientResponse.fromWeb(request, new Response(null, { status: 204 })),
+            );
+          }
+          if (request.url === "https://peer.example/mcp" && request.method === "POST") {
+            return Effect.sync(() => {
+              const body = decodeHttpClientRequestJson(request);
+              if (body.method === "initialize") {
+                return HttpClientResponse.fromWeb(
+                  request,
+                  Response.json(
+                    jsonRpcResponse(body.id ?? 1, {
+                      protocolVersion: "2025-06-18",
+                      capabilities: { tools: {} },
+                      serverInfo: { name: "peer", version: "0.0.0-test" },
+                    }),
+                    {
+                      headers: {
+                        "mcp-session-id": "session-remote-spawn",
+                        "mcp-protocol-version": "2025-06-18",
+                      },
+                    },
+                  ),
+                );
+              }
+              if (body.method === "notifications/initialized") {
+                return HttpClientResponse.fromWeb(request, new Response(null, { status: 202 }));
+              }
+              if (body.method === "tools/call") {
+                capturedRemoteArguments = body.params?.arguments;
+                return HttpClientResponse.fromWeb(
+                  request,
+                  Response.json(
+                    jsonRpcResponse(body.id ?? 2, {
+                      content: [{ type: "text", text: "spawned" }],
+                      structuredContent: {
+                        childThreadId: remoteChildThreadId,
+                        projectId: remoteProjectId,
+                        mode: "current_checkout",
+                        branch: null,
+                        worktreePath: "/remote/repo",
+                        parentThreadId,
+                      },
+                      isError: false,
+                    }),
+                  ),
+                );
+              }
+              return HttpClientResponse.fromWeb(
+                request,
+                Response.json({ error: "unexpected method" }, { status: 500 }),
+              );
+            });
+          }
+          return Effect.succeed(
+            HttpClientResponse.fromWeb(
+              request,
+              Response.json({ error: "unexpected request" }, { status: 404 }),
+            ),
+          );
+        };
+
+        const result = yield* server
+          .callTool({
+            name: "t3_spawn_subagent",
+            arguments: {
+              prompt: "run elsewhere",
+              target: "peer-b",
+              directory: "/remote/repo",
+            },
+          })
+          .pipe(
+            Effect.provideService(McpInvocationContext.McpInvocationContext, invocation),
+            Effect.provideService(McpSchema.McpServerClient, client),
+          );
+
+        expect(result.isError).toBe(false);
+        expect(result.structuredContent).toMatchObject({
+          childThreadId: remoteChildThreadId,
+          parentThreadId,
+        });
+        expect(capturedRemoteArguments).toMatchObject({
+          prompt: "run elsewhere",
+          directory: "/remote/repo",
+          detached: true,
+          remoteParentThreadId: parentThreadId,
+          remoteParentEnvironmentId: environmentId,
+        });
+        expect(insertedRemoteChildren).toHaveLength(1);
+        expect(insertedRemoteChildren[0]).toMatchObject({
+          parentThreadId,
+          childEnvironmentId: peerEnvironmentId,
+          childThreadId: remoteChildThreadId,
+          alias: "peer-b",
+          status: "running",
+        });
+        expect(registeredChildren).toEqual([]);
+        expect(peerHttpRequests.map((request) => request.url)).toEqual([
+          "https://peer.example/.well-known/t3/environment",
+          "https://peer.example/mcp",
+          "https://peer.example/mcp",
+          "https://peer.example/mcp",
+          "https://peer.example/mcp",
+        ]);
+      }),
+    ).pipe(
+      Effect.ensuring(
+        Effect.sync(() => {
+          peerRegistryPeers = [];
+          peerHttpHandler = null;
+          peerHttpRequests.length = 0;
+          insertedRemoteChildren.length = 0;
+          registeredChildren.length = 0;
+        }),
+      ),
+      Effect.provide(TestLayer),
+    ),
+  );
+
+  it.effect("does not timeout a side-effecting remote spawn tools call", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const server = yield* McpServer.McpServer;
+        const toolCallStarted = yield* Deferred.make<void>();
+        peerRegistryPeers = [bearerPeer()];
+        insertedRemoteChildren.length = 0;
+        peerHttpHandler = (request) => {
+          if (request.url === "https://peer.example/.well-known/t3/environment") {
+            return Effect.succeed(
+              HttpClientResponse.fromWeb(
+                request,
+                Response.json({
+                  environmentId: peerEnvironmentId,
+                  label: "Peer B",
+                  platform: { os: "linux", arch: "x64" },
+                  serverVersion: "0.0.0-test",
+                  capabilities: { repositoryIdentity: true },
+                }),
+              ),
+            );
+          }
+          if (request.url === "https://peer.example/mcp" && request.method === "DELETE") {
+            return Effect.succeed(
+              HttpClientResponse.fromWeb(request, new Response(null, { status: 204 })),
+            );
+          }
+          if (request.url === "https://peer.example/mcp" && request.method === "POST") {
+            return Effect.gen(function* () {
+              const body = decodeHttpClientRequestJson(request);
+              if (body.method === "initialize") {
+                return HttpClientResponse.fromWeb(
+                  request,
+                  Response.json(
+                    jsonRpcResponse(body.id ?? 1, {
+                      protocolVersion: "2025-06-18",
+                      capabilities: { tools: {} },
+                      serverInfo: { name: "peer", version: "0.0.0-test" },
+                    }),
+                    {
+                      headers: {
+                        "mcp-session-id": "session-remote-spawn-slow",
+                        "mcp-protocol-version": "2025-06-18",
+                      },
+                    },
+                  ),
+                );
+              }
+              if (body.method === "notifications/initialized") {
+                return HttpClientResponse.fromWeb(request, new Response(null, { status: 202 }));
+              }
+              if (body.method === "tools/call") {
+                yield* Deferred.succeed(toolCallStarted, void 0);
+                yield* TestClock.adjust(Duration.seconds(6));
+                return HttpClientResponse.fromWeb(
+                  request,
+                  Response.json(
+                    jsonRpcResponse(body.id ?? 2, {
+                      content: [{ type: "text", text: "spawned slowly" }],
+                      structuredContent: {
+                        childThreadId: remoteChildThreadId,
+                        projectId: remoteProjectId,
+                        mode: "current_checkout",
+                        branch: null,
+                        worktreePath: "/remote/repo",
+                        parentThreadId,
+                      },
+                      isError: false,
+                    }),
+                  ),
+                );
+              }
+              return HttpClientResponse.fromWeb(
+                request,
+                Response.json({ error: "unexpected method" }, { status: 500 }),
+              );
+            });
+          }
+          return Effect.succeed(
+            HttpClientResponse.fromWeb(
+              request,
+              Response.json({ error: "unexpected request" }, { status: 404 }),
+            ),
+          );
+        };
+
+        const fiber = yield* server
+          .callTool({
+            name: "t3_spawn_subagent",
+            arguments: {
+              prompt: "run slowly elsewhere",
+              target: "peer-b",
+              directory: "/remote/repo",
+            },
+          })
+          .pipe(
+            Effect.provideService(McpInvocationContext.McpInvocationContext, invocation),
+            Effect.provideService(McpSchema.McpServerClient, client),
+            Effect.forkScoped,
+          );
+        yield* Deferred.await(toolCallStarted);
+        const result = yield* Fiber.join(fiber);
+
+        expect(result.isError).toBe(false);
+        expect(result.structuredContent).toMatchObject({
+          childThreadId: remoteChildThreadId,
+          parentThreadId,
+        });
+        expect(insertedRemoteChildren).toHaveLength(1);
+        expect(insertedRemoteChildren[0]).toMatchObject({
+          parentThreadId,
+          childEnvironmentId: peerEnvironmentId,
+          childThreadId: remoteChildThreadId,
+          status: "running",
+        });
+      }),
+    ).pipe(
+      Effect.ensuring(
+        Effect.sync(() => {
+          peerRegistryPeers = [];
+          peerHttpHandler = null;
+          insertedRemoteChildren.length = 0;
+        }),
+      ),
+      Effect.provide(TestLayer),
+    ),
+  );
+
+  it.effect("records a remote spawn when MCP session cleanup stalls", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const server = yield* McpServer.McpServer;
+        const deleteStarted = yield* Deferred.make<void>();
+        peerRegistryPeers = [bearerPeer()];
+        insertedRemoteChildren.length = 0;
+        peerHttpHandler = (request) => {
+          if (request.url === "https://peer.example/.well-known/t3/environment") {
+            return Effect.succeed(
+              HttpClientResponse.fromWeb(
+                request,
+                Response.json({
+                  environmentId: peerEnvironmentId,
+                  label: "Peer B",
+                  platform: { os: "linux", arch: "x64" },
+                  serverVersion: "0.0.0-test",
+                  capabilities: { repositoryIdentity: true },
+                }),
+              ),
+            );
+          }
+          if (request.url === "https://peer.example/mcp" && request.method === "DELETE") {
+            return Effect.gen(function* () {
+              yield* Deferred.succeed(deleteStarted, void 0);
+              return yield* Effect.never;
+            });
+          }
+          if (request.url === "https://peer.example/mcp" && request.method === "POST") {
+            return Effect.sync(() => {
+              const body = decodeHttpClientRequestJson(request);
+              if (body.method === "initialize") {
+                return HttpClientResponse.fromWeb(
+                  request,
+                  Response.json(
+                    jsonRpcResponse(body.id ?? 1, {
+                      protocolVersion: "2025-06-18",
+                      capabilities: { tools: {} },
+                      serverInfo: { name: "peer", version: "0.0.0-test" },
+                    }),
+                    {
+                      headers: {
+                        "mcp-session-id": "session-remote-spawn-cleanup-hangs",
+                        "mcp-protocol-version": "2025-06-18",
+                      },
+                    },
+                  ),
+                );
+              }
+              if (body.method === "notifications/initialized") {
+                return HttpClientResponse.fromWeb(request, new Response(null, { status: 202 }));
+              }
+              if (body.method === "tools/call") {
+                return HttpClientResponse.fromWeb(
+                  request,
+                  Response.json(
+                    jsonRpcResponse(body.id ?? 2, {
+                      content: [{ type: "text", text: "spawned before cleanup stalled" }],
+                      structuredContent: {
+                        childThreadId: remoteChildThreadId,
+                        projectId: remoteProjectId,
+                        mode: "current_checkout",
+                        branch: null,
+                        worktreePath: "/remote/repo",
+                        parentThreadId,
+                      },
+                      isError: false,
+                    }),
+                  ),
+                );
+              }
+              return HttpClientResponse.fromWeb(
+                request,
+                Response.json({ error: "unexpected method" }, { status: 500 }),
+              );
+            });
+          }
+          return Effect.succeed(
+            HttpClientResponse.fromWeb(
+              request,
+              Response.json({ error: "unexpected request" }, { status: 404 }),
+            ),
+          );
+        };
+
+        const fiber = yield* server
+          .callTool({
+            name: "t3_spawn_subagent",
+            arguments: {
+              prompt: "run elsewhere before cleanup stalls",
+              target: "peer-b",
+              directory: "/remote/repo",
+            },
+          })
+          .pipe(
+            Effect.provideService(McpInvocationContext.McpInvocationContext, invocation),
+            Effect.provideService(McpSchema.McpServerClient, client),
+            Effect.forkScoped,
+          );
+        yield* Deferred.await(deleteStarted);
+        yield* TestClock.adjust(Duration.seconds(3));
+        const result = yield* Fiber.join(fiber);
+
+        expect(result.isError).toBe(false);
+        expect(insertedRemoteChildren).toHaveLength(1);
+        expect(insertedRemoteChildren[0]).toMatchObject({
+          parentThreadId,
+          childEnvironmentId: peerEnvironmentId,
+          childThreadId: remoteChildThreadId,
+          status: "running",
+        });
+      }),
+    ).pipe(
+      Effect.ensuring(
+        Effect.sync(() => {
+          peerRegistryPeers = [];
+          peerHttpHandler = null;
+          insertedRemoteChildren.length = 0;
+        }),
+      ),
+      Effect.provide(TestLayer),
+    ),
+  );
+
+  it.effect("fails remote spawn before probing when target is unknown", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const server = yield* McpServer.McpServer;
+        peerRegistryPeers = [bearerPeer()];
+        peerHttpRequests.length = 0;
+
+        const result = yield* server
+          .callTool({
+            name: "t3_spawn_subagent",
+            arguments: {
+              prompt: "run nowhere",
+              target: "missing",
+              directory: "/remote/repo",
+            },
+          })
+          .pipe(
+            Effect.provideService(McpInvocationContext.McpInvocationContext, invocation),
+            Effect.provideService(McpSchema.McpServerClient, client),
+          );
+
+        expect(result.isError).toBe(true);
+        const content = result.content?.[0];
+        expect(content?.type).toBe("text");
+        if (content?.type === "text") {
+          expect(content.text).toContain("Subagent peer target 'missing' is not registered");
+          expect(content.text).toContain("peer-b");
+        }
+        expect(peerHttpRequests).toEqual([]);
+      }),
+    ).pipe(
+      Effect.ensuring(
+        Effect.sync(() => {
+          peerRegistryPeers = [];
+          peerHttpRequests.length = 0;
+        }),
+      ),
+      Effect.provide(TestLayer),
+    ),
+  );
+
+  it.effect("checks a remote child through its recorded peer and enqueues terminal wake", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const server = yield* McpServer.McpServer;
+        peerRegistryPeers = [bearerPeer()];
+        remoteChildRows = [remoteChildRow("running")];
+        peerHttpRequests.length = 0;
+        updatedRemoteChildren.length = 0;
+        enqueuedParentInjections.length = 0;
+        peerHttpHandler = remoteCheckPeerHandler({
+          status: "completed",
+          turnCount: 3,
+          latestAssistantText: "remote done",
+        });
+
+        const result = yield* server
+          .callTool({
+            name: "t3_check_subagent",
+            arguments: { childThreadId: remoteChildThreadId },
+          })
+          .pipe(
+            Effect.provideService(McpInvocationContext.McpInvocationContext, invocation),
+            Effect.provideService(McpSchema.McpServerClient, client),
+          );
+
+        expect(result.isError).toBe(false);
+        expect(result.structuredContent).toMatchObject({
+          threadId: remoteChildThreadId,
+          status: "completed",
+          turnCount: 3,
+          latestAssistantText: "remote done",
+        });
+        expect(enqueuedParentInjections).toEqual([
+          {
+            parentThreadId,
+            childThreadId: remoteChildThreadId,
+            status: "completed",
+            finalAssistantText: "remote done",
+            error: null,
+          },
+        ]);
+        expect(updatedRemoteChildren).toEqual(
+          expect.arrayContaining([
+            expect.objectContaining({
+              parentThreadId,
+              childEnvironmentId: peerEnvironmentId,
+              childThreadId: remoteChildThreadId,
+              status: "completed",
+            }),
+          ]),
+        );
+        expect(peerHttpRequests).toEqual(
+          expect.arrayContaining([{ method: "DELETE", url: "https://peer.example/mcp" }]),
+        );
+      }),
+    ).pipe(
+      Effect.ensuring(
+        Effect.sync(() => {
+          peerRegistryPeers = [];
+          remoteChildRows = [];
+          peerHttpRequests.length = 0;
+          updatedRemoteChildren.length = 0;
+          enqueuedParentInjections.length = 0;
+          peerHttpHandler = null;
+        }),
+      ),
+      Effect.provide(TestLayer),
+    ),
+  );
+
+  it.effect("bounds remote child checks when the peer MCP call does not answer", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const server = yield* McpServer.McpServer;
+        const requestStarted = yield* Deferred.make<void>();
+        peerRegistryPeers = [bearerPeer()];
+        remoteChildRows = [remoteChildRow("running")];
+        peerHttpHandler = (request) => {
+          if (request.url === "https://peer.example/mcp" && request.method === "POST") {
+            return Effect.gen(function* () {
+              yield* Deferred.succeed(requestStarted, void 0);
+              return yield* Effect.never;
+            });
+          }
+          return Effect.succeed(
+            HttpClientResponse.fromWeb(
+              request,
+              Response.json({ error: "unexpected request" }, { status: 404 }),
+            ),
+          );
+        };
+
+        const fiber = yield* server
+          .callTool({
+            name: "t3_check_subagent",
+            arguments: { childThreadId: remoteChildThreadId },
+          })
+          .pipe(
+            Effect.provideService(McpInvocationContext.McpInvocationContext, invocation),
+            Effect.provideService(McpSchema.McpServerClient, client),
+            Effect.forkScoped,
+          );
+        yield* Deferred.await(requestStarted);
+        yield* TestClock.adjust(Duration.seconds(6));
+        const result = yield* Fiber.join(fiber);
+
+        expect(result.isError).toBe(true);
+        const content = result.content?.[0];
+        expect(content?.type).toBe("text");
+        if (content?.type === "text") {
+          expect(content.text).toContain("did not respond within 5 seconds");
+        }
+      }),
+    ).pipe(
+      Effect.ensuring(
+        Effect.sync(() => {
+          peerRegistryPeers = [];
+          remoteChildRows = [];
+          peerHttpHandler = null;
+        }),
+      ),
+      Effect.provide(TestLayer),
+    ),
+  );
+
+  it.effect("rejects remote check results for a different child thread", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const server = yield* McpServer.McpServer;
+        const otherThreadId = ThreadId.make("thread-remote-other");
+        peerRegistryPeers = [bearerPeer()];
+        remoteChildRows = [remoteChildRow("running")];
+        updatedRemoteChildren.length = 0;
+        enqueuedParentInjections.length = 0;
+        peerHttpHandler = remoteCheckPeerHandler({
+          threadId: otherThreadId,
+          status: "completed",
+          turnCount: 1,
+          latestAssistantText: "wrong child",
+        });
+
+        const result = yield* server
+          .callTool({
+            name: "t3_check_subagent",
+            arguments: { childThreadId: remoteChildThreadId },
+          })
+          .pipe(
+            Effect.provideService(McpInvocationContext.McpInvocationContext, invocation),
+            Effect.provideService(McpSchema.McpServerClient, client),
+          );
+
+        expect(result.isError).toBe(true);
+        const content = result.content?.[0];
+        expect(content?.type).toBe("text");
+        if (content?.type === "text") {
+          expect(content.text).toContain(`expected ${remoteChildThreadId}`);
+        }
+        expect(updatedRemoteChildren).toEqual([]);
+        expect(enqueuedParentInjections).toEqual([]);
+      }),
+    ).pipe(
+      Effect.ensuring(
+        Effect.sync(() => {
+          peerRegistryPeers = [];
+          remoteChildRows = [];
+          peerHttpRequests.length = 0;
+          updatedRemoteChildren.length = 0;
+          enqueuedParentInjections.length = 0;
+          peerHttpHandler = null;
+        }),
+      ),
+      Effect.provide(TestLayer),
+    ),
+  );
+
+  it.effect("waits for a remote child through the peer check proxy", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const server = yield* McpServer.McpServer;
+        peerRegistryPeers = [bearerPeer()];
+        remoteChildRows = [remoteChildRow("running")];
+        enqueuedParentInjections.length = 0;
+        peerHttpHandler = remoteCheckPeerHandler({
+          status: "completed",
+          turnCount: 2,
+          latestAssistantText: "wait saw remote done",
+        });
+
+        const result = yield* server
+          .callTool({
+            name: "t3_wait_subagent",
+            arguments: { childThreadIds: [remoteChildThreadId], timeoutSeconds: 1 },
+          })
+          .pipe(
+            Effect.provideService(McpInvocationContext.McpInvocationContext, invocation),
+            Effect.provideService(McpSchema.McpServerClient, client),
+          );
+
+        expect(result.isError).toBe(false);
+        expect(result.structuredContent).toMatchObject({
+          results: [
+            {
+              childThreadId: remoteChildThreadId,
+              status: "completed",
+              turnCount: 2,
+              finalAssistantText: "wait saw remote done",
+              error: null,
+            },
+          ],
+          settledCount: 1,
+          timedOutCount: 0,
+          pending: false,
+        });
+        expect(enqueuedParentInjections).toHaveLength(1);
+      }),
+    ).pipe(
+      Effect.ensuring(
+        Effect.sync(() => {
+          peerRegistryPeers = [];
+          remoteChildRows = [];
+          enqueuedParentInjections.length = 0;
+          peerHttpHandler = null;
+        }),
+      ),
+      Effect.provide(TestLayer),
+    ),
+  );
+
+  it.effect("treats interrupted remote children as settled for wait any", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const server = yield* McpServer.McpServer;
+        const runningChildThreadId = ThreadId.make("thread-remote-child-running");
+        peerRegistryPeers = [bearerPeer()];
+        remoteChildRows = [
+          remoteChildRow("running"),
+          {
+            ...remoteChildRow("running"),
+            childThreadId: runningChildThreadId,
+            spawnParams: { prompt: "remote running", directory: "/remote/repo", detached: true },
+          },
+        ];
+        enqueuedParentInjections.length = 0;
+        peerHttpHandler = remoteCheckPeerHandlerWith((body) => {
+          const requestedThreadId = body.params?.arguments?.childThreadId;
+          return requestedThreadId === runningChildThreadId
+            ? {
+                threadId: runningChildThreadId,
+                status: "running",
+                turnCount: 1,
+                latestAssistantText: null,
+              }
+            : {
+                threadId: remoteChildThreadId,
+                status: "interrupted",
+                turnCount: 2,
+                latestAssistantText: "interrupted final text",
+              };
+        });
+
+        const result = yield* server
+          .callTool({
+            name: "t3_wait_subagent",
+            arguments: {
+              childThreadIds: [remoteChildThreadId, runningChildThreadId],
+              timeoutSeconds: 1,
+              mode: "any",
+            },
+          })
+          .pipe(
+            Effect.provideService(McpInvocationContext.McpInvocationContext, invocation),
+            Effect.provideService(McpSchema.McpServerClient, client),
+          );
+
+        expect(result.isError).toBe(false);
+        expect(result.structuredContent).toMatchObject({
+          settledCount: 1,
+          timedOutCount: 0,
+          pending: false,
+        });
+        const results = (result.structuredContent as { readonly results?: ReadonlyArray<unknown> })
+          .results;
+        expect(results).toEqual(
+          expect.arrayContaining([
+            expect.objectContaining({
+              childThreadId: remoteChildThreadId,
+              status: "interrupted",
+              turnCount: 2,
+              finalAssistantText: "interrupted final text",
+            }),
+            expect.objectContaining({
+              childThreadId: runningChildThreadId,
+              status: "pending",
+              turnCount: 1,
+            }),
+          ]),
+        );
+      }),
+    ).pipe(
+      Effect.ensuring(
+        Effect.sync(() => {
+          peerRegistryPeers = [];
+          remoteChildRows = [];
+          enqueuedParentInjections.length = 0;
+          peerHttpHandler = null;
+        }),
+      ),
+      Effect.provide(TestLayer),
+    ),
+  );
+
+  it.effect("lists remote children alongside local children", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const server = yield* McpServer.McpServer;
+        peerRegistryPeers = [bearerPeer()];
+        remoteChildRows = [remoteChildRow("running")];
+        peerHttpHandler = remoteCheckPeerHandler({
+          status: "running",
+          turnCount: 1,
+          latestAssistantText: null,
+        });
+
+        const result = yield* server
+          .callTool({
+            name: "t3_list_subagents",
+            arguments: { parentThreadId },
+          })
+          .pipe(
+            Effect.provideService(McpInvocationContext.McpInvocationContext, invocation),
+            Effect.provideService(McpSchema.McpServerClient, client),
+          );
+
+        expect(result.isError).toBe(false);
+        const children = (
+          result.structuredContent as { readonly children?: ReadonlyArray<unknown> }
+        ).children;
+        expect(children).toEqual(
+          expect.arrayContaining([
+            expect.objectContaining({
+              childThreadId: remoteChildThreadId,
+              parentThreadId,
+              detached: true,
+              status: "running",
+              turnCount: 1,
+            }),
+          ]),
+        );
+      }),
+    ).pipe(
+      Effect.ensuring(
+        Effect.sync(() => {
+          peerRegistryPeers = [];
+          remoteChildRows = [];
+          peerHttpHandler = null;
+        }),
+      ),
+      Effect.provide(TestLayer),
+    ),
+  );
+
+  it.effect("peer-scoped receiver spawn requires directory and records remote parent", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const server = yield* McpServer.McpServer;
+        const fileSystem = yield* FileSystem.FileSystem;
+        const targetDirectory = yield* fileSystem.makeTempDirectoryScoped({
+          prefix: "t3-peer-spawn-target-",
+        });
+        activeProjectShell = {
+          ...parentProject,
+          workspaceRoot: targetDirectory,
+          repositoryIdentity: {
+            canonicalKey: `git-local:${targetDirectory}`,
+            locator: {
+              source: "git-local",
+              rootPath: targetDirectory,
+            },
+            rootPath: targetDirectory,
+          },
+        };
+        engineCommands.length = 0;
+        dispatchedTurnCommands.length = 0;
+        registeredChildren.length = 0;
+        const sourceEnvironmentId = EnvironmentId.make("environment-source-a");
+
+        const result = yield* server
+          .callTool({
+            name: "t3_spawn_subagent",
+            arguments: {
+              prompt: "run on receiver",
+              directory: targetDirectory,
+              detached: true,
+              remoteParentThreadId: parentThreadId,
+            },
+          })
+          .pipe(
+            Effect.provideService(McpInvocationContext.McpInvocationContext, {
+              ...unrestrictedPeerInvocation,
+              sourceEnvironmentId,
+            }),
+            Effect.provideService(McpSchema.McpServerClient, client),
+          );
+
+        expect(result.isError).toBe(false);
+        expect(dispatchedTurnCommands).toHaveLength(1);
+        expect(registeredChildren).toEqual([]);
+        const parentSetCommand = engineCommands.find(
+          (command): command is Extract<OrchestrationCommand, { type: "thread.parent.set" }> =>
+            command.type === "thread.parent.set",
+        );
+        expect(parentSetCommand).toMatchObject({
+          type: "thread.parent.set",
+          parentThreadId,
+          parentEnvironmentId: sourceEnvironmentId,
+        });
+        expect(result.structuredContent).toMatchObject({
+          parentThreadId,
+        });
+      }),
+    ).pipe(
+      Effect.ensuring(
+        Effect.sync(() => {
+          activeProjectShell = parentProject;
+          engineCommands.length = 0;
+          dispatchedTurnCommands.length = 0;
+          registeredChildren.length = 0;
+        }),
+      ),
+      Effect.provide(TestLayer),
+    ),
+  );
+
+  it.effect("rejects peer-scoped receiver spawn with a spoofed parent environment id", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const server = yield* McpServer.McpServer;
+        const fileSystem = yield* FileSystem.FileSystem;
+        const targetDirectory = yield* fileSystem.makeTempDirectoryScoped({
+          prefix: "t3-peer-spawn-target-",
+        });
+        activeProjectShell = {
+          ...parentProject,
+          workspaceRoot: targetDirectory,
+          repositoryIdentity: {
+            canonicalKey: `git-local:${targetDirectory}`,
+            locator: {
+              source: "git-local",
+              rootPath: targetDirectory,
+            },
+            rootPath: targetDirectory,
+          },
+        };
+        engineCommands.length = 0;
+        dispatchedTurnCommands.length = 0;
+        const sourceEnvironmentId = EnvironmentId.make("environment-source-a");
+        const spoofedEnvironmentId = EnvironmentId.make("environment-spoofed");
+
+        const result = yield* server
+          .callTool({
+            name: "t3_spawn_subagent",
+            arguments: {
+              prompt: "run on receiver",
+              directory: targetDirectory,
+              detached: true,
+              remoteParentThreadId: parentThreadId,
+              remoteParentEnvironmentId: spoofedEnvironmentId,
+            },
+          })
+          .pipe(
+            Effect.provideService(McpInvocationContext.McpInvocationContext, {
+              ...unrestrictedPeerInvocation,
+              sourceEnvironmentId,
+            }),
+            Effect.provideService(McpSchema.McpServerClient, client),
+          );
+
+        expect(result.isError).toBe(true);
+        const content = result.content?.[0];
+        expect(content?.type).toBe("text");
+        if (content?.type === "text") {
+          expect(content.text).toContain("does not match the authenticated caller backend");
+        }
+        expect(dispatchedTurnCommands).toEqual([]);
+        expect(engineCommands).toEqual([]);
+      }),
+    ).pipe(
+      Effect.ensuring(
+        Effect.sync(() => {
+          activeProjectShell = parentProject;
+          engineCommands.length = 0;
+          dispatchedTurnCommands.length = 0;
+        }),
+      ),
+      Effect.provide(TestLayer),
+    ),
+  );
+
+  it.effect("rejects peer-scoped receiver spawn through symlink outside target project", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const server = yield* McpServer.McpServer;
+        const fileSystem = yield* FileSystem.FileSystem;
+        const projectDirectory = yield* fileSystem.makeTempDirectoryScoped({
+          prefix: "t3-peer-spawn-project-",
+        });
+        const outsideDirectory = yield* fileSystem.makeTempDirectoryScoped({
+          prefix: "t3-peer-spawn-outside-",
+        });
+        const linkedDirectory = `${projectDirectory}/linked-outside`;
+        yield* fileSystem.symlink(outsideDirectory, linkedDirectory);
+        activeProjectShell = {
+          ...parentProject,
+          workspaceRoot: projectDirectory,
+          repositoryIdentity: {
+            canonicalKey: `git-local:${projectDirectory}`,
+            locator: {
+              source: "git-local",
+              rootPath: projectDirectory,
+            },
+            rootPath: projectDirectory,
+          },
+        };
+        engineCommands.length = 0;
+        dispatchedTurnCommands.length = 0;
+
+        const result = yield* server
+          .callTool({
+            name: "t3_spawn_subagent",
+            arguments: {
+              prompt: "run outside through a symlink",
+              directory: linkedDirectory,
+              detached: true,
+              remoteParentThreadId: parentThreadId,
+            },
+          })
+          .pipe(
+            Effect.provideService(McpInvocationContext.McpInvocationContext, {
+              ...unrestrictedPeerInvocation,
+              sourceEnvironmentId: EnvironmentId.make("environment-source-a"),
+            }),
+            Effect.provideService(McpSchema.McpServerClient, client),
+          );
+
+        expect(result.isError).toBe(true);
+        const content = result.content?.[0];
+        expect(content?.type).toBe("text");
+        if (content?.type === "text") {
+          expect(content.text).toContain("not inside an active target project");
+        }
+        expect(dispatchedTurnCommands).toEqual([]);
+        expect(engineCommands).toEqual([]);
+      }),
+    ).pipe(
+      Effect.ensuring(
+        Effect.sync(() => {
+          activeProjectShell = parentProject;
+          engineCommands.length = 0;
+          dispatchedTurnCommands.length = 0;
+        }),
+      ),
+      Effect.provide(TestLayer),
+    ),
+  );
+
+  it.effect("rejects peer-scoped receiver spawn for unauthorized remote parent ids", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const server = yield* McpServer.McpServer;
+        dispatchedTurnCommands.length = 0;
+
+        const result = yield* server
+          .callTool({
+            name: "t3_spawn_subagent",
+            arguments: {
+              prompt: "run on receiver",
+              directory: "/not-read-before-authz",
+              remoteParentThreadId: parentThreadId,
+              remoteParentEnvironmentId: EnvironmentId.make("environment-source-a"),
+            },
+          })
+          .pipe(
+            Effect.provideService(McpInvocationContext.McpInvocationContext, {
+              ...peerInvocation,
+              sourceEnvironmentId: EnvironmentId.make("environment-source-a"),
+            }),
+            Effect.provideService(McpSchema.McpServerClient, client),
+          );
+
+        expect(result.isError).toBe(true);
+        const content = result.content?.[0];
+        expect(content?.type).toBe("text");
+        if (content?.type === "text") {
+          expect(content.text).toContain("not authorized for parent thread");
+        }
+        expect(dispatchedTurnCommands).toEqual([]);
+      }),
+    ).pipe(
+      Effect.ensuring(Effect.sync(() => void (dispatchedTurnCommands.length = 0))),
       Effect.provide(TestLayer),
     ),
   );

@@ -1,5 +1,6 @@
 import {
   CheckpointRef,
+  EnvironmentId,
   EventId,
   MessageId,
   ProjectId,
@@ -22,6 +23,7 @@ import { OrchestrationProjectionSnapshotQueryLive } from "./ProjectionSnapshotQu
 import { ProjectionSnapshotQuery } from "../Services/ProjectionSnapshotQuery.ts";
 
 const asProjectId = (value: string): ProjectId => ProjectId.make(value);
+const asEnvironmentId = (value: string): EnvironmentId => EnvironmentId.make(value);
 const asTurnId = (value: string): TurnId => TurnId.make(value);
 const asMessageId = (value: string): MessageId => MessageId.make(value);
 const asEventId = (value: string): EventId => EventId.make(value);
@@ -87,7 +89,9 @@ projectionSnapshotLayer("ProjectionSnapshotQuery", (it) => {
           has_actionable_proposed_plan,
           created_at,
           updated_at,
-          deleted_at
+          deleted_at,
+          parent_thread_id,
+          parent_environment_id
         )
         VALUES (
           'thread-1',
@@ -105,7 +109,9 @@ projectionSnapshotLayer("ProjectionSnapshotQuery", (it) => {
           0,
           '2026-02-24T00:00:02.000Z',
           '2026-02-24T00:00:03.000Z',
-          NULL
+          NULL,
+          'thread-remote-parent',
+          'environment-remote-parent'
         )
       `;
 
@@ -336,7 +342,8 @@ projectionSnapshotLayer("ProjectionSnapshotQuery", (it) => {
           createdAt: "2026-02-24T00:00:02.000Z",
           updatedAt: "2026-02-24T00:00:03.000Z",
           archivedAt: null,
-          parentThreadId: null,
+          parentThreadId: ThreadId.make("thread-remote-parent"),
+          parentEnvironmentId: asEnvironmentId("environment-remote-parent"),
           deletedAt: null,
           messages: [],
           proposedPlans: [],
@@ -422,13 +429,29 @@ projectionSnapshotLayer("ProjectionSnapshotQuery", (it) => {
           hasPendingApprovals: true,
           hasPendingUserInput: false,
           hasActionableProposedPlan: false,
-          parentThreadId: null,
+          parentThreadId: ThreadId.make("thread-remote-parent"),
+          parentEnvironmentId: asEnvironmentId("environment-remote-parent"),
         },
       ]);
+
+      const threadShell = yield* snapshotQuery.getThreadShellById(ThreadId.make("thread-1"));
+      assert.equal(threadShell._tag, "Some");
+      if (threadShell._tag === "Some") {
+        assert.equal(threadShell.value.parentThreadId, ThreadId.make("thread-remote-parent"));
+        assert.equal(
+          threadShell.value.parentEnvironmentId,
+          asEnvironmentId("environment-remote-parent"),
+        );
+      }
 
       const threadDetail = yield* snapshotQuery.getThreadDetailById(ThreadId.make("thread-1"));
       assert.equal(threadDetail._tag, "Some");
       if (threadDetail._tag === "Some") {
+        assert.equal(threadDetail.value.parentThreadId, ThreadId.make("thread-remote-parent"));
+        assert.equal(
+          threadDetail.value.parentEnvironmentId,
+          asEnvironmentId("environment-remote-parent"),
+        );
         assert.deepEqual(threadDetail.value.messages, [
           {
             id: asMessageId("message-prompt"),

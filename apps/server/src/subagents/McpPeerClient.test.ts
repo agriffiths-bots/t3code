@@ -266,6 +266,60 @@ it.effect("initializes a peer session and sends tools/call over MCP HTTP", () =>
   });
 });
 
+it.effect("terminates a stateful MCP peer session with DELETE", () => {
+  const requests: Array<CapturedHttpRequest> = [];
+  const httpLayer = Layer.succeed(
+    HttpClient.HttpClient,
+    HttpClient.make((request) =>
+      Effect.sync(() => {
+        requests.push(request);
+        if (request.method === "DELETE") {
+          assert.equal(request.url, "https://peer.example/mcp");
+          return HttpClientResponse.fromWeb(request, new Response(null, { status: 204 }));
+        }
+        const rpc = decodeRequestBody(request);
+        if (rpc.method === "initialize") {
+          return HttpClientResponse.fromWeb(
+            request,
+            Response.json(
+              {
+                jsonrpc: "2.0",
+                id: rpc.id,
+                result: {
+                  protocolVersion: "2025-06-18",
+                  capabilities: { tools: {} },
+                  serverInfo: { name: "peer-test", version: "1.0.0" },
+                },
+              },
+              {
+                headers: {
+                  "mcp-session-id": "session-close",
+                  "mcp-protocol-version": "2025-06-18",
+                },
+              },
+            ),
+          );
+        }
+        assert.equal(rpc.method, "notifications/initialized");
+        return HttpClientResponse.fromWeb(request, new Response(null, { status: 202 }));
+      }),
+    ),
+  );
+
+  return Effect.gen(function* () {
+    const session = yield* McpPeerClient.connect(bearerPeer).pipe(Effect.provide(httpLayer));
+    yield* session.close();
+
+    assert.equal(requests.length, 3);
+    const deleteRequest = requests[2];
+    assert.ok(deleteRequest);
+    assert.equal(deleteRequest.method, "DELETE");
+    assert.equal(deleteRequest.headers.authorization, "Bearer peer-token");
+    assert.equal(deleteRequest.headers["mcp-session-id"], "session-close");
+    assert.equal(deleteRequest.headers["mcp-protocol-version"], "2025-06-18");
+  });
+});
+
 it.effect("supports stateless MCP peers that do not return an MCP session id", () => {
   const requests: Array<CapturedHttpRequest> = [];
   const httpLayer = Layer.succeed(

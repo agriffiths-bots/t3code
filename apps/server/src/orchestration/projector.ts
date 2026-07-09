@@ -498,6 +498,7 @@ export function projectEvent(
           ...nextBase,
           threads: updateThread(nextBase.threads, payload.threadId, {
             parentThreadId: payload.parentThreadId,
+            parentEnvironmentId: payload.parentEnvironmentId ?? null,
             updatedAt: payload.updatedAt,
           }),
         })),

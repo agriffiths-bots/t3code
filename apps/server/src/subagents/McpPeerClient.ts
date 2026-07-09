@@ -59,6 +59,7 @@ export class McpPeerClientError extends Schema.TaggedErrorClass<McpPeerClientErr
       "json-rpc",
       "initialize",
       "call-tool",
+      "terminate",
     ]),
     method: Schema.optional(Schema.String),
     status: Schema.optional(Schema.Number),
@@ -91,6 +92,7 @@ export interface McpPeerClientSession {
   readonly callTool: (
     input: McpPeerCallToolInput,
   ) => Effect.Effect<McpSchema.CallToolResult, McpPeerClientError>;
+  readonly close: () => Effect.Effect<void, McpPeerClientError>;
 }
 
 interface JsonRpcSuccess {
@@ -347,6 +349,41 @@ const postJsonRpcNotification = Effect.fn("McpPeerClient.postJsonRpcNotification
   },
 );
 
+const deleteSession = Effect.fn("McpPeerClient.deleteSession")(function* (input: {
+  readonly client: HttpClient.HttpClient;
+  readonly endpoint: string;
+  readonly authorizationHeader: string;
+  readonly cfAccessHeaders: Record<string, string>;
+  readonly sessionId?: string | undefined;
+  readonly protocolVersion?: string | undefined;
+}): Effect.fn.Return<void, McpPeerClientError> {
+  if (input.sessionId === undefined) return;
+  const request = HttpClientRequest.delete(input.endpoint, {
+    headers: jsonRpcHeaders({
+      authorizationHeader: input.authorizationHeader,
+      cfAccessHeaders: input.cfAccessHeaders,
+      sessionId: input.sessionId,
+      protocolVersion: input.protocolVersion,
+    }),
+  });
+  const response = yield* input.client.execute(request).pipe(
+    Effect.mapError((cause) =>
+      error("terminate", {
+        detail: "Could not reach MCP peer to terminate the session.",
+        cause,
+      }),
+    ),
+  );
+  if ((response.status >= 200 && response.status < 300) || response.status === 404) {
+    return;
+  }
+  return yield* error("terminate", {
+    status: response.status,
+    detail: "MCP peer returned a non-success status when terminating the session.",
+    cause: response.status,
+  });
+});
+
 export const connect = Effect.fn("McpPeerClient.connect")(function* (
   peer: SubagentPeer,
   options: McpPeerClientConnectOptions = {},
@@ -428,5 +465,14 @@ export const connect = Effect.fn("McpPeerClient.connect")(function* (
           ),
         ),
       ),
+    close: () =>
+      deleteSession({
+        client,
+        endpoint: peer.mcpEndpoint,
+        authorizationHeader: auth,
+        cfAccessHeaders: cfHeaders,
+        sessionId,
+        protocolVersion,
+      }),
   };
 });

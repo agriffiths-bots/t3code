@@ -87,6 +87,10 @@ export interface ValidateChildSpawnInput {
   readonly model: ModelSelection;
 }
 
+export interface EnqueueParentInjectionInput extends ChildWaitResult {
+  readonly parentThreadId: ThreadId;
+}
+
 export interface ValidatedChildSpawn {
   readonly depth: number;
 }
@@ -168,6 +172,11 @@ export interface ChildThreadCoordinatorShape {
 
   /** Whether the parent has queued sub-agent completion injections awaiting drain. */
   readonly hasPendingInjections: (parentThreadId: ThreadId) => Effect.Effect<boolean>;
+
+  /** Queue or dispatch a terminal child result that was observed outside the local coordinator. */
+  readonly enqueueParentInjection: (
+    input: EnqueueParentInjectionInput,
+  ) => Effect.Effect<void, ThreadStartToolError>;
 
   /** List the parent's registered children (in-memory view). */
   readonly listChildren: (parentThreadId: ThreadId) => Effect.Effect<ReadonlyArray<ChildListEntry>>;

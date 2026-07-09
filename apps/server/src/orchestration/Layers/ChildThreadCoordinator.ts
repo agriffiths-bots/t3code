@@ -55,6 +55,7 @@ import {
   type ChildListEntry,
   type ChildTerminalStatus,
   type ChildThreadCoordinatorShape,
+  type EnqueueParentInjectionInput,
   type ChildWaitResult,
   type WaitDeliveredMark,
   type WaitChildResult,
@@ -269,6 +270,7 @@ const make = Effect.gen(function* () {
           parent_thread_id AS "parentThreadId"
         FROM projection_threads
         WHERE parent_thread_id IS NOT NULL
+          AND parent_environment_id IS NULL
       `,
   });
 
@@ -963,7 +965,10 @@ const make = Effect.gen(function* () {
   // inline, it would deadlock; the WakeParentSyncDispatch regression test guards
   // this by enqueuing the parent's terminal signal during dispatch and asserting
   // wakeParent still completes.
-  const wakeParent = (record: ChildRecord, result: ChildWaitResult) =>
+  const wakeParent = (
+    record: Pick<ChildRecord, "parentThreadId" | "detached">,
+    result: ChildWaitResult,
+  ) =>
     Effect.gen(function* () {
       const parentThreadId = record.parentThreadId;
       const lock = yield* wakeLockFor(parentThreadId);
@@ -990,6 +995,13 @@ const make = Effect.gen(function* () {
           }
           // Persist the durable row up front so the wake survives a restart in
           // every branch below; it is deleted only after a successful dispatch.
+          const existingQueue = pendingInjections.get(parentThreadId) ?? [];
+          if (
+            queuedWakeChildren.has(result.childThreadId) ||
+            existingQueue.some((entry) => entry.childThreadId === result.childThreadId)
+          ) {
+            return;
+          }
           const deliveredByWait =
             !record.detached && waitDeliveredPromotedChildren.has(result.childThreadId);
           const waitCancellable = !record.detached;
@@ -1666,6 +1678,22 @@ const make = Effect.gen(function* () {
     parentThreadId,
   ) => Effect.sync(() => (pendingInjections.get(parentThreadId)?.length ?? 0) > 0);
 
+  const enqueueParentInjection: ChildThreadCoordinatorShape["enqueueParentInjection"] = (
+    input: EnqueueParentInjectionInput,
+  ) =>
+    wakeParent(
+      {
+        parentThreadId: input.parentThreadId,
+        detached: true,
+      },
+      {
+        childThreadId: input.childThreadId,
+        status: input.status,
+        finalAssistantText: input.finalAssistantText,
+        error: input.error,
+      },
+    );
+
   const listChildren: ChildThreadCoordinatorShape["listChildren"] = (parentThreadId) =>
     Effect.gen(function* () {
       const ids = byParent.get(parentThreadId);
@@ -2289,6 +2317,7 @@ const make = Effect.gen(function* () {
     markWaitDelivered,
     abandonWaitDelivery,
     hasPendingInjections,
+    enqueueParentInjection,
     listChildren,
     start,
     drain: worker.drain,

@@ -1,4 +1,10 @@
-import { ProjectId, ScheduledTaskEntry, ThreadId, TrimmedNonEmptyString } from "@t3tools/contracts";
+import {
+  EnvironmentId,
+  ProjectId,
+  ScheduledTaskEntry,
+  ThreadId,
+  TrimmedNonEmptyString,
+} from "@t3tools/contracts";
 import * as Schema from "effect/Schema";
 import { Tool, Toolkit } from "effect/unstable/ai";
 
@@ -26,6 +32,9 @@ export const WAIT_AUTO_PROMOTE_SECONDS = 90;
 
 export const SpawnSubagentInput = Schema.Struct({
   ...ThreadStartToolInput.fields,
+  target: Schema.optional(TrimmedNonEmptyString),
+  remoteParentThreadId: Schema.optional(ThreadId),
+  remoteParentEnvironmentId: Schema.optional(EnvironmentId),
   detached: Schema.optional(Schema.Boolean),
   waitTimeoutSeconds: Schema.optional(Schema.Int),
 });
@@ -200,7 +209,7 @@ export type ScheduleDeleteOutput = typeof ScheduleDeleteOutput.Type;
 
 export const SpawnSubagentTool = Tool.make("t3_spawn_subagent", {
   description:
-    "Delegate a unit of work to an autonomous sub-agent thread. Use this freely to fan out background or parallel work — research, refactors, exploring an approach — without blocking yourself. Defaults to detached=true: the sub-agent runs independently and wakes you with its result when it finishes, so prefer spawning detached and continuing your own work. Set detached=false only when you must have the result before proceeding; foreground spawn waits for one bounded initial status slice, returns terminal output if already done, otherwise returns status=\"running\" plus launch metadata and promotes the child to wake you on completion. Use t3_wait_subagent to wait for a still-running foreground child, or stop polling and let the parent wake automatically; never expect spawn itself to block until long work completes. Defaults to a new Git worktree off the repository default branch when the project directory is a Git repository; non-Git projects start in the current directory with warning metadata. Pass `directory` (absolute path) to base the sub-agent somewhere else entirely: a Git directory gets a new worktree off that repository, a non-Git directory runs in place — use this when the calling thread's project is not the repository the work belongs in. To pick the sub-agent's model, pass `model` as a plain model name (e.g. 'claude-opus-4-8' or 'gpt-5.4'); the provider/harness is inferred automatically, so you never guess a harness/instance id. This is the delegation primitive — for human-requested thread creation use t3_thread_start instead.",
+    "Delegate a unit of work to an autonomous sub-agent thread. Use this freely to fan out background or parallel work — research, refactors, exploring an approach — without blocking yourself. Defaults to detached=true: the sub-agent runs independently and wakes you with its result when it finishes, so prefer spawning detached and continuing your own work. Set detached=false only when you must have the result before proceeding; foreground spawn waits for one bounded initial status slice, returns terminal output if already done, otherwise returns status=\"running\" plus launch metadata and promotes the child to wake you on completion. Use t3_wait_subagent to wait for a still-running foreground child, or stop polling and let the parent wake automatically; never expect spawn itself to block until long work completes. Defaults to a new Git worktree off the repository default branch when the project directory is a Git repository; non-Git projects start in the current directory with warning metadata. Pass `directory` (absolute path) to base the sub-agent somewhere else entirely: a Git directory gets a new worktree off that repository, a non-Git directory runs in place — use this when the calling thread's project is not the repository the work belongs in. Pass `target` as a registered peer alias or environment id to spawn on another backend; remote spawns require `directory` because target filesystems are independent. To pick the sub-agent's model, pass `model` as a plain model name (e.g. 'claude-opus-4-8' or 'gpt-5.4'); the provider/harness is inferred automatically, so you never guess a harness/instance id. This is the delegation primitive — for human-requested thread creation use t3_thread_start instead.",
   parameters: SpawnSubagentInput,
   success: SpawnSubagentOutput,
   failure: ThreadStartToolError,

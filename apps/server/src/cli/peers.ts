@@ -25,10 +25,13 @@ import {
 } from "effect/unstable/http";
 
 import * as ServerConfig from "../config.ts";
+import * as ServerEnvironment from "../environment/ServerEnvironment.ts";
 import * as SubagentPeerRegistry from "../subagents/SubagentPeerRegistry.ts";
 import {
   cloudflareAccessHeaders,
+  environmentUrl,
   SUBAGENT_PEER_MCP_TOKEN_PATH,
+  type SubagentPeerMcpTokenRequest,
   SubagentPeerMcpTokenResult,
 } from "../subagents/SubagentPeerHttp.ts";
 import { authLocationFlags, type CliAuthLocationFlags, resolveCliAuthConfig } from "./config.ts";
@@ -97,14 +100,6 @@ const cloudflareAccessFromInput = Effect.fn("peers.cloudflareAccessFromInput")(f
   }
   return undefined;
 });
-
-const environmentUrl = (httpBaseUrl: string, pathname: string): string => {
-  const url = new URL(httpBaseUrl);
-  url.pathname = pathname;
-  url.search = "";
-  url.hash = "";
-  return url.toString();
-};
 
 const isPeerPairingError = Schema.is(PeerPairingError);
 
@@ -248,12 +243,20 @@ export const pairPeer = Effect.fn("peers.pairPeer")(function* (
     AuthAccessTokenResult,
     "exchange-token",
   );
+  const sourceEnvironment = yield* Effect.serviceOption(ServerEnvironment.ServerEnvironment);
+  const sourceEnvironmentId = Option.isSome(sourceEnvironment)
+    ? yield* sourceEnvironment.value.getEnvironmentId
+    : undefined;
+  const peerTokenBody = (
+    sourceEnvironmentId !== undefined ? { sourceEnvironmentId } : {}
+  ) satisfies SubagentPeerMcpTokenRequest;
   const peerToken = yield* responseJson(
     HttpClientRequest.post(environmentUrl(target.httpBaseUrl, SUBAGENT_PEER_MCP_TOKEN_PATH)).pipe(
       HttpClientRequest.setHeaders({
         ...headers,
         authorization: `${access.token_type} ${access.access_token}`,
       }),
+      HttpClientRequest.bodyJsonUnsafe(peerTokenBody),
     ),
     SubagentPeerMcpTokenResult,
     "mint-peer-token",
@@ -340,6 +343,7 @@ const runWithPeerRegistry = <A, E>(
       Effect.provide(
         Layer.mergeAll(
           SubagentPeerRegistry.layer.pipe(Layer.provide(ServerConfig.layer(config))),
+          ServerEnvironment.layer.pipe(Layer.provide(ServerConfig.layer(config))),
           FetchHttpClient.layer,
           Layer.succeed(FetchHttpClient.RequestInit, PEER_PAIRING_FETCH_REQUEST_INIT),
           Layer.succeed(References.MinimumLogLevel, minimumLogLevel),

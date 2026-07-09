@@ -1,5 +1,6 @@
 /* oxlint-disable t3code/no-manual-effect-runtime-in-tests -- These concurrency tests intentionally manage a long-lived runtime, queues, and scopes across helper boundaries. */
 import {
+  EnvironmentId,
   EventId,
   MessageId,
   ProviderInstanceId,
@@ -252,6 +253,7 @@ describe("ChildThreadCoordinator", () => {
     readonly seedChildRows?: ReadonlyArray<{
       readonly threadId: ThreadId;
       readonly parentThreadId: ThreadId;
+      readonly parentEnvironmentId?: EnvironmentId;
     }>;
     /** Pending_dispatches rows inserted BEFORE start() (simulated restart). */
     readonly seedPendingDispatches?: ReadonlyArray<PendingDispatch>;
@@ -459,8 +461,8 @@ describe("ChildThreadCoordinator", () => {
             Effect.service(SqlClient),
             (sql) =>
               sql`
-                INSERT INTO projection_threads (thread_id, project_id, title, model_selection_json, runtime_mode, interaction_mode, created_at, updated_at, parent_thread_id)
-                VALUES (${row.threadId}, ${projectId}, ${"seed"}, ${"{}"}, ${"full-access"}, ${"default"}, ${now}, ${now}, ${row.parentThreadId})
+                INSERT INTO projection_threads (thread_id, project_id, title, model_selection_json, runtime_mode, interaction_mode, created_at, updated_at, parent_thread_id, parent_environment_id)
+                VALUES (${row.threadId}, ${projectId}, ${"seed"}, ${"{}"}, ${"full-access"}, ${"default"}, ${now}, ${now}, ${row.parentThreadId}, ${row.parentEnvironmentId ?? null})
               `,
           ),
         );
@@ -693,6 +695,33 @@ describe("ChildThreadCoordinator", () => {
       listPromotedChildren,
     };
   }
+
+  it("restart reconciliation ignores child rows whose parent belongs to a remote environment", async () => {
+    const child = ThreadId.make("restart-remote-parent-child");
+    const parent = ThreadId.make("restart-remote-parent");
+    const harness = await createHarness({
+      threads: [
+        makeThreadState({
+          threadId: child,
+          parentThreadId: parent,
+          latestTurn: makeLatestTurn("completed"),
+          assistantText: "remote parent should poll this",
+        }),
+      ],
+      seedChildRows: [
+        {
+          threadId: child,
+          parentThreadId: parent,
+          parentEnvironmentId: EnvironmentId.make("environment-remote-parent"),
+        },
+      ],
+    });
+
+    await Effect.runPromise(harness.coordinator.drain);
+
+    expect(harness.dispatched).toEqual([]);
+    expect(await harness.listPendingDispatches()).toEqual([]);
+  });
 
   it("settles ready turn-diff as completed and captures final assistant text", async () => {
     const child = ThreadId.make("child-completed");

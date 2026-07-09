@@ -1,5 +1,7 @@
 import {
   CommandId,
+  DEFAULT_PROVIDER_INTERACTION_MODE,
+  DEFAULT_RUNTIME_MODE,
   MessageId,
   ThreadId,
   VcsProcessSpawnError,
@@ -94,7 +96,7 @@ interface SourceCwdProjectContext {
 
 export type ActiveThreadStartRuntime = (
   input: ThreadStartToolInput,
-  invocation: McpInvocationContext.ProviderMcpInvocationScope,
+  invocation: McpInvocationContext.McpInvocationScope,
 ) => Effect.Effect<ThreadStartToolOutput, ThreadStartToolError>;
 
 let activeThreadStartRuntime: ActiveThreadStartRuntime | null = null;
@@ -123,8 +125,15 @@ const makeActiveThreadStartRuntime = Effect.fn("ThreadToolkit.makeActiveRuntime"
       return yield* fail(`directory must be an absolute path (got "${directory}").`);
     }
     const normalized = path.normalize(directory);
+    const resolved = yield* fileSystem
+      .realPath(normalized)
+      .pipe(
+        Effect.mapError(() =>
+          fail(`directory "${normalized}" does not exist or is not accessible.`),
+        ),
+      );
     const info = yield* fileSystem
-      .stat(normalized)
+      .stat(resolved)
       .pipe(
         Effect.mapError(() =>
           fail(`directory "${normalized}" does not exist or is not accessible.`),
@@ -133,7 +142,7 @@ const makeActiveThreadStartRuntime = Effect.fn("ThreadToolkit.makeActiveRuntime"
     if (info.type !== "Directory") {
       return yield* fail(`directory "${normalized}" is not a directory.`);
     }
-    return normalized;
+    return path.normalize(resolved);
   });
 
   // Fail-CLOSED same-repository check for explicit directories: any detection
@@ -426,7 +435,7 @@ const makeActiveThreadStartRuntime = Effect.fn("ThreadToolkit.makeActiveRuntime"
       : yield* resolveCurrentBranch(sourceCwd);
   });
 
-  const loadSourceContext = Effect.fn("ThreadToolkit.loadSourceContext")(function* (
+  const loadProviderSourceContext = Effect.fn("ThreadToolkit.loadProviderSourceContext")(function* (
     invocation: McpInvocationContext.ProviderMcpInvocationScope,
   ) {
     const sourceThread = yield* projectionSnapshotQuery
@@ -455,11 +464,112 @@ const makeActiveThreadStartRuntime = Effect.fn("ThreadToolkit.makeActiveRuntime"
     return { sourceThread, project };
   });
 
+  const loadPeerSourceContext = Effect.fn("ThreadToolkit.loadPeerSourceContext")(function* (
+    input: ThreadStartToolInput,
+  ) {
+    if (input.directory === undefined) {
+      return yield* fail(
+        "Peer-scoped sub-agent spawn requires directory so the target backend can choose a local project.",
+      );
+    }
+    const explicitDirectory = yield* validateExplicitDirectory(input.directory);
+    const snapshot = yield* projectionSnapshotQuery
+      .getShellSnapshot()
+      .pipe(
+        Effect.mapError((error) =>
+          fail(error instanceof Error ? error.message : "Failed to load target projects."),
+        ),
+      );
+    const projectMatches = yield* Effect.forEach(snapshot.projects, (candidate) =>
+      fileSystem.realPath(candidate.workspaceRoot).pipe(
+        Effect.map((realWorkspaceRoot) => ({
+          project: candidate,
+          realWorkspaceRoot: path.normalize(realWorkspaceRoot),
+        })),
+        Effect.orElseSucceed(() => null),
+      ),
+    );
+    const project = projectMatches
+      .filter(
+        (candidate): candidate is NonNullable<typeof candidate> =>
+          candidate !== null && isPathWithin(candidate.realWorkspaceRoot, explicitDirectory),
+      )
+      .toSorted(
+        (left, right) => right.realWorkspaceRoot.length - left.realWorkspaceRoot.length,
+      )[0]?.project;
+    if (project === undefined) {
+      return yield* fail(
+        `Peer-scoped sub-agent spawn directory "${explicitDirectory}" is not inside an active target project.`,
+      );
+    }
+    let inheritedModelSelection = input.modelSelection ?? project.defaultModelSelection;
+    if (inheritedModelSelection === null) {
+      if (input.model === undefined) {
+        return yield* fail(
+          "Peer-scoped sub-agent spawn requires model/modelSelection when the target project has no default model.",
+        );
+      }
+      const providerInstances = yield* providerInstanceRegistry.listInstances;
+      const modelSources = yield* Effect.forEach(
+        providerInstances.filter((providerInstance) => providerInstance.enabled),
+        (providerInstance) =>
+          Effect.map(providerInstance.snapshot.getSnapshot, (snapshot) => ({
+            instanceId: providerInstance.instanceId,
+            driverKind: providerInstance.driverKind,
+            models: snapshot.models.map((providerModel) => ({
+              slug: providerModel.slug,
+              optionDescriptors: providerModel.capabilities?.optionDescriptors,
+              defaultOptions: buildProviderOptionSelectionsFromDescriptors(
+                providerModel.capabilities?.optionDescriptors,
+              ),
+            })),
+          })),
+      );
+      inheritedModelSelection = pickModelSelectionFromInstances(
+        input.model,
+        modelSources,
+        undefined,
+      );
+      if (inheritedModelSelection === null) {
+        return yield* fail(
+          `Model "${input.model}" is not served by any configured provider. Pass a model shown in the model picker, or configure a default model on the target project.`,
+        );
+      }
+    }
+    const createdAt = yield* nowIso;
+    const sourceThread: OrchestrationThreadShell = {
+      id: ThreadId.make("remote-parent"),
+      projectId: project.id,
+      title: "Remote parent",
+      modelSelection: inheritedModelSelection,
+      runtimeMode: input.runtimeMode ?? DEFAULT_RUNTIME_MODE,
+      interactionMode: input.interactionMode ?? DEFAULT_PROVIDER_INTERACTION_MODE,
+      branch: null,
+      worktreePath: null,
+      worktreeRemovable: false,
+      worktreeRemovalPath: null,
+      latestTurn: null,
+      createdAt,
+      updatedAt: createdAt,
+      archivedAt: null,
+      session: null,
+      latestUserMessageAt: null,
+      hasPendingApprovals: false,
+      hasPendingUserInput: false,
+      hasActionableProposedPlan: false,
+      parentThreadId: null,
+      parentEnvironmentId: null,
+    };
+    return { sourceThread, project };
+  });
+
   return Effect.fn("ThreadToolkit.startThread")(function* (
     input: ThreadStartToolInput,
-    invocation: McpInvocationContext.ProviderMcpInvocationScope,
+    invocation: McpInvocationContext.McpInvocationScope,
   ) {
-    const { sourceThread, project } = yield* loadSourceContext(invocation);
+    const { sourceThread, project } = McpInvocationContext.isProviderInvocationScope(invocation)
+      ? yield* loadProviderSourceContext(invocation)
+      : yield* loadPeerSourceContext(input);
     const requestedMode = input.mode ?? "new_worktree";
     if (input.directory !== undefined && input.worktreePath !== undefined) {
       return yield* fail(

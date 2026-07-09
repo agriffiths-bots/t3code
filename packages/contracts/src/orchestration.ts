@@ -10,6 +10,7 @@ import {
   ApprovalRequestId,
   CheckpointRef,
   CommandId,
+  EnvironmentId,
   EventId,
   IsoDateTime,
   MessageId,
@@ -366,6 +367,9 @@ export const OrchestrationThread = Schema.Struct({
   // can walk the thread tree. Optional (like worktreeRemovable) so existing
   // constructors and older snapshots stay valid; absent/null both mean "root".
   parentThreadId: Schema.optional(Schema.NullOr(ThreadId)),
+  // Null/absent means the parent is local to this environment. Remote parents
+  // carry the source environment id beside the source thread id.
+  parentEnvironmentId: Schema.optional(Schema.NullOr(EnvironmentId)),
   deletedAt: Schema.NullOr(IsoDateTime),
   messages: Schema.Array(OrchestrationMessage),
   proposedPlans: Schema.Array(OrchestrationProposedPlan).pipe(
@@ -420,6 +424,7 @@ export const OrchestrationThreadShell = Schema.Struct({
   hasPendingUserInput: Schema.Boolean,
   hasActionableProposedPlan: Schema.Boolean,
   parentThreadId: Schema.NullOr(ThreadId),
+  parentEnvironmentId: Schema.optional(Schema.NullOr(EnvironmentId)),
 });
 export type OrchestrationThreadShell = typeof OrchestrationThreadShell.Type;
 
@@ -685,6 +690,7 @@ const ThreadParentSetCommand = Schema.Struct({
   commandId: CommandId,
   threadId: ThreadId,
   parentThreadId: ThreadId,
+  parentEnvironmentId: Schema.optional(EnvironmentId),
   createdAt: Schema.optional(IsoDateTime),
 });
 
@@ -1127,6 +1133,7 @@ export const ThreadActivityAppendedPayload = Schema.Struct({
 export const ThreadParentSetPayload = Schema.Struct({
   threadId: ThreadId,
   parentThreadId: ThreadId,
+  parentEnvironmentId: Schema.optional(Schema.NullOr(EnvironmentId)),
   updatedAt: IsoDateTime,
 });
 
