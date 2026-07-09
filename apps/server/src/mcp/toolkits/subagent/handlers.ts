@@ -113,6 +113,10 @@ const PEER_SPAWN_PROBE_TIMEOUT = Duration.seconds(5);
 const PEER_TOOL_CALL_TIMEOUT_SECONDS = 5;
 const PEER_TOOL_CALL_TIMEOUT = Duration.seconds(PEER_TOOL_CALL_TIMEOUT_SECONDS);
 const PEER_SESSION_CLOSE_TIMEOUT = Duration.seconds(2);
+const LOCAL_SPAWN_DISPATCH_LEASE_TIMEOUT_SECONDS = 5;
+const LOCAL_SPAWN_DISPATCH_LEASE_TIMEOUT = Duration.seconds(
+  LOCAL_SPAWN_DISPATCH_LEASE_TIMEOUT_SECONDS,
+);
 const REMOTE_TERMINAL_DELIVERY_CLAIM_TTL_MS = 5 * 60 * 1_000;
 const UNTRACKED_PROJECTION_CHILD_ERROR =
   "Sub-agent thread exists in the projection but is not tracked by this server instance.";
@@ -145,6 +149,25 @@ const clamp = (value: number, min: number, max: number): number =>
 
 const appendWarning = (existing: string | undefined, warning: string): string =>
   existing === undefined ? warning : `${existing} ${warning}`;
+
+const acquireLocalDispatchLease = Effect.fn("SubagentToolkit.acquireLocalDispatchLease")(function* (
+  runtime: SubagentRuntime,
+  parentThreadId: ThreadId,
+) {
+  const lease = yield* runtime.dispatchLimiter.acquire.pipe(
+    Effect.timeoutOption(LOCAL_SPAWN_DISPATCH_LEASE_TIMEOUT),
+  );
+  if (Option.isSome(lease)) return lease.value;
+
+  yield* Effect.logWarning("sub-agent spawn dispatch capacity timed out", {
+    parentThreadId,
+    maxConcurrentDispatches: runtime.dispatchLimiter.maxConcurrentDispatches,
+    timeoutSeconds: LOCAL_SPAWN_DISPATCH_LEASE_TIMEOUT_SECONDS,
+  });
+  return yield* fail(
+    `Sub-agent dispatch capacity is saturated after ${LOCAL_SPAWN_DISPATCH_LEASE_TIMEOUT_SECONDS}s (limit ${runtime.dispatchLimiter.maxConcurrentDispatches}); no child was created. Try again after running sub-agents finish.`,
+  );
+});
 
 /**
  * Derive a turn count from a thread detail: the highest checkpoint turn count,
@@ -1457,7 +1480,9 @@ const spawnSubagent = Effect.fn("SubagentToolkit.spawn")(function* (input: Spawn
   const { started, spawnedAtMs, cleanupAndReleaseFromDelete } = yield* Effect.uninterruptibleMask(
     (restore) =>
       Effect.gen(function* () {
-        const dispatchLease = yield* restore(runtime.dispatchLimiter.acquire);
+        const dispatchLease = yield* restore(
+          acquireLocalDispatchLease(runtime, providerInvocation.threadId),
+        );
         const releaseDispatchLease: Effect.Effect<void, never, never> =
           runtime.dispatchLimiter.release(dispatchLease);
         const started = yield* spawnRuntime(

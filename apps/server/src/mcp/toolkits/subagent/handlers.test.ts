@@ -3662,6 +3662,79 @@ describe("SubagentToolkit", () => {
     ),
   );
 
+  it.effect("returns a fast error when dispatch capacity is saturated before child creation", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const server = yield* McpServer.McpServer;
+        const limiter = yield* SubagentDispatchLimiter.SubagentDispatchLimiter;
+        const fileSystem = yield* FileSystem.FileSystem;
+        const targetDirectory = yield* fileSystem.makeTempDirectoryScoped({
+          prefix: "t3-subagent-saturated-target-",
+        });
+        yield* Effect.acquireUseRelease(
+          limiter.acquire,
+          () =>
+            Effect.gen(function* () {
+              childDriverKind = "codex";
+              activeProjectShell = {
+                ...parentProject,
+                workspaceRoot: "/home/adam",
+                repositoryIdentity: null,
+              };
+              dispatchedTurnCommands.length = 0;
+              engineCommands.length = 0;
+              registeredChildren.length = 0;
+
+              const fiber = yield* server
+                .callTool({
+                  name: "t3_spawn_subagent",
+                  arguments: {
+                    prompt: "spawn from non-repo parent into explicit repo",
+                    directory: targetDirectory,
+                    mode: "current_checkout",
+                    detached: true,
+                  },
+                })
+                .pipe(
+                  Effect.provideService(McpInvocationContext.McpInvocationContext, invocation),
+                  Effect.provideService(McpSchema.McpServerClient, client),
+                  Effect.timeoutOption(Duration.seconds(6)),
+                  Effect.forkScoped,
+                );
+
+              yield* Effect.yieldNow;
+              yield* TestClock.adjust(Duration.seconds(6));
+              const maybeResult = yield* Fiber.join(fiber);
+
+              expect(Option.isSome(maybeResult)).toBe(true);
+              if (Option.isNone(maybeResult)) return;
+              expect(maybeResult.value.isError).toBe(true);
+              const content = maybeResult.value.content?.[0];
+              expect(content?.type).toBe("text");
+              if (content?.type === "text") {
+                expect(content.text).toContain("dispatch capacity");
+              }
+              expect(dispatchedTurnCommands).toEqual([]);
+              expect(engineCommands).toEqual([]);
+              expect(registeredChildren).toEqual([]);
+            }),
+          (heldLease) => limiter.release(heldLease),
+        );
+      }),
+    ).pipe(
+      Effect.ensuring(
+        Effect.sync(() => {
+          activeProjectShell = parentProject;
+          childDriverKind = undefined;
+          dispatchedTurnCommands.length = 0;
+          engineCommands.length = 0;
+          registeredChildren.length = 0;
+        }),
+      ),
+      Effect.provide(TestLayer),
+    ),
+  );
+
   it.effect(
     "foreground spawn returns launch metadata after one pending slice instead of blocking",
     () =>
