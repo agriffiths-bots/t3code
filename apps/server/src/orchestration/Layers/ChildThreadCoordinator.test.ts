@@ -194,6 +194,7 @@ const makeThreadState = (input: {
     createdAt: now,
     updatedAt: now,
     archivedAt,
+    parentThreadId: input.parentThreadId ?? null,
     deletedAt: input.deletedAt ?? null,
     messages,
     turns: [],
@@ -2835,6 +2836,7 @@ describe("ChildThreadCoordinator", () => {
     const result = await runtimeRun(harness, child);
     expect(result.status).toBe("completed");
     expect(result.error).toBe(null);
+    expect(result.finalAssistantText).toBe("completed before slow archive detail");
   });
 
   it("preserves pre-registration completed projection when archive arrives first", async () => {
@@ -3553,6 +3555,108 @@ describe("ChildThreadCoordinator", () => {
     expect(await harness.canAcquireDispatchLease()).toBe(false);
   });
 
+  it("remembers active archives before registration for later unarchive capacity", async () => {
+    const parent = ThreadId.make("live-preregister-active-archive-parent");
+    const childIds = Array.from({ length: 6 }, (_, index) =>
+      ThreadId.make(`live-preregister-active-archive-child-${index + 1}`),
+    );
+    const harness = await createHarness({
+      threads: childIds.map((threadId) =>
+        makeThreadState({
+          threadId,
+          parentThreadId: parent,
+          latestTurn: makeLatestTurn("running", TurnId.make("turn-1")),
+          session: makeSession(threadId, "running", TurnId.make("turn-1")),
+        }),
+      ),
+      slowThreadShellReadCounts: childIds.map((threadId) => ({ threadId, count: 1 })),
+    });
+    for (const childThreadId of childIds) {
+      await harness.seedDispatchLease(childThreadId);
+      await harness.feed(threadArchivedEvent(childThreadId));
+    }
+    expect(await harness.canAcquireDispatchLease()).toBe(true);
+
+    for (const childThreadId of childIds) {
+      await harness.register({
+        parentThreadId: parent,
+        childThreadId,
+        detached: false,
+        model: codexModel,
+        spawnedAtMs: 0,
+      });
+      await harness.feed(threadUnarchivedEvent(childThreadId));
+    }
+
+    const entries = await runtimeListChildren(harness, parent);
+    expect(entries).toHaveLength(6);
+    expect(entries.every((entry) => !entry.settled)).toBe(true);
+    expect(await harness.canAcquireDispatchLease()).toBe(false);
+  });
+
+  it("reacquires active preregistration archive leases when unarchived before registration", async () => {
+    const parent = ThreadId.make("live-preregister-active-unarchive-parent");
+    const childIds = Array.from({ length: 6 }, (_, index) =>
+      ThreadId.make(`live-preregister-active-unarchive-child-${index + 1}`),
+    );
+    const harness = await createHarness({
+      threads: childIds.map((threadId) =>
+        makeThreadState({
+          threadId,
+          parentThreadId: parent,
+          latestTurn: makeLatestTurn("running", TurnId.make("turn-1")),
+          session: makeSession(threadId, "running", TurnId.make("turn-1")),
+        }),
+      ),
+    });
+    for (const childThreadId of childIds) {
+      await harness.seedDispatchLease(childThreadId);
+      await harness.feed(threadArchivedEvent(childThreadId));
+    }
+    expect(await harness.canAcquireDispatchLease()).toBe(true);
+
+    for (const childThreadId of childIds) {
+      await harness.feed(threadUnarchivedEvent(childThreadId));
+    }
+    expect(await harness.canAcquireDispatchLease()).toBe(false);
+
+    for (const childThreadId of childIds) {
+      await harness.register({
+        parentThreadId: parent,
+        childThreadId,
+        detached: false,
+        model: codexModel,
+        spawnedAtMs: 0,
+      });
+    }
+
+    const entries = await runtimeListChildren(harness, parent);
+    expect(entries).toHaveLength(6);
+    expect(entries.every((entry) => !entry.settled)).toBe(true);
+  });
+
+  it("does not seed dispatch leases for unregistered root thread unarchives", async () => {
+    const threadIds = Array.from({ length: 6 }, (_, index) =>
+      ThreadId.make(`live-root-active-unarchive-${index + 1}`),
+    );
+    const harness = await createHarness({
+      threads: threadIds.map((threadId) =>
+        makeThreadState({
+          threadId,
+          latestTurn: makeLatestTurn("running", TurnId.make("turn-1")),
+          session: makeSession(threadId, "running", TurnId.make("turn-1")),
+        }),
+      ),
+    });
+
+    for (const threadId of threadIds) {
+      await harness.feed(threadArchivedEvent(threadId));
+      await harness.feed(threadUnarchivedEvent(threadId));
+    }
+
+    expect(await harness.canAcquireDispatchLease()).toBe(true);
+  });
+
   it("does not reacquire live archive leases on unarchive when projection is inactive", async () => {
     const parent = ThreadId.make("live-unarchive-inactive-parent");
     const childIds = Array.from({ length: 6 }, (_, index) =>
@@ -3825,6 +3929,39 @@ describe("ChildThreadCoordinator", () => {
     expect(entries).toHaveLength(6);
     expect(entries.every((entry) => !entry.settled)).toBe(true);
     expect(await harness.canAcquireDispatchLease()).toBe(false);
+  });
+
+  it("keeps unarchive markers seen before registration", async () => {
+    const parent = ThreadId.make("live-preregister-unarchive-marker-parent");
+    const child = ThreadId.make("live-preregister-unarchive-marker-child");
+    const turn1 = TurnId.make("turn-1");
+    const harness = await createHarness({
+      threads: [
+        makeThreadState({
+          threadId: child,
+          parentThreadId: parent,
+          latestTurn: makeLatestTurn("completed", turn1),
+          session: makeSession(child, "stopped"),
+          assistantText: "completed before preregister unarchive",
+        }),
+      ],
+    });
+
+    await harness.feed(threadArchivedEvent(child));
+    await harness.feed(threadUnarchivedEvent(child));
+    await harness.register({
+      parentThreadId: parent,
+      childThreadId: child,
+      detached: false,
+      model: codexModel,
+      spawnedAtMs: 0,
+    });
+
+    expect((await runtimeListChildren(harness, parent))[0]?.settled).toBe(true);
+    await harness.feed(turnStartRequestedEvent(child));
+    const entries = await runtimeListChildren(harness, parent);
+    expect(entries).toHaveLength(1);
+    expect(entries[0]!.settled).toBe(false);
   });
 
   it("drops stale queued wakes when an unarchived terminal child starts a new turn", async () => {

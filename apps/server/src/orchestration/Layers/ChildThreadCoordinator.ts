@@ -1583,7 +1583,17 @@ const make = Effect.gen(function* () {
           if (shellOutcome !== null) {
             archivedChildIds.delete(threadId);
             archivedActiveChildIds.delete(threadId);
-            yield* completeChild(threadId, shellOutcome.status, null, shellOutcome.error);
+            const terminalDetail = yield* getThreadDetailBounded(threadId);
+            const finalAssistantText = Option.match(terminalDetail, {
+              onNone: () => null,
+              onSome: finalAssistantTextFromThread,
+            });
+            yield* completeChild(
+              threadId,
+              shellOutcome.status,
+              finalAssistantText,
+              shellOutcome.error,
+            );
             return;
           }
         }
@@ -1606,10 +1616,17 @@ const make = Effect.gen(function* () {
       }
       if (Option.isNone(detail)) return;
       const outcome = projectedLifecycleTerminal({ ...detail.value, archivedAt });
-      if (outcome === null) return;
+      if (outcome === null) {
+        if (detail.value.parentThreadId !== undefined && detail.value.parentThreadId !== null) {
+          archivedActiveChildIds.add(threadId);
+          yield* dispatchLimiter.releaseForChild(threadId);
+        }
+        return;
+      }
       if (!isThreadArchivedOutcome(outcome)) {
         archivedChildIds.delete(threadId);
       }
+      archivedActiveChildIds.delete(threadId);
       yield* dispatchLimiter.releaseForChild(threadId);
       yield* completeChild(
         threadId,
@@ -1773,7 +1790,17 @@ const make = Effect.gen(function* () {
       const { threadId } = event.payload;
       archivedChildIds.delete(threadId);
       const record = children.get(threadId);
-      if (!record) return;
+      if (!record) {
+        if (archivedActiveChildIds.has(threadId)) {
+          const shell = yield* getThreadShellBounded(threadId);
+          if (Option.isSome(shell) ? isProjectedChildActive(shell.value) : true) {
+            yield* dispatchLimiter.seedChild(threadId);
+          }
+          archivedActiveChildIds.delete(threadId);
+        }
+        unarchivedTerminalChildIds.add(threadId);
+        return;
+      }
       const completed = yield* Deferred.poll(record.terminal);
       if (Option.isNone(completed)) return;
       const result = yield* completed.value;
