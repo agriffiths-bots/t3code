@@ -90,6 +90,7 @@ interface UsageCredentialScope {
 
 interface CodexAppServerResponse {
   readonly id?: unknown;
+  readonly method?: unknown;
   readonly result?: unknown;
   readonly error?: unknown;
 }
@@ -504,15 +505,19 @@ function codexWindow(input: {
   };
 }
 
-function codexIndividualLimitWindow(raw: unknown): PlanUsageWindow | null {
-  const limit = objectValue(raw);
+function codexIndividualLimitWindow(input: {
+  readonly id: string;
+  readonly title: string;
+  readonly raw: unknown;
+}): PlanUsageWindow | null {
+  const limit = objectValue(input.raw);
   const remainingPercent = numberValue(limit?.remainingPercent);
   if (remainingPercent === null) return null;
   return {
-    id: "codex-individual-limit",
+    id: input.id,
     provider: "codex",
     kind: "individual_limit",
-    title: "Codex individual limit",
+    title: input.title,
     usedPercent: clampPercent(100 - remainingPercent),
     resetAt: unixSecondsToIso(limit?.resetsAt),
     used: numberLikeValue(limit?.used),
@@ -522,26 +527,83 @@ function codexIndividualLimitWindow(raw: unknown): PlanUsageWindow | null {
   };
 }
 
+function codexRateLimitBucketSlug(value: string | null, index: number): string {
+  const slug = value
+    ?.toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+  return slug || `limit-${index + 1}`;
+}
+
+function codexRateLimitBucketLabel(
+  rateLimits: Record<string, unknown>,
+  fallbackKey: string | null,
+): string | null {
+  return stringValue(rateLimits.limitName) ?? fallbackKey;
+}
+
+function codexWindowsForRateLimitBucket(input: {
+  readonly rateLimits: Record<string, unknown>;
+  readonly idPrefix: string;
+  readonly titleSuffix: string;
+}): ReadonlyArray<PlanUsageWindow> {
+  return [
+    codexWindow({
+      id: `${input.idPrefix}five-hour`,
+      kind: "five_hour",
+      title: `Codex 5h${input.titleSuffix}`,
+      raw: input.rateLimits.primary,
+    }),
+    codexWindow({
+      id: `${input.idPrefix}weekly`,
+      kind: "weekly",
+      title: `Codex weekly${input.titleSuffix}`,
+      raw: input.rateLimits.secondary,
+    }),
+    codexIndividualLimitWindow({
+      id: `${input.idPrefix}individual-limit`,
+      title: `Codex individual limit${input.titleSuffix}`,
+      raw: input.rateLimits.individualLimit,
+    }),
+  ].filter((window): window is PlanUsageWindow => window !== null);
+}
+
 function parseCodexRateLimitsResponse(payload: unknown): ParsedProviderUsage | null {
   const root = objectValue(payload);
   const rateLimits = objectValue(root?.rateLimits);
   if (!root || !rateLimits) return null;
 
-  const windows = [
-    codexWindow({
-      id: "codex-five-hour",
-      kind: "five_hour",
-      title: "Codex 5h",
-      raw: rateLimits.primary,
-    }),
-    codexWindow({
-      id: "codex-weekly",
-      kind: "weekly",
-      title: "Codex weekly",
-      raw: rateLimits.secondary,
-    }),
-    codexIndividualLimitWindow(rateLimits.individualLimit),
-  ].filter((window): window is PlanUsageWindow => window !== null);
+  const rateLimitsByLimitId = objectValue(root.rateLimitsByLimitId);
+  const bucketEntries = rateLimitsByLimitId
+    ? Object.entries(rateLimitsByLimitId)
+        .map(([key, value], index) => ({ index, key, rateLimits: objectValue(value) }))
+        .filter(
+          (
+            entry,
+          ): entry is {
+            readonly index: number;
+            readonly key: string;
+            readonly rateLimits: Record<string, unknown>;
+          } => entry.rateLimits !== null,
+        )
+    : [];
+  const bucketWindows = bucketEntries.flatMap(({ index, key, rateLimits: bucket }) => {
+    const slug = codexRateLimitBucketSlug(stringValue(bucket.limitId) ?? key, index);
+    const label = codexRateLimitBucketLabel(bucket, key);
+    return codexWindowsForRateLimitBucket({
+      rateLimits: bucket,
+      idPrefix: `codex-${slug}-`,
+      titleSuffix: label && bucketEntries.length > 1 ? ` (${label})` : "",
+    });
+  });
+  const windows =
+    bucketWindows.length > 0
+      ? bucketWindows
+      : codexWindowsForRateLimitBucket({
+          rateLimits,
+          idPrefix: "codex-",
+          titleSuffix: "",
+        });
 
   if (windows.length === 0) return null;
   return {
@@ -888,6 +950,25 @@ function parseCodexAppServerLine(line: string): CodexAppServerResponse | null {
   }
 }
 
+function codexAppServerMessageId(value: unknown): string | number | null {
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  return stringValue(value);
+}
+
+function writeCodexAppServerError(
+  child: NodeChildProcess.ChildProcess,
+  id: string | number,
+  message: string,
+): void {
+  writeCodexAppServerMessage(child, {
+    id,
+    error: {
+      code: -32601,
+      message,
+    },
+  });
+}
+
 async function terminateCodexAppServer(child: NodeChildProcess.ChildProcess): Promise<void> {
   child.stdin?.end();
   child.stdout?.destroy();
@@ -956,7 +1037,7 @@ async function readCodexAppServerRateLimits(
   let nextRequestId = 0;
   let stdoutBuffer = "";
   const pending = new Map<
-    number,
+    string,
     {
       readonly resolve: (value: unknown) => void;
       readonly reject: (cause: Error) => void;
@@ -972,11 +1053,16 @@ async function readCodexAppServerRateLimits(
 
   const handleLine = (line: string): void => {
     const message = parseCodexAppServerLine(line);
-    const id = numberValue(message?.id);
+    const id = codexAppServerMessageId(message?.id);
     if (id === null) return;
-    const request = pending.get(id);
+    const method = stringValue(message?.method);
+    if (method) {
+      writeCodexAppServerError(child, id, `Method not found: ${method}`);
+      return;
+    }
+    const request = pending.get(String(id));
     if (!request) return;
-    pending.delete(id);
+    pending.delete(String(id));
     if (message?.error !== undefined) {
       request.reject(new Error("Codex app-server returned an error response."));
       return;
@@ -1007,7 +1093,7 @@ async function readCodexAppServerRateLimits(
   const request = (method: string, params?: unknown): Promise<unknown> => {
     const id = ++nextRequestId;
     return new Promise((resolve, reject) => {
-      pending.set(id, { resolve, reject });
+      pending.set(String(id), { resolve, reject });
       try {
         writeCodexAppServerMessage(child, {
           id,
@@ -1015,7 +1101,7 @@ async function readCodexAppServerRateLimits(
           ...(params === undefined ? {} : { params }),
         });
       } catch (cause) {
-        pending.delete(id);
+        pending.delete(String(id));
         reject(cause instanceof Error ? cause : new Error(String(cause)));
       }
     });

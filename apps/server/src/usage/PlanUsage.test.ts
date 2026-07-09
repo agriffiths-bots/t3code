@@ -16,6 +16,7 @@ import { __testing, loadPlanUsageSnapshot } from "./PlanUsage.ts";
 async function makeFakeCodexAppServer(input: {
   readonly rateLimitsResponse: unknown;
   readonly requiredEnv?: Readonly<Record<string, string>>;
+  readonly serverRequestMethod?: string | undefined;
 }): Promise<{
   readonly binaryPath: string;
   readonly homePath: string;
@@ -47,12 +48,29 @@ if (process.env.CODEX_HOME !== ${JSON.stringify(homePath)}) {
 
 const requestsPath = ${JSON.stringify(requestsPath)};
 const rateLimitsResponse = ${JSON.stringify(input.rateLimitsResponse)};
+const serverRequestMethod = ${JSON.stringify(input.serverRequestMethod ?? null)};
+let sawServerRequestResponse = serverRequestMethod === null;
 const write = (message) => process.stdout.write(JSON.stringify(message) + "\\n");
 const rl = readline.createInterface({ input: process.stdin });
 rl.on("line", (line) => {
   const rpc = JSON.parse(line);
-  fs.appendFileSync(requestsPath, JSON.stringify({ method: rpc.method, params: rpc.params ?? null }) + "\\n");
+  fs.appendFileSync(
+    requestsPath,
+    JSON.stringify({
+      id: rpc.id ?? null,
+      method: rpc.method ?? null,
+      params: rpc.params ?? null,
+      error: rpc.error ?? null
+    }) + "\\n"
+  );
+  if (rpc.id === "server-request-1" && rpc.error) {
+    sawServerRequestResponse = true;
+    return;
+  }
   if (rpc.id && rpc.method === "initialize") {
+    if (serverRequestMethod) {
+      write({ id: "server-request-1", method: serverRequestMethod, params: {} });
+    }
     write({
       id: rpc.id,
       result: {
@@ -68,6 +86,10 @@ rl.on("line", (line) => {
     return;
   }
   if (rpc.id && rpc.method === "account/rateLimits/read") {
+    if (!sawServerRequestResponse) {
+      console.error("missing server request response");
+      process.exit(5);
+    }
     write({ id: rpc.id, result: rateLimitsResponse });
     process.exit(0);
   }
@@ -216,12 +238,49 @@ describe("PlanUsage", () => {
     expect(result?.windows.map((window) => window.id)).toEqual(["codex-weekly"]);
   });
 
+  it("maps Codex app-server multi-bucket rate limits", () => {
+    const result = __testing.parseCodexRateLimitsResponse({
+      rateLimits: {
+        planType: "pro",
+        primary: { usedPercent: 1, resetsAt: 1783103404 },
+      },
+      rateLimitsByLimitId: {
+        codex: {
+          limitId: "codex",
+          limitName: "Codex",
+          planType: "pro",
+          primary: { usedPercent: 22, resetsAt: 1783103404, windowDurationMins: 300 },
+          secondary: { usedPercent: 44, resetsAt: 1783419037, windowDurationMins: 10080 },
+        },
+        spark: {
+          limitId: "spark",
+          limitName: "Spark",
+          planType: "pro",
+          secondary: { usedPercent: 91, resetsAt: 1783419037, windowDurationMins: 10080 },
+        },
+      },
+    });
+
+    expect(result?.windows.map((window) => window.id)).toEqual([
+      "codex-codex-five-hour",
+      "codex-codex-weekly",
+      "codex-spark-weekly",
+    ]);
+    expect(result?.windows.map((window) => window.title)).toEqual([
+      "Codex 5h (Codex)",
+      "Codex weekly (Codex)",
+      "Codex weekly (Spark)",
+    ]);
+    expect(result?.windows.map((window) => window.usedPercent)).toEqual([22, 44, 91]);
+  });
+
   it("reads Codex usage through the official app-server probe", async () => {
     const now = Date.parse("2026-07-06T15:10:00.000Z");
     const fake = await makeFakeCodexAppServer({
       requiredEnv: {
         HTTPS_PROXY: "http://proxy.example",
       },
+      serverRequestMethod: "account/chatgptAuthTokens/refresh",
       rateLimitsResponse: {
         rateLimits: {
           planType: "team",
@@ -255,10 +314,17 @@ describe("PlanUsage", () => {
       .trim()
       .split("\n")
       .map(
-        (line) => JSON.parse(line) as { readonly method: string; readonly params: unknown | null },
+        (line) =>
+          JSON.parse(line) as {
+            readonly id: string | number | null;
+            readonly method: string | null;
+            readonly params: unknown | null;
+            readonly error: { readonly code?: number; readonly message?: string } | null;
+          },
       );
     expect(requests.map((request) => request.method)).toEqual([
       "initialize",
+      null,
       "initialized",
       "account/rateLimits/read",
     ]);
@@ -266,8 +332,13 @@ describe("PlanUsage", () => {
       capabilities: { experimentalApi: true },
       clientInfo: { name: "t3code_usage" },
     });
-    expect(requests[1]?.params).toBeNull();
+    expect(requests[1]?.id).toBe("server-request-1");
+    expect(requests[1]?.error).toMatchObject({
+      code: -32601,
+      message: "Method not found: account/chatgptAuthTokens/refresh",
+    });
     expect(requests[2]?.params).toBeNull();
+    expect(requests[3]?.params).toBeNull();
   });
 
   it("maps Claude dynamic limits including scoped Fable weekly usage", () => {
