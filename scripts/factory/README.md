@@ -20,11 +20,19 @@ remediation steps.
    `factory.conf`; they never modify files). The repo marks these checks as
    parallel-safe, so the gate overlaps them and replays logs in configured
    order.
-3. **Autoreview** — Codex `gpt-5.5` (high) over exactly the staged diff
+3. **Autoreview** — Codex `gpt-5.6-sol` (high) over exactly the staged diff
    (`--mode local`). Clean review ⇒ commit passes. Findings ⇒ commit refused.
 
 A PASS is cached against the `(HEAD, staged-tree)` pair, so retries and the
 `--prepare` pre-warm are instant. Any staged change invalidates the cache.
+
+For a provider outage, the overseer may place
+`~/.openclaw/factory-reviewer-override.conf` on Adam's instruction (and remove
+it afterward). For example, Codex weekly exhaustion can use
+`--reviewers claude --model claude=opus-4.8 --thinking claude=high`. The gate
+whitelist-validates the file and writes every use or rejection to the audit
+JSONL as `kind:"reviewer-override"`; malformed values fall back to the pinned
+default. The verified Claude tuple above is the only accepted override.
 
 ## Recommended agent flow
 

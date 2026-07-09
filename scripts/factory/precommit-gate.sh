@@ -209,6 +209,32 @@ audit() { # audit <verdict> <detail-json-object> — the gate's guarantees are
     }
 }
 
+apply_reviewer_override() {
+  local override_file override_args default_args status
+  override_file="$HOME/.openclaw/factory-reviewer-override.conf"
+  [ -s "$override_file" ] || return 0
+  override_args="$(<"$override_file")"
+  [ -n "$override_args" ] || return 0
+  default_args="${FACTORY_REVIEW_ARGS[*]}"
+  status="rejected"
+  if [[ "$override_args" =~ ^--reviewers\ [-A-Za-z0-9=.\ ]+$ ]] \
+     && [ "$override_args" = "--reviewers claude --model claude=opus-4.8 --thinking claude=high" ]; then
+    read -r -a FACTORY_REVIEW_ARGS <<< "$override_args"
+    status="used"
+  else
+    echo "factory-gate: reviewer override rejected; using pinned default" >&2
+  fi
+  mkdir -p "$(dirname "$FACTORY_AUDIT_LOG")" 2>/dev/null
+  jq -cn --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg repo "$REPO_ROOT" \
+    --arg status "$status" --arg args "${FACTORY_REVIEW_ARGS[*]}" \
+    --arg requested "$override_args" --arg default_args "$default_args" \
+    '{ts:$ts,kind:"reviewer-override",repo:$repo,status:$status,args:$args,requested:$requested,default_args:$default_args}' \
+    >> "$FACTORY_AUDIT_LOG" || {
+      echo "factory-gate: FATAL — cannot audit reviewer override; refusing" >&2
+      exit 2
+    }
+}
+
 refuse() { # refuse <short> <verdict> <detail-json>
   echo "" >&2
   echo "factory-gate: COMMIT REFUSED — $1" >&2
@@ -330,7 +356,12 @@ done
 
 HEAD_SHA="$(head_sha)"
 TREE_SHA="$(git write-tree)" || refuse "git write-tree failed (unmerged index?)" scope-write-tree '{}'
-GATE_ID="$HEAD_SHA $TREE_SHA"
+# The effective reviewer configuration is part of the cache identity: a PASS
+# pre-warmed under one reviewer must not be reusable after the override file
+# changes (add/remove/edit), or a review skip could dodge the pinned reviewer.
+apply_reviewer_override
+REVIEWER_FP="$(printf '%s' "${FACTORY_REVIEW_ARGS[*]}" | sha256sum | cut -c1-12)"
+GATE_ID="$HEAD_SHA $TREE_SHA $REVIEWER_FP"
 SCOPE_DONE_MS="$(now_ms)"
 
 append_static_check_result() { # append_static_check_result <cmd> <rc> <elapsed-ms>
