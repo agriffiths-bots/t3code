@@ -16,6 +16,7 @@ import { isTemporaryWorktreeBranch, WORKTREE_BRANCH_PREFIX } from "@t3tools/shar
 import * as Cache from "effect/Cache";
 import * as Cause from "effect/Cause";
 import * as Crypto from "effect/Crypto";
+import * as DateTime from "effect/DateTime";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Equal from "effect/Equal";
@@ -89,6 +90,7 @@ const HANDLED_TURN_START_KEY_MAX = 10_000;
 const HANDLED_TURN_START_KEY_TTL = Duration.minutes(30);
 const DEFAULT_RUNTIME_MODE: RuntimeMode = "full-access";
 const DEFAULT_THREAD_TITLE = "New thread";
+const nowIso = Effect.map(DateTime.now, DateTime.formatIso);
 
 function normalizeWorktreeIdentityPath(value: string | null | undefined): string | null {
   const trimmed = value?.trim();
@@ -384,6 +386,11 @@ const make = Effect.gen(function* () {
       .pipe(Effect.map(Option.getOrUndefined));
   });
 
+  const isThreadArchivedOrGone = Effect.fnUntraced(function* (threadId: ThreadId) {
+    const thread = yield* resolveThread(threadId);
+    return !thread || thread.archivedAt !== null;
+  });
+
   const isUnstartedSyntheticErrorSession = (thread: {
     readonly latestTurn?: { readonly startedAt: string | null } | null;
     readonly session: { readonly lastError?: string | null; readonly status: string } | null;
@@ -398,6 +405,83 @@ const make = Effect.gen(function* () {
     providerService
       .listSessions()
       .pipe(Effect.map((sessions) => sessions.find((session) => session.threadId === threadId)));
+
+  const dispatchArchivedThreadSessionStop = Effect.fnUntraced(function* (input: {
+    readonly threadId: ThreadId;
+    readonly createdAt: string;
+  }) {
+    const commandId = yield* serverCommandId("provider-archived-session-stop");
+    yield* orchestrationEngine.dispatch({
+      type: "thread.session.stop",
+      commandId,
+      threadId: input.threadId,
+      createdAt: input.createdAt,
+    });
+  });
+  const archivedTurnStartCancellationDetail = (threadId: ThreadId) =>
+    `Thread '${threadId}' was archived before the queued provider turn start could run.`;
+
+  const stopTurnStartIfThreadArchived = Effect.fnUntraced(function* (input: {
+    readonly threadId: ThreadId;
+    readonly modelSelection?: ModelSelection;
+    readonly runtimeMode?: RuntimeMode;
+    readonly createdAt: string;
+  }) {
+    const latestThread = yield* resolveThread(input.threadId);
+    if (!latestThread || latestThread.archivedAt === null) {
+      return false;
+    }
+
+    const activeSession = yield* resolveActiveSession(input.threadId);
+    const hasSessionToStop =
+      (latestThread.session !== null && latestThread.session.status !== "stopped") ||
+      activeSession !== undefined;
+    const cancellationCreatedAt = yield* nowIso;
+    if (hasSessionToStop) {
+      yield* dispatchArchivedThreadSessionStop({
+        threadId: input.threadId,
+        createdAt: cancellationCreatedAt,
+      }).pipe(
+        Effect.catchCause((cause) =>
+          Effect.logWarning("provider command reactor failed to stop archived thread session", {
+            threadId: input.threadId,
+            cause: Cause.pretty(cause),
+          }),
+        ),
+      );
+    } else {
+      yield* setThreadSessionErrorOnTurnStartFailure({
+        threadId: input.threadId,
+        detail: archivedTurnStartCancellationDetail(input.threadId),
+        ...(input.modelSelection !== undefined ? { modelSelection: input.modelSelection } : {}),
+        ...(input.runtimeMode !== undefined ? { runtimeMode: input.runtimeMode } : {}),
+        createdAt: cancellationCreatedAt,
+      }).pipe(
+        Effect.catchCause((cause) =>
+          Effect.logWarning("provider command reactor failed to mark archived turn cancelled", {
+            threadId: input.threadId,
+            cause: Cause.pretty(cause),
+          }),
+        ),
+      );
+    }
+    yield* appendProviderFailureActivity({
+      threadId: input.threadId,
+      kind: "provider.turn.start.failed",
+      summary: "Provider turn start cancelled",
+      detail: archivedTurnStartCancellationDetail(input.threadId),
+      turnId: null,
+      createdAt: cancellationCreatedAt,
+    }).pipe(
+      Effect.catchCause((cause) =>
+        Effect.logWarning("provider command reactor failed to record archived turn cancellation", {
+          threadId: input.threadId,
+          cause: Cause.pretty(cause),
+        }),
+      ),
+    );
+    return true;
+  });
 
   const rejectStartedThreadModelChangeIfRequired = Effect.fnUntraced(function* (input: {
     readonly threadId: ThreadId;
@@ -766,6 +850,9 @@ const make = Effect.gen(function* () {
     yield* Effect.gen(function* () {
       const snapshot = yield* projectionSnapshotQuery.getSnapshot();
       const currentThread = snapshot.threads.find((thread) => thread.id === input.threadId);
+      if (!currentThread || currentThread.archivedAt !== null) {
+        return;
+      }
       const currentWorktreeIdentity = worktreeIdentityPath({
         worktreePath: input.worktreePath,
         worktreeRemovalPath: currentThread?.worktreeRemovalPath,
@@ -794,6 +881,7 @@ const make = Effect.gen(function* () {
 
       const targetBranch = buildGeneratedWorktreeBranchName(generated.branch);
       if (targetBranch === oldBranch) return;
+      if (yield* isThreadArchivedOrGone(input.threadId)) return;
 
       const renamed = yield* gitWorkflow.renameBranch({ cwd, oldBranch, newBranch: targetBranch });
       yield* orchestrationEngine.dispatch({
@@ -826,6 +914,9 @@ const make = Effect.gen(function* () {
     }) {
       const attachments = input.attachments ?? [];
       yield* Effect.gen(function* () {
+        if (yield* isThreadArchivedOrGone(input.threadId)) {
+          return;
+        }
         const { textGenerationModelSelection: modelSelection } =
           yield* serverSettingsService.getSettings;
 
@@ -839,6 +930,9 @@ const make = Effect.gen(function* () {
 
         const thread = yield* resolveThread(input.threadId);
         if (!thread) return;
+        if (thread.archivedAt !== null) {
+          return;
+        }
         if (!canReplaceThreadTitle(thread.title, input.titleSeed)) {
           return;
         }
@@ -873,7 +967,6 @@ const make = Effect.gen(function* () {
     if (!thread) {
       return;
     }
-
     const message = thread.messages.find((entry) => entry.id === event.payload.messageId);
     if (!message || (message.role !== "user" && message.role !== "system")) {
       yield* appendProviderFailureActivity({
@@ -886,10 +979,35 @@ const make = Effect.gen(function* () {
       });
       return;
     }
+    if (
+      yield* stopTurnStartIfThreadArchived({
+        threadId: event.payload.threadId,
+        ...(event.payload.modelSelection !== undefined
+          ? { modelSelection: event.payload.modelSelection }
+          : {}),
+        runtimeMode: event.payload.runtimeMode,
+        createdAt: event.payload.createdAt,
+      })
+    ) {
+      return;
+    }
 
     const isFirstUserMessageTurn =
       message.role === "user" &&
       thread.messages.filter((entry) => entry.role === "user").length === 1;
+    if (
+      isFirstUserMessageTurn &&
+      (yield* stopTurnStartIfThreadArchived({
+        threadId: event.payload.threadId,
+        ...(event.payload.modelSelection !== undefined
+          ? { modelSelection: event.payload.modelSelection }
+          : {}),
+        runtimeMode: event.payload.runtimeMode,
+        createdAt: event.payload.createdAt,
+      }))
+    ) {
+      return;
+    }
     if (isFirstUserMessageTurn) {
       const project = yield* resolveProject(thread.projectId);
       const generationCwd =
@@ -917,6 +1035,18 @@ const make = Effect.gen(function* () {
           ...generationInput,
         }).pipe(Effect.forkScoped);
       }
+    }
+    if (
+      yield* stopTurnStartIfThreadArchived({
+        threadId: event.payload.threadId,
+        ...(event.payload.modelSelection !== undefined
+          ? { modelSelection: event.payload.modelSelection }
+          : {}),
+        runtimeMode: event.payload.runtimeMode,
+        createdAt: event.payload.createdAt,
+      })
+    ) {
+      return;
     }
 
     const handleTurnStartFailure = (cause: Cause.Cause<unknown>) => {
@@ -975,6 +1105,14 @@ const make = Effect.gen(function* () {
     );
 
     if (Option.isNone(sendTurnRequest)) {
+      return;
+    }
+    if (
+      yield* stopTurnStartIfThreadArchived({
+        threadId: event.payload.threadId,
+        createdAt: event.payload.createdAt,
+      })
+    ) {
       return;
     }
 
@@ -1116,24 +1254,25 @@ const make = Effect.gen(function* () {
 
     const now = event.payload.createdAt;
     const activeSession = yield* resolveActiveSession(thread.id);
-    if (
+    const shouldStopProjectedSession =
       thread.session &&
       thread.session.status !== "stopped" &&
-      !(activeSession === undefined && isUnstartedSyntheticErrorSession(thread))
-    ) {
+      !(activeSession === undefined && isUnstartedSyntheticErrorSession(thread));
+    if (activeSession !== undefined || shouldStopProjectedSession) {
       yield* providerService.stopSession({ threadId: thread.id });
     }
+    const providerInstanceId =
+      thread.session?.providerInstanceId ?? activeSession?.providerInstanceId;
 
     yield* setThreadSession({
       threadId: thread.id,
       session: {
         threadId: thread.id,
         status: "stopped",
-        providerName: thread.session?.providerName ?? null,
-        ...(thread.session?.providerInstanceId !== undefined
-          ? { providerInstanceId: thread.session.providerInstanceId }
-          : {}),
-        runtimeMode: thread.session?.runtimeMode ?? DEFAULT_RUNTIME_MODE,
+        providerName: thread.session?.providerName ?? activeSession?.provider ?? null,
+        ...(providerInstanceId !== undefined ? { providerInstanceId } : {}),
+        runtimeMode:
+          thread.session?.runtimeMode ?? activeSession?.runtimeMode ?? DEFAULT_RUNTIME_MODE,
         activeTurnId: null,
         lastError: thread.session?.lastError ?? null,
         updatedAt: now,

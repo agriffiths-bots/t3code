@@ -60,6 +60,12 @@ type DecideOrchestrationCommandResult =
   | PlannedOrchestrationEvent
   | ReadonlyArray<PlannedOrchestrationEvent>;
 
+function isWorkspaceOnlyThreadMetaUpdate(
+  command: Extract<OrchestrationCommand, { type: "thread.meta.update" }>,
+): boolean {
+  return command.title === undefined && command.modelSelection === undefined;
+}
+
 /**
  * Every not-yet-archived descendant of `rootThreadId` (children, grandchildren,
  * …), for archive cascade. Iterative BFS over `parentThreadId`; guards against
@@ -371,11 +377,17 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
     }
 
     case "thread.meta.update": {
-      yield* requireThread({
+      const thread = yield* requireThread({
         readModel,
         command,
         threadId: command.threadId,
       });
+      if (thread.archivedAt !== null && !isWorkspaceOnlyThreadMetaUpdate(command)) {
+        return yield* new OrchestrationCommandInvariantError({
+          commandType: command.type,
+          detail: `Thread '${command.threadId}' is already archived and cannot handle command '${command.type}'.`,
+        });
+      }
       const occurredAt = yield* nowIso;
       return {
         ...(yield* withEventBase({
@@ -484,7 +496,7 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
     }
 
     case "thread.turn.start": {
-      const targetThread = yield* requireThread({
+      const targetThread = yield* requireThreadNotArchived({
         readModel,
         command,
         threadId: command.threadId,

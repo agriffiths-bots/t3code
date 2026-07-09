@@ -741,6 +741,7 @@ const buildAppUnderTest = (options?: {
         ),
       ),
       Layer.provide(orchestrationEngineLayer),
+      Layer.provide(orchestrationCommandReceiptRepositoryLayer),
       Layer.provide(
         Layer.mock(ProjectionSnapshotQuery.ProjectionSnapshotQuery)({
           getCommandReadModel: () => Effect.succeed(makeDefaultOrchestrationReadModel()),
@@ -762,6 +763,7 @@ const buildAppUnderTest = (options?: {
           getSnapshotSequence: () => Effect.succeed({ snapshotSequence: 0 }),
           getProjectShellById: () => Effect.succeed(Option.none()),
           getThreadShellById: () => Effect.succeed(Option.none()),
+          getThreadShellByIdIncludingArchived: () => Effect.succeed(Option.none()),
           getThreadDetailById: () => Effect.succeed(Option.none()),
           getThreadDetailSnapshot: () => Effect.succeed(Option.none()),
           getCounts: () => Effect.succeed({ projectCount: 0, threadCount: 0 }),
@@ -5973,6 +5975,396 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
     }).pipe(Effect.provide(NodeHttpServer.layerTest)),
   );
 
+  it.effect("cleans up websocket attachments when queued archive rejects a turn start", () =>
+    Effect.gen(function* () {
+      const fileSystem = yield* FileSystem.FileSystem;
+      const now = "2026-01-01T00:00:00.000Z";
+      const baseDir = yield* fileSystem.makeTempDirectoryScoped({
+        prefix: "t3-archived-attachment-",
+      });
+      const { attachmentsDir } = yield* ServerConfig.deriveServerPaths(baseDir, undefined);
+      const dispatchedCommands: OrchestrationCommand[] = [];
+
+      yield* buildAppUnderTest({
+        config: { baseDir },
+        layers: {
+          orchestrationEngine: {
+            dispatch: (command) =>
+              Effect.sync(() => {
+                dispatchedCommands.push(command);
+              }).pipe(
+                Effect.andThen(
+                  Effect.fail(
+                    new OrchestrationCommandInvariantError({
+                      commandType: "thread.turn.start",
+                      detail: `Thread '${defaultThreadId}' is already archived and cannot handle command 'thread.turn.start'.`,
+                    }),
+                  ),
+                ),
+              ),
+            readEvents: () => Stream.empty,
+          },
+        },
+      });
+
+      const wsUrl = yield* getWsServerUrl("/ws");
+      const result = yield* Effect.scoped(
+        withWsRpcClient(wsUrl, (client) =>
+          client[ORCHESTRATION_WS_METHODS.dispatchCommand]({
+            type: "thread.turn.start",
+            commandId: CommandId.make("cmd-archived-attachment-turn-start"),
+            threadId: defaultThreadId,
+            message: {
+              messageId: MessageId.make("msg-archived-attachment-turn-start"),
+              role: "user",
+              text: "this should not persist an attachment",
+              attachments: [
+                {
+                  type: "image",
+                  name: "archived.png",
+                  mimeType: "image/png",
+                  sizeBytes: NonNegativeInt.make(5),
+                  dataUrl: "data:image/png;base64,aGVsbG8=",
+                },
+              ],
+            },
+            interactionMode: "default",
+            runtimeMode: "full-access",
+            createdAt: now,
+          }),
+        ).pipe(Effect.result),
+      );
+
+      const attachmentEntries = yield* fileSystem
+        .exists(attachmentsDir)
+        .pipe(
+          Effect.flatMap((exists) =>
+            exists ? fileSystem.readDirectory(attachmentsDir) : Effect.succeed([]),
+          ),
+        );
+      assertTrue(result._tag === "Failure");
+      assertTrue(result.failure._tag === "OrchestrationDispatchCommandError");
+      assert.include(result.failure.message, "already archived");
+      assert.deepEqual(
+        dispatchedCommands.map((command) => command.type),
+        ["thread.turn.start"],
+      );
+      assert.deepEqual(attachmentEntries, []);
+    }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+
+  it.effect("does not persist partial websocket attachments when normalization fails", () =>
+    Effect.gen(function* () {
+      const fileSystem = yield* FileSystem.FileSystem;
+      const now = "2026-01-01T00:00:00.000Z";
+      const baseDir = yield* fileSystem.makeTempDirectoryScoped({
+        prefix: "t3-partial-invalid-attachment-",
+      });
+      const { attachmentsDir } = yield* ServerConfig.deriveServerPaths(baseDir, undefined);
+      const dispatchedCommands: OrchestrationCommand[] = [];
+
+      yield* buildAppUnderTest({
+        config: { baseDir },
+        layers: {
+          orchestrationEngine: {
+            dispatch: (command) =>
+              Effect.sync(() => {
+                dispatchedCommands.push(command);
+                return { sequence: 7 };
+              }),
+            readEvents: () => Stream.empty,
+          },
+        },
+      });
+
+      const wsUrl = yield* getWsServerUrl("/ws");
+      const result = yield* Effect.scoped(
+        withWsRpcClient(wsUrl, (client) =>
+          client[ORCHESTRATION_WS_METHODS.dispatchCommand]({
+            type: "thread.turn.start",
+            commandId: CommandId.make("cmd-partial-invalid-attachment-turn-start"),
+            threadId: defaultThreadId,
+            message: {
+              messageId: MessageId.make("msg-partial-invalid-attachment-turn-start"),
+              role: "user",
+              text: "this should not persist the first attachment",
+              attachments: [
+                {
+                  type: "image",
+                  name: "first-valid.png",
+                  mimeType: "image/png",
+                  sizeBytes: NonNegativeInt.make(5),
+                  dataUrl: "data:image/png;base64,aGVsbG8=",
+                },
+                {
+                  type: "image",
+                  name: "second-invalid.png",
+                  mimeType: "image/png",
+                  sizeBytes: NonNegativeInt.make(4),
+                  dataUrl: "data:text/plain;base64,bm9wZQ==",
+                },
+              ],
+            },
+            interactionMode: "default",
+            runtimeMode: "full-access",
+            createdAt: now,
+          }),
+        ).pipe(Effect.result),
+      );
+
+      const attachmentEntries = yield* fileSystem
+        .exists(attachmentsDir)
+        .pipe(
+          Effect.flatMap((exists) =>
+            exists ? fileSystem.readDirectory(attachmentsDir) : Effect.succeed([]),
+          ),
+        );
+      assertTrue(result._tag === "Failure");
+      assertTrue(result.failure._tag === "OrchestrationDispatchCommandError");
+      assert.include(result.failure.message, "Invalid image attachment payload");
+      assert.deepEqual(dispatchedCommands, []);
+      assert.deepEqual(attachmentEntries, []);
+    }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+
+  it.effect("reports HTTP archived turn-start rejections as invalid commands", () =>
+    Effect.gen(function* () {
+      const fileSystem = yield* FileSystem.FileSystem;
+      const now = "2026-01-01T00:00:00.000Z";
+      const baseDir = yield* fileSystem.makeTempDirectoryScoped({
+        prefix: "t3-http-archived-attachment-",
+      });
+      const { attachmentsDir } = yield* ServerConfig.deriveServerPaths(baseDir, undefined);
+      const dispatchedCommands: OrchestrationCommand[] = [];
+
+      yield* buildAppUnderTest({
+        config: { baseDir },
+        layers: {
+          orchestrationEngine: {
+            dispatch: (command) =>
+              Effect.sync(() => {
+                dispatchedCommands.push(command);
+              }).pipe(
+                Effect.andThen(
+                  Effect.fail(
+                    new OrchestrationCommandInvariantError({
+                      commandType: "thread.turn.start",
+                      detail: `Thread '${defaultThreadId}' is already archived and cannot handle command 'thread.turn.start'.`,
+                    }),
+                  ),
+                ),
+              ),
+            readEvents: () => Stream.empty,
+          },
+        },
+      });
+
+      const token = yield* exchangeAccessToken();
+      assert.ok(token.body.access_token);
+      const dispatchUrl = yield* getHttpServerUrl("/api/orchestration/dispatch");
+      const response = yield* fetchEffect(dispatchUrl, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${token.body.access_token}`,
+          "content-type": "application/json",
+        },
+        body: jsonRequestBody({
+          type: "thread.turn.start",
+          commandId: CommandId.make("cmd-http-archived-attachment-turn-start"),
+          threadId: defaultThreadId,
+          message: {
+            messageId: MessageId.make("msg-http-archived-attachment-turn-start"),
+            role: "user",
+            text: "this should be a client error",
+            attachments: [
+              {
+                type: "image",
+                name: "http-archived.png",
+                mimeType: "image/png",
+                sizeBytes: NonNegativeInt.make(5),
+                dataUrl: "data:image/png;base64,aGVsbG8=",
+              },
+            ],
+          },
+          interactionMode: "default",
+          runtimeMode: "full-access",
+          createdAt: now,
+        }),
+      });
+      const responseBody = yield* responseJsonEffect<{
+        readonly code: string;
+        readonly reason: string;
+      }>(response);
+      const attachmentEntries = yield* fileSystem
+        .exists(attachmentsDir)
+        .pipe(
+          Effect.flatMap((exists) =>
+            exists ? fileSystem.readDirectory(attachmentsDir) : Effect.succeed([]),
+          ),
+        );
+
+      assert.equal(response.status, 400);
+      assert.equal(responseBody.code, "invalid_request");
+      assert.equal(responseBody.reason, "invalid_command");
+      assert.deepEqual(
+        dispatchedCommands.map((command) => command.type),
+        ["thread.turn.start"],
+      );
+      assert.deepEqual(attachmentEntries, []);
+    }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+
+  it.effect("reports HTTP receipt read failures as internal dispatch errors", () =>
+    Effect.gen(function* () {
+      const now = "2026-01-01T00:00:00.000Z";
+      const dispatchedCommands: OrchestrationCommand[] = [];
+
+      yield* buildAppUnderTest({
+        layers: {
+          orchestrationCommandReceiptRepository: {
+            getByCommandId: () =>
+              Effect.fail(
+                new PersistenceSqlError({
+                  operation: "OrchestrationCommandReceipts.getByCommandId:test",
+                }),
+              ),
+          },
+          orchestrationEngine: {
+            dispatch: (command) =>
+              Effect.sync(() => {
+                dispatchedCommands.push(command);
+                return { sequence: 7 };
+              }),
+            readEvents: () => Stream.empty,
+          },
+        },
+      });
+
+      const token = yield* exchangeAccessToken();
+      assert.ok(token.body.access_token);
+      const dispatchUrl = yield* getHttpServerUrl("/api/orchestration/dispatch");
+      const response = yield* fetchEffect(dispatchUrl, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${token.body.access_token}`,
+          "content-type": "application/json",
+        },
+        body: jsonRequestBody({
+          type: "thread.turn.start",
+          commandId: CommandId.make("cmd-http-receipt-read-failure"),
+          threadId: defaultThreadId,
+          message: {
+            messageId: MessageId.make("msg-http-receipt-read-failure"),
+            role: "user",
+            text: "receipt read should be retryable",
+            attachments: [],
+          },
+          interactionMode: "default",
+          runtimeMode: "full-access",
+          createdAt: now,
+        }),
+      });
+      const responseBody = yield* responseJsonEffect<{
+        readonly code: string;
+        readonly reason: string;
+      }>(response);
+
+      assert.equal(response.status, 500);
+      assert.equal(responseBody.code, "internal_error");
+      assert.equal(responseBody.reason, "orchestration_dispatch_failed");
+      assert.deepEqual(dispatchedCommands, []);
+    }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+
+  it.effect("keeps accepted turn-start retries idempotent after archive preflight", () =>
+    Effect.gen(function* () {
+      const fileSystem = yield* FileSystem.FileSystem;
+      const now = "2026-01-01T00:00:00.000Z";
+      const commandId = CommandId.make("cmd-accepted-archived-attachment-turn-start");
+      const baseDir = yield* fileSystem.makeTempDirectoryScoped({
+        prefix: "t3-accepted-archived-attachment-",
+      });
+      const { attachmentsDir } = yield* ServerConfig.deriveServerPaths(baseDir, undefined);
+      const dispatchedCommands: OrchestrationCommand[] = [];
+
+      yield* buildAppUnderTest({
+        config: { baseDir },
+        layers: {
+          projectionSnapshotQuery: {
+            getThreadShellByIdIncludingArchived: () =>
+              Effect.die("accepted receipt retries should not read thread archive state"),
+          },
+          orchestrationCommandReceiptRepository: {
+            getByCommandId: (input) =>
+              Effect.succeed(
+                input.commandId === commandId
+                  ? Option.some({
+                      commandId,
+                      aggregateKind: "thread" as const,
+                      aggregateId: defaultThreadId,
+                      acceptedAt: now,
+                      resultSequence: NonNegativeInt.make(42),
+                      status: "accepted" as const,
+                      error: null,
+                    })
+                  : Option.none(),
+              ),
+          },
+          orchestrationEngine: {
+            dispatch: (command) =>
+              Effect.sync(() => {
+                dispatchedCommands.push(command);
+                return { sequence: 42 };
+              }),
+            readEvents: () => Stream.empty,
+          },
+        },
+      });
+
+      const wsUrl = yield* getWsServerUrl("/ws");
+      const result = yield* Effect.scoped(
+        withWsRpcClient(wsUrl, (client) =>
+          client[ORCHESTRATION_WS_METHODS.dispatchCommand]({
+            type: "thread.turn.start",
+            commandId,
+            threadId: defaultThreadId,
+            message: {
+              messageId: MessageId.make("msg-accepted-archived-attachment-turn-start"),
+              role: "user",
+              text: "already accepted",
+              attachments: [
+                {
+                  type: "image",
+                  name: "accepted.png",
+                  mimeType: "image/png",
+                  sizeBytes: NonNegativeInt.make(5),
+                  dataUrl: "data:image/png;base64,aGVsbG8=",
+                },
+              ],
+            },
+            interactionMode: "default",
+            runtimeMode: "full-access",
+            createdAt: now,
+          }),
+        ),
+      );
+
+      const attachmentEntries = yield* fileSystem
+        .exists(attachmentsDir)
+        .pipe(
+          Effect.flatMap((exists) =>
+            exists ? fileSystem.readDirectory(attachmentsDir) : Effect.succeed([]),
+          ),
+        );
+      assert.equal(result.sequence, 42);
+      assert.deepEqual(
+        dispatchedCommands.map((command) => command.type),
+        ["thread.turn.start"],
+      );
+      assert.deepEqual(attachmentEntries, []);
+    }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+
   it.effect("routes websocket rpc orchestration shell snapshot errors", () =>
     Effect.gen(function* () {
       const projectionError = new PersistenceSqlError({
@@ -6314,12 +6706,11 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
     }).pipe(Effect.provide(NodeHttpServer.layerTest)),
   );
 
-  it.effect("stops the provider session and closes thread terminals after archive", () =>
+  it.effect("dispatches archive without transport-scoped cleanup", () =>
     Effect.gen(function* () {
       const threadId = ThreadId.make("thread-archive");
       const effects: string[] = [];
       const dispatchedCommands: Array<OrchestrationCommand> = [];
-      const now = "2026-01-01T00:00:00.000Z";
 
       yield* buildAppUnderTest({
         layers: {
@@ -6336,26 +6727,6 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
                 effects.push(`dispatch:${command.type}`);
                 return { sequence: dispatchedCommands.length };
               }),
-          },
-          projectionSnapshotQuery: {
-            getThreadShellById: () =>
-              Effect.succeed(
-                Option.some(
-                  makeDefaultOrchestrationThreadShell({
-                    id: threadId,
-                    updatedAt: now,
-                    session: {
-                      threadId,
-                      status: "ready",
-                      providerName: "claudeAgent",
-                      runtimeMode: "full-access",
-                      activeTurnId: null,
-                      lastError: null,
-                      updatedAt: now,
-                    },
-                  }),
-                ),
-              ),
           },
         },
       });
@@ -6372,361 +6743,10 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
       );
 
       assert.equal(dispatchResult.sequence, 1);
-      assert.deepEqual(effects, [
-        "dispatch:thread.archive",
-        "dispatch:thread.session.stop",
-        `terminal.close:${threadId}`,
-      ]);
-      const sessionStopCommand = dispatchedCommands[1];
-      assert.equal(sessionStopCommand?.type, "thread.session.stop");
-      if (sessionStopCommand?.type === "thread.session.stop") {
-        assert.equal(sessionStopCommand.threadId, threadId);
-      }
-    }).pipe(Effect.provide(NodeHttpServer.layerTest)),
-  );
-
-  it.effect("checks session status before archiving removes the thread from active lookups", () =>
-    Effect.gen(function* () {
-      const threadId = ThreadId.make("thread-archive-precheck");
-      const effects: string[] = [];
-      const dispatchedCommands: Array<OrchestrationCommand> = [];
-      const now = "2026-01-01T00:00:00.000Z";
-      let archived = false;
-
-      yield* buildAppUnderTest({
-        layers: {
-          terminalManager: {
-            close: (input) =>
-              Effect.sync(() => {
-                effects.push(`terminal.close:${input.threadId}`);
-              }),
-          },
-          orchestrationEngine: {
-            dispatch: (command) =>
-              Effect.sync(() => {
-                dispatchedCommands.push(command);
-                effects.push(`dispatch:${command.type}`);
-                if (command.type === "thread.archive") {
-                  archived = true;
-                }
-                return { sequence: dispatchedCommands.length };
-              }),
-          },
-          projectionSnapshotQuery: {
-            getThreadShellById: () =>
-              Effect.sync(() => {
-                effects.push(`query:thread-shell:${archived ? "archived" : "active"}`);
-                return archived
-                  ? Option.none()
-                  : Option.some(
-                      makeDefaultOrchestrationThreadShell({
-                        id: threadId,
-                        updatedAt: now,
-                        session: {
-                          threadId,
-                          status: "ready",
-                          providerName: "claudeAgent",
-                          runtimeMode: "full-access",
-                          activeTurnId: null,
-                          lastError: null,
-                          updatedAt: now,
-                        },
-                      }),
-                    );
-              }),
-          },
-        },
-      });
-
-      const wsUrl = yield* getWsServerUrl("/ws");
-      const dispatchResult = yield* Effect.scoped(
-        withWsRpcClient(wsUrl, (client) =>
-          client[ORCHESTRATION_WS_METHODS.dispatchCommand]({
-            type: "thread.archive",
-            commandId: CommandId.make("cmd-thread-archive-precheck"),
-            threadId,
-          }),
-        ),
-      );
-
-      assert.equal(dispatchResult.sequence, 1);
-      assert.deepEqual(effects, [
-        "query:thread-shell:active",
-        "dispatch:thread.archive",
-        "dispatch:thread.session.stop",
-        `terminal.close:${threadId}`,
-      ]);
-      assert.deepEqual(
-        dispatchedCommands.map((command) => command.type),
-        ["thread.archive", "thread.session.stop"],
-      );
-    }).pipe(Effect.provide(NodeHttpServer.layerTest)),
-  );
-
-  it.effect("archives without dispatching session stop when the thread has no session", () =>
-    Effect.gen(function* () {
-      const threadId = ThreadId.make("thread-archive-no-session");
-      const effects: string[] = [];
-      const dispatchedCommands: Array<OrchestrationCommand> = [];
-
-      yield* buildAppUnderTest({
-        layers: {
-          terminalManager: {
-            close: (input) =>
-              Effect.sync(() => {
-                effects.push(`terminal.close:${input.threadId}`);
-              }),
-          },
-          orchestrationEngine: {
-            dispatch: (command) =>
-              Effect.sync(() => {
-                dispatchedCommands.push(command);
-                effects.push(`dispatch:${command.type}`);
-                return { sequence: dispatchedCommands.length };
-              }),
-          },
-          projectionSnapshotQuery: {
-            getThreadShellById: () =>
-              Effect.succeed(
-                Option.some(makeDefaultOrchestrationThreadShell({ id: threadId, session: null })),
-              ),
-          },
-        },
-      });
-
-      const wsUrl = yield* getWsServerUrl("/ws");
-      const dispatchResult = yield* Effect.scoped(
-        withWsRpcClient(wsUrl, (client) =>
-          client[ORCHESTRATION_WS_METHODS.dispatchCommand]({
-            type: "thread.archive",
-            commandId: CommandId.make("cmd-thread-archive-no-session"),
-            threadId,
-          }),
-        ),
-      );
-
-      assert.equal(dispatchResult.sequence, 1);
-      assert.deepEqual(effects, ["dispatch:thread.archive", `terminal.close:${threadId}`]);
+      assert.deepEqual(effects, ["dispatch:thread.archive"]);
       assert.deepEqual(
         dispatchedCommands.map((command) => command.type),
         ["thread.archive"],
-      );
-    }).pipe(Effect.provide(NodeHttpServer.layerTest)),
-  );
-
-  it.effect(
-    "archives without dispatching session stop when the thread session is already stopped",
-    () =>
-      Effect.gen(function* () {
-        const threadId = ThreadId.make("thread-archive-stopped-session");
-        const effects: string[] = [];
-        const dispatchedCommands: Array<OrchestrationCommand> = [];
-        const now = "2026-01-01T00:00:00.000Z";
-
-        yield* buildAppUnderTest({
-          layers: {
-            terminalManager: {
-              close: (input) =>
-                Effect.sync(() => {
-                  effects.push(`terminal.close:${input.threadId}`);
-                }),
-            },
-            orchestrationEngine: {
-              dispatch: (command) =>
-                Effect.sync(() => {
-                  dispatchedCommands.push(command);
-                  effects.push(`dispatch:${command.type}`);
-                  return { sequence: dispatchedCommands.length };
-                }),
-            },
-            projectionSnapshotQuery: {
-              getThreadShellById: () =>
-                Effect.succeed(
-                  Option.some(
-                    makeDefaultOrchestrationThreadShell({
-                      id: threadId,
-                      updatedAt: now,
-                      session: {
-                        threadId,
-                        status: "stopped",
-                        providerName: "claudeAgent",
-                        runtimeMode: "full-access",
-                        activeTurnId: null,
-                        lastError: null,
-                        updatedAt: now,
-                      },
-                    }),
-                  ),
-                ),
-            },
-          },
-        });
-
-        const wsUrl = yield* getWsServerUrl("/ws");
-        const dispatchResult = yield* Effect.scoped(
-          withWsRpcClient(wsUrl, (client) =>
-            client[ORCHESTRATION_WS_METHODS.dispatchCommand]({
-              type: "thread.archive",
-              commandId: CommandId.make("cmd-thread-archive-stopped-session"),
-              threadId,
-            }),
-          ),
-        );
-
-        assert.equal(dispatchResult.sequence, 1);
-        assert.deepEqual(effects, ["dispatch:thread.archive", `terminal.close:${threadId}`]);
-        assert.deepEqual(
-          dispatchedCommands.map((command) => command.type),
-          ["thread.archive"],
-        );
-      }).pipe(Effect.provide(NodeHttpServer.layerTest)),
-  );
-
-  it.effect("archives and still closes terminals when session stop fails", () =>
-    Effect.gen(function* () {
-      const threadId = ThreadId.make("thread-archive-stop-failure");
-      const effects: string[] = [];
-      const dispatchedCommands: Array<OrchestrationCommand> = [];
-      const now = "2026-01-01T00:00:00.000Z";
-
-      yield* buildAppUnderTest({
-        layers: {
-          terminalManager: {
-            close: (input) =>
-              Effect.sync(() => {
-                effects.push(`terminal.close:${input.threadId}`);
-              }),
-          },
-          orchestrationEngine: {
-            dispatch: (command) => {
-              dispatchedCommands.push(command);
-              effects.push(`dispatch:${command.type}`);
-              if (command.type === "thread.session.stop") {
-                return Effect.fail(
-                  new OrchestrationListenerCallbackError({
-                    listener: "domain-event",
-                    detail: "simulated archive stop failure",
-                  }),
-                );
-              }
-              return Effect.succeed({ sequence: dispatchedCommands.length });
-            },
-          },
-          projectionSnapshotQuery: {
-            getThreadShellById: () =>
-              Effect.succeed(
-                Option.some(
-                  makeDefaultOrchestrationThreadShell({
-                    id: threadId,
-                    updatedAt: now,
-                    session: {
-                      threadId,
-                      status: "ready",
-                      providerName: "claudeAgent",
-                      runtimeMode: "full-access",
-                      activeTurnId: null,
-                      lastError: null,
-                      updatedAt: now,
-                    },
-                  }),
-                ),
-              ),
-          },
-        },
-      });
-
-      const wsUrl = yield* getWsServerUrl("/ws");
-      const dispatchResult = yield* Effect.scoped(
-        withWsRpcClient(wsUrl, (client) =>
-          client[ORCHESTRATION_WS_METHODS.dispatchCommand]({
-            type: "thread.archive",
-            commandId: CommandId.make("cmd-thread-archive-stop-failure"),
-            threadId,
-          }),
-        ),
-      );
-
-      assert.equal(dispatchResult.sequence, 1);
-      assert.deepEqual(effects, [
-        "dispatch:thread.archive",
-        "dispatch:thread.session.stop",
-        `terminal.close:${threadId}`,
-      ]);
-      assert.deepEqual(
-        dispatchedCommands.map((command) => command.type),
-        ["thread.archive", "thread.session.stop"],
-      );
-    }).pipe(Effect.provide(NodeHttpServer.layerTest)),
-  );
-
-  it.effect("archives and still closes terminals when session stop defects", () =>
-    Effect.gen(function* () {
-      const threadId = ThreadId.make("thread-archive-stop-defect");
-      const effects: string[] = [];
-      const dispatchedCommands: Array<OrchestrationCommand> = [];
-      const now = "2026-01-01T00:00:00.000Z";
-
-      yield* buildAppUnderTest({
-        layers: {
-          terminalManager: {
-            close: (input) =>
-              Effect.sync(() => {
-                effects.push(`terminal.close:${input.threadId}`);
-              }),
-          },
-          orchestrationEngine: {
-            dispatch: (command) => {
-              dispatchedCommands.push(command);
-              effects.push(`dispatch:${command.type}`);
-              if (command.type === "thread.session.stop") {
-                return Effect.die(new Error("simulated archive stop defect"));
-              }
-              return Effect.succeed({ sequence: dispatchedCommands.length });
-            },
-          },
-          projectionSnapshotQuery: {
-            getThreadShellById: () =>
-              Effect.succeed(
-                Option.some(
-                  makeDefaultOrchestrationThreadShell({
-                    id: threadId,
-                    updatedAt: now,
-                    session: {
-                      threadId,
-                      status: "ready",
-                      providerName: "claudeAgent",
-                      runtimeMode: "full-access",
-                      activeTurnId: null,
-                      lastError: null,
-                      updatedAt: now,
-                    },
-                  }),
-                ),
-              ),
-          },
-        },
-      });
-
-      const wsUrl = yield* getWsServerUrl("/ws");
-      const dispatchResult = yield* Effect.scoped(
-        withWsRpcClient(wsUrl, (client) =>
-          client[ORCHESTRATION_WS_METHODS.dispatchCommand]({
-            type: "thread.archive",
-            commandId: CommandId.make("cmd-thread-archive-stop-defect"),
-            threadId,
-          }),
-        ),
-      );
-
-      assert.equal(dispatchResult.sequence, 1);
-      assert.deepEqual(effects, [
-        "dispatch:thread.archive",
-        "dispatch:thread.session.stop",
-        `terminal.close:${threadId}`,
-      ]);
-      assert.deepEqual(
-        dispatchedCommands.map((command) => command.type),
-        ["thread.archive", "thread.session.stop"],
       );
     }).pipe(Effect.provide(NodeHttpServer.layerTest)),
   );
@@ -7786,6 +7806,147 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
         setupActivities.every((command) => command.activity.kind !== "setup-script.failed"),
       );
       assertTrue(dispatchedCommands.every((command) => command.type !== "thread.delete"));
+    }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+
+  it.effect("preserves bootstrapped threads and worktrees when archive wins final turn start", () =>
+    Effect.gen(function* () {
+      const threadId = ThreadId.make("thread-bootstrap-archive-race");
+      const createdAt = "2026-01-01T00:00:00.000Z";
+      const dispatchedCommands: Array<OrchestrationCommand> = [];
+      const createWorktree = vi.fn(
+        (_: Parameters<GitVcsDriver.GitVcsDriver["Service"]["createWorktree"]>[0]) =>
+          Effect.succeed({
+            worktree: {
+              refName: "t3code/archive-race",
+              path: "/tmp/bootstrap-archive-race-worktree",
+            },
+          }),
+      );
+      const removeWorktree = vi.fn(
+        (_: Parameters<GitVcsDriver.GitVcsDriver["Service"]["removeWorktree"]>[0]) => Effect.void,
+      );
+      const runForThread = vi.fn(
+        (
+          _: Parameters<
+            ProjectSetupScriptRunner.ProjectSetupScriptRunner["Service"]["runForThread"]
+          >[0],
+        ) => Effect.die(new Error("unexpected setup script")),
+      );
+
+      yield* buildAppUnderTest({
+        layers: {
+          gitVcsDriver: {
+            createWorktree,
+            removeWorktree,
+          },
+          vcsStatusBroadcaster: {
+            refreshStatus: () =>
+              Effect.succeed({
+                isRepo: true,
+                hasPrimaryRemote: true,
+                isDefaultRef: false,
+                refName: "t3code/archive-race",
+                hasWorkingTreeChanges: false,
+                workingTree: {
+                  files: [],
+                  insertions: 0,
+                  deletions: 0,
+                },
+                hasUpstream: true,
+                aheadCount: 0,
+                behindCount: 0,
+                pr: null,
+              }),
+          },
+          projectSetupScriptRunner: {
+            runForThread,
+          },
+          projectionSnapshotQuery: {
+            getThreadShellByIdIncludingArchived: (requestedThreadId) =>
+              Effect.succeed(
+                requestedThreadId === threadId
+                  ? Option.some(
+                      makeDefaultOrchestrationThreadShell({
+                        id: threadId,
+                        archivedAt: createdAt,
+                      }),
+                    )
+                  : Option.none(),
+              ),
+          },
+          orchestrationEngine: {
+            dispatch: (command) =>
+              Effect.sync(() => {
+                dispatchedCommands.push(command);
+                return command;
+              }).pipe(
+                Effect.flatMap((dispatched) =>
+                  dispatched.type === "thread.turn.start"
+                    ? Effect.fail(
+                        new OrchestrationCommandInvariantError({
+                          commandType: "thread.turn.start",
+                          detail: `Thread '${threadId}' is already archived and cannot handle command 'thread.turn.start'.`,
+                        }),
+                      )
+                    : Effect.succeed({ sequence: dispatchedCommands.length }),
+                ),
+              ),
+            readEvents: () => Stream.empty,
+          },
+        },
+      });
+
+      const wsUrl = yield* getWsServerUrl("/ws");
+      const result = yield* Effect.scoped(
+        withWsRpcClient(wsUrl, (client) =>
+          client[ORCHESTRATION_WS_METHODS.dispatchCommand]({
+            type: "thread.turn.start",
+            commandId: CommandId.make("cmd-bootstrap-turn-start-archive-race"),
+            threadId,
+            message: {
+              messageId: MessageId.make("msg-bootstrap-archive-race"),
+              role: "user",
+              text: "archive wins during bootstrap",
+              attachments: [],
+            },
+            modelSelection: defaultModelSelection,
+            runtimeMode: "full-access",
+            interactionMode: "default",
+            bootstrap: {
+              createThread: {
+                projectId: defaultProjectId,
+                title: "Bootstrap Archive Race",
+                modelSelection: defaultModelSelection,
+                runtimeMode: "full-access",
+                interactionMode: "default",
+                branch: "main",
+                worktreePath: null,
+                createdAt,
+              },
+              prepareWorktree: {
+                projectCwd: "/tmp/project",
+                baseBranch: "main",
+                branch: "t3code/archive-race",
+              },
+              runSetupScript: true,
+            },
+            createdAt,
+          }),
+        ).pipe(Effect.result),
+      );
+
+      assertTrue(result._tag === "Failure");
+      assertTrue(result.failure._tag === "OrchestrationDispatchCommandError");
+      assert.include(result.failure.message, "already archived");
+      assert.deepEqual(
+        dispatchedCommands.map((command) => command.type),
+        ["thread.create", "thread.meta.update", "thread.turn.start"],
+      );
+      assertTrue(dispatchedCommands.every((command) => command.type !== "thread.delete"));
+      assert.equal(createWorktree.mock.calls.length, 1);
+      assert.equal(removeWorktree.mock.calls.length, 0);
+      assert.equal(runForThread.mock.calls.length, 0);
     }).pipe(Effect.provide(NodeHttpServer.layerTest)),
   );
 

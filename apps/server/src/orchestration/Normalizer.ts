@@ -1,7 +1,10 @@
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
+import * as Option from "effect/Option";
 import * as Path from "effect/Path";
+import * as Cause from "effect/Cause";
 import {
+  type ChatAttachment,
   type ClientOrchestrationCommand,
   type OrchestrationCommand,
   OrchestrationDispatchCommandError,
@@ -11,7 +14,56 @@ import {
 import { createAttachmentId, resolveAttachmentPath } from "../attachmentStore.ts";
 import { ServerConfig } from "../config.ts";
 import { parseBase64DataUrl } from "../imageMime.ts";
+import { OrchestrationCommandReceiptRepository } from "../persistence/Services/OrchestrationCommandReceipts.ts";
 import * as WorkspacePaths from "../workspace/WorkspacePaths.ts";
+
+const isPersistedChatAttachment = (attachment: unknown): attachment is ChatAttachment =>
+  typeof attachment === "object" &&
+  attachment !== null &&
+  "type" in attachment &&
+  attachment.type === "image" &&
+  "id" in attachment &&
+  typeof attachment.id === "string";
+
+interface AttachmentWritePlan {
+  readonly attachment: ChatAttachment;
+  readonly attachmentPath: string;
+  readonly bytes: Buffer;
+}
+
+export const cleanupPersistedCommandAttachments = (command: OrchestrationCommand) =>
+  Effect.gen(function* () {
+    if (command.type !== "thread.turn.start") {
+      return;
+    }
+
+    const fileSystem = yield* FileSystem.FileSystem;
+    const serverConfig = yield* ServerConfig;
+    yield* Effect.forEach(
+      command.message.attachments,
+      (attachment) => {
+        if (!isPersistedChatAttachment(attachment)) {
+          return Effect.void;
+        }
+        const attachmentPath = resolveAttachmentPath({
+          attachmentsDir: serverConfig.attachmentsDir,
+          attachment,
+        });
+        if (!attachmentPath) {
+          return Effect.void;
+        }
+        return fileSystem.remove(attachmentPath).pipe(
+          Effect.catchCause((cause) =>
+            Effect.logDebug("failed to clean up rejected command attachment", {
+              attachmentId: attachment.id,
+              cause: Cause.pretty(cause),
+            }),
+          ),
+        );
+      },
+      { concurrency: 1, discard: true },
+    );
+  });
 
 export const normalizeDispatchCommand = (command: ClientOrchestrationCommand) =>
   Effect.gen(function* () {
@@ -69,7 +121,15 @@ export const normalizeDispatchCommand = (command: ClientOrchestrationCommand) =>
       return command as OrchestrationCommand;
     }
 
-    const normalizedAttachments = yield* Effect.forEach(
+    const commandReceiptRepository = yield* OrchestrationCommandReceiptRepository;
+    const existingReceipt = yield* commandReceiptRepository.getByCommandId({
+      commandId: command.commandId,
+    });
+    if (Option.isSome(existingReceipt)) {
+      return command as unknown as OrchestrationCommand;
+    }
+
+    const attachmentWritePlans = yield* Effect.forEach(
       command.message.attachments,
       (attachment) =>
         Effect.gen(function* () {
@@ -112,6 +172,27 @@ export const normalizeDispatchCommand = (command: ClientOrchestrationCommand) =>
             });
           }
 
+          return {
+            attachment: persistedAttachment,
+            attachmentPath,
+            bytes,
+          } satisfies AttachmentWritePlan;
+        }),
+      { concurrency: 1 },
+    );
+
+    const commandWithPersistedAttachments = {
+      ...command,
+      message: {
+        ...command.message,
+        attachments: attachmentWritePlans.map(({ attachment }) => attachment),
+      },
+    } satisfies OrchestrationCommand;
+
+    yield* Effect.forEach(
+      attachmentWritePlans,
+      ({ attachment, attachmentPath, bytes }) =>
+        Effect.gen(function* () {
           yield* fileSystem.makeDirectory(path.dirname(attachmentPath), { recursive: true }).pipe(
             Effect.mapError(
               () =>
@@ -128,17 +209,15 @@ export const normalizeDispatchCommand = (command: ClientOrchestrationCommand) =>
                 }),
             ),
           );
-
-          return persistedAttachment;
         }),
-      { concurrency: 1 },
+      { concurrency: 1, discard: true },
+    ).pipe(
+      Effect.catch((error) =>
+        cleanupPersistedCommandAttachments(commandWithPersistedAttachments).pipe(
+          Effect.andThen(Effect.fail(error)),
+        ),
+      ),
     );
 
-    return {
-      ...command,
-      message: {
-        ...command.message,
-        attachments: normalizedAttachments,
-      },
-    } satisfies OrchestrationCommand;
+    return commandWithPersistedAttachments;
   });
