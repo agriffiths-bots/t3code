@@ -31,6 +31,7 @@ export interface McpIssuedCredential {
 export interface McpPeerCredentialRequest {
   readonly label?: string;
   readonly sourceSessionId?: AuthSessionId;
+  readonly sourceEnvironmentId?: EnvironmentId;
   readonly expiresAt?: number;
   readonly allowedParentThreadIds?: ReadonlyArray<ThreadId>;
   readonly allowedChildThreadIds?: ReadonlyArray<ThreadId>;
@@ -125,6 +126,7 @@ const PersistedPeerTokenRecord = Schema.Struct({
   tokenHash: Schema.String,
   peerTokenId: Schema.String,
   sourceSessionId: Schema.optionalKey(AuthSessionId),
+  sourceEnvironmentId: Schema.optionalKey(EnvironmentId),
   environmentId: EnvironmentId,
   capabilities: Schema.Array(McpInvocationContext.McpCapability),
   allowedParentThreadIds: Schema.optionalKey(Schema.Array(ThreadId)),
@@ -242,6 +244,9 @@ const makeWithOptions = Effect.fn("McpSessionRegistry.make")(function* (
               environmentId: record.environmentId,
               peerTokenId: record.peerTokenId,
               ...(record.sourceSessionId ? { sourceSessionId: record.sourceSessionId } : {}),
+              ...(record.sourceEnvironmentId
+                ? { sourceEnvironmentId: record.sourceEnvironmentId }
+                : {}),
               capabilities: new Set(record.capabilities),
               ...(record.allowedParentThreadIds
                 ? { allowedParentThreadIds: new Set(record.allowedParentThreadIds) }
@@ -264,6 +269,9 @@ const makeWithOptions = Effect.fn("McpSessionRegistry.make")(function* (
     tokenHash: record.tokenHash,
     peerTokenId: record.scope.peerTokenId,
     ...(record.scope.sourceSessionId ? { sourceSessionId: record.scope.sourceSessionId } : {}),
+    ...(record.scope.sourceEnvironmentId
+      ? { sourceEnvironmentId: record.scope.sourceEnvironmentId }
+      : {}),
     environmentId: record.scope.environmentId,
     capabilities: [...record.scope.capabilities].toSorted(),
     ...(record.scope.allowedParentThreadIds
@@ -376,6 +384,7 @@ const makeWithOptions = Effect.fn("McpSessionRegistry.make")(function* (
       environmentId,
       peerTokenId,
       ...(request.sourceSessionId ? { sourceSessionId: request.sourceSessionId } : {}),
+      ...(request.sourceEnvironmentId ? { sourceEnvironmentId: request.sourceEnvironmentId } : {}),
       capabilities: new Set(PEER_TOKEN_CAPABILITIES),
       ...(request.allowedParentThreadIds
         ? { allowedParentThreadIds: new Set(request.allowedParentThreadIds) }

@@ -52,6 +52,8 @@ import { SubagentRuntimeLive } from "./mcp/toolkits/subagent/handlers.ts";
 import * as SubagentDispatchLimiter from "./mcp/toolkits/subagent/SubagentDispatchLimiter.ts";
 import { ScheduledTaskRepositoryLive } from "./persistence/Layers/ScheduledTasks.ts";
 import { PendingDispatchRepositoryLive } from "./persistence/Layers/PendingDispatches.ts";
+import { RemoteChildRepositoryLive } from "./persistence/Layers/RemoteChildren.ts";
+import * as SubagentPeerRegistry from "./subagents/SubagentPeerRegistry.ts";
 import { OrchestrationReactorLive } from "./orchestration/Layers/OrchestrationReactor.ts";
 import { RuntimeReceiptBusLive } from "./orchestration/Layers/RuntimeReceiptBus.ts";
 import { ProviderRuntimeIngestionLive } from "./orchestration/Layers/ProviderRuntimeIngestion.ts";
@@ -393,7 +395,11 @@ const ServerApplicationRegistrationsLive = Layer.mergeAll(
     Layer.provide(BootstrapTurnStartDispatcher.layer),
   ),
   ThreadStartRuntimeLive,
-  SubagentRuntimeLive.pipe(Layer.provide(PendingDispatchRepositoryLive)),
+  SubagentRuntimeLive.pipe(
+    Layer.provideMerge(PendingDispatchRepositoryLive),
+    Layer.provideMerge(RemoteChildRepositoryLive),
+    Layer.provideMerge(SubagentPeerRegistry.layer),
+  ),
 );
 
 const McpRoutesLayer = Layer.mergeAll(mcpPeerTokenRouteLayer, McpHttpServer.layer).pipe(

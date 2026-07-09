@@ -355,7 +355,9 @@ it.effect("resolves peer tokens after registry reload without persisting raw bea
     });
     const allowedParentThreadId = ThreadId.make("parent-reload");
     const allowedChildThreadId = ThreadId.make("child-reload");
+    const sourceEnvironmentId = EnvironmentId.make("environment-source-reload");
     const issued = yield* firstRegistry.issuePeerToken({
+      sourceEnvironmentId,
       allowedParentThreadIds: [allowedParentThreadId],
       allowedChildThreadIds: [allowedChildThreadId],
     });
@@ -373,6 +375,7 @@ it.effect("resolves peer tokens after registry reload without persisting raw bea
       throw new Error("Expected persisted peer-scoped credential.");
     }
     expect(resolved.peerTokenId).toBe(issued.peerTokenId);
+    expect(resolved.sourceEnvironmentId).toBe(sourceEnvironmentId);
     expect(resolved.allowedParentThreadIds?.has(allowedParentThreadId)).toBe(true);
     expect(resolved.allowedChildThreadIds?.has(allowedChildThreadId)).toBe(true);
     expect(resolved.capabilities.has("subagent:spawn")).toBe(true);

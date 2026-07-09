@@ -12,6 +12,8 @@
  */
 import {
   CommandId,
+  EnvironmentId,
+  ExecutionEnvironmentDescriptor,
   isProviderAvailable,
   IsoDateTime,
   MessageId,
@@ -29,20 +31,26 @@ import { Cron } from "croner";
 import * as Cause from "effect/Cause";
 import * as Crypto from "effect/Crypto";
 import * as DateTime from "effect/DateTime";
+import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
+import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
+import * as Schedule from "effect/Schedule";
 import * as Schema from "effect/Schema";
+import { HttpClient, HttpClientRequest, HttpClientResponse } from "effect/unstable/http";
 
 import {
   coordinatorActive,
   finalAssistantTextFromThread,
 } from "../../../orchestration/Layers/ChildThreadCoordinator.ts";
 import type {
+  ChildTerminalStatus,
   ChildThreadCoordinatorShape,
   WaitSliceResult,
 } from "../../../orchestration/Services/ChildThreadCoordinator.ts";
+import { WAIT_SLICE_SECONDS } from "../../../orchestration/Services/ChildThreadCoordinator.ts";
 import { dispatchActive } from "../../../orchestration/Services/BootstrapTurnStartDispatcher.ts";
 import { OrchestrationEngineService } from "../../../orchestration/Services/OrchestrationEngine.ts";
 import { ProjectionSnapshotQuery } from "../../../orchestration/Services/ProjectionSnapshotQuery.ts";
@@ -59,7 +67,16 @@ import {
   type PendingDispatchId,
   type PendingDispatchRepositoryShape,
 } from "../../../persistence/Services/PendingDispatches.ts";
+import {
+  RemoteChildRepository,
+  type RemoteChild,
+  type RemoteChildRepositoryShape,
+  type RemoteChildStatus,
+} from "../../../persistence/Services/RemoteChildren.ts";
 import { ProviderInstanceRegistry } from "../../../provider/Services/ProviderInstanceRegistry.ts";
+import * as McpPeerClient from "../../../subagents/McpPeerClient.ts";
+import * as SubagentPeerRegistry from "../../../subagents/SubagentPeerRegistry.ts";
+import { cloudflareAccessHeaders, environmentUrl } from "../../../subagents/SubagentPeerHttp.ts";
 import * as McpInvocationContext from "../../McpInvocationContext.ts";
 import { activeThreadStartRuntimeOf, type ActiveThreadStartRuntime } from "../thread/handlers.ts";
 import { ThreadStartToolError } from "../thread/tools.ts";
@@ -71,25 +88,40 @@ import {
   WAIT_TIMEOUT_MAX_SECONDS,
   WAIT_TIMEOUT_MIN_SECONDS,
   type CheckSubagentInput,
+  CheckSubagentOutput,
+  type CheckSubagentOutput as CheckSubagentOutputType,
   type ListSubagentsInput,
   type ScheduleCreateInput,
   type ScheduleDeleteInput,
   type ScheduleListInput,
   type ScheduleUpdateInput,
   type SpawnSubagentInput,
-  type SpawnSubagentOutput,
+  SpawnSubagentOutput,
+  type SpawnSubagentOutput as SpawnSubagentOutputType,
   type SteerSubagentInput,
   type WaitSubagentInput,
-  type WaitSubagentOutput,
+  type WaitSubagentOutput as WaitSubagentOutputType,
 } from "./tools.ts";
 
 const nowIso = Effect.map(DateTime.now, DateTime.formatIso);
 const isThreadStartToolError = Schema.is(ThreadStartToolError);
+const isSubagentPeerTargetNotFoundError = Schema.is(
+  SubagentPeerRegistry.SubagentPeerTargetNotFoundError,
+);
 const WAIT_PROJECTION_ENRICHMENT_TIMEOUT_MS = 250;
+const PEER_SPAWN_PROBE_TIMEOUT = Duration.seconds(5);
+const PEER_TOOL_CALL_TIMEOUT_SECONDS = 5;
+const PEER_TOOL_CALL_TIMEOUT = Duration.seconds(PEER_TOOL_CALL_TIMEOUT_SECONDS);
+const PEER_SESSION_CLOSE_TIMEOUT = Duration.seconds(2);
+const REMOTE_TERMINAL_DELIVERY_CLAIM_TTL_MS = 5 * 60 * 1_000;
+const UNTRACKED_PROJECTION_CHILD_ERROR =
+  "Sub-agent thread exists in the projection but is not tracked by this server instance.";
 const FOREGROUND_SPAWN_PENDING_WARNING =
   "Sub-agent is still running after the initial foreground wait; returning launch metadata now. Use t3_wait_subagent to wait for terminal delivery, or stop polling and let the parent wake automatically when it completes.";
 
 const fail = (message: string) => new ThreadStartToolError({ message });
+const decodeSpawnSubagentOutput = Schema.decodeUnknownEffect(SpawnSubagentOutput);
+const decodeCheckSubagentOutput = Schema.decodeUnknownEffect(CheckSubagentOutput);
 
 const toToolError = (error: unknown, fallback: string): ThreadStartToolError =>
   isThreadStartToolError(error) ? error : fail(error instanceof Error ? error.message : fallback);
@@ -287,10 +319,10 @@ const reliableWaitTerminalStatusOf = (
 };
 
 const isWaitTerminal = (status: string): boolean =>
-  status === "completed" || status === "failed" || status === "killed";
+  status === "completed" || status === "failed" || status === "interrupted" || status === "killed";
 
 const pendingForMode = (
-  rows: ReadonlyArray<WaitSliceResult["results"][number]>,
+  rows: ReadonlyArray<{ readonly status: string }>,
   mode: "all" | "any",
 ): boolean => {
   const settledCount = rows.filter((row) => isWaitTerminal(row.status)).length;
@@ -305,6 +337,9 @@ interface SubagentRuntime {
   readonly providerInstanceRegistry: typeof ProviderInstanceRegistry.Service;
   readonly scheduledTasks: ScheduledTaskRepositoryShape;
   readonly pendingDispatches: PendingDispatchRepositoryShape;
+  readonly remoteChildren: RemoteChildRepositoryShape;
+  readonly peerRegistry: typeof SubagentPeerRegistry.SubagentPeerRegistry.Service;
+  readonly httpClient: HttpClient.HttpClient;
   readonly dispatchLimiter: typeof SubagentDispatchLimiter.Service;
 }
 
@@ -324,38 +359,8 @@ const requireSubagentCapability = (capability: McpInvocationContext.McpCapabilit
     Effect.mapError((error) => fail(error.message)),
   );
 
-const requireProviderSubagentInvocation = (capability: McpInvocationContext.McpCapability) =>
-  requireSubagentCapability(capability).pipe(
-    Effect.flatMap((invocation) =>
-      McpInvocationContext.isProviderInvocationScope(invocation)
-        ? Effect.succeed(invocation)
-        : Effect.fail(
-            fail(
-              "Peer-scoped sub-agent spawn requires remote parent context; retry after the remote spawn target is resolved by the caller.",
-            ),
-          ),
-    ),
-  );
-
 const peerSetAllows = (set: ReadonlySet<ThreadId> | undefined, threadId: ThreadId): boolean =>
   set === undefined || set.has(threadId);
-
-const requirePeerChildAccess = (
-  invocation: McpInvocationContext.McpInvocationScope,
-  childThreadIds: ReadonlyArray<ThreadId>,
-): Effect.Effect<void, ThreadStartToolError> => {
-  if (McpInvocationContext.isProviderInvocationScope(invocation)) return Effect.void;
-  const unauthorized = childThreadIds.find(
-    (childThreadId) => !peerSetAllows(invocation.allowedChildThreadIds, childThreadId),
-  );
-  return unauthorized === undefined
-    ? Effect.void
-    : Effect.fail(
-        fail(
-          `Peer-scoped sub-agent credential is not authorized for child thread ${unauthorized}.`,
-        ),
-      );
-};
 
 const requirePeerParentAccess = (
   invocation: McpInvocationContext.McpInvocationScope,
@@ -402,6 +407,58 @@ const loadThreadShell = (runtime: SubagentRuntime, threadId: ThreadId) =>
   runtime.projectionSnapshotQuery
     .getThreadShellById(threadId)
     .pipe(Effect.mapError((error) => toToolError(error, "Failed to load thread.")));
+
+const requirePeerChildAccess = (
+  runtime: SubagentRuntime,
+  invocation: McpInvocationContext.McpInvocationScope,
+  childThreadIds: ReadonlyArray<ThreadId>,
+): Effect.Effect<void, ThreadStartToolError> => {
+  if (McpInvocationContext.isProviderInvocationScope(invocation)) return Effect.void;
+  const explicitAllowedChildren = invocation.allowedChildThreadIds;
+  if (explicitAllowedChildren !== undefined) {
+    const unauthorized = childThreadIds.find(
+      (childThreadId) => !explicitAllowedChildren.has(childThreadId),
+    );
+    return unauthorized === undefined
+      ? Effect.void
+      : Effect.fail(
+          fail(
+            `Peer-scoped sub-agent credential is not authorized for child thread ${unauthorized}.`,
+          ),
+        );
+  }
+  const sourceEnvironmentId = invocation.sourceEnvironmentId;
+  if (sourceEnvironmentId === undefined) {
+    return Effect.fail(
+      fail("Peer-scoped sub-agent credential is not authorized for child thread reads."),
+    );
+  }
+  return Effect.forEach(
+    childThreadIds,
+    (childThreadId) =>
+      loadThreadShell(runtime, childThreadId).pipe(
+        Effect.flatMap((thread) =>
+          Option.match(thread, {
+            onNone: () =>
+              Effect.fail(
+                fail(
+                  `Peer-scoped sub-agent credential is not authorized for child thread ${childThreadId}.`,
+                ),
+              ),
+            onSome: (shell) =>
+              shell.parentEnvironmentId === sourceEnvironmentId
+                ? Effect.void
+                : Effect.fail(
+                    fail(
+                      `Peer-scoped sub-agent credential is not authorized for child thread ${childThreadId}.`,
+                    ),
+                  ),
+          }),
+        ),
+      ),
+    { discard: true, concurrency: "unbounded" },
+  );
+};
 
 const loadThreadDetail = (runtime: SubagentRuntime, threadId: ThreadId) =>
   runtime.projectionSnapshotQuery
@@ -472,20 +529,903 @@ const resolveExplicitModelSelection = (
     }),
   );
 
+const probePeerDescriptor = Effect.fn("SubagentToolkit.probePeerDescriptor")(function* (
+  httpClient: HttpClient.HttpClient,
+  peer: SubagentPeerRegistry.SubagentPeer,
+) {
+  const request = HttpClientRequest.get(
+    environmentUrl(peer.httpBaseUrl, "/.well-known/t3/environment"),
+  ).pipe(HttpClientRequest.setHeaders(cloudflareAccessHeaders(peer.cfAccess)));
+  const response = yield* httpClient.execute(request).pipe(
+    Effect.flatMap(HttpClientResponse.filterStatusOk),
+    Effect.flatMap(HttpClientResponse.schemaBodyJson(ExecutionEnvironmentDescriptor)),
+    Effect.timeout(PEER_SPAWN_PROBE_TIMEOUT),
+    Effect.mapError(() =>
+      fail(
+        `Sub-agent target '${peer.alias}' is offline or did not answer its environment descriptor${peer.lastSeenAt ? ` (last seen ${peer.lastSeenAt})` : ""}.`,
+      ),
+    ),
+  );
+  if (response.environmentId !== peer.environmentId) {
+    return yield* fail(
+      `Sub-agent target '${peer.alias}' resolved to environment ${response.environmentId}, expected ${peer.environmentId}.`,
+    );
+  }
+  return response;
+});
+
+const textContentOfToolResult = (result: {
+  readonly content?: ReadonlyArray<unknown> | undefined;
+}): string => {
+  const text = result.content
+    ?.map((item) =>
+      typeof item === "object" &&
+      item !== null &&
+      "type" in item &&
+      item.type === "text" &&
+      "text" in item &&
+      typeof item.text === "string"
+        ? item.text
+        : "",
+    )
+    .filter((value) => value.length > 0)
+    .join("\n");
+  return text && text.length > 0 ? text : "Remote sub-agent spawn failed.";
+};
+
+const decodeRemoteSpawnResult = (result: {
+  readonly isError?: boolean | undefined;
+  readonly structuredContent?: unknown;
+  readonly content?: ReadonlyArray<unknown> | undefined;
+}): Effect.Effect<SpawnSubagentOutputType, ThreadStartToolError> => {
+  if (result.isError === true) {
+    return Effect.fail(fail(textContentOfToolResult(result)));
+  }
+  return decodeSpawnSubagentOutput(result.structuredContent).pipe(
+    Effect.mapError((error) =>
+      fail(
+        error instanceof Error
+          ? error.message
+          : "Remote sub-agent spawn returned an invalid response.",
+      ),
+    ),
+  );
+};
+
+const decodeRemoteCheckResult = (result: {
+  readonly isError?: boolean | undefined;
+  readonly structuredContent?: unknown;
+  readonly content?: ReadonlyArray<unknown> | undefined;
+}): Effect.Effect<CheckSubagentOutputType, ThreadStartToolError> => {
+  if (result.isError === true) {
+    return Effect.fail(fail(textContentOfToolResult(result)));
+  }
+  return decodeCheckSubagentOutput(result.structuredContent).pipe(
+    Effect.mapError((error) =>
+      fail(
+        error instanceof Error
+          ? error.message
+          : "Remote sub-agent check returned an invalid response.",
+      ),
+    ),
+  );
+};
+
+const isRemoteTerminalStatus = (status: string): boolean =>
+  status === "completed" || status === "failed" || status === "killed" || status === "interrupted";
+
+const remoteChildStatusFromToolStatus = (status: string): RemoteChildStatus => {
+  switch (status) {
+    case "completed":
+    case "failed":
+    case "interrupted":
+    case "killed":
+      return status;
+    case "running":
+    case "pending":
+    case "timeout":
+    case "idle":
+      return "running";
+    default:
+      return "unknown";
+  }
+};
+
+const childTerminalStatusFromRemoteStatus = (status: string): ChildTerminalStatus =>
+  status === "completed" ? "completed" : status === "killed" ? "killed" : "failed";
+
+const remoteTerminalWakeDedupeKey = (child: RemoteChild): string =>
+  `remote-subagent-wake:${child.parentThreadId}:${child.childEnvironmentId}:${child.childThreadId}`;
+
+const resolveRemoteChildPeer = (runtime: SubagentRuntime, child: RemoteChild) =>
+  Effect.gen(function* () {
+    const resolveOption = (target: string) =>
+      runtime.peerRegistry.resolveTarget(target).pipe(
+        Effect.map(Option.some),
+        Effect.catch((error) =>
+          isSubagentPeerTargetNotFoundError(error)
+            ? Effect.succeed(Option.none())
+            : Effect.fail(fail(error.message)),
+        ),
+      );
+    const aliasPeer = yield* resolveOption(child.alias);
+    if (Option.isSome(aliasPeer) && aliasPeer.value.environmentId === child.childEnvironmentId) {
+      return aliasPeer.value;
+    }
+    const environmentPeer = yield* resolveOption(child.childEnvironmentId);
+    if (
+      Option.isSome(environmentPeer) &&
+      environmentPeer.value.environmentId === child.childEnvironmentId
+    ) {
+      return environmentPeer.value;
+    }
+    if (Option.isSome(environmentPeer)) {
+      return yield* fail(
+        `Remote child ${child.childThreadId} belongs to environment ${child.childEnvironmentId}, but environment-id lookup resolved alias '${environmentPeer.value.alias}' at ${environmentPeer.value.environmentId}.`,
+      );
+    }
+    if (Option.isSome(aliasPeer)) {
+      return yield* fail(
+        `Remote child ${child.childThreadId} belongs to environment ${child.childEnvironmentId}, but peer alias '${child.alias}' now points at ${aliasPeer.value.environmentId}.`,
+      );
+    }
+    return yield* fail(
+      `Remote child ${child.childThreadId} belongs to environment ${child.childEnvironmentId}, but peer alias '${child.alias}' is not registered.`,
+    );
+  });
+
+const withPeerToolTimeout = <A>(
+  effect: Effect.Effect<A, ThreadStartToolError>,
+  timeoutContext: string,
+): Effect.Effect<A, ThreadStartToolError> =>
+  Effect.gen(function* () {
+    const fiber = yield* effect.pipe(Effect.forkDetach);
+    const exit = yield* Fiber.await(fiber).pipe(
+      Effect.raceFirst(
+        Effect.sleep(PEER_TOOL_CALL_TIMEOUT).pipe(
+          Effect.flatMap(() =>
+            Fiber.interrupt(fiber).pipe(
+              Effect.forkDetach,
+              Effect.as(
+                fail(
+                  `${timeoutContext} did not respond within ${PEER_TOOL_CALL_TIMEOUT_SECONDS} seconds.`,
+                ),
+              ),
+            ),
+          ),
+          Effect.flatMap((error) => Effect.fail(error)),
+        ),
+      ),
+    );
+    if (Exit.isSuccess(exit)) return exit.value;
+    return yield* Effect.failCause(exit.cause);
+  });
+
+const callPeerTool = (
+  runtime: SubagentRuntime,
+  peer: SubagentPeerRegistry.SubagentPeer,
+  input: McpPeerClient.McpPeerCallToolInput,
+  timeoutContext: string,
+) =>
+  withPeerToolTimeout(
+    Effect.acquireUseRelease(
+      McpPeerClient.connect(peer).pipe(
+        Effect.provideService(HttpClient.HttpClient, runtime.httpClient),
+      ),
+      (session) =>
+        Effect.gen(function* () {
+          yield* runtime.peerRegistry.updateLastSeen(peer.alias);
+          return yield* session.callTool(input);
+        }),
+      (session) => closePeerSession(session, peer),
+    ).pipe(
+      Effect.mapError((error) =>
+        isThreadStartToolError(error) ? error : fail(error.message ?? "Remote peer call failed."),
+      ),
+    ),
+    timeoutContext,
+  );
+
+const closePeerSession = (
+  session: McpPeerClient.McpPeerClientSession,
+  peer: SubagentPeerRegistry.SubagentPeer,
+) =>
+  Effect.gen(function* () {
+    const fiber = yield* session.close().pipe(Effect.forkDetach);
+    const closeExit = yield* Fiber.await(fiber).pipe(
+      Effect.timeoutOption(PEER_SESSION_CLOSE_TIMEOUT),
+    );
+    if (Option.isNone(closeExit)) {
+      yield* Fiber.interrupt(fiber).pipe(Effect.forkDetach);
+      yield* Effect.logWarning("timed out closing MCP peer session", {
+        peerAlias: peer.alias,
+        peerEnvironmentId: peer.environmentId,
+      });
+      return;
+    }
+    if (Exit.isFailure(closeExit.value)) {
+      yield* Effect.logWarning("failed to close MCP peer session", {
+        peerAlias: peer.alias,
+        peerEnvironmentId: peer.environmentId,
+        cause: Cause.pretty(closeExit.value.cause),
+      });
+    }
+  }).pipe(
+    Effect.catchCause((cause) =>
+      Effect.logWarning("failed to close MCP peer session", {
+        peerAlias: peer.alias,
+        peerEnvironmentId: peer.environmentId,
+        cause: Cause.pretty(cause),
+      }),
+    ),
+  );
+
+const connectPeerWithTimeout = (
+  runtime: SubagentRuntime,
+  peer: SubagentPeerRegistry.SubagentPeer,
+  timeoutContext: string,
+) =>
+  withPeerToolTimeout(
+    McpPeerClient.connect(peer).pipe(
+      Effect.provideService(HttpClient.HttpClient, runtime.httpClient),
+      Effect.mapError((error) =>
+        isThreadStartToolError(error)
+          ? error
+          : fail(error.message ?? "Remote peer connect failed."),
+      ),
+    ),
+    timeoutContext,
+  );
+
+const callRemoteChildTool = (
+  runtime: SubagentRuntime,
+  child: RemoteChild,
+  input: McpPeerClient.McpPeerCallToolInput,
+) =>
+  Effect.gen(function* () {
+    const peer = yield* resolveRemoteChildPeer(runtime, child);
+    return yield* callPeerTool(runtime, peer, input, `Remote peer '${peer.alias}'`);
+  });
+
+const remoteChildrenByIdForParent = (
+  runtime: SubagentRuntime,
+  parentThreadId: ThreadId,
+  childThreadIds: ReadonlyArray<ThreadId>,
+) =>
+  runtime.remoteChildren.listByParent({ parentThreadId }).pipe(
+    Effect.mapError((error) => toToolError(error, "Failed to load remote children.")),
+    Effect.map((children) => {
+      const requested = new Set(childThreadIds.map(String));
+      return new Map(
+        children
+          .filter((child) => requested.has(String(child.childThreadId)))
+          .map((child) => [String(child.childThreadId), child] as const),
+      );
+    }),
+  );
+
+const deliverRemoteCompletion = (
+  runtime: SubagentRuntime,
+  child: RemoteChild,
+  check: CheckSubagentOutputType,
+) =>
+  Effect.gen(function* () {
+    if (!isRemoteTerminalStatus(check.status)) return;
+    const terminalStatus = childTerminalStatusFromRemoteStatus(check.status);
+    const error =
+      terminalStatus === "completed" ? null : `Remote sub-agent ended with status ${check.status}.`;
+    const coordinator = yield* requireCoordinator();
+    yield* coordinator.enqueueParentInjection({
+      parentThreadId: child.parentThreadId,
+      childThreadId: child.childThreadId,
+      status: terminalStatus,
+      finalAssistantText: check.latestAssistantText,
+      error,
+      dedupeKey: remoteTerminalWakeDedupeKey(child),
+    });
+  });
+
+const releaseRemoteCompletionClaim = (
+  runtime: SubagentRuntime,
+  input: {
+    readonly child: RemoteChild;
+    readonly claimId: string;
+    readonly updatedAt: IsoDateTime;
+  },
+) =>
+  runtime.remoteChildren
+    .releaseTerminalDeliveryClaim({
+      parentThreadId: input.child.parentThreadId,
+      childEnvironmentId: input.child.childEnvironmentId,
+      childThreadId: input.child.childThreadId,
+      claimId: input.claimId,
+      updatedAt: input.updatedAt,
+    })
+    .pipe(
+      Effect.catch((error) =>
+        Effect.logWarning("failed to release remote terminal delivery claim", {
+          childThreadId: input.child.childThreadId,
+          childEnvironmentId: input.child.childEnvironmentId,
+          cause: error.message,
+        }),
+      ),
+    );
+
+type RemoteTerminalStatusUpdate = {
+  readonly parentThreadId: ThreadId;
+  readonly childEnvironmentId: EnvironmentId;
+  readonly childThreadId: ThreadId;
+  readonly status: RemoteChildStatus;
+  readonly lastPolledAt: IsoDateTime;
+  readonly updatedAt: IsoDateTime;
+};
+
+type SuppressedRemoteTerminalWake = {
+  readonly child: RemoteChild;
+  readonly check: CheckSubagentOutputType;
+  readonly claimId: string;
+  readonly update: RemoteTerminalStatusUpdate;
+};
+
+const markRemoteTerminalClaim = (runtime: SubagentRuntime, input: SuppressedRemoteTerminalWake) =>
+  runtime.remoteChildren.markTerminalStatus({ ...input.update, claimId: input.claimId }).pipe(
+    Effect.mapError((error) => toToolError(error, "Failed to update remote child.")),
+    Effect.flatMap((marked) =>
+      Option.isSome(marked)
+        ? Effect.void
+        : Effect.fail(fail("Remote child completion claim was lost before status update.")),
+    ),
+  );
+
+const releaseSuppressedRemoteTerminalWake = (
+  runtime: SubagentRuntime,
+  input: SuppressedRemoteTerminalWake,
+) =>
+  releaseRemoteCompletionClaim(runtime, {
+    child: input.child,
+    claimId: input.claimId,
+    updatedAt: input.update.updatedAt,
+  });
+
+const markSuppressedRemoteTerminalWake = (
+  runtime: SubagentRuntime,
+  input: SuppressedRemoteTerminalWake,
+) => markRemoteTerminalClaim(runtime, input);
+
+const restoreSuppressedRemoteTerminalWake = (
+  runtime: SubagentRuntime,
+  input: SuppressedRemoteTerminalWake,
+) =>
+  Effect.uninterruptible(
+    deliverRemoteCompletion(runtime, input.child, input.check).pipe(
+      Effect.catch((error) =>
+        releaseSuppressedRemoteTerminalWake(runtime, input).pipe(
+          Effect.andThen(Effect.fail(error)),
+        ),
+      ),
+      Effect.andThen(
+        markRemoteTerminalClaim(runtime, input).pipe(
+          Effect.catch((error) =>
+            releaseSuppressedRemoteTerminalWake(runtime, input).pipe(
+              Effect.andThen(Effect.fail(error)),
+            ),
+          ),
+        ),
+      ),
+    ),
+  );
+
+const pollRemoteChildWithDeliveryResult = Effect.fn(
+  "SubagentToolkit.pollRemoteChildWithDeliveryResult",
+)(function* (
+  runtime: SubagentRuntime,
+  child: RemoteChild,
+  options?: {
+    readonly deliverTerminalWake?: boolean;
+    readonly onSuppressedTerminalWake?: (
+      suppressed: SuppressedRemoteTerminalWake,
+    ) => Effect.Effect<void>;
+  },
+) {
+  const callResult = yield* callRemoteChildTool(runtime, child, {
+    name: "t3_check_subagent",
+    arguments: { childThreadId: child.childThreadId },
+  });
+  const check = yield* decodeRemoteCheckResult(callResult);
+  if (check.threadId !== child.childThreadId) {
+    return yield* fail(
+      `Remote peer returned check result for ${check.threadId}, expected ${child.childThreadId}.`,
+    );
+  }
+  const now = yield* DateTime.now;
+  const updatedAt = DateTime.formatIso(now);
+  const claimStaleBefore = DateTime.formatIso(
+    DateTime.makeUnsafe(now.epochMilliseconds - REMOTE_TERMINAL_DELIVERY_CLAIM_TTL_MS),
+  );
+  const nextStatus = remoteChildStatusFromToolStatus(check.status);
+  const update = {
+    parentThreadId: child.parentThreadId,
+    childEnvironmentId: child.childEnvironmentId,
+    childThreadId: child.childThreadId,
+    status: nextStatus,
+    lastPolledAt: IsoDateTime.make(updatedAt),
+    updatedAt: IsoDateTime.make(updatedAt),
+  } as const;
+  if (isRemoteTerminalStatus(nextStatus)) {
+    if (!isRemoteTerminalStatus(child.status)) {
+      const claimId = yield* runtime.crypto.randomUUIDv4.pipe(Effect.orDie);
+      const suppressed = { child, check, claimId, update } satisfies SuppressedRemoteTerminalWake;
+      const deliverTerminalWake = options?.deliverTerminalWake ?? true;
+      const claimEffect = runtime.remoteChildren
+        .claimTerminalDelivery({
+          parentThreadId: child.parentThreadId,
+          childEnvironmentId: child.childEnvironmentId,
+          childThreadId: child.childThreadId,
+          claimId,
+          claimedAt: IsoDateTime.make(updatedAt),
+          claimStaleBefore: IsoDateTime.make(claimStaleBefore),
+          lastPolledAt: IsoDateTime.make(updatedAt),
+          updatedAt: IsoDateTime.make(updatedAt),
+        })
+        .pipe(
+          Effect.mapError((error) =>
+            toToolError(error, "Failed to claim remote child completion delivery."),
+          ),
+        );
+      const claimed = yield* deliverTerminalWake
+        ? claimEffect
+        : Effect.uninterruptible(
+            claimEffect.pipe(
+              Effect.tap((claimed) =>
+                Option.isSome(claimed) && options?.onSuppressedTerminalWake !== undefined
+                  ? options.onSuppressedTerminalWake(suppressed)
+                  : Effect.void,
+              ),
+            ),
+          );
+      if (Option.isSome(claimed)) {
+        if (!deliverTerminalWake) {
+          return {
+            check,
+            suppressedTerminalWake: suppressed,
+          };
+        }
+        yield* Effect.uninterruptible(
+          deliverRemoteCompletion(runtime, child, check).pipe(
+            Effect.catch((error) =>
+              releaseSuppressedRemoteTerminalWake(runtime, suppressed).pipe(
+                Effect.andThen(Effect.fail(error)),
+              ),
+            ),
+            Effect.andThen(markRemoteTerminalClaim(runtime, suppressed)),
+          ),
+        );
+        return {
+          check,
+          suppressedTerminalWake: null,
+        };
+      }
+    }
+    return { check, suppressedTerminalWake: null };
+  }
+  yield* runtime.remoteChildren
+    .updateStatus(update)
+    .pipe(Effect.mapError((error) => toToolError(error, "Failed to update remote child.")));
+  return { check, suppressedTerminalWake: null };
+});
+
+const pollRemoteChild = Effect.fn("SubagentToolkit.pollRemoteChild")(function* (
+  runtime: SubagentRuntime,
+  child: RemoteChild,
+) {
+  const result = yield* pollRemoteChildWithDeliveryResult(runtime, child);
+  return result.check;
+});
+
+const callRemoteSpawnTool = (
+  runtime: SubagentRuntime,
+  peer: SubagentPeerRegistry.SubagentPeer,
+  session: McpPeerClient.McpPeerClientSession,
+  arguments_: SpawnSubagentInput,
+) =>
+  Effect.gen(function* () {
+    yield* runtime.peerRegistry
+      .updateLastSeen(peer.alias)
+      .pipe(Effect.mapError((error) => fail(error.message)));
+    return yield* session
+      .callTool({
+        name: "t3_spawn_subagent",
+        arguments: arguments_,
+      })
+      .pipe(Effect.mapError((error) => fail(error.message)));
+  }).pipe(Effect.ensuring(closePeerSession(session, peer)));
+
+const remoteWaitRow = (input: {
+  readonly child: RemoteChild;
+  readonly check: CheckSubagentOutputType;
+  readonly status: string;
+  readonly promoted: boolean;
+}): WaitSubagentOutputType["results"][number] => {
+  const terminal = isRemoteTerminalStatus(input.status);
+  const failed = terminal && input.status !== "completed";
+  return {
+    childThreadId: input.child.childThreadId,
+    status: input.status,
+    turnCount: input.check.turnCount,
+    finalAssistantText: terminal ? input.check.latestAssistantText : null,
+    error: failed ? `Remote sub-agent ended with status ${input.check.status}.` : null,
+    ...(input.promoted
+      ? {
+          note: "still running — you will be NOTIFIED when it completes; stop calling wait and do other work",
+        }
+      : {}),
+  };
+};
+
+const waitRemoteSubagents = Effect.fn("SubagentToolkit.waitRemoteSubagents")(function* (input: {
+  readonly runtime: SubagentRuntime;
+  readonly children: ReadonlyArray<RemoteChild>;
+  readonly mode: "all" | "any";
+  readonly waitStartMs: number;
+  readonly callerDeadlineMs: number;
+  readonly autoPromoteDeadlineMs: number;
+  readonly resumeToken: string | undefined;
+}) {
+  const suppressedTerminalWakes = new Map<string, SuppressedRemoteTerminalWake>();
+
+  const restoreAllSuppressedTerminalWakes = (reason: string) =>
+    Effect.gen(function* () {
+      const pending = Array.from(suppressedTerminalWakes.values());
+      if (pending.length === 0) return;
+      const restoreExits = yield* Effect.forEach(
+        pending,
+        (suppressed) =>
+          restoreSuppressedRemoteTerminalWake(input.runtime, suppressed).pipe(Effect.exit),
+        { concurrency: "unbounded" },
+      );
+      suppressedTerminalWakes.clear();
+      const restoreFailure = restoreExits.find(Exit.isFailure);
+      if (restoreFailure !== undefined) {
+        yield* Effect.logWarning("failed to restore remote terminal wake after wait exit", {
+          reason,
+          cause: Cause.pretty(restoreFailure.cause),
+        });
+      }
+    }).pipe(
+      Effect.catchCause((cause) =>
+        Effect.logWarning("failed to clean up suppressed remote terminal wakes", {
+          reason,
+          cause: Cause.pretty(cause),
+        }),
+      ),
+    );
+
+  return yield* Effect.gen(function* () {
+    const sliceStartMs = yield* Effect.clockWith((clock) => clock.currentTimeMillis);
+    const autoPromoteDeadlineWasActive = input.autoPromoteDeadlineMs <= input.callerDeadlineMs;
+    const sliceDeadlineMs = Math.min(
+      input.callerDeadlineMs,
+      input.autoPromoteDeadlineMs,
+      sliceStartMs + WAIT_SLICE_SECONDS * 1_000,
+    );
+    let rows: WaitSubagentOutputType["results"] = [];
+    let promoted = false;
+
+    while (true) {
+      const checkExits = yield* Effect.forEach(
+        input.children,
+        (child) =>
+          pollRemoteChildWithDeliveryResult(input.runtime, child, {
+            deliverTerminalWake: false,
+            onSuppressedTerminalWake: (suppressed) =>
+              Effect.sync(() => {
+                suppressedTerminalWakes.set(String(suppressed.child.childThreadId), suppressed);
+              }),
+          }).pipe(
+            Effect.map((result) => ({ child, ...result })),
+            Effect.exit,
+          ),
+        { concurrency: "unbounded" },
+      );
+      const successes = checkExits.flatMap((exit) => (Exit.isSuccess(exit) ? [exit.value] : []));
+      for (const success of successes) {
+        if (success.suppressedTerminalWake !== null) {
+          suppressedTerminalWakes.set(
+            String(success.suppressedTerminalWake.child.childThreadId),
+            success.suppressedTerminalWake,
+          );
+        }
+      }
+      const failed = checkExits.find(Exit.isFailure);
+      if (failed !== undefined) {
+        yield* restoreAllSuppressedTerminalWakes("wait poll failure");
+        return yield* Effect.failCause(failed.cause);
+      }
+      const checks = successes;
+      const afterPollMs = yield* Effect.clockWith((clock) => clock.currentTimeMillis);
+      promoted =
+        autoPromoteDeadlineWasActive &&
+        afterPollMs >= input.autoPromoteDeadlineMs &&
+        checks.some(({ check }) => !isRemoteTerminalStatus(check.status));
+      rows = checks.map(({ child, check }) => {
+        const terminal = isRemoteTerminalStatus(check.status);
+        const status = terminal
+          ? check.status
+          : promoted
+            ? "running"
+            : afterPollMs >= input.callerDeadlineMs
+              ? "timeout"
+              : "pending";
+        return remoteWaitRow({ child, check, status, promoted: promoted && !terminal });
+      });
+      const pending = promoted ? false : pendingForMode(rows, input.mode);
+      if (!pending || afterPollMs >= sliceDeadlineMs) {
+        const markResults = yield* Effect.forEach(
+          Array.from(suppressedTerminalWakes.values()),
+          (suppressed) =>
+            markSuppressedRemoteTerminalWake(input.runtime, suppressed).pipe(
+              Effect.exit,
+              Effect.map((exit) => ({ suppressed, exit })),
+            ),
+          { concurrency: "unbounded" },
+        );
+        let markFailureCause: Cause.Cause<ThreadStartToolError> | null = null;
+        for (const result of markResults) {
+          if (Exit.isFailure(result.exit)) {
+            markFailureCause ??= result.exit.cause;
+          }
+        }
+        if (markFailureCause !== null) {
+          yield* Effect.logWarning("failed to mark remote wait completion delivered", {
+            cause: Cause.pretty(markFailureCause),
+          });
+          return yield* Effect.failCause(markFailureCause);
+        }
+        suppressedTerminalWakes.clear();
+        const settledCount = rows.filter((row) => isWaitTerminal(row.status)).length;
+        const timedOutCount = promoted ? 0 : rows.filter((row) => row.status === "timeout").length;
+        return {
+          results: rows,
+          settledCount,
+          timedOutCount,
+          pending: promoted ? false : pending,
+          resumeToken: `${input.waitStartMs}:${input.resumeToken ?? "remote"}`,
+          ...(promoted ? { promoted: true } : {}),
+        } satisfies WaitSubagentOutputType;
+      }
+      const sleepMs = Math.max(1, Math.min(1_000, sliceDeadlineMs - afterPollMs));
+      yield* Effect.sleep(Duration.millis(sleepMs));
+    }
+  }).pipe(
+    Effect.onExit((exit) =>
+      Exit.isSuccess(exit) ? Effect.void : restoreAllSuppressedTerminalWakes("wait interrupted"),
+    ),
+  );
+});
+
+const isUntrackedProjectionWaitRow = (row: WaitSliceResult["results"][number]): boolean =>
+  row.status === "failed" && row.error === UNTRACKED_PROJECTION_CHILD_ERROR;
+
+const peerProjectionWaitRow = (
+  runtime: SubagentRuntime,
+  row: WaitSliceResult["results"][number],
+  callerDeadlineMs: number,
+  observedAtMs: number,
+): Effect.Effect<WaitSliceResult["results"][number], ThreadStartToolError> =>
+  loadThreadDetail(runtime, row.childThreadId).pipe(
+    Effect.map((thread) =>
+      Option.match(thread, {
+        onNone: () => row,
+        onSome: (detail): WaitSliceResult["results"][number] => {
+          const terminalStatus = reliableWaitTerminalStatusOf(detail);
+          if (terminalStatus === "completed") {
+            return {
+              childThreadId: row.childThreadId,
+              status: "completed",
+              finalAssistantText: finalAssistantTextFromThread(detail),
+              error: null,
+            };
+          }
+          if (terminalStatus === "failed") {
+            return {
+              childThreadId: row.childThreadId,
+              status: "failed",
+              finalAssistantText: finalAssistantTextFromThread(detail),
+              error: "Child thread ended with status failed.",
+            };
+          }
+          const timedOut = observedAtMs >= callerDeadlineMs;
+          return {
+            childThreadId: row.childThreadId,
+            status: timedOut ? "timeout" : "pending",
+            finalAssistantText: null,
+            error: timedOut ? "wait exceeded budget" : null,
+          };
+        },
+      }),
+    ),
+  );
+
+const applyPeerProjectionWaitFallback = Effect.fn(
+  "SubagentToolkit.applyPeerProjectionWaitFallback",
+)(function* (input: {
+  readonly invocation: McpInvocationContext.McpInvocationScope;
+  readonly runtime: SubagentRuntime;
+  readonly slice: WaitSliceResult;
+  readonly mode: "all" | "any";
+  readonly callerDeadlineMs: number;
+  readonly observedAtMs: number;
+}) {
+  if (McpInvocationContext.isProviderInvocationScope(input.invocation)) return input.slice;
+  if (!input.slice.results.some(isUntrackedProjectionWaitRow)) return input.slice;
+  const results = yield* Effect.forEach(
+    input.slice.results,
+    (row) =>
+      isUntrackedProjectionWaitRow(row)
+        ? peerProjectionWaitRow(input.runtime, row, input.callerDeadlineMs, input.observedAtMs)
+        : Effect.succeed(row),
+    { concurrency: "unbounded" },
+  );
+  return {
+    results,
+    settledCount: results.filter((row) => isWaitTerminal(row.status)).length,
+    timedOutCount: results.filter((row) => row.status === "timeout").length,
+    pending: pendingForMode(results, input.mode),
+    resumeToken: input.slice.resumeToken,
+  } satisfies WaitSliceResult;
+});
+
+const pollRemoteChildrenOnce = Effect.fn("SubagentToolkit.pollRemoteChildrenOnce")(function* (
+  runtime: SubagentRuntime,
+) {
+  const rows = yield* runtime.remoteChildren
+    .listAll()
+    .pipe(Effect.mapError((error) => toToolError(error, "Failed to list remote children.")));
+  const running = rows.filter((row) => !isRemoteTerminalStatus(row.status));
+  yield* Effect.forEach(
+    running,
+    (row) =>
+      pollRemoteChild(runtime, row).pipe(
+        Effect.catchCause((cause) =>
+          Effect.logWarning("remote sub-agent poll failed", {
+            parentThreadId: row.parentThreadId,
+            childEnvironmentId: row.childEnvironmentId,
+            childThreadId: row.childThreadId,
+            alias: row.alias,
+            cause: Cause.pretty(cause),
+          }),
+        ),
+      ),
+    { discard: true, concurrency: 4 },
+  );
+});
+
+const remoteChildPoller = (runtime: SubagentRuntime) =>
+  pollRemoteChildrenOnce(runtime).pipe(
+    Effect.catchCause((cause) =>
+      Effect.logWarning("remote sub-agent poll sweep failed", { cause: Cause.pretty(cause) }),
+    ),
+    Effect.repeat(Schedule.spaced(Duration.seconds(2))),
+  );
+
 const spawnSubagent = Effect.fn("SubagentToolkit.spawn")(function* (input: SpawnSubagentInput) {
-  const invocation = yield* requireProviderSubagentInvocation("subagent:spawn");
+  const invocation = yield* requireSubagentCapability("subagent:spawn");
   const runtime = yield* requireRuntime();
-  const coordinator = yield* requireCoordinator();
   const spawnRuntime = yield* requireSpawnRuntime();
 
-  const { detached: detachedInput, waitTimeoutSeconds, ...threadStartInput } = input;
+  const {
+    detached: detachedInput,
+    waitTimeoutSeconds,
+    target,
+    remoteParentThreadId,
+    remoteParentEnvironmentId,
+    ...threadStartInput
+  } = input;
+
+  if (target !== undefined) {
+    if (!McpInvocationContext.isProviderInvocationScope(invocation)) {
+      return yield* fail("target is only supported by a provider-scoped parent thread.");
+    }
+    if (detachedInput === false) {
+      return yield* fail(
+        "Foreground remote sub-agent spawn is not available yet; omit detached or set detached=true.",
+      );
+    }
+    if (threadStartInput.directory === undefined) {
+      return yield* fail(
+        "Remote sub-agent spawn requires directory so the target backend can choose a local project.",
+      );
+    }
+    const peer = yield* runtime.peerRegistry
+      .resolveTarget(target)
+      .pipe(Effect.mapError((error) => fail(error.message)));
+    const descriptor = yield* probePeerDescriptor(runtime.httpClient, peer);
+    const remoteArguments = {
+      ...threadStartInput,
+      detached: true,
+      remoteParentThreadId: invocation.threadId,
+      remoteParentEnvironmentId: invocation.environmentId,
+    } satisfies SpawnSubagentInput;
+    const session = yield* connectPeerWithTimeout(runtime, peer, `Remote peer '${peer.alias}'`);
+    const callResult = yield* callRemoteSpawnTool(runtime, peer, session, remoteArguments);
+    const started = yield* decodeRemoteSpawnResult(callResult);
+    const createdAt = yield* nowIso;
+    yield* runtime.remoteChildren
+      .upsert({
+        parentThreadId: invocation.threadId,
+        childEnvironmentId: descriptor.environmentId,
+        childThreadId: started.childThreadId,
+        alias: peer.alias,
+        spawnParams: remoteArguments,
+        status: "running",
+        lastPolledAt: null,
+        createdAt,
+        updatedAt: createdAt,
+      })
+      .pipe(Effect.mapError((error) => toToolError(error, "Failed to record remote child.")));
+    return {
+      ...started,
+      parentThreadId: invocation.threadId,
+    };
+  }
+
+  if (!McpInvocationContext.isProviderInvocationScope(invocation)) {
+    if (remoteParentThreadId === undefined) {
+      return yield* fail(
+        "Peer-scoped sub-agent spawn requires remoteParentThreadId from the caller backend.",
+      );
+    }
+    if (detachedInput === false) {
+      return yield* fail("Peer-scoped remote sub-agent spawn must be detached.");
+    }
+    const parentEnvironmentId = invocation.sourceEnvironmentId;
+    if (parentEnvironmentId === undefined) {
+      return yield* fail(
+        "Peer-scoped sub-agent spawn requires a peer token with sourceEnvironmentId from the caller backend.",
+      );
+    }
+    if (
+      remoteParentEnvironmentId !== undefined &&
+      remoteParentEnvironmentId !== parentEnvironmentId
+    ) {
+      return yield* fail(
+        "Peer-scoped sub-agent spawn remoteParentEnvironmentId does not match the authenticated caller backend.",
+      );
+    }
+    yield* requirePeerParentAccess(invocation, remoteParentThreadId);
+    const started = yield* spawnRuntime(threadStartInput, invocation);
+    yield* dispatchParentSet(
+      runtime,
+      started.threadId,
+      remoteParentThreadId,
+      parentEnvironmentId,
+    ).pipe(
+      Effect.mapError((error) => toToolError(error, "Failed to link remote sub-agent parent.")),
+      Effect.onError(() =>
+        dispatchStartedChildDelete(runtime, started.threadId).pipe(Effect.catch(() => Effect.void)),
+      ),
+    );
+    return {
+      childThreadId: started.threadId,
+      projectId: started.projectId,
+      mode: started.mode,
+      branch: started.branch,
+      worktreePath: started.worktreePath,
+      parentThreadId: remoteParentThreadId,
+      ...(started.warning ? { warning: started.warning } : {}),
+    } satisfies SpawnSubagentOutputType;
+  }
+
+  const providerInvocation = invocation;
+  const coordinator = yield* requireCoordinator();
   const detached = detachedInput ?? true;
 
   // Fail-fast: refuse to spawn against a provider instance that no longer exists.
-  const source = yield* loadThreadShell(runtime, invocation.threadId).pipe(
+  const source = yield* loadThreadShell(runtime, providerInvocation.threadId).pipe(
     Effect.flatMap((shell) =>
       Option.match(shell, {
-        onNone: () => Effect.fail(fail(`Source thread ${invocation.threadId} was not found.`)),
+        onNone: () =>
+          Effect.fail(fail(`Source thread ${providerInvocation.threadId} was not found.`)),
         onSome: Effect.succeed,
       }),
     ),
@@ -506,7 +1446,7 @@ const spawnSubagent = Effect.fn("SubagentToolkit.spawn")(function* (input: Spawn
     return yield* fail(`Provider instance ${modelSelection.instanceId} is not available.`);
   }
   yield* coordinator.validateSpawn({
-    parentThreadId: invocation.threadId,
+    parentThreadId: providerInvocation.threadId,
     model: modelSelection,
   });
 
@@ -522,7 +1462,7 @@ const spawnSubagent = Effect.fn("SubagentToolkit.spawn")(function* (input: Spawn
           runtime.dispatchLimiter.release(dispatchLease);
         const started = yield* spawnRuntime(
           { ...threadStartInputWithSelection, modelSelection },
-          invocation,
+          providerInvocation,
         ).pipe(Effect.onError(() => releaseDispatchLease));
         yield* runtime.dispatchLimiter.bindChild(dispatchLease, started.threadId);
         const cleanupAndReleaseFromDelete = (reason: string) =>
@@ -532,13 +1472,13 @@ const spawnSubagent = Effect.fn("SubagentToolkit.spawn")(function* (input: Spawn
         // Persist the parent linkage before registration relies on the in-memory
         // limiter binding; restart reconciliation seeds running children from
         // this durable link.
-        yield* dispatchParentSet(runtime, started.threadId, invocation.threadId).pipe(
+        yield* dispatchParentSet(runtime, started.threadId, providerInvocation.threadId).pipe(
           Effect.mapError((error) => toToolError(error, "Failed to link sub-agent to parent.")),
           Effect.onError(() => cleanupAndReleaseFromDelete("parent link failed")),
         );
         yield* coordinator
           .register({
-            parentThreadId: invocation.threadId,
+            parentThreadId: providerInvocation.threadId,
             childThreadId: started.threadId,
             detached,
             model: modelSelection,
@@ -549,13 +1489,13 @@ const spawnSubagent = Effect.fn("SubagentToolkit.spawn")(function* (input: Spawn
       }),
   );
 
-  const base: SpawnSubagentOutput = {
+  const base: SpawnSubagentOutputType = {
     childThreadId: started.threadId,
     projectId: started.projectId,
     mode: started.mode,
     branch: started.branch,
     worktreePath: started.worktreePath,
-    parentThreadId: invocation.threadId,
+    parentThreadId: providerInvocation.threadId,
     ...(started.warning ? { warning: started.warning } : {}),
   };
 
@@ -596,6 +1536,7 @@ const dispatchParentSet = Effect.fn("SubagentToolkit.dispatchParentSet")(functio
   runtime: SubagentRuntime,
   childThreadId: ThreadId,
   parentThreadId: ThreadId,
+  parentEnvironmentId?: EnvironmentId,
 ) {
   const uuid = yield* runtime.crypto.randomUUIDv4.pipe(Effect.orDie);
   const createdAt = yield* nowIso;
@@ -604,6 +1545,7 @@ const dispatchParentSet = Effect.fn("SubagentToolkit.dispatchParentSet")(functio
     commandId: CommandId.make(`server:subagent-link:${uuid}`),
     threadId: childThreadId,
     parentThreadId,
+    ...(parentEnvironmentId !== undefined ? { parentEnvironmentId } : {}),
     createdAt,
   });
 });
@@ -716,7 +1658,17 @@ const steerSubagent = Effect.fn("SubagentToolkit.steer")(function* (input: Steer
 const checkSubagent = Effect.fn("SubagentToolkit.check")(function* (input: CheckSubagentInput) {
   const invocation = yield* requireSubagentCapability("subagent:check");
   const runtime = yield* requireRuntime();
-  yield* requirePeerChildAccess(invocation, [input.childThreadId]);
+  yield* requirePeerChildAccess(runtime, invocation, [input.childThreadId]);
+
+  if (McpInvocationContext.isProviderInvocationScope(invocation)) {
+    const remoteChildren = yield* remoteChildrenByIdForParent(runtime, invocation.threadId, [
+      input.childThreadId,
+    ]);
+    const remoteChild = remoteChildren.get(String(input.childThreadId));
+    if (remoteChild !== undefined) {
+      return yield* pollRemoteChild(runtime, remoteChild);
+    }
+  }
 
   const detail = yield* loadThreadDetail(runtime, input.childThreadId).pipe(
     Effect.flatMap((thread) =>
@@ -754,7 +1706,33 @@ const waitSubagent = Effect.fn("SubagentToolkit.wait")(function* (input: WaitSub
   const coordinator = yield* requireCoordinator();
   const childThreadIds = Array.from(new Set(input.childThreadIds));
 
-  yield* requirePeerChildAccess(invocation, childThreadIds);
+  yield* requirePeerChildAccess(runtime, invocation, childThreadIds);
+  const remoteRowsById = McpInvocationContext.isProviderInvocationScope(invocation)
+    ? yield* remoteChildrenByIdForParent(runtime, invocation.threadId, childThreadIds)
+    : new Map<string, RemoteChild>();
+  if (remoteRowsById.size > 0) {
+    if (remoteRowsById.size !== childThreadIds.length) {
+      return yield* fail(
+        "t3_wait_subagent cannot mix local and remote sub-agents in one call yet; wait for each backend group separately.",
+      );
+    }
+    const budgetSeconds = clamp(
+      input.timeoutSeconds ?? WAIT_TIMEOUT_DEFAULT_SECONDS,
+      WAIT_TIMEOUT_MIN_SECONDS,
+      WAIT_TIMEOUT_MAX_SECONDS,
+    );
+    const nowMs = yield* Effect.clockWith((clock) => clock.currentTimeMillis);
+    const waitStartMs = parseWaitStartMs(input.resumeToken, nowMs);
+    return yield* waitRemoteSubagents({
+      runtime,
+      children: childThreadIds.map((childThreadId) => remoteRowsById.get(String(childThreadId))!),
+      mode: input.mode ?? "all",
+      waitStartMs,
+      callerDeadlineMs: nowMs + budgetSeconds * 1_000,
+      autoPromoteDeadlineMs: waitStartMs + WAIT_AUTO_PROMOTE_SECONDS * 1_000,
+      resumeToken: input.resumeToken,
+    });
+  }
   if (McpInvocationContext.isProviderInvocationScope(invocation)) {
     yield* Effect.forEach(
       childThreadIds,
@@ -790,11 +1768,20 @@ const waitSubagent = Effect.fn("SubagentToolkit.wait")(function* (input: WaitSub
   return yield* Effect.gen(function* () {
     // One bounded slice per invocation — the agent re-calls with the returned
     // resumeToken while `pending` is true (never one long HTTP hold).
-    const slice = yield* coordinator.waitSlice({
+    const rawSlice = yield* coordinator.waitSlice({
       childThreadIds,
       mode: input.mode ?? "all",
       budgetDeadlineMs,
       ...(coordinatorToken !== undefined ? { resumeToken: coordinatorToken } : {}),
+    });
+    const afterSliceMs = yield* Effect.clockWith((clock) => clock.currentTimeMillis);
+    const slice = yield* applyPeerProjectionWaitFallback({
+      invocation,
+      runtime,
+      slice: rawSlice,
+      mode: input.mode ?? "all",
+      callerDeadlineMs,
+      observedAtMs: afterSliceMs,
     });
     terminalWaitChildIds.clear();
     for (const row of slice.results) {
@@ -803,7 +1790,6 @@ const waitSubagent = Effect.fn("SubagentToolkit.wait")(function* (input: WaitSub
       }
     }
 
-    const afterSliceMs = yield* Effect.clockWith((clock) => clock.currentTimeMillis);
     const enrichedRows = yield* Effect.forEach(
       slice.results,
       (
@@ -889,9 +1875,12 @@ const waitSubagent = Effect.fn("SubagentToolkit.wait")(function* (input: WaitSub
       pending: pendingForMode(effectiveRows, input.mode ?? "all"),
       resumeToken: slice.resumeToken,
     };
+    const untrackedProjectionChildIds = new Set(
+      rawSlice.results.filter(isUntrackedProjectionWaitRow).map((row) => String(row.childThreadId)),
+    );
     const coordinatorTerminalIds = new Set(
-      slice.results
-        .filter((row) => isWaitTerminal(row.status))
+      rawSlice.results
+        .filter((row) => isWaitTerminal(row.status) && !isUntrackedProjectionWaitRow(row))
         .map((row) => String(row.childThreadId)),
     );
     const projectionTerminalIds = new Set(
@@ -914,16 +1903,21 @@ const waitSubagent = Effect.fn("SubagentToolkit.wait")(function* (input: WaitSub
     // rather than the caller's requested timeout, those timeout rows are still
     // running children that must be promoted to wake-on-completion.
     const autoPromoteDeadlineWasActive = autoPromoteDeadlineMs <= callerDeadlineMs;
-    const autoPromote =
-      autoPromoteDeadlineWasActive &&
-      afterSliceMs >= autoPromoteDeadlineMs &&
-      effectiveSlice.results.some((row) => row.status === "pending" || row.status === "timeout");
-    const stillRunningIds = autoPromote
-      ? effectiveSlice.results
-          .filter((row) => row.status === "pending" || row.status === "timeout")
-          .map((row) => row.childThreadId)
-      : [];
-    if (autoPromote && stillRunningIds.length > 0) {
+    const stillRunningIds =
+      autoPromoteDeadlineWasActive && afterSliceMs >= autoPromoteDeadlineMs
+        ? effectiveSlice.results
+            .filter(
+              (row) =>
+                (row.status === "pending" || row.status === "timeout") &&
+                !untrackedProjectionChildIds.has(String(row.childThreadId)),
+            )
+            .map((row) => row.childThreadId)
+        : [];
+    const autoPromote = stillRunningIds.length > 0;
+    const autoPromotedChildIds = new Set(
+      stillRunningIds.map((childThreadId) => String(childThreadId)),
+    );
+    if (autoPromote) {
       yield* coordinator.promoteToWake(stillRunningIds);
     }
 
@@ -931,14 +1925,15 @@ const waitSubagent = Effect.fn("SubagentToolkit.wait")(function* (input: WaitSub
     // terminal result intentionally does not track it). On auto-promote, a still
     // "pending"/auto-promote "timeout" child is reported as "running" with a note
     // telling the model to stop waiting.
-    const results: WaitSubagentOutput["results"] = yield* Effect.forEach(
+    const results: WaitSubagentOutputType["results"] = yield* Effect.forEach(
       effectiveSlice.results,
       (row) =>
         loadThreadDetail(runtime, row.childThreadId).pipe(
           Effect.timeoutOption(`${WAIT_PROJECTION_ENRICHMENT_TIMEOUT_MS} millis`),
           Effect.map((thread) => {
             const promotedRunning =
-              autoPromote && (row.status === "pending" || row.status === "timeout");
+              autoPromotedChildIds.has(String(row.childThreadId)) &&
+              (row.status === "pending" || row.status === "timeout");
             return {
               childThreadId: row.childThreadId,
               status: promotedRunning ? "running" : row.status,
@@ -959,6 +1954,14 @@ const waitSubagent = Effect.fn("SubagentToolkit.wait")(function* (input: WaitSub
         ),
       { concurrency: "unbounded" },
     );
+    const reportedTimedOutCount = autoPromote
+      ? effectiveSlice.results.filter(
+          (row) => row.status === "timeout" && !autoPromotedChildIds.has(String(row.childThreadId)),
+        ).length
+      : effectiveSlice.timedOutCount;
+    const reportedPending = autoPromote
+      ? pendingForMode(results, input.mode ?? "all")
+      : effectiveSlice.pending;
 
     if (waitDeliveredRows.length > 0) {
       const markableRows = yield* markableWaitDeliveredRows(
@@ -982,10 +1985,10 @@ const waitSubagent = Effect.fn("SubagentToolkit.wait")(function* (input: WaitSub
     return {
       results,
       settledCount: effectiveSlice.settledCount,
-      timedOutCount: autoPromote ? 0 : effectiveSlice.timedOutCount,
-      // Auto-promote is a terminal return: the model must stop waiting, so this is
-      // never reported as still-pending even though some children are running.
-      pending: autoPromote ? false : effectiveSlice.pending,
+      timedOutCount: reportedTimedOutCount,
+      // Auto-promoted rows have a wake path and are reported as running/notified;
+      // projection-only peer rows keep their polling status.
+      pending: reportedPending,
       resumeToken: `${waitStartMs}:${effectiveSlice.resumeToken}`,
       ...(autoPromote ? { promoted: true } : {}),
     };
@@ -1034,7 +2037,101 @@ const listSubagents = Effect.fn("SubagentToolkit.list")(function* (input: ListSu
     ),
   );
 
-  return { parentThreadId, children };
+  const registeredIds = new Set(registered.map((entry) => String(entry.childThreadId)));
+  const projectionPeerChildren =
+    McpInvocationContext.isProviderInvocationScope(invocation) ||
+    invocation.sourceEnvironmentId === undefined
+      ? []
+      : yield* runtime.projectionSnapshotQuery.getShellSnapshot().pipe(
+          Effect.mapError((error) => toToolError(error, "Failed to load thread list.")),
+          Effect.map((snapshot) =>
+            snapshot.threads.filter(
+              (thread) =>
+                thread.parentThreadId === parentThreadId &&
+                thread.parentEnvironmentId === invocation.sourceEnvironmentId &&
+                !registeredIds.has(String(thread.id)),
+            ),
+          ),
+          Effect.flatMap((threads) =>
+            Effect.forEach(
+              threads,
+              (thread) =>
+                loadThreadDetail(runtime, thread.id).pipe(
+                  Effect.map((detail) =>
+                    Option.match(detail, {
+                      onNone: () => {
+                        const status = statusOf({
+                          latestTurn: thread.latestTurn,
+                          messages: [],
+                          session: thread.session,
+                        });
+                        return {
+                          childThreadId: thread.id,
+                          parentThreadId,
+                          detached: true,
+                          depth: 1,
+                          spawnedAtMs: Date.parse(thread.createdAt),
+                          settled: isWaitTerminal(status),
+                          status,
+                          turnCount: thread.latestTurn === null ? 0 : 1,
+                        };
+                      },
+                      onSome: (detailThread) => {
+                        const status = statusOf(detailThread);
+                        return {
+                          childThreadId: thread.id,
+                          parentThreadId,
+                          detached: true,
+                          depth: 1,
+                          spawnedAtMs: Date.parse(thread.createdAt),
+                          settled: isWaitTerminal(status),
+                          status,
+                          turnCount: turnCountOf(detailThread),
+                        };
+                      },
+                    }),
+                  ),
+                ),
+              { concurrency: "unbounded" },
+            ),
+          ),
+        );
+
+  const remoteRows = yield* runtime.remoteChildren
+    .listByParent({ parentThreadId })
+    .pipe(Effect.mapError((error) => toToolError(error, "Failed to list remote children.")));
+  const remoteChildren = yield* Effect.forEach(
+    remoteRows,
+    (entry) =>
+      pollRemoteChild(runtime, entry).pipe(
+        Effect.map((check) => {
+          const status = remoteChildStatusFromToolStatus(check.status);
+          return {
+            childThreadId: entry.childThreadId,
+            parentThreadId: entry.parentThreadId,
+            detached: true,
+            depth: 1,
+            spawnedAtMs: Date.parse(entry.createdAt),
+            settled: isRemoteTerminalStatus(status),
+            status,
+            turnCount: check.turnCount,
+          };
+        }),
+        Effect.orElseSucceed(() => ({
+          childThreadId: entry.childThreadId,
+          parentThreadId: entry.parentThreadId,
+          detached: true,
+          depth: 1,
+          spawnedAtMs: Date.parse(entry.createdAt),
+          settled: isRemoteTerminalStatus(entry.status),
+          status: entry.status,
+          turnCount: 0,
+        })),
+      ),
+    { concurrency: "unbounded" },
+  );
+
+  return { parentThreadId, children: [...children, ...projectionPeerChildren, ...remoteChildren] };
 });
 
 const validateCron = (
@@ -1292,6 +2389,9 @@ const makeSubagentRuntime = Effect.fn("SubagentToolkit.makeActiveRuntime")(funct
   const providerInstanceRegistry = yield* ProviderInstanceRegistry;
   const scheduledTasks = yield* ScheduledTaskRepository;
   const pendingDispatches = yield* PendingDispatchRepository;
+  const remoteChildren = yield* RemoteChildRepository;
+  const peerRegistry = yield* SubagentPeerRegistry.SubagentPeerRegistry;
+  const httpClient = yield* HttpClient.HttpClient;
   const dispatchLimiter = yield* SubagentDispatchLimiter;
   return {
     crypto,
@@ -1300,6 +2400,9 @@ const makeSubagentRuntime = Effect.fn("SubagentToolkit.makeActiveRuntime")(funct
     providerInstanceRegistry,
     scheduledTasks,
     pendingDispatches,
+    remoteChildren,
+    peerRegistry,
+    httpClient,
     dispatchLimiter,
   };
 });
@@ -1310,7 +2413,7 @@ export const SubagentRuntimeLive = Layer.effectDiscard(
       Effect.tap((runtime) =>
         Effect.sync(() => {
           activeRuntime = runtime;
-        }),
+        }).pipe(Effect.andThen(Effect.forkScoped(remoteChildPoller(runtime)))),
       ),
     ),
     (runtime) =>

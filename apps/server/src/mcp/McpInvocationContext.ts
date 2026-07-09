@@ -39,6 +39,7 @@ export interface PeerMcpInvocationScope extends McpInvocationScopeBase {
   readonly credentialKind: "peer";
   readonly peerTokenId: string;
   readonly sourceSessionId?: AuthSessionId;
+  readonly sourceEnvironmentId?: EnvironmentId;
   readonly allowedParentThreadIds?: ReadonlySet<ThreadId>;
   readonly allowedChildThreadIds?: ReadonlySet<ThreadId>;
   readonly expiresAt: number | null;

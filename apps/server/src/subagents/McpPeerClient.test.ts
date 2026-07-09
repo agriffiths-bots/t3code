@@ -8,7 +8,7 @@ import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Schema from "effect/Schema";
 import { McpSchema, McpServer } from "effect/unstable/ai";
-import { HttpClient, HttpClientResponse, HttpRouter } from "effect/unstable/http";
+import { HttpBody, HttpClient, HttpClientResponse, HttpRouter } from "effect/unstable/http";
 
 import * as EnvironmentAuth from "../auth/EnvironmentAuth.ts";
 import * as ServerEnvironment from "../environment/ServerEnvironment.ts";
@@ -266,6 +266,60 @@ it.effect("initializes a peer session and sends tools/call over MCP HTTP", () =>
   });
 });
 
+it.effect("terminates a stateful MCP peer session with DELETE", () => {
+  const requests: Array<CapturedHttpRequest> = [];
+  const httpLayer = Layer.succeed(
+    HttpClient.HttpClient,
+    HttpClient.make((request) =>
+      Effect.sync(() => {
+        requests.push(request);
+        if (request.method === "DELETE") {
+          assert.equal(request.url, "https://peer.example/mcp");
+          return HttpClientResponse.fromWeb(request, new Response(null, { status: 204 }));
+        }
+        const rpc = decodeRequestBody(request);
+        if (rpc.method === "initialize") {
+          return HttpClientResponse.fromWeb(
+            request,
+            Response.json(
+              {
+                jsonrpc: "2.0",
+                id: rpc.id,
+                result: {
+                  protocolVersion: "2025-06-18",
+                  capabilities: { tools: {} },
+                  serverInfo: { name: "peer-test", version: "1.0.0" },
+                },
+              },
+              {
+                headers: {
+                  "mcp-session-id": "session-close",
+                  "mcp-protocol-version": "2025-06-18",
+                },
+              },
+            ),
+          );
+        }
+        assert.equal(rpc.method, "notifications/initialized");
+        return HttpClientResponse.fromWeb(request, new Response(null, { status: 202 }));
+      }),
+    ),
+  );
+
+  return Effect.gen(function* () {
+    const session = yield* McpPeerClient.connect(bearerPeer).pipe(Effect.provide(httpLayer));
+    yield* session.close();
+
+    assert.equal(requests.length, 3);
+    const deleteRequest = requests[2];
+    assert.ok(deleteRequest);
+    assert.equal(deleteRequest.method, "DELETE");
+    assert.equal(deleteRequest.headers.authorization, "Bearer peer-token");
+    assert.equal(deleteRequest.headers["mcp-session-id"], "session-close");
+    assert.equal(deleteRequest.headers["mcp-protocol-version"], "2025-06-18");
+  });
+});
+
 it.effect("supports stateless MCP peers that do not return an MCP session id", () => {
   const requests: Array<CapturedHttpRequest> = [];
   const httpLayer = Layer.succeed(
@@ -491,6 +545,7 @@ it.effect("uses route-minted peer tokens for authenticated MCP calls", () =>
       lastAuthenticatedHttpRequestAuthorization = undefined;
       const tokenResponse = yield* httpClient.post(SUBAGENT_PEER_MCP_TOKEN_PATH, {
         headers: { authorization: "Bearer env-access-token" },
+        body: HttpBody.jsonUnsafe({ sourceEnvironmentId: "environment-source-a" }),
       });
       if (tokenResponse.status !== 200) {
         const body = yield* tokenResponse.text;
@@ -597,6 +652,7 @@ it.effect("rejects route-minted peer tokens when source session confirmation fai
       lastAuthenticatedHttpRequestAuthorization = undefined;
       const tokenResponse = yield* httpClient.post(SUBAGENT_PEER_MCP_TOKEN_PATH, {
         headers: { authorization: "Bearer racing-env-access-token" },
+        body: HttpBody.jsonUnsafe({ sourceEnvironmentId: "environment-source-a" }),
       });
 
       assert.equal(tokenResponse.status, 401);
@@ -617,6 +673,82 @@ it.effect("rejects route-minted peer tokens when source session confirmation fai
       });
       assert.equal(result.isError, false);
       assert.deepStrictEqual(result.structuredContent, { echoed: "existing token survived" });
+    }),
+  ).pipe(Effect.provide(NodeHttpServer.layerTest)),
+);
+
+it.effect("authenticates route-minted peer token requests before validating bodies", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const serverLayer = Layer.mergeAll(
+        mcpPeerTokenRouteLayer,
+        registerPeerPingTool.pipe(Layer.provideMerge(authenticatedTestMcpTransportLayer)),
+        McpHttpServer.McpGetMethodNotAllowedLive,
+      ).pipe(Layer.provide(McpSessionRegistry.layer));
+      yield* HttpRouter.serve(serverLayer, {
+        disableListenLog: true,
+        disableLogger: true,
+      }).pipe(
+        Layer.provide(Layer.succeed(EnvironmentAuth.EnvironmentAuth, fakeEnvironmentAuth)),
+        Layer.provide(Layer.succeed(ServerEnvironment.ServerEnvironment, fakeEnvironment)),
+        Layer.provide(NodeServices.layer),
+        Layer.build,
+      );
+
+      const httpClient = yield* HttpClient.HttpClient;
+      lastAuthenticatedHttpRequestAuthorization = undefined;
+      const tokenResponse = yield* httpClient.post(SUBAGENT_PEER_MCP_TOKEN_PATH, {
+        headers: { authorization: "Bearer env-access-token" },
+      });
+
+      assert.equal(tokenResponse.status, 400);
+      assert.equal(lastAuthenticatedHttpRequestAuthorization, "Bearer env-access-token");
+      const body = yield* tokenResponse.json;
+      assert.deepEqual(body, {
+        error: "invalid_request",
+        message: "sourceEnvironmentId is required when minting a subagent peer token.",
+      });
+    }),
+  ).pipe(Effect.provide(NodeHttpServer.layerTest)),
+);
+
+it.effect("rejects unauthenticated peer-token requests before parsing invalid JSON", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      let authCalls = 0;
+      const rejectingEnvironmentAuth = EnvironmentAuth.EnvironmentAuth.of({
+        ...fakeEnvironmentAuth,
+        authenticateHttpRequest: () => {
+          authCalls += 1;
+          return Effect.fail(
+            new EnvironmentAuth.ServerAuthInvalidCredentialError({
+              reason: "invalid_credential",
+            }),
+          );
+        },
+      });
+      const serverLayer = Layer.mergeAll(
+        mcpPeerTokenRouteLayer,
+        registerPeerPingTool.pipe(Layer.provideMerge(authenticatedTestMcpTransportLayer)),
+        McpHttpServer.McpGetMethodNotAllowedLive,
+      ).pipe(Layer.provide(McpSessionRegistry.layer));
+      yield* HttpRouter.serve(serverLayer, {
+        disableListenLog: true,
+        disableLogger: true,
+      }).pipe(
+        Layer.provide(Layer.succeed(EnvironmentAuth.EnvironmentAuth, rejectingEnvironmentAuth)),
+        Layer.provide(Layer.succeed(ServerEnvironment.ServerEnvironment, fakeEnvironment)),
+        Layer.provide(NodeServices.layer),
+        Layer.build,
+      );
+
+      const httpClient = yield* HttpClient.HttpClient;
+      const tokenResponse = yield* httpClient.post(SUBAGENT_PEER_MCP_TOKEN_PATH, {
+        body: HttpBody.text("{", "application/json"),
+      });
+
+      assert.equal(tokenResponse.status, 401);
+      assert.equal(authCalls, 1);
     }),
   ).pipe(Effect.provide(NodeHttpServer.layerTest)),
 );

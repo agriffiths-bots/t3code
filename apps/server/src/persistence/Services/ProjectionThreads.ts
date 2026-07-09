@@ -15,6 +15,7 @@ import {
   RuntimeMode,
   ThreadId,
   TurnId,
+  EnvironmentId,
 } from "@t3tools/contracts";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
@@ -44,6 +45,7 @@ export const ProjectionThread = Schema.Struct({
   hasActionableProposedPlan: NonNegativeInt,
   deletedAt: Schema.NullOr(IsoDateTime),
   parentThreadId: Schema.NullOr(ThreadId),
+  parentEnvironmentId: Schema.optional(Schema.NullOr(EnvironmentId)),
 });
 export type ProjectionThread = typeof ProjectionThread.Type;
 

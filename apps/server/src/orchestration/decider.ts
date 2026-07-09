@@ -456,11 +456,13 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
         command,
         threadId: command.threadId,
       });
-      yield* requireThread({
-        readModel,
-        command,
-        threadId: command.parentThreadId,
-      });
+      if (command.parentEnvironmentId === undefined) {
+        yield* requireThread({
+          readModel,
+          command,
+          threadId: command.parentThreadId,
+        });
+      }
       const occurredAt = yield* nowIso;
       return {
         ...(yield* withEventBase({
@@ -473,6 +475,9 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
         payload: {
           threadId: command.threadId,
           parentThreadId: command.parentThreadId,
+          ...(command.parentEnvironmentId !== undefined
+            ? { parentEnvironmentId: command.parentEnvironmentId }
+            : {}),
           updatedAt: occurredAt,
         },
       };

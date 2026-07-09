@@ -14,11 +14,18 @@ import * as TestClock from "effect/testing/TestClock";
 import { HttpClient, HttpClientRequest, HttpClientResponse } from "effect/unstable/http";
 
 import { __testing, pairPeer, PeerCommandInputError, PeerPairingError } from "./peers.ts";
+import * as ServerEnvironment from "../environment/ServerEnvironment.ts";
 import * as SubagentPeerRegistry from "../subagents/SubagentPeerRegistry.ts";
 
 const bearerCredential = new SubagentPeerRegistry.SubagentPeerBearerCredential({
   token: "peer-token",
 });
+
+const decodeHttpClientRequestJson = (request: HttpClientRequest.HttpClientRequest) => {
+  const rawBody = (request.body as { readonly body?: Uint8Array }).body;
+  if (rawBody === undefined) throw new Error("Expected request body.");
+  return JSON.parse(new TextDecoder().decode(rawBody)) as unknown;
+};
 
 const existingPeer: SubagentPeerRegistry.SubagentPeer = {
   alias: "vps",
@@ -188,6 +195,9 @@ it.layer(NodeServices.layer)("peers CLI helpers", (it) => {
           }
           if (request.url.endsWith("/api/mcp/peer-token")) {
             assert.equal(request.headers.authorization, "Bearer peer-access-token");
+            assert.deepEqual(decodeHttpClientRequestJson(request), {
+              sourceEnvironmentId: "env-cli",
+            });
             return Effect.succeed(
               HttpClientResponse.fromWeb(
                 request,
@@ -215,7 +225,13 @@ it.layer(NodeServices.layer)("peers CLI helpers", (it) => {
         alias: "vps",
         pairingUrl: "https://peer.example/pair#token=pair-token",
         mcpEndpoint: "https://peer.example/custom-mcp",
-      }).pipe(Effect.provide(httpLayer));
+      }).pipe(
+        Effect.provide(httpLayer),
+        Effect.provideService(ServerEnvironment.ServerEnvironment, {
+          getEnvironmentId: Effect.succeed(EnvironmentId.make("env-cli")),
+          getDescriptor: Effect.die("unused"),
+        }),
+      );
 
       assert.equal(capturedAdd?.mcpEndpoint, "https://peer.example/custom-mcp");
       assert.deepEqual(requestedUrls, [

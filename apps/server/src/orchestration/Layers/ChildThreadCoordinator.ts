@@ -55,6 +55,7 @@ import {
   type ChildListEntry,
   type ChildTerminalStatus,
   type ChildThreadCoordinatorShape,
+  type EnqueueParentInjectionInput,
   type ChildWaitResult,
   type WaitDeliveredMark,
   type WaitChildResult,
@@ -82,12 +83,11 @@ interface PendingInjection {
   readonly deliveredByWait: boolean;
   readonly waitCancellable: boolean;
   /**
-   * The command id this row was already claimed+dispatched under before a crash
-   * (R-B exactly-once). Null for a fresh injection that may be consolidated into
-   * a batch under a fresh deterministic id; non-null means it MUST be
-   * re-dispatched under this exact id so the engine's receipt dedup makes a
-   * landed turn a no-op (no duplicate) and an un-landed turn fire (no loss),
-   * regardless of how the rows happen to re-batch on restart.
+   * The command id this row must dispatch under (R-B exactly-once). Null for a
+   * fresh injection that may be consolidated into a batch under a fresh
+   * deterministic id; non-null means it MUST be dispatched alone under this exact
+   * id so the engine's receipt dedup makes a landed turn a no-op (no duplicate)
+   * and an un-landed turn fire (no loss), regardless of how rows later re-batch.
    */
   readonly claimedCommandId: CommandId | null;
 }
@@ -269,6 +269,7 @@ const make = Effect.gen(function* () {
           parent_thread_id AS "parentThreadId"
         FROM projection_threads
         WHERE parent_thread_id IS NOT NULL
+          AND parent_environment_id IS NULL
       `,
   });
 
@@ -383,14 +384,19 @@ const make = Effect.gen(function* () {
   // successful drain/dispatch (delete-on-dispatch => idempotent, no double-fire).
   const persistInjection = (
     parentThreadId: ThreadId,
-    result: ChildWaitResult,
+    result: ChildWaitResult & Pick<EnqueueParentInjectionInput, "dedupeKey">,
     deliveredByWait: boolean,
     waitCancellable: boolean,
   ) =>
     Effect.gen(function* () {
       const now = yield* nowMillis;
       const createdAt = yield* nowIso;
-      const id = (yield* randomUUID) as PendingDispatchId;
+      const id =
+        result.dedupeKey === undefined
+          ? ((yield* randomUUID) as PendingDispatchId)
+          : (result.dedupeKey as PendingDispatchId);
+      const claimedCommandId =
+        result.dedupeKey === undefined ? null : dispatchCommandIdFor("subagent-wake", id);
       const row: PendingDispatch = {
         id,
         kind: "parent_injection",
@@ -399,7 +405,7 @@ const make = Effect.gen(function* () {
         text: result.finalAssistantText,
         error: result.error,
         status: result.status,
-        commandId: null,
+        commandId: claimedCommandId,
         deliveredByWait,
         waitCancellable,
         createdAt: IsoDateTime.make(createdAt),
@@ -415,7 +421,7 @@ const make = Effect.gen(function* () {
         dispatchId: id,
         deliveredByWait,
         waitCancellable,
-        claimedCommandId: null,
+        claimedCommandId,
       } satisfies PendingInjection;
     });
 
@@ -963,7 +969,10 @@ const make = Effect.gen(function* () {
   // inline, it would deadlock; the WakeParentSyncDispatch regression test guards
   // this by enqueuing the parent's terminal signal during dispatch and asserting
   // wakeParent still completes.
-  const wakeParent = (record: ChildRecord, result: ChildWaitResult) =>
+  const wakeParent = (
+    record: Pick<ChildRecord, "parentThreadId" | "detached">,
+    result: ChildWaitResult & Pick<EnqueueParentInjectionInput, "dedupeKey">,
+  ) =>
     Effect.gen(function* () {
       const parentThreadId = record.parentThreadId;
       const lock = yield* wakeLockFor(parentThreadId);
@@ -990,6 +999,13 @@ const make = Effect.gen(function* () {
           }
           // Persist the durable row up front so the wake survives a restart in
           // every branch below; it is deleted only after a successful dispatch.
+          const existingQueue = pendingInjections.get(parentThreadId) ?? [];
+          if (
+            queuedWakeChildren.has(result.childThreadId) ||
+            existingQueue.some((entry) => entry.childThreadId === result.childThreadId)
+          ) {
+            return;
+          }
           const deliveredByWait =
             !record.detached && waitDeliveredPromotedChildren.has(result.childThreadId);
           const waitCancellable = !record.detached;
@@ -1666,6 +1682,24 @@ const make = Effect.gen(function* () {
     parentThreadId,
   ) => Effect.sync(() => (pendingInjections.get(parentThreadId)?.length ?? 0) > 0);
 
+  const enqueueParentInjection: ChildThreadCoordinatorShape["enqueueParentInjection"] = (
+    input: EnqueueParentInjectionInput,
+  ) => {
+    const result: ChildWaitResult = {
+      childThreadId: input.childThreadId,
+      status: input.status,
+      finalAssistantText: input.finalAssistantText,
+      error: input.error,
+    };
+    return wakeParent(
+      {
+        parentThreadId: input.parentThreadId,
+        detached: true,
+      },
+      input.dedupeKey === undefined ? result : { ...result, dedupeKey: input.dedupeKey },
+    );
+  };
+
   const listChildren: ChildThreadCoordinatorShape["listChildren"] = (parentThreadId) =>
     Effect.gen(function* () {
       const ids = byParent.get(parentThreadId);
@@ -2289,6 +2323,7 @@ const make = Effect.gen(function* () {
     markWaitDelivered,
     abandonWaitDelivery,
     hasPendingInjections,
+    enqueueParentInjection,
     listChildren,
     start,
     drain: worker.drain,

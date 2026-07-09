@@ -181,6 +181,7 @@ describe("ScheduledTasksReactor", () => {
       abandonWaitDelivery: () => Effect.void,
       hasPendingInjections: (parentThreadId) =>
         Effect.succeed(pendingParents.has(String(parentThreadId))),
+      enqueueParentInjection: () => Effect.void,
       listChildren: () => Effect.succeed([]),
       start: () => Effect.void,
       drain: Effect.void,

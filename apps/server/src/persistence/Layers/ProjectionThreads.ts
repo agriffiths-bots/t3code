@@ -50,7 +50,8 @@ const makeProjectionThreadRepository = Effect.gen(function* () {
           pending_user_input_count,
           has_actionable_proposed_plan,
           deleted_at,
-          parent_thread_id
+          parent_thread_id,
+          parent_environment_id
         )
         VALUES (
           ${row.threadId},
@@ -72,7 +73,8 @@ const makeProjectionThreadRepository = Effect.gen(function* () {
           ${row.pendingUserInputCount},
           ${row.hasActionableProposedPlan},
           ${row.deletedAt},
-          ${row.parentThreadId}
+          ${row.parentThreadId},
+          ${row.parentEnvironmentId ?? null}
         )
         ON CONFLICT (thread_id)
         DO UPDATE SET
@@ -94,7 +96,8 @@ const makeProjectionThreadRepository = Effect.gen(function* () {
           pending_user_input_count = excluded.pending_user_input_count,
           has_actionable_proposed_plan = excluded.has_actionable_proposed_plan,
           deleted_at = excluded.deleted_at,
-          parent_thread_id = excluded.parent_thread_id
+          parent_thread_id = excluded.parent_thread_id,
+          parent_environment_id = excluded.parent_environment_id
       `,
   });
 
@@ -123,7 +126,8 @@ const makeProjectionThreadRepository = Effect.gen(function* () {
           pending_user_input_count AS "pendingUserInputCount",
           has_actionable_proposed_plan AS "hasActionableProposedPlan",
           deleted_at AS "deletedAt",
-          parent_thread_id AS "parentThreadId"
+          parent_thread_id AS "parentThreadId",
+          parent_environment_id AS "parentEnvironmentId"
         FROM projection_threads
         WHERE thread_id = ${threadId}
       `,
@@ -154,7 +158,8 @@ const makeProjectionThreadRepository = Effect.gen(function* () {
           pending_user_input_count AS "pendingUserInputCount",
           has_actionable_proposed_plan AS "hasActionableProposedPlan",
           deleted_at AS "deletedAt",
-          parent_thread_id AS "parentThreadId"
+          parent_thread_id AS "parentThreadId",
+          parent_environment_id AS "parentEnvironmentId"
         FROM projection_threads
         WHERE project_id = ${projectId}
         ORDER BY created_at ASC, thread_id ASC

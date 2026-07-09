@@ -707,6 +707,7 @@ const makeOrchestrationProjectionPipeline = Effect.fn("makeOrchestrationProjecti
             hasActionableProposedPlan: 0,
             deletedAt: null,
             parentThreadId: null,
+            parentEnvironmentId: null,
           });
           return;
 
@@ -946,6 +947,7 @@ const makeOrchestrationProjectionPipeline = Effect.fn("makeOrchestrationProjecti
           yield* projectionThreadRepository.upsert({
             ...existingRow.value,
             parentThreadId: event.payload.parentThreadId,
+            parentEnvironmentId: event.payload.parentEnvironmentId ?? null,
             updatedAt: event.occurredAt,
           });
           return;

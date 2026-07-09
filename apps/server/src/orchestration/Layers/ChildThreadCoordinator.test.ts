@@ -1,5 +1,6 @@
 /* oxlint-disable t3code/no-manual-effect-runtime-in-tests -- These concurrency tests intentionally manage a long-lived runtime, queues, and scopes across helper boundaries. */
 import {
+  EnvironmentId,
   EventId,
   MessageId,
   ProviderInstanceId,
@@ -253,6 +254,7 @@ describe("ChildThreadCoordinator", () => {
     readonly seedChildRows?: ReadonlyArray<{
       readonly threadId: ThreadId;
       readonly parentThreadId: ThreadId;
+      readonly parentEnvironmentId?: EnvironmentId;
     }>;
     /** Pending_dispatches rows inserted BEFORE start() (simulated restart). */
     readonly seedPendingDispatches?: ReadonlyArray<PendingDispatch>;
@@ -460,8 +462,8 @@ describe("ChildThreadCoordinator", () => {
             Effect.service(SqlClient),
             (sql) =>
               sql`
-                INSERT INTO projection_threads (thread_id, project_id, title, model_selection_json, runtime_mode, interaction_mode, created_at, updated_at, parent_thread_id)
-                VALUES (${row.threadId}, ${projectId}, ${"seed"}, ${"{}"}, ${"full-access"}, ${"default"}, ${now}, ${now}, ${row.parentThreadId})
+                INSERT INTO projection_threads (thread_id, project_id, title, model_selection_json, runtime_mode, interaction_mode, created_at, updated_at, parent_thread_id, parent_environment_id)
+                VALUES (${row.threadId}, ${projectId}, ${"seed"}, ${"{}"}, ${"full-access"}, ${"default"}, ${now}, ${now}, ${row.parentThreadId}, ${row.parentEnvironmentId ?? null})
               `,
           ),
         );
@@ -694,6 +696,33 @@ describe("ChildThreadCoordinator", () => {
       listPromotedChildren,
     };
   }
+
+  it("restart reconciliation ignores child rows whose parent belongs to a remote environment", async () => {
+    const child = ThreadId.make("restart-remote-parent-child");
+    const parent = ThreadId.make("restart-remote-parent");
+    const harness = await createHarness({
+      threads: [
+        makeThreadState({
+          threadId: child,
+          parentThreadId: parent,
+          latestTurn: makeLatestTurn("completed"),
+          assistantText: "remote parent should poll this",
+        }),
+      ],
+      seedChildRows: [
+        {
+          threadId: child,
+          parentThreadId: parent,
+          parentEnvironmentId: EnvironmentId.make("environment-remote-parent"),
+        },
+      ],
+    });
+
+    await Effect.runPromise(harness.coordinator.drain);
+
+    expect(harness.dispatched).toEqual([]);
+    expect(await harness.listPendingDispatches()).toEqual([]);
+  });
 
   it("settles ready turn-diff as completed and captures final assistant text", async () => {
     const child = ThreadId.make("child-completed");
@@ -5030,6 +5059,57 @@ describe("ChildThreadCoordinator", () => {
     expect(await harness.listPendingDispatches()).toHaveLength(0);
     expect(await runtimeHasPending(harness, landedParent)).toBe(false);
     expect(await runtimeHasPending(harness, lostParent)).toBe(false);
+  });
+
+  it("R-B exactly-once: a keyed external wake retry is not re-delivered after its row was deleted", async () => {
+    const parent = ThreadId.make("xo-keyed-parent");
+    const child = ThreadId.make("xo-keyed-child");
+    const dedupeKey = "remote-subagent-wake:xo-keyed-parent:peer-env:xo-keyed-child";
+    const harness = await createHarness({
+      threads: [
+        makeThreadState({
+          threadId: parent,
+          latestTurn: makeLatestTurn("completed"),
+          session: makeSession(parent, "ready"),
+        }),
+      ],
+    });
+
+    await Effect.runPromise(
+      harness.coordinator.enqueueParentInjection({
+        parentThreadId: parent,
+        childThreadId: child,
+        status: "completed",
+        finalAssistantText: "first remote result",
+        error: null,
+        dedupeKey,
+      }),
+    );
+
+    const firstStarts = harness.dispatched.filter(
+      (c) => c.type === "thread.turn.start" && c.threadId === parent,
+    ) as Array<Extract<OrchestrationCommand, { type: "thread.turn.start" }>>;
+    expect(firstStarts).toHaveLength(1);
+    expect(firstStarts[0]?.commandId).toBe(`server:subagent-wake:${dedupeKey}`);
+    expect(await harness.listPendingDispatches()).toHaveLength(0);
+
+    await Effect.runPromise(
+      harness.coordinator.enqueueParentInjection({
+        parentThreadId: parent,
+        childThreadId: child,
+        status: "completed",
+        finalAssistantText: "duplicate remote result",
+        error: null,
+        dedupeKey,
+      }),
+    );
+
+    const startsAfterRetry = harness.dispatched.filter(
+      (c) => c.type === "thread.turn.start" && c.threadId === parent,
+    );
+    expect(startsAfterRetry).toHaveLength(1);
+    expect(await harness.listPendingDispatches()).toHaveLength(0);
+    expect(await runtimeHasPending(harness, parent)).toBe(false);
   });
 
   it("R-B exactly-once: a landed-but-undeleted batch is NOT re-delivered when a new row re-batches it", async () => {

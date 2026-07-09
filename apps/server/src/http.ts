@@ -59,6 +59,7 @@ import { buildElevenLabsRequest, resolveVoiceId, validateTtsText } from "./tts/t
 import { loadPlanUsageSnapshot } from "./usage/PlanUsage.ts";
 import {
   SUBAGENT_PEER_MCP_TOKEN_PATH,
+  SubagentPeerMcpTokenRequest,
   type SubagentPeerMcpTokenResult,
 } from "./subagents/SubagentPeerHttp.ts";
 
@@ -269,8 +270,22 @@ export const mcpPeerTokenRouteLayer = HttpRouter.add(
   Effect.gen(function* () {
     const request = yield* HttpServerRequest.HttpServerRequest;
     const session = yield* authenticateRawRequestWithScope(request, AuthOrchestrationOperateScope);
+    const body = yield* request.json.pipe(
+      Effect.flatMap(Schema.decodeUnknownEffect(SubagentPeerMcpTokenRequest)),
+      Effect.orElseSucceed(() => ({}) as SubagentPeerMcpTokenRequest),
+    );
+    if (body.sourceEnvironmentId === undefined) {
+      return HttpServerResponse.jsonUnsafe(
+        {
+          error: "invalid_request",
+          message: "sourceEnvironmentId is required when minting a subagent peer token.",
+        },
+        { status: 400 },
+      );
+    }
     const issued = yield* McpSessionRegistry.issueActiveMcpPeerCredential({
       sourceSessionId: session.sessionId,
+      sourceEnvironmentId: body.sourceEnvironmentId,
       ...(session.expiresAt ? { expiresAt: session.expiresAt.epochMilliseconds } : {}),
     }).pipe(
       Effect.catchTag("McpPeerTokenStoreError", (error) =>
