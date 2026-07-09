@@ -1,5 +1,7 @@
 import type {
   DesktopBridge,
+  DesktopNotificationActionEvent,
+  DesktopNotificationQueuedAction,
   DesktopPreviewPointerEvent,
   DesktopPreviewRecordingFrame,
   DesktopPreviewTabState,
@@ -8,8 +10,45 @@ import { exposeClerkBridge } from "@clerk/electron/preload";
 import { contextBridge, ipcRenderer } from "electron";
 
 import * as IpcChannels from "./ipc/channels.ts";
+import {
+  createDesktopNotificationActionBuffer,
+  createDesktopNotificationActionDrainScheduler,
+} from "./ipc/notificationActionBuffer.ts";
 
 exposeClerkBridge({ passkeys: true });
+
+const notificationActionBuffer = createDesktopNotificationActionBuffer();
+const notificationActionDrainScheduler = createDesktopNotificationActionDrainScheduler({
+  hasListeners: () => notificationActionBuffer.hasListeners(),
+  drain: drainNotificationActions,
+});
+
+async function drainNotificationActions() {
+  const actions = await ipcRenderer.invoke(IpcChannels.DRAIN_NOTIFICATION_ACTIONS_CHANNEL);
+  if (!Array.isArray(actions)) return;
+  const deliveredIds: number[] = [];
+  for (const action of actions) {
+    if (typeof action !== "object" || action === null) continue;
+    const queuedAction = action as DesktopNotificationQueuedAction;
+    if (typeof queuedAction.id !== "number") continue;
+    if (typeof queuedAction.event !== "object" || queuedAction.event === null) continue;
+    notificationActionBuffer.dispatch(queuedAction.event as DesktopNotificationActionEvent);
+    deliveredIds.push(queuedAction.id);
+  }
+  if (deliveredIds.length > 0) {
+    await ipcRenderer.invoke(IpcChannels.ACK_NOTIFICATION_ACTIONS_CHANNEL, deliveredIds);
+  }
+}
+
+function requestNotificationActionDrain() {
+  notificationActionDrainScheduler.request();
+}
+
+ipcRenderer.on(IpcChannels.NOTIFICATION_ACTION_CHANNEL, () => {
+  if (notificationActionBuffer.hasListeners()) {
+    requestNotificationActionDrain();
+  }
+});
 
 function unwrapEnsureSshEnvironmentResult(result: unknown) {
   if (
@@ -111,6 +150,16 @@ contextBridge.exposeInMainWorld("desktopBridge", {
       ...(position === undefined ? {} : { position }),
     }),
   openExternal: (url: string) => ipcRenderer.invoke(IpcChannels.OPEN_EXTERNAL_CHANNEL, url),
+  isNotificationSupported: () => ipcRenderer.invoke(IpcChannels.IS_NOTIFICATION_SUPPORTED_CHANNEL),
+  showNotification: (notification) =>
+    ipcRenderer.invoke(IpcChannels.SHOW_NOTIFICATION_CHANNEL, notification),
+  closeNotification: (notificationId) =>
+    ipcRenderer.invoke(IpcChannels.CLOSE_NOTIFICATION_CHANNEL, notificationId),
+  onNotificationAction: (listener) => {
+    const unsubscribe = notificationActionBuffer.subscribe(listener);
+    requestNotificationActionDrain();
+    return unsubscribe;
+  },
   onMenuAction: (listener) => {
     const wrappedListener = (_event: Electron.IpcRendererEvent, action: unknown) => {
       if (typeof action !== "string") return;

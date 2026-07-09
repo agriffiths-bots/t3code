@@ -18,6 +18,7 @@ import * as DesktopIpc from "./ipc/DesktopIpc.ts";
 import * as ElectronApp from "./electron/ElectronApp.ts";
 import * as ElectronDialog from "./electron/ElectronDialog.ts";
 import * as ElectronMenu from "./electron/ElectronMenu.ts";
+import * as ElectronNotification from "./electron/ElectronNotification.ts";
 import * as ElectronProtocol from "./electron/ElectronProtocol.ts";
 import * as ElectronSafeStorage from "./electron/ElectronSafeStorage.ts";
 import * as ElectronShell from "./electron/ElectronShell.ts";
@@ -195,6 +196,7 @@ const desktopLocalEnvironmentAuthLayer = DesktopLocalEnvironmentAuth.layer.pipe(
 const desktopApplicationLayer = Layer.mergeAll(
   DesktopLifecycle.layer,
   DesktopApplicationMenu.layer,
+  ElectronNotification.layer,
   DesktopShellEnvironment.layer,
   desktopSshLayer,
 ).pipe(

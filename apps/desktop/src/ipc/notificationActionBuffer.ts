@@ -1,0 +1,76 @@
+import type { DesktopNotificationActionEvent } from "@t3tools/contracts";
+
+const MAX_PENDING_NOTIFICATION_ACTIONS = 32;
+
+export function createDesktopNotificationActionBuffer() {
+  const listeners = new Set<(event: DesktopNotificationActionEvent) => void>();
+  const pending: DesktopNotificationActionEvent[] = [];
+
+  const dispatch = (event: DesktopNotificationActionEvent) => {
+    if (listeners.size === 0) {
+      pending.push(event);
+      while (pending.length > MAX_PENDING_NOTIFICATION_ACTIONS) {
+        pending.shift();
+      }
+      return;
+    }
+
+    for (const listener of listeners) {
+      listener(event);
+    }
+  };
+
+  const subscribe = (listener: (event: DesktopNotificationActionEvent) => void) => {
+    listeners.add(listener);
+    for (const event of pending.splice(0)) {
+      listener(event);
+    }
+    return () => {
+      listeners.delete(listener);
+    };
+  };
+
+  return {
+    dispatch,
+    subscribe,
+    hasListeners: () => listeners.size > 0,
+  };
+}
+
+export function createDesktopNotificationActionDrainScheduler(input: {
+  readonly hasListeners: () => boolean;
+  readonly drain: () => Promise<void>;
+}) {
+  let inFlight = false;
+  let requestedAgain = false;
+
+  const run = async () => {
+    try {
+      do {
+        requestedAgain = false;
+        await input.drain();
+      } while (requestedAgain && input.hasListeners());
+    } catch {
+      requestedAgain = false;
+    } finally {
+      inFlight = false;
+      if (requestedAgain && input.hasListeners()) {
+        request();
+      }
+    }
+  };
+
+  const request = () => {
+    if (!input.hasListeners()) {
+      return;
+    }
+    if (inFlight) {
+      requestedAgain = true;
+      return;
+    }
+    inFlight = true;
+    void run();
+  };
+
+  return { request };
+}

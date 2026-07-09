@@ -1,0 +1,241 @@
+import type {
+  DesktopNotificationActionEvent,
+  DesktopNotificationQueuedAction,
+  ServerDeviceNotification,
+  ServerNotificationAckAction,
+} from "@t3tools/contracts";
+import * as Context from "effect/Context";
+import * as Effect from "effect/Effect";
+import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
+import * as Ref from "effect/Ref";
+import { HttpClient, HttpClientRequest, HttpClientResponse } from "effect/unstable/http";
+import * as Electron from "electron";
+
+import * as DesktopBackendPool from "../backend/DesktopBackendPool.ts";
+import * as IpcChannels from "../ipc/channels.ts";
+import * as DesktopWindow from "../window/DesktopWindow.ts";
+import * as ElectronWindow from "./ElectronWindow.ts";
+
+export class ElectronNotification extends Context.Service<
+  ElectronNotification,
+  {
+    readonly isSupported: Effect.Effect<boolean>;
+    readonly show: (notification: ServerDeviceNotification) => Effect.Effect<boolean>;
+    readonly close: (notificationId: string) => Effect.Effect<void>;
+    readonly drainActions: Effect.Effect<readonly DesktopNotificationQueuedAction[]>;
+    readonly ackActions: (ids: readonly number[]) => Effect.Effect<void>;
+  }
+>()("@t3tools/desktop/electron/ElectronNotification") {}
+
+const MAX_PENDING_NOTIFICATION_ACTIONS = 32;
+
+function canShowNativeNotifications(): boolean {
+  const notificationConstructor = Electron.Notification as typeof Electron.Notification & {
+    readonly isSupported?: () => boolean;
+  };
+  return notificationConstructor.isSupported?.() ?? true;
+}
+
+interface NativeNotificationEntry {
+  readonly notification: ServerDeviceNotification;
+  readonly rendered: Electron.Notification;
+}
+
+export const make = Effect.gen(function* () {
+  const backendPool = yield* DesktopBackendPool.DesktopBackendPool;
+  const electronWindow = yield* ElectronWindow.ElectronWindow;
+  const desktopWindow = yield* DesktopWindow.DesktopWindow;
+  const httpClient = yield* HttpClient.HttpClient;
+  const activeNotifications = yield* Ref.make(new Map<string, NativeNotificationEntry>());
+  const pendingActions = yield* Ref.make<DesktopNotificationQueuedAction[]>([]);
+  const nextActionId = yield* Ref.make(1);
+  const suppressedCloseNotifications = new Set<Electron.Notification>();
+  const context = yield* Effect.context();
+  const runFork = Effect.runForkWith(context);
+
+  const runDetached = <E>(effect: Effect.Effect<void, E>) => {
+    runFork(
+      effect.pipe(
+        Effect.catchCause((cause) =>
+          Effect.logWarning("Failed to handle desktop notification event", { cause }),
+        ),
+      ),
+    );
+  };
+
+  const acknowledgeNotification = Effect.fn("desktop.notification.acknowledge")(function* (
+    notification: ServerDeviceNotification,
+    action: ServerNotificationAckAction,
+  ) {
+    yield* Effect.gen(function* () {
+      const primary = yield* backendPool.primary;
+      const config = yield* primary.currentConfig;
+      if (Option.isNone(config)) {
+        return;
+      }
+
+      const ackUrl = new URL("/api/notifications/ack", config.value.httpBaseUrl);
+      const request = HttpClientRequest.post(ackUrl.toString()).pipe(
+        HttpClientRequest.bodyJsonUnsafe({
+          notificationId: notification.notificationId,
+          ackToken: notification.ackToken,
+          action,
+        }),
+      );
+      yield* httpClient.execute(request).pipe(Effect.flatMap(HttpClientResponse.filterStatusOk));
+    }).pipe(
+      Effect.catchCause((cause) =>
+        Effect.logWarning("Failed to acknowledge desktop notification", { cause }),
+      ),
+    );
+  });
+
+  const enqueueAction = (event: DesktopNotificationActionEvent) =>
+    Effect.gen(function* () {
+      const id = yield* Ref.getAndUpdate(nextActionId, (current) => current + 1);
+      yield* Ref.update(pendingActions, (current) => {
+        const next = [...current, { id, event }];
+        return next.slice(Math.max(0, next.length - MAX_PENDING_NOTIFICATION_ACTIONS));
+      });
+    });
+
+  const ackActions = (ids: readonly number[]) =>
+    Ref.update(pendingActions, (current) => {
+      const ackedIds = new Set(ids);
+      return current.filter((action) => !ackedIds.has(action.id));
+    });
+
+  const drainActions = Ref.get(pendingActions);
+
+  const signalActionAvailableToWindow = Effect.fn(
+    "desktop.notification.signalActionAvailableToWindow",
+  )(function* (window: Electron.BrowserWindow) {
+    const send = Effect.sync(() => {
+      if (window.isDestroyed()) {
+        return;
+      }
+      window.webContents.send(IpcChannels.NOTIFICATION_ACTION_CHANNEL);
+    });
+
+    if (window.isDestroyed()) {
+      return;
+    }
+
+    if (window.webContents.isLoadingMainFrame()) {
+      window.webContents.once("did-finish-load", () => runDetached(send));
+      return;
+    }
+
+    yield* send;
+  });
+
+  const emitAction = Effect.fn("desktop.notification.emitAction")(function* (
+    event: DesktopNotificationActionEvent,
+  ) {
+    yield* enqueueAction(event);
+    if (event.action === "opened") {
+      const window = yield* desktopWindow.revealOrCreateMain;
+      yield* signalActionAvailableToWindow(window);
+      return;
+    }
+    yield* electronWindow.sendAll(IpcChannels.NOTIFICATION_ACTION_CHANNEL);
+  });
+
+  const forgetNotification = (notificationId: string, rendered?: Electron.Notification) =>
+    Ref.modify(activeNotifications, (current) => {
+      const currentEntry = current.get(notificationId);
+      if (!currentEntry) {
+        return [false, current];
+      }
+      if (rendered !== undefined && currentEntry?.rendered !== rendered) {
+        return [false, current];
+      }
+      const next = new Map(current);
+      next.delete(notificationId);
+      return [true, next];
+    });
+
+  const closeNotification = Effect.fn("desktop.notification.close")(function* (
+    notificationId: string,
+    suppressAction: boolean,
+  ) {
+    const active = (yield* Ref.get(activeNotifications)).get(notificationId);
+    if (!active) {
+      return;
+    }
+    if (suppressAction) {
+      suppressedCloseNotifications.add(active.rendered);
+    }
+    active.rendered.close();
+  });
+
+  const show = Effect.fn("desktop.notification.show")(function* (
+    notification: ServerDeviceNotification,
+  ) {
+    if (!canShowNativeNotifications()) {
+      return false;
+    }
+
+    yield* closeNotification(notification.notificationId, true);
+    const rendered = new Electron.Notification({
+      title: notification.title,
+      body: notification.body ?? "",
+      ...(notification.requireInteraction ? { timeoutType: "never" as const } : {}),
+      silent: false,
+    });
+
+    rendered.on("click", () => {
+      suppressedCloseNotifications.add(rendered);
+      runDetached(acknowledgeNotification(notification, "opened"));
+      runDetached(
+        Effect.gen(function* () {
+          yield* emitAction({
+            notificationId: notification.notificationId,
+            action: "opened",
+            ...(notification.deepLink === undefined ? {} : { deepLink: notification.deepLink }),
+          });
+          yield* closeNotification(notification.notificationId, true);
+        }),
+      );
+    });
+    rendered.on("close", () => {
+      runDetached(
+        Effect.gen(function* () {
+          const wasActive = yield* forgetNotification(notification.notificationId, rendered);
+          if (!wasActive) {
+            suppressedCloseNotifications.delete(rendered);
+            return;
+          }
+          if (suppressedCloseNotifications.delete(rendered)) {
+            return;
+          }
+          runDetached(acknowledgeNotification(notification, "closed"));
+          yield* emitAction({
+            notificationId: notification.notificationId,
+            action: "closed",
+            ...(notification.deepLink === undefined ? {} : { deepLink: notification.deepLink }),
+          });
+        }),
+      );
+    });
+
+    yield* Ref.update(activeNotifications, (current) => {
+      const next = new Map(current);
+      next.set(notification.notificationId, { notification, rendered });
+      return next;
+    });
+    rendered.show();
+    return true;
+  });
+
+  return ElectronNotification.of({
+    isSupported: Effect.sync(canShowNativeNotifications),
+    show,
+    close: (notificationId) => closeNotification(notificationId, true),
+    drainActions,
+    ackActions,
+  });
+});
+
+export const layer = Layer.effect(ElectronNotification, make);
