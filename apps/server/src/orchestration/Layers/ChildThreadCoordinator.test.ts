@@ -2628,6 +2628,30 @@ describe("ChildThreadCoordinator", () => {
     expect(result.error).toBe("thread archived");
   });
 
+  it("keeps replayed archive sticky when archive detail read times out", async () => {
+    const child = ThreadId.make("recon-archive-timeout-then-late-diff-child");
+    const parent = ThreadId.make("recon-archive-timeout-then-late-diff-parent");
+    const turn1 = TurnId.make("turn-1");
+    const harness = await createHarness({
+      threads: [
+        makeThreadState({
+          threadId: child,
+          parentThreadId: parent,
+          latestTurn: makeLatestTurn("running", turn1),
+          session: makeSession(child, "running", turn1),
+        }),
+      ],
+      seedChildRows: [{ threadId: child, parentThreadId: parent }],
+      persistedEvents: [threadArchivedEvent(child), turnDiffEvent(child, "ready", turn1)],
+      slowThreadDetailReadNumbers: [{ threadId: child, readNumbers: [2] }],
+    });
+
+    const result = await runtimeRun(harness, child);
+    expect(result.status).toBe("killed");
+    expect(result.error).toBe("thread archived");
+    expect(await harness.canAcquireDispatchLease()).toBe(true);
+  });
+
   it("keeps archive terminal when projection completes after the archive", async () => {
     const child = ThreadId.make("live-archive-before-late-complete-child");
     const parent = ThreadId.make("live-archive-before-late-complete-parent");
@@ -3926,6 +3950,112 @@ describe("ChildThreadCoordinator", () => {
     expect(pendingRows[0]!.text).toBe("replacement result");
   });
 
+  it("replaces stale wakes after archive-timeout unarchive and replacement turn replay", async () => {
+    const child = ThreadId.make("recon-unarchive-timeout-replace-stale-wake-child");
+    const parent = ThreadId.make("recon-unarchive-timeout-replace-stale-wake-parent");
+    const parentTurn = TurnId.make("parent-turn");
+    const turn1 = TurnId.make("turn-1");
+    const turn2 = TurnId.make("turn-2");
+    const staleWakeId = PendingDispatchId.make("pd-recon-unarchive-timeout-replace-stale");
+    const harness = await createHarness({
+      threads: [
+        makeThreadState({
+          threadId: parent,
+          latestTurn: makeLatestTurn("running", parentTurn),
+          session: makeSession(parent, "running", parentTurn),
+        }),
+        makeThreadState({
+          threadId: child,
+          parentThreadId: parent,
+          latestTurn: makeLatestTurn("completed", turn2),
+          session: makeSession(child, "stopped"),
+          assistantText: "replacement after archive timeout",
+        }),
+      ],
+      seedChildRows: [{ threadId: child, parentThreadId: parent }],
+      persistedEvents: [
+        turnDiffEvent(child, "ready", turn1),
+        threadArchivedEvent(child),
+        threadUnarchivedEvent(child),
+        turnStartRequestedEvent(child),
+        sessionSetEvent(child, "running", turn2),
+        turnDiffEvent(child, "ready", turn2),
+      ],
+      seedPendingDispatches: [
+        {
+          id: staleWakeId,
+          kind: "parent_injection",
+          targetThreadId: parent,
+          sourceChildId: child,
+          text: "old result before archive timeout",
+          error: null,
+          status: "completed",
+          commandId: null,
+          deliveredByWait: false,
+          waitCancellable: false,
+          createdAt: now as unknown as PendingDispatch["createdAt"],
+        },
+      ],
+      slowThreadDetailReadNumbers: [{ threadId: child, readNumbers: [2] }],
+    });
+
+    const pendingRows = await harness.listPendingDispatches();
+    expect(pendingRows).toHaveLength(1);
+    expect(pendingRows[0]!.id).not.toBe(staleWakeId);
+    expect(pendingRows[0]!.text).toBe("replacement after archive timeout");
+  });
+
+  it("clears wait-delivery tombstones when an unarchived terminal child starts a new turn", async () => {
+    const child = ThreadId.make("recon-unarchive-terminal-tombstone-new-turn-child");
+    const parent = ThreadId.make("recon-unarchive-terminal-tombstone-new-turn-parent");
+    const parentTurn = TurnId.make("parent-turn");
+    const turn1 = TurnId.make("turn-1");
+    const turn2 = TurnId.make("turn-2");
+    const harness = await createHarness({
+      threads: [
+        makeThreadState({
+          threadId: parent,
+          latestTurn: makeLatestTurn("running", parentTurn),
+          session: makeSession(parent, "running", parentTurn),
+        }),
+        makeThreadState({
+          threadId: child,
+          parentThreadId: parent,
+          latestTurn: makeLatestTurn("completed", turn1),
+          session: makeSession(child, "stopped"),
+          assistantText: "old delivered result",
+        }),
+      ],
+      seedChildRows: [{ threadId: child, parentThreadId: parent }],
+      seedWaitDeliveries: [{ childThreadId: child, parentThreadId: parent }],
+      persistedEvents: [
+        turnDiffEvent(child, "ready", turn1),
+        threadArchivedEvent(child),
+        threadUnarchivedEvent(child),
+      ],
+    });
+
+    expect(await harness.listPendingDispatches()).toEqual([]);
+    expect(await harness.listWaitDeliveries()).toHaveLength(1);
+    await harness.feed(turnStartRequestedEvent(child));
+    expect(await harness.listWaitDeliveries()).toEqual([]);
+    await harness.feed(sessionSetEvent(child, "running", turn2));
+    harness.setThread(
+      makeThreadState({
+        threadId: child,
+        parentThreadId: parent,
+        latestTurn: makeLatestTurn("completed", turn2),
+        session: makeSession(child, "stopped"),
+        assistantText: "new result after tombstone",
+      }),
+    );
+    await harness.feed(turnDiffEvent(child, "ready", turn2));
+
+    const pendingRows = await harness.listPendingDispatches();
+    expect(pendingRows).toHaveLength(1);
+    expect(pendingRows[0]!.text).toBe("new result after tombstone");
+  });
+
   it("preserves claimed terminal wakes when replay text detail is unavailable", async () => {
     const child = ThreadId.make("recon-unarchive-terminal-claimed-detail-lag-child");
     const parent = ThreadId.make("recon-unarchive-terminal-claimed-detail-lag-parent");
@@ -3980,6 +4110,114 @@ describe("ChildThreadCoordinator", () => {
     expect(pendingRows[0]!.commandId).toBe("claimed-restart-command");
   });
 
+  it("preserves claimed terminal wakes when assistant messages lag the terminal projection", async () => {
+    const child = ThreadId.make("recon-unarchive-terminal-claimed-message-lag-child");
+    const parent = ThreadId.make("recon-unarchive-terminal-claimed-message-lag-parent");
+    const parentTurn = TurnId.make("parent-turn");
+    const turn1 = TurnId.make("turn-1");
+    const turn2 = TurnId.make("turn-2");
+    const laggedAssistantTurn = {
+      ...makeLatestTurn("completed", turn2),
+      assistantMessageId: MessageId.make("assistant-message-lag"),
+    };
+    const claimedWakeId = PendingDispatchId.make("pd-recon-unarchive-terminal-claimed-message");
+    const harness = await createHarness({
+      threads: [
+        makeThreadState({
+          threadId: parent,
+          latestTurn: makeLatestTurn("running", parentTurn),
+          session: makeSession(parent, "running", parentTurn),
+        }),
+        makeThreadState({
+          threadId: child,
+          parentThreadId: parent,
+          latestTurn: laggedAssistantTurn,
+          session: makeSession(child, "stopped"),
+        }),
+      ],
+      seedChildRows: [{ threadId: child, parentThreadId: parent }],
+      persistedEvents: [
+        turnDiffEvent(child, "ready", turn1),
+        threadUnarchivedEvent(child),
+        turnStartRequestedEvent(child),
+        sessionSetEvent(child, "running", turn2),
+        turnDiffEvent(child, "ready", turn2),
+      ],
+      seedPendingDispatches: [
+        {
+          id: claimedWakeId,
+          kind: "parent_injection",
+          targetThreadId: parent,
+          sourceChildId: child,
+          text: "claimed result before message projection caught up",
+          error: null,
+          status: "completed",
+          commandId: "claimed-message-lag-command",
+          deliveredByWait: false,
+          waitCancellable: false,
+          createdAt: now as unknown as PendingDispatch["createdAt"],
+        },
+      ],
+    });
+
+    const pendingRows = await harness.listPendingDispatches();
+    expect(pendingRows).toHaveLength(1);
+    expect(pendingRows[0]!.id).toBe(claimedWakeId);
+    expect(pendingRows[0]!.commandId).toBe("claimed-message-lag-command");
+  });
+
+  it("replaces claimed terminal wakes when completed projection has a real null result", async () => {
+    const child = ThreadId.make("recon-unarchive-terminal-claimed-null-result-child");
+    const parent = ThreadId.make("recon-unarchive-terminal-claimed-null-result-parent");
+    const parentTurn = TurnId.make("parent-turn");
+    const turn1 = TurnId.make("turn-1");
+    const turn2 = TurnId.make("turn-2");
+    const staleWakeId = PendingDispatchId.make("pd-recon-unarchive-terminal-claimed-null");
+    const harness = await createHarness({
+      threads: [
+        makeThreadState({
+          threadId: parent,
+          latestTurn: makeLatestTurn("running", parentTurn),
+          session: makeSession(parent, "running", parentTurn),
+        }),
+        makeThreadState({
+          threadId: child,
+          parentThreadId: parent,
+          latestTurn: makeLatestTurn("completed", turn2),
+          session: makeSession(child, "stopped"),
+        }),
+      ],
+      seedChildRows: [{ threadId: child, parentThreadId: parent }],
+      persistedEvents: [
+        turnDiffEvent(child, "ready", turn1),
+        threadUnarchivedEvent(child),
+        turnStartRequestedEvent(child),
+        sessionSetEvent(child, "running", turn2),
+        turnDiffEvent(child, "ready", turn2),
+      ],
+      seedPendingDispatches: [
+        {
+          id: staleWakeId,
+          kind: "parent_injection",
+          targetThreadId: parent,
+          sourceChildId: child,
+          text: "old claimed result",
+          error: null,
+          status: "completed",
+          commandId: "claimed-null-result-command",
+          deliveredByWait: false,
+          waitCancellable: false,
+          createdAt: now as unknown as PendingDispatch["createdAt"],
+        },
+      ],
+    });
+
+    const pendingRows = await harness.listPendingDispatches();
+    expect(pendingRows).toHaveLength(1);
+    expect(pendingRows[0]!.id).not.toBe(staleWakeId);
+    expect(pendingRows[0]!.text).toBe(null);
+  });
+
   it("replaces unclaimed terminal wakes when replay text detail is unavailable", async () => {
     const child = ThreadId.make("recon-unarchive-terminal-unclaimed-detail-lag-child");
     const parent = ThreadId.make("recon-unarchive-terminal-unclaimed-detail-lag-parent");
@@ -4032,6 +4270,161 @@ describe("ChildThreadCoordinator", () => {
     expect(pendingRows).toHaveLength(1);
     expect(pendingRows[0]!.id).not.toBe(staleWakeId);
     expect(pendingRows[0]!.text).toBe("unclaimed replacement result");
+  });
+
+  it("reopens projection-only unarchived terminal children on replacement turn start", async () => {
+    const child = ThreadId.make("recon-unarchive-projection-terminal-reopen-child");
+    const parent = ThreadId.make("recon-unarchive-projection-terminal-reopen-parent");
+    const parentTurn = TurnId.make("parent-turn");
+    const turn1 = TurnId.make("turn-1");
+    const turn2 = TurnId.make("turn-2");
+    const harness = await createHarness({
+      threads: [
+        makeThreadState({
+          threadId: parent,
+          latestTurn: makeLatestTurn("running", parentTurn),
+          session: makeSession(parent, "running", parentTurn),
+        }),
+        makeThreadState({
+          threadId: child,
+          parentThreadId: parent,
+          latestTurn: makeLatestTurn("completed", turn1),
+          session: makeSession(child, "stopped"),
+          assistantText: "old projection-only result",
+        }),
+      ],
+      seedChildRows: [{ threadId: child, parentThreadId: parent }],
+      persistedEvents: [threadArchivedEvent(child), threadUnarchivedEvent(child)],
+      slowThreadDetailReadNumbers: [{ threadId: child, readNumbers: [2] }],
+    });
+
+    expect((await harness.listPendingDispatches())[0]?.text).toBe("old projection-only result");
+    await harness.feed(turnDiffEvent(child, "ready", turn1));
+    expect((await harness.listPendingDispatches())[0]?.text).toBe("old projection-only result");
+    await harness.feed(turnStartRequestedEvent(child));
+    expect(await harness.listPendingDispatches()).toEqual([]);
+    await harness.feed(sessionSetEvent(child, "running", turn2));
+    harness.setThread(
+      makeThreadState({
+        threadId: child,
+        parentThreadId: parent,
+        latestTurn: makeLatestTurn("completed", turn2),
+        session: makeSession(child, "stopped"),
+        assistantText: "new projection-only result",
+      }),
+    );
+    await harness.feed(turnDiffEvent(child, "ready", turn2));
+
+    const result = await runtimeRun(harness, child);
+    expect(result.status).toBe("completed");
+    expect(result.finalAssistantText).toBe("new projection-only result");
+    expect((await harness.listPendingDispatches())[0]?.text).toBe("new projection-only result");
+  });
+
+  it("keeps post-unarchive completion wake when the same turn later starts another turn", async () => {
+    const child = ThreadId.make("recon-unarchive-same-turn-complete-child");
+    const parent = ThreadId.make("recon-unarchive-same-turn-complete-parent");
+    const parentTurn = TurnId.make("parent-turn");
+    const turn1 = TurnId.make("turn-1");
+    const turn2 = TurnId.make("turn-2");
+    const harness = await createHarness({
+      threads: [
+        makeThreadState({
+          threadId: parent,
+          latestTurn: makeLatestTurn("running", parentTurn),
+          session: makeSession(parent, "running", parentTurn),
+        }),
+        makeThreadState({
+          threadId: child,
+          parentThreadId: parent,
+          latestTurn: makeLatestTurn("running", turn1),
+          session: makeSession(child, "running", turn1),
+        }),
+      ],
+      seedChildRows: [{ threadId: child, parentThreadId: parent }],
+      persistedEvents: [threadArchivedEvent(child), threadUnarchivedEvent(child)],
+      slowThreadDetailReadNumbers: [{ threadId: child, readNumbers: [2] }],
+    });
+
+    harness.setThread(
+      makeThreadState({
+        threadId: child,
+        parentThreadId: parent,
+        latestTurn: makeLatestTurn("completed", turn1),
+        session: makeSession(child, "stopped"),
+        assistantText: "post-unarchive same-turn result",
+      }),
+    );
+    await harness.feed(turnDiffEvent(child, "ready", turn1));
+    expect((await harness.listPendingDispatches())[0]?.text).toBe(
+      "post-unarchive same-turn result",
+    );
+
+    harness.setThread(
+      makeThreadState({
+        threadId: child,
+        parentThreadId: parent,
+        latestTurn: makeLatestTurn("running", turn2),
+        session: makeSession(child, "running", turn2),
+      }),
+    );
+    await harness.feed(turnStartRequestedEvent(child));
+
+    const pendingRows = await harness.listPendingDispatches();
+    expect(pendingRows).toHaveLength(1);
+    expect(pendingRows[0]!.text).toBe("post-unarchive same-turn result");
+  });
+
+  it("keeps replayed post-unarchive completion wake before a later replacement start", async () => {
+    const child = ThreadId.make("recon-unarchive-replayed-same-turn-complete-child");
+    const parent = ThreadId.make("recon-unarchive-replayed-same-turn-complete-parent");
+    const parentTurn = TurnId.make("parent-turn");
+    const turn1 = TurnId.make("turn-1");
+    const turn2 = TurnId.make("turn-2");
+    const validWakeId = PendingDispatchId.make("pd-recon-unarchive-replayed-same-turn-complete");
+    const harness = await createHarness({
+      threads: [
+        makeThreadState({
+          threadId: parent,
+          latestTurn: makeLatestTurn("running", parentTurn),
+          session: makeSession(parent, "running", parentTurn),
+        }),
+        makeThreadState({
+          threadId: child,
+          parentThreadId: parent,
+          latestTurn: makeLatestTurn("running", turn2),
+          session: makeSession(child, "running", turn2),
+        }),
+      ],
+      seedChildRows: [{ threadId: child, parentThreadId: parent }],
+      persistedEvents: [
+        threadArchivedEvent(child),
+        threadUnarchivedEvent(child),
+        turnDiffEvent(child, "ready", turn1),
+        turnStartRequestedEvent(child),
+      ],
+      seedPendingDispatches: [
+        {
+          id: validWakeId,
+          kind: "parent_injection",
+          targetThreadId: parent,
+          sourceChildId: child,
+          text: "post-unarchive replayed result",
+          error: null,
+          status: "completed",
+          commandId: null,
+          deliveredByWait: false,
+          waitCancellable: false,
+          createdAt: now as unknown as PendingDispatch["createdAt"],
+        },
+      ],
+      slowThreadDetailReadNumbers: [{ threadId: child, readNumbers: [2] }],
+    });
+
+    const pendingRows = await harness.listPendingDispatches();
+    expect(pendingRows).toHaveLength(1);
+    expect(pendingRows[0]!.id).toBe(validWakeId);
+    expect(pendingRows[0]!.text).toBe("post-unarchive replayed result");
   });
 
   it("synthesizes missing replayed terminal wakes after unarchive", async () => {
