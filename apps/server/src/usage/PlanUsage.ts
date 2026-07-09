@@ -53,6 +53,14 @@ const CLAUDE_SAFE_TRANSPORT_ENV_KEYS = new Set([
   "CLAUDE_CODE_CLIENT_KEY_PASSPHRASE",
   "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC",
 ]);
+const CODEX_AUTH_OVERRIDE_ENV_KEYS = new Set([
+  "AZURE_OPENAI_API_KEY",
+  "CODEX_ACCESS_TOKEN",
+  "CODEX_AUTH_TOKEN",
+  "CODEX_REFRESH_TOKEN",
+  "OPENAI_ACCESS_TOKEN",
+  "OPENAI_API_KEY",
+]);
 
 const execFile = NodeUtil.promisify(NodeChildProcess.execFile);
 
@@ -542,16 +550,43 @@ function codexRateLimitBucketLabel(
   return stringValue(rateLimits.limitName) ?? fallbackKey;
 }
 
+function codexDurationLabel(durationMins: number): string {
+  if (durationMins % 60 === 0) {
+    return `${durationMins / 60}h`;
+  }
+  return `${durationMins}m`;
+}
+
+function codexPrimaryWindowDescriptor(raw: unknown): {
+  readonly idSuffix: string;
+  readonly kind: PlanUsageWindow["kind"];
+  readonly title: string;
+} {
+  const durationMins = numberValue(objectValue(raw)?.windowDurationMins);
+  if (durationMins === 300) {
+    return { idSuffix: "five-hour", kind: "five_hour", title: "Codex 5h" };
+  }
+  if (durationMins !== null && Number.isInteger(durationMins) && durationMins > 0) {
+    return {
+      idSuffix: `${durationMins}-minute`,
+      kind: `duration_${durationMins}_minutes`,
+      title: `Codex ${codexDurationLabel(durationMins)}`,
+    };
+  }
+  return { idSuffix: "primary", kind: "primary", title: "Codex primary" };
+}
+
 function codexWindowsForRateLimitBucket(input: {
   readonly rateLimits: Record<string, unknown>;
   readonly idPrefix: string;
   readonly titleSuffix: string;
 }): ReadonlyArray<PlanUsageWindow> {
+  const primary = codexPrimaryWindowDescriptor(input.rateLimits.primary);
   return [
     codexWindow({
-      id: `${input.idPrefix}five-hour`,
-      kind: "five_hour",
-      title: `Codex 5h${input.titleSuffix}`,
+      id: `${input.idPrefix}${primary.idSuffix}`,
+      kind: primary.kind,
+      title: `${primary.title}${input.titleSuffix}`,
       raw: input.rateLimits.primary,
     }),
     codexWindow({
@@ -926,10 +961,33 @@ function codexAppServerEnvironment(
   environment?: ProviderInstanceEnvironment | undefined,
   baseEnv: NodeJS.ProcessEnv = process.env,
 ): NodeJS.ProcessEnv {
+  const sanitizedBaseEnv = codexUsageBaseEnvironment(baseEnv);
   return {
-    ...mergeProviderInstanceEnvironment(environment, baseEnv),
+    ...mergeProviderInstanceEnvironment(environment, sanitizedBaseEnv),
     CODEX_HOME: codexHome,
   };
+}
+
+function isCodexAuthOverrideEnvKey(key: string): boolean {
+  const normalized = key.toUpperCase();
+  return (
+    CODEX_AUTH_OVERRIDE_ENV_KEYS.has(normalized) ||
+    (normalized.startsWith("CODEX_") && normalized.includes("TOKEN")) ||
+    (normalized.startsWith("OPENAI_") &&
+      (normalized.includes("API_KEY") || normalized.includes("TOKEN"))) ||
+    (normalized.startsWith("AZURE_OPENAI_") &&
+      (normalized.includes("API_KEY") || normalized.includes("TOKEN")))
+  );
+}
+
+function codexUsageBaseEnvironment(baseEnv: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = { ...baseEnv };
+  for (const key of Object.keys(env)) {
+    if (isCodexAuthOverrideEnvKey(key)) {
+      delete env[key];
+    }
+  }
+  return env;
 }
 
 function writeCodexAppServerMessage(

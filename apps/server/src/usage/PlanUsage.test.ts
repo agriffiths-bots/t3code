@@ -16,6 +16,7 @@ import { __testing, loadPlanUsageSnapshot } from "./PlanUsage.ts";
 async function makeFakeCodexAppServer(input: {
   readonly rateLimitsResponse: unknown;
   readonly requiredEnv?: Readonly<Record<string, string>>;
+  readonly forbiddenEnv?: ReadonlyArray<string>;
   readonly serverRequestMethod?: string | undefined;
 }): Promise<{
   readonly binaryPath: string;
@@ -35,10 +36,17 @@ if (!process.argv.slice(2).includes("app-server")) {
 }
 
 const requiredEnv = ${JSON.stringify(input.requiredEnv ?? {})};
+const forbiddenEnv = ${JSON.stringify(input.forbiddenEnv ?? [])};
 for (const [key, value] of Object.entries(requiredEnv)) {
   if (process.env[key] !== value) {
     console.error(\`missing required env \${key}\`);
     process.exit(3);
+  }
+}
+for (const key of forbiddenEnv) {
+  if (process.env[key] !== undefined) {
+    console.error(\`forbidden env \${key}\`);
+    process.exit(6);
   }
 }
 if (process.env.CODEX_HOME !== ${JSON.stringify(homePath)}) {
@@ -238,6 +246,22 @@ describe("PlanUsage", () => {
     expect(result?.windows.map((window) => window.id)).toEqual(["codex-weekly"]);
   });
 
+  it("derives Codex primary window metadata from the app-server duration", () => {
+    const result = __testing.parseCodexRateLimitsResponse({
+      rateLimits: {
+        planType: "pro",
+        primary: { usedPercent: 6, resetsAt: 1783103404, windowDurationMins: 15 },
+      },
+    });
+
+    expect(result?.windows[0]).toMatchObject({
+      id: "codex-15-minute",
+      kind: "duration_15_minutes",
+      title: "Codex 15m",
+      usedPercent: 6,
+    });
+  });
+
   it("maps Codex app-server multi-bucket rate limits", () => {
     const result = __testing.parseCodexRateLimitsResponse({
       rateLimits: {
@@ -280,6 +304,7 @@ describe("PlanUsage", () => {
       requiredEnv: {
         HTTPS_PROXY: "http://proxy.example",
       },
+      forbiddenEnv: ["CODEX_ACCESS_TOKEN"],
       serverRequestMethod: "account/chatgptAuthTokens/refresh",
       rateLimitsResponse: {
         rateLimits: {
@@ -296,11 +321,19 @@ describe("PlanUsage", () => {
       ...fake,
       environment: [{ name: "HTTPS_PROXY", value: "http://proxy.example", sensitive: false }],
     });
+    const previousCodexAccessToken = process.env.CODEX_ACCESS_TOKEN;
+    process.env.CODEX_ACCESS_TOKEN = "ambient-token";
 
     const snapshot = await loadPlanUsageSnapshot(
       { settings, providerInstanceId: ProviderInstanceId.make("codex") },
       now,
-    );
+    ).finally(() => {
+      if (previousCodexAccessToken === undefined) {
+        delete process.env.CODEX_ACCESS_TOKEN;
+      } else {
+        process.env.CODEX_ACCESS_TOKEN = previousCodexAccessToken;
+      }
+    });
 
     expect(snapshot.providers).toHaveLength(1);
     expect(snapshot.providers[0]?.provider).toBe("codex");
@@ -339,6 +372,40 @@ describe("PlanUsage", () => {
     });
     expect(requests[2]?.params).toBeNull();
     expect(requests[3]?.params).toBeNull();
+  });
+
+  it("allows explicit Codex auth environment configured on the provider instance", async () => {
+    const now = Date.parse("2026-07-06T15:10:00.000Z");
+    const fake = await makeFakeCodexAppServer({
+      requiredEnv: {
+        CODEX_ACCESS_TOKEN: "provider-token",
+      },
+      rateLimitsResponse: {
+        rateLimits: {
+          planType: "team",
+          primary: { usedPercent: 12, resetsAt: 1783103404, windowDurationMins: 300 },
+        },
+      },
+    });
+    const settings = fakeCodexSettings({
+      ...fake,
+      environment: [{ name: "CODEX_ACCESS_TOKEN", value: "provider-token", sensitive: true }],
+    });
+    const previousCodexAccessToken = process.env.CODEX_ACCESS_TOKEN;
+    process.env.CODEX_ACCESS_TOKEN = "ambient-token";
+
+    const snapshot = await loadPlanUsageSnapshot(
+      { settings, providerInstanceId: ProviderInstanceId.make("codex") },
+      now,
+    ).finally(() => {
+      if (previousCodexAccessToken === undefined) {
+        delete process.env.CODEX_ACCESS_TOKEN;
+      } else {
+        process.env.CODEX_ACCESS_TOKEN = previousCodexAccessToken;
+      }
+    });
+
+    expect(snapshot.providers[0]?.windows.map((window) => window.usedPercent)).toEqual([12]);
   });
 
   it("maps Claude dynamic limits including scoped Fable weekly usage", () => {
