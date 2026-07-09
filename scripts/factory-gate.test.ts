@@ -76,12 +76,14 @@ function installFactoryFixture(
     `#!/usr/bin/env bash
 set -euo pipefail
 out=""
+args=("$@")
 while [[ "$#" -gt 0 ]]; do
   case "$1" in
     --json-output) out="$2"; shift 2 ;;
     *) shift ;;
   esac
 done
+[[ -z "\${FACTORY_TEST_REVIEW_ARGS_FILE:-}" ]] || printf '%s\n' "\${args[*]}" > "$FACTORY_TEST_REVIEW_ARGS_FILE"
 [[ -n "$out" ]] || { echo "missing --json-output" >&2; exit 2; }
 cat > "$out" <<'JSON'
 {"findings":[],"overall_correctness":"patch is correct","overall_explanation":"fixture clean review","overall_confidence":1}
@@ -104,7 +106,7 @@ JSON
     `FACTORY_STATIC_CHECKS=(${staticChecksConfig})
 FACTORY_STATIC_CHECKS_PARALLEL=${options.parallelStaticChecks ? "1" : "0"}
 FACTORY_AUTOREVIEW_BIN=${shellQuote(autoreview)}
-FACTORY_REVIEW_ARGS=()
+FACTORY_REVIEW_ARGS=(--reviewers codex --model codex=gpt-5.6-sol --thinking codex=high)
 FACTORY_UPSTREAM_REF="upstream/main"
 FACTORY_AUDIT_LOG=${shellQuote(audit)}
 `,
@@ -294,6 +296,73 @@ exec ${shellQuote(realDate)} "$@"
       assert.equal(
         typeof (pass?.timings as { readonly total_secs?: unknown })?.total_secs,
         "number",
+      );
+    } finally {
+      NodeFS.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("uses and audits a valid reviewer override", () => {
+    const root = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3-factory-gate-"));
+    try {
+      const { audit, repo } = installFactoryFixture(root);
+      const override = NodePath.join(root, ".openclaw", "factory-reviewer-override.conf");
+      const reviewArgs = NodePath.join(root, "review-args.txt");
+      NodeFS.mkdirSync(NodePath.dirname(override), { recursive: true });
+      NodeFS.writeFileSync(
+        override,
+        "--reviewers claude --model claude=opus-4.8 --thinking claude=high\n",
+      );
+      NodeFS.writeFileSync(NodePath.join(repo, "override.txt"), "override\n");
+      run(repo, ["git", "add", "-A"]);
+
+      run(repo, ["scripts/factory/precommit-gate.sh", "--prepare"], {
+        env: { HOME: root, FACTORY_TEST_REVIEW_ARGS_FILE: reviewArgs },
+      });
+
+      assert.match(
+        NodeFS.readFileSync(reviewArgs, "utf8"),
+        /--reviewers claude --model claude=opus-4\.8 --thinking claude=high/,
+      );
+      assert.ok(
+        readAuditRecords(audit).some(
+          (record) =>
+            record.kind === "reviewer-override" &&
+            record.args === "--reviewers claude --model claude=opus-4.8 --thinking claude=high",
+        ),
+      );
+    } finally {
+      NodeFS.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects a malformed reviewer override and uses the pinned default", () => {
+    const root = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3-factory-gate-"));
+    try {
+      const { audit, repo } = installFactoryFixture(root);
+      const override = NodePath.join(root, ".openclaw", "factory-reviewer-override.conf");
+      const reviewArgs = NodePath.join(root, "review-args.txt");
+      NodeFS.mkdirSync(NodePath.dirname(override), { recursive: true });
+      NodeFS.writeFileSync(
+        override,
+        "--reviewers claude --mode branch --model claude=opus-4.8 --thinking claude=high\n",
+      );
+      NodeFS.writeFileSync(NodePath.join(repo, "malformed.txt"), "malformed\n");
+      run(repo, ["git", "add", "-A"]);
+
+      const result = run(repo, ["scripts/factory/precommit-gate.sh", "--prepare"], {
+        env: { HOME: root, FACTORY_TEST_REVIEW_ARGS_FILE: reviewArgs },
+      });
+
+      assert.match(result.stderr, /reviewer override rejected/);
+      assert.match(
+        NodeFS.readFileSync(reviewArgs, "utf8"),
+        /--reviewers codex --model codex=gpt-5\.6-sol --thinking codex=high/,
+      );
+      assert.ok(
+        readAuditRecords(audit).some(
+          (record) => record.kind === "reviewer-override" && record.status === "rejected",
+        ),
       );
     } finally {
       NodeFS.rmSync(root, { recursive: true, force: true });

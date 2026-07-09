@@ -209,6 +209,32 @@ audit() { # audit <verdict> <detail-json-object> — the gate's guarantees are
     }
 }
 
+apply_reviewer_override() {
+  local override_file override_args default_args status
+  override_file="$HOME/.openclaw/factory-reviewer-override.conf"
+  [ -s "$override_file" ] || return 0
+  override_args="$(<"$override_file")"
+  [ -n "$override_args" ] || return 0
+  default_args="${FACTORY_REVIEW_ARGS[*]}"
+  status="rejected"
+  if [[ "$override_args" =~ ^--reviewers\ [-A-Za-z0-9=.\ ]+$ ]] \
+     && [ "$override_args" = "--reviewers claude --model claude=opus-4.8 --thinking claude=high" ]; then
+    read -r -a FACTORY_REVIEW_ARGS <<< "$override_args"
+    status="used"
+  else
+    echo "factory-gate: reviewer override rejected; using pinned default" >&2
+  fi
+  mkdir -p "$(dirname "$FACTORY_AUDIT_LOG")" 2>/dev/null
+  jq -cn --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg repo "$REPO_ROOT" \
+    --arg status "$status" --arg args "${FACTORY_REVIEW_ARGS[*]}" \
+    --arg requested "$override_args" --arg default_args "$default_args" \
+    '{ts:$ts,kind:"reviewer-override",repo:$repo,status:$status,args:$args,requested:$requested,default_args:$default_args}' \
+    >> "$FACTORY_AUDIT_LOG" || {
+      echo "factory-gate: FATAL — cannot audit reviewer override; refusing" >&2
+      exit 2
+    }
+}
+
 refuse() { # refuse <short> <verdict> <detail-json>
   echo "" >&2
   echo "factory-gate: COMMIT REFUSED — $1" >&2
@@ -452,6 +478,7 @@ else
 
   # ---- autoreview over exactly the staged diff ----
   [ -x "$FACTORY_AUTOREVIEW_BIN" ] || refuse "autoreview helper not found at $FACTORY_AUTOREVIEW_BIN" review-infra '{}'
+  apply_reviewer_override
   echo "factory-gate: autoreview (this can take several minutes; pre-warm next time with scripts/factory/precommit-gate.sh --prepare)" >&2
   rm -f "$REVIEW_JSON" "$REVIEW_FOR"
   REVIEW_START_MS="$(now_ms)"
