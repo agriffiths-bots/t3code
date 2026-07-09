@@ -356,7 +356,12 @@ done
 
 HEAD_SHA="$(head_sha)"
 TREE_SHA="$(git write-tree)" || refuse "git write-tree failed (unmerged index?)" scope-write-tree '{}'
-GATE_ID="$HEAD_SHA $TREE_SHA"
+# The effective reviewer configuration is part of the cache identity: a PASS
+# pre-warmed under one reviewer must not be reusable after the override file
+# changes (add/remove/edit), or a review skip could dodge the pinned reviewer.
+apply_reviewer_override
+REVIEWER_FP="$(printf '%s' "${FACTORY_REVIEW_ARGS[*]}" | sha256sum | cut -c1-12)"
+GATE_ID="$HEAD_SHA $TREE_SHA $REVIEWER_FP"
 SCOPE_DONE_MS="$(now_ms)"
 
 append_static_check_result() { # append_static_check_result <cmd> <rc> <elapsed-ms>
@@ -478,7 +483,6 @@ else
 
   # ---- autoreview over exactly the staged diff ----
   [ -x "$FACTORY_AUTOREVIEW_BIN" ] || refuse "autoreview helper not found at $FACTORY_AUTOREVIEW_BIN" review-infra '{}'
-  apply_reviewer_override
   echo "factory-gate: autoreview (this can take several minutes; pre-warm next time with scripts/factory/precommit-gate.sh --prepare)" >&2
   rm -f "$REVIEW_JSON" "$REVIEW_FOR"
   REVIEW_START_MS="$(now_ms)"

@@ -336,6 +336,45 @@ exec ${shellQuote(realDate)} "$@"
     }
   });
 
+  it("invalidates a cached pass when the reviewer override changes", () => {
+    const root = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3-factory-gate-"));
+    try {
+      const { audit, repo } = installFactoryFixture(root);
+      const override = NodePath.join(root, ".openclaw", "factory-reviewer-override.conf");
+      const reviewArgs = NodePath.join(root, "review-args.txt");
+      NodeFS.writeFileSync(NodePath.join(repo, "cachekey.txt"), "cachekey\n");
+      run(repo, ["git", "add", "-A"]);
+
+      // First run: default reviewer, PASS gets cached for this staged tree.
+      run(repo, ["scripts/factory/precommit-gate.sh", "--prepare"], {
+        env: { HOME: root, FACTORY_TEST_REVIEW_ARGS_FILE: reviewArgs },
+      });
+      assert.ok(!/--reviewers claude/.test(NodeFS.readFileSync(reviewArgs, "utf8")));
+
+      // Adding the override must invalidate the cached pass: the same staged
+      // tree re-reviews under the overridden reviewer instead of reusing PASS.
+      NodeFS.mkdirSync(NodePath.dirname(override), { recursive: true });
+      NodeFS.writeFileSync(
+        override,
+        "--reviewers claude --model claude=opus-4.8 --thinking claude=high\n",
+      );
+      run(repo, ["scripts/factory/precommit-gate.sh", "--prepare"], {
+        env: { HOME: root, FACTORY_TEST_REVIEW_ARGS_FILE: reviewArgs },
+      });
+      assert.match(
+        NodeFS.readFileSync(reviewArgs, "utf8"),
+        /--reviewers claude --model claude=opus-4\.8 --thinking claude=high/,
+      );
+      assert.ok(
+        readAuditRecords(audit).some(
+          (record) => record.kind === "reviewer-override" && record.status === "used",
+        ),
+      );
+    } finally {
+      NodeFS.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it("rejects a malformed reviewer override and uses the pinned default", () => {
     const root = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3-factory-gate-"));
     try {
