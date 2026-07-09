@@ -127,6 +127,25 @@ function toRuntimeStatus(
   }
 }
 
+function runtimeStatusFromSessionState(
+  state: Extract<ProviderRuntimeEvent, { type: "session.state.changed" }>["payload"]["state"],
+): "starting" | "running" | "waiting" | "stopped" | "error" {
+  switch (state) {
+    case "starting":
+      return "starting";
+    case "waiting":
+      return "waiting";
+    case "stopped":
+      return "stopped";
+    case "error":
+      return "error";
+    case "ready":
+    case "running":
+    default:
+      return "running";
+  }
+}
+
 function toRuntimePayloadFromSession(
   session: ProviderSession,
   extra?: {
@@ -750,12 +769,16 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
         return;
       }
       const previousPayload = readRecord(binding?.runtimePayload) ?? {};
+      const nextActiveTurnId =
+        event.payload.state === "waiting" || event.payload.state === "running"
+          ? (event.turnId ?? null)
+          : null;
       yield* directory.upsert({
         threadId: event.threadId,
         provider: source.provider,
         providerInstanceId: source.instanceId,
         runtimeMode: binding?.runtimeMode ?? "full-access",
-        status: event.payload.state === "waiting" ? "waiting" : (binding?.status ?? "running"),
+        status: runtimeStatusFromSessionState(event.payload.state),
         ...(resumeCursor !== undefined
           ? { resumeCursor }
           : binding?.resumeCursor !== undefined
@@ -763,7 +786,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
             : {}),
         runtimePayload: {
           ...previousPayload,
-          ...(event.payload.state === "waiting" ? { activeTurnId: event.turnId ?? null } : {}),
+          activeTurnId: nextActiveTurnId,
           lastRuntimeEvent: event.type,
           lastRuntimeEventAt: event.createdAt,
         },

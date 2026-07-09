@@ -1873,6 +1873,7 @@ routing.layer("ProviderServiceLive routing", (it) => {
   it.effect("persists replacement resume cursor from session state before sendTurn returns", () =>
     Effect.gen(function* () {
       const provider = yield* ProviderService.ProviderService;
+      const directory = yield* ProviderSessionDirectory.ProviderSessionDirectory;
       const runtimeRepository = yield* ProviderSessionRuntime.ProviderSessionRuntimeRepository;
 
       const threadId = asThreadId("thread-replacement-resume-before-send");
@@ -1882,11 +1883,24 @@ routing.layer("ProviderServiceLive routing", (it) => {
         threadId,
         runtimeMode: "full-access",
       });
+      yield* directory.upsert({
+        threadId,
+        provider: CURSOR_DRIVER,
+        providerInstanceId: cursorInstanceId,
+        runtimeMode: "full-access",
+        status: "waiting",
+        resumeCursor: session.resumeCursor,
+        runtimePayload: {
+          activeTurnId: asTurnId("turn-replacement-resume-waiting"),
+          lastRuntimeEvent: "session.state.changed",
+        },
+      });
       const replacementResumeCursor = {
         schemaVersion: 1,
         sessionId: "mock-replacement-cursor-session",
       };
 
+      yield* advanceTestClock(50);
       routing.cursor.emit({
         type: "session.state.changed",
         eventId: asEventId("evt-cursor-replacement-resume-ready"),
@@ -1898,7 +1912,24 @@ routing.layer("ProviderServiceLive routing", (it) => {
           detail: { resumeCursor: replacementResumeCursor },
         },
       });
-      yield* advanceTestClock(50);
+      yield* advanceTestClock(500);
+
+      const preSendRuntime = yield* runtimeRepository.getByThreadId({ threadId });
+      assert.equal(Option.isSome(preSendRuntime), true);
+      if (Option.isSome(preSendRuntime)) {
+        assert.equal(preSendRuntime.value.status, "running");
+        assert.deepEqual(preSendRuntime.value.resumeCursor, replacementResumeCursor);
+        const payload = preSendRuntime.value.runtimePayload;
+        assert.equal(payload !== null && typeof payload === "object", true);
+        if (payload !== null && typeof payload === "object" && !Array.isArray(payload)) {
+          const runtimePayload = payload as {
+            activeTurnId: string | null;
+            lastRuntimeEvent: string | null;
+          };
+          assert.equal(runtimePayload.activeTurnId, null);
+          assert.equal(runtimePayload.lastRuntimeEvent, "session.state.changed");
+        }
+      }
 
       yield* provider.sendTurn({
         threadId: session.threadId,

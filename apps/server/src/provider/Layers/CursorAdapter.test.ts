@@ -1784,10 +1784,18 @@ cursorAdapterTestLayer("CursorAdapterLive", (it) => {
 
       const cancelledTurnCompleted =
         yield* Deferred.make<Extract<ProviderRuntimeEvent, { type: "turn.completed" }>>();
+      const lateCompletedDelta =
+        yield* Deferred.make<Extract<ProviderRuntimeEvent, { type: "content.delta" }>>();
       const runtimeEventsFiber = yield* Stream.runForEach(adapter.streamEvents, (event) =>
         Effect.gen(function* () {
           if (String(event.threadId) !== String(threadId)) {
             return;
+          }
+          if (
+            event.type === "content.delta" &&
+            event.payload.delta === "detached late after completion"
+          ) {
+            yield* Deferred.succeed(lateCompletedDelta, event).pipe(Effect.ignore);
           }
           if (event.type === "turn.completed" && event.payload.state === "cancelled") {
             yield* Deferred.succeed(cancelledTurnCompleted, event).pipe(Effect.ignore);
@@ -1818,9 +1826,11 @@ cursorAdapterTestLayer("CursorAdapterLive", (it) => {
       const cancelled = yield* Deferred.await(cancelledTurnCompleted).pipe(
         Effect.timeout("2 seconds"),
       );
+      const lateDelta = yield* Deferred.await(lateCompletedDelta).pipe(Effect.timeout("2 seconds"));
 
       assert.notEqual(String(followUp.turnId), String(firstTurn.turnId));
       assert.equal(String(cancelled.turnId), String(followUp.turnId));
+      assert.equal(String(lateDelta.turnId), String(firstTurn.turnId));
       const sessions = yield* adapter.listSessions();
       const session = sessions.find((entry) => entry.threadId === threadId);
       assert.equal(session?.status, "ready");
@@ -1840,6 +1850,8 @@ cursorAdapterTestLayer("CursorAdapterLive", (it) => {
         makeMockAgentWrapper({
           T3_ACP_PROMPT_DELAY_MS: "1000",
           T3_ACP_EMIT_DETACHED_LATE_UPDATE_AFTER_CANCEL: "1",
+          T3_ACP_EMIT_LOAD_REPLAY_LIVE_CONTINUATION: "1",
+          T3_ACP_LOAD_REPLAY_LIVE_CONTINUATION_DELAY_MS: "50",
           T3_ACP_DELAY_LOAD_SESSION_AFTER_REPLAY: "1",
           T3_ACP_LOAD_SESSION_DELAY_MS: "250",
         }),
@@ -1918,7 +1930,9 @@ cursorAdapterTestLayer("CursorAdapterLive", (it) => {
         assert.equal(completed.payload.state, "cancelled");
       }
       const leakedDetachedDeltas = runtimeEvents.flatMap((event) =>
-        event.type === "content.delta" && event.payload.delta === "detached late after cancel"
+        event.type === "content.delta" &&
+        (event.payload.delta === "detached late after cancel" ||
+          event.payload.delta === " live continuation")
           ? [`${event.payload.delta}:${String(event.turnId)}`]
           : [],
       );
@@ -1994,6 +2008,11 @@ cursorAdapterTestLayer("CursorAdapterLive", (it) => {
       yield* adapter.interruptTurn(threadId).pipe(Effect.timeout("2 seconds"));
       const cancelled = yield* Deferred.await(cancelledTurnCompleted).pipe(
         Effect.timeout("2 seconds"),
+      );
+      const preJoinSnapshot = yield* adapter.readThread(threadId);
+      assert.include(
+        preJoinSnapshot.turns.map((turn) => String(turn.id)),
+        String(firstStarted.turnId),
       );
       const cancelledTurn = yield* Fiber.join(sendTurnFiber).pipe(Effect.timeout("2 seconds"));
 
