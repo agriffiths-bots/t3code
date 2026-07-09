@@ -362,23 +362,6 @@ const requireSubagentCapability = (capability: McpInvocationContext.McpCapabilit
 const peerSetAllows = (set: ReadonlySet<ThreadId> | undefined, threadId: ThreadId): boolean =>
   set === undefined || set.has(threadId);
 
-const requirePeerChildAccess = (
-  invocation: McpInvocationContext.McpInvocationScope,
-  childThreadIds: ReadonlyArray<ThreadId>,
-): Effect.Effect<void, ThreadStartToolError> => {
-  if (McpInvocationContext.isProviderInvocationScope(invocation)) return Effect.void;
-  const unauthorized = childThreadIds.find(
-    (childThreadId) => !peerSetAllows(invocation.allowedChildThreadIds, childThreadId),
-  );
-  return unauthorized === undefined
-    ? Effect.void
-    : Effect.fail(
-        fail(
-          `Peer-scoped sub-agent credential is not authorized for child thread ${unauthorized}.`,
-        ),
-      );
-};
-
 const requirePeerParentAccess = (
   invocation: McpInvocationContext.McpInvocationScope,
   parentThreadId: ThreadId,
@@ -424,6 +407,58 @@ const loadThreadShell = (runtime: SubagentRuntime, threadId: ThreadId) =>
   runtime.projectionSnapshotQuery
     .getThreadShellById(threadId)
     .pipe(Effect.mapError((error) => toToolError(error, "Failed to load thread.")));
+
+const requirePeerChildAccess = (
+  runtime: SubagentRuntime,
+  invocation: McpInvocationContext.McpInvocationScope,
+  childThreadIds: ReadonlyArray<ThreadId>,
+): Effect.Effect<void, ThreadStartToolError> => {
+  if (McpInvocationContext.isProviderInvocationScope(invocation)) return Effect.void;
+  const explicitAllowedChildren = invocation.allowedChildThreadIds;
+  if (explicitAllowedChildren !== undefined) {
+    const unauthorized = childThreadIds.find(
+      (childThreadId) => !explicitAllowedChildren.has(childThreadId),
+    );
+    return unauthorized === undefined
+      ? Effect.void
+      : Effect.fail(
+          fail(
+            `Peer-scoped sub-agent credential is not authorized for child thread ${unauthorized}.`,
+          ),
+        );
+  }
+  const sourceEnvironmentId = invocation.sourceEnvironmentId;
+  if (sourceEnvironmentId === undefined) {
+    return Effect.fail(
+      fail("Peer-scoped sub-agent credential is not authorized for child thread reads."),
+    );
+  }
+  return Effect.forEach(
+    childThreadIds,
+    (childThreadId) =>
+      loadThreadShell(runtime, childThreadId).pipe(
+        Effect.flatMap((thread) =>
+          Option.match(thread, {
+            onNone: () =>
+              Effect.fail(
+                fail(
+                  `Peer-scoped sub-agent credential is not authorized for child thread ${childThreadId}.`,
+                ),
+              ),
+            onSome: (shell) =>
+              shell.parentEnvironmentId === sourceEnvironmentId
+                ? Effect.void
+                : Effect.fail(
+                    fail(
+                      `Peer-scoped sub-agent credential is not authorized for child thread ${childThreadId}.`,
+                    ),
+                  ),
+          }),
+        ),
+      ),
+    { discard: true, concurrency: "unbounded" },
+  );
+};
 
 const loadThreadDetail = (runtime: SubagentRuntime, threadId: ThreadId) =>
   runtime.projectionSnapshotQuery
@@ -855,12 +890,7 @@ const releaseSuppressedRemoteTerminalWake = (
 const markSuppressedRemoteTerminalWake = (
   runtime: SubagentRuntime,
   input: SuppressedRemoteTerminalWake,
-) =>
-  markRemoteTerminalClaim(runtime, input).pipe(
-    Effect.catch((error) =>
-      releaseSuppressedRemoteTerminalWake(runtime, input).pipe(Effect.andThen(Effect.fail(error))),
-    ),
-  );
+) => markRemoteTerminalClaim(runtime, input);
 
 const restoreSuppressedRemoteTerminalWake = (
   runtime: SubagentRuntime,
@@ -1130,19 +1160,28 @@ const waitRemoteSubagents = Effect.fn("SubagentToolkit.waitRemoteSubagents")(fun
       });
       const pending = promoted ? false : pendingForMode(rows, input.mode);
       if (!pending || afterPollMs >= sliceDeadlineMs) {
-        const markExits = yield* Effect.forEach(
+        const markResults = yield* Effect.forEach(
           Array.from(suppressedTerminalWakes.values()),
           (suppressed) =>
-            markSuppressedRemoteTerminalWake(input.runtime, suppressed).pipe(Effect.exit),
+            markSuppressedRemoteTerminalWake(input.runtime, suppressed).pipe(
+              Effect.exit,
+              Effect.map((exit) => ({ suppressed, exit })),
+            ),
           { concurrency: "unbounded" },
         );
-        suppressedTerminalWakes.clear();
-        const markFailure = markExits.find(Exit.isFailure);
-        if (markFailure !== undefined) {
-          yield* Effect.logWarning("failed to mark remote wait completion delivered", {
-            cause: Cause.pretty(markFailure.cause),
-          });
+        let markFailureCause: Cause.Cause<ThreadStartToolError> | null = null;
+        for (const result of markResults) {
+          if (Exit.isFailure(result.exit)) {
+            markFailureCause ??= result.exit.cause;
+          }
         }
+        if (markFailureCause !== null) {
+          yield* Effect.logWarning("failed to mark remote wait completion delivered", {
+            cause: Cause.pretty(markFailureCause),
+          });
+          return yield* Effect.failCause(markFailureCause);
+        }
+        suppressedTerminalWakes.clear();
         const settledCount = rows.filter((row) => isWaitTerminal(row.status)).length;
         const timedOutCount = promoted ? 0 : rows.filter((row) => row.status === "timeout").length;
         return {
@@ -1619,7 +1658,7 @@ const steerSubagent = Effect.fn("SubagentToolkit.steer")(function* (input: Steer
 const checkSubagent = Effect.fn("SubagentToolkit.check")(function* (input: CheckSubagentInput) {
   const invocation = yield* requireSubagentCapability("subagent:check");
   const runtime = yield* requireRuntime();
-  yield* requirePeerChildAccess(invocation, [input.childThreadId]);
+  yield* requirePeerChildAccess(runtime, invocation, [input.childThreadId]);
 
   if (McpInvocationContext.isProviderInvocationScope(invocation)) {
     const remoteChildren = yield* remoteChildrenByIdForParent(runtime, invocation.threadId, [
@@ -1667,7 +1706,7 @@ const waitSubagent = Effect.fn("SubagentToolkit.wait")(function* (input: WaitSub
   const coordinator = yield* requireCoordinator();
   const childThreadIds = Array.from(new Set(input.childThreadIds));
 
-  yield* requirePeerChildAccess(invocation, childThreadIds);
+  yield* requirePeerChildAccess(runtime, invocation, childThreadIds);
   const remoteRowsById = McpInvocationContext.isProviderInvocationScope(invocation)
     ? yield* remoteChildrenByIdForParent(runtime, invocation.threadId, childThreadIds)
     : new Map<string, RemoteChild>();

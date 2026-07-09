@@ -2170,105 +2170,116 @@ describe("SubagentToolkit", () => {
     ),
   );
 
-  it.effect("returns remote wait results when one terminal mark fails after another succeeds", () =>
-    Effect.scoped(
-      Effect.gen(function* () {
-        const server = yield* McpServer.McpServer;
-        const markFailingChildThreadId = ThreadId.make("thread-remote-child-mark-failing");
-        peerRegistryPeers = [bearerPeer()];
-        remoteChildRows = [
-          remoteChildRow("running"),
-          {
-            ...remoteChildRow("running"),
-            childThreadId: markFailingChildThreadId,
-            spawnParams: {
-              prompt: "remote mark failing",
-              directory: "/remote/repo",
-              detached: true,
-            },
-          },
-        ];
-        remoteChildPollerRows = [];
-        remoteTerminalMarkFailureChild = markFailingChildThreadId;
-        enqueuedParentInjections.length = 0;
-        updatedRemoteChildren.length = 0;
-        remoteTerminalDeliveryEvents.length = 0;
-        remoteTerminalDeliveryClaims.clear();
-        peerHttpHandler = remoteCheckPeerHandlerWith((body) => {
-          const requestedThreadId = body.params?.arguments?.childThreadId;
-          return requestedThreadId === markFailingChildThreadId
-            ? {
-                threadId: markFailingChildThreadId,
-                status: "completed",
-                turnCount: 3,
-                latestAssistantText: "mark failed but caller saw me",
-              }
-            : {
-                threadId: remoteChildThreadId,
-                status: "completed",
-                turnCount: 2,
-                latestAssistantText: "mark succeeded and caller saw me",
-              };
-        });
-
-        const result = yield* server
-          .callTool({
-            name: "t3_wait_subagent",
-            arguments: {
-              childThreadIds: [remoteChildThreadId, markFailingChildThreadId],
-              timeoutSeconds: 1,
-              mode: "all",
-            },
-          })
-          .pipe(
-            Effect.provideService(McpInvocationContext.McpInvocationContext, invocation),
-            Effect.provideService(McpSchema.McpServerClient, client),
-          );
-
-        expect(result.isError).toBe(false);
-        const results = (result.structuredContent as { readonly results?: ReadonlyArray<unknown> })
-          .results;
-        expect(results).toEqual(
-          expect.arrayContaining([
-            expect.objectContaining({
-              childThreadId: remoteChildThreadId,
-              status: "completed",
-              finalAssistantText: "mark succeeded and caller saw me",
-            }),
-            expect.objectContaining({
+  it.effect(
+    "fails a remote wait and restores only unmarked terminal wakes when marking fails",
+    () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const server = yield* McpServer.McpServer;
+          const markFailingChildThreadId = ThreadId.make("thread-remote-child-mark-failing");
+          peerRegistryPeers = [bearerPeer()];
+          remoteChildRows = [
+            remoteChildRow("running"),
+            {
+              ...remoteChildRow("running"),
               childThreadId: markFailingChildThreadId,
-              status: "completed",
-              finalAssistantText: "mark failed but caller saw me",
-            }),
-          ]),
-        );
-        expect(enqueuedParentInjections).toEqual([]);
-        expect(updatedRemoteChildren).toEqual([
-          expect.objectContaining({
-            parentThreadId,
-            childEnvironmentId: peerEnvironmentId,
-            childThreadId: remoteChildThreadId,
-            status: "completed",
-          }),
-        ]);
-        expect(remoteTerminalDeliveryClaims.size).toBe(0);
-      }),
-    ).pipe(
-      Effect.ensuring(
-        Effect.sync(() => {
-          peerRegistryPeers = [];
-          remoteChildRows = [];
-          remoteChildPollerRows = null;
-          remoteTerminalMarkFailureChild = null;
+              spawnParams: {
+                prompt: "remote mark failing",
+                directory: "/remote/repo",
+                detached: true,
+              },
+            },
+          ];
+          remoteChildPollerRows = [];
+          remoteTerminalMarkFailureChild = markFailingChildThreadId;
           enqueuedParentInjections.length = 0;
           updatedRemoteChildren.length = 0;
           remoteTerminalDeliveryEvents.length = 0;
           remoteTerminalDeliveryClaims.clear();
-          peerHttpHandler = null;
+          peerHttpHandler = remoteCheckPeerHandlerWith((body) => {
+            const requestedThreadId = body.params?.arguments?.childThreadId;
+            return requestedThreadId === markFailingChildThreadId
+              ? {
+                  threadId: markFailingChildThreadId,
+                  status: "completed",
+                  turnCount: 3,
+                  latestAssistantText: "mark failed but caller saw me",
+                }
+              : {
+                  threadId: remoteChildThreadId,
+                  status: "completed",
+                  turnCount: 2,
+                  latestAssistantText: "mark succeeded and caller saw me",
+                };
+          });
+
+          const result = yield* server
+            .callTool({
+              name: "t3_wait_subagent",
+              arguments: {
+                childThreadIds: [remoteChildThreadId, markFailingChildThreadId],
+                timeoutSeconds: 1,
+                mode: "all",
+              },
+            })
+            .pipe(
+              Effect.provideService(McpInvocationContext.McpInvocationContext, invocation),
+              Effect.provideService(McpSchema.McpServerClient, client),
+            );
+
+          expect(result.isError).toBe(true);
+          const content = result.content?.[0];
+          expect(content?.type).toBe("text");
+          if (content?.type !== "text") throw new Error("Expected text error content.");
+          expect(content.text).toContain("SQL error in RemoteChildRepository.markTerminalStatus");
+          expect(enqueuedParentInjections).toEqual(
+            expect.arrayContaining([
+              {
+                parentThreadId,
+                childThreadId: remoteChildThreadId,
+                status: "completed",
+                finalAssistantText: "mark succeeded and caller saw me",
+                error: null,
+              },
+              {
+                parentThreadId,
+                childThreadId: markFailingChildThreadId,
+                status: "completed",
+                finalAssistantText: "mark failed but caller saw me",
+                error: null,
+              },
+            ]),
+          );
+          expect(enqueuedParentInjections).toHaveLength(2);
+          expect(updatedRemoteChildren).toEqual([
+            expect.objectContaining({
+              parentThreadId,
+              childEnvironmentId: peerEnvironmentId,
+              childThreadId: remoteChildThreadId,
+              status: "completed",
+            }),
+          ]);
+          expect(remoteTerminalDeliveryClaims.size).toBe(0);
+          expect(remoteTerminalDeliveryEvents).toEqual(
+            expect.arrayContaining(["claim", "mark", "enqueue", "release"]),
+          );
         }),
+      ).pipe(
+        Effect.ensuring(
+          Effect.sync(() => {
+            peerRegistryPeers = [];
+            remoteChildRows = [];
+            remoteChildPollerRows = null;
+            remoteTerminalMarkFailureChild = null;
+            enqueuedParentInjections.length = 0;
+            updatedRemoteChildren.length = 0;
+            remoteTerminalDeliveryEvents.length = 0;
+            remoteTerminalDeliveryClaims.clear();
+            peerHttpHandler = null;
+          }),
+        ),
+        Effect.provide(TestLayer),
       ),
-      Effect.provide(TestLayer),
-    ),
   );
 
   it.effect("restores suppressed remote wake claims when wait is interrupted", () =>
@@ -2924,10 +2935,12 @@ describe("SubagentToolkit", () => {
     ).pipe(Effect.provide(TestLayer)),
   );
 
-  it.effect("allows unrestricted peer-scoped check for any child thread", () =>
+  it.effect("allows unrestricted peer-scoped check for a receiver-spawned child", () =>
     Effect.scoped(
       Effect.gen(function* () {
         const server = yield* McpServer.McpServer;
+        const sourceEnvironmentId = EnvironmentId.make("environment-source-a");
+        childShellParentEnvironmentId = sourceEnvironmentId;
 
         const result = yield* server
           .callTool({
@@ -2935,10 +2948,10 @@ describe("SubagentToolkit", () => {
             arguments: { childThreadId },
           })
           .pipe(
-            Effect.provideService(
-              McpInvocationContext.McpInvocationContext,
-              unrestrictedPeerInvocation,
-            ),
+            Effect.provideService(McpInvocationContext.McpInvocationContext, {
+              ...unrestrictedPeerInvocation,
+              sourceEnvironmentId,
+            }),
             Effect.provideService(McpSchema.McpServerClient, client),
           );
 
@@ -2948,7 +2961,90 @@ describe("SubagentToolkit", () => {
           latestAssistantText: "child done",
         });
       }),
-    ).pipe(Effect.provide(TestLayer)),
+    ).pipe(
+      Effect.ensuring(
+        Effect.sync(() => {
+          childShellParentEnvironmentId = null;
+        }),
+      ),
+      Effect.provide(TestLayer),
+    ),
+  );
+
+  it.effect("rejects unrestricted peer-scoped check for an unrelated local child", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const server = yield* McpServer.McpServer;
+        childShellParentEnvironmentId = EnvironmentId.make("environment-other-source");
+
+        const result = yield* server
+          .callTool({
+            name: "t3_check_subagent",
+            arguments: { childThreadId },
+          })
+          .pipe(
+            Effect.provideService(McpInvocationContext.McpInvocationContext, {
+              ...unrestrictedPeerInvocation,
+              sourceEnvironmentId: EnvironmentId.make("environment-source-a"),
+            }),
+            Effect.provideService(McpSchema.McpServerClient, client),
+          );
+
+        expect(result.isError).toBe(true);
+        const content = result.content?.[0];
+        expect(content?.type).toBe("text");
+        if (content?.type !== "text") throw new Error("Expected text error content.");
+        expect(content.text).toContain(
+          `Peer-scoped sub-agent credential is not authorized for child thread ${childThreadId}`,
+        );
+        expect(content.text).not.toContain("child done");
+      }),
+    ).pipe(
+      Effect.ensuring(
+        Effect.sync(() => {
+          childShellParentEnvironmentId = null;
+        }),
+      ),
+      Effect.provide(TestLayer),
+    ),
+  );
+
+  it.effect("rejects unrestricted peer-scoped wait for an unrelated local child", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const server = yield* McpServer.McpServer;
+        childShellParentEnvironmentId = EnvironmentId.make("environment-other-source");
+
+        const result = yield* server
+          .callTool({
+            name: "t3_wait_subagent",
+            arguments: { childThreadIds: [childThreadId] },
+          })
+          .pipe(
+            Effect.provideService(McpInvocationContext.McpInvocationContext, {
+              ...unrestrictedPeerInvocation,
+              sourceEnvironmentId: EnvironmentId.make("environment-source-a"),
+            }),
+            Effect.provideService(McpSchema.McpServerClient, client),
+          );
+
+        expect(result.isError).toBe(true);
+        const content = result.content?.[0];
+        expect(content?.type).toBe("text");
+        if (content?.type !== "text") throw new Error("Expected text error content.");
+        expect(content.text).toContain(
+          `Peer-scoped sub-agent credential is not authorized for child thread ${childThreadId}`,
+        );
+        expect(content.text).not.toContain("child done");
+      }),
+    ).pipe(
+      Effect.ensuring(
+        Effect.sync(() => {
+          childShellParentEnvironmentId = null;
+        }),
+      ),
+      Effect.provide(TestLayer),
+    ),
   );
 
   it.effect("rejects peer-scoped check for an unauthorized child thread", () =>
