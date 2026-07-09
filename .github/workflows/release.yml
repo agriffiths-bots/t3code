@@ -61,6 +61,9 @@ jobs:
       - name: Check
         run: vp check
 
+      - name: Codex usage auth guard
+        run: node scripts/codex-usage-auth-guard.mjs
+
       - name: Typecheck
         run: vp run typecheck
 
