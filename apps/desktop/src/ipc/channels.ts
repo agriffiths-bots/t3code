@@ -7,6 +7,7 @@ export const IS_NOTIFICATION_SUPPORTED_CHANNEL = "desktop:is-notification-suppor
 export const SHOW_NOTIFICATION_CHANNEL = "desktop:show-notification";
 export const CLOSE_NOTIFICATION_CHANNEL = "desktop:close-notification";
 export const DRAIN_NOTIFICATION_ACTIONS_CHANNEL = "desktop:drain-notification-actions";
+export const ACK_NOTIFICATION_ACTIONS_CHANNEL = "desktop:ack-notification-actions";
 export const NOTIFICATION_ACTION_CHANNEL = "desktop:notification-action";
 export const MENU_ACTION_CHANNEL = "desktop:menu-action";
 export const UPDATE_STATE_CHANNEL = "desktop:update-state";

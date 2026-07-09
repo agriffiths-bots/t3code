@@ -2,7 +2,7 @@ import {
   ContextMenuItemSchema,
   DesktopAppBrandingSchema,
   DesktopEnvironmentBootstrapSchema,
-  DesktopNotificationActionEventSchema,
+  DesktopNotificationQueuedActionSchema,
   DesktopThemeSchema,
   PickFolderOptionsSchema,
   PRIMARY_LOCAL_ENVIRONMENT_ID,
@@ -295,9 +295,19 @@ export const closeNotification = DesktopIpc.makeIpcMethod({
 export const drainNotificationActions = DesktopIpc.makeIpcMethod({
   channel: IpcChannels.DRAIN_NOTIFICATION_ACTIONS_CHANNEL,
   payload: Schema.Void,
-  result: Schema.Array(DesktopNotificationActionEventSchema),
+  result: Schema.Array(DesktopNotificationQueuedActionSchema),
   handler: Effect.fn("desktop.ipc.window.drainNotificationActions")(function* () {
     const notifications = yield* ElectronNotification.ElectronNotification;
     return yield* notifications.drainActions;
+  }),
+});
+
+export const ackNotificationActions = DesktopIpc.makeIpcMethod({
+  channel: IpcChannels.ACK_NOTIFICATION_ACTIONS_CHANNEL,
+  payload: Schema.Array(Schema.Number),
+  result: Schema.Void,
+  handler: Effect.fn("desktop.ipc.window.ackNotificationActions")(function* (ids) {
+    const notifications = yield* ElectronNotification.ElectronNotification;
+    yield* notifications.ackActions(ids);
   }),
 });

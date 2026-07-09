@@ -988,6 +988,12 @@ export const DesktopNotificationActionEventSchema = Schema.Struct({
 });
 export type DesktopNotificationActionEvent = typeof DesktopNotificationActionEventSchema.Type;
 
+export const DesktopNotificationQueuedActionSchema = Schema.Struct({
+  id: Schema.Number,
+  event: DesktopNotificationActionEventSchema,
+});
+export type DesktopNotificationQueuedAction = typeof DesktopNotificationQueuedActionSchema.Type;
+
 export interface DesktopBridge {
   getAppBranding: () => DesktopAppBranding | null;
   // One bootstrap per pool instance currently registered with bootstrap

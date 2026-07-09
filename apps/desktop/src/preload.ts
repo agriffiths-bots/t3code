@@ -1,6 +1,7 @@
 import type {
   DesktopBridge,
   DesktopNotificationActionEvent,
+  DesktopNotificationQueuedAction,
   DesktopPreviewPointerEvent,
   DesktopPreviewRecordingFrame,
   DesktopPreviewTabState,
@@ -9,23 +10,38 @@ import { exposeClerkBridge } from "@clerk/electron/preload";
 import { contextBridge, ipcRenderer } from "electron";
 
 import * as IpcChannels from "./ipc/channels.ts";
-import { createDesktopNotificationActionBuffer } from "./ipc/notificationActionBuffer.ts";
+import {
+  createDesktopNotificationActionBuffer,
+  createDesktopNotificationActionDrainScheduler,
+} from "./ipc/notificationActionBuffer.ts";
 
 exposeClerkBridge({ passkeys: true });
 
 const notificationActionBuffer = createDesktopNotificationActionBuffer();
+const notificationActionDrainScheduler = createDesktopNotificationActionDrainScheduler({
+  hasListeners: () => notificationActionBuffer.hasListeners(),
+  drain: drainNotificationActions,
+});
 
 async function drainNotificationActions() {
   const actions = await ipcRenderer.invoke(IpcChannels.DRAIN_NOTIFICATION_ACTIONS_CHANNEL);
   if (!Array.isArray(actions)) return;
-  for (const actionEvent of actions) {
-    if (typeof actionEvent !== "object" || actionEvent === null) continue;
-    notificationActionBuffer.dispatch(actionEvent as DesktopNotificationActionEvent);
+  const deliveredIds: number[] = [];
+  for (const action of actions) {
+    if (typeof action !== "object" || action === null) continue;
+    const queuedAction = action as DesktopNotificationQueuedAction;
+    if (typeof queuedAction.id !== "number") continue;
+    if (typeof queuedAction.event !== "object" || queuedAction.event === null) continue;
+    notificationActionBuffer.dispatch(queuedAction.event as DesktopNotificationActionEvent);
+    deliveredIds.push(queuedAction.id);
+  }
+  if (deliveredIds.length > 0) {
+    await ipcRenderer.invoke(IpcChannels.ACK_NOTIFICATION_ACTIONS_CHANNEL, deliveredIds);
   }
 }
 
 function requestNotificationActionDrain() {
-  void drainNotificationActions().catch(() => undefined);
+  notificationActionDrainScheduler.request();
 }
 
 ipcRenderer.on(IpcChannels.NOTIFICATION_ACTION_CHANNEL, () => {

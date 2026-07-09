@@ -1,5 +1,9 @@
 import { assert, describe, it } from "@effect/vitest";
-import { PRIMARY_LOCAL_ENVIRONMENT_ID, type ServerDeviceNotification } from "@t3tools/contracts";
+import {
+  PRIMARY_LOCAL_ENVIRONMENT_ID,
+  type DesktopNotificationQueuedAction,
+  type ServerDeviceNotification,
+} from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
@@ -86,6 +90,10 @@ function requestBodyJson(request: HttpClientRequest.HttpClientRequest): unknown 
   const rawBody = (request.body as { readonly body?: Uint8Array }).body;
   assert.instanceOf(rawBody, Uint8Array);
   return JSON.parse(textDecoder.decode(rawBody));
+}
+
+function queuedEvents(actions: readonly DesktopNotificationQueuedAction[]) {
+  return actions.map((action) => action.event);
 }
 
 const notification: ServerDeviceNotification = {
@@ -220,7 +228,7 @@ describe("ElectronNotification", () => {
       assert.deepEqual(targetWindow.webContents.send.mock.calls, [
         [IpcChannels.NOTIFICATION_ACTION_CHANNEL],
       ]);
-      assert.deepEqual(yield* notifications.drainActions, [
+      assert.deepEqual(queuedEvents(yield* notifications.drainActions), [
         {
           notificationId: "notification-1",
           action: "opened",
@@ -254,7 +262,7 @@ describe("ElectronNotification", () => {
       assert.deepEqual(targetWindow.webContents.send.mock.calls, [
         [IpcChannels.NOTIFICATION_ACTION_CHANNEL],
       ]);
-      assert.deepEqual(yield* notifications.drainActions, [
+      assert.deepEqual(queuedEvents(yield* notifications.drainActions), [
         {
           notificationId: "notification-1",
           action: "opened",
@@ -279,7 +287,7 @@ describe("ElectronNotification", () => {
       assert.deepEqual(targetWindow.webContents.send.mock.calls, [
         [IpcChannels.NOTIFICATION_ACTION_CHANNEL],
       ]);
-      assert.deepEqual(yield* notifications.drainActions, [
+      assert.deepEqual(queuedEvents(yield* notifications.drainActions), [
         {
           notificationId: "notification-1",
           action: "opened",
@@ -316,7 +324,7 @@ describe("ElectronNotification", () => {
         action: "closed",
       });
       assert.deepEqual(sendAllMock.mock.calls, [[IpcChannels.NOTIFICATION_ACTION_CHANNEL]]);
-      assert.deepEqual(yield* notifications.drainActions, [
+      assert.deepEqual(queuedEvents(yield* notifications.drainActions), [
         {
           notificationId: "notification-1",
           action: "closed",
@@ -326,7 +334,7 @@ describe("ElectronNotification", () => {
     }).pipe(Effect.provide(makeLayer({ ackRequests })));
   });
 
-  it.effect("keeps action payloads in main until the renderer drains them", () =>
+  it.effect("keeps action payloads in main until the renderer acknowledges them", () =>
     Effect.gen(function* () {
       const notifications = yield* ElectronNotification.ElectronNotification;
 
@@ -335,16 +343,81 @@ describe("ElectronNotification", () => {
       yield* Effect.yieldNow;
       yield* Effect.yieldNow;
 
-      assert.deepEqual(yield* notifications.drainActions, [
+      const drained = yield* notifications.drainActions;
+      assert.deepEqual(queuedEvents(drained), [
         {
           notificationId: "notification-1",
           action: "opened",
           deepLink: "/environment/thread",
         },
       ]);
+      assert.deepEqual(queuedEvents(yield* notifications.drainActions), [
+        {
+          notificationId: "notification-1",
+          action: "opened",
+          deepLink: "/environment/thread",
+        },
+      ]);
+      yield* notifications.ackActions(drained.map((action) => action.id));
       assert.deepEqual(yield* notifications.drainActions, []);
     }).pipe(Effect.provide(makeLayer())),
   );
+
+  it.effect("ignores delayed close events from replaced native notifications", () =>
+    Effect.gen(function* () {
+      const notifications = yield* ElectronNotification.ElectronNotification;
+
+      yield* notifications.show(notification);
+      const firstRendered = notificationInstances[0]!;
+      firstRendered.close.mockImplementation(() => undefined);
+
+      yield* notifications.show(notification);
+      const secondRendered = notificationInstances[1]!;
+      secondRendered.close.mockImplementation(() => undefined);
+
+      yield* notifications.close(notification.notificationId);
+      firstRendered.listeners.get("close")?.();
+      secondRendered.listeners.get("close")?.();
+      yield* Effect.yieldNow;
+      yield* Effect.yieldNow;
+
+      assert.equal(secondRendered.close.mock.calls.length, 1);
+      assert.deepEqual(sendAllMock.mock.calls, []);
+      assert.deepEqual(yield* notifications.drainActions, []);
+    }).pipe(Effect.provide(makeLayer())),
+  );
+
+  it.effect("does not let stale replacement suppression hide a user close", () => {
+    const ackRequests: HttpClientRequest.HttpClientRequest[] = [];
+    return Effect.gen(function* () {
+      const notifications = yield* ElectronNotification.ElectronNotification;
+
+      yield* notifications.show(notification);
+      const firstRendered = notificationInstances[0]!;
+      firstRendered.close.mockImplementation(() => undefined);
+
+      yield* notifications.show(notification);
+      const secondRendered = notificationInstances[1]!;
+      firstRendered.listeners.get("close")?.();
+      secondRendered.listeners.get("close")?.();
+      yield* Effect.yieldNow;
+      yield* Effect.yieldNow;
+
+      assert.equal(ackRequests.length, 1);
+      assert.deepEqual(requestBodyJson(ackRequests[0]!), {
+        notificationId: "notification-1",
+        ackToken: "ack-token",
+        action: "closed",
+      });
+      assert.deepEqual(queuedEvents(yield* notifications.drainActions), [
+        {
+          notificationId: "notification-1",
+          action: "closed",
+          deepLink: "/environment/thread",
+        },
+      ]);
+    }).pipe(Effect.provide(makeLayer({ ackRequests })));
+  });
 
   it.effect("does not claim delivery when native notifications are unsupported", () =>
     Effect.gen(function* () {

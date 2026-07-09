@@ -36,6 +36,7 @@ import {
   setUpdateChannel,
 } from "./methods/updates.ts";
 import {
+  ackNotificationActions,
   confirm,
   closeNotification,
   drainNotificationActions,
@@ -97,6 +98,7 @@ export const installDesktopIpcHandlers = Effect.fn("desktop.ipc.installHandlers"
   yield* ipc.handle(showNotification);
   yield* ipc.handle(closeNotification);
   yield* ipc.handle(drainNotificationActions);
+  yield* ipc.handle(ackNotificationActions);
   yield* ipc.handle(getUpdateState);
   yield* ipc.handle(setUpdateChannel);
   yield* ipc.handle(downloadUpdate);

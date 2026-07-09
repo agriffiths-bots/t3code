@@ -1,5 +1,6 @@
 import type {
   DesktopNotificationActionEvent,
+  DesktopNotificationQueuedAction,
   ServerDeviceNotification,
   ServerNotificationAckAction,
 } from "@t3tools/contracts";
@@ -22,7 +23,8 @@ export class ElectronNotification extends Context.Service<
     readonly isSupported: Effect.Effect<boolean>;
     readonly show: (notification: ServerDeviceNotification) => Effect.Effect<boolean>;
     readonly close: (notificationId: string) => Effect.Effect<void>;
-    readonly drainActions: Effect.Effect<readonly DesktopNotificationActionEvent[]>;
+    readonly drainActions: Effect.Effect<readonly DesktopNotificationQueuedAction[]>;
+    readonly ackActions: (ids: readonly number[]) => Effect.Effect<void>;
   }
 >()("@t3tools/desktop/electron/ElectronNotification") {}
 
@@ -46,8 +48,9 @@ export const make = Effect.gen(function* () {
   const desktopWindow = yield* DesktopWindow.DesktopWindow;
   const httpClient = yield* HttpClient.HttpClient;
   const activeNotifications = yield* Ref.make(new Map<string, NativeNotificationEntry>());
-  const pendingActions = yield* Ref.make<DesktopNotificationActionEvent[]>([]);
-  const suppressedCloseNotifications = new Set<string>();
+  const pendingActions = yield* Ref.make<DesktopNotificationQueuedAction[]>([]);
+  const nextActionId = yield* Ref.make(1);
+  const suppressedCloseNotifications = new Set<Electron.Notification>();
   const context = yield* Effect.context();
   const runFork = Effect.runForkWith(context);
 
@@ -89,10 +92,21 @@ export const make = Effect.gen(function* () {
   });
 
   const enqueueAction = (event: DesktopNotificationActionEvent) =>
-    Ref.update(pendingActions, (current) => {
-      const next = [...current, event];
-      return next.slice(Math.max(0, next.length - MAX_PENDING_NOTIFICATION_ACTIONS));
+    Effect.gen(function* () {
+      const id = yield* Ref.getAndUpdate(nextActionId, (current) => current + 1);
+      yield* Ref.update(pendingActions, (current) => {
+        const next = [...current, { id, event }];
+        return next.slice(Math.max(0, next.length - MAX_PENDING_NOTIFICATION_ACTIONS));
+      });
     });
+
+  const ackActions = (ids: readonly number[]) =>
+    Ref.update(pendingActions, (current) => {
+      const ackedIds = new Set(ids);
+      return current.filter((action) => !ackedIds.has(action.id));
+    });
+
+  const drainActions = Ref.get(pendingActions);
 
   const signalActionAvailableToWindow = Effect.fn(
     "desktop.notification.signalActionAvailableToWindow",
@@ -128,11 +142,18 @@ export const make = Effect.gen(function* () {
     yield* electronWindow.sendAll(IpcChannels.NOTIFICATION_ACTION_CHANNEL);
   });
 
-  const forgetNotification = (notificationId: string) =>
-    Ref.update(activeNotifications, (current) => {
+  const forgetNotification = (notificationId: string, rendered?: Electron.Notification) =>
+    Ref.modify(activeNotifications, (current) => {
+      const currentEntry = current.get(notificationId);
+      if (!currentEntry) {
+        return [false, current];
+      }
+      if (rendered !== undefined && currentEntry?.rendered !== rendered) {
+        return [false, current];
+      }
       const next = new Map(current);
       next.delete(notificationId);
-      return next;
+      return [true, next];
     });
 
   const closeNotification = Effect.fn("desktop.notification.close")(function* (
@@ -144,7 +165,7 @@ export const make = Effect.gen(function* () {
       return;
     }
     if (suppressAction) {
-      suppressedCloseNotifications.add(notificationId);
+      suppressedCloseNotifications.add(active.rendered);
     }
     active.rendered.close();
   });
@@ -165,7 +186,7 @@ export const make = Effect.gen(function* () {
     });
 
     rendered.on("click", () => {
-      suppressedCloseNotifications.add(notification.notificationId);
+      suppressedCloseNotifications.add(rendered);
       runDetached(acknowledgeNotification(notification, "opened"));
       runDetached(
         Effect.gen(function* () {
@@ -181,8 +202,12 @@ export const make = Effect.gen(function* () {
     rendered.on("close", () => {
       runDetached(
         Effect.gen(function* () {
-          yield* forgetNotification(notification.notificationId);
-          if (suppressedCloseNotifications.delete(notification.notificationId)) {
+          const wasActive = yield* forgetNotification(notification.notificationId, rendered);
+          if (!wasActive) {
+            suppressedCloseNotifications.delete(rendered);
+            return;
+          }
+          if (suppressedCloseNotifications.delete(rendered)) {
             return;
           }
           runDetached(acknowledgeNotification(notification, "closed"));
@@ -208,7 +233,8 @@ export const make = Effect.gen(function* () {
     isSupported: Effect.sync(canShowNativeNotifications),
     show,
     close: (notificationId) => closeNotification(notificationId, true),
-    drainActions: Ref.getAndSet(pendingActions, []),
+    drainActions,
+    ackActions,
   });
 });
 

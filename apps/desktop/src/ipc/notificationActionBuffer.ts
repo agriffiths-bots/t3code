@@ -36,3 +36,41 @@ export function createDesktopNotificationActionBuffer() {
     hasListeners: () => listeners.size > 0,
   };
 }
+
+export function createDesktopNotificationActionDrainScheduler(input: {
+  readonly hasListeners: () => boolean;
+  readonly drain: () => Promise<void>;
+}) {
+  let inFlight = false;
+  let requestedAgain = false;
+
+  const run = async () => {
+    try {
+      do {
+        requestedAgain = false;
+        await input.drain();
+      } while (requestedAgain && input.hasListeners());
+    } catch {
+      requestedAgain = false;
+    } finally {
+      inFlight = false;
+      if (requestedAgain && input.hasListeners()) {
+        request();
+      }
+    }
+  };
+
+  const request = () => {
+    if (!input.hasListeners()) {
+      return;
+    }
+    if (inFlight) {
+      requestedAgain = true;
+      return;
+    }
+    inFlight = true;
+    void run();
+  };
+
+  return { request };
+}
