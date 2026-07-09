@@ -677,7 +677,7 @@ it.effect("rejects route-minted peer tokens when source session confirmation fai
   ).pipe(Effect.provide(NodeHttpServer.layerTest)),
 );
 
-it.effect("rejects route-minted peer tokens without a source environment", () =>
+it.effect("authenticates route-minted peer token requests before validating bodies", () =>
   Effect.scoped(
     Effect.gen(function* () {
       const serverLayer = Layer.mergeAll(
@@ -702,12 +702,53 @@ it.effect("rejects route-minted peer tokens without a source environment", () =>
       });
 
       assert.equal(tokenResponse.status, 400);
-      assert.equal(lastAuthenticatedHttpRequestAuthorization, undefined);
+      assert.equal(lastAuthenticatedHttpRequestAuthorization, "Bearer env-access-token");
       const body = yield* tokenResponse.json;
       assert.deepEqual(body, {
         error: "invalid_request",
         message: "sourceEnvironmentId is required when minting a subagent peer token.",
       });
+    }),
+  ).pipe(Effect.provide(NodeHttpServer.layerTest)),
+);
+
+it.effect("rejects unauthenticated peer-token requests before parsing invalid JSON", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      let authCalls = 0;
+      const rejectingEnvironmentAuth = EnvironmentAuth.EnvironmentAuth.of({
+        ...fakeEnvironmentAuth,
+        authenticateHttpRequest: () => {
+          authCalls += 1;
+          return Effect.fail(
+            new EnvironmentAuth.ServerAuthInvalidCredentialError({
+              reason: "invalid_credential",
+            }),
+          );
+        },
+      });
+      const serverLayer = Layer.mergeAll(
+        mcpPeerTokenRouteLayer,
+        registerPeerPingTool.pipe(Layer.provideMerge(authenticatedTestMcpTransportLayer)),
+        McpHttpServer.McpGetMethodNotAllowedLive,
+      ).pipe(Layer.provide(McpSessionRegistry.layer));
+      yield* HttpRouter.serve(serverLayer, {
+        disableListenLog: true,
+        disableLogger: true,
+      }).pipe(
+        Layer.provide(Layer.succeed(EnvironmentAuth.EnvironmentAuth, rejectingEnvironmentAuth)),
+        Layer.provide(Layer.succeed(ServerEnvironment.ServerEnvironment, fakeEnvironment)),
+        Layer.provide(NodeServices.layer),
+        Layer.build,
+      );
+
+      const httpClient = yield* HttpClient.HttpClient;
+      const tokenResponse = yield* httpClient.post(SUBAGENT_PEER_MCP_TOKEN_PATH, {
+        body: HttpBody.text("{", "application/json"),
+      });
+
+      assert.equal(tokenResponse.status, 401);
+      assert.equal(authCalls, 1);
     }),
   ).pipe(Effect.provide(NodeHttpServer.layerTest)),
 );

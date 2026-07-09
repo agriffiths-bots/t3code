@@ -275,10 +275,14 @@ const dispatchedTurnCommands: Array<Extract<OrchestrationCommand, { type: "threa
 const insertedDispatches: Array<PendingDispatch> = [];
 const insertedRemoteChildren: Array<RemoteChild> = [];
 let remoteChildRows: ReadonlyArray<RemoteChild> = [];
+let remoteChildPollerRows: ReadonlyArray<RemoteChild> | null = null;
 const remoteTerminalDeliveryEvents: Array<"claim" | "enqueue" | "mark" | "release"> = [];
 const remoteTerminalDeliveryClaims = new Map<string, string>();
+let remoteTerminalClaimEntered: Deferred.Deferred<void> | null = null;
 let remoteTerminalDeliveryEntered: Deferred.Deferred<void> | null = null;
 let remoteTerminalDeliveryGate: Deferred.Deferred<void> | null = null;
+let remoteTerminalDeliveryFailure: ThreadStartToolError | null = null;
+let remoteTerminalMarkFailureChild: ThreadId | null = null;
 const updatedRemoteChildren: Array<{
   readonly parentThreadId: ThreadId;
   readonly childEnvironmentId: EnvironmentId;
@@ -602,6 +606,11 @@ const coordinatorLayer = Layer.succeed(ChildThreadCoordinator, {
       if (remoteTerminalDeliveryGate !== null) {
         yield* Deferred.await(remoteTerminalDeliveryGate);
       }
+      if (remoteTerminalDeliveryFailure !== null) {
+        const error = remoteTerminalDeliveryFailure;
+        remoteTerminalDeliveryFailure = null;
+        return yield* error;
+      }
       if (
         enqueuedParentInjections.some(
           (row) =>
@@ -677,13 +686,13 @@ const remoteChildrenLayer = Layer.succeed(RemoteChildRepository, {
   getByChild: () => Effect.succeed(Option.none()),
   listByParent: ({ parentThreadId }) =>
     Effect.succeed(remoteChildRows.filter((row) => row.parentThreadId === parentThreadId)),
-  listAll: () => Effect.succeed(remoteChildRows),
+  listAll: () => Effect.succeed(remoteChildPollerRows ?? remoteChildRows),
   updateStatus: (input) =>
     Effect.sync(() => {
       updatedRemoteChildren.push(input);
     }),
   claimTerminalDelivery: (input) =>
-    Effect.sync(() => {
+    Effect.gen(function* () {
       const index = remoteChildRows.findIndex(
         (row) =>
           row.parentThreadId === input.parentThreadId &&
@@ -704,6 +713,9 @@ const remoteChildrenLayer = Layer.succeed(RemoteChildRepository, {
       if (remoteTerminalDeliveryClaims.has(key)) return Option.none();
       remoteTerminalDeliveryEvents.push("claim");
       remoteTerminalDeliveryClaims.set(key, input.claimId);
+      if (remoteTerminalClaimEntered !== null) {
+        yield* Deferred.succeed(remoteTerminalClaimEntered, void 0);
+      }
       return Option.some(current);
     }),
   releaseTerminalDeliveryClaim: (input) =>
@@ -715,7 +727,7 @@ const remoteChildrenLayer = Layer.succeed(RemoteChildRepository, {
       }
     }),
   markTerminalStatus: (input) =>
-    Effect.sync(() => {
+    Effect.gen(function* () {
       const index = remoteChildRows.findIndex(
         (row) =>
           row.parentThreadId === input.parentThreadId &&
@@ -724,6 +736,11 @@ const remoteChildrenLayer = Layer.succeed(RemoteChildRepository, {
       );
       if (index < 0) return Option.none();
       const current = remoteChildRows[index]!;
+      if (remoteTerminalMarkFailureChild === input.childThreadId) {
+        return yield* new PersistenceSqlError({
+          operation: "RemoteChildRepository.markTerminalStatus:test",
+        });
+      }
       if (
         current.status === "completed" ||
         current.status === "failed" ||
@@ -1688,7 +1705,11 @@ describe("SubagentToolkit", () => {
         const server = yield* McpServer.McpServer;
         peerRegistryPeers = [bearerPeer()];
         remoteChildRows = [remoteChildRow("running")];
+        remoteChildPollerRows = [];
         enqueuedParentInjections.length = 0;
+        updatedRemoteChildren.length = 0;
+        remoteTerminalDeliveryEvents.length = 0;
+        remoteTerminalDeliveryClaims.clear();
         peerHttpHandler = remoteCheckPeerHandler({
           status: "completed",
           turnCount: 2,
@@ -1720,14 +1741,27 @@ describe("SubagentToolkit", () => {
           timedOutCount: 0,
           pending: false,
         });
-        expect(enqueuedParentInjections).toHaveLength(1);
+        expect(enqueuedParentInjections).toHaveLength(0);
+        expect(updatedRemoteChildren).toEqual([
+          expect.objectContaining({
+            parentThreadId,
+            childEnvironmentId: peerEnvironmentId,
+            childThreadId: remoteChildThreadId,
+            status: "completed",
+          }),
+        ]);
+        expect(remoteTerminalDeliveryEvents).toEqual(["claim", "mark"]);
       }),
     ).pipe(
       Effect.ensuring(
         Effect.sync(() => {
           peerRegistryPeers = [];
           remoteChildRows = [];
+          remoteChildPollerRows = null;
           enqueuedParentInjections.length = 0;
+          updatedRemoteChildren.length = 0;
+          remoteTerminalDeliveryEvents.length = 0;
+          remoteTerminalDeliveryClaims.clear();
           peerHttpHandler = null;
         }),
       ),
@@ -1749,7 +1783,11 @@ describe("SubagentToolkit", () => {
             spawnParams: { prompt: "remote running", directory: "/remote/repo", detached: true },
           },
         ];
+        remoteChildPollerRows = [];
         enqueuedParentInjections.length = 0;
+        updatedRemoteChildren.length = 0;
+        remoteTerminalDeliveryEvents.length = 0;
+        remoteTerminalDeliveryClaims.clear();
         peerHttpHandler = remoteCheckPeerHandlerWith((body) => {
           const requestedThreadId = body.params?.arguments?.childThreadId;
           return requestedThreadId === runningChildThreadId
@@ -1804,13 +1842,457 @@ describe("SubagentToolkit", () => {
             }),
           ]),
         );
+        expect(enqueuedParentInjections).toHaveLength(0);
       }),
     ).pipe(
       Effect.ensuring(
         Effect.sync(() => {
           peerRegistryPeers = [];
           remoteChildRows = [];
+          remoteChildPollerRows = null;
           enqueuedParentInjections.length = 0;
+          updatedRemoteChildren.length = 0;
+          remoteTerminalDeliveryEvents.length = 0;
+          remoteTerminalDeliveryClaims.clear();
+          peerHttpHandler = null;
+        }),
+      ),
+      Effect.provide(TestLayer),
+    ),
+  );
+
+  it.effect("restores a remote terminal wake when a sibling wait poll fails", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const server = yield* McpServer.McpServer;
+        const failingChildThreadId = ThreadId.make("thread-remote-child-failing");
+        const wrongThreadId = ThreadId.make("thread-remote-child-wrong");
+        peerRegistryPeers = [bearerPeer()];
+        remoteChildRows = [
+          remoteChildRow("running"),
+          {
+            ...remoteChildRow("running"),
+            childThreadId: failingChildThreadId,
+            spawnParams: { prompt: "remote failing", directory: "/remote/repo", detached: true },
+          },
+        ];
+        remoteChildPollerRows = [];
+        enqueuedParentInjections.length = 0;
+        updatedRemoteChildren.length = 0;
+        remoteTerminalDeliveryEvents.length = 0;
+        remoteTerminalDeliveryClaims.clear();
+        peerHttpHandler = remoteCheckPeerHandlerWith((body) => {
+          const requestedThreadId = body.params?.arguments?.childThreadId;
+          return requestedThreadId === failingChildThreadId
+            ? {
+                threadId: wrongThreadId,
+                status: "completed",
+                turnCount: 1,
+                latestAssistantText: "wrong child",
+              }
+            : {
+                threadId: remoteChildThreadId,
+                status: "completed",
+                turnCount: 2,
+                latestAssistantText: "wait consumed before sibling failed",
+              };
+        });
+
+        const result = yield* server
+          .callTool({
+            name: "t3_wait_subagent",
+            arguments: {
+              childThreadIds: [remoteChildThreadId, failingChildThreadId],
+              timeoutSeconds: 1,
+              mode: "all",
+            },
+          })
+          .pipe(
+            Effect.provideService(McpInvocationContext.McpInvocationContext, invocation),
+            Effect.provideService(McpSchema.McpServerClient, client),
+          );
+
+        expect(result.isError).toBe(true);
+        expect(enqueuedParentInjections).toEqual([
+          {
+            parentThreadId,
+            childThreadId: remoteChildThreadId,
+            status: "completed",
+            finalAssistantText: "wait consumed before sibling failed",
+            error: null,
+          },
+        ]);
+        expect(updatedRemoteChildren).toEqual([
+          expect.objectContaining({
+            parentThreadId,
+            childEnvironmentId: peerEnvironmentId,
+            childThreadId: remoteChildThreadId,
+            status: "completed",
+          }),
+        ]);
+        expect(remoteTerminalDeliveryEvents).toEqual(["claim", "enqueue", "mark"]);
+      }),
+    ).pipe(
+      Effect.ensuring(
+        Effect.sync(() => {
+          peerRegistryPeers = [];
+          remoteChildRows = [];
+          remoteChildPollerRows = null;
+          enqueuedParentInjections.length = 0;
+          updatedRemoteChildren.length = 0;
+          remoteTerminalDeliveryEvents.length = 0;
+          remoteTerminalDeliveryClaims.clear();
+          peerHttpHandler = null;
+        }),
+      ),
+      Effect.provide(TestLayer),
+    ),
+  );
+
+  it.effect("releases a suppressed remote wake claim when restoration enqueue fails", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const server = yield* McpServer.McpServer;
+        const failingChildThreadId = ThreadId.make("thread-remote-child-failing");
+        const wrongThreadId = ThreadId.make("thread-remote-child-wrong");
+        peerRegistryPeers = [bearerPeer()];
+        remoteChildRows = [
+          remoteChildRow("running"),
+          {
+            ...remoteChildRow("running"),
+            childThreadId: failingChildThreadId,
+            spawnParams: { prompt: "remote failing", directory: "/remote/repo", detached: true },
+          },
+        ];
+        remoteChildPollerRows = [];
+        enqueuedParentInjections.length = 0;
+        updatedRemoteChildren.length = 0;
+        remoteTerminalDeliveryEvents.length = 0;
+        remoteTerminalDeliveryClaims.clear();
+        remoteTerminalDeliveryFailure = new ThreadStartToolError({ message: "enqueue failed" });
+        peerHttpHandler = remoteCheckPeerHandlerWith((body) => {
+          const requestedThreadId = body.params?.arguments?.childThreadId;
+          return requestedThreadId === failingChildThreadId
+            ? {
+                threadId: wrongThreadId,
+                status: "completed",
+                turnCount: 1,
+                latestAssistantText: "wrong child",
+              }
+            : {
+                threadId: remoteChildThreadId,
+                status: "completed",
+                turnCount: 2,
+                latestAssistantText: "restore should release on enqueue failure",
+              };
+        });
+
+        const result = yield* server
+          .callTool({
+            name: "t3_wait_subagent",
+            arguments: {
+              childThreadIds: [remoteChildThreadId, failingChildThreadId],
+              timeoutSeconds: 1,
+              mode: "all",
+            },
+          })
+          .pipe(
+            Effect.provideService(McpInvocationContext.McpInvocationContext, invocation),
+            Effect.provideService(McpSchema.McpServerClient, client),
+          );
+
+        expect(result.isError).toBe(true);
+        expect(enqueuedParentInjections).toEqual([]);
+        expect(updatedRemoteChildren).toEqual([]);
+        expect(remoteTerminalDeliveryClaims.size).toBe(0);
+        expect(remoteTerminalDeliveryEvents).toEqual(["claim", "release"]);
+      }),
+    ).pipe(
+      Effect.ensuring(
+        Effect.sync(() => {
+          peerRegistryPeers = [];
+          remoteChildRows = [];
+          remoteChildPollerRows = null;
+          enqueuedParentInjections.length = 0;
+          updatedRemoteChildren.length = 0;
+          remoteTerminalDeliveryEvents.length = 0;
+          remoteTerminalDeliveryClaims.clear();
+          remoteTerminalDeliveryFailure = null;
+          peerHttpHandler = null;
+        }),
+      ),
+      Effect.provide(TestLayer),
+    ),
+  );
+
+  it.effect("returns remote wait results when one terminal mark fails after another succeeds", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const server = yield* McpServer.McpServer;
+        const markFailingChildThreadId = ThreadId.make("thread-remote-child-mark-failing");
+        peerRegistryPeers = [bearerPeer()];
+        remoteChildRows = [
+          remoteChildRow("running"),
+          {
+            ...remoteChildRow("running"),
+            childThreadId: markFailingChildThreadId,
+            spawnParams: {
+              prompt: "remote mark failing",
+              directory: "/remote/repo",
+              detached: true,
+            },
+          },
+        ];
+        remoteChildPollerRows = [];
+        remoteTerminalMarkFailureChild = markFailingChildThreadId;
+        enqueuedParentInjections.length = 0;
+        updatedRemoteChildren.length = 0;
+        remoteTerminalDeliveryEvents.length = 0;
+        remoteTerminalDeliveryClaims.clear();
+        peerHttpHandler = remoteCheckPeerHandlerWith((body) => {
+          const requestedThreadId = body.params?.arguments?.childThreadId;
+          return requestedThreadId === markFailingChildThreadId
+            ? {
+                threadId: markFailingChildThreadId,
+                status: "completed",
+                turnCount: 3,
+                latestAssistantText: "mark failed but caller saw me",
+              }
+            : {
+                threadId: remoteChildThreadId,
+                status: "completed",
+                turnCount: 2,
+                latestAssistantText: "mark succeeded and caller saw me",
+              };
+        });
+
+        const result = yield* server
+          .callTool({
+            name: "t3_wait_subagent",
+            arguments: {
+              childThreadIds: [remoteChildThreadId, markFailingChildThreadId],
+              timeoutSeconds: 1,
+              mode: "all",
+            },
+          })
+          .pipe(
+            Effect.provideService(McpInvocationContext.McpInvocationContext, invocation),
+            Effect.provideService(McpSchema.McpServerClient, client),
+          );
+
+        expect(result.isError).toBe(false);
+        const results = (result.structuredContent as { readonly results?: ReadonlyArray<unknown> })
+          .results;
+        expect(results).toEqual(
+          expect.arrayContaining([
+            expect.objectContaining({
+              childThreadId: remoteChildThreadId,
+              status: "completed",
+              finalAssistantText: "mark succeeded and caller saw me",
+            }),
+            expect.objectContaining({
+              childThreadId: markFailingChildThreadId,
+              status: "completed",
+              finalAssistantText: "mark failed but caller saw me",
+            }),
+          ]),
+        );
+        expect(enqueuedParentInjections).toEqual([]);
+        expect(updatedRemoteChildren).toEqual([
+          expect.objectContaining({
+            parentThreadId,
+            childEnvironmentId: peerEnvironmentId,
+            childThreadId: remoteChildThreadId,
+            status: "completed",
+          }),
+        ]);
+        expect(remoteTerminalDeliveryClaims.size).toBe(0);
+      }),
+    ).pipe(
+      Effect.ensuring(
+        Effect.sync(() => {
+          peerRegistryPeers = [];
+          remoteChildRows = [];
+          remoteChildPollerRows = null;
+          remoteTerminalMarkFailureChild = null;
+          enqueuedParentInjections.length = 0;
+          updatedRemoteChildren.length = 0;
+          remoteTerminalDeliveryEvents.length = 0;
+          remoteTerminalDeliveryClaims.clear();
+          peerHttpHandler = null;
+        }),
+      ),
+      Effect.provide(TestLayer),
+    ),
+  );
+
+  it.effect("restores suppressed remote wake claims when wait is interrupted", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const server = yield* McpServer.McpServer;
+        const runningChildThreadId = ThreadId.make("thread-remote-child-running");
+        const claimEntered = yield* Deferred.make<void>();
+        peerRegistryPeers = [bearerPeer()];
+        remoteChildRows = [
+          remoteChildRow("running"),
+          {
+            ...remoteChildRow("running"),
+            childThreadId: runningChildThreadId,
+            spawnParams: { prompt: "remote running", directory: "/remote/repo", detached: true },
+          },
+        ];
+        remoteChildPollerRows = [];
+        remoteTerminalClaimEntered = claimEntered;
+        enqueuedParentInjections.length = 0;
+        updatedRemoteChildren.length = 0;
+        remoteTerminalDeliveryEvents.length = 0;
+        remoteTerminalDeliveryClaims.clear();
+        peerHttpHandler = remoteCheckPeerHandlerWith((body) => {
+          const requestedThreadId = body.params?.arguments?.childThreadId;
+          return requestedThreadId === runningChildThreadId
+            ? {
+                threadId: runningChildThreadId,
+                status: "running",
+                turnCount: 1,
+                latestAssistantText: null,
+              }
+            : {
+                threadId: remoteChildThreadId,
+                status: "completed",
+                turnCount: 2,
+                latestAssistantText: "interrupted wait restored me",
+              };
+        });
+
+        const fiber = yield* server
+          .callTool({
+            name: "t3_wait_subagent",
+            arguments: {
+              childThreadIds: [remoteChildThreadId, runningChildThreadId],
+              timeoutSeconds: 10,
+              mode: "all",
+            },
+          })
+          .pipe(
+            Effect.provideService(McpInvocationContext.McpInvocationContext, invocation),
+            Effect.provideService(McpSchema.McpServerClient, client),
+            Effect.forkScoped,
+          );
+        yield* Deferred.await(claimEntered);
+        yield* Fiber.interrupt(fiber);
+
+        expect(enqueuedParentInjections).toEqual([
+          {
+            parentThreadId,
+            childThreadId: remoteChildThreadId,
+            status: "completed",
+            finalAssistantText: "interrupted wait restored me",
+            error: null,
+          },
+        ]);
+        expect(updatedRemoteChildren).toEqual([
+          expect.objectContaining({
+            parentThreadId,
+            childEnvironmentId: peerEnvironmentId,
+            childThreadId: remoteChildThreadId,
+            status: "completed",
+          }),
+        ]);
+        expect(remoteTerminalDeliveryClaims.size).toBe(0);
+        expect(remoteTerminalDeliveryEvents).toEqual(["claim", "enqueue", "mark"]);
+      }),
+    ).pipe(
+      Effect.ensuring(
+        Effect.sync(() => {
+          peerRegistryPeers = [];
+          remoteChildRows = [];
+          remoteChildPollerRows = null;
+          remoteTerminalClaimEntered = null;
+          enqueuedParentInjections.length = 0;
+          updatedRemoteChildren.length = 0;
+          remoteTerminalDeliveryEvents.length = 0;
+          remoteTerminalDeliveryClaims.clear();
+          peerHttpHandler = null;
+        }),
+      ),
+      Effect.provide(TestLayer),
+    ),
+  );
+
+  it.effect("does not restore remote terminal wakes claimed by another poller", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const server = yield* McpServer.McpServer;
+        const failingChildThreadId = ThreadId.make("thread-remote-child-failing");
+        const wrongThreadId = ThreadId.make("thread-remote-child-wrong");
+        peerRegistryPeers = [bearerPeer()];
+        remoteChildRows = [
+          remoteChildRow("running"),
+          {
+            ...remoteChildRow("running"),
+            childThreadId: failingChildThreadId,
+            spawnParams: { prompt: "remote failing", directory: "/remote/repo", detached: true },
+          },
+        ];
+        remoteChildPollerRows = [];
+        enqueuedParentInjections.length = 0;
+        updatedRemoteChildren.length = 0;
+        remoteTerminalDeliveryEvents.length = 0;
+        remoteTerminalDeliveryClaims.clear();
+        remoteTerminalDeliveryClaims.set(
+          remoteChildKey({
+            parentThreadId,
+            childEnvironmentId: peerEnvironmentId,
+            childThreadId: remoteChildThreadId,
+          }),
+          "other-claim",
+        );
+        peerHttpHandler = remoteCheckPeerHandlerWith((body) => {
+          const requestedThreadId = body.params?.arguments?.childThreadId;
+          return requestedThreadId === failingChildThreadId
+            ? {
+                threadId: wrongThreadId,
+                status: "completed",
+                turnCount: 1,
+                latestAssistantText: "wrong child",
+              }
+            : {
+                threadId: remoteChildThreadId,
+                status: "completed",
+                turnCount: 2,
+                latestAssistantText: "already claimed elsewhere",
+              };
+        });
+
+        const result = yield* server
+          .callTool({
+            name: "t3_wait_subagent",
+            arguments: {
+              childThreadIds: [remoteChildThreadId, failingChildThreadId],
+              timeoutSeconds: 1,
+              mode: "all",
+            },
+          })
+          .pipe(
+            Effect.provideService(McpInvocationContext.McpInvocationContext, invocation),
+            Effect.provideService(McpSchema.McpServerClient, client),
+          );
+
+        expect(result.isError).toBe(true);
+        expect(enqueuedParentInjections).toEqual([]);
+        expect(updatedRemoteChildren).toEqual([]);
+        expect(remoteTerminalDeliveryEvents).toEqual([]);
+      }),
+    ).pipe(
+      Effect.ensuring(
+        Effect.sync(() => {
+          peerRegistryPeers = [];
+          remoteChildRows = [];
+          remoteChildPollerRows = null;
+          enqueuedParentInjections.length = 0;
+          updatedRemoteChildren.length = 0;
+          remoteTerminalDeliveryEvents.length = 0;
+          remoteTerminalDeliveryClaims.clear();
           peerHttpHandler = null;
         }),
       ),

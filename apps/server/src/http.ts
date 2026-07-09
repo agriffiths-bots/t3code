@@ -269,6 +269,7 @@ export const mcpPeerTokenRouteLayer = HttpRouter.add(
   SUBAGENT_PEER_MCP_TOKEN_PATH,
   Effect.gen(function* () {
     const request = yield* HttpServerRequest.HttpServerRequest;
+    const session = yield* authenticateRawRequestWithScope(request, AuthOrchestrationOperateScope);
     const body = yield* request.json.pipe(
       Effect.flatMap(Schema.decodeUnknownEffect(SubagentPeerMcpTokenRequest)),
       Effect.orElseSucceed(() => ({}) as SubagentPeerMcpTokenRequest),
@@ -282,7 +283,6 @@ export const mcpPeerTokenRouteLayer = HttpRouter.add(
         { status: 400 },
       );
     }
-    const session = yield* authenticateRawRequestWithScope(request, AuthOrchestrationOperateScope);
     const issued = yield* McpSessionRegistry.issueActiveMcpPeerCredential({
       sourceSessionId: session.sessionId,
       sourceEnvironmentId: body.sourceEnvironmentId,

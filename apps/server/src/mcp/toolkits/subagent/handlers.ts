@@ -787,9 +787,86 @@ const releaseRemoteCompletionClaim = (
       ),
     );
 
-const pollRemoteChild = Effect.fn("SubagentToolkit.pollRemoteChild")(function* (
+type RemoteTerminalStatusUpdate = {
+  readonly parentThreadId: ThreadId;
+  readonly childEnvironmentId: EnvironmentId;
+  readonly childThreadId: ThreadId;
+  readonly status: RemoteChildStatus;
+  readonly lastPolledAt: IsoDateTime;
+  readonly updatedAt: IsoDateTime;
+};
+
+type SuppressedRemoteTerminalWake = {
+  readonly child: RemoteChild;
+  readonly check: CheckSubagentOutputType;
+  readonly claimId: string;
+  readonly update: RemoteTerminalStatusUpdate;
+};
+
+const markRemoteTerminalClaim = (runtime: SubagentRuntime, input: SuppressedRemoteTerminalWake) =>
+  runtime.remoteChildren.markTerminalStatus({ ...input.update, claimId: input.claimId }).pipe(
+    Effect.mapError((error) => toToolError(error, "Failed to update remote child.")),
+    Effect.flatMap((marked) =>
+      Option.isSome(marked)
+        ? Effect.void
+        : Effect.fail(fail("Remote child completion claim was lost before status update.")),
+    ),
+  );
+
+const releaseSuppressedRemoteTerminalWake = (
+  runtime: SubagentRuntime,
+  input: SuppressedRemoteTerminalWake,
+) =>
+  releaseRemoteCompletionClaim(runtime, {
+    child: input.child,
+    claimId: input.claimId,
+    updatedAt: input.update.updatedAt,
+  });
+
+const markSuppressedRemoteTerminalWake = (
+  runtime: SubagentRuntime,
+  input: SuppressedRemoteTerminalWake,
+) =>
+  markRemoteTerminalClaim(runtime, input).pipe(
+    Effect.catch((error) =>
+      releaseSuppressedRemoteTerminalWake(runtime, input).pipe(Effect.andThen(Effect.fail(error))),
+    ),
+  );
+
+const restoreSuppressedRemoteTerminalWake = (
+  runtime: SubagentRuntime,
+  input: SuppressedRemoteTerminalWake,
+) =>
+  Effect.uninterruptible(
+    deliverRemoteCompletion(runtime, input.child, input.check).pipe(
+      Effect.catch((error) =>
+        releaseSuppressedRemoteTerminalWake(runtime, input).pipe(
+          Effect.andThen(Effect.fail(error)),
+        ),
+      ),
+      Effect.andThen(
+        markRemoteTerminalClaim(runtime, input).pipe(
+          Effect.catch((error) =>
+            releaseSuppressedRemoteTerminalWake(runtime, input).pipe(
+              Effect.andThen(Effect.fail(error)),
+            ),
+          ),
+        ),
+      ),
+    ),
+  );
+
+const pollRemoteChildWithDeliveryResult = Effect.fn(
+  "SubagentToolkit.pollRemoteChildWithDeliveryResult",
+)(function* (
   runtime: SubagentRuntime,
   child: RemoteChild,
+  options?: {
+    readonly deliverTerminalWake?: boolean;
+    readonly onSuppressedTerminalWake?: (
+      suppressed: SuppressedRemoteTerminalWake,
+    ) => Effect.Effect<void>;
+  },
 ) {
   const callResult = yield* callRemoteChildTool(runtime, child, {
     name: "t3_check_subagent",
@@ -818,7 +895,9 @@ const pollRemoteChild = Effect.fn("SubagentToolkit.pollRemoteChild")(function* (
   if (isRemoteTerminalStatus(nextStatus)) {
     if (!isRemoteTerminalStatus(child.status)) {
       const claimId = yield* runtime.crypto.randomUUIDv4.pipe(Effect.orDie);
-      const claimed = yield* runtime.remoteChildren
+      const suppressed = { child, check, claimId, update } satisfies SuppressedRemoteTerminalWake;
+      const deliverTerminalWake = options?.deliverTerminalWake ?? true;
+      const claimEffect = runtime.remoteChildren
         .claimTerminalDelivery({
           parentThreadId: child.parentThreadId,
           childEnvironmentId: child.childEnvironmentId,
@@ -834,38 +913,54 @@ const pollRemoteChild = Effect.fn("SubagentToolkit.pollRemoteChild")(function* (
             toToolError(error, "Failed to claim remote child completion delivery."),
           ),
         );
+      const claimed = yield* deliverTerminalWake
+        ? claimEffect
+        : Effect.uninterruptible(
+            claimEffect.pipe(
+              Effect.tap((claimed) =>
+                Option.isSome(claimed) && options?.onSuppressedTerminalWake !== undefined
+                  ? options.onSuppressedTerminalWake(suppressed)
+                  : Effect.void,
+              ),
+            ),
+          );
       if (Option.isSome(claimed)) {
+        if (!deliverTerminalWake) {
+          return {
+            check,
+            suppressedTerminalWake: suppressed,
+          };
+        }
         yield* Effect.uninterruptible(
           deliverRemoteCompletion(runtime, child, check).pipe(
             Effect.catch((error) =>
-              releaseRemoteCompletionClaim(runtime, {
-                child,
-                claimId,
-                updatedAt: IsoDateTime.make(updatedAt),
-              }).pipe(Effect.andThen(Effect.fail(error))),
-            ),
-            Effect.andThen(
-              runtime.remoteChildren.markTerminalStatus({ ...update, claimId }).pipe(
-                Effect.mapError((error) => toToolError(error, "Failed to update remote child.")),
-                Effect.flatMap((marked) =>
-                  Option.isSome(marked)
-                    ? Effect.void
-                    : Effect.fail(
-                        fail("Remote child completion claim was lost before status update."),
-                      ),
-                ),
+              releaseSuppressedRemoteTerminalWake(runtime, suppressed).pipe(
+                Effect.andThen(Effect.fail(error)),
               ),
             ),
+            Effect.andThen(markRemoteTerminalClaim(runtime, suppressed)),
           ),
         );
+        return {
+          check,
+          suppressedTerminalWake: null,
+        };
       }
     }
-    return check;
+    return { check, suppressedTerminalWake: null };
   }
   yield* runtime.remoteChildren
     .updateStatus(update)
     .pipe(Effect.mapError((error) => toToolError(error, "Failed to update remote child.")));
-  return check;
+  return { check, suppressedTerminalWake: null };
+});
+
+const pollRemoteChild = Effect.fn("SubagentToolkit.pollRemoteChild")(function* (
+  runtime: SubagentRuntime,
+  child: RemoteChild,
+) {
+  const result = yield* pollRemoteChildWithDeliveryResult(runtime, child);
+  return result.check;
 });
 
 const callRemoteSpawnTool = (
@@ -917,55 +1012,127 @@ const waitRemoteSubagents = Effect.fn("SubagentToolkit.waitRemoteSubagents")(fun
   readonly autoPromoteDeadlineMs: number;
   readonly resumeToken: string | undefined;
 }) {
-  const sliceStartMs = yield* Effect.clockWith((clock) => clock.currentTimeMillis);
-  const autoPromoteDeadlineWasActive = input.autoPromoteDeadlineMs <= input.callerDeadlineMs;
-  const sliceDeadlineMs = Math.min(
-    input.callerDeadlineMs,
-    input.autoPromoteDeadlineMs,
-    sliceStartMs + WAIT_SLICE_SECONDS * 1_000,
-  );
-  let rows: WaitSubagentOutputType["results"] = [];
-  let promoted = false;
+  const suppressedTerminalWakes = new Map<string, SuppressedRemoteTerminalWake>();
 
-  while (true) {
-    const checks = yield* Effect.forEach(
-      input.children,
-      (child) =>
-        pollRemoteChild(input.runtime, child).pipe(Effect.map((check) => ({ child, check }))),
-      { concurrency: "unbounded" },
+  const restoreAllSuppressedTerminalWakes = (reason: string) =>
+    Effect.gen(function* () {
+      const pending = Array.from(suppressedTerminalWakes.values());
+      if (pending.length === 0) return;
+      const restoreExits = yield* Effect.forEach(
+        pending,
+        (suppressed) =>
+          restoreSuppressedRemoteTerminalWake(input.runtime, suppressed).pipe(Effect.exit),
+        { concurrency: "unbounded" },
+      );
+      suppressedTerminalWakes.clear();
+      const restoreFailure = restoreExits.find(Exit.isFailure);
+      if (restoreFailure !== undefined) {
+        yield* Effect.logWarning("failed to restore remote terminal wake after wait exit", {
+          reason,
+          cause: Cause.pretty(restoreFailure.cause),
+        });
+      }
+    }).pipe(
+      Effect.catchCause((cause) =>
+        Effect.logWarning("failed to clean up suppressed remote terminal wakes", {
+          reason,
+          cause: Cause.pretty(cause),
+        }),
+      ),
     );
-    const afterPollMs = yield* Effect.clockWith((clock) => clock.currentTimeMillis);
-    promoted =
-      autoPromoteDeadlineWasActive &&
-      afterPollMs >= input.autoPromoteDeadlineMs &&
-      checks.some(({ check }) => !isRemoteTerminalStatus(check.status));
-    rows = checks.map(({ child, check }) => {
-      const terminal = isRemoteTerminalStatus(check.status);
-      const status = terminal
-        ? check.status
-        : promoted
-          ? "running"
-          : afterPollMs >= input.callerDeadlineMs
-            ? "timeout"
-            : "pending";
-      return remoteWaitRow({ child, check, status, promoted: promoted && !terminal });
-    });
-    const pending = promoted ? false : pendingForMode(rows, input.mode);
-    if (!pending || afterPollMs >= sliceDeadlineMs) {
-      const settledCount = rows.filter((row) => isWaitTerminal(row.status)).length;
-      const timedOutCount = promoted ? 0 : rows.filter((row) => row.status === "timeout").length;
-      return {
-        results: rows,
-        settledCount,
-        timedOutCount,
-        pending: promoted ? false : pending,
-        resumeToken: `${input.waitStartMs}:${input.resumeToken ?? "remote"}`,
-        ...(promoted ? { promoted: true } : {}),
-      } satisfies WaitSubagentOutputType;
+
+  return yield* Effect.gen(function* () {
+    const sliceStartMs = yield* Effect.clockWith((clock) => clock.currentTimeMillis);
+    const autoPromoteDeadlineWasActive = input.autoPromoteDeadlineMs <= input.callerDeadlineMs;
+    const sliceDeadlineMs = Math.min(
+      input.callerDeadlineMs,
+      input.autoPromoteDeadlineMs,
+      sliceStartMs + WAIT_SLICE_SECONDS * 1_000,
+    );
+    let rows: WaitSubagentOutputType["results"] = [];
+    let promoted = false;
+
+    while (true) {
+      const checkExits = yield* Effect.forEach(
+        input.children,
+        (child) =>
+          pollRemoteChildWithDeliveryResult(input.runtime, child, {
+            deliverTerminalWake: false,
+            onSuppressedTerminalWake: (suppressed) =>
+              Effect.sync(() => {
+                suppressedTerminalWakes.set(String(suppressed.child.childThreadId), suppressed);
+              }),
+          }).pipe(
+            Effect.map((result) => ({ child, ...result })),
+            Effect.exit,
+          ),
+        { concurrency: "unbounded" },
+      );
+      const successes = checkExits.flatMap((exit) => (Exit.isSuccess(exit) ? [exit.value] : []));
+      for (const success of successes) {
+        if (success.suppressedTerminalWake !== null) {
+          suppressedTerminalWakes.set(
+            String(success.suppressedTerminalWake.child.childThreadId),
+            success.suppressedTerminalWake,
+          );
+        }
+      }
+      const failed = checkExits.find(Exit.isFailure);
+      if (failed !== undefined) {
+        yield* restoreAllSuppressedTerminalWakes("wait poll failure");
+        return yield* Effect.failCause(failed.cause);
+      }
+      const checks = successes;
+      const afterPollMs = yield* Effect.clockWith((clock) => clock.currentTimeMillis);
+      promoted =
+        autoPromoteDeadlineWasActive &&
+        afterPollMs >= input.autoPromoteDeadlineMs &&
+        checks.some(({ check }) => !isRemoteTerminalStatus(check.status));
+      rows = checks.map(({ child, check }) => {
+        const terminal = isRemoteTerminalStatus(check.status);
+        const status = terminal
+          ? check.status
+          : promoted
+            ? "running"
+            : afterPollMs >= input.callerDeadlineMs
+              ? "timeout"
+              : "pending";
+        return remoteWaitRow({ child, check, status, promoted: promoted && !terminal });
+      });
+      const pending = promoted ? false : pendingForMode(rows, input.mode);
+      if (!pending || afterPollMs >= sliceDeadlineMs) {
+        const markExits = yield* Effect.forEach(
+          Array.from(suppressedTerminalWakes.values()),
+          (suppressed) =>
+            markSuppressedRemoteTerminalWake(input.runtime, suppressed).pipe(Effect.exit),
+          { concurrency: "unbounded" },
+        );
+        suppressedTerminalWakes.clear();
+        const markFailure = markExits.find(Exit.isFailure);
+        if (markFailure !== undefined) {
+          yield* Effect.logWarning("failed to mark remote wait completion delivered", {
+            cause: Cause.pretty(markFailure.cause),
+          });
+        }
+        const settledCount = rows.filter((row) => isWaitTerminal(row.status)).length;
+        const timedOutCount = promoted ? 0 : rows.filter((row) => row.status === "timeout").length;
+        return {
+          results: rows,
+          settledCount,
+          timedOutCount,
+          pending: promoted ? false : pending,
+          resumeToken: `${input.waitStartMs}:${input.resumeToken ?? "remote"}`,
+          ...(promoted ? { promoted: true } : {}),
+        } satisfies WaitSubagentOutputType;
+      }
+      const sleepMs = Math.max(1, Math.min(1_000, sliceDeadlineMs - afterPollMs));
+      yield* Effect.sleep(Duration.millis(sleepMs));
     }
-    const sleepMs = Math.max(1, Math.min(1_000, sliceDeadlineMs - afterPollMs));
-    yield* Effect.sleep(Duration.millis(sleepMs));
-  }
+  }).pipe(
+    Effect.onExit((exit) =>
+      Exit.isSuccess(exit) ? Effect.void : restoreAllSuppressedTerminalWakes("wait interrupted"),
+    ),
+  );
 });
 
 const pollRemoteChildrenOnce = Effect.fn("SubagentToolkit.pollRemoteChildrenOnce")(function* (
