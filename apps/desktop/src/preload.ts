@@ -1,5 +1,6 @@
 import type {
   DesktopBridge,
+  DesktopNotificationActionEvent,
   DesktopPreviewPointerEvent,
   DesktopPreviewRecordingFrame,
   DesktopPreviewTabState,
@@ -8,8 +9,16 @@ import { exposeClerkBridge } from "@clerk/electron/preload";
 import { contextBridge, ipcRenderer } from "electron";
 
 import * as IpcChannels from "./ipc/channels.ts";
+import { createDesktopNotificationActionBuffer } from "./ipc/notificationActionBuffer.ts";
 
 exposeClerkBridge({ passkeys: true });
+
+const notificationActionBuffer = createDesktopNotificationActionBuffer();
+
+ipcRenderer.on(IpcChannels.NOTIFICATION_ACTION_CHANNEL, (_event, actionEvent: unknown) => {
+  if (typeof actionEvent !== "object" || actionEvent === null) return;
+  notificationActionBuffer.dispatch(actionEvent as DesktopNotificationActionEvent);
+});
 
 function unwrapEnsureSshEnvironmentResult(result: unknown) {
   if (
@@ -111,6 +120,12 @@ contextBridge.exposeInMainWorld("desktopBridge", {
       ...(position === undefined ? {} : { position }),
     }),
   openExternal: (url: string) => ipcRenderer.invoke(IpcChannels.OPEN_EXTERNAL_CHANNEL, url),
+  isNotificationSupported: () => ipcRenderer.invoke(IpcChannels.IS_NOTIFICATION_SUPPORTED_CHANNEL),
+  showNotification: (notification) =>
+    ipcRenderer.invoke(IpcChannels.SHOW_NOTIFICATION_CHANNEL, notification),
+  closeNotification: (notificationId) =>
+    ipcRenderer.invoke(IpcChannels.CLOSE_NOTIFICATION_CHANNEL, notificationId),
+  onNotificationAction: (listener) => notificationActionBuffer.subscribe(listener),
   onMenuAction: (listener) => {
     const wrappedListener = (_event: Electron.IpcRendererEvent, action: unknown) => {
       if (typeof action !== "string") return;

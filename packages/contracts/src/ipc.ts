@@ -34,6 +34,7 @@ import type {
 import type { ProviderInstanceId } from "./providerInstance.ts";
 import type {
   ServerConfig,
+  ServerDeviceNotification,
   ServerProcessDiagnosticsResult,
   ServerProcessResourceHistoryInput,
   ServerProcessResourceHistoryResult,
@@ -45,6 +46,7 @@ import type {
   ServerTraceDiagnosticsResult,
   ServerUpsertKeybindingResult,
 } from "./server.ts";
+import { ServerNotificationAckAction } from "./server.ts";
 import type {
   TerminalAttachInput,
   TerminalAttachStreamEvent,
@@ -979,6 +981,13 @@ export const DesktopCloudflareAccessCredentialsInstallInputSchema = Schema.Struc
 export type DesktopCloudflareAccessCredentialsInstallInput =
   typeof DesktopCloudflareAccessCredentialsInstallInputSchema.Type;
 
+export const DesktopNotificationActionEventSchema = Schema.Struct({
+  notificationId: Schema.String,
+  action: ServerNotificationAckAction,
+  deepLink: Schema.optionalKey(Schema.String),
+});
+export type DesktopNotificationActionEvent = typeof DesktopNotificationActionEventSchema.Type;
+
 export interface DesktopBridge {
   getAppBranding: () => DesktopAppBranding | null;
   // One bootstrap per pool instance currently registered with bootstrap
@@ -1037,6 +1046,10 @@ export interface DesktopBridge {
     position?: { x: number; y: number },
   ) => Promise<T | null>;
   openExternal: (url: string) => Promise<boolean>;
+  isNotificationSupported?: () => Promise<boolean>;
+  showNotification?: (notification: ServerDeviceNotification) => Promise<boolean>;
+  closeNotification?: (notificationId: string) => Promise<void>;
+  onNotificationAction?: (listener: (event: DesktopNotificationActionEvent) => void) => () => void;
   onMenuAction: (listener: (action: string) => void) => () => void;
   getUpdateState: () => Promise<DesktopUpdateState>;
   setUpdateChannel: (channel: DesktopUpdateChannel) => Promise<DesktopUpdateState>;

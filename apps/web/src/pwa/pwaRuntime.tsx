@@ -1,5 +1,6 @@
 import { useAtomValue } from "@effect/atom-react";
 import type {
+  DesktopBridge,
   EnvironmentId,
   ServerDeviceNotification,
   ServerNotificationStreamEvent,
@@ -121,6 +122,19 @@ function shouldRunPwaRuntime(): boolean {
   );
 }
 
+export async function canUseNativeDesktopNotifications(
+  bridge: Pick<DesktopBridge, "isNotificationSupported" | "showNotification"> | undefined,
+): Promise<boolean> {
+  if (!bridge?.showNotification || !bridge.isNotificationSupported) {
+    return false;
+  }
+  try {
+    return await bridge.isNotificationSupported();
+  } catch {
+    return false;
+  }
+}
+
 function deviceLabel(): string {
   if (window.desktopBridge) {
     return "Desktop app";
@@ -216,7 +230,7 @@ function PwaRuntimeForEnvironment({ environmentId }: { readonly environmentId: E
     [ackNotification, environmentId],
   );
 
-  const showDesktopNotification = useCallback(
+  const showRendererDesktopNotification = useCallback(
     (notification: ServerDeviceNotification) => {
       if (
         !window.desktopBridge ||
@@ -255,6 +269,30 @@ function PwaRuntimeForEnvironment({ environmentId }: { readonly environmentId: E
     [acknowledge],
   );
 
+  const showDesktopNotification = useCallback(
+    (notification: ServerDeviceNotification) => {
+      const bridge = window.desktopBridge;
+      if (!bridge) {
+        return;
+      }
+
+      if (bridge.showNotification) {
+        void bridge.showNotification(notification).then(
+          (shown) => {
+            if (!shown) {
+              showRendererDesktopNotification(notification);
+            }
+          },
+          () => showRendererDesktopNotification(notification),
+        );
+        return;
+      }
+
+      showRendererDesktopNotification(notification);
+    },
+    [showRendererDesktopNotification],
+  );
+
   useEffect(() => {
     if (!notificationEvent || notificationEvent === lastEventRef.current) {
       return;
@@ -266,9 +304,26 @@ function PwaRuntimeForEnvironment({ environmentId }: { readonly environmentId: E
     }
 
     suppressedCloseAcks.current.add(notificationEvent.notificationId);
+    void window.desktopBridge?.closeNotification?.(notificationEvent.notificationId);
     activeNotifications.current.get(notificationEvent.notificationId)?.close();
     activeNotifications.current.delete(notificationEvent.notificationId);
   }, [notificationEvent, showDesktopNotification]);
+
+  useEffect(() => {
+    return window.desktopBridge?.onNotificationAction?.((actionEvent) => {
+      if (
+        actionEvent.action !== "opened" &&
+        actionEvent.action !== "dismissed" &&
+        actionEvent.action !== "closed"
+      ) {
+        return;
+      }
+      acknowledge(actionEvent.notificationId, actionEvent.action);
+      if (actionEvent.action === "opened") {
+        openDeepLink(actionEvent.deepLink);
+      }
+    });
+  }, [acknowledge]);
 
   useEffect(() => {
     const handleMessage = (event: MessageEvent) => {
@@ -326,9 +381,11 @@ function PwaRuntimeForEnvironment({ environmentId }: { readonly environmentId: E
     }
 
     async function registerDesktop(): Promise<void> {
-      if (!("Notification" in window)) return;
-      const permission = await requestPermissionAfterGesture();
-      if (cancelled || permission !== "granted") return;
+      if (!(await canUseNativeDesktopNotifications(window.desktopBridge))) {
+        if (!("Notification" in window)) return;
+        const permission = await requestPermissionAfterGesture();
+        if (cancelled || permission !== "granted") return;
+      }
 
       await registerDevice({
         environmentId,

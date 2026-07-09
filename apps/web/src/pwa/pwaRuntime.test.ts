@@ -1,7 +1,12 @@
 import { describe, expect, it } from "vite-plus/test";
 import { Children, isValidElement, type ReactElement, type ReactNode } from "react";
 
-import { PwaRuntimeView, PwaServiceWorkerRegistration, resolveDeepLinkTarget } from "./pwaRuntime";
+import {
+  canUseNativeDesktopNotifications,
+  PwaRuntimeView,
+  PwaServiceWorkerRegistration,
+  resolveDeepLinkTarget,
+} from "./pwaRuntime";
 
 describe("resolveDeepLinkTarget", () => {
   it("keeps notification deep links as pathnames for browser history", () => {
@@ -33,5 +38,40 @@ describe("PwaRuntimeView", () => {
 
   it("does not mount browser PWA side effects for unsupported runtimes", () => {
     expect(PwaRuntimeView({ enabled: false, environmentId: null })).toBeNull();
+  });
+});
+
+describe("canUseNativeDesktopNotifications", () => {
+  it("requires both the native show bridge and a positive support probe", async () => {
+    await expect(
+      canUseNativeDesktopNotifications({
+        showNotification: async () => true,
+        isNotificationSupported: async () => true,
+      }),
+    ).resolves.toBe(true);
+
+    await expect(
+      canUseNativeDesktopNotifications({
+        showNotification: async () => false,
+        isNotificationSupported: async () => false,
+      }),
+    ).resolves.toBe(false);
+  });
+
+  it("falls back to renderer permission when the support probe is missing or rejects", async () => {
+    await expect(
+      canUseNativeDesktopNotifications({
+        showNotification: async () => true,
+      }),
+    ).resolves.toBe(false);
+
+    await expect(
+      canUseNativeDesktopNotifications({
+        showNotification: async () => true,
+        isNotificationSupported: async () => {
+          throw new Error("probe failed");
+        },
+      }),
+    ).resolves.toBe(false);
   });
 });

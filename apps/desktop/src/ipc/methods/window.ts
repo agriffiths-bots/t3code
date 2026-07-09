@@ -5,6 +5,7 @@ import {
   DesktopThemeSchema,
   PickFolderOptionsSchema,
   PRIMARY_LOCAL_ENVIRONMENT_ID,
+  ServerDeviceNotification,
   type DesktopEnvironmentBootstrap,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
@@ -19,6 +20,7 @@ import * as DesktopWslBackend from "../../wsl/DesktopWslBackend.ts";
 import * as DesktopWslEnvironment from "../../wsl/DesktopWslEnvironment.ts";
 import * as ElectronDialog from "../../electron/ElectronDialog.ts";
 import * as ElectronMenu from "../../electron/ElectronMenu.ts";
+import * as ElectronNotification from "../../electron/ElectronNotification.ts";
 import * as ElectronShell from "../../electron/ElectronShell.ts";
 import * as ElectronTheme from "../../electron/ElectronTheme.ts";
 import * as ElectronWindow from "../../electron/ElectronWindow.ts";
@@ -256,5 +258,35 @@ export const openExternal = DesktopIpc.makeIpcMethod({
   handler: Effect.fn("desktop.ipc.window.openExternal")(function* (url) {
     const shell = yield* ElectronShell.ElectronShell;
     return yield* shell.openExternal(url);
+  }),
+});
+
+export const showNotification = DesktopIpc.makeIpcMethod({
+  channel: IpcChannels.SHOW_NOTIFICATION_CHANNEL,
+  payload: ServerDeviceNotification,
+  result: Schema.Boolean,
+  handler: Effect.fn("desktop.ipc.window.showNotification")(function* (notification) {
+    const notifications = yield* ElectronNotification.ElectronNotification;
+    return yield* notifications.show(notification);
+  }),
+});
+
+export const isNotificationSupported = DesktopIpc.makeIpcMethod({
+  channel: IpcChannels.IS_NOTIFICATION_SUPPORTED_CHANNEL,
+  payload: Schema.Void,
+  result: Schema.Boolean,
+  handler: Effect.fn("desktop.ipc.window.isNotificationSupported")(function* () {
+    const notifications = yield* ElectronNotification.ElectronNotification;
+    return yield* notifications.isSupported;
+  }),
+});
+
+export const closeNotification = DesktopIpc.makeIpcMethod({
+  channel: IpcChannels.CLOSE_NOTIFICATION_CHANNEL,
+  payload: Schema.String,
+  result: Schema.Void,
+  handler: Effect.fn("desktop.ipc.window.closeNotification")(function* (notificationId) {
+    const notifications = yield* ElectronNotification.ElectronNotification;
+    yield* notifications.close(notificationId);
   }),
 });

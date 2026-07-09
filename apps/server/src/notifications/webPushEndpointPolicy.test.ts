@@ -10,6 +10,12 @@ describe("getWebPushEndpointValidationError", () => {
     expect(
       getWebPushEndpointValidationError("https://updates.push.services.mozilla.com/wpush/v2/test"),
     ).toBeNull();
+    expect(
+      getWebPushEndpointValidationError("https://fcm.googleapis.com/fcm/send/test"),
+    ).toBeNull();
+    expect(
+      getWebPushEndpointValidationError("https://wns2-ln2p.notify.windows.com/w/?token=test"),
+    ).toBeNull();
   });
 
   it("rejects non-HTTPS and non-public endpoints", () => {

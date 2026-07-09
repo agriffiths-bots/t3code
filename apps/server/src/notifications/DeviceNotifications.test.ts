@@ -1,4 +1,9 @@
 import * as NodeServices from "@effect/platform-node/NodeServices";
+import * as NodeCrypto from "node:crypto";
+// @effect-diagnostics-next-line nodeBuiltinImport:off - The web-push integration test needs raw headers from a local HTTPS push endpoint.
+import type * as NodeHttp from "node:http";
+// @effect-diagnostics-next-line nodeBuiltinImport:off - web-push sends through Node HTTPS, so the mock endpoint and trusted agent must use Node HTTPS.
+import * as NodeHttps from "node:https";
 import { afterEach, assert, expect, it, vi } from "@effect/vitest";
 import type { ServerNotificationStreamEvent } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
@@ -16,6 +21,55 @@ import * as ServerSecretStore from "../auth/ServerSecretStore.ts";
 import * as ServerConfig from "../config.ts";
 import * as DeviceNotifications from "./DeviceNotifications.ts";
 import * as WebPushEndpointGuard from "./WebPushEndpointGuard.ts";
+
+const TEST_PUSH_SERVER_KEY = `-----BEGIN PRIVATE KEY-----
+MIIEvAIBADANBgkqhkiG9w0BAQEFAASCBKYwggSiAgEAAoIBAQCn9YCqyzB0eWu4
+RrcB22XQfy8EatXSCIZcuREFAHJfnBI7kimBcVZ+OZCYcZJYKFZgVhqfOUjj2nzT
+Y1Vw9JBopn8Sj0m/ymPWDSppgCTQn2D0q+XfNFFlo0C6rQ9aNnFPeBSth5vqrPse
+9MC+M2xOzDVTe7OAPBzqS0FnslbQluozWGnW9zPmaQOr2VkLIbShpz8j+pW1uxKL
+iSqkizeycvDEKOOjN15JB0c7M6DeLJwsyyk9f4nZIizZQIHk3Iqzk8S2QJaSOws3
+YU7Ftj3GPDk4HKbP2Ew4iJ41+8NjNKVNg/hbe5OAu+6HcXX3bMLW7siqDtPEF3qQ
+1pepTdDhAgMBAAECggEACL+xRNRCMSL9ATOPx1U8E7T4SEDfY+olQ5GxSQMpsgDB
+c2Bs8IzsjjUl6sbpslVhkHGTv+z+Nr40B9fSBMj8d7MKhfc4Rnj+o9D6P1YZNNPE
+e2Iz3mFNhx+OmNq4ZMDWvKa63wIkFUCO8SEbJB0uHFmnQnK8Wibnc63ZWZMw0fsg
+vcxsv0HxhLx4a6mEs8KwOKWPnNVOnBwKO/ij8+hEszOa4im9YtoJsEXCFcNlV3IF
+/D67m2wUxX2u1HGjL7k+qvbxRhIo0zXnW3GgpzTQlfYRPKhasyGGqitmbK3PnVqu
+2arP9xaTcYaP8ntvAYBZ6zPLgojkL20rbDyTjN97dQKBgQDmRNxvbWMs1AfopgY0
+T+h0xs9rnPAbuw7bW5TBzqy1dGmLVU7oAXYYyqGK1GjM7K1ELQVXParHT4TJD6R2
+atgAPBpwBuo25np/lEdjnMu66+DRO9xB4frSySiw8kmy4HjLl2GV2QS9rXUy0iY/
+RK9h4nX+P7/OTSeLtQmYamqubQKBgQC6ui84vCD9XaIqx5ZC1odMKmy4S4Xg0Q9w
+r4rT/mdlgRykzIZKGliP/hxeOuyQ4D2s+ynGg50G9hetAa+4XBUybjRNd041H5O7
+vIY3g1Hm0FWUXPIFUSLWY+o9iUT34e5cNO5//Q1qHLEg562HDkbcl5Rj4MhqP0lC
+KWXJwyGTxQKBgCgXARHdR5D8cUwN67Kb3urF2kLwFdWeIZ4LOcDsTKFi3SVG+u/l
+oTv7u1hCVuSmqBvggreHov4EWCfxMz7ypxyTWj761TgttFIV7L/pAodOnduPwm8t
++s9L+mukIzSjZCR9/J1sJSko0+i/Ma1+NdKi7MwRKUGvqRznrf39OQmZAoGAdTxO
+R6W+ZLU0Cv3ytpYwrj54siEgti0sL4jXdhBlZJJypHmQ2te9wPI/Z15BhxhzQLcU
+3IFnxqYd6U6EwBB4cohEqFp+rNXdkGJmNlZpxqwI/zR386SkZcynlekodyXP3O6S
+y6LamEPZZhpvlbr9/KPi0+6ehi6j1TleohW0cC0CgYAdVoQ8qAjhalA1C3jYxcJb
+42kHTn14mIMruH6/hr3S0e/BFGIOFRNlHeu5XXzQJTWiclCuO6SLJPK0Xc2EB5ta
+zhJgNbpS6HXyyXi7xSOOVuc20o3U1tTSpWzJaukCkZmCLLXIwzuM1J/wBRs9HYr2
+HVLFuTQyjglEsZfSOmlaxw==
+-----END PRIVATE KEY-----`;
+
+const TEST_PUSH_SERVER_CERT = `-----BEGIN CERTIFICATE-----
+MIIDJTCCAg2gAwIBAgIUcFdXq6esSYgutJl8OFoqNAYqrIMwDQYJKoZIhvcNAQEL
+BQAwFDESMBAGA1UEAwwJbG9jYWxob3N0MB4XDTI2MDcwOTAwMDYyNloXDTM2MDcw
+NjAwMDYyNlowFDESMBAGA1UEAwwJbG9jYWxob3N0MIIBIjANBgkqhkiG9w0BAQEF
+AAOCAQ8AMIIBCgKCAQEAp/WAqsswdHlruEa3Adtl0H8vBGrV0giGXLkRBQByX5wS
+O5IpgXFWfjmQmHGSWChWYFYanzlI49p802NVcPSQaKZ/Eo9Jv8pj1g0qaYAk0J9g
+9Kvl3zRRZaNAuq0PWjZxT3gUrYeb6qz7HvTAvjNsTsw1U3uzgDwc6ktBZ7JW0Jbq
+M1hp1vcz5mkDq9lZCyG0oac/I/qVtbsSi4kqpIs3snLwxCjjozdeSQdHOzOg3iyc
+LMspPX+J2SIs2UCB5NyKs5PEtkCWkjsLN2FOxbY9xjw5OBymz9hMOIieNfvDYzSl
+TYP4W3uTgLvuh3F192zC1u7Iqg7TxBd6kNaXqU3Q4QIDAQABo28wbTAdBgNVHQ4E
+FgQUfZmQ9xZ5SkpZqXRpBn5hfipmAmwwHwYDVR0jBBgwFoAUfZmQ9xZ5SkpZqXRp
+Bn5hfipmAmwwDwYDVR0TAQH/BAUwAwEB/zAaBgNVHREEEzARgglsb2NhbGhvc3SH
+BH8AAAEwDQYJKoZIhvcNAQELBQADggEBAG/Yy72nBZ6B1RfZvqlm/1WCFJpNUZI5
+2pHU02QkndQHJ7gIrI2F6A9tmKUP6l/E/+XzCttIy5JefKanzWd8yylQA0B+8Oph
+7jAb06QrwP+YliS7yhaLu/E/Yq3XbTmkY6cNk5gxymyTidc89AYrOIsQp70gzAk8
+vuHOjS7cVclCl/s7TNbtp1U1PTkQtfU+gcDxn1LpMGCs9xQdHT8B5xJb0zNM5e3Q
+rzh5lnyxAlQn3b1ra+gXOu9X4DYPkldpEPvl0Ckq132y4GTWKq/3C1+92+8X7dir
+Hp+komj6aaPGBoStmFx8DMAOWmdGRiHB/dob5t05L/JHiHQOB613ZR8=
+-----END CERTIFICATE-----`;
 
 const makeNotificationsLayer = (guardLayer = WebPushEndpointGuard.layer) =>
   DeviceNotifications.layer.pipe(
@@ -41,14 +95,102 @@ const makeGuardLayer = (
 ): Layer.Layer<WebPushEndpointGuard.WebPushEndpointGuard> =>
   Layer.succeed(WebPushEndpointGuard.WebPushEndpointGuard, WebPushEndpointGuard.make(resolve));
 
+const makePushSubscriptionKeys = () => {
+  const ecdh = NodeCrypto.createECDH("prime256v1");
+  ecdh.generateKeys();
+  return {
+    p256dh: ecdh.getPublicKey().toString("base64url"),
+    auth: NodeCrypto.randomBytes(16).toString("base64url"),
+  };
+};
+
 const webPushSubscription = (endpoint = "https://push.example.net/send") => ({
   endpoint,
   expirationTime: null,
-  keys: {
-    p256dh: "p256dh-key",
-    auth: "auth-key",
-  },
+  keys: makePushSubscriptionKeys(),
 });
+
+interface MockPushRequest {
+  readonly method: string | undefined;
+  readonly url: string | undefined;
+  readonly headers: NodeHttp.IncomingHttpHeaders;
+  readonly body: Buffer;
+}
+
+const makeMockPushServer = Effect.acquireRelease(
+  Effect.promise(
+    () =>
+      new Promise<{
+        readonly agent: NodeHttps.Agent;
+        readonly endpoint: string;
+        readonly requests: MockPushRequest[];
+        readonly server: NodeHttps.Server;
+      }>((resolve, reject) => {
+        const requests: MockPushRequest[] = [];
+        const server = NodeHttps.createServer(
+          { key: TEST_PUSH_SERVER_KEY, cert: TEST_PUSH_SERVER_CERT },
+          (request, response) => {
+            const chunks: Buffer[] = [];
+            request.on("data", (chunk) => {
+              chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+            });
+            request.on("end", () => {
+              requests.push({
+                method: request.method,
+                url: request.url,
+                headers: request.headers,
+                body: Buffer.concat(chunks),
+              });
+              response.statusCode = 201;
+              response.end();
+            });
+          },
+        );
+        server.once("error", reject);
+        server.listen(0, "127.0.0.1", () => {
+          const address = server.address();
+          if (!address || typeof address === "string") {
+            reject(new Error("Expected a TCP address for mock push server."));
+            return;
+          }
+          resolve({
+            agent: new NodeHttps.Agent({ ca: TEST_PUSH_SERVER_CERT }),
+            endpoint: `https://127.0.0.1:${address.port}/push`,
+            requests,
+            server,
+          });
+        });
+      }),
+  ),
+  ({ server }) =>
+    Effect.promise(
+      () =>
+        new Promise<void>((resolve, reject) => {
+          server.close((error) => {
+            if (error) {
+              reject(error);
+              return;
+            }
+            resolve();
+          });
+        }),
+    ),
+);
+
+const makeAcceptedEndpointGuardLayer = (
+  agent: NodeHttps.Agent,
+): Layer.Layer<WebPushEndpointGuard.WebPushEndpointGuard> =>
+  Layer.succeed(
+    WebPushEndpointGuard.WebPushEndpointGuard,
+    WebPushEndpointGuard.WebPushEndpointGuard.of({
+      prepare: (endpoint) =>
+        Effect.succeed({
+          agent,
+          address: { address: "127.0.0.1", family: 4 },
+          hostname: new URL(endpoint).hostname,
+        }),
+    }),
+  );
 
 const makeRebindingGuardLayer = () => {
   let resolutionAttempt = 0;
@@ -266,6 +408,39 @@ it.layer(NodeServices.layer)("DeviceNotifications.layer", (it) => {
       assert.equal(result.deliveredDevices, 0);
       expect(sendNotification).not.toHaveBeenCalled();
     }).pipe(Effect.provide(makeNotificationsLayer(makeRebindingGuardLayer()))),
+  );
+
+  it.effect("sends accepted web-push notifications as POSTs to the push endpoint", () =>
+    Effect.gen(function* () {
+      const mockPush = yield* makeMockPushServer;
+
+      const result = yield* Effect.gen(function* () {
+        const notifications = yield* DeviceNotifications.DeviceNotifications;
+        yield* notifications.registerDevice({
+          deviceId: "web-push-post",
+          deviceKind: "web-push",
+          ackUrl: "https://app.example.test/api/notifications/ack",
+          subscription: webPushSubscription(mockPush.endpoint),
+        });
+        return yield* notifications.notify({
+          title: "Accepted POST",
+          body: "This should reach the mock push service.",
+          deepLink: "/environment/thread",
+        });
+      }).pipe(
+        Effect.provide(makeNotificationsLayer(makeAcceptedEndpointGuardLayer(mockPush.agent))),
+      );
+
+      assert.equal(result.deliveredDevices, 1);
+      assert.equal(mockPush.requests.length, 1);
+      const request = mockPush.requests[0]!;
+      assert.equal(request.method, "POST");
+      assert.equal(request.url, "/push");
+      assert.equal(request.headers.ttl, "86400");
+      assert.equal(request.headers.urgency, "high");
+      assert.equal(request.headers["content-type"], "application/octet-stream");
+      assert.isAbove(request.body.byteLength, 0);
+    }).pipe(Effect.scoped),
   );
 
   it.effect("sends public web-push endpoints with a pinned agent", () =>

@@ -37,12 +37,15 @@ import {
 } from "./methods/updates.ts";
 import {
   confirm,
+  closeNotification,
   getAppBranding,
   getLocalEnvironmentBootstraps,
   getLocalEnvironmentBearerToken,
+  isNotificationSupported,
   openExternal,
   pickFolder,
   setTheme,
+  showNotification,
   showContextMenu,
 } from "./methods/window.ts";
 import * as PreviewIpc from "./methods/preview.ts";
@@ -89,6 +92,9 @@ export const installDesktopIpcHandlers = Effect.fn("desktop.ipc.installHandlers"
   yield* ipc.handle(setTheme);
   yield* ipc.handle(showContextMenu);
   yield* ipc.handle(openExternal);
+  yield* ipc.handle(isNotificationSupported);
+  yield* ipc.handle(showNotification);
+  yield* ipc.handle(closeNotification);
   yield* ipc.handle(getUpdateState);
   yield* ipc.handle(setUpdateChannel);
   yield* ipc.handle(downloadUpdate);
