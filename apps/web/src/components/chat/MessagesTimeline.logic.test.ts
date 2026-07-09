@@ -1121,6 +1121,102 @@ describe("deriveMessagesTimelineRows", () => {
     ]);
   });
 
+  it("falls back to the terminal assistant when a matched boundary is older", () => {
+    const turnSummary = {
+      turnId: "turn-1" as never,
+      completedAt: "2026-01-01T00:00:24Z",
+      assistantMessageId: "assistant-older" as never,
+      checkpointTurnCount: 1,
+      checkpointRef: "checkpoint-1" as never,
+      status: "ready" as const,
+      files: [],
+    };
+    const rows = deriveMessagesTimelineRows({
+      timelineEntries: [
+        {
+          id: "user-entry",
+          kind: "message",
+          createdAt: "2026-01-01T00:00:00Z",
+          message: {
+            id: "user-1" as never,
+            role: "user",
+            text: "Do the thing",
+            turnId: null,
+            createdAt: "2026-01-01T00:00:00Z",
+            updatedAt: "2026-01-01T00:00:00Z",
+            streaming: false,
+          },
+        },
+        {
+          id: "assistant-older-entry",
+          kind: "message",
+          createdAt: "2026-01-01T00:00:05Z",
+          message: {
+            id: "assistant-older" as never,
+            role: "assistant",
+            text: "I will inspect first.",
+            turnId: "turn-1" as never,
+            createdAt: "2026-01-01T00:00:05Z",
+            updatedAt: "2026-01-01T00:00:05Z",
+            streaming: false,
+          },
+        },
+        {
+          id: "work-entry",
+          kind: "work",
+          createdAt: "2026-01-01T00:00:06Z",
+          entry: {
+            id: "work-1",
+            createdAt: "2026-01-01T00:00:06Z",
+            turnId: "turn-1" as never,
+            label: "Read file",
+            tone: "tool",
+          },
+        },
+        {
+          id: "assistant-final-entry",
+          kind: "message",
+          createdAt: "2026-01-01T00:00:20Z",
+          message: {
+            id: "assistant-final-visible" as never,
+            role: "assistant",
+            text: "Final answer.",
+            turnId: "turn-1" as never,
+            createdAt: "2026-01-01T00:00:20Z",
+            updatedAt: "2026-01-01T00:00:20Z",
+            streaming: false,
+          },
+        },
+      ],
+      latestTurn: {
+        turnId: "turn-1" as never,
+        state: "completed",
+        startedAt: "2026-01-01T00:00:00Z",
+        completedAt: "2026-01-01T00:00:24Z",
+        assistantMessageId: "assistant-older" as never,
+      },
+      isWorking: false,
+      activeTurnStartedAt: null,
+      turnDiffSummaryByAssistantMessageId: new Map(),
+      turnDiffSummaryByTurnId: new Map([["turn-1" as never, turnSummary]]),
+      revertTurnCountByUserMessageId: new Map(),
+    });
+
+    expect(rows.map((row) => row.id)).toEqual([
+      "user-entry",
+      "turn-fold:turn-1",
+      "assistant-final-entry",
+    ]);
+    expect(
+      rows
+        .filter(
+          (row): row is Extract<(typeof rows)[number], { kind: "message" }> =>
+            row.kind === "message" && row.message.role === "assistant",
+        )
+        .map((row) => row.message.text),
+    ).toEqual(["Final answer."]);
+  });
+
   it("falls back from a null boundary when a terminal assistant is projected after work", () => {
     const rows = deriveMessagesTimelineRows({
       timelineEntries: [
