@@ -5,9 +5,10 @@ import {
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
+import * as Schema from "effect/Schema";
 import * as HttpApiBuilder from "effect/unstable/httpapi/HttpApiBuilder";
 
-import { normalizeDispatchCommand } from "./Normalizer.ts";
+import { cleanupPersistedCommandAttachments, normalizeDispatchCommand } from "./Normalizer.ts";
 import {
   annotateEnvironmentRequest,
   failEnvironmentInternal,
@@ -17,6 +18,19 @@ import {
 } from "../auth/http.ts";
 import { OrchestrationEngineService } from "./Services/OrchestrationEngine.ts";
 import { ProjectionSnapshotQuery } from "./Services/ProjectionSnapshotQuery.ts";
+import {
+  OrchestrationCommandInvariantError,
+  OrchestrationCommandPreviouslyRejectedError,
+} from "./Errors.ts";
+
+const isClientCommandDispatchError = (cause: unknown) =>
+  isOrchestrationCommandInvariantError(cause) ||
+  isOrchestrationCommandPreviouslyRejectedError(cause);
+
+const isOrchestrationCommandInvariantError = Schema.is(OrchestrationCommandInvariantError);
+const isOrchestrationCommandPreviouslyRejectedError = Schema.is(
+  OrchestrationCommandPreviouslyRejectedError,
+);
 
 export const orchestrationHttpApiLayer = HttpApiBuilder.group(
   EnvironmentHttpApi,
@@ -80,13 +94,17 @@ export const orchestrationHttpApiLayer = HttpApiBuilder.group(
           const normalizedCommand = yield* normalizeDispatchCommand(args.payload).pipe(
             Effect.catch(() => failEnvironmentInvalidRequest("invalid_command")),
           );
-          return yield* orchestrationEngine
-            .dispatch(normalizedCommand)
-            .pipe(
-              Effect.catch((cause) =>
-                failEnvironmentInternal("orchestration_dispatch_failed", cause),
-              ),
-            );
+          return yield* orchestrationEngine.dispatch(normalizedCommand).pipe(
+            Effect.catch((cause) =>
+              Effect.gen(function* () {
+                yield* cleanupPersistedCommandAttachments(normalizedCommand);
+                if (isClientCommandDispatchError(cause)) {
+                  return yield* failEnvironmentInvalidRequest("invalid_command");
+                }
+                return yield* failEnvironmentInternal("orchestration_dispatch_failed", cause);
+              }),
+            ),
+          );
         }),
       );
   }),

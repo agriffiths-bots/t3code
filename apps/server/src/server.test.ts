@@ -5975,7 +5975,7 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
     }).pipe(Effect.provide(NodeHttpServer.layerTest)),
   );
 
-  it.effect("rejects archived turn starts before persisting websocket attachments", () =>
+  it.effect("cleans up websocket attachments when queued archive rejects a turn start", () =>
     Effect.gen(function* () {
       const fileSystem = yield* FileSystem.FileSystem;
       const now = "2026-01-01T00:00:00.000Z";
@@ -5988,20 +5988,20 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
       yield* buildAppUnderTest({
         config: { baseDir },
         layers: {
-          projectionSnapshotQuery: {
-            getThreadShellByIdIncludingArchived: (threadId) =>
-              Effect.succeed(
-                threadId === defaultThreadId
-                  ? Option.some(makeDefaultOrchestrationThreadShell({ archivedAt: now }))
-                  : Option.none(),
-              ),
-          },
           orchestrationEngine: {
             dispatch: (command) =>
               Effect.sync(() => {
                 dispatchedCommands.push(command);
-                return { sequence: 7 };
-              }),
+              }).pipe(
+                Effect.andThen(
+                  Effect.fail(
+                    new OrchestrationCommandInvariantError({
+                      commandType: "thread.turn.start",
+                      detail: `Thread '${defaultThreadId}' is already archived and cannot handle command 'thread.turn.start'.`,
+                    }),
+                  ),
+                ),
+              ),
             readEvents: () => Stream.empty,
           },
         },
@@ -6045,7 +6045,171 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
       assertTrue(result._tag === "Failure");
       assertTrue(result.failure._tag === "OrchestrationDispatchCommandError");
       assert.include(result.failure.message, "already archived");
+      assert.deepEqual(
+        dispatchedCommands.map((command) => command.type),
+        ["thread.turn.start"],
+      );
+      assert.deepEqual(attachmentEntries, []);
+    }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+
+  it.effect("does not persist partial websocket attachments when normalization fails", () =>
+    Effect.gen(function* () {
+      const fileSystem = yield* FileSystem.FileSystem;
+      const now = "2026-01-01T00:00:00.000Z";
+      const baseDir = yield* fileSystem.makeTempDirectoryScoped({
+        prefix: "t3-partial-invalid-attachment-",
+      });
+      const { attachmentsDir } = yield* ServerConfig.deriveServerPaths(baseDir, undefined);
+      const dispatchedCommands: OrchestrationCommand[] = [];
+
+      yield* buildAppUnderTest({
+        config: { baseDir },
+        layers: {
+          orchestrationEngine: {
+            dispatch: (command) =>
+              Effect.sync(() => {
+                dispatchedCommands.push(command);
+                return { sequence: 7 };
+              }),
+            readEvents: () => Stream.empty,
+          },
+        },
+      });
+
+      const wsUrl = yield* getWsServerUrl("/ws");
+      const result = yield* Effect.scoped(
+        withWsRpcClient(wsUrl, (client) =>
+          client[ORCHESTRATION_WS_METHODS.dispatchCommand]({
+            type: "thread.turn.start",
+            commandId: CommandId.make("cmd-partial-invalid-attachment-turn-start"),
+            threadId: defaultThreadId,
+            message: {
+              messageId: MessageId.make("msg-partial-invalid-attachment-turn-start"),
+              role: "user",
+              text: "this should not persist the first attachment",
+              attachments: [
+                {
+                  type: "image",
+                  name: "first-valid.png",
+                  mimeType: "image/png",
+                  sizeBytes: NonNegativeInt.make(5),
+                  dataUrl: "data:image/png;base64,aGVsbG8=",
+                },
+                {
+                  type: "image",
+                  name: "second-invalid.png",
+                  mimeType: "image/png",
+                  sizeBytes: NonNegativeInt.make(4),
+                  dataUrl: "data:text/plain;base64,bm9wZQ==",
+                },
+              ],
+            },
+            interactionMode: "default",
+            runtimeMode: "full-access",
+            createdAt: now,
+          }),
+        ).pipe(Effect.result),
+      );
+
+      const attachmentEntries = yield* fileSystem
+        .exists(attachmentsDir)
+        .pipe(
+          Effect.flatMap((exists) =>
+            exists ? fileSystem.readDirectory(attachmentsDir) : Effect.succeed([]),
+          ),
+        );
+      assertTrue(result._tag === "Failure");
+      assertTrue(result.failure._tag === "OrchestrationDispatchCommandError");
+      assert.include(result.failure.message, "Invalid image attachment payload");
       assert.deepEqual(dispatchedCommands, []);
+      assert.deepEqual(attachmentEntries, []);
+    }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+
+  it.effect("reports HTTP archived turn-start rejections as invalid commands", () =>
+    Effect.gen(function* () {
+      const fileSystem = yield* FileSystem.FileSystem;
+      const now = "2026-01-01T00:00:00.000Z";
+      const baseDir = yield* fileSystem.makeTempDirectoryScoped({
+        prefix: "t3-http-archived-attachment-",
+      });
+      const { attachmentsDir } = yield* ServerConfig.deriveServerPaths(baseDir, undefined);
+      const dispatchedCommands: OrchestrationCommand[] = [];
+
+      yield* buildAppUnderTest({
+        config: { baseDir },
+        layers: {
+          orchestrationEngine: {
+            dispatch: (command) =>
+              Effect.sync(() => {
+                dispatchedCommands.push(command);
+              }).pipe(
+                Effect.andThen(
+                  Effect.fail(
+                    new OrchestrationCommandInvariantError({
+                      commandType: "thread.turn.start",
+                      detail: `Thread '${defaultThreadId}' is already archived and cannot handle command 'thread.turn.start'.`,
+                    }),
+                  ),
+                ),
+              ),
+            readEvents: () => Stream.empty,
+          },
+        },
+      });
+
+      const token = yield* exchangeAccessToken();
+      assert.ok(token.body.access_token);
+      const dispatchUrl = yield* getHttpServerUrl("/api/orchestration/dispatch");
+      const response = yield* fetchEffect(dispatchUrl, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${token.body.access_token}`,
+          "content-type": "application/json",
+        },
+        body: jsonRequestBody({
+          type: "thread.turn.start",
+          commandId: CommandId.make("cmd-http-archived-attachment-turn-start"),
+          threadId: defaultThreadId,
+          message: {
+            messageId: MessageId.make("msg-http-archived-attachment-turn-start"),
+            role: "user",
+            text: "this should be a client error",
+            attachments: [
+              {
+                type: "image",
+                name: "http-archived.png",
+                mimeType: "image/png",
+                sizeBytes: NonNegativeInt.make(5),
+                dataUrl: "data:image/png;base64,aGVsbG8=",
+              },
+            ],
+          },
+          interactionMode: "default",
+          runtimeMode: "full-access",
+          createdAt: now,
+        }),
+      });
+      const responseBody = yield* responseJsonEffect<{
+        readonly code: string;
+        readonly reason: string;
+      }>(response);
+      const attachmentEntries = yield* fileSystem
+        .exists(attachmentsDir)
+        .pipe(
+          Effect.flatMap((exists) =>
+            exists ? fileSystem.readDirectory(attachmentsDir) : Effect.succeed([]),
+          ),
+        );
+
+      assert.equal(response.status, 400);
+      assert.equal(responseBody.code, "invalid_request");
+      assert.equal(responseBody.reason, "invalid_command");
+      assert.deepEqual(
+        dispatchedCommands.map((command) => command.type),
+        ["thread.turn.start"],
+      );
       assert.deepEqual(attachmentEntries, []);
     }).pipe(Effect.provide(NodeHttpServer.layerTest)),
   );

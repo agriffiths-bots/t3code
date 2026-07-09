@@ -1,6 +1,12 @@
 import * as NodeCrypto from "node:crypto";
 
-import { CommandId, type OrchestrationEvent, type ThreadId } from "@t3tools/contracts";
+import {
+  CommandId,
+  type OrchestrationEvent,
+  type OrchestrationSession,
+  type ProviderSession,
+  type ThreadId,
+} from "@t3tools/contracts";
 import { makeDrainableWorker } from "@t3tools/shared/DrainableWorker";
 import * as Cause from "effect/Cause";
 import * as Effect from "effect/Effect";
@@ -33,7 +39,11 @@ interface ThreadArchivedCleanupWorkItem {
 }
 type ThreadCleanupWorkItem = ThreadDeletedCleanupWorkItem | ThreadArchivedCleanupWorkItem;
 type ArchivedThreadSnapshotState =
-  | { readonly _tag: "Current"; readonly projectedSessionLive: boolean }
+  | {
+      readonly _tag: "Current";
+      readonly session: OrchestrationSession | null;
+      readonly projectedSessionLive: boolean;
+    }
   | { readonly _tag: "Stale" }
   | { readonly _tag: "Unknown" };
 
@@ -98,6 +108,7 @@ const make = Effect.gen(function* () {
             thread.archivedAt === event.payload.archivedAt
               ? {
                   _tag: "Current",
+                  session: thread.session,
                   projectedSessionLive:
                     thread.session !== null && thread.session.status !== "stopped",
                 }
@@ -126,10 +137,10 @@ const make = Effect.gen(function* () {
     return { _tag: "Unknown" } as const;
   });
 
-  const hasRuntimeSession = (threadId: ThreadId) =>
+  const resolveRuntimeSession = (threadId: ThreadId) =>
     providerService.listSessions().pipe(
-      Effect.map((sessions) => sessions.some((session) => session.threadId === threadId)),
-      Effect.orElseSucceed(() => false),
+      Effect.map((sessions) => sessions.find((session) => session.threadId === threadId)),
+      Effect.orElseSucceed(() => undefined),
     );
 
   const sessionStopCommandIdForArchive = (
@@ -160,6 +171,45 @@ const make = Effect.gen(function* () {
       }),
       message: "thread archive cleanup skipped provider session stop dispatch",
       threadId: event.payload.threadId,
+    });
+
+  const sessionSetCommandIdForArchiveReplay = (event: ThreadArchivedEvent) =>
+    Effect.succeed(
+      CommandId.make(`session-set-for-archive-replay:${event.eventId}:${NodeCrypto.randomUUID()}`),
+    );
+
+  const stopAndRecordReplayArchivedSession = (input: {
+    readonly event: ThreadArchivedEvent;
+    readonly projectedSession: OrchestrationSession | null;
+    readonly runtimeSession: ProviderSession | undefined;
+  }) =>
+    logCleanupCauseUnlessInterrupted({
+      effect: Effect.gen(function* () {
+        const { event, projectedSession, runtimeSession } = input;
+        const threadId = event.payload.threadId;
+        yield* providerService.stopSession({ threadId });
+        const providerInstanceId =
+          projectedSession?.providerInstanceId ?? runtimeSession?.providerInstanceId;
+        yield* orchestrationEngine.dispatch({
+          type: "thread.session.set",
+          commandId: yield* sessionSetCommandIdForArchiveReplay(event),
+          threadId,
+          session: {
+            threadId,
+            status: "stopped",
+            providerName: projectedSession?.providerName ?? runtimeSession?.provider ?? null,
+            ...(providerInstanceId !== undefined ? { providerInstanceId } : {}),
+            runtimeMode:
+              projectedSession?.runtimeMode ?? runtimeSession?.runtimeMode ?? "full-access",
+            activeTurnId: null,
+            lastError: projectedSession?.lastError ?? null,
+            updatedAt: event.occurredAt,
+          },
+          createdAt: event.occurredAt,
+        });
+      }),
+      message: "thread archive replay cleanup skipped provider session stop",
+      threadId: input.event.payload.threadId,
     });
 
   const processThreadDeleted = Effect.fn("processThreadDeleted")(function* (
@@ -197,8 +247,17 @@ const make = Effect.gen(function* () {
     }
     const projectedSessionLive =
       snapshotState._tag === "Current" && snapshotState.projectedSessionLive;
-    if (projectedSessionLive || (yield* hasRuntimeSession(threadId))) {
-      yield* dispatchSessionStopForArchive(event, source);
+    const runtimeSession = yield* resolveRuntimeSession(threadId);
+    if (projectedSessionLive || runtimeSession !== undefined) {
+      if (source === "replay") {
+        yield* stopAndRecordReplayArchivedSession({
+          event,
+          projectedSession: snapshotState.session,
+          runtimeSession,
+        });
+      } else {
+        yield* dispatchSessionStopForArchive(event, source);
+      }
     }
     yield* closeArchivedThreadTerminals(threadId);
   });

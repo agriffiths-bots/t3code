@@ -483,24 +483,34 @@ describe("OrchestrationEngine", () => {
       }),
     );
 
-    await expect(
-      system.run(
-        engine.dispatch({
-          type: "thread.turn.start",
-          commandId: CommandId.make("cmd-turn-start-archived-thread"),
-          threadId,
-          message: {
-            messageId: asMessageId("msg-archived-turn-start"),
-            role: "user",
-            text: "should not persist",
-            attachments: [],
-          },
-          interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
-          runtimeMode: "approval-required",
-          createdAt,
-        }),
-      ),
-    ).rejects.toThrow("already archived");
+    const turnStartCommand = {
+      type: "thread.turn.start" as const,
+      commandId: CommandId.make("cmd-turn-start-archived-thread"),
+      threadId,
+      message: {
+        messageId: asMessageId("msg-archived-turn-start"),
+        role: "user" as const,
+        text: "should not persist",
+        attachments: [],
+      },
+      interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+      runtimeMode: "approval-required" as const,
+      createdAt,
+    };
+
+    await expect(system.run(engine.dispatch(turnStartCommand))).rejects.toThrow("already archived");
+
+    await system.run(
+      engine.dispatch({
+        type: "thread.unarchive",
+        commandId: CommandId.make("cmd-thread-archived-turn-start-unarchive"),
+        threadId,
+      }),
+    );
+
+    await expect(system.run(engine.dispatch(turnStartCommand))).rejects.toThrow(
+      "previously rejected",
+    );
 
     const events = await system.run(
       Stream.runCollect(engine.readEvents(0)).pipe(

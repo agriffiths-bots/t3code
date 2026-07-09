@@ -356,6 +356,14 @@ describe("ThreadDeletionReactor", () => {
       const closeTerminal = vi.fn<TerminalManager.TerminalManager["Service"]["close"]>(
         () => Effect.void,
       );
+      const stopSession = vi.fn<ProviderServiceShape["stopSession"]>((input) =>
+        Effect.sync(() => {
+          const index = runtimeSessions.findIndex((session) => session.threadId === input.threadId);
+          if (index >= 0) {
+            runtimeSessions.splice(index, 1);
+          }
+        }),
+      );
 
       const engine = {
         readEvents: () => Stream.fromIterable([archiveEvent]),
@@ -373,7 +381,7 @@ describe("ThreadDeletionReactor", () => {
         interruptTurn: () => unsupported(),
         respondToRequest: () => unsupported(),
         respondToUserInput: () => unsupported(),
-        stopSession: () => unsupported(),
+        stopSession,
         listSessions: () => Effect.succeed(runtimeSessions),
         getCapabilities: () => Effect.succeed({ sessionModelSwitch: "in-session" }),
         getInstanceInfo: () => unsupported(),
@@ -416,7 +424,10 @@ describe("ThreadDeletionReactor", () => {
           const threadDeletionReactor = yield* ThreadDeletionReactor;
           yield* threadDeletionReactor.start();
           yield* waitFor(
-            () => dispatchedCommands.length === 1 && closeTerminal.mock.calls.length === 1,
+            () =>
+              stopSession.mock.calls.length === 1 &&
+              dispatchedCommands.length === 1 &&
+              closeTerminal.mock.calls.length === 1,
           );
           yield* threadDeletionReactor.drain;
         }).pipe(Effect.provide(layer)),
@@ -424,17 +435,25 @@ describe("ThreadDeletionReactor", () => {
 
       expect(dispatchedCommands).toMatchObject([
         {
-          type: "thread.session.stop",
+          type: "thread.session.set",
           threadId,
+          session: {
+            status: "stopped",
+            providerName: "codex",
+            providerInstanceId: ProviderInstanceId.make("codex"),
+            runtimeMode: "approval-required",
+          },
         },
       ]);
       expect(String(dispatchedCommands[0]?.commandId)).toContain(
-        `session-stop-for-archive-replay:${archiveEvent.eventId}:`,
+        `session-set-for-archive-replay:${archiveEvent.eventId}:`,
       );
       expect(dispatchedCommands[0]?.commandId).not.toBe(
         CommandId.make(`session-stop-for-archive:${archiveEvent.eventId}`),
       );
+      expect(stopSession).toHaveBeenCalledWith({ threadId });
       expect(closeTerminal).toHaveBeenCalledWith({ threadId });
+      expect(runtimeSessions).toHaveLength(0);
     }),
   );
 
