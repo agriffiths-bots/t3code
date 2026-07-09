@@ -14,6 +14,7 @@ import type {
 import {
   ApprovalRequestId,
   ClaudeSettings,
+  EnvironmentId,
   ProviderDriverKind,
   ProviderItemId,
   ProviderRuntimeEvent,
@@ -34,6 +35,8 @@ import * as TestClock from "effect/testing/TestClock";
 
 import { attachmentRelativePath } from "../../attachmentStore.ts";
 import { ServerConfig } from "../../config.ts";
+import { makeClaudeMcpServers } from "../../mcp/McpProviderInjection.ts";
+import * as McpProviderSession from "../../mcp/McpProviderSession.ts";
 import { ServerSettingsService } from "../../serverSettings.ts";
 import { ProviderAdapterProcessError, ProviderAdapterValidationError } from "../Errors.ts";
 import type { ClaudeAdapterShape } from "../Services/ClaudeAdapter.ts";
@@ -435,6 +438,41 @@ describe("ClaudeAdapterLive", () => {
       const createInput = harness.getLastCreateQueryInput();
       assert.equal(createInput?.options.env?.HOME, NodePath.join(NodeOS.homedir(), ".claude-work"));
     }).pipe(
+      Effect.provideService(Random.Random, makeDeterministicRandomService()),
+      Effect.provide(harness.layer),
+    );
+  });
+
+  it.effect("injects the canonical MCP server into Claude SDK sessions", () => {
+    const harness = makeHarness();
+    const threadId = ThreadId.make("thread-claude-mcp-injection");
+    const mcpSession: McpProviderSession.McpProviderSessionConfig = {
+      environmentId: EnvironmentId.make("environment-claude-mcp-injection"),
+      threadId,
+      providerSessionId: "provider-session-claude-mcp-injection",
+      providerInstanceId: ProviderInstanceId.make("claudeAgent"),
+      endpoint: "http://127.0.0.1:3773/mcp",
+      authorizationHeader: "Bearer claude-mcp-token",
+    };
+    return Effect.gen(function* () {
+      McpProviderSession.setMcpProviderSession(mcpSession);
+      yield* Effect.addFinalizer(() =>
+        Effect.sync(() => McpProviderSession.clearMcpProviderSession(threadId)),
+      );
+
+      const adapter = yield* ClaudeAdapter;
+      yield* adapter.startSession({
+        threadId,
+        provider: ProviderDriverKind.make("claudeAgent"),
+        runtimeMode: "full-access",
+      });
+
+      assert.deepEqual(
+        harness.getLastCreateQueryInput()?.options.mcpServers,
+        makeClaudeMcpServers(mcpSession),
+      );
+    }).pipe(
+      Effect.scoped,
       Effect.provideService(Random.Random, makeDeterministicRandomService()),
       Effect.provide(harness.layer),
     );

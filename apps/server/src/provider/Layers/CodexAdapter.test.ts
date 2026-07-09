@@ -6,6 +6,7 @@ import * as NodePath from "node:path";
 import {
   ApprovalRequestId,
   CodexSettings,
+  EnvironmentId,
   EventId,
   ProviderDriverKind,
   ProviderInstanceId,
@@ -35,6 +36,8 @@ import * as Stream from "effect/Stream";
 import * as CodexErrors from "effect-codex-app-server/errors";
 
 import { ServerConfig } from "../../config.ts";
+import { makeCodexMcpRuntimeConfig } from "../../mcp/McpProviderInjection.ts";
+import * as McpProviderSession from "../../mcp/McpProviderSession.ts";
 import { ServerSettingsService } from "../../serverSettings.ts";
 import { ProviderAdapterValidationError } from "../Errors.ts";
 import type { CodexAdapterShape } from "../Services/CodexAdapter.ts";
@@ -287,6 +290,55 @@ validationLayer("CodexAdapterLive validation", (it) => {
       });
     }),
   );
+
+  it.effect("injects the canonical MCP server into Codex app-server sessions", () => {
+    const runtimeFactory = makeRuntimeFactory();
+    const baseEnvironment = { KEEP_ME: "1" };
+    const layer = Layer.effect(
+      CodexAdapter,
+      Effect.gen(function* () {
+        const codexConfig = decodeCodexSettings({});
+        return yield* makeCodexAdapter(codexConfig, {
+          environment: baseEnvironment,
+          makeRuntime: runtimeFactory.factory,
+        });
+      }),
+    ).pipe(
+      Layer.provideMerge(ServerConfig.layerTest(process.cwd(), process.cwd())),
+      Layer.provideMerge(ServerSettingsService.layerTest()),
+      Layer.provideMerge(providerSessionDirectoryTestLayer),
+      Layer.provideMerge(NodeServices.layer),
+    );
+    const threadId = asThreadId("thread-codex-mcp-injection");
+    const mcpSession: McpProviderSession.McpProviderSessionConfig = {
+      environmentId: EnvironmentId.make("environment-codex-mcp-injection"),
+      threadId,
+      providerSessionId: "provider-session-codex-mcp-injection",
+      providerInstanceId: ProviderInstanceId.make("codex"),
+      endpoint: "http://127.0.0.1:3773/mcp",
+      authorizationHeader: "Bearer codex-mcp-token",
+    };
+
+    return Effect.gen(function* () {
+      McpProviderSession.setMcpProviderSession(mcpSession);
+      yield* Effect.addFinalizer(() =>
+        Effect.sync(() => McpProviderSession.clearMcpProviderSession(threadId)),
+      );
+
+      const adapter = yield* CodexAdapter;
+      yield* adapter.startSession({
+        threadId,
+        provider: ProviderDriverKind.make("codex"),
+        runtimeMode: "full-access",
+      });
+
+      const runtime = runtimeFactory.lastRuntime;
+      NodeAssert.ok(runtime);
+      const expected = makeCodexMcpRuntimeConfig(mcpSession, baseEnvironment);
+      NodeAssert.deepStrictEqual(runtime.options.environment, expected.environment);
+      NodeAssert.deepStrictEqual(runtime.options.appServerArgs, expected.appServerArgs);
+    }).pipe(Effect.scoped, Effect.provide(layer));
+  });
 });
 
 const sessionRuntimeFactory = makeRuntimeFactory();

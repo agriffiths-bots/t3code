@@ -19,6 +19,7 @@ import { createModelSelection } from "@t3tools/shared/model";
 import {
   ApprovalRequestId,
   CursorSettings,
+  EnvironmentId,
   ProviderDriverKind,
   type ProviderRuntimeEvent,
   ThreadId,
@@ -27,6 +28,8 @@ import {
 } from "@t3tools/contracts";
 
 import { ServerConfig } from "../../config.ts";
+import { makeAcpMcpServers } from "../../mcp/McpProviderInjection.ts";
+import * as McpProviderSession from "../../mcp/McpProviderSession.ts";
 import { ServerSettingsService } from "../../serverSettings.ts";
 import type { CursorAdapterShape } from "../Services/CursorAdapter.ts";
 import { makeCursorAdapter } from "./CursorAdapter.ts";
@@ -729,6 +732,57 @@ cursorAdapterTestLayer("CursorAdapterLive", (it) => {
 
       assert.equal(result._tag, "Failure");
     }),
+  );
+
+  it.effect("injects the canonical MCP server into Cursor ACP sessions", () =>
+    Effect.gen(function* () {
+      const adapter = yield* CursorAdapter;
+      const serverSettings = yield* ServerSettingsService;
+      const threadId = ThreadId.make("cursor-mcp-injection-probe");
+      const tempDir = yield* Effect.promise(() =>
+        NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "cursor-acp-mcp-")),
+      );
+      const requestLogPath = NodePath.join(tempDir, "requests.ndjson");
+      const argvLogPath = NodePath.join(tempDir, "argv.txt");
+      yield* Effect.promise(() => NodeFSP.writeFile(requestLogPath, "", "utf8"));
+      const wrapperPath = yield* Effect.promise(() =>
+        makeProbeWrapper(requestLogPath, argvLogPath),
+      );
+      yield* serverSettings.updateSettings({ providers: { cursor: { binaryPath: wrapperPath } } });
+
+      const mcpSession: McpProviderSession.McpProviderSessionConfig = {
+        environmentId: EnvironmentId.make("environment-cursor-mcp-injection"),
+        threadId,
+        providerSessionId: "provider-session-cursor-mcp-injection",
+        providerInstanceId: ProviderInstanceId.make("cursor"),
+        endpoint: "http://127.0.0.1:3773/mcp",
+        authorizationHeader: "Bearer cursor-mcp-token",
+      };
+      McpProviderSession.setMcpProviderSession(mcpSession);
+      yield* Effect.addFinalizer(() =>
+        Effect.sync(() => McpProviderSession.clearMcpProviderSession(threadId)),
+      );
+
+      yield* adapter.startSession({
+        threadId,
+        provider: ProviderDriverKind.make("cursor"),
+        cwd: process.cwd(),
+        runtimeMode: "full-access",
+        modelSelection: { instanceId: ProviderInstanceId.make("cursor"), model: "composer-2" },
+      });
+      yield* adapter.stopSession(threadId);
+
+      const requests = yield* waitForJsonLogMatch(
+        requestLogPath,
+        (entry) => entry.method === "session/new",
+      );
+      const sessionNew = requests.find((entry) => entry.method === "session/new");
+      assert.isDefined(sessionNew);
+      assert.deepEqual(
+        (sessionNew?.params as Record<string, unknown> | undefined)?.mcpServers,
+        makeAcpMcpServers(mcpSession),
+      );
+    }).pipe(Effect.scoped),
   );
 
   it.effect("maps app plan mode onto the ACP plan session mode", () =>
