@@ -52,6 +52,8 @@ interface AssistantSegmentEntry {
 
 const TURN_MESSAGE_IDS_BY_TURN_CACHE_CAPACITY = 10_000;
 const TURN_MESSAGE_IDS_BY_TURN_TTL = Duration.minutes(120);
+const TERMINAL_TURNS_CACHE_CAPACITY = 10_000;
+const TERMINAL_TURNS_TTL = Duration.minutes(120);
 const BUFFERED_MESSAGE_TEXT_BY_MESSAGE_ID_CACHE_CAPACITY = 20_000;
 const BUFFERED_MESSAGE_TEXT_BY_MESSAGE_ID_TTL = Duration.minutes(120);
 const BUFFERED_PROPOSED_PLAN_BY_ID_CACHE_CAPACITY = 10_000;
@@ -646,6 +648,12 @@ const make = Effect.gen(function* () {
     lookup: () => Effect.succeed(new Set<MessageId>()),
   });
 
+  const terminalTurnsByTurnKey = yield* Cache.make<string, true>({
+    capacity: TERMINAL_TURNS_CACHE_CAPACITY,
+    timeToLive: TERMINAL_TURNS_TTL,
+    lookup: () => Effect.succeed(true),
+  });
+
   const bufferedAssistantTextByMessageId = yield* Cache.make<MessageId, string>({
     capacity: BUFFERED_MESSAGE_TEXT_BY_MESSAGE_ID_CACHE_CAPACITY,
     timeToLive: BUFFERED_MESSAGE_TEXT_BY_MESSAGE_ID_TTL,
@@ -723,6 +731,14 @@ const make = Effect.gen(function* () {
 
   const clearAssistantMessageIdsForTurn = (threadId: ThreadId, turnId: TurnId) =>
     Cache.invalidate(turnMessageIdsByTurnKey, providerTurnKey(threadId, turnId));
+
+  const rememberTerminalTurn = (threadId: ThreadId, turnId: TurnId) =>
+    Cache.set(terminalTurnsByTurnKey, providerTurnKey(threadId, turnId), true);
+
+  const hasTerminalTurn = (threadId: ThreadId, turnId: TurnId) =>
+    Cache.getOption(terminalTurnsByTurnKey, providerTurnKey(threadId, turnId)).pipe(
+      Effect.map(Option.isSome),
+    );
 
   const getAssistantSegmentStateForTurn = (threadId: ThreadId, turnId: TurnId) =>
     Cache.getOption(assistantSegmentStateByTurnKey, providerTurnKey(threadId, turnId));
@@ -1167,6 +1183,7 @@ const make = Effect.gen(function* () {
       const prefix = `${threadId}:`;
       const proposedPlanPrefix = `plan:${threadId}:`;
       const turnKeys = Array.from(yield* Cache.keys(turnMessageIdsByTurnKey));
+      const terminalTurnKeys = Array.from(yield* Cache.keys(terminalTurnsByTurnKey));
       const assistantSegmentKeys = Array.from(yield* Cache.keys(assistantSegmentStateByTurnKey));
       const proposedPlanKeys = Array.from(yield* Cache.keys(bufferedProposedPlanById));
       yield* Effect.forEach(
@@ -1186,6 +1203,12 @@ const make = Effect.gen(function* () {
 
             yield* Cache.invalidate(turnMessageIdsByTurnKey, key);
           }),
+        { concurrency: 1 },
+      ).pipe(Effect.asVoid);
+      yield* Effect.forEach(
+        terminalTurnKeys,
+        (key) =>
+          key.startsWith(prefix) ? Cache.invalidate(terminalTurnsByTurnKey, key) : Effect.void,
         { concurrency: 1 },
       ).pipe(Effect.asVoid);
       yield* Effect.forEach(
@@ -1352,6 +1375,10 @@ const make = Effect.gen(function* () {
           ? yield* getSourceProposedPlanReferenceForAcceptedTurnStart(thread.id, eventTurnId)
           : null;
 
+      if (event.type === "turn.completed" && eventTurnId !== undefined) {
+        yield* rememberTerminalTurn(thread.id, eventTurnId);
+      }
+
       if (
         event.type === "session.started" ||
         event.type === "session.state.changed" ||
@@ -1402,6 +1429,7 @@ const make = Effect.gen(function* () {
             eventTurnId !== undefined &&
             !sameId(activeTurnId, eventTurnId)
           ) {
+            yield* rememberTerminalTurn(thread.id, activeTurnId);
             const detailedThread = yield* getLoadedThreadDetail();
             yield* finalizeRememberedAssistantMessagesForTurn({
               event,
@@ -1472,6 +1500,8 @@ const make = Effect.gen(function* () {
         if (turnId) {
           yield* rememberAssistantMessageId(thread.id, turnId, assistantMessageId);
         }
+        const shouldFinalizeTerminalDelta =
+          turnId !== undefined && (yield* hasTerminalTurn(thread.id, turnId));
 
         const assistantDeliveryMode: AssistantDeliveryMode = yield* Effect.map(
           serverSettingsService.getSettings,
@@ -1479,6 +1509,7 @@ const make = Effect.gen(function* () {
         );
         if (assistantDeliveryMode === "buffered") {
           const spillChunk = yield* appendBufferedAssistantText(assistantMessageId, assistantDelta);
+          let hasProjectedMessage = false;
           if (spillChunk.length > 0) {
             yield* orchestrationEngine.dispatch({
               type: "thread.message.assistant.delta",
@@ -1488,6 +1519,19 @@ const make = Effect.gen(function* () {
               delta: spillChunk,
               ...(turnId ? { turnId } : {}),
               createdAt: now,
+            });
+            hasProjectedMessage = true;
+          }
+          if (shouldFinalizeTerminalDelta) {
+            yield* finalizeAssistantMessage({
+              event,
+              threadId: thread.id,
+              messageId: assistantMessageId,
+              turnId,
+              createdAt: now,
+              commandTag: "assistant-complete-after-terminal-delta",
+              finalDeltaCommandTag: "assistant-delta-finalize-after-terminal-delta",
+              hasProjectedMessage,
             });
           }
         } else {
@@ -1500,6 +1544,18 @@ const make = Effect.gen(function* () {
             ...(turnId ? { turnId } : {}),
             createdAt: now,
           });
+          if (shouldFinalizeTerminalDelta) {
+            yield* finalizeAssistantMessage({
+              event,
+              threadId: thread.id,
+              messageId: assistantMessageId,
+              turnId,
+              createdAt: now,
+              commandTag: "assistant-complete-after-terminal-streaming-delta",
+              finalDeltaCommandTag: "assistant-delta-finalize-after-terminal-streaming-delta",
+              hasProjectedMessage: true,
+            });
+          }
         }
       }
 

@@ -25,6 +25,7 @@ const emitForeignSessionUpdates = process.env.T3_ACP_EMIT_FOREIGN_SESSION_UPDATE
 const hangPromptForever = process.env.T3_ACP_HANG_PROMPT_FOREVER === "1";
 const hangFirstPromptForever = process.env.T3_ACP_HANG_FIRST_PROMPT_FOREVER === "1";
 const emitLateUpdateAfterCancel = process.env.T3_ACP_EMIT_LATE_UPDATE_AFTER_CANCEL === "1";
+const exitAfterPromptReturn = process.env.T3_ACP_EXIT_AFTER_PROMPT_RETURN === "1";
 const omitXAiPromptCompleteStopReason =
   process.env.T3_ACP_OMIT_XAI_PROMPT_COMPLETE_STOP_REASON === "1";
 const failLoadSession = process.env.T3_ACP_FAIL_LOAD_SESSION === "1";
@@ -585,6 +586,14 @@ const program = Effect.gen(function* () {
 
       if (failPrompt || (failFirstPrompt && promptCount === 1)) {
         return yield* AcpError.AcpRequestError.internalError("Mock prompt failure");
+      }
+
+      if (exitAfterPromptReturn) {
+        yield* Effect.forkIn(
+          Effect.sleep("5 millis").pipe(Effect.andThen(Effect.sync(() => process.exit(0)))),
+          programScope,
+        );
+        return { stopReason: "end_turn" };
       }
 
       if (emitStaleXAiPromptCompleteBeforeSecondHang && promptCount === 1) {

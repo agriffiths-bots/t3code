@@ -505,6 +505,55 @@ cursorAdapterTestLayer("CursorAdapterLive", (it) => {
     }),
   );
 
+  it.effect("settles a completed turn when the Cursor notification stream exits before drain", () =>
+    Effect.gen(function* () {
+      const adapter = yield* CursorAdapter;
+      const settings = yield* ServerSettingsService;
+      const threadId = ThreadId.make("cursor-drain-notification-exit-thread");
+      const turnCompleted =
+        yield* Deferred.make<Extract<ProviderRuntimeEvent, { type: "turn.completed" }>>();
+
+      const wrapperPath = yield* Effect.promise(() =>
+        makeMockAgentWrapper({
+          T3_ACP_EXIT_AFTER_PROMPT_RETURN: "1",
+        }),
+      );
+      yield* settings.updateSettings({ providers: { cursor: { binaryPath: wrapperPath } } });
+
+      const runtimeEventsFiber = yield* Stream.runForEach(adapter.streamEvents, (event) =>
+        Effect.gen(function* () {
+          if (String(event.threadId) !== String(threadId)) {
+            return;
+          }
+          if (event.type === "turn.completed") {
+            yield* Deferred.succeed(turnCompleted, event).pipe(Effect.ignore);
+          }
+        }),
+      ).pipe(Effect.forkChild);
+
+      yield* adapter.startSession({
+        threadId,
+        provider: ProviderDriverKind.make("cursor"),
+        cwd: process.cwd(),
+        runtimeMode: "full-access",
+        modelSelection: { instanceId: ProviderInstanceId.make("cursor"), model: "default" },
+      });
+
+      yield* adapter
+        .sendTurn({
+          threadId,
+          input: "complete even if Cursor notifications exit",
+          attachments: [],
+        })
+        .pipe(Effect.timeout("2 seconds"));
+      const completed = yield* Deferred.await(turnCompleted).pipe(Effect.timeout("2 seconds"));
+      assert.equal(completed.payload.state, "completed");
+
+      yield* adapter.stopSession(threadId);
+      yield* Fiber.interrupt(runtimeEventsFiber);
+    }),
+  );
+
   it.effect("clears a resumed active turn when interrupted before a local prompt", () =>
     Effect.gen(function* () {
       const adapter = yield* CursorAdapter;

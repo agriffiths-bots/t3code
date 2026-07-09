@@ -135,6 +135,7 @@ interface CursorSessionContext {
   readonly turns: Array<{ id: TurnId; items: Array<unknown> }>;
   lastPlanFingerprint: string | undefined;
   activeTurnId: TurnId | undefined;
+  readonly stoppedSignal: Deferred.Deferred<void>;
   /** Number of sendTurn prompts currently in flight or being prepared.
    * >0 means a turn is actively running, so a new sendTurn is a steer that
    * continues it, and only the last remaining prompt settles the turn. */
@@ -458,10 +459,22 @@ export function makeCursorAdapter(
       return Effect.succeed(ctx);
     };
 
+    const awaitNotificationFiberExit = (ctx: CursorSessionContext) =>
+      ctx.notificationFiber === undefined
+        ? Effect.void
+        : Fiber.await(ctx.notificationFiber).pipe(Effect.asVoid);
+
+    const drainEventsOrSessionEnd = (ctx: CursorSessionContext) =>
+      Effect.raceFirst(
+        ctx.acp.drainEvents,
+        Effect.raceFirst(Deferred.await(ctx.stoppedSignal), awaitNotificationFiberExit(ctx)),
+      );
+
     const stopSessionInternal = (ctx: CursorSessionContext) =>
       Effect.gen(function* () {
         if (ctx.stopped) return;
         ctx.stopped = true;
+        yield* Deferred.succeed(ctx.stoppedSignal, undefined).pipe(Effect.ignore);
         yield* settlePendingApprovalsAsCancelled(ctx.pendingApprovals);
         yield* settlePendingUserInputsAsEmptyAnswers(ctx.pendingUserInputs);
         if (ctx.notificationFiber) {
@@ -510,6 +523,7 @@ export function makeCursorAdapter(
 
           const pendingApprovals = new Map<ApprovalRequestId, PendingApproval>();
           const pendingUserInputs = new Map<ApprovalRequestId, PendingUserInput>();
+          const stoppedSignal = yield* Deferred.make<void>();
           const sessionScope = yield* Scope.make("sequential");
           let sessionScopeTransferred = false;
           yield* Effect.addFinalizer(() =>
@@ -772,6 +786,7 @@ export function makeCursorAdapter(
             turns: [],
             lastPlanFingerprint: undefined,
             activeTurnId: input.activeTurnId,
+            stoppedSignal,
             promptsInFlight: 0,
             stopped: false,
           };
@@ -1030,15 +1045,29 @@ export function makeCursorAdapter(
           // superseded prompt resolving (usually cancelled) while another is
           // in flight or pending must leave the merged turn running.
           if (ctx.promptsInFlight === 1) {
+            if (ctx.stopped) {
+              return {
+                threadId: input.threadId,
+                turnId,
+                resumeCursor: ctx.session.resumeCursor,
+              };
+            }
+            yield* drainEventsOrSessionEnd(ctx);
+            if (ctx.stopped) {
+              return {
+                threadId: input.threadId,
+                turnId,
+                resumeCursor: ctx.session.resumeCursor,
+              };
+            }
             const { activeTurnId: _completedActiveTurnId, ...sessionWithoutActiveTurn } =
               ctx.session;
-            ctx.activeTurnId = undefined;
-            ctx.session = {
+            const completedSession = {
               ...sessionWithoutActiveTurn,
               status: "ready",
               updatedAt: yield* nowIso,
               model: resolvedModel,
-            };
+            } satisfies ProviderSession;
             yield* offerRuntimeEvent({
               type: "turn.completed",
               ...(yield* makeEventStamp()),
@@ -1050,6 +1079,8 @@ export function makeCursorAdapter(
                 stopReason: result.stopReason ?? null,
               },
             });
+            ctx.activeTurnId = undefined;
+            ctx.session = completedSession;
           } else {
             ctx.session = {
               ...ctx.session,
