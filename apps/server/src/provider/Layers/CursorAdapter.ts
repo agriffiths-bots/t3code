@@ -379,6 +379,19 @@ export function makeCursorAdapter(
             ctx.acp.drainEvents.pipe(Effect.as(true)),
             Deferred.await(ctx.stoppedSignal).pipe(Effect.as(false)),
           );
+    const switchNotificationTurnIdAfterDrain = (ctx: CursorSessionContext, turnId: TurnId) =>
+      ctx.stopped
+        ? Effect.succeed(false)
+        : Effect.raceFirst(
+            ctx.acp
+              .drainEventsThen(
+                Effect.sync(() => {
+                  ctx.notificationTurnId = turnId;
+                }),
+              )
+              .pipe(Effect.as(true)),
+            Deferred.await(ctx.stoppedSignal).pipe(Effect.as(false)),
+          );
 
     const rememberAssistantItemTurnId = (
       ctx: CursorSessionContext,
@@ -1057,14 +1070,13 @@ export function makeCursorAdapter(
             });
           }
 
-          const drainedBeforeTurn = yield* drainAcpEventsUnlessStopped(ctx);
+          const drainedBeforeTurn = yield* switchNotificationTurnIdAfterDrain(ctx, turnId);
           if (!drainedBeforeTurn || ctx.stopped) {
             return yield* new ProviderAdapterSessionNotFoundError({
               provider: PROVIDER,
               threadId: input.threadId,
             });
           }
-          ctx.notificationTurnId = turnId;
 
           const promptParts: Array<EffectAcpSchema.ContentBlock> = [];
           if (input.input?.trim()) {

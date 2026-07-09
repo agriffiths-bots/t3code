@@ -182,6 +182,11 @@ export class AcpSessionRuntime extends Context.Service<
     readonly getEvents: () => Stream.Stream<AcpSessionRuntimeEvent, never>;
     /** Waits until the current event consumer has processed every queued event. */
     readonly drainEvents: Effect.Effect<void>;
+    /**
+     * Waits for queued events, then runs `effect` before any waiting
+     * `session/update` producer can enqueue additional parsed events.
+     */
+    readonly drainEventsThen: <A, E, R>(effect: Effect.Effect<A, E, R>) => Effect.Effect<A, E, R>;
     /** Latest mode state observed from session setup and `session/update` notifications. */
     readonly getModeState: Effect.Effect<AcpSessionModeState | undefined>;
     /** Latest configuration options observed from session setup and configuration writes. */
@@ -289,6 +294,7 @@ export const make = (
     const startStateRef = yield* Ref.make<AcpStartState>({ _tag: "NotStarted" });
     const startupSessionIdRef = yield* Ref.make<Option.Option<string>>(Option.none());
     const promptSerializationSemaphore = yield* Semaphore.make(1);
+    const sessionUpdateSemaphore = yield* Semaphore.make(1);
     const activePromptFiberRef = yield* Ref.make<
       Option.Option<Fiber.Fiber<EffectAcpSchema.PromptResponse, EffectAcpErrors.AcpError>>
     >(Option.none());
@@ -418,13 +424,15 @@ export const make = (
         if (activeSessionId === undefined || notification.sessionId !== activeSessionId) {
           return;
         }
-        yield* handleSessionUpdate({
-          queue: eventQueue,
-          modeStateRef,
-          toolCallsRef,
-          assistantSegmentRef,
-          params: notification,
-        });
+        yield* sessionUpdateSemaphore.withPermit(
+          handleSessionUpdate({
+            queue: eventQueue,
+            modeStateRef,
+            toolCallsRef,
+            assistantSegmentRef,
+            params: notification,
+          }),
+        );
       }),
     );
     const initializeClientCapabilities = {
@@ -757,14 +765,28 @@ export const make = (
       handleExtNotification: acp.handleExtNotification,
       start: () => start,
       getEvents: () => Stream.fromQueue(eventQueue),
-      drainEvents: Effect.gen(function* () {
-        const acknowledge = yield* Deferred.make<void>();
-        yield* Queue.offer(eventQueue, {
-          _tag: "EventStreamBarrier",
-          acknowledge,
-        });
-        yield* Deferred.await(acknowledge);
-      }),
+      drainEventsThen: (effect) =>
+        sessionUpdateSemaphore.withPermit(
+          Effect.gen(function* () {
+            const acknowledge = yield* Deferred.make<void>();
+            yield* Queue.offer(eventQueue, {
+              _tag: "EventStreamBarrier",
+              acknowledge,
+            });
+            yield* Deferred.await(acknowledge);
+            return yield* effect;
+          }),
+        ),
+      drainEvents: sessionUpdateSemaphore.withPermit(
+        Effect.gen(function* () {
+          const acknowledge = yield* Deferred.make<void>();
+          yield* Queue.offer(eventQueue, {
+            _tag: "EventStreamBarrier",
+            acknowledge,
+          });
+          yield* Deferred.await(acknowledge);
+        }),
+      ),
       getModeState: Ref.get(modeStateRef),
       getConfigOptions: Ref.get(configOptionsRef),
       prompt: (payload) =>
