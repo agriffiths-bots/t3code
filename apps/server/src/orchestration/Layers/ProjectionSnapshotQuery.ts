@@ -1922,6 +1922,65 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
       } satisfies OrchestrationThreadShell);
     });
 
+  const getThreadShellByIdIncludingArchived: ProjectionSnapshotQueryShape["getThreadShellByIdIncludingArchived"] =
+    (threadId) =>
+      Effect.gen(function* () {
+        const [threadRow, latestTurnRow, sessionRow] = yield* Effect.all([
+          getNonDeletedThreadRowById({ threadId }).pipe(
+            Effect.mapError(
+              toPersistenceSqlOrDecodeError(
+                "ProjectionSnapshotQuery.getThreadShellByIdIncludingArchived:getThread:query",
+                "ProjectionSnapshotQuery.getThreadShellByIdIncludingArchived:getThread:decodeRow",
+              ),
+            ),
+          ),
+          getLatestTurnRowByThread({ threadId }).pipe(
+            Effect.mapError(
+              toPersistenceSqlOrDecodeError(
+                "ProjectionSnapshotQuery.getThreadShellByIdIncludingArchived:getLatestTurn:query",
+                "ProjectionSnapshotQuery.getThreadShellByIdIncludingArchived:getLatestTurn:decodeRow",
+              ),
+            ),
+          ),
+          getThreadSessionRowByThread({ threadId }).pipe(
+            Effect.mapError(
+              toPersistenceSqlOrDecodeError(
+                "ProjectionSnapshotQuery.getThreadShellByIdIncludingArchived:getSession:query",
+                "ProjectionSnapshotQuery.getThreadShellByIdIncludingArchived:getSession:decodeRow",
+              ),
+            ),
+          ),
+        ]);
+
+        if (Option.isNone(threadRow)) {
+          return Option.none<OrchestrationThreadShell>();
+        }
+
+        return Option.some({
+          id: threadRow.value.threadId,
+          projectId: threadRow.value.projectId,
+          title: threadRow.value.title,
+          modelSelection: threadRow.value.modelSelection,
+          runtimeMode: threadRow.value.runtimeMode,
+          interactionMode: threadRow.value.interactionMode,
+          branch: threadRow.value.branch,
+          worktreePath: threadRow.value.worktreePath,
+          worktreeRemovable: threadRow.value.worktreeRemovable > 0,
+          worktreeRemovalPath: threadRow.value.worktreeRemovalPath,
+          latestTurn: Option.isSome(latestTurnRow) ? mapLatestTurn(latestTurnRow.value) : null,
+          createdAt: threadRow.value.createdAt,
+          updatedAt: threadRow.value.updatedAt,
+          archivedAt: threadRow.value.archivedAt,
+          session: Option.isSome(sessionRow) ? mapSessionRow(sessionRow.value) : null,
+          latestUserMessageAt: threadRow.value.latestUserMessageAt,
+          hasPendingApprovals: threadRow.value.pendingApprovalCount > 0,
+          hasPendingUserInput: threadRow.value.pendingUserInputCount > 0,
+          hasActionableProposedPlan: threadRow.value.hasActionableProposedPlan > 0,
+          parentThreadId: threadRow.value.parentThreadId,
+          parentEnvironmentId: threadRow.value.parentEnvironmentId ?? null,
+        } satisfies OrchestrationThreadShell);
+      });
+
   const getThreadDetailById: ProjectionSnapshotQueryShape["getThreadDetailById"] = (threadId) =>
     Effect.gen(function* () {
       const [
@@ -2117,6 +2176,7 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
     getThreadCheckpointContext,
     getFullThreadDiffContext,
     getThreadShellById,
+    getThreadShellByIdIncludingArchived,
     getThreadDetailById,
     getThreadDetailSnapshot,
   } satisfies ProjectionSnapshotQueryShape;

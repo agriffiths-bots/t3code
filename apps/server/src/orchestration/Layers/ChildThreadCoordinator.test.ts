@@ -452,19 +452,8 @@ describe("ChildThreadCoordinator", () => {
       }),
     );
 
-    const projectionLayer = Layer.succeed(ProjectionSnapshotQuery, {
-      getCommandReadModel: () => unsupported(),
-      getSnapshot: () => unsupported(),
-      getShellSnapshot: () => unsupported(),
-      getArchivedShellSnapshot: () => unsupported(),
-      getSnapshotSequence: () => unsupported(),
-      getCounts: () => unsupported(),
-      getActiveProjectByWorkspaceRoot: () => unsupported(),
-      getProjectShellById: () => unsupported(),
-      getFirstActiveThreadIdByProjectId: () => unsupported(),
-      getThreadCheckpointContext: () => unsupported(),
-      getFullThreadDiffContext: () => unsupported(),
-      getThreadShellById: (threadId) =>
+    const readThreadShellByIdIncludingArchived: ProjectionSnapshotQuery["Service"]["getThreadShellByIdIncludingArchived"] =
+      (threadId) =>
         Effect.gen(function* () {
           const slowReadCount = slowShellReadCounts.get(String(threadId)) ?? 0;
           if (slowShellIds.has(String(threadId)) || slowReadCount > 0) {
@@ -478,14 +467,38 @@ describe("ChildThreadCoordinator", () => {
           if (sequence !== undefined && sequence.length > 0) {
             const readCount = shellReadCounts.get(String(threadId)) ?? 0;
             shellReadCounts.set(String(threadId), readCount + 1);
-            const shell = sequence[Math.min(readCount, sequence.length - 1)]!.shell;
-            return shell.archivedAt === null ? Option.some(shell) : Option.none();
+            return Option.some(sequence[Math.min(readCount, sequence.length - 1)]!.shell);
           }
           const state = threadStates.get(threadId);
-          return state && state.shell.archivedAt === null
-            ? Option.some(state.shell)
-            : Option.none();
-        }),
+          return state ? Option.some(state.shell) : Option.none();
+        });
+
+    const readThreadShellById: ProjectionSnapshotQuery["Service"]["getThreadShellById"] = (
+      threadId,
+    ) =>
+      readThreadShellByIdIncludingArchived(threadId).pipe(
+        Effect.map(
+          Option.match({
+            onNone: () => Option.none(),
+            onSome: (shell) => (shell.archivedAt === null ? Option.some(shell) : Option.none()),
+          }),
+        ),
+      );
+
+    const projectionLayer = Layer.succeed(ProjectionSnapshotQuery, {
+      getCommandReadModel: () => unsupported(),
+      getSnapshot: () => unsupported(),
+      getShellSnapshot: () => unsupported(),
+      getArchivedShellSnapshot: () => unsupported(),
+      getSnapshotSequence: () => unsupported(),
+      getCounts: () => unsupported(),
+      getActiveProjectByWorkspaceRoot: () => unsupported(),
+      getProjectShellById: () => unsupported(),
+      getFirstActiveThreadIdByProjectId: () => unsupported(),
+      getThreadCheckpointContext: () => unsupported(),
+      getFullThreadDiffContext: () => unsupported(),
+      getThreadShellById: readThreadShellById,
+      getThreadShellByIdIncludingArchived: readThreadShellByIdIncludingArchived,
       getThreadDetailById: (threadId) =>
         Effect.gen(function* () {
           const key = String(threadId);

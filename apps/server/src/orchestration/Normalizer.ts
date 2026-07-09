@@ -1,5 +1,6 @@
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
+import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 import {
   type ClientOrchestrationCommand,
@@ -11,6 +12,7 @@ import {
 import { createAttachmentId, resolveAttachmentPath } from "../attachmentStore.ts";
 import { ServerConfig } from "../config.ts";
 import { parseBase64DataUrl } from "../imageMime.ts";
+import { ProjectionSnapshotQuery } from "./Services/ProjectionSnapshotQuery.ts";
 import * as WorkspacePaths from "../workspace/WorkspacePaths.ts";
 
 export const normalizeDispatchCommand = (command: ClientOrchestrationCommand) =>
@@ -18,6 +20,7 @@ export const normalizeDispatchCommand = (command: ClientOrchestrationCommand) =>
     const fileSystem = yield* FileSystem.FileSystem;
     const path = yield* Path.Path;
     const serverConfig = yield* ServerConfig;
+    const projectionSnapshotQuery = yield* ProjectionSnapshotQuery;
     const workspacePaths = yield* WorkspacePaths.WorkspacePaths;
 
     const normalizeProjectWorkspaceRoot = (workspaceRoot: string) =>
@@ -67,6 +70,22 @@ export const normalizeDispatchCommand = (command: ClientOrchestrationCommand) =>
 
     if (command.type !== "thread.turn.start") {
       return command as OrchestrationCommand;
+    }
+
+    const threadShell = yield* projectionSnapshotQuery
+      .getThreadShellByIdIncludingArchived(command.threadId)
+      .pipe(
+        Effect.mapError(
+          () =>
+            new OrchestrationDispatchCommandError({
+              message: `Failed to read thread '${command.threadId}' before dispatching '${command.type}'.`,
+            }),
+        ),
+      );
+    if (Option.isSome(threadShell) && threadShell.value.archivedAt !== null) {
+      return yield* new OrchestrationDispatchCommandError({
+        message: `Thread '${command.threadId}' is already archived and cannot handle command '${command.type}'.`,
+      });
     }
 
     const normalizedAttachments = yield* Effect.forEach(

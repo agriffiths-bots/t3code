@@ -5,6 +5,9 @@ import * as NodePath from "node:path";
 
 import {
   ModelSelection,
+  type OrchestrationCommand,
+  type OrchestrationEvent,
+  type OrchestrationSession,
   ProviderRuntimeEvent,
   ProviderSession,
   ProviderDriverKind,
@@ -25,6 +28,7 @@ import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Layer from "effect/Layer";
 import * as ManagedRuntime from "effect/ManagedRuntime";
+import * as Option from "effect/Option";
 import * as PubSub from "effect/PubSub";
 import * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
@@ -58,6 +62,7 @@ import { ProjectionSnapshotQuery } from "../Services/ProjectionSnapshotQuery.ts"
 import { readDetailedReadModel } from "../testUtils/readModel.ts";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import * as Clock from "effect/Clock";
+import * as Deferred from "effect/Deferred";
 import { ServerSettingsService } from "../../serverSettings.ts";
 import { VcsStatusBroadcaster } from "../../vcs/VcsStatusBroadcaster.ts";
 import * as GitWorkflowService from "../../git/GitWorkflowService.ts";
@@ -470,6 +475,279 @@ describe("ProviderCommandReactor", () => {
     const thread = readModel.threads.find((entry) => entry.id === ThreadId.make("thread-1"));
     expect(thread?.session?.threadId).toBe("thread-1");
     expect(thread?.session?.runtimeMode).toBe("approval-required");
+  });
+
+  it("does not start a provider session for an archived thread", async () => {
+    const harness = await createHarness();
+    const now = "2026-01-01T00:00:00.000Z";
+
+    await runtime!.runPromise(
+      harness.engine.dispatch({
+        type: "thread.archive",
+        commandId: CommandId.make("cmd-archive-before-turn-start"),
+        threadId: ThreadId.make("thread-1"),
+      }),
+    );
+
+    await expect(
+      runtime!.runPromise(
+        harness.engine.dispatch({
+          type: "thread.turn.start",
+          commandId: CommandId.make("cmd-turn-start-archived-thread"),
+          threadId: ThreadId.make("thread-1"),
+          message: {
+            messageId: asMessageId("user-message-archived-thread"),
+            role: "user",
+            text: "this should not start",
+            attachments: [],
+          },
+          interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+          runtimeMode: "approval-required",
+          createdAt: now,
+        }),
+      ),
+    ).rejects.toThrow("already archived");
+
+    await harness.drain();
+    expect(harness.startSession).not.toHaveBeenCalled();
+    expect(harness.sendTurn).not.toHaveBeenCalled();
+  });
+
+  it("records a visible cancellation when archive wins a queued turn start", async () => {
+    const harness = await createHarness();
+    const now = "2026-01-01T00:00:00.000Z";
+    const releaseStartSession = Effect.runSync(Deferred.make<void>());
+    const defaultStartSession = harness.startSession.getMockImplementation();
+    if (!defaultStartSession) {
+      throw new Error("Missing default startSession implementation.");
+    }
+    harness.startSession.mockImplementationOnce((threadId, input) =>
+      Deferred.await(releaseStartSession).pipe(
+        Effect.flatMap(() => defaultStartSession(threadId, input)),
+      ),
+    );
+
+    await runtime!.runPromise(
+      harness.engine.dispatch({
+        type: "thread.turn.start",
+        commandId: CommandId.make("cmd-turn-start-then-archive"),
+        threadId: ThreadId.make("thread-1"),
+        message: {
+          messageId: asMessageId("user-message-then-archive"),
+          role: "user",
+          text: "archive before provider work",
+          attachments: [],
+        },
+        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+        runtimeMode: "approval-required",
+        createdAt: now,
+      }),
+    );
+    await waitFor(() => harness.startSession.mock.calls.length === 1);
+
+    await runtime!.runPromise(
+      harness.engine.dispatch({
+        type: "thread.archive",
+        commandId: CommandId.make("cmd-archive-queued-turn"),
+        threadId: ThreadId.make("thread-1"),
+      }),
+    );
+    await Effect.runPromise(Deferred.succeed(releaseStartSession, undefined));
+
+    await waitFor(async () => {
+      const readModel = await harness.readModel();
+      const thread = readModel.threads.find((entry) => entry.id === ThreadId.make("thread-1"));
+      return (
+        thread?.activities.some(
+          (activity) =>
+            activity.kind === "provider.turn.start.failed" &&
+            typeof activity.payload === "object" &&
+            activity.payload !== null &&
+            "detail" in activity.payload &&
+            String(activity.payload.detail).includes("archived before the queued provider turn"),
+        ) === true
+      );
+    });
+    await harness.drain();
+
+    expect(harness.sendTurn).not.toHaveBeenCalled();
+    expect(harness.stopSession).toHaveBeenCalledTimes(1);
+    expect(harness.runtimeSessions).toHaveLength(0);
+    const readModel = await harness.readModel();
+    const thread = readModel.threads.find((entry) => entry.id === ThreadId.make("thread-1"));
+    expect(thread?.archivedAt).not.toBeNull();
+    expect(thread?.messages.at(-1)).toMatchObject({
+      id: asMessageId("user-message-then-archive"),
+      text: "archive before provider work",
+    });
+  });
+
+  it("marks archived queued turn starts as failed when no provider session exists", async () => {
+    const threadId = ThreadId.make("archived-queued-no-session");
+    const messageId = asMessageId("user-message-archived-queued-no-session");
+    const now = "2026-01-01T00:00:00.000Z";
+    const modelSelection = {
+      instanceId: ProviderInstanceId.make("codex"),
+      model: "gpt-5-codex",
+    };
+    const domainEvents = Effect.runSync(PubSub.unbounded<OrchestrationEvent>());
+    const runtimeEventPubSub = Effect.runSync(PubSub.unbounded<ProviderRuntimeEvent>());
+    const dispatchedCommands: OrchestrationCommand[] = [];
+    let projectedSession: OrchestrationSession | null = null;
+
+    const startSession = vi.fn<ProviderServiceShape["startSession"]>(() =>
+      Effect.die("startSession should not be called"),
+    );
+    const sendTurn = vi.fn<ProviderServiceShape["sendTurn"]>(() =>
+      Effect.die("sendTurn should not be called"),
+    );
+    const stopSession = vi.fn<ProviderServiceShape["stopSession"]>(() =>
+      Effect.die("stopSession should not be called"),
+    );
+    const providerService: ProviderServiceShape = {
+      startSession,
+      sendTurn,
+      interruptTurn: () => Effect.die("interruptTurn should not be called") as never,
+      respondToRequest: () => Effect.die("respondToRequest should not be called") as never,
+      respondToUserInput: () => Effect.die("respondToUserInput should not be called") as never,
+      stopSession,
+      listSessions: () => Effect.succeed([]),
+      getCapabilities: () => Effect.succeed({ sessionModelSwitch: "in-session" }),
+      getInstanceInfo: (instanceId) =>
+        Effect.succeed({
+          instanceId,
+          driverKind: ProviderDriverKind.make("codex"),
+          displayName: undefined,
+          enabled: true,
+          continuationIdentity: {
+            driverKind: ProviderDriverKind.make("codex"),
+            continuationKey: "codex:home:/shared-codex",
+          },
+        }),
+      rollbackConversation: () => Effect.die("rollbackConversation should not be called") as never,
+      streamEvents: Stream.fromPubSub(runtimeEventPubSub),
+    };
+    const engine = {
+      readEvents: () => Stream.empty,
+      streamDomainEvents: Stream.fromPubSub(domainEvents),
+      dispatch: (command: OrchestrationCommand) =>
+        Effect.sync(() => {
+          dispatchedCommands.push(command);
+          if (command.type === "thread.session.set") {
+            projectedSession = command.session;
+          }
+          return { sequence: dispatchedCommands.length + 1 };
+        }),
+    } satisfies OrchestrationEngineService["Service"];
+    const archivedTurnStartEvent: Extract<
+      OrchestrationEvent,
+      { type: "thread.turn-start-requested" }
+    > = {
+      sequence: 1,
+      eventId: EventId.make("event-archived-queued-no-session"),
+      aggregateKind: "thread",
+      aggregateId: threadId,
+      type: "thread.turn-start-requested",
+      occurredAt: now,
+      commandId: CommandId.make("cmd-archived-queued-no-session"),
+      causationEventId: null,
+      correlationId: CommandId.make("cmd-archived-queued-no-session"),
+      metadata: {},
+      payload: {
+        threadId,
+        messageId,
+        runtimeMode: "approval-required",
+        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+        createdAt: now,
+      },
+    };
+
+    const layer = ProviderCommandReactorLive.pipe(
+      Layer.provideMerge(Layer.succeed(OrchestrationEngineService, engine)),
+      Layer.provideMerge(
+        Layer.mock(ProjectionSnapshotQuery)({
+          getThreadDetailById: () =>
+            Effect.succeed(
+              Option.some({
+                id: threadId,
+                projectId: asProjectId("project-1"),
+                title: "Archived child",
+                archivedAt: now,
+                modelSelection,
+                runtimeMode: "approval-required",
+                interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+                branch: null,
+                worktreePath: null,
+                session: projectedSession,
+                messages: [
+                  {
+                    id: messageId,
+                    role: "user",
+                    text: "queued before archive",
+                    attachments: [],
+                  },
+                ],
+              } as never),
+            ),
+        }),
+      ),
+      Layer.provideMerge(Layer.succeed(ProviderService, providerService)),
+      Layer.provideMerge(
+        makeProviderRegistryLayer([{ instanceId: modelSelection.instanceId }] as never),
+      ),
+      Layer.provideMerge(
+        Layer.mock(GitWorkflowService.GitWorkflowService)({
+          renameBranch: () => Effect.die("renameBranch should not be called") as never,
+        }),
+      ),
+      Layer.provideMerge(
+        Layer.succeed(VcsStatusBroadcaster, {
+          getStatus: () => Effect.die("getStatus should not be called"),
+          refreshLocalStatus: () => Effect.die("refreshLocalStatus should not be called"),
+          refreshStatus: () => Effect.die("refreshStatus should not be called"),
+          streamStatus: () => Stream.die("streamStatus should not be called"),
+        }),
+      ),
+      Layer.provideMerge(
+        Layer.mock(TextGeneration, {
+          generateBranchName: () => Effect.die("generateBranchName should not be called") as never,
+          generateThreadTitle: () =>
+            Effect.die("generateThreadTitle should not be called") as never,
+        }),
+      ),
+      Layer.provideMerge(ServerSettingsService.layerTest()),
+      Layer.provideMerge(NodeServices.layer),
+    );
+    const unitRuntime = ManagedRuntime.make(layer);
+    const unitScope = await Effect.runPromise(Scope.make("sequential"));
+    try {
+      const reactor = await unitRuntime.runPromise(Effect.service(ProviderCommandReactor));
+      await Effect.runPromise(reactor.start().pipe(Scope.provide(unitScope)));
+      await Effect.runPromise(Effect.yieldNow);
+      await Effect.runPromise(PubSub.publish(domainEvents, archivedTurnStartEvent));
+      await waitFor(
+        () =>
+          dispatchedCommands.some((command) => command.type === "thread.session.set") &&
+          dispatchedCommands.some((command) => command.type === "thread.activity.append"),
+      );
+      await Effect.runPromise(reactor.drain);
+    } finally {
+      await Effect.runPromise(Scope.close(unitScope, Exit.void));
+      await unitRuntime.dispose();
+    }
+
+    expect(startSession).not.toHaveBeenCalled();
+    expect(sendTurn).not.toHaveBeenCalled();
+    expect(stopSession).not.toHaveBeenCalled();
+    expect(dispatchedCommands.map((command) => command.type)).toEqual([
+      "thread.session.set",
+      "thread.activity.append",
+    ]);
+    expect(projectedSession).toMatchObject({
+      status: "error",
+      activeTurnId: null,
+      lastError: expect.stringContaining("archived before the queued provider turn"),
+    });
   });
 
   it("accepts server-originated system turn starts as provider input", async () => {
@@ -1234,6 +1512,90 @@ describe("ProviderCommandReactor", () => {
       message: "Add a safer reconnect backoff.",
     });
     expect(harness.refreshStatus.mock.calls[0]?.[0]).toBe("/tmp/provider-project-worktree");
+  });
+
+  it("does not apply generated first-turn metadata after the thread is archived", async () => {
+    const harness = await createHarness();
+    const now = "2026-01-01T00:00:00.000Z";
+    const seededTitle = "Investigate archive cleanup race";
+    const temporaryBranch = "t3code/1234abcd";
+    const worktreePath = "/tmp/provider-project-worktree";
+    const releaseGeneration = Effect.runSync(Deferred.make<void>());
+    let branchGenerationCompleted = false;
+    let titleGenerationCompleted = false;
+
+    harness.generateBranchName.mockReturnValue(
+      Deferred.await(releaseGeneration).pipe(
+        Effect.map(() => {
+          branchGenerationCompleted = true;
+          return { branch: "feature/generated" };
+        }),
+      ),
+    );
+    harness.generateThreadTitle.mockReturnValue(
+      Deferred.await(releaseGeneration).pipe(
+        Effect.map(() => {
+          titleGenerationCompleted = true;
+          return { title: "Generated title after archive" };
+        }),
+      ),
+    );
+
+    await runtime!.runPromise(
+      harness.engine.dispatch({
+        type: "thread.meta.update",
+        commandId: CommandId.make("cmd-thread-first-turn-race-seed"),
+        threadId: ThreadId.make("thread-1"),
+        title: seededTitle,
+        branch: temporaryBranch,
+        worktreePath,
+      }),
+    );
+
+    await runtime!.runPromise(
+      harness.engine.dispatch({
+        type: "thread.turn.start",
+        commandId: CommandId.make("cmd-turn-start-first-turn-metadata-race"),
+        threadId: ThreadId.make("thread-1"),
+        message: {
+          messageId: asMessageId("user-message-first-turn-metadata-race"),
+          role: "user",
+          text: "Rename the branch and title after this starts.",
+          attachments: [],
+        },
+        titleSeed: seededTitle,
+        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+        runtimeMode: "approval-required",
+        createdAt: now,
+      }),
+    );
+
+    await waitFor(
+      () =>
+        harness.generateBranchName.mock.calls.length === 1 &&
+        harness.generateThreadTitle.mock.calls.length === 1,
+    );
+    await runtime!.runPromise(
+      harness.engine.dispatch({
+        type: "thread.archive",
+        commandId: CommandId.make("cmd-archive-first-turn-metadata-race"),
+        threadId: ThreadId.make("thread-1"),
+      }),
+    );
+    await Effect.runPromise(Deferred.succeed(releaseGeneration, undefined));
+    await waitFor(() => branchGenerationCompleted && titleGenerationCompleted);
+    for (let index = 0; index < 5; index++) {
+      await runtime!.runPromise(Effect.yieldNow);
+    }
+
+    expect(harness.renameBranch).not.toHaveBeenCalled();
+    expect(harness.refreshStatus).not.toHaveBeenCalled();
+    const readModel = await harness.readModel();
+    const thread = readModel.threads.find((entry) => entry.id === ThreadId.make("thread-1"));
+    expect(thread?.archivedAt).not.toBeNull();
+    expect(thread?.title).toBe(seededTitle);
+    expect(thread?.branch).toBe(temporaryBranch);
+    expect(thread?.worktreePath).toBe(worktreePath);
   });
 
   it("does not rename a temporary branch when another thread shares the worktree", async () => {
@@ -2969,5 +3331,38 @@ describe("ProviderCommandReactor", () => {
     expect(thread?.session?.threadId).toBe("thread-1");
     expect(thread?.session?.providerInstanceId).toBe(ProviderInstanceId.make("codex_work"));
     expect(thread?.session?.activeTurnId).toBeNull();
+  });
+
+  it("reacts to thread.session.stop by stopping a runtime-only provider session", async () => {
+    const harness = await createHarness();
+    const now = "2026-01-01T00:00:00.000Z";
+    harness.runtimeSessions.push({
+      provider: ProviderDriverKind.make("codex"),
+      providerInstanceId: ProviderInstanceId.make("codex_work"),
+      status: "ready",
+      runtimeMode: "approval-required",
+      threadId: ThreadId.make("thread-1"),
+      resumeCursor: { opaque: "runtime-only-session" },
+      createdAt: now,
+      updatedAt: now,
+    });
+
+    await runtime!.runPromise(
+      harness.engine.dispatch({
+        type: "thread.session.stop",
+        commandId: CommandId.make("cmd-runtime-only-session-stop"),
+        threadId: ThreadId.make("thread-1"),
+        createdAt: now,
+      }),
+    );
+
+    await waitFor(() => harness.stopSession.mock.calls.length === 1);
+    expect(harness.runtimeSessions).toHaveLength(0);
+    const readModel = await harness.readModel();
+    const thread = readModel.threads.find((entry) => entry.id === ThreadId.make("thread-1"));
+    expect(thread?.session?.status).toBe("stopped");
+    expect(thread?.session?.providerName).toBe("codex");
+    expect(thread?.session?.providerInstanceId).toBe(ProviderInstanceId.make("codex_work"));
+    expect(thread?.session?.runtimeMode).toBe("approval-required");
   });
 });

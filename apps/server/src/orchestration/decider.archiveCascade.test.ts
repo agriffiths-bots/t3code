@@ -256,4 +256,73 @@ it.layer(NodeServices.layer)("archive cascade decider", (it) => {
       expect(archivedIds).toEqual(["childB", "parent"]);
     }),
   );
+
+  it.effect("rejects title metadata updates for archived threads", () =>
+    Effect.gen(function* () {
+      let readModel = yield* seedTree;
+      readModel = yield* apply(readModel, 10, {
+        eventId: asEventId("evt-prearchive-parent"),
+        aggregateKind: "thread",
+        aggregateId: asThreadId("parent"),
+        type: "thread.archived",
+        occurredAt: now,
+        commandId: asCommandId("cmd-prearchive-parent"),
+        causationEventId: null,
+        correlationId: asCommandId("cmd-prearchive-parent"),
+        metadata: {},
+        payload: { threadId: asThreadId("parent"), archivedAt: now, updatedAt: now },
+      });
+
+      const error = yield* Effect.flip(
+        decideOrchestrationCommand({
+          command: {
+            type: "thread.meta.update",
+            commandId: asCommandId("cmd-meta-update-archived-parent"),
+            threadId: asThreadId("parent"),
+            title: "Generated title after archive",
+          },
+          readModel,
+        }),
+      );
+
+      expect(error.message).toContain("already archived");
+    }),
+  );
+
+  it.effect("allows workspace metadata sync for archived threads", () =>
+    Effect.gen(function* () {
+      let readModel = yield* seedTree;
+      readModel = yield* apply(readModel, 10, {
+        eventId: asEventId("evt-prearchive-parent-workspace-sync"),
+        aggregateKind: "thread",
+        aggregateId: asThreadId("parent"),
+        type: "thread.archived",
+        occurredAt: now,
+        commandId: asCommandId("cmd-prearchive-parent-workspace-sync"),
+        causationEventId: null,
+        correlationId: asCommandId("cmd-prearchive-parent-workspace-sync"),
+        metadata: {},
+        payload: { threadId: asThreadId("parent"), archivedAt: now, updatedAt: now },
+      });
+
+      const event = yield* decideOrchestrationCommand({
+        command: {
+          type: "thread.meta.update",
+          commandId: asCommandId("cmd-meta-update-archived-workspace"),
+          threadId: asThreadId("parent"),
+          branch: "t3code/generated",
+          worktreePath: "/tmp/archive/generated",
+        },
+        readModel,
+      });
+
+      expect(Array.isArray(event)).toBe(false);
+      expect((event as PlannedEvent).type).toBe("thread.meta-updated");
+      expect((event as PlannedEvent).payload).toMatchObject({
+        threadId: asThreadId("parent"),
+        branch: "t3code/generated",
+        worktreePath: "/tmp/archive/generated",
+      });
+    }),
+  );
 });

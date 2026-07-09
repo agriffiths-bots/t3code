@@ -538,6 +538,14 @@ const projectionLayer = Layer.succeed(ProjectionSnapshotQuery, {
           ? Option.some(makeParentShell())
           : Option.none(),
     ),
+  getThreadShellByIdIncludingArchived: (threadId) =>
+    Effect.succeed(
+      threadId === childThreadId
+        ? Option.some(makeChildShell(childTurnState))
+        : threadId === parentThreadId
+          ? Option.some(makeParentShell())
+          : Option.none(),
+    ),
   getThreadDetailById: (threadId) =>
     Effect.suspend(() => {
       if (threadId === childThreadId) {

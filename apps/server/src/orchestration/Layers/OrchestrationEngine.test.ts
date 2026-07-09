@@ -203,6 +203,7 @@ describe("OrchestrationEngine", () => {
           getThreadCheckpointContext: () => Effect.succeed(Option.none()),
           getFullThreadDiffContext: () => Effect.succeed(Option.none()),
           getThreadShellById: () => Effect.succeed(Option.none()),
+          getThreadShellByIdIncludingArchived: () => Effect.succeed(Option.none()),
           getThreadDetailById: () => Effect.succeed(Option.none()),
           getThreadDetailSnapshot: () => Effect.succeed(Option.none()),
         }),
@@ -432,6 +433,87 @@ describe("OrchestrationEngine", () => {
       (await system.readModel()).threads.find((thread) => thread.id === "thread-archive")
         ?.archivedAt,
     ).toBeNull();
+
+    await system.dispose();
+  });
+
+  it("rejects turn starts for archived threads before appending a user message", async () => {
+    const system = await createOrchestrationSystem();
+    const { engine } = system;
+    const createdAt = now();
+    const threadId = ThreadId.make("thread-archived-turn-start");
+
+    await system.run(
+      engine.dispatch({
+        type: "project.create",
+        commandId: CommandId.make("cmd-project-archived-turn-start-create"),
+        projectId: asProjectId("project-archived-turn-start"),
+        title: "Project Archived Turn Start",
+        workspaceRoot: "/tmp/project-archived-turn-start",
+        defaultModelSelection: {
+          instanceId: ProviderInstanceId.make("codex"),
+          model: "gpt-5-codex",
+        },
+        createdAt,
+      }),
+    );
+    await system.run(
+      engine.dispatch({
+        type: "thread.create",
+        commandId: CommandId.make("cmd-thread-archived-turn-start-create"),
+        threadId,
+        projectId: asProjectId("project-archived-turn-start"),
+        title: "Archived turn start",
+        modelSelection: {
+          instanceId: ProviderInstanceId.make("codex"),
+          model: "gpt-5-codex",
+        },
+        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+        runtimeMode: "approval-required",
+        branch: null,
+        worktreePath: null,
+        createdAt,
+      }),
+    );
+    await system.run(
+      engine.dispatch({
+        type: "thread.archive",
+        commandId: CommandId.make("cmd-thread-archived-turn-start-archive"),
+        threadId,
+      }),
+    );
+
+    await expect(
+      system.run(
+        engine.dispatch({
+          type: "thread.turn.start",
+          commandId: CommandId.make("cmd-turn-start-archived-thread"),
+          threadId,
+          message: {
+            messageId: asMessageId("msg-archived-turn-start"),
+            role: "user",
+            text: "should not persist",
+            attachments: [],
+          },
+          interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+          runtimeMode: "approval-required",
+          createdAt,
+        }),
+      ),
+    ).rejects.toThrow("already archived");
+
+    const events = await system.run(
+      Stream.runCollect(engine.readEvents(0)).pipe(
+        Effect.map((chunk): OrchestrationEvent[] => Array.from(chunk)),
+      ),
+    );
+    expect(
+      events.some(
+        (event) =>
+          event.commandId === CommandId.make("cmd-turn-start-archived-thread") &&
+          event.type === "thread.message-sent",
+      ),
+    ).toBe(false);
 
     await system.dispose();
   });
