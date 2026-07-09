@@ -40,6 +40,25 @@ const activityOrder = O.combineAll<OrchestrationThreadActivity>([
   O.mapInput(O.String, (a) => a.id),
 ]);
 
+const IMMEDIATE_SUBAGENT_STEER_COMMAND_PREFIX = "server:subagent-steer-immediate:";
+
+function isImmediateSubagentSteerCommandId(commandId: OrchestrationEvent["commandId"]): boolean {
+  return (
+    commandId !== null && String(commandId).startsWith(IMMEDIATE_SUBAGENT_STEER_COMMAND_PREFIX)
+  );
+}
+
+function activeSessionTurnId(session: OrchestrationThread["session"]): TurnId | null {
+  if (
+    session === null ||
+    (session.status !== "running" && session.status !== "waiting") ||
+    session.activeTurnId === null
+  ) {
+    return null;
+  }
+  return session.activeTurnId;
+}
+
 function updateExistingMessageForMessageSent(
   entry: OrchestrationMessage,
   message: OrchestrationMessage,
@@ -239,6 +258,12 @@ export function applyThreadDetailEvent(
 
     // ── Messages ────────────────────────────────────────────────────
     case "thread.message-sent": {
+      const projectedTurnId =
+        event.payload.turnId === null &&
+        isImmediateSubagentSteerCommandId(event.commandId) &&
+        (event.payload.role === "user" || event.payload.role === "system")
+          ? activeSessionTurnId(thread.session)
+          : event.payload.turnId;
       const message: OrchestrationMessage = {
         id: event.payload.messageId,
         role: event.payload.role,
@@ -246,7 +271,7 @@ export function applyThreadDetailEvent(
         ...(event.payload.attachments !== undefined
           ? { attachments: event.payload.attachments }
           : {}),
-        turnId: event.payload.turnId,
+        turnId: projectedTurnId,
         streaming: event.payload.streaming,
         createdAt: event.payload.createdAt,
         updatedAt: event.payload.updatedAt,

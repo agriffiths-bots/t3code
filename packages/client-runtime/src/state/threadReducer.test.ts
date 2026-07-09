@@ -2,6 +2,7 @@ import { describe, expect, it } from "vite-plus/test";
 
 import {
   CheckpointRef,
+  CommandId,
   EventId,
   MessageId,
   ProjectId,
@@ -509,6 +510,57 @@ describe("applyThreadDetailEvent", () => {
         expect(result.thread.latestTurn?.state).toBe("running");
         expect(result.thread.latestTurn?.completedAt).toBeNull();
         expect(result.thread.turns).toEqual([result.thread.latestTurn]);
+      }
+    });
+
+    it("binds immediate subagent steer messages to the active turn", () => {
+      const threadWithRunningSession: OrchestrationThread = {
+        ...baseThread,
+        session: {
+          threadId: ThreadId.make("thread-1"),
+          status: "running",
+          providerName: "codex",
+          runtimeMode: "full-access",
+          activeTurnId: TurnId.make("turn-1"),
+          lastError: null,
+          updatedAt: "2026-04-01T06:59:00.000Z",
+        },
+        latestTurn: {
+          turnId: TurnId.make("turn-1"),
+          state: "running",
+          requestedAt: "2026-04-01T06:59:00.000Z",
+          startedAt: "2026-04-01T06:59:00.000Z",
+          completedAt: null,
+          assistantMessageId: null,
+        },
+      };
+
+      const result = applyThreadDetailEvent(threadWithRunningSession, {
+        ...baseEventFields,
+        commandId: CommandId.make("server:subagent-steer-immediate:client-reducer"),
+        sequence: 8,
+        occurredAt: "2026-04-01T07:00:00.000Z",
+        aggregateKind: "thread",
+        aggregateId: ThreadId.make("thread-1"),
+        type: "thread.message-sent",
+        payload: {
+          threadId: ThreadId.make("thread-1"),
+          messageId: MessageId.make("msg-steer"),
+          role: "user",
+          text: "Adjust the active child turn.",
+          turnId: null,
+          streaming: false,
+          createdAt: "2026-04-01T07:00:00.000Z",
+          updatedAt: "2026-04-01T07:00:00.000Z",
+        },
+      });
+
+      expect(result.kind).toBe("updated");
+      if (result.kind === "updated") {
+        expect(result.thread.messages.find((message) => message.id === "msg-steer")?.turnId).toBe(
+          "turn-1",
+        );
+        expect(result.thread.latestTurn).toEqual(threadWithRunningSession.latestTurn);
       }
     });
   });
