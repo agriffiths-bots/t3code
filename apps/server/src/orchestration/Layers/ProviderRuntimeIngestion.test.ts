@@ -1354,6 +1354,38 @@ describe("ProviderRuntimeIngestion", () => {
     expect(threadAfterSteer.session?.activeTurnId).toBe(newTurnId);
     expect(threadAfterSteer.latestTurn?.turnId).toBe(newTurnId);
     expect(threadAfterSteer.latestTurn?.state).toBe("running");
+
+    harness.emit({
+      type: "content.delta",
+      eventId: asEventId("evt-late-delta-for-steered-over-turn"),
+      provider: ProviderDriverKind.make("codex"),
+      createdAt,
+      threadId,
+      turnId: oldTurnId,
+      itemId: asItemId("late-steered-over-item"),
+      payload: {
+        streamKind: "assistant_text",
+        delta: "late old turn text",
+      },
+    });
+
+    const threadWithLateOldTurnDelta = await waitForThread(
+      harness.readModel,
+      (thread) =>
+        thread.messages.some(
+          (message: ProviderRuntimeTestMessage) =>
+            message.id === "assistant:late-steered-over-item" &&
+            message.turnId === oldTurnId &&
+            message.text === "late old turn text" &&
+            !message.streaming,
+        ),
+      2_000,
+      threadId,
+    );
+    const lateOldTurnMessage = threadWithLateOldTurnDelta.messages.find(
+      (message: ProviderRuntimeTestMessage) => message.id === "assistant:late-steered-over-item",
+    );
+    expect(lateOldTurnMessage?.streaming).toBe(false);
   });
 
   it("does not mark the source proposed plan implemented for an unrelated turn.started when no thread active turn is tracked", async () => {
@@ -1653,6 +1685,752 @@ describe("ProviderRuntimeIngestion", () => {
       (entry: ProviderRuntimeTestMessage) => entry.id === "assistant:item-buffered",
     );
     expect(message?.text).toBe("buffer me");
+    expect(message?.streaming).toBe(false);
+  });
+
+  it("finalizes Cursor assistant deltas that arrive after turn completion", async () => {
+    const harness = await createHarness();
+    const now = "2026-01-01T00:00:00.000Z";
+    const threadId = asThreadId("thread-1");
+    const turnId = asTurnId("turn-cursor-late-delta");
+
+    harness.emit({
+      type: "turn.started",
+      eventId: asEventId("evt-cursor-late-delta-started"),
+      provider: ProviderDriverKind.make("cursor"),
+      createdAt: now,
+      threadId,
+      turnId,
+    });
+    await waitForThread(
+      harness.readModel,
+      (thread) =>
+        thread.session?.status === "running" &&
+        thread.session?.activeTurnId === "turn-cursor-late-delta",
+    );
+
+    harness.emit({
+      type: "turn.completed",
+      eventId: asEventId("evt-cursor-late-delta-completed"),
+      provider: ProviderDriverKind.make("cursor"),
+      createdAt: now,
+      threadId,
+      turnId,
+      payload: {
+        state: "completed",
+        stopReason: "end_turn",
+      },
+    });
+    await waitForThread(
+      harness.readModel,
+      (thread) => thread.session?.status === "ready" && thread.session?.activeTurnId === null,
+    );
+
+    harness.emit({
+      type: "content.delta",
+      eventId: asEventId("evt-cursor-late-delta-text"),
+      provider: ProviderDriverKind.make("cursor"),
+      createdAt: now,
+      threadId,
+      turnId,
+      itemId: asItemId("cursor-late-item"),
+      payload: {
+        streamKind: "assistant_text",
+        delta: "MODEL_OK composer",
+      },
+    });
+
+    const thread = await waitForThread(harness.readModel, (entry) =>
+      entry.messages.some(
+        (message: ProviderRuntimeTestMessage) =>
+          message.id === "assistant:cursor-late-item" &&
+          message.turnId === turnId &&
+          message.text === "MODEL_OK composer" &&
+          !message.streaming,
+      ),
+    );
+    const message = thread.messages.find(
+      (entry: ProviderRuntimeTestMessage) => entry.id === "assistant:cursor-late-item",
+    );
+    expect(message?.text).toBe("MODEL_OK composer");
+    expect(message?.turnId).toBe(turnId);
+    expect(message?.streaming).toBe(false);
+  });
+
+  it("keeps split Cursor assistant deltas on one message across terminal ordering", async () => {
+    const harness = await createHarness();
+    const now = "2026-01-01T00:00:00.000Z";
+    const threadId = asThreadId("thread-1");
+    const turnId = asTurnId("turn-cursor-split-terminal-delta");
+
+    harness.emit({
+      type: "turn.started",
+      eventId: asEventId("evt-cursor-split-delta-started"),
+      provider: ProviderDriverKind.make("cursor"),
+      createdAt: now,
+      threadId,
+      turnId,
+    });
+    await waitForThread(
+      harness.readModel,
+      (thread) =>
+        thread.session?.status === "running" &&
+        thread.session?.activeTurnId === "turn-cursor-split-terminal-delta",
+    );
+
+    harness.emit({
+      type: "content.delta",
+      eventId: asEventId("evt-cursor-split-delta-before-complete"),
+      provider: ProviderDriverKind.make("cursor"),
+      createdAt: now,
+      threadId,
+      turnId,
+      itemId: asItemId("cursor-split-item"),
+      payload: {
+        streamKind: "assistant_text",
+        delta: "MODEL",
+      },
+    });
+    harness.emit({
+      type: "turn.completed",
+      eventId: asEventId("evt-cursor-split-delta-completed"),
+      provider: ProviderDriverKind.make("cursor"),
+      createdAt: now,
+      threadId,
+      turnId,
+      payload: {
+        state: "completed",
+        stopReason: "end_turn",
+      },
+    });
+    await waitForThread(
+      harness.readModel,
+      (thread) =>
+        thread.session?.status === "ready" &&
+        thread.messages.some(
+          (message: ProviderRuntimeTestMessage) =>
+            message.id === "assistant:cursor-split-item" &&
+            message.text === "MODEL" &&
+            !message.streaming,
+        ),
+    );
+
+    harness.emit({
+      type: "content.delta",
+      eventId: asEventId("evt-cursor-split-delta-after-complete-1"),
+      provider: ProviderDriverKind.make("cursor"),
+      createdAt: now,
+      threadId,
+      turnId,
+      itemId: asItemId("cursor-split-item"),
+      payload: {
+        streamKind: "assistant_text",
+        delta: "_OK",
+      },
+    });
+    harness.emit({
+      type: "content.delta",
+      eventId: asEventId("evt-cursor-split-delta-after-complete-2"),
+      provider: ProviderDriverKind.make("cursor"),
+      createdAt: now,
+      threadId,
+      turnId,
+      itemId: asItemId("cursor-split-item"),
+      payload: {
+        streamKind: "assistant_text",
+        delta: " composer",
+      },
+    });
+
+    const thread = await waitForThread(harness.readModel, (entry) =>
+      entry.messages.some(
+        (message: ProviderRuntimeTestMessage) =>
+          message.id === "assistant:cursor-split-item" &&
+          message.turnId === turnId &&
+          message.text === "MODEL_OK composer" &&
+          !message.streaming,
+      ),
+    );
+    const messages = thread.messages.filter(
+      (entry: ProviderRuntimeTestMessage) => entry.id === "assistant:cursor-split-item",
+    );
+    expect(messages).toHaveLength(1);
+    expect(messages[0]?.text).toBe("MODEL_OK composer");
+    expect(messages[0]?.streaming).toBe(false);
+  });
+
+  it("keeps late Cursor deltas on their explicit old turn when a new turn is active", async () => {
+    const harness = await createHarness();
+    const now = "2026-01-01T00:00:00.000Z";
+    const threadId = asThreadId("thread-1");
+    const oldTurnId = asTurnId("turn-cursor-old-late-delta");
+    const newTurnId = asTurnId("turn-cursor-new-active");
+
+    harness.emit({
+      type: "turn.started",
+      eventId: asEventId("evt-cursor-old-late-started"),
+      provider: ProviderDriverKind.make("cursor"),
+      createdAt: now,
+      threadId,
+      turnId: oldTurnId,
+    });
+    await waitForThread(
+      harness.readModel,
+      (thread) =>
+        thread.session?.status === "running" &&
+        thread.session?.activeTurnId === "turn-cursor-old-late-delta",
+    );
+    harness.emit({
+      type: "turn.completed",
+      eventId: asEventId("evt-cursor-old-late-completed"),
+      provider: ProviderDriverKind.make("cursor"),
+      createdAt: now,
+      threadId,
+      turnId: oldTurnId,
+      payload: {
+        state: "completed",
+      },
+    });
+    await waitForThread(
+      harness.readModel,
+      (thread) => thread.session?.status === "ready" && thread.session?.activeTurnId === null,
+    );
+
+    harness.setProviderSession({
+      provider: ProviderDriverKind.make("cursor"),
+      status: "running",
+      runtimeMode: "approval-required",
+      threadId,
+      createdAt: now,
+      updatedAt: now,
+      activeTurnId: newTurnId,
+    });
+    harness.emit({
+      type: "turn.started",
+      eventId: asEventId("evt-cursor-new-active-started"),
+      provider: ProviderDriverKind.make("cursor"),
+      createdAt: now,
+      threadId,
+      turnId: newTurnId,
+    });
+    await waitForThread(
+      harness.readModel,
+      (thread) =>
+        thread.session?.status === "running" &&
+        thread.session?.activeTurnId === "turn-cursor-new-active",
+    );
+
+    harness.emit({
+      type: "content.delta",
+      eventId: asEventId("evt-cursor-old-late-delta-text"),
+      provider: ProviderDriverKind.make("cursor"),
+      createdAt: now,
+      threadId,
+      turnId: oldTurnId,
+      itemId: asItemId("cursor-old-late-item"),
+      payload: {
+        streamKind: "assistant_text",
+        delta: "old turn result",
+      },
+    });
+
+    const thread = await waitForThread(harness.readModel, (entry) =>
+      entry.messages.some(
+        (message: ProviderRuntimeTestMessage) =>
+          message.id === "assistant:cursor-old-late-item" &&
+          message.turnId === oldTurnId &&
+          message.text === "old turn result" &&
+          !message.streaming,
+      ),
+    );
+    const message = thread.messages.find(
+      (entry: ProviderRuntimeTestMessage) => entry.id === "assistant:cursor-old-late-item",
+    );
+    expect(message?.turnId).toBe(oldTurnId);
+    expect(
+      thread.messages.some(
+        (entry: ProviderRuntimeTestMessage) =>
+          entry.id === "assistant:cursor-old-late-item" && entry.turnId === newTurnId,
+      ),
+    ).toBe(false);
+  });
+
+  it("remembers non-active Cursor turn completions before late deltas arrive", async () => {
+    const harness = await createHarness();
+    const now = "2026-01-01T00:00:00.000Z";
+    const threadId = asThreadId("thread-1");
+    const activeTurnId = asTurnId("turn-cursor-active-during-old-completion");
+    const oldTurnId = asTurnId("turn-cursor-rejected-completion");
+
+    harness.emit({
+      type: "turn.started",
+      eventId: asEventId("evt-cursor-active-during-old-completion-started"),
+      provider: ProviderDriverKind.make("cursor"),
+      createdAt: now,
+      threadId,
+      turnId: activeTurnId,
+    });
+    await waitForThread(
+      harness.readModel,
+      (thread) =>
+        thread.session?.status === "running" &&
+        thread.session?.activeTurnId === "turn-cursor-active-during-old-completion",
+    );
+
+    harness.emit({
+      type: "turn.completed",
+      eventId: asEventId("evt-cursor-rejected-old-completion"),
+      provider: ProviderDriverKind.make("cursor"),
+      createdAt: now,
+      threadId,
+      turnId: oldTurnId,
+      payload: {
+        state: "completed",
+      },
+    });
+    await harness.drain();
+    const afterRejectedCompletion = await harness.readModel();
+    const activeThread = afterRejectedCompletion.threads.find((entry) => entry.id === threadId);
+    expect(activeThread?.session?.status).toBe("running");
+    expect(activeThread?.session?.activeTurnId).toBe(activeTurnId);
+
+    harness.emit({
+      type: "content.delta",
+      eventId: asEventId("evt-cursor-delta-after-rejected-old-completion"),
+      provider: ProviderDriverKind.make("cursor"),
+      createdAt: now,
+      threadId,
+      turnId: oldTurnId,
+      itemId: asItemId("cursor-rejected-old-item"),
+      payload: {
+        streamKind: "assistant_text",
+        delta: "old completed text",
+      },
+    });
+
+    const thread = await waitForThread(harness.readModel, (entry) =>
+      entry.messages.some(
+        (message: ProviderRuntimeTestMessage) =>
+          message.id === "assistant:cursor-rejected-old-item" &&
+          message.turnId === oldTurnId &&
+          message.text === "old completed text" &&
+          !message.streaming,
+      ),
+    );
+    const message = thread.messages.find(
+      (entry: ProviderRuntimeTestMessage) => entry.id === "assistant:cursor-rejected-old-item",
+    );
+    expect(message?.turnId).toBe(oldTurnId);
+    expect(thread.session?.activeTurnId).toBe(activeTurnId);
+  });
+
+  it("completes streaming Cursor assistant deltas that arrive after turn completion", async () => {
+    const harness = await createHarness({ serverSettings: { enableAssistantStreaming: true } });
+    const now = "2026-01-01T00:00:00.000Z";
+    const threadId = asThreadId("thread-1");
+    const turnId = asTurnId("turn-cursor-streaming-late-delta");
+
+    harness.emit({
+      type: "turn.started",
+      eventId: asEventId("evt-cursor-streaming-late-started"),
+      provider: ProviderDriverKind.make("cursor"),
+      createdAt: now,
+      threadId,
+      turnId,
+    });
+    await waitForThread(
+      harness.readModel,
+      (thread) =>
+        thread.session?.status === "running" &&
+        thread.session?.activeTurnId === "turn-cursor-streaming-late-delta",
+    );
+
+    harness.emit({
+      type: "turn.completed",
+      eventId: asEventId("evt-cursor-streaming-late-completed"),
+      provider: ProviderDriverKind.make("cursor"),
+      createdAt: now,
+      threadId,
+      turnId,
+      payload: {
+        state: "completed",
+      },
+    });
+    await waitForThread(
+      harness.readModel,
+      (thread) => thread.session?.status === "ready" && thread.session?.activeTurnId === null,
+    );
+
+    harness.emit({
+      type: "content.delta",
+      eventId: asEventId("evt-cursor-streaming-late-delta"),
+      provider: ProviderDriverKind.make("cursor"),
+      createdAt: now,
+      threadId,
+      turnId,
+      itemId: asItemId("cursor-streaming-late-item"),
+      payload: {
+        streamKind: "assistant_text",
+        delta: "streamed after completion",
+      },
+    });
+
+    const thread = await waitForThread(harness.readModel, (entry) =>
+      entry.messages.some(
+        (message: ProviderRuntimeTestMessage) =>
+          message.id === "assistant:cursor-streaming-late-item" &&
+          message.turnId === turnId &&
+          message.text === "streamed after completion" &&
+          !message.streaming,
+      ),
+    );
+    const message = thread.messages.find(
+      (entry: ProviderRuntimeTestMessage) => entry.id === "assistant:cursor-streaming-late-item",
+    );
+    expect(message?.streaming).toBe(false);
+  });
+
+  it("drops Cursor assistant deltas after cancelled or interrupted turn completion", async () => {
+    const harness = await createHarness();
+    const now = "2026-01-01T00:00:00.000Z";
+    const threadId = asThreadId("thread-1");
+
+    for (const terminalState of ["cancelled", "interrupted"] as const) {
+      const turnId = asTurnId(`turn-cursor-${terminalState}-late-output`);
+      const itemId = asItemId(`cursor-${terminalState}-late-item`);
+
+      harness.emit({
+        type: "turn.started",
+        eventId: asEventId(`evt-cursor-${terminalState}-started`),
+        provider: ProviderDriverKind.make("cursor"),
+        createdAt: now,
+        threadId,
+        turnId,
+      });
+      await waitForThread(
+        harness.readModel,
+        (thread) =>
+          thread.session?.status === "running" &&
+          thread.session?.activeTurnId === `turn-cursor-${terminalState}-late-output`,
+        2000,
+        threadId,
+      );
+
+      harness.emit({
+        type: "content.delta",
+        eventId: asEventId(`evt-cursor-${terminalState}-before-terminal`),
+        provider: ProviderDriverKind.make("cursor"),
+        createdAt: now,
+        threadId,
+        turnId,
+        itemId,
+        payload: {
+          streamKind: "assistant_text",
+          delta: "text before cancel",
+        },
+      });
+      harness.emit({
+        type: "turn.completed",
+        eventId: asEventId(`evt-cursor-${terminalState}-completed`),
+        provider: ProviderDriverKind.make("cursor"),
+        createdAt: now,
+        threadId,
+        turnId,
+        payload: {
+          state: terminalState,
+          stopReason: terminalState,
+        },
+      });
+      await waitForThread(
+        harness.readModel,
+        (thread) => thread.session?.status === "ready" && thread.session?.activeTurnId === null,
+        2000,
+        threadId,
+      );
+
+      harness.emit({
+        type: "content.delta",
+        eventId: asEventId(`evt-cursor-${terminalState}-after-terminal`),
+        provider: ProviderDriverKind.make("cursor"),
+        createdAt: now,
+        threadId,
+        turnId,
+        itemId,
+        payload: {
+          streamKind: "assistant_text",
+          delta: " late stale text",
+        },
+      });
+      harness.emit({
+        type: "item.completed",
+        eventId: asEventId(`evt-cursor-${terminalState}-assistant-completed`),
+        provider: ProviderDriverKind.make("cursor"),
+        createdAt: now,
+        threadId,
+        turnId,
+        itemId,
+        payload: {
+          itemType: "assistant_message",
+          status: "completed",
+        },
+      });
+
+      await harness.drain();
+      const snapshot = await harness.readModel();
+      const thread = snapshot.threads.find((entry) => entry.id === threadId);
+      const message = thread?.messages.find(
+        (entry: ProviderRuntimeTestMessage) =>
+          entry.id === `assistant:cursor-${terminalState}-late-item`,
+      );
+      expect(message?.text).toBe("text before cancel");
+      expect(message?.streaming).toBe(false);
+    }
+  });
+
+  it("finalizes Cursor assistant deltas that arrive after failed turn completion", async () => {
+    const harness = await createHarness();
+    const now = "2026-01-01T00:00:00.000Z";
+    const threadId = asThreadId("thread-1");
+    const turnId = asTurnId("turn-cursor-failed-late-delta");
+
+    harness.emit({
+      type: "turn.started",
+      eventId: asEventId("evt-cursor-failed-late-started"),
+      provider: ProviderDriverKind.make("cursor"),
+      createdAt: now,
+      threadId,
+      turnId,
+    });
+    await waitForThread(
+      harness.readModel,
+      (thread) =>
+        thread.session?.status === "running" &&
+        thread.session?.activeTurnId === "turn-cursor-failed-late-delta",
+    );
+
+    harness.emit({
+      type: "turn.completed",
+      eventId: asEventId("evt-cursor-failed-late-completed"),
+      provider: ProviderDriverKind.make("cursor"),
+      createdAt: now,
+      threadId,
+      turnId,
+      payload: {
+        state: "failed",
+        errorMessage: "Cursor failed after producing output",
+      },
+    });
+    await waitForThread(
+      harness.readModel,
+      (thread) => thread.session?.status === "error" && thread.session?.activeTurnId === null,
+    );
+
+    harness.emit({
+      type: "content.delta",
+      eventId: asEventId("evt-cursor-failed-late-delta"),
+      provider: ProviderDriverKind.make("cursor"),
+      createdAt: now,
+      threadId,
+      turnId,
+      itemId: asItemId("cursor-failed-late-item"),
+      payload: {
+        streamKind: "assistant_text",
+        delta: "failed turn text",
+      },
+    });
+
+    const thread = await waitForThread(harness.readModel, (entry) =>
+      entry.messages.some(
+        (message: ProviderRuntimeTestMessage) =>
+          message.id === "assistant:cursor-failed-late-item" &&
+          message.turnId === turnId &&
+          message.text === "failed turn text" &&
+          !message.streaming,
+      ),
+    );
+    const message = thread.messages.find(
+      (entry: ProviderRuntimeTestMessage) => entry.id === "assistant:cursor-failed-late-item",
+    );
+    expect(message?.streaming).toBe(false);
+  });
+
+  it("preserves buffered Cursor assistant text when a turn is cancelled", async () => {
+    const harness = await createHarness();
+    const now = "2026-01-01T00:00:00.000Z";
+    const threadId = asThreadId("thread-1");
+    const turnId = asTurnId("turn-cursor-buffered-cancelled");
+    const itemId = asItemId("cursor-buffered-cancelled-item");
+
+    harness.emit({
+      type: "turn.started",
+      eventId: asEventId("evt-cursor-buffered-cancelled-started"),
+      provider: ProviderDriverKind.make("cursor"),
+      createdAt: now,
+      threadId,
+      turnId,
+    });
+    await waitForThread(
+      harness.readModel,
+      (thread) =>
+        thread.session?.status === "running" &&
+        thread.session?.activeTurnId === "turn-cursor-buffered-cancelled",
+    );
+
+    harness.emit({
+      type: "content.delta",
+      eventId: asEventId("evt-cursor-buffered-cancelled-before-terminal"),
+      provider: ProviderDriverKind.make("cursor"),
+      createdAt: now,
+      threadId,
+      turnId,
+      itemId,
+      payload: {
+        streamKind: "assistant_text",
+        delta: "visible before cancel",
+      },
+    });
+    await harness.drain();
+    expect((await harness.readModel()).threads[0]?.messages).toEqual([]);
+
+    harness.emit({
+      type: "turn.completed",
+      eventId: asEventId("evt-cursor-buffered-cancelled-completed"),
+      provider: ProviderDriverKind.make("cursor"),
+      createdAt: now,
+      threadId,
+      turnId,
+      payload: {
+        state: "cancelled",
+        stopReason: "cancelled",
+      },
+    });
+    await waitForThread(
+      harness.readModel,
+      (thread) =>
+        thread.session?.status === "ready" &&
+        thread.session?.activeTurnId === null &&
+        thread.messages.some(
+          (message: ProviderRuntimeTestMessage) =>
+            message.id === "assistant:cursor-buffered-cancelled-item" &&
+            message.text === "visible before cancel" &&
+            !message.streaming,
+        ),
+    );
+
+    harness.emit({
+      type: "content.delta",
+      eventId: asEventId("evt-cursor-buffered-cancelled-after-terminal"),
+      provider: ProviderDriverKind.make("cursor"),
+      createdAt: now,
+      threadId,
+      turnId,
+      itemId,
+      payload: {
+        streamKind: "assistant_text",
+        delta: " stale after cancel",
+      },
+    });
+    await harness.drain();
+    const snapshot = await harness.readModel();
+    const thread = snapshot.threads.find((entry) => entry.id === threadId);
+    const message = thread?.messages.find(
+      (entry: ProviderRuntimeTestMessage) =>
+        entry.id === "assistant:cursor-buffered-cancelled-item",
+    );
+    expect(message?.text).toBe("visible before cancel");
+    expect(message?.streaming).toBe(false);
+  });
+
+  it("completes already-streamed Cursor assistant text when a turn is cancelled", async () => {
+    const harness = await createHarness({ serverSettings: { enableAssistantStreaming: true } });
+    const now = "2026-01-01T00:00:00.000Z";
+    const threadId = asThreadId("thread-1");
+    const turnId = asTurnId("turn-cursor-streaming-cancelled");
+    const itemId = asItemId("cursor-streaming-cancelled-item");
+
+    harness.emit({
+      type: "turn.started",
+      eventId: asEventId("evt-cursor-streaming-cancelled-started"),
+      provider: ProviderDriverKind.make("cursor"),
+      createdAt: now,
+      threadId,
+      turnId,
+    });
+    await waitForThread(
+      harness.readModel,
+      (thread) =>
+        thread.session?.status === "running" &&
+        thread.session?.activeTurnId === "turn-cursor-streaming-cancelled",
+    );
+
+    harness.emit({
+      type: "content.delta",
+      eventId: asEventId("evt-cursor-streaming-cancelled-before-terminal"),
+      provider: ProviderDriverKind.make("cursor"),
+      createdAt: now,
+      threadId,
+      turnId,
+      itemId,
+      payload: {
+        streamKind: "assistant_text",
+        delta: "visible before cancel",
+      },
+    });
+    await waitForThread(harness.readModel, (thread) =>
+      thread.messages.some(
+        (message: ProviderRuntimeTestMessage) =>
+          message.id === "assistant:cursor-streaming-cancelled-item" &&
+          message.text === "visible before cancel" &&
+          message.streaming,
+      ),
+    );
+
+    harness.emit({
+      type: "turn.completed",
+      eventId: asEventId("evt-cursor-streaming-cancelled-completed"),
+      provider: ProviderDriverKind.make("cursor"),
+      createdAt: now,
+      threadId,
+      turnId,
+      payload: {
+        state: "cancelled",
+        stopReason: "cancelled",
+      },
+    });
+    await waitForThread(
+      harness.readModel,
+      (thread) =>
+        thread.session?.status === "ready" &&
+        thread.session?.activeTurnId === null &&
+        thread.messages.some(
+          (message: ProviderRuntimeTestMessage) =>
+            message.id === "assistant:cursor-streaming-cancelled-item" &&
+            message.text === "visible before cancel" &&
+            !message.streaming,
+        ),
+    );
+
+    harness.emit({
+      type: "content.delta",
+      eventId: asEventId("evt-cursor-streaming-cancelled-after-terminal"),
+      provider: ProviderDriverKind.make("cursor"),
+      createdAt: now,
+      threadId,
+      turnId,
+      itemId,
+      payload: {
+        streamKind: "assistant_text",
+        delta: " stale after cancel",
+      },
+    });
+    await harness.drain();
+    const snapshot = await harness.readModel();
+    const thread = snapshot.threads.find((entry) => entry.id === threadId);
+    const message = thread?.messages.find(
+      (entry: ProviderRuntimeTestMessage) =>
+        entry.id === "assistant:cursor-streaming-cancelled-item",
+    );
+    expect(message?.text).toBe("visible before cancel");
     expect(message?.streaming).toBe(false);
   });
 
@@ -2430,6 +3208,79 @@ describe("ProviderRuntimeIngestion", () => {
     );
     expect(message?.text.length).toBe(oversizedText.length);
     expect(message?.text).toBe(oversizedText);
+    expect(message?.streaming).toBe(false);
+  });
+
+  it("completes spilled buffered assistant text when a turn is cancelled", async () => {
+    const harness = await createHarness();
+    const now = "2026-01-01T00:00:00.000Z";
+    const oversizedText = "x".repeat(40_000);
+    const threadId = asThreadId("thread-1");
+    const turnId = asTurnId("turn-buffer-spill-cancelled");
+    const itemId = asItemId("item-buffer-spill-cancelled");
+
+    harness.emit({
+      type: "turn.started",
+      eventId: asEventId("evt-turn-started-buffer-spill-cancelled"),
+      provider: ProviderDriverKind.make("cursor"),
+      createdAt: now,
+      threadId,
+      turnId,
+    });
+    await waitForThread(
+      harness.readModel,
+      (thread) =>
+        thread.session?.status === "running" &&
+        thread.session?.activeTurnId === "turn-buffer-spill-cancelled",
+    );
+
+    harness.emit({
+      type: "content.delta",
+      eventId: asEventId("evt-message-delta-buffer-spill-cancelled"),
+      provider: ProviderDriverKind.make("cursor"),
+      createdAt: now,
+      threadId,
+      turnId,
+      itemId,
+      payload: {
+        streamKind: "assistant_text",
+        delta: oversizedText,
+      },
+    });
+    await waitForThread(harness.readModel, (entry) =>
+      entry.messages.some(
+        (message: ProviderRuntimeTestMessage) =>
+          message.id === "assistant:item-buffer-spill-cancelled" &&
+          message.text === oversizedText &&
+          message.streaming,
+      ),
+    );
+
+    harness.emit({
+      type: "turn.completed",
+      eventId: asEventId("evt-turn-completed-buffer-spill-cancelled"),
+      provider: ProviderDriverKind.make("cursor"),
+      createdAt: now,
+      threadId,
+      turnId,
+      payload: {
+        state: "cancelled",
+        stopReason: "cancelled",
+      },
+    });
+
+    const thread = await waitForThread(harness.readModel, (entry) =>
+      entry.messages.some(
+        (message: ProviderRuntimeTestMessage) =>
+          message.id === "assistant:item-buffer-spill-cancelled" &&
+          message.text === oversizedText &&
+          !message.streaming,
+      ),
+    );
+    const message = thread.messages.find(
+      (entry: ProviderRuntimeTestMessage) => entry.id === "assistant:item-buffer-spill-cancelled",
+    );
+    expect(message?.text.length).toBe(oversizedText.length);
     expect(message?.streaming).toBe(false);
   });
 

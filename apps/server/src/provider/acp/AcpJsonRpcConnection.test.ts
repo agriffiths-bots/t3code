@@ -232,6 +232,44 @@ describe("AcpSessionRuntime", () => {
     ),
   );
 
+  it.effect("does not await a wedged session/cancel after releasing a prompt", () =>
+    Effect.gen(function* () {
+      const runtime = yield* AcpSessionRuntime.AcpSessionRuntime;
+      yield* runtime.start();
+
+      const promptFiber = yield* runtime
+        .prompt({
+          prompt: [{ type: "text", text: "hang forever" }],
+        })
+        .pipe(Effect.forkChild({ startImmediately: true }));
+
+      yield* Effect.sleep("50 millis");
+      yield* runtime.cancel.pipe(Effect.timeout("2 seconds"));
+
+      const promptResult = yield* Fiber.join(promptFiber).pipe(Effect.timeout("2 seconds"));
+      expect(promptResult).toMatchObject({ stopReason: "cancelled" });
+    }).pipe(
+      Effect.provide(
+        AcpSessionRuntime.layer({
+          spawn: {
+            command: mockAgentCommand,
+            args: mockAgentArgs,
+            env: {
+              T3_ACP_HANG_FIRST_PROMPT_FOREVER: "1",
+              T3_ACP_HANG_CANCEL: "1",
+            },
+          },
+          cwd: process.cwd(),
+          clientInfo: { name: "t3-test", version: "0.0.0" },
+          authMethodId: "test",
+        }),
+      ),
+      Effect.scoped,
+      Effect.provide(NodeServices.layer),
+      TestClock.withLive,
+    ),
+  );
+
   it.effect("segments assistant text around ACP tool calls", () =>
     Effect.gen(function* () {
       const runtime = yield* AcpSessionRuntime.AcpSessionRuntime;

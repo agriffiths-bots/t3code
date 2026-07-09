@@ -52,6 +52,10 @@ interface AssistantSegmentEntry {
 
 const TURN_MESSAGE_IDS_BY_TURN_CACHE_CAPACITY = 10_000;
 const TURN_MESSAGE_IDS_BY_TURN_TTL = Duration.minutes(120);
+const TERMINAL_TURNS_CACHE_CAPACITY = 10_000;
+const TERMINAL_TURNS_TTL = Duration.minutes(120);
+const SUPPRESSED_TERMINAL_TURNS_CACHE_CAPACITY = 10_000;
+const SUPPRESSED_TERMINAL_TURNS_TTL = Duration.minutes(120);
 const BUFFERED_MESSAGE_TEXT_BY_MESSAGE_ID_CACHE_CAPACITY = 20_000;
 const BUFFERED_MESSAGE_TEXT_BY_MESSAGE_ID_TTL = Duration.minutes(120);
 const BUFFERED_PROPOSED_PLAN_BY_ID_CACHE_CAPACITY = 10_000;
@@ -646,6 +650,17 @@ const make = Effect.gen(function* () {
     lookup: () => Effect.succeed(new Set<MessageId>()),
   });
 
+  const terminalTurnsByTurnKey = yield* Cache.make<string, true>({
+    capacity: TERMINAL_TURNS_CACHE_CAPACITY,
+    timeToLive: TERMINAL_TURNS_TTL,
+    lookup: () => Effect.succeed(true),
+  });
+  const suppressedTerminalTurnsByTurnKey = yield* Cache.make<string, true>({
+    capacity: SUPPRESSED_TERMINAL_TURNS_CACHE_CAPACITY,
+    timeToLive: SUPPRESSED_TERMINAL_TURNS_TTL,
+    lookup: () => Effect.succeed(true),
+  });
+
   const bufferedAssistantTextByMessageId = yield* Cache.make<MessageId, string>({
     capacity: BUFFERED_MESSAGE_TEXT_BY_MESSAGE_ID_CACHE_CAPACITY,
     timeToLive: BUFFERED_MESSAGE_TEXT_BY_MESSAGE_ID_TTL,
@@ -723,6 +738,30 @@ const make = Effect.gen(function* () {
 
   const clearAssistantMessageIdsForTurn = (threadId: ThreadId, turnId: TurnId) =>
     Cache.invalidate(turnMessageIdsByTurnKey, providerTurnKey(threadId, turnId));
+
+  const rememberTerminalTurn = (threadId: ThreadId, turnId: TurnId) =>
+    Cache.set(terminalTurnsByTurnKey, providerTurnKey(threadId, turnId), true).pipe(
+      Effect.andThen(
+        Cache.invalidate(suppressedTerminalTurnsByTurnKey, providerTurnKey(threadId, turnId)),
+      ),
+    );
+
+  const hasTerminalTurn = (threadId: ThreadId, turnId: TurnId) =>
+    Cache.getOption(terminalTurnsByTurnKey, providerTurnKey(threadId, turnId)).pipe(
+      Effect.map(Option.isSome),
+    );
+
+  const suppressTerminalTurn = (threadId: ThreadId, turnId: TurnId) =>
+    Cache.invalidate(terminalTurnsByTurnKey, providerTurnKey(threadId, turnId)).pipe(
+      Effect.andThen(
+        Cache.set(suppressedTerminalTurnsByTurnKey, providerTurnKey(threadId, turnId), true),
+      ),
+    );
+
+  const hasSuppressedTerminalTurn = (threadId: ThreadId, turnId: TurnId) =>
+    Cache.getOption(suppressedTerminalTurnsByTurnKey, providerTurnKey(threadId, turnId)).pipe(
+      Effect.map(Option.isSome),
+    );
 
   const getAssistantSegmentStateForTurn = (threadId: ThreadId, turnId: TurnId) =>
     Cache.getOption(assistantSegmentStateByTurnKey, providerTurnKey(threadId, turnId));
@@ -1084,6 +1123,16 @@ const make = Effect.gen(function* () {
       yield* clearAssistantSegmentStateForTurn(input.threadId, input.turnId);
     });
 
+  const discardRememberedAssistantMessagesForTurn = (threadId: ThreadId, turnId: TurnId) =>
+    Effect.gen(function* () {
+      const assistantMessageIds = yield* getAssistantMessageIdsForTurn(threadId, turnId);
+      yield* Effect.forEach(assistantMessageIds, clearAssistantMessageState, {
+        concurrency: 1,
+      }).pipe(Effect.asVoid);
+      yield* clearAssistantMessageIdsForTurn(threadId, turnId);
+      yield* clearAssistantSegmentStateForTurn(threadId, turnId);
+    });
+
   const upsertProposedPlan = (input: {
     event: ProviderRuntimeEvent;
     threadId: ThreadId;
@@ -1167,6 +1216,10 @@ const make = Effect.gen(function* () {
       const prefix = `${threadId}:`;
       const proposedPlanPrefix = `plan:${threadId}:`;
       const turnKeys = Array.from(yield* Cache.keys(turnMessageIdsByTurnKey));
+      const terminalTurnKeys = Array.from(yield* Cache.keys(terminalTurnsByTurnKey));
+      const suppressedTerminalTurnKeys = Array.from(
+        yield* Cache.keys(suppressedTerminalTurnsByTurnKey),
+      );
       const assistantSegmentKeys = Array.from(yield* Cache.keys(assistantSegmentStateByTurnKey));
       const proposedPlanKeys = Array.from(yield* Cache.keys(bufferedProposedPlanById));
       yield* Effect.forEach(
@@ -1186,6 +1239,20 @@ const make = Effect.gen(function* () {
 
             yield* Cache.invalidate(turnMessageIdsByTurnKey, key);
           }),
+        { concurrency: 1 },
+      ).pipe(Effect.asVoid);
+      yield* Effect.forEach(
+        terminalTurnKeys,
+        (key) =>
+          key.startsWith(prefix) ? Cache.invalidate(terminalTurnsByTurnKey, key) : Effect.void,
+        { concurrency: 1 },
+      ).pipe(Effect.asVoid);
+      yield* Effect.forEach(
+        suppressedTerminalTurnKeys,
+        (key) =>
+          key.startsWith(prefix)
+            ? Cache.invalidate(suppressedTerminalTurnsByTurnKey, key)
+            : Effect.void,
         { concurrency: 1 },
       ).pipe(Effect.asVoid);
       yield* Effect.forEach(
@@ -1352,6 +1419,15 @@ const make = Effect.gen(function* () {
           ? yield* getSourceProposedPlanReferenceForAcceptedTurnStart(thread.id, eventTurnId)
           : null;
 
+      if (event.type === "turn.completed" && eventTurnId !== undefined) {
+        const terminalState = normalizeRuntimeTurnState(event.payload.state);
+        if (terminalState === "completed" || terminalState === "failed") {
+          yield* rememberTerminalTurn(thread.id, eventTurnId);
+        } else if (terminalState === "cancelled" || terminalState === "interrupted") {
+          yield* suppressTerminalTurn(thread.id, eventTurnId);
+        }
+      }
+
       if (
         event.type === "session.started" ||
         event.type === "session.state.changed" ||
@@ -1402,6 +1478,7 @@ const make = Effect.gen(function* () {
             eventTurnId !== undefined &&
             !sameId(activeTurnId, eventTurnId)
           ) {
+            yield* rememberTerminalTurn(thread.id, activeTurnId);
             const detailedThread = yield* getLoadedThreadDetail();
             yield* finalizeRememberedAssistantMessagesForTurn({
               event,
@@ -1464,6 +1541,11 @@ const make = Effect.gen(function* () {
 
       if (assistantDelta && assistantDelta.length > 0) {
         const turnId = toTurnId(event.turnId);
+        const shouldSuppressTerminalDelta =
+          turnId !== undefined && (yield* hasSuppressedTerminalTurn(thread.id, turnId));
+        if (shouldSuppressTerminalDelta) {
+          return;
+        }
         const assistantMessageId = yield* getOrCreateAssistantMessageId({
           threadId: thread.id,
           event,
@@ -1472,6 +1554,8 @@ const make = Effect.gen(function* () {
         if (turnId) {
           yield* rememberAssistantMessageId(thread.id, turnId, assistantMessageId);
         }
+        const shouldFinalizeTerminalDelta =
+          turnId !== undefined && (yield* hasTerminalTurn(thread.id, turnId));
 
         const assistantDeliveryMode: AssistantDeliveryMode = yield* Effect.map(
           serverSettingsService.getSettings,
@@ -1479,6 +1563,7 @@ const make = Effect.gen(function* () {
         );
         if (assistantDeliveryMode === "buffered") {
           const spillChunk = yield* appendBufferedAssistantText(assistantMessageId, assistantDelta);
+          let hasProjectedMessage = false;
           if (spillChunk.length > 0) {
             yield* orchestrationEngine.dispatch({
               type: "thread.message.assistant.delta",
@@ -1488,6 +1573,19 @@ const make = Effect.gen(function* () {
               delta: spillChunk,
               ...(turnId ? { turnId } : {}),
               createdAt: now,
+            });
+            hasProjectedMessage = true;
+          }
+          if (shouldFinalizeTerminalDelta) {
+            yield* finalizeAssistantMessage({
+              event,
+              threadId: thread.id,
+              messageId: assistantMessageId,
+              turnId,
+              createdAt: now,
+              commandTag: "assistant-complete-after-terminal-delta",
+              finalDeltaCommandTag: "assistant-delta-finalize-after-terminal-delta",
+              hasProjectedMessage,
             });
           }
         } else {
@@ -1500,6 +1598,18 @@ const make = Effect.gen(function* () {
             ...(turnId ? { turnId } : {}),
             createdAt: now,
           });
+          if (shouldFinalizeTerminalDelta) {
+            yield* finalizeAssistantMessage({
+              event,
+              threadId: thread.id,
+              messageId: assistantMessageId,
+              turnId,
+              createdAt: now,
+              commandTag: "assistant-complete-after-terminal-streaming-delta",
+              finalDeltaCommandTag: "assistant-delta-finalize-after-terminal-streaming-delta",
+              hasProjectedMessage: true,
+            });
+          }
         }
       }
 
@@ -1574,6 +1684,14 @@ const make = Effect.gen(function* () {
         const detailedThread = yield* getLoadedThreadDetail();
         const messages = detailedThread?.messages ?? [];
         const turnId = toTurnId(event.turnId);
+        const shouldSuppressTerminalCompletion =
+          turnId !== undefined && (yield* hasSuppressedTerminalTurn(thread.id, turnId));
+        if (shouldSuppressTerminalCompletion) {
+          if (turnId) {
+            yield* discardRememberedAssistantMessagesForTurn(thread.id, turnId);
+          }
+          return;
+        }
         const activeAssistantMessageId = turnId
           ? yield* getActiveAssistantMessageIdForTurn(
               thread.id,
@@ -1645,15 +1763,28 @@ const make = Effect.gen(function* () {
         const proposedPlans = detailedThread?.proposedPlans ?? [];
         const turnId = toTurnId(event.turnId);
         if (turnId) {
-          yield* finalizeRememberedAssistantMessagesForTurn({
-            event,
-            threadId: thread.id,
-            turnId,
-            messages,
-            createdAt: now,
-            commandTag: "assistant-complete-finalize",
-            finalDeltaCommandTag: "assistant-delta-finalize-fallback",
-          });
+          const terminalState = normalizeRuntimeTurnState(event.payload.state);
+          if (terminalState === "cancelled" || terminalState === "interrupted") {
+            yield* finalizeRememberedAssistantMessagesForTurn({
+              event,
+              threadId: thread.id,
+              turnId,
+              messages,
+              createdAt: now,
+              commandTag: "assistant-complete-cancelled-finalize",
+              finalDeltaCommandTag: "assistant-delta-finalize-cancelled",
+            });
+          } else {
+            yield* finalizeRememberedAssistantMessagesForTurn({
+              event,
+              threadId: thread.id,
+              turnId,
+              messages,
+              createdAt: now,
+              commandTag: "assistant-complete-finalize",
+              finalDeltaCommandTag: "assistant-delta-finalize-fallback",
+            });
+          }
 
           yield* finalizeBufferedProposedPlan({
             event,
