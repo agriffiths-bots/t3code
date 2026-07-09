@@ -1,6 +1,7 @@
 import {
   ApprovalRequestId,
   type ChatAttachment,
+  MessageId,
   type OrchestrationEvent,
   type OrchestrationSessionStatus,
   ThreadId,
@@ -134,6 +135,14 @@ function extractActivityRequestId(payload: unknown): ApprovalRequestId | null {
   }
   const requestId = (payload as Record<string, unknown>).requestId;
   return typeof requestId === "string" ? ApprovalRequestId.make(requestId) : null;
+}
+
+function extractActivityMessageId(payload: unknown): MessageId | null {
+  if (typeof payload !== "object" || payload === null) {
+    return null;
+  }
+  const messageId = (payload as Record<string, unknown>).messageId;
+  return typeof messageId === "string" ? MessageId.make(messageId) : null;
 }
 
 function isStalePendingApprovalFailureDetail(detail: string | null): boolean {
@@ -1320,9 +1329,17 @@ const makeOrchestrationProjectionPipeline = Effect.fn("makeOrchestrationProjecti
           if (event.payload.activity.kind !== "provider.turn.start.failed") {
             return;
           }
-          yield* projectionTurnRepository.deletePendingTurnStartByThreadId({
-            threadId: event.payload.threadId,
-          });
+          const messageId = extractActivityMessageId(event.payload.activity.payload);
+          if (messageId !== null) {
+            yield* projectionTurnRepository.deletePendingTurnStartByMessageId({
+              threadId: event.payload.threadId,
+              messageId,
+            });
+          } else {
+            yield* projectionTurnRepository.deletePendingTurnStartByThreadId({
+              threadId: event.payload.threadId,
+            });
+          }
           return;
         }
 

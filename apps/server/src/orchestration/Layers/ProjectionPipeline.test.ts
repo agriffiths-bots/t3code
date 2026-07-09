@@ -3563,6 +3563,121 @@ it.effect("restores pending turn-start metadata across projection pipeline resta
   ),
 );
 
+it.effect("deletes failed pending turn starts by message id", () =>
+  Effect.gen(function* () {
+    const projectionPipeline = yield* OrchestrationProjectionPipeline;
+    const eventStore = yield* OrchestrationEventStore;
+    const sql = yield* SqlClient.SqlClient;
+    const threadId = ThreadId.make("thread-keyed-start-failure");
+    const firstMessageId = MessageId.make("message-keyed-keep");
+    const secondMessageId = MessageId.make("message-keyed-delete");
+    const appendAndProject = (event: Parameters<typeof eventStore.append>[0]) =>
+      eventStore
+        .append(event)
+        .pipe(Effect.flatMap((savedEvent) => projectionPipeline.projectEvent(savedEvent)));
+
+    yield* appendAndProject({
+      type: "thread.created",
+      eventId: EventId.make("evt-keyed-failure-create"),
+      aggregateKind: "thread",
+      aggregateId: threadId,
+      occurredAt: "2026-02-26T16:00:00.000Z",
+      commandId: CommandId.make("cmd-keyed-failure-create"),
+      causationEventId: null,
+      correlationId: CorrelationId.make("cmd-keyed-failure-create"),
+      metadata: {},
+      payload: {
+        threadId,
+        projectId: ProjectId.make("project-1"),
+        title: "Thread keyed failure",
+        modelSelection: {
+          instanceId: ProviderInstanceId.make("codex"),
+          model: "gpt-5-codex",
+        },
+        runtimeMode: "full-access",
+        branch: null,
+        worktreePath: null,
+        createdAt: "2026-02-26T16:00:00.000Z",
+        updatedAt: "2026-02-26T16:00:00.000Z",
+      },
+    });
+    for (const [messageId, eventId, commandId, createdAt] of [
+      [
+        firstMessageId,
+        EventId.make("evt-keyed-failure-request-first"),
+        CommandId.make("cmd-keyed-failure-request-first"),
+        "2026-02-26T16:00:01.000Z",
+      ],
+      [
+        secondMessageId,
+        EventId.make("evt-keyed-failure-request-second"),
+        CommandId.make("cmd-keyed-failure-request-second"),
+        "2026-02-26T16:00:02.000Z",
+      ],
+    ] as const) {
+      yield* appendAndProject({
+        type: "thread.turn-start-requested",
+        eventId,
+        aggregateKind: "thread",
+        aggregateId: threadId,
+        occurredAt: createdAt,
+        commandId,
+        causationEventId: null,
+        correlationId: CorrelationId.make(commandId),
+        metadata: {},
+        payload: {
+          threadId,
+          messageId,
+          runtimeMode: "full-access",
+          createdAt,
+        },
+      });
+    }
+
+    yield* appendAndProject({
+      type: "thread.activity-appended",
+      eventId: EventId.make("evt-keyed-failure-activity"),
+      aggregateKind: "thread",
+      aggregateId: threadId,
+      occurredAt: "2026-02-26T16:00:03.000Z",
+      commandId: CommandId.make("cmd-keyed-failure-activity"),
+      causationEventId: null,
+      correlationId: CorrelationId.make("cmd-keyed-failure-activity"),
+      metadata: {},
+      payload: {
+        threadId,
+        activity: {
+          id: EventId.make("activity-keyed-failure"),
+          tone: "info",
+          kind: "provider.turn.start.failed",
+          summary: "Queued turn canceled",
+          payload: {
+            detail: "queued prompt was canceled",
+            messageId: secondMessageId,
+            canceled: true,
+          },
+          turnId: null,
+          createdAt: "2026-02-26T16:00:03.000Z",
+        },
+      },
+    });
+
+    const pendingRows = yield* sql<{ readonly messageId: string }>`
+      SELECT pending_message_id AS "messageId"
+      FROM projection_turns
+      WHERE thread_id = ${threadId}
+        AND turn_id IS NULL
+        AND state = 'pending'
+      ORDER BY row_id ASC
+    `;
+    assert.deepEqual(pendingRows, [{ messageId: "message-keyed-keep" }]);
+  }).pipe(
+    Effect.provide(
+      Layer.fresh(makeProjectionPipelinePrefixedTestLayer("t3-projection-keyed-failure-")),
+    ),
+  ),
+);
+
 const engineLayer = it.layer(
   OrchestrationEngineLive.pipe(
     Layer.provide(OrchestrationProjectionSnapshotQueryLive),

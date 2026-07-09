@@ -139,11 +139,68 @@ const THREAD_TURN_PENDING_KIND = "thread_turn" as const;
 const pendingThreadTurnIdForMessage = (messageId: MessageId): PendingDispatchId =>
   PendingDispatchId.make(`thread-turn:${messageId}`);
 
+const pendingThreadTurnRowForEvent = (event: TurnStartRequestedEvent): PendingDispatch => {
+  const payload = event.payload;
+  return {
+    id: pendingThreadTurnIdForMessage(payload.messageId),
+    kind: THREAD_TURN_PENDING_KIND,
+    targetThreadId: payload.threadId,
+    sourceChildId: null,
+    text: encodeQueuedThreadTurnPayloadJson({
+      messageId: payload.messageId,
+      ...(payload.modelSelection !== undefined ? { modelSelection: payload.modelSelection } : {}),
+      runtimeMode: payload.runtimeMode,
+      interactionMode: payload.interactionMode,
+      createdAt: payload.createdAt,
+    }),
+    error: null,
+    status: null,
+    commandId: null,
+    deliveredByWait: false,
+    waitCancellable: false,
+    createdAt: IsoDateTime.make(payload.createdAt),
+  };
+};
+
 function parseQueuedThreadTurnPayload(row: PendingDispatch): QueuedThreadTurnPayload | null {
   if (row.text === null) {
     return null;
   }
   return Option.getOrNull(decodeQueuedThreadTurnPayloadJson(row.text));
+}
+
+function failedProviderTurnStartMessageIds(thread: OrchestrationThread): ReadonlySet<string> {
+  const ids = new Set<string>();
+  const pendingPromptMessages = thread.messages.filter(
+    (message) => message.turnId === null && (message.role === "user" || message.role === "system"),
+  );
+  const failedActivities = thread.activities
+    .filter((activity) => activity.kind === "provider.turn.start.failed")
+    .toSorted(
+      (left, right) =>
+        left.createdAt.localeCompare(right.createdAt) || left.id.localeCompare(right.id),
+    );
+
+  for (const activity of failedActivities) {
+    if (activity.kind !== "provider.turn.start.failed") {
+      continue;
+    }
+    const payload =
+      typeof activity.payload === "object" && activity.payload !== null
+        ? (activity.payload as Record<string, unknown>)
+        : null;
+    if (typeof payload?.messageId === "string") {
+      ids.add(payload.messageId);
+      continue;
+    }
+    const legacyPrompt = pendingPromptMessages.find(
+      (message) => !ids.has(message.id) && message.createdAt <= activity.createdAt,
+    );
+    if (legacyPrompt !== undefined) {
+      ids.add(legacyPrompt.id);
+    }
+  }
+  return ids;
 }
 
 function isThreadProviderIdle(thread: OrchestrationThread): boolean {
@@ -302,10 +359,13 @@ const make = Effect.gen(function* () {
     lookup: () => Effect.succeed(true),
   });
 
-  const hasHandledTurnStartRecently = (key: string) =>
-    Cache.getOption(handledTurnStartKeys, key).pipe(
-      Effect.flatMap((cached) =>
-        Cache.set(handledTurnStartKeys, key, true).pipe(Effect.as(Option.isSome(cached))),
+  const wasTurnStartHandledRecently = (key: string) =>
+    Cache.getOption(handledTurnStartKeys, key).pipe(Effect.map(Option.isSome));
+  const markTurnStartHandledRecently = (key: string) => Cache.set(handledTurnStartKeys, key, true);
+  const claimTurnStartHandling = (key: string) =>
+    wasTurnStartHandledRecently(key).pipe(
+      Effect.flatMap((handled) =>
+        handled ? Effect.succeed(true) : markTurnStartHandledRecently(key).pipe(Effect.as(false)),
       ),
     );
   const providerDriverForInstance = (instanceId: ModelSelection["instanceId"]) =>
@@ -998,6 +1058,49 @@ const make = Effect.gen(function* () {
     },
   );
 
+  const startFirstUserTurnSideEffects = Effect.fn("startFirstUserTurnSideEffects")(
+    function* (input: {
+      readonly event: TurnStartRequestedEvent;
+      readonly thread: OrchestrationThread;
+      readonly message: OrchestrationThread["messages"][number];
+    }) {
+      const { event, thread, message } = input;
+      const isFirstUserMessageTurn =
+        message.role === "user" &&
+        thread.messages.filter((entry) => entry.role === "user").length === 1;
+      if (!isFirstUserMessageTurn) {
+        return;
+      }
+
+      const project = yield* resolveProject(thread.projectId);
+      const generationCwd =
+        resolveThreadWorkspaceCwd({
+          thread,
+          projects: project ? [project] : [],
+        }) ?? process.cwd();
+      const generationInput = {
+        messageText: message.text,
+        ...(message.attachments !== undefined ? { attachments: message.attachments } : {}),
+        ...(event.payload.titleSeed !== undefined ? { titleSeed: event.payload.titleSeed } : {}),
+      };
+
+      yield* maybeGenerateAndRenameWorktreeBranchForFirstTurn({
+        threadId: event.payload.threadId,
+        branch: thread.branch,
+        worktreePath: thread.worktreePath,
+        ...generationInput,
+      }).pipe(Effect.forkScoped);
+
+      if (canReplaceThreadTitle(thread.title, event.payload.titleSeed)) {
+        yield* maybeGenerateThreadTitleForFirstTurn({
+          threadId: event.payload.threadId,
+          cwd: generationCwd,
+          ...generationInput,
+        }).pipe(Effect.forkScoped);
+      }
+    },
+  );
+
   const handleTurnStartFailure = (input: {
     readonly threadId: ThreadId;
     readonly cause: Cause.Cause<unknown>;
@@ -1061,26 +1164,7 @@ const make = Effect.gen(function* () {
   const enqueueThreadTurnUntilIdle = Effect.fnUntraced(function* (input: {
     readonly event: TurnStartRequestedEvent;
   }) {
-    const payload = input.event.payload;
-    const row: PendingDispatch = {
-      id: pendingThreadTurnIdForMessage(payload.messageId),
-      kind: THREAD_TURN_PENDING_KIND,
-      targetThreadId: payload.threadId,
-      sourceChildId: null,
-      text: encodeQueuedThreadTurnPayloadJson({
-        messageId: payload.messageId,
-        ...(payload.modelSelection !== undefined ? { modelSelection: payload.modelSelection } : {}),
-        runtimeMode: payload.runtimeMode,
-        interactionMode: payload.interactionMode,
-        createdAt: payload.createdAt,
-      }),
-      error: null,
-      status: null,
-      commandId: null,
-      deliveredByWait: false,
-      waitCancellable: false,
-      createdAt: IsoDateTime.make(payload.createdAt),
-    };
+    const row = pendingThreadTurnRowForEvent(input.event);
     yield* Effect.sync(() => {
       canceledThreadTurnDispatchIds.delete(row.id);
     });
@@ -1089,6 +1173,11 @@ const make = Effect.gen(function* () {
 
   const deletePendingThreadTurnRows = (ids: ReadonlyArray<PendingDispatchId>) =>
     pendingDispatches.deleteByIds(ids).pipe(Effect.orDie);
+
+  const resetAndReleaseThreadTurnDispatchClaim = (rowId: PendingDispatchId) =>
+    pendingDispatches
+      .resetClaims({ ids: [rowId] })
+      .pipe(Effect.orDie, Effect.ensuring(releaseThreadTurnDispatchClaim(rowId)));
 
   const cancelPendingThreadTurnRows = (input: {
     readonly threadId: ThreadId;
@@ -1143,6 +1232,10 @@ const make = Effect.gen(function* () {
         activeProviderSession?.status === "running" ||
         activeProviderSession?.activeTurnId !== undefined
       ) {
+        return false;
+      }
+      const latestThread = yield* resolveThread(input.threadId);
+      if (!latestThread || !canAutoDrainQueuedThreadTurns(latestThread)) {
         return false;
       }
       const rows = yield* pendingDispatches
@@ -1326,7 +1419,7 @@ const make = Effect.gen(function* () {
           .pipe(Effect.orDie);
         const canSendAfterClaim = yield* claimedThreadTurnCanSend({ threadId, rowId: row.id });
         if (!canSendAfterClaim) {
-          yield* releaseThreadTurnDispatchClaim(row.id);
+          yield* resetAndReleaseThreadTurnDispatchClaim(row.id);
           return;
         }
 
@@ -1350,12 +1443,22 @@ const make = Effect.gen(function* () {
           Effect.ensuring(releaseThreadTurnDispatchClaim(row.id)),
           Effect.forkScoped,
         );
-        yield* Effect.sync(() => {
+        const stillClaimed = yield* Effect.sync(() => {
           inFlightThreadTurnFibers.set(row.id, sendFiber);
-          if (!inFlightThreadTurnDispatchIds.has(row.id)) {
+          const claimed =
+            inFlightThreadTurnDispatchIds.has(row.id) && !canceledThreadTurnDispatchIds.has(row.id);
+          if (!claimed) {
             inFlightThreadTurnFibers.delete(row.id);
           }
+          return claimed;
         });
+        const canReleaseQueuedSend =
+          stillClaimed && (yield* claimedThreadTurnCanSend({ threadId, rowId: row.id }));
+        if (!canReleaseQueuedSend) {
+          yield* Fiber.interrupt(sendFiber).pipe(Effect.ignore);
+          yield* resetAndReleaseThreadTurnDispatchClaim(row.id);
+          return;
+        }
         yield* Deferred.succeed(startQueuedSend, undefined);
         return;
       }
@@ -1373,11 +1476,66 @@ const make = Effect.gen(function* () {
     }
   });
 
+  const recoverMissingQueuedThreadTurnsFromEventLog = Effect.fnUntraced(function* () {
+    const existingRows = yield* pendingDispatches.listAll().pipe(Effect.orDie);
+    const knownThreadTurnRowIds = new Set(
+      existingRows.filter((row) => row.kind === THREAD_TURN_PENDING_KIND).map((row) => row.id),
+    );
+    const threadCache = new Map<string, OrchestrationThread | undefined>();
+
+    yield* orchestrationEngine.readEvents(0, Number.MAX_SAFE_INTEGER).pipe(
+      Stream.runForEach((event) =>
+        Effect.gen(function* () {
+          if (event.type !== "thread.turn-start-requested") {
+            return;
+          }
+
+          const key = turnStartKeyForEvent(event);
+          if (yield* claimTurnStartHandling(key)) {
+            return;
+          }
+
+          const rowId = pendingThreadTurnIdForMessage(event.payload.messageId);
+          if (knownThreadTurnRowIds.has(rowId)) {
+            return;
+          }
+
+          const threadCacheKey = String(event.payload.threadId);
+          let thread = threadCache.get(threadCacheKey);
+          if (!threadCache.has(threadCacheKey)) {
+            thread = yield* resolveThread(event.payload.threadId);
+            threadCache.set(threadCacheKey, thread);
+          }
+          if (!thread) {
+            return;
+          }
+
+          const message = thread.messages.find((entry) => entry.id === event.payload.messageId);
+          if (!message || (message.role !== "user" && message.role !== "system")) {
+            return;
+          }
+          if (message.turnId !== null) {
+            return;
+          }
+          if (failedProviderTurnStartMessageIds(thread).has(event.payload.messageId)) {
+            return;
+          }
+
+          yield* startFirstUserTurnSideEffects({ event, thread, message });
+          const row = pendingThreadTurnRowForEvent(event);
+          yield* pendingDispatches.insert(row).pipe(Effect.orDie);
+          knownThreadTurnRowIds.add(row.id);
+        }),
+      ),
+      Effect.orDie,
+    );
+  });
+
   const processTurnStartRequested = Effect.fn("processTurnStartRequested")(function* (
     event: TurnStartRequestedEvent,
   ) {
     const key = turnStartKeyForEvent(event);
-    if (yield* hasHandledTurnStartRecently(key)) {
+    if (yield* claimTurnStartHandling(key)) {
       return;
     }
 
@@ -1400,37 +1558,7 @@ const make = Effect.gen(function* () {
       return;
     }
 
-    const isFirstUserMessageTurn =
-      message.role === "user" &&
-      thread.messages.filter((entry) => entry.role === "user").length === 1;
-    if (isFirstUserMessageTurn) {
-      const project = yield* resolveProject(thread.projectId);
-      const generationCwd =
-        resolveThreadWorkspaceCwd({
-          thread,
-          projects: project ? [project] : [],
-        }) ?? process.cwd();
-      const generationInput = {
-        messageText: message.text,
-        ...(message.attachments !== undefined ? { attachments: message.attachments } : {}),
-        ...(event.payload.titleSeed !== undefined ? { titleSeed: event.payload.titleSeed } : {}),
-      };
-
-      yield* maybeGenerateAndRenameWorktreeBranchForFirstTurn({
-        threadId: event.payload.threadId,
-        branch: thread.branch,
-        worktreePath: thread.worktreePath,
-        ...generationInput,
-      }).pipe(Effect.forkScoped);
-
-      if (canReplaceThreadTitle(thread.title, event.payload.titleSeed)) {
-        yield* maybeGenerateThreadTitleForFirstTurn({
-          threadId: event.payload.threadId,
-          cwd: generationCwd,
-          ...generationInput,
-        }).pipe(Effect.forkScoped);
-      }
-    }
+    yield* startFirstUserTurnSideEffects({ event, thread, message });
 
     let pendingThreadTurns = yield* pendingDispatches
       .listByTarget({ kind: THREAD_TURN_PENDING_KIND, targetThreadId: event.payload.threadId })
@@ -1794,6 +1922,13 @@ const make = Effect.gen(function* () {
       Stream.runForEach(orchestrationEngine.streamDomainEvents, processEvent),
     );
     yield* Effect.yieldNow;
+    yield* recoverMissingQueuedThreadTurnsFromEventLog().pipe(
+      Effect.catchCause((cause) =>
+        Effect.logWarning("provider command reactor failed to recover queued turns on start", {
+          cause: Cause.pretty(cause),
+        }),
+      ),
+    );
     yield* drainAllPendingThreadTurns().pipe(
       Effect.catchCause((cause) =>
         Effect.logWarning("provider command reactor failed to drain queued turns on start", {

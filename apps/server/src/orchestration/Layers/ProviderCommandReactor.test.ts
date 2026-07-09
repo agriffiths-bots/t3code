@@ -151,6 +151,7 @@ describe("ProviderCommandReactor", () => {
     readonly threadModelSelection?: ModelSelection;
     readonly sessionModelSwitch?: "unsupported" | "in-session";
     readonly requiresNewThreadForModelChange?: boolean;
+    readonly startReactor?: boolean;
   }) {
     const now = "2026-01-01T00:00:00.000Z";
     const baseDir =
@@ -250,6 +251,9 @@ describe("ProviderCommandReactor", () => {
         }
       }),
     );
+    const listSessions = vi.fn<ProviderServiceShape["listSessions"]>(() =>
+      Effect.succeed(runtimeSessions),
+    );
     const renameBranch = vi.fn((input: unknown) =>
       Effect.succeed({
         branch:
@@ -312,7 +316,7 @@ describe("ProviderCommandReactor", () => {
       respondToRequest: respondToRequest as ProviderServiceShape["respondToRequest"],
       respondToUserInput: respondToUserInput as ProviderServiceShape["respondToUserInput"],
       stopSession: stopSession as ProviderServiceShape["stopSession"],
-      listSessions: () => Effect.succeed(runtimeSessions),
+      listSessions,
       getCapabilities: (_provider) =>
         Effect.succeed({
           sessionModelSwitch: input?.sessionModelSwitch ?? "in-session",
@@ -390,8 +394,26 @@ describe("ProviderCommandReactor", () => {
     const engine = await runtime.runPromise(Effect.service(OrchestrationEngineService));
     const snapshotQuery = await runtime.runPromise(Effect.service(ProjectionSnapshotQuery));
     const reactor = await runtime.runPromise(Effect.service(ProviderCommandReactor));
-    scope = await Effect.runPromise(Scope.make("sequential"));
-    await Effect.runPromise(reactor.start().pipe(Scope.provide(scope)));
+    let reactorStarted = false;
+    const startReactor = async () => {
+      if (reactorStarted) {
+        return;
+      }
+      scope = await Effect.runPromise(Scope.make("sequential"));
+      await Effect.runPromise(reactor.start().pipe(Scope.provide(scope)));
+      reactorStarted = true;
+    };
+    if (input?.startReactor !== false) {
+      await startReactor();
+    }
+    const runStartupRecoveryAgain = async () => {
+      const transientScope = await Effect.runPromise(Scope.make("sequential"));
+      try {
+        await Effect.runPromise(reactor.start().pipe(Scope.provide(transientScope)));
+      } finally {
+        await Effect.runPromise(Scope.close(transientScope, Exit.void));
+      }
+    };
     const drain = () => Effect.runPromise(reactor.drain);
     const listPendingDispatches = () =>
       runtime!.runPromise(
@@ -434,6 +456,7 @@ describe("ProviderCommandReactor", () => {
       respondToRequest,
       respondToUserInput,
       stopSession,
+      listSessions,
       renameBranch,
       refreshStatus,
       generateBranchName,
@@ -441,6 +464,8 @@ describe("ProviderCommandReactor", () => {
       runtimeSessions,
       stateDir,
       drain,
+      startReactor,
+      runStartupRecoveryAgain,
       listPendingDispatches,
     };
   }
@@ -519,6 +544,37 @@ describe("ProviderCommandReactor", () => {
       role: "system",
       text: "[sub-agent child-1 completed] done",
     });
+  });
+
+  it("does not recover a turn start already handled by the live stream", async () => {
+    const harness = await createHarness();
+    const now = "2026-01-01T00:00:00.000Z";
+
+    await runtime!.runPromise(
+      harness.engine.dispatch({
+        type: "thread.turn.start",
+        commandId: CommandId.make("cmd-turn-start-live-before-recovery"),
+        threadId: ThreadId.make("thread-1"),
+        message: {
+          messageId: asMessageId("user-message-live-before-recovery"),
+          role: "user",
+          text: "live stream handled before recovery",
+          attachments: [],
+        },
+        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+        runtimeMode: "approval-required",
+        createdAt: now,
+      }),
+    );
+
+    await waitFor(() => harness.sendTurn.mock.calls.length === 1);
+    expect(await harness.listPendingDispatches()).toHaveLength(0);
+
+    await harness.runStartupRecoveryAgain();
+    await harness.drain();
+
+    expect(harness.sendTurn).toHaveBeenCalledTimes(1);
+    expect(await harness.listPendingDispatches()).toHaveLength(0);
   });
 
   it("queues accepted mid-turn user messages until the active turn is idle", async () => {
@@ -673,6 +729,120 @@ describe("ProviderCommandReactor", () => {
       thread?.activities.some((activity) => activity.kind === "provider.turn.start.failed") ??
         false,
     ).toBe(false);
+  });
+
+  it("recovers queued turn starts committed before the reactor could persist a dispatch row", async () => {
+    const harness = await createHarness({ startReactor: false });
+    const now = "2026-01-01T00:00:00.000Z";
+    const idleAt = "2026-01-01T00:00:05.000Z";
+    harness.generateThreadTitle.mockReturnValue(
+      Effect.succeed({ title: "Recovered queued title" }),
+    );
+
+    harness.runtimeSessions.push({
+      provider: ProviderDriverKind.make("codex"),
+      providerInstanceId: ProviderInstanceId.make("codex"),
+      status: "running",
+      runtimeMode: "approval-required",
+      model: "gpt-5-codex",
+      threadId: ThreadId.make("thread-1"),
+      resumeCursor: { opaque: "resume-running-before-recovery" },
+      activeTurnId: asTurnId("turn-running-before-recovery"),
+      createdAt: now,
+      updatedAt: now,
+    });
+
+    await runtime!.runPromise(
+      harness.engine.dispatch({
+        type: "thread.session.set",
+        commandId: CommandId.make("cmd-session-set-running-before-recovery"),
+        threadId: ThreadId.make("thread-1"),
+        session: {
+          threadId: ThreadId.make("thread-1"),
+          status: "running",
+          providerName: "codex",
+          providerInstanceId: ProviderInstanceId.make("codex"),
+          runtimeMode: "approval-required",
+          activeTurnId: asTurnId("turn-running-before-recovery"),
+          lastError: null,
+          updatedAt: now,
+        },
+        createdAt: now,
+      }),
+    );
+    await runtime!.runPromise(
+      harness.engine.dispatch({
+        type: "thread.turn.start",
+        commandId: CommandId.make("cmd-turn-start-recovered-queued"),
+        threadId: ThreadId.make("thread-1"),
+        message: {
+          messageId: asMessageId("user-message-recovered-queued"),
+          role: "user",
+          text: "queued before reactor startup",
+          attachments: [],
+        },
+        titleSeed: "Thread",
+        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+        runtimeMode: "approval-required",
+        createdAt: now,
+      }),
+    );
+    expect(await harness.listPendingDispatches()).toHaveLength(0);
+
+    await harness.startReactor();
+    await harness.drain();
+
+    expect(harness.sendTurn).not.toHaveBeenCalled();
+    const recoveredRows = await harness.listPendingDispatches();
+    expect(recoveredRows).toHaveLength(1);
+    expect(recoveredRows[0]?.id).toBe("thread-turn:user-message-recovered-queued");
+    await waitFor(() => harness.generateThreadTitle.mock.calls.length === 1);
+    expect(harness.generateThreadTitle.mock.calls[0]?.[0]).toMatchObject({
+      message: "queued before reactor startup",
+    });
+    await waitFor(async () => {
+      const readModel = await harness.readModel();
+      return (
+        readModel.threads.find((entry) => entry.id === ThreadId.make("thread-1"))?.title ===
+        "Recovered queued title"
+      );
+    });
+
+    harness.runtimeSessions.splice(0, 1, {
+      provider: ProviderDriverKind.make("codex"),
+      providerInstanceId: ProviderInstanceId.make("codex"),
+      status: "ready",
+      runtimeMode: "approval-required",
+      model: "gpt-5-codex",
+      threadId: ThreadId.make("thread-1"),
+      resumeCursor: { opaque: "resume-running-before-recovery" },
+      createdAt: now,
+      updatedAt: idleAt,
+    });
+    await runtime!.runPromise(
+      harness.engine.dispatch({
+        type: "thread.session.set",
+        commandId: CommandId.make("cmd-session-set-ready-after-recovery"),
+        threadId: ThreadId.make("thread-1"),
+        session: {
+          threadId: ThreadId.make("thread-1"),
+          status: "ready",
+          providerName: "codex",
+          providerInstanceId: ProviderInstanceId.make("codex"),
+          runtimeMode: "approval-required",
+          activeTurnId: null,
+          lastError: null,
+          updatedAt: idleAt,
+        },
+        createdAt: idleAt,
+      }),
+    );
+
+    await waitFor(() => harness.sendTurn.mock.calls.length === 1);
+    expect(harness.sendTurn.mock.calls[0]?.[0]).toMatchObject({
+      input: "queued before reactor startup",
+    });
+    await waitFor(async () => (await harness.listPendingDispatches()).length === 0);
   });
 
   it("does not drain queued mid-turn messages after an explicit stop", async () => {
@@ -1082,6 +1252,292 @@ describe("ProviderCommandReactor", () => {
     expect(thread?.session?.status).toBe("stopped");
     expect(thread?.session?.activeTurnId).toBeNull();
     expect(thread?.latestTurn?.turnId).not.toBe("turn-queued-after-stop");
+  });
+
+  it("does not release a queued send when a stop lands after claim but before release", async () => {
+    const harness = await createHarness();
+    const now = "2026-01-01T00:00:00.000Z";
+    const readyAt = "2026-01-01T00:00:05.000Z";
+    const stoppedAt = "2026-01-01T00:00:06.000Z";
+
+    harness.runtimeSessions.push({
+      provider: ProviderDriverKind.make("codex"),
+      providerInstanceId: ProviderInstanceId.make("codex"),
+      status: "running",
+      runtimeMode: "approval-required",
+      model: "gpt-5-codex",
+      threadId: ThreadId.make("thread-1"),
+      resumeCursor: { opaque: "resume-running-before-release-race" },
+      activeTurnId: asTurnId("turn-running-before-release-race"),
+      createdAt: now,
+      updatedAt: now,
+    });
+
+    await runtime!.runPromise(
+      harness.engine.dispatch({
+        type: "thread.session.set",
+        commandId: CommandId.make("cmd-session-set-running-before-release-race"),
+        threadId: ThreadId.make("thread-1"),
+        session: {
+          threadId: ThreadId.make("thread-1"),
+          status: "running",
+          providerName: "codex",
+          providerInstanceId: ProviderInstanceId.make("codex"),
+          runtimeMode: "approval-required",
+          activeTurnId: asTurnId("turn-running-before-release-race"),
+          lastError: null,
+          updatedAt: now,
+        },
+        createdAt: now,
+      }),
+    );
+    await runtime!.runPromise(
+      harness.engine.dispatch({
+        type: "thread.turn.start",
+        commandId: CommandId.make("cmd-turn-start-before-release-race"),
+        threadId: ThreadId.make("thread-1"),
+        message: {
+          messageId: asMessageId("user-message-before-release-race"),
+          role: "user",
+          text: "queued before release race",
+          attachments: [],
+        },
+        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+        runtimeMode: "approval-required",
+        createdAt: now,
+      }),
+    );
+    await harness.drain();
+    expect(await harness.listPendingDispatches()).toHaveLength(1);
+
+    harness.runtimeSessions.splice(0, 1, {
+      provider: ProviderDriverKind.make("codex"),
+      providerInstanceId: ProviderInstanceId.make("codex"),
+      status: "ready",
+      runtimeMode: "approval-required",
+      model: "gpt-5-codex",
+      threadId: ThreadId.make("thread-1"),
+      resumeCursor: { opaque: "resume-running-before-release-race" },
+      createdAt: now,
+      updatedAt: readyAt,
+    });
+
+    let listSessionsAfterReady = 0;
+    harness.listSessions.mockImplementation(() =>
+      Effect.gen(function* () {
+        listSessionsAfterReady += 1;
+        const sessions = [...harness.runtimeSessions];
+        if (listSessionsAfterReady === 5) {
+          harness.runtimeSessions.splice(0);
+          yield* harness.engine
+            .dispatch({
+              type: "thread.session.set",
+              commandId: CommandId.make("cmd-session-set-stopped-before-release"),
+              threadId: ThreadId.make("thread-1"),
+              session: {
+                threadId: ThreadId.make("thread-1"),
+                status: "stopped",
+                providerName: "codex",
+                providerInstanceId: ProviderInstanceId.make("codex"),
+                runtimeMode: "approval-required",
+                activeTurnId: null,
+                lastError: null,
+                updatedAt: stoppedAt,
+              },
+              createdAt: stoppedAt,
+            })
+            .pipe(Effect.orDie);
+        }
+        return sessions;
+      }),
+    );
+
+    await runtime!.runPromise(
+      harness.engine.dispatch({
+        type: "thread.session.set",
+        commandId: CommandId.make("cmd-session-set-ready-before-release-race"),
+        threadId: ThreadId.make("thread-1"),
+        session: {
+          threadId: ThreadId.make("thread-1"),
+          status: "ready",
+          providerName: "codex",
+          providerInstanceId: ProviderInstanceId.make("codex"),
+          runtimeMode: "approval-required",
+          activeTurnId: null,
+          lastError: null,
+          updatedAt: readyAt,
+        },
+        createdAt: readyAt,
+      }),
+    );
+
+    await waitFor(async () => (await harness.listPendingDispatches()).length === 0);
+    await Effect.runPromise(Effect.sleep("10 millis"));
+    await harness.drain();
+
+    expect(harness.sendTurn).not.toHaveBeenCalled();
+    expect(listSessionsAfterReady).toBe(5);
+    const readModel = await harness.readModel();
+    const thread = readModel.threads.find((entry) => entry.id === ThreadId.make("thread-1"));
+    expect(
+      thread?.messages.find((message) => message.id === "user-message-before-release-race")?.turnId,
+    ).toBeNull();
+    expect(thread?.session?.status).toBe("stopped");
+  });
+
+  it("resets a durable queued-send claim when the provider becomes busy before release", async () => {
+    const harness = await createHarness();
+    const now = "2026-01-01T00:00:00.000Z";
+    const readyAt = "2026-01-01T00:00:05.000Z";
+    const retryAt = "2026-01-01T00:00:06.000Z";
+
+    harness.runtimeSessions.push({
+      provider: ProviderDriverKind.make("codex"),
+      providerInstanceId: ProviderInstanceId.make("codex"),
+      status: "running",
+      runtimeMode: "approval-required",
+      model: "gpt-5-codex",
+      threadId: ThreadId.make("thread-1"),
+      resumeCursor: { opaque: "resume-busy-before-release" },
+      activeTurnId: asTurnId("turn-busy-before-release"),
+      createdAt: now,
+      updatedAt: now,
+    });
+
+    await runtime!.runPromise(
+      harness.engine.dispatch({
+        type: "thread.session.set",
+        commandId: CommandId.make("cmd-session-set-running-before-claim-reset"),
+        threadId: ThreadId.make("thread-1"),
+        session: {
+          threadId: ThreadId.make("thread-1"),
+          status: "running",
+          providerName: "codex",
+          providerInstanceId: ProviderInstanceId.make("codex"),
+          runtimeMode: "approval-required",
+          activeTurnId: asTurnId("turn-busy-before-release"),
+          lastError: null,
+          updatedAt: now,
+        },
+        createdAt: now,
+      }),
+    );
+    await runtime!.runPromise(
+      harness.engine.dispatch({
+        type: "thread.turn.start",
+        commandId: CommandId.make("cmd-turn-start-before-claim-reset"),
+        threadId: ThreadId.make("thread-1"),
+        message: {
+          messageId: asMessageId("user-message-before-claim-reset"),
+          role: "user",
+          text: "queued before claim reset",
+          attachments: [],
+        },
+        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+        runtimeMode: "approval-required",
+        createdAt: now,
+      }),
+    );
+    await harness.drain();
+    expect(await harness.listPendingDispatches()).toHaveLength(1);
+
+    harness.runtimeSessions.splice(0, 1, {
+      provider: ProviderDriverKind.make("codex"),
+      providerInstanceId: ProviderInstanceId.make("codex"),
+      status: "ready",
+      runtimeMode: "approval-required",
+      model: "gpt-5-codex",
+      threadId: ThreadId.make("thread-1"),
+      resumeCursor: { opaque: "resume-busy-before-release" },
+      createdAt: now,
+      updatedAt: readyAt,
+    });
+
+    let busyInjected = false;
+    let listSessionsAfterReady = 0;
+    harness.listSessions.mockImplementation(() =>
+      Effect.sync(() => {
+        listSessionsAfterReady += 1;
+        if (!busyInjected && listSessionsAfterReady === 5) {
+          busyInjected = true;
+          harness.runtimeSessions.splice(0, 1, {
+            provider: ProviderDriverKind.make("codex"),
+            providerInstanceId: ProviderInstanceId.make("codex"),
+            status: "running",
+            runtimeMode: "approval-required",
+            model: "gpt-5-codex",
+            threadId: ThreadId.make("thread-1"),
+            resumeCursor: { opaque: "resume-busy-before-release" },
+            activeTurnId: asTurnId("turn-runtime-busy-before-release"),
+            createdAt: now,
+            updatedAt: readyAt,
+          });
+        }
+        return [...harness.runtimeSessions];
+      }),
+    );
+
+    await runtime!.runPromise(
+      harness.engine.dispatch({
+        type: "thread.session.set",
+        commandId: CommandId.make("cmd-session-set-ready-before-claim-reset"),
+        threadId: ThreadId.make("thread-1"),
+        session: {
+          threadId: ThreadId.make("thread-1"),
+          status: "ready",
+          providerName: "codex",
+          providerInstanceId: ProviderInstanceId.make("codex"),
+          runtimeMode: "approval-required",
+          activeTurnId: null,
+          lastError: null,
+          updatedAt: readyAt,
+        },
+        createdAt: readyAt,
+      }),
+    );
+
+    await waitFor(() => listSessionsAfterReady >= 5);
+    await harness.drain();
+    const rowsAfterAbort = await harness.listPendingDispatches();
+    expect(rowsAfterAbort).toHaveLength(1);
+    expect(rowsAfterAbort[0]?.commandId).toBeNull();
+    expect(harness.sendTurn).not.toHaveBeenCalled();
+
+    harness.runtimeSessions.splice(0, 1, {
+      provider: ProviderDriverKind.make("codex"),
+      providerInstanceId: ProviderInstanceId.make("codex"),
+      status: "ready",
+      runtimeMode: "approval-required",
+      model: "gpt-5-codex",
+      threadId: ThreadId.make("thread-1"),
+      resumeCursor: { opaque: "resume-busy-before-release" },
+      createdAt: now,
+      updatedAt: retryAt,
+    });
+    await runtime!.runPromise(
+      harness.engine.dispatch({
+        type: "thread.session.set",
+        commandId: CommandId.make("cmd-session-set-ready-after-claim-reset"),
+        threadId: ThreadId.make("thread-1"),
+        session: {
+          threadId: ThreadId.make("thread-1"),
+          status: "ready",
+          providerName: "codex",
+          providerInstanceId: ProviderInstanceId.make("codex"),
+          runtimeMode: "approval-required",
+          activeTurnId: null,
+          lastError: null,
+          updatedAt: retryAt,
+        },
+        createdAt: retryAt,
+      }),
+    );
+
+    await waitFor(() => harness.sendTurn.mock.calls.length === 1);
+    expect(harness.sendTurn.mock.calls[0]?.[0]).toMatchObject({
+      input: "queued before claim reset",
+    });
+    await waitFor(async () => (await harness.listPendingDispatches()).length === 0);
   });
 
   it("queues rapid follow-up messages while an immediate provider send is in flight", async () => {
