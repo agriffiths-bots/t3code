@@ -1802,7 +1802,18 @@ const make = Effect.gen(function* () {
         return;
       }
       const completed = yield* Deferred.poll(record.terminal);
-      if (Option.isNone(completed)) return;
+      if (Option.isNone(completed)) {
+        if (archivedActiveChildIds.has(threadId)) {
+          const shell = yield* getThreadShellBounded(threadId);
+          if (Option.isSome(shell) && !isProjectedChildActive(shell.value)) {
+            yield* dispatchLimiter.releaseForChild(threadId);
+          }
+        }
+        archivedActiveChildIds.delete(threadId);
+        yield* discardQueuedArchivedWake(threadId);
+        yield* drainChildSteers(threadId);
+        return;
+      }
       const result = yield* completed.value;
       if (result.status !== "killed" || result.error !== "thread archived") {
         unarchivedTerminalChildIds.add(threadId);
@@ -2819,6 +2830,8 @@ const make = Effect.gen(function* () {
       const prunedArchivedDeliveredWakeChildIds = new Set<ThreadId>();
       const deliveredWakeCleanupChildIds = new Set<ThreadId>();
       const promotedWakeCleanupChildIds = new Set<ThreadId>();
+      const retainedPromotedWakeChildIds = new Set<ThreadId>();
+      const promotedChildCleanupIds = new Set<ThreadId>();
       const retainedPostUnarchiveFallbackWakeIdByChild = new Map<ThreadId, PendingDispatchId>();
       const retainedPostUnarchiveFallbackWakeCreatedAtByChild = new Map<ThreadId, number>();
       for (const row of persisted) {
@@ -2911,7 +2924,16 @@ const make = Effect.gen(function* () {
               row.waitCancellable,
           );
           if (hasRemainingPromotedWake) {
+            retainedPromotedWakeChildIds.add(childThreadId);
             promotedWakeCleanupChildIds.delete(childThreadId);
+          }
+        }
+        for (const childThreadId of promotedWakeCleanupChildIds) {
+          promotedChildCleanupIds.add(childThreadId);
+        }
+        for (const childThreadId of deliveredWakeCleanupChildIds) {
+          if (!retainedPromotedWakeChildIds.has(childThreadId)) {
+            promotedChildCleanupIds.add(childThreadId);
           }
         }
         yield* sql
@@ -2919,9 +2941,7 @@ const make = Effect.gen(function* () {
             Effect.gen(function* () {
               yield* deleteDispatchRows(staleWakeRows.map((row) => row.id));
               yield* deleteWaitDeliveryRows([...deliveredWakeCleanupChildIds]);
-              yield* deletePromotedChildRows([
-                ...new Set([...deliveredWakeCleanupChildIds, ...promotedWakeCleanupChildIds]),
-              ]);
+              yield* deletePromotedChildRows([...promotedChildCleanupIds]);
             }),
           )
           .pipe(Effect.orDie);
@@ -2942,10 +2962,12 @@ const make = Effect.gen(function* () {
         }
         if (
           deliveredWakeCleanupChildIds.has(childThreadId) ||
-          promotedWakeCleanupChildIds.has(childThreadId)
+          promotedChildCleanupIds.has(childThreadId)
         ) {
-          promotedChildren.delete(childThreadId);
-          activePromotedWaitChildren.delete(childThreadId);
+          if (promotedChildCleanupIds.has(childThreadId)) {
+            promotedChildren.delete(childThreadId);
+            activePromotedWaitChildren.delete(childThreadId);
+          }
         }
         if (hasRemainingWake) {
           queuedWakeChildren.add(childThreadId);
@@ -2983,16 +3005,26 @@ const make = Effect.gen(function* () {
         unarchivedArchiveChildIds.has(childThreadId) ||
         unarchivedArchivedTerminalChildIds.has(childThreadId);
 
+      const inactiveProjectionUnarchivedChildIds = new Set<ThreadId>();
+
       // Non-terminal children may still have terminal projection state even when
       // replay only saw a conservative "missing" diff. Reconcile that before
       // applying the provider-instance kill path.
       for (const childThreadId of knownChildIds) {
         if (terminalByChild.has(childThreadId)) continue;
+        const projectedTerminal = projectedTerminalByChild.get(childThreadId);
         if (
           shouldMarkProjectionUnarchivedTerminal(childThreadId) &&
-          projectedTerminalByChild.has(childThreadId)
+          projectedTerminal !== undefined
         ) {
           unarchivedTerminalChildIds.add(childThreadId);
+          if (
+            projectedTerminal.status === "failed" &&
+            (projectedTerminal.error === "session stopped" ||
+              projectedTerminal.error === "session error")
+          ) {
+            continue;
+          }
         }
         yield* oneShotTerminalCheck(childThreadId);
       }
@@ -3017,6 +3049,14 @@ const make = Effect.gen(function* () {
         if (done) continue;
         if (shouldMarkProjectionUnarchivedTerminal(childThreadId)) {
           unarchivedTerminalChildIds.add(childThreadId);
+          if (
+            projectedTerminal.status === "failed" &&
+            (projectedTerminal.error === "session stopped" ||
+              projectedTerminal.error === "session error")
+          ) {
+            inactiveProjectionUnarchivedChildIds.add(childThreadId);
+            continue;
+          }
         }
         yield* settleChild(childThreadId, projectedTerminal.status, projectedTerminal.error);
       }
@@ -3049,6 +3089,7 @@ const make = Effect.gen(function* () {
           yield* settleChild(childThreadId, "killed", "provider instance removed");
           continue;
         }
+        if (inactiveProjectionUnarchivedChildIds.has(childThreadId)) continue;
         yield* dispatchLimiter.seedChild(childThreadId);
       }
 
