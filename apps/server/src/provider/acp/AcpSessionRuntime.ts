@@ -48,6 +48,7 @@ export type AcpSessionRuntimeEvent = AcpParsedSessionEvent | AcpSessionEventStre
 
 const defaultSessionLoadTimeout = Duration.seconds(90);
 const defaultSessionLoadReplayIdleGap = Duration.seconds(2);
+const defaultCancelRequestTimeout = Duration.millis(500);
 
 export interface AcpSpawnInput {
   readonly command: string;
@@ -194,14 +195,17 @@ export class AcpSessionRuntime extends Context.Service<
       payload: Omit<EffectAcpSchema.PromptRequest, "sessionId">,
     ) => Effect.Effect<EffectAcpSchema.PromptResponse, EffectAcpErrors.AcpError>;
     /**
-     * Sends `session/cancel` and releases the local active prompt waiter.
+     * Releases the local active prompt waiter, sends a real ACP `session/cancel`
+     * request for the active session, and waits briefly so a following prompt
+     * cannot overtake the cancel request if the provider wedges.
      * @see https://agentclientprotocol.com/protocol/schema#session/cancel
      */
     readonly cancel: Effect.Effect<void, EffectAcpErrors.AcpError>;
     /**
-     * Sends `session/cancel` without interrupting the active prompt waiter.
-     * Use this when a pending client interaction can settle the prompt naturally;
-     * callers can then keep suppression tied to the prompt's real completion.
+     * Sends `session/cancel` without interrupting the active prompt waiter and
+     * waits for the provider RPC. Use this when a pending client interaction can
+     * settle the prompt naturally; callers can then keep suppression tied to the
+     * prompt's real completion.
      */
     readonly requestCancel: Effect.Effect<void, EffectAcpErrors.AcpError>;
     /**
@@ -822,7 +826,13 @@ export const make = (
             if (Option.isSome(activePromptFiber)) {
               yield* Fiber.interrupt(activePromptFiber.value).pipe(Effect.ignore);
             }
-            yield* acp.agent.cancel({ sessionId: started.sessionId }).pipe(Effect.ignore);
+            yield* acp.agent
+              .cancel({ sessionId: started.sessionId })
+              .pipe(
+                Effect.ignore,
+                Effect.timeoutOption(defaultCancelRequestTimeout),
+                Effect.asVoid,
+              );
           }),
         ),
       ),
