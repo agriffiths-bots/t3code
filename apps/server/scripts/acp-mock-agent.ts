@@ -24,6 +24,7 @@ const emitXAiPromptCompleteThenHang = process.env.T3_ACP_EMIT_XAI_PROMPT_COMPLET
 const emitForeignSessionUpdates = process.env.T3_ACP_EMIT_FOREIGN_SESSION_UPDATES === "1";
 const hangPromptForever = process.env.T3_ACP_HANG_PROMPT_FOREVER === "1";
 const hangFirstPromptForever = process.env.T3_ACP_HANG_FIRST_PROMPT_FOREVER === "1";
+const hangCancel = process.env.T3_ACP_HANG_CANCEL === "1";
 const emitLateUpdateAfterCancel = process.env.T3_ACP_EMIT_LATE_UPDATE_AFTER_CANCEL === "1";
 const exitAfterPromptReturn = process.env.T3_ACP_EXIT_AFTER_PROMPT_RETURN === "1";
 const emitDetachedLateUpdateAfterCancel =
@@ -58,6 +59,7 @@ const emitOverlappingXAiPromptCompleteOutOfOrder =
   process.env.T3_ACP_EMIT_OVERLAPPING_XAI_PROMPT_COMPLETE_OUT_OF_ORDER === "1";
 const failPrompt = process.env.T3_ACP_FAIL_PROMPT === "1";
 const failFirstPrompt = process.env.T3_ACP_FAIL_FIRST_PROMPT === "1";
+const failPromptsAfterFirst = process.env.T3_ACP_FAIL_PROMPTS_AFTER_FIRST === "1";
 const failSetConfigOption = process.env.T3_ACP_FAIL_SET_CONFIG_OPTION === "1";
 const exitOnSetConfigOption = process.env.T3_ACP_EXIT_ON_SET_CONFIG_OPTION === "1";
 const promptResponseText = process.env.T3_ACP_PROMPT_RESPONSE_TEXT;
@@ -602,6 +604,9 @@ const program = Effect.gen(function* () {
     Effect.gen(function* () {
       const cancelledSessionId = String(sessionId ?? "mock-session-1");
       cancelledSessions.add(cancelledSessionId);
+      if (hangCancel) {
+        return yield* Effect.never;
+      }
       if (emitLateUpdateAfterCancel) {
         yield* Effect.sleep("50 millis");
         yield* Effect.sync(() => {
@@ -657,7 +662,11 @@ const program = Effect.gen(function* () {
         yield* Effect.sleep(`${effectivePromptDelayMs} millis`);
       }
 
-      if (failPrompt || (failFirstPrompt && promptCount === 1)) {
+      if (
+        failPrompt ||
+        (failFirstPrompt && promptCount === 1) ||
+        (failPromptsAfterFirst && promptCount > 1)
+      ) {
         return yield* AcpError.AcpRequestError.internalError("Mock prompt failure");
       }
 

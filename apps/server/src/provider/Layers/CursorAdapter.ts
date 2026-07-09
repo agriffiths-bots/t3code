@@ -4,6 +4,8 @@
  * @module CursorAdapterLive
  */
 
+import * as NodeTimersPromises from "node:timers/promises";
+
 import {
   ApprovalRequestId,
   type CursorSettings,
@@ -85,6 +87,12 @@ const CURSOR_RESUME_VERSION = 1 as const;
 const ACP_PLAN_MODE_ALIASES = ["plan", "architect"];
 const ACP_IMPLEMENT_MODE_ALIASES = ["code", "agent", "default", "chat", "implement"];
 const ACP_APPROVAL_MODE_ALIASES = ["ask"];
+const CURSOR_COMPLETED_TURN_LATE_UPDATE_GRACE_MS = 200;
+const CURSOR_CANCEL_REQUEST_TIMEOUT_MS = 500;
+const CURSOR_CANCEL_DRAIN_TIMEOUT_MS = 500;
+
+const liveDelay = (milliseconds: number) =>
+  Effect.promise<void>(() => NodeTimersPromises.setTimeout(milliseconds).then(() => undefined));
 
 function encodeJsonStringForDiagnostics(input: unknown): string | undefined {
   const result = encodeUnknownJsonStringExit(input);
@@ -154,9 +162,11 @@ interface CursorSessionContext {
   lastModelSelection: CursorBoundModelSelection | undefined;
   dropAcpUpdatesAfterLocalCancel: boolean;
   readonly suppressedNotificationTurnIds: Set<string>;
+  readonly preCompletedCancelledTurnIds: Set<string>;
   localCancelRequestsInFlight: number;
   locallyCancelledPromptsInFlight: number;
   localCancelSettled: Deferred.Deferred<void> | undefined;
+  promptStartSettled: Deferred.Deferred<void> | undefined;
   promptStartedDuringLocalCancel: boolean;
   restartBeforeNextPrompt: boolean;
   readonly stoppedSignal: Deferred.Deferred<void>;
@@ -170,6 +180,7 @@ interface CursorSessionContext {
 interface StartSessionInternalOptions {
   readonly replaceExistingAfterStart?: boolean;
   readonly emitReplacedSessionExited?: boolean;
+  readonly detachReplacedSessionStop?: boolean;
   readonly initialTurns?: CursorSessionContext["turns"];
 }
 
@@ -508,13 +519,70 @@ export function makeCursorAdapter(
           ctx.locallyCancelledPromptsInFlight === 0 &&
           ctx.promptsInFlight === 0
         ) {
-          yield* drainEventsOrSessionEnd(ctx);
+          yield* drainLocalCancelEventsOrTimeout(ctx);
           ctx.dropAcpUpdatesAfterLocalCancel = false;
           ctx.promptStartedDuringLocalCancel = false;
           const settled = ctx.localCancelSettled;
           ctx.localCancelSettled = undefined;
           yield* Deferred.succeed(settled, undefined).pipe(Effect.asVoid);
         }
+      });
+
+    const completeActiveTurnAsCancelledBeforeRestart = (ctx: CursorSessionContext) =>
+      Effect.gen(function* () {
+        const turnId = ctx.activeTurnId;
+        if (turnId === undefined || ctx.preCompletedCancelledTurnIds.has(String(turnId))) {
+          return;
+        }
+        ctx.preCompletedCancelledTurnIds.add(String(turnId));
+        const { activeTurnId: _cancelledActiveTurnId, ...sessionWithoutActiveTurn } = ctx.session;
+        ctx.activeTurnId = undefined;
+        ctx.notificationTurnId = turnId;
+        ctx.session = {
+          ...sessionWithoutActiveTurn,
+          status: "ready",
+          updatedAt: yield* nowIso,
+        };
+        yield* offerRuntimeEvent({
+          type: "turn.completed",
+          ...(yield* makeEventStamp()),
+          provider: PROVIDER,
+          threadId: ctx.threadId,
+          turnId,
+          payload: {
+            state: "cancelled",
+            stopReason: "cancelled",
+          },
+        });
+      });
+
+    const releaseLocalCancelSettledForRestart = (ctx: CursorSessionContext) =>
+      Effect.gen(function* () {
+        if (
+          ctx.localCancelSettled !== undefined &&
+          ctx.localCancelRequestsInFlight === 0 &&
+          ctx.promptsInFlight > 0 &&
+          ctx.restartBeforeNextPrompt
+        ) {
+          yield* completeActiveTurnAsCancelledBeforeRestart(ctx);
+          const settled = ctx.localCancelSettled;
+          ctx.localCancelSettled = undefined;
+          yield* Deferred.succeed(settled, undefined).pipe(Effect.asVoid);
+        }
+      });
+
+    const releasePromptStartSettled = (
+      ctx: CursorSessionContext,
+      promptStartSettled: Deferred.Deferred<void> | undefined,
+    ) =>
+      Effect.gen(function* () {
+        if (promptStartSettled === undefined) {
+          return;
+        }
+        if (ctx.promptStartSettled === promptStartSettled) {
+          ctx.promptStartSettled = undefined;
+        }
+        yield* Deferred.succeed(promptStartSettled, undefined).pipe(Effect.asVoid);
       });
 
     const requireSession = (
@@ -539,6 +607,41 @@ export function makeCursorAdapter(
         ctx.acp.drainEvents,
         Effect.raceFirst(Deferred.await(ctx.stoppedSignal), awaitNotificationFiberExit(ctx)),
       );
+
+    const drainLocalCancelEventsOrTimeout = (ctx: CursorSessionContext) =>
+      Effect.raceFirst(drainEventsOrSessionEnd(ctx), liveDelay(CURSOR_CANCEL_DRAIN_TIMEOUT_MS));
+
+    const shouldDrainCompletedTurnLateUpdatesBeforePrompt = (
+      ctx: CursorSessionContext,
+      nextTurnId: TurnId,
+      previousNotificationTurnId: TurnId | undefined,
+      previousPromptsInFlight: number,
+    ) =>
+      previousNotificationTurnId !== undefined &&
+      previousNotificationTurnId !== nextTurnId &&
+      previousPromptsInFlight === 0 &&
+      !ctx.dropAcpUpdatesAfterLocalCancel;
+
+    const drainCompletedTurnLateUpdatesBeforePrompt = (
+      ctx: CursorSessionContext,
+      nextTurnId: TurnId,
+      previousNotificationTurnId: TurnId | undefined,
+      previousPromptsInFlight: number,
+    ) => {
+      if (
+        !shouldDrainCompletedTurnLateUpdatesBeforePrompt(
+          ctx,
+          nextTurnId,
+          previousNotificationTurnId,
+          previousPromptsInFlight,
+        )
+      ) {
+        return Effect.void;
+      }
+      return liveDelay(CURSOR_COMPLETED_TURN_LATE_UPDATE_GRACE_MS).pipe(
+        Effect.andThen(drainEventsOrSessionEnd(ctx)),
+      );
+    };
 
     const stopSessionInternal = (
       ctx: CursorSessionContext,
@@ -889,9 +992,11 @@ export function makeCursorAdapter(
           lastModelSelection: cloneCursorModelSelection(cursorModelSelection),
           dropAcpUpdatesAfterLocalCancel: false,
           suppressedNotificationTurnIds: new Set<string>(),
+          preCompletedCancelledTurnIds: new Set<string>(),
           localCancelRequestsInFlight: 0,
           locallyCancelledPromptsInFlight: 0,
           localCancelSettled: undefined,
+          promptStartSettled: undefined,
           promptStartedDuringLocalCancel: false,
           restartBeforeNextPrompt: false,
           stoppedSignal,
@@ -994,12 +1099,20 @@ export function makeCursorAdapter(
           existingToReplace !== ctx &&
           !existingToReplace.stopped
         ) {
-          yield* stopSessionInternal(
+          const stopReplacedSession = stopSessionInternal(
             existingToReplace,
             internalOptions.emitReplacedSessionExited === undefined
               ? undefined
               : { emitSessionExited: internalOptions.emitReplacedSessionExited },
           );
+          if (internalOptions.detachReplacedSessionStop === true) {
+            yield* stopReplacedSession.pipe(
+              Effect.ignore,
+              Effect.forkDetach({ startImmediately: true }),
+            );
+          } else {
+            yield* stopReplacedSession;
+          }
         }
 
         yield* offerRuntimeEvent({
@@ -1079,6 +1192,7 @@ export function makeCursorAdapter(
             {
               replaceExistingAfterStart: true,
               emitReplacedSessionExited: false,
+              detachReplacedSessionStop: true,
               initialTurns: previousTurns,
             },
           );
@@ -1090,10 +1204,18 @@ export function makeCursorAdapter(
     const sendTurn: CursorAdapterShape["sendTurn"] = (input) =>
       Effect.gen(function* () {
         let ctx = yield* requireSession(input.threadId);
+        if (ctx.promptStartSettled !== undefined) {
+          yield* Deferred.await(ctx.promptStartSettled);
+          ctx = yield* requireSession(input.threadId);
+        }
         if (ctx.localCancelSettled !== undefined) {
           yield* Deferred.await(ctx.localCancelSettled);
         }
         ctx = yield* restartSessionBeforeNextPrompt(input.threadId);
+        if (ctx.promptStartSettled !== undefined) {
+          yield* Deferred.await(ctx.promptStartSettled);
+          ctx = yield* requireSession(input.threadId);
+        }
         // A sendTurn during active work is a steer: the agent folds the new
         // prompt into the ongoing work, so the active turn id is reused
         // instead of opening a new turn.
@@ -1114,10 +1236,30 @@ export function makeCursorAdapter(
         const previousLastPlanFingerprint = ctx.lastPlanFingerprint;
         const previousLastModelSelection = cloneCursorModelSelection(ctx.lastModelSelection);
         let activeStateApplied = false;
-        // Count this prompt immediately so a superseded in-flight prompt
-        // resolving from here on does not settle the turn; the matching
-        // decrement is the `ensuring` below.
-        ctx.promptsInFlight += 1;
+        let promptCounted = false;
+        const needsCompletedTurnDrain =
+          steeringTurnId === undefined &&
+          shouldDrainCompletedTurnLateUpdatesBeforePrompt(
+            ctx,
+            turnId,
+            previousNotificationTurnId,
+            previousPromptsInFlight,
+          );
+        const promptStartSettled = needsCompletedTurnDrain
+          ? yield* Deferred.make<void>()
+          : undefined;
+        if (promptStartSettled !== undefined) {
+          ctx.promptStartSettled = promptStartSettled;
+        }
+        const countPromptInFlight = () => {
+          if (!promptCounted) {
+            ctx.promptsInFlight += 1;
+            promptCounted = true;
+          }
+        };
+        // Reserve every prompt before async configuration so concurrent sends
+        // classify themselves as steering instead of opening parallel turns.
+        countPromptInFlight();
 
         return yield* Effect.gen(function* () {
           const turnModelSelection =
@@ -1144,8 +1286,15 @@ export function makeCursorAdapter(
           } else if (ctx.lastModelSelection === undefined && model !== undefined) {
             ctx.lastModelSelection = { instanceId: boundInstanceId, model };
           }
+          if (needsCompletedTurnDrain) {
+            yield* drainCompletedTurnLateUpdatesBeforePrompt(
+              ctx,
+              turnId,
+              previousNotificationTurnId,
+              previousPromptsInFlight,
+            );
+          }
           ctx.activeTurnId = turnId;
-          ctx.notificationTurnId = turnId;
           const localCancelSuppressionActive =
             ctx.dropAcpUpdatesAfterLocalCancel ||
             ctx.localCancelRequestsInFlight > 0 ||
@@ -1227,6 +1376,51 @@ export function makeCursorAdapter(
             });
           }
 
+          ctx.notificationTurnId = turnId;
+          yield* releasePromptStartSettled(ctx, promptStartSettled);
+          if (
+            ctx.stopped ||
+            ctx.restartBeforeNextPrompt ||
+            ctx.localCancelRequestsInFlight > 0 ||
+            ctx.locallyCancelledPromptsInFlight > 0
+          ) {
+            ctx.locallyCancelledPromptsInFlight = Math.max(
+              0,
+              ctx.locallyCancelledPromptsInFlight - 1,
+            );
+            if (
+              !ctx.stopped &&
+              activeStateApplied &&
+              ctx.activeTurnId === turnId &&
+              ctx.promptsInFlight === 1
+            ) {
+              const { activeTurnId: _cancelledActiveTurnId, ...sessionWithoutActiveTurn } =
+                ctx.session;
+              ctx.activeTurnId = undefined;
+              ctx.session = {
+                ...sessionWithoutActiveTurn,
+                status: "ready",
+                updatedAt: yield* nowIso,
+              };
+              yield* offerRuntimeEvent({
+                type: "turn.completed",
+                ...(yield* makeEventStamp()),
+                provider: PROVIDER,
+                threadId: input.threadId,
+                turnId,
+                payload: {
+                  state: "cancelled",
+                  stopReason: "cancelled",
+                },
+              });
+            }
+            return {
+              threadId: input.threadId,
+              turnId,
+              resumeCursor: ctx.session.resumeCursor,
+            };
+          }
+
           const result = yield* ctx.acp
             .prompt({
               prompt: promptParts,
@@ -1249,7 +1443,7 @@ export function makeCursorAdapter(
           const locallyCancelledPrompt = ctx.locallyCancelledPromptsInFlight > 0;
           const cancelledResult = result.stopReason === "cancelled" || locallyCancelledPrompt;
           if (locallyCancelledPrompt) {
-            yield* drainEventsOrSessionEnd(ctx);
+            yield* drainLocalCancelEventsOrTimeout(ctx);
             ctx.locallyCancelledPromptsInFlight = Math.max(
               0,
               ctx.locallyCancelledPromptsInFlight - 1,
@@ -1276,23 +1470,28 @@ export function makeCursorAdapter(
             }
             const { activeTurnId: _completedActiveTurnId, ...sessionWithoutActiveTurn } =
               ctx.session;
+            const completionAlreadyEmitted =
+              cancelledResult && ctx.preCompletedCancelledTurnIds.has(String(turnId));
             const completedSession = {
               ...sessionWithoutActiveTurn,
               status: "ready",
               updatedAt: yield* nowIso,
               model: resolvedModel,
             } satisfies ProviderSession;
-            yield* offerRuntimeEvent({
-              type: "turn.completed",
-              ...(yield* makeEventStamp()),
-              provider: PROVIDER,
-              threadId: input.threadId,
-              turnId,
-              payload: {
-                state: cancelledResult ? "cancelled" : "completed",
-                stopReason: cancelledResult ? "cancelled" : (result.stopReason ?? null),
-              },
-            });
+            if (!completionAlreadyEmitted) {
+              yield* offerRuntimeEvent({
+                type: "turn.completed",
+                ...(yield* makeEventStamp()),
+                provider: PROVIDER,
+                threadId: input.threadId,
+                turnId,
+                payload: {
+                  state: cancelledResult ? "cancelled" : "completed",
+                  stopReason: cancelledResult ? "cancelled" : (result.stopReason ?? null),
+                },
+              });
+            }
+            ctx.preCompletedCancelledTurnIds.delete(String(turnId));
             ctx.activeTurnId = undefined;
             ctx.notificationTurnId = turnId;
             ctx.dropAcpUpdatesAfterLocalCancel = cancelledResult;
@@ -1336,7 +1535,10 @@ export function makeCursorAdapter(
           ),
           Effect.ensuring(
             Effect.gen(function* () {
-              ctx.promptsInFlight = Math.max(0, ctx.promptsInFlight - 1);
+              if (promptCounted) {
+                ctx.promptsInFlight = Math.max(0, ctx.promptsInFlight - 1);
+              }
+              yield* releasePromptStartSettled(ctx, promptStartSettled);
               clearLocalCancelDropForQueuedPrompt(ctx);
               yield* completeLocalCancelSettled(ctx);
             }),
@@ -1379,13 +1581,14 @@ export function makeCursorAdapter(
         yield* settlePendingUserInputsAsEmptyAnswers(ctx.pendingUserInputs);
         const cancelEffect =
           ctx.promptsInFlight > 0 && hasPendingInteraction ? ctx.acp.requestCancel : ctx.acp.cancel;
-        yield* Effect.ignore(
-          cancelEffect.pipe(
-            Effect.mapError((error) =>
-              mapAcpToAdapterError(PROVIDER, threadId, "session/cancel", error),
-            ),
-            Effect.andThen(drainEventsOrSessionEnd(ctx)),
+        const cancelAndDrain = cancelEffect.pipe(
+          Effect.mapError((error) =>
+            mapAcpToAdapterError(PROVIDER, threadId, "session/cancel", error),
           ),
+          Effect.andThen(drainEventsOrSessionEnd(ctx)),
+        );
+        yield* Effect.ignore(
+          Effect.raceFirst(cancelAndDrain, liveDelay(CURSOR_CANCEL_REQUEST_TIMEOUT_MS)),
         ).pipe(
           Effect.ensuring(
             Effect.sync(() => {
@@ -1393,6 +1596,7 @@ export function makeCursorAdapter(
             }),
           ),
         );
+        yield* releaseLocalCancelSettledForRestart(ctx);
         if (
           resumedTurnToCancel !== undefined &&
           ctx.promptsInFlight === 0 &&
