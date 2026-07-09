@@ -299,6 +299,7 @@ export const make = (
     const activePromptFiberRef = yield* Ref.make<
       Option.Option<Fiber.Fiber<EffectAcpSchema.PromptResponse, EffectAcpErrors.AcpError>>
     >(Option.none());
+    const postPromptSettlingRef = yield* Ref.make(false);
     const sessionLoadGateRef = yield* Ref.make<Option.Option<SessionLoadGate>>(Option.none());
 
     const logRequest = (event: AcpSessionRequestLogEvent) =>
@@ -433,6 +434,7 @@ export const make = (
             modeStateRef,
             toolCallsRef,
             assistantSegmentRef,
+            postPromptSettlingRef,
             params: notification,
             eventScope,
           }),
@@ -706,6 +708,7 @@ export const make = (
           modeStateRef,
           toolCallsRef,
           assistantSegmentRef,
+          postPromptSettlingRef,
           params: notification,
           eventScope,
         });
@@ -800,6 +803,7 @@ export const make = (
         promptSerializationSemaphore.withPermit(
           Effect.gen(function* () {
             const started = yield* getStartedState;
+            yield* Ref.set(postPromptSettlingRef, false);
             yield* closeActiveAssistantSegment({
               queue: eventQueue,
               assistantSegmentRef,
@@ -827,12 +831,11 @@ export const make = (
                 Effect.gen(function* () {
                   yield* Fiber.interrupt(promptRpcFiber).pipe(Effect.ignore);
                   yield* Ref.set(activePromptFiberRef, Option.none());
-                }),
-              ),
-              Effect.tap(() =>
-                closeActiveAssistantSegment({
-                  queue: eventQueue,
-                  assistantSegmentRef,
+                  yield* Ref.set(postPromptSettlingRef, true);
+                  yield* closeActiveAssistantSegment({
+                    queue: eventQueue,
+                    assistantSegmentRef,
+                  });
                 }),
               ),
             );
@@ -926,6 +929,7 @@ const handleSessionUpdate = ({
   modeStateRef,
   toolCallsRef,
   assistantSegmentRef,
+  postPromptSettlingRef,
   params,
   eventScope,
 }: {
@@ -933,6 +937,7 @@ const handleSessionUpdate = ({
   readonly modeStateRef: Ref.Ref<AcpSessionModeState | undefined>;
   readonly toolCallsRef: Ref.Ref<Map<string, AcpToolCallState>>;
   readonly assistantSegmentRef: Ref.Ref<AcpAssistantSegmentState>;
+  readonly postPromptSettlingRef: Ref.Ref<boolean>;
   readonly params: EffectAcpSchema.SessionNotification;
   readonly eventScope: unknown;
 }): Effect.Effect<void> =>
@@ -1000,6 +1005,13 @@ const handleSessionUpdate = ({
             }
           : event,
       );
+    }
+    const postPromptSettling = yield* Ref.get(postPromptSettlingRef);
+    if (postPromptSettling) {
+      yield* closeActiveAssistantSegment({
+        queue,
+        assistantSegmentRef,
+      });
     }
   });
 

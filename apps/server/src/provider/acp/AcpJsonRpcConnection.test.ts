@@ -642,6 +642,12 @@ describe("AcpSessionRuntime", () => {
         expect(contentDelta.itemId).toBe("assistant:mock-session-1:segment:0");
         expect(contentDelta.text).toBe(" live continuation");
       }
+
+      const unexpectedCompletion = yield* Effect.raceFirst(
+        Stream.runHead(runtime.getEvents()),
+        TestClock.adjust("100 millis").pipe(Effect.as(Option.none())),
+      );
+      expect(Option.isNone(unexpectedCompletion)).toBe(true);
     }).pipe(
       Effect.provide(
         AcpSessionRuntime.layer({

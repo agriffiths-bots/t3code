@@ -46,6 +46,7 @@ const emitOverlappingXAiPromptCompleteOutOfOrder =
   process.env.T3_ACP_EMIT_OVERLAPPING_XAI_PROMPT_COMPLETE_OUT_OF_ORDER === "1";
 const failPrompt = process.env.T3_ACP_FAIL_PROMPT === "1";
 const failFirstPrompt = process.env.T3_ACP_FAIL_FIRST_PROMPT === "1";
+const failPromptAfterResponse = process.env.T3_ACP_FAIL_PROMPT_AFTER_RESPONSE === "1";
 const failSetConfigOption = process.env.T3_ACP_FAIL_SET_CONFIG_OPTION === "1";
 const exitOnSetConfigOption = process.env.T3_ACP_EXIT_ON_SET_CONFIG_OPTION === "1";
 const promptResponseText = process.env.T3_ACP_PROMPT_RESPONSE_TEXT;
@@ -1012,6 +1013,12 @@ const program = Effect.gen(function* () {
             content: { type: "text", text: chunk },
           },
         });
+      }
+
+      if (failPromptAfterResponse) {
+        return yield* AcpError.AcpRequestError.internalError(
+          "Mock prompt failure after response chunk",
+        );
       }
 
       if (promptCount === 1 && lateFirstPromptResponseText !== undefined) {

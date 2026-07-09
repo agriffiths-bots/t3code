@@ -321,7 +321,7 @@ cursorAdapterTestLayer("CursorAdapterLive", (it) => {
     }),
   );
 
-  it.effect("keeps delayed Composer item completion scoped to its source turn", () =>
+  it.effect("completes delayed Composer chunks without waiting for the next prompt", () =>
     Effect.gen(function* () {
       const adapter = yield* CursorAdapter;
       const settings = yield* ServerSettingsService;
@@ -374,22 +374,86 @@ cursorAdapterTestLayer("CursorAdapterLive", (it) => {
         attachments: [],
       });
 
-      const lateDelta = yield* Deferred.await(lateDeltaReady);
+      const lateDelta = yield* Deferred.await(lateDeltaReady).pipe(Effect.timeout("2 seconds"));
       assert.equal(lateDelta.type, "content.delta");
       if (lateDelta.type === "content.delta") {
         assert.equal(String(lateDelta.turnId), String(firstTurn.turnId));
       }
 
-      const secondTurn = yield* adapter.sendTurn({
-        threadId,
-        input: "second Composer turn",
-        attachments: [],
-      });
-      const lateCompletion = yield* Deferred.await(lateCompletionReady);
+      const lateCompletion = yield* Deferred.await(lateCompletionReady).pipe(
+        Effect.timeout("2 seconds"),
+      );
       assert.equal(lateCompletion.type, "item.completed");
       if (lateCompletion.type === "item.completed") {
         assert.equal(String(lateCompletion.turnId), String(firstTurn.turnId));
-        assert.notEqual(String(lateCompletion.turnId), String(secondTurn.turnId));
+      }
+
+      yield* Fiber.interrupt(runtimeEventsFiber);
+      yield* adapter.stopSession(threadId);
+    }),
+  );
+
+  it.effect("completes Composer chunks before a failed prompt settles", () =>
+    Effect.gen(function* () {
+      const adapter = yield* CursorAdapter;
+      const settings = yield* ServerSettingsService;
+      const threadId = ThreadId.make("cursor-failed-prompt-completes-chunks");
+
+      const wrapperPath = yield* Effect.promise(() =>
+        makeMockAgentWrapper({
+          T3_ACP_PROMPT_RESPONSE_TEXT: "partial before failure",
+          T3_ACP_FAIL_PROMPT_AFTER_RESPONSE: "1",
+        }),
+      );
+      yield* settings.updateSettings({ providers: { cursor: { binaryPath: wrapperPath } } });
+
+      const deltaReady = yield* Deferred.make<ProviderRuntimeEvent>();
+      const completionReady = yield* Deferred.make<ProviderRuntimeEvent>();
+      let failedItemId: string | undefined;
+
+      const runtimeEventsFiber = yield* Stream.runForEach(adapter.streamEvents, (event) =>
+        Effect.gen(function* () {
+          if (String(event.threadId) !== String(threadId)) {
+            return;
+          }
+          if (event.type === "content.delta" && event.payload.delta === "partial before failure") {
+            failedItemId = event.itemId === undefined ? undefined : String(event.itemId);
+            yield* Deferred.succeed(deltaReady, event).pipe(Effect.ignore);
+            return;
+          }
+          if (
+            event.type === "item.completed" &&
+            failedItemId !== undefined &&
+            String(event.itemId) === failedItemId
+          ) {
+            yield* Deferred.succeed(completionReady, event).pipe(Effect.ignore);
+          }
+        }),
+      ).pipe(Effect.forkChild);
+
+      yield* adapter.startSession({
+        threadId,
+        provider: ProviderDriverKind.make("cursor"),
+        cwd: process.cwd(),
+        runtimeMode: "full-access",
+        modelSelection: { instanceId: ProviderInstanceId.make("cursor"), model: "composer-2" },
+      });
+
+      const failedTurnExit = yield* adapter
+        .sendTurn({
+          threadId,
+          input: "fail after a partial response",
+          attachments: [],
+        })
+        .pipe(Effect.exit);
+      assert.equal(failedTurnExit._tag, "Failure");
+
+      const delta = yield* Deferred.await(deltaReady).pipe(Effect.timeout("2 seconds"));
+      assert.equal(delta.type, "content.delta");
+      const completed = yield* Deferred.await(completionReady).pipe(Effect.timeout("2 seconds"));
+      assert.equal(completed.type, "item.completed");
+      if (delta.type === "content.delta" && completed.type === "item.completed") {
+        assert.equal(String(completed.turnId), String(delta.turnId));
       }
 
       yield* Fiber.interrupt(runtimeEventsFiber);
