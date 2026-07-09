@@ -96,11 +96,22 @@ const QueuedThreadTurnPayload = Schema.Struct({
   runtimeMode: Schema.optional(RuntimeModeSchema),
   interactionMode: Schema.optional(ProviderInteractionMode),
   createdAt: IsoDateTime,
+  sourceSequence: Schema.optional(Schema.Number),
 });
 type QueuedThreadTurnPayload = typeof QueuedThreadTurnPayload.Type;
 const QueuedThreadTurnPayloadJson = Schema.fromJsonString(QueuedThreadTurnPayload);
 const encodeQueuedThreadTurnPayloadJson = Schema.encodeSync(QueuedThreadTurnPayloadJson);
 const decodeQueuedThreadTurnPayloadJson = Schema.decodeUnknownOption(QueuedThreadTurnPayloadJson);
+
+interface StopRequestMarker {
+  readonly sequence: number;
+  readonly createdAt: string;
+}
+
+const stopRequestSupersedesSequence = (
+  stopRequest: StopRequestMarker,
+  sourceSequence: number | undefined,
+): boolean => sourceSequence === undefined || stopRequest.sequence > sourceSequence;
 
 function toNonEmptyProviderInput(value: string | undefined): string | undefined {
   const normalized = value?.trim();
@@ -152,6 +163,7 @@ const pendingThreadTurnRowForEvent = (event: TurnStartRequestedEvent): PendingDi
       runtimeMode: payload.runtimeMode,
       interactionMode: payload.interactionMode,
       createdAt: payload.createdAt,
+      sourceSequence: event.sequence,
     }),
     error: null,
     status: null,
@@ -167,6 +179,14 @@ function parseQueuedThreadTurnPayload(row: PendingDispatch): QueuedThreadTurnPay
     return null;
   }
   return Option.getOrNull(decodeQueuedThreadTurnPayloadJson(row.text));
+}
+
+function stopRequestSupersedesQueuedRow(
+  stopRequest: StopRequestMarker,
+  row: PendingDispatch,
+): boolean {
+  const payload = parseQueuedThreadTurnPayload(row);
+  return payload === null || stopRequestSupersedesSequence(stopRequest, payload.sourceSequence);
 }
 
 function failedProviderTurnStartMessageIds(thread: OrchestrationThread): ReadonlySet<string> {
@@ -379,6 +399,7 @@ const make = Effect.gen(function* () {
   const canceledThreadTurnDispatchIds = new Set<string>();
   const inFlightThreadTurnFibers = new Map<string, Fiber.Fiber<void, never>>();
   const inFlightImmediateThreadTurnThreadIds = new Set<string>();
+  const stopRequestByThreadId = new Map<string, StopRequestMarker>();
 
   const claimThreadTurnDispatch = (rowId: PendingDispatchId) =>
     Effect.sync(() => {
@@ -1218,13 +1239,29 @@ const make = Effect.gen(function* () {
   const claimedThreadTurnCanSend = (input: {
     readonly threadId: ThreadId;
     readonly rowId: PendingDispatchId;
+    readonly sourceSequence?: number;
   }) =>
     Effect.gen(function* () {
+      const stopRequest = stopRequestByThreadId.get(input.threadId);
+      if (
+        stopRequest !== undefined &&
+        stopRequestSupersedesSequence(stopRequest, input.sourceSequence)
+      ) {
+        return false;
+      }
       if (canceledThreadTurnDispatchIds.has(input.rowId)) {
         return false;
       }
       const thread = yield* resolveThread(input.threadId);
-      if (!thread || !canAutoDrainQueuedThreadTurns(thread)) {
+      if (!thread) {
+        return false;
+      }
+      const canSendForThread =
+        canAutoDrainQueuedThreadTurns(thread) ||
+        (thread.session?.status === "stopped" &&
+          stopRequest !== undefined &&
+          !stopRequestSupersedesSequence(stopRequest, input.sourceSequence));
+      if (!canSendForThread) {
         return false;
       }
       const activeProviderSession = yield* resolveActiveSession(input.threadId);
@@ -1235,7 +1272,15 @@ const make = Effect.gen(function* () {
         return false;
       }
       const latestThread = yield* resolveThread(input.threadId);
-      if (!latestThread || !canAutoDrainQueuedThreadTurns(latestThread)) {
+      if (!latestThread) {
+        return false;
+      }
+      const canSendForLatestThread =
+        canAutoDrainQueuedThreadTurns(latestThread) ||
+        (latestThread.session?.status === "stopped" &&
+          stopRequest !== undefined &&
+          !stopRequestSupersedesSequence(stopRequest, input.sourceSequence));
+      if (!canSendForLatestThread) {
         return false;
       }
       const rows = yield* pendingDispatches
@@ -1262,19 +1307,27 @@ const make = Effect.gen(function* () {
         return;
       }
       if (thread.session?.status === "stopped") {
-        yield* cancelPendingThreadTurnRows({
-          threadId,
-          rows,
-          createdAt: thread.session.updatedAt,
-        });
-        return;
+        const stopRequest = stopRequestByThreadId.get(threadId);
+        const rowsToCancel =
+          stopRequest === undefined
+            ? rows
+            : rows.filter((row) => stopRequestSupersedesQueuedRow(stopRequest, row));
+        const rowsToKeep =
+          stopRequest === undefined
+            ? []
+            : rows.filter((row) => !stopRequestSupersedesQueuedRow(stopRequest, row));
+        if (rowsToCancel.length > 0) {
+          yield* cancelPendingThreadTurnRows({
+            threadId,
+            rows: rowsToCancel,
+            createdAt: thread.session.updatedAt,
+          });
+        }
+        if (rowsToKeep.length === 0) {
+          return;
+        }
+        rows = rowsToKeep;
       }
-      const activeProviderSession = yield* resolveActiveSession(threadId);
-      const hasLiveProviderTurn =
-        activeProviderSession?.status === "running" ||
-        activeProviderSession?.activeTurnId !== undefined ||
-        ((thread.session?.status === "running" || thread.session?.status === "waiting") &&
-          thread.session.activeTurnId !== null);
       const claimedRows = rows.filter(
         (row) => row.commandId !== null && !inFlightThreadTurnDispatchIds.has(row.id),
       );
@@ -1288,7 +1341,7 @@ const make = Effect.gen(function* () {
             continue;
           }
           const message = thread.messages.find((entry) => entry.id === payload.messageId);
-          if (hasLiveProviderTurn || (message !== undefined && message.turnId !== null)) {
+          if (message !== undefined && message.turnId !== null) {
             rowsToDelete.push(row);
           } else {
             rowsToRetry.push(row);
@@ -1319,13 +1372,19 @@ const make = Effect.gen(function* () {
       if (inFlightImmediateThreadTurnThreadIds.has(threadId)) {
         return;
       }
+      const activeProviderSession = yield* resolveActiveSession(threadId);
       if (
         activeProviderSession?.status === "running" ||
         activeProviderSession?.activeTurnId !== undefined
       ) {
         return;
       }
-      if (!canAutoDrainQueuedThreadTurns(thread)) {
+      const stopRequest = stopRequestByThreadId.get(threadId);
+      const hasPostStopQueuedRow =
+        thread.session?.status === "stopped" &&
+        stopRequest !== undefined &&
+        rows.some((row) => !stopRequestSupersedesQueuedRow(stopRequest, row));
+      if (!canAutoDrainQueuedThreadTurns(thread) && !hasPostStopQueuedRow) {
         return;
       }
 
@@ -1407,7 +1466,13 @@ const make = Effect.gen(function* () {
           return;
         }
 
-        const canSend = yield* claimedThreadTurnCanSend({ threadId, rowId: row.id });
+        const canSend = yield* claimedThreadTurnCanSend({
+          threadId,
+          rowId: row.id,
+          ...(payload.sourceSequence !== undefined
+            ? { sourceSequence: payload.sourceSequence }
+            : {}),
+        });
         if (!canSend) {
           yield* releaseThreadTurnDispatchClaim(row.id);
           return;
@@ -1417,7 +1482,13 @@ const make = Effect.gen(function* () {
         yield* pendingDispatches
           .claim({ ids: [row.id], commandId: claimCommandId })
           .pipe(Effect.orDie);
-        const canSendAfterClaim = yield* claimedThreadTurnCanSend({ threadId, rowId: row.id });
+        const canSendAfterClaim = yield* claimedThreadTurnCanSend({
+          threadId,
+          rowId: row.id,
+          ...(payload.sourceSequence !== undefined
+            ? { sourceSequence: payload.sourceSequence }
+            : {}),
+        });
         if (!canSendAfterClaim) {
           yield* resetAndReleaseThreadTurnDispatchClaim(row.id);
           return;
@@ -1453,7 +1524,14 @@ const make = Effect.gen(function* () {
           return claimed;
         });
         const canReleaseQueuedSend =
-          stillClaimed && (yield* claimedThreadTurnCanSend({ threadId, rowId: row.id }));
+          stillClaimed &&
+          (yield* claimedThreadTurnCanSend({
+            threadId,
+            rowId: row.id,
+            ...(payload.sourceSequence !== undefined
+              ? { sourceSequence: payload.sourceSequence }
+              : {}),
+          }));
         if (!canReleaseQueuedSend) {
           yield* Fiber.interrupt(sendFiber).pipe(Effect.ignore);
           yield* resetAndReleaseThreadTurnDispatchClaim(row.id);
@@ -1478,10 +1556,64 @@ const make = Effect.gen(function* () {
 
   const recoverMissingQueuedThreadTurnsFromEventLog = Effect.fnUntraced(function* () {
     const existingRows = yield* pendingDispatches.listAll().pipe(Effect.orDie);
-    const knownThreadTurnRowIds = new Set(
-      existingRows.filter((row) => row.kind === THREAD_TURN_PENDING_KIND).map((row) => row.id),
+    const knownThreadTurnRows = new Map(
+      existingRows
+        .filter((row) => row.kind === THREAD_TURN_PENDING_KIND)
+        .map((row) => [row.id, row]),
     );
     const threadCache = new Map<string, OrchestrationThread | undefined>();
+    const latestStopRequestByThread = new Map<
+      string,
+      { readonly sequence: number; readonly createdAt: string }
+    >();
+    const effectiveStopRequestByThread = new Map<string, StopRequestMarker>();
+    const resolveThreadCached = (threadId: ThreadId) =>
+      Effect.gen(function* () {
+        const threadCacheKey = String(threadId);
+        let thread = threadCache.get(threadCacheKey);
+        if (!threadCache.has(threadCacheKey)) {
+          thread = yield* resolveThread(threadId);
+          threadCache.set(threadCacheKey, thread);
+        }
+        return thread;
+      });
+
+    yield* orchestrationEngine.readEvents(0, Number.MAX_SAFE_INTEGER).pipe(
+      Stream.runForEach((event) =>
+        Effect.sync(() => {
+          if (event.type === "thread.session-stop-requested") {
+            const key = String(event.payload.threadId);
+            const previous = latestStopRequestByThread.get(key);
+            const stopRequest = {
+              sequence: event.sequence,
+              createdAt: event.payload.createdAt,
+            };
+            if (previous === undefined || event.sequence > previous.sequence) {
+              latestStopRequestByThread.set(key, stopRequest);
+            }
+            effectiveStopRequestByThread.set(key, stopRequest);
+            return;
+          }
+          if (event.type === "thread.session-set" && event.payload.session.status !== "stopped") {
+            const key = String(event.payload.threadId);
+            const stopRequest = effectiveStopRequestByThread.get(key);
+            if (
+              stopRequest !== undefined &&
+              event.sequence > stopRequest.sequence &&
+              event.payload.session.updatedAt > stopRequest.createdAt
+            ) {
+              effectiveStopRequestByThread.delete(key);
+            }
+          }
+        }),
+      ),
+      Effect.orDie,
+    );
+    yield* Effect.sync(() => {
+      for (const [threadId, stopRequest] of effectiveStopRequestByThread) {
+        stopRequestByThreadId.set(threadId, stopRequest);
+      }
+    });
 
     yield* orchestrationEngine.readEvents(0, Number.MAX_SAFE_INTEGER).pipe(
       Stream.runForEach((event) =>
@@ -1490,22 +1622,76 @@ const make = Effect.gen(function* () {
             return;
           }
 
+          const rowId = pendingThreadTurnIdForMessage(event.payload.messageId);
+          const existingKnownRow = knownThreadTurnRows.get(rowId);
+          if (existingKnownRow !== undefined) {
+            const payload = parseQueuedThreadTurnPayload(existingKnownRow);
+            if (payload !== null && payload.sourceSequence === undefined) {
+              const backfilledRow = {
+                ...existingKnownRow,
+                text: encodeQueuedThreadTurnPayloadJson({
+                  messageId: payload.messageId,
+                  ...(payload.modelSelection !== undefined
+                    ? { modelSelection: payload.modelSelection }
+                    : {}),
+                  ...(payload.runtimeMode !== undefined
+                    ? { runtimeMode: payload.runtimeMode }
+                    : {}),
+                  ...(payload.interactionMode !== undefined
+                    ? { interactionMode: payload.interactionMode }
+                    : {}),
+                  createdAt: payload.createdAt,
+                  sourceSequence: event.sequence,
+                }),
+              } satisfies PendingDispatch;
+              yield* pendingDispatches.insert(backfilledRow).pipe(Effect.orDie);
+              knownThreadTurnRows.set(rowId, backfilledRow);
+            }
+          }
+          const stopRequest = latestStopRequestByThread.get(String(event.payload.threadId));
+          if (stopRequest !== undefined && stopRequest.sequence > event.sequence) {
+            const existingRow = knownThreadTurnRows.get(rowId);
+            const thread = yield* resolveThreadCached(event.payload.threadId);
+            const message = thread?.messages.find((entry) => entry.id === event.payload.messageId);
+            if (existingRow !== undefined) {
+              if (message !== undefined && message.turnId !== null) {
+                yield* deletePendingThreadTurnRows([existingRow.id]);
+              } else {
+                yield* cancelPendingThreadTurnRows({
+                  threadId: event.payload.threadId,
+                  rows: [existingRow],
+                  createdAt: stopRequest.createdAt,
+                });
+              }
+              knownThreadTurnRows.delete(rowId);
+            } else {
+              if (
+                thread !== undefined &&
+                message !== undefined &&
+                (message.role === "user" || message.role === "system") &&
+                message.turnId === null &&
+                !failedProviderTurnStartMessageIds(thread).has(event.payload.messageId)
+              ) {
+                yield* appendQueuedTurnCanceledActivity({
+                  threadId: event.payload.threadId,
+                  messageId: event.payload.messageId,
+                  createdAt: stopRequest.createdAt,
+                });
+              }
+            }
+            return;
+          }
+
           const key = turnStartKeyForEvent(event);
           if (yield* claimTurnStartHandling(key)) {
             return;
           }
 
-          const rowId = pendingThreadTurnIdForMessage(event.payload.messageId);
-          if (knownThreadTurnRowIds.has(rowId)) {
+          if (knownThreadTurnRows.has(rowId)) {
             return;
           }
 
-          const threadCacheKey = String(event.payload.threadId);
-          let thread = threadCache.get(threadCacheKey);
-          if (!threadCache.has(threadCacheKey)) {
-            thread = yield* resolveThread(event.payload.threadId);
-            threadCache.set(threadCacheKey, thread);
-          }
+          const thread = yield* resolveThreadCached(event.payload.threadId);
           if (!thread) {
             return;
           }
@@ -1524,7 +1710,7 @@ const make = Effect.gen(function* () {
           yield* startFirstUserTurnSideEffects({ event, thread, message });
           const row = pendingThreadTurnRowForEvent(event);
           yield* pendingDispatches.insert(row).pipe(Effect.orDie);
-          knownThreadTurnRowIds.add(row.id);
+          knownThreadTurnRows.set(row.id, row);
         }),
       ),
       Effect.orDie,
@@ -1558,18 +1744,39 @@ const make = Effect.gen(function* () {
       return;
     }
 
+    const stopRequest = stopRequestByThreadId.get(event.payload.threadId);
+    if (stopRequest !== undefined && stopRequestSupersedesSequence(stopRequest, event.sequence)) {
+      yield* appendQueuedTurnCanceledActivity({
+        threadId: event.payload.threadId,
+        messageId: event.payload.messageId,
+        createdAt: stopRequest.createdAt,
+      });
+      return;
+    }
+
     yield* startFirstUserTurnSideEffects({ event, thread, message });
 
     let pendingThreadTurns = yield* pendingDispatches
       .listByTarget({ kind: THREAD_TURN_PENDING_KIND, targetThreadId: event.payload.threadId })
       .pipe(Effect.orDie);
     if (thread.session?.status === "stopped" && pendingThreadTurns.length > 0) {
-      yield* cancelPendingThreadTurnRows({
-        threadId: event.payload.threadId,
-        rows: pendingThreadTurns,
-        createdAt: event.payload.createdAt,
-      });
-      pendingThreadTurns = [];
+      const stopRequest = stopRequestByThreadId.get(event.payload.threadId);
+      const rowsToCancel =
+        stopRequest === undefined
+          ? pendingThreadTurns
+          : pendingThreadTurns.filter((row) => stopRequestSupersedesQueuedRow(stopRequest, row));
+      const rowsToKeep =
+        stopRequest === undefined
+          ? []
+          : pendingThreadTurns.filter((row) => !stopRequestSupersedesQueuedRow(stopRequest, row));
+      if (rowsToCancel.length > 0) {
+        yield* cancelPendingThreadTurnRows({
+          threadId: event.payload.threadId,
+          rows: rowsToCancel,
+          createdAt: event.payload.createdAt,
+        });
+      }
+      pendingThreadTurns = rowsToKeep;
     }
     const activeProviderSession = yield* resolveActiveSession(event.payload.threadId);
     const hasLiveProviderTurn =
@@ -1783,12 +1990,35 @@ const make = Effect.gen(function* () {
   const processSessionStopRequested = Effect.fn("processSessionStopRequested")(function* (
     event: Extract<ProviderIntentEvent, { type: "thread.session-stop-requested" }>,
   ) {
+    yield* Effect.sync(() => {
+      stopRequestByThreadId.set(event.payload.threadId, {
+        sequence: event.sequence,
+        createdAt: event.payload.createdAt,
+      });
+    });
     const thread = yield* resolveThread(event.payload.threadId);
     if (!thread) {
       return;
     }
 
     const now = event.payload.createdAt;
+    const rows = yield* pendingDispatches
+      .listByTarget({ kind: THREAD_TURN_PENDING_KIND, targetThreadId: thread.id })
+      .pipe(Effect.orDie);
+    const rowsToCancel = rows.filter((row) =>
+      stopRequestSupersedesQueuedRow(
+        { sequence: event.sequence, createdAt: event.payload.createdAt },
+        row,
+      ),
+    );
+    if (rowsToCancel.length > 0) {
+      yield* cancelPendingThreadTurnRows({
+        threadId: thread.id,
+        rows: rowsToCancel,
+        createdAt: now,
+      });
+    }
+
     const activeSession = yield* resolveActiveSession(thread.id);
     if (
       thread.session &&
@@ -1870,14 +2100,37 @@ const make = Effect.gen(function* () {
               targetThreadId: event.payload.threadId,
             })
             .pipe(Effect.orDie);
-          if (rows.length > 0) {
+          const stopRequest = stopRequestByThreadId.get(event.payload.threadId);
+          const rowsToCancel =
+            stopRequest === undefined
+              ? rows
+              : rows.filter((row) => stopRequestSupersedesQueuedRow(stopRequest, row));
+          const rowsToKeep =
+            stopRequest === undefined
+              ? []
+              : rows.filter((row) => !stopRequestSupersedesQueuedRow(stopRequest, row));
+          if (rowsToCancel.length > 0) {
             yield* cancelPendingThreadTurnRows({
               threadId: event.payload.threadId,
-              rows,
+              rows: rowsToCancel,
               createdAt: event.payload.session.updatedAt,
             });
           }
+          if (rowsToKeep.length > 0) {
+            yield* drainPendingThreadTurns(event.payload.threadId);
+            return;
+          }
           return;
+        }
+        const stopRequest = stopRequestByThreadId.get(event.payload.threadId);
+        if (
+          stopRequest !== undefined &&
+          event.sequence > stopRequest.sequence &&
+          event.payload.session.updatedAt > stopRequest.createdAt
+        ) {
+          yield* Effect.sync(() => {
+            stopRequestByThreadId.delete(event.payload.threadId);
+          });
         }
         yield* drainPendingThreadTurns(event.payload.threadId);
         return;
@@ -1904,6 +2157,14 @@ const make = Effect.gen(function* () {
 
   const start: ProviderCommandReactorShape["start"] = Effect.fn("start")(function* () {
     const processEvent = Effect.fn("processEvent")(function* (event: OrchestrationEvent) {
+      if (event.type === "thread.session-stop-requested") {
+        yield* Effect.sync(() => {
+          stopRequestByThreadId.set(event.payload.threadId, {
+            sequence: event.sequence,
+            createdAt: event.payload.createdAt,
+          });
+        });
+      }
       if (
         event.type === "thread.runtime-mode-set" ||
         event.type === "thread.turn-start-requested" ||
