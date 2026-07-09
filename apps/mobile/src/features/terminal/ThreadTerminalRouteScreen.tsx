@@ -930,7 +930,7 @@ export function ThreadTerminalRouteScreen(props: ThreadTerminalRouteScreenProps)
         </NativeHeaderToolbar>
       ) : null}
 
-      <View style={{ flex: 1, backgroundColor: terminalTheme.background }}>
+      <View className="flex-1" style={{ backgroundColor: terminalTheme.background }}>
         {!isEnvironmentReady ? (
           <EnvironmentConnectionNotice
             environmentLabel={
@@ -950,7 +950,7 @@ export function ThreadTerminalRouteScreen(props: ThreadTerminalRouteScreenProps)
           />
         ) : (
           <>
-            <View style={{ flex: 1, paddingBottom: terminalBottomInset }}>
+            <View className="flex-1" style={{ paddingBottom: terminalBottomInset }}>
               <TerminalSurface
                 buffer={terminalSurfaceBuffer}
                 fontSize={fontSize}
@@ -969,10 +969,10 @@ export function ThreadTerminalRouteScreen(props: ThreadTerminalRouteScreenProps)
                 offset={{ closed: 0, opened: 0 }}
               >
                 <View
+                  className="border-t"
                   style={{
                     backgroundColor: terminalTheme.background,
                     borderTopColor: terminalTheme.border,
-                    borderTopWidth: 1,
                     minHeight: TERMINAL_ACCESSORY_HEIGHT,
                   }}
                 >
