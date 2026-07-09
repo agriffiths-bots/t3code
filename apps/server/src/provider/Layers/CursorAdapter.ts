@@ -4,6 +4,8 @@
  * @module CursorAdapterLive
  */
 
+import * as NodeTimersPromises from "node:timers/promises";
+
 import {
   ApprovalRequestId,
   type CursorSettings,
@@ -137,6 +139,7 @@ interface CursorSessionContext {
   readonly assistantItemTurnIds: Map<string, TurnId | undefined>;
   lastPlanFingerprint: string | undefined;
   activeTurnId: TurnId | undefined;
+  suppressAcpUpdatesAfterLocalCancel: boolean;
   // ACP session/update notifications do not carry prompt ids. Keep their turn
   // scope separate from session activity so stale queued updates are not
   // assigned to the next active turn.
@@ -532,28 +535,64 @@ export function makeCursorAdapter(
       return Effect.succeed(ctx);
     };
 
-    const stopSessionInternal = (ctx: CursorSessionContext) =>
+    const cleanupStoppedSession = (ctx: CursorSessionContext) =>
       Effect.gen(function* () {
-        if (ctx.stopped) return;
-        ctx.stopped = true;
-        yield* Deferred.succeed(ctx.stoppedSignal, undefined).pipe(Effect.ignore);
         yield* settlePendingApprovalsAsCancelled(ctx.pendingApprovals);
         yield* settlePendingUserInputsAsEmptyAnswers(ctx.pendingUserInputs);
         if (ctx.notificationFiber) {
           yield* Fiber.interrupt(ctx.notificationFiber);
         }
         yield* Effect.ignore(Scope.close(ctx.scope, Exit.void));
+      });
+
+    const publishSessionExited = (ctx: CursorSessionContext) =>
+      makeEventStamp().pipe(
+        Effect.flatMap((stamp) =>
+          offerRuntimeEvent({
+            type: "session.exited",
+            ...stamp,
+            provider: PROVIDER,
+            threadId: ctx.threadId,
+            payload: {
+              exitKind: "graceful",
+              ...(ctx.mcpProviderSessionId
+                ? { mcpProviderSessionId: ctx.mcpProviderSessionId }
+                : {}),
+            },
+          }),
+        ),
+      );
+
+    const finishStoppedSession = (ctx: CursorSessionContext) =>
+      Effect.gen(function* () {
+        yield* cleanupStoppedSession(ctx);
+        yield* publishSessionExited(ctx);
+      });
+
+    const markSessionStopped = (ctx: CursorSessionContext) =>
+      Effect.gen(function* () {
+        if (ctx.stopped) {
+          return false;
+        }
+        ctx.stopped = true;
+        yield* Deferred.succeed(ctx.stoppedSignal, undefined).pipe(Effect.ignore);
         sessions.delete(ctx.threadId);
-        yield* offerRuntimeEvent({
-          type: "session.exited",
-          ...(yield* makeEventStamp()),
-          provider: PROVIDER,
-          threadId: ctx.threadId,
-          payload: {
-            exitKind: "graceful",
-            ...(ctx.mcpProviderSessionId ? { mcpProviderSessionId: ctx.mcpProviderSessionId } : {}),
-          },
-        });
+        return true;
+      });
+
+    const stopSessionInternal = (ctx: CursorSessionContext) =>
+      Effect.gen(function* () {
+        const shouldStop = yield* markSessionStopped(ctx);
+        if (!shouldStop) return;
+        yield* finishStoppedSession(ctx);
+      });
+
+    const stopSessionDetached = (ctx: CursorSessionContext) =>
+      Effect.gen(function* () {
+        const shouldStop = yield* markSessionStopped(ctx);
+        if (!shouldStop) return;
+        yield* publishSessionExited(ctx);
+        yield* cleanupStoppedSession(ctx).pipe(Effect.ignore, Effect.forkDetach, Effect.asVoid);
       });
 
     const startSession: CursorAdapterShape["startSession"] = (input) =>
@@ -869,6 +908,7 @@ export function makeCursorAdapter(
             assistantItemTurnIds: new Map(),
             lastPlanFingerprint: undefined,
             activeTurnId: input.activeTurnId,
+            suppressAcpUpdatesAfterLocalCancel: false,
             notificationTurnId: input.activeTurnId,
             promptsInFlight: 0,
             stopped: false,
@@ -879,6 +919,9 @@ export function makeCursorAdapter(
               Effect.gen(function* () {
                 if (event._tag === "EventStreamBarrier") {
                   yield* Deferred.succeed(event.acknowledge, undefined);
+                  return;
+                }
+                if (ctx.suppressAcpUpdatesAfterLocalCancel) {
                   return;
                 }
                 if (event._tag === "ModeChanged") {
@@ -1098,14 +1141,6 @@ export function makeCursorAdapter(
             });
           }
 
-          const drainedBeforeTurn = yield* switchNotificationTurnIdAfterDrain(ctx, turnId);
-          if (!drainedBeforeTurn || ctx.stopped) {
-            return yield* new ProviderAdapterSessionNotFoundError({
-              provider: PROVIDER,
-              threadId: input.threadId,
-            });
-          }
-
           const promptParts: Array<EffectAcpSchema.ContentBlock> = [];
           if (input.input?.trim()) {
             promptParts.push({ type: "text", text: input.input.trim() });
@@ -1150,6 +1185,14 @@ export function makeCursorAdapter(
             });
           }
 
+          const drainedBeforeTurn = yield* switchNotificationTurnIdAfterDrain(ctx, turnId);
+          if (!drainedBeforeTurn || ctx.stopped) {
+            return yield* new ProviderAdapterSessionNotFoundError({
+              provider: PROVIDER,
+              threadId: input.threadId,
+            });
+          }
+
           const result = yield* ctx.acp
             .prompt({
               prompt: promptParts,
@@ -1166,12 +1209,15 @@ export function makeCursorAdapter(
           } else {
             ctx.turns.push({ id: turnId, items: [{ prompt: promptParts, result }] });
           }
-          const drainedEvents = yield* drainAcpEventsUnlessStopped(ctx);
-          if (!drainedEvents || ctx.stopped) {
-            return yield* new ProviderAdapterSessionNotFoundError({
-              provider: PROVIDER,
-              threadId: input.threadId,
-            });
+          if (result.stopReason !== "cancelled") {
+            ctx.suppressAcpUpdatesAfterLocalCancel = false;
+            const drainedEvents = yield* drainAcpEventsUnlessStopped(ctx);
+            if (!drainedEvents || ctx.stopped) {
+              return yield* new ProviderAdapterSessionNotFoundError({
+                provider: PROVIDER,
+                threadId: input.threadId,
+              });
+            }
           }
           // Only the last remaining prompt settles the turn — a steer-
           // superseded prompt resolving (usually cancelled) while another is
@@ -1199,6 +1245,9 @@ export function makeCursorAdapter(
                 stopReason: result.stopReason ?? null,
               },
             });
+            if (result.stopReason === "cancelled") {
+              yield* stopSessionDetached(ctx);
+            }
           } else {
             ctx.session = {
               ...ctx.session,
@@ -1224,6 +1273,7 @@ export function makeCursorAdapter(
                 ctx.session.activeTurnId === turnId
               ) {
                 ctx.activeTurnId = previousActiveTurnId;
+                ctx.suppressAcpUpdatesAfterLocalCancel = false;
                 ctx.notificationTurnId = previousNotificationTurnId;
                 ctx.session = previousSession;
                 ctx.lastPlanFingerprint = previousLastPlanFingerprint;
@@ -1245,14 +1295,21 @@ export function makeCursorAdapter(
           ctx.promptsInFlight === 0 && ctx.activeTurnId !== undefined
             ? ctx.activeTurnId
             : undefined;
+        if (ctx.promptsInFlight > 0) {
+          ctx.suppressAcpUpdatesAfterLocalCancel = true;
+        }
         yield* settlePendingApprovalsAsCancelled(ctx.pendingApprovals);
         yield* settlePendingUserInputsAsEmptyAnswers(ctx.pendingUserInputs);
-        yield* Effect.ignore(
-          ctx.acp.cancel.pipe(
-            Effect.mapError((error) =>
-              mapAcpToAdapterError(PROVIDER, threadId, "session/cancel", error),
-            ),
+        const cancelFiber = yield* ctx.acp.cancel.pipe(
+          Effect.mapError((error) =>
+            mapAcpToAdapterError(PROVIDER, threadId, "session/cancel", error),
           ),
+          Effect.ignore,
+          Effect.forkIn(ctx.scope),
+        );
+        yield* Effect.raceFirst(
+          Fiber.join(cancelFiber).pipe(Effect.ignore),
+          Effect.promise(() => NodeTimersPromises.setTimeout(50)),
         );
         if (
           resumedTurnToCancel !== undefined &&

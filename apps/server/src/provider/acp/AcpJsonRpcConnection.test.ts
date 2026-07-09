@@ -3,6 +3,7 @@ import * as NodePath from "node:path";
 import * as NodeOS from "node:os";
 import * as NodeURL from "node:url";
 import * as NodeFS from "node:fs";
+import * as NodeTimersPromises from "node:timers/promises";
 
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { it } from "@effect/vitest";
@@ -77,6 +78,7 @@ describe("AcpSessionRuntime", () => {
         prompt: [{ type: "text", text: "hi" }],
       });
       expect(promptResult).toMatchObject({ stopReason: "end_turn" });
+      yield* TestClock.adjust("25 millis");
 
       const notes = Array.from(yield* Stream.runCollect(Stream.take(runtime.getEvents(), 4)));
       expect(notes).toHaveLength(4);
@@ -125,6 +127,7 @@ describe("AcpSessionRuntime", () => {
         prompt: [{ type: "text", text: "hi" }],
       });
       expect(promptResult).toMatchObject({ stopReason: "end_turn" });
+      yield* TestClock.adjust("25 millis");
 
       const notes = Array.from(yield* Stream.runCollect(Stream.take(runtime.getEvents(), 4)));
       expect(notes.map((note) => note._tag)).toEqual([
@@ -208,9 +211,37 @@ describe("AcpSessionRuntime", () => {
       const firstPromptResult = yield* Fiber.join(promptFiber);
       expect(firstPromptResult).toMatchObject({ stopReason: "cancelled" });
 
-      const secondPromptResult = yield* runtime.prompt({
-        prompt: [{ type: "text", text: "second" }],
-      });
+      yield* Effect.promise(() => NodeTimersPromises.setTimeout(150));
+      const lateCancelNotes = Array.from(
+        yield* Stream.runCollect(Stream.take(runtime.getEvents(), 3)).pipe(
+          Effect.timeout("2 seconds"),
+        ),
+      );
+      expect(lateCancelNotes.map((note) => note._tag)).toEqual([
+        "AssistantItemStarted",
+        "ContentDelta",
+        "AssistantItemCompleted",
+      ]);
+      const lateCancelStart = lateCancelNotes[0];
+      const lateCancelDelta = lateCancelNotes[1];
+      const lateCancelCompleted = lateCancelNotes[2];
+      if (
+        lateCancelStart?._tag === "AssistantItemStarted" &&
+        lateCancelDelta?._tag === "ContentDelta" &&
+        lateCancelCompleted?._tag === "AssistantItemCompleted"
+      ) {
+        expect(lateCancelDelta.itemId).toBe(lateCancelStart.itemId);
+        expect(lateCancelDelta.text).toBe("late after cancel");
+        expect(lateCancelCompleted.itemId).toBe(lateCancelStart.itemId);
+      }
+
+      const secondPromptFiber = yield* runtime
+        .prompt({
+          prompt: [{ type: "text", text: "second" }],
+        })
+        .pipe(Effect.forkChild);
+      yield* TestClock.adjust("100 millis");
+      const secondPromptResult = yield* Fiber.join(secondPromptFiber);
       expect(secondPromptResult).toMatchObject({ stopReason: "end_turn" });
     }).pipe(
       Effect.provide(
@@ -220,6 +251,8 @@ describe("AcpSessionRuntime", () => {
             args: mockAgentArgs,
             env: {
               T3_ACP_HANG_FIRST_PROMPT_FOREVER: "1",
+              T3_ACP_EMIT_LATE_UPDATE_AFTER_CANCEL: "1",
+              T3_ACP_LATE_UPDATE_AFTER_CANCEL_DELAY_MS: "25",
             },
           },
           cwd: process.cwd(),
@@ -504,6 +537,7 @@ describe("AcpSessionRuntime", () => {
       yield* runtime.prompt({
         prompt: [{ type: "text", text: "hi after retry" }],
       });
+      yield* TestClock.adjust("25 millis");
       const notes = Array.from(yield* Stream.runCollect(Stream.take(runtime.getEvents(), 4)));
       expect(notes.map((note) => note._tag)).toEqual([
         "PlanUpdated",
@@ -552,6 +586,7 @@ describe("AcpSessionRuntime", () => {
       yield* runtime.prompt({
         prompt: [{ type: "text", text: "hi" }],
       });
+      yield* TestClock.adjust("25 millis");
       const notes = Array.from(yield* Stream.runCollect(Stream.take(runtime.getEvents(), 4)));
       expect(notes.map((note) => note._tag)).toEqual([
         "PlanUpdated",
@@ -589,6 +624,7 @@ describe("AcpSessionRuntime", () => {
       yield* runtime.prompt({
         prompt: [{ type: "text", text: "hi" }],
       });
+      yield* TestClock.adjust("25 millis");
       const notes = Array.from(yield* Stream.runCollect(Stream.take(runtime.getEvents(), 4)));
       const assistantStarted = notes.find((note) => note._tag === "AssistantItemStarted");
       const contentDelta = notes.find((note) => note._tag === "ContentDelta");

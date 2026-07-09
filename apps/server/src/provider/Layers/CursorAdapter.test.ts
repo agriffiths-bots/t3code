@@ -1,7 +1,9 @@
 // @effect-diagnostics nodeBuiltinImport:off
+import * as NodeChildProcess from "node:child_process";
 import * as NodePath from "node:path";
 import * as NodeOS from "node:os";
 import * as NodeFSP from "node:fs/promises";
+import * as NodeTimersPromises from "node:timers/promises";
 import * as NodeURL from "node:url";
 
 import * as NodeServices from "@effect/platform-node/NodeServices";
@@ -28,6 +30,7 @@ import {
 
 import { ServerConfig } from "../../config.ts";
 import { ServerSettingsService } from "../../serverSettings.ts";
+import { attachmentRelativePath } from "../../attachmentStore.ts";
 import type { CursorAdapterShape } from "../Services/CursorAdapter.ts";
 import { makeCursorAdapter } from "./CursorAdapter.ts";
 const decodeCursorSettings = Schema.decodeSync(CursorSettings);
@@ -202,6 +205,7 @@ cursorAdapterTestLayer("CursorAdapterLive", (it) => {
         input: "hello mock",
         attachments: [],
       });
+      yield* TestClock.adjust("25 millis");
 
       const runtimeEvents = Array.from(yield* Fiber.join(runtimeEventsFiber));
       const types = runtimeEvents.map((e) => e.type);
@@ -336,21 +340,26 @@ cursorAdapterTestLayer("CursorAdapterLive", (it) => {
       );
       yield* settings.updateSettings({ providers: { cursor: { binaryPath: wrapperPath } } });
 
+      const firstDeltaReady = yield* Deferred.make<ProviderRuntimeEvent>();
+      const completionReady = yield* Deferred.make<ProviderRuntimeEvent>();
       const lateDeltasReady = yield* Deferred.make<ReadonlyArray<ProviderRuntimeEvent>>();
-      const lateCompletionReady = yield* Deferred.make<ProviderRuntimeEvent>();
       const lateDeltas: Array<ProviderRuntimeEvent> = [];
-      let lateItemId: string | undefined;
+      let firstItemId: string | undefined;
 
       const runtimeEventsFiber = yield* Stream.runForEach(adapter.streamEvents, (event) =>
         Effect.gen(function* () {
           if (String(event.threadId) !== String(threadId)) {
             return;
           }
+          if (event.type === "content.delta" && event.payload.delta === "first response") {
+            firstItemId = event.itemId === undefined ? undefined : String(event.itemId);
+            yield* Deferred.succeed(firstDeltaReady, event).pipe(Effect.ignore);
+            return;
+          }
           if (
             event.type === "content.delta" &&
             (event.payload.delta === "late after" || event.payload.delta === " first")
           ) {
-            lateItemId ??= event.itemId === undefined ? undefined : String(event.itemId);
             lateDeltas.push(event);
             if (lateDeltas.length === 2) {
               yield* Deferred.succeed(lateDeltasReady, [...lateDeltas]).pipe(Effect.ignore);
@@ -359,10 +368,10 @@ cursorAdapterTestLayer("CursorAdapterLive", (it) => {
           }
           if (
             event.type === "item.completed" &&
-            lateItemId !== undefined &&
-            String(event.itemId) === lateItemId
+            firstItemId !== undefined &&
+            String(event.itemId) === firstItemId
           ) {
-            yield* Deferred.succeed(lateCompletionReady, event).pipe(Effect.ignore);
+            yield* Deferred.succeed(completionReady, event).pipe(Effect.ignore);
           }
         }),
       ).pipe(Effect.forkChild);
@@ -381,6 +390,10 @@ cursorAdapterTestLayer("CursorAdapterLive", (it) => {
         attachments: [],
       });
 
+      const firstDelta = yield* Deferred.await(firstDeltaReady).pipe(Effect.timeout("2 seconds"));
+      assert.equal(firstDelta.type, "content.delta");
+      assert.isDefined(firstItemId);
+
       const lateDeltasResult = yield* Deferred.await(lateDeltasReady).pipe(
         Effect.timeout("2 seconds"),
       );
@@ -394,19 +407,120 @@ cursorAdapterTestLayer("CursorAdapterLive", (it) => {
         assert.equal(lateDelta.type, "content.delta");
         if (lateDelta.type === "content.delta") {
           assert.equal(String(lateDelta.turnId), String(firstTurn.turnId));
-          assert.equal(String(lateDelta.itemId), lateItemId);
+          assert.equal(String(lateDelta.itemId), firstItemId);
         }
       }
       yield* TestClock.adjust("25 millis");
 
-      const lateCompletion = yield* Deferred.await(lateCompletionReady).pipe(
-        Effect.timeout("2 seconds"),
-      );
-      assert.equal(lateCompletion.type, "item.completed");
-      if (lateCompletion.type === "item.completed") {
-        assert.equal(String(lateCompletion.turnId), String(firstTurn.turnId));
-        assert.equal(String(lateCompletion.itemId), lateItemId);
+      const completion = yield* Deferred.await(completionReady).pipe(Effect.timeout("2 seconds"));
+      assert.equal(completion.type, "item.completed");
+      if (completion.type === "item.completed") {
+        assert.equal(String(completion.turnId), String(firstTurn.turnId));
+        assert.equal(String(completion.itemId), firstItemId);
       }
+
+      yield* Fiber.interrupt(runtimeEventsFiber);
+      yield* adapter.stopSession(threadId);
+    }),
+  );
+
+  it.effect("keeps stale Composer chunks on the previous turn while preparing a prompt", () =>
+    Effect.gen(function* () {
+      const adapter = yield* CursorAdapter;
+      const settings = yield* ServerSettingsService;
+      const serverConfig = yield* ServerConfig;
+      const threadId = ThreadId.make("cursor-scope-switch-during-prompt-prep");
+
+      const wrapperPath = yield* Effect.promise(() =>
+        makeMockAgentWrapper({
+          T3_ACP_PROMPT_RESPONSE_TEXT: "first response",
+          T3_ACP_LATE_FIRST_PROMPT_RESPONSE_TEXT: "late previous",
+          T3_ACP_LATE_FIRST_PROMPT_RESPONSE_DELAY_MS: "100",
+        }),
+      );
+      yield* settings.updateSettings({ providers: { cursor: { binaryPath: wrapperPath } } });
+
+      const firstDeltaReady = yield* Deferred.make<ProviderRuntimeEvent>();
+      const firstCompletionReady = yield* Deferred.make<ProviderRuntimeEvent>();
+      const lateDeltaReady = yield* Deferred.make<ProviderRuntimeEvent>();
+      let firstItemId: string | undefined;
+
+      const runtimeEventsFiber = yield* Stream.runForEach(adapter.streamEvents, (event) =>
+        Effect.gen(function* () {
+          if (String(event.threadId) !== String(threadId)) {
+            return;
+          }
+          if (event.type === "content.delta" && event.payload.delta === "first response") {
+            firstItemId = event.itemId === undefined ? undefined : String(event.itemId);
+            yield* Deferred.succeed(firstDeltaReady, event).pipe(Effect.ignore);
+            return;
+          }
+          if (
+            event.type === "item.completed" &&
+            firstItemId !== undefined &&
+            String(event.itemId) === firstItemId
+          ) {
+            yield* Deferred.succeed(firstCompletionReady, event).pipe(Effect.ignore);
+            return;
+          }
+          if (event.type === "content.delta" && event.payload.delta === "late previous") {
+            yield* Deferred.succeed(lateDeltaReady, event).pipe(Effect.ignore);
+          }
+        }),
+      ).pipe(Effect.forkChild);
+
+      yield* adapter.startSession({
+        threadId,
+        provider: ProviderDriverKind.make("cursor"),
+        cwd: process.cwd(),
+        runtimeMode: "full-access",
+        modelSelection: { instanceId: ProviderInstanceId.make("cursor"), model: "composer-2" },
+      });
+
+      const firstTurn = yield* adapter.sendTurn({
+        threadId,
+        input: "first Composer turn",
+        attachments: [],
+      });
+      yield* Deferred.await(firstDeltaReady).pipe(Effect.timeout("2 seconds"));
+      yield* TestClock.adjust("25 millis");
+      yield* Deferred.await(firstCompletionReady).pipe(Effect.timeout("2 seconds"));
+
+      const blockingAttachment = {
+        type: "image" as const,
+        id: "cursor-scope-switch-00000000-0000-4000-8000-000000000001",
+        name: "blocking.png",
+        mimeType: "image/png",
+        sizeBytes: 4,
+      };
+      const blockingAttachmentPath = NodePath.join(
+        serverConfig.attachmentsDir,
+        attachmentRelativePath(blockingAttachment),
+      );
+      yield* Effect.promise(() =>
+        NodeFSP.mkdir(NodePath.dirname(blockingAttachmentPath), { recursive: true }),
+      );
+      yield* Effect.sync(() => NodeChildProcess.execFileSync("mkfifo", [blockingAttachmentPath]));
+
+      const secondTurnFiber = yield* adapter
+        .sendTurn({
+          threadId,
+          input: "second Composer turn",
+          attachments: [blockingAttachment],
+        })
+        .pipe(Effect.forkChild);
+
+      const lateDelta = yield* Deferred.await(lateDeltaReady).pipe(Effect.timeout("2 seconds"));
+      yield* Effect.promise(() =>
+        NodeFSP.writeFile(blockingAttachmentPath, Uint8Array.from([1, 2, 3, 4])),
+      );
+      const secondTurn = yield* Fiber.join(secondTurnFiber).pipe(Effect.timeout("2 seconds"));
+
+      assert.equal(lateDelta.type, "content.delta");
+      if (lateDelta.type === "content.delta") {
+        assert.equal(String(lateDelta.turnId), String(firstTurn.turnId));
+      }
+      assert.notEqual(String(secondTurn.turnId), String(firstTurn.turnId));
 
       yield* Fiber.interrupt(runtimeEventsFiber);
       yield* adapter.stopSession(threadId);
@@ -1495,18 +1609,17 @@ cursorAdapterTestLayer("CursorAdapterLive", (it) => {
       );
       yield* serverSettings.updateSettings({ providers: { cursor: { binaryPath: wrapperPath } } });
 
+      const requestOpenedReady = yield* Deferred.make<ProviderRuntimeEvent>();
       const requestResolvedReady = yield* Deferred.make<ProviderRuntimeEvent>();
       const turnCompletedReady = yield* Deferred.make<ProviderRuntimeEvent>();
-      let interrupted = false;
 
       const runtimeEventsFiber = yield* Stream.runForEach(adapter.streamEvents, (event) =>
         Effect.gen(function* () {
           if (String(event.threadId) !== String(threadId)) {
             return;
           }
-          if (event.type === "request.opened" && !interrupted) {
-            interrupted = true;
-            yield* adapter.interruptTurn(threadId);
+          if (event.type === "request.opened") {
+            yield* Deferred.succeed(requestOpenedReady, event).pipe(Effect.ignore);
             return;
           }
           if (event.type === "request.resolved") {
@@ -1535,9 +1648,31 @@ cursorAdapterTestLayer("CursorAdapterLive", (it) => {
         })
         .pipe(Effect.forkChild);
 
-      const requestResolved = yield* Deferred.await(requestResolvedReady);
-      const turnCompleted = yield* Deferred.await(turnCompletedReady);
-      yield* Fiber.join(sendTurnFiber);
+      yield* Effect.raceFirst(
+        Deferred.await(requestOpenedReady),
+        Effect.promise(() => NodeTimersPromises.setTimeout(2_000)).pipe(
+          Effect.flatMap(() => Effect.die("Timed out waiting for request.opened")),
+        ),
+      );
+      yield* adapter.interruptTurn(threadId);
+      const requestResolved = yield* Effect.raceFirst(
+        Deferred.await(requestResolvedReady),
+        Effect.promise(() => NodeTimersPromises.setTimeout(2_000)).pipe(
+          Effect.flatMap(() => Effect.die("Timed out waiting for request.resolved")),
+        ),
+      );
+      const turnCompleted = yield* Effect.raceFirst(
+        Deferred.await(turnCompletedReady),
+        Effect.promise(() => NodeTimersPromises.setTimeout(2_000)).pipe(
+          Effect.flatMap(() => Effect.die("Timed out waiting for turn.completed")),
+        ),
+      );
+      yield* Effect.raceFirst(
+        Fiber.join(sendTurnFiber),
+        Effect.promise(() => NodeTimersPromises.setTimeout(2_000)).pipe(
+          Effect.flatMap(() => Effect.die("Timed out waiting for sendTurn")),
+        ),
+      );
       yield* Fiber.interrupt(runtimeEventsFiber);
 
       assert.equal(requestResolved.type, "request.resolved");
@@ -1565,9 +1700,200 @@ cursorAdapterTestLayer("CursorAdapterLive", (it) => {
       assert.isTrue(requests.some((entry) => entry.method === "session/cancel"));
       assert.isTrue(requests.some(isCancelledApprovalResponse));
 
+      assert.equal(yield* adapter.hasSession(threadId), false);
+    }),
+  );
+
+  it.effect("drops late assistant chunks after cancelling a local prompt", () =>
+    Effect.gen(function* () {
+      const adapter = yield* CursorAdapter;
+      const settings = yield* ServerSettingsService;
+      const threadId = ThreadId.make("cursor-cancel-late-assistant");
+
+      const wrapperPath = yield* Effect.promise(() =>
+        makeMockAgentWrapper({
+          T3_ACP_HANG_PROMPT_FOREVER: "1",
+          T3_ACP_EMIT_LATE_UPDATE_AFTER_CANCEL: "1",
+          T3_ACP_LATE_UPDATE_AFTER_CANCEL_DELAY_MS: "0",
+        }),
+      );
+      yield* settings.updateSettings({ providers: { cursor: { binaryPath: wrapperPath } } });
+
+      const turnCompletedReady = yield* Deferred.make<ProviderRuntimeEvent>();
+      const seenEvents: Array<ProviderRuntimeEvent> = [];
+
+      const runtimeEventsFiber = yield* Stream.runForEach(adapter.streamEvents, (event) =>
+        Effect.gen(function* () {
+          if (String(event.threadId) !== String(threadId)) {
+            return;
+          }
+          seenEvents.push(event);
+          if (event.type === "turn.completed") {
+            yield* Deferred.succeed(turnCompletedReady, event).pipe(Effect.ignore);
+          }
+        }),
+      ).pipe(Effect.forkChild);
+
+      yield* adapter.startSession({
+        threadId,
+        provider: ProviderDriverKind.make("cursor"),
+        cwd: process.cwd(),
+        runtimeMode: "full-access",
+        modelSelection: { instanceId: ProviderInstanceId.make("cursor"), model: "composer-2" },
+      });
+
+      const sendTurnFiber = yield* adapter
+        .sendTurn({
+          threadId,
+          input: "cancel before stale text arrives",
+          attachments: [],
+        })
+        .pipe(Effect.forkChild);
+
+      yield* Effect.gen(function* () {
+        for (let attempt = 0; attempt < 200; attempt += 1) {
+          const sessions = yield* adapter.listSessions();
+          const session = sessions.find((entry) => entry.threadId === threadId);
+          if (session?.activeTurnId !== undefined) {
+            return;
+          }
+          yield* TestClock.adjust("10 millis");
+        }
+        throw new Error("Timed out waiting for the prompt to be in flight.");
+      });
+
+      yield* adapter.interruptTurn(threadId);
+      const turnCompleted = yield* Deferred.await(turnCompletedReady).pipe(
+        Effect.timeout("2 seconds"),
+      );
+      yield* Fiber.join(sendTurnFiber).pipe(Effect.timeout("2 seconds"));
+      yield* Effect.promise(() => NodeTimersPromises.setTimeout(150));
+
+      assert.equal(turnCompleted.type, "turn.completed");
+      if (turnCompleted.type === "turn.completed") {
+        assert.equal(turnCompleted.payload.state, "cancelled");
+      }
+      assert.isFalse(
+        seenEvents.some(
+          (event) => event.type === "content.delta" && event.payload.delta === "late after cancel",
+        ),
+      );
+
+      yield* Fiber.interrupt(runtimeEventsFiber);
+      assert.equal(yield* adapter.hasSession(threadId), false);
+    }),
+  );
+
+  it.effect("does not attach late cancelled chunks to the next prompt", () =>
+    Effect.gen(function* () {
+      const adapter = yield* CursorAdapter;
+      const settings = yield* ServerSettingsService;
+      const threadId = ThreadId.make("cursor-cancel-then-next-prompt");
+
+      const wrapperPath = yield* Effect.promise(() =>
+        makeMockAgentWrapper({
+          T3_ACP_HANG_FIRST_PROMPT_FOREVER: "1",
+          T3_ACP_EMIT_LATE_UPDATE_AFTER_CANCEL: "1",
+          T3_ACP_LATE_UPDATE_AFTER_CANCEL_DELAY_MS: "0",
+          T3_ACP_SECOND_PROMPT_DELAY_MS: "50",
+        }),
+      );
+      yield* settings.updateSettings({ providers: { cursor: { binaryPath: wrapperPath } } });
+
+      const firstTurnCompletedReady = yield* Deferred.make<ProviderRuntimeEvent>();
+      const secondDeltaReady = yield* Deferred.make<ProviderRuntimeEvent>();
+      const seenEvents: Array<ProviderRuntimeEvent> = [];
+
+      const runtimeEventsFiber = yield* Stream.runForEach(adapter.streamEvents, (event) =>
+        Effect.gen(function* () {
+          if (String(event.threadId) !== String(threadId)) {
+            return;
+          }
+          seenEvents.push(event);
+          if (event.type === "turn.completed") {
+            yield* Deferred.succeed(firstTurnCompletedReady, event).pipe(Effect.ignore);
+            return;
+          }
+          if (
+            event.type === "content.delta" &&
+            event.payload.delta === "hello from fresh session"
+          ) {
+            yield* Deferred.succeed(secondDeltaReady, event).pipe(Effect.ignore);
+          }
+        }),
+      ).pipe(Effect.forkChild);
+
+      yield* adapter.startSession({
+        threadId,
+        provider: ProviderDriverKind.make("cursor"),
+        cwd: process.cwd(),
+        runtimeMode: "full-access",
+        modelSelection: { instanceId: ProviderInstanceId.make("cursor"), model: "composer-2" },
+      });
+
+      const firstTurnFiber = yield* adapter
+        .sendTurn({
+          threadId,
+          input: "cancel this prompt",
+          attachments: [],
+        })
+        .pipe(Effect.forkChild);
+
+      yield* Effect.gen(function* () {
+        for (let attempt = 0; attempt < 200; attempt += 1) {
+          const sessions = yield* adapter.listSessions();
+          const session = sessions.find((entry) => entry.threadId === threadId);
+          if (session?.activeTurnId !== undefined) {
+            return;
+          }
+          yield* TestClock.adjust("10 millis");
+        }
+        throw new Error("Timed out waiting for the first prompt to be in flight.");
+      });
+
+      yield* adapter.interruptTurn(threadId);
+      yield* Deferred.await(firstTurnCompletedReady).pipe(Effect.timeout("2 seconds"));
+      yield* Fiber.join(firstTurnFiber).pipe(Effect.timeout("2 seconds"));
+      assert.equal(yield* adapter.hasSession(threadId), false);
+
+      yield* Effect.promise(() => NodeTimersPromises.setTimeout(75));
+      assert.isFalse(
+        seenEvents.some(
+          (event) => event.type === "content.delta" && event.payload.delta === "late after cancel",
+        ),
+      );
+
+      const cleanWrapperPath = yield* Effect.promise(() =>
+        makeMockAgentWrapper({
+          T3_ACP_PROMPT_RESPONSE_TEXT: "hello from fresh session",
+        }),
+      );
+      yield* settings.updateSettings({ providers: { cursor: { binaryPath: cleanWrapperPath } } });
+      yield* adapter.startSession({
+        threadId,
+        provider: ProviderDriverKind.make("cursor"),
+        cwd: process.cwd(),
+        runtimeMode: "full-access",
+        modelSelection: { instanceId: ProviderInstanceId.make("cursor"), model: "composer-2" },
+      });
+
+      const secondTurn = yield* adapter.sendTurn({
+        threadId,
+        input: "start a clean prompt",
+        attachments: [],
+      });
+      const secondDelta = yield* Deferred.await(secondDeltaReady).pipe(Effect.timeout("2 seconds"));
+
+      assert.equal(secondDelta.type, "content.delta");
+      if (secondDelta.type === "content.delta") {
+        assert.equal(String(secondDelta.turnId), String(secondTurn.turnId));
+      }
+
+      yield* Fiber.interrupt(runtimeEventsFiber);
       yield* adapter.stopSession(threadId);
     }),
   );
+
   it.effect("stopping a session settles pending approval waits", () =>
     Effect.gen(function* () {
       const adapter = yield* CursorAdapter;
@@ -1693,8 +2019,7 @@ cursorAdapterTestLayer("CursorAdapterLive", (it) => {
       yield* adapter.interruptTurn(threadId);
       yield* Fiber.await(sendTurnFiber);
 
-      assert.equal(yield* adapter.hasSession(threadId), true);
-      yield* adapter.stopSession(threadId);
+      assert.equal(yield* adapter.hasSession(threadId), false);
     }),
   );
 

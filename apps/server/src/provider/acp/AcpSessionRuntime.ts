@@ -1,9 +1,12 @@
+import * as NodeTimersPromises from "node:timers/promises";
+
 import * as Cause from "effect/Cause";
 import * as Clock from "effect/Clock";
 import * as Context from "effect/Context";
 import * as Deferred from "effect/Deferred";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
+import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
@@ -48,6 +51,7 @@ export type AcpSessionRuntimeEvent = AcpParsedSessionEvent | AcpSessionEventStre
 
 const defaultSessionLoadTimeout = Duration.seconds(90);
 const defaultSessionLoadReplayIdleGap = Duration.seconds(2);
+const postPromptAssistantSettleDelayMs = 50;
 
 export interface AcpSpawnInput {
   readonly command: string;
@@ -347,7 +351,9 @@ export const make = (
     const schedulePostPromptSegmentClose = Effect.gen(function* () {
       yield* cancelPostPromptSegmentClose;
       const fiber = yield* Effect.gen(function* () {
-        yield* Effect.sleep("25 millis");
+        yield* Effect.promise(() =>
+          NodeTimersPromises.setTimeout(postPromptAssistantSettleDelayMs),
+        );
         yield* sessionUpdateSemaphore.withPermit(
           closeActiveAssistantSegment({
             queue: eventQueue,
@@ -357,6 +363,19 @@ export const make = (
         yield* Ref.set(postPromptCloseFiberRef, Option.none());
       }).pipe(Effect.forkIn(runtimeScope));
       yield* Ref.set(postPromptCloseFiberRef, Option.some(fiber));
+    });
+
+    const awaitPostPromptSegmentClose = Effect.gen(function* () {
+      while (true) {
+        const closeFiber = yield* Ref.get(postPromptCloseFiberRef);
+        if (Option.isNone(closeFiber)) {
+          return;
+        }
+        yield* Fiber.await(closeFiber.value);
+        yield* Ref.update(postPromptCloseFiberRef, (current) =>
+          Option.isSome(current) && current.value === closeFiber.value ? Option.none() : current,
+        );
+      }
     });
 
     const spawnCommand = yield* resolveSpawnCommand(
@@ -850,36 +869,77 @@ export const make = (
               acp.agent.prompt(requestPayload),
             ).pipe(Effect.forkIn(runtimeScope));
             yield* Ref.set(activePromptFiberRef, Option.some(promptRpcFiber));
-            return yield* Fiber.join(promptRpcFiber).pipe(
-              Effect.catchCause((cause) =>
-                Cause.hasInterruptsOnly(cause)
-                  ? Effect.succeed(cancelledResponse)
-                  : Effect.failCause(cause),
-              ),
-              Effect.ensuring(
-                Effect.gen(function* () {
-                  yield* Fiber.interrupt(promptRpcFiber).pipe(Effect.ignore);
-                  yield* Ref.set(activePromptFiberRef, Option.none());
-                  yield* Ref.set(postPromptSettlingRef, true);
-                  yield* closeActiveAssistantSegment({
+            const cleanupInterruptedPrompt = Effect.gen(function* () {
+              yield* Fiber.interrupt(promptRpcFiber).pipe(Effect.ignore);
+              yield* Ref.set(activePromptFiberRef, Option.none());
+              yield* Ref.set(postPromptSettlingRef, false);
+              yield* cancelPostPromptSegmentClose;
+              yield* sessionUpdateSemaphore.withPermit(
+                closeActiveAssistantSegment({
+                  queue: eventQueue,
+                  assistantSegmentRef,
+                }),
+              );
+            });
+
+            return yield* Effect.gen(function* () {
+              const promptExit = yield* Fiber.join(promptRpcFiber).pipe(
+                Effect.catchCause((cause) =>
+                  Cause.hasInterruptsOnly(cause)
+                    ? Effect.succeed(cancelledResponse)
+                    : Effect.failCause(cause),
+                ),
+                Effect.exit,
+              );
+              yield* Fiber.interrupt(promptRpcFiber).pipe(Effect.ignore);
+              yield* Ref.set(activePromptFiberRef, Option.none());
+              if (Exit.isSuccess(promptExit) && promptExit.value.stopReason !== "cancelled") {
+                yield* Ref.set(postPromptSettlingRef, true);
+                yield* schedulePostPromptSegmentClose;
+                yield* awaitPostPromptSegmentClose;
+              } else {
+                yield* Ref.set(postPromptSettlingRef, true);
+                yield* sessionUpdateSemaphore.withPermit(
+                  closeActiveAssistantSegment({
                     queue: eventQueue,
                     assistantSegmentRef,
-                  });
-                }),
-              ),
-            );
+                  }),
+                );
+                yield* schedulePostPromptSegmentClose;
+              }
+              if (Exit.isSuccess(promptExit)) {
+                return promptExit.value;
+              }
+              return yield* Effect.failCause(promptExit.cause);
+            }).pipe(Effect.onInterrupt(() => cleanupInterruptedPrompt));
           }),
         ),
       cancel: getStartedState.pipe(
         Effect.flatMap((started) =>
           Effect.gen(function* () {
-            const activePromptFiber = yield* Ref.get(activePromptFiberRef);
-            if (Option.isSome(activePromptFiber)) {
-              yield* Fiber.interrupt(activePromptFiber.value).pipe(Effect.ignore);
-            }
-            yield* acp.agent
+            const cancelNotificationFiber = yield* acp.agent
               .cancel({ sessionId: started.sessionId })
               .pipe(Effect.ignore, Effect.forkIn(runtimeScope));
+            const activePromptFiber = yield* Ref.get(activePromptFiberRef);
+            let promptInterruptFiber: Fiber.Fiber<void, never> | undefined;
+            if (Option.isSome(activePromptFiber)) {
+              promptInterruptFiber = yield* Fiber.interrupt(activePromptFiber.value).pipe(
+                Effect.ignore,
+                Effect.forkIn(runtimeScope),
+              );
+            }
+            yield* Effect.raceFirst(
+              Effect.all(
+                [
+                  Fiber.join(cancelNotificationFiber).pipe(Effect.ignore),
+                  promptInterruptFiber
+                    ? Fiber.join(promptInterruptFiber).pipe(Effect.ignore)
+                    : Effect.void,
+                ],
+                { discard: true },
+              ),
+              Effect.promise(() => NodeTimersPromises.setTimeout(25)),
+            );
           }),
         ),
       ),

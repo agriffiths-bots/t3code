@@ -25,6 +25,9 @@ const emitForeignSessionUpdates = process.env.T3_ACP_EMIT_FOREIGN_SESSION_UPDATE
 const hangPromptForever = process.env.T3_ACP_HANG_PROMPT_FOREVER === "1";
 const hangFirstPromptForever = process.env.T3_ACP_HANG_FIRST_PROMPT_FOREVER === "1";
 const emitLateUpdateAfterCancel = process.env.T3_ACP_EMIT_LATE_UPDATE_AFTER_CANCEL === "1";
+const lateUpdateAfterCancelDelayMs = Number(
+  process.env.T3_ACP_LATE_UPDATE_AFTER_CANCEL_DELAY_MS ?? "50",
+);
 const omitXAiPromptCompleteStopReason =
   process.env.T3_ACP_OMIT_XAI_PROMPT_COMPLETE_STOP_REASON === "1";
 const failLoadSession = process.env.T3_ACP_FAIL_LOAD_SESSION === "1";
@@ -564,7 +567,7 @@ const program = Effect.gen(function* () {
       const cancelledSessionId = String(sessionId ?? "mock-session-1");
       cancelledSessions.add(cancelledSessionId);
       if (emitLateUpdateAfterCancel) {
-        yield* Effect.sleep("50 millis");
+        yield* Effect.sleep(`${lateUpdateAfterCancelDelayMs} millis`);
         yield* Effect.sync(() => {
           writeJsonRpcNotification("session/update", {
             sessionId: cancelledSessionId,
