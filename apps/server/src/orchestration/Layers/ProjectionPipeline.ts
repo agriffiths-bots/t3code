@@ -309,6 +309,63 @@ function retainProjectionMessagesAfterRevert(
   return messages.filter((message) => retainedMessageIds.has(message.messageId));
 }
 
+function projectionAssistantMessageCanAdvanceTurnBoundary(input: {
+  readonly turnId: ProjectionTurn["turnId"];
+  readonly candidateMessageId: ProjectionTurn["assistantMessageId"];
+  readonly currentMessageId: ProjectionTurn["assistantMessageId"];
+  readonly candidateMessage: Option.Option<ProjectionThreadMessage>;
+  readonly currentMessage: Option.Option<ProjectionThreadMessage>;
+}): boolean {
+  if (input.turnId === null || input.currentMessageId === null) {
+    return true;
+  }
+  if (input.currentMessageId === input.candidateMessageId) {
+    return true;
+  }
+  if (Option.isNone(input.candidateMessage)) {
+    return false;
+  }
+  if (input.candidateMessage.value.turnId !== input.turnId) {
+    return false;
+  }
+  if (Option.isNone(input.currentMessage)) {
+    return true;
+  }
+  if (input.currentMessage.value.turnId !== input.turnId) {
+    return true;
+  }
+  return (
+    compareProjectionMessageOrder(input.candidateMessage.value, input.currentMessage.value) >= 0
+  );
+}
+
+function compareProjectionMessageOrder(
+  left: ProjectionThreadMessage,
+  right: ProjectionThreadMessage,
+): number {
+  return (
+    left.createdAt.localeCompare(right.createdAt) ||
+    left.updatedAt.localeCompare(right.updatedAt) ||
+    left.messageId.localeCompare(right.messageId)
+  );
+}
+
+function projectionCheckpointCanBecomeLatestTurn(input: {
+  readonly currentLatestTurnId: ProjectionTurn["turnId"];
+  readonly currentLatestTurn: Option.Option<ProjectionTurn>;
+  readonly candidateTurnId: ProjectionTurn["turnId"];
+  readonly candidateCheckpointTurnCount: number;
+}): boolean {
+  if (input.currentLatestTurnId === null || input.currentLatestTurnId === input.candidateTurnId) {
+    return true;
+  }
+  return (
+    Option.isSome(input.currentLatestTurn) &&
+    input.currentLatestTurn.value.checkpointTurnCount !== null &&
+    input.candidateCheckpointTurnCount >= input.currentLatestTurn.value.checkpointTurnCount
+  );
+}
+
 function isSubAgentWakeSystemMessageText(text: string): boolean {
   return text.trimStart().startsWith("[sub-agent ");
 }
@@ -814,9 +871,24 @@ const makeOrchestrationProjectionPipeline = Effect.fn("makeOrchestrationProjecti
             event.payload.assistantMessageId === null ||
             Option.isNone(projectedAssistantMessage) ||
             projectedAssistantMessage.value.turnId === event.payload.turnId;
+          const currentLatestTurn =
+            existingRow.value.latestTurnId === null
+              ? Option.none()
+              : yield* projectionTurnRepository.getByTurnId({
+                  threadId: event.payload.threadId,
+                  turnId: existingRow.value.latestTurnId,
+                });
+          const shouldUpdateLatestTurn =
+            shouldAdvanceLatestTurn &&
+            projectionCheckpointCanBecomeLatestTurn({
+              currentLatestTurnId: existingRow.value.latestTurnId,
+              currentLatestTurn,
+              candidateTurnId: event.payload.turnId,
+              candidateCheckpointTurnCount: event.payload.checkpointTurnCount,
+            });
           yield* projectionThreadRepository.upsert({
             ...existingRow.value,
-            latestTurnId: shouldAdvanceLatestTurn
+            latestTurnId: shouldUpdateLatestTurn
               ? event.payload.turnId
               : existingRow.value.latestTurnId,
             updatedAt: event.occurredAt,
@@ -1364,22 +1436,52 @@ const makeOrchestrationProjectionPipeline = Effect.fn("makeOrchestrationProjecti
               : yield* projectionThreadMessageRepository.getByMessageId({
                   messageId: event.payload.assistantMessageId,
                 });
-          const nextAssistantMessageId =
+          const currentAssistantMessage =
+            Option.isSome(existingTurn) && existingTurn.value.assistantMessageId !== null
+              ? yield* projectionThreadMessageRepository.getByMessageId({
+                  messageId: existingTurn.value.assistantMessageId,
+                })
+              : Option.none();
+          const validAssistantMessageId =
             event.payload.assistantMessageId !== null &&
             (Option.isNone(projectedAssistantMessage) ||
               projectedAssistantMessage.value.turnId === event.payload.turnId)
               ? event.payload.assistantMessageId
               : null;
+          const advancingAssistantMessageId =
+            validAssistantMessageId !== null &&
+            projectionAssistantMessageCanAdvanceTurnBoundary({
+              turnId: event.payload.turnId,
+              candidateMessageId: validAssistantMessageId,
+              currentMessageId: Option.isSome(existingTurn)
+                ? existingTurn.value.assistantMessageId
+                : null,
+              candidateMessage: projectedAssistantMessage,
+              currentMessage: currentAssistantMessage,
+            })
+              ? validAssistantMessageId
+              : null;
+          const nextAssistantMessageId =
+            event.payload.assistantMessageId === null
+              ? null
+              : advancingAssistantMessageId !== null
+                ? advancingAssistantMessageId
+                : Option.isSome(existingTurn) &&
+                    existingTurn.value.assistantMessageId === event.payload.assistantMessageId
+                  ? null
+                  : Option.isSome(existingTurn)
+                    ? existingTurn.value.assistantMessageId
+                    : null;
           yield* projectionTurnRepository.clearCheckpointTurnConflict({
             threadId: event.payload.threadId,
             turnId: event.payload.turnId,
             checkpointTurnCount: event.payload.checkpointTurnCount,
           });
-          if (nextAssistantMessageId !== null) {
+          if (advancingAssistantMessageId !== null) {
             yield* projectionTurnRepository.clearAssistantMessageIdConflict({
               threadId: event.payload.threadId,
               turnId: event.payload.turnId,
-              assistantMessageId: nextAssistantMessageId,
+              assistantMessageId: advancingAssistantMessageId,
             });
           }
 

@@ -419,6 +419,326 @@ it.layer(
       assert.deepEqual(rowsAfterRevert, []);
     }),
   );
+
+  it.effect(
+    "keeps a later same-turn assistant boundary when an older checkpoint arrives late",
+    () =>
+      Effect.gen(function* () {
+        const projectionPipeline = yield* OrchestrationProjectionPipeline;
+        const eventStore = yield* OrchestrationEventStore;
+        const sql = yield* SqlClient.SqlClient;
+        const threadId = ThreadId.make("thread-delayed-boundary");
+        const turnId = TurnId.make("turn-delayed-boundary");
+        const secondTurnId = TurnId.make("turn-delayed-boundary-second");
+        const olderAssistantMessageId = MessageId.make("assistant-older-boundary");
+        const laterAssistantMessageId = MessageId.make("assistant-later-boundary");
+        const secondTurnAssistantMessageId = MessageId.make("assistant-second-turn-boundary");
+        const missingOlderAssistantMessageId = MessageId.make("assistant-pruned-older-boundary");
+
+        yield* eventStore.append({
+          type: "thread.created",
+          eventId: EventId.make("evt-delayed-boundary-thread"),
+          aggregateKind: "thread",
+          aggregateId: threadId,
+          occurredAt: "2026-01-01T00:00:00.000Z",
+          commandId: CommandId.make("cmd-delayed-boundary-thread"),
+          causationEventId: null,
+          correlationId: CorrelationId.make("cmd-delayed-boundary-thread"),
+          metadata: {},
+          payload: {
+            threadId,
+            projectId: ProjectId.make("project-delayed-boundary"),
+            title: "Thread delayed boundary",
+            modelSelection: {
+              instanceId: ProviderInstanceId.make("claude"),
+              model: "claude-sonnet-4-5",
+            },
+            runtimeMode: "full-access",
+            branch: null,
+            worktreePath: null,
+            createdAt: "2026-01-01T00:00:00.000Z",
+            updatedAt: "2026-01-01T00:00:00.000Z",
+          },
+        });
+
+        yield* eventStore.append({
+          type: "thread.message-sent",
+          eventId: EventId.make("evt-delayed-boundary-older-message"),
+          aggregateKind: "thread",
+          aggregateId: threadId,
+          occurredAt: "2026-01-01T00:00:01.000Z",
+          commandId: CommandId.make("cmd-delayed-boundary-older-message"),
+          causationEventId: null,
+          correlationId: CorrelationId.make("cmd-delayed-boundary-older-message"),
+          metadata: {},
+          payload: {
+            threadId,
+            messageId: olderAssistantMessageId,
+            role: "assistant",
+            text: "older work update",
+            turnId,
+            streaming: false,
+            createdAt: "2026-01-01T00:00:01.000Z",
+            updatedAt: "2026-01-01T00:00:01.000Z",
+          },
+        });
+
+        yield* eventStore.append({
+          type: "thread.message-sent",
+          eventId: EventId.make("evt-delayed-boundary-later-message"),
+          aggregateKind: "thread",
+          aggregateId: threadId,
+          occurredAt: "2026-01-01T00:00:05.000Z",
+          commandId: CommandId.make("cmd-delayed-boundary-later-message"),
+          causationEventId: null,
+          correlationId: CorrelationId.make("cmd-delayed-boundary-later-message"),
+          metadata: {},
+          payload: {
+            threadId,
+            messageId: laterAssistantMessageId,
+            role: "assistant",
+            text: "final response",
+            turnId,
+            streaming: false,
+            createdAt: "2026-01-01T00:00:05.000Z",
+            updatedAt: "2026-01-01T00:00:05.000Z",
+          },
+        });
+
+        yield* eventStore.append({
+          type: "thread.turn-diff-completed",
+          eventId: EventId.make("evt-delayed-boundary-later-checkpoint"),
+          aggregateKind: "thread",
+          aggregateId: threadId,
+          occurredAt: "2026-01-01T00:00:06.000Z",
+          commandId: CommandId.make("cmd-delayed-boundary-later-checkpoint"),
+          causationEventId: null,
+          correlationId: CorrelationId.make("cmd-delayed-boundary-later-checkpoint"),
+          metadata: {},
+          payload: {
+            threadId,
+            turnId,
+            checkpointTurnCount: 1,
+            checkpointRef: CheckpointRef.make("refs/t3/checkpoints/thread-delayed-boundary/turn/1"),
+            status: "ready",
+            files: [],
+            assistantMessageId: laterAssistantMessageId,
+            completedAt: "2026-01-01T00:00:06.000Z",
+          },
+        });
+
+        yield* eventStore.append({
+          type: "thread.message-sent",
+          eventId: EventId.make("evt-delayed-boundary-second-message"),
+          aggregateKind: "thread",
+          aggregateId: threadId,
+          occurredAt: "2026-01-01T00:00:08.000Z",
+          commandId: CommandId.make("cmd-delayed-boundary-second-message"),
+          causationEventId: null,
+          correlationId: CorrelationId.make("cmd-delayed-boundary-second-message"),
+          metadata: {},
+          payload: {
+            threadId,
+            messageId: secondTurnAssistantMessageId,
+            role: "assistant",
+            text: "second turn final response",
+            turnId: secondTurnId,
+            streaming: false,
+            createdAt: "2026-01-01T00:00:08.000Z",
+            updatedAt: "2026-01-01T00:00:08.000Z",
+          },
+        });
+
+        yield* eventStore.append({
+          type: "thread.turn-diff-completed",
+          eventId: EventId.make("evt-delayed-boundary-second-checkpoint"),
+          aggregateKind: "thread",
+          aggregateId: threadId,
+          occurredAt: "2026-01-01T00:00:09.000Z",
+          commandId: CommandId.make("cmd-delayed-boundary-second-checkpoint"),
+          causationEventId: null,
+          correlationId: CorrelationId.make("cmd-delayed-boundary-second-checkpoint"),
+          metadata: {},
+          payload: {
+            threadId,
+            turnId: secondTurnId,
+            checkpointTurnCount: 2,
+            checkpointRef: CheckpointRef.make("refs/t3/checkpoints/thread-delayed-boundary/turn/2"),
+            status: "ready",
+            files: [],
+            assistantMessageId: secondTurnAssistantMessageId,
+            completedAt: "2026-01-01T00:00:09.000Z",
+          },
+        });
+
+        yield* eventStore.append({
+          type: "thread.turn-diff-completed",
+          eventId: EventId.make("evt-delayed-boundary-older-checkpoint"),
+          aggregateKind: "thread",
+          aggregateId: threadId,
+          occurredAt: "2026-01-01T00:00:10.000Z",
+          commandId: CommandId.make("cmd-delayed-boundary-older-checkpoint"),
+          causationEventId: null,
+          correlationId: CorrelationId.make("cmd-delayed-boundary-older-checkpoint"),
+          metadata: {},
+          payload: {
+            threadId,
+            turnId,
+            checkpointTurnCount: 1,
+            checkpointRef: CheckpointRef.make(
+              "refs/t3/checkpoints/thread-delayed-boundary/turn/1-delayed",
+            ),
+            status: "ready",
+            files: [],
+            assistantMessageId: missingOlderAssistantMessageId,
+            completedAt: "2026-01-01T00:00:10.000Z",
+          },
+        });
+
+        yield* projectionPipeline.bootstrap;
+
+        const turnRows = yield* sql<{
+          readonly assistantMessageId: string | null;
+          readonly state: string;
+          readonly completedAt: string | null;
+          readonly checkpointRef: string | null;
+        }>`
+        SELECT
+          assistant_message_id AS "assistantMessageId",
+          state,
+          completed_at AS "completedAt",
+          checkpoint_ref AS "checkpointRef"
+        FROM projection_turns
+        WHERE thread_id = ${threadId}
+          AND turn_id = ${turnId}
+      `;
+        assert.deepEqual(turnRows, [
+          {
+            assistantMessageId: "assistant-later-boundary",
+            state: "completed",
+            completedAt: "2026-01-01T00:00:10.000Z",
+            checkpointRef: "refs/t3/checkpoints/thread-delayed-boundary/turn/1-delayed",
+          },
+        ]);
+
+        const threadRows = yield* sql<{ readonly latestTurnId: string | null }>`
+          SELECT latest_turn_id AS "latestTurnId"
+          FROM projection_threads
+          WHERE thread_id = ${threadId}
+        `;
+        assert.deepEqual(threadRows, [{ latestTurnId: "turn-delayed-boundary-second" }]);
+      }),
+  );
+
+  it.effect("lets a valid checkpoint replace a stale missing assistant boundary", () =>
+    Effect.gen(function* () {
+      const projectionPipeline = yield* OrchestrationProjectionPipeline;
+      const eventStore = yield* OrchestrationEventStore;
+      const sql = yield* SqlClient.SqlClient;
+      const threadId = ThreadId.make("thread-stale-boundary-recovery");
+      const turnId = TurnId.make("turn-stale-boundary-recovery");
+      const validAssistantMessageId = MessageId.make("assistant-valid-boundary");
+      const missingAssistantMessageId = MessageId.make("assistant-missing-boundary");
+
+      yield* eventStore.append({
+        type: "thread.created",
+        eventId: EventId.make("evt-stale-boundary-thread"),
+        aggregateKind: "thread",
+        aggregateId: threadId,
+        occurredAt: "2026-01-01T00:00:00.000Z",
+        commandId: CommandId.make("cmd-stale-boundary-thread"),
+        causationEventId: null,
+        correlationId: CorrelationId.make("cmd-stale-boundary-thread"),
+        metadata: {},
+        payload: {
+          threadId,
+          projectId: ProjectId.make("project-stale-boundary"),
+          title: "Thread stale boundary recovery",
+          modelSelection: {
+            instanceId: ProviderInstanceId.make("claude"),
+            model: "claude-sonnet-4-5",
+          },
+          runtimeMode: "full-access",
+          branch: null,
+          worktreePath: null,
+          createdAt: "2026-01-01T00:00:00.000Z",
+          updatedAt: "2026-01-01T00:00:00.000Z",
+        },
+      });
+
+      yield* eventStore.append({
+        type: "thread.message-sent",
+        eventId: EventId.make("evt-stale-boundary-valid-message"),
+        aggregateKind: "thread",
+        aggregateId: threadId,
+        occurredAt: "2026-01-01T00:00:05.000Z",
+        commandId: CommandId.make("cmd-stale-boundary-valid-message"),
+        causationEventId: null,
+        correlationId: CorrelationId.make("cmd-stale-boundary-valid-message"),
+        metadata: {},
+        payload: {
+          threadId,
+          messageId: validAssistantMessageId,
+          role: "assistant",
+          text: "Final answer.",
+          turnId,
+          streaming: false,
+          createdAt: "2026-01-01T00:00:05.000Z",
+          updatedAt: "2026-01-01T00:00:05.000Z",
+        },
+      });
+
+      yield* projectionPipeline.bootstrap;
+
+      yield* sql`
+        UPDATE projection_turns
+        SET assistant_message_id = ${missingAssistantMessageId}
+        WHERE thread_id = ${threadId}
+          AND turn_id = ${turnId}
+      `;
+
+      const checkpointEvent = yield* eventStore.append({
+        type: "thread.turn-diff-completed",
+        eventId: EventId.make("evt-stale-boundary-valid-checkpoint"),
+        aggregateKind: "thread",
+        aggregateId: threadId,
+        occurredAt: "2026-01-01T00:00:06.000Z",
+        commandId: CommandId.make("cmd-stale-boundary-valid-checkpoint"),
+        causationEventId: null,
+        correlationId: CorrelationId.make("cmd-stale-boundary-valid-checkpoint"),
+        metadata: {},
+        payload: {
+          threadId,
+          turnId,
+          checkpointTurnCount: 1,
+          checkpointRef: CheckpointRef.make("refs/t3/checkpoints/thread-stale-boundary/turn/1"),
+          status: "ready",
+          files: [],
+          assistantMessageId: validAssistantMessageId,
+          completedAt: "2026-01-01T00:00:06.000Z",
+        },
+      });
+      yield* projectionPipeline.projectEvent(checkpointEvent);
+
+      const turnRows = yield* sql<{
+        readonly assistantMessageId: string | null;
+        readonly checkpointRef: string | null;
+      }>`
+        SELECT
+          assistant_message_id AS "assistantMessageId",
+          checkpoint_ref AS "checkpointRef"
+        FROM projection_turns
+        WHERE thread_id = ${threadId}
+          AND turn_id = ${turnId}
+      `;
+      assert.deepEqual(turnRows, [
+        {
+          assistantMessageId: "assistant-valid-boundary",
+          checkpointRef: "refs/t3/checkpoints/thread-stale-boundary/turn/1",
+        },
+      ]);
+    }),
+  );
 });
 
 it.layer(Layer.fresh(makeProjectionPipelinePrefixedTestLayer("t3-projection-system-wake-revert-")))(

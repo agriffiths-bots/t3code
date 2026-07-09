@@ -21,6 +21,7 @@ function makeThread(overrides: Partial<Thread> = {}): Thread {
     interactionMode: "default",
     session: null,
     messages: [],
+    turns: [],
     proposedPlans: [],
     createdAt: "2026-03-01T00:00:00.000Z",
     archivedAt: null,

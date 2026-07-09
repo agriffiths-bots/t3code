@@ -87,6 +87,7 @@ describe("orchestration projector", () => {
         branch: null,
         worktreePath: null,
         latestTurn: null,
+        turns: [],
         createdAt: now,
         updatedAt: now,
         archivedAt: null,
@@ -330,6 +331,8 @@ describe("orchestration projector", () => {
 
     const thread = afterRunning.threads[0];
     expect(thread?.latestTurn?.turnId).toBe("turn-1");
+    expect(thread?.turns[0]?.turnId).toBe("turn-1");
+    expect(thread?.turns[0]?.state).toBe("running");
     expect(thread?.session?.status).toBe("running");
 
     // Leaving the "running" session status settles the running turn with the
@@ -338,6 +341,9 @@ describe("orchestration projector", () => {
     expect(settledThread?.latestTurn?.turnId).toBe("turn-1");
     expect(settledThread?.latestTurn?.state).toBe("completed");
     expect(settledThread?.latestTurn?.completedAt).toBe(settledAt);
+    expect(settledThread?.turns[0]?.turnId).toBe("turn-1");
+    expect(settledThread?.turns[0]?.state).toBe("completed");
+    expect(settledThread?.turns[0]?.completedAt).toBe(settledAt);
   });
 
   it("updates canonical thread runtime mode from thread.runtime-mode-set", async () => {
@@ -672,6 +678,184 @@ describe("orchestration projector", () => {
       expect(afterRevert.threads[0]?.messages).toHaveLength(0);
       expect(afterRevert.threads[0]?.latestTurn?.assistantMessageId).toBeNull();
     }),
+  );
+
+  effectIt.effect(
+    "keeps a later same-turn assistant boundary when an older checkpoint arrives late",
+    () =>
+      Effect.gen(function* () {
+        const createdAt = "2026-02-23T09:40:00.000Z";
+        const model = createEmptyReadModel(createdAt);
+
+        const afterCreate = yield* projectEvent(
+          model,
+          makeEvent({
+            sequence: 1,
+            type: "thread.created",
+            aggregateKind: "thread",
+            aggregateId: "thread-1",
+            occurredAt: createdAt,
+            commandId: "cmd-create",
+            payload: {
+              threadId: "thread-1",
+              projectId: "project-1",
+              title: "demo",
+              modelSelection: {
+                provider: ProviderDriverKind.make("claude"),
+                model: "claude-sonnet-4-5",
+              },
+              runtimeMode: "full-access",
+              branch: null,
+              worktreePath: null,
+              createdAt,
+              updatedAt: createdAt,
+            },
+          }),
+        );
+
+        const afterOlderMessage = yield* projectEvent(
+          afterCreate,
+          makeEvent({
+            sequence: 2,
+            type: "thread.message-sent",
+            aggregateKind: "thread",
+            aggregateId: "thread-1",
+            occurredAt: "2026-02-23T09:40:01.000Z",
+            commandId: "cmd-older-message",
+            payload: {
+              threadId: "thread-1",
+              messageId: "assistant-older",
+              role: "assistant",
+              text: "working",
+              turnId: "turn-1",
+              streaming: false,
+              createdAt: "2026-02-23T09:40:01.000Z",
+              updatedAt: "2026-02-23T09:40:01.000Z",
+            },
+          }),
+        );
+
+        const afterLaterMessage = yield* projectEvent(
+          afterOlderMessage,
+          makeEvent({
+            sequence: 3,
+            type: "thread.message-sent",
+            aggregateKind: "thread",
+            aggregateId: "thread-1",
+            occurredAt: "2026-02-23T09:40:05.000Z",
+            commandId: "cmd-later-message",
+            payload: {
+              threadId: "thread-1",
+              messageId: "assistant-later",
+              role: "assistant",
+              text: "final",
+              turnId: "turn-1",
+              streaming: false,
+              createdAt: "2026-02-23T09:40:05.000Z",
+              updatedAt: "2026-02-23T09:40:05.000Z",
+            },
+          }),
+        );
+
+        const afterLaterCheckpoint = yield* projectEvent(
+          afterLaterMessage,
+          makeEvent({
+            sequence: 4,
+            type: "thread.turn-diff-completed",
+            aggregateKind: "thread",
+            aggregateId: "thread-1",
+            occurredAt: "2026-02-23T09:40:06.000Z",
+            commandId: "cmd-later-checkpoint",
+            payload: {
+              threadId: "thread-1",
+              turnId: "turn-1",
+              checkpointTurnCount: 1,
+              checkpointRef: "refs/t3/checkpoints/thread-1/turn/1",
+              status: "ready",
+              files: [],
+              assistantMessageId: "assistant-later",
+              completedAt: "2026-02-23T09:40:06.000Z",
+            },
+          }),
+        );
+
+        const afterSecondTurnMessage = yield* projectEvent(
+          afterLaterCheckpoint,
+          makeEvent({
+            sequence: 5,
+            type: "thread.message-sent",
+            aggregateKind: "thread",
+            aggregateId: "thread-1",
+            occurredAt: "2026-02-23T09:40:08.000Z",
+            commandId: "cmd-second-turn-message",
+            payload: {
+              threadId: "thread-1",
+              messageId: "assistant-turn-2",
+              role: "assistant",
+              text: "second turn final",
+              turnId: "turn-2",
+              streaming: false,
+              createdAt: "2026-02-23T09:40:08.000Z",
+              updatedAt: "2026-02-23T09:40:08.000Z",
+            },
+          }),
+        );
+
+        const afterSecondTurnCheckpoint = yield* projectEvent(
+          afterSecondTurnMessage,
+          makeEvent({
+            sequence: 6,
+            type: "thread.turn-diff-completed",
+            aggregateKind: "thread",
+            aggregateId: "thread-1",
+            occurredAt: "2026-02-23T09:40:09.000Z",
+            commandId: "cmd-second-turn-checkpoint",
+            payload: {
+              threadId: "thread-1",
+              turnId: "turn-2",
+              checkpointTurnCount: 2,
+              checkpointRef: "refs/t3/checkpoints/thread-1/turn/2",
+              status: "ready",
+              files: [],
+              assistantMessageId: "assistant-turn-2",
+              completedAt: "2026-02-23T09:40:09.000Z",
+            },
+          }),
+        );
+
+        const afterDelayedOlderCheckpoint = yield* projectEvent(
+          afterSecondTurnCheckpoint,
+          makeEvent({
+            sequence: 7,
+            type: "thread.turn-diff-completed",
+            aggregateKind: "thread",
+            aggregateId: "thread-1",
+            occurredAt: "2026-02-23T09:40:07.000Z",
+            commandId: "cmd-delayed-older-checkpoint",
+            payload: {
+              threadId: "thread-1",
+              turnId: "turn-1",
+              checkpointTurnCount: 1,
+              checkpointRef: "refs/t3/checkpoints/thread-1/turn/1-delayed",
+              status: "ready",
+              files: [],
+              assistantMessageId: "assistant-pruned-older",
+              completedAt: "2026-02-23T09:40:07.000Z",
+            },
+          }),
+        );
+
+        const thread = afterDelayedOlderCheckpoint.threads[0];
+        expect(thread?.checkpoints[0]?.assistantMessageId).toBe("assistant-pruned-older");
+        expect(thread?.latestTurn?.turnId).toBe("turn-2");
+        expect(thread?.latestTurn?.state).toBe("completed");
+        expect(thread?.latestTurn?.completedAt).toBe("2026-02-23T09:40:09.000Z");
+        expect(thread?.latestTurn?.assistantMessageId).toBe("assistant-turn-2");
+        expect(thread?.turns.map((turn) => [turn.turnId, turn.assistantMessageId])).toEqual([
+          ["turn-1", "assistant-later"],
+          ["turn-2", "assistant-turn-2"],
+        ]);
+      }),
   );
 
   it("prunes reverted turn messages from in-memory thread snapshot", async () => {
@@ -1158,6 +1342,18 @@ describe("orchestration projector", () => {
         afterNewTurn.threads[0]?.messages.find((message) => message.id === "system-notice-1")
           ?.turnId,
       ).toBeNull();
+      expect(
+        afterNewTurn.threads[0]?.turns.find((turn) => turn.turnId === "turn-old"),
+      ).toMatchObject({
+        state: "completed",
+        completedAt: "2026-02-23T10:00:04.000Z",
+      });
+      expect(
+        afterNewTurn.threads[0]?.turns.find((turn) => turn.turnId === "turn-new"),
+      ).toMatchObject({
+        state: "running",
+        completedAt: null,
+      });
     }),
   );
 

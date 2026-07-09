@@ -69,6 +69,7 @@ const BASE_THREAD: OrchestrationThread = {
   branch: "main",
   worktreePath: null,
   latestTurn: null,
+  turns: [],
   createdAt: "2026-04-01T00:00:00.000Z",
   updatedAt: "2026-04-01T00:00:00.000Z",
   archivedAt: null,
@@ -1227,6 +1228,379 @@ describe("EnvironmentThreads", () => {
       );
 
       expect(Option.getOrThrow(recovered.data).messages).toEqual([missedAssistantMessage]);
+    }),
+  );
+
+  it.effect("does not regress turn state from a non-advancing reconcile snapshot", () =>
+    Effect.gen(function* () {
+      const runningThread = makeRunningThread();
+      const runningTurn = runningThread.latestTurn;
+      if (runningTurn === null) {
+        throw new Error("test fixture must have a running latestTurn");
+      }
+      const harness = yield* makeHarness({
+        cached: {
+          ...runningThread,
+          turns: [runningTurn],
+        },
+      });
+      yield* awaitThreadState(
+        harness.observed,
+        (value) =>
+          value.status === "live" &&
+          Option.isSome(value.data) &&
+          value.data.value.turns.at(0)?.state === "running",
+      );
+      yield* Queue.offer(harness.inputs, sessionReady(CACHED_SNAPSHOT_SEQUENCE + 1));
+      const completed = yield* awaitThreadState(
+        harness.observed,
+        (value) =>
+          value.status === "live" &&
+          Option.isSome(value.data) &&
+          value.data.value.latestTurn?.state === "completed" &&
+          value.data.value.turns.at(0)?.state === "completed",
+      );
+
+      const completedThread = Option.getOrThrow(completed.data);
+      const staleRunningTurn = {
+        ...runningTurn,
+        assistantMessageId: MessageId.make("assistant-stale-boundary"),
+      };
+      const loaderCallsBeforeReconcile = yield* Ref.get(harness.loaderCalls);
+      yield* Ref.set(
+        harness.httpSnapshot,
+        Option.some({
+          snapshotSequence: CACHED_SNAPSHOT_SEQUENCE,
+          thread: {
+            ...completedThread,
+            latestTurn: staleRunningTurn,
+            turns: [staleRunningTurn],
+          },
+        }),
+      );
+
+      yield* advanceActiveReconcileInterval;
+      for (let ticks = 0; ticks < 50; ticks += 1) {
+        if ((yield* Ref.get(harness.loaderCalls)) > loaderCallsBeforeReconcile) {
+          break;
+        }
+        yield* Effect.yieldNow;
+      }
+
+      expect(yield* Ref.get(harness.loaderCalls)).toBeGreaterThan(loaderCallsBeforeReconcile);
+      const thread = Option.getOrThrow((yield* Ref.get(harness.latest)).data);
+      expect(thread.turns).toEqual(completedThread.turns);
+      expect(thread.latestTurn).toEqual(completedThread.latestTurn);
+    }),
+  );
+
+  it.effect("merges recovered turn assistant boundaries from non-advancing snapshots", () =>
+    Effect.gen(function* () {
+      const runningThread = makeRunningThread();
+      const runningTurn = runningThread.latestTurn;
+      if (runningTurn === null) {
+        throw new Error("test fixture must have a running latestTurn");
+      }
+      const harness = yield* makeHarness({
+        cached: {
+          ...runningThread,
+          turns: [runningTurn],
+        },
+      });
+      yield* awaitThreadState(
+        harness.observed,
+        (value) =>
+          value.status === "live" &&
+          Option.isSome(value.data) &&
+          value.data.value.turns.at(0)?.state === "running",
+      );
+      yield* Queue.offer(harness.inputs, sessionReady(CACHED_SNAPSHOT_SEQUENCE + 1));
+      yield* awaitThreadState(
+        harness.observed,
+        (value) =>
+          value.status === "live" &&
+          Option.isSome(value.data) &&
+          value.data.value.latestTurn?.state === "completed" &&
+          value.data.value.turns.at(0)?.assistantMessageId === null,
+      );
+
+      const recoveredAssistantMessage: OrchestrationMessage = {
+        id: MessageId.make("message-recovered-turn-boundary"),
+        role: "assistant",
+        text: "Recovered final response.",
+        attachments: [],
+        turnId: RUNNING_TURN_ID,
+        streaming: false,
+        createdAt: "2026-07-07T21:00:03.000Z",
+        updatedAt: "2026-07-07T21:00:03.000Z",
+      };
+      const completedThread = Option.getOrThrow((yield* Ref.get(harness.latest)).data);
+      const completedTurn = completedThread.turns.at(0);
+      if (completedTurn === undefined) {
+        throw new Error("completed fixture must keep a turn row");
+      }
+      yield* Ref.set(
+        harness.httpSnapshot,
+        Option.some({
+          snapshotSequence: CACHED_SNAPSHOT_SEQUENCE,
+          thread: {
+            ...completedThread,
+            messages: [recoveredAssistantMessage],
+            turns: [
+              {
+                ...completedTurn,
+                assistantMessageId: recoveredAssistantMessage.id,
+              },
+            ],
+          },
+        }),
+      );
+
+      yield* advanceActiveReconcileInterval;
+      const recovered = yield* awaitThreadState(
+        harness.observed,
+        (value) =>
+          value.status === "live" &&
+          Option.isSome(value.data) &&
+          value.data.value.messages.some((message) => message.id === recoveredAssistantMessage.id),
+      );
+
+      const thread = Option.getOrThrow(recovered.data);
+      expect(thread.turns.at(0)).toMatchObject({
+        turnId: RUNNING_TURN_ID,
+        state: "completed",
+        assistantMessageId: recoveredAssistantMessage.id,
+      });
+      expect(thread.latestTurn).toEqual(completedThread.latestTurn);
+    }),
+  );
+
+  it.effect("replaces stale interim turn boundaries from non-advancing snapshots", () =>
+    Effect.gen(function* () {
+      const interimAssistantMessage: OrchestrationMessage = {
+        id: MessageId.make("message-interim-boundary"),
+        role: "assistant",
+        text: "I will inspect first.",
+        attachments: [],
+        turnId: RUNNING_TURN_ID,
+        streaming: false,
+        createdAt: "2026-07-07T21:00:02.000Z",
+        updatedAt: "2026-07-07T21:00:02.000Z",
+      };
+      const runningThread = makeRunningThread([interimAssistantMessage]);
+      const runningTurn = runningThread.latestTurn;
+      if (runningTurn === null) {
+        throw new Error("test fixture must have a running latestTurn");
+      }
+      const harness = yield* makeHarness({
+        cached: {
+          ...runningThread,
+          latestTurn: {
+            ...runningTurn,
+            assistantMessageId: interimAssistantMessage.id,
+          },
+          turns: [
+            {
+              ...runningTurn,
+              assistantMessageId: interimAssistantMessage.id,
+            },
+          ],
+        },
+      });
+      yield* awaitThreadState(
+        harness.observed,
+        (value) =>
+          value.status === "live" &&
+          Option.isSome(value.data) &&
+          value.data.value.turns.at(0)?.assistantMessageId === interimAssistantMessage.id,
+      );
+      yield* Queue.offer(harness.inputs, sessionReady(CACHED_SNAPSHOT_SEQUENCE + 1));
+      yield* awaitThreadState(
+        harness.observed,
+        (value) =>
+          value.status === "live" &&
+          Option.isSome(value.data) &&
+          value.data.value.latestTurn?.state === "completed",
+      );
+
+      const finalAssistantMessage: OrchestrationMessage = {
+        id: MessageId.make("message-recovered-final-boundary"),
+        role: "assistant",
+        text: "Final response.",
+        attachments: [],
+        turnId: RUNNING_TURN_ID,
+        streaming: false,
+        createdAt: "2026-07-07T21:00:03.000Z",
+        updatedAt: "2026-07-07T21:00:03.000Z",
+      };
+      const completedThread = Option.getOrThrow((yield* Ref.get(harness.latest)).data);
+      const completedTurn = completedThread.turns.at(0);
+      if (completedTurn === undefined) {
+        throw new Error("completed fixture must keep a turn row");
+      }
+      yield* Ref.set(
+        harness.httpSnapshot,
+        Option.some({
+          snapshotSequence: CACHED_SNAPSHOT_SEQUENCE,
+          thread: {
+            ...completedThread,
+            messages: [interimAssistantMessage, finalAssistantMessage],
+            turns: [
+              {
+                ...completedTurn,
+                assistantMessageId: finalAssistantMessage.id,
+              },
+            ],
+          },
+        }),
+      );
+
+      yield* advanceActiveReconcileInterval;
+      const recovered = yield* awaitThreadState(
+        harness.observed,
+        (value) =>
+          value.status === "live" &&
+          Option.isSome(value.data) &&
+          value.data.value.messages.some((message) => message.id === finalAssistantMessage.id),
+      );
+
+      const thread = Option.getOrThrow(recovered.data);
+      expect(thread.turns.at(0)).toMatchObject({
+        turnId: RUNNING_TURN_ID,
+        state: "completed",
+        assistantMessageId: finalAssistantMessage.id,
+      });
+    }),
+  );
+
+  it.effect("uses snapshot completion time when settling placeholder running turns", () =>
+    Effect.gen(function* () {
+      const runningThread = makeRunningThread();
+      const runningTurn = runningThread.latestTurn;
+      if (runningTurn === null) {
+        throw new Error("test fixture must have a running latestTurn");
+      }
+      const placeholderTurn = {
+        ...runningTurn,
+        completedAt: "2026-07-07T21:00:02.000Z",
+      };
+      const harness = yield* makeHarness({
+        cached: {
+          ...runningThread,
+          turns: [placeholderTurn],
+        },
+      });
+      yield* awaitThreadState(
+        harness.observed,
+        (value) =>
+          value.status === "live" &&
+          Option.isSome(value.data) &&
+          value.data.value.turns.at(0)?.completedAt === placeholderTurn.completedAt,
+      );
+
+      yield* Ref.set(
+        harness.httpSnapshot,
+        Option.some({
+          snapshotSequence: CACHED_SNAPSHOT_SEQUENCE,
+          thread: {
+            ...runningThread,
+            updatedAt: runningThread.updatedAt,
+            latestTurn: {
+              ...placeholderTurn,
+              state: "completed",
+              completedAt: "2026-07-07T21:00:04.000Z",
+            },
+            turns: [
+              {
+                ...placeholderTurn,
+                state: "completed",
+                completedAt: "2026-07-07T21:00:04.000Z",
+              },
+            ],
+          },
+        }),
+      );
+
+      yield* advanceActiveReconcileInterval;
+      const recovered = yield* awaitThreadState(
+        harness.observed,
+        (value) =>
+          value.status === "live" &&
+          Option.isSome(value.data) &&
+          value.data.value.latestTurn?.state === "completed" &&
+          value.data.value.turns.at(0)?.state === "completed",
+      );
+
+      const thread = Option.getOrThrow(recovered.data);
+      expect(thread.latestTurn?.completedAt).toBe("2026-07-07T21:00:04.000Z");
+      expect(thread.turns.at(0)?.completedAt).toBe("2026-07-07T21:00:04.000Z");
+    }),
+  );
+
+  it.effect("clears interim assistant boundaries from authoritative null snapshots", () =>
+    Effect.gen(function* () {
+      const interimAssistantMessage: OrchestrationMessage = {
+        id: MessageId.make("assistant-interim"),
+        role: "assistant",
+        text: "I will inspect first.",
+        turnId: RUNNING_TURN_ID,
+        streaming: false,
+        createdAt: "2026-07-07T21:00:02.000Z",
+        updatedAt: "2026-07-07T21:00:02.000Z",
+      };
+      const runningThread = makeRunningThread([interimAssistantMessage]);
+      const runningTurn = runningThread.latestTurn;
+      if (runningTurn === null) {
+        throw new Error("test fixture must have a running latestTurn");
+      }
+      const interimTurn = {
+        ...runningTurn,
+        assistantMessageId: interimAssistantMessage.id,
+      };
+      const harness = yield* makeHarness({
+        cached: {
+          ...runningThread,
+          latestTurn: interimTurn,
+          turns: [interimTurn],
+        },
+      });
+
+      yield* Ref.set(
+        harness.httpSnapshot,
+        Option.some({
+          snapshotSequence: CACHED_SNAPSHOT_SEQUENCE,
+          thread: {
+            ...runningThread,
+            latestTurn: {
+              ...interimTurn,
+              state: "completed",
+              completedAt: "2026-07-07T21:00:04.000Z",
+              assistantMessageId: null,
+            },
+            turns: [
+              {
+                ...interimTurn,
+                state: "completed",
+                completedAt: "2026-07-07T21:00:04.000Z",
+                assistantMessageId: null,
+              },
+            ],
+          },
+        }),
+      );
+
+      yield* advanceActiveReconcileInterval;
+      const recovered = yield* awaitThreadState(
+        harness.observed,
+        (value) =>
+          value.status === "live" &&
+          Option.isSome(value.data) &&
+          value.data.value.latestTurn?.state === "completed",
+      );
+
+      const thread = Option.getOrThrow(recovered.data);
+      expect(thread.latestTurn?.assistantMessageId).toBeNull();
+      expect(thread.turns.at(0)?.assistantMessageId).toBeNull();
     }),
   );
 

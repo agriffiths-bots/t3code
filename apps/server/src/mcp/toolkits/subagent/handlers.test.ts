@@ -186,6 +186,7 @@ const makeChildDetail = (): OrchestrationThread => ({
       updatedAt: "2026-06-17T10:01:00.000Z",
     },
   ],
+  turns: [],
   proposedPlans: [],
   activities: [],
   checkpoints: childDetailCheckpoints ?? [],
