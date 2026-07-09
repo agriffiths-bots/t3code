@@ -134,6 +134,7 @@ interface CursorSessionContext {
   notificationFiber: Fiber.Fiber<void, never> | undefined;
   readonly pendingApprovals: Map<ApprovalRequestId, PendingApproval>;
   readonly pendingUserInputs: Map<ApprovalRequestId, PendingUserInput>;
+  readonly promptDispatchSemaphore: Semaphore.Semaphore;
   readonly stoppedSignal: Deferred.Deferred<void>;
   readonly turns: Array<{ id: TurnId; items: Array<unknown> }>;
   readonly assistantItemTurnIds: Map<string, TurnId | undefined>;
@@ -624,6 +625,7 @@ export function makeCursorAdapter(
 
           const pendingApprovals = new Map<ApprovalRequestId, PendingApproval>();
           const pendingUserInputs = new Map<ApprovalRequestId, PendingUserInput>();
+          const promptDispatchSemaphore = yield* Semaphore.make(1);
           const stoppedSignal = yield* Deferred.make<void>();
           const sessionScope = yield* Scope.make("sequential");
           let sessionScopeTransferred = false;
@@ -903,6 +905,7 @@ export function makeCursorAdapter(
             notificationFiber: undefined,
             pendingApprovals,
             pendingUserInputs,
+            promptDispatchSemaphore,
             stoppedSignal,
             turns: [],
             assistantItemTurnIds: new Map(),
@@ -1193,15 +1196,31 @@ export function makeCursorAdapter(
             });
           }
 
-          const result = yield* ctx.acp
-            .prompt({
-              prompt: promptParts,
-            })
-            .pipe(
-              Effect.mapError((error) =>
-                mapAcpToAdapterError(PROVIDER, input.threadId, "session/prompt", error),
-              ),
-            );
+          const result = yield* ctx.promptDispatchSemaphore.withPermit(
+            Effect.gen(function* () {
+              if (ctx.stopped || ctx.suppressAcpUpdatesAfterLocalCancel) {
+                return yield* new ProviderAdapterSessionNotFoundError({
+                  provider: PROVIDER,
+                  threadId: input.threadId,
+                });
+              }
+              return yield* ctx.acp
+                .prompt({
+                  prompt: promptParts,
+                })
+                .pipe(
+                  Effect.mapError((error) =>
+                    mapAcpToAdapterError(PROVIDER, input.threadId, "session/prompt", error),
+                  ),
+                );
+            }),
+          );
+          if (ctx.stopped) {
+            return yield* new ProviderAdapterSessionNotFoundError({
+              provider: PROVIDER,
+              threadId: input.threadId,
+            });
+          }
 
           const turnRecord = ctx.turns.find((turn) => turn.id === turnId);
           if (turnRecord) {
@@ -1209,7 +1228,9 @@ export function makeCursorAdapter(
           } else {
             ctx.turns.push({ id: turnId, items: [{ prompt: promptParts, result }] });
           }
-          if (result.stopReason !== "cancelled") {
+          const cancelledByLocalInterrupt =
+            result.stopReason === "cancelled" && ctx.suppressAcpUpdatesAfterLocalCancel;
+          if (!cancelledByLocalInterrupt) {
             ctx.suppressAcpUpdatesAfterLocalCancel = false;
             const drainedEvents = yield* drainAcpEventsUnlessStopped(ctx);
             if (!drainedEvents || ctx.stopped) {
@@ -1222,7 +1243,7 @@ export function makeCursorAdapter(
           // Only the last remaining prompt settles the turn — a steer-
           // superseded prompt resolving (usually cancelled) while another is
           // in flight or pending must leave the merged turn running.
-          if (ctx.promptsInFlight === 1) {
+          if (ctx.promptsInFlight === 1 || cancelledByLocalInterrupt) {
             const { activeTurnId: _completedActiveTurnId, ...sessionWithoutActiveTurn } =
               ctx.session;
             ctx.activeTurnId = undefined;
@@ -1245,7 +1266,7 @@ export function makeCursorAdapter(
                 stopReason: result.stopReason ?? null,
               },
             });
-            if (result.stopReason === "cancelled") {
+            if (cancelledByLocalInterrupt) {
               yield* stopSessionDetached(ctx);
             }
           } else {

@@ -1894,6 +1894,108 @@ cursorAdapterTestLayer("CursorAdapterLive", (it) => {
     }),
   );
 
+  it.effect("emits one cancelled completion when interrupting a steered prompt queue", () =>
+    Effect.gen(function* () {
+      const adapter = yield* CursorAdapter;
+      const settings = yield* ServerSettingsService;
+      const threadId = ThreadId.make("cursor-cancel-steered-queue");
+      const tempDir = yield* Effect.promise(() =>
+        NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "cursor-acp-steer-cancel-")),
+      );
+      const requestLogPath = NodePath.join(tempDir, "requests.ndjson");
+
+      const wrapperPath = yield* Effect.promise(() =>
+        makeMockAgentWrapper({
+          T3_ACP_HANG_FIRST_PROMPT_FOREVER: "1",
+          T3_ACP_REQUEST_LOG_PATH: requestLogPath,
+        }),
+      );
+      yield* settings.updateSettings({ providers: { cursor: { binaryPath: wrapperPath } } });
+
+      const firstTurnCompletedReady = yield* Deferred.make<ProviderRuntimeEvent>();
+      const seenEvents: Array<ProviderRuntimeEvent> = [];
+
+      const runtimeEventsFiber = yield* Stream.runForEach(adapter.streamEvents, (event) =>
+        Effect.gen(function* () {
+          if (String(event.threadId) !== String(threadId)) {
+            return;
+          }
+          seenEvents.push(event);
+          if (event.type === "turn.completed") {
+            yield* Deferred.succeed(firstTurnCompletedReady, event).pipe(Effect.ignore);
+          }
+        }),
+      ).pipe(Effect.forkChild);
+
+      yield* adapter.startSession({
+        threadId,
+        provider: ProviderDriverKind.make("cursor"),
+        cwd: process.cwd(),
+        runtimeMode: "full-access",
+        modelSelection: { instanceId: ProviderInstanceId.make("cursor"), model: "composer-2" },
+      });
+
+      const firstTurnFiber = yield* adapter
+        .sendTurn({
+          threadId,
+          input: "first prompt",
+          attachments: [],
+        })
+        .pipe(Effect.forkChild);
+
+      yield* Effect.gen(function* () {
+        for (let attempt = 0; attempt < 200; attempt += 1) {
+          const sessions = yield* adapter.listSessions();
+          const session = sessions.find((entry) => entry.threadId === threadId);
+          if (session?.activeTurnId !== undefined) {
+            return;
+          }
+          yield* TestClock.adjust("10 millis");
+        }
+        throw new Error("Timed out waiting for the first prompt to be in flight.");
+      });
+
+      const steeredTurnFiber = yield* adapter
+        .sendTurn({
+          threadId,
+          input: "steered prompt",
+          attachments: [],
+        })
+        .pipe(Effect.forkChild);
+      yield* Effect.promise(() => NodeTimersPromises.setTimeout(50));
+
+      yield* adapter.interruptTurn(threadId);
+      const completion = yield* Deferred.await(firstTurnCompletedReady).pipe(
+        Effect.timeout("2 seconds"),
+      );
+      yield* Fiber.join(firstTurnFiber).pipe(Effect.timeout("2 seconds"));
+      yield* Effect.raceFirst(
+        Fiber.await(steeredTurnFiber),
+        Effect.promise(() => NodeTimersPromises.setTimeout(2_000)).pipe(
+          Effect.flatMap(() => Effect.die("Timed out waiting for steered sendTurn")),
+        ),
+      );
+      yield* Effect.promise(() => NodeTimersPromises.setTimeout(100));
+
+      assert.equal(completion.type, "turn.completed");
+      if (completion.type === "turn.completed") {
+        assert.equal(completion.payload.state, "cancelled");
+      }
+      assert.lengthOf(
+        seenEvents.filter((event) => event.type === "turn.completed"),
+        1,
+      );
+      const requests = yield* Effect.promise(() => readJsonLines(requestLogPath));
+      assert.lengthOf(
+        requests.filter((entry) => entry.method === "session/prompt"),
+        1,
+      );
+      assert.equal(yield* adapter.hasSession(threadId), false);
+
+      yield* Fiber.interrupt(runtimeEventsFiber);
+    }),
+  );
+
   it.effect("stopping a session settles pending approval waits", () =>
     Effect.gen(function* () {
       const adapter = yield* CursorAdapter;

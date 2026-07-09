@@ -188,6 +188,54 @@ it.layer(grokAdapterTestLayer)("GrokAdapterLive", (it) => {
     }),
   );
 
+  it.effect("projects ACP usage updates into thread token usage events", () =>
+    Effect.gen(function* () {
+      const threadId = ThreadId.make("grok-usage-update-thread");
+      const wrapperPath = yield* Effect.promise(() =>
+        makeMockGrokWrapper({ T3_ACP_EMIT_USAGE_UPDATE: "1" }),
+      );
+      const adapter = yield* makeTestAdapter(wrapperPath);
+
+      const usageUpdated =
+        yield* Deferred.make<
+          Extract<ProviderRuntimeEvent, { type: "thread.token-usage.updated" }>
+        >();
+      const runtimeEventsFiber = yield* Stream.runForEach(adapter.streamEvents, (event) =>
+        Effect.gen(function* () {
+          if (
+            String(event.threadId) === String(threadId) &&
+            event.type === "thread.token-usage.updated"
+          ) {
+            yield* Deferred.succeed(usageUpdated, event).pipe(Effect.ignore);
+          }
+        }),
+      ).pipe(Effect.forkChild);
+
+      yield* adapter.startSession({
+        threadId,
+        provider: ProviderDriverKind.make("grok"),
+        cwd: process.cwd(),
+        runtimeMode: "full-access",
+      });
+
+      const turn = yield* adapter.sendTurn({
+        threadId,
+        input: "report usage",
+        attachments: [],
+      });
+      const usageEvent = yield* Deferred.await(usageUpdated).pipe(Effect.timeout("2 seconds"));
+
+      assert.equal(String(usageEvent.turnId), String(turn.turnId));
+      assert.deepEqual(usageEvent.payload.usage, {
+        usedTokens: 2048,
+        maxTokens: 1_000_000,
+      });
+
+      yield* Fiber.interrupt(runtimeEventsFiber);
+      yield* adapter.stopSession(threadId);
+    }),
+  );
+
   it.effect("closes the ACP child process when a session stops", () =>
     Effect.gen(function* () {
       const threadId = ThreadId.make("grok-stop-session-close");
