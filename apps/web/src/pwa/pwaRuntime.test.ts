@@ -1,12 +1,24 @@
 import { describe, expect, it } from "vite-plus/test";
+import type { ServerDeviceNotification } from "@t3tools/contracts";
 import { Children, isValidElement, type ReactElement, type ReactNode } from "react";
 
 import {
   canUseNativeDesktopNotifications,
+  createDesktopNotificationDeliveryCoordinator,
   PwaRuntimeView,
   PwaServiceWorkerRegistration,
   resolveDeepLinkTarget,
 } from "./pwaRuntime";
+
+const notification: ServerDeviceNotification = {
+  notificationId: "notification-1",
+  ackToken: "ack-token",
+  title: "Task finished",
+  body: "The task finished.",
+  deepLink: "/environment/thread",
+  createdAt: "2026-07-09T00:00:00.000Z" as ServerDeviceNotification["createdAt"],
+  requireInteraction: true,
+};
 
 describe("resolveDeepLinkTarget", () => {
   it("keeps notification deep links as pathnames for browser history", () => {
@@ -21,6 +33,66 @@ describe("resolveDeepLinkTarget", () => {
     expect(resolveDeepLinkTarget(undefined, "hash")).toBeNull();
     expect(resolveDeepLinkTarget("https://example.com/env-1/thread-1", "hash")).toBeNull();
     expect(resolveDeepLinkTarget("//example.com/env-1/thread-1", "hash")).toBeNull();
+  });
+});
+
+describe("createDesktopNotificationDeliveryCoordinator", () => {
+  it("closes an accepted native notification when dismiss races its pending show", async () => {
+    let resolveShow!: (shown: boolean) => void;
+    const closeNativeCalls: string[] = [];
+    const fallbackNotifications: ServerDeviceNotification[] = [];
+    const coordinator = createDesktopNotificationDeliveryCoordinator({
+      showNative: () =>
+        new Promise<boolean>((resolve) => {
+          resolveShow = resolve;
+        }),
+      closeNative: (notificationId) => closeNativeCalls.push(notificationId),
+      showFallback: (nextNotification) => fallbackNotifications.push(nextNotification),
+    });
+
+    coordinator.show(notification);
+    coordinator.dismiss(notification.notificationId);
+    expect(closeNativeCalls).toEqual(["notification-1"]);
+
+    resolveShow(true);
+    await Promise.resolve();
+
+    expect(closeNativeCalls).toEqual(["notification-1", "notification-1"]);
+    expect(fallbackNotifications).toEqual([]);
+  });
+
+  it("does not fall back to renderer notifications after a cancelled native show fails", async () => {
+    let rejectShow!: (error: unknown) => void;
+    const fallbackNotifications: ServerDeviceNotification[] = [];
+    const coordinator = createDesktopNotificationDeliveryCoordinator({
+      showNative: () =>
+        new Promise<boolean>((_resolve, reject) => {
+          rejectShow = reject;
+        }),
+      closeNative: () => undefined,
+      showFallback: (nextNotification) => fallbackNotifications.push(nextNotification),
+    });
+
+    coordinator.show(notification);
+    coordinator.dismiss(notification.notificationId);
+    rejectShow(new Error("native show failed"));
+    await Promise.resolve();
+
+    expect(fallbackNotifications).toEqual([]);
+  });
+
+  it("falls back to renderer notifications when an uncancelled native show is refused", async () => {
+    const fallbackNotifications: ServerDeviceNotification[] = [];
+    const coordinator = createDesktopNotificationDeliveryCoordinator({
+      showNative: async () => false,
+      closeNative: () => undefined,
+      showFallback: (nextNotification) => fallbackNotifications.push(nextNotification),
+    });
+
+    coordinator.show(notification);
+    await Promise.resolve();
+
+    expect(fallbackNotifications).toEqual([notification]);
   });
 });
 

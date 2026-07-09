@@ -135,6 +135,77 @@ export async function canUseNativeDesktopNotifications(
   }
 }
 
+interface DesktopNotificationDeliveryHost {
+  readonly showNative: (notification: ServerDeviceNotification) => Promise<boolean>;
+  readonly closeNative: (notificationId: string) => void;
+  readonly showFallback: (notification: ServerDeviceNotification) => void;
+}
+
+export function createDesktopNotificationDeliveryCoordinator(
+  host: DesktopNotificationDeliveryHost,
+) {
+  const pendingNativeShows = new Map<string, symbol>();
+  const cancelledNativeShows = new Map<string, symbol>();
+
+  const completePendingShow = (notificationId: string, token: symbol): boolean => {
+    if (pendingNativeShows.get(notificationId) !== token) {
+      return false;
+    }
+    pendingNativeShows.delete(notificationId);
+    return true;
+  };
+
+  const wasCancelled = (notificationId: string, token: symbol): boolean => {
+    if (cancelledNativeShows.get(notificationId) !== token) {
+      return false;
+    }
+    cancelledNativeShows.delete(notificationId);
+    return true;
+  };
+
+  return {
+    show(notification: ServerDeviceNotification) {
+      const notificationId = notification.notificationId;
+      const token = Symbol(notificationId);
+      pendingNativeShows.set(notificationId, token);
+      cancelledNativeShows.delete(notificationId);
+
+      void host.showNative(notification).then(
+        (shown) => {
+          if (!completePendingShow(notificationId, token)) {
+            return;
+          }
+          if (wasCancelled(notificationId, token)) {
+            if (shown) {
+              host.closeNative(notificationId);
+            }
+            return;
+          }
+          if (!shown) {
+            host.showFallback(notification);
+          }
+        },
+        () => {
+          if (!completePendingShow(notificationId, token)) {
+            return;
+          }
+          if (wasCancelled(notificationId, token)) {
+            return;
+          }
+          host.showFallback(notification);
+        },
+      );
+    },
+    dismiss(notificationId: string) {
+      const token = pendingNativeShows.get(notificationId);
+      if (token) {
+        cancelledNativeShows.set(notificationId, token);
+      }
+      host.closeNative(notificationId);
+    },
+  };
+}
+
 function deviceLabel(): string {
   if (window.desktopBridge) {
     return "Desktop app";
@@ -216,6 +287,12 @@ function PwaRuntimeForEnvironment({ environmentId }: { readonly environmentId: E
   const activeNotifications = useRef(new Map<string, Notification>());
   const suppressedCloseAcks = useRef(new Set<string>());
   const lastEventRef = useRef<ServerNotificationStreamEvent | null>(null);
+  const showRendererDesktopNotificationRef = useRef<
+    (notification: ServerDeviceNotification) => void
+  >(() => undefined);
+  const desktopNotificationDeliveryRef = useRef<ReturnType<
+    typeof createDesktopNotificationDeliveryCoordinator
+  > | null>(null);
 
   const acknowledge = useCallback(
     (notificationId: string, action: "opened" | "dismissed" | "closed") => {
@@ -268,6 +345,17 @@ function PwaRuntimeForEnvironment({ environmentId }: { readonly environmentId: E
     },
     [acknowledge],
   );
+  showRendererDesktopNotificationRef.current = showRendererDesktopNotification;
+  if (desktopNotificationDeliveryRef.current === null) {
+    desktopNotificationDeliveryRef.current = createDesktopNotificationDeliveryCoordinator({
+      showNative: (notification) =>
+        window.desktopBridge?.showNotification?.(notification) ?? Promise.resolve(false),
+      closeNative: (notificationId) => {
+        void window.desktopBridge?.closeNotification?.(notificationId);
+      },
+      showFallback: (notification) => showRendererDesktopNotificationRef.current(notification),
+    });
+  }
 
   const showDesktopNotification = useCallback(
     (notification: ServerDeviceNotification) => {
@@ -277,14 +365,7 @@ function PwaRuntimeForEnvironment({ environmentId }: { readonly environmentId: E
       }
 
       if (bridge.showNotification) {
-        void bridge.showNotification(notification).then(
-          (shown) => {
-            if (!shown) {
-              showRendererDesktopNotification(notification);
-            }
-          },
-          () => showRendererDesktopNotification(notification),
-        );
+        desktopNotificationDeliveryRef.current?.show(notification);
         return;
       }
 
@@ -304,7 +385,7 @@ function PwaRuntimeForEnvironment({ environmentId }: { readonly environmentId: E
     }
 
     suppressedCloseAcks.current.add(notificationEvent.notificationId);
-    void window.desktopBridge?.closeNotification?.(notificationEvent.notificationId);
+    desktopNotificationDeliveryRef.current?.dismiss(notificationEvent.notificationId);
     activeNotifications.current.get(notificationEvent.notificationId)?.close();
     activeNotifications.current.delete(notificationEvent.notificationId);
   }, [notificationEvent, showDesktopNotification]);
