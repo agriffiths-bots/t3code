@@ -57,6 +57,7 @@ import {
   makeAcpPlanUpdatedEvent,
   makeAcpRequestOpenedEvent,
   makeAcpRequestResolvedEvent,
+  makeAcpThreadTokenUsageUpdatedEvent,
   makeAcpToolCallEvent,
 } from "../acp/AcpCoreRuntimeEvents.ts";
 import {
@@ -131,6 +132,7 @@ interface CursorSessionContext {
   notificationFiber: Fiber.Fiber<void, never> | undefined;
   readonly pendingApprovals: Map<ApprovalRequestId, PendingApproval>;
   readonly pendingUserInputs: Map<ApprovalRequestId, PendingUserInput>;
+  readonly stoppedSignal: Deferred.Deferred<void>;
   readonly turns: Array<{ id: TurnId; items: Array<unknown> }>;
   lastPlanFingerprint: string | undefined;
   activeTurnId: TurnId | undefined;
@@ -461,6 +463,7 @@ export function makeCursorAdapter(
       Effect.gen(function* () {
         if (ctx.stopped) return;
         ctx.stopped = true;
+        yield* Deferred.succeed(ctx.stoppedSignal, undefined).pipe(Effect.ignore);
         yield* settlePendingApprovalsAsCancelled(ctx.pendingApprovals);
         yield* settlePendingUserInputsAsEmptyAnswers(ctx.pendingUserInputs);
         if (ctx.notificationFiber) {
@@ -509,6 +512,7 @@ export function makeCursorAdapter(
 
           const pendingApprovals = new Map<ApprovalRequestId, PendingApproval>();
           const pendingUserInputs = new Map<ApprovalRequestId, PendingUserInput>();
+          const stoppedSignal = yield* Deferred.make<void>();
           const sessionScope = yield* Scope.make("sequential");
           let sessionScopeTransferred = false;
           yield* Effect.addFinalizer(() =>
@@ -780,6 +784,7 @@ export function makeCursorAdapter(
             notificationFiber: undefined,
             pendingApprovals,
             pendingUserInputs,
+            stoppedSignal,
             turns: [],
             lastPlanFingerprint: undefined,
             activeTurnId: input.activeTurnId,
@@ -868,6 +873,24 @@ export function makeCursorAdapter(
                         turnId: ctx.activeTurnId,
                         ...(event.itemId ? { itemId: event.itemId } : {}),
                         text: event.text,
+                        rawPayload: event.rawPayload,
+                      }),
+                    );
+                    return;
+                  case "TokenUsageUpdated":
+                    yield* logNative(
+                      ctx.threadId,
+                      "session/update",
+                      event.rawPayload,
+                      "acp.jsonrpc",
+                    );
+                    yield* offerRuntimeEvent(
+                      makeAcpThreadTokenUsageUpdatedEvent({
+                        stamp: yield* makeEventStamp(),
+                        provider: PROVIDER,
+                        threadId: ctx.threadId,
+                        turnId: ctx.activeTurnId,
+                        usage: event.usage,
                         rawPayload: event.rawPayload,
                       }),
                     );
@@ -1036,6 +1059,18 @@ export function makeCursorAdapter(
             turnRecord.items.push({ prompt: promptParts, result });
           } else {
             ctx.turns.push({ id: turnId, items: [{ prompt: promptParts, result }] });
+          }
+          const drainedEvents = ctx.stopped
+            ? false
+            : yield* Effect.raceFirst(
+                ctx.acp.drainEvents.pipe(Effect.as(true)),
+                Deferred.await(ctx.stoppedSignal).pipe(Effect.as(false)),
+              );
+          if (!drainedEvents || ctx.stopped) {
+            return yield* new ProviderAdapterSessionNotFoundError({
+              provider: PROVIDER,
+              threadId: input.threadId,
+            });
           }
           // Only the last remaining prompt settles the turn — a steer-
           // superseded prompt resolving (usually cancelled) while another is

@@ -729,6 +729,73 @@ describe("ProviderRuntimeIngestion", () => {
     expect(message?.streaming).toBe(false);
   });
 
+  it("projects Cursor assistant deltas without explicit turn ids onto the active turn", async () => {
+    const harness = await createHarness();
+    const now = "2026-01-01T00:00:00.000Z";
+    const threadId = asThreadId("thread-1");
+    const turnId = asTurnId("turn-cursor-composer-race");
+    const itemId = asItemId("assistant:mock-session-1:segment:0");
+
+    harness.emit({
+      type: "turn.started",
+      eventId: asEventId("evt-cursor-turn-started"),
+      provider: ProviderDriverKind.make("cursor"),
+      createdAt: now,
+      threadId,
+      turnId,
+    });
+    await waitForThread(
+      harness.readModel,
+      (thread) =>
+        thread.session?.status === "running" &&
+        thread.session?.activeTurnId === "turn-cursor-composer-race",
+    );
+
+    for (const [index, delta] of ["MODEL", "_OK", " composer"].entries()) {
+      harness.emit({
+        type: "content.delta",
+        eventId: asEventId(`evt-cursor-composer-delta-${index}`),
+        provider: ProviderDriverKind.make("cursor"),
+        createdAt: now,
+        threadId,
+        itemId,
+        payload: {
+          streamKind: "assistant_text",
+          delta,
+        },
+      });
+    }
+    harness.emit({
+      type: "turn.completed",
+      eventId: asEventId("evt-cursor-turn-completed"),
+      provider: ProviderDriverKind.make("cursor"),
+      createdAt: now,
+      threadId,
+      turnId,
+      payload: {
+        state: "completed",
+        stopReason: "end_turn",
+      },
+    });
+
+    const thread = await waitForThread(
+      harness.readModel,
+      (entry) =>
+        entry.session?.status === "ready" &&
+        entry.messages.some(
+          (message: ProviderRuntimeTestMessage) =>
+            message.id === "assistant:assistant:mock-session-1:segment:0" && !message.streaming,
+        ),
+    );
+    const message = thread.messages.find(
+      (entry: ProviderRuntimeTestMessage) =>
+        entry.id === "assistant:assistant:mock-session-1:segment:0",
+    );
+    expect(message?.text).toBe("MODEL_OK composer");
+    expect(message?.turnId).toBe("turn-cursor-composer-race");
+    expect(message?.streaming).toBe(false);
+  });
+
   it("uses assistant item completion detail when no assistant deltas were streamed", async () => {
     const harness = await createHarness();
     const now = "2026-01-01T00:00:00.000Z";

@@ -334,6 +334,33 @@ describe("AcpRuntimeModel", () => {
         },
       },
     ]);
+
+    const usageResult = parseSessionUpdateEvent({
+      sessionId: "session-1",
+      update: {
+        sessionUpdate: "usage_update",
+        used: 2048,
+        size: 1_000_000,
+      },
+    } satisfies EffectAcpSchema.SessionNotification);
+
+    expect(usageResult.events).toEqual([
+      {
+        _tag: "TokenUsageUpdated",
+        usage: {
+          usedTokens: 2048,
+          maxTokens: 1_000_000,
+        },
+        rawPayload: {
+          sessionId: "session-1",
+          update: {
+            sessionUpdate: "usage_update",
+            used: 2048,
+            size: 1_000_000,
+          },
+        },
+      },
+    ]);
   });
 
   it("keeps permission request parsing compatible with loose extension payloads", () => {

@@ -256,6 +256,71 @@ cursorAdapterTestLayer("CursorAdapterLive", (it) => {
     }),
   );
 
+  it.effect("keeps fast Composer assistant chunks scoped to the active turn", () =>
+    Effect.gen(function* () {
+      const adapter = yield* CursorAdapter;
+      const settings = yield* ServerSettingsService;
+      const threadId = ThreadId.make("cursor-fast-composer-chunks");
+
+      const wrapperPath = yield* Effect.promise(() =>
+        makeMockAgentWrapper({
+          T3_ACP_PROMPT_RESPONSE_CHUNKS: "MODEL|_OK| composer",
+          T3_ACP_EMIT_USAGE_UPDATE: "1",
+        }),
+      );
+      yield* settings.updateSettings({ providers: { cursor: { binaryPath: wrapperPath } } });
+
+      const runtimeEventsFiber = yield* adapter.streamEvents.pipe(
+        Stream.takeUntil((event) => event.type === "turn.completed"),
+        Stream.runCollect,
+        Effect.forkChild,
+      );
+
+      yield* adapter.startSession({
+        threadId,
+        provider: ProviderDriverKind.make("cursor"),
+        cwd: process.cwd(),
+        runtimeMode: "full-access",
+        modelSelection: { instanceId: ProviderInstanceId.make("cursor"), model: "composer-2" },
+      });
+
+      const turn = yield* adapter.sendTurn({
+        threadId,
+        input: "return a Composer marker",
+        attachments: [],
+      });
+
+      const runtimeEvents = Array.from(yield* Fiber.join(runtimeEventsFiber));
+      const turnEvents = runtimeEvents.filter(
+        (event) => String(event.threadId) === String(threadId),
+      );
+      const assistantEvents = turnEvents.filter(
+        (event) =>
+          event.type === "item.started" ||
+          event.type === "content.delta" ||
+          event.type === "item.completed",
+      );
+      const assistantDeltas = turnEvents.filter((event) => event.type === "content.delta");
+      assert.deepStrictEqual(
+        assistantDeltas.map((event) => (event.type === "content.delta" ? event.payload.delta : "")),
+        ["MODEL", "_OK", " composer"],
+      );
+      assert.isTrue(assistantEvents.every((event) => String(event.turnId) === turn.turnId));
+
+      const usageEvent = turnEvents.find((event) => event.type === "thread.token-usage.updated");
+      assert.isDefined(usageEvent);
+      if (usageEvent?.type === "thread.token-usage.updated") {
+        assert.deepStrictEqual(usageEvent.payload.usage, {
+          usedTokens: 2048,
+          maxTokens: 1_000_000,
+        });
+        assert.equal(String(usageEvent.turnId), turn.turnId);
+      }
+
+      yield* adapter.stopSession(threadId);
+    }),
+  );
+
   it.effect("steers a running turn instead of opening a new one on mid-turn sendTurn", () =>
     Effect.gen(function* () {
       const adapter = yield* CursorAdapter;

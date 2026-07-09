@@ -1455,6 +1455,15 @@ const make = Effect.gen(function* () {
         }
       }
 
+      // Cursor can deliver assistant chunks after its adapter has already
+      // observed prompt completion; keep those chunks inside the active turn.
+      const inferredTurnIdForAssistantDelta =
+        event.type === "content.delta" &&
+        event.payload.streamKind === "assistant_text" &&
+        eventTurnId === undefined &&
+        activeTurnId !== null
+          ? TurnId.make(activeTurnId)
+          : undefined;
       const assistantDelta =
         event.type === "content.delta" && event.payload.streamKind === "assistant_text"
           ? event.payload.delta
@@ -1463,7 +1472,7 @@ const make = Effect.gen(function* () {
         event.type === "turn.proposed.delta" ? event.payload.delta : undefined;
 
       if (assistantDelta && assistantDelta.length > 0) {
-        const turnId = toTurnId(event.turnId);
+        const turnId = eventTurnId ?? inferredTurnIdForAssistantDelta;
         const assistantMessageId = yield* getOrCreateAssistantMessageId({
           threadId: thread.id,
           event,

@@ -49,6 +49,8 @@ const failFirstPrompt = process.env.T3_ACP_FAIL_FIRST_PROMPT === "1";
 const failSetConfigOption = process.env.T3_ACP_FAIL_SET_CONFIG_OPTION === "1";
 const exitOnSetConfigOption = process.env.T3_ACP_EXIT_ON_SET_CONFIG_OPTION === "1";
 const promptResponseText = process.env.T3_ACP_PROMPT_RESPONSE_TEXT;
+const promptResponseChunks = process.env.T3_ACP_PROMPT_RESPONSE_CHUNKS?.split("|") ?? null;
+const emitUsageUpdate = process.env.T3_ACP_EMIT_USAGE_UPDATE === "1";
 const promptDelayMs = Number(process.env.T3_ACP_PROMPT_DELAY_MS ?? "0");
 const firstPromptDelayMs =
   process.env.T3_ACP_FIRST_PROMPT_DELAY_MS === undefined
@@ -987,13 +989,26 @@ const program = Effect.gen(function* () {
         },
       });
 
-      yield* agent.client.sessionUpdate({
-        sessionId: requestedSessionId,
-        update: {
-          sessionUpdate: "agent_message_chunk",
-          content: { type: "text", text: promptResponseText ?? "hello from mock" },
-        },
-      });
+      if (emitUsageUpdate) {
+        yield* agent.client.sessionUpdate({
+          sessionId: requestedSessionId,
+          update: {
+            sessionUpdate: "usage_update",
+            used: 2048,
+            size: 1_000_000,
+          },
+        });
+      }
+
+      for (const chunk of promptResponseChunks ?? [promptResponseText ?? "hello from mock"]) {
+        yield* agent.client.sessionUpdate({
+          sessionId: requestedSessionId,
+          update: {
+            sessionUpdate: "agent_message_chunk",
+            content: { type: "text", text: chunk },
+          },
+        });
+      }
 
       return { stopReason: "end_turn" };
     }),
