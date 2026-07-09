@@ -1084,7 +1084,7 @@ async function readCodexAppServerRateLimits(
     resolveSpawnCommand(executable, CODEX_APP_SERVER_ARGS, { env }),
   );
   const child = NodeChildProcess.spawn(spawnCommand.command, spawnCommand.args, {
-    cwd: source.home || undefined,
+    cwd: process.cwd(),
     env,
     shell: spawnCommand.shell,
     stdio: ["pipe", "pipe", "pipe"],

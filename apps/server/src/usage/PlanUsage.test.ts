@@ -17,15 +17,20 @@ async function makeFakeCodexAppServer(input: {
   readonly rateLimitsResponse: unknown;
   readonly requiredEnv?: Readonly<Record<string, string>>;
   readonly forbiddenEnv?: ReadonlyArray<string>;
+  readonly homeExists?: boolean;
   readonly serverRequestMethod?: string | undefined;
 }): Promise<{
   readonly binaryPath: string;
   readonly homePath: string;
   readonly requestsPath: string;
 }> {
-  const homePath = await NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "t3-usage-codex-home-"));
-  const requestsPath = NodePath.join(homePath, "requests.jsonl");
-  const binaryPath = NodePath.join(homePath, "codex-fake");
+  const rootPath = await NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "t3-usage-codex-"));
+  const homePath = NodePath.join(rootPath, "codex-home");
+  if (input.homeExists !== false) {
+    await NodeFSP.mkdir(homePath, { recursive: true });
+  }
+  const requestsPath = NodePath.join(rootPath, "requests.jsonl");
+  const binaryPath = NodePath.join(rootPath, "codex-fake");
   const script = `#!/usr/bin/env node
 const fs = require("node:fs");
 const readline = require("node:readline");
@@ -406,6 +411,28 @@ describe("PlanUsage", () => {
     });
 
     expect(snapshot.providers[0]?.windows.map((window) => window.usedPercent)).toEqual([12]);
+  });
+
+  it("starts Codex app-server when the selected home directory does not exist yet", async () => {
+    const now = Date.parse("2026-07-06T15:10:00.000Z");
+    const fake = await makeFakeCodexAppServer({
+      homeExists: false,
+      rateLimitsResponse: {
+        rateLimits: {
+          planType: "team",
+          primary: { usedPercent: 18, resetsAt: 1783103404, windowDurationMins: 300 },
+        },
+      },
+    });
+    await expect(NodeFSP.stat(fake.homePath)).rejects.toMatchObject({ code: "ENOENT" });
+    const settings = fakeCodexSettings(fake);
+
+    const snapshot = await loadPlanUsageSnapshot(
+      { settings, providerInstanceId: ProviderInstanceId.make("codex") },
+      now,
+    );
+
+    expect(snapshot.providers[0]?.windows.map((window) => window.usedPercent)).toEqual([18]);
   });
 
   it("maps Claude dynamic limits including scoped Fable weekly usage", () => {
