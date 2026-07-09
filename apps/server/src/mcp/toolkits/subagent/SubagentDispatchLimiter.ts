@@ -20,6 +20,7 @@ export interface SubagentDispatchLimiterShape {
     childThreadId: ThreadId,
   ) => Effect.Effect<void>;
   readonly seedChild: (childThreadId: ThreadId) => Effect.Effect<void>;
+  readonly leasedChildThreadIds: Effect.Effect<ReadonlyArray<ThreadId>>;
   readonly release: (lease: SubagentDispatchLease) => Effect.Effect<void>;
   readonly releaseForChild: (childThreadId: ThreadId) => Effect.Effect<void>;
 }
@@ -191,6 +192,10 @@ const makeWithMax = (maxConcurrentDispatches: number) =>
         }),
       );
 
+    const leasedChildThreadIds = Ref.get(state).pipe(
+      Effect.map((current) => [...current.childLeases.keys()].sort()),
+    );
+
     const release: SubagentDispatchLimiterShape["release"] = (lease) => releaseId(lease.id);
 
     return SubagentDispatchLimiter.of({
@@ -198,6 +203,7 @@ const makeWithMax = (maxConcurrentDispatches: number) =>
       acquire,
       bindChild,
       seedChild,
+      leasedChildThreadIds,
       release,
       releaseForChild,
     });

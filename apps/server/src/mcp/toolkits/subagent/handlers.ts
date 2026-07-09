@@ -159,10 +159,12 @@ const acquireLocalDispatchLease = Effect.fn("SubagentToolkit.acquireLocalDispatc
   );
   if (Option.isSome(lease)) return lease.value;
 
+  const holderChildThreadIds = yield* runtime.dispatchLimiter.leasedChildThreadIds;
   yield* Effect.logWarning("sub-agent spawn dispatch capacity timed out", {
     parentThreadId,
     maxConcurrentDispatches: runtime.dispatchLimiter.maxConcurrentDispatches,
     timeoutSeconds: LOCAL_SPAWN_DISPATCH_LEASE_TIMEOUT_SECONDS,
+    holderChildThreadIds,
   });
   return yield* fail(
     `Sub-agent dispatch capacity is saturated after ${LOCAL_SPAWN_DISPATCH_LEASE_TIMEOUT_SECONDS}s (limit ${runtime.dispatchLimiter.maxConcurrentDispatches}); no child was created. Try again after running sub-agents finish.`,
