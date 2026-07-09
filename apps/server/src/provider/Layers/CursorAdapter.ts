@@ -134,8 +134,13 @@ interface CursorSessionContext {
   readonly pendingUserInputs: Map<ApprovalRequestId, PendingUserInput>;
   readonly stoppedSignal: Deferred.Deferred<void>;
   readonly turns: Array<{ id: TurnId; items: Array<unknown> }>;
+  readonly assistantItemTurnIds: Map<string, TurnId | undefined>;
   lastPlanFingerprint: string | undefined;
   activeTurnId: TurnId | undefined;
+  // ACP session/update notifications do not carry prompt ids. Keep their turn
+  // scope separate from session activity so stale queued updates are not
+  // assigned to the next active turn.
+  notificationTurnId: TurnId | undefined;
   /** Number of sendTurn prompts currently in flight or being prepared.
    * >0 means a turn is actively running, so a new sendTurn is a steer that
    * continues it, and only the last remaining prompt settles the turn. */
@@ -367,6 +372,38 @@ export function makeCursorAdapter(
     const offerRuntimeEvent = (event: ProviderRuntimeEvent) =>
       PubSub.publish(runtimeEventPubSub, event).pipe(Effect.asVoid);
 
+    const drainAcpEventsUnlessStopped = (ctx: CursorSessionContext) =>
+      ctx.stopped
+        ? Effect.succeed(false)
+        : Effect.raceFirst(
+            ctx.acp.drainEvents.pipe(Effect.as(true)),
+            Deferred.await(ctx.stoppedSignal).pipe(Effect.as(false)),
+          );
+
+    const rememberAssistantItemTurnId = (
+      ctx: CursorSessionContext,
+      itemId: string | undefined,
+      turnId: TurnId | undefined,
+    ) => {
+      if (itemId === undefined) return turnId;
+      if (!ctx.assistantItemTurnIds.has(itemId)) {
+        ctx.assistantItemTurnIds.set(itemId, turnId);
+      }
+      return ctx.assistantItemTurnIds.get(itemId);
+    };
+
+    const completeAssistantItemTurnId = (
+      ctx: CursorSessionContext,
+      itemId: string,
+    ): TurnId | undefined => {
+      if (!ctx.assistantItemTurnIds.has(itemId)) {
+        return ctx.notificationTurnId;
+      }
+      const turnId = ctx.assistantItemTurnIds.get(itemId);
+      ctx.assistantItemTurnIds.delete(itemId);
+      return turnId;
+    };
+
     const getThreadSemaphore = (threadId: string) =>
       SynchronizedRef.modifyEffect(threadLocksRef, (current) => {
         const existing: Option.Option<Semaphore.Semaphore> = Option.fromNullishOr(
@@ -416,6 +453,7 @@ export function makeCursorAdapter(
 
     const emitPlanUpdate = (
       ctx: CursorSessionContext,
+      turnId: TurnId | undefined,
       payload: {
         readonly explanation?: string | null;
         readonly plan: ReadonlyArray<{
@@ -428,7 +466,7 @@ export function makeCursorAdapter(
       method: string,
     ) =>
       Effect.gen(function* () {
-        const fingerprint = `${ctx.activeTurnId ?? "no-turn"}:${encodeJsonStringForDiagnostics(payload) ?? "[unserializable payload]"}`;
+        const fingerprint = `${turnId ?? "no-turn"}:${encodeJsonStringForDiagnostics(payload) ?? "[unserializable payload]"}`;
         if (ctx.lastPlanFingerprint === fingerprint) {
           return;
         }
@@ -438,7 +476,7 @@ export function makeCursorAdapter(
             stamp: yield* makeEventStamp(),
             provider: PROVIDER,
             threadId: ctx.threadId,
-            turnId: ctx.activeTurnId,
+            turnId,
             payload,
             source,
             method,
@@ -581,6 +619,7 @@ export function makeCursorAdapter(
             yield* acp.handleExtRequest("cursor/ask_question", CursorAskQuestionRequest, (params) =>
               mapExtensionFailure(
                 Effect.gen(function* () {
+                  const requestTurnId = ctx?.notificationTurnId;
                   yield* logNative(
                     input.threadId,
                     "cursor/ask_question",
@@ -596,7 +635,7 @@ export function makeCursorAdapter(
                     ...(yield* makeEventStamp()),
                     provider: PROVIDER,
                     threadId: input.threadId,
-                    turnId: ctx?.activeTurnId,
+                    turnId: requestTurnId,
                     requestId: runtimeRequestId,
                     payload: { questions: extractAskQuestions(params) },
                     raw: {
@@ -612,7 +651,7 @@ export function makeCursorAdapter(
                     ...(yield* makeEventStamp()),
                     provider: PROVIDER,
                     threadId: input.threadId,
-                    turnId: ctx?.activeTurnId,
+                    turnId: requestTurnId,
                     requestId: runtimeRequestId,
                     payload: { answers: resolved },
                   });
@@ -623,6 +662,7 @@ export function makeCursorAdapter(
             yield* acp.handleExtRequest("cursor/create_plan", CursorCreatePlanRequest, (params) =>
               mapExtensionFailure(
                 Effect.gen(function* () {
+                  const requestTurnId = ctx?.notificationTurnId;
                   yield* logNative(
                     input.threadId,
                     "cursor/create_plan",
@@ -634,7 +674,7 @@ export function makeCursorAdapter(
                     ...(yield* makeEventStamp()),
                     provider: PROVIDER,
                     threadId: input.threadId,
-                    turnId: ctx?.activeTurnId,
+                    turnId: requestTurnId,
                     payload: { planMarkdown: extractPlanMarkdown(params) },
                     raw: {
                       source: "acp.cursor.extension",
@@ -661,6 +701,7 @@ export function makeCursorAdapter(
                     if (ctx) {
                       yield* emitPlanUpdate(
                         ctx,
+                        ctx.notificationTurnId,
                         extractTodosAsPlan(params),
                         params,
                         "acp.cursor.extension",
@@ -673,6 +714,7 @@ export function makeCursorAdapter(
             yield* acp.handleRequestPermission((params) =>
               mapExtensionFailure(
                 Effect.gen(function* () {
+                  const requestTurnId = ctx?.notificationTurnId;
                   yield* logNative(
                     input.threadId,
                     "session/request_permission",
@@ -703,7 +745,7 @@ export function makeCursorAdapter(
                       stamp: yield* makeEventStamp(),
                       provider: PROVIDER,
                       threadId: input.threadId,
-                      turnId: ctx?.activeTurnId,
+                      turnId: requestTurnId,
                       requestId: runtimeRequestId,
                       permissionRequest,
                       detail:
@@ -723,7 +765,7 @@ export function makeCursorAdapter(
                       stamp: yield* makeEventStamp(),
                       provider: PROVIDER,
                       threadId: input.threadId,
-                      turnId: ctx?.activeTurnId,
+                      turnId: requestTurnId,
                       requestId: runtimeRequestId,
                       permissionRequest,
                       decision: resolved,
@@ -786,8 +828,10 @@ export function makeCursorAdapter(
             pendingUserInputs,
             stoppedSignal,
             turns: [],
+            assistantItemTurnIds: new Map(),
             lastPlanFingerprint: undefined,
             activeTurnId: input.activeTurnId,
+            notificationTurnId: input.activeTurnId,
             promptsInFlight: 0,
             stopped: false,
           };
@@ -802,24 +846,30 @@ export function makeCursorAdapter(
                   case "ModeChanged":
                     return;
                   case "AssistantItemStarted":
+                    const startedTurnId = rememberAssistantItemTurnId(
+                      ctx,
+                      event.itemId,
+                      ctx.notificationTurnId,
+                    );
                     yield* offerRuntimeEvent(
                       makeAcpAssistantItemEvent({
                         stamp: yield* makeEventStamp(),
                         provider: PROVIDER,
                         threadId: ctx.threadId,
-                        turnId: ctx.activeTurnId,
+                        turnId: startedTurnId,
                         itemId: event.itemId,
                         lifecycle: "item.started",
                       }),
                     );
                     return;
                   case "AssistantItemCompleted":
+                    const completedTurnId = completeAssistantItemTurnId(ctx, event.itemId);
                     yield* offerRuntimeEvent(
                       makeAcpAssistantItemEvent({
                         stamp: yield* makeEventStamp(),
                         provider: PROVIDER,
                         threadId: ctx.threadId,
-                        turnId: ctx.activeTurnId,
+                        turnId: completedTurnId,
                         itemId: event.itemId,
                         lifecycle: "item.completed",
                       }),
@@ -834,6 +884,7 @@ export function makeCursorAdapter(
                     );
                     yield* emitPlanUpdate(
                       ctx,
+                      ctx.notificationTurnId,
                       event.payload,
                       event.rawPayload,
                       "acp.jsonrpc",
@@ -852,7 +903,7 @@ export function makeCursorAdapter(
                         stamp: yield* makeEventStamp(),
                         provider: PROVIDER,
                         threadId: ctx.threadId,
-                        turnId: ctx.activeTurnId,
+                        turnId: ctx.notificationTurnId,
                         toolCall: event.toolCall,
                         rawPayload: event.rawPayload,
                       }),
@@ -865,12 +916,17 @@ export function makeCursorAdapter(
                       event.rawPayload,
                       "acp.jsonrpc",
                     );
+                    const contentTurnId = rememberAssistantItemTurnId(
+                      ctx,
+                      event.itemId,
+                      ctx.notificationTurnId,
+                    );
                     yield* offerRuntimeEvent(
                       makeAcpContentDeltaEvent({
                         stamp: yield* makeEventStamp(),
                         provider: PROVIDER,
                         threadId: ctx.threadId,
-                        turnId: ctx.activeTurnId,
+                        turnId: contentTurnId,
                         ...(event.itemId ? { itemId: event.itemId } : {}),
                         text: event.text,
                         rawPayload: event.rawPayload,
@@ -889,7 +945,7 @@ export function makeCursorAdapter(
                         stamp: yield* makeEventStamp(),
                         provider: PROVIDER,
                         threadId: ctx.threadId,
-                        turnId: ctx.activeTurnId,
+                        turnId: ctx.notificationTurnId,
                         usage: event.usage,
                         rawPayload: event.rawPayload,
                       }),
@@ -950,6 +1006,7 @@ export function makeCursorAdapter(
             : undefined;
         const turnId = steeringTurnId ?? TurnId.make(yield* randomUUIDv4);
         const previousActiveTurnId = ctx.activeTurnId;
+        const previousNotificationTurnId = ctx.notificationTurnId;
         const previousSession = ctx.session;
         const previousLastPlanFingerprint = ctx.lastPlanFingerprint;
         let activeStateApplied = false;
@@ -999,6 +1056,15 @@ export function makeCursorAdapter(
               payload: { model: resolvedModel },
             });
           }
+
+          const drainedBeforeTurn = yield* drainAcpEventsUnlessStopped(ctx);
+          if (!drainedBeforeTurn || ctx.stopped) {
+            return yield* new ProviderAdapterSessionNotFoundError({
+              provider: PROVIDER,
+              threadId: input.threadId,
+            });
+          }
+          ctx.notificationTurnId = turnId;
 
           const promptParts: Array<EffectAcpSchema.ContentBlock> = [];
           if (input.input?.trim()) {
@@ -1060,12 +1126,7 @@ export function makeCursorAdapter(
           } else {
             ctx.turns.push({ id: turnId, items: [{ prompt: promptParts, result }] });
           }
-          const drainedEvents = ctx.stopped
-            ? false
-            : yield* Effect.raceFirst(
-                ctx.acp.drainEvents.pipe(Effect.as(true)),
-                Deferred.await(ctx.stoppedSignal).pipe(Effect.as(false)),
-              );
+          const drainedEvents = yield* drainAcpEventsUnlessStopped(ctx);
           if (!drainedEvents || ctx.stopped) {
             return yield* new ProviderAdapterSessionNotFoundError({
               provider: PROVIDER,
@@ -1079,6 +1140,8 @@ export function makeCursorAdapter(
             const { activeTurnId: _completedActiveTurnId, ...sessionWithoutActiveTurn } =
               ctx.session;
             ctx.activeTurnId = undefined;
+            // Keep the completed turn as the notification scope until the next
+            // sendTurn drains stale ACP updates and switches to its own scope.
             ctx.session = {
               ...sessionWithoutActiveTurn,
               status: "ready",
@@ -1121,6 +1184,7 @@ export function makeCursorAdapter(
                 ctx.session.activeTurnId === turnId
               ) {
                 ctx.activeTurnId = previousActiveTurnId;
+                ctx.notificationTurnId = previousNotificationTurnId;
                 ctx.session = previousSession;
                 ctx.lastPlanFingerprint = previousLastPlanFingerprint;
               }

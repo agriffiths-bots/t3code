@@ -50,6 +50,10 @@ const failSetConfigOption = process.env.T3_ACP_FAIL_SET_CONFIG_OPTION === "1";
 const exitOnSetConfigOption = process.env.T3_ACP_EXIT_ON_SET_CONFIG_OPTION === "1";
 const promptResponseText = process.env.T3_ACP_PROMPT_RESPONSE_TEXT;
 const promptResponseChunks = process.env.T3_ACP_PROMPT_RESPONSE_CHUNKS?.split("|") ?? null;
+const lateFirstPromptResponseText = process.env.T3_ACP_LATE_FIRST_PROMPT_RESPONSE_TEXT;
+const lateFirstPromptResponseDelayMs = Number(
+  process.env.T3_ACP_LATE_FIRST_PROMPT_RESPONSE_DELAY_MS ?? "0",
+);
 const emitUsageUpdate = process.env.T3_ACP_EMIT_USAGE_UPDATE === "1";
 const promptDelayMs = Number(process.env.T3_ACP_PROMPT_DELAY_MS ?? "0");
 const firstPromptDelayMs =
@@ -1008,6 +1012,22 @@ const program = Effect.gen(function* () {
             content: { type: "text", text: chunk },
           },
         });
+      }
+
+      if (promptCount === 1 && lateFirstPromptResponseText !== undefined) {
+        yield* Effect.forkIn(
+          Effect.gen(function* () {
+            yield* Effect.sleep(lateFirstPromptResponseDelayMs);
+            writeJsonRpcNotification("session/update", {
+              sessionId: requestedSessionId,
+              update: {
+                sessionUpdate: "agent_message_chunk",
+                content: { type: "text", text: lateFirstPromptResponseText },
+              },
+            });
+          }),
+          programScope,
+        );
       }
 
       return { stopReason: "end_turn" };

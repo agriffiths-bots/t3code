@@ -321,6 +321,82 @@ cursorAdapterTestLayer("CursorAdapterLive", (it) => {
     }),
   );
 
+  it.effect("keeps delayed Composer item completion scoped to its source turn", () =>
+    Effect.gen(function* () {
+      const adapter = yield* CursorAdapter;
+      const settings = yield* ServerSettingsService;
+      const threadId = ThreadId.make("cursor-delayed-composer-completion");
+
+      const wrapperPath = yield* Effect.promise(() =>
+        makeMockAgentWrapper({
+          T3_ACP_PROMPT_RESPONSE_TEXT: "first response",
+          T3_ACP_LATE_FIRST_PROMPT_RESPONSE_TEXT: "late after first",
+          T3_ACP_LATE_FIRST_PROMPT_RESPONSE_DELAY_MS: "25",
+        }),
+      );
+      yield* settings.updateSettings({ providers: { cursor: { binaryPath: wrapperPath } } });
+
+      const lateDeltaReady = yield* Deferred.make<ProviderRuntimeEvent>();
+      const lateCompletionReady = yield* Deferred.make<ProviderRuntimeEvent>();
+      let lateItemId: string | undefined;
+
+      const runtimeEventsFiber = yield* Stream.runForEach(adapter.streamEvents, (event) =>
+        Effect.gen(function* () {
+          if (String(event.threadId) !== String(threadId)) {
+            return;
+          }
+          if (event.type === "content.delta" && event.payload.delta === "late after first") {
+            lateItemId = event.itemId === undefined ? undefined : String(event.itemId);
+            yield* Deferred.succeed(lateDeltaReady, event).pipe(Effect.ignore);
+            return;
+          }
+          if (
+            event.type === "item.completed" &&
+            lateItemId !== undefined &&
+            String(event.itemId) === lateItemId
+          ) {
+            yield* Deferred.succeed(lateCompletionReady, event).pipe(Effect.ignore);
+          }
+        }),
+      ).pipe(Effect.forkChild);
+
+      yield* adapter.startSession({
+        threadId,
+        provider: ProviderDriverKind.make("cursor"),
+        cwd: process.cwd(),
+        runtimeMode: "full-access",
+        modelSelection: { instanceId: ProviderInstanceId.make("cursor"), model: "composer-2" },
+      });
+
+      const firstTurn = yield* adapter.sendTurn({
+        threadId,
+        input: "first Composer turn",
+        attachments: [],
+      });
+
+      const lateDelta = yield* Deferred.await(lateDeltaReady);
+      assert.equal(lateDelta.type, "content.delta");
+      if (lateDelta.type === "content.delta") {
+        assert.equal(String(lateDelta.turnId), String(firstTurn.turnId));
+      }
+
+      const secondTurn = yield* adapter.sendTurn({
+        threadId,
+        input: "second Composer turn",
+        attachments: [],
+      });
+      const lateCompletion = yield* Deferred.await(lateCompletionReady);
+      assert.equal(lateCompletion.type, "item.completed");
+      if (lateCompletion.type === "item.completed") {
+        assert.equal(String(lateCompletion.turnId), String(firstTurn.turnId));
+        assert.notEqual(String(lateCompletion.turnId), String(secondTurn.turnId));
+      }
+
+      yield* Fiber.interrupt(runtimeEventsFiber);
+      yield* adapter.stopSession(threadId);
+    }),
+  );
+
   it.effect("steers a running turn instead of opening a new one on mid-turn sendTurn", () =>
     Effect.gen(function* () {
       const adapter = yield* CursorAdapter;

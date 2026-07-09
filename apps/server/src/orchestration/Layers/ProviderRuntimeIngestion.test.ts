@@ -729,11 +729,11 @@ describe("ProviderRuntimeIngestion", () => {
     expect(message?.streaming).toBe(false);
   });
 
-  it("projects Cursor assistant deltas without explicit turn ids onto the active turn", async () => {
+  it("projects Cursor adapter-stamped assistant deltas onto their source turn", async () => {
     const harness = await createHarness();
     const now = "2026-01-01T00:00:00.000Z";
     const threadId = asThreadId("thread-1");
-    const turnId = asTurnId("turn-cursor-composer-race");
+    const turnId = asTurnId("turn-cursor-composer-stamped");
     const itemId = asItemId("assistant:mock-session-1:segment:0");
 
     harness.emit({
@@ -748,7 +748,7 @@ describe("ProviderRuntimeIngestion", () => {
       harness.readModel,
       (thread) =>
         thread.session?.status === "running" &&
-        thread.session?.activeTurnId === "turn-cursor-composer-race",
+        thread.session?.activeTurnId === "turn-cursor-composer-stamped",
     );
 
     for (const [index, delta] of ["MODEL", "_OK", " composer"].entries()) {
@@ -758,6 +758,7 @@ describe("ProviderRuntimeIngestion", () => {
         provider: ProviderDriverKind.make("cursor"),
         createdAt: now,
         threadId,
+        turnId,
         itemId,
         payload: {
           streamKind: "assistant_text",
@@ -792,8 +793,70 @@ describe("ProviderRuntimeIngestion", () => {
         entry.id === "assistant:assistant:mock-session-1:segment:0",
     );
     expect(message?.text).toBe("MODEL_OK composer");
-    expect(message?.turnId).toBe("turn-cursor-composer-race");
+    expect(message?.turnId).toBe("turn-cursor-composer-stamped");
     expect(message?.streaming).toBe(false);
+  });
+
+  it("leaves Cursor assistant deltas without explicit turn ids thread-scoped", async () => {
+    const harness = await createHarness({ serverSettings: { enableAssistantStreaming: true } });
+    const now = "2026-01-01T00:00:00.000Z";
+    const threadId = asThreadId("thread-1");
+    const turnId = asTurnId("turn-cursor-unscoped-delta");
+    const itemId = asItemId("item-cursor-unscoped-delta");
+
+    harness.emit({
+      type: "turn.started",
+      eventId: asEventId("evt-cursor-unscoped-turn-started"),
+      provider: ProviderDriverKind.make("cursor"),
+      createdAt: now,
+      threadId,
+      turnId,
+    });
+    await waitForThread(
+      harness.readModel,
+      (thread) =>
+        thread.session?.status === "running" &&
+        thread.session?.activeTurnId === "turn-cursor-unscoped-delta",
+    );
+
+    harness.emit({
+      type: "content.delta",
+      eventId: asEventId("evt-cursor-unscoped-delta"),
+      provider: ProviderDriverKind.make("cursor"),
+      createdAt: now,
+      threadId,
+      itemId,
+      payload: {
+        streamKind: "assistant_text",
+        delta: "thread-scoped Cursor replay",
+      },
+    });
+    harness.emit({
+      type: "turn.completed",
+      eventId: asEventId("evt-cursor-unscoped-turn-completed"),
+      provider: ProviderDriverKind.make("cursor"),
+      createdAt: now,
+      threadId,
+      turnId,
+      payload: {
+        state: "completed",
+      },
+    });
+
+    const thread = await waitForThread(
+      harness.readModel,
+      (entry) =>
+        entry.session?.status === "ready" &&
+        entry.messages.some(
+          (message: ProviderRuntimeTestMessage) =>
+            message.id === "assistant:item-cursor-unscoped-delta",
+        ),
+    );
+    const message = thread.messages.find(
+      (entry: ProviderRuntimeTestMessage) => entry.id === "assistant:item-cursor-unscoped-delta",
+    );
+    expect(message?.text).toBe("thread-scoped Cursor replay");
+    expect(message?.turnId).toBe(null);
   });
 
   it("leaves non-Cursor assistant deltas without explicit turn ids thread-scoped", async () => {
