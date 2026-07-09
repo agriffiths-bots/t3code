@@ -1,6 +1,5 @@
 // @effect-diagnostics nodeBuiltinImport:off - Provider usage discovery reads CLI-owned files and binaries.
 // @effect-diagnostics globalDate:off - Provider APIs exchange reset timestamps as Unix/ISO dates.
-// @effect-diagnostics globalFetch:off - The Codex usage boundary calls provider OAuth usage endpoints directly.
 import type {
   PlanUsageProvider,
   PlanUsageSnapshot,
@@ -16,15 +15,15 @@ import { resolveSpawnCommand } from "@t3tools/shared/shell";
 import * as Effect from "effect/Effect";
 import * as NodeChildProcess from "node:child_process";
 import * as NodeCrypto from "node:crypto";
-import * as NodeFSP from "node:fs/promises";
 import * as NodePath from "node:path";
+import * as NodeTimersPromises from "node:timers/promises";
 import * as NodeUtil from "node:util";
 import { expandHomePath } from "../pathExpansion.ts";
 import { mergeProviderInstanceEnvironment } from "../provider/ProviderInstanceEnvironment.ts";
 
-const CODEX_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage";
-const CODEX_REFRESH_URL = "https://auth.openai.com/oauth/token";
-const CODEX_OAUTH_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann";
+const CODEX_APP_SERVER_ARGS = ["app-server"] as const;
+const CODEX_APP_SERVER_USAGE_TIMEOUT_MS = 10_000;
+const CODEX_APP_SERVER_USAGE_FORCE_KILL_AFTER_MS = 1_000;
 const CLAUDE_CLI_USAGE_ARGS = [
   "--safe-mode",
   "--setting-sources",
@@ -45,7 +44,6 @@ const CLAUDE_CLI_AUTH_STATUS_ARGS = [
 ] as const;
 const CACHE_TTL_MS = 60_000;
 const MAX_CACHE_ENTRIES = 32;
-const UPSTREAM_TIMEOUT_MS = 10_000;
 const CLAUDE_CLI_TIMEOUT_MS = 30_000;
 const CLI_MAX_BUFFER_BYTES = 1024 * 1024;
 const CLAUDE_SAFE_TRANSPORT_ENV_KEYS = new Set([
@@ -54,6 +52,14 @@ const CLAUDE_SAFE_TRANSPORT_ENV_KEYS = new Set([
   "CLAUDE_CODE_CLIENT_KEY",
   "CLAUDE_CODE_CLIENT_KEY_PASSPHRASE",
   "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC",
+]);
+const CODEX_AUTH_OVERRIDE_ENV_KEYS = new Set([
+  "AZURE_OPENAI_API_KEY",
+  "CODEX_ACCESS_TOKEN",
+  "CODEX_AUTH_TOKEN",
+  "CODEX_REFRESH_TOKEN",
+  "OPENAI_ACCESS_TOKEN",
+  "OPENAI_API_KEY",
 ]);
 
 const execFile = NodeUtil.promisify(NodeChildProcess.execFile);
@@ -90,6 +96,13 @@ interface UsageCredentialScope {
   readonly sources: ReadonlyArray<UsageCredentialSource>;
 }
 
+interface CodexAppServerResponse {
+  readonly id?: unknown;
+  readonly method?: unknown;
+  readonly result?: unknown;
+  readonly error?: unknown;
+}
+
 interface LoadPlanUsageOptions {
   readonly settings?: ServerSettings | undefined;
   readonly providerInstanceId?: ProviderInstanceIdType | null | undefined;
@@ -105,6 +118,14 @@ interface UsageProviderInstance {
 
 function numberValue(value: unknown): number | null {
   return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+function numberLikeValue(value: unknown): number | null {
+  const numeric = numberValue(value);
+  if (numeric !== null) return numeric;
+  if (typeof value !== "string") return null;
+  const parsed = Number(value.trim());
+  return Number.isFinite(parsed) ? parsed : null;
 }
 
 function stringValue(value: unknown): string | null {
@@ -476,7 +497,7 @@ function codexWindow(input: {
   readonly raw: unknown;
 }): PlanUsageWindow | null {
   const raw = objectValue(input.raw);
-  const usedPercent = numberValue(raw?.used_percent);
+  const usedPercent = numberValue(raw?.usedPercent);
   if (usedPercent === null) return null;
   return {
     id: input.id,
@@ -484,7 +505,7 @@ function codexWindow(input: {
     kind: input.kind,
     title: input.title,
     usedPercent: clampPercent(usedPercent),
-    resetAt: unixSecondsToIso(raw?.reset_at),
+    resetAt: unixSecondsToIso(raw?.resetsAt),
     used: null,
     limit: null,
     unit: null,
@@ -492,30 +513,137 @@ function codexWindow(input: {
   };
 }
 
-function parseCodexUsageResponse(payload: unknown): ParsedProviderUsage | null {
-  const root = objectValue(payload);
-  const rateLimit = objectValue(root?.rate_limit);
-  if (!root || !rateLimit) return null;
+function codexIndividualLimitWindow(input: {
+  readonly id: string;
+  readonly title: string;
+  readonly raw: unknown;
+}): PlanUsageWindow | null {
+  const limit = objectValue(input.raw);
+  const remainingPercent = numberValue(limit?.remainingPercent);
+  if (remainingPercent === null) return null;
+  return {
+    id: input.id,
+    provider: "codex",
+    kind: "individual_limit",
+    title: input.title,
+    usedPercent: clampPercent(100 - remainingPercent),
+    resetAt: unixSecondsToIso(limit?.resetsAt),
+    used: numberLikeValue(limit?.used),
+    limit: numberLikeValue(limit?.limit),
+    unit: null,
+    severity: null,
+  };
+}
 
-  const windows = [
+function codexRateLimitBucketSlug(value: string | null, index: number): string {
+  const slug = value
+    ?.toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+  return slug || `limit-${index + 1}`;
+}
+
+function codexRateLimitBucketLabel(
+  rateLimits: Record<string, unknown>,
+  fallbackKey: string | null,
+): string | null {
+  return stringValue(rateLimits.limitName) ?? fallbackKey;
+}
+
+function codexDurationLabel(durationMins: number): string {
+  if (durationMins % 60 === 0) {
+    return `${durationMins / 60}h`;
+  }
+  return `${durationMins}m`;
+}
+
+function codexPrimaryWindowDescriptor(raw: unknown): {
+  readonly idSuffix: string;
+  readonly kind: PlanUsageWindow["kind"];
+  readonly title: string;
+} {
+  const durationMins = numberValue(objectValue(raw)?.windowDurationMins);
+  if (durationMins === 300) {
+    return { idSuffix: "five-hour", kind: "five_hour", title: "Codex 5h" };
+  }
+  if (durationMins !== null && Number.isInteger(durationMins) && durationMins > 0) {
+    return {
+      idSuffix: `${durationMins}-minute`,
+      kind: `duration_${durationMins}_minutes`,
+      title: `Codex ${codexDurationLabel(durationMins)}`,
+    };
+  }
+  return { idSuffix: "primary", kind: "primary", title: "Codex primary" };
+}
+
+function codexWindowsForRateLimitBucket(input: {
+  readonly rateLimits: Record<string, unknown>;
+  readonly idPrefix: string;
+  readonly titleSuffix: string;
+}): ReadonlyArray<PlanUsageWindow> {
+  const primary = codexPrimaryWindowDescriptor(input.rateLimits.primary);
+  return [
     codexWindow({
-      id: "codex-five-hour",
-      kind: "five_hour",
-      title: "Codex 5h",
-      raw: rateLimit.primary_window,
+      id: `${input.idPrefix}${primary.idSuffix}`,
+      kind: primary.kind,
+      title: `${primary.title}${input.titleSuffix}`,
+      raw: input.rateLimits.primary,
     }),
     codexWindow({
-      id: "codex-weekly",
+      id: `${input.idPrefix}weekly`,
       kind: "weekly",
-      title: "Codex weekly",
-      raw: rateLimit.secondary_window,
+      title: `Codex weekly${input.titleSuffix}`,
+      raw: input.rateLimits.secondary,
+    }),
+    codexIndividualLimitWindow({
+      id: `${input.idPrefix}individual-limit`,
+      title: `Codex individual limit${input.titleSuffix}`,
+      raw: input.rateLimits.individualLimit,
     }),
   ].filter((window): window is PlanUsageWindow => window !== null);
+}
+
+function parseCodexRateLimitsResponse(payload: unknown): ParsedProviderUsage | null {
+  const root = objectValue(payload);
+  const rateLimits = objectValue(root?.rateLimits);
+  if (!root || !rateLimits) return null;
+
+  const rateLimitsByLimitId = objectValue(root.rateLimitsByLimitId);
+  const bucketEntries = rateLimitsByLimitId
+    ? Object.entries(rateLimitsByLimitId)
+        .map(([key, value], index) => ({ index, key, rateLimits: objectValue(value) }))
+        .filter(
+          (
+            entry,
+          ): entry is {
+            readonly index: number;
+            readonly key: string;
+            readonly rateLimits: Record<string, unknown>;
+          } => entry.rateLimits !== null,
+        )
+    : [];
+  const bucketWindows = bucketEntries.flatMap(({ index, key, rateLimits: bucket }) => {
+    const slug = codexRateLimitBucketSlug(stringValue(bucket.limitId) ?? key, index);
+    const label = codexRateLimitBucketLabel(bucket, key);
+    return codexWindowsForRateLimitBucket({
+      rateLimits: bucket,
+      idPrefix: `codex-${slug}-`,
+      titleSuffix: label && bucketEntries.length > 1 ? ` (${label})` : "",
+    });
+  });
+  const windows =
+    bucketWindows.length > 0
+      ? bucketWindows
+      : codexWindowsForRateLimitBucket({
+          rateLimits,
+          idPrefix: "codex-",
+          titleSuffix: "",
+        });
 
   if (windows.length === 0) return null;
   return {
     provider: "codex",
-    plan: stringValue(root.plan_type),
+    plan: stringValue(rateLimits.planType),
     windows,
   };
 }
@@ -583,77 +711,6 @@ function parseClaudeUsageResponse(
     plan,
     windows,
   };
-}
-
-async function readJsonFile(path: string): Promise<Record<string, unknown> | null> {
-  try {
-    return JSON.parse(await NodeFSP.readFile(path, "utf8")) as Record<string, unknown>;
-  } catch {
-    return null;
-  }
-}
-
-async function writeJsonFilePrivate(
-  path: string,
-  value: Record<string, unknown>,
-): Promise<boolean> {
-  const tempPath = `${path}.${process.pid}.${Date.now()}.tmp`;
-  try {
-    await NodeFSP.writeFile(tempPath, `${JSON.stringify(value, null, 2)}\n`, {
-      encoding: "utf8",
-      mode: 0o600,
-    });
-    await NodeFSP.rename(tempPath, path);
-    await NodeFSP.chmod(path, 0o600).catch(() => undefined);
-    return true;
-  } catch {
-    await NodeFSP.rm(tempPath, { force: true }).catch(() => undefined);
-    return false;
-  }
-}
-
-async function fetchJson(
-  url: string,
-  headers: Record<string, string>,
-  options?: {
-    readonly method?: "GET" | "POST";
-    readonly body?: string;
-  },
-): Promise<unknown | null> {
-  try {
-    const response = await fetch(url, {
-      headers,
-      method: options?.method ?? "GET",
-      body: options?.body,
-      signal: AbortSignal.timeout(UPSTREAM_TIMEOUT_MS),
-    });
-    if (!response.ok) return null;
-    return await response.json();
-  } catch {
-    return null;
-  }
-}
-
-async function fetchJsonStatus(
-  url: string,
-  headers: Record<string, string>,
-  options?: {
-    readonly method?: "GET" | "POST";
-    readonly body?: string;
-  },
-): Promise<{ readonly status: number; readonly payload: unknown | null }> {
-  try {
-    const response = await fetch(url, {
-      headers,
-      method: options?.method ?? "GET",
-      body: options?.body,
-      signal: AbortSignal.timeout(UPSTREAM_TIMEOUT_MS),
-    });
-    if (!response.ok) return { status: response.status, payload: null };
-    return { status: response.status, payload: await response.json() };
-  } catch {
-    return { status: 0, payload: null };
-  }
 }
 
 function defaultCodexHome(): string {
@@ -758,7 +815,7 @@ function usageSourceForInstance(
     provider,
     instanceId: instance.instanceId,
     home: configuredHomeForProvider(provider, instance),
-    executable: provider === "claude" ? configuredCommandOrNull(config?.binaryPath) : null,
+    executable: configuredCommandOrNull(config?.binaryPath),
     environment: instance.environment,
   };
 }
@@ -790,9 +847,10 @@ function usageEnvironmentKeyFromEnv(
 function usageEffectiveEnvironmentKey(
   source: UsageCredentialSource,
 ): ReadonlyArray<readonly [string, string]> {
-  if (source.provider !== "claude") return [];
   return usageEnvironmentKeyFromEnv(
-    claudeCliEnvironment(source.home, source.environment, {} as NodeJS.ProcessEnv),
+    source.provider === "codex"
+      ? codexAppServerEnvironment(source.home, source.environment, {} as NodeJS.ProcessEnv)
+      : claudeCliEnvironment(source.home, source.environment, {} as NodeJS.ProcessEnv),
   );
 }
 
@@ -898,110 +956,252 @@ export function resolveUsageCredentialScope(
   };
 }
 
-interface CodexAuth {
-  readonly authPath: string;
-  readonly auth: Record<string, unknown>;
-  readonly tokens: Record<string, unknown>;
-  readonly accessToken: string;
-  readonly refreshToken: string | null;
-  readonly accountId: string | null;
-}
-
-function parseCodexAuthFile(
-  authPath: string,
-  auth: Record<string, unknown> | null,
-): CodexAuth | null {
-  if (!auth) return null;
-  const tokens = objectValue(auth?.tokens);
-  if (!tokens) return null;
-  const accessToken = stringValue(tokens?.access_token) ?? stringValue(tokens?.accessToken);
-  if (!accessToken) return null;
-  const accountId = stringValue(tokens?.account_id) ?? stringValue(tokens?.accountId);
-  const refreshToken = stringValue(tokens?.refresh_token) ?? stringValue(tokens?.refreshToken);
+function codexAppServerEnvironment(
+  codexHome: string,
+  environment?: ProviderInstanceEnvironment | undefined,
+  baseEnv: NodeJS.ProcessEnv = process.env,
+): NodeJS.ProcessEnv {
+  const sanitizedBaseEnv = codexUsageBaseEnvironment(baseEnv);
   return {
-    authPath,
-    auth,
-    tokens,
-    accessToken,
-    refreshToken,
-    accountId,
+    ...mergeProviderInstanceEnvironment(environment, sanitizedBaseEnv),
+    CODEX_HOME: codexHome,
   };
 }
 
-async function readCodexAuth(codexHome: string): Promise<CodexAuth | null> {
-  const authPath = NodePath.join(codexHome, "auth.json");
-  return parseCodexAuthFile(authPath, await readJsonFile(authPath));
-}
-
-async function refreshCodexAuth(auth: CodexAuth): Promise<CodexAuth | null> {
-  if (!auth.refreshToken) return null;
-  const payload = await fetchJson(
-    CODEX_REFRESH_URL,
-    {
-      Accept: "application/json",
-      "Content-Type": "application/json",
-      "User-Agent": "T3Code",
-    },
-    {
-      method: "POST",
-      body: JSON.stringify({
-        client_id: CODEX_OAUTH_CLIENT_ID,
-        grant_type: "refresh_token",
-        refresh_token: auth.refreshToken,
-        scope: "openid profile email",
-      }),
-    },
+function isCodexAuthOverrideEnvKey(key: string): boolean {
+  const normalized = key.toUpperCase();
+  return (
+    CODEX_AUTH_OVERRIDE_ENV_KEYS.has(normalized) ||
+    (normalized.startsWith("CODEX_") && normalized.includes("TOKEN")) ||
+    (normalized.startsWith("OPENAI_") &&
+      (normalized.includes("API_KEY") || normalized.includes("TOKEN"))) ||
+    (normalized.startsWith("AZURE_OPENAI_") &&
+      (normalized.includes("API_KEY") || normalized.includes("TOKEN")))
   );
-  const response = objectValue(payload);
-  if (!response) return null;
-
-  const accessToken = stringValue(response.access_token);
-  if (!accessToken) return null;
-  const refreshToken = stringValue(response.refresh_token) ?? auth.refreshToken;
-  const nextTokens: Record<string, unknown> = {
-    ...auth.tokens,
-    access_token: accessToken,
-    refresh_token: refreshToken,
-  };
-  const idToken = stringValue(response.id_token);
-  if (idToken) nextTokens.id_token = idToken;
-  const expiresIn = numberValue(response.expires_in);
-  if (expiresIn !== null) {
-    nextTokens.expires_at = Math.floor(Date.now() / 1000) + expiresIn;
-  }
-  const currentAuth = parseCodexAuthFile(auth.authPath, await readJsonFile(auth.authPath));
-  if (!currentAuth || currentAuth.accountId !== auth.accountId) return null;
-  if (currentAuth.refreshToken !== auth.refreshToken) return currentAuth;
-
-  const nextAuth = { ...auth.auth, tokens: nextTokens };
-  const wrote = await writeJsonFilePrivate(auth.authPath, nextAuth);
-  if (!wrote) return null;
-  return {
-    ...auth,
-    auth: nextAuth,
-    tokens: nextTokens,
-    accessToken,
-    refreshToken,
-  };
 }
 
-const codexUsageHeaders = (auth: Pick<CodexAuth, "accessToken" | "accountId">) => ({
-  Authorization: `Bearer ${auth.accessToken}`,
-  Accept: "application/json",
-  "User-Agent": "T3Code",
-  ...(auth.accountId ? { "ChatGPT-Account-Id": auth.accountId } : {}),
-});
-
-async function loadCodexUsage(codexHome: string): Promise<ParsedProviderUsage | null> {
-  const auth = await readCodexAuth(codexHome);
-  if (!auth) return null;
-  let response = await fetchJsonStatus(CODEX_USAGE_URL, codexUsageHeaders(auth));
-  if (response.status === 401) {
-    const refreshed = await refreshCodexAuth(auth);
-    if (!refreshed) return null;
-    response = await fetchJsonStatus(CODEX_USAGE_URL, codexUsageHeaders(refreshed));
+function codexUsageBaseEnvironment(baseEnv: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = { ...baseEnv };
+  for (const key of Object.keys(env)) {
+    if (isCodexAuthOverrideEnvKey(key)) {
+      delete env[key];
+    }
   }
-  return parseCodexUsageResponse(response.payload);
+  return env;
+}
+
+function writeCodexAppServerMessage(
+  child: NodeChildProcess.ChildProcess,
+  message: Record<string, unknown>,
+): void {
+  child.stdin?.write(`${JSON.stringify(message)}\n`);
+}
+
+function parseCodexAppServerLine(line: string): CodexAppServerResponse | null {
+  const trimmed = line.trim();
+  if (!trimmed) return null;
+  try {
+    const payload = JSON.parse(trimmed) as unknown;
+    return objectValue(payload) as CodexAppServerResponse | null;
+  } catch {
+    return null;
+  }
+}
+
+function codexAppServerMessageId(value: unknown): string | number | null {
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  return stringValue(value);
+}
+
+function writeCodexAppServerError(
+  child: NodeChildProcess.ChildProcess,
+  id: string | number,
+  message: string,
+): void {
+  writeCodexAppServerMessage(child, {
+    id,
+    error: {
+      code: -32601,
+      message,
+    },
+  });
+}
+
+async function terminateCodexAppServer(child: NodeChildProcess.ChildProcess): Promise<void> {
+  child.stdin?.end();
+  child.stdout?.destroy();
+  child.stderr?.destroy();
+  if (child.exitCode !== null || child.signalCode !== null) return;
+
+  const abort = new AbortController();
+  let onExit: (() => void) | undefined;
+  const exited = new Promise<void>((resolve) => {
+    onExit = () => resolve();
+    child.once("exit", onExit);
+  });
+  try {
+    child.kill("SIGTERM");
+    await Promise.race([
+      exited,
+      NodeTimersPromises.scheduler
+        .wait(CODEX_APP_SERVER_USAGE_FORCE_KILL_AFTER_MS, {
+          signal: abort.signal,
+        })
+        .then(() => {
+          if (child.exitCode === null && child.signalCode === null) {
+            child.kill("SIGKILL");
+          }
+        }),
+    ]);
+  } finally {
+    abort.abort();
+    if (onExit) child.off("exit", onExit);
+  }
+}
+
+async function withCodexAppServerUsageTimeout<T>(task: Promise<T>): Promise<T> {
+  const abort = new AbortController();
+  try {
+    return await Promise.race([
+      task,
+      NodeTimersPromises.scheduler
+        .wait(CODEX_APP_SERVER_USAGE_TIMEOUT_MS, { signal: abort.signal })
+        .then(() => {
+          throw new Error("Codex app-server usage probe timed out.");
+        }),
+    ]);
+  } finally {
+    abort.abort();
+  }
+}
+
+async function readCodexAppServerRateLimits(
+  source: UsageCredentialSource,
+): Promise<unknown | null> {
+  const env = codexAppServerEnvironment(source.home, source.environment);
+  const executable = source.executable ?? "codex";
+  const spawnCommand = await Effect.runPromise(
+    resolveSpawnCommand(executable, CODEX_APP_SERVER_ARGS, { env }),
+  );
+  const child = NodeChildProcess.spawn(spawnCommand.command, spawnCommand.args, {
+    cwd: process.cwd(),
+    env,
+    shell: spawnCommand.shell,
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+  child.stdin?.on("error", () => undefined);
+  child.stderr?.resume();
+
+  let nextRequestId = 0;
+  let stdoutBuffer = "";
+  const pending = new Map<
+    string,
+    {
+      readonly resolve: (value: unknown) => void;
+      readonly reject: (cause: Error) => void;
+    }
+  >();
+
+  const rejectPending = (cause: Error): void => {
+    for (const request of pending.values()) {
+      request.reject(cause);
+    }
+    pending.clear();
+  };
+
+  const handleLine = (line: string): void => {
+    const message = parseCodexAppServerLine(line);
+    const id = codexAppServerMessageId(message?.id);
+    if (id === null) return;
+    const method = stringValue(message?.method);
+    if (method) {
+      writeCodexAppServerError(child, id, `Method not found: ${method}`);
+      return;
+    }
+    const request = pending.get(String(id));
+    if (!request) return;
+    pending.delete(String(id));
+    if (message?.error !== undefined) {
+      request.reject(new Error("Codex app-server returned an error response."));
+      return;
+    }
+    request.resolve(message?.result ?? null);
+  };
+
+  child.stdout?.setEncoding("utf8");
+  child.stdout?.on("data", (chunk: string) => {
+    stdoutBuffer += chunk;
+    if (stdoutBuffer.length > CLI_MAX_BUFFER_BYTES) {
+      rejectPending(new Error("Codex app-server usage response exceeded the output limit."));
+      return;
+    }
+    for (;;) {
+      const newlineIndex = stdoutBuffer.indexOf("\n");
+      if (newlineIndex === -1) break;
+      const line = stdoutBuffer.slice(0, newlineIndex);
+      stdoutBuffer = stdoutBuffer.slice(newlineIndex + 1);
+      handleLine(line);
+    }
+  });
+  child.once("error", (cause) => rejectPending(cause));
+  child.once("exit", (code, signal) => {
+    rejectPending(new Error(`Codex app-server exited before usage was read: ${code ?? signal}`));
+  });
+
+  const request = (method: string, params?: unknown): Promise<unknown> => {
+    const id = ++nextRequestId;
+    return new Promise((resolve, reject) => {
+      pending.set(String(id), { resolve, reject });
+      try {
+        writeCodexAppServerMessage(child, {
+          id,
+          method,
+          ...(params === undefined ? {} : { params }),
+        });
+      } catch (cause) {
+        pending.delete(String(id));
+        reject(cause instanceof Error ? cause : new Error(String(cause)));
+      }
+    });
+  };
+
+  const notify = (method: string, params?: unknown): void => {
+    writeCodexAppServerMessage(child, {
+      method,
+      ...(params === undefined ? {} : { params }),
+    });
+  };
+
+  try {
+    const rateLimits = await withCodexAppServerUsageTimeout(
+      (async () => {
+        await request("initialize", {
+          clientInfo: {
+            name: "t3code_usage",
+            title: "T3 Code Usage",
+            version: "0.0.0",
+          },
+          capabilities: {
+            experimentalApi: true,
+          },
+        });
+        notify("initialized");
+        return await request("account/rateLimits/read");
+      })(),
+    );
+    return rateLimits;
+  } finally {
+    rejectPending(new Error("Codex app-server usage probe finished."));
+    await terminateCodexAppServer(child);
+  }
+}
+
+async function loadCodexUsage(source: UsageCredentialSource): Promise<ParsedProviderUsage | null> {
+  try {
+    return parseCodexRateLimitsResponse(await readCodexAppServerRateLimits(source));
+  } catch {
+    return null;
+  }
 }
 
 function isClaudeAuthOverrideEnvKey(key: string): boolean {
@@ -1087,9 +1287,7 @@ async function loadProviderUsage(
   const fetchedAt = new Date(now).toISOString();
   const tasks = scope.sources.map(async (source): Promise<ProviderUsage | null> => {
     const usage =
-      source.provider === "codex"
-        ? await loadCodexUsage(source.home)
-        : await loadClaudeUsage(source);
+      source.provider === "codex" ? await loadCodexUsage(source) : await loadClaudeUsage(source);
     if (!usage) return null;
     const includeInstanceLabel = (sourceCounts.get(source.provider) ?? 0) > 1;
     return {
@@ -1212,10 +1410,11 @@ export async function loadPlanUsageSnapshot(
 }
 
 export const __testing = {
+  CODEX_APP_SERVER_USAGE_TIMEOUT_MS,
   CLAUDE_CLI_USAGE_ARGS,
   CLAUDE_CLI_TIMEOUT_MS,
-  UPSTREAM_TIMEOUT_MS,
-  parseCodexUsageResponse,
+  codexAppServerEnvironment,
+  parseCodexRateLimitsResponse,
   parseClaudeUsageResponse,
   parseClaudeCliUsageText,
   parseClaudeCliResetAt,

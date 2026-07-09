@@ -13,6 +13,109 @@ import {
 
 import { __testing, loadPlanUsageSnapshot } from "./PlanUsage.ts";
 
+async function makeFakeCodexAppServer(input: {
+  readonly rateLimitsResponse: unknown;
+  readonly requiredEnv?: Readonly<Record<string, string>>;
+  readonly forbiddenEnv?: ReadonlyArray<string>;
+  readonly homeExists?: boolean;
+  readonly serverRequestMethod?: string | undefined;
+}): Promise<{
+  readonly binaryPath: string;
+  readonly homePath: string;
+  readonly requestsPath: string;
+}> {
+  const rootPath = await NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "t3-usage-codex-"));
+  const homePath = NodePath.join(rootPath, "codex-home");
+  if (input.homeExists !== false) {
+    await NodeFSP.mkdir(homePath, { recursive: true });
+  }
+  const requestsPath = NodePath.join(rootPath, "requests.jsonl");
+  const binaryPath = NodePath.join(rootPath, "codex-fake");
+  const script = `#!/usr/bin/env node
+const fs = require("node:fs");
+const readline = require("node:readline");
+
+if (!process.argv.slice(2).includes("app-server")) {
+  console.error("expected app-server argument");
+  process.exit(2);
+}
+
+const requiredEnv = ${JSON.stringify(input.requiredEnv ?? {})};
+const forbiddenEnv = ${JSON.stringify(input.forbiddenEnv ?? [])};
+for (const [key, value] of Object.entries(requiredEnv)) {
+  if (process.env[key] !== value) {
+    console.error(\`missing required env \${key}\`);
+    process.exit(3);
+  }
+}
+for (const key of forbiddenEnv) {
+  if (process.env[key] !== undefined) {
+    console.error(\`forbidden env \${key}\`);
+    process.exit(6);
+  }
+}
+if (process.env.CODEX_HOME !== ${JSON.stringify(homePath)}) {
+  console.error("unexpected CODEX_HOME");
+  process.exit(4);
+}
+
+const requestsPath = ${JSON.stringify(requestsPath)};
+const rateLimitsResponse = ${JSON.stringify(input.rateLimitsResponse)};
+const serverRequestMethod = ${JSON.stringify(input.serverRequestMethod ?? null)};
+let sawServerRequestResponse = serverRequestMethod === null;
+const write = (message) => process.stdout.write(JSON.stringify(message) + "\\n");
+const rl = readline.createInterface({ input: process.stdin });
+rl.on("line", (line) => {
+  const rpc = JSON.parse(line);
+  fs.appendFileSync(
+    requestsPath,
+    JSON.stringify({
+      id: rpc.id ?? null,
+      method: rpc.method ?? null,
+      params: rpc.params ?? null,
+      error: rpc.error ?? null
+    }) + "\\n"
+  );
+  if (rpc.id === "server-request-1" && rpc.error) {
+    sawServerRequestResponse = true;
+    return;
+  }
+  if (rpc.id && rpc.method === "initialize") {
+    if (serverRequestMethod) {
+      write({ id: "server-request-1", method: serverRequestMethod, params: {} });
+    }
+    write({
+      id: rpc.id,
+      result: {
+        userAgent: "codex-fake/0.0.0",
+        codexHome: process.env.CODEX_HOME,
+        platformFamily: "unix",
+        platformOs: "linux"
+      }
+    });
+    return;
+  }
+  if (rpc.method === "initialized") {
+    return;
+  }
+  if (rpc.id && rpc.method === "account/rateLimits/read") {
+    if (!sawServerRequestResponse) {
+      console.error("missing server request response");
+      process.exit(5);
+    }
+    write({ id: rpc.id, result: rateLimitsResponse });
+    process.exit(0);
+  }
+  if (rpc.id) {
+    write({ id: rpc.id, error: { message: "unexpected request" } });
+  }
+});
+`;
+  await NodeFSP.writeFile(binaryPath, script, { mode: 0o700 });
+  await NodeFSP.chmod(binaryPath, 0o700);
+  return { binaryPath, homePath, requestsPath };
+}
+
 async function makeFakeClaude(input: {
   readonly usageTexts: ReadonlyArray<string>;
   readonly usageDelaysMs?: ReadonlyArray<number>;
@@ -79,20 +182,257 @@ function fakeClaudeSettings(input: {
   };
 }
 
-describe("PlanUsage", () => {
-  it("maps Codex primary and weekly windows and ignores additional Spark limits", () => {
-    const result = __testing.parseCodexUsageResponse({
-      plan_type: "pro",
-      rate_limit: {
-        primary_window: { used_percent: 77, reset_at: 1783103404, limit_window_seconds: 18000 },
-        secondary_window: { used_percent: 59, reset_at: 1783419037, limit_window_seconds: 604800 },
+function fakeCodexSettings(input: {
+  readonly binaryPath: string;
+  readonly homePath: string;
+  readonly environment?: ProviderInstanceEnvironment;
+}): ServerSettings {
+  return {
+    ...DEFAULT_SERVER_SETTINGS,
+    providerInstances: {
+      [ProviderInstanceId.make("codex")]: {
+        driver: ProviderDriverKind.make("codex"),
+        config: {
+          binaryPath: input.binaryPath,
+          homePath: input.homePath,
+        },
+        environment: input.environment ?? [],
       },
-      additional_rate_limits: [{ limit_name: "GPT-5.3-Codex-Spark" }],
+    },
+  };
+}
+
+describe("PlanUsage", () => {
+  it("maps official Codex app-server primary, weekly, and individual limit windows", () => {
+    const result = __testing.parseCodexRateLimitsResponse({
+      rateLimits: {
+        planType: "pro",
+        primary: { usedPercent: 77, resetsAt: 1783103404, windowDurationMins: 300 },
+        secondary: { usedPercent: 59, resetsAt: 1783419037, windowDurationMins: 10080 },
+        individualLimit: {
+          limit: "100",
+          remainingPercent: 25,
+          resetsAt: 1783419037,
+          used: "75",
+        },
+        credits: {
+          balance: "42",
+          hasCredits: true,
+          unlimited: false,
+        },
+      },
     });
 
     expect(result?.plan).toBe("pro");
-    expect(result?.windows.map((window) => window.id)).toEqual(["codex-five-hour", "codex-weekly"]);
+    expect(result?.windows.map((window) => window.id)).toEqual([
+      "codex-five-hour",
+      "codex-weekly",
+      "codex-individual-limit",
+    ]);
     expect(result?.windows[0]?.resetAt).toBe("2026-07-03T18:30:04.000Z");
+    expect(result?.windows[2]).toMatchObject({
+      usedPercent: 75,
+      used: 75,
+      limit: 100,
+      resetAt: "2026-07-07T10:10:37.000Z",
+    });
+  });
+
+  it("omits Codex app-server windows that are absent for the current plan", () => {
+    const result = __testing.parseCodexRateLimitsResponse({
+      rateLimits: {
+        planType: "enterprise",
+        primary: null,
+        secondary: { usedPercent: 59, resetsAt: 1783419037, windowDurationMins: 10080 },
+      },
+    });
+
+    expect(result?.plan).toBe("enterprise");
+    expect(result?.windows.map((window) => window.id)).toEqual(["codex-weekly"]);
+  });
+
+  it("derives Codex primary window metadata from the app-server duration", () => {
+    const result = __testing.parseCodexRateLimitsResponse({
+      rateLimits: {
+        planType: "pro",
+        primary: { usedPercent: 6, resetsAt: 1783103404, windowDurationMins: 15 },
+      },
+    });
+
+    expect(result?.windows[0]).toMatchObject({
+      id: "codex-15-minute",
+      kind: "duration_15_minutes",
+      title: "Codex 15m",
+      usedPercent: 6,
+    });
+  });
+
+  it("maps Codex app-server multi-bucket rate limits", () => {
+    const result = __testing.parseCodexRateLimitsResponse({
+      rateLimits: {
+        planType: "pro",
+        primary: { usedPercent: 1, resetsAt: 1783103404 },
+      },
+      rateLimitsByLimitId: {
+        codex: {
+          limitId: "codex",
+          limitName: "Codex",
+          planType: "pro",
+          primary: { usedPercent: 22, resetsAt: 1783103404, windowDurationMins: 300 },
+          secondary: { usedPercent: 44, resetsAt: 1783419037, windowDurationMins: 10080 },
+        },
+        spark: {
+          limitId: "spark",
+          limitName: "Spark",
+          planType: "pro",
+          secondary: { usedPercent: 91, resetsAt: 1783419037, windowDurationMins: 10080 },
+        },
+      },
+    });
+
+    expect(result?.windows.map((window) => window.id)).toEqual([
+      "codex-codex-five-hour",
+      "codex-codex-weekly",
+      "codex-spark-weekly",
+    ]);
+    expect(result?.windows.map((window) => window.title)).toEqual([
+      "Codex 5h (Codex)",
+      "Codex weekly (Codex)",
+      "Codex weekly (Spark)",
+    ]);
+    expect(result?.windows.map((window) => window.usedPercent)).toEqual([22, 44, 91]);
+  });
+
+  it("reads Codex usage through the official app-server probe", async () => {
+    const now = Date.parse("2026-07-06T15:10:00.000Z");
+    const fake = await makeFakeCodexAppServer({
+      requiredEnv: {
+        HTTPS_PROXY: "http://proxy.example",
+      },
+      forbiddenEnv: ["CODEX_ACCESS_TOKEN"],
+      serverRequestMethod: "account/chatgptAuthTokens/refresh",
+      rateLimitsResponse: {
+        rateLimits: {
+          planType: "team",
+          primary: { usedPercent: 12, resetsAt: 1783103404, windowDurationMins: 300 },
+          secondary: { usedPercent: 34, resetsAt: 1783419037, windowDurationMins: 10080 },
+        },
+      },
+    });
+    await NodeFSP.writeFile(NodePath.join(fake.homePath, "auth.json"), "not-json\n", {
+      mode: 0o600,
+    });
+    const settings = fakeCodexSettings({
+      ...fake,
+      environment: [{ name: "HTTPS_PROXY", value: "http://proxy.example", sensitive: false }],
+    });
+    const previousCodexAccessToken = process.env.CODEX_ACCESS_TOKEN;
+    process.env.CODEX_ACCESS_TOKEN = "ambient-token";
+
+    const snapshot = await loadPlanUsageSnapshot(
+      { settings, providerInstanceId: ProviderInstanceId.make("codex") },
+      now,
+    ).finally(() => {
+      if (previousCodexAccessToken === undefined) {
+        delete process.env.CODEX_ACCESS_TOKEN;
+      } else {
+        process.env.CODEX_ACCESS_TOKEN = previousCodexAccessToken;
+      }
+    });
+
+    expect(snapshot.providers).toHaveLength(1);
+    expect(snapshot.providers[0]?.provider).toBe("codex");
+    expect(snapshot.providers[0]?.plan).toBe("team");
+    expect(snapshot.providers[0]?.windows.map((window) => window.id)).toEqual([
+      "codex:codex:codex-five-hour",
+      "codex:codex:codex-weekly",
+    ]);
+    expect(snapshot.providers[0]?.windows.map((window) => window.usedPercent)).toEqual([12, 34]);
+    const requests = (await NodeFSP.readFile(fake.requestsPath, "utf8"))
+      .trim()
+      .split("\n")
+      .map(
+        (line) =>
+          JSON.parse(line) as {
+            readonly id: string | number | null;
+            readonly method: string | null;
+            readonly params: unknown | null;
+            readonly error: { readonly code?: number; readonly message?: string } | null;
+          },
+      );
+    expect(requests.map((request) => request.method)).toEqual([
+      "initialize",
+      null,
+      "initialized",
+      "account/rateLimits/read",
+    ]);
+    expect(requests[0]?.params).toMatchObject({
+      capabilities: { experimentalApi: true },
+      clientInfo: { name: "t3code_usage" },
+    });
+    expect(requests[1]?.id).toBe("server-request-1");
+    expect(requests[1]?.error).toMatchObject({
+      code: -32601,
+      message: "Method not found: account/chatgptAuthTokens/refresh",
+    });
+    expect(requests[2]?.params).toBeNull();
+    expect(requests[3]?.params).toBeNull();
+  });
+
+  it("allows explicit Codex auth environment configured on the provider instance", async () => {
+    const now = Date.parse("2026-07-06T15:10:00.000Z");
+    const fake = await makeFakeCodexAppServer({
+      requiredEnv: {
+        CODEX_ACCESS_TOKEN: "provider-token",
+      },
+      rateLimitsResponse: {
+        rateLimits: {
+          planType: "team",
+          primary: { usedPercent: 12, resetsAt: 1783103404, windowDurationMins: 300 },
+        },
+      },
+    });
+    const settings = fakeCodexSettings({
+      ...fake,
+      environment: [{ name: "CODEX_ACCESS_TOKEN", value: "provider-token", sensitive: true }],
+    });
+    const previousCodexAccessToken = process.env.CODEX_ACCESS_TOKEN;
+    process.env.CODEX_ACCESS_TOKEN = "ambient-token";
+
+    const snapshot = await loadPlanUsageSnapshot(
+      { settings, providerInstanceId: ProviderInstanceId.make("codex") },
+      now,
+    ).finally(() => {
+      if (previousCodexAccessToken === undefined) {
+        delete process.env.CODEX_ACCESS_TOKEN;
+      } else {
+        process.env.CODEX_ACCESS_TOKEN = previousCodexAccessToken;
+      }
+    });
+
+    expect(snapshot.providers[0]?.windows.map((window) => window.usedPercent)).toEqual([12]);
+  });
+
+  it("starts Codex app-server when the selected home directory does not exist yet", async () => {
+    const now = Date.parse("2026-07-06T15:10:00.000Z");
+    const fake = await makeFakeCodexAppServer({
+      homeExists: false,
+      rateLimitsResponse: {
+        rateLimits: {
+          planType: "team",
+          primary: { usedPercent: 18, resetsAt: 1783103404, windowDurationMins: 300 },
+        },
+      },
+    });
+    await expect(NodeFSP.stat(fake.homePath)).rejects.toMatchObject({ code: "ENOENT" });
+    const settings = fakeCodexSettings(fake);
+
+    const snapshot = await loadPlanUsageSnapshot(
+      { settings, providerInstanceId: ProviderInstanceId.make("codex") },
+      now,
+    );
+
+    expect(snapshot.providers[0]?.windows.map((window) => window.usedPercent)).toEqual([18]);
   });
 
   it("maps Claude dynamic limits including scoped Fable weekly usage", () => {

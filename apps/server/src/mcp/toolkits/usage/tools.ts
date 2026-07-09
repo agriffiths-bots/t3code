@@ -24,7 +24,7 @@ export class GetUsageToolError extends Schema.TaggedErrorClass<GetUsageToolError
 
 export const GetUsageTool = Tool.make("t3_get_usage", {
   description:
-    "Return the current T3 Code plan-usage snapshot for Codex and Claude provider backends. Omitting providerInstanceId aggregates enabled Codex/Claude instances; passing providerInstanceId scopes the read to that configured backend. Codex usage is read from ChatGPT wham usage; Claude usage is read through the official Claude CLI usage path.",
+    "Return the current T3 Code plan-usage snapshot for Codex and Claude provider backends. Omitting providerInstanceId aggregates enabled Codex/Claude instances; passing providerInstanceId scopes the read to that configured backend. Codex usage is read through the official Codex app-server; Claude usage is read through the official Claude CLI usage path.",
   parameters: GetUsageInput,
   success: GetUsageOutput,
   failure: GetUsageToolError,
