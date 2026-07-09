@@ -330,14 +330,15 @@ cursorAdapterTestLayer("CursorAdapterLive", (it) => {
       const wrapperPath = yield* Effect.promise(() =>
         makeMockAgentWrapper({
           T3_ACP_PROMPT_RESPONSE_TEXT: "first response",
-          T3_ACP_LATE_FIRST_PROMPT_RESPONSE_TEXT: "late after first",
+          T3_ACP_LATE_FIRST_PROMPT_RESPONSE_CHUNKS: "late after| first",
           T3_ACP_LATE_FIRST_PROMPT_RESPONSE_DELAY_MS: "25",
         }),
       );
       yield* settings.updateSettings({ providers: { cursor: { binaryPath: wrapperPath } } });
 
-      const lateDeltaReady = yield* Deferred.make<ProviderRuntimeEvent>();
+      const lateDeltasReady = yield* Deferred.make<ReadonlyArray<ProviderRuntimeEvent>>();
       const lateCompletionReady = yield* Deferred.make<ProviderRuntimeEvent>();
+      const lateDeltas: Array<ProviderRuntimeEvent> = [];
       let lateItemId: string | undefined;
 
       const runtimeEventsFiber = yield* Stream.runForEach(adapter.streamEvents, (event) =>
@@ -345,9 +346,15 @@ cursorAdapterTestLayer("CursorAdapterLive", (it) => {
           if (String(event.threadId) !== String(threadId)) {
             return;
           }
-          if (event.type === "content.delta" && event.payload.delta === "late after first") {
-            lateItemId = event.itemId === undefined ? undefined : String(event.itemId);
-            yield* Deferred.succeed(lateDeltaReady, event).pipe(Effect.ignore);
+          if (
+            event.type === "content.delta" &&
+            (event.payload.delta === "late after" || event.payload.delta === " first")
+          ) {
+            lateItemId ??= event.itemId === undefined ? undefined : String(event.itemId);
+            lateDeltas.push(event);
+            if (lateDeltas.length === 2) {
+              yield* Deferred.succeed(lateDeltasReady, [...lateDeltas]).pipe(Effect.ignore);
+            }
             return;
           }
           if (
@@ -374,11 +381,23 @@ cursorAdapterTestLayer("CursorAdapterLive", (it) => {
         attachments: [],
       });
 
-      const lateDelta = yield* Deferred.await(lateDeltaReady).pipe(Effect.timeout("2 seconds"));
-      assert.equal(lateDelta.type, "content.delta");
-      if (lateDelta.type === "content.delta") {
-        assert.equal(String(lateDelta.turnId), String(firstTurn.turnId));
+      const lateDeltasResult = yield* Deferred.await(lateDeltasReady).pipe(
+        Effect.timeout("2 seconds"),
+      );
+      assert.deepStrictEqual(
+        lateDeltasResult.map((event) =>
+          event.type === "content.delta" ? event.payload.delta : "",
+        ),
+        ["late after", " first"],
+      );
+      for (const lateDelta of lateDeltasResult) {
+        assert.equal(lateDelta.type, "content.delta");
+        if (lateDelta.type === "content.delta") {
+          assert.equal(String(lateDelta.turnId), String(firstTurn.turnId));
+          assert.equal(String(lateDelta.itemId), lateItemId);
+        }
       }
+      yield* TestClock.adjust("25 millis");
 
       const lateCompletion = yield* Deferred.await(lateCompletionReady).pipe(
         Effect.timeout("2 seconds"),
@@ -386,6 +405,7 @@ cursorAdapterTestLayer("CursorAdapterLive", (it) => {
       assert.equal(lateCompletion.type, "item.completed");
       if (lateCompletion.type === "item.completed") {
         assert.equal(String(lateCompletion.turnId), String(firstTurn.turnId));
+        assert.equal(String(lateCompletion.itemId), lateItemId);
       }
 
       yield* Fiber.interrupt(runtimeEventsFiber);

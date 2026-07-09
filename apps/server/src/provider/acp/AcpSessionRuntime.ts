@@ -300,6 +300,9 @@ export const make = (
       Option.Option<Fiber.Fiber<EffectAcpSchema.PromptResponse, EffectAcpErrors.AcpError>>
     >(Option.none());
     const postPromptSettlingRef = yield* Ref.make(false);
+    const postPromptCloseFiberRef = yield* Ref.make<Option.Option<Fiber.Fiber<void, never>>>(
+      Option.none(),
+    );
     const sessionLoadGateRef = yield* Ref.make<Option.Option<SessionLoadGate>>(Option.none());
 
     const logRequest = (event: AcpSessionRequestLogEvent) =>
@@ -332,6 +335,29 @@ export const make = (
           ),
         ),
       );
+
+    const cancelPostPromptSegmentClose = Effect.gen(function* () {
+      const existing = yield* Ref.get(postPromptCloseFiberRef);
+      if (Option.isSome(existing)) {
+        yield* Fiber.interrupt(existing.value).pipe(Effect.ignore);
+        yield* Ref.set(postPromptCloseFiberRef, Option.none());
+      }
+    });
+
+    const schedulePostPromptSegmentClose = Effect.gen(function* () {
+      yield* cancelPostPromptSegmentClose;
+      const fiber = yield* Effect.gen(function* () {
+        yield* Effect.sleep("25 millis");
+        yield* sessionUpdateSemaphore.withPermit(
+          closeActiveAssistantSegment({
+            queue: eventQueue,
+            assistantSegmentRef,
+          }),
+        );
+        yield* Ref.set(postPromptCloseFiberRef, Option.none());
+      }).pipe(Effect.forkIn(runtimeScope));
+      yield* Ref.set(postPromptCloseFiberRef, Option.some(fiber));
+    });
 
     const spawnCommand = yield* resolveSpawnCommand(
       options.spawn.command,
@@ -435,6 +461,7 @@ export const make = (
             toolCallsRef,
             assistantSegmentRef,
             postPromptSettlingRef,
+            schedulePostPromptSegmentClose,
             params: notification,
             eventScope,
           }),
@@ -709,6 +736,7 @@ export const make = (
           toolCallsRef,
           assistantSegmentRef,
           postPromptSettlingRef,
+          schedulePostPromptSegmentClose,
           params: notification,
           eventScope,
         });
@@ -803,6 +831,7 @@ export const make = (
         promptSerializationSemaphore.withPermit(
           Effect.gen(function* () {
             const started = yield* getStartedState;
+            yield* cancelPostPromptSegmentClose;
             yield* Ref.set(postPromptSettlingRef, false);
             yield* closeActiveAssistantSegment({
               queue: eventQueue,
@@ -930,6 +959,7 @@ const handleSessionUpdate = ({
   toolCallsRef,
   assistantSegmentRef,
   postPromptSettlingRef,
+  schedulePostPromptSegmentClose,
   params,
   eventScope,
 }: {
@@ -938,6 +968,7 @@ const handleSessionUpdate = ({
   readonly toolCallsRef: Ref.Ref<Map<string, AcpToolCallState>>;
   readonly assistantSegmentRef: Ref.Ref<AcpAssistantSegmentState>;
   readonly postPromptSettlingRef: Ref.Ref<boolean>;
+  readonly schedulePostPromptSegmentClose: Effect.Effect<void>;
   readonly params: EffectAcpSchema.SessionNotification;
   readonly eventScope: unknown;
 }): Effect.Effect<void> =>
@@ -1008,10 +1039,7 @@ const handleSessionUpdate = ({
     }
     const postPromptSettling = yield* Ref.get(postPromptSettlingRef);
     if (postPromptSettling) {
-      yield* closeActiveAssistantSegment({
-        queue,
-        assistantSegmentRef,
-      });
+      yield* schedulePostPromptSegmentClose;
     }
   });
 
