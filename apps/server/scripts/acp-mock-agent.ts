@@ -26,6 +26,8 @@ const hangPromptForever = process.env.T3_ACP_HANG_PROMPT_FOREVER === "1";
 const hangFirstPromptForever = process.env.T3_ACP_HANG_FIRST_PROMPT_FOREVER === "1";
 const emitLateUpdateAfterCancel = process.env.T3_ACP_EMIT_LATE_UPDATE_AFTER_CANCEL === "1";
 const exitAfterPromptReturn = process.env.T3_ACP_EXIT_AFTER_PROMPT_RETURN === "1";
+const emitLateCursorExtensionAfterCancel =
+  process.env.T3_ACP_EMIT_LATE_CURSOR_EXTENSION_AFTER_CANCEL === "1";
 const omitXAiPromptCompleteStopReason =
   process.env.T3_ACP_OMIT_XAI_PROMPT_COMPLETE_STOP_REASON === "1";
 const failLoadSession = process.env.T3_ACP_FAIL_LOAD_SESSION === "1";
@@ -35,6 +37,7 @@ const emitLoadReplay = process.env.T3_ACP_EMIT_LOAD_REPLAY === "1";
 const emitLoadReplayMultiSegment = process.env.T3_ACP_EMIT_LOAD_REPLAY_MULTI_SEGMENT === "1";
 const emitLoadReplayLiveContinuation =
   process.env.T3_ACP_EMIT_LOAD_REPLAY_LIVE_CONTINUATION === "1";
+const emitLoadPendingAskQuestion = process.env.T3_ACP_EMIT_LOAD_PENDING_ASK_QUESTION === "1";
 const loadReplayLiveContinuationDelayMs = Number(
   process.env.T3_ACP_LOAD_REPLAY_LIVE_CONTINUATION_DELAY_MS ?? "20",
 );
@@ -51,6 +54,9 @@ const failSetConfigOption = process.env.T3_ACP_FAIL_SET_CONFIG_OPTION === "1";
 const exitOnSetConfigOption = process.env.T3_ACP_EXIT_ON_SET_CONFIG_OPTION === "1";
 const promptResponseText = process.env.T3_ACP_PROMPT_RESPONSE_TEXT;
 const promptDelayMs = Number(process.env.T3_ACP_PROMPT_DELAY_MS ?? "0");
+const toolCallAfterPermissionDelayMs = Number(
+  process.env.T3_ACP_TOOL_CALL_AFTER_PERMISSION_DELAY_MS ?? "0",
+);
 const firstPromptDelayMs =
   process.env.T3_ACP_FIRST_PROMPT_DELAY_MS === undefined
     ? undefined
@@ -463,6 +469,33 @@ const program = Effect.gen(function* () {
           configOptions: configOptions(),
         };
       }
+      if (emitLoadPendingAskQuestion) {
+        yield* Effect.forkIn(
+          Effect.gen(function* () {
+            yield* Effect.sleep("10 millis");
+            yield* agent.client.extRequest("cursor/ask_question", {
+              toolCallId: "load-ask-question-tool-call-1",
+              title: "Question",
+              questions: [
+                {
+                  id: "scope",
+                  prompt: "Which scope?",
+                  options: [
+                    { id: "workspace", label: "Workspace" },
+                    { id: "session", label: "Session" },
+                  ],
+                },
+              ],
+            });
+          }),
+          programScope,
+        );
+        return {
+          modes: modeState(),
+          models: modelState(),
+          configOptions: configOptions(),
+        };
+      }
       if (hangLoadSessionAfterReplay || delayLoadSessionAfterReplay) {
         emitLoadReplayNotifications(requestedSessionId);
         yield* agent.client.sessionUpdate({
@@ -563,6 +596,16 @@ const program = Effect.gen(function* () {
               sessionUpdate: "agent_message_chunk",
               content: { type: "text", text: "late after cancel" },
             },
+          });
+        });
+      }
+      if (emitLateCursorExtensionAfterCancel) {
+        yield* Effect.sleep("50 millis");
+        yield* Effect.sync(() => {
+          writeJsonRpcNotification("cursor/update_todos", {
+            toolCallId: "late-cursor-extension-after-cancel",
+            todos: [{ content: "late extension todo after cancel", status: "in_progress" }],
+            merge: false,
           });
         });
       }
@@ -818,6 +861,9 @@ const program = Effect.gen(function* () {
         const cancelled =
           cancelledSessions.delete(requestedSessionId) ||
           permission.outcome.outcome === "cancelled";
+        if (Number.isFinite(toolCallAfterPermissionDelayMs) && toolCallAfterPermissionDelayMs > 0) {
+          yield* Effect.sleep(`${toolCallAfterPermissionDelayMs} millis`);
+        }
 
         yield* agent.client.sessionUpdate({
           sessionId: requestedSessionId,

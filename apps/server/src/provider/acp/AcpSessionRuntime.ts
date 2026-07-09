@@ -194,10 +194,16 @@ export class AcpSessionRuntime extends Context.Service<
       payload: Omit<EffectAcpSchema.PromptRequest, "sessionId">,
     ) => Effect.Effect<EffectAcpSchema.PromptResponse, EffectAcpErrors.AcpError>;
     /**
-     * Sends a real ACP `session/cancel` notification for the active session.
+     * Sends `session/cancel` and releases the local active prompt waiter.
      * @see https://agentclientprotocol.com/protocol/schema#session/cancel
      */
     readonly cancel: Effect.Effect<void, EffectAcpErrors.AcpError>;
+    /**
+     * Sends `session/cancel` without interrupting the active prompt waiter.
+     * Use this when a pending client interaction can settle the prompt naturally;
+     * callers can then keep suppression tied to the prompt's real completion.
+     */
+    readonly requestCancel: Effect.Effect<void, EffectAcpErrors.AcpError>;
     /**
      * Selects the active mode through the negotiated `mode` configuration option.
      * This is a no-op when the requested mode is already active.
@@ -816,10 +822,13 @@ export const make = (
             if (Option.isSome(activePromptFiber)) {
               yield* Fiber.interrupt(activePromptFiber.value).pipe(Effect.ignore);
             }
-            yield* acp.agent
-              .cancel({ sessionId: started.sessionId })
-              .pipe(Effect.ignore, Effect.forkIn(runtimeScope));
+            yield* acp.agent.cancel({ sessionId: started.sessionId }).pipe(Effect.ignore);
           }),
+        ),
+      ),
+      requestCancel: getStartedState.pipe(
+        Effect.flatMap((started) =>
+          acp.agent.cancel({ sessionId: started.sessionId }).pipe(Effect.ignore),
         ),
       ),
       setMode: (modeId) =>

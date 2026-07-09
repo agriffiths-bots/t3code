@@ -607,7 +607,65 @@ cursorAdapterTestLayer("CursorAdapterLive", (it) => {
       assert.notEqual(String(nextTurn.turnId), String(activeTurnId));
 
       yield* adapter.stopSession(threadId);
-    }),
+    }).pipe(TestClock.withLive),
+  );
+
+  it.effect("unblocks follow-up sends after interrupting a resumed pending user input", () =>
+    Effect.gen(function* () {
+      const adapter = yield* CursorAdapter;
+      const settings = yield* ServerSettingsService;
+      const threadId = ThreadId.make("cursor-resume-pending-input-interrupt");
+      const activeTurnId = TurnId.make("turn-cursor-resume-pending-input");
+
+      const wrapperPath = yield* Effect.promise(() =>
+        makeMockAgentWrapper({
+          T3_ACP_EMIT_LOAD_PENDING_ASK_QUESTION: "1",
+        }),
+      );
+      yield* settings.updateSettings({ providers: { cursor: { binaryPath: wrapperPath } } });
+
+      const userInputRequested =
+        yield* Deferred.make<Extract<ProviderRuntimeEvent, { type: "user-input.requested" }>>();
+      const runtimeEventsFiber = yield* Stream.runForEach(adapter.streamEvents, (event) => {
+        if (String(event.threadId) !== String(threadId) || event.type !== "user-input.requested") {
+          return Effect.void;
+        }
+        return Deferred.succeed(userInputRequested, event).pipe(Effect.ignore);
+      }).pipe(Effect.forkChild);
+
+      yield* adapter.startSession({
+        threadId,
+        provider: ProviderDriverKind.make("cursor"),
+        cwd: process.cwd(),
+        runtimeMode: "full-access",
+        modelSelection: { instanceId: ProviderInstanceId.make("cursor"), model: "default" },
+        resumeCursor: {
+          schemaVersion: 1,
+          sessionId: "mock-session-1",
+        },
+        activeTurnId,
+      });
+
+      yield* Deferred.await(userInputRequested).pipe(Effect.timeout("2 seconds"));
+
+      yield* adapter.interruptTurn(threadId).pipe(Effect.timeout("2 seconds"));
+      const nextTurn = yield* adapter
+        .sendTurn({
+          threadId,
+          input: "start fresh after resumed input interrupt",
+          attachments: [],
+        })
+        .pipe(Effect.timeout("2 seconds"));
+      assert.notEqual(String(nextTurn.turnId), String(activeTurnId));
+
+      const sessions = yield* adapter.listSessions();
+      const session = sessions.find((entry) => entry.threadId === threadId);
+      assert.equal(session?.status, "ready");
+      assert.equal(session?.activeTurnId, undefined);
+
+      yield* Fiber.interrupt(runtimeEventsFiber);
+      yield* adapter.stopSession(threadId);
+    }).pipe(TestClock.withLive),
   );
 
   it.effect("binds session/load live continuations to the resumed active turn", () =>
@@ -1444,8 +1502,196 @@ cursorAdapterTestLayer("CursorAdapterLive", (it) => {
       assert.isTrue(requests.some(isCancelledApprovalResponse));
 
       yield* adapter.stopSession(threadId);
-    }),
+    }).pipe(TestClock.withLive),
   );
+
+  it.effect("drops late ACP notifications after a turn is cancelled", () =>
+    Effect.gen(function* () {
+      const adapter = yield* CursorAdapter;
+      const serverSettings = yield* ServerSettingsService;
+      const threadId = ThreadId.make("cursor-drop-late-cancelled-notifications");
+      const wrapperPath = yield* Effect.promise(() =>
+        makeMockAgentWrapper({
+          T3_ACP_EMIT_TOOL_CALLS: "1",
+          T3_ACP_EMIT_LATE_UPDATE_AFTER_CANCEL: "1",
+          T3_ACP_EMIT_LATE_CURSOR_EXTENSION_AFTER_CANCEL: "1",
+        }),
+      );
+      yield* serverSettings.updateSettings({ providers: { cursor: { binaryPath: wrapperPath } } });
+
+      const runtimeEvents: ProviderRuntimeEvent[] = [];
+      const requestOpened =
+        yield* Deferred.make<Extract<ProviderRuntimeEvent, { type: "request.opened" }>>();
+      const turnCompleted =
+        yield* Deferred.make<Extract<ProviderRuntimeEvent, { type: "turn.completed" }>>();
+      let interrupted = false;
+      const runtimeEventsFiber = yield* Stream.runForEach(adapter.streamEvents, (event) =>
+        Effect.gen(function* () {
+          if (String(event.threadId) !== String(threadId)) {
+            return;
+          }
+          runtimeEvents.push(event);
+          if (event.type === "request.opened" && !interrupted) {
+            interrupted = true;
+            yield* Deferred.succeed(requestOpened, event).pipe(Effect.ignore);
+            yield* adapter.interruptTurn(threadId);
+            return;
+          }
+          if (event.type === "turn.completed") {
+            yield* Deferred.succeed(turnCompleted, event).pipe(Effect.ignore);
+          }
+        }),
+      ).pipe(Effect.forkChild);
+
+      yield* adapter.startSession({
+        threadId,
+        provider: ProviderDriverKind.make("cursor"),
+        cwd: process.cwd(),
+        runtimeMode: "approval-required",
+        modelSelection: { instanceId: ProviderInstanceId.make("cursor"), model: "default" },
+      });
+
+      const sendTurnFiber = yield* adapter
+        .sendTurn({ threadId, input: "cancel before the late update", attachments: [] })
+        .pipe(Effect.forkChild);
+      const opened = yield* Deferred.await(requestOpened).pipe(Effect.timeout("2 seconds"));
+      const completed = yield* Deferred.await(turnCompleted).pipe(Effect.timeout("2 seconds"));
+      yield* Fiber.join(sendTurnFiber).pipe(Effect.timeout("2 seconds"));
+      yield* Effect.sleep("150 millis");
+
+      assert.equal(completed.type, "turn.completed");
+      if (completed.type === "turn.completed") {
+        assert.equal(completed.payload.state, "cancelled");
+        assert.equal(completed.payload.stopReason, "cancelled");
+      }
+
+      const requestOpenedIndex = runtimeEvents.indexOf(opened);
+      const cancelledIndex = runtimeEvents.findIndex(
+        (event) =>
+          event.type === "turn.completed" &&
+          String(event.threadId) === String(threadId) &&
+          String(event.turnId) === String(completed.turnId) &&
+          event.payload.state === "cancelled",
+      );
+      const turnOutputTypes = new Set([
+        "content.delta",
+        "item.started",
+        "item.updated",
+        "item.completed",
+        "turn.plan.updated",
+      ]);
+      const outputAfterCancellation = runtimeEvents
+        .slice(cancelledIndex + 1)
+        .filter(
+          (event) => String(event.threadId) === String(threadId) && turnOutputTypes.has(event.type),
+        );
+
+      assert.isAtLeast(requestOpenedIndex, 0);
+      assert.isAtLeast(cancelledIndex, 0);
+      assert.deepEqual(
+        runtimeEvents
+          .slice(requestOpenedIndex + 1, cancelledIndex)
+          .filter(
+            (event) =>
+              String(event.threadId) === String(threadId) && turnOutputTypes.has(event.type),
+          ),
+        [],
+      );
+      assert.deepEqual(outputAfterCancellation, []);
+      assert.isFalse(
+        runtimeEvents.some(
+          (event) =>
+            event.type === "content.delta" &&
+            (event.payload.delta === "hello from mock" ||
+              event.payload.delta === "late after cancel"),
+        ),
+      );
+
+      yield* Fiber.interrupt(runtimeEventsFiber);
+      yield* adapter.stopSession(threadId);
+    }).pipe(TestClock.withLive),
+  );
+
+  it.effect("keeps cancelled prompt output suppressed when a follow-up send starts", () =>
+    Effect.gen(function* () {
+      const adapter = yield* CursorAdapter;
+      const serverSettings = yield* ServerSettingsService;
+      const threadId = ThreadId.make("cursor-drop-cancelled-output-before-follow-up");
+      const wrapperPath = yield* Effect.promise(() =>
+        makeMockAgentWrapper({
+          T3_ACP_EMIT_TOOL_CALLS: "1",
+          T3_ACP_EMIT_LATE_UPDATE_AFTER_CANCEL: "1",
+          T3_ACP_TOOL_CALL_AFTER_PERMISSION_DELAY_MS: "400",
+        }),
+      );
+      yield* serverSettings.updateSettings({ providers: { cursor: { binaryPath: wrapperPath } } });
+
+      const runtimeEvents: ProviderRuntimeEvent[] = [];
+      const requestOpened =
+        yield* Deferred.make<Extract<ProviderRuntimeEvent, { type: "request.opened" }>>();
+      const cancelledTurnCompleted =
+        yield* Deferred.make<Extract<ProviderRuntimeEvent, { type: "turn.completed" }>>();
+      let sawRequest = false;
+      const runtimeEventsFiber = yield* Stream.runForEach(adapter.streamEvents, (event) =>
+        Effect.gen(function* () {
+          if (String(event.threadId) !== String(threadId)) {
+            return;
+          }
+          runtimeEvents.push(event);
+          if (event.type === "request.opened" && !sawRequest) {
+            sawRequest = true;
+            yield* Deferred.succeed(requestOpened, event).pipe(Effect.ignore);
+          }
+          if (event.type === "turn.completed" && event.payload.state === "cancelled") {
+            yield* Deferred.succeed(cancelledTurnCompleted, event).pipe(Effect.ignore);
+          }
+        }),
+      ).pipe(Effect.forkChild);
+
+      yield* adapter.startSession({
+        threadId,
+        provider: ProviderDriverKind.make("cursor"),
+        cwd: process.cwd(),
+        runtimeMode: "approval-required",
+        modelSelection: { instanceId: ProviderInstanceId.make("cursor"), model: "default" },
+      });
+
+      const firstSendFiber = yield* adapter
+        .sendTurn({ threadId, input: "cancel before follow-up", attachments: [] })
+        .pipe(Effect.forkChild);
+      const opened = yield* Deferred.await(requestOpened).pipe(Effect.timeout("2 seconds"));
+      const interruptFiber = yield* adapter.interruptTurn(threadId).pipe(Effect.forkChild);
+      yield* Effect.sleep("10 millis");
+      const followUpFiber = yield* adapter
+        .sendTurn({ threadId, input: "follow up while cancel unwinds", attachments: [] })
+        .pipe(Effect.forkChild);
+
+      yield* Fiber.join(interruptFiber).pipe(Effect.timeout("2 seconds"));
+      yield* Deferred.await(cancelledTurnCompleted).pipe(Effect.timeout("2 seconds"));
+      yield* Fiber.join(firstSendFiber).pipe(Effect.timeout("2 seconds"));
+
+      const requestOpenedIndex = runtimeEvents.indexOf(opened);
+      assert.isAtLeast(requestOpenedIndex, 0);
+      const leakedCancelledDeltas = runtimeEvents
+        .slice(requestOpenedIndex + 1)
+        .flatMap((event) =>
+          event.type === "content.delta" &&
+          (event.payload.delta === "hello from mock" || event.payload.delta === "late after cancel")
+            ? [`${event.payload.delta}:${String(event.turnId)}`]
+            : [],
+        );
+      assert.deepEqual(
+        leakedCancelledDeltas,
+        [],
+        `cancelled prompt deltas leaked: ${leakedCancelledDeltas.join(", ")}`,
+      );
+
+      yield* Fiber.interrupt(followUpFiber);
+      yield* Fiber.interrupt(runtimeEventsFiber);
+      yield* adapter.stopSession(threadId);
+    }).pipe(TestClock.withLive),
+  );
+
   it.effect("stopping a session settles pending approval waits", () =>
     Effect.gen(function* () {
       const adapter = yield* CursorAdapter;
@@ -1573,7 +1819,7 @@ cursorAdapterTestLayer("CursorAdapterLive", (it) => {
 
       assert.equal(yield* adapter.hasSession(threadId), true);
       yield* adapter.stopSession(threadId);
-    }),
+    }).pipe(TestClock.withLive),
   );
 
   it.effect("broadcasts runtime events to multiple stream consumers", () =>
