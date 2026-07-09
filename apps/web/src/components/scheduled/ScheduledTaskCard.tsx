@@ -33,6 +33,8 @@ export interface ScheduledTaskCardProps {
   readonly threadTitle: string | null;
   /** Joined client-side: "project · branch" workspace meta line. */
   readonly workspaceLabel: string | null;
+  /** Renderer-facing backend/environment label, e.g. "Windows" or "WSL (Ubuntu)". */
+  readonly environmentLabel: string | null;
   readonly overdue: boolean;
   readonly lastStatusFailed: boolean;
 }
@@ -55,6 +57,7 @@ export function ScheduledTaskCard({
   task,
   threadTitle,
   workspaceLabel,
+  environmentLabel,
   overdue,
   lastStatusFailed,
 }: ScheduledTaskCardProps) {
@@ -141,6 +144,8 @@ export function ScheduledTaskCard({
     <Card
       className="px-4 py-3.5"
       data-testid={`scheduled-task-card-${task.taskId}`}
+      data-environment-id={environmentId}
+      data-environment-label={environmentLabel ?? undefined}
       data-overdue={overdue ? "true" : undefined}
       data-enabled={task.enabled ? "true" : "false"}
     >
@@ -150,6 +155,16 @@ export function ScheduledTaskCard({
         <div className="flex min-w-0 flex-1 flex-col gap-1.5">
           <div className="flex min-w-0 flex-wrap items-center gap-2">
             <CardFrameTitle className="min-w-0 truncate">{title}</CardFrameTitle>
+            {environmentLabel ? (
+              <Badge
+                variant="outline"
+                size="sm"
+                className="max-w-40 overflow-hidden text-ellipsis"
+                title={`Backend: ${environmentLabel}`}
+              >
+                {environmentLabel}
+              </Badge>
+            ) : null}
             {isCron && task.cronExpr ? (
               <Tooltip>
                 <TooltipTrigger

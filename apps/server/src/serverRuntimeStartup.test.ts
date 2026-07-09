@@ -1,18 +1,36 @@
 import * as NodeServices from "@effect/platform-node/NodeServices";
-import { DEFAULT_MODEL, ProjectId, ProviderInstanceId, ThreadId } from "@t3tools/contracts";
+import {
+  DEFAULT_MODEL,
+  EnvironmentId,
+  ProjectId,
+  ProviderInstanceId,
+  ThreadId,
+} from "@t3tools/contracts";
 import { assert, it } from "@effect/vitest";
 import * as Crypto from "effect/Crypto";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
+import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as PlatformError from "effect/PlatformError";
 import * as Ref from "effect/Ref";
 import * as Stream from "effect/Stream";
+import { HttpServer } from "effect/unstable/http";
 
+import * as EnvironmentAuth from "./auth/EnvironmentAuth.ts";
 import * as ServerConfig from "./config.ts";
+import * as ServerEnvironment from "./environment/ServerEnvironment.ts";
+import * as Keybindings from "./keybindings.ts";
+import * as ServerLifecycleEvents from "./serverLifecycleEvents.ts";
+import * as ServerSettings from "./serverSettings.ts";
+import * as ChildThreadCoordinator from "./orchestration/Services/ChildThreadCoordinator.ts";
 import * as OrchestrationEngine from "./orchestration/Services/OrchestrationEngine.ts";
+import * as OrchestrationReactor from "./orchestration/Services/OrchestrationReactor.ts";
 import * as ProjectionSnapshotQuery from "./orchestration/Services/ProjectionSnapshotQuery.ts";
+import * as ScheduledTasksReactor from "./orchestration/Services/ScheduledTasksReactor.ts";
+import * as ExternalLauncher from "./process/externalLauncher.ts";
+import * as ProviderSessionReaper from "./provider/Services/ProviderSessionReaper.ts";
 import * as AnalyticsService from "./telemetry/AnalyticsService.ts";
 import * as ServerRuntimeStartup from "./serverRuntimeStartup.ts";
 
@@ -66,6 +84,142 @@ it.effect("enqueueCommand fails queued work when readiness fails", () =>
 
       const error = yield* Effect.flip(Fiber.join(queuedCommandFiber));
       assert.equal(error.message, "Server runtime startup failed before command readiness.");
+    }),
+  ),
+);
+
+it.effect("desktop startup starts scheduled tasks reactor before command readiness", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const reactorStarts = yield* Ref.make<ReadonlyArray<string>>([]);
+      const pushReactorStart = (name: string) =>
+        Ref.update(reactorStarts, (current) => [...current, name]);
+      const environmentId = EnvironmentId.make("env-desktop-wsl-startup-test");
+      const descriptor = {
+        environmentId,
+        label: "WSL Ubuntu",
+        platform: { os: "linux", arch: "x64" },
+        serverVersion: "0.0.0-test",
+        capabilities: { repositoryIdentity: false },
+      } as const;
+
+      const startup = yield* ServerRuntimeStartup.make.pipe(
+        Effect.provide(
+          Layer.mergeAll(
+            ServerConfig.layer({
+              logLevel: "Error",
+              traceMinLevel: "Info",
+              traceTimingEnabled: true,
+              traceBatchWindowMs: 200,
+              traceMaxBytes: 10 * 1024 * 1024,
+              traceMaxFiles: 10,
+              otlpTracesUrl: undefined,
+              otlpMetricsUrl: undefined,
+              otlpExportIntervalMs: 10_000,
+              otlpServiceName: "t3-server",
+              mode: "desktop",
+              port: 3774,
+              host: "0.0.0.0",
+              cwd: "/tmp/startup-project",
+              baseDir: "/tmp/t3-startup-test",
+              stateDir: "/tmp/t3-startup-test/userdata",
+              dbPath: "/tmp/t3-startup-test/userdata/state.sqlite",
+              keybindingsConfigPath: "/tmp/t3-startup-test/userdata/keybindings.json",
+              settingsPath: "/tmp/t3-startup-test/userdata/settings.json",
+              providerStatusCacheDir: "/tmp/t3-startup-test/caches",
+              worktreesDir: "/tmp/t3-startup-test/worktrees",
+              attachmentsDir: "/tmp/t3-startup-test/userdata/attachments",
+              logsDir: "/tmp/t3-startup-test/userdata/logs",
+              serverLogPath: "/tmp/t3-startup-test/userdata/logs/server.log",
+              serverTracePath: "/tmp/t3-startup-test/userdata/logs/server.trace.ndjson",
+              providerLogsDir: "/tmp/t3-startup-test/userdata/logs/provider",
+              providerEventLogPath: "/tmp/t3-startup-test/userdata/logs/provider/events.log",
+              terminalLogsDir: "/tmp/t3-startup-test/userdata/logs/terminals",
+              anonymousIdPath: "/tmp/t3-startup-test/userdata/anonymous-id",
+              environmentIdPath: "/tmp/t3-startup-test/userdata/environment-id",
+              serverRuntimeStatePath: "/tmp/t3-startup-test/userdata/server-runtime.json",
+              subagentPeersPath: "/tmp/t3-startup-test/subagent-peers.json",
+              secretsDir: "/tmp/t3-startup-test/userdata/secrets",
+              staticDir: undefined,
+              devUrl: undefined,
+              hostedAppUrl: undefined,
+              noBrowser: true,
+              startupPresentation: "browser",
+              desktopBootstrapToken: "desktop-bootstrap-token",
+              autoBootstrapProjectFromCwd: false,
+              logWebSocketEvents: false,
+              tailscaleServeEnabled: false,
+              tailscaleServePort: 443,
+            }),
+            Layer.succeed(Keybindings.Keybindings, {
+              start: Effect.void,
+              ready: Effect.void,
+              getKeybindings: Effect.succeed([]),
+              updateKeybindings: () => Effect.succeed([]),
+              streamChanges: Stream.empty,
+            } as never),
+            Layer.succeed(ServerSettings.ServerSettingsService, {
+              start: Effect.void,
+              ready: Effect.void,
+              getSettings: Effect.succeed({}),
+              updateSettings: () => Effect.succeed({}),
+              streamChanges: Stream.empty,
+            } as never),
+            Layer.succeed(OrchestrationReactor.OrchestrationReactor, {
+              start: () => pushReactorStart("orchestration"),
+            }),
+            Layer.succeed(ProviderSessionReaper.ProviderSessionReaper, {
+              start: () => pushReactorStart("provider-reaper"),
+            }),
+            Layer.succeed(ChildThreadCoordinator.ChildThreadCoordinator, {
+              start: () => pushReactorStart("child-coordinator"),
+            } as never),
+            Layer.succeed(ScheduledTasksReactor.ScheduledTasksReactor, {
+              start: () => pushReactorStart("scheduled-tasks"),
+            }),
+            Layer.succeed(ServerLifecycleEvents.ServerLifecycleEvents, {
+              publish: (event) => Effect.succeed({ ...event, sequence: 1 }),
+              snapshot: Effect.succeed({ sequence: 0, events: [] }),
+              stream: Stream.empty,
+            }),
+            Layer.succeed(ServerEnvironment.ServerEnvironment, {
+              getEnvironmentId: Effect.succeed(environmentId),
+              getDescriptor: Effect.succeed(descriptor),
+            }),
+            Layer.succeed(EnvironmentAuth.EnvironmentAuth, {
+              issueStartupPairingUrl: (baseUrl: string) => Effect.succeed(baseUrl),
+            } as never),
+            Layer.succeed(ExternalLauncher.ExternalLauncher, {
+              resolveAvailableEditors: () => Effect.succeed([]),
+              launchBrowser: () => Effect.void,
+              launchEditor: () => Effect.void,
+            } as never),
+            Layer.succeed(ProjectionSnapshotQuery.ProjectionSnapshotQuery, {
+              getCounts: () => Effect.succeed({ projectCount: 0, threadCount: 0 }),
+            } as never),
+            Layer.succeed(OrchestrationEngine.OrchestrationEngineService, {
+              readEvents: () => Stream.empty,
+              dispatch: () => Effect.succeed({ sequence: 1 }),
+              streamDomainEvents: Stream.empty,
+            } as never),
+            Layer.succeed(HttpServer.HttpServer, {
+              address: { _tag: "TcpAddress", hostname: "127.0.0.1", port: 3774 },
+              serve: () => Effect.void,
+            } as never),
+            AnalyticsService.AnalyticsService.layerTest,
+            NodeServices.layer,
+          ),
+        ),
+      );
+
+      yield* startup.awaitCommandReady;
+
+      assert.deepStrictEqual(yield* Ref.get(reactorStarts), [
+        "orchestration",
+        "provider-reaper",
+        "child-coordinator",
+        "scheduled-tasks",
+      ]);
     }),
   ),
 );

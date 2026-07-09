@@ -2,11 +2,13 @@ import { useAtomValue } from "@effect/atom-react";
 import {
   createEnvironmentScheduledTasksAtoms,
   createScheduledTasksEnvironmentAtoms,
+  type EnvironmentScheduledTasksState,
 } from "@t3tools/client-runtime/state/schedules";
 import type { EnvironmentId, ScheduledTaskEntry, ThreadId } from "@t3tools/contracts";
 import * as Option from "effect/Option";
 import { Atom } from "effect/unstable/reactivity";
 
+import { environmentCatalog } from "../connection/catalog";
 import { connectionAtomRuntime } from "../connection/runtime";
 import { scheduleCadenceLabel } from "../scheduled/formatCadence";
 
@@ -126,6 +128,29 @@ export const scheduledTasksForEnvironmentAtom = Atom.family((environmentId: Envi
   ).pipe(Atom.withLabel(`scheduled-tasks-for-environment:${environmentId}`)),
 );
 
+export interface ScopedScheduledTaskEntry {
+  readonly environmentId: EnvironmentId;
+  readonly task: ScheduledTaskEntry;
+}
+
+export const scheduledTasksForAllEnvironmentsAtom = Atom.make((get) => {
+  const tasks: ScopedScheduledTaskEntry[] = [];
+  for (const environmentId of get(environmentCatalog.catalogValueAtom).entries.keys()) {
+    for (const task of get(scheduledTasksForEnvironmentAtom(environmentId))) {
+      tasks.push({ environmentId, task });
+    }
+  }
+  return tasks as ReadonlyArray<ScopedScheduledTaskEntry>;
+}).pipe(Atom.withLabel("scheduled-tasks-for-all-environments"));
+
+export const scheduledTaskStatesByEnvironmentAtom = Atom.make((get) => {
+  const states = new Map<EnvironmentId, EnvironmentScheduledTasksState>();
+  for (const environmentId of get(environmentCatalog.catalogValueAtom).entries.keys()) {
+    states.set(environmentId, get(environmentScheduledTasks.stateValueAtom(environmentId)));
+  }
+  return states as ReadonlyMap<EnvironmentId, EnvironmentScheduledTasksState>;
+}).pipe(Atom.withLabel("scheduled-task-states-by-environment"));
+
 export const schedulesByThreadIdAtom = Atom.family((environmentId: EnvironmentId) =>
   Atom.make((get) =>
     reduceSchedulesByThreadId(get(scheduledTasksForEnvironmentAtom(environmentId))),
@@ -147,6 +172,10 @@ export function useScheduledTasks(
       ? scheduledTasksForEnvironmentAtom(environmentId)
       : EMPTY_SCHEDULED_TASKS_ATOM,
   );
+}
+
+export function useScheduledTasksAcrossEnvironments(): ReadonlyArray<ScopedScheduledTaskEntry> {
+  return useAtomValue(scheduledTasksForAllEnvironmentsAtom);
 }
 
 export function useSchedulesByThreadId(
