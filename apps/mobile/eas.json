@@ -11,7 +11,8 @@
         "APP_VARIANT": "development",
         "EXPO_OWNER": "adam0410",
         "EXPO_PROJECT_ID": "c5d56501-d2d8-444d-8b4a-b54ead1ba0f7",
-        "EXPO_UPDATES_URL": "https://u.expo.dev/c5d56501-d2d8-444d-8b4a-b54ead1ba0f7"
+        "EXPO_UPDATES_URL": "https://u.expo.dev/c5d56501-d2d8-444d-8b4a-b54ead1ba0f7",
+        "NODE_OPTIONS": "--max-old-space-size=4096"
       },
       "channel": "development",
       "developmentClient": true,
@@ -23,7 +24,8 @@
         "APP_VARIANT": "preview",
         "EXPO_OWNER": "adam0410",
         "EXPO_PROJECT_ID": "c5d56501-d2d8-444d-8b4a-b54ead1ba0f7",
-        "EXPO_UPDATES_URL": "https://u.expo.dev/c5d56501-d2d8-444d-8b4a-b54ead1ba0f7"
+        "EXPO_UPDATES_URL": "https://u.expo.dev/c5d56501-d2d8-444d-8b4a-b54ead1ba0f7",
+        "NODE_OPTIONS": "--max-old-space-size=4096"
       },
       "channel": "preview",
       "environment": "preview",
@@ -39,7 +41,8 @@
         "EXPO_OWNER": "adam0410",
         "EXPO_PROJECT_ID": "c5d56501-d2d8-444d-8b4a-b54ead1ba0f7",
         "EXPO_UPDATES_URL": "https://u.expo.dev/c5d56501-d2d8-444d-8b4a-b54ead1ba0f7",
-        "MOBILE_VERSION_POLICY": "fingerprint"
+        "MOBILE_VERSION_POLICY": "fingerprint",
+        "NODE_OPTIONS": "--max-old-space-size=4096"
       },
       "channel": "preview",
       "environment": "preview",
@@ -55,7 +58,8 @@
         "APP_VARIANT": "production",
         "EXPO_OWNER": "adam0410",
         "EXPO_PROJECT_ID": "c5d56501-d2d8-444d-8b4a-b54ead1ba0f7",
-        "EXPO_UPDATES_URL": "https://u.expo.dev/c5d56501-d2d8-444d-8b4a-b54ead1ba0f7"
+        "EXPO_UPDATES_URL": "https://u.expo.dev/c5d56501-d2d8-444d-8b4a-b54ead1ba0f7",
+        "NODE_OPTIONS": "--max-old-space-size=4096"
       },
       "channel": "production",
       "environment": "production",
