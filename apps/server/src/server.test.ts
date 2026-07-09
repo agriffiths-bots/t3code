@@ -741,6 +741,7 @@ const buildAppUnderTest = (options?: {
         ),
       ),
       Layer.provide(orchestrationEngineLayer),
+      Layer.provide(orchestrationCommandReceiptRepositoryLayer),
       Layer.provide(
         Layer.mock(ProjectionSnapshotQuery.ProjectionSnapshotQuery)({
           getCommandReadModel: () => Effect.succeed(makeDefaultOrchestrationReadModel()),
@@ -6049,6 +6050,95 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
     }).pipe(Effect.provide(NodeHttpServer.layerTest)),
   );
 
+  it.effect("keeps accepted turn-start retries idempotent after archive preflight", () =>
+    Effect.gen(function* () {
+      const fileSystem = yield* FileSystem.FileSystem;
+      const now = "2026-01-01T00:00:00.000Z";
+      const commandId = CommandId.make("cmd-accepted-archived-attachment-turn-start");
+      const baseDir = yield* fileSystem.makeTempDirectoryScoped({
+        prefix: "t3-accepted-archived-attachment-",
+      });
+      const { attachmentsDir } = yield* ServerConfig.deriveServerPaths(baseDir, undefined);
+      const dispatchedCommands: OrchestrationCommand[] = [];
+
+      yield* buildAppUnderTest({
+        config: { baseDir },
+        layers: {
+          projectionSnapshotQuery: {
+            getThreadShellByIdIncludingArchived: () =>
+              Effect.die("accepted receipt retries should not read thread archive state"),
+          },
+          orchestrationCommandReceiptRepository: {
+            getByCommandId: (input) =>
+              Effect.succeed(
+                input.commandId === commandId
+                  ? Option.some({
+                      commandId,
+                      aggregateKind: "thread" as const,
+                      aggregateId: defaultThreadId,
+                      acceptedAt: now,
+                      resultSequence: NonNegativeInt.make(42),
+                      status: "accepted" as const,
+                      error: null,
+                    })
+                  : Option.none(),
+              ),
+          },
+          orchestrationEngine: {
+            dispatch: (command) =>
+              Effect.sync(() => {
+                dispatchedCommands.push(command);
+                return { sequence: 42 };
+              }),
+            readEvents: () => Stream.empty,
+          },
+        },
+      });
+
+      const wsUrl = yield* getWsServerUrl("/ws");
+      const result = yield* Effect.scoped(
+        withWsRpcClient(wsUrl, (client) =>
+          client[ORCHESTRATION_WS_METHODS.dispatchCommand]({
+            type: "thread.turn.start",
+            commandId,
+            threadId: defaultThreadId,
+            message: {
+              messageId: MessageId.make("msg-accepted-archived-attachment-turn-start"),
+              role: "user",
+              text: "already accepted",
+              attachments: [
+                {
+                  type: "image",
+                  name: "accepted.png",
+                  mimeType: "image/png",
+                  sizeBytes: NonNegativeInt.make(5),
+                  dataUrl: "data:image/png;base64,aGVsbG8=",
+                },
+              ],
+            },
+            interactionMode: "default",
+            runtimeMode: "full-access",
+            createdAt: now,
+          }),
+        ),
+      );
+
+      const attachmentEntries = yield* fileSystem
+        .exists(attachmentsDir)
+        .pipe(
+          Effect.flatMap((exists) =>
+            exists ? fileSystem.readDirectory(attachmentsDir) : Effect.succeed([]),
+          ),
+        );
+      assert.equal(result.sequence, 42);
+      assert.deepEqual(
+        dispatchedCommands.map((command) => command.type),
+        ["thread.turn.start"],
+      );
+      assert.deepEqual(attachmentEntries, []);
+    }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+
   it.effect("routes websocket rpc orchestration shell snapshot errors", () =>
     Effect.gen(function* () {
       const projectionError = new PersistenceSqlError({
@@ -7490,6 +7580,123 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
         setupActivities.every((command) => command.activity.kind !== "setup-script.failed"),
       );
       assertTrue(dispatchedCommands.every((command) => command.type !== "thread.delete"));
+    }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+
+  it.effect("preserves bootstrapped threads and worktrees when archive wins final turn start", () =>
+    Effect.gen(function* () {
+      const threadId = ThreadId.make("thread-bootstrap-archive-race");
+      const createdAt = "2026-01-01T00:00:00.000Z";
+      const dispatchedCommands: Array<OrchestrationCommand> = [];
+      const createWorktree = vi.fn(
+        (_: Parameters<GitVcsDriver.GitVcsDriver["Service"]["createWorktree"]>[0]) =>
+          Effect.succeed({
+            worktree: {
+              refName: "t3code/archive-race",
+              path: "/tmp/bootstrap-archive-race-worktree",
+            },
+          }),
+      );
+      const removeWorktree = vi.fn(
+        (_: Parameters<GitVcsDriver.GitVcsDriver["Service"]["removeWorktree"]>[0]) => Effect.void,
+      );
+
+      yield* buildAppUnderTest({
+        layers: {
+          gitVcsDriver: {
+            createWorktree,
+            removeWorktree,
+          },
+          vcsStatusBroadcaster: {
+            refreshStatus: () =>
+              Effect.succeed({
+                isRepo: true,
+                hasPrimaryRemote: true,
+                isDefaultRef: false,
+                refName: "t3code/archive-race",
+                hasWorkingTreeChanges: false,
+                workingTree: {
+                  files: [],
+                  insertions: 0,
+                  deletions: 0,
+                },
+                hasUpstream: true,
+                aheadCount: 0,
+                behindCount: 0,
+                pr: null,
+              }),
+          },
+          orchestrationEngine: {
+            dispatch: (command) =>
+              Effect.sync(() => {
+                dispatchedCommands.push(command);
+                return command;
+              }).pipe(
+                Effect.flatMap((dispatched) =>
+                  dispatched.type === "thread.turn.start"
+                    ? Effect.fail(
+                        new OrchestrationCommandInvariantError({
+                          commandType: "thread.turn.start",
+                          detail: `Thread '${threadId}' is already archived and cannot handle command 'thread.turn.start'.`,
+                        }),
+                      )
+                    : Effect.succeed({ sequence: dispatchedCommands.length }),
+                ),
+              ),
+            readEvents: () => Stream.empty,
+          },
+        },
+      });
+
+      const wsUrl = yield* getWsServerUrl("/ws");
+      const result = yield* Effect.scoped(
+        withWsRpcClient(wsUrl, (client) =>
+          client[ORCHESTRATION_WS_METHODS.dispatchCommand]({
+            type: "thread.turn.start",
+            commandId: CommandId.make("cmd-bootstrap-turn-start-archive-race"),
+            threadId,
+            message: {
+              messageId: MessageId.make("msg-bootstrap-archive-race"),
+              role: "user",
+              text: "archive wins during bootstrap",
+              attachments: [],
+            },
+            modelSelection: defaultModelSelection,
+            runtimeMode: "full-access",
+            interactionMode: "default",
+            bootstrap: {
+              createThread: {
+                projectId: defaultProjectId,
+                title: "Bootstrap Archive Race",
+                modelSelection: defaultModelSelection,
+                runtimeMode: "full-access",
+                interactionMode: "default",
+                branch: "main",
+                worktreePath: null,
+                createdAt,
+              },
+              prepareWorktree: {
+                projectCwd: "/tmp/project",
+                baseBranch: "main",
+                branch: "t3code/archive-race",
+              },
+              runSetupScript: false,
+            },
+            createdAt,
+          }),
+        ).pipe(Effect.result),
+      );
+
+      assertTrue(result._tag === "Failure");
+      assertTrue(result.failure._tag === "OrchestrationDispatchCommandError");
+      assert.include(result.failure.message, "already archived");
+      assert.deepEqual(
+        dispatchedCommands.map((command) => command.type),
+        ["thread.create", "thread.meta.update", "thread.turn.start"],
+      );
+      assertTrue(dispatchedCommands.every((command) => command.type !== "thread.delete"));
+      assert.equal(createWorktree.mock.calls.length, 1);
+      assert.equal(removeWorktree.mock.calls.length, 0);
     }).pipe(Effect.provide(NodeHttpServer.layerTest)),
   );
 

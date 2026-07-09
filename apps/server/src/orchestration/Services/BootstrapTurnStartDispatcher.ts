@@ -74,6 +74,10 @@ function threadAlreadyExistsDetail(threadId: ThreadId): string {
   return `Thread '${threadId}' already exists and cannot be created twice.`;
 }
 
+function threadArchivedTurnStartDetail(threadId: ThreadId): string {
+  return `Thread '${threadId}' is already archived and cannot handle command 'thread.turn.start'.`;
+}
+
 function isDuplicateThreadCreateError(
   error: OrchestrationDispatchCommandError,
   threadId: ThreadId,
@@ -84,6 +88,18 @@ function isDuplicateThreadCreateError(
     return cause.commandType === "thread.create" && cause.detail === detail;
   }
   return error.message === `Orchestration command invariant failed (thread.create): ${detail}`;
+}
+
+function isArchivedFinalTurnStartCause(cause: Cause.Cause<unknown>, threadId: ThreadId): boolean {
+  const error = Cause.squash(cause);
+  const detail = threadArchivedTurnStartDetail(threadId);
+  if (isOrchestrationCommandInvariantError(error)) {
+    return error.commandType === "thread.turn.start" && error.detail === detail;
+  }
+  if (isOrchestrationDispatchCommandError(error)) {
+    return error.message.includes(detail);
+  }
+  return error instanceof Error && error.message.includes(detail);
 }
 
 function toCanonicalJson(value: unknown): string {
@@ -672,6 +688,9 @@ export const layer = Layer.effect(
         Effect.catchCause((cause) => {
           const dispatchError = toBootstrapDispatchCommandCauseError(cause);
           if (Cause.hasInterruptsOnly(cause)) {
+            return Effect.fail(dispatchError);
+          }
+          if (isArchivedFinalTurnStartCause(cause, command.threadId)) {
             return Effect.fail(dispatchError);
           }
           return cleanupCreatedThread().pipe(

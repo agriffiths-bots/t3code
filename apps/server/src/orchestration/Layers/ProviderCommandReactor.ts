@@ -16,6 +16,7 @@ import { isTemporaryWorktreeBranch, WORKTREE_BRANCH_PREFIX } from "@t3tools/shar
 import * as Cache from "effect/Cache";
 import * as Cause from "effect/Cause";
 import * as Crypto from "effect/Crypto";
+import * as DateTime from "effect/DateTime";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Equal from "effect/Equal";
@@ -89,6 +90,7 @@ const HANDLED_TURN_START_KEY_MAX = 10_000;
 const HANDLED_TURN_START_KEY_TTL = Duration.minutes(30);
 const DEFAULT_RUNTIME_MODE: RuntimeMode = "full-access";
 const DEFAULT_THREAD_TITLE = "New thread";
+const nowIso = Effect.map(DateTime.now, DateTime.formatIso);
 
 function normalizeWorktreeIdentityPath(value: string | null | undefined): string | null {
   const trimmed = value?.trim();
@@ -434,8 +436,12 @@ const make = Effect.gen(function* () {
     const hasSessionToStop =
       (latestThread.session !== null && latestThread.session.status !== "stopped") ||
       activeSession !== undefined;
+    const cancellationCreatedAt = yield* nowIso;
     if (hasSessionToStop) {
-      yield* dispatchArchivedThreadSessionStop(input).pipe(
+      yield* dispatchArchivedThreadSessionStop({
+        threadId: input.threadId,
+        createdAt: cancellationCreatedAt,
+      }).pipe(
         Effect.catchCause((cause) =>
           Effect.logWarning("provider command reactor failed to stop archived thread session", {
             threadId: input.threadId,
@@ -449,7 +455,7 @@ const make = Effect.gen(function* () {
         detail: archivedTurnStartCancellationDetail(input.threadId),
         ...(input.modelSelection !== undefined ? { modelSelection: input.modelSelection } : {}),
         ...(input.runtimeMode !== undefined ? { runtimeMode: input.runtimeMode } : {}),
-        createdAt: input.createdAt,
+        createdAt: cancellationCreatedAt,
       }).pipe(
         Effect.catchCause((cause) =>
           Effect.logWarning("provider command reactor failed to mark archived turn cancelled", {
@@ -465,7 +471,7 @@ const make = Effect.gen(function* () {
       summary: "Provider turn start cancelled",
       detail: archivedTurnStartCancellationDetail(input.threadId),
       turnId: null,
-      createdAt: input.createdAt,
+      createdAt: cancellationCreatedAt,
     }).pipe(
       Effect.catchCause((cause) =>
         Effect.logWarning("provider command reactor failed to record archived turn cancellation", {

@@ -743,6 +743,18 @@ describe("ProviderCommandReactor", () => {
       "thread.session.set",
       "thread.activity.append",
     ]);
+    const sessionSetCommand = dispatchedCommands.find(
+      (command): command is Extract<OrchestrationCommand, { type: "thread.session.set" }> =>
+        command.type === "thread.session.set",
+    );
+    const activityCommand = dispatchedCommands.find(
+      (command): command is Extract<OrchestrationCommand, { type: "thread.activity.append" }> =>
+        command.type === "thread.activity.append",
+    );
+    expect(sessionSetCommand?.createdAt).not.toBe(now);
+    expect(sessionSetCommand?.session.updatedAt).toBe(sessionSetCommand?.createdAt);
+    expect(activityCommand?.createdAt).toBe(sessionSetCommand?.createdAt);
+    expect(activityCommand?.activity.createdAt).toBe(sessionSetCommand?.createdAt);
     expect(projectedSession).toMatchObject({
       status: "error",
       activeTurnId: null,

@@ -12,6 +12,7 @@ import {
 import { createAttachmentId, resolveAttachmentPath } from "../attachmentStore.ts";
 import { ServerConfig } from "../config.ts";
 import { parseBase64DataUrl } from "../imageMime.ts";
+import { OrchestrationCommandReceiptRepository } from "../persistence/Services/OrchestrationCommandReceipts.ts";
 import { ProjectionSnapshotQuery } from "./Services/ProjectionSnapshotQuery.ts";
 import * as WorkspacePaths from "../workspace/WorkspacePaths.ts";
 
@@ -70,6 +71,21 @@ export const normalizeDispatchCommand = (command: ClientOrchestrationCommand) =>
 
     if (command.type !== "thread.turn.start") {
       return command as OrchestrationCommand;
+    }
+
+    const commandReceiptRepository = yield* OrchestrationCommandReceiptRepository;
+    const existingReceipt = yield* commandReceiptRepository
+      .getByCommandId({ commandId: command.commandId })
+      .pipe(
+        Effect.mapError(
+          () =>
+            new OrchestrationDispatchCommandError({
+              message: `Failed to read command receipt for '${command.commandId}' before dispatching '${command.type}'.`,
+            }),
+        ),
+      );
+    if (Option.isSome(existingReceipt)) {
+      return command as unknown as OrchestrationCommand;
     }
 
     const threadShell = yield* projectionSnapshotQuery
