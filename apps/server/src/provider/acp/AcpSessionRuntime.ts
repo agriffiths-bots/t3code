@@ -70,6 +70,7 @@ export interface AcpSessionRuntimeOptions {
   readonly authMethodId: string;
   readonly mcpServers?: ReadonlyArray<EffectAcpSchema.McpServer>;
   readonly requestLogger?: (event: AcpSessionRequestLogEvent) => Effect.Effect<void, never>;
+  readonly captureEventScope?: Effect.Effect<unknown>;
   readonly protocolLogging?: {
     readonly logIncoming?: boolean;
     readonly logOutgoing?: boolean;
@@ -424,6 +425,8 @@ export const make = (
         if (activeSessionId === undefined || notification.sessionId !== activeSessionId) {
           return;
         }
+        const eventScope =
+          options.captureEventScope === undefined ? undefined : yield* options.captureEventScope;
         yield* sessionUpdateSemaphore.withPermit(
           handleSessionUpdate({
             queue: eventQueue,
@@ -431,6 +434,7 @@ export const make = (
             toolCallsRef,
             assistantSegmentRef,
             params: notification,
+            eventScope,
           }),
         );
       }),
@@ -695,12 +699,15 @@ export const make = (
         }),
       );
       for (const notification of bufferedLoadUpdates) {
+        const eventScope =
+          options.captureEventScope === undefined ? undefined : yield* options.captureEventScope;
         yield* handleSessionUpdate({
           queue: eventQueue,
           modeStateRef,
           toolCallsRef,
           assistantSegmentRef,
           params: notification,
+          eventScope,
         });
       }
 
@@ -920,12 +927,14 @@ const handleSessionUpdate = ({
   toolCallsRef,
   assistantSegmentRef,
   params,
+  eventScope,
 }: {
   readonly queue: Queue.Queue<AcpSessionRuntimeEvent>;
   readonly modeStateRef: Ref.Ref<AcpSessionModeState | undefined>;
   readonly toolCallsRef: Ref.Ref<Map<string, AcpToolCallState>>;
   readonly assistantSegmentRef: Ref.Ref<AcpAssistantSegmentState>;
   readonly params: EffectAcpSchema.SessionNotification;
+  readonly eventScope: unknown;
 }): Effect.Effect<void> =>
   Effect.gen(function* () {
     const parsed = parseSessionUpdateEvent(params);
@@ -958,6 +967,7 @@ const handleSessionUpdate = ({
           _tag: "ToolCallUpdated",
           toolCall: merged,
           rawPayload: event.rawPayload,
+          ...(eventScope !== undefined ? { eventScope } : {}),
         });
         continue;
       }
@@ -972,14 +982,24 @@ const handleSessionUpdate = ({
           queue,
           assistantSegmentRef,
           sessionId: params.sessionId,
+          eventScope,
         });
         yield* Queue.offer(queue, {
           ...event,
           itemId,
+          ...(eventScope !== undefined ? { eventScope } : {}),
         });
         continue;
       }
-      yield* Queue.offer(queue, event);
+      yield* Queue.offer(
+        queue,
+        eventScope !== undefined
+          ? {
+              ...event,
+              eventScope,
+            }
+          : event,
+      );
     }
   });
 
@@ -1083,10 +1103,12 @@ const ensureActiveAssistantSegment = ({
   queue,
   assistantSegmentRef,
   sessionId,
+  eventScope,
 }: {
   readonly queue: Queue.Queue<AcpSessionRuntimeEvent>;
   readonly assistantSegmentRef: Ref.Ref<AcpAssistantSegmentState>;
   readonly sessionId: string;
+  readonly eventScope: unknown;
 }) =>
   Ref.modify<AcpAssistantSegmentState, EnsureActiveAssistantSegmentResult>(
     assistantSegmentRef,
@@ -1096,6 +1118,7 @@ const ensureActiveAssistantSegment = ({
           ? ({
               _tag: "AssistantItemStarted",
               itemId: current.activeItemId,
+              ...(eventScope !== undefined ? { eventScope } : {}),
             } satisfies Extract<AcpParsedSessionEvent, { readonly _tag: "AssistantItemStarted" }>)
           : undefined;
         return [
@@ -1112,6 +1135,7 @@ const ensureActiveAssistantSegment = ({
           startedEvent: {
             _tag: "AssistantItemStarted",
             itemId,
+            ...(eventScope !== undefined ? { eventScope } : {}),
           } satisfies Extract<AcpParsedSessionEvent, { readonly _tag: "AssistantItemStarted" }>,
         },
         {

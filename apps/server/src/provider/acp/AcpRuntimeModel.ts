@@ -80,40 +80,44 @@ export interface AcpPermissionRequest {
   readonly toolCall?: AcpToolCallState;
 }
 
+interface AcpParsedSessionEventMetadata {
+  readonly eventScope?: unknown;
+}
+
 export type AcpParsedSessionEvent =
-  | {
+  | (AcpParsedSessionEventMetadata & {
       readonly _tag: "ModeChanged";
       readonly modeId: string;
-    }
-  | {
+    })
+  | (AcpParsedSessionEventMetadata & {
       readonly _tag: "AssistantItemStarted";
       readonly itemId: string;
-    }
-  | {
+    })
+  | (AcpParsedSessionEventMetadata & {
       readonly _tag: "AssistantItemCompleted";
       readonly itemId: string;
-    }
-  | {
+    })
+  | (AcpParsedSessionEventMetadata & {
       readonly _tag: "PlanUpdated";
       readonly payload: AcpPlanUpdate;
       readonly rawPayload: unknown;
-    }
-  | {
+    })
+  | (AcpParsedSessionEventMetadata & {
       readonly _tag: "ToolCallUpdated";
       readonly toolCall: AcpToolCallState;
       readonly rawPayload: unknown;
-    }
-  | {
+    })
+  | (AcpParsedSessionEventMetadata & {
       readonly _tag: "ContentDelta";
       readonly itemId?: string;
       readonly text: string;
       readonly rawPayload: unknown;
-    }
-  | {
+    })
+  | (AcpParsedSessionEventMetadata & {
       readonly _tag: "TokenUsageUpdated";
       readonly usage: ThreadTokenUsageSnapshot;
       readonly rawPayload: unknown;
-    };
+    });
 
 type AcpSessionSetupResponse =
   | EffectAcpSchema.LoadSessionResponse

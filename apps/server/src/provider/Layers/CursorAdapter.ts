@@ -178,6 +178,28 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+function cursorAcpEventScopeTurnId(scope: unknown): TurnId | undefined {
+  if (!isRecord(scope) || !("notificationTurnId" in scope)) {
+    return undefined;
+  }
+  return typeof scope.notificationTurnId === "string"
+    ? TurnId.make(scope.notificationTurnId)
+    : undefined;
+}
+
+function cursorAcpEventHasScope(scope: unknown): boolean {
+  return isRecord(scope) && "notificationTurnId" in scope;
+}
+
+function resolveCursorAcpEventTurnId(
+  ctx: CursorSessionContext,
+  event: { readonly eventScope?: unknown },
+): TurnId | undefined {
+  return cursorAcpEventHasScope(event.eventScope)
+    ? cursorAcpEventScopeTurnId(event.eventScope)
+    : ctx.notificationTurnId;
+}
+
 function parseCursorResume(raw: unknown): { sessionId: string } | undefined {
   if (!isRecord(raw)) return undefined;
   if (raw.schemaVersion !== CURSOR_RESUME_VERSION) return undefined;
@@ -598,6 +620,9 @@ export function makeCursorAdapter(
             cwd,
             ...(resumeSessionId ? { resumeSessionId } : {}),
             clientInfo: { name: "t3-code", version: "0.0.0" },
+            captureEventScope: Effect.sync(() => ({
+              notificationTurnId: ctx?.notificationTurnId ?? input.activeTurnId,
+            })),
             ...(mcpSession
               ? {
                   mcpServers: [
@@ -852,17 +877,20 @@ export function makeCursorAdapter(
           const nf = yield* Stream.runDrain(
             Stream.mapEffect(acp.getEvents(), (event) =>
               Effect.gen(function* () {
+                if (event._tag === "EventStreamBarrier") {
+                  yield* Deferred.succeed(event.acknowledge, undefined);
+                  return;
+                }
+                if (event._tag === "ModeChanged") {
+                  return;
+                }
+                const eventTurnId = resolveCursorAcpEventTurnId(ctx, event);
                 switch (event._tag) {
-                  case "EventStreamBarrier":
-                    yield* Deferred.succeed(event.acknowledge, undefined);
-                    return;
-                  case "ModeChanged":
-                    return;
                   case "AssistantItemStarted":
                     const startedTurnId = rememberAssistantItemTurnId(
                       ctx,
                       event.itemId,
-                      ctx.notificationTurnId,
+                      eventTurnId,
                     );
                     yield* offerRuntimeEvent(
                       makeAcpAssistantItemEvent({
@@ -897,7 +925,7 @@ export function makeCursorAdapter(
                     );
                     yield* emitPlanUpdate(
                       ctx,
-                      ctx.notificationTurnId,
+                      eventTurnId,
                       event.payload,
                       event.rawPayload,
                       "acp.jsonrpc",
@@ -916,7 +944,7 @@ export function makeCursorAdapter(
                         stamp: yield* makeEventStamp(),
                         provider: PROVIDER,
                         threadId: ctx.threadId,
-                        turnId: ctx.notificationTurnId,
+                        turnId: eventTurnId,
                         toolCall: event.toolCall,
                         rawPayload: event.rawPayload,
                       }),
@@ -932,7 +960,7 @@ export function makeCursorAdapter(
                     const contentTurnId = rememberAssistantItemTurnId(
                       ctx,
                       event.itemId,
-                      ctx.notificationTurnId,
+                      eventTurnId,
                     );
                     yield* offerRuntimeEvent(
                       makeAcpContentDeltaEvent({
@@ -958,7 +986,7 @@ export function makeCursorAdapter(
                         stamp: yield* makeEventStamp(),
                         provider: PROVIDER,
                         threadId: ctx.threadId,
-                        turnId: ctx.notificationTurnId,
+                        turnId: eventTurnId,
                         usage: event.usage,
                         rawPayload: event.rawPayload,
                       }),
