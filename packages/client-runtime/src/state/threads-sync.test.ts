@@ -1537,6 +1537,73 @@ describe("EnvironmentThreads", () => {
     }),
   );
 
+  it.effect("clears interim assistant boundaries from authoritative null snapshots", () =>
+    Effect.gen(function* () {
+      const interimAssistantMessage: OrchestrationMessage = {
+        id: MessageId.make("assistant-interim"),
+        role: "assistant",
+        text: "I will inspect first.",
+        turnId: RUNNING_TURN_ID,
+        streaming: false,
+        createdAt: "2026-07-07T21:00:02.000Z",
+        updatedAt: "2026-07-07T21:00:02.000Z",
+      };
+      const runningThread = makeRunningThread([interimAssistantMessage]);
+      const runningTurn = runningThread.latestTurn;
+      if (runningTurn === null) {
+        throw new Error("test fixture must have a running latestTurn");
+      }
+      const interimTurn = {
+        ...runningTurn,
+        assistantMessageId: interimAssistantMessage.id,
+      };
+      const harness = yield* makeHarness({
+        cached: {
+          ...runningThread,
+          latestTurn: interimTurn,
+          turns: [interimTurn],
+        },
+      });
+
+      yield* Ref.set(
+        harness.httpSnapshot,
+        Option.some({
+          snapshotSequence: CACHED_SNAPSHOT_SEQUENCE,
+          thread: {
+            ...runningThread,
+            latestTurn: {
+              ...interimTurn,
+              state: "completed",
+              completedAt: "2026-07-07T21:00:04.000Z",
+              assistantMessageId: null,
+            },
+            turns: [
+              {
+                ...interimTurn,
+                state: "completed",
+                completedAt: "2026-07-07T21:00:04.000Z",
+                assistantMessageId: null,
+              },
+            ],
+          },
+        }),
+      );
+
+      yield* advanceActiveReconcileInterval;
+      const recovered = yield* awaitThreadState(
+        harness.observed,
+        (value) =>
+          value.status === "live" &&
+          Option.isSome(value.data) &&
+          value.data.value.latestTurn?.state === "completed",
+      );
+
+      const thread = Option.getOrThrow(recovered.data);
+      expect(thread.latestTurn?.assistantMessageId).toBeNull();
+      expect(thread.turns.at(0)?.assistantMessageId).toBeNull();
+    }),
+  );
+
   it.effect("does not poll parked waiting sessions without an active turn", () =>
     Effect.gen(function* () {
       const parkedWaitingThread: OrchestrationThread = {

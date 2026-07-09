@@ -1056,7 +1056,7 @@ describe("deriveMessagesTimelineRows", () => {
     expect(assistantRow?.assistantTurnDiffSummary).toBe(turnSummary);
   });
 
-  it("keeps the last assistant visible for a missing non-null boundary followed by late work", () => {
+  it("does not promote a pre-work assistant when a non-null boundary is missing", () => {
     const rows = deriveMessagesTimelineRows({
       timelineEntries: [
         {
@@ -1114,11 +1114,7 @@ describe("deriveMessagesTimelineRows", () => {
       revertTurnCountByUserMessageId: new Map(),
     });
 
-    expect(rows.map((row) => row.id)).toEqual([
-      "user-entry",
-      "assistant-final-entry",
-      "turn-fold:turn-1",
-    ]);
+    expect(rows.map((row) => row.id)).toEqual(["user-entry", "turn-fold:turn-1"]);
   });
 
   it("falls back to the terminal assistant when a matched boundary is older", () => {

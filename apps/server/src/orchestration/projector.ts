@@ -306,6 +306,30 @@ function upsertTurn(
   );
 }
 
+function settleRunningTurnsForSession(input: {
+  readonly turns: ReadonlyArray<OrchestrationLatestTurn>;
+  readonly activeTurnId: TurnId | null;
+  readonly settledTurnState: OrchestrationLatestTurn["state"] | null;
+  readonly settledAt: string;
+}): OrchestrationLatestTurn[] {
+  if (input.activeTurnId !== null) {
+    return input.turns.map((turn) =>
+      turn.turnId !== input.activeTurnId && turn.state === "running"
+        ? { ...turn, state: "completed", completedAt: input.settledAt }
+        : turn,
+    );
+  }
+  if (input.settledTurnState === null) {
+    return [...input.turns];
+  }
+  const settledTurnState = input.settledTurnState;
+  return input.turns.map((turn) =>
+    turn.state === "running"
+      ? { ...turn, state: settledTurnState, completedAt: input.settledAt }
+      : turn,
+  );
+}
+
 function rebindTurnAssistantMessage(
   turns: ReadonlyArray<OrchestrationLatestTurn>,
   turnId: TurnId,
@@ -789,42 +813,53 @@ export function projectEvent(
         // Leaving the "running" session status is the turn-end signal: settle
         // a still-running latest turn so its duration reflects the whole turn.
         const settledTurnState = settledTurnStateForSessionStatus(session.status);
+        const latestTurn =
+          activeTurnId !== null
+            ? {
+                turnId: activeTurnId,
+                state: "running" as const,
+                requestedAt:
+                  thread.latestTurn?.turnId === activeTurnId
+                    ? thread.latestTurn.requestedAt
+                    : session.updatedAt,
+                startedAt:
+                  thread.latestTurn?.turnId === activeTurnId
+                    ? (thread.latestTurn.startedAt ?? session.updatedAt)
+                    : session.updatedAt,
+                completedAt: null,
+                assistantMessageId:
+                  thread.latestTurn?.turnId === activeTurnId
+                    ? (thread.latestTurn.assistantMessageId ?? activeTurnAssistantMessageId)
+                    : activeTurnAssistantMessageId,
+              }
+            : thread.latestTurn !== null &&
+                thread.latestTurn.state === "running" &&
+                settledTurnState !== null
+              ? {
+                  ...thread.latestTurn,
+                  state: settledTurnState,
+                  // A running turn's completedAt can only hold a mid-turn
+                  // placeholder checkpoint timestamp — the session leaving
+                  // "running" is the authoritative turn end.
+                  completedAt: session.updatedAt,
+                }
+              : thread.latestTurn;
+        const turns = upsertTurn(
+          settleRunningTurnsForSession({
+            turns: thread.turns,
+            activeTurnId,
+            settledTurnState,
+            settledAt: session.updatedAt,
+          }),
+          latestTurn,
+        );
         return {
           ...nextBase,
           threads: updateThread(nextBase.threads, payload.threadId, {
             session,
             messages,
-            latestTurn:
-              activeTurnId !== null
-                ? {
-                    turnId: activeTurnId,
-                    state: "running",
-                    requestedAt:
-                      thread.latestTurn?.turnId === activeTurnId
-                        ? thread.latestTurn.requestedAt
-                        : session.updatedAt,
-                    startedAt:
-                      thread.latestTurn?.turnId === activeTurnId
-                        ? (thread.latestTurn.startedAt ?? session.updatedAt)
-                        : session.updatedAt,
-                    completedAt: null,
-                    assistantMessageId:
-                      thread.latestTurn?.turnId === activeTurnId
-                        ? (thread.latestTurn.assistantMessageId ?? activeTurnAssistantMessageId)
-                        : activeTurnAssistantMessageId,
-                  }
-                : thread.latestTurn !== null &&
-                    thread.latestTurn.state === "running" &&
-                    settledTurnState !== null
-                  ? {
-                      ...thread.latestTurn,
-                      state: settledTurnState,
-                      // A running turn's completedAt can only hold a mid-turn
-                      // placeholder checkpoint timestamp — the session leaving
-                      // "running" is the authoritative turn end.
-                      completedAt: session.updatedAt,
-                    }
-                  : thread.latestTurn,
+            turns,
+            latestTurn,
             updatedAt: event.occurredAt,
           }),
         };

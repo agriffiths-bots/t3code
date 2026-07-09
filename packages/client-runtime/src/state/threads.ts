@@ -117,9 +117,15 @@ function mergeTurnBoundary(
     snapshotSettled &&
     snapshotAssistantMessageId !== null &&
     (current.completedAt === null || snapshot.completedAt >= current.completedAt);
+  const snapshotHasAuthoritativeNullBoundary =
+    snapshotSettled &&
+    snapshot.assistantMessageId === null &&
+    (current.completedAt === null || snapshot.completedAt >= current.completedAt);
   const assistantMessageId = snapshotHasAuthoritativeBoundary
     ? snapshotAssistantMessageId
-    : (current.assistantMessageId ?? snapshotAssistantMessageId);
+    : snapshotHasAuthoritativeNullBoundary
+      ? null
+      : (current.assistantMessageId ?? snapshotAssistantMessageId);
   const sourceProposedPlan = current.sourceProposedPlan ?? snapshot.sourceProposedPlan;
 
   return {

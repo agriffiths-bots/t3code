@@ -331,6 +331,8 @@ describe("orchestration projector", () => {
 
     const thread = afterRunning.threads[0];
     expect(thread?.latestTurn?.turnId).toBe("turn-1");
+    expect(thread?.turns[0]?.turnId).toBe("turn-1");
+    expect(thread?.turns[0]?.state).toBe("running");
     expect(thread?.session?.status).toBe("running");
 
     // Leaving the "running" session status settles the running turn with the
@@ -339,6 +341,9 @@ describe("orchestration projector", () => {
     expect(settledThread?.latestTurn?.turnId).toBe("turn-1");
     expect(settledThread?.latestTurn?.state).toBe("completed");
     expect(settledThread?.latestTurn?.completedAt).toBe(settledAt);
+    expect(settledThread?.turns[0]?.turnId).toBe("turn-1");
+    expect(settledThread?.turns[0]?.state).toBe("completed");
+    expect(settledThread?.turns[0]?.completedAt).toBe(settledAt);
   });
 
   it("updates canonical thread runtime mode from thread.runtime-mode-set", async () => {
@@ -1337,6 +1342,18 @@ describe("orchestration projector", () => {
         afterNewTurn.threads[0]?.messages.find((message) => message.id === "system-notice-1")
           ?.turnId,
       ).toBeNull();
+      expect(
+        afterNewTurn.threads[0]?.turns.find((turn) => turn.turnId === "turn-old"),
+      ).toMatchObject({
+        state: "completed",
+        completedAt: "2026-02-23T10:00:04.000Z",
+      });
+      expect(
+        afterNewTurn.threads[0]?.turns.find((turn) => turn.turnId === "turn-new"),
+      ).toMatchObject({
+        state: "running",
+        completedAt: null,
+      });
     }),
   );
 

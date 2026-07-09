@@ -347,8 +347,22 @@ function deriveEffectiveFinalAssistantBoundariesByTurnId(
     if (fallbackAssistantMessageId === null) {
       continue;
     }
-    if (!boundary.has(fallbackAssistantMessageId)) {
+    if (boundary.has(fallbackAssistantMessageId)) {
+      continue;
+    }
+    const matchingAssistantEntry = entries.some(
+      (entry) =>
+        entry.kind === "message" &&
+        entry.message.role === "assistant" &&
+        boundary.has(String(entry.message.id)),
+    );
+    if (matchingAssistantEntry) {
       effectiveBoundariesByTurnId.set(turnId, new Set([fallbackAssistantMessageId]));
+      continue;
+    }
+    const terminalAssistantMessageId = findTerminalAssistantAfterLastWork(entries);
+    if (terminalAssistantMessageId !== null) {
+      effectiveBoundariesByTurnId.set(turnId, new Set([terminalAssistantMessageId]));
     }
   }
 
