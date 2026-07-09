@@ -6214,6 +6214,68 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
     }).pipe(Effect.provide(NodeHttpServer.layerTest)),
   );
 
+  it.effect("reports HTTP receipt read failures as internal dispatch errors", () =>
+    Effect.gen(function* () {
+      const now = "2026-01-01T00:00:00.000Z";
+      const dispatchedCommands: OrchestrationCommand[] = [];
+
+      yield* buildAppUnderTest({
+        layers: {
+          orchestrationCommandReceiptRepository: {
+            getByCommandId: () =>
+              Effect.fail(
+                new PersistenceSqlError({
+                  operation: "OrchestrationCommandReceipts.getByCommandId:test",
+                }),
+              ),
+          },
+          orchestrationEngine: {
+            dispatch: (command) =>
+              Effect.sync(() => {
+                dispatchedCommands.push(command);
+                return { sequence: 7 };
+              }),
+            readEvents: () => Stream.empty,
+          },
+        },
+      });
+
+      const token = yield* exchangeAccessToken();
+      assert.ok(token.body.access_token);
+      const dispatchUrl = yield* getHttpServerUrl("/api/orchestration/dispatch");
+      const response = yield* fetchEffect(dispatchUrl, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${token.body.access_token}`,
+          "content-type": "application/json",
+        },
+        body: jsonRequestBody({
+          type: "thread.turn.start",
+          commandId: CommandId.make("cmd-http-receipt-read-failure"),
+          threadId: defaultThreadId,
+          message: {
+            messageId: MessageId.make("msg-http-receipt-read-failure"),
+            role: "user",
+            text: "receipt read should be retryable",
+            attachments: [],
+          },
+          interactionMode: "default",
+          runtimeMode: "full-access",
+          createdAt: now,
+        }),
+      });
+      const responseBody = yield* responseJsonEffect<{
+        readonly code: string;
+        readonly reason: string;
+      }>(response);
+
+      assert.equal(response.status, 500);
+      assert.equal(responseBody.code, "internal_error");
+      assert.equal(responseBody.reason, "orchestration_dispatch_failed");
+      assert.deepEqual(dispatchedCommands, []);
+    }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+
   it.effect("keeps accepted turn-start retries idempotent after archive preflight", () =>
     Effect.gen(function* () {
       const fileSystem = yield* FileSystem.FileSystem;
@@ -7764,6 +7826,13 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
       const removeWorktree = vi.fn(
         (_: Parameters<GitVcsDriver.GitVcsDriver["Service"]["removeWorktree"]>[0]) => Effect.void,
       );
+      const runForThread = vi.fn(
+        (
+          _: Parameters<
+            ProjectSetupScriptRunner.ProjectSetupScriptRunner["Service"]["runForThread"]
+          >[0],
+        ) => Effect.die(new Error("unexpected setup script")),
+      );
 
       yield* buildAppUnderTest({
         layers: {
@@ -7789,6 +7858,22 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
                 behindCount: 0,
                 pr: null,
               }),
+          },
+          projectSetupScriptRunner: {
+            runForThread,
+          },
+          projectionSnapshotQuery: {
+            getThreadShellByIdIncludingArchived: (requestedThreadId) =>
+              Effect.succeed(
+                requestedThreadId === threadId
+                  ? Option.some(
+                      makeDefaultOrchestrationThreadShell({
+                        id: threadId,
+                        archivedAt: createdAt,
+                      }),
+                    )
+                  : Option.none(),
+              ),
           },
           orchestrationEngine: {
             dispatch: (command) =>
@@ -7844,7 +7929,7 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
                 baseBranch: "main",
                 branch: "t3code/archive-race",
               },
-              runSetupScript: false,
+              runSetupScript: true,
             },
             createdAt,
           }),
@@ -7861,6 +7946,7 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
       assertTrue(dispatchedCommands.every((command) => command.type !== "thread.delete"));
       assert.equal(createWorktree.mock.calls.length, 1);
       assert.equal(removeWorktree.mock.calls.length, 0);
+      assert.equal(runForThread.mock.calls.length, 0);
     }).pipe(Effect.provide(NodeHttpServer.layerTest)),
   );
 

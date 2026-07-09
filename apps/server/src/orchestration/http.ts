@@ -2,8 +2,11 @@ import {
   AuthOrchestrationOperateScope,
   AuthOrchestrationReadScope,
   EnvironmentHttpApi,
+  OrchestrationDispatchCommandError,
 } from "@t3tools/contracts";
+import * as Cause from "effect/Cause";
 import * as Effect from "effect/Effect";
+import * as Exit from "effect/Exit";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 import * as HttpApiBuilder from "effect/unstable/httpapi/HttpApiBuilder";
@@ -27,6 +30,7 @@ const isClientCommandDispatchError = (cause: unknown) =>
   isOrchestrationCommandInvariantError(cause) ||
   isOrchestrationCommandPreviouslyRejectedError(cause);
 
+const isOrchestrationDispatchCommandError = Schema.is(OrchestrationDispatchCommandError);
 const isOrchestrationCommandInvariantError = Schema.is(OrchestrationCommandInvariantError);
 const isOrchestrationCommandPreviouslyRejectedError = Schema.is(
   OrchestrationCommandPreviouslyRejectedError,
@@ -91,9 +95,15 @@ export const orchestrationHttpApiLayer = HttpApiBuilder.group(
         Effect.fn("environment.orchestration.dispatch")(function* (args) {
           yield* annotateEnvironmentRequest(args.endpoint.name);
           yield* requireEnvironmentScope(AuthOrchestrationOperateScope);
-          const normalizedCommand = yield* normalizeDispatchCommand(args.payload).pipe(
-            Effect.catch(() => failEnvironmentInvalidRequest("invalid_command")),
-          );
+          const normalizedCommandExit = yield* Effect.exit(normalizeDispatchCommand(args.payload));
+          if (Exit.isFailure(normalizedCommandExit)) {
+            const cause = Cause.squash(normalizedCommandExit.cause);
+            if (isOrchestrationDispatchCommandError(cause)) {
+              return yield* failEnvironmentInvalidRequest("invalid_command");
+            }
+            return yield* failEnvironmentInternal("orchestration_dispatch_failed", cause);
+          }
+          const normalizedCommand = normalizedCommandExit.value;
           return yield* orchestrationEngine.dispatch(normalizedCommand).pipe(
             Effect.catch((cause) =>
               Effect.gen(function* () {

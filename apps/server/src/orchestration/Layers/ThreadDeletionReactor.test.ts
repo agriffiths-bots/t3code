@@ -24,6 +24,7 @@ import {
   ProviderService,
   type ProviderServiceShape,
 } from "../../provider/Services/ProviderService.ts";
+import { ProviderSessionNotFoundError } from "../../provider/Errors.ts";
 import { makeProviderRegistryLayer } from "../../provider/testUtils/providerRegistryMock.ts";
 import { ServerSettingsService } from "../../serverSettings.ts";
 import { PersistenceSqlError } from "../../persistence/Errors.ts";
@@ -454,6 +455,104 @@ describe("ThreadDeletionReactor", () => {
       expect(stopSession).toHaveBeenCalledWith({ threadId });
       expect(closeTerminal).toHaveBeenCalledWith({ threadId });
       expect(runtimeSessions).toHaveLength(0);
+    }),
+  );
+
+  it.effect("records replayed stopped sessions when provider stop cannot route", () =>
+    Effect.gen(function* () {
+      const domainEvents = yield* PubSub.unbounded<OrchestrationEvent>();
+      const threadId = ThreadId.make("startup-archived-stop-fails");
+      const archiveEvent = archivedEvent(threadId, 1);
+      const dispatchedCommands: OrchestrationCommand[] = [];
+      const closeTerminal = vi.fn<TerminalManager.TerminalManager["Service"]["close"]>(
+        () => Effect.void,
+      );
+      const stopSession = vi.fn<ProviderServiceShape["stopSession"]>(() =>
+        Effect.fail(new ProviderSessionNotFoundError({ threadId })),
+      );
+
+      const engine = {
+        readEvents: () => Stream.fromIterable([archiveEvent]),
+        streamDomainEvents: Stream.fromPubSub(domainEvents),
+        dispatch: (command: OrchestrationCommand) =>
+          Effect.sync(() => {
+            dispatchedCommands.push(command);
+            return { sequence: 2 };
+          }),
+      } satisfies OrchestrationEngineService["Service"];
+
+      const providerService: ProviderServiceShape = {
+        startSession: () => unsupported(),
+        sendTurn: () => unsupported(),
+        interruptTurn: () => unsupported(),
+        respondToRequest: () => unsupported(),
+        respondToUserInput: () => unsupported(),
+        stopSession,
+        listSessions: () => Effect.succeed([]),
+        getCapabilities: () => Effect.succeed({ sessionModelSwitch: "in-session" }),
+        getInstanceInfo: () => unsupported(),
+        rollbackConversation: () => unsupported(),
+        streamEvents: Stream.empty,
+      };
+
+      const terminalManager: TerminalManager.TerminalManager["Service"] = {
+        open: () => unsupported(),
+        attachStream: () => unsupported(),
+        write: () => unsupported(),
+        resize: () => unsupported(),
+        clear: () => unsupported(),
+        restart: () => unsupported(),
+        close: closeTerminal,
+        subscribe: () => Effect.succeed(() => undefined),
+        subscribeMetadata: () => Effect.succeed(() => undefined),
+      };
+
+      const layer = ThreadDeletionReactorLive.pipe(
+        Layer.provideMerge(Layer.succeed(OrchestrationEngineService, engine)),
+        Layer.provideMerge(
+          Layer.mock(ProjectionSnapshotQuery)({
+            getThreadShellByIdIncludingArchived: () =>
+              Effect.succeed(
+                Option.some({
+                  id: threadId,
+                  archivedAt: now,
+                  session: sessionFor(threadId),
+                } as never),
+              ),
+          }),
+        ),
+        Layer.provideMerge(Layer.succeed(ProviderService, providerService)),
+        Layer.provideMerge(Layer.succeed(TerminalManager.TerminalManager, terminalManager)),
+      );
+
+      yield* Effect.scoped(
+        Effect.gen(function* () {
+          const threadDeletionReactor = yield* ThreadDeletionReactor;
+          yield* threadDeletionReactor.start();
+          yield* waitFor(
+            () =>
+              stopSession.mock.calls.length === 1 &&
+              dispatchedCommands.length === 1 &&
+              closeTerminal.mock.calls.length === 1,
+          );
+          yield* threadDeletionReactor.drain;
+        }).pipe(Effect.provide(layer)),
+      );
+
+      expect(dispatchedCommands).toMatchObject([
+        {
+          type: "thread.session.set",
+          threadId,
+          session: {
+            status: "stopped",
+            providerName: "codex",
+            providerInstanceId: ProviderInstanceId.make("codex"),
+            runtimeMode: "approval-required",
+          },
+        },
+      ]);
+      expect(stopSession).toHaveBeenCalledWith({ threadId });
+      expect(closeTerminal).toHaveBeenCalledWith({ threadId });
     }),
   );
 

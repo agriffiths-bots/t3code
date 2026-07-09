@@ -122,16 +122,9 @@ export const normalizeDispatchCommand = (command: ClientOrchestrationCommand) =>
     }
 
     const commandReceiptRepository = yield* OrchestrationCommandReceiptRepository;
-    const existingReceipt = yield* commandReceiptRepository
-      .getByCommandId({ commandId: command.commandId })
-      .pipe(
-        Effect.mapError(
-          () =>
-            new OrchestrationDispatchCommandError({
-              message: `Failed to read command receipt for '${command.commandId}' before dispatching '${command.type}'.`,
-            }),
-        ),
-      );
+    const existingReceipt = yield* commandReceiptRepository.getByCommandId({
+      commandId: command.commandId,
+    });
     if (Option.isSome(existingReceipt)) {
       return command as unknown as OrchestrationCommand;
     }

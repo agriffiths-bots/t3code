@@ -187,7 +187,11 @@ const make = Effect.gen(function* () {
       effect: Effect.gen(function* () {
         const { event, projectedSession, runtimeSession } = input;
         const threadId = event.payload.threadId;
-        yield* providerService.stopSession({ threadId });
+        yield* logCleanupCauseUnlessInterrupted({
+          effect: providerService.stopSession({ threadId }),
+          message: "thread archive replay cleanup skipped provider session stop",
+          threadId,
+        });
         const providerInstanceId =
           projectedSession?.providerInstanceId ?? runtimeSession?.providerInstanceId;
         yield* orchestrationEngine.dispatch({
@@ -208,7 +212,7 @@ const make = Effect.gen(function* () {
           createdAt: event.occurredAt,
         });
       }),
-      message: "thread archive replay cleanup skipped provider session stop",
+      message: "thread archive replay cleanup skipped stopped session projection",
       threadId: input.event.payload.threadId,
     });
 

@@ -460,6 +460,22 @@ export const layer = Layer.effect(
             ),
           );
 
+      const rejectFinalTurnIfThreadArchived = () =>
+        projectionSnapshotQuery.getThreadShellByIdIncludingArchived(command.threadId).pipe(
+          Effect.mapError((cause) =>
+            toDispatchCommandError(cause, "Failed to read bootstrap thread archive state."),
+          ),
+          Effect.flatMap(
+            Option.match({
+              onNone: () => Effect.void,
+              onSome: (thread) =>
+                thread.archivedAt === null
+                  ? Effect.void
+                  : orchestrationEngine.dispatch(finalTurnStartCommand).pipe(Effect.asVoid),
+            }),
+          ),
+        );
+
       const runSetupProgram = () =>
         Effect.gen(function* () {
           if (!bootstrap?.runSetupScript || !targetWorktreePath) {
@@ -469,6 +485,7 @@ export const layer = Layer.effect(
           if (Option.isSome(finalTurnReceipt)) {
             return;
           }
+          yield* rejectFinalTurnIfThreadArchived();
           const worktreePath = targetWorktreePath;
           const requestedAt = yield* nowIso;
           yield* projectSetupScriptRunner
