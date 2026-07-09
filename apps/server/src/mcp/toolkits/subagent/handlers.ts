@@ -105,12 +105,17 @@ import {
 
 const nowIso = Effect.map(DateTime.now, DateTime.formatIso);
 const isThreadStartToolError = Schema.is(ThreadStartToolError);
+const isSubagentPeerTargetNotFoundError = Schema.is(
+  SubagentPeerRegistry.SubagentPeerTargetNotFoundError,
+);
 const WAIT_PROJECTION_ENRICHMENT_TIMEOUT_MS = 250;
 const PEER_SPAWN_PROBE_TIMEOUT = Duration.seconds(5);
 const PEER_TOOL_CALL_TIMEOUT_SECONDS = 5;
 const PEER_TOOL_CALL_TIMEOUT = Duration.seconds(PEER_TOOL_CALL_TIMEOUT_SECONDS);
 const PEER_SESSION_CLOSE_TIMEOUT = Duration.seconds(2);
 const REMOTE_TERMINAL_DELIVERY_CLAIM_TTL_MS = 5 * 60 * 1_000;
+const UNTRACKED_PROJECTION_CHILD_ERROR =
+  "Sub-agent thread exists in the projection but is not tracked by this server instance.";
 const FOREGROUND_SPAWN_PENDING_WARNING =
   "Sub-agent is still running after the initial foreground wait; returning launch metadata now. Use t3_wait_subagent to wait for terminal delivery, or stop polling and let the parent wake automatically when it completes.";
 
@@ -594,22 +599,45 @@ const remoteChildStatusFromToolStatus = (status: string): RemoteChildStatus => {
 const childTerminalStatusFromRemoteStatus = (status: string): ChildTerminalStatus =>
   status === "completed" ? "completed" : status === "killed" ? "killed" : "failed";
 
+const remoteTerminalWakeDedupeKey = (child: RemoteChild): string =>
+  `remote-subagent-wake:${child.parentThreadId}:${child.childEnvironmentId}:${child.childThreadId}`;
+
 const resolveRemoteChildPeer = (runtime: SubagentRuntime, child: RemoteChild) =>
-  runtime.peerRegistry.resolveTarget(child.alias).pipe(
-    Effect.catch(() => runtime.peerRegistry.resolveTarget(child.childEnvironmentId)),
-    Effect.flatMap((peer) =>
-      peer.environmentId === child.childEnvironmentId
-        ? Effect.succeed(peer)
-        : Effect.fail(
-            fail(
-              `Remote child ${child.childThreadId} belongs to environment ${child.childEnvironmentId}, but peer alias '${child.alias}' now points at ${peer.environmentId}.`,
-            ),
-          ),
-    ),
-    Effect.mapError((error) =>
-      isThreadStartToolError(error) ? error : fail(error.message ?? "Remote peer was not found."),
-    ),
-  );
+  Effect.gen(function* () {
+    const resolveOption = (target: string) =>
+      runtime.peerRegistry.resolveTarget(target).pipe(
+        Effect.map(Option.some),
+        Effect.catch((error) =>
+          isSubagentPeerTargetNotFoundError(error)
+            ? Effect.succeed(Option.none())
+            : Effect.fail(fail(error.message)),
+        ),
+      );
+    const aliasPeer = yield* resolveOption(child.alias);
+    if (Option.isSome(aliasPeer) && aliasPeer.value.environmentId === child.childEnvironmentId) {
+      return aliasPeer.value;
+    }
+    const environmentPeer = yield* resolveOption(child.childEnvironmentId);
+    if (
+      Option.isSome(environmentPeer) &&
+      environmentPeer.value.environmentId === child.childEnvironmentId
+    ) {
+      return environmentPeer.value;
+    }
+    if (Option.isSome(environmentPeer)) {
+      return yield* fail(
+        `Remote child ${child.childThreadId} belongs to environment ${child.childEnvironmentId}, but environment-id lookup resolved alias '${environmentPeer.value.alias}' at ${environmentPeer.value.environmentId}.`,
+      );
+    }
+    if (Option.isSome(aliasPeer)) {
+      return yield* fail(
+        `Remote child ${child.childThreadId} belongs to environment ${child.childEnvironmentId}, but peer alias '${child.alias}' now points at ${aliasPeer.value.environmentId}.`,
+      );
+    }
+    return yield* fail(
+      `Remote child ${child.childThreadId} belongs to environment ${child.childEnvironmentId}, but peer alias '${child.alias}' is not registered.`,
+    );
+  });
 
 const withPeerToolTimeout = <A>(
   effect: Effect.Effect<A, ThreadStartToolError>,
@@ -758,6 +786,7 @@ const deliverRemoteCompletion = (
       status: terminalStatus,
       finalAssistantText: check.latestAssistantText,
       error,
+      dedupeKey: remoteTerminalWakeDedupeKey(child),
     });
   });
 
@@ -1133,6 +1162,78 @@ const waitRemoteSubagents = Effect.fn("SubagentToolkit.waitRemoteSubagents")(fun
       Exit.isSuccess(exit) ? Effect.void : restoreAllSuppressedTerminalWakes("wait interrupted"),
     ),
   );
+});
+
+const isUntrackedProjectionWaitRow = (row: WaitSliceResult["results"][number]): boolean =>
+  row.status === "failed" && row.error === UNTRACKED_PROJECTION_CHILD_ERROR;
+
+const peerProjectionWaitRow = (
+  runtime: SubagentRuntime,
+  row: WaitSliceResult["results"][number],
+  callerDeadlineMs: number,
+  observedAtMs: number,
+): Effect.Effect<WaitSliceResult["results"][number], ThreadStartToolError> =>
+  loadThreadDetail(runtime, row.childThreadId).pipe(
+    Effect.map((thread) =>
+      Option.match(thread, {
+        onNone: () => row,
+        onSome: (detail): WaitSliceResult["results"][number] => {
+          const terminalStatus = reliableWaitTerminalStatusOf(detail);
+          if (terminalStatus === "completed") {
+            return {
+              childThreadId: row.childThreadId,
+              status: "completed",
+              finalAssistantText: finalAssistantTextFromThread(detail),
+              error: null,
+            };
+          }
+          if (terminalStatus === "failed") {
+            return {
+              childThreadId: row.childThreadId,
+              status: "failed",
+              finalAssistantText: finalAssistantTextFromThread(detail),
+              error: "Child thread ended with status failed.",
+            };
+          }
+          const timedOut = observedAtMs >= callerDeadlineMs;
+          return {
+            childThreadId: row.childThreadId,
+            status: timedOut ? "timeout" : "pending",
+            finalAssistantText: null,
+            error: timedOut ? "wait exceeded budget" : null,
+          };
+        },
+      }),
+    ),
+  );
+
+const applyPeerProjectionWaitFallback = Effect.fn(
+  "SubagentToolkit.applyPeerProjectionWaitFallback",
+)(function* (input: {
+  readonly invocation: McpInvocationContext.McpInvocationScope;
+  readonly runtime: SubagentRuntime;
+  readonly slice: WaitSliceResult;
+  readonly mode: "all" | "any";
+  readonly callerDeadlineMs: number;
+  readonly observedAtMs: number;
+}) {
+  if (McpInvocationContext.isProviderInvocationScope(input.invocation)) return input.slice;
+  if (!input.slice.results.some(isUntrackedProjectionWaitRow)) return input.slice;
+  const results = yield* Effect.forEach(
+    input.slice.results,
+    (row) =>
+      isUntrackedProjectionWaitRow(row)
+        ? peerProjectionWaitRow(input.runtime, row, input.callerDeadlineMs, input.observedAtMs)
+        : Effect.succeed(row),
+    { concurrency: "unbounded" },
+  );
+  return {
+    results,
+    settledCount: results.filter((row) => isWaitTerminal(row.status)).length,
+    timedOutCount: results.filter((row) => row.status === "timeout").length,
+    pending: pendingForMode(results, input.mode),
+    resumeToken: input.slice.resumeToken,
+  } satisfies WaitSliceResult;
 });
 
 const pollRemoteChildrenOnce = Effect.fn("SubagentToolkit.pollRemoteChildrenOnce")(function* (
@@ -1628,11 +1729,20 @@ const waitSubagent = Effect.fn("SubagentToolkit.wait")(function* (input: WaitSub
   return yield* Effect.gen(function* () {
     // One bounded slice per invocation — the agent re-calls with the returned
     // resumeToken while `pending` is true (never one long HTTP hold).
-    const slice = yield* coordinator.waitSlice({
+    const rawSlice = yield* coordinator.waitSlice({
       childThreadIds,
       mode: input.mode ?? "all",
       budgetDeadlineMs,
       ...(coordinatorToken !== undefined ? { resumeToken: coordinatorToken } : {}),
+    });
+    const afterSliceMs = yield* Effect.clockWith((clock) => clock.currentTimeMillis);
+    const slice = yield* applyPeerProjectionWaitFallback({
+      invocation,
+      runtime,
+      slice: rawSlice,
+      mode: input.mode ?? "all",
+      callerDeadlineMs,
+      observedAtMs: afterSliceMs,
     });
     terminalWaitChildIds.clear();
     for (const row of slice.results) {
@@ -1641,7 +1751,6 @@ const waitSubagent = Effect.fn("SubagentToolkit.wait")(function* (input: WaitSub
       }
     }
 
-    const afterSliceMs = yield* Effect.clockWith((clock) => clock.currentTimeMillis);
     const enrichedRows = yield* Effect.forEach(
       slice.results,
       (
@@ -1727,9 +1836,12 @@ const waitSubagent = Effect.fn("SubagentToolkit.wait")(function* (input: WaitSub
       pending: pendingForMode(effectiveRows, input.mode ?? "all"),
       resumeToken: slice.resumeToken,
     };
+    const untrackedProjectionChildIds = new Set(
+      rawSlice.results.filter(isUntrackedProjectionWaitRow).map((row) => String(row.childThreadId)),
+    );
     const coordinatorTerminalIds = new Set(
-      slice.results
-        .filter((row) => isWaitTerminal(row.status))
+      rawSlice.results
+        .filter((row) => isWaitTerminal(row.status) && !isUntrackedProjectionWaitRow(row))
         .map((row) => String(row.childThreadId)),
     );
     const projectionTerminalIds = new Set(
@@ -1752,16 +1864,21 @@ const waitSubagent = Effect.fn("SubagentToolkit.wait")(function* (input: WaitSub
     // rather than the caller's requested timeout, those timeout rows are still
     // running children that must be promoted to wake-on-completion.
     const autoPromoteDeadlineWasActive = autoPromoteDeadlineMs <= callerDeadlineMs;
-    const autoPromote =
-      autoPromoteDeadlineWasActive &&
-      afterSliceMs >= autoPromoteDeadlineMs &&
-      effectiveSlice.results.some((row) => row.status === "pending" || row.status === "timeout");
-    const stillRunningIds = autoPromote
-      ? effectiveSlice.results
-          .filter((row) => row.status === "pending" || row.status === "timeout")
-          .map((row) => row.childThreadId)
-      : [];
-    if (autoPromote && stillRunningIds.length > 0) {
+    const stillRunningIds =
+      autoPromoteDeadlineWasActive && afterSliceMs >= autoPromoteDeadlineMs
+        ? effectiveSlice.results
+            .filter(
+              (row) =>
+                (row.status === "pending" || row.status === "timeout") &&
+                !untrackedProjectionChildIds.has(String(row.childThreadId)),
+            )
+            .map((row) => row.childThreadId)
+        : [];
+    const autoPromote = stillRunningIds.length > 0;
+    const autoPromotedChildIds = new Set(
+      stillRunningIds.map((childThreadId) => String(childThreadId)),
+    );
+    if (autoPromote) {
       yield* coordinator.promoteToWake(stillRunningIds);
     }
 
@@ -1776,7 +1893,8 @@ const waitSubagent = Effect.fn("SubagentToolkit.wait")(function* (input: WaitSub
           Effect.timeoutOption(`${WAIT_PROJECTION_ENRICHMENT_TIMEOUT_MS} millis`),
           Effect.map((thread) => {
             const promotedRunning =
-              autoPromote && (row.status === "pending" || row.status === "timeout");
+              autoPromotedChildIds.has(String(row.childThreadId)) &&
+              (row.status === "pending" || row.status === "timeout");
             return {
               childThreadId: row.childThreadId,
               status: promotedRunning ? "running" : row.status,
@@ -1797,6 +1915,14 @@ const waitSubagent = Effect.fn("SubagentToolkit.wait")(function* (input: WaitSub
         ),
       { concurrency: "unbounded" },
     );
+    const reportedTimedOutCount = autoPromote
+      ? effectiveSlice.results.filter(
+          (row) => row.status === "timeout" && !autoPromotedChildIds.has(String(row.childThreadId)),
+        ).length
+      : effectiveSlice.timedOutCount;
+    const reportedPending = autoPromote
+      ? pendingForMode(results, input.mode ?? "all")
+      : effectiveSlice.pending;
 
     if (waitDeliveredRows.length > 0) {
       const markableRows = yield* markableWaitDeliveredRows(
@@ -1820,10 +1946,10 @@ const waitSubagent = Effect.fn("SubagentToolkit.wait")(function* (input: WaitSub
     return {
       results,
       settledCount: effectiveSlice.settledCount,
-      timedOutCount: autoPromote ? 0 : effectiveSlice.timedOutCount,
-      // Auto-promote is a terminal return: the model must stop waiting, so this is
-      // never reported as still-pending even though some children are running.
-      pending: autoPromote ? false : effectiveSlice.pending,
+      timedOutCount: reportedTimedOutCount,
+      // Auto-promoted rows have a wake path and are reported as running/notified;
+      // projection-only peer rows keep their polling status.
+      pending: reportedPending,
       resumeToken: `${waitStartMs}:${effectiveSlice.resumeToken}`,
       ...(autoPromote ? { promoted: true } : {}),
     };
@@ -1872,6 +1998,66 @@ const listSubagents = Effect.fn("SubagentToolkit.list")(function* (input: ListSu
     ),
   );
 
+  const registeredIds = new Set(registered.map((entry) => String(entry.childThreadId)));
+  const projectionPeerChildren =
+    McpInvocationContext.isProviderInvocationScope(invocation) ||
+    invocation.sourceEnvironmentId === undefined
+      ? []
+      : yield* runtime.projectionSnapshotQuery.getShellSnapshot().pipe(
+          Effect.mapError((error) => toToolError(error, "Failed to load thread list.")),
+          Effect.map((snapshot) =>
+            snapshot.threads.filter(
+              (thread) =>
+                thread.parentThreadId === parentThreadId &&
+                thread.parentEnvironmentId === invocation.sourceEnvironmentId &&
+                !registeredIds.has(String(thread.id)),
+            ),
+          ),
+          Effect.flatMap((threads) =>
+            Effect.forEach(
+              threads,
+              (thread) =>
+                loadThreadDetail(runtime, thread.id).pipe(
+                  Effect.map((detail) =>
+                    Option.match(detail, {
+                      onNone: () => {
+                        const status = statusOf({
+                          latestTurn: thread.latestTurn,
+                          messages: [],
+                          session: thread.session,
+                        });
+                        return {
+                          childThreadId: thread.id,
+                          parentThreadId,
+                          detached: true,
+                          depth: 1,
+                          spawnedAtMs: Date.parse(thread.createdAt),
+                          settled: isWaitTerminal(status),
+                          status,
+                          turnCount: thread.latestTurn === null ? 0 : 1,
+                        };
+                      },
+                      onSome: (detailThread) => {
+                        const status = statusOf(detailThread);
+                        return {
+                          childThreadId: thread.id,
+                          parentThreadId,
+                          detached: true,
+                          depth: 1,
+                          spawnedAtMs: Date.parse(thread.createdAt),
+                          settled: isWaitTerminal(status),
+                          status,
+                          turnCount: turnCountOf(detailThread),
+                        };
+                      },
+                    }),
+                  ),
+                ),
+              { concurrency: "unbounded" },
+            ),
+          ),
+        );
+
   const remoteRows = yield* runtime.remoteChildren
     .listByParent({ parentThreadId })
     .pipe(Effect.mapError((error) => toToolError(error, "Failed to list remote children.")));
@@ -1906,7 +2092,7 @@ const listSubagents = Effect.fn("SubagentToolkit.list")(function* (input: ListSu
     { concurrency: "unbounded" },
   );
 
-  return { parentThreadId, children: [...children, ...remoteChildren] };
+  return { parentThreadId, children: [...children, ...projectionPeerChildren, ...remoteChildren] };
 });
 
 const validateCron = (

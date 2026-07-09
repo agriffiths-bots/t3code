@@ -5060,6 +5060,57 @@ describe("ChildThreadCoordinator", () => {
     expect(await runtimeHasPending(harness, lostParent)).toBe(false);
   });
 
+  it("R-B exactly-once: a keyed external wake retry is not re-delivered after its row was deleted", async () => {
+    const parent = ThreadId.make("xo-keyed-parent");
+    const child = ThreadId.make("xo-keyed-child");
+    const dedupeKey = "remote-subagent-wake:xo-keyed-parent:peer-env:xo-keyed-child";
+    const harness = await createHarness({
+      threads: [
+        makeThreadState({
+          threadId: parent,
+          latestTurn: makeLatestTurn("completed"),
+          session: makeSession(parent, "ready"),
+        }),
+      ],
+    });
+
+    await Effect.runPromise(
+      harness.coordinator.enqueueParentInjection({
+        parentThreadId: parent,
+        childThreadId: child,
+        status: "completed",
+        finalAssistantText: "first remote result",
+        error: null,
+        dedupeKey,
+      }),
+    );
+
+    const firstStarts = harness.dispatched.filter(
+      (c) => c.type === "thread.turn.start" && c.threadId === parent,
+    ) as Array<Extract<OrchestrationCommand, { type: "thread.turn.start" }>>;
+    expect(firstStarts).toHaveLength(1);
+    expect(firstStarts[0]?.commandId).toBe(`server:subagent-wake:${dedupeKey}`);
+    expect(await harness.listPendingDispatches()).toHaveLength(0);
+
+    await Effect.runPromise(
+      harness.coordinator.enqueueParentInjection({
+        parentThreadId: parent,
+        childThreadId: child,
+        status: "completed",
+        finalAssistantText: "duplicate remote result",
+        error: null,
+        dedupeKey,
+      }),
+    );
+
+    const startsAfterRetry = harness.dispatched.filter(
+      (c) => c.type === "thread.turn.start" && c.threadId === parent,
+    );
+    expect(startsAfterRetry).toHaveLength(1);
+    expect(await harness.listPendingDispatches()).toHaveLength(0);
+    expect(await runtimeHasPending(harness, parent)).toBe(false);
+  });
+
   it("R-B exactly-once: a landed-but-undeleted batch is NOT re-delivered when a new row re-batches it", async () => {
     // The hard case the deterministic-batch-id alone could not cover: rows [X,Y]
     // were claimed+dispatched as ONE consolidated turn under a fixed commandId and

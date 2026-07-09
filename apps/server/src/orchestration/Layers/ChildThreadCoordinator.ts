@@ -83,12 +83,11 @@ interface PendingInjection {
   readonly deliveredByWait: boolean;
   readonly waitCancellable: boolean;
   /**
-   * The command id this row was already claimed+dispatched under before a crash
-   * (R-B exactly-once). Null for a fresh injection that may be consolidated into
-   * a batch under a fresh deterministic id; non-null means it MUST be
-   * re-dispatched under this exact id so the engine's receipt dedup makes a
-   * landed turn a no-op (no duplicate) and an un-landed turn fire (no loss),
-   * regardless of how the rows happen to re-batch on restart.
+   * The command id this row must dispatch under (R-B exactly-once). Null for a
+   * fresh injection that may be consolidated into a batch under a fresh
+   * deterministic id; non-null means it MUST be dispatched alone under this exact
+   * id so the engine's receipt dedup makes a landed turn a no-op (no duplicate)
+   * and an un-landed turn fire (no loss), regardless of how rows later re-batch.
    */
   readonly claimedCommandId: CommandId | null;
 }
@@ -385,14 +384,19 @@ const make = Effect.gen(function* () {
   // successful drain/dispatch (delete-on-dispatch => idempotent, no double-fire).
   const persistInjection = (
     parentThreadId: ThreadId,
-    result: ChildWaitResult,
+    result: ChildWaitResult & Pick<EnqueueParentInjectionInput, "dedupeKey">,
     deliveredByWait: boolean,
     waitCancellable: boolean,
   ) =>
     Effect.gen(function* () {
       const now = yield* nowMillis;
       const createdAt = yield* nowIso;
-      const id = (yield* randomUUID) as PendingDispatchId;
+      const id =
+        result.dedupeKey === undefined
+          ? ((yield* randomUUID) as PendingDispatchId)
+          : (result.dedupeKey as PendingDispatchId);
+      const claimedCommandId =
+        result.dedupeKey === undefined ? null : dispatchCommandIdFor("subagent-wake", id);
       const row: PendingDispatch = {
         id,
         kind: "parent_injection",
@@ -401,7 +405,7 @@ const make = Effect.gen(function* () {
         text: result.finalAssistantText,
         error: result.error,
         status: result.status,
-        commandId: null,
+        commandId: claimedCommandId,
         deliveredByWait,
         waitCancellable,
         createdAt: IsoDateTime.make(createdAt),
@@ -417,7 +421,7 @@ const make = Effect.gen(function* () {
         dispatchId: id,
         deliveredByWait,
         waitCancellable,
-        claimedCommandId: null,
+        claimedCommandId,
       } satisfies PendingInjection;
     });
 
@@ -967,7 +971,7 @@ const make = Effect.gen(function* () {
   // wakeParent still completes.
   const wakeParent = (
     record: Pick<ChildRecord, "parentThreadId" | "detached">,
-    result: ChildWaitResult,
+    result: ChildWaitResult & Pick<EnqueueParentInjectionInput, "dedupeKey">,
   ) =>
     Effect.gen(function* () {
       const parentThreadId = record.parentThreadId;
@@ -1680,19 +1684,21 @@ const make = Effect.gen(function* () {
 
   const enqueueParentInjection: ChildThreadCoordinatorShape["enqueueParentInjection"] = (
     input: EnqueueParentInjectionInput,
-  ) =>
-    wakeParent(
+  ) => {
+    const result: ChildWaitResult = {
+      childThreadId: input.childThreadId,
+      status: input.status,
+      finalAssistantText: input.finalAssistantText,
+      error: input.error,
+    };
+    return wakeParent(
       {
         parentThreadId: input.parentThreadId,
         detached: true,
       },
-      {
-        childThreadId: input.childThreadId,
-        status: input.status,
-        finalAssistantText: input.finalAssistantText,
-        error: input.error,
-      },
+      input.dedupeKey === undefined ? result : { ...result, dedupeKey: input.dedupeKey },
     );
+  };
 
   const listChildren: ChildThreadCoordinatorShape["listChildren"] = (parentThreadId) =>
     Effect.gen(function* () {

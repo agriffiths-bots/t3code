@@ -28,6 +28,7 @@ import { describe, expect, it } from "@effect/vitest";
 
 import {
   ChildThreadCoordinator,
+  type ChildListEntry,
   type ChildThreadCoordinatorShape,
   type WaitDeliveredMark,
   type WaitSliceInput,
@@ -163,6 +164,7 @@ let childDetailLatestTurnCompletedAt = "2026-06-17T10:01:00.000Z";
 let childDetailMessages: OrchestrationThread["messages"] | null = null;
 let childDetailSession: OrchestrationThread["session"] | null = null;
 let childDetailCheckpoints: OrchestrationThread["checkpoints"] | null = null;
+let childShellParentEnvironmentId: EnvironmentId | null = null;
 
 const makeChildDetail = (): OrchestrationThread => ({
   id: childThreadId,
@@ -231,6 +233,7 @@ const makeChildShell = (turnState: "completed" | "running" = "completed") => ({
   hasPendingUserInput: false,
   hasActionableProposedPlan: false,
   parentThreadId,
+  parentEnvironmentId: childShellParentEnvironmentId,
 });
 
 // Test seams: mutable holders the per-test layers reconfigure before driving a
@@ -257,6 +260,7 @@ const promotedCalls: Array<ReadonlyArray<ThreadId>> = [];
 let promoteToWakeDefect: unknown | null = null;
 const markWaitDeliveredCalls: Array<ReadonlyArray<WaitDeliveredMark>> = [];
 const abandonWaitDeliveryCalls: Array<ReadonlyArray<ThreadId>> = [];
+let listChildrenOverride: ReadonlyArray<ChildListEntry> | null = null;
 const enqueuedParentInjections: Array<{
   readonly parentThreadId: ThreadId;
   readonly childThreadId: ThreadId;
@@ -264,6 +268,7 @@ const enqueuedParentInjections: Array<{
   readonly finalAssistantText: string | null;
   readonly error: string | null;
 }> = [];
+const enqueuedParentInjectionDedupeKeys: Array<string | null> = [];
 const assertParentCalls: Array<{
   readonly parentThreadId: ThreadId;
   readonly childThreadId: ThreadId;
@@ -621,23 +626,31 @@ const coordinatorLayer = Layer.succeed(ChildThreadCoordinator, {
         return;
       }
       remoteTerminalDeliveryEvents.push("enqueue");
-      enqueuedParentInjections.push(input);
+      enqueuedParentInjectionDedupeKeys.push(input.dedupeKey ?? null);
+      enqueuedParentInjections.push({
+        parentThreadId: input.parentThreadId,
+        childThreadId: input.childThreadId,
+        status: input.status,
+        finalAssistantText: input.finalAssistantText,
+        error: input.error,
+      });
     }),
   listChildren: (parent) =>
     Effect.succeed(
-      parent === parentThreadId
-        ? [
-            {
-              childThreadId,
-              parentThreadId,
-              detached: true,
-              model: codexModel,
-              spawnedAtMs: 1,
-              depth: 1,
-              settled: true,
-            },
-          ]
-        : [],
+      listChildrenOverride ??
+        (parent === parentThreadId
+          ? [
+              {
+                childThreadId,
+                parentThreadId,
+                detached: true,
+                model: codexModel,
+                spawnedAtMs: 1,
+                depth: 1,
+                settled: true,
+              },
+            ]
+          : []),
     ),
   start: () => Effect.void,
   drain: Effect.void,
@@ -1425,6 +1438,132 @@ describe("SubagentToolkit", () => {
     ),
   );
 
+  it.effect("checks a remote child by environment id when its recorded alias was reused", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const server = yield* McpServer.McpServer;
+        const reusedEnvironmentId = EnvironmentId.make("environment-peer-reused");
+        peerRegistryPeers = [
+          {
+            ...bearerPeer(),
+            environmentId: reusedEnvironmentId,
+            httpBaseUrl: "https://wrong-peer.example/",
+            mcpEndpoint: "https://wrong-peer.example/mcp",
+          },
+          {
+            ...bearerPeer(),
+            alias: "peer-b-original",
+          },
+        ];
+        remoteChildRows = [remoteChildRow("running")];
+        peerHttpRequests.length = 0;
+        updatedRemoteChildren.length = 0;
+        peerHttpHandler = remoteCheckPeerHandler({
+          status: "running",
+          turnCount: 1,
+          latestAssistantText: null,
+        });
+
+        const result = yield* server
+          .callTool({
+            name: "t3_check_subagent",
+            arguments: { childThreadId: remoteChildThreadId },
+          })
+          .pipe(
+            Effect.provideService(McpInvocationContext.McpInvocationContext, invocation),
+            Effect.provideService(McpSchema.McpServerClient, client),
+          );
+
+        expect(result.isError).toBe(false);
+        expect(result.structuredContent).toMatchObject({
+          threadId: remoteChildThreadId,
+          status: "running",
+        });
+        expect(peerHttpRequests).toEqual(
+          expect.arrayContaining([{ method: "POST", url: "https://peer.example/mcp" }]),
+        );
+        expect(peerHttpRequests).not.toEqual(
+          expect.arrayContaining([{ method: "POST", url: "https://wrong-peer.example/mcp" }]),
+        );
+      }),
+    ).pipe(
+      Effect.ensuring(
+        Effect.sync(() => {
+          peerRegistryPeers = [];
+          remoteChildRows = [];
+          peerHttpRequests.length = 0;
+          updatedRemoteChildren.length = 0;
+          peerHttpHandler = null;
+        }),
+      ),
+      Effect.provide(TestLayer),
+    ),
+  );
+
+  it.effect(
+    "fails remote child polling when environment-id fallback resolves an alias collision",
+    () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const server = yield* McpServer.McpServer;
+          peerRegistryPeers = [
+            {
+              ...bearerPeer(),
+              environmentId: EnvironmentId.make("environment-peer-reused"),
+              httpBaseUrl: "https://wrong-peer.example/",
+              mcpEndpoint: "https://wrong-peer.example/mcp",
+            },
+            {
+              ...bearerPeer(),
+              alias: String(peerEnvironmentId),
+              environmentId: EnvironmentId.make("environment-alias-collision"),
+              httpBaseUrl: "https://collision-peer.example/",
+              mcpEndpoint: "https://collision-peer.example/mcp",
+            },
+          ];
+          remoteChildRows = [remoteChildRow("running")];
+          peerHttpRequests.length = 0;
+          updatedRemoteChildren.length = 0;
+          peerHttpHandler = remoteCheckPeerHandler({
+            status: "running",
+            turnCount: 1,
+            latestAssistantText: null,
+          });
+
+          const result = yield* server
+            .callTool({
+              name: "t3_check_subagent",
+              arguments: { childThreadId: remoteChildThreadId },
+            })
+            .pipe(
+              Effect.provideService(McpInvocationContext.McpInvocationContext, invocation),
+              Effect.provideService(McpSchema.McpServerClient, client),
+            );
+
+          expect(result.isError).toBe(true);
+          const content = result.content?.[0];
+          expect(content?.type).toBe("text");
+          if (content?.type === "text") {
+            expect(content.text).toContain("environment-id lookup resolved alias");
+            expect(content.text).toContain(String(peerEnvironmentId));
+          }
+          expect(peerHttpRequests).toEqual([]);
+          expect(updatedRemoteChildren).toEqual([]);
+        }),
+      ).pipe(
+        Effect.ensuring(
+          Effect.sync(() => {
+            peerRegistryPeers = [];
+            remoteChildRows = [];
+            peerHttpRequests.length = 0;
+            updatedRemoteChildren.length = 0;
+            peerHttpHandler = null;
+          }),
+        ),
+        Effect.provide(TestLayer),
+      ),
+  );
+
   it.effect("checks a remote child through its recorded peer and enqueues terminal wake once", () =>
     Effect.scoped(
       Effect.gen(function* () {
@@ -1434,6 +1573,7 @@ describe("SubagentToolkit", () => {
         peerHttpRequests.length = 0;
         updatedRemoteChildren.length = 0;
         enqueuedParentInjections.length = 0;
+        enqueuedParentInjectionDedupeKeys.length = 0;
         remoteTerminalDeliveryEvents.length = 0;
         remoteTerminalDeliveryClaims.clear();
         peerHttpHandler = remoteCheckPeerHandler({
@@ -1468,6 +1608,9 @@ describe("SubagentToolkit", () => {
             error: null,
           },
         ]);
+        expect(enqueuedParentInjectionDedupeKeys).toEqual([
+          `remote-subagent-wake:${parentThreadId}:${peerEnvironmentId}:${remoteChildThreadId}`,
+        ]);
         expect(updatedRemoteChildren).toEqual(
           expect.arrayContaining([
             expect.objectContaining({
@@ -1495,6 +1638,7 @@ describe("SubagentToolkit", () => {
 
         expect(duplicate.isError).toBe(false);
         expect(enqueuedParentInjections).toHaveLength(1);
+        expect(enqueuedParentInjectionDedupeKeys).toHaveLength(1);
         expect(updatedRemoteChildren).toHaveLength(1);
         expect(remoteTerminalDeliveryEvents).toEqual(["claim", "enqueue", "mark"]);
       }),
@@ -1506,6 +1650,7 @@ describe("SubagentToolkit", () => {
           peerHttpRequests.length = 0;
           updatedRemoteChildren.length = 0;
           enqueuedParentInjections.length = 0;
+          enqueuedParentInjectionDedupeKeys.length = 0;
           remoteTerminalDeliveryEvents.length = 0;
           remoteTerminalDeliveryClaims.clear();
           peerHttpHandler = null;
@@ -2858,6 +3003,186 @@ describe("SubagentToolkit", () => {
         expect(content.text).not.toContain("child done");
       }),
     ).pipe(Effect.provide(TestLayer)),
+  );
+
+  it.effect("allows peer-scoped wait for a receiver-spawned child that is only in projection", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const server = yield* McpServer.McpServer;
+        const sourceEnvironmentId = EnvironmentId.make("environment-source-a");
+        waitSliceResult = {
+          results: [
+            {
+              childThreadId,
+              status: "failed",
+              finalAssistantText: null,
+              error:
+                "Sub-agent thread exists in the projection but is not tracked by this server instance.",
+            },
+          ],
+          settledCount: 1,
+          timedOutCount: 0,
+          pending: false,
+          resumeToken: "coordinator-token",
+        };
+        markWaitDeliveredCalls.length = 0;
+        abandonWaitDeliveryCalls.length = 0;
+
+        const result = yield* server
+          .callTool({
+            name: "t3_wait_subagent",
+            arguments: { childThreadIds: [childThreadId] },
+          })
+          .pipe(
+            Effect.provideService(McpInvocationContext.McpInvocationContext, {
+              ...childOnlyPeerInvocation,
+              sourceEnvironmentId,
+            }),
+            Effect.provideService(McpSchema.McpServerClient, client),
+          );
+
+        expect(result.isError).toBe(false);
+        expect(result.structuredContent).toMatchObject({
+          pending: false,
+          settledCount: 1,
+          results: [
+            {
+              childThreadId,
+              status: "completed",
+              finalAssistantText: "child done",
+              error: null,
+            },
+          ],
+        });
+        expect(markWaitDeliveredCalls).toEqual([]);
+        expect(abandonWaitDeliveryCalls).toEqual([]);
+      }),
+    ).pipe(
+      Effect.ensuring(
+        Effect.sync(() => {
+          waitSliceResult = null;
+          markWaitDeliveredCalls.length = 0;
+          abandonWaitDeliveryCalls.length = 0;
+        }),
+      ),
+      Effect.provide(TestLayer),
+    ),
+  );
+
+  it.effect("does not auto-promote an untracked peer-scoped projection wait", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const server = yield* McpServer.McpServer;
+        const sourceEnvironmentId = EnvironmentId.make("environment-source-a");
+        childDetailTurnState = "running";
+        waitSliceResult = {
+          results: [
+            {
+              childThreadId,
+              status: "failed",
+              finalAssistantText: null,
+              error:
+                "Sub-agent thread exists in the projection but is not tracked by this server instance.",
+            },
+          ],
+          settledCount: 1,
+          timedOutCount: 0,
+          pending: false,
+          resumeToken: "coordinator-token",
+        };
+        promotedCalls.length = 0;
+
+        const result = yield* server
+          .callTool({
+            name: "t3_wait_subagent",
+            arguments: {
+              childThreadIds: [childThreadId],
+              resumeToken: "-100000:coordinator-token",
+            },
+          })
+          .pipe(
+            Effect.provideService(McpInvocationContext.McpInvocationContext, {
+              ...childOnlyPeerInvocation,
+              sourceEnvironmentId,
+            }),
+            Effect.provideService(McpSchema.McpServerClient, client),
+          );
+
+        expect(result.isError).toBe(false);
+        expect(result.structuredContent).toMatchObject({
+          pending: true,
+          settledCount: 0,
+          timedOutCount: 0,
+          results: [
+            {
+              childThreadId,
+              status: "pending",
+              finalAssistantText: null,
+              error: null,
+            },
+          ],
+        });
+        expect(result.structuredContent).not.toHaveProperty("promoted");
+        expect(promotedCalls).toEqual([]);
+      }),
+    ).pipe(
+      Effect.ensuring(
+        Effect.sync(() => {
+          childDetailTurnState = "completed";
+          waitSliceResult = null;
+          promotedCalls.length = 0;
+        }),
+      ),
+      Effect.provide(TestLayer),
+    ),
+  );
+
+  it.effect(
+    "lists receiver-spawned peer children from projection when coordinator is untracked",
+    () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const server = yield* McpServer.McpServer;
+          const sourceEnvironmentId = EnvironmentId.make("environment-source-a");
+          childShellParentEnvironmentId = sourceEnvironmentId;
+          listChildrenOverride = [];
+
+          const result = yield* server
+            .callTool({
+              name: "t3_list_subagents",
+              arguments: { parentThreadId },
+            })
+            .pipe(
+              Effect.provideService(McpInvocationContext.McpInvocationContext, {
+                ...unrestrictedPeerInvocation,
+                sourceEnvironmentId,
+              }),
+              Effect.provideService(McpSchema.McpServerClient, client),
+            );
+
+          expect(result.isError).toBe(false);
+          expect(result.structuredContent).toMatchObject({
+            parentThreadId,
+            children: [
+              {
+                childThreadId,
+                parentThreadId,
+                detached: true,
+                status: "completed",
+                turnCount: 1,
+              },
+            ],
+          });
+        }),
+      ).pipe(
+        Effect.ensuring(
+          Effect.sync(() => {
+            childShellParentEnvironmentId = null;
+            listChildrenOverride = null;
+          }),
+        ),
+        Effect.provide(TestLayer),
+      ),
   );
 
   it.effect("reports a stopped child with only a stale completed latest turn as failed", () =>

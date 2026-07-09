@@ -89,6 +89,13 @@ export interface ValidateChildSpawnInput {
 
 export interface EnqueueParentInjectionInput extends ChildWaitResult {
   readonly parentThreadId: ThreadId;
+  /**
+   * Optional stable key for externally observed completions that may be retried
+   * after their transient source bookkeeping fails. When present, retries dispatch
+   * under the same command id so the orchestration engine's receipt dedup keeps
+   * parent wake delivery exactly-once.
+   */
+  readonly dedupeKey?: string;
 }
 
 export interface ValidatedChildSpawn {
