@@ -45,6 +45,7 @@ function render(overrides: Partial<ScheduledTaskCardProps> = {}): string {
     task: baseTask,
     threadTitle: "Inbox digest",
     workspaceLabel: "acme · main",
+    environmentLabel: "WSL (Ubuntu)",
     overdue: false,
     lastStatusFailed: false,
     ...overrides,
@@ -119,5 +120,12 @@ describe("ScheduledTaskCard", () => {
     expect(render({ task: { ...baseTask, enabled: false } })).toContain(
       'aria-label="Enable Inbox digest"',
     );
+  });
+
+  it("renders the owning backend label and scopes card data to that environment", () => {
+    const html = render();
+    expect(html).toContain("WSL (Ubuntu)");
+    expect(html).toContain('data-environment-id="env-1"');
+    expect(html).toContain('data-environment-label="WSL (Ubuntu)"');
   });
 });
