@@ -3,9 +3,10 @@
  *
  * Owns persistence operations for the plain (non event-sourced)
  * `pending_dispatches` table that backs the sub-agent coordinator's
- * restart-safe wake/steer delivery (R-B). A row records either a parent
- * injection (a child completion that must wake the parent) or a child steer
- * (a provider-deferred steer awaiting the child going idle).
+ * restart-safe wake/steer/turn delivery (R-B). A row records either a parent
+ * injection (a child completion that must wake the parent), a child steer
+ * (a provider-deferred steer awaiting the child going idle), or an accepted
+ * thread turn whose provider send must wait for the current turn to go idle.
  *
  * @module PendingDispatchRepository
  */
@@ -19,7 +20,11 @@ import type { ProjectionRepositoryError } from "../Errors.ts";
 export const PendingDispatchId = Schema.String.pipe(Schema.brand("PendingDispatchId"));
 export type PendingDispatchId = typeof PendingDispatchId.Type;
 
-export const PendingDispatchKind = Schema.Literals(["parent_injection", "child_steer"]);
+export const PendingDispatchKind = Schema.Literals([
+  "parent_injection",
+  "child_steer",
+  "thread_turn",
+]);
 export type PendingDispatchKind = typeof PendingDispatchKind.Type;
 
 export const PendingDispatch = Schema.Struct({
@@ -66,6 +71,11 @@ export const MarkPendingDispatchesWaitDeliveredInput = Schema.Struct({
 export type MarkPendingDispatchesWaitDeliveredInput =
   typeof MarkPendingDispatchesWaitDeliveredInput.Type;
 
+export const ResetPendingDispatchClaimsInput = Schema.Struct({
+  ids: Schema.Array(PendingDispatchId),
+});
+export type ResetPendingDispatchClaimsInput = typeof ResetPendingDispatchClaimsInput.Type;
+
 export const ListPendingDispatchesByTargetInput = Schema.Struct({
   kind: PendingDispatchKind,
   targetThreadId: ThreadId,
@@ -108,6 +118,13 @@ export interface PendingDispatchRepositoryShape {
    */
   readonly markWaitDelivered: (
     input: MarkPendingDispatchesWaitDeliveredInput,
+  ) => Effect.Effect<void, ProjectionRepositoryError>;
+
+  /**
+   * Clear durable claim ids so crash-recovered rows whose provider delivery was not proven can retry.
+   */
+  readonly resetClaims: (
+    input: ResetPendingDispatchClaimsInput,
   ) => Effect.Effect<void, ProjectionRepositoryError>;
 
   /**

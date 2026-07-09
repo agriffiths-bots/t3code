@@ -701,7 +701,7 @@ describe("applyThreadDetailEvent", () => {
       }
     });
 
-    it("binds the latest pending system wake message to the running turn", () => {
+    it("binds the oldest pending system wake message to the running turn", () => {
       const threadWithSystemWake: OrchestrationThread = {
         ...baseThread,
         messages: [
@@ -713,6 +713,15 @@ describe("applyThreadDetailEvent", () => {
             streaming: false,
             createdAt: "2026-04-01T07:59:00.000Z",
             updatedAt: "2026-04-01T07:59:00.000Z",
+          },
+          {
+            id: MessageId.make("system-wake-2"),
+            role: "system",
+            text: "[sub-agent child-2 completed] done",
+            turnId: null,
+            streaming: false,
+            createdAt: "2026-04-01T07:59:30.000Z",
+            updatedAt: "2026-04-01T07:59:30.000Z",
           },
         ],
       };
@@ -741,6 +750,73 @@ describe("applyThreadDetailEvent", () => {
       expect(result.kind).toBe("updated");
       if (result.kind === "updated") {
         expect(result.thread.messages[0]?.turnId).toBe("turn-1");
+        expect(result.thread.messages[1]?.turnId).toBeNull();
+      }
+    });
+
+    it("does not let historical start failures skip later pending prompts", () => {
+      const threadWithHistoricalFailure: OrchestrationThread = {
+        ...baseThread,
+        messages: [
+          {
+            id: MessageId.make("failed-prompt"),
+            role: "user",
+            text: "this start failed",
+            turnId: null,
+            streaming: false,
+            createdAt: "2026-04-01T07:58:00.000Z",
+            updatedAt: "2026-04-01T07:58:00.000Z",
+          },
+          {
+            id: MessageId.make("later-prompt"),
+            role: "user",
+            text: "this start succeeds",
+            turnId: null,
+            streaming: false,
+            createdAt: "2026-04-01T07:59:00.000Z",
+            updatedAt: "2026-04-01T07:59:00.000Z",
+          },
+        ],
+        activities: [
+          {
+            id: EventId.make("activity-failed-start"),
+            tone: "error",
+            kind: "provider.turn.start.failed",
+            summary: "Provider turn start failed",
+            payload: {
+              detail: "simulated start failure",
+            },
+            turnId: null,
+            createdAt: "2026-04-01T07:58:30.000Z",
+          },
+        ],
+      };
+
+      const result = applyThreadDetailEvent(threadWithHistoricalFailure, {
+        ...baseEventFields,
+        sequence: 9,
+        occurredAt: "2026-04-01T08:00:00.000Z",
+        aggregateKind: "thread",
+        aggregateId: ThreadId.make("thread-1"),
+        type: "thread.session-set",
+        payload: {
+          threadId: ThreadId.make("thread-1"),
+          session: {
+            threadId: ThreadId.make("thread-1"),
+            status: "running",
+            providerName: "codex",
+            runtimeMode: "full-access",
+            activeTurnId: TurnId.make("turn-later"),
+            lastError: null,
+            updatedAt: "2026-04-01T08:00:00.000Z",
+          },
+        },
+      });
+
+      expect(result.kind).toBe("updated");
+      if (result.kind === "updated") {
+        expect(result.thread.messages[0]?.turnId).toBeNull();
+        expect(result.thread.messages[1]?.turnId).toBe("turn-later");
       }
     });
 

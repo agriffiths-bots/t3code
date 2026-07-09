@@ -219,22 +219,57 @@ function retainThreadMessagesAfterRevert(
   return messages.filter((message) => retainedMessageIds.has(message.id));
 }
 
-function bindLatestPendingPromptMessageToTurn(
+function bindNextPendingPromptMessageToTurn(
   messages: ReadonlyArray<OrchestrationMessage>,
   turnId: TurnId,
+  failedPromptMessageIds: ReadonlySet<string>,
 ): ReadonlyArray<OrchestrationMessage> {
-  let pendingIndex = -1;
-  for (let index = messages.length - 1; index >= 0; index -= 1) {
-    const message = messages[index];
-    if (message && message.turnId === null && isThreadPromptMessage(message)) {
-      pendingIndex = index;
-      break;
+  const pendingIndex = messages.findIndex((message) => {
+    if (message.turnId !== null || !isThreadPromptMessage(message)) {
+      return false;
     }
-  }
+    return !failedPromptMessageIds.has(message.id);
+  });
   if (pendingIndex === -1) return messages;
   return messages.map((message, index) =>
     index === pendingIndex ? { ...message, turnId } : message,
   );
+}
+
+function failedTurnStartPromptMessageIds(
+  messages: ReadonlyArray<OrchestrationMessage>,
+  activities: OrchestrationThread["activities"],
+): ReadonlySet<string> {
+  const ids = new Set<string>();
+  const pendingPromptMessages = messages.filter(
+    (message) => message.turnId === null && isThreadPromptMessage(message),
+  );
+  const failedActivities = activities
+    .filter((activity) => activity.kind === "provider.turn.start.failed")
+    .toSorted(
+      (left, right) =>
+        left.createdAt.localeCompare(right.createdAt) || left.id.localeCompare(right.id),
+    );
+  for (const activity of failedActivities) {
+    if (activity.kind !== "provider.turn.start.failed") {
+      continue;
+    }
+    const payload =
+      typeof activity.payload === "object" && activity.payload !== null
+        ? (activity.payload as Record<string, unknown>)
+        : null;
+    if (typeof payload?.messageId === "string") {
+      ids.add(payload.messageId);
+      continue;
+    }
+    const legacyPrompt = pendingPromptMessages.find(
+      (message) => !ids.has(message.id) && message.createdAt <= activity.createdAt,
+    );
+    if (legacyPrompt !== undefined) {
+      ids.add(legacyPrompt.id);
+    }
+  }
+  return ids;
 }
 
 function latestAssistantMessageIdForTurn(
@@ -243,7 +278,7 @@ function latestAssistantMessageIdForTurn(
 ): MessageId | null {
   for (let index = messages.length - 1; index >= 0; index -= 1) {
     const message = messages[index];
-    if (message?.role === "assistant" && message.turnId === turnId) {
+    if (message && message.role === "assistant" && message.turnId === turnId) {
       return message.id;
     }
   }
@@ -804,10 +839,18 @@ export function projectEvent(
             ? session.activeTurnId
             : null;
         const previousActiveTurnId = thread.session?.activeTurnId ?? null;
+        const failedPromptMessageIds = failedTurnStartPromptMessageIds(
+          thread.messages,
+          thread.activities,
+        );
         const messages =
           activeTurnId === null || activeTurnId === previousActiveTurnId
             ? thread.messages
-            : bindLatestPendingPromptMessageToTurn(thread.messages, activeTurnId);
+            : bindNextPendingPromptMessageToTurn(
+                thread.messages,
+                activeTurnId,
+                failedPromptMessageIds,
+              );
         const activeTurnAssistantMessageId =
           activeTurnId === null ? null : latestAssistantMessageIdForTurn(messages, activeTurnId);
 

@@ -1287,10 +1287,32 @@ describe("orchestration projector", () => {
         }),
       );
 
-      const afterUnchangedOldTurn = yield* projectEvent(
+      const afterSecondWakeMessage = yield* projectEvent(
         afterNoticeMessage,
         makeEvent({
           sequence: 5,
+          type: "thread.message-sent",
+          aggregateKind: "thread",
+          aggregateId: "thread-1",
+          occurredAt: "2026-02-23T10:00:02.750Z",
+          commandId: "cmd-system-wake-2",
+          payload: {
+            threadId: "thread-1",
+            messageId: "system-wake-2",
+            role: "system",
+            text: "[sub-agent child-2 completed] done",
+            turnId: null,
+            streaming: false,
+            createdAt: "2026-02-23T10:00:02.750Z",
+            updatedAt: "2026-02-23T10:00:02.750Z",
+          },
+        }),
+      );
+
+      const afterUnchangedOldTurn = yield* projectEvent(
+        afterSecondWakeMessage,
+        makeEvent({
+          sequence: 6,
           type: "thread.session-set",
           aggregateKind: "thread",
           aggregateId: "thread-1",
@@ -1315,7 +1337,7 @@ describe("orchestration projector", () => {
       const afterNewTurn = yield* projectEvent(
         afterUnchangedOldTurn,
         makeEvent({
-          sequence: 6,
+          sequence: 7,
           type: "thread.session-set",
           aggregateKind: "thread",
           aggregateId: "thread-1",
@@ -1343,6 +1365,9 @@ describe("orchestration projector", () => {
           ?.turnId,
       ).toBeNull();
       expect(
+        afterNewTurn.threads[0]?.messages.find((message) => message.id === "system-wake-2")?.turnId,
+      ).toBeNull();
+      expect(
         afterNewTurn.threads[0]?.turns.find((turn) => turn.turnId === "turn-old"),
       ).toMatchObject({
         state: "completed",
@@ -1354,6 +1379,125 @@ describe("orchestration projector", () => {
         state: "running",
         completedAt: null,
       });
+    }),
+  );
+
+  effectIt.effect("does not let historical start failures skip later pending prompts", () =>
+    Effect.gen(function* () {
+      const createdAt = "2026-02-23T10:00:00.000Z";
+      const model = createEmptyReadModel(createdAt);
+      const events = [
+        makeEvent({
+          sequence: 1,
+          type: "thread.created",
+          aggregateKind: "thread",
+          aggregateId: "thread-1",
+          occurredAt: createdAt,
+          commandId: "cmd-create",
+          payload: {
+            threadId: "thread-1",
+            projectId: "project-1",
+            title: "demo",
+            modelSelection: {
+              provider: ProviderDriverKind.make("codex"),
+              model: "gpt-5.3-codex",
+            },
+            runtimeMode: "full-access",
+            branch: null,
+            worktreePath: null,
+            createdAt,
+            updatedAt: createdAt,
+          },
+        }),
+        makeEvent({
+          sequence: 2,
+          type: "thread.message-sent",
+          aggregateKind: "thread",
+          aggregateId: "thread-1",
+          occurredAt: "2026-02-23T10:00:01.000Z",
+          commandId: "cmd-failed-message",
+          payload: {
+            threadId: "thread-1",
+            messageId: "failed-prompt",
+            role: "user",
+            text: "this start failed",
+            turnId: null,
+            streaming: false,
+            createdAt: "2026-02-23T10:00:01.000Z",
+            updatedAt: "2026-02-23T10:00:01.000Z",
+          },
+        }),
+        makeEvent({
+          sequence: 3,
+          type: "thread.activity-appended",
+          aggregateKind: "thread",
+          aggregateId: "thread-1",
+          occurredAt: "2026-02-23T10:00:02.000Z",
+          commandId: "cmd-failed-activity",
+          payload: {
+            threadId: "thread-1",
+            activity: {
+              id: "activity-failed-start",
+              tone: "error",
+              kind: "provider.turn.start.failed",
+              summary: "Provider turn start failed",
+              payload: {
+                detail: "simulated start failure",
+              },
+              turnId: null,
+              createdAt: "2026-02-23T10:00:02.000Z",
+            },
+          },
+        }),
+        makeEvent({
+          sequence: 4,
+          type: "thread.message-sent",
+          aggregateKind: "thread",
+          aggregateId: "thread-1",
+          occurredAt: "2026-02-23T10:00:03.000Z",
+          commandId: "cmd-later-message",
+          payload: {
+            threadId: "thread-1",
+            messageId: "later-prompt",
+            role: "user",
+            text: "this start succeeds",
+            turnId: null,
+            streaming: false,
+            createdAt: "2026-02-23T10:00:03.000Z",
+            updatedAt: "2026-02-23T10:00:03.000Z",
+          },
+        }),
+        makeEvent({
+          sequence: 5,
+          type: "thread.session-set",
+          aggregateKind: "thread",
+          aggregateId: "thread-1",
+          occurredAt: "2026-02-23T10:00:04.000Z",
+          commandId: "cmd-later-running",
+          payload: {
+            threadId: "thread-1",
+            session: {
+              threadId: "thread-1",
+              status: "running",
+              providerName: "codex",
+              runtimeMode: "approval-required",
+              activeTurnId: "turn-later",
+              lastError: null,
+              updatedAt: "2026-02-23T10:00:04.000Z",
+            },
+          },
+        }),
+      ];
+
+      let projected = model;
+      for (const event of events) {
+        projected = yield* projectEvent(projected, event);
+      }
+      const thread = projected.threads[0];
+      expect(thread?.messages.find((message) => message.id === "failed-prompt")?.turnId).toBeNull();
+      expect(thread?.messages.find((message) => message.id === "later-prompt")?.turnId).toBe(
+        "turn-later",
+      );
     }),
   );
 

@@ -357,10 +357,18 @@ export function applyThreadDetailEvent(
           ? event.payload.session.activeTurnId
           : null;
       const previousActiveTurnId = thread.session?.activeTurnId ?? null;
+      const failedPromptMessageIds = failedTurnStartPromptMessageIds(
+        thread.messages,
+        thread.activities,
+      );
       const messages =
         activeTurnId === null || activeTurnId === previousActiveTurnId
           ? thread.messages
-          : bindLatestPendingPromptMessageToTurn(thread.messages, activeTurnId);
+          : bindNextPendingPromptMessageToTurn(
+              thread.messages,
+              activeTurnId,
+              failedPromptMessageIds,
+            );
       const activeTurnAssistantMessageId =
         activeTurnId === null ? null : latestAssistantMessageIdForTurn(messages, activeTurnId);
       const latestTurn: OrchestrationLatestTurn | null =
@@ -912,26 +920,59 @@ function retainMessagesAfterRevert(
   });
 }
 
-function bindLatestPendingPromptMessageToTurn(
+function bindNextPendingPromptMessageToTurn(
   messages: ReadonlyArray<OrchestrationMessage>,
   turnId: TurnId,
+  failedPromptMessageIds: ReadonlySet<string>,
 ): OrchestrationMessage[] {
-  let pendingIndex = -1;
-  for (let index = messages.length - 1; index >= 0; index -= 1) {
-    const message = messages[index];
-    if (
-      message &&
-      message.turnId === null &&
-      (message.role === "user" ||
-        (message.role === "system" && isSubAgentWakeSystemMessageText(message.text)))
-    ) {
-      pendingIndex = index;
-      break;
+  const pendingIndex = messages.findIndex((message) => {
+    if (!isPendingPromptMessage(message)) {
+      return false;
     }
-  }
+    return !failedPromptMessageIds.has(message.id);
+  });
   if (pendingIndex === -1) return [...messages];
   return Arr.map(messages, (message, index) =>
     index === pendingIndex ? { ...message, turnId } : message,
+  );
+}
+
+function failedTurnStartPromptMessageIds(
+  messages: ReadonlyArray<OrchestrationMessage>,
+  activities: ReadonlyArray<OrchestrationThreadActivity>,
+): ReadonlySet<string> {
+  const ids = new Set<string>();
+  const pendingPromptMessages = messages.filter(isPendingPromptMessage);
+  const failedActivities = activities
+    .filter((activity) => activity.kind === "provider.turn.start.failed")
+    .toSorted(
+      (left, right) =>
+        left.createdAt.localeCompare(right.createdAt) || left.id.localeCompare(right.id),
+    );
+  for (const activity of failedActivities) {
+    const payload =
+      typeof activity.payload === "object" && activity.payload !== null
+        ? (activity.payload as Record<string, unknown>)
+        : null;
+    if (typeof payload?.messageId === "string") {
+      ids.add(payload.messageId);
+      continue;
+    }
+    const legacyPrompt = pendingPromptMessages.find(
+      (message) => !ids.has(message.id) && message.createdAt <= activity.createdAt,
+    );
+    if (legacyPrompt !== undefined) {
+      ids.add(legacyPrompt.id);
+    }
+  }
+  return ids;
+}
+
+function isPendingPromptMessage(message: OrchestrationMessage): boolean {
+  return (
+    message.turnId === null &&
+    (message.role === "user" ||
+      (message.role === "system" && isSubAgentWakeSystemMessageText(message.text)))
   );
 }
 

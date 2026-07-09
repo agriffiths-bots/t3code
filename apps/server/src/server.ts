@@ -177,7 +177,7 @@ const PlatformServicesLive = Layer.unwrap(
 const ReactorLayerLive = Layer.empty.pipe(
   Layer.provideMerge(OrchestrationReactorLive),
   Layer.provideMerge(ProviderRuntimeIngestionLive),
-  Layer.provideMerge(ProviderCommandReactorLive),
+  Layer.provideMerge(ProviderCommandReactorLive.pipe(Layer.provide(PendingDispatchRepositoryLive))),
   Layer.provideMerge(CheckpointReactorLive),
   Layer.provideMerge(ThreadDeletionReactorLive),
   Layer.provideMerge(VcsMaintenanceReactor.layer),

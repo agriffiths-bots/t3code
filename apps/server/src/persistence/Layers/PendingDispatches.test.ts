@@ -151,6 +151,39 @@ layer("PendingDispatchRepository", (it) => {
     }),
   );
 
+  it.effect("resetClaims clears command_id and is a no-op for an empty id list", () =>
+    Effect.gen(function* () {
+      const repository = yield* PendingDispatchRepository;
+      const parent = ThreadId.make("parent-reset-claim");
+
+      yield* repository.insert(
+        makeRow({
+          id: PendingDispatchId.make("reset-claim-a"),
+          targetThreadId: parent,
+          commandId: "server:queued-turn-send:reset-a",
+        }),
+      );
+      yield* repository.insert(
+        makeRow({
+          id: PendingDispatchId.make("reset-claim-b"),
+          targetThreadId: parent,
+          commandId: "server:queued-turn-send:reset-b",
+        }),
+      );
+
+      yield* repository.resetClaims({ ids: [] });
+      yield* repository.resetClaims({ ids: [PendingDispatchId.make("reset-claim-a")] });
+
+      const rows = yield* repository.listByTarget({
+        kind: "parent_injection",
+        targetThreadId: parent,
+      });
+      const byId = new Map(rows.map((row) => [row.id as string, row]));
+      assert.equal(byId.get("reset-claim-a")?.commandId, null);
+      assert.equal(byId.get("reset-claim-b")?.commandId, "server:queued-turn-send:reset-b");
+    }),
+  );
+
   it.effect("markWaitDelivered stamps delivered_by_wait and is a no-op for an empty id list", () =>
     Effect.gen(function* () {
       const repository = yield* PendingDispatchRepository;
@@ -176,7 +209,7 @@ layer("PendingDispatchRepository", (it) => {
     }),
   );
 
-  it.effect("listAll returns every row across targets, oldest first", () =>
+  it.effect("listAll returns every row across targets in insertion order", () =>
     Effect.gen(function* () {
       const repository = yield* PendingDispatchRepository;
 
@@ -199,7 +232,7 @@ layer("PendingDispatchRepository", (it) => {
       const ids = all.map((row) => row.id as string);
       assert.isTrue(ids.includes("all-1"));
       assert.isTrue(ids.includes("all-2"));
-      assert.isTrue(ids.indexOf("all-1") < ids.indexOf("all-2"));
+      assert.isTrue(ids.indexOf("all-2") < ids.indexOf("all-1"));
     }),
   );
 });

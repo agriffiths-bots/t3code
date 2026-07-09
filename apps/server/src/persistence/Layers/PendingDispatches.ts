@@ -12,6 +12,7 @@ import {
   ListPendingDispatchesByTargetInput,
   PendingDispatch,
   PendingDispatchRepository,
+  ResetPendingDispatchClaimsInput,
   type PendingDispatchRepositoryShape,
 } from "../Services/PendingDispatches.ts";
 
@@ -97,7 +98,7 @@ const makePendingDispatchRepository = Effect.gen(function* () {
         FROM pending_dispatches
         WHERE kind = ${kind}
           AND target_thread_id = ${targetThreadId}
-        ORDER BY created_at ASC, id ASC
+        ORDER BY rowid ASC
       `,
   });
 
@@ -119,7 +120,7 @@ const makePendingDispatchRepository = Effect.gen(function* () {
           wait_cancellable AS "waitCancellable",
           created_at AS "createdAt"
         FROM pending_dispatches
-        ORDER BY created_at ASC, id ASC
+        ORDER BY rowid ASC
       `,
   });
 
@@ -139,6 +140,16 @@ const makePendingDispatchRepository = Effect.gen(function* () {
       sql`
         UPDATE pending_dispatches
         SET delivered_by_wait = 1
+        WHERE ${sql.in("id", ids)}
+      `,
+  });
+
+  const resetPendingDispatchClaims = SqlSchema.void({
+    Request: ResetPendingDispatchClaimsInput,
+    execute: ({ ids }) =>
+      sql`
+        UPDATE pending_dispatches
+        SET command_id = NULL
         WHERE ${sql.in("id", ids)}
       `,
   });
@@ -176,6 +187,13 @@ const makePendingDispatchRepository = Effect.gen(function* () {
           ),
         );
 
+  const resetClaims: PendingDispatchRepositoryShape["resetClaims"] = (input) =>
+    input.ids.length === 0
+      ? Effect.void
+      : resetPendingDispatchClaims(input).pipe(
+          Effect.mapError(toPersistenceSqlError("PendingDispatchRepository.resetClaims:query")),
+        );
+
   const deleteByIds: PendingDispatchRepositoryShape["deleteByIds"] = (ids) =>
     ids.length === 0
       ? Effect.void
@@ -193,6 +211,7 @@ const makePendingDispatchRepository = Effect.gen(function* () {
     listAll,
     claim,
     markWaitDelivered,
+    resetClaims,
     deleteByIds,
   } satisfies PendingDispatchRepositoryShape;
 });

@@ -692,6 +692,7 @@ const pendingDispatchesLayer = Layer.succeed(PendingDispatchRepository, {
   listAll: () => Effect.succeed([]),
   claim: () => Effect.void,
   markWaitDelivered: () => Effect.void,
+  resetClaims: () => Effect.void,
   deleteByIds: () => Effect.void,
 });
 

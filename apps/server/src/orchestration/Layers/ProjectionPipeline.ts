@@ -1316,6 +1316,16 @@ const makeOrchestrationProjectionPipeline = Effect.fn("makeOrchestrationProjecti
           return;
         }
 
+        case "thread.activity-appended": {
+          if (event.payload.activity.kind !== "provider.turn.start.failed") {
+            return;
+          }
+          yield* projectionTurnRepository.deletePendingTurnStartByThreadId({
+            threadId: event.payload.threadId,
+          });
+          return;
+        }
+
         case "thread.message-sent": {
           if (event.payload.turnId === null || event.payload.role !== "assistant") {
             return;
