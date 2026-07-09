@@ -322,11 +322,14 @@ function projectionAssistantMessageCanAdvanceTurnBoundary(input: {
   if (input.currentMessageId === input.candidateMessageId) {
     return true;
   }
-  if (Option.isNone(input.candidateMessage) || Option.isNone(input.currentMessage)) {
+  if (Option.isNone(input.candidateMessage)) {
     return false;
   }
   if (input.candidateMessage.value.turnId !== input.turnId) {
     return false;
+  }
+  if (Option.isNone(input.currentMessage)) {
+    return true;
   }
   if (input.currentMessage.value.turnId !== input.turnId) {
     return true;

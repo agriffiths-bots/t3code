@@ -1213,6 +1213,84 @@ describe("deriveMessagesTimelineRows", () => {
     ).toEqual(["Final answer."]);
   });
 
+  it("does not promote a later pre-work assistant when a matched boundary is stale", () => {
+    const rows = deriveMessagesTimelineRows({
+      timelineEntries: [
+        {
+          id: "user-entry",
+          kind: "message",
+          createdAt: "2026-01-01T00:00:00Z",
+          message: {
+            id: "user-1" as never,
+            role: "user",
+            text: "Do the thing",
+            turnId: null,
+            createdAt: "2026-01-01T00:00:00Z",
+            updatedAt: "2026-01-01T00:00:00Z",
+            streaming: false,
+          },
+        },
+        {
+          id: "assistant-older-entry",
+          kind: "message",
+          createdAt: "2026-01-01T00:00:05Z",
+          message: {
+            id: "assistant-older" as never,
+            role: "assistant",
+            text: "Earlier commentary.",
+            turnId: "turn-1" as never,
+            createdAt: "2026-01-01T00:00:05Z",
+            updatedAt: "2026-01-01T00:00:05Z",
+            streaming: false,
+          },
+        },
+        {
+          id: "assistant-later-entry",
+          kind: "message",
+          createdAt: "2026-01-01T00:00:10Z",
+          message: {
+            id: "assistant-later" as never,
+            role: "assistant",
+            text: "I need one more check.",
+            turnId: "turn-1" as never,
+            createdAt: "2026-01-01T00:00:10Z",
+            updatedAt: "2026-01-01T00:00:10Z",
+            streaming: false,
+          },
+        },
+        {
+          id: "late-work-entry",
+          kind: "work",
+          createdAt: "2026-01-01T00:00:11Z",
+          entry: {
+            id: "work-late",
+            createdAt: "2026-01-01T00:00:11Z",
+            turnId: "turn-1" as never,
+            label: "Ran check",
+            tone: "tool",
+          },
+        },
+      ],
+      latestTurn: {
+        turnId: "turn-1" as never,
+        state: "completed",
+        startedAt: "2026-01-01T00:00:00Z",
+        completedAt: "2026-01-01T00:00:12Z",
+        assistantMessageId: "assistant-older" as never,
+      },
+      isWorking: false,
+      activeTurnStartedAt: null,
+      turnDiffSummaryByAssistantMessageId: new Map(),
+      turnDiffSummaryByTurnId: new Map(),
+      revertTurnCountByUserMessageId: new Map(),
+    });
+
+    expect(rows.map((row) => row.id)).toEqual(["user-entry", "turn-fold:turn-1"]);
+    expect(rows.some((row) => row.kind === "message" && row.message.role === "assistant")).toBe(
+      false,
+    );
+  });
+
   it("falls back from a null boundary when a terminal assistant is projected after work", () => {
     const rows = deriveMessagesTimelineRows({
       timelineEntries: [

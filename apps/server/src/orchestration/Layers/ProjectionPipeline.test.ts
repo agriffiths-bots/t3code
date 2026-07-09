@@ -629,6 +629,116 @@ it.layer(
         assert.deepEqual(threadRows, [{ latestTurnId: "turn-delayed-boundary-second" }]);
       }),
   );
+
+  it.effect("lets a valid checkpoint replace a stale missing assistant boundary", () =>
+    Effect.gen(function* () {
+      const projectionPipeline = yield* OrchestrationProjectionPipeline;
+      const eventStore = yield* OrchestrationEventStore;
+      const sql = yield* SqlClient.SqlClient;
+      const threadId = ThreadId.make("thread-stale-boundary-recovery");
+      const turnId = TurnId.make("turn-stale-boundary-recovery");
+      const validAssistantMessageId = MessageId.make("assistant-valid-boundary");
+      const missingAssistantMessageId = MessageId.make("assistant-missing-boundary");
+
+      yield* eventStore.append({
+        type: "thread.created",
+        eventId: EventId.make("evt-stale-boundary-thread"),
+        aggregateKind: "thread",
+        aggregateId: threadId,
+        occurredAt: "2026-01-01T00:00:00.000Z",
+        commandId: CommandId.make("cmd-stale-boundary-thread"),
+        causationEventId: null,
+        correlationId: CorrelationId.make("cmd-stale-boundary-thread"),
+        metadata: {},
+        payload: {
+          threadId,
+          projectId: ProjectId.make("project-stale-boundary"),
+          title: "Thread stale boundary recovery",
+          modelSelection: {
+            instanceId: ProviderInstanceId.make("claude"),
+            model: "claude-sonnet-4-5",
+          },
+          runtimeMode: "full-access",
+          branch: null,
+          worktreePath: null,
+          createdAt: "2026-01-01T00:00:00.000Z",
+          updatedAt: "2026-01-01T00:00:00.000Z",
+        },
+      });
+
+      yield* eventStore.append({
+        type: "thread.message-sent",
+        eventId: EventId.make("evt-stale-boundary-valid-message"),
+        aggregateKind: "thread",
+        aggregateId: threadId,
+        occurredAt: "2026-01-01T00:00:05.000Z",
+        commandId: CommandId.make("cmd-stale-boundary-valid-message"),
+        causationEventId: null,
+        correlationId: CorrelationId.make("cmd-stale-boundary-valid-message"),
+        metadata: {},
+        payload: {
+          threadId,
+          messageId: validAssistantMessageId,
+          role: "assistant",
+          text: "Final answer.",
+          turnId,
+          streaming: false,
+          createdAt: "2026-01-01T00:00:05.000Z",
+          updatedAt: "2026-01-01T00:00:05.000Z",
+        },
+      });
+
+      yield* projectionPipeline.bootstrap;
+
+      yield* sql`
+        UPDATE projection_turns
+        SET assistant_message_id = ${missingAssistantMessageId}
+        WHERE thread_id = ${threadId}
+          AND turn_id = ${turnId}
+      `;
+
+      const checkpointEvent = yield* eventStore.append({
+        type: "thread.turn-diff-completed",
+        eventId: EventId.make("evt-stale-boundary-valid-checkpoint"),
+        aggregateKind: "thread",
+        aggregateId: threadId,
+        occurredAt: "2026-01-01T00:00:06.000Z",
+        commandId: CommandId.make("cmd-stale-boundary-valid-checkpoint"),
+        causationEventId: null,
+        correlationId: CorrelationId.make("cmd-stale-boundary-valid-checkpoint"),
+        metadata: {},
+        payload: {
+          threadId,
+          turnId,
+          checkpointTurnCount: 1,
+          checkpointRef: CheckpointRef.make("refs/t3/checkpoints/thread-stale-boundary/turn/1"),
+          status: "ready",
+          files: [],
+          assistantMessageId: validAssistantMessageId,
+          completedAt: "2026-01-01T00:00:06.000Z",
+        },
+      });
+      yield* projectionPipeline.projectEvent(checkpointEvent);
+
+      const turnRows = yield* sql<{
+        readonly assistantMessageId: string | null;
+        readonly checkpointRef: string | null;
+      }>`
+        SELECT
+          assistant_message_id AS "assistantMessageId",
+          checkpoint_ref AS "checkpointRef"
+        FROM projection_turns
+        WHERE thread_id = ${threadId}
+          AND turn_id = ${turnId}
+      `;
+      assert.deepEqual(turnRows, [
+        {
+          assistantMessageId: "assistant-valid-boundary",
+          checkpointRef: "refs/t3/checkpoints/thread-stale-boundary/turn/1",
+        },
+      ]);
+    }),
+  );
 });
 
 it.layer(Layer.fresh(makeProjectionPipelinePrefixedTestLayer("t3-projection-system-wake-revert-")))(
