@@ -104,6 +104,9 @@ interface ChildTerminalOutcome {
   readonly error: string | null;
 }
 
+const isThreadArchivedOutcome = (outcome: ChildTerminalOutcome): boolean =>
+  outcome.status === "killed" && outcome.error === "thread archived";
+
 const ChildRowSchema = Schema.Struct({
   threadId: Schema.String,
   parentThreadId: Schema.NullOr(Schema.String),
@@ -151,6 +154,15 @@ const isThreadIdle = (shell: OrchestrationThreadShell): boolean => {
   return (
     (session.status === "ready" || session.status === "waiting" || session.status === "stopped") &&
     session.activeTurnId === null
+  );
+};
+
+const isProjectedChildActive = (shell: OrchestrationThreadShell): boolean => {
+  if (shell.latestTurn?.state === "running") return true;
+  const session = shell.session;
+  return (
+    (session?.status === "running" || session?.status === "waiting") &&
+    session.activeTurnId !== null
   );
 };
 
@@ -237,6 +249,9 @@ const make = Effect.gen(function* () {
   const children = new Map<ThreadId, ChildRecord>();
   const byParent = new Map<ThreadId, Set<ThreadId>>();
   const pendingInjections = new Map<ThreadId, Array<PendingInjection>>();
+  const archivedChildIds = new Set<ThreadId>();
+  const archivedActiveChildIds = new Set<ThreadId>();
+  const unarchivedTerminalChildIds = new Set<ThreadId>();
   const pendingDrainRetryParents = new Set<ThreadId>();
   const pendingIdleDrainRetryParents = new Set<ThreadId>();
   const parentWakeLocks = new Map<ThreadId, Semaphore.Semaphore>();
@@ -420,6 +435,14 @@ const make = Effect.gen(function* () {
       ? Effect.void
       : sql`
           DELETE FROM subagent_promoted_children
+          WHERE ${sql.in("child_thread_id", childThreadIds)}
+        `.pipe(Effect.asVoid);
+
+  const deleteWaitDeliveryRows = (childThreadIds: ReadonlyArray<ThreadId>) =>
+    childThreadIds.length === 0
+      ? Effect.void
+      : sql`
+          DELETE FROM subagent_wait_deliveries
           WHERE ${sql.in("child_thread_id", childThreadIds)}
         `.pipe(Effect.asVoid);
 
@@ -1350,6 +1373,10 @@ const make = Effect.gen(function* () {
       const { threadId, status } = event.payload;
       if (children.has(threadId)) {
         const shellOption = yield* getThreadShellBounded(threadId);
+        if (archivedChildIds.has(threadId)) {
+          yield* settleChild(threadId, "killed", "thread archived", true);
+          return;
+        }
         if (pendingTurnStartByChild.has(threadId)) {
           const latestTurn = Option.isSome(shellOption) ? shellOption.value.latestTurn : null;
           const session = Option.isSome(shellOption) ? shellOption.value.session : null;
@@ -1444,6 +1471,11 @@ const make = Effect.gen(function* () {
       ) {
         return;
       }
+      if (archivedChildIds.has(threadId)) {
+        yield* settleChild(threadId, "killed", "thread archived", true);
+        yield* drainChildSteers(threadId);
+        return;
+      }
       if (session.status === "ready") {
         const expectedTurnId = activeTurnByChild.get(threadId);
         if (expectedTurnId === undefined) return;
@@ -1497,6 +1529,9 @@ const make = Effect.gen(function* () {
   const handleThreadDeleted = (event: ThreadDeletedEvent) =>
     Effect.gen(function* () {
       const { threadId } = event.payload;
+      archivedChildIds.delete(threadId);
+      archivedActiveChildIds.delete(threadId);
+      unarchivedTerminalChildIds.delete(threadId);
       yield* dispatchLimiter.releaseForChild(threadId);
       if (children.has(threadId)) {
         yield* settleChild(threadId, "killed", "thread deleted");
@@ -1506,10 +1541,36 @@ const make = Effect.gen(function* () {
   const handleThreadArchived = (event: ThreadArchivedEvent) =>
     Effect.gen(function* () {
       const { threadId, archivedAt } = event.payload;
-      const detail = yield* getThreadDetail(threadId);
+      archivedChildIds.add(threadId);
+      const detail = yield* getThreadDetailBounded(threadId);
+      if (children.has(threadId)) {
+        const projectedOutcome = Option.match(detail, {
+          onNone: () => null,
+          onSome: (thread) => projectedLifecycleTerminal({ ...thread, archivedAt }),
+        });
+        const outcome: ChildTerminalOutcome =
+          projectedOutcome ?? ({ status: "killed", error: "thread archived" } as const);
+        if (isThreadArchivedOutcome(outcome) && projectedOutcome === null) {
+          archivedActiveChildIds.add(threadId);
+        } else {
+          archivedActiveChildIds.delete(threadId);
+        }
+        if (!isThreadArchivedOutcome(outcome)) {
+          archivedChildIds.delete(threadId);
+        }
+        const finalAssistantText = Option.match(detail, {
+          onNone: () => null,
+          onSome: finalAssistantTextFromThread,
+        });
+        yield* completeChild(threadId, outcome.status, finalAssistantText, outcome.error);
+        return;
+      }
       if (Option.isNone(detail)) return;
       const outcome = projectedLifecycleTerminal({ ...detail.value, archivedAt });
       if (outcome === null) return;
+      if (!isThreadArchivedOutcome(outcome)) {
+        archivedChildIds.delete(threadId);
+      }
       yield* dispatchLimiter.releaseForChild(threadId);
       yield* completeChild(
         threadId,
@@ -1522,6 +1583,7 @@ const make = Effect.gen(function* () {
   const discardQueuedArchivedWake = (childThreadId: ThreadId) =>
     Effect.gen(function* () {
       const archivedEntries: Array<PendingInjection> = [];
+      const retainedWakeChildIds = new Set<ThreadId>();
       for (const [parentThreadId, queue] of pendingInjections) {
         const retained = queue.filter((entry) => {
           const archivedWake =
@@ -1529,6 +1591,9 @@ const make = Effect.gen(function* () {
             entry.status === "killed" &&
             entry.error === "thread archived";
           if (archivedWake) archivedEntries.push(entry);
+          if (!archivedWake && entry.childThreadId === childThreadId) {
+            retainedWakeChildIds.add(entry.childThreadId);
+          }
           return !archivedWake;
         });
         if (retained.length === 0) {
@@ -1538,33 +1603,138 @@ const make = Effect.gen(function* () {
         }
       }
       if (archivedEntries.length > 0) {
-        yield* deleteDispatchRows(archivedEntries.map((entry) => entry.dispatchId));
-        for (const entry of archivedEntries) {
-          queuedWakeChildren.delete(entry.childThreadId);
+        const deliveredChildIds = [
+          ...new Set(
+            archivedEntries
+              .filter(
+                (entry) =>
+                  entry.deliveredByWait || waitDeliveredPromotedChildren.has(entry.childThreadId),
+              )
+              .map((entry) => entry.childThreadId),
+          ),
+        ];
+        yield* sql
+          .withTransaction(
+            Effect.gen(function* () {
+              yield* deleteDispatchRows(archivedEntries.map((entry) => entry.dispatchId));
+              yield* deletePromotedChildRows(promotedRowsToDeleteFor(archivedEntries));
+              yield* deleteWaitDeliveryRows(deliveredChildIds);
+            }),
+          )
+          .pipe(Effect.orDie);
+        yield* clearDeletedWakeStateMemory(archivedEntries);
+        for (const retainedChildId of retainedWakeChildIds) {
+          queuedWakeChildren.add(retainedChildId);
         }
+        const record = children.get(childThreadId);
+        if (
+          record !== undefined &&
+          !record.detached &&
+          !retainedWakeChildIds.has(childThreadId) &&
+          !waitDeliveryMarkedAt.has(childThreadId) &&
+          !waitDeliveredPromotedChildren.has(childThreadId) &&
+          !promotedChildren.has(childThreadId)
+        ) {
+          children.set(childThreadId, { ...record, detached: true });
+        }
+      }
+    });
+
+  const discardQueuedChildWakes = (childThreadId: ThreadId) =>
+    Effect.gen(function* () {
+      const staleEntries: Array<PendingInjection> = [];
+      for (const [parentThreadId, queue] of pendingInjections) {
+        const retained = queue.filter((entry) => {
+          if (entry.childThreadId === childThreadId) {
+            staleEntries.push(entry);
+            return false;
+          }
+          return true;
+        });
+        if (retained.length === 0) {
+          pendingInjections.delete(parentThreadId);
+        } else if (retained.length !== queue.length) {
+          pendingInjections.set(parentThreadId, retained);
+        }
+      }
+      if (staleEntries.length > 0) {
+        const deliveredChildIds = [
+          ...new Set(
+            staleEntries
+              .filter(
+                (entry) =>
+                  entry.deliveredByWait || waitDeliveredPromotedChildren.has(entry.childThreadId),
+              )
+              .map((entry) => entry.childThreadId),
+          ),
+        ];
+        yield* sql
+          .withTransaction(
+            Effect.gen(function* () {
+              yield* deleteDispatchRows(staleEntries.map((entry) => entry.dispatchId));
+              yield* deletePromotedChildRows(promotedRowsToDeleteFor(staleEntries));
+              yield* deleteWaitDeliveryRows(deliveredChildIds);
+            }),
+          )
+          .pipe(Effect.orDie);
+        yield* clearDeletedWakeStateMemory(staleEntries);
+      } else {
+        queuedWakeChildren.delete(childThreadId);
+      }
+      const record = children.get(childThreadId);
+      if (
+        record !== undefined &&
+        !record.detached &&
+        !waitDeliveryMarkedAt.has(childThreadId) &&
+        !waitDeliveredPromotedChildren.has(childThreadId) &&
+        !promotedChildren.has(childThreadId)
+      ) {
+        children.set(childThreadId, { ...record, detached: true });
       }
     });
 
   const handleThreadUnarchived = (event: ThreadUnarchivedEvent) =>
     Effect.gen(function* () {
       const { threadId } = event.payload;
+      archivedChildIds.delete(threadId);
       const record = children.get(threadId);
       if (!record) return;
       const completed = yield* Deferred.poll(record.terminal);
       if (Option.isNone(completed)) return;
       const result = yield* completed.value;
-      if (result.status !== "killed" || result.error !== "thread archived") return;
+      if (result.status !== "killed" || result.error !== "thread archived") {
+        unarchivedTerminalChildIds.add(threadId);
+        return;
+      }
       const terminal = yield* Deferred.make<ChildWaitResult>();
       children.set(threadId, { ...record, terminal });
+      unarchivedTerminalChildIds.delete(threadId);
+      const shell = yield* getThreadShellBounded(threadId);
+      if (
+        archivedActiveChildIds.has(threadId) ||
+        (Option.isSome(shell) && isProjectedChildActive(shell.value))
+      ) {
+        yield* dispatchLimiter.seedChild(threadId);
+      }
+      archivedActiveChildIds.delete(threadId);
       yield* discardQueuedArchivedWake(threadId);
     });
 
   const handleTurnStartRequested = (event: TurnStartRequestedEvent) =>
     Effect.gen(function* () {
       const { threadId } = event.payload;
-      const record = children.get(threadId);
+      let record = children.get(threadId);
       if (!record) return;
-      const done = yield* Deferred.isDone(record.terminal);
+      let done = yield* Deferred.isDone(record.terminal);
+      if (done && unarchivedTerminalChildIds.has(threadId)) {
+        yield* discardQueuedChildWakes(threadId);
+        const terminal = yield* Deferred.make<ChildWaitResult>();
+        record = children.get(threadId) ?? record;
+        record = { ...record, terminal };
+        children.set(threadId, record);
+        unarchivedTerminalChildIds.delete(threadId);
+        done = false;
+      }
       if (!done) {
         yield* dispatchLimiter.seedChild(threadId);
       }
@@ -1625,6 +1795,10 @@ const make = Effect.gen(function* () {
       if (!record) return;
       const done = yield* Deferred.isDone(record.terminal);
       if (done) return;
+      if (archivedChildIds.has(childThreadId)) {
+        yield* settleChild(childThreadId, "killed", "thread archived", true);
+        return;
+      }
       const settleProjectedLifecycle = (detail: OrchestrationThread) =>
         Effect.gen(function* () {
           const outcome = projectedLifecycleTerminal(detail);
@@ -2030,6 +2204,8 @@ const make = Effect.gen(function* () {
       const lifecycleTerminatedByChild = new Set<ThreadId>();
       const archivedSinceLastUnarchiveByChild = new Set<ThreadId>();
       const unarchivedArchiveChildIds = new Set<ThreadId>();
+      const unarchivedTerminalChildIds = new Set<ThreadId>();
+      const unarchivedTerminalStartedChildIds = new Set<ThreadId>();
       let maxSequence = 0;
       const markLifecycleTerminal = (
         threadId: ThreadId,
@@ -2135,6 +2311,10 @@ const make = Effect.gen(function* () {
               }
               runningByChild.set(threadId, true);
               terminalByChild.delete(threadId);
+              if (unarchivedTerminalChildIds.has(threadId)) {
+                unarchivedTerminalStartedChildIds.add(threadId);
+              }
+              unarchivedTerminalChildIds.delete(threadId);
               activeTurnByReplayedChild.delete(threadId);
               pendingTurnStartByReplayedChild.add(threadId);
               missingDiffWhileRunningByReplayedChild.delete(threadId);
@@ -2261,6 +2441,7 @@ const make = Effect.gen(function* () {
               if (outcome.status === "killed" && outcome.error === "thread archived") {
                 unarchivedArchiveChildIds.delete(threadId);
               }
+              unarchivedTerminalChildIds.delete(threadId);
               markLifecycleTerminal(threadId, outcome);
               return;
             }
@@ -2274,6 +2455,8 @@ const make = Effect.gen(function* () {
               const terminal = terminalByChild.get(threadId);
               if (terminal?.status === "killed" && terminal.error === "thread archived") {
                 terminalByChild.delete(threadId);
+              } else if (terminal !== undefined) {
+                unarchivedTerminalChildIds.add(threadId);
               }
               lifecycleTerminatedByChild.delete(threadId);
               return;
@@ -2290,6 +2473,8 @@ const make = Effect.gen(function* () {
         pendingSameTurnStartByReplayedChild,
         missingDiffWhileRunningByReplayedChild,
         unarchivedArchiveChildIds,
+        unarchivedTerminalChildIds,
+        unarchivedTerminalStartedChildIds,
         maxSequence,
       };
     });
@@ -2410,6 +2595,8 @@ const make = Effect.gen(function* () {
         pendingSameTurnStartByReplayedChild,
         missingDiffWhileRunningByReplayedChild,
         unarchivedArchiveChildIds,
+        unarchivedTerminalChildIds: replayedUnarchivedTerminalChildIds,
+        unarchivedTerminalStartedChildIds: replayedUnarchivedTerminalStartedChildIds,
       } = yield* reconcileFromLog(knownChildIds);
       for (const [childThreadId, turnId] of activeTurnByReplayedChild) {
         activeTurnByChild.set(childThreadId, turnId);
@@ -2423,33 +2610,89 @@ const make = Effect.gen(function* () {
       for (const childThreadId of missingDiffWhileRunningByReplayedChild) {
         missingDiffWhileRunningByChild.add(childThreadId);
       }
+      const terminalTextByStartedChild = new Map<ThreadId, string | null>();
+      for (const childThreadId of replayedUnarchivedTerminalStartedChildIds) {
+        if (!terminalByChild.has(childThreadId)) continue;
+        const detail = yield* getThreadDetailBounded(childThreadId);
+        terminalTextByStartedChild.set(
+          childThreadId,
+          Option.match(detail, {
+            onNone: () => null,
+            onSome: finalAssistantTextFromThread,
+          }),
+        );
+      }
       const prunedArchivedWakeDispatchIds = new Set<PendingDispatchId>();
       const prunedArchivedWakeChildIds = new Set<ThreadId>();
-      if (unarchivedArchiveChildIds.size > 0) {
-        const staleArchivedWakeRows = persisted.filter(
-          (row) =>
-            row.kind === "parent_injection" &&
-            row.sourceChildId !== null &&
-            unarchivedArchiveChildIds.has(row.sourceChildId as ThreadId) &&
-            row.status === "killed" &&
-            row.error === "thread archived",
-        );
-        if (staleArchivedWakeRows.length > 0) {
-          for (const row of staleArchivedWakeRows) {
-            const childThreadId = row.sourceChildId as ThreadId;
-            prunedArchivedWakeDispatchIds.add(row.id);
-            prunedArchivedWakeChildIds.add(childThreadId);
-          }
-          yield* deleteDispatchRows(staleArchivedWakeRows.map((row) => row.id));
+      const prunedArchivedDeliveredWakeChildIds = new Set<ThreadId>();
+      const deliveredWakeCleanupChildIds = new Set<ThreadId>();
+      const staleWakeRows = persisted.filter((row) => {
+        if (row.kind !== "parent_injection" || row.sourceChildId === null) return false;
+        const childThreadId = row.sourceChildId as ThreadId;
+        if (
+          unarchivedArchiveChildIds.has(childThreadId) &&
+          row.status === "killed" &&
+          row.error === "thread archived"
+        ) {
+          return true;
         }
+        if (!replayedUnarchivedTerminalStartedChildIds.has(childThreadId)) return false;
+        const terminal = terminalByChild.get(childThreadId);
+        if (terminal === undefined) return true;
+        if (row.status !== terminal.status || row.error !== terminal.error) return true;
+        if (terminal.status !== "completed") return false;
+        return row.text !== (terminalTextByStartedChild.get(childThreadId) ?? null);
+      });
+      if (staleWakeRows.length > 0) {
+        for (const row of staleWakeRows) {
+          const childThreadId = row.sourceChildId as ThreadId;
+          prunedArchivedWakeDispatchIds.add(row.id);
+          prunedArchivedWakeChildIds.add(childThreadId);
+          if (row.deliveredByWait) {
+            prunedArchivedDeliveredWakeChildIds.add(childThreadId);
+          }
+        }
+        for (const childThreadId of prunedArchivedWakeChildIds) {
+          const hasRemainingDeliveredWake = persisted.some(
+            (row) =>
+              row.kind === "parent_injection" &&
+              row.sourceChildId === childThreadId &&
+              !prunedArchivedWakeDispatchIds.has(row.id) &&
+              row.deliveredByWait,
+          );
+          if (
+            prunedArchivedDeliveredWakeChildIds.has(childThreadId) &&
+            !hasRemainingDeliveredWake
+          ) {
+            deliveredWakeCleanupChildIds.add(childThreadId);
+          }
+        }
+        yield* sql
+          .withTransaction(
+            Effect.gen(function* () {
+              yield* deleteDispatchRows(staleWakeRows.map((row) => row.id));
+              yield* deleteWaitDeliveryRows([...deliveredWakeCleanupChildIds]);
+              yield* deletePromotedChildRows([...deliveredWakeCleanupChildIds]);
+            }),
+          )
+          .pipe(Effect.orDie);
       }
       for (const childThreadId of prunedArchivedWakeChildIds) {
-        const hasRemainingWake = persisted.some(
+        const remainingWakeRows = persisted.filter(
           (row) =>
             row.kind === "parent_injection" &&
             row.sourceChildId === childThreadId &&
             !prunedArchivedWakeDispatchIds.has(row.id),
         );
+        const hasRemainingWake = remainingWakeRows.length > 0;
+        if (deliveredWakeCleanupChildIds.has(childThreadId)) {
+          waitDeliveredChildIds.delete(childThreadId);
+          waitDeliveredPromotedChildren.delete(childThreadId);
+          waitDeliveryMarkedAt.delete(childThreadId);
+          waitDeliveryParentTurnAt.delete(childThreadId);
+          promotedChildren.delete(childThreadId);
+          activePromotedWaitChildren.delete(childThreadId);
+        }
         if (hasRemainingWake) {
           queuedWakeChildren.add(childThreadId);
           continue;
@@ -2460,6 +2703,12 @@ const make = Effect.gen(function* () {
         const record = children.get(childThreadId);
         if (record !== undefined && !record.detached) {
           children.set(childThreadId, { ...record, detached: true });
+        }
+      }
+      for (const childThreadId of replayedUnarchivedTerminalChildIds) {
+        unarchivedTerminalChildIds.add(childThreadId);
+        if (pendingWakeChildIds.has(childThreadId)) {
+          queuedWakeChildren.add(childThreadId);
         }
       }
       for (const [childThreadId, outcome] of terminalByChild) {
