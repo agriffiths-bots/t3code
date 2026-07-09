@@ -76,6 +76,20 @@ describe("SubagentDispatchLimiter", () => {
     }).pipe(Effect.provide(layerTest(2))),
   );
 
+  it.effect("reports child ids holding active leases", () =>
+    Effect.gen(function* () {
+      const limiter = yield* SubagentDispatchLimiter;
+      const lease = yield* limiter.acquire;
+      yield* limiter.bindChild(lease, ThreadId.make("child-bound"));
+      yield* limiter.seedChild(ThreadId.make("child-seeded"));
+
+      expect(yield* limiter.leasedChildThreadIds).toEqual(["child-bound", "child-seeded"]);
+
+      yield* limiter.releaseForChild(ThreadId.make("child-bound"));
+      expect(yield* limiter.leasedChildThreadIds).toEqual(["child-seeded"]);
+    }).pipe(Effect.provide(layerTest(3))),
+  );
+
   it.effect("removes an interrupted queued acquire before granting the next waiter", () =>
     Effect.gen(function* () {
       const limiter = yield* SubagentDispatchLimiter;
