@@ -583,6 +583,225 @@ describe("ProviderCommandReactor", () => {
     expect(await harness.listPendingDispatches()).toHaveLength(0);
   });
 
+  it("does not recover idle turn starts without queued evidence", async () => {
+    const harness = await createHarness({ startReactor: false });
+    const now = "2026-01-01T00:00:00.000Z";
+    harness.generateThreadTitle.mockReturnValue(Effect.succeed({ title: "Idle prompt" }));
+
+    await runtime!.runPromise(
+      harness.engine.dispatch({
+        type: "thread.turn.start",
+        commandId: CommandId.make("cmd-turn-start-idle-before-recovery"),
+        threadId: ThreadId.make("thread-1"),
+        message: {
+          messageId: asMessageId("user-message-idle-before-recovery"),
+          role: "user",
+          text: "idle prompt already delivered before projection",
+          attachments: [],
+        },
+        titleSeed: "Thread",
+        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+        runtimeMode: "approval-required",
+        createdAt: now,
+      }),
+    );
+
+    await harness.startReactor();
+    await harness.drain();
+
+    expect(harness.sendTurn).not.toHaveBeenCalled();
+    expect(await harness.listPendingDispatches()).toHaveLength(0);
+  });
+
+  it("does not let a skipped idle recovery marker requeue later idle starts", async () => {
+    const harness = await createHarness({ startReactor: false });
+    const now = "2026-01-01T00:00:00.000Z";
+    const readyAt = "2026-01-01T00:00:01.000Z";
+    const laterAt = "2026-01-01T00:00:02.000Z";
+    harness.generateThreadTitle.mockReturnValue(Effect.succeed({ title: "Idle prompt" }));
+
+    await runtime!.runPromise(
+      harness.engine.dispatch({
+        type: "thread.turn.start",
+        commandId: CommandId.make("cmd-turn-start-first-idle-before-recovery"),
+        threadId: ThreadId.make("thread-1"),
+        message: {
+          messageId: asMessageId("user-message-first-idle-before-recovery"),
+          role: "user",
+          text: "first idle prompt already delivered before projection",
+          attachments: [],
+        },
+        titleSeed: "Thread",
+        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+        runtimeMode: "approval-required",
+        createdAt: now,
+      }),
+    );
+    await runtime!.runPromise(
+      harness.engine.dispatch({
+        type: "thread.session.set",
+        commandId: CommandId.make("cmd-session-set-ready-between-idle-recovery"),
+        threadId: ThreadId.make("thread-1"),
+        session: {
+          threadId: ThreadId.make("thread-1"),
+          status: "ready",
+          providerName: "codex",
+          providerInstanceId: ProviderInstanceId.make("codex"),
+          runtimeMode: "approval-required",
+          activeTurnId: null,
+          lastError: null,
+          updatedAt: readyAt,
+        },
+        createdAt: readyAt,
+      }),
+    );
+    await runtime!.runPromise(
+      harness.engine.dispatch({
+        type: "thread.turn.start",
+        commandId: CommandId.make("cmd-turn-start-later-idle-before-recovery"),
+        threadId: ThreadId.make("thread-1"),
+        message: {
+          messageId: asMessageId("user-message-later-idle-before-recovery"),
+          role: "user",
+          text: "later idle prompt also already delivered before projection",
+          attachments: [],
+        },
+        titleSeed: "Thread",
+        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+        runtimeMode: "approval-required",
+        createdAt: laterAt,
+      }),
+    );
+
+    await harness.startReactor();
+    await harness.drain();
+
+    expect(harness.sendTurn).not.toHaveBeenCalled();
+    expect(await harness.listPendingDispatches()).toHaveLength(0);
+  });
+
+  it("does not recover consecutive idle turn starts without queued evidence", async () => {
+    const harness = await createHarness({ startReactor: false });
+    const now = "2026-01-01T00:00:00.000Z";
+    const laterAt = "2026-01-01T00:00:01.000Z";
+    harness.generateThreadTitle.mockReturnValue(Effect.succeed({ title: "Idle prompt" }));
+
+    await runtime!.runPromise(
+      harness.engine.dispatch({
+        type: "thread.turn.start",
+        commandId: CommandId.make("cmd-turn-start-consecutive-idle-1"),
+        threadId: ThreadId.make("thread-1"),
+        message: {
+          messageId: asMessageId("user-message-consecutive-idle-1"),
+          role: "user",
+          text: "first consecutive idle prompt",
+          attachments: [],
+        },
+        titleSeed: "Thread",
+        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+        runtimeMode: "approval-required",
+        createdAt: now,
+      }),
+    );
+    await runtime!.runPromise(
+      harness.engine.dispatch({
+        type: "thread.turn.start",
+        commandId: CommandId.make("cmd-turn-start-consecutive-idle-2"),
+        threadId: ThreadId.make("thread-1"),
+        message: {
+          messageId: asMessageId("user-message-consecutive-idle-2"),
+          role: "user",
+          text: "second consecutive idle prompt",
+          attachments: [],
+        },
+        titleSeed: "Thread",
+        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+        runtimeMode: "approval-required",
+        createdAt: laterAt,
+      }),
+    );
+
+    await harness.startReactor();
+    await harness.drain();
+
+    expect(harness.sendTurn).not.toHaveBeenCalled();
+    expect(await harness.listPendingDispatches()).toHaveLength(0);
+  });
+
+  it("does not use future queued rows as evidence for earlier idle turn starts", async () => {
+    const harness = await createHarness({ startReactor: false });
+    const now = "2026-01-01T00:00:00.000Z";
+    const laterAt = "2026-01-01T00:00:01.000Z";
+    const laterMessageId = asMessageId("user-message-future-queued-row");
+    harness.generateThreadTitle.mockReturnValue(Effect.succeed({ title: "Idle prompt" }));
+
+    await runtime!.runPromise(
+      harness.engine.dispatch({
+        type: "thread.turn.start",
+        commandId: CommandId.make("cmd-turn-start-before-future-row"),
+        threadId: ThreadId.make("thread-1"),
+        message: {
+          messageId: asMessageId("user-message-before-future-row"),
+          role: "user",
+          text: "idle prompt before future row",
+          attachments: [],
+        },
+        titleSeed: "Thread",
+        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+        runtimeMode: "approval-required",
+        createdAt: now,
+      }),
+    );
+    await runtime!.runPromise(
+      harness.engine.dispatch({
+        type: "thread.turn.start",
+        commandId: CommandId.make("cmd-turn-start-future-queued-row"),
+        threadId: ThreadId.make("thread-1"),
+        message: {
+          messageId: laterMessageId,
+          role: "user",
+          text: "future queued prompt",
+          attachments: [],
+        },
+        titleSeed: "Thread",
+        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+        runtimeMode: "approval-required",
+        createdAt: laterAt,
+      }),
+    );
+    await runtime!.runPromise(
+      Effect.flatMap(Effect.service(PendingDispatchRepository), (repo) =>
+        repo.insert({
+          id: asPendingDispatchId(`thread-turn:${laterMessageId}`),
+          kind: "thread_turn",
+          targetThreadId: ThreadId.make("thread-1"),
+          sourceChildId: null,
+          text: JSON.stringify({
+            messageId: laterMessageId,
+            runtimeMode: "approval-required",
+            interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+            createdAt: laterAt,
+          }),
+          error: null,
+          status: null,
+          commandId: null,
+          deliveredByWait: false,
+          waitCancellable: false,
+          createdAt: laterAt,
+        }),
+      ),
+    );
+
+    await harness.startReactor();
+    await waitFor(() => harness.sendTurn.mock.calls.length === 1);
+    await harness.drain();
+
+    expect(harness.sendTurn.mock.calls[0]?.[0]).toMatchObject({
+      input: "future queued prompt",
+    });
+    expect(await harness.listPendingDispatches()).toHaveLength(0);
+  });
+
   it("queues accepted mid-turn user messages until the active turn is idle", async () => {
     const harness = await createHarness();
     const now = "2026-01-01T00:00:00.000Z";
@@ -906,6 +1125,92 @@ describe("ProviderCommandReactor", () => {
     ).toBe(true);
   });
 
+  it("replays persisted stops before draining later recovered turn starts", async () => {
+    const harness = await createHarness({ startReactor: false });
+    const now = "2026-01-01T00:00:00.000Z";
+    const stoppedAt = "2026-01-01T00:00:01.000Z";
+    const promptAt = "2026-01-01T00:00:02.000Z";
+    const messageId = asMessageId("user-message-after-unsettled-recovery-stop");
+
+    harness.runtimeSessions.push({
+      provider: ProviderDriverKind.make("codex"),
+      providerInstanceId: ProviderInstanceId.make("codex"),
+      status: "running",
+      runtimeMode: "approval-required",
+      model: "gpt-5-codex",
+      threadId: ThreadId.make("thread-1"),
+      resumeCursor: { opaque: "resume-running-before-unsettled-stop" },
+      activeTurnId: asTurnId("turn-running-before-unsettled-stop"),
+      createdAt: now,
+      updatedAt: now,
+    });
+
+    await runtime!.runPromise(
+      harness.engine.dispatch({
+        type: "thread.session.set",
+        commandId: CommandId.make("cmd-session-set-running-before-unsettled-stop"),
+        threadId: ThreadId.make("thread-1"),
+        session: {
+          threadId: ThreadId.make("thread-1"),
+          status: "running",
+          providerName: "codex",
+          providerInstanceId: ProviderInstanceId.make("codex"),
+          runtimeMode: "approval-required",
+          activeTurnId: asTurnId("turn-running-before-unsettled-stop"),
+          lastError: null,
+          updatedAt: now,
+        },
+        createdAt: now,
+      }),
+    );
+    await runtime!.runPromise(
+      harness.engine.dispatch({
+        type: "thread.session.stop",
+        commandId: CommandId.make("cmd-session-stop-unsettled-before-recovery"),
+        threadId: ThreadId.make("thread-1"),
+        createdAt: stoppedAt,
+      }),
+    );
+    await runtime!.runPromise(
+      harness.engine.dispatch({
+        type: "thread.turn.start",
+        commandId: CommandId.make("cmd-turn-start-after-unsettled-recovery-stop"),
+        threadId: ThreadId.make("thread-1"),
+        message: {
+          messageId,
+          role: "user",
+          text: "prompt after unsettled persisted stop",
+          attachments: [],
+        },
+        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+        runtimeMode: "approval-required",
+        createdAt: promptAt,
+      }),
+    );
+
+    await harness.startReactor();
+    await waitFor(() => harness.stopSession.mock.calls.length === 1);
+    await waitFor(() => harness.sendTurn.mock.calls.length === 1);
+    await harness.drain();
+
+    expect(harness.sendTurn.mock.calls[0]?.[0]).toMatchObject({
+      input: "prompt after unsettled persisted stop",
+    });
+    expect(await harness.listPendingDispatches()).toHaveLength(0);
+    const readModel = await harness.readModel();
+    const thread = readModel.threads.find((entry) => entry.id === ThreadId.make("thread-1"));
+    expect(
+      thread?.activities.some((activity) => {
+        if (activity.kind !== "provider.turn.start.failed") return false;
+        const payload =
+          typeof activity.payload === "object" && activity.payload !== null
+            ? (activity.payload as Record<string, unknown>)
+            : {};
+        return payload.messageId === messageId && payload.canceled === true;
+      }) ?? false,
+    ).toBe(false);
+  });
+
   it("does not mark already-run turn starts canceled during persisted stop recovery", async () => {
     const harness = await createHarness({ startReactor: false });
     const now = "2026-01-01T00:00:00.000Z";
@@ -1022,6 +1327,140 @@ describe("ProviderCommandReactor", () => {
         return payload.messageId === messageId && payload.canceled === true;
       }) ?? false,
     ).toBe(false);
+  });
+
+  it("does not use stale delivered queued rows as recovery evidence for later idle starts", async () => {
+    const harness = await createHarness({ startReactor: false });
+    const now = "2026-01-01T00:00:00.000Z";
+    const runningAt = "2026-01-01T00:00:00.500Z";
+    const completedAt = "2026-01-01T00:00:01.000Z";
+    const readyAt = "2026-01-01T00:00:01.500Z";
+    const laterAt = "2026-01-01T00:00:02.000Z";
+    const messageId = asMessageId("user-message-delivered-before-stale-row");
+    const assistantMessageId = asMessageId("assistant-message-delivered-before-stale-row");
+    const turnId = asTurnId("turn-delivered-before-stale-row");
+
+    await runtime!.runPromise(
+      harness.engine.dispatch({
+        type: "thread.turn.start",
+        commandId: CommandId.make("cmd-turn-start-delivered-before-stale-row"),
+        threadId: ThreadId.make("thread-1"),
+        message: {
+          messageId,
+          role: "user",
+          text: "delivered before stale row cleanup",
+          attachments: [],
+        },
+        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+        runtimeMode: "approval-required",
+        createdAt: now,
+      }),
+    );
+    await runtime!.runPromise(
+      harness.engine.dispatch({
+        type: "thread.session.set",
+        commandId: CommandId.make("cmd-session-set-running-delivered-before-stale-row"),
+        threadId: ThreadId.make("thread-1"),
+        session: {
+          threadId: ThreadId.make("thread-1"),
+          status: "running",
+          providerName: "codex",
+          providerInstanceId: ProviderInstanceId.make("codex"),
+          runtimeMode: "approval-required",
+          activeTurnId: turnId,
+          lastError: null,
+          updatedAt: runningAt,
+        },
+        createdAt: runningAt,
+      }),
+    );
+    await runtime!.runPromise(
+      harness.engine.dispatch({
+        type: "thread.message.assistant.complete",
+        commandId: CommandId.make("cmd-assistant-delivered-before-stale-row"),
+        threadId: ThreadId.make("thread-1"),
+        messageId: assistantMessageId,
+        turnId,
+        createdAt: completedAt,
+      }),
+    );
+    await runtime!.runPromise(
+      harness.engine.dispatch({
+        type: "thread.turn.diff.complete",
+        commandId: CommandId.make("cmd-turn-diff-delivered-before-stale-row"),
+        threadId: ThreadId.make("thread-1"),
+        turnId,
+        completedAt,
+        checkpointRef: CheckpointRef.make("refs/t3/checkpoints/thread-1/turn/stale-row"),
+        status: "ready",
+        files: [],
+        assistantMessageId,
+        checkpointTurnCount: 1,
+        createdAt: completedAt,
+      }),
+    );
+    await runtime!.runPromise(
+      harness.engine.dispatch({
+        type: "thread.session.set",
+        commandId: CommandId.make("cmd-session-set-ready-after-stale-row-delivery"),
+        threadId: ThreadId.make("thread-1"),
+        session: {
+          threadId: ThreadId.make("thread-1"),
+          status: "ready",
+          providerName: "codex",
+          providerInstanceId: ProviderInstanceId.make("codex"),
+          runtimeMode: "approval-required",
+          activeTurnId: null,
+          lastError: null,
+          updatedAt: readyAt,
+        },
+        createdAt: readyAt,
+      }),
+    );
+    await runtime!.runPromise(
+      Effect.flatMap(Effect.service(PendingDispatchRepository), (repo) =>
+        repo.insert({
+          id: asPendingDispatchId(`thread-turn:${messageId}`),
+          kind: "thread_turn",
+          targetThreadId: ThreadId.make("thread-1"),
+          sourceChildId: null,
+          text: JSON.stringify({
+            messageId,
+            runtimeMode: "approval-required",
+            interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+            createdAt: now,
+          }),
+          error: null,
+          status: null,
+          commandId: "server:queued-turn-send:delivered-before-stale-row",
+          deliveredByWait: false,
+          waitCancellable: false,
+          createdAt: now,
+        }),
+      ),
+    );
+    await runtime!.runPromise(
+      harness.engine.dispatch({
+        type: "thread.turn.start",
+        commandId: CommandId.make("cmd-turn-start-idle-after-stale-row"),
+        threadId: ThreadId.make("thread-1"),
+        message: {
+          messageId: asMessageId("user-message-idle-after-stale-row"),
+          role: "user",
+          text: "idle prompt after stale row",
+          attachments: [],
+        },
+        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+        runtimeMode: "approval-required",
+        createdAt: laterAt,
+      }),
+    );
+
+    await harness.startReactor();
+    await harness.drain();
+
+    expect(harness.sendTurn).not.toHaveBeenCalled();
+    expect(await harness.listPendingDispatches()).toHaveLength(0);
   });
 
   it("cancels durable queued turn rows superseded by a persisted stop request on startup", async () => {

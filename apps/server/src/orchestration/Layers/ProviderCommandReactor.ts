@@ -89,6 +89,10 @@ type TurnStartRequestedEvent = Extract<
   ProviderCommandReactorEvent,
   { type: "thread.turn-start-requested" }
 >;
+type SessionStopRequestedEvent = Extract<
+  ProviderCommandReactorEvent,
+  { type: "thread.session-stop-requested" }
+>;
 
 const QueuedThreadTurnPayload = Schema.Struct({
   messageId: MessageId,
@@ -108,10 +112,26 @@ interface StopRequestMarker {
   readonly createdAt: string;
 }
 
+interface HistoricalThreadSessionState {
+  readonly status: OrchestrationSession["status"];
+  readonly activeTurnId: TurnId | null;
+}
+
 const stopRequestSupersedesSequence = (
   stopRequest: StopRequestMarker,
   sourceSequence: number | undefined,
 ): boolean => sourceSequence === undefined || stopRequest.sequence > sourceSequence;
+
+function historicalSessionBlocksImmediateSend(
+  session: HistoricalThreadSessionState | undefined,
+): boolean {
+  if (session === undefined) {
+    return false;
+  }
+  return (
+    session.activeTurnId !== null || session.status === "starting" || session.status === "running"
+  );
+}
 
 function toNonEmptyProviderInput(value: string | undefined): string | undefined {
   const normalized = value?.trim();
@@ -1236,6 +1256,40 @@ const make = Effect.gen(function* () {
       yield* deletePendingThreadTurnRows(input.rows.map((row) => row.id));
     }).pipe(Effect.orDie);
 
+  const partitionStoppedThreadTurnRows = (input: {
+    readonly thread: OrchestrationThread | undefined;
+    readonly rows: ReadonlyArray<PendingDispatch>;
+    readonly stopRequest: StopRequestMarker | undefined;
+  }): {
+    readonly rowsToCancel: ReadonlyArray<PendingDispatch>;
+    readonly rowsToDelete: ReadonlyArray<PendingDispatch>;
+    readonly rowsToKeep: ReadonlyArray<PendingDispatch>;
+  } => {
+    const rowsToCancel: PendingDispatch[] = [];
+    const rowsToDelete: PendingDispatch[] = [];
+    const rowsToKeep: PendingDispatch[] = [];
+    for (const row of input.rows) {
+      if (
+        input.stopRequest !== undefined &&
+        !stopRequestSupersedesQueuedRow(input.stopRequest, row)
+      ) {
+        rowsToKeep.push(row);
+        continue;
+      }
+      const payload = parseQueuedThreadTurnPayload(row);
+      const message =
+        payload === null
+          ? undefined
+          : input.thread?.messages.find((entry) => entry.id === payload.messageId);
+      if (message !== undefined && message.turnId !== null) {
+        rowsToDelete.push(row);
+      } else {
+        rowsToCancel.push(row);
+      }
+    }
+    return { rowsToCancel, rowsToDelete, rowsToKeep };
+  };
+
   const claimedThreadTurnCanSend = (input: {
     readonly threadId: ThreadId;
     readonly rowId: PendingDispatchId;
@@ -1308,14 +1362,14 @@ const make = Effect.gen(function* () {
       }
       if (thread.session?.status === "stopped") {
         const stopRequest = stopRequestByThreadId.get(threadId);
-        const rowsToCancel =
-          stopRequest === undefined
-            ? rows
-            : rows.filter((row) => stopRequestSupersedesQueuedRow(stopRequest, row));
-        const rowsToKeep =
-          stopRequest === undefined
-            ? []
-            : rows.filter((row) => !stopRequestSupersedesQueuedRow(stopRequest, row));
+        const { rowsToCancel, rowsToDelete, rowsToKeep } = partitionStoppedThreadTurnRows({
+          thread,
+          rows,
+          stopRequest,
+        });
+        if (rowsToDelete.length > 0) {
+          yield* deletePendingThreadTurnRows(rowsToDelete.map((row) => row.id));
+        }
         if (rowsToCancel.length > 0) {
           yield* cancelPendingThreadTurnRows({
             threadId,
@@ -1555,18 +1609,13 @@ const make = Effect.gen(function* () {
   });
 
   const recoverMissingQueuedThreadTurnsFromEventLog = Effect.fnUntraced(function* () {
-    const existingRows = yield* pendingDispatches.listAll().pipe(Effect.orDie);
-    const knownThreadTurnRows = new Map(
-      existingRows
-        .filter((row) => row.kind === THREAD_TURN_PENDING_KIND)
-        .map((row) => [row.id, row]),
-    );
     const threadCache = new Map<string, OrchestrationThread | undefined>();
     const latestStopRequestByThread = new Map<
       string,
       { readonly sequence: number; readonly createdAt: string }
     >();
     const effectiveStopRequestByThread = new Map<string, StopRequestMarker>();
+    const effectiveStopEventByThread = new Map<string, SessionStopRequestedEvent>();
     const resolveThreadCached = (threadId: ThreadId) =>
       Effect.gen(function* () {
         const threadCacheKey = String(threadId);
@@ -1592,6 +1641,7 @@ const make = Effect.gen(function* () {
               latestStopRequestByThread.set(key, stopRequest);
             }
             effectiveStopRequestByThread.set(key, stopRequest);
+            effectiveStopEventByThread.set(key, event);
             return;
           }
           if (event.type === "thread.session-set" && event.payload.session.status !== "stopped") {
@@ -1603,6 +1653,7 @@ const make = Effect.gen(function* () {
               event.payload.session.updatedAt > stopRequest.createdAt
             ) {
               effectiveStopRequestByThread.delete(key);
+              effectiveStopEventByThread.delete(key);
             }
           }
         }),
@@ -1614,15 +1665,120 @@ const make = Effect.gen(function* () {
         stopRequestByThreadId.set(threadId, stopRequest);
       }
     });
+    yield* Effect.forEach(
+      effectiveStopEventByThread.values(),
+      (event) =>
+        Effect.gen(function* () {
+          const thread = yield* resolveThreadCached(event.payload.threadId);
+          if (
+            thread === undefined ||
+            (thread.session?.status === "stopped" &&
+              thread.session.updatedAt >= event.payload.createdAt)
+          ) {
+            return;
+          }
+          yield* processSessionStopRequested(event);
+          threadCache.delete(String(event.payload.threadId));
+        }),
+      { concurrency: 1, discard: true },
+    );
+
+    const existingRows = yield* pendingDispatches.listAll().pipe(Effect.orDie);
+    const knownThreadTurnRows = new Map(
+      existingRows
+        .filter((row) => row.kind === THREAD_TURN_PENDING_KIND)
+        .map((row) => [row.id, row]),
+    );
+    const staleKnownRows: PendingDispatch[] = [];
+    for (const row of knownThreadTurnRows.values()) {
+      const payload = parseQueuedThreadTurnPayload(row);
+      if (payload === null) {
+        staleKnownRows.push(row);
+        continue;
+      }
+      const thread = yield* resolveThreadCached(row.targetThreadId);
+      const message = thread?.messages.find((entry) => entry.id === payload.messageId);
+      if (
+        thread === undefined ||
+        message === undefined ||
+        (message.role !== "user" && message.role !== "system") ||
+        message.turnId !== null ||
+        failedProviderTurnStartMessageIds(thread).has(payload.messageId)
+      ) {
+        staleKnownRows.push(row);
+      }
+    }
+    if (staleKnownRows.length > 0) {
+      yield* deletePendingThreadTurnRows(staleKnownRows.map((row) => row.id));
+      for (const row of staleKnownRows) {
+        knownThreadTurnRows.delete(row.id);
+      }
+    }
+    const queuedRowCountByThread = new Map<string, number>();
+    const queuedRowEvidenceIds = new Set<PendingDispatchId>();
+    const incrementQueuedRowCount = (threadId: ThreadId) => {
+      const key = String(threadId);
+      queuedRowCountByThread.set(key, (queuedRowCountByThread.get(key) ?? 0) + 1);
+    };
+    const markQueuedRowEvidence = (row: PendingDispatch) => {
+      if (queuedRowEvidenceIds.has(row.id)) {
+        return;
+      }
+      queuedRowEvidenceIds.add(row.id);
+      incrementQueuedRowCount(row.targetThreadId);
+    };
+    const decrementQueuedRowCount = (threadId: ThreadId) => {
+      const key = String(threadId);
+      const nextCount = (queuedRowCountByThread.get(key) ?? 0) - 1;
+      if (nextCount > 0) {
+        queuedRowCountByThread.set(key, nextCount);
+      } else {
+        queuedRowCountByThread.delete(key);
+      }
+    };
+    const unmarkQueuedRowEvidence = (row: PendingDispatch) => {
+      if (!queuedRowEvidenceIds.delete(row.id)) {
+        return;
+      }
+      decrementQueuedRowCount(row.targetThreadId);
+    };
+    const historicalSessionByThread = new Map<string, HistoricalThreadSessionState>();
+    const unsettledStopRequestByThread = new Map<string, StopRequestMarker>();
 
     yield* orchestrationEngine.readEvents(0, Number.MAX_SAFE_INTEGER).pipe(
       Stream.runForEach((event) =>
         Effect.gen(function* () {
+          if (event.type === "thread.session-stop-requested") {
+            unsettledStopRequestByThread.set(String(event.payload.threadId), {
+              sequence: event.sequence,
+              createdAt: event.payload.createdAt,
+            });
+            return;
+          }
+          if (event.type === "thread.session-set") {
+            const key = String(event.payload.threadId);
+            const historicalSession = {
+              status: event.payload.session.status,
+              activeTurnId: event.payload.session.activeTurnId,
+            } satisfies HistoricalThreadSessionState;
+            historicalSessionByThread.set(key, historicalSession);
+            const stopRequest = unsettledStopRequestByThread.get(key);
+            if (
+              stopRequest !== undefined &&
+              event.sequence > stopRequest.sequence &&
+              (event.payload.session.status === "stopped" ||
+                event.payload.session.updatedAt > stopRequest.createdAt)
+            ) {
+              unsettledStopRequestByThread.delete(key);
+            }
+            return;
+          }
           if (event.type !== "thread.turn-start-requested") {
             return;
           }
 
           const rowId = pendingThreadTurnIdForMessage(event.payload.messageId);
+          const key = turnStartKeyForEvent(event);
           const existingKnownRow = knownThreadTurnRows.get(rowId);
           if (existingKnownRow !== undefined) {
             const payload = parseQueuedThreadTurnPayload(existingKnownRow);
@@ -1654,6 +1810,9 @@ const make = Effect.gen(function* () {
             const thread = yield* resolveThreadCached(event.payload.threadId);
             const message = thread?.messages.find((entry) => entry.id === event.payload.messageId);
             if (existingRow !== undefined) {
+              if (yield* claimTurnStartHandling(key)) {
+                return;
+              }
               if (message !== undefined && message.turnId !== null) {
                 yield* deletePendingThreadTurnRows([existingRow.id]);
               } else {
@@ -1664,6 +1823,7 @@ const make = Effect.gen(function* () {
                 });
               }
               knownThreadTurnRows.delete(rowId);
+              unmarkQueuedRowEvidence(existingRow);
             } else {
               if (
                 thread !== undefined &&
@@ -1672,6 +1832,9 @@ const make = Effect.gen(function* () {
                 message.turnId === null &&
                 !failedProviderTurnStartMessageIds(thread).has(event.payload.messageId)
               ) {
+                if (yield* claimTurnStartHandling(key)) {
+                  return;
+                }
                 yield* appendQueuedTurnCanceledActivity({
                   threadId: event.payload.threadId,
                   messageId: event.payload.messageId,
@@ -1682,12 +1845,12 @@ const make = Effect.gen(function* () {
             return;
           }
 
-          const key = turnStartKeyForEvent(event);
-          if (yield* claimTurnStartHandling(key)) {
-            return;
-          }
-
           if (knownThreadTurnRows.has(rowId)) {
+            const row = knownThreadTurnRows.get(rowId);
+            if (row !== undefined) {
+              markQueuedRowEvidence(row);
+              yield* claimTurnStartHandling(key);
+            }
             return;
           }
 
@@ -1707,10 +1870,23 @@ const make = Effect.gen(function* () {
             return;
           }
 
+          const threadKey = String(event.payload.threadId);
+          const hasQueuedRecoveryEvidence =
+            (queuedRowCountByThread.get(threadKey) ?? 0) > 0 ||
+            historicalSessionBlocksImmediateSend(historicalSessionByThread.get(threadKey)) ||
+            unsettledStopRequestByThread.has(threadKey);
+          if (!hasQueuedRecoveryEvidence) {
+            return;
+          }
+
+          if (yield* claimTurnStartHandling(key)) {
+            return;
+          }
           yield* startFirstUserTurnSideEffects({ event, thread, message });
           const row = pendingThreadTurnRowForEvent(event);
           yield* pendingDispatches.insert(row).pipe(Effect.orDie);
           knownThreadTurnRows.set(row.id, row);
+          markQueuedRowEvidence(row);
         }),
       ),
       Effect.orDie,
@@ -2005,12 +2181,14 @@ const make = Effect.gen(function* () {
     const rows = yield* pendingDispatches
       .listByTarget({ kind: THREAD_TURN_PENDING_KIND, targetThreadId: thread.id })
       .pipe(Effect.orDie);
-    const rowsToCancel = rows.filter((row) =>
-      stopRequestSupersedesQueuedRow(
-        { sequence: event.sequence, createdAt: event.payload.createdAt },
-        row,
-      ),
-    );
+    const { rowsToCancel, rowsToDelete } = partitionStoppedThreadTurnRows({
+      thread,
+      rows,
+      stopRequest: { sequence: event.sequence, createdAt: event.payload.createdAt },
+    });
+    if (rowsToDelete.length > 0) {
+      yield* deletePendingThreadTurnRows(rowsToDelete.map((row) => row.id));
+    }
     if (rowsToCancel.length > 0) {
       yield* cancelPendingThreadTurnRows({
         threadId: thread.id,
@@ -2101,14 +2279,15 @@ const make = Effect.gen(function* () {
             })
             .pipe(Effect.orDie);
           const stopRequest = stopRequestByThreadId.get(event.payload.threadId);
-          const rowsToCancel =
-            stopRequest === undefined
-              ? rows
-              : rows.filter((row) => stopRequestSupersedesQueuedRow(stopRequest, row));
-          const rowsToKeep =
-            stopRequest === undefined
-              ? []
-              : rows.filter((row) => !stopRequestSupersedesQueuedRow(stopRequest, row));
+          const thread = yield* resolveThread(event.payload.threadId);
+          const { rowsToCancel, rowsToDelete, rowsToKeep } = partitionStoppedThreadTurnRows({
+            thread,
+            rows,
+            stopRequest,
+          });
+          if (rowsToDelete.length > 0) {
+            yield* deletePendingThreadTurnRows(rowsToDelete.map((row) => row.id));
+          }
           if (rowsToCancel.length > 0) {
             yield* cancelPendingThreadTurnRows({
               threadId: event.payload.threadId,
