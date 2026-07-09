@@ -154,6 +154,7 @@ const makeRemoteChildRepository = Effect.gen(function* () {
         WHERE parent_thread_id = ${parentThreadId}
           AND child_env_id = ${childEnvironmentId}
           AND child_thread_id = ${childThreadId}
+          AND NOT ${sql.in("status", REMOTE_CHILD_TERMINAL_STATUSES)}
       `,
   });
 
