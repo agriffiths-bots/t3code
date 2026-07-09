@@ -26,6 +26,8 @@ const hangPromptForever = process.env.T3_ACP_HANG_PROMPT_FOREVER === "1";
 const hangFirstPromptForever = process.env.T3_ACP_HANG_FIRST_PROMPT_FOREVER === "1";
 const emitLateUpdateAfterCancel = process.env.T3_ACP_EMIT_LATE_UPDATE_AFTER_CANCEL === "1";
 const exitAfterPromptReturn = process.env.T3_ACP_EXIT_AFTER_PROMPT_RETURN === "1";
+const emitDetachedLateUpdateAfterCancel =
+  process.env.T3_ACP_EMIT_DETACHED_LATE_UPDATE_AFTER_CANCEL === "1";
 const emitLateCursorExtensionAfterCancel =
   process.env.T3_ACP_EMIT_LATE_CURSOR_EXTENSION_AFTER_CANCEL === "1";
 const omitXAiPromptCompleteStopReason =
@@ -38,6 +40,7 @@ const emitLoadReplayMultiSegment = process.env.T3_ACP_EMIT_LOAD_REPLAY_MULTI_SEG
 const emitLoadReplayLiveContinuation =
   process.env.T3_ACP_EMIT_LOAD_REPLAY_LIVE_CONTINUATION === "1";
 const emitLoadPendingAskQuestion = process.env.T3_ACP_EMIT_LOAD_PENDING_ASK_QUESTION === "1";
+const loadPendingAskQuestionOncePath = process.env.T3_ACP_LOAD_PENDING_ASK_QUESTION_ONCE_PATH;
 const loadReplayLiveContinuationDelayMs = Number(
   process.env.T3_ACP_LOAD_REPLAY_LIVE_CONTINUATION_DELAY_MS ?? "20",
 );
@@ -469,7 +472,14 @@ const program = Effect.gen(function* () {
           configOptions: configOptions(),
         };
       }
-      if (emitLoadPendingAskQuestion) {
+      const shouldEmitLoadPendingAskQuestion =
+        emitLoadPendingAskQuestion &&
+        (loadPendingAskQuestionOncePath === undefined ||
+          !NodeFS.existsSync(loadPendingAskQuestionOncePath));
+      if (shouldEmitLoadPendingAskQuestion) {
+        if (loadPendingAskQuestionOncePath !== undefined) {
+          NodeFS.writeFileSync(loadPendingAskQuestionOncePath, "1", "utf8");
+        }
         yield* Effect.forkIn(
           Effect.gen(function* () {
             yield* Effect.sleep("10 millis");
@@ -608,6 +618,21 @@ const program = Effect.gen(function* () {
             merge: false,
           });
         });
+      }
+      if (emitDetachedLateUpdateAfterCancel) {
+        yield* Effect.forkIn(
+          Effect.gen(function* () {
+            yield* Effect.sleep("200 millis");
+            writeJsonRpcNotification("session/update", {
+              sessionId: cancelledSessionId,
+              update: {
+                sessionUpdate: "agent_message_chunk",
+                content: { type: "text", text: "detached late after cancel" },
+              },
+            });
+          }),
+          programScope,
+        );
       }
     }),
   );
