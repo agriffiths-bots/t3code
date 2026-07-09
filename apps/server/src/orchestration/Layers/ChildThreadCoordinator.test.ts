@@ -2798,6 +2798,45 @@ describe("ChildThreadCoordinator", () => {
     expect(result.finalAssistantText).toBe("completed before archive");
   });
 
+  it("preserves live completed shell when archive detail read times out", async () => {
+    const child = ThreadId.make("live-archive-completed-slow-detail-child");
+    const parent = ThreadId.make("live-archive-completed-slow-detail-parent");
+    const turn1 = TurnId.make("turn-1");
+    const harness = await createHarness({
+      threads: [
+        makeThreadState({
+          threadId: child,
+          parentThreadId: parent,
+          latestTurn: makeLatestTurn("running", turn1),
+          session: makeSession(child, "running", turn1),
+        }),
+      ],
+      slowThreadDetailReadNumbers: [{ threadId: child, readNumbers: [1] }],
+    });
+    await harness.register({
+      parentThreadId: parent,
+      childThreadId: child,
+      detached: false,
+      model: codexModel,
+      spawnedAtMs: 0,
+    });
+    harness.setThread(
+      makeThreadState({
+        threadId: child,
+        parentThreadId: parent,
+        latestTurn: makeLatestTurn("completed", turn1),
+        session: makeSession(child, "stopped"),
+        assistantText: "completed before slow archive detail",
+      }),
+    );
+
+    await harness.feed(threadArchivedEvent(child));
+
+    const result = await runtimeRun(harness, child);
+    expect(result.status).toBe("completed");
+    expect(result.error).toBe(null);
+  });
+
   it("preserves pre-registration completed projection when archive arrives first", async () => {
     const child = ThreadId.make("live-archive-before-register-completed-child");
     const parent = ThreadId.make("live-archive-before-register-completed-parent");
@@ -3559,6 +3598,61 @@ describe("ChildThreadCoordinator", () => {
     expect(entries).toHaveLength(6);
     expect(entries.every((entry) => !entry.settled)).toBe(true);
     expect(await harness.canAcquireDispatchLease()).toBe(true);
+  });
+
+  it("drains deferred steers when unarchiving idle children", async () => {
+    const parent = ThreadId.make("live-unarchive-idle-steer-parent");
+    const child = ThreadId.make("live-unarchive-idle-steer-child");
+    const turn1 = TurnId.make("turn-1");
+    const harness = await createHarness({
+      threads: [
+        makeThreadState({
+          threadId: child,
+          parentThreadId: parent,
+          latestTurn: makeLatestTurn("running", turn1),
+          session: makeSession(child, "running", turn1),
+        }),
+      ],
+    });
+    await harness.register({
+      parentThreadId: parent,
+      childThreadId: child,
+      detached: false,
+      model: codexModel,
+      spawnedAtMs: 0,
+    });
+    await harness.feed(threadArchivedEvent(child));
+    await harness.insertPendingDispatch({
+      id: PendingDispatchId.make("pd-live-unarchive-idle-steer"),
+      kind: "child_steer",
+      targetThreadId: child,
+      sourceChildId: null,
+      text: "continue after unarchive",
+      error: null,
+      status: null,
+      commandId: null,
+      deliveredByWait: false,
+      waitCancellable: false,
+      createdAt: now as unknown as PendingDispatch["createdAt"],
+    });
+    harness.setThread(
+      makeThreadState({
+        threadId: child,
+        parentThreadId: parent,
+        latestTurn: null,
+        session: makeSession(child, "stopped"),
+      }),
+    );
+
+    await harness.feed(threadUnarchivedEvent(child));
+
+    const steerStarts = harness.dispatched.filter(
+      (command): command is Extract<OrchestrationCommand, { readonly type: "thread.turn.start" }> =>
+        command.type === "thread.turn.start" && command.threadId === child,
+    );
+    expect(steerStarts).toHaveLength(1);
+    expect(steerStarts[0]?.message.text).toBe("continue after unarchive");
+    expect(await harness.listPendingDispatches()).toEqual([]);
   });
 
   it("clears live wait-delivery state when unarchiving a delivered archived wake", async () => {
@@ -4506,6 +4600,126 @@ describe("ChildThreadCoordinator", () => {
     expect(pendingRows).toHaveLength(1);
     expect(pendingRows[0]!.id).toBe(newWakeId);
     expect(pendingRows[0]!.text).toBe("new replayed result");
+  });
+
+  it("keeps replayed post-unarchive wakes after a subsequent child turn starts", async () => {
+    const child = ThreadId.make("recon-unarchive-terminal-keep-after-later-start-child");
+    const parent = ThreadId.make("recon-unarchive-terminal-keep-after-later-start-parent");
+    const turn1 = TurnId.make("turn-1");
+    const turn2 = TurnId.make("turn-2");
+    const turn3 = TurnId.make("turn-3");
+    const newWakeId = PendingDispatchId.make(
+      "pd-recon-unarchive-terminal-new-wake-after-later-start",
+    );
+    const harness = await createHarness({
+      threads: [
+        makeThreadState({
+          threadId: child,
+          parentThreadId: parent,
+          latestTurn: makeLatestTurn("running", turn3),
+          session: makeSession(child, "running", turn3),
+        }),
+      ],
+      seedChildRows: [{ threadId: child, parentThreadId: parent }],
+      persistedEvents: [
+        turnDiffEvent(child, "ready", turn1),
+        threadArchivedEvent(child),
+        threadUnarchivedEvent(child),
+        turnStartRequestedEvent(child),
+        sessionSetEvent(child, "running", turn2),
+        turnDiffEvent(child, "ready", turn2),
+        turnStartRequestedEvent(child),
+        sessionSetEvent(child, "running", turn3),
+      ],
+      seedPendingDispatches: [
+        {
+          id: newWakeId,
+          kind: "parent_injection",
+          targetThreadId: parent,
+          sourceChildId: child,
+          text: "post-unarchive result before later start",
+          error: null,
+          status: "completed",
+          commandId: null,
+          deliveredByWait: false,
+          waitCancellable: false,
+          createdAt: now as unknown as PendingDispatch["createdAt"],
+        },
+      ],
+    });
+
+    const pendingRows = await harness.listPendingDispatches();
+    expect(pendingRows).toHaveLength(1);
+    expect(pendingRows[0]!.id).toBe(newWakeId);
+    expect(pendingRows[0]!.text).toBe("post-unarchive result before later start");
+  });
+
+  it("prunes stale post-unarchive wake siblings after a subsequent child turn starts", async () => {
+    const child = ThreadId.make("recon-unarchive-terminal-prune-sibling-after-later-start-child");
+    const parent = ThreadId.make("recon-unarchive-terminal-prune-sibling-after-later-start-parent");
+    const turn1 = TurnId.make("turn-1");
+    const turn2 = TurnId.make("turn-2");
+    const turn3 = TurnId.make("turn-3");
+    const staleWakeId = PendingDispatchId.make(
+      "pd-recon-unarchive-terminal-stale-sibling-after-later-start",
+    );
+    const newWakeId = PendingDispatchId.make(
+      "pd-recon-unarchive-terminal-current-sibling-after-later-start",
+    );
+    const harness = await createHarness({
+      threads: [
+        makeThreadState({
+          threadId: child,
+          parentThreadId: parent,
+          latestTurn: makeLatestTurn("running", turn3),
+          session: makeSession(child, "running", turn3),
+        }),
+      ],
+      seedChildRows: [{ threadId: child, parentThreadId: parent }],
+      persistedEvents: [
+        turnDiffEvent(child, "ready", turn1),
+        threadArchivedEvent(child),
+        threadUnarchivedEvent(child),
+        turnStartRequestedEvent(child),
+        sessionSetEvent(child, "running", turn2),
+        turnDiffEvent(child, "ready", turn2),
+        turnStartRequestedEvent(child),
+        sessionSetEvent(child, "running", turn3),
+      ],
+      seedPendingDispatches: [
+        {
+          id: staleWakeId,
+          kind: "parent_injection",
+          targetThreadId: parent,
+          sourceChildId: child,
+          text: "old pre-unarchive result",
+          error: null,
+          status: "completed",
+          commandId: null,
+          deliveredByWait: false,
+          waitCancellable: false,
+          createdAt: "2026-06-17T09:59:59.000Z" as unknown as PendingDispatch["createdAt"],
+        },
+        {
+          id: newWakeId,
+          kind: "parent_injection",
+          targetThreadId: parent,
+          sourceChildId: child,
+          text: "post-unarchive result before later start",
+          error: null,
+          status: "completed",
+          commandId: null,
+          deliveredByWait: false,
+          waitCancellable: false,
+          createdAt: now as unknown as PendingDispatch["createdAt"],
+        },
+      ],
+    });
+
+    const pendingRows = await harness.listPendingDispatches();
+    expect(pendingRows).toHaveLength(1);
+    expect(pendingRows[0]!.id).toBe(newWakeId);
+    expect(pendingRows[0]!.text).toBe("post-unarchive result before later start");
   });
 
   it("preserves projected completion when shell reconciliation times out", async () => {

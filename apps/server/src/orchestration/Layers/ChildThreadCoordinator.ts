@@ -923,6 +923,17 @@ const make = Effect.gen(function* () {
       pendingSameTurnId: pendingSameTurnStartByChild.get(childThreadId),
     });
 
+  const shellTerminalOutcome = (
+    childThreadId: ThreadId,
+    shell: OrchestrationThreadShell,
+  ): ChildTerminalOutcome | null => {
+    const terminalTurn = currentLiveProjectedTerminal(childThreadId, shell);
+    if (terminalTurn === null) return null;
+    return terminalTurn.state === "completed"
+      ? { status: "completed", error: null }
+      : { status: "failed", error: `turn ${terminalTurn.state}` };
+  };
+
   const completeChild = (
     childThreadId: ThreadId,
     status: ChildTerminalStatus,
@@ -1564,6 +1575,18 @@ const make = Effect.gen(function* () {
           onNone: () => null,
           onSome: (thread) => projectedLifecycleTerminal({ ...thread, archivedAt }),
         });
+        if (projectedOutcome === null && Option.isNone(detail)) {
+          const shell = yield* getThreadShellBounded(threadId);
+          const shellOutcome = Option.isSome(shell)
+            ? shellTerminalOutcome(threadId, shell.value)
+            : null;
+          if (shellOutcome !== null) {
+            archivedChildIds.delete(threadId);
+            archivedActiveChildIds.delete(threadId);
+            yield* completeChild(threadId, shellOutcome.status, null, shellOutcome.error);
+            return;
+          }
+        }
         const outcome: ChildTerminalOutcome =
           projectedOutcome ?? ({ status: "killed", error: "thread archived" } as const);
         if (isThreadArchivedOutcome(outcome) && projectedOutcome === null) {
@@ -1771,6 +1794,7 @@ const make = Effect.gen(function* () {
       }
       archivedActiveChildIds.delete(threadId);
       yield* discardQueuedArchivedWake(threadId);
+      yield* drainChildSteers(threadId);
     });
 
   const handleTurnStartRequested = (event: TurnStartRequestedEvent) =>
@@ -2260,8 +2284,20 @@ const make = Effect.gen(function* () {
       const unarchivedArchivedTerminalChildIds = new Set<ThreadId>();
       const unarchivedTerminalChildIds = new Set<ThreadId>();
       const unarchivedTerminalStartedChildIds = new Set<ThreadId>();
+      const postUnarchiveTerminalByStartedChild = new Map<
+        ThreadId,
+        { status: ChildTerminalStatus; error: string | null }
+      >();
       const rearchivedUnarchivedTerminalStartedChildIds = new Set<ThreadId>();
       let maxSequence = 0;
+      const rememberPostUnarchiveTerminal = (
+        threadId: ThreadId,
+        outcome: { readonly status: ChildTerminalStatus; readonly error: string | null },
+      ) => {
+        if (unarchivedTerminalStartedChildIds.has(threadId)) {
+          postUnarchiveTerminalByStartedChild.set(threadId, outcome);
+        }
+      };
       const markLifecycleTerminal = (
         threadId: ThreadId,
         outcome: { readonly status: ChildTerminalStatus; readonly error: string | null },
@@ -2333,10 +2369,12 @@ const make = Effect.gen(function* () {
                   missingDiffWhileRunningByReplayedChild.add(threadId);
                   return;
                 }
-                terminalByChild.set(threadId, {
+                const outcome = {
                   status: "failed",
                   error: "turn diff missing",
-                });
+                } as const;
+                terminalByChild.set(threadId, outcome);
+                rememberPostUnarchiveTerminal(threadId, outcome);
                 runningByChild.set(threadId, false);
                 pendingSameTurnStartByReplayedChild.delete(threadId);
                 missingDiffWhileRunningByReplayedChild.delete(threadId);
@@ -2344,12 +2382,12 @@ const make = Effect.gen(function* () {
                 unarchivedArchivedTerminalChildIds.delete(threadId);
                 return;
               }
-              terminalByChild.set(
-                threadId,
+              const outcome =
                 status === "ready"
-                  ? { status: "completed", error: null }
-                  : { status: "failed", error: `turn diff ${status}` },
-              );
+                  ? ({ status: "completed", error: null } as const)
+                  : ({ status: "failed", error: `turn diff ${status}` } as const);
+              terminalByChild.set(threadId, outcome);
+              rememberPostUnarchiveTerminal(threadId, outcome);
               runningByChild.set(threadId, false);
               activeTurnByReplayedChild.delete(threadId);
               pendingSameTurnStartByReplayedChild.delete(threadId);
@@ -2362,6 +2400,10 @@ const make = Effect.gen(function* () {
               const { threadId } = event.payload;
               if (!knownChildIds.has(threadId)) return;
               if (lifecycleTerminatedByChild.has(threadId)) return;
+              const priorTerminal = terminalByChild.get(threadId);
+              if (priorTerminal !== undefined && unarchivedTerminalStartedChildIds.has(threadId)) {
+                postUnarchiveTerminalByStartedChild.set(threadId, priorTerminal);
+              }
               const sameTurnId = activeTurnByReplayedChild.get(threadId);
               if (sameTurnId !== undefined) {
                 pendingSameTurnStartByReplayedChild.set(threadId, sameTurnId);
@@ -2403,7 +2445,9 @@ const make = Effect.gen(function* () {
                 const latestTurn = Option.isSome(shellOption) ? shellOption.value.latestTurn : null;
                 if (latestTurn?.turnId !== expectedTurnId) return;
                 if (latestTurn.state === "completed") {
-                  terminalByChild.set(threadId, { status: "completed", error: null });
+                  const outcome = { status: "completed", error: null } as const;
+                  terminalByChild.set(threadId, outcome);
+                  rememberPostUnarchiveTerminal(threadId, outcome);
                   runningByChild.set(threadId, false);
                   activeTurnByReplayedChild.delete(threadId);
                   pendingTurnStartByReplayedChild.delete(threadId);
@@ -2412,10 +2456,12 @@ const make = Effect.gen(function* () {
                   return;
                 }
                 if (latestTurn.state === "error" || latestTurn.state === "interrupted") {
-                  terminalByChild.set(threadId, {
+                  const outcome = {
                     status: "failed",
                     error: `turn ${latestTurn.state}`,
-                  });
+                  } as const;
+                  terminalByChild.set(threadId, outcome);
+                  rememberPostUnarchiveTerminal(threadId, outcome);
                   runningByChild.set(threadId, false);
                   activeTurnByReplayedChild.delete(threadId);
                   pendingTurnStartByReplayedChild.delete(threadId);
@@ -2463,7 +2509,9 @@ const make = Effect.gen(function* () {
                   (priorTerminal?.status !== "failed" ||
                     missingDiffWhileRunningByReplayedChild.has(threadId))
                 ) {
-                  terminalByChild.set(threadId, { status: "completed", error: null });
+                  const outcome = { status: "completed", error: null } as const;
+                  terminalByChild.set(threadId, outcome);
+                  rememberPostUnarchiveTerminal(threadId, outcome);
                   runningByChild.set(threadId, false);
                   activeTurnByReplayedChild.delete(threadId);
                   pendingTurnStartByReplayedChild.delete(threadId);
@@ -2471,10 +2519,12 @@ const make = Effect.gen(function* () {
                   missingDiffWhileRunningByReplayedChild.delete(threadId);
                   return;
                 }
-                terminalByChild.set(threadId, {
+                const outcome = {
                   status: "failed",
                   error: `session ${session.status}`,
-                });
+                } as const;
+                terminalByChild.set(threadId, outcome);
+                rememberPostUnarchiveTerminal(threadId, outcome);
                 runningByChild.set(threadId, false);
                 activeTurnByReplayedChild.delete(threadId);
                 pendingTurnStartByReplayedChild.delete(threadId);
@@ -2497,6 +2547,7 @@ const make = Effect.gen(function* () {
               const { threadId, archivedAt } = event.payload;
               if (!knownChildIds.has(threadId)) return;
               archivedSinceLastUnarchiveByChild.add(threadId);
+              postUnarchiveTerminalByStartedChild.delete(threadId);
               if (unarchivedTerminalStartedChildIds.has(threadId)) {
                 rearchivedUnarchivedTerminalStartedChildIds.add(threadId);
               }
@@ -2519,6 +2570,7 @@ const make = Effect.gen(function* () {
                 unarchivedArchiveChildIds.add(threadId);
                 archivedSinceLastUnarchiveByChild.delete(threadId);
               }
+              postUnarchiveTerminalByStartedChild.delete(threadId);
               const terminal = terminalByChild.get(threadId);
               if (terminal?.status === "killed" && terminal.error === "thread archived") {
                 terminalByChild.delete(threadId);
@@ -2544,6 +2596,7 @@ const make = Effect.gen(function* () {
         unarchivedArchivedTerminalChildIds,
         unarchivedTerminalChildIds,
         unarchivedTerminalStartedChildIds,
+        postUnarchiveTerminalByStartedChild,
         rearchivedUnarchivedTerminalStartedChildIds,
         maxSequence,
       };
@@ -2668,6 +2721,7 @@ const make = Effect.gen(function* () {
         unarchivedArchivedTerminalChildIds,
         unarchivedTerminalChildIds: replayedUnarchivedTerminalChildIds,
         unarchivedTerminalStartedChildIds: replayedUnarchivedTerminalStartedChildIds,
+        postUnarchiveTerminalByStartedChild,
         rearchivedUnarchivedTerminalStartedChildIds,
       } = yield* reconcileFromLog(knownChildIds);
       for (const [childThreadId, turnId] of activeTurnByReplayedChild) {
@@ -2706,6 +2760,32 @@ const make = Effect.gen(function* () {
       const prunedArchivedDeliveredWakeChildIds = new Set<ThreadId>();
       const deliveredWakeCleanupChildIds = new Set<ThreadId>();
       const promotedWakeCleanupChildIds = new Set<ThreadId>();
+      const retainedPostUnarchiveFallbackWakeIdByChild = new Map<ThreadId, PendingDispatchId>();
+      const retainedPostUnarchiveFallbackWakeCreatedAtByChild = new Map<ThreadId, number>();
+      for (const row of persisted) {
+        if (row.kind !== "parent_injection" || row.sourceChildId === null) continue;
+        const childThreadId = row.sourceChildId as ThreadId;
+        if (!replayedUnarchivedTerminalStartedChildIds.has(childThreadId)) continue;
+        if (terminalByChild.has(childThreadId)) continue;
+        const terminal = postUnarchiveTerminalByStartedChild.get(childThreadId);
+        if (terminal === undefined) continue;
+        if (row.status !== terminal.status || row.error !== terminal.error) continue;
+        const createdAtMs = Date.parse(String(row.createdAt));
+        const comparableCreatedAt = Number.isFinite(createdAtMs) ? createdAtMs : 0;
+        const retainedCreatedAt =
+          retainedPostUnarchiveFallbackWakeCreatedAtByChild.get(childThreadId);
+        const retainedId = retainedPostUnarchiveFallbackWakeIdByChild.get(childThreadId);
+        if (
+          retainedCreatedAt === undefined ||
+          comparableCreatedAt > retainedCreatedAt ||
+          (comparableCreatedAt === retainedCreatedAt &&
+            retainedId !== undefined &&
+            String(row.id) > String(retainedId))
+        ) {
+          retainedPostUnarchiveFallbackWakeIdByChild.set(childThreadId, row.id);
+          retainedPostUnarchiveFallbackWakeCreatedAtByChild.set(childThreadId, comparableCreatedAt);
+        }
+      }
       const staleWakeRows = persisted.filter((row) => {
         if (row.kind !== "parent_injection" || row.sourceChildId === null) return false;
         const childThreadId = row.sourceChildId as ThreadId;
@@ -2724,9 +2804,14 @@ const make = Effect.gen(function* () {
           return false;
         }
         if (!replayedUnarchivedTerminalStartedChildIds.has(childThreadId)) return false;
-        const terminal = terminalByChild.get(childThreadId);
+        const replayTerminal = terminalByChild.get(childThreadId);
+        const postUnarchiveTerminal = postUnarchiveTerminalByStartedChild.get(childThreadId);
+        const terminal = replayTerminal ?? postUnarchiveTerminal;
         if (terminal === undefined) return true;
         if (row.status !== terminal.status || row.error !== terminal.error) return true;
+        if (replayTerminal === undefined && postUnarchiveTerminal !== undefined) {
+          return retainedPostUnarchiveFallbackWakeIdByChild.get(childThreadId) !== row.id;
+        }
         if (terminal.status !== "completed") return false;
         const projectedText = terminalTextByStartedChild.get(childThreadId);
         if (projectedText === undefined) return row.commandId === null;
