@@ -796,6 +796,68 @@ describe("ProviderRuntimeIngestion", () => {
     expect(message?.streaming).toBe(false);
   });
 
+  it("leaves non-Cursor assistant deltas without explicit turn ids thread-scoped", async () => {
+    const harness = await createHarness({ serverSettings: { enableAssistantStreaming: true } });
+    const now = "2026-01-01T00:00:00.000Z";
+    const threadId = asThreadId("thread-1");
+    const turnId = asTurnId("turn-codex-unscoped-delta");
+    const itemId = asItemId("item-codex-unscoped-delta");
+
+    harness.emit({
+      type: "turn.started",
+      eventId: asEventId("evt-codex-unscoped-turn-started"),
+      provider: ProviderDriverKind.make("codex"),
+      createdAt: now,
+      threadId,
+      turnId,
+    });
+    await waitForThread(
+      harness.readModel,
+      (thread) =>
+        thread.session?.status === "running" &&
+        thread.session?.activeTurnId === "turn-codex-unscoped-delta",
+    );
+
+    harness.emit({
+      type: "content.delta",
+      eventId: asEventId("evt-codex-unscoped-delta"),
+      provider: ProviderDriverKind.make("codex"),
+      createdAt: now,
+      threadId,
+      itemId,
+      payload: {
+        streamKind: "assistant_text",
+        delta: "thread-scoped replay",
+      },
+    });
+    harness.emit({
+      type: "turn.completed",
+      eventId: asEventId("evt-codex-unscoped-turn-completed"),
+      provider: ProviderDriverKind.make("codex"),
+      createdAt: now,
+      threadId,
+      turnId,
+      payload: {
+        state: "completed",
+      },
+    });
+
+    const thread = await waitForThread(
+      harness.readModel,
+      (entry) =>
+        entry.session?.status === "ready" &&
+        entry.messages.some(
+          (message: ProviderRuntimeTestMessage) =>
+            message.id === "assistant:item-codex-unscoped-delta",
+        ),
+    );
+    const message = thread.messages.find(
+      (entry: ProviderRuntimeTestMessage) => entry.id === "assistant:item-codex-unscoped-delta",
+    );
+    expect(message?.text).toBe("thread-scoped replay");
+    expect(message?.turnId).toBe(null);
+  });
+
   it("uses assistant item completion detail when no assistant deltas were streamed", async () => {
     const harness = await createHarness();
     const now = "2026-01-01T00:00:00.000Z";

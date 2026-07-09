@@ -1460,6 +1460,7 @@ const make = Effect.gen(function* () {
       const inferredTurnIdForAssistantDelta =
         event.type === "content.delta" &&
         event.payload.streamKind === "assistant_text" &&
+        String(event.provider) === "cursor" &&
         eventTurnId === undefined &&
         activeTurnId !== null
           ? TurnId.make(activeTurnId)
