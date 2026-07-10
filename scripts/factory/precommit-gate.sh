@@ -110,6 +110,7 @@ FACTORY_REVIEW_ARGS=()
 FACTORY_AUTOREVIEW_BIN="$HOME/.claude/skills/autoreview/scripts/autoreview"
 FACTORY_UPSTREAM_REF="upstream/main"
 FACTORY_AUDIT_LOG="$HOME/.openclaw/audit/factory-precommit.jsonl"
+FACTORY_REVIEW_MEMORY_FINDINGS=15
 # Config problems are RECORDED here and enforced after the --status /
 # FACTORY_SKIP handling below: a broken landed config must refuse normal
 # commits (never degrade to review-only) while the audited skip hatch stays
@@ -361,6 +362,9 @@ TREE_SHA="$(git write-tree)" || refuse "git write-tree failed (unmerged index?)"
 # changes (add/remove/edit), or a review skip could dodge the pinned reviewer.
 apply_reviewer_override
 REVIEWER_FP="$(printf '%s' "${FACTORY_REVIEW_ARGS[*]}" | sha256sum | cut -c1-12)"
+# Reviewer memory is intentionally excluded: cache identity is HEAD + staged
+# tree + reviewer configuration only. Audit history grows after reviews and
+# must not invalidate an already-bound result for the same code and reviewer.
 GATE_ID="$HEAD_SHA $TREE_SHA $REVIEWER_FP"
 SCOPE_DONE_MS="$(now_ms)"
 
@@ -456,6 +460,51 @@ run_static_checks_parallel() {
   fi
 }
 
+build_reviewer_memory_ledger() { # build_reviewer_memory_ledger <output-file>
+  local output branch memory_json
+  output="$1"
+  [ -s "$FACTORY_AUDIT_LOG" ] || return 1
+  branch="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo '?')"
+  memory_json="$(jq -Rsc --arg repo "$REPO_ROOT" --arg branch "$branch" \
+    --argjson limit "$FACTORY_REVIEW_MEMORY_FINDINGS" '
+      split("\n") | map(fromjson?)
+      | map(select(. != null and ((.worktree // .repo // "") == $repo) and ((.branch // "") == $branch)))
+      | . as $records
+      | (reduce ($records[] | (.findings // [])[]) as $finding
+          ({seen:{}, lines:[]};
+           (($finding.title // "") | ascii_downcase) + "\u0000" + ($finding.file // $finding.path // "") as $key
+           | if .seen[$key] then .
+             else .seen[$key] = true
+             | .lines += [{
+                 title:($finding.title // ""),
+                 priority:($finding.priority // ""),
+                 file:($finding.file // $finding.path // "")
+               }]
+             end)
+         | .lines[-$limit:]) as $findings
+      | (reduce ($records[] | ((.dismissals // []) + (.valid_dismissals // []))[]) as $dismissal
+          ([];
+           ($dismissal | if type == "object" then (.title // "") else tostring end) as $title
+           | if $title == "" or index($title) != null then . else . + [$title] end)) as $dismissals
+      | {findings:$findings, dismissals:$dismissals}
+    ' "$FACTORY_AUDIT_LOG")" || return 1
+  if [ "$(jq '(.findings | length) + (.dismissals | length)' <<<"$memory_json")" -eq 0 ]; then
+    return 1
+  fi
+  {
+    echo "## PRIOR REVIEW ROUNDS LEDGER (context from earlier gate rounds on this branch)"
+    echo "The following findings were already reported in previous rounds and have been addressed or explicitly dismissed. Treat them and reworded equivalents as SETTLED — do not re-raise them. Your value this round is finding NEW, previously unreported issues in the changed code. Review the diff as thoroughly as you would fresh code; the ledger only tells you which conclusions are already handled, not that the code is safe."
+    echo
+    echo "Previously reported and addressed:"
+    jq -r 'if (.findings | length) == 0 then "- (none)" else .findings[] | "- [\(.priority)] \(.title) (\(.file)) -> addressed in a subsequent commit" end' <<<"$memory_json"
+    if [ "$(jq '.dismissals | length' <<<"$memory_json")" -gt 0 ]; then
+      echo
+      echo "Dismissed with audited rationale (do not re-raise):"
+      jq -r '.dismissals[] | "- \(.) -> DISMISSED with audited rationale (settled design decision)"' <<<"$memory_json"
+    fi
+  } > "$output"
+}
+
 # ---- cached pass ----
 if [ -f "$MARKER" ] && [ "$(cat "$MARKER")" = "$GATE_ID" ]; then
   discard_stale_dismissals
@@ -485,9 +534,18 @@ else
   [ -x "$FACTORY_AUTOREVIEW_BIN" ] || refuse "autoreview helper not found at $FACTORY_AUTOREVIEW_BIN" review-infra '{}'
   echo "factory-gate: autoreview (this can take several minutes; pre-warm next time with scripts/factory/precommit-gate.sh --prepare)" >&2
   rm -f "$REVIEW_JSON" "$REVIEW_FOR"
+  ledger_file="$(mktemp "$STATE_DIR/reviewer-memory.XXXXXX")" || refuse "cannot create reviewer-memory ledger" review-infra '{}'
+  review_context_args=()
+  if build_reviewer_memory_ledger "$ledger_file" && [ -s "$ledger_file" ]; then
+    review_context_args=(--extra-context "$ledger_file")
+  else
+    rm -f "$ledger_file"
+    ledger_file=""
+  fi
   REVIEW_START_MS="$(now_ms)"
-  "$FACTORY_AUTOREVIEW_BIN" --mode local "${FACTORY_REVIEW_ARGS[@]}" --json-output "$REVIEW_JSON" 1>&2
+  "$FACTORY_AUTOREVIEW_BIN" --mode local "${FACTORY_REVIEW_ARGS[@]}" "${review_context_args[@]}" --json-output "$REVIEW_JSON" 1>&2
   review_rc=$?
+  [ -z "$ledger_file" ] || rm -f "$ledger_file"
   REVIEW_END_MS="$(now_ms)"
 
   if [ "$review_rc" -eq 0 ]; then

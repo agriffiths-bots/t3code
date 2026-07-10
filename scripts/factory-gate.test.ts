@@ -76,14 +76,17 @@ function installFactoryFixture(
     `#!/usr/bin/env bash
 set -euo pipefail
 out=""
+extra_context=""
 args=("$@")
 while [[ "$#" -gt 0 ]]; do
   case "$1" in
     --json-output) out="$2"; shift 2 ;;
+    --extra-context) extra_context="$2"; shift 2 ;;
     *) shift ;;
   esac
 done
 [[ -z "\${FACTORY_TEST_REVIEW_ARGS_FILE:-}" ]] || printf '%s\n' "\${args[*]}" > "$FACTORY_TEST_REVIEW_ARGS_FILE"
+[[ -z "\${FACTORY_TEST_EXTRA_CONTEXT_FILE:-}" || -z "$extra_context" ]] || cp "$extra_context" "$FACTORY_TEST_EXTRA_CONTEXT_FILE"
 [[ -n "$out" ]] || { echo "missing --json-output" >&2; exit 2; }
 cat > "$out" <<'JSON'
 {"findings":[],"overall_correctness":"patch is correct","overall_explanation":"fixture clean review","overall_confidence":1}
@@ -183,6 +186,99 @@ function expectPartialTreeCommitRefused(args: ReadonlyArray<string>): void {
 }
 
 describe("factory pre-commit gate", () => {
+  it("passes no reviewer-memory context on the first branch round", () => {
+    const root = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3-factory-gate-"));
+    try {
+      const { repo } = installFactoryFixture(root);
+      const reviewArgs = NodePath.join(root, "review-args.txt");
+      NodeFS.writeFileSync(NodePath.join(repo, "first-round.txt"), "first round\n");
+      run(repo, ["git", "add", "-A"]);
+
+      run(repo, ["scripts/factory/precommit-gate.sh", "--prepare"], {
+        env: { FACTORY_TEST_REVIEW_ARGS_FILE: reviewArgs },
+      });
+
+      assert.ok(!/--extra-context/.test(NodeFS.readFileSync(reviewArgs, "utf8")));
+    } finally {
+      NodeFS.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("passes prior branch findings to the second review round as settled context", () => {
+    const root = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3-factory-gate-"));
+    try {
+      const { audit, repo } = installFactoryFixture(root);
+      const reviewArgs = NodePath.join(root, "review-args.txt");
+      const extraContext = NodePath.join(root, "extra-context.txt");
+      const branch = run(repo, ["git", "branch", "--show-current"]).stdout.trim();
+      NodeFS.appendFileSync(
+        audit,
+        `${JSON.stringify({
+          ts: "2026-07-10T08:00:00Z",
+          kind: "factory_precommit",
+          repo,
+          branch,
+          verdict: "review-findings",
+          findings: [{ title: "First round bug", priority: "P1", file: "src/bug.ts" }],
+        })}\n`,
+      );
+      NodeFS.writeFileSync(NodePath.join(repo, "second-round.txt"), "second round\n");
+      run(repo, ["git", "add", "-A"]);
+
+      run(repo, ["scripts/factory/precommit-gate.sh", "--prepare"], {
+        env: {
+          FACTORY_TEST_REVIEW_ARGS_FILE: reviewArgs,
+          FACTORY_TEST_EXTRA_CONTEXT_FILE: extraContext,
+        },
+      });
+
+      assert.match(NodeFS.readFileSync(reviewArgs, "utf8"), /--extra-context/);
+      const ledger = NodeFS.readFileSync(extraContext, "utf8");
+      assert.match(
+        ledger,
+        /\[P1\] First round bug \(src\/bug\.ts\) -> addressed in a subsequent commit/,
+      );
+      assert.match(ledger, /reworded equivalents as SETTLED/);
+      assert.match(ledger, /finding NEW, previously unreported issues/);
+      assert.match(ledger, /not that the code is safe/);
+    } finally {
+      NodeFS.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("includes audited dismissals in reviewer memory with settled framing", () => {
+    const root = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3-factory-gate-"));
+    try {
+      const { audit, repo } = installFactoryFixture(root);
+      const extraContext = NodePath.join(root, "extra-context.txt");
+      const branch = run(repo, ["git", "branch", "--show-current"]).stdout.trim();
+      NodeFS.appendFileSync(
+        audit,
+        `${JSON.stringify({
+          ts: "2026-07-10T08:00:00Z",
+          kind: "factory_precommit",
+          repo,
+          branch,
+          verdict: "pass-with-dismissals",
+          dismissals: [{ title: "Intentional design choice" }],
+        })}\n`,
+      );
+      NodeFS.writeFileSync(NodePath.join(repo, "after-dismissal.txt"), "after dismissal\n");
+      run(repo, ["git", "add", "-A"]);
+
+      run(repo, ["scripts/factory/precommit-gate.sh", "--prepare"], {
+        env: { FACTORY_TEST_EXTRA_CONTEXT_FILE: extraContext },
+      });
+
+      assert.match(
+        NodeFS.readFileSync(extraContext, "utf8"),
+        /Intentional design choice -> DISMISSED with audited rationale \(settled design decision\)/,
+      );
+    } finally {
+      NodeFS.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it("refuses pathspec commits that would exclude staged files from the commit tree", () => {
     expectPartialTreeCommitRefused(["a.txt"]);
   });
