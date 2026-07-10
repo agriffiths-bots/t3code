@@ -9,7 +9,10 @@ import * as McpInvocationContext from "./McpInvocationContext.ts";
 import * as McpSessionRegistry from "./McpSessionRegistry.ts";
 import { ThreadToolkitHandlersLive } from "./toolkits/thread/handlers.ts";
 import { ThreadToolkit } from "./toolkits/thread/tools.ts";
-import { SubagentToolkitHandlersLive } from "./toolkits/subagent/handlers.ts";
+import {
+  installPeerSubagentCompatibility,
+  SubagentToolkitHandlersLive,
+} from "./toolkits/subagent/handlers.ts";
 import { SubagentToolkit } from "./toolkits/subagent/tools.ts";
 import { NotifyToolkitHandlersLive } from "./toolkits/notify/handlers.ts";
 import { NotifyToolkit } from "./toolkits/notify/tools.ts";
@@ -91,9 +94,12 @@ export const ThreadToolkitRegistrationLive = McpServer.toolkit(ThreadToolkit).pi
   Layer.provide(ThreadToolkitHandlersLive),
 );
 
-export const SubagentToolkitRegistrationLive = McpServer.toolkit(SubagentToolkit).pipe(
-  Layer.provide(SubagentToolkitHandlersLive),
-);
+export const SubagentToolkitRegistrationLive = Layer.effectDiscard(
+  Effect.gen(function* () {
+    yield* McpServer.registerToolkit(SubagentToolkit);
+    yield* installPeerSubagentCompatibility;
+  }),
+).pipe(Layer.provide(SubagentToolkitHandlersLive), Layer.provide(McpServer.McpServer.layer));
 
 export const NotifyToolkitRegistrationLive = McpServer.toolkit(NotifyToolkit).pipe(
   Layer.provide(NotifyToolkitHandlersLive),

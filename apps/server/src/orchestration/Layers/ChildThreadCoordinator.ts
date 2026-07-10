@@ -994,7 +994,7 @@ const make = Effect.gen(function* () {
     // Guard against unbounded growth when many children settle with large
     // payloads; the full per-child results remain queryable via t3_check.
     if (joined.length > CONSOLIDATED_INJECTION_MAX_CHARS) {
-      return `${joined.slice(0, CONSOLIDATED_INJECTION_MAX_CHARS)}\n[...${entries.length} sub-agent results truncated; use t3_check_subagent for full output]`;
+      return `${joined.slice(0, CONSOLIDATED_INJECTION_MAX_CHARS)}\n[...${entries.length} sub-agent results truncated; use t3_subagents with childThreadId for full output]`;
     }
     return joined;
   };

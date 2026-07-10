@@ -43,11 +43,9 @@ const environmentId = EnvironmentId.make("environment-mcp-conformance");
 const threadId = ThreadId.make("thread-mcp-conformance");
 const providerInstanceId = ProviderInstanceId.make("codex");
 
-const expectedToolNamesAfterPreviewRemoval = [
-  "t3_check_subagent",
+const expectedToolNamesAfterSpawnTrim = [
   "t3_get_usage",
   "t3_list_backends",
-  "t3_list_subagents",
   "t3_notify",
   "t3_schedule_create",
   "t3_schedule_delete",
@@ -55,7 +53,13 @@ const expectedToolNamesAfterPreviewRemoval = [
   "t3_schedule_update",
   "t3_spawn_subagent",
   "t3_steer_subagent",
+  "t3_subagents",
   "t3_thread_start",
+] as const;
+
+const removedSubagentToolNames = [
+  "t3_check_subagent",
+  "t3_list_subagents",
   "t3_wait_subagent",
 ] as const;
 
@@ -275,11 +279,34 @@ it.effect("conforms to the official streamable HTTP MCP client", () =>
       const toolsResult = yield* Effect.promise(() => client.listTools());
       ListToolsResultSchema.parse(toolsResult);
       const toolNames = new Set(toolsResult.tools.map((tool) => tool.name));
-      expect([...toolNames].toSorted()).toEqual([...expectedToolNamesAfterPreviewRemoval]);
+      expect([...toolNames].toSorted()).toEqual([...expectedToolNamesAfterSpawnTrim]);
       for (const removedName of removedPreviewToolNames) {
         expect(toolNames.has(removedName), `${removedName} must be absent from tools/list`).toBe(
           false,
         );
+      }
+      for (const removedName of removedSubagentToolNames) {
+        expect(toolNames.has(removedName), `${removedName} must be absent from tools/list`).toBe(
+          false,
+        );
+      }
+
+      for (const toolName of ["t3_spawn_subagent", "t3_thread_start"] as const) {
+        const tool = toolsResult.tools.find((candidate) => candidate.name === toolName);
+        expect(tool, `${toolName} must be present`).toBeDefined();
+        expect(Object.keys(tool?.inputSchema.properties ?? {}).toSorted()).toEqual([
+          "branch",
+          "directory",
+          "model",
+          "prompt",
+          "reasoningEffort",
+          "title",
+        ]);
+        expect([...(tool?.inputSchema.required ?? [])].toSorted()).toEqual([
+          "model",
+          "prompt",
+          "title",
+        ]);
       }
 
       for (const tool of toolsResult.tools) {

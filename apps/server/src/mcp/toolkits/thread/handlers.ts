@@ -36,11 +36,13 @@ import { GitWorkflowService } from "../../../git/GitWorkflowService.ts";
 import * as VcsDriverRegistry from "../../../vcs/VcsDriverRegistry.ts";
 import {
   ThreadStartToolError,
+  type ThreadStartInternalInput,
   type ThreadStartMode,
-  type ThreadStartToolInput,
+  type ThreadStartPublicInput,
   type ThreadStartToolOutput,
   ThreadToolkit,
 } from "./tools.ts";
+import { applyMcpReasoningEffort } from "./reasoningEffort.ts";
 
 const nowIso = Effect.map(DateTime.now, DateTime.formatIso);
 const isThreadStartToolError = Schema.is(ThreadStartToolError);
@@ -95,7 +97,7 @@ interface SourceCwdProjectContext {
 }
 
 export type ActiveThreadStartRuntime = (
-  input: ThreadStartToolInput,
+  input: ThreadStartInternalInput,
   invocation: McpInvocationContext.McpInvocationScope,
 ) => Effect.Effect<ThreadStartToolOutput, ThreadStartToolError>;
 
@@ -377,7 +379,7 @@ const makeActiveThreadStartRuntime = Effect.fn("ThreadToolkit.makeActiveRuntime"
 
   const resolveNewWorktreeBaseBranch = Effect.fn("ThreadToolkit.resolveNewWorktreeBaseBranch")(
     function* (
-      input: ThreadStartToolInput,
+      input: ThreadStartInternalInput,
       project: OrchestrationProjectShell,
       sourceThread: OrchestrationThreadShell,
       sourceCwd: string,
@@ -417,7 +419,7 @@ const makeActiveThreadStartRuntime = Effect.fn("ThreadToolkit.makeActiveRuntime"
 
   const resolveInitialBranch = Effect.fn("ThreadToolkit.resolveInitialBranch")(function* (
     mode: ThreadStartMode,
-    input: ThreadStartToolInput,
+    input: ThreadStartInternalInput,
     sourceThread: OrchestrationThreadShell,
     sourceCwd: string,
     canUseSourceBranch: boolean,
@@ -465,7 +467,7 @@ const makeActiveThreadStartRuntime = Effect.fn("ThreadToolkit.makeActiveRuntime"
   });
 
   const loadPeerSourceContext = Effect.fn("ThreadToolkit.loadPeerSourceContext")(function* (
-    input: ThreadStartToolInput,
+    input: ThreadStartInternalInput,
   ) {
     if (input.directory === undefined) {
       return yield* fail(
@@ -564,7 +566,7 @@ const makeActiveThreadStartRuntime = Effect.fn("ThreadToolkit.makeActiveRuntime"
   });
 
   return Effect.fn("ThreadToolkit.startThread")(function* (
-    input: ThreadStartToolInput,
+    input: ThreadStartInternalInput,
     invocation: McpInvocationContext.McpInvocationScope,
   ) {
     const { sourceThread, project } = McpInvocationContext.isProviderInvocationScope(invocation)
@@ -812,7 +814,7 @@ export const ThreadStartRuntimeLive = Layer.effectDiscard(
 );
 
 const resolveModelSelection = (
-  input: ThreadStartToolInput,
+  input: ThreadStartInternalInput,
   sourceThread: OrchestrationThreadShell,
   modelSources: ReadonlyArray<ProviderModelSource>,
 ): Effect.Effect<ModelSelection, ThreadStartToolError> => {
@@ -832,13 +834,18 @@ const resolveModelSelection = (
         ),
       );
     }
-    return Effect.succeed(resolved);
+    const effort = applyMcpReasoningEffort(resolved, modelSources, input.reasoningEffort);
+    return effort.error === undefined
+      ? Effect.succeed(effort.selection)
+      : Effect.fail(fail(effort.error));
   }
   // Otherwise an explicit modelSelection wins, else inherit the source thread.
   return Effect.succeed(input.modelSelection ?? sourceThread.modelSelection);
 };
 
-const startThread = Effect.fn("ThreadToolkit.startThread")(function* (input: ThreadStartToolInput) {
+const startThread = Effect.fn("ThreadToolkit.startThread")(function* (
+  input: ThreadStartPublicInput,
+) {
   const invocation = yield* McpInvocationContext.requireProviderMcpCapability(
     "thread-management",
   ).pipe(Effect.mapError((error) => fail(error.message)));
