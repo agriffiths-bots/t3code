@@ -212,8 +212,8 @@ export function selectWorktreeTeardown(input: {
   const hasSharedConsumer = input.snapshot.threads.some(
     (candidate) =>
       candidate.id !== thread.id &&
-      (isSameOrNestedPath(normalizeWorktreePath(candidate.worktreePath), path) ||
-        isSameOrNestedPath(normalizeWorktreePath(candidate.worktreeRemovalPath), path)),
+      (pathsOverlap(normalizeWorktreePath(candidate.worktreePath), path) ||
+        pathsOverlap(normalizeWorktreePath(candidate.worktreeRemovalPath), path)),
   );
   if (hasSharedConsumer) {
     return null;
@@ -442,6 +442,10 @@ const make = Effect.gen(function* () {
       }
     }
 
+    if (!candidate.force) {
+      yield* worktreeLifecycle.markTeardownPending(candidate.threadId);
+    }
+
     if (pathExists) {
       const removeResult = yield* gitWorkflow
         .removeWorktree({
@@ -505,6 +509,9 @@ const make = Effect.gen(function* () {
       worktreeRemovable: false,
       worktreeRemovalPath: null,
     });
+    if (!candidate.force) {
+      yield* worktreeLifecycle.clearTeardownPending(candidate.threadId);
+    }
     yield* Effect.logInfo("thread lifecycle worktree removed", {
       eventType: event.type,
       threadId: candidate.threadId,

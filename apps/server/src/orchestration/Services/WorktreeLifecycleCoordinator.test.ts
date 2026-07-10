@@ -1,5 +1,5 @@
 import { describe, expect, it } from "@effect/vitest";
-import type { OrchestrationCommand } from "@t3tools/contracts";
+import { ThreadId, type OrchestrationCommand } from "@t3tools/contracts";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
@@ -69,4 +69,17 @@ describe("WorktreeLifecycleCoordinator", () => {
       } as unknown as OrchestrationCommand),
     ).toBe(false);
   });
+
+  it.effect("tracks pending teardown until ownership metadata is cleared", () =>
+    Effect.gen(function* () {
+      const coordinator = yield* WorktreeLifecycleCoordinator;
+      const threadId = ThreadId.make("thread-pending-teardown");
+
+      expect(yield* coordinator.isTeardownPending(threadId)).toBe(false);
+      yield* coordinator.markTeardownPending(threadId);
+      expect(yield* coordinator.isTeardownPending(threadId)).toBe(true);
+      yield* coordinator.clearTeardownPending(threadId);
+      expect(yield* coordinator.isTeardownPending(threadId)).toBe(false);
+    }).pipe(Effect.provide(WorktreeLifecycleCoordinatorLive)),
+  );
 });

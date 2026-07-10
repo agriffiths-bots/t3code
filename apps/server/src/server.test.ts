@@ -6838,6 +6838,9 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
                       lifecyclePermitDepth -= 1;
                     }),
                 ),
+              markTeardownPending: () => Effect.void,
+              clearTeardownPending: () => Effect.void,
+              isTeardownPending: () => Effect.succeed(false),
             },
             projectSetupScriptRunner: {
               runForThread,

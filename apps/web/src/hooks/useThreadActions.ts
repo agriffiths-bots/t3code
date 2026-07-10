@@ -60,6 +60,13 @@ export function isThreadDeleteConfirmationCurrent(
   return confirmedOwnedWorktreePath === ownedWorktreePathForThreadDelete(subject);
 }
 
+export function threadDeleteRequiresConfirmation(
+  confirmHistoryDeletion: boolean,
+  subject: ThreadDeleteConfirmationSubject,
+): boolean {
+  return confirmHistoryDeletion || ownedWorktreePathForThreadDelete(subject) !== null;
+}
+
 export function buildThreadDeleteConfirmationMessage(
   input: ThreadDeleteConfirmationSubject,
 ): string {
@@ -222,7 +229,7 @@ export function useThreadActions() {
     ) => {
       let resolved = resolveThreadTarget(target);
       const localApi = readLocalApi();
-      if (confirmThreadDelete && localApi) {
+      if (localApi) {
         const fallbackSubject = opts.confirmationSubject ?? {
           title: "this thread",
           worktreePath: null,
@@ -233,7 +240,10 @@ export function useThreadActions() {
         while (true) {
           const confirmationSubject = resolved?.thread ?? fallbackSubject;
           const currentOwnedWorktreePath = ownedWorktreePathForThreadDelete(confirmationSubject);
-          if (!isThreadDeleteConfirmationCurrent(confirmedOwnedWorktreePath, confirmationSubject)) {
+          if (
+            threadDeleteRequiresConfirmation(confirmThreadDelete, confirmationSubject) &&
+            !isThreadDeleteConfirmationCurrent(confirmedOwnedWorktreePath, confirmationSubject)
+          ) {
             const confirmationResult = await settlePromise(() =>
               localApi.dialogs.confirm(buildThreadDeleteConfirmationMessage(confirmationSubject)),
             );
@@ -250,7 +260,7 @@ export function useThreadActions() {
           const refreshedOwnedWorktreePath = ownedWorktreePathForThreadDelete(
             refreshed?.thread ?? fallbackSubject,
           );
-          if (refreshedOwnedWorktreePath === confirmedOwnedWorktreePath) {
+          if (refreshedOwnedWorktreePath === currentOwnedWorktreePath) {
             resolved = refreshed;
             break;
           }

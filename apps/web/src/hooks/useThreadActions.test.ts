@@ -5,6 +5,7 @@ import {
   buildThreadDeleteConfirmationMessage,
   buildThreadsDeleteConfirmationMessage,
   isThreadDeleteConfirmationCurrent,
+  threadDeleteRequiresConfirmation,
   ThreadArchiveBlockedError,
 } from "./useThreadActions";
 
@@ -63,6 +64,25 @@ describe("buildThreadDeleteConfirmationMessage", () => {
         worktreePath: "/tmp/t3-worktrees/lifecycle-work",
         worktreeRemovable: true,
         worktreeRemovalPath: "/tmp/t3-worktrees/lifecycle-work",
+      }),
+    ).toBe(false);
+  });
+
+  it("requires worktree-loss consent when history confirmations are disabled", () => {
+    expect(
+      threadDeleteRequiresConfirmation(false, {
+        title: "Lifecycle work",
+        worktreePath: "/tmp/t3-worktrees/lifecycle-work",
+        worktreeRemovable: true,
+        worktreeRemovalPath: "/tmp/t3-worktrees/lifecycle-work",
+      }),
+    ).toBe(true);
+    expect(
+      threadDeleteRequiresConfirmation(false, {
+        title: "Main checkout",
+        worktreePath: "/repo",
+        worktreeRemovable: false,
+        worktreeRemovalPath: null,
       }),
     ).toBe(false);
   });

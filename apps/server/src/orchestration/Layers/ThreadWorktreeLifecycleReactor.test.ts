@@ -25,7 +25,10 @@ import * as TerminalManager from "../../terminal/Manager.ts";
 import { OrchestrationEngineService } from "../Services/OrchestrationEngine.ts";
 import { ProjectionSnapshotQuery } from "../Services/ProjectionSnapshotQuery.ts";
 import { ThreadDeletionReactor } from "../Services/ThreadDeletionReactor.ts";
-import { WorktreeLifecycleCoordinatorLive } from "../Services/WorktreeLifecycleCoordinator.ts";
+import {
+  WorktreeLifecycleCoordinator,
+  WorktreeLifecycleCoordinatorLive,
+} from "../Services/WorktreeLifecycleCoordinator.ts";
 import { ThreadDeletionReactorLive } from "./ThreadDeletionReactor.ts";
 
 const NOW = "2026-07-10T18:00:00.000Z";
@@ -38,6 +41,7 @@ const snapshot = (input: {
   readonly archived?: boolean;
   readonly deleted?: boolean;
   readonly shared?: boolean;
+  readonly ancestorShared?: boolean;
 }): OrchestrationReadModel =>
   ({
     snapshotSequence: 2,
@@ -62,6 +66,20 @@ const snapshot = (input: {
               worktreeRemovable: false,
               worktreeRemovalPath: WORKTREE_ROOT,
               archivedAt: NOW,
+              deletedAt: null,
+              session: null,
+            },
+          ]
+        : []),
+      ...(input.ancestorShared
+        ? [
+            {
+              id: ThreadId.make("thread-worktree-ancestor-consumer"),
+              projectId: PROJECT_ID,
+              worktreePath: "/worktrees",
+              worktreeRemovable: false,
+              worktreeRemovalPath: null,
+              archivedAt: null,
               deletedAt: null,
               session: null,
             },
@@ -131,6 +149,7 @@ async function createHarness(input: {
   readonly pathExists: boolean;
   readonly closeFails?: boolean;
   readonly dirty?: boolean;
+  readonly metadataFailuresBeforeSuccess?: number;
   readonly persistedEvents?: ReadonlyArray<OrchestrationEvent>;
   readonly projectedSessionStatus?: OrchestrationSession["status"];
   readonly projectIsRepo?: boolean;
@@ -156,12 +175,19 @@ async function createHarness(input: {
           operations.push("prune");
         });
   });
-  const dispatch = vi.fn((command: { readonly type: string; readonly commandId?: string }) =>
-    Effect.sync(() => {
+  let metadataAttempts = 0;
+  const dispatch = vi.fn((command: { readonly type: string; readonly commandId?: string }) => {
+    if (command.type === "thread.meta.update") {
+      metadataAttempts += 1;
+      if (metadataAttempts <= (input.metadataFailuresBeforeSuccess ?? 0)) {
+        return Effect.fail("metadata clear failed");
+      }
+    }
+    return Effect.sync(() => {
       operations.push(command.type === "thread.meta.update" ? "metadata" : command.type);
       return { sequence: 3 };
-    }),
-  );
+    });
+  });
   const closeTerminal = vi.fn(() =>
     input.closeFails === true
       ? Effect.fail("terminal close failed")
@@ -244,6 +270,7 @@ async function createHarness(input: {
   );
   const scope = Effect.runSync(Scope.make("sequential"));
   const reactor = await runtime.runPromise(ThreadDeletionReactor);
+  const worktreeLifecycle = await runtime.runPromise(WorktreeLifecycleCoordinator);
   await runtime.runPromise(reactor.start().pipe(Scope.provide(scope)));
   await runtime.runPromise(Effect.yieldNow);
   await runtime.runPromise(Effect.yieldNow);
@@ -252,6 +279,7 @@ async function createHarness(input: {
     closeTerminal,
     dispatch,
     invalidateLocalStatus,
+    isTeardownPending: () => runtime.runPromise(worktreeLifecycle.isTeardownPending(THREAD_ID)),
     operations,
     pruneWorktrees,
     removeWorktree,
@@ -309,6 +337,21 @@ describe("ThreadDeletionReactor owned worktree lifecycle", () => {
 
       expect(harness.removeWorktree).not.toHaveBeenCalled();
       expect(harness.pruneWorktrees).not.toHaveBeenCalled();
+      expect(harness.dispatch).not.toHaveBeenCalled();
+    } finally {
+      await harness.dispose();
+    }
+  });
+
+  it("retains an owned root nested inside another thread workspace", async () => {
+    const harness = await createHarness({
+      snapshot: snapshot({ deleted: true, ancestorShared: true }),
+      pathExists: true,
+    });
+    try {
+      await harness.run(lifecycleEvent("thread.deleted"));
+
+      expect(harness.removeWorktree).not.toHaveBeenCalled();
       expect(harness.dispatch).not.toHaveBeenCalled();
     } finally {
       await harness.dispose();
@@ -515,6 +558,24 @@ describe("ThreadDeletionReactor owned worktree lifecycle", () => {
       expect(harness.pruneWorktrees).toHaveBeenCalledTimes(2);
       expect(harness.dispatch).toHaveBeenCalledOnce();
       expect(harness.operations.at(-1)).toBe("metadata");
+    } finally {
+      await harness.dispose();
+    }
+  });
+
+  it("keeps archived teardown pending until ownership metadata clears", async () => {
+    const harness = await createHarness({
+      snapshot: snapshot({ archived: true }),
+      pathExists: true,
+      metadataFailuresBeforeSuccess: 1,
+    });
+    try {
+      await harness.run(lifecycleEvent("thread.archived"));
+      expect(await harness.isTeardownPending()).toBe(true);
+
+      await harness.sleep(400);
+      await harness.drain();
+      expect(await harness.isTeardownPending()).toBe(false);
     } finally {
       await harness.dispose();
     }

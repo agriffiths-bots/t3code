@@ -37,6 +37,7 @@ import {
   type OrchestrationProjectionPipelineShape,
 } from "../Services/ProjectionPipeline.ts";
 import { ProjectionSnapshotQuery } from "../Services/ProjectionSnapshotQuery.ts";
+import { WorktreeLifecycleCoordinator } from "../Services/WorktreeLifecycleCoordinator.ts";
 import { readDetailedReadModel } from "../testUtils/readModel.ts";
 import { ServerConfig } from "../../config.ts";
 
@@ -66,9 +67,11 @@ async function createOrchestrationSystem() {
   const runtime = ManagedRuntime.make(orchestrationLayer);
   const engine = await runtime.runPromise(Effect.service(OrchestrationEngineService));
   const snapshotQuery = await runtime.runPromise(Effect.service(ProjectionSnapshotQuery));
+  const worktreeLifecycle = await runtime.runPromise(Effect.service(WorktreeLifecycleCoordinator));
   return {
     engine,
     snapshotQuery,
+    worktreeLifecycle,
     readModel: () => readDetailedReadModel(snapshotQuery),
     run: <A, E>(effect: Effect.Effect<A, E>) => runtime.runPromise(effect),
     dispose: () => runtime.dispose(),
@@ -422,6 +425,23 @@ describe("OrchestrationEngine", () => {
         ?.archivedAt,
     ).not.toBeNull();
 
+    await system.run(system.worktreeLifecycle.markTeardownPending(ThreadId.make("thread-archive")));
+    await expect(
+      system.run(
+        engine.dispatch({
+          type: "thread.unarchive",
+          commandId: CommandId.make("cmd-thread-unarchive-while-teardown-pending"),
+          threadId: ThreadId.make("thread-archive"),
+        }),
+      ),
+    ).rejects.toMatchObject({
+      _tag: "OrchestrationCommandInvariantError",
+      commandType: "thread.unarchive",
+    });
+    await system.run(
+      system.worktreeLifecycle.clearTeardownPending(ThreadId.make("thread-archive")),
+    );
+
     await system.run(
       engine.dispatch({
         type: "thread.unarchive",
@@ -433,6 +453,40 @@ describe("OrchestrationEngine", () => {
       (await system.readModel()).threads.find((thread) => thread.id === "thread-archive")
         ?.archivedAt,
     ).toBeNull();
+
+    const missingOwnedWorktree = "/tmp/t3code-missing-owned-worktree-restart-guard";
+    await system.run(
+      engine.dispatch({
+        type: "thread.meta.update",
+        commandId: CommandId.make("cmd-thread-owned-worktree-before-rearchive"),
+        threadId: ThreadId.make("thread-archive"),
+        worktreePath: missingOwnedWorktree,
+        worktreeRemovable: true,
+        worktreeRemovalPath: missingOwnedWorktree,
+      }),
+    );
+    await system.run(
+      engine.dispatch({
+        type: "thread.archive",
+        commandId: CommandId.make("cmd-thread-rearchive-with-missing-owned-worktree"),
+        threadId: ThreadId.make("thread-archive"),
+      }),
+    );
+    expect(
+      await system.run(system.worktreeLifecycle.isTeardownPending(ThreadId.make("thread-archive"))),
+    ).toBe(false);
+    await expect(
+      system.run(
+        engine.dispatch({
+          type: "thread.unarchive",
+          commandId: CommandId.make("cmd-thread-unarchive-after-restart-state-loss"),
+          threadId: ThreadId.make("thread-archive"),
+        }),
+      ),
+    ).rejects.toMatchObject({
+      _tag: "OrchestrationCommandInvariantError",
+      commandType: "thread.unarchive",
+    });
 
     await system.dispose();
   });
