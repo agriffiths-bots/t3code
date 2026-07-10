@@ -89,12 +89,13 @@ export function sanitizeThreadErrorMessage(
     return null;
   }
 
+  if (options?.turnState === "error") {
+    return normalizedMessage;
+  }
+
   if (isClaudeUserSteerAbortDiagnosticMessage(normalizedMessage)) {
     if (options?.turnState === "interrupted") {
       return null;
-    }
-    if (options?.turnState === "error") {
-      return normalizedMessage;
     }
   }
 

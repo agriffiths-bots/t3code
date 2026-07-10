@@ -3653,19 +3653,35 @@ describe("ClaudeAdapterLive", () => {
     const cases = [
       {
         isError: false,
-        error: "[ede_diagnostic] result_type=user last_content_type=n/a stop_reason=tool_use",
+        errors: ["[ede_diagnostic] result_type=user last_content_type=n/a stop_reason=tool_use"],
       },
       {
         isError: true,
-        error: "[ede_diagnostic] result_type=user last_content_type=n/a stop_reason=tool_use",
+        errors: ["[ede_diagnostic] result_type=user last_content_type=n/a stop_reason=tool_use"],
       },
       {
         isError: false,
-        error: "[ede_diagnostic] turn aborted (steer) stop_reason=tool_use",
+        errors: ["[ede_diagnostic] turn aborted (steer) stop_reason=tool_use"],
       },
       {
         isError: true,
-        error: "[ede_diagnostic] turn aborted (steer) stop_reason=tool_use",
+        errors: ["[ede_diagnostic] turn aborted (steer) stop_reason=tool_use"],
+      },
+      {
+        isError: false,
+        errors: [
+          "[ede_diagnostic] result_type=user last_content_type=n/a stop_reason=tool_use",
+          "Error: Request was aborted.",
+        ],
+      },
+      {
+        isError: false,
+        errors: [
+          [
+            "[ede_diagnostic] turn aborted (steer) stop_reason=tool_use",
+            "Error: Request was aborted.",
+          ].join("\n"),
+        ],
       },
     ] as const;
 
@@ -3695,7 +3711,7 @@ describe("ClaudeAdapterLive", () => {
           type: "result",
           subtype: "error_during_execution",
           is_error: testCase.isError,
-          errors: [testCase.error],
+          errors: testCase.errors,
           stop_reason: "tool_use",
           session_id: `sdk-session-steer-abort-${index}`,
           uuid: `result-steer-abort-${index}`,
@@ -3719,7 +3735,7 @@ describe("ClaudeAdapterLive", () => {
         if (turnCompleted?.type === "turn.completed") {
           assert.equal(String(turnCompleted.turnId), String(turn.turnId));
           assert.equal(turnCompleted.payload.state, "interrupted");
-          assert.equal(turnCompleted.payload.errorMessage, testCase.error);
+          assert.equal(turnCompleted.payload.errorMessage, testCase.errors[0]);
         }
 
         const sessions = yield* adapter.listSessions();

@@ -307,24 +307,43 @@ function resultErrorsText(result: SDKResultMessage): string {
     : "";
 }
 
-function isClaudeUserSteerAbortDiagnostic(error: string): boolean {
-  const lines = error
-    .split(/\r?\n/u)
-    .map((line) => line.trim().toLowerCase())
-    .filter((line) => line.length > 0);
+function isClaudeUserSteerAbortDiagnosticLine(line: string): boolean {
+  const normalizedLine = line.trim().toLowerCase();
   return (
-    lines.length === 1 &&
-    lines.every(
-      (line) =>
-        /^\[ede_diagnostic\]\s+result_type=user\s+last_content_type=\S+\s+stop_reason=tool_use$/u.test(
-          line,
-        ) || /^\[ede_diagnostic\]\s+turn aborted\s+\([^\r\n)]*\)\s+stop_reason=\S+$/u.test(line),
-    )
+    /^\[ede_diagnostic\]\s+result_type=user\s+last_content_type=\S+\s+stop_reason=tool_use$/u.test(
+      normalizedLine,
+    ) ||
+    /^\[ede_diagnostic\]\s+turn aborted\s+\([^\r\n)]*\)\s+stop_reason=\S+$/u.test(normalizedLine)
   );
 }
 
 function isClaudeUserSteerAbortDiagnosticCandidate(error: string): boolean {
   return /\[ede_diagnostic\]\s+(?:result_type=user\b|turn aborted\b)/u.test(error.toLowerCase());
+}
+
+function isClaudeExplicitAbortDiagnosticLine(line: string): boolean {
+  const normalizedLine = line.trim().toLowerCase();
+  return (
+    /^(?:error:\s*)?request was aborted\.?$/u.test(normalizedLine) ||
+    /^interrupted by user\.?$/u.test(normalizedLine) ||
+    /^aborted\.?$/u.test(normalizedLine)
+  );
+}
+
+function isClaudeUserSteerAbortEnvelope(errors: ReadonlyArray<string>): boolean {
+  const lines = errors.flatMap((error) =>
+    error
+      .split(/\r?\n/u)
+      .map((line) => line.trim())
+      .filter((line) => line.length > 0),
+  );
+  return (
+    lines.filter(isClaudeUserSteerAbortDiagnosticLine).length === 1 &&
+    lines.every(
+      (line) =>
+        isClaudeUserSteerAbortDiagnosticLine(line) || isClaudeExplicitAbortDiagnosticLine(line),
+    )
+  );
 }
 
 function isTaskNotificationResult(result: SDKResultMessage | undefined): boolean {
@@ -424,8 +443,8 @@ function isInterruptedResult(result: SDKResultMessage): boolean {
   ) {
     // Claude CLI 2.1.206 emits these exact steer envelopes with is_error=true,
     // while older/provenance captures used false. The diagnostic grammar is the
-    // stable discriminator; companion or unrelated errors remain fail-closed.
-    return result.errors.length === 1 && result.errors.every(isClaudeUserSteerAbortDiagnostic);
+    // stable discriminator; only explicit abort companions are also benign.
+    return isClaudeUserSteerAbortEnvelope(result.errors);
   }
 
   return (

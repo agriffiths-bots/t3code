@@ -97,8 +97,17 @@ describe("sanitizeThreadErrorMessage", () => {
   });
 
   it("preserves steer-shaped diagnostics for failed Claude turns", () => {
-    const error = "[ede_diagnostic] result_type=user last_content_type=n/a stop_reason=tool_use";
-    expect(sanitizeThreadErrorMessage(error, { turnState: "error" })).toBe(error);
+    const errors = [
+      "[ede_diagnostic] result_type=user last_content_type=n/a stop_reason=tool_use",
+      [
+        "[ede_diagnostic] result_type=user last_content_type=n/a stop_reason=tool_use",
+        "Claude execution failed after the steer boundary.",
+      ].join("\n"),
+      "[ede_diagnostic] result_type=user last_content_type=n/a stop_reason=tool_use Claude execution failed",
+    ];
+    for (const error of errors) {
+      expect(sanitizeThreadErrorMessage(error, { turnState: "error" })).toBe(error);
+    }
   });
 
   it("does not suppress a steer diagnostic with a companion error", () => {
