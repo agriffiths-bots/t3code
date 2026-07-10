@@ -433,10 +433,12 @@ const make = Effect.gen(function* () {
           detail: `Archived owned worktree '${candidate.path}' is no longer a Git worktree.`,
         });
       }
-      if (status.hasWorkingTreeChanges) {
+      const hasIgnoredFiles = yield* gitWorkflow.hasIgnoredFiles(candidate.path);
+      if (status.hasWorkingTreeChanges || hasIgnoredFiles) {
         yield* Effect.logWarning("thread archive retained dirty owned worktree", {
           threadId: candidate.threadId,
           path: candidate.path,
+          hasIgnoredFiles,
         });
         return;
       }
@@ -457,6 +459,9 @@ const make = Effect.gen(function* () {
       if (removeResult._tag === "Failure") {
         pathExists = yield* fileSystem.exists(candidate.path);
         if (pathExists) {
+          if (!candidate.force) {
+            yield* worktreeLifecycle.clearTeardownPending(candidate.threadId);
+          }
           return yield* removeResult.failure;
         }
         requiresRepositoryProbeBeforePrune = true;

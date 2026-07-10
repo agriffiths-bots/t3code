@@ -48,6 +48,7 @@ export class GitWorkflowService extends Context.Service<
     readonly invalidateLocalStatus: (cwd: string) => Effect.Effect<void, never>;
     readonly invalidateRemoteStatus: (cwd: string) => Effect.Effect<void, never>;
     readonly invalidateStatus: (cwd: string) => Effect.Effect<void, never>;
+    readonly hasIgnoredFiles: (cwd: string) => Effect.Effect<boolean, GitCommandError>;
     readonly pullCurrentBranch: (cwd: string) => Effect.Effect<VcsPullResult, GitCommandError>;
     readonly runStackedAction: (
       input: GitRunStackedActionInput,
@@ -274,6 +275,20 @@ export const make = Effect.gen(function* () {
     invalidateLocalStatus: gitManager.invalidateLocalStatus,
     invalidateRemoteStatus: gitManager.invalidateRemoteStatus,
     invalidateStatus: gitManager.invalidateStatus,
+    hasIgnoredFiles: (cwd) =>
+      ensureGitCommand("GitWorkflowService.hasIgnoredFiles", cwd).pipe(
+        Effect.andThen(
+          git.execute({
+            operation: "GitWorkflowService.hasIgnoredFiles",
+            cwd,
+            args: ["ls-files", "--others", "--ignored", "--exclude-standard", "-z"],
+            timeoutMs: 20_000,
+            maxOutputBytes: 1,
+            appendTruncationMarker: true,
+          }),
+        ),
+        Effect.map((result) => result.stdout.length > 0 || result.stdoutTruncated),
+      ),
     pullCurrentBranch: (cwd) =>
       ensureGitCommand("GitWorkflowService.pullCurrentBranch", cwd).pipe(
         Effect.andThen(git.pullCurrentBranch(cwd)),

@@ -44,6 +44,7 @@ const ThreadDeletionReactorTestLive = ThreadDeletionReactorLive.pipe(
   Layer.provide(
     Layer.mock(GitWorkflowService.GitWorkflowService)({
       localStatus: () => Effect.succeed({ isRepo: true, hasWorkingTreeChanges: false } as never),
+      hasIgnoredFiles: () => Effect.succeed(false),
       removeWorktree: () => Effect.void,
       pruneWorktrees: () => Effect.void,
     }),

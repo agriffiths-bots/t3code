@@ -149,19 +149,23 @@ async function createHarness(input: {
   readonly pathExists: boolean;
   readonly closeFails?: boolean;
   readonly dirty?: boolean;
+  readonly ignored?: boolean;
   readonly metadataFailuresBeforeSuccess?: number;
   readonly persistedEvents?: ReadonlyArray<OrchestrationEvent>;
   readonly projectedSessionStatus?: OrchestrationSession["status"];
   readonly projectIsRepo?: boolean;
   readonly projectRootExists?: boolean;
   readonly pruneFailuresBeforeSuccess?: number;
+  readonly removeFails?: boolean;
 }) {
   const events = Effect.runSync(PubSub.unbounded<OrchestrationEvent>());
   const operations: string[] = [];
   const removeWorktree = vi.fn(() =>
-    Effect.sync(() => {
-      operations.push("remove");
-    }),
+    input.removeFails === true
+      ? Effect.fail("worktree removal failed")
+      : Effect.sync(() => {
+          operations.push("remove");
+        }),
   );
   let pruneAttempts = 0;
   const pruneWorktrees = vi.fn(() => {
@@ -245,6 +249,7 @@ async function createHarness(input: {
       Layer.provideMerge(
         Layer.succeed(GitWorkflow.GitWorkflowService, {
           invalidateLocalStatus,
+          hasIgnoredFiles: () => Effect.succeed(input.ignored === true),
           localStatus: ({ cwd }: { readonly cwd: string }) =>
             Effect.sync(() => {
               operations.push("status");
@@ -508,6 +513,23 @@ describe("ThreadDeletionReactor owned worktree lifecycle", () => {
     }
   });
 
+  it("retains an archived owned root containing only ignored files", async () => {
+    const harness = await createHarness({
+      snapshot: snapshot({ archived: true }),
+      pathExists: true,
+      ignored: true,
+    });
+    try {
+      await harness.run(lifecycleEvent("thread.archived"));
+
+      expect(harness.removeWorktree).not.toHaveBeenCalled();
+      expect(harness.dispatch).not.toHaveBeenCalled();
+      expect(await harness.isTeardownPending()).toBe(false);
+    } finally {
+      await harness.dispose();
+    }
+  });
+
   it("does not touch the filesystem when terminal close fails", async () => {
     const harness = await createHarness({
       snapshot: snapshot({ deleted: true }),
@@ -575,6 +597,22 @@ describe("ThreadDeletionReactor owned worktree lifecycle", () => {
 
       await harness.sleep(400);
       await harness.drain();
+      expect(await harness.isTeardownPending()).toBe(false);
+    } finally {
+      await harness.dispose();
+    }
+  });
+
+  it("clears archive teardown pending when removal fails and the root remains", async () => {
+    const harness = await createHarness({
+      snapshot: snapshot({ archived: true }),
+      pathExists: true,
+      removeFails: true,
+    });
+    try {
+      await harness.run(lifecycleEvent("thread.archived"));
+
+      expect(harness.removeWorktree).toHaveBeenCalledOnce();
       expect(await harness.isTeardownPending()).toBe(false);
     } finally {
       await harness.dispose();

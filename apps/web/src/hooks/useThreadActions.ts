@@ -97,6 +97,17 @@ export function buildThreadsDeleteConfirmationMessage(
     `Delete ${inputs.length} thread${inputs.length === 1 ? "" : "s"}?`,
     "This permanently clears conversation history for these threads.",
   ];
+  lines.push(...buildOwnedWorktreesDeleteWarning(inputs));
+  return lines.join("\n");
+}
+
+export function buildOwnedWorktreesDeleteWarning(
+  inputs: ReadonlyArray<{
+    readonly worktreePath: string | null;
+    readonly worktreeRemovable?: boolean | undefined;
+    readonly worktreeRemovalPath?: string | null | undefined;
+  }>,
+): ReadonlyArray<string> {
   const ownedWorktreePaths = [
     ...new Set(
       inputs.flatMap((input) => {
@@ -105,15 +116,15 @@ export function buildThreadsDeleteConfirmationMessage(
       }),
     ),
   ];
-  if (ownedWorktreePaths.length > 0) {
-    lines.push(
-      "",
-      "This also permanently deletes these T3-created worktrees when no other thread or project uses them:",
-      ...ownedWorktreePaths.map((path) => `- ${formatWorktreePathForDisplay(path)}`),
-      "Uncommitted and untracked files in those worktrees will be lost.",
-    );
+  if (ownedWorktreePaths.length === 0) {
+    return [];
   }
-  return lines.join("\n");
+  return [
+    "",
+    "This also permanently deletes these T3-created worktrees when no other thread or project uses them:",
+    ...ownedWorktreePaths.map((path) => `- ${formatWorktreePathForDisplay(path)}`),
+    "Uncommitted and untracked files in those worktrees will be lost.",
+  ];
 }
 
 export function useThreadActions() {

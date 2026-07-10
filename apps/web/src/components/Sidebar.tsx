@@ -115,8 +115,10 @@ import { useComposerDraftStore } from "../composerDraftStore";
 import { useNewThreadHandler } from "../hooks/useHandleNewThread";
 import { useDesktopUpdateState } from "../state/desktopUpdate";
 import { isThreadSessionActive } from "../session-logic";
+import { fetchFreshArchivedThreadSnapshot } from "../lib/archivedThreadsState";
 
 import {
+  buildOwnedWorktreesDeleteWarning,
   buildThreadsDeleteConfirmationMessage,
   ownedWorktreePathForThreadDelete,
   useThreadActions,
@@ -1636,6 +1638,76 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
       }
 
       const memberProjectRef = scopeProjectRef(member.environmentId, member.id);
+      const readCurrentProjectThreads = async () => {
+        const archivedSnapshot = await fetchFreshArchivedThreadSnapshot(member.environmentId);
+        if (archivedSnapshot === null) {
+          toastManager.add(
+            stackedThreadToast({
+              type: "warning",
+              title: "Project safety details are unavailable",
+              description: "Could not verify archived worktrees. Try deleting the project again.",
+            }),
+          );
+          return null;
+        }
+        const activeThreads = Array.from(sidebarThreadByKeyRef.current.values()).filter(
+          (thread) =>
+            thread.environmentId === memberProjectRef.environmentId &&
+            thread.projectId === memberProjectRef.projectId,
+        );
+        const archivedThreads = archivedSnapshot.threads
+          .filter((thread) => thread.projectId === member.id)
+          .map((thread) => ({ ...thread, environmentId: member.environmentId }));
+        return [...activeThreads, ...archivedThreads];
+      };
+      const projectThreadSafetyFingerprint = (
+        threads: NonNullable<Awaited<ReturnType<typeof readCurrentProjectThreads>>>,
+      ) =>
+        threads
+          .map(
+            (thread) =>
+              `${thread.environmentId}:${thread.id}:${ownedWorktreePathForThreadDelete(thread) ?? ""}`,
+          )
+          .toSorted()
+          .join("\n");
+      const confirmForcedProjectRemoval = async () => {
+        while (true) {
+          const projectThreads = await readCurrentProjectThreads();
+          if (projectThreads === null) {
+            return false;
+          }
+          const count = projectThreads.length;
+          const confirmedFingerprint = projectThreadSafetyFingerprint(projectThreads);
+          const confirmed = await api.dialogs.confirm(
+            [
+              count > 0
+                ? `Remove project "${member.title}" and delete its ${count} thread${count === 1 ? "" : "s"}?`
+                : `Remove project "${member.title}"?`,
+              `Path: ${member.workspaceRoot}`,
+              ...(member.environmentLabel ? [`Environment: ${member.environmentLabel}`] : []),
+              ...(count > 0
+                ? ["This permanently clears conversation history for those threads."]
+                : []),
+              ...buildOwnedWorktreesDeleteWarning(projectThreads),
+              "This removes only this project entry.",
+              "This action cannot be undone.",
+            ].join("\n"),
+          );
+          if (!confirmed) {
+            return false;
+          }
+          const refreshedThreads = await readCurrentProjectThreads();
+          if (
+            refreshedThreads !== null &&
+            projectThreadSafetyFingerprint(refreshedThreads) === confirmedFingerprint
+          ) {
+            return true;
+          }
+          if (refreshedThreads === null) {
+            return false;
+          }
+        }
+      };
       const memberThreadCount = memberThreadCountByPhysicalKey.get(member.physicalProjectKey) ?? 0;
       if (memberThreadCount > 0) {
         const warningToastId = toastManager.add(
@@ -1653,37 +1725,7 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
                     window.setTimeout(resolve, 180);
                   });
 
-                  const latestProjectThreads = Array.from(
-                    sidebarThreadByKeyRef.current.values(),
-                  ).filter(
-                    (thread) =>
-                      thread.environmentId === memberProjectRef.environmentId &&
-                      thread.projectId === memberProjectRef.projectId,
-                  );
-                  const confirmed = await api.dialogs.confirm(
-                    latestProjectThreads.length > 0
-                      ? [
-                          `Remove project "${member.title}" and delete its ${latestProjectThreads.length} thread${
-                            latestProjectThreads.length === 1 ? "" : "s"
-                          }?`,
-                          `Path: ${member.workspaceRoot}`,
-                          ...(member.environmentLabel
-                            ? [`Environment: ${member.environmentLabel}`]
-                            : []),
-                          "This permanently clears conversation history for those threads.",
-                          "This removes only this project entry.",
-                          "This action cannot be undone.",
-                        ].join("\n")
-                      : [
-                          `Remove project "${member.title}"?`,
-                          `Path: ${member.workspaceRoot}`,
-                          ...(member.environmentLabel
-                            ? [`Environment: ${member.environmentLabel}`]
-                            : []),
-                          "This removes only this project entry.",
-                        ].join("\n"),
-                  );
-                  if (!confirmed) {
+                  if (!(await confirmForcedProjectRemoval())) {
                     return;
                   }
 
@@ -1743,17 +1785,7 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
           // engine treats any non-deleted thread (incl. archived) as non-empty and
           // rejects delete without force. Re-prompt and retry with force=true so an
           // archived-only project can still be removed from the UI.
-          const forceConfirmed = await api.dialogs.confirm(
-            [
-              `Project "${member.title}" still has archived threads, so it isn't empty.`,
-              `Path: ${member.workspaceRoot}`,
-              ...(member.environmentLabel ? [`Environment: ${member.environmentLabel}`] : []),
-              "Delete the project and all of its threads, including archived ones?",
-              "This permanently clears their conversation history.",
-              "This action cannot be undone.",
-            ].join("\n"),
-          );
-          if (!forceConfirmed) {
+          if (!(await confirmForcedProjectRemoval())) {
             return;
           }
           const forced = await removeProject(member, { force: true });
