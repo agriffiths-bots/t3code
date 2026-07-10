@@ -7,6 +7,31 @@ import * as TestClock from "effect/testing/TestClock";
 import * as ServerSettings from "../serverSettings.ts";
 import { makeLayer, PlanUsageSnapshotStore } from "./PlanUsageSnapshot.ts";
 
+it.effect("does not block layer acquisition on the initial usage probe", () => {
+  let probes = 0;
+  const layer = makeLayer({
+    load: () => {
+      probes += 1;
+      return new Promise(() => {});
+    },
+  }).pipe(Layer.provide(ServerSettings.layerTest(DEFAULT_SERVER_SETTINGS)));
+
+  return Effect.scoped(
+    Effect.gen(function* () {
+      const layerFiber = yield* Layer.build(layer).pipe(
+        Effect.forkChild({ startImmediately: true }),
+      );
+      yield* Effect.yieldNow;
+      yield* Effect.yieldNow;
+
+      assert.equal(probes, 1);
+      const layerExit = layerFiber.pollUnsafe();
+      assert.isDefined(layerExit);
+      assert.equal(layerExit?._tag, "Success");
+    }),
+  );
+});
+
 it.effect("refreshes plan usage in the background without request-driven probes", () => {
   let probes = 0;
   const layer = makeLayer({

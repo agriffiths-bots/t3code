@@ -33,6 +33,12 @@ export interface ServerConfigProjection {
   readonly source: "cache" | "live";
 }
 
+function withoutTransientServerConfig(config: ServerConfig): ServerConfig {
+  if (config.planUsage === undefined) return config;
+  const { planUsage: _, ...cachedConfig } = config;
+  return cachedConfig;
+}
+
 export function applyServerConfigProjection(
   current: Option.Option<ServerConfigProjection>,
   event: ServerConfigStreamEvent,
@@ -119,6 +125,7 @@ export const makeEnvironmentServerConfigState = Effect.fn("EnvironmentServerConf
     const cache = yield* EnvironmentCacheStore;
     const environmentId = supervisor.target.environmentId;
     const cachedConfig = yield* cache.loadServerConfig(environmentId).pipe(
+      Effect.map(Option.map(withoutTransientServerConfig)),
       Effect.catch((error) =>
         Effect.logWarning("Could not load cached server configuration.").pipe(
           Effect.annotateLogs({
@@ -142,18 +149,20 @@ export const makeEnvironmentServerConfigState = Effect.fn("EnvironmentServerConf
     const persist = Effect.fn("EnvironmentServerConfigState.persist")(function* (
       config: ServerConfig,
     ) {
-      return yield* cache.saveServerConfig(environmentId, config).pipe(
-        Effect.as(true),
-        Effect.catch((error) =>
-          Effect.logWarning("Could not persist cached server configuration.").pipe(
-            Effect.annotateLogs({
-              environmentId,
-              ...safeErrorLogAttributes(error),
-            }),
-            Effect.as(false),
+      return yield* cache
+        .saveServerConfig(environmentId, withoutTransientServerConfig(config))
+        .pipe(
+          Effect.as(true),
+          Effect.catch((error) =>
+            Effect.logWarning("Could not persist cached server configuration.").pipe(
+              Effect.annotateLogs({
+                environmentId,
+                ...safeErrorLogAttributes(error),
+              }),
+              Effect.as(false),
+            ),
           ),
-        ),
-      );
+        );
     });
 
     const persistPending = Effect.fn("EnvironmentServerConfigState.persistPending")(function* (

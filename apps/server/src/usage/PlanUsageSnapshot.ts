@@ -118,8 +118,7 @@ export const makeLayer = (options?: {
       const refreshInterval = Effect.sleep(
         `${options?.refreshIntervalMs ?? PLAN_USAGE_REFRESH_INTERVAL_MS} millis`,
       );
-      yield* refresh;
-      const refreshLoop = Effect.forever(refreshInterval.pipe(Effect.andThen(refresh)));
+      const refreshLoop = Effect.forever(refresh.pipe(Effect.andThen(refreshInterval)));
       yield* Effect.forkScoped(refreshLoop);
 
       const read = Effect.fn("PlanUsageSnapshotStore.read")(function* (
