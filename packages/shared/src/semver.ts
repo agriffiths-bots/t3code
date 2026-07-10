@@ -6,6 +6,13 @@ interface ParsedSemver {
 }
 
 const SEMVER_NUMBER_SEGMENT = /^\d+$/;
+const BUILD_VERSION_PATTERN =
+  /^(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)(?:-(?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*)(?:\.(?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*))*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/u;
+
+export function normalizeBuildVersion(value: string | undefined): string | undefined {
+  const trimmed = value?.trim() ?? "";
+  return BUILD_VERSION_PATTERN.test(trimmed) ? trimmed : undefined;
+}
 
 export function normalizeSemverVersion(version: string): string {
   const [main, prerelease] = version.trim().split("-", 2);

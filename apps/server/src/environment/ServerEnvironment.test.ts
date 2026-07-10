@@ -71,16 +71,19 @@ it.layer(NodeServices.layer)("ServerEnvironmentLive", (it) => {
     }),
   );
 
-  it.effect("includes the served build sha when one is injected", () =>
+  it.effect("includes the served build identity when one is injected", () =>
     Effect.gen(function* () {
       const fileSystem = yield* FileSystem.FileSystem;
       const baseDir = yield* fileSystem.makeTempDirectoryScoped({
         prefix: "t3-server-environment-build-sha-test-",
       });
       const buildSha = "cccccccccccccccccccccccccccccccccccccccc";
-      const previous = process.env.T3CODE_BUILD_SHA;
+      const buildVersion = "0.0.29-nightly.20260710.30";
+      const previousBuildSha = process.env.T3CODE_BUILD_SHA;
+      const previousBuildVersion = process.env.T3CODE_BUILD_VERSION;
 
       process.env.T3CODE_BUILD_SHA = buildSha.toUpperCase();
+      process.env.T3CODE_BUILD_VERSION = buildVersion;
       const descriptor = yield* Effect.gen(function* () {
         const serverEnvironment = yield* ServerEnvironment.ServerEnvironment;
         return yield* serverEnvironment.getDescriptor;
@@ -88,16 +91,22 @@ it.layer(NodeServices.layer)("ServerEnvironmentLive", (it) => {
         Effect.provide(makeServerEnvironmentLayer(baseDir)),
         Effect.ensuring(
           Effect.sync(() => {
-            if (previous === undefined) {
+            if (previousBuildSha === undefined) {
               delete process.env.T3CODE_BUILD_SHA;
             } else {
-              process.env.T3CODE_BUILD_SHA = previous;
+              process.env.T3CODE_BUILD_SHA = previousBuildSha;
+            }
+            if (previousBuildVersion === undefined) {
+              delete process.env.T3CODE_BUILD_VERSION;
+            } else {
+              process.env.T3CODE_BUILD_VERSION = previousBuildVersion;
             }
           }),
         ),
       );
 
       expect(descriptor.serverBuildSha).toBe(buildSha);
+      expect(descriptor.serverVersion).toBe(buildVersion);
     }),
   );
 
@@ -108,6 +117,23 @@ it.layer(NodeServices.layer)("ServerEnvironmentLive", (it) => {
     expect(ServerEnvironment.__testing.resolveConfiguredBuildSha("not-a-sha", buildSha)).toBe(
       buildSha,
     );
+  });
+
+  it("prefers valid runtime and bundled build versions over the package fallback", () => {
+    expect(
+      ServerEnvironment.__testing.resolveConfiguredBuildVersion(
+        "0.0.30-nightly.20260711.31",
+        "0.0.29-nightly.20260710.30",
+        "0.0.28",
+      ),
+    ).toBe("0.0.30-nightly.20260711.31");
+    expect(
+      ServerEnvironment.__testing.resolveConfiguredBuildVersion(
+        "not-semver",
+        "0.0.29-nightly.20260710.30",
+        "0.0.28",
+      ),
+    ).toBe("0.0.29-nightly.20260710.30");
   });
 
   it.effect("structures persisted environment id filesystem failures", () =>
