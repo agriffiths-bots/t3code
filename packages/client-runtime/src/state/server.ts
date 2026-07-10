@@ -98,6 +98,16 @@ const cachedConfigSnapshotEvent = (config: ServerConfig): ServerConfigStreamEven
 });
 
 /**
+ * Shared payload for every `subscribeServerConfig` consumer. The subscription
+ * atom family is keyed on `JSON.stringify([environmentId, input])`, so ALL
+ * consumers must pass this identical value — otherwise the environment ends up
+ * with two independent websocket streams (each running its own
+ * `providerRegistry.refresh()`). `supportsHeartbeat` opts this heartbeat-aware
+ * client build into the server's keepalive frames.
+ */
+export const SERVER_CONFIG_SUBSCRIPTION_INPUT = { supportsHeartbeat: true } as const;
+
+/**
  * Keeps a complete server configuration available during reconnects. Server
  * config carries the provider/model catalogue used by task creation, so it is
  * useful—and safe—to retain after a transport session ends.
@@ -162,7 +172,7 @@ export const makeEnvironmentServerConfigState = Effect.fn("EnvironmentServerConf
       Effect.forkScoped,
     );
 
-    yield* subscribe(WS_METHODS.subscribeServerConfig, {}).pipe(
+    yield* subscribe(WS_METHODS.subscribeServerConfig, SERVER_CONFIG_SUBSCRIPTION_INPUT).pipe(
       Stream.runForEach((event) =>
         Effect.gen(function* () {
           const next = applyServerConfigProjection(yield* SubscriptionRef.get(state), event);
@@ -228,16 +238,6 @@ export function projectServerWelcome(
   const welcome = event.payload as ServerLifecycleWelcomePayload;
   return [Option.some(welcome), [welcome]];
 }
-
-/**
- * Shared payload for every `subscribeServerConfig` consumer. The subscription
- * atom family is keyed on `JSON.stringify([environmentId, input])`, so ALL
- * consumers must pass this identical value — otherwise the environment ends up
- * with two independent websocket streams (each running its own
- * `providerRegistry.refresh()`). `supportsHeartbeat` opts this heartbeat-aware
- * client build into the server's keepalive frames.
- */
-export const SERVER_CONFIG_SUBSCRIPTION_INPUT = { supportsHeartbeat: true } as const;
 
 export function resolveServerConfigValue(
   projection: ServerConfigProjection | null,
