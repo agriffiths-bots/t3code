@@ -2,14 +2,17 @@ import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, it } from "@effect/vitest";
 import * as ConfigProvider from "effect/ConfigProvider";
 import * as Effect from "effect/Effect";
+import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
+import * as Path from "effect/Path";
 import * as Sink from "effect/Sink";
 import * as Stream from "effect/Stream";
 import { ChildProcessSpawner } from "effect/unstable/process";
 
 import {
   BuildCommandFailedError,
+  BundledClientBuildStampMissingError,
   createStageWorkspaceConfig,
   createStagePatchedDependencies,
   createBuildConfig,
@@ -47,6 +50,7 @@ import {
   resolvePackageManagerUserAgent,
   stageLinuxIconSize,
   STAGE_INSTALL_ARGS,
+  validateBundledClientAssets,
 } from "./build-desktop-artifact.ts";
 import { BRAND_ASSET_PATHS } from "./lib/brand-assets.ts";
 import { HostProcessArchitecture, HostProcessPlatform } from "@t3tools/shared/hostProcess";
@@ -365,7 +369,61 @@ it.layer(NodeServices.layer)("build-desktop-artifact", (it) => {
         T3CODE_WEB_SOURCEMAP: "0",
       },
     );
+    assert.deepStrictEqual(
+      createDesktopPackageBuildEnv(
+        { PATH: "/bin" },
+        {
+          buildSha: "abcdefabcdefabcdefabcdefabcdefabcdefabcd",
+          buildVersion: "0.0.29-nightly.20260710.30",
+        },
+      ),
+      {
+        PATH: "/bin",
+        T3CODE_BUILD_SHA: "abcdefabcdefabcdefabcdefabcdefabcdefabcd",
+        T3CODE_BUILD_VERSION: "0.0.29-nightly.20260710.30",
+        T3CODE_DESKTOP_PACKAGE: "1",
+        T3CODE_WEB_SOURCEMAP: "0",
+      },
+    );
   });
+
+  it.effect("rejects a desktop client bundle without its expected build sha", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const clientDir = yield* fs.makeTempDirectoryScoped({
+        prefix: "t3-desktop-client-stamp-test-",
+      });
+      const assetsDir = path.join(clientDir, "assets");
+      const scriptPath = path.join(assetsDir, "index.js");
+      const buildSha = "abcdefabcdefabcdefabcdefabcdefabcdefabcd";
+      const buildVersion = "0.0.29-nightly.20260710.30";
+
+      yield* fs.makeDirectory(assetsDir, { recursive: true });
+      yield* fs.writeFileString(
+        path.join(clientDir, "index.html"),
+        '<script type="module" src="/assets/index.js"></script>',
+      );
+      yield* fs.writeFileString(scriptPath, 'const APP_BUILD_SHA = "";');
+      yield* fs.writeFileString(
+        path.join(clientDir, "build-identity.json"),
+        `{"buildSha":"","buildVersion":"${buildVersion}-beta.1"}\n`,
+      );
+
+      const error = yield* validateBundledClientAssets(clientDir, buildSha, buildVersion).pipe(
+        Effect.flip,
+      );
+      assert.instanceOf(error, BundledClientBuildStampMissingError);
+      assert.equal(error.expectedBuildSha, buildSha);
+      assert.equal(error.expectedBuildVersion, buildVersion);
+
+      yield* fs.writeFileString(
+        path.join(clientDir, "build-identity.json"),
+        `{"buildSha":"${buildSha}","buildVersion":"${buildVersion}"}\n`,
+      );
+      yield* validateBundledClientAssets(clientDir, buildSha, buildVersion);
+    }),
+  );
 
   it("keeps electron-builder dependency collection on pnpm for staged apps", () => {
     const env = createElectronBuilderEnv({

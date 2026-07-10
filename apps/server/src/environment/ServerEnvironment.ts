@@ -1,5 +1,6 @@
 import { EnvironmentId, type ExecutionEnvironmentDescriptor } from "@t3tools/contracts";
 import { HostProcessArchitecture, HostProcessPlatform } from "@t3tools/shared/hostProcess";
+import { normalizeBuildVersion } from "@t3tools/shared/semver";
 import * as Context from "effect/Context";
 import * as Crypto from "effect/Crypto";
 import * as Effect from "effect/Effect";
@@ -14,6 +15,7 @@ import * as ProcessRunner from "../processRunner.ts";
 import { resolveServerEnvironmentLabel } from "./ServerEnvironmentLabel.ts";
 
 declare const __T3CODE_BUILD_SHA__: string | undefined;
+declare const __T3CODE_BUILD_VERSION__: string | undefined;
 
 export class ServerEnvironmentIdPersistenceError extends Schema.TaggedErrorClass<ServerEnvironmentIdPersistenceError>()(
   "ServerEnvironmentIdPersistenceError",
@@ -84,6 +86,14 @@ function resolveConfiguredBuildSha(
   return undefined;
 }
 
+function resolveConfiguredBuildVersion(
+  envValue: string | undefined,
+  bundledValue: string | undefined,
+  fallbackValue: string,
+): string {
+  return normalizeBuildVersion(envValue) ?? normalizeBuildVersion(bundledValue) ?? fallbackValue;
+}
+
 export const make = Effect.gen(function* () {
   const fileSystem = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
@@ -152,6 +162,11 @@ export const make = Effect.gen(function* () {
     process.env.T3CODE_BUILD_SHA,
     typeof __T3CODE_BUILD_SHA__ !== "undefined" ? __T3CODE_BUILD_SHA__ : undefined,
   );
+  const serverVersion = resolveConfiguredBuildVersion(
+    process.env.T3CODE_BUILD_VERSION,
+    typeof __T3CODE_BUILD_VERSION__ !== "undefined" ? __T3CODE_BUILD_VERSION__ : undefined,
+    packageJson.version,
+  );
 
   const descriptor: ExecutionEnvironmentDescriptor = {
     environmentId,
@@ -160,7 +175,7 @@ export const make = Effect.gen(function* () {
       os: platformOs(hostPlatform),
       arch: platformArch(hostArchitecture),
     },
-    serverVersion: packageJson.version,
+    serverVersion,
     ...(serverBuildSha !== undefined ? { serverBuildSha } : {}),
     capabilities: {
       repositoryIdentity: true,
@@ -182,4 +197,5 @@ export const layer = Layer.effect(ServerEnvironment, make).pipe(Layer.provide(Pr
 
 export const __testing = {
   resolveConfiguredBuildSha,
+  resolveConfiguredBuildVersion,
 };

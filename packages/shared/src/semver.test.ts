@@ -1,6 +1,11 @@
 import { describe, expect, it } from "vite-plus/test";
 
-import { compareSemverVersions, normalizeSemverVersion, satisfiesSemverRange } from "./semver.ts";
+import {
+  compareSemverVersions,
+  normalizeBuildVersion,
+  normalizeSemverVersion,
+  satisfiesSemverRange,
+} from "./semver.ts";
 
 describe("semver helpers", () => {
   it("matches supported range groups", () => {
@@ -16,6 +21,20 @@ describe("semver helpers", () => {
 
   it("normalizes versions with a missing patch segment", () => {
     expect(normalizeSemverVersion("2.1")).toBe("2.1.0");
+  });
+
+  it("accepts stamped build versions and rejects malformed values", () => {
+    expect(normalizeBuildVersion(" 0.0.29-nightly.20260710.30 ")).toBe(
+      "0.0.29-nightly.20260710.30",
+    );
+    expect(normalizeBuildVersion("1.2.3+build.4")).toBe("1.2.3+build.4");
+    expect(normalizeBuildVersion("1.2.3+01")).toBe("1.2.3+01");
+    expect(normalizeBuildVersion("01.2.3")).toBeUndefined();
+    expect(normalizeBuildVersion("1.02.3")).toBeUndefined();
+    expect(normalizeBuildVersion("1.2.03")).toBeUndefined();
+    expect(normalizeBuildVersion("1.2.3-01")).toBeUndefined();
+    expect(normalizeBuildVersion("1.2.3-alpha.01")).toBeUndefined();
+    expect(normalizeBuildVersion("not-semver")).toBeUndefined();
   });
 
   it("compares prerelease versions before stable versions", () => {
