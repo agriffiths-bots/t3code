@@ -1575,6 +1575,15 @@ describe("deriveTimelineEntries", () => {
           streaming: false,
         },
         {
+          id: MessageId.make("assistant-same-boundary-turn-2"),
+          role: "assistant",
+          text: "second response sharing the request timestamp",
+          createdAt: "2026-02-23T00:01:00.000Z",
+          turnId: TurnId.make("turn-2"),
+          updatedAt: "2026-02-23T00:01:01.600Z",
+          streaming: false,
+        },
+        {
           id: MessageId.make("user-turn-2"),
           role: "user",
           text: "second prompt",
@@ -1586,6 +1595,8 @@ describe("deriveTimelineEntries", () => {
       ],
       [],
       [],
+      [{ turnId: TurnId.make("turn-1"), requestedAt: "2026-02-23T00:00:00.000Z" }],
+      { turnId: TurnId.make("turn-2"), requestedAt: "2026-02-23T00:01:00.000Z" },
     );
 
     expect(entries.map((entry) => entry.id)).toEqual([
@@ -1593,8 +1604,90 @@ describe("deriveTimelineEntries", () => {
       "assistant-turn-1",
       "user-turn-2",
       "assistant-reused-segment-turn-2",
+      "assistant-same-boundary-turn-2",
     ]);
   });
+
+  it.each([
+    ["Codex", null, "2026-07-10T08:00:01.000Z", "2026-07-10T08:00:01.000Z", true],
+    [
+      "Claude",
+      TurnId.make("turn-active"),
+      "2026-07-10T08:00:01.000Z",
+      "2026-07-10T08:00:01.000Z",
+      true,
+    ],
+    [
+      "Claude with a spanning assistant segment",
+      TurnId.make("turn-active"),
+      "2026-07-10T08:00:01.000Z",
+      "2026-07-10T08:00:04.000Z",
+      false,
+    ],
+    [
+      "Claude with a rebound assistant segment",
+      TurnId.make("turn-active"),
+      "2026-07-10T08:00:00.250Z",
+      "2026-07-10T08:00:04.000Z",
+      false,
+    ],
+  ] as const)(
+    "keeps a %s mid-turn message before the same turn's continuing output",
+    (_provider, injectedTurnId, assistantCreatedAt, assistantUpdatedAt, includeFirstWork) => {
+      const activeTurnId = TurnId.make("turn-active");
+      const message = (
+        id: string,
+        role: "user" | "assistant",
+        createdAt: string,
+        turnId: TurnId | null,
+        updatedAt = createdAt,
+      ) => ({
+        id: MessageId.make(id),
+        role,
+        text: id,
+        createdAt,
+        turnId,
+        updatedAt,
+        streaming: false,
+      });
+      const work = (id: string, createdAt: string) => ({
+        id,
+        turnId: activeTurnId,
+        createdAt,
+        label: id,
+        tone: "tool" as const,
+      });
+      const entries = deriveTimelineEntries(
+        [
+          message("user-initial", "user", "2026-07-10T08:00:00.000Z", null),
+          message(
+            "assistant-before-steer",
+            "assistant",
+            assistantCreatedAt,
+            activeTurnId,
+            assistantUpdatedAt,
+          ),
+          message("user-mid-turn", "user", "2026-07-10T08:00:03.000Z", injectedTurnId),
+          message("assistant-after-steer", "assistant", "2026-07-10T08:00:04.000Z", activeTurnId),
+        ],
+        [],
+        [
+          ...(includeFirstWork ? [work("work-before-steer", "2026-07-10T08:00:02.000Z")] : []),
+          work("work-after-steer", "2026-07-10T08:00:05.000Z"),
+        ],
+        [{ turnId: activeTurnId, requestedAt: "2026-07-10T08:00:00.500Z" }],
+      );
+
+      expect(entries.map((entry) => entry.id)).toEqual([
+        "user-initial",
+        "assistant-before-steer",
+        ...(includeFirstWork ? ["work-before-steer"] : []),
+        "user-mid-turn",
+        "assistant-after-steer",
+        "work-after-steer",
+      ]);
+    },
+  );
 
   it("exposes a running-turn assistant message-sent event immediately", () => {
     const threadId = ThreadId.make("thread-live-assistant");

@@ -1389,80 +1389,116 @@ function compareTimelineEntryTimestamp(left: TimelineEntry, right: TimelineEntry
   return left.id.localeCompare(right.id);
 }
 
-function deriveTimelineTurnOrder(
+interface TimelineTurnBoundary {
+  readonly requestedAt: string;
+  readonly floorTimestamp: string;
+  readonly startPromptEntryId: string | null;
+  readonly startPromptInputIndex: number | null;
+}
+
+function deriveTimelineTurnBoundaries(
   rows: ReadonlyArray<TimelineEntry>,
-): ReadonlyMap<string, { readonly createdAt: string; readonly firstIndex: number }> {
-  const grouped = new Map<
-    string,
-    Array<{ readonly entry: TimelineEntry; readonly index: number }>
-  >();
-  rows.forEach((entry, index) => {
+  inputIndex: ReadonlyMap<string, number>,
+  turns: ReadonlyArray<Pick<OrchestrationLatestTurn, "turnId" | "requestedAt">>,
+  latestTurn: Pick<OrchestrationLatestTurn, "turnId" | "requestedAt"> | null,
+): ReadonlyMap<string, TimelineTurnBoundary> {
+  const grouped = new Map<string, Array<TimelineEntry>>();
+  const turnsById = new Map(turns.map((turn) => [String(turn.turnId), turn] as const));
+  if (latestTurn !== null && !turnsById.has(String(latestTurn.turnId))) {
+    turnsById.set(String(latestTurn.turnId), latestTurn);
+  }
+  for (const entry of rows) {
     const turnId = timelineEntryTurnId(entry);
     if (turnId === null) {
-      return;
+      continue;
     }
     const existing = grouped.get(turnId);
     if (existing) {
-      existing.push({ entry, index });
+      existing.push(entry);
     } else {
-      grouped.set(turnId, [{ entry, index }]);
+      grouped.set(turnId, [entry]);
     }
-  });
+  }
 
-  const order = new Map<string, { readonly createdAt: string; readonly firstIndex: number }>();
+  const boundaries = new Map<string, TimelineTurnBoundary>();
   for (const [turnId, entries] of grouped.entries()) {
+    const turn = turnsById.get(turnId);
+    if (!turn) {
+      continue;
+    }
     const promptEntry = entries
-      .map(({ entry }) => entry)
       .filter(timelineEntryIsPrompt)
       .toSorted(compareTimelineEntryTimestamp)[0];
-    const firstEntry = entries.map(({ entry }) => entry).toSorted(compareTimelineEntryTimestamp)[0];
-    const firstIndex = Math.min(...entries.map(({ index }) => index));
-    order.set(turnId, {
-      createdAt: (promptEntry ?? firstEntry)?.createdAt ?? "",
-      firstIndex,
+    // A turn-start prompt is recorded no later than the turn request. Any
+    // prompt after requestedAt is a steer, even when all preceding output is
+    // an ACP replay segment carrying a stale pre-request timestamp.
+    const isStartPrompt = promptEntry !== undefined && promptEntry.createdAt <= turn.requestedAt;
+    boundaries.set(turnId, {
+      requestedAt: turn.requestedAt,
+      floorTimestamp: isStartPrompt ? promptEntry.createdAt : turn.requestedAt,
+      startPromptEntryId: isStartPrompt ? promptEntry.id : null,
+      startPromptInputIndex: isStartPrompt ? (inputIndex.get(promptEntry.id) ?? 0) : null,
     });
   }
-  return order;
+  return boundaries;
 }
 
-function compareTimelineEntriesByTurnOrder(
-  turnOrder: ReadonlyMap<string, { readonly createdAt: string; readonly firstIndex: number }>,
+function effectiveTimelineEntryTimestamp(
+  turnBoundaries: ReadonlyMap<string, TimelineTurnBoundary>,
+  entry: TimelineEntry,
+): string {
+  const turnId = timelineEntryTurnId(entry);
+  if (turnId === null) {
+    return entry.createdAt;
+  }
+  const boundary = turnBoundaries.get(turnId);
+  if (!boundary || entry.createdAt >= boundary.requestedAt) {
+    return entry.createdAt;
+  }
+  return boundary.floorTimestamp;
+}
+
+function compareTimelineEntries(
+  turnBoundaries: ReadonlyMap<string, TimelineTurnBoundary>,
   inputIndex: ReadonlyMap<string, number>,
   left: TimelineEntry,
   right: TimelineEntry,
 ): number {
   const leftTurnId = timelineEntryTurnId(left);
   const rightTurnId = timelineEntryTurnId(right);
-  const leftOrder =
-    leftTurnId === null
-      ? { createdAt: left.createdAt, firstIndex: inputIndex.get(left.id) ?? 0 }
-      : (turnOrder.get(leftTurnId) ?? {
-          createdAt: left.createdAt,
-          firstIndex: inputIndex.get(left.id) ?? 0,
-        });
-  const rightOrder =
-    rightTurnId === null
-      ? { createdAt: right.createdAt, firstIndex: inputIndex.get(right.id) ?? 0 }
-      : (turnOrder.get(rightTurnId) ?? {
-          createdAt: right.createdAt,
-          firstIndex: inputIndex.get(right.id) ?? 0,
-        });
-
-  const turnCreatedAtComparison = leftOrder.createdAt.localeCompare(rightOrder.createdAt);
-  if (turnCreatedAtComparison !== 0) {
-    return turnCreatedAtComparison;
+  const leftEffectiveTimestamp = effectiveTimelineEntryTimestamp(turnBoundaries, left);
+  const rightEffectiveTimestamp = effectiveTimelineEntryTimestamp(turnBoundaries, right);
+  const effectiveTimestampComparison =
+    leftEffectiveTimestamp.localeCompare(rightEffectiveTimestamp);
+  if (effectiveTimestampComparison !== 0) {
+    return effectiveTimestampComparison;
   }
 
-  if (leftOrder.firstIndex !== rightOrder.firstIndex) {
-    return leftOrder.firstIndex - rightOrder.firstIndex;
+  const leftBoundary = leftTurnId === null ? undefined : turnBoundaries.get(leftTurnId);
+  const rightBoundary = rightTurnId === null ? undefined : turnBoundaries.get(rightTurnId);
+  const leftInPromptGroup =
+    leftBoundary !== undefined &&
+    leftBoundary.startPromptEntryId !== null &&
+    (left.id === leftBoundary.startPromptEntryId || left.createdAt <= leftBoundary.requestedAt);
+  const rightInPromptGroup =
+    rightBoundary !== undefined &&
+    rightBoundary.startPromptEntryId !== null &&
+    (right.id === rightBoundary.startPromptEntryId || right.createdAt <= rightBoundary.requestedAt);
+  const leftGroupIndex = leftInPromptGroup
+    ? (leftBoundary.startPromptInputIndex ?? 0)
+    : (inputIndex.get(left.id) ?? 0);
+  const rightGroupIndex = rightInPromptGroup
+    ? (rightBoundary.startPromptInputIndex ?? 0)
+    : (inputIndex.get(right.id) ?? 0);
+  if (leftGroupIndex !== rightGroupIndex) {
+    return leftGroupIndex - rightGroupIndex;
   }
 
-  if (leftTurnId !== null && leftTurnId === rightTurnId) {
-    const promptRankComparison =
-      Number(timelineEntryIsPrompt(left) ? 0 : 1) - Number(timelineEntryIsPrompt(right) ? 0 : 1);
-    if (promptRankComparison !== 0) {
-      return promptRankComparison;
-    }
+  const promptRankComparison =
+    Number(!leftInPromptGroup || left.id !== leftBoundary.startPromptEntryId) -
+    Number(!rightInPromptGroup || right.id !== rightBoundary.startPromptEntryId);
+  if (promptRankComparison !== 0) {
+    return promptRankComparison;
   }
 
   return compareTimelineEntryTimestamp(left, right);
@@ -1472,6 +1508,8 @@ export function deriveTimelineEntries(
   messages: ReadonlyArray<ChatMessage>,
   proposedPlans: ReadonlyArray<ProposedPlan>,
   workEntries: ReadonlyArray<WorkLogEntry>,
+  turns: ReadonlyArray<Pick<OrchestrationLatestTurn, "turnId" | "requestedAt">> = [],
+  latestTurn: Pick<OrchestrationLatestTurn, "turnId" | "requestedAt"> | null = null,
 ): TimelineEntry[] {
   const messageRows: TimelineEntry[] = messages.map((message) => ({
     id: message.id,
@@ -1493,8 +1531,10 @@ export function deriveTimelineEntries(
   }));
   const rows = [...messageRows, ...proposedPlanRows, ...workRows];
   const inputIndex = new Map(rows.map((entry, index) => [entry.id, index] as const));
-  const turnOrder = deriveTimelineTurnOrder(rows);
-  return rows.toSorted((a, b) => compareTimelineEntriesByTurnOrder(turnOrder, inputIndex, a, b));
+  const turnBoundaries = deriveTimelineTurnBoundaries(rows, inputIndex, turns, latestTurn);
+  return rows.toSorted((left, right) =>
+    compareTimelineEntries(turnBoundaries, inputIndex, left, right),
+  );
 }
 
 export function inferCheckpointTurnCountByTurnId(
