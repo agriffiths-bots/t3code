@@ -2632,8 +2632,20 @@ function ChatViewContent(props: ChatViewProps) {
   ]);
   const timelineEntries = useMemo(
     () =>
-      deriveTimelineEntries(timelineMessages, activeThread?.proposedPlans ?? [], workLogEntries),
-    [activeThread?.proposedPlans, timelineMessages, workLogEntries],
+      deriveTimelineEntries(
+        timelineMessages,
+        activeThread?.proposedPlans ?? [],
+        workLogEntries,
+        activeThread?.turns ?? [],
+        activeThread?.latestTurn ?? null,
+      ),
+    [
+      activeThread?.latestTurn,
+      activeThread?.proposedPlans,
+      activeThread?.turns,
+      timelineMessages,
+      workLogEntries,
+    ],
   );
   const { turnDiffSummaries, inferredCheckpointTurnCountByTurnId } =
     useTurnDiffSummaries(activeThread);

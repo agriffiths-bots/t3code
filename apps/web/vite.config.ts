@@ -5,6 +5,8 @@ import { tanstackRouter } from "@tanstack/router-plugin/vite";
 import { defineProject, type TestProjectInlineConfiguration } from "vite-plus/test/config";
 import "vite-plus/test/config";
 import { defineConfig } from "vite-plus";
+import { normalizeBuildVersion } from "@t3tools/shared/semver";
+import type { Plugin } from "vite";
 import pkg from "./package.json" with { type: "json" };
 
 import { loadRepoEnv } from "../../scripts/lib/public-config";
@@ -22,7 +24,10 @@ const configuredRelayTracingUrl = repoEnv.VITE_RELAY_OTLP_TRACES_URL?.trim() || 
 const configuredRelayTracingDataset = repoEnv.VITE_RELAY_OTLP_TRACES_DATASET?.trim() || "";
 const configuredRelayTracingToken = repoEnv.VITE_RELAY_OTLP_TRACES_TOKEN?.trim() || "";
 const configuredHostedAppChannel = process.env.VITE_HOSTED_APP_CHANNEL?.trim() || "";
-const configuredAppVersion = process.env.APP_VERSION?.trim() || pkg.version;
+const configuredAppVersion =
+  normalizeBuildVersion(process.env.APP_VERSION) ??
+  normalizeBuildVersion(process.env.T3CODE_BUILD_VERSION) ??
+  pkg.version;
 const configuredAppBuildSha = (() => {
   const buildSha = process.env.T3CODE_BUILD_SHA?.trim() ?? "";
   return /^[0-9a-f]{40}$/i.test(buildSha) ? buildSha.toLowerCase() : "";
@@ -43,6 +48,19 @@ const configuredHostedAppUrl = (() => {
 const sourcemapEnv = process.env.T3CODE_WEB_SOURCEMAP?.trim().toLowerCase();
 const desktopPackageBuildEnv = process.env.T3CODE_DESKTOP_PACKAGE?.trim().toLowerCase();
 const desktopPackageBuild = desktopPackageBuildEnv === "1" || desktopPackageBuildEnv === "true";
+const buildIdentityPlugin: Plugin = {
+  name: "t3-build-identity",
+  generateBundle() {
+    this.emitFile({
+      type: "asset",
+      fileName: "build-identity.json",
+      source: `${JSON.stringify({
+        buildSha: configuredAppBuildSha,
+        buildVersion: configuredAppVersion,
+      })}\n`,
+    });
+  },
+};
 
 // Vite 8.1's experimental bundled dev mode: serves rolldown-bundled chunks in
 // dev for much faster startup/reload on large module graphs, with HMR served
@@ -111,6 +129,7 @@ const devProxyTarget = resolveDevProxyTarget(configuredWsUrl);
 export default defineConfig(() => {
   return {
     plugins: [
+      buildIdentityPlugin,
       tanstackRouter(),
       react(),
       babel({

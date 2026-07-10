@@ -1575,6 +1575,15 @@ describe("deriveTimelineEntries", () => {
           streaming: false,
         },
         {
+          id: MessageId.make("assistant-same-boundary-turn-2"),
+          role: "assistant",
+          text: "second response sharing the request timestamp",
+          createdAt: "2026-02-23T00:01:00.000Z",
+          turnId: TurnId.make("turn-2"),
+          updatedAt: "2026-02-23T00:01:01.600Z",
+          streaming: false,
+        },
+        {
           id: MessageId.make("user-turn-2"),
           role: "user",
           text: "second prompt",
@@ -1586,6 +1595,8 @@ describe("deriveTimelineEntries", () => {
       ],
       [],
       [],
+      [{ turnId: TurnId.make("turn-1"), requestedAt: "2026-02-23T00:00:00.000Z" }],
+      { turnId: TurnId.make("turn-2"), requestedAt: "2026-02-23T00:01:00.000Z" },
     );
 
     expect(entries.map((entry) => entry.id)).toEqual([
@@ -1593,8 +1604,173 @@ describe("deriveTimelineEntries", () => {
       "assistant-turn-1",
       "user-turn-2",
       "assistant-reused-segment-turn-2",
+      "assistant-same-boundary-turn-2",
     ]);
   });
+
+  it("prefers the latest-turn request boundary over a stale matching history row", () => {
+    const turnId = TurnId.make("turn-reconnected");
+    const entries = deriveTimelineEntries(
+      [
+        {
+          id: MessageId.make("user-reconnected"),
+          role: "user",
+          text: "resume after reconnect",
+          createdAt: "2026-02-23T00:01:00.000Z",
+          turnId,
+          updatedAt: "2026-02-23T00:01:00.000Z",
+          streaming: false,
+        },
+        {
+          id: MessageId.make("assistant-reconnected-stale-segment"),
+          role: "assistant",
+          text: "replayed segment with its original timestamp",
+          createdAt: "2026-02-23T00:00:30.000Z",
+          turnId,
+          updatedAt: "2026-02-23T00:01:01.000Z",
+          streaming: false,
+        },
+      ],
+      [],
+      [],
+      [{ turnId, requestedAt: "2026-02-23T00:00:00.000Z" }],
+      { turnId, requestedAt: "2026-02-23T00:01:00.000Z" },
+    );
+
+    expect(entries.map((entry) => entry.id)).toEqual([
+      "user-reconnected",
+      "assistant-reconnected-stale-segment",
+    ]);
+  });
+
+  it("does not infer a turn-start boundary from a historical Claude steer", () => {
+    const historicalTurnId = TurnId.make("turn-history-gap");
+    const entries = deriveTimelineEntries(
+      [
+        {
+          id: MessageId.make("assistant-before-history-gap-steer"),
+          role: "assistant",
+          text: "output before steer",
+          createdAt: "2026-02-23T00:00:30.000Z",
+          turnId: historicalTurnId,
+          updatedAt: "2026-02-23T00:00:30.000Z",
+          streaming: false,
+        },
+        {
+          id: MessageId.make("user-history-gap-steer"),
+          role: "user",
+          text: "historical steer",
+          createdAt: "2026-02-23T00:01:00.000Z",
+          turnId: historicalTurnId,
+          updatedAt: "2026-02-23T00:01:00.000Z",
+          streaming: false,
+        },
+        {
+          id: MessageId.make("assistant-after-history-gap-steer"),
+          role: "assistant",
+          text: "output after steer",
+          createdAt: "2026-02-23T00:01:30.000Z",
+          turnId: historicalTurnId,
+          updatedAt: "2026-02-23T00:01:30.000Z",
+          streaming: false,
+        },
+      ],
+      [],
+      [],
+      [],
+      {
+        turnId: TurnId.make("turn-current"),
+        requestedAt: "2026-02-23T00:02:00.000Z",
+      },
+    );
+
+    expect(entries.map((entry) => entry.id)).toEqual([
+      "assistant-before-history-gap-steer",
+      "user-history-gap-steer",
+      "assistant-after-history-gap-steer",
+    ]);
+  });
+
+  it.each([
+    ["Codex", null, "2026-07-10T08:00:01.000Z", "2026-07-10T08:00:01.000Z", true],
+    [
+      "Claude",
+      TurnId.make("turn-active"),
+      "2026-07-10T08:00:01.000Z",
+      "2026-07-10T08:00:01.000Z",
+      true,
+    ],
+    [
+      "Claude with a spanning assistant segment",
+      TurnId.make("turn-active"),
+      "2026-07-10T08:00:01.000Z",
+      "2026-07-10T08:00:04.000Z",
+      false,
+    ],
+    [
+      "Claude with a rebound assistant segment",
+      TurnId.make("turn-active"),
+      "2026-07-10T08:00:00.250Z",
+      "2026-07-10T08:00:04.000Z",
+      false,
+    ],
+  ] as const)(
+    "keeps a %s mid-turn message before the same turn's continuing output",
+    (_provider, injectedTurnId, assistantCreatedAt, assistantUpdatedAt, includeFirstWork) => {
+      const activeTurnId = TurnId.make("turn-active");
+      const message = (
+        id: string,
+        role: "user" | "assistant",
+        createdAt: string,
+        turnId: TurnId | null,
+        updatedAt = createdAt,
+      ) => ({
+        id: MessageId.make(id),
+        role,
+        text: id,
+        createdAt,
+        turnId,
+        updatedAt,
+        streaming: false,
+      });
+      const work = (id: string, createdAt: string) => ({
+        id,
+        turnId: activeTurnId,
+        createdAt,
+        label: id,
+        tone: "tool" as const,
+      });
+      const entries = deriveTimelineEntries(
+        [
+          message("user-initial", "user", "2026-07-10T08:00:00.000Z", null),
+          message(
+            "assistant-before-steer",
+            "assistant",
+            assistantCreatedAt,
+            activeTurnId,
+            assistantUpdatedAt,
+          ),
+          message("user-mid-turn", "user", "2026-07-10T08:00:03.000Z", injectedTurnId),
+          message("assistant-after-steer", "assistant", "2026-07-10T08:00:04.000Z", activeTurnId),
+        ],
+        [],
+        [
+          ...(includeFirstWork ? [work("work-before-steer", "2026-07-10T08:00:02.000Z")] : []),
+          work("work-after-steer", "2026-07-10T08:00:05.000Z"),
+        ],
+        [{ turnId: activeTurnId, requestedAt: "2026-07-10T08:00:00.500Z" }],
+      );
+
+      expect(entries.map((entry) => entry.id)).toEqual([
+        "user-initial",
+        "assistant-before-steer",
+        ...(includeFirstWork ? ["work-before-steer"] : []),
+        "user-mid-turn",
+        "assistant-after-steer",
+        "work-after-steer",
+      ]);
+    },
+  );
 
   it("exposes a running-turn assistant message-sent event immediately", () => {
     const threadId = ThreadId.make("thread-live-assistant");

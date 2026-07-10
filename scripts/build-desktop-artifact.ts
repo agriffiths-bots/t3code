@@ -79,6 +79,14 @@ const decodeWorkspaceConfig = Schema.decodeEffect(fromYaml(WorkspaceConfig));
 const decodeNodePtyManifest = Schema.decodeUnknownEffect(
   Schema.fromJsonString(Schema.Struct({ version: Schema.String })),
 );
+const decodeBundledClientBuildIdentity = Schema.decodeUnknownEffect(
+  Schema.fromJsonString(
+    Schema.Struct({
+      buildSha: Schema.String,
+      buildVersion: Schema.String,
+    }),
+  ),
+);
 const encodeStageWorkspaceConfig = Schema.encodeEffect(fromYaml(StageWorkspaceConfig));
 
 const readWorkspaceConfig = Effect.fn("readWorkspaceConfig")(function* () {
@@ -272,6 +280,32 @@ export class BundledClientAssetsMissingError extends Schema.TaggedErrorClass<Bun
     const preview = this.missingFiles.slice(0, 6).join(", ");
     const suffix = this.missingFiles.length > 6 ? ` (+${this.missingFiles.length - 6} more)` : "";
     return `Bundled client references missing files in ${this.indexPath}: ${preview}${suffix}. Rebuild web/server artifacts.`;
+  }
+}
+
+export class BundledClientBuildStampMissingError extends Schema.TaggedErrorClass<BundledClientBuildStampMissingError>()(
+  "BundledClientBuildStampMissingError",
+  {
+    clientDir: Schema.String,
+    identityPath: Schema.String,
+    expectedBuildSha: Schema.String,
+    expectedBuildVersion: Schema.String,
+  },
+) {
+  override get message(): string {
+    return `Bundled client in ${this.clientDir} does not contain build identity ${this.expectedBuildVersion}@${this.expectedBuildSha}. Rebuild it with T3CODE_BUILD_SHA and T3CODE_BUILD_VERSION set.`;
+  }
+}
+
+export class DesktopBuildShaResolutionError extends Schema.TaggedErrorClass<DesktopBuildShaResolutionError>()(
+  "DesktopBuildShaResolutionError",
+  {
+    configuredValue: Schema.String,
+    gitCommitHash: Schema.String,
+  },
+) {
+  override get message(): string {
+    return "Desktop artifacts require a full 40-character T3CODE_BUILD_SHA or a resolvable git HEAD.";
   }
 }
 
@@ -482,7 +516,7 @@ const spawnAndCollectOutput = Effect.fn("spawnAndCollectOutput")(function* (
 
 const resolveGitCommitHash = Effect.fn("resolveGitCommitHash")(function* (repoRoot: string) {
   const result = yield* spawnAndCollectOutput(
-    ChildProcess.make("git", ["rev-parse", "--short=12", "HEAD"], {
+    ChildProcess.make("git", ["rev-parse", "HEAD"], {
       cwd: repoRoot,
     }),
   ).pipe(
@@ -502,6 +536,11 @@ const resolveGitCommitHash = Effect.fn("resolveGitCommitHash")(function* (repoRo
   }
   return hash.toLowerCase();
 });
+
+function normalizeFullBuildSha(value: string | undefined): string | undefined {
+  const trimmed = value?.trim() ?? "";
+  return /^[0-9a-f]{40}$/i.test(trimmed) ? trimmed.toLowerCase() : undefined;
+}
 
 const resolvePythonForNodeGyp = Effect.fn("resolvePythonForNodeGyp")(function* () {
   const fs = yield* FileSystem.FileSystem;
@@ -644,9 +683,19 @@ export const DESKTOP_ASAR_UNPACK = [
 
 export function createDesktopPackageBuildEnv(
   env: NodeJS.ProcessEnv = process.env,
+  buildIdentity?: {
+    readonly buildSha: string;
+    readonly buildVersion: string;
+  },
 ): NodeJS.ProcessEnv {
   return {
     ...env,
+    ...(buildIdentity
+      ? {
+          T3CODE_BUILD_SHA: buildIdentity.buildSha,
+          T3CODE_BUILD_VERSION: buildIdentity.buildVersion,
+        }
+      : {}),
     ...DESKTOP_PACKAGE_BUILD_ENV,
   };
 }
@@ -1415,41 +1464,61 @@ function stageWindowsIcons(stageResourcesDir: string, sourceIco: string) {
   });
 }
 
-function validateBundledClientAssets(clientDir: string) {
-  return Effect.gen(function* () {
-    const fs = yield* FileSystem.FileSystem;
-    const path = yield* Path.Path;
-    const indexPath = path.join(clientDir, "index.html");
-    const indexHtml = yield* fs.readFileString(indexPath);
-    const refs = [...indexHtml.matchAll(/\b(?:src|href)=["']([^"']+)["']/g)]
-      .map((match) => match[1])
-      .filter((value): value is string => value !== undefined);
-    const missing: string[] = [];
+export const validateBundledClientAssets = Effect.fn("validateBundledClientAssets")(function* (
+  clientDir: string,
+  expectedBuildSha: string,
+  expectedBuildVersion: string,
+) {
+  const fs = yield* FileSystem.FileSystem;
+  const path = yield* Path.Path;
+  const indexPath = path.join(clientDir, "index.html");
+  const indexHtml = yield* fs.readFileString(indexPath);
+  const refs = [...indexHtml.matchAll(/\b(?:src|href)=["']([^"']+)["']/g)]
+    .map((match) => match[1])
+    .filter((value): value is string => value !== undefined);
+  const missing: string[] = [];
 
-    for (const ref of refs) {
-      const normalizedRef = ref.split("#")[0]?.split("?")[0] ?? "";
-      if (!normalizedRef) continue;
-      if (normalizedRef.startsWith("http://") || normalizedRef.startsWith("https://")) continue;
-      if (normalizedRef.startsWith("data:") || normalizedRef.startsWith("mailto:")) continue;
+  for (const ref of refs) {
+    const normalizedRef = ref.split("#")[0]?.split("?")[0] ?? "";
+    if (!normalizedRef) continue;
+    if (normalizedRef.startsWith("http://") || normalizedRef.startsWith("https://")) continue;
+    if (normalizedRef.startsWith("data:") || normalizedRef.startsWith("mailto:")) continue;
 
-      const ext = path.extname(normalizedRef);
-      if (!ext) continue;
+    const ext = path.extname(normalizedRef);
+    if (!ext) continue;
 
-      const relativePath = normalizedRef.replace(/^\/+/, "");
-      const assetPath = path.join(clientDir, relativePath);
-      if (!(yield* fs.exists(assetPath))) {
-        missing.push(normalizedRef);
-      }
+    const relativePath = normalizedRef.replace(/^\/+/, "");
+    const assetPath = path.join(clientDir, relativePath);
+    if (!(yield* fs.exists(assetPath))) {
+      missing.push(normalizedRef);
     }
+  }
 
-    if (missing.length > 0) {
-      return yield* new BundledClientAssetsMissingError({
-        indexPath,
-        missingFiles: missing,
-      });
-    }
+  if (missing.length > 0) {
+    return yield* new BundledClientAssetsMissingError({
+      indexPath,
+      missingFiles: missing,
+    });
+  }
+
+  const identityPath = path.join(clientDir, "build-identity.json");
+  const invalidBuildIdentity = new BundledClientBuildStampMissingError({
+    clientDir,
+    identityPath,
+    expectedBuildSha,
+    expectedBuildVersion,
   });
-}
+  const buildIdentity = yield* fs.readFileString(identityPath).pipe(
+    Effect.flatMap(decodeBundledClientBuildIdentity),
+    Effect.mapError(() => invalidBuildIdentity),
+  );
+  if (
+    buildIdentity.buildSha !== expectedBuildSha ||
+    buildIdentity.buildVersion !== expectedBuildVersion
+  ) {
+    return yield* invalidBuildIdentity;
+  }
+});
 
 export function resolveDesktopRuntimeDependencies(
   dependencies: Record<string, string> | undefined,
@@ -1836,6 +1905,17 @@ const buildDesktopArtifact = Effect.fn("buildDesktopArtifact")(function* (
   const appVersion = options.version ?? serverPackageJson.version;
   const iconAssets = resolveDesktopBuildIconAssets(appVersion);
   const commitHash = yield* resolveGitCommitHash(repoRoot);
+  const configuredBuildSha = process.env.T3CODE_BUILD_SHA?.trim() ?? "";
+  const buildSha = normalizeFullBuildSha(configuredBuildSha) ?? normalizeFullBuildSha(commitHash);
+  if (
+    buildSha === undefined ||
+    (configuredBuildSha && buildSha !== configuredBuildSha.toLowerCase())
+  ) {
+    return yield* new DesktopBuildShaResolutionError({
+      configuredValue: configuredBuildSha,
+      gitCommitHash: commitHash,
+    });
+  }
   const mkdir = options.keepStage ? fs.makeTempDirectory : fs.makeTempDirectoryScoped;
   const createdStageRoot = yield* mkdir({
     prefix: `t3code-desktop-${options.platform}-stage-`,
@@ -1855,7 +1935,10 @@ const buildDesktopArtifact = Effect.fn("buildDesktopArtifact")(function* (
 
   if (!options.skipBuild) {
     yield* Effect.log("[desktop-artifact] Building desktop/server/web artifacts...");
-    const packageBuildEnv = createDesktopPackageBuildEnv();
+    const packageBuildEnv = createDesktopPackageBuildEnv(process.env, {
+      buildSha,
+      buildVersion: appVersion,
+    });
     const spawnCommand = yield* resolveSpawnCommand("vp", ["run", "build:desktop"], {
       env: packageBuildEnv,
     });
@@ -1891,7 +1974,7 @@ const buildDesktopArtifact = Effect.fn("buildDesktopArtifact")(function* (
     });
   }
 
-  yield* validateBundledClientAssets(path.dirname(bundledClientEntry));
+  yield* validateBundledClientAssets(path.dirname(bundledClientEntry), buildSha, appVersion);
 
   yield* fs.makeDirectory(path.join(stageAppDir, "apps/desktop"), { recursive: true });
   yield* fs.makeDirectory(path.join(stageAppDir, "apps/server"), { recursive: true });
@@ -1989,7 +2072,7 @@ const buildDesktopArtifact = Effect.fn("buildDesktopArtifact")(function* (
     name: "t3code",
     version: appVersion,
     buildVersion: appVersion,
-    t3codeCommitHash: commitHash,
+    t3codeCommitHash: commitHash === "unknown" ? commitHash : commitHash.slice(0, 12),
     private: true,
     packageManager: rootPackageJson.packageManager,
     description: "T3 Code desktop build",
