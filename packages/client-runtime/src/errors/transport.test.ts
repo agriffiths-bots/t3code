@@ -82,12 +82,72 @@ describe("sanitizeThreadErrorMessage", () => {
     expect(sanitizeThreadErrorMessage("SocketCloseError: oops")).toBeNull();
   });
 
-  it("replaces raw Claude interrupted-turn diagnostics with friendly copy", () => {
+  it("suppresses Claude non-error steer diagnostics to avoid duplicate retry advice", () => {
     expect(
       sanitizeThreadErrorMessage(
         "[ede_diagnostic] result_type=user last_content_type=n/a stop_reason=tool_use",
+        { turnState: "interrupted" },
+      ),
+    ).toBeNull();
+    expect(
+      sanitizeThreadErrorMessage("[ede_diagnostic] turn aborted (steer) stop_reason=tool_use", {
+        turnState: "interrupted",
+      }),
+    ).toBeNull();
+  });
+
+  it("preserves steer-shaped diagnostics for failed Claude turns", () => {
+    const errors = [
+      "[ede_diagnostic] result_type=user last_content_type=n/a stop_reason=tool_use",
+      [
+        "[ede_diagnostic] result_type=user last_content_type=n/a stop_reason=tool_use",
+        "Claude execution failed after the steer boundary.",
+      ].join("\n"),
+      "[ede_diagnostic] result_type=user last_content_type=n/a stop_reason=tool_use Claude execution failed",
+    ];
+    for (const error of errors) {
+      expect(sanitizeThreadErrorMessage(error, { turnState: "error" })).toBe(error);
+    }
+  });
+
+  it("does not suppress a steer diagnostic with a companion error", () => {
+    const error = [
+      "[ede_diagnostic] result_type=user last_content_type=n/a stop_reason=tool_use",
+      "Claude execution failed after the steer boundary.",
+    ].join("\n");
+    expect(sanitizeThreadErrorMessage(error, { turnState: "interrupted" })).toBe(
+      INTERRUPTED_TURN_ERROR_MESSAGE,
+    );
+    expect(
+      sanitizeThreadErrorMessage(
+        "[ede_diagnostic] result_type=user last_content_type=n/a stop_reason=tool_use Claude execution failed",
+        { turnState: "interrupted" },
       ),
     ).toBe(INTERRUPTED_TURN_ERROR_MESSAGE);
+  });
+
+  it("does not suppress near-miss Claude diagnostics", () => {
+    expect(
+      sanitizeThreadErrorMessage(
+        "[ede_diagnostic] result_type=assistant last_content_type=text stop_reason=tool_use",
+      ),
+    ).toBe(INTERRUPTED_TURN_ERROR_MESSAGE);
+    expect(sanitizeThreadErrorMessage("[ede_diagnostic] result_type=user status=failed")).toBe(
+      "[ede_diagnostic] result_type=user status=failed",
+    );
+    expect(
+      sanitizeThreadErrorMessage("[ede_diagnostic] turn aborted (quota) stop_reason=tool_use", {
+        turnState: "interrupted",
+      }),
+    ).toBe(INTERRUPTED_TURN_ERROR_MESSAGE);
+    expect(
+      sanitizeThreadErrorMessage("[ede_diagnostic] turn aborted (steer) stop_reason=error", {
+        turnState: "interrupted",
+      }),
+    ).toBe("[ede_diagnostic] turn aborted (steer) stop_reason=error");
+  });
+
+  it("retains friendly copy for explicit Claude request aborts", () => {
     expect(sanitizeThreadErrorMessage("Error: Request was aborted.")).toBe(
       INTERRUPTED_TURN_ERROR_MESSAGE,
     );
