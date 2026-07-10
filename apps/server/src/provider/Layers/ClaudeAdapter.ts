@@ -307,6 +307,26 @@ function resultErrorsText(result: SDKResultMessage): string {
     : "";
 }
 
+function isClaudeUserSteerAbortDiagnostic(error: string): boolean {
+  const lines = error
+    .split(/\r?\n/u)
+    .map((line) => line.trim().toLowerCase())
+    .filter((line) => line.length > 0);
+  return (
+    lines.length === 1 &&
+    lines.every(
+      (line) =>
+        /^\[ede_diagnostic\]\s+result_type=user\s+last_content_type=\S+\s+stop_reason=tool_use$/u.test(
+          line,
+        ) || /^\[ede_diagnostic\]\s+turn aborted\s+\([^\r\n)]*\)\s+stop_reason=\S+$/u.test(line),
+    )
+  );
+}
+
+function isClaudeUserSteerAbortDiagnosticCandidate(error: string): boolean {
+  return /\[ede_diagnostic\]\s+(?:result_type=user\b|turn aborted\b)/u.test(error.toLowerCase());
+}
+
 function isTaskNotificationResult(result: SDKResultMessage | undefined): boolean {
   const origin = (result as { readonly origin?: unknown } | undefined)?.origin;
   return (
@@ -396,6 +416,16 @@ function isInterruptedResult(result: SDKResultMessage): boolean {
   const errors = resultErrorsText(result);
   if (errors.includes("interrupt")) {
     return true;
+  }
+
+  if (
+    result.subtype === "error_during_execution" &&
+    // The SDK types this flag as boolean. Keep the non-error boundary: the same
+    // diagnostic text also appears on genuine is_error=true execution failures.
+    result.is_error === false &&
+    result.errors.some(isClaudeUserSteerAbortDiagnosticCandidate)
+  ) {
+    return result.errors.length === 1 && result.errors.every(isClaudeUserSteerAbortDiagnostic);
   }
 
   return (

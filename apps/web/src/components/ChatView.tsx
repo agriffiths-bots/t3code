@@ -1637,7 +1637,9 @@ function ChatViewContent(props: ChatViewProps) {
   );
   const isServerThread = routeKind === "server" && serverThread !== null;
   const activeThread = isServerThread ? serverThread : localDraftThread;
-  const serverThreadSessionError = sanitizeThreadErrorMessage(serverThread?.session?.lastError);
+  const serverThreadSessionError = sanitizeThreadErrorMessage(serverThread?.session?.lastError, {
+    turnState: serverThread?.latestTurn?.state ?? null,
+  });
   const serverThreadSessionErrorTurnId = serverThread?.latestTurn?.turnId ?? null;
   const threadError = isServerThread
     ? resolveVisibleServerThreadError({
