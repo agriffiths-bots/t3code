@@ -6,6 +6,7 @@ import {
   ThreadId,
   type OrchestrationEvent,
   type OrchestrationReadModel,
+  type OrchestrationSession,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
@@ -99,12 +100,39 @@ const lifecycleEvent = (type: "thread.deleted" | "thread.archived"): Orchestrati
         payload: { threadId: THREAD_ID, archivedAt: NOW, updatedAt: NOW },
       };
 
+const stoppedSessionEvent = (): OrchestrationEvent =>
+  ({
+    sequence: 3,
+    eventId: EventId.make("event-owned-worktree-stopped"),
+    aggregateKind: "thread",
+    aggregateId: THREAD_ID,
+    type: "thread.session-set",
+    occurredAt: NOW,
+    commandId: CommandId.make("command-owned-worktree-stopped"),
+    causationEventId: null,
+    correlationId: CommandId.make("command-owned-worktree-stopped"),
+    metadata: {},
+    payload: {
+      threadId: THREAD_ID,
+      session: {
+        threadId: THREAD_ID,
+        status: "stopped",
+        providerName: null,
+        runtimeMode: "full-access",
+        activeTurnId: null,
+        lastError: null,
+        updatedAt: NOW,
+      },
+    },
+  }) as OrchestrationEvent;
+
 async function createHarness(input: {
   readonly snapshot: OrchestrationReadModel;
   readonly pathExists: boolean;
   readonly closeFails?: boolean;
   readonly dirty?: boolean;
   readonly persistedEvents?: ReadonlyArray<OrchestrationEvent>;
+  readonly projectedSessionStatus?: OrchestrationSession["status"];
   readonly projectIsRepo?: boolean;
   readonly projectRootExists?: boolean;
   readonly pruneFailuresBeforeSuccess?: number;
@@ -128,9 +156,9 @@ async function createHarness(input: {
           operations.push("prune");
         });
   });
-  const dispatch = vi.fn(() =>
+  const dispatch = vi.fn((command: { readonly type: string; readonly commandId?: string }) =>
     Effect.sync(() => {
-      operations.push("metadata");
+      operations.push(command.type === "thread.meta.update" ? "metadata" : command.type);
       return { sequence: 3 };
     }),
   );
@@ -164,7 +192,17 @@ async function createHarness(input: {
               Option.some({
                 id: THREAD_ID,
                 archivedAt: input.snapshot.threads[0]?.archivedAt ?? null,
-                session: null,
+                session: input.projectedSessionStatus
+                  ? {
+                      threadId: THREAD_ID,
+                      status: input.projectedSessionStatus,
+                      providerName: "codex",
+                      runtimeMode: "full-access",
+                      activeTurnId: null,
+                      lastError: null,
+                      updatedAt: NOW,
+                    }
+                  : null,
               } as never),
             ),
         } as never),
@@ -211,6 +249,7 @@ async function createHarness(input: {
   await runtime.runPromise(Effect.yieldNow);
 
   return {
+    closeTerminal,
     dispatch,
     invalidateLocalStatus,
     operations,
@@ -336,6 +375,74 @@ describe("ThreadDeletionReactor owned worktree lifecycle", () => {
         "metadata",
       ]);
       expect(harness.operations.at(-1)).toBe("metadata");
+    } finally {
+      await harness.dispose();
+    }
+  });
+
+  it("waits for a projected live archive session to stop before removal", async () => {
+    const harness = await createHarness({
+      snapshot: snapshot({ archived: true }),
+      pathExists: true,
+      projectedSessionStatus: "ready",
+    });
+    try {
+      await harness.run(lifecycleEvent("thread.archived"));
+
+      expect(harness.dispatch).toHaveBeenCalledWith(
+        expect.objectContaining({ type: "thread.session.stop", threadId: THREAD_ID }),
+      );
+      expect(harness.removeWorktree).not.toHaveBeenCalled();
+
+      await harness.sleep(400);
+      await harness.drain();
+      expect(harness.dispatch.mock.calls).toEqual(
+        expect.arrayContaining([
+          [expect.objectContaining({ type: "thread.session.stop", threadId: THREAD_ID })],
+          [expect.objectContaining({ type: "thread.session.stop", threadId: THREAD_ID })],
+        ]),
+      );
+      const stopCommandIds = harness.dispatch.mock.calls
+        .map(([command]) => command)
+        .filter((command) => command.type === "thread.session.stop")
+        .map((command) => command.commandId);
+      expect(new Set(stopCommandIds).size).toBe(stopCommandIds.length);
+      expect(harness.removeWorktree).not.toHaveBeenCalled();
+    } finally {
+      await harness.dispose();
+    }
+  });
+
+  it("removes an archived owned root whose projected session is already errored", async () => {
+    const harness = await createHarness({
+      snapshot: snapshot({ archived: true }),
+      pathExists: true,
+      projectedSessionStatus: "error",
+    });
+    try {
+      await harness.run(lifecycleEvent("thread.archived"));
+
+      expect(harness.dispatch).not.toHaveBeenCalledWith(
+        expect.objectContaining({ type: "thread.session.stop" }),
+      );
+      expect(harness.removeWorktree).toHaveBeenCalledOnce();
+    } finally {
+      await harness.dispose();
+    }
+  });
+
+  it("deletes terminal history when a stopped event finishes deleted-thread teardown", async () => {
+    const harness = await createHarness({
+      snapshot: snapshot({ deleted: true }),
+      pathExists: false,
+    });
+    try {
+      await harness.run(stoppedSessionEvent());
+
+      expect(harness.closeTerminal).toHaveBeenCalledWith({
+        threadId: THREAD_ID,
+        deleteHistory: true,
+      });
     } finally {
       await harness.dispose();
     }

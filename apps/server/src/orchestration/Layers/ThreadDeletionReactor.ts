@@ -263,8 +263,7 @@ const make = Effect.gen(function* () {
               ? {
                   _tag: "Current",
                   session: thread.session,
-                  projectedSessionLive:
-                    thread.session !== null && thread.session.status !== "stopped",
+                  projectedSessionLive: isSessionLive(thread.session?.status ?? null),
                 }
               : { _tag: "Stale" },
         }),
@@ -299,6 +298,7 @@ const make = Effect.gen(function* () {
   const sessionStopCommandIdForArchive = (
     event: ThreadArchivedEvent,
     source: ThreadCleanupEventSource,
+    teardownRetry: number,
   ) =>
     source === "replay"
       ? Effect.succeed(
@@ -306,15 +306,22 @@ const make = Effect.gen(function* () {
             `session-stop-for-archive-replay:${event.eventId}:${NodeCrypto.randomUUID()}`,
           ),
         )
-      : Effect.succeed(CommandId.make(`session-stop-for-archive:${event.eventId}`));
+      : Effect.succeed(
+          CommandId.make(
+            teardownRetry === 0
+              ? `session-stop-for-archive:${event.eventId}`
+              : `session-stop-for-archive:${event.eventId}:retry:${teardownRetry}`,
+          ),
+        );
 
   const dispatchSessionStopForArchive = Effect.fn("dispatchSessionStopForArchive")(function* (
     event: ThreadArchivedEvent,
     source: ThreadCleanupEventSource,
+    teardownRetry: number,
   ) {
     yield* orchestrationEngine.dispatch({
       type: "thread.session.stop",
-      commandId: yield* sessionStopCommandIdForArchive(event, source),
+      commandId: yield* sessionStopCommandIdForArchive(event, source, teardownRetry),
       threadId: event.payload.threadId,
       createdAt: event.occurredAt,
     });
@@ -406,7 +413,7 @@ const make = Effect.gen(function* () {
     }
 
     if (event.type === "thread.session-set") {
-      yield* closeThreadTerminals(candidate.threadId, false);
+      yield* closeThreadTerminals(candidate.threadId, candidate.force);
     }
     if ((yield* resolveRuntimeSession(candidate.threadId)) !== undefined) {
       return yield* new WorktreeLifecycleTeardownError({
@@ -548,7 +555,12 @@ const make = Effect.gen(function* () {
           runtimeSession,
         });
       } else {
-        yield* dispatchSessionStopForArchive(event, source);
+        yield* dispatchSessionStopForArchive(event, source, item.teardownRetries);
+        yield* closeThreadTerminals(event.payload.threadId, false);
+        return yield* new WorktreeLifecycleTeardownError({
+          threadId: event.payload.threadId,
+          detail: "Archived provider session has not reached a terminal state after stop dispatch.",
+        });
       }
     }
     yield* closeThreadTerminals(event.payload.threadId, false);
