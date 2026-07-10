@@ -20,6 +20,7 @@ import { EditorId } from "./editor.ts";
 import { ModelCapabilities } from "./model.ts";
 import { ProviderDriverKind, ProviderInstanceId } from "./providerInstance.ts";
 import { ServerSettings } from "./settings.ts";
+import { PlanUsageSnapshotSchema } from "./planUsage.ts";
 
 const KeybindingsMalformedConfigIssue = Schema.Struct({
   kind: Schema.Literal("keybindings.malformed-config"),
@@ -522,6 +523,7 @@ export const ServerConfig = Schema.Struct({
   keybindings: ResolvedKeybindingsConfig,
   issues: ServerConfigIssues,
   providers: ServerProviders,
+  planUsage: Schema.optional(PlanUsageSnapshotSchema),
   availableEditors: Schema.Array(EditorId),
   observability: ServerObservability,
   settings: ServerSettings,
@@ -570,6 +572,7 @@ export type ServerConfigKeybindingsUpdatedPayload =
 
 export const ServerConfigProviderStatusesPayload = Schema.Struct({
   providers: ServerProviders,
+  planUsage: Schema.optional(PlanUsageSnapshotSchema),
 });
 export type ServerConfigProviderStatusesPayload = typeof ServerConfigProviderStatusesPayload.Type;
 

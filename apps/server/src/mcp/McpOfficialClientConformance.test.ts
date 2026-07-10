@@ -25,6 +25,7 @@ import { ProjectionSnapshotQuery } from "../orchestration/Services/ProjectionSna
 import { ProviderRegistry } from "../provider/Services/ProviderRegistry.ts";
 import { makeProviderRegistryMock } from "../provider/testUtils/providerRegistryMock.ts";
 import { ServerSettingsService } from "../serverSettings.ts";
+import * as PlanUsageSnapshot from "../usage/PlanUsageSnapshot.ts";
 import * as McpHttpServer from "./McpHttpServer.ts";
 import * as McpInvocationContext from "./McpInvocationContext.ts";
 import * as McpSessionRegistry from "./McpSessionRegistry.ts";
@@ -153,6 +154,12 @@ const conformanceLayer = McpHttpServer.layer.pipe(
   Layer.provide(PreviewAutomationBroker.layer.pipe(Layer.provide(NodeServices.layer))),
   Layer.provide(deviceNotificationsLayer),
   Layer.provide(ServerSettingsService.layerTest()),
+  Layer.provide(
+    PlanUsageSnapshot.layerTest({
+      updatedAt: "2026-07-10T08:00:00.000Z",
+      providers: [],
+    }),
+  ),
   Layer.provide(Layer.succeed(ProviderRegistry, makeProviderRegistryMock([makeProvider()]))),
   Layer.provide(projectionSnapshotQueryLayer),
 );

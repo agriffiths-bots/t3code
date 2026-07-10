@@ -95,6 +95,7 @@ import { makeManualOnlyProviderMaintenanceCapabilities } from "./provider/provid
 import * as ServerLifecycleEvents from "./serverLifecycleEvents.ts";
 import * as ServerRuntimeStartup from "./serverRuntimeStartup.ts";
 import * as ServerSettings from "./serverSettings.ts";
+import * as PlanUsageSnapshot from "./usage/PlanUsageSnapshot.ts";
 import * as TerminalManager from "./terminal/Manager.ts";
 import * as PreviewManager from "./preview/Manager.ts";
 import * as PortScanner from "./preview/PortScanner.ts";
@@ -567,6 +568,12 @@ const buildAppUnderTest = (options?: {
       disableListenLog: true,
       disableLogger: true,
     }).pipe(
+      Layer.provide(
+        PlanUsageSnapshot.layerTest({
+          updatedAt: "1970-01-01T00:00:00.000Z",
+          providers: [],
+        }),
+      ),
       Layer.provide(
         Layer.mock(Keybindings.Keybindings)({
           loadConfigState: Effect.succeed({
@@ -4597,6 +4604,10 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
         assert.deepEqual(first.config.keybindings, []);
         assert.deepEqual(first.config.issues, []);
         assert.deepEqual(first.config.providers, providers);
+        assert.deepEqual(first.config.planUsage, {
+          updatedAt: "1970-01-01T00:00:00.000Z",
+          providers: [],
+        });
         assert.equal(first.config.observability.logsDirectoryPath.endsWith("/logs"), true);
         assert.equal(first.config.observability.localTracingEnabled, true);
         assert.equal(first.config.observability.otlpTracesUrl, "http://localhost:4318/v1/traces");

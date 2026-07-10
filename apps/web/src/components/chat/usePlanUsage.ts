@@ -4,6 +4,7 @@ import {
   type PlanUsageSnapshot,
   type ProviderInstanceId,
 } from "@t3tools/contracts";
+import { useAtomValue } from "@effect/atom-react";
 import { ManagedRelay } from "@t3tools/client-runtime/relay";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
@@ -12,6 +13,7 @@ import { useEffect, useRef, useState } from "react";
 import { environmentCatalog } from "~/connection/catalog";
 import { runtime } from "~/lib/runtime";
 import { usePreparedConnection } from "~/state/session";
+import { serverEnvironment } from "~/state/server";
 import { useAtomCommand } from "~/state/use-atom-command";
 
 const decodePlanUsageSnapshot = Schema.decodeUnknownSync(PlanUsageSnapshotSchema);
@@ -115,6 +117,7 @@ export function usePlanUsage(
   environmentId: EnvironmentId | null,
   providerInstanceId: ProviderInstanceId | null,
 ): PlanUsageSnapshot | null {
+  const serverConfig = useAtomValue(serverEnvironment.configValueAtom(environmentId));
   const connection = usePreparedConnection(environmentId);
   const [snapshotState, setSnapshotState] = useState<{
     readonly key: string;
@@ -128,6 +131,10 @@ export function usePlanUsage(
   const requestedDpopRefreshKeyRef = useRef<string | null>(null);
 
   useEffect(() => {
+    if (connection._tag !== "None" && providerInstanceId === null && serverConfig?.planUsage) {
+      setSnapshotState(null);
+      return;
+    }
     if (connection._tag === "None") {
       setSnapshotState(null);
       return;
@@ -187,8 +194,11 @@ export function usePlanUsage(
       cancelled = true;
       window.clearInterval(interval);
     };
-  }, [connection, providerInstanceId, retryEnvironment]);
+  }, [connection, providerInstanceId, retryEnvironment, serverConfig?.planUsage]);
 
   const currentKey = planUsageConnectionKey(connection, providerInstanceId);
+  if (connection._tag !== "None" && providerInstanceId === null && serverConfig?.planUsage) {
+    return serverConfig.planUsage;
+  }
   return snapshotState && snapshotState.key === currentKey ? snapshotState.snapshot : null;
 }

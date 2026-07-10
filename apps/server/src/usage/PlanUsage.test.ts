@@ -11,7 +11,7 @@ import {
   type ServerSettings,
 } from "@t3tools/contracts";
 
-import { __testing, loadPlanUsageSnapshot } from "./PlanUsage.ts";
+import { __testing, loadPlanUsageSnapshot, scopePlanUsageSnapshot } from "./PlanUsage.ts";
 
 async function makeFakeCodexAppServer(input: {
   readonly rateLimitsResponse: unknown;
@@ -267,7 +267,7 @@ describe("PlanUsage", () => {
     });
   });
 
-  it("maps Codex app-server multi-bucket rate limits", () => {
+  it("filters Spark from Codex app-server multi-bucket rate limits", () => {
     const result = __testing.parseCodexRateLimitsResponse({
       rateLimits: {
         planType: "pro",
@@ -282,8 +282,8 @@ describe("PlanUsage", () => {
           secondary: { usedPercent: 44, resetsAt: 1783419037, windowDurationMins: 10080 },
         },
         spark: {
-          limitId: "spark",
-          limitName: "Spark",
+          limitId: "gpt-5.3-codex-spark",
+          limitName: "gpt-5.3 Codex Spark",
           planType: "pro",
           secondary: { usedPercent: 91, resetsAt: 1783419037, windowDurationMins: 10080 },
         },
@@ -293,14 +293,28 @@ describe("PlanUsage", () => {
     expect(result?.windows.map((window) => window.id)).toEqual([
       "codex-codex-five-hour",
       "codex-codex-weekly",
-      "codex-spark-weekly",
     ]);
-    expect(result?.windows.map((window) => window.title)).toEqual([
-      "Codex 5h (Codex)",
-      "Codex weekly (Codex)",
-      "Codex weekly (Spark)",
-    ]);
-    expect(result?.windows.map((window) => window.usedPercent)).toEqual([22, 44, 91]);
+    expect(result?.windows.map((window) => window.title)).toEqual(["Codex 5h", "Codex weekly"]);
+    expect(result?.windows.map((window) => window.usedPercent)).toEqual([22, 44]);
+  });
+
+  it("does not revive a Spark-only bucket through the legacy fallback", () => {
+    const result = __testing.parseCodexRateLimitsResponse({
+      rateLimits: {
+        planType: "pro",
+        secondary: { usedPercent: 91, resetsAt: 1783419037, windowDurationMins: 10080 },
+      },
+      rateLimitsByLimitId: {
+        spark: {
+          limitId: "gpt-5.3-codex-spark",
+          limitName: "gpt-5.3 Codex Spark",
+          planType: "pro",
+          secondary: { usedPercent: 91, resetsAt: 1783419037, windowDurationMins: 10080 },
+        },
+      },
+    });
+
+    expect(result).toBeNull();
   });
 
   it("reads Codex usage through the official app-server probe", async () => {
@@ -863,6 +877,61 @@ describe("PlanUsage", () => {
         { provider: "claude", instanceId: "claudeAgent", home: "/tmp/claude-default" },
       ],
     });
+  });
+
+  it("scopes a deduplicated probe result to every equivalent provider alias", () => {
+    const settings = {
+      ...DEFAULT_SERVER_SETTINGS,
+      providerInstances: {
+        claudeAgent: {
+          driver: "claudeAgent" as const,
+          enabled: true,
+          config: { homePath: "/shared/claude" },
+        },
+        claude_two: {
+          driver: "claudeAgent" as const,
+          enabled: true,
+          config: { homePath: "/shared/claude" },
+        },
+        claude_other: {
+          driver: "claudeAgent" as const,
+          enabled: true,
+          config: { homePath: "/other/claude" },
+        },
+      },
+    };
+    const scoped = scopePlanUsageSnapshot(
+      {
+        updatedAt: "2026-07-10T08:00:00.000Z",
+        providers: [
+          {
+            provider: "claude",
+            plan: "max",
+            windows: [
+              {
+                id: "claude:claudeAgent:claude-session-0",
+                provider: "claude",
+                kind: "session",
+                title: "Claude Session (claudeAgent)",
+                usedPercent: 20,
+                resetAt: null,
+                used: null,
+                limit: null,
+                unit: null,
+                severity: null,
+              },
+            ],
+          },
+        ],
+      },
+      ProviderInstanceId.make("claude_two"),
+      settings,
+    );
+
+    expect(scoped.providers[0]?.windows.map((window) => window.id)).toEqual([
+      "claude:claude_two:claude-session-0",
+    ]);
+    expect(scoped.providers[0]?.windows.map((window) => window.title)).toEqual(["Claude Session"]);
   });
 
   it("does not revive disabled default provider instances from legacy settings", () => {
