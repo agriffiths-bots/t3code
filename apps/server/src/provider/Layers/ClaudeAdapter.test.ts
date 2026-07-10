@@ -3590,63 +3590,178 @@ describe("ClaudeAdapterLive", () => {
     );
   });
 
-  it.effect("treats user-aborted Claude results as interrupted without a runtime error", () => {
-    const harness = makeHarness();
-    return Effect.gen(function* () {
-      const adapter = yield* ClaudeAdapter;
+  it.effect("treats Claude user-steer diagnostics as interrupted without a runtime error", () => {
+    const cases = [
+      {
+        isError: false,
+        error: "[ede_diagnostic] result_type=user last_content_type=n/a stop_reason=tool_use",
+        stopReason: "tool_use",
+        terminalReason: undefined,
+      },
+      {
+        isError: true,
+        error: "[ede_diagnostic] result_type=user last_content_type=n/a stop_reason=null",
+        stopReason: null,
+        terminalReason: "aborted_streaming",
+      },
+    ] as const;
 
-      const runtimeEventsFiber = yield* Stream.take(adapter.streamEvents, 6).pipe(
-        Stream.runCollect,
-        Effect.forkChild,
+    return Effect.forEach(cases, (testCase, index) => {
+      const harness = makeHarness();
+      return Effect.gen(function* () {
+        const adapter = yield* ClaudeAdapter;
+
+        const runtimeEventsFiber = yield* Stream.take(adapter.streamEvents, 6).pipe(
+          Stream.runCollect,
+          Effect.forkChild,
+        );
+
+        const session = yield* adapter.startSession({
+          threadId: THREAD_ID,
+          provider: ProviderDriverKind.make("claudeAgent"),
+          runtimeMode: "full-access",
+        });
+
+        const turn = yield* adapter.sendTurn({
+          threadId: session.threadId,
+          input: "hello",
+          attachments: [],
+        });
+
+        harness.query.emit({
+          type: "result",
+          subtype: "error_during_execution",
+          is_error: testCase.isError,
+          errors: [testCase.error],
+          stop_reason: testCase.stopReason,
+          ...(testCase.terminalReason ? { terminal_reason: testCase.terminalReason } : {}),
+          session_id: `sdk-session-abort-${index}`,
+          uuid: `result-abort-${index}`,
+        } as unknown as SDKMessage);
+
+        const runtimeEvents = Array.from(yield* Fiber.join(runtimeEventsFiber));
+        assert.deepEqual(
+          runtimeEvents.map((event) => event.type),
+          [
+            "session.started",
+            "session.configured",
+            "session.state.changed",
+            "turn.started",
+            "thread.started",
+            "turn.completed",
+          ],
+        );
+
+        const turnCompleted = runtimeEvents[runtimeEvents.length - 1];
+        assert.equal(turnCompleted?.type, "turn.completed");
+        if (turnCompleted?.type === "turn.completed") {
+          assert.equal(String(turnCompleted.turnId), String(turn.turnId));
+          assert.equal(turnCompleted.payload.state, "interrupted");
+          assert.equal(turnCompleted.payload.errorMessage, testCase.error);
+          assert.equal(turnCompleted.payload.stopReason, testCase.stopReason);
+        }
+
+        const sessions = yield* adapter.listSessions();
+        assert.equal(sessions[0]?.status, "ready");
+        assert.equal(sessions[0]?.lastError, undefined);
+      }).pipe(
+        Effect.provideService(Random.Random, makeDeterministicRandomService()),
+        Effect.provide(harness.layer),
       );
+    });
+  });
 
-      const session = yield* adapter.startSession({
-        threadId: THREAD_ID,
-        provider: ProviderDriverKind.make("claudeAgent"),
-        runtimeMode: "full-access",
-      });
+  it.effect("keeps genuine Claude execution errors failed", () => {
+    const cases = [
+      {
+        isError: true,
+        error: "Claude execution failed while invoking a tool.",
+        stopReason: "tool_use",
+        terminalReason: undefined,
+      },
+      {
+        isError: false,
+        error: "[ede_diagnostic] result_type=user status=failed",
+        stopReason: null,
+        terminalReason: undefined,
+      },
+      {
+        isError: true,
+        error: "[ede_diagnostic] result_type=user last_content_type=n/a stop_reason=null",
+        stopReason: null,
+        terminalReason: "model_error",
+      },
+    ] as const;
 
-      const turn = yield* adapter.sendTurn({
-        threadId: session.threadId,
-        input: "hello",
-        attachments: [],
-      });
+    return Effect.forEach(cases, (testCase, index) => {
+      const harness = makeHarness();
+      return Effect.gen(function* () {
+        const adapter = yield* ClaudeAdapter;
 
-      harness.query.emit({
-        type: "result",
-        subtype: "error_during_execution",
-        is_error: false,
-        errors: ["Error: Request was aborted."],
-        stop_reason: "tool_use",
-        session_id: "sdk-session-abort",
-        uuid: "result-abort",
-      } as unknown as SDKMessage);
+        const runtimeEventsFiber = yield* Stream.take(adapter.streamEvents, 7).pipe(
+          Stream.runCollect,
+          Effect.forkChild,
+        );
 
-      const runtimeEvents = Array.from(yield* Fiber.join(runtimeEventsFiber));
-      assert.deepEqual(
-        runtimeEvents.map((event) => event.type),
-        [
-          "session.started",
-          "session.configured",
-          "session.state.changed",
-          "turn.started",
-          "thread.started",
-          "turn.completed",
-        ],
+        const session = yield* adapter.startSession({
+          threadId: THREAD_ID,
+          provider: ProviderDriverKind.make("claudeAgent"),
+          runtimeMode: "full-access",
+        });
+
+        const turn = yield* adapter.sendTurn({
+          threadId: session.threadId,
+          input: "hello",
+          attachments: [],
+        });
+
+        harness.query.emit({
+          type: "result",
+          subtype: "error_during_execution",
+          is_error: testCase.isError,
+          errors: [testCase.error],
+          stop_reason: testCase.stopReason,
+          ...(testCase.terminalReason ? { terminal_reason: testCase.terminalReason } : {}),
+          session_id: `sdk-session-execution-error-${index}`,
+          uuid: `result-execution-error-${index}`,
+        } as unknown as SDKMessage);
+
+        const runtimeEvents = Array.from(yield* Fiber.join(runtimeEventsFiber));
+        assert.deepEqual(
+          runtimeEvents.map((event) => event.type),
+          [
+            "session.started",
+            "session.configured",
+            "session.state.changed",
+            "turn.started",
+            "thread.started",
+            "runtime.error",
+            "turn.completed",
+          ],
+        );
+
+        const runtimeError = runtimeEvents[runtimeEvents.length - 2];
+        assert.equal(runtimeError?.type, "runtime.error");
+        if (runtimeError?.type === "runtime.error") {
+          assert.equal(runtimeError.payload.message, testCase.error);
+        }
+
+        const turnCompleted = runtimeEvents[runtimeEvents.length - 1];
+        assert.equal(turnCompleted?.type, "turn.completed");
+        if (turnCompleted?.type === "turn.completed") {
+          assert.equal(String(turnCompleted.turnId), String(turn.turnId));
+          assert.equal(turnCompleted.payload.state, "failed");
+          assert.equal(turnCompleted.payload.errorMessage, testCase.error);
+        }
+
+        const sessions = yield* adapter.listSessions();
+        assert.equal(sessions[0]?.status, "ready");
+        assert.equal(sessions[0]?.lastError, testCase.error);
+      }).pipe(
+        Effect.provideService(Random.Random, makeDeterministicRandomService()),
+        Effect.provide(harness.layer),
       );
-
-      const turnCompleted = runtimeEvents[runtimeEvents.length - 1];
-      assert.equal(turnCompleted?.type, "turn.completed");
-      if (turnCompleted?.type === "turn.completed") {
-        assert.equal(String(turnCompleted.turnId), String(turn.turnId));
-        assert.equal(turnCompleted.payload.state, "interrupted");
-        assert.equal(turnCompleted.payload.errorMessage, "Error: Request was aborted.");
-        assert.equal(turnCompleted.payload.stopReason, "tool_use");
-      }
-    }).pipe(
-      Effect.provideService(Random.Random, makeDeterministicRandomService()),
-      Effect.provide(harness.layer),
-    );
+    });
   });
 
   it.effect("closes the session when the Claude stream aborts after a turn starts", () => {

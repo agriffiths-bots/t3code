@@ -82,12 +82,50 @@ describe("sanitizeThreadErrorMessage", () => {
     expect(sanitizeThreadErrorMessage("SocketCloseError: oops")).toBeNull();
   });
 
-  it("replaces raw Claude interrupted-turn diagnostics with friendly copy", () => {
+  it("suppresses Claude user-steer abort diagnostics to avoid duplicate retry advice", () => {
+    expect(
+      sanitizeThreadErrorMessage(
+        "[ede_diagnostic] result_type=user is_error=false last_content_type=n/a stop_reason=tool_use",
+      ),
+    ).toBeNull();
+    expect(
+      sanitizeThreadErrorMessage(
+        "[ede_diagnostic] result_type=user stop_reason=tool_use is_error=false",
+      ),
+    ).toBeNull();
+    expect(
+      sanitizeThreadErrorMessage("[ede_diagnostic] result_type=user terminal_reason=aborted_tools"),
+    ).toBeNull();
+    expect(sanitizeThreadErrorMessage("[ede_diagnostic] result_type=user turn aborted")).toBeNull();
+  });
+
+  it("does not suppress Claude diagnostics without the user-steer result type", () => {
+    expect(
+      sanitizeThreadErrorMessage(
+        "[ede_diagnostic] result_type=assistant last_content_type=text stop_reason=tool_use",
+      ),
+    ).toBe(INTERRUPTED_TURN_ERROR_MESSAGE);
+  });
+
+  it("does not suppress user diagnostics without a known steer-abort marker", () => {
+    const diagnostics = [
+      "[ede_diagnostic] result_type=user status=failed",
+      "[ede_diagnostic] result_type=user last_content_type=n/a stop_reason=null",
+    ];
+    for (const diagnostic of diagnostics) {
+      expect(sanitizeThreadErrorMessage(diagnostic)).toBe(diagnostic);
+    }
+  });
+
+  it("does not suppress an ambiguous user tool-use diagnostic without a clean result marker", () => {
     expect(
       sanitizeThreadErrorMessage(
         "[ede_diagnostic] result_type=user last_content_type=n/a stop_reason=tool_use",
       ),
     ).toBe(INTERRUPTED_TURN_ERROR_MESSAGE);
+  });
+
+  it("retains the friendly copy for other known Claude interruption messages", () => {
     expect(sanitizeThreadErrorMessage("Error: Request was aborted.")).toBe(
       INTERRUPTED_TURN_ERROR_MESSAGE,
     );

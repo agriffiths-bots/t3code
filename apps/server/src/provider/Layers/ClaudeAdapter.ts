@@ -307,6 +307,29 @@ function resultErrorsText(result: SDKResultMessage): string {
     : "";
 }
 
+function isClaudeUserSteerAbortResult(result: SDKResultMessage): boolean {
+  if (!("errors" in result) || !Array.isArray(result.errors)) {
+    return false;
+  }
+
+  const hasDiagnostic = result.errors.some((error) => {
+    const normalized = error.toLowerCase();
+    return /\[ede_diagnostic\]/u.test(normalized) && /\bresult_type=user\b/u.test(normalized);
+  });
+  if (!hasDiagnostic) {
+    return false;
+  }
+
+  const errors = resultErrorsText(result);
+  return (
+    (result.is_error === false &&
+      (result.stop_reason === "tool_use" || /\bstop_reason=tool_use\b/u.test(errors))) ||
+    /\bturn aborted\b/u.test(errors) ||
+    result.terminal_reason === "aborted_streaming" ||
+    result.terminal_reason === "aborted_tools"
+  );
+}
+
 function isTaskNotificationResult(result: SDKResultMessage | undefined): boolean {
   const origin = (result as { readonly origin?: unknown } | undefined)?.origin;
   return (
@@ -395,6 +418,10 @@ function shouldDrainTaskNotificationResult(
 function isInterruptedResult(result: SDKResultMessage): boolean {
   const errors = resultErrorsText(result);
   if (errors.includes("interrupt")) {
+    return true;
+  }
+
+  if (result.subtype === "error_during_execution" && isClaudeUserSteerAbortResult(result)) {
     return true;
   }
 

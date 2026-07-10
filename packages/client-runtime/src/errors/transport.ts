@@ -53,6 +53,22 @@ export function isClaudeInterruptedTurnDiagnosticMessage(
   return CLAUDE_INTERRUPTED_TURN_PATTERNS.some((pattern) => pattern.test(normalizedMessage));
 }
 
+function isClaudeUserSteerAbortDiagnosticMessage(message: string): boolean {
+  return message.split(/\r?\n/u).some((line) => {
+    if (!/\[ede_diagnostic\]/i.test(line) || !/\bresult_type=user\b/i.test(line)) {
+      return false;
+    }
+
+    const hasKnownAbortReason =
+      /\bterminal_reason=(?:aborted_streaming|aborted_tools)\b/i.test(line) ||
+      /\bturn aborted\b/i.test(line);
+    const hasCleanToolUseResult =
+      /\bis_error=false\b/i.test(line) && /\bstop_reason=tool_use\b/i.test(line);
+
+    return hasKnownAbortReason || hasCleanToolUseResult;
+  });
+}
+
 /**
  * Strip transport connection errors from user-facing error messages.
  * Returns `null` for transport errors so the UI can distinguish between
@@ -65,6 +81,10 @@ export function sanitizeThreadErrorMessage(message: string | null | undefined): 
 
   const normalizedMessage = message.trim();
   if (normalizedMessage.length === 0 || isTransportConnectionErrorMessage(normalizedMessage)) {
+    return null;
+  }
+
+  if (isClaudeUserSteerAbortDiagnosticMessage(normalizedMessage)) {
     return null;
   }
 
