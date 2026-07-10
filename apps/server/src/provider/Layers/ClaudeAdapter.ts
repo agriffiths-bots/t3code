@@ -313,7 +313,7 @@ function isClaudeUserSteerAbortDiagnosticLine(line: string): boolean {
     /^\[ede_diagnostic\]\s+result_type=user\s+last_content_type=\S+\s+stop_reason=tool_use$/u.test(
       normalizedLine,
     ) ||
-    /^\[ede_diagnostic\]\s+turn aborted\s+\([^\r\n)]*\)\s+stop_reason=\S+$/u.test(normalizedLine)
+    /^\[ede_diagnostic\]\s+turn aborted\s+\(steer\)\s+stop_reason=tool_use$/u.test(normalizedLine)
   );
 }
 

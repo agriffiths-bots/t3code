@@ -135,6 +135,16 @@ describe("sanitizeThreadErrorMessage", () => {
     expect(sanitizeThreadErrorMessage("[ede_diagnostic] result_type=user status=failed")).toBe(
       "[ede_diagnostic] result_type=user status=failed",
     );
+    expect(
+      sanitizeThreadErrorMessage("[ede_diagnostic] turn aborted (quota) stop_reason=tool_use", {
+        turnState: "interrupted",
+      }),
+    ).toBe(INTERRUPTED_TURN_ERROR_MESSAGE);
+    expect(
+      sanitizeThreadErrorMessage("[ede_diagnostic] turn aborted (steer) stop_reason=error", {
+        turnState: "interrupted",
+      }),
+    ).toBe("[ede_diagnostic] turn aborted (steer) stop_reason=error");
   });
 
   it("retains friendly copy for explicit Claude request aborts", () => {

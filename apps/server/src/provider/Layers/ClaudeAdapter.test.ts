@@ -3754,6 +3754,14 @@ describe("ClaudeAdapterLive", () => {
       { isError: false, errors: ["[ede_diagnostic] result_type=user status=failed"] },
       {
         isError: true,
+        errors: ["[ede_diagnostic] turn aborted (quota) stop_reason=tool_use"],
+      },
+      {
+        isError: true,
+        errors: ["[ede_diagnostic] turn aborted (steer) stop_reason=error"],
+      },
+      {
+        isError: true,
         errors: [
           "[ede_diagnostic] result_type=user last_content_type=n/a stop_reason=tool_use",
           "Claude execution failed after the steer boundary.",
@@ -3788,10 +3796,10 @@ describe("ClaudeAdapterLive", () => {
       return Effect.gen(function* () {
         const adapter = yield* ClaudeAdapter;
 
-        const runtimeEventsFiber = yield* Stream.take(adapter.streamEvents, 7).pipe(
-          Stream.runCollect,
-          Effect.forkChild,
-        );
+        const runtimeEventsFiber = yield* Stream.takeUntil(
+          adapter.streamEvents,
+          (event) => event.type === "turn.completed",
+        ).pipe(Stream.runCollect, Effect.forkChild);
 
         const session = yield* adapter.startSession({
           threadId: THREAD_ID,

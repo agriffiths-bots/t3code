@@ -19,7 +19,7 @@ const CLAUDE_INTERRUPTED_TURN_PATTERNS = [
 
 const CLAUDE_USER_STEER_ABORT_PATTERNS = [
   /^\[ede_diagnostic\]\s+result_type=user\s+last_content_type=\S+\s+stop_reason=tool_use$/i,
-  /^\[ede_diagnostic\]\s+turn aborted\s+\([^\r\n)]*\)\s+stop_reason=\S+$/i,
+  /^\[ede_diagnostic\]\s+turn aborted\s+\(steer\)\s+stop_reason=tool_use$/i,
 ] as const;
 
 export const INTERRUPTED_TURN_ERROR_MESSAGE =
