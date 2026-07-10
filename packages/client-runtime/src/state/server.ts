@@ -59,6 +59,7 @@ export function applyServerConfigProjection(
         config: {
           ...projection.config,
           providers: event.payload.providers,
+          ...(event.payload.planUsage ? { planUsage: event.payload.planUsage } : {}),
         },
         latestEvent: event,
         source: "live",

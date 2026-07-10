@@ -81,6 +81,25 @@ describe("server state projection", () => {
     expect(result.latestEvent.type).toBe("settingsUpdated");
   });
 
+  it("projects background plan usage updates without reconnecting", () => {
+    const snapshot = applyServerConfigProjection(Option.none(), {
+      version: 1,
+      type: "snapshot",
+      config: CONFIG,
+    });
+    const planUsage = {
+      updatedAt: "2026-07-10T08:00:00.000Z",
+      providers: [],
+    };
+    const projected = applyServerConfigProjection(snapshot, {
+      version: 1,
+      type: "providerStatuses",
+      payload: { providers: [], planUsage },
+    });
+
+    expect(Option.getOrThrow(projected).config.planUsage).toBe(planUsage);
+  });
+
   it("keeps websocket heartbeat frames out of the projected server config", () => {
     const snapshot = applyServerConfigProjection(Option.none(), {
       version: 1,

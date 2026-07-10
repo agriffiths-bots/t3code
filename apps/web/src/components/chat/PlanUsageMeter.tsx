@@ -5,9 +5,9 @@ import { Popover, PopoverPopup, PopoverTrigger } from "../ui/popover";
 import {
   flattenPlanUsageWindows,
   formatPlanUsageReset,
-  formatPlanUsageStaleAt,
   formatPlanUsageValue,
   planUsageColor,
+  planUsageProviderBoundary,
   selectMostConstrainedPlanUsageWindow,
 } from "./PlanUsageMeter.logic";
 
@@ -78,12 +78,18 @@ export function PlanUsageMeter(props: { snapshot: PlanUsageSnapshot | null }) {
             </div>
           </div>
           <div className="flex flex-col gap-2">
-            {windows.map((window) => {
+            {windows.map((window, index) => {
               const percent = Math.max(0, Math.min(100, window.usedPercent));
               const color = planUsageColor(window);
-              const staleLabel = formatPlanUsageStaleAt(window.staleAt);
               return (
-                <div key={window.id} className="flex flex-col gap-1.5">
+                <div
+                  key={`${window.provider}:${window.id}`}
+                  className={cn(
+                    "flex flex-col gap-1.5",
+                    planUsageProviderBoundary(windows, index) &&
+                      "mt-1 border-border/70 border-t pt-3",
+                  )}
+                >
                   <div className="flex items-center justify-between gap-3 text-[11px] leading-4">
                     <span className="font-medium text-muted-foreground/80">{window.title}</span>
                     <span className="tabular-nums text-muted-foreground/70">
@@ -104,9 +110,7 @@ export function PlanUsageMeter(props: { snapshot: PlanUsageSnapshot | null }) {
                     />
                   </div>
                   <div className="text-[11px] leading-4 text-muted-foreground/60">
-                    {staleLabel
-                      ? `${staleLabel} · ${formatPlanUsageReset(window.resetAt)}`
-                      : formatPlanUsageReset(window.resetAt)}
+                    {formatPlanUsageReset(window.resetAt)}
                   </div>
                 </div>
               );

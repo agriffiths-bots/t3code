@@ -84,6 +84,7 @@ import * as ProviderMaintenanceRunner from "./provider/providerMaintenanceRunner
 import * as ServerLifecycleEvents from "./serverLifecycleEvents.ts";
 import * as ServerRuntimeStartup from "./serverRuntimeStartup.ts";
 import * as ServerSettings from "./serverSettings.ts";
+import * as PlanUsageSnapshot from "./usage/PlanUsageSnapshot.ts";
 import * as TerminalManager from "./terminal/Manager.ts";
 import * as PreviewAutomationBroker from "./mcp/PreviewAutomationBroker.ts";
 import * as PreviewManager from "./preview/Manager.ts";
@@ -410,6 +411,7 @@ const makeWsRpcLayer = (
       const fileSystem = yield* FileSystem.FileSystem;
       const lifecycleEvents = yield* ServerLifecycleEvents.ServerLifecycleEvents;
       const serverSettings = yield* ServerSettings.ServerSettingsService;
+      const planUsageSnapshot = yield* PlanUsageSnapshot.PlanUsageSnapshotStore;
       const startup = yield* ServerRuntimeStartup.ServerRuntimeStartup;
       const workspaceEntries = yield* WorkspaceEntries.WorkspaceEntries;
       const workspaceFileSystem = yield* WorkspaceFileSystem.WorkspaceFileSystem;
@@ -696,6 +698,7 @@ const makeWsRpcLayer = (
           keybindings: keybindingsConfig.keybindings,
           issues: keybindingsConfig.issues,
           providers,
+          planUsage: yield* planUsageSnapshot.current,
           availableEditors: yield* externalLauncher.resolveAvailableEditors(),
           observability: {
             logsDirectoryPath: config.logsDir,
@@ -1698,6 +1701,17 @@ const makeWsRpcLayer = (
                 })),
                 Stream.debounce(Duration.millis(PROVIDER_STATUS_DEBOUNCE_MS)),
               );
+              const planUsageUpdates = planUsageSnapshot.changes.pipe(
+                Stream.mapEffect((planUsage) =>
+                  providerRegistry.getProviders.pipe(
+                    Effect.map((providers) => ({
+                      version: 1 as const,
+                      type: "providerStatuses" as const,
+                      payload: { providers, planUsage },
+                    })),
+                  ),
+                ),
+              );
               const settingsUpdates = serverSettings.streamChanges.pipe(
                 Stream.map((settings) => ServerSettings.redactServerSettingsForClient(settings)),
                 Stream.map((settings) => ({
@@ -1713,7 +1727,7 @@ const makeWsRpcLayer = (
 
               const configUpdates = Stream.merge(
                 keybindingsUpdates,
-                Stream.merge(providerStatuses, settingsUpdates),
+                Stream.merge(providerStatuses, Stream.merge(settingsUpdates, planUsageUpdates)),
               );
               // Only send keepalive heartbeats to clients that declared support
               // for the `heartbeat` union variant; older/version-skewed clients

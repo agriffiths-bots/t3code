@@ -2,7 +2,36 @@ import type { PlanUsageSnapshot, PlanUsageWindow } from "@t3tools/contracts";
 
 export function flattenPlanUsageWindows(snapshot: PlanUsageSnapshot | null): PlanUsageWindow[] {
   if (!snapshot) return [];
-  return snapshot.providers.flatMap((provider) => provider.windows);
+  return snapshot.providers
+    .flatMap((provider) => provider.windows)
+    .filter((window) => window.staleAt === undefined)
+    .toSorted((left, right) => {
+      const providerOrder = providerRank(left.provider) - providerRank(right.provider);
+      if (providerOrder !== 0) return providerOrder;
+      const kindOrder = windowKindRank(left.kind) - windowKindRank(right.kind);
+      if (kindOrder !== 0) return kindOrder;
+      return left.id < right.id ? -1 : left.id > right.id ? 1 : 0;
+    });
+}
+
+export function planUsageProviderBoundary(
+  windows: ReadonlyArray<PlanUsageWindow>,
+  index: number,
+): boolean {
+  const previous = windows[index - 1];
+  const current = windows[index];
+  return previous !== undefined && current !== undefined && previous.provider !== current.provider;
+}
+
+function providerRank(provider: PlanUsageWindow["provider"]): number {
+  return provider === "codex" ? 0 : 1;
+}
+
+function windowKindRank(kind: string): number {
+  if (kind === "five_hour" || kind === "session") return 0;
+  if (kind === "weekly" || kind === "weekly_all") return 1;
+  if (kind === "weekly_scoped") return 2;
+  return 3;
 }
 
 export function selectMostConstrainedPlanUsageWindow(
