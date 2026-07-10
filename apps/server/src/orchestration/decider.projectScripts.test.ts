@@ -95,6 +95,82 @@ it.layer(NodeServices.layer)("decider project scripts", (it) => {
     }),
   );
 
+  it.effect("rejects a workspace-root retarget while the project owns a removable worktree", () =>
+    Effect.gen(function* () {
+      const now = "2026-01-01T00:00:00.000Z";
+      const projectId = asProjectId("project-owned-worktree");
+      const threadId = ThreadId.make("thread-owned-worktree");
+      const withProject = yield* projectEvent(createEmptyReadModel(now), {
+        sequence: 1,
+        eventId: asEventId("evt-project-owned-worktree"),
+        aggregateKind: "project",
+        aggregateId: projectId,
+        type: "project.created",
+        occurredAt: now,
+        commandId: CommandId.make("cmd-project-owned-worktree"),
+        causationEventId: null,
+        correlationId: CommandId.make("cmd-project-owned-worktree"),
+        metadata: {},
+        payload: {
+          projectId,
+          title: "Owned worktree",
+          workspaceRoot: "/repo-a",
+          defaultModelSelection: null,
+          scripts: [],
+          createdAt: now,
+          updatedAt: now,
+        },
+      });
+      const readModel = yield* projectEvent(withProject, {
+        sequence: 2,
+        eventId: asEventId("evt-thread-owned-worktree"),
+        aggregateKind: "thread",
+        aggregateId: threadId,
+        type: "thread.created",
+        occurredAt: now,
+        commandId: CommandId.make("cmd-thread-owned-worktree"),
+        causationEventId: null,
+        correlationId: CommandId.make("cmd-thread-owned-worktree"),
+        metadata: {},
+        payload: {
+          threadId,
+          projectId,
+          title: "Thread",
+          modelSelection: {
+            instanceId: ProviderInstanceId.make("codex"),
+            model: "gpt-5-codex",
+          },
+          interactionMode: "plan",
+          runtimeMode: "approval-required",
+          branch: "feature/owned",
+          worktreePath: "/repo-a-worktrees/owned",
+          worktreeRemovable: true,
+          worktreeRemovalPath: "/repo-a-worktrees/owned",
+          createdAt: now,
+          updatedAt: now,
+        },
+      });
+
+      const error = yield* decideOrchestrationCommand({
+        command: {
+          type: "project.meta.update",
+          commandId: CommandId.make("cmd-project-retarget-owned-worktree"),
+          projectId,
+          workspaceRoot: "/repo-b",
+        },
+        readModel,
+      }).pipe(Effect.flip);
+
+      expect(error).toMatchObject({
+        _tag: "OrchestrationCommandInvariantError",
+        commandType: "project.meta.update",
+      });
+      if (error._tag === "OrchestrationCommandInvariantError") {
+        expect(error.detail).toContain("owns a removable thread worktree");
+      }
+    }),
+  );
+
   it.effect("emits user message and turn-start-requested events for thread.turn.start", () =>
     Effect.gen(function* () {
       const now = "2026-01-01T00:00:00.000Z";

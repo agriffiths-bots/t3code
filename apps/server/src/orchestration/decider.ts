@@ -183,11 +183,25 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
     }
 
     case "project.meta.update": {
-      yield* requireProject({
+      const project = yield* requireProject({
         readModel,
         command,
         projectId: command.projectId,
       });
+      if (
+        command.workspaceRoot !== undefined &&
+        command.workspaceRoot !== project.workspaceRoot &&
+        listThreadsByProjectId(readModel, command.projectId).some(
+          (thread) =>
+            thread.worktreeRemovable === true &&
+            (thread.worktreePath !== null || thread.worktreeRemovalPath !== null),
+        )
+      ) {
+        return yield* new OrchestrationCommandInvariantError({
+          commandType: command.type,
+          detail: `Project '${command.projectId}' cannot change workspace roots while it owns a removable thread worktree.`,
+        });
+      }
       const occurredAt = yield* nowIso;
       return {
         ...(yield* withEventBase({

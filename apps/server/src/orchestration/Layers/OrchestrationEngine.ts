@@ -13,6 +13,7 @@ import * as Deferred from "effect/Deferred";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
+import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Metric from "effect/Metric";
 import * as Option from "effect/Option";
@@ -45,6 +46,11 @@ import {
   OrchestrationEngineService,
   type OrchestrationEngineShape,
 } from "../Services/OrchestrationEngine.ts";
+import {
+  commandRequiresWorktreeLifecycle,
+  WorktreeLifecycleCoordinator,
+  WorktreeLifecycleCoordinatorLive,
+} from "../Services/WorktreeLifecycleCoordinator.ts";
 const isOrchestrationCommandPreviouslyRejectedError = Schema.is(
   OrchestrationCommandPreviouslyRejectedError,
 );
@@ -82,6 +88,8 @@ const makeOrchestrationEngine = Effect.gen(function* () {
   const commandReceiptRepository = yield* OrchestrationCommandReceiptRepository;
   const projectionPipeline = yield* OrchestrationProjectionPipeline;
   const projectionSnapshotQuery = yield* ProjectionSnapshotQuery;
+  const worktreeLifecycle = yield* WorktreeLifecycleCoordinator;
+  const fileSystem = yield* FileSystem.FileSystem;
   const crypto = yield* Crypto.Crypto;
 
   const nowIso = Effect.map(DateTime.now, DateTime.formatIso);
@@ -309,7 +317,7 @@ const makeOrchestrationEngine = Effect.gen(function* () {
   const readEvents: OrchestrationEngineShape["readEvents"] = (fromSequenceExclusive, limit) =>
     eventStore.readFromSequence(fromSequenceExclusive, limit);
 
-  const dispatch: OrchestrationEngineShape["dispatch"] = (command) =>
+  const dispatchQueued: NonNullable<OrchestrationEngineShape["dispatchCoordinated"]> = (command) =>
     Effect.gen(function* () {
       const result = yield* Deferred.make<{ sequence: number }, OrchestrationDispatchError>();
       yield* Queue.offer(commandQueue, {
@@ -320,9 +328,46 @@ const makeOrchestrationEngine = Effect.gen(function* () {
       return yield* Deferred.await(result);
     });
 
+  const archivedOwnedWorktreeIsMissing = (threadId: ThreadId) => {
+    const thread = commandReadModel.threads.find((candidate) => candidate.id === threadId);
+    const ownedPath =
+      thread?.archivedAt !== null && thread?.worktreeRemovable === true
+        ? (thread.worktreeRemovalPath ?? thread.worktreePath)
+        : null;
+    if (!ownedPath) {
+      return Effect.succeed(false);
+    }
+    return fileSystem.exists(ownedPath).pipe(
+      Effect.map((exists) => !exists),
+      Effect.orElseSucceed(() => true),
+    );
+  };
+
+  const dispatch: OrchestrationEngineShape["dispatch"] = (command) => {
+    if (!commandRequiresWorktreeLifecycle(command)) {
+      return dispatchQueued(command);
+    }
+    return worktreeLifecycle.withPermit(
+      Effect.gen(function* () {
+        if (
+          command.type === "thread.unarchive" &&
+          ((yield* worktreeLifecycle.isTeardownPending(command.threadId)) ||
+            (yield* archivedOwnedWorktreeIsMissing(command.threadId)))
+        ) {
+          return yield* new OrchestrationCommandInvariantError({
+            commandType: command.type,
+            detail: `Thread '${command.threadId}' cannot be unarchived while its owned worktree teardown is pending.`,
+          });
+        }
+        return yield* dispatchQueued(command);
+      }),
+    );
+  };
+
   return {
     readEvents,
     dispatch,
+    dispatchCoordinated: dispatchQueued,
     // Each access creates a fresh PubSub subscription so that multiple
     // consumers (wsServer, ProviderRuntimeIngestion, CheckpointReactor, etc.)
     // each independently receive all domain events.
@@ -335,4 +380,8 @@ const makeOrchestrationEngine = Effect.gen(function* () {
 export const OrchestrationEngineLive = Layer.effect(
   OrchestrationEngineService,
   makeOrchestrationEngine,
+).pipe(
+  // Retain the same coordinator in the layer output so provider activation and
+  // lifecycle reactors share the exact permit used by command dispatch.
+  Layer.provideMerge(WorktreeLifecycleCoordinatorLive),
 );

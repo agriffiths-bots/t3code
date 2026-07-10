@@ -199,6 +199,53 @@ describe("GitWorkflowService", () => {
     }).pipe(Effect.provide(testLayer));
   });
 
+  it.effect("detects ignored files that normal status omits", () => {
+    const gitHandle: VcsDriverRegistry.VcsDriverHandle = {
+      kind: "git",
+      repository: {
+        kind: "git",
+        rootPath: "/project/repo",
+        metadataPath: "/project/repo/.git",
+        freshness: {
+          source: "live-local",
+          observedAt: DateTime.makeUnsafe("1970-01-01T00:00:00.000Z"),
+          expiresAt: Option.none(),
+        },
+      },
+      driver: {} as VcsDriverRegistry.VcsDriverHandle["driver"],
+    };
+    const execute = vi.fn(() =>
+      Effect.succeed({
+        exitCode: 0 as never,
+        stdout: ".env\0",
+        stderr: "",
+        stdoutTruncated: false,
+        stderrTruncated: false,
+      }),
+    );
+    const testLayer = GitWorkflowService.layer.pipe(
+      Layer.provide(
+        Layer.mock(VcsDriverRegistry.VcsDriverRegistry)({
+          resolve: () => Effect.succeed(gitHandle),
+        }),
+      ),
+      Layer.provide(Layer.mock(GitVcsDriver.GitVcsDriver)({ execute })),
+      Layer.provide(Layer.mock(GitManager.GitManager)({})),
+    );
+
+    return Effect.gen(function* () {
+      const workflow = yield* GitWorkflowService.GitWorkflowService;
+      expect(yield* workflow.hasIgnoredFiles("/project/repo")).toBe(true);
+      expect(execute).toHaveBeenCalledWith(
+        expect.objectContaining({
+          cwd: "/project/repo",
+          args: ["ls-files", "--others", "--ignored", "--exclude-standard", "-z"],
+          appendTruncationMarker: true,
+        }),
+      );
+    }).pipe(Effect.provide(testLayer));
+  });
+
   it.effect("structures workflow detection failures without exposing upstream details", () => {
     const cause = new VcsRepositoryDetectionError({
       operation: "VcsDriverRegistry.detect",

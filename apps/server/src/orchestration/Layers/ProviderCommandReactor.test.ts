@@ -58,6 +58,7 @@ import {
 } from "./ProviderCommandReactor.ts";
 import { OrchestrationEngineService } from "../Services/OrchestrationEngine.ts";
 import { ProviderCommandReactor } from "../Services/ProviderCommandReactor.ts";
+import { WorktreeLifecycleCoordinatorLive } from "../Services/WorktreeLifecycleCoordinator.ts";
 import { ProjectionSnapshotQuery } from "../Services/ProjectionSnapshotQuery.ts";
 import { readDetailedReadModel } from "../testUtils/readModel.ts";
 import * as NodeServices from "@effect/platform-node/NodeServices";
@@ -513,7 +514,7 @@ describe("ProviderCommandReactor", () => {
     expect(harness.sendTurn).not.toHaveBeenCalled();
   });
 
-  it("records a visible cancellation when archive wins a queued turn start", async () => {
+  it("serializes archive behind provider activation that already owns the lifecycle permit", async () => {
     const harness = await createHarness();
     const now = "2026-01-01T00:00:00.000Z";
     const releaseStartSession = Effect.runSync(Deferred.make<void>());
@@ -545,34 +546,28 @@ describe("ProviderCommandReactor", () => {
     );
     await waitFor(() => harness.startSession.mock.calls.length === 1);
 
-    await runtime!.runPromise(
-      harness.engine.dispatch({
-        type: "thread.archive",
-        commandId: CommandId.make("cmd-archive-queued-turn"),
-        threadId: ThreadId.make("thread-1"),
-      }),
-    );
+    let archiveResolved = false;
+    const archivePromise = runtime!
+      .runPromise(
+        harness.engine.dispatch({
+          type: "thread.archive",
+          commandId: CommandId.make("cmd-archive-queued-turn"),
+          threadId: ThreadId.make("thread-1"),
+        }),
+      )
+      .then((result) => {
+        archiveResolved = true;
+        return result;
+      });
+    await Effect.runPromise(Effect.sleep("50 millis"));
+    expect(archiveResolved).toBe(false);
     await Effect.runPromise(Deferred.succeed(releaseStartSession, undefined));
-
-    await waitFor(async () => {
-      const readModel = await harness.readModel();
-      const thread = readModel.threads.find((entry) => entry.id === ThreadId.make("thread-1"));
-      return (
-        thread?.activities.some(
-          (activity) =>
-            activity.kind === "provider.turn.start.failed" &&
-            typeof activity.payload === "object" &&
-            activity.payload !== null &&
-            "detail" in activity.payload &&
-            String(activity.payload.detail).includes("archived before the queued provider turn"),
-        ) === true
-      );
-    });
+    await archivePromise;
     await harness.drain();
 
-    expect(harness.sendTurn).not.toHaveBeenCalled();
-    expect(harness.stopSession).toHaveBeenCalledTimes(1);
-    expect(harness.runtimeSessions).toHaveLength(0);
+    expect(harness.sendTurn).toHaveBeenCalledTimes(1);
+    expect(harness.stopSession).not.toHaveBeenCalled();
+    expect(harness.runtimeSessions).toHaveLength(1);
     const readModel = await harness.readModel();
     const thread = readModel.threads.find((entry) => entry.id === ThreadId.make("thread-1"));
     expect(thread?.archivedAt).not.toBeNull();
@@ -663,6 +658,7 @@ describe("ProviderCommandReactor", () => {
     };
 
     const layer = ProviderCommandReactorLive.pipe(
+      Layer.provideMerge(WorktreeLifecycleCoordinatorLive),
       Layer.provideMerge(Layer.succeed(OrchestrationEngineService, engine)),
       Layer.provideMerge(
         Layer.mock(ProjectionSnapshotQuery)({
