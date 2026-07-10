@@ -291,7 +291,7 @@ let peerHttpHandler:
 let modelInstances: ReadonlyArray<unknown> = [];
 const insertedTasks: Array<Pick<ScheduledTask, "busyPolicy" | "modelSelection">> = [];
 // Existing scheduled tasks visible to t3_schedule_update (via listAll), and the
-// updated rows it writes back — so a test can assert a model re-route / un-pin.
+// updated rows it writes back — so tests can assert model re-routing and preservation.
 let existingTasks: ReadonlyArray<ScheduledTask> = [];
 const updatedTasks: Array<ScheduledTask> = [];
 
@@ -2811,12 +2811,11 @@ describe("SubagentToolkit", () => {
     ).pipe(Effect.provide(TestLayer)),
   );
 
-  it.effect("Fix 1: t3_schedule_update with model:null un-pins the model", () =>
+  it.effect("t3_schedule_update rejects a nullable model reset", () =>
     Effect.scoped(
       Effect.gen(function* () {
         const server = yield* McpServer.McpServer;
         updatedTasks.length = 0;
-        // A task currently pinned to Claude.
         existingTasks = [
           makeScheduledTask({
             instanceId: ProviderInstanceId.make("claudeAgent"),
@@ -2834,11 +2833,8 @@ describe("SubagentToolkit", () => {
             Effect.provideService(McpSchema.McpServerClient, client),
           );
 
-        expect(result.isError).toBe(false);
-        // The pin is cleared on both the returned entry and the persisted row.
-        expect(result.structuredContent).toMatchObject({ modelSelection: null });
-        expect(updatedTasks).toHaveLength(1);
-        expect(updatedTasks[0]!.modelSelection).toBeNull();
+        expect(result.isError).toBe(true);
+        expect(updatedTasks).toHaveLength(0);
       }),
     ).pipe(Effect.provide(TestLayer)),
   );

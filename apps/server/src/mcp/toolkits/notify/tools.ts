@@ -14,8 +14,8 @@ const dependencies = [McpInvocationContext.McpInvocationContext];
 
 export const NotifyInput = Schema.Struct({
   title: ServerNotifyInput.fields.title,
-  body: ServerNotifyInput.fields.body,
-  deepLink: ServerNotifyInput.fields.deepLink,
+  body: Schema.optionalKey(Schema.required(ServerNotifyInput.fields.body)),
+  deepLink: Schema.optionalKey(Schema.required(ServerNotifyInput.fields.deepLink)),
 });
 export type NotifyInput = typeof NotifyInput.Type;
 

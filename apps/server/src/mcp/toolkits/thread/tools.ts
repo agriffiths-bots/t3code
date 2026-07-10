@@ -25,9 +25,9 @@ export const ThreadStartPublicInput = Schema.Struct({
   prompt: TrimmedNonEmptyString.check(Schema.isMaxLength(PROVIDER_SEND_TURN_MAX_INPUT_CHARS)),
   model: TrimmedNonEmptyString,
   title: TrimmedNonEmptyString.check(Schema.isMaxLength(255)),
-  directory: Schema.optional(TrimmedNonEmptyString),
-  branch: Schema.optional(TrimmedNonEmptyString),
-  reasoningEffort: Schema.optional(TrimmedNonEmptyString),
+  directory: Schema.optionalKey(TrimmedNonEmptyString),
+  branch: Schema.optionalKey(TrimmedNonEmptyString),
+  reasoningEffort: Schema.optionalKey(TrimmedNonEmptyString),
 });
 export type ThreadStartPublicInput = typeof ThreadStartPublicInput.Type;
 
@@ -83,7 +83,7 @@ const dependencies = [McpInvocationContext.McpInvocationContext];
 
 export const ThreadStartTool = Tool.make("t3_thread_start", {
   description:
-    "Start a new T3 Code thread with the supplied initial prompt, only when the user explicitly asks to start/spawn/create another thread or agent. Do not use for autonomous delegation or background parallel work. The model and title are required. Defaults to creating a new Git worktree from the repository default branch when the project directory is a Git repository; non-Git projects start in the current directory with warning metadata. Pass `directory` (absolute path) to base the thread somewhere else entirely. `reasoningEffort` defaults to `xhigh` for Codex models that advertise reasoning effort and overrides that default when supplied. This tool launches the child turn and returns metadata without waiting for completion.",
+    "Start a new T3 Code thread with the supplied initial prompt, only when the user explicitly asks to start/spawn/create another thread or agent. Do not use for autonomous delegation or background parallel work. The model and title are required. Defaults to creating a new Git worktree from the repository default branch when the project directory is a Git repository; non-Git projects start in the current directory with warning metadata. The child inherits the source thread's runtime and interaction modes, and configured setup runs for a new project worktree. Pass `directory` (absolute path) to base the thread somewhere else entirely. `reasoningEffort` defaults to `xhigh` for Codex models that advertise reasoning effort and overrides that default when supplied. This tool launches the child turn and returns metadata without waiting for completion.",
   parameters: ThreadStartPublicInput,
   success: ThreadStartToolOutput,
   failure: ThreadStartToolError,

@@ -80,7 +80,7 @@ export const LegacyCheckSubagentInput = Schema.Struct({ childThreadId: ThreadId 
 export type LegacyCheckSubagentInput = typeof LegacyCheckSubagentInput.Type;
 
 export const SubagentsInput = Schema.Struct({
-  childThreadId: Schema.optional(ThreadId),
+  childThreadId: Schema.optionalKey(ThreadId),
 });
 export type SubagentsInput = typeof SubagentsInput.Type;
 
@@ -106,15 +106,15 @@ export const SubagentsOutput = Schema.Struct({
 export type SubagentsOutput = typeof SubagentsOutput.Type;
 
 export const ScheduleCreateInput = Schema.Struct({
-  threadId: Schema.optional(ThreadId),
+  threadId: Schema.optionalKey(ThreadId),
   prompt: Schema.String,
-  intervalSeconds: Schema.optional(Schema.Int),
-  cronExpr: Schema.optional(Schema.String),
-  timezone: Schema.optional(Schema.String),
+  intervalSeconds: Schema.optionalKey(Schema.Int),
+  cronExpr: Schema.optionalKey(Schema.String),
+  timezone: Schema.optionalKey(Schema.String),
   // Optional plain model name (e.g. "claude-opus-4-8" or "gpt-5.4"); the
   // provider/harness is inferred from the live model lists, so the caller never
   // guesses a harness/instance id. Omit to inherit the thread's current model.
-  model: Schema.optional(TrimmedNonEmptyString),
+  model: Schema.optionalKey(TrimmedNonEmptyString),
 });
 export type ScheduleCreateInput = typeof ScheduleCreateInput.Type;
 
@@ -126,7 +126,7 @@ export const ScheduleEntry = ScheduledTaskEntry;
 export type ScheduleEntry = typeof ScheduleEntry.Type;
 
 export const ScheduleListInput = Schema.Struct({
-  threadId: Schema.optional(ThreadId),
+  threadId: Schema.optionalKey(ThreadId),
 });
 export type ScheduleListInput = typeof ScheduleListInput.Type;
 
@@ -137,13 +137,12 @@ export type ScheduleListOutput = typeof ScheduleListOutput.Type;
 
 export const ScheduleUpdateInput = Schema.Struct({
   taskId: ScheduledTaskId,
-  enabled: Schema.optional(Schema.Boolean),
-  intervalSeconds: Schema.optional(Schema.Int),
-  cronExpr: Schema.optional(Schema.String),
-  // Re-route the schedule to a new plain model name (provider/harness inferred),
-  // or pass null to un-pin and inherit the thread's current model again. Omit to
-  // leave the current model unchanged.
-  model: Schema.optional(Schema.NullOr(TrimmedNonEmptyString)),
+  enabled: Schema.optionalKey(Schema.Boolean),
+  intervalSeconds: Schema.optionalKey(Schema.Int),
+  cronExpr: Schema.optionalKey(Schema.String),
+  // Re-route the schedule to a new plain model name (provider/harness inferred).
+  // Omit to leave the current model unchanged.
+  model: Schema.optionalKey(TrimmedNonEmptyString),
 });
 export type ScheduleUpdateInput = typeof ScheduleUpdateInput.Type;
 
@@ -221,7 +220,7 @@ export const ScheduleListTool = Tool.make("t3_schedule_list", {
 
 export const ScheduleUpdateTool = Tool.make("t3_schedule_update", {
   description:
-    "Update a scheduled task: enable/disable it, change its interval or cron expression (cron is re-validated), re-route it to a new model by passing `model` as a plain model name (provider/harness inferred), or pass `model: null` to un-pin the model so runs inherit the thread's current model again. The persisted busy policy is preserved. Only the supplied fields are changed.",
+    "Update a scheduled task: enable/disable it, change its interval or cron expression (cron is re-validated), or re-route it to a new model by passing `model` as a plain model name (provider/harness inferred). Omitted fields remain unchanged, including the model and persisted busy policy.",
   parameters: ScheduleUpdateInput,
   success: ScheduleEntry,
   failure: ThreadStartToolError,

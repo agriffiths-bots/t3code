@@ -1567,16 +1567,13 @@ const scheduleUpdate = Effect.fn("SubagentToolkit.scheduleUpdate")(function* (
     nextRunAt = computed === null ? null : IsoDateTime.make(computed);
   }
 
-  // Three-way `model` handling: omit (undefined) keeps the current selection;
-  // an explicit null un-pins it (runs inherit the thread's model again); a plain
-  // name re-routes. On a re-route, prefer the schedule's current instance, or —
+  // Omitted `model` keeps the current selection; a plain name re-routes. On a
+  // re-route, prefer the schedule's current instance, or —
   // when it is still inheriting — the target thread's instance, so a
   // multi-instance setup keeps continuity (matches create).
   let modelSelection: ModelSelection | null;
   if (input.model === undefined) {
     modelSelection = existing.modelSelection;
-  } else if (input.model === null) {
-    modelSelection = null;
   } else {
     const preferInstanceId =
       existing.modelSelection?.instanceId ??
