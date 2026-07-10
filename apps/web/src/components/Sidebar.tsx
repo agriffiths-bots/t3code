@@ -116,7 +116,11 @@ import { useNewThreadHandler } from "../hooks/useHandleNewThread";
 import { useDesktopUpdateState } from "../state/desktopUpdate";
 import { isThreadSessionActive } from "../session-logic";
 
-import { useThreadActions } from "../hooks/useThreadActions";
+import {
+  buildThreadsDeleteConfirmationMessage,
+  ownedWorktreePathForThreadDelete,
+  useThreadActions,
+} from "../hooks/useThreadActions";
 import { projectEnvironment } from "../state/projects";
 import { useEnabledScheduleCount, useThreadScheduleSummary } from "../state/schedules";
 import { useEnvironmentQuery } from "../state/query";
@@ -1999,23 +2003,29 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
       if (clicked !== "delete") return;
 
       if (appSettingsConfirmThreadDelete) {
+        const selectedThreads = threadKeys.flatMap((threadKey) => {
+          const thread = sidebarThreadByKeyRef.current.get(threadKey);
+          return thread ? [thread] : [];
+        });
         const confirmed = await api.dialogs.confirm(
-          [
-            `Delete ${count} thread${count === 1 ? "" : "s"}?`,
-            "This permanently clears conversation history for these threads.",
-          ].join("\n"),
+          buildThreadsDeleteConfirmationMessage(selectedThreads),
         );
         if (!confirmed) return;
       }
 
       const deletedThreadKeys = new Set(threadKeys);
+      const completedThreadKeys: string[] = [];
       for (const threadKey of threadKeys) {
         const thread = sidebarThreadByKeyRef.current.get(threadKey);
         if (!thread) continue;
         const result = await deleteThread(scopeThreadRef(thread.environmentId, thread.id), {
           deletedThreadKeys,
+          ...(appSettingsConfirmThreadDelete
+            ? { confirmedOwnedWorktreePath: ownedWorktreePathForThreadDelete(thread) }
+            : {}),
         });
         if (result._tag === "Failure") {
+          removeFromSelection(completedThreadKeys);
           if (!isAtomCommandInterrupted(result)) {
             const error = squashAtomCommandFailure(result);
             toastManager.add(
@@ -2028,8 +2038,13 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
           }
           return;
         }
+        if (!result.value.deleted) {
+          removeFromSelection(completedThreadKeys);
+          return;
+        }
+        completedThreadKeys.push(threadKey);
       }
-      removeFromSelection(threadKeys);
+      removeFromSelection(completedThreadKeys);
     },
     [
       appSettingsConfirmThreadDelete,
@@ -2368,17 +2383,6 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
         return;
       }
       if (clicked !== "delete") return;
-      if (appSettingsConfirmThreadDelete) {
-        const confirmed = await api.dialogs.confirm(
-          [
-            `Delete thread "${thread.title}"?`,
-            "This permanently clears conversation history for this thread.",
-          ].join("\n"),
-        );
-        if (!confirmed) {
-          return;
-        }
-      }
       const result = await deleteThread(threadRef);
       if (result._tag === "Failure" && !isAtomCommandInterrupted(result)) {
         const error = squashAtomCommandFailure(result);
@@ -2392,7 +2396,6 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
       }
     },
     [
-      appSettingsConfirmThreadDelete,
       copyPathToClipboard,
       copyThreadIdToClipboard,
       deleteThread,

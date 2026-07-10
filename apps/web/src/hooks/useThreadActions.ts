@@ -38,24 +38,72 @@ export class ThreadArchiveBlockedError extends Schema.TaggedErrorClass<ThreadArc
   }
 }
 
-export function buildThreadDeleteConfirmationMessage(input: {
+export interface ThreadDeleteConfirmationSubject {
   readonly title: string;
   readonly worktreePath: string | null;
   readonly worktreeRemovable?: boolean | undefined;
   readonly worktreeRemovalPath?: string | null | undefined;
-}): string {
+}
+
+export function ownedWorktreePathForThreadDelete(
+  input: ThreadDeleteConfirmationSubject,
+): string | null {
+  return input.worktreeRemovable === true
+    ? (input.worktreeRemovalPath ?? input.worktreePath)
+    : null;
+}
+
+export function isThreadDeleteConfirmationCurrent(
+  confirmedOwnedWorktreePath: string | null | undefined,
+  subject: ThreadDeleteConfirmationSubject,
+): boolean {
+  return confirmedOwnedWorktreePath === ownedWorktreePathForThreadDelete(subject);
+}
+
+export function buildThreadDeleteConfirmationMessage(
+  input: ThreadDeleteConfirmationSubject,
+): string {
   const lines = [
     `Delete thread "${input.title}"?`,
     "This permanently clears conversation history for this thread.",
   ];
-  const ownedWorktreePath =
-    input.worktreeRemovable === true ? (input.worktreeRemovalPath ?? input.worktreePath) : null;
+  const ownedWorktreePath = ownedWorktreePathForThreadDelete(input);
   if (ownedWorktreePath) {
     lines.push(
       "",
       "This also permanently deletes its T3-created worktree when no other thread or project uses it:",
       formatWorktreePathForDisplay(ownedWorktreePath),
       "Uncommitted and untracked files in that worktree will be lost.",
+    );
+  }
+  return lines.join("\n");
+}
+
+export function buildThreadsDeleteConfirmationMessage(
+  inputs: ReadonlyArray<{
+    readonly worktreePath: string | null;
+    readonly worktreeRemovable?: boolean | undefined;
+    readonly worktreeRemovalPath?: string | null | undefined;
+  }>,
+): string {
+  const lines = [
+    `Delete ${inputs.length} thread${inputs.length === 1 ? "" : "s"}?`,
+    "This permanently clears conversation history for these threads.",
+  ];
+  const ownedWorktreePaths = [
+    ...new Set(
+      inputs.flatMap((input) => {
+        const path = ownedWorktreePathForThreadDelete({ title: "", ...input });
+        return path ? [path] : [];
+      }),
+    ),
+  ];
+  if (ownedWorktreePaths.length > 0) {
+    lines.push(
+      "",
+      "This also permanently deletes these T3-created worktrees when no other thread or project uses them:",
+      ...ownedWorktreePaths.map((path) => `- ${formatWorktreePathForDisplay(path)}`),
+      "Uncommitted and untracked files in those worktrees will be lost.",
     );
   }
   return lines.join("\n");
@@ -164,8 +212,51 @@ export function useThreadActions() {
   );
 
   const deleteThread = useCallback(
-    async (target: ScopedThreadRef, opts: { deletedThreadKeys?: ReadonlySet<string> } = {}) => {
-      const resolved = resolveThreadTarget(target);
+    async (
+      target: ScopedThreadRef,
+      opts: {
+        deletedThreadKeys?: ReadonlySet<string>;
+        confirmedOwnedWorktreePath?: string | null;
+        confirmationSubject?: ThreadDeleteConfirmationSubject;
+      } = {},
+    ) => {
+      let resolved = resolveThreadTarget(target);
+      const localApi = readLocalApi();
+      if (confirmThreadDelete && localApi) {
+        const fallbackSubject = opts.confirmationSubject ?? {
+          title: "this thread",
+          worktreePath: null,
+          worktreeRemovable: false,
+          worktreeRemovalPath: null,
+        };
+        let confirmedOwnedWorktreePath = opts.confirmedOwnedWorktreePath;
+        while (true) {
+          const confirmationSubject = resolved?.thread ?? fallbackSubject;
+          const currentOwnedWorktreePath = ownedWorktreePathForThreadDelete(confirmationSubject);
+          if (!isThreadDeleteConfirmationCurrent(confirmedOwnedWorktreePath, confirmationSubject)) {
+            const confirmationResult = await settlePromise(() =>
+              localApi.dialogs.confirm(buildThreadDeleteConfirmationMessage(confirmationSubject)),
+            );
+            if (confirmationResult._tag === "Failure") {
+              return confirmationResult;
+            }
+            if (!confirmationResult.value) {
+              return AsyncResult.success({ deleted: false as const });
+            }
+            confirmedOwnedWorktreePath = currentOwnedWorktreePath;
+          }
+
+          const refreshed = resolveThreadTarget(target);
+          const refreshedOwnedWorktreePath = ownedWorktreePathForThreadDelete(
+            refreshed?.thread ?? fallbackSubject,
+          );
+          if (refreshedOwnedWorktreePath === confirmedOwnedWorktreePath) {
+            resolved = refreshed;
+            break;
+          }
+          resolved = refreshed;
+        }
+      }
       if (!resolved) {
         // Thread not in main store (e.g. archived thread) — dispatch delete directly.
         const result = await deleteThreadMutation({
@@ -174,6 +265,7 @@ export function useThreadActions() {
         });
         if (result._tag === "Success") {
           refreshArchivedThreadsForEnvironment(target.environmentId);
+          return AsyncResult.success({ deleted: true as const });
         }
         return result;
       }
@@ -264,13 +356,14 @@ export function useThreadActions() {
         }
       }
 
-      return deleteResult;
+      return AsyncResult.success({ deleted: true as const });
     },
     [
       clearComposerDraftForThread,
       clearProjectDraftThreadById,
       clearTerminalUiState,
       closeTerminal,
+      confirmThreadDelete,
       deleteThreadMutation,
       getCurrentRouteThreadRef,
       router,
@@ -281,35 +374,9 @@ export function useThreadActions() {
   );
 
   const confirmAndDeleteThread = useCallback(
-    async (target: ScopedThreadRef) => {
-      const localApi = readLocalApi();
-      const resolved = resolveThreadTarget(target);
-
-      if (confirmThreadDelete && localApi) {
-        const title = resolved?.thread.title ?? "this thread";
-        const confirmationResult = await settlePromise(() =>
-          localApi.dialogs.confirm(
-            resolved
-              ? buildThreadDeleteConfirmationMessage(resolved.thread)
-              : buildThreadDeleteConfirmationMessage({
-                  title,
-                  worktreePath: null,
-                  worktreeRemovable: false,
-                  worktreeRemovalPath: null,
-                }),
-          ),
-        );
-        if (confirmationResult._tag === "Failure") {
-          return confirmationResult;
-        }
-        if (!confirmationResult.value) {
-          return AsyncResult.success(undefined);
-        }
-      }
-
-      return deleteThread(target);
-    },
-    [confirmThreadDelete, deleteThread, resolveThreadTarget],
+    (target: ScopedThreadRef, confirmationSubject?: ThreadDeleteConfirmationSubject) =>
+      deleteThread(target, confirmationSubject ? { confirmationSubject } : {}),
+    [deleteThread],
   );
 
   return useMemo(
