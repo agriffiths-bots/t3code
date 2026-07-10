@@ -40,8 +40,8 @@ export const PendingDispatch = Schema.Struct({
    */
   commandId: Schema.NullOr(Schema.String),
   /**
-   * True when a foreground promoted child result has already been returned by
-   * t3_wait_subagent. The row remains durable until the parent turn completes;
+   * True when a foreground-promoted child result has already been delivered.
+   * The row remains durable until the parent turn completes;
    * then the coordinator prunes it instead of dispatching a duplicate wake.
    */
   deliveredByWait: Schema.Boolean,
@@ -103,8 +103,8 @@ export interface PendingDispatchRepositoryShape {
   ) => Effect.Effect<void, ProjectionRepositoryError>;
 
   /**
-   * Durably mark rows whose child result was delivered through t3_wait_subagent
-   * before the parent turn committed. A no-op for an empty id list.
+   * Durably mark rows whose child result was delivered before the parent turn
+   * committed. A no-op for an empty id list.
    */
   readonly markWaitDelivered: (
     input: MarkPendingDispatchesWaitDeliveredInput,

@@ -3,8 +3,8 @@
  *
  * Tracks parent/child thread relationships in memory, settles a per-child
  * terminal `Deferred` exactly once from death/completion domain events, and
- * exposes a BOUNDED `waitSlice` so the `t3_wait_subagent` MCP tool never holds
- * a single long HTTP call (see finalPlan §5/C6). Detached children wake their
+ * retains a BOUNDED `waitSlice` for internal coordinator callers and tests.
+ * Detached children wake their
  * parent (idle -> dispatch a turn, mid-turn -> enqueue) under a per-parent
  * lock; pending injections drain when the parent next completes a turn.
  *
@@ -18,9 +18,7 @@ import type * as Scope from "effect/Scope";
 import type { ThreadStartToolError } from "../../mcp/toolkits/thread/tools.ts";
 
 /**
- * Bound on a single `waitSlice`: each MCP `t3_wait_subagent` invocation waits
- * at most this long before returning `pending` so the agent re-calls. Keeps
- * every HTTP call well within the cross-provider timeout tolerance (C6).
+ * Bound on a single internal `waitSlice` observation before returning pending.
  */
 export const WAIT_SLICE_SECONDS = 20;
 
@@ -53,7 +51,7 @@ export interface ChildWaitResult {
   readonly error: string | null;
 }
 
-/** Per-child wait status surfaced to the MCP tool (adds the non-terminal states). */
+/** Per-child wait status surfaced to internal coordinator callers. */
 export type WaitChildStatus = ChildTerminalStatus | "timeout" | "pending";
 
 export interface WaitChildResult {

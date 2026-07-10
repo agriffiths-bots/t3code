@@ -3,9 +3,9 @@
 Manual (non-CI) end-to-end verification that a real Claude agent running INSIDE
 a t3 thread drives the sub-agent + scheduler MCP tools (migrations 033/034,
 `ChildThreadCoordinator` + `ScheduledTasksReactor`, the
-`t3_spawn_subagent` / `t3_steer_subagent` / `t3_check_subagent` /
-`t3_wait_subagent` / `t3_list_subagent` / `t3_schedule_create|list|update|delete`
-tools). Full scenario design lives in **`/tmp/t3-design/e2ePlan.md`** — this
+`t3_spawn_subagent` / `t3_steer_subagent` / `t3_subagents` /
+`t3_schedule_create|list|update|delete` tools). Full scenario design lives in
+**`/tmp/t3-design/e2ePlan.md`** — this
 README maps that plan onto the assets in this directory.
 
 All assertions come from observable persisted state: the SQLite projection
@@ -55,35 +55,34 @@ healthy. **Always kill any server you start when done.**
 
 ### (b) Cross-provider spawn (claude+codex+cursor) — `e2ePlan.md` §(b)
 
-- After `t3_spawn_subagent` ×3 (one per provider, `detached:true`):
+- After `t3_spawn_subagent` ×3 (one required model/title pair per provider):
   `childrenOf(db, root)` returns 3 rows with `parent_thread_id=root`; the
   `model` column verifies per-provider routing.
 - `threadShell(db, child).latestTurn.state` goes `running` → `completed`.
-- Fan-out + single `t3_wait_subagent(mode:"all")`: assert each child settled and
-  has non-null `assistantMessages(db, child)`.
+- `t3_subagents()` lists all three children and `t3_subagents({childThreadId})`
+  reports each child's latest text after it settles.
 - Detached WAKE / consolidation: `assistantMessages(db, root, "user")` contains
   the `[sub-agent <id> completed]` injection(s) — one turn carrying both for the
   two-child consolidation case.
 
-### (c) Long wait ~1 hour (opt-in `E2E_ENABLE_1H=1`) — `e2ePlan.md` §(c)
+### (c) Long-running child wakes its parent (opt-in `E2E_ENABLE_1H=1`) — `e2ePlan.md` §(c)
 
 - Child prompt runs `fib-sleep.sh` (default `FIB_SCALE=60`, 54 min cumulative),
   keeping its turn alive script-driven (reliable, not model-driven).
-- Driver loops `t3_wait_subagent(timeoutSeconds:3900)` across ~20s slices.
+- The parent continues independently after spawn; no polling/wait tool is used.
 - Assert with `threadShell` that the child turn does not settle early; measured
   wall-clock spawn→settle in [50,62] min; cross-check
-  `turnTimestamps(db, child)` `completed_at - requested_at` ≈ duration. Each
-  intermediate slice returns `status:"pending"` + resumeToken, HTTP <30s.
+  `turnTimestamps(db, child)` `completed_at - requested_at` ≈ duration. After
+  completion, the parent receives exactly one coordinator wake injection.
 - For local iteration, set the child prompt to use `FIB_SCALE=1` (54s) to
-  exercise the slice/resumeToken loop without the 1h hold.
+  exercise the same wake-on-completion path without the 1h hold.
 
-### (d) Killed child → wait returns failure, not hang — `e2ePlan.md` §(d)
+### (d) Killed child → parent receives failure wake — `e2ePlan.md` §(d)
 
-- Spawn a ~10 min child (`FIB_SCALE` tuned), start the wait loop.
+- Spawn a ~10 min child (`FIB_SCALE` tuned), then let the parent continue.
 - Kill via (i) `thread.delete`, (ii) `kill -9` the provider process,
-  (iii) `session.stop`. Assert wait reports `killed`/`failed` within one slice;
+  (iii) `session.stop`. Assert the parent wake reports `killed`/`failed`;
   `threadShell(db, child).session.last_error` is populated and
   `latestTurn.state` is `failed`/`interrupted`.
-- CONTROL: `t3_wait_subagent(timeoutSeconds:5)` on a live child → `timeout`.
 - ORPHAN: kill the parent after a detached spawn; assert a WARN is logged and no
-  crash (documented preview limitation).
+  crash (documented limitation).
