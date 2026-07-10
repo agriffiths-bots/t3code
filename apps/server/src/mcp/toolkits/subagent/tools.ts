@@ -8,10 +8,7 @@ import {
 import * as Schema from "effect/Schema";
 import { Tool, Toolkit } from "effect/unstable/ai";
 
-import {
-  ScheduleBusyPolicy,
-  ScheduledTaskId,
-} from "../../../persistence/Services/ScheduledTasks.ts";
+import { ScheduledTaskId } from "../../../persistence/Services/ScheduledTasks.ts";
 import * as McpInvocationContext from "../../McpInvocationContext.ts";
 import {
   ThreadStartInternalInput,
@@ -114,7 +111,6 @@ export const ScheduleCreateInput = Schema.Struct({
   intervalSeconds: Schema.optional(Schema.Int),
   cronExpr: Schema.optional(Schema.String),
   timezone: Schema.optional(Schema.String),
-  busyPolicy: Schema.optional(ScheduleBusyPolicy),
   // Optional plain model name (e.g. "claude-opus-4-8" or "gpt-5.4"); the
   // provider/harness is inferred from the live model lists, so the caller never
   // guesses a harness/instance id. Omit to inherit the thread's current model.
@@ -142,7 +138,6 @@ export type ScheduleListOutput = typeof ScheduleListOutput.Type;
 export const ScheduleUpdateInput = Schema.Struct({
   taskId: ScheduledTaskId,
   enabled: Schema.optional(Schema.Boolean),
-  busyPolicy: Schema.optional(ScheduleBusyPolicy),
   intervalSeconds: Schema.optional(Schema.Int),
   cronExpr: Schema.optional(Schema.String),
   // Re-route the schedule to a new plain model name (provider/harness inferred),
@@ -202,7 +197,7 @@ export const SubagentsTool = Tool.make("t3_subagents", {
 
 export const ScheduleCreateTool = Tool.make("t3_schedule_create", {
   description:
-    "Schedule a recurring prompt to be sent to a thread (defaults to the calling thread). Provide exactly one of intervalSeconds (fixed interval) or cronExpr (a cron expression, validated on create); optionally a timezone (IANA name, default UTC) and busyPolicy (\"skip\" default, or \"queue_once\"). The same thread is reused on every trigger. To pin the model each run uses, pass `model` as a plain model name (e.g. 'claude-opus-4-8' or 'gpt-5.4'); the provider/harness is inferred automatically, so you never guess a harness/instance id. Pin a model on the thread's own provider (like the interactive model picker) — pinning a different provider than the thread's active session errors at run time, so prefer a dedicated thread for a cross-provider schedule. Omit `model` to inherit the thread's current model on each run.",
+    "Schedule a recurring prompt to be sent to a thread (defaults to the calling thread). Provide exactly one of intervalSeconds (fixed interval) or cronExpr (a cron expression, validated on create); timezone defaults to UTC and the busy policy always defaults to skip. The same thread is reused on every trigger. To pin the model each run uses, pass `model` as a plain model name (e.g. 'claude-opus-4-8' or 'gpt-5.4'); the provider/harness is inferred automatically, so you never guess a harness/instance id. Pin a model on the thread's own provider (like the interactive model picker) — pinning a different provider than the thread's active session errors at run time, so prefer a dedicated thread for a cross-provider schedule. Omit `model` to inherit the thread's current model on each run.",
   parameters: ScheduleCreateInput,
   success: ScheduleEntry,
   failure: ThreadStartToolError,
@@ -226,7 +221,7 @@ export const ScheduleListTool = Tool.make("t3_schedule_list", {
 
 export const ScheduleUpdateTool = Tool.make("t3_schedule_update", {
   description:
-    "Update a scheduled task: enable/disable it, change its busyPolicy, change its interval or cron expression (cron is re-validated), re-route it to a new model by passing `model` as a plain model name (provider/harness inferred), or pass `model: null` to un-pin the model so runs inherit the thread's current model again. Only the supplied fields are changed.",
+    "Update a scheduled task: enable/disable it, change its interval or cron expression (cron is re-validated), re-route it to a new model by passing `model` as a plain model name (provider/harness inferred), or pass `model: null` to un-pin the model so runs inherit the thread's current model again. The persisted busy policy is preserved. Only the supplied fields are changed.",
   parameters: ScheduleUpdateInput,
   success: ScheduleEntry,
   failure: ThreadStartToolError,

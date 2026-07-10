@@ -399,12 +399,13 @@ const ServerApplicationRegistrationsLive = Layer.mergeAll(
   SubagentRuntimeLive.pipe(
     Layer.provideMerge(PendingDispatchRepositoryLive),
     Layer.provideMerge(RemoteChildRepositoryLive),
-    Layer.provideMerge(SubagentPeerRegistry.layer),
+    Layer.provide(SubagentPeerRegistry.layer),
   ),
 );
 
 const McpRoutesLayer = Layer.mergeAll(mcpPeerTokenRouteLayer, McpHttpServer.layer).pipe(
   Layer.provide(McpSessionRegistry.layer),
+  Layer.provide(SubagentPeerRegistry.layer),
 );
 
 export const makeRoutesLayer = Layer.mergeAll(

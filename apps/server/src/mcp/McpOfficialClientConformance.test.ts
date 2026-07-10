@@ -6,6 +6,7 @@ import { CallToolResultSchema, ListToolsResultSchema } from "@modelcontextprotoc
 import { expect, it } from "@effect/vitest";
 import {
   EnvironmentId,
+  type ExecutionEnvironmentDescriptor,
   ProjectId,
   ProviderDriverKind,
   ProviderInstanceId,
@@ -17,13 +18,15 @@ import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Stream from "effect/Stream";
-import { HttpRouter, HttpServer } from "effect/unstable/http";
+import { FetchHttpClient, HttpRouter, HttpServer } from "effect/unstable/http";
 
+import * as ServerEnvironment from "../environment/ServerEnvironment.ts";
 import * as DeviceNotifications from "../notifications/DeviceNotifications.ts";
 import { ProjectionSnapshotQuery } from "../orchestration/Services/ProjectionSnapshotQuery.ts";
 import { ProviderRegistry } from "../provider/Services/ProviderRegistry.ts";
 import { makeProviderRegistryMock } from "../provider/testUtils/providerRegistryMock.ts";
 import { ServerSettingsService } from "../serverSettings.ts";
+import * as SubagentPeerRegistry from "../subagents/SubagentPeerRegistry.ts";
 import * as PlanUsageSnapshot from "../usage/PlanUsageSnapshot.ts";
 import * as McpHttpServer from "./McpHttpServer.ts";
 import * as McpInvocationContext from "./McpInvocationContext.ts";
@@ -182,6 +185,28 @@ const deviceNotificationsLayer = Layer.mock(DeviceNotifications.DeviceNotificati
   events: Stream.empty,
 });
 
+const conformanceEnvironmentDescriptor: ExecutionEnvironmentDescriptor = {
+  environmentId,
+  label: "MCP Conformance",
+  platform: { os: "linux", arch: "x64" },
+  serverVersion: "0.0.0-test",
+  capabilities: { repositoryIdentity: true },
+};
+
+const serverEnvironmentLayer = Layer.succeed(ServerEnvironment.ServerEnvironment, {
+  getEnvironmentId: Effect.succeed(environmentId),
+  getDescriptor: Effect.succeed(conformanceEnvironmentDescriptor),
+});
+
+const subagentPeerRegistryLayer = Layer.succeed(SubagentPeerRegistry.SubagentPeerRegistry, {
+  add: () => Effect.die("unused"),
+  list: Effect.succeed([]),
+  remove: () => Effect.die("unused"),
+  getByAlias: () => Effect.succeed(Option.none()),
+  resolveTarget: () => Effect.die("unused"),
+  updateLastSeen: () => Effect.succeed(Option.none()),
+});
+
 const conformanceLayer = McpHttpServer.layer.pipe(
   Layer.provide(mcpSessionRegistryLayer),
   Layer.provide(deviceNotificationsLayer),
@@ -193,6 +218,9 @@ const conformanceLayer = McpHttpServer.layer.pipe(
     }),
   ),
   Layer.provide(Layer.succeed(ProviderRegistry, makeProviderRegistryMock([makeProvider()]))),
+  Layer.provide(serverEnvironmentLayer),
+  Layer.provide(subagentPeerRegistryLayer),
+  Layer.provide(FetchHttpClient.layer),
   Layer.provide(projectionSnapshotQueryLayer),
 );
 
@@ -309,6 +337,15 @@ it.effect("conforms to the official streamable HTTP MCP client", () =>
         ]);
       }
 
+      const propertiesOf = (toolName: string) => {
+        const tool = toolsResult.tools.find((candidate) => candidate.name === toolName);
+        expect(tool, `${toolName} must be present`).toBeDefined();
+        return tool?.inputSchema.properties ?? {};
+      };
+      expect(propertiesOf("t3_notify")).not.toHaveProperty("requireInteraction");
+      expect(propertiesOf("t3_schedule_create")).not.toHaveProperty("busyPolicy");
+      expect(propertiesOf("t3_schedule_update")).not.toHaveProperty("busyPolicy");
+
       for (const tool of toolsResult.tools) {
         expect(tool.inputSchema.type, `${tool.name} input schema must be an object`).toBe("object");
         expect(tool.inputSchema.anyOf, `${tool.name} input schema must not root anyOf`).toBe(
@@ -345,7 +382,15 @@ it.effect("conforms to the official streamable HTTP MCP client", () =>
       expect(callResult.structuredContent).toBeDefined();
       expect(callResult.structuredContent).not.toBeNull();
       expect(callResult.structuredContent).toMatchObject({
-        backends: [{ instanceId: "codex", driver: "codex" }],
+        backends: [
+          {
+            alias: "local",
+            environmentId: "environment-mcp-conformance",
+            os: "linux",
+            status: "online",
+            providers: [{ instanceId: "codex", driver: "codex" }],
+          },
+        ],
       });
       expect(callResult.content.length).toBeGreaterThan(0);
       for (const block of callResult.content) {

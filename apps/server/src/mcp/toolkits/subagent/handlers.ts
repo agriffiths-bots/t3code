@@ -1473,7 +1473,7 @@ const scheduleCreate = Effect.fn("SubagentToolkit.scheduleCreate")(function* (
     cronExpr,
     timezoneName: timezone,
     enabled: NonNegativeInt.make(1),
-    busyPolicy: input.busyPolicy ?? "skip",
+    busyPolicy: "skip",
     nextRunAt: nextRunAt === null ? null : IsoDateTime.make(nextRunAt),
     lastRunAt: null,
     lastStatus: null,
@@ -1595,7 +1595,7 @@ const scheduleUpdate = Effect.fn("SubagentToolkit.scheduleUpdate")(function* (
     ...existing,
     enabled:
       input.enabled === undefined ? existing.enabled : NonNegativeInt.make(input.enabled ? 1 : 0),
-    busyPolicy: input.busyPolicy ?? existing.busyPolicy,
+    busyPolicy: existing.busyPolicy,
     scheduleKind,
     intervalSeconds,
     cronExpr,

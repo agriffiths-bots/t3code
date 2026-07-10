@@ -289,7 +289,7 @@ let peerHttpHandler:
 // Fix 1 seams: the enabled provider instances (with their live model lists) the
 // schedule handlers resolve a plain `model` against, and the tasks they persist.
 let modelInstances: ReadonlyArray<unknown> = [];
-const insertedTasks: Array<{ readonly modelSelection: ModelSelection | null }> = [];
+const insertedTasks: Array<Pick<ScheduledTask, "busyPolicy" | "modelSelection">> = [];
 // Existing scheduled tasks visible to t3_schedule_update (via listAll), and the
 // updated rows it writes back — so a test can assert a model re-route / un-pin.
 let existingTasks: ReadonlyArray<ScheduledTask> = [];
@@ -435,7 +435,10 @@ const remoteCheckPeerHandler = (check: RemoteCheckFixture) =>
   remoteCheckPeerHandlerWith(() => check);
 
 const scheduledTaskId = ScheduledTaskId.make("sched-fix1");
-const makeScheduledTask = (modelSelection: ModelSelection | null): ScheduledTask => ({
+const makeScheduledTask = (
+  modelSelection: ModelSelection | null,
+  busyPolicy: ScheduledTask["busyPolicy"] = "skip",
+): ScheduledTask => ({
   taskId: scheduledTaskId,
   threadId: parentThreadId,
   prompt: "nightly summary",
@@ -444,7 +447,7 @@ const makeScheduledTask = (modelSelection: ModelSelection | null): ScheduledTask
   cronExpr: null,
   timezoneName: "UTC",
   enabled: NonNegativeInt.make(1),
-  busyPolicy: "skip",
+  busyPolicy,
   nextRunAt: IsoDateTime.make("2026-06-17T10:00:00.000Z"),
   lastRunAt: null,
   lastStatus: null,
@@ -2703,6 +2706,7 @@ describe("SubagentToolkit", () => {
         });
         // ...and the persisted task carries the same resolved selection.
         expect(insertedTasks).toHaveLength(1);
+        expect(insertedTasks[0]!.busyPolicy).toBe("skip");
         expect(insertedTasks[0]!.modelSelection).toMatchObject({
           instanceId: "claudeAgent",
           model: "claude-opus-4-8",
@@ -2865,6 +2869,30 @@ describe("SubagentToolkit", () => {
           instanceId: "codex",
           model: "gpt-5.4",
         });
+      }),
+    ).pipe(Effect.provide(TestLayer)),
+  );
+
+  it.effect("t3_schedule_update preserves the persisted busy policy", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const server = yield* McpServer.McpServer;
+        updatedTasks.length = 0;
+        existingTasks = [makeScheduledTask(null, "queue_once")];
+
+        const result = yield* server
+          .callTool({
+            name: "t3_schedule_update",
+            arguments: { taskId: scheduledTaskId, enabled: false },
+          })
+          .pipe(
+            Effect.provideService(McpInvocationContext.McpInvocationContext, invocation),
+            Effect.provideService(McpSchema.McpServerClient, client),
+          );
+
+        expect(result.isError).toBe(false);
+        expect(updatedTasks).toHaveLength(1);
+        expect(updatedTasks[0]!.busyPolicy).toBe("queue_once");
       }),
     ).pipe(Effect.provide(TestLayer)),
   );
