@@ -1404,7 +1404,10 @@ function deriveTimelineTurnBoundaries(
 ): ReadonlyMap<string, TimelineTurnBoundary> {
   const grouped = new Map<string, Array<TimelineEntry>>();
   const turnsById = new Map(turns.map((turn) => [String(turn.turnId), turn] as const));
-  if (latestTurn !== null && !turnsById.has(String(latestTurn.turnId))) {
+  if (latestTurn !== null) {
+    // The shell subscription can advance before the detail snapshot. Prefer
+    // its authoritative latest-turn boundary over a stale matching history
+    // row during that reconnect window.
     turnsById.set(String(latestTurn.turnId), latestTurn);
   }
   for (const entry of rows) {
@@ -1424,18 +1427,22 @@ function deriveTimelineTurnBoundaries(
   for (const [turnId, entries] of grouped.entries()) {
     const turn = turnsById.get(turnId);
     if (!turn) {
+      // Without the persisted request boundary, an attached user prompt is
+      // ambiguous: it can be either the turn start or a Claude mid-turn steer.
+      // Raw chronology is safer than moving real pre-steer output below it.
       continue;
     }
     const promptEntry = entries
       .filter(timelineEntryIsPrompt)
       .toSorted(compareTimelineEntryTimestamp)[0];
+    const requestedAt = turn.requestedAt;
     // A turn-start prompt is recorded no later than the turn request. Any
     // prompt after requestedAt is a steer, even when all preceding output is
     // an ACP replay segment carrying a stale pre-request timestamp.
-    const isStartPrompt = promptEntry !== undefined && promptEntry.createdAt <= turn.requestedAt;
+    const isStartPrompt = promptEntry !== undefined && promptEntry.createdAt <= requestedAt;
     boundaries.set(turnId, {
-      requestedAt: turn.requestedAt,
-      floorTimestamp: isStartPrompt ? promptEntry.createdAt : turn.requestedAt,
+      requestedAt,
+      floorTimestamp: isStartPrompt ? promptEntry.createdAt : requestedAt,
       startPromptEntryId: isStartPrompt ? promptEntry.id : null,
       startPromptInputIndex: isStartPrompt ? (inputIndex.get(promptEntry.id) ?? 0) : null,
     });

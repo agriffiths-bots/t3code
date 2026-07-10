@@ -1608,6 +1608,89 @@ describe("deriveTimelineEntries", () => {
     ]);
   });
 
+  it("prefers the latest-turn request boundary over a stale matching history row", () => {
+    const turnId = TurnId.make("turn-reconnected");
+    const entries = deriveTimelineEntries(
+      [
+        {
+          id: MessageId.make("user-reconnected"),
+          role: "user",
+          text: "resume after reconnect",
+          createdAt: "2026-02-23T00:01:00.000Z",
+          turnId,
+          updatedAt: "2026-02-23T00:01:00.000Z",
+          streaming: false,
+        },
+        {
+          id: MessageId.make("assistant-reconnected-stale-segment"),
+          role: "assistant",
+          text: "replayed segment with its original timestamp",
+          createdAt: "2026-02-23T00:00:30.000Z",
+          turnId,
+          updatedAt: "2026-02-23T00:01:01.000Z",
+          streaming: false,
+        },
+      ],
+      [],
+      [],
+      [{ turnId, requestedAt: "2026-02-23T00:00:00.000Z" }],
+      { turnId, requestedAt: "2026-02-23T00:01:00.000Z" },
+    );
+
+    expect(entries.map((entry) => entry.id)).toEqual([
+      "user-reconnected",
+      "assistant-reconnected-stale-segment",
+    ]);
+  });
+
+  it("does not infer a turn-start boundary from a historical Claude steer", () => {
+    const historicalTurnId = TurnId.make("turn-history-gap");
+    const entries = deriveTimelineEntries(
+      [
+        {
+          id: MessageId.make("assistant-before-history-gap-steer"),
+          role: "assistant",
+          text: "output before steer",
+          createdAt: "2026-02-23T00:00:30.000Z",
+          turnId: historicalTurnId,
+          updatedAt: "2026-02-23T00:00:30.000Z",
+          streaming: false,
+        },
+        {
+          id: MessageId.make("user-history-gap-steer"),
+          role: "user",
+          text: "historical steer",
+          createdAt: "2026-02-23T00:01:00.000Z",
+          turnId: historicalTurnId,
+          updatedAt: "2026-02-23T00:01:00.000Z",
+          streaming: false,
+        },
+        {
+          id: MessageId.make("assistant-after-history-gap-steer"),
+          role: "assistant",
+          text: "output after steer",
+          createdAt: "2026-02-23T00:01:30.000Z",
+          turnId: historicalTurnId,
+          updatedAt: "2026-02-23T00:01:30.000Z",
+          streaming: false,
+        },
+      ],
+      [],
+      [],
+      [],
+      {
+        turnId: TurnId.make("turn-current"),
+        requestedAt: "2026-02-23T00:02:00.000Z",
+      },
+    );
+
+    expect(entries.map((entry) => entry.id)).toEqual([
+      "assistant-before-history-gap-steer",
+      "user-history-gap-steer",
+      "assistant-after-history-gap-steer",
+    ]);
+  });
+
   it.each([
     ["Codex", null, "2026-07-10T08:00:01.000Z", "2026-07-10T08:00:01.000Z", true],
     [
