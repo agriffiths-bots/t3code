@@ -29,7 +29,6 @@ import * as HttpApiBuilder from "effect/unstable/httpapi/HttpApiBuilder";
 import { OtlpTracer } from "effect/unstable/observability";
 
 import * as ServerConfig from "./config.ts";
-import * as ServerSettings from "./serverSettings.ts";
 import {
   ASSET_ROUTE_PREFIX,
   FALLBACK_PROJECT_FAVICON_SVG,
@@ -56,7 +55,7 @@ import {
   normalizeCorsOrigin,
 } from "./httpCors.ts";
 import { buildElevenLabsRequest, resolveVoiceId, validateTtsText } from "./tts/ttsRequest.logic.ts";
-import { loadPlanUsageSnapshot } from "./usage/PlanUsage.ts";
+import * as PlanUsageSnapshot from "./usage/PlanUsageSnapshot.ts";
 import {
   SUBAGENT_PEER_MCP_TOKEN_PATH,
   SubagentPeerMcpTokenRequest,
@@ -467,11 +466,8 @@ export const planUsageRouteLayer = HttpRouter.add(
     const providerInstanceId = rawProviderInstanceId
       ? Option.getOrNull(decodedProviderInstanceId)
       : null;
-    const serverSettings = yield* ServerSettings.ServerSettingsService;
-    const settings = yield* serverSettings.getSettings;
-    const snapshot = yield* Effect.promise(() =>
-      loadPlanUsageSnapshot({ providerInstanceId, settings }),
-    );
+    const planUsage = yield* PlanUsageSnapshot.PlanUsageSnapshotStore;
+    const snapshot = yield* planUsage.read(providerInstanceId);
 
     return HttpServerResponse.jsonUnsafe(snapshot, {
       headers: {

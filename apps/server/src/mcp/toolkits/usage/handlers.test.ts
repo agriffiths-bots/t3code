@@ -10,6 +10,7 @@ import * as Layer from "effect/Layer";
 import { McpSchema, McpServer } from "effect/unstable/ai";
 
 import { ServerSettingsService } from "../../../serverSettings.ts";
+import * as PlanUsageSnapshot from "../../../usage/PlanUsageSnapshot.ts";
 import * as McpInvocationContext from "../../McpInvocationContext.ts";
 import { UsageToolkitRegistrationLive } from "../../McpHttpServer.ts";
 
@@ -63,6 +64,12 @@ const withPlanUsagePollingDisabled = <A, E, R>(effect: Effect.Effect<A, E, R>) =
 const makeLayer = () =>
   UsageToolkitRegistrationLive.pipe(
     Layer.provideMerge(McpServer.McpServer.layer),
+    Layer.provide(
+      PlanUsageSnapshot.layerTest({
+        updatedAt: "2026-07-10T08:00:00.000Z",
+        providers: [],
+      }),
+    ),
     Layer.provide(ServerSettingsService.layerTest(DEFAULT_SERVER_SETTINGS)),
   );
 

@@ -77,4 +77,39 @@ describe("ComposerPrimaryActions", () => {
 
     expect(markup).not.toContain(">Send</span>");
   });
+
+  it("shows stop only while running with an empty draft", () => {
+    const markup = renderActions({
+      isRunning: true,
+      hasSendableContent: false,
+      showSendLabel: true,
+    });
+
+    expect(markup).toContain('aria-label="Stop generation"');
+    expect(markup).toContain("min-w-16");
+    expect(markup).toContain(">Stop</span>");
+    expect(markup).not.toContain('aria-label="Send message"');
+  });
+
+  it("shows send for a steering draft while running", () => {
+    const markup = renderActions({
+      isRunning: true,
+      hasSendableContent: true,
+      showSendLabel: true,
+    });
+
+    expect(markup).toContain('aria-label="Send message"');
+    expect(markup).toContain("min-w-16");
+    expect(markup).toContain(">Send</span>");
+    expect(markup).not.toContain('aria-label="Stop generation"');
+  });
+
+  it("shows send while idle regardless of draft content", () => {
+    expect(renderActions({ isRunning: false, hasSendableContent: false })).toContain(
+      'aria-label="Send message"',
+    );
+    expect(renderActions({ isRunning: false, hasSendableContent: true })).toContain(
+      'aria-label="Send message"',
+    );
+  });
 });

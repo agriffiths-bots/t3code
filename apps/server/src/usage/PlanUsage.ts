@@ -609,7 +609,7 @@ function parseCodexRateLimitsResponse(payload: unknown): ParsedProviderUsage | n
   if (!root || !rateLimits) return null;
 
   const rateLimitsByLimitId = objectValue(root.rateLimitsByLimitId);
-  const bucketEntries = rateLimitsByLimitId
+  const availableBucketEntries = rateLimitsByLimitId
     ? Object.entries(rateLimitsByLimitId)
         .map(([key, value], index) => ({ index, key, rateLimits: objectValue(value) }))
         .filter(
@@ -622,6 +622,12 @@ function parseCodexRateLimitsResponse(payload: unknown): ParsedProviderUsage | n
           } => entry.rateLimits !== null,
         )
     : [];
+  const bucketEntries = availableBucketEntries.filter(({ key, rateLimits: bucket }) => {
+    const id = stringValue(bucket.limitId) ?? key;
+    const label = codexRateLimitBucketLabel(bucket, key);
+    const isSparkBucket = (value: string) => /(^|[^a-z])spark([^a-z]|$)/i.test(value);
+    return !isSparkBucket(id) && !isSparkBucket(label ?? "");
+  });
   const bucketWindows = bucketEntries.flatMap(({ index, key, rateLimits: bucket }) => {
     const slug = codexRateLimitBucketSlug(stringValue(bucket.limitId) ?? key, index);
     const label = codexRateLimitBucketLabel(bucket, key);
@@ -632,7 +638,7 @@ function parseCodexRateLimitsResponse(payload: unknown): ParsedProviderUsage | n
     });
   });
   const windows =
-    bucketWindows.length > 0
+    availableBucketEntries.length > 0
       ? bucketWindows
       : codexWindowsForRateLimitBucket({
           rateLimits,
@@ -953,6 +959,37 @@ export function resolveUsageCredentialScope(
   return {
     cacheKey: usageScopeCacheKey(sources),
     sources,
+  };
+}
+
+export function scopePlanUsageSnapshot(
+  snapshot: PlanUsageSnapshot,
+  providerInstanceId: ProviderInstanceIdType,
+  settings: ServerSettings,
+): PlanUsageSnapshot {
+  const requestedSource = resolveUsageCredentialScope({ settings, providerInstanceId }).sources[0];
+  if (!requestedSource) return { updatedAt: snapshot.updatedAt, providers: [] };
+  const canonicalSource = resolveUsageCredentialScope({ settings }).sources.find(
+    (source) => usageProbeKey(source) === usageProbeKey(requestedSource),
+  );
+  if (!canonicalSource) return { updatedAt: snapshot.updatedAt, providers: [] };
+  const canonicalMarker = `:${canonicalSource.instanceId}:`;
+  const requestedMarker = `:${providerInstanceId}:`;
+  const canonicalTitleSuffix = ` (${canonicalSource.instanceId})`;
+  return {
+    updatedAt: snapshot.updatedAt,
+    providers: snapshot.providers.flatMap((provider) => {
+      const windows = provider.windows
+        .filter((window) => window.id.includes(canonicalMarker))
+        .map((window) => ({
+          ...window,
+          id: window.id.replace(canonicalMarker, requestedMarker),
+          title: window.title.endsWith(canonicalTitleSuffix)
+            ? window.title.slice(0, -canonicalTitleSuffix.length)
+            : window.title,
+        }));
+      return windows.length > 0 ? [{ ...provider, windows }] : [];
+    }),
   };
 }
 

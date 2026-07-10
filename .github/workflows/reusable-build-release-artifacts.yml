@@ -243,12 +243,24 @@ jobs:
       T3CODE_CLERK_JWT_TEMPLATE: ${{ inputs.clerk_jwt_template }}
       T3CODE_CLERK_CLI_OAUTH_CLIENT_ID: ${{ inputs.clerk_cli_oauth_client_id }}
       T3CODE_RELAY_URL: ${{ inputs.relay_url }}
+      T3CODE_BUILD_VERSION: ${{ inputs.release_version }}
     steps:
       - name: Checkout
         uses: actions/checkout@v6
         with:
           ref: ${{ inputs.ref }}
           fetch-depth: 0
+
+      - name: Stamp checked-out build SHA
+        shell: bash
+        run: |
+          set -euo pipefail
+          build_sha="$(git rev-parse HEAD)"
+          if [[ ! "$build_sha" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::Expected a full GitHub commit SHA, got '$build_sha'."
+            exit 1
+          fi
+          echo "T3CODE_BUILD_SHA=$build_sha" >> "$GITHUB_ENV"
 
       - name: Setup Vite+
         uses: voidzero-dev/setup-vp@v1

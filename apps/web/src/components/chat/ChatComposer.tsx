@@ -901,6 +901,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
   const [isComposerModelPickerOpen, setIsComposerModelPickerOpen] = useState(false);
   const [isComposerFocused, setIsComposerFocused] = useState(false);
   const isMobileViewport = useMediaQuery("max-sm");
+  const hasCoarsePointer = useMediaQuery({ pointer: "coarse" });
   const isComposerCollapsedMobile = isMobileViewport && !isComposerFocused;
 
   // ------------------------------------------------------------------
@@ -1780,7 +1781,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     }
     if (
       key === "Enter" &&
-      shouldSubmitComposerOnEnter({ isMobileViewport, shiftKey: event.shiftKey })
+      shouldSubmitComposerOnEnter({ hasCoarsePointer, shiftKey: event.shiftKey })
     ) {
       submitComposer();
       return true;

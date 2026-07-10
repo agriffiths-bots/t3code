@@ -1,4 +1,5 @@
 import "vite-plus/test/config";
+import { normalizeBuildVersion } from "@t3tools/shared/semver";
 import { defineConfig, mergeConfig } from "vite-plus";
 
 import baseConfig from "../../vite.config.ts";
@@ -40,6 +41,7 @@ function resolveBuildSha(): string {
 }
 
 const buildSha = resolveBuildSha();
+const buildVersion = normalizeBuildVersion(process.env.T3CODE_BUILD_VERSION) ?? "";
 
 export default mergeConfig(
   baseConfig,
@@ -67,6 +69,7 @@ export default mergeConfig(
       },
       define: {
         __T3CODE_BUILD_SHA__: JSON.stringify(buildSha),
+        __T3CODE_BUILD_VERSION__: JSON.stringify(buildVersion),
         __T3CODE_BUILD_RELAY_URL__: JSON.stringify(repoEnv.T3CODE_RELAY_URL?.trim() ?? ""),
         __T3CODE_BUILD_CLERK_PUBLISHABLE_KEY__: JSON.stringify(
           repoEnv.T3CODE_CLERK_PUBLISHABLE_KEY?.trim() ?? "",
