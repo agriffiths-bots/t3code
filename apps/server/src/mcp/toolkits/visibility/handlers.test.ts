@@ -118,7 +118,7 @@ const decodeRequest = (request: HttpClientRequest.HttpClientRequest) => {
 const jsonRpcResult = (id: number, result: unknown) => ({ jsonrpc: "2.0", id, result });
 
 const remoteInventoryHandler =
-  (calledTools: string[]): TestHttpHandler =>
+  (calledTools: string[], environmentId = "environment-visibility-windows"): TestHttpHandler =>
   (request) => {
     if (request.method === "DELETE") {
       return Effect.succeed(
@@ -159,7 +159,7 @@ const remoteInventoryHandler =
                 backends: [
                   {
                     alias: "local",
-                    environmentId: "environment-visibility-windows",
+                    environmentId,
                     label: "Windows Workstation",
                     os: "windows",
                     status: "online",
@@ -347,6 +347,37 @@ it.effect("keeps failed configured peers visible with descriptor OS and no provi
         },
       ],
     });
+  }),
+);
+
+it.effect("rejects peer inventory from a different environment", () =>
+  Effect.gen(function* () {
+    const calledTools: string[] = [];
+    const seenAliases: string[] = [];
+    const result = yield* callListBackends(
+      makeLayer({
+        providers: [],
+        peers: [windowsPeer()],
+        httpHandler: remoteInventoryHandler(calledTools, "environment-visibility-unexpected"),
+        seenAliases,
+      }),
+    );
+
+    expect(result.isError).toBe(false);
+    expect(result.structuredContent).toMatchObject({
+      backends: [
+        { alias: "local", status: "online" },
+        {
+          alias: "windows",
+          environmentId: "environment-visibility-windows",
+          status: "error",
+          error: expect.stringContaining("environment-visibility-unexpected"),
+          providers: [],
+        },
+      ],
+    });
+    expect(calledTools).toEqual(["t3_list_backends"]);
+    expect(seenAliases).toEqual([]);
   }),
 );
 

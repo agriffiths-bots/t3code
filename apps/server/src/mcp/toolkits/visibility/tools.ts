@@ -89,9 +89,9 @@ export const ListBackendsTool = Tool.make("t3_list_backends", {
   dependencies,
 })
   .annotate(Tool.Title, "List T3 Code backends")
-  .annotate(Tool.Readonly, true)
+  .annotate(Tool.Readonly, false)
   .annotate(Tool.Destructive, false)
-  .annotate(Tool.Idempotent, true)
-  .annotate(Tool.OpenWorld, false);
+  .annotate(Tool.Idempotent, false)
+  .annotate(Tool.OpenWorld, true);
 
 export const VisibilityToolkit = Toolkit.make(ListBackendsTool);

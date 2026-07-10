@@ -402,6 +402,16 @@ it.effect("conforms to the official streamable HTTP MCP client", () =>
         }
       }
 
+      const listBackendsTool = toolsResult.tools.find(
+        (candidate) => candidate.name === "t3_list_backends",
+      );
+      expect(listBackendsTool?.annotations).toMatchObject({
+        readOnlyHint: false,
+        destructiveHint: false,
+        idempotentHint: false,
+        openWorldHint: true,
+      });
+
       const callResult = CallToolResultSchema.parse(
         yield* Effect.promise(() =>
           client.callTool({ name: "t3_list_backends", arguments: {} }, CallToolResultSchema),

@@ -34,8 +34,13 @@ const decodeListBackendsOutput = Schema.decodeUnknownEffect(ListBackendsOutput);
 
 class PeerInventoryError extends Schema.TaggedErrorClass<PeerInventoryError>()(
   "PeerInventoryError",
-  { message: Schema.String },
+  {
+    reason: Schema.Literals(["call-rejected", "invalid-shape", "environment-mismatch"]),
+    message: Schema.String,
+  },
 ) {}
+
+const isPeerInventoryError = Schema.is(PeerInventoryError);
 
 const providerLabel = (provider: ServerProvider): string =>
   provider.displayName ?? provider.instanceId;
@@ -81,16 +86,25 @@ const fetchPeerInventory = (
         const result = yield* session.callTool({ name: "t3_list_backends", arguments: {} });
         if (result.isError === true) {
           return yield* new PeerInventoryError({
+            reason: "call-rejected",
             message: `Peer '${peer.alias}' rejected t3_list_backends.`,
           });
         }
         const decoded = yield* decodeListBackendsOutput(result.structuredContent);
         if (decoded.backends.length !== 1) {
           return yield* new PeerInventoryError({
+            reason: "invalid-shape",
             message: `Peer '${peer.alias}' returned ${decoded.backends.length} local backend rows; expected 1.`,
           });
         }
-        return decoded.backends[0]!;
+        const backend = decoded.backends[0]!;
+        if (backend.environmentId !== peer.environmentId) {
+          return yield* new PeerInventoryError({
+            reason: "environment-mismatch",
+            message: `Peer '${peer.alias}' returned environment '${backend.environmentId}'; expected '${peer.environmentId}'.`,
+          });
+        }
+        return backend;
       }),
     closePeerSession,
   ).pipe(Effect.timeout(PEER_INVENTORY_TIMEOUT));
@@ -141,12 +155,18 @@ const probePeer = Effect.fn("VisibilityToolkit.probePeer")(function* (
 
   const descriptor = yield* fetchPeerDescriptor(peer, httpClient).pipe(Effect.option);
   const knownDescriptor = Option.getOrUndefined(descriptor);
+  const descriptorMatchesPeer = knownDescriptor?.environmentId === peer.environmentId;
+  const trustedDescriptor = descriptorMatchesPeer ? knownDescriptor : undefined;
+  const inventoryEnvironmentMismatch =
+    isPeerInventoryError(inventory.left) && inventory.left.reason === "environment-mismatch";
+  const identityMismatch =
+    inventoryEnvironmentMismatch || (knownDescriptor !== undefined && !descriptorMatchesPeer);
   return {
     alias: peer.alias,
-    environmentId: knownDescriptor?.environmentId ?? peer.environmentId,
-    label: knownDescriptor?.label ?? peer.alias,
-    os: knownDescriptor?.platform.os ?? "unknown",
-    status: knownDescriptor === undefined ? "offline" : "error",
+    environmentId: peer.environmentId,
+    label: trustedDescriptor?.label ?? peer.alias,
+    os: trustedDescriptor?.platform.os ?? "unknown",
+    status: trustedDescriptor === undefined && !identityMismatch ? "offline" : "error",
     ...(peer.lastSeenAt === undefined ? {} : { lastSeenAt: peer.lastSeenAt }),
     error: errorMessage(inventory.left),
     providers: [],
