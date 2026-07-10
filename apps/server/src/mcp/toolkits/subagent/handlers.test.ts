@@ -3601,7 +3601,7 @@ describe("SubagentToolkit", () => {
         const result = yield* server.callTool({ name: "t3_list_subagents", arguments: {} }).pipe(
           Effect.provideService(McpInvocationContext.McpInvocationContext, {
             ...invocation,
-            capabilities: new Set(["preview"] as const),
+            capabilities: new Set<McpInvocationContext.McpCapability>(),
           }),
           Effect.provideService(McpSchema.McpServerClient, client),
         );

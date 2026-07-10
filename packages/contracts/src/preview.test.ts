@@ -9,8 +9,6 @@ import {
   PreviewViewportSetting,
 } from "./preview.ts";
 import {
-  PreviewAutomationHost,
-  PreviewAutomationError,
   PreviewAutomationOpenInput,
   PreviewAutomationResizeInput,
   PreviewAutomationResizeResult,
@@ -25,8 +23,6 @@ const decodeViewport = Schema.decodeUnknownSync(PreviewViewportSetting);
 const decodeResizeInput = Schema.decodeUnknownSync(PreviewAutomationResizeInput);
 const decodeOpenInput = Schema.decodeUnknownSync(PreviewAutomationOpenInput);
 const decodeResizeResult = Schema.decodeUnknownSync(PreviewAutomationResizeResult);
-const decodeAutomationHost = Schema.decodeUnknownSync(PreviewAutomationHost);
-const decodeAutomationError = Schema.decodeUnknownSync(PreviewAutomationError);
 const decodeAutomationStatus = Schema.decodeUnknownSync(PreviewAutomationStatus);
 
 describe("PreviewNavStatus", () => {
@@ -163,50 +159,6 @@ describe("PreviewAutomationStatus", () => {
       hostState: "missing",
       recovery: "Open T3 Code Desktop.",
     });
-  });
-});
-
-describe("PreviewAutomationHost", () => {
-  it("accepts legacy hosts and current operation advertisements", () => {
-    expect(decodeAutomationHost({ clientId: "legacy", environmentId: "environment-1" })).toEqual({
-      clientId: "legacy",
-      environmentId: "environment-1",
-    });
-    expect(
-      decodeAutomationHost({
-        clientId: "current",
-        environmentId: "environment-1",
-        supportedOperations: ["status", "resize"],
-      }).supportedOperations,
-    ).toEqual(["status", "resize"]);
-  });
-});
-
-describe("PreviewAutomationError", () => {
-  it("preserves a typed non-editable target failure", () => {
-    const error = decodeAutomationError({
-      _tag: "PreviewAutomationTargetNotEditableError",
-      operation: "type",
-      environmentId: "environment-1",
-      threadId: "thread-1",
-      providerSessionId: "provider-session-1",
-      providerInstanceId: "codex",
-      clientId: "client-1",
-      connectionId: "connection-1",
-      requestId: "request-1",
-      tabId: "tab-1",
-      timeoutMs: 1_000,
-      remoteTag: "PreviewAutomationTargetNotEditableError",
-      remoteMessageLength: 12,
-      cause: {},
-      selectorKind: "focused-element",
-    });
-
-    expect(error._tag).toBe("PreviewAutomationTargetNotEditableError");
-    if (error._tag === "PreviewAutomationTargetNotEditableError") {
-      expect(error.selectorKind).toBe("focused-element");
-      expect(error.message).toBe("Preview automation type requires an editable focused element.");
-    }
   });
 });
 

@@ -2,7 +2,6 @@ import { expect, it } from "@effect/vitest";
 import { Tool } from "effect/unstable/ai";
 
 import { NotifyToolkit } from "./toolkits/notify/tools.ts";
-import { PreviewSnapshotToolkit, PreviewStandardToolkit } from "./toolkits/preview/tools.ts";
 import { SubagentToolkit } from "./toolkits/subagent/tools.ts";
 import { ThreadToolkit } from "./toolkits/thread/tools.ts";
 import { UsageToolkit } from "./toolkits/usage/tools.ts";
@@ -10,8 +9,6 @@ import { VisibilityToolkit } from "./toolkits/visibility/tools.ts";
 
 const allToolkits = [
   NotifyToolkit,
-  PreviewSnapshotToolkit,
-  PreviewStandardToolkit,
   SubagentToolkit,
   ThreadToolkit,
   UsageToolkit,
@@ -35,6 +32,6 @@ it("every MCP tool advertises a top-level object input schema", () => {
   }
   // Guard the guard: if toolkit wiring changes shape, this test must not
   // silently pass on an empty list.
-  expect(checked.length).toBeGreaterThanOrEqual(20);
+  expect(checked).toHaveLength(13);
   expect(checked).toContain("t3_list_backends");
 });
