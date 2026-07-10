@@ -77,14 +77,10 @@ import type {
 import {
   PreviewAutomationClickInput,
   PreviewAutomationEvaluateInput,
-  PreviewAutomationHost,
-  PreviewAutomationHostFocus,
   PreviewAutomationPressInput,
-  PreviewAutomationResponse,
   PreviewAutomationScrollInput,
   PreviewAutomationSnapshot,
   PreviewAutomationStatus,
-  PreviewAutomationStreamEvent,
   PreviewAutomationTypeInput,
   PreviewAutomationWaitForInput,
 } from "./previewAutomation.ts";
@@ -1295,15 +1291,6 @@ export interface EnvironmentApi {
     close: (input: typeof PreviewCloseInput.Encoded) => Promise<void>;
     list: (input: typeof PreviewListInput.Encoded) => Promise<PreviewListResult>;
     reportStatus: (input: typeof PreviewReportStatusInput.Encoded) => Promise<void>;
-    automation: {
-      connect: (
-        input: PreviewAutomationHost,
-        callback: (event: PreviewAutomationStreamEvent) => void,
-        options?: { onResubscribe?: () => void },
-      ) => () => void;
-      respond: (response: PreviewAutomationResponse) => Promise<void>;
-      focusHost: (input: PreviewAutomationHostFocus) => Promise<void>;
-    };
     onEvent: (
       callback: (event: PreviewEvent) => void,
       options?: { onResubscribe?: () => void },

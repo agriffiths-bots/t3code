@@ -1,6 +1,5 @@
 // @effect-diagnostics globalFetch:off globalFetchInEffect:off - This conformance test intentionally drives the HTTP boundary through the official MCP SDK transport and raw protocol probes.
 import { NodeHttpServer } from "@effect/platform-node";
-import * as NodeServices from "@effect/platform-node/NodeServices";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { CallToolResultSchema, ListToolsResultSchema } from "@modelcontextprotocol/sdk/types.js";
@@ -28,7 +27,6 @@ import { ServerSettingsService } from "../serverSettings.ts";
 import * as McpHttpServer from "./McpHttpServer.ts";
 import * as McpInvocationContext from "./McpInvocationContext.ts";
 import * as McpSessionRegistry from "./McpSessionRegistry.ts";
-import * as PreviewAutomationBroker from "./PreviewAutomationBroker.ts";
 
 type SdkTransport = Parameters<Client["connect"]>[0];
 type ParsedCallToolResult = {
@@ -44,6 +42,38 @@ const environmentId = EnvironmentId.make("environment-mcp-conformance");
 const threadId = ThreadId.make("thread-mcp-conformance");
 const providerInstanceId = ProviderInstanceId.make("codex");
 
+const expectedToolNamesAfterPreviewRemoval = [
+  "t3_check_subagent",
+  "t3_get_usage",
+  "t3_list_backends",
+  "t3_list_subagents",
+  "t3_notify",
+  "t3_schedule_create",
+  "t3_schedule_delete",
+  "t3_schedule_list",
+  "t3_schedule_update",
+  "t3_spawn_subagent",
+  "t3_steer_subagent",
+  "t3_thread_start",
+  "t3_wait_subagent",
+] as const;
+
+const removedPreviewToolNames = [
+  "preview_click",
+  "preview_evaluate",
+  "preview_navigate",
+  "preview_open",
+  "preview_press",
+  "preview_recording_start",
+  "preview_recording_stop",
+  "preview_resize",
+  "preview_scroll",
+  "preview_snapshot",
+  "preview_status",
+  "preview_type",
+  "preview_wait_for",
+] as const;
+
 const invocation: McpInvocationContext.ProviderMcpInvocationScope = {
   credentialKind: "provider-session",
   environmentId,
@@ -51,7 +81,6 @@ const invocation: McpInvocationContext.ProviderMcpInvocationScope = {
   providerSessionId: "provider-session-mcp-conformance",
   providerInstanceId,
   capabilities: new Set([
-    "preview",
     "thread-management",
     "notification",
     "subagent:spawn",
@@ -150,7 +179,6 @@ const deviceNotificationsLayer = Layer.mock(DeviceNotifications.DeviceNotificati
 
 const conformanceLayer = McpHttpServer.layer.pipe(
   Layer.provide(mcpSessionRegistryLayer),
-  Layer.provide(PreviewAutomationBroker.layer.pipe(Layer.provide(NodeServices.layer))),
   Layer.provide(deviceNotificationsLayer),
   Layer.provide(ServerSettingsService.layerTest()),
   Layer.provide(Layer.succeed(ProviderRegistry, makeProviderRegistryMock([makeProvider()]))),
@@ -239,17 +267,13 @@ it.effect("conforms to the official streamable HTTP MCP client", () =>
 
       const toolsResult = yield* Effect.promise(() => client.listTools());
       ListToolsResultSchema.parse(toolsResult);
-      expect(toolsResult.tools.length).toBeGreaterThanOrEqual(20);
       const toolNames = new Set(toolsResult.tools.map((tool) => tool.name));
-      expect([...toolNames]).toEqual(
-        expect.arrayContaining([
-          "t3_list_backends",
-          "t3_thread_start",
-          "t3_spawn_subagent",
-          "preview_status",
-          "preview_snapshot",
-        ]),
-      );
+      expect([...toolNames].toSorted()).toEqual([...expectedToolNamesAfterPreviewRemoval]);
+      for (const removedName of removedPreviewToolNames) {
+        expect(toolNames.has(removedName), `${removedName} must be absent from tools/list`).toBe(
+          false,
+        );
+      }
 
       for (const tool of toolsResult.tools) {
         expect(tool.inputSchema.type, `${tool.name} input schema must be an object`).toBe("object");
