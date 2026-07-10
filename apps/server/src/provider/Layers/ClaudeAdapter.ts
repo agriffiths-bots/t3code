@@ -420,11 +420,11 @@ function isInterruptedResult(result: SDKResultMessage): boolean {
 
   if (
     result.subtype === "error_during_execution" &&
-    // The SDK types this flag as boolean. Keep the non-error boundary: the same
-    // diagnostic text also appears on genuine is_error=true execution failures.
-    result.is_error === false &&
     result.errors.some(isClaudeUserSteerAbortDiagnosticCandidate)
   ) {
+    // Claude CLI 2.1.206 emits these exact steer envelopes with is_error=true,
+    // while older/provenance captures used false. The diagnostic grammar is the
+    // stable discriminator; companion or unrelated errors remain fail-closed.
     return result.errors.length === 1 && result.errors.every(isClaudeUserSteerAbortDiagnostic);
   }
 

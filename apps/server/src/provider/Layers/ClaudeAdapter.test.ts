@@ -3649,13 +3649,27 @@ describe("ClaudeAdapterLive", () => {
     );
   });
 
-  it.effect("treats Claude non-error steer diagnostics as interrupted and clean", () => {
-    const errors = [
-      "[ede_diagnostic] result_type=user last_content_type=n/a stop_reason=tool_use",
-      "[ede_diagnostic] turn aborted (steer) stop_reason=tool_use",
+  it.effect("treats Claude steer diagnostics as interrupted and clean", () => {
+    const cases = [
+      {
+        isError: false,
+        error: "[ede_diagnostic] result_type=user last_content_type=n/a stop_reason=tool_use",
+      },
+      {
+        isError: true,
+        error: "[ede_diagnostic] result_type=user last_content_type=n/a stop_reason=tool_use",
+      },
+      {
+        isError: false,
+        error: "[ede_diagnostic] turn aborted (steer) stop_reason=tool_use",
+      },
+      {
+        isError: true,
+        error: "[ede_diagnostic] turn aborted (steer) stop_reason=tool_use",
+      },
     ] as const;
 
-    return Effect.forEach(errors, (error, index) => {
+    return Effect.forEach(cases, (testCase, index) => {
       const harness = makeHarness();
       return Effect.gen(function* () {
         const adapter = yield* ClaudeAdapter;
@@ -3680,8 +3694,8 @@ describe("ClaudeAdapterLive", () => {
         harness.query.emit({
           type: "result",
           subtype: "error_during_execution",
-          is_error: false,
-          errors: [error],
+          is_error: testCase.isError,
+          errors: [testCase.error],
           stop_reason: "tool_use",
           session_id: `sdk-session-steer-abort-${index}`,
           uuid: `result-steer-abort-${index}`,
@@ -3705,7 +3719,7 @@ describe("ClaudeAdapterLive", () => {
         if (turnCompleted?.type === "turn.completed") {
           assert.equal(String(turnCompleted.turnId), String(turn.turnId));
           assert.equal(turnCompleted.payload.state, "interrupted");
-          assert.equal(turnCompleted.payload.errorMessage, error);
+          assert.equal(turnCompleted.payload.errorMessage, testCase.error);
         }
 
         const sessions = yield* adapter.listSessions();
@@ -3721,20 +3735,16 @@ describe("ClaudeAdapterLive", () => {
   it.effect("keeps genuine Claude execution errors failed", () => {
     const cases = [
       { isError: true, errors: ["Claude execution failed while invoking a tool."] },
-      {
-        isError: true,
-        errors: ["[ede_diagnostic] result_type=user last_content_type=n/a stop_reason=tool_use"],
-      },
       { isError: false, errors: ["[ede_diagnostic] result_type=user status=failed"] },
       {
-        isError: false,
+        isError: true,
         errors: [
           "[ede_diagnostic] result_type=user last_content_type=n/a stop_reason=tool_use",
           "Claude execution failed after the steer boundary.",
         ],
       },
       {
-        isError: false,
+        isError: true,
         errors: [
           "[ede_diagnostic] turn aborted (steer) stop_reason=tool_use",
           "Claude execution failed after the aborted boundary.",
