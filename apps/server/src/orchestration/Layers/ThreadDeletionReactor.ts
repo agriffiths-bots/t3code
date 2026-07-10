@@ -416,6 +416,7 @@ const make = Effect.gen(function* () {
     }
 
     let pathExists = yield* fileSystem.exists(candidate.path);
+    let requiresRepositoryProbeBeforePrune = !pathExists;
     if (pathExists && !candidate.force) {
       yield* gitWorkflow.invalidateLocalStatus(candidate.path);
       const status = yield* gitWorkflow.localStatus({ cwd: candidate.path });
@@ -447,6 +448,7 @@ const make = Effect.gen(function* () {
         if (pathExists) {
           return yield* removeResult.failure;
         }
+        requiresRepositoryProbeBeforePrune = true;
         yield* Effect.logDebug("thread lifecycle worktree disappeared during removal", {
           threadId: candidate.threadId,
           path: candidate.path,
@@ -459,7 +461,35 @@ const make = Effect.gen(function* () {
       });
     }
 
-    yield* gitWorkflow.pruneWorktrees(candidate.projectCwd);
+    if (requiresRepositoryProbeBeforePrune) {
+      if (yield* fileSystem.exists(candidate.projectCwd)) {
+        yield* gitWorkflow.invalidateLocalStatus(candidate.projectCwd);
+        const projectStatus = yield* gitWorkflow.localStatus({ cwd: candidate.projectCwd });
+        if (projectStatus.isRepo) {
+          yield* gitWorkflow.pruneWorktrees(candidate.projectCwd);
+        } else {
+          yield* Effect.logWarning(
+            "thread lifecycle skipped worktree prune because owning project is no longer a Git repository",
+            {
+              threadId: candidate.threadId,
+              projectRoot: candidate.projectCwd,
+              path: candidate.path,
+            },
+          );
+        }
+      } else {
+        yield* Effect.logWarning(
+          "thread lifecycle skipped worktree prune because owning project is absent",
+          {
+            threadId: candidate.threadId,
+            projectRoot: candidate.projectCwd,
+            path: candidate.path,
+          },
+        );
+      }
+    } else {
+      yield* gitWorkflow.pruneWorktrees(candidate.projectCwd);
+    }
     yield* dispatchAlreadyCoordinated(orchestrationEngine, {
       type: "thread.meta.update",
       commandId: CommandId.make(`server:worktree-teardown:${event.eventId}`),

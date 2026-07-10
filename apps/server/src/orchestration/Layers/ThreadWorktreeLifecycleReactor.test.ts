@@ -105,6 +105,8 @@ async function createHarness(input: {
   readonly closeFails?: boolean;
   readonly dirty?: boolean;
   readonly persistedEvents?: ReadonlyArray<OrchestrationEvent>;
+  readonly projectIsRepo?: boolean;
+  readonly projectRootExists?: boolean;
   readonly pruneFailuresBeforeSuccess?: number;
 }) {
   const events = Effect.runSync(PubSub.unbounded<OrchestrationEvent>());
@@ -117,6 +119,9 @@ async function createHarness(input: {
   let pruneAttempts = 0;
   const pruneWorktrees = vi.fn(() => {
     pruneAttempts += 1;
+    if (input.projectRootExists === false || input.projectIsRepo === false) {
+      return Effect.fail("owning project repository is unavailable");
+    }
     return pruneAttempts <= (input.pruneFailuresBeforeSuccess ?? 0)
       ? Effect.fail("worktree prune failed")
       : Effect.sync(() => {
@@ -176,12 +181,12 @@ async function createHarness(input: {
       Layer.provideMerge(
         Layer.succeed(GitWorkflow.GitWorkflowService, {
           invalidateLocalStatus,
-          localStatus: () =>
+          localStatus: ({ cwd }: { readonly cwd: string }) =>
             Effect.sync(() => {
               operations.push("status");
               return {
-                isRepo: true,
-                hasWorkingTreeChanges: input.dirty === true,
+                isRepo: cwd === PROJECT_ROOT ? input.projectIsRepo !== false : true,
+                hasWorkingTreeChanges: cwd === WORKTREE_ROOT && input.dirty === true,
               } as never;
             }),
           removeWorktree,
@@ -190,7 +195,10 @@ async function createHarness(input: {
       ),
       Layer.provideMerge(
         Layer.succeed(FileSystem.FileSystem, {
-          exists: () => Effect.succeed(input.pathExists),
+          exists: (path: string) =>
+            Effect.succeed(
+              path === WORKTREE_ROOT ? input.pathExists : input.projectRootExists !== false,
+            ),
         } as never),
       ),
       Layer.provideMerge(WorktreeLifecycleCoordinatorLive),
@@ -281,6 +289,28 @@ describe("ThreadDeletionReactor owned worktree lifecycle", () => {
       expect(harness.operations.at(-1)).toBe("metadata");
     } finally {
       await harness.dispose();
+    }
+  });
+
+  it("clears ownership when the worktree and owning repository are both gone", async () => {
+    for (const projectState of [
+      { projectRootExists: false },
+      { projectRootExists: true, projectIsRepo: false },
+    ]) {
+      const harness = await createHarness({
+        snapshot: snapshot({ deleted: true }),
+        pathExists: false,
+        ...projectState,
+      });
+      try {
+        await harness.run(lifecycleEvent("thread.deleted"));
+
+        expect(harness.pruneWorktrees).not.toHaveBeenCalled();
+        expect(harness.dispatch).toHaveBeenCalledOnce();
+        expect(harness.operations.at(-1)).toBe("metadata");
+      } finally {
+        await harness.dispose();
+      }
     }
   });
 

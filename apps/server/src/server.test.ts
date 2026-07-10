@@ -86,6 +86,7 @@ import {
 } from "./orchestration/Errors.ts";
 import * as ProjectionSnapshotQuery from "./orchestration/Services/ProjectionSnapshotQuery.ts";
 import * as BootstrapTurnStartDispatcher from "./orchestration/Services/BootstrapTurnStartDispatcher.ts";
+import * as WorktreeLifecycleCoordinator from "./orchestration/Services/WorktreeLifecycleCoordinator.ts";
 import * as OrchestrationCommandReceipts from "./persistence/Services/OrchestrationCommandReceipts.ts";
 import { SqlitePersistenceMemory } from "./persistence/Layers/Sqlite.ts";
 import { ScheduledTaskRepository } from "./persistence/Services/ScheduledTasks.ts";
@@ -346,6 +347,7 @@ const buildAppUnderTest = (options?: {
     >;
     terminalManager?: Partial<TerminalManager.TerminalManager["Service"]>;
     orchestrationEngine?: Partial<OrchestrationEngine.OrchestrationEngineService["Service"]>;
+    worktreeLifecycleCoordinator?: WorktreeLifecycleCoordinator.WorktreeLifecycleCoordinator["Service"];
     orchestrationCommandReceiptRepository?: Partial<
       OrchestrationCommandReceipts.OrchestrationCommandReceiptRepository["Service"]
     >;
@@ -543,12 +545,22 @@ const buildAppUnderTest = (options?: {
       runForThread: () => Effect.succeed({ status: "no-script" as const }),
       ...options?.layers?.projectSetupScriptRunner,
     });
+    const orchestrationDispatch =
+      options?.layers?.orchestrationEngine?.dispatch ?? (() => Effect.succeed({ sequence: 0 }));
     const orchestrationEngineLayer = Layer.mock(OrchestrationEngine.OrchestrationEngineService)({
       readEvents: () => Stream.empty,
-      dispatch: () => Effect.succeed({ sequence: 0 }),
+      dispatch: orchestrationDispatch,
+      dispatchCoordinated:
+        options?.layers?.orchestrationEngine?.dispatchCoordinated ?? orchestrationDispatch,
       streamDomainEvents: Stream.empty,
       ...options?.layers?.orchestrationEngine,
     });
+    const worktreeLifecycleCoordinatorLayer = options?.layers?.worktreeLifecycleCoordinator
+      ? Layer.succeed(
+          WorktreeLifecycleCoordinator.WorktreeLifecycleCoordinator,
+          options.layers.worktreeLifecycleCoordinator,
+        )
+      : WorktreeLifecycleCoordinator.WorktreeLifecycleCoordinatorLive;
     const orchestrationCommandReceiptRepositoryLayer = Layer.mock(
       OrchestrationCommandReceipts.OrchestrationCommandReceiptRepository,
     )({
@@ -562,6 +574,7 @@ const buildAppUnderTest = (options?: {
       Layer.provideMerge(projectSetupScriptRunnerLayer),
       Layer.provideMerge(orchestrationEngineLayer),
       Layer.provideMerge(orchestrationCommandReceiptRepositoryLayer),
+      Layer.provideMerge(worktreeLifecycleCoordinatorLayer),
     );
 
     const servedRoutesLayer = HttpRouter.serve(makeRoutesLayer, {
@@ -6728,6 +6741,7 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
       Effect.gen(function* () {
         const dispatchedCommands: Array<OrchestrationCommand> = [];
         const bootstrapGitOperations: string[] = [];
+        let lifecyclePermitDepth = 0;
         const refreshStatus = vi.fn((_: string) =>
           Effect.succeed({
             isRepo: true,
@@ -6766,6 +6780,7 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
         const createWorktree = vi.fn(
           (_: Parameters<GitVcsDriver.GitVcsDriver["Service"]["createWorktree"]>[0]) =>
             Effect.sync(() => {
+              assert.equal(lifecyclePermitDepth, 1);
               bootstrapGitOperations.push("create-worktree");
               return {
                 worktree: {
@@ -6803,10 +6818,26 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
             orchestrationEngine: {
               dispatch: (command) =>
                 Effect.sync(() => {
+                  if (command.type === "thread.meta.update") {
+                    assert.equal(lifecyclePermitDepth, 1);
+                  }
                   dispatchedCommands.push(command);
                   return { sequence: dispatchedCommands.length };
                 }),
               readEvents: () => Stream.empty,
+            },
+            worktreeLifecycleCoordinator: {
+              withPermit: (effect) =>
+                Effect.acquireUseRelease(
+                  Effect.sync(() => {
+                    lifecyclePermitDepth += 1;
+                  }),
+                  () => effect,
+                  () =>
+                    Effect.sync(() => {
+                      lifecyclePermitDepth -= 1;
+                    }),
+                ),
             },
             projectSetupScriptRunner: {
               runForThread,

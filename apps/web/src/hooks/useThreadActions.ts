@@ -24,6 +24,7 @@ import { buildThreadRouteParams, resolveThreadRouteRef } from "../threadRoutes";
 import { useClientSettings } from "./useSettings";
 import { useAtomCommand } from "../state/use-atom-command";
 import { isThreadSessionActive } from "../session-logic";
+import { formatWorktreePathForDisplay } from "../worktreeCleanup";
 
 export class ThreadArchiveBlockedError extends Schema.TaggedErrorClass<ThreadArchiveBlockedError>()(
   "ThreadArchiveBlockedError",
@@ -35,6 +36,29 @@ export class ThreadArchiveBlockedError extends Schema.TaggedErrorClass<ThreadArc
   override get message(): string {
     return "Cannot archive a running thread.";
   }
+}
+
+export function buildThreadDeleteConfirmationMessage(input: {
+  readonly title: string;
+  readonly worktreePath: string | null;
+  readonly worktreeRemovable?: boolean | undefined;
+  readonly worktreeRemovalPath?: string | null | undefined;
+}): string {
+  const lines = [
+    `Delete thread "${input.title}"?`,
+    "This permanently clears conversation history for this thread.",
+  ];
+  const ownedWorktreePath =
+    input.worktreeRemovable === true ? (input.worktreeRemovalPath ?? input.worktreePath) : null;
+  if (ownedWorktreePath) {
+    lines.push(
+      "",
+      "This also permanently deletes its T3-created worktree when no other thread or project uses it:",
+      formatWorktreePathForDisplay(ownedWorktreePath),
+      "Uncommitted and untracked files in that worktree will be lost.",
+    );
+  }
+  return lines.join("\n");
 }
 
 export function useThreadActions() {
@@ -265,10 +289,14 @@ export function useThreadActions() {
         const title = resolved?.thread.title ?? "this thread";
         const confirmationResult = await settlePromise(() =>
           localApi.dialogs.confirm(
-            [
-              `Delete thread "${title}"?`,
-              "This permanently clears conversation history for this thread.",
-            ].join("\n"),
+            resolved
+              ? buildThreadDeleteConfirmationMessage(resolved.thread)
+              : buildThreadDeleteConfirmationMessage({
+                  title,
+                  worktreePath: null,
+                  worktreeRemovable: false,
+                  worktreeRemovalPath: null,
+                }),
           ),
         );
         if (confirmationResult._tag === "Failure") {
