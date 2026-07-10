@@ -115,13 +115,11 @@ export const makeLayer = (options?: {
           }),
         ),
       );
-      const refreshLoop = Effect.forever(
-        refresh.pipe(
-          Effect.andThen(
-            Effect.sleep(`${options?.refreshIntervalMs ?? PLAN_USAGE_REFRESH_INTERVAL_MS} millis`),
-          ),
-        ),
+      const refreshInterval = Effect.sleep(
+        `${options?.refreshIntervalMs ?? PLAN_USAGE_REFRESH_INTERVAL_MS} millis`,
       );
+      yield* refresh;
+      const refreshLoop = Effect.forever(refreshInterval.pipe(Effect.andThen(refresh)));
       yield* Effect.forkScoped(refreshLoop);
 
       const read = Effect.fn("PlanUsageSnapshotStore.read")(function* (
