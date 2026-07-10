@@ -8,7 +8,7 @@ import * as McpInvocationContext from "../../McpInvocationContext.ts";
 const dependencies = [ServerSettingsService, McpInvocationContext.McpInvocationContext];
 
 export const GetUsageInput = Schema.Struct({
-  providerInstanceId: Schema.optional(ProviderInstanceId),
+  providerInstanceId: Schema.optionalKey(ProviderInstanceId),
 });
 export type GetUsageInput = typeof GetUsageInput.Type;
 
