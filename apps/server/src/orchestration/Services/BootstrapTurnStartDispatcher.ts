@@ -345,8 +345,8 @@ export const layer = Layer.effect(
       let skipWorktreePreparation = false;
       // The worktree THIS bootstrap created (if any), for cleanup on failure.
       // A failed bootstrap must not leave its worktree behind — and for
-      // directory-targeted (non-removable, foreign-repo) worktrees the
-      // projectId-keyed reaper never would, so the dispatcher owns cleanup.
+      // directory-targeted (non-removable, foreign-repo) worktrees lifecycle
+      // teardown must not remove them, so the dispatcher owns cleanup.
       let createdWorktree: { readonly cwd: string; readonly path: string } | null = null;
 
       const cleanupCreatedThread = () =>
@@ -681,8 +681,8 @@ export const layer = Layer.effect(
           );
           // An explicit cleanup policy from createThread survives worktree
           // preparation: cross-repo (directory-targeted) worktrees are marked
-          // non-removable there because the projectId-keyed reaper cannot see
-          // their repository and would orphan them.
+          // non-removable there because lifecycle teardown runs against the
+          // project's repository and cannot safely remove a foreign checkout.
           const preparedWorktreeRemovable = bootstrap.createThread?.worktreeRemovable ?? true;
           yield* orchestrationEngine.dispatch({
             type: "thread.meta.update",

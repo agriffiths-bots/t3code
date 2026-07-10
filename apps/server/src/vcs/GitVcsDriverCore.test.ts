@@ -678,6 +678,35 @@ it.layer(TestLayer)("GitVcsDriver core integration", (it) => {
         assert.equal(yield* fileSystem.exists(worktreePath), false);
       }),
     );
+
+    it.effect("prunes a registration after its worktree directory was already removed", () =>
+      Effect.gen(function* () {
+        const cwd = yield* makeTmpDir();
+        const { initialBranch } = yield* initRepoWithCommit(cwd);
+        const pathService = yield* Path.Path;
+        const worktreePath = pathService.join(
+          yield* makeTmpDir("git-worktrees-"),
+          "pre-removed-worktree",
+        );
+        const driver = yield* GitVcsDriver.GitVcsDriver;
+        yield* driver.createWorktree({
+          cwd,
+          path: worktreePath,
+          refName: initialBranch,
+          newRefName: "feature/pre-removed-worktree",
+        });
+
+        const fileSystem = yield* FileSystem.FileSystem;
+        yield* fileSystem.remove(worktreePath, { recursive: true });
+        yield* driver.pruneWorktrees(cwd);
+
+        const refs = yield* driver.listRefs({ cwd });
+        assert.equal(
+          refs.refs.find((ref) => ref.name === "feature/pre-removed-worktree")?.worktreePath,
+          undefined,
+        );
+      }),
+    );
   });
 
   describe("commit context", () => {

@@ -45,6 +45,11 @@ import {
   OrchestrationEngineService,
   type OrchestrationEngineShape,
 } from "../Services/OrchestrationEngine.ts";
+import {
+  commandRequiresWorktreeLifecycle,
+  WorktreeLifecycleCoordinator,
+  WorktreeLifecycleCoordinatorLive,
+} from "../Services/WorktreeLifecycleCoordinator.ts";
 const isOrchestrationCommandPreviouslyRejectedError = Schema.is(
   OrchestrationCommandPreviouslyRejectedError,
 );
@@ -82,6 +87,7 @@ const makeOrchestrationEngine = Effect.gen(function* () {
   const commandReceiptRepository = yield* OrchestrationCommandReceiptRepository;
   const projectionPipeline = yield* OrchestrationProjectionPipeline;
   const projectionSnapshotQuery = yield* ProjectionSnapshotQuery;
+  const worktreeLifecycle = yield* WorktreeLifecycleCoordinator;
   const crypto = yield* Crypto.Crypto;
 
   const nowIso = Effect.map(DateTime.now, DateTime.formatIso);
@@ -309,7 +315,7 @@ const makeOrchestrationEngine = Effect.gen(function* () {
   const readEvents: OrchestrationEngineShape["readEvents"] = (fromSequenceExclusive, limit) =>
     eventStore.readFromSequence(fromSequenceExclusive, limit);
 
-  const dispatch: OrchestrationEngineShape["dispatch"] = (command) =>
+  const dispatchQueued: NonNullable<OrchestrationEngineShape["dispatchCoordinated"]> = (command) =>
     Effect.gen(function* () {
       const result = yield* Deferred.make<{ sequence: number }, OrchestrationDispatchError>();
       yield* Queue.offer(commandQueue, {
@@ -320,9 +326,15 @@ const makeOrchestrationEngine = Effect.gen(function* () {
       return yield* Deferred.await(result);
     });
 
+  const dispatch: OrchestrationEngineShape["dispatch"] = (command) =>
+    commandRequiresWorktreeLifecycle(command)
+      ? worktreeLifecycle.withPermit(dispatchQueued(command))
+      : dispatchQueued(command);
+
   return {
     readEvents,
     dispatch,
+    dispatchCoordinated: dispatchQueued,
     // Each access creates a fresh PubSub subscription so that multiple
     // consumers (wsServer, ProviderRuntimeIngestion, CheckpointReactor, etc.)
     // each independently receive all domain events.
@@ -335,4 +347,8 @@ const makeOrchestrationEngine = Effect.gen(function* () {
 export const OrchestrationEngineLive = Layer.effect(
   OrchestrationEngineService,
   makeOrchestrationEngine,
+).pipe(
+  // Retain the same coordinator in the layer output so provider activation and
+  // lifecycle reactors share the exact permit used by command dispatch.
+  Layer.provideMerge(WorktreeLifecycleCoordinatorLive),
 );

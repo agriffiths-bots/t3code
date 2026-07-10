@@ -585,7 +585,7 @@ const makeActiveThreadStartRuntime = Effect.fn("ThreadToolkit.makeActiveRuntime"
     // A FOREIGN explicit directory (different repository than the caller's
     // project, fail-closed) gets the cross-repo restrictions; a same-repo
     // explicit directory keeps cleanup and branch behavior (worktrees are
-    // repo-global, so the projectId-keyed reaper still sees them).
+    // repo-global, so lifecycle teardown can still target them safely).
     const explicitForeignDirectory =
       explicitDirectory !== null && !(explicitDirectoryContext?.sameRepository ?? false);
     // Setup scripts are stricter than cleanup: they are resolved by the
@@ -660,10 +660,9 @@ const makeActiveThreadStartRuntime = Effect.fn("ThreadToolkit.makeActiveRuntime"
           ? sourceCwd
           : null;
     // Cross-repo worktrees (explicit directory) must not be marked removable:
-    // the stale-worktree reaper resolves the repository via the caller's
-    // projectId and would never find them there — it would clear the thread
-    // metadata and orphan the actual worktree. They are user-managed until
-    // cleanup understands foreign repositories.
+    // lifecycle teardown removes through the caller's project root and cannot
+    // safely target a foreign repository. They are user-managed until cleanup
+    // understands foreign repositories.
     const worktreeRemovable = mode === "new_worktree" && !explicitForeignDirectory;
     // Removal-root inheritance only applies to children actually running
     // inside the SOURCE thread's worktree: an explicit directory (even

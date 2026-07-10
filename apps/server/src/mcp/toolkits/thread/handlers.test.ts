@@ -545,8 +545,8 @@ it.effect("bases the child on an explicit git directory with a new worktree", ()
       projectCwd: explicitDir,
       baseBranch: "main",
     });
-    // Cross-repo worktrees are user-managed: the reaper resolves repositories
-    // via the caller's projectId and would orphan them if marked removable.
+    // Cross-repo worktrees are user-managed: lifecycle teardown runs through
+    // the caller's project repository and cannot safely remove them.
     expect(command.bootstrap?.createThread?.worktreeRemovable).toBe(false);
     expect(String(result.structuredContent?.warning)).toContain("not auto-cleaned");
     // The caller project's setup script must never run inside an explicitly
@@ -648,7 +648,7 @@ it.effect("never borrows the caller project's branch for an explicit directory",
 
 it.effect("keeps cleanup and setup for a directory inside the project workspace", () =>
   // A directory that resolves to the caller project's own repository AND lies
-  // inside its workspace gets no restrictions: the reaper sees same-repo
+  // inside its workspace gets no restrictions: lifecycle teardown sees same-repo
   // worktrees and the project's setup script runs in its own workspace.
   Effect.gen(function* () {
     const commands: OrchestrationCommand[] = [];

@@ -33,7 +33,10 @@ import type { ProviderServiceError } from "../../provider/Errors.ts";
 import { TextGeneration } from "../../textGeneration/TextGeneration.ts";
 import { ProviderService } from "../../provider/Services/ProviderService.ts";
 import { ProviderRegistry } from "../../provider/Services/ProviderRegistry.ts";
-import { OrchestrationEngineService } from "../Services/OrchestrationEngine.ts";
+import {
+  dispatchAlreadyCoordinated,
+  OrchestrationEngineService,
+} from "../Services/OrchestrationEngine.ts";
 import { ProjectionSnapshotQuery } from "../Services/ProjectionSnapshotQuery.ts";
 import {
   ProviderCommandReactor,
@@ -42,6 +45,7 @@ import {
 import { ServerSettingsService } from "../../serverSettings.ts";
 import { VcsStatusBroadcaster } from "../../vcs/VcsStatusBroadcaster.ts";
 import { GitWorkflowService } from "../../git/GitWorkflowService.ts";
+import { WorktreeLifecycleCoordinator } from "../Services/WorktreeLifecycleCoordinator.ts";
 const isProviderAdapterRequestError = Schema.is(ProviderAdapterRequestError);
 const isProviderDriverKind = Schema.is(ProviderDriverKind);
 
@@ -214,6 +218,7 @@ const make = Effect.gen(function* () {
   const vcsStatusBroadcaster = yield* VcsStatusBroadcaster;
   const textGeneration = yield* TextGeneration;
   const serverSettingsService = yield* ServerSettingsService;
+  const worktreeLifecycle = yield* WorktreeLifecycleCoordinator;
   const serverCommandId = (tag: string) =>
     crypto.randomUUIDv4.pipe(Effect.map((uuid) => CommandId.make(`server:${tag}:${uuid}`)));
   const serverEventId = () => crypto.randomUUIDv4.pipe(Effect.map(EventId.make));
@@ -848,21 +853,21 @@ const make = Effect.gen(function* () {
     const cwd = input.worktreePath;
     const attachments = input.attachments ?? [];
     yield* Effect.gen(function* () {
-      const snapshot = yield* projectionSnapshotQuery.getSnapshot();
-      const currentThread = snapshot.threads.find((thread) => thread.id === input.threadId);
-      if (!currentThread || currentThread.archivedAt !== null) {
-        return;
-      }
-      const currentWorktreeIdentity = worktreeIdentityPath({
+      const initialSnapshot = yield* projectionSnapshotQuery.getSnapshot();
+      const initialThread = initialSnapshot.threads.find((thread) => thread.id === input.threadId);
+      const initialWorktreeIdentity = worktreeIdentityPath({
         worktreePath: input.worktreePath,
-        worktreeRemovalPath: currentThread?.worktreeRemovalPath,
+        worktreeRemovalPath: initialThread?.worktreeRemovalPath,
       });
       if (
-        snapshot.threads.some(
+        !initialThread ||
+        initialThread.archivedAt !== null ||
+        initialThread.deletedAt !== null ||
+        initialSnapshot.threads.some(
           (thread) =>
             thread.id !== input.threadId &&
-            currentWorktreeIdentity !== null &&
-            worktreeIdentityPath(thread) === currentWorktreeIdentity,
+            initialWorktreeIdentity !== null &&
+            worktreeIdentityPath(thread) === initialWorktreeIdentity,
         )
       ) {
         return;
@@ -870,7 +875,6 @@ const make = Effect.gen(function* () {
 
       const { textGenerationModelSelection: modelSelection } =
         yield* serverSettingsService.getSettings;
-
       const generated = yield* textGeneration.generateBranchName({
         cwd,
         message: input.messageText,
@@ -881,17 +885,52 @@ const make = Effect.gen(function* () {
 
       const targetBranch = buildGeneratedWorktreeBranchName(generated.branch);
       if (targetBranch === oldBranch) return;
-      if (yield* isThreadArchivedOrGone(input.threadId)) return;
 
-      const renamed = yield* gitWorkflow.renameBranch({ cwd, oldBranch, newBranch: targetBranch });
-      yield* orchestrationEngine.dispatch({
-        type: "thread.meta.update",
-        commandId: yield* serverCommandId("worktree-branch-rename"),
-        threadId: input.threadId,
-        branch: renamed.branch,
-        worktreePath: cwd,
-      });
-      yield* vcsStatusBroadcaster.refreshStatus(cwd).pipe(Effect.ignoreCause({ log: true }));
+      yield* worktreeLifecycle.withPermit(
+        Effect.gen(function* () {
+          const snapshot = yield* projectionSnapshotQuery.getSnapshot();
+          const currentThread = snapshot.threads.find((thread) => thread.id === input.threadId);
+          if (
+            !currentThread ||
+            currentThread.archivedAt !== null ||
+            currentThread.deletedAt !== null ||
+            currentThread.branch !== oldBranch ||
+            currentThread.worktreePath !== cwd
+          ) {
+            return;
+          }
+          const currentWorktreeIdentity = worktreeIdentityPath({
+            worktreePath: input.worktreePath,
+            worktreeRemovalPath: currentThread?.worktreeRemovalPath,
+          });
+          if (
+            snapshot.threads.some(
+              (thread) =>
+                thread.id !== input.threadId &&
+                currentWorktreeIdentity !== null &&
+                worktreeIdentityPath(thread) === currentWorktreeIdentity,
+            )
+          ) {
+            return;
+          }
+
+          if (yield* isThreadArchivedOrGone(input.threadId)) return;
+
+          const renamed = yield* gitWorkflow.renameBranch({
+            cwd,
+            oldBranch,
+            newBranch: targetBranch,
+          });
+          yield* dispatchAlreadyCoordinated(orchestrationEngine, {
+            type: "thread.meta.update",
+            commandId: yield* serverCommandId("worktree-branch-rename"),
+            threadId: input.threadId,
+            branch: renamed.branch,
+            worktreePath: cwd,
+          });
+          yield* vcsStatusBroadcaster.refreshStatus(cwd).pipe(Effect.ignoreCause({ log: true }));
+        }),
+      );
     }).pipe(
       Effect.catchCause((cause) =>
         Effect.logWarning("provider command reactor failed to generate or rename worktree branch", {
@@ -1089,35 +1128,46 @@ const make = Effect.gen(function* () {
         ),
       );
 
-    const sendTurnRequest = yield* buildSendTurnRequestForThread({
-      threadId: event.payload.threadId,
-      messageText: message.text,
-      ...(message.attachments !== undefined ? { attachments: message.attachments } : {}),
-      ...(event.payload.modelSelection !== undefined
-        ? { modelSelection: event.payload.modelSelection }
-        : {}),
-      runtimeMode: event.payload.runtimeMode,
-      interactionMode: event.payload.interactionMode,
-      createdAt: event.payload.createdAt,
-    }).pipe(
-      Effect.map(Option.some),
-      Effect.catchCause((cause) => handleTurnStartFailure(cause).pipe(Effect.as(Option.none()))),
-    );
+    const activateProviderTurn = Effect.gen(function* () {
+      if (
+        yield* stopTurnStartIfThreadArchived({
+          threadId: event.payload.threadId,
+          createdAt: event.payload.createdAt,
+        })
+      ) {
+        return;
+      }
 
-    if (Option.isNone(sendTurnRequest)) {
-      return;
-    }
-    if (
-      yield* stopTurnStartIfThreadArchived({
+      const sendTurnRequest = yield* buildSendTurnRequestForThread({
         threadId: event.payload.threadId,
+        messageText: message.text,
+        ...(message.attachments !== undefined ? { attachments: message.attachments } : {}),
+        ...(event.payload.modelSelection !== undefined
+          ? { modelSelection: event.payload.modelSelection }
+          : {}),
+        runtimeMode: event.payload.runtimeMode,
+        interactionMode: event.payload.interactionMode,
         createdAt: event.payload.createdAt,
-      })
-    ) {
-      return;
-    }
+      }).pipe(
+        Effect.map(Option.some),
+        Effect.catchCause((cause) => handleTurnStartFailure(cause).pipe(Effect.as(Option.none()))),
+      );
+      if (Option.isNone(sendTurnRequest)) {
+        return;
+      }
+      if (
+        yield* stopTurnStartIfThreadArchived({
+          threadId: event.payload.threadId,
+          createdAt: event.payload.createdAt,
+        })
+      ) {
+        return;
+      }
+      yield* providerService.sendTurn(sendTurnRequest.value);
+    });
 
-    yield* providerService
-      .sendTurn(sendTurnRequest.value)
+    yield* worktreeLifecycle
+      .withPermit(activateProviderTurn)
       .pipe(Effect.catchCause(recoverTurnStartFailure), Effect.forkScoped);
   });
 
