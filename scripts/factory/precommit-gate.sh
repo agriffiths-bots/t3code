@@ -472,20 +472,31 @@ build_reviewer_memory_ledger() { # build_reviewer_memory_ledger <output-file>
       | . as $records
       | (reduce ($records[] | (.findings // [])[]) as $finding
           ({seen:{}, lines:[]};
-           (($finding.title // "") | ascii_downcase) + "\u0000" + ($finding.file // $finding.path // "") as $key
+           ([
+             (($finding.title // "") | ascii_downcase),
+             ($finding.file // $finding.path // ""),
+             ($finding.line // "")
+           ] | tojson) as $key
            | if .seen[$key] then .
              else .seen[$key] = true
              | .lines += [{
                  title:($finding.title // ""),
                  priority:($finding.priority // ""),
-                 file:($finding.file // $finding.path // "")
+                 file:($finding.file // $finding.path // ""),
+                 line:($finding.line // "")
                }]
              end)
          | .lines[-$limit:]) as $findings
       | (reduce ($records[] | ((.dismissals // []) + (.valid_dismissals // []))[]) as $dismissal
-          ([];
-           ($dismissal | if type == "object" then (.title // "") else tostring end) as $title
-           | if $title == "" or index($title) != null then . else . + [$title] end)) as $dismissals
+          ({seen:{}, lines:[]};
+           ($dismissal | if type == "object" then {
+             title:(.title // ""), file:(.file // .path // ""), line:(.line // "")
+           } else {title:tostring, file:"", line:""} end) as $entry
+           | ([$entry.title, $entry.file, $entry.line] | tojson) as $key
+           | if $entry.title == "" or .seen[$key] then .
+             else .seen[$key] = true | .lines += [$entry]
+             end)
+         | .lines) as $dismissals
       | {findings:$findings, dismissals:$dismissals}
     ' "$FACTORY_AUDIT_LOG")" || return 1
   if [ "$(jq '(.findings | length) + (.dismissals | length)' <<<"$memory_json")" -eq 0 ]; then
@@ -496,11 +507,11 @@ build_reviewer_memory_ledger() { # build_reviewer_memory_ledger <output-file>
     echo "The following findings were already reported in previous rounds and have been addressed or explicitly dismissed. Treat them and reworded equivalents as SETTLED — do not re-raise them. Your value this round is finding NEW, previously unreported issues in the changed code. Review the diff as thoroughly as you would fresh code; the ledger only tells you which conclusions are already handled, not that the code is safe."
     echo
     echo "Previously reported and addressed:"
-    jq -r 'if (.findings | length) == 0 then "- (none)" else .findings[] | "- [\(.priority)] \(.title) (\(.file)) -> addressed in a subsequent commit" end' <<<"$memory_json"
+    jq -r 'if (.findings | length) == 0 then "- (none)" else .findings[] | "- [\(.priority)] \(.title) (\(.file)\(if .line == "" then "" else ":\(.line)" end)) -> addressed in a subsequent commit" end' <<<"$memory_json"
     if [ "$(jq '.dismissals | length' <<<"$memory_json")" -gt 0 ]; then
       echo
       echo "Dismissed with audited rationale (do not re-raise):"
-      jq -r '.dismissals[] | "- \(.) -> DISMISSED with audited rationale (settled design decision)"' <<<"$memory_json"
+      jq -r '.dismissals[] | "- \(.title)\(if .file == "" then "" else " (\(.file)\(if .line == "" then "" else ":\(.line)" end))" end) -> DISMISSED with audited rationale (settled design decision)"' <<<"$memory_json"
     fi
   } > "$output"
 }

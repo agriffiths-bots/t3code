@@ -219,7 +219,7 @@ describe("factory pre-commit gate", () => {
           repo,
           branch,
           verdict: "review-findings",
-          findings: [{ title: "First round bug", priority: "P1", file: "src/bug.ts" }],
+          findings: [{ title: "First round bug", priority: "P1", file: "src/bug.ts", line: 42 }],
         })}\n`,
       );
       NodeFS.writeFileSync(NodePath.join(repo, "second-round.txt"), "second round\n");
@@ -236,7 +236,7 @@ describe("factory pre-commit gate", () => {
       const ledger = NodeFS.readFileSync(extraContext, "utf8");
       assert.match(
         ledger,
-        /\[P1\] First round bug \(src\/bug\.ts\) -> addressed in a subsequent commit/,
+        /\[P1\] First round bug \(src\/bug\.ts:42\) -> addressed in a subsequent commit/,
       );
       assert.match(ledger, /reworded equivalents as SETTLED/);
       assert.match(ledger, /finding NEW, previously unreported issues/);
@@ -260,7 +260,7 @@ describe("factory pre-commit gate", () => {
           repo,
           branch,
           verdict: "pass-with-dismissals",
-          dismissals: [{ title: "Intentional design choice" }],
+          dismissals: [{ title: "Intentional design choice", file: "src/design.ts", line: 17 }],
         })}\n`,
       );
       NodeFS.writeFileSync(NodePath.join(repo, "after-dismissal.txt"), "after dismissal\n");
@@ -272,7 +272,7 @@ describe("factory pre-commit gate", () => {
 
       assert.match(
         NodeFS.readFileSync(extraContext, "utf8"),
-        /Intentional design choice -> DISMISSED with audited rationale \(settled design decision\)/,
+        /Intentional design choice \(src\/design\.ts:17\) -> DISMISSED with audited rationale \(settled design decision\)/,
       );
     } finally {
       NodeFS.rmSync(root, { recursive: true, force: true });
