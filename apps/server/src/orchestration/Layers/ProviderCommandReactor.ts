@@ -526,6 +526,7 @@ const make = Effect.gen(function* () {
     options?: {
       readonly modelSelection?: ModelSelection;
       readonly runtimeMode?: RuntimeMode;
+      readonly providerSessionDetached?: boolean;
     },
   ) {
     const thread = yield* resolveThread(threadId);
@@ -658,6 +659,9 @@ const make = Effect.gen(function* () {
         ...(input?.resumeCursor !== undefined ? { resumeCursor: input.resumeCursor } : {}),
         ...(input?.activeTurnId !== undefined ? { activeTurnId: input.activeTurnId } : {}),
         runtimeMode: desiredRuntimeMode,
+        ...(options?.providerSessionDetached !== undefined
+          ? { detached: options.providerSessionDetached }
+          : {}),
       });
 
     const bindSessionToThread = (session: ProviderSession) =>
@@ -779,6 +783,7 @@ const make = Effect.gen(function* () {
     readonly modelSelection?: ModelSelection;
     readonly runtimeMode?: RuntimeMode;
     readonly interactionMode?: "default" | "plan";
+    readonly providerSessionDetached?: boolean;
     readonly createdAt: string;
   }) {
     const thread = yield* resolveThread(input.threadId);
@@ -790,6 +795,9 @@ const make = Effect.gen(function* () {
     yield* ensureSessionForThread(input.threadId, input.createdAt, {
       ...(input.modelSelection !== undefined ? { modelSelection: input.modelSelection } : {}),
       ...(input.runtimeMode !== undefined ? { runtimeMode: input.runtimeMode } : {}),
+      ...(input.providerSessionDetached !== undefined
+        ? { providerSessionDetached: input.providerSessionDetached }
+        : {}),
     });
     if (input.modelSelection !== undefined) {
       threadModelSelections.set(input.threadId, input.modelSelection);
@@ -1147,6 +1155,9 @@ const make = Effect.gen(function* () {
           : {}),
         runtimeMode: event.payload.runtimeMode,
         interactionMode: event.payload.interactionMode,
+        ...(event.payload.providerSessionDetached !== undefined
+          ? { providerSessionDetached: event.payload.providerSessionDetached }
+          : {}),
         createdAt: event.payload.createdAt,
       }).pipe(
         Effect.map(Option.some),

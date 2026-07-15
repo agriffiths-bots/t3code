@@ -99,6 +99,9 @@ interface SourceCwdProjectContext {
 export type ActiveThreadStartRuntime = (
   input: ThreadStartInternalInput,
   invocation: McpInvocationContext.McpInvocationScope,
+  options?: {
+    readonly providerSessionDetached?: boolean;
+  },
 ) => Effect.Effect<ThreadStartToolOutput, ThreadStartToolError>;
 
 let activeThreadStartRuntime: ActiveThreadStartRuntime | null = null;
@@ -568,6 +571,9 @@ const makeActiveThreadStartRuntime = Effect.fn("ThreadToolkit.makeActiveRuntime"
   return Effect.fn("ThreadToolkit.startThread")(function* (
     input: ThreadStartInternalInput,
     invocation: McpInvocationContext.McpInvocationScope,
+    options?: {
+      readonly providerSessionDetached?: boolean;
+    },
   ) {
     const { sourceThread, project } = McpInvocationContext.isProviderInvocationScope(invocation)
       ? yield* loadProviderSourceContext(invocation)
@@ -740,6 +746,9 @@ const makeActiveThreadStartRuntime = Effect.fn("ThreadToolkit.makeActiveRuntime"
       ...(titleSeed !== undefined ? { titleSeed } : {}),
       runtimeMode,
       interactionMode,
+      ...(options?.providerSessionDetached !== undefined
+        ? { providerSessionDetached: options.providerSessionDetached }
+        : {}),
       bootstrap: {
         createThread: {
           projectId: project.id,

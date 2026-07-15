@@ -500,6 +500,79 @@ function startLifecycleRuntime() {
 }
 
 lifecycleLayer("CodexAdapterLive lifecycle", (it) => {
+  it.effect("preserves detached-child routing across the real completion sequence", () =>
+    Effect.gen(function* () {
+      const { adapter, runtime } = yield* startLifecycleRuntime();
+      const eventsFiber = yield* Stream.runCollect(Stream.take(adapter.streamEvents, 3)).pipe(
+        Effect.forkChild,
+      );
+      const threadId = asThreadId("thread-1");
+      const turnId = asTurnId("turn-detached-child");
+      const itemId = asItemId("message-detached-child");
+
+      yield* runtime.emit({
+        id: asEventId("evt-detached-child-turn-started"),
+        kind: "notification",
+        provider: ProviderDriverKind.make("codex"),
+        createdAt: "2026-01-01T00:00:01.000Z",
+        method: "turn/started",
+        threadId,
+        turnId,
+        payload: {
+          threadId,
+          turn: { id: turnId, status: "inProgress", items: [] },
+        },
+      } satisfies ProviderEvent);
+      yield* runtime.emit({
+        id: asEventId("evt-detached-child-item-completed"),
+        kind: "notification",
+        provider: ProviderDriverKind.make("codex"),
+        createdAt: "2026-01-01T00:00:02.000Z",
+        method: "item/completed",
+        threadId,
+        turnId,
+        itemId,
+        payload: {
+          completedAtMs: 1_778_000_000_000,
+          threadId,
+          turnId,
+          item: {
+            type: "agentMessage",
+            id: itemId,
+            text: "detached child completed",
+          },
+        },
+      } satisfies ProviderEvent);
+      yield* runtime.emit({
+        id: asEventId("evt-detached-child-turn-completed"),
+        kind: "notification",
+        provider: ProviderDriverKind.make("codex"),
+        createdAt: "2026-01-01T00:00:03.000Z",
+        method: "turn/completed",
+        threadId,
+        turnId,
+        payload: {
+          threadId,
+          turn: { id: turnId, status: "completed", items: [] },
+        },
+      } satisfies ProviderEvent);
+
+      const events = Array.from(yield* Fiber.join(eventsFiber));
+      NodeAssert.deepStrictEqual(
+        events.map((event) => ({
+          type: event.type,
+          threadId: event.threadId,
+          turnId: event.turnId,
+        })),
+        [
+          { type: "turn.started", threadId, turnId },
+          { type: "item.completed", threadId, turnId },
+          { type: "turn.completed", threadId, turnId },
+        ],
+      );
+    }),
+  );
+
   it.effect("maps completed agent message items to canonical item.completed events", () =>
     Effect.gen(function* () {
       const { adapter, runtime } = yield* startLifecycleRuntime();
