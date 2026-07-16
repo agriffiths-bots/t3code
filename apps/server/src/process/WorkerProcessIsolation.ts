@@ -4,6 +4,7 @@ import { HostProcessPlatform } from "@t3tools/shared/hostProcess";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Config from "effect/Config";
+import * as Duration from "effect/Duration";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
@@ -19,6 +20,7 @@ export interface WorkerProcessIsolationConfig {
   readonly nice: number;
   readonly systemdRunPath: string;
   readonly systemctlPath: string;
+  readonly forceKillAfterSeconds: number;
 }
 
 export interface WorkerLaunchExecutable {
@@ -33,9 +35,13 @@ interface SystemdAvailability {
 
 export interface WorkerProcessIsolationShape {
   readonly config: WorkerProcessIsolationConfig;
+  readonly bootIdentity: string;
   readonly wrapSpawner: (
     spawner: ChildProcessSpawner.ChildProcessSpawner["Service"],
   ) => ChildProcessSpawner.ChildProcessSpawner["Service"];
+  readonly reapStaleScopes: (
+    spawner: ChildProcessSpawner.ChildProcessSpawner["Service"],
+  ) => Effect.Effect<void>;
   readonly prepareExecutable: (input: {
     readonly realCommand: string;
     readonly directory: string;
@@ -54,9 +60,17 @@ const DEFAULT_CONFIG: WorkerProcessIsolationConfig = {
   nice: 10,
   systemdRunPath: "systemd-run",
   systemctlPath: "systemctl",
+  forceKillAfterSeconds: 2,
 };
 
 let nextScopeId = 0;
+
+interface WorkerProcessIsolationRuntimeOptions {
+  readonly bootIdentity?: string;
+  readonly isBootAlive?: (pid: number, processStartTime: string) => boolean;
+}
+
+type ReadProcessStartTime = (pid: number) => Effect.Effect<string | undefined>;
 
 const truthy = (value: string): boolean => {
   const normalized = value.trim().toLowerCase();
@@ -71,6 +85,11 @@ const parseNice = (value: string): number => {
   return Math.min(19, Math.max(0, parsed));
 };
 
+const parseForceKillAfterSeconds = (value: string): number => {
+  const parsed = Number.parseFloat(value.trim());
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : DEFAULT_CONFIG.forceKillAfterSeconds;
+};
+
 const trimOr = (value: string, fallback: string): string => {
   const trimmed = value.trim();
   return trimmed.length > 0 ? trimmed : fallback;
@@ -78,9 +97,51 @@ const trimOr = (value: string, fallback: string): string => {
 
 const supportsSystemdIsolation = (platform: NodeJS.Platform): boolean => platform === "linux";
 
-const makeScopeUnitName = (): string => {
+const parseProcessStartTime = (stat: string): string | undefined => {
+  const commandEnd = stat.lastIndexOf(")");
+  if (commandEnd < 0) return undefined;
+  const fieldsAfterCommand = stat
+    .slice(commandEnd + 1)
+    .trim()
+    .split(/\s+/u);
+  const startTime = fieldsAfterCommand[19];
+  return startTime !== undefined && /^\d+$/u.test(startTime) ? startTime : undefined;
+};
+
+const makeBootIdentity = (processStartTime: string | undefined): string =>
+  `b${process.pid}-${processStartTime ?? "0"}-${NodeCrypto.randomUUID().replaceAll("-", "")}`;
+
+const makeScopeUnitName = (bootIdentity: string): string => {
   nextScopeId += 1;
-  return `t3-worker-${process.pid}-${nextScopeId}-${NodeCrypto.randomUUID().replaceAll("-", "")}.scope`;
+  return `t3-worker-${bootIdentity}-${nextScopeId}-${NodeCrypto.randomUUID().replaceAll("-", "")}.scope`;
+};
+
+const OWNED_SCOPE_UNIT_PATTERN =
+  /^t3-worker-(b([1-9]\d*)-(\d+)-[a-f0-9]{32})-[a-zA-Z0-9]+(?:-[a-zA-Z0-9]+)*\.scope$/;
+
+const parseOwnedScopeUnit = (
+  unitName: string,
+):
+  | {
+      readonly bootIdentity: string;
+      readonly ownerPid: number;
+      readonly processStartTime: string;
+    }
+  | undefined => {
+  const match = OWNED_SCOPE_UNIT_PATTERN.exec(unitName);
+  if (!match?.[1] || !match[2] || !match[3]) return undefined;
+  const ownerPid = Number.parseInt(match[2], 10);
+  if (!Number.isSafeInteger(ownerPid) || ownerPid <= 0) return undefined;
+  return { bootIdentity: match[1], ownerPid, processStartTime: match[3] };
+};
+
+const isPidOccupied = (pid: number): boolean => {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "EPERM";
+  }
 };
 
 const escapeSystemdEnvironmentExpansion = (value: string): string => value.split("$").join("$$");
@@ -128,6 +189,9 @@ const EnvConfig = Config.all({
   systemctlPath: Config.string("T3CODE_WORKER_SYSTEMCTL").pipe(
     Config.withDefault(DEFAULT_CONFIG.systemctlPath),
   ),
+  forceKillAfterSeconds: Config.string("T3CODE_WORKER_SYSTEMD_FORCE_KILL_AFTER_SECONDS").pipe(
+    Config.withDefault(String(DEFAULT_CONFIG.forceKillAfterSeconds)),
+  ),
 }).pipe(
   Config.map(
     (env): WorkerProcessIsolationConfig => ({
@@ -137,6 +201,7 @@ const EnvConfig = Config.all({
       nice: parseNice(env.nice),
       systemdRunPath: trimOr(env.systemdRunPath, DEFAULT_CONFIG.systemdRunPath),
       systemctlPath: trimOr(env.systemctlPath, DEFAULT_CONFIG.systemctlPath),
+      forceKillAfterSeconds: parseForceKillAfterSeconds(env.forceKillAfterSeconds),
     }),
   ),
 );
@@ -235,6 +300,53 @@ const signalScopeUnit = (
     .pipe(Effect.asVoid, Effect.ignore);
 };
 
+const signalScopeUnitChecked = (
+  spawner: ChildProcessSpawner.ChildProcessSpawner["Service"],
+  config: WorkerProcessIsolationConfig,
+  unitName: string,
+  signal: ChildProcess.Signal,
+): Effect.Effect<boolean> =>
+  spawner
+    .exitCode(
+      ChildProcess.make(config.systemctlPath, ["--user", "kill", `--signal=${signal}`, unitName]),
+    )
+    .pipe(
+      Effect.map((code) => Number(code) === 0),
+      Effect.orElseSucceed(() => false),
+    );
+
+const listWorkerScopeUnits = (
+  spawner: ChildProcessSpawner.ChildProcessSpawner["Service"],
+  config: WorkerProcessIsolationConfig,
+): Effect.Effect<ReadonlyArray<string>> =>
+  spawner
+    .string(
+      ChildProcess.make(config.systemctlPath, [
+        "--user",
+        "list-units",
+        "--type=scope",
+        "--all",
+        "--no-legend",
+        "--plain",
+        "--no-pager",
+        "t3-worker-*.scope",
+      ]),
+    )
+    .pipe(
+      Effect.map((output) =>
+        output
+          .split(/\r?\n/u)
+          .map((line) =>
+            line
+              .trim()
+              .split(/\s+/u)
+              .find((token) => token.startsWith("t3-worker-") && token.endsWith(".scope")),
+          )
+          .filter((unitName): unitName is string => Boolean(unitName)),
+      ),
+      Effect.orElseSucceed(() => []),
+    );
+
 const scheduleScopeForceKill = (
   spawner: ChildProcessSpawner.ChildProcessSpawner["Service"],
   config: WorkerProcessIsolationConfig,
@@ -326,6 +438,7 @@ quota="\${T3CODE_WORKER_SYSTEMD_CPU_QUOTA:-200%}"
 nice="\${T3CODE_WORKER_NICE:-10}"
 systemd_run="\${T3CODE_WORKER_SYSTEMD_RUN:-systemd-run}"
 systemctl="\${T3CODE_WORKER_SYSTEMCTL:-systemctl}"
+boot_identity="\${T3CODE_SERVER_BOOT_IDENTITY:-}"
 force_kill_after="\${T3CODE_WORKER_SYSTEMD_FORCE_KILL_AFTER_SECONDS:-2}"
 case "$enabled" in
   0|false|FALSE|no|NO|off|OFF)
@@ -342,7 +455,10 @@ systemd_supports_expand_environment() {
 }
 
 run_systemd_scope() {
-  unit="t3-worker-$$-$(date +%s 2>/dev/null || echo 0).scope"
+  if [ -z "$boot_identity" ]; then
+    exec "$real_command" "$@"
+  fi
+  unit="t3-worker-$boot_identity-$$-$(date +%s 2>/dev/null || echo 0).scope"
   if systemd_supports_expand_environment; then
     "$systemd_run" --user --scope --quiet --collect --expand-environment=no "--unit=$unit" "--slice=$slice" "--nice=$nice" -- "$real_command" "$@" <&0 &
   else
@@ -411,10 +527,30 @@ const writeExecutableFileAtomically = (input: {
     }),
   );
 
-const makeWithConfig = (config: WorkerProcessIsolationConfig) =>
+const makeWithConfig = (
+  config: WorkerProcessIsolationConfig,
+  runtimeOptions: WorkerProcessIsolationRuntimeOptions = {},
+  readProcessStartTime: ReadProcessStartTime,
+) =>
   Effect.gen(function* () {
     const platform = yield* HostProcessPlatform;
     const systemdIsolationSupported = supportsSystemdIsolation(platform);
+    const bootIdentity =
+      runtimeOptions.bootIdentity ?? makeBootIdentity(yield* readProcessStartTime(process.pid));
+    const bootIsAlive = (pid: number, processStartTime: string): Effect.Effect<boolean> => {
+      if (runtimeOptions.isBootAlive !== undefined) {
+        return Effect.sync(() => runtimeOptions.isBootAlive!(pid, processStartTime));
+      }
+      if (!isPidOccupied(pid)) return Effect.succeed(false);
+      return readProcessStartTime(pid).pipe(
+        Effect.map(
+          (observedStartTime) =>
+            processStartTime === "0" ||
+            observedStartTime === undefined ||
+            observedStartTime === processStartTime,
+        ),
+      );
+    };
     const availabilityRef = yield* Ref.make<Option.Option<SystemdAvailability>>(Option.none());
 
     const ensureAvailable = (
@@ -463,7 +599,7 @@ const makeWithConfig = (config: WorkerProcessIsolationConfig) =>
         return ensureAvailable(spawner).pipe(
           Effect.flatMap((available) => {
             if (!available.available) return spawner.spawn(command);
-            const unitName = makeScopeUnitName();
+            const unitName = makeScopeUnitName(bootIdentity);
             return spawner
               .spawn(wrapCommand(command, config, available.expandEnvironmentFlag, unitName))
               .pipe(
@@ -480,6 +616,46 @@ const makeWithConfig = (config: WorkerProcessIsolationConfig) =>
           }),
         );
       });
+
+    const reapStaleScopes: WorkerProcessIsolationShape["reapStaleScopes"] = (spawner) => {
+      if (!config.enabled || !systemdIsolationSupported) return Effect.void;
+      return Effect.gen(function* () {
+        const unitNames = yield* listWorkerScopeUnits(spawner, config);
+        const staleFlags = yield* Effect.forEach(
+          unitNames,
+          (unitName) => {
+            const owner = parseOwnedScopeUnit(unitName);
+            if (owner === undefined || owner.bootIdentity === bootIdentity) {
+              return Effect.succeed(false);
+            }
+            return bootIsAlive(owner.ownerPid, owner.processStartTime).pipe(
+              Effect.map((alive) => !alive),
+            );
+          },
+          { concurrency: "unbounded" },
+        );
+        const staleUnitNames = unitNames.filter((_, index) => staleFlags[index] === true);
+        yield* Effect.forEach(
+          staleUnitNames,
+          (unitName) =>
+            Effect.gen(function* () {
+              const termSent = yield* signalScopeUnitChecked(spawner, config, unitName, "SIGTERM");
+              yield* Effect.sleep(Duration.seconds(config.forceKillAfterSeconds));
+              const killSent = yield* signalScopeUnitChecked(spawner, config, unitName, "SIGKILL");
+              yield* termSent || killSent
+                ? Effect.logInfo("worker.process.isolation.stale-scope-reaped", {
+                    unitName,
+                    bootIdentity,
+                  })
+                : Effect.logWarning("worker.process.isolation.stale-scope-reap-failed", {
+                    unitName,
+                    bootIdentity,
+                  });
+            }),
+          { concurrency: "unbounded", discard: true },
+        );
+      });
+    };
 
     const prepareExecutable: WorkerProcessIsolationShape["prepareExecutable"] = (input) =>
       Effect.gen(function* () {
@@ -506,6 +682,8 @@ const makeWithConfig = (config: WorkerProcessIsolationConfig) =>
             T3CODE_WORKER_NICE: String(config.nice),
             T3CODE_WORKER_SYSTEMD_RUN: config.systemdRunPath,
             T3CODE_WORKER_SYSTEMCTL: config.systemctlPath,
+            T3CODE_WORKER_SYSTEMD_FORCE_KILL_AFTER_SECONDS: String(config.forceKillAfterSeconds),
+            T3CODE_SERVER_BOOT_IDENTITY: bootIdentity,
           },
         } satisfies WorkerLaunchExecutable;
       }).pipe(
@@ -517,29 +695,46 @@ const makeWithConfig = (config: WorkerProcessIsolationConfig) =>
 
     return WorkerProcessIsolation.of({
       config,
+      bootIdentity,
       wrapSpawner,
+      reapStaleScopes,
       prepareExecutable,
     });
   });
 
-export const make = makeWithConfig;
+export const make = (
+  config: WorkerProcessIsolationConfig,
+  runtimeOptions: WorkerProcessIsolationRuntimeOptions = {},
+) =>
+  Effect.gen(function* () {
+    const fs = yield* FileSystem.FileSystem;
+    const readProcessStartTime: ReadProcessStartTime = (pid) =>
+      fs.readFileString(`/proc/${pid}/stat`).pipe(
+        Effect.map(parseProcessStartTime),
+        Effect.orElseSucceed(() => undefined),
+      );
+    return yield* makeWithConfig(config, runtimeOptions, readProcessStartTime);
+  });
 
 export const layer = Layer.effect(WorkerProcessIsolation, EnvConfig.pipe(Effect.flatMap(make)));
 
 export const layerTest = (
   config: Partial<WorkerProcessIsolationConfig> = {},
   platform: NodeJS.Platform = "linux",
+  runtimeOptions: WorkerProcessIsolationRuntimeOptions = {},
 ) =>
   Layer.effect(
     WorkerProcessIsolation,
-    makeWithConfig({ ...DEFAULT_CONFIG, ...config }).pipe(
-      Effect.provideService(HostProcessPlatform, platform),
-    ),
+    makeWithConfig({ ...DEFAULT_CONFIG, ...config }, runtimeOptions, (pid) =>
+      Effect.succeed(pid === process.pid ? "1" : undefined),
+    ).pipe(Effect.provideService(HostProcessPlatform, platform)),
   );
 
 export const disabled = WorkerProcessIsolation.of({
   config: { ...DEFAULT_CONFIG, enabled: false },
+  bootIdentity: "disabled",
   wrapSpawner: (spawner) => spawner,
+  reapStaleScopes: () => Effect.void,
   prepareExecutable: (input) =>
     Effect.succeed({
       executablePath: input.realCommand,

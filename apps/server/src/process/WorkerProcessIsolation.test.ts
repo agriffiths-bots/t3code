@@ -1,11 +1,14 @@
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { describe, expect, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
+import * as Duration from "effect/Duration";
 import * as FileSystem from "effect/FileSystem";
+import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as Path from "effect/Path";
 import * as Sink from "effect/Sink";
 import * as Stream from "effect/Stream";
+import * as TestClock from "effect/testing/TestClock";
 import * as ChildProcess from "effect/unstable/process/ChildProcess";
 import * as ChildProcessSpawner from "effect/unstable/process/ChildProcessSpawner";
 
@@ -14,6 +17,7 @@ import * as WorkerProcessIsolation from "./WorkerProcessIsolation.ts";
 function makeHandle(
   code = 0,
   onKill: (options: ChildProcess.KillOptions | undefined) => void = () => undefined,
+  stdout = "",
 ) {
   return ChildProcessSpawner.makeHandle({
     pid: ChildProcessSpawner.ProcessId(1),
@@ -22,7 +26,7 @@ function makeHandle(
     kill: (options) => Effect.sync(() => onKill(options)),
     unref: Effect.succeed(Effect.void),
     stdin: Sink.drain,
-    stdout: Stream.empty,
+    stdout: stdout.length > 0 ? Stream.succeed(new TextEncoder().encode(stdout)) : Stream.empty,
     stderr: Stream.empty,
     all: Stream.empty,
     getInputFd: () => Sink.drain,
@@ -84,7 +88,7 @@ describe("WorkerProcessIsolation", () => {
         "--quiet",
         "--collect",
         "--expand-environment=no",
-        expect.stringMatching(/^--unit=t3-worker-.+\.scope$/),
+        expect.stringMatching(/^--unit=t3-worker-b\d+-\d+-[a-f0-9]{32}-.+\.scope$/),
         "--slice=factory-workers.slice",
         "--nice=10",
         "--",
@@ -270,6 +274,71 @@ describe("WorkerProcessIsolation", () => {
     }).pipe(Effect.provide(WorkerProcessIsolation.layerTest({}, "win32"))),
   );
 
+  it.effect("reaps only scopes owned by a dead prior server boot", () =>
+    Effect.gen(function* () {
+      const commands: ChildProcess.StandardCommand[] = [];
+      const currentBoot = `b${process.pid}-100-${"a".repeat(32)}`;
+      const liveForeignBoot = `b777-200-${"b".repeat(32)}`;
+      const reusedPidBoot = `b777-199-${"2".repeat(32)}`;
+      const deadPriorBoot = `b424242-300-${"c".repeat(32)}`;
+      const currentUnit = `t3-worker-${currentBoot}-1-${"d".repeat(32)}.scope`;
+      const liveForeignUnit = `t3-worker-${liveForeignBoot}-2-${"e".repeat(32)}.scope`;
+      const reusedPidUnit = `t3-worker-${reusedPidBoot}-3-${"3".repeat(32)}.scope`;
+      const deadPriorUnit = `t3-worker-${deadPriorBoot}-3-${"f".repeat(32)}.scope`;
+      const legacyForeignUnit = `t3-worker-123-4-${"1".repeat(32)}.scope`;
+      const listing = [
+        `${currentUnit} loaded active running current`,
+        `${liveForeignUnit} loaded active running live-foreign`,
+        `${reusedPidUnit} loaded active running reused-pid`,
+        `● ${deadPriorUnit} loaded active running stale`,
+        `${legacyForeignUnit} loaded active running unowned-legacy`,
+      ].join("\n");
+      const spawner = ChildProcessSpawner.make((command) =>
+        Effect.sync(() => {
+          if (!ChildProcess.isStandardCommand(command)) {
+            throw new Error("expected standard command");
+          }
+          commands.push(command);
+          return makeHandle(0, undefined, commands.length === 1 ? listing : "");
+        }),
+      );
+      const isolation = yield* WorkerProcessIsolation.WorkerProcessIsolation;
+
+      const reapFiber = yield* isolation.reapStaleScopes(spawner).pipe(Effect.forkChild);
+      while (commands.length < 3) yield* Effect.yieldNow;
+
+      expect(commands[0]?.args).toEqual([
+        "--user",
+        "list-units",
+        "--type=scope",
+        "--all",
+        "--no-legend",
+        "--plain",
+        "--no-pager",
+        "t3-worker-*.scope",
+      ]);
+      expect(commands.slice(1).map((command) => command.args)).toEqual([
+        ["--user", "kill", "--signal=SIGTERM", reusedPidUnit],
+        ["--user", "kill", "--signal=SIGTERM", deadPriorUnit],
+      ]);
+      yield* TestClock.adjust(Duration.seconds(2));
+      yield* Fiber.join(reapFiber);
+      expect(commands.slice(1).map((command) => command.args)).toEqual([
+        ["--user", "kill", "--signal=SIGTERM", reusedPidUnit],
+        ["--user", "kill", "--signal=SIGTERM", deadPriorUnit],
+        ["--user", "kill", "--signal=SIGKILL", reusedPidUnit],
+        ["--user", "kill", "--signal=SIGKILL", deadPriorUnit],
+      ]);
+    }).pipe(
+      Effect.provide(
+        WorkerProcessIsolation.layerTest({}, "linux", {
+          bootIdentity: `b${process.pid}-100-${"a".repeat(32)}`,
+          isBootAlive: (pid, processStartTime) => pid === 777 && processStartTime === "200",
+        }),
+      ),
+    ),
+  );
+
   it.effect("prepares a wrapper executable for SDK-managed workers", () =>
     Effect.gen(function* () {
       const fs = yield* FileSystem.FileSystem;
@@ -285,6 +354,7 @@ describe("WorkerProcessIsolation", () => {
 
       expect(executable.executablePath).toBe(path.join(directory, "t3-worker-systemd-run"));
       expect(executable.env.T3_WORKER_REAL_COMMAND).toBe("/usr/bin/claude");
+      expect(executable.env.T3CODE_SERVER_BOOT_IDENTITY).toMatch(/^b\d+-\d+-[a-f0-9]{32}$/);
       expect(contents).toContain("systemd-run");
       expect(contents).toContain("--expand-environment=no");
       expect(contents).toContain("--unit=$unit");

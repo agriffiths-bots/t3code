@@ -24,6 +24,7 @@ import * as NodeServices from "@effect/platform-node/NodeServices";
 import { it, vi } from "@effect/vitest";
 
 import * as Context from "effect/Context";
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
@@ -42,13 +43,13 @@ import { ServerSettingsService } from "../../serverSettings.ts";
 import { ProviderAdapterValidationError } from "../Errors.ts";
 import type { CodexAdapterShape } from "../Services/CodexAdapter.ts";
 import { ProviderSessionDirectory } from "../Services/ProviderSessionDirectory.ts";
+import { type CodexAdapterLiveOptions, makeCodexAdapter } from "./CodexAdapter.ts";
 import {
   type CodexSessionRuntimeOptions,
   type CodexSessionRuntimeSendTurnInput,
   type CodexSessionRuntimeShape,
   type CodexThreadSnapshot,
 } from "./CodexSessionRuntime.ts";
-import { makeCodexAdapter } from "./CodexAdapter.ts";
 const decodeCodexSettings = Schema.decodeSync(CodexSettings);
 
 // Test-local service tag so the rest of the file can keep using `yield* CodexAdapter`.
@@ -118,13 +119,30 @@ class FakeCodexRuntime implements CodexSessionRuntimeShape {
 
   public readonly closeImpl = vi.fn(() => Promise.resolve(undefined));
 
+  public startOverride: (() => Effect.Effect<ProviderSession>) | undefined;
+  public closeOverride: (() => Effect.Effect<void>) | undefined;
+
   readonly options: CodexSessionRuntimeOptions;
 
   constructor(options: CodexSessionRuntimeOptions) {
     this.options = options;
   }
 
+  makeSession(): ProviderSession {
+    return {
+      provider: ProviderDriverKind.make("codex"),
+      status: "ready",
+      runtimeMode: this.options.runtimeMode,
+      threadId: this.options.threadId,
+      cwd: this.options.cwd,
+      ...(this.options.model ? { model: this.options.model } : {}),
+      createdAt: this.now,
+      updatedAt: this.now,
+    };
+  }
+
   start() {
+    if (this.startOverride) return this.startOverride();
     return Effect.promise(() => this.startImpl());
   }
 
@@ -156,7 +174,9 @@ class FakeCodexRuntime implements CodexSessionRuntimeShape {
     return Stream.fromQueue(this.eventQueue);
   }
 
-  close = Effect.promise(() => this.closeImpl());
+  close = Effect.suspend(() =>
+    this.closeOverride ? this.closeOverride() : Effect.promise(() => this.closeImpl()),
+  );
 
   emit(event: ProviderEvent) {
     return Queue.offer(this.eventQueue, event).pipe(Effect.asVoid);
@@ -173,11 +193,38 @@ function makeRuntimeFactory() {
 
   return {
     factory,
+    get runtimes(): ReadonlyArray<FakeCodexRuntime> {
+      return runtimes;
+    },
     get lastRuntime(): FakeCodexRuntime | undefined {
       return runtimes.at(-1);
     },
   };
 }
+
+type TestRuntimeFactory = NonNullable<CodexAdapterLiveOptions["makeRuntime"]>;
+
+const makeAdapterTestLayer = (factory: TestRuntimeFactory) =>
+  Layer.effect(
+    CodexAdapter,
+    Effect.gen(function* () {
+      const codexConfig = decodeCodexSettings({});
+      return yield* makeCodexAdapter(codexConfig, { makeRuntime: factory });
+    }),
+  ).pipe(
+    Layer.provideMerge(ServerConfig.layerTest(process.cwd(), process.cwd())),
+    Layer.provideMerge(ServerSettingsService.layerTest()),
+    Layer.provideMerge(providerSessionDirectoryTestLayer),
+    Layer.provideMerge(NodeServices.layer),
+  );
+
+const buildAdapterWithScope = Effect.fn("CodexAdapter.test.buildAdapterWithScope")(function* (
+  factory: TestRuntimeFactory,
+  scope: Scope.Closeable,
+) {
+  const context = yield* Layer.buildWithScope(makeAdapterTestLayer(factory), scope);
+  return yield* Effect.service(CodexAdapter).pipe(Effect.provide(context));
+});
 
 function makeScopedRuntimeFactory(options?: { readonly failConstruction?: boolean }) {
   const runtimes: Array<FakeCodexRuntime> = [];
@@ -1225,6 +1272,823 @@ scopedFailureLayer("CodexAdapterLive scoped startup failure", (it) => {
     }),
   );
 });
+
+it.effect("single-flights compatible starts for the same thread", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const startEntered = yield* Deferred.make<void>();
+      const releaseStart = yield* Deferred.make<void>();
+      const runtimes: FakeCodexRuntime[] = [];
+      const factory: TestRuntimeFactory = (options) =>
+        Effect.sync(() => {
+          const runtime = new FakeCodexRuntime(options);
+          runtime.startOverride = () =>
+            Deferred.succeed(startEntered, undefined).pipe(
+              Effect.andThen(Deferred.await(releaseStart)),
+              Effect.as(runtime.makeSession()),
+            );
+          runtimes.push(runtime);
+          return runtime;
+        });
+      const adapterScope = yield* Scope.make("sequential");
+      yield* Effect.addFinalizer(() => Scope.close(adapterScope, Exit.void));
+      const adapter = yield* buildAdapterWithScope(factory, adapterScope);
+      const input = {
+        provider: ProviderDriverKind.make("codex"),
+        threadId: asThreadId("thread-compatible-single-flight"),
+        cwd: "/workspace/compatible",
+        modelSelection: createModelSelection(ProviderInstanceId.make("codex"), "gpt-5.4-mini"),
+        runtimeMode: "full-access" as const,
+        detached: true,
+      };
+
+      const firstFiber = yield* adapter.startSession(input).pipe(Effect.forkChild);
+      yield* Deferred.await(startEntered);
+      const secondFiber = yield* adapter.startSession(input).pipe(Effect.forkChild);
+      yield* Effect.forEach(Array.from({ length: 10 }), () => Effect.yieldNow, {
+        discard: true,
+      });
+
+      NodeAssert.equal(runtimes.length, 1);
+      yield* Deferred.succeed(releaseStart, undefined);
+      const first = yield* Fiber.join(firstFiber);
+      const second = yield* Fiber.join(secondFiber);
+
+      NodeAssert.strictEqual(first, second);
+      NodeAssert.equal(runtimes.length, 1);
+      NodeAssert.equal(yield* adapter.hasSession(input.threadId), true);
+    }),
+  ),
+);
+
+it.effect("keeps a shared start alive when its original caller is interrupted", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const startEntered = yield* Deferred.make<void>();
+      const releaseStart = yield* Deferred.make<void>();
+      let runtime: FakeCodexRuntime | undefined;
+      const factory: TestRuntimeFactory = (options) =>
+        Effect.sync(() => {
+          runtime = new FakeCodexRuntime(options);
+          runtime.startOverride = () =>
+            Deferred.succeed(startEntered, undefined).pipe(
+              Effect.andThen(Deferred.await(releaseStart)),
+              Effect.as(runtime!.makeSession()),
+            );
+          return runtime;
+        });
+      const adapterScope = yield* Scope.make("sequential");
+      yield* Effect.addFinalizer(() => Scope.close(adapterScope, Exit.void));
+      const adapter = yield* buildAdapterWithScope(factory, adapterScope);
+      const input = {
+        threadId: asThreadId("thread-shared-start-caller-cancelled"),
+        runtimeMode: "full-access" as const,
+      };
+
+      const firstFiber = yield* adapter.startSession(input).pipe(Effect.forkChild);
+      yield* Deferred.await(startEntered);
+      const joinedFiber = yield* adapter.startSession(input).pipe(Effect.forkChild);
+      yield* Effect.forEach(Array.from({ length: 10 }), () => Effect.yieldNow, {
+        discard: true,
+      });
+
+      yield* Fiber.interrupt(firstFiber);
+      NodeAssert.ok(runtime);
+      NodeAssert.equal(runtime.closeImpl.mock.calls.length, 0);
+      yield* Deferred.succeed(releaseStart, undefined);
+      yield* Fiber.join(joinedFiber);
+
+      NodeAssert.equal(runtime.closeImpl.mock.calls.length, 0);
+      NodeAssert.equal(yield* adapter.hasSession(input.threadId), true);
+    }),
+  ),
+);
+
+it.effect("serializes incompatible same-thread starts until the old scope is closed", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const firstStartEntered = yield* Deferred.make<void>();
+      const releaseFirstStart = yield* Deferred.make<void>();
+      const runtimes: FakeCodexRuntime[] = [];
+      const released: ThreadId[] = [];
+      let liveRuntimes = 0;
+      let maxLiveRuntimes = 0;
+      const factory: TestRuntimeFactory = (options) =>
+        Effect.gen(function* () {
+          yield* Scope.Scope;
+          const runtime = new FakeCodexRuntime(options);
+          const index = runtimes.length;
+          runtimes.push(runtime);
+          liveRuntimes += 1;
+          maxLiveRuntimes = Math.max(maxLiveRuntimes, liveRuntimes);
+          yield* Effect.addFinalizer(() =>
+            Effect.sync(() => {
+              liveRuntimes -= 1;
+              released.push(options.threadId);
+            }),
+          );
+          if (index === 0) {
+            runtime.startOverride = () =>
+              Deferred.succeed(firstStartEntered, undefined).pipe(
+                Effect.andThen(Deferred.await(releaseFirstStart)),
+                Effect.as(runtime.makeSession()),
+              );
+          }
+          return runtime;
+        });
+      const adapterScope = yield* Scope.make("sequential");
+      yield* Effect.addFinalizer(() => Scope.close(adapterScope, Exit.void));
+      const adapter = yield* buildAdapterWithScope(factory, adapterScope);
+      const threadId = asThreadId("thread-incompatible-serialization");
+      const baseInput = {
+        provider: ProviderDriverKind.make("codex"),
+        threadId,
+        cwd: "/workspace/serialized",
+        runtimeMode: "full-access" as const,
+        detached: true,
+      };
+
+      const firstFiber = yield* adapter
+        .startSession({
+          ...baseInput,
+          modelSelection: createModelSelection(ProviderInstanceId.make("codex"), "model-a"),
+        })
+        .pipe(Effect.forkChild);
+      yield* Deferred.await(firstStartEntered);
+      const secondFiber = yield* adapter
+        .startSession({
+          ...baseInput,
+          modelSelection: createModelSelection(ProviderInstanceId.make("codex"), "model-b"),
+        })
+        .pipe(Effect.forkChild);
+      yield* Effect.forEach(Array.from({ length: 10 }), () => Effect.yieldNow, {
+        discard: true,
+      });
+
+      NodeAssert.equal(runtimes.length, 1);
+      NodeAssert.equal(liveRuntimes, 1);
+      const replacementExitFiber = yield* Stream.runHead(adapter.streamEvents).pipe(
+        Effect.forkChild,
+      );
+      yield* Deferred.succeed(releaseFirstStart, undefined);
+      yield* Fiber.join(firstFiber);
+      const second = yield* Fiber.join(secondFiber);
+
+      NodeAssert.equal(second.model, "model-b");
+      NodeAssert.equal(runtimes.length, 2);
+      NodeAssert.equal(maxLiveRuntimes, 1);
+      NodeAssert.deepStrictEqual(released, [threadId]);
+      NodeAssert.equal(runtimes[0]?.closeImpl.mock.calls.length, 1);
+      NodeAssert.equal(replacementExitFiber.pollUnsafe(), undefined);
+      yield* Fiber.interrupt(replacementExitFiber);
+    }),
+  ),
+);
+
+it.effect("finishes replacement teardown when the replacement start is cancelled", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const closeEntered = yield* Deferred.make<void>();
+      const releaseClose = yield* Deferred.make<void>();
+      const released: ThreadId[] = [];
+      const runtimes: FakeCodexRuntime[] = [];
+      const factory: TestRuntimeFactory = (options) =>
+        Effect.gen(function* () {
+          yield* Scope.Scope;
+          yield* Effect.addFinalizer(() =>
+            Effect.sync(() => {
+              released.push(options.threadId);
+            }),
+          );
+          const runtime = new FakeCodexRuntime(options);
+          runtimes.push(runtime);
+          return runtime;
+        });
+      const adapterScope = yield* Scope.make("sequential");
+      yield* Effect.addFinalizer(() => Scope.close(adapterScope, Exit.void));
+      const adapter = yield* buildAdapterWithScope(factory, adapterScope);
+      const threadId = asThreadId("thread-cancelled-replacement-close");
+      const baseInput = { threadId, runtimeMode: "full-access" as const };
+
+      yield* adapter.startSession({
+        ...baseInput,
+        modelSelection: createModelSelection(ProviderInstanceId.make("codex"), "model-a"),
+      });
+      const oldRuntime = runtimes[0];
+      NodeAssert.ok(oldRuntime);
+      oldRuntime.closeOverride = () =>
+        Effect.promise(() => oldRuntime.closeImpl()).pipe(
+          Effect.andThen(Deferred.succeed(closeEntered, undefined)),
+          Effect.andThen(Deferred.await(releaseClose)),
+        );
+      const exitEventFiber = yield* Stream.runHead(adapter.streamEvents).pipe(Effect.forkChild);
+      const replacementFiber = yield* adapter
+        .startSession({
+          ...baseInput,
+          modelSelection: createModelSelection(ProviderInstanceId.make("codex"), "model-b"),
+        })
+        .pipe(Effect.forkChild);
+      yield* Deferred.await(closeEntered);
+
+      const interruptFiber = yield* Fiber.interrupt(replacementFiber).pipe(Effect.forkChild);
+      yield* Effect.forEach(Array.from({ length: 10 }), () => Effect.yieldNow, {
+        discard: true,
+      });
+      NodeAssert.equal(runtimes.length, 1);
+      NodeAssert.deepStrictEqual(released, []);
+      yield* Deferred.succeed(releaseClose, undefined);
+      yield* Fiber.join(interruptFiber);
+      const exitEvent = yield* Fiber.join(exitEventFiber);
+
+      NodeAssert.equal(oldRuntime.closeImpl.mock.calls.length, 1);
+      NodeAssert.equal(exitEvent._tag, "Some");
+      if (exitEvent._tag === "Some") {
+        NodeAssert.equal(exitEvent.value.type, "session.exited");
+      }
+      NodeAssert.deepStrictEqual(released, [threadId]);
+      NodeAssert.equal(runtimes.length, 1);
+      NodeAssert.equal(yield* adapter.hasSession(threadId), false);
+    }),
+  ),
+);
+
+it.effect("emits the old session exit when replacement construction fails", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const runtimes: FakeCodexRuntime[] = [];
+      const factory: TestRuntimeFactory = (options) => {
+        if (runtimes.length > 0) {
+          return Effect.fail(
+            new CodexErrors.CodexAppServerSpawnError({
+              command: `${options.binaryPath} app-server`,
+              cause: new Error("replacement construction failed"),
+            }),
+          );
+        }
+        return Effect.sync(() => {
+          const runtime = new FakeCodexRuntime(options);
+          runtimes.push(runtime);
+          return runtime;
+        });
+      };
+      const adapterScope = yield* Scope.make("sequential");
+      yield* Effect.addFinalizer(() => Scope.close(adapterScope, Exit.void));
+      const adapter = yield* buildAdapterWithScope(factory, adapterScope);
+      const threadId = asThreadId("thread-failed-replacement-exit");
+      const baseInput = { threadId, runtimeMode: "full-access" as const };
+      yield* adapter.startSession({
+        ...baseInput,
+        modelSelection: createModelSelection(ProviderInstanceId.make("codex"), "model-a"),
+      });
+      const oldRuntime = runtimes[0];
+      NodeAssert.ok(oldRuntime);
+      const exitEventFiber = yield* Stream.runHead(adapter.streamEvents).pipe(Effect.forkChild);
+
+      const replacementExit = yield* adapter
+        .startSession({
+          ...baseInput,
+          modelSelection: createModelSelection(ProviderInstanceId.make("codex"), "model-b"),
+        })
+        .pipe(Effect.exit);
+      const exitEvent = yield* Fiber.join(exitEventFiber);
+
+      NodeAssert.equal(Exit.isFailure(replacementExit), true);
+      NodeAssert.equal(exitEvent._tag, "Some");
+      if (exitEvent._tag === "Some") {
+        NodeAssert.equal(exitEvent.value.type, "session.exited");
+        NodeAssert.equal(exitEvent.value.threadId, threadId);
+      }
+      NodeAssert.equal(oldRuntime.closeImpl.mock.calls.length, 1);
+      NodeAssert.equal(yield* adapter.hasSession(threadId), false);
+    }),
+  ),
+);
+
+for (const scenario of [
+  {
+    name: "resume cursors",
+    first: { resumeCursor: { threadId: "provider-thread-a" } },
+    second: { resumeCursor: { threadId: "provider-thread-b" } },
+  },
+  {
+    name: "service tiers",
+    first: {
+      modelSelection: createModelSelection(ProviderInstanceId.make("codex"), "model-a", [
+        { id: "serviceTier", value: "priority" },
+      ]),
+    },
+    second: {
+      modelSelection: createModelSelection(ProviderInstanceId.make("codex"), "model-a", [
+        { id: "serviceTier", value: "flex" },
+      ]),
+    },
+  },
+] as const) {
+  it.effect(`serializes same-thread starts with different ${scenario.name}`, () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const firstStartEntered = yield* Deferred.make<void>();
+        const releaseFirstStart = yield* Deferred.make<void>();
+        const runtimes: FakeCodexRuntime[] = [];
+        const factory: TestRuntimeFactory = (options) =>
+          Effect.sync(() => {
+            const runtime = new FakeCodexRuntime(options);
+            if (runtimes.length === 0) {
+              runtime.startOverride = () =>
+                Deferred.succeed(firstStartEntered, undefined).pipe(
+                  Effect.andThen(Deferred.await(releaseFirstStart)),
+                  Effect.as(runtime.makeSession()),
+                );
+            }
+            runtimes.push(runtime);
+            return runtime;
+          });
+        const adapterScope = yield* Scope.make("sequential");
+        yield* Effect.addFinalizer(() => Scope.close(adapterScope, Exit.void));
+        const adapter = yield* buildAdapterWithScope(factory, adapterScope);
+        const baseInput = {
+          threadId: asThreadId(`thread-incompatible-${scenario.name.replace(" ", "-")}`),
+          runtimeMode: "full-access" as const,
+        };
+
+        const firstFiber = yield* adapter
+          .startSession({ ...baseInput, ...scenario.first })
+          .pipe(Effect.forkChild);
+        yield* Deferred.await(firstStartEntered);
+        const secondFiber = yield* adapter
+          .startSession({ ...baseInput, ...scenario.second })
+          .pipe(Effect.forkChild);
+        yield* Effect.forEach(Array.from({ length: 10 }), () => Effect.yieldNow, {
+          discard: true,
+        });
+
+        NodeAssert.equal(runtimes.length, 1);
+        yield* Deferred.succeed(releaseFirstStart, undefined);
+        yield* Fiber.join(firstFiber);
+        yield* Fiber.join(secondFiber);
+
+        NodeAssert.equal(runtimes.length, 2);
+        NodeAssert.equal(runtimes[0]?.closeImpl.mock.calls.length, 1);
+      }),
+    ),
+  );
+}
+
+it.effect("serializes same-thread starts from different MCP provider sessions", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const firstStartEntered = yield* Deferred.make<void>();
+      const releaseFirstStart = yield* Deferred.make<void>();
+      const runtimes: FakeCodexRuntime[] = [];
+      const factory: TestRuntimeFactory = (options) =>
+        Effect.sync(() => {
+          const runtime = new FakeCodexRuntime(options);
+          if (runtimes.length === 0) {
+            runtime.startOverride = () =>
+              Deferred.succeed(firstStartEntered, undefined).pipe(
+                Effect.andThen(Deferred.await(releaseFirstStart)),
+                Effect.as(runtime.makeSession()),
+              );
+          }
+          runtimes.push(runtime);
+          return runtime;
+        });
+      const adapterScope = yield* Scope.make("sequential");
+      yield* Effect.addFinalizer(() => Scope.close(adapterScope, Exit.void));
+      const adapter = yield* buildAdapterWithScope(factory, adapterScope);
+      const threadId = asThreadId("thread-incompatible-mcp-session");
+      const firstMcpSession: McpProviderSession.McpProviderSessionConfig = {
+        environmentId: EnvironmentId.make("environment-mcp-a"),
+        threadId,
+        providerSessionId: "provider-session-mcp-a",
+        providerInstanceId: ProviderInstanceId.make("codex"),
+        endpoint: "http://127.0.0.1:3773/mcp-a",
+        authorizationHeader: "Bearer mcp-token-a",
+      };
+      const secondMcpSession: McpProviderSession.McpProviderSessionConfig = {
+        ...firstMcpSession,
+        environmentId: EnvironmentId.make("environment-mcp-b"),
+        providerSessionId: "provider-session-mcp-b",
+        endpoint: "http://127.0.0.1:3773/mcp-b",
+        authorizationHeader: "Bearer mcp-token-b",
+      };
+      yield* Effect.addFinalizer(() =>
+        Effect.sync(() => McpProviderSession.clearMcpProviderSession(threadId)),
+      );
+      const input = { threadId, runtimeMode: "full-access" as const };
+
+      McpProviderSession.setMcpProviderSession(firstMcpSession);
+      const firstFiber = yield* adapter.startSession(input).pipe(Effect.forkChild);
+      yield* Deferred.await(firstStartEntered);
+      McpProviderSession.setMcpProviderSession(secondMcpSession);
+      const secondFiber = yield* adapter.startSession(input).pipe(Effect.forkChild);
+      yield* Effect.forEach(Array.from({ length: 10 }), () => Effect.yieldNow, {
+        discard: true,
+      });
+
+      NodeAssert.equal(runtimes.length, 1);
+      yield* Deferred.succeed(releaseFirstStart, undefined);
+      yield* Fiber.join(firstFiber);
+      yield* Fiber.join(secondFiber);
+
+      NodeAssert.equal(runtimes.length, 2);
+      NodeAssert.deepStrictEqual(
+        runtimes[0]?.options.appServerArgs,
+        makeCodexMcpRuntimeConfig(firstMcpSession, process.env).appServerArgs,
+      );
+      NodeAssert.deepStrictEqual(
+        runtimes[1]?.options.appServerArgs,
+        makeCodexMcpRuntimeConfig(secondMcpSession, process.env).appServerArgs,
+      );
+    }),
+  ),
+);
+
+it.effect("starts different thread ids concurrently", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const releaseStarts = yield* Deferred.make<void>();
+      const enteredByThread = new Map<ThreadId, Deferred.Deferred<void>>();
+      const runtimes: FakeCodexRuntime[] = [];
+      const factory: TestRuntimeFactory = (options) =>
+        Effect.gen(function* () {
+          const entered = yield* Deferred.make<void>();
+          enteredByThread.set(options.threadId, entered);
+          const runtime = new FakeCodexRuntime(options);
+          runtime.startOverride = () =>
+            Deferred.succeed(entered, undefined).pipe(
+              Effect.andThen(Deferred.await(releaseStarts)),
+              Effect.as(runtime.makeSession()),
+            );
+          runtimes.push(runtime);
+          return runtime;
+        });
+      const adapterScope = yield* Scope.make("sequential");
+      yield* Effect.addFinalizer(() => Scope.close(adapterScope, Exit.void));
+      const adapter = yield* buildAdapterWithScope(factory, adapterScope);
+      const firstThreadId = asThreadId("thread-parallel-a");
+      const secondThreadId = asThreadId("thread-parallel-b");
+
+      const firstFiber = yield* adapter
+        .startSession({ threadId: firstThreadId, runtimeMode: "full-access" })
+        .pipe(Effect.forkChild);
+      while (!enteredByThread.has(firstThreadId)) yield* Effect.yieldNow;
+      yield* Deferred.await(enteredByThread.get(firstThreadId)!);
+      const secondFiber = yield* adapter
+        .startSession({ threadId: secondThreadId, runtimeMode: "full-access" })
+        .pipe(Effect.forkChild);
+      while (!enteredByThread.has(secondThreadId)) yield* Effect.yieldNow;
+      yield* Deferred.await(enteredByThread.get(secondThreadId)!);
+
+      NodeAssert.equal(runtimes.length, 2);
+      yield* Deferred.succeed(releaseStarts, undefined);
+      yield* Fiber.join(firstFiber);
+      yield* Fiber.join(secondFiber);
+    }),
+  ),
+);
+
+it.effect("closes an interrupted in-flight start scope", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const startEntered = yield* Deferred.make<void>();
+      const neverRelease = yield* Deferred.make<void>();
+      const released: ThreadId[] = [];
+      let runtime: FakeCodexRuntime | undefined;
+      const factory: TestRuntimeFactory = (options) =>
+        Effect.gen(function* () {
+          yield* Scope.Scope;
+          yield* Effect.addFinalizer(() =>
+            Effect.sync(() => {
+              released.push(options.threadId);
+            }),
+          );
+          runtime = new FakeCodexRuntime(options);
+          runtime.startOverride = () =>
+            Deferred.succeed(startEntered, undefined).pipe(
+              Effect.andThen(Deferred.await(neverRelease)),
+              Effect.as(runtime!.makeSession()),
+            );
+          return runtime;
+        });
+      const adapterScope = yield* Scope.make("sequential");
+      yield* Effect.addFinalizer(() => Scope.close(adapterScope, Exit.void));
+      const adapter = yield* buildAdapterWithScope(factory, adapterScope);
+      const threadId = asThreadId("thread-interrupted-start");
+      const startFiber = yield* adapter
+        .startSession({ threadId, runtimeMode: "full-access" })
+        .pipe(Effect.forkChild);
+      yield* Deferred.await(startEntered);
+
+      yield* Fiber.interrupt(startFiber);
+
+      NodeAssert.ok(runtime);
+      NodeAssert.equal(runtime.closeImpl.mock.calls.length, 1);
+      NodeAssert.deepStrictEqual(released, [threadId]);
+      NodeAssert.equal(yield* adapter.hasSession(threadId), false);
+    }),
+  ),
+);
+
+for (const stopOperation of ["stopSession", "stopAll"] as const) {
+  it.effect(`${stopOperation} cancels and drains an in-flight start`, () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const startEntered = yield* Deferred.make<void>();
+        const neverRelease = yield* Deferred.make<void>();
+        const released: ThreadId[] = [];
+        let runtime: FakeCodexRuntime | undefined;
+        const factory: TestRuntimeFactory = (options) =>
+          Effect.gen(function* () {
+            yield* Scope.Scope;
+            yield* Effect.addFinalizer(() =>
+              Effect.sync(() => {
+                released.push(options.threadId);
+              }),
+            );
+            runtime = new FakeCodexRuntime(options);
+            runtime.startOverride = () =>
+              Deferred.succeed(startEntered, undefined).pipe(
+                Effect.andThen(Deferred.await(neverRelease)),
+                Effect.as(runtime!.makeSession()),
+              );
+            return runtime;
+          });
+        const adapterScope = yield* Scope.make("sequential");
+        yield* Effect.addFinalizer(() => Scope.close(adapterScope, Exit.void));
+        const adapter = yield* buildAdapterWithScope(factory, adapterScope);
+        const threadId = asThreadId(`thread-${stopOperation}-during-start`);
+        const startFiber = yield* adapter
+          .startSession({ threadId, runtimeMode: "full-access" })
+          .pipe(Effect.forkChild);
+        yield* Deferred.await(startEntered);
+
+        if (stopOperation === "stopSession") {
+          yield* adapter.stopSession(threadId);
+        } else {
+          yield* adapter.stopAll();
+        }
+        const startExit = yield* Fiber.await(startFiber);
+
+        NodeAssert.equal(Exit.isFailure(startExit), true);
+        NodeAssert.ok(runtime);
+        NodeAssert.equal(runtime.closeImpl.mock.calls.length, 1);
+        NodeAssert.deepStrictEqual(released, [threadId]);
+        NodeAssert.equal(yield* adapter.hasSession(threadId), false);
+      }),
+    ),
+  );
+}
+
+it.effect("stopSession cancels an incompatible start waiting behind another start", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const startEntered = yield* Deferred.make<void>();
+      const neverRelease = yield* Deferred.make<void>();
+      const runtimes: FakeCodexRuntime[] = [];
+      const factory: TestRuntimeFactory = (options) =>
+        Effect.sync(() => {
+          const runtime = new FakeCodexRuntime(options);
+          runtime.startOverride = () =>
+            Deferred.succeed(startEntered, undefined).pipe(
+              Effect.andThen(Deferred.await(neverRelease)),
+              Effect.as(runtime.makeSession()),
+            );
+          runtimes.push(runtime);
+          return runtime;
+        });
+      const adapterScope = yield* Scope.make("sequential");
+      yield* Effect.addFinalizer(() => Scope.close(adapterScope, Exit.void));
+      const adapter = yield* buildAdapterWithScope(factory, adapterScope);
+      const threadId = asThreadId("thread-stop-cancels-serialized-start");
+      const baseInput = { threadId, runtimeMode: "full-access" as const };
+      const firstFiber = yield* adapter
+        .startSession({
+          ...baseInput,
+          modelSelection: createModelSelection(ProviderInstanceId.make("codex"), "model-a"),
+        })
+        .pipe(Effect.forkChild);
+      yield* Deferred.await(startEntered);
+      const waitingFiber = yield* adapter
+        .startSession({
+          ...baseInput,
+          modelSelection: createModelSelection(ProviderInstanceId.make("codex"), "model-b"),
+        })
+        .pipe(Effect.forkChild);
+      yield* Effect.forEach(Array.from({ length: 10 }), () => Effect.yieldNow, {
+        discard: true,
+      });
+
+      yield* adapter.stopSession(threadId);
+      const firstExit = yield* Fiber.await(firstFiber);
+      const waitingExit = yield* Fiber.await(waitingFiber);
+
+      NodeAssert.equal(Exit.isFailure(firstExit), true);
+      NodeAssert.equal(Exit.isFailure(waitingExit), true);
+      NodeAssert.equal(runtimes.length, 1);
+      NodeAssert.equal(yield* adapter.hasSession(threadId), false);
+    }),
+  ),
+);
+
+it.effect("stale cleanup cannot remove or close a successor session", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const oldCloseEntered = yield* Deferred.make<void>();
+      const releaseOldClose = yield* Deferred.make<void>();
+      const runtimes: FakeCodexRuntime[] = [];
+      const factory: TestRuntimeFactory = (options) =>
+        Effect.sync(() => {
+          const runtime = new FakeCodexRuntime(options);
+          runtimes.push(runtime);
+          return runtime;
+        });
+      const adapterScope = yield* Scope.make("sequential");
+      yield* Effect.addFinalizer(() => Scope.close(adapterScope, Exit.void));
+      const adapter = yield* buildAdapterWithScope(factory, adapterScope);
+      const threadId = asThreadId("thread-stale-cleanup");
+      const input = { threadId, runtimeMode: "full-access" as const };
+
+      yield* adapter.startSession(input);
+      const oldRuntime = runtimes[0];
+      NodeAssert.ok(oldRuntime);
+      oldRuntime.closeOverride = () =>
+        Deferred.succeed(oldCloseEntered, undefined).pipe(
+          Effect.andThen(Deferred.await(releaseOldClose)),
+        );
+      const staleStopFiber = yield* adapter.stopSession(threadId).pipe(Effect.forkChild);
+      yield* Deferred.await(oldCloseEntered);
+
+      const successorFiber = yield* adapter.startSession(input).pipe(Effect.forkChild);
+      yield* Effect.forEach(Array.from({ length: 10 }), () => Effect.yieldNow, {
+        discard: true,
+      });
+      NodeAssert.equal(runtimes.length, 1);
+      yield* Deferred.succeed(releaseOldClose, undefined);
+      yield* Fiber.join(staleStopFiber);
+      const successor = yield* Fiber.join(successorFiber);
+      const successorRuntime = runtimes[1];
+      NodeAssert.ok(successorRuntime);
+
+      NodeAssert.equal(successor.model, undefined);
+      NodeAssert.equal(yield* adapter.hasSession(threadId), true);
+      NodeAssert.equal(successorRuntime.closeImpl.mock.calls.length, 0);
+      yield* adapter.sendTurn({ threadId, input: "still alive" });
+      NodeAssert.equal(successorRuntime.sendTurnImpl.mock.calls.length, 1);
+    }),
+  ),
+);
+
+it.effect("does not forward a stale session-closed event while starting a successor", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const oldCloseEntered = yield* Deferred.make<void>();
+      const releaseOldClose = yield* Deferred.make<void>();
+      const runtimes: FakeCodexRuntime[] = [];
+      const factory: TestRuntimeFactory = (options) =>
+        Effect.sync(() => {
+          const runtime = new FakeCodexRuntime(options);
+          runtimes.push(runtime);
+          return runtime;
+        });
+      const adapterScope = yield* Scope.make("sequential");
+      yield* Effect.addFinalizer(() => Scope.close(adapterScope, Exit.void));
+      const adapter = yield* buildAdapterWithScope(factory, adapterScope);
+      const threadId = asThreadId("thread-stale-close-event");
+      const input = { threadId, runtimeMode: "full-access" as const };
+
+      yield* adapter.startSession(input);
+      const oldRuntime = runtimes[0];
+      NodeAssert.ok(oldRuntime);
+      oldRuntime.closeOverride = () =>
+        oldRuntime
+          .emit({
+            id: asEventId("evt-stale-session-closed"),
+            kind: "session",
+            provider: ProviderDriverKind.make("codex"),
+            threadId,
+            createdAt: "2026-01-01T00:00:00.000Z",
+            method: "session/closed",
+            message: "Old session stopped",
+          })
+          .pipe(
+            Effect.andThen(Deferred.succeed(oldCloseEntered, undefined)),
+            Effect.andThen(Deferred.await(releaseOldClose)),
+          );
+      const forwardedEventFiber = yield* Stream.runHead(adapter.streamEvents).pipe(
+        Effect.forkChild,
+      );
+      const staleStopFiber = yield* adapter.stopSession(threadId).pipe(Effect.forkChild);
+      yield* Deferred.await(oldCloseEntered);
+      const successorFiber = yield* adapter.startSession(input).pipe(Effect.forkChild);
+      yield* Effect.forEach(Array.from({ length: 10 }), () => Effect.yieldNow, {
+        discard: true,
+      });
+
+      NodeAssert.equal(runtimes.length, 1);
+      yield* Deferred.succeed(releaseOldClose, undefined);
+      yield* Fiber.join(staleStopFiber);
+      yield* Fiber.join(successorFiber);
+      const forwardedEvent = yield* Fiber.join(forwardedEventFiber);
+      NodeAssert.equal(forwardedEvent._tag, "Some");
+      if (forwardedEvent._tag === "Some") {
+        NodeAssert.equal(forwardedEvent.value.type, "session.exited");
+        NodeAssert.equal(forwardedEvent.value.threadId, threadId);
+      }
+      const duplicateEventFiber = yield* Stream.runHead(adapter.streamEvents).pipe(
+        Effect.forkChild,
+      );
+      yield* Effect.forEach(Array.from({ length: 10 }), () => Effect.yieldNow, {
+        discard: true,
+      });
+
+      NodeAssert.equal(duplicateEventFiber.pollUnsafe(), undefined);
+      yield* Fiber.interrupt(duplicateEventFiber);
+      NodeAssert.equal(yield* adapter.hasSession(threadId), true);
+    }),
+  ),
+);
+
+it.effect("does not duplicate a session exit already forwarded by the runtime", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const runtimeFactory = makeRuntimeFactory();
+      const adapterScope = yield* Scope.make("sequential");
+      yield* Effect.addFinalizer(() => Scope.close(adapterScope, Exit.void));
+      const adapter = yield* buildAdapterWithScope(runtimeFactory.factory, adapterScope);
+      const threadId = asThreadId("thread-runtime-exit-deduplication");
+      yield* adapter.startSession({ threadId, runtimeMode: "full-access" });
+      const runtime = runtimeFactory.lastRuntime;
+      NodeAssert.ok(runtime);
+      const runtimeExitFiber = yield* Stream.runHead(adapter.streamEvents).pipe(Effect.forkChild);
+
+      yield* runtime.emit({
+        id: asEventId("evt-runtime-session-closed"),
+        kind: "session",
+        provider: ProviderDriverKind.make("codex"),
+        threadId,
+        createdAt: "2026-01-01T00:00:00.000Z",
+        method: "session/closed",
+        message: "Runtime session stopped",
+      });
+      const runtimeExit = yield* Fiber.join(runtimeExitFiber);
+      NodeAssert.equal(runtimeExit._tag, "Some");
+      if (runtimeExit._tag === "Some") {
+        NodeAssert.equal(runtimeExit.value.type, "session.exited");
+      }
+      const duplicateExitFiber = yield* Stream.runHead(adapter.streamEvents).pipe(Effect.forkChild);
+
+      yield* adapter.stopSession(threadId);
+      yield* Effect.forEach(Array.from({ length: 10 }), () => Effect.yieldNow, {
+        discard: true,
+      });
+
+      NodeAssert.equal(duplicateExitFiber.pollUnsafe(), undefined);
+      yield* Fiber.interrupt(duplicateExitFiber);
+    }),
+  ),
+);
+
+it.effect("adapter release cancels and drains an in-flight start", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const startEntered = yield* Deferred.make<void>();
+      const neverRelease = yield* Deferred.make<void>();
+      const released: ThreadId[] = [];
+      let runtime: FakeCodexRuntime | undefined;
+      const factory: TestRuntimeFactory = (options) =>
+        Effect.gen(function* () {
+          yield* Scope.Scope;
+          yield* Effect.addFinalizer(() =>
+            Effect.sync(() => {
+              released.push(options.threadId);
+            }),
+          );
+          runtime = new FakeCodexRuntime(options);
+          runtime.startOverride = () =>
+            Deferred.succeed(startEntered, undefined).pipe(
+              Effect.andThen(Deferred.await(neverRelease)),
+              Effect.as(runtime!.makeSession()),
+            );
+          return runtime;
+        });
+      const adapterScope = yield* Scope.make("sequential");
+      const adapter = yield* buildAdapterWithScope(factory, adapterScope);
+      const threadId = asThreadId("thread-adapter-release-start");
+      const startFiber = yield* adapter
+        .startSession({ threadId, runtimeMode: "full-access" })
+        .pipe(Effect.forkChild);
+      yield* Deferred.await(startEntered);
+
+      yield* Scope.close(adapterScope, Exit.void);
+      yield* Fiber.await(startFiber);
+
+      NodeAssert.ok(runtime);
+      NodeAssert.equal(runtime.closeImpl.mock.calls.length, 1);
+      NodeAssert.deepStrictEqual(released, [threadId]);
+    }),
+  ),
+);
 
 it.effect("flushes managed native logs when the adapter layer shuts down", () =>
   Effect.gen(function* () {
