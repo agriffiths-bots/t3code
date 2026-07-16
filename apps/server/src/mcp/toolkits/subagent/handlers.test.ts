@@ -976,7 +976,7 @@ describe("SubagentToolkit", () => {
         const command = dispatchedTurnCommands[0];
         if (!command) throw new Error("Expected spawn to dispatch a child turn start.");
         expect(command.type).toBe("thread.turn.start");
-        expect("providerSessionDetached" in command).toBe(false);
+        expect(command.providerSessionDetached).toBe(true);
         expect(registeredChildren).toEqual([{ childThreadId: command.threadId, parentThreadId }]);
         expect(peerHttpRequests).toEqual([]);
         expect(insertedRemoteChildren).toEqual([]);

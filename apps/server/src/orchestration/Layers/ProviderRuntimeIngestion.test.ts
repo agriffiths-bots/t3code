@@ -587,6 +587,115 @@ describe("ProviderRuntimeIngestion", () => {
     expect(await harness.leasedChildThreadIds()).toEqual([]);
   });
 
+  it.each(["codex", "grok", "claudeAgent"] as const)(
+    "settles a detached %s child and releases its dispatch lease from the provider completion sequence",
+    async (driver) => {
+      const providerDriver = ProviderDriverKind.make(driver);
+      const harness = await createHarness({ provider: providerDriver });
+      const childThreadId = asThreadId("thread-1");
+      const parentThreadId = asThreadId(`detached-parent-${driver}`);
+      const turnId = asTurnId(`detached-turn-${driver}`);
+      const createdAt = "2026-01-01T00:00:01.000Z";
+
+      await harness.acquireDispatchLease(childThreadId);
+      await Effect.runPromise(
+        harness.coordinator.register({
+          parentThreadId,
+          childThreadId,
+          detached: true,
+          model: harness.modelSelection,
+          spawnedAtMs: 1,
+        }),
+      );
+      await Effect.runPromise(
+        harness.engine.dispatch({
+          type: "thread.turn.start",
+          commandId: CommandId.make(`cmd-detached-turn-${driver}`),
+          threadId: childThreadId,
+          message: {
+            messageId: asMessageId(`message-detached-turn-${driver}`),
+            role: "user",
+            text: `complete the detached ${driver} child`,
+            attachments: [],
+          },
+          interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+          runtimeMode: "approval-required",
+          providerSessionDetached: true,
+          createdAt,
+        }),
+      );
+
+      expect(await harness.readProjectedTurns(childThreadId)).toEqual([
+        { turnId: null, state: "pending" },
+      ]);
+      expect(await harness.leasedChildThreadIds()).toEqual([childThreadId]);
+
+      // CodexAdapter maps the real app-server turn/started -> item/completed ->
+      // turn/completed notification order into these canonical runtime events.
+      // Grok and Claude produce the same canonical sequence from per-child sessions.
+      harness.emit({
+        type: "turn.started",
+        eventId: asEventId(`evt-detached-turn-started-${driver}`),
+        provider: providerDriver,
+        threadId: childThreadId,
+        turnId,
+        createdAt,
+        payload: {},
+      });
+      harness.emit({
+        type: "item.completed",
+        eventId: asEventId(`evt-detached-item-completed-${driver}`),
+        provider: providerDriver,
+        threadId: childThreadId,
+        turnId,
+        itemId: asItemId(`detached-message-${driver}`),
+        createdAt: "2026-01-01T00:00:02.000Z",
+        payload: {
+          itemType: "assistant_message",
+          status: "completed",
+          detail: `${driver} detached child completed`,
+        },
+      });
+      harness.emit({
+        type: "turn.completed",
+        eventId: asEventId(`evt-detached-turn-completed-${driver}`),
+        provider: providerDriver,
+        threadId: childThreadId,
+        turnId,
+        createdAt: "2026-01-01T00:00:03.000Z",
+        payload: { state: "completed" },
+      });
+
+      await harness.drain();
+      const completedThread = await waitForThread(
+        harness.readModel,
+        (thread) => thread.latestTurn?.turnId === turnId && thread.latestTurn.state === "completed",
+      );
+      expect(completedThread.latestTurn?.state).toBe("completed");
+      expect(await harness.readProjectedTurns(childThreadId)).toEqual([
+        { turnId, state: "completed" },
+      ]);
+
+      const childResult = await Effect.runPromise(
+        harness.coordinator.waitSlice({
+          childThreadIds: [childThreadId],
+          mode: "all",
+          budgetDeadlineMs: Number.MAX_SAFE_INTEGER,
+        }),
+      );
+      expect(childResult.results).toEqual([
+        {
+          childThreadId,
+          status: "completed",
+          finalAssistantText: `${driver} detached child completed`,
+          error: null,
+          parentTurnIdAtWait: null,
+        },
+      ]);
+      expect(await harness.leasedChildThreadIds()).toEqual([]);
+    },
+  );
+
   it("applies provider session.state.changed transitions directly", async () => {
     const harness = await createHarness();
     const waitingAt = "2026-01-01T00:00:00.000Z";
