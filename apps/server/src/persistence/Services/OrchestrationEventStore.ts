@@ -9,7 +9,7 @@
  *
  * @module OrchestrationEventStore
  */
-import { OrchestrationEvent } from "@t3tools/contracts";
+import { OrchestrationEvent, type ThreadId } from "@t3tools/contracts";
 import * as Context from "effect/Context";
 import type * as Effect from "effect/Effect";
 import type * as Stream from "effect/Stream";
@@ -52,6 +52,15 @@ export interface OrchestrationEventStoreShape {
    * @returns Stream containing all stored events.
    */
   readonly readAll: () => Stream.Stream<OrchestrationEvent, OrchestrationEventStoreError>;
+
+  /**
+   * Read only the latest persisted sequence for one thread aggregate. This is
+   * intentionally a scalar query: callers use it to detect missed live events
+   * without decoding event payloads or hydrating the thread projection.
+   */
+  readonly getLatestThreadSequence: (
+    threadId: ThreadId,
+  ) => Effect.Effect<number, OrchestrationEventStoreError>;
 }
 
 /**

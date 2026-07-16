@@ -600,6 +600,18 @@ export const OrchestrationThreadDetailSnapshot = Schema.Struct({
 });
 export type OrchestrationThreadDetailSnapshot = typeof OrchestrationThreadDetailSnapshot.Type;
 
+/**
+ * Lightweight persisted-event marker for one thread aggregate. Unlike a
+ * detail snapshot, this value can be read without hydrating messages, items,
+ * activities, or checkpoints.
+ */
+export const OrchestrationThreadRevision = Schema.Struct({
+  latestSequence: NonNegativeInt,
+  /** Lowest sequence applied by every projector needed for thread detail. */
+  projectionSequence: NonNegativeInt,
+});
+export type OrchestrationThreadRevision = typeof OrchestrationThreadRevision.Type;
+
 export const ProjectCreateCommand = Schema.Struct({
   type: Schema.Literal("project.create"),
   commandId: CommandId,

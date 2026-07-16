@@ -8,6 +8,7 @@ import {
 } from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
 import * as Clock from "effect/Clock";
+import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
 import * as Queue from "effect/Queue";
@@ -22,7 +23,8 @@ import { connectionProjectionPhase } from "../connection/model.ts";
 import { EnvironmentSupervisor } from "../connection/supervisor.ts";
 import { EnvironmentCacheStore } from "../platform/persistence.ts";
 import { subscribe } from "../rpc/client.ts";
-import { ThreadSnapshotLoader } from "./threadSnapshotHttp.ts";
+import { ThreadRevisionLoader, ThreadSnapshotLoader } from "./threadSnapshotHttp.ts";
+import { ThreadReconciliationActivity } from "./threadReconciliationActivity.ts";
 import { parseThreadKey, threadKey } from "./entities.ts";
 import { applyThreadDetailEvent } from "./threadReducer.ts";
 import { THREAD_STATE_IDLE_TTL_MS } from "./threadRetention.ts";
@@ -33,8 +35,40 @@ import {
   type EnvironmentThreadStatus,
 } from "./threadState.ts";
 
-const ACTIVE_THREAD_RECONCILE_INTERVAL = "2 seconds";
-const RECENT_THREAD_RECONCILE_GRACE_MS = 8_000;
+export interface ThreadReconciliationPolicy {
+  readonly fastIntervalMs: number;
+  readonly fastWindowMs: number;
+  readonly backoffMultiplier: number;
+  readonly maxBackoffMs: number;
+}
+
+export const DEFAULT_THREAD_RECONCILIATION_POLICY: ThreadReconciliationPolicy = Object.freeze({
+  fastIntervalMs: 2_000,
+  fastWindowMs: 30_000,
+  backoffMultiplier: 2,
+  maxBackoffMs: 60_000,
+});
+
+type ThreadReconciliationReason =
+  | "recovery-snapshot"
+  | "incoming-event"
+  | "changed-revision"
+  | "locally-initiated-turn"
+  | "connection-generation-change"
+  | "unchanged-backoff";
+
+type ThreadProjectionReconcileResult =
+  | {
+      readonly kind: "recovered";
+      readonly recoveredThroughSequence: number;
+    }
+  | {
+      readonly kind: "pending";
+    };
+
+export interface EnvironmentThreadStateOptions {
+  readonly reconciliationPolicy?: ThreadReconciliationPolicy;
+}
 
 function statusWithoutLiveData(data: Option.Option<OrchestrationThread>): EnvironmentThreadStatus {
   return Option.isSome(data) ? "cached" : "empty";
@@ -52,6 +86,10 @@ function threadNeedsProjectionReconcile(thread: OrchestrationThread): boolean {
 
 function threadProjectionMatches(left: OrchestrationThread, right: OrchestrationThread): boolean {
   return JSON.stringify(left) === JSON.stringify(right);
+}
+
+function serializedJsonBytes(value: unknown): number {
+  return new TextEncoder().encode(JSON.stringify(value)).byteLength;
 }
 
 function threadBelongsInActiveDetail(thread: OrchestrationThread): boolean {
@@ -198,10 +236,15 @@ function formatThreadError(cause: Cause.Cause<unknown>): string {
 
 export const makeEnvironmentThreadState = Effect.fn("EnvironmentThreadState.make")(function* (
   threadId: ThreadIdType,
+  options?: EnvironmentThreadStateOptions,
 ) {
   const supervisor = yield* EnvironmentSupervisor;
   const cache = yield* EnvironmentCacheStore;
   const snapshotLoader = yield* ThreadSnapshotLoader;
+  const revisionLoader = yield* ThreadRevisionLoader;
+  const reconciliationActivity = yield* ThreadReconciliationActivity;
+  const reconciliationPolicy =
+    options?.reconciliationPolicy ?? DEFAULT_THREAD_RECONCILIATION_POLICY;
   const environmentId = supervisor.target.environmentId;
   const cached = yield* cache.loadThread(environmentId, threadId).pipe(
     Effect.catch((error) =>
@@ -227,7 +270,21 @@ export const makeEnvironmentThreadState = Effect.fn("EnvironmentThreadState.make
     Option.match(cached, { onNone: () => 0, onSome: (snapshot) => snapshot.snapshotSequence }),
   );
   const persistence = yield* Queue.sliding<OrchestrationThreadDetailSnapshot>(1);
-  const reconcileUntil = yield* Ref.make(0);
+  const reconciliationWake = yield* Queue.sliding<ThreadReconciliationReason>(1);
+  const reconcileFastUntil = yield* Ref.make(0);
+  const reconciliationDelayMs = yield* Ref.make(reconciliationPolicy.fastIntervalMs);
+  const reconciliationUnchangedCount = yield* Ref.make(0);
+  const lastReconciliationReason = yield* Ref.make<ThreadReconciliationReason>("recovery-snapshot");
+  // A later delivered event cannot prove that every earlier event arrived.
+  // Only an accepted detail/recovery snapshot advances this verified marker;
+  // live events advance the reconnect cursor and leave a revision pending.
+  const lastVerifiedRevision = yield* Ref.make(yield* SubscriptionRef.get(lastSequence));
+  const pendingRevision = yield* Ref.make(0);
+  const revisionCheckUnresolved = yield* Ref.make(false);
+  const connectionGeneration = yield* Ref.make(
+    (yield* SubscriptionRef.get(supervisor.state)).generation,
+  );
+  const subscribeInput: { threadId: ThreadIdType; afterSequence?: number } = { threadId };
   // Sequence of the last applied destructive collection change (revert). A
   // non-advancing snapshot taken before this point may still contain pruned
   // messages, so it must not be used as an additive recovery source.
@@ -318,22 +375,37 @@ export const makeEnvironmentThreadState = Effect.fn("EnvironmentThreadState.make
   });
 
   const markThreadRecentlyActive = Effect.fn("EnvironmentThreadState.markThreadRecentlyActive")(
-    function* () {
+    function* (
+      reason: Exclude<ThreadReconciliationReason, "unchanged-backoff">,
+      markOptions?: { readonly wake?: boolean },
+    ) {
       const now = yield* Clock.currentTimeMillis;
-      yield* Ref.set(reconcileUntil, now + RECENT_THREAD_RECONCILE_GRACE_MS);
+      yield* Ref.set(reconcileFastUntil, now + reconciliationPolicy.fastWindowMs);
+      yield* Ref.set(reconciliationDelayMs, reconciliationPolicy.fastIntervalMs);
+      yield* Ref.set(reconciliationUnchangedCount, 0);
+      yield* Ref.set(lastReconciliationReason, reason);
+      if (markOptions?.wake !== false) {
+        yield* Queue.offer(reconciliationWake, reason);
+      }
     },
   );
 
-  const shouldReconcileThread = Effect.fn("EnvironmentThreadState.shouldReconcileThread")(
-    function* (thread: OrchestrationThread) {
-      if (threadNeedsProjectionReconcile(thread)) {
-        yield* markThreadRecentlyActive();
-        return true;
-      }
-      const [now, until] = yield* Effect.all([Clock.currentTimeMillis, Ref.get(reconcileUntil)]);
-      return until > now;
-    },
-  );
+  const advanceLastSequence = Effect.fn("EnvironmentThreadState.advanceLastSequence")(function* (
+    sequence: number,
+  ) {
+    const current = yield* SubscriptionRef.get(lastSequence);
+    if (sequence > current) {
+      yield* SubscriptionRef.set(lastSequence, sequence);
+    }
+    subscribeInput.afterSequence = Math.max(current, sequence);
+  });
+
+  const acknowledgeSnapshotRevision = Effect.fn(
+    "EnvironmentThreadState.acknowledgeSnapshotRevision",
+  )(function* (sequence: number) {
+    yield* Ref.update(lastVerifiedRevision, (revision) => Math.max(revision, sequence));
+    yield* Ref.update(pendingRevision, (pending) => (pending <= sequence ? 0 : pending));
+  });
 
   const setDeleted = Effect.fn("EnvironmentThreadState.setDeleted")(function* () {
     yield* SubscriptionRef.set(state, {
@@ -361,6 +433,7 @@ export const makeEnvironmentThreadState = Effect.fn("EnvironmentThreadState.make
       readonly allowOlderFreshThread?: boolean;
       readonly mergeNonAdvancingSnapshot?: boolean;
       readonly skipMatchingCurrentSequence?: boolean;
+      readonly activityReason?: Exclude<ThreadReconciliationReason, "unchanged-backoff">;
     },
   ) {
     const sequence = yield* SubscriptionRef.get(lastSequence);
@@ -373,19 +446,19 @@ export const makeEnvironmentThreadState = Effect.fn("EnvironmentThreadState.make
       olderReconcileSnapshot &&
       snapshot.snapshotSequence < (yield* Ref.get(lastRevertSequence))
     ) {
-      return;
+      return false;
     }
     if (olderSequence && options?.allowOlderFreshThread !== true) {
-      return;
+      return false;
     }
     if (
       olderSequence &&
       (Option.isNone(current.data) || snapshot.thread.updatedAt < current.data.value.updatedAt)
     ) {
-      return;
+      return false;
     }
     if (snapshot.snapshotSequence === sequence && options?.allowCurrentSequence !== true) {
-      return;
+      return false;
     }
 
     const thread =
@@ -399,32 +472,45 @@ export const makeEnvironmentThreadState = Effect.fn("EnvironmentThreadState.make
       Option.isSome(current.data) &&
       threadProjectionMatches(current.data.value, thread)
     ) {
-      return;
+      if (current.status !== "live") {
+        yield* SubscriptionRef.set(state, {
+          ...current,
+          status: "live",
+          error: Option.none(),
+        });
+        yield* markThreadRecentlyActive(options?.activityReason ?? "recovery-snapshot");
+      }
+      return true;
     }
 
     if (snapshot.snapshotSequence > sequence) {
-      yield* SubscriptionRef.set(lastSequence, snapshot.snapshotSequence);
+      yield* advanceLastSequence(snapshot.snapshotSequence);
     }
     yield* setThread(thread, {
       persist: !olderReconcileSnapshot,
     });
-    if (threadBelongsInActiveDetail(thread) && threadNeedsProjectionReconcile(thread)) {
-      yield* markThreadRecentlyActive();
-    }
+    yield* markThreadRecentlyActive(options?.activityReason ?? "recovery-snapshot");
+    return true;
   });
 
   const applySnapshot = Effect.fn("EnvironmentThreadState.applySnapshot")(function* (
     snapshot: OrchestrationThreadDetailSnapshot,
     options?: Parameters<typeof applySnapshotLocked>[1],
   ) {
-    yield* applyLock.withPermit(applySnapshotLocked(snapshot, options));
+    return yield* applyLock.withPermit(applySnapshotLocked(snapshot, options));
   });
 
   const applyItemLocked = Effect.fn("EnvironmentThreadState.applyItemLocked")(function* (
     item: OrchestrationThreadStreamItem,
   ) {
     if (item.kind === "snapshot") {
-      yield* applySnapshotLocked(item.snapshot, { allowCurrentSequence: true });
+      const accepted = yield* applySnapshotLocked(item.snapshot, {
+        allowCurrentSequence: true,
+        skipMatchingCurrentSequence: true,
+      });
+      if (accepted) {
+        yield* acknowledgeSnapshotRevision(item.snapshot.snapshotSequence);
+      }
       return;
     }
 
@@ -432,11 +518,20 @@ export const makeEnvironmentThreadState = Effect.fn("EnvironmentThreadState.make
     if (item.event.sequence <= sequence) {
       return;
     }
-    yield* SubscriptionRef.set(lastSequence, item.event.sequence);
+    yield* advanceLastSequence(item.event.sequence);
+    yield* Ref.update(pendingRevision, (pending) => Math.max(pending, item.event.sequence));
     if (item.event.type === "thread.reverted") {
       yield* Ref.set(lastRevertSequence, item.event.sequence);
     }
-    yield* markThreadRecentlyActive();
+    yield* markThreadRecentlyActive("incoming-event");
+    yield* Effect.logDebug("Applied live thread event.").pipe(
+      Effect.annotateLogs({
+        environmentId,
+        threadId,
+        lastAppliedSequence: item.event.sequence,
+        eventType: item.event.type,
+      }),
+    );
 
     const current = yield* SubscriptionRef.get(state);
     if (Option.isNone(current.data)) {
@@ -460,60 +555,278 @@ export const makeEnvironmentThreadState = Effect.fn("EnvironmentThreadState.make
   });
 
   const reconcileFromProjection = Effect.fn("EnvironmentThreadState.reconcileFromProjection")(
-    function* () {
+    function* (revisionSequence: number, projectionSequence: number | null) {
       const prepared = yield* SubscriptionRef.get(supervisor.prepared);
       if (Option.isNone(prepared)) {
-        return;
+        return { kind: "pending" } as ThreadProjectionReconcileResult;
       }
       const result = yield* snapshotLoader.loadForReconcile(prepared.value, threadId);
       if (result.kind === "missing") {
+        const projectionCaughtUp =
+          projectionSequence !== null && projectionSequence >= revisionSequence;
+        yield* Effect.logDebug(
+          projectionCaughtUp
+            ? "Thread reconciliation confirmed a projected deletion."
+            : "Thread reconciliation detail is missing while projection is behind.",
+        ).pipe(
+          Effect.annotateLogs({
+            environmentId,
+            threadId,
+            reconciliationReason: "changed-revision",
+            revisionSequence,
+            projectionSequence,
+            projectionCaughtUp,
+            responseBytes: 0,
+          }),
+        );
+        if (!projectionCaughtUp) {
+          return { kind: "pending" } as ThreadProjectionReconcileResult;
+        }
         yield* applyLock.withPermit(setDeleted());
-        return;
+        return {
+          kind: "recovered",
+          recoveredThroughSequence: revisionSequence,
+        } as ThreadProjectionReconcileResult;
       }
       if (result.kind === "unavailable") {
-        return;
+        yield* Effect.logDebug("Thread reconciliation detail was unavailable.").pipe(
+          Effect.annotateLogs({
+            environmentId,
+            threadId,
+            reconciliationReason: "changed-revision",
+            revisionSequence,
+            responseBytes: 0,
+          }),
+        );
+        return { kind: "pending" } as ThreadProjectionReconcileResult;
       }
-      yield* applySnapshot(result.snapshot, {
+      const responseBytes = serializedJsonBytes(result.snapshot);
+      const accepted = yield* applySnapshot(result.snapshot, {
         allowOlderFreshThread: true,
         allowCurrentSequence: true,
         mergeNonAdvancingSnapshot: true,
         skipMatchingCurrentSequence: true,
+        activityReason: "changed-revision",
       });
+      yield* Effect.logDebug("Loaded thread detail after its revision advanced.").pipe(
+        Effect.annotateLogs({
+          environmentId,
+          threadId,
+          reconciliationReason: "changed-revision",
+          revisionSequence,
+          snapshotSequence: result.snapshot.snapshotSequence,
+          responseBytes,
+        }),
+      );
+      if (!accepted || result.snapshot.snapshotSequence < revisionSequence) {
+        yield* Effect.logDebug(
+          "Thread reconciliation detail has not reached the revision yet.",
+        ).pipe(
+          Effect.annotateLogs({
+            environmentId,
+            threadId,
+            reconciliationReason: "changed-revision",
+            revisionSequence,
+            snapshotSequence: result.snapshot.snapshotSequence,
+            snapshotAccepted: accepted,
+            responseBytes,
+          }),
+        );
+        return { kind: "pending" } as ThreadProjectionReconcileResult;
+      }
+      return {
+        kind: "recovered",
+        recoveredThroughSequence: result.snapshot.snapshotSequence,
+      } as ThreadProjectionReconcileResult;
     },
   );
 
-  yield* Effect.forkScoped(
-    Effect.forever(
-      Effect.sleep(ACTIVE_THREAD_RECONCILE_INTERVAL).pipe(
-        Effect.andThen(
-          SubscriptionRef.get(state).pipe(
-            Effect.flatMap((current) => {
-              if (Option.isNone(current.data)) {
-                return Effect.void;
-              }
-              return shouldReconcileThread(current.data.value).pipe(
-                Effect.flatMap((shouldReconcile) =>
-                  shouldReconcile ? reconcileFromProjection() : Effect.void,
-                ),
-              );
-            }),
-          ),
-        ),
-      ),
-    ),
+  const recordUnchangedRevision = Effect.fn("EnvironmentThreadState.recordUnchangedRevision")(
+    function* (input: { readonly latestSequence: number | null; readonly responseBytes: number }) {
+      const now = yield* Clock.currentTimeMillis;
+      const fastUntil = yield* Ref.get(reconcileFastUntil);
+      const unchangedCount = yield* Ref.updateAndGet(
+        reconciliationUnchangedCount,
+        (count) => count + 1,
+      );
+      const currentDelayMs = yield* Ref.get(reconciliationDelayMs);
+      const inFastWindow = fastUntil > now;
+      const nextDelayMs = inFastWindow
+        ? reconciliationPolicy.fastIntervalMs
+        : Math.min(
+            reconciliationPolicy.maxBackoffMs,
+            Math.max(reconciliationPolicy.fastIntervalMs, currentDelayMs) *
+              reconciliationPolicy.backoffMultiplier,
+          );
+      yield* Ref.set(reconciliationDelayMs, nextDelayMs);
+      if (!inFastWindow) {
+        yield* Ref.set(lastReconciliationReason, "unchanged-backoff");
+      }
+      const lastAppliedSequence = yield* SubscriptionRef.get(lastSequence);
+      yield* Effect.logDebug("Checked thread revision for reconciliation.").pipe(
+        Effect.annotateLogs({
+          environmentId,
+          threadId,
+          reconciliationReason: inFastWindow
+            ? yield* Ref.get(lastReconciliationReason)
+            : "unchanged-backoff",
+          latestSequence: input.latestSequence,
+          lastAppliedSequence,
+          responseBytes: input.responseBytes,
+          unchangedCount,
+          backoffMs: nextDelayMs,
+        }),
+      );
+    },
   );
 
-  yield* SubscriptionRef.changes(supervisor.state).pipe(
-    Stream.runForEach((connectionState) => {
-      switch (connectionProjectionPhase(connectionState)) {
-        case "synchronizing":
-          return setSynchronizing;
-        case "disconnected":
-          return setDisconnected;
-        case "ready":
-          return setReady;
+  const checkThreadRevision = Effect.fn("EnvironmentThreadState.checkThreadRevision")(function* () {
+    const prepared = yield* SubscriptionRef.get(supervisor.prepared);
+    if (Option.isNone(prepared)) {
+      return;
+    }
+    const result = yield* revisionLoader.load(prepared.value, threadId);
+    yield* Ref.set(revisionCheckUnresolved, result.kind === "unavailable");
+    const [verifiedRevision, currentPendingRevision] = yield* Effect.all([
+      Ref.get(lastVerifiedRevision),
+      Ref.get(pendingRevision),
+    ]);
+    if (result.kind === "unavailable" && currentPendingRevision <= verifiedRevision) {
+      yield* recordUnchangedRevision({ latestSequence: null, responseBytes: 0 });
+      return;
+    }
+
+    const latestSequence = result.kind === "found" ? result.revision.latestSequence : null;
+    const projectionSequence = result.kind === "found" ? result.revision.projectionSequence : null;
+    const nextPendingRevision =
+      latestSequence === null
+        ? currentPendingRevision
+        : Math.max(currentPendingRevision, latestSequence);
+    const markerAdvanced = nextPendingRevision > Math.max(verifiedRevision, currentPendingRevision);
+    if (markerAdvanced) {
+      yield* Ref.set(pendingRevision, nextPendingRevision);
+      yield* markThreadRecentlyActive("changed-revision", { wake: false });
+      yield* Effect.logDebug("Thread revision advanced; loading detail.").pipe(
+        Effect.annotateLogs({
+          environmentId,
+          threadId,
+          reconciliationReason: "changed-revision",
+          latestSequence,
+          lastAppliedSequence: yield* SubscriptionRef.get(lastSequence),
+          responseBytes: result.kind === "found" ? result.responseBytes : 0,
+          unchangedCount: 0,
+          backoffMs: reconciliationPolicy.fastIntervalMs,
+        }),
+      );
+    }
+
+    if (nextPendingRevision <= verifiedRevision) {
+      yield* recordUnchangedRevision({
+        latestSequence,
+        responseBytes: result.kind === "found" ? result.responseBytes : 0,
+      });
+      return;
+    }
+
+    const reconciliation = yield* reconcileFromProjection(nextPendingRevision, projectionSequence);
+    if (reconciliation.kind === "recovered") {
+      yield* acknowledgeSnapshotRevision(reconciliation.recoveredThroughSequence);
+      return;
+    }
+    yield* recordUnchangedRevision({
+      latestSequence,
+      responseBytes: result.kind === "found" ? result.responseBytes : 0,
+    });
+  });
+
+  yield* reconciliationActivity.events.pipe(
+    Stream.filter((event) => event.environmentId === environmentId && event.threadId === threadId),
+    Stream.runForEach((event) => markThreadRecentlyActive(event.reason)),
+    Effect.forkScoped,
+  );
+
+  const waitForReconciliationDeadline = Effect.fn(
+    "EnvironmentThreadState.waitForReconciliationDeadline",
+  )(function* (initialDelayMs: number) {
+    let deadline = (yield* Clock.currentTimeMillis) + initialDelayMs;
+    for (;;) {
+      const now = yield* Clock.currentTimeMillis;
+      const remainingMs = Math.max(0, deadline - now);
+      if (remainingMs === 0) {
+        return;
       }
-    }),
+      const wakeReason = yield* Effect.raceFirst(
+        Effect.sleep(Duration.millis(remainingMs)).pipe(Effect.as("timer" as const)),
+        Queue.take(reconciliationWake).pipe(Effect.as("activity" as const)),
+      );
+      if (wakeReason === "timer") {
+        return;
+      }
+      // Activity may shorten an existing backoff to the newly reset fast
+      // interval. It must never move an already scheduled check later, or a
+      // busy stream could starve reconciliation forever.
+      const activityDeadline =
+        (yield* Clock.currentTimeMillis) + (yield* Ref.get(reconciliationDelayMs));
+      deadline = Math.min(deadline, activityDeadline);
+    }
+  });
+
+  yield* Effect.gen(function* () {
+    for (;;) {
+      const current = yield* SubscriptionRef.get(state);
+      const now = yield* Clock.currentTimeMillis;
+      const fastUntil = yield* Ref.get(reconcileFastUntil);
+      const [verifiedRevision, currentPendingRevision] = yield* Effect.all([
+        Ref.get(lastVerifiedRevision),
+        Ref.get(pendingRevision),
+      ]);
+      const unresolvedRevisionCheck = yield* Ref.get(revisionCheckUnresolved);
+      const eligible =
+        unresolvedRevisionCheck ||
+        currentPendingRevision > verifiedRevision ||
+        (Option.isSome(current.data) &&
+          (threadNeedsProjectionReconcile(current.data.value) || fastUntil > now));
+      if (!eligible) {
+        yield* Queue.take(reconciliationWake);
+        continue;
+      }
+
+      const delayMs = yield* Ref.get(reconciliationDelayMs);
+      yield* waitForReconciliationDeadline(delayMs);
+      yield* checkThreadRevision();
+    }
+  }).pipe(Effect.forkScoped);
+
+  yield* SubscriptionRef.changes(supervisor.state).pipe(
+    Stream.runForEach((connectionState) =>
+      Effect.gen(function* () {
+        const previousGeneration = yield* Ref.get(connectionGeneration);
+        if (connectionState.generation !== previousGeneration) {
+          yield* Ref.set(connectionGeneration, connectionState.generation);
+          yield* markThreadRecentlyActive("connection-generation-change");
+          yield* Effect.logDebug("Thread connection generation changed.").pipe(
+            Effect.annotateLogs({
+              environmentId,
+              threadId,
+              connectionGeneration: connectionState.generation,
+              lastAppliedSequence: yield* SubscriptionRef.get(lastSequence),
+              reconciliationReason: "connection-generation-change",
+            }),
+          );
+        }
+        switch (connectionProjectionPhase(connectionState)) {
+          case "synchronizing":
+            yield* setSynchronizing;
+            return;
+          case "disconnected":
+            yield* setDisconnected;
+            return;
+          case "ready":
+            yield* setReady;
+            return;
+        }
+      }),
+    ),
     Effect.forkScoped,
   );
 
@@ -547,16 +860,31 @@ export const makeEnvironmentThreadState = Effect.fn("EnvironmentThreadState.make
 
       if (Option.isSome(base)) {
         yield* applyItem({ kind: "snapshot", snapshot: base.value });
+        yield* advanceLastSequence(base.value.snapshotSequence);
+      } else {
+        delete subscribeInput.afterSequence;
       }
 
-      const subscribeInput = Option.match(base, {
-        onNone: () => ({ threadId }),
-        onSome: (snapshot) => ({ threadId, afterSequence: snapshot.snapshotSequence }),
-      });
+      const logSubscriptionLifecycle = (phase: "start" | "stop") =>
+        Effect.all([SubscriptionRef.get(lastSequence), SubscriptionRef.get(supervisor.state)]).pipe(
+          Effect.flatMap(([lastAppliedSequence, connectionState]) =>
+            Effect.logDebug(`Thread subscription ${phase}.`).pipe(
+              Effect.annotateLogs({
+                environmentId,
+                threadId,
+                subscriptionPhase: phase,
+                connectionGeneration: connectionState.generation,
+                lastAppliedSequence,
+              }),
+            ),
+          ),
+        );
 
       yield* subscribe(ORCHESTRATION_WS_METHODS.subscribeThread, subscribeInput, {
         onExpectedFailure: setStreamError,
         retryExpectedFailureAfter: "250 millis",
+        onSessionStart: () => logSubscriptionLifecycle("start"),
+        onSessionStop: () => logSubscriptionLifecycle("stop"),
       }).pipe(Stream.runForEach(applyItem));
     }),
   );
@@ -584,7 +912,12 @@ export function threadStateChanges(environmentId: EnvironmentIdType, threadId: T
 
 export function createEnvironmentThreadStateAtoms<R, E>(
   runtime: Atom.AtomRuntime<
-    EnvironmentRegistry | EnvironmentCacheStore | ThreadSnapshotLoader | R,
+    | EnvironmentRegistry
+    | EnvironmentCacheStore
+    | ThreadSnapshotLoader
+    | ThreadRevisionLoader
+    | ThreadReconciliationActivity
+    | R,
     E
   >,
 ) {
@@ -609,6 +942,7 @@ export function createEnvironmentThreadStateAtoms<R, E>(
 export * from "./archivedThreads.ts";
 export * from "./checkpointDiff.ts";
 export * from "./threadSnapshotHttp.ts";
+export * from "./threadReconciliationActivity.ts";
 export * from "./composerPathSearch.ts";
 export * from "./threadCommands.ts";
 export * from "./threadDetail.ts";

@@ -21,6 +21,7 @@ import {
 } from "../auth/http.ts";
 import { OrchestrationEngineService } from "./Services/OrchestrationEngine.ts";
 import { ProjectionSnapshotQuery } from "./Services/ProjectionSnapshotQuery.ts";
+import { OrchestrationEventStore } from "../persistence/Services/OrchestrationEventStore.ts";
 import {
   OrchestrationCommandInvariantError,
   OrchestrationCommandPreviouslyRejectedError,
@@ -42,6 +43,7 @@ export const orchestrationHttpApiLayer = HttpApiBuilder.group(
   Effect.fnUntraced(function* (handlers) {
     const projectionSnapshotQuery = yield* ProjectionSnapshotQuery;
     const orchestrationEngine = yield* OrchestrationEngineService;
+    const orchestrationEventStore = yield* OrchestrationEventStore;
 
     return handlers
       .handle(
@@ -88,6 +90,25 @@ export const orchestrationHttpApiLayer = HttpApiBuilder.group(
             return yield* failEnvironmentNotFound("thread_not_found");
           }
           return snapshot.value;
+        }),
+      )
+      .handle(
+        "threadRevision",
+        Effect.fn("environment.orchestration.threadRevision")(function* (args) {
+          yield* annotateEnvironmentRequest(args.endpoint.name);
+          yield* requireEnvironmentScope(AuthOrchestrationReadScope);
+          const revision = yield* Effect.all({
+            latestSequence: orchestrationEventStore.getLatestThreadSequence(args.params.threadId),
+            projection: projectionSnapshotQuery.getSnapshotSequence(),
+          }).pipe(
+            Effect.catch((cause) =>
+              failEnvironmentInternal("orchestration_thread_revision_failed", cause),
+            ),
+          );
+          return {
+            latestSequence: revision.latestSequence,
+            projectionSequence: revision.projection.snapshotSequence,
+          };
         }),
       )
       .handle(

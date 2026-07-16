@@ -156,6 +156,8 @@ export function subscribe<TTag extends EnvironmentSubscriptionRpcTag>(
       cause: Cause.Cause<EnvironmentRpcStreamFailure<TTag>>,
     ) => Effect.Effect<void, never, never>;
     readonly retryExpectedFailureAfter?: Duration.Input;
+    readonly onSessionStart?: () => Effect.Effect<void, never, never>;
+    readonly onSessionStop?: () => Effect.Effect<void, never, never>;
   },
 ): Stream.Stream<
   EnvironmentRpcStreamValue<TTag>,
@@ -223,7 +225,15 @@ export function subscribe<TTag extends EnvironmentSubscriptionRpcTag>(
                       }),
                     ),
                   );
-                return subscribeToSession();
+                return Stream.unwrap(
+                  (options?.onSessionStart?.() ?? Effect.void).pipe(
+                    Effect.as(
+                      subscribeToSession().pipe(
+                        Stream.ensuring(options?.onSessionStop?.() ?? Effect.void),
+                      ),
+                    ),
+                  ),
+                );
               },
             }),
           ),

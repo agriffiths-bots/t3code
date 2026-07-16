@@ -88,6 +88,7 @@ import * as ProjectionSnapshotQuery from "./orchestration/Services/ProjectionSna
 import * as BootstrapTurnStartDispatcher from "./orchestration/Services/BootstrapTurnStartDispatcher.ts";
 import * as WorktreeLifecycleCoordinator from "./orchestration/Services/WorktreeLifecycleCoordinator.ts";
 import * as OrchestrationCommandReceipts from "./persistence/Services/OrchestrationCommandReceipts.ts";
+import * as OrchestrationEventStore from "./persistence/Services/OrchestrationEventStore.ts";
 import { SqlitePersistenceMemory } from "./persistence/Layers/Sqlite.ts";
 import { ScheduledTaskRepository } from "./persistence/Services/ScheduledTasks.ts";
 import { PersistenceSqlError } from "./persistence/Errors.ts";
@@ -761,6 +762,14 @@ const buildAppUnderTest = (options?: {
         ),
       ),
       Layer.provide(orchestrationEngineLayer),
+      Layer.provide(
+        Layer.mock(OrchestrationEventStore.OrchestrationEventStore)({
+          append: () => Effect.die("OrchestrationEventStore.append not stubbed in this test"),
+          readFromSequence: () => Stream.empty,
+          readAll: () => Stream.empty,
+          getLatestThreadSequence: () => Effect.succeed(0),
+        }),
+      ),
       Layer.provide(orchestrationCommandReceiptRepositoryLayer),
       Layer.provide(
         Layer.mock(ProjectionSnapshotQuery.ProjectionSnapshotQuery)({
@@ -1385,6 +1394,22 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
 
       assert.equal(response.status, 200);
       assert.deepEqual(body, testEnvironmentDescriptor);
+    }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+
+  it.effect("serves a lightweight authenticated thread revision marker", () =>
+    Effect.gen(function* () {
+      yield* buildAppUnderTest();
+      const cookie = yield* getAuthenticatedSessionCookieHeader();
+      const url = yield* getHttpServerUrl(`/api/orchestration/threads/${defaultThreadId}/revision`);
+      const response = yield* fetchEffect(url, { headers: { cookie } });
+      const body = yield* responseJsonEffect<{
+        readonly latestSequence: number;
+        readonly projectionSequence: number;
+      }>(response);
+
+      assert.equal(response.status, 200);
+      assert.deepEqual(body, { latestSequence: 0, projectionSequence: 0 });
     }).pipe(Effect.provide(NodeHttpServer.layerTest)),
   );
 

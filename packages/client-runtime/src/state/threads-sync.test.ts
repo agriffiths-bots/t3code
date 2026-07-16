@@ -14,6 +14,7 @@ import {
   type OrchestrationThreadStreamItem,
 } from "@t3tools/contracts";
 import { describe, expect, it } from "@effect/vitest";
+import * as Clock from "effect/Clock";
 import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
 import * as Queue from "effect/Queue";
@@ -34,9 +35,13 @@ import * as Persistence from "../platform/persistence.ts";
 import * as RpcSession from "../rpc/session.ts";
 import {
   EMPTY_ENVIRONMENT_THREAD_STATE,
+  DEFAULT_THREAD_RECONCILIATION_POLICY,
   makeEnvironmentThreadState,
+  ThreadReconciliationActivity,
+  ThreadRevisionLoader,
   ThreadSnapshotLoader,
   type EnvironmentThreadState,
+  type ThreadReconciliationPolicy,
   type ThreadSnapshotLoadResult,
 } from "./threads.ts";
 
@@ -142,6 +147,9 @@ const advanceActiveReconcileInterval = Effect.gen(function* () {
 const makeHarness = Effect.fn("TestEnvironmentThreads.makeHarness")(function* (options?: {
   readonly cached?: OrchestrationThread;
   readonly httpSnapshot?: Option.Option<OrchestrationThreadDetailSnapshot>;
+  readonly reconciliationPolicy?: ThreadReconciliationPolicy;
+  readonly revisionSequence?: number;
+  readonly projectionSequence?: number;
 }) {
   const inputs = yield* Queue.unbounded<TestThreadInput>();
   const observed = yield* Queue.unbounded<EnvironmentThreadState>();
@@ -149,6 +157,15 @@ const makeHarness = Effect.fn("TestEnvironmentThreads.makeHarness")(function* (o
   const retryCount = yield* Ref.make(0);
   const subscriptionCount = yield* Ref.make(0);
   const loaderCalls = yield* Ref.make(0);
+  const revisionCalls = yield* Ref.make(0);
+  const revisionCallTimes = yield* Ref.make<ReadonlyArray<number>>([]);
+  const revisionAvailable = yield* Ref.make(true);
+  const explicitRevisionSequence = yield* Ref.make<Option.Option<number>>(
+    Option.fromNullishOr(options?.revisionSequence),
+  );
+  const explicitProjectionSequence = yield* Ref.make<Option.Option<number>>(
+    Option.fromNullishOr(options?.projectionSequence),
+  );
   const httpSnapshot = yield* Ref.make(
     options?.httpSnapshot ?? Option.none<OrchestrationThreadDetailSnapshot>(),
   );
@@ -156,6 +173,7 @@ const makeHarness = Effect.fn("TestEnvironmentThreads.makeHarness")(function* (o
     Option.none(),
   );
   const lastSubscribeAfterSequence = yield* Ref.make<number | undefined>(undefined);
+  const subscribeAfterSequences = yield* Ref.make<ReadonlyArray<number | undefined>>([]);
   const savedThreads = yield* Ref.make<ReadonlyArray<OrchestrationThreadDetailSnapshot>>([]);
   const removedThreads = yield* Ref.make<ReadonlyArray<ThreadId>>([]);
   const supervisorState = yield* SubscriptionRef.make<SupervisorConnectionState>(
@@ -172,6 +190,9 @@ const makeHarness = Effect.fn("TestEnvironmentThreads.makeHarness")(function* (o
       Stream.unwrap(
         Ref.updateAndGet(subscriptionCount, (count) => count + 1).pipe(
           Effect.andThen(Ref.set(lastSubscribeAfterSequence, input.afterSequence)),
+          Effect.andThen(
+            Ref.update(subscribeAfterSequences, (current) => [...current, input.afterSequence]),
+          ),
           Effect.as(streamFrom(inputs)),
         ),
       ),
@@ -211,6 +232,45 @@ const makeHarness = Effect.fn("TestEnvironmentThreads.makeHarness")(function* (o
         ),
       ),
   });
+  const revisionLoader = ThreadRevisionLoader.of({
+    load: (_prepared, threadId) =>
+      Effect.gen(function* () {
+        yield* Ref.update(revisionCalls, (count) => count + 1);
+        const now = yield* Clock.currentTimeMillis;
+        yield* Ref.update(revisionCallTimes, (current) => [...current, now]);
+        if (threadId !== THREAD_ID || !(yield* Ref.get(revisionAvailable))) {
+          return { kind: "unavailable" } as const;
+        }
+        const explicit = yield* Ref.get(explicitRevisionSequence);
+        const latestSequence = Option.isSome(explicit)
+          ? explicit.value
+          : Option.match(yield* Ref.get(httpSnapshot), {
+              onNone: () => (options?.cached === undefined ? 0 : CACHED_SNAPSHOT_SEQUENCE),
+              onSome: (current) => current.snapshotSequence,
+            });
+        const projectionSequence = Option.getOrElse(
+          yield* Ref.get(explicitProjectionSequence),
+          () => latestSequence,
+        );
+        const revision = { latestSequence, projectionSequence };
+        return {
+          kind: "found",
+          revision,
+          responseBytes: new TextEncoder().encode(
+            `{"latestSequence":${latestSequence},"projectionSequence":${projectionSequence}}`,
+          ).byteLength,
+        } as const;
+      }),
+  });
+  const localActivity = yield* Queue.unbounded<{
+    readonly environmentId: EnvironmentId;
+    readonly threadId: ThreadId;
+    readonly reason: "locally-initiated-turn";
+  }>();
+  const reconciliationActivity = ThreadReconciliationActivity.of({
+    publish: (event) => Queue.offer(localActivity, event).pipe(Effect.asVoid),
+    events: Stream.fromQueue(localActivity),
+  });
   const supervisor = EnvironmentSupervisor.EnvironmentSupervisor.of({
     target: TARGET,
     state: supervisorState,
@@ -242,10 +302,14 @@ const makeHarness = Effect.fn("TestEnvironmentThreads.makeHarness")(function* (o
     saveVcsRefs: () => Effect.void,
     clear: () => Effect.void,
   });
-  const threadState = yield* makeEnvironmentThreadState(THREAD_ID).pipe(
+  const threadState = yield* makeEnvironmentThreadState(THREAD_ID, {
+    reconciliationPolicy: options?.reconciliationPolicy ?? DEFAULT_THREAD_RECONCILIATION_POLICY,
+  }).pipe(
     Effect.provideService(EnvironmentSupervisor.EnvironmentSupervisor, supervisor),
     Effect.provideService(Persistence.EnvironmentCacheStore, cache),
     Effect.provideService(ThreadSnapshotLoader, snapshotLoader),
+    Effect.provideService(ThreadRevisionLoader, revisionLoader),
+    Effect.provideService(ThreadReconciliationActivity, reconciliationActivity),
   );
   yield* SubscriptionRef.changes(threadState).pipe(
     Stream.runForEach((state) =>
@@ -261,14 +325,25 @@ const makeHarness = Effect.fn("TestEnvironmentThreads.makeHarness")(function* (o
     retryCount,
     subscriptionCount,
     loaderCalls,
+    revisionCalls,
+    revisionCallTimes,
+    revisionAvailable,
+    explicitRevisionSequence,
+    explicitProjectionSequence,
     httpSnapshot,
     httpReconcileResult,
     lastSubscribeAfterSequence,
+    subscribeAfterSequences,
     supervisorState,
     supervisorSession,
     savedThreads,
     removedThreads,
     replaceSession: SubscriptionRef.set(supervisorSession, Option.some(testSession(client))),
+    markLocalTurn: reconciliationActivity.publish({
+      environmentId: TARGET.environmentId,
+      threadId: THREAD_ID,
+      reason: "locally-initiated-turn",
+    }),
   };
 });
 
@@ -455,6 +530,185 @@ describe("EnvironmentThreads", () => {
     }),
   );
 
+  it.effect(
+    "bounds full loads for a permanently-running unchanged 3.8 MB thread and backs revision checks off",
+    () =>
+      Effect.gen(function* () {
+        const largeMessage: OrchestrationMessage = {
+          id: MessageId.make("message-3-8mb-running-fixture"),
+          role: "assistant",
+          text: "x".repeat(3_800_000),
+          attachments: [],
+          turnId: RUNNING_TURN_ID,
+          streaming: false,
+          createdAt: "2026-07-07T21:00:03.000Z",
+          updatedAt: "2026-07-07T21:00:03.000Z",
+        };
+        const harness = yield* makeHarness({
+          cached: makeRunningThread([largeMessage]),
+          revisionSequence: CACHED_SNAPSHOT_SEQUENCE,
+        });
+        yield* awaitThreadState(
+          harness.observed,
+          (value) =>
+            value.status === "live" &&
+            Option.isSome(value.data) &&
+            value.data.value.messages.at(0)?.text.length === 3_800_000,
+        );
+
+        for (let index = 0; index < 15; index += 1) {
+          yield* TestClock.adjust("2 seconds");
+          yield* Effect.yieldNow;
+        }
+        for (const delay of [4, 8, 16, 32, 60]) {
+          yield* TestClock.adjust(`${delay} seconds`);
+          yield* Effect.yieldNow;
+        }
+
+        const callTimes = yield* Ref.get(harness.revisionCallTimes);
+        const intervals = callTimes.slice(1).map((time, index) => time - callTimes[index]!);
+        expect(yield* Ref.get(harness.loaderCalls)).toBe(0);
+        expect(yield* Ref.get(harness.revisionCalls)).toBe(20);
+        expect(intervals.slice(0, 14)).toEqual(Array.from({ length: 14 }, () => 2_000));
+        expect(intervals.slice(-5)).toEqual([4_000, 8_000, 16_000, 32_000, 60_000]);
+      }),
+  );
+
+  it.effect("resets the fast window for a genuine live event but not stale running state", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness({
+        cached: makeRunningThread(),
+        revisionSequence: CACHED_SNAPSHOT_SEQUENCE,
+        reconciliationPolicy: {
+          fastIntervalMs: 2_000,
+          fastWindowMs: 4_000,
+          backoffMultiplier: 2,
+          maxBackoffMs: 8_000,
+        },
+      });
+      yield* awaitThreadState(harness.observed, (value) => value.status === "live");
+
+      yield* TestClock.adjust("2 seconds");
+      yield* TestClock.adjust("2 seconds");
+      yield* TestClock.adjust("4 seconds");
+      yield* Effect.yieldNow;
+      const beforeLiveEvent = yield* Ref.get(harness.revisionCallTimes);
+      expect(beforeLiveEvent).toEqual([2_000, 4_000, 8_000]);
+
+      yield* Queue.offer(
+        harness.inputs,
+        activityAppended(
+          "A genuine live event reset reconciliation.",
+          CACHED_SNAPSHOT_SEQUENCE + 1,
+        ),
+      );
+      const liveEventState = yield* awaitThreadState(
+        harness.observed,
+        (value) =>
+          Option.isSome(value.data) &&
+          value.data.value.activities.some(
+            (activity) => activity.summary === "A genuine live event reset reconciliation.",
+          ),
+      );
+      yield* Ref.set(
+        harness.httpSnapshot,
+        Option.some({
+          snapshotSequence: CACHED_SNAPSHOT_SEQUENCE + 1,
+          thread: Option.getOrThrow(liveEventState.data),
+        }),
+      );
+      yield* TestClock.adjust("2 seconds");
+      yield* TestClock.adjust("2 seconds");
+      yield* Effect.yieldNow;
+
+      const afterLiveEvent = yield* Ref.get(harness.revisionCallTimes);
+      expect(afterLiveEvent.slice(-2)).toEqual([10_000, 12_000]);
+      expect(yield* Ref.get(harness.loaderCalls)).toBe(1);
+    }),
+  );
+
+  it.effect("wakes backed-off reconciliation after a locally initiated turn", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness({
+        cached: makeRunningThread(),
+        revisionSequence: CACHED_SNAPSHOT_SEQUENCE,
+        reconciliationPolicy: {
+          fastIntervalMs: 2_000,
+          fastWindowMs: 4_000,
+          backoffMultiplier: 2,
+          maxBackoffMs: 8_000,
+        },
+      });
+      yield* awaitThreadState(harness.observed, (value) => value.status === "live");
+      yield* TestClock.adjust("2 seconds");
+      yield* TestClock.adjust("2 seconds");
+      yield* TestClock.adjust("4 seconds");
+      yield* Effect.yieldNow;
+
+      yield* harness.markLocalTurn;
+      yield* Effect.yieldNow;
+      yield* TestClock.adjust("2 seconds");
+      yield* Effect.yieldNow;
+
+      expect((yield* Ref.get(harness.revisionCallTimes)).at(-1)).toBe(10_000);
+    }),
+  );
+
+  it.effect("does not let continuous live activity starve the revision deadline", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness({
+        cached: makeRunningThread(),
+        revisionSequence: CACHED_SNAPSHOT_SEQUENCE + 5,
+        projectionSequence: CACHED_SNAPSHOT_SEQUENCE,
+      });
+      yield* awaitThreadState(harness.observed, (value) => value.status === "live");
+
+      for (let index = 1; index <= 5; index += 1) {
+        yield* TestClock.adjust("1 second");
+        yield* Queue.offer(
+          harness.inputs,
+          activityAppended(`Continuous activity ${index}`, CACHED_SNAPSHOT_SEQUENCE + index),
+        );
+        yield* Effect.yieldNow;
+      }
+
+      expect(yield* Ref.get(harness.revisionCallTimes)).toEqual([2_000, 4_000]);
+    }),
+  );
+
+  it.effect("keeps local-turn reconciliation backed off until an unavailable marker recovers", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness({
+        cached: BASE_THREAD,
+        reconciliationPolicy: {
+          fastIntervalMs: 2_000,
+          fastWindowMs: 4_000,
+          backoffMultiplier: 2,
+          maxBackoffMs: 8_000,
+        },
+      });
+      yield* awaitThreadState(harness.observed, (value) => value.status === "live");
+      yield* Ref.set(harness.revisionAvailable, false);
+      yield* harness.markLocalTurn;
+      yield* Effect.yieldNow;
+
+      for (const delay of [2, 2, 4]) {
+        yield* TestClock.adjust(`${delay} seconds`);
+        yield* Effect.yieldNow;
+      }
+      expect(yield* Ref.get(harness.revisionCallTimes)).toEqual([2_000, 4_000, 8_000]);
+
+      yield* Ref.set(harness.revisionAvailable, true);
+      yield* TestClock.adjust("8 seconds");
+      yield* Effect.yieldNow;
+      expect(yield* Ref.get(harness.revisionCallTimes)).toEqual([2_000, 4_000, 8_000, 16_000]);
+
+      yield* TestClock.adjust("60 seconds");
+      yield* Effect.yieldNow;
+      expect(yield* Ref.get(harness.revisionCallTimes)).toEqual([2_000, 4_000, 8_000, 16_000]);
+    }),
+  );
+
   it.effect("reduces live events and persists the latest thread", () =>
     Effect.gen(function* () {
       const harness = yield* makeHarness({ cached: BASE_THREAD });
@@ -527,6 +781,39 @@ describe("EnvironmentThreads", () => {
     }),
   );
 
+  it.effect(
+    "ignores duplicate replay without rebuilding or persisting an unchanged full thread",
+    () =>
+      Effect.gen(function* () {
+        const harness = yield* makeHarness({
+          cached: BASE_THREAD,
+          revisionSequence: CACHED_SNAPSHOT_SEQUENCE,
+        });
+        yield* awaitThreadState(harness.observed, (value) => value.status === "live");
+        yield* TestClock.adjust("500 millis");
+        yield* Effect.yieldNow;
+
+        const before = yield* Ref.get(harness.latest);
+        const beforeThread = Option.getOrThrow(before.data);
+        const savesBeforeReplay = (yield* Ref.get(harness.savedThreads)).length;
+        expect(savesBeforeReplay).toBe(0);
+
+        yield* Queue.offer(harness.inputs, snapshot(BASE_THREAD, CACHED_SNAPSHOT_SEQUENCE));
+        yield* Queue.offer(
+          harness.inputs,
+          titleUpdated("Duplicate replay must be ignored", CACHED_SNAPSHOT_SEQUENCE),
+        );
+        yield* Effect.yieldNow;
+        yield* TestClock.adjust("500 millis");
+        yield* Effect.yieldNow;
+
+        const after = yield* Ref.get(harness.latest);
+        expect(Option.getOrThrow(after.data)).toBe(beforeThread);
+        expect((yield* Ref.get(harness.savedThreads)).length).toBe(savesBeforeReplay);
+        expect(yield* Ref.get(harness.loaderCalls)).toBe(0);
+      }),
+  );
+
   it.effect("removes cached data when the thread is deleted", () =>
     Effect.gen(function* () {
       const harness = yield* makeHarness({ cached: BASE_THREAD });
@@ -575,7 +862,7 @@ describe("EnvironmentThreads", () => {
     }),
   );
 
-  it.effect("preserves data after a domain failure and resumes on a replacement session", () =>
+  it.effect("creates a fresh reconnect subscription from the latest applied cursor", () =>
     Effect.gen(function* () {
       const harness = yield* makeHarness({ cached: BASE_THREAD });
       yield* Queue.offer(harness.inputs, snapshot(BASE_THREAD, CACHED_SNAPSHOT_SEQUENCE + 1));
@@ -616,6 +903,10 @@ describe("EnvironmentThreads", () => {
 
       expect(Option.isNone(recovered.error)).toBe(true);
       expect(yield* Ref.get(harness.subscriptionCount)).toBe(2);
+      expect(yield* Ref.get(harness.subscribeAfterSequences)).toEqual([
+        CACHED_SNAPSHOT_SEQUENCE,
+        CACHED_SNAPSHOT_SEQUENCE + 1,
+      ]);
     }),
   );
 
@@ -676,7 +967,7 @@ describe("EnvironmentThreads", () => {
     }),
   );
 
-  it.effect("reconciles a running turn from projection when a live message frame is missed", () =>
+  it.effect("heals one persisted event omitted from the live path with exactly one full load", () =>
     Effect.gen(function* () {
       const runningThread = makeRunningThread();
       const harness = yield* makeHarness({ cached: runningThread });
@@ -706,6 +997,7 @@ describe("EnvironmentThreads", () => {
           thread: makeRunningThread([missedAssistantMessage]),
         }),
       );
+      yield* Ref.set(harness.explicitRevisionSequence, Option.some(CACHED_SNAPSHOT_SEQUENCE + 1));
 
       yield* advanceActiveReconcileInterval;
       const recovered = yield* awaitThreadState(
@@ -718,7 +1010,155 @@ describe("EnvironmentThreads", () => {
 
       expect(Option.getOrThrow(recovered.data).messages).toEqual([missedAssistantMessage]);
       expect(yield* Ref.get(harness.subscriptionCount)).toBe(1);
-      expect(yield* Ref.get(harness.loaderCalls)).toBeGreaterThanOrEqual(1);
+      expect(yield* Ref.get(harness.loaderCalls)).toBe(1);
+
+      for (let index = 0; index < 5; index += 1) {
+        yield* advanceActiveReconcileInterval;
+      }
+      expect(yield* Ref.get(harness.loaderCalls)).toBe(1);
+    }),
+  );
+
+  it.effect("heals an omitted event even when a later live event advances the applied cursor", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness({ cached: makeRunningThread() });
+      yield* awaitThreadState(harness.observed, (value) => value.status === "live");
+
+      yield* Queue.offer(
+        harness.inputs,
+        activityAppended(
+          "A later event arrived after the missed message.",
+          CACHED_SNAPSHOT_SEQUENCE + 2,
+        ),
+      );
+      const afterLaterEvent = yield* awaitThreadState(
+        harness.observed,
+        (value) =>
+          Option.isSome(value.data) &&
+          value.data.value.activities.some(
+            (activity) => activity.summary === "A later event arrived after the missed message.",
+          ),
+      );
+      const missedAssistantMessage: OrchestrationMessage = {
+        id: MessageId.make("message-missed-before-later-live-event"),
+        role: "assistant",
+        text: "This earlier persisted message was omitted from the live path.",
+        attachments: [],
+        turnId: RUNNING_TURN_ID,
+        streaming: false,
+        createdAt: "2026-07-07T21:00:02.000Z",
+        updatedAt: "2026-07-07T21:00:02.000Z",
+      };
+      yield* Ref.set(
+        harness.httpSnapshot,
+        Option.some({
+          snapshotSequence: CACHED_SNAPSHOT_SEQUENCE + 2,
+          thread: {
+            ...Option.getOrThrow(afterLaterEvent.data),
+            messages: [missedAssistantMessage],
+          },
+        }),
+      );
+      yield* Ref.set(harness.explicitRevisionSequence, Option.some(CACHED_SNAPSHOT_SEQUENCE + 2));
+
+      yield* advanceActiveReconcileInterval;
+      const recovered = yield* awaitThreadState(
+        harness.observed,
+        (value) =>
+          Option.isSome(value.data) &&
+          value.data.value.messages.some((message) => message.id === missedAssistantMessage.id),
+      );
+
+      expect(Option.getOrThrow(recovered.data).messages).toContainEqual(missedAssistantMessage);
+      expect(yield* Ref.get(harness.loaderCalls)).toBe(1);
+    }),
+  );
+
+  it.effect("keeps an advanced revision pending across a transient detail failure", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness({
+        cached: makeRunningThread(),
+        revisionSequence: CACHED_SNAPSHOT_SEQUENCE + 1,
+      });
+      yield* awaitThreadState(harness.observed, (value) => value.status === "live");
+
+      yield* advanceActiveReconcileInterval;
+      expect(yield* Ref.get(harness.loaderCalls)).toBe(1);
+
+      const recoveredMessage: OrchestrationMessage = {
+        id: MessageId.make("message-after-transient-detail-failure"),
+        role: "assistant",
+        text: "Recovered after the first detail request was unavailable.",
+        attachments: [],
+        turnId: RUNNING_TURN_ID,
+        streaming: false,
+        createdAt: "2026-07-07T21:00:03.000Z",
+        updatedAt: "2026-07-07T21:00:03.000Z",
+      };
+      yield* Ref.set(
+        harness.httpSnapshot,
+        Option.some({
+          snapshotSequence: CACHED_SNAPSHOT_SEQUENCE + 1,
+          thread: makeRunningThread([recoveredMessage]),
+        }),
+      );
+      yield* advanceActiveReconcileInterval;
+      const recovered = yield* awaitThreadState(
+        harness.observed,
+        (value) =>
+          Option.isSome(value.data) &&
+          value.data.value.messages.some((message) => message.id === recoveredMessage.id),
+      );
+      yield* advanceActiveReconcileInterval;
+
+      expect(Option.getOrThrow(recovered.data).messages).toEqual([recoveredMessage]);
+      expect(yield* Ref.get(harness.loaderCalls)).toBe(2);
+    }),
+  );
+
+  it.effect("retries a pending revision until the detail projection catches up", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness({
+        cached: makeRunningThread(),
+        revisionSequence: CACHED_SNAPSHOT_SEQUENCE + 2,
+        httpSnapshot: Option.some({
+          snapshotSequence: CACHED_SNAPSHOT_SEQUENCE + 1,
+          thread: makeRunningThread(),
+        }),
+      });
+      yield* awaitThreadState(harness.observed, (value) => value.status === "live");
+
+      yield* advanceActiveReconcileInterval;
+      expect(yield* Ref.get(harness.loaderCalls)).toBe(1);
+
+      const recoveredMessage: OrchestrationMessage = {
+        id: MessageId.make("message-after-projection-catch-up"),
+        role: "assistant",
+        text: "Recovered after the projection reached the persisted marker.",
+        attachments: [],
+        turnId: RUNNING_TURN_ID,
+        streaming: false,
+        createdAt: "2026-07-07T21:00:03.000Z",
+        updatedAt: "2026-07-07T21:00:03.000Z",
+      };
+      yield* Ref.set(
+        harness.httpSnapshot,
+        Option.some({
+          snapshotSequence: CACHED_SNAPSHOT_SEQUENCE + 2,
+          thread: makeRunningThread([recoveredMessage]),
+        }),
+      );
+      yield* advanceActiveReconcileInterval;
+      const recovered = yield* awaitThreadState(
+        harness.observed,
+        (value) =>
+          Option.isSome(value.data) &&
+          value.data.value.messages.some((message) => message.id === recoveredMessage.id),
+      );
+      yield* advanceActiveReconcileInterval;
+
+      expect(Option.getOrThrow(recovered.data).messages).toEqual([recoveredMessage]);
+      expect(yield* Ref.get(harness.loaderCalls)).toBe(2);
     }),
   );
 
@@ -751,6 +1191,7 @@ describe("EnvironmentThreads", () => {
           thread: { ...makeRunningThread([missedAssistantMessage]), title: "Live title" },
         }),
       );
+      yield* Ref.set(harness.explicitRevisionSequence, Option.some(CACHED_SNAPSHOT_SEQUENCE + 100));
 
       yield* advanceActiveReconcileInterval;
       const recovered = yield* awaitThreadState(
@@ -798,6 +1239,7 @@ describe("EnvironmentThreads", () => {
           },
         }),
       );
+      yield* Ref.set(harness.explicitRevisionSequence, Option.some(CACHED_SNAPSHOT_SEQUENCE + 100));
 
       yield* advanceActiveReconcileInterval;
       const recovered = yield* awaitThreadState(
@@ -861,6 +1303,7 @@ describe("EnvironmentThreads", () => {
           },
         }),
       );
+      yield* Ref.set(harness.explicitRevisionSequence, Option.some(CACHED_SNAPSHOT_SEQUENCE + 100));
 
       yield* advanceActiveReconcileInterval;
       const recovered = yield* awaitThreadState(
@@ -928,6 +1371,10 @@ describe("EnvironmentThreads", () => {
               messages: [missedAssistantMessage],
             },
           }),
+        );
+        yield* Ref.set(
+          harness.explicitRevisionSequence,
+          Option.some(CACHED_SNAPSHOT_SEQUENCE + 100),
         );
 
         yield* advanceActiveReconcileInterval;
@@ -1036,6 +1483,7 @@ describe("EnvironmentThreads", () => {
           },
         }),
       );
+      yield* Ref.set(harness.explicitRevisionSequence, Option.some(CACHED_SNAPSHOT_SEQUENCE + 100));
 
       yield* advanceActiveReconcileInterval;
       yield* Effect.yieldNow;
@@ -1152,6 +1600,10 @@ describe("EnvironmentThreads", () => {
             },
           }),
         );
+        yield* Ref.set(
+          harness.explicitRevisionSequence,
+          Option.some(CACHED_SNAPSHOT_SEQUENCE + 100),
+        );
 
         // Drive several reconcile intervals so at least one load observes the
         // pre-revert snapshot, and watch whether the pruned message ever
@@ -1221,6 +1673,7 @@ describe("EnvironmentThreads", () => {
           },
         }),
       );
+      yield* Ref.set(harness.explicitRevisionSequence, Option.some(CACHED_SNAPSHOT_SEQUENCE + 100));
 
       yield* advanceActiveReconcileInterval;
       const recovered = yield* awaitThreadState(
@@ -1282,6 +1735,7 @@ describe("EnvironmentThreads", () => {
           },
         }),
       );
+      yield* Ref.set(harness.explicitRevisionSequence, Option.some(CACHED_SNAPSHOT_SEQUENCE + 100));
 
       yield* advanceActiveReconcileInterval;
       for (let ticks = 0; ticks < 50; ticks += 1) {
@@ -1359,6 +1813,7 @@ describe("EnvironmentThreads", () => {
           },
         }),
       );
+      yield* Ref.set(harness.explicitRevisionSequence, Option.some(CACHED_SNAPSHOT_SEQUENCE + 100));
 
       yield* advanceActiveReconcileInterval;
       const recovered = yield* awaitThreadState(
@@ -1458,6 +1913,7 @@ describe("EnvironmentThreads", () => {
           },
         }),
       );
+      yield* Ref.set(harness.explicitRevisionSequence, Option.some(CACHED_SNAPSHOT_SEQUENCE + 100));
 
       yield* advanceActiveReconcileInterval;
       const recovered = yield* awaitThreadState(
@@ -1524,6 +1980,7 @@ describe("EnvironmentThreads", () => {
           },
         }),
       );
+      yield* Ref.set(harness.explicitRevisionSequence, Option.some(CACHED_SNAPSHOT_SEQUENCE + 100));
 
       yield* advanceActiveReconcileInterval;
       const recovered = yield* awaitThreadState(
@@ -1592,6 +2049,7 @@ describe("EnvironmentThreads", () => {
           },
         }),
       );
+      yield* Ref.set(harness.explicitRevisionSequence, Option.some(CACHED_SNAPSHOT_SEQUENCE + 100));
 
       yield* advanceActiveReconcileInterval;
       const recovered = yield* awaitThreadState(
@@ -1645,6 +2103,37 @@ describe("EnvironmentThreads", () => {
     }),
   );
 
+  it.effect("keeps a missing detail pending until the projection reaches the revision", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness({
+        cached: makeRunningThread(),
+        revisionSequence: CACHED_SNAPSHOT_SEQUENCE + 1,
+        projectionSequence: CACHED_SNAPSHOT_SEQUENCE,
+      });
+      yield* awaitThreadState(harness.observed, (value) => value.status === "live");
+      yield* Ref.set(harness.httpReconcileResult, Option.some({ kind: "missing" }));
+
+      yield* advanceActiveReconcileInterval;
+
+      const beforeCatchUp = yield* Ref.get(harness.latest);
+      expect(beforeCatchUp.status).toBe("live");
+      expect(Option.isSome(beforeCatchUp.data)).toBe(true);
+      expect(yield* Ref.get(harness.removedThreads)).toEqual([]);
+      expect(yield* Ref.get(harness.loaderCalls)).toBe(1);
+
+      yield* Ref.set(harness.explicitProjectionSequence, Option.some(CACHED_SNAPSHOT_SEQUENCE + 1));
+      yield* advanceActiveReconcileInterval;
+      const deletedState = yield* awaitThreadState(
+        harness.observed,
+        (value) => value.status === "deleted",
+      );
+
+      expect(Option.isNone(deletedState.data)).toBe(true);
+      expect(yield* Ref.get(harness.removedThreads)).toEqual([THREAD_ID]);
+      expect(yield* Ref.get(harness.loaderCalls)).toBe(2);
+    }),
+  );
+
   it.effect("treats a missing active-turn reconcile snapshot as a deleted thread", () =>
     Effect.gen(function* () {
       const harness = yield* makeHarness({ cached: makeRunningThread() });
@@ -1656,6 +2145,7 @@ describe("EnvironmentThreads", () => {
           value.data.value.latestTurn?.state === "running",
       );
       yield* Ref.set(harness.httpReconcileResult, Option.some({ kind: "missing" }));
+      yield* Ref.set(harness.explicitRevisionSequence, Option.some(CACHED_SNAPSHOT_SEQUENCE + 100));
 
       yield* advanceActiveReconcileInterval;
       const deletedState = yield* awaitThreadState(

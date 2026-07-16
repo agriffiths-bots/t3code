@@ -64,6 +64,12 @@ const ReadFromSequenceRequestSchema = Schema.Struct({
   sequenceExclusive: NonNegativeInt,
   limit: Schema.Number,
 });
+const LatestThreadSequenceRequestSchema = Schema.Struct({
+  threadId: ThreadId,
+});
+const LatestThreadSequenceRowSchema = Schema.Struct({
+  latestSequence: Schema.NullOr(NonNegativeInt),
+});
 const DEFAULT_READ_FROM_SEQUENCE_LIMIT = 1_000;
 const READ_PAGE_SIZE = 500;
 
@@ -181,6 +187,18 @@ const makeEventStore = Effect.gen(function* () {
       `,
   });
 
+  const readLatestThreadSequence = SqlSchema.findOne({
+    Request: LatestThreadSequenceRequestSchema,
+    Result: LatestThreadSequenceRowSchema,
+    execute: ({ threadId }) =>
+      sql`
+        SELECT MAX(sequence) AS "latestSequence"
+        FROM orchestration_events
+        WHERE aggregate_kind = 'thread'
+          AND stream_id = ${threadId}
+      `,
+  });
+
   const append: OrchestrationEventStoreShape["append"] = (event) =>
     appendEventRow({
       eventId: event.eventId,
@@ -264,6 +282,16 @@ const makeEventStore = Effect.gen(function* () {
     append,
     readFromSequence,
     readAll: () => readFromSequence(0, Number.MAX_SAFE_INTEGER),
+    getLatestThreadSequence: (threadId) =>
+      readLatestThreadSequence({ threadId }).pipe(
+        Effect.mapError(
+          toPersistenceSqlOrDecodeError(
+            "OrchestrationEventStore.getLatestThreadSequence:query",
+            "OrchestrationEventStore.getLatestThreadSequence:decodeRow",
+          ),
+        ),
+        Effect.map((row) => row.latestSequence ?? 0),
+      ),
   } satisfies OrchestrationEventStoreShape;
 });
 
