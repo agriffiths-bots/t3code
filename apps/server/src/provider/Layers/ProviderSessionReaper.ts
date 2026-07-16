@@ -129,6 +129,7 @@ const makeProviderSessionReaper = (options?: ProviderSessionReaperLiveOptions) =
       readonly turnId: TurnId;
       readonly reason: string;
       readonly sessionOwnershipId?: string;
+      readonly allowLegacyActiveTurnMatch?: boolean;
       readonly onOwned: Effect.Effect<void, E, R>;
       readonly onStopped: Effect.Effect<void, E, R>;
     }) =>
@@ -139,7 +140,9 @@ const makeProviderSessionReaper = (options?: ProviderSessionReaperLiveOptions) =
           reason: input.reason,
           ...(input.sessionOwnershipId !== undefined
             ? { sessionOwnershipId: input.sessionOwnershipId }
-            : { requireSessionAbsent: true }),
+            : input.allowLegacyActiveTurnMatch === true
+              ? { allowLegacyActiveTurnMatch: true }
+              : { requireSessionAbsent: true }),
           onOwned: input.onOwned,
           onStopped: input.onStopped,
         })
@@ -210,6 +213,7 @@ const makeProviderSessionReaper = (options?: ProviderSessionReaperLiveOptions) =
       readonly reason: string;
       readonly failedAt: string;
       readonly expiredApprovalRequestIds?: ReadonlyArray<string>;
+      readonly allowLegacyActiveTurnMatch?: boolean;
     }) {
       const key = activeTurnKey(input.thread.id, input.turnId);
       const providerInstanceId =
@@ -229,6 +233,7 @@ const makeProviderSessionReaper = (options?: ProviderSessionReaperLiveOptions) =
         turnId: input.turnId,
         reason: input.reason,
         ...(sessionOwnershipId !== undefined ? { sessionOwnershipId } : {}),
+        ...(input.allowLegacyActiveTurnMatch === true ? { allowLegacyActiveTurnMatch: true } : {}),
         onOwned: Effect.gen(function* () {
           yield* orchestrationEngine.dispatch({
             type: "thread.session.set",
@@ -428,6 +433,7 @@ const makeProviderSessionReaper = (options?: ProviderSessionReaperLiveOptions) =
                 reason: `Provider permission request '${oldest.requestId}' was unanswered for ${permissionRequestTimeoutMs}ms.`,
                 failedAt,
                 expiredApprovalRequestIds,
+                allowLegacyActiveTurnMatch: true,
               });
             }
             continue;

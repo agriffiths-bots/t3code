@@ -933,11 +933,17 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
       }
       const previousPayload = readRecord(binding?.runtimePayload) ?? {};
       const bindingActiveTurnId = readPersistedActiveTurnId(previousPayload);
+      const lastTerminalTurnId =
+        typeof previousPayload.lastTerminalTurnId === "string"
+          ? previousPayload.lastTerminalTurnId
+          : undefined;
       if (
         terminalSessionState &&
-        bindingActiveTurnId !== undefined &&
         event.turnId !== undefined &&
-        event.turnId !== bindingActiveTurnId
+        ((bindingActiveTurnId !== undefined && event.turnId !== bindingActiveTurnId) ||
+          (bindingActiveTurnId === undefined &&
+            lastTerminalTurnId !== undefined &&
+            event.turnId !== lastTerminalTurnId))
       ) {
         return false;
       }
@@ -973,6 +979,9 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
             ? {
                 sendTurnOperationId: null,
                 activeTurnSendTurnOperationId: null,
+                ...(bindingActiveTurnId !== undefined || event.turnId !== undefined
+                  ? { lastTerminalTurnId: bindingActiveTurnId ?? event.turnId }
+                  : {}),
               }
             : {}),
           ...(event.payload.state === "error" && event.payload.reason !== undefined
@@ -2572,7 +2581,12 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
           input.sessionOwnershipId !== undefined &&
           sessionOwnershipId === input.sessionOwnershipId &&
           turnStillBelongsToFailure;
-        const sessionIsProvablyAbsent =
+        const legacyActiveTurnStillOwnsFailure =
+          input.allowLegacyActiveTurnMatch === true &&
+          input.sessionOwnershipId === undefined &&
+          typeof sessionOwnershipId !== "string" &&
+          activeTurnId === input.turnId;
+        const sessionAbsence =
           input.requireSessionAbsent === true && binding.providerInstanceId !== undefined
             ? yield* registry.getByInstance(binding.providerInstanceId).pipe(
                 Effect.flatMap((adapter) =>
@@ -2580,14 +2594,30 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
                     adapter,
                     provider: binding.provider,
                     threadId: input.threadId,
+                  }).pipe(
+                    Effect.map((sessionIsProvablyAbsent) => ({
+                      providerInstanceIsAbsent: false,
+                      sessionIsProvablyAbsent,
+                    })),
+                  ),
+                ),
+                Effect.catchTag("ProviderUnsupportedError", () =>
+                  Effect.succeed({
+                    providerInstanceIsAbsent: true,
+                    sessionIsProvablyAbsent: true,
                   }),
                 ),
               )
-            : false;
+            : {
+                providerInstanceIsAbsent: false,
+                sessionIsProvablyAbsent: false,
+              };
         const bindingStillBelongsToFailedTurn =
           operationStillOwnsFailure ||
           (input.sendTurnOperationId === undefined &&
-            (identityStillOwnsFailure || sessionIsProvablyAbsent));
+            (identityStillOwnsFailure ||
+              legacyActiveTurnStillOwnsFailure ||
+              sessionAbsence.sessionIsProvablyAbsent));
         if (!bindingStillBelongsToFailedTurn) {
           return false;
         }
@@ -2604,7 +2634,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
             ? { providerInstanceId: binding.providerInstanceId }
             : {}),
           runtimeMode: binding.runtimeMode ?? "full-access",
-          status: "error",
+          status: sessionAbsence.providerInstanceIsAbsent ? "stopped" : "error",
           ...(binding.resumeCursor !== undefined ? { resumeCursor: binding.resumeCursor } : {}),
           runtimePayload: mergeRuntimePayload(binding.runtimePayload, {
             activeTurnId: null,
@@ -2612,7 +2642,9 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
             activeTurnSendTurnOperationId: null,
             lastTerminalTurnId: input.turnId,
             lastError: input.reason,
-            lastRuntimeEvent: "provider.turn.watchdog.stop-pending",
+            lastRuntimeEvent: sessionAbsence.providerInstanceIsAbsent
+              ? "provider.turn.watchdog.instance-absent"
+              : "provider.turn.watchdog.stop-pending",
             lastRuntimeEventAt: failedAt,
           }),
         });
@@ -2620,7 +2652,11 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
         // the binding ownership check. Otherwise a replacement can start in
         // the gap and be overwritten by this terminal event.
         yield* input.onOwned;
-        yield* stopSession({ threadId: input.threadId });
+        if (sessionAbsence.providerInstanceIsAbsent) {
+          yield* clearMcpSession(input.threadId);
+        } else {
+          yield* stopSession({ threadId: input.threadId });
+        }
         yield* input.onStopped;
         return true;
       }),

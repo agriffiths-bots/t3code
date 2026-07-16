@@ -3413,7 +3413,106 @@ describe("ProviderCommandReactor", () => {
       thread?.activities.find((activity) => activity.kind === "provider.turn.start.failed"),
     ).toMatchObject({
       turnId: null,
-      payload: { detail: expect.stringContaining("already in flight") },
+      payload: {
+        detail: expect.stringContaining("already in flight"),
+        turnStartMessageId: "user-message-overlapping-turn-start",
+      },
+    });
+  });
+
+  it("does not attribute the next provider turn to a rejected prompt", async () => {
+    const harness = await createHarness();
+    const rejectedAt = "2026-01-01T00:00:00.000Z";
+    const acceptedAt = "2026-01-01T00:00:01.000Z";
+    const rejectedMessageId = asMessageId("user-message-rejected-before-start");
+    const acceptedMessageId = asMessageId("user-message-accepted-after-rejection");
+    const acceptedTurnId = asTurnId("turn-accepted-after-rejection");
+    harness.sendTurn.mockImplementationOnce(
+      () =>
+        Effect.fail(
+          new ProviderSendTurnFailedError({
+            provider: "codex",
+            threadId: ThreadId.make("thread-1"),
+            detail: "Another session/prompt request is already in flight for this thread.",
+            sessionOwnershipId: "rejected-prompt-owner",
+            superseded: true,
+            overlapping: true,
+          }),
+        ) as never,
+    );
+
+    await runtime!.runPromise(
+      harness.engine.dispatch({
+        type: "thread.turn.start",
+        commandId: CommandId.make("cmd-rejected-before-start"),
+        threadId: ThreadId.make("thread-1"),
+        message: {
+          messageId: rejectedMessageId,
+          role: "user",
+          text: "rejected prompt",
+          attachments: [],
+        },
+        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+        runtimeMode: "approval-required",
+        createdAt: rejectedAt,
+      }),
+    );
+    await waitFor(async () => {
+      const thread = (await harness.readModel()).threads.find(
+        (entry) => entry.id === ThreadId.make("thread-1"),
+      );
+      return (
+        thread?.activities.some((activity) => activity.kind === "provider.turn.start.failed") ??
+        false
+      );
+    });
+
+    await runtime!.runPromise(
+      harness.engine.dispatch({
+        type: "thread.turn.start",
+        commandId: CommandId.make("cmd-accepted-after-rejection"),
+        threadId: ThreadId.make("thread-1"),
+        message: {
+          messageId: acceptedMessageId,
+          role: "user",
+          text: "accepted prompt",
+          attachments: [],
+        },
+        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+        runtimeMode: "approval-required",
+        createdAt: acceptedAt,
+      }),
+    );
+    await waitFor(() => harness.sendTurn.mock.calls.length === 2);
+    await runtime!.runPromise(
+      harness.engine.dispatch({
+        type: "thread.session.set",
+        commandId: CommandId.make("cmd-session-accepted-after-rejection"),
+        threadId: ThreadId.make("thread-1"),
+        session: {
+          threadId: ThreadId.make("thread-1"),
+          status: "running",
+          providerName: "codex",
+          providerInstanceId: ProviderInstanceId.make("codex"),
+          runtimeMode: "approval-required",
+          activeTurnId: acceptedTurnId,
+          lastError: null,
+          updatedAt: acceptedAt,
+        },
+        createdAt: acceptedAt,
+      }),
+    );
+
+    const thread = (await harness.readModel()).threads.find(
+      (entry) => entry.id === ThreadId.make("thread-1"),
+    );
+    expect(thread?.messages.find((message) => message.id === rejectedMessageId)?.turnId).toBeNull();
+    expect(thread?.messages.find((message) => message.id === acceptedMessageId)?.turnId).toBe(
+      acceptedTurnId,
+    );
+    expect(thread?.latestTurn).toMatchObject({
+      turnId: acceptedTurnId,
+      requestedAt: acceptedAt,
     });
   });
 

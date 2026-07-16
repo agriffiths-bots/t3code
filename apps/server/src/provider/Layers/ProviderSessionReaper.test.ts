@@ -164,6 +164,13 @@ describe("ProviderSessionReaper", () => {
     let readModel = input.readModel as unknown as OrchestrationReadModel;
     const stoppedThreadIds = new Set<ThreadId>();
     const dispatchedCommands: OrchestrationCommand[] = [];
+    const stopFailedSessionCalls: Array<{
+      readonly threadId: ThreadId;
+      readonly turnId: TurnId;
+      readonly sessionOwnershipId?: string;
+      readonly requireSessionAbsent?: boolean;
+      readonly allowLegacyActiveTurnMatch?: boolean;
+    }> = [];
     const stopSession = vi.fn<ProviderServiceShape["stopSession"]>(
       (request) =>
         (input.stopSessionImplementation
@@ -225,13 +232,27 @@ describe("ProviderSessionReaper", () => {
       respondToRequest: () => unsupported(),
       respondToUserInput: () => unsupported(),
       stopSession,
-      stopFailedSession: ({ threadId, turnId: _turnId, reason: _reason, onOwned, onStopped }) =>
-        Effect.gen(function* () {
-          yield* onOwned;
-          yield* stopSession({ threadId });
-          yield* onStopped;
+      stopFailedSession: (request) => {
+        stopFailedSessionCalls.push({
+          threadId: request.threadId,
+          turnId: request.turnId,
+          ...(request.sessionOwnershipId !== undefined
+            ? { sessionOwnershipId: request.sessionOwnershipId }
+            : {}),
+          ...(request.requireSessionAbsent !== undefined
+            ? { requireSessionAbsent: request.requireSessionAbsent }
+            : {}),
+          ...(request.allowLegacyActiveTurnMatch !== undefined
+            ? { allowLegacyActiveTurnMatch: request.allowLegacyActiveTurnMatch }
+            : {}),
+        });
+        return Effect.gen(function* () {
+          yield* request.onOwned;
+          yield* stopSession({ threadId: request.threadId });
+          yield* request.onStopped;
           return true;
-        }),
+        });
+      },
       listSessions: input.listSessionsImplementation ?? (() => Effect.succeed([])),
       getCapabilities: () => Effect.succeed({ sessionModelSwitch: "in-session" }),
       getInstanceInfo: (instanceId) => {
@@ -320,6 +341,7 @@ describe("ProviderSessionReaper", () => {
         readModel = nextReadModel as unknown as OrchestrationReadModel;
       },
       stopSession,
+      stopFailedSessionCalls,
       stoppedThreadIds,
       readModel: () => readModel,
     };
@@ -888,7 +910,7 @@ describe("ProviderSessionReaper", () => {
     });
   });
 
-  it("fails and frees a running turn when a permission request exceeds its timeout", async () => {
+  it("fails a legacy live turn when its permission request exceeds the timeout", async () => {
     const threadId = ThreadId.make("thread-watchdog-permission-timeout");
     const turnId = TurnId.make("turn-watchdog-permission-timeout");
     const requestId = ApprovalRequestId.make("approval-watchdog-timeout");
@@ -954,6 +976,11 @@ describe("ProviderSessionReaper", () => {
     await waitFor(() => harness.readModel().threads[0]?.latestTurn?.state === "error");
 
     const thread = harness.readModel().threads[0];
+    expect(harness.stopFailedSessionCalls).toContainEqual({
+      threadId,
+      turnId,
+      allowLegacyActiveTurnMatch: true,
+    });
     expect(thread?.latestTurn?.state).toBe("error");
     expect(thread?.session).toMatchObject({
       status: "stopped",
