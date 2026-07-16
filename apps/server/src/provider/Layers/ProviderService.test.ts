@@ -1625,6 +1625,7 @@ routing.layer("ProviderServiceLive routing", (it) => {
       assert.equal(steerFailure._tag, "ProviderSendTurnFailedError");
       if (steerFailure._tag === "ProviderSendTurnFailedError") {
         assert.equal(steerFailure.turnId, undefined);
+        assert.equal(steerFailure.preservedActiveTurnId, existingTurn.turnId);
         assert.equal(steerFailure.superseded, false);
       }
       const binding = Option.getOrThrow(yield* directory.getBinding(threadId));
@@ -1639,11 +1640,38 @@ routing.layer("ProviderServiceLive routing", (it) => {
       assert.equal(binding.status, "running");
       assert.equal(runtimePayload.activeTurnId, existingTurn.turnId);
       assert.equal(runtimePayload.lastError, null);
-      assert.equal(runtimePayload.lastFailedSendTurnOperationId, null);
+      assert.equal(typeof runtimePayload.lastFailedSendTurnOperationId, "string");
       assert.equal(runtimePayload.lastRuntimeEvent, "provider.sendTurn");
       assert.equal(runtimePayload.lastTerminalTurnId, null);
       assert.equal(runtimePayload.sendTurnOperationId, null);
       assert.equal(routing.codex.sessions.get(threadId)?.activeTurnId, existingTurn.turnId);
+
+      routing.codex.emit({
+        type: "turn.completed",
+        eventId: asEventId("evt-preserved-steer-turn-completed"),
+        provider: ProviderDriverKind.make("codex"),
+        threadId,
+        turnId: existingTurn.turnId,
+        createdAt: "2026-01-01T00:00:05.000Z",
+        payload: { state: "completed" },
+      });
+      yield* advanceTestClock(50);
+      routing.codex.emit({
+        type: "session.state.changed",
+        eventId: asEventId("evt-session-waiting-after-preserved-steer"),
+        provider: ProviderDriverKind.make("codex"),
+        threadId,
+        createdAt: "2026-01-01T00:00:06.000Z",
+        payload: { state: "waiting" },
+      });
+      yield* advanceTestClock(50);
+
+      const settledBinding = Option.getOrThrow(yield* directory.getBinding(threadId));
+      assert.equal(settledBinding.status, "waiting");
+      assert.equal(
+        (settledBinding.runtimePayload as { readonly lastRuntimeEvent?: unknown }).lastRuntimeEvent,
+        "session.state.changed",
+      );
     }),
   );
 
@@ -3631,7 +3659,7 @@ fanout.layer("ProviderServiceLive fanout", (it) => {
     }),
   );
 
-  it.effect("marks the runtime binding failed when a provider process exits mid-turn", () =>
+  it.effect("fails the runtime binding on an untagged provider exit mid-turn", () =>
     Effect.gen(function* () {
       const threadId = asThreadId("thread-runtime-process-exit");
       const provider = yield* ProviderService.ProviderService;
@@ -3657,7 +3685,6 @@ fanout.layer("ProviderServiceLive fanout", (it) => {
         threadId: session.threadId,
         turnId: turn.turnId,
         payload: {
-          exitKind: "error",
           reason: "provider process exited mid-turn",
         },
       });

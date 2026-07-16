@@ -185,6 +185,7 @@ function toRuntimePayloadFromSession(
     sendTurnOperationId: null,
     activeTurnSendTurnOperationId: null,
     lastFailedSendTurnOperationId: null,
+    failedSendPreservedActiveTurnId: null,
     lastTerminalTurnId: null,
     unconfirmedSessionExit: null,
   };
@@ -1061,12 +1062,13 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
         }
         const activeTurnId = previousPayload.activeTurnId;
         const correlatedTurnId = event.turnId ?? bindingActiveTurnId;
+        const providerExitIsError = event.payload.exitKind !== "graceful";
         yield* directory.upsert({
           threadId: event.threadId,
           provider: source.provider,
           providerInstanceId: source.instanceId,
           runtimeMode: binding?.runtimeMode ?? "full-access",
-          status: event.payload.exitKind === "error" ? "error" : "stopped",
+          status: providerExitIsError ? "error" : "stopped",
           ...(binding?.resumeCursor !== undefined ? { resumeCursor: binding.resumeCursor } : {}),
           runtimePayload: {
             ...previousPayload,
@@ -1288,6 +1290,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
               sessionOwnershipId,
               sendTurnOperationId: operationId,
               lastFailedSendTurnOperationId: null,
+              failedSendPreservedActiveTurnId: null,
             },
           });
           yield* Ref.update(activeSendTurnOperations, (current) => {
@@ -1353,9 +1356,14 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
             runtimePayload: {
               ...currentPayload,
               sendTurnOperationId: null,
+              lastFailedSendTurnOperationId: ownership.operationId,
+              failedSendPreservedActiveTurnId: currentActiveTurnId,
             },
           });
-          return { superseded: false } as const;
+          return {
+            superseded: false,
+            preservedActiveTurnId: currentActiveTurnId,
+          } as const;
         }
         const failedAt = yield* nowIso;
         yield* directory.upsert({
@@ -1371,6 +1379,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
             sendTurnOperationId: null,
             activeTurnSendTurnOperationId: null,
             lastFailedSendTurnOperationId: ownership.operationId,
+            failedSendPreservedActiveTurnId: null,
             lastError: errorMessage,
             ...(currentActiveTurnId !== undefined
               ? { lastTerminalTurnId: currentActiveTurnId }
@@ -1412,10 +1421,15 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
       return false;
     }
     const runtimePayload = readRecord(binding.runtimePayload) ?? {};
-    return (
-      typeof runtimePayload.lastFailedSendTurnOperationId === "string" &&
-      runtimePayload.sendTurnOperationId === null
-    );
+    const failedOperationId = runtimePayload.lastFailedSendTurnOperationId;
+    if (typeof failedOperationId !== "string" || runtimePayload.sendTurnOperationId !== null) {
+      return false;
+    }
+    const preservedActiveTurnId = runtimePayload.failedSendPreservedActiveTurnId;
+    if (typeof preservedActiveTurnId === "string") {
+      return event.turnId !== undefined && String(event.turnId) !== preservedActiveTurnId;
+    }
+    return true;
   });
 
   const handleAcceptedRuntimeEvent = Effect.fn("ProviderService.handleAcceptedRuntimeEvent")(
@@ -2183,6 +2197,10 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
                     sendTurnOperationId: sendTurnOwnership.operationId,
                     ...("turnId" in failure && failure.turnId !== undefined
                       ? { turnId: failure.turnId }
+                      : {}),
+                    ...("preservedActiveTurnId" in failure &&
+                    failure.preservedActiveTurnId !== undefined
+                      ? { preservedActiveTurnId: failure.preservedActiveTurnId }
                       : {}),
                     superseded: failure.superseded,
                     cause: error,

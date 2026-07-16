@@ -484,7 +484,7 @@ describe("ProviderRuntimeIngestion", () => {
     expect(thread.session?.lastError).toBe("turn failed");
   });
 
-  it("fails a running turn when the provider process exits with an error", async () => {
+  it("fails a running turn when the provider process exits without a graceful tag", async () => {
     const harness = await createHarness();
     const turnId = asTurnId("turn-provider-process-exit");
 
@@ -509,7 +509,6 @@ describe("ProviderRuntimeIngestion", () => {
       createdAt: "2026-01-01T00:00:10.000Z",
       turnId,
       payload: {
-        exitKind: "error",
         reason: "provider process died unexpectedly",
       },
     });

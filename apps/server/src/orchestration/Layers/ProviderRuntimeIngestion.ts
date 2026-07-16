@@ -1449,7 +1449,7 @@ const make = Effect.gen(function* () {
             case "turn.started":
               return "running";
             case "session.exited":
-              return event.payload.exitKind === "error" ? "error" : "stopped";
+              return event.payload.exitKind !== "graceful" ? "error" : "stopped";
             case "turn.completed":
               return normalizeRuntimeTurnState(event.payload.state) === "failed"
                 ? "error"
@@ -1464,7 +1464,7 @@ const make = Effect.gen(function* () {
         const lastError =
           event.type === "session.state.changed" && event.payload.state === "error"
             ? (event.payload.reason ?? thread.session?.lastError ?? "Provider session error")
-            : event.type === "session.exited" && event.payload.exitKind === "error"
+            : event.type === "session.exited" && event.payload.exitKind !== "graceful"
               ? (event.payload.reason ??
                 thread.session?.lastError ??
                 "Provider process exited while the turn was running")

@@ -99,6 +99,7 @@ export class ProviderSendTurnFailedError extends Schema.TaggedErrorClass<Provide
     sessionOwnershipId: Schema.String,
     sendTurnOperationId: Schema.optional(Schema.String),
     turnId: Schema.optional(Schema.String),
+    preservedActiveTurnId: Schema.optional(Schema.String),
     superseded: Schema.Boolean,
     overlapping: Schema.optional(Schema.Boolean),
     cause: Schema.optional(Schema.Defect()),

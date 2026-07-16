@@ -2500,6 +2500,42 @@ describe("ChildThreadCoordinator", () => {
     expect(result.error).toBe("session error");
   });
 
+  it("settles a replayed provider error over a running turn and wakes the parent", async () => {
+    const child = ThreadId.make("recon-provider-error-running-child");
+    const parent = ThreadId.make("recon-provider-error-running-parent");
+    const turn1 = TurnId.make("turn-provider-error");
+    const harness = await createHarness({
+      threads: [
+        makeThreadState({
+          threadId: parent,
+          latestTurn: makeLatestTurn("completed", TurnId.make("turn-parent-completed")),
+          session: makeSession(parent, "ready"),
+        }),
+        makeThreadState({
+          threadId: child,
+          parentThreadId: parent,
+          latestTurn: makeLatestTurn("running", turn1),
+          session: makeSession(child, "error", null, "provider process exited"),
+        }),
+      ],
+      seedChildRows: [{ threadId: child, parentThreadId: parent }],
+      persistedEvents: [
+        turnStartRequestedEvent(child),
+        sessionSetEvent(child, "running", turn1),
+        sessionSetEvent(child, "error", null, "provider process exited"),
+      ],
+    });
+
+    const result = await runtimeRun(harness, child);
+    expect(result.status).toBe("failed");
+    expect(result.error).toBe("session error");
+    const parentWakes = harness.dispatched.filter(
+      (command) => command.type === "thread.turn.start" && command.threadId === parent,
+    ) as Array<Extract<OrchestrationCommand, { type: "thread.turn.start" }>>;
+    expect(parentWakes).toHaveLength(1);
+    expect(parentWakes[0]!.message.text).toContain(`[sub-agent ${child} failed] session error`);
+  });
+
   it("settles live stopped after replaying a running placeholder missing turn-diff", async () => {
     const child = ThreadId.make("recon-running-missing-live-stopped");
     const parent = ThreadId.make("recon-running-missing-live-stopped-parent");

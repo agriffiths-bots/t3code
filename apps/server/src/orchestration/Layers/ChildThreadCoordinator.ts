@@ -166,6 +166,14 @@ const isProjectedChildActive = (shell: OrchestrationThreadShell): boolean => {
   );
 };
 
+const shouldSettleTerminalSession = (input: {
+  readonly status: SessionSetEvent["payload"]["session"]["status"];
+  readonly turnRunning: boolean;
+  readonly missingDiffWhileRunning: boolean;
+}): boolean =>
+  input.status === "error" ||
+  (input.status === "stopped" && (!input.turnRunning || input.missingDiffWhileRunning));
+
 const parseIsoMillis = (value: string | null | undefined): number | null => {
   if (value == null) return null;
   const parsed = Date.parse(value);
@@ -1564,9 +1572,11 @@ const make = Effect.gen(function* () {
         onSome: (shell) => shell.latestTurn?.state === "running",
       });
       if (
-        session.status === "stopped" &&
-        turnRunning &&
-        !missingDiffWhileRunningByChild.has(threadId)
+        !shouldSettleTerminalSession({
+          status: session.status,
+          turnRunning,
+          missingDiffWhileRunning: missingDiffWhileRunningByChild.has(threadId),
+        })
       ) {
         return;
       }
@@ -2556,9 +2566,11 @@ const make = Effect.gen(function* () {
                 }
               }
               if (
-                (session.status === "stopped" || session.status === "error") &&
-                (runningByChild.get(threadId) !== true ||
-                  missingDiffWhileRunningByReplayedChild.has(threadId))
+                shouldSettleTerminalSession({
+                  status: session.status,
+                  turnRunning: runningByChild.get(threadId) === true,
+                  missingDiffWhileRunning: missingDiffWhileRunningByReplayedChild.has(threadId),
+                })
               ) {
                 const priorTerminal = terminalByChild.get(threadId);
                 if (session.status === "stopped" && priorTerminal?.status === "completed") {

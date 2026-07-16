@@ -3417,6 +3417,99 @@ describe("ProviderCommandReactor", () => {
     });
   });
 
+  it("records a failed steer without stopping the pre-existing active turn", async () => {
+    const harness = await createHarness();
+    const now = "2026-01-01T00:00:00.000Z";
+    const activeTurnId = asTurnId("turn-running-before-failed-steer");
+    await runtime!.runPromise(
+      harness.engine.dispatch({
+        type: "thread.session.set",
+        commandId: CommandId.make("cmd-active-turn-before-failed-steer"),
+        threadId: ThreadId.make("thread-1"),
+        session: {
+          threadId: ThreadId.make("thread-1"),
+          status: "running",
+          providerName: "codex",
+          providerInstanceId: ProviderInstanceId.make("codex"),
+          runtimeMode: "approval-required",
+          activeTurnId,
+          lastError: null,
+          updatedAt: now,
+        },
+        createdAt: now,
+      }),
+    );
+    harness.runtimeSessions.push({
+      provider: ProviderDriverKind.make("codex"),
+      providerInstanceId: ProviderInstanceId.make("codex"),
+      status: "running",
+      runtimeMode: "approval-required",
+      threadId: ThreadId.make("thread-1"),
+      activeTurnId,
+      resumeCursor: { opaque: "resume-active-turn-before-failed-steer" },
+      createdAt: now,
+      updatedAt: now,
+    });
+    harness.sendTurn.mockImplementationOnce(
+      () =>
+        Effect.fail(
+          new ProviderSendTurnFailedError({
+            provider: "codex",
+            threadId: ThreadId.make("thread-1"),
+            detail: "steer rejected before turn.started",
+            sessionOwnershipId: "failed-steer-session-owner",
+            sendTurnOperationId: "failed-steer-operation",
+            preservedActiveTurnId: activeTurnId,
+            superseded: false,
+          }),
+        ) as never,
+    );
+
+    await runtime!.runPromise(
+      harness.engine.dispatch({
+        type: "thread.turn.start",
+        commandId: CommandId.make("cmd-failed-steer"),
+        threadId: ThreadId.make("thread-1"),
+        message: {
+          messageId: asMessageId("user-message-failed-steer"),
+          role: "user",
+          text: "steer the active turn",
+          attachments: [],
+        },
+        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+        runtimeMode: "approval-required",
+        createdAt: now,
+      }),
+    );
+
+    await waitFor(async () => {
+      const thread = (await harness.readModel()).threads.find(
+        (entry) => entry.id === ThreadId.make("thread-1"),
+      );
+      return (
+        thread?.activities.some((activity) => activity.kind === "provider.turn.start.failed") ??
+        false
+      );
+    });
+    const thread = (await harness.readModel()).threads.find(
+      (entry) => entry.id === ThreadId.make("thread-1"),
+    );
+    expect(thread?.latestTurn).toMatchObject({ turnId: activeTurnId, state: "running" });
+    expect(thread?.session).toMatchObject({
+      status: "running",
+      activeTurnId,
+      lastError: null,
+    });
+    expect(harness.stopFailedSessionCalls).toHaveLength(0);
+    expect(harness.stopSession).not.toHaveBeenCalled();
+    expect(
+      thread?.activities.find((activity) => activity.kind === "provider.turn.start.failed"),
+    ).toMatchObject({
+      turnId: null,
+      payload: { detail: "steer rejected before turn.started" },
+    });
+  });
+
   it("keeps failed cleanup visible and replaces the session on the next turn", async () => {
     const harness = await createHarness();
     const now = "2026-01-01T00:00:00.000Z";

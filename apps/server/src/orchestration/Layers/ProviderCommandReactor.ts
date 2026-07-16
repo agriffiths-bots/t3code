@@ -1299,6 +1299,18 @@ const make = Effect.gen(function* () {
         });
         return;
       }
+      if (sendTurnFailure?.preservedActiveTurnId !== undefined) {
+        const failedAt = yield* nowIso;
+        yield* appendProviderFailureActivity({
+          threadId: event.payload.threadId,
+          kind: "provider.turn.start.failed",
+          summary: "Provider turn start failed",
+          detail: sendTurnFailure.detail,
+          turnId: null,
+          createdAt: failedAt,
+        });
+        return;
+      }
       const detail = formatFailureDetail(cause);
       const sessionStartTimeoutFailure = findProviderSessionStartTimeoutError(cause);
       const failedAt = yield* nowIso;
