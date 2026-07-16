@@ -43,7 +43,11 @@ import { ServerSettingsService } from "../../serverSettings.ts";
 import { ProviderAdapterValidationError } from "../Errors.ts";
 import type { CodexAdapterShape } from "../Services/CodexAdapter.ts";
 import { ProviderSessionDirectory } from "../Services/ProviderSessionDirectory.ts";
-import { type CodexAdapterLiveOptions, makeCodexAdapter } from "./CodexAdapter.ts";
+import {
+  type CodexAdapterLiveOptions,
+  deleteSessionIfCurrent,
+  makeCodexAdapter,
+} from "./CodexAdapter.ts";
 import {
   type CodexSessionRuntimeOptions,
   type CodexSessionRuntimeSendTurnInput,
@@ -1439,6 +1443,9 @@ it.effect("serializes incompatible same-thread starts until the old scope is clo
       NodeAssert.equal(maxLiveRuntimes, 1);
       NodeAssert.deepStrictEqual(released, [threadId]);
       NodeAssert.equal(runtimes[0]?.closeImpl.mock.calls.length, 1);
+      yield* Effect.forEach(Array.from({ length: 10 }), () => Effect.yieldNow, {
+        discard: true,
+      });
       NodeAssert.equal(replacementExitFiber.pollUnsafe(), undefined);
       yield* Fiber.interrupt(replacementExitFiber);
     }),
@@ -1908,6 +1915,12 @@ it.effect("stale cleanup cannot remove or close a successor session", () =>
       const adapter = yield* buildAdapterWithScope(factory, adapterScope);
       const threadId = asThreadId("thread-stale-cleanup");
       const input = { threadId, runtimeMode: "full-access" as const };
+      const stale = { generation: 1 };
+      const current = { generation: 2 };
+      const sessionRegistry = new Map([[threadId, current]]);
+
+      NodeAssert.equal(deleteSessionIfCurrent(sessionRegistry, threadId, stale), false);
+      NodeAssert.strictEqual(sessionRegistry.get(threadId), current);
 
       yield* adapter.startSession(input);
       const oldRuntime = runtimes[0];

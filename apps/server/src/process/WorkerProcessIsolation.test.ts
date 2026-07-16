@@ -5,6 +5,7 @@ import * as Duration from "effect/Duration";
 import * as FileSystem from "effect/FileSystem";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
+import * as Logger from "effect/Logger";
 import * as Path from "effect/Path";
 import * as Sink from "effect/Sink";
 import * as Stream from "effect/Stream";
@@ -274,10 +275,14 @@ describe("WorkerProcessIsolation", () => {
     }).pipe(Effect.provide(WorkerProcessIsolation.layerTest({}, "win32"))),
   );
 
-  it.effect("reaps only scopes owned by a dead prior server boot", () =>
-    Effect.gen(function* () {
+  it.effect("reaps only scopes owned by a dead prior server boot", () => {
+    const messages: Array<ReadonlyArray<unknown>> = [];
+    const currentBoot = `b${process.pid}-100-${"a".repeat(32)}`;
+    const logger = Logger.make<unknown, void>(({ message }) => {
+      messages.push(message as ReadonlyArray<unknown>);
+    });
+    return Effect.gen(function* () {
       const commands: ChildProcess.StandardCommand[] = [];
-      const currentBoot = `b${process.pid}-100-${"a".repeat(32)}`;
       const liveForeignBoot = `b777-200-${"b".repeat(32)}`;
       const reusedPidBoot = `b777-199-${"2".repeat(32)}`;
       const deadPriorBoot = `b424242-300-${"c".repeat(32)}`;
@@ -305,7 +310,7 @@ describe("WorkerProcessIsolation", () => {
       const isolation = yield* WorkerProcessIsolation.WorkerProcessIsolation;
 
       const reapFiber = yield* isolation.reapStaleScopes(spawner).pipe(Effect.forkChild);
-      while (commands.length < 3) yield* Effect.yieldNow;
+      while (commands.length < 2) yield* Effect.yieldNow;
 
       expect(commands[0]?.args).toEqual([
         "--user",
@@ -318,26 +323,39 @@ describe("WorkerProcessIsolation", () => {
         "t3-worker-*.scope",
       ]);
       expect(commands.slice(1).map((command) => command.args)).toEqual([
-        ["--user", "kill", "--signal=SIGTERM", reusedPidUnit],
         ["--user", "kill", "--signal=SIGTERM", deadPriorUnit],
       ]);
       yield* TestClock.adjust(Duration.seconds(2));
       yield* Fiber.join(reapFiber);
       expect(commands.slice(1).map((command) => command.args)).toEqual([
-        ["--user", "kill", "--signal=SIGTERM", reusedPidUnit],
         ["--user", "kill", "--signal=SIGTERM", deadPriorUnit],
-        ["--user", "kill", "--signal=SIGKILL", reusedPidUnit],
         ["--user", "kill", "--signal=SIGKILL", deadPriorUnit],
+      ]);
+      expect(messages).toContainEqual([
+        "worker.process.isolation.scope-owner-unverifiable",
+        {
+          unitName: reusedPidUnit,
+          ownerPid: 777,
+          recordedStartTime: "199",
+          bootIdentity: currentBoot,
+        },
       ]);
     }).pipe(
       Effect.provide(
-        WorkerProcessIsolation.layerTest({}, "linux", {
-          bootIdentity: `b${process.pid}-100-${"a".repeat(32)}`,
-          isBootAlive: (pid, processStartTime) => pid === 777 && processStartTime === "200",
-        }),
+        Layer.merge(
+          WorkerProcessIsolation.layerTest({}, "linux", {
+            bootIdentity: currentBoot,
+            classifyBootOwner: (pid, processStartTime) => {
+              if (pid === 777 && processStartTime === "200") return "alive";
+              if (pid === 777 && processStartTime === "199") return "unverifiable";
+              return "dead";
+            },
+          }),
+          Logger.layer([logger], { mergeWithExisting: false }),
+        ),
       ),
-    ),
-  );
+    );
+  });
 
   it.effect("prepares a wrapper executable for SDK-managed workers", () =>
     Effect.gen(function* () {

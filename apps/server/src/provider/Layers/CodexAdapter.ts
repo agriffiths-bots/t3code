@@ -105,6 +105,16 @@ interface CodexAdapterSessionContext {
   stopped: boolean;
 }
 
+export const deleteSessionIfCurrent = <Key, Session extends { readonly generation: number }>(
+  sessions: Map<Key, Session>,
+  key: Key,
+  expected: Session,
+): boolean => {
+  const current = sessions.get(key);
+  if (current !== expected || current.generation !== expected.generation) return false;
+  return sessions.delete(key);
+};
+
 interface CodexStartCompatibility {
   readonly cwd: string;
   readonly model: string | undefined;
@@ -2047,10 +2057,7 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
         if (reason !== "replace") {
           yield* emitGracefulSessionExitIfNeeded(session);
         }
-        const current = sessions.get(session.threadId);
-        if (current === session && current.generation === session.generation) {
-          sessions.delete(session.threadId);
-        }
+        deleteSessionIfCurrent(sessions, session.threadId, session);
         yield* Effect.logInfo("codex.session.stopped", {
           providerInstanceId: boundInstanceId,
           threadId: session.threadId,

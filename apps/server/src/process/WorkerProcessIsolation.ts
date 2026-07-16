@@ -67,10 +67,12 @@ let nextScopeId = 0;
 
 interface WorkerProcessIsolationRuntimeOptions {
   readonly bootIdentity?: string;
-  readonly isBootAlive?: (pid: number, processStartTime: string) => boolean;
+  readonly classifyBootOwner?: (pid: number, processStartTime: string) => BootOwnerStatus;
 }
 
 type ReadProcessStartTime = (pid: number) => Effect.Effect<string | undefined>;
+type BootOwnerStatus = "alive" | "dead" | "unverifiable";
+type PidOccupancy = "occupied" | "free" | "unverifiable";
 
 const truthy = (value: string): boolean => {
   const normalized = value.trim().toLowerCase();
@@ -135,12 +137,15 @@ const parseOwnedScopeUnit = (
   return { bootIdentity: match[1], ownerPid, processStartTime: match[3] };
 };
 
-const isPidOccupied = (pid: number): boolean => {
+const pidOccupancy = (pid: number): PidOccupancy => {
   try {
     process.kill(pid, 0);
-    return true;
+    return "occupied";
   } catch (error) {
-    return (error as NodeJS.ErrnoException).code === "EPERM";
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "ESRCH") return "free";
+    if (code === "EPERM") return "occupied";
+    return "unverifiable";
   }
 };
 
@@ -537,18 +542,23 @@ const makeWithConfig = (
     const systemdIsolationSupported = supportsSystemdIsolation(platform);
     const bootIdentity =
       runtimeOptions.bootIdentity ?? makeBootIdentity(yield* readProcessStartTime(process.pid));
-    const bootIsAlive = (pid: number, processStartTime: string): Effect.Effect<boolean> => {
-      if (runtimeOptions.isBootAlive !== undefined) {
-        return Effect.sync(() => runtimeOptions.isBootAlive!(pid, processStartTime));
+    const classifyBootOwner = (
+      pid: number,
+      processStartTime: string,
+    ): Effect.Effect<BootOwnerStatus> => {
+      if (runtimeOptions.classifyBootOwner !== undefined) {
+        return Effect.sync(() => runtimeOptions.classifyBootOwner!(pid, processStartTime));
       }
-      if (!isPidOccupied(pid)) return Effect.succeed(false);
+      const occupancy = pidOccupancy(pid);
+      if (occupancy === "free") return Effect.succeed("dead");
+      if (occupancy === "unverifiable") return Effect.succeed("unverifiable");
       return readProcessStartTime(pid).pipe(
-        Effect.map(
-          (observedStartTime) =>
-            processStartTime === "0" ||
-            observedStartTime === undefined ||
-            observedStartTime === processStartTime,
-        ),
+        Effect.map((observedStartTime): BootOwnerStatus => {
+          if (processStartTime === "0" || observedStartTime === undefined) {
+            return "unverifiable";
+          }
+          return observedStartTime === processStartTime ? "alive" : "unverifiable";
+        }),
       );
     };
     const availabilityRef = yield* Ref.make<Option.Option<SystemdAvailability>>(Option.none());
@@ -628,8 +638,18 @@ const makeWithConfig = (
             if (owner === undefined || owner.bootIdentity === bootIdentity) {
               return Effect.succeed(false);
             }
-            return bootIsAlive(owner.ownerPid, owner.processStartTime).pipe(
-              Effect.map((alive) => !alive),
+            return classifyBootOwner(owner.ownerPid, owner.processStartTime).pipe(
+              Effect.tap((status) =>
+                status === "unverifiable"
+                  ? Effect.logWarning("worker.process.isolation.scope-owner-unverifiable", {
+                      unitName,
+                      ownerPid: owner.ownerPid,
+                      recordedStartTime: owner.processStartTime,
+                      bootIdentity,
+                    })
+                  : Effect.void,
+              ),
+              Effect.map((status) => status === "dead"),
             );
           },
           { concurrency: "unbounded" },
