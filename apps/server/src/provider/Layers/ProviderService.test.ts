@@ -3954,6 +3954,7 @@ fanout.layer("ProviderServiceLive fanout", (it) => {
         payload: { state: "completed" },
       });
       yield* advanceTestClock(500);
+      fanout.codex.sessions.delete(threadId);
 
       fanout.codex.emit({
         type: "session.exited",
@@ -3971,10 +3972,14 @@ fanout.layer("ProviderServiceLive fanout", (it) => {
 
       const idleBinding = Option.getOrThrow(yield* directory.getBinding(threadId));
       assert.equal(idleBinding.status, "running");
-      assert.equal(
-        (idleBinding.runtimePayload as { readonly activeTurnId?: unknown }).activeTurnId,
-        null,
-      );
+      const idlePayload = idleBinding.runtimePayload as {
+        readonly activeTurnId?: unknown;
+        readonly lastRuntimeEvent?: unknown;
+        readonly lastTerminalTurnId?: unknown;
+      };
+      assert.equal(idlePayload.activeTurnId, null);
+      assert.equal(idlePayload.lastRuntimeEvent, "turn.completed");
+      assert.equal(idlePayload.lastTerminalTurnId, replacementTurn.turnId);
     }),
   );
 

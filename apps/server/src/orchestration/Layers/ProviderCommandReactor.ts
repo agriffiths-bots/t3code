@@ -277,6 +277,7 @@ const make = Effect.gen(function* () {
     readonly turnId: TurnId | null;
     readonly createdAt: string;
     readonly requestId?: string;
+    readonly turnStartRequestId?: EventId;
   }) =>
     Effect.all({
       commandId: serverCommandId("provider-failure-activity"),
@@ -295,6 +296,9 @@ const make = Effect.gen(function* () {
             payload: {
               detail: input.detail,
               ...(input.requestId ? { requestId: input.requestId } : {}),
+              ...(input.turnStartRequestId !== undefined
+                ? { turnStartRequestId: input.turnStartRequestId }
+                : {}),
             },
             turnId: input.turnId,
             createdAt: input.createdAt,
@@ -456,6 +460,7 @@ const make = Effect.gen(function* () {
       readonly createdAt: string;
       readonly sessionOwnershipId?: string;
       readonly sendTurnOperationId?: string;
+      readonly turnStartRequestId?: EventId;
       readonly liveSessionLookup: Option.Option<ProviderSession>;
       readonly modelSelection?: ModelSelection;
       readonly runtimeMode?: RuntimeMode;
@@ -531,6 +536,9 @@ const make = Effect.gen(function* () {
               detail: input.detail,
               turnId: failedTurnId,
               createdAt: input.createdAt,
+              ...(input.turnStartRequestId !== undefined
+                ? { turnStartRequestId: input.turnStartRequestId }
+                : {}),
             });
           }),
           onStopped: setThreadSession({
@@ -607,6 +615,7 @@ const make = Effect.gen(function* () {
     readonly modelSelection?: ModelSelection;
     readonly runtimeMode?: RuntimeMode;
     readonly createdAt: string;
+    readonly turnStartRequestId: EventId;
   }) {
     const latestThread = yield* resolveThread(input.threadId);
     if (!latestThread || latestThread.archivedAt === null) {
@@ -653,6 +662,7 @@ const make = Effect.gen(function* () {
       detail: archivedTurnStartCancellationDetail(input.threadId),
       turnId: null,
       createdAt: cancellationCreatedAt,
+      turnStartRequestId: input.turnStartRequestId,
     }).pipe(
       Effect.catchCause((cause) =>
         Effect.logWarning("provider command reactor failed to record archived turn cancellation", {
@@ -1203,6 +1213,7 @@ const make = Effect.gen(function* () {
         detail: `Turn start message '${event.payload.messageId}' was not found for turn start request.`,
         turnId: null,
         createdAt: event.payload.createdAt,
+        turnStartRequestId: event.eventId,
       });
       return;
     }
@@ -1214,6 +1225,7 @@ const make = Effect.gen(function* () {
           : {}),
         runtimeMode: event.payload.runtimeMode,
         createdAt: event.payload.createdAt,
+        turnStartRequestId: event.eventId,
       })
     ) {
       return;
@@ -1231,6 +1243,7 @@ const make = Effect.gen(function* () {
           : {}),
         runtimeMode: event.payload.runtimeMode,
         createdAt: event.payload.createdAt,
+        turnStartRequestId: event.eventId,
       }))
     ) {
       return;
@@ -1271,6 +1284,7 @@ const make = Effect.gen(function* () {
           : {}),
         runtimeMode: event.payload.runtimeMode,
         createdAt: event.payload.createdAt,
+        turnStartRequestId: event.eventId,
       })
     ) {
       return;
@@ -1290,6 +1304,7 @@ const make = Effect.gen(function* () {
           detail: sendTurnFailure.detail,
           turnId: null,
           createdAt: failedAt,
+          turnStartRequestId: event.eventId,
         });
         return;
       }
@@ -1308,6 +1323,7 @@ const make = Effect.gen(function* () {
           detail: sendTurnFailure.detail,
           turnId: null,
           createdAt: failedAt,
+          turnStartRequestId: event.eventId,
         });
         return;
       }
@@ -1365,6 +1381,7 @@ const make = Effect.gen(function* () {
             ? { modelSelection: event.payload.modelSelection }
             : {}),
           runtimeMode: event.payload.runtimeMode,
+          turnStartRequestId: event.eventId,
         });
       }
 
@@ -1384,6 +1401,7 @@ const make = Effect.gen(function* () {
         detail,
         turnId: null,
         createdAt: failedAt,
+        turnStartRequestId: event.eventId,
       });
     });
 
@@ -1404,6 +1422,7 @@ const make = Effect.gen(function* () {
         yield* stopTurnStartIfThreadArchived({
           threadId: event.payload.threadId,
           createdAt: event.payload.createdAt,
+          turnStartRequestId: event.eventId,
         })
       ) {
         return;
@@ -1433,6 +1452,7 @@ const make = Effect.gen(function* () {
         yield* stopTurnStartIfThreadArchived({
           threadId: event.payload.threadId,
           createdAt: event.payload.createdAt,
+          turnStartRequestId: event.eventId,
         })
       ) {
         return;

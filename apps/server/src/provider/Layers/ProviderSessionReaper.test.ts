@@ -523,7 +523,7 @@ describe("ProviderSessionReaper", () => {
     expect(harness.stopSession).not.toHaveBeenCalled();
   });
 
-  it("fails an orphaned projected turn after one ready-session grace sweep", async () => {
+  it("does not classify a present ready session as process disappearance", async () => {
     const threadId = ThreadId.make("thread-watchdog-ready-stuck-projection");
     const turnId = TurnId.make("turn-watchdog-ready-stuck-projection");
     const startedAt = "2026-01-01T00:00:00.000Z";
@@ -573,14 +573,12 @@ describe("ProviderSessionReaper", () => {
     const reaper = await runtime!.runPromise(Effect.service(ProviderSessionReaper));
     scope = await runtime!.runPromise(Scope.make("sequential"));
     await runtime!.runPromise(reaper.start().pipe(Scope.provide(scope)));
-    await waitFor(() => harness.readModel().threads[0]?.latestTurn?.state === "error");
+    await waitFor(() => snapshotCount >= 2);
+    await runtime!.runPromise(drainFibers);
 
     expect(snapshotCount).toBeGreaterThanOrEqual(2);
-    expect(harness.stopSession).toHaveBeenCalledWith({ threadId });
-    expect(harness.readModel().threads[0]?.session).toMatchObject({
-      status: "stopped",
-      lastError: expect.stringContaining("disappeared"),
-    });
+    expect(harness.stopSession).not.toHaveBeenCalled();
+    expect(harness.readModel().threads[0]?.latestTurn?.state).toBe("running");
   });
 
   it("defers a projected running turn already recorded terminal in its binding", async () => {
@@ -1166,6 +1164,60 @@ describe("ProviderSessionReaper", () => {
     ).toBe("running");
   });
 
+  it("treats a connecting session that owns the projected turn as live", async () => {
+    const threadId = ThreadId.make("thread-watchdog-connecting-live");
+    const turnId = TurnId.make("turn-watchdog-connecting-live");
+    const startedAt = "2026-01-01T00:00:00.000Z";
+    const harness = await createHarness({
+      sweepIntervalMs: 2,
+      listSessionsImplementation: () =>
+        Effect.succeed([
+          {
+            provider: ProviderDriverKind.make("claudeAgent"),
+            providerInstanceId: ProviderInstanceId.make("claudeAgent"),
+            status: "connecting",
+            runtimeMode: "full-access",
+            threadId,
+            activeTurnId: turnId,
+            createdAt: startedAt,
+            updatedAt: startedAt,
+          },
+        ]),
+      readModel: makeReadModel([
+        {
+          id: threadId,
+          latestTurn: {
+            turnId,
+            state: "running",
+            requestedAt: startedAt,
+            startedAt,
+            completedAt: null,
+            assistantMessageId: null,
+          },
+          session: {
+            threadId,
+            status: "running",
+            providerName: "claudeAgent",
+            runtimeMode: "full-access",
+            activeTurnId: turnId,
+            lastError: null,
+            updatedAt: startedAt,
+          },
+        },
+      ]),
+    });
+    await seedActiveRuntimeBinding({ threadId, turnId });
+
+    const reaper = await runtime!.runPromise(Effect.service(ProviderSessionReaper));
+    scope = await runtime!.runPromise(Scope.make("sequential"));
+    await runtime!.runPromise(reaper.start().pipe(Scope.provide(scope)));
+    await runtime!.runPromise(Effect.sleep("30 millis"));
+
+    expect(harness.readModel().threads[0]?.latestTurn?.state).toBe("running");
+    expect(harness.dispatch).not.toHaveBeenCalled();
+    expect(harness.stopSession).not.toHaveBeenCalled();
+  });
+
   it("prefers an exact live turn over a stale same-thread session", async () => {
     const threadId = ThreadId.make("thread-watchdog-replacement-live");
     const turnId = TurnId.make("turn-watchdog-replacement-live");
@@ -1235,13 +1287,13 @@ describe("ProviderSessionReaper", () => {
     ).toBe("running");
   });
 
-  it("does not treat a live session for a different turn as proof of liveness", async () => {
+  it("defers a projected old turn while a live replacement turn owns the thread", async () => {
     const threadId = ThreadId.make("thread-watchdog-mismatched-live-turn");
     const turnId = TurnId.make("turn-watchdog-projected");
     const otherTurnId = TurnId.make("turn-watchdog-provider");
     const startedAt = "2026-01-01T00:00:00.000Z";
     const harness = await createHarness({
-      sweepIntervalMs: 60_000,
+      sweepIntervalMs: 2,
       listSessionsImplementation: () =>
         Effect.succeed([
           {
@@ -1283,13 +1335,14 @@ describe("ProviderSessionReaper", () => {
     const reaper = await runtime!.runPromise(Effect.service(ProviderSessionReaper));
     scope = await runtime!.runPromise(Scope.make("sequential"));
     await runtime!.runPromise(reaper.start().pipe(Scope.provide(scope)));
-    await waitFor(() => harness.readModel().threads[0]?.latestTurn?.state === "error");
+    await runtime!.runPromise(Effect.sleep("30 millis"));
 
     expect(harness.readModel().threads[0]?.latestTurn).toMatchObject({
       turnId,
-      state: "error",
+      state: "running",
     });
-    expect(harness.stopSession).toHaveBeenCalledWith({ threadId });
+    expect(harness.dispatch).not.toHaveBeenCalled();
+    expect(harness.stopSession).not.toHaveBeenCalled();
   });
 
   it("reaps stale persisted sessions without active turns", async () => {

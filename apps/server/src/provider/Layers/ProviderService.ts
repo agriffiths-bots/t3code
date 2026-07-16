@@ -1032,10 +1032,16 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
           currentMcpProviderSessionId ?? boundMcpProviderSessionId;
         const eventMcpProviderSessionId = event.payload.mcpProviderSessionId;
         const bindingActiveTurnId = readPersistedActiveTurnId(previousPayload);
+        const lastTerminalTurnId =
+          typeof previousPayload.lastTerminalTurnId === "string"
+            ? previousPayload.lastTerminalTurnId
+            : undefined;
         if (
-          bindingActiveTurnId !== undefined &&
           event.turnId !== undefined &&
-          event.turnId !== bindingActiveTurnId
+          ((bindingActiveTurnId !== undefined && event.turnId !== bindingActiveTurnId) ||
+            (bindingActiveTurnId === undefined &&
+              lastTerminalTurnId !== undefined &&
+              event.turnId !== lastTerminalTurnId))
         ) {
           return Option.none<ProviderRuntimeEvent>();
         }

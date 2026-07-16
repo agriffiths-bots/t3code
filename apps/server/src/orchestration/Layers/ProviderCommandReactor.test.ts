@@ -3506,7 +3506,10 @@ describe("ProviderCommandReactor", () => {
       thread?.activities.find((activity) => activity.kind === "provider.turn.start.failed"),
     ).toMatchObject({
       turnId: null,
-      payload: { detail: "steer rejected before turn.started" },
+      payload: {
+        detail: "steer rejected before turn.started",
+        turnStartRequestId: expect.any(String),
+      },
     });
   });
 

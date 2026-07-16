@@ -56,8 +56,24 @@ function providerSessionForActiveTurn(
 function liveSessionStillRunsTurn(session: ProviderSession | undefined, turnId: TurnId): boolean {
   return (
     session !== undefined &&
-    (session.status === "running" || session.status === "waiting") &&
+    (session.status === "connecting" ||
+      session.status === "running" ||
+      session.status === "waiting") &&
     session.activeTurnId === turnId
+  );
+}
+
+function nonTerminalSessionForThread(
+  sessions: ReadonlyArray<ProviderSession>,
+  threadId: ThreadId,
+): ProviderSession | undefined {
+  return sessions.find(
+    (session) =>
+      session.threadId === threadId &&
+      (session.status === "connecting" ||
+        session.status === "ready" ||
+        session.status === "running" ||
+        session.status === "waiting"),
   );
 }
 
@@ -82,13 +98,6 @@ function bindingRecordsTerminalTurn(
     typeof payload.lastTerminalTurnId === "string" &&
     payload.lastTerminalTurnId === turnId
   );
-}
-
-function hasReadySessionForThread(
-  sessions: ReadonlyArray<ProviderSession>,
-  threadId: ThreadId,
-): boolean {
-  return sessions.some((session) => session.threadId === threadId && session.status === "ready");
 }
 
 function activeTurnKey(threadId: ThreadId, turnId: TurnId): string {
@@ -355,24 +364,34 @@ const makeProviderSessionReaper = (options?: ProviderSessionReaperLiveOptions) =
           const failedAt = DateTime.formatIso(yield* DateTime.now);
           const expiredApprovalRequestIds = expiredApprovals.map((approval) => approval.requestId);
 
-          // ProviderService can persist terminal runtime state, and the adapter
-          // can become ready, before the projection consumes the canonical event.
-          // Give either disagreement one full sweep for projection catch-up. If
-          // it remains stable, normal liveness/ownership checks resume so a lost
-          // canonical event cannot disable stale-turn healing forever.
+          // ProviderService can persist terminal runtime state, or a replacement
+          // can become live in the adapter, before the projection consumes the
+          // canonical event. Record one full sweep for projection catch-up. A
+          // non-terminal same-thread session remains live evidence after that
+          // sweep and must never be stopped as though the provider disappeared.
           const bindingRecordsTerminal = bindingRecordsTerminalTurn(binding, activeTurnId);
-          const liveSessionIsReady =
-            Option.isSome(liveSessions) &&
-            hasReadySessionForThread(liveSessions.value, binding.threadId);
+          const exactTurnSession = Option.isSome(liveSessions)
+            ? providerSessionForActiveTurn(liveSessions.value, binding.threadId, activeTurnId)
+            : undefined;
+          const nonTerminalThreadSession = Option.isSome(liveSessions)
+            ? nonTerminalSessionForThread(liveSessions.value, binding.threadId)
+            : undefined;
+          const sessionProjectionMayLag =
+            nonTerminalThreadSession !== undefined &&
+            !liveSessionStillRunsTurn(exactTurnSession, activeTurnId);
           if (
-            (bindingRecordsTerminal || liveSessionIsReady) &&
+            (bindingRecordsTerminal || sessionProjectionMayLag) &&
             projectionLagDeferrals.get(binding.threadId) !== activeTurnId
           ) {
             projectionLagDeferrals.set(binding.threadId, activeTurnId);
             continue;
           }
-          if (!bindingRecordsTerminal && !liveSessionIsReady) {
+          if (!bindingRecordsTerminal && !sessionProjectionMayLag) {
             projectionLagDeferrals.delete(binding.threadId);
+          }
+
+          if (sessionProjectionMayLag) {
+            continue;
           }
 
           if (binding.status === "error" || binding.status === "stopped") {
@@ -398,11 +417,7 @@ const makeProviderSessionReaper = (options?: ProviderSessionReaperLiveOptions) =
             continue;
           }
 
-          const liveSession = providerSessionForActiveTurn(
-            liveSessions.value,
-            binding.threadId,
-            activeTurnId,
-          );
+          const liveSession = exactTurnSession;
           if (liveSessionStillRunsTurn(liveSession, activeTurnId)) {
             if (expiredApprovals.length > 0) {
               const oldest = expiredApprovals[0]!;
@@ -431,6 +446,13 @@ const makeProviderSessionReaper = (options?: ProviderSessionReaperLiveOptions) =
               failedAt,
               expiredApprovalRequestIds,
             });
+            continue;
+          }
+
+          // All non-terminal statuses are live or projection-lag evidence. Only
+          // a terminal exact owner or a genuinely absent same-thread session may
+          // reach the failure paths above/below.
+          if (nonTerminalThreadSession !== undefined) {
             continue;
           }
 
