@@ -4288,10 +4288,11 @@ fanout.layer("ProviderServiceLive fanout", (it) => {
     }),
   );
 
-  it.effect("treats a definitively removed provider instance as session absence", () =>
+  it.effect("requires turn ownership when a provider instance is definitively removed", () =>
     Effect.gen(function* () {
       const threadId = asThreadId("thread-removed-instance-cleanup");
       const turnId = asTurnId("turn-removed-instance-cleanup");
+      const staleTurnId = asTurnId("turn-stale-removed-instance-cleanup");
       const removedInstanceId = ProviderInstanceId.make("codex_removed");
       const provider = yield* ProviderService.ProviderService;
       const directory = yield* ProviderSessionDirectory.ProviderSessionDirectory;
@@ -4306,9 +4307,63 @@ fanout.layer("ProviderServiceLive fanout", (it) => {
           sessionOwnershipId: null,
         },
       });
-      let ownedCallbackRan = false;
-      let stoppedCallbackRan = false;
+      let ownedCallbackRuns = 0;
+      let stoppedCallbackRuns = 0;
       const codexStopsBefore = fanout.codex.stopSession.mock.calls.length;
+
+      const staleActiveClaimed = yield* provider.stopFailedSession({
+        threadId,
+        turnId: staleTurnId,
+        reason: "stale cleanup after configured provider instance was removed",
+        requireSessionAbsent: true,
+        onOwned: Effect.sync(() => {
+          ownedCallbackRuns += 1;
+        }),
+        onStopped: Effect.sync(() => {
+          stoppedCallbackRuns += 1;
+        }),
+      });
+      assert.equal(staleActiveClaimed, false);
+      assert.equal(ownedCallbackRuns, 0);
+      assert.equal(stoppedCallbackRuns, 0);
+      const activeBinding = Option.getOrThrow(yield* directory.getBinding(threadId));
+      assert.equal(activeBinding.status, "running");
+      assert.equal(
+        (activeBinding.runtimePayload as { readonly activeTurnId?: unknown }).activeTurnId,
+        turnId,
+      );
+
+      yield* directory.upsert({
+        ...activeBinding,
+        status: "error",
+        runtimePayload: {
+          ...(activeBinding.runtimePayload as Record<string, unknown>),
+          activeTurnId: null,
+          lastTerminalTurnId: turnId,
+        },
+      });
+      const staleTerminalClaimed = yield* provider.stopFailedSession({
+        threadId,
+        turnId: staleTurnId,
+        reason: "stale cleanup after the owned turn became terminal",
+        requireSessionAbsent: true,
+        onOwned: Effect.sync(() => {
+          ownedCallbackRuns += 1;
+        }),
+        onStopped: Effect.sync(() => {
+          stoppedCallbackRuns += 1;
+        }),
+      });
+      assert.equal(staleTerminalClaimed, false);
+      assert.equal(ownedCallbackRuns, 0);
+      assert.equal(stoppedCallbackRuns, 0);
+      const terminalBinding = Option.getOrThrow(yield* directory.getBinding(threadId));
+      assert.equal(terminalBinding.status, "error");
+      assert.equal(
+        (terminalBinding.runtimePayload as { readonly lastTerminalTurnId?: unknown })
+          .lastTerminalTurnId,
+        turnId,
+      );
 
       const claimed = yield* provider.stopFailedSession({
         threadId,
@@ -4316,16 +4371,16 @@ fanout.layer("ProviderServiceLive fanout", (it) => {
         reason: "configured provider instance was removed",
         requireSessionAbsent: true,
         onOwned: Effect.sync(() => {
-          ownedCallbackRan = true;
+          ownedCallbackRuns += 1;
         }),
         onStopped: Effect.sync(() => {
-          stoppedCallbackRan = true;
+          stoppedCallbackRuns += 1;
         }),
       });
 
       assert.equal(claimed, true);
-      assert.equal(ownedCallbackRan, true);
-      assert.equal(stoppedCallbackRan, true);
+      assert.equal(ownedCallbackRuns, 1);
+      assert.equal(stoppedCallbackRuns, 1);
       assert.equal(fanout.codex.stopSession.mock.calls.length, codexStopsBefore);
       const binding = Option.getOrThrow(yield* directory.getBinding(threadId));
       assert.equal(binding.status, "stopped");
@@ -4374,7 +4429,7 @@ fanout.layer("ProviderServiceLive fanout", (it) => {
     }),
   );
 
-  it.effect("requires proven absence before identity-free failed-turn cleanup", () =>
+  it.effect("requires absence and turn ownership for identity-free cleanup", () =>
     Effect.gen(function* () {
       const threadId = asThreadId("thread-failed-cleanup-absence-proof");
       const provider = yield* ProviderService.ProviderService;
@@ -4417,7 +4472,7 @@ fanout.layer("ProviderServiceLive fanout", (it) => {
         runtimePayload: {
           ...(bindingWithoutRuntimeTurn.runtimePayload as Record<string, unknown>),
           activeTurnId: null,
-          lastTerminalTurnId: null,
+          lastTerminalTurnId: turn.turnId,
         },
       });
       fanout.codex.sessions.delete(threadId);

@@ -2617,7 +2617,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
           (input.sendTurnOperationId === undefined &&
             (identityStillOwnsFailure ||
               legacyActiveTurnStillOwnsFailure ||
-              sessionAbsence.sessionIsProvablyAbsent));
+              (sessionAbsence.sessionIsProvablyAbsent && turnStillBelongsToFailure)));
         if (!bindingStillBelongsToFailedTurn) {
           return false;
         }
