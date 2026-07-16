@@ -2,6 +2,7 @@ import {
   type ChatAttachment,
   CommandId,
   EventId,
+  type MessageId,
   type ModelSelection,
   type OrchestrationEvent,
   ProviderDriverKind,
@@ -278,6 +279,7 @@ const make = Effect.gen(function* () {
     readonly createdAt: string;
     readonly requestId?: string;
     readonly turnStartRequestId?: EventId;
+    readonly turnStartMessageId?: MessageId;
   }) =>
     Effect.all({
       commandId: serverCommandId("provider-failure-activity"),
@@ -298,6 +300,9 @@ const make = Effect.gen(function* () {
               ...(input.requestId ? { requestId: input.requestId } : {}),
               ...(input.turnStartRequestId !== undefined
                 ? { turnStartRequestId: input.turnStartRequestId }
+                : {}),
+              ...(input.turnStartMessageId !== undefined
+                ? { turnStartMessageId: input.turnStartMessageId }
                 : {}),
             },
             turnId: input.turnId,
@@ -461,6 +466,7 @@ const make = Effect.gen(function* () {
       readonly sessionOwnershipId?: string;
       readonly sendTurnOperationId?: string;
       readonly turnStartRequestId?: EventId;
+      readonly turnStartMessageId?: MessageId;
       readonly liveSessionLookup: Option.Option<ProviderSession>;
       readonly modelSelection?: ModelSelection;
       readonly runtimeMode?: RuntimeMode;
@@ -539,6 +545,9 @@ const make = Effect.gen(function* () {
               ...(input.turnStartRequestId !== undefined
                 ? { turnStartRequestId: input.turnStartRequestId }
                 : {}),
+              ...(input.turnStartMessageId !== undefined
+                ? { turnStartMessageId: input.turnStartMessageId }
+                : {}),
             });
           }),
           onStopped: setThreadSession({
@@ -616,6 +625,7 @@ const make = Effect.gen(function* () {
     readonly runtimeMode?: RuntimeMode;
     readonly createdAt: string;
     readonly turnStartRequestId: EventId;
+    readonly turnStartMessageId: MessageId;
   }) {
     const latestThread = yield* resolveThread(input.threadId);
     if (!latestThread || latestThread.archivedAt === null) {
@@ -663,6 +673,7 @@ const make = Effect.gen(function* () {
       turnId: null,
       createdAt: cancellationCreatedAt,
       turnStartRequestId: input.turnStartRequestId,
+      turnStartMessageId: input.turnStartMessageId,
     }).pipe(
       Effect.catchCause((cause) =>
         Effect.logWarning("provider command reactor failed to record archived turn cancellation", {
@@ -1214,6 +1225,7 @@ const make = Effect.gen(function* () {
         turnId: null,
         createdAt: event.payload.createdAt,
         turnStartRequestId: event.eventId,
+        turnStartMessageId: event.payload.messageId,
       });
       return;
     }
@@ -1226,6 +1238,7 @@ const make = Effect.gen(function* () {
         runtimeMode: event.payload.runtimeMode,
         createdAt: event.payload.createdAt,
         turnStartRequestId: event.eventId,
+        turnStartMessageId: event.payload.messageId,
       })
     ) {
       return;
@@ -1244,6 +1257,7 @@ const make = Effect.gen(function* () {
         runtimeMode: event.payload.runtimeMode,
         createdAt: event.payload.createdAt,
         turnStartRequestId: event.eventId,
+        turnStartMessageId: event.payload.messageId,
       }))
     ) {
       return;
@@ -1285,6 +1299,7 @@ const make = Effect.gen(function* () {
         runtimeMode: event.payload.runtimeMode,
         createdAt: event.payload.createdAt,
         turnStartRequestId: event.eventId,
+        turnStartMessageId: event.payload.messageId,
       })
     ) {
       return;
@@ -1305,6 +1320,7 @@ const make = Effect.gen(function* () {
           turnId: null,
           createdAt: failedAt,
           turnStartRequestId: event.eventId,
+          turnStartMessageId: event.payload.messageId,
         });
         return;
       }
@@ -1324,6 +1340,7 @@ const make = Effect.gen(function* () {
           turnId: null,
           createdAt: failedAt,
           turnStartRequestId: event.eventId,
+          turnStartMessageId: event.payload.messageId,
         });
         return;
       }
@@ -1382,6 +1399,7 @@ const make = Effect.gen(function* () {
             : {}),
           runtimeMode: event.payload.runtimeMode,
           turnStartRequestId: event.eventId,
+          turnStartMessageId: event.payload.messageId,
         });
       }
 
@@ -1402,6 +1420,7 @@ const make = Effect.gen(function* () {
         turnId: null,
         createdAt: failedAt,
         turnStartRequestId: event.eventId,
+        turnStartMessageId: event.payload.messageId,
       });
     });
 
@@ -1423,6 +1442,7 @@ const make = Effect.gen(function* () {
           threadId: event.payload.threadId,
           createdAt: event.payload.createdAt,
           turnStartRequestId: event.eventId,
+          turnStartMessageId: event.payload.messageId,
         })
       ) {
         return;
@@ -1453,6 +1473,7 @@ const make = Effect.gen(function* () {
           threadId: event.payload.threadId,
           createdAt: event.payload.createdAt,
           turnStartRequestId: event.eventId,
+          turnStartMessageId: event.payload.messageId,
         })
       ) {
         return;

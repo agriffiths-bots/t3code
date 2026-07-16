@@ -92,6 +92,8 @@ export interface ProviderServiceShape {
     readonly sendTurnOperationId?: string;
     /** Fail closed unless the currently bound adapter has no live session. */
     readonly requireSessionAbsent?: boolean;
+    /** Caller has freshly observed a live legacy session owning this exact active turn. */
+    readonly allowLegacyActiveTurnMatch?: boolean;
     /** Runs after ownership is verified, while replacement starts are locked out. */
     readonly onOwned: Effect.Effect<void, E, R>;
     /** Runs after physical cleanup succeeds, before replacement starts are admitted. */

@@ -347,6 +347,7 @@ function makeProviderServiceLayer(options?: ProviderServiceLiveOptions) {
     codex,
     claude,
     cursor,
+    registry,
     layer,
   };
 }
@@ -3648,9 +3649,67 @@ fanout.layer("ProviderServiceLive fanout", (it) => {
     }),
   );
 
-  it.effect("persists and publishes an owning adapter's live session error", () =>
+  it.effect(
+    "persists terminal ownership and publishes an owning adapter's live session error",
+    () =>
+      Effect.gen(function* () {
+        const threadId = asThreadId("thread-live-adapter-session-error");
+        const provider = yield* ProviderService.ProviderService;
+        const directory = yield* ProviderSessionDirectory.ProviderSessionDirectory;
+        yield* provider.startSession(threadId, {
+          provider: ProviderDriverKind.make("codex"),
+          providerInstanceId: codexInstanceId,
+          threadId,
+          runtimeMode: "full-access",
+        });
+        const turn = yield* provider.sendTurn({
+          threadId,
+          input: "fail this provider turn",
+          attachments: [],
+        });
+        const errorEventId = asEventId("evt-live-adapter-session-error");
+        const publishedError = yield* provider.streamEvents.pipe(
+          Stream.filter((event) => event.eventId === errorEventId),
+          Stream.take(1),
+          Stream.runCollect,
+          Effect.forkChild,
+        );
+        yield* advanceTestClock(50);
+
+        fanout.codex.emit({
+          type: "session.state.changed",
+          eventId: errorEventId,
+          provider: ProviderDriverKind.make("codex"),
+          createdAt: "2026-01-01T00:00:10.000Z",
+          threadId,
+          turnId: turn.turnId,
+          payload: {
+            state: "error",
+            reason: "Windows sandbox setup failed",
+          },
+        });
+
+        const publishedEvents = Array.from(yield* Fiber.join(publishedError));
+        assert.equal(publishedEvents[0]?.type, "session.state.changed");
+        assert.equal(fanout.codex.sessions.has(threadId), true);
+        const binding = Option.getOrThrow(yield* directory.getBinding(threadId));
+        const runtimePayload = binding.runtimePayload as {
+          readonly activeTurnId?: unknown;
+          readonly lastError?: unknown;
+          readonly lastRuntimeEvent?: unknown;
+          readonly lastTerminalTurnId?: unknown;
+        };
+        assert.equal(binding.status, "error");
+        assert.equal(runtimePayload.activeTurnId, null);
+        assert.equal(runtimePayload.lastError, "Windows sandbox setup failed");
+        assert.equal(runtimePayload.lastRuntimeEvent, "session.state.changed");
+        assert.equal(runtimePayload.lastTerminalTurnId, turn.turnId);
+      }),
+  );
+
+  it.effect("ignores a stale session error after a replacement turn becomes idle", () =>
     Effect.gen(function* () {
-      const threadId = asThreadId("thread-live-adapter-session-error");
+      const threadId = asThreadId("thread-runtime-stale-state-error");
       const provider = yield* ProviderService.ProviderService;
       const directory = yield* ProviderSessionDirectory.ProviderSessionDirectory;
       yield* provider.startSession(threadId, {
@@ -3659,40 +3718,75 @@ fanout.layer("ProviderServiceLive fanout", (it) => {
         threadId,
         runtimeMode: "full-access",
       });
-      const errorEventId = asEventId("evt-live-adapter-session-error");
-      const publishedError = yield* provider.streamEvents.pipe(
-        Stream.filter((event) => event.eventId === errorEventId),
+      const staleTurn = yield* provider.sendTurn({
+        threadId,
+        input: "old provider turn",
+        attachments: [],
+      });
+      const replacementTurnId = asTurnId("turn-runtime-state-error-replacement");
+      fanout.codex.sendTurn.mockImplementationOnce((input) =>
+        Effect.succeed({ threadId: input.threadId, turnId: replacementTurnId }),
+      );
+      const replacementTurn = yield* provider.sendTurn({
+        threadId,
+        input: "replacement provider turn",
+        attachments: [],
+      });
+
+      fanout.codex.emit({
+        type: "turn.completed",
+        eventId: asEventId("evt-runtime-state-error-replacement-completed"),
+        provider: ProviderDriverKind.make("codex"),
+        createdAt: "2026-01-01T00:00:11.000Z",
+        threadId,
+        turnId: replacementTurn.turnId,
+        payload: { state: "completed" },
+      });
+      yield* advanceTestClock(500);
+
+      const staleEventId = asEventId("evt-runtime-stale-state-error");
+      const sentinelEventId = asEventId("evt-runtime-after-stale-state-error");
+      const published = yield* provider.streamEvents.pipe(
+        Stream.filter(
+          (event) => event.eventId === staleEventId || event.eventId === sentinelEventId,
+        ),
         Stream.take(1),
         Stream.runCollect,
         Effect.forkChild,
       );
       yield* advanceTestClock(50);
-
       fanout.codex.emit({
         type: "session.state.changed",
-        eventId: errorEventId,
+        eventId: staleEventId,
         provider: ProviderDriverKind.make("codex"),
-        createdAt: "2026-01-01T00:00:10.000Z",
+        createdAt: "2026-01-01T00:00:12.000Z",
         threadId,
-        payload: {
-          state: "error",
-          reason: "Windows sandbox setup failed",
-        },
+        turnId: staleTurn.turnId,
+        payload: { state: "error", reason: "old provider turn failed late" },
       });
+      fanout.codex.emit({
+        type: "session.started",
+        eventId: sentinelEventId,
+        provider: ProviderDriverKind.make("codex"),
+        createdAt: "2026-01-01T00:00:13.000Z",
+        threadId,
+        payload: {},
+      });
+      const publishedEvents = Array.from(yield* Fiber.join(published));
+      assert.equal(publishedEvents[0]?.eventId, sentinelEventId);
 
-      const publishedEvents = Array.from(yield* Fiber.join(publishedError));
-      assert.equal(publishedEvents[0]?.type, "session.state.changed");
-      assert.equal(fanout.codex.sessions.has(threadId), true);
       const binding = Option.getOrThrow(yield* directory.getBinding(threadId));
       const runtimePayload = binding.runtimePayload as {
         readonly activeTurnId?: unknown;
         readonly lastError?: unknown;
         readonly lastRuntimeEvent?: unknown;
+        readonly lastTerminalTurnId?: unknown;
       };
-      assert.equal(binding.status, "error");
+      assert.equal(binding.status, "running");
       assert.equal(runtimePayload.activeTurnId, null);
-      assert.equal(runtimePayload.lastError, "Windows sandbox setup failed");
-      assert.equal(runtimePayload.lastRuntimeEvent, "session.state.changed");
+      assert.equal(runtimePayload.lastError, undefined);
+      assert.equal(runtimePayload.lastRuntimeEvent, "turn.completed");
+      assert.equal(runtimePayload.lastTerminalTurnId, replacementTurn.turnId);
     }),
   );
 
@@ -4133,7 +4227,209 @@ fanout.layer("ProviderServiceLive fanout", (it) => {
     }),
   );
 
-  it.effect("requires proven absence before identity-free failed-turn cleanup", () =>
+  it.effect("accepts only an exact active-turn match for legacy failed-session cleanup", () =>
+    Effect.gen(function* () {
+      const threadId = asThreadId("thread-legacy-active-turn-cleanup");
+      const provider = yield* ProviderService.ProviderService;
+      const directory = yield* ProviderSessionDirectory.ProviderSessionDirectory;
+      yield* provider.startSession(threadId, {
+        provider: ProviderDriverKind.make("codex"),
+        providerInstanceId: codexInstanceId,
+        threadId,
+        runtimeMode: "full-access",
+      });
+      const turn = yield* provider.sendTurn({
+        threadId,
+        input: "legacy provider turn",
+        attachments: [],
+      });
+      const binding = Option.getOrThrow(yield* directory.getBinding(threadId));
+      yield* directory.upsert({
+        ...binding,
+        runtimePayload: {
+          ...(binding.runtimePayload as Record<string, unknown>),
+          sessionOwnershipId: null,
+        },
+      });
+
+      let ownedCallbackRan = false;
+      const staleClaimed = yield* provider.stopFailedSession({
+        threadId,
+        turnId: asTurnId("turn-other-legacy-owner"),
+        reason: "stale legacy cleanup",
+        allowLegacyActiveTurnMatch: true,
+        onOwned: Effect.sync(() => {
+          ownedCallbackRan = true;
+        }),
+        onStopped: Effect.void,
+      });
+      assert.equal(staleClaimed, false);
+      assert.equal(ownedCallbackRan, false);
+      assert.equal(fanout.codex.sessions.has(threadId), true);
+
+      let stoppedCallbackRan = false;
+      const exactClaimed = yield* provider.stopFailedSession({
+        threadId,
+        turnId: turn.turnId,
+        reason: "legacy approval timed out",
+        allowLegacyActiveTurnMatch: true,
+        onOwned: Effect.sync(() => {
+          ownedCallbackRan = true;
+        }),
+        onStopped: Effect.sync(() => {
+          stoppedCallbackRan = true;
+        }),
+      });
+      assert.equal(exactClaimed, true);
+      assert.equal(ownedCallbackRan, true);
+      assert.equal(stoppedCallbackRan, true);
+      assert.equal(fanout.codex.sessions.has(threadId), false);
+      assert.equal(Option.getOrThrow(yield* directory.getBinding(threadId)).status, "stopped");
+    }),
+  );
+
+  it.effect("requires turn ownership when a provider instance is definitively removed", () =>
+    Effect.gen(function* () {
+      const threadId = asThreadId("thread-removed-instance-cleanup");
+      const turnId = asTurnId("turn-removed-instance-cleanup");
+      const staleTurnId = asTurnId("turn-stale-removed-instance-cleanup");
+      const removedInstanceId = ProviderInstanceId.make("codex_removed");
+      const provider = yield* ProviderService.ProviderService;
+      const directory = yield* ProviderSessionDirectory.ProviderSessionDirectory;
+      yield* directory.upsert({
+        threadId,
+        provider: ProviderDriverKind.make("codex"),
+        providerInstanceId: removedInstanceId,
+        runtimeMode: "full-access",
+        status: "running",
+        runtimePayload: {
+          activeTurnId: turnId,
+          sessionOwnershipId: null,
+        },
+      });
+      let ownedCallbackRuns = 0;
+      let stoppedCallbackRuns = 0;
+      const codexStopsBefore = fanout.codex.stopSession.mock.calls.length;
+
+      const staleActiveClaimed = yield* provider.stopFailedSession({
+        threadId,
+        turnId: staleTurnId,
+        reason: "stale cleanup after configured provider instance was removed",
+        requireSessionAbsent: true,
+        onOwned: Effect.sync(() => {
+          ownedCallbackRuns += 1;
+        }),
+        onStopped: Effect.sync(() => {
+          stoppedCallbackRuns += 1;
+        }),
+      });
+      assert.equal(staleActiveClaimed, false);
+      assert.equal(ownedCallbackRuns, 0);
+      assert.equal(stoppedCallbackRuns, 0);
+      const activeBinding = Option.getOrThrow(yield* directory.getBinding(threadId));
+      assert.equal(activeBinding.status, "running");
+      assert.equal(
+        (activeBinding.runtimePayload as { readonly activeTurnId?: unknown }).activeTurnId,
+        turnId,
+      );
+
+      yield* directory.upsert({
+        ...activeBinding,
+        status: "error",
+        runtimePayload: {
+          ...(activeBinding.runtimePayload as Record<string, unknown>),
+          activeTurnId: null,
+          lastTerminalTurnId: turnId,
+        },
+      });
+      const staleTerminalClaimed = yield* provider.stopFailedSession({
+        threadId,
+        turnId: staleTurnId,
+        reason: "stale cleanup after the owned turn became terminal",
+        requireSessionAbsent: true,
+        onOwned: Effect.sync(() => {
+          ownedCallbackRuns += 1;
+        }),
+        onStopped: Effect.sync(() => {
+          stoppedCallbackRuns += 1;
+        }),
+      });
+      assert.equal(staleTerminalClaimed, false);
+      assert.equal(ownedCallbackRuns, 0);
+      assert.equal(stoppedCallbackRuns, 0);
+      const terminalBinding = Option.getOrThrow(yield* directory.getBinding(threadId));
+      assert.equal(terminalBinding.status, "error");
+      assert.equal(
+        (terminalBinding.runtimePayload as { readonly lastTerminalTurnId?: unknown })
+          .lastTerminalTurnId,
+        turnId,
+      );
+
+      const claimed = yield* provider.stopFailedSession({
+        threadId,
+        turnId,
+        reason: "configured provider instance was removed",
+        requireSessionAbsent: true,
+        onOwned: Effect.sync(() => {
+          ownedCallbackRuns += 1;
+        }),
+        onStopped: Effect.sync(() => {
+          stoppedCallbackRuns += 1;
+        }),
+      });
+
+      assert.equal(claimed, true);
+      assert.equal(ownedCallbackRuns, 1);
+      assert.equal(stoppedCallbackRuns, 1);
+      assert.equal(fanout.codex.stopSession.mock.calls.length, codexStopsBefore);
+      const binding = Option.getOrThrow(yield* directory.getBinding(threadId));
+      assert.equal(binding.status, "stopped");
+      assert.equal(
+        (binding.runtimePayload as { readonly lastRuntimeEvent?: unknown }).lastRuntimeEvent,
+        "provider.turn.watchdog.instance-absent",
+      );
+    }),
+  );
+
+  it.effect("defers failed-session cleanup when provider instance lookup is ambiguous", () =>
+    Effect.gen(function* () {
+      const threadId = asThreadId("thread-transient-instance-lookup");
+      const turnId = asTurnId("turn-transient-instance-lookup");
+      const provider = yield* ProviderService.ProviderService;
+      const directory = yield* ProviderSessionDirectory.ProviderSessionDirectory;
+      yield* directory.upsert({
+        threadId,
+        provider: ProviderDriverKind.make("codex"),
+        providerInstanceId: codexInstanceId,
+        runtimeMode: "full-access",
+        status: "running",
+        runtimePayload: { activeTurnId: turnId },
+      });
+      const lookup = vi
+        .spyOn(fanout.registry, "getByInstance")
+        .mockImplementationOnce(() => Effect.die("transient registry lookup failure") as never);
+      let ownedCallbackRan = false;
+      const cleanupExit = yield* provider
+        .stopFailedSession({
+          threadId,
+          turnId,
+          reason: "ambiguous provider instance lookup",
+          requireSessionAbsent: true,
+          onOwned: Effect.sync(() => {
+            ownedCallbackRan = true;
+          }),
+          onStopped: Effect.void,
+        })
+        .pipe(Effect.exit);
+      lookup.mockRestore();
+
+      assert.equal(Exit.isFailure(cleanupExit), true);
+      assert.equal(ownedCallbackRan, false);
+      assert.equal(Option.getOrThrow(yield* directory.getBinding(threadId)).status, "running");
+    }),
+  );
+
+  it.effect("requires absence and turn ownership for identity-free cleanup", () =>
     Effect.gen(function* () {
       const threadId = asThreadId("thread-failed-cleanup-absence-proof");
       const provider = yield* ProviderService.ProviderService;
@@ -4176,7 +4472,7 @@ fanout.layer("ProviderServiceLive fanout", (it) => {
         runtimePayload: {
           ...(bindingWithoutRuntimeTurn.runtimePayload as Record<string, unknown>),
           activeTurnId: null,
-          lastTerminalTurnId: null,
+          lastTerminalTurnId: turn.turnId,
         },
       });
       fanout.codex.sessions.delete(threadId);
