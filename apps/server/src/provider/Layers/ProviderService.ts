@@ -9,6 +9,7 @@
  *
  * @module ProviderServiceLive
  */
+import * as NodeCrypto from "node:crypto";
 import {
   ModelSelection,
   NonNegativeInt,
@@ -32,9 +33,11 @@ import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as PubSub from "effect/PubSub";
 import * as Ref from "effect/Ref";
+import * as Semaphore from "effect/Semaphore";
 import * as Schema from "effect/Schema";
 import * as SchemaIssue from "effect/SchemaIssue";
 import * as Stream from "effect/Stream";
+import * as SynchronizedRef from "effect/SynchronizedRef";
 
 import {
   increment,
@@ -46,7 +49,12 @@ import {
   providerTurnMetricAttributes,
   withMetrics,
 } from "../../observability/Metrics.ts";
-import { type ProviderAdapterError, ProviderValidationError } from "../Errors.ts";
+import {
+  type ProviderAdapterError,
+  ProviderSessionStartTimeoutError,
+  ProviderSendTurnFailedError,
+  ProviderValidationError,
+} from "../Errors.ts";
 import type { ProviderAdapterShape } from "../Services/ProviderAdapter.ts";
 import * as ProviderAdapterRegistry from "../Services/ProviderAdapterRegistry.ts";
 import * as ProviderService from "../Services/ProviderService.ts";
@@ -68,6 +76,8 @@ const supportsActiveTurnResume = (provider: ProviderDriverKind): boolean => prov
  */
 export interface ProviderServiceLiveOptions {
   readonly canonicalEventLogger?: EventNdjsonLogger;
+  /** Maximum time external provider startup may hold the per-thread recovery lock. */
+  readonly sessionStartTimeoutMs?: number;
 }
 
 type ProviderServiceMethod<Name extends keyof ProviderService.ProviderService["Service"]> =
@@ -151,8 +161,10 @@ function toRuntimePayloadFromSession(
   extra?: {
     readonly modelSelection?: unknown;
     readonly detached?: boolean;
+    readonly mcpProviderSessionId?: string;
     readonly lastRuntimeEvent?: string;
     readonly lastRuntimeEventAt?: string;
+    readonly sessionOwnershipId?: string;
   },
 ): Record<string, unknown> {
   return {
@@ -162,10 +174,18 @@ function toRuntimePayloadFromSession(
     lastError: session.lastError ?? null,
     ...(extra?.modelSelection !== undefined ? { modelSelection: extra.modelSelection } : {}),
     ...(extra?.detached !== undefined ? { detached: extra.detached } : {}),
+    ...(extra?.mcpProviderSessionId !== undefined
+      ? { mcpProviderSessionId: extra.mcpProviderSessionId }
+      : {}),
     ...(extra?.lastRuntimeEvent !== undefined ? { lastRuntimeEvent: extra.lastRuntimeEvent } : {}),
     ...(extra?.lastRuntimeEventAt !== undefined
       ? { lastRuntimeEventAt: extra.lastRuntimeEventAt }
       : {}),
+    sessionOwnershipId: extra?.sessionOwnershipId ?? NodeCrypto.randomUUID(),
+    sendTurnOperationId: null,
+    lastFailedSendTurnOperationId: null,
+    lastTerminalTurnId: null,
+    unconfirmedSessionExit: null,
   };
 }
 
@@ -365,6 +385,10 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
   const runtimeEventPubSub = yield* PubSub.unbounded<ProviderRuntimeEvent>();
   const nowIso = Effect.map(DateTime.now, DateTime.formatIso);
   const mcpEndCleanupRetryDelay = "250 millis";
+  const sessionExitLivenessPollDelay = "50 millis";
+  const sessionExitLivenessProbeTimeout = "50 millis";
+  const sessionExitLivenessPollAttempts = 5;
+  const sessionStartTimeoutMs = Math.max(1, options?.sessionStartTimeoutMs ?? 10 * 60 * 1_000);
   const adapterGenerations = yield* Ref.make(
     new Map<ProviderInstanceId, AdapterGenerationRecord>(),
   );
@@ -372,6 +396,85 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
     new Map<ProviderInstanceId, Map<ThreadId, TrackedMcpSessionRecord>>(),
   );
   const pendingMcpSessionStarts = yield* Ref.make(new Map<ThreadId, number>());
+  const activeSendTurnOperations = yield* Ref.make(new Map<ThreadId, string>());
+  const threadSessionLocks = yield* SynchronizedRef.make(
+    new Map<ThreadId, { readonly semaphore: Semaphore.Semaphore; readonly users: number }>(),
+  );
+  const getThreadSessionLock = (threadId: ThreadId) =>
+    SynchronizedRef.modifyEffect(threadSessionLocks, (current) => {
+      const existing = current.get(threadId);
+      if (existing !== undefined) {
+        const next = new Map(current);
+        const acquired = { ...existing, users: existing.users + 1 };
+        next.set(threadId, acquired);
+        return Effect.succeed([acquired, next] as const);
+      }
+      return Semaphore.make(1).pipe(
+        Effect.map((semaphore) => {
+          const next = new Map(current);
+          const acquired = { semaphore, users: 1 };
+          next.set(threadId, acquired);
+          return [acquired, next] as const;
+        }),
+      );
+    });
+  const releaseThreadSessionLock = (threadId: ThreadId, semaphore: Semaphore.Semaphore) =>
+    SynchronizedRef.update(threadSessionLocks, (current) => {
+      const existing = current.get(threadId);
+      if (existing === undefined || existing.semaphore !== semaphore) return current;
+      const next = new Map(current);
+      if (existing.users <= 1) {
+        next.delete(threadId);
+      } else {
+        next.set(threadId, { ...existing, users: existing.users - 1 });
+      }
+      return next;
+    });
+  const withThreadSessionLock = <A, E, R>(threadId: ThreadId, effect: Effect.Effect<A, E, R>) =>
+    Effect.acquireUseRelease(
+      getThreadSessionLock(threadId),
+      ({ semaphore }) => semaphore.withPermit(effect),
+      ({ semaphore }) => releaseThreadSessionLock(threadId, semaphore),
+    );
+  const releaseSendTurnOperation = (threadId: ThreadId, operationId: string) =>
+    withThreadSessionLock(
+      threadId,
+      Effect.gen(function* () {
+        yield* Ref.update(activeSendTurnOperations, (current) => {
+          if (current.get(threadId) !== operationId) return current;
+          const next = new Map(current);
+          next.delete(threadId);
+          return next;
+        });
+        const binding = Option.getOrUndefined(yield* directory.getBinding(threadId));
+        const runtimePayload = readRecord(binding?.runtimePayload) ?? {};
+        if (binding === undefined || runtimePayload.sendTurnOperationId !== operationId) {
+          return;
+        }
+        yield* directory.upsert({
+          threadId,
+          provider: binding.provider,
+          ...(binding.providerInstanceId !== undefined
+            ? { providerInstanceId: binding.providerInstanceId }
+            : {}),
+          runtimeMode: binding.runtimeMode ?? "full-access",
+          status: binding.status ?? "running",
+          ...(binding.resumeCursor !== undefined ? { resumeCursor: binding.resumeCursor } : {}),
+          runtimePayload: {
+            ...runtimePayload,
+            sendTurnOperationId: null,
+          },
+        });
+      }),
+    ).pipe(
+      Effect.catchCause((cause) =>
+        Effect.logWarning("provider.session.send-turn-operation-release-failed", {
+          threadId,
+          operationId,
+          cause,
+        }),
+      ),
+    );
   const beginMcpSessionStart = (threadId: ThreadId) =>
     Ref.update(pendingMcpSessionStarts, (current) => {
       const next = new Map(current);
@@ -697,8 +800,10 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
     extra?: {
       readonly modelSelection?: unknown;
       readonly detached?: boolean;
+      readonly mcpProviderSessionId?: string;
       readonly lastRuntimeEvent?: string;
       readonly lastRuntimeEventAt?: string;
+      readonly sessionOwnershipId?: string;
     },
   ) =>
     Effect.gen(function* () {
@@ -733,42 +838,92 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
       });
     });
 
+  const providerSessionIsProvablyGone = Effect.fn("ProviderService.providerSessionIsProvablyGone")(
+    function* (input: {
+      readonly adapter: ProviderAdapterShape<ProviderAdapterError>;
+      readonly provider: ProviderDriverKind;
+      readonly threadId: ThreadId;
+    }) {
+      let adapterStillOwnsSession = Option.some(true);
+      for (
+        let attempt = 0;
+        attempt < sessionExitLivenessPollAttempts &&
+        Option.isSome(adapterStillOwnsSession) &&
+        adapterStillOwnsSession.value;
+        attempt += 1
+      ) {
+        yield* Effect.sleep(sessionExitLivenessPollDelay);
+        adapterStillOwnsSession = yield* input.adapter.hasSession(input.threadId).pipe(
+          Effect.timeoutOption(sessionExitLivenessProbeTimeout),
+          Effect.catchCause((cause) =>
+            Effect.logWarning("provider.session.exit-liveness-check-failed", {
+              threadId: input.threadId,
+              provider: input.provider,
+              cause,
+            }).pipe(Effect.as(Option.none<boolean>())),
+          ),
+        );
+        if (Option.isNone(adapterStillOwnsSession)) {
+          yield* Effect.logWarning("provider.session.exit-liveness-check-unavailable", {
+            threadId: input.threadId,
+            provider: input.provider,
+          });
+        }
+      }
+      return Option.isSome(adapterStillOwnsSession) && !adapterStillOwnsSession.value;
+    },
+  );
+
   const persistSessionStateRuntimeState = (
     source: {
       readonly instanceId: ProviderInstanceId;
       readonly provider: ProviderDriverKind;
       readonly adapterGeneration: number;
+      readonly adapter: ProviderAdapterShape<ProviderAdapterError>;
     },
     event: ProviderRuntimeEvent,
   ) => {
     if (event.type !== "session.state.changed") {
-      return Effect.void;
+      return Effect.succeed(true);
     }
     const resumeCursor = readResumeCursorFromRuntimeDetail(event.payload.detail);
-    if (event.payload.state !== "waiting" && resumeCursor === undefined) {
-      return Effect.void;
+    const terminalSessionState =
+      event.payload.state === "error" || event.payload.state === "stopped";
+    if (!terminalSessionState && event.payload.state !== "waiting" && resumeCursor === undefined) {
+      return Effect.succeed(true);
     }
 
-    return Effect.gen(function* () {
+    const persistState = Effect.gen(function* () {
       if (!(yield* isCurrentAdapterGeneration(source.instanceId, source.adapterGeneration))) {
-        return;
+        return false;
       }
-      const binding = Option.getOrUndefined(
-        yield* directory
-          .getBinding(event.threadId)
-          .pipe(
-            Effect.orElseSucceed(() =>
-              Option.none<ProviderSessionDirectory.ProviderRuntimeBinding>(),
-            ),
-          ),
-      );
+      const binding = Option.getOrUndefined(yield* directory.getBinding(event.threadId));
       if (
         binding !== undefined &&
         (binding.provider !== source.provider || binding.providerInstanceId !== source.instanceId)
       ) {
-        return;
+        return false;
       }
       const previousPayload = readRecord(binding?.runtimePayload) ?? {};
+      const bindingActiveTurnId = readPersistedActiveTurnId(previousPayload);
+      if (
+        terminalSessionState &&
+        bindingActiveTurnId !== undefined &&
+        event.turnId !== undefined &&
+        event.turnId !== bindingActiveTurnId
+      ) {
+        return false;
+      }
+      if (
+        terminalSessionState &&
+        !(yield* providerSessionIsProvablyGone({
+          adapter: source.adapter,
+          provider: source.provider,
+          threadId: event.threadId,
+        }))
+      ) {
+        return false;
+      }
       const nextActiveTurnId =
         event.payload.state === "waiting" || event.payload.state === "running"
           ? (event.turnId ?? null)
@@ -787,11 +942,141 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
         runtimePayload: {
           ...previousPayload,
           activeTurnId: nextActiveTurnId,
+          ...(terminalSessionState ? { sendTurnOperationId: null } : {}),
           lastRuntimeEvent: event.type,
           lastRuntimeEventAt: event.createdAt,
         },
       });
+      return true;
     });
+    return terminalSessionState
+      ? withThreadSessionLock(event.threadId, persistState)
+      : persistState;
+  };
+
+  const persistSessionExitRuntimeState = (
+    source: {
+      readonly instanceId: ProviderInstanceId;
+      readonly provider: ProviderDriverKind;
+      readonly adapterGeneration: number;
+      readonly adapter: ProviderAdapterShape<ProviderAdapterError>;
+    },
+    event: ProviderRuntimeEvent,
+    onAccepted: (event: ProviderRuntimeEvent) => Effect.Effect<void>,
+  ) => {
+    if (event.type !== "session.exited") {
+      return Effect.succeed(Option.some(event));
+    }
+
+    return withThreadSessionLock(
+      event.threadId,
+      Effect.gen(function* () {
+        if (!(yield* isCurrentAdapterGeneration(source.instanceId, source.adapterGeneration))) {
+          return Option.none<ProviderRuntimeEvent>();
+        }
+        // Ownership checks must fail closed: treating a transient read error
+        // as an absent binding could let an old exit overwrite a replacement.
+        const binding = Option.getOrUndefined(yield* directory.getBinding(event.threadId));
+        if (
+          binding !== undefined &&
+          (binding.provider !== source.provider || binding.providerInstanceId !== source.instanceId)
+        ) {
+          return Option.none<ProviderRuntimeEvent>();
+        }
+        const previousPayload = readRecord(binding?.runtimePayload) ?? {};
+        const boundMcpProviderSessionId =
+          typeof previousPayload.mcpProviderSessionId === "string"
+            ? previousPayload.mcpProviderSessionId
+            : undefined;
+        const currentMcpSession = McpProviderSession.readMcpProviderSession(event.threadId);
+        const currentMcpProviderSessionId =
+          currentMcpSession?.providerInstanceId === source.instanceId
+            ? currentMcpSession.providerSessionId
+            : undefined;
+        const authoritativeMcpProviderSessionId =
+          currentMcpProviderSessionId ?? boundMcpProviderSessionId;
+        const eventMcpProviderSessionId = event.payload.mcpProviderSessionId;
+        const bindingActiveTurnId = readPersistedActiveTurnId(previousPayload);
+        if (
+          bindingActiveTurnId !== undefined &&
+          event.turnId !== undefined &&
+          event.turnId !== bindingActiveTurnId
+        ) {
+          return Option.none<ProviderRuntimeEvent>();
+        }
+        if (eventMcpProviderSessionId === undefined) {
+          // Adapter cleanup can lag event emission under load. Poll for a
+          // definitive disappearance instead of relying on one timing sample.
+          // An exact turn id is insufficient because a replacement may resume
+          // that same provider turn; a still-live session therefore makes any
+          // session-id-less exit ambiguous.
+          // If ownership stays ambiguous, persist the observation so the
+          // watchdog can reconcile it from later live-session snapshots.
+          if (
+            !(yield* providerSessionIsProvablyGone({
+              adapter: source.adapter,
+              provider: source.provider,
+              threadId: event.threadId,
+            }))
+          ) {
+            if (binding !== undefined) {
+              yield* directory.upsert({
+                threadId: event.threadId,
+                provider: binding.provider,
+                providerInstanceId: source.instanceId,
+                runtimeMode: binding.runtimeMode ?? "full-access",
+                status: binding.status ?? "running",
+                ...(binding.resumeCursor !== undefined
+                  ? { resumeCursor: binding.resumeCursor }
+                  : {}),
+                runtimePayload: {
+                  ...previousPayload,
+                  unconfirmedSessionExit: {
+                    eventId: event.eventId,
+                    observedAt: event.createdAt,
+                    ...(event.payload.reason !== undefined ? { reason: event.payload.reason } : {}),
+                  },
+                },
+              });
+            }
+            return Option.none<ProviderRuntimeEvent>();
+          }
+        }
+        if (
+          eventMcpProviderSessionId !== undefined &&
+          authoritativeMcpProviderSessionId !== undefined &&
+          eventMcpProviderSessionId !== authoritativeMcpProviderSessionId
+        ) {
+          return Option.none<ProviderRuntimeEvent>();
+        }
+        const activeTurnId = previousPayload.activeTurnId;
+        const correlatedTurnId = event.turnId ?? bindingActiveTurnId;
+        yield* directory.upsert({
+          threadId: event.threadId,
+          provider: source.provider,
+          providerInstanceId: source.instanceId,
+          runtimeMode: binding?.runtimeMode ?? "full-access",
+          status: event.payload.exitKind === "error" ? "error" : "stopped",
+          ...(binding?.resumeCursor !== undefined ? { resumeCursor: binding.resumeCursor } : {}),
+          runtimePayload: {
+            ...previousPayload,
+            activeTurnId: null,
+            sendTurnOperationId: null,
+            ...(activeTurnId !== null && activeTurnId !== undefined
+              ? { lastTerminalTurnId: activeTurnId }
+              : {}),
+            ...(event.payload.reason !== undefined ? { lastError: event.payload.reason } : {}),
+            lastRuntimeEvent: event.type,
+            lastRuntimeEventAt: event.createdAt,
+            unconfirmedSessionExit: null,
+          },
+        });
+        const canonicalEvent =
+          correlatedTurnId === undefined ? event : { ...event, turnId: correlatedTurnId };
+        yield* onAccepted(canonicalEvent);
+        return Option.some<ProviderRuntimeEvent>(canonicalEvent);
+      }),
+    );
   };
 
   const persistTerminalTurnRuntimeState = (
@@ -929,139 +1214,313 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
     });
   };
 
+  const registerSendTurnOperation = Effect.fn("ProviderService.registerSendTurnOperation")(
+    function* (input: {
+      readonly source: {
+        readonly instanceId: ProviderInstanceId;
+        readonly provider: ProviderDriverKind;
+      };
+      readonly threadId: ThreadId;
+    }) {
+      return yield* withThreadSessionLock(
+        input.threadId,
+        Effect.gen(function* () {
+          const binding = Option.getOrUndefined(yield* directory.getBinding(input.threadId));
+          if (
+            binding === undefined ||
+            binding.provider !== input.source.provider ||
+            binding.providerInstanceId !== input.source.instanceId
+          ) {
+            return yield* toValidationError(
+              "ProviderService.sendTurn",
+              `Provider binding changed before send-turn registration for thread '${input.threadId}'.`,
+            );
+          }
+          const currentPayload = readRecord(binding.runtimePayload) ?? {};
+          const sessionOwnershipId =
+            typeof currentPayload.sessionOwnershipId === "string"
+              ? currentPayload.sessionOwnershipId
+              : NodeCrypto.randomUUID();
+          const activeOperationId = (yield* Ref.get(activeSendTurnOperations)).get(input.threadId);
+          if (
+            activeOperationId !== undefined &&
+            currentPayload.sendTurnOperationId === activeOperationId
+          ) {
+            return yield* new ProviderSendTurnFailedError({
+              provider: input.source.provider,
+              threadId: input.threadId,
+              detail: "Another session/prompt request is already in flight for this thread.",
+              sessionOwnershipId,
+              superseded: true,
+              overlapping: true,
+            });
+          }
+          const operationId = NodeCrypto.randomUUID();
+          yield* directory.upsert({
+            threadId: input.threadId,
+            provider: binding.provider,
+            providerInstanceId: input.source.instanceId,
+            runtimeMode: binding.runtimeMode ?? "full-access",
+            status: binding.status ?? "running",
+            ...(binding.resumeCursor !== undefined ? { resumeCursor: binding.resumeCursor } : {}),
+            runtimePayload: {
+              ...currentPayload,
+              sessionOwnershipId,
+              sendTurnOperationId: operationId,
+              lastFailedSendTurnOperationId: null,
+            },
+          });
+          yield* Ref.update(activeSendTurnOperations, (current) => {
+            const next = new Map(current);
+            next.set(input.threadId, operationId);
+            return next;
+          });
+          return { sessionOwnershipId, operationId } as const;
+        }),
+      );
+    },
+  );
+
   const clearFailedSendTurnRuntimeState = (
     source: {
       readonly instanceId: ProviderInstanceId;
       readonly provider: ProviderDriverKind;
-      readonly adapter: ProviderAdapterShape<ProviderAdapterError>;
     },
     threadId: ThreadId,
-    previousBinding: ProviderSessionDirectory.ProviderRuntimeBinding | undefined,
+    ownership: {
+      readonly sessionOwnershipId: string;
+      readonly operationId: string;
+    },
+    errorMessage: string,
   ) =>
-    Effect.gen(function* () {
-      const binding = Option.getOrUndefined(
-        yield* directory
-          .getBinding(threadId)
-          .pipe(
-            Effect.orElseSucceed(() =>
-              Option.none<ProviderSessionDirectory.ProviderRuntimeBinding>(),
-            ),
-          ),
-      );
-      if (!binding) {
-        return;
-      }
-      if (
-        binding.provider !== source.provider ||
-        binding.providerInstanceId !== source.instanceId
-      ) {
-        return;
-      }
-
-      const currentPayload = readRecord(binding.runtimePayload) ?? {};
-      if (currentPayload.lastRuntimeEvent !== "turn.started") {
-        return;
-      }
-      const currentActiveTurnId = currentPayload.activeTurnId;
-      if (currentActiveTurnId === null || currentActiveTurnId === undefined) {
-        return;
-      }
-      const liveActiveTurnId = yield* Effect.gen(function* () {
-        if (!(yield* source.adapter.hasSession(threadId))) {
-          return undefined;
+    withThreadSessionLock(
+      threadId,
+      Effect.gen(function* () {
+        const binding = Option.getOrUndefined(yield* directory.getBinding(threadId));
+        if (
+          binding === undefined ||
+          binding.provider !== source.provider ||
+          binding.providerInstanceId !== source.instanceId
+        ) {
+          return { superseded: true } as const;
         }
-        const sessions = yield* source.adapter.listSessions();
-        return sessions.find((session) => session.threadId === threadId)?.activeTurnId;
-      });
-      if (
-        liveActiveTurnId !== undefined &&
-        String(liveActiveTurnId) === String(currentActiveTurnId)
-      ) {
-        return;
-      }
 
-      const previousPayload = readRecord(previousBinding?.runtimePayload) ?? {};
-      const previousActiveTurnId = previousPayload.activeTurnId;
-      const restoredPayload: Record<string, unknown> = {
-        ...currentPayload,
-        activeTurnId: previousActiveTurnId ?? null,
-        lastRuntimeEvent: previousPayload.lastRuntimeEvent ?? "provider.sendTurn.failed",
-      };
-      if (previousPayload.lastRuntimeEventAt !== undefined) {
-        restoredPayload.lastRuntimeEventAt = previousPayload.lastRuntimeEventAt;
-      } else {
-        restoredPayload.lastRuntimeEventAt = yield* nowIso;
-      }
+        const currentPayload = readRecord(binding.runtimePayload) ?? {};
+        if (
+          currentPayload.sessionOwnershipId !== ownership.sessionOwnershipId ||
+          currentPayload.sendTurnOperationId !== ownership.operationId
+        ) {
+          return { superseded: true } as const;
+        }
+        // Single-flight registration means any active turn on this binding
+        // still belongs to this operation even if a later state notification
+        // replaced `turn.started` as the most recent runtime event.
+        const currentActiveTurnId =
+          typeof currentPayload.activeTurnId === "string"
+            ? TurnId.make(currentPayload.activeTurnId)
+            : undefined;
+        const failedAt = yield* nowIso;
+        yield* directory.upsert({
+          threadId,
+          provider: source.provider,
+          providerInstanceId: source.instanceId,
+          runtimeMode: binding.runtimeMode ?? "full-access",
+          status: currentActiveTurnId === undefined ? (binding.status ?? "running") : "error",
+          ...(binding.resumeCursor !== undefined ? { resumeCursor: binding.resumeCursor } : {}),
+          runtimePayload: {
+            ...currentPayload,
+            activeTurnId: null,
+            sendTurnOperationId: null,
+            lastFailedSendTurnOperationId: ownership.operationId,
+            lastError: errorMessage,
+            ...(currentActiveTurnId !== undefined
+              ? { lastTerminalTurnId: currentActiveTurnId }
+              : {}),
+            lastRuntimeEvent: "provider.sendTurn.failed",
+            lastRuntimeEventAt: failedAt,
+          },
+        });
+        return {
+          superseded: false,
+          ...(currentActiveTurnId !== undefined ? { turnId: currentActiveTurnId } : {}),
+        } as const;
+      }),
+    );
 
-      yield* directory.upsert({
-        threadId,
-        provider: source.provider,
-        providerInstanceId: source.instanceId,
-        runtimeMode: binding.runtimeMode ?? "full-access",
-        status: previousBinding?.status ?? binding.status ?? "running",
-        ...(binding.resumeCursor !== undefined ? { resumeCursor: binding.resumeCursor } : {}),
-        runtimePayload: restoredPayload,
+  const shouldFenceRuntimeEventAfterSendFailure = Effect.fn(
+    "ProviderService.shouldFenceRuntimeEventAfterSendFailure",
+  )(function* (
+    source: {
+      readonly instanceId: ProviderInstanceId;
+      readonly provider: ProviderDriverKind;
+    },
+    event: ProviderRuntimeEvent,
+  ) {
+    const canReviveFailedSend =
+      event.type === "turn.started" ||
+      (event.type === "session.state.changed" &&
+        (event.payload.state === "starting" ||
+          event.payload.state === "running" ||
+          event.payload.state === "waiting"));
+    if (!canReviveFailedSend) return false;
+
+    const binding = Option.getOrUndefined(yield* directory.getBinding(event.threadId));
+    if (
+      binding === undefined ||
+      binding.provider !== source.provider ||
+      binding.providerInstanceId !== source.instanceId
+    ) {
+      return false;
+    }
+    const runtimePayload = readRecord(binding.runtimePayload) ?? {};
+    return (
+      typeof runtimePayload.lastFailedSendTurnOperationId === "string" &&
+      runtimePayload.sendTurnOperationId === null
+    );
+  });
+
+  const handleAcceptedRuntimeEvent = Effect.fn("ProviderService.handleAcceptedRuntimeEvent")(
+    function* (
+      source: {
+        readonly instanceId: ProviderInstanceId;
+        readonly provider: ProviderDriverKind;
+        readonly adapterGeneration: number;
+        readonly adapter: ProviderAdapterShape<ProviderAdapterError>;
+      },
+      canonicalEvent: ProviderRuntimeEvent,
+      sessionEndContext?: {
+        readonly providerSessionId?: string;
+        readonly duringPendingStart: boolean;
+      },
+    ) {
+      const handleEvent = Effect.gen(function* () {
+        const shouldFence = yield* shouldFenceRuntimeEventAfterSendFailure(
+          source,
+          canonicalEvent,
+        ).pipe(
+          Effect.catchCause((cause) =>
+            Effect.logWarning("provider.session.failed-send-fence-read-failed", {
+              threadId: canonicalEvent.threadId,
+              provider: canonicalEvent.provider,
+              cause,
+            }).pipe(Effect.as(true)),
+          ),
+        );
+        if (shouldFence) {
+          yield* Effect.logDebug("provider.session.failed-send-runtime-event-ignored", {
+            threadId: canonicalEvent.threadId,
+            provider: canonicalEvent.provider,
+            eventId: canonicalEvent.eventId,
+            eventType: canonicalEvent.type,
+          });
+          return;
+        }
+        const sessionStateAccepted = yield* persistSessionStateRuntimeState(
+          source,
+          canonicalEvent,
+        ).pipe(
+          Effect.catchCause((cause) =>
+            Effect.logWarning("provider.session.state-persist-failed", {
+              threadId: canonicalEvent.threadId,
+              provider: canonicalEvent.provider,
+              cause,
+            }).pipe(Effect.as(false)),
+          ),
+        );
+        if (!sessionStateAccepted) return;
+        yield* persistStartedTurnRuntimeState(source, canonicalEvent).pipe(
+          Effect.catchCause((cause) =>
+            Effect.logWarning("provider.session.turn-start-persist-failed", {
+              threadId: canonicalEvent.threadId,
+              provider: canonicalEvent.provider,
+              cause,
+            }),
+          ),
+        );
+        yield* persistTerminalTurnRuntimeState(source, canonicalEvent).pipe(
+          Effect.catchCause((cause) =>
+            Effect.logWarning("provider.session.terminal-turn-persist-failed", {
+              threadId: canonicalEvent.threadId,
+              provider: canonicalEvent.provider,
+              cause,
+            }),
+          ),
+        );
+        yield* increment(providerRuntimeEventsTotal, {
+          provider: canonicalEvent.provider,
+          eventType: canonicalEvent.type,
+        });
+        if (sessionEndContext !== undefined) {
+          yield* clearMcpSessionAfterProviderSessionEnds(source, canonicalEvent, {
+            ...(sessionEndContext.providerSessionId !== undefined
+              ? { providerSessionId: sessionEndContext.providerSessionId }
+              : {}),
+            duringPendingStart: sessionEndContext.duringPendingStart,
+          }).pipe(Effect.forkDetach, Effect.asVoid);
+        }
+        yield* publishRuntimeEvent(canonicalEvent);
       });
-    });
+
+      const mustOrderAgainstSendFailure =
+        canonicalEvent.type === "turn.started" ||
+        (canonicalEvent.type === "session.state.changed" &&
+          canonicalEvent.payload.state !== "error" &&
+          canonicalEvent.payload.state !== "stopped");
+      yield* mustOrderAgainstSendFailure
+        ? withThreadSessionLock(canonicalEvent.threadId, handleEvent)
+        : handleEvent;
+    },
+  );
 
   const processRuntimeEvent = (
     source: {
       readonly instanceId: ProviderInstanceId;
       readonly provider: ProviderDriverKind;
       readonly adapterGeneration: number;
+      readonly adapter: ProviderAdapterShape<ProviderAdapterError>;
     },
     event: ProviderRuntimeEvent,
   ): Effect.Effect<void> =>
     Effect.sync(() => correlateRuntimeEventWithInstance(source, event)).pipe(
-      Effect.flatMap((canonicalEvent) =>
+      Effect.flatMap((uncorrelatedEvent) =>
         Effect.gen(function* () {
-          const isSessionEnd = isProviderSessionEndEvent(canonicalEvent);
+          const isSessionEnd = isProviderSessionEndEvent(uncorrelatedEvent);
           const observedMcpSession = isSessionEnd
-            ? McpProviderSession.readMcpProviderSession(canonicalEvent.threadId)
+            ? McpProviderSession.readMcpProviderSession(uncorrelatedEvent.threadId)
             : undefined;
           const observedDuringPendingStart = isSessionEnd
-            ? yield* hasPendingMcpSessionStart(canonicalEvent.threadId)
+            ? yield* hasPendingMcpSessionStart(uncorrelatedEvent.threadId)
             : false;
-          yield* persistSessionStateRuntimeState(source, canonicalEvent).pipe(
-            Effect.catchCause((cause) =>
-              Effect.logWarning("provider.session.state-persist-failed", {
-                threadId: canonicalEvent.threadId,
-                provider: canonicalEvent.provider,
-                cause,
-              }),
-            ),
-          );
-          yield* persistStartedTurnRuntimeState(source, canonicalEvent).pipe(
-            Effect.catchCause((cause) =>
-              Effect.logWarning("provider.session.turn-start-persist-failed", {
-                threadId: canonicalEvent.threadId,
-                provider: canonicalEvent.provider,
-                cause,
-              }),
-            ),
-          );
-          yield* persistTerminalTurnRuntimeState(source, canonicalEvent).pipe(
-            Effect.catchCause((cause) =>
-              Effect.logWarning("provider.session.terminal-turn-persist-failed", {
-                threadId: canonicalEvent.threadId,
-                provider: canonicalEvent.provider,
-                cause,
-              }),
-            ),
-          );
-          yield* increment(providerRuntimeEventsTotal, {
-            provider: canonicalEvent.provider,
-            eventType: canonicalEvent.type,
-          });
           if (isSessionEnd) {
-            yield* clearMcpSessionAfterProviderSessionEnds(source, canonicalEvent, {
-              ...(observedMcpSession
-                ? { providerSessionId: observedMcpSession.providerSessionId }
-                : {}),
-              duringPendingStart: observedDuringPendingStart,
-            }).pipe(Effect.forkDetach, Effect.asVoid);
+            const correlatedSessionExit = yield* persistSessionExitRuntimeState(
+              source,
+              uncorrelatedEvent,
+              (canonicalEvent) =>
+                handleAcceptedRuntimeEvent(source, canonicalEvent, {
+                  ...(observedMcpSession !== undefined
+                    ? { providerSessionId: observedMcpSession.providerSessionId }
+                    : {}),
+                  duringPendingStart: observedDuringPendingStart,
+                }),
+            ).pipe(
+              Effect.catchCause((cause) =>
+                Effect.logWarning("provider.session.exit-persist-failed", {
+                  threadId: uncorrelatedEvent.threadId,
+                  provider: uncorrelatedEvent.provider,
+                  cause,
+                }).pipe(Effect.as(Option.none<ProviderRuntimeEvent>())),
+              ),
+            );
+            if (Option.isNone(correlatedSessionExit)) {
+              yield* Effect.logDebug("provider.session.stale-exit-ignored", {
+                threadId: uncorrelatedEvent.threadId,
+                provider: uncorrelatedEvent.provider,
+                eventId: uncorrelatedEvent.eventId,
+              });
+            }
+            return;
           }
-          yield* publishRuntimeEvent(canonicalEvent);
+          yield* handleAcceptedRuntimeEvent(source, uncorrelatedEvent);
         }),
       ),
     );
@@ -1107,6 +1566,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
               instanceId: id,
               provider: adapter.provider,
               adapterGeneration,
+              adapter,
             },
             event,
           ),
@@ -1375,156 +1835,238 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
         "provider.thread_id": threadId,
         "provider.runtime_mode": parsed.runtimeMode,
       });
-      return yield* Effect.gen(function* () {
-        const instanceInfo = yield* registry.getInstanceInfo(resolvedInstanceId);
-        const resolvedProvider = instanceInfo.driverKind;
-        metricProvider = resolvedProvider;
-        if (parsed.provider !== undefined && parsed.provider !== resolvedProvider) {
-          return yield* toValidationError(
-            "ProviderService.startSession",
-            `Provider instance '${resolvedInstanceId}' belongs to driver '${resolvedProvider}', not '${parsed.provider}'.`,
-          );
-        }
-        const input = {
-          ...parsed,
-          threadId,
-          provider: resolvedProvider,
-        };
-        if (!instanceInfo.enabled) {
-          return yield* toValidationError(
-            "ProviderService.startSession",
-            `Provider instance '${resolvedInstanceId}' is disabled in T3 Code settings.`,
-          );
-        }
-        const persistedBinding = Option.getOrUndefined(yield* directory.getBinding(threadId));
-        const effectiveResumeCursor =
-          input.resumeCursor ??
-          (persistedBinding?.providerInstanceId === resolvedInstanceId
-            ? persistedBinding.resumeCursor
-            : undefined);
-        const effectiveCwd =
-          input.cwd ??
-          (persistedBinding?.providerInstanceId === resolvedInstanceId
-            ? readPersistedCwd(persistedBinding.runtimePayload)
-            : undefined);
-        const effectiveDetached =
-          input.detached ??
-          (persistedBinding?.providerInstanceId === resolvedInstanceId
-            ? readPersistedDetached(persistedBinding.runtimePayload)
-            : undefined);
-        const usesPersistedResumeCursor =
-          effectiveResumeCursor !== undefined &&
-          persistedBinding?.providerInstanceId === resolvedInstanceId &&
-          persistedBinding.resumeCursor !== null &&
-          persistedBinding.resumeCursor !== undefined &&
-          resumeCursorEquals(effectiveResumeCursor, persistedBinding.resumeCursor);
-        const persistedActiveTurnId =
-          supportsActiveTurnResume(resolvedProvider) &&
-          usesPersistedResumeCursor &&
-          persistedBinding !== undefined
-            ? readPersistedActiveTurnId(persistedBinding.runtimePayload)
+      return yield* withThreadSessionLock(
+        threadId,
+        Effect.gen(function* () {
+          const instanceInfo = yield* registry.getInstanceInfo(resolvedInstanceId);
+          const resolvedProvider = instanceInfo.driverKind;
+          metricProvider = resolvedProvider;
+          if (parsed.provider !== undefined && parsed.provider !== resolvedProvider) {
+            return yield* toValidationError(
+              "ProviderService.startSession",
+              `Provider instance '${resolvedInstanceId}' belongs to driver '${resolvedProvider}', not '${parsed.provider}'.`,
+            );
+          }
+          const input = {
+            ...parsed,
+            threadId,
+            provider: resolvedProvider,
+          };
+          if (!instanceInfo.enabled) {
+            return yield* toValidationError(
+              "ProviderService.startSession",
+              `Provider instance '${resolvedInstanceId}' is disabled in T3 Code settings.`,
+            );
+          }
+          const persistedBinding = Option.getOrUndefined(yield* directory.getBinding(threadId));
+          let persistedRuntimePayload = readRecord(persistedBinding?.runtimePayload) ?? {};
+          let persistedBindingNeedsUpdate = false;
+          if (
+            typeof persistedRuntimePayload.sendTurnOperationId === "string" &&
+            persistedRuntimePayload.sendTurnOperationId.length > 0 &&
+            persistedBinding !== undefined
+          ) {
+            const activeOperationId = (yield* Ref.get(activeSendTurnOperations)).get(threadId);
+            if (
+              persistedBinding.status !== "error" &&
+              persistedBinding.status !== "stopped" &&
+              activeOperationId === persistedRuntimePayload.sendTurnOperationId
+            ) {
+              return yield* toValidationError(
+                "ProviderService.startSession",
+                `Cannot replace provider session for thread '${threadId}' while session/prompt is in flight. Retry after the prompt settles.`,
+              );
+            }
+            // A persisted token without the matching in-process operation is
+            // crash residue, not liveness evidence. Reconcile it before the
+            // replacement starts so a restart cannot wedge recovery forever.
+            persistedRuntimePayload = {
+              ...persistedRuntimePayload,
+              sendTurnOperationId: null,
+            };
+            persistedBindingNeedsUpdate = true;
+          }
+          let persistedSessionOwnershipId =
+            typeof persistedRuntimePayload.sessionOwnershipId === "string"
+              ? persistedRuntimePayload.sessionOwnershipId
+              : undefined;
+          if (persistedBinding !== undefined && persistedSessionOwnershipId === undefined) {
+            persistedSessionOwnershipId = NodeCrypto.randomUUID();
+            persistedRuntimePayload = {
+              ...persistedRuntimePayload,
+              sessionOwnershipId: persistedSessionOwnershipId,
+            };
+            persistedBindingNeedsUpdate = true;
+          }
+          if (persistedBinding !== undefined && persistedBindingNeedsUpdate) {
+            yield* directory.upsert({
+              threadId,
+              provider: persistedBinding.provider,
+              ...(persistedBinding.providerInstanceId !== undefined
+                ? { providerInstanceId: persistedBinding.providerInstanceId }
+                : {}),
+              runtimeMode: persistedBinding.runtimeMode ?? "full-access",
+              status: persistedBinding.status ?? "running",
+              ...(persistedBinding.resumeCursor !== undefined
+                ? { resumeCursor: persistedBinding.resumeCursor }
+                : {}),
+              runtimePayload: persistedRuntimePayload,
+            });
+          }
+          const effectiveResumeCursor =
+            input.resumeCursor ??
+            (persistedBinding?.providerInstanceId === resolvedInstanceId
+              ? persistedBinding.resumeCursor
+              : undefined);
+          const effectiveCwd =
+            input.cwd ??
+            (persistedBinding?.providerInstanceId === resolvedInstanceId
+              ? readPersistedCwd(persistedBinding.runtimePayload)
+              : undefined);
+          const effectiveDetached =
+            input.detached ??
+            (persistedBinding?.providerInstanceId === resolvedInstanceId
+              ? readPersistedDetached(persistedBinding.runtimePayload)
+              : undefined);
+          const usesPersistedResumeCursor =
+            effectiveResumeCursor !== undefined &&
+            persistedBinding?.providerInstanceId === resolvedInstanceId &&
+            persistedBinding.resumeCursor !== null &&
+            persistedBinding.resumeCursor !== undefined &&
+            resumeCursorEquals(effectiveResumeCursor, persistedBinding.resumeCursor);
+          const persistedActiveTurnId =
+            supportsActiveTurnResume(resolvedProvider) &&
+            usesPersistedResumeCursor &&
+            persistedBinding !== undefined
+              ? readPersistedActiveTurnId(persistedBinding.runtimePayload)
+              : undefined;
+          const effectiveActiveTurnId = supportsActiveTurnResume(resolvedProvider)
+            ? (input.activeTurnId ?? persistedActiveTurnId)
             : undefined;
-        const effectiveActiveTurnId = supportsActiveTurnResume(resolvedProvider)
-          ? (input.activeTurnId ?? persistedActiveTurnId)
-          : undefined;
-        yield* Effect.annotateCurrentSpan({
-          "provider.kind": resolvedProvider,
-          "provider.resume_cursor.source":
-            input.resumeCursor !== undefined
-              ? "request"
-              : effectiveResumeCursor !== undefined &&
-                  persistedBinding?.providerInstanceId === resolvedInstanceId
-                ? "persisted"
-                : "none",
-          "provider.resume_cursor.present": effectiveResumeCursor !== undefined,
-          "provider.cwd.source":
-            input.cwd !== undefined
-              ? "request"
-              : effectiveCwd !== undefined &&
-                  persistedBinding?.providerInstanceId === resolvedInstanceId
-                ? "persisted"
-                : "none",
-          "provider.cwd.effective": effectiveCwd ?? "",
-          "provider.session.detached": effectiveDetached === true,
-        });
-        const adapter = yield* registry.getByInstance(resolvedInstanceId);
-        const adapterGeneration = yield* getAdapterGenerationForStart(resolvedInstanceId, adapter);
-        if (adapterGeneration === 0) {
-          return yield* toValidationError(
-            "ProviderService.startSession",
-            `Provider instance '${resolvedInstanceId}' was replaced before starting thread '${threadId}'. Retry the start.`,
-          );
-        }
-        yield* beginMcpSessionStart(threadId);
-        let preparedMcpSession: McpProviderSession.McpProviderSessionConfig | undefined;
-        const session = yield* Effect.gen(function* () {
-          preparedMcpSession = yield* prepareMcpSession(threadId, resolvedInstanceId);
-          return yield* adapter.startSession({
-            ...input,
-            providerInstanceId: resolvedInstanceId,
-            ...(effectiveCwd !== undefined ? { cwd: effectiveCwd } : {}),
-            ...(effectiveResumeCursor !== undefined ? { resumeCursor: effectiveResumeCursor } : {}),
-            ...(effectiveDetached !== undefined ? { detached: effectiveDetached } : {}),
-            ...(effectiveActiveTurnId !== undefined ? { activeTurnId: effectiveActiveTurnId } : {}),
+          yield* Effect.annotateCurrentSpan({
+            "provider.kind": resolvedProvider,
+            "provider.resume_cursor.source":
+              input.resumeCursor !== undefined
+                ? "request"
+                : effectiveResumeCursor !== undefined &&
+                    persistedBinding?.providerInstanceId === resolvedInstanceId
+                  ? "persisted"
+                  : "none",
+            "provider.resume_cursor.present": effectiveResumeCursor !== undefined,
+            "provider.cwd.source":
+              input.cwd !== undefined
+                ? "request"
+                : effectiveCwd !== undefined &&
+                    persistedBinding?.providerInstanceId === resolvedInstanceId
+                  ? "persisted"
+                  : "none",
+            "provider.cwd.effective": effectiveCwd ?? "",
+            "provider.session.detached": effectiveDetached === true,
           });
+          const adapter = yield* registry.getByInstance(resolvedInstanceId);
+          const adapterGeneration = yield* getAdapterGenerationForStart(
+            resolvedInstanceId,
+            adapter,
+          );
+          if (adapterGeneration === 0) {
+            return yield* toValidationError(
+              "ProviderService.startSession",
+              `Provider instance '${resolvedInstanceId}' was replaced before starting thread '${threadId}'. Retry the start.`,
+            );
+          }
+          yield* beginMcpSessionStart(threadId);
+          let preparedMcpSession: McpProviderSession.McpProviderSessionConfig | undefined;
+          const session = yield* Effect.gen(function* () {
+            preparedMcpSession = yield* prepareMcpSession(threadId, resolvedInstanceId);
+            const startedSession = yield* adapter
+              .startSession({
+                ...input,
+                providerInstanceId: resolvedInstanceId,
+                ...(effectiveCwd !== undefined ? { cwd: effectiveCwd } : {}),
+                ...(effectiveResumeCursor !== undefined
+                  ? { resumeCursor: effectiveResumeCursor }
+                  : {}),
+                ...(effectiveDetached !== undefined ? { detached: effectiveDetached } : {}),
+                ...(effectiveActiveTurnId !== undefined
+                  ? { activeTurnId: effectiveActiveTurnId }
+                  : {}),
+              })
+              .pipe(Effect.timeoutOption(sessionStartTimeoutMs));
+            if (Option.isNone(startedSession)) {
+              const detail = `Provider startup timed out after ${sessionStartTimeoutMs}ms.`;
+              return yield* new ProviderSessionStartTimeoutError({
+                provider: resolvedProvider,
+                threadId,
+                detail,
+                timeoutMs: sessionStartTimeoutMs,
+                ...(persistedSessionOwnershipId !== undefined
+                  ? { sessionOwnershipId: persistedSessionOwnershipId }
+                  : {}),
+              });
+            }
+            return startedSession.value;
+          }).pipe(
+            Effect.onError(() =>
+              clearPreparedMcpSession(threadId, resolvedInstanceId, preparedMcpSession),
+            ),
+            Effect.ensuring(endMcpSessionStart(threadId)),
+          );
+
+          if (session.provider !== adapter.provider) {
+            yield* clearPreparedMcpSession(threadId, resolvedInstanceId, preparedMcpSession);
+            return yield* toValidationError(
+              "ProviderService.startSession",
+              `Adapter/provider mismatch: requested '${adapter.provider}', received '${session.provider}'.`,
+            );
+          }
+          if (!(yield* isCurrentAdapterGeneration(resolvedInstanceId, adapterGeneration))) {
+            yield* stopSupersededAdapterSession(adapter, threadId, resolvedInstanceId);
+            yield* clearPreparedMcpSession(threadId, resolvedInstanceId, preparedMcpSession);
+            return yield* toValidationError(
+              "ProviderService.startSession",
+              `Provider instance '${resolvedInstanceId}' was replaced while starting thread '${threadId}'. Retry the start.`,
+            );
+          }
+          yield* trackMcpSession(threadId, resolvedInstanceId, adapterGeneration);
+          const sessionWithInstance = withActiveTurnFallback(
+            {
+              ...session,
+              providerInstanceId: resolvedInstanceId,
+            },
+            effectiveActiveTurnId,
+          );
+
+          yield* stopStaleSessionsForThread({
+            threadId,
+            currentInstanceId: resolvedInstanceId,
+          });
+          yield* upsertSessionBinding(sessionWithInstance, threadId, {
+            modelSelection: input.modelSelection,
+            ...(effectiveDetached !== undefined ? { detached: effectiveDetached } : {}),
+            ...(preparedMcpSession !== undefined
+              ? { mcpProviderSessionId: preparedMcpSession.providerSessionId }
+              : {}),
+          });
+          yield* analytics.record("provider.session.started", {
+            provider: sessionWithInstance.provider,
+            runtimeMode: input.runtimeMode,
+            hasResumeCursor: sessionWithInstance.resumeCursor !== undefined,
+            hasCwd: typeof effectiveCwd === "string" && effectiveCwd.trim().length > 0,
+            hasModel:
+              typeof input.modelSelection?.model === "string" &&
+              input.modelSelection.model.trim().length > 0,
+          });
+
+          return sessionWithInstance;
         }).pipe(
-          Effect.onError(() =>
-            clearPreparedMcpSession(threadId, resolvedInstanceId, preparedMcpSession),
-          ),
-          Effect.ensuring(endMcpSessionStart(threadId)),
-        );
-
-        if (session.provider !== adapter.provider) {
-          yield* clearPreparedMcpSession(threadId, resolvedInstanceId, preparedMcpSession);
-          return yield* toValidationError(
-            "ProviderService.startSession",
-            `Adapter/provider mismatch: requested '${adapter.provider}', received '${session.provider}'.`,
-          );
-        }
-        if (!(yield* isCurrentAdapterGeneration(resolvedInstanceId, adapterGeneration))) {
-          yield* stopSupersededAdapterSession(adapter, threadId, resolvedInstanceId);
-          yield* clearPreparedMcpSession(threadId, resolvedInstanceId, preparedMcpSession);
-          return yield* toValidationError(
-            "ProviderService.startSession",
-            `Provider instance '${resolvedInstanceId}' was replaced while starting thread '${threadId}'. Retry the start.`,
-          );
-        }
-        yield* trackMcpSession(threadId, resolvedInstanceId, adapterGeneration);
-        const sessionWithInstance = withActiveTurnFallback(
-          {
-            ...session,
-            providerInstanceId: resolvedInstanceId,
-          },
-          effectiveActiveTurnId,
-        );
-
-        yield* stopStaleSessionsForThread({
-          threadId,
-          currentInstanceId: resolvedInstanceId,
-        });
-        yield* upsertSessionBinding(sessionWithInstance, threadId, {
-          modelSelection: input.modelSelection,
-          ...(effectiveDetached !== undefined ? { detached: effectiveDetached } : {}),
-        });
-        yield* analytics.record("provider.session.started", {
-          provider: sessionWithInstance.provider,
-          runtimeMode: input.runtimeMode,
-          hasResumeCursor: sessionWithInstance.resumeCursor !== undefined,
-          hasCwd: typeof effectiveCwd === "string" && effectiveCwd.trim().length > 0,
-          hasModel:
-            typeof input.modelSelection?.model === "string" &&
-            input.modelSelection.model.trim().length > 0,
-        });
-
-        return sessionWithInstance;
-      }).pipe(
-        withMetrics({
-          counter: providerSessionsTotal,
-          attributes: () =>
-            providerMetricAttributes(metricProvider, {
-              operation: "start",
-            }),
-        }),
+          withMetrics({
+            counter: providerSessionsTotal,
+            attributes: () =>
+              providerMetricAttributes(metricProvider, {
+                operation: "start",
+              }),
+          }),
+        ),
       );
     },
   );
@@ -1566,68 +2108,149 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
         "provider.kind": routed.adapter.provider,
         ...(input.modelSelection?.model ? { "provider.model": input.modelSelection.model } : {}),
       });
-      const bindingBeforeSend = Option.getOrUndefined(
-        yield* directory
-          .getBinding(input.threadId)
-          .pipe(
-            Effect.orElseSucceed(() =>
-              Option.none<ProviderSessionDirectory.ProviderRuntimeBinding>(),
-            ),
-          ),
-      );
-      const turn = yield* routed.adapter.sendTurn(input).pipe(
-        Effect.catch((error) =>
-          clearFailedSendTurnRuntimeState(
-            {
-              provider: routed.adapter.provider,
-              instanceId: routed.instanceId,
-              adapter: routed.adapter,
-            },
-            input.threadId,
-            bindingBeforeSend,
-          ).pipe(
-            Effect.catchCause((cause) =>
-              Effect.logWarning("provider.session.send-turn-failure-cleanup-failed", {
-                threadId: input.threadId,
-                provider: routed.adapter.provider,
-                cause,
-              }),
-            ),
-            Effect.andThen(Effect.fail(error)),
-          ),
-        ),
-      );
-      const binding = Option.getOrUndefined(
-        yield* directory
-          .getBinding(input.threadId)
-          .pipe(
-            Effect.orElseSucceed(() =>
-              Option.none<ProviderSessionDirectory.ProviderRuntimeBinding>(),
-            ),
-          ),
-      );
-      const persistedPayload = readRecord(binding?.runtimePayload) ?? {};
-      const lastTerminalTurnId = persistedPayload.lastTerminalTurnId;
-      const turnAlreadyTerminated =
-        lastTerminalTurnId !== null &&
-        lastTerminalTurnId !== undefined &&
-        String(lastTerminalTurnId) === String(turn.turnId);
-      const runtimePayloadPatch: Record<string, unknown> = {
-        ...(input.modelSelection !== undefined ? { modelSelection: input.modelSelection } : {}),
-        activeTurnId: turnAlreadyTerminated ? null : turn.turnId,
-      };
-      if (!turnAlreadyTerminated) {
-        runtimePayloadPatch.lastRuntimeEvent = "provider.sendTurn";
-        runtimePayloadPatch.lastRuntimeEventAt = yield* nowIso;
-      }
-      yield* directory.upsert({
+      const sendTurnOwnership = yield* registerSendTurnOperation({
+        source: {
+          provider: routed.adapter.provider,
+          instanceId: routed.instanceId,
+        },
         threadId: input.threadId,
-        provider: routed.adapter.provider,
-        providerInstanceId: routed.instanceId,
-        status: "running",
-        ...(turn.resumeCursor !== undefined ? { resumeCursor: turn.resumeCursor } : {}),
-        runtimePayload: mergeRuntimePayload(binding?.runtimePayload, runtimePayloadPatch),
       });
+      const turn = yield* Effect.gen(function* () {
+        const acceptedTurn = yield* routed.adapter.sendTurn(input).pipe(
+          Effect.catch((error) =>
+            clearFailedSendTurnRuntimeState(
+              {
+                provider: routed.adapter.provider,
+                instanceId: routed.instanceId,
+              },
+              input.threadId,
+              sendTurnOwnership,
+              error.message,
+            ).pipe(
+              Effect.catchCause((cause) =>
+                Effect.logWarning("provider.session.send-turn-failure-cleanup-failed", {
+                  threadId: input.threadId,
+                  provider: routed.adapter.provider,
+                  cause,
+                }).pipe(Effect.as({ superseded: false } as const)),
+              ),
+              Effect.flatMap((failure) =>
+                Effect.fail(
+                  new ProviderSendTurnFailedError({
+                    provider: routed.adapter.provider,
+                    threadId: input.threadId,
+                    detail: error.message,
+                    sessionOwnershipId: sendTurnOwnership.sessionOwnershipId,
+                    sendTurnOperationId: sendTurnOwnership.operationId,
+                    ...("turnId" in failure && failure.turnId !== undefined
+                      ? { turnId: failure.turnId }
+                      : {}),
+                    superseded: failure.superseded,
+                    cause: error,
+                  }),
+                ),
+              ),
+            ),
+          ),
+        );
+        const sendTurnResultPersisted = yield* withThreadSessionLock(
+          input.threadId,
+          Effect.gen(function* () {
+            const binding = Option.getOrUndefined(yield* directory.getBinding(input.threadId));
+            const persistedPayload = readRecord(binding?.runtimePayload) ?? {};
+            if (
+              binding === undefined ||
+              binding.provider !== routed.adapter.provider ||
+              binding.providerInstanceId !== routed.instanceId ||
+              persistedPayload.sessionOwnershipId !== sendTurnOwnership.sessionOwnershipId
+            ) {
+              return { _tag: "superseded" } as const;
+            }
+            if (binding.status === "error" || binding.status === "stopped") {
+              // A correlated session exit or failed cleanup won while the
+              // adapter request was in flight. Retire only this operation token;
+              // never resurrect the dead session as running on late success.
+              yield* directory.upsert({
+                threadId: input.threadId,
+                provider: binding.provider,
+                providerInstanceId: routed.instanceId,
+                runtimeMode: binding.runtimeMode ?? "full-access",
+                status: binding.status,
+                ...(binding.resumeCursor !== undefined
+                  ? { resumeCursor: binding.resumeCursor }
+                  : {}),
+                runtimePayload: {
+                  ...persistedPayload,
+                  sendTurnOperationId: null,
+                  lastFailedSendTurnOperationId: sendTurnOwnership.operationId,
+                },
+              });
+              return {
+                _tag: "terminal",
+                detail:
+                  typeof persistedPayload.lastError === "string"
+                    ? persistedPayload.lastError
+                    : "Provider session became terminal before session/prompt returned.",
+              } as const;
+            }
+            if (persistedPayload.sendTurnOperationId !== sendTurnOwnership.operationId) {
+              return { _tag: "superseded" } as const;
+            }
+            const lastTerminalTurnId = persistedPayload.lastTerminalTurnId;
+            const turnAlreadyTerminated =
+              lastTerminalTurnId !== null &&
+              lastTerminalTurnId !== undefined &&
+              String(lastTerminalTurnId) === String(acceptedTurn.turnId);
+            const runtimePayloadPatch: Record<string, unknown> = {
+              ...(input.modelSelection !== undefined
+                ? { modelSelection: input.modelSelection }
+                : {}),
+              activeTurnId: turnAlreadyTerminated ? null : acceptedTurn.turnId,
+              sendTurnOperationId: null,
+            };
+            if (!turnAlreadyTerminated) {
+              runtimePayloadPatch.lastRuntimeEvent = "provider.sendTurn";
+              runtimePayloadPatch.lastRuntimeEventAt = yield* nowIso;
+            }
+            yield* directory.upsert({
+              threadId: input.threadId,
+              provider: routed.adapter.provider,
+              providerInstanceId: routed.instanceId,
+              status: binding.status === "waiting" ? "waiting" : "running",
+              ...(acceptedTurn.resumeCursor !== undefined
+                ? { resumeCursor: acceptedTurn.resumeCursor }
+                : {}),
+              runtimePayload: mergeRuntimePayload(binding.runtimePayload, runtimePayloadPatch),
+            });
+            return { _tag: "persisted" } as const;
+          }),
+        );
+        if (sendTurnResultPersisted._tag === "terminal") {
+          return yield* new ProviderSendTurnFailedError({
+            provider: routed.adapter.provider,
+            threadId: input.threadId,
+            detail: sendTurnResultPersisted.detail,
+            sessionOwnershipId: sendTurnOwnership.sessionOwnershipId,
+            sendTurnOperationId: sendTurnOwnership.operationId,
+            turnId: acceptedTurn.turnId,
+            superseded: false,
+          });
+        }
+        if (sendTurnResultPersisted._tag === "superseded") {
+          return yield* new ProviderSendTurnFailedError({
+            provider: routed.adapter.provider,
+            threadId: input.threadId,
+            detail: "Provider session ownership changed after session/prompt was accepted.",
+            sessionOwnershipId: sendTurnOwnership.sessionOwnershipId,
+            sendTurnOperationId: sendTurnOwnership.operationId,
+            turnId: acceptedTurn.turnId,
+            superseded: true,
+          });
+        }
+        return acceptedTurn;
+      }).pipe(
+        Effect.ensuring(releaseSendTurnOperation(input.threadId, sendTurnOwnership.operationId)),
+      );
       yield* analytics.record("provider.turn.sent", {
         provider: routed.adapter.provider,
         model: input.modelSelection?.model,
@@ -1801,6 +2424,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
           status: "stopped",
           runtimePayload: mergeRuntimePayload(binding?.runtimePayload, {
             activeTurnId: null,
+            sendTurnOperationId: null,
           }),
         });
         yield* analytics.record("provider.session.stopped", {
@@ -1817,6 +2441,102 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
       );
     },
   );
+
+  const stopFailedSession: ProviderService.ProviderServiceShape["stopFailedSession"] = Effect.fn(
+    "ProviderService.stopFailedSession",
+  )(function* (input) {
+    return yield* withThreadSessionLock(
+      input.threadId,
+      Effect.gen(function* () {
+        const binding = Option.getOrUndefined(yield* directory.getBinding(input.threadId));
+        if (binding === undefined) {
+          if (input.sessionOwnershipId !== undefined || input.requireSessionAbsent !== true) {
+            return false;
+          }
+          // There is no runtime owner to clean up. Keep the replacement-start
+          // lock until the terminal projection is committed so a new session
+          // cannot be overwritten by this stale failure handler.
+          yield* input.onOwned;
+          yield* input.onStopped;
+          return true;
+        }
+        const runtimePayload = readRecord(binding.runtimePayload) ?? {};
+        const activeTurnId = readPersistedActiveTurnId(runtimePayload);
+        const lastTerminalTurnId = runtimePayload.lastTerminalTurnId;
+        const sessionOwnershipId = runtimePayload.sessionOwnershipId;
+        const currentSendTurnOperationId = runtimePayload.sendTurnOperationId;
+        const lastFailedSendTurnOperationId = runtimePayload.lastFailedSendTurnOperationId;
+        const operationStillOwnsFailure =
+          input.sendTurnOperationId !== undefined &&
+          input.sessionOwnershipId !== undefined &&
+          sessionOwnershipId === input.sessionOwnershipId &&
+          lastFailedSendTurnOperationId === input.sendTurnOperationId &&
+          (currentSendTurnOperationId === null || currentSendTurnOperationId === undefined) &&
+          (activeTurnId === undefined || activeTurnId === input.turnId);
+        const turnStillBelongsToFailure =
+          activeTurnId === input.turnId ||
+          (lastTerminalTurnId !== null &&
+            lastTerminalTurnId !== undefined &&
+            String(lastTerminalTurnId) === String(input.turnId));
+        const identityStillOwnsFailure =
+          input.sessionOwnershipId !== undefined &&
+          sessionOwnershipId === input.sessionOwnershipId &&
+          turnStillBelongsToFailure;
+        const sessionIsProvablyAbsent =
+          input.requireSessionAbsent === true &&
+          turnStillBelongsToFailure &&
+          binding.providerInstanceId !== undefined
+            ? yield* registry.getByInstance(binding.providerInstanceId).pipe(
+                Effect.flatMap((adapter) =>
+                  providerSessionIsProvablyGone({
+                    adapter,
+                    provider: binding.provider,
+                    threadId: input.threadId,
+                  }),
+                ),
+              )
+            : false;
+        const bindingStillBelongsToFailedTurn =
+          operationStillOwnsFailure ||
+          (input.sendTurnOperationId === undefined &&
+            (identityStillOwnsFailure || sessionIsProvablyAbsent));
+        if (!bindingStillBelongsToFailedTurn) {
+          return false;
+        }
+        if (binding.status === "stopped") {
+          yield* input.onOwned;
+          yield* input.onStopped;
+          return true;
+        }
+        const failedAt = yield* nowIso;
+        yield* directory.upsert({
+          threadId: input.threadId,
+          provider: binding.provider,
+          ...(binding.providerInstanceId !== undefined
+            ? { providerInstanceId: binding.providerInstanceId }
+            : {}),
+          runtimeMode: binding.runtimeMode ?? "full-access",
+          status: "error",
+          ...(binding.resumeCursor !== undefined ? { resumeCursor: binding.resumeCursor } : {}),
+          runtimePayload: mergeRuntimePayload(binding.runtimePayload, {
+            activeTurnId: null,
+            sendTurnOperationId: null,
+            lastTerminalTurnId: input.turnId,
+            lastError: input.reason,
+            lastRuntimeEvent: "provider.turn.watchdog.stop-pending",
+            lastRuntimeEventAt: failedAt,
+          }),
+        });
+        // Projection and lease settlement must happen under the same lock as
+        // the binding ownership check. Otherwise a replacement can start in
+        // the gap and be overwritten by this terminal event.
+        yield* input.onOwned;
+        yield* stopSession({ threadId: input.threadId });
+        yield* input.onStopped;
+        return true;
+      }),
+    );
+  });
 
   const listSessions: ProviderServiceMethod<"listSessions"> = Effect.fn("listSessions")(
     function* () {
@@ -2021,6 +2741,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
     respondToRequest,
     respondToUserInput,
     stopSession,
+    stopFailedSession,
     listSessions,
     getCapabilities,
     getInstanceInfo,

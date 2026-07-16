@@ -2675,23 +2675,87 @@ it.layer(BaseTestLayer)("OrchestrationProjectionPipeline", (it) => {
         },
       });
 
+      yield* appendAndProject({
+        type: "thread.activity-appended",
+        eventId: EventId.make("evt-stale-approval-5"),
+        aggregateKind: "thread",
+        aggregateId: ThreadId.make("thread-stale-approval"),
+        occurredAt: "2026-02-26T12:30:04.000Z",
+        commandId: CommandId.make("cmd-stale-approval-5"),
+        causationEventId: null,
+        correlationId: CorrelationId.make("cmd-stale-approval-5"),
+        metadata: {},
+        payload: {
+          threadId: ThreadId.make("thread-stale-approval"),
+          activity: {
+            id: EventId.make("activity-timeout-approval-requested"),
+            tone: "approval",
+            kind: "approval.requested",
+            summary: "Command approval requested",
+            payload: {
+              requestId: "approval-request-timeout-2",
+              requestKind: "command",
+            },
+            turnId: null,
+            createdAt: "2026-02-26T12:30:04.000Z",
+          },
+        },
+      });
+
+      yield* appendAndProject({
+        type: "thread.activity-appended",
+        eventId: EventId.make("evt-stale-approval-6"),
+        aggregateKind: "thread",
+        aggregateId: ThreadId.make("thread-stale-approval"),
+        occurredAt: "2026-02-26T12:30:05.000Z",
+        commandId: CommandId.make("cmd-stale-approval-6"),
+        causationEventId: null,
+        correlationId: CorrelationId.make("cmd-stale-approval-6"),
+        metadata: {},
+        payload: {
+          threadId: ThreadId.make("thread-stale-approval"),
+          activity: {
+            id: EventId.make("activity-timeout-approval-resolved"),
+            tone: "error",
+            kind: "approval.resolved",
+            summary: "Approval request timed out",
+            payload: {
+              requestId: "approval-request-timeout-2",
+              decision: "cancel",
+            },
+            turnId: null,
+            createdAt: "2026-02-26T12:30:05.000Z",
+          },
+        },
+      });
+
       const approvalRows = yield* sql<{
         readonly requestId: string;
         readonly status: string;
+        readonly decision: string | null;
         readonly resolvedAt: string | null;
       }>`
         SELECT
           request_id AS "requestId",
           status,
+          decision,
           resolved_at AS "resolvedAt"
         FROM projection_pending_approvals
-        WHERE request_id = 'approval-request-stale-1'
+        WHERE request_id IN ('approval-request-stale-1', 'approval-request-timeout-2')
+        ORDER BY request_id
       `;
       assert.deepEqual(approvalRows, [
         {
           requestId: "approval-request-stale-1",
           status: "resolved",
+          decision: null,
           resolvedAt: "2026-02-26T12:30:03.000Z",
+        },
+        {
+          requestId: "approval-request-timeout-2",
+          status: "resolved",
+          decision: "cancel",
+          resolvedAt: "2026-02-26T12:30:05.000Z",
         },
       ]);
 

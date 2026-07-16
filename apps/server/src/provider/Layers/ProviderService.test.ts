@@ -23,6 +23,7 @@ import {
 import { createModelSelection } from "@t3tools/shared/model";
 import { it, assert, vi } from "@effect/vitest";
 
+import * as Cause from "effect/Cause";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
@@ -48,7 +49,7 @@ import type { ProviderAdapterShape } from "../Services/ProviderAdapter.ts";
 import * as ProviderAdapterRegistry from "../Services/ProviderAdapterRegistry.ts";
 import * as ProviderService from "../Services/ProviderService.ts";
 import * as ProviderSessionDirectory from "../Services/ProviderSessionDirectory.ts";
-import { makeProviderServiceLive } from "./ProviderService.ts";
+import { makeProviderServiceLive, type ProviderServiceLiveOptions } from "./ProviderService.ts";
 import * as ProviderEventLoggers from "./ProviderEventLoggers.ts";
 import { ProviderSessionDirectoryLive } from "./ProviderSessionDirectory.ts";
 import * as McpProviderSession from "../../mcp/McpProviderSession.ts";
@@ -92,6 +93,7 @@ type LegacyProviderRuntimeEvent = {
 function makeFakeCodexAdapter(provider: ProviderDriverKind = CODEX_DRIVER) {
   const sessions = new Map<ThreadId, ProviderSession>();
   const runtimeEventPubSub = Effect.runSync(PubSub.unbounded<ProviderRuntimeEvent>());
+  let runtimeEventGate: Deferred.Deferred<void> | undefined;
 
   const startSession = vi.fn((input: ProviderSessionStartInput) =>
     Effect.sync(() => {
@@ -232,7 +234,14 @@ function makeFakeCodexAdapter(provider: ProviderDriverKind = CODEX_DRIVER) {
     rollbackThread,
     stopAll,
     get streamEvents() {
-      return Stream.fromPubSub(runtimeEventPubSub);
+      return Stream.fromPubSub(runtimeEventPubSub).pipe(
+        Stream.mapEffect((event) => {
+          const gate = runtimeEventGate;
+          return gate === undefined
+            ? Effect.succeed(event)
+            : Deferred.await(gate).pipe(Effect.as(event));
+        }),
+      );
     },
   };
 
@@ -251,11 +260,21 @@ function makeFakeCodexAdapter(provider: ProviderDriverKind = CODEX_DRIVER) {
     sessions.set(threadId, update(existing));
   };
 
+  const pauseRuntimeEvents = Deferred.make<void>().pipe(
+    Effect.map((gate) => {
+      runtimeEventGate = gate;
+      return Effect.sync(() => {
+        if (runtimeEventGate === gate) runtimeEventGate = undefined;
+      }).pipe(Effect.andThen(Deferred.succeed(gate, undefined)), Effect.asVoid);
+    }),
+  );
+
   return {
     adapter,
     emit,
     sessions,
     updateSession,
+    pauseRuntimeEvents,
     startSession,
     sendTurn,
     interruptTurn,
@@ -284,7 +303,7 @@ const hasMetricSnapshot = (
       Object.entries(attributes).every(([key, value]) => snapshot.attributes?.[key] === value),
   );
 
-function makeProviderServiceLayer() {
+function makeProviderServiceLayer(options?: ProviderServiceLiveOptions) {
   const codex = makeFakeCodexAdapter();
   const claude = makeFakeCodexAdapter(CLAUDE_AGENT_DRIVER);
   const cursor = makeFakeCodexAdapter(CURSOR_DRIVER);
@@ -305,7 +324,7 @@ function makeProviderServiceLayer() {
 
   const layer = it.layer(
     Layer.mergeAll(
-      makeProviderServiceLive().pipe(
+      makeProviderServiceLive(options).pipe(
         Layer.provide(providerAdapterLayer),
         Layer.provide(directoryLayer),
         Layer.provide(defaultServerSettingsLayer),
@@ -600,7 +619,7 @@ it.effect("ProviderServiceLive rejects new sessions for disabled custom instance
   }).pipe(Effect.provide(NodeServices.layer)),
 );
 
-const routing = makeProviderServiceLayer();
+const routing = makeProviderServiceLayer({ sessionStartTimeoutMs: 50 });
 
 it.effect("ProviderServiceLive writes canonical events to the emitting thread segment", () =>
   Effect.gen(function* () {
@@ -1358,8 +1377,15 @@ routing.layer("ProviderServiceLive routing", (it) => {
       });
 
       const startedEventId = asEventId("evt-started-before-send-failed");
+      const waitingEventId = asEventId("evt-waiting-after-started-before-send-failed");
       const startedFiber = yield* provider.streamEvents.pipe(
         Stream.filter((event) => event.eventId === startedEventId),
+        Stream.take(1),
+        Stream.runCollect,
+        Effect.forkChild,
+      );
+      const waitingFiber = yield* provider.streamEvents.pipe(
+        Stream.filter((event) => event.eventId === waitingEventId),
         Stream.take(1),
         Stream.runCollect,
         Effect.forkChild,
@@ -1377,6 +1403,16 @@ routing.layer("ProviderServiceLive routing", (it) => {
             payload: {},
           });
           yield* Fiber.join(startedFiber);
+          routing.codex.emit({
+            type: "session.state.changed",
+            eventId: waitingEventId,
+            provider: ProviderDriverKind.make("codex"),
+            threadId: input.threadId,
+            turnId,
+            createdAt: "2026-01-01T00:00:04.525Z",
+            payload: { state: "waiting" },
+          });
+          yield* Fiber.join(waitingFiber);
           routing.codex.updateSession(input.threadId, (session) => {
             const { activeTurnId: _activeTurnId, ...sessionWithoutActiveTurn } = session;
             return {
@@ -1409,13 +1445,149 @@ routing.layer("ProviderServiceLive routing", (it) => {
           readonly activeTurnId?: unknown;
           readonly lastRuntimeEvent?: unknown;
         };
+        assert.equal(binding.value.status, "error");
         assert.equal(runtimePayload.activeTurnId, null);
         assert.equal(runtimePayload.lastRuntimeEvent, "provider.sendTurn.failed");
       }
     }),
   );
 
-  it.effect("keeps persisted active turn state when a failed send is still live", () =>
+  it.effect("fences queued turn lifecycle events after session/prompt rejects", () =>
+    Effect.gen(function* () {
+      const provider = yield* ProviderService.ProviderService;
+      const directory = yield* ProviderSessionDirectory.ProviderSessionDirectory;
+      const threadId = asThreadId("thread-queued-start-after-send-failed");
+      const turnId = asTurnId("turn-queued-start-after-send-failed");
+      const sentinelEventId = asEventId("evt-after-queued-send-failure-events");
+
+      yield* provider.startSession(threadId, {
+        provider: ProviderDriverKind.make("codex"),
+        providerInstanceId: codexInstanceId,
+        threadId,
+        runtimeMode: "full-access",
+      });
+
+      const sentinelFiber = yield* provider.streamEvents.pipe(
+        Stream.filter((event) => event.eventId === sentinelEventId),
+        Stream.take(1),
+        Stream.runCollect,
+        Effect.forkChild,
+      );
+      yield* advanceTestClock(50);
+      const resumeRuntimeEvents = yield* routing.codex.pauseRuntimeEvents;
+      routing.codex.sendTurn.mockImplementationOnce((input) =>
+        Effect.gen(function* () {
+          routing.codex.emit({
+            type: "turn.started",
+            eventId: asEventId("evt-queued-start-before-send-failed"),
+            provider: ProviderDriverKind.make("codex"),
+            threadId: input.threadId,
+            turnId,
+            createdAt: "2026-01-01T00:00:04.600Z",
+            payload: {},
+          });
+          routing.codex.emit({
+            type: "session.state.changed",
+            eventId: asEventId("evt-queued-waiting-before-send-failed"),
+            provider: ProviderDriverKind.make("codex"),
+            threadId: input.threadId,
+            turnId,
+            createdAt: "2026-01-01T00:00:04.625Z",
+            payload: { state: "waiting" },
+          });
+          return yield* new ProviderAdapterRequestError({
+            provider: String(CODEX_DRIVER),
+            method: "session/prompt",
+            detail: "prompt rejected after queueing lifecycle events",
+          });
+        }),
+      );
+
+      const exit = yield* provider
+        .sendTurn({ threadId, input: "hello", attachments: [] })
+        .pipe(Effect.exit);
+      assert.equal(Exit.isFailure(exit), true);
+
+      yield* resumeRuntimeEvents;
+      routing.codex.emit({
+        type: "session.started",
+        eventId: sentinelEventId,
+        provider: ProviderDriverKind.make("codex"),
+        threadId,
+        createdAt: "2026-01-01T00:00:04.650Z",
+        payload: {},
+      });
+      yield* Fiber.join(sentinelFiber);
+
+      const binding = Option.getOrThrow(yield* directory.getBinding(threadId));
+      const runtimePayload = binding.runtimePayload as {
+        readonly activeTurnId?: unknown;
+        readonly lastRuntimeEvent?: unknown;
+        readonly lastFailedSendTurnOperationId?: unknown;
+      };
+      assert.equal(binding.status, "running");
+      assert.equal(runtimePayload.activeTurnId, null);
+      assert.equal(runtimePayload.lastRuntimeEvent, "provider.sendTurn.failed");
+      assert.equal(typeof runtimePayload.lastFailedSendTurnOperationId, "string");
+    }),
+  );
+
+  it.effect("keeps a live session reusable when sendTurn fails before turn.started", () =>
+    Effect.gen(function* () {
+      const provider = yield* ProviderService.ProviderService;
+      const directory = yield* ProviderSessionDirectory.ProviderSessionDirectory;
+      const threadId = asThreadId("thread-pre-start-send-failure-retry");
+
+      yield* provider.startSession(threadId, {
+        provider: ProviderDriverKind.make("codex"),
+        providerInstanceId: codexInstanceId,
+        threadId,
+        runtimeMode: "full-access",
+      });
+      routing.codex.sendTurn.mockImplementationOnce(() =>
+        Effect.fail(
+          new ProviderAdapterRequestError({
+            provider: String(CODEX_DRIVER),
+            method: "session/prompt",
+            detail: "pre-start prompt rejection",
+          }),
+        ),
+      );
+
+      const firstFailure = yield* provider
+        .sendTurn({
+          threadId,
+          input: "prompt rejected before turn.started",
+          attachments: [],
+        })
+        .pipe(Effect.flip);
+      assert.equal(firstFailure._tag, "ProviderSendTurnFailedError");
+      const failedBinding = Option.getOrThrow(yield* directory.getBinding(threadId));
+      const failedRuntimePayload = failedBinding.runtimePayload as {
+        readonly activeTurnId?: unknown;
+        readonly lastError?: unknown;
+        readonly sendTurnOperationId?: unknown;
+      };
+      assert.equal(failedBinding.status, "running");
+      assert.equal(failedRuntimePayload.activeTurnId, null);
+      assert.match(String(failedRuntimePayload.lastError), /pre-start prompt rejection/);
+      assert.equal(failedRuntimePayload.sendTurnOperationId, null);
+
+      const retryTurn = yield* provider.sendTurn({
+        threadId,
+        input: "retry on the same live session",
+        attachments: [],
+      });
+      const retriedBinding = Option.getOrThrow(yield* directory.getBinding(threadId));
+      assert.equal(retriedBinding.status, "running");
+      assert.equal(
+        (retriedBinding.runtimePayload as { readonly activeTurnId?: unknown }).activeTurnId,
+        retryTurn.turnId,
+      );
+    }),
+  );
+
+  it.effect("fails persisted active turn state when sendTurn rejects despite a live adapter", () =>
     Effect.gen(function* () {
       const provider = yield* ProviderService.ProviderService;
       const directory = yield* ProviderSessionDirectory.ProviderSessionDirectory;
@@ -1478,11 +1650,511 @@ routing.layer("ProviderServiceLive routing", (it) => {
       if (Option.isSome(binding)) {
         const runtimePayload = binding.value.runtimePayload as {
           readonly activeTurnId?: unknown;
+          readonly lastError?: unknown;
           readonly lastRuntimeEvent?: unknown;
         };
-        assert.equal(runtimePayload.activeTurnId, turnId);
-        assert.equal(runtimePayload.lastRuntimeEvent, "turn.started");
+        assert.equal(binding.value.status, "error");
+        assert.equal(runtimePayload.activeTurnId, null);
+        assert.equal(
+          runtimePayload.lastError,
+          "Provider adapter request failed (codex) for sendTurn: simulated send failure with live steer",
+        );
+        assert.equal(runtimePayload.lastRuntimeEvent, "provider.sendTurn.failed");
       }
+    }),
+  );
+
+  it.effect("does not attribute a delayed sendTurn failure to a replacement session", () =>
+    Effect.gen(function* () {
+      const provider = yield* ProviderService.ProviderService;
+      const directory = yield* ProviderSessionDirectory.ProviderSessionDirectory;
+      const threadId = asThreadId("thread-delayed-send-failure-replacement");
+      const oldSendEntered = yield* Deferred.make<void>();
+      const releaseOldSend = yield* Deferred.make<void>();
+
+      yield* provider.startSession(threadId, {
+        provider: ProviderDriverKind.make("codex"),
+        providerInstanceId: codexInstanceId,
+        threadId,
+        runtimeMode: "full-access",
+      });
+      routing.codex.sendTurn.mockImplementationOnce(() =>
+        Effect.gen(function* () {
+          yield* Deferred.succeed(oldSendEntered, undefined);
+          yield* Deferred.await(releaseOldSend);
+          return yield* new ProviderAdapterRequestError({
+            provider: String(CODEX_DRIVER),
+            method: "session/prompt",
+            detail: "old prompt rejected after replacement",
+          });
+        }),
+      );
+      const oldFailureFiber = yield* provider
+        .sendTurn({
+          threadId,
+          input: "old prompt",
+          attachments: [],
+        })
+        .pipe(Effect.flip, Effect.forkChild);
+      yield* Deferred.await(oldSendEntered);
+
+      const oldBinding = Option.getOrThrow(yield* directory.getBinding(threadId));
+      yield* directory.upsert({
+        ...oldBinding,
+        runtimePayload: {
+          ...(oldBinding.runtimePayload as Record<string, unknown>),
+          sessionOwnershipId: "replacement-session-owner",
+          sendTurnOperationId: null,
+        },
+      });
+      const replacementTurn = yield* provider.sendTurn({
+        threadId,
+        input: "replacement prompt",
+        attachments: [],
+      });
+      yield* Deferred.succeed(releaseOldSend, undefined);
+
+      const oldFailure = yield* Fiber.join(oldFailureFiber);
+      assert.equal(oldFailure._tag, "ProviderSendTurnFailedError");
+      if (oldFailure._tag === "ProviderSendTurnFailedError") {
+        assert.equal(oldFailure.superseded, true);
+        assert.equal(oldFailure.turnId, undefined);
+      }
+      const binding = Option.getOrThrow(yield* directory.getBinding(threadId));
+      const runtimePayload = binding.runtimePayload as {
+        readonly activeTurnId?: unknown;
+        readonly lastError?: unknown;
+      };
+      assert.equal(binding.status, "running");
+      assert.equal(runtimePayload.activeTurnId, replacementTurn.turnId);
+      assert.notEqual(runtimePayload.lastError, "old prompt rejected after replacement");
+    }),
+  );
+
+  it.effect("rejects session replacement while session/prompt is in flight", () =>
+    Effect.gen(function* () {
+      const provider = yield* ProviderService.ProviderService;
+      const directory = yield* ProviderSessionDirectory.ProviderSessionDirectory;
+      const threadId = asThreadId("thread-replacement-during-send-success");
+      const sendEntered = yield* Deferred.make<void>();
+      const releaseSend = yield* Deferred.make<void>();
+      const returnedTurnId = asTurnId("turn-returned-after-replacement-refused");
+      const startsBeforeTest = routing.codex.startSession.mock.calls.length;
+
+      yield* provider.startSession(threadId, {
+        provider: ProviderDriverKind.make("codex"),
+        providerInstanceId: codexInstanceId,
+        threadId,
+        runtimeMode: "full-access",
+      });
+      routing.codex.sendTurn.mockImplementationOnce(() =>
+        Effect.gen(function* () {
+          yield* Deferred.succeed(sendEntered, undefined);
+          yield* Deferred.await(releaseSend);
+          return { threadId, turnId: returnedTurnId };
+        }),
+      );
+      const sendFiber = yield* provider
+        .sendTurn({
+          threadId,
+          input: "prompt that must retain session ownership",
+          attachments: [],
+        })
+        .pipe(Effect.forkChild);
+      yield* Deferred.await(sendEntered);
+
+      const replacementExit = yield* provider
+        .startSession(threadId, {
+          provider: ProviderDriverKind.make("codex"),
+          providerInstanceId: codexInstanceId,
+          threadId,
+          runtimeMode: "full-access",
+        })
+        .pipe(Effect.exit);
+      assert.equal(Exit.isFailure(replacementExit), true);
+      if (Exit.isFailure(replacementExit)) {
+        assert.match(
+          Cause.pretty(replacementExit.cause),
+          /Cannot replace provider session.*session\/prompt is in flight/,
+        );
+      }
+
+      yield* Deferred.succeed(releaseSend, undefined);
+      const turn = yield* Fiber.join(sendFiber);
+      assert.equal(turn.turnId, returnedTurnId);
+      assert.equal(routing.codex.startSession.mock.calls.length, startsBeforeTest + 1);
+
+      const binding = Option.getOrThrow(yield* directory.getBinding(threadId));
+      const runtimePayload = binding.runtimePayload as {
+        readonly activeTurnId?: unknown;
+        readonly sendTurnOperationId?: unknown;
+      };
+      assert.equal(binding.status, "running");
+      assert.equal(runtimePayload.activeTurnId, returnedTurnId);
+      assert.equal(runtimePayload.sendTurnOperationId, null);
+    }),
+  );
+
+  it.effect("rejects an overlapping send without replacing the first operation owner", () =>
+    Effect.gen(function* () {
+      const provider = yield* ProviderService.ProviderService;
+      const directory = yield* ProviderSessionDirectory.ProviderSessionDirectory;
+      const threadId = asThreadId("thread-overlapping-send-single-flight");
+      const firstSendEntered = yield* Deferred.make<void>();
+      const releaseFirstSend = yield* Deferred.make<void>();
+      const firstTurnId = asTurnId("turn-overlapping-send-first-owner");
+      const sendsBeforeTest = routing.codex.sendTurn.mock.calls.length;
+
+      yield* provider.startSession(threadId, {
+        provider: ProviderDriverKind.make("codex"),
+        providerInstanceId: codexInstanceId,
+        threadId,
+        runtimeMode: "full-access",
+      });
+      routing.codex.sendTurn.mockImplementationOnce(() =>
+        Effect.gen(function* () {
+          yield* Deferred.succeed(firstSendEntered, undefined);
+          yield* Deferred.await(releaseFirstSend);
+          return { threadId, turnId: firstTurnId };
+        }),
+      );
+      const firstSendFiber = yield* provider
+        .sendTurn({
+          threadId,
+          input: "first prompt owns the operation",
+          attachments: [],
+        })
+        .pipe(Effect.forkChild);
+      yield* Deferred.await(firstSendEntered);
+
+      const overlappingFailure = yield* provider
+        .sendTurn({
+          threadId,
+          input: "overlapping prompt must be rejected",
+          attachments: [],
+        })
+        .pipe(Effect.flip);
+      assert.equal(overlappingFailure._tag, "ProviderSendTurnFailedError");
+      if (overlappingFailure._tag === "ProviderSendTurnFailedError") {
+        assert.equal(overlappingFailure.superseded, true);
+        assert.equal(overlappingFailure.overlapping, true);
+        assert.match(overlappingFailure.detail, /already in flight/);
+      }
+      assert.equal(routing.codex.sendTurn.mock.calls.length, sendsBeforeTest + 1);
+
+      yield* Deferred.succeed(releaseFirstSend, undefined);
+      const firstTurn = yield* Fiber.join(firstSendFiber);
+      assert.equal(firstTurn.turnId, firstTurnId);
+      const binding = Option.getOrThrow(yield* directory.getBinding(threadId));
+      const runtimePayload = binding.runtimePayload as {
+        readonly activeTurnId?: unknown;
+        readonly sendTurnOperationId?: unknown;
+      };
+      assert.equal(runtimePayload.activeTurnId, firstTurnId);
+      assert.equal(runtimePayload.sendTurnOperationId, null);
+    }),
+  );
+
+  it.effect("fails a successful send whose session ownership was superseded", () =>
+    Effect.gen(function* () {
+      const provider = yield* ProviderService.ProviderService;
+      const directory = yield* ProviderSessionDirectory.ProviderSessionDirectory;
+      const threadId = asThreadId("thread-successful-send-owner-superseded");
+      const sendEntered = yield* Deferred.make<void>();
+      const releaseSend = yield* Deferred.make<void>();
+      const staleTurnId = asTurnId("turn-successful-send-owner-superseded");
+
+      yield* provider.startSession(threadId, {
+        provider: ProviderDriverKind.make("codex"),
+        providerInstanceId: codexInstanceId,
+        threadId,
+        runtimeMode: "full-access",
+      });
+      routing.codex.sendTurn.mockImplementationOnce(() =>
+        Effect.gen(function* () {
+          yield* Deferred.succeed(sendEntered, undefined);
+          yield* Deferred.await(releaseSend);
+          return { threadId, turnId: staleTurnId };
+        }),
+      );
+      const staleSendFiber = yield* provider
+        .sendTurn({
+          threadId,
+          input: "prompt accepted by a superseded owner",
+          attachments: [],
+        })
+        .pipe(Effect.flip, Effect.forkChild);
+      yield* Deferred.await(sendEntered);
+
+      const oldBinding = Option.getOrThrow(yield* directory.getBinding(threadId));
+      yield* directory.upsert({
+        ...oldBinding,
+        status: "running",
+        runtimePayload: {
+          ...(oldBinding.runtimePayload as Record<string, unknown>),
+          sessionOwnershipId: "new-session-owner-after-send",
+          sendTurnOperationId: null,
+          activeTurnId: null,
+          lastRuntimeEvent: "provider.replacement",
+        },
+      });
+      yield* Deferred.succeed(releaseSend, undefined);
+
+      const failure = yield* Fiber.join(staleSendFiber);
+      assert.equal(failure._tag, "ProviderSendTurnFailedError");
+      if (failure._tag === "ProviderSendTurnFailedError") {
+        assert.equal(failure.superseded, true);
+        assert.equal(failure.turnId, staleTurnId);
+      }
+      const replacementBinding = Option.getOrThrow(yield* directory.getBinding(threadId));
+      const runtimePayload = replacementBinding.runtimePayload as {
+        readonly activeTurnId?: unknown;
+        readonly lastRuntimeEvent?: unknown;
+        readonly sessionOwnershipId?: unknown;
+      };
+      assert.equal(replacementBinding.status, "running");
+      assert.equal(runtimePayload.activeTurnId, null);
+      assert.equal(runtimePayload.lastRuntimeEvent, "provider.replacement");
+      assert.equal(runtimePayload.sessionOwnershipId, "new-session-owner-after-send");
+    }),
+  );
+
+  it.effect("reconciles a crash-stale send token before replacing the session", () =>
+    Effect.gen(function* () {
+      const provider = yield* ProviderService.ProviderService;
+      const directory = yield* ProviderSessionDirectory.ProviderSessionDirectory;
+      const threadId = asThreadId("thread-crash-stale-send-token");
+      const startsBeforeTest = routing.codex.startSession.mock.calls.length;
+
+      yield* provider.startSession(threadId, {
+        provider: ProviderDriverKind.make("codex"),
+        providerInstanceId: codexInstanceId,
+        threadId,
+        runtimeMode: "full-access",
+      });
+      const oldBinding = Option.getOrThrow(yield* directory.getBinding(threadId));
+      yield* directory.upsert({
+        ...oldBinding,
+        runtimePayload: {
+          ...(oldBinding.runtimePayload as Record<string, unknown>),
+          sendTurnOperationId: "operation-from-dead-server-process",
+        },
+      });
+
+      yield* provider.startSession(threadId, {
+        provider: ProviderDriverKind.make("codex"),
+        providerInstanceId: codexInstanceId,
+        threadId,
+        runtimeMode: "full-access",
+      });
+
+      assert.equal(routing.codex.startSession.mock.calls.length, startsBeforeTest + 2);
+      const replacement = Option.getOrThrow(yield* directory.getBinding(threadId));
+      assert.equal(
+        (replacement.runtimePayload as { readonly sendTurnOperationId?: unknown })
+          .sendTurnOperationId,
+        null,
+      );
+    }),
+  );
+
+  it.effect("bounds provider startup so a hung adapter releases the recovery lock", () =>
+    Effect.gen(function* () {
+      const provider = yield* ProviderService.ProviderService;
+      const threadId = asThreadId("thread-hung-provider-start-timeout");
+
+      yield* provider.startSession(threadId, {
+        provider: ProviderDriverKind.make("codex"),
+        providerInstanceId: codexInstanceId,
+        threadId,
+        runtimeMode: "full-access",
+      });
+      routing.codex.startSession.mockImplementationOnce(() => Effect.never);
+
+      const hungStartFiber = yield* provider
+        .startSession(threadId, {
+          provider: ProviderDriverKind.make("codex"),
+          providerInstanceId: codexInstanceId,
+          threadId,
+          runtimeMode: "full-access",
+        })
+        .pipe(Effect.exit, Effect.forkChild);
+      yield* Effect.yieldNow;
+      yield* advanceTestClock(50);
+
+      const hungStartExit = yield* Fiber.join(hungStartFiber);
+      assert.equal(Exit.isFailure(hungStartExit), true);
+      if (Exit.isFailure(hungStartExit)) {
+        assert.match(Cause.pretty(hungStartExit.cause), /Provider startup timed out/);
+      }
+
+      const recovered = yield* provider.startSession(threadId, {
+        provider: ProviderDriverKind.make("codex"),
+        providerInstanceId: codexInstanceId,
+        threadId,
+        runtimeMode: "full-access",
+      });
+      assert.equal(recovered.threadId, threadId);
+    }),
+  );
+
+  it.effect("allows provider startup that completes just under the injected timeout", () =>
+    Effect.gen(function* () {
+      const provider = yield* ProviderService.ProviderService;
+      const threadId = asThreadId("thread-provider-start-just-under-timeout");
+      const startEntered = yield* Deferred.make<void>();
+      const defaultStartSession = routing.codex.startSession.getMockImplementation();
+      assert.ok(defaultStartSession);
+      routing.codex.startSession.mockImplementationOnce((input) =>
+        Effect.gen(function* () {
+          yield* Deferred.succeed(startEntered, undefined);
+          yield* Effect.sleep("49 millis");
+          return yield* defaultStartSession(input);
+        }),
+      );
+
+      const startFiber = yield* provider
+        .startSession(threadId, {
+          provider: ProviderDriverKind.make("codex"),
+          providerInstanceId: codexInstanceId,
+          threadId,
+          runtimeMode: "full-access",
+        })
+        .pipe(Effect.forkChild);
+      yield* Deferred.await(startEntered);
+      yield* advanceTestClock(49);
+
+      const session = yield* Fiber.join(startFiber);
+      assert.equal(session.threadId, threadId);
+      assert.equal(session.status, "ready");
+    }),
+  );
+
+  it.effect("clears send ownership when an in-flight prompt fiber is interrupted", () =>
+    Effect.gen(function* () {
+      const provider = yield* ProviderService.ProviderService;
+      const directory = yield* ProviderSessionDirectory.ProviderSessionDirectory;
+      const threadId = asThreadId("thread-interrupted-send-token");
+
+      yield* provider.startSession(threadId, {
+        provider: ProviderDriverKind.make("codex"),
+        providerInstanceId: codexInstanceId,
+        threadId,
+        runtimeMode: "full-access",
+      });
+      routing.codex.sendTurn.mockImplementationOnce(() => Effect.never);
+      const sendFiber = yield* provider
+        .sendTurn({
+          threadId,
+          input: "prompt interrupted before the adapter settles",
+          attachments: [],
+        })
+        .pipe(Effect.forkChild);
+
+      let registeredOperation: unknown;
+      for (let attempt = 0; attempt < 20 && typeof registeredOperation !== "string"; attempt += 1) {
+        yield* Effect.yieldNow;
+        const binding = Option.getOrThrow(yield* directory.getBinding(threadId));
+        registeredOperation = (binding.runtimePayload as { readonly sendTurnOperationId?: unknown })
+          .sendTurnOperationId;
+      }
+      assert.equal(typeof registeredOperation, "string");
+
+      yield* Fiber.interrupt(sendFiber);
+      const interruptedBinding = Option.getOrThrow(yield* directory.getBinding(threadId));
+      assert.equal(
+        (interruptedBinding.runtimePayload as { readonly sendTurnOperationId?: unknown })
+          .sendTurnOperationId,
+        null,
+      );
+
+      const replacement = yield* provider.startSession(threadId, {
+        provider: ProviderDriverKind.make("codex"),
+        providerInstanceId: codexInstanceId,
+        threadId,
+        runtimeMode: "full-access",
+      });
+      assert.equal(replacement.threadId, threadId);
+    }),
+  );
+
+  it.effect("does not resurrect a session that exits before sendTurn returns", () =>
+    Effect.gen(function* () {
+      const provider = yield* ProviderService.ProviderService;
+      const directory = yield* ProviderSessionDirectory.ProviderSessionDirectory;
+      const threadId = asThreadId("thread-exit-before-send-success");
+      const sendEntered = yield* Deferred.make<void>();
+      const releaseSend = yield* Deferred.make<void>();
+      const returnedTurnId = asTurnId("turn-returned-after-session-exit");
+
+      yield* provider.startSession(threadId, {
+        provider: ProviderDriverKind.make("codex"),
+        providerInstanceId: codexInstanceId,
+        threadId,
+        runtimeMode: "full-access",
+      });
+      routing.codex.sendTurn.mockImplementationOnce(() =>
+        Effect.gen(function* () {
+          yield* Deferred.succeed(sendEntered, undefined);
+          yield* Deferred.await(releaseSend);
+          return {
+            threadId,
+            turnId: returnedTurnId,
+          };
+        }),
+      );
+      const sendFiber = yield* provider
+        .sendTurn({
+          threadId,
+          input: "return after the process exits",
+          attachments: [],
+        })
+        .pipe(Effect.flip, Effect.forkChild);
+      yield* Deferred.await(sendEntered);
+
+      routing.codex.sessions.delete(threadId);
+      const exitEventId = asEventId("evt-exit-before-send-success");
+      const exitConsumer = yield* provider.streamEvents.pipe(
+        Stream.filter((event) => event.eventId === exitEventId),
+        Stream.take(1),
+        Stream.runCollect,
+        Effect.forkChild,
+      );
+      yield* advanceTestClock(50);
+      routing.codex.emit({
+        type: "session.exited",
+        eventId: exitEventId,
+        provider: ProviderDriverKind.make("codex"),
+        createdAt: "2026-01-01T00:00:10.000Z",
+        threadId,
+        payload: {
+          exitKind: "error",
+          reason: "provider exited while session/prompt was in flight",
+        },
+      });
+      yield* advanceTestClock(50);
+      yield* Fiber.join(exitConsumer);
+      yield* Deferred.succeed(releaseSend, undefined);
+      const sendFailure = yield* Fiber.join(sendFiber);
+      assert.equal(sendFailure._tag, "ProviderSendTurnFailedError");
+      if (sendFailure._tag === "ProviderSendTurnFailedError") {
+        assert.equal(sendFailure.superseded, false);
+        assert.equal(sendFailure.turnId, returnedTurnId);
+        assert.match(sendFailure.detail, /provider exited while session\/prompt was in flight/);
+      }
+
+      const binding = Option.getOrThrow(yield* directory.getBinding(threadId));
+      const runtimePayload = binding.runtimePayload as {
+        readonly activeTurnId?: unknown;
+        readonly lastError?: unknown;
+        readonly lastRuntimeEvent?: unknown;
+        readonly sendTurnOperationId?: unknown;
+      };
+      assert.equal(binding.status, "error");
+      assert.equal(runtimePayload.activeTurnId, null);
+      assert.equal(runtimePayload.lastRuntimeEvent, "session.exited");
+      assert.equal(runtimePayload.lastError, "provider exited while session/prompt was in flight");
+      assert.equal(runtimePayload.sendTurnOperationId, null);
     }),
   );
 
@@ -2714,17 +3386,19 @@ it.effect(
           endpoint: "http://127.0.0.1:43123/mcp",
           authorizationHeader: "Bearer adapter-replaced-during-start-replacement-token",
         });
-        const replacementSession = yield* provider.startSession(threadId, {
-          provider: CODEX_DRIVER,
-          providerInstanceId: codexInstanceId,
-          threadId,
-          runtimeMode: "full-access",
-        });
-        assert.equal(replacementSession.provider, CODEX_DRIVER);
-
+        const replacementFiber = yield* provider
+          .startSession(threadId, {
+            provider: CODEX_DRIVER,
+            providerInstanceId: codexInstanceId,
+            threadId,
+            runtimeMode: "full-access",
+          })
+          .pipe(Effect.forkScoped);
         yield* Deferred.succeed(releaseStart, undefined);
 
         const exit = yield* Fiber.join(startFiber);
+        const replacementSession = yield* Fiber.join(replacementFiber);
+        assert.equal(replacementSession.provider, CODEX_DRIVER);
         assert.equal(Exit.isFailure(exit), true);
         assert.deepEqual(firstCodex.stopSession.mock.calls, [[threadId]]);
         assert.equal(
@@ -2846,6 +3520,496 @@ fanout.layer("ProviderServiceLive fanout", (it) => {
         received.map((event) => event.eventId),
         [asEventId("evt-seq-1"), asEventId("evt-seq-2"), asEventId("evt-seq-3")],
       );
+    }),
+  );
+
+  it.effect("marks the runtime binding failed when a provider process exits mid-turn", () =>
+    Effect.gen(function* () {
+      const threadId = asThreadId("thread-runtime-process-exit");
+      const provider = yield* ProviderService.ProviderService;
+      const directory = yield* ProviderSessionDirectory.ProviderSessionDirectory;
+      const session = yield* provider.startSession(threadId, {
+        provider: ProviderDriverKind.make("codex"),
+        providerInstanceId: codexInstanceId,
+        threadId,
+        runtimeMode: "full-access",
+      });
+      const turn = yield* provider.sendTurn({
+        threadId,
+        input: "run until the provider dies",
+        attachments: [],
+      });
+      fanout.codex.sessions.delete(threadId);
+
+      fanout.codex.emit({
+        type: "session.exited",
+        eventId: asEventId("evt-runtime-process-exited"),
+        provider: ProviderDriverKind.make("codex"),
+        createdAt: "2026-01-01T00:00:10.000Z",
+        threadId: session.threadId,
+        turnId: turn.turnId,
+        payload: {
+          exitKind: "error",
+          reason: "provider process exited mid-turn",
+        },
+      });
+      yield* advanceTestClock(500);
+
+      const binding = Option.getOrThrow(yield* directory.getBinding(threadId));
+      const runtimePayload = binding.runtimePayload as {
+        readonly activeTurnId?: unknown;
+        readonly lastError?: unknown;
+        readonly lastRuntimeEvent?: unknown;
+        readonly lastTerminalTurnId?: unknown;
+      };
+      assert.equal(binding.status, "error");
+      assert.equal(runtimePayload.activeTurnId, null);
+      assert.equal(runtimePayload.lastError, "provider process exited mid-turn");
+      assert.equal(runtimePayload.lastRuntimeEvent, "session.exited");
+      assert.equal(runtimePayload.lastTerminalTurnId, turn.turnId);
+    }),
+  );
+
+  it.effect("ignores an uncorrelated session exit when the liveness probe fails", () =>
+    Effect.gen(function* () {
+      const threadId = asThreadId("thread-runtime-exit-liveness-unknown");
+      const provider = yield* ProviderService.ProviderService;
+      const directory = yield* ProviderSessionDirectory.ProviderSessionDirectory;
+      const session = yield* provider.startSession(threadId, {
+        provider: ProviderDriverKind.make("codex"),
+        providerInstanceId: codexInstanceId,
+        threadId,
+        runtimeMode: "full-access",
+      });
+      const turn = yield* provider.sendTurn({
+        threadId,
+        input: "keep the current owner on uncertain exit",
+        attachments: [],
+      });
+      fanout.codex.sessions.delete(threadId);
+      fanout.codex.hasSession.mockImplementationOnce(() =>
+        Effect.die("transient provider liveness defect"),
+      );
+
+      fanout.codex.emit({
+        type: "session.exited",
+        eventId: asEventId("evt-runtime-exit-liveness-unknown"),
+        provider: ProviderDriverKind.make("codex"),
+        createdAt: "2026-01-01T00:00:10.000Z",
+        threadId: session.threadId,
+        payload: {
+          exitKind: "error",
+          reason: "uncorrelated old process exit",
+        },
+      });
+      yield* advanceTestClock(500);
+
+      const binding = Option.getOrThrow(yield* directory.getBinding(threadId));
+      const runtimePayload = binding.runtimePayload as {
+        readonly activeTurnId?: unknown;
+        readonly lastRuntimeEvent?: unknown;
+        readonly unconfirmedSessionExit?: unknown;
+      };
+      assert.equal(binding.status, "running");
+      assert.equal(runtimePayload.activeTurnId, turn.turnId);
+      assert.notEqual(runtimePayload.lastRuntimeEvent, "session.exited");
+      assert.deepEqual(runtimePayload.unconfirmedSessionExit, {
+        eventId: "evt-runtime-exit-liveness-unknown",
+        observedAt: "2026-01-01T00:00:10.000Z",
+        reason: "uncorrelated old process exit",
+      });
+    }),
+  );
+
+  it.effect("bounds a hung session-exit liveness probe and records it as unconfirmed", () =>
+    Effect.gen(function* () {
+      const threadId = asThreadId("thread-runtime-exit-liveness-timeout");
+      const provider = yield* ProviderService.ProviderService;
+      const directory = yield* ProviderSessionDirectory.ProviderSessionDirectory;
+      const session = yield* provider.startSession(threadId, {
+        provider: ProviderDriverKind.make("codex"),
+        providerInstanceId: codexInstanceId,
+        threadId,
+        runtimeMode: "full-access",
+      });
+      const turn = yield* provider.sendTurn({
+        threadId,
+        input: "do not block runtime ingestion on a hung liveness probe",
+        attachments: [],
+      });
+      fanout.codex.sessions.delete(threadId);
+      fanout.codex.hasSession.mockImplementationOnce(() => Effect.never);
+      yield* advanceTestClock(10);
+
+      fanout.codex.emit({
+        type: "session.exited",
+        eventId: asEventId("evt-runtime-exit-liveness-timeout"),
+        provider: ProviderDriverKind.make("codex"),
+        createdAt: "2026-01-01T00:00:10.000Z",
+        threadId: session.threadId,
+        payload: {
+          exitKind: "error",
+          reason: "provider liveness probe did not answer",
+        },
+      });
+      yield* advanceTestClock(500);
+
+      const binding = Option.getOrThrow(yield* directory.getBinding(threadId));
+      const runtimePayload = binding.runtimePayload as {
+        readonly activeTurnId?: unknown;
+        readonly lastRuntimeEvent?: unknown;
+        readonly unconfirmedSessionExit?: unknown;
+      };
+      assert.equal(binding.status, "running");
+      assert.equal(runtimePayload.activeTurnId, turn.turnId);
+      assert.notEqual(runtimePayload.lastRuntimeEvent, "session.exited");
+      assert.deepEqual(runtimePayload.unconfirmedSessionExit, {
+        eventId: "evt-runtime-exit-liveness-timeout",
+        observedAt: "2026-01-01T00:00:10.000Z",
+        reason: "provider liveness probe did not answer",
+      });
+    }),
+  );
+
+  it.effect("accepts a genuine exact-turn exit after asynchronous adapter cleanup", () =>
+    Effect.gen(function* () {
+      const threadId = asThreadId("thread-runtime-delayed-exit-cleanup");
+      const provider = yield* ProviderService.ProviderService;
+      const directory = yield* ProviderSessionDirectory.ProviderSessionDirectory;
+      yield* provider.startSession(threadId, {
+        provider: ProviderDriverKind.make("codex"),
+        providerInstanceId: codexInstanceId,
+        threadId,
+        runtimeMode: "full-access",
+      });
+      const turn = yield* provider.sendTurn({
+        threadId,
+        input: "wait for delayed adapter cleanup",
+        attachments: [],
+      });
+      fanout.codex.hasSession.mockImplementationOnce(() => Effect.succeed(true));
+      fanout.codex.hasSession.mockImplementationOnce(() => Effect.succeed(true));
+      fanout.codex.hasSession.mockImplementationOnce(() =>
+        Effect.sync(() => {
+          fanout.codex.sessions.delete(threadId);
+          return false;
+        }),
+      );
+
+      fanout.codex.emit({
+        type: "session.exited",
+        eventId: asEventId("evt-runtime-delayed-exit-cleanup"),
+        provider: ProviderDriverKind.make("codex"),
+        createdAt: "2026-01-01T00:00:10.000Z",
+        threadId,
+        turnId: turn.turnId,
+        payload: {
+          exitKind: "error",
+          reason: "provider cleanup completed asynchronously",
+        },
+      });
+      yield* advanceTestClock(500);
+
+      const binding = Option.getOrThrow(yield* directory.getBinding(threadId));
+      const runtimePayload = binding.runtimePayload as {
+        readonly activeTurnId?: unknown;
+        readonly lastError?: unknown;
+        readonly lastRuntimeEvent?: unknown;
+        readonly lastTerminalTurnId?: unknown;
+      };
+      assert.equal(binding.status, "error");
+      assert.equal(runtimePayload.activeTurnId, null);
+      assert.equal(runtimePayload.lastError, "provider cleanup completed asynchronously");
+      assert.equal(runtimePayload.lastRuntimeEvent, "session.exited");
+      assert.equal(runtimePayload.lastTerminalTurnId, turn.turnId);
+    }),
+  );
+
+  it.effect("ignores an untagged stale exit from an older turn", () =>
+    Effect.gen(function* () {
+      const threadId = asThreadId("thread-runtime-stale-process-exit");
+      const provider = yield* ProviderService.ProviderService;
+      const directory = yield* ProviderSessionDirectory.ProviderSessionDirectory;
+      const session = yield* provider.startSession(threadId, {
+        provider: ProviderDriverKind.make("codex"),
+        providerInstanceId: codexInstanceId,
+        threadId,
+        runtimeMode: "full-access",
+      });
+      const staleTurn = yield* provider.sendTurn({
+        threadId,
+        input: "old provider turn",
+        attachments: [],
+      });
+      const replacementTurnId = asTurnId("turn-runtime-stale-process-replacement");
+      fanout.codex.sendTurn.mockImplementationOnce((input) =>
+        Effect.succeed({ threadId: input.threadId, turnId: replacementTurnId }),
+      );
+      const replacementTurn = yield* provider.sendTurn({
+        threadId,
+        input: "replacement provider turn",
+        attachments: [],
+      });
+
+      fanout.codex.emit({
+        type: "session.exited",
+        eventId: asEventId("evt-runtime-stale-process-exited"),
+        provider: ProviderDriverKind.make("codex"),
+        createdAt: "2026-01-01T00:00:10.000Z",
+        threadId: session.threadId,
+        turnId: staleTurn.turnId,
+        payload: {
+          exitKind: "error",
+          reason: "old provider process exited late",
+        },
+      });
+      yield* advanceTestClock(500);
+
+      const binding = Option.getOrThrow(yield* directory.getBinding(threadId));
+      assert.equal(binding.status, "running");
+      assert.equal(
+        (binding.runtimePayload as { readonly activeTurnId?: unknown }).activeTurnId,
+        replacementTurn.turnId,
+      );
+
+      fanout.codex.emit({
+        type: "turn.completed",
+        eventId: asEventId("evt-runtime-replacement-turn-completed"),
+        provider: ProviderDriverKind.make("codex"),
+        createdAt: "2026-01-01T00:00:11.000Z",
+        threadId: session.threadId,
+        turnId: replacementTurn.turnId,
+        payload: { state: "completed" },
+      });
+      yield* advanceTestClock(500);
+
+      fanout.codex.emit({
+        type: "session.exited",
+        eventId: asEventId("evt-runtime-stale-process-exited-idle"),
+        provider: ProviderDriverKind.make("codex"),
+        createdAt: "2026-01-01T00:00:12.000Z",
+        threadId: session.threadId,
+        turnId: staleTurn.turnId,
+        payload: {
+          exitKind: "error",
+          reason: "old provider process exited after replacement went idle",
+        },
+      });
+      yield* advanceTestClock(500);
+
+      const idleBinding = Option.getOrThrow(yield* directory.getBinding(threadId));
+      assert.equal(idleBinding.status, "running");
+      assert.equal(
+        (idleBinding.runtimePayload as { readonly activeTurnId?: unknown }).activeTurnId,
+        null,
+      );
+    }),
+  );
+
+  it.effect("defers an exact-turn exit while a same-turn session is still live", () =>
+    Effect.gen(function* () {
+      const threadId = asThreadId("thread-runtime-exact-turn-process-exit");
+      const provider = yield* ProviderService.ProviderService;
+      const directory = yield* ProviderSessionDirectory.ProviderSessionDirectory;
+      const session = yield* provider.startSession(threadId, {
+        provider: ProviderDriverKind.make("codex"),
+        providerInstanceId: codexInstanceId,
+        threadId,
+        runtimeMode: "full-access",
+      });
+      const turn = yield* provider.sendTurn({
+        threadId,
+        input: "provider exits before adapter cleanup completes",
+        attachments: [],
+      });
+
+      fanout.codex.emit({
+        type: "session.exited",
+        eventId: asEventId("evt-runtime-exact-turn-process-exited"),
+        provider: ProviderDriverKind.make("codex"),
+        createdAt: "2026-01-01T00:00:10.000Z",
+        threadId: session.threadId,
+        turnId: turn.turnId,
+        payload: {
+          exitKind: "error",
+          reason: "provider process exited before adapter cleanup",
+        },
+      });
+      yield* advanceTestClock(500);
+
+      const binding = Option.getOrThrow(yield* directory.getBinding(threadId));
+      const runtimePayload = binding.runtimePayload as {
+        readonly activeTurnId?: unknown;
+        readonly unconfirmedSessionExit?: unknown;
+      };
+      assert.equal(binding.status, "running");
+      assert.equal(runtimePayload.activeTurnId, turn.turnId);
+      assert.deepEqual(runtimePayload.unconfirmedSessionExit, {
+        eventId: "evt-runtime-exact-turn-process-exited",
+        observedAt: "2026-01-01T00:00:10.000Z",
+        reason: "provider process exited before adapter cleanup",
+      });
+    }),
+  );
+
+  it.effect("does not stop a replacement session when failed cleanup loses the start race", () =>
+    Effect.gen(function* () {
+      const threadId = asThreadId("thread-failed-cleanup-replacement-race");
+      const provider = yield* ProviderService.ProviderService;
+      const directory = yield* ProviderSessionDirectory.ProviderSessionDirectory;
+      yield* provider.startSession(threadId, {
+        provider: ProviderDriverKind.make("codex"),
+        providerInstanceId: codexInstanceId,
+        threadId,
+        runtimeMode: "full-access",
+      });
+      const failedTurn = yield* provider.sendTurn({
+        threadId,
+        input: "fail before replacement",
+        attachments: [],
+      });
+      const currentBinding = Option.getOrThrow(yield* directory.getBinding(threadId));
+      const failedSessionOwnershipId = (
+        currentBinding.runtimePayload as { readonly sessionOwnershipId?: unknown }
+      ).sessionOwnershipId;
+      assert.equal(typeof failedSessionOwnershipId, "string");
+      yield* directory.upsert({
+        ...currentBinding,
+        status: "error",
+        runtimePayload: {
+          ...(currentBinding.runtimePayload as Record<string, unknown>),
+          activeTurnId: null,
+          lastTerminalTurnId: failedTurn.turnId,
+          lastError: "failed cleanup remains pending",
+        },
+      });
+
+      const replacementStartEntered = yield* Deferred.make<void>();
+      const allowReplacementStart = yield* Deferred.make<void>();
+      const defaultStartSession = fanout.codex.startSession.getMockImplementation();
+      assert.ok(defaultStartSession);
+      fanout.codex.startSession.mockImplementationOnce((input) =>
+        Effect.gen(function* () {
+          yield* Deferred.succeed(replacementStartEntered, undefined);
+          yield* Deferred.await(allowReplacementStart);
+          return yield* defaultStartSession(input);
+        }),
+      );
+      let staleOwnedCallbackRan = false;
+      let staleStoppedCallbackRan = false;
+
+      const replacementFiber = yield* provider
+        .startSession(threadId, {
+          provider: ProviderDriverKind.make("codex"),
+          providerInstanceId: codexInstanceId,
+          threadId,
+          runtimeMode: "full-access",
+          activeTurnId: failedTurn.turnId,
+        })
+        .pipe(Effect.forkChild);
+      yield* Deferred.await(replacementStartEntered);
+      const cleanupFiber = yield* provider
+        .stopFailedSession({
+          threadId,
+          turnId: failedTurn.turnId,
+          reason: "failed cleanup remains pending",
+          sessionOwnershipId: failedSessionOwnershipId as string,
+          onOwned: Effect.sync(() => {
+            staleOwnedCallbackRan = true;
+          }),
+          onStopped: Effect.sync(() => {
+            staleStoppedCallbackRan = true;
+          }),
+        })
+        .pipe(Effect.forkChild);
+      yield* Effect.yieldNow;
+      yield* Deferred.succeed(allowReplacementStart, undefined);
+      yield* Fiber.join(replacementFiber);
+
+      assert.equal(yield* Fiber.join(cleanupFiber), false);
+      assert.equal(staleOwnedCallbackRan, false);
+      assert.equal(staleStoppedCallbackRan, false);
+      assert.equal(fanout.codex.stopSession.mock.calls.length, 0);
+      const replacementBinding = Option.getOrThrow(yield* directory.getBinding(threadId));
+      assert.equal(replacementBinding.status, "running");
+      assert.equal(
+        (replacementBinding.runtimePayload as { readonly activeTurnId?: unknown }).activeTurnId,
+        failedTurn.turnId,
+      );
+
+      yield* provider.stopSession({ threadId });
+      let stoppedReplacementCallbackRan = false;
+      const stoppedReplacementClaimed = yield* provider.stopFailedSession({
+        threadId,
+        turnId: failedTurn.turnId,
+        reason: "late cleanup after replacement stopped",
+        sessionOwnershipId: failedSessionOwnershipId as string,
+        onOwned: Effect.sync(() => {
+          stoppedReplacementCallbackRan = true;
+        }),
+        onStopped: Effect.void,
+      });
+      assert.equal(stoppedReplacementClaimed, false);
+      assert.equal(stoppedReplacementCallbackRan, false);
+      const stoppedReplacementBinding = Option.getOrThrow(yield* directory.getBinding(threadId));
+      assert.equal(stoppedReplacementBinding.status, "stopped");
+    }),
+  );
+
+  it.effect("requires proven absence before identity-free failed-turn cleanup", () =>
+    Effect.gen(function* () {
+      const threadId = asThreadId("thread-failed-cleanup-absence-proof");
+      const provider = yield* ProviderService.ProviderService;
+      yield* provider.startSession(threadId, {
+        provider: ProviderDriverKind.make("codex"),
+        providerInstanceId: codexInstanceId,
+        threadId,
+        runtimeMode: "full-access",
+      });
+      const turn = yield* provider.sendTurn({
+        threadId,
+        input: "keep the same-turn successor alive",
+        attachments: [],
+      });
+      let ownedCallbackRan = false;
+
+      const liveClaimFiber = yield* provider
+        .stopFailedSession({
+          threadId,
+          turnId: turn.turnId,
+          reason: "stale cleanup must not stop a live owner",
+          requireSessionAbsent: true,
+          onOwned: Effect.sync(() => {
+            ownedCallbackRan = true;
+          }),
+          onStopped: Effect.void,
+        })
+        .pipe(Effect.forkChild);
+      yield* Effect.yieldNow;
+      yield* advanceTestClock(250);
+      const liveClaimed = yield* Fiber.join(liveClaimFiber);
+      assert.equal(liveClaimed, false);
+      assert.equal(ownedCallbackRan, false);
+      assert.equal(fanout.codex.sessions.has(threadId), true);
+
+      fanout.codex.sessions.delete(threadId);
+      const deadClaimFiber = yield* provider
+        .stopFailedSession({
+          threadId,
+          turnId: turn.turnId,
+          reason: "the exact turn has no provider session",
+          requireSessionAbsent: true,
+          onOwned: Effect.sync(() => {
+            ownedCallbackRan = true;
+          }),
+          onStopped: Effect.void,
+        })
+        .pipe(Effect.forkChild);
+      yield* Effect.yieldNow;
+      yield* advanceTestClock(50);
+      const deadClaimed = yield* Fiber.join(deadClaimFiber);
+      assert.equal(deadClaimed, true);
+      assert.equal(ownedCallbackRan, true);
     }),
   );
 
@@ -3040,6 +4204,7 @@ fanout.layer("ProviderServiceLive fanout", (it) => {
     Effect.gen(function* () {
       const threadId = asThreadId("thread-mcp-replacement");
       const provider = yield* ProviderService.ProviderService;
+      const directory = yield* ProviderSessionDirectory.ProviderSessionDirectory;
       McpProviderSession.setMcpProviderSession({
         environmentId,
         threadId,
@@ -3069,6 +4234,11 @@ fanout.layer("ProviderServiceLive fanout", (it) => {
         threadId,
         runtimeMode: "full-access",
       });
+      const replacementTurn = yield* provider.sendTurn({
+        threadId,
+        input: "keep the replacement turn running",
+        attachments: [],
+      });
 
       fanout.codex.emit({
         type: "session.exited",
@@ -3088,10 +4258,90 @@ fanout.layer("ProviderServiceLive fanout", (it) => {
         McpProviderSession.readMcpProviderSession(session.threadId)?.providerSessionId,
         "provider-session-mcp-replacement",
       );
+      const binding = Option.getOrThrow(yield* directory.getBinding(threadId));
+      assert.equal(binding.status, "running");
+      assert.equal(
+        (binding.runtimePayload as { readonly activeTurnId?: unknown }).activeTurnId,
+        replacementTurn.turnId,
+      );
     }).pipe(
       Effect.ensuring(
         Effect.sync(() =>
           McpProviderSession.clearMcpProviderSession(asThreadId("thread-mcp-replacement")),
+        ),
+      ),
+    ),
+  );
+
+  it.effect("accepts the current MCP session exit while replacement binding persistence lags", () =>
+    Effect.gen(function* () {
+      const threadId = asThreadId("thread-mcp-current-exit-before-rebind");
+      const provider = yield* ProviderService.ProviderService;
+      const directory = yield* ProviderSessionDirectory.ProviderSessionDirectory;
+      McpProviderSession.setMcpProviderSession({
+        environmentId,
+        threadId,
+        providerSessionId: "provider-session-mcp-before-rebind-old",
+        providerInstanceId: codexInstanceId,
+        endpoint: "http://127.0.0.1:43123/mcp",
+        authorizationHeader: "Bearer old-before-rebind-token",
+      });
+      yield* provider.startSession(threadId, {
+        provider: ProviderDriverKind.make("codex"),
+        providerInstanceId: codexInstanceId,
+        threadId,
+        runtimeMode: "full-access",
+      });
+      // prepareMcpSession advances the in-memory identity before the external
+      // provider start returns and the directory binding can be refreshed.
+      McpProviderSession.setMcpProviderSession({
+        environmentId,
+        threadId,
+        providerSessionId: "provider-session-mcp-before-rebind-current",
+        providerInstanceId: codexInstanceId,
+        endpoint: "http://127.0.0.1:43123/mcp",
+        authorizationHeader: "Bearer current-before-rebind-token",
+      });
+      yield* advanceTestClock(10);
+      const beforeExitBinding = Option.getOrThrow(yield* directory.getBinding(threadId));
+      assert.equal(
+        (beforeExitBinding.runtimePayload as { readonly mcpProviderSessionId?: unknown })
+          .mcpProviderSessionId,
+        "provider-session-mcp-before-rebind-old",
+      );
+      assert.equal(
+        McpProviderSession.readMcpProviderSession(threadId)?.providerSessionId,
+        "provider-session-mcp-before-rebind-current",
+      );
+      fanout.codex.emit({
+        type: "session.exited",
+        eventId: asEventId("evt-mcp-current-session-exited-before-rebind"),
+        provider: ProviderDriverKind.make("codex"),
+        createdAt: "2026-01-01T00:00:00.000Z",
+        threadId,
+        payload: {
+          exitKind: "error",
+          reason: "replacement provider exited before binding caught up",
+          mcpProviderSessionId: "provider-session-mcp-before-rebind-current",
+        },
+      });
+      yield* Effect.yieldNow;
+      let binding = Option.getOrThrow(yield* directory.getBinding(threadId));
+      for (let attempt = 0; attempt < 10 && binding.status !== "error"; attempt += 1) {
+        yield* advanceTestClock(250);
+        binding = Option.getOrThrow(yield* directory.getBinding(threadId));
+      }
+      assert.equal(binding.status, "error");
+      assert.equal(
+        (binding.runtimePayload as { readonly activeTurnId?: unknown }).activeTurnId,
+        null,
+      );
+    }).pipe(
+      Effect.ensuring(
+        Effect.sync(() =>
+          McpProviderSession.clearMcpProviderSession(
+            asThreadId("thread-mcp-current-exit-before-rebind"),
+          ),
         ),
       ),
     ),

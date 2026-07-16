@@ -1527,6 +1527,9 @@ const make = Effect.gen(function* () {
         }
         return;
       }
+      if (session.status !== "stopped" && session.status !== "error") {
+        return;
+      }
       if (session.status === "stopped") {
         yield* oneShotTerminalCheck(threadId);
         const settledFromProjection = yield* Deferred.isDone(record.terminal);
@@ -1536,6 +1539,18 @@ const make = Effect.gen(function* () {
         }
       }
       const shellOption = yield* getThreadShell(threadId);
+      if (session.status === "error") {
+        const errorStillOwnsProjectedSession = Option.match(shellOption, {
+          onNone: () => false,
+          onSome: (shell) =>
+            shell.session?.status === "error" &&
+            shell.session.updatedAt === session.updatedAt &&
+            shell.session.lastError === session.lastError,
+        });
+        if (!errorStillOwnsProjectedSession) {
+          return;
+        }
+      }
       if (session.status === "stopped" && Option.isSome(shellOption)) {
         const terminalTurn = currentLiveProjectedTerminal(threadId, shellOption.value);
         if (terminalTurn?.state === "completed") {
@@ -1548,9 +1563,15 @@ const make = Effect.gen(function* () {
         onNone: () => false,
         onSome: (shell) => shell.latestTurn?.state === "running",
       });
-      if (turnRunning && !missingDiffWhileRunningByChild.has(threadId)) return;
+      if (
+        session.status === "stopped" &&
+        turnRunning &&
+        !missingDiffWhileRunningByChild.has(threadId)
+      ) {
+        return;
+      }
       missingDiffWhileRunningByChild.delete(threadId);
-      yield* settleChild(threadId, "failed", `session ${session.status}`);
+      yield* settleChild(threadId, "failed", session.lastError ?? `session ${session.status}`);
     });
 
   const handleThreadDeleted = (event: ThreadDeletedEvent) =>

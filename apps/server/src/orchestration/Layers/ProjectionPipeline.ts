@@ -1196,7 +1196,16 @@ const makeOrchestrationProjectionPipeline = Effect.fn("makeOrchestrationProjecti
               threadId: event.payload.threadId,
             });
             yield* Effect.forEach(
-              existingTurns.filter((turn) => turn.turnId !== null && turn.state === "running"),
+              existingTurns.filter(
+                (turn) =>
+                  turn.turnId !== null &&
+                  (turn.state === "running" ||
+                    // A dead-session interrupt carries its exact turn id on
+                    // this terminal event before a second event clears it.
+                    (settledTurnState === "error" &&
+                      turn.state === "interrupted" &&
+                      turn.turnId === event.payload.session.activeTurnId)),
+              ),
               (turn) =>
                 turn.turnId === null
                   ? Effect.void

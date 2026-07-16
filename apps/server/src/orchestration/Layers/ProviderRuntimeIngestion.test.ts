@@ -105,6 +105,7 @@ function createProviderServiceHarness() {
     respondToRequest: () => unsupported(),
     respondToUserInput: () => unsupported(),
     stopSession: () => unsupported(),
+    stopFailedSession: () => unsupported(),
     listSessions: () => Effect.succeed([...runtimeSessions]),
     getCapabilities: () => Effect.succeed({ sessionModelSwitch: "in-session" }),
     getInstanceInfo: (instanceId) => {
@@ -368,6 +369,119 @@ describe("ProviderRuntimeIngestion", () => {
     );
     expect(thread.session?.status).toBe("error");
     expect(thread.session?.lastError).toBe("turn failed");
+  });
+
+  it("fails a running turn when the provider process exits with an error", async () => {
+    const harness = await createHarness();
+    const turnId = asTurnId("turn-provider-process-exit");
+
+    harness.emit({
+      type: "turn.started",
+      eventId: asEventId("evt-process-exit-turn-started"),
+      provider: ProviderDriverKind.make("codex"),
+      threadId: asThreadId("thread-1"),
+      createdAt: "2026-01-01T00:00:00.000Z",
+      turnId,
+    });
+    await waitForThread(
+      harness.readModel,
+      (thread) => thread.latestTurn?.turnId === turnId && thread.latestTurn.state === "running",
+    );
+
+    harness.emit({
+      type: "session.exited",
+      eventId: asEventId("evt-provider-process-exited"),
+      provider: ProviderDriverKind.make("codex"),
+      threadId: asThreadId("thread-1"),
+      createdAt: "2026-01-01T00:00:10.000Z",
+      turnId,
+      payload: {
+        exitKind: "error",
+        reason: "provider process died unexpectedly",
+      },
+    });
+
+    const thread = await waitForThread(
+      harness.readModel,
+      (entry) =>
+        entry.latestTurn?.turnId === turnId &&
+        entry.latestTurn.state === "error" &&
+        entry.session?.status === "error" &&
+        entry.session.activeTurnId === null,
+    );
+    expect(thread.latestTurn).toMatchObject({ turnId, state: "error" });
+    expect(thread.session).toMatchObject({
+      status: "error",
+      activeTurnId: null,
+      lastError: "provider process died unexpectedly",
+    });
+  });
+
+  it("ignores a stale provider exit after a replacement turn starts", async () => {
+    const harness = await createHarness();
+    const staleTurnId = asTurnId("turn-stale-provider-process");
+    const replacementTurnId = asTurnId("turn-replacement-provider-process");
+
+    harness.emit({
+      type: "turn.started",
+      eventId: asEventId("evt-stale-process-turn-started"),
+      provider: ProviderDriverKind.make("codex"),
+      threadId: asThreadId("thread-1"),
+      createdAt: "2026-01-01T00:00:00.000Z",
+      turnId: staleTurnId,
+    });
+    await waitForThread(
+      harness.readModel,
+      (thread) => thread.session?.activeTurnId === staleTurnId,
+    );
+
+    harness.emit({
+      type: "turn.completed",
+      eventId: asEventId("evt-stale-process-turn-failed"),
+      provider: ProviderDriverKind.make("codex"),
+      threadId: asThreadId("thread-1"),
+      createdAt: "2026-01-01T00:00:04.000Z",
+      turnId: staleTurnId,
+      payload: { state: "failed", errorMessage: "old provider turn failed" },
+    });
+    await waitForThread(harness.readModel, (thread) => thread.session?.activeTurnId === null);
+
+    harness.emit({
+      type: "turn.started",
+      eventId: asEventId("evt-replacement-process-turn-started"),
+      provider: ProviderDriverKind.make("codex"),
+      threadId: asThreadId("thread-1"),
+      createdAt: "2026-01-01T00:00:05.000Z",
+      turnId: replacementTurnId,
+    });
+    await waitForThread(
+      harness.readModel,
+      (thread) => thread.session?.activeTurnId === replacementTurnId,
+    );
+
+    harness.emit({
+      type: "session.exited",
+      eventId: asEventId("evt-stale-provider-process-exited"),
+      provider: ProviderDriverKind.make("codex"),
+      threadId: asThreadId("thread-1"),
+      createdAt: "2026-01-01T00:00:10.000Z",
+      turnId: staleTurnId,
+      payload: {
+        exitKind: "error",
+        reason: "stale provider process exited late",
+      },
+    });
+    await harness.drain();
+
+    const thread = (await harness.readModel()).threads.find(
+      (entry) => entry.id === asThreadId("thread-1"),
+    );
+    expect(thread?.latestTurn).toMatchObject({ turnId: replacementTurnId, state: "running" });
+    expect(thread?.session).toMatchObject({
+      status: "running",
+      activeTurnId: replacementTurnId,
+    });
+    expect(thread?.session?.lastError).not.toBe("stale provider process exited late");
   });
 
   it("applies provider session.state.changed transitions directly", async () => {

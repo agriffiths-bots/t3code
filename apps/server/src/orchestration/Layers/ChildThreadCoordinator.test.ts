@@ -88,13 +88,14 @@ const makeSession = (
   threadId: ThreadId,
   status: OrchestrationSession["status"],
   activeTurnId: TurnId | null = null,
+  lastError: string | null = null,
 ): OrchestrationSession => ({
   threadId,
   status,
   providerName: "codex",
   runtimeMode: "full-access",
   activeTurnId,
-  lastError: null,
+  lastError,
   updatedAt: now,
 });
 
@@ -249,6 +250,7 @@ const sessionSetEvent = (
   threadId: ThreadId,
   status: OrchestrationSession["status"],
   activeTurnId: TurnId | null = null,
+  lastError: string | null = null,
 ): OrchestrationEvent =>
   ({
     eventId: EventId.make(`evt-session-${threadId}-${status}`),
@@ -256,7 +258,7 @@ const sessionSetEvent = (
     aggregateKind: "thread",
     aggregateId: threadId,
     occurredAt: now,
-    payload: { threadId, session: makeSession(threadId, status, activeTurnId) },
+    payload: { threadId, session: makeSession(threadId, status, activeTurnId, lastError) },
   }) as unknown as OrchestrationEvent;
 
 const threadDeletedEvent = (threadId: ThreadId): OrchestrationEvent =>
@@ -779,6 +781,14 @@ describe("ChildThreadCoordinator", () => {
         }),
       );
 
+    const listDispatchLeaseChildIds = () =>
+      activeRuntime.runPromise(
+        Effect.flatMap(
+          Effect.service(SubagentDispatchLimiter.SubagentDispatchLimiter),
+          (limiter) => limiter.leasedChildThreadIds,
+        ),
+      );
+
     // Offer an event, then wait until the coordinator has finished processing it.
     const feed = async (event: OrchestrationEvent) => {
       await Effect.runPromise(Queue.offer(eventQueue, event));
@@ -810,6 +820,7 @@ describe("ChildThreadCoordinator", () => {
       listPromotedChildren,
       canAcquireDispatchLease,
       seedDispatchLease,
+      listDispatchLeaseChildIds,
     };
   }
 
@@ -1203,6 +1214,131 @@ describe("ChildThreadCoordinator", () => {
     ) as Array<Extract<OrchestrationCommand, { type: "thread.turn.start" }>>;
     expect(turnStarts).toHaveLength(1);
     expect(turnStarts[0]!.message.text).toContain(`[sub-agent ${child} failed] session error`);
+  });
+
+  it("ignores a stale session error after a replacement child turn starts", async () => {
+    const child = ThreadId.make("child-stale-error-after-replacement");
+    const parent = ThreadId.make("parent-stale-error-after-replacement");
+    const oldTurnId = TurnId.make("turn-before-stale-error");
+    const replacementTurnId = TurnId.make("turn-replacement-after-stale-error");
+    const harness = await createHarness({
+      threads: [
+        makeThreadState({
+          threadId: child,
+          parentThreadId: parent,
+          latestTurn: makeLatestTurn("running", oldTurnId),
+          session: makeSession(child, "running", oldTurnId),
+        }),
+      ],
+    });
+    await harness.register({
+      parentThreadId: parent,
+      childThreadId: child,
+      detached: false,
+      model: codexModel,
+      spawnedAtMs: 0,
+    });
+    await harness.feed(sessionSetEvent(child, "running", oldTurnId));
+    harness.setThread(
+      makeThreadState({
+        threadId: child,
+        parentThreadId: parent,
+        latestTurn: makeLatestTurn("running", replacementTurnId),
+        session: makeSession(child, "running", replacementTurnId),
+      }),
+    );
+
+    await harness.feed(
+      sessionSetEvent(child, "error", null, "old provider failed after replacement"),
+    );
+
+    const slice = await runtimeWaitSlice(harness, [child], PAST_MS);
+    expect(slice.results[0]?.status).toBe("timeout");
+    expect(harness.dispatched).not.toContainEqual(
+      expect.objectContaining({ type: "thread.turn.start", threadId: parent }),
+    );
+  });
+
+  it("does not settle a running child on healthy session updates", async () => {
+    const child = ThreadId.make("child-healthy-session-updates");
+    const parent = ThreadId.make("parent-healthy-session-updates");
+    const turnId = TurnId.make("turn-healthy-session-updates");
+    const harness = await createHarness({
+      threads: [
+        makeThreadState({
+          threadId: child,
+          parentThreadId: parent,
+          latestTurn: makeLatestTurn("running", turnId),
+          session: makeSession(child, "running", turnId),
+        }),
+      ],
+    });
+    await harness.register({
+      parentThreadId: parent,
+      childThreadId: child,
+      detached: false,
+      model: codexModel,
+      spawnedAtMs: 0,
+    });
+
+    await harness.feed(sessionSetEvent(child, "running", turnId));
+    await harness.feed(sessionSetEvent(child, "waiting", turnId));
+
+    const slice = await runtimeWaitSlice(harness, [child], PAST_MS);
+    expect(slice.results[0]?.status).toBe("timeout");
+    expect(await harness.listDispatchLeaseChildIds()).toEqual([]);
+  });
+
+  it("releases dispatch leases for every watchdog failure cause", async () => {
+    const failureCases = [
+      ["process-death", "Provider session disappeared while the turn was running."],
+      ["prompt-failure", "session/prompt failed while the turn was running."],
+      ["permission-timeout", "Provider permission request was unanswered."],
+      ["dead-interrupt", "Provider session is no longer alive during interrupt."],
+    ] as const;
+    const parent = ThreadId.make("parent-watchdog-release");
+    const children = failureCases.map(([name]) => ThreadId.make(`child-watchdog-${name}`));
+    const harness = await createHarness({
+      threads: children.map((threadId) =>
+        makeThreadState({
+          threadId,
+          parentThreadId: parent,
+          latestTurn: makeLatestTurn("running", TurnId.make(`turn-${threadId}`)),
+          session: makeSession(threadId, "running", TurnId.make(`turn-${threadId}`)),
+        }),
+      ),
+    });
+
+    for (const child of children) {
+      await harness.register({
+        parentThreadId: parent,
+        childThreadId: child,
+        detached: false,
+        model: codexModel,
+        spawnedAtMs: 0,
+      });
+      await harness.seedDispatchLease(child);
+    }
+    expect(await harness.listDispatchLeaseChildIds()).toEqual([...children].sort());
+
+    for (const [index, child] of children.entries()) {
+      const [, reason] = failureCases[index]!;
+      const turnId = TurnId.make(`turn-${child}`);
+      harness.setThread(
+        makeThreadState({
+          threadId: child,
+          parentThreadId: parent,
+          latestTurn: makeLatestTurn("running", turnId),
+          session: makeSession(child, "error", null, reason),
+        }),
+      );
+      await harness.feed(sessionSetEvent(child, "error", null, reason));
+      const result = await runtimeRun(harness, child);
+      expect(result.status).toBe("failed");
+      expect(result.error).toBe(reason);
+    }
+
+    expect(await harness.listDispatchLeaseChildIds()).toEqual([]);
   });
 
   it("settles an errored session as failed during one-shot register", async () => {
