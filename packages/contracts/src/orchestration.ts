@@ -1326,14 +1326,18 @@ export type OrchestrationEvent = typeof OrchestrationEvent.Type;
 export const OrchestrationThreadStreamItem = Schema.Union([
   Schema.Struct({
     kind: Schema.Literal("snapshot"),
-    storageEpoch: TrimmedNonEmptyString,
+    /** Missing for stream frames produced by older environment servers. */
+    storageEpoch: Schema.optionalKey(TrimmedNonEmptyString),
     /** Accept this snapshot authoritatively even when its sequence moved backwards. */
     force: Schema.optionalKey(Schema.Boolean),
     snapshot: OrchestrationThreadDetailSnapshot,
   }),
   Schema.Struct({
     kind: Schema.Literal("event"),
-    storageEpoch: TrimmedNonEmptyString,
+    /** Missing for stream frames produced by older environment servers. */
+    storageEpoch: Schema.optionalKey(TrimmedNonEmptyString),
+    /** Reset stale cursors before applying this authoritative event. */
+    force: Schema.optionalKey(Schema.Boolean),
     event: OrchestrationEvent,
   }),
 ]);

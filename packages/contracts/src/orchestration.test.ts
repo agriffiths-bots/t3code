@@ -16,6 +16,7 @@ import {
   ProjectMetaUpdatedPayload,
   OrchestrationProposedPlan,
   OrchestrationSession,
+  OrchestrationThreadStreamItem,
   ProjectCreateCommand,
   ThreadMetaUpdatedPayload,
   ThreadTurnStartCommand,
@@ -50,7 +51,36 @@ function getOptionValue(
 const decodeThreadCreatedPayload = Schema.decodeUnknownEffect(ThreadCreatedPayload);
 const decodeOrchestrationCommand = Schema.decodeUnknownEffect(OrchestrationCommand);
 const decodeOrchestrationEvent = Schema.decodeUnknownEffect(OrchestrationEvent);
+const decodeOrchestrationThreadStreamItem = Schema.decodeUnknownEffect(
+  OrchestrationThreadStreamItem,
+);
 const decodeThreadMetaUpdatedPayload = Schema.decodeUnknownEffect(ThreadMetaUpdatedPayload);
+
+it.effect("decodes legacy thread stream frames without a storage epoch", () =>
+  Effect.gen(function* () {
+    const decoded = yield* decodeOrchestrationThreadStreamItem({
+      kind: "event",
+      event: {
+        eventId: "event-legacy-delete",
+        sequence: 8,
+        occurredAt: "2026-07-16T06:00:00.000Z",
+        commandId: null,
+        causationEventId: null,
+        correlationId: null,
+        metadata: {},
+        aggregateKind: "thread",
+        aggregateId: "thread-legacy",
+        type: "thread.deleted",
+        payload: {
+          threadId: "thread-legacy",
+          deletedAt: "2026-07-16T06:00:00.000Z",
+        },
+      },
+    });
+
+    assert.strictEqual(decoded.storageEpoch, undefined);
+  }),
+);
 
 it.effect("parses turn diff input when fromTurnCount <= toTurnCount", () =>
   Effect.gen(function* () {

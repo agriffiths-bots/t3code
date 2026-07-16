@@ -154,10 +154,11 @@ const makeHarness = Effect.fn("TestEnvironmentThreads.makeHarness")(function* (o
   readonly reconciliationPolicy?: ThreadReconciliationPolicy;
   readonly revisionSequence?: number;
   readonly projectionSequence?: number;
-  readonly cachedStorageEpoch?: string;
+  readonly cachedStorageEpoch?: string | null;
   readonly cachedLatestSequence?: number;
   readonly revisionStorageEpoch?: string;
   readonly revisionEventId?: EventId | null;
+  readonly preserveMissingSnapshotMetadata?: boolean;
 }) {
   const inputs = yield* Queue.unbounded<TestThreadInput>();
   const observed = yield* Queue.unbounded<EnvironmentThreadState>();
@@ -183,6 +184,9 @@ const makeHarness = Effect.fn("TestEnvironmentThreads.makeHarness")(function* (o
   const normalizeSnapshot = (
     snapshot: OrchestrationThreadDetailSnapshot,
   ): OrchestrationThreadDetailSnapshot => {
+    if (options?.preserveMissingSnapshotMetadata === true) {
+      return snapshot;
+    }
     const latestSequence = snapshot.latestSequence ?? snapshot.snapshotSequence;
     return {
       ...snapshot,
@@ -340,7 +344,9 @@ const makeHarness = Effect.fn("TestEnvironmentThreads.makeHarness")(function* (o
           ? Option.some({
               snapshotSequence: CACHED_SNAPSHOT_SEQUENCE,
               thread: options.cached,
-              storageEpoch: options.cachedStorageEpoch ?? STORAGE_EPOCH,
+              ...(options.cachedStorageEpoch === null
+                ? {}
+                : { storageEpoch: options.cachedStorageEpoch ?? STORAGE_EPOCH }),
               latestSequence: options.cachedLatestSequence ?? CACHED_SNAPSHOT_SEQUENCE,
               latestEventId: markerEventId(
                 options.cachedLatestSequence ?? CACHED_SNAPSHOT_SEQUENCE,
@@ -455,6 +461,22 @@ const titleUpdated = (
   },
 });
 
+const legacyTitleUpdated = (title: string, sequence: number): OrchestrationThreadStreamItem => {
+  const { storageEpoch: _storageEpoch, ...item } = titleUpdated(title, sequence);
+  return item;
+};
+
+const legacySnapshot = (
+  thread: OrchestrationThread,
+  snapshotSequence: number,
+): OrchestrationThreadStreamItem => ({
+  kind: "snapshot",
+  snapshot: {
+    snapshotSequence,
+    thread,
+  },
+});
+
 const activityAppended = (
   summary: string,
   sequence = 3,
@@ -508,6 +530,16 @@ const deleted = (sequence = 3, storageEpoch = STORAGE_EPOCH): OrchestrationThrea
       deletedAt: "2026-04-01T02:00:00.000Z",
     },
   },
+});
+
+const legacyDeleted = (sequence: number): OrchestrationThreadStreamItem => {
+  const { storageEpoch: _storageEpoch, ...item } = deleted(sequence);
+  return item;
+};
+
+const forcedDeleted = (sequence: number): OrchestrationThreadStreamItem => ({
+  ...deleted(sequence),
+  force: true,
 });
 
 const archived = (sequence = 3, storageEpoch = STORAGE_EPOCH): OrchestrationThreadStreamItem => ({
@@ -782,6 +814,155 @@ describe("EnvironmentThreads", () => {
       );
       expect(Option.getOrThrow(postRestore.data).title).toBe("First post-restore event");
       expect(yield* Ref.get(harness.loaderCalls)).toBe(1);
+    }),
+  );
+
+  it.effect("recovers once before accepting legacy stream frames without a storage epoch", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness({
+        cached: BASE_THREAD,
+        revisionSequence: CACHED_SNAPSHOT_SEQUENCE,
+        preserveMissingSnapshotMetadata: true,
+      });
+      yield* awaitThreadState(harness.observed, (value) => value.status === "live");
+
+      const recoveredThread = {
+        ...BASE_THREAD,
+        title: "Authoritative legacy recovery",
+        updatedAt: "2026-07-16T02:12:00.000Z",
+      };
+      yield* Ref.set(harness.revisionAvailable, false);
+      yield* Ref.set(
+        harness.httpSnapshot,
+        Option.some({
+          snapshotSequence: 8,
+          thread: recoveredThread,
+        }),
+      );
+      yield* Queue.offer(harness.inputs, legacyTitleUpdated("Unverified legacy event", 8));
+      for (let index = 0; index < 5; index += 1) {
+        yield* Effect.yieldNow;
+      }
+
+      yield* TestClock.adjust("2 seconds");
+      yield* Effect.yieldNow;
+      const recovered = yield* awaitThreadState(
+        harness.observed,
+        (value) => Option.isSome(value.data) && value.data.value.title === recoveredThread.title,
+      );
+      expect(Option.getOrThrow(recovered.data).title).toBe(recoveredThread.title);
+      expect(yield* Ref.get(harness.loaderCalls)).toBe(1);
+
+      yield* Queue.offer(harness.inputs, legacyTitleUpdated("Subsequent legacy event", 9));
+      const updated = yield* awaitThreadState(
+        harness.observed,
+        (value) =>
+          Option.isSome(value.data) && value.data.value.title === "Subsequent legacy event",
+      );
+      expect(Option.getOrThrow(updated.data).title).toBe("Subsequent legacy event");
+      yield* TestClock.adjust("8 seconds");
+      yield* Effect.yieldNow;
+      expect(yield* Ref.get(harness.loaderCalls)).toBe(1);
+      expect(yield* Ref.get(harness.subscriptionCount)).toBe(1);
+
+      const deletionHarness = yield* makeHarness({
+        cached: BASE_THREAD,
+        revisionSequence: CACHED_SNAPSHOT_SEQUENCE,
+        preserveMissingSnapshotMetadata: true,
+      });
+      yield* awaitThreadState(deletionHarness.observed, (value) => value.status === "live");
+      yield* Ref.set(deletionHarness.revisionAvailable, false);
+      yield* Ref.set(deletionHarness.httpReconcileResult, Option.some({ kind: "missing" }));
+      yield* Queue.offer(deletionHarness.inputs, legacyDeleted(8));
+      for (let index = 0; index < 5; index += 1) {
+        yield* Effect.yieldNow;
+      }
+
+      yield* TestClock.adjust("2 seconds");
+      yield* Effect.yieldNow;
+      const deletedState = yield* awaitThreadState(
+        deletionHarness.observed,
+        (value) => value.status === "deleted",
+      );
+      expect(deletedState.status).toBe("deleted");
+      expect(yield* Ref.get(deletionHarness.loaderCalls)).toBe(1);
+      yield* TestClock.adjust("8 seconds");
+      yield* Effect.yieldNow;
+      expect(yield* Ref.get(deletionHarness.loaderCalls)).toBe(1);
+      expect(yield* Ref.get(deletionHarness.subscriptionCount)).toBe(1);
+    }),
+  );
+
+  it.effect("revalidates a warm unknown-epoch cache at every session boundary", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness({
+        cached: {
+          ...BASE_THREAD,
+          title: "Stale unknown-epoch cache",
+        },
+        cachedStorageEpoch: null,
+        cachedLatestSequence: 10,
+      });
+
+      const firstAuthoritativeThread = {
+        ...BASE_THREAD,
+        title: "First authoritative legacy snapshot",
+      };
+      yield* Queue.offer(harness.inputs, legacySnapshot(firstAuthoritativeThread, 4));
+      const firstRecovered = yield* awaitThreadState(
+        harness.observed,
+        (value) =>
+          Option.isSome(value.data) && value.data.value.title === firstAuthoritativeThread.title,
+      );
+      expect(Option.getOrThrow(firstRecovered.data).title).toBe(firstAuthoritativeThread.title);
+      expect(yield* Ref.get(harness.lastSubscribeAfterSequence)).toBeUndefined();
+
+      yield* Queue.offer(harness.inputs, legacyTitleUpdated("First legacy live event", 5));
+      yield* awaitThreadState(
+        harness.observed,
+        (value) =>
+          Option.isSome(value.data) && value.data.value.title === "First legacy live event",
+      );
+
+      yield* harness.replaceSession;
+      for (let index = 0; index < 5; index += 1) {
+        yield* Effect.yieldNow;
+      }
+      const secondAuthoritativeThread = {
+        ...BASE_THREAD,
+        title: "Reconnect authoritative legacy snapshot",
+      };
+      yield* Queue.offer(harness.inputs, legacySnapshot(secondAuthoritativeThread, 3));
+      const secondRecovered = yield* awaitThreadState(
+        harness.observed,
+        (value) =>
+          Option.isSome(value.data) && value.data.value.title === secondAuthoritativeThread.title,
+      );
+
+      expect(Option.getOrThrow(secondRecovered.data).title).toBe(secondAuthoritativeThread.title);
+      expect(yield* Ref.get(harness.subscribeAfterSequences)).toEqual([undefined, undefined]);
+      expect(yield* Ref.get(harness.loaderCalls)).toBe(0);
+      expect(yield* Ref.get(harness.subscriptionCount)).toBe(2);
+    }),
+  );
+
+  it.effect("applies a forced deletion below the stale same-epoch cursor", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness({
+        cached: BASE_THREAD,
+        revisionSequence: CACHED_SNAPSHOT_SEQUENCE,
+      });
+      yield* awaitThreadState(harness.observed, (value) => value.status === "live");
+
+      yield* Queue.offer(harness.inputs, forcedDeleted(CACHED_SNAPSHOT_SEQUENCE - 1));
+      const deletedState = yield* awaitThreadState(
+        harness.observed,
+        (value) => value.status === "deleted",
+      );
+
+      expect(deletedState.status).toBe("deleted");
+      expect(yield* Ref.get(harness.removedThreads)).toEqual([THREAD_ID]);
+      expect(yield* Ref.get(harness.subscriptionCount)).toBe(1);
     }),
   );
 
