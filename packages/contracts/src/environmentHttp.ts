@@ -32,6 +32,7 @@ import {
   OrchestrationReadModel,
   OrchestrationShellSnapshot,
   OrchestrationThreadDetailSnapshot,
+  OrchestrationThreadRevision,
 } from "./orchestration.ts";
 import {
   RelayCloudEnvironmentHealthRequest,
@@ -93,6 +94,7 @@ export const EnvironmentInternalErrorReason = Schema.Literals([
   "client_session_revoke_failed",
   "orchestration_snapshot_failed",
   "orchestration_thread_snapshot_failed",
+  "orchestration_thread_revision_failed",
   "orchestration_dispatch_failed",
   "internal_error",
 ]);
@@ -489,6 +491,14 @@ export class EnvironmentOrchestrationHttpApi extends HttpApiGroup.make("orchestr
       params: EnvironmentOrchestrationThreadSnapshotParams,
       success: OrchestrationThreadDetailSnapshot,
       error: EnvironmentOrchestrationThreadSnapshotErrors,
+    }).middleware(EnvironmentAuthenticatedAuth),
+  )
+  .add(
+    HttpApiEndpoint.get("threadRevision", "/api/orchestration/threads/:threadId/revision", {
+      headers: OptionalBearerHeaders,
+      params: EnvironmentOrchestrationThreadSnapshotParams,
+      success: OrchestrationThreadRevision,
+      error: EnvironmentOrchestrationSnapshotErrors,
     }).middleware(EnvironmentAuthenticatedAuth),
   )
   .add(
