@@ -30,6 +30,7 @@ import * as OrchestrationReactor from "./orchestration/Services/OrchestrationRea
 import * as ProjectionSnapshotQuery from "./orchestration/Services/ProjectionSnapshotQuery.ts";
 import * as ScheduledTasksReactor from "./orchestration/Services/ScheduledTasksReactor.ts";
 import * as ExternalLauncher from "./process/externalLauncher.ts";
+import * as WorkerProcessIsolation from "./process/WorkerProcessIsolation.ts";
 import * as ProviderSessionReaper from "./provider/Services/ProviderSessionReaper.ts";
 import * as AnalyticsService from "./telemetry/AnalyticsService.ts";
 import * as ServerRuntimeStartup from "./serverRuntimeStartup.ts";
@@ -194,6 +195,10 @@ it.effect("desktop startup starts scheduled tasks reactor before command readine
               launchBrowser: () => Effect.void,
               launchEditor: () => Effect.void,
             } as never),
+            Layer.succeed(WorkerProcessIsolation.WorkerProcessIsolation, {
+              ...WorkerProcessIsolation.disabled,
+              reapStaleScopes: () => pushReactorStart("worker-scope-reaper"),
+            }),
             Layer.succeed(ProjectionSnapshotQuery.ProjectionSnapshotQuery, {
               getCounts: () => Effect.succeed({ projectCount: 0, threadCount: 0 }),
             } as never),
@@ -215,6 +220,7 @@ it.effect("desktop startup starts scheduled tasks reactor before command readine
       yield* startup.awaitCommandReady;
 
       assert.deepStrictEqual(yield* Ref.get(reactorStarts), [
+        "worker-scope-reaper",
         "orchestration",
         "provider-reaper",
         "child-coordinator",

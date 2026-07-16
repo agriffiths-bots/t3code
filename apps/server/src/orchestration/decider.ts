@@ -589,6 +589,9 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
             Object.hasOwn(command, "interactionMode") && command.interactionMode !== undefined
               ? command.interactionMode
               : targetThread.interactionMode,
+          ...(command.providerSessionDetached !== undefined
+            ? { providerSessionDetached: command.providerSessionDetached }
+            : {}),
           ...(sourceProposedPlan !== undefined ? { sourceProposedPlan } : {}),
           createdAt: command.createdAt,
         },

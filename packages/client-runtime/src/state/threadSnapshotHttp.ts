@@ -1,4 +1,8 @@
-import type { OrchestrationThreadDetailSnapshot, ThreadId } from "@t3tools/contracts";
+import type {
+  OrchestrationThreadDetailSnapshot,
+  OrchestrationThreadRevision,
+  ThreadId,
+} from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
@@ -58,6 +62,39 @@ export const fetchEnvironmentThreadSnapshot = Effect.fn(
   );
 });
 
+/** Read only the persisted-event marker for a thread aggregate. */
+export const fetchEnvironmentThreadRevision = Effect.fn(
+  "clientRuntime.state.fetchEnvironmentThreadRevision",
+)(function* (input: {
+  readonly prepared: PreparedConnection;
+  readonly threadId: ThreadId;
+  readonly signer: Option.Option<ManagedRelayDpopSigner["Service"]>;
+  readonly timeoutMs?: number;
+}) {
+  const requestUrl = environmentEndpointUrl(
+    input.prepared.httpBaseUrl,
+    `/api/orchestration/threads/${input.threadId}/revision`,
+  );
+  const client = yield* makeEnvironmentHttpApiClient(input.prepared.httpBaseUrl);
+  const headers = yield* buildEnvironmentAuthHeaders(
+    input.prepared.httpAuthorization,
+    "GET",
+    requestUrl,
+    input.signer,
+  );
+  return yield* executeEnvironmentHttpRequest(
+    requestUrl,
+    input.timeoutMs ?? DEFAULT_THREAD_SNAPSHOT_TIMEOUT_MS,
+    withEnvironmentCredentials(
+      input.prepared.httpAuthorization,
+      client.orchestration.threadRevision({
+        params: { threadId: input.threadId },
+        headers,
+      }),
+    ),
+  );
+});
+
 export type FetchEnvironmentThreadSnapshotError = RemoteEnvironmentRequestError;
 
 export type ThreadSnapshotLoadResult =
@@ -67,6 +104,17 @@ export type ThreadSnapshotLoadResult =
     }
   | {
       readonly kind: "missing";
+    }
+  | {
+      readonly kind: "unavailable";
+    };
+
+export type ThreadRevisionLoadResult =
+  | {
+      readonly kind: "found";
+      readonly revision: OrchestrationThreadRevision;
+      /** UTF-8 bytes in the decoded JSON marker, for client load telemetry. */
+      readonly responseBytes: number;
     }
   | {
       readonly kind: "unavailable";
@@ -92,6 +140,50 @@ export class ThreadSnapshotLoader extends Context.Service<
     ) => Effect.Effect<ThreadSnapshotLoadResult>;
   }
 >()("@t3tools/client-runtime/state/threadSnapshotHttp/ThreadSnapshotLoader") {}
+
+export class ThreadRevisionLoader extends Context.Service<
+  ThreadRevisionLoader,
+  {
+    readonly load: (
+      prepared: PreparedConnection,
+      threadId: ThreadId,
+    ) => Effect.Effect<ThreadRevisionLoadResult>;
+  }
+>()("@t3tools/client-runtime/state/threadSnapshotHttp/ThreadRevisionLoader") {}
+
+const jsonResponseBytes = (value: unknown): number =>
+  new TextEncoder().encode(JSON.stringify(value)).byteLength;
+
+export const threadRevisionLoaderLayer: Layer.Layer<
+  ThreadRevisionLoader,
+  never,
+  HttpClient.HttpClient
+> = Layer.effect(
+  ThreadRevisionLoader,
+  Effect.gen(function* () {
+    const httpClient = yield* HttpClient.HttpClient;
+    const signer = yield* Effect.serviceOption(ManagedRelayDpopSigner);
+    return ThreadRevisionLoader.of({
+      load: (prepared, threadId) =>
+        fetchEnvironmentThreadRevision({ prepared, threadId, signer }).pipe(
+          Effect.map(
+            (revision): ThreadRevisionLoadResult => ({
+              kind: "found",
+              revision,
+              responseBytes: jsonResponseBytes(revision),
+            }),
+          ),
+          Effect.provideService(HttpClient.HttpClient, httpClient),
+          Effect.catchCause((cause) =>
+            Effect.logWarning("Could not load the thread revision over HTTP.").pipe(
+              Effect.annotateLogs({ threadId, cause: Cause.pretty(cause) }),
+              Effect.as({ kind: "unavailable" } as const),
+            ),
+          ),
+        ),
+    });
+  }),
+);
 
 export const threadSnapshotLoaderLayer: Layer.Layer<
   ThreadSnapshotLoader,

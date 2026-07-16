@@ -144,6 +144,7 @@ describe("environment RPC", () => {
   it.effect("switches durable subscriptions when the supervisor replaces the session", () =>
     Effect.gen(function* () {
       const subscriptions: string[] = [];
+      const lifecycle: string[] = [];
       const firstClient = {
         [WS_METHODS.subscribeTerminalEvents]: () => {
           subscriptions.push("first");
@@ -169,7 +170,14 @@ describe("environment RPC", () => {
         return yield* Effect.die(new Error(`Expected ${count} durable subscriptions.`));
       });
 
-      const subscriptionFiber = yield* subscribe(WS_METHODS.subscribeTerminalEvents, {}).pipe(
+      const subscriptionFiber = yield* subscribe(
+        WS_METHODS.subscribeTerminalEvents,
+        {},
+        {
+          onSessionStart: () => Effect.sync(() => lifecycle.push("start")).pipe(Effect.asVoid),
+          onSessionStop: () => Effect.sync(() => lifecycle.push("stop")).pipe(Effect.asVoid),
+        },
+      ).pipe(
         Stream.runDrain,
         Effect.provideService(EnvironmentSupervisor.EnvironmentSupervisor, supervisor),
         Effect.forkChild,
@@ -181,6 +189,7 @@ describe("environment RPC", () => {
       yield* Fiber.interrupt(subscriptionFiber);
 
       expect(subscriptions).toEqual(["first", "second"]);
+      expect(lifecycle).toEqual(["start", "stop", "start", "stop"]);
       expect(yield* Ref.get(retryCount)).toBe(0);
     }),
   );

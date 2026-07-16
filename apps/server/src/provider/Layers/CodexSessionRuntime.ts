@@ -132,6 +132,7 @@ export interface CodexThreadSnapshot {
 }
 
 export interface CodexSessionRuntimeShape {
+  readonly processId?: number;
   readonly start: () => Effect.Effect<ProviderSession, CodexSessionRuntimeError>;
   readonly getSession: Effect.Effect<ProviderSession>;
   readonly sendTurn: (
@@ -1260,6 +1261,7 @@ export const makeCodexSessionRuntime = (
     });
 
     return {
+      processId: Number(child.pid),
       start,
       getSession: Ref.get(sessionRef),
       sendTurn: (input) =>

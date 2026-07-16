@@ -47,7 +47,6 @@ import {
   parseRemotePairingHostChange,
   parseRemotePairingFields,
 } from "./ConnectionsSettings.logic";
-import { resolveRelayClerkTokenOptions } from "../../cloud/publicConfig";
 import {
   SettingsPageContainer,
   SettingsRow,

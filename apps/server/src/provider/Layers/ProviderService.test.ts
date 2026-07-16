@@ -1587,6 +1587,66 @@ routing.layer("ProviderServiceLive routing", (it) => {
     }),
   );
 
+  it.effect("preserves a pre-existing active turn when a steer fails before turn.started", () =>
+    Effect.gen(function* () {
+      const provider = yield* ProviderService.ProviderService;
+      const directory = yield* ProviderSessionDirectory.ProviderSessionDirectory;
+      const threadId = asThreadId("thread-failed-steer-existing-turn");
+
+      yield* provider.startSession(threadId, {
+        provider: ProviderDriverKind.make("codex"),
+        providerInstanceId: codexInstanceId,
+        threadId,
+        runtimeMode: "full-access",
+      });
+      const existingTurn = yield* provider.sendTurn({
+        threadId,
+        input: "keep this provider turn running",
+        attachments: [],
+      });
+      routing.codex.sendTurn.mockImplementationOnce(() =>
+        Effect.fail(
+          new ProviderAdapterRequestError({
+            provider: String(CODEX_DRIVER),
+            method: "session/prompt",
+            detail: "steer rejected before turn.started",
+          }),
+        ),
+      );
+
+      const steerFailure = yield* provider
+        .sendTurn({
+          threadId,
+          input: "steer the existing provider turn",
+          attachments: [],
+        })
+        .pipe(Effect.flip);
+
+      assert.equal(steerFailure._tag, "ProviderSendTurnFailedError");
+      if (steerFailure._tag === "ProviderSendTurnFailedError") {
+        assert.equal(steerFailure.turnId, undefined);
+        assert.equal(steerFailure.superseded, false);
+      }
+      const binding = Option.getOrThrow(yield* directory.getBinding(threadId));
+      const runtimePayload = binding.runtimePayload as {
+        readonly activeTurnId?: unknown;
+        readonly lastError?: unknown;
+        readonly lastFailedSendTurnOperationId?: unknown;
+        readonly lastRuntimeEvent?: unknown;
+        readonly lastTerminalTurnId?: unknown;
+        readonly sendTurnOperationId?: unknown;
+      };
+      assert.equal(binding.status, "running");
+      assert.equal(runtimePayload.activeTurnId, existingTurn.turnId);
+      assert.equal(runtimePayload.lastError, null);
+      assert.equal(runtimePayload.lastFailedSendTurnOperationId, null);
+      assert.equal(runtimePayload.lastRuntimeEvent, "provider.sendTurn");
+      assert.equal(runtimePayload.lastTerminalTurnId, null);
+      assert.equal(runtimePayload.sendTurnOperationId, null);
+      assert.equal(routing.codex.sessions.get(threadId)?.activeTurnId, existingTurn.turnId);
+    }),
+  );
+
   it.effect("fails persisted active turn state when sendTurn rejects despite a live adapter", () =>
     Effect.gen(function* () {
       const provider = yield* ProviderService.ProviderService;
@@ -3523,6 +3583,54 @@ fanout.layer("ProviderServiceLive fanout", (it) => {
     }),
   );
 
+  it.effect("persists and publishes an owning adapter's live session error", () =>
+    Effect.gen(function* () {
+      const threadId = asThreadId("thread-live-adapter-session-error");
+      const provider = yield* ProviderService.ProviderService;
+      const directory = yield* ProviderSessionDirectory.ProviderSessionDirectory;
+      yield* provider.startSession(threadId, {
+        provider: ProviderDriverKind.make("codex"),
+        providerInstanceId: codexInstanceId,
+        threadId,
+        runtimeMode: "full-access",
+      });
+      const errorEventId = asEventId("evt-live-adapter-session-error");
+      const publishedError = yield* provider.streamEvents.pipe(
+        Stream.filter((event) => event.eventId === errorEventId),
+        Stream.take(1),
+        Stream.runCollect,
+        Effect.forkChild,
+      );
+      yield* advanceTestClock(50);
+
+      fanout.codex.emit({
+        type: "session.state.changed",
+        eventId: errorEventId,
+        provider: ProviderDriverKind.make("codex"),
+        createdAt: "2026-01-01T00:00:10.000Z",
+        threadId,
+        payload: {
+          state: "error",
+          reason: "Windows sandbox setup failed",
+        },
+      });
+
+      const publishedEvents = Array.from(yield* Fiber.join(publishedError));
+      assert.equal(publishedEvents[0]?.type, "session.state.changed");
+      assert.equal(fanout.codex.sessions.has(threadId), true);
+      const binding = Option.getOrThrow(yield* directory.getBinding(threadId));
+      const runtimePayload = binding.runtimePayload as {
+        readonly activeTurnId?: unknown;
+        readonly lastError?: unknown;
+        readonly lastRuntimeEvent?: unknown;
+      };
+      assert.equal(binding.status, "error");
+      assert.equal(runtimePayload.activeTurnId, null);
+      assert.equal(runtimePayload.lastError, "Windows sandbox setup failed");
+      assert.equal(runtimePayload.lastRuntimeEvent, "session.state.changed");
+    }),
+  );
+
   it.effect("marks the runtime binding failed when a provider process exits mid-turn", () =>
     Effect.gen(function* () {
       const threadId = asThreadId("thread-runtime-process-exit");
@@ -3960,6 +4068,7 @@ fanout.layer("ProviderServiceLive fanout", (it) => {
     Effect.gen(function* () {
       const threadId = asThreadId("thread-failed-cleanup-absence-proof");
       const provider = yield* ProviderService.ProviderService;
+      const directory = yield* ProviderSessionDirectory.ProviderSessionDirectory;
       yield* provider.startSession(threadId, {
         provider: ProviderDriverKind.make("codex"),
         providerInstanceId: codexInstanceId,
@@ -3992,6 +4101,15 @@ fanout.layer("ProviderServiceLive fanout", (it) => {
       assert.equal(ownedCallbackRan, false);
       assert.equal(fanout.codex.sessions.has(threadId), true);
 
+      const bindingWithoutRuntimeTurn = Option.getOrThrow(yield* directory.getBinding(threadId));
+      yield* directory.upsert({
+        ...bindingWithoutRuntimeTurn,
+        runtimePayload: {
+          ...(bindingWithoutRuntimeTurn.runtimePayload as Record<string, unknown>),
+          activeTurnId: null,
+          lastTerminalTurnId: null,
+        },
+      });
       fanout.codex.sessions.delete(threadId);
       const deadClaimFiber = yield* provider
         .stopFailedSession({

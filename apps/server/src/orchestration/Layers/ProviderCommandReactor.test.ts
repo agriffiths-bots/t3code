@@ -517,6 +517,52 @@ describe("ProviderCommandReactor", () => {
     expect(thread?.session?.runtimeMode).toBe("approval-required");
   });
 
+  it.each([
+    { driver: "codex", instanceId: "codex", model: "gpt-5-codex" },
+    { driver: "grok", instanceId: "grok", model: "grok-code-fast-1" },
+    {
+      driver: "claudeAgent",
+      instanceId: "claudeAgent",
+      model: "claude-opus-4-6",
+    },
+  ] as const)(
+    "passes the detached session hint to the $driver provider",
+    async ({ driver, instanceId, model }) => {
+      const modelSelection = {
+        instanceId: ProviderInstanceId.make(instanceId),
+        model,
+      };
+      const harness = await createHarness({ threadModelSelection: modelSelection });
+      const now = "2026-01-01T00:00:00.000Z";
+
+      await runtime!.runPromise(
+        harness.engine.dispatch({
+          type: "thread.turn.start",
+          commandId: CommandId.make(`cmd-detached-${driver}`),
+          threadId: ThreadId.make("thread-1"),
+          message: {
+            messageId: asMessageId(`user-message-detached-${driver}`),
+            role: "user",
+            text: `run detached with ${driver}`,
+            attachments: [],
+          },
+          interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+          runtimeMode: "approval-required",
+          providerSessionDetached: true,
+          createdAt: now,
+        }),
+      );
+
+      await waitFor(() => harness.startSession.mock.calls.length === 1);
+      await waitFor(() => harness.sendTurn.mock.calls.length === 1);
+      expect(harness.startSession.mock.calls[0]?.[1]).toMatchObject({
+        provider: driver,
+        providerInstanceId: instanceId,
+        detached: true,
+      });
+    },
+  );
+
   it("does not start a provider session for an archived thread", async () => {
     const harness = await createHarness();
     const now = "2026-01-01T00:00:00.000Z";
