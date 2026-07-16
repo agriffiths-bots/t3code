@@ -95,6 +95,7 @@ interface PendingInjection {
 type TurnDiffCompletedEvent = Extract<OrchestrationEvent, { type: "thread.turn-diff-completed" }>;
 type TurnStartRequestedEvent = Extract<OrchestrationEvent, { type: "thread.turn-start-requested" }>;
 type SessionSetEvent = Extract<OrchestrationEvent, { type: "thread.session-set" }>;
+type ActivityAppendedEvent = Extract<OrchestrationEvent, { type: "thread.activity-appended" }>;
 type ThreadArchivedEvent = Extract<OrchestrationEvent, { type: "thread.archived" }>;
 type ThreadUnarchivedEvent = Extract<OrchestrationEvent, { type: "thread.unarchived" }>;
 type ThreadDeletedEvent = Extract<OrchestrationEvent, { type: "thread.deleted" }>;
@@ -173,6 +174,21 @@ const shouldSettleTerminalSession = (input: {
 }): boolean =>
   input.status === "error" ||
   (input.status === "stopped" && (!input.turnRunning || input.missingDiffWhileRunning));
+
+const clearFailedPendingTurnStart = (input: {
+  readonly threadId: ThreadId;
+  readonly activeTurns: Map<ThreadId, TurnId>;
+  readonly pendingStarts: Set<ThreadId>;
+  readonly pendingSameTurnStarts: Map<ThreadId, TurnId>;
+}): void => {
+  if (!input.pendingStarts.has(input.threadId)) return;
+  const preservedActiveTurnId = input.pendingSameTurnStarts.get(input.threadId);
+  input.pendingStarts.delete(input.threadId);
+  input.pendingSameTurnStarts.delete(input.threadId);
+  if (preservedActiveTurnId !== undefined) {
+    input.activeTurns.set(input.threadId, preservedActiveTurnId);
+  }
+};
 
 const parseIsoMillis = (value: string | null | undefined): number | null => {
   if (value == null) return null;
@@ -1895,6 +1911,18 @@ const make = Effect.gen(function* () {
       missingDiffWhileRunningByChild.delete(threadId);
     });
 
+  const handleActivityAppended = (event: ActivityAppendedEvent) =>
+    Effect.sync(() => {
+      const { threadId, activity } = event.payload;
+      if (!children.has(threadId) || activity.kind !== "provider.turn.start.failed") return;
+      clearFailedPendingTurnStart({
+        threadId,
+        activeTurns: activeTurnByChild,
+        pendingStarts: pendingTurnStartByChild,
+        pendingSameTurnStarts: pendingSameTurnStartByChild,
+      });
+    });
+
   const processEvent = (event: OrchestrationEvent) => {
     switch (event.type) {
       case "thread.turn-diff-completed":
@@ -1903,6 +1931,8 @@ const make = Effect.gen(function* () {
         return handleTurnStartRequested(event);
       case "thread.session-set":
         return handleSessionSet(event);
+      case "thread.activity-appended":
+        return handleActivityAppended(event);
       case "thread.archived":
         return handleThreadArchived(event);
       case "thread.unarchived":
@@ -2503,6 +2533,20 @@ const make = Effect.gen(function* () {
               activeTurnByReplayedChild.delete(threadId);
               pendingTurnStartByReplayedChild.add(threadId);
               missingDiffWhileRunningByReplayedChild.delete(threadId);
+              return;
+            }
+            case "thread.activity-appended": {
+              const { threadId, activity } = event.payload;
+              if (!knownChildIds.has(threadId)) return;
+              if (lifecycleTerminatedByChild.has(threadId)) return;
+              if (activeArchiveByReplayedChild.has(threadId)) return;
+              if (activity.kind !== "provider.turn.start.failed") return;
+              clearFailedPendingTurnStart({
+                threadId,
+                activeTurns: activeTurnByReplayedChild,
+                pendingStarts: pendingTurnStartByReplayedChild,
+                pendingSameTurnStarts: pendingSameTurnStartByReplayedChild,
+              });
               return;
             }
             case "thread.session-set": {

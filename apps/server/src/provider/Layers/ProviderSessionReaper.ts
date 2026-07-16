@@ -61,6 +61,36 @@ function liveSessionStillRunsTurn(session: ProviderSession | undefined, turnId: 
   );
 }
 
+function bindingRecordsTerminalTurn(
+  binding: ProviderRuntimeBindingWithMetadata,
+  turnId: TurnId,
+): boolean {
+  const runtimePayload = binding.runtimePayload;
+  if (
+    runtimePayload === null ||
+    typeof runtimePayload !== "object" ||
+    Array.isArray(runtimePayload)
+  ) {
+    return false;
+  }
+  const payload = runtimePayload as Record<string, unknown>;
+  const lastRuntimeEvent = payload.lastRuntimeEvent;
+  const watchdogOwnsTerminalMarker =
+    typeof lastRuntimeEvent === "string" && lastRuntimeEvent.startsWith("provider.turn.watchdog.");
+  return (
+    !watchdogOwnsTerminalMarker &&
+    typeof payload.lastTerminalTurnId === "string" &&
+    payload.lastTerminalTurnId === turnId
+  );
+}
+
+function hasReadySessionForThread(
+  sessions: ReadonlyArray<ProviderSession>,
+  threadId: ThreadId,
+): boolean {
+  return sessions.some((session) => session.threadId === threadId && session.status === "ready");
+}
+
 function activeTurnKey(threadId: ThreadId, turnId: TurnId): string {
   return `${threadId}:${turnId}`;
 }
@@ -83,6 +113,7 @@ const makeProviderSessionReaper = (options?: ProviderSessionReaperLiveOptions) =
       options?.permissionRequestTimeoutMs ?? DEFAULT_PERMISSION_REQUEST_TIMEOUT_MS,
     );
     const stopTimeoutMs = Math.max(1, options?.stopTimeoutMs ?? DEFAULT_STOP_TIMEOUT_MS);
+    const projectionLagDeferrals = new Map<ThreadId, TurnId>();
 
     const stopProviderSession = <E, R>(input: {
       readonly threadId: ThreadId;
@@ -324,6 +355,26 @@ const makeProviderSessionReaper = (options?: ProviderSessionReaperLiveOptions) =
           const failedAt = DateTime.formatIso(yield* DateTime.now);
           const expiredApprovalRequestIds = expiredApprovals.map((approval) => approval.requestId);
 
+          // ProviderService can persist terminal runtime state, and the adapter
+          // can become ready, before the projection consumes the canonical event.
+          // Give either disagreement one full sweep for projection catch-up. If
+          // it remains stable, normal liveness/ownership checks resume so a lost
+          // canonical event cannot disable stale-turn healing forever.
+          const bindingRecordsTerminal = bindingRecordsTerminalTurn(binding, activeTurnId);
+          const liveSessionIsReady =
+            Option.isSome(liveSessions) &&
+            hasReadySessionForThread(liveSessions.value, binding.threadId);
+          if (
+            (bindingRecordsTerminal || liveSessionIsReady) &&
+            projectionLagDeferrals.get(binding.threadId) !== activeTurnId
+          ) {
+            projectionLagDeferrals.set(binding.threadId, activeTurnId);
+            continue;
+          }
+          if (!bindingRecordsTerminal && !liveSessionIsReady) {
+            projectionLagDeferrals.delete(binding.threadId);
+          }
+
           if (binding.status === "error" || binding.status === "stopped") {
             yield* failActiveTurn({
               binding,
@@ -397,6 +448,8 @@ const makeProviderSessionReaper = (options?: ProviderSessionReaperLiveOptions) =
           });
           continue;
         }
+
+        projectionLagDeferrals.delete(binding.threadId);
 
         const terminalFailedSession = thread?.session?.status === "error" ? thread.session : null;
         const terminalFailedTurn =

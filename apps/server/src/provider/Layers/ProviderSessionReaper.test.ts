@@ -316,6 +316,9 @@ describe("ProviderSessionReaper", () => {
     return {
       dispatch,
       dispatchedCommands,
+      setReadModel: (nextReadModel: ReturnType<typeof makeReadModel>) => {
+        readModel = nextReadModel as unknown as OrchestrationReadModel;
+      },
       stopSession,
       stoppedThreadIds,
       readModel: () => readModel,
@@ -327,6 +330,8 @@ describe("ProviderSessionReaper", () => {
     readonly turnId: TurnId;
     readonly status?: "running" | "error" | "stopped";
     readonly lastError?: string;
+    readonly lastSeenAt?: string;
+    readonly lastTerminalTurnId?: TurnId;
   }) {
     const repository = await runtime!.runPromise(
       Effect.service(ProviderSessionRuntime.ProviderSessionRuntimeRepository),
@@ -339,17 +344,23 @@ describe("ProviderSessionReaper", () => {
         adapterKey: "claudeAgent",
         runtimeMode: "full-access",
         status: input.status ?? "running",
-        lastSeenAt: "2026-01-01T00:00:00.000Z",
+        lastSeenAt: input.lastSeenAt ?? "2026-01-01T00:00:00.000Z",
         resumeCursor: { opaque: `resume-${input.threadId}` },
         runtimePayload: {
           cwd: `/tmp/${input.threadId}`,
           detached: true,
           model: "test-watchdog-model",
-          activeTurnId: input.status === "error" ? null : input.turnId,
-          ...(input.status === "error"
+          activeTurnId:
+            input.status === "error" || input.lastTerminalTurnId !== undefined
+              ? null
+              : input.turnId,
+          ...(input.status === "error" || input.lastTerminalTurnId !== undefined
             ? {
-                lastTerminalTurnId: input.turnId,
-                lastRuntimeEvent: "provider.turn.watchdog.stop-pending",
+                lastTerminalTurnId: input.lastTerminalTurnId ?? input.turnId,
+                lastRuntimeEvent:
+                  input.status === "error"
+                    ? "provider.turn.watchdog.stop-pending"
+                    : "turn.completed",
               }
             : {}),
           ...(input.lastError !== undefined ? { lastError: input.lastError } : {}),
@@ -417,6 +428,258 @@ describe("ProviderSessionReaper", () => {
       cwd: `/tmp/${threadId}`,
       detached: true,
       model: "test-watchdog-model",
+    });
+  });
+
+  it("defers a projected running turn while its live session is already ready", async () => {
+    const threadId = ThreadId.make("thread-watchdog-ready-projection-lag");
+    const turnId = TurnId.make("turn-watchdog-ready-projection-lag");
+    const startedAt = "2026-01-01T00:00:00.000Z";
+    const lastSeenAt = DateTime.formatIso(await Effect.runPromise(DateTime.now));
+    let snapshotCount = 0;
+    const runningReadModel = makeReadModel([
+      {
+        id: threadId,
+        latestTurn: {
+          turnId,
+          state: "running",
+          requestedAt: startedAt,
+          startedAt,
+          completedAt: null,
+          assistantMessageId: null,
+        },
+        session: {
+          threadId,
+          status: "running",
+          providerName: "claudeAgent",
+          runtimeMode: "full-access",
+          activeTurnId: turnId,
+          lastError: null,
+          updatedAt: startedAt,
+        },
+      },
+    ]);
+    const harness = await createHarness({
+      sweepIntervalMs: 100,
+      listSessionsImplementation: () =>
+        Effect.sync(() => {
+          snapshotCount += 1;
+          return [
+            {
+              provider: ProviderDriverKind.make("claudeAgent"),
+              providerInstanceId: ProviderInstanceId.make("claudeAgent"),
+              status: "ready" as const,
+              runtimeMode: "full-access" as const,
+              threadId,
+              createdAt: startedAt,
+              updatedAt: startedAt,
+            },
+          ];
+        }),
+      readModel: runningReadModel,
+    });
+    await seedActiveRuntimeBinding({ threadId, turnId, lastSeenAt });
+
+    const reaper = await runtime!.runPromise(Effect.service(ProviderSessionReaper));
+    scope = await runtime!.runPromise(Scope.make("sequential"));
+    await runtime!.runPromise(reaper.start().pipe(Scope.provide(scope)));
+    await waitFor(() => snapshotCount >= 1);
+    await runtime!.runPromise(drainFibers);
+
+    expect(harness.readModel().threads[0]?.latestTurn?.state).toBe("running");
+    expect(harness.dispatch).not.toHaveBeenCalled();
+    expect(harness.stopSession).not.toHaveBeenCalled();
+
+    const snapshotsBeforeProjectionCatchUp = snapshotCount;
+    harness.setReadModel(
+      makeReadModel([
+        {
+          id: threadId,
+          latestTurn: {
+            turnId,
+            state: "completed",
+            requestedAt: startedAt,
+            startedAt,
+            completedAt: startedAt,
+            assistantMessageId: null,
+          },
+          session: {
+            threadId,
+            status: "ready",
+            providerName: "claudeAgent",
+            runtimeMode: "full-access",
+            activeTurnId: null,
+            lastError: null,
+            updatedAt: startedAt,
+          },
+        },
+      ]),
+    );
+    await waitFor(() => snapshotCount > snapshotsBeforeProjectionCatchUp);
+    await runtime!.runPromise(drainFibers);
+
+    expect(harness.readModel().threads[0]?.latestTurn?.state).toBe("completed");
+    expect(harness.dispatch).not.toHaveBeenCalled();
+    expect(harness.stopSession).not.toHaveBeenCalled();
+  });
+
+  it("fails an orphaned projected turn after one ready-session grace sweep", async () => {
+    const threadId = ThreadId.make("thread-watchdog-ready-stuck-projection");
+    const turnId = TurnId.make("turn-watchdog-ready-stuck-projection");
+    const startedAt = "2026-01-01T00:00:00.000Z";
+    let snapshotCount = 0;
+    const harness = await createHarness({
+      sweepIntervalMs: 2,
+      listSessionsImplementation: () =>
+        Effect.sync(() => {
+          snapshotCount += 1;
+          return [
+            {
+              provider: ProviderDriverKind.make("claudeAgent"),
+              providerInstanceId: ProviderInstanceId.make("claudeAgent"),
+              status: "ready" as const,
+              runtimeMode: "full-access" as const,
+              threadId,
+              createdAt: startedAt,
+              updatedAt: startedAt,
+            },
+          ];
+        }),
+      readModel: makeReadModel([
+        {
+          id: threadId,
+          latestTurn: {
+            turnId,
+            state: "running",
+            requestedAt: startedAt,
+            startedAt,
+            completedAt: null,
+            assistantMessageId: null,
+          },
+          session: {
+            threadId,
+            status: "running",
+            providerName: "claudeAgent",
+            runtimeMode: "full-access",
+            activeTurnId: turnId,
+            lastError: null,
+            updatedAt: startedAt,
+          },
+        },
+      ]),
+    });
+    await seedActiveRuntimeBinding({ threadId, turnId });
+
+    const reaper = await runtime!.runPromise(Effect.service(ProviderSessionReaper));
+    scope = await runtime!.runPromise(Scope.make("sequential"));
+    await runtime!.runPromise(reaper.start().pipe(Scope.provide(scope)));
+    await waitFor(() => harness.readModel().threads[0]?.latestTurn?.state === "error");
+
+    expect(snapshotCount).toBeGreaterThanOrEqual(2);
+    expect(harness.stopSession).toHaveBeenCalledWith({ threadId });
+    expect(harness.readModel().threads[0]?.session).toMatchObject({
+      status: "stopped",
+      lastError: expect.stringContaining("disappeared"),
+    });
+  });
+
+  it("defers a projected running turn already recorded terminal in its binding", async () => {
+    const threadId = ThreadId.make("thread-watchdog-terminal-binding-projection-lag");
+    const turnId = TurnId.make("turn-watchdog-terminal-binding-projection-lag");
+    const startedAt = "2026-01-01T00:00:00.000Z";
+    const harness = await createHarness({
+      sweepIntervalMs: 60_000,
+      listSessionsImplementation: () => Effect.succeed([]),
+      readModel: makeReadModel([
+        {
+          id: threadId,
+          latestTurn: {
+            turnId,
+            state: "running",
+            requestedAt: startedAt,
+            startedAt,
+            completedAt: null,
+            assistantMessageId: null,
+          },
+          session: {
+            threadId,
+            status: "running",
+            providerName: "claudeAgent",
+            runtimeMode: "full-access",
+            activeTurnId: turnId,
+            lastError: null,
+            updatedAt: startedAt,
+          },
+        },
+      ]),
+    });
+    await seedActiveRuntimeBinding({
+      threadId,
+      turnId,
+      lastTerminalTurnId: turnId,
+    });
+
+    const reaper = await runtime!.runPromise(Effect.service(ProviderSessionReaper));
+    scope = await runtime!.runPromise(Scope.make("sequential"));
+    await runtime!.runPromise(reaper.start().pipe(Scope.provide(scope)));
+    await runtime!.runPromise(drainFibers);
+
+    expect(harness.readModel().threads[0]?.latestTurn?.state).toBe("running");
+    expect(harness.dispatch).not.toHaveBeenCalled();
+    expect(harness.stopSession).not.toHaveBeenCalled();
+  });
+
+  it("fails an orphaned projected turn after one terminal-binding grace sweep", async () => {
+    const threadId = ThreadId.make("thread-watchdog-terminal-binding-stuck-projection");
+    const turnId = TurnId.make("turn-watchdog-terminal-binding-stuck-projection");
+    const startedAt = "2026-01-01T00:00:00.000Z";
+    let snapshotCount = 0;
+    const harness = await createHarness({
+      sweepIntervalMs: 2,
+      listSessionsImplementation: () =>
+        Effect.sync(() => {
+          snapshotCount += 1;
+          return [];
+        }),
+      readModel: makeReadModel([
+        {
+          id: threadId,
+          latestTurn: {
+            turnId,
+            state: "running",
+            requestedAt: startedAt,
+            startedAt,
+            completedAt: null,
+            assistantMessageId: null,
+          },
+          session: {
+            threadId,
+            status: "running",
+            providerName: "claudeAgent",
+            runtimeMode: "full-access",
+            activeTurnId: turnId,
+            lastError: null,
+            updatedAt: startedAt,
+          },
+        },
+      ]),
+    });
+    await seedActiveRuntimeBinding({
+      threadId,
+      turnId,
+      lastTerminalTurnId: turnId,
+    });
+
+    const reaper = await runtime!.runPromise(Effect.service(ProviderSessionReaper));
+    scope = await runtime!.runPromise(Scope.make("sequential"));
+    await runtime!.runPromise(reaper.start().pipe(Scope.provide(scope)));
+    await waitFor(() => harness.readModel().threads[0]?.latestTurn?.state === "error");
+
+    expect(snapshotCount).toBeGreaterThanOrEqual(2);
+    expect(harness.stopSession).toHaveBeenCalledWith({ threadId });
+    expect(harness.readModel().threads[0]?.session).toMatchObject({
+      status: "stopped",
+      lastError: expect.stringContaining("disappeared"),
     });
   });
 

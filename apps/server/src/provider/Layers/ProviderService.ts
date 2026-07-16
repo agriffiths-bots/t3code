@@ -399,6 +399,30 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
   );
   const pendingMcpSessionStarts = yield* Ref.make(new Map<ThreadId, number>());
   const activeSendTurnOperations = yield* Ref.make(new Map<ThreadId, string>());
+  const startAdapterSessionWithTimeout = Effect.fn(
+    "ProviderService.startAdapterSessionWithTimeout",
+  )(function* (input: {
+    readonly adapter: ProviderAdapterShape<ProviderAdapterError>;
+    readonly request: ProviderSessionStartInput;
+    readonly sessionOwnershipId?: string;
+  }) {
+    const startedSession = yield* input.adapter
+      .startSession(input.request)
+      .pipe(Effect.timeoutOption(sessionStartTimeoutMs));
+    if (Option.isNone(startedSession)) {
+      const detail = `Provider startup timed out after ${sessionStartTimeoutMs}ms.`;
+      return yield* new ProviderSessionStartTimeoutError({
+        provider: input.adapter.provider,
+        threadId: input.request.threadId,
+        detail,
+        timeoutMs: sessionStartTimeoutMs,
+        ...(input.sessionOwnershipId !== undefined
+          ? { sessionOwnershipId: input.sessionOwnershipId }
+          : {}),
+      });
+    }
+    return startedSession.value;
+  });
   const threadSessionLocks = yield* SynchronizedRef.make(
     new Map<ThreadId, { readonly semaphore: Semaphore.Semaphore; readonly users: number }>(),
   );
@@ -1715,6 +1739,11 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
       const persistedCwd = readPersistedCwd(input.binding.runtimePayload);
       const persistedModelSelection = readPersistedModelSelection(input.binding.runtimePayload);
       const persistedDetached = readPersistedDetached(input.binding.runtimePayload);
+      const persistedRuntimePayload = readRecord(input.binding.runtimePayload) ?? {};
+      const persistedSessionOwnershipId =
+        typeof persistedRuntimePayload.sessionOwnershipId === "string"
+          ? persistedRuntimePayload.sessionOwnershipId
+          : undefined;
       const persistedActiveTurnId = readResumableActiveTurnId(
         input.binding.provider,
         input.binding.runtimePayload,
@@ -1724,16 +1753,22 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
       let preparedMcpSession: McpProviderSession.McpProviderSessionConfig | undefined;
       const resumed = yield* Effect.gen(function* () {
         preparedMcpSession = yield* prepareMcpSession(input.binding.threadId, bindingInstanceId);
-        return yield* adapter.startSession({
-          threadId: input.binding.threadId,
-          provider: input.binding.provider,
-          providerInstanceId: bindingInstanceId,
-          ...(persistedCwd ? { cwd: persistedCwd } : {}),
-          ...(persistedModelSelection ? { modelSelection: persistedModelSelection } : {}),
-          ...(hasResumeCursor ? { resumeCursor: input.binding.resumeCursor } : {}),
-          ...(persistedDetached !== undefined ? { detached: persistedDetached } : {}),
-          ...(persistedActiveTurnId !== undefined ? { activeTurnId: persistedActiveTurnId } : {}),
-          runtimeMode: input.binding.runtimeMode ?? "full-access",
+        return yield* startAdapterSessionWithTimeout({
+          adapter,
+          request: {
+            threadId: input.binding.threadId,
+            provider: input.binding.provider,
+            providerInstanceId: bindingInstanceId,
+            ...(persistedCwd ? { cwd: persistedCwd } : {}),
+            ...(persistedModelSelection ? { modelSelection: persistedModelSelection } : {}),
+            ...(hasResumeCursor ? { resumeCursor: input.binding.resumeCursor } : {}),
+            ...(persistedDetached !== undefined ? { detached: persistedDetached } : {}),
+            ...(persistedActiveTurnId !== undefined ? { activeTurnId: persistedActiveTurnId } : {}),
+            runtimeMode: input.binding.runtimeMode ?? "full-access",
+          },
+          ...(persistedSessionOwnershipId !== undefined
+            ? { sessionOwnershipId: persistedSessionOwnershipId }
+            : {}),
         });
       }).pipe(
         Effect.onError(() =>
@@ -2031,8 +2066,9 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
           let preparedMcpSession: McpProviderSession.McpProviderSessionConfig | undefined;
           const session = yield* Effect.gen(function* () {
             preparedMcpSession = yield* prepareMcpSession(threadId, resolvedInstanceId);
-            const startedSession = yield* adapter
-              .startSession({
+            return yield* startAdapterSessionWithTimeout({
+              adapter,
+              request: {
                 ...input,
                 providerInstanceId: resolvedInstanceId,
                 ...(effectiveCwd !== undefined ? { cwd: effectiveCwd } : {}),
@@ -2043,21 +2079,11 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
                 ...(effectiveActiveTurnId !== undefined
                   ? { activeTurnId: effectiveActiveTurnId }
                   : {}),
-              })
-              .pipe(Effect.timeoutOption(sessionStartTimeoutMs));
-            if (Option.isNone(startedSession)) {
-              const detail = `Provider startup timed out after ${sessionStartTimeoutMs}ms.`;
-              return yield* new ProviderSessionStartTimeoutError({
-                provider: resolvedProvider,
-                threadId,
-                detail,
-                timeoutMs: sessionStartTimeoutMs,
-                ...(persistedSessionOwnershipId !== undefined
-                  ? { sessionOwnershipId: persistedSessionOwnershipId }
-                  : {}),
-              });
-            }
-            return startedSession.value;
+              },
+              ...(persistedSessionOwnershipId !== undefined
+                ? { sessionOwnershipId: persistedSessionOwnershipId }
+                : {}),
+            });
           }).pipe(
             Effect.onError(() =>
               clearPreparedMcpSession(threadId, resolvedInstanceId, preparedMcpSession),

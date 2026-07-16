@@ -261,6 +261,27 @@ const sessionSetEvent = (
     payload: { threadId, session: makeSession(threadId, status, activeTurnId, lastError) },
   }) as unknown as OrchestrationEvent;
 
+const providerTurnStartFailedEvent = (threadId: ThreadId): OrchestrationEvent =>
+  ({
+    eventId: EventId.make(`evt-provider-turn-start-failed-${threadId}`),
+    type: "thread.activity-appended",
+    aggregateKind: "thread",
+    aggregateId: threadId,
+    occurredAt: now,
+    payload: {
+      threadId,
+      activity: {
+        id: EventId.make(`activity-provider-turn-start-failed-${threadId}`),
+        tone: "error",
+        kind: "provider.turn.start.failed",
+        summary: "Provider turn start failed",
+        payload: { detail: "steer rejected before turn.started" },
+        turnId: null,
+        createdAt: now,
+      },
+    },
+  }) as unknown as OrchestrationEvent;
+
 const threadDeletedEvent = (threadId: ThreadId): OrchestrationEvent =>
   ({
     eventId: EventId.make(`evt-deleted-${threadId}`),
@@ -2664,6 +2685,47 @@ describe("ChildThreadCoordinator", () => {
 
     const slice = await runtimeWaitSlice(harness, [child], PAST_MS);
     expect(slice.results[0]!.status).toBe("timeout");
+  });
+
+  it("replays a failed steer by restoring the old turn and waking its parent on completion", async () => {
+    const child = ThreadId.make("recon-failed-steer-completed-child");
+    const parent = ThreadId.make("recon-failed-steer-completed-parent");
+    const oldTurn = TurnId.make("turn-before-failed-steer");
+    const harness = await createHarness({
+      threads: [
+        makeThreadState({
+          threadId: parent,
+          latestTurn: makeLatestTurn("completed", TurnId.make("turn-parent-before-child-wake")),
+          session: makeSession(parent, "ready"),
+        }),
+        makeThreadState({
+          threadId: child,
+          parentThreadId: parent,
+          latestTurn: makeLatestTurn("completed", oldTurn),
+          session: makeSession(child, "ready"),
+          assistantText: "old turn completed after the failed steer",
+        }),
+      ],
+      seedChildRows: [{ threadId: child, parentThreadId: parent }],
+      persistedEvents: [
+        turnStartRequestedEvent(child),
+        sessionSetEvent(child, "running", oldTurn),
+        turnStartRequestedEvent(child),
+        providerTurnStartFailedEvent(child),
+        sessionSetEvent(child, "ready"),
+      ],
+    });
+
+    const result = await runtimeRun(harness, child);
+    expect(result.status).toBe("completed");
+    expect(result.finalAssistantText).toBe("old turn completed after the failed steer");
+    const parentWakes = harness.dispatched.filter(
+      (command) => command.type === "thread.turn.start" && command.threadId === parent,
+    ) as Array<Extract<OrchestrationCommand, { type: "thread.turn.start" }>>;
+    expect(parentWakes).toHaveLength(1);
+    expect(parentWakes[0]!.message.text).toContain(
+      `[sub-agent ${child} completed] old turn completed after the failed steer`,
+    );
   });
 
   it("reconciles completed projection before killing a missing-diff child whose provider is gone", async () => {

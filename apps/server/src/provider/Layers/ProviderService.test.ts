@@ -2086,6 +2086,43 @@ routing.layer("ProviderServiceLive routing", (it) => {
     }),
   );
 
+  it.effect("bounds provider startup while recovering a stale session for sendTurn", () =>
+    Effect.gen(function* () {
+      const provider = yield* ProviderService.ProviderService;
+      const threadId = asThreadId("thread-hung-provider-recovery-start-timeout");
+      const initial = yield* provider.startSession(threadId, {
+        provider: ProviderDriverKind.make("codex"),
+        providerInstanceId: codexInstanceId,
+        threadId,
+        cwd: "/tmp/project-hung-recovery-start",
+        runtimeMode: "full-access",
+      });
+      yield* routing.codex.stopAll();
+      routing.codex.startSession.mockImplementationOnce(() => Effect.never);
+      const sendCallsBeforeRecovery = routing.codex.sendTurn.mock.calls.length;
+
+      const failureFiber = yield* provider
+        .sendTurn({
+          threadId: initial.threadId,
+          input: "resume through a hung provider start",
+          attachments: [],
+        })
+        .pipe(Effect.flip, Effect.forkChild);
+      yield* Effect.yieldNow;
+      yield* advanceTestClock(50);
+
+      const failure = yield* Fiber.join(failureFiber);
+      assert.equal(failure._tag, "ProviderSessionStartTimeoutError");
+      if (failure._tag === "ProviderSessionStartTimeoutError") {
+        assert.equal(failure.provider, "codex");
+        assert.equal(failure.threadId, threadId);
+        assert.equal(failure.timeoutMs, 50);
+        assert.equal(failure.detail, "Provider startup timed out after 50ms.");
+      }
+      assert.equal(routing.codex.sendTurn.mock.calls.length, sendCallsBeforeRecovery);
+    }),
+  );
+
   it.effect("allows provider startup that completes just under the injected timeout", () =>
     Effect.gen(function* () {
       const provider = yield* ProviderService.ProviderService;
