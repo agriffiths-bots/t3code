@@ -16,6 +16,9 @@ import {
   ProviderInstanceId,
   type ProviderRuntimeEvent,
   type ProviderRequestKind,
+  type ProviderSession,
+  type ProviderSessionStartInput,
+  EventId,
   type ThreadTokenUsageSnapshot,
   type ProviderUserInputAnswers,
   RuntimeItemId,
@@ -26,10 +29,13 @@ import {
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as Crypto from "effect/Crypto";
+import * as DateTime from "effect/DateTime";
+import * as Deferred from "effect/Deferred";
 import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
 import * as FileSystem from "effect/FileSystem";
 import * as Queue from "effect/Queue";
+import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
 import * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
@@ -88,11 +94,100 @@ export interface CodexAdapterLiveOptions {
 
 interface CodexAdapterSessionContext {
   readonly threadId: ThreadId;
+  readonly generation: number;
+  readonly detached: boolean;
   readonly scope: Scope.Closeable;
   readonly runtime: CodexSessionRuntimeShape;
   readonly eventFiber: Fiber.Fiber<void, never>;
+  readonly stopCompleted: Deferred.Deferred<void>;
+  readonly exitForwarded: Ref.Ref<boolean>;
+  readonly mcpProviderSessionId: string | undefined;
   stopped: boolean;
 }
+
+export const deleteSessionIfCurrent = <Key, Session extends { readonly generation: number }>(
+  sessions: Map<Key, Session>,
+  key: Key,
+  expected: Session,
+): boolean => {
+  const current = sessions.get(key);
+  if (current !== expected || current.generation !== expected.generation) return false;
+  return sessions.delete(key);
+};
+
+interface CodexStartCompatibility {
+  readonly cwd: string;
+  readonly model: string | undefined;
+  readonly resumeThreadId: string | undefined;
+  readonly serviceTier: string | undefined;
+  readonly mcpSessionKey: string | undefined;
+  readonly runtimeMode: ProviderSessionStartInput["runtimeMode"];
+  readonly detached: boolean;
+  readonly adapterGeneration: string;
+}
+
+interface CodexStartOperation {
+  readonly compatibility: CodexStartCompatibility;
+  readonly result: Deferred.Deferred<ProviderSession, ProviderAdapterError>;
+  readonly cancel: Deferred.Deferred<void>;
+  readonly completed: Deferred.Deferred<void>;
+}
+
+interface CodexInFlightStart {
+  readonly operation: CodexStartOperation;
+  readonly waiterCount: number;
+}
+
+interface CodexStartGateState {
+  readonly closing: boolean;
+  readonly inFlight: ReadonlyMap<ThreadId, CodexInFlightStart>;
+  readonly startIntents: ReadonlyMap<ThreadId, ReadonlySet<Deferred.Deferred<void>>>;
+  readonly stoppingAll: Deferred.Deferred<void> | undefined;
+  readonly stoppingThreads: ReadonlyMap<ThreadId, Deferred.Deferred<void>>;
+}
+
+type CodexStartDecision =
+  | { readonly _tag: "Closed" }
+  | {
+      readonly _tag: "WaitForStop";
+      readonly completed: Deferred.Deferred<void>;
+    }
+  | { readonly _tag: "Join"; readonly operation: CodexStartOperation }
+  | { readonly _tag: "Wait"; readonly operation: CodexStartOperation }
+  | { readonly _tag: "Lead"; readonly operation: CodexStartOperation };
+
+type CodexSessionStopReason = "replace" | "explicit" | "stop-all" | "adapter-release";
+
+type CodexThreadStopDecision =
+  | { readonly _tag: "WaitAll"; readonly completed: Deferred.Deferred<void> }
+  | { readonly _tag: "Join"; readonly completed: Deferred.Deferred<void> }
+  | {
+      readonly _tag: "Lead";
+      readonly operation: CodexStartOperation | undefined;
+      readonly intents: ReadonlyArray<Deferred.Deferred<void>>;
+    };
+
+type CodexStopAllDecision =
+  | { readonly _tag: "Join"; readonly completed: Deferred.Deferred<void> }
+  | {
+      readonly _tag: "Lead";
+      readonly operations: ReadonlyArray<CodexStartOperation>;
+      readonly intents: ReadonlyArray<Deferred.Deferred<void>>;
+      readonly threadStops: ReadonlyArray<Deferred.Deferred<void>>;
+    };
+
+const startCompatibilitiesEqual = (
+  left: CodexStartCompatibility,
+  right: CodexStartCompatibility,
+): boolean =>
+  left.cwd === right.cwd &&
+  left.model === right.model &&
+  left.resumeThreadId === right.resumeThreadId &&
+  left.serviceTier === right.serviceTier &&
+  left.mcpSessionKey === right.mcpSessionKey &&
+  left.runtimeMode === right.runtimeMode &&
+  left.detached === right.detached &&
+  left.adapterGeneration === right.adapterGeneration;
 
 function mapCodexRuntimeError(
   threadId: ThreadId,
@@ -1372,32 +1467,101 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
     options?.nativeEventLogger === undefined ? nativeEventLogger : undefined;
   const runtimeEventQueue = yield* Queue.unbounded<ProviderRuntimeEvent>();
   const sessions = new Map<ThreadId, CodexAdapterSessionContext>();
+  const adapterGeneration = yield* crypto.randomUUIDv4.pipe(Effect.orDie);
+  // ProviderInstanceRegistry closes an old instance scope before constructing
+  // its replacement, so the bound instance id and generation are implicit in
+  // this adapter-local keyed gate.
+  const startGate = yield* Ref.make<CodexStartGateState>({
+    closing: false,
+    inFlight: new Map(),
+    startIntents: new Map(),
+    stoppingAll: undefined,
+    stoppingThreads: new Map(),
+  });
+  let nextSessionGeneration = 0;
 
-  const startSession: CodexAdapterShape["startSession"] = (input) =>
+  const emitGracefulSessionExit = Effect.fn("emitGracefulSessionExit")(function* (
+    session: CodexAdapterSessionContext,
+  ) {
+    const event: ProviderEvent = {
+      id: EventId.make(yield* crypto.randomUUIDv4.pipe(Effect.orDie)),
+      kind: "session",
+      provider: PROVIDER,
+      threadId: session.threadId,
+      createdAt: DateTime.formatIso(yield* DateTime.now),
+      method: "session/closed",
+      message: "Session stopped",
+    };
+    yield* Queue.offerAll(
+      runtimeEventQueue,
+      mapToRuntimeEvents(
+        event,
+        session.threadId,
+        session.mcpProviderSessionId ? { mcpProviderSessionId: session.mcpProviderSessionId } : {},
+      ),
+    );
+  });
+
+  const emitGracefulSessionExitIfNeeded = Effect.fn("emitGracefulSessionExitIfNeeded")(function* (
+    session: CodexAdapterSessionContext,
+  ) {
+    const alreadyForwarded = yield* Ref.getAndSet(session.exitForwarded, true);
+    if (!alreadyForwarded) {
+      yield* emitGracefulSessionExit(session);
+    }
+  });
+
+  const startCompatibility = (
+    input: ProviderSessionStartInput,
+    mcpSession: McpProviderSession.McpProviderSessionConfig | undefined,
+  ): CodexStartCompatibility => {
+    const boundModelSelection =
+      input.modelSelection?.instanceId === boundInstanceId ? input.modelSelection : undefined;
+    return {
+      cwd: input.cwd ?? process.cwd(),
+      model: boundModelSelection?.model,
+      resumeThreadId: isCodexResumeCursorSchema(input.resumeCursor)
+        ? input.resumeCursor.threadId
+        : undefined,
+      serviceTier: getCodexServiceTierOptionValue(boundModelSelection),
+      mcpSessionKey: mcpSession
+        ? JSON.stringify({
+            environmentId: mcpSession.environmentId,
+            providerSessionId: mcpSession.providerSessionId,
+            providerInstanceId: mcpSession.providerInstanceId,
+            endpoint: mcpSession.endpoint,
+            authorizationHeader: mcpSession.authorizationHeader,
+          })
+        : undefined,
+      runtimeMode: input.runtimeMode,
+      detached: input.detached === true,
+      adapterGeneration,
+    };
+  };
+
+  const startSessionTransaction = (
+    input: ProviderSessionStartInput,
+    compatibility: CodexStartCompatibility,
+    mcpSession: McpProviderSession.McpProviderSessionConfig | undefined,
+  ): Effect.Effect<ProviderSession, ProviderAdapterError> =>
     Effect.scoped(
       Effect.gen(function* () {
-        if (input.provider !== undefined && input.provider !== PROVIDER) {
-          return yield* new ProviderAdapterValidationError({
-            provider: PROVIDER,
-            operation: "startSession",
-            issue: `Expected provider '${PROVIDER}' but received '${input.provider}'.`,
-          });
-        }
-
         const existing = sessions.get(input.threadId);
-        if (existing && !existing.stopped) {
-          yield* Effect.suspend(() => stopSessionInternal(existing));
+        let replacementPublished = false;
+        if (existing) {
+          yield* Effect.uninterruptible(
+            Effect.addFinalizer(() =>
+              replacementPublished ? Effect.void : emitGracefulSessionExitIfNeeded(existing),
+            ).pipe(Effect.andThen(Effect.suspend(() => stopSessionInternal(existing, "replace")))),
+          );
         }
 
-        const serviceTier =
-          input.modelSelection?.instanceId === boundInstanceId
-            ? getCodexServiceTierOptionValue(input.modelSelection)
-            : undefined;
-        const mcpSession = McpProviderSession.readMcpProviderSession(input.threadId);
+        nextSessionGeneration += 1;
+        const sessionGeneration = nextSessionGeneration;
         const runtimeInput: CodexSessionRuntimeOptions = {
           threadId: input.threadId,
           providerInstanceId: boundInstanceId,
-          cwd: input.cwd ?? process.cwd(),
+          cwd: compatibility.cwd,
           binaryPath: codexConfig.binaryPath,
           ...(options?.environment ? { environment: options.environment } : {}),
           ...(codexConfig.homePath ? { homePath: codexConfig.homePath } : {}),
@@ -1408,7 +1572,7 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
           ...(input.modelSelection?.instanceId === boundInstanceId
             ? { model: input.modelSelection.model }
             : {}),
-          ...(serviceTier ? { serviceTier } : {}),
+          ...(compatibility.serviceTier ? { serviceTier: compatibility.serviceTier } : {}),
           ...(mcpSession
             ? makeCodexMcpRuntimeConfig(mcpSession, options?.environment ?? process.env)
             : {}),
@@ -1437,6 +1601,20 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
               }),
           ),
         );
+        let runtimeTransferred = false;
+        yield* Effect.addFinalizer(() =>
+          runtimeTransferred ? Effect.void : runtime.close.pipe(Effect.ignore),
+        );
+
+        yield* Effect.logInfo("codex.session.starting", {
+          providerInstanceId: boundInstanceId,
+          threadId: input.threadId,
+          childPid: runtime.processId,
+          detached: compatibility.detached,
+          adapterGeneration,
+          sessionGeneration,
+        });
+        const exitForwarded = yield* Ref.make(false);
 
         const eventFiber = yield* Stream.runForEach(runtime.events, (event) =>
           Effect.gen(function* () {
@@ -1455,7 +1633,12 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
               });
               return;
             }
-            yield* Queue.offerAll(runtimeEventQueue, runtimeEvents);
+            const forwardEvents = Queue.offerAll(runtimeEventQueue, runtimeEvents);
+            yield* runtimeEvents.some((runtimeEvent) => runtimeEvent.type === "session.exited")
+              ? Effect.uninterruptible(
+                  forwardEvents.pipe(Effect.andThen(Ref.set(exitForwarded, true))),
+                )
+              : forwardEvents;
           }),
         ).pipe(Effect.forkIn(sessionScope));
 
@@ -1469,25 +1652,225 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
                 cause,
               }),
           ),
-          Effect.onError(() =>
-            runtime.close.pipe(
-              Effect.andThen(Effect.ignore(Scope.close(sessionScope, Exit.void))),
-              Effect.andThen(Fiber.interrupt(eventFiber)),
-              Effect.ignore,
-            ),
-          ),
         );
 
-        sessions.set(input.threadId, {
+        yield* Effect.logInfo("codex.session.started", {
+          providerInstanceId: boundInstanceId,
           threadId: input.threadId,
-          scope: sessionScope,
-          runtime,
-          eventFiber,
-          stopped: false,
+          providerThreadId:
+            isCodexResumeCursorSchema(started.resumeCursor) && "threadId" in started.resumeCursor
+              ? started.resumeCursor.threadId
+              : undefined,
+          childPid: runtime.processId,
+          detached: compatibility.detached,
+          adapterGeneration,
+          sessionGeneration,
         });
-        sessionScopeTransferred = true;
+        const stopCompleted = yield* Deferred.make<void>();
 
-        return started;
+        // This must remain the final effect in the transaction. Publication,
+        // cleanup ownership transfer, and successful return happen in one
+        // synchronous step, so cancellation either cleans the candidate up or
+        // observes a fully published session.
+        return yield* Effect.sync(() => {
+          sessions.set(input.threadId, {
+            threadId: input.threadId,
+            generation: sessionGeneration,
+            detached: compatibility.detached,
+            scope: sessionScope,
+            runtime,
+            eventFiber,
+            stopCompleted,
+            exitForwarded,
+            mcpProviderSessionId: mcpSession?.providerSessionId,
+            stopped: false,
+          });
+          sessionScopeTransferred = true;
+          runtimeTransferred = true;
+          replacementPublished = true;
+          return started;
+        });
+      }),
+    );
+
+  const startSessionWithIntent = (
+    input: ProviderSessionStartInput,
+    intent: Deferred.Deferred<void>,
+    compatibility: CodexStartCompatibility,
+    mcpSession: McpProviderSession.McpProviderSessionConfig | undefined,
+  ): ReturnType<CodexAdapterShape["startSession"]> =>
+    Effect.uninterruptibleMask((restore) =>
+      Effect.gen(function* () {
+        if (input.provider !== undefined && input.provider !== PROVIDER) {
+          return yield* new ProviderAdapterValidationError({
+            provider: PROVIDER,
+            operation: "startSession",
+            issue: `Expected provider '${PROVIDER}' but received '${input.provider}'.`,
+          });
+        }
+        if (yield* Deferred.isDone(intent)) {
+          return yield* new ProviderAdapterSessionClosedError({
+            provider: PROVIDER,
+            threadId: input.threadId,
+          });
+        }
+
+        const candidate: CodexStartOperation = {
+          compatibility,
+          result: yield* Deferred.make<ProviderSession, ProviderAdapterError>(),
+          cancel: yield* Deferred.make<void>(),
+          completed: yield* Deferred.make<void>(),
+        };
+        const decision = yield* Ref.modify(
+          startGate,
+          (state): readonly [CodexStartDecision, CodexStartGateState] => {
+            if (state.closing) return [{ _tag: "Closed" as const }, state] as const;
+            const activeStop = state.stoppingAll ?? state.stoppingThreads.get(input.threadId);
+            if (activeStop !== undefined) {
+              return [{ _tag: "WaitForStop", completed: activeStop }, state];
+            }
+            const existing = state.inFlight.get(input.threadId);
+            if (existing !== undefined) {
+              if (
+                existing.waiterCount > 0 &&
+                startCompatibilitiesEqual(existing.operation.compatibility, compatibility)
+              ) {
+                const inFlight = new Map(state.inFlight);
+                inFlight.set(input.threadId, {
+                  ...existing,
+                  waiterCount: existing.waiterCount + 1,
+                });
+                return [
+                  { _tag: "Join", operation: existing.operation },
+                  { ...state, inFlight },
+                ];
+              }
+              return [{ _tag: "Wait", operation: existing.operation }, state];
+            }
+            const inFlight = new Map(state.inFlight);
+            inFlight.set(input.threadId, { operation: candidate, waiterCount: 1 });
+            return [
+              { _tag: "Lead", operation: candidate },
+              { ...state, inFlight },
+            ];
+          },
+        );
+
+        const awaitOwnedStart = (operation: CodexStartOperation) =>
+          restore(Deferred.await(operation.result)).pipe(
+            Effect.ensuring(
+              Ref.modify(startGate, (state) => {
+                const current = state.inFlight.get(input.threadId);
+                if (current?.operation !== operation || current.waiterCount <= 0) {
+                  return [false, state] as const;
+                }
+                const inFlight = new Map(state.inFlight);
+                const waiterCount = current.waiterCount - 1;
+                inFlight.set(input.threadId, { ...current, waiterCount });
+                return [waiterCount === 0, { ...state, inFlight }] as const;
+              }).pipe(
+                Effect.flatMap((cancel) =>
+                  cancel
+                    ? Deferred.succeed(operation.cancel, undefined).pipe(
+                        Effect.andThen(Deferred.await(operation.completed)),
+                        Effect.asVoid,
+                      )
+                    : Effect.void,
+                ),
+              ),
+            ),
+          );
+
+        if (decision._tag === "Closed") {
+          return yield* new ProviderAdapterSessionClosedError({
+            provider: PROVIDER,
+            threadId: input.threadId,
+          });
+        }
+        if (decision._tag === "WaitForStop") {
+          yield* restore(Deferred.await(decision.completed));
+          return yield* restore(startSessionWithIntent(input, intent, compatibility, mcpSession));
+        }
+        if (decision._tag === "Join") {
+          yield* Effect.logDebug("codex.session.start-joined", {
+            providerInstanceId: boundInstanceId,
+            threadId: input.threadId,
+            adapterGeneration,
+          });
+          return yield* awaitOwnedStart(decision.operation);
+        }
+        if (decision._tag === "Wait") {
+          yield* restore(Deferred.await(decision.operation.completed));
+          return yield* restore(startSessionWithIntent(input, intent, compatibility, mcpSession));
+        }
+
+        yield* Effect.raceFirst(
+          startSessionTransaction(input, compatibility, mcpSession),
+          Deferred.await(candidate.cancel).pipe(Effect.andThen(Effect.interrupt)),
+        ).pipe(
+          Effect.onExit((result) =>
+            Effect.gen(function* () {
+              yield* Ref.update(startGate, (state) => {
+                if (state.inFlight.get(input.threadId)?.operation !== candidate) return state;
+                const inFlight = new Map(state.inFlight);
+                inFlight.delete(input.threadId);
+                return { ...state, inFlight };
+              });
+              if (Exit.isSuccess(result)) {
+                yield* Deferred.succeed(candidate.result, result.value).pipe(Effect.orDie);
+              } else {
+                yield* Deferred.failCause(candidate.result, result.cause).pipe(Effect.orDie);
+              }
+              yield* Deferred.succeed(candidate.completed, undefined).pipe(Effect.orDie);
+            }),
+          ),
+          // The shared worker must outlive any one caller. Adapter release
+          // owns cancellation and drains every operation before shutdown.
+          Effect.forkDetach({ uninterruptible: false }),
+        );
+        return yield* awaitOwnedStart(candidate);
+      }),
+    );
+
+  const startSession: CodexAdapterShape["startSession"] = (input) =>
+    Effect.uninterruptibleMask((restore) =>
+      Effect.gen(function* () {
+        const mcpSession = McpProviderSession.readMcpProviderSession(input.threadId);
+        const compatibility = startCompatibility(input, mcpSession);
+        const intent = yield* Deferred.make<void>();
+        const registered = yield* Ref.modify(startGate, (state) => {
+          if (state.closing) return [false, state] as const;
+          const startIntents = new Map(state.startIntents);
+          const threadIntents = new Set(startIntents.get(input.threadId) ?? []);
+          threadIntents.add(intent);
+          startIntents.set(input.threadId, threadIntents);
+          return [true, { ...state, startIntents }] as const;
+        });
+        if (!registered) {
+          return yield* new ProviderAdapterSessionClosedError({
+            provider: PROVIDER,
+            threadId: input.threadId,
+          });
+        }
+        return yield* restore(
+          startSessionWithIntent(input, intent, compatibility, mcpSession),
+        ).pipe(
+          Effect.ensuring(
+            Ref.update(startGate, (state) => {
+              const current = state.startIntents.get(input.threadId);
+              if (current === undefined || !current.has(intent)) return state;
+              const startIntents = new Map(state.startIntents);
+              const threadIntents = new Set(current);
+              threadIntents.delete(intent);
+              if (threadIntents.size === 0) {
+                startIntents.delete(input.threadId);
+              } else {
+                startIntents.set(input.threadId, threadIntents);
+              }
+              return { ...state, startIntents };
+            }),
+          ),
+        );
       }),
     );
 
@@ -1650,25 +2033,117 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
 
   const stopSessionInternal = Effect.fn("stopSessionInternal")(function* (
     session: CodexAdapterSessionContext,
+    reason: CodexSessionStopReason,
   ) {
-    if (session.stopped) {
-      return;
-    }
-    session.stopped = true;
-    sessions.delete(session.threadId);
-    yield* session.runtime.close.pipe(Effect.ignore);
-    yield* Effect.ignore(Scope.close(session.scope, Exit.void));
-    yield* Fiber.interrupt(session.eventFiber).pipe(Effect.ignore);
+    yield* Effect.uninterruptible(
+      Effect.gen(function* () {
+        if (session.stopped) {
+          yield* Deferred.await(session.stopCompleted);
+          return;
+        }
+        session.stopped = true;
+        yield* Effect.logInfo("codex.session.stopping", {
+          providerInstanceId: boundInstanceId,
+          threadId: session.threadId,
+          childPid: session.runtime.processId,
+          detached: session.detached,
+          adapterGeneration,
+          sessionGeneration: session.generation,
+          reason,
+        });
+        yield* Fiber.interrupt(session.eventFiber).pipe(Effect.ignore);
+        yield* session.runtime.close.pipe(Effect.ignore);
+        yield* Effect.ignore(Scope.close(session.scope, Exit.void));
+        if (reason !== "replace") {
+          yield* emitGracefulSessionExitIfNeeded(session);
+        }
+        deleteSessionIfCurrent(sessions, session.threadId, session);
+        yield* Effect.logInfo("codex.session.stopped", {
+          providerInstanceId: boundInstanceId,
+          threadId: session.threadId,
+          childPid: session.runtime.processId,
+          detached: session.detached,
+          adapterGeneration,
+          sessionGeneration: session.generation,
+          reason,
+        });
+        yield* Deferred.succeed(session.stopCompleted, undefined).pipe(Effect.orDie);
+      }),
+    );
+  });
+
+  const stopThreadCoordinated: (
+    threadId: ThreadId,
+    reason: CodexSessionStopReason,
+  ) => Effect.Effect<void> = Effect.fn("stopThreadCoordinated")(function* (
+    threadId: ThreadId,
+    reason: CodexSessionStopReason,
+  ) {
+    yield* Effect.uninterruptible(
+      Effect.gen(function* () {
+        const completed = yield* Deferred.make<void>();
+        const decision = yield* Ref.modify(
+          startGate,
+          (state): readonly [CodexThreadStopDecision, CodexStartGateState] => {
+            if (state.stoppingAll !== undefined) {
+              return [{ _tag: "WaitAll" as const, completed: state.stoppingAll }, state] as const;
+            }
+            const currentStop = state.stoppingThreads.get(threadId);
+            if (currentStop !== undefined) {
+              return [{ _tag: "Join" as const, completed: currentStop }, state] as const;
+            }
+            const stoppingThreads = new Map(state.stoppingThreads);
+            stoppingThreads.set(threadId, completed);
+            return [
+              {
+                _tag: "Lead" as const,
+                operation: state.inFlight.get(threadId)?.operation,
+                intents: Array.from(state.startIntents.get(threadId) ?? []),
+              },
+              { ...state, stoppingThreads },
+            ] as const;
+          },
+        );
+
+        if (decision._tag === "WaitAll") {
+          yield* Deferred.await(decision.completed);
+          yield* stopThreadCoordinated(threadId, reason);
+          return;
+        }
+        if (decision._tag === "Join") {
+          yield* Deferred.await(decision.completed);
+          return;
+        }
+
+        yield* Effect.gen(function* () {
+          yield* Effect.forEach(decision.intents, (intent) => Deferred.succeed(intent, undefined), {
+            concurrency: 1,
+            discard: true,
+          });
+          if (decision.operation !== undefined) {
+            yield* Deferred.succeed(decision.operation.cancel, undefined);
+            yield* Deferred.await(decision.operation.completed);
+          }
+          const session = sessions.get(threadId);
+          if (session !== undefined) {
+            yield* stopSessionInternal(session, reason);
+          }
+        }).pipe(
+          Effect.ensuring(
+            Ref.update(startGate, (state) => {
+              if (state.stoppingThreads.get(threadId) !== completed) return state;
+              const stoppingThreads = new Map(state.stoppingThreads);
+              stoppingThreads.delete(threadId);
+              return { ...state, stoppingThreads };
+            }).pipe(Effect.andThen(Deferred.succeed(completed, undefined)), Effect.asVoid),
+          ),
+        );
+      }),
+    );
   });
 
   const stopSession: CodexAdapterShape["stopSession"] = (threadId) =>
-    Effect.gen(function* () {
-      const session = sessions.get(threadId);
-      if (!session) {
-        return;
-      }
-      yield* stopSessionInternal(session);
-    });
+    stopThreadCoordinated(threadId, "explicit");
 
   const listSessions: CodexAdapterShape["listSessions"] = () =>
     Effect.forEach(
@@ -1680,14 +2155,119 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
   const hasSession: CodexAdapterShape["hasSession"] = (threadId) =>
     Effect.succeed(Boolean(sessions.get(threadId) && !sessions.get(threadId)?.stopped));
 
-  const stopAll: CodexAdapterShape["stopAll"] = () =>
-    Effect.forEach(Array.from(sessions.values()), stopSessionInternal, {
-      concurrency: 1,
-      discard: true,
-    }).pipe(Effect.asVoid);
+  const stopAllWithReason = (reason: CodexSessionStopReason) =>
+    Effect.forEach(
+      Array.from(sessions.values()),
+      (session) => stopSessionInternal(session, reason),
+      {
+        concurrency: 1,
+        discard: true,
+      },
+    ).pipe(Effect.asVoid);
+
+  const stopAllCoordinated: () => Effect.Effect<void> = Effect.fn("stopAllCoordinated")(
+    function* () {
+      yield* Effect.uninterruptible(
+        Effect.gen(function* () {
+          const completed = yield* Deferred.make<void>();
+          const decision = yield* Ref.modify(
+            startGate,
+            (state): readonly [CodexStopAllDecision, CodexStartGateState] => {
+              if (state.stoppingAll !== undefined) {
+                return [{ _tag: "Join" as const, completed: state.stoppingAll }, state] as const;
+              }
+              return [
+                {
+                  _tag: "Lead" as const,
+                  operations: Array.from(state.inFlight.values(), (start) => start.operation),
+                  intents: Array.from(state.startIntents.values()).flatMap((intents) =>
+                    Array.from(intents),
+                  ),
+                  threadStops: Array.from(state.stoppingThreads.values()),
+                },
+                {
+                  ...state,
+                  stoppingAll: completed,
+                },
+              ] as const;
+            },
+          );
+          if (decision._tag === "Join") {
+            yield* Deferred.await(decision.completed);
+            return;
+          }
+
+          yield* Effect.gen(function* () {
+            yield* Effect.forEach(
+              decision.intents,
+              (intent) => Deferred.succeed(intent, undefined),
+              { concurrency: 1, discard: true },
+            );
+            yield* Effect.forEach(
+              decision.operations,
+              (operation) => Deferred.succeed(operation.cancel, undefined),
+              { concurrency: 1, discard: true },
+            );
+            yield* Effect.forEach(
+              decision.operations,
+              (operation) => Deferred.await(operation.completed),
+              { concurrency: 1, discard: true },
+            );
+            yield* Effect.forEach(decision.threadStops, Deferred.await, {
+              concurrency: 1,
+              discard: true,
+            });
+            yield* stopAllWithReason("stop-all");
+          }).pipe(
+            Effect.ensuring(
+              Ref.update(startGate, (state) =>
+                state.stoppingAll === completed ? { ...state, stoppingAll: undefined } : state,
+              ).pipe(Effect.andThen(Deferred.succeed(completed, undefined)), Effect.asVoid),
+            ),
+          );
+        }),
+      );
+    },
+  );
+
+  const stopAll: CodexAdapterShape["stopAll"] = stopAllCoordinated;
 
   yield* Effect.acquireRelease(Effect.void, () =>
-    stopAll().pipe(
+    Effect.gen(function* () {
+      const shutdownState = yield* Ref.modify(startGate, (state) => [
+        {
+          inFlightStarts: Array.from(state.inFlight.values(), (start) => start.operation),
+          startIntents: Array.from(state.startIntents.values()).flatMap((intents) =>
+            Array.from(intents),
+          ),
+          activeStops: [
+            ...(state.stoppingAll === undefined ? [] : [state.stoppingAll]),
+            ...state.stoppingThreads.values(),
+          ],
+        },
+        { ...state, closing: true },
+      ]);
+      yield* Effect.forEach(
+        shutdownState.startIntents,
+        (intent) => Deferred.succeed(intent, undefined),
+        { concurrency: 1, discard: true },
+      );
+      yield* Effect.forEach(
+        shutdownState.inFlightStarts,
+        (start) => Deferred.succeed(start.cancel, undefined),
+        { concurrency: 1, discard: true },
+      );
+      yield* Effect.forEach(
+        shutdownState.inFlightStarts,
+        (start) => Deferred.await(start.completed),
+        { concurrency: 1, discard: true },
+      );
+      yield* Effect.forEach(shutdownState.activeStops, Deferred.await, {
+        concurrency: 1,
+        discard: true,
+      });
+      yield* stopAllWithReason("adapter-release");
+    }).pipe(
       Effect.andThen(Queue.shutdown(runtimeEventQueue)),
       Effect.andThen(managedNativeEventLogger?.close() ?? Effect.void),
       Effect.ignore,
