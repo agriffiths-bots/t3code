@@ -10,6 +10,7 @@ import {
   OrchestrationEventType,
   ProjectId,
   ThreadId,
+  TrimmedNonEmptyString,
 } from "@t3tools/contracts";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
 import * as SqlSchema from "effect/unstable/sql/SqlSchema";
@@ -64,11 +65,18 @@ const ReadFromSequenceRequestSchema = Schema.Struct({
   sequenceExclusive: NonNegativeInt,
   limit: Schema.Number,
 });
-const LatestThreadSequenceRequestSchema = Schema.Struct({
+const LatestThreadRevisionRequestSchema = Schema.Struct({
   threadId: ThreadId,
 });
-const LatestThreadSequenceRowSchema = Schema.Struct({
+const LatestThreadRevisionRowSchema = Schema.Struct({
   latestSequence: Schema.NullOr(NonNegativeInt),
+  latestEventId: Schema.NullOr(EventId),
+});
+const LatestSequenceRowSchema = Schema.Struct({
+  latestSequence: Schema.NullOr(NonNegativeInt),
+});
+const StorageEpochRowSchema = Schema.Struct({
+  storageEpoch: TrimmedNonEmptyString,
 });
 const DEFAULT_READ_FROM_SEQUENCE_LIMIT = 1_000;
 const READ_PAGE_SIZE = 500;
@@ -187,17 +195,48 @@ const makeEventStore = Effect.gen(function* () {
       `,
   });
 
-  const readLatestThreadSequence = SqlSchema.findOne({
-    Request: LatestThreadSequenceRequestSchema,
-    Result: LatestThreadSequenceRowSchema,
+  const readLatestThreadRevision = SqlSchema.findOne({
+    Request: LatestThreadRevisionRequestSchema,
+    Result: LatestThreadRevisionRowSchema,
     execute: ({ threadId }) =>
       sql`
-        SELECT MAX(sequence) AS "latestSequence"
+        SELECT
+          MAX(sequence) AS "latestSequence",
+          event_id AS "latestEventId"
         FROM orchestration_events
         WHERE aggregate_kind = 'thread'
           AND stream_id = ${threadId}
       `,
   });
+
+  const readStorageEpoch = SqlSchema.findOne({
+    Request: Schema.Struct({}),
+    Result: StorageEpochRowSchema,
+    execute: () => sql`
+      SELECT storage_epoch AS "storageEpoch"
+      FROM orchestration_event_store_metadata
+      WHERE singleton = 1
+    `,
+  });
+
+  const readLatestSequence = SqlSchema.findOne({
+    Request: Schema.Struct({}),
+    Result: LatestSequenceRowSchema,
+    execute: () => sql`
+      SELECT MAX(sequence) AS "latestSequence"
+      FROM orchestration_events
+    `,
+  });
+
+  const storageEpoch = yield* readStorageEpoch({}).pipe(
+    Effect.mapError(
+      toPersistenceSqlOrDecodeError(
+        "OrchestrationEventStore.init:readStorageEpoch",
+        "OrchestrationEventStore.init:decodeStorageEpoch",
+      ),
+    ),
+    Effect.map((row) => row.storageEpoch),
+  );
 
   const append: OrchestrationEventStoreShape["append"] = (event) =>
     appendEventRow({
@@ -279,15 +318,29 @@ const makeEventStore = Effect.gen(function* () {
   };
 
   return {
+    storageEpoch,
     append,
     readFromSequence,
     readAll: () => readFromSequence(0, Number.MAX_SAFE_INTEGER),
-    getLatestThreadSequence: (threadId) =>
-      readLatestThreadSequence({ threadId }).pipe(
+    getLatestThreadRevision: (threadId) =>
+      readLatestThreadRevision({ threadId }).pipe(
         Effect.mapError(
           toPersistenceSqlOrDecodeError(
-            "OrchestrationEventStore.getLatestThreadSequence:query",
-            "OrchestrationEventStore.getLatestThreadSequence:decodeRow",
+            "OrchestrationEventStore.getLatestThreadRevision:query",
+            "OrchestrationEventStore.getLatestThreadRevision:decodeRow",
+          ),
+        ),
+        Effect.map((row) => ({
+          latestSequence: row.latestSequence ?? 0,
+          latestEventId: row.latestEventId,
+        })),
+      ),
+    getLatestSequence: () =>
+      readLatestSequence({}).pipe(
+        Effect.mapError(
+          toPersistenceSqlOrDecodeError(
+            "OrchestrationEventStore.getLatestSequence:query",
+            "OrchestrationEventStore.getLatestSequence:decodeRow",
           ),
         ),
         Effect.map((row) => row.latestSequence ?? 0),

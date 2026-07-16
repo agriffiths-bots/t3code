@@ -97,6 +97,7 @@ describe("OrchestrationEngine", () => {
   it("bootstraps command handling from persisted projections without reading the full snapshot", async () => {
     let nextSequence = 8;
     const eventStore: OrchestrationEventStoreShape = {
+      storageEpoch: "test-storage-epoch",
       append: (event) =>
         Effect.sync(() => {
           const savedEvent = {
@@ -114,7 +115,8 @@ describe("OrchestrationEngine", () => {
             detail: "historical replay should not be used during bootstrap",
           }),
         ),
-      getLatestThreadSequence: () => Effect.succeed(0),
+      getLatestThreadRevision: () => Effect.succeed({ latestSequence: 0, latestEventId: null }),
+      getLatestSequence: () => Effect.succeed(0),
     };
 
     const projectionSnapshot = {
@@ -1056,6 +1058,7 @@ describe("OrchestrationEngine", () => {
     let shouldFailFirstAppend = true;
 
     const flakyStore: OrchestrationEventStoreShape = {
+      storageEpoch: "test-storage-epoch",
       append(event) {
         if (shouldFailFirstAppend && event.commandId === CommandId.make("cmd-flaky-1")) {
           shouldFailFirstAppend = false;
@@ -1080,7 +1083,8 @@ describe("OrchestrationEngine", () => {
       readAll() {
         return Stream.fromIterable(events);
       },
-      getLatestThreadSequence: () => Effect.succeed(0),
+      getLatestThreadRevision: () => Effect.succeed({ latestSequence: 0, latestEventId: null }),
+      getLatestSequence: () => Effect.succeed(0),
     };
 
     const ServerConfigLayer = ServerConfig.layerTest(process.cwd(), {
@@ -1298,6 +1302,7 @@ describe("OrchestrationEngine", () => {
     let nextSequence = 1;
 
     const nonTransactionalStore: OrchestrationEventStoreShape = {
+      storageEpoch: "test-storage-epoch",
       append(event) {
         const savedEvent = {
           ...event,
@@ -1313,7 +1318,8 @@ describe("OrchestrationEngine", () => {
       readAll() {
         return Stream.fromIterable(events);
       },
-      getLatestThreadSequence: () => Effect.succeed(0),
+      getLatestThreadRevision: () => Effect.succeed({ latestSequence: 0, latestEventId: null }),
+      getLatestSequence: () => Effect.succeed(0),
     };
 
     let shouldFailProjection = true;

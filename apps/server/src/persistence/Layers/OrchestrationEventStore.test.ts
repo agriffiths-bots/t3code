@@ -17,6 +17,20 @@ const layer = it.layer(
 );
 
 layer("OrchestrationEventStore", (it) => {
+  it.effect("creates and retains one persisted storage epoch", () =>
+    Effect.gen(function* () {
+      const eventStore = yield* OrchestrationEventStore;
+      const sql = yield* SqlClient.SqlClient;
+      const rows = yield* sql<{ readonly storageEpoch: string }>`
+        SELECT storage_epoch AS "storageEpoch"
+        FROM orchestration_event_store_metadata
+      `;
+
+      assert.match(eventStore.storageEpoch, /^[0-9a-f]{32}$/);
+      assert.deepEqual(rows, [{ storageEpoch: eventStore.storageEpoch }]);
+    }),
+  );
+
   it.effect("stores json columns as strings and replays decoded events", () =>
     Effect.gen(function* () {
       const eventStore = yield* OrchestrationEventStore;
@@ -158,11 +172,28 @@ layer("OrchestrationEventStore", (it) => {
         )
       `;
 
-      const latestSequence = yield* eventStore.getLatestThreadSequence(threadId);
-      assert.isAbove(latestSequence, 0);
-      assert.equal(
-        yield* eventStore.getLatestThreadSequence(ThreadId.make("thread-without-events")),
-        0,
+      const latestRevision = yield* eventStore.getLatestThreadRevision(threadId);
+      assert.isAbove(latestRevision.latestSequence, 0);
+      assert.equal(latestRevision.latestEventId, "evt-thread-lightweight-revision");
+      assert.equal(yield* eventStore.getLatestSequence(), latestRevision.latestSequence);
+      assert.deepEqual(
+        yield* eventStore.getLatestThreadRevision(ThreadId.make("thread-without-events")),
+        { latestSequence: 0, latestEventId: null },
+      );
+
+      const plan = yield* sql<{ readonly detail: string }>`
+        EXPLAIN QUERY PLAN
+        SELECT MAX(sequence), event_id
+        FROM orchestration_events
+        WHERE aggregate_kind = 'thread'
+          AND stream_id = ${threadId}
+      `;
+      assert.isTrue(
+        plan.some(
+          (row) =>
+            row.detail.includes("COVERING INDEX") &&
+            row.detail.includes("idx_orch_events_thread_revision"),
+        ),
       );
     }),
   );

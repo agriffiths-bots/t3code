@@ -348,6 +348,7 @@ const buildAppUnderTest = (options?: {
     >;
     terminalManager?: Partial<TerminalManager.TerminalManager["Service"]>;
     orchestrationEngine?: Partial<OrchestrationEngine.OrchestrationEngineService["Service"]>;
+    orchestrationEventStore?: Partial<OrchestrationEventStore.OrchestrationEventStore["Service"]>;
     worktreeLifecycleCoordinator?: WorktreeLifecycleCoordinator.WorktreeLifecycleCoordinator["Service"];
     orchestrationCommandReceiptRepository?: Partial<
       OrchestrationCommandReceipts.OrchestrationCommandReceiptRepository["Service"]
@@ -764,10 +765,13 @@ const buildAppUnderTest = (options?: {
       Layer.provide(orchestrationEngineLayer),
       Layer.provide(
         Layer.mock(OrchestrationEventStore.OrchestrationEventStore)({
+          storageEpoch: "test-storage-epoch",
           append: () => Effect.die("OrchestrationEventStore.append not stubbed in this test"),
           readFromSequence: () => Stream.empty,
           readAll: () => Stream.empty,
-          getLatestThreadSequence: () => Effect.succeed(0),
+          getLatestThreadRevision: () => Effect.succeed({ latestSequence: 0, latestEventId: null }),
+          getLatestSequence: () => Effect.succeed(0),
+          ...options?.layers?.orchestrationEventStore,
         }),
       ),
       Layer.provide(orchestrationCommandReceiptRepositoryLayer),
@@ -1404,12 +1408,19 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
       const url = yield* getHttpServerUrl(`/api/orchestration/threads/${defaultThreadId}/revision`);
       const response = yield* fetchEffect(url, { headers: { cookie } });
       const body = yield* responseJsonEffect<{
+        readonly storageEpoch: string;
         readonly latestSequence: number;
+        readonly latestEventId: string | null;
         readonly projectionSequence: number;
       }>(response);
 
       assert.equal(response.status, 200);
-      assert.deepEqual(body, { latestSequence: 0, projectionSequence: 0 });
+      assert.deepEqual(body, {
+        storageEpoch: "test-storage-epoch",
+        latestSequence: 0,
+        latestEventId: null,
+        projectionSequence: 0,
+      });
     }).pipe(Effect.provide(NodeHttpServer.layerTest)),
   );
 
@@ -6399,6 +6410,159 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
       assertTrue(result.failure._tag === "OrchestrationGetSnapshotError");
       assertTrue(result.failure.cause instanceof Error);
       assert.include(result.failure.cause.message, projectionError.message);
+    }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+
+  it.effect("serves an authoritative thread snapshot for epoch or backwards-cursor mismatch", () =>
+    Effect.gen(function* () {
+      const storageEpoch = "restored-storage-epoch";
+      const latestEventId = EventId.make("event-restored-marker-6");
+      let snapshot = {
+        snapshotSequence: 6,
+        thread: {
+          ...makeDefaultOrchestrationReadModel().threads[0]!,
+          title: "Restored thread",
+        },
+      };
+      let readEventsCalled = false;
+      const readEventsStarted = yield* Deferred.make<void>();
+      let latestStoreSequence = 7;
+
+      yield* buildAppUnderTest({
+        layers: {
+          projectionSnapshotQuery: {
+            getThreadDetailSnapshot: () => Effect.succeed(Option.some(snapshot)),
+          },
+          orchestrationEventStore: {
+            storageEpoch,
+            getLatestThreadRevision: () => Effect.succeed({ latestSequence: 6, latestEventId }),
+            getLatestSequence: () => Effect.succeed(latestStoreSequence),
+          },
+          orchestrationEngine: {
+            readEvents: () => {
+              readEventsCalled = true;
+              return Stream.fromEffect(Deferred.succeed(readEventsStarted, undefined)).pipe(
+                Stream.drain,
+              );
+            },
+          },
+        },
+      });
+
+      const wsUrl = yield* getWsServerUrl("/ws");
+      for (const clientStorageEpoch of ["previous-storage-epoch", storageEpoch]) {
+        const items = yield* Effect.scoped(
+          withWsRpcClient(wsUrl, (client) =>
+            client[ORCHESTRATION_WS_METHODS.subscribeThread]({
+              threadId: defaultThreadId,
+              afterSequence: 7,
+              storageEpoch: clientStorageEpoch,
+              verifiedRevision: 7,
+              observedRevision: 7,
+              observedEventId: EventId.make("event-discarded-marker-7"),
+            }).pipe(Stream.take(1), Stream.runCollect),
+          ),
+        );
+
+        assert.deepEqual(Array.from(items), [
+          {
+            kind: "snapshot",
+            storageEpoch,
+            force: true,
+            snapshot: { ...snapshot, storageEpoch, latestSequence: 6, latestEventId },
+          },
+        ]);
+      }
+      assert.equal(readEventsCalled, false);
+
+      const collisionItems = yield* Effect.scoped(
+        withWsRpcClient(wsUrl, (client) =>
+          client[ORCHESTRATION_WS_METHODS.subscribeThread]({
+            threadId: defaultThreadId,
+            afterSequence: 7,
+            storageEpoch,
+            verifiedRevision: 6,
+            observedRevision: 6,
+            observedEventId: EventId.make("event-discarded-marker-6"),
+          }).pipe(Stream.take(1), Stream.runCollect),
+        ),
+      );
+      assert.deepEqual(Array.from(collisionItems), [
+        {
+          kind: "snapshot",
+          storageEpoch,
+          force: true,
+          snapshot: { ...snapshot, storageEpoch, latestSequence: 6, latestEventId },
+        },
+      ]);
+
+      latestStoreSequence = 6;
+      const restoredGlobalCursorItems = yield* Effect.scoped(
+        withWsRpcClient(wsUrl, (client) =>
+          client[ORCHESTRATION_WS_METHODS.subscribeThread]({
+            threadId: defaultThreadId,
+            afterSequence: 7,
+            storageEpoch,
+            verifiedRevision: 6,
+            observedRevision: 6,
+            observedEventId: latestEventId,
+          }).pipe(Stream.take(1), Stream.runCollect),
+        ),
+      );
+      assert.deepEqual(Array.from(restoredGlobalCursorItems), [
+        {
+          kind: "snapshot",
+          storageEpoch,
+          force: true,
+          snapshot: { ...snapshot, storageEpoch, latestSequence: 6, latestEventId },
+        },
+      ]);
+      assert.equal(readEventsCalled, false);
+
+      latestStoreSequence = 7;
+      yield* Effect.scoped(
+        Effect.gen(function* () {
+          yield* withWsRpcClient(wsUrl, (client) =>
+            client[ORCHESTRATION_WS_METHODS.subscribeThread]({
+              threadId: defaultThreadId,
+              afterSequence: 7,
+              storageEpoch,
+              verifiedRevision: 6,
+              observedRevision: 6,
+              observedEventId: latestEventId,
+            }).pipe(Stream.runDrain),
+          ).pipe(Effect.forkScoped);
+          yield* Deferred.await(readEventsStarted);
+        }),
+      );
+      assert.equal(readEventsCalled, true);
+
+      snapshot = { ...snapshot, snapshotSequence: 5 };
+      const laggingItems = yield* Effect.scoped(
+        withWsRpcClient(wsUrl, (client) =>
+          client[ORCHESTRATION_WS_METHODS.subscribeThread]({
+            threadId: defaultThreadId,
+            afterSequence: 7,
+            storageEpoch: "previous-storage-epoch",
+            verifiedRevision: 7,
+            observedRevision: 7,
+            observedEventId: EventId.make("event-discarded-marker-7"),
+          }).pipe(Stream.take(1), Stream.runCollect),
+        ),
+      );
+      assert.deepEqual(Array.from(laggingItems), [
+        {
+          kind: "snapshot",
+          storageEpoch,
+          force: true,
+          snapshot: {
+            ...snapshot,
+            storageEpoch,
+            latestSequence: 0,
+            latestEventId: null,
+          },
+        },
+      ]);
     }).pipe(Effect.provide(NodeHttpServer.layerTest)),
   );
 

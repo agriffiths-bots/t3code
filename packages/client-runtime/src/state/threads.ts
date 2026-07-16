@@ -1,6 +1,7 @@
 import {
   ORCHESTRATION_WS_METHODS,
   type EnvironmentId as EnvironmentIdType,
+  type EventId as EventIdType,
   type OrchestrationThread,
   type OrchestrationThreadDetailSnapshot,
   type OrchestrationThreadStreamItem,
@@ -61,6 +62,7 @@ type ThreadProjectionReconcileResult =
   | {
       readonly kind: "recovered";
       readonly recoveredThroughSequence: number;
+      readonly recoveredThroughEventId: EventIdType | null;
     }
   | {
       readonly kind: "pending";
@@ -72,16 +74,6 @@ export interface EnvironmentThreadStateOptions {
 
 function statusWithoutLiveData(data: Option.Option<OrchestrationThread>): EnvironmentThreadStatus {
   return Option.isSome(data) ? "cached" : "empty";
-}
-
-function threadNeedsProjectionReconcile(thread: OrchestrationThread): boolean {
-  if (thread.session?.status === "starting" || thread.session?.status === "running") {
-    return true;
-  }
-  if (thread.session?.status === "waiting" && thread.session.activeTurnId !== null) {
-    return true;
-  }
-  return thread.latestTurn?.state === "running";
 }
 
 function threadProjectionMatches(left: OrchestrationThread, right: OrchestrationThread): boolean {
@@ -269,6 +261,23 @@ export const makeEnvironmentThreadState = Effect.fn("EnvironmentThreadState.make
   const lastSequence = yield* SubscriptionRef.make(
     Option.match(cached, { onNone: () => 0, onSome: (snapshot) => snapshot.snapshotSequence }),
   );
+  const initialVerifiedRevision = Option.match(cached, {
+    onNone: () => 0,
+    onSome: (snapshot) => snapshot.latestSequence ?? snapshot.snapshotSequence,
+  });
+  const initialVerifiedEventId = Option.match(cached, {
+    onNone: () => undefined,
+    onSome: (snapshot) => snapshot.latestEventId,
+  });
+  const initialObservedRevision = Option.match(cached, {
+    onNone: () => initialVerifiedRevision,
+    onSome: (snapshot) => snapshot.observedRevision ?? initialVerifiedRevision,
+  });
+  const initialObservedEventId = Option.match(cached, {
+    onNone: () => undefined,
+    onSome: (snapshot) =>
+      snapshot.observedEventId !== undefined ? snapshot.observedEventId : initialVerifiedEventId,
+  });
   const persistence = yield* Queue.sliding<OrchestrationThreadDetailSnapshot>(1);
   const reconciliationWake = yield* Queue.sliding<ThreadReconciliationReason>(1);
   const reconcileFastUntil = yield* Ref.make(0);
@@ -278,13 +287,43 @@ export const makeEnvironmentThreadState = Effect.fn("EnvironmentThreadState.make
   // A later delivered event cannot prove that every earlier event arrived.
   // Only an accepted detail/recovery snapshot advances this verified marker;
   // live events advance the reconnect cursor and leave a revision pending.
-  const lastVerifiedRevision = yield* Ref.make(yield* SubscriptionRef.get(lastSequence));
-  const pendingRevision = yield* Ref.make(0);
+  const lastVerifiedRevision = yield* Ref.make(initialVerifiedRevision);
+  const lastVerifiedRevisionEventId = yield* Ref.make<EventIdType | null | undefined>(
+    initialVerifiedEventId,
+  );
+  const pendingRevision = yield* Ref.make(
+    initialObservedRevision > initialVerifiedRevision ? initialObservedRevision : 0,
+  );
+  const observedRevisionEventId = yield* Ref.make<EventIdType | null | undefined>(
+    initialObservedEventId,
+  );
+  const authoritativeResetPending = yield* Ref.make(false);
   const revisionCheckUnresolved = yield* Ref.make(false);
   const connectionGeneration = yield* Ref.make(
     (yield* SubscriptionRef.get(supervisor.state)).generation,
   );
-  const subscribeInput: { threadId: ThreadIdType; afterSequence?: number } = { threadId };
+  const initialStorageEpoch = Option.flatMap(cached, (snapshot) =>
+    Option.fromNullishOr(snapshot.storageEpoch),
+  );
+  const currentStorageEpoch = yield* Ref.make(initialStorageEpoch);
+  const subscribeInput: {
+    threadId: ThreadIdType;
+    afterSequence?: number;
+    storageEpoch?: string;
+    verifiedRevision?: number;
+    observedRevision?: number;
+    observedEventId?: EventIdType | null;
+  } = {
+    threadId,
+    ...(Option.isSome(initialStorageEpoch) ? { storageEpoch: initialStorageEpoch.value } : {}),
+    ...(Option.isSome(cached) && cached.value.latestSequence !== undefined
+      ? { verifiedRevision: cached.value.latestSequence }
+      : {}),
+    ...(Option.isSome(cached) && cached.value.observedRevision !== undefined
+      ? { observedRevision: cached.value.observedRevision }
+      : {}),
+    ...(initialObservedEventId !== undefined ? { observedEventId: initialObservedEventId } : {}),
+  };
   // Sequence of the last applied destructive collection change (revert). A
   // non-advancing snapshot taken before this point may still contain pruned
   // messages, so it must not be used as an additive recovery source.
@@ -294,29 +333,54 @@ export const makeEnvironmentThreadState = Effect.fn("EnvironmentThreadState.make
   const persist = Effect.fn("EnvironmentThreadState.persist")(function* (
     snapshot: OrchestrationThreadDetailSnapshot,
   ) {
-    const [current, currentSequence] = yield* Effect.all([
+    const [
+      current,
+      currentSequence,
+      storageEpoch,
+      verifiedRevision,
+      verifiedEventId,
+      pending,
+      observedEventId,
+    ] = yield* Effect.all([
       SubscriptionRef.get(state),
       SubscriptionRef.get(lastSequence),
+      Ref.get(currentStorageEpoch),
+      Ref.get(lastVerifiedRevision),
+      Ref.get(lastVerifiedRevisionEventId),
+      Ref.get(pendingRevision),
+      Ref.get(observedRevisionEventId),
     ]);
     if (
       current.status === "deleted" ||
       Option.isNone(current.data) ||
       snapshot.snapshotSequence !== currentSequence ||
+      (Option.isSome(storageEpoch) &&
+        snapshot.storageEpoch !== undefined &&
+        snapshot.storageEpoch !== storageEpoch.value) ||
       !threadProjectionMatches(current.data.value, snapshot.thread)
     ) {
       return;
     }
-    yield* cache.saveThread(environmentId, snapshot).pipe(
-      Effect.catch((error) =>
-        Effect.logWarning("Could not persist the thread cache.").pipe(
-          Effect.annotateLogs({
-            environmentId,
-            threadId,
-            error: error.message,
-          }),
+    yield* cache
+      .saveThread(environmentId, {
+        ...snapshot,
+        ...(Option.isSome(storageEpoch) ? { storageEpoch: storageEpoch.value } : {}),
+        latestSequence: verifiedRevision,
+        ...(verifiedEventId !== undefined ? { latestEventId: verifiedEventId } : {}),
+        observedRevision: Math.max(verifiedRevision, pending),
+        ...(observedEventId !== undefined ? { observedEventId } : {}),
+      })
+      .pipe(
+        Effect.catch((error) =>
+          Effect.logWarning("Could not persist the thread cache.").pipe(
+            Effect.annotateLogs({
+              environmentId,
+              threadId,
+              error: error.message,
+            }),
+          ),
         ),
-      ),
-    );
+      );
   });
 
   yield* Stream.fromQueue(persistence).pipe(
@@ -371,7 +435,22 @@ export const makeEnvironmentThreadState = Effect.fn("EnvironmentThreadState.make
       return;
     }
     const snapshotSequence = yield* SubscriptionRef.get(lastSequence);
-    yield* Queue.offer(persistence, { snapshotSequence, thread });
+    const storageEpoch = yield* Ref.get(currentStorageEpoch);
+    const [latestSequence, latestEventId, pending, observedEventId] = yield* Effect.all([
+      Ref.get(lastVerifiedRevision),
+      Ref.get(lastVerifiedRevisionEventId),
+      Ref.get(pendingRevision),
+      Ref.get(observedRevisionEventId),
+    ]);
+    yield* Queue.offer(persistence, {
+      snapshotSequence,
+      thread,
+      ...(Option.isSome(storageEpoch) ? { storageEpoch: storageEpoch.value } : {}),
+      latestSequence,
+      ...(latestEventId !== undefined ? { latestEventId } : {}),
+      observedRevision: Math.max(latestSequence, pending),
+      ...(observedEventId !== undefined ? { observedEventId } : {}),
+    });
   });
 
   const markThreadRecentlyActive = Effect.fn("EnvironmentThreadState.markThreadRecentlyActive")(
@@ -396,15 +475,91 @@ export const makeEnvironmentThreadState = Effect.fn("EnvironmentThreadState.make
     const current = yield* SubscriptionRef.get(lastSequence);
     if (sequence > current) {
       yield* SubscriptionRef.set(lastSequence, sequence);
+      subscribeInput.afterSequence = sequence;
+    } else {
+      subscribeInput.afterSequence = current;
     }
-    subscribeInput.afterSequence = Math.max(current, sequence);
   });
+
+  const resetReconciliationCursors = Effect.fn("EnvironmentThreadState.resetReconciliationCursors")(
+    function* (
+      storageEpoch: string,
+      reason:
+        | "backwards-revision"
+        | "revision-identity-change"
+        | "storage-epoch-change"
+        | "unknown-storage-epoch",
+    ) {
+      const [
+        previousLastSequence,
+        previousVerifiedRevision,
+        previousPendingRevision,
+        previousEpoch,
+      ] = yield* Effect.all([
+        SubscriptionRef.get(lastSequence),
+        Ref.get(lastVerifiedRevision),
+        Ref.get(pendingRevision),
+        Ref.get(currentStorageEpoch),
+      ]);
+      yield* SubscriptionRef.set(lastSequence, 0);
+      yield* Ref.set(lastVerifiedRevision, 0);
+      yield* Ref.set(lastVerifiedRevisionEventId, undefined);
+      yield* Ref.set(pendingRevision, 0);
+      yield* Ref.set(observedRevisionEventId, undefined);
+      yield* Ref.set(lastRevertSequence, 0);
+      yield* Ref.set(authoritativeResetPending, true);
+      yield* Ref.set(currentStorageEpoch, Option.some(storageEpoch));
+      delete subscribeInput.afterSequence;
+      delete subscribeInput.verifiedRevision;
+      delete subscribeInput.observedRevision;
+      delete subscribeInput.observedEventId;
+      subscribeInput.storageEpoch = storageEpoch;
+      yield* Effect.logWarning(
+        "Reset thread reconciliation cursors for authoritative recovery.",
+      ).pipe(
+        Effect.annotateLogs({
+          environmentId,
+          threadId,
+          reconciliationResetReason: reason,
+          previousStorageEpoch: Option.getOrNull(previousEpoch),
+          storageEpoch,
+          previousLastSequence,
+          previousVerifiedRevision,
+          previousPendingRevision,
+        }),
+      );
+    },
+  );
 
   const acknowledgeSnapshotRevision = Effect.fn(
     "EnvironmentThreadState.acknowledgeSnapshotRevision",
-  )(function* (sequence: number) {
-    yield* Ref.update(lastVerifiedRevision, (revision) => Math.max(revision, sequence));
+  )(function* (
+    sequence: number,
+    eventId: EventIdType | null | undefined,
+    updateReconnectContract = eventId !== undefined,
+  ) {
+    const resetWasPending = yield* Ref.get(authoritativeResetPending);
+    yield* Ref.set(lastVerifiedRevision, sequence);
+    yield* Ref.set(lastVerifiedRevisionEventId, eventId);
     yield* Ref.update(pendingRevision, (pending) => (pending <= sequence ? 0 : pending));
+    const remainingPendingRevision = yield* Ref.get(pendingRevision);
+    if (remainingPendingRevision <= sequence) {
+      yield* Ref.set(observedRevisionEventId, eventId);
+    }
+    yield* Ref.set(
+      authoritativeResetPending,
+      resetWasPending && remainingPendingRevision > sequence,
+    );
+    if (updateReconnectContract) {
+      subscribeInput.verifiedRevision = sequence;
+      subscribeInput.observedRevision = Math.max(sequence, remainingPendingRevision);
+      const observedEventId = yield* Ref.get(observedRevisionEventId);
+      if (observedEventId === undefined) {
+        delete subscribeInput.observedEventId;
+      } else {
+        subscribeInput.observedEventId = observedEventId;
+      }
+    }
   });
 
   const setDeleted = Effect.fn("EnvironmentThreadState.setDeleted")(function* () {
@@ -500,17 +655,70 @@ export const makeEnvironmentThreadState = Effect.fn("EnvironmentThreadState.make
     return yield* applyLock.withPermit(applySnapshotLocked(snapshot, options));
   });
 
+  const recordObservedEventRevision = Effect.fn(
+    "EnvironmentThreadState.recordObservedEventRevision",
+  )(function* (sequence: number, eventId: EventIdType) {
+    const pending = yield* Ref.get(pendingRevision);
+    if (sequence >= pending) {
+      yield* Ref.set(pendingRevision, sequence);
+      yield* Ref.set(observedRevisionEventId, eventId);
+    }
+    if (sequence >= (subscribeInput.observedRevision ?? 0)) {
+      subscribeInput.observedRevision = sequence;
+      subscribeInput.observedEventId = eventId;
+    }
+  });
+
   const applyItemLocked = Effect.fn("EnvironmentThreadState.applyItemLocked")(function* (
     item: OrchestrationThreadStreamItem,
   ) {
+    const storageEpoch = yield* Ref.get(currentStorageEpoch);
+    const storageEpochChanged =
+      Option.isNone(storageEpoch) || storageEpoch.value !== item.storageEpoch;
+    const forcedSnapshotReset = item.kind === "snapshot" && item.force === true;
+    if (storageEpochChanged || forcedSnapshotReset) {
+      yield* resetReconciliationCursors(
+        item.storageEpoch,
+        Option.isNone(storageEpoch)
+          ? "unknown-storage-epoch"
+          : storageEpoch.value !== item.storageEpoch
+            ? "storage-epoch-change"
+            : "backwards-revision",
+      );
+    }
+
     if (item.kind === "snapshot") {
-      const accepted = yield* applySnapshotLocked(item.snapshot, {
-        allowCurrentSequence: true,
-        skipMatchingCurrentSequence: true,
-      });
+      const accepted = yield* applySnapshotLocked(
+        { ...item.snapshot, storageEpoch: item.storageEpoch },
+        {
+          allowCurrentSequence: true,
+          skipMatchingCurrentSequence: true,
+        },
+      );
       if (accepted) {
-        yield* acknowledgeSnapshotRevision(item.snapshot.snapshotSequence);
+        yield* acknowledgeSnapshotRevision(
+          item.snapshot.latestSequence ?? item.snapshot.snapshotSequence,
+          item.snapshot.latestEventId,
+          item.snapshot.latestSequence !== undefined && item.snapshot.latestEventId !== undefined,
+        );
       }
+      return;
+    }
+
+    if (yield* Ref.get(authoritativeResetPending)) {
+      yield* recordObservedEventRevision(item.event.sequence, item.event.eventId);
+      yield* markThreadRecentlyActive("changed-revision");
+      yield* Effect.logWarning(
+        "Deferred a thread event until authoritative recovery catches up.",
+      ).pipe(
+        Effect.annotateLogs({
+          environmentId,
+          threadId,
+          storageEpoch: item.storageEpoch,
+          eventSequence: item.event.sequence,
+          eventType: item.event.type,
+        }),
+      );
       return;
     }
 
@@ -519,7 +727,7 @@ export const makeEnvironmentThreadState = Effect.fn("EnvironmentThreadState.make
       return;
     }
     yield* advanceLastSequence(item.event.sequence);
-    yield* Ref.update(pendingRevision, (pending) => Math.max(pending, item.event.sequence));
+    yield* recordObservedEventRevision(item.event.sequence, item.event.eventId);
     if (item.event.type === "thread.reverted") {
       yield* Ref.set(lastRevertSequence, item.event.sequence);
     }
@@ -555,7 +763,11 @@ export const makeEnvironmentThreadState = Effect.fn("EnvironmentThreadState.make
   });
 
   const reconcileFromProjection = Effect.fn("EnvironmentThreadState.reconcileFromProjection")(
-    function* (revisionSequence: number, projectionSequence: number | null) {
+    function* (
+      revisionSequence: number,
+      revisionEventId: EventIdType | null,
+      projectionSequence: number | null,
+    ) {
       const prepared = yield* SubscriptionRef.get(supervisor.prepared);
       if (Option.isNone(prepared)) {
         return { kind: "pending" } as ThreadProjectionReconcileResult;
@@ -586,6 +798,7 @@ export const makeEnvironmentThreadState = Effect.fn("EnvironmentThreadState.make
         return {
           kind: "recovered",
           recoveredThroughSequence: revisionSequence,
+          recoveredThroughEventId: revisionEventId,
         } as ThreadProjectionReconcileResult;
       }
       if (result.kind === "unavailable") {
@@ -618,7 +831,13 @@ export const makeEnvironmentThreadState = Effect.fn("EnvironmentThreadState.make
           responseBytes,
         }),
       );
-      if (!accepted || result.snapshot.snapshotSequence < revisionSequence) {
+      if (
+        !accepted ||
+        result.snapshot.snapshotSequence < revisionSequence ||
+        result.snapshot.latestSequence === undefined ||
+        result.snapshot.latestSequence < revisionSequence ||
+        result.snapshot.latestEventId === undefined
+      ) {
         yield* Effect.logDebug(
           "Thread reconciliation detail has not reached the revision yet.",
         ).pipe(
@@ -636,7 +855,8 @@ export const makeEnvironmentThreadState = Effect.fn("EnvironmentThreadState.make
       }
       return {
         kind: "recovered",
-        recoveredThroughSequence: result.snapshot.snapshotSequence,
+        recoveredThroughSequence: result.snapshot.latestSequence,
+        recoveredThroughEventId: result.snapshot.latestEventId,
       } as ThreadProjectionReconcileResult;
     },
   );
@@ -687,24 +907,99 @@ export const makeEnvironmentThreadState = Effect.fn("EnvironmentThreadState.make
     }
     const result = yield* revisionLoader.load(prepared.value, threadId);
     yield* Ref.set(revisionCheckUnresolved, result.kind === "unavailable");
-    const [verifiedRevision, currentPendingRevision] = yield* Effect.all([
+    let [
+      verifiedRevision,
+      currentPendingRevision,
+      observedEventId,
+      lastAppliedSequence,
+      resetPending,
+    ] = yield* Effect.all([
       Ref.get(lastVerifiedRevision),
       Ref.get(pendingRevision),
+      Ref.get(observedRevisionEventId),
+      SubscriptionRef.get(lastSequence),
+      Ref.get(authoritativeResetPending),
     ]);
-    if (result.kind === "unavailable" && currentPendingRevision <= verifiedRevision) {
+    if (
+      result.kind === "unavailable" &&
+      currentPendingRevision <= verifiedRevision &&
+      !resetPending
+    ) {
       yield* recordUnchangedRevision({ latestSequence: null, responseBytes: 0 });
       return;
     }
 
     const latestSequence = result.kind === "found" ? result.revision.latestSequence : null;
+    const latestEventId = result.kind === "found" ? result.revision.latestEventId : null;
     const projectionSequence = result.kind === "found" ? result.revision.projectionSequence : null;
-    const nextPendingRevision =
-      latestSequence === null
-        ? currentPendingRevision
-        : Math.max(currentPendingRevision, latestSequence);
-    const markerAdvanced = nextPendingRevision > Math.max(verifiedRevision, currentPendingRevision);
+    if (result.kind === "found") {
+      const markerSequence = result.revision.latestSequence;
+      const storageEpoch = yield* Ref.get(currentStorageEpoch);
+      const currentState = yield* SubscriptionRef.get(state);
+      const epochUnknownWithCursor =
+        Option.isNone(storageEpoch) &&
+        (lastAppliedSequence > 0 || Option.isSome(currentState.data));
+      const epochChanged =
+        Option.isSome(storageEpoch) && storageEpoch.value !== result.revision.storageEpoch;
+      const cursorAheadOfMarker =
+        Option.isSome(storageEpoch) &&
+        storageEpoch.value === result.revision.storageEpoch &&
+        Math.max(verifiedRevision, currentPendingRevision) > markerSequence;
+      const observedRevision = Math.max(verifiedRevision, currentPendingRevision);
+      const revisionIdentityMatches =
+        observedRevision === 0
+          ? observedEventId === null && result.revision.latestEventId === null
+          : observedEventId != null &&
+            result.revision.latestEventId !== null &&
+            observedEventId === result.revision.latestEventId;
+      const revisionIdentityChanged =
+        Option.isSome(storageEpoch) &&
+        storageEpoch.value === result.revision.storageEpoch &&
+        observedRevision === markerSequence &&
+        !revisionIdentityMatches;
+
+      if (
+        epochUnknownWithCursor ||
+        epochChanged ||
+        cursorAheadOfMarker ||
+        revisionIdentityChanged
+      ) {
+        yield* applyLock.withPermit(
+          resetReconciliationCursors(
+            result.revision.storageEpoch,
+            epochUnknownWithCursor
+              ? "unknown-storage-epoch"
+              : epochChanged
+                ? "storage-epoch-change"
+                : cursorAheadOfMarker
+                  ? "backwards-revision"
+                  : "revision-identity-change",
+          ),
+        );
+        yield* Ref.set(pendingRevision, markerSequence);
+        yield* Ref.set(observedRevisionEventId, result.revision.latestEventId);
+        yield* markThreadRecentlyActive("changed-revision", { wake: false });
+        verifiedRevision = 0;
+        currentPendingRevision = markerSequence;
+        observedEventId = result.revision.latestEventId;
+        lastAppliedSequence = 0;
+        resetPending = true;
+      } else if (Option.isNone(storageEpoch)) {
+        yield* Ref.set(currentStorageEpoch, Option.some(result.revision.storageEpoch));
+        subscribeInput.storageEpoch = result.revision.storageEpoch;
+      }
+    }
+
+    let nextPendingRevision = currentPendingRevision;
+    const markerAdvanced =
+      latestSequence !== null &&
+      !resetPending &&
+      latestSequence > verifiedRevision &&
+      latestSequence > currentPendingRevision;
     if (markerAdvanced) {
+      nextPendingRevision = latestSequence;
       yield* Ref.set(pendingRevision, nextPendingRevision);
+      yield* Ref.set(observedRevisionEventId, latestEventId);
       yield* markThreadRecentlyActive("changed-revision", { wake: false });
       yield* Effect.logDebug("Thread revision advanced; loading detail.").pipe(
         Effect.annotateLogs({
@@ -712,7 +1007,7 @@ export const makeEnvironmentThreadState = Effect.fn("EnvironmentThreadState.make
           threadId,
           reconciliationReason: "changed-revision",
           latestSequence,
-          lastAppliedSequence: yield* SubscriptionRef.get(lastSequence),
+          lastAppliedSequence,
           responseBytes: result.kind === "found" ? result.responseBytes : 0,
           unchangedCount: 0,
           backoffMs: reconciliationPolicy.fastIntervalMs,
@@ -720,7 +1015,7 @@ export const makeEnvironmentThreadState = Effect.fn("EnvironmentThreadState.make
       );
     }
 
-    if (nextPendingRevision <= verifiedRevision) {
+    if (!resetPending && nextPendingRevision <= verifiedRevision) {
       yield* recordUnchangedRevision({
         latestSequence,
         responseBytes: result.kind === "found" ? result.responseBytes : 0,
@@ -728,9 +1023,16 @@ export const makeEnvironmentThreadState = Effect.fn("EnvironmentThreadState.make
       return;
     }
 
-    const reconciliation = yield* reconcileFromProjection(nextPendingRevision, projectionSequence);
+    const reconciliation = yield* reconcileFromProjection(
+      nextPendingRevision,
+      latestEventId,
+      projectionSequence,
+    );
     if (reconciliation.kind === "recovered") {
-      yield* acknowledgeSnapshotRevision(reconciliation.recoveredThroughSequence);
+      yield* acknowledgeSnapshotRevision(
+        reconciliation.recoveredThroughSequence,
+        reconciliation.recoveredThroughEventId,
+      );
       return;
     }
     yield* recordUnchangedRevision({
@@ -774,18 +1076,17 @@ export const makeEnvironmentThreadState = Effect.fn("EnvironmentThreadState.make
   yield* Effect.gen(function* () {
     for (;;) {
       const current = yield* SubscriptionRef.get(state);
-      const now = yield* Clock.currentTimeMillis;
-      const fastUntil = yield* Ref.get(reconcileFastUntil);
-      const [verifiedRevision, currentPendingRevision] = yield* Effect.all([
+      const [verifiedRevision, currentPendingRevision, resetPending] = yield* Effect.all([
         Ref.get(lastVerifiedRevision),
         Ref.get(pendingRevision),
+        Ref.get(authoritativeResetPending),
       ]);
       const unresolvedRevisionCheck = yield* Ref.get(revisionCheckUnresolved);
       const eligible =
         unresolvedRevisionCheck ||
+        resetPending ||
         currentPendingRevision > verifiedRevision ||
-        (Option.isSome(current.data) &&
-          (threadNeedsProjectionReconcile(current.data.value) || fastUntil > now));
+        Option.isSome(current.data);
       if (!eligible) {
         yield* Queue.take(reconciliationWake);
         continue;
@@ -859,8 +1160,30 @@ export const makeEnvironmentThreadState = Effect.fn("EnvironmentThreadState.make
           });
 
       if (Option.isSome(base)) {
-        yield* applyItem({ kind: "snapshot", snapshot: base.value });
-        yield* advanceLastSequence(base.value.snapshotSequence);
+        const baseStorageEpoch = Option.fromNullishOr(base.value.storageEpoch);
+        if (Option.isSome(baseStorageEpoch)) {
+          yield* Ref.set(currentStorageEpoch, baseStorageEpoch);
+          subscribeInput.storageEpoch = baseStorageEpoch.value;
+          yield* applyItem({
+            kind: "snapshot",
+            storageEpoch: baseStorageEpoch.value,
+            snapshot: base.value,
+          });
+          yield* advanceLastSequence(base.value.snapshotSequence);
+        } else {
+          const accepted = yield* applySnapshot(base.value, {
+            allowCurrentSequence: true,
+            skipMatchingCurrentSequence: true,
+          });
+          if (accepted) {
+            yield* acknowledgeSnapshotRevision(
+              base.value.latestSequence ?? base.value.snapshotSequence,
+              base.value.latestEventId,
+              base.value.latestSequence !== undefined && base.value.latestEventId !== undefined,
+            );
+          }
+          delete subscribeInput.afterSequence;
+        }
       } else {
         delete subscribeInput.afterSequence;
       }

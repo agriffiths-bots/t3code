@@ -53,6 +53,10 @@ const TARGET = new PrimaryConnectionTarget({
 });
 const THREAD_ID = ThreadId.make("thread-1");
 const CACHED_SNAPSHOT_SEQUENCE = 7;
+const STORAGE_EPOCH = "storage-epoch-1";
+const RESTORED_STORAGE_EPOCH = "storage-epoch-2";
+const markerEventId = (sequence: number) =>
+  sequence === 0 ? null : EventId.make(`event-marker-${sequence}`);
 const PREPARED: PreparedConnection = {
   environmentId: TARGET.environmentId,
   label: TARGET.label,
@@ -150,6 +154,10 @@ const makeHarness = Effect.fn("TestEnvironmentThreads.makeHarness")(function* (o
   readonly reconciliationPolicy?: ThreadReconciliationPolicy;
   readonly revisionSequence?: number;
   readonly projectionSequence?: number;
+  readonly cachedStorageEpoch?: string;
+  readonly cachedLatestSequence?: number;
+  readonly revisionStorageEpoch?: string;
+  readonly revisionEventId?: EventId | null;
 }) {
   const inputs = yield* Queue.unbounded<TestThreadInput>();
   const observed = yield* Queue.unbounded<EnvironmentThreadState>();
@@ -166,13 +174,40 @@ const makeHarness = Effect.fn("TestEnvironmentThreads.makeHarness")(function* (o
   const explicitProjectionSequence = yield* Ref.make<Option.Option<number>>(
     Option.fromNullishOr(options?.projectionSequence),
   );
-  const httpSnapshot = yield* Ref.make(
-    options?.httpSnapshot ?? Option.none<OrchestrationThreadDetailSnapshot>(),
+  const explicitRevisionEventId = yield* Ref.make<EventId | null | undefined>(
+    options?.revisionEventId,
+  );
+  const revisionStorageEpoch = yield* Ref.make(
+    options?.revisionStorageEpoch ?? options?.cachedStorageEpoch ?? STORAGE_EPOCH,
+  );
+  const normalizeSnapshot = (
+    snapshot: OrchestrationThreadDetailSnapshot,
+  ): OrchestrationThreadDetailSnapshot => {
+    const latestSequence = snapshot.latestSequence ?? snapshot.snapshotSequence;
+    return {
+      ...snapshot,
+      storageEpoch: snapshot.storageEpoch ?? options?.revisionStorageEpoch ?? STORAGE_EPOCH,
+      latestSequence,
+      latestEventId:
+        snapshot.latestEventId !== undefined
+          ? snapshot.latestEventId
+          : markerEventId(latestSequence),
+    };
+  };
+  const httpSnapshot = yield* Ref.make<Option.Option<OrchestrationThreadDetailSnapshot>>(
+    Option.map(
+      options?.httpSnapshot ?? Option.none<OrchestrationThreadDetailSnapshot>(),
+      normalizeSnapshot,
+    ),
   );
   const httpReconcileResult = yield* Ref.make<Option.Option<ThreadSnapshotLoadResult>>(
     Option.none(),
   );
   const lastSubscribeAfterSequence = yield* Ref.make<number | undefined>(undefined);
+  const lastSubscribeStorageEpoch = yield* Ref.make<string | undefined>(undefined);
+  const lastSubscribeVerifiedRevision = yield* Ref.make<number | undefined>(undefined);
+  const lastSubscribeObservedRevision = yield* Ref.make<number | undefined>(undefined);
+  const lastSubscribeObservedEventId = yield* Ref.make<EventId | null | undefined>(undefined);
   const subscribeAfterSequences = yield* Ref.make<ReadonlyArray<number | undefined>>([]);
   const savedThreads = yield* Ref.make<ReadonlyArray<OrchestrationThreadDetailSnapshot>>([]);
   const removedThreads = yield* Ref.make<ReadonlyArray<ThreadId>>([]);
@@ -186,10 +221,20 @@ const makeHarness = Effect.fn("TestEnvironmentThreads.makeHarness")(function* (o
       ),
     );
   const client = {
-    [ORCHESTRATION_WS_METHODS.subscribeThread]: (input: { readonly afterSequence?: number }) =>
+    [ORCHESTRATION_WS_METHODS.subscribeThread]: (input: {
+      readonly afterSequence?: number;
+      readonly storageEpoch?: string;
+      readonly verifiedRevision?: number;
+      readonly observedRevision?: number;
+      readonly observedEventId?: EventId | null;
+    }) =>
       Stream.unwrap(
         Ref.updateAndGet(subscriptionCount, (count) => count + 1).pipe(
           Effect.andThen(Ref.set(lastSubscribeAfterSequence, input.afterSequence)),
+          Effect.andThen(Ref.set(lastSubscribeStorageEpoch, input.storageEpoch)),
+          Effect.andThen(Ref.set(lastSubscribeVerifiedRevision, input.verifiedRevision)),
+          Effect.andThen(Ref.set(lastSubscribeObservedRevision, input.observedRevision)),
+          Effect.andThen(Ref.set(lastSubscribeObservedEventId, input.observedEventId)),
           Effect.andThen(
             Ref.update(subscribeAfterSequences, (current) => [...current, input.afterSequence]),
           ),
@@ -208,7 +253,7 @@ const makeHarness = Effect.fn("TestEnvironmentThreads.makeHarness")(function* (o
       Ref.update(loaderCalls, (count) => count + 1).pipe(
         Effect.andThen(() =>
           threadId === THREAD_ID
-            ? Ref.get(httpSnapshot)
+            ? Ref.get(httpSnapshot).pipe(Effect.map(Option.map(normalizeSnapshot)))
             : Effect.succeed(Option.none<OrchestrationThreadDetailSnapshot>()),
         ),
       ),
@@ -221,12 +266,14 @@ const makeHarness = Effect.fn("TestEnvironmentThreads.makeHarness")(function* (o
             }
             const explicit = yield* Ref.get(httpReconcileResult);
             if (Option.isSome(explicit)) {
-              return explicit.value;
+              return explicit.value.kind === "found"
+                ? { ...explicit.value, snapshot: normalizeSnapshot(explicit.value.snapshot) }
+                : explicit.value;
             }
             const snapshot = yield* Ref.get(httpSnapshot);
             return Option.match(snapshot, {
               onNone: () => ({ kind: "unavailable" }) as const,
-              onSome: (value) => ({ kind: "found", snapshot: value }) as const,
+              onSome: (value) => ({ kind: "found", snapshot: normalizeSnapshot(value) }) as const,
             });
           }),
         ),
@@ -252,12 +299,16 @@ const makeHarness = Effect.fn("TestEnvironmentThreads.makeHarness")(function* (o
           yield* Ref.get(explicitProjectionSequence),
           () => latestSequence,
         );
-        const revision = { latestSequence, projectionSequence };
+        const storageEpoch = yield* Ref.get(revisionStorageEpoch);
+        const configuredEventId = yield* Ref.get(explicitRevisionEventId);
+        const latestEventId =
+          configuredEventId === undefined ? markerEventId(latestSequence) : configuredEventId;
+        const revision = { storageEpoch, latestSequence, latestEventId, projectionSequence };
         return {
           kind: "found",
           revision,
           responseBytes: new TextEncoder().encode(
-            `{"latestSequence":${latestSequence},"projectionSequence":${projectionSequence}}`,
+            `{"storageEpoch":"${storageEpoch}","latestSequence":${latestSequence},"latestEventId":${latestEventId === null ? "null" : `"${latestEventId}"`},"projectionSequence":${projectionSequence}}`,
           ).byteLength,
         } as const;
       }),
@@ -289,6 +340,15 @@ const makeHarness = Effect.fn("TestEnvironmentThreads.makeHarness")(function* (o
           ? Option.some({
               snapshotSequence: CACHED_SNAPSHOT_SEQUENCE,
               thread: options.cached,
+              storageEpoch: options.cachedStorageEpoch ?? STORAGE_EPOCH,
+              latestSequence: options.cachedLatestSequence ?? CACHED_SNAPSHOT_SEQUENCE,
+              latestEventId: markerEventId(
+                options.cachedLatestSequence ?? CACHED_SNAPSHOT_SEQUENCE,
+              ),
+              observedRevision: options.cachedLatestSequence ?? CACHED_SNAPSHOT_SEQUENCE,
+              observedEventId: markerEventId(
+                options.cachedLatestSequence ?? CACHED_SNAPSHOT_SEQUENCE,
+              ),
             })
           : Option.none(),
       ),
@@ -330,9 +390,15 @@ const makeHarness = Effect.fn("TestEnvironmentThreads.makeHarness")(function* (o
     revisionAvailable,
     explicitRevisionSequence,
     explicitProjectionSequence,
+    explicitRevisionEventId,
+    revisionStorageEpoch,
     httpSnapshot,
     httpReconcileResult,
     lastSubscribeAfterSequence,
+    lastSubscribeStorageEpoch,
+    lastSubscribeVerifiedRevision,
+    lastSubscribeObservedRevision,
+    lastSubscribeObservedEventId,
     subscribeAfterSequences,
     supervisorState,
     supervisorSession,
@@ -350,16 +416,26 @@ const makeHarness = Effect.fn("TestEnvironmentThreads.makeHarness")(function* (o
 const snapshot = (
   thread: OrchestrationThread,
   snapshotSequence = 1,
+  storageEpoch = STORAGE_EPOCH,
 ): OrchestrationThreadStreamItem => ({
   kind: "snapshot",
+  storageEpoch,
   snapshot: {
     snapshotSequence,
     thread,
+    storageEpoch,
+    latestSequence: snapshotSequence,
+    latestEventId: markerEventId(snapshotSequence),
   },
 });
 
-const titleUpdated = (title: string, sequence = 2): OrchestrationThreadStreamItem => ({
+const titleUpdated = (
+  title: string,
+  sequence = 2,
+  storageEpoch = STORAGE_EPOCH,
+): OrchestrationThreadStreamItem => ({
   kind: "event",
+  storageEpoch,
   event: {
     eventId: EventId.make("event-title"),
     sequence,
@@ -379,8 +455,13 @@ const titleUpdated = (title: string, sequence = 2): OrchestrationThreadStreamIte
   },
 });
 
-const activityAppended = (summary: string, sequence = 3): OrchestrationThreadStreamItem => ({
+const activityAppended = (
+  summary: string,
+  sequence = 3,
+  storageEpoch = STORAGE_EPOCH,
+): OrchestrationThreadStreamItem => ({
   kind: "event",
+  storageEpoch,
   event: {
     eventId: EventId.make(`event-activity-${sequence}`),
     sequence,
@@ -408,8 +489,9 @@ const activityAppended = (summary: string, sequence = 3): OrchestrationThreadStr
   },
 });
 
-const deleted = (sequence = 3): OrchestrationThreadStreamItem => ({
+const deleted = (sequence = 3, storageEpoch = STORAGE_EPOCH): OrchestrationThreadStreamItem => ({
   kind: "event",
+  storageEpoch,
   event: {
     eventId: EventId.make("event-deleted"),
     sequence,
@@ -428,8 +510,9 @@ const deleted = (sequence = 3): OrchestrationThreadStreamItem => ({
   },
 });
 
-const archived = (sequence = 3): OrchestrationThreadStreamItem => ({
+const archived = (sequence = 3, storageEpoch = STORAGE_EPOCH): OrchestrationThreadStreamItem => ({
   kind: "event",
+  storageEpoch,
   event: {
     eventId: EventId.make("event-archived"),
     sequence,
@@ -449,8 +532,9 @@ const archived = (sequence = 3): OrchestrationThreadStreamItem => ({
   },
 });
 
-const unarchived = (sequence = 4): OrchestrationThreadStreamItem => ({
+const unarchived = (sequence = 4, storageEpoch = STORAGE_EPOCH): OrchestrationThreadStreamItem => ({
   kind: "event",
+  storageEpoch,
   event: {
     eventId: EventId.make("event-unarchived"),
     sequence,
@@ -469,8 +553,12 @@ const unarchived = (sequence = 4): OrchestrationThreadStreamItem => ({
   },
 });
 
-const sessionReady = (sequence = 3): OrchestrationThreadStreamItem => ({
+const sessionReady = (
+  sequence = 3,
+  storageEpoch = STORAGE_EPOCH,
+): OrchestrationThreadStreamItem => ({
   kind: "event",
+  storageEpoch,
   event: {
     eventId: EventId.make("event-session-ready"),
     sequence,
@@ -530,6 +618,29 @@ describe("EnvironmentThreads", () => {
     }),
   );
 
+  it.effect("keeps global replay and per-thread revision cursors distinct", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness({
+        cached: BASE_THREAD,
+        cachedLatestSequence: 6,
+        revisionSequence: 6,
+      });
+      yield* awaitThreadState(harness.observed, (value) => value.status === "live");
+      for (let index = 0; index < 5; index += 1) {
+        yield* Effect.yieldNow;
+      }
+
+      expect(yield* Ref.get(harness.lastSubscribeAfterSequence)).toBe(7);
+      expect(yield* Ref.get(harness.lastSubscribeVerifiedRevision)).toBe(6);
+      expect(yield* Ref.get(harness.lastSubscribeObservedRevision)).toBe(6);
+      for (const delay of [2, 2, 4, 8]) {
+        yield* TestClock.adjust(`${delay} seconds`);
+        yield* Effect.yieldNow;
+      }
+      expect(yield* Ref.get(harness.loaderCalls)).toBe(0);
+    }),
+  );
+
   it.effect(
     "bounds full loads for a permanently-running unchanged 3.8 MB thread and backs revision checks off",
     () =>
@@ -572,6 +683,323 @@ describe("EnvironmentThreads", () => {
         expect(intervals.slice(0, 14)).toEqual(Array.from({ length: 14 }, () => 2_000));
         expect(intervals.slice(-5)).toEqual([4_000, 8_000, 16_000, 32_000, 60_000]);
       }),
+  );
+
+  it.effect("keeps polling an idle mounted thread after the fast window", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness({
+        cached: BASE_THREAD,
+        revisionSequence: CACHED_SNAPSHOT_SEQUENCE,
+        reconciliationPolicy: {
+          fastIntervalMs: 2_000,
+          fastWindowMs: 4_000,
+          backoffMultiplier: 2,
+          maxBackoffMs: 60_000,
+        },
+      });
+      yield* awaitThreadState(harness.observed, (value) => value.status === "live");
+
+      yield* TestClock.adjust("2 seconds");
+      yield* Effect.yieldNow;
+      yield* TestClock.adjust("2 seconds");
+      yield* Effect.yieldNow;
+      expect(yield* Ref.get(harness.revisionCallTimes)).toEqual([2_000, 4_000]);
+
+      const healedThread = {
+        ...BASE_THREAD,
+        title: "Idle missed event healed",
+        updatedAt: "2026-07-16T02:00:00.000Z",
+      };
+      yield* Ref.set(harness.explicitRevisionSequence, Option.some(8));
+      yield* Ref.set(harness.explicitProjectionSequence, Option.some(8));
+      yield* Ref.set(
+        harness.httpSnapshot,
+        Option.some({
+          snapshotSequence: 8,
+          thread: healedThread,
+          storageEpoch: STORAGE_EPOCH,
+        }),
+      );
+
+      yield* TestClock.adjust("60 seconds");
+      yield* Effect.yieldNow;
+      const healed = yield* awaitThreadState(
+        harness.observed,
+        (value) => Option.isSome(value.data) && value.data.value.title === healedThread.title,
+      );
+
+      expect(Option.getOrThrow(healed.data).title).toBe(healedThread.title);
+      expect(yield* Ref.get(harness.loaderCalls)).toBe(1);
+    }),
+  );
+
+  it.effect("resets all cursors and loads one authoritative snapshot on an epoch change", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness({
+        cached: BASE_THREAD,
+        revisionSequence: CACHED_SNAPSHOT_SEQUENCE,
+      });
+      yield* awaitThreadState(harness.observed, (value) => value.status === "live");
+
+      const restoredThread = {
+        ...BASE_THREAD,
+        title: "Restored epoch snapshot",
+        updatedAt: "2026-07-16T02:10:00.000Z",
+      };
+      yield* Ref.set(harness.revisionStorageEpoch, RESTORED_STORAGE_EPOCH);
+      yield* Ref.set(harness.explicitRevisionSequence, Option.some(6));
+      yield* Ref.set(harness.explicitProjectionSequence, Option.some(6));
+      yield* Ref.set(
+        harness.httpSnapshot,
+        Option.some({
+          snapshotSequence: 6,
+          thread: restoredThread,
+          storageEpoch: RESTORED_STORAGE_EPOCH,
+        }),
+      );
+
+      yield* TestClock.adjust("2 seconds");
+      yield* Effect.yieldNow;
+      yield* awaitThreadState(
+        harness.observed,
+        (value) => Option.isSome(value.data) && value.data.value.title === restoredThread.title,
+      );
+      expect(yield* Ref.get(harness.loaderCalls)).toBe(1);
+
+      yield* harness.replaceSession;
+      yield* Effect.yieldNow;
+      expect(yield* Ref.get(harness.lastSubscribeAfterSequence)).toBe(6);
+      expect(yield* Ref.get(harness.lastSubscribeStorageEpoch)).toBe(RESTORED_STORAGE_EPOCH);
+
+      yield* Queue.offer(
+        harness.inputs,
+        titleUpdated("First post-restore event", 7, RESTORED_STORAGE_EPOCH),
+      );
+      const postRestore = yield* awaitThreadState(
+        harness.observed,
+        (value) =>
+          Option.isSome(value.data) && value.data.value.title === "First post-restore event",
+      );
+      expect(Option.getOrThrow(postRestore.data).title).toBe("First post-restore event");
+      expect(yield* Ref.get(harness.loaderCalls)).toBe(1);
+    }),
+  );
+
+  it.effect("defers every new-epoch event until authoritative recovery finishes", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness({
+        cached: BASE_THREAD,
+        revisionSequence: CACHED_SNAPSHOT_SEQUENCE,
+      });
+      yield* awaitThreadState(harness.observed, (value) => value.status === "live");
+
+      const recoveredThread = {
+        ...BASE_THREAD,
+        title: "Authoritative epoch recovery",
+        updatedAt: "2026-07-16T02:15:00.000Z",
+      };
+      yield* Ref.set(harness.revisionStorageEpoch, RESTORED_STORAGE_EPOCH);
+      yield* Ref.set(harness.explicitRevisionSequence, Option.some(8));
+      yield* Ref.set(harness.explicitProjectionSequence, Option.some(8));
+      yield* Ref.set(
+        harness.httpSnapshot,
+        Option.some({
+          snapshotSequence: 8,
+          thread: recoveredThread,
+          storageEpoch: RESTORED_STORAGE_EPOCH,
+        }),
+      );
+
+      yield* Queue.offer(
+        harness.inputs,
+        titleUpdated("Deferred epoch event 7", 7, RESTORED_STORAGE_EPOCH),
+      );
+      yield* Queue.offer(
+        harness.inputs,
+        titleUpdated("Deferred epoch event 8", 8, RESTORED_STORAGE_EPOCH),
+      );
+      for (let index = 0; index < 5; index += 1) {
+        yield* Effect.yieldNow;
+      }
+      expect(Option.getOrThrow((yield* Ref.get(harness.latest)).data).title).toBe(
+        BASE_THREAD.title,
+      );
+
+      yield* TestClock.adjust("2 seconds");
+      yield* Effect.yieldNow;
+      const recovered = yield* awaitThreadState(
+        harness.observed,
+        (value) => Option.isSome(value.data) && value.data.value.title === recoveredThread.title,
+      );
+      expect(Option.getOrThrow(recovered.data).title).toBe(recoveredThread.title);
+      expect(yield* Ref.get(harness.loaderCalls)).toBe(1);
+    }),
+  );
+
+  it.effect("forces one authoritative reset when a same-epoch marker moves backwards", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness({
+        cached: BASE_THREAD,
+        revisionSequence: CACHED_SNAPSHOT_SEQUENCE,
+      });
+      yield* awaitThreadState(harness.observed, (value) => value.status === "live");
+
+      const restoredThread = {
+        ...BASE_THREAD,
+        title: "Same-epoch restored title",
+        updatedAt: "2026-07-16T02:20:00.000Z",
+      };
+      yield* Ref.set(harness.explicitRevisionSequence, Option.some(6));
+      yield* Ref.set(harness.explicitProjectionSequence, Option.some(6));
+      yield* Ref.set(
+        harness.httpSnapshot,
+        Option.some({
+          snapshotSequence: 6,
+          thread: restoredThread,
+          storageEpoch: STORAGE_EPOCH,
+        }),
+      );
+
+      yield* TestClock.adjust("2 seconds");
+      yield* Effect.yieldNow;
+      const restored = yield* awaitThreadState(
+        harness.observed,
+        (value) => Option.isSome(value.data) && value.data.value.title === restoredThread.title,
+      );
+
+      expect(Option.getOrThrow(restored.data).title).toBe(restoredThread.title);
+      expect(yield* Ref.get(harness.loaderCalls)).toBe(1);
+      yield* TestClock.adjust("4 seconds");
+      yield* Effect.yieldNow;
+      expect(yield* Ref.get(harness.loaderCalls)).toBe(1);
+    }),
+  );
+
+  it.effect("resets when restored history reuses the same epoch and sequence", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness({
+        cached: BASE_THREAD,
+        revisionSequence: CACHED_SNAPSHOT_SEQUENCE,
+      });
+      yield* awaitThreadState(harness.observed, (value) => value.status === "live");
+
+      const replacementEventId = EventId.make("event-restored-marker-7");
+      const restoredThread = {
+        ...BASE_THREAD,
+        title: "Restored equal-sequence history",
+        updatedAt: "2026-07-16T02:22:00.000Z",
+      };
+      yield* Ref.set(harness.explicitRevisionEventId, replacementEventId);
+      yield* Ref.set(
+        harness.httpSnapshot,
+        Option.some({
+          snapshotSequence: CACHED_SNAPSHOT_SEQUENCE,
+          thread: restoredThread,
+          storageEpoch: STORAGE_EPOCH,
+          latestSequence: CACHED_SNAPSHOT_SEQUENCE,
+          latestEventId: replacementEventId,
+        }),
+      );
+
+      yield* TestClock.adjust("2 seconds");
+      yield* Effect.yieldNow;
+      const restored = yield* awaitThreadState(
+        harness.observed,
+        (value) => Option.isSome(value.data) && value.data.value.title === restoredThread.title,
+      );
+
+      expect(Option.getOrThrow(restored.data).title).toBe(restoredThread.title);
+      expect(yield* Ref.get(harness.loaderCalls)).toBe(1);
+      yield* TestClock.adjust("4 seconds");
+      yield* Effect.yieldNow;
+      expect(yield* Ref.get(harness.loaderCalls)).toBe(1);
+      yield* harness.replaceSession;
+      yield* Effect.yieldNow;
+      expect(yield* Ref.get(harness.lastSubscribeObservedRevision)).toBe(CACHED_SNAPSHOT_SEQUENCE);
+      expect(yield* Ref.get(harness.lastSubscribeObservedEventId)).toBe(replacementEventId);
+    }),
+  );
+
+  it.effect("resets when a same-epoch marker moves behind an unverified live event", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness({
+        cached: BASE_THREAD,
+        cachedLatestSequence: 6,
+        revisionSequence: 10,
+      });
+      yield* awaitThreadState(harness.observed, (value) => value.status === "live");
+
+      yield* Queue.offer(harness.inputs, titleUpdated("Unverified live title", 10));
+      yield* awaitThreadState(
+        harness.observed,
+        (value) => Option.isSome(value.data) && value.data.value.title === "Unverified live title",
+      );
+
+      const restoredThread = {
+        ...BASE_THREAD,
+        title: "Restored behind pending event",
+        updatedAt: "2026-07-16T02:25:00.000Z",
+      };
+      yield* Ref.set(harness.explicitRevisionSequence, Option.some(8));
+      yield* Ref.set(harness.explicitProjectionSequence, Option.some(8));
+      yield* Ref.set(
+        harness.httpSnapshot,
+        Option.some({
+          snapshotSequence: 8,
+          thread: restoredThread,
+          storageEpoch: STORAGE_EPOCH,
+        }),
+      );
+
+      yield* TestClock.adjust("2 seconds");
+      yield* Effect.yieldNow;
+      const restored = yield* awaitThreadState(
+        harness.observed,
+        (value) => Option.isSome(value.data) && value.data.value.title === restoredThread.title,
+      );
+
+      expect(Option.getOrThrow(restored.data).title).toBe(restoredThread.title);
+      expect(yield* Ref.get(harness.loaderCalls)).toBe(1);
+      yield* harness.replaceSession;
+      yield* Effect.yieldNow;
+      expect(yield* Ref.get(harness.lastSubscribeAfterSequence)).toBe(8);
+      expect(yield* Ref.get(harness.lastSubscribeVerifiedRevision)).toBe(8);
+      expect(yield* Ref.get(harness.lastSubscribeObservedRevision)).toBe(8);
+    }),
+  );
+
+  it.effect("accepts a forced same-epoch reconnect snapshot below the old cursor", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness({ cached: BASE_THREAD });
+      yield* awaitThreadState(harness.observed, (value) => value.status === "live");
+      const restoredThread = {
+        ...BASE_THREAD,
+        title: "Reconnect restored title",
+        updatedAt: "2026-07-16T02:30:00.000Z",
+      };
+
+      yield* Queue.offer(harness.inputs, {
+        kind: "snapshot",
+        storageEpoch: STORAGE_EPOCH,
+        force: true,
+        snapshot: {
+          snapshotSequence: 6,
+          thread: restoredThread,
+          storageEpoch: STORAGE_EPOCH,
+          latestSequence: 6,
+          latestEventId: markerEventId(6),
+        },
+      });
+      const restored = yield* awaitThreadState(
+        harness.observed,
+        (value) => Option.isSome(value.data) && value.data.value.title === restoredThread.title,
+      );
+
+      expect(Option.getOrThrow(restored.data).title).toBe(restoredThread.title);
+      yield* harness.replaceSession;
+      yield* Effect.yieldNow;
+      expect(yield* Ref.get(harness.lastSubscribeAfterSequence)).toBe(6);
+    }),
   );
 
   it.effect("resets the fast window for a genuine live event but not stale running state", () =>
@@ -617,6 +1045,7 @@ describe("EnvironmentThreads", () => {
           thread: Option.getOrThrow(liveEventState.data),
         }),
       );
+      yield* Ref.set(harness.explicitRevisionSequence, Option.some(CACHED_SNAPSHOT_SEQUENCE + 1));
       yield* TestClock.adjust("2 seconds");
       yield* TestClock.adjust("2 seconds");
       yield* Effect.yieldNow;
@@ -705,7 +1134,9 @@ describe("EnvironmentThreads", () => {
 
       yield* TestClock.adjust("60 seconds");
       yield* Effect.yieldNow;
-      expect(yield* Ref.get(harness.revisionCallTimes)).toEqual([2_000, 4_000, 8_000, 16_000]);
+      expect(yield* Ref.get(harness.revisionCallTimes)).toEqual([
+        2_000, 4_000, 8_000, 16_000, 24_000, 32_000, 40_000, 48_000, 56_000, 64_000, 72_000,
+      ]);
     }),
   );
 
@@ -1562,6 +1993,7 @@ describe("EnvironmentThreads", () => {
 
         yield* Queue.offer(harness.inputs, {
           kind: "event",
+          storageEpoch: STORAGE_EPOCH,
           event: {
             eventId: EventId.make("event-reverted"),
             sequence: CACHED_SNAPSHOT_SEQUENCE + 2,

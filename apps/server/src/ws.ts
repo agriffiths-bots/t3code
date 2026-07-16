@@ -73,7 +73,9 @@ import {
 } from "./orchestration/Normalizer.ts";
 import * as OrchestrationEngine from "./orchestration/Services/OrchestrationEngine.ts";
 import * as ProjectionSnapshotQuery from "./orchestration/Services/ProjectionSnapshotQuery.ts";
+import { coveredThreadRevision } from "./orchestration/threadRevision.ts";
 import { ScheduledTaskRepository, toScheduleEntry } from "./persistence/Services/ScheduledTasks.ts";
+import { OrchestrationEventStore } from "./persistence/Services/OrchestrationEventStore.ts";
 import {
   observeRpcEffect as instrumentRpcEffect,
   observeRpcStream as instrumentRpcStream,
@@ -388,6 +390,7 @@ const makeWsRpcLayer = (currentSession: EnvironmentAuth.AuthenticatedSession) =>
       const projectionSnapshotQuery = yield* ProjectionSnapshotQuery.ProjectionSnapshotQuery;
       const scheduledTaskRepository = yield* ScheduledTaskRepository;
       const orchestrationEngine = yield* OrchestrationEngine.OrchestrationEngineService;
+      const orchestrationEventStore = yield* OrchestrationEventStore;
       const checkpointDiffQuery = yield* CheckpointDiffQuery.CheckpointDiffQuery;
       const keybindings = yield* Keybindings.Keybindings;
       const externalLauncher = yield* ExternalLauncher.ExternalLauncher;
@@ -986,11 +989,13 @@ const makeWsRpcLayer = (currentSession: EnvironmentAuth.AuthenticatedSession) =>
                 event.aggregateKind === "thread" &&
                 event.aggregateId === input.threadId &&
                 isThreadDetailEvent(event);
+              const storageEpoch = orchestrationEventStore.storageEpoch;
 
               const liveStream = orchestrationEngine.streamDomainEvents.pipe(
                 Stream.filter(isThisThreadDetailEvent),
                 Stream.map((event) => ({
                   kind: "event" as const,
+                  storageEpoch,
                   event,
                 })),
               );
@@ -1012,8 +1017,40 @@ const makeWsRpcLayer = (currentSession: EnvironmentAuth.AuthenticatedSession) =>
               // page-bounded limit): the range is normally tiny (a fresh HTTP
               // snapshot sequence) and the per-thread filter runs after reading,
               // so a global cap could otherwise omit this thread's events.
-              if (input.afterSequence !== undefined) {
-                const afterSequence = input.afterSequence;
+              // A global replay cursor may legitimately exceed this idle
+              // thread's marker, but it must never exceed the current store
+              // high-water mark after a restore. Resume only when both cursors
+              // and the exact per-thread history identity are still valid.
+              const requestedAfterSequence = input.afterSequence;
+              const [latestRevision, latestStoreSequence] = yield* Effect.all([
+                orchestrationEventStore.getLatestThreadRevision(input.threadId),
+                orchestrationEventStore.getLatestSequence(),
+              ]).pipe(
+                Effect.mapError(
+                  (cause) =>
+                    new OrchestrationGetSnapshotError({
+                      message: `Failed to validate thread ${input.threadId} replay cursor`,
+                      cause,
+                    }),
+                ),
+              );
+              const observedIdentityMatches =
+                input.observedRevision === latestRevision.latestSequence &&
+                (input.observedRevision === 0
+                  ? input.observedEventId === null && latestRevision.latestEventId === null
+                  : input.observedEventId != null &&
+                    latestRevision.latestEventId !== null &&
+                    input.observedEventId === latestRevision.latestEventId);
+              const canResumeFromCursor =
+                requestedAfterSequence !== undefined &&
+                requestedAfterSequence <= latestStoreSequence &&
+                input.storageEpoch === storageEpoch &&
+                input.verifiedRevision !== undefined &&
+                input.verifiedRevision <= latestRevision.latestSequence &&
+                input.observedRevision !== undefined &&
+                observedIdentityMatches;
+              if (canResumeFromCursor && requestedAfterSequence !== undefined) {
+                const afterSequence = requestedAfterSequence;
                 return Stream.unwrap(
                   Effect.gen(function* () {
                     const liveBuffer = yield* Queue.unbounded<OrchestrationThreadStreamItem>();
@@ -1024,7 +1061,11 @@ const makeWsRpcLayer = (currentSession: EnvironmentAuth.AuthenticatedSession) =>
                       .readEvents(afterSequence, Number.MAX_SAFE_INTEGER)
                       .pipe(
                         Stream.filter(isThisThreadDetailEvent),
-                        Stream.map((event) => ({ kind: "event" as const, event })),
+                        Stream.map((event) => ({
+                          kind: "event" as const,
+                          storageEpoch,
+                          event,
+                        })),
                         Stream.mapError(
                           (cause) =>
                             new OrchestrationGetSnapshotError({
@@ -1060,7 +1101,13 @@ const makeWsRpcLayer = (currentSession: EnvironmentAuth.AuthenticatedSession) =>
               return Stream.concat(
                 Stream.make({
                   kind: "snapshot" as const,
-                  snapshot: snapshot.value,
+                  storageEpoch,
+                  ...(requestedAfterSequence !== undefined ? { force: true } : {}),
+                  snapshot: {
+                    ...snapshot.value,
+                    storageEpoch,
+                    ...coveredThreadRevision(snapshot.value.snapshotSequence, latestRevision),
+                  },
                 }),
                 liveStream,
               );

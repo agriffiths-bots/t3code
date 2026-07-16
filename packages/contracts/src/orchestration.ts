@@ -584,6 +584,18 @@ export type OrchestrationSubscribeShellInput = typeof OrchestrationSubscribeShel
 export const OrchestrationSubscribeThreadInput = Schema.Struct({
   threadId: ThreadId,
   /**
+   * Epoch of the event store that produced `afterSequence`. The server only
+   * resumes from the cursor when this matches its current store; otherwise it
+   * sends an authoritative snapshot.
+   */
+  storageEpoch: Schema.optionalKey(TrimmedNonEmptyString),
+  /** Latest per-thread marker already covered by the client's authoritative detail. */
+  verifiedRevision: Schema.optionalKey(NonNegativeInt),
+  /** Highest per-thread marker observed by the client, including unverified live events. */
+  observedRevision: Schema.optionalKey(NonNegativeInt),
+  /** Identity of the event at `observedRevision`; distinguishes restored replacement history. */
+  observedEventId: Schema.optionalKey(Schema.NullOr(EventId)),
+  /**
    * When provided, the server skips the initial snapshot frame and instead
    * replays events after this sequence before streaming live events. Clients
    * that load the snapshot over HTTP pass the snapshot's sequence here so the
@@ -597,6 +609,16 @@ export type OrchestrationSubscribeThreadInput = typeof OrchestrationSubscribeThr
 export const OrchestrationThreadDetailSnapshot = Schema.Struct({
   snapshotSequence: NonNegativeInt,
   thread: OrchestrationThread,
+  /** Present on HTTP and persisted client snapshots; optional for internal projection queries. */
+  storageEpoch: Schema.optionalKey(TrimmedNonEmptyString),
+  /** Per-thread persisted marker covered by this detail snapshot. */
+  latestSequence: Schema.optionalKey(NonNegativeInt),
+  /** Identity of the persisted event at `latestSequence`, or null when the sequence is zero. */
+  latestEventId: Schema.optionalKey(Schema.NullOr(EventId)),
+  /** Highest per-thread marker reflected by a persisted client cache entry. */
+  observedRevision: Schema.optionalKey(NonNegativeInt),
+  /** Identity of the event at a persisted cache entry's `observedRevision`. */
+  observedEventId: Schema.optionalKey(Schema.NullOr(EventId)),
 });
 export type OrchestrationThreadDetailSnapshot = typeof OrchestrationThreadDetailSnapshot.Type;
 
@@ -606,7 +628,9 @@ export type OrchestrationThreadDetailSnapshot = typeof OrchestrationThreadDetail
  * activities, or checkpoints.
  */
 export const OrchestrationThreadRevision = Schema.Struct({
+  storageEpoch: TrimmedNonEmptyString,
   latestSequence: NonNegativeInt,
+  latestEventId: Schema.NullOr(EventId),
   /** Lowest sequence applied by every projector needed for thread detail. */
   projectionSequence: NonNegativeInt,
 });
@@ -1302,10 +1326,14 @@ export type OrchestrationEvent = typeof OrchestrationEvent.Type;
 export const OrchestrationThreadStreamItem = Schema.Union([
   Schema.Struct({
     kind: Schema.Literal("snapshot"),
+    storageEpoch: TrimmedNonEmptyString,
+    /** Accept this snapshot authoritatively even when its sequence moved backwards. */
+    force: Schema.optionalKey(Schema.Boolean),
     snapshot: OrchestrationThreadDetailSnapshot,
   }),
   Schema.Struct({
     kind: Schema.Literal("event"),
+    storageEpoch: TrimmedNonEmptyString,
     event: OrchestrationEvent,
   }),
 ]);
