@@ -86,6 +86,53 @@ export class ProviderAdapterProcessError extends Schema.TaggedErrorClass<Provide
 }
 
 /**
+ * ProviderSendTurnFailedError - A session/prompt operation failed after the
+ * provider facade captured its owning session. `superseded` means a newer
+ * session replaced that owner before the delayed operation settled.
+ */
+export class ProviderSendTurnFailedError extends Schema.TaggedErrorClass<ProviderSendTurnFailedError>()(
+  "ProviderSendTurnFailedError",
+  {
+    provider: Schema.String,
+    threadId: Schema.String,
+    detail: Schema.String,
+    sessionOwnershipId: Schema.String,
+    sendTurnOperationId: Schema.optional(Schema.String),
+    turnId: Schema.optional(Schema.String),
+    preservedActiveTurnId: Schema.optional(Schema.String),
+    superseded: Schema.Boolean,
+    overlapping: Schema.optional(Schema.Boolean),
+    cause: Schema.optional(Schema.Defect()),
+  },
+) {
+  override get message(): string {
+    return this.superseded
+      ? `Provider send-turn result was superseded (${this.provider}) for thread ${this.threadId}: ${this.detail}`
+      : `Provider send-turn failed (${this.provider}) for thread ${this.threadId}: ${this.detail}`;
+  }
+}
+
+/**
+ * ProviderSessionStartTimeoutError - External provider startup exceeded its
+ * bounded I/O window. When present, `sessionOwnershipId` identifies the
+ * persisted session that the timed-out restart was attempting to replace.
+ */
+export class ProviderSessionStartTimeoutError extends Schema.TaggedErrorClass<ProviderSessionStartTimeoutError>()(
+  "ProviderSessionStartTimeoutError",
+  {
+    provider: Schema.String,
+    threadId: Schema.String,
+    detail: Schema.String,
+    timeoutMs: Schema.Number,
+    sessionOwnershipId: Schema.optional(Schema.String),
+  },
+) {
+  override get message(): string {
+    return `Provider session startup timed out (${this.provider}) for thread ${this.threadId}: ${this.detail}`;
+  }
+}
+
+/**
  * ProviderValidationError - Invalid provider API input.
  */
 export class ProviderValidationError extends Schema.TaggedErrorClass<ProviderValidationError>()(
@@ -200,5 +247,7 @@ export type ProviderServiceError =
   | ProviderInstanceNotFoundError
   | ProviderSessionNotFoundError
   | ProviderSessionDirectoryPersistenceError
+  | ProviderSessionStartTimeoutError
+  | ProviderSendTurnFailedError
   | ProviderAdapterError
   | CheckpointServiceError;

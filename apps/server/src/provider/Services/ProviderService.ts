@@ -22,6 +22,7 @@ import type {
   ProviderSessionStartInput,
   ProviderStopSessionInput,
   ThreadId,
+  TurnId,
   ProviderTurnStartResult,
 } from "@t3tools/contracts";
 import * as Context from "effect/Context";
@@ -78,6 +79,24 @@ export interface ProviderServiceShape {
   readonly stopSession: (
     input: ProviderStopSessionInput,
   ) => Effect.Effect<void, ProviderServiceError>;
+
+  /**
+   * Stop a failed provider session only while its persisted binding still
+   * belongs to the expected terminal turn. Returns false after replacement.
+   */
+  readonly stopFailedSession: <E, R>(input: {
+    readonly threadId: ThreadId;
+    readonly turnId: TurnId;
+    readonly reason: string;
+    readonly sessionOwnershipId?: string;
+    readonly sendTurnOperationId?: string;
+    /** Fail closed unless the currently bound adapter has no live session. */
+    readonly requireSessionAbsent?: boolean;
+    /** Runs after ownership is verified, while replacement starts are locked out. */
+    readonly onOwned: Effect.Effect<void, E, R>;
+    /** Runs after physical cleanup succeeds, before replacement starts are admitted. */
+    readonly onStopped: Effect.Effect<void, E, R>;
+  }) => Effect.Effect<boolean, ProviderServiceError | E, R>;
 
   /**
    * List active provider sessions.
