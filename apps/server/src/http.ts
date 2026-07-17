@@ -6,6 +6,7 @@ import {
   EnvironmentHttpApi,
   ProviderInstanceId,
   ServerNotificationAckAction,
+  ServerNotificationRecoveryInput,
 } from "@t3tools/contracts";
 import { decodeOtlpTraceRecords } from "@t3tools/shared/observability";
 import * as Data from "effect/Data";
@@ -62,6 +63,7 @@ const OTLP_TRACES_PROXY_PATH = "/api/observability/v1/traces";
 const TTS_SPEAK_PATH = "/api/tts/speak";
 const PLAN_USAGE_PATH = "/api/plan-usage";
 const NOTIFICATION_ACK_PATH = "/api/notifications/ack";
+const NOTIFICATION_RECOVERY_PATH = "/api/notifications/recover";
 const LOOPBACK_HOSTNAMES = new Set(["127.0.0.1", "::1", "localhost"]);
 const DESKTOP_RENDERER_ORIGINS = ["t3code://app", "t3code-dev://app"];
 const BROWSER_API_CORS_MAX_AGE_SECONDS = 600;
@@ -347,6 +349,9 @@ const NotificationAckRequest = Schema.Struct({
   action: ServerNotificationAckAction,
 });
 const decodeNotificationAckRequest = Schema.decodeUnknownEffect(NotificationAckRequest);
+const decodeNotificationRecoveryRequest = Schema.decodeUnknownEffect(
+  ServerNotificationRecoveryInput,
+);
 
 export const ttsSpeakHandler = Effect.gen(function* () {
   yield* authenticateRawRouteWithScope(AuthOrchestrationOperateScope);
@@ -434,6 +439,39 @@ export const notificationAckRouteLayer = HttpRouter.add(
       cause === "bad_request"
         ? Effect.succeed(HttpServerResponse.text("Bad Request", { status: 400 }))
         : Effect.logWarning("Notification acknowledgement failed", { cause }).pipe(
+            Effect.as(HttpServerResponse.text("Internal Server Error", { status: 500 })),
+          ),
+    ),
+  ),
+);
+
+export const notificationRecoveryRouteLayer = HttpRouter.add(
+  "POST",
+  NOTIFICATION_RECOVERY_PATH,
+  Effect.gen(function* () {
+    const request = yield* HttpServerRequest.HttpServerRequest;
+    const raw = yield* request.json.pipe(Effect.mapError(() => "not_found" as const));
+    const input = yield* decodeNotificationRecoveryRequest(raw).pipe(
+      Effect.mapError(() => "not_found" as const),
+    );
+    const notifications = yield* DeviceNotifications.DeviceNotifications;
+    const result = yield* notifications
+      .recoverSubscription(input)
+      .pipe(Effect.catchTag("ServerNotificationEndpointError", () => Effect.succeed(null)));
+    if (result === null) {
+      return HttpServerResponse.text("Not Found", { status: 404 });
+    }
+    return HttpServerResponse.jsonUnsafe(result, {
+      headers: {
+        "Cache-Control": "no-store",
+        "X-Content-Type-Options": "nosniff",
+      },
+    });
+  }).pipe(
+    Effect.catch((cause) =>
+      cause === "not_found"
+        ? Effect.succeed(HttpServerResponse.text("Not Found", { status: 404 }))
+        : Effect.logWarning("Push subscription recovery failed", { cause }).pipe(
             Effect.as(HttpServerResponse.text("Internal Server Error", { status: 500 })),
           ),
     ),

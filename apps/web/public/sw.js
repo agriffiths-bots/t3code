@@ -2,6 +2,11 @@ const CACHE_VERSION = "t3-code-v2";
 const CACHE_PREFIX = "t3-code-";
 const APP_SHELL_URLS = ["/", "/manifest.webmanifest", "/pwa-icon-192.png", "/pwa-icon-512.png"];
 const DEFAULT_ACK_URL = "/api/notifications/ack";
+const PUSH_RECOVERY_DB_NAME = "t3-push-recovery";
+const PUSH_RECOVERY_DB_VERSION = 1;
+const PUSH_RECOVERY_STORE_NAME = "configuration";
+const PUSH_RECOVERY_CONFIG_KEY = "current";
+const PUSH_RECOVERY_RETRY_DELAYS_MS = [0, 250, 1_000];
 const BUILD_ASSET_PATH_PREFIX = "/assets/";
 const BUILD_ASSET_CACHE_PREFIX = `${CACHE_PREFIX}assets-`;
 const NON_SPA_ROUTE_PATH_PREFIXES = [
@@ -13,6 +18,145 @@ const NON_SPA_ROUTE_PATH_PREFIXES = [
   "/downloads",
 ];
 const STATIC_FILE_PATH_PATTERN = /\/[^/]+\.[^/]+$/;
+
+function openPushRecoveryDatabase() {
+  return new Promise((resolve, reject) => {
+    const request = indexedDB.open(PUSH_RECOVERY_DB_NAME, PUSH_RECOVERY_DB_VERSION);
+    request.onupgradeneeded = () => {
+      if (!request.result.objectStoreNames.contains(PUSH_RECOVERY_STORE_NAME)) {
+        request.result.createObjectStore(PUSH_RECOVERY_STORE_NAME);
+      }
+    };
+    request.onsuccess = () => resolve(request.result);
+    // oxlint-disable-next-line unicorn/prefer-add-event-listener -- This request is owned by this one-shot promise.
+    request.onerror = () =>
+      reject(request.error ?? new Error("Failed to open push recovery store."));
+  });
+}
+
+async function readPushRecoveryConfig() {
+  const database = await openPushRecoveryDatabase();
+  try {
+    return await new Promise((resolve, reject) => {
+      const request = database
+        .transaction(PUSH_RECOVERY_STORE_NAME, "readonly")
+        .objectStore(PUSH_RECOVERY_STORE_NAME)
+        .get(PUSH_RECOVERY_CONFIG_KEY);
+      request.onsuccess = () => resolve(request.result ?? null);
+      // oxlint-disable-next-line unicorn/prefer-add-event-listener -- This request is owned by this one-shot promise.
+      request.onerror = () =>
+        reject(request.error ?? new Error("Failed to read push recovery configuration."));
+    });
+  } finally {
+    database.close();
+  }
+}
+
+async function writePushRecoveryConfig(config) {
+  const database = await openPushRecoveryDatabase();
+  try {
+    await new Promise((resolve, reject) => {
+      const transaction = database.transaction(PUSH_RECOVERY_STORE_NAME, "readwrite");
+      transaction.oncomplete = () => resolve();
+      // oxlint-disable-next-line unicorn/prefer-add-event-listener -- This transaction is owned by this one-shot promise.
+      transaction.onerror = () =>
+        reject(transaction.error ?? new Error("Failed to write push recovery configuration."));
+      // oxlint-disable-next-line unicorn/prefer-add-event-listener -- This transaction is owned by this one-shot promise.
+      transaction.onabort = () =>
+        reject(transaction.error ?? new Error("Push recovery configuration write aborted."));
+      transaction.objectStore(PUSH_RECOVERY_STORE_NAME).put(config, PUSH_RECOVERY_CONFIG_KEY);
+    });
+  } finally {
+    database.close();
+  }
+}
+
+function pushRecoveryConfigsMatch(left, right) {
+  return (
+    left.oldEndpoint === right.oldEndpoint &&
+    left.recoveryToken === right.recoveryToken &&
+    left.recoveryUrl === right.recoveryUrl &&
+    left.vapidPublicKey === right.vapidPublicKey
+  );
+}
+
+async function replacePushRecoveryConfig(expected, replacement) {
+  const database = await openPushRecoveryDatabase();
+  try {
+    return await new Promise((resolve, reject) => {
+      let replaced = false;
+      const transaction = database.transaction(PUSH_RECOVERY_STORE_NAME, "readwrite");
+      transaction.oncomplete = () => resolve(replaced);
+      // oxlint-disable-next-line unicorn/prefer-add-event-listener -- This transaction is owned by this one-shot promise.
+      transaction.onerror = () =>
+        reject(transaction.error ?? new Error("Failed to replace push recovery configuration."));
+      // oxlint-disable-next-line unicorn/prefer-add-event-listener -- This transaction is owned by this one-shot promise.
+      transaction.onabort = () =>
+        reject(transaction.error ?? new Error("Push recovery configuration replace aborted."));
+      const store = transaction.objectStore(PUSH_RECOVERY_STORE_NAME);
+      const request = store.get(PUSH_RECOVERY_CONFIG_KEY);
+      request.onsuccess = () => {
+        const current = parsePushRecoveryConfig(request.result);
+        if (!current || !pushRecoveryConfigsMatch(current, expected)) return;
+        replaced = true;
+        store.put(replacement, PUSH_RECOVERY_CONFIG_KEY);
+      };
+    });
+  } finally {
+    database.close();
+  }
+}
+
+function parsePushRecoveryConfig(value) {
+  if (
+    !value ||
+    typeof value.oldEndpoint !== "string" ||
+    typeof value.recoveryToken !== "string" ||
+    typeof value.recoveryUrl !== "string" ||
+    typeof value.vapidPublicKey !== "string"
+  ) {
+    return null;
+  }
+  try {
+    const recoveryUrl = new URL(value.recoveryUrl);
+    if (recoveryUrl.protocol !== "http:" && recoveryUrl.protocol !== "https:") {
+      return null;
+    }
+  } catch {
+    return null;
+  }
+  return {
+    oldEndpoint: value.oldEndpoint,
+    recoveryToken: value.recoveryToken,
+    recoveryUrl: value.recoveryUrl,
+    vapidPublicKey: value.vapidPublicKey,
+  };
+}
+
+function urlBase64ToUint8Array(value) {
+  const padding = "=".repeat((4 - (value.length % 4)) % 4);
+  const raw = atob(`${value}${padding}`.replace(/-/g, "+").replace(/_/g, "/"));
+  return Uint8Array.from(raw, (character) => character.charCodeAt(0));
+}
+
+function waitForPushRecoveryRetry(delayMillis) {
+  return new Promise((resolve) => setTimeout(resolve, delayMillis));
+}
+
+function toServerPushSubscription(subscription) {
+  const json = subscription?.toJSON();
+  if (!json?.endpoint || !json.keys?.p256dh || !json.keys.auth) {
+    return null;
+  }
+  return {
+    endpoint: json.endpoint,
+    expirationTime: json.expirationTime ?? null,
+    keys: {
+      p256dh: json.keys.p256dh,
+      auth: json.keys.auth,
+    },
+  };
+}
 
 function isBuildAssetUrl(url) {
   return url.origin === self.location.origin && url.pathname.startsWith(BUILD_ASSET_PATH_PREFIX);
@@ -218,6 +362,68 @@ self.addEventListener("fetch", (event) => {
 
   event.waitUntil(cacheCleanup);
   event.respondWith(networkResponse.then((response) => response).catch(cachedShellOrUnavailable));
+});
+
+self.addEventListener("message", (event) => {
+  if (event.data?.type !== "t3-push-recovery-config") return;
+  const config = parsePushRecoveryConfig(event.data);
+  if (!config) return;
+  event.waitUntil(writePushRecoveryConfig(config));
+});
+
+async function recoverPushSubscription(event) {
+  const config = parsePushRecoveryConfig(await readPushRecoveryConfig());
+  if (!config) return;
+
+  const subscription =
+    event.newSubscription ??
+    (await self.registration.pushManager.subscribe({
+      userVisibleOnly: true,
+      applicationServerKey: urlBase64ToUint8Array(config.vapidPublicKey),
+    }));
+  const newSubscription = toServerPushSubscription(subscription);
+  if (!newSubscription) return;
+  const request = {
+    method: "POST",
+    mode: "cors",
+    credentials: "omit",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      oldEndpoint: config.oldEndpoint,
+      recoveryToken: config.recoveryToken,
+      newSubscription,
+    }),
+  };
+
+  for (const [attempt, delayMillis] of PUSH_RECOVERY_RETRY_DELAYS_MS.entries()) {
+    if (delayMillis > 0) await waitForPushRecoveryRetry(delayMillis);
+    try {
+      const response = await fetch(config.recoveryUrl, request);
+      if (!response.ok) {
+        const retryable =
+          response.status === 408 || response.status === 429 || response.status >= 500;
+        if (!retryable) return;
+        throw new Error(`Push recovery failed with status ${response.status}.`);
+      }
+
+      const result = await response.json();
+      if (typeof result?.recoveryToken !== "string" || result.recoveryToken.length === 0) {
+        throw new Error("Push recovery returned an invalid token response.");
+      }
+      await replacePushRecoveryConfig(config, {
+        ...config,
+        oldEndpoint: newSubscription.endpoint,
+        recoveryToken: result.recoveryToken,
+      });
+      return;
+    } catch (cause) {
+      if (attempt === PUSH_RECOVERY_RETRY_DELAYS_MS.length - 1) throw cause;
+    }
+  }
+}
+
+self.addEventListener("pushsubscriptionchange", (event) => {
+  event.waitUntil(recoverPushSubscription(event).catch(() => undefined));
 });
 
 function readPushPayload(event) {

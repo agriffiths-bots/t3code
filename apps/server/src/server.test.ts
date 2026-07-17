@@ -698,7 +698,9 @@ const buildAppUnderTest = (options?: {
             Effect.succeed({
               deviceId: input.deviceId,
               vapidPublicKey: "test-vapid-public-key",
+              recoveryToken: "test-recovery-token",
             }),
+          recoverSubscription: () => Effect.succeed(null),
           ackNotification: (input) =>
             Effect.succeed({
               notificationId: input.notificationId,
@@ -1398,6 +1400,74 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
 
       assert.equal(response.status, 200);
       assert.deepEqual(body, testEnvironmentDescriptor);
+    }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+
+  it.effect("recovers a push subscription by token and collapses lookup failures to 404", () =>
+    Effect.gen(function* () {
+      const recoveryCalls: Array<{
+        readonly oldEndpoint: string;
+        readonly recoveryToken: string;
+      }> = [];
+      yield* buildAppUnderTest({
+        layers: {
+          deviceNotifications: {
+            recoverSubscription: (input) => {
+              recoveryCalls.push({
+                oldEndpoint: input.oldEndpoint,
+                recoveryToken: input.recoveryToken,
+              });
+              return Effect.succeed(
+                input.oldEndpoint === "https://push.example/old" &&
+                  input.recoveryToken === "valid-recovery-token"
+                  ? { recoveryToken: "rotated-recovery-token" }
+                  : null,
+              );
+            },
+          },
+        },
+      });
+
+      const recoveryUrl = yield* getHttpServerUrl("/api/notifications/recover");
+      const postRecovery = (oldEndpoint: string, recoveryToken: string) =>
+        fetchEffect(recoveryUrl, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: jsonRequestBody({
+            oldEndpoint,
+            recoveryToken,
+            newSubscription: {
+              endpoint: "https://push.example/new",
+              expirationTime: null,
+              keys: { p256dh: "p256dh", auth: "auth" },
+            },
+          }),
+        });
+
+      const acceptedResponse = yield* postRecovery(
+        "https://push.example/old",
+        "valid-recovery-token",
+      );
+      const acceptedBody = yield* responseJsonEffect<{ readonly recoveryToken: string }>(
+        acceptedResponse,
+      );
+      const wrongTokenResponse = yield* postRecovery(
+        "https://push.example/old",
+        "wrong-recovery-token",
+      );
+      const unknownEndpointResponse = yield* postRecovery(
+        "https://push.example/unknown",
+        "valid-recovery-token",
+      );
+
+      assert.equal(acceptedResponse.status, 200);
+      assert.deepEqual(acceptedBody, { recoveryToken: "rotated-recovery-token" });
+      assert.equal(acceptedResponse.headers["cache-control"], "no-store");
+      assert.equal(wrongTokenResponse.status, 404);
+      assert.equal(unknownEndpointResponse.status, 404);
+      assert.equal(yield* wrongTokenResponse.text, "Not Found");
+      assert.equal(yield* unknownEndpointResponse.text, "Not Found");
+      assert.equal(recoveryCalls.length, 3);
     }).pipe(Effect.provide(NodeHttpServer.layerTest)),
   );
 

@@ -5,6 +5,7 @@ import { Children, isValidElement, type ReactElement, type ReactNode } from "rea
 import {
   canUseNativeDesktopNotifications,
   createDesktopNotificationDeliveryCoordinator,
+  createSerializedRegistrationRefresh,
   PwaRuntimeView,
   PwaServiceWorkerRegistration,
   resolveDeepLinkTarget,
@@ -174,5 +175,33 @@ describe("shouldRegisterDesktopNotifications", () => {
 
     await expect(registrationAllowed).resolves.toBe(false);
     expect(permissionRequests).toBe(0);
+  });
+});
+
+describe("createSerializedRegistrationRefresh", () => {
+  it("prevents a delayed registration response from arriving after a newer refresh", async () => {
+    let resolveFirst!: () => void;
+    let refreshCalls = 0;
+    const refresh = createSerializedRegistrationRefresh(async () => {
+      refreshCalls += 1;
+      if (refreshCalls === 1) {
+        await new Promise<void>((resolve) => {
+          resolveFirst = resolve;
+        });
+      }
+    });
+
+    const first = refresh();
+    const overlapping = refresh();
+    await Promise.resolve();
+
+    expect(overlapping).toBe(first);
+    expect(refreshCalls).toBe(1);
+
+    resolveFirst();
+    await first;
+    await refresh();
+
+    expect(refreshCalls).toBe(2);
   });
 });
