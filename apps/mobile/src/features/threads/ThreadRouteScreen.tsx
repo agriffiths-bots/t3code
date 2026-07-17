@@ -5,6 +5,7 @@ import {
   useNavigation,
   type StaticScreenProps,
 } from "@react-navigation/native";
+import type { MenuAction } from "@react-native-menu/menu";
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import * as Option from "effect/Option";
 import { EnvironmentId, ThreadId, type ProjectScript } from "@t3tools/contracts";
@@ -18,9 +19,11 @@ import { vcsEnvironment } from "../../state/vcs";
 
 import { EmptyState } from "../../components/EmptyState";
 import {
+  AndroidHeaderIconButton,
   AndroidScreenHeader,
   type AndroidHeaderAction,
 } from "../../components/AndroidScreenHeader";
+import { ControlPillMenu } from "../../components/ControlPill";
 import { LoadingScreen } from "../../components/LoadingScreen";
 import { scopedThreadKey } from "../../lib/scopedEntities";
 import { connectionTone } from "../connection/connectionTone";
@@ -35,8 +38,12 @@ import { useSelectedThreadDetailState } from "../../state/use-thread-detail";
 import { useThreadSelection } from "../../state/use-thread-selection";
 import { GitActionProgressOverlay } from "./GitActionProgressOverlay";
 import {
+  basename,
   buildTerminalMenuSessions,
+  getTerminalStatusLabel,
   nextOpenTerminalId,
+  projectScriptMenuIcon,
+  projectScriptMenuLabel,
   resolveProjectScriptTerminalId,
 } from "../terminal/terminalMenu";
 import {
@@ -70,6 +77,7 @@ import {
   ThreadInspectorContentStack,
   type ThreadInspectorMode,
 } from "./thread-inspector-content-stack";
+import { navigateBackOrHome } from "./threadRouteNavigation";
 
 interface ThreadInspectorSelection {
   readonly routeThreadIdentity: string | null;
@@ -628,6 +636,75 @@ function ThreadRouteContent(
   };
   const threadCenterHeaderItems = useThreadGitCenterHeaderItems(threadGitControlProps);
   const compactRightHeaderItems = useThreadGitRightHeaderItems(threadGitControlProps);
+  const androidTerminalMenuActions = useMemo<MenuAction[]>(
+    () => [
+      ...(selectedThreadProject?.scripts ?? []).map(
+        (script): MenuAction => ({
+          id: `project-script:${script.id}`,
+          title: projectScriptMenuLabel(script),
+          subtitle: script.command,
+          image: projectScriptMenuIcon(script.icon),
+        }),
+      ),
+      ...((selectedThreadProject?.scripts.length ?? 0) === 0
+        ? [
+            {
+              id: "project-script-unavailable",
+              title: "No project scripts",
+              subtitle: "This project has no saved scripts yet",
+              image: "play",
+              attributes: { disabled: true },
+            } satisfies MenuAction,
+          ]
+        : []),
+      ...terminalMenuSessions.map(
+        (session): MenuAction => ({
+          id: `terminal-session:${session.terminalId}`,
+          title: session.displayLabel,
+          subtitle: [
+            getTerminalStatusLabel({
+              status: session.status,
+              hasRunningSubprocess: session.hasRunningSubprocess,
+            }),
+            basename(session.cwd),
+          ]
+            .filter(Boolean)
+            .join(" · "),
+          image: "terminal",
+        }),
+      ),
+      {
+        id: "terminal-new",
+        title: "Open new terminal",
+        subtitle: "Start another shell for this thread",
+        image: "plus",
+      },
+    ],
+    [selectedThreadProject?.scripts, terminalMenuSessions],
+  );
+  const handleAndroidTerminalMenuAction = useCallback(
+    (event: { readonly nativeEvent: { readonly event: string } }) => {
+      const actionId = event.nativeEvent.event;
+      if (actionId === "terminal-new") {
+        handleOpenNewTerminal();
+        return;
+      }
+      if (actionId.startsWith("terminal-session:")) {
+        handleOpenTerminal(actionId.slice("terminal-session:".length));
+        return;
+      }
+      if (actionId.startsWith("project-script:")) {
+        const scriptId = actionId.slice("project-script:".length);
+        const script = selectedThreadProject?.scripts.find(
+          (candidate) => candidate.id === scriptId,
+        );
+        if (script) {
+          void handleRunProjectScript(script);
+        }
+      }
+    },
+    [handleOpenNewTerminal, handleOpenTerminal, handleRunProjectScript, selectedThreadProject],
+  );
   const splitLeftHeaderItems = useMemo<NativeHeaderItems>(
     () => [
       {
@@ -687,13 +764,6 @@ function ThreadRouteContent(
         onPress: handleOpenFilesInspector,
       });
     }
-    if (selectedThreadProject?.workspaceRoot) {
-      actions.push({
-        accessibilityLabel: "Open terminal",
-        icon: "terminal",
-        onPress: () => handleOpenTerminal(null),
-      });
-    }
     actions.push({
       accessibilityLabel: "Open git controls",
       icon: "point.topleft.down.curvedto.point.bottomright.up",
@@ -710,13 +780,20 @@ function ThreadRouteContent(
   }, [
     fileInspector.supported,
     handleOpenFilesInspector,
-    handleOpenTerminal,
     handleOpenGitInspector,
     handleToggleInspector,
     props.onReturnToThread,
     selectedThreadCwd,
     selectedThreadProject?.workspaceRoot,
   ]);
+
+  const handleNavigateBack = useCallback(() => {
+    navigateBackOrHome({
+      canGoBack: () => navigation.canGoBack(),
+      goBack: () => navigation.goBack(),
+      goHome: () => navigation.dispatch(StackActions.replace("Home")),
+    });
+  }, [navigation]);
 
   // Deep links / cold starts land with Thread as the ONLY route, where the
   // native back button does not render. Provide an explicit Home escape for
@@ -846,8 +923,20 @@ function ThreadRouteContent(
         <AndroidScreenHeader
           title={selectedThread.title}
           subtitle={headerSubtitle}
-          onBack={layout.usesSplitView ? undefined : () => navigation.goBack()}
+          onBack={layout.usesSplitView ? undefined : handleNavigateBack}
           actions={androidHeaderActions}
+          trailing={
+            selectedThreadProject?.workspaceRoot ? (
+              <ControlPillMenu
+                actions={androidTerminalMenuActions}
+                isAnchoredToRight
+                title="Terminal"
+                onPressAction={handleAndroidTerminalMenuAction}
+              >
+                <AndroidHeaderIconButton accessibilityLabel="Terminal actions" icon="terminal" />
+              </ControlPillMenu>
+            ) : null
+          }
         />
       ) : null}
 
