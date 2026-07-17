@@ -834,7 +834,12 @@ export function projectEvent(
                     : activeTurnAssistantMessageId,
               }
             : thread.latestTurn !== null &&
-                thread.latestTurn.state === "running" &&
+                (thread.latestTurn.state === "running" ||
+                  // A dead-session interrupt carries its exact turn id on the
+                  // terminal event before a second event clears it.
+                  (settledTurnState === "error" &&
+                    thread.latestTurn.state === "interrupted" &&
+                    thread.latestTurn.turnId === session.activeTurnId)) &&
                 settledTurnState !== null
               ? {
                   ...thread.latestTurn,

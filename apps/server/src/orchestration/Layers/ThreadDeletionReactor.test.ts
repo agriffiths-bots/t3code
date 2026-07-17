@@ -10,9 +10,7 @@ import {
   type ProviderSession,
   ThreadId,
 } from "@t3tools/contracts";
-import * as Cause from "effect/Cause";
 import * as Effect from "effect/Effect";
-import * as Exit from "effect/Exit";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as PubSub from "effect/PubSub";
@@ -36,11 +34,22 @@ import { OrchestrationEngineService } from "../Services/OrchestrationEngine.ts";
 import { ProjectionSnapshotQuery } from "../Services/ProjectionSnapshotQuery.ts";
 import { ProviderCommandReactor } from "../Services/ProviderCommandReactor.ts";
 import { ThreadDeletionReactor } from "../Services/ThreadDeletionReactor.ts";
+import { WorktreeLifecycleCoordinatorLive } from "../Services/WorktreeLifecycleCoordinator.ts";
 import { ProviderCommandReactorLive } from "./ProviderCommandReactor.ts";
-import {
-  logCleanupCauseUnlessInterrupted,
-  ThreadDeletionReactorLive,
-} from "./ThreadDeletionReactor.ts";
+import { ThreadDeletionReactorLive } from "./ThreadDeletionReactor.ts";
+
+const ThreadDeletionReactorTestLive = ThreadDeletionReactorLive.pipe(
+  Layer.provide(WorktreeLifecycleCoordinatorLive),
+  Layer.provide(NodeServices.layer),
+  Layer.provide(
+    Layer.mock(GitWorkflowService.GitWorkflowService)({
+      localStatus: () => Effect.succeed({ isRepo: true, hasWorkingTreeChanges: false } as never),
+      hasIgnoredFiles: () => Effect.succeed(false),
+      removeWorktree: () => Effect.void,
+      pruneWorktrees: () => Effect.void,
+    }),
+  ),
+);
 
 const now = "2026-01-01T00:00:00.000Z";
 
@@ -138,41 +147,6 @@ const sessionStopRequestedEvent = (
   },
 });
 
-describe("logCleanupCauseUnlessInterrupted", () => {
-  const threadId = ThreadId.make("thread-deletion-reactor-test");
-
-  it.effect("swallows ordinary cleanup failures", () =>
-    Effect.gen(function* () {
-      const exit = yield* Effect.exit(
-        logCleanupCauseUnlessInterrupted({
-          effect: Effect.fail("cleanup failed"),
-          message: "thread deletion cleanup skipped provider session stop",
-          threadId,
-        }),
-      );
-
-      expect(Exit.isSuccess(exit)).toBe(true);
-    }),
-  );
-
-  it.effect("preserves interrupt causes", () =>
-    Effect.gen(function* () {
-      const exit = yield* Effect.exit(
-        logCleanupCauseUnlessInterrupted({
-          effect: Effect.interrupt,
-          message: "thread deletion cleanup skipped provider session stop",
-          threadId,
-        }),
-      );
-
-      expect(Exit.isFailure(exit)).toBe(true);
-      if (Exit.isFailure(exit)) {
-        expect(Cause.hasInterruptsOnly(exit.cause)).toBe(true);
-      }
-    }),
-  );
-});
-
 describe("ThreadDeletionReactor", () => {
   it.effect("cleans up provider sessions and terminals for every archived descendant", () =>
     Effect.gen(function* () {
@@ -225,6 +199,7 @@ describe("ThreadDeletionReactor", () => {
         respondToRequest: () => unsupported(),
         respondToUserInput: () => unsupported(),
         stopSession,
+        stopFailedSession: () => unsupported(),
         listSessions: () => Effect.succeed(runtimeSessions),
         getCapabilities: () => Effect.succeed({ sessionModelSwitch: "in-session" }),
         getInstanceInfo: (instanceId) =>
@@ -254,7 +229,7 @@ describe("ThreadDeletionReactor", () => {
         subscribeMetadata: () => Effect.succeed(() => undefined),
       };
 
-      const layer = Layer.mergeAll(ProviderCommandReactorLive, ThreadDeletionReactorLive).pipe(
+      const layer = Layer.mergeAll(ProviderCommandReactorLive, ThreadDeletionReactorTestLive).pipe(
         Layer.provideMerge(Layer.succeed(OrchestrationEngineService, engine)),
         Layer.provideMerge(
           Layer.mock(ProjectionSnapshotQuery)({
@@ -301,6 +276,7 @@ describe("ThreadDeletionReactor", () => {
         ),
         Layer.provideMerge(ServerSettingsService.layerTest()),
         Layer.provideMerge(NodeServices.layer),
+        Layer.provideMerge(WorktreeLifecycleCoordinatorLive),
       );
 
       yield* Effect.scoped(
@@ -383,6 +359,7 @@ describe("ThreadDeletionReactor", () => {
         respondToRequest: () => unsupported(),
         respondToUserInput: () => unsupported(),
         stopSession,
+        stopFailedSession: () => unsupported(),
         listSessions: () => Effect.succeed(runtimeSessions),
         getCapabilities: () => Effect.succeed({ sessionModelSwitch: "in-session" }),
         getInstanceInfo: () => unsupported(),
@@ -402,7 +379,7 @@ describe("ThreadDeletionReactor", () => {
         subscribeMetadata: () => Effect.succeed(() => undefined),
       };
 
-      const layer = ThreadDeletionReactorLive.pipe(
+      const layer = ThreadDeletionReactorTestLive.pipe(
         Layer.provideMerge(Layer.succeed(OrchestrationEngineService, engine)),
         Layer.provideMerge(
           Layer.mock(ProjectionSnapshotQuery)({
@@ -488,6 +465,7 @@ describe("ThreadDeletionReactor", () => {
         respondToRequest: () => unsupported(),
         respondToUserInput: () => unsupported(),
         stopSession,
+        stopFailedSession: () => unsupported(),
         listSessions: () => Effect.succeed([]),
         getCapabilities: () => Effect.succeed({ sessionModelSwitch: "in-session" }),
         getInstanceInfo: () => unsupported(),
@@ -507,7 +485,7 @@ describe("ThreadDeletionReactor", () => {
         subscribeMetadata: () => Effect.succeed(() => undefined),
       };
 
-      const layer = ThreadDeletionReactorLive.pipe(
+      const layer = ThreadDeletionReactorTestLive.pipe(
         Layer.provideMerge(Layer.succeed(OrchestrationEngineService, engine)),
         Layer.provideMerge(
           Layer.mock(ProjectionSnapshotQuery)({
@@ -530,10 +508,7 @@ describe("ThreadDeletionReactor", () => {
           const threadDeletionReactor = yield* ThreadDeletionReactor;
           yield* threadDeletionReactor.start();
           yield* waitFor(
-            () =>
-              stopSession.mock.calls.length === 1 &&
-              dispatchedCommands.length === 1 &&
-              closeTerminal.mock.calls.length === 1,
+            () => dispatchedCommands.length === 1 && closeTerminal.mock.calls.length === 1,
           );
           yield* threadDeletionReactor.drain;
         }).pipe(Effect.provide(layer)),
@@ -551,7 +526,7 @@ describe("ThreadDeletionReactor", () => {
           },
         },
       ]);
-      expect(stopSession).toHaveBeenCalledWith({ threadId });
+      expect(stopSession).not.toHaveBeenCalled();
       expect(closeTerminal).toHaveBeenCalledWith({ threadId });
     }),
   );
@@ -607,6 +582,7 @@ describe("ThreadDeletionReactor", () => {
           respondToRequest: () => unsupported(),
           respondToUserInput: () => unsupported(),
           stopSession,
+          stopFailedSession: () => unsupported(),
           listSessions: () => Effect.succeed(runtimeSessions),
           getCapabilities: () => Effect.succeed({ sessionModelSwitch: "in-session" }),
           getInstanceInfo: () => unsupported(),
@@ -626,7 +602,7 @@ describe("ThreadDeletionReactor", () => {
           subscribeMetadata: () => Effect.succeed(() => undefined),
         };
 
-        const layer = ThreadDeletionReactorLive.pipe(
+        const layer = ThreadDeletionReactorTestLive.pipe(
           Layer.provideMerge(Layer.succeed(OrchestrationEngineService, engine)),
           Layer.provideMerge(
             Layer.mock(ProjectionSnapshotQuery)({
@@ -703,6 +679,7 @@ describe("ThreadDeletionReactor", () => {
         respondToRequest: () => unsupported(),
         respondToUserInput: () => unsupported(),
         stopSession: () => unsupported(),
+        stopFailedSession: () => unsupported(),
         listSessions: () => Effect.succeed(runtimeSessions),
         getCapabilities: () => Effect.succeed({ sessionModelSwitch: "in-session" }),
         getInstanceInfo: () => unsupported(),
@@ -722,7 +699,7 @@ describe("ThreadDeletionReactor", () => {
         subscribeMetadata: () => Effect.succeed(() => undefined),
       };
 
-      const layer = ThreadDeletionReactorLive.pipe(
+      const layer = ThreadDeletionReactorTestLive.pipe(
         Layer.provideMerge(Layer.succeed(OrchestrationEngineService, engine)),
         Layer.provideMerge(
           Layer.mock(ProjectionSnapshotQuery)({
@@ -794,6 +771,7 @@ describe("ThreadDeletionReactor", () => {
           respondToRequest: () => unsupported(),
           respondToUserInput: () => unsupported(),
           stopSession,
+          stopFailedSession: () => unsupported(),
           listSessions: () => Effect.succeed([providerSessionFor(archivedThreadId)]),
           getCapabilities: () => Effect.succeed({ sessionModelSwitch: "in-session" }),
           getInstanceInfo: () => unsupported(),
@@ -813,7 +791,7 @@ describe("ThreadDeletionReactor", () => {
           subscribeMetadata: () => Effect.succeed(() => undefined),
         };
 
-        const layer = ThreadDeletionReactorLive.pipe(
+        const layer = ThreadDeletionReactorTestLive.pipe(
           Layer.provideMerge(Layer.succeed(OrchestrationEngineService, engine)),
           Layer.provideMerge(
             Layer.mock(ProjectionSnapshotQuery)({
@@ -831,15 +809,13 @@ describe("ThreadDeletionReactor", () => {
             yield* Effect.yieldNow;
             yield* PubSub.publish(domainEvents, archivedEvent(archivedThreadId, 1));
             yield* PubSub.publish(domainEvents, deletedEvent(deletedThreadId, 2));
-            yield* waitFor(
-              () => stopSession.mock.calls.length === 1 && closeTerminal.mock.calls.length === 1,
-            );
+            yield* waitFor(() => closeTerminal.mock.calls.length === 1);
             yield* threadDeletionReactor.drain;
           }).pipe(Effect.provide(layer)),
         );
 
         expect(getThreadShellByIdIncludingArchived).toHaveBeenCalled();
-        expect(stopSession).toHaveBeenCalledWith({ threadId: deletedThreadId });
+        expect(stopSession).not.toHaveBeenCalled();
         expect(closeTerminal).toHaveBeenCalledWith({
           threadId: deletedThreadId,
           deleteHistory: true,

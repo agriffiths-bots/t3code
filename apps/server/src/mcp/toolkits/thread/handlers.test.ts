@@ -32,7 +32,8 @@ import { ProviderInstanceRegistry } from "../../../provider/Services/ProviderIns
 import type { ProviderInstance } from "../../../provider/ProviderDriver.ts";
 import * as McpInvocationContext from "../../McpInvocationContext.ts";
 import { ThreadToolkitRegistrationLive } from "../../McpHttpServer.ts";
-import { ThreadStartRuntimeLive } from "./handlers.ts";
+import { activeThreadStartRuntimeOf, ThreadStartRuntimeLive } from "./handlers.ts";
+import type { ThreadStartInternalInput } from "./tools.ts";
 
 const projectId = ProjectId.make("project-thread-mcp");
 const sourceThreadId = ThreadId.make("source-thread-mcp");
@@ -97,7 +98,6 @@ const client = McpSchema.McpServerClient.of({
   },
   getClient: Effect.die("unused"),
 });
-
 const makeTempDirectory = (prefix: string) =>
   Effect.gen(function* () {
     const fileSystem = yield* FileSystem.FileSystem;
@@ -335,14 +335,75 @@ const callStartTool = (
   options: TestLayerOptions = {},
 ) =>
   Effect.gen(function* () {
-    const server = yield* McpServer.McpServer;
-    return yield* server
-      .callTool({ name: "t3_thread_start", arguments: arguments_ })
-      .pipe(
-        Effect.provideService(McpInvocationContext.McpInvocationContext, invocation),
-        Effect.provideService(McpSchema.McpServerClient, client),
-      );
+    const runtime = activeThreadStartRuntimeOf();
+    if (runtime === null) return yield* Effect.die("Thread start runtime is unavailable in test.");
+    return yield* runtime(arguments_ as ThreadStartInternalInput, invocation).pipe(
+      Effect.map((output) => ({
+        isError: false as const,
+        structuredContent: output,
+        content: [{ type: "text" as const, text: JSON.stringify(output) }],
+      })),
+      Effect.catch((error) =>
+        Effect.succeed({
+          isError: true as const,
+          structuredContent: undefined,
+          content: [{ type: "text" as const, text: error.message }],
+        }),
+      ),
+    );
   }).pipe(Effect.provide(makeTestLayer(commands, options)));
+
+it.effect("starts through the slim MCP surface with xhigh Codex effort by default", () =>
+  Effect.gen(function* () {
+    const commands: OrchestrationCommand[] = [];
+    const result = yield* Effect.gen(function* () {
+      const server = yield* McpServer.McpServer;
+      return yield* server
+        .callTool({
+          name: "t3_thread_start",
+          arguments: {
+            prompt: "Investigate flaky tests",
+            model: "gpt-5.4",
+            title: "Flaky test investigation",
+          },
+        })
+        .pipe(
+          Effect.provideService(McpInvocationContext.McpInvocationContext, invocation),
+          Effect.provideService(McpSchema.McpServerClient, client),
+        );
+    }).pipe(
+      Effect.provide(
+        makeTestLayer(commands, {
+          providerInstances: [
+            makeModelInstance("codex", "codex", [
+              { slug: "gpt-5.4", optionId: "reasoningEffort", value: "low" },
+            ]),
+          ],
+        }),
+      ),
+    );
+
+    expect(result.isError).toBe(false);
+    expect(commands[0]).toMatchObject({
+      type: "thread.turn.start",
+      modelSelection: {
+        instanceId: "codex",
+        model: "gpt-5.4",
+        options: [{ id: "reasoningEffort", value: "xhigh" }],
+      },
+      bootstrap: {
+        createThread: {
+          title: "Flaky test investigation",
+          modelSelection: {
+            instanceId: "codex",
+            model: "gpt-5.4",
+            options: [{ id: "reasoningEffort", value: "xhigh" }],
+          },
+        },
+      },
+    });
+  }),
+);
 
 it.effect("starts a new worktree thread by default and inherits source settings", () =>
   Effect.gen(function* () {
@@ -545,8 +606,8 @@ it.effect("bases the child on an explicit git directory with a new worktree", ()
       projectCwd: explicitDir,
       baseBranch: "main",
     });
-    // Cross-repo worktrees are user-managed: the reaper resolves repositories
-    // via the caller's projectId and would orphan them if marked removable.
+    // Cross-repo worktrees are user-managed: lifecycle teardown runs through
+    // the caller's project repository and cannot safely remove them.
     expect(command.bootstrap?.createThread?.worktreeRemovable).toBe(false);
     expect(String(result.structuredContent?.warning)).toContain("not auto-cleaned");
     // The caller project's setup script must never run inside an explicitly
@@ -648,7 +709,7 @@ it.effect("never borrows the caller project's branch for an explicit directory",
 
 it.effect("keeps cleanup and setup for a directory inside the project workspace", () =>
   // A directory that resolves to the caller project's own repository AND lies
-  // inside its workspace gets no restrictions: the reaper sees same-repo
+  // inside its workspace gets no restrictions: lifecycle teardown sees same-repo
   // worktrees and the project's setup script runs in its own workspace.
   Effect.gen(function* () {
     const commands: OrchestrationCommand[] = [];

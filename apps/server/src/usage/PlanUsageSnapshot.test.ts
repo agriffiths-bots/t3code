@@ -1,6 +1,5 @@
 import { DEFAULT_SERVER_SETTINGS } from "@t3tools/contracts";
 import { assert, it } from "@effect/vitest";
-import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as TestClock from "effect/testing/TestClock";
@@ -8,31 +7,30 @@ import * as TestClock from "effect/testing/TestClock";
 import * as ServerSettings from "../serverSettings.ts";
 import { makeLayer, PlanUsageSnapshotStore } from "./PlanUsageSnapshot.ts";
 
-it.effect("serves the current snapshot without blocking while the background probe warms", () =>
-  Effect.gen(function* () {
-    let releaseProbe!: () => void;
-    const blockedProbe = new Promise<void>((resolve) => {
-      releaseProbe = resolve;
-    });
-    const layer = makeLayer({
-      load: async () => {
-        await blockedProbe;
-        return { updatedAt: "2026-07-10T08:01:00.000Z", providers: [] };
-      },
-    }).pipe(Layer.provide(ServerSettings.layerTest(DEFAULT_SERVER_SETTINGS)));
+it.effect("does not block layer acquisition on the initial usage probe", () => {
+  let probes = 0;
+  const layer = makeLayer({
+    load: () => {
+      probes += 1;
+      return new Promise(() => {});
+    },
+  }).pipe(Layer.provide(ServerSettings.layerTest(DEFAULT_SERVER_SETTINGS)));
 
-    const scope = yield* Effect.scope;
-    const store = yield* Layer.buildWithScope(layer, scope).pipe(
-      Effect.map((context) => Context.get(context, PlanUsageSnapshotStore)),
-    );
-    assert.deepEqual((yield* store.current).providers, []);
+  return Effect.scoped(
+    Effect.gen(function* () {
+      const layerFiber = yield* Layer.build(layer).pipe(
+        Effect.forkChild({ startImmediately: true }),
+      );
+      yield* Effect.yieldNow;
+      yield* Effect.yieldNow;
 
-    releaseProbe();
-    yield* Effect.yieldNow;
-    yield* Effect.yieldNow;
-    assert.equal((yield* store.current).updatedAt, "2026-07-10T08:01:00.000Z");
-  }),
-);
+      assert.equal(probes, 1);
+      const layerExit = layerFiber.pollUnsafe();
+      assert.isDefined(layerExit);
+      assert.equal(layerExit?._tag, "Success");
+    }),
+  );
+});
 
 it.effect("refreshes plan usage in the background without request-driven probes", () => {
   let probes = 0;

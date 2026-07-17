@@ -9,7 +9,7 @@
  *
  * @module OrchestrationEventStore
  */
-import { OrchestrationEvent } from "@t3tools/contracts";
+import { OrchestrationEvent, type EventId, type ThreadId } from "@t3tools/contracts";
 import * as Context from "effect/Context";
 import type * as Effect from "effect/Effect";
 import type * as Stream from "effect/Stream";
@@ -20,6 +20,9 @@ import type { OrchestrationEventStoreError } from "../Errors.ts";
  * OrchestrationEventStoreShape - Service API for orchestration event persistence.
  */
 export interface OrchestrationEventStoreShape {
+  /** Stable identity for this event-store database, preserved by backups. */
+  readonly storageEpoch: string;
+
   /**
    * Persist a new orchestration event.
    *
@@ -52,6 +55,22 @@ export interface OrchestrationEventStoreShape {
    * @returns Stream containing all stored events.
    */
   readonly readAll: () => Stream.Stream<OrchestrationEvent, OrchestrationEventStoreError>;
+
+  /**
+   * Read only the latest persisted sequence for one thread aggregate. This is
+   * intentionally a scalar query: callers use it to detect missed live events
+   * without decoding event payloads or hydrating the thread projection.
+   */
+  readonly getLatestThreadRevision: (threadId: ThreadId) => Effect.Effect<
+    {
+      readonly latestSequence: number;
+      readonly latestEventId: EventId | null;
+    },
+    OrchestrationEventStoreError
+  >;
+
+  /** Read the global event-store high-water mark without decoding event payloads. */
+  readonly getLatestSequence: () => Effect.Effect<number, OrchestrationEventStoreError>;
 }
 
 /**

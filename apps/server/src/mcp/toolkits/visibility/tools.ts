@@ -1,21 +1,26 @@
 import {
-  ModelSelection,
-  ProjectId,
+  EnvironmentId,
+  ExecutionEnvironmentPlatformOs,
+  IsoDateTime,
   ProviderDriverKind,
   ProviderInstanceId,
   ServerProviderState,
   TrimmedNonEmptyString,
 } from "@t3tools/contracts";
 import * as Schema from "effect/Schema";
+import { HttpClient } from "effect/unstable/http";
 import { Tool, Toolkit } from "effect/unstable/ai";
 
-import { ProjectionSnapshotQuery } from "../../../orchestration/Services/ProjectionSnapshotQuery.ts";
+import * as ServerEnvironment from "../../../environment/ServerEnvironment.ts";
 import { ProviderRegistry } from "../../../provider/Services/ProviderRegistry.ts";
+import * as SubagentPeerRegistry from "../../../subagents/SubagentPeerRegistry.ts";
 import * as McpInvocationContext from "../../McpInvocationContext.ts";
 
 const dependencies = [
   ProviderRegistry,
-  ProjectionSnapshotQuery,
+  ServerEnvironment.ServerEnvironment,
+  SubagentPeerRegistry.SubagentPeerRegistry,
+  HttpClient.HttpClient,
   McpInvocationContext.McpInvocationContext,
 ];
 
@@ -28,23 +33,13 @@ const dependencies = [
 export const ListBackendsInput = Schema.Record(Schema.String, Schema.Never);
 export type ListBackendsInput = typeof ListBackendsInput.Type;
 
-const BackendProjectFields = {
-  id: ProjectId,
-  title: TrimmedNonEmptyString,
-  workspaceRoot: TrimmedNonEmptyString,
-  defaultModelSelection: Schema.NullOr(ModelSelection),
-};
-
-export const BackendProject = Schema.Struct(BackendProjectFields);
-export type BackendProject = typeof BackendProject.Type;
-
 export const BackendModel = Schema.Struct({
   slug: TrimmedNonEmptyString,
   name: TrimmedNonEmptyString,
 });
 export type BackendModel = typeof BackendModel.Type;
 
-export const BackendSummary = Schema.Struct({
+export const BackendProvider = Schema.Struct({
   instanceId: ProviderInstanceId,
   driver: ProviderDriverKind,
   label: TrimmedNonEmptyString,
@@ -55,20 +50,26 @@ export const BackendSummary = Schema.Struct({
   availability: Schema.Literals(["available", "unavailable"]),
   available: Schema.Boolean,
   models: Schema.Array(BackendModel),
-  projects: Schema.Array(BackendProject),
+});
+export type BackendProvider = typeof BackendProvider.Type;
+
+export const BackendStatus = Schema.Literals(["online", "offline", "error"]);
+export type BackendStatus = typeof BackendStatus.Type;
+
+export const BackendSummary = Schema.Struct({
+  alias: TrimmedNonEmptyString,
+  environmentId: EnvironmentId,
+  label: TrimmedNonEmptyString,
+  os: ExecutionEnvironmentPlatformOs,
+  status: BackendStatus,
+  lastSeenAt: Schema.optional(IsoDateTime),
+  error: Schema.optional(TrimmedNonEmptyString),
+  providers: Schema.Array(BackendProvider),
 });
 export type BackendSummary = typeof BackendSummary.Type;
 
-export const UnknownBackendProject = Schema.Struct({
-  ...BackendProjectFields,
-  requestedInstanceId: ProviderInstanceId,
-});
-export type UnknownBackendProject = typeof UnknownBackendProject.Type;
-
 export const ListBackendsOutput = Schema.Struct({
   backends: Schema.Array(BackendSummary),
-  unassignedProjects: Schema.Array(BackendProject),
-  unknownBackendProjects: Schema.Array(UnknownBackendProject),
 });
 export type ListBackendsOutput = typeof ListBackendsOutput.Type;
 
@@ -81,16 +82,16 @@ export class ListBackendsToolError extends Schema.TaggedErrorClass<ListBackendsT
 
 export const ListBackendsTool = Tool.make("t3_list_backends", {
   description:
-    "List configured T3 Code provider backends with their exact instance ids, human labels, models, and projects grouped by each project's default backend. Use this when you need the correct backend or model names before starting threads or subagents.",
+    "List the local T3 Code backend and configured peer backends by alias, with OS, connection status, and available providers/models nested under each backend. Peer inventory failures remain visible as offline/error rows instead of disappearing.",
   parameters: ListBackendsInput,
   success: ListBackendsOutput,
   failure: ListBackendsToolError,
   dependencies,
 })
   .annotate(Tool.Title, "List T3 Code backends")
-  .annotate(Tool.Readonly, true)
+  .annotate(Tool.Readonly, false)
   .annotate(Tool.Destructive, false)
-  .annotate(Tool.Idempotent, true)
-  .annotate(Tool.OpenWorld, false);
+  .annotate(Tool.Idempotent, false)
+  .annotate(Tool.OpenWorld, true);
 
 export const VisibilityToolkit = Toolkit.make(ListBackendsTool);

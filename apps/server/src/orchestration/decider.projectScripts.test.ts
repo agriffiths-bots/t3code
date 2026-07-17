@@ -95,6 +95,193 @@ it.layer(NodeServices.layer)("decider project scripts", (it) => {
     }),
   );
 
+  it.effect("rejects a workspace-root retarget while the project owns a removable worktree", () =>
+    Effect.gen(function* () {
+      const now = "2026-01-01T00:00:00.000Z";
+      const projectId = asProjectId("project-owned-worktree");
+      const threadId = ThreadId.make("thread-owned-worktree");
+      const withProject = yield* projectEvent(createEmptyReadModel(now), {
+        sequence: 1,
+        eventId: asEventId("evt-project-owned-worktree"),
+        aggregateKind: "project",
+        aggregateId: projectId,
+        type: "project.created",
+        occurredAt: now,
+        commandId: CommandId.make("cmd-project-owned-worktree"),
+        causationEventId: null,
+        correlationId: CommandId.make("cmd-project-owned-worktree"),
+        metadata: {},
+        payload: {
+          projectId,
+          title: "Owned worktree",
+          workspaceRoot: "/repo-a",
+          defaultModelSelection: null,
+          scripts: [],
+          createdAt: now,
+          updatedAt: now,
+        },
+      });
+      const readModel = yield* projectEvent(withProject, {
+        sequence: 2,
+        eventId: asEventId("evt-thread-owned-worktree"),
+        aggregateKind: "thread",
+        aggregateId: threadId,
+        type: "thread.created",
+        occurredAt: now,
+        commandId: CommandId.make("cmd-thread-owned-worktree"),
+        causationEventId: null,
+        correlationId: CommandId.make("cmd-thread-owned-worktree"),
+        metadata: {},
+        payload: {
+          threadId,
+          projectId,
+          title: "Thread",
+          modelSelection: {
+            instanceId: ProviderInstanceId.make("codex"),
+            model: "gpt-5-codex",
+          },
+          interactionMode: "plan",
+          runtimeMode: "approval-required",
+          branch: "feature/owned",
+          worktreePath: "/repo-a-worktrees/owned",
+          worktreeRemovable: true,
+          worktreeRemovalPath: "/repo-a-worktrees/owned",
+          createdAt: now,
+          updatedAt: now,
+        },
+      });
+
+      const error = yield* decideOrchestrationCommand({
+        command: {
+          type: "project.meta.update",
+          commandId: CommandId.make("cmd-project-retarget-owned-worktree"),
+          projectId,
+          workspaceRoot: "/repo-b",
+        },
+        readModel,
+      }).pipe(Effect.flip);
+
+      expect(error).toMatchObject({
+        _tag: "OrchestrationCommandInvariantError",
+        commandType: "project.meta.update",
+      });
+      if (error._tag === "OrchestrationCommandInvariantError") {
+        expect(error.detail).toContain("owns a removable thread worktree");
+      }
+    }),
+  );
+
+  it.effect("rejects project.create for an active workspace root that already exists", () =>
+    Effect.gen(function* () {
+      const now = "2026-01-01T00:00:00.000Z";
+      const initial = createEmptyReadModel(now);
+      const readModel = yield* projectEvent(initial, {
+        sequence: 1,
+        eventId: asEventId("evt-project-create"),
+        aggregateKind: "project",
+        aggregateId: asProjectId("project-existing"),
+        type: "project.created",
+        occurredAt: now,
+        commandId: CommandId.make("cmd-project-create"),
+        causationEventId: null,
+        correlationId: CommandId.make("cmd-project-create"),
+        metadata: {},
+        payload: {
+          projectId: asProjectId("project-existing"),
+          title: "Project",
+          workspaceRoot: "/tmp/project",
+          defaultModelSelection: null,
+          scripts: [],
+          createdAt: now,
+          updatedAt: now,
+        },
+      });
+
+      const failure = yield* Effect.flip(
+        decideOrchestrationCommand({
+          command: {
+            type: "project.create",
+            commandId: CommandId.make("cmd-project-create-duplicate-root"),
+            projectId: asProjectId("project-duplicate-root"),
+            title: "Duplicate Project",
+            workspaceRoot: "/tmp/project/",
+            createdAt: now,
+          },
+          readModel,
+        }),
+      );
+
+      expect(failure.message).toContain(
+        "Active project 'project-existing' already exists for workspace root '/tmp/project'.",
+      );
+    }),
+  );
+
+  it.effect("rejects project.meta.update when moving onto another active workspace root", () =>
+    Effect.gen(function* () {
+      const now = "2026-01-01T00:00:00.000Z";
+      const initial = createEmptyReadModel(now);
+      const withFirstProject = yield* projectEvent(initial, {
+        sequence: 1,
+        eventId: asEventId("evt-project-create-first"),
+        aggregateKind: "project",
+        aggregateId: asProjectId("project-first"),
+        type: "project.created",
+        occurredAt: now,
+        commandId: CommandId.make("cmd-project-create-first"),
+        causationEventId: null,
+        correlationId: CommandId.make("cmd-project-create-first"),
+        metadata: {},
+        payload: {
+          projectId: asProjectId("project-first"),
+          title: "First",
+          workspaceRoot: "/tmp/project-first",
+          defaultModelSelection: null,
+          scripts: [],
+          createdAt: now,
+          updatedAt: now,
+        },
+      });
+      const readModel = yield* projectEvent(withFirstProject, {
+        sequence: 2,
+        eventId: asEventId("evt-project-create-second"),
+        aggregateKind: "project",
+        aggregateId: asProjectId("project-second"),
+        type: "project.created",
+        occurredAt: now,
+        commandId: CommandId.make("cmd-project-create-second"),
+        causationEventId: null,
+        correlationId: CommandId.make("cmd-project-create-second"),
+        metadata: {},
+        payload: {
+          projectId: asProjectId("project-second"),
+          title: "Second",
+          workspaceRoot: "/tmp/project-second",
+          defaultModelSelection: null,
+          scripts: [],
+          createdAt: now,
+          updatedAt: now,
+        },
+      });
+
+      const failure = yield* Effect.flip(
+        decideOrchestrationCommand({
+          command: {
+            type: "project.meta.update",
+            commandId: CommandId.make("cmd-project-update-duplicate-root"),
+            projectId: asProjectId("project-second"),
+            workspaceRoot: "/tmp/project-first",
+          },
+          readModel,
+        }),
+      );
+
+      expect(failure.message).toContain(
+        "Active project 'project-first' already exists for workspace root '/tmp/project-first'.",
+      );
+    }),
+  );
+
   it.effect("emits user message and turn-start-requested events for thread.turn.start", () =>
     Effect.gen(function* () {
       const now = "2026-01-01T00:00:00.000Z";

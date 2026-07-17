@@ -13,8 +13,7 @@ import type { McpCapability } from "./McpInvocationContext.ts";
 import * as McpSessionRegistry from "./McpSessionRegistry.ts";
 
 const environmentId = EnvironmentId.make("environment-1");
-const mcpCapabilities = () =>
-  new Set<McpCapability>(["preview", "thread-management", "notification"]);
+const mcpCapabilities = () => new Set<McpCapability>(["thread-management", "notification"]);
 const makeFakeHttpServer = (hostname: string, port = 43123) =>
   HttpServer.HttpServer.of({
     address: { _tag: "TcpAddress", hostname, port },
@@ -109,7 +108,6 @@ it.effect("stores only a token hash, resolves the bearer token, and revokes by t
       throw new Error("Expected a provider-session credential.");
     }
     expect(resolved?.threadId).toBe(threadId);
-    expect(resolved?.capabilities.has("preview")).toBe(true);
     expect(resolved?.capabilities.has("thread-management")).toBe(true);
     expect(resolved?.capabilities.has("notification")).toBe(true);
 
@@ -303,7 +301,6 @@ it.effect("issues peer tokens with only the subagent proxy capabilities", () =>
     expect([...resolved.capabilities].toSorted()).toEqual(
       [...McpSessionRegistry.__testing.PEER_TOKEN_CAPABILITIES].toSorted(),
     );
-    expect(resolved.capabilities.has("preview")).toBe(false);
     expect(resolved.capabilities.has("thread-management")).toBe(false);
     expect(resolved.capabilities.has("notification")).toBe(false);
   }),

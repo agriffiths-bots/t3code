@@ -86,7 +86,9 @@ import {
 } from "./orchestration/Errors.ts";
 import * as ProjectionSnapshotQuery from "./orchestration/Services/ProjectionSnapshotQuery.ts";
 import * as BootstrapTurnStartDispatcher from "./orchestration/Services/BootstrapTurnStartDispatcher.ts";
+import * as WorktreeLifecycleCoordinator from "./orchestration/Services/WorktreeLifecycleCoordinator.ts";
 import * as OrchestrationCommandReceipts from "./persistence/Services/OrchestrationCommandReceipts.ts";
+import * as OrchestrationEventStore from "./persistence/Services/OrchestrationEventStore.ts";
 import { SqlitePersistenceMemory } from "./persistence/Layers/Sqlite.ts";
 import { ScheduledTaskRepository } from "./persistence/Services/ScheduledTasks.ts";
 import { PersistenceSqlError } from "./persistence/Errors.ts";
@@ -346,6 +348,8 @@ const buildAppUnderTest = (options?: {
     >;
     terminalManager?: Partial<TerminalManager.TerminalManager["Service"]>;
     orchestrationEngine?: Partial<OrchestrationEngine.OrchestrationEngineService["Service"]>;
+    orchestrationEventStore?: Partial<OrchestrationEventStore.OrchestrationEventStore["Service"]>;
+    worktreeLifecycleCoordinator?: WorktreeLifecycleCoordinator.WorktreeLifecycleCoordinator["Service"];
     orchestrationCommandReceiptRepository?: Partial<
       OrchestrationCommandReceipts.OrchestrationCommandReceiptRepository["Service"]
     >;
@@ -543,12 +547,22 @@ const buildAppUnderTest = (options?: {
       runForThread: () => Effect.succeed({ status: "no-script" as const }),
       ...options?.layers?.projectSetupScriptRunner,
     });
+    const orchestrationDispatch =
+      options?.layers?.orchestrationEngine?.dispatch ?? (() => Effect.succeed({ sequence: 0 }));
     const orchestrationEngineLayer = Layer.mock(OrchestrationEngine.OrchestrationEngineService)({
       readEvents: () => Stream.empty,
-      dispatch: () => Effect.succeed({ sequence: 0 }),
+      dispatch: orchestrationDispatch,
+      dispatchCoordinated:
+        options?.layers?.orchestrationEngine?.dispatchCoordinated ?? orchestrationDispatch,
       streamDomainEvents: Stream.empty,
       ...options?.layers?.orchestrationEngine,
     });
+    const worktreeLifecycleCoordinatorLayer = options?.layers?.worktreeLifecycleCoordinator
+      ? Layer.succeed(
+          WorktreeLifecycleCoordinator.WorktreeLifecycleCoordinator,
+          options.layers.worktreeLifecycleCoordinator,
+        )
+      : WorktreeLifecycleCoordinator.WorktreeLifecycleCoordinatorLive;
     const orchestrationCommandReceiptRepositoryLayer = Layer.mock(
       OrchestrationCommandReceipts.OrchestrationCommandReceiptRepository,
     )({
@@ -562,6 +576,7 @@ const buildAppUnderTest = (options?: {
       Layer.provideMerge(projectSetupScriptRunnerLayer),
       Layer.provideMerge(orchestrationEngineLayer),
       Layer.provideMerge(orchestrationCommandReceiptRepositoryLayer),
+      Layer.provideMerge(worktreeLifecycleCoordinatorLayer),
     );
 
     const servedRoutesLayer = HttpRouter.serve(makeRoutesLayer, {
@@ -748,6 +763,17 @@ const buildAppUnderTest = (options?: {
         ),
       ),
       Layer.provide(orchestrationEngineLayer),
+      Layer.provide(
+        Layer.mock(OrchestrationEventStore.OrchestrationEventStore)({
+          storageEpoch: "test-storage-epoch",
+          append: () => Effect.die("OrchestrationEventStore.append not stubbed in this test"),
+          readFromSequence: () => Stream.empty,
+          readAll: () => Stream.empty,
+          getLatestThreadRevision: () => Effect.succeed({ latestSequence: 0, latestEventId: null }),
+          getLatestSequence: () => Effect.succeed(0),
+          ...options?.layers?.orchestrationEventStore,
+        }),
+      ),
       Layer.provide(orchestrationCommandReceiptRepositoryLayer),
       Layer.provide(
         Layer.mock(ProjectionSnapshotQuery.ProjectionSnapshotQuery)({
@@ -1372,6 +1398,29 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
 
       assert.equal(response.status, 200);
       assert.deepEqual(body, testEnvironmentDescriptor);
+    }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+
+  it.effect("serves a lightweight authenticated thread revision marker", () =>
+    Effect.gen(function* () {
+      yield* buildAppUnderTest();
+      const cookie = yield* getAuthenticatedSessionCookieHeader();
+      const url = yield* getHttpServerUrl(`/api/orchestration/threads/${defaultThreadId}/revision`);
+      const response = yield* fetchEffect(url, { headers: { cookie } });
+      const body = yield* responseJsonEffect<{
+        readonly storageEpoch: string;
+        readonly latestSequence: number;
+        readonly latestEventId: string | null;
+        readonly projectionSequence: number;
+      }>(response);
+
+      assert.equal(response.status, 200);
+      assert.deepEqual(body, {
+        storageEpoch: "test-storage-epoch",
+        latestSequence: 0,
+        latestEventId: null,
+        projectionSequence: 0,
+      });
     }).pipe(Effect.provide(NodeHttpServer.layerTest)),
   );
 
@@ -4474,46 +4523,6 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
     }).pipe(Effect.provide(NodeHttpServer.layerTest)),
   );
 
-  it.effect("shares one preview automation broker across websocket sessions", () =>
-    Effect.scoped(
-      Effect.gen(function* () {
-        yield* buildAppUnderTest();
-
-        const wsUrl = yield* getWsServerUrl("/ws");
-        const firstConnected = yield* Deferred.make<string>();
-        const firstClosed = yield* Deferred.make<void>();
-        const host = {
-          clientId: "shared-preview-host",
-          environmentId: testEnvironmentDescriptor.environmentId,
-        } as const;
-
-        yield* withWsRpcClient(wsUrl, (client) =>
-          client[WS_METHODS.previewAutomationConnect](host).pipe(
-            Stream.tap((event) =>
-              event.type === "connected"
-                ? Deferred.succeed(firstConnected, event.connectionId)
-                : Effect.void,
-            ),
-            Stream.runDrain,
-            Effect.ensuring(Deferred.succeed(firstClosed, undefined)),
-          ),
-        ).pipe(Effect.forkScoped);
-
-        const firstConnectionId = yield* Deferred.await(firstConnected);
-        const replacementEvent = yield* withWsRpcClient(wsUrl, (client) =>
-          client[WS_METHODS.previewAutomationConnect](host).pipe(Stream.runHead),
-        ).pipe(Effect.map(Option.getOrThrow));
-        const firstStreamClosed = yield* Deferred.await(firstClosed).pipe(
-          Effect.timeoutOption("2 seconds"),
-        );
-
-        assert.equal(replacementEvent.type, "connected");
-        assert.notEqual(replacementEvent.connectionId, firstConnectionId);
-        assert.isTrue(Option.isSome(firstStreamClosed));
-      }),
-    ).pipe(Effect.provide(NodeHttpServer.layerTest)),
-  );
-
   it.effect("rejects websocket rpc handshake when session authentication is missing", () =>
     Effect.gen(function* () {
       const fs = yield* FileSystem.FileSystem;
@@ -6404,6 +6413,374 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
     }).pipe(Effect.provide(NodeHttpServer.layerTest)),
   );
 
+  it.effect("serves an authoritative thread snapshot for epoch or backwards-cursor mismatch", () =>
+    Effect.gen(function* () {
+      const storageEpoch = "restored-storage-epoch";
+      const latestEventId = EventId.make("event-restored-marker-6");
+      let snapshot = {
+        snapshotSequence: 6,
+        thread: {
+          ...makeDefaultOrchestrationReadModel().threads[0]!,
+          title: "Restored thread",
+        },
+      };
+      let readEventsCalled = false;
+      const readEventsStarted = yield* Deferred.make<void>();
+      let latestStoreSequence = 7;
+
+      yield* buildAppUnderTest({
+        layers: {
+          projectionSnapshotQuery: {
+            getThreadDetailSnapshot: () => Effect.succeed(Option.some(snapshot)),
+          },
+          orchestrationEventStore: {
+            storageEpoch,
+            getLatestThreadRevision: () => Effect.succeed({ latestSequence: 6, latestEventId }),
+            getLatestSequence: () => Effect.succeed(latestStoreSequence),
+          },
+          orchestrationEngine: {
+            readEvents: () => {
+              readEventsCalled = true;
+              return Stream.fromEffect(Deferred.succeed(readEventsStarted, undefined)).pipe(
+                Stream.drain,
+              );
+            },
+          },
+        },
+      });
+
+      const wsUrl = yield* getWsServerUrl("/ws");
+      for (const clientStorageEpoch of ["previous-storage-epoch", storageEpoch]) {
+        const items = yield* Effect.scoped(
+          withWsRpcClient(wsUrl, (client) =>
+            client[ORCHESTRATION_WS_METHODS.subscribeThread]({
+              threadId: defaultThreadId,
+              afterSequence: 7,
+              storageEpoch: clientStorageEpoch,
+              verifiedRevision: 7,
+              observedRevision: 7,
+              observedEventId: EventId.make("event-discarded-marker-7"),
+            }).pipe(Stream.take(1), Stream.runCollect),
+          ),
+        );
+
+        assert.deepEqual(Array.from(items), [
+          {
+            kind: "snapshot",
+            storageEpoch,
+            force: true,
+            snapshot: { ...snapshot, storageEpoch, latestSequence: 6, latestEventId },
+          },
+        ]);
+      }
+      assert.equal(readEventsCalled, false);
+
+      const collisionItems = yield* Effect.scoped(
+        withWsRpcClient(wsUrl, (client) =>
+          client[ORCHESTRATION_WS_METHODS.subscribeThread]({
+            threadId: defaultThreadId,
+            afterSequence: 7,
+            storageEpoch,
+            verifiedRevision: 6,
+            observedRevision: 6,
+            observedEventId: EventId.make("event-discarded-marker-6"),
+          }).pipe(Stream.take(1), Stream.runCollect),
+        ),
+      );
+      assert.deepEqual(Array.from(collisionItems), [
+        {
+          kind: "snapshot",
+          storageEpoch,
+          force: true,
+          snapshot: { ...snapshot, storageEpoch, latestSequence: 6, latestEventId },
+        },
+      ]);
+
+      latestStoreSequence = 6;
+      const restoredGlobalCursorItems = yield* Effect.scoped(
+        withWsRpcClient(wsUrl, (client) =>
+          client[ORCHESTRATION_WS_METHODS.subscribeThread]({
+            threadId: defaultThreadId,
+            afterSequence: 7,
+            storageEpoch,
+            verifiedRevision: 6,
+            observedRevision: 6,
+            observedEventId: latestEventId,
+          }).pipe(Stream.take(1), Stream.runCollect),
+        ),
+      );
+      assert.deepEqual(Array.from(restoredGlobalCursorItems), [
+        {
+          kind: "snapshot",
+          storageEpoch,
+          force: true,
+          snapshot: { ...snapshot, storageEpoch, latestSequence: 6, latestEventId },
+        },
+      ]);
+      assert.equal(readEventsCalled, false);
+
+      latestStoreSequence = 7;
+      yield* Effect.scoped(
+        Effect.gen(function* () {
+          yield* withWsRpcClient(wsUrl, (client) =>
+            client[ORCHESTRATION_WS_METHODS.subscribeThread]({
+              threadId: defaultThreadId,
+              afterSequence: 7,
+              storageEpoch,
+              verifiedRevision: 6,
+              observedRevision: 6,
+              observedEventId: latestEventId,
+            }).pipe(Stream.runDrain),
+          ).pipe(Effect.forkScoped);
+          yield* Deferred.await(readEventsStarted);
+        }),
+      );
+      assert.equal(readEventsCalled, true);
+
+      snapshot = { ...snapshot, snapshotSequence: 5 };
+      const laggingItems = yield* Effect.scoped(
+        withWsRpcClient(wsUrl, (client) =>
+          client[ORCHESTRATION_WS_METHODS.subscribeThread]({
+            threadId: defaultThreadId,
+            afterSequence: 7,
+            storageEpoch: "previous-storage-epoch",
+            verifiedRevision: 7,
+            observedRevision: 7,
+            observedEventId: EventId.make("event-discarded-marker-7"),
+          }).pipe(Stream.take(1), Stream.runCollect),
+        ),
+      );
+      assert.deepEqual(Array.from(laggingItems), [
+        {
+          kind: "snapshot",
+          storageEpoch,
+          force: true,
+          snapshot: {
+            ...snapshot,
+            storageEpoch,
+            latestSequence: 0,
+            latestEventId: null,
+          },
+        },
+      ]);
+    }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+
+  it.effect("replays a missed deletion with or without a cursor and avoids retry loops", () =>
+    Effect.gen(function* () {
+      const storageEpoch = "deleted-thread-storage-epoch";
+      const deletedEvent: OrchestrationEvent = {
+        eventId: EventId.make("event-deleted-thread-8"),
+        sequence: 8,
+        occurredAt: "2026-07-16T06:00:00.000Z",
+        commandId: null,
+        causationEventId: null,
+        correlationId: null,
+        metadata: {},
+        aggregateKind: "thread",
+        aggregateId: defaultThreadId,
+        type: "thread.deleted",
+        payload: {
+          threadId: defaultThreadId,
+          deletedAt: "2026-07-16T06:00:00.000Z",
+        },
+      };
+      let snapshotRequests = 0;
+      let revisionRequests = 0;
+      const replayRequests: Array<{ readonly afterSequence: number; readonly limit?: number }> = [];
+
+      yield* buildAppUnderTest({
+        layers: {
+          projectionSnapshotQuery: {
+            getThreadDetailSnapshot: () => {
+              snapshotRequests += 1;
+              return Effect.succeed(Option.none());
+            },
+          },
+          orchestrationEventStore: {
+            storageEpoch,
+            getLatestThreadRevision: () => {
+              revisionRequests += 1;
+              return Effect.succeed(
+                revisionRequests === 1
+                  ? {
+                      latestSequence: 7,
+                      latestEventId: EventId.make("event-before-delete-7"),
+                    }
+                  : {
+                      latestSequence: deletedEvent.sequence,
+                      latestEventId: deletedEvent.eventId,
+                    },
+              );
+            },
+            getLatestSequence: () => Effect.succeed(deletedEvent.sequence),
+          },
+          orchestrationEngine: {
+            readEvents: (afterSequence, limit) => {
+              replayRequests.push({ afterSequence, ...(limit === undefined ? {} : { limit }) });
+              return afterSequence === deletedEvent.sequence - 1
+                ? Stream.succeed(deletedEvent)
+                : Stream.empty;
+            },
+          },
+        },
+      });
+
+      const wsUrl = yield* getWsServerUrl("/ws");
+      const subscriptionInputs = [
+        {
+          threadId: defaultThreadId,
+          afterSequence: 10,
+          storageEpoch,
+          verifiedRevision: 10,
+          observedRevision: 10,
+          observedEventId: EventId.make("event-before-restore-10"),
+        },
+        // A warm legacy cache deliberately omits its unknown-epoch cursor so
+        // the server must provide an authoritative recovery item.
+        { threadId: defaultThreadId },
+      ];
+      let subscriptionRequests = 0;
+      const observedDeletions: Array<OrchestrationEvent> = [];
+      const observedForcedFlags: Array<boolean> = [];
+      for (const input of subscriptionInputs) {
+        let observedDeletion: OrchestrationEvent | undefined;
+        let observedDeletionWasForced = false;
+        for (let attempt = 0; attempt < 3 && observedDeletion === undefined; attempt += 1) {
+          subscriptionRequests += 1;
+          const result = yield* Effect.scoped(
+            withWsRpcClient(wsUrl, (client) =>
+              client[ORCHESTRATION_WS_METHODS.subscribeThread](input).pipe(Stream.runHead),
+            ),
+          ).pipe(Effect.option);
+          if (
+            Option.isSome(result) &&
+            Option.isSome(result.value) &&
+            result.value.value.kind === "event" &&
+            result.value.value.event.type === "thread.deleted"
+          ) {
+            observedDeletion = result.value.value.event;
+            observedDeletionWasForced = result.value.value.force === true;
+          }
+        }
+        if (observedDeletion !== undefined) {
+          observedDeletions.push(observedDeletion);
+        }
+        observedForcedFlags.push(observedDeletionWasForced);
+      }
+
+      assert.deepEqual(
+        observedDeletions.map((event) => event.eventId),
+        [deletedEvent.eventId, deletedEvent.eventId],
+      );
+      assert.deepEqual(observedForcedFlags, [true, true]);
+      assert.equal(subscriptionRequests, 2);
+      assert.equal(snapshotRequests, 2);
+      assert.equal(revisionRequests, 4);
+      assert.deepEqual(replayRequests, [
+        { afterSequence: 7, limit: 1 },
+        { afterSequence: 7, limit: 1 },
+      ]);
+    }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+
+  it.effect("buffers live thread events before reading a forced snapshot", () =>
+    Effect.gen(function* () {
+      const storageEpoch = "forced-snapshot-storage-epoch";
+      const latestEventId = EventId.make("event-forced-snapshot-marker-6");
+      const liveEvents = yield* PubSub.unbounded<OrchestrationEvent>();
+      const liveSubscriptionAttached = yield* Deferred.make<void>();
+      const handshakeThreadId = ThreadId.make("thread-live-subscription-handshake");
+      const handshakeEvent: OrchestrationEvent = {
+        eventId: EventId.make("event-live-subscription-handshake"),
+        sequence: 7,
+        occurredAt: "2026-07-16T06:01:00.000Z",
+        commandId: null,
+        causationEventId: null,
+        correlationId: null,
+        metadata: {},
+        aggregateKind: "thread",
+        aggregateId: handshakeThreadId,
+        type: "thread.meta-updated",
+        payload: {
+          threadId: handshakeThreadId,
+          title: "Handshake",
+          updatedAt: "2026-07-16T06:01:00.000Z",
+        },
+      };
+      const betweenSnapshotAndSubscribeEvent: OrchestrationEvent = {
+        eventId: EventId.make("event-between-snapshot-and-subscribe"),
+        sequence: 8,
+        occurredAt: "2026-07-16T06:02:00.000Z",
+        commandId: null,
+        causationEventId: null,
+        correlationId: null,
+        metadata: {},
+        aggregateKind: "thread",
+        aggregateId: defaultThreadId,
+        type: "thread.archived",
+        payload: {
+          threadId: defaultThreadId,
+          archivedAt: "2026-07-16T06:02:00.000Z",
+          updatedAt: "2026-07-16T06:02:00.000Z",
+        },
+      };
+      const snapshot = {
+        snapshotSequence: 6,
+        thread: makeDefaultOrchestrationReadModel().threads[0]!,
+      };
+
+      yield* buildAppUnderTest({
+        layers: {
+          projectionSnapshotQuery: {
+            getThreadDetailSnapshot: () =>
+              Effect.gen(function* () {
+                yield* PubSub.publish(liveEvents, handshakeEvent);
+                yield* Deferred.await(liveSubscriptionAttached);
+                yield* PubSub.publish(liveEvents, betweenSnapshotAndSubscribeEvent);
+                return Option.some(snapshot);
+              }),
+          },
+          orchestrationEventStore: {
+            storageEpoch,
+            getLatestThreadRevision: () => Effect.succeed({ latestSequence: 6, latestEventId }),
+            getLatestSequence: () => Effect.succeed(8),
+          },
+          orchestrationEngine: {
+            streamDomainEvents: Stream.fromPubSub(liveEvents).pipe(
+              Stream.tap((event) =>
+                event.eventId === handshakeEvent.eventId
+                  ? Deferred.succeed(liveSubscriptionAttached, undefined)
+                  : Effect.void,
+              ),
+            ),
+          },
+        },
+      });
+
+      const wsUrl = yield* getWsServerUrl("/ws");
+      const items = yield* Effect.scoped(
+        withWsRpcClient(wsUrl, (client) =>
+          client[ORCHESTRATION_WS_METHODS.subscribeThread]({
+            threadId: defaultThreadId,
+            afterSequence: 6,
+            storageEpoch: "stale-storage-epoch",
+            verifiedRevision: 6,
+            observedRevision: 6,
+            observedEventId: latestEventId,
+          }).pipe(Stream.take(2), Stream.runCollect),
+        ),
+      );
+      const receivedItems = Array.from(items);
+
+      assert.equal(receivedItems[0]?.kind, "snapshot");
+      assert.equal(receivedItems[1]?.kind, "event");
+      if (receivedItems[1]?.kind === "event") {
+        assert.equal(receivedItems[1].event.eventId, betweenSnapshotAndSubscribeEvent.eventId);
+      }
+    }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+
   it.effect("serves a fresh shell snapshot instead of replaying an ancient cursor", () =>
     Effect.gen(function* () {
       const snapshot = {
@@ -6768,6 +7145,7 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
       Effect.gen(function* () {
         const dispatchedCommands: Array<OrchestrationCommand> = [];
         const bootstrapGitOperations: string[] = [];
+        let lifecyclePermitDepth = 0;
         const refreshStatus = vi.fn((_: string) =>
           Effect.succeed({
             isRepo: true,
@@ -6806,6 +7184,7 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
         const createWorktree = vi.fn(
           (_: Parameters<GitVcsDriver.GitVcsDriver["Service"]["createWorktree"]>[0]) =>
             Effect.sync(() => {
+              assert.equal(lifecyclePermitDepth, 1);
               bootstrapGitOperations.push("create-worktree");
               return {
                 worktree: {
@@ -6843,10 +7222,29 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
             orchestrationEngine: {
               dispatch: (command) =>
                 Effect.sync(() => {
+                  if (command.type === "thread.meta.update") {
+                    assert.equal(lifecyclePermitDepth, 1);
+                  }
                   dispatchedCommands.push(command);
                   return { sequence: dispatchedCommands.length };
                 }),
               readEvents: () => Stream.empty,
+            },
+            worktreeLifecycleCoordinator: {
+              withPermit: (effect) =>
+                Effect.acquireUseRelease(
+                  Effect.sync(() => {
+                    lifecyclePermitDepth += 1;
+                  }),
+                  () => effect,
+                  () =>
+                    Effect.sync(() => {
+                      lifecyclePermitDepth -= 1;
+                    }),
+                ),
+              markTeardownPending: () => Effect.void,
+              clearTeardownPending: () => Effect.void,
+              isTeardownPending: () => Effect.succeed(false),
             },
             projectSetupScriptRunner: {
               runForThread,

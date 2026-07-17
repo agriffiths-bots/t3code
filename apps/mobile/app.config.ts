@@ -11,47 +11,69 @@ const repoEnv = loadRepoEnv();
 Object.assign(process.env, repoEnv);
 
 const APP_VARIANT = resolveAppVariant(repoEnv.APP_VARIANT);
+const isIosPersonalTeamBuild = repoEnv.T3CODE_IOS_PERSONAL_TEAM === "1";
 
-const VARIANT_CONFIG: Record<
-  AppVariant,
-  {
-    readonly appName: string;
-    readonly scheme: string;
-    readonly iosIcon: string;
-    readonly splashIcon: string;
-    readonly iosBundleIdentifier: string;
-    readonly androidPackage: string;
-    readonly relyingParty?: string;
-  }
-> = {
+const personalTeamBundleIdentifier = repoEnv.T3CODE_IOS_PERSONAL_TEAM_BUNDLE_ID?.trim();
+const IOS_BUNDLE_IDENTIFIER_PATTERN = /^[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+$/;
+
+if (
+  isIosPersonalTeamBuild &&
+  (!personalTeamBundleIdentifier ||
+    !IOS_BUNDLE_IDENTIFIER_PATTERN.test(personalTeamBundleIdentifier))
+) {
+  throw new Error(
+    "T3CODE_IOS_PERSONAL_TEAM_BUNDLE_ID must be a reverse-DNS identifier such as com.example.t3code when T3CODE_IOS_PERSONAL_TEAM=1.",
+  );
+}
+
+const DEVELOPMENT_ASSETS = {
+  appIcon: "./assets/splash-icon-dev.png",
+  iosIcon: "./assets/icon-composer-dev.icon",
+  splashIcon: "./assets/splash-icon-dev.png",
+  androidAdaptiveForeground: "./assets/android-icon-dev-foreground.png",
+  androidAdaptiveBackgroundColor: "#00639B",
+  androidMonochromeIcon: "./assets/android-icon-mark.png",
+  androidNotificationIcon: "./assets/android-notification-icon.png",
+  androidNotificationColor: "#00639B",
+} as const;
+
+const RELEASE_ASSETS = {
+  appIcon: "./assets/splash-icon-prod.png",
+  iosIcon: "./assets/icon-composer-prod.icon",
+  splashIcon: "./assets/splash-icon-prod.png",
+  androidAdaptiveForeground: "./assets/android-icon-mark.png",
+  androidAdaptiveBackgroundColor: "#000000",
+  androidMonochromeIcon: "./assets/android-icon-mark.png",
+  androidNotificationIcon: "./assets/android-notification-icon.png",
+  androidNotificationColor: "#FFFFFF",
+} as const;
+
+const VARIANT_CONFIG = {
   development: {
     appName: "T3 Code Dev",
     scheme: "t3code-dev",
-    iosIcon: "./assets/icon-composer-dev.icon",
-    splashIcon: "./assets/splash-icon-dev.png",
     iosBundleIdentifier: "com.t3tools.t3code.dev",
     androidPackage: "com.t3tools.t3code.dev",
     relyingParty: "clerk.t3.codes",
+    assets: DEVELOPMENT_ASSETS,
   },
   preview: {
     appName: "T3 Code Preview",
     scheme: "t3code-preview",
-    iosIcon: "./assets/icon-composer-prod.icon",
-    splashIcon: "./assets/splash-icon-prod.png",
     iosBundleIdentifier: "com.t3tools.t3code.preview",
     androidPackage: "com.t3tools.t3code.preview",
     relyingParty: "clerk.t3.codes",
+    assets: RELEASE_ASSETS,
   },
   production: {
     appName: "T3 Code",
     scheme: "t3code",
-    iosIcon: "./assets/icon-composer-prod.icon",
-    splashIcon: "./assets/splash-icon-prod.png",
     iosBundleIdentifier: "com.t3tools.t3code",
     androidPackage: "com.t3tools.t3code",
     relyingParty: "clerk.t3.codes",
+    assets: RELEASE_ASSETS,
   },
-};
+} as const;
 
 function resolveAppVariant(value: string | undefined): AppVariant {
   switch (value) {
@@ -65,6 +87,9 @@ function resolveAppVariant(value: string | undefined): AppVariant {
 }
 
 const variant = VARIANT_CONFIG[APP_VARIANT];
+const iosBundleIdentifier = isIosPersonalTeamBuild
+  ? personalTeamBundleIdentifier!
+  : variant.iosBundleIdentifier;
 const firstNonEmpty = (...values: ReadonlyArray<string | undefined>): string | undefined =>
   values.find((value) => value !== undefined && value.trim().length > 0);
 const easProjectId =
@@ -109,6 +134,50 @@ const dmSansFonts = {
   bold: "@expo-google-fonts/dm-sans/700Bold/DMSans_700Bold.ttf",
 } as const;
 
+const widgetsPlugin: NonNullable<ExpoConfig["plugins"]>[number] = [
+  "expo-widgets",
+  {
+    bundleIdentifier: `${iosBundleIdentifier}.widgets`,
+    groupIdentifier: `group.${iosBundleIdentifier}`,
+    enablePushNotifications: true,
+    // Agent activity can update many times an hour; without the
+    // frequent-updates entitlement iOS throttles the update budget sooner.
+    frequentUpdates: true,
+    widgets: [
+      {
+        name: "AgentActivity",
+        displayName: "Agent Activity",
+        description: "Shows the current state of active T3 Code agents.",
+        supportedFamilies: ["systemSmall", "systemMedium", "accessoryRectangular"],
+      },
+    ],
+  },
+];
+
+const sharingPlugin: NonNullable<ExpoConfig["plugins"]>[number] = [
+  "expo-sharing",
+  {
+    ios: {
+      // Personal Teams cannot sign App Groups or extension targets. Keep the
+      // reduced-capability local build usable while release builds expose the
+      // real system share target.
+      enabled: !isIosPersonalTeamBuild,
+      extensionBundleIdentifier: `${iosBundleIdentifier}.sharing`,
+      appGroupId: `group.${iosBundleIdentifier}`,
+      activationRule: {
+        supportsText: true,
+        supportsWebUrlWithMaxCount: 1,
+        supportsImageWithMaxCount: 8,
+      },
+    },
+    android: {
+      enabled: true,
+      singleShareMimeTypes: ["text/plain", "image/*"],
+      multipleShareMimeTypes: ["image/*"],
+    },
+  },
+];
+
 // These aliases match the fonts' PostScript names on iOS. Register the same
 // names on Android so React Native and the native composer use one set of
 // family names without waiting for runtime font loading.
@@ -127,7 +196,7 @@ const config: ExpoConfig = {
     policy: process.env.MOBILE_VERSION_POLICY ?? "fingerprint",
   },
   orientation: "portrait",
-  icon: "./assets/icon.png",
+  icon: variant.assets.appIcon,
   userInterfaceStyle: "automatic",
   updates: {
     enabled: true,
@@ -136,9 +205,9 @@ const config: ExpoConfig = {
     fallbackToCacheTimeout: 0,
   },
   ios: {
-    icon: variant.iosIcon,
+    icon: variant.assets.iosIcon,
     supportsTablet: true,
-    bundleIdentifier: variant.iosBundleIdentifier,
+    bundleIdentifier: iosBundleIdentifier,
     // Pin code signing to the T3 Tools team so non-interactive `expo run:ios`
     // does not fall back to a personal team (which cannot sign app groups,
     // Sign in with Apple, or push notification entitlements).
@@ -157,20 +226,23 @@ const config: ExpoConfig = {
     },
   },
   android: {
-    icon: "./assets/icon.png",
+    icon: variant.assets.appIcon,
     package: variant.androidPackage,
     adaptiveIcon: {
-      backgroundColor: "#E6F4FE",
-      foregroundImage: "./assets/android-icon-foreground.png",
-      backgroundImage: "./assets/android-icon-background.png",
-      monochromeImage: "./assets/android-icon-monochrome.png",
+      backgroundColor: variant.assets.androidAdaptiveBackgroundColor,
+      foregroundImage: variant.assets.androidAdaptiveForeground,
+      monochromeImage: variant.assets.androidMonochromeIcon,
     },
-    predictiveBackGestureEnabled: false,
+    // Opts into OnBackInvokedCallback-based back dispatch (Android 13+).
+    // JS back handling survives it via react-native's Android 16 shim plus
+    // withAndroidPredictiveBackCompat on Android 13-15.
+    predictiveBackGestureEnabled: true,
   },
   web: {
-    favicon: "./assets/favicon.png",
+    favicon: variant.assets.appIcon,
   },
   plugins: [
+    "expo-asset",
     [
       "expo-font",
       {
@@ -197,24 +269,51 @@ const config: ExpoConfig = {
     ],
     "expo-secure-store",
     "expo-sqlite",
-    ["@clerk/expo", { theme: "./clerk-theme.json" }],
+    ...(isIosPersonalTeamBuild
+      ? [sharingPlugin]
+      : ["./plugins/withShareExtensionDisplayName.cjs", sharingPlugin]),
+    [
+      "expo-notifications",
+      {
+        icon: variant.assets.androidNotificationIcon,
+        color: variant.assets.androidNotificationColor,
+        mode: APP_VARIANT === "development" ? "development" : "production",
+      },
+    ],
+    // appleSignIn must be gated here: withoutIosPersonalTeamCapabilities.cjs runs before
+    // plugins earlier in this array, so it cannot strip the entitlement Clerk would add.
+    ["@clerk/expo", { theme: "./clerk-theme.json", appleSignIn: !isIosPersonalTeamBuild }],
     "expo-web-browser",
+    [
+      "expo-quick-actions",
+      {
+        // Adaptive launcher-shortcut icon; referenced by resource name from
+        // the shortcut items set in src/features/shortcuts.
+        androidIcons: {
+          shortcut_icon: {
+            foregroundImage: variant.assets.androidAdaptiveForeground,
+            backgroundColor: variant.assets.androidAdaptiveBackgroundColor,
+          },
+        },
+      },
+    ],
     [
       "expo-camera",
       {
         cameraPermission: "Allow T3 Code to access your camera so you can scan pairing QR codes.",
         barcodeScannerEnabled: true,
+        recordAudioAndroid: false,
       },
     ],
     [
       "expo-splash-screen",
       {
-        image: variant.splashIcon,
+        image: variant.assets.splashIcon,
         resizeMode: "contain",
         backgroundColor: "#ffffff",
         imageWidth: 220,
         dark: {
-          image: variant.splashIcon,
+          image: variant.assets.splashIcon,
           backgroundColor: "#0a0a0a",
         },
       },
@@ -238,26 +337,20 @@ const config: ExpoConfig = {
     // expo-widgets' — its dangerous mod wipes ios/ExpoWidgetsTarget/ (which
     // would delete the asset catalog) and its xcodeproj mod creates the widget
     // target (which must exist before the compile phase can be attached).
-    "./plugins/withWidgetLogoAsset.cjs",
-    [
-      "expo-widgets",
-      {
-        bundleIdentifier: `${variant.iosBundleIdentifier}.widgets`,
-        groupIdentifier: `group.${variant.iosBundleIdentifier}`,
-        enablePushNotifications: true,
-        // Agent activity can update many times an hour; without the
-        // frequent-updates entitlement iOS throttles the update budget sooner.
-        frequentUpdates: true,
-        widgets,
-      },
-    ],
+    ...(!isIosPersonalTeamBuild ? ["./plugins/withWidgetLogoAsset.cjs", widgetsPlugin] : []),
     "./plugins/withIosSceneLifecycle.cjs",
     "./plugins/withAndroidCleartextTraffic.cjs",
-    "./plugins/withAndroidGradleMemory.cjs",
+    "./plugins/withAndroidGradleHeap.cjs",
+    "./plugins/withAndroidModernPopupMenu.cjs",
+    "./plugins/withAndroidModernAlertDialog.cjs",
+    "./plugins/withAndroidPredictiveBackCompat.cjs",
+    // Fork-local: registers Android widget string resources for the widgets above.
     ["./plugins/withAndroidWidgetStringResources.cjs", { widgets }],
+    ...(isIosPersonalTeamBuild ? ["./plugins/withoutIosPersonalTeamCapabilities.cjs"] : []),
   ],
   extra: {
     appVariant: APP_VARIANT,
+    iosPersonalTeamBuild: isIosPersonalTeamBuild,
     relay: {
       url: repoEnv.T3CODE_RELAY_URL ?? null,
     },

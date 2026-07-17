@@ -40,7 +40,6 @@ import { ProviderInstanceRegistryHydrationLive } from "./provider/Layers/Provide
 import * as TerminalManager from "./terminal/Manager.ts";
 import * as McpHttpServer from "./mcp/McpHttpServer.ts";
 import * as McpSessionRegistry from "./mcp/McpSessionRegistry.ts";
-import * as PreviewAutomationBroker from "./mcp/PreviewAutomationBroker.ts";
 import * as PreviewManager from "./preview/Manager.ts";
 import * as PortScanner from "./preview/PortScanner.ts";
 import * as ProcessRunner from "./processRunner.ts";
@@ -400,12 +399,13 @@ const ServerApplicationRegistrationsLive = Layer.mergeAll(
   SubagentRuntimeLive.pipe(
     Layer.provideMerge(PendingDispatchRepositoryLive),
     Layer.provideMerge(RemoteChildRepositoryLive),
-    Layer.provideMerge(SubagentPeerRegistry.layer),
+    Layer.provide(SubagentPeerRegistry.layer),
   ),
 );
 
 const McpRoutesLayer = Layer.mergeAll(mcpPeerTokenRouteLayer, McpHttpServer.layer).pipe(
   Layer.provide(McpSessionRegistry.layer),
+  Layer.provide(SubagentPeerRegistry.layer),
 );
 
 export const makeRoutesLayer = Layer.mergeAll(
@@ -426,7 +426,7 @@ export const makeRoutesLayer = Layer.mergeAll(
     websocketRpcRouteLayer,
   ),
   McpRoutesLayer,
-).pipe(Layer.provide(PreviewAutomationBroker.layer), Layer.provide(browserApiCorsLayer));
+).pipe(Layer.provide(browserApiCorsLayer));
 
 export const makeServerLayer = Layer.unwrap(
   Effect.gen(function* () {

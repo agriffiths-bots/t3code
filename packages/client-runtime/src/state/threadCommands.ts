@@ -1,4 +1,5 @@
 import * as Crypto from "effect/Crypto";
+import * as Effect from "effect/Effect";
 import { Atom } from "effect/unstable/reactivity";
 
 import { createAtomCommandScheduler, createEnvironmentCommand } from "./runtime.ts";
@@ -31,6 +32,8 @@ import {
   updateThreadMetadata,
 } from "../operations/commands.ts";
 import type { EnvironmentRegistry } from "../connection/registry.ts";
+import { EnvironmentSupervisor } from "../connection/supervisor.ts";
+import { ThreadReconciliationActivity } from "./threadReconciliationActivity.ts";
 
 export type {
   ArchiveThreadInput,
@@ -48,8 +51,27 @@ export type {
   UpdateThreadMetadataInput,
 } from "../operations/commands.ts";
 
+export const startThreadTurnWithReconciliation = Effect.fn(
+  "EnvironmentThreadCommands.startTurnWithReconciliation",
+)(function* (input: StartThreadTurnInput) {
+  const supervisor = yield* EnvironmentSupervisor;
+  const activity = yield* ThreadReconciliationActivity;
+  // Publish the local intent before dispatch. If the server accepts the turn
+  // but the response is lost, reconciliation must already be awake to detect
+  // the persisted revision even when the matching live event is also missed.
+  yield* activity.publish({
+    environmentId: supervisor.target.environmentId,
+    threadId: input.threadId,
+    reason: "locally-initiated-turn",
+  });
+  return yield* startThreadTurn(input);
+});
+
 export function createThreadEnvironmentAtoms<R, E>(
-  runtime: Atom.AtomRuntime<EnvironmentRegistry | Crypto.Crypto | R, E>,
+  runtime: Atom.AtomRuntime<
+    EnvironmentRegistry | Crypto.Crypto | ThreadReconciliationActivity | R,
+    E
+  >,
 ) {
   const scheduler = createAtomCommandScheduler();
   const concurrency = {
@@ -102,7 +124,7 @@ export function createThreadEnvironmentAtoms<R, E>(
     }),
     startTurn: createEnvironmentCommand(runtime, {
       label: "environment-data:commands:thread:start-turn",
-      execute: (input: StartThreadTurnInput) => startThreadTurn(input),
+      execute: startThreadTurnWithReconciliation,
       scheduler,
       concurrency,
     }),

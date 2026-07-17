@@ -42,6 +42,16 @@ const CONFIG = {
   settings: {},
 } as unknown as ServerConfig;
 
+const CACHED_PLAN_USAGE = {
+  updatedAt: "2026-07-10T08:00:00.000Z",
+  providers: [],
+} satisfies NonNullable<ServerConfig["planUsage"]>;
+
+const LIVE_PLAN_USAGE = {
+  updatedAt: "2026-07-10T08:02:00.000Z",
+  providers: [],
+} satisfies NonNullable<ServerConfig["planUsage"]>;
+
 const snapshotEvent = (config: ServerConfig): ServerConfigStreamEvent => ({
   version: 1,
   type: "snapshot",
@@ -230,6 +240,7 @@ describe("server state projection", () => {
         disconnect: Effect.void,
         retryNow: Effect.void,
       } satisfies EnvironmentSupervisor.EnvironmentSupervisor["Service"]);
+      const cachedConfig = { ...CONFIG, planUsage: CACHED_PLAN_USAGE };
       const savedConfigs = yield* Queue.unbounded<ServerConfig>();
       const cache = Persistence.EnvironmentCacheStore.of({
         loadShell: () => Effect.succeed(Option.none()),
@@ -237,7 +248,7 @@ describe("server state projection", () => {
         loadThread: () => Effect.succeed(Option.none()),
         saveThread: () => Effect.void,
         removeThread: () => Effect.void,
-        loadServerConfig: () => Effect.succeed(Option.some(CONFIG)),
+        loadServerConfig: () => Effect.succeed(Option.some(cachedConfig)),
         saveServerConfig: (_environmentId, config) => Queue.offer(savedConfigs, config),
         loadVcsRefs: () => Effect.succeed(Option.none()),
         saveVcsRefs: () => Effect.void,
@@ -250,13 +261,15 @@ describe("server state projection", () => {
             Effect.provideService(EnvironmentSupervisor.EnvironmentSupervisor, supervisor),
             Effect.provideService(Persistence.EnvironmentCacheStore, cache),
           );
-          expect(Option.getOrThrow(yield* SubscriptionRef.get(state)).config).toBe(CONFIG);
+          expect(
+            Option.getOrThrow(yield* SubscriptionRef.get(state)).config.planUsage,
+          ).toBeUndefined();
 
           const providers: ServerConfig["providers"] = [];
           yield* Queue.offer(events, {
             version: 1,
             type: "providerStatuses",
-            payload: { providers },
+            payload: { providers, planUsage: LIVE_PLAN_USAGE },
           });
           const projected = yield* SubscriptionRef.changes(state).pipe(
             Stream.filter((value) =>
@@ -267,11 +280,15 @@ describe("server state projection", () => {
             ),
             Stream.runHead,
           );
-          expect(Option.getOrThrow(Option.getOrThrow(projected)).config.providers).toBe(providers);
+          const liveConfig = Option.getOrThrow(Option.getOrThrow(projected)).config;
+          expect(liveConfig.providers).toBe(providers);
+          expect(liveConfig.planUsage).toBe(LIVE_PLAN_USAGE);
         }),
       );
 
-      expect((yield* Queue.take(savedConfigs)).providers).toEqual([]);
+      const savedConfig = yield* Queue.take(savedConfigs);
+      expect(savedConfig.providers).toEqual([]);
+      expect(savedConfig.planUsage).toBeUndefined();
     }),
   );
 

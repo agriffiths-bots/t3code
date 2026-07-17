@@ -24,6 +24,7 @@ import {
   SqlitePersistenceMemory,
 } from "../../persistence/Layers/Sqlite.ts";
 import { OrchestrationEventStore } from "../../persistence/Services/OrchestrationEventStore.ts";
+import { ProjectionTurnRepository } from "../../persistence/Services/ProjectionTurns.ts";
 import * as RepositoryIdentityResolver from "../../project/RepositoryIdentityResolver.ts";
 import { OrchestrationEngineLive } from "./OrchestrationEngine.ts";
 import {
@@ -2675,23 +2676,87 @@ it.layer(BaseTestLayer)("OrchestrationProjectionPipeline", (it) => {
         },
       });
 
+      yield* appendAndProject({
+        type: "thread.activity-appended",
+        eventId: EventId.make("evt-stale-approval-5"),
+        aggregateKind: "thread",
+        aggregateId: ThreadId.make("thread-stale-approval"),
+        occurredAt: "2026-02-26T12:30:04.000Z",
+        commandId: CommandId.make("cmd-stale-approval-5"),
+        causationEventId: null,
+        correlationId: CorrelationId.make("cmd-stale-approval-5"),
+        metadata: {},
+        payload: {
+          threadId: ThreadId.make("thread-stale-approval"),
+          activity: {
+            id: EventId.make("activity-timeout-approval-requested"),
+            tone: "approval",
+            kind: "approval.requested",
+            summary: "Command approval requested",
+            payload: {
+              requestId: "approval-request-timeout-2",
+              requestKind: "command",
+            },
+            turnId: null,
+            createdAt: "2026-02-26T12:30:04.000Z",
+          },
+        },
+      });
+
+      yield* appendAndProject({
+        type: "thread.activity-appended",
+        eventId: EventId.make("evt-stale-approval-6"),
+        aggregateKind: "thread",
+        aggregateId: ThreadId.make("thread-stale-approval"),
+        occurredAt: "2026-02-26T12:30:05.000Z",
+        commandId: CommandId.make("cmd-stale-approval-6"),
+        causationEventId: null,
+        correlationId: CorrelationId.make("cmd-stale-approval-6"),
+        metadata: {},
+        payload: {
+          threadId: ThreadId.make("thread-stale-approval"),
+          activity: {
+            id: EventId.make("activity-timeout-approval-resolved"),
+            tone: "error",
+            kind: "approval.resolved",
+            summary: "Approval request timed out",
+            payload: {
+              requestId: "approval-request-timeout-2",
+              decision: "cancel",
+            },
+            turnId: null,
+            createdAt: "2026-02-26T12:30:05.000Z",
+          },
+        },
+      });
+
       const approvalRows = yield* sql<{
         readonly requestId: string;
         readonly status: string;
+        readonly decision: string | null;
         readonly resolvedAt: string | null;
       }>`
         SELECT
           request_id AS "requestId",
           status,
+          decision,
           resolved_at AS "resolvedAt"
         FROM projection_pending_approvals
-        WHERE request_id = 'approval-request-stale-1'
+        WHERE request_id IN ('approval-request-stale-1', 'approval-request-timeout-2')
+        ORDER BY request_id
       `;
       assert.deepEqual(approvalRows, [
         {
           requestId: "approval-request-stale-1",
           status: "resolved",
+          decision: null,
           resolvedAt: "2026-02-26T12:30:03.000Z",
+        },
+        {
+          requestId: "approval-request-timeout-2",
+          status: "resolved",
+          decision: "cancel",
+          resolvedAt: "2026-02-26T12:30:05.000Z",
         },
       ]);
 
@@ -3556,6 +3621,264 @@ it.effect("restores pending turn-start metadata across projection pipeline resta
       Layer.provideMerge(
         ServerConfig.layerTest(process.cwd(), {
           prefix: "t3-projection-pipeline-restart-",
+        }),
+        NodeServices.layer,
+      ),
+    ),
+  ),
+);
+
+it.effect("replays failed turn-start cleanup without clearing a newer pending prompt", () =>
+  Effect.gen(function* () {
+    const { dbPath } = yield* ServerConfig;
+    const persistenceLayer = makeSqlitePersistenceLive(dbPath);
+    const projectionLayer = OrchestrationProjectionPipelineLive.pipe(
+      Layer.provideMerge(OrchestrationEventStoreLive),
+      Layer.provideMerge(persistenceLayer),
+    );
+    const threadId = ThreadId.make("thread-failed-start-replay");
+    const rejectedMessageId = MessageId.make("message-failed-start-replay");
+    const acceptedMessageId = rejectedMessageId;
+    const uncorrelatedTurnId = TurnId.make("turn-after-failed-start-replay");
+    const acceptedTurnId = TurnId.make("turn-accepted-start-replay");
+    const legacyThreadId = ThreadId.make("thread-materialized-failed-start");
+    const legacyMessageId = MessageId.make("message-materialized-failed-start");
+    const legacyRequestId = EventId.make("evt-materialized-failed-start-request");
+
+    const turnRows = yield* Effect.gen(function* () {
+      const eventStore = yield* OrchestrationEventStore;
+      const projectionPipeline = yield* OrchestrationProjectionPipeline;
+      const projectionTurnRepository = yield* ProjectionTurnRepository;
+      const sql = yield* SqlClient.SqlClient;
+
+      yield* eventStore.append({
+        type: "thread.turn-start-requested",
+        eventId: EventId.make("evt-failed-start-replay-request"),
+        aggregateKind: "thread",
+        aggregateId: threadId,
+        occurredAt: "2026-02-26T14:00:00.000Z",
+        commandId: CommandId.make("cmd-failed-start-replay-request"),
+        causationEventId: null,
+        correlationId: CorrelationId.make("cmd-failed-start-replay-request"),
+        metadata: {},
+        payload: {
+          threadId,
+          messageId: rejectedMessageId,
+          runtimeMode: "approval-required",
+          createdAt: "2026-02-26T14:00:00.000Z",
+        },
+      });
+      const appendRejectedStartActivity = (
+        eventId: string,
+        occurredAt: string,
+        input?: {
+          readonly threadId: ThreadId;
+          readonly turnStartRequestId: EventId;
+        },
+      ) => {
+        const activityThreadId = input?.threadId ?? threadId;
+        return eventStore.append({
+          type: "thread.activity-appended",
+          eventId: EventId.make(eventId),
+          aggregateKind: "thread",
+          aggregateId: activityThreadId,
+          occurredAt,
+          commandId: CommandId.make(`cmd-${eventId}`),
+          causationEventId: null,
+          correlationId: CorrelationId.make(`cmd-${eventId}`),
+          metadata: {},
+          payload: {
+            threadId: activityThreadId,
+            activity: {
+              id: EventId.make(`activity-${eventId}`),
+              tone: "error" as const,
+              kind: "provider.turn.start.failed",
+              summary: "Provider turn start failed",
+              payload: {
+                detail: "session/prompt rejected before turn.started",
+                turnStartRequestId: input?.turnStartRequestId ?? "evt-failed-start-replay-request",
+              },
+              turnId: null,
+              createdAt: occurredAt,
+            },
+          },
+        });
+      };
+      yield* appendRejectedStartActivity(
+        "evt-failed-start-replay-activity",
+        "2026-02-26T14:00:01.000Z",
+      );
+      yield* eventStore.append({
+        type: "thread.session-set",
+        eventId: EventId.make("evt-uncorrelated-session-replay"),
+        aggregateKind: "thread",
+        aggregateId: threadId,
+        occurredAt: "2026-02-26T14:00:02.000Z",
+        commandId: CommandId.make("cmd-uncorrelated-session-replay"),
+        causationEventId: null,
+        correlationId: CorrelationId.make("cmd-uncorrelated-session-replay"),
+        metadata: {},
+        payload: {
+          threadId,
+          session: {
+            threadId,
+            status: "running",
+            providerName: "codex",
+            runtimeMode: "approval-required",
+            activeTurnId: uncorrelatedTurnId,
+            lastError: null,
+            updatedAt: "2026-02-26T14:00:02.000Z",
+          },
+        },
+      });
+      yield* eventStore.append({
+        type: "thread.session-set",
+        eventId: EventId.make("evt-uncorrelated-session-ready-replay"),
+        aggregateKind: "thread",
+        aggregateId: threadId,
+        occurredAt: "2026-02-26T14:00:03.000Z",
+        commandId: CommandId.make("cmd-uncorrelated-session-ready-replay"),
+        causationEventId: null,
+        correlationId: CorrelationId.make("cmd-uncorrelated-session-ready-replay"),
+        metadata: {},
+        payload: {
+          threadId,
+          session: {
+            threadId,
+            status: "ready",
+            providerName: "codex",
+            runtimeMode: "approval-required",
+            activeTurnId: null,
+            lastError: null,
+            updatedAt: "2026-02-26T14:00:03.000Z",
+          },
+        },
+      });
+      yield* eventStore.append({
+        type: "thread.turn-start-requested",
+        eventId: EventId.make("evt-accepted-start-replay-request"),
+        aggregateKind: "thread",
+        aggregateId: threadId,
+        occurredAt: "2026-02-26T14:00:04.000Z",
+        commandId: CommandId.make("cmd-accepted-start-replay-request"),
+        causationEventId: null,
+        correlationId: CorrelationId.make("cmd-accepted-start-replay-request"),
+        metadata: {},
+        payload: {
+          threadId,
+          messageId: acceptedMessageId,
+          runtimeMode: "approval-required",
+          createdAt: "2026-02-26T14:00:04.000Z",
+        },
+      });
+      yield* appendRejectedStartActivity(
+        "evt-delayed-failed-start-replay-activity",
+        "2026-02-26T14:00:05.000Z",
+      );
+      yield* eventStore.append({
+        type: "thread.session-set",
+        eventId: EventId.make("evt-accepted-session-replay"),
+        aggregateKind: "thread",
+        aggregateId: threadId,
+        occurredAt: "2026-02-26T14:00:06.000Z",
+        commandId: CommandId.make("cmd-accepted-session-replay"),
+        causationEventId: null,
+        correlationId: CorrelationId.make("cmd-accepted-session-replay"),
+        metadata: {},
+        payload: {
+          threadId,
+          session: {
+            threadId,
+            status: "running",
+            providerName: "codex",
+            runtimeMode: "approval-required",
+            activeTurnId: acceptedTurnId,
+            lastError: null,
+            updatedAt: "2026-02-26T14:00:06.000Z",
+          },
+        },
+      });
+      yield* eventStore.append({
+        type: "thread.turn-start-requested",
+        eventId: legacyRequestId,
+        aggregateKind: "thread",
+        aggregateId: legacyThreadId,
+        occurredAt: "2026-02-26T14:00:07.000Z",
+        commandId: CommandId.make("cmd-materialized-failed-start-request"),
+        causationEventId: null,
+        correlationId: CorrelationId.make("cmd-materialized-failed-start-request"),
+        metadata: {},
+        payload: {
+          threadId: legacyThreadId,
+          messageId: legacyMessageId,
+          runtimeMode: "approval-required",
+          createdAt: "2026-02-26T14:00:07.000Z",
+        },
+      });
+      yield* appendRejectedStartActivity(
+        "evt-materialized-failed-start-activity",
+        "2026-02-26T14:00:08.000Z",
+        { threadId: legacyThreadId, turnStartRequestId: legacyRequestId },
+      );
+
+      yield* projectionPipeline.bootstrap;
+      const pendingRows = yield* sql<{ readonly count: number }>`
+        SELECT COUNT(*) AS "count"
+        FROM projection_turns
+        WHERE thread_id = ${threadId}
+          AND turn_id IS NULL
+          AND state = 'pending'
+      `;
+      assert.equal(pendingRows[0]?.count ?? 0, 0);
+      yield* projectionTurnRepository.replacePendingTurnStart({
+        threadId: legacyThreadId,
+        messageId: legacyMessageId,
+        sourceProposedPlanThreadId: null,
+        sourceProposedPlanId: null,
+        requestedAt: "2026-02-26T14:00:07.000Z",
+      });
+      yield* projectionPipeline.bootstrap;
+      const repairedPendingRows = yield* sql<{ readonly count: number }>`
+        SELECT COUNT(*) AS "count"
+        FROM projection_turns
+        WHERE thread_id = ${legacyThreadId}
+          AND turn_id IS NULL
+          AND state = 'pending'
+      `;
+      assert.equal(repairedPendingRows[0]?.count ?? 0, 0);
+      return yield* sql<{
+        readonly turnId: string;
+        readonly pendingMessageId: string | null;
+        readonly requestedAt: string;
+      }>`
+        SELECT
+          turn_id AS "turnId",
+          pending_message_id AS "pendingMessageId",
+          requested_at AS "requestedAt"
+        FROM projection_turns
+        WHERE thread_id = ${threadId}
+          AND turn_id IS NOT NULL
+        ORDER BY requested_at ASC, turn_id ASC
+      `;
+    }).pipe(Effect.provide(projectionLayer));
+
+    assert.deepEqual(turnRows, [
+      {
+        turnId: uncorrelatedTurnId,
+        pendingMessageId: null,
+        requestedAt: "2026-02-26T14:00:02.000Z",
+      },
+      {
+        turnId: acceptedTurnId,
+        pendingMessageId: acceptedMessageId,
+        requestedAt: "2026-02-26T14:00:04.000Z",
+      },
+    ]);
+  }).pipe(
+    Effect.provide(
+      Layer.provideMerge(
+        ServerConfig.layerTest(process.cwd(), {
+          prefix: "t3-projection-failed-start-replay-",
         }),
         NodeServices.layer,
       ),

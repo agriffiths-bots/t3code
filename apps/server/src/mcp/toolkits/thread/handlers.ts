@@ -36,11 +36,13 @@ import { GitWorkflowService } from "../../../git/GitWorkflowService.ts";
 import * as VcsDriverRegistry from "../../../vcs/VcsDriverRegistry.ts";
 import {
   ThreadStartToolError,
+  type ThreadStartInternalInput,
   type ThreadStartMode,
-  type ThreadStartToolInput,
+  type ThreadStartPublicInput,
   type ThreadStartToolOutput,
   ThreadToolkit,
 } from "./tools.ts";
+import { applyMcpReasoningEffort } from "./reasoningEffort.ts";
 
 const nowIso = Effect.map(DateTime.now, DateTime.formatIso);
 const isThreadStartToolError = Schema.is(ThreadStartToolError);
@@ -95,8 +97,11 @@ interface SourceCwdProjectContext {
 }
 
 export type ActiveThreadStartRuntime = (
-  input: ThreadStartToolInput,
+  input: ThreadStartInternalInput,
   invocation: McpInvocationContext.McpInvocationScope,
+  options?: {
+    readonly providerSessionDetached?: boolean;
+  },
 ) => Effect.Effect<ThreadStartToolOutput, ThreadStartToolError>;
 
 let activeThreadStartRuntime: ActiveThreadStartRuntime | null = null;
@@ -377,7 +382,7 @@ const makeActiveThreadStartRuntime = Effect.fn("ThreadToolkit.makeActiveRuntime"
 
   const resolveNewWorktreeBaseBranch = Effect.fn("ThreadToolkit.resolveNewWorktreeBaseBranch")(
     function* (
-      input: ThreadStartToolInput,
+      input: ThreadStartInternalInput,
       project: OrchestrationProjectShell,
       sourceThread: OrchestrationThreadShell,
       sourceCwd: string,
@@ -417,7 +422,7 @@ const makeActiveThreadStartRuntime = Effect.fn("ThreadToolkit.makeActiveRuntime"
 
   const resolveInitialBranch = Effect.fn("ThreadToolkit.resolveInitialBranch")(function* (
     mode: ThreadStartMode,
-    input: ThreadStartToolInput,
+    input: ThreadStartInternalInput,
     sourceThread: OrchestrationThreadShell,
     sourceCwd: string,
     canUseSourceBranch: boolean,
@@ -465,7 +470,7 @@ const makeActiveThreadStartRuntime = Effect.fn("ThreadToolkit.makeActiveRuntime"
   });
 
   const loadPeerSourceContext = Effect.fn("ThreadToolkit.loadPeerSourceContext")(function* (
-    input: ThreadStartToolInput,
+    input: ThreadStartInternalInput,
   ) {
     if (input.directory === undefined) {
       return yield* fail(
@@ -564,8 +569,11 @@ const makeActiveThreadStartRuntime = Effect.fn("ThreadToolkit.makeActiveRuntime"
   });
 
   return Effect.fn("ThreadToolkit.startThread")(function* (
-    input: ThreadStartToolInput,
+    input: ThreadStartInternalInput,
     invocation: McpInvocationContext.McpInvocationScope,
+    options?: {
+      readonly providerSessionDetached?: boolean;
+    },
   ) {
     const { sourceThread, project } = McpInvocationContext.isProviderInvocationScope(invocation)
       ? yield* loadProviderSourceContext(invocation)
@@ -585,7 +593,7 @@ const makeActiveThreadStartRuntime = Effect.fn("ThreadToolkit.makeActiveRuntime"
     // A FOREIGN explicit directory (different repository than the caller's
     // project, fail-closed) gets the cross-repo restrictions; a same-repo
     // explicit directory keeps cleanup and branch behavior (worktrees are
-    // repo-global, so the projectId-keyed reaper still sees them).
+    // repo-global, so lifecycle teardown can still target them safely).
     const explicitForeignDirectory =
       explicitDirectory !== null && !(explicitDirectoryContext?.sameRepository ?? false);
     // Setup scripts are stricter than cleanup: they are resolved by the
@@ -660,10 +668,9 @@ const makeActiveThreadStartRuntime = Effect.fn("ThreadToolkit.makeActiveRuntime"
           ? sourceCwd
           : null;
     // Cross-repo worktrees (explicit directory) must not be marked removable:
-    // the stale-worktree reaper resolves the repository via the caller's
-    // projectId and would never find them there — it would clear the thread
-    // metadata and orphan the actual worktree. They are user-managed until
-    // cleanup understands foreign repositories.
+    // lifecycle teardown removes through the caller's project root and cannot
+    // safely target a foreign repository. They are user-managed until cleanup
+    // understands foreign repositories.
     const worktreeRemovable = mode === "new_worktree" && !explicitForeignDirectory;
     // Removal-root inheritance only applies to children actually running
     // inside the SOURCE thread's worktree: an explicit directory (even
@@ -739,6 +746,9 @@ const makeActiveThreadStartRuntime = Effect.fn("ThreadToolkit.makeActiveRuntime"
       ...(titleSeed !== undefined ? { titleSeed } : {}),
       runtimeMode,
       interactionMode,
+      ...(options?.providerSessionDetached !== undefined
+        ? { providerSessionDetached: options.providerSessionDetached }
+        : {}),
       bootstrap: {
         createThread: {
           projectId: project.id,
@@ -812,7 +822,7 @@ export const ThreadStartRuntimeLive = Layer.effectDiscard(
 );
 
 const resolveModelSelection = (
-  input: ThreadStartToolInput,
+  input: ThreadStartInternalInput,
   sourceThread: OrchestrationThreadShell,
   modelSources: ReadonlyArray<ProviderModelSource>,
 ): Effect.Effect<ModelSelection, ThreadStartToolError> => {
@@ -832,13 +842,18 @@ const resolveModelSelection = (
         ),
       );
     }
-    return Effect.succeed(resolved);
+    const effort = applyMcpReasoningEffort(resolved, modelSources, input.reasoningEffort);
+    return effort.error === undefined
+      ? Effect.succeed(effort.selection)
+      : Effect.fail(fail(effort.error));
   }
   // Otherwise an explicit modelSelection wins, else inherit the source thread.
   return Effect.succeed(input.modelSelection ?? sourceThread.modelSelection);
 };
 
-const startThread = Effect.fn("ThreadToolkit.startThread")(function* (input: ThreadStartToolInput) {
+const startThread = Effect.fn("ThreadToolkit.startThread")(function* (
+  input: ThreadStartPublicInput,
+) {
   const invocation = yield* McpInvocationContext.requireProviderMcpCapability(
     "thread-management",
   ).pipe(Effect.mapError((error) => fail(error.message)));

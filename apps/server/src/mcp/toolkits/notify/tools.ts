@@ -12,7 +12,11 @@ import { ThreadStartToolError } from "../thread/tools.ts";
 
 const dependencies = [McpInvocationContext.McpInvocationContext];
 
-export const NotifyInput = ServerNotifyInput;
+export const NotifyInput = Schema.Struct({
+  title: ServerNotifyInput.fields.title,
+  body: Schema.optionalKey(Schema.required(ServerNotifyInput.fields.body)),
+  deepLink: Schema.optionalKey(Schema.required(ServerNotifyInput.fields.deepLink)),
+});
 export type NotifyInput = typeof NotifyInput.Type;
 
 export const NotifyOutput = Schema.Struct({

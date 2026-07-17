@@ -9,7 +9,6 @@ import {
   ProviderDriverKind,
   type ProviderInstanceConfig,
   type ProviderInstanceId,
-  type ScopedThreadRef,
 } from "@t3tools/contracts";
 import { scopeThreadRef } from "@t3tools/client-runtime/environment";
 import { safeErrorLogAttributes } from "@t3tools/client-runtime/errors";
@@ -1517,9 +1516,13 @@ export function ArchivedThreadsPanel() {
   }, [archivedSnapshots]);
 
   const handleArchivedThreadContextMenu = useCallback(
-    async (threadRef: ScopedThreadRef, position: { x: number; y: number }) => {
+    async (
+      thread: (typeof archivedGroups)[number]["threads"][number],
+      position: { x: number; y: number },
+    ) => {
       const api = readLocalApi();
       if (!api) return;
+      const threadRef = scopeThreadRef(thread.environmentId, thread.id);
       const clicked = await api.contextMenu.show(
         [
           { id: "unarchive", label: "Unarchive" },
@@ -1532,7 +1535,7 @@ export function ArchivedThreadsPanel() {
         const result = await unarchiveThread(threadRef);
         if (result._tag === "Success") {
           refreshArchivedThreads();
-        } else if (!isAtomCommandInterrupted(result)) {
+        } else if (result._tag === "Failure" && !isAtomCommandInterrupted(result)) {
           const error = squashAtomCommandFailure(result);
           toastManager.add(
             stackedThreadToast({
@@ -1546,10 +1549,10 @@ export function ArchivedThreadsPanel() {
       }
 
       if (clicked === "delete") {
-        const result = await confirmAndDeleteThread(threadRef);
-        if (result._tag === "Success") {
+        const result = await confirmAndDeleteThread(threadRef, thread);
+        if (result._tag === "Success" && result.value.deleted) {
           refreshArchivedThreads();
-        } else if (!isAtomCommandInterrupted(result)) {
+        } else if (result._tag === "Failure" && !isAtomCommandInterrupted(result)) {
           const error = squashAtomCommandFailure(result);
           toastManager.add(
             stackedThreadToast({
@@ -1604,13 +1607,10 @@ export function ArchivedThreadsPanel() {
                   event.preventDefault();
                   void (async () => {
                     const result = await settlePromise(() =>
-                      handleArchivedThreadContextMenu(
-                        scopeThreadRef(thread.environmentId, thread.id),
-                        {
-                          x: event.clientX,
-                          y: event.clientY,
-                        },
-                      ),
+                      handleArchivedThreadContextMenu(thread, {
+                        x: event.clientX,
+                        y: event.clientY,
+                      }),
                     );
                     if (result._tag === "Failure") {
                       const error = squashAtomCommandFailure(result);

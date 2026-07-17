@@ -51,6 +51,14 @@ export interface OrchestrationEngineShape {
   ) => Effect.Effect<{ sequence: number }, OrchestrationDispatchError, never>;
 
   /**
+   * Dispatch while trusted code already owns the worktree lifecycle permit.
+   * This must never be exposed through a transport boundary.
+   */
+  readonly dispatchCoordinated?: (
+    command: OrchestrationCommand,
+  ) => Effect.Effect<{ sequence: number }, OrchestrationDispatchError, never>;
+
+  /**
    * Stream persisted domain events in dispatch order.
    *
    * This is a hot runtime stream (new events only), not a historical replay.
@@ -73,3 +81,8 @@ export class OrchestrationEngineService extends Context.Service<
   OrchestrationEngineService,
   OrchestrationEngineShape
 >()("t3/orchestration/Services/OrchestrationEngine/OrchestrationEngineService") {}
+
+export const dispatchAlreadyCoordinated = (
+  engine: OrchestrationEngineShape,
+  command: OrchestrationCommand,
+) => (engine.dispatchCoordinated ?? engine.dispatch)(command);

@@ -8,37 +8,29 @@ import {
 import * as Schema from "effect/Schema";
 import { Tool, Toolkit } from "effect/unstable/ai";
 
-import {
-  ScheduleBusyPolicy,
-  ScheduledTaskId,
-} from "../../../persistence/Services/ScheduledTasks.ts";
+import { ScheduledTaskId } from "../../../persistence/Services/ScheduledTasks.ts";
 import * as McpInvocationContext from "../../McpInvocationContext.ts";
-import { ThreadStartToolError, ThreadStartToolInput, ThreadStartMode } from "../thread/tools.ts";
+import {
+  ThreadStartInternalInput,
+  ThreadStartPublicInput,
+  ThreadStartToolError,
+  ThreadStartMode,
+} from "../thread/tools.ts";
 
 const dependencies = [McpInvocationContext.McpInvocationContext];
 
-// Logical wait budget bounds (seconds) surfaced to `t3_wait_subagent`. The
-// server clamps the requested timeout into this range; the per-invocation HTTP
-// hold itself is bounded separately by WAIT_SLICE_SECONDS in the coordinator.
-export const WAIT_TIMEOUT_DEFAULT_SECONDS = 600;
-export const WAIT_TIMEOUT_MIN_SECONDS = 1;
-export const WAIT_TIMEOUT_MAX_SECONDS = 3_900;
+export const SpawnSubagentInput = ThreadStartPublicInput;
+export type SpawnSubagentInput = typeof SpawnSubagentInput.Type;
 
-// Cumulative blocking budget cap for a single `t3_wait_subagent` (across
-// resumeToken re-calls), regardless of the caller's timeoutSeconds (R-A). Once
-// this elapses with children still running, the wait auto-promotes them to
-// wake-on-completion and returns so the model stops polling.
-export const WAIT_AUTO_PROMOTE_SECONDS = 90;
-
-export const SpawnSubagentInput = Schema.Struct({
-  ...ThreadStartToolInput.fields,
+export const SpawnSubagentInternalInput = Schema.Struct({
+  ...ThreadStartInternalInput.fields,
   target: Schema.optional(TrimmedNonEmptyString),
   remoteParentThreadId: Schema.optional(ThreadId),
   remoteParentEnvironmentId: Schema.optional(EnvironmentId),
   detached: Schema.optional(Schema.Boolean),
   waitTimeoutSeconds: Schema.optional(Schema.Int),
 });
-export type SpawnSubagentInput = typeof SpawnSubagentInput.Type;
+export type SpawnSubagentInternalInput = typeof SpawnSubagentInternalInput.Type;
 
 export const SpawnSubagentOutput = Schema.Struct({
   childThreadId: ThreadId,
@@ -48,11 +40,6 @@ export const SpawnSubagentOutput = Schema.Struct({
   worktreePath: Schema.NullOr(Schema.String),
   parentThreadId: ThreadId,
   warning: Schema.optional(Schema.String),
-  // Present only for a foreground (detached=false) spawn. If the initial
-  // bounded wait slice does not finish, status is "running" and callers should
-  // poll with t3_wait_subagent.
-  status: Schema.optional(Schema.String),
-  finalAssistantText: Schema.optional(Schema.NullOr(Schema.String)),
 });
 export type SpawnSubagentOutput = typeof SpawnSubagentOutput.Type;
 
@@ -81,59 +68,21 @@ export const SteerSubagentOutput = Schema.Struct({
 });
 export type SteerSubagentOutput = typeof SteerSubagentOutput.Type;
 
-export const CheckSubagentInput = Schema.Struct({
-  childThreadId: ThreadId,
-});
-export type CheckSubagentInput = typeof CheckSubagentInput.Type;
-
-export const CheckSubagentOutput = Schema.Struct({
+export const SubagentDetailOutput = Schema.Struct({
   threadId: ThreadId,
   status: Schema.String,
   turnCount: Schema.Int,
   latestAssistantText: Schema.NullOr(Schema.String),
 });
-export type CheckSubagentOutput = typeof CheckSubagentOutput.Type;
+export type SubagentDetailOutput = typeof SubagentDetailOutput.Type;
 
-export const WaitSubagentMode = Schema.Literals(["all", "any"]);
-export type WaitSubagentMode = typeof WaitSubagentMode.Type;
+export const LegacyCheckSubagentInput = Schema.Struct({ childThreadId: ThreadId });
+export type LegacyCheckSubagentInput = typeof LegacyCheckSubagentInput.Type;
 
-export const WaitSubagentInput = Schema.Struct({
-  childThreadIds: Schema.Array(ThreadId).check(Schema.isMinLength(1)),
-  timeoutSeconds: Schema.optional(Schema.Int),
-  mode: Schema.optional(WaitSubagentMode),
-  resumeToken: Schema.optional(Schema.String),
+export const SubagentsInput = Schema.Struct({
+  childThreadId: Schema.optionalKey(ThreadId),
 });
-export type WaitSubagentInput = typeof WaitSubagentInput.Type;
-
-export const WaitSubagentResult = Schema.Struct({
-  childThreadId: ThreadId,
-  status: Schema.String,
-  turnCount: Schema.Int,
-  finalAssistantText: Schema.NullOr(Schema.String),
-  error: Schema.NullOr(Schema.String),
-  // Present on a still-running child once the wait auto-promoted (R-A): the
-  // child will now notify the parent on completion, so the model should stop
-  // waiting and do other work.
-  note: Schema.optional(Schema.String),
-});
-
-export const WaitSubagentOutput = Schema.Struct({
-  results: Schema.Array(WaitSubagentResult),
-  settledCount: Schema.Int,
-  timedOutCount: Schema.Int,
-  pending: Schema.Boolean,
-  resumeToken: Schema.String,
-  // True when the ~90s auto-promote budget elapsed with one+ children still
-  // running (R-A): those children were promoted to wake-on-completion and the
-  // model should stop calling wait.
-  promoted: Schema.optional(Schema.Boolean),
-});
-export type WaitSubagentOutput = typeof WaitSubagentOutput.Type;
-
-export const ListSubagentsInput = Schema.Struct({
-  parentThreadId: Schema.optional(ThreadId),
-});
-export type ListSubagentsInput = typeof ListSubagentsInput.Type;
+export type SubagentsInput = typeof SubagentsInput.Type;
 
 export const ListSubagentEntry = Schema.Struct({
   childThreadId: ThreadId,
@@ -146,23 +95,26 @@ export const ListSubagentEntry = Schema.Struct({
   turnCount: Schema.Int,
 });
 
-export const ListSubagentsOutput = Schema.Struct({
-  parentThreadId: ThreadId,
-  children: Schema.Array(ListSubagentEntry),
+export const SubagentsOutput = Schema.Struct({
+  parentThreadId: Schema.optional(ThreadId),
+  children: Schema.optional(Schema.Array(ListSubagentEntry)),
+  threadId: Schema.optional(ThreadId),
+  status: Schema.optional(Schema.String),
+  turnCount: Schema.optional(Schema.Int),
+  latestAssistantText: Schema.optional(Schema.NullOr(Schema.String)),
 });
-export type ListSubagentsOutput = typeof ListSubagentsOutput.Type;
+export type SubagentsOutput = typeof SubagentsOutput.Type;
 
 export const ScheduleCreateInput = Schema.Struct({
-  threadId: Schema.optional(ThreadId),
+  threadId: Schema.optionalKey(ThreadId),
   prompt: Schema.String,
-  intervalSeconds: Schema.optional(Schema.Int),
-  cronExpr: Schema.optional(Schema.String),
-  timezone: Schema.optional(Schema.String),
-  busyPolicy: Schema.optional(ScheduleBusyPolicy),
+  intervalSeconds: Schema.optionalKey(Schema.Int),
+  cronExpr: Schema.optionalKey(Schema.String),
+  timezone: Schema.optionalKey(Schema.String),
   // Optional plain model name (e.g. "claude-opus-4-8" or "gpt-5.4"); the
   // provider/harness is inferred from the live model lists, so the caller never
   // guesses a harness/instance id. Omit to inherit the thread's current model.
-  model: Schema.optional(TrimmedNonEmptyString),
+  model: Schema.optionalKey(TrimmedNonEmptyString),
 });
 export type ScheduleCreateInput = typeof ScheduleCreateInput.Type;
 
@@ -174,7 +126,7 @@ export const ScheduleEntry = ScheduledTaskEntry;
 export type ScheduleEntry = typeof ScheduleEntry.Type;
 
 export const ScheduleListInput = Schema.Struct({
-  threadId: Schema.optional(ThreadId),
+  threadId: Schema.optionalKey(ThreadId),
 });
 export type ScheduleListInput = typeof ScheduleListInput.Type;
 
@@ -185,14 +137,12 @@ export type ScheduleListOutput = typeof ScheduleListOutput.Type;
 
 export const ScheduleUpdateInput = Schema.Struct({
   taskId: ScheduledTaskId,
-  enabled: Schema.optional(Schema.Boolean),
-  busyPolicy: Schema.optional(ScheduleBusyPolicy),
-  intervalSeconds: Schema.optional(Schema.Int),
-  cronExpr: Schema.optional(Schema.String),
-  // Re-route the schedule to a new plain model name (provider/harness inferred),
-  // or pass null to un-pin and inherit the thread's current model again. Omit to
-  // leave the current model unchanged.
-  model: Schema.optional(Schema.NullOr(TrimmedNonEmptyString)),
+  enabled: Schema.optionalKey(Schema.Boolean),
+  intervalSeconds: Schema.optionalKey(Schema.Int),
+  cronExpr: Schema.optionalKey(Schema.String),
+  // Re-route the schedule to a new plain model name (provider/harness inferred).
+  // Omit to leave the current model unchanged.
+  model: Schema.optionalKey(TrimmedNonEmptyString),
 });
 export type ScheduleUpdateInput = typeof ScheduleUpdateInput.Type;
 
@@ -209,7 +159,7 @@ export type ScheduleDeleteOutput = typeof ScheduleDeleteOutput.Type;
 
 export const SpawnSubagentTool = Tool.make("t3_spawn_subagent", {
   description:
-    "Delegate a unit of work to an autonomous sub-agent thread. Use this freely to fan out background or parallel work — research, refactors, exploring an approach — without blocking yourself. Defaults to detached=true: the sub-agent runs independently and wakes you with its result when it finishes, so prefer spawning detached and continuing your own work. Set detached=false only when you must have the result before proceeding; foreground spawn waits for one bounded initial status slice, returns terminal output if already done, otherwise returns status=\"running\" plus launch metadata and promotes the child to wake you on completion. Use t3_wait_subagent to wait for a still-running foreground child, or stop polling and let the parent wake automatically; never expect spawn itself to block until long work completes. Defaults to a new Git worktree off the repository default branch when the project directory is a Git repository; non-Git projects start in the current directory with warning metadata. Pass `directory` (absolute path) to base the sub-agent somewhere else entirely: a Git directory gets a new worktree off that repository, a non-Git directory runs in place — use this when the calling thread's project is not the repository the work belongs in. Pass `target` as a registered peer alias or environment id to spawn on another backend; remote spawns require `directory` because target filesystems are independent. To pick the sub-agent's model, pass `model` as a plain model name (e.g. 'claude-opus-4-8' or 'gpt-5.4'); the provider/harness is inferred automatically, so you never guess a harness/instance id. This is the delegation primitive — for human-requested thread creation use t3_thread_start instead.",
+    "Delegate a unit of work to an autonomous sub-agent thread. The model and title are required. The child inherits the parent runtime and interaction modes, runs independently, and wakes the parent with its result on completion. Defaults to a new Git worktree from project configuration. Pass `directory` to target another local project and `branch` to name the new worktree branch. `reasoningEffort` defaults to `xhigh` for Codex models that advertise reasoning effort and overrides that default when supplied. For human-requested thread creation use t3_thread_start instead.",
   parameters: SpawnSubagentInput,
   success: SpawnSubagentOutput,
   failure: ThreadStartToolError,
@@ -232,45 +182,21 @@ export const SteerSubagentTool = Tool.make("t3_steer_subagent", {
   .annotate(Tool.Destructive, true)
   .annotate(Tool.Idempotent, false);
 
-export const CheckSubagentTool = Tool.make("t3_check_subagent", {
+export const SubagentsTool = Tool.make("t3_subagents", {
   description:
-    "Read the current status of a sub-agent without waiting. Returns its status, turn count, and latest assistant text. Use this for a quick non-blocking poll; use t3_wait_subagent when you actually need to block until it finishes.",
-  parameters: CheckSubagentInput,
-  success: CheckSubagentOutput,
+    "List sub-agents spawned by the calling thread with their current statuses. Pass `childThreadId` to inspect one owned child in detail, including its latest assistant text. Omitting `childThreadId` defaults to listing all children of the calling thread.",
+  parameters: SubagentsInput,
+  success: SubagentsOutput,
   failure: ThreadStartToolError,
   dependencies,
 })
-  .annotate(Tool.Title, "Check T3 Code sub-agent")
-  .annotate(Tool.Readonly, true)
-  .annotate(Tool.Idempotent, true);
-
-export const WaitSubagentTool = Tool.make("t3_wait_subagent", {
-  description:
-    'Wait for one or more sub-agents to finish. This returns quickly with one result row per requested child; a child that has not finished yet has status "pending". While pending is true and you still want to wait, re-call this tool with the returned resumeToken (and the same childThreadIds) to keep waiting — never assume a single call blocks until completion. This waits at most ~90 seconds in total (across resumeToken re-calls); once that elapses with children still running, it returns promoted=true and those children have status "running" — STOP calling wait and go do other work, you will receive a new message automatically when each one finishes. mode "all" (default) waits for every child; "any" returns as soon as one settles. timeoutSeconds (default 600, clamped to [1,3900]) is the requested logical budget; children still unfinished once it is exhausted are returned with status "timeout".',
-  parameters: WaitSubagentInput,
-  success: WaitSubagentOutput,
-  failure: ThreadStartToolError,
-  dependencies,
-})
-  .annotate(Tool.Title, "Wait for T3 Code sub-agents")
-  .annotate(Tool.Readonly, true)
-  .annotate(Tool.Idempotent, false);
-
-export const ListSubagentsTool = Tool.make("t3_list_subagents", {
-  description:
-    "List the sub-agents spawned by a parent thread (defaults to the calling thread), merging in-memory registration metadata (spawn time, detached, depth) with each child's current status and turn count.",
-  parameters: ListSubagentsInput,
-  success: ListSubagentsOutput,
-  failure: ThreadStartToolError,
-  dependencies,
-})
-  .annotate(Tool.Title, "List T3 Code sub-agents")
+  .annotate(Tool.Title, "Inspect T3 Code sub-agents")
   .annotate(Tool.Readonly, true)
   .annotate(Tool.Idempotent, true);
 
 export const ScheduleCreateTool = Tool.make("t3_schedule_create", {
   description:
-    "Schedule a recurring prompt to be sent to a thread (defaults to the calling thread). Provide exactly one of intervalSeconds (fixed interval) or cronExpr (a cron expression, validated on create); optionally a timezone (IANA name, default UTC) and busyPolicy (\"skip\" default, or \"queue_once\"). The same thread is reused on every trigger. To pin the model each run uses, pass `model` as a plain model name (e.g. 'claude-opus-4-8' or 'gpt-5.4'); the provider/harness is inferred automatically, so you never guess a harness/instance id. Pin a model on the thread's own provider (like the interactive model picker) — pinning a different provider than the thread's active session errors at run time, so prefer a dedicated thread for a cross-provider schedule. Omit `model` to inherit the thread's current model on each run.",
+    "Schedule a recurring prompt to be sent to a thread (defaults to the calling thread). Provide exactly one of intervalSeconds (fixed interval) or cronExpr (a cron expression, validated on create); timezone defaults to UTC and the busy policy always defaults to skip. The same thread is reused on every trigger. To pin the model each run uses, pass `model` as a plain model name (e.g. 'claude-opus-4-8' or 'gpt-5.4'); the provider/harness is inferred automatically, so you never guess a harness/instance id. Pin a model on the thread's own provider (like the interactive model picker) — pinning a different provider than the thread's active session errors at run time, so prefer a dedicated thread for a cross-provider schedule. Omit `model` to inherit the thread's current model on each run.",
   parameters: ScheduleCreateInput,
   success: ScheduleEntry,
   failure: ThreadStartToolError,
@@ -294,7 +220,7 @@ export const ScheduleListTool = Tool.make("t3_schedule_list", {
 
 export const ScheduleUpdateTool = Tool.make("t3_schedule_update", {
   description:
-    "Update a scheduled task: enable/disable it, change its busyPolicy, change its interval or cron expression (cron is re-validated), re-route it to a new model by passing `model` as a plain model name (provider/harness inferred), or pass `model: null` to un-pin the model so runs inherit the thread's current model again. Only the supplied fields are changed.",
+    "Update a scheduled task: enable/disable it, change its interval or cron expression (cron is re-validated), or re-route it to a new model by passing `model` as a plain model name (provider/harness inferred). Omitted fields remain unchanged, including the model and persisted busy policy.",
   parameters: ScheduleUpdateInput,
   success: ScheduleEntry,
   failure: ThreadStartToolError,
@@ -318,9 +244,7 @@ export const ScheduleDeleteTool = Tool.make("t3_schedule_delete", {
 export const SubagentToolkit = Toolkit.make(
   SpawnSubagentTool,
   SteerSubagentTool,
-  CheckSubagentTool,
-  WaitSubagentTool,
-  ListSubagentsTool,
+  SubagentsTool,
   ScheduleCreateTool,
   ScheduleListTool,
   ScheduleUpdateTool,

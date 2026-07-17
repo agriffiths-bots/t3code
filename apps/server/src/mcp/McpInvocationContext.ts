@@ -1,7 +1,6 @@
 import {
   type AuthSessionId,
   type EnvironmentId,
-  PreviewAutomationUnavailableError,
   type ProviderInstanceId,
   type ThreadId,
 } from "@t3tools/contracts";
@@ -10,7 +9,6 @@ import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 
 export const McpCapability = Schema.Literals([
-  "preview",
   "thread-management",
   "notification",
   "subagent:spawn",
@@ -81,29 +79,15 @@ export const isProviderInvocationScope = (
   invocation: McpInvocationScope,
 ): invocation is ProviderMcpInvocationScope => invocation.credentialKind === "provider-session";
 
-const isLegacyProviderCapability = (
-  capability: McpCapability,
-): capability is "preview" | "thread-management" | "notification" =>
-  capability === "preview" || capability === "thread-management" || capability === "notification";
-
 export const requireMcpCapability = Effect.fn("mcp.requireCapability")(function* (
   capability: McpCapability,
 ) {
   const invocation = yield* McpInvocationContext;
   if (!invocation.capabilities.has(capability)) {
-    if (!isProviderInvocationScope(invocation) || !isLegacyProviderCapability(capability)) {
-      return yield* new McpCapabilityUnavailableError({
-        capability,
-        environmentId: invocation.environmentId,
-        credentialKind: invocation.credentialKind,
-      });
-    }
-    return yield* new PreviewAutomationUnavailableError({
+    return yield* new McpCapabilityUnavailableError({
       capability,
       environmentId: invocation.environmentId,
-      threadId: invocation.threadId,
-      providerSessionId: invocation.providerSessionId,
-      providerInstanceId: invocation.providerInstanceId,
+      credentialKind: invocation.credentialKind,
     });
   }
   return invocation;
@@ -117,19 +101,10 @@ export const requireAnyMcpCapability = Effect.fn("mcp.requireAnyCapability")(fun
     return invocation;
   }
   const capability = capabilities[0] ?? "thread-management";
-  if (!isProviderInvocationScope(invocation) || !isLegacyProviderCapability(capability)) {
-    return yield* new McpCapabilityUnavailableError({
-      capability,
-      environmentId: invocation.environmentId,
-      credentialKind: invocation.credentialKind,
-    });
-  }
-  return yield* new PreviewAutomationUnavailableError({
+  return yield* new McpCapabilityUnavailableError({
     capability,
     environmentId: invocation.environmentId,
-    threadId: invocation.threadId,
-    providerSessionId: invocation.providerSessionId,
-    providerInstanceId: invocation.providerInstanceId,
+    credentialKind: invocation.credentialKind,
   });
 });
 

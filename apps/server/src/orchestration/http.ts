@@ -21,6 +21,8 @@ import {
 } from "../auth/http.ts";
 import { OrchestrationEngineService } from "./Services/OrchestrationEngine.ts";
 import { ProjectionSnapshotQuery } from "./Services/ProjectionSnapshotQuery.ts";
+import { coveredThreadRevision } from "./threadRevision.ts";
+import { OrchestrationEventStore } from "../persistence/Services/OrchestrationEventStore.ts";
 import {
   OrchestrationCommandInvariantError,
   OrchestrationCommandPreviouslyRejectedError,
@@ -42,6 +44,7 @@ export const orchestrationHttpApiLayer = HttpApiBuilder.group(
   Effect.fnUntraced(function* (handlers) {
     const projectionSnapshotQuery = yield* ProjectionSnapshotQuery;
     const orchestrationEngine = yield* OrchestrationEngineService;
+    const orchestrationEventStore = yield* OrchestrationEventStore;
 
     return handlers
       .handle(
@@ -77,17 +80,42 @@ export const orchestrationHttpApiLayer = HttpApiBuilder.group(
         Effect.fn("environment.orchestration.threadSnapshot")(function* (args) {
           yield* annotateEnvironmentRequest(args.endpoint.name);
           yield* requireEnvironmentScope(AuthOrchestrationReadScope);
-          const snapshot = yield* projectionSnapshotQuery
-            .getThreadDetailSnapshot(args.params.threadId)
-            .pipe(
-              Effect.catch((cause) =>
-                failEnvironmentInternal("orchestration_thread_snapshot_failed", cause),
-              ),
-            );
+          const [snapshot, latestRevision] = yield* Effect.all([
+            projectionSnapshotQuery.getThreadDetailSnapshot(args.params.threadId),
+            orchestrationEventStore.getLatestThreadRevision(args.params.threadId),
+          ]).pipe(
+            Effect.catch((cause) =>
+              failEnvironmentInternal("orchestration_thread_snapshot_failed", cause),
+            ),
+          );
           if (Option.isNone(snapshot)) {
             return yield* failEnvironmentNotFound("thread_not_found");
           }
-          return snapshot.value;
+          return {
+            ...snapshot.value,
+            storageEpoch: orchestrationEventStore.storageEpoch,
+            ...coveredThreadRevision(snapshot.value.snapshotSequence, latestRevision),
+          };
+        }),
+      )
+      .handle(
+        "threadRevision",
+        Effect.fn("environment.orchestration.threadRevision")(function* (args) {
+          yield* annotateEnvironmentRequest(args.endpoint.name);
+          yield* requireEnvironmentScope(AuthOrchestrationReadScope);
+          const revision = yield* Effect.all({
+            latest: orchestrationEventStore.getLatestThreadRevision(args.params.threadId),
+            projection: projectionSnapshotQuery.getSnapshotSequence(),
+          }).pipe(
+            Effect.catch((cause) =>
+              failEnvironmentInternal("orchestration_thread_revision_failed", cause),
+            ),
+          );
+          return {
+            storageEpoch: orchestrationEventStore.storageEpoch,
+            ...revision.latest,
+            projectionSequence: revision.projection.snapshotSequence,
+          };
         }),
       )
       .handle(

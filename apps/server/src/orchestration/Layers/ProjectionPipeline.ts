@@ -1178,6 +1178,80 @@ const makeOrchestrationProjectionPipeline = Effect.fn("makeOrchestrationProjecti
           return;
         }
 
+        case "thread.activity-appended": {
+          if (event.payload.activity.kind !== "provider.turn.start.failed") {
+            return;
+          }
+          const payload = event.payload.activity.payload;
+          const currentTurnStartMessageId =
+            typeof payload === "object" &&
+            payload !== null &&
+            "turnStartMessageId" in payload &&
+            typeof payload.turnStartMessageId === "string"
+              ? payload.turnStartMessageId
+              : null;
+          const turnStartRequestId =
+            typeof payload === "object" &&
+            payload !== null &&
+            "turnStartRequestId" in payload &&
+            typeof payload.turnStartRequestId === "string"
+              ? payload.turnStartRequestId
+              : null;
+          const correlatedRequestRows =
+            turnStartRequestId !== null
+              ? yield* sql<{ readonly messageId: unknown }>`
+                    SELECT json_extract(turn_start.payload_json, '$.messageId') AS "messageId"
+                    FROM orchestration_events AS turn_start
+                    WHERE turn_start.event_id = ${turnStartRequestId}
+                      AND turn_start.aggregate_kind = 'thread'
+                      AND turn_start.stream_id = ${event.payload.threadId}
+                      AND turn_start.event_type = 'thread.turn-start-requested'
+                      AND turn_start.sequence < ${event.sequence}
+                      AND turn_start.event_id = (
+                        SELECT latest_turn_start.event_id
+                        FROM orchestration_events AS latest_turn_start
+                        WHERE latest_turn_start.aggregate_kind = 'thread'
+                          AND latest_turn_start.stream_id = turn_start.stream_id
+                          AND latest_turn_start.event_type = 'thread.turn-start-requested'
+                          AND latest_turn_start.sequence < ${event.sequence}
+                          AND json_extract(
+                            latest_turn_start.payload_json,
+                            '$.messageId'
+                          ) = json_extract(turn_start.payload_json, '$.messageId')
+                        ORDER BY latest_turn_start.sequence DESC
+                        LIMIT 1
+                      )
+                    LIMIT 1
+                  `.pipe(
+                  Effect.mapError(
+                    toPersistenceSqlError("ProjectionPipeline.resolveLegacyTurnStartMessage:query"),
+                  ),
+                )
+              : [];
+          const correlatedTurnStartMessageId = correlatedRequestRows[0]?.messageId;
+          const turnStartMessageId =
+            typeof correlatedTurnStartMessageId === "string" &&
+            (currentTurnStartMessageId === null ||
+              currentTurnStartMessageId === correlatedTurnStartMessageId)
+              ? correlatedTurnStartMessageId
+              : null;
+          if (turnStartMessageId === null) {
+            return;
+          }
+          const pendingTurnStart = yield* projectionTurnRepository.getPendingTurnStartByThreadId({
+            threadId: event.payload.threadId,
+          });
+          if (
+            Option.isSome(pendingTurnStart) &&
+            pendingTurnStart.value.messageId === turnStartMessageId
+          ) {
+            yield* projectionTurnRepository.deletePendingTurnStartByThreadId({
+              threadId: event.payload.threadId,
+            });
+          }
+          return;
+        }
+
         case "thread.session-set": {
           const turnId = event.payload.session.activeTurnId;
           if (
@@ -1196,7 +1270,16 @@ const makeOrchestrationProjectionPipeline = Effect.fn("makeOrchestrationProjecti
               threadId: event.payload.threadId,
             });
             yield* Effect.forEach(
-              existingTurns.filter((turn) => turn.turnId !== null && turn.state === "running"),
+              existingTurns.filter(
+                (turn) =>
+                  turn.turnId !== null &&
+                  (turn.state === "running" ||
+                    // A dead-session interrupt carries its exact turn id on
+                    // this terminal event before a second event clears it.
+                    (settledTurnState === "error" &&
+                      turn.state === "interrupted" &&
+                      turn.turnId === event.payload.session.activeTurnId)),
+              ),
               (turn) =>
                 turn.turnId === null
                   ? Effect.void
@@ -1767,6 +1850,43 @@ const makeOrchestrationProjectionPipeline = Effect.fn("makeOrchestrationProjecti
           ),
         );
 
+    const repairRejectedPendingTurnStarts = sql`
+      DELETE FROM projection_turns AS pending
+      WHERE pending.turn_id IS NULL
+        AND pending.state = 'pending'
+        AND EXISTS (
+          SELECT 1
+          FROM orchestration_events AS turn_start
+          JOIN orchestration_events AS failure
+            ON failure.aggregate_kind = 'thread'
+            AND failure.stream_id = turn_start.stream_id
+            AND failure.sequence > turn_start.sequence
+          WHERE turn_start.aggregate_kind = 'thread'
+            AND turn_start.stream_id = pending.thread_id
+            AND turn_start.event_type = 'thread.turn-start-requested'
+            AND json_extract(turn_start.payload_json, '$.messageId') = pending.pending_message_id
+            AND turn_start.event_id = (
+              SELECT latest_turn_start.event_id
+              FROM orchestration_events AS latest_turn_start
+              WHERE latest_turn_start.aggregate_kind = 'thread'
+                AND latest_turn_start.stream_id = pending.thread_id
+                AND latest_turn_start.event_type = 'thread.turn-start-requested'
+                AND json_extract(
+                  latest_turn_start.payload_json,
+                  '$.messageId'
+                ) = pending.pending_message_id
+              ORDER BY latest_turn_start.sequence DESC
+              LIMIT 1
+            )
+            AND failure.event_type = 'thread.activity-appended'
+            AND json_extract(failure.payload_json, '$.activity.kind') = 'provider.turn.start.failed'
+            AND json_extract(
+              failure.payload_json,
+              '$.activity.payload.turnStartRequestId'
+            ) = turn_start.event_id
+        )
+    `;
+
     const projectEvent: OrchestrationProjectionPipelineShape["projectEvent"] = (event) =>
       Effect.forEach(projectors, (projector) => runProjectorForEvent(projector, event), {
         concurrency: 1,
@@ -1780,24 +1900,26 @@ const makeOrchestrationProjectionPipeline = Effect.fn("makeOrchestrationProjecti
         ),
       );
 
-    const bootstrap: OrchestrationProjectionPipelineShape["bootstrap"] = Effect.forEach(
-      projectors,
-      bootstrapProjector,
-      { concurrency: 1 },
-    ).pipe(
-      Effect.provideService(FileSystem.FileSystem, fileSystem),
-      Effect.provideService(Path.Path, path),
-      Effect.provideService(ServerConfig, serverConfig),
-      Effect.asVoid,
-      Effect.tap(() =>
-        Effect.logDebug("orchestration projection pipeline bootstrapped").pipe(
-          Effect.annotateLogs({ projectors: projectors.length }),
+    const bootstrap: OrchestrationProjectionPipelineShape["bootstrap"] =
+      repairRejectedPendingTurnStarts.pipe(
+        Effect.andThen(
+          Effect.forEach(projectors, bootstrapProjector, {
+            concurrency: 1,
+          }),
         ),
-      ),
-      Effect.catchTag("SqlError", (sqlError) =>
-        Effect.fail(toPersistenceSqlError("ProjectionPipeline.bootstrap:query")(sqlError)),
-      ),
-    );
+        Effect.provideService(FileSystem.FileSystem, fileSystem),
+        Effect.provideService(Path.Path, path),
+        Effect.provideService(ServerConfig, serverConfig),
+        Effect.asVoid,
+        Effect.tap(() =>
+          Effect.logDebug("orchestration projection pipeline bootstrapped").pipe(
+            Effect.annotateLogs({ projectors: projectors.length }),
+          ),
+        ),
+        Effect.catchTag("SqlError", (sqlError) =>
+          Effect.fail(toPersistenceSqlError("ProjectionPipeline.bootstrap:query")(sqlError)),
+        ),
+      );
 
     return {
       bootstrap,

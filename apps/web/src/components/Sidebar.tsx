@@ -115,8 +115,14 @@ import { useComposerDraftStore } from "../composerDraftStore";
 import { useNewThreadHandler } from "../hooks/useHandleNewThread";
 import { useDesktopUpdateState } from "../state/desktopUpdate";
 import { isThreadSessionActive } from "../session-logic";
+import { fetchFreshArchivedThreadSnapshot } from "../lib/archivedThreadsState";
 
-import { useThreadActions } from "../hooks/useThreadActions";
+import {
+  buildOwnedWorktreesDeleteWarning,
+  buildThreadsDeleteConfirmationMessage,
+  ownedWorktreePathForThreadDelete,
+  useThreadActions,
+} from "../hooks/useThreadActions";
 import { projectEnvironment } from "../state/projects";
 import { useEnabledScheduleCount, useThreadScheduleSummary } from "../state/schedules";
 import { useEnvironmentQuery } from "../state/query";
@@ -899,7 +905,9 @@ export const SidebarThreadRow = memo(function SidebarThreadRow(props: SidebarThr
                   />
                 }
               >
-                <TerminalIcon className={`size-3 ${terminalStatus.pulse ? "animate-pulse" : ""}`} />
+                <TerminalIcon
+                  className={`size-3 ${terminalStatus.pulse ? "animate-status-pulse" : ""}`}
+                />
               </TooltipTrigger>
               <TooltipPopup side="top">{terminalStatus.label}</TooltipPopup>
             </Tooltip>
@@ -1632,6 +1640,76 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
       }
 
       const memberProjectRef = scopeProjectRef(member.environmentId, member.id);
+      const readCurrentProjectThreads = async () => {
+        const archivedSnapshot = await fetchFreshArchivedThreadSnapshot(member.environmentId);
+        if (archivedSnapshot === null) {
+          toastManager.add(
+            stackedThreadToast({
+              type: "warning",
+              title: "Project safety details are unavailable",
+              description: "Could not verify archived worktrees. Try deleting the project again.",
+            }),
+          );
+          return null;
+        }
+        const activeThreads = Array.from(sidebarThreadByKeyRef.current.values()).filter(
+          (thread) =>
+            thread.environmentId === memberProjectRef.environmentId &&
+            thread.projectId === memberProjectRef.projectId,
+        );
+        const archivedThreads = archivedSnapshot.threads
+          .filter((thread) => thread.projectId === member.id)
+          .map((thread) => ({ ...thread, environmentId: member.environmentId }));
+        return [...activeThreads, ...archivedThreads];
+      };
+      const projectThreadSafetyFingerprint = (
+        threads: NonNullable<Awaited<ReturnType<typeof readCurrentProjectThreads>>>,
+      ) =>
+        threads
+          .map(
+            (thread) =>
+              `${thread.environmentId}:${thread.id}:${ownedWorktreePathForThreadDelete(thread) ?? ""}`,
+          )
+          .toSorted()
+          .join("\n");
+      const confirmForcedProjectRemoval = async () => {
+        while (true) {
+          const projectThreads = await readCurrentProjectThreads();
+          if (projectThreads === null) {
+            return false;
+          }
+          const count = projectThreads.length;
+          const confirmedFingerprint = projectThreadSafetyFingerprint(projectThreads);
+          const confirmed = await api.dialogs.confirm(
+            [
+              count > 0
+                ? `Remove project "${member.title}" and delete its ${count} thread${count === 1 ? "" : "s"}?`
+                : `Remove project "${member.title}"?`,
+              `Path: ${member.workspaceRoot}`,
+              ...(member.environmentLabel ? [`Environment: ${member.environmentLabel}`] : []),
+              ...(count > 0
+                ? ["This permanently clears conversation history for those threads."]
+                : []),
+              ...buildOwnedWorktreesDeleteWarning(projectThreads),
+              "This removes only this project entry.",
+              "This action cannot be undone.",
+            ].join("\n"),
+          );
+          if (!confirmed) {
+            return false;
+          }
+          const refreshedThreads = await readCurrentProjectThreads();
+          if (
+            refreshedThreads !== null &&
+            projectThreadSafetyFingerprint(refreshedThreads) === confirmedFingerprint
+          ) {
+            return true;
+          }
+          if (refreshedThreads === null) {
+            return false;
+          }
+        }
+      };
       const memberThreadCount = memberThreadCountByPhysicalKey.get(member.physicalProjectKey) ?? 0;
       if (memberThreadCount > 0) {
         const warningToastId = toastManager.add(
@@ -1649,37 +1727,7 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
                     window.setTimeout(resolve, 180);
                   });
 
-                  const latestProjectThreads = Array.from(
-                    sidebarThreadByKeyRef.current.values(),
-                  ).filter(
-                    (thread) =>
-                      thread.environmentId === memberProjectRef.environmentId &&
-                      thread.projectId === memberProjectRef.projectId,
-                  );
-                  const confirmed = await api.dialogs.confirm(
-                    latestProjectThreads.length > 0
-                      ? [
-                          `Remove project "${member.title}" and delete its ${latestProjectThreads.length} thread${
-                            latestProjectThreads.length === 1 ? "" : "s"
-                          }?`,
-                          `Path: ${member.workspaceRoot}`,
-                          ...(member.environmentLabel
-                            ? [`Environment: ${member.environmentLabel}`]
-                            : []),
-                          "This permanently clears conversation history for those threads.",
-                          "This removes only this project entry.",
-                          "This action cannot be undone.",
-                        ].join("\n")
-                      : [
-                          `Remove project "${member.title}"?`,
-                          `Path: ${member.workspaceRoot}`,
-                          ...(member.environmentLabel
-                            ? [`Environment: ${member.environmentLabel}`]
-                            : []),
-                          "This removes only this project entry.",
-                        ].join("\n"),
-                  );
-                  if (!confirmed) {
+                  if (!(await confirmForcedProjectRemoval())) {
                     return;
                   }
 
@@ -1739,17 +1787,7 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
           // engine treats any non-deleted thread (incl. archived) as non-empty and
           // rejects delete without force. Re-prompt and retry with force=true so an
           // archived-only project can still be removed from the UI.
-          const forceConfirmed = await api.dialogs.confirm(
-            [
-              `Project "${member.title}" still has archived threads, so it isn't empty.`,
-              `Path: ${member.workspaceRoot}`,
-              ...(member.environmentLabel ? [`Environment: ${member.environmentLabel}`] : []),
-              "Delete the project and all of its threads, including archived ones?",
-              "This permanently clears their conversation history.",
-              "This action cannot be undone.",
-            ].join("\n"),
-          );
-          if (!forceConfirmed) {
+          if (!(await confirmForcedProjectRemoval())) {
             return;
           }
           const forced = await removeProject(member, { force: true });
@@ -1999,23 +2037,29 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
       if (clicked !== "delete") return;
 
       if (appSettingsConfirmThreadDelete) {
+        const selectedThreads = threadKeys.flatMap((threadKey) => {
+          const thread = sidebarThreadByKeyRef.current.get(threadKey);
+          return thread ? [thread] : [];
+        });
         const confirmed = await api.dialogs.confirm(
-          [
-            `Delete ${count} thread${count === 1 ? "" : "s"}?`,
-            "This permanently clears conversation history for these threads.",
-          ].join("\n"),
+          buildThreadsDeleteConfirmationMessage(selectedThreads),
         );
         if (!confirmed) return;
       }
 
       const deletedThreadKeys = new Set(threadKeys);
+      const completedThreadKeys: string[] = [];
       for (const threadKey of threadKeys) {
         const thread = sidebarThreadByKeyRef.current.get(threadKey);
         if (!thread) continue;
         const result = await deleteThread(scopeThreadRef(thread.environmentId, thread.id), {
           deletedThreadKeys,
+          ...(appSettingsConfirmThreadDelete
+            ? { confirmedOwnedWorktreePath: ownedWorktreePathForThreadDelete(thread) }
+            : {}),
         });
         if (result._tag === "Failure") {
+          removeFromSelection(completedThreadKeys);
           if (!isAtomCommandInterrupted(result)) {
             const error = squashAtomCommandFailure(result);
             toastManager.add(
@@ -2028,8 +2072,13 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
           }
           return;
         }
+        if (!result.value.deleted) {
+          removeFromSelection(completedThreadKeys);
+          return;
+        }
+        completedThreadKeys.push(threadKey);
       }
-      removeFromSelection(threadKeys);
+      removeFromSelection(completedThreadKeys);
     },
     [
       appSettingsConfirmThreadDelete,
@@ -2368,17 +2417,6 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
         return;
       }
       if (clicked !== "delete") return;
-      if (appSettingsConfirmThreadDelete) {
-        const confirmed = await api.dialogs.confirm(
-          [
-            `Delete thread "${thread.title}"?`,
-            "This permanently clears conversation history for this thread.",
-          ].join("\n"),
-        );
-        if (!confirmed) {
-          return;
-        }
-      }
       const result = await deleteThread(threadRef);
       if (result._tag === "Failure" && !isAtomCommandInterrupted(result)) {
         const error = squashAtomCommandFailure(result);
@@ -2392,7 +2430,6 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
       }
     },
     [
-      appSettingsConfirmThreadDelete,
       copyPathToClipboard,
       copyThreadIdToClipboard,
       deleteThread,
@@ -2433,7 +2470,7 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
                 <span className="absolute inset-0 flex items-center justify-center transition-opacity duration-150 group-hover/project-header:opacity-0">
                   <span
                     className={`size-[9px] rounded-full ${projectStatus.dotClass} ${
-                      projectStatus.pulse ? "animate-pulse" : ""
+                      projectStatus.pulse ? "animate-status-pulse" : ""
                     }`}
                   />
                 </span>
@@ -3421,8 +3458,9 @@ export default function Sidebar() {
     return buildPhysicalToLogicalProjectKeyMap({
       projects: orderedProjects,
       settings: projectGroupingSettings,
+      primaryEnvironmentId,
     });
-  }, [orderedProjects, projectGroupingSettings]);
+  }, [orderedProjects, projectGroupingSettings, primaryEnvironmentId]);
   const projectPhysicalKeyByScopedRef = useMemo(
     () =>
       new Map(

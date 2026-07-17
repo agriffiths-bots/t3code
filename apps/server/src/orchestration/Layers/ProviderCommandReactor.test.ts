@@ -37,7 +37,11 @@ import { afterEach, describe, expect, it, vi } from "vite-plus/test";
 
 import { deriveServerPaths, ServerConfig } from "../../config.ts";
 import { TextGenerationError } from "@t3tools/contracts";
-import { ProviderAdapterRequestError } from "../../provider/Errors.ts";
+import {
+  ProviderAdapterRequestError,
+  ProviderSendTurnFailedError,
+  ProviderSessionStartTimeoutError,
+} from "../../provider/Errors.ts";
 import { OrchestrationEventStoreLive } from "../../persistence/Layers/OrchestrationEventStore.ts";
 import { OrchestrationCommandReceiptRepositoryLive } from "../../persistence/Layers/OrchestrationCommandReceipts.ts";
 import { SqlitePersistenceMemory } from "../../persistence/Layers/Sqlite.ts";
@@ -58,6 +62,7 @@ import {
 } from "./ProviderCommandReactor.ts";
 import { OrchestrationEngineService } from "../Services/OrchestrationEngine.ts";
 import { ProviderCommandReactor } from "../Services/ProviderCommandReactor.ts";
+import { WorktreeLifecycleCoordinatorLive } from "../Services/WorktreeLifecycleCoordinator.ts";
 import { ProjectionSnapshotQuery } from "../Services/ProjectionSnapshotQuery.ts";
 import { readDetailedReadModel } from "../testUtils/readModel.ts";
 import * as NodeServices from "@effect/platform-node/NodeServices";
@@ -151,6 +156,7 @@ describe("ProviderCommandReactor", () => {
     readonly threadModelSelection?: ModelSelection;
     readonly sessionModelSwitch?: "unsupported" | "in-session";
     readonly requiresNewThreadForModelChange?: boolean;
+    readonly stopFailedSessionImplementation?: ProviderServiceShape["stopFailedSession"];
   }) {
     const now = "2026-01-01T00:00:00.000Z";
     const baseDir =
@@ -305,6 +311,36 @@ describe("ProviderCommandReactor", () => {
     ];
 
     const unsupported = () => Effect.die(new Error("Unsupported provider call in test")) as never;
+    const stopFailedSessionCalls: Array<{
+      readonly threadId: ThreadId;
+      readonly turnId: TurnId;
+      readonly reason: string;
+      readonly sessionOwnershipId?: string;
+      readonly requireSessionAbsent?: boolean;
+    }> = [];
+    const stopFailedSession: ProviderServiceShape["stopFailedSession"] = (request) => {
+      stopFailedSessionCalls.push({
+        threadId: request.threadId,
+        turnId: request.turnId,
+        reason: request.reason,
+        ...(request.sessionOwnershipId !== undefined
+          ? { sessionOwnershipId: request.sessionOwnershipId }
+          : {}),
+        ...(request.requireSessionAbsent !== undefined
+          ? { requireSessionAbsent: request.requireSessionAbsent }
+          : {}),
+      });
+      if (input?.stopFailedSessionImplementation) {
+        return input.stopFailedSessionImplementation(request);
+      }
+      return Effect.gen(function* () {
+        yield* request.onOwned;
+        yield* stopSession({ threadId: request.threadId });
+        yield* request.onStopped;
+        return true;
+      });
+    };
+    const listSessions = vi.fn(() => Effect.succeed(runtimeSessions));
     const service: ProviderServiceShape = {
       startSession: startSession as ProviderServiceShape["startSession"],
       sendTurn: sendTurn as ProviderServiceShape["sendTurn"],
@@ -312,7 +348,8 @@ describe("ProviderCommandReactor", () => {
       respondToRequest: respondToRequest as ProviderServiceShape["respondToRequest"],
       respondToUserInput: respondToUserInput as ProviderServiceShape["respondToUserInput"],
       stopSession: stopSession as ProviderServiceShape["stopSession"],
-      listSessions: () => Effect.succeed(runtimeSessions),
+      stopFailedSession,
+      listSessions,
       getCapabilities: (_provider) =>
         Effect.succeed({
           sessionModelSwitch: input?.sessionModelSwitch ?? "in-session",
@@ -428,6 +465,9 @@ describe("ProviderCommandReactor", () => {
       respondToRequest,
       respondToUserInput,
       stopSession,
+      stopFailedSession,
+      stopFailedSessionCalls,
+      listSessions,
       renameBranch,
       refreshStatus,
       generateBranchName,
@@ -477,6 +517,52 @@ describe("ProviderCommandReactor", () => {
     expect(thread?.session?.runtimeMode).toBe("approval-required");
   });
 
+  it.each([
+    { driver: "codex", instanceId: "codex", model: "gpt-5-codex" },
+    { driver: "grok", instanceId: "grok", model: "grok-code-fast-1" },
+    {
+      driver: "claudeAgent",
+      instanceId: "claudeAgent",
+      model: "claude-opus-4-6",
+    },
+  ] as const)(
+    "passes the detached session hint to the $driver provider",
+    async ({ driver, instanceId, model }) => {
+      const modelSelection = {
+        instanceId: ProviderInstanceId.make(instanceId),
+        model,
+      };
+      const harness = await createHarness({ threadModelSelection: modelSelection });
+      const now = "2026-01-01T00:00:00.000Z";
+
+      await runtime!.runPromise(
+        harness.engine.dispatch({
+          type: "thread.turn.start",
+          commandId: CommandId.make(`cmd-detached-${driver}`),
+          threadId: ThreadId.make("thread-1"),
+          message: {
+            messageId: asMessageId(`user-message-detached-${driver}`),
+            role: "user",
+            text: `run detached with ${driver}`,
+            attachments: [],
+          },
+          interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+          runtimeMode: "approval-required",
+          providerSessionDetached: true,
+          createdAt: now,
+        }),
+      );
+
+      await waitFor(() => harness.startSession.mock.calls.length === 1);
+      await waitFor(() => harness.sendTurn.mock.calls.length === 1);
+      expect(harness.startSession.mock.calls[0]?.[1]).toMatchObject({
+        provider: driver,
+        providerInstanceId: instanceId,
+        detached: true,
+      });
+    },
+  );
+
   it("does not start a provider session for an archived thread", async () => {
     const harness = await createHarness();
     const now = "2026-01-01T00:00:00.000Z";
@@ -513,7 +599,7 @@ describe("ProviderCommandReactor", () => {
     expect(harness.sendTurn).not.toHaveBeenCalled();
   });
 
-  it("records a visible cancellation when archive wins a queued turn start", async () => {
+  it("serializes archive behind provider activation that already owns the lifecycle permit", async () => {
     const harness = await createHarness();
     const now = "2026-01-01T00:00:00.000Z";
     const releaseStartSession = Effect.runSync(Deferred.make<void>());
@@ -545,34 +631,28 @@ describe("ProviderCommandReactor", () => {
     );
     await waitFor(() => harness.startSession.mock.calls.length === 1);
 
-    await runtime!.runPromise(
-      harness.engine.dispatch({
-        type: "thread.archive",
-        commandId: CommandId.make("cmd-archive-queued-turn"),
-        threadId: ThreadId.make("thread-1"),
-      }),
-    );
+    let archiveResolved = false;
+    const archivePromise = runtime!
+      .runPromise(
+        harness.engine.dispatch({
+          type: "thread.archive",
+          commandId: CommandId.make("cmd-archive-queued-turn"),
+          threadId: ThreadId.make("thread-1"),
+        }),
+      )
+      .then((result) => {
+        archiveResolved = true;
+        return result;
+      });
+    await Effect.runPromise(Effect.sleep("50 millis"));
+    expect(archiveResolved).toBe(false);
     await Effect.runPromise(Deferred.succeed(releaseStartSession, undefined));
-
-    await waitFor(async () => {
-      const readModel = await harness.readModel();
-      const thread = readModel.threads.find((entry) => entry.id === ThreadId.make("thread-1"));
-      return (
-        thread?.activities.some(
-          (activity) =>
-            activity.kind === "provider.turn.start.failed" &&
-            typeof activity.payload === "object" &&
-            activity.payload !== null &&
-            "detail" in activity.payload &&
-            String(activity.payload.detail).includes("archived before the queued provider turn"),
-        ) === true
-      );
-    });
+    await archivePromise;
     await harness.drain();
 
-    expect(harness.sendTurn).not.toHaveBeenCalled();
-    expect(harness.stopSession).toHaveBeenCalledTimes(1);
-    expect(harness.runtimeSessions).toHaveLength(0);
+    expect(harness.sendTurn).toHaveBeenCalledTimes(1);
+    expect(harness.stopSession).not.toHaveBeenCalled();
+    expect(harness.runtimeSessions).toHaveLength(1);
     const readModel = await harness.readModel();
     const thread = readModel.threads.find((entry) => entry.id === ThreadId.make("thread-1"));
     expect(thread?.archivedAt).not.toBeNull();
@@ -611,6 +691,7 @@ describe("ProviderCommandReactor", () => {
       respondToRequest: () => Effect.die("respondToRequest should not be called") as never,
       respondToUserInput: () => Effect.die("respondToUserInput should not be called") as never,
       stopSession,
+      stopFailedSession: () => Effect.die("stopFailedSession should not be called") as never,
       listSessions: () => Effect.succeed([]),
       getCapabilities: () => Effect.succeed({ sessionModelSwitch: "in-session" }),
       getInstanceInfo: (instanceId) =>
@@ -663,6 +744,7 @@ describe("ProviderCommandReactor", () => {
     };
 
     const layer = ProviderCommandReactorLive.pipe(
+      Layer.provideMerge(WorktreeLifecycleCoordinatorLive),
       Layer.provideMerge(Layer.succeed(OrchestrationEngineService, engine)),
       Layer.provideMerge(
         Layer.mock(ProjectionSnapshotQuery)({
@@ -840,8 +922,8 @@ describe("ProviderCommandReactor", () => {
       runtimeMode: "approval-required",
       activeTurnId: null,
       lastError: expect.stringContaining("simulated first start failure"),
-      updatedAt: now,
     });
+    expect(thread?.session?.updatedAt).not.toBe(now);
     expect(
       thread?.activities.find((activity) => activity.kind === "provider.turn.start.failed"),
     ).toMatchObject({
@@ -849,6 +931,110 @@ describe("ProviderCommandReactor", () => {
         detail: expect.stringContaining("simulated first start failure"),
       },
     });
+  });
+
+  it("fails and releases the turn through stopFailedSession when provider startup times out", async () => {
+    const harness = await createHarness();
+    const now = "2026-01-01T00:00:00.000Z";
+
+    await runtime!.runPromise(
+      harness.engine.dispatch({
+        type: "thread.runtime-mode.set",
+        commandId: CommandId.make("cmd-runtime-before-provider-startup-timeout"),
+        threadId: ThreadId.make("thread-1"),
+        runtimeMode: "full-access",
+        createdAt: now,
+      }),
+    );
+    await runtime!.runPromise(
+      harness.engine.dispatch({
+        type: "thread.turn.start",
+        commandId: CommandId.make("cmd-turn-start-before-provider-startup-timeout"),
+        threadId: ThreadId.make("thread-1"),
+        message: {
+          messageId: asMessageId("user-message-before-provider-startup-timeout"),
+          role: "user",
+          text: "establish the provider session",
+          attachments: [],
+        },
+        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+        runtimeMode: "full-access",
+        createdAt: now,
+      }),
+    );
+    await waitFor(() => harness.sendTurn.mock.calls.length === 1);
+
+    const activeTurnId = asTurnId("turn-1");
+    const activeSession = harness.runtimeSessions[0];
+    expect(activeSession).toBeDefined();
+    harness.runtimeSessions[0] = {
+      ...activeSession!,
+      status: "running",
+      activeTurnId,
+    };
+    await runtime!.runPromise(
+      harness.engine.dispatch({
+        type: "thread.session.set",
+        commandId: CommandId.make("cmd-session-running-before-provider-startup-timeout"),
+        threadId: ThreadId.make("thread-1"),
+        session: {
+          threadId: ThreadId.make("thread-1"),
+          status: "running",
+          providerName: "codex",
+          providerInstanceId: ProviderInstanceId.make("codex"),
+          runtimeMode: "full-access",
+          activeTurnId,
+          lastError: null,
+          updatedAt: now,
+        },
+        createdAt: now,
+      }),
+    );
+
+    harness.startSession.mockImplementationOnce(
+      (_: unknown, __: unknown) =>
+        Effect.fail(
+          new ProviderSessionStartTimeoutError({
+            provider: "codex",
+            threadId: "thread-1",
+            detail: "Provider startup timed out after 50ms.",
+            timeoutMs: 50,
+            sessionOwnershipId: "owner-provider-startup-timeout",
+          }),
+        ) as never,
+    );
+
+    await runtime!.runPromise(
+      harness.engine.dispatch({
+        type: "thread.runtime-mode.set",
+        commandId: CommandId.make("cmd-runtime-provider-startup-timeout"),
+        threadId: ThreadId.make("thread-1"),
+        runtimeMode: "approval-required",
+        createdAt: now,
+      }),
+    );
+
+    await waitFor(async () => {
+      const thread = (await harness.readModel()).threads.find(
+        (entry) => entry.id === ThreadId.make("thread-1"),
+      );
+      return thread?.latestTurn?.state === "error" && thread.session?.status === "stopped";
+    });
+    const thread = (await harness.readModel()).threads.find(
+      (entry) => entry.id === ThreadId.make("thread-1"),
+    );
+    expect(thread?.latestTurn).toMatchObject({ state: "error" });
+    expect(thread?.session).toMatchObject({
+      status: "stopped",
+      activeTurnId: null,
+      lastError: expect.stringContaining("Provider startup timed out"),
+    });
+    expect(harness.stopFailedSessionCalls).toEqual([
+      expect.objectContaining({
+        sessionOwnershipId: "owner-provider-startup-timeout",
+      }),
+    ]);
+    expect(harness.stopSession).toHaveBeenCalledWith({ threadId: ThreadId.make("thread-1") });
   });
 
   it("records the driver kind separately from custom provider instance ids on first-start failure", async () => {
@@ -1091,7 +1277,6 @@ describe("ProviderCommandReactor", () => {
         createdAt: now,
       }),
     );
-
     await runtime!.runPromise(
       harness.engine.dispatch({
         type: "thread.session.stop",
@@ -2870,6 +3055,17 @@ describe("ProviderCommandReactor", () => {
         createdAt: now,
       }),
     );
+    harness.runtimeSessions.push({
+      provider: ProviderDriverKind.make("codex"),
+      providerInstanceId: ProviderInstanceId.make("codex"),
+      status: "running",
+      runtimeMode: "approval-required",
+      threadId: ThreadId.make("thread-1"),
+      activeTurnId: asTurnId("turn-1"),
+      resumeCursor: { opaque: "resume-alive-interrupt" },
+      createdAt: now,
+      updatedAt: now,
+    });
 
     await runtime!.runPromise(
       harness.engine.dispatch({
@@ -2885,6 +3081,877 @@ describe("ProviderCommandReactor", () => {
     expect(harness.interruptTurn.mock.calls[0]?.[0]).toEqual({
       threadId: "thread-1",
     });
+  });
+
+  it("fails the turn and frees the session when session/prompt fails after the turn starts", async () => {
+    const harness = await createHarness();
+    const now = "2026-01-01T00:00:00.000Z";
+    const turnId = asTurnId("turn-prompt-failure");
+    harness.sendTurn.mockImplementationOnce(
+      () =>
+        Effect.gen(function* () {
+          const session = harness.runtimeSessions[0];
+          if (session === undefined) {
+            return yield* Effect.die("expected provider session");
+          }
+          harness.runtimeSessions[0] = {
+            ...session,
+            status: "running",
+            activeTurnId: turnId,
+            updatedAt: now,
+          };
+          yield* harness.engine.dispatch({
+            type: "thread.session.set",
+            commandId: CommandId.make("cmd-prompt-failure-running"),
+            threadId: ThreadId.make("thread-1"),
+            session: {
+              threadId: ThreadId.make("thread-1"),
+              status: "running",
+              providerName: "codex",
+              providerInstanceId: ProviderInstanceId.make("codex"),
+              runtimeMode: "approval-required",
+              activeTurnId: turnId,
+              lastError: null,
+              updatedAt: now,
+            },
+            createdAt: now,
+          });
+          return yield* new ProviderAdapterRequestError({
+            provider: "codex",
+            method: "session/prompt",
+            detail: "simulated session/prompt failure",
+          });
+        }) as never,
+    );
+
+    await runtime!.runPromise(
+      harness.engine.dispatch({
+        type: "thread.turn.start",
+        commandId: CommandId.make("cmd-turn-start-prompt-failure"),
+        threadId: ThreadId.make("thread-1"),
+        message: {
+          messageId: asMessageId("user-message-prompt-failure"),
+          role: "user",
+          text: "trigger prompt failure",
+          attachments: [],
+        },
+        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+        runtimeMode: "approval-required",
+        createdAt: now,
+      }),
+    );
+
+    await waitFor(async () => {
+      const thread = (await harness.readModel()).threads.find(
+        (entry) => entry.id === ThreadId.make("thread-1"),
+      );
+      return thread?.latestTurn?.state === "error";
+    });
+
+    const thread = (await harness.readModel()).threads.find(
+      (entry) => entry.id === ThreadId.make("thread-1"),
+    );
+    expect(thread?.latestTurn).toMatchObject({ turnId, state: "error" });
+    expect(thread?.session).toMatchObject({
+      status: "stopped",
+      activeTurnId: null,
+      lastError: expect.stringContaining("simulated session/prompt failure"),
+    });
+    expect(harness.stopSession).toHaveBeenCalledWith({ threadId: ThreadId.make("thread-1") });
+    expect(harness.runtimeSessions).toHaveLength(0);
+  });
+
+  it("does not attribute a pre-start prompt failure to the previous completed turn", async () => {
+    const harness = await createHarness();
+    const startedAt = "2026-01-01T00:00:00.000Z";
+    const completedAt = "2026-01-01T00:00:01.000Z";
+    const previousTurnId = asTurnId("turn-completed-before-prompt-failure");
+
+    await runtime!.runPromise(
+      harness.engine.dispatch({
+        type: "thread.session.set",
+        commandId: CommandId.make("cmd-previous-turn-running-before-prompt-failure"),
+        threadId: ThreadId.make("thread-1"),
+        session: {
+          threadId: ThreadId.make("thread-1"),
+          status: "running",
+          providerName: "codex",
+          providerInstanceId: ProviderInstanceId.make("codex"),
+          runtimeMode: "approval-required",
+          activeTurnId: previousTurnId,
+          lastError: null,
+          updatedAt: startedAt,
+        },
+        createdAt: startedAt,
+      }),
+    );
+    await runtime!.runPromise(
+      harness.engine.dispatch({
+        type: "thread.session.set",
+        commandId: CommandId.make("cmd-previous-turn-completed-before-prompt-failure"),
+        threadId: ThreadId.make("thread-1"),
+        session: {
+          threadId: ThreadId.make("thread-1"),
+          status: "ready",
+          providerName: "codex",
+          providerInstanceId: ProviderInstanceId.make("codex"),
+          runtimeMode: "approval-required",
+          activeTurnId: null,
+          lastError: null,
+          updatedAt: completedAt,
+        },
+        createdAt: completedAt,
+      }),
+    );
+    harness.runtimeSessions.push({
+      provider: ProviderDriverKind.make("codex"),
+      providerInstanceId: ProviderInstanceId.make("codex"),
+      status: "ready",
+      runtimeMode: "approval-required",
+      threadId: ThreadId.make("thread-1"),
+      resumeCursor: { opaque: "resume-after-completed-turn" },
+      createdAt: startedAt,
+      updatedAt: completedAt,
+    });
+    harness.sendTurn.mockImplementationOnce(
+      () =>
+        Effect.fail(
+          new ProviderSendTurnFailedError({
+            provider: "codex",
+            threadId: ThreadId.make("thread-1"),
+            detail: "session/prompt rejected before turn.started",
+            sessionOwnershipId: "pre-start-prompt-failure-owner",
+            superseded: false,
+          }),
+        ) as never,
+    );
+
+    await runtime!.runPromise(
+      harness.engine.dispatch({
+        type: "thread.turn.start",
+        commandId: CommandId.make("cmd-pre-start-prompt-failure-after-completed-turn"),
+        threadId: ThreadId.make("thread-1"),
+        message: {
+          messageId: asMessageId("user-message-pre-start-prompt-failure"),
+          role: "user",
+          text: "fail before provider turn starts",
+          attachments: [],
+        },
+        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+        runtimeMode: "approval-required",
+        createdAt: completedAt,
+      }),
+    );
+
+    await waitFor(async () => {
+      const thread = (await harness.readModel()).threads.find(
+        (entry) => entry.id === ThreadId.make("thread-1"),
+      );
+      return thread?.session?.lastError === "session/prompt rejected before turn.started";
+    });
+    const thread = (await harness.readModel()).threads.find(
+      (entry) => entry.id === ThreadId.make("thread-1"),
+    );
+    expect(thread?.latestTurn).toMatchObject({ turnId: previousTurnId, state: "completed" });
+    expect(thread?.session).toMatchObject({
+      status: "ready",
+      activeTurnId: null,
+      lastError: "session/prompt rejected before turn.started",
+    });
+    expect(harness.stopFailedSessionCalls).toHaveLength(0);
+    expect(
+      thread?.activities.find((activity) => activity.kind === "provider.turn.start.failed"),
+    ).toMatchObject({ turnId: null });
+  });
+
+  it("ignores a delayed sendTurn failure after its session owner was replaced", async () => {
+    const harness = await createHarness();
+    const now = "2026-01-01T00:00:00.000Z";
+    const replacementTurnId = asTurnId("turn-replacement-after-old-prompt");
+    harness.sendTurn.mockImplementationOnce(
+      () =>
+        Effect.gen(function* () {
+          yield* harness.engine.dispatch({
+            type: "thread.session.set",
+            commandId: CommandId.make("cmd-replacement-running-before-old-prompt-failure"),
+            threadId: ThreadId.make("thread-1"),
+            session: {
+              threadId: ThreadId.make("thread-1"),
+              status: "running",
+              providerName: "codex",
+              providerInstanceId: ProviderInstanceId.make("codex"),
+              runtimeMode: "approval-required",
+              activeTurnId: replacementTurnId,
+              lastError: null,
+              updatedAt: now,
+            },
+            createdAt: now,
+          });
+          return yield* new ProviderSendTurnFailedError({
+            provider: "codex",
+            threadId: ThreadId.make("thread-1"),
+            detail: "old prompt rejected after replacement",
+            sessionOwnershipId: "old-session-owner",
+            superseded: true,
+          });
+        }) as never,
+    );
+
+    await runtime!.runPromise(
+      harness.engine.dispatch({
+        type: "thread.turn.start",
+        commandId: CommandId.make("cmd-old-turn-start-before-replacement"),
+        threadId: ThreadId.make("thread-1"),
+        message: {
+          messageId: asMessageId("user-message-old-turn-before-replacement"),
+          role: "user",
+          text: "old prompt",
+          attachments: [],
+        },
+        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+        runtimeMode: "approval-required",
+        createdAt: now,
+      }),
+    );
+
+    await waitFor(() => harness.sendTurn.mock.calls.length === 1);
+    await harness.drain();
+    const thread = (await harness.readModel()).threads.find(
+      (entry) => entry.id === ThreadId.make("thread-1"),
+    );
+    expect(thread?.session).toMatchObject({
+      status: "running",
+      activeTurnId: replacementTurnId,
+      lastError: null,
+    });
+    expect(harness.stopFailedSessionCalls).toHaveLength(0);
+    expect(
+      thread?.activities.some((activity) => activity.kind === "provider.turn.start.failed"),
+    ).toBe(false);
+  });
+
+  it("records an overlapping prompt rejection without stopping the first turn", async () => {
+    const harness = await createHarness();
+    const now = "2026-01-01T00:00:00.000Z";
+    const firstTurnId = asTurnId("turn-running-before-overlapping-prompt");
+    await runtime!.runPromise(
+      harness.engine.dispatch({
+        type: "thread.session.set",
+        commandId: CommandId.make("cmd-first-turn-running-before-overlap"),
+        threadId: ThreadId.make("thread-1"),
+        session: {
+          threadId: ThreadId.make("thread-1"),
+          status: "running",
+          providerName: "codex",
+          providerInstanceId: ProviderInstanceId.make("codex"),
+          runtimeMode: "approval-required",
+          activeTurnId: firstTurnId,
+          lastError: null,
+          updatedAt: now,
+        },
+        createdAt: now,
+      }),
+    );
+    harness.runtimeSessions.push({
+      provider: ProviderDriverKind.make("codex"),
+      providerInstanceId: ProviderInstanceId.make("codex"),
+      status: "running",
+      runtimeMode: "approval-required",
+      threadId: ThreadId.make("thread-1"),
+      activeTurnId: firstTurnId,
+      resumeCursor: { opaque: "resume-first-overlapping-turn" },
+      createdAt: now,
+      updatedAt: now,
+    });
+    harness.sendTurn.mockImplementationOnce(
+      () =>
+        Effect.fail(
+          new ProviderSendTurnFailedError({
+            provider: "codex",
+            threadId: ThreadId.make("thread-1"),
+            detail: "Another session/prompt request is already in flight for this thread.",
+            sessionOwnershipId: "first-overlapping-prompt-owner",
+            superseded: true,
+            overlapping: true,
+          }),
+        ) as never,
+    );
+
+    await runtime!.runPromise(
+      harness.engine.dispatch({
+        type: "thread.turn.start",
+        commandId: CommandId.make("cmd-overlapping-turn-start"),
+        threadId: ThreadId.make("thread-1"),
+        message: {
+          messageId: asMessageId("user-message-overlapping-turn-start"),
+          role: "user",
+          text: "overlapping prompt",
+          attachments: [],
+        },
+        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+        runtimeMode: "approval-required",
+        createdAt: now,
+      }),
+    );
+
+    await waitFor(async () => {
+      const thread = (await harness.readModel()).threads.find(
+        (entry) => entry.id === ThreadId.make("thread-1"),
+      );
+      return (
+        thread?.activities.some((activity) => activity.kind === "provider.turn.start.failed") ??
+        false
+      );
+    });
+    const thread = (await harness.readModel()).threads.find(
+      (entry) => entry.id === ThreadId.make("thread-1"),
+    );
+    expect(thread?.latestTurn).toMatchObject({ turnId: firstTurnId, state: "running" });
+    expect(thread?.session).toMatchObject({ status: "running", activeTurnId: firstTurnId });
+    expect(harness.stopFailedSessionCalls).toHaveLength(0);
+    expect(
+      thread?.activities.find((activity) => activity.kind === "provider.turn.start.failed"),
+    ).toMatchObject({
+      turnId: null,
+      payload: {
+        detail: expect.stringContaining("already in flight"),
+        turnStartMessageId: "user-message-overlapping-turn-start",
+      },
+    });
+  });
+
+  it("does not attribute the next provider turn to a rejected prompt", async () => {
+    const harness = await createHarness();
+    const rejectedAt = "2026-01-01T00:00:00.000Z";
+    const acceptedAt = "2026-01-01T00:00:01.000Z";
+    const rejectedMessageId = asMessageId("user-message-rejected-before-start");
+    const acceptedMessageId = asMessageId("user-message-accepted-after-rejection");
+    const acceptedTurnId = asTurnId("turn-accepted-after-rejection");
+    harness.sendTurn.mockImplementationOnce(
+      () =>
+        Effect.fail(
+          new ProviderSendTurnFailedError({
+            provider: "codex",
+            threadId: ThreadId.make("thread-1"),
+            detail: "Another session/prompt request is already in flight for this thread.",
+            sessionOwnershipId: "rejected-prompt-owner",
+            superseded: true,
+            overlapping: true,
+          }),
+        ) as never,
+    );
+
+    await runtime!.runPromise(
+      harness.engine.dispatch({
+        type: "thread.turn.start",
+        commandId: CommandId.make("cmd-rejected-before-start"),
+        threadId: ThreadId.make("thread-1"),
+        message: {
+          messageId: rejectedMessageId,
+          role: "user",
+          text: "rejected prompt",
+          attachments: [],
+        },
+        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+        runtimeMode: "approval-required",
+        createdAt: rejectedAt,
+      }),
+    );
+    await waitFor(async () => {
+      const thread = (await harness.readModel()).threads.find(
+        (entry) => entry.id === ThreadId.make("thread-1"),
+      );
+      return (
+        thread?.activities.some((activity) => activity.kind === "provider.turn.start.failed") ??
+        false
+      );
+    });
+
+    await runtime!.runPromise(
+      harness.engine.dispatch({
+        type: "thread.turn.start",
+        commandId: CommandId.make("cmd-accepted-after-rejection"),
+        threadId: ThreadId.make("thread-1"),
+        message: {
+          messageId: acceptedMessageId,
+          role: "user",
+          text: "accepted prompt",
+          attachments: [],
+        },
+        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+        runtimeMode: "approval-required",
+        createdAt: acceptedAt,
+      }),
+    );
+    await waitFor(() => harness.sendTurn.mock.calls.length === 2);
+    await runtime!.runPromise(
+      harness.engine.dispatch({
+        type: "thread.session.set",
+        commandId: CommandId.make("cmd-session-accepted-after-rejection"),
+        threadId: ThreadId.make("thread-1"),
+        session: {
+          threadId: ThreadId.make("thread-1"),
+          status: "running",
+          providerName: "codex",
+          providerInstanceId: ProviderInstanceId.make("codex"),
+          runtimeMode: "approval-required",
+          activeTurnId: acceptedTurnId,
+          lastError: null,
+          updatedAt: acceptedAt,
+        },
+        createdAt: acceptedAt,
+      }),
+    );
+
+    const thread = (await harness.readModel()).threads.find(
+      (entry) => entry.id === ThreadId.make("thread-1"),
+    );
+    expect(thread?.messages.find((message) => message.id === rejectedMessageId)?.turnId).toBeNull();
+    expect(thread?.messages.find((message) => message.id === acceptedMessageId)?.turnId).toBe(
+      acceptedTurnId,
+    );
+    expect(thread?.latestTurn).toMatchObject({
+      turnId: acceptedTurnId,
+      requestedAt: acceptedAt,
+    });
+  });
+
+  it("records a failed steer without stopping the pre-existing active turn", async () => {
+    const harness = await createHarness();
+    const now = "2026-01-01T00:00:00.000Z";
+    const activeTurnId = asTurnId("turn-running-before-failed-steer");
+    await runtime!.runPromise(
+      harness.engine.dispatch({
+        type: "thread.session.set",
+        commandId: CommandId.make("cmd-active-turn-before-failed-steer"),
+        threadId: ThreadId.make("thread-1"),
+        session: {
+          threadId: ThreadId.make("thread-1"),
+          status: "running",
+          providerName: "codex",
+          providerInstanceId: ProviderInstanceId.make("codex"),
+          runtimeMode: "approval-required",
+          activeTurnId,
+          lastError: null,
+          updatedAt: now,
+        },
+        createdAt: now,
+      }),
+    );
+    harness.runtimeSessions.push({
+      provider: ProviderDriverKind.make("codex"),
+      providerInstanceId: ProviderInstanceId.make("codex"),
+      status: "running",
+      runtimeMode: "approval-required",
+      threadId: ThreadId.make("thread-1"),
+      activeTurnId,
+      resumeCursor: { opaque: "resume-active-turn-before-failed-steer" },
+      createdAt: now,
+      updatedAt: now,
+    });
+    harness.sendTurn.mockImplementationOnce(
+      () =>
+        Effect.fail(
+          new ProviderSendTurnFailedError({
+            provider: "codex",
+            threadId: ThreadId.make("thread-1"),
+            detail: "steer rejected before turn.started",
+            sessionOwnershipId: "failed-steer-session-owner",
+            sendTurnOperationId: "failed-steer-operation",
+            preservedActiveTurnId: activeTurnId,
+            superseded: false,
+          }),
+        ) as never,
+    );
+
+    await runtime!.runPromise(
+      harness.engine.dispatch({
+        type: "thread.turn.start",
+        commandId: CommandId.make("cmd-failed-steer"),
+        threadId: ThreadId.make("thread-1"),
+        message: {
+          messageId: asMessageId("user-message-failed-steer"),
+          role: "user",
+          text: "steer the active turn",
+          attachments: [],
+        },
+        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+        runtimeMode: "approval-required",
+        createdAt: now,
+      }),
+    );
+
+    await waitFor(async () => {
+      const thread = (await harness.readModel()).threads.find(
+        (entry) => entry.id === ThreadId.make("thread-1"),
+      );
+      return (
+        thread?.activities.some((activity) => activity.kind === "provider.turn.start.failed") ??
+        false
+      );
+    });
+    const thread = (await harness.readModel()).threads.find(
+      (entry) => entry.id === ThreadId.make("thread-1"),
+    );
+    expect(thread?.latestTurn).toMatchObject({ turnId: activeTurnId, state: "running" });
+    expect(thread?.session).toMatchObject({
+      status: "running",
+      activeTurnId,
+      lastError: null,
+    });
+    expect(harness.stopFailedSessionCalls).toHaveLength(0);
+    expect(harness.stopSession).not.toHaveBeenCalled();
+    expect(
+      thread?.activities.find((activity) => activity.kind === "provider.turn.start.failed"),
+    ).toMatchObject({
+      turnId: null,
+      payload: {
+        detail: "steer rejected before turn.started",
+        turnStartRequestId: expect.any(String),
+      },
+    });
+  });
+
+  it("keeps failed cleanup visible and replaces the session on the next turn", async () => {
+    const harness = await createHarness();
+    const now = "2026-01-01T00:00:00.000Z";
+    const failedTurnId = asTurnId("turn-prompt-cleanup-failure");
+    harness.sendTurn.mockImplementationOnce(
+      () =>
+        Effect.gen(function* () {
+          const session = harness.runtimeSessions[0];
+          if (session === undefined) {
+            return yield* Effect.die("expected provider session");
+          }
+          harness.runtimeSessions[0] = {
+            ...session,
+            status: "running",
+            activeTurnId: failedTurnId,
+            updatedAt: now,
+          };
+          yield* harness.engine.dispatch({
+            type: "thread.session.set",
+            commandId: CommandId.make("cmd-prompt-cleanup-failure-running"),
+            threadId: ThreadId.make("thread-1"),
+            session: {
+              threadId: ThreadId.make("thread-1"),
+              status: "running",
+              providerName: "codex",
+              providerInstanceId: ProviderInstanceId.make("codex"),
+              runtimeMode: "approval-required",
+              activeTurnId: failedTurnId,
+              lastError: null,
+              updatedAt: now,
+            },
+            createdAt: now,
+          });
+          return yield* new ProviderAdapterRequestError({
+            provider: "codex",
+            method: "session/prompt",
+            detail: "simulated prompt and cleanup failure",
+          });
+        }) as never,
+    );
+    harness.stopSession.mockImplementationOnce(
+      () =>
+        Effect.fail(
+          new ProviderAdapterRequestError({
+            provider: "codex",
+            method: "session/stop",
+            detail: "simulated cleanup failure",
+          }),
+        ) as never,
+    );
+
+    await runtime!.runPromise(
+      harness.engine.dispatch({
+        type: "thread.turn.start",
+        commandId: CommandId.make("cmd-turn-start-prompt-cleanup-failure"),
+        threadId: ThreadId.make("thread-1"),
+        message: {
+          messageId: asMessageId("user-message-prompt-cleanup-failure"),
+          role: "user",
+          text: "trigger prompt and cleanup failure",
+          attachments: [],
+        },
+        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+        runtimeMode: "approval-required",
+        createdAt: now,
+      }),
+    );
+
+    await waitFor(async () => {
+      const thread = (await harness.readModel()).threads.find(
+        (entry) => entry.id === ThreadId.make("thread-1"),
+      );
+      return thread?.latestTurn?.state === "error";
+    });
+
+    const failedThread = (await harness.readModel()).threads.find(
+      (entry) => entry.id === ThreadId.make("thread-1"),
+    );
+    expect(failedThread?.latestTurn).toMatchObject({ turnId: failedTurnId, state: "error" });
+    expect(failedThread?.session).toMatchObject({
+      status: "error",
+      activeTurnId: null,
+      lastError: expect.stringContaining("simulated prompt and cleanup failure"),
+    });
+    expect(harness.runtimeSessions).toHaveLength(1);
+
+    await runtime!.runPromise(
+      harness.engine.dispatch({
+        type: "thread.turn.start",
+        commandId: CommandId.make("cmd-turn-start-after-cleanup-failure"),
+        threadId: ThreadId.make("thread-1"),
+        message: {
+          messageId: asMessageId("user-message-after-cleanup-failure"),
+          role: "user",
+          text: "start with a replacement session",
+          attachments: [],
+        },
+        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+        runtimeMode: "approval-required",
+        createdAt: now,
+      }),
+    );
+
+    await waitFor(() => harness.startSession.mock.calls.length === 2);
+    expect(harness.startSession.mock.calls[1]?.[0]).toBe(ThreadId.make("thread-1"));
+  });
+
+  it("force-fails a running turn when interrupt finds its provider session dead", async () => {
+    const harness = await createHarness();
+    const now = "2026-01-01T00:00:00.000Z";
+    const providerTurnId = asTurnId("provider-turn-dead-interrupt");
+    const orchestrationTurnId = asTurnId("orchestration-turn-dead-interrupt");
+
+    await runtime!.runPromise(
+      harness.engine.dispatch({
+        type: "thread.session.set",
+        commandId: CommandId.make("cmd-dead-interrupt-running"),
+        threadId: ThreadId.make("thread-1"),
+        session: {
+          threadId: ThreadId.make("thread-1"),
+          status: "running",
+          providerName: "codex",
+          providerInstanceId: ProviderInstanceId.make("codex"),
+          runtimeMode: "approval-required",
+          activeTurnId: providerTurnId,
+          lastError: null,
+          updatedAt: now,
+        },
+        createdAt: now,
+      }),
+    );
+
+    await runtime!.runPromise(
+      harness.engine.dispatch({
+        type: "thread.turn.interrupt",
+        commandId: CommandId.make("cmd-dead-session-turn-interrupt"),
+        threadId: ThreadId.make("thread-1"),
+        turnId: orchestrationTurnId,
+        createdAt: now,
+      }),
+    );
+
+    await waitFor(async () => {
+      const thread = (await harness.readModel()).threads.find(
+        (entry) => entry.id === ThreadId.make("thread-1"),
+      );
+      return thread?.latestTurn?.state === "error";
+    });
+
+    const thread = (await harness.readModel()).threads.find(
+      (entry) => entry.id === ThreadId.make("thread-1"),
+    );
+    expect(thread?.latestTurn).toMatchObject({ turnId: orchestrationTurnId, state: "error" });
+    expect(thread?.session).toMatchObject({
+      status: "stopped",
+      activeTurnId: null,
+      lastError: expect.stringContaining("no longer alive"),
+    });
+    expect(harness.interruptTurn).not.toHaveBeenCalled();
+    expect(harness.listSessions).toHaveBeenCalledTimes(1);
+    expect(harness.stopFailedSessionCalls).toContainEqual(
+      expect.objectContaining({ turnId: providerTurnId }),
+    );
+    expect(harness.stopSession).toHaveBeenCalledWith({ threadId: ThreadId.make("thread-1") });
+    expect(harness.runtimeSessions).toHaveLength(0);
+  });
+
+  it("does not overwrite a replacement when dead-turn cleanup no longer owns the binding", async () => {
+    const harness = await createHarness({
+      stopFailedSessionImplementation: () => Effect.succeed(false),
+    });
+    const now = "2026-01-01T00:00:00.000Z";
+    const turnId = asTurnId("turn-stale-dead-interrupt");
+
+    await runtime!.runPromise(
+      harness.engine.dispatch({
+        type: "thread.session.set",
+        commandId: CommandId.make("cmd-stale-dead-interrupt-running"),
+        threadId: ThreadId.make("thread-1"),
+        session: {
+          threadId: ThreadId.make("thread-1"),
+          status: "running",
+          providerName: "codex",
+          providerInstanceId: ProviderInstanceId.make("codex"),
+          runtimeMode: "approval-required",
+          activeTurnId: turnId,
+          lastError: null,
+          updatedAt: now,
+        },
+        createdAt: now,
+      }),
+    );
+    await runtime!.runPromise(
+      harness.engine.dispatch({
+        type: "thread.turn.interrupt",
+        commandId: CommandId.make("cmd-stale-dead-session-turn-interrupt"),
+        threadId: ThreadId.make("thread-1"),
+        turnId,
+        createdAt: now,
+      }),
+    );
+
+    await waitFor(() => harness.stopFailedSessionCalls.length === 1);
+    await harness.drain();
+
+    const thread = (await harness.readModel()).threads.find(
+      (entry) => entry.id === ThreadId.make("thread-1"),
+    );
+    expect(thread?.session).toMatchObject({
+      status: "running",
+      activeTurnId: turnId,
+      lastError: null,
+    });
+    expect(harness.stopSession).not.toHaveBeenCalled();
+  });
+
+  it("does not force-fail a turn when interrupt processing is itself cancelled", async () => {
+    const harness = await createHarness();
+    const now = "2026-01-01T00:00:00.000Z";
+    const turnId = asTurnId("turn-interrupt-cancelled");
+    harness.interruptTurn.mockImplementationOnce(() => Effect.interrupt as never);
+
+    await runtime!.runPromise(
+      harness.engine.dispatch({
+        type: "thread.session.set",
+        commandId: CommandId.make("cmd-interrupt-cancelled-running"),
+        threadId: ThreadId.make("thread-1"),
+        session: {
+          threadId: ThreadId.make("thread-1"),
+          status: "running",
+          providerName: "codex",
+          providerInstanceId: ProviderInstanceId.make("codex"),
+          runtimeMode: "approval-required",
+          activeTurnId: turnId,
+          lastError: null,
+          updatedAt: now,
+        },
+        createdAt: now,
+      }),
+    );
+    harness.runtimeSessions.push({
+      provider: ProviderDriverKind.make("codex"),
+      providerInstanceId: ProviderInstanceId.make("codex"),
+      status: "running",
+      runtimeMode: "approval-required",
+      threadId: ThreadId.make("thread-1"),
+      activeTurnId: turnId,
+      resumeCursor: { opaque: "resume-interrupt-cancelled" },
+      createdAt: now,
+      updatedAt: now,
+    });
+
+    await runtime!.runPromise(
+      harness.engine.dispatch({
+        type: "thread.turn.interrupt",
+        commandId: CommandId.make("cmd-turn-interrupt-cancelled"),
+        threadId: ThreadId.make("thread-1"),
+        turnId,
+        createdAt: now,
+      }),
+    );
+    await waitFor(() => harness.interruptTurn.mock.calls.length === 1);
+    await runtime!.runPromise(Effect.yieldNow);
+
+    const thread = (await harness.readModel()).threads.find(
+      (entry) => entry.id === ThreadId.make("thread-1"),
+    );
+    expect(thread?.latestTurn).toMatchObject({ turnId, state: "interrupted" });
+    expect(thread?.session).toMatchObject({ status: "running", activeTurnId: turnId });
+    expect(harness.stopSession).not.toHaveBeenCalled();
+  });
+
+  it("does not rewrite an older interrupted turn for an unrelated session error", async () => {
+    const harness = await createHarness();
+    const now = "2026-01-01T00:00:00.000Z";
+    const turnId = asTurnId("turn-prior-interrupt");
+
+    await runtime!.runPromise(
+      harness.engine.dispatch({
+        type: "thread.session.set",
+        commandId: CommandId.make("cmd-prior-interrupt-running"),
+        threadId: ThreadId.make("thread-1"),
+        session: {
+          threadId: ThreadId.make("thread-1"),
+          status: "running",
+          providerName: "codex",
+          providerInstanceId: ProviderInstanceId.make("codex"),
+          runtimeMode: "approval-required",
+          activeTurnId: turnId,
+          lastError: null,
+          updatedAt: now,
+        },
+        createdAt: now,
+      }),
+    );
+    harness.runtimeSessions.push({
+      provider: ProviderDriverKind.make("codex"),
+      providerInstanceId: ProviderInstanceId.make("codex"),
+      status: "running",
+      runtimeMode: "approval-required",
+      threadId: ThreadId.make("thread-1"),
+      activeTurnId: turnId,
+      resumeCursor: { opaque: "resume-prior-interrupt" },
+      createdAt: now,
+      updatedAt: now,
+    });
+    await runtime!.runPromise(
+      harness.engine.dispatch({
+        type: "thread.turn.interrupt",
+        commandId: CommandId.make("cmd-prior-turn-interrupt"),
+        threadId: ThreadId.make("thread-1"),
+        turnId,
+        createdAt: now,
+      }),
+    );
+    await waitFor(() => harness.interruptTurn.mock.calls.length === 1);
+
+    await runtime!.runPromise(
+      harness.engine.dispatch({
+        type: "thread.session.set",
+        commandId: CommandId.make("cmd-unrelated-session-error"),
+        threadId: ThreadId.make("thread-1"),
+        session: {
+          threadId: ThreadId.make("thread-1"),
+          status: "error",
+          providerName: "codex",
+          providerInstanceId: ProviderInstanceId.make("codex"),
+          runtimeMode: "approval-required",
+          activeTurnId: null,
+          lastError: "unrelated next-session startup failure",
+          updatedAt: now,
+        },
+        createdAt: now,
+      }),
+    );
+
+    const thread = (await harness.readModel()).threads.find(
+      (entry) => entry.id === ThreadId.make("thread-1"),
+    );
+    expect(thread?.latestTurn).toMatchObject({ turnId, state: "interrupted" });
   });
 
   it("starts a fresh session when only projected session state exists", async () => {

@@ -33,6 +33,12 @@ export interface ServerConfigProjection {
   readonly source: "cache" | "live";
 }
 
+export function withoutTransientServerConfig(config: ServerConfig): ServerConfig {
+  if (config.planUsage === undefined) return config;
+  const { planUsage: _, ...cachedConfig } = config;
+  return cachedConfig;
+}
+
 export function applyServerConfigProjection(
   current: Option.Option<ServerConfigProjection>,
   event: ServerConfigStreamEvent,
@@ -98,11 +104,6 @@ const cachedConfigSnapshotEvent = (config: ServerConfig): ServerConfigStreamEven
   config,
 });
 
-export function withoutTransientServerConfig(config: ServerConfig): ServerConfig {
-  const { planUsage: _planUsage, ...persistent } = config;
-  return persistent;
-}
-
 export function demoteServerConfigProjection(
   projection: Option.Option<ServerConfigProjection>,
 ): Option.Option<ServerConfigProjection> {
@@ -134,6 +135,7 @@ export const makeEnvironmentServerConfigState = Effect.fn("EnvironmentServerConf
     const cache = yield* EnvironmentCacheStore;
     const environmentId = supervisor.target.environmentId;
     const cachedConfig = yield* cache.loadServerConfig(environmentId).pipe(
+      Effect.map(Option.map(withoutTransientServerConfig)),
       Effect.catch((error) =>
         Effect.logWarning("Could not load cached server configuration.").pipe(
           Effect.annotateLogs({

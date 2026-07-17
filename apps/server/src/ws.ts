@@ -73,7 +73,9 @@ import {
 } from "./orchestration/Normalizer.ts";
 import * as OrchestrationEngine from "./orchestration/Services/OrchestrationEngine.ts";
 import * as ProjectionSnapshotQuery from "./orchestration/Services/ProjectionSnapshotQuery.ts";
+import { coveredThreadRevision } from "./orchestration/threadRevision.ts";
 import { ScheduledTaskRepository, toScheduleEntry } from "./persistence/Services/ScheduledTasks.ts";
+import { OrchestrationEventStore } from "./persistence/Services/OrchestrationEventStore.ts";
 import {
   observeRpcEffect as instrumentRpcEffect,
   observeRpcStream as instrumentRpcStream,
@@ -86,7 +88,6 @@ import * as ServerRuntimeStartup from "./serverRuntimeStartup.ts";
 import * as ServerSettings from "./serverSettings.ts";
 import * as PlanUsageSnapshot from "./usage/PlanUsageSnapshot.ts";
 import * as TerminalManager from "./terminal/Manager.ts";
-import * as PreviewAutomationBroker from "./mcp/PreviewAutomationBroker.ts";
 import * as PreviewManager from "./preview/Manager.ts";
 import { issueAssetUrl } from "./assets/AssetAccess.ts";
 import * as PortScanner from "./preview/PortScanner.ts";
@@ -334,9 +335,6 @@ const RPC_REQUIRED_SCOPE = new Map<string, AuthEnvironmentScope>([
   [WS_METHODS.previewClose, AuthOrchestrationOperateScope],
   [WS_METHODS.previewList, AuthOrchestrationReadScope],
   [WS_METHODS.previewReportStatus, AuthOrchestrationOperateScope],
-  [WS_METHODS.previewAutomationConnect, AuthOrchestrationOperateScope],
-  [WS_METHODS.previewAutomationRespond, AuthOrchestrationOperateScope],
-  [WS_METHODS.previewAutomationFocusHost, AuthOrchestrationOperateScope],
   [WS_METHODS.subscribePreviewEvents, AuthOrchestrationReadScope],
   [WS_METHODS.subscribeDiscoveredLocalServers, AuthOrchestrationReadScope],
   [WS_METHODS.subscribeServerConfig, AuthOrchestrationReadScope],
@@ -385,16 +383,14 @@ function toAuthAccessStreamEvent(
   }
 }
 
-const makeWsRpcLayer = (
-  currentSession: EnvironmentAuth.AuthenticatedSession,
-  previewAutomationBroker: PreviewAutomationBroker.PreviewAutomationBroker["Service"],
-) =>
+const makeWsRpcLayer = (currentSession: EnvironmentAuth.AuthenticatedSession) =>
   WsRpcGroup.toLayer(
     Effect.gen(function* () {
       const currentSessionId = currentSession.sessionId;
       const projectionSnapshotQuery = yield* ProjectionSnapshotQuery.ProjectionSnapshotQuery;
       const scheduledTaskRepository = yield* ScheduledTaskRepository;
       const orchestrationEngine = yield* OrchestrationEngine.OrchestrationEngineService;
+      const orchestrationEventStore = yield* OrchestrationEventStore;
       const checkpointDiffQuery = yield* CheckpointDiffQuery.CheckpointDiffQuery;
       const keybindings = yield* Keybindings.Keybindings;
       const externalLauncher = yield* ExternalLauncher.ExternalLauncher;
@@ -874,6 +870,7 @@ const makeWsRpcLayer = (
                         ),
                       ),
                     );
+                    yield* Effect.yieldNow;
                     const currentSequence = yield* projectionSnapshotQuery
                       .getSnapshotSequence()
                       .pipe(
@@ -988,16 +985,18 @@ const makeWsRpcLayer = (
         [ORCHESTRATION_WS_METHODS.subscribeThread]: (input) =>
           observeRpcStreamEffect(
             ORCHESTRATION_WS_METHODS.subscribeThread,
-            Effect.gen(function* () {
+            Effect.sync(() => {
               const isThisThreadDetailEvent = (event: OrchestrationEvent) =>
                 event.aggregateKind === "thread" &&
                 event.aggregateId === input.threadId &&
                 isThreadDetailEvent(event);
+              const storageEpoch = orchestrationEventStore.storageEpoch;
 
               const liveStream = orchestrationEngine.streamDomainEvents.pipe(
                 Stream.filter(isThisThreadDetailEvent),
                 Stream.map((event) => ({
                   kind: "event" as const,
+                  storageEpoch,
                   event,
                 })),
               );
@@ -1019,19 +1018,60 @@ const makeWsRpcLayer = (
               // page-bounded limit): the range is normally tiny (a fresh HTTP
               // snapshot sequence) and the per-thread filter runs after reading,
               // so a global cap could otherwise omit this thread's events.
-              if (input.afterSequence !== undefined) {
-                const afterSequence = input.afterSequence;
-                return Stream.unwrap(
-                  Effect.gen(function* () {
-                    const liveBuffer = yield* Queue.unbounded<OrchestrationThreadStreamItem>();
-                    yield* Effect.forkScoped(
-                      liveStream.pipe(Stream.runForEach((item) => Queue.offer(liveBuffer, item))),
-                    );
+              // A global replay cursor may legitimately exceed this idle
+              // thread's marker, but it must never exceed the current store
+              // high-water mark after a restore. Resume only when both cursors
+              // and the exact per-thread history identity are still valid.
+              const requestedAfterSequence = input.afterSequence;
+              return Stream.unwrap(
+                Effect.gen(function* () {
+                  // Attach the live subscription before reading either the replay
+                  // boundary or the fallback snapshot. Every path then drains the
+                  // same buffer after its persisted recovery item(s), closing the
+                  // snapshot-then-subscribe race for both warm and cold clients.
+                  const liveBuffer = yield* Queue.unbounded<OrchestrationThreadStreamItem>();
+                  yield* Effect.forkScoped(
+                    liveStream.pipe(Stream.runForEach((item) => Queue.offer(liveBuffer, item))),
+                  );
+                  yield* Effect.yieldNow;
+                  const liveBufferStream = Stream.fromQueue(liveBuffer);
+                  const [latestRevision, latestStoreSequence] = yield* Effect.all([
+                    orchestrationEventStore.getLatestThreadRevision(input.threadId),
+                    orchestrationEventStore.getLatestSequence(),
+                  ]).pipe(
+                    Effect.mapError(
+                      (cause) =>
+                        new OrchestrationGetSnapshotError({
+                          message: `Failed to validate thread ${input.threadId} replay cursor`,
+                          cause,
+                        }),
+                    ),
+                  );
+                  const observedIdentityMatches =
+                    input.observedRevision === latestRevision.latestSequence &&
+                    (input.observedRevision === 0
+                      ? input.observedEventId === null && latestRevision.latestEventId === null
+                      : input.observedEventId != null &&
+                        latestRevision.latestEventId !== null &&
+                        input.observedEventId === latestRevision.latestEventId);
+                  const canResumeFromCursor =
+                    requestedAfterSequence !== undefined &&
+                    requestedAfterSequence <= latestStoreSequence &&
+                    input.storageEpoch === storageEpoch &&
+                    input.verifiedRevision !== undefined &&
+                    input.verifiedRevision <= latestRevision.latestSequence &&
+                    input.observedRevision !== undefined &&
+                    observedIdentityMatches;
+                  if (canResumeFromCursor && requestedAfterSequence !== undefined) {
                     const catchUpStream = orchestrationEngine
-                      .readEvents(afterSequence, Number.MAX_SAFE_INTEGER)
+                      .readEvents(requestedAfterSequence, Number.MAX_SAFE_INTEGER)
                       .pipe(
                         Stream.filter(isThisThreadDetailEvent),
-                        Stream.map((event) => ({ kind: "event" as const, event })),
+                        Stream.map((event) => ({
+                          kind: "event" as const,
+                          storageEpoch,
+                          event,
+                        })),
                         Stream.mapError(
                           (cause) =>
                             new OrchestrationGetSnapshotError({
@@ -1040,36 +1080,95 @@ const makeWsRpcLayer = (
                             }),
                         ),
                       );
-                    return Stream.concat(catchUpStream, Stream.fromQueue(liveBuffer));
-                  }),
-                );
-              }
+                    return Stream.concat(catchUpStream, liveBufferStream);
+                  }
 
-              const snapshot = yield* projectionSnapshotQuery
-                .getThreadDetailSnapshot(input.threadId)
-                .pipe(
-                  Effect.mapError(
-                    (cause) =>
-                      new OrchestrationGetSnapshotError({
-                        message: `Failed to load thread ${input.threadId}`,
-                        cause,
-                      }),
-                  ),
-                );
+                  const snapshot = yield* projectionSnapshotQuery
+                    .getThreadDetailSnapshot(input.threadId)
+                    .pipe(
+                      Effect.mapError(
+                        (cause) =>
+                          new OrchestrationGetSnapshotError({
+                            message: `Failed to load thread ${input.threadId}`,
+                            cause,
+                          }),
+                      ),
+                    );
 
-              if (Option.isNone(snapshot)) {
-                return yield* new OrchestrationGetSnapshotError({
-                  message: `Thread ${input.threadId} was not found`,
-                  cause: input.threadId,
-                });
-              }
+                  if (Option.isNone(snapshot)) {
+                    // A cursorless subscription can still come from a warm
+                    // unknown-epoch cache: the client deliberately discarded
+                    // its untrustworthy cursor to force authoritative recovery.
+                    // Recover an exact persisted tombstone for every missing
+                    // snapshot so that path observes deletion instead of
+                    // retrying the failed subscription every 250 ms.
+                    const missingSnapshotRevision = yield* orchestrationEventStore
+                      .getLatestThreadRevision(input.threadId)
+                      .pipe(
+                        Effect.mapError(
+                          (cause) =>
+                            new OrchestrationGetSnapshotError({
+                              message: `Failed to refresh missing thread ${input.threadId} revision`,
+                              cause,
+                            }),
+                        ),
+                      );
+                    if (
+                      missingSnapshotRevision.latestSequence > 0 &&
+                      missingSnapshotRevision.latestEventId !== null
+                    ) {
+                      const latestDeletion = yield* orchestrationEngine
+                        .readEvents(missingSnapshotRevision.latestSequence - 1, 1)
+                        .pipe(
+                          Stream.filter(
+                            (event) =>
+                              event.aggregateKind === "thread" &&
+                              event.aggregateId === input.threadId &&
+                              event.sequence === missingSnapshotRevision.latestSequence &&
+                              event.eventId === missingSnapshotRevision.latestEventId &&
+                              event.type === "thread.deleted",
+                          ),
+                          Stream.runHead,
+                          Effect.mapError(
+                            (cause) =>
+                              new OrchestrationGetSnapshotError({
+                                message: `Failed to recover deleted thread ${input.threadId}`,
+                                cause,
+                              }),
+                          ),
+                        );
+                      if (Option.isSome(latestDeletion)) {
+                        return Stream.concat(
+                          Stream.make({
+                            kind: "event" as const,
+                            storageEpoch,
+                            force: true,
+                            event: latestDeletion.value,
+                          }),
+                          liveBufferStream,
+                        );
+                      }
+                    }
+                    return yield* new OrchestrationGetSnapshotError({
+                      message: `Thread ${input.threadId} was not found`,
+                      cause: input.threadId,
+                    });
+                  }
 
-              return Stream.concat(
-                Stream.make({
-                  kind: "snapshot" as const,
-                  snapshot: snapshot.value,
+                  return Stream.concat(
+                    Stream.make({
+                      kind: "snapshot" as const,
+                      storageEpoch,
+                      ...(requestedAfterSequence !== undefined ? { force: true } : {}),
+                      snapshot: {
+                        ...snapshot.value,
+                        storageEpoch,
+                        ...coveredThreadRevision(snapshot.value.snapshotSequence, latestRevision),
+                      },
+                    }),
+                    liveBufferStream,
+                  );
                 }),
-                liveStream,
               );
             }),
             { "rpc.aggregate": "orchestration" },
@@ -1635,24 +1734,6 @@ const makeWsRpcLayer = (
           observeRpcEffect(WS_METHODS.previewReportStatus, previewManager.reportStatus(input), {
             "rpc.aggregate": "preview",
           }),
-        [WS_METHODS.previewAutomationConnect]: (input) =>
-          observeRpcStreamEffect(
-            WS_METHODS.previewAutomationConnect,
-            previewAutomationBroker.connect(input),
-            { "rpc.aggregate": "preview-automation" },
-          ),
-        [WS_METHODS.previewAutomationRespond]: (input) =>
-          observeRpcEffect(
-            WS_METHODS.previewAutomationRespond,
-            previewAutomationBroker.respond(input),
-            { "rpc.aggregate": "preview-automation" },
-          ),
-        [WS_METHODS.previewAutomationFocusHost]: (input) =>
-          observeRpcEffect(
-            WS_METHODS.previewAutomationFocusHost,
-            previewAutomationBroker.focusHost(input),
-            { "rpc.aggregate": "preview-automation" },
-          ),
         [WS_METHODS.subscribePreviewEvents]: (_input) =>
           observeRpcStream(WS_METHODS.subscribePreviewEvents, previewManager.events, {
             "rpc.aggregate": "preview",
@@ -1802,66 +1883,61 @@ const makeWsRpcLayer = (
     }),
   );
 
-export const websocketRpcRouteLayer = Layer.unwrap(
+export const websocketRpcRouteLayer = HttpRouter.add(
+  "GET",
+  "/ws",
   Effect.gen(function* () {
-    const previewAutomationBroker = yield* PreviewAutomationBroker.PreviewAutomationBroker;
-    return HttpRouter.add(
-      "GET",
-      "/ws",
-      Effect.gen(function* () {
-        const request = yield* HttpServerRequest.HttpServerRequest;
-        const serverAuth = yield* EnvironmentAuth.EnvironmentAuth;
-        const sessions = yield* SessionStore.SessionStore;
-        const session = yield* serverAuth.authenticateWebSocketUpgrade(request).pipe(
-          Effect.catchIf(EnvironmentAuth.isServerAuthCredentialError, (error) =>
-            failEnvironmentAuthInvalid(EnvironmentAuth.serverAuthCredentialReason(error)),
-          ),
-          Effect.catchIf(EnvironmentAuth.isServerAuthInternalError, (error) =>
-            failEnvironmentInternal("internal_error", error),
-          ),
-        );
-        const rpcWebSocketHttpEffect = yield* RpcServer.toHttpEffectWebsocket(WsRpcGroup, {
-          disableTracing: true,
-        }).pipe(
-          Effect.provide(
-            makeWsRpcLayer(session, previewAutomationBroker).pipe(
-              Layer.provideMerge(RpcSerialization.layerJson),
-              Layer.provide(ProviderMaintenanceRunner.layer),
-              Layer.provide(
-                SourceControlDiscovery.layer.pipe(
-                  Layer.provide(
-                    SourceControlProviderRegistry.layer.pipe(
-                      Layer.provide(
-                        Layer.mergeAll(
-                          AzureDevOpsCli.layer,
-                          BitbucketApi.layer,
-                          GitHubCli.layer,
-                          GitLabCli.layer,
-                        ),
-                      ),
-                      Layer.provideMerge(GitVcsDriver.layer),
-                      Layer.provide(
-                        VcsDriverRegistry.layer.pipe(Layer.provide(VcsProjectConfig.layer)),
-                      ),
-                    ),
-                  ),
-                  Layer.provide(VcsProcess.layer),
-                ),
-              ),
-            ),
-          ),
-        );
-        return yield* Effect.acquireUseRelease(
-          sessions.markConnected(session.sessionId),
-          () => rpcWebSocketHttpEffect,
-          () => sessions.markDisconnected(session.sessionId),
-        );
-      }).pipe(
-        Effect.catchTags({
-          EnvironmentAuthInvalidError: HttpServerRespondable.toResponse,
-          EnvironmentInternalError: HttpServerRespondable.toResponse,
-        }),
+    const request = yield* HttpServerRequest.HttpServerRequest;
+    const serverAuth = yield* EnvironmentAuth.EnvironmentAuth;
+    const sessions = yield* SessionStore.SessionStore;
+    const session = yield* serverAuth.authenticateWebSocketUpgrade(request).pipe(
+      Effect.catchIf(EnvironmentAuth.isServerAuthCredentialError, (error) =>
+        failEnvironmentAuthInvalid(EnvironmentAuth.serverAuthCredentialReason(error)),
+      ),
+      Effect.catchIf(EnvironmentAuth.isServerAuthInternalError, (error) =>
+        failEnvironmentInternal("internal_error", error),
       ),
     );
-  }),
+    const rpcWebSocketHttpEffect = yield* RpcServer.toHttpEffectWebsocket(WsRpcGroup, {
+      disableTracing: true,
+    }).pipe(
+      Effect.provide(
+        makeWsRpcLayer(session).pipe(
+          Layer.provideMerge(RpcSerialization.layerJson),
+          Layer.provide(ProviderMaintenanceRunner.layer),
+          Layer.provide(
+            SourceControlDiscovery.layer.pipe(
+              Layer.provide(
+                SourceControlProviderRegistry.layer.pipe(
+                  Layer.provide(
+                    Layer.mergeAll(
+                      AzureDevOpsCli.layer,
+                      BitbucketApi.layer,
+                      GitHubCli.layer,
+                      GitLabCli.layer,
+                    ),
+                  ),
+                  Layer.provideMerge(GitVcsDriver.layer),
+                  Layer.provide(
+                    VcsDriverRegistry.layer.pipe(Layer.provide(VcsProjectConfig.layer)),
+                  ),
+                ),
+              ),
+              Layer.provide(VcsProcess.layer),
+            ),
+          ),
+        ),
+      ),
+    );
+    return yield* Effect.acquireUseRelease(
+      sessions.markConnected(session.sessionId),
+      () => rpcWebSocketHttpEffect,
+      () => sessions.markDisconnected(session.sessionId),
+    );
+  }).pipe(
+    Effect.catchTags({
+      EnvironmentAuthInvalidError: HttpServerRespondable.toResponse,
+      EnvironmentInternalError: HttpServerRespondable.toResponse,
+    }),
+  ),
 );

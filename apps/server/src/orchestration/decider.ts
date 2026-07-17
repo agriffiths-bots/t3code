@@ -13,6 +13,7 @@ import type * as PlatformError from "effect/PlatformError";
 import { OrchestrationCommandInvariantError } from "./Errors.ts";
 import {
   listThreadsByProjectId,
+  requireActiveProjectWorkspaceRootAbsent,
   requireProject,
   requireProjectAbsent,
   requireThread,
@@ -161,6 +162,12 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
         command,
         projectId: command.projectId,
       });
+      yield* requireActiveProjectWorkspaceRootAbsent({
+        readModel,
+        command,
+        workspaceRoot: command.workspaceRoot,
+        exceptProjectId: command.projectId,
+      });
 
       return {
         ...(yield* withEventBase({
@@ -183,11 +190,32 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
     }
 
     case "project.meta.update": {
-      yield* requireProject({
+      const project = yield* requireProject({
         readModel,
         command,
         projectId: command.projectId,
       });
+      if (command.workspaceRoot !== undefined) {
+        if (
+          command.workspaceRoot !== project.workspaceRoot &&
+          listThreadsByProjectId(readModel, command.projectId).some(
+            (thread) =>
+              thread.worktreeRemovable === true &&
+              (thread.worktreePath !== null || thread.worktreeRemovalPath !== null),
+          )
+        ) {
+          return yield* new OrchestrationCommandInvariantError({
+            commandType: command.type,
+            detail: `Project '${command.projectId}' cannot change workspace roots while it owns a removable thread worktree.`,
+          });
+        }
+        yield* requireActiveProjectWorkspaceRootAbsent({
+          readModel,
+          command,
+          workspaceRoot: command.workspaceRoot,
+          exceptProjectId: command.projectId,
+        });
+      }
       const occurredAt = yield* nowIso;
       return {
         ...(yield* withEventBase({
@@ -575,6 +603,9 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
             Object.hasOwn(command, "interactionMode") && command.interactionMode !== undefined
               ? command.interactionMode
               : targetThread.interactionMode,
+          ...(command.providerSessionDetached !== undefined
+            ? { providerSessionDetached: command.providerSessionDetached }
+            : {}),
           ...(sourceProposedPlan !== undefined ? { sourceProposedPlan } : {}),
           createdAt: command.createdAt,
         },

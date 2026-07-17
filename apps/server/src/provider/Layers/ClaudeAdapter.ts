@@ -307,6 +307,45 @@ function resultErrorsText(result: SDKResultMessage): string {
     : "";
 }
 
+function isClaudeUserSteerAbortDiagnosticLine(line: string): boolean {
+  const normalizedLine = line.trim().toLowerCase();
+  return (
+    /^\[ede_diagnostic\]\s+result_type=user\s+last_content_type=\S+\s+stop_reason=tool_use$/u.test(
+      normalizedLine,
+    ) ||
+    /^\[ede_diagnostic\]\s+turn aborted\s+\(steer\)\s+stop_reason=tool_use$/u.test(normalizedLine)
+  );
+}
+
+function isClaudeUserSteerAbortDiagnosticCandidate(error: string): boolean {
+  return /\[ede_diagnostic\]\s+(?:result_type=user\b|turn aborted\b)/u.test(error.toLowerCase());
+}
+
+function isClaudeExplicitAbortDiagnosticLine(line: string): boolean {
+  const normalizedLine = line.trim().toLowerCase();
+  return (
+    /^(?:error:\s*)?request was aborted\.?$/u.test(normalizedLine) ||
+    /^interrupted by user\.?$/u.test(normalizedLine) ||
+    /^aborted\.?$/u.test(normalizedLine)
+  );
+}
+
+function isClaudeUserSteerAbortEnvelope(errors: ReadonlyArray<string>): boolean {
+  const lines = errors.flatMap((error) =>
+    error
+      .split(/\r?\n/u)
+      .map((line) => line.trim())
+      .filter((line) => line.length > 0),
+  );
+  return (
+    lines.filter(isClaudeUserSteerAbortDiagnosticLine).length === 1 &&
+    lines.every(
+      (line) =>
+        isClaudeUserSteerAbortDiagnosticLine(line) || isClaudeExplicitAbortDiagnosticLine(line),
+    )
+  );
+}
+
 function isTaskNotificationResult(result: SDKResultMessage | undefined): boolean {
   const origin = (result as { readonly origin?: unknown } | undefined)?.origin;
   return (
@@ -396,6 +435,16 @@ function isInterruptedResult(result: SDKResultMessage): boolean {
   const errors = resultErrorsText(result);
   if (errors.includes("interrupt")) {
     return true;
+  }
+
+  if (
+    result.subtype === "error_during_execution" &&
+    result.errors.some(isClaudeUserSteerAbortDiagnosticCandidate)
+  ) {
+    // Claude CLI 2.1.206 emits these exact steer envelopes with is_error=true,
+    // while older/provenance captures used false. The diagnostic grammar is the
+    // stable discriminator; only explicit abort companions are also benign.
+    return isClaudeUserSteerAbortEnvelope(result.errors);
   }
 
   return (

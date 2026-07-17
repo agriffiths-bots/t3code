@@ -6,12 +6,21 @@ import { Atom } from "effect/unstable/reactivity";
 import type { EnvironmentRegistry } from "../connection/registry.ts";
 import type { EnvironmentCacheStore } from "../platform/persistence.ts";
 import { THREAD_STATE_IDLE_TTL_MS } from "./threadRetention.ts";
-import { createEnvironmentThreadStateAtoms, type ThreadSnapshotLoader } from "./threads.ts";
+import {
+  createEnvironmentThreadStateAtoms,
+  type ThreadReconciliationActivity,
+  type ThreadRevisionLoader,
+  type ThreadSnapshotLoader,
+} from "./threads.ts";
 
 describe("createEnvironmentThreadStateAtoms", () => {
   it("retains thread state across short subscriber gaps", () => {
     const runtime = Atom.runtime(Layer.empty) as unknown as Atom.AtomRuntime<
-      EnvironmentRegistry | EnvironmentCacheStore | ThreadSnapshotLoader,
+      | EnvironmentRegistry
+      | EnvironmentCacheStore
+      | ThreadSnapshotLoader
+      | ThreadRevisionLoader
+      | ThreadReconciliationActivity,
       never
     >;
     const threads = createEnvironmentThreadStateAtoms(runtime);

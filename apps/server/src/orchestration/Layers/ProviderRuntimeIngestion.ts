@@ -1394,7 +1394,7 @@ const make = Effect.gen(function* () {
         }
         switch (event.type) {
           case "session.exited":
-            return true;
+            return !conflictsWithActiveTurn && !missingTurnForActiveTurn;
           case "session.started":
           case "thread.started":
             return true;
@@ -1449,7 +1449,7 @@ const make = Effect.gen(function* () {
             case "turn.started":
               return "running";
             case "session.exited":
-              return "stopped";
+              return event.payload.exitKind !== "graceful" ? "error" : "stopped";
             case "turn.completed":
               return normalizeRuntimeTurnState(event.payload.state) === "failed"
                 ? "error"
@@ -1464,12 +1464,16 @@ const make = Effect.gen(function* () {
         const lastError =
           event.type === "session.state.changed" && event.payload.state === "error"
             ? (event.payload.reason ?? thread.session?.lastError ?? "Provider session error")
-            : event.type === "turn.completed" &&
-                normalizeRuntimeTurnState(event.payload.state) === "failed"
-              ? (event.payload.errorMessage ?? thread.session?.lastError ?? "Turn failed")
-              : status === "ready"
-                ? null
-                : (thread.session?.lastError ?? null);
+            : event.type === "session.exited" && event.payload.exitKind !== "graceful"
+              ? (event.payload.reason ??
+                thread.session?.lastError ??
+                "Provider process exited while the turn was running")
+              : event.type === "turn.completed" &&
+                  normalizeRuntimeTurnState(event.payload.state) === "failed"
+                ? (event.payload.errorMessage ?? thread.session?.lastError ?? "Turn failed")
+                : status === "ready"
+                  ? null
+                  : (thread.session?.lastError ?? null);
 
         if (shouldApplyThreadLifecycle) {
           if (
@@ -1797,7 +1801,7 @@ const make = Effect.gen(function* () {
         }
       }
 
-      if (event.type === "session.exited") {
+      if (event.type === "session.exited" && shouldApplyThreadLifecycle) {
         yield* clearTurnStateForSession(thread.id);
       }
 

@@ -1,12 +1,12 @@
 // @effect-diagnostics globalFetch:off globalFetchInEffect:off - This conformance test intentionally drives the HTTP boundary through the official MCP SDK transport and raw protocol probes.
 import { NodeHttpServer } from "@effect/platform-node";
-import * as NodeServices from "@effect/platform-node/NodeServices";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { CallToolResultSchema, ListToolsResultSchema } from "@modelcontextprotocol/sdk/types.js";
 import { expect, it } from "@effect/vitest";
 import {
   EnvironmentId,
+  type ExecutionEnvironmentDescriptor,
   ProjectId,
   ProviderDriverKind,
   ProviderInstanceId,
@@ -18,18 +18,19 @@ import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Stream from "effect/Stream";
-import { HttpRouter, HttpServer } from "effect/unstable/http";
+import { FetchHttpClient, HttpRouter, HttpServer } from "effect/unstable/http";
 
+import * as ServerEnvironment from "../environment/ServerEnvironment.ts";
 import * as DeviceNotifications from "../notifications/DeviceNotifications.ts";
 import { ProjectionSnapshotQuery } from "../orchestration/Services/ProjectionSnapshotQuery.ts";
 import { ProviderRegistry } from "../provider/Services/ProviderRegistry.ts";
 import { makeProviderRegistryMock } from "../provider/testUtils/providerRegistryMock.ts";
 import { ServerSettingsService } from "../serverSettings.ts";
+import * as SubagentPeerRegistry from "../subagents/SubagentPeerRegistry.ts";
 import * as PlanUsageSnapshot from "../usage/PlanUsageSnapshot.ts";
 import * as McpHttpServer from "./McpHttpServer.ts";
 import * as McpInvocationContext from "./McpInvocationContext.ts";
 import * as McpSessionRegistry from "./McpSessionRegistry.ts";
-import * as PreviewAutomationBroker from "./PreviewAutomationBroker.ts";
 
 type SdkTransport = Parameters<Client["connect"]>[0];
 type ParsedCallToolResult = {
@@ -45,6 +46,76 @@ const environmentId = EnvironmentId.make("environment-mcp-conformance");
 const threadId = ThreadId.make("thread-mcp-conformance");
 const providerInstanceId = ProviderInstanceId.make("codex");
 
+const expectedToolNamesAfterSpawnTrim = [
+  "t3_get_usage",
+  "t3_list_backends",
+  "t3_notify",
+  "t3_schedule_create",
+  "t3_schedule_delete",
+  "t3_schedule_list",
+  "t3_schedule_update",
+  "t3_spawn_subagent",
+  "t3_steer_subagent",
+  "t3_subagents",
+  "t3_thread_start",
+] as const;
+
+type ExpectedToolName = (typeof expectedToolNamesAfterSpawnTrim)[number];
+
+const expectedToolInputShapes: Record<
+  ExpectedToolName,
+  { readonly properties: ReadonlyArray<string>; readonly required: ReadonlyArray<string> }
+> = {
+  t3_get_usage: { properties: ["providerInstanceId"], required: [] },
+  t3_list_backends: { properties: [], required: [] },
+  t3_notify: { properties: ["body", "deepLink", "title"], required: ["title"] },
+  t3_schedule_create: {
+    properties: ["cronExpr", "intervalSeconds", "model", "prompt", "threadId", "timezone"],
+    required: ["prompt"],
+  },
+  t3_schedule_delete: { properties: ["taskId"], required: ["taskId"] },
+  t3_schedule_list: { properties: ["threadId"], required: [] },
+  t3_schedule_update: {
+    properties: ["cronExpr", "enabled", "intervalSeconds", "model", "taskId"],
+    required: ["taskId"],
+  },
+  t3_spawn_subagent: {
+    properties: ["branch", "directory", "model", "prompt", "reasoningEffort", "title"],
+    required: ["model", "prompt", "title"],
+  },
+  t3_steer_subagent: {
+    properties: ["childThreadId", "message"],
+    required: ["childThreadId", "message"],
+  },
+  t3_subagents: { properties: ["childThreadId"], required: [] },
+  t3_thread_start: {
+    properties: ["branch", "directory", "model", "prompt", "reasoningEffort", "title"],
+    required: ["model", "prompt", "title"],
+  },
+};
+
+const removedSubagentToolNames = [
+  "t3_check_subagent",
+  "t3_list_subagents",
+  "t3_wait_subagent",
+] as const;
+
+const removedPreviewToolNames = [
+  "preview_click",
+  "preview_evaluate",
+  "preview_navigate",
+  "preview_open",
+  "preview_press",
+  "preview_recording_start",
+  "preview_recording_stop",
+  "preview_resize",
+  "preview_scroll",
+  "preview_snapshot",
+  "preview_status",
+  "preview_type",
+  "preview_wait_for",
+] as const;
+
 const invocation: McpInvocationContext.ProviderMcpInvocationScope = {
   credentialKind: "provider-session",
   environmentId,
@@ -52,7 +123,6 @@ const invocation: McpInvocationContext.ProviderMcpInvocationScope = {
   providerSessionId: "provider-session-mcp-conformance",
   providerInstanceId,
   capabilities: new Set([
-    "preview",
     "thread-management",
     "notification",
     "subagent:spawn",
@@ -149,9 +219,30 @@ const deviceNotificationsLayer = Layer.mock(DeviceNotifications.DeviceNotificati
   events: Stream.empty,
 });
 
+const conformanceEnvironmentDescriptor: ExecutionEnvironmentDescriptor = {
+  environmentId,
+  label: "MCP Conformance",
+  platform: { os: "linux", arch: "x64" },
+  serverVersion: "0.0.0-test",
+  capabilities: { repositoryIdentity: true },
+};
+
+const serverEnvironmentLayer = Layer.succeed(ServerEnvironment.ServerEnvironment, {
+  getEnvironmentId: Effect.succeed(environmentId),
+  getDescriptor: Effect.succeed(conformanceEnvironmentDescriptor),
+});
+
+const subagentPeerRegistryLayer = Layer.succeed(SubagentPeerRegistry.SubagentPeerRegistry, {
+  add: () => Effect.die("unused"),
+  list: Effect.succeed([]),
+  remove: () => Effect.die("unused"),
+  getByAlias: () => Effect.succeed(Option.none()),
+  resolveTarget: () => Effect.die("unused"),
+  updateLastSeen: () => Effect.succeed(Option.none()),
+});
+
 const conformanceLayer = McpHttpServer.layer.pipe(
   Layer.provide(mcpSessionRegistryLayer),
-  Layer.provide(PreviewAutomationBroker.layer.pipe(Layer.provide(NodeServices.layer))),
   Layer.provide(deviceNotificationsLayer),
   Layer.provide(ServerSettingsService.layerTest()),
   Layer.provide(
@@ -161,6 +252,9 @@ const conformanceLayer = McpHttpServer.layer.pipe(
     }),
   ),
   Layer.provide(Layer.succeed(ProviderRegistry, makeProviderRegistryMock([makeProvider()]))),
+  Layer.provide(serverEnvironmentLayer),
+  Layer.provide(subagentPeerRegistryLayer),
+  Layer.provide(FetchHttpClient.layer),
   Layer.provide(projectionSnapshotQueryLayer),
 );
 
@@ -200,6 +294,20 @@ const postJsonRpc = (url: URL, body: unknown, sessionId?: string, protocolVersio
     },
     body: typeof body === "string" ? body : JSON.stringify(body),
   });
+
+const assertNoNullableInputSchema = (value: unknown, path: string): void => {
+  if (Array.isArray(value)) {
+    value.forEach((item, index) => assertNoNullableInputSchema(item, `${path}[${index}]`));
+    return;
+  }
+  if (typeof value !== "object" || value === null) return;
+
+  const record = value as Readonly<Record<string, unknown>>;
+  expect(record.type, `${path} must not accept null`).not.toBe("null");
+  for (const [key, child] of Object.entries(record)) {
+    assertNoNullableInputSchema(child, `${path}.${key}`);
+  }
+};
 
 it.effect("conforms to the official streamable HTTP MCP client", () =>
   Effect.scoped(
@@ -246,19 +354,28 @@ it.effect("conforms to the official streamable HTTP MCP client", () =>
 
       const toolsResult = yield* Effect.promise(() => client.listTools());
       ListToolsResultSchema.parse(toolsResult);
-      expect(toolsResult.tools.length).toBeGreaterThanOrEqual(20);
       const toolNames = new Set(toolsResult.tools.map((tool) => tool.name));
-      expect([...toolNames]).toEqual(
-        expect.arrayContaining([
-          "t3_list_backends",
-          "t3_thread_start",
-          "t3_spawn_subagent",
-          "preview_status",
-          "preview_snapshot",
-        ]),
-      );
+      expect([...toolNames].toSorted()).toEqual([...expectedToolNamesAfterSpawnTrim]);
+      for (const removedName of removedPreviewToolNames) {
+        expect(toolNames.has(removedName), `${removedName} must be absent from tools/list`).toBe(
+          false,
+        );
+      }
+      for (const removedName of removedSubagentToolNames) {
+        expect(toolNames.has(removedName), `${removedName} must be absent from tools/list`).toBe(
+          false,
+        );
+      }
 
       for (const tool of toolsResult.tools) {
+        const expected = expectedToolInputShapes[tool.name as ExpectedToolName];
+        expect(expected, `${tool.name} must have a pinned input shape`).toBeDefined();
+        expect(Object.keys(tool.inputSchema.properties ?? {}).toSorted()).toEqual(
+          expected?.properties,
+        );
+        expect([...(tool.inputSchema.required ?? [])].toSorted()).toEqual(expected?.required);
+        assertNoNullableInputSchema(tool.inputSchema, `${tool.name}.inputSchema`);
+
         expect(tool.inputSchema.type, `${tool.name} input schema must be an object`).toBe("object");
         expect(tool.inputSchema.anyOf, `${tool.name} input schema must not root anyOf`).toBe(
           undefined,
@@ -285,6 +402,16 @@ it.effect("conforms to the official streamable HTTP MCP client", () =>
         }
       }
 
+      const listBackendsTool = toolsResult.tools.find(
+        (candidate) => candidate.name === "t3_list_backends",
+      );
+      expect(listBackendsTool?.annotations).toMatchObject({
+        readOnlyHint: false,
+        destructiveHint: false,
+        idempotentHint: false,
+        openWorldHint: true,
+      });
+
       const callResult = CallToolResultSchema.parse(
         yield* Effect.promise(() =>
           client.callTool({ name: "t3_list_backends", arguments: {} }, CallToolResultSchema),
@@ -294,7 +421,15 @@ it.effect("conforms to the official streamable HTTP MCP client", () =>
       expect(callResult.structuredContent).toBeDefined();
       expect(callResult.structuredContent).not.toBeNull();
       expect(callResult.structuredContent).toMatchObject({
-        backends: [{ instanceId: "codex", driver: "codex" }],
+        backends: [
+          {
+            alias: "local",
+            environmentId: "environment-mcp-conformance",
+            os: "linux",
+            status: "online",
+            providers: [{ instanceId: "codex", driver: "codex" }],
+          },
+        ],
       });
       expect(callResult.content.length).toBeGreaterThan(0);
       for (const block of callResult.content) {
