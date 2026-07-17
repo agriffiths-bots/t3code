@@ -98,6 +98,21 @@ const cachedConfigSnapshotEvent = (config: ServerConfig): ServerConfigStreamEven
   config,
 });
 
+export function withoutTransientServerConfig(config: ServerConfig): ServerConfig {
+  const { planUsage: _planUsage, ...persistent } = config;
+  return persistent;
+}
+
+export function demoteServerConfigProjection(
+  projection: Option.Option<ServerConfigProjection>,
+): Option.Option<ServerConfigProjection> {
+  return Option.map(projection, (current) => ({
+    ...current,
+    config: withoutTransientServerConfig(current.config),
+    source: "cache" as const,
+  }));
+}
+
 /**
  * Shared payload for every `subscribeServerConfig` consumer. The subscription
  * atom family is keyed on `JSON.stringify([environmentId, input])`, so ALL
@@ -142,18 +157,20 @@ export const makeEnvironmentServerConfigState = Effect.fn("EnvironmentServerConf
     const persist = Effect.fn("EnvironmentServerConfigState.persist")(function* (
       config: ServerConfig,
     ) {
-      return yield* cache.saveServerConfig(environmentId, config).pipe(
-        Effect.as(true),
-        Effect.catch((error) =>
-          Effect.logWarning("Could not persist cached server configuration.").pipe(
-            Effect.annotateLogs({
-              environmentId,
-              ...safeErrorLogAttributes(error),
-            }),
-            Effect.as(false),
+      return yield* cache
+        .saveServerConfig(environmentId, withoutTransientServerConfig(config))
+        .pipe(
+          Effect.as(true),
+          Effect.catch((error) =>
+            Effect.logWarning("Could not persist cached server configuration.").pipe(
+              Effect.annotateLogs({
+                environmentId,
+                ...safeErrorLogAttributes(error),
+              }),
+              Effect.as(false),
+            ),
           ),
-        ),
-      );
+        );
     });
 
     const persistPending = Effect.fn("EnvironmentServerConfigState.persistPending")(function* (
@@ -173,9 +190,20 @@ export const makeEnvironmentServerConfigState = Effect.fn("EnvironmentServerConf
       Effect.forkScoped,
     );
 
+    yield* SubscriptionRef.changes(supervisor.session).pipe(
+      Stream.runForEach(
+        Option.match({
+          onNone: () => SubscriptionRef.update(state, demoteServerConfigProjection),
+          onSome: () => Effect.void,
+        }),
+      ),
+      Effect.forkScoped,
+    );
+
     yield* subscribe(WS_METHODS.subscribeServerConfig, SERVER_CONFIG_SUBSCRIPTION_INPUT).pipe(
       Stream.runForEach((event) =>
         Effect.gen(function* () {
+          if (Option.isNone(yield* SubscriptionRef.get(supervisor.session))) return;
           const next = applyServerConfigProjection(yield* SubscriptionRef.get(state), event);
           if (Option.isNone(next)) {
             return;
@@ -248,6 +276,12 @@ export function resolveServerConfigValue(
   return initialConfig ?? projection?.config ?? null;
 }
 
+export function resolveLiveServerConfigValue(
+  projection: ServerConfigProjection | null,
+): ServerConfig | null {
+  return projection?.source === "live" ? projection.config : null;
+}
+
 export function createServerEnvironmentAtoms<R, E>(
   runtime: Atom.AtomRuntime<EnvironmentRegistry | EnvironmentCacheStore | R, E>,
   options: {
@@ -292,6 +326,17 @@ export function createServerEnvironmentAtoms<R, E>(
       );
     }).pipe(Atom.withLabel(`environment-data:server:config:${environmentId}`));
   });
+  const liveConfigValueAtom = Atom.family((environmentId: EnvironmentId | null) => {
+    if (environmentId === null) return emptyConfigAtom;
+    return Atom.make((get): ServerConfig | null => {
+      const projection = Option.getOrNull(
+        AsyncResult.value(
+          get(configProjection({ environmentId, input: SERVER_CONFIG_SUBSCRIPTION_INPUT })),
+        ),
+      );
+      return resolveLiveServerConfigValue(projection);
+    }).pipe(Atom.withLabel(`environment-data:server:live-config:${environmentId}`));
+  });
   const settingsValueAtom = Atom.family((environmentId: EnvironmentId) =>
     Atom.make((get) => get(configValueAtom(environmentId))?.settings ?? null).pipe(
       Atom.withLabel(`environment-data:server:settings:${environmentId}`),
@@ -305,6 +350,7 @@ export function createServerEnvironmentAtoms<R, E>(
 
   return {
     configValueAtom,
+    liveConfigValueAtom,
     settingsValueAtom,
     providersValueAtom,
     traceDiagnostics: createEnvironmentRpcQueryAtomFamily(runtime, {

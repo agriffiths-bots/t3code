@@ -117,7 +117,7 @@ export function usePlanUsage(
   environmentId: EnvironmentId | null,
   providerInstanceId: ProviderInstanceId | null,
 ): PlanUsageSnapshot | null {
-  const serverConfig = useAtomValue(serverEnvironment.configValueAtom(environmentId));
+  const liveServerConfig = useAtomValue(serverEnvironment.liveConfigValueAtom(environmentId));
   const connection = usePreparedConnection(environmentId);
   const [snapshotState, setSnapshotState] = useState<{
     readonly key: string;
@@ -129,9 +129,12 @@ export function usePlanUsage(
     reportDefect: false,
   });
   const requestedDpopRefreshKeyRef = useRef<string | null>(null);
+  const aggregateUsageStreamPendingOrAvailable =
+    providerInstanceId === null &&
+    (liveServerConfig === null || liveServerConfig.planUsage !== undefined);
 
   useEffect(() => {
-    if (connection._tag !== "None" && providerInstanceId === null && serverConfig?.planUsage) {
+    if (aggregateUsageStreamPendingOrAvailable) {
       setSnapshotState(null);
       return;
     }
@@ -194,11 +197,14 @@ export function usePlanUsage(
       cancelled = true;
       window.clearInterval(interval);
     };
-  }, [connection, providerInstanceId, retryEnvironment, serverConfig?.planUsage]);
+  }, [aggregateUsageStreamPendingOrAvailable, connection, providerInstanceId, retryEnvironment]);
 
   const currentKey = planUsageConnectionKey(connection, providerInstanceId);
-  if (connection._tag !== "None" && providerInstanceId === null && serverConfig?.planUsage) {
-    return serverConfig.planUsage;
+  if (connection._tag !== "None" && providerInstanceId === null) {
+    return (
+      liveServerConfig?.planUsage ??
+      (snapshotState && snapshotState.key === currentKey ? snapshotState.snapshot : null)
+    );
   }
   return snapshotState && snapshotState.key === currentKey ? snapshotState.snapshot : null;
 }

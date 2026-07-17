@@ -23,10 +23,13 @@ import type { WsRpcProtocolClient } from "../rpc/protocol.ts";
 import type { RpcSession } from "../rpc/session.ts";
 import {
   applyServerConfigProjection,
+  demoteServerConfigProjection,
   makeEnvironmentServerConfigState,
   projectServerConfig,
   projectServerWelcome,
+  resolveLiveServerConfigValue,
   resolveServerConfigValue,
+  withoutTransientServerConfig,
 } from "./server.ts";
 
 const CONFIG = {
@@ -177,6 +180,39 @@ describe("server state projection", () => {
         initial,
       ),
     ).toBe(live);
+  });
+
+  it("exposes plan usage only from a live server-config projection", () => {
+    const cached = { ...CONFIG, planUsage: { updatedAt: "cached", providers: [] } } as ServerConfig;
+    const live = { ...CONFIG, planUsage: { updatedAt: "live", providers: [] } } as ServerConfig;
+
+    expect(
+      resolveLiveServerConfigValue({
+        config: cached,
+        latestEvent: snapshotEvent(cached),
+        source: "cache",
+      }),
+    ).toBeNull();
+    expect(
+      resolveLiveServerConfigValue({
+        config: live,
+        latestEvent: snapshotEvent(live),
+        source: "live",
+      }),
+    ).toBe(live);
+  });
+
+  it("drops transient plan usage when a live projection becomes reconnect cache", () => {
+    const live = { ...CONFIG, planUsage: { updatedAt: "live", providers: [] } } as ServerConfig;
+    const demoted = Option.getOrThrow(
+      demoteServerConfigProjection(
+        Option.some({ config: live, latestEvent: snapshotEvent(live), source: "live" }),
+      ),
+    );
+
+    expect(demoted.source).toBe("cache");
+    expect(demoted.config.planUsage).toBeUndefined();
+    expect(withoutTransientServerConfig(live).planUsage).toBeUndefined();
   });
 
   it.effect("starts from cached configuration and persists the live projection", () =>
