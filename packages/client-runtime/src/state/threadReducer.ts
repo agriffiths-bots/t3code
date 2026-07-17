@@ -112,6 +112,13 @@ export function applyThreadDetailEvent(
     case "project.meta-updated":
     case "project.deleted":
       return { kind: "unchanged" };
+    case "project.data-audience-set":
+      return event.payload.projectId === thread.projectId
+        ? {
+            kind: "updated",
+            thread: { ...thread, dataAudience: event.payload.newDataAudience },
+          }
+        : { kind: "unchanged" };
 
     // ── Thread lifecycle ────────────────────────────────────────────
     case "thread.created":

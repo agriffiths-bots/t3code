@@ -1,4 +1,5 @@
 import {
+  AuthProjectAudienceAdminScope,
   AuthOrchestrationOperateScope,
   AuthOrchestrationReadScope,
   EnvironmentHttpApi,
@@ -24,6 +25,10 @@ import { ProjectionSnapshotQuery } from "./Services/ProjectionSnapshotQuery.ts";
 import { coveredThreadRevision } from "./threadRevision.ts";
 import { OrchestrationEventStore } from "../persistence/Services/OrchestrationEventStore.ts";
 import {
+  ProjectAudienceAdministrationError,
+  setProjectAudienceToFactory,
+} from "../project/ProjectAudienceAdministration.ts";
+import {
   OrchestrationCommandInvariantError,
   OrchestrationCommandPreviouslyRejectedError,
 } from "./Errors.ts";
@@ -37,6 +42,7 @@ const isOrchestrationCommandInvariantError = Schema.is(OrchestrationCommandInvar
 const isOrchestrationCommandPreviouslyRejectedError = Schema.is(
   OrchestrationCommandPreviouslyRejectedError,
 );
+const isProjectAudienceAdministrationError = Schema.is(ProjectAudienceAdministrationError);
 
 export const orchestrationHttpApiLayer = HttpApiBuilder.group(
   EnvironmentHttpApi,
@@ -137,6 +143,29 @@ export const orchestrationHttpApiLayer = HttpApiBuilder.group(
               Effect.gen(function* () {
                 yield* cleanupPersistedCommandAttachments(normalizedCommand);
                 if (isClientCommandDispatchError(cause)) {
+                  return yield* failEnvironmentInvalidRequest("invalid_command");
+                }
+                return yield* failEnvironmentInternal("orchestration_dispatch_failed", cause);
+              }),
+            ),
+          );
+        }),
+      )
+      .handle(
+        "setProjectAudienceToFactory",
+        Effect.fn("environment.orchestration.setProjectAudienceToFactory")(function* (args) {
+          yield* annotateEnvironmentRequest(args.endpoint.name);
+          const session = yield* requireEnvironmentScope(AuthProjectAudienceAdminScope);
+          return yield* setProjectAudienceToFactory({
+            projectId: args.payload.projectId,
+            actor: session.subject,
+          }).pipe(
+            Effect.catch((cause) =>
+              Effect.gen(function* () {
+                if (
+                  isProjectAudienceAdministrationError(cause) ||
+                  isClientCommandDispatchError(cause)
+                ) {
                   return yield* failEnvironmentInvalidRequest("invalid_command");
                 }
                 return yield* failEnvironmentInternal("orchestration_dispatch_failed", cause);

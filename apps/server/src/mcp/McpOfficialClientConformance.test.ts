@@ -466,6 +466,29 @@ it.effect("conforms to the official streamable HTTP MCP client", () =>
       });
       expect(unknownMethodBody.id).toBeDefined();
 
+      const audienceAdminToolResponse = yield* Effect.promise(() =>
+        postJsonRpc(
+          mcpUrl,
+          {
+            jsonrpc: "2.0",
+            id: 9_002,
+            method: "tools/call",
+            params: {
+              name: "t3_set_audience_to_factory",
+              arguments: { projectId: "project-mcp-conformance" },
+            },
+          },
+          sessionId,
+          transport.protocolVersion,
+        ),
+      );
+      const audienceAdminToolBody = (yield* Effect.promise(() =>
+        parseJsonRpcHttpBody(audienceAdminToolResponse),
+      )) as { readonly error?: unknown };
+      expect(audienceAdminToolBody).toMatchObject({
+        error: { code: expect.any(Number), message: expect.any(String) },
+      });
+
       const malformedResponse = yield* Effect.promise(() =>
         postJsonRpc(
           mcpUrl,

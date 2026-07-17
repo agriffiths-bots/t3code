@@ -6437,6 +6437,8 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
         layers: {
           projectionSnapshotQuery: {
             getThreadDetailSnapshot: () => Effect.succeed(Option.some(snapshot)),
+            getThreadShellByIdIncludingArchived: () =>
+              Effect.succeed(Option.some(makeDefaultOrchestrationThreadShell())),
           },
           orchestrationEventStore: {
             storageEpoch,
@@ -6465,6 +6467,7 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
               verifiedRevision: 7,
               observedRevision: 7,
               observedEventId: EventId.make("event-discarded-marker-7"),
+              observedDataAudience: "private",
             }).pipe(Stream.take(1), Stream.runCollect),
           ),
         );
@@ -6489,6 +6492,7 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
             verifiedRevision: 6,
             observedRevision: 6,
             observedEventId: EventId.make("event-discarded-marker-6"),
+            observedDataAudience: "private",
           }).pipe(Stream.take(1), Stream.runCollect),
         ),
       );
@@ -6511,6 +6515,7 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
             verifiedRevision: 6,
             observedRevision: 6,
             observedEventId: latestEventId,
+            observedDataAudience: "private",
           }).pipe(Stream.take(1), Stream.runCollect),
         ),
       );
@@ -6535,6 +6540,7 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
               verifiedRevision: 6,
               observedRevision: 6,
               observedEventId: latestEventId,
+              observedDataAudience: "private",
             }).pipe(Stream.runDrain),
           ).pipe(Effect.forkScoped);
           yield* Deferred.await(readEventsStarted);
@@ -6552,6 +6558,7 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
             verifiedRevision: 7,
             observedRevision: 7,
             observedEventId: EventId.make("event-discarded-marker-7"),
+            observedDataAudience: "private",
           }).pipe(Stream.take(1), Stream.runCollect),
         ),
       );
@@ -6568,6 +6575,163 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
           },
         },
       ]);
+    }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+
+  it.effect("invalidates a resumable thread cache when its inherited audience is stale", () =>
+    Effect.gen(function* () {
+      const storageEpoch = "audience-change-storage-epoch";
+      const latestEventId = EventId.make("event-before-audience-change-6");
+      const snapshot = {
+        snapshotSequence: 8,
+        thread: {
+          ...makeDefaultOrchestrationReadModel().threads[0]!,
+          dataAudience: "factory" as const,
+        },
+      };
+      let readEventsCalled = false;
+
+      yield* buildAppUnderTest({
+        layers: {
+          projectionSnapshotQuery: {
+            getThreadShellByIdIncludingArchived: () =>
+              Effect.succeed(
+                Option.some(makeDefaultOrchestrationThreadShell({ dataAudience: "factory" })),
+              ),
+            getThreadDetailSnapshot: () => Effect.succeed(Option.some(snapshot)),
+          },
+          orchestrationEventStore: {
+            storageEpoch,
+            getLatestThreadRevision: () => Effect.succeed({ latestSequence: 6, latestEventId }),
+            getLatestSequence: () => Effect.succeed(8),
+          },
+          orchestrationEngine: {
+            readEvents: () => {
+              readEventsCalled = true;
+              return Stream.empty;
+            },
+          },
+        },
+      });
+
+      const wsUrl = yield* getWsServerUrl("/ws");
+      const item = yield* Effect.scoped(
+        withWsRpcClient(wsUrl, (client) =>
+          client[ORCHESTRATION_WS_METHODS.subscribeThread]({
+            threadId: defaultThreadId,
+            afterSequence: 8,
+            storageEpoch,
+            verifiedRevision: 6,
+            observedRevision: 6,
+            observedEventId: latestEventId,
+            observedDataAudience: "private",
+          }).pipe(Stream.runHead),
+        ),
+      );
+
+      assert.isTrue(Option.isSome(item));
+      if (Option.isSome(item)) {
+        assert.equal(item.value.kind, "snapshot");
+        if (item.value.kind === "snapshot") {
+          assert.equal(item.value.snapshot.thread.dataAudience, "factory");
+          assert.equal(item.value.force, true);
+        }
+      }
+      assert.equal(readEventsCalled, false);
+    }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+
+  it.effect("streams a project audience change to subscribed thread detail", () =>
+    Effect.gen(function* () {
+      const storageEpoch = "live-audience-storage-epoch";
+      const liveEvents = yield* PubSub.unbounded<OrchestrationEvent>();
+      const liveSubscriptionAttached = yield* Deferred.make<void>();
+      const makeAudienceEvent = (
+        projectId: ProjectId,
+        eventId: EventId,
+        sequence: number,
+      ): OrchestrationEvent => ({
+        eventId,
+        sequence,
+        occurredAt: "2026-07-17T10:00:00.000Z",
+        commandId: null,
+        causationEventId: null,
+        correlationId: null,
+        metadata: {},
+        aggregateKind: "project",
+        aggregateId: projectId,
+        type: "project.data-audience-set",
+        payload: {
+          projectId,
+          workspaceRoot: "/tmp/project",
+          oldDataAudience: "private",
+          newDataAudience: "factory",
+          actor: "local-admin:test",
+          updatedAt: "2026-07-17T10:00:00.000Z",
+        },
+      });
+      const handshakeEvent = makeAudienceEvent(
+        ProjectId.make("project-unrelated"),
+        EventId.make("event-live-audience-handshake"),
+        7,
+      );
+      const audienceEvent = makeAudienceEvent(
+        defaultProjectId,
+        EventId.make("event-live-audience-change"),
+        8,
+      );
+      const snapshot = {
+        snapshotSequence: 6,
+        thread: makeDefaultOrchestrationReadModel().threads[0]!,
+      };
+
+      yield* buildAppUnderTest({
+        layers: {
+          projectionSnapshotQuery: {
+            getThreadShellByIdIncludingArchived: () =>
+              Effect.gen(function* () {
+                yield* PubSub.publish(liveEvents, handshakeEvent);
+                yield* Deferred.await(liveSubscriptionAttached);
+                yield* PubSub.publish(liveEvents, audienceEvent);
+                return Option.some(makeDefaultOrchestrationThreadShell());
+              }),
+            getThreadDetailSnapshot: () => Effect.succeed(Option.some(snapshot)),
+          },
+          orchestrationEventStore: {
+            storageEpoch,
+            getLatestThreadRevision: () =>
+              Effect.succeed({
+                latestSequence: 6,
+                latestEventId: EventId.make("event-live-audience-marker-6"),
+              }),
+            getLatestSequence: () => Effect.succeed(8),
+          },
+          orchestrationEngine: {
+            streamDomainEvents: Stream.fromPubSub(liveEvents).pipe(
+              Stream.tap((event) =>
+                event.eventId === handshakeEvent.eventId
+                  ? Deferred.succeed(liveSubscriptionAttached, undefined)
+                  : Effect.void,
+              ),
+            ),
+          },
+        },
+      });
+
+      const wsUrl = yield* getWsServerUrl("/ws");
+      const items = yield* Effect.scoped(
+        withWsRpcClient(wsUrl, (client) =>
+          client[ORCHESTRATION_WS_METHODS.subscribeThread]({
+            threadId: defaultThreadId,
+          }).pipe(Stream.take(2), Stream.runCollect),
+        ),
+      );
+      const received = Array.from(items);
+      assert.equal(received[0]?.kind, "snapshot");
+      assert.equal(received[1]?.kind, "event");
+      if (received[1]?.kind === "event") {
+        assert.equal(received[1].event.eventId, audienceEvent.eventId);
+      }
     }).pipe(Effect.provide(NodeHttpServer.layerTest)),
   );
 

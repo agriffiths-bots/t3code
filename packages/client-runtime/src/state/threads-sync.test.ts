@@ -8,6 +8,7 @@ import {
   ProviderInstanceId,
   ThreadId,
   TurnId,
+  type DataAudience,
   type OrchestrationMessage,
   type OrchestrationThread,
   type OrchestrationThreadDetailSnapshot,
@@ -213,6 +214,7 @@ const makeHarness = Effect.fn("TestEnvironmentThreads.makeHarness")(function* (o
   const lastSubscribeVerifiedRevision = yield* Ref.make<number | undefined>(undefined);
   const lastSubscribeObservedRevision = yield* Ref.make<number | undefined>(undefined);
   const lastSubscribeObservedEventId = yield* Ref.make<EventId | null | undefined>(undefined);
+  const lastSubscribeObservedDataAudience = yield* Ref.make<DataAudience | undefined>(undefined);
   const subscribeAfterSequences = yield* Ref.make<ReadonlyArray<number | undefined>>([]);
   const savedThreads = yield* Ref.make<ReadonlyArray<OrchestrationThreadDetailSnapshot>>([]);
   const removedThreads = yield* Ref.make<ReadonlyArray<ThreadId>>([]);
@@ -232,6 +234,7 @@ const makeHarness = Effect.fn("TestEnvironmentThreads.makeHarness")(function* (o
       readonly verifiedRevision?: number;
       readonly observedRevision?: number;
       readonly observedEventId?: EventId | null;
+      readonly observedDataAudience?: DataAudience;
     }) =>
       Stream.unwrap(
         Ref.updateAndGet(subscriptionCount, (count) => count + 1).pipe(
@@ -240,6 +243,7 @@ const makeHarness = Effect.fn("TestEnvironmentThreads.makeHarness")(function* (o
           Effect.andThen(Ref.set(lastSubscribeVerifiedRevision, input.verifiedRevision)),
           Effect.andThen(Ref.set(lastSubscribeObservedRevision, input.observedRevision)),
           Effect.andThen(Ref.set(lastSubscribeObservedEventId, input.observedEventId)),
+          Effect.andThen(Ref.set(lastSubscribeObservedDataAudience, input.observedDataAudience)),
           Effect.andThen(
             Ref.update(subscribeAfterSequences, (current) => [...current, input.afterSequence]),
           ),
@@ -406,6 +410,7 @@ const makeHarness = Effect.fn("TestEnvironmentThreads.makeHarness")(function* (o
     lastSubscribeVerifiedRevision,
     lastSubscribeObservedRevision,
     lastSubscribeObservedEventId,
+    lastSubscribeObservedDataAudience,
     subscribeAfterSequences,
     supervisorState,
     supervisorSession,
@@ -647,7 +652,53 @@ describe("EnvironmentThreads", () => {
       // The subscription resumed from the cached sequence and never fetched the
       // full snapshot over HTTP.
       expect(yield* Ref.get(harness.lastSubscribeAfterSequence)).toBe(CACHED_SNAPSHOT_SEQUENCE);
+      expect(yield* Ref.get(harness.lastSubscribeObservedDataAudience)).toBe("private");
       expect(yield* Ref.get(harness.loaderCalls)).toBe(0);
+    }),
+  );
+
+  it.effect("carries an inherited audience update into the next resume request", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness({ cached: BASE_THREAD });
+      yield* Queue.offer(harness.inputs, {
+        kind: "event",
+        storageEpoch: STORAGE_EPOCH,
+        event: {
+          eventId: EventId.make("event-project-audience-factory-8"),
+          sequence: 8,
+          occurredAt: "2026-07-17T10:00:00.000Z",
+          commandId: null,
+          causationEventId: null,
+          correlationId: null,
+          metadata: {},
+          aggregateKind: "project",
+          aggregateId: BASE_THREAD.projectId,
+          type: "project.data-audience-set",
+          payload: {
+            projectId: BASE_THREAD.projectId,
+            workspaceRoot: "/tmp/project-1",
+            oldDataAudience: "private",
+            newDataAudience: "factory",
+            actor: "local-admin:test",
+            updatedAt: "2026-07-17T10:00:00.000Z",
+          },
+        },
+      });
+      yield* awaitThreadState(
+        harness.observed,
+        (value) => Option.isSome(value.data) && value.data.value.dataAudience === "factory",
+      );
+
+      yield* harness.replaceSession;
+      for (let attempt = 0; attempt < 100; attempt += 1) {
+        if ((yield* Ref.get(harness.subscriptionCount)) >= 2) {
+          break;
+        }
+        yield* Effect.yieldNow;
+      }
+
+      expect(yield* Ref.get(harness.subscriptionCount)).toBe(2);
+      expect(yield* Ref.get(harness.lastSubscribeObservedDataAudience)).toBe("factory");
     }),
   );
 

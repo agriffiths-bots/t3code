@@ -197,6 +197,12 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
         projectId: command.projectId,
       });
       if (command.workspaceRoot !== undefined) {
+        if (project.dataAudience === "factory" && command.workspaceRoot !== project.workspaceRoot) {
+          return yield* new OrchestrationCommandInvariantError({
+            commandType: command.type,
+            detail: `Factory project '${command.projectId}' cannot change workspace roots through a standard project command.`,
+          });
+        }
         if (
           command.workspaceRoot !== project.workspaceRoot &&
           listThreadsByProjectId(readModel, command.projectId).some(
@@ -235,6 +241,38 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
             : {}),
           ...(command.scripts !== undefined ? { scripts: command.scripts } : {}),
           updatedAt: occurredAt,
+        },
+      };
+    }
+
+    case "project.data-audience.set": {
+      const project = yield* requireProject({
+        readModel,
+        command,
+        projectId: command.projectId,
+      });
+      if (project.workspaceRoot !== command.expectedWorkspaceRoot) {
+        return yield* new OrchestrationCommandInvariantError({
+          commandType: command.type,
+          detail: `Project '${command.projectId}' workspace root changed during audience administration.`,
+        });
+      }
+
+      return {
+        ...(yield* withEventBase({
+          aggregateKind: "project",
+          aggregateId: command.projectId,
+          occurredAt: command.occurredAt,
+          commandId: command.commandId,
+        })),
+        type: "project.data-audience-set",
+        payload: {
+          projectId: command.projectId,
+          workspaceRoot: project.workspaceRoot,
+          oldDataAudience: project.dataAudience,
+          newDataAudience: "factory",
+          actor: command.actor,
+          updatedAt: command.occurredAt,
         },
       };
     }

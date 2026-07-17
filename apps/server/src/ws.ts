@@ -569,6 +569,7 @@ const makeWsRpcLayer = (currentSession: EnvironmentAuth.AuthenticatedSession) =>
         switch (event.type) {
           case "project.created":
           case "project.meta-updated":
+          case "project.data-audience-set":
             return projectionSnapshotQuery.getProjectShellById(event.payload.projectId).pipe(
               Effect.map((project) =>
                 Option.map(project, (nextProject) => ({
@@ -986,14 +987,15 @@ const makeWsRpcLayer = (currentSession: EnvironmentAuth.AuthenticatedSession) =>
           observeRpcStreamEffect(
             ORCHESTRATION_WS_METHODS.subscribeThread,
             Effect.sync(() => {
-              const isThisThreadDetailEvent = (event: OrchestrationEvent) =>
-                event.aggregateKind === "thread" &&
-                event.aggregateId === input.threadId &&
-                isThreadDetailEvent(event);
+              const isCandidateThreadDetailEvent = (event: OrchestrationEvent) =>
+                (event.aggregateKind === "thread" &&
+                  event.aggregateId === input.threadId &&
+                  isThreadDetailEvent(event)) ||
+                event.type === "project.data-audience-set";
               const storageEpoch = orchestrationEventStore.storageEpoch;
 
               const liveStream = orchestrationEngine.streamDomainEvents.pipe(
-                Stream.filter(isThisThreadDetailEvent),
+                Stream.filter(isCandidateThreadDetailEvent),
                 Stream.map((event) => ({
                   kind: "event" as const,
                   storageEpoch,
@@ -1034,17 +1036,34 @@ const makeWsRpcLayer = (currentSession: EnvironmentAuth.AuthenticatedSession) =>
                     liveStream.pipe(Stream.runForEach((item) => Queue.offer(liveBuffer, item))),
                   );
                   yield* Effect.yieldNow;
-                  const liveBufferStream = Stream.fromQueue(liveBuffer);
-                  const [latestRevision, latestStoreSequence] = yield* Effect.all([
-                    orchestrationEventStore.getLatestThreadRevision(input.threadId),
-                    orchestrationEventStore.getLatestSequence(),
-                  ]).pipe(
+                  const [latestRevision, latestStoreSequence, subscribedThread] = yield* Effect.all(
+                    [
+                      orchestrationEventStore.getLatestThreadRevision(input.threadId),
+                      orchestrationEventStore.getLatestSequence(),
+                      projectionSnapshotQuery.getThreadShellByIdIncludingArchived(input.threadId),
+                    ],
+                  ).pipe(
                     Effect.mapError(
                       (cause) =>
                         new OrchestrationGetSnapshotError({
                           message: `Failed to validate thread ${input.threadId} replay cursor`,
                           cause,
                         }),
+                    ),
+                  );
+                  const subscribedProjectId = Option.map(
+                    subscribedThread,
+                    (thread) => thread.projectId,
+                  );
+                  const isThisThreadDetailEvent = (event: OrchestrationEvent) =>
+                    (event.aggregateKind === "thread" &&
+                      event.aggregateId === input.threadId &&
+                      isThreadDetailEvent(event)) ||
+                    (event.type === "project.data-audience-set" &&
+                      Option.contains(subscribedProjectId, event.payload.projectId));
+                  const liveBufferStream = Stream.fromQueue(liveBuffer).pipe(
+                    Stream.filter(
+                      (item) => item.kind === "event" && isThisThreadDetailEvent(item.event),
                     ),
                   );
                   const observedIdentityMatches =
@@ -1061,6 +1080,10 @@ const makeWsRpcLayer = (currentSession: EnvironmentAuth.AuthenticatedSession) =>
                     input.verifiedRevision !== undefined &&
                     input.verifiedRevision <= latestRevision.latestSequence &&
                     input.observedRevision !== undefined &&
+                    Option.exists(
+                      subscribedThread,
+                      (thread) => input.observedDataAudience === thread.dataAudience,
+                    ) &&
                     observedIdentityMatches;
                   if (canResumeFromCursor && requestedAfterSequence !== undefined) {
                     const catchUpStream = orchestrationEngine

@@ -623,4 +623,49 @@ it.layer(NodeServices.layer)("decider project scripts", (it) => {
       });
     }),
   );
+
+  it.effect("prevents a standard command from retargeting a factory project root", () =>
+    Effect.gen(function* () {
+      const now = "2026-07-17T12:00:00.000Z";
+      const projectId = asProjectId("project-factory-root-lock");
+      const readModel = yield* projectEvent(createEmptyReadModel(now), {
+        sequence: 1,
+        eventId: asEventId("evt-project-factory-root-lock"),
+        aggregateKind: "project",
+        aggregateId: projectId,
+        type: "project.created",
+        occurredAt: now,
+        commandId: CommandId.make("cmd-project-factory-root-lock"),
+        causationEventId: null,
+        correlationId: CommandId.make("cmd-project-factory-root-lock"),
+        metadata: {},
+        payload: {
+          projectId,
+          title: "Factory",
+          workspaceRoot: "/repo/factory",
+          dataAudience: "factory",
+          defaultModelSelection: null,
+          scripts: [],
+          createdAt: now,
+          updatedAt: now,
+        },
+      });
+
+      const error = yield* decideOrchestrationCommand({
+        command: {
+          type: "project.meta.update",
+          commandId: CommandId.make("cmd-project-factory-retarget"),
+          projectId,
+          workspaceRoot: "/home/user",
+        },
+        readModel,
+      }).pipe(Effect.flip);
+
+      expect(error._tag).toBe("OrchestrationCommandInvariantError");
+      if (error._tag !== "OrchestrationCommandInvariantError") {
+        throw new Error(`Expected OrchestrationCommandInvariantError, got ${error._tag}`);
+      }
+      expect(error.detail).toContain("cannot change workspace roots");
+    }),
+  );
 });
