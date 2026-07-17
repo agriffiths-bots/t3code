@@ -57,7 +57,7 @@ import {
 import { usePrimaryEnvironment } from "../../state/environments";
 import { useProjects } from "../../state/entities";
 import { useArchivedThreadSnapshots } from "../../lib/archivedThreadsState";
-import { formatRelativeTime, formatRelativeTimeLabel } from "../../timestampFormat";
+import { formatRelativeTimeLabel, getRelativeTimeState } from "../../timestampFormat";
 import { Button } from "../ui/button";
 import { DraftInput } from "../ui/draft-input";
 import { Select, SelectItem, SelectPopup, SelectTrigger, SelectValue } from "../ui/select";
@@ -133,10 +133,14 @@ const PROVIDER_SETTINGS = DRIVER_OPTIONS.map((definition) => ({
 
 function ProviderLastChecked({ lastCheckedAt }: { lastCheckedAt: string | null }) {
   useRelativeTimeTick();
-  const lastCheckedRelative = lastCheckedAt ? formatRelativeTime(lastCheckedAt) : null;
+  const lastCheckedRelative = getRelativeTimeState(lastCheckedAt);
 
-  if (!lastCheckedRelative) {
+  if (lastCheckedRelative.status === "missing") {
     return null;
+  }
+
+  if (lastCheckedRelative.status === "invalid") {
+    return <span className="text-[11px] text-muted-foreground/50">Checked unavailable</span>;
   }
 
   return (
