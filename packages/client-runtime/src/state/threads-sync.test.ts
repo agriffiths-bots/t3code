@@ -657,51 +657,6 @@ describe("EnvironmentThreads", () => {
     }),
   );
 
-  it.effect("carries an inherited audience update into the next resume request", () =>
-    Effect.gen(function* () {
-      const harness = yield* makeHarness({ cached: BASE_THREAD });
-      yield* Queue.offer(harness.inputs, {
-        kind: "event",
-        storageEpoch: STORAGE_EPOCH,
-        event: {
-          eventId: EventId.make("event-project-audience-factory-8"),
-          sequence: 8,
-          occurredAt: "2026-07-17T10:00:00.000Z",
-          commandId: null,
-          causationEventId: null,
-          correlationId: null,
-          metadata: {},
-          aggregateKind: "project",
-          aggregateId: BASE_THREAD.projectId,
-          type: "project.data-audience-set",
-          payload: {
-            projectId: BASE_THREAD.projectId,
-            workspaceRoot: "/tmp/project-1",
-            oldDataAudience: "private",
-            newDataAudience: "factory",
-            actor: "local-admin:test",
-            updatedAt: "2026-07-17T10:00:00.000Z",
-          },
-        },
-      });
-      yield* awaitThreadState(
-        harness.observed,
-        (value) => Option.isSome(value.data) && value.data.value.dataAudience === "factory",
-      );
-
-      yield* harness.replaceSession;
-      for (let attempt = 0; attempt < 100; attempt += 1) {
-        if ((yield* Ref.get(harness.subscriptionCount)) >= 2) {
-          break;
-        }
-        yield* Effect.yieldNow;
-      }
-
-      expect(yield* Ref.get(harness.subscriptionCount)).toBe(2);
-      expect(yield* Ref.get(harness.lastSubscribeObservedDataAudience)).toBe("factory");
-    }),
-  );
-
   it.effect("keeps global replay and per-thread revision cursors distinct", () =>
     Effect.gen(function* () {
       const harness = yield* makeHarness({

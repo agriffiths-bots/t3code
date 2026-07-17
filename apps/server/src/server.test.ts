@@ -6641,7 +6641,7 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
     }).pipe(Effect.provide(NodeHttpServer.layerTest)),
   );
 
-  it.effect("streams a project audience change to subscribed thread detail", () =>
+  it.effect("keeps project audience changes off the revision-tracked thread stream", () =>
     Effect.gen(function* () {
       const storageEpoch = "live-audience-storage-epoch";
       const liveEvents = yield* PubSub.unbounded<OrchestrationEvent>();
@@ -6680,6 +6680,31 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
         EventId.make("event-live-audience-change"),
         8,
       );
+      const threadEvent: OrchestrationEvent = {
+        eventId: EventId.make("event-live-thread-change"),
+        sequence: 9,
+        occurredAt: "2026-07-17T10:01:00.000Z",
+        commandId: null,
+        causationEventId: null,
+        correlationId: null,
+        metadata: {},
+        aggregateKind: "thread",
+        aggregateId: defaultThreadId,
+        type: "thread.activity-appended",
+        payload: {
+          threadId: defaultThreadId,
+          activity: {
+            id: EventId.make("activity-live-after-audience-change"),
+            tone: "info",
+            kind: "test",
+            summary: "Thread event after audience change",
+            payload: {},
+            turnId: null,
+            sequence: 9,
+            createdAt: "2026-07-17T10:01:00.000Z",
+          },
+        },
+      };
       const snapshot = {
         snapshotSequence: 6,
         thread: makeDefaultOrchestrationReadModel().threads[0]!,
@@ -6693,6 +6718,7 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
                 yield* PubSub.publish(liveEvents, handshakeEvent);
                 yield* Deferred.await(liveSubscriptionAttached);
                 yield* PubSub.publish(liveEvents, audienceEvent);
+                yield* PubSub.publish(liveEvents, threadEvent);
                 return Option.some(makeDefaultOrchestrationThreadShell());
               }),
             getThreadDetailSnapshot: () => Effect.succeed(Option.some(snapshot)),
@@ -6704,7 +6730,7 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
                 latestSequence: 6,
                 latestEventId: EventId.make("event-live-audience-marker-6"),
               }),
-            getLatestSequence: () => Effect.succeed(8),
+            getLatestSequence: () => Effect.succeed(9),
           },
           orchestrationEngine: {
             streamDomainEvents: Stream.fromPubSub(liveEvents).pipe(
@@ -6730,7 +6756,7 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
       assert.equal(received[0]?.kind, "snapshot");
       assert.equal(received[1]?.kind, "event");
       if (received[1]?.kind === "event") {
-        assert.equal(received[1].event.eventId, audienceEvent.eventId);
+        assert.equal(received[1].event.eventId, threadEvent.eventId);
       }
     }).pipe(Effect.provide(NodeHttpServer.layerTest)),
   );

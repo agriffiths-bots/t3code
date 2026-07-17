@@ -251,6 +251,12 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
         command,
         projectId: command.projectId,
       });
+      if (project.deletedAt !== null) {
+        return yield* new OrchestrationCommandInvariantError({
+          commandType: command.type,
+          detail: `Project '${command.projectId}' is deleted and cannot handle command '${command.type}'.`,
+        });
+      }
       if (project.workspaceRoot !== command.expectedWorkspaceRoot) {
         return yield* new OrchestrationCommandInvariantError({
           commandType: command.type,

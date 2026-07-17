@@ -987,15 +987,14 @@ const makeWsRpcLayer = (currentSession: EnvironmentAuth.AuthenticatedSession) =>
           observeRpcStreamEffect(
             ORCHESTRATION_WS_METHODS.subscribeThread,
             Effect.sync(() => {
-              const isCandidateThreadDetailEvent = (event: OrchestrationEvent) =>
-                (event.aggregateKind === "thread" &&
-                  event.aggregateId === input.threadId &&
-                  isThreadDetailEvent(event)) ||
-                event.type === "project.data-audience-set";
+              const isThisThreadDetailEvent = (event: OrchestrationEvent) =>
+                event.aggregateKind === "thread" &&
+                event.aggregateId === input.threadId &&
+                isThreadDetailEvent(event);
               const storageEpoch = orchestrationEventStore.storageEpoch;
 
               const liveStream = orchestrationEngine.streamDomainEvents.pipe(
-                Stream.filter(isCandidateThreadDetailEvent),
+                Stream.filter(isThisThreadDetailEvent),
                 Stream.map((event) => ({
                   kind: "event" as const,
                   storageEpoch,
@@ -1051,21 +1050,7 @@ const makeWsRpcLayer = (currentSession: EnvironmentAuth.AuthenticatedSession) =>
                         }),
                     ),
                   );
-                  const subscribedProjectId = Option.map(
-                    subscribedThread,
-                    (thread) => thread.projectId,
-                  );
-                  const isThisThreadDetailEvent = (event: OrchestrationEvent) =>
-                    (event.aggregateKind === "thread" &&
-                      event.aggregateId === input.threadId &&
-                      isThreadDetailEvent(event)) ||
-                    (event.type === "project.data-audience-set" &&
-                      Option.contains(subscribedProjectId, event.payload.projectId));
-                  const liveBufferStream = Stream.fromQueue(liveBuffer).pipe(
-                    Stream.filter(
-                      (item) => item.kind === "event" && isThisThreadDetailEvent(item.event),
-                    ),
-                  );
+                  const liveBufferStream = Stream.fromQueue(liveBuffer);
                   const observedIdentityMatches =
                     input.observedRevision === latestRevision.latestSequence &&
                     (input.observedRevision === 0
