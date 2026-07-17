@@ -39,6 +39,94 @@ const projectionSnapshotLayer = it.layer(
 );
 
 projectionSnapshotLayer("ProjectionSnapshotQuery", (it) => {
+  it.effect("exposes thread audience only through its parent project", () =>
+    Effect.gen(function* () {
+      const snapshotQuery = yield* ProjectionSnapshotQuery;
+      const sql = yield* SqlClient.SqlClient;
+
+      yield* sql`DELETE FROM projection_threads WHERE thread_id = 'thread-audience-inheritance'`;
+      yield* sql`DELETE FROM projection_projects WHERE project_id = 'project-audience-inheritance'`;
+      yield* sql`
+        INSERT INTO projection_projects (
+          project_id,
+          title,
+          workspace_root,
+          data_audience,
+          default_model_selection_json,
+          scripts_json,
+          created_at,
+          updated_at,
+          deleted_at
+        )
+        VALUES (
+          'project-audience-inheritance',
+          'Audience inheritance',
+          '/tmp/project-audience-inheritance',
+          'factory',
+          NULL,
+          '[]',
+          '2026-07-17T00:00:00.000Z',
+          '2026-07-17T00:00:00.000Z',
+          NULL
+        )
+      `;
+      yield* sql`
+        INSERT INTO projection_threads (
+          thread_id,
+          project_id,
+          title,
+          model_selection_json,
+          runtime_mode,
+          interaction_mode,
+          branch,
+          worktree_path,
+          latest_turn_id,
+          created_at,
+          updated_at,
+          deleted_at
+        )
+        VALUES (
+          'thread-audience-inheritance',
+          'project-audience-inheritance',
+          'Inherited audience',
+          '{"instanceId":"codex","model":"gpt-5.5"}',
+          'full-access',
+          'default',
+          NULL,
+          NULL,
+          NULL,
+          '2026-07-17T00:00:00.000Z',
+          '2026-07-17T00:00:00.000Z',
+          NULL
+        )
+      `;
+
+      const threadColumns = yield* sql<{ readonly name: string }>`
+        PRAGMA table_info(projection_threads)
+      `;
+      assert.equal(
+        threadColumns.some((column) => column.name === "data_audience"),
+        false,
+      );
+
+      const shell = yield* snapshotQuery.getThreadShellById(
+        ThreadId.make("thread-audience-inheritance"),
+      );
+      assert.equal(shell._tag, "Some");
+      if (shell._tag === "Some") {
+        assert.equal(shell.value.dataAudience, "factory");
+      }
+
+      const detail = yield* snapshotQuery.getThreadDetailById(
+        ThreadId.make("thread-audience-inheritance"),
+      );
+      assert.equal(detail._tag, "Some");
+      if (detail._tag === "Some") {
+        assert.equal(detail.value.dataAudience, "factory");
+      }
+    }),
+  );
+
   it.effect("hydrates read model from projection tables and computes snapshot sequence", () =>
     Effect.gen(function* () {
       const snapshotQuery = yield* ProjectionSnapshotQuery;
@@ -293,6 +381,7 @@ projectionSnapshotLayer("ProjectionSnapshotQuery", (it) => {
           id: asProjectId("project-1"),
           title: "Project 1",
           workspaceRoot: "/tmp/project-1",
+          dataAudience: "private",
           repositoryIdentity: null,
           defaultModelSelection: {
             instanceId: ProviderInstanceId.make("codex"),
@@ -316,6 +405,7 @@ projectionSnapshotLayer("ProjectionSnapshotQuery", (it) => {
         {
           id: ThreadId.make("thread-1"),
           projectId: asProjectId("project-1"),
+          dataAudience: "private",
           title: "Thread 1",
           modelSelection: {
             instanceId: ProviderInstanceId.make("codex"),
@@ -369,6 +459,7 @@ projectionSnapshotLayer("ProjectionSnapshotQuery", (it) => {
           id: asProjectId("project-1"),
           title: "Project 1",
           workspaceRoot: "/tmp/project-1",
+          dataAudience: "private",
           repositoryIdentity: null,
           defaultModelSelection: {
             instanceId: ProviderInstanceId.make("codex"),
@@ -391,6 +482,7 @@ projectionSnapshotLayer("ProjectionSnapshotQuery", (it) => {
         {
           id: ThreadId.make("thread-1"),
           projectId: asProjectId("project-1"),
+          dataAudience: "private",
           title: "Thread 1",
           modelSelection: {
             instanceId: ProviderInstanceId.make("codex"),

@@ -42,6 +42,7 @@ function makeProject(overrides: Partial<Project> = {}): Project {
     environmentId: primaryEnvironmentId,
     title: "shared-repo",
     workspaceRoot: "/tmp/shared-repo",
+    dataAudience: "private",
     repositoryIdentity: null,
     defaultModelSelection: {
       instanceId: ProviderInstanceId.make("codex"),

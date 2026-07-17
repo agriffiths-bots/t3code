@@ -62,6 +62,7 @@ const makeShell = (input: {
 }): OrchestrationThreadShell => ({
   id: input.threadId,
   projectId,
+  dataAudience: "private",
   title: `Thread ${input.threadId}`,
   modelSelection: codexModel,
   runtimeMode: "full-access",

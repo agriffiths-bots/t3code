@@ -123,6 +123,7 @@ const makeThreadState = (input: {
   const shell: OrchestrationThreadShell = {
     id: input.threadId,
     projectId,
+    dataAudience: "private",
     title: `Thread ${input.threadId}`,
     modelSelection: codexModel,
     runtimeMode: "full-access",
@@ -185,6 +186,7 @@ const makeThreadState = (input: {
   const detail: OrchestrationThread = {
     id: input.threadId,
     projectId,
+    dataAudience: shell.dataAudience,
     title: `Thread ${input.threadId}`,
     modelSelection: codexModel,
     runtimeMode: "full-access",

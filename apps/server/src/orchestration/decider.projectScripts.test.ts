@@ -40,6 +40,7 @@ it.layer(NodeServices.layer)("decider project scripts", (it) => {
       const event = Array.isArray(result) ? result[0] : result;
       expect(event.type).toBe("project.created");
       expect((event.payload as { scripts: unknown[] }).scripts).toEqual([]);
+      expect((event.payload as { dataAudience: string }).dataAudience).toBe("private");
     }),
   );
 
@@ -62,6 +63,7 @@ it.layer(NodeServices.layer)("decider project scripts", (it) => {
           projectId: asProjectId("project-scripts"),
           title: "Scripts",
           workspaceRoot: "/tmp/scripts",
+          dataAudience: "private",
           defaultModelSelection: null,
           scripts: [],
           createdAt: now,
@@ -115,6 +117,7 @@ it.layer(NodeServices.layer)("decider project scripts", (it) => {
           projectId,
           title: "Owned worktree",
           workspaceRoot: "/repo-a",
+          dataAudience: "private",
           defaultModelSelection: null,
           scripts: [],
           createdAt: now,
@@ -190,6 +193,7 @@ it.layer(NodeServices.layer)("decider project scripts", (it) => {
           projectId: asProjectId("project-existing"),
           title: "Project",
           workspaceRoot: "/tmp/project",
+          dataAudience: "private",
           defaultModelSelection: null,
           scripts: [],
           createdAt: now,
@@ -236,6 +240,7 @@ it.layer(NodeServices.layer)("decider project scripts", (it) => {
           projectId: asProjectId("project-first"),
           title: "First",
           workspaceRoot: "/tmp/project-first",
+          dataAudience: "private",
           defaultModelSelection: null,
           scripts: [],
           createdAt: now,
@@ -257,6 +262,7 @@ it.layer(NodeServices.layer)("decider project scripts", (it) => {
           projectId: asProjectId("project-second"),
           title: "Second",
           workspaceRoot: "/tmp/project-second",
+          dataAudience: "private",
           defaultModelSelection: null,
           scripts: [],
           createdAt: now,
@@ -301,6 +307,7 @@ it.layer(NodeServices.layer)("decider project scripts", (it) => {
           projectId: asProjectId("project-1"),
           title: "Project",
           workspaceRoot: "/tmp/project",
+          dataAudience: "private",
           defaultModelSelection: null,
           scripts: [],
           createdAt: now,
@@ -399,6 +406,7 @@ it.layer(NodeServices.layer)("decider project scripts", (it) => {
           projectId: asProjectId("project-1"),
           title: "Project",
           workspaceRoot: "/tmp/project",
+          dataAudience: "private",
           defaultModelSelection: null,
           scripts: [],
           createdAt: now,
@@ -477,6 +485,7 @@ it.layer(NodeServices.layer)("decider project scripts", (it) => {
           projectId: asProjectId("project-1"),
           title: "Project",
           workspaceRoot: "/tmp/project",
+          dataAudience: "private",
           defaultModelSelection: null,
           scripts: [],
           createdAt: now,
@@ -555,6 +564,7 @@ it.layer(NodeServices.layer)("decider project scripts", (it) => {
           projectId: asProjectId("project-1"),
           title: "Project",
           workspaceRoot: "/tmp/project",
+          dataAudience: "private",
           defaultModelSelection: null,
           scripts: [],
           createdAt: now,

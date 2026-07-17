@@ -16,6 +16,7 @@ const stubProject = {
   id: ProjectId.make("project-1"),
   title: "Test Project",
   workspaceRoot: "/workspace/test",
+  dataAudience: "private",
   repositoryIdentity: null,
   defaultModelSelection: null,
   scripts: [],
@@ -26,6 +27,7 @@ const stubProject = {
 const stubThread = {
   id: ThreadId.make("thread-1"),
   projectId: ProjectId.make("project-1"),
+  dataAudience: "private",
   title: "Test Thread",
   modelSelection: { instanceId: ProviderInstanceId.make("codex"), model: "gpt-5.4" },
   runtimeMode: "full-access" as const,

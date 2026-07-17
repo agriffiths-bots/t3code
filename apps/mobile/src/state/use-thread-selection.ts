@@ -48,6 +48,7 @@ function threadDetailToShell(
     environmentId,
     id: thread.id,
     projectId: thread.projectId,
+    dataAudience: thread.dataAudience,
     title: thread.title,
     modelSelection: thread.modelSelection,
     runtimeMode: thread.runtimeMode,

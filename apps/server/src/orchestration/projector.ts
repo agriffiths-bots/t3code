@@ -7,6 +7,7 @@ import type {
   TurnId,
 } from "@t3tools/contracts";
 import {
+  DEFAULT_DATA_AUDIENCE,
   OrchestrationCheckpointSummary,
   OrchestrationMessage,
   OrchestrationSession,
@@ -517,6 +518,7 @@ export function projectEvent(
             id: payload.projectId,
             title: payload.title,
             workspaceRoot: payload.workspaceRoot,
+            dataAudience: payload.dataAudience,
             defaultModelSelection: payload.defaultModelSelection,
             scripts: payload.scripts,
             createdAt: payload.createdAt,
@@ -582,11 +584,15 @@ export function projectEvent(
           event.type,
           "payload",
         );
+        const dataAudience =
+          nextBase.projects.find((project) => project.id === payload.projectId)?.dataAudience ??
+          DEFAULT_DATA_AUDIENCE;
         const thread: OrchestrationThread = yield* decodeForEvent(
           OrchestrationThread,
           {
             id: payload.threadId,
             projectId: payload.projectId,
+            dataAudience,
             title: payload.title,
             modelSelection: payload.modelSelection,
             runtimeMode: payload.runtimeMode,

@@ -1205,6 +1205,7 @@ function makeProject(overrides: Partial<Project> = {}): Project {
     environmentId: localEnvironmentId,
     title: "Project",
     workspaceRoot: "/tmp/project",
+    dataAudience: "private",
     repositoryIdentity: null,
     defaultModelSelection: {
       instanceId: ProviderInstanceId.make("codex"),
@@ -1223,6 +1224,7 @@ function makeThread(overrides: Partial<Thread> = {}): Thread {
     id: ThreadId.make("thread-1"),
     environmentId: localEnvironmentId,
     projectId: ProjectId.make("project-1"),
+    dataAudience: "private",
     title: "Thread",
     modelSelection: {
       instanceId: ProviderInstanceId.make("codex"),

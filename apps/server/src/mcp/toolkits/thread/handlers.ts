@@ -545,6 +545,7 @@ const makeActiveThreadStartRuntime = Effect.fn("ThreadToolkit.makeActiveRuntime"
     const sourceThread: OrchestrationThreadShell = {
       id: ThreadId.make("remote-parent"),
       projectId: project.id,
+      dataAudience: project.dataAudience,
       title: "Remote parent",
       modelSelection: inheritedModelSelection,
       runtimeMode: input.runtimeMode ?? DEFAULT_RUNTIME_MODE,

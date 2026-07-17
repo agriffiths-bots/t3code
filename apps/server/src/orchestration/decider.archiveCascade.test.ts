@@ -40,6 +40,7 @@ const project = (base: ReturnType<typeof createEmptyReadModel>) =>
       projectId,
       title: "Archive Project",
       workspaceRoot: "/tmp/archive",
+      dataAudience: "private",
       defaultModelSelection: null,
       scripts: [],
       createdAt: now,
