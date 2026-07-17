@@ -69,7 +69,9 @@ capture fails, the manager restarts the unchanged service and injects the
 pre-stop manifest instead of continuing the update.
 
 Rollbacks before the updated service can accept writes restore the pre-stop DB
-snapshot after checking out the pre-restart SHA. The manager pins the pre-update
+snapshot after checking out the pre-restart SHA. After every rollback checkout,
+the manager restores that SHA's frozen dependency installation before rebuilding
+its web and server artifacts. The manager pins the pre-update
 `health-probe` and `inject-resume` helpers under
 `$T3DR_LEDGER/<UTC date>/pinned-tools/` before merging the target SHA, then uses
 those pinned tools for post-update health checks, rollback re-probes, and resume
@@ -97,6 +99,12 @@ work during downtime, but still records the rollback SHA and uses the same
 snapshot, stop/start, health, DB restore, and resume-injection rollback path if
 the restarted service is not healthy.
 
+`--rollback-sha SHA --target-sha SHA` without `--prebuilt-target` is the nightly
+dependency-update fallback. The checkout is already at the target, but the
+explicit rollback SHA makes the manager rebuild the stamped web and server
+artifacts and preserves the real pre-cycle checkout for any start, verification,
+or health rollback.
+
 ## Nightly cycle
 
 `scripts/ops/daily-restart/t3-nightly-cycle` is the 03:00 cron entrypoint. It
@@ -111,12 +119,30 @@ runs:
    deployed with prebuilt artifacts. Instead, rc=66 selects the live fallback:
    build the stamped web bundle in a detached worktree, verify and fast-forward
    the live checkout to the pinned target, run the frozen workspace install,
-   atomically exchange the web dist, and continue through the configured
-   restart step. The atomic exchange is preflighted on the checkout filesystem
-   before any live mutation.
-   A durable `$T3DR_LEDGER/t3-nightly-cycle.pending-live-deploy` marker keeps
-   this path selected across failures and later same-SHA cycles; only a fully
-   successful cycle archives it as `<run-dir>/live-deploy.completed`.
+   publish restart metadata, and continue through a pre-update copy of the
+   configured restart manager. The detached web build validates the target but
+   is not published while the old service can still handle requests. The manager
+   rebuilds both target web and server artifacts only after it owns the guarded
+   downtime, so this path needs no `mv --exchange` support on older GNU
+   coreutils. A failure before that handoff restores the rollback checkout and
+   its frozen dependencies.
+   After all pre-mutation validation and staging succeeds, a durable
+   `$T3DR_LEDGER/t3-nightly-cycle.pending-live-deploy` marker keeps the
+   validated rollback and target SHAs selected across failures and later
+   same-SHA cycles; only a fully successful cycle archives it as
+   `<run-dir>/live-deploy.completed`. Restart-manager snapshots are retained by
+   rollback SHA under `$T3DR_LEDGER/t3-nightly-cycle.restart-managers/`, so a
+   later retry never sources orchestration code from an already-updated checkout.
+   If a crash leaves the marker after a successful restart, a later cycle
+   archives it only when both the latest restart result and the running service's
+   stamped `serverBuildSha` confirm the target. A confirmed rollback service is
+   retried; any other combination fails closed instead of reusing a stale base.
+   Legacy target-only markers recover their rollback from the last successful
+   restart ledger result (or, before any checkout mutation, the running service's
+   stamped `serverBuildSha`), verify that commit against the target and checkout
+   reflog, then bind retries to the current manager's checked
+   `live-rollback-v1` capability instead of an old manager that cannot honor the
+   recovered rollback.
    Non-fast-forward targets and all other build failures still abort the cycle.
 4. Optional desktop artifact hook. Until T1 lands, this is a safe no-op. The
    one-line integration is `T3DR_DESKTOP_ARTIFACT=1`, which runs

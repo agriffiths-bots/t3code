@@ -24,6 +24,7 @@ rollback_sha="${T3DR_ROLLBACK_SHA:-}"
 target_sha_override="${T3DR_TARGET_SHA:-}"
 prebuilt_assets_dir="${T3DR_PREBUILT_ASSETS_DIR:-}"
 pinned_health_probe_source="${T3DR_PINNED_HEALTH_PROBE:-}"
+# capability: live-rollback-v1
 
 usage() {
   cat >&2 <<'USAGE'
@@ -32,7 +33,8 @@ usage: t3-daily-restart [--db PATH] [--checkout PATH] [--service NAME]
                         [--attachments-dir DIR]
                         [--probe-timeout SECS]
                         [--smoke-instance INSTANCE] [--smoke-model MODEL]
-                        [--prebuilt-target --rollback-sha SHA [--target-sha SHA]]
+                        [--rollback-sha SHA] [--target-sha SHA]
+                        [--prebuilt-target]
 USAGE
 }
 
@@ -854,6 +856,11 @@ rollback() {
     record_result "ROLLBACK-FAILED"
     return 1
   }
+  run_capture 900 pnpm -C "$checkout" install --frozen-lockfile --prefer-offline || {
+    log "ROLLBACK dependency restore failed"
+    record_result "ROLLBACK-FAILED"
+    return 1
+  }
   restore="$(resolve_tool t3-db-restore)" || {
     log "ROLLBACK missing t3-db-restore"
     record_result "ROLLBACK-FAILED"
@@ -906,6 +913,11 @@ code_only_rollback() {
   fi
   run_capture 60 git -C "$checkout" checkout "$pre_sha" || {
     log "CODE_ROLLBACK git checkout failed"
+    record_result "CODE-ROLLBACK-FAILED"
+    return 1
+  }
+  run_capture 900 pnpm -C "$checkout" install --frozen-lockfile --prefer-offline || {
+    log "CODE_ROLLBACK dependency restore failed"
     record_result "CODE-ROLLBACK-FAILED"
     return 1
   }
@@ -979,7 +991,6 @@ if [[ "$prebuilt_target" == "1" ]]; then
   fi
   log "prebuilt target verified rollback_sha=$pre_sha target_sha=$target_sha"
 else
-  pre_sha="$cycle_start_sha"
   if [[ -n "$target_sha_override" ]]; then
     target_sha="$(run_output 30 git -C "$checkout" rev-parse --verify "${target_sha_override}^{commit}")" || {
       log "failed to resolve target_sha=$target_sha_override"
@@ -992,6 +1003,26 @@ else
       record_result "FAILED"
       exit 1
     }
+  fi
+  if [[ -n "$rollback_sha" ]]; then
+    pre_sha="$(run_output 30 git -C "$checkout" rev-parse --verify "${rollback_sha}^{commit}")" || {
+      log "failed to resolve rollback_sha=$rollback_sha"
+      record_result "FAILED"
+      exit 1
+    }
+    if [[ "$cycle_start_sha" != "$target_sha" ]]; then
+      log "live fallback target mismatch: checkout_head=$cycle_start_sha target_sha=$target_sha"
+      record_result "FAILED"
+      exit 1
+    fi
+    if ! run_capture 60 git -C "$checkout" merge-base --is-ancestor "$pre_sha" "$target_sha"; then
+      log "live fallback target is not a fast-forward from rollback_sha=$pre_sha"
+      record_result "FAILED"
+      exit 1
+    fi
+    log "live fallback target verified rollback_sha=$pre_sha target_sha=$target_sha"
+  else
+    pre_sha="$cycle_start_sha"
   fi
 fi
 

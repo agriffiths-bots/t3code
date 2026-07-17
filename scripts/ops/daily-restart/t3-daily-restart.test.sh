@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# Assertion chains are safe here because pass and fail always return success.
+# shellcheck disable=SC2015
 set -u
 
 ROOT="$(git rev-parse --show-toplevel)"
@@ -333,7 +335,7 @@ export FAKE_VERIFY_RESTART_RC=9
 run_manager "$tmp"
 unset FAKE_VERIFY_RESTART_RC
 [[ "$(cat "$tmp/rc")" != "0" ]] && pass "verify-restart failure exits nonzero" || fail "verify-restart failure exits nonzero"
-assert_order "$tmp/calls.log" "systemctl --user start fake.service" "verify-restart" "systemctl --user stop fake.service" "git -C $tmp/checkout checkout aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" "restore" "pnpm -C $tmp/checkout/apps/web run build" "pnpm -C $tmp/checkout run build:desktop" "systemctl --user start fake.service" "health"
+assert_order "$tmp/calls.log" "systemctl --user start fake.service" "verify-restart" "systemctl --user stop fake.service" "git -C $tmp/checkout checkout aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" "pnpm -C $tmp/checkout install --frozen-lockfile --prefer-offline" "restore" "pnpm -C $tmp/checkout/apps/web run build" "pnpm -C $tmp/checkout run build:desktop" "systemctl --user start fake.service" "health"
 grep -Fq "RESULT ROLLBACK-OK" "$tmp/ledger/"*/t3-daily-restart.result && pass "verify-restart failure rolls back loudly" || fail "verify-restart failure rolls back loudly"
 
 tmp="$(mktemp -d)"
@@ -496,7 +498,7 @@ export FAKE_HEALTH_FAIL_ONCE=1
 run_manager "$tmp"
 unset FAKE_HEALTH_FAIL_ONCE
 [[ "$(cat "$tmp/rc")" != "0" ]] && pass "health rollback exits nonzero" || fail "health rollback exits nonzero"
-assert_order "$tmp/calls.log" "health" "systemctl --user stop" "git -C" "restore" "pnpm -C $tmp/checkout/apps/web run build" "pnpm -C $tmp/checkout run build:desktop" "systemctl --user start" "health"
+assert_order "$tmp/calls.log" "health" "systemctl --user stop" "git -C" "pnpm -C $tmp/checkout install --frozen-lockfile --prefer-offline" "restore" "pnpm -C $tmp/checkout/apps/web run build" "pnpm -C $tmp/checkout run build:desktop" "systemctl --user start" "health"
 grep -Fq "RESULT ROLLBACK-OK" "$tmp/ledger/"*/t3-daily-restart.result && pass "health rollback result recorded" || fail "health rollback result recorded"
 if grep -Fq "diff --quiet" "$tmp/calls.log"; then
   fail "health rollback consulted migration diff"
@@ -576,7 +578,7 @@ export FAKE_PNPM_FAIL_ONCE=1
 run_manager "$tmp"
 unset FAKE_PNPM_FAIL_ONCE
 [[ "$(cat "$tmp/rc")" != "0" ]] && pass "web build failure exits nonzero" || fail "web build failure exits nonzero"
-assert_order "$tmp/calls.log" "pnpm -C $tmp/checkout/apps/web run build" "systemctl --user stop" "git -C" "pnpm -C $tmp/checkout/apps/web run build" "pnpm -C $tmp/checkout run build:desktop" "systemctl --user start" "health"
+assert_order "$tmp/calls.log" "pnpm -C $tmp/checkout/apps/web run build" "systemctl --user stop" "git -C" "pnpm -C $tmp/checkout install --frozen-lockfile --prefer-offline" "pnpm -C $tmp/checkout/apps/web run build" "pnpm -C $tmp/checkout run build:desktop" "systemctl --user start" "health"
 if awk 'f && /restore/ { found=1 } /pnpm/ { f=1 } END { exit found ? 0 : 1 }' "$tmp/calls.log"; then
   fail "web build rollback restored db"
 else
@@ -685,6 +687,34 @@ else
 fi
 
 tmp="$(mktemp -d)"
+export FAKE_PRE_SHA=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+run_manager "$tmp" \
+  --rollback-sha aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+  --target-sha bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+unset FAKE_PRE_SHA
+[[ "$(cat "$tmp/rc")" == "0" ]] && pass "live fallback restart exits zero" || fail "live fallback restart exits zero"
+grep -Fq "pnpm-env T3CODE_BUILD_SHA=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb cmd=-C $tmp/checkout/apps/web run build" "$tmp/calls.log" \
+  && grep -Fq "pnpm-env T3CODE_BUILD_SHA=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb cmd=-C $tmp/checkout run build:desktop" "$tmp/calls.log" \
+  && pass "live fallback rollback metadata forces web and server rebuilds" \
+  || fail "live fallback rollback metadata forces web and server rebuilds"
+grep -Fq '"pre_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"' "$tmp/ledger/"*/resume-manifest.json \
+  && pass "live fallback manifest records the pre-cycle rollback sha" \
+  || fail "live fallback manifest records the pre-cycle rollback sha"
+
+tmp="$(mktemp -d)"
+export FAKE_PRE_SHA=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+export FAKE_VERIFY_RESTART_RC=9
+run_manager "$tmp" \
+  --rollback-sha aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+  --target-sha bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+unset FAKE_PRE_SHA FAKE_VERIFY_RESTART_RC
+[[ "$(cat "$tmp/rc")" != "0" ]] && pass "live fallback verification failure exits nonzero" || fail "live fallback verification failure exits nonzero"
+grep -Fq "git -C $tmp/checkout checkout aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" "$tmp/calls.log" \
+  && grep -Fq "pnpm -C $tmp/checkout install --frozen-lockfile --prefer-offline" "$tmp/calls.log" \
+  && pass "live fallback verification failure restores pre-cycle source and dependencies" \
+  || fail "live fallback verification failure restores pre-cycle source and dependencies"
+
+tmp="$(mktemp -d)"
 run_manager "$tmp" --prebuilt-target \
   --rollback-sha aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
   --target-sha bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
@@ -715,7 +745,10 @@ run_manager "$tmp" --prebuilt-target \
   --target-sha bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
 unset FAKE_HEALTH_FAIL_ONCE
 [[ "$(cat "$tmp/rc")" != "0" ]] && pass "prebuilt health failure exits nonzero" || fail "prebuilt health failure exits nonzero"
-grep -Fq "git -C $tmp/checkout checkout aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" "$tmp/calls.log" && pass "prebuilt rollback checks out rollback sha" || fail "prebuilt rollback checks out rollback sha"
+grep -Fq "git -C $tmp/checkout checkout aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" "$tmp/calls.log" \
+  && grep -Fq "pnpm -C $tmp/checkout install --frozen-lockfile --prefer-offline" "$tmp/calls.log" \
+  && pass "prebuilt rollback restores rollback source and dependencies" \
+  || fail "prebuilt rollback restores rollback source and dependencies"
 
 tmp="$(mktemp -d)"
 export FAKE_SNAPSHOT_FAIL_N=2
