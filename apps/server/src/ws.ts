@@ -569,6 +569,7 @@ const makeWsRpcLayer = (currentSession: EnvironmentAuth.AuthenticatedSession) =>
         switch (event.type) {
           case "project.created":
           case "project.meta-updated":
+          case "project.data-audience-set":
             return projectionSnapshotQuery.getProjectShellById(event.payload.projectId).pipe(
               Effect.map((project) =>
                 Option.map(project, (nextProject) => ({
@@ -1034,11 +1035,13 @@ const makeWsRpcLayer = (currentSession: EnvironmentAuth.AuthenticatedSession) =>
                     liveStream.pipe(Stream.runForEach((item) => Queue.offer(liveBuffer, item))),
                   );
                   yield* Effect.yieldNow;
-                  const liveBufferStream = Stream.fromQueue(liveBuffer);
-                  const [latestRevision, latestStoreSequence] = yield* Effect.all([
-                    orchestrationEventStore.getLatestThreadRevision(input.threadId),
-                    orchestrationEventStore.getLatestSequence(),
-                  ]).pipe(
+                  const [latestRevision, latestStoreSequence, subscribedThread] = yield* Effect.all(
+                    [
+                      orchestrationEventStore.getLatestThreadRevision(input.threadId),
+                      orchestrationEventStore.getLatestSequence(),
+                      projectionSnapshotQuery.getThreadShellByIdIncludingArchived(input.threadId),
+                    ],
+                  ).pipe(
                     Effect.mapError(
                       (cause) =>
                         new OrchestrationGetSnapshotError({
@@ -1047,6 +1050,7 @@ const makeWsRpcLayer = (currentSession: EnvironmentAuth.AuthenticatedSession) =>
                         }),
                     ),
                   );
+                  const liveBufferStream = Stream.fromQueue(liveBuffer);
                   const observedIdentityMatches =
                     input.observedRevision === latestRevision.latestSequence &&
                     (input.observedRevision === 0
@@ -1061,6 +1065,10 @@ const makeWsRpcLayer = (currentSession: EnvironmentAuth.AuthenticatedSession) =>
                     input.verifiedRevision !== undefined &&
                     input.verifiedRevision <= latestRevision.latestSequence &&
                     input.observedRevision !== undefined &&
+                    Option.exists(
+                      subscribedThread,
+                      (thread) => input.observedDataAudience === thread.dataAudience,
+                    ) &&
                     observedIdentityMatches;
                   if (canResumeFromCursor && requestedAfterSequence !== undefined) {
                     const catchUpStream = orchestrationEngine

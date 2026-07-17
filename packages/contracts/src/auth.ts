@@ -81,6 +81,7 @@ export const AuthAccessReadScope = "access:read" as const;
 export const AuthAccessWriteScope = "access:write" as const;
 export const AuthRelayReadScope = "relay:read" as const;
 export const AuthRelayWriteScope = "relay:write" as const;
+export const AuthProjectAudienceAdminScope = "admin:project-audience" as const;
 export const AuthEnvironmentScope = Schema.Literals([
   AuthOrchestrationReadScope,
   AuthOrchestrationOperateScope,
@@ -90,6 +91,7 @@ export const AuthEnvironmentScope = Schema.Literals([
   AuthAccessWriteScope,
   AuthRelayReadScope,
   AuthRelayWriteScope,
+  AuthProjectAudienceAdminScope,
 ]);
 export type AuthEnvironmentScope = typeof AuthEnvironmentScope.Type;
 export const AuthEnvironmentScopes = Schema.Array(AuthEnvironmentScope);
@@ -107,6 +109,15 @@ export const AuthAdministrativeScopes = [
   AuthAccessReadScope,
   AuthAccessWriteScope,
   AuthRelayWriteScope,
+] as const;
+/**
+ * Minted only by the local project administration CLI for the duration of one
+ * command. It is deliberately excluded from both standard and delegable
+ * administrative scope sets.
+ */
+export const AuthLocalProjectAudienceAdministrativeScopes = [
+  AuthOrchestrationReadScope,
+  AuthProjectAudienceAdminScope,
 ] as const;
 
 export const AuthTokenExchangeGrantType =

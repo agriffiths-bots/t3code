@@ -21,6 +21,7 @@ import { MAX_THREAD_CHECKPOINTS } from "./checkpointRetention.ts";
 import {
   MessageSentPayloadSchema,
   ProjectCreatedPayload,
+  ProjectDataAudienceSetPayload,
   ProjectDeletedPayload,
   ProjectMetaUpdatedPayload,
   ThreadActivityAppendedPayload,
@@ -556,6 +557,32 @@ export function projectEvent(
                   updatedAt: payload.updatedAt,
                 }
               : project,
+          ),
+        })),
+      );
+
+    case "project.data-audience-set":
+      return decodeForEvent(
+        ProjectDataAudienceSetPayload,
+        event.payload,
+        event.type,
+        "payload",
+      ).pipe(
+        Effect.map((payload) => ({
+          ...nextBase,
+          projects: nextBase.projects.map((project) =>
+            project.id === payload.projectId
+              ? {
+                  ...project,
+                  dataAudience: payload.newDataAudience,
+                  updatedAt: payload.updatedAt,
+                }
+              : project,
+          ),
+          threads: nextBase.threads.map((thread) =>
+            thread.projectId === payload.projectId
+              ? { ...thread, dataAudience: payload.newDataAudience }
+              : thread,
           ),
         })),
       );

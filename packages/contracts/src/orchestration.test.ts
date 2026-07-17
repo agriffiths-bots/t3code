@@ -6,9 +6,11 @@ import {
   DEFAULT_PROVIDER_INTERACTION_MODE,
   DEFAULT_RUNTIME_MODE,
   ClientOrchestrationCommand,
+  LocalAdminProjectDataAudienceSetCommand,
   ModelSelection,
   OrchestrationCommand,
   OrchestrationEvent,
+  OrchestrationRpcSchemas,
   OrchestrationGetFullThreadDiffInput,
   OrchestrationGetTurnDiffInput,
   OrchestrationLatestTurn,
@@ -34,6 +36,12 @@ const decodeProjectCreatedPayload = Schema.decodeUnknownEffect(ProjectCreatedPay
 const decodeProjectMetaUpdatedPayload = Schema.decodeUnknownEffect(ProjectMetaUpdatedPayload);
 const decodeThreadTurnStartCommand = Schema.decodeUnknownEffect(ThreadTurnStartCommand);
 const decodeClientOrchestrationCommand = Schema.decodeUnknownEffect(ClientOrchestrationCommand);
+const decodeLocalAdminProjectDataAudienceSetCommand = Schema.decodeUnknownEffect(
+  LocalAdminProjectDataAudienceSetCommand,
+);
+const decodeWsDispatchCommand = Schema.decodeUnknownEffect(
+  OrchestrationRpcSchemas.dispatchCommand.input,
+);
 const decodeThreadTurnStartRequestedPayload = Schema.decodeUnknownEffect(
   ThreadTurnStartRequestedPayload,
 );
@@ -55,6 +63,29 @@ const decodeOrchestrationThreadStreamItem = Schema.decodeUnknownEffect(
   OrchestrationThreadStreamItem,
 );
 const decodeThreadMetaUpdatedPayload = Schema.decodeUnknownEffect(ThreadMetaUpdatedPayload);
+
+it.effect(
+  "keeps project audience administration out of client and WebSocket dispatch schemas",
+  () =>
+    Effect.gen(function* () {
+      const command = {
+        type: "project.data-audience.set",
+        commandId: "local-admin:test",
+        projectId: "project-1",
+        expectedWorkspaceRoot: "/repo",
+        actor: "local-admin:test-user:1000",
+        occurredAt: "2026-07-17T12:00:00.000Z",
+      };
+
+      const trusted = yield* decodeLocalAdminProjectDataAudienceSetCommand(command);
+      assert.strictEqual(trusted.type, "project.data-audience.set");
+      assert.strictEqual(
+        (yield* Effect.exit(decodeClientOrchestrationCommand(command)))._tag,
+        "Failure",
+      );
+      assert.strictEqual((yield* Effect.exit(decodeWsDispatchCommand(command)))._tag, "Failure");
+    }),
+);
 
 it.effect("decodes legacy thread stream frames without a storage epoch", () =>
   Effect.gen(function* () {

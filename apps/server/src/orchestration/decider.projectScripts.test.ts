@@ -623,4 +623,112 @@ it.layer(NodeServices.layer)("decider project scripts", (it) => {
       });
     }),
   );
+
+  it.effect("rejects an audience change after the project is deleted", () =>
+    Effect.gen(function* () {
+      const createdAt = "2026-07-17T12:00:00.000Z";
+      const deletedAt = "2026-07-17T12:01:00.000Z";
+      const projectId = asProjectId("project-deleted-audience");
+      const withProject = yield* projectEvent(createEmptyReadModel(createdAt), {
+        sequence: 1,
+        eventId: asEventId("evt-project-deleted-audience-created"),
+        aggregateKind: "project",
+        aggregateId: projectId,
+        type: "project.created",
+        occurredAt: createdAt,
+        commandId: CommandId.make("cmd-project-deleted-audience-created"),
+        causationEventId: null,
+        correlationId: CommandId.make("cmd-project-deleted-audience-created"),
+        metadata: {},
+        payload: {
+          projectId,
+          title: "Deleted audience project",
+          workspaceRoot: "/repo/deleted-audience",
+          dataAudience: "private",
+          defaultModelSelection: null,
+          scripts: [],
+          createdAt,
+          updatedAt: createdAt,
+        },
+      });
+      const readModel = yield* projectEvent(withProject, {
+        sequence: 2,
+        eventId: asEventId("evt-project-deleted-audience-deleted"),
+        aggregateKind: "project",
+        aggregateId: projectId,
+        type: "project.deleted",
+        occurredAt: deletedAt,
+        commandId: CommandId.make("cmd-project-deleted-audience-deleted"),
+        causationEventId: null,
+        correlationId: CommandId.make("cmd-project-deleted-audience-deleted"),
+        metadata: {},
+        payload: { projectId, deletedAt },
+      });
+
+      const error = yield* decideOrchestrationCommand({
+        command: {
+          type: "project.data-audience.set",
+          commandId: CommandId.make("cmd-project-deleted-audience-set"),
+          projectId,
+          expectedWorkspaceRoot: "/repo/deleted-audience",
+          actor: "local-admin:test",
+          occurredAt: "2026-07-17T12:02:00.000Z",
+        },
+        readModel,
+      }).pipe(Effect.flip);
+
+      expect(error).toMatchObject({
+        _tag: "OrchestrationCommandInvariantError",
+        commandType: "project.data-audience.set",
+      });
+      if (error._tag === "OrchestrationCommandInvariantError") {
+        expect(error.detail).toContain("is deleted");
+      }
+    }),
+  );
+
+  it.effect("prevents a standard command from retargeting a factory project root", () =>
+    Effect.gen(function* () {
+      const now = "2026-07-17T12:00:00.000Z";
+      const projectId = asProjectId("project-factory-root-lock");
+      const readModel = yield* projectEvent(createEmptyReadModel(now), {
+        sequence: 1,
+        eventId: asEventId("evt-project-factory-root-lock"),
+        aggregateKind: "project",
+        aggregateId: projectId,
+        type: "project.created",
+        occurredAt: now,
+        commandId: CommandId.make("cmd-project-factory-root-lock"),
+        causationEventId: null,
+        correlationId: CommandId.make("cmd-project-factory-root-lock"),
+        metadata: {},
+        payload: {
+          projectId,
+          title: "Factory",
+          workspaceRoot: "/repo/factory",
+          dataAudience: "factory",
+          defaultModelSelection: null,
+          scripts: [],
+          createdAt: now,
+          updatedAt: now,
+        },
+      });
+
+      const error = yield* decideOrchestrationCommand({
+        command: {
+          type: "project.meta.update",
+          commandId: CommandId.make("cmd-project-factory-retarget"),
+          projectId,
+          workspaceRoot: "/home/user",
+        },
+        readModel,
+      }).pipe(Effect.flip);
+
+      expect(error._tag).toBe("OrchestrationCommandInvariantError");
+      if (error._tag !== "OrchestrationCommandInvariantError") {
+        throw new Error(`Expected OrchestrationCommandInvariantError, got ${error._tag}`);
+      }
+      expect(error.detail).toContain("cannot change workspace roots");
+    }),
+  );
 });

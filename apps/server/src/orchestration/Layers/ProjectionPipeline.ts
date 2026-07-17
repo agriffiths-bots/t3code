@@ -617,6 +617,21 @@ const makeOrchestrationProjectionPipeline = Effect.fn("makeOrchestrationProjecti
           return;
         }
 
+        case "project.data-audience-set": {
+          const existingRow = yield* projectionProjectRepository.getById({
+            projectId: event.payload.projectId,
+          });
+          if (Option.isNone(existingRow)) {
+            return;
+          }
+          yield* projectionProjectRepository.upsert({
+            ...existingRow.value,
+            dataAudience: event.payload.newDataAudience,
+            updatedAt: event.payload.updatedAt,
+          });
+          return;
+        }
+
         case "project.deleted": {
           const existingRow = yield* projectionProjectRepository.getById({
             projectId: event.payload.projectId,

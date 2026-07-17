@@ -1,6 +1,7 @@
 import {
   CommandId,
   AuthAdministrativeScopes,
+  AuthLocalProjectAudienceAdministrativeScopes,
   EnvironmentHttpApi,
   EnvironmentHttpCommonError,
   type OrchestrationReadModel,
@@ -30,6 +31,10 @@ import * as ProjectionSnapshotQuery from "../orchestration/Services/ProjectionSn
 import { OrchestrationLayerLive } from "../orchestration/runtimeLayer.ts";
 import { layerConfig as SqlitePersistenceLayerLive } from "../persistence/Layers/Sqlite.ts";
 import * as RepositoryIdentityResolver from "../project/RepositoryIdentityResolver.ts";
+import {
+  localProjectAudienceAdminSubject,
+  setProjectAudienceToFactory,
+} from "../project/ProjectAudienceAdministration.ts";
 import * as ServerRuntimeStartup from "../serverRuntimeStartup.ts";
 import {
   clearPersistedServerRuntimeState,
@@ -220,6 +225,23 @@ const withProjectCliSessionToken = <A, E, R>(
     (issued) => environmentAuth.revokeSession(issued.sessionId).pipe(Effect.ignore({ log: true })),
   );
 
+const withProjectAudienceAdminCliSessionToken = <A, E, R>(
+  environmentAuth: EnvironmentAuth.EnvironmentAuth["Service"],
+  run: (token: string) => Effect.Effect<A, E, R>,
+) => {
+  const actor = localProjectAudienceAdminSubject();
+  return Effect.acquireUseRelease(
+    environmentAuth.issueSession({
+      scopes: AuthLocalProjectAudienceAdministrativeScopes,
+      subject: actor,
+      label: "t3 project audience admin cli",
+      ttl: Duration.minutes(1),
+    }),
+    (issued) => run(issued.token),
+    (issued) => environmentAuth.revokeSession(issued.sessionId).pipe(Effect.ignore({ log: true })),
+  );
+};
+
 const withProjectCliLiveServerTimeout = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
   effect.pipe(Effect.timeout(PROJECT_CLI_LIVE_SERVER_TIMEOUT));
 
@@ -335,6 +357,22 @@ const dispatchLiveOrchestrationCommand = (
     Effect.mapError(projectCommandErrorFromLiveServerRequest),
   );
 
+const setLiveProjectAudienceToFactory = (
+  origin: string,
+  bearerToken: string,
+  projectId: ProjectId,
+) =>
+  Effect.gen(function* () {
+    const client = yield* makeLiveServerClient(origin);
+    yield* client.orchestration.setProjectAudienceToFactory({
+      headers: { authorization: `Bearer ${bearerToken}` },
+      payload: { projectId },
+    });
+  }).pipe(
+    withProjectCliLiveServerTimeout,
+    Effect.mapError(projectCommandErrorFromLiveServerRequest),
+  );
+
 const getOfflineSnapshot = Effect.fn("getOfflineSnapshot")(function* () {
   const projectionSnapshotQuery = yield* ProjectionSnapshotQuery.ProjectionSnapshotQuery;
   return yield* projectionSnapshotQuery.getSnapshot();
@@ -427,6 +465,51 @@ const runProjectMutation = Effect.fn("runProjectMutation")(function* (
         mode: "offline",
       });
       yield* Console.log(output);
+    }).pipe(Effect.provide(offlineRuntimeLayer));
+  }).pipe(
+    Effect.provide(
+      Layer.mergeAll(EnvironmentAuth.runtimeLayer, WorkspacePaths.layer).pipe(
+        Layer.provideMerge(FetchHttpClient.layer),
+        Layer.provide(ServerConfig.layer(config)),
+        Layer.provide(Layer.succeed(References.MinimumLogLevel, minimumLogLevel)),
+      ),
+    ),
+  );
+});
+
+const runProjectSetAudienceToFactory = Effect.fn("runProjectSetAudienceToFactory")(function* (
+  flags: CliAuthLocationFlags,
+  identifier: string,
+) {
+  const logLevel = yield* GlobalFlag.LogLevel;
+  const config = yield* resolveCliAuthConfig(flags, logLevel);
+  const minimumLogLevel = config.logLevel;
+
+  return yield* Effect.gen(function* () {
+    const environmentAuth = yield* EnvironmentAuth.EnvironmentAuth;
+    const liveMode = yield* tryResolveLiveProjectExecutionMode(environmentAuth, config);
+
+    if (Option.isSome(liveMode)) {
+      return yield* withProjectAudienceAdminCliSessionToken(environmentAuth, (token) =>
+        Effect.gen(function* () {
+          const snapshot = yield* fetchLiveOrchestrationSnapshot(liveMode.value.origin, token);
+          const project = yield* findActiveProjectTarget({ snapshot, identifier });
+          yield* setLiveProjectAudienceToFactory(liveMode.value.origin, token, project.id);
+          yield* Console.log(`Set project ${project.id} (${project.title}) audience to factory.`);
+        }),
+      );
+    }
+
+    const offlineRuntimeLayer = ProjectCliRuntimeLive.pipe(
+      Layer.provide(ServerConfig.layer(config)),
+      Layer.provide(Layer.succeed(References.MinimumLogLevel, minimumLogLevel)),
+    );
+    const actor = localProjectAudienceAdminSubject();
+    return yield* Effect.gen(function* () {
+      const snapshot = yield* getOfflineSnapshot();
+      const project = yield* findActiveProjectTarget({ snapshot, identifier });
+      yield* setProjectAudienceToFactory({ projectId: project.id, actor });
+      yield* Console.log(`Set project ${project.id} (${project.title}) audience to factory.`);
     }).pipe(Effect.provide(offlineRuntimeLayer));
   }).pipe(
     Effect.provide(
@@ -563,7 +646,24 @@ const projectRenameCommand = Command.make("rename", {
   ),
 );
 
+const projectSetAudienceToFactoryCommand = Command.make("set-audience-to-factory", {
+  ...projectLocationFlags,
+  project: Argument.string("project").pipe(
+    Argument.withDescription("Project id or workspace root to classify as factory data."),
+  ),
+}).pipe(
+  Command.withDescription(
+    "Classify a dedicated repository project as factory data from the local admin context.",
+  ),
+  Command.withHandler((flags) => runProjectSetAudienceToFactory(flags, flags.project)),
+);
+
 export const projectCommand = Command.make("project").pipe(
   Command.withDescription("Manage projects."),
-  Command.withSubcommands([projectAddCommand, projectRemoveCommand, projectRenameCommand]),
+  Command.withSubcommands([
+    projectAddCommand,
+    projectRemoveCommand,
+    projectRenameCommand,
+    projectSetAudienceToFactoryCommand,
+  ]),
 );

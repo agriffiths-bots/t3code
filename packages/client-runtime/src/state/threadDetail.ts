@@ -27,9 +27,9 @@ const EMPTY_CHECKPOINTS: ReadonlyArray<OrchestrationCheckpointSummary> = Object.
  *
  * Shell and detail subscriptions are intentionally independent. A cached detail can
  * therefore briefly outlive a newer shell snapshot after reconnecting. Workspace
- * consumers must use the shell branch/worktree/project fields so they do not target
- * a stale checkout while retaining messages, activities, plans, and checkpoints
- * from the detail subscription.
+ * consumers must use the shell branch/worktree/project/audience fields so they do
+ * not target a stale checkout or audience while retaining messages, activities,
+ * plans, and checkpoints from the detail subscription.
  */
 export function mergeEnvironmentThread(
   detail: EnvironmentThread | null,
@@ -47,6 +47,7 @@ export function mergeEnvironmentThread(
     environmentId: shell.environmentId,
     id: shell.id,
     projectId: shell.projectId,
+    dataAudience: shell.dataAudience,
     title: shell.title,
     modelSelection: shell.modelSelection,
     runtimeMode: shell.runtimeMode,

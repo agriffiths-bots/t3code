@@ -84,6 +84,9 @@ const READ_PAGE_SIZE = 500;
 function inferActorKind(
   event: Omit<OrchestrationEvent, "sequence">,
 ): Schema.Schema.Type<typeof OrchestrationActorKind> {
+  if (event.type === "project.data-audience-set") {
+    return "local-admin";
+  }
   if (event.commandId !== null && event.commandId.startsWith("provider:")) {
     return "provider";
   }

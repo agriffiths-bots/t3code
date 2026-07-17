@@ -199,7 +199,7 @@ function makeHarness() {
 }
 
 describe("environment entity projections", () => {
-  it("composes detail collections with authoritative shell workspace metadata", () => {
+  it("composes detail collections with authoritative shell workspace and audience metadata", () => {
     const messages: OrchestrationThread["messages"] = [];
     const detail = {
       ...THREAD_SHELL,
@@ -217,6 +217,7 @@ describe("environment entity projections", () => {
     const shell = {
       ...THREAD_SHELL,
       environmentId: ENVIRONMENT_ID,
+      dataAudience: "factory" as const,
       title: "Current thread",
       branch: "current-branch",
       worktreePath: "/repo/current-worktree",
@@ -225,6 +226,7 @@ describe("environment entity projections", () => {
     const merged = mergeEnvironmentThread(detail, shell);
 
     expect(merged).toMatchObject({
+      dataAudience: "factory",
       title: "Current thread",
       branch: "current-branch",
       worktreePath: "/repo/current-worktree",
