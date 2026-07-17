@@ -54,7 +54,7 @@ import { useSelectedThreadWorktree } from "../../state/use-selected-thread-workt
 import { useThreadSelection } from "../../state/use-thread-selection";
 import { vcsEnvironment } from "../../state/vcs";
 import { WorkspaceSidebarToolbar } from "../layout/workspace-sidebar-toolbar";
-import { ThreadGitMenu } from "../threads/ThreadGitControls";
+import { AndroidThreadGitMenu, ThreadGitMenu } from "../threads/ThreadGitControls";
 import { useReviewCacheForThread } from "./reviewState";
 import {
   type NativeReviewDiffViewHandle,
@@ -637,18 +637,31 @@ export function ReviewSheet(props: ReviewSheetProps) {
           subtitle={androidHeaderSubtitle || "Select a diff"}
           onBack={handleReturnToThread}
           trailing={
-            showSectionToolbar ? (
-              <ControlPillMenu
-                actions={androidSectionMenuActions}
-                isAnchoredToRight
-                onPressAction={handleAndroidSectionMenuAction}
-              >
-                <AndroidHeaderIconButton
-                  accessibilityLabel="Select review diff"
-                  icon="ellipsis.circle"
+            <>
+              {gitMenuAvailable && selectedThread !== null ? (
+                <AndroidThreadGitMenu
+                  environmentId={environmentId}
+                  threadId={threadId}
+                  currentBranch={selectedThread.branch ?? null}
+                  gitStatus={gitStatusQuery.data}
+                  gitOperationLabel={gitState.gitOperationLabel}
+                  onPull={gitActions.onPullSelectedThreadBranch}
+                  onRunAction={gitActions.onRunSelectedThreadGitAction}
                 />
-              </ControlPillMenu>
-            ) : null
+              ) : null}
+              {showSectionToolbar ? (
+                <ControlPillMenu
+                  actions={androidSectionMenuActions}
+                  isAnchoredToRight
+                  onPressAction={handleAndroidSectionMenuAction}
+                >
+                  <AndroidHeaderIconButton
+                    accessibilityLabel="Select review diff"
+                    icon="ellipsis.circle"
+                  />
+                </ControlPillMenu>
+              ) : null}
+            </>
           }
         />
       ) : null}

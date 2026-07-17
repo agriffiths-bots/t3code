@@ -10,10 +10,13 @@ import {
   requiresDefaultBranchConfirmation,
   resolveQuickAction,
 } from "@t3tools/client-runtime/state/vcs";
+import type { MenuAction } from "@react-native-menu/menu";
 import { useNavigation } from "@react-navigation/native";
 import { NativeHeaderToolbar } from "../../native/StackHeader";
 import { useCallback, useMemo } from "react";
 import { Alert } from "react-native";
+import { AndroidHeaderIconButton } from "../../components/AndroidScreenHeader";
+import { ControlPillMenu } from "../../components/ControlPill";
 import { tryOpenExternalUrl } from "../../lib/openExternalUrl";
 import {
   basename,
@@ -538,5 +541,76 @@ export function ThreadGitMenu(props: ThreadGitMenuProps) {
         <NativeHeaderToolbar.Label>More</NativeHeaderToolbar.Label>
       </NativeHeaderToolbar.MenuAction>
     </NativeHeaderToolbar.Menu>
+  );
+}
+
+/** Android rendering of the shared thread git-action model. */
+export function AndroidThreadGitMenu(props: ThreadGitMenuProps) {
+  const model = useThreadGitControlModel(props);
+  const actions = useMemo<MenuAction[]>(
+    () => [
+      {
+        id: "status",
+        title: compactMenuBranchLabel(model.currentBranchLabel),
+        subtitle: compactMenuStatus(props.gitStatus),
+        image: "point.topleft.down.curvedto.point.bottomright.up",
+        attributes: { disabled: true },
+      },
+      {
+        id: "quick-action",
+        title: model.quickAction.label,
+        subtitle: model.quickActionHint ?? undefined,
+        image: model.quickActionIcon,
+        attributes: model.quickAction.disabled ? { disabled: true } : undefined,
+      },
+      {
+        id: "review",
+        title: "Review changes",
+        subtitle: "Turn diffs and worktree changes",
+        image: "text.bubble",
+        attributes: model.isRepo ? undefined : { disabled: true },
+      },
+      {
+        id: "more",
+        title: "More",
+        subtitle: "Commit, files, branches",
+        image: "ellipsis",
+      },
+    ],
+    [
+      model.currentBranchLabel,
+      model.isRepo,
+      model.quickAction.disabled,
+      model.quickAction.label,
+      model.quickActionHint,
+      model.quickActionIcon,
+      props.gitStatus,
+    ],
+  );
+  const handleAction = useCallback(
+    (event: { readonly nativeEvent: { readonly event: string } }) => {
+      if (event.nativeEvent.event === "quick-action") {
+        void model.runQuickAction();
+      } else if (event.nativeEvent.event === "review") {
+        model.openReview();
+      } else if (event.nativeEvent.event === "more") {
+        model.openGitInspector();
+      }
+    },
+    [model],
+  );
+
+  return (
+    <ControlPillMenu
+      actions={actions}
+      isAnchoredToRight
+      title="Git actions"
+      onPressAction={handleAction}
+    >
+      <AndroidHeaderIconButton
+        accessibilityLabel="Git actions"
+        icon="point.topleft.down.curvedto.point.bottomright.up"
+      />
+    </ControlPillMenu>
   );
 }
