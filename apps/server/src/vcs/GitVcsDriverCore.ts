@@ -871,6 +871,20 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
       }),
     );
 
+  const executeGitWithStableDiagnostics = (
+    operation: string,
+    cwd: string,
+    args: readonly string[],
+    options: ExecuteGitOptions = {},
+  ): Effect.Effect<GitVcsDriver.ExecuteGitResult, GitCommandError> =>
+    executeGit(operation, cwd, args, {
+      ...options,
+      env: {
+        ...options.env,
+        LC_ALL: "C",
+      },
+    });
+
   const runGit = (
     operation: string,
     cwd: string,
@@ -1225,7 +1239,7 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
   });
 
   const readStatusDetailsRemote = Effect.fn("readStatusDetailsRemote")(function* (cwd: string) {
-    const branchResult = yield* executeGit(
+    const branchResult = yield* executeGitWithStableDiagnostics(
       "GitVcsDriver.statusDetailsRemote.branch",
       cwd,
       ["rev-parse", "--abbrev-ref", "HEAD"],
@@ -1309,7 +1323,7 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
   });
 
   const readStatusDetailsLocal = Effect.fn("readStatusDetailsLocal")(function* (cwd: string) {
-    const statusResult = yield* executeGit(
+    const statusResult = yield* executeGitWithStableDiagnostics(
       "GitVcsDriver.statusDetails.status",
       cwd,
       ["status", "--porcelain=2", "--branch"],
@@ -1989,7 +2003,7 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
   const listRefs: GitVcsDriver.GitVcsDriver["Service"]["listRefs"] = Effect.fn("listRefs")(
     function* (input) {
       const refListFormat = "%(refname)%09%(committerdate:unix)";
-      const localRefListResult = yield* executeGit(
+      const localRefListResult = yield* executeGitWithStableDiagnostics(
         "GitVcsDriver.listRefs.localForEachRef",
         input.cwd,
         ["for-each-ref", `--format=${refListFormat}`, "refs/heads"],
@@ -2029,7 +2043,7 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
           `GitVcsDriver.listRefs: local ref lookup returned code ${localRefListResult.exitCode} for ${input.cwd}: ${stderr}. Falling back to git branch.`,
         );
 
-        const fallbackLocalBranchResult = yield* executeGit(
+        const fallbackLocalBranchResult = yield* executeGitWithStableDiagnostics(
           "GitVcsDriver.listRefs.localBranchFallback",
           input.cwd,
           ["branch", "--no-color", "--no-column"],
