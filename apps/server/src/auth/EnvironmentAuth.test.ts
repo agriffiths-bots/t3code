@@ -3,6 +3,7 @@ import { AuthAdministrativeScopes } from "@t3tools/contracts";
 import { expect, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import * as SqlClient from "effect/unstable/sql/SqlClient";
 
 import * as ServerConfig from "../config.ts";
 import { SqlitePersistenceMemory } from "../persistence/Layers/Sqlite.ts";
@@ -25,7 +26,7 @@ const makeServerConfigLayer = (overrides?: Partial<ServerConfig.ServerConfig["Se
 
 const makeEnvironmentAuthLayer = (overrides?: Partial<ServerConfig.ServerConfig["Service"]>) =>
   EnvironmentAuth.layer.pipe(
-    Layer.provide(SqlitePersistenceMemory),
+    Layer.provideMerge(SqlitePersistenceMemory),
     Layer.provide(ServerSecretStore.layer),
     Layer.provide(makeServerConfigLayer(overrides)),
   );
@@ -134,6 +135,8 @@ it.layer(NodeServices.layer)("EnvironmentAuth.layer", (it) => {
       expect(pairingCredential.audienceCeiling).toBe("factory");
       expect(exchanged.response.audienceCeiling).toBe("factory");
       expect(verified.audienceCeiling).toBe("factory");
+      expect(exchanged.response.scopes).toEqual(["relay:read"]);
+      expect(verified.scopes).toEqual(["relay:read"]);
     }).pipe(Effect.provide(makeEnvironmentAuthLayer())),
   );
 
@@ -169,10 +172,18 @@ it.layer(NodeServices.layer)("EnvironmentAuth.layer", (it) => {
           { audienceCeiling: "private" },
         )
         .pipe(Effect.flip);
+      const retried = yield* serverAuth.exchangeBootstrapCredentialForAccessToken(
+        pairingCredential.credential,
+        undefined,
+        requestMetadata,
+        { audienceCeiling: "factory" },
+      );
       const sessions = yield* serverAuth.listSessions();
 
       expect(error._tag).toBe("ServerAuthAudienceNotGrantedError");
-      expect(sessions).toHaveLength(0);
+      expect(retried.audienceCeiling).toBe("factory");
+      expect(retried.scope).toBe("relay:read");
+      expect(sessions).toHaveLength(1);
     }).pipe(Effect.provide(makeEnvironmentAuthLayer())),
   );
 
@@ -191,8 +202,42 @@ it.layer(NodeServices.layer)("EnvironmentAuth.layer", (it) => {
           { audienceCeiling: "private" },
         )
         .pipe(Effect.flip);
+      const retried = yield* serverAuth.exchangeBootstrapCredentialForAccessToken(
+        pairingCredential.credential,
+        ["orchestration:read"],
+        requestMetadata,
+        { audienceCeiling: "private" },
+      );
 
       expect(error._tag).toBe("ServerAuthScopeNotGrantedError");
+      expect(retried.scope).toBe("orchestration:read");
+    }).pipe(Effect.provide(makeEnvironmentAuthLayer())),
+  );
+
+  it.effect("validates factory-effective scopes before consuming a private grant", () =>
+    Effect.gen(function* () {
+      const serverAuth = yield* EnvironmentAuth.EnvironmentAuth;
+      const pairingCredential = yield* serverAuth.issuePairingCredential({
+        audienceCeiling: "private",
+      });
+
+      const error = yield* serverAuth
+        .exchangeBootstrapCredentialForAccessToken(
+          pairingCredential.credential,
+          ["orchestration:read"],
+          requestMetadata,
+          { audienceCeiling: "factory" },
+        )
+        .pipe(Effect.flip);
+      const retried = yield* serverAuth.exchangeBootstrapCredentialForAccessToken(
+        pairingCredential.credential,
+        ["relay:read"],
+        requestMetadata,
+        { audienceCeiling: "factory" },
+      );
+
+      expect(error._tag).toBe("ServerAuthInvalidScopeError");
+      expect(retried.scope).toBe("relay:read");
     }).pipe(Effect.provide(makeEnvironmentAuthLayer())),
   );
 
@@ -212,6 +257,48 @@ it.layer(NodeServices.layer)("EnvironmentAuth.layer", (it) => {
       );
 
       expect(token.scope).toBe("orchestration:read");
+    }).pipe(Effect.provide(makeEnvironmentAuthLayer())),
+  );
+
+  it.effect("rejects a migrated zero-scope grant before consuming it", () =>
+    Effect.gen(function* () {
+      const serverAuth = yield* EnvironmentAuth.EnvironmentAuth;
+      const sql = yield* SqlClient.SqlClient;
+      const pairingCredential = yield* serverAuth.issuePairingCredential({
+        audienceCeiling: "factory",
+      });
+      yield* sql`
+        UPDATE auth_pairing_links
+        SET scopes = ${"[]"}
+        WHERE credential = ${pairingCredential.credential}
+      `;
+
+      const error = yield* serverAuth
+        .exchangeBootstrapCredentialForAccessToken(
+          pairingCredential.credential,
+          undefined,
+          requestMetadata,
+          { audienceCeiling: "factory" },
+        )
+        .pipe(Effect.flip);
+      const browserError = yield* serverAuth
+        .createBrowserSession(pairingCredential.credential, requestMetadata)
+        .pipe(Effect.flip);
+      yield* sql`
+        UPDATE auth_pairing_links
+        SET scopes = ${'["relay:read"]'}
+        WHERE credential = ${pairingCredential.credential}
+      `;
+      const retried = yield* serverAuth.exchangeBootstrapCredentialForAccessToken(
+        pairingCredential.credential,
+        undefined,
+        requestMetadata,
+        { audienceCeiling: "factory" },
+      );
+
+      expect(error._tag).toBe("ServerAuthInvalidScopeError");
+      expect(browserError._tag).toBe("ServerAuthInvalidCredentialError");
+      expect(retried.scope).toBe("relay:read");
     }).pipe(Effect.provide(makeEnvironmentAuthLayer())),
   );
 

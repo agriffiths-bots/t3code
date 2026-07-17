@@ -14,6 +14,7 @@ import {
   issueRemoteDpopWebSocketTicket,
   issueRemoteWebSocketTicket,
   RemoteEnvironmentAccessRejectedError,
+  RemoteEnvironmentAudienceCeilingMismatchError,
   RemoteEnvironmentAuthInvalidJsonError,
   RemoteEnvironmentAuthTimeoutError,
   resolveRemoteWebSocketConnectionUrl,
@@ -135,6 +136,61 @@ describe("remote environment authorization", () => {
         },
         body: "grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Atoken-exchange&subject_token=pairing-token&subject_token_type=urn%3At3%3Aparams%3Aoauth%3Atoken-type%3Aenvironment-bootstrap&requested_token_type=urn%3Aietf%3Aparams%3Aoauth%3Atoken-type%3Aaccess_token&audience_ceiling=private",
       });
+    }),
+  );
+
+  it.effect("treats legacy token responses as private without allowing factory widening", () =>
+    Effect.gen(function* () {
+      const privateFetch = recordedFetch(
+        Response.json({
+          access_token: "legacy-bearer-token",
+          issued_token_type: "urn:ietf:params:oauth:token-type:access_token",
+          token_type: "Bearer",
+          expires_in: 3600,
+          scope: "orchestration:read",
+        }),
+      );
+
+      const result = yield* bootstrapRemoteBearerSession({
+        httpBaseUrl: "https://legacy.example.com/",
+        credential: "legacy-pairing-token",
+        audienceCeiling: "private",
+      }).pipe(provideRemoteHttp(privateFetch.fetchFn));
+
+      const factoryBearerFetch = recordedFetch(
+        Response.json({
+          access_token: "legacy-bearer-token",
+          issued_token_type: "urn:ietf:params:oauth:token-type:access_token",
+          token_type: "Bearer",
+          expires_in: 3600,
+          scope: "orchestration:read",
+        }),
+      );
+      const bearerError = yield* bootstrapRemoteBearerSession({
+        httpBaseUrl: "https://legacy.example.com/",
+        credential: "legacy-pairing-token",
+        audienceCeiling: "factory",
+      }).pipe(provideRemoteHttp(factoryBearerFetch.fetchFn), Effect.flip);
+
+      const factoryDpopFetch = recordedFetch(
+        Response.json({
+          access_token: "legacy-dpop-token",
+          issued_token_type: "urn:ietf:params:oauth:token-type:access_token",
+          token_type: "DPoP",
+          expires_in: 3600,
+          scope: "orchestration:read",
+        }),
+      );
+      const dpopError = yield* exchangeRemoteDpopAccessToken({
+        httpBaseUrl: "https://legacy.example.com/",
+        credential: "legacy-pairing-token",
+        audienceCeiling: "factory",
+        dpopProof: "proof",
+      }).pipe(provideRemoteHttp(factoryDpopFetch.fetchFn), Effect.flip);
+
+      expect(result.audienceCeiling).toBe("private");
+      expect(bearerError).toBeInstanceOf(RemoteEnvironmentAudienceCeilingMismatchError);
+      expect(dpopError).toBeInstanceOf(RemoteEnvironmentAudienceCeilingMismatchError);
     }),
   );
 

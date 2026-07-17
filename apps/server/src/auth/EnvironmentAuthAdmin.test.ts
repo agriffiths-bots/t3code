@@ -45,7 +45,7 @@ it.layer(NodeServices.layer)("EnvironmentAuth administrative operations", (it) =
 
       const created = yield* environmentAuth.createPairingLink({
         audienceCeiling: "factory",
-        scopes: ["orchestration:read"],
+        scopes: ["orchestration:read", "relay:read"],
         subject: "one-time-token",
         label: "CI phone",
       });
@@ -53,13 +53,14 @@ it.layer(NodeServices.layer)("EnvironmentAuth administrative operations", (it) =
       const revoked = yield* environmentAuth.revokePairingLink(created.id);
       const listedAfterRevoke = yield* environmentAuth.listPairingLinks();
 
-      expect(created.scopes).toEqual(["orchestration:read"]);
+      expect(created.scopes).toEqual(["relay:read"]);
       expect(created.audienceCeiling).toBe("factory");
       expect(created.credential.length).toBeGreaterThan(0);
       expect(listedBeforeRevoke).toHaveLength(1);
       expect(listedBeforeRevoke[0]?.id).toBe(created.id);
       expect(listedBeforeRevoke[0]?.label).toBe("CI phone");
       expect(listedBeforeRevoke[0]?.credential).toBe(created.credential);
+      expect(listedBeforeRevoke[0]?.scopes).toEqual(["relay:read"]);
       expect(revoked).toBe(true);
       expect(listedAfterRevoke).toHaveLength(0);
     }).pipe(Effect.provide(makeEnvironmentAuthLayer())),

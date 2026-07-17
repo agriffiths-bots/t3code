@@ -213,7 +213,7 @@ it.layer(NodeServices.layer)("PairingGrantStore.layer", (it) => {
       });
       const second = yield* bootstrapCredentials.issueOneTimeToken({
         audienceCeiling: "factory",
-        scopes: ["orchestration:read", "access:write"],
+        scopes: ["orchestration:read", "access:write", "relay:read"],
       });
 
       const activeBeforeRevoke = yield* bootstrapCredentials.listActive();
@@ -225,6 +225,9 @@ it.layer(NodeServices.layer)("PairingGrantStore.layer", (it) => {
       expect(activeBeforeRevoke.find((entry) => entry.id === second.id)?.audienceCeiling).toBe(
         "factory",
       );
+      expect(activeBeforeRevoke.find((entry) => entry.id === second.id)?.scopes).toEqual([
+        "relay:read",
+      ]);
 
       const revoked = yield* bootstrapCredentials.revoke(first.id);
       const activeAfterRevoke = yield* bootstrapCredentials.listActive();
@@ -235,6 +238,22 @@ it.layer(NodeServices.layer)("PairingGrantStore.layer", (it) => {
       expect(activeAfterRevoke.map((entry) => entry.id)).toContain(second.id);
       expect(revokedConsume.message).toContain("no longer available");
       expect(revokedConsume._tag).toBe("UnavailableBootstrapCredentialError");
+    }).pipe(Effect.provide(makePairingGrantStoreLayer())),
+  );
+
+  it.effect("rejects factory grants when every requested scope is denied", () =>
+    Effect.gen(function* () {
+      const bootstrapCredentials = yield* PairingGrantStore.PairingGrantStore;
+      const error = yield* bootstrapCredentials
+        .issueOneTimeToken({
+          audienceCeiling: "factory",
+          scopes: ["orchestration:read", "access:write"],
+        })
+        .pipe(Effect.flip);
+      const active = yield* bootstrapCredentials.listActive();
+
+      expect(error._tag).toBe("PairingCredentialIssueError");
+      expect(active).toEqual([]);
     }).pipe(Effect.provide(makePairingGrantStoreLayer())),
   );
 

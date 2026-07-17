@@ -113,6 +113,11 @@ export function mapRemoteEnvironmentError(
   error: RemoteEnvironmentAuthError,
 ): ConnectionAttemptError {
   switch (error._tag) {
+    case "RemoteEnvironmentAudienceCeilingMismatchError":
+      return new ConnectionBlockedError({
+        reason: "permission",
+        detail: "The environment did not enforce the requested audience restriction.",
+      });
     case "EnvironmentAuthInvalidError":
       return new ConnectionBlockedError({
         reason: "authentication",

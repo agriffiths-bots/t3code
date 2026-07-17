@@ -37,6 +37,7 @@ import * as HttpApiBuilder from "effect/unstable/httpapi/HttpApiBuilder";
 
 import * as EnvironmentAuth from "./EnvironmentAuth.ts";
 import * as SessionStore from "./SessionStore.ts";
+import { restrictScopesForAudienceCeiling } from "./audienceScopePolicy.ts";
 import { traceAuthenticatedRelayRequest, traceRelayRequest } from "../cloud/traceRelayRequest.ts";
 import * as ServerConfig from "../config.ts";
 import { deriveAuthClientMetadata } from "./utils.ts";
@@ -424,6 +425,12 @@ export const authHttpApiLayer = HttpApiBuilder.group(
             if (
               delegatedScopes.length === 0 ||
               new Set<AuthEnvironmentScope>(delegatedScopes).size !== delegatedScopes.length
+            ) {
+              return yield* failEnvironmentInvalidRequest("invalid_scope");
+            }
+            if (
+              restrictScopesForAudienceCeiling(delegatedScopes, args.payload.audienceCeiling)
+                .length === 0
             ) {
               return yield* failEnvironmentInvalidRequest("invalid_scope");
             }

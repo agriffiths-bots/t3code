@@ -1,8 +1,11 @@
 import * as NodeServices from "@effect/platform-node/NodeServices";
+import { AuthAudienceCeiling, AuthEnvironmentScopes, AuthSessionId } from "@t3tools/contracts";
 import { expect, it } from "@effect/vitest";
+import * as DateTime from "effect/DateTime";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import * as Schema from "effect/Schema";
 import * as TestClock from "effect/testing/TestClock";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
 
@@ -12,6 +15,21 @@ import { SqlitePersistenceMemory } from "../persistence/Layers/Sqlite.ts";
 import * as AuthSessions from "../persistence/AuthSessions.ts";
 import * as SessionStore from "./SessionStore.ts";
 import * as ServerSecretStore from "./ServerSecretStore.ts";
+import { base64UrlEncode, signPayload } from "./utils.ts";
+
+const ExistingSessionClaims = Schema.Struct({
+  v: Schema.Literal(1),
+  kind: Schema.Literal("session"),
+  sid: AuthSessionId,
+  sub: Schema.String,
+  scopes: AuthEnvironmentScopes,
+  audienceCeiling: AuthAudienceCeiling,
+  method: Schema.Literal("bearer-access-token"),
+  iat: Schema.Number,
+  exp: Schema.Number,
+});
+const encodeExistingSessionClaims = Schema.encodeSync(Schema.fromJsonString(ExistingSessionClaims));
+const encodeEnvironmentScopes = Schema.encodeSync(Schema.fromJsonString(AuthEnvironmentScopes));
 
 const makeServerConfigLayer = (
   overrides?: Partial<Pick<ServerConfig.ServerConfig["Service"], "desktopBootstrapToken">>,
@@ -32,7 +50,7 @@ const makeSessionStoreLayer = (
 ) =>
   SessionStore.layer.pipe(
     Layer.provideMerge(SqlitePersistenceMemory),
-    Layer.provide(ServerSecretStore.layer),
+    Layer.provideMerge(ServerSecretStore.layer),
     Layer.provide(makeServerConfigLayer(overrides)),
   );
 
@@ -167,14 +185,77 @@ it.layer(NodeServices.layer)("SessionStore.layer", (it) => {
       expect(verified.method).toBe("bearer-access-token");
       expect(verified.subject).toBe("test-clock");
       expect(verified.audienceCeiling).toBe("factory");
-      expect(verified.scopes).toEqual([
+      expect(issued.scopes).toEqual(["relay:read"]);
+      expect(verified.scopes).toEqual(["relay:read"]);
+    }).pipe(Effect.provide(Layer.merge(makeSessionStoreLayer(), TestClock.layer()))),
+  );
+
+  it.effect("rejects factory sessions when every requested scope is denied", () =>
+    Effect.gen(function* () {
+      const sessions = yield* SessionStore.SessionStore;
+      const error = yield* sessions
+        .issue({
+          audienceCeiling: "factory",
+          method: "bearer-access-token",
+          subject: "denied-factory-session",
+          scopes: ["orchestration:read"],
+        })
+        .pipe(Effect.flip);
+      const active = yield* sessions.listActive();
+
+      expect(error._tag).toBe("SessionCredentialIssueError");
+      expect(active).toEqual([]);
+    }).pipe(Effect.provide(makeSessionStoreLayer())),
+  );
+
+  it.effect("removes denied scopes while verifying existing factory claims", () =>
+    Effect.gen(function* () {
+      const sessions = yield* SessionStore.SessionStore;
+      const secretStore = yield* ServerSecretStore.ServerSecretStore;
+      const sql = yield* SqlClient.SqlClient;
+      const issued = yield* sessions.issue({
+        audienceCeiling: "factory",
+        method: "bearer-access-token",
+        subject: "existing-factory-claim",
+      });
+      const now = yield* DateTime.now;
+      const overbroadScopes = [
         "orchestration:read",
         "orchestration:operate",
         "terminal:operate",
         "review:write",
         "relay:read",
-      ]);
-    }).pipe(Effect.provide(Layer.merge(makeSessionStoreLayer(), TestClock.layer()))),
+        "access:read",
+        "access:write",
+        "relay:write",
+      ] as const;
+      yield* sql`
+        UPDATE auth_sessions
+        SET scopes = ${encodeEnvironmentScopes(overbroadScopes)}
+        WHERE session_id = ${issued.sessionId}
+      `;
+      const encodedPayload = base64UrlEncode(
+        encodeExistingSessionClaims({
+          v: 1,
+          kind: "session",
+          sid: issued.sessionId,
+          sub: "existing-factory-claim",
+          scopes: overbroadScopes,
+          audienceCeiling: "factory",
+          method: "bearer-access-token",
+          iat: now.epochMilliseconds,
+          exp: issued.expiresAt.epochMilliseconds,
+        }),
+      );
+      const signingSecret = yield* secretStore.getOrCreateRandom("server-signing-key", 32);
+      const existingToken = `${encodedPayload}.${signPayload(encodedPayload, signingSecret)}`;
+      const verified = yield* sessions.verify(existingToken);
+      const websocket = yield* sessions.issueWebSocketToken(issued.sessionId);
+      const verifiedWebSocket = yield* sessions.verifyWebSocketToken(websocket.token);
+
+      expect(verified.scopes).toEqual(["relay:read"]);
+      expect(verifiedWebSocket.scopes).toEqual(["relay:read"]);
+    }).pipe(Effect.provide(makeSessionStoreLayer())),
   );
 
   it.effect("rejects websocket tokens once the parent session has expired", () =>
@@ -258,7 +339,7 @@ it.layer(NodeServices.layer)("SessionStore.layer", (it) => {
       const client = yield* sessions.issue({
         audienceCeiling: "factory",
         subject: "one-time-token",
-        scopes: ["orchestration:read"],
+        scopes: ["orchestration:read", "relay:read"],
         client: {
           label: "Julius iPhone",
           deviceType: "mobile",
@@ -285,6 +366,9 @@ it.layer(NodeServices.layer)("SessionStore.layer", (it) => {
       expect(
         beforeRevoke.find((entry) => entry.sessionId === client.sessionId)?.audienceCeiling,
       ).toBe("factory");
+      expect(beforeRevoke.find((entry) => entry.sessionId === client.sessionId)?.scopes).toEqual([
+        "relay:read",
+      ]);
       expect(beforeRevoke.find((entry) => entry.sessionId === client.sessionId)?.client.label).toBe(
         "Julius iPhone",
       );

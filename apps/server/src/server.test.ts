@@ -3369,6 +3369,81 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
     }).pipe(Effect.provide(NodeHttpServer.layerTest)),
   );
 
+  it.effect("denies factory-ceiling sessions access to private orchestration surfaces", () =>
+    Effect.gen(function* () {
+      yield* buildAppUnderTest();
+
+      const ownerCookie = yield* getAuthenticatedSessionCookieHeader();
+      const deniedGrantResponse = yield* HttpClient.post("/api/auth/pairing-token", {
+        headers: { cookie: ownerCookie },
+        body: yield* HttpBody.json({
+          audienceCeiling: "factory",
+          scopes: ["orchestration:read"],
+        }),
+      });
+      const deniedGrantBody = (yield* deniedGrantResponse.json) as {
+        readonly reason: string;
+      };
+      assert.equal(deniedGrantResponse.status, 400);
+      assert.equal(deniedGrantBody.reason, "invalid_scope");
+
+      const { response: exchangeResponse, body: tokenBody } = yield* exchangeAccessToken(
+        defaultDesktopBootstrapToken,
+        { audienceCeiling: "factory" },
+      );
+      assert.equal(exchangeResponse.status, 200);
+      assert.equal(tokenBody.scope, "relay:read");
+      assert.isDefined(tokenBody.access_token);
+
+      const authorization = `Bearer ${tokenBody.access_token ?? ""}`;
+      const snapshotResponse = yield* fetchEffect(
+        yield* getHttpServerUrl("/api/orchestration/snapshot"),
+        { headers: { authorization } },
+      );
+      const shellResponse = yield* fetchEffect(
+        yield* getHttpServerUrl("/api/orchestration/shell"),
+        { headers: { authorization } },
+      );
+      const threadResponse = yield* fetchEffect(
+        yield* getHttpServerUrl(`/api/orchestration/threads/${defaultThreadId}`),
+        { headers: { authorization } },
+      );
+      const dispatchResponse = yield* fetchEffect(
+        yield* getHttpServerUrl("/api/orchestration/dispatch"),
+        {
+          method: "POST",
+          headers: { authorization, "content-type": "application/json" },
+          body: jsonRequestBody({
+            type: "thread.turn.start",
+            commandId: CommandId.make("cmd-factory-ceiling-denied"),
+            threadId: defaultThreadId,
+            message: {
+              messageId: MessageId.make("msg-factory-ceiling-denied"),
+              role: "user",
+              text: "must not dispatch",
+              attachments: [],
+            },
+            interactionMode: "default",
+            runtimeMode: "full-access",
+            createdAt: "2026-07-17T12:00:00.000Z",
+          }),
+        },
+      );
+
+      const readResponses = [snapshotResponse, shellResponse, threadResponse];
+      for (const response of readResponses) {
+        const body = yield* responseJsonEffect<{ readonly requiredScope: string }>(response);
+        assert.equal(response.status, 403);
+        assert.equal(body.requiredScope, "orchestration:read");
+      }
+      const dispatchBody = yield* responseJsonEffect<{ readonly requiredScope: string }>(
+        dispatchResponse,
+      );
+      assert.equal(dispatchResponse.status, 403);
+      assert.equal(dispatchBody.requiredScope, "orchestration:operate");
+    }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+
   it.effect("includes CORS headers on remote auth success responses", () =>
     Effect.gen(function* () {
       yield* buildAppUnderTest();

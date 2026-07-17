@@ -23,6 +23,7 @@ import * as Option from "effect/Option";
 import * as ServerConfig from "../config.ts";
 import * as AuthSessions from "../persistence/AuthSessions.ts";
 import * as ServerSecretStore from "./ServerSecretStore.ts";
+import { restrictScopesForAudienceCeiling } from "./audienceScopePolicy.ts";
 import {
   base64UrlDecodeUtf8,
   base64UrlEncode,
@@ -476,6 +477,7 @@ function toClientMetadata(record: {
 function toAuthClientSession(input: Omit<AuthClientSession, "current">): AuthClientSession {
   return {
     ...input,
+    scopes: restrictScopesForAudienceCeiling(input.scopes, input.audienceCeiling),
     current: false,
   };
 }
@@ -601,13 +603,24 @@ export const make = Effect.gen(function* () {
       const expiresAt = DateTime.add(issuedAt, {
         milliseconds: Duration.toMillis(input?.ttl ?? DEFAULT_SESSION_TTL),
       });
+      const audienceCeiling = input.audienceCeiling;
+      const scopes = restrictScopesForAudienceCeiling(
+        input?.scopes ?? AuthStandardClientScopes,
+        audienceCeiling,
+      );
+      if (scopes.length === 0) {
+        return yield* new SessionCredentialIssueError({
+          sessionId,
+          cause: new Error("The audience ceiling denies every requested scope."),
+        });
+      }
       const claims: SessionClaims = {
         v: 1,
         kind: "session",
         sid: sessionId,
         sub: input?.subject ?? "browser",
-        scopes: input?.scopes ?? AuthStandardClientScopes,
-        audienceCeiling: input.audienceCeiling,
+        scopes,
+        audienceCeiling,
         method: input?.method ?? "browser-session-cookie",
         ...(input?.proofKeyThumbprint ? { jkt: input.proofKeyThumbprint } : {}),
         iat: issuedAt.epochMilliseconds,
@@ -671,7 +684,7 @@ export const make = Effect.gen(function* () {
         client,
         audienceCeiling: claims.audienceCeiling,
         expiresAt: expiresAt,
-        scopes: claims.scopes,
+        scopes: restrictScopesForAudienceCeiling(claims.scopes, claims.audienceCeiling),
         ...(claims.jkt ? { proofKeyThumbprint: claims.jkt } : {}),
       } satisfies IssuedSession;
     },
@@ -737,7 +750,7 @@ export const make = Effect.gen(function* () {
         audienceCeiling: claims.audienceCeiling,
         expiresAt: expiresAt.value,
         subject: claims.sub,
-        scopes: claims.scopes,
+        scopes: restrictScopesForAudienceCeiling(claims.scopes, claims.audienceCeiling),
         ...(claims.jkt ? { proofKeyThumbprint: claims.jkt } : {}),
       } satisfies VerifiedSession;
     },
@@ -861,7 +874,7 @@ export const make = Effect.gen(function* () {
       audienceCeiling: claims.audienceCeiling,
       expiresAt: row.value.expiresAt,
       subject: row.value.subject,
-      scopes: row.value.scopes,
+      scopes: restrictScopesForAudienceCeiling(row.value.scopes, claims.audienceCeiling),
     } satisfies VerifiedSession;
   });
 

@@ -35,6 +35,10 @@ import * as EnvironmentAuthPolicy from "./EnvironmentAuthPolicy.ts";
 import * as PairingGrantStore from "./PairingGrantStore.ts";
 import * as ServerSecretStore from "./ServerSecretStore.ts";
 import * as SessionStore from "./SessionStore.ts";
+import {
+  canNarrowAudienceCeiling,
+  restrictScopesForAudienceCeiling,
+} from "./audienceScopePolicy.ts";
 import { verifyRequestDpopProof } from "./dpop.ts";
 import * as ServerConfig from "../config.ts";
 import {
@@ -424,12 +428,7 @@ export const serverAuthInvalidRequestReason = (
       ? "scope_not_granted"
       : "audience_not_granted";
 
-export function canNarrowAudienceCeiling(
-  source: AuthAudienceCeiling,
-  requested: AuthAudienceCeiling,
-): boolean {
-  return source === "private" || requested === "factory";
-}
+export { canNarrowAudienceCeiling };
 
 export class ServerAuthForbiddenOperationError extends Schema.TaggedErrorClass<ServerAuthForbiddenOperationError>()(
   "ServerAuthForbiddenOperationError",
@@ -714,23 +713,33 @@ export const make = Effect.gen(function* () {
     credential,
     requestMetadata,
   ) =>
-    bootstrapCredentials.consume(credential).pipe(
+    bootstrapCredentials.inspect(credential).pipe(
       Effect.mapError(toBootstrapExchangeError),
-      Effect.flatMap((grant) =>
-        sessions
-          .issue({
-            method: "browser-session-cookie",
-            subject: grant.subject,
-            scopes: grant.scopes,
-            audienceCeiling: grant.audienceCeiling,
-            client: {
-              ...requestMetadata,
-              ...(grant.label ? { label: grant.label } : {}),
-            },
-          })
-          .pipe(
-            Effect.mapError((cause) => new ServerAuthAuthenticatedSessionIssueError({ cause })),
-          ),
+      Effect.flatMap((storedGrant) =>
+        Effect.gen(function* () {
+          if (storedGrant.scopes.length === 0) {
+            return yield* new ServerAuthInvalidCredentialError({
+              diagnostic: "Bootstrap credential grants no usable scopes.",
+            });
+          }
+          const grant = yield* bootstrapCredentials
+            .consume(credential)
+            .pipe(Effect.mapError(toBootstrapExchangeError));
+          return yield* sessions
+            .issue({
+              method: "browser-session-cookie",
+              subject: grant.subject,
+              scopes: grant.scopes,
+              audienceCeiling: grant.audienceCeiling,
+              client: {
+                ...requestMetadata,
+                ...(grant.label ? { label: grant.label } : {}),
+              },
+            })
+            .pipe(
+              Effect.mapError((cause) => new ServerAuthAuthenticatedSessionIssueError({ cause })),
+            );
+        }),
       ),
       Effect.map(
         (session) =>
@@ -750,18 +759,31 @@ export const make = Effect.gen(function* () {
 
   const exchangeBootstrapCredentialForAccessToken: EnvironmentAuth["Service"]["exchangeBootstrapCredentialForAccessToken"] =
     (credential, requestedScopes, requestMetadata, input) =>
-      bootstrapCredentials.consume(credential, input).pipe(
+      bootstrapCredentials.inspect(credential, input).pipe(
         Effect.mapError(toBootstrapExchangeError),
-        Effect.flatMap((grant) =>
+        Effect.flatMap((storedGrant) =>
           Effect.gen(function* () {
-            const grantedScopes = requestedScopes ?? grant.scopes;
-            if (!grantedScopes.every((scope) => grant.scopes.includes(scope))) {
+            const requestedGrantScopes = requestedScopes ?? storedGrant.scopes;
+            if (requestedGrantScopes.length === 0) {
+              return yield* new ServerAuthInvalidScopeError({});
+            }
+            if (!requestedGrantScopes.every((scope) => storedGrant.scopes.includes(scope))) {
               return yield* new ServerAuthScopeNotGrantedError({});
             }
             const grantedAudienceCeiling = input?.audienceCeiling ?? "factory";
-            if (!canNarrowAudienceCeiling(grant.audienceCeiling, grantedAudienceCeiling)) {
+            if (!canNarrowAudienceCeiling(storedGrant.audienceCeiling, grantedAudienceCeiling)) {
               return yield* new ServerAuthAudienceNotGrantedError({});
             }
+            const grantedScopes = restrictScopesForAudienceCeiling(
+              requestedGrantScopes,
+              grantedAudienceCeiling,
+            );
+            if (grantedScopes.length === 0) {
+              return yield* new ServerAuthInvalidScopeError({});
+            }
+            const grant = yield* bootstrapCredentials
+              .consume(credential, input)
+              .pipe(Effect.mapError(toBootstrapExchangeError));
             return yield* sessions
               .issue({
                 method: input?.proofKeyThumbprint ? "dpop-access-token" : "bearer-access-token",
@@ -838,8 +860,12 @@ export const make = Effect.gen(function* () {
   )(
     function* (input) {
       const createdAt = yield* DateTime.now;
+      const scopes = restrictScopesForAudienceCeiling(
+        input?.scopes ?? AuthStandardClientScopes,
+        input.audienceCeiling,
+      );
       const issued = yield* bootstrapCredentials.issueOneTimeToken({
-        scopes: input?.scopes ?? AuthStandardClientScopes,
+        scopes,
         audienceCeiling: input.audienceCeiling,
         subject: input?.subject ?? "one-time-token",
         ...(input?.ttl ? { ttl: input.ttl } : {}),
@@ -849,7 +875,7 @@ export const make = Effect.gen(function* () {
       return {
         id: issued.id,
         credential: issued.credential,
-        scopes: input?.scopes ?? AuthStandardClientScopes,
+        scopes,
         audienceCeiling: issued.audienceCeiling,
         subject: input?.subject ?? "one-time-token",
         ...(issued.label ? { label: issued.label } : {}),

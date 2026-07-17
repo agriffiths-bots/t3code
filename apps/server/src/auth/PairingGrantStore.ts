@@ -20,6 +20,7 @@ import * as Stream from "effect/Stream";
 
 import * as ServerConfig from "../config.ts";
 import * as AuthPairingLinks from "../persistence/AuthPairingLinks.ts";
+import { restrictScopesForAudienceCeiling } from "./audienceScopePolicy.ts";
 
 export interface BootstrapGrant {
   readonly method: ServerAuthBootstrapMethod;
@@ -223,6 +224,12 @@ export class PairingGrantStore extends Context.Service<
     >;
     readonly streamChanges: Stream.Stream<BootstrapCredentialChange>;
     readonly revoke: (id: string) => Effect.Effect<boolean, BootstrapCredentialInternalError>;
+    readonly inspect: (
+      credential: string,
+      input?: {
+        readonly proofKeyThumbprint?: string;
+      },
+    ) => Effect.Effect<BootstrapGrant, BootstrapCredentialError>;
     readonly consume: (
       credential: string,
       input?: {
@@ -342,7 +349,7 @@ export const make = Effect.gen(function* () {
           ? ({
               id: row.id,
               credential: row.credential,
-              scopes: row.scopes,
+              scopes: restrictScopesForAudienceCeiling(row.scopes, row.audienceCeiling),
               audienceCeiling: row.audienceCeiling,
               subject: row.subject,
               label: row.label,
@@ -352,7 +359,7 @@ export const make = Effect.gen(function* () {
           : ({
               id: row.id,
               credential: row.credential,
-              scopes: row.scopes,
+              scopes: restrictScopesForAudienceCeiling(row.scopes, row.audienceCeiling),
               audienceCeiling: row.audienceCeiling,
               subject: row.subject,
               createdAt: row.createdAt,
@@ -391,6 +398,19 @@ export const make = Effect.gen(function* () {
     const ttl = input?.ttl ?? DEFAULT_ONE_TIME_TOKEN_TTL_MINUTES;
     const now = yield* DateTime.now;
     const expiresAt = DateTime.add(now, { milliseconds: Duration.toMillis(ttl) });
+    const scopes = restrictScopesForAudienceCeiling(
+      input?.scopes ?? AuthStandardClientScopes,
+      input.audienceCeiling,
+    );
+    const subject = input?.subject ?? "one-time-token";
+    if (scopes.length === 0) {
+      return yield* new PairingCredentialIssueError({
+        pairingLinkId: id,
+        subject,
+        ...(input?.label ? { label: input.label } : {}),
+        cause: new Error("The audience ceiling denies every requested scope."),
+      });
+    }
     const issued: IssuedBootstrapCredential = {
       id,
       credential,
@@ -399,13 +419,12 @@ export const make = Effect.gen(function* () {
       ...(input?.proofKeyThumbprint ? { proofKeyThumbprint: input.proofKeyThumbprint } : {}),
       expiresAt,
     };
-    const subject = input?.subject ?? "one-time-token";
     yield* pairingLinks
       .create({
         id,
         credential,
         method: "one-time-token",
-        scopes: input?.scopes ?? AuthStandardClientScopes,
+        scopes,
         audienceCeiling: input.audienceCeiling,
         subject,
         label: input?.label ?? null,
@@ -427,7 +446,7 @@ export const make = Effect.gen(function* () {
     yield* emitUpsert({
       id,
       credential,
-      scopes: input?.scopes ?? AuthStandardClientScopes,
+      scopes,
       audienceCeiling: input.audienceCeiling,
       subject: input?.subject ?? "one-time-token",
       ...(input?.label ? { label: input.label } : {}),
@@ -436,6 +455,64 @@ export const make = Effect.gen(function* () {
     });
     return issued;
   });
+
+  const inspect: PairingGrantStore["Service"]["inspect"] = Effect.fn("PairingGrantStore.inspect")(
+    function* (credential, input) {
+      const now = yield* DateTime.now;
+      const seededGrant = (yield* Ref.get(seededGrantsRef)).get(credential);
+      if (seededGrant) {
+        if (DateTime.isGreaterThanOrEqualTo(now, seededGrant.expiresAt)) {
+          return yield* new ExpiredBootstrapCredentialError({});
+        }
+        if (
+          seededGrant.proofKeyThumbprint &&
+          seededGrant.proofKeyThumbprint !== input?.proofKeyThumbprint
+        ) {
+          return yield* new BootstrapCredentialProofKeyMismatchError({});
+        }
+        return {
+          ...seededGrant,
+          scopes: restrictScopesForAudienceCeiling(seededGrant.scopes, seededGrant.audienceCeiling),
+        };
+      }
+
+      const matching = yield* pairingLinks
+        .getByCredential({ credential })
+        .pipe(Effect.mapError((cause) => new BootstrapCredentialLookupError({ cause })));
+      if (Option.isNone(matching)) {
+        return yield* new UnknownBootstrapCredentialError({});
+      }
+      if (matching.value.revokedAt !== null) {
+        return yield* new UnavailableBootstrapCredentialError({});
+      }
+      if (matching.value.consumedAt !== null) {
+        return yield* new ConsumedBootstrapCredentialError({});
+      }
+      if (DateTime.isGreaterThanOrEqualTo(now, matching.value.expiresAt)) {
+        return yield* new ExpiredBootstrapCredentialError({});
+      }
+      if (
+        matching.value.proofKeyThumbprint !== null &&
+        matching.value.proofKeyThumbprint !== input?.proofKeyThumbprint
+      ) {
+        return yield* new BootstrapCredentialProofKeyMismatchError({});
+      }
+      return {
+        method: matching.value.method,
+        scopes: restrictScopesForAudienceCeiling(
+          matching.value.scopes,
+          matching.value.audienceCeiling,
+        ),
+        audienceCeiling: matching.value.audienceCeiling,
+        subject: matching.value.subject,
+        ...(matching.value.label ? { label: matching.value.label } : {}),
+        ...(matching.value.proofKeyThumbprint
+          ? { proofKeyThumbprint: matching.value.proofKeyThumbprint }
+          : {}),
+        expiresAt: matching.value.expiresAt,
+      } satisfies BootstrapGrant;
+    },
+  );
 
   const consume: PairingGrantStore["Service"]["consume"] = Effect.fn("PairingGrantStore.consume")(
     function* (credential, input) {
@@ -496,7 +573,7 @@ export const make = Effect.gen(function* () {
               _tag: "success",
               grant: {
                 method: grant.method,
-                scopes: grant.scopes,
+                scopes: restrictScopesForAudienceCeiling(grant.scopes, grant.audienceCeiling),
                 audienceCeiling: grant.audienceCeiling,
                 subject: grant.subject,
                 ...(grant.label ? { label: grant.label } : {}),
@@ -531,7 +608,10 @@ export const make = Effect.gen(function* () {
         yield* emitRemoved(consumed.value.id);
         return {
           method: consumed.value.method,
-          scopes: consumed.value.scopes,
+          scopes: restrictScopesForAudienceCeiling(
+            consumed.value.scopes,
+            consumed.value.audienceCeiling,
+          ),
           audienceCeiling: consumed.value.audienceCeiling,
           subject: consumed.value.subject,
           ...(consumed.value.label ? { label: consumed.value.label } : {}),
@@ -579,6 +659,7 @@ export const make = Effect.gen(function* () {
       return Stream.fromPubSub(changesPubSub);
     },
     revoke,
+    inspect,
     consume,
   });
 });
