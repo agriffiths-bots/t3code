@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# Assertion chains are safe here because pass and fail always return success.
+# shellcheck disable=SC2015
 set -u
 
 ROOT="$(git rev-parse --show-toplevel)"
@@ -20,9 +22,16 @@ if [[ "${FAKE_LOG_PATH:-0}" == "1" ]]; then
 fi
 echo "git $*" >>"$T_LOG"
 case "$*" in
-  *"rev-parse HEAD"*) echo "${FAKE_HEAD_SHA:-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}" ;;
+  *"rev-parse HEAD"*)
+    if [[ -f "$T_TMP/fake-head" ]]; then
+      cat "$T_TMP/fake-head"
+    else
+      echo "${FAKE_HEAD_SHA:-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}"
+    fi
+    ;;
   *"rev-parse origin/main"*) echo "${FAKE_TARGET_SHA:-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb}" ;;
   *"diff --name-only"*) printf '%s\n' "${FAKE_CHANGED_FILES:-}" ;;
+  *"status --porcelain"*) printf '%s\n' "${FAKE_GIT_STATUS:-}" ;;
   *"merge-base --is-ancestor"*) exit "${FAKE_ANCESTOR_RC:-0}" ;;
   *"worktree prune"*) exit "${FAKE_GIT_WORKTREE_PRUNE_RC:-0}" ;;
   *"worktree add --detach"*)
@@ -33,7 +42,12 @@ case "$*" in
     rm -rf -- "${*: -1}"
     exit "${FAKE_GIT_WORKTREE_REMOVE_RC:-0}"
     ;;
-  *"merge --ff-only"*) exit "${FAKE_GIT_MERGE_RC:-0}" ;;
+  *"merge --ff-only"*)
+    if [[ "${FAKE_GIT_MERGE_RC:-0}" == "0" && "${FAKE_MERGE_LEAVES_HEAD:-0}" != "1" ]]; then
+      echo "${*: -1}" >"$T_TMP/fake-head"
+    fi
+    exit "${FAKE_GIT_MERGE_RC:-0}"
+    ;;
 esac
 exit "${FAKE_GIT_RC:-0}"
 SH
@@ -65,6 +79,15 @@ for ((i = 0; i < ${#args[@]}; i++)); do
     esac
   fi
 done
+if [[ "$*" == *" install "* ]]; then
+  if [[ "$*" == *"-C $T_TMP/checkout install "* && -n "${FAKE_LIVE_INSTALL_RC:-}" ]]; then
+    exit "$FAKE_LIVE_INSTALL_RC"
+  fi
+  exit "${FAKE_PNPM_INSTALL_RC:-${FAKE_PNPM_RC:-0}}"
+fi
+if [[ "$*" == *" run build" ]]; then
+  exit "${FAKE_PNPM_BUILD_RC:-${FAKE_PNPM_RC:-0}}"
+fi
 exit "${FAKE_PNPM_RC:-0}"
 SH
   cat >"$dir/fake-backup" <<'SH'
@@ -193,6 +216,8 @@ else
   pass "backup failure aborts before sync"
 fi
 grep -Fq "FAILURE step=backup" "$tmp/ledger/"*/t3-nightly-cycle.alert && pass "backup failure alerts" || fail "backup failure alerts"
+grep -Fq "RESULT FAILED step=backup rc=9" "$tmp/ledger/"*/t3-nightly-cycle.result && pass "backup failure records non-ok summary" || fail "backup failure records non-ok summary"
+grep -Fq "END FAILED" "$tmp/ledger/"*/t3-nightly-cycle.log && pass "backup failure records failed cycle end" || fail "backup failure records failed cycle end"
 
 tmp="$(mktemp -d)"
 export FAKE_PNPM_RC=8
@@ -226,15 +251,117 @@ fi
 
 tmp="$(mktemp -d)"
 export FAKE_CHANGED_FILES=$'patches/foo.patch\napps/web/src/App.tsx'
+mkdir -p "$tmp/checkout/apps/web/dist"
+printf 'old-web\n' >"$tmp/checkout/apps/web/dist/index.html"
 run_cycle "$tmp"
 unset FAKE_CHANGED_FILES
-[[ "$(cat "$tmp/rc")" != "0" ]] && pass "dependency install input change exits nonzero" || fail "dependency install input change exits nonzero"
+stage="$tmp/ledger/$(date -u +%F)/prebuilt-stage/checkout"
+[[ "$(cat "$tmp/rc")" == "0" ]] && pass "dependency install input change falls back successfully" || fail "dependency install input change falls back successfully"
 grep -Fq "dependency manifests changed" "$tmp/ledger/"*/build-release-artifacts.log && pass "dependency install input change logged" || fail "dependency install input change logged"
-if grep -Fq "worktree add" "$tmp/calls.log" || grep -Fq "restart" "$tmp/calls.log"; then
-  fail "dependency install input change staged or restarted"
+assert_order "$tmp/calls.log" \
+  "git -C $tmp/checkout diff --name-only" \
+  "git -C $tmp/checkout worktree add --detach $stage" \
+  "pnpm -C $stage install --frozen-lockfile --prefer-offline" \
+  "pnpm -C $stage/apps/web run build" \
+  "git -C $tmp/checkout merge --ff-only bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" \
+  "pnpm -C $tmp/checkout install --frozen-lockfile --prefer-offline" \
+  "restart prebuilt=0"
+grep -Fq "pnpm-env T3CODE_BUILD_SHA=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb cmd=-C $stage/apps/web run build" "$tmp/calls.log" \
+  && pass "live fallback stamps web build" \
+  || fail "live fallback stamps web build"
+grep -Fq "web" "$tmp/checkout/apps/web/dist/index.html" && pass "live fallback atomically promotes isolated web build" || fail "live fallback atomically promotes isolated web build"
+grep -Fq '"step":"build-release-artifacts","status":"fallback","rc":66' "$tmp/ledger/"*/t3-nightly-cycle.jsonl \
+  && pass "rc=66 fallback is machine readable" \
+  || fail "rc=66 fallback is machine readable"
+[[ ! -e "$tmp/ledger/$(date -u +%F)/t3-nightly-cycle.alert" ]] \
+  && pass "recovered rc=66 does not leave a failure alert" \
+  || fail "recovered rc=66 does not leave a failure alert"
+grep -Fq "RESULT OK" "$tmp/ledger/"*/t3-nightly-cycle.result && pass "live fallback cycle proceeds to ok" || fail "live fallback cycle proceeds to ok"
+[[ ! -e "$tmp/ledger/t3-nightly-cycle.pending-live-deploy" ]] \
+  && pass "successful live fallback clears pending marker" \
+  || fail "successful live fallback clears pending marker"
+grep -Fq "T3DR_TARGET_SHA=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" "$tmp/ledger/"*/live-deploy.completed \
+  && pass "successful live fallback archives completion" \
+  || fail "successful live fallback archives completion"
+
+tmp="$(mktemp -d)"
+export FAKE_CHANGED_FILES="pnpm-lock.yaml"
+T3DR_DESKTOP_ARTIFACT=1 run_cycle "$tmp"
+unset FAKE_CHANGED_FILES
+stage="$tmp/ledger/$(date -u +%F)/prebuilt-stage/checkout"
+[[ "$(cat "$tmp/rc")" == "0" ]] && pass "artifact-enabled live fallback exits zero" || fail "artifact-enabled live fallback exits zero"
+assert_order "$tmp/calls.log" \
+  "pnpm -C $stage/apps/web run build" \
+  "pnpm -C $stage run dist:desktop:artifact" \
+  "pnpm -C $tmp/checkout install --frozen-lockfile --prefer-offline" \
+  "restart prebuilt=0"
+grep -Fq "desktop" "$tmp/ledger/$(date -u +%F)/desktop-artifact/artifact.txt" \
+  && pass "live fallback persists desktop artifact" \
+  || fail "live fallback persists desktop artifact"
+
+tmp="$(mktemp -d)"
+mkdir -p "$tmp/checkout/apps/web/dist"
+printf 'old-web\n' >"$tmp/checkout/apps/web/dist/index.html"
+export FAKE_CHANGED_FILES="pnpm-lock.yaml"
+export FAKE_PNPM_BUILD_RC=8
+run_cycle "$tmp"
+unset FAKE_CHANGED_FILES FAKE_PNPM_BUILD_RC
+[[ "$(cat "$tmp/rc")" != "0" ]] && pass "isolated live web build failure exits nonzero" || fail "isolated live web build failure exits nonzero"
+grep -Fq "old-web" "$tmp/checkout/apps/web/dist/index.html" \
+  && pass "failed isolated build preserves active web dist" \
+  || fail "failed isolated build preserves active web dist"
+if grep -Fq "git -C $tmp/checkout merge --ff-only" "$tmp/calls.log" || grep -Fq "restart prebuilt=" "$tmp/calls.log"; then
+  fail "failed isolated build mutates checkout or restarts"
 else
-  pass "dependency install input change aborts before staging"
+  pass "failed isolated build aborts before live mutation"
 fi
+
+tmp="$(mktemp -d)"
+export FAKE_CHANGED_FILES="pnpm-lock.yaml"
+export FAKE_GIT_STATUS=" M apps/web/src/App.tsx"
+run_cycle "$tmp"
+unset FAKE_CHANGED_FILES FAKE_GIT_STATUS
+[[ "$(cat "$tmp/rc")" != "0" ]] && pass "dirty live fallback exits nonzero" || fail "dirty live fallback exits nonzero"
+grep -Fq "FAILURE step=live-deploy rc=69" "$tmp/ledger/"*/t3-nightly-cycle.alert && pass "dirty live fallback alerts" || fail "dirty live fallback alerts"
+test -f "$tmp/ledger/t3-nightly-cycle.pending-live-deploy" && pass "dirty live fallback retains pending marker" || fail "dirty live fallback retains pending marker"
+if grep -Fq "merge --ff-only" "$tmp/calls.log" || grep -Fq "restart prebuilt=" "$tmp/calls.log"; then
+  fail "dirty live fallback mutates or restarts"
+else
+  pass "dirty live fallback aborts before mutation"
+fi
+
+tmp="$(mktemp -d)"
+export FAKE_CHANGED_FILES="pnpm-lock.yaml"
+export FAKE_MERGE_LEAVES_HEAD=1
+run_cycle "$tmp"
+unset FAKE_CHANGED_FILES FAKE_MERGE_LEAVES_HEAD
+[[ "$(cat "$tmp/rc")" != "0" ]] && pass "wrong post-merge head exits nonzero" || fail "wrong post-merge head exits nonzero"
+grep -Fq "did not reach pinned target" "$tmp/ledger/"*/live-deploy.log && pass "wrong post-merge head is logged" || fail "wrong post-merge head is logged"
+if grep -Fq "pnpm -C $tmp/checkout install" "$tmp/calls.log" || grep -Fq "restart prebuilt=" "$tmp/calls.log"; then
+  fail "wrong post-merge head installs or restarts"
+else
+  pass "wrong post-merge head aborts before live install"
+fi
+
+tmp="$(mktemp -d)"
+export FAKE_CHANGED_FILES="pnpm-lock.yaml"
+export FAKE_LIVE_INSTALL_RC=8
+run_cycle "$tmp"
+unset FAKE_CHANGED_FILES FAKE_LIVE_INSTALL_RC
+[[ "$(cat "$tmp/rc")" != "0" ]] && pass "failed live install exits nonzero" || fail "failed live install exits nonzero"
+grep -Fq "T3DR_TARGET_SHA=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" "$tmp/ledger/t3-nightly-cycle.pending-live-deploy" \
+  && pass "failed live install retains target marker" \
+  || fail "failed live install retains target marker"
+export FAKE_HEAD_SHA=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+run_cycle "$tmp"
+unset FAKE_HEAD_SHA
+[[ "$(cat "$tmp/rc")" == "0" ]] && pass "same-sha pending deploy retry exits zero" || fail "same-sha pending deploy retry exits zero"
+[[ "$(grep -Fc "pnpm -C $tmp/checkout install --frozen-lockfile --prefer-offline" "$tmp/calls.log")" == "2" ]] \
+  && pass "same-sha pending deploy retries workspace install" \
+  || fail "same-sha pending deploy retries workspace install"
+[[ ! -e "$tmp/ledger/t3-nightly-cycle.pending-live-deploy" ]] \
+  && pass "same-sha retry clears pending marker after success" \
+  || fail "same-sha retry clears pending marker after success"
 
 tmp="$(mktemp -d)"
 export FAKE_ANCESTOR_RC=1
@@ -242,11 +369,28 @@ run_cycle "$tmp"
 unset FAKE_ANCESTOR_RC
 [[ "$(cat "$tmp/rc")" != "0" ]] && pass "non-fast-forward target exits nonzero" || fail "non-fast-forward target exits nonzero"
 grep -Fq "target is not a fast-forward" "$tmp/ledger/"*/build-release-artifacts.log && pass "non-fast-forward target logged" || fail "non-fast-forward target logged"
+grep -Fq "FAILURE step=build-release-artifacts rc=67" "$tmp/ledger/"*/t3-nightly-cycle.alert && pass "non-66 build failure alerts" || fail "non-66 build failure alerts"
 if grep -Fq "worktree add" "$tmp/calls.log" || grep -Fq "restart" "$tmp/calls.log"; then
   fail "non-fast-forward target staged or restarted"
 else
   pass "non-fast-forward target aborts before staging"
 fi
+
+tmp="$(mktemp -d)"
+mkdir -p "$tmp/ledger"
+exec 8>"$tmp/ledger/t3-nightly-cycle.lock"
+flock -n 8
+run_cycle "$tmp"
+flock -u 8
+exec 8>&-
+[[ "$(cat "$tmp/rc")" == "75" ]] && pass "lock contention exits 75" || fail "lock contention exits 75"
+grep -Fq "FAILURE step=lock rc=75" "$tmp/ledger/"*/t3-nightly-cycle.alert && pass "lock contention alerts" || fail "lock contention alerts"
+grep -Fq "RESULT FAILED step=lock rc=75" "$tmp/ledger/"*/t3-nightly-cycle.result && pass "lock contention records non-ok summary" || fail "lock contention records non-ok summary"
+
+tmp="$(mktemp -d)"
+T3DR_BUILD_ALWAYS=invalid run_cycle "$tmp"
+[[ "$(cat "$tmp/rc")" == "2" ]] && pass "invalid configuration exits 2" || fail "invalid configuration exits 2"
+grep -Fq "FAILURE step=configuration rc=2" "$tmp/ledger/"*/t3-nightly-cycle.alert && pass "invalid configuration alerts" || fail "invalid configuration alerts"
 
 tmp="$(mktemp -d)"
 T3DR_DESKTOP_ARTIFACT=1 run_cycle "$tmp"

@@ -106,10 +106,18 @@ runs:
 2. Upstream sync (`T3DR_UPSTREAM_SYNC_CMD`, default `~/.openclaw/bin/t3-upstream-sync`).
 3. Build `origin/main` in a detached staging worktree and stage the web dist
    plus server dist payload without mutating the live checkout.
-   Targets that are not fast-forwards from the live checkout, or that change
-   pnpm install inputs (`package.json`, `pnpm-lock.yaml`, `pnpm-workspace.yaml`,
-   `.npmrc`, `pnpmfile.cjs`, or `patches/**`), are rejected before staging so
-   new dist code is never started against rollback dependencies.
+   Targets that change pnpm install inputs (`package.json`, `pnpm-lock.yaml`,
+   `pnpm-workspace.yaml`, `.npmrc`, `pnpmfile.cjs`, or `patches/**`) are never
+   deployed with prebuilt artifacts. Instead, rc=66 selects the live fallback:
+   build the stamped web bundle in a detached worktree, verify and fast-forward
+   the live checkout to the pinned target, run the frozen workspace install,
+   atomically exchange the web dist, and continue through the configured
+   restart step. The atomic exchange is preflighted on the checkout filesystem
+   before any live mutation.
+   A durable `$T3DR_LEDGER/t3-nightly-cycle.pending-live-deploy` marker keeps
+   this path selected across failures and later same-SHA cycles; only a fully
+   successful cycle archives it as `<run-dir>/live-deploy.completed`.
+   Non-fast-forward targets and all other build failures still abort the cycle.
 4. Optional desktop artifact hook. Until T1 lands, this is a safe no-op. The
    one-line integration is `T3DR_DESKTOP_ARTIFACT=1`, which runs
    `dist:desktop:artifact` in the staging worktree with
@@ -121,7 +129,9 @@ runs:
 
 Machine-readable cycle events are appended to
 `$T3DR_LEDGER/<UTC date>/t3-nightly-cycle.jsonl`; operator-readable logs and
-alerts live in the same run directory.
+alerts live in the same run directory. Every non-OK exit writes a durable
+`t3-nightly-cycle.alert` marker and a `RESULT FAILED` line in
+`t3-nightly-cycle.result`, including lock contention and configuration errors.
 
 ## Capture active threads
 
