@@ -242,7 +242,322 @@ function navigationRequest(pathname: string): RequestStub {
   };
 }
 
+interface MemoryIdbRequest {
+  error?: Error | null;
+  result?: unknown;
+  onerror?: () => void;
+  onsuccess?: () => void;
+  onupgradeneeded?: () => void;
+}
+
+interface MemoryIdbTransaction {
+  error?: Error | null;
+  onabort?: () => void;
+  oncomplete?: () => void;
+  onerror?: () => void;
+  objectStore: () => {
+    get: (key: string) => MemoryIdbRequest;
+    put: (value: unknown, key: string) => MemoryIdbRequest;
+  };
+}
+
+class MemoryIndexedDbFactory {
+  private created = false;
+  private readonly values = new Map<string, unknown>();
+
+  open(): MemoryIdbRequest {
+    const request: MemoryIdbRequest = {};
+    queueMicrotask(() => {
+      request.result = {
+        close() {},
+        createObjectStore: () => {
+          this.created = true;
+        },
+        objectStoreNames: {
+          contains: () => this.created,
+        },
+        transaction: (): MemoryIdbTransaction => {
+          let writeQueued = false;
+          const transaction: MemoryIdbTransaction = {
+            objectStore: () => ({
+              get: (key) => {
+                const getRequest: MemoryIdbRequest = {};
+                queueMicrotask(() => {
+                  getRequest.result = this.values.get(key);
+                  getRequest.onsuccess?.();
+                  if (!writeQueued) transaction.oncomplete?.();
+                });
+                return getRequest;
+              },
+              put: (value, key) => {
+                writeQueued = true;
+                const putRequest: MemoryIdbRequest = {};
+                queueMicrotask(() => {
+                  this.values.set(key, value);
+                  putRequest.result = key;
+                  putRequest.onsuccess?.();
+                  transaction.oncomplete?.();
+                });
+                return putRequest;
+              },
+            }),
+          };
+          return transaction;
+        },
+      };
+      if (!this.created) {
+        request.onupgradeneeded?.();
+      }
+      request.onsuccess?.();
+    });
+    return request;
+  }
+}
+
+type PushSubscriptionStub = {
+  endpoint: string;
+  toJSON: () => {
+    endpoint: string;
+    expirationTime: number | null;
+    keys: { auth: string; p256dh: string };
+  };
+};
+
+function makePushSubscription(endpoint: string): PushSubscriptionStub {
+  return {
+    endpoint,
+    toJSON: () => ({
+      endpoint,
+      expirationTime: null,
+      keys: { auth: "new-auth", p256dh: "new-p256dh" },
+    }),
+  };
+}
+
+function createPushRecoveryHarness(
+  recoveryResponder: (init: RequestInit) => Promise<Response> = async () =>
+    new Response(JSON.stringify({ recoveryToken: "rotated-recovery-token" }), {
+      headers: { "content-type": "application/json" },
+    }),
+) {
+  const listeners = new Map<string, (event: unknown) => void>();
+  const indexedDb = new MemoryIndexedDbFactory();
+  const subscription = makePushSubscription("https://push.example/new");
+  const subscribeCalls: Array<{
+    readonly applicationServerKey: Uint8Array;
+    readonly userVisibleOnly: boolean;
+  }> = [];
+  const recoveryPosts: Array<{ readonly body: string; readonly init: RequestInit }> = [];
+  const selfScope = {
+    location: new URL(`${ORIGIN}/`),
+    addEventListener(type: string, listener: (event: unknown) => void) {
+      listeners.set(type, listener);
+    },
+    skipWaiting() {},
+    clients: {
+      async claim() {},
+      async matchAll() {
+        return [];
+      },
+      async openWindow() {},
+    },
+    registration: {
+      async getNotifications() {
+        return [];
+      },
+      async showNotification() {},
+      pushManager: {
+        async subscribe(options: {
+          readonly applicationServerKey: Uint8Array;
+          readonly userVisibleOnly: boolean;
+        }) {
+          subscribeCalls.push(options);
+          return subscription;
+        },
+      },
+    },
+  };
+  const loadWorker = new Function(
+    "self",
+    "caches",
+    "Response",
+    "Request",
+    "URL",
+    "Promise",
+    "Set",
+    "Error",
+    "fetch",
+    "indexedDB",
+    `${serviceWorkerSource}\nreturn { readPushRecoveryConfig };`,
+  ) as (
+    selfScope: unknown,
+    cacheStorage: MemoryCacheStorage,
+    responseConstructor: typeof Response,
+    requestConstructor: typeof Request,
+    urlConstructor: typeof URL,
+    promiseConstructor: typeof Promise,
+    setConstructor: typeof Set,
+    errorConstructor: typeof Error,
+    fetchImplementation: (input: string, init: RequestInit) => Promise<Response>,
+    indexedDbFactory: MemoryIndexedDbFactory,
+  ) => { readPushRecoveryConfig: () => Promise<unknown> };
+  const workerExports = loadWorker(
+    selfScope,
+    new MemoryCacheStorage(),
+    Response,
+    Request,
+    URL,
+    Promise,
+    Set,
+    Error,
+    async (_input, init) => {
+      recoveryPosts.push({ body: String(init.body), init });
+      return await recoveryResponder(init);
+    },
+    indexedDb,
+  );
+
+  const dispatchExtendableEvent = async (type: string, event: Record<string, unknown>) => {
+    const listener = listeners.get(type);
+    if (!listener) throw new Error(`Service worker did not register a ${type} listener.`);
+    const waitUntilPromises: Promise<unknown>[] = [];
+    listener({
+      ...event,
+      waitUntil(promise: Promise<unknown>) {
+        waitUntilPromises.push(promise);
+      },
+    });
+    await Promise.all(waitUntilPromises);
+  };
+
+  return { dispatchExtendableEvent, recoveryPosts, subscribeCalls, workerExports };
+}
+
 describe("t3 service worker", () => {
+  it("recovers a changed push subscription in the background and stores the rotated token", async () => {
+    const harness = createPushRecoveryHarness();
+    await harness.dispatchExtendableEvent("message", {
+      data: {
+        type: "t3-push-recovery-config",
+        oldEndpoint: "https://push.example/old",
+        recoveryToken: "initial-recovery-token",
+        recoveryUrl: `${ORIGIN}/api/notifications/recover`,
+        vapidPublicKey: "AQIDBA",
+      },
+    });
+
+    await harness.dispatchExtendableEvent("pushsubscriptionchange", {
+      oldSubscription: { endpoint: "https://push.example/intermediate" },
+      newSubscription: null,
+    });
+
+    expect(harness.subscribeCalls).toHaveLength(1);
+    expect(Array.from(harness.subscribeCalls[0]?.applicationServerKey ?? [])).toEqual([1, 2, 3, 4]);
+    expect(harness.recoveryPosts).toHaveLength(1);
+    expect(harness.recoveryPosts[0]?.init).toMatchObject({
+      method: "POST",
+      mode: "cors",
+      credentials: "omit",
+    });
+    expect(JSON.parse(harness.recoveryPosts[0]?.body ?? "{}")).toEqual({
+      oldEndpoint: "https://push.example/old",
+      recoveryToken: "initial-recovery-token",
+      newSubscription: {
+        endpoint: "https://push.example/new",
+        expirationTime: null,
+        keys: { auth: "new-auth", p256dh: "new-p256dh" },
+      },
+    });
+    expect(await harness.workerExports.readPushRecoveryConfig()).toEqual({
+      oldEndpoint: "https://push.example/new",
+      recoveryToken: "rotated-recovery-token",
+      recoveryUrl: `${ORIGIN}/api/notifications/recover`,
+      vapidPublicKey: "AQIDBA",
+    });
+  });
+
+  it("does not let a delayed recovery response replace a newer page registration token", async () => {
+    let finishRecovery!: () => void;
+    let signalRecoveryStarted!: () => void;
+    const recoveryStarted = new Promise<void>((resolve) => {
+      signalRecoveryStarted = resolve;
+    });
+    const harness = createPushRecoveryHarness(async () => {
+      signalRecoveryStarted();
+      await new Promise<void>((resolve) => {
+        finishRecovery = resolve;
+      });
+      return new Response(JSON.stringify({ recoveryToken: "stale-recovery-token" }), {
+        headers: { "content-type": "application/json" },
+      });
+    });
+    const initialConfig = {
+      type: "t3-push-recovery-config",
+      oldEndpoint: "https://push.example/old",
+      recoveryToken: "initial-recovery-token",
+      recoveryUrl: `${ORIGIN}/api/notifications/recover`,
+      vapidPublicKey: "AQIDBA",
+    };
+    const freshConfig = {
+      type: "t3-push-recovery-config",
+      oldEndpoint: "https://push.example/page-registration",
+      recoveryToken: "fresh-page-token",
+      recoveryUrl: `${ORIGIN}/api/notifications/recover`,
+      vapidPublicKey: "AQIDBA",
+    };
+    await harness.dispatchExtendableEvent("message", { data: initialConfig });
+
+    const delayedRecovery = harness.dispatchExtendableEvent("pushsubscriptionchange", {
+      oldSubscription: { endpoint: "https://push.example/intermediate" },
+      newSubscription: null,
+    });
+    await recoveryStarted;
+    await harness.dispatchExtendableEvent("message", { data: freshConfig });
+    finishRecovery();
+    await delayedRecovery;
+
+    expect(await harness.workerExports.readPushRecoveryConfig()).toEqual({
+      oldEndpoint: freshConfig.oldEndpoint,
+      recoveryToken: freshConfig.recoveryToken,
+      recoveryUrl: freshConfig.recoveryUrl,
+      vapidPublicKey: freshConfig.vapidPublicKey,
+    });
+  });
+
+  it("retries the identical recovery request when the first response is lost", async () => {
+    let attempts = 0;
+    const harness = createPushRecoveryHarness(async () => {
+      attempts += 1;
+      if (attempts === 1) throw new TypeError("recovery response lost");
+      return new Response(JSON.stringify({ recoveryToken: "replayed-recovery-token" }), {
+        headers: { "content-type": "application/json" },
+      });
+    });
+    await harness.dispatchExtendableEvent("message", {
+      data: {
+        type: "t3-push-recovery-config",
+        oldEndpoint: "https://push.example/old",
+        recoveryToken: "initial-recovery-token",
+        recoveryUrl: `${ORIGIN}/api/notifications/recover`,
+        vapidPublicKey: "AQIDBA",
+      },
+    });
+
+    await harness.dispatchExtendableEvent("pushsubscriptionchange", {
+      oldSubscription: { endpoint: "https://push.example/intermediate" },
+      newSubscription: null,
+    });
+
+    expect(harness.recoveryPosts).toHaveLength(2);
+    expect(harness.recoveryPosts[1]?.body).toBe(harness.recoveryPosts[0]?.body);
+    expect(await harness.workerExports.readPushRecoveryConfig()).toEqual({
+      oldEndpoint: "https://push.example/new",
+      recoveryToken: "replayed-recovery-token",
+      recoveryUrl: `${ORIGIN}/api/notifications/recover`,
+      vapidPublicKey: "AQIDBA",
+    });
+  });
+
   it("does not refresh the offline shell from excluded HTML endpoints", async () => {
     const originalShell = '<html><script type="module" src="/assets/current.js"></script></html>';
     const harness = createHarness(() => htmlResponse("<html>api html</html>"));

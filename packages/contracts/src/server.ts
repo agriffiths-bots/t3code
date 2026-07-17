@@ -441,8 +441,21 @@ export type ServerNotificationRegisterInput = typeof ServerNotificationRegisterI
 export const ServerNotificationRegisterResult = Schema.Struct({
   deviceId: TrimmedNonEmptyString,
   vapidPublicKey: TrimmedNonEmptyString,
+  recoveryToken: TrimmedNonEmptyString,
 });
 export type ServerNotificationRegisterResult = typeof ServerNotificationRegisterResult.Type;
+
+export const ServerNotificationRecoveryInput = Schema.Struct({
+  oldEndpoint: TrimmedNonEmptyString,
+  recoveryToken: TrimmedNonEmptyString,
+  newSubscription: ServerWebPushSubscription,
+});
+export type ServerNotificationRecoveryInput = typeof ServerNotificationRecoveryInput.Type;
+
+export const ServerNotificationRecoveryResult = Schema.Struct({
+  recoveryToken: TrimmedNonEmptyString,
+});
+export type ServerNotificationRecoveryResult = typeof ServerNotificationRecoveryResult.Type;
 
 export const ServerNotificationConfig = Schema.Struct({
   vapidPublicKey: TrimmedNonEmptyString,
@@ -452,7 +465,12 @@ export type ServerNotificationConfig = typeof ServerNotificationConfig.Type;
 export class ServerNotificationPersistenceError extends Schema.TaggedErrorClass<ServerNotificationPersistenceError>()(
   "ServerNotificationPersistenceError",
   {
-    operation: Schema.Literals(["register-device", "remove-device"]),
+    operation: Schema.Literals([
+      "register-device",
+      "expire-device",
+      "recover-device",
+      "purge-expired-devices",
+    ]),
     detail: TrimmedNonEmptyString,
     cause: Schema.optional(Schema.Defect()),
   },

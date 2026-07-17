@@ -10,6 +10,8 @@ import {
   ServerNotificationPersistenceError,
   type ServerNotificationRegisterInput,
   type ServerNotificationRegisterResult,
+  type ServerNotificationRecoveryInput,
+  type ServerNotificationRecoveryResult,
   type ServerNotificationStreamEvent,
   type ServerNotifyInput,
   type ServerNotifyResult,
@@ -20,6 +22,7 @@ import * as Context from "effect/Context";
 import * as Crypto from "effect/Crypto";
 import * as Data from "effect/Data";
 import * as DateTime from "effect/DateTime";
+import * as Encoding from "effect/Encoding";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
@@ -32,15 +35,20 @@ import * as SynchronizedRef from "effect/SynchronizedRef";
 import webPush, { type PushSubscription, WebPushError } from "web-push";
 
 import * as ServerSecretStore from "../auth/ServerSecretStore.ts";
+import { signPayload, timingSafeEqualBase64Url } from "../auth/utils.ts";
 import * as ServerConfig from "../config.ts";
 import { writeFileStringAtomically } from "../atomicWrite.ts";
 import * as WebPushEndpointGuard from "./WebPushEndpointGuard.ts";
 
 const VAPID_KEYS_SECRET = "web-push-vapid-keys";
+const RECOVERY_TOKEN_DERIVATION_KEY_SECRET = "push-recovery-token-derivation-key";
 const DEVICE_STORE_FILE = "notification-devices.json";
 const VAPID_SUBJECT = "mailto:t3code@localhost";
 const ACTIVE_NOTIFICATION_TTL_MILLIS = 24 * 60 * 60 * 1000;
+const EXPIRED_DEVICE_TTL_MILLIS = 30 * 24 * 60 * 60 * 1000;
 const MAX_ACTIVE_NOTIFICATIONS = 1_000;
+const RECOVERY_TOKEN_BYTES = 32;
+const DUMMY_RECOVERY_TOKEN_HASH = Encoding.encodeBase64Url(new Uint8Array(32));
 
 const NotificationDeviceRecord = Schema.Struct({
   deviceId: Schema.String,
@@ -49,6 +57,16 @@ const NotificationDeviceRecord = Schema.Struct({
   userAgent: Schema.optional(Schema.String),
   ackUrl: Schema.optional(Schema.String),
   subscription: Schema.optional(ServerWebPushSubscription),
+  status: Schema.optional(Schema.Literals(["active", "expired"])),
+  expiredAt: Schema.optional(Schema.String),
+  recoveryTokenHash: Schema.optional(Schema.String),
+  recoveryReplay: Schema.optional(
+    Schema.Struct({
+      previousTokenHash: Schema.String,
+      oldEndpoint: Schema.String,
+      newSubscription: ServerWebPushSubscription,
+    }),
+  ),
   createdAt: Schema.String,
   updatedAt: Schema.String,
 });
@@ -93,6 +111,12 @@ export class DeviceNotifications extends Context.Service<
       ServerNotificationRegisterResult,
       ServerNotificationEndpointError | ServerNotificationPersistenceError
     >;
+    readonly recoverSubscription: (
+      input: ServerNotificationRecoveryInput,
+    ) => Effect.Effect<
+      ServerNotificationRecoveryResult | null,
+      ServerNotificationEndpointError | ServerNotificationPersistenceError
+    >;
     readonly ackNotification: (
       input: ServerNotificationAckInput,
       options?: { readonly requireAckToken?: boolean },
@@ -117,7 +141,7 @@ interface ActiveNotificationEntry {
 }
 
 function toPushSubscription(record: NotificationDeviceRecord): PushSubscription | null {
-  if (record.subscription === undefined) {
+  if (record.status === "expired" || record.subscription === undefined) {
     return null;
   }
   return {
@@ -128,6 +152,40 @@ function toPushSubscription(record: NotificationDeviceRecord): PushSubscription 
       auth: record.subscription.keys.auth,
     },
   };
+}
+
+function subscriptionMatches(
+  record: NotificationDeviceRecord,
+  subscription: PushSubscription,
+): boolean {
+  return (
+    record.subscription?.endpoint === subscription.endpoint &&
+    record.subscription.expirationTime === subscription.expirationTime &&
+    record.subscription.keys.p256dh === subscription.keys.p256dh &&
+    record.subscription.keys.auth === subscription.keys.auth
+  );
+}
+
+function serverSubscriptionsMatch(
+  left: ServerWebPushSubscription,
+  right: ServerWebPushSubscription,
+): boolean {
+  return (
+    left.endpoint === right.endpoint &&
+    left.expirationTime === right.expirationTime &&
+    left.keys.p256dh === right.keys.p256dh &&
+    left.keys.auth === right.keys.auth
+  );
+}
+
+function recoveryTokenDerivationPayload(subscription: ServerWebPushSubscription): string {
+  return JSON.stringify([
+    "push-recovery-subscription-v1",
+    subscription.endpoint,
+    subscription.expirationTime,
+    subscription.keys.p256dh,
+    subscription.keys.auth,
+  ]);
 }
 
 function notificationTopic(notificationId: string): string {
@@ -238,6 +296,7 @@ function upsertDevice(
   devices: ReadonlyMap<string, NotificationDeviceRecord>,
   input: ServerNotificationRegisterInput,
   timestamp: string,
+  recoveryTokenHash: string,
 ): ReadonlyMap<string, NotificationDeviceRecord> {
   const current = devices.get(input.deviceId);
   const next = new Map(devices);
@@ -248,17 +307,60 @@ function upsertDevice(
     ...(input.userAgent === undefined ? {} : { userAgent: input.userAgent }),
     ...(input.ackUrl === undefined ? {} : { ackUrl: input.ackUrl }),
     ...(input.subscription === undefined ? {} : { subscription: input.subscription }),
+    status: "active",
+    recoveryTokenHash,
     createdAt: current?.createdAt ?? timestamp,
     updatedAt: timestamp,
   });
   return next;
 }
 
-function isExpiredPushError(error: WebPushSendError): boolean {
-  return (
+function expiredPushStatus(error: WebPushSendError): 404 | 410 | null {
+  if (
     error.cause instanceof WebPushError &&
     (error.cause.statusCode === 404 || error.cause.statusCode === 410)
+  ) {
+    return error.cause.statusCode;
+  }
+  return null;
+}
+
+function isRecoveryEligible(record: NotificationDeviceRecord, nowMillis: number): boolean {
+  if (record.status !== "expired") {
+    return true;
+  }
+  if (record.expiredAt === undefined) {
+    return false;
+  }
+  const expiredAtMillis = Date.parse(record.expiredAt);
+  return (
+    Number.isFinite(expiredAtMillis) && nowMillis - expiredAtMillis < EXPIRED_DEVICE_TTL_MILLIS
   );
+}
+
+function pruneExpiredDevices(
+  devices: ReadonlyMap<string, NotificationDeviceRecord>,
+  nowMillis: number,
+): ReadonlyMap<string, NotificationDeviceRecord> {
+  return new Map(
+    Array.from(devices).filter(([, device]) => {
+      if (device.status !== "expired" || device.expiredAt === undefined) {
+        return true;
+      }
+      const expiredAtMillis = Date.parse(device.expiredAt);
+      return (
+        !Number.isFinite(expiredAtMillis) || nowMillis - expiredAtMillis < EXPIRED_DEVICE_TTL_MILLIS
+      );
+    }),
+  );
+}
+
+function endpointHost(endpoint: string): string {
+  try {
+    return new URL(endpoint).hostname;
+  } catch {
+    return "invalid";
+  }
 }
 
 function makeDismissPayload(notificationId: string): string {
@@ -327,6 +429,10 @@ export const make = Effect.fn("DeviceNotifications.make")(function* () {
   const secrets = yield* ServerSecretStore.ServerSecretStore;
   const endpointGuard = yield* WebPushEndpointGuard.WebPushEndpointGuard;
   const vapidKeys = yield* getOrCreateVapidKeys(secrets);
+  const recoveryTokenDerivationKey = yield* secrets.getOrCreateRandom(
+    RECOVERY_TOKEN_DERIVATION_KEY_SECRET,
+    RECOVERY_TOKEN_BYTES,
+  );
   webPush.setVapidDetails(VAPID_SUBJECT, vapidKeys.publicKey, vapidKeys.privateKey);
 
   const storePath = path.join(config.stateDir, DEVICE_STORE_FILE);
@@ -343,6 +449,24 @@ export const make = Effect.fn("DeviceNotifications.make")(function* () {
     );
   const makeDeviceNotification = (input: ServerNotifyInput) =>
     makeNotification(input).pipe(Effect.provideService(Crypto.Crypto, crypto));
+  const hashRecoveryToken = (token: string) =>
+    crypto
+      .digest("SHA-256", textEncoder.encode(token))
+      .pipe(Effect.map(Encoding.encodeBase64Url), Effect.orDie);
+  const deriveRecoveryToken = (subscription: ServerWebPushSubscription) =>
+    signPayload(recoveryTokenDerivationPayload(subscription), recoveryTokenDerivationKey);
+  const makeRecoveryCredential = Effect.fn("DeviceNotifications.makeRecoveryCredential")(function* (
+    subscription: ServerWebPushSubscription | undefined,
+  ) {
+    const recoveryToken =
+      subscription === undefined
+        ? yield* crypto
+            .randomBytes(RECOVERY_TOKEN_BYTES)
+            .pipe(Effect.map(Encoding.encodeBase64Url), Effect.orDie)
+        : deriveRecoveryToken(subscription);
+    const recoveryTokenHash = yield* hashRecoveryToken(recoveryToken);
+    return { recoveryToken, recoveryTokenHash };
+  });
   const state = yield* SynchronizedRef.make<NotificationState>({
     devices: initialDevices,
     activeNotifications: new Map(),
@@ -360,14 +484,28 @@ export const make = Effect.fn("DeviceNotifications.make")(function* () {
     );
   });
 
-  const removeDevice = Effect.fn("DeviceNotifications.removeDevice")(function* (deviceId: string) {
+  const expireDevice = Effect.fn("DeviceNotifications.expireDevice")(function* (
+    deviceId: string,
+    failedSubscription: PushSubscription,
+    timestamp: string,
+  ) {
     yield* SynchronizedRef.modifyEffect(state, (current) => {
-      if (!current.devices.has(deviceId)) {
+      const existing = current.devices.get(deviceId);
+      if (
+        existing === undefined ||
+        existing.status === "expired" ||
+        !subscriptionMatches(existing, failedSubscription)
+      ) {
         return Effect.succeed([undefined, current] as const);
       }
       const nextDevices = new Map(current.devices);
-      nextDevices.delete(deviceId);
-      return persistDevices(nextDevices, "remove-device").pipe(
+      nextDevices.set(deviceId, {
+        ...existing,
+        status: "expired",
+        expiredAt: timestamp,
+        updatedAt: timestamp,
+      });
+      return persistDevices(nextDevices, "expire-device").pipe(
         Effect.as([undefined, { ...current, devices: nextDevices }] as const),
       );
     });
@@ -404,22 +542,32 @@ export const make = Effect.fn("DeviceNotifications.make")(function* () {
       catch: (cause) => new WebPushSendError({ cause }),
     }).pipe(
       Effect.as(true),
-      Effect.catch((cause) =>
-        isExpiredPushError(cause)
-          ? removeDevice(device.deviceId).pipe(
-              Effect.catch((removeCause) =>
-                Effect.logWarning("Failed to remove expired notification device", {
-                  cause: removeCause,
-                  deviceId: device.deviceId,
-                }),
-              ),
-              Effect.as(false),
-            )
-          : Effect.logWarning("Failed to send web push notification", {
-              cause,
-              deviceId: device.deviceId,
-            }).pipe(Effect.as(false)),
-      ),
+      Effect.catch((cause) => {
+        const status = expiredPushStatus(cause);
+        if (status === null) {
+          return Effect.logWarning("Failed to send web push notification", {
+            cause,
+            deviceId: device.deviceId,
+          }).pipe(Effect.as(false));
+        }
+        return Effect.gen(function* () {
+          yield* Effect.logWarning("Web push subscription expired", {
+            deviceId: device.deviceId,
+            endpointHost: endpointHost(subscription.endpoint),
+            reason: `push-service-${status}`,
+          });
+          const timestamp = yield* nowIso;
+          yield* expireDevice(device.deviceId, subscription, timestamp).pipe(
+            Effect.catch((expireCause) =>
+              Effect.logWarning("Failed to expire notification device", {
+                cause: expireCause,
+                deviceId: device.deviceId,
+              }),
+            ),
+          );
+          return false;
+        });
+      }),
     );
   });
 
@@ -434,8 +582,16 @@ export const make = Effect.fn("DeviceNotifications.make")(function* () {
       yield* endpointGuard.prepare(input.subscription.endpoint);
     }
     const timestamp = yield* nowIso;
+    const nowMillis = yield* Clock.currentTimeMillis;
+    const recovery = yield* makeRecoveryCredential(input.subscription);
     yield* SynchronizedRef.modifyEffect(state, (current) => {
-      const nextDevices = upsertDevice(current.devices, input, timestamp);
+      const retainedDevices = pruneExpiredDevices(current.devices, nowMillis);
+      const nextDevices = upsertDevice(
+        retainedDevices,
+        input,
+        timestamp,
+        recovery.recoveryTokenHash,
+      );
       return persistDevices(nextDevices, "register-device").pipe(
         Effect.as([undefined, { ...current, devices: nextDevices }] as const),
       );
@@ -443,7 +599,113 @@ export const make = Effect.fn("DeviceNotifications.make")(function* () {
     return {
       deviceId: input.deviceId,
       vapidPublicKey: vapidKeys.publicKey,
+      recoveryToken: recovery.recoveryToken,
     };
+  });
+
+  const recoverSubscription: DeviceNotifications["Service"]["recoverSubscription"] = Effect.fn(
+    "DeviceNotifications.recoverSubscription",
+  )(function* (input) {
+    const timestamp = yield* nowIso;
+    const nowMillis = yield* Clock.currentTimeMillis;
+    const candidateHash = yield* hashRecoveryToken(input.recoveryToken);
+    const rotatedToken = deriveRecoveryToken(input.newSubscription);
+    const rotatedTokenHash = yield* hashRecoveryToken(rotatedToken);
+
+    return yield* SynchronizedRef.modifyEffect(state, (current) => {
+      const retainedDevices = pruneExpiredDevices(current.devices, nowMillis);
+      let matchingDevice:
+        | { readonly device: NotificationDeviceRecord; readonly kind: "rotate" | "replay" }
+        | undefined;
+      let comparedStoredHash = false;
+      for (const device of retainedDevices.values()) {
+        if (!isRecoveryEligible(device, nowMillis)) {
+          continue;
+        }
+        if (device.subscription?.endpoint === input.oldEndpoint) {
+          comparedStoredHash = true;
+          if (
+            timingSafeEqualBase64Url(
+              candidateHash,
+              device.recoveryTokenHash ?? DUMMY_RECOVERY_TOKEN_HASH,
+            )
+          ) {
+            matchingDevice ??= { device, kind: "rotate" };
+          }
+        }
+        const replay = device.recoveryReplay;
+        if (
+          replay?.oldEndpoint === input.oldEndpoint &&
+          serverSubscriptionsMatch(replay.newSubscription, input.newSubscription)
+        ) {
+          comparedStoredHash = true;
+          const previousTokenMatches = timingSafeEqualBase64Url(
+            candidateHash,
+            replay.previousTokenHash,
+          );
+          const rotatedTokenStillCurrent = timingSafeEqualBase64Url(
+            rotatedTokenHash,
+            device.recoveryTokenHash ?? DUMMY_RECOVERY_TOKEN_HASH,
+          );
+          if (previousTokenMatches && rotatedTokenStillCurrent) {
+            matchingDevice ??= { device, kind: "replay" };
+          }
+        }
+      }
+      if (!comparedStoredHash) {
+        timingSafeEqualBase64Url(candidateHash, DUMMY_RECOVERY_TOKEN_HASH);
+      }
+
+      if (matchingDevice === undefined) {
+        if (retainedDevices.size === current.devices.size) {
+          return Effect.succeed([null, current] as const);
+        }
+        return persistDevices(retainedDevices, "purge-expired-devices").pipe(
+          Effect.catch(() => Effect.void),
+          Effect.as([null, { ...current, devices: retainedDevices }] as const),
+        );
+      }
+
+      if (matchingDevice.kind === "replay") {
+        const result = { recoveryToken: rotatedToken };
+        if (retainedDevices.size === current.devices.size) {
+          return Effect.succeed([result, current] as const);
+        }
+        return persistDevices(retainedDevices, "purge-expired-devices").pipe(
+          Effect.catch(() => Effect.void),
+          Effect.as([result, { ...current, devices: retainedDevices }] as const),
+        );
+      }
+
+      return endpointGuard.prepare(input.newSubscription.endpoint).pipe(
+        Effect.andThen(() => {
+          const nextDevices = new Map(retainedDevices);
+          const {
+            expiredAt: _expiredAt,
+            recoveryReplay: _recoveryReplay,
+            ...activeDevice
+          } = matchingDevice.device;
+          nextDevices.set(matchingDevice.device.deviceId, {
+            ...activeDevice,
+            subscription: input.newSubscription,
+            status: "active",
+            recoveryTokenHash: rotatedTokenHash,
+            recoveryReplay: {
+              previousTokenHash: candidateHash,
+              oldEndpoint: input.oldEndpoint,
+              newSubscription: input.newSubscription,
+            },
+            updatedAt: timestamp,
+          });
+          return persistDevices(nextDevices, "recover-device").pipe(
+            Effect.as([
+              { recoveryToken: rotatedToken },
+              { ...current, devices: nextDevices },
+            ] as const),
+          );
+        }),
+      );
+    });
   });
 
   const notify: DeviceNotifications["Service"]["notify"] = Effect.fn("DeviceNotifications.notify")(
@@ -460,7 +722,10 @@ export const make = Effect.fn("DeviceNotifications.make")(function* () {
           expiresAtMillis: nowMillis + ACTIVE_NOTIFICATION_TTL_MILLIS,
         });
         const boundedActive = pruneActiveNotifications(nextActive, nowMillis);
-        return [current.devices, { ...current, activeNotifications: boundedActive }] as const;
+        const activeDevices = new Map(
+          Array.from(current.devices).filter(([, device]) => device.status !== "expired"),
+        );
+        return [activeDevices, { ...current, activeNotifications: boundedActive }] as const;
       });
 
       yield* publish(event);
@@ -548,7 +813,7 @@ export const make = Effect.fn("DeviceNotifications.make")(function* () {
     yield* Effect.forEach(
       result.devices.values(),
       (device) =>
-        device.deviceKind === "web-push"
+        device.deviceKind === "web-push" && device.status !== "expired"
           ? sendWebPush(device, makeDismissPayload(input.notificationId), input.notificationId)
           : Effect.void,
       { concurrency: 8, discard: true },
@@ -583,6 +848,7 @@ export const make = Effect.fn("DeviceNotifications.make")(function* () {
   return DeviceNotifications.of({
     getConfig,
     registerDevice,
+    recoverSubscription,
     ackNotification,
     notify,
     events,

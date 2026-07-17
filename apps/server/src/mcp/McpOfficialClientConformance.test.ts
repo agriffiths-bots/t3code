@@ -215,6 +215,7 @@ const projectionSnapshotQueryLayer = Layer.mock(ProjectionSnapshotQuery)({
 const deviceNotificationsLayer = Layer.mock(DeviceNotifications.DeviceNotifications)({
   getConfig: Effect.die("unused"),
   registerDevice: () => Effect.die("unused"),
+  recoverSubscription: () => Effect.die("unused"),
   ackNotification: () => Effect.die("unused"),
   notify: () => Effect.die("unused"),
   events: Stream.empty,

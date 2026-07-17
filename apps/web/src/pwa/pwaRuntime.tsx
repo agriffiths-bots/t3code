@@ -115,6 +115,14 @@ function resolveNotificationAckUrl(httpBaseUrl: string | null): string | undefin
   }
 }
 
+function resolveNotificationRecoveryUrl(httpBaseUrl: string | null): string | undefined {
+  try {
+    return new URL("/api/notifications/recover", httpBaseUrl ?? window.location.origin).toString();
+  } catch {
+    return undefined;
+  }
+}
+
 function shouldRunPwaRuntime(): boolean {
   return (
     typeof window !== "undefined" &&
@@ -148,6 +156,23 @@ export async function shouldRegisterDesktopNotifications(input: {
   }
   const permission = await input.requestPermission();
   return !input.isCancelled() && permission === "granted";
+}
+
+export function createSerializedRegistrationRefresh(
+  refresh: () => Promise<void>,
+): () => Promise<void> {
+  let inFlight: Promise<void> | null = null;
+  return () => {
+    if (inFlight) return inFlight;
+
+    const next = Promise.resolve().then(refresh);
+    inFlight = next;
+    const clear = () => {
+      if (inFlight === next) inFlight = null;
+    };
+    void next.then(clear, clear);
+    return next;
+  };
 }
 
 interface DesktopNotificationDeliveryHost {
@@ -518,7 +543,7 @@ function PwaRuntimeForEnvironment({ environmentId }: { readonly environmentId: E
       if (!serverSubscription) return;
       const ackUrl = resolveNotificationAckUrl(httpBaseUrl);
 
-      await registerDevice({
+      const registrationResult = await registerDevice({
         environmentId,
         input: {
           deviceId: resolveDeviceId(),
@@ -529,16 +554,29 @@ function PwaRuntimeForEnvironment({ environmentId }: { readonly environmentId: E
           subscription: serverSubscription,
         },
       });
+      const registered = Option.getOrNull(AsyncResult.value(registrationResult));
+      const recoveryUrl = resolveNotificationRecoveryUrl(httpBaseUrl);
+      if (cancelled || !registered || !recoveryUrl) return;
+      registration.active?.postMessage({
+        type: "t3-push-recovery-config",
+        oldEndpoint: serverSubscription.endpoint,
+        recoveryToken: registered.recoveryToken,
+        recoveryUrl,
+        vapidPublicKey,
+      });
     }
 
-    const refreshRegistration = () => {
+    const runRegistrationRefresh = createSerializedRegistrationRefresh(async () => {
       if (window.desktopBridge) {
-        void registerDesktop();
+        await registerDesktop();
         return;
       }
       if (notificationConfig) {
-        void registerWebPush(notificationConfig.vapidPublicKey);
+        await registerWebPush(notificationConfig.vapidPublicKey);
       }
+    });
+    const refreshRegistration = () => {
+      void runRegistrationRefresh().catch(() => undefined);
     };
 
     refreshRegistration();
