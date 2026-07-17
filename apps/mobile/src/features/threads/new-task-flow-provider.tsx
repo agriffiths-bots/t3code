@@ -256,6 +256,7 @@ export function NewTaskFlowProvider(props: React.PropsWithChildren) {
       // (branch queries, worktree bootstrap) must skip it, not receive a
       // fabricated path.
       workspaceRoot: creation.projectCwd ?? "",
+      dataAudience: "private",
       repositoryIdentity: null,
       defaultModelSelection: editingPendingTask.modelSelection ?? null,
       scripts: [],

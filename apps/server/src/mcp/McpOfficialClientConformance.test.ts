@@ -162,6 +162,7 @@ const project: OrchestrationProjectShell = {
   id: ProjectId.make("project-mcp-conformance"),
   title: "MCP Conformance",
   workspaceRoot: "/tmp/t3-mcp-conformance",
+  dataAudience: "private",
   defaultModelSelection: {
     instanceId: providerInstanceId,
     model: "gpt-5-codex",

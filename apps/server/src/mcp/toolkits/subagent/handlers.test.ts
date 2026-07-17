@@ -75,6 +75,7 @@ const parentProject: OrchestrationProjectShell = {
   id: projectId,
   title: "Project",
   workspaceRoot: "/repo",
+  dataAudience: "private",
   repositoryIdentity: {
     canonicalKey: "git-local:/repo",
     locator: {
@@ -160,6 +161,7 @@ let childShellParentEnvironmentId: EnvironmentId | null = null;
 const makeChildDetail = (): OrchestrationThread => ({
   id: childThreadId,
   projectId,
+  dataAudience: parentProject.dataAudience,
   title: "Child",
   modelSelection: codexModel,
   runtimeMode: "full-access",
@@ -202,6 +204,7 @@ const makeChildDetail = (): OrchestrationThread => ({
 const makeChildShell = (turnState: "completed" | "running" = "completed") => ({
   id: childThreadId,
   projectId,
+  dataAudience: parentProject.dataAudience,
   title: "Child",
   modelSelection: codexModel,
   runtimeMode: "full-access" as const,

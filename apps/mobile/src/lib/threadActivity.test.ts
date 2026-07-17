@@ -34,6 +34,7 @@ function makeThread(
   input: Partial<OrchestrationThread> & Pick<OrchestrationThread, "id" | "projectId" | "title">,
 ): OrchestrationThread {
   return {
+    dataAudience: "private",
     modelSelection: { instanceId: ProviderInstanceId.make("codex"), model: "gpt-5.4" },
     runtimeMode: "full-access",
     interactionMode: "default",

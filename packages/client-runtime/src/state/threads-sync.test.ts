@@ -68,6 +68,7 @@ const PREPARED: PreparedConnection = {
 const BASE_THREAD: OrchestrationThread = {
   id: THREAD_ID,
   projectId: ProjectId.make("project-1"),
+  dataAudience: "private",
   title: "Cached thread",
   modelSelection: {
     instanceId: ProviderInstanceId.make("codex"),

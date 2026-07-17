@@ -1778,6 +1778,7 @@ describe("deriveTimelineEntries", () => {
     const baseThread: OrchestrationThread = {
       id: threadId,
       projectId: ProjectId.make("project-live-assistant"),
+      dataAudience: "private",
       title: "Live assistant delivery",
       modelSelection: { instanceId: ProviderInstanceId.make("claudeAgent"), model: "claude" },
       runtimeMode: "full-access",

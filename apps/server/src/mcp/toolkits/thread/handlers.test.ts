@@ -45,6 +45,7 @@ const modelSelection: ModelSelection = {
 const sourceThread: OrchestrationThreadShell = {
   id: sourceThreadId,
   projectId,
+  dataAudience: "private",
   title: "Source",
   modelSelection,
   runtimeMode: "auto-accept-edits",
@@ -66,6 +67,7 @@ const project: OrchestrationProjectShell = {
   id: projectId,
   title: "Project",
   workspaceRoot: "/repo",
+  dataAudience: "private",
   repositoryIdentity: {
     canonicalKey: "git-local:/repo",
     locator: {

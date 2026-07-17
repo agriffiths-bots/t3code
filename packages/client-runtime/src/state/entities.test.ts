@@ -86,6 +86,7 @@ describe("scoped entity keys", () => {
 const THREAD_SHELL = {
   id: THREAD_ID,
   projectId: PROJECT_ID,
+  dataAudience: "private",
   title: "Thread",
   modelSelection: { instanceId: ProviderInstanceId.make("codex"), model: "gpt-5.4" },
   runtimeMode: "full-access",
@@ -112,6 +113,7 @@ const SNAPSHOT: OrchestrationShellSnapshot = {
       id: PROJECT_ID,
       title: "Project",
       workspaceRoot: "/repo",
+      dataAudience: "private",
       repositoryIdentity: null,
       defaultModelSelection: null,
       scripts: [],
@@ -122,6 +124,7 @@ const SNAPSHOT: OrchestrationShellSnapshot = {
       id: OTHER_PROJECT_ID,
       title: "Other project",
       workspaceRoot: "/other-repo",
+      dataAudience: "private",
       repositoryIdentity: null,
       defaultModelSelection: null,
       scripts: [],

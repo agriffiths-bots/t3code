@@ -29,6 +29,7 @@ const readModel: OrchestrationReadModel = {
       id: ProjectId.make("project-a"),
       title: "Project A",
       workspaceRoot: "/tmp/project-a",
+      dataAudience: "private",
       defaultModelSelection: {
         instanceId: ProviderInstanceId.make("codex"),
         model: "gpt-5-codex",
@@ -42,6 +43,7 @@ const readModel: OrchestrationReadModel = {
       id: ProjectId.make("project-b"),
       title: "Project B",
       workspaceRoot: "/tmp/project-b",
+      dataAudience: "private",
       defaultModelSelection: {
         instanceId: ProviderInstanceId.make("codex"),
         model: "gpt-5-codex",
@@ -56,6 +58,7 @@ const readModel: OrchestrationReadModel = {
     {
       id: ThreadId.make("thread-1"),
       projectId: ProjectId.make("project-a"),
+      dataAudience: "private",
       title: "Thread A",
       modelSelection: {
         instanceId: ProviderInstanceId.make("codex"),
@@ -80,6 +83,7 @@ const readModel: OrchestrationReadModel = {
     {
       id: ThreadId.make("thread-2"),
       projectId: ProjectId.make("project-b"),
+      dataAudience: "private",
       title: "Thread B",
       modelSelection: {
         instanceId: ProviderInstanceId.make("codex"),

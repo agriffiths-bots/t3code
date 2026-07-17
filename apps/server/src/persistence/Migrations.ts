@@ -61,6 +61,7 @@ import Migration0046 from "./Migrations/046_RemoteSubagentChildren.ts";
 import Migration0047 from "./Migrations/047_RemoteChildTerminalDeliveryClaims.ts";
 import Migration0048 from "./Migrations/048_OrchestrationEventStoreStorageEpoch.ts";
 import Migration0049 from "./Migrations/049_OrchestrationThreadRevisionCoveringIndex.ts";
+import Migration0050 from "./Migrations/050_ProjectionProjectDataAudience.ts";
 
 /**
  * Migration loader with all migrations defined inline.
@@ -121,6 +122,7 @@ export const migrationEntries = [
   [47, "RemoteChildTerminalDeliveryClaims", Migration0047],
   [48, "OrchestrationEventStoreStorageEpoch", Migration0048],
   [49, "OrchestrationThreadRevisionCoveringIndex", Migration0049],
+  [50, "ProjectionProjectDataAudience", Migration0050],
 ] as const;
 
 export const makeMigrationLoader = (throughId?: number) =>

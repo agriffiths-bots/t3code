@@ -12,6 +12,7 @@ function makeProject(
 ): OrchestrationProjectShell {
   return {
     workspaceRoot: `/workspaces/${input.id}`,
+    dataAudience: "private",
     repositoryIdentity: null,
     defaultModelSelection: null,
     scripts: [],
@@ -26,6 +27,7 @@ function makeThread(
     Pick<OrchestrationThreadShell, "id" | "projectId" | "title">,
 ): OrchestrationThreadShell {
   return {
+    dataAudience: "private",
     modelSelection: { instanceId: ProviderInstanceId.make("codex"), model: "gpt-5.4" },
     runtimeMode: "full-access",
     interactionMode: "default",
