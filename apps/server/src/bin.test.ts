@@ -3,6 +3,7 @@ import * as NodeHttp from "node:http";
 import * as NodeFS from "node:fs";
 import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
+import * as NodeURL from "node:url";
 
 import * as NodeHttpServer from "@effect/platform-node/NodeHttpServer";
 import * as NodeServices from "@effect/platform-node/NodeServices";
@@ -50,6 +51,10 @@ import { environmentAuthenticatedAuthLayer } from "./auth/http.ts";
 
 const CliRuntimeLayer = Layer.mergeAll(NodeServices.layer, NetService.layer);
 class ProjectCliHttpApi extends HttpApi.make("environment").add(EnvironmentOrchestrationHttpApi) {}
+const repositoryRoot = NodePath.resolve(
+  NodePath.dirname(NodeURL.fileURLToPath(import.meta.url)),
+  "../../..",
+);
 
 const connectCli = makeCli({ cloudEnabled: true });
 const noConnectCli = makeCli({ cloudEnabled: false });
@@ -527,7 +532,7 @@ it.layer(NodeServices.layer)("bin cli parsing", (it) => {
         const baseDir = NodeFS.mkdtempSync(
           NodePath.join(NodeOS.tmpdir(), "t3-cli-project-audience-audit-test-"),
         );
-        const workspaceRoot = process.cwd();
+        const workspaceRoot = repositoryRoot;
 
         yield* runCliWithRuntime([
           "project",
@@ -609,7 +614,7 @@ it.layer(NodeServices.layer)("bin cli parsing", (it) => {
       const baseDir = NodeFS.mkdtempSync(
         NodePath.join(NodeOS.tmpdir(), "t3-cli-project-audience-subdir-test-"),
       );
-      const workspaceRoot = NodePath.join(process.cwd(), "apps", "server");
+      const workspaceRoot = NodePath.join(repositoryRoot, "apps", "server");
 
       yield* runCliWithRuntime([
         "project",
@@ -640,7 +645,7 @@ it.layer(NodeServices.layer)("bin cli parsing", (it) => {
         const baseDir = NodeFS.mkdtempSync(
           NodePath.join(NodeOS.tmpdir(), "t3-cli-project-audience-live-test-"),
         );
-        const workspaceRoot = process.cwd();
+        const workspaceRoot = repositoryRoot;
 
         yield* withLiveProjectCliServer(baseDir, (origin) =>
           Effect.gen(function* () {
