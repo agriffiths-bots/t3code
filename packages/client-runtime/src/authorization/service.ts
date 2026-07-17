@@ -318,6 +318,7 @@ export const make = Effect.gen(function* () {
       const access = yield* exchangeRemoteDpopAccessToken({
         httpBaseUrl: bootstrap.endpoint.httpBaseUrl,
         credential: bootstrap.credential,
+        audienceCeiling: "private",
         dpopProof: bootstrapProof,
         scopes: presentation.scopes,
         clientMetadata: presentation.metadata,

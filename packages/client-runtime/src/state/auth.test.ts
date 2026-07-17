@@ -10,6 +10,7 @@ describe("applyAuthAccessStreamEvent", () => {
       id: "pairing-link",
       credential: "credential",
       scopes: ["orchestration:read"],
+      audienceCeiling: "factory",
       subject: "subject",
       label: "Phone",
       createdAt: DateTime.makeUnsafe("2036-04-07T00:00:00.000Z"),
@@ -19,6 +20,7 @@ describe("applyAuthAccessStreamEvent", () => {
       sessionId: AuthSessionId.make("session-client"),
       subject: "subject",
       scopes: ["orchestration:read"],
+      audienceCeiling: "factory",
       method: "browser-session-cookie",
       client: {
         label: "Phone",
@@ -58,6 +60,7 @@ describe("applyAuthAccessStreamEvent", () => {
             id: "pairing-link",
             credential: "credential",
             scopes: ["orchestration:read"],
+            audienceCeiling: "factory",
             subject: "subject",
             label: "Phone",
             createdAt: DateTime.makeUnsafe("2036-04-07T00:00:00.000Z"),

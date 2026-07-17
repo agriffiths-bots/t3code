@@ -83,6 +83,7 @@ const withCosCliSessionToken = <A, E, R>(
 ) =>
   Effect.acquireUseRelease(
     environmentAuth.issueSession({
+      audienceCeiling: "private",
       scopes: AuthAdministrativeScopes,
       label: "t3 cos cli",
     }),

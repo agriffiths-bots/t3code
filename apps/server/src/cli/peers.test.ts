@@ -188,6 +188,7 @@ it.layer(NodeServices.layer)("peers CLI helpers", (it) => {
                   issued_token_type: AuthAccessTokenType,
                   token_type: "Bearer",
                   expires_in: 3600,
+                  audienceCeiling: "private",
                   scope: "standard",
                 }),
               ),

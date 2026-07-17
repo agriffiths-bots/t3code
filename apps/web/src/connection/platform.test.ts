@@ -65,6 +65,7 @@ function makeBridge(
         issued_token_type: "urn:ietf:params:oauth:token-type:access_token",
         token_type: "Bearer",
         expires_in: 3_600,
+        audienceCeiling: "private",
         scope: AuthStandardClientScopes.join(" "),
       };
     },

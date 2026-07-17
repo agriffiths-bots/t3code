@@ -90,6 +90,7 @@ function pairingHttpLayer(
           issued_token_type: "urn:ietf:params:oauth:token-type:access_token",
           token_type: "Bearer",
           expires_in: 3600,
+          audienceCeiling: "private",
           scope: AuthStandardClientScopes.join(" "),
         }),
       );
@@ -153,6 +154,7 @@ describe("connection onboarding", () => {
       const tokenParams = new URLSearchParams(tokenBody);
       expect(tokenParams.get("subject_token")).toBe("pairing-token");
       expect(tokenParams.get("scope")).toBe(AuthStandardClientScopes.join(" "));
+      expect(tokenParams.get("audience_ceiling")).toBe("private");
       expect(tokenParams.get("client_label")).toBe("T3 Code Test");
     }),
   );

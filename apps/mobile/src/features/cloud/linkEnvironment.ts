@@ -547,6 +547,7 @@ const connectRelayManagedEnvironment = Effect.fn("mobile.cloud.connectRelayManag
     const bootstrap = yield* exchangeRemoteDpopAccessToken({
       httpBaseUrl: connect.endpoint.httpBaseUrl,
       credential: connect.credential,
+      audienceCeiling: "private",
       dpopProof: bootstrapDpop,
       clientMetadata: authClientMetadata(),
     }).pipe(

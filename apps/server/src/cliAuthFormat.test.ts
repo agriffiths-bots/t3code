@@ -14,6 +14,7 @@ it("formats issued pairing credentials with the secret and optional pair URL", (
       id: "pairing-1",
       credential: "secret-pairing-token",
       scopes: ["orchestration:read"],
+      audienceCeiling: "private",
       subject: "one-time-token",
       createdAt: DateTime.makeUnsafe("2026-04-08T09:00:00.000Z"),
       expiresAt: DateTime.makeUnsafe("2026-04-08T10:00:00.000Z"),
@@ -34,6 +35,7 @@ it("formats pairing listings without exposing the secret token", () => {
         subject: "one-time-token",
         label: "Phone",
         scopes: ["orchestration:read"],
+        audienceCeiling: "factory",
         createdAt: DateTime.makeUnsafe("2026-04-08T09:00:00.000Z"),
         expiresAt: DateTime.makeUnsafe("2026-04-08T10:00:00.000Z"),
       },
@@ -52,6 +54,7 @@ it("formats issued sessions with the bearer token but omits tokens from listings
       token: "secret-session-token",
       method: "bearer-access-token",
       scopes: ["orchestration:read", "access:write"],
+      audienceCeiling: "private",
       subject: "cli-issued-session",
       client: {
         label: "deploy-bot",
@@ -68,6 +71,7 @@ it("formats issued sessions with the bearer token but omits tokens from listings
         sessionId: "session-1" as never,
         method: "bearer-access-token",
         scopes: ["orchestration:read", "access:write"],
+        audienceCeiling: "private",
         subject: "cli-issued-session",
         client: {
           label: "deploy-bot",

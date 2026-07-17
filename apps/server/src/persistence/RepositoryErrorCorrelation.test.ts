@@ -37,6 +37,7 @@ describe("persistence error correlation", () => {
         sessionId,
         subject,
         scopes,
+        audienceCeiling: "private",
         method: "browser-session-cookie",
         client: {
           label: null,
@@ -72,6 +73,7 @@ describe("persistence error correlation", () => {
           sessionId,
           subject,
           scopes,
+          audienceCeiling: "private",
           method: "browser-session-cookie",
           client: {
             label: null,
@@ -161,6 +163,7 @@ describe("persistence error correlation", () => {
           credential,
           method: "one-time-token",
           scopes,
+          audienceCeiling: "private",
           subject,
           label: null,
           proofKeyThumbprint: null,

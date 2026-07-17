@@ -44,6 +44,7 @@ it.layer(NodeServices.layer)("EnvironmentAuth administrative operations", (it) =
       const environmentAuth = yield* EnvironmentAuth.EnvironmentAuth;
 
       const created = yield* environmentAuth.createPairingLink({
+        audienceCeiling: "factory",
         scopes: ["orchestration:read"],
         subject: "one-time-token",
         label: "CI phone",
@@ -53,6 +54,7 @@ it.layer(NodeServices.layer)("EnvironmentAuth administrative operations", (it) =
       const listedAfterRevoke = yield* environmentAuth.listPairingLinks();
 
       expect(created.scopes).toEqual(["orchestration:read"]);
+      expect(created.audienceCeiling).toBe("factory");
       expect(created.credential.length).toBeGreaterThan(0);
       expect(listedBeforeRevoke).toHaveLength(1);
       expect(listedBeforeRevoke[0]?.id).toBe(created.id);
@@ -69,6 +71,7 @@ it.layer(NodeServices.layer)("EnvironmentAuth administrative operations", (it) =
       const sessionCredentials = yield* SessionStore.SessionStore;
 
       const issued = yield* environmentAuth.issueSession({
+        audienceCeiling: "private",
         label: "deploy-bot",
       });
       const verified = yield* sessionCredentials.verify(issued.token);
@@ -77,6 +80,7 @@ it.layer(NodeServices.layer)("EnvironmentAuth administrative operations", (it) =
       const listedAfterRevoke = yield* environmentAuth.listSessions();
 
       expect(issued.method).toBe("bearer-access-token");
+      expect(issued.audienceCeiling).toBe("private");
       expect(issued.scopes).toEqual([
         "orchestration:read",
         "orchestration:operate",
@@ -115,6 +119,7 @@ it.layer(NodeServices.layer)("EnvironmentAuth administrative operations", (it) =
       const sessionCredentials = yield* SessionStore.SessionStore;
 
       const issued = yield* environmentAuth.issueSession({
+        audienceCeiling: "private",
         label: "remote-ipad",
       });
       const beforeConnect = yield* environmentAuth.listSessions();

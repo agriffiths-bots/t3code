@@ -1,5 +1,6 @@
 import type {
   AuthBrowserSessionResult,
+  AuthAudienceCeiling,
   AuthClientMetadata,
   AuthEnvironmentScope,
   AuthPairingCredentialResult,
@@ -149,6 +150,7 @@ export interface ServerPairingLinkRecord {
   readonly id: string;
   readonly credential: string;
   readonly scopes: ReadonlyArray<AuthEnvironmentScope>;
+  readonly audienceCeiling: AuthAudienceCeiling;
   readonly subject: string;
   readonly label?: string;
   readonly createdAt: string;
@@ -159,6 +161,7 @@ export interface ServerClientSessionRecord {
   readonly sessionId: AuthSessionId;
   readonly subject: string;
   readonly scopes: ReadonlyArray<AuthEnvironmentScope>;
+  readonly audienceCeiling: AuthAudienceCeiling;
   readonly method: ServerAuthSessionMethod;
   readonly client: AuthClientMetadata;
   readonly issuedAt: string;
@@ -399,6 +402,7 @@ export async function createServerPairingCredential(input?: {
           client.auth.pairingCredential({
             headers: {},
             payload: {
+              audienceCeiling: "private",
               ...(trimmedLabel ? { label: trimmedLabel } : {}),
               ...(input?.scopes ? { scopes: input.scopes } : {}),
             },
@@ -431,6 +435,7 @@ export async function listServerPairingLinks(): Promise<ReadonlyArray<ServerPair
           id: pairingLink.id,
           credential: pairingLink.credential,
           scopes: pairingLink.scopes,
+          audienceCeiling: pairingLink.audienceCeiling,
           subject: pairingLink.subject,
           createdAt: timestamps.createdAt,
           expiresAt: timestamps.expiresAt,
@@ -440,6 +445,7 @@ export async function listServerPairingLinks(): Promise<ReadonlyArray<ServerPair
         id: pairingLink.id,
         credential: pairingLink.credential,
         scopes: pairingLink.scopes,
+        audienceCeiling: pairingLink.audienceCeiling,
         subject: pairingLink.subject,
         label: pairingLink.label,
         createdAt: timestamps.createdAt,
@@ -483,6 +489,7 @@ export async function listServerClientSessions(): Promise<
       sessionId: clientSession.sessionId,
       subject: clientSession.subject,
       scopes: clientSession.scopes,
+      audienceCeiling: clientSession.audienceCeiling,
       method: clientSession.method,
       client: clientSession.client,
       issuedAt: DateTime.formatIso(clientSession.issuedAt),

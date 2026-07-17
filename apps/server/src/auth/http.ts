@@ -380,7 +380,12 @@ export const authHttpApiLayer = HttpApiBuilder.group(
                   ...(args.payload.client_os ? { os: args.payload.client_os } : {}),
                 },
               }),
-              proofKeyThumbprint ? { proofKeyThumbprint } : undefined,
+              {
+                ...(proofKeyThumbprint ? { proofKeyThumbprint } : {}),
+                ...(args.payload.audience_ceiling
+                  ? { audienceCeiling: args.payload.audience_ceiling }
+                  : {}),
+              },
             );
           },
           traceRelayRequest,
@@ -426,6 +431,14 @@ export const authHttpApiLayer = HttpApiBuilder.group(
               if (!session.scopes.has(delegatedScope)) {
                 return yield* failEnvironmentScopeRequired(delegatedScope);
               }
+            }
+            if (
+              !EnvironmentAuth.canNarrowAudienceCeiling(
+                session.audienceCeiling,
+                args.payload.audienceCeiling,
+              )
+            ) {
+              return yield* failEnvironmentInvalidRequest("audience_not_granted");
             }
             return yield* serverAuth.issuePairingCredential(args.payload);
           },

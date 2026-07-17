@@ -2,6 +2,10 @@ import * as Schema from "effect/Schema";
 import * as HttpApiSchema from "effect/unstable/httpapi/HttpApiSchema";
 
 import { AuthSessionId, TrimmedNonEmptyString } from "./baseSchemas.ts";
+import { DataAudience } from "./orchestration.ts";
+
+export const AuthAudienceCeiling = DataAudience;
+export type AuthAudienceCeiling = typeof AuthAudienceCeiling.Type;
 
 /**
  * Declares the server's overall authentication posture.
@@ -151,6 +155,7 @@ export type AuthBrowserSessionRequest = typeof AuthBrowserSessionRequest.Type;
 export const AuthBrowserSessionResult = Schema.Struct({
   authenticated: Schema.Literal(true),
   scopes: AuthEnvironmentScopes,
+  audienceCeiling: AuthAudienceCeiling,
   sessionMethod: ServerAuthSessionMethod,
   expiresAt: Schema.DateTimeUtc,
 });
@@ -177,6 +182,7 @@ export const AuthTokenExchangeRequest = Schema.Struct({
   subject_token: TrimmedNonEmptyString,
   subject_token_type: Schema.Literal(AuthEnvironmentBootstrapTokenType),
   requested_token_type: Schema.Literal(AuthAccessTokenType),
+  audience_ceiling: Schema.optionalKey(AuthAudienceCeiling),
   scope: Schema.optionalKey(TrimmedNonEmptyString),
   client_label: Schema.optionalKey(TrimmedNonEmptyString),
   client_device_type: Schema.optionalKey(AuthClientMetadataDeviceType),
@@ -190,6 +196,7 @@ export const AuthAccessTokenResult = Schema.Struct({
   token_type: Schema.Literals(["Bearer", "DPoP"]),
   expires_in: Schema.Number,
   scope: TrimmedNonEmptyString,
+  audienceCeiling: AuthAudienceCeiling,
 });
 export type AuthAccessTokenResult = typeof AuthAccessTokenResult.Type;
 
@@ -202,6 +209,7 @@ export type AuthWebSocketTicketResult = typeof AuthWebSocketTicketResult.Type;
 export const AuthPairingCredentialResult = Schema.Struct({
   id: TrimmedNonEmptyString,
   credential: TrimmedNonEmptyString,
+  audienceCeiling: AuthAudienceCeiling,
   label: Schema.optionalKey(TrimmedNonEmptyString),
   expiresAt: Schema.DateTimeUtc,
 });
@@ -211,6 +219,7 @@ export const AuthPairingLink = Schema.Struct({
   id: TrimmedNonEmptyString,
   credential: TrimmedNonEmptyString,
   scopes: AuthEnvironmentScopes,
+  audienceCeiling: AuthAudienceCeiling,
   subject: TrimmedNonEmptyString,
   label: Schema.optionalKey(TrimmedNonEmptyString),
   createdAt: Schema.DateTimeUtc,
@@ -232,6 +241,7 @@ export const AuthClientSession = Schema.Struct({
   sessionId: AuthSessionId,
   subject: TrimmedNonEmptyString,
   scopes: AuthEnvironmentScopes,
+  audienceCeiling: AuthAudienceCeiling,
   method: ServerAuthSessionMethod,
   client: AuthClientMetadata,
   issuedAt: Schema.DateTimeUtc,
@@ -329,6 +339,7 @@ export const AuthRevokeClientSessionInput = Schema.Struct({
 export type AuthRevokeClientSessionInput = typeof AuthRevokeClientSessionInput.Type;
 
 export const AuthCreatePairingCredentialInput = Schema.Struct({
+  audienceCeiling: AuthAudienceCeiling,
   label: Schema.optionalKey(TrimmedNonEmptyString),
   scopes: Schema.optionalKey(AuthEnvironmentScopes),
 });
@@ -338,6 +349,7 @@ export const AuthSessionState = Schema.Struct({
   authenticated: Schema.Boolean,
   auth: ServerAuthDescriptor,
   scopes: Schema.optionalKey(AuthEnvironmentScopes),
+  audienceCeiling: Schema.optionalKey(AuthAudienceCeiling),
   sessionMethod: Schema.optionalKey(ServerAuthSessionMethod),
   expiresAt: Schema.optionalKey(Schema.DateTimeUtc),
 });

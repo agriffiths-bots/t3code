@@ -1028,6 +1028,7 @@ const exchangeAccessToken = (
   options?: {
     readonly headers?: Record<string, string>;
     readonly scope?: string;
+    readonly audienceCeiling?: "private" | "factory";
     readonly clientMetadata?: {
       readonly label?: string;
       readonly deviceType?: string;
@@ -1048,6 +1049,7 @@ const exchangeAccessToken = (
         subject_token: credential,
         subject_token_type: AuthEnvironmentBootstrapTokenType,
         requested_token_type: AuthAccessTokenType,
+        audience_ceiling: options?.audienceCeiling ?? "private",
         scope:
           options?.scope ??
           "orchestration:read orchestration:operate terminal:operate review:write relay:read access:read access:write relay:write",
@@ -1635,7 +1637,7 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
         headers: {
           cookie: ownerCookie,
         },
-        body: yield* HttpBody.json({}),
+        body: yield* HttpBody.json({ audienceCeiling: "private" }),
       });
       const pairingBody = (yield* pairingResponse.json) as {
         readonly credential: string;
@@ -1692,7 +1694,7 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
         const ownerCookie = yield* getAuthenticatedSessionCookieHeader();
         const credentialResponse = yield* HttpClient.post("/api/auth/pairing-token", {
           headers: { cookie: ownerCookie },
-          body: yield* HttpBody.json({}),
+          body: yield* HttpBody.json({ audienceCeiling: "private" }),
         });
         const credential = (yield* credentialResponse.json) as { readonly credential: string };
         const tokenUrl = yield* getHttpServerUrl("/oauth/token");
@@ -1714,6 +1716,7 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
             subject_token: credential.credential,
             subject_token_type: "urn:t3:params:oauth:token-type:environment-bootstrap",
             requested_token_type: "urn:ietf:params:oauth:token-type:access_token",
+            audience_ceiling: "private",
             scope: "orchestration:read orchestration:operate terminal:operate review:write",
           }).toString(),
         });
@@ -1768,7 +1771,7 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
         headers: {
           cookie: ownerCookie,
         },
-        body: yield* HttpBody.json({}),
+        body: yield* HttpBody.json({ audienceCeiling: "private" }),
       });
       const firstCredential = (yield* firstCredentialResponse.json) as {
         readonly credential: string;
@@ -1777,7 +1780,7 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
         headers: {
           cookie: ownerCookie,
         },
-        body: yield* HttpBody.json({}),
+        body: yield* HttpBody.json({ audienceCeiling: "private" }),
       });
       const secondCredential = (yield* secondCredentialResponse.json) as {
         readonly credential: string;
@@ -1821,7 +1824,7 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
         headers: {
           cookie: ownerCookie,
         },
-        body: yield* HttpBody.json({}),
+        body: yield* HttpBody.json({ audienceCeiling: "private" }),
       });
       const credential = (yield* credentialResponse.json) as {
         readonly credential: string;
@@ -1856,7 +1859,7 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
         headers: {
           cookie: ownerCookie,
         },
-        body: yield* HttpBody.json({}),
+        body: yield* HttpBody.json({ audienceCeiling: "private" }),
       });
       const credential = (yield* credentialResponse.json) as {
         readonly credential: string;
@@ -2138,7 +2141,7 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
       const ownerCookie = yield* getAuthenticatedSessionCookieHeader();
       const credentialResponse = yield* HttpClient.post("/api/auth/pairing-token", {
         headers: { cookie: ownerCookie },
-        body: yield* HttpBody.json({}),
+        body: yield* HttpBody.json({ audienceCeiling: "private" }),
       });
       const credential = (yield* credentialResponse.json) as { readonly credential: string };
       const pairedCookie = yield* getAuthenticatedSessionCookieHeader(credential.credential);
@@ -2225,7 +2228,7 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
 
       const credentialResponse = yield* HttpClient.post("/api/auth/pairing-token", {
         headers: { cookie: ownerCookie },
-        body: yield* HttpBody.json({}),
+        body: yield* HttpBody.json({ audienceCeiling: "private" }),
       });
       const credential = (yield* credentialResponse.json) as { readonly credential: string };
       const pairedCookie = yield* getAuthenticatedSessionCookieHeader(credential.credential);
@@ -3331,7 +3334,7 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
         headers: {
           authorization: `Bearer ${tokenBody.access_token ?? ""}`,
         },
-        body: yield* HttpBody.json({}),
+        body: yield* HttpBody.json({ audienceCeiling: "private" }),
       });
       const overbroadPairingBody = (yield* overbroadPairingResponse.json) as {
         readonly requiredScope: string;
@@ -3340,7 +3343,10 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
         headers: {
           authorization: `Bearer ${tokenBody.access_token ?? ""}`,
         },
-        body: yield* HttpBody.json({ scopes: ["access:write"] }),
+        body: yield* HttpBody.json({
+          audienceCeiling: "private",
+          scopes: ["access:write"],
+        }),
       });
       const wsTicketResponse = yield* HttpClient.post("/api/auth/websocket-ticket", {
         headers: {
@@ -3687,7 +3693,7 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
         headers: {
           cookie: yield* getAuthenticatedSessionCookieHeader(),
         },
-        body: yield* HttpBody.json({}),
+        body: yield* HttpBody.json({ audienceCeiling: "private" }),
       });
       const body = (yield* response.json) as {
         readonly credential: string;
@@ -3716,7 +3722,7 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
         headers: {
           authorization: `Bearer ${bearerToken}`,
         },
-        body: yield* HttpBody.json({ label: "Hosted web" }),
+        body: yield* HttpBody.json({ audienceCeiling: "private", label: "Hosted web" }),
       });
       const body = (yield* response.json) as {
         readonly credential: string;
@@ -3737,7 +3743,7 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
         headers: {
           cookie: yield* getAuthenticatedSessionCookieHeader(),
         },
-        body: yield* HttpBody.json({ scopes: [] }),
+        body: yield* HttpBody.json({ audienceCeiling: "private", scopes: [] }),
       });
       const body = (yield* response.json) as {
         readonly code: string;
@@ -3755,7 +3761,7 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
       yield* buildAppUnderTest();
 
       const response = yield* HttpClient.post("/api/auth/pairing-token", {
-        body: yield* HttpBody.json({}),
+        body: yield* HttpBody.json({ audienceCeiling: "private" }),
       });
       assert.equal(response.status, 401);
     }).pipe(Effect.provide(NodeHttpServer.layerTest)),
@@ -3774,7 +3780,7 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
         headers: {
           cookie: ownerCookie,
         },
-        body: yield* HttpBody.json({}),
+        body: yield* HttpBody.json({ audienceCeiling: "private" }),
       });
       const createdBody = (yield* createdResponse.json) as {
         readonly id: string;
@@ -3820,7 +3826,7 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
         headers: {
           cookie: yield* getAuthenticatedSessionCookieHeader(),
         },
-        body: yield* HttpBody.json({}),
+        body: yield* HttpBody.json({ audienceCeiling: "private" }),
       });
       const ownerBody = (yield* ownerResponse.json) as {
         readonly credential: string;
@@ -3832,7 +3838,7 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
         headers: {
           cookie: pairedSessionCookie,
         },
-        body: yield* HttpBody.json({}),
+        body: yield* HttpBody.json({ audienceCeiling: "private" }),
       });
       const pairedBody = (yield* pairedResponse.json) as {
         readonly _tag: string;
@@ -3866,6 +3872,7 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
           "content-type": "application/json",
         },
         body: jsonRequestBody({
+          audienceCeiling: "private",
           label: "Julius iPhone",
         }),
       });
@@ -3926,7 +3933,7 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
         headers: {
           cookie: pairedSessionCookieHeader,
         },
-        body: yield* HttpBody.json({}),
+        body: yield* HttpBody.json({ audienceCeiling: "private" }),
       });
       const pairedClientPairingBody = (yield* pairedClientPairingResponse.json) as {
         readonly _tag: string;
@@ -3976,7 +3983,7 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
           headers: {
             cookie: ownerCookie,
           },
-          body: yield* HttpBody.json({ scopes: [scope] }),
+          body: yield* HttpBody.json({ audienceCeiling: "private", scopes: [scope] }),
         });
         assert.equal(pairingResponse.status, 200);
         const pairingBody = (yield* pairingResponse.json) as {
@@ -3995,7 +4002,7 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
         headers: {
           cookie: readCookie,
         },
-        body: yield* HttpBody.json({}),
+        body: yield* HttpBody.json({ audienceCeiling: "private" }),
       });
       const readWriteBody = (yield* readWriteResponse.json) as {
         readonly requiredScope: string;
@@ -4032,7 +4039,7 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
         headers: {
           cookie: ownerCookie,
         },
-        body: yield* HttpBody.json({}),
+        body: yield* HttpBody.json({ audienceCeiling: "private" }),
       });
       const pairingBody = (yield* pairingResponse.json) as {
         readonly credential: string;
@@ -4064,7 +4071,7 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
         headers: {
           cookie: pairedSessionCookie,
         },
-        body: yield* HttpBody.json({}),
+        body: yield* HttpBody.json({ audienceCeiling: "private" }),
       });
 
       assert.equal(revokeResponse.status, 200);

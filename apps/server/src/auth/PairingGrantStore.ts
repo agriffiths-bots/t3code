@@ -1,6 +1,7 @@
 import {
   AuthAdministrativeScopes,
   AuthStandardClientScopes,
+  type AuthAudienceCeiling,
   type AuthEnvironmentScope,
   type AuthPairingLink,
   type ServerAuthBootstrapMethod,
@@ -23,6 +24,7 @@ import * as AuthPairingLinks from "../persistence/AuthPairingLinks.ts";
 export interface BootstrapGrant {
   readonly method: ServerAuthBootstrapMethod;
   readonly scopes: ReadonlyArray<AuthEnvironmentScope>;
+  readonly audienceCeiling: AuthAudienceCeiling;
   readonly subject: string;
   readonly label?: string;
   readonly proofKeyThumbprint?: string;
@@ -188,6 +190,7 @@ export const isBootstrapCredentialError = Schema.is(BootstrapCredentialError);
 export interface IssuedBootstrapCredential {
   readonly id: string;
   readonly credential: string;
+  readonly audienceCeiling: AuthAudienceCeiling;
   readonly label?: string;
   readonly proofKeyThumbprint?: string;
   readonly expiresAt: DateTime.Utc;
@@ -206,7 +209,8 @@ export type BootstrapCredentialChange =
 export class PairingGrantStore extends Context.Service<
   PairingGrantStore,
   {
-    readonly issueOneTimeToken: (input?: {
+    readonly issueOneTimeToken: (input: {
+      readonly audienceCeiling: AuthAudienceCeiling;
       readonly ttl?: Duration.Duration;
       readonly scopes?: ReadonlyArray<AuthEnvironmentScope>;
       readonly subject?: string;
@@ -312,6 +316,7 @@ export const make = Effect.gen(function* () {
     yield* seedGrant(config.desktopBootstrapToken, {
       method: "desktop-bootstrap",
       scopes: AuthAdministrativeScopes,
+      audienceCeiling: "private",
       subject: "desktop-bootstrap",
       expiresAt: DateTime.add(now, {
         milliseconds: Duration.toMillis(DESKTOP_BOOTSTRAP_TTL_HOURS),
@@ -338,6 +343,7 @@ export const make = Effect.gen(function* () {
               id: row.id,
               credential: row.credential,
               scopes: row.scopes,
+              audienceCeiling: row.audienceCeiling,
               subject: row.subject,
               label: row.label,
               createdAt: row.createdAt,
@@ -347,6 +353,7 @@ export const make = Effect.gen(function* () {
               id: row.id,
               credential: row.credential,
               scopes: row.scopes,
+              audienceCeiling: row.audienceCeiling,
               subject: row.subject,
               createdAt: row.createdAt,
               expiresAt: row.expiresAt,
@@ -387,6 +394,7 @@ export const make = Effect.gen(function* () {
     const issued: IssuedBootstrapCredential = {
       id,
       credential,
+      audienceCeiling: input.audienceCeiling,
       ...(input?.label ? { label: input.label } : {}),
       ...(input?.proofKeyThumbprint ? { proofKeyThumbprint: input.proofKeyThumbprint } : {}),
       expiresAt,
@@ -398,6 +406,7 @@ export const make = Effect.gen(function* () {
         credential,
         method: "one-time-token",
         scopes: input?.scopes ?? AuthStandardClientScopes,
+        audienceCeiling: input.audienceCeiling,
         subject,
         label: input?.label ?? null,
         proofKeyThumbprint: input?.proofKeyThumbprint ?? null,
@@ -419,6 +428,7 @@ export const make = Effect.gen(function* () {
       id,
       credential,
       scopes: input?.scopes ?? AuthStandardClientScopes,
+      audienceCeiling: input.audienceCeiling,
       subject: input?.subject ?? "one-time-token",
       ...(input?.label ? { label: input.label } : {}),
       createdAt: now,
@@ -487,6 +497,7 @@ export const make = Effect.gen(function* () {
               grant: {
                 method: grant.method,
                 scopes: grant.scopes,
+                audienceCeiling: grant.audienceCeiling,
                 subject: grant.subject,
                 ...(grant.label ? { label: grant.label } : {}),
                 ...(grant.proofKeyThumbprint
@@ -521,6 +532,7 @@ export const make = Effect.gen(function* () {
         return {
           method: consumed.value.method,
           scopes: consumed.value.scopes,
+          audienceCeiling: consumed.value.audienceCeiling,
           subject: consumed.value.subject,
           ...(consumed.value.label ? { label: consumed.value.label } : {}),
           ...(consumed.value.proofKeyThumbprint

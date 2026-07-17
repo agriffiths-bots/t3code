@@ -88,11 +88,13 @@ it.layer(NodeServices.layer)("EnvironmentAuth.layer", (it) => {
     }),
   );
 
-  it.effect("issues standard pairing credentials by default", () =>
+  it.effect("issues explicitly private standard pairing credentials", () =>
     Effect.gen(function* () {
       const serverAuth = yield* EnvironmentAuth.EnvironmentAuth;
 
-      const pairingCredential = yield* serverAuth.issuePairingCredential();
+      const pairingCredential = yield* serverAuth.issuePairingCredential({
+        audienceCeiling: "private",
+      });
       const exchanged = yield* serverAuth.createBrowserSession(
         pairingCredential.credential,
         requestMetadata,
@@ -110,19 +112,83 @@ it.layer(NodeServices.layer)("EnvironmentAuth.layer", (it) => {
         "relay:read",
       ]);
       expect(verified.subject).toBe("one-time-token");
+      expect(verified.audienceCeiling).toBe("private");
+    }).pipe(Effect.provide(makeEnvironmentAuthLayer())),
+  );
+
+  it.effect("pairs a factory-ceiling grant into a factory browser session", () =>
+    Effect.gen(function* () {
+      const serverAuth = yield* EnvironmentAuth.EnvironmentAuth;
+      const pairingCredential = yield* serverAuth.issuePairingCredential({
+        audienceCeiling: "factory",
+      });
+
+      const exchanged = yield* serverAuth.createBrowserSession(
+        pairingCredential.credential,
+        requestMetadata,
+      );
+      const verified = yield* serverAuth.authenticateHttpRequest(
+        makeCookieRequest(exchanged.sessionToken),
+      );
+
+      expect(pairingCredential.audienceCeiling).toBe("factory");
+      expect(exchanged.response.audienceCeiling).toBe("factory");
+      expect(verified.audienceCeiling).toBe("factory");
+    }).pipe(Effect.provide(makeEnvironmentAuthLayer())),
+  );
+
+  it.effect("narrows an omitted token-exchange audience to factory", () =>
+    Effect.gen(function* () {
+      const serverAuth = yield* EnvironmentAuth.EnvironmentAuth;
+      const pairingCredential = yield* serverAuth.issuePairingCredential({
+        audienceCeiling: "private",
+      });
+
+      const token = yield* serverAuth.exchangeBootstrapCredentialForAccessToken(
+        pairingCredential.credential,
+        undefined,
+        requestMetadata,
+      );
+
+      expect(token.audienceCeiling).toBe("factory");
+    }).pipe(Effect.provide(makeEnvironmentAuthLayer())),
+  );
+
+  it.effect("rejects a factory grant that requests a private-capable claim", () =>
+    Effect.gen(function* () {
+      const serverAuth = yield* EnvironmentAuth.EnvironmentAuth;
+      const pairingCredential = yield* serverAuth.issuePairingCredential({
+        audienceCeiling: "factory",
+      });
+
+      const error = yield* serverAuth
+        .exchangeBootstrapCredentialForAccessToken(
+          pairingCredential.credential,
+          undefined,
+          requestMetadata,
+          { audienceCeiling: "private" },
+        )
+        .pipe(Effect.flip);
+      const sessions = yield* serverAuth.listSessions();
+
+      expect(error._tag).toBe("ServerAuthAudienceNotGrantedError");
+      expect(sessions).toHaveLength(0);
     }).pipe(Effect.provide(makeEnvironmentAuthLayer())),
   );
 
   it.effect("does not exchange ordinary pairing grants for administrative access tokens", () =>
     Effect.gen(function* () {
       const serverAuth = yield* EnvironmentAuth.EnvironmentAuth;
-      const pairingCredential = yield* serverAuth.issuePairingCredential();
+      const pairingCredential = yield* serverAuth.issuePairingCredential({
+        audienceCeiling: "private",
+      });
 
       const error = yield* serverAuth
         .exchangeBootstrapCredentialForAccessToken(
           pairingCredential.credential,
           ["orchestration:read", "access:write"],
           requestMetadata,
+          { audienceCeiling: "private" },
         )
         .pipe(Effect.flip);
 
@@ -134,6 +200,7 @@ it.layer(NodeServices.layer)("EnvironmentAuth.layer", (it) => {
     Effect.gen(function* () {
       const serverAuth = yield* EnvironmentAuth.EnvironmentAuth;
       const pairingCredential = yield* serverAuth.issuePairingCredential({
+        audienceCeiling: "private",
         scopes: ["orchestration:read"],
       });
 
@@ -141,6 +208,7 @@ it.layer(NodeServices.layer)("EnvironmentAuth.layer", (it) => {
         pairingCredential.credential,
         undefined,
         requestMetadata,
+        { audienceCeiling: "private" },
       );
 
       expect(token.scope).toBe("orchestration:read");
@@ -150,18 +218,22 @@ it.layer(NodeServices.layer)("EnvironmentAuth.layer", (it) => {
   it.effect("reports a reused one-time pairing credential as consumed", () =>
     Effect.gen(function* () {
       const serverAuth = yield* EnvironmentAuth.EnvironmentAuth;
-      const pairingCredential = yield* serverAuth.issuePairingCredential();
+      const pairingCredential = yield* serverAuth.issuePairingCredential({
+        audienceCeiling: "private",
+      });
 
       yield* serverAuth.exchangeBootstrapCredentialForAccessToken(
         pairingCredential.credential,
         undefined,
         requestMetadata,
+        { audienceCeiling: "private" },
       );
       const error = yield* serverAuth
         .exchangeBootstrapCredentialForAccessToken(
           pairingCredential.credential,
           undefined,
           requestMetadata,
+          { audienceCeiling: "private" },
         )
         .pipe(Effect.flip);
 
@@ -176,6 +248,7 @@ it.layer(NodeServices.layer)("EnvironmentAuth.layer", (it) => {
     Effect.gen(function* () {
       const serverAuth = yield* EnvironmentAuth.EnvironmentAuth;
       const pairingCredential = yield* serverAuth.issuePairingCredential({
+        audienceCeiling: "private",
         scopes: AuthAdministrativeScopes,
       });
       const listedPairingLinks = yield* serverAuth.listPairingLinks();
@@ -233,6 +306,7 @@ it.layer(NodeServices.layer)("EnvironmentAuth.layer", (it) => {
           makeCookieRequest(administrativeExchange.sessionToken),
         );
         const pairingCredential = yield* serverAuth.issuePairingCredential({
+          audienceCeiling: "private",
           label: "Julius iPhone",
         });
         const listedPairingLinks = yield* serverAuth.listPairingLinks();

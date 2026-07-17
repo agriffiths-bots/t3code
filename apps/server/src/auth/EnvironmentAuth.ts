@@ -3,6 +3,7 @@ import {
   AuthAccessWriteScope,
   AuthAdministrativeScopes,
   AuthStandardClientScopes,
+  type AuthAudienceCeiling,
   type AuthAccessTokenResult,
   type AuthBrowserSessionResult,
   type AuthClientMetadata,
@@ -50,6 +51,7 @@ export interface IssuedPairingLink {
   readonly id: string;
   readonly credential: string;
   readonly scopes: ReadonlyArray<AuthEnvironmentScope>;
+  readonly audienceCeiling: AuthAudienceCeiling;
   readonly subject: string;
   readonly label?: string;
   readonly createdAt: DateTime.Utc;
@@ -61,6 +63,7 @@ export interface IssuedBearerSession {
   readonly token: string;
   readonly method: "bearer-access-token";
   readonly scopes: ReadonlyArray<AuthEnvironmentScope>;
+  readonly audienceCeiling: AuthAudienceCeiling;
   readonly subject: string;
   readonly client: AuthClientMetadata;
   readonly expiresAt: DateTime.Utc;
@@ -71,6 +74,7 @@ export interface AuthenticatedSession {
   readonly subject: string;
   readonly method: ServerAuthSessionMethod;
   readonly scopes: ReadonlyArray<AuthEnvironmentScope>;
+  readonly audienceCeiling: AuthAudienceCeiling;
   readonly proofKeyThumbprint?: string;
   readonly expiresAt?: DateTime.DateTime;
 }
@@ -395,16 +399,37 @@ export class ServerAuthScopeNotGrantedError extends Schema.TaggedErrorClass<Serv
   }
 }
 
+export class ServerAuthAudienceNotGrantedError extends Schema.TaggedErrorClass<ServerAuthAudienceNotGrantedError>()(
+  "ServerAuthAudienceNotGrantedError",
+  {},
+) {
+  override get message(): string {
+    return "The requested audience ceiling was not granted.";
+  }
+}
+
 export const ServerAuthInvalidRequestError = Schema.Union([
   ServerAuthInvalidScopeError,
   ServerAuthScopeNotGrantedError,
+  ServerAuthAudienceNotGrantedError,
 ]);
 export type ServerAuthInvalidRequestError = typeof ServerAuthInvalidRequestError.Type;
 export const isServerAuthInvalidRequestError = Schema.is(ServerAuthInvalidRequestError);
 export const serverAuthInvalidRequestReason = (
   error: ServerAuthInvalidRequestError,
-): "invalid_scope" | "scope_not_granted" =>
-  error._tag === "ServerAuthInvalidScopeError" ? "invalid_scope" : "scope_not_granted";
+): "invalid_scope" | "scope_not_granted" | "audience_not_granted" =>
+  error._tag === "ServerAuthInvalidScopeError"
+    ? "invalid_scope"
+    : error._tag === "ServerAuthScopeNotGrantedError"
+      ? "scope_not_granted"
+      : "audience_not_granted";
+
+export function canNarrowAudienceCeiling(
+  source: AuthAudienceCeiling,
+  requested: AuthAudienceCeiling,
+): boolean {
+  return source === "private" || requested === "factory";
+}
 
 export class ServerAuthForbiddenOperationError extends Schema.TaggedErrorClass<ServerAuthForbiddenOperationError>()(
   "ServerAuthForbiddenOperationError",
@@ -438,12 +463,14 @@ export class EnvironmentAuth extends Context.Service<
       requestMetadata: AuthClientMetadata,
       input?: {
         readonly proofKeyThumbprint?: string;
+        readonly audienceCeiling?: AuthAudienceCeiling;
       },
     ) => Effect.Effect<
       AuthAccessTokenResult,
       ServerAuthInvalidCredentialError | ServerAuthInvalidRequestError | ServerAuthInternalError
     >;
-    readonly createPairingLink: (input?: {
+    readonly createPairingLink: (input: {
+      readonly audienceCeiling: AuthAudienceCeiling;
       readonly ttl?: Duration.Duration;
       readonly label?: string;
       readonly scopes?: ReadonlyArray<AuthEnvironmentScope>;
@@ -451,7 +478,7 @@ export class EnvironmentAuth extends Context.Service<
       readonly proofKeyThumbprint?: string;
     }) => Effect.Effect<IssuedPairingLink, ServerAuthInternalError>;
     readonly issuePairingCredential: (
-      input?: AuthCreatePairingCredentialInput,
+      input: AuthCreatePairingCredentialInput,
     ) => Effect.Effect<AuthPairingCredentialResult, ServerAuthInternalError>;
     readonly issueStartupPairingCredential: () => Effect.Effect<
       AuthPairingCredentialResult,
@@ -461,7 +488,8 @@ export class EnvironmentAuth extends Context.Service<
       readonly excludeSubjects?: ReadonlyArray<string>;
     }) => Effect.Effect<ReadonlyArray<AuthPairingLink>, ServerAuthInternalError>;
     readonly revokePairingLink: (id: string) => Effect.Effect<boolean, ServerAuthInternalError>;
-    readonly issueSession: (input?: {
+    readonly issueSession: (input: {
+      readonly audienceCeiling: AuthAudienceCeiling;
       readonly ttl?: Duration.Duration;
       readonly subject?: string;
       readonly scopes?: ReadonlyArray<AuthEnvironmentScope>;
@@ -611,6 +639,7 @@ export const make = Effect.gen(function* () {
         subject: session.subject,
         method: session.method,
         scopes: session.scopes,
+        audienceCeiling: session.audienceCeiling,
         ...(session.proofKeyThumbprint ? { proofKeyThumbprint: session.proofKeyThumbprint } : {}),
         ...(session.expiresAt ? { expiresAt: session.expiresAt } : {}),
       })),
@@ -667,6 +696,7 @@ export const make = Effect.gen(function* () {
             authenticated: true,
             auth: descriptor,
             scopes: session.scopes,
+            audienceCeiling: session.audienceCeiling,
             sessionMethod: session.method,
             ...(session.expiresAt ? { expiresAt: DateTime.toUtc(session.expiresAt) } : {}),
           }) satisfies AuthSessionState,
@@ -692,6 +722,7 @@ export const make = Effect.gen(function* () {
             method: "browser-session-cookie",
             subject: grant.subject,
             scopes: grant.scopes,
+            audienceCeiling: grant.audienceCeiling,
             client: {
               ...requestMetadata,
               ...(grant.label ? { label: grant.label } : {}),
@@ -707,6 +738,7 @@ export const make = Effect.gen(function* () {
             response: {
               authenticated: true,
               scopes: session.scopes,
+              audienceCeiling: session.audienceCeiling,
               sessionMethod: session.method,
               expiresAt: DateTime.toUtc(session.expiresAt),
             } satisfies AuthBrowserSessionResult,
@@ -726,11 +758,16 @@ export const make = Effect.gen(function* () {
             if (!grantedScopes.every((scope) => grant.scopes.includes(scope))) {
               return yield* new ServerAuthScopeNotGrantedError({});
             }
+            const grantedAudienceCeiling = input?.audienceCeiling ?? "factory";
+            if (!canNarrowAudienceCeiling(grant.audienceCeiling, grantedAudienceCeiling)) {
+              return yield* new ServerAuthAudienceNotGrantedError({});
+            }
             return yield* sessions
               .issue({
                 method: input?.proofKeyThumbprint ? "dpop-access-token" : "bearer-access-token",
                 subject: grant.subject,
                 scopes: grantedScopes,
+                audienceCeiling: grantedAudienceCeiling,
                 ...(input?.proofKeyThumbprint
                   ? {
                       proofKeyThumbprint: input.proofKeyThumbprint,
@@ -764,6 +801,7 @@ export const make = Effect.gen(function* () {
                     ),
                   ),
                   scope: encodeOAuthScope(session.scopes),
+                  audienceCeiling: session.audienceCeiling,
                 }) satisfies AuthAccessTokenResult,
             ),
           ),
@@ -773,11 +811,13 @@ export const make = Effect.gen(function* () {
 
   const issuePairingCredentialForSubject = (input: {
     readonly scopes: ReadonlyArray<AuthEnvironmentScope>;
+    readonly audienceCeiling: AuthAudienceCeiling;
     readonly subject: string;
     readonly label?: string;
   }) =>
     createPairingLink({
       scopes: input.scopes,
+      audienceCeiling: input.audienceCeiling,
       subject: input.subject,
       ...(input.label ? { label: input.label } : {}),
     }).pipe(
@@ -786,6 +826,7 @@ export const make = Effect.gen(function* () {
           ({
             id: issued.id,
             credential: issued.credential,
+            audienceCeiling: issued.audienceCeiling,
             ...(issued.label ? { label: issued.label } : {}),
             expiresAt: issued.expiresAt,
           }) satisfies AuthPairingCredentialResult,
@@ -799,6 +840,7 @@ export const make = Effect.gen(function* () {
       const createdAt = yield* DateTime.now;
       const issued = yield* bootstrapCredentials.issueOneTimeToken({
         scopes: input?.scopes ?? AuthStandardClientScopes,
+        audienceCeiling: input.audienceCeiling,
         subject: input?.subject ?? "one-time-token",
         ...(input?.ttl ? { ttl: input.ttl } : {}),
         ...(input?.label ? { label: input.label } : {}),
@@ -808,6 +850,7 @@ export const make = Effect.gen(function* () {
         id: issued.id,
         credential: issued.credential,
         scopes: input?.scopes ?? AuthStandardClientScopes,
+        audienceCeiling: issued.audienceCeiling,
         subject: input?.subject ?? "one-time-token",
         ...(issued.label ? { label: issued.label } : {}),
         createdAt: DateTime.toUtc(createdAt),
@@ -845,6 +888,7 @@ export const make = Effect.gen(function* () {
         subject: input?.subject ?? DEFAULT_SESSION_SUBJECT,
         method: "bearer-access-token",
         scopes: input?.scopes ?? AuthAdministrativeScopes,
+        audienceCeiling: input.audienceCeiling,
         client: {
           ...(input?.label ? { label: input.label } : {}),
           deviceType: "bot",
@@ -859,6 +903,7 @@ export const make = Effect.gen(function* () {
               token: issued.token,
               method: "bearer-access-token",
               scopes: issued.scopes,
+              audienceCeiling: issued.audienceCeiling,
               subject: input?.subject ?? DEFAULT_SESSION_SUBJECT,
               client: issued.client,
               expiresAt: DateTime.toUtc(issued.expiresAt),
@@ -908,6 +953,7 @@ export const make = Effect.gen(function* () {
   const issuePairingCredential: EnvironmentAuth["Service"]["issuePairingCredential"] = (input) =>
     issuePairingCredentialForSubject({
       scopes: input?.scopes ?? AuthStandardClientScopes,
+      audienceCeiling: input.audienceCeiling,
       subject: "one-time-token",
       ...(input?.label ? { label: input.label } : {}),
     }).pipe(Effect.withSpan("EnvironmentAuth.issuePairingCredential"));
@@ -916,6 +962,7 @@ export const make = Effect.gen(function* () {
     () =>
       issuePairingCredentialForSubject({
         scopes: AuthAdministrativeScopes,
+        audienceCeiling: "private",
         subject: INTERNAL_ADMINISTRATIVE_BOOTSTRAP_SUBJECT,
       }).pipe(Effect.withSpan("EnvironmentAuth.issueStartupPairingCredential"));
 
@@ -1013,6 +1060,7 @@ export const make = Effect.gen(function* () {
               subject: session.subject,
               method: session.method,
               scopes: session.scopes,
+              audienceCeiling: session.audienceCeiling,
               ...(session.expiresAt ? { expiresAt: session.expiresAt } : {}),
             })),
             mapSessionVerificationErrors,

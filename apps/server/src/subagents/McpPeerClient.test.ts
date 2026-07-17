@@ -115,6 +115,7 @@ const fakeEnvironmentAuth = EnvironmentAuth.EnvironmentAuth.of({
       subject: "peer-client-route-test",
       method: "bearer-access-token" as const,
       scopes: [AuthOrchestrationOperateScope],
+      audienceCeiling: "private",
       expiresAt: DateTime.makeUnsafe("2036-07-08T10:00:00.000Z"),
     });
   },
@@ -124,6 +125,7 @@ const fakeEnvironmentAuth = EnvironmentAuth.EnvironmentAuth.of({
       subject: "peer-client-route-test",
       method: "bearer-access-token" as const,
       scopes: [AuthOrchestrationOperateScope],
+      audienceCeiling: "private",
       expiresAt: DateTime.makeUnsafe("2036-07-08T10:00:00.000Z"),
     }),
   authenticateWebSocketUpgrade: () => Effect.die("unused"),
@@ -613,6 +615,7 @@ it.effect("rejects route-minted peer tokens when source session confirmation fai
             subject: "peer-client-route-race-test",
             method: "bearer-access-token" as const,
             scopes: [AuthOrchestrationOperateScope],
+            audienceCeiling: "private",
             expiresAt: DateTime.makeUnsafe("2036-07-08T10:00:00.000Z"),
           });
         },
