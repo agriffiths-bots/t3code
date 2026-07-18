@@ -71,6 +71,7 @@ import { resolveAttachmentPath } from "../../attachmentStore.ts";
 import { ServerConfig } from "../../config.ts";
 import { makeClaudeMcpServers } from "../../mcp/McpProviderInjection.ts";
 import * as McpProviderSession from "../../mcp/McpProviderSession.ts";
+import * as WorkerProcessIsolation from "../../process/WorkerProcessIsolation.ts";
 import { makeClaudeEnvironment } from "../Drivers/ClaudeHome.ts";
 import {
   getClaudeModelCapabilities,
@@ -1508,6 +1509,7 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
   const fileSystem = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
   const serverConfig = yield* ServerConfig;
+  const workerProcessIsolation = yield* WorkerProcessIsolation.currentOrDisabled;
   const crypto = yield* Crypto.Crypto;
   const claudeEnvironment = yield* makeClaudeEnvironment(claudeSettings, options?.environment).pipe(
     Effect.provideService(Path.Path, path),
@@ -3626,7 +3628,19 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
       const canUseTool: CanUseTool = (toolName, toolInput, callbackOptions) =>
         runPromise(canUseToolEffect(toolName, toolInput, callbackOptions));
 
-      const workerExecutable = { executablePath: claudeSettings.binaryPath, env: {} };
+      const claudeBinaryPath = claudeSettings.binaryPath;
+      const workerExecutable =
+        input.detached === true
+          ? yield* workerProcessIsolation
+              .prepareExecutable({
+                realCommand: claudeBinaryPath,
+                directory: serverConfig.stateDir,
+              })
+              .pipe(
+                Effect.provideService(FileSystem.FileSystem, fileSystem),
+                Effect.provideService(Path.Path, path),
+              )
+          : { executablePath: claudeBinaryPath, env: {} };
       const extraArgs = parseCliArgs(claudeSettings.launchArgs).flags;
       const modelSelection =
         input.modelSelection?.instanceId === boundInstanceId ? input.modelSelection : undefined;
@@ -3661,6 +3675,7 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
         ...(ultracode ? { ultracode: true } : {}),
       };
       const mcpSession = McpProviderSession.readMcpProviderSession(input.threadId);
+      let workerStderrBuffer = "";
       const queryOptions: ClaudeQueryOptions = {
         ...(input.cwd ? { cwd: input.cwd } : {}),
         ...(apiModelId ? { model: apiModelId } : {}),
@@ -3683,6 +3698,25 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
         ...(newSessionId ? { sessionId: newSessionId } : {}),
         includePartialMessages: true,
         canUseTool,
+        ...(input.detached === true
+          ? {
+              stderr: (data: string) => {
+                const lines = `${workerStderrBuffer}${data}`.split(/\r?\n/u);
+                workerStderrBuffer = (lines.pop() ?? "").slice(-4096);
+                for (const line of lines) {
+                  const reason = WorkerProcessIsolation.parseFallbackWarningLine(line);
+                  if (reason === undefined) continue;
+                  runFork(
+                    Effect.logWarning("worker.process.isolation.sdk-fallback", {
+                      providerInstanceId: boundInstanceId,
+                      threadId,
+                      reason,
+                    }),
+                  );
+                }
+              },
+            }
+          : {}),
         env: { ...claudeEnvironment, ...workerExecutable.env },
         ...(input.cwd ? { additionalDirectories: [input.cwd] } : {}),
         ...(Object.keys(extraArgs).length > 0 ? { extraArgs } : {}),
