@@ -172,6 +172,7 @@ export const bootstrapSshBearerSession = DesktopIpc.makeIpcMethod({
       bootstrapRemoteBearerSession({
         httpBaseUrl: resolvedHttpBaseUrl,
         credential,
+        audienceCeiling: "private",
       }),
     )(httpBaseUrl);
   }),

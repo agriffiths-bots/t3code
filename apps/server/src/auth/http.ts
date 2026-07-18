@@ -37,6 +37,7 @@ import * as HttpApiBuilder from "effect/unstable/httpapi/HttpApiBuilder";
 
 import * as EnvironmentAuth from "./EnvironmentAuth.ts";
 import * as SessionStore from "./SessionStore.ts";
+import { restrictScopesForAudienceCeiling } from "./audienceScopePolicy.ts";
 import { traceAuthenticatedRelayRequest, traceRelayRequest } from "../cloud/traceRelayRequest.ts";
 import * as ServerConfig from "../config.ts";
 import { deriveAuthClientMetadata } from "./utils.ts";
@@ -380,7 +381,12 @@ export const authHttpApiLayer = HttpApiBuilder.group(
                   ...(args.payload.client_os ? { os: args.payload.client_os } : {}),
                 },
               }),
-              proofKeyThumbprint ? { proofKeyThumbprint } : undefined,
+              {
+                ...(proofKeyThumbprint ? { proofKeyThumbprint } : {}),
+                ...(args.payload.audience_ceiling
+                  ? { audienceCeiling: args.payload.audience_ceiling }
+                  : {}),
+              },
             );
           },
           traceRelayRequest,
@@ -422,10 +428,24 @@ export const authHttpApiLayer = HttpApiBuilder.group(
             ) {
               return yield* failEnvironmentInvalidRequest("invalid_scope");
             }
+            if (
+              restrictScopesForAudienceCeiling(delegatedScopes, args.payload.audienceCeiling)
+                .length === 0
+            ) {
+              return yield* failEnvironmentInvalidRequest("invalid_scope");
+            }
             for (const delegatedScope of delegatedScopes) {
               if (!session.scopes.has(delegatedScope)) {
                 return yield* failEnvironmentScopeRequired(delegatedScope);
               }
+            }
+            if (
+              !EnvironmentAuth.canNarrowAudienceCeiling(
+                session.audienceCeiling,
+                args.payload.audienceCeiling,
+              )
+            ) {
+              return yield* failEnvironmentInvalidRequest("audience_not_granted");
             }
             return yield* serverAuth.issuePairingCredential(args.payload);
           },

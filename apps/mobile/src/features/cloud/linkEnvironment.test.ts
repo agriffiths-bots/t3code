@@ -453,6 +453,7 @@ describe("mobile cloud link environment client", () => {
             issued_token_type: "urn:ietf:params:oauth:token-type:access_token",
             token_type: "DPoP",
             expires_in: 3600,
+            audienceCeiling: "private",
             scope: "orchestration:read orchestration:operate terminal:operate review:write",
           }),
         );
@@ -860,6 +861,7 @@ describe("mobile cloud link environment client", () => {
                 issued_token_type: "urn:ietf:params:oauth:token-type:access_token",
                 token_type: "DPoP",
                 expires_in: 3600,
+                audienceCeiling: "private",
                 scope: "orchestration:read orchestration:operate terminal:operate review:write",
               }),
             );
@@ -947,6 +949,7 @@ describe("mobile cloud link environment client", () => {
                 issued_token_type: "urn:ietf:params:oauth:token-type:access_token",
                 token_type: "DPoP",
                 expires_in: 3600,
+                audienceCeiling: "private",
                 scope: "orchestration:read orchestration:operate terminal:operate review:write",
               }),
             );

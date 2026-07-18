@@ -667,6 +667,7 @@ it.layer(NodeServices.layer)("bin cli parsing", (it) => {
 
             const environmentAuth = yield* EnvironmentAuth.EnvironmentAuth;
             const standardSession = yield* environmentAuth.issueSession({
+              audienceCeiling: "private",
               scopes: AuthStandardClientScopes,
               subject: "standard-http-test",
             });
@@ -699,6 +700,7 @@ it.layer(NodeServices.layer)("bin cli parsing", (it) => {
             );
             assert.isDefined(broadProject);
             const adminSession = yield* environmentAuth.issueSession({
+              audienceCeiling: "private",
               scopes: [AuthProjectAudienceAdminScope],
               subject: "local-admin:http-error-test",
             });

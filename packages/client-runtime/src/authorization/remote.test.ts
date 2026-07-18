@@ -14,6 +14,7 @@ import {
   issueRemoteDpopWebSocketTicket,
   issueRemoteWebSocketTicket,
   RemoteEnvironmentAccessRejectedError,
+  RemoteEnvironmentAudienceCeilingMismatchError,
   RemoteEnvironmentAuthInvalidJsonError,
   RemoteEnvironmentAuthTimeoutError,
   resolveRemoteWebSocketConnectionUrl,
@@ -108,6 +109,7 @@ describe("remote environment authorization", () => {
             issued_token_type: "urn:ietf:params:oauth:token-type:access_token",
             token_type: "Bearer",
             expires_in: 3600,
+            audienceCeiling: "private",
             scope:
               "orchestration:read orchestration:operate terminal:operate review:write relay:read",
           },
@@ -118,6 +120,7 @@ describe("remote environment authorization", () => {
       const result = yield* bootstrapRemoteBearerSession({
         httpBaseUrl: "https://remote.example.com/",
         credential: "pairing-token",
+        audienceCeiling: "private",
       }).pipe(provideRemoteHttp(fetch.fetchFn));
 
       expect(result).toMatchObject({
@@ -131,8 +134,63 @@ describe("remote environment authorization", () => {
         headers: {
           "content-type": "application/x-www-form-urlencoded",
         },
-        body: "grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Atoken-exchange&subject_token=pairing-token&subject_token_type=urn%3At3%3Aparams%3Aoauth%3Atoken-type%3Aenvironment-bootstrap&requested_token_type=urn%3Aietf%3Aparams%3Aoauth%3Atoken-type%3Aaccess_token",
+        body: "grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Atoken-exchange&subject_token=pairing-token&subject_token_type=urn%3At3%3Aparams%3Aoauth%3Atoken-type%3Aenvironment-bootstrap&requested_token_type=urn%3Aietf%3Aparams%3Aoauth%3Atoken-type%3Aaccess_token&audience_ceiling=private",
       });
+    }),
+  );
+
+  it.effect("treats legacy token responses as private without allowing factory widening", () =>
+    Effect.gen(function* () {
+      const privateFetch = recordedFetch(
+        Response.json({
+          access_token: "legacy-bearer-token",
+          issued_token_type: "urn:ietf:params:oauth:token-type:access_token",
+          token_type: "Bearer",
+          expires_in: 3600,
+          scope: "orchestration:read",
+        }),
+      );
+
+      const result = yield* bootstrapRemoteBearerSession({
+        httpBaseUrl: "https://legacy.example.com/",
+        credential: "legacy-pairing-token",
+        audienceCeiling: "private",
+      }).pipe(provideRemoteHttp(privateFetch.fetchFn));
+
+      const factoryBearerFetch = recordedFetch(
+        Response.json({
+          access_token: "legacy-bearer-token",
+          issued_token_type: "urn:ietf:params:oauth:token-type:access_token",
+          token_type: "Bearer",
+          expires_in: 3600,
+          scope: "orchestration:read",
+        }),
+      );
+      const bearerError = yield* bootstrapRemoteBearerSession({
+        httpBaseUrl: "https://legacy.example.com/",
+        credential: "legacy-pairing-token",
+        audienceCeiling: "factory",
+      }).pipe(provideRemoteHttp(factoryBearerFetch.fetchFn), Effect.flip);
+
+      const factoryDpopFetch = recordedFetch(
+        Response.json({
+          access_token: "legacy-dpop-token",
+          issued_token_type: "urn:ietf:params:oauth:token-type:access_token",
+          token_type: "DPoP",
+          expires_in: 3600,
+          scope: "orchestration:read",
+        }),
+      );
+      const dpopError = yield* exchangeRemoteDpopAccessToken({
+        httpBaseUrl: "https://legacy.example.com/",
+        credential: "legacy-pairing-token",
+        audienceCeiling: "factory",
+        dpopProof: "proof",
+      }).pipe(provideRemoteHttp(factoryDpopFetch.fetchFn), Effect.flip);
+
+      expect(result.audienceCeiling).toBe("private");
+      expect(bearerError).toBeInstanceOf(RemoteEnvironmentAudienceCeilingMismatchError);
+      expect(dpopError).toBeInstanceOf(RemoteEnvironmentAudienceCeilingMismatchError);
     }),
   );
 
@@ -144,6 +202,7 @@ describe("remote environment authorization", () => {
           issued_token_type: "urn:ietf:params:oauth:token-type:access_token",
           token_type: "DPoP",
           expires_in: 3600,
+          audienceCeiling: "private",
           scope: "orchestration:read orchestration:operate terminal:operate review:write",
         }),
         Response.json({
@@ -155,6 +214,7 @@ describe("remote environment authorization", () => {
       const token = yield* exchangeRemoteDpopAccessToken({
         httpBaseUrl: "https://remote.example.com/",
         credential: "one-time-credential",
+        audienceCeiling: "private",
         dpopProof: "token-proof",
         clientMetadata: {
           label: "T3 Code Mobile",
@@ -172,7 +232,7 @@ describe("remote environment authorization", () => {
         url: "https://remote.example.com/oauth/token",
         method: "POST",
         headers: { dpop: "token-proof", "content-type": "application/x-www-form-urlencoded" },
-        body: "grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Atoken-exchange&subject_token=one-time-credential&subject_token_type=urn%3At3%3Aparams%3Aoauth%3Atoken-type%3Aenvironment-bootstrap&requested_token_type=urn%3Aietf%3Aparams%3Aoauth%3Atoken-type%3Aaccess_token&client_label=T3+Code+Mobile&client_device_type=mobile&client_os=iOS",
+        body: "grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Atoken-exchange&subject_token=one-time-credential&subject_token_type=urn%3At3%3Aparams%3Aoauth%3Atoken-type%3Aenvironment-bootstrap&requested_token_type=urn%3Aietf%3Aparams%3Aoauth%3Atoken-type%3Aaccess_token&audience_ceiling=private&client_label=T3+Code+Mobile&client_device_type=mobile&client_os=iOS",
       });
       expectFetchCall(fetch.calls, 2, {
         url: "https://remote.example.com/api/auth/websocket-ticket",
@@ -194,6 +254,7 @@ describe("remote environment authorization", () => {
             issued_token_type: "urn:ietf:params:oauth:token-type:access_token",
             token_type: "Bearer",
             expires_in: 3600,
+            audienceCeiling: "private",
             scope:
               "orchestration:read orchestration:operate terminal:operate review:write relay:read",
           },
@@ -204,6 +265,7 @@ describe("remote environment authorization", () => {
       yield* bootstrapRemoteBearerSession({
         httpBaseUrl: "https://remote.example.com/",
         credential: "pairing-token",
+        audienceCeiling: "private",
         clientMetadata: {
           label: "T3 Code Mobile",
           deviceType: "mobile",
@@ -214,7 +276,7 @@ describe("remote environment authorization", () => {
       expectFetchCall(fetch.calls, 1, {
         url: "https://remote.example.com/oauth/token",
         method: "POST",
-        body: "grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Atoken-exchange&subject_token=pairing-token&subject_token_type=urn%3At3%3Aparams%3Aoauth%3Atoken-type%3Aenvironment-bootstrap&requested_token_type=urn%3Aietf%3Aparams%3Aoauth%3Atoken-type%3Aaccess_token&client_label=T3+Code+Mobile&client_device_type=mobile&client_os=iOS",
+        body: "grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Atoken-exchange&subject_token=pairing-token&subject_token_type=urn%3At3%3Aparams%3Aoauth%3Atoken-type%3Aenvironment-bootstrap&requested_token_type=urn%3Aietf%3Aparams%3Aoauth%3Atoken-type%3Aaccess_token&audience_ceiling=private&client_label=T3+Code+Mobile&client_device_type=mobile&client_os=iOS",
       });
     }),
   );
@@ -228,6 +290,7 @@ describe("remote environment authorization", () => {
             issued_token_type: "urn:ietf:params:oauth:token-type:access_token",
             token_type: "Bearer",
             expires_in: 3600,
+            audienceCeiling: "private",
             scope:
               "orchestration:read orchestration:operate terminal:operate review:write relay:read",
           },
@@ -238,6 +301,7 @@ describe("remote environment authorization", () => {
       yield* bootstrapRemoteBearerSession({
         httpBaseUrl: "https://remote.example.com/",
         credential: "pairing-token",
+        audienceCeiling: "private",
         cloudflareAccess: { jwt: "cf-access-jwt" },
       }).pipe(provideRemoteHttp(fetch.fetchFn));
 
@@ -261,6 +325,7 @@ describe("remote environment authorization", () => {
             issued_token_type: "urn:ietf:params:oauth:token-type:access_token",
             token_type: "Bearer",
             expires_in: 3600,
+            audienceCeiling: "private",
             scope:
               "orchestration:read orchestration:operate terminal:operate review:write relay:read",
           },
@@ -271,6 +336,7 @@ describe("remote environment authorization", () => {
       yield* bootstrapRemoteBearerSession({
         httpBaseUrl: "https://remote.example.com/",
         credential: "pairing-token",
+        audienceCeiling: "private",
         cloudflareAccess: {
           _tag: "service-token",
           clientId: "client-id",
@@ -298,6 +364,7 @@ describe("remote environment authorization", () => {
             issued_token_type: "urn:ietf:params:oauth:token-type:access_token",
             token_type: "Bearer",
             expires_in: 3600,
+            audienceCeiling: "factory",
             scope: "orchestration:read",
           },
           { status: 200 },
@@ -307,13 +374,14 @@ describe("remote environment authorization", () => {
       yield* bootstrapRemoteBearerSession({
         httpBaseUrl: "https://remote.example.com/",
         credential: "pairing-token",
+        audienceCeiling: "factory",
         scopes: ["orchestration:read"],
       }).pipe(provideRemoteHttp(fetch.fetchFn));
 
       expectFetchCall(fetch.calls, 1, {
         url: "https://remote.example.com/oauth/token",
         method: "POST",
-        body: "grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Atoken-exchange&subject_token=pairing-token&subject_token_type=urn%3At3%3Aparams%3Aoauth%3Atoken-type%3Aenvironment-bootstrap&requested_token_type=urn%3Aietf%3Aparams%3Aoauth%3Atoken-type%3Aaccess_token&scope=orchestration%3Aread",
+        body: "grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Atoken-exchange&subject_token=pairing-token&subject_token_type=urn%3At3%3Aparams%3Aoauth%3Atoken-type%3Aenvironment-bootstrap&requested_token_type=urn%3Aietf%3Aparams%3Aoauth%3Atoken-type%3Aaccess_token&audience_ceiling=factory&scope=orchestration%3Aread",
       });
     }),
   );
@@ -345,6 +413,7 @@ describe("remote environment authorization", () => {
               sessionMethods: ["browser-session-cookie", "bearer-access-token"],
               sessionCookieName: "t3_session",
             },
+            audienceCeiling: "private",
             scopes: [
               "orchestration:read",
               "orchestration:operate",
@@ -429,6 +498,7 @@ describe("remote environment authorization", () => {
             sessionMethods: ["dpop-access-token"],
             sessionCookieName: "t3_session",
           },
+          audienceCeiling: "private",
           sessionMethod: "dpop-access-token",
           scopes: [
             "orchestration:read",
@@ -558,6 +628,7 @@ describe("remote environment authorization", () => {
       const error = yield* bootstrapRemoteBearerSession({
         httpBaseUrl: "https://remote.example.com/",
         credential: "pairing-token",
+        audienceCeiling: "private",
       }).pipe(provideRemoteHttp(fetch.fetchFn), Effect.flip);
 
       expect(error).toBeInstanceOf(RemoteEnvironmentAuthInvalidJsonError);

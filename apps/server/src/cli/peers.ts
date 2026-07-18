@@ -231,6 +231,7 @@ export const pairPeer = Effect.fn("peers.pairPeer")(function* (
     subject_token: target.credential,
     subject_token_type: AuthEnvironmentBootstrapTokenType,
     requested_token_type: AuthAccessTokenType,
+    audience_ceiling: "private",
     scope: encodeOAuthScope(AuthStandardClientScopes),
     client_label: `subagent-peer:${alias}`,
     client_device_type: "bot",

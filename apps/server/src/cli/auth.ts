@@ -95,6 +95,7 @@ const pairingCreateCommand = Command.make("create", {
       (environmentAuth) =>
         Effect.gen(function* () {
           const issued = yield* environmentAuth.createPairingLink({
+            audienceCeiling: "private",
             scopes: AuthStandardClientScopes,
             subject: "one-time-token",
             ...(Option.isSome(flags.ttl) ? { ttl: flags.ttl.value } : {}),
@@ -174,6 +175,7 @@ const sessionIssueCommand = Command.make("issue", {
       (environmentAuth) =>
         Effect.gen(function* () {
           const issued = yield* environmentAuth.issueSession({
+            audienceCeiling: "private",
             scopes: AuthAdministrativeScopes,
             ...(Option.isSome(flags.ttl) ? { ttl: flags.ttl.value } : {}),
             ...(Option.isSome(flags.label) ? { label: flags.label.value } : {}),

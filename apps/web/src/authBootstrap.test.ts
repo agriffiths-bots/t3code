@@ -44,6 +44,7 @@ const unauthenticatedSession = (auth: AuthSessionState["auth"]): AuthSessionStat
 const authenticatedSession = (auth: AuthSessionState["auth"]): AuthSessionState => ({
   authenticated: true,
   auth,
+  audienceCeiling: "private",
   sessionMethod: "browser-session-cookie",
   expiresAt: SESSION_EXPIRES_AT,
 });
@@ -51,6 +52,7 @@ const authenticatedSession = (auth: AuthSessionState["auth"]): AuthSessionState 
 const browserSession = (scopes: AuthBrowserSessionResult["scopes"]): AuthBrowserSessionResult => ({
   authenticated: true,
   scopes,
+  audienceCeiling: "private",
   sessionMethod: "browser-session-cookie",
   expiresAt: SESSION_EXPIRES_AT,
 });
@@ -101,6 +103,7 @@ async function installAuthApi(input: {
   readonly pairingCredential?: (payload: AuthCreatePairingCredentialInput) => Effect.Effect<{
     readonly id: string;
     readonly credential: string;
+    readonly audienceCeiling: AuthCreatePairingCredentialInput["audienceCeiling"];
     readonly label?: string;
     readonly expiresAt: DateTime.Utc;
   }>;
@@ -491,6 +494,7 @@ describe("resolveInitialServerAuthGateState", () => {
         Effect.succeed({
           id: "pairing-link-1",
           credential: "pairing-token",
+          audienceCeiling: payload.audienceCeiling,
           ...(payload.label === undefined ? {} : { label: payload.label }),
           expiresAt: SESSION_EXPIRES_AT,
         }),
@@ -504,11 +508,16 @@ describe("resolveInitialServerAuthGateState", () => {
     expect(credential).toMatchObject({
       id: "pairing-link-1",
       credential: "pairing-token",
+      audienceCeiling: "private",
       label: "Julius iPhone",
     });
     expect(DateTime.formatIso(credential.expiresAt)).toBe("2026-04-05T00:00:00.000Z");
     expect(testApi.calls.pairingCredential).toEqual([
-      { label: "Julius iPhone", scopes: ["orchestration:read"] },
+      {
+        audienceCeiling: "private",
+        label: "Julius iPhone",
+        scopes: ["orchestration:read"],
+      },
     ]);
   });
 });

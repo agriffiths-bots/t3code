@@ -2,6 +2,7 @@ import {
   AuthSessionId,
   AuthStandardClientScopes,
   AuthEnvironmentScopes,
+  AuthAudienceCeiling,
   type AuthClientMetadata,
   type AuthClientSession,
   type AuthEnvironmentScope,
@@ -22,6 +23,7 @@ import * as Option from "effect/Option";
 import * as ServerConfig from "../config.ts";
 import * as AuthSessions from "../persistence/AuthSessions.ts";
 import * as ServerSecretStore from "./ServerSecretStore.ts";
+import { restrictScopesForAudienceCeiling } from "./audienceScopePolicy.ts";
 import {
   base64UrlDecodeUtf8,
   base64UrlEncode,
@@ -35,6 +37,7 @@ export interface IssuedSession {
   readonly token: string;
   readonly method: ServerAuthSessionMethod;
   readonly client: AuthClientMetadata;
+  readonly audienceCeiling: AuthAudienceCeiling;
   readonly expiresAt: DateTime.DateTime;
   readonly scopes: ReadonlyArray<AuthEnvironmentScope>;
   readonly proofKeyThumbprint?: string;
@@ -45,6 +48,7 @@ export interface VerifiedSession {
   readonly token: string;
   readonly method: ServerAuthSessionMethod;
   readonly client: AuthClientMetadata;
+  readonly audienceCeiling: AuthAudienceCeiling;
   readonly expiresAt?: DateTime.DateTime;
   readonly subject: string;
   readonly scopes: ReadonlyArray<AuthEnvironmentScope>;
@@ -138,6 +142,17 @@ export class InvalidSessionExpirationClaimError extends Schema.TaggedErrorClass<
   }
 }
 
+export class SessionAudienceCeilingMismatchError extends Schema.TaggedErrorClass<SessionAudienceCeilingMismatchError>()(
+  "SessionAudienceCeilingMismatchError",
+  {
+    sessionId: AuthSessionId,
+  },
+) {
+  override get message(): string {
+    return "Session audience ceiling does not match persisted state.";
+  }
+}
+
 export class MalformedWebSocketTokenError extends Schema.TaggedErrorClass<MalformedWebSocketTokenError>()(
   "MalformedWebSocketTokenError",
   {},
@@ -224,6 +239,7 @@ export const SessionCredentialInvalidError = Schema.Union([
   UnknownSessionTokenError,
   SessionTokenRevokedError,
   InvalidSessionExpirationClaimError,
+  SessionAudienceCeilingMismatchError,
   MalformedWebSocketTokenError,
   InvalidWebSocketTokenSignatureError,
   InvalidWebSocketTokenPayloadError,
@@ -359,7 +375,8 @@ export class SessionStore extends Context.Service<
   SessionStore,
   {
     readonly cookieName: string;
-    readonly issue: (input?: {
+    readonly issue: (input: {
+      readonly audienceCeiling: AuthAudienceCeiling;
       readonly ttl?: Duration.Duration;
       readonly subject?: string;
       readonly method?: ServerAuthSessionMethod;
@@ -412,6 +429,7 @@ const SessionClaims = Schema.Struct({
   sid: AuthSessionId,
   sub: Schema.String,
   scopes: AuthEnvironmentScopes,
+  audienceCeiling: AuthAudienceCeiling,
   method: Schema.Literals(["browser-session-cookie", "bearer-access-token", "dpop-access-token"]),
   jkt: Schema.optionalKey(Schema.String),
   iat: Schema.Number,
@@ -423,6 +441,7 @@ const WebSocketClaims = Schema.Struct({
   v: Schema.Literal(1),
   kind: Schema.Literal("websocket"),
   sid: AuthSessionId,
+  audienceCeiling: AuthAudienceCeiling,
   iat: Schema.Number,
   exp: Schema.Number,
 });
@@ -458,6 +477,7 @@ function toClientMetadata(record: {
 function toAuthClientSession(input: Omit<AuthClientSession, "current">): AuthClientSession {
   return {
     ...input,
+    scopes: restrictScopesForAudienceCeiling(input.scopes, input.audienceCeiling),
     current: false,
   };
 }
@@ -500,6 +520,7 @@ export const make = Effect.gen(function* () {
           sessionId: row.value.sessionId,
           subject: row.value.subject,
           scopes: row.value.scopes,
+          audienceCeiling: row.value.audienceCeiling,
           method: row.value.method,
           client: toClientMetadata(row.value.client),
           issuedAt: row.value.issuedAt,
@@ -582,12 +603,24 @@ export const make = Effect.gen(function* () {
       const expiresAt = DateTime.add(issuedAt, {
         milliseconds: Duration.toMillis(input?.ttl ?? DEFAULT_SESSION_TTL),
       });
+      const audienceCeiling = input.audienceCeiling;
+      const scopes = restrictScopesForAudienceCeiling(
+        input?.scopes ?? AuthStandardClientScopes,
+        audienceCeiling,
+      );
+      if (scopes.length === 0) {
+        return yield* new SessionCredentialIssueError({
+          sessionId,
+          cause: new Error("The audience ceiling denies every requested scope."),
+        });
+      }
       const claims: SessionClaims = {
         v: 1,
         kind: "session",
         sid: sessionId,
         sub: input?.subject ?? "browser",
-        scopes: input?.scopes ?? AuthStandardClientScopes,
+        scopes,
+        audienceCeiling,
         method: input?.method ?? "browser-session-cookie",
         ...(input?.proofKeyThumbprint ? { jkt: input.proofKeyThumbprint } : {}),
         iat: issuedAt.epochMilliseconds,
@@ -615,6 +648,7 @@ export const make = Effect.gen(function* () {
           sessionId,
           subject: claims.sub,
           scopes: claims.scopes,
+          audienceCeiling: claims.audienceCeiling,
           method: claims.method,
           client: {
             label: client.label ?? null,
@@ -633,6 +667,7 @@ export const make = Effect.gen(function* () {
           sessionId,
           subject: claims.sub,
           scopes: claims.scopes,
+          audienceCeiling: claims.audienceCeiling,
           method: claims.method,
           client,
           issuedAt,
@@ -647,8 +682,9 @@ export const make = Effect.gen(function* () {
         token: `${encodedPayload}.${signature}`,
         method: claims.method,
         client,
+        audienceCeiling: claims.audienceCeiling,
         expiresAt: expiresAt,
-        scopes: claims.scopes,
+        scopes: restrictScopesForAudienceCeiling(claims.scopes, claims.audienceCeiling),
         ...(claims.jkt ? { proofKeyThumbprint: claims.jkt } : {}),
       } satisfies IssuedSession;
     },
@@ -702,15 +738,19 @@ export const make = Effect.gen(function* () {
           revokedAt: row.value.revokedAt,
         });
       }
+      if (row.value.audienceCeiling !== claims.audienceCeiling) {
+        return yield* new SessionAudienceCeilingMismatchError({ sessionId: claims.sid });
+      }
 
       return {
         sessionId: claims.sid,
         token,
         method: claims.method,
         client: toClientMetadata(row.value.client),
+        audienceCeiling: claims.audienceCeiling,
         expiresAt: expiresAt.value,
         subject: claims.sub,
-        scopes: claims.scopes,
+        scopes: restrictScopesForAudienceCeiling(claims.scopes, claims.audienceCeiling),
         ...(claims.jkt ? { proofKeyThumbprint: claims.jkt } : {}),
       } satisfies VerifiedSession;
     },
@@ -721,6 +761,19 @@ export const make = Effect.gen(function* () {
     "SessionStore.issueWebSocketToken",
   )(function* (sessionId, input) {
     const issuedAt = yield* DateTime.now;
+    const row = yield* authSessions
+      .getById({ sessionId })
+      .pipe(Effect.mapError((cause) => new WebSocketTokenIssueError({ sessionId, cause })));
+    if (
+      Option.isNone(row) ||
+      row.value.revokedAt !== null ||
+      row.value.expiresAt.epochMilliseconds <= issuedAt.epochMilliseconds
+    ) {
+      return yield* new WebSocketTokenIssueError({
+        sessionId,
+        cause: new Error("Cannot issue a websocket claim for an inactive session."),
+      });
+    }
     const expiresAt = DateTime.add(issuedAt, {
       milliseconds: Duration.toMillis(input?.ttl ?? DEFAULT_WEBSOCKET_TOKEN_TTL),
     });
@@ -728,6 +781,7 @@ export const make = Effect.gen(function* () {
       v: 1,
       kind: "websocket",
       sid: sessionId,
+      audienceCeiling: row.value.audienceCeiling,
       iat: issuedAt.epochMilliseconds,
       exp: expiresAt.epochMilliseconds,
     };
@@ -808,15 +862,19 @@ export const make = Effect.gen(function* () {
         revokedAt: row.value.revokedAt,
       });
     }
+    if (row.value.audienceCeiling !== claims.audienceCeiling) {
+      return yield* new SessionAudienceCeilingMismatchError({ sessionId: claims.sid });
+    }
 
     return {
       sessionId: row.value.sessionId,
       token,
       method: row.value.method,
       client: toClientMetadata(row.value.client),
+      audienceCeiling: claims.audienceCeiling,
       expiresAt: row.value.expiresAt,
       subject: row.value.subject,
-      scopes: row.value.scopes,
+      scopes: restrictScopesForAudienceCeiling(row.value.scopes, claims.audienceCeiling),
     } satisfies VerifiedSession;
   });
 
@@ -831,6 +889,7 @@ export const make = Effect.gen(function* () {
           sessionId: row.sessionId,
           subject: row.subject,
           scopes: row.scopes,
+          audienceCeiling: row.audienceCeiling,
           method: row.method,
           client: toClientMetadata(row.client),
           issuedAt: row.issuedAt,

@@ -891,6 +891,7 @@ const cloudMintCredentialHandler = Effect.fn("environment.cloud.mintCredential")
 
     const keyPair = yield* getOrCreateEnvironmentKeyPairFromSecretStore(dependencies.secrets);
     const issued = yield* dependencies.environmentAuth.createPairingLink({
+      audienceCeiling: "private",
       scopes: AuthStandardClientScopes,
       subject: "cloud-connect",
       ttl: Duration.minutes(2),

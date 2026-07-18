@@ -218,6 +218,7 @@ const withProjectCliSessionToken = <A, E, R>(
 ) =>
   Effect.acquireUseRelease(
     environmentAuth.issueSession({
+      audienceCeiling: "private",
       scopes: AuthAdministrativeScopes,
       label: "t3 project cli",
     }),
@@ -232,6 +233,7 @@ const withProjectAudienceAdminCliSessionToken = <A, E, R>(
   const actor = localProjectAudienceAdminSubject();
   return Effect.acquireUseRelease(
     environmentAuth.issueSession({
+      audienceCeiling: "private",
       scopes: AuthLocalProjectAudienceAdministrativeScopes,
       subject: actor,
       label: "t3 project audience admin cli",

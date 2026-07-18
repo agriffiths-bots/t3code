@@ -60,7 +60,9 @@ it.layer(NodeServices.layer)("PairingGrantStore.layer", (it) => {
   it.effect("issues pairing tokens in a short manual-entry format", () =>
     Effect.gen(function* () {
       const bootstrapCredentials = yield* PairingGrantStore.PairingGrantStore;
-      const issued = yield* bootstrapCredentials.issueOneTimeToken();
+      const issued = yield* bootstrapCredentials.issueOneTimeToken({
+        audienceCeiling: "private",
+      });
 
       expect(issued.credential).toMatch(/^[23456789ABCDEFGHJKLMNPQRSTUVWXYZ]{12}$/);
     }).pipe(Effect.provide(makePairingGrantStoreLayer())),
@@ -69,7 +71,10 @@ it.layer(NodeServices.layer)("PairingGrantStore.layer", (it) => {
   it.effect("issues one-time bootstrap tokens that can only be consumed once", () =>
     Effect.gen(function* () {
       const bootstrapCredentials = yield* PairingGrantStore.PairingGrantStore;
-      const issued = yield* bootstrapCredentials.issueOneTimeToken({ label: "Julius iPhone" });
+      const issued = yield* bootstrapCredentials.issueOneTimeToken({
+        audienceCeiling: "private",
+        label: "Julius iPhone",
+      });
       const first = yield* bootstrapCredentials.consume(issued.credential);
       const second = yield* Effect.flip(bootstrapCredentials.consume(issued.credential));
 
@@ -82,6 +87,7 @@ it.layer(NodeServices.layer)("PairingGrantStore.layer", (it) => {
         "relay:read",
       ]);
       expect(first.subject).toBe("one-time-token");
+      expect(first.audienceCeiling).toBe("private");
       expect(first.label).toBe("Julius iPhone");
       expect(issued.label).toBe("Julius iPhone");
       expect(second._tag).toBe("ConsumedBootstrapCredentialError");
@@ -92,7 +98,9 @@ it.layer(NodeServices.layer)("PairingGrantStore.layer", (it) => {
   it.effect("atomically consumes a one-time token when multiple requests race", () =>
     Effect.gen(function* () {
       const bootstrapCredentials = yield* PairingGrantStore.PairingGrantStore;
-      const token = yield* bootstrapCredentials.issueOneTimeToken();
+      const token = yield* bootstrapCredentials.issueOneTimeToken({
+        audienceCeiling: "private",
+      });
       const results = yield* Effect.all(
         Array.from({ length: 8 }, () =>
           Effect.result(bootstrapCredentials.consume(token.credential)),
@@ -118,6 +126,7 @@ it.layer(NodeServices.layer)("PairingGrantStore.layer", (it) => {
     Effect.gen(function* () {
       const bootstrapCredentials = yield* PairingGrantStore.PairingGrantStore;
       const token = yield* bootstrapCredentials.issueOneTimeToken({
+        audienceCeiling: "factory",
         proofKeyThumbprint: "client-proof-key-thumbprint",
       });
 
@@ -134,6 +143,7 @@ it.layer(NodeServices.layer)("PairingGrantStore.layer", (it) => {
       expect(missing.message).toContain("proof key mismatch");
       expect(wrong.message).toContain("proof key mismatch");
       expect(consumed.proofKeyThumbprint).toBe("client-proof-key-thumbprint");
+      expect(consumed.audienceCeiling).toBe("factory");
     }).pipe(Effect.provide(makePairingGrantStoreLayer())),
   );
 
@@ -156,6 +166,7 @@ it.layer(NodeServices.layer)("PairingGrantStore.layer", (it) => {
         "relay:write",
       ]);
       expect(first.subject).toBe("desktop-bootstrap");
+      expect(first.audienceCeiling).toBe("private");
       expect(second.method).toBe("desktop-bootstrap");
       expect(third.method).toBe("desktop-bootstrap");
     }).pipe(
@@ -197,14 +208,26 @@ it.layer(NodeServices.layer)("PairingGrantStore.layer", (it) => {
   it.effect("lists and revokes active pairing links", () =>
     Effect.gen(function* () {
       const bootstrapCredentials = yield* PairingGrantStore.PairingGrantStore;
-      const first = yield* bootstrapCredentials.issueOneTimeToken();
+      const first = yield* bootstrapCredentials.issueOneTimeToken({
+        audienceCeiling: "private",
+      });
       const second = yield* bootstrapCredentials.issueOneTimeToken({
-        scopes: ["orchestration:read", "access:write"],
+        audienceCeiling: "factory",
+        scopes: ["orchestration:read", "access:write", "relay:read"],
       });
 
       const activeBeforeRevoke = yield* bootstrapCredentials.listActive();
       expect(activeBeforeRevoke.map((entry) => entry.id)).toContain(first.id);
       expect(activeBeforeRevoke.map((entry) => entry.id)).toContain(second.id);
+      expect(activeBeforeRevoke.find((entry) => entry.id === first.id)?.audienceCeiling).toBe(
+        "private",
+      );
+      expect(activeBeforeRevoke.find((entry) => entry.id === second.id)?.audienceCeiling).toBe(
+        "factory",
+      );
+      expect(activeBeforeRevoke.find((entry) => entry.id === second.id)?.scopes).toEqual([
+        "relay:read",
+      ]);
 
       const revoked = yield* bootstrapCredentials.revoke(first.id);
       const activeAfterRevoke = yield* bootstrapCredentials.listActive();
@@ -215,6 +238,22 @@ it.layer(NodeServices.layer)("PairingGrantStore.layer", (it) => {
       expect(activeAfterRevoke.map((entry) => entry.id)).toContain(second.id);
       expect(revokedConsume.message).toContain("no longer available");
       expect(revokedConsume._tag).toBe("UnavailableBootstrapCredentialError");
+    }).pipe(Effect.provide(makePairingGrantStoreLayer())),
+  );
+
+  it.effect("rejects factory grants when every requested scope is denied", () =>
+    Effect.gen(function* () {
+      const bootstrapCredentials = yield* PairingGrantStore.PairingGrantStore;
+      const error = yield* bootstrapCredentials
+        .issueOneTimeToken({
+          audienceCeiling: "factory",
+          scopes: ["orchestration:read", "access:write"],
+        })
+        .pipe(Effect.flip);
+      const active = yield* bootstrapCredentials.listActive();
+
+      expect(error._tag).toBe("PairingCredentialIssueError");
+      expect(active).toEqual([]);
     }).pipe(Effect.provide(makePairingGrantStoreLayer())),
   );
 

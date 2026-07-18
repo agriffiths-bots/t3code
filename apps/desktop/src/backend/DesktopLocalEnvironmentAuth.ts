@@ -70,6 +70,7 @@ export const make = Effect.gen(function* () {
         const session = yield* bootstrapRemoteBearerSession({
           httpBaseUrl: config.httpBaseUrl.href,
           credential,
+          audienceCeiling: "private",
           clientMetadata: {
             label: "T3 Code Desktop",
             deviceType: "desktop",

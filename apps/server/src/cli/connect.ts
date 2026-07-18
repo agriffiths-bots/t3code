@@ -183,6 +183,7 @@ const withCloudCliSessionToken = <A, E, R>(
 ) =>
   Effect.acquireUseRelease(
     environmentAuth.issueSession({
+      audienceCeiling: "private",
       scopes: [AuthRelayWriteScope],
       subject: "cloud-cli",
       label: "t3 connect cli",

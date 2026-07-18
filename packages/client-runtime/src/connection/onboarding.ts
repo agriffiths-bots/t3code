@@ -215,6 +215,7 @@ export const preparePairingRegistration = Effect.fn(
   const access = yield* bootstrapRemoteBearerSession({
     httpBaseUrl: target.httpBaseUrl,
     credential: target.credential,
+    audienceCeiling: "private",
     scopes: presentation.scopes,
     clientMetadata: presentation.metadata,
     ...(cloudflareAccess ? { cloudflareAccess } : {}),

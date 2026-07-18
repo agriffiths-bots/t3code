@@ -1,11 +1,13 @@
 import {
   AuthAccessTokenType,
+  type AuthAudienceCeiling,
   type AuthClientPresentationMetadata,
   AuthEnvironmentBootstrapTokenType,
   AuthTokenExchangeGrantType,
   type AuthEnvironmentScope,
 } from "@t3tools/contracts";
 import { encodeOAuthScope } from "@t3tools/shared/oauthScope";
+import * as Data from "effect/Data";
 import * as Effect from "effect/Effect";
 import { FetchHttpClient } from "effect/unstable/http";
 import { environmentEndpointUrl } from "../environment/endpoint.ts";
@@ -22,7 +24,25 @@ export {
   RemoteEnvironmentAuthTimeoutError,
   RemoteEnvironmentAuthUndeclaredStatusError,
 } from "../rpc/http.ts";
-export type RemoteEnvironmentAuthError = RemoteEnvironmentRequestError;
+export class RemoteEnvironmentAudienceCeilingMismatchError extends Data.TaggedError(
+  "RemoteEnvironmentAudienceCeilingMismatchError",
+)<{
+  readonly message: string;
+  readonly requested: AuthAudienceCeiling;
+  readonly received: AuthAudienceCeiling;
+}> {
+  constructor(requested: AuthAudienceCeiling, received: AuthAudienceCeiling) {
+    super({
+      message: `Remote environment returned audience ceiling '${received}' after '${requested}' was requested.`,
+      requested,
+      received,
+    });
+  }
+}
+
+export type RemoteEnvironmentAuthError =
+  | RemoteEnvironmentRequestError
+  | RemoteEnvironmentAudienceCeilingMismatchError;
 
 const DEFAULT_REMOTE_REQUEST_TIMEOUT_MS = 10_000;
 
@@ -74,11 +94,24 @@ const clientMetadataTokenExchangeFields = (
   ...(clientMetadata?.os ? { client_os: clientMetadata.os } : {}),
 });
 
+const validateRemoteAccessTokenAudience = <
+  A extends { readonly audienceCeiling: AuthAudienceCeiling },
+>(
+  requested: AuthAudienceCeiling,
+  response: A,
+): Effect.Effect<A, RemoteEnvironmentAudienceCeilingMismatchError> =>
+  requested === "private" || response.audienceCeiling === "factory"
+    ? Effect.succeed(response)
+    : Effect.fail(
+        new RemoteEnvironmentAudienceCeilingMismatchError(requested, response.audienceCeiling),
+      );
+
 export const exchangeRemoteDpopAccessToken = Effect.fn(
   "clientRuntime.authorization.exchangeRemoteDpopAccessToken",
 )(function* (input: {
   readonly httpBaseUrl: string;
   readonly credential: string;
+  readonly audienceCeiling: AuthAudienceCeiling;
   readonly scopes?: ReadonlyArray<AuthEnvironmentScope>;
   readonly clientMetadata?: AuthClientPresentationMetadata;
   readonly dpopProof: string;
@@ -96,12 +129,13 @@ export const exchangeRemoteDpopAccessToken = Effect.fn(
         subject_token: input.credential,
         subject_token_type: AuthEnvironmentBootstrapTokenType,
         requested_token_type: AuthAccessTokenType,
+        audience_ceiling: input.audienceCeiling,
         ...(input.scopes ? { scope: encodeOAuthScope(input.scopes) } : {}),
         ...clientMetadataTokenExchangeFields(input.clientMetadata),
       },
     }),
   );
-  return response;
+  return yield* validateRemoteAccessTokenAudience(input.audienceCeiling, response);
 });
 
 export const bootstrapRemoteBearerSession = Effect.fn(
@@ -109,13 +143,14 @@ export const bootstrapRemoteBearerSession = Effect.fn(
 )(function* (input: {
   readonly httpBaseUrl: string;
   readonly credential: string;
+  readonly audienceCeiling: AuthAudienceCeiling;
   readonly scopes?: ReadonlyArray<AuthEnvironmentScope>;
   readonly clientMetadata?: AuthClientPresentationMetadata;
   readonly cloudflareAccess?: CloudflareAccessAuthorization;
   readonly timeoutMs?: number;
 }) {
   const client = yield* makeEnvironmentHttpApiClient(input.httpBaseUrl);
-  return yield* executeEnvironmentHttpRequest(
+  const response = yield* executeEnvironmentHttpRequest(
     environmentEndpointUrl(input.httpBaseUrl, "/oauth/token"),
     input.timeoutMs ?? DEFAULT_REMOTE_REQUEST_TIMEOUT_MS,
     client.auth.token({
@@ -125,11 +160,13 @@ export const bootstrapRemoteBearerSession = Effect.fn(
         subject_token: input.credential,
         subject_token_type: AuthEnvironmentBootstrapTokenType,
         requested_token_type: AuthAccessTokenType,
+        audience_ceiling: input.audienceCeiling,
         ...(input.scopes ? { scope: encodeOAuthScope(input.scopes) } : {}),
         ...clientMetadataTokenExchangeFields(input.clientMetadata),
       },
     }),
   );
+  return yield* validateRemoteAccessTokenAudience(input.audienceCeiling, response);
 });
 
 export const fetchRemoteSessionState = Effect.fn(

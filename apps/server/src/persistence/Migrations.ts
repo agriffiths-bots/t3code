@@ -62,6 +62,7 @@ import Migration0047 from "./Migrations/047_RemoteChildTerminalDeliveryClaims.ts
 import Migration0048 from "./Migrations/048_OrchestrationEventStoreStorageEpoch.ts";
 import Migration0049 from "./Migrations/049_OrchestrationThreadRevisionCoveringIndex.ts";
 import Migration0050 from "./Migrations/050_ProjectionProjectDataAudience.ts";
+import Migration0051 from "./Migrations/051_AuthAudienceCeilings.ts";
 
 /**
  * Migration loader with all migrations defined inline.
@@ -123,6 +124,7 @@ export const migrationEntries = [
   [48, "OrchestrationEventStoreStorageEpoch", Migration0048],
   [49, "OrchestrationThreadRevisionCoveringIndex", Migration0049],
   [50, "ProjectionProjectDataAudience", Migration0050],
+  [51, "AuthAudienceCeilings", Migration0051],
 ] as const;
 
 export const makeMigrationLoader = (throughId?: number) =>

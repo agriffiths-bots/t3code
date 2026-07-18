@@ -6,7 +6,7 @@ import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
 import * as SqlSchema from "effect/unstable/sql/SqlSchema";
 
-import { AuthEnvironmentScopes } from "@t3tools/contracts";
+import { AuthAudienceCeiling, AuthEnvironmentScopes } from "@t3tools/contracts";
 
 import {
   type AuthPairingLinkRepositoryError,
@@ -20,6 +20,7 @@ export const AuthPairingLinkRecord = Schema.Struct({
   credential: Schema.String,
   method: Schema.Literals(["desktop-bootstrap", "one-time-token"]),
   scopes: Schema.fromJsonString(AuthEnvironmentScopes),
+  audienceCeiling: AuthAudienceCeiling,
   subject: Schema.String,
   label: Schema.NullOr(Schema.String),
   proofKeyThumbprint: Schema.NullOr(Schema.String),
@@ -35,6 +36,7 @@ export const CreateAuthPairingLinkInput = Schema.Struct({
   credential: Schema.String,
   method: Schema.Literals(["desktop-bootstrap", "one-time-token"]),
   scopes: AuthEnvironmentScopes,
+  audienceCeiling: AuthAudienceCeiling,
   subject: Schema.String,
   label: Schema.NullOr(Schema.String),
   proofKeyThumbprint: Schema.NullOr(Schema.String),
@@ -72,6 +74,7 @@ const AuthPairingLinkRawDbRow = Schema.Struct({
   credential: Schema.Unknown,
   method: Schema.Unknown,
   scopes: Schema.Unknown,
+  audienceCeiling: Schema.Unknown,
   subject: Schema.Unknown,
   label: Schema.Unknown,
   proofKeyThumbprint: Schema.Unknown,
@@ -131,6 +134,7 @@ export const make = Effect.gen(function* () {
           credential,
           method,
           scopes,
+          audience_ceiling,
           subject,
           label,
           proof_key_thumbprint,
@@ -144,6 +148,7 @@ export const make = Effect.gen(function* () {
           ${input.credential},
           ${input.method},
           ${JSON.stringify(input.scopes)},
+          ${input.audienceCeiling},
           ${input.subject},
           ${input.label},
           ${input.proofKeyThumbprint},
@@ -175,6 +180,7 @@ export const make = Effect.gen(function* () {
           credential AS "credential",
           method AS "method",
           scopes AS "scopes",
+          audience_ceiling AS "audienceCeiling",
           subject AS "subject",
           label AS "label",
           proof_key_thumbprint AS "proofKeyThumbprint",
@@ -195,6 +201,7 @@ export const make = Effect.gen(function* () {
           credential AS "credential",
           method AS "method",
           scopes AS "scopes",
+          audience_ceiling AS "audienceCeiling",
           subject AS "subject",
           label AS "label",
           proof_key_thumbprint AS "proofKeyThumbprint",
@@ -234,6 +241,7 @@ export const make = Effect.gen(function* () {
           credential AS "credential",
           method AS "method",
           scopes AS "scopes",
+          audience_ceiling AS "audienceCeiling",
           subject AS "subject",
           label AS "label",
           proof_key_thumbprint AS "proofKeyThumbprint",

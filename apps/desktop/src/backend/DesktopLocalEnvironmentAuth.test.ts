@@ -46,6 +46,7 @@ describe("DesktopLocalEnvironmentAuth", () => {
                     issued_token_type: "urn:ietf:params:oauth:token-type:access_token",
                     token_type: "Bearer",
                     expires_in: 3600,
+                    audienceCeiling: "private",
                     scope: "orchestration:read",
                   }),
                   { status: 200, headers: { "content-type": "application/json" } },

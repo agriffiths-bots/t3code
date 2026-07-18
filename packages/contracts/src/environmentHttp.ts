@@ -10,6 +10,7 @@ import * as HttpServerResponse from "effect/unstable/http/HttpServerResponse";
 
 import {
   AuthAccessTokenResult,
+  AuthAudienceCeiling,
   AuthBrowserSessionRequest,
   AuthBrowserSessionResult,
   AuthClientSession,
@@ -65,6 +66,7 @@ const OptionalDpopProofHeaders = Schema.Struct({
 export const EnvironmentRequestInvalidReason = Schema.Literals([
   "invalid_scope",
   "scope_not_granted",
+  "audience_not_granted",
   "invalid_command",
 ]);
 export type EnvironmentRequestInvalidReason = typeof EnvironmentRequestInvalidReason.Type;
@@ -319,6 +321,7 @@ export interface EnvironmentSessionPrincipalShape {
   readonly subject: string;
   readonly method: ServerAuthSessionMethod;
   readonly scopes: ReadonlySet<AuthEnvironmentScope>;
+  readonly audienceCeiling: AuthAudienceCeiling;
   readonly proofKeyThumbprint?: string;
   readonly expiresAt?: DateTime.DateTime;
 }
