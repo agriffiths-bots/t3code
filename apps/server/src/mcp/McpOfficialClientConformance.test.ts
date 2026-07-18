@@ -47,6 +47,7 @@ const threadId = ThreadId.make("thread-mcp-conformance");
 const providerInstanceId = ProviderInstanceId.make("codex");
 
 const expectedToolNamesAfterSpawnTrim = [
+  "t3_archive_thread",
   "t3_get_usage",
   "t3_list_backends",
   "t3_notify",
@@ -66,6 +67,7 @@ const expectedToolInputShapes: Record<
   ExpectedToolName,
   { readonly properties: ReadonlyArray<string>; readonly required: ReadonlyArray<string> }
 > = {
+  t3_archive_thread: { properties: ["threadId"], required: ["threadId"] },
   t3_get_usage: { properties: ["providerInstanceId"], required: [] },
   t3_list_backends: { properties: [], required: [] },
   t3_notify: { properties: ["body", "deepLink", "title"], required: ["title"] },
@@ -199,6 +201,7 @@ const projectionSnapshotQueryLayer = Layer.mock(ProjectionSnapshotQuery)({
     }),
   getProjectShellById: () => Effect.succeed(Option.none()),
   getThreadShellById: () => Effect.succeed(Option.none()),
+  getThreadShellByIdIncludingArchived: () => Effect.succeed(Option.none()),
   getSnapshot: () => Effect.die("unused"),
   getCommandReadModel: () => Effect.die("unused"),
   getArchivedShellSnapshot: () => Effect.die("unused"),

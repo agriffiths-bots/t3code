@@ -32,6 +32,7 @@ it("every MCP tool advertises a top-level object input schema", () => {
   }
   // Guard the guard: if toolkit wiring changes shape, this test must not
   // silently pass on an empty list.
-  expect(checked).toHaveLength(11);
+  expect(checked).toHaveLength(12);
+  expect(checked).toContain("t3_archive_thread");
   expect(checked).toContain("t3_list_backends");
 });

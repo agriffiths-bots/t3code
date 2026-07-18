@@ -29,13 +29,20 @@ import * as Schema from "effect/Schema";
 
 import * as McpInvocationContext from "../../McpInvocationContext.ts";
 import { resolveThreadWorkspaceCwd } from "../../../checkpointing/Utils.ts";
+import {
+  ChildThreadCoordinator,
+  MAX_DEPTH,
+} from "../../../orchestration/Services/ChildThreadCoordinator.ts";
 import * as BootstrapTurnStartDispatcher from "../../../orchestration/Services/BootstrapTurnStartDispatcher.ts";
+import { OrchestrationEngineService } from "../../../orchestration/Services/OrchestrationEngine.ts";
 import { ProjectionSnapshotQuery } from "../../../orchestration/Services/ProjectionSnapshotQuery.ts";
 import { ProviderInstanceRegistry } from "../../../provider/Services/ProviderInstanceRegistry.ts";
 import { GitWorkflowService } from "../../../git/GitWorkflowService.ts";
 import * as VcsDriverRegistry from "../../../vcs/VcsDriverRegistry.ts";
 import {
   ThreadStartToolError,
+  type ThreadArchiveToolInput,
+  type ThreadArchiveToolOutput,
   type ThreadStartInternalInput,
   type ThreadStartMode,
   type ThreadStartPublicInput,
@@ -50,6 +57,8 @@ const isVcsProcessSpawnError = Schema.is(VcsProcessSpawnError);
 const isVcsUnsupportedOperationError = Schema.is(VcsUnsupportedOperationError);
 
 const fail = (message: string) => new ThreadStartToolError({ message });
+const toToolError = (error: unknown, fallback: string): ThreadStartToolError =>
+  isThreadStartToolError(error) ? error : fail(error instanceof Error ? error.message : fallback);
 
 const isMissingCwdSpawnError = (error: unknown, cwd: string): boolean => {
   if (!isVcsProcessSpawnError(error) || error.cwd !== cwd) return false;
@@ -104,7 +113,13 @@ export type ActiveThreadStartRuntime = (
   },
 ) => Effect.Effect<ThreadStartToolOutput, ThreadStartToolError>;
 
+type ActiveThreadArchiveRuntime = (
+  input: ThreadArchiveToolInput,
+  invocation: McpInvocationContext.ProviderMcpInvocationScope,
+) => Effect.Effect<ThreadArchiveToolOutput, ThreadStartToolError>;
+
 let activeThreadStartRuntime: ActiveThreadStartRuntime | null = null;
+let activeThreadArchiveRuntime: ActiveThreadArchiveRuntime | null = null;
 
 /** Reach the live thread-start runtime from sub-agent tool handlers (mirrors `dispatchActive`). */
 export const activeThreadStartRuntimeOf = (): ActiveThreadStartRuntime | null =>
@@ -806,18 +821,141 @@ const makeActiveThreadStartRuntime = Effect.fn("ThreadToolkit.makeActiveRuntime"
   });
 });
 
+const makeActiveThreadArchiveRuntime = Effect.fn("ThreadToolkit.makeActiveArchiveRuntime")(
+  function* () {
+    const crypto = yield* Crypto.Crypto;
+    const projectionSnapshotQuery = yield* ProjectionSnapshotQuery;
+    const orchestrationEngine = yield* OrchestrationEngineService;
+    const childThreadCoordinator = yield* ChildThreadCoordinator;
+
+    const loadThreadIncludingArchived = Effect.fn("ThreadToolkit.loadThreadIncludingArchived")(
+      function* (threadId: ThreadId) {
+        return yield* projectionSnapshotQuery
+          .getThreadShellByIdIncludingArchived(threadId)
+          .pipe(
+            Effect.mapError((error) => toToolError(error, `Failed to load thread ${threadId}.`)),
+          );
+      },
+    );
+
+    const ownedDescendantFailure = (targetThreadId: ThreadId, ownerThreadId: ThreadId) =>
+      fail(`Thread ${targetThreadId} is not owned by invoking root ${ownerThreadId}.`);
+
+    const requireOwnedStrictDescendant = Effect.fn("ThreadToolkit.requireOwnedStrictDescendant")(
+      function* (owner: OrchestrationThreadShell, target: OrchestrationThreadShell) {
+        if (target.id === owner.id) {
+          return yield* fail(
+            `Archive target ${target.id} must be a strict descendant of the invoking root.`,
+          );
+        }
+        if (target.dataAudience !== "private") {
+          return yield* ownedDescendantFailure(target.id, owner.id);
+        }
+
+        const visited = new Set<ThreadId>([target.id]);
+        let current = target;
+        for (let depth = 0; depth < MAX_DEPTH; depth += 1) {
+          if (current.parentEnvironmentId != null) {
+            return yield* ownedDescendantFailure(target.id, owner.id);
+          }
+          const parentThreadId = current.parentThreadId;
+          if (parentThreadId === null) {
+            return yield* ownedDescendantFailure(target.id, owner.id);
+          }
+          if (parentThreadId === owner.id) return;
+          if (visited.has(parentThreadId)) {
+            return yield* ownedDescendantFailure(target.id, owner.id);
+          }
+          visited.add(parentThreadId);
+
+          const parentOption = yield* loadThreadIncludingArchived(parentThreadId);
+          if (Option.isNone(parentOption)) {
+            return yield* ownedDescendantFailure(target.id, owner.id);
+          }
+          const parent = parentOption.value;
+          if (parent.dataAudience !== "private" || parent.archivedAt !== null) {
+            return yield* ownedDescendantFailure(target.id, owner.id);
+          }
+          current = parent;
+        }
+        return yield* ownedDescendantFailure(target.id, owner.id);
+      },
+    );
+
+    return Effect.fn("ThreadToolkit.archiveThreadRuntime")(function* (
+      input: ThreadArchiveToolInput,
+      invocation: McpInvocationContext.ProviderMcpInvocationScope,
+    ) {
+      const sourceOption = yield* loadThreadIncludingArchived(invocation.threadId);
+      if (Option.isNone(sourceOption)) {
+        return yield* fail(`Invoking thread ${invocation.threadId} was not found.`);
+      }
+      const source = sourceOption.value;
+      if (
+        source.dataAudience !== "private" ||
+        source.parentThreadId !== null ||
+        source.archivedAt !== null
+      ) {
+        return yield* fail(
+          "t3_archive_thread is owner-only and requires a private root thread provider context.",
+        );
+      }
+
+      const targetOption = yield* loadThreadIncludingArchived(input.threadId);
+      if (Option.isNone(targetOption)) {
+        return yield* fail(`Thread ${input.threadId} was not found.`);
+      }
+      const target = targetOption.value;
+      if (target.archivedAt !== null) {
+        return yield* fail(`Thread ${input.threadId} is already archived.`);
+      }
+      yield* requireOwnedStrictDescendant(source, target);
+
+      const parentThreadId = target.parentThreadId;
+      if (parentThreadId === null) {
+        return yield* ownedDescendantFailure(target.id, source.id);
+      }
+      const childEntry = (yield* childThreadCoordinator.listChildren(parentThreadId)).find(
+        (entry) => entry.childThreadId === target.id,
+      );
+      if (childEntry === undefined) {
+        return yield* fail(`Thread ${target.id} is not an active tracked sub-agent child.`);
+      }
+      if (childEntry.settled) {
+        return yield* fail(`Thread ${target.id} is already terminal.`);
+      }
+
+      const commandUuid = yield* crypto.randomUUIDv4.pipe(
+        Effect.mapError((error) => toToolError(error, "Failed to generate archive command id.")),
+      );
+      const result = yield* orchestrationEngine
+        .dispatch({
+          type: "thread.archive",
+          commandId: CommandId.make(`mcp-admin:thread-archive:${commandUuid}`),
+          threadId: target.id,
+        })
+        .pipe(
+          Effect.mapError((error) => toToolError(error, `Failed to archive thread ${target.id}.`)),
+        );
+      return { threadId: target.id, sequence: result.sequence };
+    });
+  },
+);
+
 export const ThreadStartRuntimeLive = Layer.effectDiscard(
   Effect.acquireRelease(
-    makeActiveThreadStartRuntime().pipe(
-      Effect.tap((runtime) =>
+    Effect.all([makeActiveThreadStartRuntime(), makeActiveThreadArchiveRuntime()]).pipe(
+      Effect.tap(([startRuntime, archiveRuntime]) =>
         Effect.sync(() => {
-          activeThreadStartRuntime = runtime;
+          activeThreadStartRuntime = startRuntime;
+          activeThreadArchiveRuntime = archiveRuntime;
         }),
       ),
     ),
-    (runtime) =>
+    ([startRuntime, archiveRuntime]) =>
       Effect.sync(() => {
-        if (activeThreadStartRuntime === runtime) activeThreadStartRuntime = null;
+        if (activeThreadStartRuntime === startRuntime) activeThreadStartRuntime = null;
+        if (activeThreadArchiveRuntime === archiveRuntime) activeThreadArchiveRuntime = null;
       }),
   ),
 );
@@ -863,8 +1001,20 @@ const startThread = Effect.fn("ThreadToolkit.startThread")(function* (
   return yield* runtime(input, invocation);
 });
 
+const archiveThread = Effect.fn("ThreadToolkit.archiveThread")(function* (
+  input: ThreadArchiveToolInput,
+) {
+  const invocation = yield* McpInvocationContext.requireProviderMcpCapability(
+    "thread-management",
+  ).pipe(Effect.mapError((error) => fail(error.message)));
+  const runtime = activeThreadArchiveRuntime;
+  if (!runtime) return yield* fail("Thread archive runtime is not available.");
+  return yield* runtime(input, invocation);
+});
+
 const handlers = {
   t3_thread_start: startThread,
+  t3_archive_thread: archiveThread,
 } satisfies Parameters<typeof ThreadToolkit.toLayer>[0];
 
 export const ThreadToolkitHandlersLive = ThreadToolkit.toLayer(handlers);
