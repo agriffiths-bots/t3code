@@ -120,6 +120,9 @@ export type ThreadRevisionLoadResult =
       readonly kind: "gone";
     }
   | {
+      readonly kind: "snapshot-required";
+    }
+  | {
       readonly kind: "unavailable";
     };
 
@@ -183,6 +186,13 @@ export const threadRevisionLoaderLayer: Layer.Layer<
                 Effect.annotateLogs({ threadId }),
                 Effect.as({ kind: "gone" } as const),
               ),
+            EnvironmentScopeRequiredError: () =>
+              Effect.logDebug(
+                "Thread revision denied over HTTP; falling back to the audience-scoped snapshot.",
+              ).pipe(
+                Effect.annotateLogs({ threadId }),
+                Effect.as({ kind: "snapshot-required" } as const),
+              ),
           }),
           Effect.catchCause((cause) =>
             Effect.logWarning("Could not load the thread revision over HTTP.").pipe(
@@ -219,6 +229,11 @@ export const threadSnapshotLoaderLayer: Layer.Layer<
         Effect.catchTags({
           EnvironmentResourceNotFoundError: () =>
             Effect.logDebug("Thread snapshot not found over HTTP.").pipe(
+              Effect.annotateLogs({ threadId }),
+              Effect.as({ kind: "missing" } as const),
+            ),
+          EnvironmentScopeRequiredError: () =>
+            Effect.logDebug("Thread snapshot access denied over HTTP.").pipe(
               Effect.annotateLogs({ threadId }),
               Effect.as({ kind: "missing" } as const),
             ),

@@ -172,6 +172,7 @@ const makeHarness = Effect.fn("TestEnvironmentThreads.makeHarness")(function* (o
   const revisionCallTimes = yield* Ref.make<ReadonlyArray<number>>([]);
   const revisionAvailable = yield* Ref.make(true);
   const revisionGone = yield* Ref.make(false);
+  const revisionSnapshotRequired = yield* Ref.make(false);
   const explicitRevisionSequence = yield* Ref.make<Option.Option<number>>(
     Option.fromNullishOr(options?.revisionSequence),
   );
@@ -301,6 +302,9 @@ const makeHarness = Effect.fn("TestEnvironmentThreads.makeHarness")(function* (o
         if (yield* Ref.get(revisionGone)) {
           return { kind: "gone" } as const;
         }
+        if (yield* Ref.get(revisionSnapshotRequired)) {
+          return { kind: "snapshot-required" } as const;
+        }
         const explicit = yield* Ref.get(explicitRevisionSequence);
         const latestSequence = Option.isSome(explicit)
           ? explicit.value
@@ -404,6 +408,7 @@ const makeHarness = Effect.fn("TestEnvironmentThreads.makeHarness")(function* (o
     revisionCallTimes,
     revisionAvailable,
     revisionGone,
+    revisionSnapshotRequired,
     explicitRevisionSequence,
     explicitProjectionSequence,
     explicitRevisionEventId,
@@ -826,6 +831,69 @@ describe("EnvironmentThreads", () => {
       expect(Option.getOrThrow(retained.data).id).toBe(THREAD_ID);
       expect(yield* Ref.get(harness.removedThreads)).toEqual([]);
       expect(yield* Ref.get(harness.revisionCalls)).toBe(2);
+    }),
+  );
+
+  it.effect("evicts a cached thread when revision denial reconciles to a scoped 404", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness({
+        cached: BASE_THREAD,
+        revisionSequence: CACHED_SNAPSHOT_SEQUENCE,
+      });
+      yield* awaitThreadState(harness.observed, (value) => value.status === "live");
+      yield* Ref.set(harness.revisionSnapshotRequired, true);
+      yield* Ref.set(harness.httpReconcileResult, Option.some({ kind: "missing" }));
+
+      yield* advanceActiveReconcileInterval;
+
+      const reconciled = yield* Ref.get(harness.latest);
+      expect(reconciled.status).toBe("deleted");
+      expect(Option.isNone(reconciled.data)).toBe(true);
+      expect(yield* Ref.get(harness.removedThreads)).toEqual([THREAD_ID]);
+      expect(yield* Ref.get(harness.loaderCalls)).toBe(1);
+      expect(yield* Ref.get(harness.revisionCalls)).toBe(1);
+    }),
+  );
+
+  it.effect("refreshes a visible thread when revision denial reconciles to a scoped snapshot", () =>
+    Effect.gen(function* () {
+      const refreshedThread = {
+        ...BASE_THREAD,
+        dataAudience: "factory" as const,
+        title: "Factory-visible refresh",
+        updatedAt: "2026-07-18T14:00:00.000Z",
+      };
+      const harness = yield* makeHarness({
+        cached: BASE_THREAD,
+        revisionSequence: CACHED_SNAPSHOT_SEQUENCE,
+      });
+      yield* awaitThreadState(harness.observed, (value) => value.status === "live");
+      yield* Ref.set(harness.revisionSnapshotRequired, true);
+      yield* Ref.set(
+        harness.httpReconcileResult,
+        Option.some({
+          kind: "found",
+          snapshot: {
+            snapshotSequence: CACHED_SNAPSHOT_SEQUENCE + 1,
+            thread: refreshedThread,
+            storageEpoch: STORAGE_EPOCH,
+            latestSequence: CACHED_SNAPSHOT_SEQUENCE + 1,
+            latestEventId: markerEventId(CACHED_SNAPSHOT_SEQUENCE + 1),
+          },
+        }),
+      );
+
+      yield* advanceActiveReconcileInterval;
+
+      const reconciled = yield* awaitThreadState(
+        harness.observed,
+        (value) => Option.isSome(value.data) && value.data.value.title === refreshedThread.title,
+      );
+      expect(reconciled.status).toBe("live");
+      expect(Option.getOrThrow(reconciled.data).dataAudience).toBe("factory");
+      expect(yield* Ref.get(harness.removedThreads)).toEqual([]);
+      expect(yield* Ref.get(harness.loaderCalls)).toBe(1);
+      expect(yield* Ref.get(harness.revisionCalls)).toBe(1);
     }),
   );
 
