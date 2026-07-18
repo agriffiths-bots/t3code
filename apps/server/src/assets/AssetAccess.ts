@@ -1,6 +1,6 @@
-import type { AssetResource } from "@t3tools/contracts";
 import {
   AssetAttachmentNotFoundError,
+  AuthAudienceCeiling,
   AssetPreviewTypeValidationError,
   AssetProjectFaviconInspectionError,
   AssetProjectFaviconNotFoundError,
@@ -12,6 +12,10 @@ import {
   AssetWorkspacePathValidationError,
   AssetWorkspaceResolutionError,
   AssetWorkspaceRootNormalizationError,
+  DataAudience,
+  type AssetResource,
+  type AuthAudienceCeiling as AuthAudienceCeilingType,
+  type DataAudience as DataAudienceType,
 } from "@t3tools/contracts";
 import {
   isWorkspaceImagePreviewPath,
@@ -35,6 +39,7 @@ import {
   timingSafeEqualBase64Url,
 } from "../auth/utils.ts";
 import * as ServerSecretStore from "../auth/ServerSecretStore.ts";
+import { canReadDataAudience } from "../auth/audienceDataPolicy.ts";
 import { resolveAttachmentPathById } from "../attachmentStore.ts";
 import * as ServerConfig from "../config.ts";
 import * as ProjectFaviconResolver from "../project/ProjectFaviconResolver.ts";
@@ -56,6 +61,11 @@ const PREVIEW_ASSET_EXTENSIONS = new Set([
   ".woff2",
 ]);
 
+const AudienceBoundAssetClaimFields = {
+  dataAudience: Schema.optional(DataAudience),
+  audienceCeiling: Schema.optional(AuthAudienceCeiling),
+};
+
 const AssetClaimsSchema = Schema.Union([
   Schema.Struct({
     version: Schema.Literal(1),
@@ -63,6 +73,7 @@ const AssetClaimsSchema = Schema.Union([
     workspaceRoot: Schema.String,
     baseRelativePath: Schema.String,
     expiresAt: Schema.Number,
+    ...AudienceBoundAssetClaimFields,
   }),
   Schema.Struct({
     version: Schema.Literal(1),
@@ -70,12 +81,14 @@ const AssetClaimsSchema = Schema.Union([
     workspaceRoot: Schema.String,
     relativePath: Schema.String,
     expiresAt: Schema.Number,
+    ...AudienceBoundAssetClaimFields,
   }),
   Schema.Struct({
     version: Schema.Literal(1),
     kind: Schema.Literal("attachment"),
     attachmentId: Schema.String,
     expiresAt: Schema.Number,
+    ...AudienceBoundAssetClaimFields,
   }),
   Schema.Struct({
     version: Schema.Literal(1),
@@ -83,6 +96,7 @@ const AssetClaimsSchema = Schema.Union([
     workspaceRoot: Schema.String,
     relativePath: Schema.NullOr(Schema.String),
     expiresAt: Schema.Number,
+    ...AudienceBoundAssetClaimFields,
   }),
 ]);
 type AssetClaims = typeof AssetClaimsSchema.Type;
@@ -165,11 +179,17 @@ const resolveCanonicalWorkspaceFileForRequest = (input: {
 export const issueAssetUrl = Effect.fn("AssetAccess.issueAssetUrl")(function* (input: {
   readonly resource: AssetResource;
   readonly workspaceRoot?: string;
+  readonly dataAudience?: DataAudienceType;
+  readonly audienceCeiling?: AuthAudienceCeilingType;
 }) {
   const fileSystem = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
   const workspacePaths = yield* WorkspacePaths.WorkspacePaths;
   const expiresAt = (yield* Clock.currentTimeMillis) + ASSET_TOKEN_TTL_MS;
+  const audienceClaims = {
+    dataAudience: input.dataAudience ?? ("private" as const),
+    audienceCeiling: input.audienceCeiling ?? ("private" as const),
+  };
   let claims: AssetClaims;
   let fileName: string;
 
@@ -241,6 +261,7 @@ export const issueAssetUrl = Effect.fn("AssetAccess.issueAssetUrl")(function* (i
             workspaceRoot: canonicalWorkspaceRoot,
             relativePath: resolved.relativePath,
             expiresAt,
+            ...audienceClaims,
           }
         : {
             version: 1,
@@ -248,6 +269,7 @@ export const issueAssetUrl = Effect.fn("AssetAccess.issueAssetUrl")(function* (i
             workspaceRoot: canonicalWorkspaceRoot,
             baseRelativePath: path.dirname(resolved.relativePath),
             expiresAt,
+            ...audienceClaims,
           };
       fileName = path.basename(resolved.relativePath);
       break;
@@ -268,6 +290,7 @@ export const issueAssetUrl = Effect.fn("AssetAccess.issueAssetUrl")(function* (i
         kind: "attachment",
         attachmentId: input.resource.attachmentId,
         expiresAt,
+        ...audienceClaims,
       };
       fileName = path.basename(attachmentPath);
       break;
@@ -323,6 +346,7 @@ export const issueAssetUrl = Effect.fn("AssetAccess.issueAssetUrl")(function* (i
         ),
         relativePath,
         expiresAt,
+        ...audienceClaims,
       };
       fileName = relativePath ? path.basename(relativePath) : PROJECT_FAVICON_FALLBACK_MARKER;
       break;
@@ -350,6 +374,7 @@ export const issueAssetUrl = Effect.fn("AssetAccess.issueAssetUrl")(function* (i
 export const resolveAsset = Effect.fn("AssetAccess.resolveAsset")(function* (
   token: string,
   relativePath: string,
+  options?: { readonly audienceCeiling?: AuthAudienceCeilingType },
 ) {
   const [encodedPayload, signature] = token.split(".");
   if (!encodedPayload || !signature) return null;
@@ -364,6 +389,16 @@ export const resolveAsset = Effect.fn("AssetAccess.resolveAsset")(function* (
 
   const claims = decodeClaims(encodedPayload);
   if (!claims || claims.expiresAt <= (yield* Clock.currentTimeMillis)) return null;
+
+  const requestedAudienceCeiling = options?.audienceCeiling ?? ("private" as const);
+  const claimsAudienceCeiling = claims.audienceCeiling ?? ("private" as const);
+  const claimsDataAudience = claims.dataAudience ?? ("private" as const);
+  if (
+    claimsAudienceCeiling !== requestedAudienceCeiling ||
+    !canReadDataAudience(requestedAudienceCeiling, claimsDataAudience)
+  ) {
+    return null;
+  }
 
   if (claims.kind === "attachment") {
     const config = yield* ServerConfig.ServerConfig;

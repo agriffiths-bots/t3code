@@ -6279,6 +6279,59 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
     }).pipe(Effect.provide(NodeHttpServer.layerTest)),
   );
 
+  it.effect("masks private signed asset URLs under a factory audience token", () =>
+    Effect.gen(function* () {
+      const fileSystem = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const config = yield* buildAppUnderTest();
+      const attachmentId = "thread-private-http-assets-00000000-0000-4000-8000-000000000001";
+      yield* fileSystem.makeDirectory(config.attachmentsDir, { recursive: true });
+      yield* fileSystem.writeFileString(
+        path.join(config.attachmentsDir, `${attachmentId}.bin`),
+        "private attachment",
+      );
+
+      const configLayer = ServerConfig.layer(config);
+      const assetSetupLayer = Layer.mergeAll(
+        configLayer,
+        ServerSecretStore.layer.pipe(Layer.provide(configLayer)),
+        WorkspacePaths.layer,
+        ProjectFaviconResolver.layer.pipe(Layer.provide(WorkspacePaths.layer)),
+      ).pipe(Layer.provideMerge(NodeServices.layer));
+      const issuedAssetUrl = yield* AssetAccess.issueAssetUrl({
+        resource: { _tag: "attachment", attachmentId },
+        dataAudience: "private",
+        audienceCeiling: "private",
+      }).pipe(Effect.provide(assetSetupLayer));
+
+      const unauthenticatedResponse = yield* fetchEffect(
+        yield* getHttpServerUrl(issuedAssetUrl.relativeUrl),
+      );
+      assert.equal(unauthenticatedResponse.status, 404);
+
+      const ownerCookie = yield* getAuthenticatedSessionCookieHeader();
+      const unrestrictedResponse = yield* fetchEffect(
+        yield* getHttpServerUrl(issuedAssetUrl.relativeUrl),
+        { headers: { cookie: ownerCookie } },
+      );
+      assert.equal(unrestrictedResponse.status, 200);
+      assert.equal(yield* unrestrictedResponse.text, "private attachment");
+
+      const { response: tokenResponse, body: tokenBody } = yield* exchangeAccessToken(
+        defaultDesktopBootstrapToken,
+        { audienceCeiling: "factory", scope: "orchestration:read" },
+      );
+      assert.equal(tokenResponse.status, 200);
+      assert.isDefined(tokenBody.access_token);
+
+      const factoryResponse = yield* fetchEffect(
+        yield* getHttpServerUrl(issuedAssetUrl.relativeUrl),
+        { headers: { authorization: `Bearer ${tokenBody.access_token ?? ""}` } },
+      );
+      assert.equal(factoryResponse.status, 404);
+    }).pipe(Effect.provide(NodeHttpServer.layerTest), TestClock.withLive),
+  );
+
   it.effect("routes websocket rpc projects.writeFile", () =>
     Effect.gen(function* () {
       const fs = yield* FileSystem.FileSystem;
