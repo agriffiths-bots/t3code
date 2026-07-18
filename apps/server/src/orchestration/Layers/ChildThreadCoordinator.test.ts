@@ -3761,6 +3761,30 @@ describe("ChildThreadCoordinator", () => {
     expect(await harness.canAcquireDispatchLease()).toBe(true);
   });
 
+  it("keeps inactive unarchived provider-death projections pending on boot", async () => {
+    const parent = ThreadId.make("recon-unarchive-provider-death-pending-parent");
+    const child = ThreadId.make("recon-unarchive-provider-death-pending-child");
+    const harness = await createHarness({
+      threads: [
+        makeThreadState({
+          threadId: child,
+          parentThreadId: parent,
+          latestTurn: makeLatestTurn("running"),
+          session: makeSession(child, "stopped", null, "Provider process exited with code 0."),
+        }),
+      ],
+      seedChildRows: [{ threadId: child, parentThreadId: parent }],
+      persistedEvents: [threadArchivedEvent(child), threadUnarchivedEvent(child)],
+    });
+
+    const entries = await runtimeListChildren(harness, parent);
+    expect(entries).toHaveLength(1);
+    expect(entries[0]!.settled).toBe(false);
+    const slice = await runtimeWaitSlice(harness, [child], PAST_MS);
+    expect(slice.results[0]!.status).toBe("timeout");
+    expect(await harness.listPendingDispatches()).toEqual([]);
+  });
+
   it("does not re-mark fully pruned archived wakes as queued on boot", async () => {
     const child = ThreadId.make("recon-prune-archive-synthesize-child");
     const parent = ThreadId.make("recon-prune-archive-synthesize-parent");

@@ -103,6 +103,7 @@ type ThreadDeletedEvent = Extract<OrchestrationEvent, { type: "thread.deleted" }
 interface ChildTerminalOutcome {
   readonly status: ChildTerminalStatus;
   readonly error: string | null;
+  readonly fromSessionProjection?: boolean;
 }
 
 const isThreadArchivedOutcome = (outcome: ChildTerminalOutcome): boolean =>
@@ -337,10 +338,18 @@ const projectedLifecycleTerminal = (thread: OrchestrationThread): ChildTerminalO
   if (latestTurn?.state === "running") {
     if (thread.archivedAt !== null) return { status: "killed", error: "thread archived" };
     if (thread.session?.status === "error") {
-      return { status: "failed", error: thread.session.lastError ?? "session error" };
+      return {
+        status: "failed",
+        error: thread.session.lastError ?? "session error",
+        fromSessionProjection: true,
+      };
     }
     if (thread.session?.status === "stopped") {
-      return { status: "failed", error: thread.session.lastError ?? "session stopped" };
+      return {
+        status: "failed",
+        error: thread.session.lastError ?? "session stopped",
+        fromSessionProjection: true,
+      };
     }
     return null;
   }
@@ -365,10 +374,12 @@ const projectedLifecycleTerminal = (thread: OrchestrationThread): ChildTerminalO
       ? { status: "killed", error: "thread archived" }
       : (latestTurnTerminal ?? { status: "killed", error: "thread archived" });
   }
-  if (thread.session?.status === "error") return { status: "failed", error: "session error" };
+  if (thread.session?.status === "error") {
+    return { status: "failed", error: "session error", fromSessionProjection: true };
+  }
   if (thread.session?.status === "stopped") {
     if (latestTurnTerminal !== null) return latestTurnTerminal;
-    return { status: "failed", error: "session stopped" };
+    return { status: "failed", error: "session stopped", fromSessionProjection: true };
   }
   return null;
 };
@@ -3254,8 +3265,7 @@ const make = Effect.gen(function* () {
           unarchivedTerminalChildIds.add(childThreadId);
           if (
             projectedTerminal.status === "failed" &&
-            (projectedTerminal.error === "session stopped" ||
-              projectedTerminal.error === "session error")
+            projectedTerminal.fromSessionProjection === true
           ) {
             continue;
           }
@@ -3285,8 +3295,7 @@ const make = Effect.gen(function* () {
           unarchivedTerminalChildIds.add(childThreadId);
           if (
             projectedTerminal.status === "failed" &&
-            (projectedTerminal.error === "session stopped" ||
-              projectedTerminal.error === "session error")
+            projectedTerminal.fromSessionProjection === true
           ) {
             inactiveProjectionUnarchivedChildIds.add(childThreadId);
             continue;
