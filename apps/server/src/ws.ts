@@ -300,7 +300,7 @@ const RPC_REQUIRED_SCOPE = new Map<string, AuthEnvironmentScope>([
   [WS_METHODS.serverSignalProcess, AuthOrchestrationOperateScope],
   [WS_METHODS.serverGetNotificationConfig, AuthOrchestrationReadScope],
   [WS_METHODS.serverRegisterNotificationDevice, AuthOrchestrationOperateScope],
-  [WS_METHODS.serverAckNotification, AuthOrchestrationOperateScope],
+  [WS_METHODS.serverAckNotification, AuthOrchestrationReadScope],
   [WS_METHODS.cloudGetRelayClientStatus, AuthRelayWriteScope],
   [WS_METHODS.cloudInstallRelayClient, AuthRelayWriteScope],
   [WS_METHODS.sourceControlLookupRepository, AuthOrchestrationReadScope],

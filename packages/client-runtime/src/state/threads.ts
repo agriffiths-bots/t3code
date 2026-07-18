@@ -1003,6 +1003,7 @@ export const makeEnvironmentThreadState = Effect.fn("EnvironmentThreadState.make
           reconciliation.recoveredThroughSequence,
           reconciliation.recoveredThroughEventId,
         );
+        yield* recordUnchangedRevision({ latestSequence: null, responseBytes: 0 });
         return;
       }
       yield* Ref.set(revisionCheckUnresolved, true);

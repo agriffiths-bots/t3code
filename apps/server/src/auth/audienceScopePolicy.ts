@@ -24,6 +24,7 @@ const FACTORY_AUDIENCE_ALLOWED_ORCHESTRATION_READ_RPC_METHODS = new Set<string>(
   ORCHESTRATION_WS_METHODS.subscribeThread,
   ORCHESTRATION_WS_METHODS.subscribeScheduledTasks,
   WS_METHODS.subscribeNotificationEvents,
+  WS_METHODS.serverAckNotification,
 ]);
 
 export function canNarrowAudienceCeiling(

@@ -12,6 +12,7 @@ it.each([
   [ORCHESTRATION_WS_METHODS.replayEvents, AuthOrchestrationReadScope, "factory", true],
   [ORCHESTRATION_WS_METHODS.subscribeScheduledTasks, AuthOrchestrationReadScope, "factory", true],
   [WS_METHODS.subscribeNotificationEvents, AuthOrchestrationReadScope, "factory", true],
+  [WS_METHODS.serverAckNotification, AuthOrchestrationReadScope, "factory", true],
   [WS_METHODS.serverGetConfig, AuthOrchestrationReadScope, "factory", false],
   [WS_METHODS.projectsReadFile, AuthOrchestrationReadScope, "factory", false],
   [WS_METHODS.filesystemBrowse, AuthOrchestrationReadScope, "factory", false],

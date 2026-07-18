@@ -31,6 +31,7 @@ import {
   ProviderInstanceId,
   ResolvedKeybindingRule,
   ScheduledTaskId,
+  type ServerNotificationStreamEvent,
   ThreadId,
   WS_METHODS,
   WsRpcGroup,
@@ -58,6 +59,7 @@ import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 import * as PubSub from "effect/PubSub";
 import * as Queue from "effect/Queue";
+import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
 import * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
@@ -7438,6 +7440,104 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
                 ],
               ],
             );
+          }),
+        ),
+      );
+    }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+
+  it.effect("allows factory read sessions to ACK delivered factory notifications", () =>
+    Effect.gen(function* () {
+      const now = "2026-07-18T08:05:00.000Z";
+      const notificationId = "notification-factory-ack";
+      const ackToken = "notification-factory-ack-token";
+      const showEvent: ServerNotificationStreamEvent = {
+        type: "show",
+        notification: {
+          notificationId,
+          ackToken,
+          title: "Factory notification",
+          createdAt: IsoDateTime.make(now),
+          requireInteraction: true,
+        },
+      };
+      const dismissEvents = yield* Queue.unbounded<ServerNotificationStreamEvent>();
+      const ackCalls = yield* Ref.make<
+        ReadonlyArray<{
+          readonly notificationId: string;
+          readonly action: string;
+          readonly audienceCeiling: "private" | "factory" | undefined;
+        }>
+      >([]);
+
+      yield* buildAppUnderTest({
+        layers: {
+          deviceNotifications: {
+            eventsForAudience: (audienceCeiling) =>
+              audienceCeiling === "factory" ? Stream.make(showEvent) : Stream.empty,
+            ackNotification: (input, options) =>
+              Ref.update(ackCalls, (current) => [
+                ...current,
+                {
+                  notificationId: input.notificationId,
+                  action: input.action,
+                  audienceCeiling: options?.audienceCeiling,
+                },
+              ]).pipe(
+                Effect.andThen(
+                  Queue.offer(dismissEvents, {
+                    type: "dismiss",
+                    notificationId: input.notificationId,
+                  }),
+                ),
+                Effect.as({ notificationId: input.notificationId, accepted: true }),
+              ),
+          },
+        },
+      });
+
+      const { response: exchangeResponse, body: tokenBody } = yield* exchangeAccessToken(
+        defaultDesktopBootstrapToken,
+        { audienceCeiling: "factory", scope: "orchestration:read" },
+      );
+      assert.equal(exchangeResponse.status, 200);
+      assert.equal(tokenBody.scope, "orchestration:read");
+      const wsTicketResponse = yield* fetchEffect(
+        yield* getHttpServerUrl("/api/auth/websocket-ticket"),
+        {
+          method: "POST",
+          headers: { authorization: `Bearer ${tokenBody.access_token ?? ""}` },
+        },
+      );
+      const wsTicketBody = yield* responseJsonEffect<{ readonly ticket: string }>(wsTicketResponse);
+      const wsUrl = `${yield* getWsServerUrl("/ws", { authenticated: false })}?wsTicket=${encodeURIComponent(wsTicketBody.ticket)}`;
+
+      yield* Effect.scoped(
+        withWsRpcClient(wsUrl, (client) =>
+          Effect.gen(function* () {
+            const notifications = yield* client[WS_METHODS.subscribeNotificationEvents]({}).pipe(
+              Stream.take(1),
+              Stream.runCollect,
+            );
+            assert.deepEqual(
+              Array.from(notifications).flatMap((event) =>
+                event.type === "show" ? [event.notification.title] : [],
+              ),
+              ["Factory notification"],
+            );
+
+            const ack = yield* client[WS_METHODS.serverAckNotification]({
+              notificationId,
+              ackToken,
+              action: "dismissed",
+            });
+            assert.deepEqual(ack, { notificationId, accepted: true });
+
+            const dismissEvent = yield* Queue.take(dismissEvents);
+            assert.deepEqual(dismissEvent, { type: "dismiss", notificationId });
+            assert.deepEqual(yield* Ref.get(ackCalls), [
+              { notificationId, action: "dismissed", audienceCeiling: "factory" },
+            ]);
           }),
         ),
       );

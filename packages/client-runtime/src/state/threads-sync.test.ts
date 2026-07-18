@@ -734,6 +734,39 @@ describe("EnvironmentThreads", () => {
       }),
   );
 
+  it.effect("backs off repeated snapshot-required recoveries on idle threads", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness({
+        cached: BASE_THREAD,
+        reconciliationPolicy: {
+          fastIntervalMs: 2_000,
+          fastWindowMs: 0,
+          backoffMultiplier: 2,
+          maxBackoffMs: 60_000,
+        },
+      });
+      yield* awaitThreadState(harness.observed, (value) => value.status === "live");
+      yield* Ref.set(harness.revisionSnapshotRequired, true);
+      yield* Ref.set(
+        harness.httpSnapshot,
+        Option.some({
+          snapshotSequence: CACHED_SNAPSHOT_SEQUENCE,
+          thread: BASE_THREAD,
+          storageEpoch: STORAGE_EPOCH,
+          latestSequence: CACHED_SNAPSHOT_SEQUENCE,
+          latestEventId: markerEventId(CACHED_SNAPSHOT_SEQUENCE),
+        }),
+      );
+
+      for (const delay of [2, 4, 8]) {
+        yield* TestClock.adjust(`${delay} seconds`);
+        yield* Effect.yieldNow;
+      }
+
+      expect(yield* Ref.get(harness.revisionCallTimes)).toEqual([2_000, 6_000, 14_000]);
+    }),
+  );
+
   it.effect("keeps polling an idle mounted thread after the fast window", () =>
     Effect.gen(function* () {
       const harness = yield* makeHarness({
