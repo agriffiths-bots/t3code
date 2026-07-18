@@ -53,6 +53,27 @@ export class WorkerProcessIsolation extends Context.Service<
   WorkerProcessIsolationShape
 >()("t3/process/WorkerProcessIsolation") {}
 
+export const FALLBACK_WARNING_PREFIX = "t3 worker process isolation unavailable";
+
+const FALLBACK_REASON_VALUES = [
+  "missing-boot-identity",
+  "missing-systemd-run",
+  "missing-systemctl",
+  "scope-probe-failed",
+  "slice-quota-configuration-failed",
+] as const;
+
+export type FallbackReason = (typeof FALLBACK_REASON_VALUES)[number];
+
+const FALLBACK_REASONS = new Set<string>(FALLBACK_REASON_VALUES);
+
+export const parseFallbackWarningLine = (line: string): FallbackReason | undefined => {
+  const prefix = `${FALLBACK_WARNING_PREFIX}: `;
+  if (!line.startsWith(prefix)) return undefined;
+  const reason = line.slice(prefix.length);
+  return FALLBACK_REASONS.has(reason) ? (reason as FallbackReason) : undefined;
+};
+
 const DEFAULT_CONFIG: WorkerProcessIsolationConfig = {
   enabled: true,
   slice: "factory-workers.slice",
@@ -459,8 +480,13 @@ systemd_supports_expand_environment() {
   "$systemd_run" --help 2>/dev/null | grep -q -- '--expand-environment='
 }
 
+warn_fallback() {
+  printf '%s: %s\n' "${FALLBACK_WARNING_PREFIX}" "$1" >&2
+}
+
 run_systemd_scope() {
   if [ -z "$boot_identity" ]; then
+    warn_fallback "missing-boot-identity"
     exec "$real_command" "$@"
   fi
   unit="t3-worker-$boot_identity-$$-$(date +%s 2>/dev/null || echo 0).scope"
@@ -496,19 +522,30 @@ run_systemd_scope() {
   exit "$status"
 }
 
-if command -v "$systemd_run" >/dev/null 2>&1 && command -v "$systemctl" >/dev/null 2>&1; then
-  if systemd_supports_expand_environment; then
-    "$systemd_run" --user --scope --quiet --collect --expand-environment=no "--slice=$slice" "--nice=$nice" -- /bin/true >/dev/null 2>&1
-    probe_status=$?
-  else
-    "$systemd_run" --user --scope --quiet --collect "--slice=$slice" "--nice=$nice" -- /bin/true >/dev/null 2>&1
-    probe_status=$?
-  fi
-  if [ "$probe_status" = 0 ] && "$systemctl" --user set-property --runtime "$slice" "CPUQuota=$quota" >/dev/null 2>&1; then
-    run_systemd_scope "$@"
-  fi
+if ! command -v "$systemd_run" >/dev/null 2>&1; then
+  warn_fallback "missing-systemd-run"
+  exec "$real_command" "$@"
 fi
-exec "$real_command" "$@"
+if ! command -v "$systemctl" >/dev/null 2>&1; then
+  warn_fallback "missing-systemctl"
+  exec "$real_command" "$@"
+fi
+if systemd_supports_expand_environment; then
+  "$systemd_run" --user --scope --quiet --collect --expand-environment=no "--slice=$slice" "--nice=$nice" -- /bin/true >/dev/null 2>&1
+  probe_status=$?
+else
+  "$systemd_run" --user --scope --quiet --collect "--slice=$slice" "--nice=$nice" -- /bin/true >/dev/null 2>&1
+  probe_status=$?
+fi
+if [ "$probe_status" != 0 ]; then
+  warn_fallback "scope-probe-failed"
+  exec "$real_command" "$@"
+fi
+if ! "$systemctl" --user set-property --runtime "$slice" "CPUQuota=$quota" >/dev/null 2>&1; then
+  warn_fallback "slice-quota-configuration-failed"
+  exec "$real_command" "$@"
+fi
+run_systemd_scope "$@"
 `;
 
 const writeExecutableFileAtomically = (input: {
