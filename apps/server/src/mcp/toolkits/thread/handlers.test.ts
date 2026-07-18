@@ -26,6 +26,10 @@ import { McpSchema, McpServer } from "effect/unstable/ai";
 import { GitWorkflowService } from "../../../git/GitWorkflowService.ts";
 import * as VcsDriverRegistry from "../../../vcs/VcsDriverRegistry.ts";
 import * as BootstrapTurnStartDispatcher from "../../../orchestration/Services/BootstrapTurnStartDispatcher.ts";
+import {
+  ChildThreadCoordinator,
+  type ChildListEntry,
+} from "../../../orchestration/Services/ChildThreadCoordinator.ts";
 import { OrchestrationEngineService } from "../../../orchestration/Services/OrchestrationEngine.ts";
 import { ProjectionSnapshotQuery } from "../../../orchestration/Services/ProjectionSnapshotQuery.ts";
 import { ProviderInstanceRegistry } from "../../../provider/Services/ProviderInstanceRegistry.ts";
@@ -184,6 +188,8 @@ interface TestLayerOptions {
   readonly providerInstances?: ReadonlyArray<ProviderInstance>;
   readonly project?: OrchestrationProjectShell;
   readonly sourceThread?: OrchestrationThreadShell;
+  readonly threadShells?: ReadonlyArray<OrchestrationThreadShell>;
+  readonly settledChildThreadIds?: ReadonlySet<ThreadId>;
   readonly gitWorkflow?: Partial<GitWorkflowService["Service"]>;
   readonly vcsDetect?: VcsDriverRegistry.VcsDriverRegistry["Service"]["detect"];
 }
@@ -279,6 +285,22 @@ const makeTestLayer = (commands: OrchestrationCommand[], options: TestLayerOptio
   const testProject = options.project ?? project;
   const testSourceThread = options.sourceThread ?? sourceThread;
   const providerInstances = options.providerInstances ?? [];
+  const threadShells = new Map(
+    [...(options.threadShells ?? []), testSourceThread].map((thread) => [thread.id, thread]),
+  );
+  const childEntries = [...threadShells.values()]
+    .filter((thread) => thread.parentThreadId !== null)
+    .map(
+      (thread): ChildListEntry => ({
+        childThreadId: thread.id,
+        parentThreadId: thread.parentThreadId!,
+        detached: false,
+        model: thread.modelSelection,
+        spawnedAtMs: 0,
+        depth: 1,
+        settled: options.settledChildThreadIds?.has(thread.id) ?? false,
+      }),
+    );
   const bootstrapTurnStartDispatcherLayer = Layer.mock(
     BootstrapTurnStartDispatcher.BootstrapTurnStartDispatcher,
   )({
@@ -301,7 +323,16 @@ const makeTestLayer = (commands: OrchestrationCommand[], options: TestLayerOptio
     Layer.provide(
       Layer.mock(ProjectionSnapshotQuery)({
         getProjectShellById: () => Effect.succeed(Option.some(testProject)),
-        getThreadShellById: () => Effect.succeed(Option.some(testSourceThread)),
+        getThreadShellById: (threadId) =>
+          Effect.succeed(Option.fromUndefinedOr(threadShells.get(threadId))),
+        getThreadShellByIdIncludingArchived: (threadId) =>
+          Effect.succeed(Option.fromUndefinedOr(threadShells.get(threadId))),
+      }),
+    ),
+    Layer.provide(
+      Layer.mock(ChildThreadCoordinator)({
+        listChildren: (parentThreadId) =>
+          Effect.succeed(childEntries.filter((entry) => entry.parentThreadId === parentThreadId)),
       }),
     ),
     Layer.provide(
@@ -323,7 +354,11 @@ const makeTestLayer = (commands: OrchestrationCommand[], options: TestLayerOptio
     Layer.provide(
       Layer.mock(OrchestrationEngineService)({
         readEvents: () => Stream.empty,
-        dispatch: () => Effect.succeed({ sequence: 1 }),
+        dispatch: (command) =>
+          Effect.sync(() => {
+            commands.push(command);
+            return { sequence: 23 };
+          }),
         streamDomainEvents: Stream.empty,
       }),
     ),
@@ -354,6 +389,238 @@ const callStartTool = (
       ),
     );
   }).pipe(Effect.provide(makeTestLayer(commands, options)));
+
+const callArchiveTool = (
+  threadId: ThreadId,
+  commands: OrchestrationCommand[],
+  options: TestLayerOptions = {},
+  scope: McpInvocationContext.McpInvocationScope = invocation,
+) =>
+  Effect.gen(function* () {
+    const server = yield* McpServer.McpServer;
+    return yield* server
+      .callTool({ name: "t3_archive_thread", arguments: { threadId } })
+      .pipe(
+        Effect.provideService(McpInvocationContext.McpInvocationContext, scope),
+        Effect.provideService(McpSchema.McpServerClient, client),
+      );
+  }).pipe(Effect.provide(makeTestLayer(commands, options)));
+
+const childThreadId = ThreadId.make("archive-child-thread");
+const activeChildThread: OrchestrationThreadShell = {
+  ...sourceThread,
+  id: childThreadId,
+  title: "Archive child",
+  parentThreadId: sourceThreadId,
+};
+
+it.effect("archives an active child through the existing orchestration command", () =>
+  Effect.gen(function* () {
+    const commands: OrchestrationCommand[] = [];
+    const result = yield* callArchiveTool(childThreadId, commands, {
+      threadShells: [activeChildThread],
+    });
+
+    expect(result.isError).toBe(false);
+    expect(result.structuredContent).toEqual({ threadId: childThreadId, sequence: 23 });
+    expect(commands).toHaveLength(1);
+    expect(commands[0]).toMatchObject({
+      type: "thread.archive",
+      threadId: childThreadId,
+    });
+    expect(commands[0]?.commandId).toMatch(/^mcp-admin:thread-archive:/);
+  }),
+);
+
+it.effect("authorizes archive only for a private root provider context", () =>
+  Effect.gen(function* () {
+    const peerInvocation: McpInvocationContext.PeerMcpInvocationScope = {
+      credentialKind: "peer",
+      environmentId: invocation.environmentId,
+      peerTokenId: "archive-peer",
+      capabilities: new Set(["thread-management"]),
+      issuedAt: 1,
+      expiresAt: null,
+    };
+    const callerCases: ReadonlyArray<{
+      readonly label: string;
+      readonly scope: McpInvocationContext.McpInvocationScope;
+      readonly source: OrchestrationThreadShell;
+      readonly expectedError: string;
+    }> = [
+      {
+        label: "private child",
+        scope: { ...invocation, threadId: childThreadId },
+        source: activeChildThread,
+        expectedError: "private root thread",
+      },
+      {
+        label: "factory root",
+        scope: invocation,
+        source: { ...sourceThread, dataAudience: "factory" },
+        expectedError: "private root thread",
+      },
+      {
+        label: "factory child",
+        scope: { ...invocation, threadId: childThreadId },
+        source: { ...activeChildThread, dataAudience: "factory" },
+        expectedError: "private root thread",
+      },
+      {
+        label: "peer",
+        scope: peerInvocation,
+        source: sourceThread,
+        expectedError: "must be scoped to a provider session",
+      },
+    ];
+
+    for (const callerCase of callerCases) {
+      const commands: OrchestrationCommand[] = [];
+      const result = yield* callArchiveTool(
+        childThreadId,
+        commands,
+        {
+          sourceThread: callerCase.source,
+          threadShells: [activeChildThread],
+        },
+        callerCase.scope,
+      );
+      expect(result.isError, callerCase.label).toBe(true);
+      expect(errorText(result.content), callerCase.label).toContain(callerCase.expectedError);
+      expect(commands, callerCase.label).toHaveLength(0);
+    }
+  }),
+);
+
+it.effect("rejects owner self-archive", () =>
+  Effect.gen(function* () {
+    const commands: OrchestrationCommand[] = [];
+    const result = yield* callArchiveTool(sourceThreadId, commands);
+
+    expect(result.isError).toBe(true);
+    expect(errorText(result.content)).toContain("strict descendant");
+    expect(commands).toHaveLength(0);
+  }),
+);
+
+it.effect("rejects a private-root non-owner targeting another root's child", () =>
+  Effect.gen(function* () {
+    const commands: OrchestrationCommand[] = [];
+    const otherRootId = ThreadId.make("other-private-root");
+    const otherRoot = { ...sourceThread, id: otherRootId, title: "Other root" };
+    const otherChild = {
+      ...activeChildThread,
+      id: ThreadId.make("other-private-child"),
+      parentThreadId: otherRootId,
+    };
+    const result = yield* callArchiveTool(otherChild.id, commands, {
+      threadShells: [otherRoot, otherChild],
+    });
+
+    expect(result.isError).toBe(true);
+    expect(errorText(result.content)).toContain("not owned by invoking root");
+    expect(commands).toHaveLength(0);
+  }),
+);
+
+it.effect("rejects broken or cyclic target ancestry", () =>
+  Effect.gen(function* () {
+    const brokenChild = {
+      ...activeChildThread,
+      id: ThreadId.make("broken-archive-child"),
+      parentThreadId: ThreadId.make("missing-archive-parent"),
+    };
+    const cycleChildId = ThreadId.make("cycle-archive-child");
+    const cycleParentId = ThreadId.make("cycle-archive-parent");
+    const cycleChild = {
+      ...activeChildThread,
+      id: cycleChildId,
+      parentThreadId: cycleParentId,
+    };
+    const cycleParent = {
+      ...activeChildThread,
+      id: cycleParentId,
+      parentThreadId: cycleChildId,
+    };
+    const remoteParentChild = {
+      ...activeChildThread,
+      id: ThreadId.make("remote-parent-archive-child"),
+      parentEnvironmentId: EnvironmentId.make("other-environment"),
+    };
+    const factoryTarget = {
+      ...activeChildThread,
+      id: ThreadId.make("factory-archive-child"),
+      dataAudience: "factory" as const,
+    };
+    const ancestryCases = [
+      { label: "missing parent", target: brokenChild, threads: [brokenChild] },
+      {
+        label: "cycle",
+        target: cycleChild,
+        threads: [cycleChild, cycleParent],
+      },
+      {
+        label: "remote parent",
+        target: remoteParentChild,
+        threads: [remoteParentChild],
+      },
+      {
+        label: "factory target",
+        target: factoryTarget,
+        threads: [factoryTarget],
+      },
+    ] as const;
+
+    for (const ancestryCase of ancestryCases) {
+      const commands: OrchestrationCommand[] = [];
+      const result = yield* callArchiveTool(ancestryCase.target.id, commands, {
+        threadShells: ancestryCase.threads,
+      });
+      expect(result.isError, ancestryCase.label).toBe(true);
+      expect(errorText(result.content), ancestryCase.label).toContain("not owned by invoking root");
+      expect(commands, ancestryCase.label).toHaveLength(0);
+    }
+  }),
+);
+
+it.effect("rejects an already-terminal child without dispatching", () =>
+  Effect.gen(function* () {
+    const commands: OrchestrationCommand[] = [];
+    const result = yield* callArchiveTool(childThreadId, commands, {
+      threadShells: [activeChildThread],
+      settledChildThreadIds: new Set([childThreadId]),
+    });
+
+    expect(result.isError).toBe(true);
+    expect(errorText(result.content)).toContain("already terminal");
+    expect(commands).toHaveLength(0);
+  }),
+);
+
+it.effect("rejects a nonexistent archive target without dispatching", () =>
+  Effect.gen(function* () {
+    const commands: OrchestrationCommand[] = [];
+    const missingThreadId = ThreadId.make("missing-archive-child");
+    const result = yield* callArchiveTool(missingThreadId, commands);
+
+    expect(result.isError).toBe(true);
+    expect(errorText(result.content)).toContain(`Thread ${missingThreadId} was not found`);
+    expect(commands).toHaveLength(0);
+  }),
+);
+
+it.effect("rejects an already-archived retry without dispatching", () =>
+  Effect.gen(function* () {
+    const commands: OrchestrationCommand[] = [];
+    const result = yield* callArchiveTool(childThreadId, commands, {
+      threadShells: [{ ...activeChildThread, archivedAt: "2026-07-18T08:00:00.000Z" }],
+    });
+
+    expect(result.isError).toBe(true);
+    expect(errorText(result.content)).toContain("already archived");
+    expect(commands).toHaveLength(0);
+  }),
+);
 
 it.effect("starts through the slim MCP surface with xhigh Codex effort by default", () =>
   Effect.gen(function* () {
