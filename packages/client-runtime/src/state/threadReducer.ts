@@ -570,6 +570,22 @@ export function applyThreadDetailEvent(
       };
     }
 
+    case "thread.turn-effective-model-set": {
+      const setEffectiveModel = (turn: OrchestrationLatestTurn) =>
+        turn.turnId === event.payload.turnId
+          ? { ...turn, effectiveModel: event.payload.effectiveModel }
+          : turn;
+      return {
+        kind: "updated",
+        thread: {
+          ...thread,
+          latestTurn: thread.latestTurn ? setEffectiveModel(thread.latestTurn) : null,
+          turns: Arr.map(thread.turns, setEffectiveModel),
+          updatedAt: event.occurredAt,
+        },
+      };
+    }
+
     // ── Revert ──────────────────────────────────────────────────────
     case "thread.reverted": {
       const checkpoints = pipe(

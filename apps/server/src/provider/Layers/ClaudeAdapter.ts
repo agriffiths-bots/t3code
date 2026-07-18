@@ -51,6 +51,7 @@ import {
   getModelSelectionBooleanOptionValue,
   getModelSelectionStringOptionValue,
   getProviderOptionDescriptors,
+  normalizeModelSlug,
   resolvePromptInjectedEffort,
 } from "@t3tools/shared/model";
 import * as Cause from "effect/Cause";
@@ -124,6 +125,8 @@ interface ClaudeResumeState {
 interface ClaudeTurnState {
   readonly turnId: TurnId;
   readonly startedAt: string;
+  requestedModel: string | undefined;
+  effectiveModel: string | undefined;
   /**
    * True for turns auto-started by assistant output arriving without an
    * active turn (background agent/subagent responses between user prompts).
@@ -472,6 +475,40 @@ function maxClaudeContextWindowFromModelUsage(
   }
 
   return maxContextWindow;
+}
+
+function normalizeClaudeModel(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const normalized = value.trim();
+  return normalized.length > 0 ? normalized : undefined;
+}
+
+function comparableClaudeModel(value: string): string {
+  const withoutContextWindow = value.replace(/\[(?:1m|200k)\]$/u, "");
+  const normalized = normalizeModelSlug(withoutContextWindow, PROVIDER) ?? withoutContextWindow;
+  return normalized.toLowerCase().replace(/-\d{8}$/u, "");
+}
+
+function sameClaudeModel(left: string, right: string): boolean {
+  return comparableClaudeModel(left) === comparableClaudeModel(right);
+}
+
+function divergentClaudeEffectiveModel(
+  turnState: ClaudeTurnState,
+  modelUsage: Record<string, ModelUsage> | undefined,
+): string | undefined {
+  const requestedModel = turnState.requestedModel;
+  const usageModels = Object.keys(modelUsage ?? {}).flatMap((model) => {
+    const normalized = normalizeClaudeModel(model);
+    return normalized ? [normalized] : [];
+  });
+  const effectiveModel =
+    turnState.effectiveModel ?? (usageModels.length === 1 ? usageModels[0] : undefined);
+
+  if (!effectiveModel || !requestedModel || sameClaudeModel(effectiveModel, requestedModel)) {
+    return undefined;
+  }
+  return effectiveModel;
 }
 
 function selectedClaudeContextWindow(
@@ -2153,6 +2190,8 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
       return;
     }
 
+    const effectiveModel = divergentClaudeEffectiveModel(turnState, result?.modelUsage);
+
     for (const [index, tool] of context.inFlightTools.entries()) {
       const toolStamp = yield* makeEventStamp();
       yield* offerRuntimeEvent({
@@ -2216,6 +2255,7 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
       payload: {
         state: status,
         ...(result?.stop_reason !== undefined ? { stopReason: result.stop_reason } : {}),
+        ...(effectiveModel ? { effectiveModel } : {}),
         ...(result?.usage ? { usage: result.usage } : {}),
         ...(result?.modelUsage ? { modelUsage: result.modelUsage } : {}),
         ...(typeof result?.total_cost_usd === "number"
@@ -2645,6 +2685,8 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
     context.turnState = {
       turnId,
       startedAt,
+      requestedModel: context.session.model,
+      effectiveModel: undefined,
       synthetic: true,
       items: [],
       assistantTextBlocks: new Map(),
@@ -2695,6 +2737,10 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
       rawMethod: "claude/synthetic-turn-start",
       rawPayload: {},
     });
+
+    if (context.turnState && message.parent_tool_use_id === null) {
+      context.turnState.effectiveModel = normalizeClaudeModel(message.message?.model);
+    }
 
     const content = message.message?.content;
     if (Array.isArray(content)) {
@@ -3908,6 +3954,8 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
       const turnState: ClaudeTurnState = {
         turnId,
         startedAt: yield* nowIso,
+        requestedModel: modelSelection?.model ?? context.session.model,
+        effectiveModel: undefined,
         items: [],
         assistantTextBlocks: new Map(),
         assistantTextBlockOrder: [],
@@ -3949,6 +3997,11 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
       type: "message",
       message,
     }).pipe(Effect.mapError((cause) => toRequestError(input.threadId, "turn/start", cause)));
+
+    if (steeringTurnState) {
+      steeringTurnState.requestedModel = modelSelection?.model ?? context.session.model;
+      steeringTurnState.effectiveModel = undefined;
+    }
 
     return {
       threadId: context.session.threadId,

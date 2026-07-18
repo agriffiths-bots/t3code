@@ -1,4 +1,4 @@
-import { EnvironmentId, MessageId } from "@t3tools/contracts";
+import { EnvironmentId, MessageId, TurnId } from "@t3tools/contracts";
 import { createRef, type ReactNode, type Ref } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { beforeAll, describe, expect, it, vi } from "vite-plus/test";
@@ -224,6 +224,56 @@ function buildUserTimelineEntry(text: string) {
 }
 
 describe("MessagesTimeline", () => {
+  it("shows the effective-model badge only for rerouted turns", async () => {
+    const { MessagesTimeline } = await import("./MessagesTimeline");
+    const turnId = TurnId.make("turn-rerouted");
+    const assistantMessageId = MessageId.make("assistant-rerouted");
+    const timelineEntries = [
+      {
+        id: "assistant-rerouted-entry",
+        kind: "message" as const,
+        createdAt: MESSAGE_CREATED_AT,
+        message: {
+          id: assistantMessageId,
+          role: "assistant" as const,
+          text: "Fallback response",
+          turnId,
+          createdAt: MESSAGE_CREATED_AT,
+          updatedAt: MESSAGE_CREATED_AT,
+          streaming: false,
+        },
+      },
+    ];
+    const latestTurn = {
+      turnId,
+      state: "completed" as const,
+      startedAt: MESSAGE_CREATED_AT,
+      completedAt: MESSAGE_CREATED_AT,
+      assistantMessageId,
+      effectiveModel: "claude-opus-4-8",
+    };
+
+    const reroutedMarkup = renderToStaticMarkup(
+      <MessagesTimeline
+        {...buildProps()}
+        latestTurn={latestTurn}
+        turns={[latestTurn]}
+        timelineEntries={timelineEntries}
+      />,
+    );
+    const normalMarkup = renderToStaticMarkup(
+      <MessagesTimeline
+        {...buildProps()}
+        latestTurn={{ ...latestTurn, effectiveModel: undefined }}
+        turns={[{ ...latestTurn, effectiveModel: undefined }]}
+        timelineEntries={timelineEntries}
+      />,
+    );
+
+    expect(reroutedMarkup).toContain("answered by claude-opus-4-8");
+    expect(normalMarkup).not.toContain("answered by");
+  });
+
   it("uses LegendList isNearEnd when deciding whether the live edge is visible", async () => {
     const {
       resolveTimelineIsAtEnd,

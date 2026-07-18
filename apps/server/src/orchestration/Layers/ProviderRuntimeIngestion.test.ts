@@ -438,6 +438,19 @@ describe("ProviderRuntimeIngestion", () => {
             `,
           ),
         ),
+      readProjectedEffectiveModel: (threadId: ThreadId, turnId: TurnId) =>
+        managedRuntime.runPromise(
+          Effect.flatMap(
+            Effect.service(SqlClient),
+            (sql) => sql<{ readonly effectiveModel: string | null }>`
+              SELECT effective_model AS "effectiveModel"
+              FROM projection_turns
+              WHERE thread_id = ${threadId}
+                AND turn_id = ${turnId}
+              LIMIT 1
+            `,
+          ),
+        ),
       drain,
     };
   }
@@ -482,6 +495,73 @@ describe("ProviderRuntimeIngestion", () => {
     );
     expect(thread.session?.status).toBe("error");
     expect(thread.session?.lastError).toBe("turn failed");
+  });
+
+  it("persists effective models from turn completion and explicit reroutes", async () => {
+    const harness = await createHarness();
+    const turnId = asTurnId("turn-effective-model");
+
+    harness.emit({
+      type: "turn.started",
+      eventId: asEventId("evt-effective-model-started"),
+      provider: ProviderDriverKind.make("codex"),
+      threadId: asThreadId("thread-1"),
+      createdAt: "2026-01-01T00:00:00.000Z",
+      turnId,
+    });
+    await waitForThread(harness.readModel, (thread) => thread.latestTurn?.turnId === turnId);
+
+    harness.emit({
+      type: "turn.completed",
+      eventId: asEventId("evt-effective-model-completed"),
+      provider: ProviderDriverKind.make("codex"),
+      threadId: asThreadId("thread-1"),
+      createdAt: "2026-01-01T00:00:01.000Z",
+      turnId,
+      payload: {
+        state: "completed",
+        effectiveModel: "claude-opus-4-8",
+      },
+    });
+
+    const completedThread = await waitForThread(
+      harness.readModel,
+      (thread) => thread.latestTurn?.effectiveModel === "claude-opus-4-8",
+    );
+    expect(completedThread.turns[0]?.effectiveModel).toBe("claude-opus-4-8");
+    expect(await harness.readProjectedEffectiveModel(asThreadId("thread-1"), turnId)).toEqual([
+      { effectiveModel: "claude-opus-4-8" },
+    ]);
+
+    const codexTurnId = asTurnId("turn-codex-rerouted");
+    harness.emit({
+      type: "turn.started",
+      eventId: asEventId("evt-codex-reroute-started"),
+      provider: ProviderDriverKind.make("codex"),
+      threadId: asThreadId("thread-1"),
+      createdAt: "2026-01-01T00:00:02.000Z",
+      turnId: codexTurnId,
+    });
+    await waitForThread(harness.readModel, (thread) => thread.latestTurn?.turnId === codexTurnId);
+    harness.emit({
+      type: "model.rerouted",
+      eventId: asEventId("evt-codex-rerouted"),
+      provider: ProviderDriverKind.make("codex"),
+      threadId: asThreadId("thread-1"),
+      createdAt: "2026-01-01T00:00:03.000Z",
+      turnId: codexTurnId,
+      payload: {
+        fromModel: "gpt-5.4-mini",
+        toModel: "gpt-5.4",
+        reason: "fallback",
+      },
+    });
+
+    const reroutedThread = await waitForThread(
+      harness.readModel,
+      (thread) => thread.latestTurn?.effectiveModel === "gpt-5.4",
+    );
+    expect(reroutedThread.latestTurn?.turnId).toBe(codexTurnId);
   });
 
   it("fails a running turn when the provider process exits without a graceful tag", async () => {

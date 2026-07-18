@@ -37,6 +37,7 @@ import {
   ThreadRevertedPayload,
   ThreadSessionSetPayload,
   ThreadTurnDiffCompletedPayload,
+  ThreadTurnEffectiveModelSetPayload,
 } from "./Schemas.ts";
 
 type ThreadPatch = Partial<Omit<OrchestrationThread, "id" | "projectId">>;
@@ -1097,6 +1098,33 @@ export function projectEvent(
           }),
         };
       });
+
+    case "thread.turn-effective-model-set":
+      return decodeForEvent(
+        ThreadTurnEffectiveModelSetPayload,
+        event.payload,
+        event.type,
+        "payload",
+      ).pipe(
+        Effect.map((payload) => {
+          const thread = nextBase.threads.find((entry) => entry.id === payload.threadId);
+          if (!thread) {
+            return nextBase;
+          }
+          const setEffectiveModel = (turn: OrchestrationLatestTurn) =>
+            turn.turnId === payload.turnId
+              ? { ...turn, effectiveModel: payload.effectiveModel }
+              : turn;
+          return {
+            ...nextBase,
+            threads: updateThread(nextBase.threads, payload.threadId, {
+              latestTurn: thread.latestTurn ? setEffectiveModel(thread.latestTurn) : null,
+              turns: thread.turns.map(setEffectiveModel),
+              updatedAt: event.occurredAt,
+            }),
+          };
+        }),
+      );
 
     case "thread.reverted":
       return decodeForEvent(ThreadRevertedPayload, event.payload, event.type, "payload").pipe(
