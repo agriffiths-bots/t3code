@@ -2140,6 +2140,26 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
         } satisfies OrchestrationThreadShell);
       });
 
+  const getThreadShellSnapshotByIdIncludingArchived: ProjectionSnapshotQueryShape["getThreadShellSnapshotByIdIncludingArchived"] =
+    (threadId) =>
+      sql
+        .withTransaction(
+          Effect.gen(function* () {
+            const thread = yield* getThreadShellByIdIncludingArchived(threadId);
+            const { snapshotSequence } = yield* getSnapshotSequence();
+            return { snapshotSequence, thread };
+          }),
+        )
+        .pipe(
+          Effect.mapError((error) =>
+            isPersistenceError(error)
+              ? error
+              : toPersistenceSqlError(
+                  "ProjectionSnapshotQuery.getThreadShellSnapshotByIdIncludingArchived:transaction",
+                )(error),
+          ),
+        );
+
   const getThreadDetailById: ProjectionSnapshotQueryShape["getThreadDetailById"] = (threadId) =>
     Effect.gen(function* () {
       const audienceCeiling = yield* currentReadAudienceCeiling;
@@ -2337,6 +2357,7 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
     getFullThreadDiffContext,
     getThreadShellById,
     getThreadShellByIdIncludingArchived,
+    getThreadShellSnapshotByIdIncludingArchived,
     getThreadDetailById,
     getThreadDetailSnapshot,
   } satisfies ProjectionSnapshotQueryShape;

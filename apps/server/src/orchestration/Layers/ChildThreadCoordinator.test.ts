@@ -533,6 +533,7 @@ describe("ChildThreadCoordinator", () => {
       getFullThreadDiffContext: () => unsupported(),
       getThreadShellById: readThreadShellById,
       getThreadShellByIdIncludingArchived: readThreadShellByIdIncludingArchived,
+      getThreadShellSnapshotByIdIncludingArchived: () => unsupported(),
       getThreadDetailById: (threadId) =>
         Effect.gen(function* () {
           const key = String(threadId);

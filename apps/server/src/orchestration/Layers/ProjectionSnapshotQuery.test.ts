@@ -306,6 +306,20 @@ projectionSnapshotLayer("ProjectionSnapshotQuery", (it) => {
               .pipe(Effect.map(Option.isSome)),
           },
           {
+            name: "archived thread shell snapshot by id",
+            privateRead: snapshotQuery
+              .getThreadShellSnapshotByIdIncludingArchived(privateArchivedThreadId)
+              .pipe(Effect.map(({ thread }) => Option.isSome(thread))),
+            factoryRead: snapshotQuery
+              .getThreadShellSnapshotByIdIncludingArchived(factoryArchivedThreadId)
+              .pipe(Effect.map(({ thread }) => Option.isSome(thread))),
+            missingRead: snapshotQuery
+              .getThreadShellSnapshotByIdIncludingArchived(
+                ThreadId.make("thread-read-guard-missing"),
+              )
+              .pipe(Effect.map(({ thread }) => Option.isSome(thread))),
+          },
+          {
             name: "thread detail by id",
             privateRead: snapshotQuery
               .getThreadDetailById(privateActiveThreadId)
