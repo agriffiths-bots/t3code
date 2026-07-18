@@ -1460,6 +1460,37 @@ describe("ChildThreadCoordinator", () => {
     expect(turnStarts[0]!.message.text).toContain(`[sub-agent ${child} failed] session error`);
   });
 
+  it("settles a stopped running session and releases its lease during one-shot register", async () => {
+    const child = ThreadId.make("child-stopped-before-register");
+    const parent = ThreadId.make("parent-stopped-before-register");
+    const reason = "Provider process exited before child registration.";
+    const harness = await createHarness({
+      threads: [
+        makeThreadState({
+          threadId: child,
+          parentThreadId: parent,
+          latestTurn: makeLatestTurn("running"),
+          session: makeSession(child, "stopped", null, reason),
+        }),
+      ],
+    });
+    await harness.seedDispatchLease(child);
+
+    await harness.register({
+      parentThreadId: parent,
+      childThreadId: child,
+      detached: false,
+      model: codexModel,
+      spawnedAtMs: 0,
+    });
+
+    const result = await runtimeRun(harness, child);
+    expect(result.status).toBe("failed");
+    expect(result.error).toBe(reason);
+    expect(await harness.listDispatchLeaseChildIds()).not.toContain(child);
+    expect(await harness.canAcquireDispatchLease()).toBe(true);
+  });
+
   it("settles session-set ready with a completed projected turn as completed", async () => {
     const child = ThreadId.make("child-ready-completed");
     const parent = ThreadId.make("parent-ready-completed");
@@ -1909,16 +1940,90 @@ describe("ChildThreadCoordinator", () => {
     expect(result.finalAssistantText).toBe("same turn stopped complete");
   });
 
-  it("does NOT settle session-set stopped while the latest turn is still running", async () => {
-    const child = ThreadId.make("child-stopped-running");
-    const parent = ThreadId.make("parent-4b");
+  it("settles provider-death session states and releases capacity", async () => {
+    const deathCases = [
+      {
+        name: "zero-exit",
+        status: "stopped",
+        reason: "Provider process exited with code 0.",
+      },
+      {
+        name: "nonzero-exit",
+        status: "error",
+        reason: "Provider process exited with code 1.",
+      },
+      {
+        name: "signal",
+        status: "error",
+        reason: "Provider process exited after signal SIGKILL.",
+      },
+      {
+        name: "supervisor-reap",
+        status: "stopped",
+        reason: "Provider session was reaped after its process disappeared.",
+      },
+      {
+        name: "spawn-failure",
+        status: "error",
+        reason: "Provider process spawn failed after session creation.",
+      },
+    ] as const;
+    const parent = ThreadId.make("parent-provider-death");
+    const children = deathCases.map(({ name }) => ThreadId.make(`child-provider-death-${name}`));
+    const harness = await createHarness({
+      threads: deathCases.map((_, index) =>
+        makeThreadState({
+          threadId: children[index]!,
+          parentThreadId: parent,
+          latestTurn: makeLatestTurn("running"),
+          session: makeSession(children[index]!, "running", TurnId.make("turn-1")),
+        }),
+      ),
+    });
+
+    for (const [index, deathCase] of deathCases.entries()) {
+      const child = children[index]!;
+      await harness.register({
+        parentThreadId: parent,
+        childThreadId: child,
+        detached: false,
+        model: codexModel,
+        spawnedAtMs: 0,
+      });
+      await harness.seedDispatchLease(child);
+      harness.setThread(
+        makeThreadState({
+          threadId: child,
+          parentThreadId: parent,
+          latestTurn: makeLatestTurn("running"),
+          session: makeSession(child, deathCase.status, null, deathCase.reason),
+        }),
+      );
+
+      await harness.feed(sessionSetEvent(child, deathCase.status, null, deathCase.reason));
+
+      const slice = await runtimeWaitSlice(harness, [child], FAR_FUTURE_MS);
+      expect(slice.results[0]).toMatchObject({
+        status: "failed",
+        error: deathCase.reason,
+      });
+      expect(await harness.listDispatchLeaseChildIds()).not.toContain(child);
+      expect(await harness.canAcquireDispatchLease()).toBe(true);
+    }
+  });
+
+  it("does not settle a stale stopped event after a replacement session is running", async () => {
+    const child = ThreadId.make("child-stale-stopped-after-replacement");
+    const parent = ThreadId.make("parent-stale-stopped-after-replacement");
+    const oldTurnId = TurnId.make("superseded-turn");
+    const replacementTurnId = TurnId.make("replacement-turn");
     const harness = await createHarness({
       threads: [
         makeThreadState({
           threadId: child,
           parentThreadId: parent,
-          latestTurn: makeLatestTurn("running"),
-          session: makeSession(child, "stopped"),
+          latestTurn: makeLatestTurn("running", oldTurnId),
+          session: makeSession(child, "running", oldTurnId),
         }),
       ],
     });
@@ -1929,9 +2034,61 @@ describe("ChildThreadCoordinator", () => {
       model: codexModel,
       spawnedAtMs: 0,
     });
-    await harness.feed(sessionSetEvent(child, "stopped"));
+    await harness.seedDispatchLease(child);
+    await harness.feed(turnDiffEvent(child, "missing", oldTurnId));
+    await harness.feed(turnStartRequestedEvent(child));
+    harness.setThread(
+      makeThreadState({
+        threadId: child,
+        parentThreadId: parent,
+        latestTurn: makeLatestTurn("running", replacementTurnId),
+        session: makeSession(child, "running", replacementTurnId),
+      }),
+    );
+    await harness.feed(sessionSetEvent(child, "running", replacementTurnId));
+
+    await harness.feed(
+      sessionSetEvent(child, "stopped", null, "superseded provider process exited"),
+    );
+
     const slice = await runtimeWaitSlice(harness, [child], FAR_FUTURE_MS);
     expect(slice.results[0]!.status).toBe("pending");
+    expect(await harness.listDispatchLeaseChildIds()).toContain(child);
+  });
+
+  it("does not settle stale stopped after a same-turn replacement session is running", async () => {
+    const child = ThreadId.make("child-stale-stopped-after-same-turn-replacement");
+    const parent = ThreadId.make("parent-stale-stopped-after-same-turn-replacement");
+    const turnId = TurnId.make("reused-turn");
+    const harness = await createHarness({
+      threads: [
+        makeThreadState({
+          threadId: child,
+          parentThreadId: parent,
+          latestTurn: makeLatestTurn("running", turnId),
+          session: makeSession(child, "running", turnId),
+        }),
+      ],
+    });
+    await harness.register({
+      parentThreadId: parent,
+      childThreadId: child,
+      detached: false,
+      model: codexModel,
+      spawnedAtMs: 0,
+    });
+    await harness.seedDispatchLease(child);
+    await harness.feed(turnDiffEvent(child, "missing", turnId));
+    await harness.feed(turnStartRequestedEvent(child));
+    await harness.feed(sessionSetEvent(child, "running", turnId));
+
+    await harness.feed(
+      sessionSetEvent(child, "stopped", null, "superseded same-turn provider exited"),
+    );
+
+    const slice = await runtimeWaitSlice(harness, [child], FAR_FUTURE_MS);
+    expect(slice.results[0]!.status).toBe("pending");
+    expect(await harness.listDispatchLeaseChildIds()).toContain(child);
   });
 
   it("settles stopped after a stale completed projection with a newer user message as failed", async () => {
@@ -5551,18 +5708,31 @@ describe("ChildThreadCoordinator", () => {
     expect(result.error).toBe("session stopped");
   });
 
-  it("keeps boot-reconciled stopped running children pending", async () => {
+  it("settles boot-reconciled provider-dead running children and frees all six leases", async () => {
     const parent = ThreadId.make("boot-stopped-running-parent");
-    const childIds = Array.from({ length: 6 }, (_, index) =>
-      ThreadId.make(`boot-stopped-running-child-${index + 1}`),
+    const bootDeathCases = [
+      { name: "zero-exit", status: "stopped", reason: "Provider process exited with code 0." },
+      { name: "reaped", status: "stopped", reason: "Provider session process was reaped." },
+      { name: "gone", status: "stopped", reason: "Provider instance disappeared." },
+      { name: "nonzero", status: "error", reason: "Provider process exited with code 1." },
+      { name: "signal", status: "error", reason: "Provider process received SIGKILL." },
+      { name: "spawn", status: "error", reason: "Provider process spawn failed." },
+    ] as const;
+    const childIds = bootDeathCases.map(({ name }) =>
+      ThreadId.make(`boot-stopped-running-child-${name}`),
     );
     const harness = await createHarness({
-      threads: childIds.map((threadId) =>
+      threads: childIds.map((threadId, index) =>
         makeThreadState({
           threadId,
           parentThreadId: parent,
           latestTurn: makeLatestTurn("running"),
-          session: makeSession(threadId, "stopped"),
+          session: makeSession(
+            threadId,
+            bootDeathCases[index]!.status,
+            null,
+            bootDeathCases[index]!.reason,
+          ),
         }),
       ),
       seedChildRows: childIds.map((threadId) => ({ threadId, parentThreadId: parent })),
@@ -5571,8 +5741,13 @@ describe("ChildThreadCoordinator", () => {
 
     const entries = await runtimeListChildren(harness, parent);
     expect(entries).toHaveLength(6);
-    expect(entries.every((entry) => !entry.settled)).toBe(true);
-    expect(await harness.canAcquireDispatchLease()).toBe(false);
+    expect(entries.every((entry) => entry.settled)).toBe(true);
+    const slice = await runtimeWaitSlice(harness, childIds, FAR_FUTURE_MS);
+    expect(slice.results.map(({ status, error }) => ({ status, error }))).toEqual(
+      bootDeathCases.map(({ reason }) => ({ status: "failed", error: reason })),
+    );
+    expect(await harness.listDispatchLeaseChildIds()).toEqual([]);
+    expect(await harness.canAcquireDispatchLease()).toBe(true);
   });
 
   it("does not let stale projection terminal override replayed pending starts", async () => {

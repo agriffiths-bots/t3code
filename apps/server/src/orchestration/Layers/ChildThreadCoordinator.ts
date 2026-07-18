@@ -167,25 +167,42 @@ const isProjectedChildActive = (shell: OrchestrationThreadShell): boolean => {
   );
 };
 
-const shouldSettleTerminalSession = (input: {
-  readonly status: SessionSetEvent["payload"]["session"]["status"];
-  readonly turnRunning: boolean;
-  readonly missingDiffWhileRunning: boolean;
-}): boolean =>
-  input.status === "error" ||
-  (input.status === "stopped" && (!input.turnRunning || input.missingDiffWhileRunning));
-
-const sessionErrorOwnsProjectedSession = (
-  session: SessionSetEvent["payload"]["session"],
-  shell: Option.Option<OrchestrationThreadShell>,
+const shouldSettleTerminalSession = (
+  status: SessionSetEvent["payload"]["session"]["status"],
 ): boolean =>
-  session.status !== "error" ||
-  Option.match(shell, {
+  // The provider can no longer advance a child once its session is terminal.
+  // A still-running turn projection is therefore stale liveness, not a reason
+  // to retain the child's dispatch lease.
+  status === "error" || status === "stopped";
+
+const terminalSessionOwnsProjectedSession = (input: {
+  readonly session: SessionSetEvent["payload"]["session"];
+  readonly shell: Option.Option<OrchestrationThreadShell>;
+  readonly allowStoppedProjectionLag: boolean;
+  readonly expectedActiveTurnId: TurnId | undefined;
+}): boolean =>
+  (input.session.status !== "error" && input.session.status !== "stopped") ||
+  Option.match(input.shell, {
     onNone: () => false,
-    onSome: (projected) =>
-      projected.session?.status === "error" &&
-      projected.session.updatedAt === session.updatedAt &&
-      projected.session.lastError === session.lastError,
+    onSome: (projected) => {
+      const projectedSession = projected.session;
+      if (
+        projectedSession?.status === input.session.status &&
+        projectedSession.updatedAt === input.session.updatedAt &&
+        projectedSession.lastError === input.session.lastError
+      ) {
+        return true;
+      }
+      return (
+        input.session.status === "stopped" &&
+        input.allowStoppedProjectionLag &&
+        input.expectedActiveTurnId !== undefined &&
+        projected.latestTurn?.state === "running" &&
+        projected.latestTurn.turnId === input.expectedActiveTurnId &&
+        (projectedSession?.status === "running" || projectedSession?.status === "waiting") &&
+        projectedSession.activeTurnId === input.expectedActiveTurnId
+      );
+    },
   });
 
 const activeTurnReportedBySession = (
@@ -313,7 +330,14 @@ const projectedLifecycleTerminal = (thread: OrchestrationThread): ChildTerminalO
   }
   const latestTurn = thread.latestTurn;
   if (latestTurn?.state === "running") {
-    return thread.archivedAt !== null ? { status: "killed", error: "thread archived" } : null;
+    if (thread.archivedAt !== null) return { status: "killed", error: "thread archived" };
+    if (thread.session?.status === "error") {
+      return { status: "failed", error: thread.session.lastError ?? "session error" };
+    }
+    if (thread.session?.status === "stopped") {
+      return { status: "failed", error: thread.session.lastError ?? "session stopped" };
+    }
+    return null;
   }
   const terminalAt = latestTurn?.completedAt ?? latestTurn?.startedAt ?? latestTurn?.requestedAt;
   const latestUserMessageAt = latestUserMessageAtFromThread(thread);
@@ -1588,6 +1612,12 @@ const make = Effect.gen(function* () {
       if (!record) return;
       const reportedActiveTurnId = activeTurnReportedBySession(session);
       if (reportedActiveTurnId !== undefined) {
+        if (
+          activeTurnByChild.get(threadId) !== reportedActiveTurnId ||
+          pendingSameTurnStartByChild.get(threadId) === reportedActiveTurnId
+        ) {
+          missingDiffWhileRunningByChild.delete(threadId);
+        }
         activeTurnByChild.set(threadId, reportedActiveTurnId);
         pendingTurnStartByChild.delete(threadId);
         pendingSameTurnStartByChild.delete(threadId);
@@ -1640,7 +1670,14 @@ const make = Effect.gen(function* () {
         }
       }
       const shellOption = yield* getThreadShell(threadId);
-      if (!sessionErrorOwnsProjectedSession(session, shellOption)) {
+      if (
+        !terminalSessionOwnsProjectedSession({
+          session,
+          shell: shellOption,
+          allowStoppedProjectionLag: missingDiffWhileRunningByChild.has(threadId),
+          expectedActiveTurnId: activeTurnByChild.get(threadId),
+        })
+      ) {
         return;
       }
       if (session.status === "stopped" && Option.isSome(shellOption)) {
@@ -1651,17 +1688,7 @@ const make = Effect.gen(function* () {
           return;
         }
       }
-      const turnRunning = Option.match(shellOption, {
-        onNone: () => false,
-        onSome: (shell) => shell.latestTurn?.state === "running",
-      });
-      if (
-        !shouldSettleTerminalSession({
-          status: session.status,
-          turnRunning,
-          missingDiffWhileRunning: missingDiffWhileRunningByChild.has(threadId),
-        })
-      ) {
+      if (!shouldSettleTerminalSession(session.status)) {
         return;
       }
       missingDiffWhileRunningByChild.delete(threadId);
@@ -2088,23 +2115,40 @@ const make = Effect.gen(function* () {
           if (settled) return;
         }
       }
+      const canSettleProjectedStoppedSession =
+        !pendingTurnStartByChild.has(childThreadId) &&
+        !pendingSameTurnStartByChild.has(childThreadId) &&
+        !unarchivedTerminalChildIds.has(childThreadId);
+      const settleProjectedSessionFailure = (sessionError: string) =>
+        Effect.gen(function* () {
+          const result: ChildWaitResult = {
+            childThreadId,
+            status: "failed",
+            finalAssistantText: null,
+            error: sessionError,
+          };
+          if (options?.prepareWaitFallback) {
+            yield* ensurePromotedWaitFallback(record, childThreadId, result);
+          }
+          yield* settleChild(childThreadId, "failed", sessionError, true);
+        });
       if (shell.session?.status === "error") {
-        const result: ChildWaitResult = {
-          childThreadId,
-          status: "failed",
-          finalAssistantText: null,
-          error: "session error",
-        };
-        if (options?.prepareWaitFallback) {
-          yield* ensurePromotedWaitFallback(record, childThreadId, result);
-        }
-        yield* settleChild(childThreadId, "failed", "session error", true);
+        yield* settleProjectedSessionFailure(shell.session.lastError ?? "session error");
         return;
       }
-      if (shell.latestTurn === null) return;
+      if (shell.latestTurn === null) {
+        if (shell.session?.status === "stopped" && canSettleProjectedStoppedSession) {
+          yield* settleProjectedSessionFailure(shell.session.lastError ?? "session stopped");
+        }
+        return;
+      }
       const terminalTurn = currentLiveProjectedTerminal(childThreadId, shell);
       const turnState = shell.latestTurn.state;
       if (terminalTurn === null) {
+        if (shell.session?.status === "stopped" && canSettleProjectedStoppedSession) {
+          yield* settleProjectedSessionFailure(shell.session.lastError ?? "session stopped");
+          return;
+        }
         if (turnState !== "running") return;
         const activeTurnId = shell.session?.activeTurnId ?? null;
         if (activeTurnId !== null && activeTurnId === shell.latestTurn.turnId) {
@@ -2657,6 +2701,12 @@ const make = Effect.gen(function* () {
               }
               const reportedActiveTurnId = activeTurnReportedBySession(session);
               if (reportedActiveTurnId !== undefined) {
+                if (
+                  activeTurnByReplayedChild.get(threadId) !== reportedActiveTurnId ||
+                  pendingSameTurnStartByReplayedChild.get(threadId) === reportedActiveTurnId
+                ) {
+                  missingDiffWhileRunningByReplayedChild.delete(threadId);
+                }
                 activeTurnByReplayedChild.set(threadId, reportedActiveTurnId);
                 pendingTurnStartByReplayedChild.delete(threadId);
                 pendingSameTurnStartByReplayedChild.delete(threadId);
@@ -2696,15 +2746,16 @@ const make = Effect.gen(function* () {
                   return;
                 }
               }
-              if (
-                shouldSettleTerminalSession({
-                  status: session.status,
-                  turnRunning: runningByChild.get(threadId) === true,
-                  missingDiffWhileRunning: missingDiffWhileRunningByReplayedChild.has(threadId),
-                })
-              ) {
+              if (shouldSettleTerminalSession(session.status)) {
                 const shellOption = yield* getThreadShellBounded(threadId);
-                if (!sessionErrorOwnsProjectedSession(session, shellOption)) {
+                if (
+                  !terminalSessionOwnsProjectedSession({
+                    session,
+                    shell: shellOption,
+                    allowStoppedProjectionLag: missingDiffWhileRunningByReplayedChild.has(threadId),
+                    expectedActiveTurnId: activeTurnByReplayedChild.get(threadId),
+                  })
+                ) {
                   return;
                 }
                 const priorTerminal = terminalByChild.get(threadId);
