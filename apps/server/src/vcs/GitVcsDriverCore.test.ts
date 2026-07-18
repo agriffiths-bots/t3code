@@ -129,7 +129,10 @@ it.effect("uses stable diagnostics for every parsed non-repository command", () 
     assert.deepStrictEqual(commands, [
       { args: ["status", "--porcelain=2", "--branch"], lcAll: "C" },
       { args: ["rev-parse", "--abbrev-ref", "HEAD"], lcAll: "C" },
-      { args: ["for-each-ref", "--format=%(refname)%09%(committerdate:unix)", "refs/heads"], lcAll: "C" },
+      {
+        args: ["for-each-ref", "--format=%(refname)%09%(committerdate:unix)", "refs/heads"],
+        lcAll: "C",
+      },
     ]);
   }).pipe(Effect.provide(layer));
 });
