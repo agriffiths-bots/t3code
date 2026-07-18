@@ -61,6 +61,30 @@ function failAuthorization(command: OrchestrationCommand, detail: string) {
   );
 }
 
+function isFactorySessionAuthority(authority: OrchestrationCommandDispatchAuthority): boolean {
+  return authority.kind === "session" && authority.audienceCeiling === "factory";
+}
+
+function hasThreadCreateWorktreeMetadata(
+  command: Extract<OrchestrationCommand, { type: "thread.create" }>,
+): boolean {
+  return (
+    command.worktreePath !== null ||
+    (command.worktreeRemovalPath ?? null) !== null ||
+    command.worktreeRemovable === true
+  );
+}
+
+function hasThreadMetaWorktreeMutation(
+  command: Extract<OrchestrationCommand, { type: "thread.meta.update" }>,
+): boolean {
+  return (
+    command.worktreePath !== undefined ||
+    command.worktreeRemovalPath !== undefined ||
+    command.worktreeRemovable !== undefined
+  );
+}
+
 function findProject(
   readModel: OrchestrationReadModel,
   projectId: ProjectId,
@@ -75,18 +99,30 @@ function findThread(
   return readModel.threads.find((thread) => thread.id === threadId);
 }
 
-function findActiveProjectWorkspaceRootCollision(input: {
+function findActiveProjectByWorkspaceRoot(input: {
   readonly readModel: OrchestrationReadModel;
   readonly workspaceRoot: string;
-  readonly exceptProjectId: ProjectId;
 }): OrchestrationProject | undefined {
   const normalizedWorkspaceRoot = normalizeProjectPathForComparison(input.workspaceRoot);
   return input.readModel.projects.find(
     (project) =>
       project.deletedAt === null &&
-      project.id !== input.exceptProjectId &&
       normalizeProjectPathForComparison(project.workspaceRoot) === normalizedWorkspaceRoot,
   );
+}
+
+function findActiveProjectWorkspaceRootCollision(input: {
+  readonly readModel: OrchestrationReadModel;
+  readonly workspaceRoot: string;
+  readonly exceptProjectId: ProjectId;
+}): OrchestrationProject | undefined {
+  const existingProject = findActiveProjectByWorkspaceRoot({
+    readModel: input.readModel,
+    workspaceRoot: input.workspaceRoot,
+  });
+  return existingProject !== undefined && existingProject.id !== input.exceptProjectId
+    ? existingProject
+    : undefined;
 }
 
 function collectUnarchivedDescendantThreads(
@@ -211,6 +247,93 @@ function bindProjectCreate(
   return bound;
 }
 
+function requireSameBootstrapProjectAsThread(input: {
+  readonly command: Extract<OrchestrationCommand, { type: "thread.turn.start" }>;
+  readonly thread: OrchestrationThread;
+  readonly project: OrchestrationProject;
+}): Effect.Effect<void, OrchestrationCommandAudienceAuthorizationError> {
+  if (
+    input.thread.projectId !== input.project.id ||
+    input.thread.dataAudience !== input.project.dataAudience
+  ) {
+    return failAuthorization(input.command, threadNotFoundDetail(input.command, input.thread.id));
+  }
+  return Effect.void;
+}
+
+function requireBootstrapSideEffectsAuthorized(input: {
+  readonly command: Extract<OrchestrationCommand, { type: "thread.turn.start" }>;
+  readonly readModel: OrchestrationReadModel;
+  readonly authority: OrchestrationCommandDispatchAuthority;
+  readonly targetProject: OrchestrationProject | undefined;
+  readonly existingThread: OrchestrationThread | undefined;
+}): Effect.Effect<void, OrchestrationCommandAudienceAuthorizationError> {
+  const bootstrap = input.command.bootstrap;
+  if (bootstrap === undefined) {
+    return Effect.void;
+  }
+  if (!isFactorySessionAuthority(input.authority)) {
+    return Effect.void;
+  }
+
+  const createThreadWorktreePath = bootstrap.createThread?.worktreePath ?? null;
+  const createThreadWorktreeRemovalPath = bootstrap.createThread?.worktreeRemovalPath ?? null;
+  if (createThreadWorktreePath !== null || createThreadWorktreeRemovalPath !== null) {
+    if (input.targetProject === undefined) {
+      return failAuthorization(
+        input.command,
+        threadNotFoundDetail(input.command, input.command.threadId),
+      );
+    }
+    return failAuthorization(
+      input.command,
+      projectNotFoundDetail(input.command, input.targetProject.id),
+    );
+  }
+
+  if (bootstrap.runSetupScript === true) {
+    if (input.existingThread !== undefined) {
+      return failAuthorization(
+        input.command,
+        threadNotFoundDetail(input.command, input.command.threadId),
+      );
+    }
+    if (input.targetProject === undefined) {
+      return failAuthorization(
+        input.command,
+        threadNotFoundDetail(input.command, input.command.threadId),
+      );
+    }
+  }
+
+  const prepareWorktree = bootstrap.prepareWorktree;
+  if (prepareWorktree === undefined) {
+    return Effect.void;
+  }
+
+  const targetProject = input.targetProject;
+  if (targetProject === undefined) {
+    return failAuthorization(
+      input.command,
+      threadNotFoundDetail(input.command, input.command.threadId),
+    );
+  }
+
+  const prepareProject = findActiveProjectByWorkspaceRoot({
+    readModel: input.readModel,
+    workspaceRoot: prepareWorktree.projectCwd,
+  });
+  if (
+    prepareProject === undefined ||
+    prepareProject.id !== targetProject.id ||
+    !canAccessAudience(input.authority, prepareProject.dataAudience)
+  ) {
+    return failAuthorization(input.command, projectNotFoundDetail(input.command, targetProject.id));
+  }
+
+  return Effect.void;
+}
+
 export const authorizeOrchestrationCommandMutation = Effect.fn(
   "authorizeOrchestrationCommandMutation",
 )(function* (input: {
@@ -246,7 +369,31 @@ export const authorizeOrchestrationCommandMutation = Effect.fn(
       }
       return bindProjectCreate(command, authority);
     }
-    case "project.meta.update":
+    case "project.meta.update": {
+      yield* requireProjectAudience({
+        command,
+        readModel,
+        authority,
+        projectId: command.projectId,
+      });
+      if (command.workspaceRoot !== undefined) {
+        const workspaceRootCollision = findActiveProjectWorkspaceRootCollision({
+          readModel,
+          workspaceRoot: command.workspaceRoot,
+          exceptProjectId: command.projectId,
+        });
+        if (
+          workspaceRootCollision !== undefined &&
+          !canAccessAudience(authority, workspaceRootCollision.dataAudience)
+        ) {
+          return yield* failAuthorization(
+            command,
+            projectNotFoundDetail(command, command.projectId),
+          );
+        }
+      }
+      return command;
+    }
     case "project.data-audience.set":
     case "project.delete":
       yield* requireProjectAudience({
@@ -271,6 +418,9 @@ export const authorizeOrchestrationCommandMutation = Effect.fn(
         authority,
         projectId: command.projectId,
       });
+      if (isFactorySessionAuthority(authority) && hasThreadCreateWorktreeMetadata(command)) {
+        return yield* failAuthorization(command, projectNotFoundDetail(command, command.projectId));
+      }
       return command;
     }
 
@@ -307,6 +457,7 @@ export const authorizeOrchestrationCommandMutation = Effect.fn(
     case "thread.turn.start": {
       const thread = findThread(readModel, command.threadId);
       let targetAudience: DataAudience;
+      let targetProject: OrchestrationProject | undefined;
       if (thread !== undefined) {
         const authorizedThread = yield* requireThreadAudience({
           command,
@@ -315,6 +466,20 @@ export const authorizeOrchestrationCommandMutation = Effect.fn(
           threadId: command.threadId,
         });
         targetAudience = authorizedThread.dataAudience;
+        if (command.bootstrap?.createThread !== undefined) {
+          const project = yield* requireProjectAudience({
+            command,
+            readModel,
+            authority,
+            projectId: command.bootstrap.createThread.projectId,
+          });
+          yield* requireSameBootstrapProjectAsThread({
+            command,
+            thread: authorizedThread,
+            project,
+          });
+          targetProject = project;
+        }
       } else if (command.bootstrap?.createThread !== undefined) {
         const project = yield* requireProjectAudience({
           command,
@@ -323,9 +488,17 @@ export const authorizeOrchestrationCommandMutation = Effect.fn(
           projectId: command.bootstrap.createThread.projectId,
         });
         targetAudience = project.dataAudience;
+        targetProject = project;
       } else {
         return yield* failAuthorization(command, threadNotFoundDetail(command, command.threadId));
       }
+      yield* requireBootstrapSideEffectsAuthorized({
+        command,
+        readModel,
+        authority,
+        targetProject,
+        existingThread: thread,
+      });
       if (command.sourceProposedPlan !== undefined) {
         const sourceThread = yield* requireThreadAudience({
           command,
@@ -343,9 +516,15 @@ export const authorizeOrchestrationCommandMutation = Effect.fn(
       return command;
     }
 
+    case "thread.meta.update":
+      yield* requireThreadAudience({ command, readModel, authority, threadId: command.threadId });
+      if (isFactorySessionAuthority(authority) && hasThreadMetaWorktreeMutation(command)) {
+        return yield* failAuthorization(command, threadNotFoundDetail(command, command.threadId));
+      }
+      return command;
+
     case "thread.delete":
     case "thread.unarchive":
-    case "thread.meta.update":
     case "thread.runtime-mode.set":
     case "thread.interaction-mode.set":
     case "thread.turn.interrupt":

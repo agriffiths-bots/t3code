@@ -28,6 +28,7 @@ import { VcsStatusBroadcaster } from "../../vcs/VcsStatusBroadcaster.ts";
 import { OrchestrationCommandInvariantError } from "../Errors.ts";
 import {
   authorizeOrchestrationCommandMutation,
+  trustedSystemDispatchAuthority,
   type OrchestrationCommandDispatchAuthority,
 } from "../commandAudienceGuard.ts";
 import { dispatchAlreadyCoordinated, OrchestrationEngineService } from "./OrchestrationEngine.ts";
@@ -46,6 +47,7 @@ const isOrchestrationCommandInvariantError = Schema.is(OrchestrationCommandInvar
 const isOrchestrationDispatchCommandError = Schema.is(OrchestrationDispatchCommandError);
 
 const nowIso = Effect.map(DateTime.now, DateTime.formatIso);
+const bootstrapInternalAuthority = trustedSystemDispatchAuthority("bootstrap-turn-start");
 
 function unexpectedCompatibilityError(error: never): never {
   throw new Error(`Unhandled compatibility error: ${String(error)}`);
@@ -650,7 +652,7 @@ export const layer = Layer.effect(
                 (bootstrap?.prepareWorktree === undefined ? createThread.worktreePath : null),
               createdAt: createThread.createdAt,
             },
-            authority,
+            bootstrapInternalAuthority,
           ).pipe(
             Effect.matchEffect({
               onFailure: (error) => {
@@ -746,7 +748,7 @@ export const layer = Layer.effect(
               worktreeRemovable: preparedWorktreeRemovable,
               worktreeRemovalPath: preparedWorktreeRemovable ? worktree.worktree.path : null,
             },
-            authority,
+            bootstrapInternalAuthority,
           );
           yield* refreshGitStatus(targetWorktreePath);
         }

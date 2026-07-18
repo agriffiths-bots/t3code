@@ -583,6 +583,381 @@ describe("authorizeOrchestrationCommandMutation", () => {
     }),
   );
 
+  it.effect("rejects direct thread.create worktree metadata from factory sessions", () =>
+    Effect.gen(function* () {
+      const exit = yield* authorizeFailureEffect({
+        type: "thread.create",
+        commandId: CommandId.make("cmd-private-guard-thread-create-worktree-path"),
+        threadId: ThreadId.make("thread-factory-command-guard-direct-worktree-path"),
+        projectId: factoryProjectId,
+        title: "Factory direct thread with private cwd",
+        modelSelection,
+        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+        runtimeMode: "full-access",
+        branch: null,
+        worktreePath: "/tmp/private-command-guard",
+        worktreeRemovable: true,
+        worktreeRemovalPath: "/tmp/private-command-guard",
+        createdAt,
+      });
+      const rendered = String(exit);
+      expect(rendered).toContain("Project 'project-factory-command-guard' does not exist");
+      expect(rendered).not.toContain("project-private-command-guard");
+      expect(rendered).not.toContain("/tmp/private-command-guard");
+    }),
+  );
+
+  it.effect("rejects direct thread.meta.update worktree metadata from factory sessions", () =>
+    Effect.gen(function* () {
+      const exit = yield* authorizeFailureEffect({
+        type: "thread.meta.update",
+        commandId: CommandId.make("cmd-private-guard-thread-meta-worktree-path"),
+        threadId: factoryThreadId,
+        worktreePath: "/tmp/private-command-guard",
+        worktreeRemovalPath: "/tmp/private-command-guard",
+        worktreeRemovable: true,
+      });
+      const rendered = String(exit);
+      expect(rendered).toContain("Thread 'thread-factory-command-guard' does not exist");
+      expect(rendered).not.toContain("project-private-command-guard");
+      expect(rendered).not.toContain("/tmp/private-command-guard");
+    }),
+  );
+
+  it.effect("masks hidden project root collisions on project meta update", () =>
+    Effect.gen(function* () {
+      const exit = yield* authorizeFailureEffect({
+        type: "project.meta.update",
+        commandId: CommandId.make("cmd-private-guard-project-meta-root-collision"),
+        projectId: factoryProjectId,
+        workspaceRoot: "/tmp/private-command-guard/",
+      });
+      const rendered = String(exit);
+      expect(rendered).toContain("Project 'project-factory-command-guard' does not exist");
+      expect(rendered).not.toContain("project-private-command-guard");
+      expect(rendered).not.toContain("/tmp/private-command-guard");
+    }),
+  );
+
+  it.effect(
+    "rejects prepareWorktree bootstraps on existing threads before filesystem side effects",
+    () =>
+      Effect.gen(function* () {
+        const exit = yield* authorizeFailureEffect({
+          type: "thread.turn.start",
+          commandId: CommandId.make("cmd-private-guard-existing-thread-prepare-worktree"),
+          threadId: factoryThreadId,
+          message: {
+            messageId: asMessageId("msg-private-guard-existing-thread-prepare-worktree"),
+            role: "user",
+            text: "must not create a private worktree",
+            attachments: [],
+          },
+          interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+          runtimeMode: "full-access",
+          bootstrap: {
+            prepareWorktree: {
+              projectCwd: "/tmp/private-command-guard",
+              baseBranch: "main",
+              branch: "private-side-effect",
+            },
+          },
+          createdAt,
+        });
+        const rendered = String(exit);
+        expect(rendered).toContain("Thread 'thread-factory-command-guard' does not exist");
+        expect(rendered).not.toContain("project-private-command-guard");
+        expect(rendered).not.toContain("/tmp/private-command-guard");
+      }),
+  );
+
+  it.effect(
+    "rejects setup-script bootstrap side effects on existing threads without createThread authorization",
+    () =>
+      Effect.gen(function* () {
+        const exit = yield* authorizeFailureEffect(
+          {
+            type: "thread.turn.start",
+            commandId: CommandId.make("cmd-private-guard-existing-thread-setup-script"),
+            threadId: factoryThreadId,
+            message: {
+              messageId: asMessageId("msg-private-guard-existing-thread-setup-script"),
+              role: "user",
+              text: "must not launch setup from a bare bootstrap",
+              attachments: [],
+            },
+            interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+            runtimeMode: "full-access",
+            bootstrap: {
+              runSetupScript: true,
+            },
+            createdAt,
+          },
+          factoryAuthority,
+          {
+            ...readModel(),
+            threads: readModel().threads.map((thread) =>
+              thread.id === factoryThreadId
+                ? { ...thread, worktreePath: "/tmp/factory-command-guard-worktree" }
+                : thread,
+            ),
+          },
+        );
+        const rendered = String(exit);
+        expect(rendered).toContain("Thread 'thread-factory-command-guard' does not exist");
+        expect(rendered).not.toContain("project-private-command-guard");
+        expect(rendered).not.toContain("/tmp/private-command-guard");
+      }),
+  );
+
+  it.effect("rejects setup-script replays that would reuse an existing hidden worktree path", () =>
+    Effect.gen(function* () {
+      const model = readModel();
+      const exit = yield* authorizeFailureEffect(
+        {
+          type: "thread.turn.start",
+          commandId: CommandId.make("cmd-private-guard-existing-thread-reused-setup-path"),
+          threadId: factoryThreadId,
+          message: {
+            messageId: asMessageId("msg-private-guard-existing-thread-reused-setup-path"),
+            role: "user",
+            text: "must not launch setup from reused hidden metadata",
+            attachments: [],
+          },
+          interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+          runtimeMode: "full-access",
+          bootstrap: {
+            createThread: {
+              projectId: factoryProjectId,
+              title: "Factory replay thread",
+              modelSelection,
+              interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+              runtimeMode: "full-access",
+              branch: null,
+              worktreePath: null,
+              createdAt,
+            },
+            prepareWorktree: {
+              projectCwd: "/tmp/factory-command-guard",
+              baseBranch: "main",
+              branch: "factory-side-effect",
+            },
+            runSetupScript: true,
+          },
+          createdAt,
+        },
+        factoryAuthority,
+        {
+          ...model,
+          threads: model.threads.map((thread) =>
+            thread.id === factoryThreadId
+              ? {
+                  ...thread,
+                  branch: "factory-side-effect",
+                  worktreePath: "/tmp/private-command-guard",
+                }
+              : thread,
+          ),
+        },
+      );
+      const rendered = String(exit);
+      expect(rendered).toContain("Thread 'thread-factory-command-guard' does not exist");
+      expect(rendered).not.toContain("project-private-command-guard");
+      expect(rendered).not.toContain("/tmp/private-command-guard");
+    }),
+  );
+
+  it.effect("rejects bootstrap worktreePath metadata even without setup scripts", () =>
+    Effect.gen(function* () {
+      const exit = yield* authorizeFailureEffect({
+        type: "thread.turn.start",
+        commandId: CommandId.make("cmd-private-guard-create-thread-bare-worktree-path"),
+        threadId: ThreadId.make("thread-factory-command-guard-bare-worktree-path"),
+        message: {
+          messageId: asMessageId("msg-private-guard-create-thread-bare-worktree-path"),
+          role: "user",
+          text: "must not start a turn from a caller-supplied worktree path",
+          attachments: [],
+        },
+        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+        runtimeMode: "full-access",
+        bootstrap: {
+          createThread: {
+            projectId: factoryProjectId,
+            title: "Factory thread with bare provider cwd",
+            modelSelection,
+            interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+            runtimeMode: "full-access",
+            branch: null,
+            worktreePath: "/tmp/private-command-guard",
+            createdAt,
+          },
+        },
+        createdAt,
+      });
+      const rendered = String(exit);
+      expect(rendered).toContain("Project 'project-factory-command-guard' does not exist");
+      expect(rendered).not.toContain("project-private-command-guard");
+      expect(rendered).not.toContain("/tmp/private-command-guard");
+    }),
+  );
+
+  it.effect("rejects bootstrap worktreeRemovalPath metadata even without setup scripts", () =>
+    Effect.gen(function* () {
+      const exit = yield* authorizeFailureEffect({
+        type: "thread.turn.start",
+        commandId: CommandId.make("cmd-private-guard-create-thread-bare-removal-path"),
+        threadId: ThreadId.make("thread-factory-command-guard-bare-removal-path"),
+        message: {
+          messageId: asMessageId("msg-private-guard-create-thread-bare-removal-path"),
+          role: "user",
+          text: "must not persist caller-supplied worktree removal metadata",
+          attachments: [],
+        },
+        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+        runtimeMode: "full-access",
+        bootstrap: {
+          createThread: {
+            projectId: factoryProjectId,
+            title: "Factory thread with bare removal cwd",
+            modelSelection,
+            interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+            runtimeMode: "full-access",
+            branch: null,
+            worktreePath: null,
+            worktreeRemovalPath: "/tmp/private-command-guard",
+            createdAt,
+          },
+        },
+        createdAt,
+      });
+      const rendered = String(exit);
+      expect(rendered).toContain("Project 'project-factory-command-guard' does not exist");
+      expect(rendered).not.toContain("project-private-command-guard");
+      expect(rendered).not.toContain("/tmp/private-command-guard");
+    }),
+  );
+
+  it.effect(
+    "rejects setup-script worktreePath without prepareWorktree even inside the authorized project",
+    () =>
+      Effect.gen(function* () {
+        const exit = yield* authorizeFailureEffect({
+          type: "thread.turn.start",
+          commandId: CommandId.make("cmd-private-guard-create-thread-bare-setup-worktree-path"),
+          threadId: ThreadId.make("thread-factory-command-guard-bare-setup-worktree-path"),
+          message: {
+            messageId: asMessageId("msg-private-guard-create-thread-bare-setup-worktree-path"),
+            role: "user",
+            text: "must not launch setup from a caller-supplied worktree path",
+            attachments: [],
+          },
+          interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+          runtimeMode: "full-access",
+          bootstrap: {
+            createThread: {
+              projectId: factoryProjectId,
+              title: "Factory thread with bare setup cwd",
+              modelSelection,
+              interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+              runtimeMode: "full-access",
+              branch: null,
+              worktreePath: "/tmp/factory-command-guard/link-to-private",
+              createdAt,
+            },
+            runSetupScript: true,
+          },
+          createdAt,
+        });
+        const rendered = String(exit);
+        expect(rendered).toContain("Project 'project-factory-command-guard' does not exist");
+        expect(rendered).not.toContain("project-private-command-guard");
+        expect(rendered).not.toContain("/tmp/private-command-guard");
+      }),
+  );
+
+  it.effect(
+    "allows prepareWorktree when createThread authorizes the same accessible project root",
+    () =>
+      Effect.gen(function* () {
+        const command: OrchestrationCommand = {
+          type: "thread.turn.start",
+          commandId: CommandId.make("cmd-factory-guard-create-thread-prepare-worktree"),
+          threadId: ThreadId.make("thread-factory-command-guard-created-with-worktree"),
+          message: {
+            messageId: asMessageId("msg-factory-guard-create-thread-prepare-worktree"),
+            role: "user",
+            text: "prepare an authorized factory worktree",
+            attachments: [],
+          },
+          interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+          runtimeMode: "full-access",
+          bootstrap: {
+            createThread: {
+              projectId: factoryProjectId,
+              title: "Factory prepared thread",
+              modelSelection,
+              interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+              runtimeMode: "full-access",
+              branch: null,
+              worktreePath: null,
+              createdAt,
+            },
+            prepareWorktree: {
+              projectCwd: "/tmp/factory-command-guard",
+              baseBranch: "main",
+              branch: "factory-side-effect",
+            },
+            runSetupScript: true,
+          },
+          createdAt,
+        };
+        expect(yield* authorizeEffect(command)).toMatchObject(command);
+      }),
+  );
+
+  it.effect(
+    "rejects prepareWorktree whose cwd belongs to a hidden project even when createThread is factory",
+    () =>
+      Effect.gen(function* () {
+        const exit = yield* authorizeFailureEffect({
+          type: "thread.turn.start",
+          commandId: CommandId.make("cmd-private-guard-create-thread-prepare-worktree"),
+          threadId: ThreadId.make("thread-factory-command-guard-hidden-prepare-worktree"),
+          message: {
+            messageId: asMessageId("msg-private-guard-create-thread-prepare-worktree"),
+            role: "user",
+            text: "must not prepare a private worktree",
+            attachments: [],
+          },
+          interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+          runtimeMode: "full-access",
+          bootstrap: {
+            createThread: {
+              projectId: factoryProjectId,
+              title: "Factory thread with private cwd",
+              modelSelection,
+              interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+              runtimeMode: "full-access",
+              branch: null,
+              worktreePath: null,
+              createdAt,
+            },
+            prepareWorktree: {
+              projectCwd: "/tmp/private-command-guard",
+              baseBranch: "main",
+              branch: "private-side-effect",
+            },
+          },
+          createdAt,
+        });
+        const rendered = String(exit);
+        expect(rendered).toContain("Project 'project-factory-command-guard' does not exist");
+        expect(rendered).not.toContain("project-private-command-guard");
+        expect(rendered).not.toContain("/tmp/private-command-guard");
+      }),
+  );
+
   it.effect("rejects unknown target audience fail closed", () =>
     Effect.gen(function* () {
       const exit = yield* authorizeFailureEffect({
