@@ -2738,7 +2738,10 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
       rawPayload: {},
     });
 
-    if (context.turnState && message.parent_tool_use_id === null) {
+    if (
+      context.turnState &&
+      (message.parent_tool_use_id === null || message.parent_tool_use_id === undefined)
+    ) {
       context.turnState.effectiveModel = normalizeClaudeModel(message.message?.model);
     }
 

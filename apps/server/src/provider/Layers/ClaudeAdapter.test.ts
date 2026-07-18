@@ -1252,7 +1252,7 @@ describe("ClaudeAdapterLive", () => {
     );
   });
 
-  it.effect("records the effective model when Claude reroutes a turn", () => {
+  it.effect("records an omitted-parent effective model with multi-model usage", () => {
     const harness = makeHarness();
     return Effect.gen(function* () {
       const adapter = yield* ClaudeAdapter;
@@ -1282,7 +1282,6 @@ describe("ClaudeAdapterLive", () => {
         type: "assistant",
         session_id: "sdk-session-effective-model-rerouted",
         uuid: "assistant-effective-model-rerouted",
-        parent_tool_use_id: null,
         message: {
           id: "assistant-message-effective-model-rerouted",
           model: "claude-opus-4-8",
@@ -1301,6 +1300,10 @@ describe("ClaudeAdapterLive", () => {
           "claude-opus-4-8": {
             contextWindow: 1_000_000,
             maxOutputTokens: 128_000,
+          },
+          "claude-sonnet-5": {
+            contextWindow: 200_000,
+            maxOutputTokens: 64_000,
           },
         },
       } as unknown as SDKMessage);

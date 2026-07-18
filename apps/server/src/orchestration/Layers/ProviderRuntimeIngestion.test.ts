@@ -65,6 +65,7 @@ import { ProjectionSnapshotQuery } from "../Services/ProjectionSnapshotQuery.ts"
 import { readDetailedReadModel } from "../testUtils/readModel.ts";
 import { ServerConfig } from "../../config.ts";
 import { ServerSettingsService } from "../../serverSettings.ts";
+import { isThreadDetailEvent } from "../../ws.ts";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 
 function makeTestServerSettingsLayer(overrides: Partial<ServerSettings> = {}) {
@@ -532,6 +533,15 @@ describe("ProviderRuntimeIngestion", () => {
     expect(await harness.readProjectedEffectiveModel(asThreadId("thread-1"), turnId)).toEqual([
       { effectiveModel: "claude-opus-4-8" },
     ]);
+    const effectiveModelEvent = (await harness.readEvents(0)).find(
+      (event) => event.type === "thread.turn-effective-model-set",
+    );
+    expect(effectiveModelEvent).toBeDefined();
+    if (!effectiveModelEvent) {
+      throw new Error("Expected the effective-model event to be persisted");
+    }
+    // subscribeThread shares this predicate for both live delivery and catch-up replay.
+    expect(isThreadDetailEvent(effectiveModelEvent)).toBe(true);
 
     const codexTurnId = asTurnId("turn-codex-rerouted");
     harness.emit({
