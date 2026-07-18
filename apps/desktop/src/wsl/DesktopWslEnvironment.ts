@@ -32,7 +32,11 @@ export interface EnsureWslNodePtyOptions {
 }
 
 export type EnsureWslNodePtyResult =
-  | { readonly ok: true; readonly nodePath: string; readonly resolvedPath: string }
+  | {
+      readonly ok: true;
+      readonly nodePath: string;
+      readonly resolvedPath: string;
+    }
   | {
       readonly ok: false;
       readonly reason: string;
@@ -222,6 +226,7 @@ export const formatNodePtyProbeFailureReason = (exitCode: number): string | null
 const NODE_PTY_PROBE_SCRIPT = (
   linuxServerDir: string,
 ) => `printf 'nodePath:%s\\n' "$(command -v node 2>/dev/null)"
+printf 'nodeVersion:%s\\n' "$(node -p 'process.versions.node' 2>/dev/null)"
 printf 'resolvedPath:%s\\n' "$PATH"
 cd ${shellQuote(linuxServerDir)} && node <<'NODE' >/dev/null 2>&1
 const fs = require("node:fs");
@@ -307,6 +312,16 @@ export const parseNodePath = (stdout: string): string | null => {
     .map((line) => line.slice("nodePath:".length).trim())
     .find((value) => value.length > 0);
   return path ?? null;
+};
+
+export const parseNodeVersion = (stdout: string): string | null => {
+  const version = stdout
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((line) => line.startsWith("nodeVersion:"))
+    .map((line) => line.slice("nodeVersion:".length).trim())
+    .find((value) => value.length > 0);
+  return version ?? null;
 };
 
 // Captures the login-shell PATH after the shared resolver has loaded version
@@ -395,7 +410,11 @@ const ensureNodePtyImpl = (
 
     const transportFailureReason = formatWslShellTransportFailureReason(probe.transportFailure);
     if (transportFailureReason !== null) {
-      return { ok: false, reason: transportFailureReason, fatal: false } as const;
+      return {
+        ok: false,
+        reason: transportFailureReason,
+        fatal: false,
+      } as const;
     }
 
     // No node at all, even after the shared resolver repaired PATH. Surface
@@ -434,12 +453,45 @@ const ensureNodePtyImpl = (
       } as const;
     }
 
-    if (probe.exitCode === 0) return { ok: true, nodePath, resolvedPath } as const;
+    // Server dependencies (e.g. "effect") couldn't be resolved on the WSL
+    // filesystem — a packaging regression, since the server bundle needs its
+    // node_modules unpacked from the asar. Fatal so wsl-only mode falls back to
+    // Windows and dual mode surfaces the reason inline, instead of the server
+    // crash-looping on ERR_MODULE_NOT_FOUND once it actually launches.
+    if (probe.exitCode === 3) {
+      return {
+        ok: false,
+        reason:
+          "WSL server dependencies could not be loaded (for example \"effect\"). The server's bundled node_modules is not readable by the WSL distro's Node — this is a packaging problem with this build. Please report it.",
+        fatal: true,
+      } as const;
+    }
+
+    if (probe.exitCode === 0) {
+      const rawVersion = parseNodeVersion(probe.stdout);
+      if (
+        rawVersion !== null &&
+        options.nodeEngineRange &&
+        !satisfiesSemverRange(rawVersion, options.nodeEngineRange.trim())
+      ) {
+        const range = options.nodeEngineRange.trim();
+        return {
+          ok: false,
+          reason: `WSL Node.js ${rawVersion} does not satisfy the server's required engine range (${range}). Install a compatible version, and restart the desktop app.`,
+          fatal: true,
+        } as const;
+      }
+      return { ok: true, nodePath, resolvedPath } as const;
+    }
 
     if (options.allowBuild !== true) {
       const packagedProbeFailure = formatNodePtyProbeFailureReason(probe.exitCode);
       if (packagedProbeFailure !== null) {
-        return { ok: false, reason: packagedProbeFailure, fatal: true } as const;
+        return {
+          ok: false,
+          reason: packagedProbeFailure,
+          fatal: true,
+        } as const;
       }
     }
 
