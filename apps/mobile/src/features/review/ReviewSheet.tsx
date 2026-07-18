@@ -57,6 +57,7 @@ import { WorkspaceSidebarToolbar } from "../layout/workspace-sidebar-toolbar";
 import { AndroidThreadGitMenu, ThreadGitMenu } from "../threads/ThreadGitControls";
 import { useReviewCacheForThread } from "./reviewState";
 import {
+  isNativeReviewDiffDrawEvent,
   type NativeReviewDiffViewHandle,
   resolveNativeReviewDiffView,
 } from "../diffs/nativeReviewDiffSurface";
@@ -72,8 +73,10 @@ import { resolveReviewAvailability } from "./reviewAvailability";
 import { resolveSelectedReviewFileId } from "./reviewPaneSelection";
 import { buildReviewSectionMenu } from "./review-section-menu";
 import type { ReviewSectionItem } from "./reviewModel";
+import { markNativeShowcaseReady } from "../showcase/nativeShowcaseScene";
 
 const REVIEW_HEADER_SPACING = 0;
+const SHOWCASE_ENABLED = process.env.EXPO_PUBLIC_SHOWCASE === "1";
 
 const ReviewNotice = memo(function ReviewNotice(props: { readonly notice: string }) {
   return (
@@ -395,6 +398,7 @@ export function ReviewSheet(props: ReviewSheetProps) {
     });
   const NativeReviewDiffView = resolveNativeReviewDiffView()!;
   const nativeReviewDiffViewRef = useRef<NativeReviewDiffViewHandle>(null);
+  const showcasedReviewDrawRef = useRef<string | null>(null);
   // Native pull-to-refresh on the diff surface (replaces the old Refresh menu item).
   const [isPullRefreshing, setIsPullRefreshing] = useState(false);
   const handlePullToRefresh = useCallback(async () => {
@@ -436,6 +440,25 @@ export function ReviewSheet(props: ReviewSheetProps) {
     selectedRowIds: commentSelection.selectedRowIds,
     canHighlight: parsedDiff.kind === "files",
   });
+  const showcaseReviewKey =
+    SHOWCASE_ENABLED && parsedDiff.kind === "files" && selectedSection
+      ? `${reviewCache.threadKey}:${selectedSection.id}:${nativeBridge.tokensResetKey}`
+      : null;
+  const handleNativeDebug = useCallback(
+    (event: NativeSyntheticEvent<Record<string, unknown>>) => {
+      nativeBridge.onDebug(event);
+      if (
+        showcaseReviewKey === null ||
+        showcasedReviewDrawRef.current === showcaseReviewKey ||
+        !isNativeReviewDiffDrawEvent(event.nativeEvent)
+      ) {
+        return;
+      }
+      showcasedReviewDrawRef.current = showcaseReviewKey;
+      markNativeShowcaseReady("review");
+    },
+    [nativeBridge.onDebug, showcaseReviewKey],
+  );
 
   const handleSelectFile = useCallback(
     (fileId: string | null) => {
@@ -802,7 +825,7 @@ export function ReviewSheet(props: ReviewSheetProps) {
                   tokensPatchJson={nativeBridge.tokensPatchJson}
                   tokensResetKey={nativeBridge.tokensResetKey}
                   viewedFileIdsJson={nativeBridge.viewedFileIdsJson}
-                  onDebug={nativeBridge.onDebug}
+                  onDebug={handleNativeDebug}
                   onPressLine={commentSelection.onPressLine}
                   onVisibleFileChange={handleVisibleFileChange}
                   onToggleComment={nativeBridge.onToggleComment}

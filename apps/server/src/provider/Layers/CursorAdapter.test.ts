@@ -232,7 +232,7 @@ cursorAdapterTestLayer("CursorAdapterLive", (it) => {
       assert.isDefined(delta);
       if (delta?.type === "content.delta") {
         assert.equal(delta.payload.delta, "hello from mock");
-        assert.match(String(delta.itemId), /^assistant:mock-session-1:segment:0$/);
+        assert.match(String(delta.itemId), /^assistant:mock-session-1:runtime:[^:]+:segment:0$/);
       }
 
       const assistantCompleted = runtimeEvents.find(
@@ -752,14 +752,20 @@ cursorAdapterTestLayer("CursorAdapterLive", (it) => {
       assert.isDefined(assistantStarted);
       if (assistantStarted?.type === "item.started") {
         assert.equal(String(assistantStarted.turnId), String(activeTurnId));
-        assert.equal(assistantStarted.itemId, "assistant:mock-session-1:segment:0");
+        assert.match(
+          String(assistantStarted.itemId),
+          /^assistant:mock-session-1:runtime:[0-9a-f-]+:segment:0$/,
+        );
       }
 
       const delta = runtimeEvents.find((event) => event.type === "content.delta");
       assert.isDefined(delta);
       if (delta?.type === "content.delta") {
         assert.equal(String(delta.turnId), String(activeTurnId));
-        assert.equal(delta.itemId, "assistant:mock-session-1:segment:0");
+        assert.match(
+          String(delta.itemId),
+          /^assistant:mock-session-1:runtime:[0-9a-f-]+:segment:0$/,
+        );
         assert.equal(delta.payload.delta, " live continuation");
       }
 
@@ -1186,7 +1192,10 @@ cursorAdapterTestLayer("CursorAdapterLive", (it) => {
           if (contentDelta?.type === "content.delta") {
             assert.equal(String(contentDelta.turnId), String(turn.turnId));
             assert.equal(contentDelta.payload.delta, "hello from mock");
-            assert.equal(String(contentDelta.itemId), "assistant:mock-session-1:segment:0");
+            assert.match(
+              String(contentDelta.itemId),
+              /^assistant:mock-session-1:runtime:[^:]+:segment:0$/,
+            );
           }
         });
 
