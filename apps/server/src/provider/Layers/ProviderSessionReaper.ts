@@ -29,6 +29,7 @@ import {
 } from "../Services/ProviderSessionReaper.ts";
 import { ProviderService } from "../Services/ProviderService.ts";
 
+import { trustedSystemDispatchAuthority } from "../../orchestration/commandAudienceGuard.ts";
 const DEFAULT_INACTIVITY_THRESHOLD_MS = 30 * 60 * 1000;
 const DEFAULT_SWEEP_INTERVAL_MS = 5 * 60 * 1000;
 const DEFAULT_PERMISSION_REQUEST_TIMEOUT_MS = 4 * 60 * 60 * 1000;
@@ -235,23 +236,26 @@ const makeProviderSessionReaper = (options?: ProviderSessionReaperLiveOptions) =
         ...(sessionOwnershipId !== undefined ? { sessionOwnershipId } : {}),
         ...(input.allowLegacyActiveTurnMatch === true ? { allowLegacyActiveTurnMatch: true } : {}),
         onOwned: Effect.gen(function* () {
-          yield* orchestrationEngine.dispatch({
-            type: "thread.session.set",
-            commandId: CommandId.make(`provider-turn-watchdog:${key}`),
-            threadId: input.thread.id,
-            session: {
+          yield* orchestrationEngine.dispatch(
+            {
+              type: "thread.session.set",
+              commandId: CommandId.make(`provider-turn-watchdog:${key}`),
               threadId: input.thread.id,
-              status: "error",
-              providerName: input.thread.session?.providerName ?? input.binding.provider,
-              ...(providerInstanceId !== undefined ? { providerInstanceId } : {}),
-              runtimeMode:
-                input.thread.session?.runtimeMode ?? input.binding.runtimeMode ?? "full-access",
-              activeTurnId: null,
-              lastError: input.reason,
-              updatedAt: input.failedAt,
+              session: {
+                threadId: input.thread.id,
+                status: "error",
+                providerName: input.thread.session?.providerName ?? input.binding.provider,
+                ...(providerInstanceId !== undefined ? { providerInstanceId } : {}),
+                runtimeMode:
+                  input.thread.session?.runtimeMode ?? input.binding.runtimeMode ?? "full-access",
+                activeTurnId: null,
+                lastError: input.reason,
+                updatedAt: input.failedAt,
+              },
+              createdAt: input.failedAt,
             },
-            createdAt: input.failedAt,
-          });
+            trustedSystemDispatchAuthority("ProviderSessionReaper"),
+          );
 
           yield* Effect.forEach(
             input.expiredApprovalRequestIds ?? [],
@@ -259,42 +263,48 @@ const makeProviderSessionReaper = (options?: ProviderSessionReaperLiveOptions) =
               // `approval.resolved` is the canonical event consumed by
               // ProjectionPipeline to mark the pending-approval row resolved
               // and decrement the thread shell's pending count.
-              orchestrationEngine.dispatch({
-                type: "thread.activity.append",
-                commandId: CommandId.make(`provider-turn-watchdog:approval:${requestId}`),
-                threadId: input.thread.id,
-                activity: {
-                  id: EventId.make(`provider-turn-watchdog:approval:${requestId}`),
-                  tone: "error",
-                  kind: "approval.resolved",
-                  summary: "Approval request timed out",
-                  payload: { requestId, decision: "cancel" },
-                  turnId: input.turnId,
+              orchestrationEngine.dispatch(
+                {
+                  type: "thread.activity.append",
+                  commandId: CommandId.make(`provider-turn-watchdog:approval:${requestId}`),
+                  threadId: input.thread.id,
+                  activity: {
+                    id: EventId.make(`provider-turn-watchdog:approval:${requestId}`),
+                    tone: "error",
+                    kind: "approval.resolved",
+                    summary: "Approval request timed out",
+                    payload: { requestId, decision: "cancel" },
+                    turnId: input.turnId,
+                    createdAt: input.failedAt,
+                  },
                   createdAt: input.failedAt,
                 },
-                createdAt: input.failedAt,
-              }),
+                trustedSystemDispatchAuthority("ProviderSessionReaper"),
+              ),
             { concurrency: 1 },
           ).pipe(Effect.asVoid);
         }),
         onStopped: Effect.gen(function* () {
-          yield* orchestrationEngine.dispatch({
-            type: "thread.session.set",
-            commandId: CommandId.make(`provider-turn-watchdog:release:${key}`),
-            threadId: input.thread.id,
-            session: {
+          yield* orchestrationEngine.dispatch(
+            {
+              type: "thread.session.set",
+              commandId: CommandId.make(`provider-turn-watchdog:release:${key}`),
               threadId: input.thread.id,
-              status: "stopped",
-              providerName: input.thread.session?.providerName ?? input.binding.provider,
-              ...(providerInstanceId !== undefined ? { providerInstanceId } : {}),
-              runtimeMode:
-                input.thread.session?.runtimeMode ?? input.binding.runtimeMode ?? "full-access",
-              activeTurnId: null,
-              lastError: input.reason,
-              updatedAt: input.failedAt,
+              session: {
+                threadId: input.thread.id,
+                status: "stopped",
+                providerName: input.thread.session?.providerName ?? input.binding.provider,
+                ...(providerInstanceId !== undefined ? { providerInstanceId } : {}),
+                runtimeMode:
+                  input.thread.session?.runtimeMode ?? input.binding.runtimeMode ?? "full-access",
+                activeTurnId: null,
+                lastError: input.reason,
+                updatedAt: input.failedAt,
+              },
+              createdAt: input.failedAt,
             },
-            createdAt: input.failedAt,
-          });
+            trustedSystemDispatchAuthority("ProviderSessionReaper"),
+          );
           yield* persistReleasedBinding({
             binding: input.binding,
             turnId: input.turnId,
@@ -504,29 +514,32 @@ const makeProviderSessionReaper = (options?: ProviderSessionReaperLiveOptions) =
             ...(sessionOwnershipId !== undefined ? { sessionOwnershipId } : {}),
             onOwned: Effect.void,
             onStopped: Effect.gen(function* () {
-              yield* orchestrationEngine.dispatch({
-                type: "thread.session.set",
-                commandId: CommandId.make(
-                  `provider-turn-watchdog:retry-release:${binding.threadId}:${terminalFailedTurn.turnId}`,
-                ),
-                threadId: binding.threadId,
-                session: {
+              yield* orchestrationEngine.dispatch(
+                {
+                  type: "thread.session.set",
+                  commandId: CommandId.make(
+                    `provider-turn-watchdog:retry-release:${binding.threadId}:${terminalFailedTurn.turnId}`,
+                  ),
                   threadId: binding.threadId,
-                  status: "stopped",
-                  providerName: terminalFailedSession.providerName ?? binding.provider,
-                  ...(terminalFailedSession.providerInstanceId !== undefined
-                    ? { providerInstanceId: terminalFailedSession.providerInstanceId }
-                    : binding.providerInstanceId !== undefined
-                      ? { providerInstanceId: binding.providerInstanceId }
-                      : {}),
-                  runtimeMode:
-                    terminalFailedSession.runtimeMode ?? binding.runtimeMode ?? "full-access",
-                  activeTurnId: null,
-                  lastError: reason,
-                  updatedAt: releasedAt,
+                  session: {
+                    threadId: binding.threadId,
+                    status: "stopped",
+                    providerName: terminalFailedSession.providerName ?? binding.provider,
+                    ...(terminalFailedSession.providerInstanceId !== undefined
+                      ? { providerInstanceId: terminalFailedSession.providerInstanceId }
+                      : binding.providerInstanceId !== undefined
+                        ? { providerInstanceId: binding.providerInstanceId }
+                        : {}),
+                    runtimeMode:
+                      terminalFailedSession.runtimeMode ?? binding.runtimeMode ?? "full-access",
+                    activeTurnId: null,
+                    lastError: reason,
+                    updatedAt: releasedAt,
+                  },
+                  createdAt: releasedAt,
                 },
-                createdAt: releasedAt,
-              });
+                trustedSystemDispatchAuthority("ProviderSessionReaper"),
+              );
               yield* persistReleasedBinding({
                 binding,
                 turnId: terminalFailedTurn.turnId,

@@ -94,6 +94,7 @@ import {
   type SubagentsInput,
 } from "./tools.ts";
 
+import { trustedSystemDispatchAuthority } from "../../../orchestration/commandAudienceGuard.ts";
 const nowIso = Effect.map(DateTime.now, DateTime.formatIso);
 const isThreadStartToolError = Schema.is(ThreadStartToolError);
 const isSubagentPeerTargetNotFoundError = Schema.is(
@@ -1077,24 +1078,30 @@ const dispatchParentSet = Effect.fn("SubagentToolkit.dispatchParentSet")(functio
 ) {
   const uuid = yield* runtime.crypto.randomUUIDv4.pipe(Effect.orDie);
   const createdAt = yield* nowIso;
-  yield* runtime.orchestrationEngine.dispatch({
-    type: "thread.parent.set",
-    commandId: CommandId.make(`server:subagent-link:${uuid}`),
-    threadId: childThreadId,
-    parentThreadId,
-    ...(parentEnvironmentId !== undefined ? { parentEnvironmentId } : {}),
-    createdAt,
-  });
+  yield* runtime.orchestrationEngine.dispatch(
+    {
+      type: "thread.parent.set",
+      commandId: CommandId.make(`server:subagent-link:${uuid}`),
+      threadId: childThreadId,
+      parentThreadId,
+      ...(parentEnvironmentId !== undefined ? { parentEnvironmentId } : {}),
+      createdAt,
+    },
+    trustedSystemDispatchAuthority("handlers"),
+  );
 });
 
 const dispatchStartedChildDelete = Effect.fn("SubagentToolkit.dispatchStartedChildDelete")(
   function* (runtime: SubagentRuntime, childThreadId: ThreadId) {
     const uuid = yield* runtime.crypto.randomUUIDv4.pipe(Effect.orDie);
-    yield* runtime.orchestrationEngine.dispatch({
-      type: "thread.delete",
-      commandId: CommandId.make(`server:subagent-cleanup:${uuid}`),
-      threadId: childThreadId,
-    });
+    yield* runtime.orchestrationEngine.dispatch(
+      {
+        type: "thread.delete",
+        commandId: CommandId.make(`server:subagent-cleanup:${uuid}`),
+        threadId: childThreadId,
+      },
+      trustedSystemDispatchAuthority("handlers"),
+    );
   },
 );
 
@@ -1174,16 +1181,19 @@ const steerSubagent = Effect.fn("SubagentToolkit.steer")(function* (input: Steer
   const uuid = yield* runtime.crypto.randomUUIDv4.pipe(Effect.orDie);
   const messageId = MessageId.make(yield* runtime.crypto.randomUUIDv4.pipe(Effect.orDie));
   const createdAt = yield* nowIso;
-  yield* dispatchActive({
-    type: "thread.turn.start",
-    commandId: CommandId.make(`server:subagent-steer:${uuid}`),
-    threadId: input.childThreadId,
-    message: { messageId, role: "user", text: input.message, attachments: [] },
-    runtimeMode: child.runtimeMode,
-    interactionMode: child.interactionMode,
-    bootstrap: undefined,
-    createdAt,
-  }).pipe(Effect.mapError((error) => toToolError(error, "Failed to steer sub-agent.")));
+  yield* dispatchActive(
+    {
+      type: "thread.turn.start",
+      commandId: CommandId.make(`server:subagent-steer:${uuid}`),
+      threadId: input.childThreadId,
+      message: { messageId, role: "user", text: input.message, attachments: [] },
+      runtimeMode: child.runtimeMode,
+      interactionMode: child.interactionMode,
+      bootstrap: undefined,
+      createdAt,
+    },
+    trustedSystemDispatchAuthority("handlers"),
+  ).pipe(Effect.mapError((error) => toToolError(error, "Failed to steer sub-agent.")));
 
   return {
     childThreadId: input.childThreadId,

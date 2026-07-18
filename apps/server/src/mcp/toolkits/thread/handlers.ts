@@ -51,6 +51,7 @@ import {
 } from "./tools.ts";
 import { applyMcpReasoningEffort } from "./reasoningEffort.ts";
 
+import { trustedSystemDispatchAuthority } from "../../../orchestration/commandAudienceGuard.ts";
 const nowIso = Effect.map(DateTime.now, DateTime.formatIso);
 const isThreadStartToolError = Schema.is(ThreadStartToolError);
 const isVcsProcessSpawnError = Schema.is(VcsProcessSpawnError);
@@ -748,49 +749,53 @@ const makeActiveThreadStartRuntime = Effect.fn("ThreadToolkit.makeActiveRuntime"
       return yield* fail("existing_worktree mode requires worktreePath.");
     }
 
-    yield* BootstrapTurnStartDispatcher.dispatchActive({
-      type: "thread.turn.start",
-      commandId: ids.commandId,
-      threadId: ids.threadId,
-      message: {
-        messageId: ids.messageId,
-        role: "user",
-        text: input.prompt,
-        attachments: [],
-      },
-      modelSelection,
-      ...(titleSeed !== undefined ? { titleSeed } : {}),
-      runtimeMode,
-      interactionMode,
-      ...(options?.providerSessionDetached !== undefined
-        ? { providerSessionDetached: options.providerSessionDetached }
-        : {}),
-      bootstrap: {
-        createThread: {
-          projectId: project.id,
-          title,
-          modelSelection,
-          runtimeMode,
-          interactionMode,
-          branch,
-          worktreePath,
-          worktreeRemovable,
-          worktreeRemovalPath,
-          createdAt,
+    yield* BootstrapTurnStartDispatcher.dispatchActive(
+      {
+        type: "thread.turn.start",
+        commandId: ids.commandId,
+        threadId: ids.threadId,
+        message: {
+          messageId: ids.messageId,
+          role: "user",
+          text: input.prompt,
+          attachments: [],
         },
-        ...(prepareWorktree
-          ? {
-              prepareWorktree,
-              // Setup scripts are resolved by the CALLER's projectId; running one
-              // inside an explicitly targeted other repository would execute an
-              // unrelated project's setup command there. Suppressed for
-              // directory targets (explicit true is rejected at input).
-              runSetupScript: explicitDirectoryAllowsSetupScript && (input.runSetupScript ?? true),
-            }
+        modelSelection,
+        ...(titleSeed !== undefined ? { titleSeed } : {}),
+        runtimeMode,
+        interactionMode,
+        ...(options?.providerSessionDetached !== undefined
+          ? { providerSessionDetached: options.providerSessionDetached }
           : {}),
+        bootstrap: {
+          createThread: {
+            projectId: project.id,
+            title,
+            modelSelection,
+            runtimeMode,
+            interactionMode,
+            branch,
+            worktreePath,
+            worktreeRemovable,
+            worktreeRemovalPath,
+            createdAt,
+          },
+          ...(prepareWorktree
+            ? {
+                prepareWorktree,
+                // Setup scripts are resolved by the CALLER's projectId; running one
+                // inside an explicitly targeted other repository would execute an
+                // unrelated project's setup command there. Suppressed for
+                // directory targets (explicit true is rejected at input).
+                runSetupScript:
+                  explicitDirectoryAllowsSetupScript && (input.runSetupScript ?? true),
+              }
+            : {}),
+        },
+        createdAt,
       },
-      createdAt,
-    }).pipe(
+      trustedSystemDispatchAuthority("handlers"),
+    ).pipe(
       Effect.mapError((error) =>
         fail(error instanceof Error ? error.message : "Failed to start child thread."),
       ),
@@ -929,11 +934,14 @@ const makeActiveThreadArchiveRuntime = Effect.fn("ThreadToolkit.makeActiveArchiv
         Effect.mapError((error) => toToolError(error, "Failed to generate archive command id.")),
       );
       const result = yield* orchestrationEngine
-        .dispatch({
-          type: "thread.archive",
-          commandId: CommandId.make(`mcp-admin:thread-archive:${commandUuid}`),
-          threadId: target.id,
-        })
+        .dispatch(
+          {
+            type: "thread.archive",
+            commandId: CommandId.make(`mcp-admin:thread-archive:${commandUuid}`),
+            threadId: target.id,
+          },
+          trustedSystemDispatchAuthority("handlers"),
+        )
         .pipe(
           Effect.mapError((error) => toToolError(error, `Failed to archive thread ${target.id}.`)),
         );

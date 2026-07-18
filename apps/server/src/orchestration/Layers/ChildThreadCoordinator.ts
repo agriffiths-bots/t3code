@@ -63,6 +63,7 @@ import {
   type WaitSliceResult,
 } from "../Services/ChildThreadCoordinator.ts";
 
+import { trustedSystemDispatchAuthority } from "../commandAudienceGuard.ts";
 interface ChildRecord {
   readonly parentThreadId: ThreadId;
   readonly detached: boolean;
@@ -1116,15 +1117,18 @@ const make = Effect.gen(function* () {
     Effect.gen(function* () {
       const messageId = MessageId.make(yield* randomUUID);
       const createdAt = yield* nowIso;
-      yield* dispatchActive({
-        type: "thread.turn.start",
-        commandId,
-        threadId: shell.id,
-        message: { messageId, role: "system", text, attachments: [] },
-        runtimeMode: shell.runtimeMode,
-        interactionMode: shell.interactionMode,
-        createdAt,
-      });
+      yield* dispatchActive(
+        {
+          type: "thread.turn.start",
+          commandId,
+          threadId: shell.id,
+          message: { messageId, role: "system", text, attachments: [] },
+          runtimeMode: shell.runtimeMode,
+          interactionMode: shell.interactionMode,
+          createdAt,
+        },
+        trustedSystemDispatchAuthority("ChildThreadCoordinator"),
+      );
     });
 
   // Dispatch a deferred steer to a now-idle child as a fresh user turn (R-C).
@@ -1137,15 +1141,18 @@ const make = Effect.gen(function* () {
     Effect.gen(function* () {
       const messageId = MessageId.make(yield* randomUUID);
       const createdAt = yield* nowIso;
-      yield* dispatchActive({
-        type: "thread.turn.start",
-        commandId,
-        threadId: shell.id,
-        message: { messageId, role: "user", text, attachments: [] },
-        runtimeMode: shell.runtimeMode,
-        interactionMode: shell.interactionMode,
-        createdAt,
-      });
+      yield* dispatchActive(
+        {
+          type: "thread.turn.start",
+          commandId,
+          threadId: shell.id,
+          message: { messageId, role: "user", text, attachments: [] },
+          runtimeMode: shell.runtimeMode,
+          interactionMode: shell.interactionMode,
+          createdAt,
+        },
+        trustedSystemDispatchAuthority("ChildThreadCoordinator"),
+      );
     });
 
   const appendSubagentActivity = (parentThreadId: ThreadId, result: ChildWaitResult) =>
@@ -1153,25 +1160,28 @@ const make = Effect.gen(function* () {
       const commandId = yield* newCommandId("subagent-activity");
       const activityId = EventId.make(yield* randomUUID);
       const createdAt = yield* nowIso;
-      yield* orchestrationEngine.dispatch({
-        type: "thread.activity.append",
-        commandId,
-        threadId: parentThreadId,
-        activity: {
-          id: activityId,
-          tone: result.status === "completed" ? "info" : "error",
-          kind: "subagent.completed",
-          summary: `Sub-agent ${result.childThreadId} ${result.status}`,
-          payload: {
-            childThreadId: result.childThreadId,
-            status: result.status,
-            error: result.error,
+      yield* orchestrationEngine.dispatch(
+        {
+          type: "thread.activity.append",
+          commandId,
+          threadId: parentThreadId,
+          activity: {
+            id: activityId,
+            tone: result.status === "completed" ? "info" : "error",
+            kind: "subagent.completed",
+            summary: `Sub-agent ${result.childThreadId} ${result.status}`,
+            payload: {
+              childThreadId: result.childThreadId,
+              status: result.status,
+              error: result.error,
+            },
+            turnId: null,
+            createdAt,
           },
-          turnId: null,
           createdAt,
         },
-        createdAt,
-      });
+        trustedSystemDispatchAuthority("ChildThreadCoordinator"),
+      );
     });
 
   // Atomic per-parent idle-check + dispatch: never resume a turnCount-0 parent,

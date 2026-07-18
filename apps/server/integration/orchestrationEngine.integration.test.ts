@@ -37,6 +37,9 @@ import type {
 } from "../src/orchestration/Services/RuntimeReceiptBus.ts";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 
+import { trustedSystemDispatchAuthority } from "../src/orchestration/commandAudienceGuard.ts";
+const testDispatchAuthority = trustedSystemDispatchAuthority("orchestration-test");
+
 const asMessageId = (value: string): MessageId => MessageId.make(value);
 const asProjectId = (value: string): ProjectId => ProjectId.make(value);
 const asEventId = (value: string): EventId => EventId.make(value);
@@ -123,35 +126,41 @@ const seedProjectAndThread = (harness: OrchestrationIntegrationHarness) =>
     const defaultModel = DEFAULT_MODEL_BY_PROVIDER[provider] ?? DEFAULT_MODEL;
     const instanceId = defaultInstanceIdForDriver(provider);
 
-    yield* harness.engine.dispatch({
-      type: "project.create",
-      commandId: CommandId.make("cmd-project-create"),
-      projectId: PROJECT_ID,
-      title: "Integration Project",
-      workspaceRoot: harness.workspaceDir,
-      defaultModelSelection: {
-        instanceId,
-        model: defaultModel,
+    yield* harness.engine.dispatch(
+      {
+        type: "project.create",
+        commandId: CommandId.make("cmd-project-create"),
+        projectId: PROJECT_ID,
+        title: "Integration Project",
+        workspaceRoot: harness.workspaceDir,
+        defaultModelSelection: {
+          instanceId,
+          model: defaultModel,
+        },
+        createdAt,
       },
-      createdAt,
-    });
+      testDispatchAuthority,
+    );
 
-    yield* harness.engine.dispatch({
-      type: "thread.create",
-      commandId: CommandId.make("cmd-thread-create"),
-      threadId: THREAD_ID,
-      projectId: PROJECT_ID,
-      title: "Integration Thread",
-      modelSelection: {
-        instanceId,
-        model: defaultModel,
+    yield* harness.engine.dispatch(
+      {
+        type: "thread.create",
+        commandId: CommandId.make("cmd-thread-create"),
+        threadId: THREAD_ID,
+        projectId: PROJECT_ID,
+        title: "Integration Thread",
+        modelSelection: {
+          instanceId,
+          model: defaultModel,
+        },
+        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+        runtimeMode: "approval-required",
+        branch: null,
+        worktreePath: harness.workspaceDir,
+        createdAt,
       },
-      interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
-      runtimeMode: "approval-required",
-      branch: null,
-      worktreePath: harness.workspaceDir,
-      createdAt,
-    });
+      testDispatchAuthority,
+    );
   });
 
 const startTurn = (input: {
@@ -162,25 +171,28 @@ const startTurn = (input: {
   readonly modelSelection?: ModelSelection;
   readonly createdAt?: string;
 }) =>
-  input.harness.engine.dispatch({
-    type: "thread.turn.start",
-    commandId: CommandId.make(input.commandId),
-    threadId: THREAD_ID,
-    message: {
-      messageId: asMessageId(input.messageId),
-      role: "user",
-      text: input.text,
-      attachments: [],
+  input.harness.engine.dispatch(
+    {
+      type: "thread.turn.start",
+      commandId: CommandId.make(input.commandId),
+      threadId: THREAD_ID,
+      message: {
+        messageId: asMessageId(input.messageId),
+        role: "user",
+        text: input.text,
+        attachments: [],
+      },
+      ...(input.modelSelection !== undefined
+        ? {
+            modelSelection: input.modelSelection,
+          }
+        : {}),
+      interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+      runtimeMode: "approval-required",
+      createdAt: input.createdAt ?? nowIso(),
     },
-    ...(input.modelSelection !== undefined
-      ? {
-          modelSelection: input.modelSelection,
-        }
-      : {}),
-    interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
-    runtimeMode: "approval-required",
-    createdAt: input.createdAt ?? nowIso(),
-  });
+    testDispatchAuthority,
+  );
 
 it.live("runs a single turn end-to-end and persists checkpoint state in sqlite + git", () =>
   withHarness((harness) =>
@@ -273,50 +285,59 @@ it.live.skipIf(!process.env.CODEX_BINARY_PATH)(
       Effect.gen(function* () {
         const createdAt = nowIso();
 
-        yield* harness.engine.dispatch({
-          type: "project.create",
-          commandId: CommandId.make("cmd-project-create-real-codex"),
-          projectId: PROJECT_ID,
-          title: "Integration Project",
-          workspaceRoot: harness.workspaceDir,
-          defaultModelSelection: {
-            instanceId: ProviderInstanceId.make("codex"),
-            model: "gpt-5.3-codex",
+        yield* harness.engine.dispatch(
+          {
+            type: "project.create",
+            commandId: CommandId.make("cmd-project-create-real-codex"),
+            projectId: PROJECT_ID,
+            title: "Integration Project",
+            workspaceRoot: harness.workspaceDir,
+            defaultModelSelection: {
+              instanceId: ProviderInstanceId.make("codex"),
+              model: "gpt-5.3-codex",
+            },
+            createdAt,
           },
-          createdAt,
-        });
+          testDispatchAuthority,
+        );
 
-        yield* harness.engine.dispatch({
-          type: "thread.create",
-          commandId: CommandId.make("cmd-thread-create-real-codex"),
-          threadId: THREAD_ID,
-          projectId: PROJECT_ID,
-          title: "Integration Thread",
-          modelSelection: {
-            instanceId: ProviderInstanceId.make("codex"),
-            model: "gpt-5.3-codex",
+        yield* harness.engine.dispatch(
+          {
+            type: "thread.create",
+            commandId: CommandId.make("cmd-thread-create-real-codex"),
+            threadId: THREAD_ID,
+            projectId: PROJECT_ID,
+            title: "Integration Thread",
+            modelSelection: {
+              instanceId: ProviderInstanceId.make("codex"),
+              model: "gpt-5.3-codex",
+            },
+            interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+            runtimeMode: "full-access",
+            branch: null,
+            worktreePath: harness.workspaceDir,
+            createdAt,
           },
-          interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
-          runtimeMode: "full-access",
-          branch: null,
-          worktreePath: harness.workspaceDir,
-          createdAt,
-        });
+          testDispatchAuthority,
+        );
 
-        yield* harness.engine.dispatch({
-          type: "thread.turn.start",
-          commandId: CommandId.make("cmd-turn-start-real-codex-1"),
-          threadId: THREAD_ID,
-          message: {
-            messageId: asMessageId("msg-real-codex-1"),
-            role: "user",
-            text: "Reply with exactly ALPHA.",
-            attachments: [],
+        yield* harness.engine.dispatch(
+          {
+            type: "thread.turn.start",
+            commandId: CommandId.make("cmd-turn-start-real-codex-1"),
+            threadId: THREAD_ID,
+            message: {
+              messageId: asMessageId("msg-real-codex-1"),
+              role: "user",
+              text: "Reply with exactly ALPHA.",
+              attachments: [],
+            },
+            interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+            runtimeMode: "full-access",
+            createdAt: nowIso(),
           },
-          interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
-          runtimeMode: "full-access",
-          createdAt: nowIso(),
-        });
+          testDispatchAuthority,
+        );
 
         const firstThread = yield* harness.waitForThread(
           THREAD_ID,
@@ -330,20 +351,23 @@ it.live.skipIf(!process.env.CODEX_BINARY_PATH)(
         );
         assert.equal(firstThread.session?.threadId, "thread-1");
 
-        yield* harness.engine.dispatch({
-          type: "thread.turn.start",
-          commandId: CommandId.make("cmd-turn-start-real-codex-2"),
-          threadId: THREAD_ID,
-          message: {
-            messageId: asMessageId("msg-real-codex-2"),
-            role: "user",
-            text: "Reply with exactly BETA.",
-            attachments: [],
+        yield* harness.engine.dispatch(
+          {
+            type: "thread.turn.start",
+            commandId: CommandId.make("cmd-turn-start-real-codex-2"),
+            threadId: THREAD_ID,
+            message: {
+              messageId: asMessageId("msg-real-codex-2"),
+              role: "user",
+              text: "Reply with exactly BETA.",
+              attachments: [],
+            },
+            interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+            runtimeMode: "approval-required",
+            createdAt: nowIso(),
           },
-          interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
-          runtimeMode: "approval-required",
-          createdAt: nowIso(),
-        });
+          testDispatchAuthority,
+        );
 
         const secondThread = yield* harness.waitForThread(
           THREAD_ID,
@@ -597,14 +621,17 @@ it.live("tracks approval requests and resolves pending approvals on user respons
       );
       assert.equal(pendingRow.status, "pending");
 
-      yield* harness.engine.dispatch({
-        type: "thread.approval.respond",
-        commandId: CommandId.make("cmd-approval-respond"),
-        threadId: THREAD_ID,
-        requestId: APPROVAL_REQUEST_ID,
-        decision: "accept",
-        createdAt: nowIso(),
-      });
+      yield* harness.engine.dispatch(
+        {
+          type: "thread.approval.respond",
+          commandId: CommandId.make("cmd-approval-respond"),
+          threadId: THREAD_ID,
+          requestId: APPROVAL_REQUEST_ID,
+          decision: "accept",
+          createdAt: nowIso(),
+        },
+        testDispatchAuthority,
+      );
 
       const resolvedRow = yield* harness.waitForPendingApproval(
         "req-approval-1",
@@ -831,13 +858,16 @@ it.live("reverts to an earlier checkpoint and trims checkpoint projections + git
         8000,
       );
 
-      yield* harness.engine.dispatch({
-        type: "thread.checkpoint.revert",
-        commandId: CommandId.make("cmd-checkpoint-revert"),
-        threadId: THREAD_ID,
-        turnCount: 1,
-        createdAt: nowIso(),
-      });
+      yield* harness.engine.dispatch(
+        {
+          type: "thread.checkpoint.revert",
+          commandId: CommandId.make("cmd-checkpoint-revert"),
+          threadId: THREAD_ID,
+          turnCount: 1,
+          createdAt: nowIso(),
+        },
+        testDispatchAuthority,
+      );
 
       yield* harness.waitForDomainEvent((event) => event.type === "thread.reverted");
       const revertedThread = yield* harness.waitForThread(
@@ -894,13 +924,16 @@ it.live(
       Effect.gen(function* () {
         yield* seedProjectAndThread(harness);
 
-        yield* harness.engine.dispatch({
-          type: "thread.checkpoint.revert",
-          commandId: CommandId.make("cmd-checkpoint-revert-no-session"),
-          threadId: THREAD_ID,
-          turnCount: 0,
-          createdAt: nowIso(),
-        });
+        yield* harness.engine.dispatch(
+          {
+            type: "thread.checkpoint.revert",
+            commandId: CommandId.make("cmd-checkpoint-revert-no-session"),
+            threadId: THREAD_ID,
+            turnCount: 0,
+            createdAt: nowIso(),
+          },
+          testDispatchAuthority,
+        );
 
         const thread = yield* harness.waitForThread(THREAD_ID, (entry) =>
           entry.activities.some(
@@ -1186,14 +1219,17 @@ it.live("forwards claudeAgent approval responses to the provider session", () =>
         );
         assert.equal(thread.session?.threadId, "thread-1");
 
-        yield* harness.engine.dispatch({
-          type: "thread.approval.respond",
-          commandId: CommandId.make("cmd-claude-approval-respond"),
-          threadId: THREAD_ID,
-          requestId: APPROVAL_REQUEST_ID,
-          decision: "accept",
-          createdAt: nowIso(),
-        });
+        yield* harness.engine.dispatch(
+          {
+            type: "thread.approval.respond",
+            commandId: CommandId.make("cmd-claude-approval-respond"),
+            threadId: THREAD_ID,
+            requestId: APPROVAL_REQUEST_ID,
+            decision: "accept",
+            createdAt: nowIso(),
+          },
+          testDispatchAuthority,
+        );
 
         yield* harness.waitForPendingApproval(
           "req-approval-1",
@@ -1271,12 +1307,15 @@ it.live("forwards thread.turn.interrupt to claudeAgent provider sessions", () =>
         );
         assert.equal(thread.session?.threadId, "thread-1");
 
-        yield* harness.engine.dispatch({
-          type: "thread.turn.interrupt",
-          commandId: CommandId.make("cmd-turn-interrupt-claude"),
-          threadId: THREAD_ID,
-          createdAt: nowIso(),
-        });
+        yield* harness.engine.dispatch(
+          {
+            type: "thread.turn.interrupt",
+            commandId: CommandId.make("cmd-turn-interrupt-claude"),
+            threadId: THREAD_ID,
+            createdAt: nowIso(),
+          },
+          testDispatchAuthority,
+        );
         yield* harness.waitForDomainEvent(
           (event) => event.type === "thread.turn-interrupt-requested",
         );
@@ -1412,13 +1451,16 @@ it.live("reverts claudeAgent turns and rolls back provider conversation state", 
             entry.session?.providerName === "claudeAgent",
         );
 
-        yield* harness.engine.dispatch({
-          type: "thread.checkpoint.revert",
-          commandId: CommandId.make("cmd-checkpoint-revert-claude"),
-          threadId: THREAD_ID,
-          turnCount: 1,
-          createdAt: nowIso(),
-        });
+        yield* harness.engine.dispatch(
+          {
+            type: "thread.checkpoint.revert",
+            commandId: CommandId.make("cmd-checkpoint-revert-claude"),
+            threadId: THREAD_ID,
+            turnCount: 1,
+            createdAt: nowIso(),
+          },
+          testDispatchAuthority,
+        );
 
         const revertedThread = yield* harness.waitForThread(
           THREAD_ID,

@@ -59,6 +59,9 @@ import { ServerConfig } from "../../config.ts";
 import * as WorkspaceEntries from "../../workspace/WorkspaceEntries.ts";
 import * as WorkspacePaths from "../../workspace/WorkspacePaths.ts";
 
+import { trustedSystemDispatchAuthority } from "../commandAudienceGuard.ts";
+const testDispatchAuthority = trustedSystemDispatchAuthority("orchestration-test");
+
 const asProjectId = (value: string): ProjectId => ProjectId.make(value);
 const asTurnId = (value: string): TurnId => TurnId.make(value);
 
@@ -358,36 +361,42 @@ describe("CheckpointReactor", () => {
 
     const createdAt = "2026-01-01T00:00:00.000Z";
     await Effect.runPromise(
-      engine.dispatch({
-        type: "project.create",
-        commandId: CommandId.make("cmd-project-create"),
-        projectId: asProjectId("project-1"),
-        title: "Test Project",
-        workspaceRoot: options?.projectWorkspaceRoot ?? cwd,
-        defaultModelSelection: {
-          instanceId: ProviderInstanceId.make("codex"),
-          model: "gpt-5-codex",
+      engine.dispatch(
+        {
+          type: "project.create",
+          commandId: CommandId.make("cmd-project-create"),
+          projectId: asProjectId("project-1"),
+          title: "Test Project",
+          workspaceRoot: options?.projectWorkspaceRoot ?? cwd,
+          defaultModelSelection: {
+            instanceId: ProviderInstanceId.make("codex"),
+            model: "gpt-5-codex",
+          },
+          createdAt,
         },
-        createdAt,
-      }),
+        testDispatchAuthority,
+      ),
     );
     await Effect.runPromise(
-      engine.dispatch({
-        type: "thread.create",
-        commandId: CommandId.make("cmd-thread-create"),
-        threadId: ThreadId.make("thread-1"),
-        projectId: asProjectId("project-1"),
-        title: "Thread",
-        modelSelection: {
-          instanceId: ProviderInstanceId.make("codex"),
-          model: "gpt-5-codex",
+      engine.dispatch(
+        {
+          type: "thread.create",
+          commandId: CommandId.make("cmd-thread-create"),
+          threadId: ThreadId.make("thread-1"),
+          projectId: asProjectId("project-1"),
+          title: "Thread",
+          modelSelection: {
+            instanceId: ProviderInstanceId.make("codex"),
+            model: "gpt-5-codex",
+          },
+          interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+          runtimeMode: "approval-required",
+          branch: null,
+          worktreePath: options?.threadWorktreePath ?? cwd,
+          createdAt,
         },
-        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
-        runtimeMode: "approval-required",
-        branch: null,
-        worktreePath: options?.threadWorktreePath ?? cwd,
-        createdAt,
-      }),
+        testDispatchAuthority,
+      ),
     );
 
     if (options?.seedFilesystemCheckpoints ?? true) {
@@ -427,21 +436,24 @@ describe("CheckpointReactor", () => {
     const createdAt = "2026-01-01T00:00:00.000Z";
 
     await Effect.runPromise(
-      harness.engine.dispatch({
-        type: "thread.session.set",
-        commandId: CommandId.make("cmd-session-set-capture"),
-        threadId: ThreadId.make("thread-1"),
-        session: {
+      harness.engine.dispatch(
+        {
+          type: "thread.session.set",
+          commandId: CommandId.make("cmd-session-set-capture"),
           threadId: ThreadId.make("thread-1"),
-          status: "ready",
-          providerName: "codex",
-          runtimeMode: "approval-required",
-          activeTurnId: null,
-          lastError: null,
-          updatedAt: createdAt,
+          session: {
+            threadId: ThreadId.make("thread-1"),
+            status: "ready",
+            providerName: "codex",
+            runtimeMode: "approval-required",
+            activeTurnId: null,
+            lastError: null,
+            updatedAt: createdAt,
+          },
+          createdAt,
         },
-        createdAt,
-      }),
+        testDispatchAuthority,
+      ),
     );
 
     harness.provider.emit({
@@ -525,21 +537,24 @@ describe("CheckpointReactor", () => {
     const createdAt = "2026-01-01T00:00:00.000Z";
 
     await Effect.runPromise(
-      harness.engine.dispatch({
-        type: "thread.session.set",
-        commandId: CommandId.make("cmd-session-set-primary-running"),
-        threadId: ThreadId.make("thread-1"),
-        session: {
+      harness.engine.dispatch(
+        {
+          type: "thread.session.set",
+          commandId: CommandId.make("cmd-session-set-primary-running"),
           threadId: ThreadId.make("thread-1"),
-          status: "running",
-          providerName: "codex",
-          runtimeMode: "approval-required",
-          activeTurnId: asTurnId("turn-main"),
-          lastError: null,
-          updatedAt: createdAt,
+          session: {
+            threadId: ThreadId.make("thread-1"),
+            status: "running",
+            providerName: "codex",
+            runtimeMode: "approval-required",
+            activeTurnId: asTurnId("turn-main"),
+            lastError: null,
+            updatedAt: createdAt,
+          },
+          createdAt,
         },
-        createdAt,
-      }),
+        testDispatchAuthority,
+      ),
     );
 
     harness.provider.emit({
@@ -600,21 +615,24 @@ describe("CheckpointReactor", () => {
     const createdAt = "2026-01-01T00:00:00.000Z";
 
     await Effect.runPromise(
-      harness.engine.dispatch({
-        type: "thread.session.set",
-        commandId: CommandId.make("cmd-session-set-capture-claude"),
-        threadId: ThreadId.make("thread-1"),
-        session: {
+      harness.engine.dispatch(
+        {
+          type: "thread.session.set",
+          commandId: CommandId.make("cmd-session-set-capture-claude"),
           threadId: ThreadId.make("thread-1"),
-          status: "ready",
-          providerName: "claudeAgent",
-          runtimeMode: "approval-required",
-          activeTurnId: null,
-          lastError: null,
-          updatedAt: createdAt,
+          session: {
+            threadId: ThreadId.make("thread-1"),
+            status: "ready",
+            providerName: "claudeAgent",
+            runtimeMode: "approval-required",
+            activeTurnId: null,
+            lastError: null,
+            updatedAt: createdAt,
+          },
+          createdAt,
         },
-        createdAt,
-      }),
+        testDispatchAuthority,
+      ),
     );
 
     harness.provider.emit({
@@ -658,21 +676,24 @@ describe("CheckpointReactor", () => {
     const createdAt = "2026-01-01T00:00:00.000Z";
 
     await Effect.runPromise(
-      harness.engine.dispatch({
-        type: "thread.session.set",
-        commandId: CommandId.make("cmd-session-set-missing-baseline-diff"),
-        threadId: ThreadId.make("thread-1"),
-        session: {
+      harness.engine.dispatch(
+        {
+          type: "thread.session.set",
+          commandId: CommandId.make("cmd-session-set-missing-baseline-diff"),
           threadId: ThreadId.make("thread-1"),
-          status: "ready",
-          providerName: "codex",
-          runtimeMode: "approval-required",
-          activeTurnId: null,
-          lastError: null,
-          updatedAt: createdAt,
+          session: {
+            threadId: ThreadId.make("thread-1"),
+            status: "ready",
+            providerName: "codex",
+            runtimeMode: "approval-required",
+            activeTurnId: null,
+            lastError: null,
+            updatedAt: createdAt,
+          },
+          createdAt,
         },
-        createdAt,
-      }),
+        testDispatchAuthority,
+      ),
     );
 
     harness.provider.emit({
@@ -708,20 +729,23 @@ describe("CheckpointReactor", () => {
     });
 
     await Effect.runPromise(
-      harness.engine.dispatch({
-        type: "thread.turn.start",
-        commandId: CommandId.make("cmd-turn-start-for-baseline"),
-        threadId: ThreadId.make("thread-1"),
-        message: {
-          messageId: MessageId.make("message-user-1"),
-          role: "user",
-          text: "start turn",
-          attachments: [],
+      harness.engine.dispatch(
+        {
+          type: "thread.turn.start",
+          commandId: CommandId.make("cmd-turn-start-for-baseline"),
+          threadId: ThreadId.make("thread-1"),
+          message: {
+            messageId: MessageId.make("message-user-1"),
+            role: "user",
+            text: "start turn",
+            attachments: [],
+          },
+          interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+          runtimeMode: "approval-required",
+          createdAt: "2026-01-01T00:00:00.000Z",
         },
-        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
-        runtimeMode: "approval-required",
-        createdAt: "2026-01-01T00:00:00.000Z",
-      }),
+        testDispatchAuthority,
+      ),
     );
 
     await waitForGitRefExists(
@@ -746,21 +770,24 @@ describe("CheckpointReactor", () => {
     const createdAt = "2026-01-01T00:00:00.000Z";
 
     await Effect.runPromise(
-      harness.engine.dispatch({
-        type: "thread.session.set",
-        commandId: CommandId.make("cmd-session-set-missing-provider-cwd"),
-        threadId: ThreadId.make("thread-1"),
-        session: {
+      harness.engine.dispatch(
+        {
+          type: "thread.session.set",
+          commandId: CommandId.make("cmd-session-set-missing-provider-cwd"),
           threadId: ThreadId.make("thread-1"),
-          status: "running",
-          providerName: "codex",
-          runtimeMode: "approval-required",
-          activeTurnId: asTurnId("turn-missing-cwd"),
-          lastError: null,
-          updatedAt: createdAt,
+          session: {
+            threadId: ThreadId.make("thread-1"),
+            status: "running",
+            providerName: "codex",
+            runtimeMode: "approval-required",
+            activeTurnId: asTurnId("turn-missing-cwd"),
+            lastError: null,
+            updatedAt: createdAt,
+          },
+          createdAt,
         },
-        createdAt,
-      }),
+        testDispatchAuthority,
+      ),
     );
 
     NodeFS.writeFileSync(NodePath.join(harness.cwd, "README.md"), "v2\n", "utf8");
@@ -793,21 +820,24 @@ describe("CheckpointReactor", () => {
     const createdAt = "2026-01-01T00:00:00.000Z";
 
     await Effect.runPromise(
-      harness.engine.dispatch({
-        type: "thread.session.set",
-        commandId: CommandId.make("cmd-session-set-checkpoint-captured"),
-        threadId: ThreadId.make("thread-1"),
-        session: {
+      harness.engine.dispatch(
+        {
+          type: "thread.session.set",
+          commandId: CommandId.make("cmd-session-set-checkpoint-captured"),
           threadId: ThreadId.make("thread-1"),
-          status: "ready",
-          providerName: "codex",
-          runtimeMode: "approval-required",
-          activeTurnId: null,
-          lastError: null,
-          updatedAt: createdAt,
+          session: {
+            threadId: ThreadId.make("thread-1"),
+            status: "ready",
+            providerName: "codex",
+            runtimeMode: "approval-required",
+            activeTurnId: null,
+            lastError: null,
+            updatedAt: createdAt,
+          },
+          createdAt,
         },
-        createdAt,
-      }),
+        testDispatchAuthority,
+      ),
     );
 
     harness.provider.emit({
@@ -843,21 +873,24 @@ describe("CheckpointReactor", () => {
     const createdAt = "2026-01-01T00:00:00.000Z";
 
     await Effect.runPromise(
-      harness.engine.dispatch({
-        type: "thread.session.set",
-        commandId: CommandId.make("cmd-session-set-non-repo-runtime"),
-        threadId: ThreadId.make("thread-1"),
-        session: {
+      harness.engine.dispatch(
+        {
+          type: "thread.session.set",
+          commandId: CommandId.make("cmd-session-set-non-repo-runtime"),
           threadId: ThreadId.make("thread-1"),
-          status: "ready",
-          providerName: "codex",
-          runtimeMode: "approval-required",
-          activeTurnId: null,
-          lastError: null,
-          updatedAt: createdAt,
+          session: {
+            threadId: ThreadId.make("thread-1"),
+            status: "ready",
+            providerName: "codex",
+            runtimeMode: "approval-required",
+            activeTurnId: null,
+            lastError: null,
+            updatedAt: createdAt,
+          },
+          createdAt,
         },
-        createdAt,
-      }),
+        testDispatchAuthority,
+      ),
     );
 
     harness.provider.emit({
@@ -895,60 +928,72 @@ describe("CheckpointReactor", () => {
     const createdAt = "2026-01-01T00:00:00.000Z";
 
     await Effect.runPromise(
-      harness.engine.dispatch({
-        type: "thread.session.set",
-        commandId: CommandId.make("cmd-session-set"),
-        threadId: ThreadId.make("thread-1"),
-        session: {
+      harness.engine.dispatch(
+        {
+          type: "thread.session.set",
+          commandId: CommandId.make("cmd-session-set"),
           threadId: ThreadId.make("thread-1"),
-          status: "ready",
-          providerName: "codex",
-          runtimeMode: "approval-required",
-          activeTurnId: null,
-          lastError: null,
-          updatedAt: createdAt,
+          session: {
+            threadId: ThreadId.make("thread-1"),
+            status: "ready",
+            providerName: "codex",
+            runtimeMode: "approval-required",
+            activeTurnId: null,
+            lastError: null,
+            updatedAt: createdAt,
+          },
+          createdAt,
         },
-        createdAt,
-      }),
+        testDispatchAuthority,
+      ),
     );
 
     await Effect.runPromise(
-      harness.engine.dispatch({
-        type: "thread.turn.diff.complete",
-        commandId: CommandId.make("cmd-diff-1"),
-        threadId: ThreadId.make("thread-1"),
-        turnId: asTurnId("turn-1"),
-        completedAt: createdAt,
-        checkpointRef: checkpointRefForThreadTurn(ThreadId.make("thread-1"), 1),
-        status: "ready",
-        files: [],
-        checkpointTurnCount: 1,
-        createdAt,
-      }),
+      harness.engine.dispatch(
+        {
+          type: "thread.turn.diff.complete",
+          commandId: CommandId.make("cmd-diff-1"),
+          threadId: ThreadId.make("thread-1"),
+          turnId: asTurnId("turn-1"),
+          completedAt: createdAt,
+          checkpointRef: checkpointRefForThreadTurn(ThreadId.make("thread-1"), 1),
+          status: "ready",
+          files: [],
+          checkpointTurnCount: 1,
+          createdAt,
+        },
+        testDispatchAuthority,
+      ),
     );
     await Effect.runPromise(
-      harness.engine.dispatch({
-        type: "thread.turn.diff.complete",
-        commandId: CommandId.make("cmd-diff-2"),
-        threadId: ThreadId.make("thread-1"),
-        turnId: asTurnId("turn-2"),
-        completedAt: createdAt,
-        checkpointRef: checkpointRefForThreadTurn(ThreadId.make("thread-1"), 2),
-        status: "ready",
-        files: [],
-        checkpointTurnCount: 2,
-        createdAt,
-      }),
+      harness.engine.dispatch(
+        {
+          type: "thread.turn.diff.complete",
+          commandId: CommandId.make("cmd-diff-2"),
+          threadId: ThreadId.make("thread-1"),
+          turnId: asTurnId("turn-2"),
+          completedAt: createdAt,
+          checkpointRef: checkpointRefForThreadTurn(ThreadId.make("thread-1"), 2),
+          status: "ready",
+          files: [],
+          checkpointTurnCount: 2,
+          createdAt,
+        },
+        testDispatchAuthority,
+      ),
     );
 
     await Effect.runPromise(
-      harness.engine.dispatch({
-        type: "thread.checkpoint.revert",
-        commandId: CommandId.make("cmd-revert-request"),
-        threadId: ThreadId.make("thread-1"),
-        turnCount: 1,
-        createdAt,
-      }),
+      harness.engine.dispatch(
+        {
+          type: "thread.checkpoint.revert",
+          commandId: CommandId.make("cmd-revert-request"),
+          threadId: ThreadId.make("thread-1"),
+          turnCount: 1,
+          createdAt,
+        },
+        testDispatchAuthority,
+      ),
     );
 
     await waitForEvent(harness.engine, (event) => event.type === "thread.reverted");
@@ -976,60 +1021,72 @@ describe("CheckpointReactor", () => {
     const createdAt = "2026-01-01T00:00:00.000Z";
 
     await Effect.runPromise(
-      harness.engine.dispatch({
-        type: "thread.session.set",
-        commandId: CommandId.make("cmd-session-set-claude"),
-        threadId: ThreadId.make("thread-1"),
-        session: {
+      harness.engine.dispatch(
+        {
+          type: "thread.session.set",
+          commandId: CommandId.make("cmd-session-set-claude"),
           threadId: ThreadId.make("thread-1"),
-          status: "ready",
-          providerName: "claudeAgent",
-          runtimeMode: "approval-required",
-          activeTurnId: null,
-          lastError: null,
-          updatedAt: createdAt,
+          session: {
+            threadId: ThreadId.make("thread-1"),
+            status: "ready",
+            providerName: "claudeAgent",
+            runtimeMode: "approval-required",
+            activeTurnId: null,
+            lastError: null,
+            updatedAt: createdAt,
+          },
+          createdAt,
         },
-        createdAt,
-      }),
+        testDispatchAuthority,
+      ),
     );
 
     await Effect.runPromise(
-      harness.engine.dispatch({
-        type: "thread.turn.diff.complete",
-        commandId: CommandId.make("cmd-diff-claude-1"),
-        threadId: ThreadId.make("thread-1"),
-        turnId: asTurnId("turn-claude-1"),
-        completedAt: createdAt,
-        checkpointRef: checkpointRefForThreadTurn(ThreadId.make("thread-1"), 1),
-        status: "ready",
-        files: [],
-        checkpointTurnCount: 1,
-        createdAt,
-      }),
+      harness.engine.dispatch(
+        {
+          type: "thread.turn.diff.complete",
+          commandId: CommandId.make("cmd-diff-claude-1"),
+          threadId: ThreadId.make("thread-1"),
+          turnId: asTurnId("turn-claude-1"),
+          completedAt: createdAt,
+          checkpointRef: checkpointRefForThreadTurn(ThreadId.make("thread-1"), 1),
+          status: "ready",
+          files: [],
+          checkpointTurnCount: 1,
+          createdAt,
+        },
+        testDispatchAuthority,
+      ),
     );
     await Effect.runPromise(
-      harness.engine.dispatch({
-        type: "thread.turn.diff.complete",
-        commandId: CommandId.make("cmd-diff-claude-2"),
-        threadId: ThreadId.make("thread-1"),
-        turnId: asTurnId("turn-claude-2"),
-        completedAt: createdAt,
-        checkpointRef: checkpointRefForThreadTurn(ThreadId.make("thread-1"), 2),
-        status: "ready",
-        files: [],
-        checkpointTurnCount: 2,
-        createdAt,
-      }),
+      harness.engine.dispatch(
+        {
+          type: "thread.turn.diff.complete",
+          commandId: CommandId.make("cmd-diff-claude-2"),
+          threadId: ThreadId.make("thread-1"),
+          turnId: asTurnId("turn-claude-2"),
+          completedAt: createdAt,
+          checkpointRef: checkpointRefForThreadTurn(ThreadId.make("thread-1"), 2),
+          status: "ready",
+          files: [],
+          checkpointTurnCount: 2,
+          createdAt,
+        },
+        testDispatchAuthority,
+      ),
     );
 
     await Effect.runPromise(
-      harness.engine.dispatch({
-        type: "thread.checkpoint.revert",
-        commandId: CommandId.make("cmd-revert-request-claude"),
-        threadId: ThreadId.make("thread-1"),
-        turnCount: 1,
-        createdAt,
-      }),
+      harness.engine.dispatch(
+        {
+          type: "thread.checkpoint.revert",
+          commandId: CommandId.make("cmd-revert-request-claude"),
+          threadId: ThreadId.make("thread-1"),
+          turnCount: 1,
+          createdAt,
+        },
+        testDispatchAuthority,
+      ),
     );
 
     await waitForEvent(harness.engine, (event) => event.type === "thread.reverted");
@@ -1045,69 +1102,84 @@ describe("CheckpointReactor", () => {
     const createdAt = "2026-01-01T00:00:00.000Z";
 
     await Effect.runPromise(
-      harness.engine.dispatch({
-        type: "thread.session.set",
-        commandId: CommandId.make("cmd-session-set-inline-revert"),
-        threadId: ThreadId.make("thread-1"),
-        session: {
+      harness.engine.dispatch(
+        {
+          type: "thread.session.set",
+          commandId: CommandId.make("cmd-session-set-inline-revert"),
           threadId: ThreadId.make("thread-1"),
-          status: "ready",
-          providerName: "codex",
-          runtimeMode: "approval-required",
-          activeTurnId: null,
-          lastError: null,
-          updatedAt: createdAt,
+          session: {
+            threadId: ThreadId.make("thread-1"),
+            status: "ready",
+            providerName: "codex",
+            runtimeMode: "approval-required",
+            activeTurnId: null,
+            lastError: null,
+            updatedAt: createdAt,
+          },
+          createdAt,
         },
-        createdAt,
-      }),
+        testDispatchAuthority,
+      ),
     );
 
     await Effect.runPromise(
-      harness.engine.dispatch({
-        type: "thread.turn.diff.complete",
-        commandId: CommandId.make("cmd-inline-revert-diff-1"),
-        threadId: ThreadId.make("thread-1"),
-        turnId: asTurnId("turn-1"),
-        completedAt: createdAt,
-        checkpointRef: checkpointRefForThreadTurn(ThreadId.make("thread-1"), 1),
-        status: "ready",
-        files: [],
-        checkpointTurnCount: 1,
-        createdAt,
-      }),
+      harness.engine.dispatch(
+        {
+          type: "thread.turn.diff.complete",
+          commandId: CommandId.make("cmd-inline-revert-diff-1"),
+          threadId: ThreadId.make("thread-1"),
+          turnId: asTurnId("turn-1"),
+          completedAt: createdAt,
+          checkpointRef: checkpointRefForThreadTurn(ThreadId.make("thread-1"), 1),
+          status: "ready",
+          files: [],
+          checkpointTurnCount: 1,
+          createdAt,
+        },
+        testDispatchAuthority,
+      ),
     );
     await Effect.runPromise(
-      harness.engine.dispatch({
-        type: "thread.turn.diff.complete",
-        commandId: CommandId.make("cmd-inline-revert-diff-2"),
-        threadId: ThreadId.make("thread-1"),
-        turnId: asTurnId("turn-2"),
-        completedAt: createdAt,
-        checkpointRef: checkpointRefForThreadTurn(ThreadId.make("thread-1"), 2),
-        status: "ready",
-        files: [],
-        checkpointTurnCount: 2,
-        createdAt,
-      }),
+      harness.engine.dispatch(
+        {
+          type: "thread.turn.diff.complete",
+          commandId: CommandId.make("cmd-inline-revert-diff-2"),
+          threadId: ThreadId.make("thread-1"),
+          turnId: asTurnId("turn-2"),
+          completedAt: createdAt,
+          checkpointRef: checkpointRefForThreadTurn(ThreadId.make("thread-1"), 2),
+          status: "ready",
+          files: [],
+          checkpointTurnCount: 2,
+          createdAt,
+        },
+        testDispatchAuthority,
+      ),
     );
 
     await Effect.runPromise(
-      harness.engine.dispatch({
-        type: "thread.checkpoint.revert",
-        commandId: CommandId.make("cmd-sequenced-revert-request-1"),
-        threadId: ThreadId.make("thread-1"),
-        turnCount: 1,
-        createdAt,
-      }),
+      harness.engine.dispatch(
+        {
+          type: "thread.checkpoint.revert",
+          commandId: CommandId.make("cmd-sequenced-revert-request-1"),
+          threadId: ThreadId.make("thread-1"),
+          turnCount: 1,
+          createdAt,
+        },
+        testDispatchAuthority,
+      ),
     );
     await Effect.runPromise(
-      harness.engine.dispatch({
-        type: "thread.checkpoint.revert",
-        commandId: CommandId.make("cmd-sequenced-revert-request-0"),
-        threadId: ThreadId.make("thread-1"),
-        turnCount: 0,
-        createdAt,
-      }),
+      harness.engine.dispatch(
+        {
+          type: "thread.checkpoint.revert",
+          commandId: CommandId.make("cmd-sequenced-revert-request-0"),
+          threadId: ThreadId.make("thread-1"),
+          turnCount: 0,
+          createdAt,
+        },
+        testDispatchAuthority,
+      ),
     );
 
     await harness.drain();
@@ -1128,13 +1200,16 @@ describe("CheckpointReactor", () => {
     const createdAt = "2026-01-01T00:00:00.000Z";
 
     await Effect.runPromise(
-      harness.engine.dispatch({
-        type: "thread.checkpoint.revert",
-        commandId: CommandId.make("cmd-revert-no-session"),
-        threadId: ThreadId.make("thread-1"),
-        turnCount: 1,
-        createdAt,
-      }),
+      harness.engine.dispatch(
+        {
+          type: "thread.checkpoint.revert",
+          commandId: CommandId.make("cmd-revert-no-session"),
+          threadId: ThreadId.make("thread-1"),
+          turnCount: 1,
+          createdAt,
+        },
+        testDispatchAuthority,
+      ),
     );
 
     const thread = await waitForThread(harness.readModel, (entry) =>

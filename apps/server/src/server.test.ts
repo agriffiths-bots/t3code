@@ -9271,6 +9271,11 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
             createWorktree,
           },
           projectionSnapshotQuery: {
+            getCommandReadModel: () =>
+              Effect.succeed({
+                ...makeDefaultOrchestrationReadModel(),
+                threads: [existingThread],
+              }),
             getThreadDetailById: (candidateThreadId) =>
               Effect.succeed(
                 candidateThreadId === threadId ? Option.some(existingThread) : Option.none(),

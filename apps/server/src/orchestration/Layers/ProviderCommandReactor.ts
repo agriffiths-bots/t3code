@@ -51,6 +51,7 @@ import { ServerSettingsService } from "../../serverSettings.ts";
 import { VcsStatusBroadcaster } from "../../vcs/VcsStatusBroadcaster.ts";
 import { GitWorkflowService } from "../../git/GitWorkflowService.ts";
 import { WorktreeLifecycleCoordinator } from "../Services/WorktreeLifecycleCoordinator.ts";
+import { trustedSystemDispatchAuthority } from "../commandAudienceGuard.ts";
 const isProviderAdapterRequestError = Schema.is(ProviderAdapterRequestError);
 const isProviderSendTurnFailedError = Schema.is(ProviderSendTurnFailedError);
 const isProviderSessionStartTimeoutError = Schema.is(ProviderSessionStartTimeoutError);
@@ -286,30 +287,33 @@ const make = Effect.gen(function* () {
       eventId: serverEventId(),
     }).pipe(
       Effect.flatMap(({ commandId, eventId }) =>
-        orchestrationEngine.dispatch({
-          type: "thread.activity.append",
-          commandId,
-          threadId: input.threadId,
-          activity: {
-            id: eventId,
-            tone: "error",
-            kind: input.kind,
-            summary: input.summary,
-            payload: {
-              detail: input.detail,
-              ...(input.requestId ? { requestId: input.requestId } : {}),
-              ...(input.turnStartRequestId !== undefined
-                ? { turnStartRequestId: input.turnStartRequestId }
-                : {}),
-              ...(input.turnStartMessageId !== undefined
-                ? { turnStartMessageId: input.turnStartMessageId }
-                : {}),
+        orchestrationEngine.dispatch(
+          {
+            type: "thread.activity.append",
+            commandId,
+            threadId: input.threadId,
+            activity: {
+              id: eventId,
+              tone: "error",
+              kind: input.kind,
+              summary: input.summary,
+              payload: {
+                detail: input.detail,
+                ...(input.requestId ? { requestId: input.requestId } : {}),
+                ...(input.turnStartRequestId !== undefined
+                  ? { turnStartRequestId: input.turnStartRequestId }
+                  : {}),
+                ...(input.turnStartMessageId !== undefined
+                  ? { turnStartMessageId: input.turnStartMessageId }
+                  : {}),
+              },
+              turnId: input.turnId,
+              createdAt: input.createdAt,
             },
-            turnId: input.turnId,
             createdAt: input.createdAt,
           },
-          createdAt: input.createdAt,
-        }),
+          trustedSystemDispatchAuthority("ProviderCommandReactor"),
+        ),
       ),
     );
 
@@ -343,13 +347,16 @@ const make = Effect.gen(function* () {
   }) =>
     serverCommandId("provider-session-set").pipe(
       Effect.flatMap((commandId) =>
-        orchestrationEngine.dispatch({
-          type: "thread.session.set",
-          commandId,
-          threadId: input.threadId,
-          session: input.session,
-          createdAt: input.createdAt,
-        }),
+        orchestrationEngine.dispatch(
+          {
+            type: "thread.session.set",
+            commandId,
+            threadId: input.threadId,
+            session: input.session,
+            createdAt: input.createdAt,
+          },
+          trustedSystemDispatchAuthority("ProviderCommandReactor"),
+        ),
       ),
     );
 
@@ -609,12 +616,15 @@ const make = Effect.gen(function* () {
     readonly createdAt: string;
   }) {
     const commandId = yield* serverCommandId("provider-archived-session-stop");
-    yield* orchestrationEngine.dispatch({
-      type: "thread.session.stop",
-      commandId,
-      threadId: input.threadId,
-      createdAt: input.createdAt,
-    });
+    yield* orchestrationEngine.dispatch(
+      {
+        type: "thread.session.stop",
+        commandId,
+        threadId: input.threadId,
+        createdAt: input.createdAt,
+      },
+      trustedSystemDispatchAuthority("ProviderCommandReactor"),
+    );
   });
   const archivedTurnStartCancellationDetail = (threadId: ThreadId) =>
     `Thread '${threadId}' was archived before the queued provider turn start could run.`;
@@ -1128,13 +1138,17 @@ const make = Effect.gen(function* () {
             oldBranch,
             newBranch: targetBranch,
           });
-          yield* dispatchAlreadyCoordinated(orchestrationEngine, {
-            type: "thread.meta.update",
-            commandId: yield* serverCommandId("worktree-branch-rename"),
-            threadId: input.threadId,
-            branch: renamed.branch,
-            worktreePath: cwd,
-          });
+          yield* dispatchAlreadyCoordinated(
+            orchestrationEngine,
+            {
+              type: "thread.meta.update",
+              commandId: yield* serverCommandId("worktree-branch-rename"),
+              threadId: input.threadId,
+              branch: renamed.branch,
+              worktreePath: cwd,
+            },
+            trustedSystemDispatchAuthority("ProviderCommandReactor"),
+          );
           yield* vcsStatusBroadcaster.refreshStatus(cwd).pipe(Effect.ignoreCause({ log: true }));
         }),
       );
@@ -1183,12 +1197,15 @@ const make = Effect.gen(function* () {
           return;
         }
 
-        yield* orchestrationEngine.dispatch({
-          type: "thread.meta.update",
-          commandId: yield* serverCommandId("thread-title-rename"),
-          threadId: input.threadId,
-          title: generated.title,
-        });
+        yield* orchestrationEngine.dispatch(
+          {
+            type: "thread.meta.update",
+            commandId: yield* serverCommandId("thread-title-rename"),
+            threadId: input.threadId,
+            title: generated.title,
+          },
+          trustedSystemDispatchAuthority("ProviderCommandReactor"),
+        );
       }).pipe(
         Effect.catchCause((cause) =>
           Effect.logWarning("provider command reactor failed to generate or rename thread title", {

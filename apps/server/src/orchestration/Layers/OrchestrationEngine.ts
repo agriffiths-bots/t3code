@@ -33,11 +33,16 @@ import { toPersistenceSqlError } from "../../persistence/Errors.ts";
 import { OrchestrationEventStore } from "../../persistence/Services/OrchestrationEventStore.ts";
 import { OrchestrationCommandReceiptRepository } from "../../persistence/Services/OrchestrationCommandReceipts.ts";
 import {
+  OrchestrationCommandAudienceAuthorizationError,
   OrchestrationCommandInvariantError,
   OrchestrationCommandPreviouslyRejectedError,
   type OrchestrationDispatchError,
   type OrchestrationProjectorDecodeError,
 } from "../Errors.ts";
+import {
+  authorizeOrchestrationCommandMutation,
+  type OrchestrationCommandDispatchAuthority,
+} from "../commandAudienceGuard.ts";
 import { decideOrchestrationCommand } from "../decider.ts";
 import { createEmptyReadModel, projectEvent } from "../projector.ts";
 import { OrchestrationProjectionPipeline } from "../Services/ProjectionPipeline.ts";
@@ -55,9 +60,13 @@ const isOrchestrationCommandPreviouslyRejectedError = Schema.is(
   OrchestrationCommandPreviouslyRejectedError,
 );
 const isOrchestrationCommandInvariantError = Schema.is(OrchestrationCommandInvariantError);
+const isOrchestrationCommandAudienceAuthorizationError = Schema.is(
+  OrchestrationCommandAudienceAuthorizationError,
+);
 
 interface CommandEnvelope {
   command: OrchestrationCommand;
+  authority: OrchestrationCommandDispatchAuthority | undefined;
   result: Deferred.Deferred<{ sequence: number }, OrchestrationDispatchError>;
   startedAtMs: number;
 }
@@ -144,8 +153,14 @@ const makeOrchestrationEngine = Effect.gen(function* () {
           "orchestration.aggregate_id": aggregateRef.aggregateId,
         });
 
+        const command = yield* authorizeOrchestrationCommandMutation({
+          command: envelope.command,
+          readModel: commandReadModel,
+          authority: envelope.authority,
+        });
+
         const existingReceipt = yield* commandReceiptRepository.getByCommandId({
-          commandId: envelope.command.commandId,
+          commandId: command.commandId,
         });
         if (Option.isSome(existingReceipt)) {
           if (existingReceipt.value.status === "accepted") {
@@ -159,8 +174,10 @@ const makeOrchestrationEngine = Effect.gen(function* () {
           });
         }
 
+        yield* requireUnarchiveWorktreeLifecycleReady(command);
+
         const eventBase = yield* decideOrchestrationCommand({
-          command: envelope.command,
+          command,
           readModel: commandReadModel,
         }).pipe(
           Effect.provideService(Crypto.Crypto, crypto),
@@ -168,7 +185,7 @@ const makeOrchestrationEngine = Effect.gen(function* () {
             isOrchestrationCommandInvariantError(cause)
               ? cause
               : new OrchestrationCommandInvariantError({
-                  commandType: envelope.command.type,
+                  commandType: command.type,
                   detail: "Failed to generate an event identifier.",
                   cause,
                 }),
@@ -191,13 +208,13 @@ const makeOrchestrationEngine = Effect.gen(function* () {
               const lastSavedEvent = committedEvents.at(-1) ?? null;
               if (lastSavedEvent === null) {
                 return yield* new OrchestrationCommandInvariantError({
-                  commandType: envelope.command.type,
+                  commandType: command.type,
                   detail: "Command produced no events.",
                 });
               }
 
               yield* commandReceiptRepository.upsert({
-                commandId: envelope.command.commandId,
+                commandId: command.commandId,
                 aggregateKind: lastSavedEvent.aggregateKind,
                 aggregateId: lastSavedEvent.aggregateId,
                 acceptedAt: lastSavedEvent.occurredAt,
@@ -271,7 +288,10 @@ const makeOrchestrationEngine = Effect.gen(function* () {
           }
 
           const error = Cause.squash(exit.cause) as OrchestrationDispatchError;
-          if (!isOrchestrationCommandPreviouslyRejectedError(error)) {
+          if (
+            !isOrchestrationCommandPreviouslyRejectedError(error) &&
+            !isOrchestrationCommandAudienceAuthorizationError(error)
+          ) {
             yield* reconcileReadModelAfterDispatchFailure.pipe(
               Effect.catch(() =>
                 Effect.logWarning(
@@ -318,11 +338,15 @@ const makeOrchestrationEngine = Effect.gen(function* () {
   const readEvents: OrchestrationEngineShape["readEvents"] = (fromSequenceExclusive, limit) =>
     eventStore.readFromSequence(fromSequenceExclusive, limit);
 
-  const dispatchQueued: NonNullable<OrchestrationEngineShape["dispatchCoordinated"]> = (command) =>
+  const dispatchQueued: NonNullable<OrchestrationEngineShape["dispatchCoordinated"]> = (
+    command,
+    authority,
+  ) =>
     Effect.gen(function* () {
       const result = yield* Deferred.make<{ sequence: number }, OrchestrationDispatchError>();
       yield* Queue.offer(commandQueue, {
         command,
+        authority,
         result,
         startedAtMs: yield* Clock.currentTimeMillis,
       });
@@ -344,25 +368,28 @@ const makeOrchestrationEngine = Effect.gen(function* () {
     );
   };
 
-  const dispatch: OrchestrationEngineShape["dispatch"] = (command) => {
-    if (!commandRequiresWorktreeLifecycle(command)) {
-      return dispatchQueued(command);
+  const requireUnarchiveWorktreeLifecycleReady = (command: OrchestrationCommand) => {
+    if (command.type !== "thread.unarchive") {
+      return Effect.void;
     }
-    return worktreeLifecycle.withPermit(
-      Effect.gen(function* () {
-        if (
-          command.type === "thread.unarchive" &&
-          ((yield* worktreeLifecycle.isTeardownPending(command.threadId)) ||
-            (yield* archivedOwnedWorktreeIsMissing(command.threadId)))
-        ) {
-          return yield* new OrchestrationCommandInvariantError({
-            commandType: command.type,
-            detail: `Thread '${command.threadId}' cannot be unarchived while its owned worktree teardown is pending.`,
-          });
-        }
-        return yield* dispatchQueued(command);
-      }),
-    );
+    return Effect.gen(function* () {
+      if (
+        (yield* worktreeLifecycle.isTeardownPending(command.threadId)) ||
+        (yield* archivedOwnedWorktreeIsMissing(command.threadId))
+      ) {
+        return yield* new OrchestrationCommandInvariantError({
+          commandType: command.type,
+          detail: `Thread '${command.threadId}' cannot be unarchived while its owned worktree teardown is pending.`,
+        });
+      }
+    });
+  };
+
+  const dispatch: OrchestrationEngineShape["dispatch"] = (command, authority) => {
+    if (!commandRequiresWorktreeLifecycle(command)) {
+      return dispatchQueued(command, authority);
+    }
+    return worktreeLifecycle.withPermit(dispatchQueued(command, authority));
   };
 
   return {

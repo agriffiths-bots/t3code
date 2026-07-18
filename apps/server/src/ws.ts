@@ -71,6 +71,7 @@ import {
   cleanupPersistedCommandAttachments,
   normalizeDispatchCommand,
 } from "./orchestration/Normalizer.ts";
+import { sessionDispatchAuthority } from "./orchestration/commandAudienceGuard.ts";
 import * as OrchestrationEngine from "./orchestration/Services/OrchestrationEngine.ts";
 import * as ProjectionSnapshotQuery from "./orchestration/Services/ProjectionSnapshotQuery.ts";
 import { coveredThreadRevision } from "./orchestration/threadRevision.ts";
@@ -650,7 +651,10 @@ const makeWsRpcLayer = (currentSession: EnvironmentAuth.AuthenticatedSession) =>
       const dispatchBootstrapTurnStart = (
         command: Extract<OrchestrationCommand, { type: "thread.turn.start" }>,
       ): Effect.Effect<{ readonly sequence: number }, OrchestrationDispatchCommandError> =>
-        BootstrapTurnStartDispatcher.dispatchActive(command);
+        BootstrapTurnStartDispatcher.dispatchActive(
+          command,
+          sessionDispatchAuthority(currentSession),
+        );
 
       const dispatchNormalizedCommand = (
         normalizedCommand: OrchestrationCommand,
@@ -659,7 +663,7 @@ const makeWsRpcLayer = (currentSession: EnvironmentAuth.AuthenticatedSession) =>
           normalizedCommand.type === "thread.turn.start" && normalizedCommand.bootstrap
             ? dispatchBootstrapTurnStart(normalizedCommand)
             : orchestrationEngine
-                .dispatch(normalizedCommand)
+                .dispatch(normalizedCommand, sessionDispatchAuthority(currentSession))
                 .pipe(
                   Effect.mapError((cause) =>
                     toDispatchCommandError(cause, "Failed to dispatch orchestration command"),

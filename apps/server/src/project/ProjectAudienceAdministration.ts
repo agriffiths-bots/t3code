@@ -13,6 +13,7 @@ import { OrchestrationEngineService } from "../orchestration/Services/Orchestrat
 import { ProjectionSnapshotQuery } from "../orchestration/Services/ProjectionSnapshotQuery.ts";
 import { RepositoryIdentityResolver } from "./RepositoryIdentityResolver.ts";
 
+import { trustedSystemDispatchAuthority } from "../orchestration/commandAudienceGuard.ts";
 export class ProjectAudienceAdministrationError extends Schema.TaggedErrorClass<ProjectAudienceAdministrationError>()(
   "ProjectAudienceAdministrationError",
   {
@@ -165,12 +166,15 @@ export const setProjectAudienceToFactory = Effect.fn(
   });
   const commandUuid = yield* crypto.randomUUIDv4;
 
-  return yield* orchestrationEngine.dispatch({
-    type: "project.data-audience.set",
-    commandId: CommandId.make(`local-admin:project-audience:${commandUuid}`),
-    projectId: input.projectId,
-    expectedWorkspaceRoot: project.value.workspaceRoot,
-    actor: input.actor,
-    occurredAt: DateTime.formatIso(yield* DateTime.now),
-  });
+  return yield* orchestrationEngine.dispatch(
+    {
+      type: "project.data-audience.set",
+      commandId: CommandId.make(`local-admin:project-audience:${commandUuid}`),
+      projectId: input.projectId,
+      expectedWorkspaceRoot: project.value.workspaceRoot,
+      actor: input.actor,
+      occurredAt: DateTime.formatIso(yield* DateTime.now),
+    },
+    trustedSystemDispatchAuthority("ProjectAudienceAdministration"),
+  );
 });

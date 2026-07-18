@@ -325,6 +325,10 @@ describe("ThreadDeletionReactor owned worktree lifecycle", () => {
           worktreeRemovable: false,
           worktreeRemovalPath: null,
         }),
+        expect.objectContaining({
+          kind: "trusted-system",
+          reason: "ThreadDeletionReactor",
+        }),
       );
       expect(harness.operations).toEqual(["close", "remove", "prune", "metadata"]);
     } finally {
@@ -439,6 +443,10 @@ describe("ThreadDeletionReactor owned worktree lifecycle", () => {
 
       expect(harness.dispatch).toHaveBeenCalledWith(
         expect.objectContaining({ type: "thread.session.stop", threadId: THREAD_ID }),
+        expect.objectContaining({
+          kind: "trusted-system",
+          reason: "ThreadDeletionReactor",
+        }),
       );
       expect(harness.removeWorktree).not.toHaveBeenCalled();
 
@@ -446,8 +454,20 @@ describe("ThreadDeletionReactor owned worktree lifecycle", () => {
       await harness.drain();
       expect(harness.dispatch.mock.calls).toEqual(
         expect.arrayContaining([
-          [expect.objectContaining({ type: "thread.session.stop", threadId: THREAD_ID })],
-          [expect.objectContaining({ type: "thread.session.stop", threadId: THREAD_ID })],
+          [
+            expect.objectContaining({ type: "thread.session.stop", threadId: THREAD_ID }),
+            expect.objectContaining({
+              kind: "trusted-system",
+              reason: "ThreadDeletionReactor",
+            }),
+          ],
+          [
+            expect.objectContaining({ type: "thread.session.stop", threadId: THREAD_ID }),
+            expect.objectContaining({
+              kind: "trusted-system",
+              reason: "ThreadDeletionReactor",
+            }),
+          ],
         ]),
       );
       const stopCommandIds = harness.dispatch.mock.calls

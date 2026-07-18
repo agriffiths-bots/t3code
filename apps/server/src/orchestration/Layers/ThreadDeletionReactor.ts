@@ -34,6 +34,7 @@ import {
 } from "../Services/ThreadDeletionReactor.ts";
 import { WorktreeLifecycleCoordinator } from "../Services/WorktreeLifecycleCoordinator.ts";
 
+import { trustedSystemDispatchAuthority } from "../commandAudienceGuard.ts";
 type ThreadDeletedEvent = Extract<OrchestrationEvent, { type: "thread.deleted" }>;
 type ThreadArchivedEvent = Extract<OrchestrationEvent, { type: "thread.archived" }>;
 type ThreadSessionSetEvent = Extract<OrchestrationEvent, { type: "thread.session-set" }>;
@@ -319,12 +320,15 @@ const make = Effect.gen(function* () {
     source: ThreadCleanupEventSource,
     teardownRetry: number,
   ) {
-    yield* orchestrationEngine.dispatch({
-      type: "thread.session.stop",
-      commandId: yield* sessionStopCommandIdForArchive(event, source, teardownRetry),
-      threadId: event.payload.threadId,
-      createdAt: event.occurredAt,
-    });
+    yield* orchestrationEngine.dispatch(
+      {
+        type: "thread.session.stop",
+        commandId: yield* sessionStopCommandIdForArchive(event, source, teardownRetry),
+        threadId: event.payload.threadId,
+        createdAt: event.occurredAt,
+      },
+      trustedSystemDispatchAuthority("ThreadDeletionReactor"),
+    );
   });
 
   const sessionSetCommandIdForArchiveReplay = (event: ThreadArchivedEvent) =>
@@ -345,23 +349,26 @@ const make = Effect.gen(function* () {
       }
       const providerInstanceId =
         projectedSession?.providerInstanceId ?? runtimeSession?.providerInstanceId;
-      yield* orchestrationEngine.dispatch({
-        type: "thread.session.set",
-        commandId: yield* sessionSetCommandIdForArchiveReplay(event),
-        threadId,
-        session: {
+      yield* orchestrationEngine.dispatch(
+        {
+          type: "thread.session.set",
+          commandId: yield* sessionSetCommandIdForArchiveReplay(event),
           threadId,
-          status: "stopped",
-          providerName: projectedSession?.providerName ?? runtimeSession?.provider ?? null,
-          ...(providerInstanceId !== undefined ? { providerInstanceId } : {}),
-          runtimeMode:
-            projectedSession?.runtimeMode ?? runtimeSession?.runtimeMode ?? "full-access",
-          activeTurnId: null,
-          lastError: projectedSession?.lastError ?? null,
-          updatedAt: event.occurredAt,
+          session: {
+            threadId,
+            status: "stopped",
+            providerName: projectedSession?.providerName ?? runtimeSession?.provider ?? null,
+            ...(providerInstanceId !== undefined ? { providerInstanceId } : {}),
+            runtimeMode:
+              projectedSession?.runtimeMode ?? runtimeSession?.runtimeMode ?? "full-access",
+            activeTurnId: null,
+            lastError: projectedSession?.lastError ?? null,
+            updatedAt: event.occurredAt,
+          },
+          createdAt: event.occurredAt,
         },
-        createdAt: event.occurredAt,
-      });
+        trustedSystemDispatchAuthority("ThreadDeletionReactor"),
+      );
     },
   );
 
@@ -506,14 +513,18 @@ const make = Effect.gen(function* () {
     } else {
       yield* gitWorkflow.pruneWorktrees(candidate.projectCwd);
     }
-    yield* dispatchAlreadyCoordinated(orchestrationEngine, {
-      type: "thread.meta.update",
-      commandId: CommandId.make(`server:worktree-teardown:${event.eventId}`),
-      threadId: candidate.threadId,
-      worktreePath: null,
-      worktreeRemovable: false,
-      worktreeRemovalPath: null,
-    });
+    yield* dispatchAlreadyCoordinated(
+      orchestrationEngine,
+      {
+        type: "thread.meta.update",
+        commandId: CommandId.make(`server:worktree-teardown:${event.eventId}`),
+        threadId: candidate.threadId,
+        worktreePath: null,
+        worktreeRemovable: false,
+        worktreeRemovalPath: null,
+      },
+      trustedSystemDispatchAuthority("ThreadDeletionReactor"),
+    );
     if (!candidate.force) {
       yield* worktreeLifecycle.clearTeardownPending(candidate.threadId);
     }
