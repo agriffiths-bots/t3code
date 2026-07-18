@@ -975,6 +975,7 @@ const buildAppUnderTest = (options?: {
               deliveredDevices: NonNegativeInt.make(0),
             }),
           events: Stream.empty,
+          eventsForAudience: () => Stream.empty,
           ...options?.layers?.deviceNotifications,
         }),
       ),
@@ -1043,6 +1044,7 @@ const buildAppUnderTest = (options?: {
       Layer.provide(orchestrationCommandReceiptRepositoryLayer),
       Layer.provide(
         Layer.mock(ProjectionSnapshotQuery.ProjectionSnapshotQuery)({
+          canReadEventAggregate: () => Effect.succeed(true),
           getCommandReadModel: () => Effect.succeed(makeDefaultOrchestrationReadModel()),
           getSnapshot: () => Effect.succeed(makeDefaultOrchestrationReadModel()),
           getShellSnapshot: () =>
@@ -4383,9 +4385,28 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
     }).pipe(Effect.provide(NodeHttpServer.layerTest)),
   );
 
-  it.effect("denies factory-ceiling sessions access to private orchestration surfaces", () =>
+  it.effect("allows factory read scope while continuing to deny operation scopes", () =>
     Effect.gen(function* () {
-      yield* buildAppUnderTest();
+      const emptySnapshot = {
+        ...makeDefaultOrchestrationReadModel(),
+        projects: [],
+        threads: [],
+      };
+      yield* buildAppUnderTest({
+        layers: {
+          projectionSnapshotQuery: {
+            getSnapshot: () => Effect.succeed(emptySnapshot),
+            getShellSnapshot: () =>
+              Effect.succeed({
+                snapshotSequence: emptySnapshot.snapshotSequence,
+                projects: [],
+                threads: [],
+                updatedAt: emptySnapshot.updatedAt,
+              }),
+            getThreadDetailSnapshot: () => Effect.succeed(Option.none()),
+          },
+        },
+      });
 
       const ownerCookie = yield* getAuthenticatedSessionCookieHeader();
       const deniedGrantResponse = yield* HttpClient.post("/api/auth/pairing-token", {
@@ -4395,18 +4416,14 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
           scopes: ["orchestration:read"],
         }),
       });
-      const deniedGrantBody = (yield* deniedGrantResponse.json) as {
-        readonly reason: string;
-      };
-      assert.equal(deniedGrantResponse.status, 400);
-      assert.equal(deniedGrantBody.reason, "invalid_scope");
+      assert.equal(deniedGrantResponse.status, 200);
 
       const { response: exchangeResponse, body: tokenBody } = yield* exchangeAccessToken(
         defaultDesktopBootstrapToken,
         { audienceCeiling: "factory" },
       );
       assert.equal(exchangeResponse.status, 200);
-      assert.equal(tokenBody.scope, "relay:read");
+      assert.equal(tokenBody.scope, "orchestration:read relay:read");
       assert.isDefined(tokenBody.access_token);
 
       const authorization = `Bearer ${tokenBody.access_token ?? ""}`;
@@ -4422,6 +4439,13 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
         yield* getHttpServerUrl(`/api/orchestration/threads/${defaultThreadId}`),
         { headers: { authorization } },
       );
+      const threadRevisionResponse = yield* fetchEffect(
+        yield* getHttpServerUrl(`/api/orchestration/threads/${defaultThreadId}/revision`),
+        { headers: { authorization } },
+      );
+      const planUsageResponse = yield* fetchEffect(yield* getHttpServerUrl("/api/plan-usage"), {
+        headers: { authorization },
+      });
       const dispatchResponse = yield* fetchEffect(
         yield* getHttpServerUrl("/api/orchestration/dispatch"),
         {
@@ -4444,17 +4468,43 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
         },
       );
 
-      const readResponses = [snapshotResponse, shellResponse, threadResponse];
-      for (const response of readResponses) {
-        const body = yield* responseJsonEffect<{ readonly requiredScope: string }>(response);
-        assert.equal(response.status, 403);
-        assert.equal(body.requiredScope, "orchestration:read");
-      }
+      assert.equal(snapshotResponse.status, 200);
+      assert.equal(shellResponse.status, 200);
+      assert.equal(threadResponse.status, 404);
+      assert.equal(threadRevisionResponse.status, 403);
+      assert.equal(planUsageResponse.status, 403);
       const dispatchBody = yield* responseJsonEffect<{ readonly requiredScope: string }>(
         dispatchResponse,
       );
       assert.equal(dispatchResponse.status, 403);
       assert.equal(dispatchBody.requiredScope, "orchestration:operate");
+
+      const wsTicketResponse = yield* fetchEffect(
+        yield* getHttpServerUrl("/api/auth/websocket-ticket"),
+        { method: "POST", headers: { authorization } },
+      );
+      const wsTicketBody = yield* responseJsonEffect<{ readonly ticket: string }>(wsTicketResponse);
+      const wsUrl = `${yield* getWsServerUrl("/ws", { authenticated: false })}?wsTicket=${encodeURIComponent(wsTicketBody.ticket)}`;
+      const wsResults = yield* Effect.scoped(
+        withWsRpcClient(wsUrl, (client) =>
+          Effect.all({
+            guardedRead: client[ORCHESTRATION_WS_METHODS.replayEvents]({
+              fromSequenceExclusive: 0,
+            }).pipe(Effect.result),
+            unrelatedRead: client[WS_METHODS.serverGetConfig]({}).pipe(Effect.result),
+          }),
+        ),
+      );
+      assert.equal(
+        wsResults.guardedRead._tag === "Failure" ? wsResults.guardedRead.failure._tag : "Success",
+        "OrchestrationReplayEventsError",
+      );
+      assert.equal(
+        wsResults.unrelatedRead._tag === "Failure"
+          ? wsResults.unrelatedRead.failure._tag
+          : "Success",
+        "EnvironmentAuthorizationError",
+      );
     }).pipe(Effect.provide(NodeHttpServer.layerTest)),
   );
 
@@ -7163,6 +7213,383 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
         ),
       );
       assert.deepEqual(replayResult, []);
+    }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+
+  it.effect("fails closed on factory cursors and filters other delivery", () =>
+    Effect.gen(function* () {
+      const privateThreadId = ThreadId.make("thread-event-delivery-private");
+      const factoryThreadId = ThreadId.make("thread-event-delivery-factory");
+      const missingThreadId = ThreadId.make("thread-event-delivery-missing");
+      const factoryProjectId = ProjectId.make("project-event-delivery-factory");
+      const now = "2026-07-18T08:00:00.000Z";
+      const events: ReadonlyArray<OrchestrationEvent> = [
+        {
+          eventId: EventId.make("event-delivery-private"),
+          sequence: 1,
+          occurredAt: now,
+          commandId: null,
+          causationEventId: null,
+          correlationId: null,
+          metadata: { providerTurnId: "PRIVATE::event-metadata" },
+          aggregateKind: "thread",
+          aggregateId: privateThreadId,
+          type: "thread.meta-updated",
+          payload: { threadId: privateThreadId, title: "PRIVATE::event", updatedAt: now },
+        },
+        {
+          eventId: EventId.make("event-delivery-factory"),
+          sequence: 2,
+          occurredAt: now,
+          commandId: null,
+          causationEventId: null,
+          correlationId: null,
+          metadata: {},
+          aggregateKind: "thread",
+          aggregateId: factoryThreadId,
+          type: "thread.meta-updated",
+          payload: { threadId: factoryThreadId, title: "Factory event", updatedAt: now },
+        },
+      ];
+      const scheduledTasks = [
+        {
+          taskId: ScheduledTaskId.make("schedule-event-delivery-private"),
+          threadId: privateThreadId,
+          prompt: "PRIVATE::schedule",
+          scheduleKind: "interval" as const,
+          intervalSeconds: 3_600,
+          cronExpr: null,
+          timezoneName: "UTC",
+          enabled: NonNegativeInt.make(1),
+          busyPolicy: "skip" as const,
+          nextRunAt: now,
+          lastRunAt: null,
+          lastStatus: null,
+          lastError: null,
+          skippedCount: NonNegativeInt.make(0),
+          retryCount: NonNegativeInt.make(0),
+          queuedCount: NonNegativeInt.make(0),
+          modelSelection: null,
+          createdAt: now,
+        },
+        {
+          taskId: ScheduledTaskId.make("schedule-event-delivery-factory"),
+          threadId: factoryThreadId,
+          prompt: "Factory schedule",
+          scheduleKind: "interval" as const,
+          intervalSeconds: 3_600,
+          cronExpr: null,
+          timezoneName: "UTC",
+          enabled: NonNegativeInt.make(1),
+          busyPolicy: "skip" as const,
+          nextRunAt: now,
+          lastRunAt: null,
+          lastStatus: null,
+          lastError: null,
+          skippedCount: NonNegativeInt.make(0),
+          retryCount: NonNegativeInt.make(0),
+          queuedCount: NonNegativeInt.make(0),
+          modelSelection: null,
+          createdAt: now,
+        },
+      ];
+      const isFactoryAggregate = (aggregateId: string) => aggregateId.includes("factory");
+
+      yield* buildAppUnderTest({
+        layers: {
+          projectionSnapshotQuery: {
+            canReadEventAggregate: ({ aggregateId }) =>
+              Effect.succeed(isFactoryAggregate(aggregateId)),
+            getSnapshotSequence: () => Effect.succeed({ snapshotSequence: 2 }),
+            getThreadShellById: (threadId) =>
+              Effect.succeed(
+                threadId === factoryThreadId
+                  ? Option.some(
+                      makeDefaultOrchestrationThreadShell({
+                        id: factoryThreadId,
+                        projectId: factoryProjectId,
+                        dataAudience: "factory",
+                        title: "Factory event",
+                      }),
+                    )
+                  : Option.none(),
+              ),
+          },
+          orchestrationEngine: {
+            readEvents: (fromSequenceExclusive) =>
+              Stream.fromIterable(events.filter((event) => event.sequence > fromSequenceExclusive)),
+          },
+          scheduledTaskRepository: {
+            listAll: () => Effect.succeed(scheduledTasks),
+            revisionChanges: Stream.make(0),
+          },
+          deviceNotifications: {
+            eventsForAudience: (audienceCeiling) =>
+              audienceCeiling === "factory"
+                ? Stream.make({
+                    type: "show" as const,
+                    notification: {
+                      notificationId: "notification-event-delivery-factory",
+                      ackToken: "notification-event-delivery-factory-token",
+                      title: "Factory notification",
+                      createdAt: IsoDateTime.make(now),
+                      requireInteraction: true,
+                    },
+                  })
+                : Stream.empty,
+          },
+        },
+      });
+
+      const { response: exchangeResponse, body: tokenBody } = yield* exchangeAccessToken(
+        defaultDesktopBootstrapToken,
+        { audienceCeiling: "factory", scope: "orchestration:read" },
+      );
+      assert.equal(exchangeResponse.status, 200);
+      assert.equal(tokenBody.scope, "orchestration:read");
+      const wsTicketResponse = yield* fetchEffect(
+        yield* getHttpServerUrl("/api/auth/websocket-ticket"),
+        {
+          method: "POST",
+          headers: { authorization: `Bearer ${tokenBody.access_token ?? ""}` },
+        },
+      );
+      const wsTicketBody = yield* responseJsonEffect<{ readonly ticket: string }>(wsTicketResponse);
+      const wsUrl = `${yield* getWsServerUrl("/ws", { authenticated: false })}?wsTicket=${encodeURIComponent(wsTicketBody.ticket)}`;
+
+      yield* Effect.scoped(
+        withWsRpcClient(wsUrl, (client) =>
+          Effect.gen(function* () {
+            const replay = yield* client[ORCHESTRATION_WS_METHODS.replayEvents]({
+              fromSequenceExclusive: 0,
+            }).pipe(Effect.result);
+            assert.deepEqual(
+              replay._tag === "Failure"
+                ? [replay.failure._tag, replay.failure.message]
+                : ["Success"],
+              [
+                "OrchestrationReplayEventsError",
+                "Audience-scoped event cursors are unavailable for restricted-audience sessions",
+              ],
+            );
+
+            const catchUp = yield* client[ORCHESTRATION_WS_METHODS.subscribeShell]({
+              afterSequence: 0,
+            }).pipe(Stream.take(1), Stream.runCollect, Effect.result);
+            assert.deepEqual(
+              catchUp._tag === "Failure"
+                ? [catchUp.failure._tag, catchUp.failure.message]
+                : ["Success"],
+              [
+                "OrchestrationGetSnapshotError",
+                "Audience-scoped event cursors are unavailable for restricted-audience sessions",
+              ],
+            );
+
+            const schedules = yield* client[ORCHESTRATION_WS_METHODS.subscribeScheduledTasks](
+              {},
+            ).pipe(Stream.take(1), Stream.runCollect);
+            assert.deepEqual(
+              Array.from(schedules).flatMap((item) =>
+                item.kind === "snapshot" ? item.snapshot.tasks.map((task) => task.taskId) : [],
+              ),
+              [ScheduledTaskId.make("schedule-event-delivery-factory")],
+            );
+
+            const notifications = yield* client[WS_METHODS.subscribeNotificationEvents]({}).pipe(
+              Stream.take(1),
+              Stream.runCollect,
+            );
+            assert.deepEqual(
+              Array.from(notifications).flatMap((event) =>
+                event.type === "show" ? [event.notification.title] : [],
+              ),
+              ["Factory notification"],
+            );
+
+            const probeResults = [];
+            for (const threadId of [factoryThreadId, privateThreadId, missingThreadId]) {
+              probeResults.push(
+                yield* client[ORCHESTRATION_WS_METHODS.subscribeThread]({ threadId }).pipe(
+                  Stream.take(1),
+                  Stream.runCollect,
+                  Effect.result,
+                ),
+              );
+            }
+            assert.deepEqual(
+              probeResults.map((result) =>
+                result._tag === "Failure"
+                  ? [result.failure._tag, result.failure.message]
+                  : ["Success"],
+              ),
+              [
+                [
+                  "OrchestrationGetSnapshotError",
+                  "Audience-scoped event cursors are unavailable for restricted-audience sessions",
+                ],
+                [
+                  "OrchestrationGetSnapshotError",
+                  "Audience-scoped event cursors are unavailable for restricted-audience sessions",
+                ],
+                [
+                  "OrchestrationGetSnapshotError",
+                  "Audience-scoped event cursors are unavailable for restricted-audience sessions",
+                ],
+              ],
+            );
+          }),
+        ),
+      );
+    }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+
+  it.effect("refreshes factory schedules on audience promotion without a task mutation", () =>
+    Effect.gen(function* () {
+      const liveEvents = yield* PubSub.unbounded<OrchestrationEvent>();
+      const promotedProjectId = ProjectId.make("project-live-delivery-factory");
+      const promotedThreadId = ThreadId.make("thread-live-delivery-factory");
+      const privateThreadId = ThreadId.make("thread-live-delivery-private");
+      const now = "2026-07-18T08:30:00.000Z";
+      let promoted = false;
+      const promotedThread = makeDefaultOrchestrationThreadShell({
+        id: promotedThreadId,
+        projectId: promotedProjectId,
+        dataAudience: "factory",
+        title: "Promoted factory thread",
+      });
+      const promotedSchedule = {
+        taskId: ScheduledTaskId.make("schedule-live-delivery-factory"),
+        threadId: promotedThreadId,
+        prompt: "Promoted factory schedule",
+        scheduleKind: "interval" as const,
+        intervalSeconds: 3_600,
+        cronExpr: null,
+        timezoneName: "UTC",
+        enabled: NonNegativeInt.make(1),
+        busyPolicy: "skip" as const,
+        nextRunAt: now,
+        lastRunAt: null,
+        lastStatus: null,
+        lastError: null,
+        skippedCount: NonNegativeInt.make(0),
+        retryCount: NonNegativeInt.make(0),
+        queuedCount: NonNegativeInt.make(0),
+        modelSelection: null,
+        createdAt: now,
+      };
+
+      yield* buildAppUnderTest({
+        layers: {
+          projectionSnapshotQuery: {
+            canReadEventAggregate: ({ aggregateId }) =>
+              Effect.succeed(
+                promoted && (aggregateId === promotedProjectId || aggregateId === promotedThreadId),
+              ),
+            getSnapshotSequence: () => Effect.succeed({ snapshotSequence: 0 }),
+            getShellSnapshot: () =>
+              Effect.succeed({
+                snapshotSequence: 3,
+                projects: [
+                  {
+                    id: promotedProjectId,
+                    title: "Promoted factory project",
+                    workspaceRoot: "/tmp/promoted-factory-project",
+                    dataAudience: "factory",
+                    defaultModelSelection: null,
+                    scripts: [],
+                    createdAt: now,
+                    updatedAt: now,
+                  },
+                ],
+                threads: [promotedThread],
+                updatedAt: now,
+              }),
+          },
+          orchestrationEngine: {
+            readEvents: () => Stream.empty,
+            streamDomainEvents: Stream.fromPubSub(liveEvents),
+          },
+          scheduledTaskRepository: {
+            listAll: () => Effect.succeed([promotedSchedule]),
+            revisionChanges: Stream.make(0),
+          },
+        },
+      });
+
+      const { body: tokenBody } = yield* exchangeAccessToken(defaultDesktopBootstrapToken, {
+        audienceCeiling: "factory",
+        scope: "orchestration:read",
+      });
+      const wsTicketResponse = yield* fetchEffect(
+        yield* getHttpServerUrl("/api/auth/websocket-ticket"),
+        {
+          method: "POST",
+          headers: { authorization: `Bearer ${tokenBody.access_token ?? ""}` },
+        },
+      );
+      const wsTicketBody = yield* responseJsonEffect<{ readonly ticket: string }>(wsTicketResponse);
+      const wsUrl = `${yield* getWsServerUrl("/ws", { authenticated: false })}?wsTicket=${encodeURIComponent(wsTicketBody.ticket)}`;
+
+      yield* Effect.scoped(
+        withWsRpcClient(wsUrl, (client) =>
+          Effect.gen(function* () {
+            const schedulesReady = yield* Deferred.make<void>();
+            const schedulesFiber = yield* client[ORCHESTRATION_WS_METHODS.subscribeScheduledTasks](
+              {},
+            ).pipe(
+              Stream.tap(() => Deferred.succeed(schedulesReady, undefined)),
+              Stream.take(2),
+              Stream.runCollect,
+              Effect.forkScoped,
+            );
+            yield* Deferred.await(schedulesReady);
+
+            yield* PubSub.publish(liveEvents, {
+              eventId: EventId.make("event-live-private-before-promotion"),
+              sequence: 1,
+              occurredAt: now,
+              commandId: null,
+              causationEventId: null,
+              correlationId: null,
+              metadata: { providerTurnId: "PRIVATE::live-event" },
+              aggregateKind: "thread",
+              aggregateId: privateThreadId,
+              type: "thread.meta-updated",
+              payload: { threadId: privateThreadId, title: "PRIVATE::live", updatedAt: now },
+            });
+            promoted = true;
+            yield* PubSub.publish(liveEvents, {
+              eventId: EventId.make("event-live-audience-promotion"),
+              sequence: 2,
+              occurredAt: now,
+              commandId: null,
+              causationEventId: null,
+              correlationId: null,
+              metadata: {},
+              aggregateKind: "project",
+              aggregateId: promotedProjectId,
+              type: "project.data-audience-set",
+              payload: {
+                projectId: promotedProjectId,
+                workspaceRoot: "/tmp/promoted-factory-project",
+                oldDataAudience: "private",
+                newDataAudience: "factory",
+                actor: "local-admin",
+                updatedAt: now,
+              },
+            });
+
+            const scheduleItems = Array.from(yield* Fiber.join(schedulesFiber));
+            assert.deepEqual(
+              scheduleItems.map((item) =>
+                item.kind === "snapshot" ? item.snapshot.tasks.map((task) => task.taskId) : [],
+              ),
+              [[], [promotedSchedule.taskId]],
+            );
+          }),
+        ),
+      );
     }).pipe(Effect.provide(NodeHttpServer.layerTest)),
   );
 

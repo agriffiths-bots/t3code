@@ -11,8 +11,8 @@ import * as Option from "effect/Option";
  * unrestricted/private view. Request handlers provide a principal so the same
  * repository boundary can narrow every project/thread read consistently.
  *
- * Event and stream filtering intentionally does not consume this policy until
- * the event/stream guard lands.
+ * Projection queries and event/stream delivery consume this same ceiling so
+ * every read surface applies one audience ordering rule.
  */
 export const currentReadAudienceCeiling: Effect.Effect<AuthAudienceCeiling> = Effect.map(
   Effect.serviceOption(EnvironmentAuthenticatedPrincipal),

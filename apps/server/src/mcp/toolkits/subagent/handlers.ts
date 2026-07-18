@@ -49,6 +49,7 @@ import type {
 import { dispatchActive } from "../../../orchestration/Services/BootstrapTurnStartDispatcher.ts";
 import { OrchestrationEngineService } from "../../../orchestration/Services/OrchestrationEngine.ts";
 import { ProjectionSnapshotQuery } from "../../../orchestration/Services/ProjectionSnapshotQuery.ts";
+import { canReadDataAudience } from "../../../auth/audienceDataPolicy.ts";
 import {
   ScheduledTaskRepository,
   toScheduleEntry,
@@ -1496,8 +1497,20 @@ const scheduleCreate = Effect.fn("SubagentToolkit.scheduleCreate")(function* (
 const scheduleList = Effect.fn("SubagentToolkit.scheduleList")(function* (
   input: ScheduleListInput,
 ) {
-  yield* requireProviderInvocation;
+  const invocation = yield* requireProviderInvocation;
   const runtime = yield* requireRuntime();
+
+  const sourceThread = yield* runtime.projectionSnapshotQuery
+    .getThreadShellByIdIncludingArchived(invocation.threadId)
+    .pipe(
+      Effect.mapError((error) => toToolError(error, "Failed to load schedule audience.")),
+      Effect.flatMap(
+        Option.match({
+          onNone: () => Effect.fail(fail(`Thread ${invocation.threadId} was not found.`)),
+          onSome: Effect.succeed,
+        }),
+      ),
+    );
 
   const tasks = yield* (
     input.threadId !== undefined
@@ -1505,7 +1518,23 @@ const scheduleList = Effect.fn("SubagentToolkit.scheduleList")(function* (
       : runtime.scheduledTasks.listAll()
   ).pipe(Effect.mapError((error) => toToolError(error, "Failed to list scheduled tasks.")));
 
-  return { tasks: tasks.map(toScheduleEntry) };
+  const visibility = yield* Effect.forEach(
+    tasks,
+    (task) =>
+      runtime.projectionSnapshotQuery.getThreadShellByIdIncludingArchived(task.threadId).pipe(
+        Effect.mapError((error) => toToolError(error, "Failed to filter scheduled tasks.")),
+        Effect.map(
+          Option.exists((targetThread) =>
+            canReadDataAudience(sourceThread.dataAudience, targetThread.dataAudience),
+          ),
+        ),
+      ),
+    { concurrency: 8 },
+  );
+
+  return {
+    tasks: tasks.filter((_, index) => visibility[index] === true).map(toScheduleEntry),
+  };
 });
 
 const loadTaskById = (

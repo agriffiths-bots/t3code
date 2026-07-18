@@ -117,6 +117,13 @@ const ProjectionCountsRowSchema = Schema.Struct({
 const AudienceCeilingInput = Schema.Struct({
   audienceCeiling: AuthAudienceCeiling,
 });
+const EventAggregateLookupInput = Schema.Struct({
+  aggregateKind: Schema.Literals(["project", "thread"]),
+  aggregateId: Schema.String,
+});
+const EventAggregateAudienceRow = Schema.Struct({
+  dataAudience: DataAudience,
+});
 const WorkspaceRootLookupInput = Schema.Struct({
   workspaceRoot: Schema.String,
   audienceCeiling: AuthAudienceCeiling,
@@ -684,6 +691,27 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
               OR projects.data_audience = 'factory'
           ) AS "threadCount"
       `,
+  });
+
+  const getEventAggregateAudienceRow = SqlSchema.findOneOption({
+    Request: EventAggregateLookupInput,
+    Result: EventAggregateAudienceRow,
+    execute: ({ aggregateKind, aggregateId }) =>
+      aggregateKind === "project"
+        ? sql`
+            SELECT data_audience AS "dataAudience"
+            FROM projection_projects
+            WHERE project_id = ${aggregateId}
+            LIMIT 1
+          `
+        : sql`
+            SELECT projects.data_audience AS "dataAudience"
+            FROM projection_threads threads
+            INNER JOIN projection_projects projects
+              ON projects.project_id = threads.project_id
+            WHERE threads.thread_id = ${aggregateId}
+            LIMIT 1
+          `,
   });
 
   const getActiveProjectRowByWorkspaceRoot = SqlSchema.findOneOption({
@@ -1820,6 +1848,24 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
         }),
       );
 
+  const canReadEventAggregate: NonNullable<
+    ProjectionSnapshotQueryShape["canReadEventAggregate"]
+  > = (input) =>
+    Effect.gen(function* () {
+      const audienceCeiling = yield* currentReadAudienceCeiling;
+      const audience = yield* getEventAggregateAudienceRow(input).pipe(
+        Effect.mapError(
+          toPersistenceSqlOrDecodeError(
+            "ProjectionSnapshotQuery.canReadEventAggregate:query",
+            "ProjectionSnapshotQuery.canReadEventAggregate:decodeRow",
+          ),
+        ),
+      );
+      return Option.exists(audience, (row) =>
+        canReadDataAudience(audienceCeiling, row.dataAudience),
+      );
+    });
+
   const getSnapshotSequence: ProjectionSnapshotQueryShape["getSnapshotSequence"] = () =>
     listProjectionStateRows(undefined).pipe(
       Effect.mapError(
@@ -2331,6 +2377,7 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
       );
 
   return {
+    canReadEventAggregate,
     getCommandReadModel,
     getSnapshot,
     getShellSnapshot,

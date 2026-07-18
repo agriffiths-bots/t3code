@@ -185,8 +185,8 @@ it.layer(NodeServices.layer)("SessionStore.layer", (it) => {
       expect(verified.method).toBe("bearer-access-token");
       expect(verified.subject).toBe("test-clock");
       expect(verified.audienceCeiling).toBe("factory");
-      expect(issued.scopes).toEqual(["relay:read"]);
-      expect(verified.scopes).toEqual(["relay:read"]);
+      expect(issued.scopes).toEqual(["orchestration:read", "relay:read"]);
+      expect(verified.scopes).toEqual(["orchestration:read", "relay:read"]);
     }).pipe(Effect.provide(Layer.merge(makeSessionStoreLayer(), TestClock.layer()))),
   );
 
@@ -198,7 +198,7 @@ it.layer(NodeServices.layer)("SessionStore.layer", (it) => {
           audienceCeiling: "factory",
           method: "bearer-access-token",
           subject: "denied-factory-session",
-          scopes: ["orchestration:read"],
+          scopes: ["orchestration:operate"],
         })
         .pipe(Effect.flip);
       const active = yield* sessions.listActive();
@@ -253,8 +253,8 @@ it.layer(NodeServices.layer)("SessionStore.layer", (it) => {
       const websocket = yield* sessions.issueWebSocketToken(issued.sessionId);
       const verifiedWebSocket = yield* sessions.verifyWebSocketToken(websocket.token);
 
-      expect(verified.scopes).toEqual(["relay:read"]);
-      expect(verifiedWebSocket.scopes).toEqual(["relay:read"]);
+      expect(verified.scopes).toEqual(["orchestration:read", "relay:read"]);
+      expect(verifiedWebSocket.scopes).toEqual(["orchestration:read", "relay:read"]);
     }).pipe(Effect.provide(makeSessionStoreLayer())),
   );
 
@@ -367,6 +367,7 @@ it.layer(NodeServices.layer)("SessionStore.layer", (it) => {
         beforeRevoke.find((entry) => entry.sessionId === client.sessionId)?.audienceCeiling,
       ).toBe("factory");
       expect(beforeRevoke.find((entry) => entry.sessionId === client.sessionId)?.scopes).toEqual([
+        "orchestration:read",
         "relay:read",
       ]);
       expect(beforeRevoke.find((entry) => entry.sessionId === client.sessionId)?.client.label).toBe(

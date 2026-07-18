@@ -135,8 +135,8 @@ it.layer(NodeServices.layer)("EnvironmentAuth.layer", (it) => {
       expect(pairingCredential.audienceCeiling).toBe("factory");
       expect(exchanged.response.audienceCeiling).toBe("factory");
       expect(verified.audienceCeiling).toBe("factory");
-      expect(exchanged.response.scopes).toEqual(["relay:read"]);
-      expect(verified.scopes).toEqual(["relay:read"]);
+      expect(exchanged.response.scopes).toEqual(["orchestration:read", "relay:read"]);
+      expect(verified.scopes).toEqual(["orchestration:read", "relay:read"]);
     }).pipe(Effect.provide(makeEnvironmentAuthLayer())),
   );
 
@@ -182,7 +182,7 @@ it.layer(NodeServices.layer)("EnvironmentAuth.layer", (it) => {
 
       expect(error._tag).toBe("ServerAuthAudienceNotGrantedError");
       expect(retried.audienceCeiling).toBe("factory");
-      expect(retried.scope).toBe("relay:read");
+      expect(retried.scope).toBe("orchestration:read relay:read");
       expect(sessions).toHaveLength(1);
     }).pipe(Effect.provide(makeEnvironmentAuthLayer())),
   );
@@ -224,7 +224,7 @@ it.layer(NodeServices.layer)("EnvironmentAuth.layer", (it) => {
       const error = yield* serverAuth
         .exchangeBootstrapCredentialForAccessToken(
           pairingCredential.credential,
-          ["orchestration:read"],
+          ["orchestration:operate"],
           requestMetadata,
           { audienceCeiling: "factory" },
         )

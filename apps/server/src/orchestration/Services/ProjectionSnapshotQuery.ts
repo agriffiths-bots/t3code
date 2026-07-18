@@ -59,10 +59,28 @@ export interface ProjectionFullThreadDiffContext {
   readonly toCheckpointRef: CheckpointRef | null;
 }
 
+export interface ProjectionEventAggregateRef {
+  readonly aggregateKind: "project" | "thread";
+  readonly aggregateId: ProjectId | ThreadId;
+}
+
 /**
  * ProjectionSnapshotQueryShape - Service API for read-model snapshots.
  */
 export interface ProjectionSnapshotQueryShape {
+  /**
+   * Resolve whether the current authenticated principal may observe an event
+   * aggregate. Deleted projection rows remain classifiable so replayed
+   * tombstones can be delivered without exposing cross-audience ids. Missing
+   * projection rows fail closed.
+   *
+   * Optional only for narrow test doubles created before the event delivery
+   * guard; production delivery treats an absent implementation as invisible.
+   */
+  readonly canReadEventAggregate?: (
+    input: ProjectionEventAggregateRef,
+  ) => Effect.Effect<boolean, ProjectionRepositoryError>;
+
   /**
    * Read the lightweight command snapshot used to bootstrap the in-memory
    * orchestration engine without hydrating message/activity/checkpoint bodies.

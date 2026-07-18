@@ -1,4 +1,6 @@
 import {
+  AuthAudienceCeiling,
+  DataAudience,
   IsoDateTime,
   NonNegativeInt,
   ServerDeviceNotification,
@@ -35,6 +37,7 @@ import * as SynchronizedRef from "effect/SynchronizedRef";
 import webPush, { type PushSubscription, WebPushError } from "web-push";
 
 import * as ServerSecretStore from "../auth/ServerSecretStore.ts";
+import { canReadDataAudience } from "../auth/audienceDataPolicy.ts";
 import { signPayload, timingSafeEqualBase64Url } from "../auth/utils.ts";
 import * as ServerConfig from "../config.ts";
 import { writeFileStringAtomically } from "../atomicWrite.ts";
@@ -50,7 +53,7 @@ const MAX_ACTIVE_NOTIFICATIONS = 1_000;
 const RECOVERY_TOKEN_BYTES = 32;
 const DUMMY_RECOVERY_TOKEN_HASH = Encoding.encodeBase64Url(new Uint8Array(32));
 
-const NotificationDeviceRecord = Schema.Struct({
+const NotificationDeviceRecordFields = {
   deviceId: Schema.String,
   deviceKind: Schema.Literals(["web-push", "desktop"]),
   deviceLabel: Schema.optional(Schema.String),
@@ -69,14 +72,31 @@ const NotificationDeviceRecord = Schema.Struct({
   ),
   createdAt: Schema.String,
   updatedAt: Schema.String,
+} as const;
+
+const LegacyNotificationDeviceRecord = Schema.Struct({
+  ...NotificationDeviceRecordFields,
+  audienceCeiling: Schema.optional(AuthAudienceCeiling),
+});
+const NotificationDeviceRecord = Schema.Struct({
+  ...NotificationDeviceRecordFields,
+  audienceCeiling: AuthAudienceCeiling,
 });
 type NotificationDeviceRecord = typeof NotificationDeviceRecord.Type;
 
-const NotificationDeviceStore = Schema.Struct({
+const LegacyNotificationDeviceStore = Schema.Struct({
   version: Schema.Literal(1),
+  devices: Schema.Array(LegacyNotificationDeviceRecord),
+});
+const NotificationDeviceStore = Schema.Struct({
+  version: Schema.Literal(2),
   devices: Schema.Array(NotificationDeviceRecord),
 });
 type NotificationDeviceStore = typeof NotificationDeviceStore.Type;
+const PersistedNotificationDeviceStore = Schema.Union([
+  LegacyNotificationDeviceStore,
+  NotificationDeviceStore,
+]);
 
 const VapidKeyPair = Schema.Struct({
   publicKey: Schema.String,
@@ -98,7 +118,12 @@ const NotificationDismissPayload = Schema.Struct({
 interface NotificationState {
   readonly devices: ReadonlyMap<string, NotificationDeviceRecord>;
   readonly activeNotifications: ReadonlyMap<string, ActiveNotificationEntry>;
-  readonly subscribers: ReadonlySet<Queue.Queue<ServerNotificationStreamEvent>>;
+  readonly subscribers: ReadonlySet<Queue.Queue<AudienceNotificationStreamEntry>>;
+}
+
+interface AudienceNotificationStreamEntry {
+  readonly event: ServerNotificationStreamEvent;
+  readonly dataAudience: DataAudience;
 }
 
 export class DeviceNotifications extends Context.Service<
@@ -107,6 +132,7 @@ export class DeviceNotifications extends Context.Service<
     readonly getConfig: Effect.Effect<ServerNotificationConfig>;
     readonly registerDevice: (
       input: ServerNotificationRegisterInput,
+      options: { readonly audienceCeiling: AuthAudienceCeiling },
     ) => Effect.Effect<
       ServerNotificationRegisterResult,
       ServerNotificationEndpointError | ServerNotificationPersistenceError
@@ -119,10 +145,22 @@ export class DeviceNotifications extends Context.Service<
     >;
     readonly ackNotification: (
       input: ServerNotificationAckInput,
-      options?: { readonly requireAckToken?: boolean },
+      options?: {
+        readonly requireAckToken?: boolean;
+        readonly audienceCeiling?: AuthAudienceCeiling;
+      },
     ) => Effect.Effect<ServerNotificationAckResult>;
-    readonly notify: (input: ServerNotifyInput) => Effect.Effect<ServerNotifyResult>;
+    readonly notify: (
+      input: ServerNotifyInput,
+      options?: {
+        readonly dataAudience: DataAudience;
+        readonly resultAudienceCeiling?: AuthAudienceCeiling;
+      },
+    ) => Effect.Effect<ServerNotifyResult>;
     readonly events: Stream.Stream<ServerNotificationStreamEvent>;
+    readonly eventsForAudience: (
+      audienceCeiling: AuthAudienceCeiling,
+    ) => Stream.Stream<ServerNotificationStreamEvent>;
   }
 >()("t3/notifications/DeviceNotifications") {}
 
@@ -137,6 +175,7 @@ class WebPushSendError extends Data.TaggedError("WebPushSendError")<{
 
 interface ActiveNotificationEntry {
   readonly notification: ServerDeviceNotification;
+  readonly dataAudience: DataAudience;
   readonly expiresAtMillis: number;
 }
 
@@ -194,7 +233,7 @@ function notificationTopic(notificationId: string): string {
 
 function serializeStore(devices: ReadonlyMap<string, NotificationDeviceRecord>): string {
   const store: NotificationDeviceStore = {
-    version: 1,
+    version: 2,
     devices: Array.from(devices.values()).toSorted((left, right) =>
       left.deviceId.localeCompare(right.deviceId),
     ),
@@ -202,7 +241,7 @@ function serializeStore(devices: ReadonlyMap<string, NotificationDeviceRecord>):
   return `${encodeDeviceStoreJson(store)}\n`;
 }
 
-const NotificationDeviceStoreJson = Schema.fromJsonString(NotificationDeviceStore);
+const NotificationDeviceStoreJson = Schema.fromJsonString(PersistedNotificationDeviceStore);
 const VapidKeyPairJson = Schema.fromJsonString(VapidKeyPair);
 const NotificationShowPayloadJson = Schema.fromJsonString(NotificationShowPayload);
 const NotificationDismissPayloadJson = Schema.fromJsonString(NotificationDismissPayload);
@@ -234,11 +273,18 @@ const readDeviceStore = Effect.fn("DeviceNotifications.readDeviceStore")(functio
   const parsed = yield* decodeDeviceStoreJson(raw).pipe(
     Effect.catch((cause) =>
       Effect.logWarning("Failed to decode notification device store", { cause }).pipe(
-        Effect.as({ version: 1, devices: [] } satisfies NotificationDeviceStore),
+        Effect.as({ version: 2, devices: [] } satisfies NotificationDeviceStore),
       ),
     ),
   );
-  return new Map(parsed.devices.map((device) => [device.deviceId, device]));
+  const devices =
+    parsed.version === 1
+      ? parsed.devices.map((device) => ({
+          ...device,
+          audienceCeiling: device.audienceCeiling ?? ("factory" as const),
+        }))
+      : parsed.devices;
+  return new Map(devices.map((device) => [device.deviceId, device]));
 });
 
 const persistDeviceStore = Effect.fn("DeviceNotifications.persistDeviceStore")(function* (
@@ -297,6 +343,7 @@ function upsertDevice(
   input: ServerNotificationRegisterInput,
   timestamp: string,
   recoveryTokenHash: string,
+  audienceCeiling: AuthAudienceCeiling,
 ): ReadonlyMap<string, NotificationDeviceRecord> {
   const current = devices.get(input.deviceId);
   const next = new Map(devices);
@@ -309,6 +356,7 @@ function upsertDevice(
     ...(input.subscription === undefined ? {} : { subscription: input.subscription }),
     status: "active",
     recoveryTokenHash,
+    audienceCeiling,
     createdAt: current?.createdAt ?? timestamp,
     updatedAt: timestamp,
   });
@@ -474,12 +522,12 @@ export const make = Effect.fn("DeviceNotifications.make")(function* () {
   });
 
   const publish = Effect.fn("DeviceNotifications.publish")(function* (
-    event: ServerNotificationStreamEvent,
+    entry: AudienceNotificationStreamEntry,
   ) {
     const snapshot = yield* SynchronizedRef.get(state);
     yield* Effect.forEach(
       snapshot.subscribers,
-      (subscriber) => Queue.offer(subscriber, event).pipe(Effect.ignore),
+      (subscriber) => Queue.offer(subscriber, entry).pipe(Effect.ignore),
       { discard: true },
     );
   });
@@ -577,7 +625,7 @@ export const make = Effect.fn("DeviceNotifications.make")(function* () {
 
   const registerDevice: DeviceNotifications["Service"]["registerDevice"] = Effect.fn(
     "DeviceNotifications.registerDevice",
-  )(function* (input) {
+  )(function* (input, options) {
     if (input.subscription !== undefined) {
       yield* endpointGuard.prepare(input.subscription.endpoint);
     }
@@ -591,6 +639,7 @@ export const make = Effect.fn("DeviceNotifications.make")(function* () {
         input,
         timestamp,
         recovery.recoveryTokenHash,
+        options.audienceCeiling,
       );
       return persistDevices(nextDevices, "register-device").pipe(
         Effect.as([undefined, { ...current, devices: nextDevices }] as const),
@@ -709,7 +758,9 @@ export const make = Effect.fn("DeviceNotifications.make")(function* () {
   });
 
   const notify: DeviceNotifications["Service"]["notify"] = Effect.fn("DeviceNotifications.notify")(
-    function* (input) {
+    function* (input, options) {
+      const dataAudience = options?.dataAudience ?? "private";
+      const resultAudienceCeiling = options?.resultAudienceCeiling ?? "private";
       const notification = yield* makeDeviceNotification(input);
       const nowMillis = yield* Clock.currentTimeMillis;
       const event: ServerNotificationStreamEvent = { type: "show", notification };
@@ -719,6 +770,7 @@ export const make = Effect.fn("DeviceNotifications.make")(function* () {
         );
         nextActive.set(notification.notificationId, {
           notification,
+          dataAudience,
           expiresAtMillis: nowMillis + ACTIVE_NOTIFICATION_TTL_MILLIS,
         });
         const boundedActive = pruneActiveNotifications(nextActive, nowMillis);
@@ -728,9 +780,12 @@ export const make = Effect.fn("DeviceNotifications.make")(function* () {
         return [activeDevices, { ...current, activeNotifications: boundedActive }] as const;
       });
 
-      yield* publish(event);
+      yield* publish({ event, dataAudience });
+      const visibleDevices = Array.from(devices.values()).filter((device) =>
+        canReadDataAudience(device.audienceCeiling, dataAudience),
+      );
       const delivered = yield* Effect.forEach(
-        devices.values(),
+        visibleDevices,
         (device) =>
           device.deviceKind === "web-push"
             ? sendWebPush(
@@ -745,8 +800,14 @@ export const make = Effect.fn("DeviceNotifications.make")(function* () {
       return {
         notificationId: notification.notificationId,
         deliveredDevices: NonNegativeInt.make(
-          delivered.filter(Boolean).length +
-            Array.from(devices.values()).filter((device) => device.deviceKind === "desktop").length,
+          visibleDevices.reduce(
+            (count, device, index) =>
+              canReadDataAudience(resultAudienceCeiling, device.audienceCeiling) &&
+              (device.deviceKind === "desktop" || delivered[index] === true)
+                ? count + 1
+                : count,
+            0,
+          ),
         ),
       };
     },
@@ -771,7 +832,7 @@ export const make = Effect.fn("DeviceNotifications.make")(function* () {
         current,
       ): readonly [
         {
-          readonly notification: ServerDeviceNotification | null;
+          readonly notification: ActiveNotificationEntry | null;
           readonly devices: ReadonlyMap<string, NotificationDeviceRecord>;
         },
         NotificationState,
@@ -793,15 +854,25 @@ export const make = Effect.fn("DeviceNotifications.make")(function* () {
             { ...current, activeNotifications },
           ] as const;
         }
+        if (
+          options?.audienceCeiling !== undefined &&
+          !canReadDataAudience(options.audienceCeiling, existing.dataAudience)
+        ) {
+          return [
+            { notification: null, devices: current.devices },
+            { ...current, activeNotifications },
+          ] as const;
+        }
         const nextActive = new Map(activeNotifications);
         nextActive.delete(input.notificationId);
         return [
-          { notification: existing.notification, devices: current.devices },
+          { notification: existing, devices: current.devices },
           { ...current, activeNotifications: nextActive },
         ] as const;
       },
     );
-    if (result.notification === null) {
+    const dismissedNotification = result.notification;
+    if (dismissedNotification === null) {
       return { notificationId: input.notificationId, accepted: false };
     }
 
@@ -809,9 +880,11 @@ export const make = Effect.fn("DeviceNotifications.make")(function* () {
       type: "dismiss",
       notificationId: input.notificationId,
     };
-    yield* publish(dismissEvent);
+    yield* publish({ event: dismissEvent, dataAudience: dismissedNotification.dataAudience });
     yield* Effect.forEach(
-      result.devices.values(),
+      Array.from(result.devices.values()).filter((device) =>
+        canReadDataAudience(device.audienceCeiling, dismissedNotification.dataAudience),
+      ),
       (device) =>
         device.deviceKind === "web-push" && device.status !== "expired"
           ? sendWebPush(device, makeDismissPayload(input.notificationId), input.notificationId)
@@ -822,7 +895,7 @@ export const make = Effect.fn("DeviceNotifications.make")(function* () {
   });
 
   const acquireSubscriber = Effect.fn("DeviceNotifications.acquireSubscriber")(function* () {
-    const queue = yield* Queue.unbounded<ServerNotificationStreamEvent>();
+    const queue = yield* Queue.unbounded<AudienceNotificationStreamEntry>();
     yield* SynchronizedRef.update(state, (current) => ({
       ...current,
       subscribers: new Set([...current.subscribers, queue]),
@@ -831,7 +904,7 @@ export const make = Effect.fn("DeviceNotifications.make")(function* () {
   });
 
   const releaseSubscriber = Effect.fn("DeviceNotifications.releaseSubscriber")(function* (
-    queue: Queue.Queue<ServerNotificationStreamEvent>,
+    queue: Queue.Queue<AudienceNotificationStreamEntry>,
   ) {
     yield* SynchronizedRef.update(state, (current) => {
       const subscribers = new Set(current.subscribers);
@@ -841,9 +914,17 @@ export const make = Effect.fn("DeviceNotifications.make")(function* () {
     yield* Queue.shutdown(queue);
   });
 
-  const events = Stream.scoped(
+  const audienceEvents = Stream.scoped(
     Stream.fromEffect(Effect.acquireRelease(acquireSubscriber(), releaseSubscriber)),
   ).pipe(Stream.flatMap((queue) => Stream.fromQueue(queue)));
+  const events = audienceEvents.pipe(Stream.map((entry) => entry.event));
+  const eventsForAudience: DeviceNotifications["Service"]["eventsForAudience"] = (
+    audienceCeiling,
+  ) =>
+    audienceEvents.pipe(
+      Stream.filter((entry) => canReadDataAudience(audienceCeiling, entry.dataAudience)),
+      Stream.map((entry) => entry.event),
+    );
 
   return DeviceNotifications.of({
     getConfig,
@@ -852,6 +933,7 @@ export const make = Effect.fn("DeviceNotifications.make")(function* () {
     ackNotification,
     notify,
     events,
+    eventsForAudience,
   });
 });
 
