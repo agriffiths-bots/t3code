@@ -762,7 +762,10 @@ cursorAdapterTestLayer("CursorAdapterLive", (it) => {
       assert.isDefined(delta);
       if (delta?.type === "content.delta") {
         assert.equal(String(delta.turnId), String(activeTurnId));
-        assert.match(String(delta.itemId), /^assistant:mock-session-1:runtime:[0-9a-f-]+:segment:0$/);
+        assert.match(
+          String(delta.itemId),
+          /^assistant:mock-session-1:runtime:[0-9a-f-]+:segment:0$/,
+        );
         assert.equal(delta.payload.delta, " live continuation");
       }
 
