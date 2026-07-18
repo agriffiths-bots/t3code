@@ -69,7 +69,9 @@ capture fails, the manager restarts the unchanged service and injects the
 pre-stop manifest instead of continuing the update.
 
 Rollbacks before the updated service can accept writes restore the pre-stop DB
-snapshot after checking out the pre-restart SHA. The manager pins the pre-update
+snapshot after checking out the pre-restart SHA. After every rollback checkout,
+the manager restores that SHA's frozen dependency installation before rebuilding
+its web and server artifacts. The manager pins the pre-update
 `health-probe` and `inject-resume` helpers under
 `$T3DR_LEDGER/<UTC date>/pinned-tools/` before merging the target SHA, then uses
 those pinned tools for post-update health checks, rollback re-probes, and resume
@@ -97,6 +99,12 @@ work during downtime, but still records the rollback SHA and uses the same
 snapshot, stop/start, health, DB restore, and resume-injection rollback path if
 the restarted service is not healthy.
 
+`--rollback-sha SHA --target-sha SHA` without `--prebuilt-target` is the nightly
+dependency-update fallback. The checkout is already at the target, but the
+explicit rollback SHA makes the manager rebuild the stamped web and server
+artifacts and preserves the real pre-cycle checkout for any start, verification,
+or health rollback.
+
 ## Nightly cycle
 
 `scripts/ops/daily-restart/t3-nightly-cycle` is the 03:00 cron entrypoint. It
@@ -106,10 +114,41 @@ runs:
 2. Upstream sync (`T3DR_UPSTREAM_SYNC_CMD`, default `~/.openclaw/bin/t3-upstream-sync`).
 3. Build `origin/main` in a detached staging worktree and stage the web dist
    plus server dist payload without mutating the live checkout.
-   Targets that are not fast-forwards from the live checkout, or that change
-   pnpm install inputs (`package.json`, `pnpm-lock.yaml`, `pnpm-workspace.yaml`,
-   `.npmrc`, `pnpmfile.cjs`, or `patches/**`), are rejected before staging so
-   new dist code is never started against rollback dependencies.
+   Targets that change pnpm install inputs (`package.json`, `pnpm-lock.yaml`,
+   `pnpm-workspace.yaml`, `.npmrc`, `pnpmfile.cjs`, or `patches/**`) are never
+   deployed with prebuilt artifacts. Instead, rc=66 selects the live fallback:
+   build the stamped web bundle in a detached worktree, verify and fast-forward
+   the live checkout to the pinned target, run the frozen workspace install,
+   publish restart metadata, and continue through a pre-update copy of the
+   configured restart manager. The detached web build validates the target but
+   is not published while the old service can still handle requests. The manager
+   rebuilds both target web and server artifacts only after it owns the guarded
+   downtime, so this path needs no `mv --exchange` support on older GNU
+   coreutils. A failure before that handoff restores the rollback checkout and
+   its frozen dependencies.
+   After all pre-mutation validation and staging succeeds, a durable
+   `$T3DR_LEDGER/t3-nightly-cycle.pending-live-deploy` marker keeps the
+   validated rollback and target SHAs selected across failures and later
+   same-SHA cycles; only a fully successful cycle archives it as
+   `<run-dir>/live-deploy.completed`. Restart-manager snapshots are retained by
+   rollback SHA under `$T3DR_LEDGER/t3-nightly-cycle.restart-managers/`, so a
+   later retry never sources orchestration code from an already-updated checkout.
+   A retry deploys the marker's stored target, even if `origin/main` has since
+   advanced, after confirming that the stored target is still contained in the
+   fetched branch. A missing or force-pushed-away stored target fails closed
+   with rc=70 and an alert instead of silently deploying the newer branch head.
+   If a crash leaves the marker after a successful restart, a later cycle
+   archives it only when both the latest restart result and the running service's
+   stamped `serverBuildSha` confirm the target; this reconciliation also applies
+   to legacy target-only markers. A confirmed rollback service is retried; any
+   other combination fails closed instead of reusing a stale base.
+   Legacy target-only markers recover their rollback from the last successful
+   restart ledger result (or, before any checkout mutation, the running service's
+   stamped `serverBuildSha`), verify that commit against the target and checkout
+   reflog, then bind retries to the current manager's checked
+   `live-rollback-v1` capability instead of an old manager that cannot honor the
+   recovered rollback.
+   Non-fast-forward targets and all other build failures still abort the cycle.
 4. Optional desktop artifact hook. Until T1 lands, this is a safe no-op. The
    one-line integration is `T3DR_DESKTOP_ARTIFACT=1`, which runs
    `dist:desktop:artifact` in the staging worktree with
@@ -121,7 +160,9 @@ runs:
 
 Machine-readable cycle events are appended to
 `$T3DR_LEDGER/<UTC date>/t3-nightly-cycle.jsonl`; operator-readable logs and
-alerts live in the same run directory.
+alerts live in the same run directory. Every non-OK exit writes a durable
+`t3-nightly-cycle.alert` marker and a `RESULT FAILED` line in
+`t3-nightly-cycle.result`, including lock contention and configuration errors.
 
 ## Capture active threads
 

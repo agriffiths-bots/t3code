@@ -24,6 +24,8 @@ rollback_sha="${T3DR_ROLLBACK_SHA:-}"
 target_sha_override="${T3DR_TARGET_SHA:-}"
 prebuilt_assets_dir="${T3DR_PREBUILT_ASSETS_DIR:-}"
 pinned_health_probe_source="${T3DR_PINNED_HEALTH_PROBE:-}"
+resume_token_revoke_deferred="${T3DR_DEFER_RESUME_TOKEN_REVOKE:-0}"
+# capability: live-rollback-v1
 
 usage() {
   cat >&2 <<'USAGE'
@@ -32,7 +34,8 @@ usage: t3-daily-restart [--db PATH] [--checkout PATH] [--service NAME]
                         [--attachments-dir DIR]
                         [--probe-timeout SECS]
                         [--smoke-instance INSTANCE] [--smoke-model MODEL]
-                        [--prebuilt-target --rollback-sha SHA [--target-sha SHA]]
+                        [--rollback-sha SHA] [--target-sha SHA]
+                        [--prebuilt-target]
 USAGE
 }
 
@@ -107,6 +110,14 @@ case "$prebuilt_target" in
     exit 2
     ;;
 esac
+case "$resume_token_revoke_deferred" in
+  1|true|TRUE|yes|YES) resume_token_revoke_deferred=1 ;;
+  0|false|FALSE|no|NO|"") resume_token_revoke_deferred=0 ;;
+  *)
+    echo "t3-daily-restart: T3DR_DEFER_RESUME_TOKEN_REVOKE must be boolean" >&2
+    exit 2
+    ;;
+esac
 if [[ "$prebuilt_target" == "1" && -z "$rollback_sha" ]]; then
   echo "t3-daily-restart: --rollback-sha or T3DR_ROLLBACK_SHA is required with --prebuilt-target" >&2
   exit 2
@@ -117,6 +128,11 @@ if [[ "$prebuilt_target" == "1" && -z "$target_sha_override" ]]; then
 fi
 if [[ "$prebuilt_target" == "1" && ( -z "$prebuilt_assets_dir" || ! -d "$prebuilt_assets_dir" ) ]]; then
   echo "t3-daily-restart: T3DR_PREBUILT_ASSETS_DIR is required with --prebuilt-target" >&2
+  exit 2
+fi
+if [[ "$prebuilt_target" == "0" && -n "$rollback_sha" &&
+  -z "${T3DR_TOKEN:-}" && -z "${T3_TOKEN:-}" ]]; then
+  echo "t3-daily-restart: live fallback requires a resume token minted before checkout dependency mutation" >&2
   exit 2
 fi
 
@@ -136,12 +152,14 @@ pinned_tools_dir="$run_dir/pinned-tools"
 pinned_health_probe=""
 pinned_verify_restart=""
 pinned_inject_resume=""
+pinned_db_restore=""
 pre_restart_pid=""
 resume_token=""
 resume_token_session_id=""
 resume_token_dir=""
 resume_token_file=""
 resume_token_validation_deferred=0
+result_recorded=0
 
 exec 9>"$lock_file"
 if ! flock -n 9; then
@@ -169,6 +187,7 @@ record_result() {
   printf '%s RESULT %s pre_sha=%s target_sha=%s snapshot=%s manifest=%s\n' \
     "$(date -u +%FT%TZ)" "$1" "${pre_sha:-unknown}" "${target_sha:-unknown}" \
     "${snapshot_path:-unknown}" "$manifest" | tee -a "$result_file" >&2
+  result_recorded=1
 }
 
 resolve_tool() {
@@ -472,6 +491,7 @@ NODE
 prepare_resume_token() {
   if [[ -n "${T3DR_TOKEN:-}" ]]; then
     resume_token="$T3DR_TOKEN"
+    resume_token_session_id="${T3DR_TOKEN_SESSION_ID:-}"
     log "resume token source=T3DR_TOKEN"
   elif [[ -n "${T3_TOKEN:-}" ]]; then
     resume_token="$T3_TOKEN"
@@ -506,7 +526,11 @@ ensure_resume_token_validated() {
 
 cleanup_resume_token() {
   if [[ -n "$resume_token_session_id" ]]; then
-    revoke_resume_session "$resume_token_session_id" || log "failed to revoke minted resume token session"
+    if [[ "$resume_token_revoke_deferred" == "1" ]]; then
+      log "resume token session revocation deferred; leaving short-lived token to expire"
+    else
+      revoke_resume_session "$resume_token_session_id" || log "failed to revoke minted resume token session"
+    fi
     resume_token_session_id=""
   fi
   if [[ -n "$resume_token_dir" ]]; then
@@ -521,7 +545,21 @@ on_exit() {
   cleanup_resume_token || true
   exit "$rc"
 }
+
+on_signal() {
+  local signal="$1" rc="$2"
+  trap - TERM INT HUP
+  log "received $signal; aborting with rc=$rc"
+  if [[ "$result_recorded" -eq 0 ]]; then
+    record_result "FAILED"
+  fi
+  exit "$rc"
+}
+
 trap on_exit EXIT
+trap 'on_signal TERM 143' TERM
+trap 'on_signal INT 130' INT
+trap 'on_signal HUP 129' HUP
 
 sanitize_manifest_for_post_stop_capture_failure() {
   local output
@@ -696,6 +734,7 @@ retry_legacy_unstamped_noop_restart() {
     run_capture 60 systemctl --user start "$service" || log "LEGACY_REBUILD failed to restart after rebuild failure"
     return 1
   fi
+  resume_token_revoke_deferred=0
   if ! run_capture 60 systemctl --user start "$service"; then
     log "LEGACY_REBUILD start failed"
     return 1
@@ -725,6 +764,30 @@ pin_verify_restart() {
   }
   pinned_verify_restart="$pinned_tool"
   log "PINNED verify-restart source=$source_tool pinned=$pinned_tool"
+}
+
+pin_db_restore() {
+  local source_tool pinned_tool temp_tool
+  source_tool="$(resolve_tool t3-db-restore)" || return 1
+  mkdir -p "$pinned_tools_dir" || return 1
+  chmod 700 "$pinned_tools_dir" || return 1
+  pinned_tool="$pinned_tools_dir/t3-db-restore"
+  temp_tool="$pinned_tools_dir/.t3-db-restore.$$"
+  rm -f -- "$temp_tool" || return 1
+  cp -p -- "$source_tool" "$temp_tool" || {
+    rm -f -- "$temp_tool"
+    return 1
+  }
+  chmod 700 "$temp_tool" || {
+    rm -f -- "$temp_tool"
+    return 1
+  }
+  mv -f -- "$temp_tool" "$pinned_tool" || {
+    rm -f -- "$temp_tool"
+    return 1
+  }
+  pinned_db_restore="$pinned_tool"
+  log "PINNED t3-db-restore source=$source_tool pinned=$pinned_tool"
 }
 
 pin_health_probe() {
@@ -837,30 +900,35 @@ replace_checkout_dir_from_payload() {
 promote_prebuilt_assets() {
   replace_checkout_dir_from_payload "apps/web/dist" || return 1
   replace_checkout_dir_from_payload "apps/server/dist" || return 1
+  resume_token_revoke_deferred=0
   log "promoted prebuilt assets from $prebuilt_assets_dir"
 }
 
 rollback() {
   local probe_file="$1"
-  local restore
   log "ROLLBACK begin"
   if ! stop_service_or_escalate "ROLLBACK"; then
     log "ROLLBACK stop failed"
     record_result "ROLLBACK-FAILED"
     return 1
   fi
-  run_capture 60 git -C "$checkout" checkout "$pre_sha" || {
-    log "ROLLBACK git checkout failed"
+  if [[ -z "$pinned_db_restore" || ! -x "$pinned_db_restore" ]]; then
+    log "ROLLBACK missing pinned t3-db-restore after stopping failed target"
     record_result "ROLLBACK-FAILED"
     return 1
-  }
-  restore="$(resolve_tool t3-db-restore)" || {
-    log "ROLLBACK missing t3-db-restore"
-    record_result "ROLLBACK-FAILED"
-    return 1
-  }
-  run_capture 300 "$restore" --db "$db" --snapshot "$snapshot_path" || {
+  fi
+  run_capture 300 "$pinned_db_restore" --db "$db" --snapshot "$snapshot_path" || {
     log "ROLLBACK db restore failed"
+    record_result "ROLLBACK-FAILED"
+    return 1
+  }
+  run_capture 60 git -C "$checkout" checkout "$pre_sha" || {
+    log "ROLLBACK git checkout failed after db restore"
+    record_result "ROLLBACK-FAILED"
+    return 1
+  }
+  run_capture 900 pnpm -C "$checkout" install --frozen-lockfile --prefer-offline || {
+    log "ROLLBACK dependency restore failed after db restore"
     record_result "ROLLBACK-FAILED"
     return 1
   }
@@ -874,6 +942,7 @@ rollback() {
     record_result "ROLLBACK-FAILED"
     return 1
   }
+  resume_token_revoke_deferred=0
   run_capture 60 systemctl --user start "$service" || {
     log "ROLLBACK start failed"
     record_result "ROLLBACK-FAILED"
@@ -909,6 +978,11 @@ code_only_rollback() {
     record_result "CODE-ROLLBACK-FAILED"
     return 1
   }
+  run_capture 900 pnpm -C "$checkout" install --frozen-lockfile --prefer-offline || {
+    log "CODE_ROLLBACK dependency restore failed"
+    record_result "CODE-ROLLBACK-FAILED"
+    return 1
+  }
   run_capture 900 env T3CODE_BUILD_SHA="$pre_sha" pnpm -C "$checkout/apps/web" run build || {
     log "CODE_ROLLBACK web rebuild failed"
     record_result "CODE-ROLLBACK-FAILED"
@@ -919,6 +993,7 @@ code_only_rollback() {
     record_result "CODE-ROLLBACK-FAILED"
     return 1
   }
+  resume_token_revoke_deferred=0
   run_capture 60 systemctl --user start "$service" || {
     log "CODE_ROLLBACK start failed"
     record_result "CODE-ROLLBACK-FAILED"
@@ -979,7 +1054,6 @@ if [[ "$prebuilt_target" == "1" ]]; then
   fi
   log "prebuilt target verified rollback_sha=$pre_sha target_sha=$target_sha"
 else
-  pre_sha="$cycle_start_sha"
   if [[ -n "$target_sha_override" ]]; then
     target_sha="$(run_output 30 git -C "$checkout" rev-parse --verify "${target_sha_override}^{commit}")" || {
       log "failed to resolve target_sha=$target_sha_override"
@@ -992,6 +1066,26 @@ else
       record_result "FAILED"
       exit 1
     }
+  fi
+  if [[ -n "$rollback_sha" ]]; then
+    pre_sha="$(run_output 30 git -C "$checkout" rev-parse --verify "${rollback_sha}^{commit}")" || {
+      log "failed to resolve rollback_sha=$rollback_sha"
+      record_result "FAILED"
+      exit 1
+    }
+    if [[ "$cycle_start_sha" != "$target_sha" ]]; then
+      log "live fallback target mismatch: checkout_head=$cycle_start_sha target_sha=$target_sha"
+      record_result "FAILED"
+      exit 1
+    fi
+    if ! run_capture 60 git -C "$checkout" merge-base --is-ancestor "$pre_sha" "$target_sha"; then
+      log "live fallback target is not a fast-forward from rollback_sha=$pre_sha"
+      record_result "FAILED"
+      exit 1
+    fi
+    log "live fallback target verified rollback_sha=$pre_sha target_sha=$target_sha"
+  else
+    pre_sha="$cycle_start_sha"
   fi
 fi
 
@@ -1066,6 +1160,11 @@ if ! pin_inject_resume; then
 fi
 if ! pin_verify_restart; then
   log "failed to pin pre-update verify-restart"
+  record_result "FAILED"
+  exit 1
+fi
+if ! pin_db_restore; then
+  log "failed to pin pre-update t3-db-restore"
   record_result "FAILED"
   exit 1
 fi
@@ -1160,6 +1259,7 @@ elif [[ "$pre_sha" != "$target_sha" ]]; then
     log "deploy artifact build failed before restart"
     code_only_rollback "$run_dir/health-probe.after-deploy-build" || exit 1
   fi
+  resume_token_revoke_deferred=0
   updated=1
 else
   log "checkout already at target; skipping rebuilds"

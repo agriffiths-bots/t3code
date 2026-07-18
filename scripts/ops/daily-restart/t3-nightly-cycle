@@ -29,6 +29,18 @@ sync_timeout="${T3DR_UPSTREAM_SYNC_TIMEOUT:-12600}"
 build_timeout="${T3DR_BUILD_TIMEOUT:-1800}"
 desktop_artifact="${T3DR_DESKTOP_ARTIFACT:-0}"
 build_always="${T3DR_BUILD_ALWAYS:-0}"
+startup_error=""
+startup_rc=0
+live_deploy_target=""
+live_deploy_rollback=""
+live_restart_source_sha=""
+live_deploy_pending=0
+live_resume_token=""
+live_resume_session_id=""
+live_resume_entry=""
+live_resume_cleanup_safe=0
+live_resume_handed_off=0
+failure_recorded=0
 
 usage() {
   cat >&2 <<'USAGE'
@@ -41,22 +53,22 @@ USAGE
 require_value() {
   local flag="$1"
   if [[ "$#" -lt 2 || -z "${2:-}" || "${2:-}" == --* ]]; then
-    echo "t3-nightly-cycle: $flag requires a value" >&2
-    usage
-    exit 2
+    startup_error="t3-nightly-cycle: $flag requires a value"
+    startup_rc=2
+    return 1
   fi
 }
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --checkout) require_value "$@"; checkout="$2"; shift 2 ;;
-    --ledger) require_value "$@"; ledger="$2"; shift 2 ;;
-    --backup-cmd) require_value "$@"; backup_cmd="$2"; shift 2 ;;
-    --upstream-sync-cmd) require_value "$@"; upstream_sync_cmd="$2"; shift 2 ;;
-    --restart-cmd) require_value "$@"; restart_cmd="$2"; shift 2 ;;
-    --deadline-local) require_value "$@"; deadline_local="$2"; shift 2 ;;
+    --checkout) require_value "$@" || break; checkout="$2"; shift 2 ;;
+    --ledger) require_value "$@" || break; ledger="$2"; shift 2 ;;
+    --backup-cmd) require_value "$@" || break; backup_cmd="$2"; shift 2 ;;
+    --upstream-sync-cmd) require_value "$@" || break; upstream_sync_cmd="$2"; shift 2 ;;
+    --restart-cmd) require_value "$@" || break; restart_cmd="$2"; shift 2 ;;
+    --deadline-local) require_value "$@" || break; deadline_local="$2"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
-    *) echo "t3-nightly-cycle: unknown arg: $1" >&2; usage; exit 2 ;;
+    *) startup_error="t3-nightly-cycle: unknown arg: $1"; startup_rc=2; break ;;
   esac
 done
 
@@ -64,16 +76,16 @@ case "$desktop_artifact" in
   1|true|TRUE|yes|YES) desktop_artifact=1 ;;
   0|false|FALSE|no|NO|"") desktop_artifact=0 ;;
   *)
-    echo "t3-nightly-cycle: T3DR_DESKTOP_ARTIFACT must be boolean" >&2
-    exit 2
+    startup_error="t3-nightly-cycle: T3DR_DESKTOP_ARTIFACT must be boolean"
+    startup_rc=2
     ;;
 esac
 case "$build_always" in
   1|true|TRUE|yes|YES) build_always=1 ;;
   0|false|FALSE|no|NO|"") build_always=0 ;;
   *)
-    echo "t3-nightly-cycle: T3DR_BUILD_ALWAYS must be boolean" >&2
-    exit 2
+    startup_error="t3-nightly-cycle: T3DR_BUILD_ALWAYS must be boolean"
+    startup_rc=2
     ;;
 esac
 
@@ -92,13 +104,10 @@ stage_payload="$stage_root/payload"
 desktop_artifact_dir="$run_dir/desktop-artifact"
 pinned_tools_dir="$run_dir/pinned-tools"
 pinned_rollback_probe="$pinned_tools_dir/health-probe.rollback"
-
-exec 9>"$lock_file"
-if ! flock -n 9; then
-  printf '%s RESULT LOCKED\n' "$(date -u +%FT%TZ)" >>"$result_file"
-  echo "t3-nightly-cycle: another run is already active" >&2
-  exit 75
-fi
+durable_restart_root="$ledger/t3-nightly-cycle.restart-managers"
+restart_manager_checkout="$stage_root/restart-manager-source"
+pending_live_deploy="$ledger/t3-nightly-cycle.pending-live-deploy"
+completed_live_deploy="$run_dir/live-deploy.completed"
 
 log() {
   printf '[%s] %s\n' "$(date -u +%FT%TZ)" "$*" | tee -a "$log_file" >&2
@@ -144,6 +153,7 @@ record_failure() {
   local step="$1" rc="$2" step_log="$3"
   printf '%s FAILURE step=%s rc=%s log=%s\n' "$(date -u +%FT%TZ)" "$step" "$rc" "$step_log" | tee -a "$alert_file" >&2
   printf '%s RESULT FAILED step=%s rc=%s\n' "$(date -u +%FT%TZ)" "$step" "$rc" | tee -a "$result_file" >&2
+  failure_recorded=1
 }
 
 run_shell_step() {
@@ -261,6 +271,128 @@ copy_payload_dir() {
   cp -a "$source_dir/." "$target_dir/"
 }
 
+cleanup_restart_manager_checkout() {
+  local step_log="$1"
+  if [[ ! -e "$restart_manager_checkout" ]]; then
+    return 0
+  fi
+  run_logged 120 "$step_log" git -C "$checkout" worktree remove --force "$restart_manager_checkout" || {
+    printf '[%s] WARNING failed to remove restart-manager source worktree; removing path directly\n' "$(date -u +%FT%TZ)" >>"$step_log"
+    remove_path_under "$stage_root" "$restart_manager_checkout" || true
+    run_logged 120 "$step_log" git -C "$checkout" worktree prune || true
+  }
+}
+
+pin_live_restart_orchestrator() {
+  local current_head="$1" rollback_sha="$2" manager_source_sha="$3" step_log="$4"
+  local restart_path restart_source checkout_real restart_rel source_dir source_name temp_dir pinned_dir pinned_sha pinned_source_sha
+  case "$restart_cmd" in
+    */*) restart_path="$(realpath_m "$restart_cmd")" || return 1 ;;
+    *) restart_path="$(command -v -- "$restart_cmd")" || return 1 ;;
+  esac
+  restart_path="$(realpath_m "$restart_path")" || return 1
+  checkout_real="$(realpath -e -- "$checkout")" || return 1
+  if [[ "$restart_path" != "$checkout_real"/* ]]; then
+    restart_source="$(realpath -e -- "$restart_path")" || return 1
+    [[ -x "$restart_source" ]] || return 1
+    restart_cmd="$restart_source"
+    printf '[%s] restart orchestrator is already outside the mutable checkout: %s\n' "$(date -u +%FT%TZ)" "$restart_source"
+    return 0
+  fi
+  restart_rel="${restart_path#"$checkout_real"/}"
+  source_name="$(basename "$restart_path")"
+  pinned_dir="$durable_restart_root/$rollback_sha"
+  if [[ -d "$pinned_dir" ]]; then
+    pinned_sha="$(sed -n '1p' "$pinned_dir/.rollback-sha" 2>/dev/null)"
+    pinned_source_sha="$(sed -n '1p' "$pinned_dir/.manager-source-sha" 2>/dev/null)"
+    if [[ "$pinned_sha" != "$rollback_sha" || "$pinned_source_sha" != "$manager_source_sha" ||
+      ! -x "$pinned_dir/$source_name" ||
+      ( "$source_name" == "t3-daily-restart" && ! -f "$pinned_dir/$source_name" ) ]]; then
+      echo "invalid durable restart orchestrator for rollback_sha=$rollback_sha: $pinned_dir" >&2
+      return 1
+    fi
+    if [[ "$source_name" == "t3-daily-restart" ]] &&
+      ! grep -Fqx '# capability: live-rollback-v1' "$pinned_dir/$source_name"; then
+      echo "durable restart orchestrator lacks live rollback capability: $pinned_dir/$source_name" >&2
+      return 1
+    fi
+    restart_cmd="$pinned_dir/$source_name"
+    printf '[%s] reusing rollback-bound restart orchestrator rollback_sha=%s manager_source_sha=%s pinned=%s\n' "$(date -u +%FT%TZ)" "$rollback_sha" "$manager_source_sha" "$restart_cmd"
+    return 0
+  fi
+  if [[ -e "$pinned_dir" ]]; then
+    echo "durable restart orchestrator path is not a directory: $pinned_dir" >&2
+    return 1
+  fi
+
+  source_dir="$(dirname "$restart_path")"
+  if [[ "$current_head" != "$manager_source_sha" ]]; then
+    mkdir -p "$stage_root" || return 1
+    remove_path_under "$stage_root" "$restart_manager_checkout" || return 1
+    run_logged 120 "$step_log" git -C "$checkout" worktree prune || return 1
+    run_logged 120 "$step_log" git -C "$checkout" worktree add --detach "$restart_manager_checkout" "$manager_source_sha" || return 1
+    source_dir="$restart_manager_checkout/$(dirname "$restart_rel")"
+  fi
+  if [[ ! -x "$source_dir/$source_name" ]]; then
+    echo "restart orchestrator source is missing or not executable: $source_dir/$source_name" >&2
+    cleanup_restart_manager_checkout "$step_log"
+    return 1
+  fi
+  if [[ "$source_name" == "t3-daily-restart" ]] &&
+    ! grep -Fqx '# capability: live-rollback-v1' "$source_dir/$source_name"; then
+    echo "restart orchestrator source lacks live rollback capability: $source_dir/$source_name" >&2
+    cleanup_restart_manager_checkout "$step_log"
+    return 1
+  fi
+
+  mkdir -p "$durable_restart_root" || {
+    cleanup_restart_manager_checkout "$step_log"
+    return 1
+  }
+  chmod 700 "$durable_restart_root" || {
+    cleanup_restart_manager_checkout "$step_log"
+    return 1
+  }
+  temp_dir="$durable_restart_root/.${rollback_sha}.$$"
+  remove_path_under "$durable_restart_root" "$temp_dir" || {
+    cleanup_restart_manager_checkout "$step_log"
+    return 1
+  }
+  mkdir "$temp_dir" || {
+    cleanup_restart_manager_checkout "$step_log"
+    return 1
+  }
+  cp -a -- "$source_dir/." "$temp_dir/" || {
+    remove_path_under "$durable_restart_root" "$temp_dir" || true
+    cleanup_restart_manager_checkout "$step_log"
+    return 1
+  }
+  cleanup_restart_manager_checkout "$step_log"
+  printf '%s\n' "$rollback_sha" >"$temp_dir/.rollback-sha" || {
+    remove_path_under "$durable_restart_root" "$temp_dir" || true
+    return 1
+  }
+  printf '%s\n' "$manager_source_sha" >"$temp_dir/.manager-source-sha" || {
+    remove_path_under "$durable_restart_root" "$temp_dir" || true
+    return 1
+  }
+  chmod 600 "$temp_dir/.rollback-sha" "$temp_dir/.manager-source-sha" || {
+    remove_path_under "$durable_restart_root" "$temp_dir" || true
+    return 1
+  }
+  if [[ ! -x "$temp_dir/$source_name" ]]; then
+    echo "pinned restart orchestrator is not executable: $temp_dir/$source_name" >&2
+    remove_path_under "$durable_restart_root" "$temp_dir" || true
+    return 1
+  fi
+  mv -- "$temp_dir" "$pinned_dir" || {
+    remove_path_under "$durable_restart_root" "$temp_dir" || true
+    return 1
+  }
+  restart_cmd="$pinned_dir/$source_name"
+  printf '[%s] pinned rollback restart orchestrator rollback_sha=%s manager_source_sha=%s source=%s pinned=%s\n' "$(date -u +%FT%TZ)" "$rollback_sha" "$manager_source_sha" "$source_dir/$source_name" "$restart_cmd"
+}
+
 write_restart_metadata() {
   local mode="$1" tmp_file="$prebuilt_env.tmp.$$"
   rm -f "$tmp_file"
@@ -293,6 +425,18 @@ write_restart_metadata() {
         return 1
       }
       ;;
+    live)
+      local rollback_sha="$2" target_sha="$3"
+      [[ -n "$rollback_sha" && -n "$target_sha" ]] || return 68
+      {
+        printf 'T3DR_PREBUILT_TARGET=0\n'
+        printf 'T3DR_ROLLBACK_SHA=%s\n' "$rollback_sha"
+        printf 'T3DR_TARGET_SHA=%s\n' "$target_sha"
+      } >"$tmp_file" || {
+        rm -f "$tmp_file"
+        return 1
+      }
+      ;;
     *) return 68 ;;
   esac
   mv -fT -- "$tmp_file" "$prebuilt_env" || {
@@ -301,8 +445,121 @@ write_restart_metadata() {
   }
 }
 
+write_pending_live_deploy() {
+  local rollback_sha="$1" target_sha="$2" manager_source_sha="$3" tmp_file="$pending_live_deploy.tmp.$$"
+  [[ "$rollback_sha" =~ ^[0-9a-f]{40}$ && "$target_sha" =~ ^[0-9a-f]{40}$ &&
+    "$manager_source_sha" =~ ^[0-9a-f]{40}$ ]] || return 68
+  {
+    printf 'T3DR_ROLLBACK_SHA=%s\n' "$rollback_sha"
+    printf 'T3DR_TARGET_SHA=%s\n' "$target_sha"
+    printf 'T3DR_RESTART_MANAGER_SHA=%s\n' "$manager_source_sha"
+  } >"$tmp_file" || {
+    rm -f -- "$tmp_file"
+    return 1
+  }
+  mv -fT -- "$tmp_file" "$pending_live_deploy" || {
+    rm -f -- "$tmp_file"
+    return 1
+  }
+}
+
+read_pending_live_deploy() {
+  local rollback_sha target_sha manager_source_sha
+  rollback_sha="$(sed -n 's/^T3DR_ROLLBACK_SHA=//p' "$pending_live_deploy" 2>/dev/null | head -1)"
+  target_sha="$(sed -n 's/^T3DR_TARGET_SHA=//p' "$pending_live_deploy" 2>/dev/null | head -1)"
+  manager_source_sha="$(sed -n 's/^T3DR_RESTART_MANAGER_SHA=//p' "$pending_live_deploy" 2>/dev/null | head -1)"
+  [[ "$target_sha" =~ ^[0-9a-f]{40}$ ]] || return 68
+  if [[ -n "$rollback_sha" && ! "$rollback_sha" =~ ^[0-9a-f]{40}$ ]]; then
+    return 68
+  fi
+  if [[ -n "$manager_source_sha" && ! "$manager_source_sha" =~ ^[0-9a-f]{40}$ ]]; then
+    return 68
+  fi
+  printf '%s\t%s\t%s\n' "${rollback_sha:-legacy}" "$target_sha" "${manager_source_sha:-rollback}"
+}
+
+fetch_live_deployed_sha() {
+  local step_log="$1" descriptor deployed_sha
+  descriptor="$(capture_logged 10 "$step_log" curl -fsS --max-time 5 "${origin%/}/.well-known/t3/environment")" || return 68
+  deployed_sha="$(node -e '
+const fs = require("node:fs");
+const descriptor = JSON.parse(fs.readFileSync(0, "utf8"));
+if (typeof descriptor.serverBuildSha !== "string") process.exit(2);
+process.stdout.write(descriptor.serverBuildSha.trim().toLowerCase());
+' <<<"$descriptor" 2>>"$step_log")" || return 68
+  [[ "$deployed_sha" =~ ^[0-9a-f]{40}$ ]] || return 68
+  capture_logged 30 "$step_log" git -C "$checkout" rev-parse --verify "${deployed_sha}^{commit}"
+}
+
+last_successful_deployed_sha() {
+  local result_file line candidate last_sha=""
+  for result_file in "$ledger"/????-??-??/t3-daily-restart.result; do
+    [[ -f "$result_file" ]] || continue
+    while IFS= read -r line; do
+      case "$line" in
+        *" RESULT OK "*)
+          candidate="$(sed -n 's/.* target_sha=\([0-9a-f]\{40\}\) .*/\1/p' <<<"$line")"
+          [[ "$candidate" =~ ^[0-9a-f]{40}$ ]] && last_sha="$candidate"
+          ;;
+      esac
+    done <"$result_file"
+  done
+  [[ "$last_sha" =~ ^[0-9a-f]{40}$ ]] || return 1
+  printf '%s\n' "$last_sha"
+}
+
+recover_legacy_pending_rollback() {
+  local current_head="$1" marker_target="$2" step_log="$3"
+  local deployed_sha running_sha reflog_shas candidate saw_target=0
+  deployed_sha="$(last_successful_deployed_sha || true)"
+  running_sha="$(fetch_live_deployed_sha "$step_log" || true)"
+  if [[ -n "$deployed_sha" ]]; then
+    deployed_sha="$(capture_logged 30 "$step_log" git -C "$checkout" rev-parse --verify "${deployed_sha}^{commit}")" || return 68
+    printf '[%s] legacy pending marker rollback source=last-successful-restart sha=%s running_sha=%s\n' "$(date -u +%FT%TZ)" "$deployed_sha" "${running_sha:-unknown}" >>"$step_log"
+  elif [[ "$current_head" != "$marker_target" && "$running_sha" == "$current_head" ]]; then
+    deployed_sha="$running_sha"
+    printf '[%s] legacy pending marker rollback source=running-service-before-mutation sha=%s\n' "$(date -u +%FT%TZ)" "$deployed_sha" >>"$step_log"
+  else
+    printf '[%s] legacy pending marker migration has no authoritative last-known-good SHA current_head=%s target=%s running_sha=%s\n' "$(date -u +%FT%TZ)" "$current_head" "$marker_target" "${running_sha:-unknown}" >>"$step_log"
+    return 68
+  fi
+  if ! run_logged 60 "$step_log" git -C "$checkout" merge-base --is-ancestor "$deployed_sha" "$marker_target"; then
+    printf '[%s] running service SHA is not an ancestor of legacy pending target deployed_sha=%s target=%s\n' "$(date -u +%FT%TZ)" "$deployed_sha" "$marker_target" >>"$step_log"
+    return 68
+  fi
+  if [[ "$current_head" == "$deployed_sha" && "$current_head" != "$marker_target" ]]; then
+    printf '%s\n' "$deployed_sha"
+    return 0
+  fi
+  reflog_shas="$(capture_logged 30 "$step_log" git -C "$checkout" reflog show --format=%H --max-count=64 HEAD)" || return 68
+  while IFS= read -r candidate; do
+    [[ "$candidate" =~ ^[0-9a-f]{40}$ ]] || continue
+    if [[ "$candidate" == "$marker_target" ]]; then
+      saw_target=1
+      continue
+    fi
+    if [[ "$saw_target" -eq 1 && "$candidate" == "$deployed_sha" ]]; then
+      printf '%s\n' "$deployed_sha"
+      return 0
+    fi
+  done <<<"$reflog_shas"
+  printf '[%s] legacy pending marker migration could not prove deployed SHA preceded target deployed_sha=%s target=%s current_head=%s\n' "$(date -u +%FT%TZ)" "$deployed_sha" "$marker_target" "$current_head" >>"$step_log"
+  return 68
+}
+
+complete_pending_live_deploy() {
+  if [[ "$live_deploy_pending" -ne 1 ]]; then
+    return 0
+  fi
+  if [[ ! -f "$pending_live_deploy" ]]; then
+    printf '[%s] pending live deploy marker disappeared before cycle completion: %s\n' "$(date -u +%FT%TZ)" "$pending_live_deploy" >>"$log_file"
+    return 1
+  fi
+  mv -fT -- "$pending_live_deploy" "$completed_live_deploy"
+}
+
 prepare_stage_checkout() {
-  local step_log="$1"
+  local step_log="$1" target_sha="$2"
   remove_path_under "$stage_root" "$stage_checkout" || return 1
   run_logged 120 "$step_log" git -C "$checkout" worktree prune || return 1
   run_logged 120 "$step_log" git -C "$checkout" worktree add --detach "$stage_checkout" "$target_sha"
@@ -318,11 +575,92 @@ cleanup_stage_checkout() {
   fi
 }
 
+restore_failed_live_handoff() {
+  local step_log="$1" restored_head
+  printf '[%s] restoring live checkout after failed pre-restart handoff rollback_sha=%s\n' "$(date -u +%FT%TZ)" "$live_deploy_rollback" >>"$step_log"
+  run_logged 60 "$step_log" git -C "$checkout" checkout "$live_deploy_rollback" || return 1
+  restored_head="$(capture_logged 30 "$step_log" git -C "$checkout" rev-parse HEAD)" || return 1
+  if [[ "$restored_head" != "$live_deploy_rollback" ]]; then
+    printf '[%s] failed handoff restore reached wrong checkout head expected=%s actual=%s\n' "$(date -u +%FT%TZ)" "$live_deploy_rollback" "$restored_head" >>"$step_log"
+    return 1
+  fi
+  run_logged "$build_timeout" "$step_log" pnpm -C "$checkout" install --frozen-lockfile --prefer-offline
+}
+
+server_state_home() {
+  local home="${T3CODE_HOME:-}"
+  if [[ -n "$home" ]]; then
+    printf '%s\n' "$home"
+    return 0
+  fi
+  cd "$(dirname "$db")/.." 2>/dev/null && pwd -P
+}
+
+prepare_live_resume_token() {
+  local current_head="$1" step_log="$2"
+  local home json parsed
+  if [[ -n "${T3DR_TOKEN:-}" || -n "${T3_TOKEN:-}" ]]; then
+    printf '[%s] live resume token supplied; skipping pre-mutation mint\n' "$(date -u +%FT%TZ)" >>"$step_log"
+    return 0
+  fi
+  if [[ "$current_head" != "$live_deploy_rollback" ]]; then
+    printf '[%s] refusing resume-token mint from post-mutation checkout current_head=%s rollback_sha=%s; supply T3DR_TOKEN or T3_TOKEN\n' \
+      "$(date -u +%FT%TZ)" "$current_head" "$live_deploy_rollback" >>"$step_log"
+    return 68
+  fi
+  home="$(server_state_home)" || return 1
+  if [[ -f "$checkout/apps/server/dist/bin.mjs" ]]; then
+    live_resume_entry="$checkout/apps/server/dist/bin.mjs"
+  else
+    live_resume_entry="$checkout/apps/server/src/bin.ts"
+  fi
+  json="$(
+    env -u VITE_DEV_SERVER_URL T3CODE_HOME="$home" timeout 30 node "$live_resume_entry" auth session issue \
+      --json \
+      --ttl "${T3DR_RESUME_TOKEN_TTL:-7200s}" \
+      --label daily-restart-resume-injection \
+      --subject daily-restart-resume-injection 2>>"$step_log"
+  )" || return 1
+  parsed="$(node -e 'const fs=require("node:fs"); const issued=JSON.parse(fs.readFileSync(0,"utf8")); console.log(issued.token || ""); console.log(issued.sessionId || "");' <<<"$json" 2>>"$step_log")" || return 1
+  live_resume_token="$(sed -n '1p' <<<"$parsed")"
+  live_resume_session_id="$(sed -n '2p' <<<"$parsed")"
+  if [[ -z "$live_resume_token" || -z "$live_resume_session_id" ]]; then
+    live_resume_token=""
+    live_resume_session_id=""
+    return 1
+  fi
+  live_resume_cleanup_safe=1
+  printf '[%s] minted live resume token before checkout dependency mutation\n' "$(date -u +%FT%TZ)" >>"$step_log"
+}
+
+cleanup_unhanded_live_resume_token() {
+  local home
+  if [[ -z "$live_resume_session_id" || "$live_resume_handed_off" -eq 1 ]]; then
+    return 0
+  fi
+  if [[ "$live_resume_cleanup_safe" -ne 1 || -z "$live_resume_entry" ]]; then
+    log "WARNING live resume token cannot be safely revoked from the mutated checkout; leaving it to expire"
+    return 1
+  fi
+  home="$(server_state_home)" || return 1
+  if ! env -u VITE_DEV_SERVER_URL T3CODE_HOME="$home" timeout 30 node "$live_resume_entry" \
+    auth session revoke "$live_resume_session_id" >>"$log_file" 2>&1; then
+    log "WARNING failed to revoke unhanded live resume token"
+    return 1
+  fi
+  live_resume_token=""
+  live_resume_session_id=""
+  live_resume_entry=""
+  live_resume_cleanup_safe=0
+}
+
 build_release_artifacts() {
   local step="build-release-artifacts"
   local step_log="$run_dir/$step.log"
   local started="$SECONDS" rc=0 duration
-  local rollback_sha target_sha dependency_changes
+  local rollback_sha target_sha dependency_changes pending_metadata pending_format pending_rollback pending_target pending_manager_source
+  local pending_rollback_commit pending_target_commit
+  local pending_running_sha pending_successful_sha pending_reconciled=0 fallback_required=0
   : >"$step_log"
   write_event "$step" "started" "" "" "$step_log"
   log "STEP $step start log=$step_log checkout=$checkout"
@@ -334,6 +672,97 @@ build_release_artifacts() {
   if [[ "$rc" -eq 0 ]]; then
     target_sha="$(capture_logged 30 "$step_log" git -C "$checkout" rev-parse origin/main)" || rc=$?
   fi
+  if [[ "$rc" -eq 0 && -e "$pending_live_deploy" ]]; then
+    pending_metadata="$(read_pending_live_deploy)" || rc=$?
+    if [[ "$rc" -eq 0 ]]; then
+      IFS=$'\t' read -r pending_format pending_target pending_manager_source <<<"$pending_metadata"
+      pending_running_sha="$(fetch_live_deployed_sha "$step_log" || true)"
+      pending_successful_sha="$(last_successful_deployed_sha || true)"
+      if [[ "$rollback_sha" == "$pending_target" && "$pending_running_sha" == "$pending_target" &&
+        "$pending_successful_sha" == "$pending_target" ]]; then
+        live_deploy_pending=1
+        if complete_pending_live_deploy; then
+          live_deploy_pending=0
+          pending_reconciled=1
+          printf '[%s] reconciled pending live deploy already completed target_sha=%s format=%s\n' \
+            "$(date -u +%FT%TZ)" "$pending_target" "$pending_format" >>"$step_log"
+        else
+          rc=$?
+        fi
+      elif [[ "$pending_format" == "legacy" ]]; then
+        pending_rollback="$(recover_legacy_pending_rollback "$rollback_sha" "$pending_target" "$step_log")" || rc=$?
+        if [[ "$rc" -eq 0 ]]; then
+          pending_manager_source="$rollback_sha"
+          printf '[%s] migrating legacy pending live deploy rollback_sha=%s target_sha=%s manager_source_sha=%s\n' "$(date -u +%FT%TZ)" "$pending_rollback" "$pending_target" "$pending_manager_source" >>"$step_log"
+        fi
+      else
+        pending_rollback="$pending_format"
+        if [[ "$pending_manager_source" == "rollback" ]]; then
+          pending_manager_source="$pending_rollback"
+        fi
+      fi
+    fi
+    if [[ "$rc" -eq 0 && "$pending_reconciled" -eq 0 ]]; then
+      if [[ "$pending_running_sha" != "$pending_rollback" ||
+        ( "$rollback_sha" != "$pending_rollback" && "$rollback_sha" != "$pending_target" ) ]]; then
+        printf '[%s] pending live deploy state is ambiguous; refusing retry current_head=%s rollback_sha=%s target_sha=%s running_sha=%s successful_sha=%s\n' \
+          "$(date -u +%FT%TZ)" "$rollback_sha" "$pending_rollback" "$pending_target" \
+          "${pending_running_sha:-unknown}" "${pending_successful_sha:-unknown}" >>"$step_log"
+        rc=68
+      else
+        printf '[%s] pending live deploy still runs rollback_sha=%s checkout_sha=%s; retrying stored target_sha=%s\n' \
+          "$(date -u +%FT%TZ)" "$pending_rollback" "$rollback_sha" "$pending_target" >>"$step_log"
+      fi
+    fi
+    if [[ "$rc" -eq 0 && "$pending_reconciled" -eq 0 ]]; then
+      pending_rollback_commit="$(capture_logged 30 "$step_log" git -C "$checkout" rev-parse --verify "${pending_rollback}^{commit}")" || rc=68
+      if [[ "$rc" -eq 0 && "$pending_rollback_commit" != "$pending_rollback" ]]; then
+        printf '[%s] pending rollback SHA did not resolve exactly expected=%s actual=%s\n' \
+          "$(date -u +%FT%TZ)" "$pending_rollback" "$pending_rollback_commit" >>"$step_log"
+        rc=68
+      fi
+    fi
+    if [[ "$rc" -eq 0 && "$pending_reconciled" -eq 0 ]]; then
+      pending_target_commit="$(capture_logged 30 "$step_log" git -C "$checkout" rev-parse --verify "${pending_target}^{commit}")" || rc=70
+      if [[ "$rc" -eq 0 && "$pending_target_commit" != "$pending_target" ]]; then
+        printf '[%s] stored pending target did not resolve exactly expected=%s actual=%s\n' \
+          "$(date -u +%FT%TZ)" "$pending_target" "$pending_target_commit" >>"$step_log"
+        rc=70
+      elif [[ "$rc" -eq 70 ]]; then
+        printf '[%s] stored pending target is no longer available after origin fetch target_sha=%s origin_main=%s\n' \
+          "$(date -u +%FT%TZ)" "$pending_target" "$target_sha" >>"$step_log"
+      fi
+    fi
+    if [[ "$rc" -eq 0 && "$pending_reconciled" -eq 0 ]]; then
+      if ! run_logged 60 "$step_log" git -C "$checkout" merge-base --is-ancestor "$pending_rollback" "$pending_target"; then
+        printf '[%s] stored pending target is not a fast-forward from pending rollback_sha=%s target_sha=%s\n' \
+          "$(date -u +%FT%TZ)" "$pending_rollback" "$pending_target" >>"$step_log"
+        rc=67
+      fi
+    fi
+    if [[ "$rc" -eq 0 && "$pending_reconciled" -eq 0 ]]; then
+      if ! run_logged 60 "$step_log" git -C "$checkout" merge-base --is-ancestor "$pending_target" "$target_sha"; then
+        printf '[%s] stored pending target is no longer reachable from origin/main target_sha=%s origin_main=%s\n' \
+          "$(date -u +%FT%TZ)" "$pending_target" "$target_sha" >>"$step_log"
+        rc=70
+      fi
+    fi
+    if [[ "$rc" -eq 0 && "$pending_reconciled" -eq 0 ]]; then
+      printf '[%s] retrying pending live deploy stored_target=%s origin_main=%s\n' \
+        "$(date -u +%FT%TZ)" "$pending_target" "$target_sha" >>"$step_log"
+      rc=66
+      fallback_required=1
+      live_deploy_rollback="$pending_rollback"
+      live_deploy_target="$pending_target"
+      live_restart_source_sha="$pending_manager_source"
+    fi
+  fi
+  if [[ "$rc" -eq 0 && "$rollback_sha" != "$target_sha" ]]; then
+    if ! run_logged 60 "$step_log" git -C "$checkout" merge-base --is-ancestor "$rollback_sha" "$target_sha"; then
+      printf '[%s] target is not a fast-forward from rollback_sha; refusing prebuilt deploy before downtime\n' "$(date -u +%FT%TZ)" >>"$step_log"
+      rc=67
+    fi
+  fi
   if [[ "$rc" -eq 0 && "$rollback_sha" != "$target_sha" ]]; then
     dependency_changes="$(changed_dependency_manifests "$rollback_sha" "$target_sha" "$step_log")" || rc=$?
     if [[ "$rc" -eq 0 && -n "$dependency_changes" ]]; then
@@ -342,12 +771,10 @@ build_release_artifacts() {
         printf '%s\n' "$dependency_changes"
       } >>"$step_log"
       rc=66
-    fi
-  fi
-  if [[ "$rc" -eq 0 && "$rollback_sha" != "$target_sha" ]]; then
-    if ! run_logged 60 "$step_log" git -C "$checkout" merge-base --is-ancestor "$rollback_sha" "$target_sha"; then
-      printf '[%s] target is not a fast-forward from rollback_sha; refusing prebuilt deploy before downtime\n' "$(date -u +%FT%TZ)" >>"$step_log"
-      rc=67
+      fallback_required=1
+      live_deploy_rollback="$rollback_sha"
+      live_deploy_target="$target_sha"
+      live_restart_source_sha="$rollback_sha"
     fi
   fi
   if [[ "$rc" -eq 0 && ( "$rollback_sha" != "$target_sha" || "$build_always" == "1" ) ]]; then
@@ -357,7 +784,7 @@ build_release_artifacts() {
     mkdir -p "$stage_root" || rc=$?
   fi
   if [[ "$rc" -eq 0 && ( "$rollback_sha" != "$target_sha" || "$build_always" == "1" ) ]]; then
-    prepare_stage_checkout "$step_log" || rc=$?
+    prepare_stage_checkout "$step_log" "$target_sha" || rc=$?
   fi
   if [[ "$rc" -eq 0 && ( "$rollback_sha" != "$target_sha" || "$build_always" == "1" ) ]]; then
     run_logged "$build_timeout" "$step_log" pnpm -C "$stage_checkout" install --frozen-lockfile --prefer-offline || rc=$?
@@ -416,9 +843,149 @@ build_release_artifacts() {
     log "STEP $step ok duration=${duration}s"
     return 0
   fi
+  if [[ "$rc" -eq 66 && "$fallback_required" -eq 1 ]]; then
+    write_event "$step" "fallback" "$rc" "$duration" "$step_log"
+    log "STEP $step fallback rc=66 target_sha=$live_deploy_target"
+    return 66
+  fi
   write_event "$step" "failed" "$rc" "$duration" "$step_log"
   record_failure "$step" "$rc" "$step_log"
   return "$rc"
+}
+
+run_live_deploy_step() {
+  local step="live-deploy"
+  local step_log="$run_dir/$step.log"
+  local started="$SECONDS" rc=0 duration live_checkout_mutated=0
+  local checkout_status current_head deployed_head
+  : >"$step_log"
+  write_event "$step" "started" "" "" "$step_log"
+  log "STEP $step start log=$step_log rollback_sha=$live_deploy_rollback target_sha=$live_deploy_target manager_source_sha=$live_restart_source_sha"
+
+  if [[ -z "$live_deploy_rollback" || -z "$live_deploy_target" || -z "$live_restart_source_sha" ]]; then
+    printf '[%s] missing pinned rollback, target, or restart manager source for rc=66 fallback\n' "$(date -u +%FT%TZ)" >>"$step_log"
+    rc=68
+  fi
+  if [[ "$rc" -eq 0 ]]; then
+    checkout_status="$(capture_logged 30 "$step_log" git -C "$checkout" status --porcelain)" || rc=$?
+    if [[ "$rc" -eq 0 && -n "$checkout_status" ]]; then
+      printf '[%s] live checkout is dirty; refusing rc=66 fallback update\n' "$(date -u +%FT%TZ)" >>"$step_log"
+      rc=69
+    fi
+  fi
+  if [[ "$rc" -eq 0 ]]; then
+    current_head="$(capture_logged 30 "$step_log" git -C "$checkout" rev-parse HEAD)" || rc=$?
+  fi
+  if [[ "$rc" -eq 0 ]]; then
+    run_logged 60 "$step_log" git -C "$checkout" merge-base --is-ancestor "$current_head" "$live_deploy_target" || rc=67
+  fi
+  if [[ "$rc" -eq 0 ]]; then
+    # The function and its run_logged calls only append to this log; they never read it.
+    # shellcheck disable=SC2094
+    pin_live_restart_orchestrator "$current_head" "$live_deploy_rollback" "$live_restart_source_sha" "$step_log" >>"$step_log" 2>&1 || rc=$?
+  fi
+  if [[ "$rc" -eq 0 && -z "${T3DR_TOKEN:-}" && -z "${T3_TOKEN:-}" &&
+    "$current_head" != "$live_deploy_rollback" ]]; then
+    printf '[%s] restoring post-mutation checkout to running rollback before resume-token mint current_head=%s rollback_sha=%s\n' \
+      "$(date -u +%FT%TZ)" "$current_head" "$live_deploy_rollback" >>"$step_log"
+    if restore_failed_live_handoff "$step_log"; then
+      current_head="$live_deploy_rollback"
+    else
+      rc=$?
+    fi
+  fi
+  if [[ "$rc" -eq 0 ]]; then
+    mkdir -p "$stage_root" || rc=$?
+  fi
+  if [[ "$rc" -eq 0 ]]; then
+    prepare_stage_checkout "$step_log" "$live_deploy_target" || rc=$?
+  fi
+  if [[ "$rc" -eq 0 ]]; then
+    run_logged "$build_timeout" "$step_log" pnpm -C "$stage_checkout" install --frozen-lockfile --prefer-offline || rc=$?
+  fi
+  if [[ "$rc" -eq 0 ]]; then
+    run_logged "$build_timeout" "$step_log" env T3CODE_BUILD_SHA="$live_deploy_target" pnpm -C "$stage_checkout/apps/web" run build || rc=$?
+  fi
+  if [[ "$rc" -eq 0 ]]; then
+    if [[ "$desktop_artifact" == "1" ]]; then
+      mkdir -p "$desktop_artifact_dir" || rc=$?
+      if [[ "$rc" -eq 0 ]]; then
+        run_logged "$build_timeout" "$step_log" env T3CODE_BUILD_SHA="$live_deploy_target" T3CODE_DESKTOP_OUTPUT_DIR="$desktop_artifact_dir" pnpm -C "$stage_checkout" run dist:desktop:artifact || rc=$?
+      fi
+    else
+      printf '[%s] DESKTOP_ARTIFACT TODO no-op: set T3DR_DESKTOP_ARTIFACT=1 after T1 lands to run dist:desktop:artifact into %s\n' "$(date -u +%FT%TZ)" "$desktop_artifact_dir" >>"$step_log"
+    fi
+  fi
+  if [[ "$rc" -eq 0 ]]; then
+    checkout_status="$(capture_logged 30 "$step_log" git -C "$checkout" status --porcelain)" || rc=$?
+    if [[ "$rc" -eq 0 && -n "$checkout_status" ]]; then
+      printf '[%s] live checkout became dirty; refusing rc=66 fallback update\n' "$(date -u +%FT%TZ)" >>"$step_log"
+      rc=69
+    fi
+  fi
+  if [[ "$rc" -eq 0 ]]; then
+    prepare_live_resume_token "$current_head" "$step_log" || rc=$?
+  fi
+  if [[ "$rc" -eq 0 ]]; then
+    write_pending_live_deploy "$live_deploy_rollback" "$live_deploy_target" "$live_restart_source_sha" || rc=$?
+    if [[ "$rc" -eq 0 ]]; then
+      live_deploy_pending=1
+    fi
+  fi
+  if [[ "$rc" -eq 0 ]]; then
+    if run_logged 120 "$step_log" git -C "$checkout" merge --ff-only "$live_deploy_target"; then
+      if [[ "$current_head" != "$live_deploy_target" ]]; then
+        live_checkout_mutated=1
+        live_resume_cleanup_safe=0
+      fi
+    else
+      rc=$?
+    fi
+  fi
+  if [[ "$rc" -eq 0 ]]; then
+    deployed_head="$(capture_logged 30 "$step_log" git -C "$checkout" rev-parse HEAD)" || rc=$?
+    if [[ "$rc" -eq 0 && "$deployed_head" != "$live_deploy_target" ]]; then
+      printf '[%s] live checkout did not reach pinned target expected=%s actual=%s\n' "$(date -u +%FT%TZ)" "$live_deploy_target" "$deployed_head" >>"$step_log"
+      rc=67
+    fi
+  fi
+  if [[ "$rc" -eq 0 ]]; then
+    run_logged "$build_timeout" "$step_log" pnpm -C "$checkout" install --frozen-lockfile --prefer-offline || rc=$?
+  fi
+  if [[ "$rc" -eq 0 ]]; then
+    write_restart_metadata live "$live_deploy_rollback" "$live_deploy_target" || rc=$?
+  fi
+  cleanup_stage_checkout "$step_log"
+  if [[ "$rc" -ne 0 && "$live_checkout_mutated" -eq 1 ]]; then
+    if restore_failed_live_handoff "$step_log"; then
+      live_resume_cleanup_safe=1
+    else
+      printf '[%s] ERROR failed to restore checkout after live handoff failure\n' "$(date -u +%FT%TZ)" >>"$step_log"
+    fi
+  fi
+  if [[ "$rc" -ne 0 ]]; then
+    cleanup_unhanded_live_resume_token || true
+  fi
+
+  duration=$((SECONDS - started))
+  if [[ "$rc" -eq 0 ]]; then
+    write_event "$step" "ok" "$rc" "$duration" "$step_log"
+    log "STEP $step ok duration=${duration}s"
+    return 0
+  fi
+  write_event "$step" "failed" "$rc" "$duration" "$step_log"
+  record_failure "$step" "$rc" "$step_log"
+  return "$rc"
+}
+
+prepare_deploy() {
+  local build_rc=0
+  build_release_artifacts || build_rc=$?
+  case "$build_rc" in
+    0) return 0 ;;
+    66) run_live_deploy_step ;;
+    *) return "$build_rc" ;;
+  esac
 }
 
 run_restart_step() {
@@ -474,14 +1041,28 @@ run_restart_step() {
       printf '[%s] invalid no-op restart metadata in %s\n' "$(date -u +%FT%TZ)" "$prebuilt_env" >>"$step_log"
       rc=68
     else
-      env "${restart_env[@]}" \
-        T3DR_TARGET_SHA="$target" \
-        "$restart_cmd" >>"$step_log" 2>&1
+      if [[ -n "$live_resume_token" ]]; then
+        live_resume_handed_off=1
+        T3DR_TOKEN="$live_resume_token" T3DR_TOKEN_SESSION_ID="$live_resume_session_id" \
+          env "${restart_env[@]}" T3DR_DEFER_RESUME_TOKEN_REVOKE=1 \
+          T3DR_PREBUILT_TARGET=0 T3DR_ROLLBACK_SHA="$rollback" T3DR_TARGET_SHA="$target" \
+          "$restart_cmd" >>"$step_log" 2>&1
+      else
+        env "${restart_env[@]}" \
+          T3DR_PREBUILT_TARGET=0 T3DR_ROLLBACK_SHA="$rollback" T3DR_TARGET_SHA="$target" \
+          "$restart_cmd" >>"$step_log" 2>&1
+      fi
       rc=$?
     fi
   else
     printf '[%s] missing restart metadata in %s\n' "$(date -u +%FT%TZ)" "$prebuilt_env" >>"$step_log"
     rc=68
+  fi
+  if [[ "$live_resume_handed_off" -eq 1 ]]; then
+    live_resume_token=""
+    live_resume_session_id=""
+    live_resume_entry=""
+    live_resume_cleanup_safe=0
   fi
   duration=$((SECONDS - started))
   if [[ "$rc" -eq 0 ]]; then
@@ -508,20 +1089,76 @@ assert_deadline() {
   write_event "deadline" "ok" 0 "$((deadline - now))" ""
 }
 
+# ShellCheck cannot infer that this function is invoked by the EXIT trap.
+# shellcheck disable=SC2317
+record_unexpected_exit() {
+  local rc="$?"
+  cleanup_unhanded_live_resume_token || true
+  if [[ "$rc" -ne 0 && "$failure_recorded" -eq 0 ]]; then
+    record_failure "unexpected-exit" "$rc" "$log_file"
+    write_event "cycle" "failed" "$rc" "" "$log_file"
+    log "END FAILED"
+  fi
+}
+
+# ShellCheck cannot infer that this function is invoked by the signal traps.
+# shellcheck disable=SC2317
+record_signal() {
+  local signal="$1" rc="$2"
+  trap - TERM INT HUP
+  if [[ "$failure_recorded" -eq 0 ]]; then
+    record_failure "signal-$signal" "$rc" "$log_file"
+    write_event "cycle" "failed" "$rc" "" "$log_file"
+    log "END FAILED signal=$signal"
+  fi
+  exit "$rc"
+}
+
+trap record_unexpected_exit EXIT
+trap 'record_signal TERM 143' TERM
+trap 'record_signal INT 130' INT
+trap 'record_signal HUP 129' HUP
+
+if ! exec 9>"$lock_file"; then
+  record_failure "lock" 1 "$log_file"
+  write_event "cycle" "failed" 1 "" "$log_file"
+  log "END FAILED"
+  exit 1
+fi
+if ! flock -n 9; then
+  record_failure "lock" 75 "$log_file"
+  write_event "cycle" "failed" 75 "" "$log_file"
+  log "END LOCKED"
+  exit 75
+fi
+
 log "BEGIN checkout=$checkout ledger=$ledger deadline=${deadline_local} timezone=$timezone"
 write_event "cycle" "started" "" "" "$log_file"
 
+if [[ -n "$startup_error" ]]; then
+  echo "$startup_error" >&2
+  usage
+  record_failure "configuration" "$startup_rc" "$log_file"
+  write_event "cycle" "failed" "$startup_rc" "" "$log_file"
+  log "END FAILED"
+  exit "$startup_rc"
+fi
+
 if run_shell_step "backup" "$backup_timeout" "$backup_cmd" &&
   run_shell_step "upstream-sync" "$sync_timeout" "T3_REPO_DIR=$(shell_quote "$checkout") $upstream_sync_cmd" &&
-  build_release_artifacts &&
+  prepare_deploy &&
   run_restart_step &&
-  assert_deadline; then
+  assert_deadline &&
+  complete_pending_live_deploy; then
   printf '%s RESULT OK run_dir=%s deadline=%s/%s\n' "$(date -u +%FT%TZ)" "$run_dir" "$timezone" "$deadline_local" | tee -a "$result_file" >&2
   write_event "cycle" "ok" 0 "" "$log_file"
   log "END OK"
   exit 0
 fi
 
+if [[ "$failure_recorded" -eq 0 ]]; then
+  record_failure "cycle" 1 "$log_file"
+fi
 write_event "cycle" "failed" 1 "" "$log_file"
 log "END FAILED"
 exit 1

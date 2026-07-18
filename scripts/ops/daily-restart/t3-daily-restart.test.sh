@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# Assertion chains are safe here because pass and fail always return success.
+# shellcheck disable=SC2015
 set -u
 
 ROOT="$(git rev-parse --show-toplevel)"
@@ -51,6 +53,14 @@ WEAK
 echo "verify-weakened $*" >>"$T_LOG"
 WEAK
       chmod +x "$T_TMP/bin/verify-restart"
+    fi
+    if [[ "${FAKE_TARGET_WEAKENS_DB_RESTORE:-0}" == "1" ]]; then
+      cat >"$T_TMP/bin/t3-db-restore" <<'WEAK'
+#!/usr/bin/env bash
+echo "restore-target $*" >>"$T_LOG"
+exit 97
+WEAK
+      chmod +x "$T_TMP/bin/t3-db-restore"
     fi
     exit "${FAKE_GIT_RC:-0}"
     ;;
@@ -132,7 +142,7 @@ echo "$T_TMP/snapshot.sqlite"
 SH
   cat >"$dir/t3-db-restore" <<'SH'
 #!/usr/bin/env bash
-echo "restore $*" >>"$T_LOG"
+echo "restore-original $*" >>"$T_LOG"
 exit "${FAKE_RESTORE_RC:-0}"
 SH
   cat >"$dir/capture-active-threads" <<'SH'
@@ -252,6 +262,9 @@ if [[ "${FAKE_PNPM_FAIL_ONCE:-0}" == "1" && ! -f "$T_TMP/pnpm-failed" ]]; then
   : >"$T_TMP/pnpm-failed"
   exit 8
 fi
+if [[ "$*" == *" install "* && -n "${FAKE_PNPM_INSTALL_RC:-}" ]]; then
+  exit "$FAKE_PNPM_INSTALL_RC"
+fi
 exit "${FAKE_PNPM_RC:-0}"
 SH
   cat >"$dir/claude" <<'SH'
@@ -329,12 +342,74 @@ grep -Fq "health --origin http://127.0.0.1:1 --service fake.service --instance f
 grep -Fq "verify-restart --service fake.service --origin http://127.0.0.1:1 --checkout $tmp/checkout --expected-sha bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb --previous-pid 111 --timeout 1" "$tmp/calls.log" && pass "verify-restart receives pid and target" || fail "verify-restart receives pid and target"
 
 tmp="$(mktemp -d)"
+T3DR_TOKEN=pre-minted-token T3DR_TOKEN_SESSION_ID=pre-minted-session run_manager "$tmp"
+[[ "$(cat "$tmp/rc")" == "0" ]] && pass "pre-minted resume token exits zero" || fail "pre-minted resume token exits zero"
+if grep -Fq "mint-resume-token" "$tmp/calls.log"; then
+  fail "pre-minted resume token was minted again"
+else
+  pass "pre-minted resume token skips checkout-hosted mint"
+fi
+grep -Fq "revoke-resume-token pre-minted-session" "$tmp/calls.log" \
+  && pass "pre-minted resume token session is revoked" \
+  || fail "pre-minted resume token session is revoked"
+
+tmp="$(mktemp -d)"
+export FAKE_PRE_SHA=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+run_manager "$tmp" \
+  --rollback-sha aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+  --target-sha bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+unset FAKE_PRE_SHA
+[[ "$(cat "$tmp/rc")" == "2" ]] && pass "live fallback without pre-minted token exits two" || fail "live fallback without pre-minted token exits two"
+grep -Fq "live fallback requires a resume token minted before checkout dependency mutation" "$tmp/stderr" \
+  && pass "live fallback without pre-minted token fails closed" \
+  || fail "live fallback without pre-minted token fails closed"
+
+tmp="$(mktemp -d)"
+export FAKE_PRE_SHA=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+T3DR_TOKEN=pre-minted-token T3DR_TOKEN_SESSION_ID=deferred-session \
+  T3DR_DEFER_RESUME_TOKEN_REVOKE=1 run_manager "$tmp" \
+  --rollback-sha aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+  --target-sha bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+unset FAKE_PRE_SHA
+[[ "$(cat "$tmp/rc")" == "0" ]] && pass "deferred live token handoff exits zero" || fail "deferred live token handoff exits zero"
+grep -Fq "revoke-resume-token deferred-session" "$tmp/calls.log" \
+  && pass "deferred live token revokes after a consistent server build" \
+  || fail "deferred live token revokes after a consistent server build"
+
+tmp="$(mktemp -d)"
+export FAKE_PRE_SHA=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+export FAKE_SNAPSHOT_FAIL_N=1
+T3DR_TOKEN=pre-minted-token T3DR_TOKEN_SESSION_ID=deferred-session \
+  T3DR_DEFER_RESUME_TOKEN_REVOKE=1 run_manager "$tmp" \
+  --rollback-sha aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+  --target-sha bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+unset FAKE_PRE_SHA FAKE_SNAPSHOT_FAIL_N
+[[ "$(cat "$tmp/rc")" != "0" ]] && pass "deferred live token pre-build failure exits nonzero" || fail "deferred live token pre-build failure exits nonzero"
+if grep -Fq "revoke-resume-token deferred-session" "$tmp/calls.log"; then
+  fail "deferred live token used an inconsistent server artifact for revocation"
+else
+  pass "deferred live token avoids inconsistent server artifact revocation"
+fi
+
+tmp="$(mktemp -d)"
 export FAKE_VERIFY_RESTART_RC=9
 run_manager "$tmp"
 unset FAKE_VERIFY_RESTART_RC
 [[ "$(cat "$tmp/rc")" != "0" ]] && pass "verify-restart failure exits nonzero" || fail "verify-restart failure exits nonzero"
-assert_order "$tmp/calls.log" "systemctl --user start fake.service" "verify-restart" "systemctl --user stop fake.service" "git -C $tmp/checkout checkout aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" "restore" "pnpm -C $tmp/checkout/apps/web run build" "pnpm -C $tmp/checkout run build:desktop" "systemctl --user start fake.service" "health"
+assert_order "$tmp/calls.log" "systemctl --user start fake.service" "verify-restart" "systemctl --user stop fake.service" "restore" "git -C $tmp/checkout checkout aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" "pnpm -C $tmp/checkout install --frozen-lockfile --prefer-offline" "pnpm -C $tmp/checkout/apps/web run build" "pnpm -C $tmp/checkout run build:desktop" "systemctl --user start fake.service" "health"
 grep -Fq "RESULT ROLLBACK-OK" "$tmp/ledger/"*/t3-daily-restart.result && pass "verify-restart failure rolls back loudly" || fail "verify-restart failure rolls back loudly"
+
+tmp="$(mktemp -d)"
+export FAKE_VERIFY_RESTART_RC=9
+export FAKE_PNPM_INSTALL_RC=8
+run_manager "$tmp"
+unset FAKE_VERIFY_RESTART_RC FAKE_PNPM_INSTALL_RC
+[[ "$(cat "$tmp/rc")" != "0" ]] && pass "rollback dependency install failure exits nonzero" || fail "rollback dependency install failure exits nonzero"
+assert_order "$tmp/calls.log" "verify-restart" "systemctl --user stop fake.service" "restore" "git -C $tmp/checkout checkout aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" "pnpm -C $tmp/checkout install --frozen-lockfile --prefer-offline"
+grep -Fq "ROLLBACK dependency restore failed after db restore" "$tmp/ledger/"*/t3-daily-restart.log \
+  && grep -Fq "RESULT ROLLBACK-FAILED" "$tmp/ledger/"*/t3-daily-restart.result \
+  && pass "rollback install failure restores quiesced database first" \
+  || fail "rollback install failure restores quiesced database first"
 
 tmp="$(mktemp -d)"
 caller_path="$tmp/nonstandard-node"
@@ -496,7 +571,7 @@ export FAKE_HEALTH_FAIL_ONCE=1
 run_manager "$tmp"
 unset FAKE_HEALTH_FAIL_ONCE
 [[ "$(cat "$tmp/rc")" != "0" ]] && pass "health rollback exits nonzero" || fail "health rollback exits nonzero"
-assert_order "$tmp/calls.log" "health" "systemctl --user stop" "git -C" "restore" "pnpm -C $tmp/checkout/apps/web run build" "pnpm -C $tmp/checkout run build:desktop" "systemctl --user start" "health"
+assert_order "$tmp/calls.log" "health" "systemctl --user stop" "restore" "git -C" "pnpm -C $tmp/checkout install --frozen-lockfile --prefer-offline" "pnpm -C $tmp/checkout/apps/web run build" "pnpm -C $tmp/checkout run build:desktop" "systemctl --user start" "health"
 grep -Fq "RESULT ROLLBACK-OK" "$tmp/ledger/"*/t3-daily-restart.result && pass "health rollback result recorded" || fail "health rollback result recorded"
 if grep -Fq "diff --quiet" "$tmp/calls.log"; then
   fail "health rollback consulted migration diff"
@@ -507,6 +582,21 @@ if awk 'f && /inject/ { found=1 } /pnpm -C .* run build:desktop/ { if (++n == 2)
   pass "health rollback injects resume"
 else
   fail "health rollback injects resume"
+fi
+
+tmp="$(mktemp -d)"
+export FAKE_HEALTH_FAIL_ONCE=1
+export FAKE_TARGET_WEAKENS_DB_RESTORE=1
+run_manager "$tmp"
+unset FAKE_HEALTH_FAIL_ONCE FAKE_TARGET_WEAKENS_DB_RESTORE
+[[ "$(cat "$tmp/rc")" != "0" ]] && pass "target-tainted db restore rollback exits nonzero" || fail "target-tainted db restore rollback exits nonzero"
+grep -Fq "restore-original --db $tmp/state.sqlite" "$tmp/calls.log" \
+  && pass "rollback uses the pinned pre-update db restore" \
+  || fail "rollback uses the pinned pre-update db restore"
+if grep -Fq "restore-target" "$tmp/calls.log"; then
+  fail "rollback used the target-tainted db restore"
+else
+  pass "rollback ignores the target-tainted db restore"
 fi
 
 tmp="$(mktemp -d)"
@@ -576,7 +666,7 @@ export FAKE_PNPM_FAIL_ONCE=1
 run_manager "$tmp"
 unset FAKE_PNPM_FAIL_ONCE
 [[ "$(cat "$tmp/rc")" != "0" ]] && pass "web build failure exits nonzero" || fail "web build failure exits nonzero"
-assert_order "$tmp/calls.log" "pnpm -C $tmp/checkout/apps/web run build" "systemctl --user stop" "git -C" "pnpm -C $tmp/checkout/apps/web run build" "pnpm -C $tmp/checkout run build:desktop" "systemctl --user start" "health"
+assert_order "$tmp/calls.log" "pnpm -C $tmp/checkout/apps/web run build" "systemctl --user stop" "git -C" "pnpm -C $tmp/checkout install --frozen-lockfile --prefer-offline" "pnpm -C $tmp/checkout/apps/web run build" "pnpm -C $tmp/checkout run build:desktop" "systemctl --user start" "health"
 if awk 'f && /restore/ { found=1 } /pnpm/ { f=1 } END { exit found ? 0 : 1 }' "$tmp/calls.log"; then
   fail "web build rollback restored db"
 else
@@ -685,6 +775,34 @@ else
 fi
 
 tmp="$(mktemp -d)"
+export FAKE_PRE_SHA=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+T3DR_TOKEN=live-fallback-token run_manager "$tmp" \
+  --rollback-sha aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+  --target-sha bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+unset FAKE_PRE_SHA
+[[ "$(cat "$tmp/rc")" == "0" ]] && pass "live fallback restart exits zero" || fail "live fallback restart exits zero"
+grep -Fq "pnpm-env T3CODE_BUILD_SHA=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb cmd=-C $tmp/checkout/apps/web run build" "$tmp/calls.log" \
+  && grep -Fq "pnpm-env T3CODE_BUILD_SHA=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb cmd=-C $tmp/checkout run build:desktop" "$tmp/calls.log" \
+  && pass "live fallback rollback metadata forces web and server rebuilds" \
+  || fail "live fallback rollback metadata forces web and server rebuilds"
+grep -Fq '"pre_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"' "$tmp/ledger/"*/resume-manifest.json \
+  && pass "live fallback manifest records the pre-cycle rollback sha" \
+  || fail "live fallback manifest records the pre-cycle rollback sha"
+
+tmp="$(mktemp -d)"
+export FAKE_PRE_SHA=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+export FAKE_VERIFY_RESTART_RC=9
+T3DR_TOKEN=live-fallback-token run_manager "$tmp" \
+  --rollback-sha aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+  --target-sha bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+unset FAKE_PRE_SHA FAKE_VERIFY_RESTART_RC
+[[ "$(cat "$tmp/rc")" != "0" ]] && pass "live fallback verification failure exits nonzero" || fail "live fallback verification failure exits nonzero"
+grep -Fq "git -C $tmp/checkout checkout aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" "$tmp/calls.log" \
+  && grep -Fq "pnpm -C $tmp/checkout install --frozen-lockfile --prefer-offline" "$tmp/calls.log" \
+  && pass "live fallback verification failure restores pre-cycle source and dependencies" \
+  || fail "live fallback verification failure restores pre-cycle source and dependencies"
+
+tmp="$(mktemp -d)"
 run_manager "$tmp" --prebuilt-target \
   --rollback-sha aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
   --target-sha bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
@@ -715,7 +833,10 @@ run_manager "$tmp" --prebuilt-target \
   --target-sha bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
 unset FAKE_HEALTH_FAIL_ONCE
 [[ "$(cat "$tmp/rc")" != "0" ]] && pass "prebuilt health failure exits nonzero" || fail "prebuilt health failure exits nonzero"
-grep -Fq "git -C $tmp/checkout checkout aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" "$tmp/calls.log" && pass "prebuilt rollback checks out rollback sha" || fail "prebuilt rollback checks out rollback sha"
+grep -Fq "git -C $tmp/checkout checkout aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" "$tmp/calls.log" \
+  && grep -Fq "pnpm -C $tmp/checkout install --frozen-lockfile --prefer-offline" "$tmp/calls.log" \
+  && pass "prebuilt rollback restores rollback source and dependencies" \
+  || fail "prebuilt rollback restores rollback source and dependencies"
 
 tmp="$(mktemp -d)"
 export FAKE_SNAPSHOT_FAIL_N=2
