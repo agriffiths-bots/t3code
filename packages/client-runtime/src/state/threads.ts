@@ -680,6 +680,9 @@ export const makeEnvironmentThreadState = Effect.fn("EnvironmentThreadState.make
   const applyItemLocked = Effect.fn("EnvironmentThreadState.applyItemLocked")(function* (
     item: OrchestrationThreadStreamItem,
   ) {
+    if ((yield* SubscriptionRef.get(state)).status === "deleted") {
+      return;
+    }
     const storageEpoch = yield* Ref.get(currentStorageEpoch);
     const itemStorageEpoch = Option.fromNullishOr(item.storageEpoch);
     const storageEpochChanged = Option.match(itemStorageEpoch, {
@@ -963,6 +966,24 @@ export const makeEnvironmentThreadState = Effect.fn("EnvironmentThreadState.make
     },
   );
 
+  const reconcileGoneThread = Effect.fn("EnvironmentThreadState.reconcileGoneThread")(function* () {
+    yield* Effect.logWarning(
+      "Thread revision endpoint reported the thread gone; removing cached detail.",
+    ).pipe(
+      Effect.annotateLogs({
+        environmentId,
+        threadId,
+        reconciliationReason: "revision-not-found",
+      }),
+    );
+    yield* setDeleted();
+    yield* Effect.all([
+      Ref.set(pendingRevision, 0),
+      Ref.set(observedRevisionEventId, undefined),
+      Ref.set(authoritativeResetPending, false),
+    ]);
+  });
+
   const checkThreadRevision = Effect.fn("EnvironmentThreadState.checkThreadRevision")(function* () {
     const prepared = yield* SubscriptionRef.get(supervisor.prepared);
     if (Option.isNone(prepared)) {
@@ -970,6 +991,10 @@ export const makeEnvironmentThreadState = Effect.fn("EnvironmentThreadState.make
     }
     const result = yield* revisionLoader.load(prepared.value, threadId);
     yield* Ref.set(revisionCheckUnresolved, result.kind === "unavailable");
+    if (result.kind === "gone") {
+      yield* applyLock.withPermit(reconcileGoneThread());
+      return;
+    }
     let [
       verifiedRevision,
       currentPendingRevision,

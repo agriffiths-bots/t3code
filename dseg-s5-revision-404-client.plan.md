@@ -7,6 +7,7 @@ Treat the revision endpoint's typed `thread_not_found` response as definitive ev
 ## Blast radius and smallest change
 
 - `packages/client-runtime/src/state/threadSnapshotHttp.ts`: add a `gone` revision-loader result and map only `EnvironmentResourceNotFoundError` to it; web and mobile consume this shared layer unchanged.
+- `packages/client-runtime/src/state/threadSnapshotHttp.test.ts`: pin the real HTTP loader's typed-404 and transient-fetch classifications.
 - `packages/client-runtime/src/state/threads.ts`: the sole production consumer reconciles `gone` through the existing `setDeleted` state/cache path, clears unresolved reconciliation cursors, logs loudly, and becomes ineligible for further polling.
 - `packages/client-runtime/src/state/threads-sync.test.ts`: extend the loader harness and prove cached eviction, transient retention, and terminal polling behavior.
 - Server projection readers, HTTP contracts, schemas, migrations, persistence formats, restart/resume inputs, and server tests are unchanged. Cached restart state is removed through the existing cache API, so a remount cannot resurrect the gone thread.
