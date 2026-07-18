@@ -66,6 +66,7 @@ const CHECKPOINT_DIFF_CONTEXT_KEEP_PER_THREAD = MAX_THREAD_CHECKPOINTS + 1;
 const decodeReadModel = Schema.decodeUnknownEffect(OrchestrationReadModel);
 const decodeShellSnapshot = Schema.decodeUnknownEffect(OrchestrationShellSnapshot);
 const decodeThread = Schema.decodeUnknownEffect(OrchestrationThread);
+const isThreadId = Schema.is(ThreadId);
 const ProjectionProjectDbRowSchema = ProjectionProject.mapFields(
   Struct.assign({
     defaultModelSelection: Schema.NullOr(Schema.fromJsonString(ModelSelection)),
@@ -206,7 +207,50 @@ function scopeProjectAndThreadRows(input: {
     threadRows,
     sessionRows: input.sessionRows.filter((row) => visibleThreadIds.has(row.threadId)),
     latestTurnRows: input.latestTurnRows.filter((row) => visibleThreadIds.has(row.threadId)),
+    readableThreadIds: input.audienceCeiling === "private" ? undefined : visibleThreadIds,
   };
+}
+
+type ReadableThreadIds = ReadonlySet<ThreadId> | undefined;
+
+function readableThreadIdsForAudience(
+  audienceCeiling: AuthAudienceCeiling,
+  rows: ReadonlyArray<Schema.Schema.Type<typeof ProjectionThreadIdLookupRowSchema>>,
+): ReadableThreadIds {
+  if (audienceCeiling === "private") {
+    return undefined;
+  }
+  return new Set(
+    rows
+      .filter((row) => canReadDataAudience(audienceCeiling, row.dataAudience))
+      .map((row) => row.threadId),
+  );
+}
+
+function canExposeThreadReference(
+  threadId: ThreadId,
+  readableThreadIds: ReadableThreadIds,
+): boolean {
+  return readableThreadIds === undefined || readableThreadIds.has(threadId);
+}
+
+function mapParentThreadReference(
+  row: Pick<
+    Schema.Schema.Type<typeof ProjectionThreadDbRowSchema>,
+    "parentThreadId" | "parentEnvironmentId"
+  >,
+  readableThreadIds: ReadableThreadIds,
+) {
+  if (
+    row.parentThreadId === null ||
+    canExposeThreadReference(row.parentThreadId, readableThreadIds)
+  ) {
+    return {
+      parentThreadId: row.parentThreadId,
+      parentEnvironmentId: row.parentEnvironmentId ?? null,
+    };
+  }
+  return { parentThreadId: null, parentEnvironmentId: null };
 }
 
 function computeSnapshotSequence(
@@ -235,6 +279,7 @@ function computeSnapshotSequence(
 
 function mapLatestTurn(
   row: Schema.Schema.Type<typeof ProjectionLatestTurnDbRowSchema>,
+  readableThreadIds?: ReadableThreadIds,
 ): OrchestrationLatestTurn {
   return {
     turnId: row.turnId,
@@ -250,7 +295,9 @@ function mapLatestTurn(
     startedAt: row.startedAt,
     completedAt: row.completedAt,
     assistantMessageId: row.assistantMessageId,
-    ...(row.sourceProposedPlanThreadId !== null && row.sourceProposedPlanId !== null
+    ...(row.sourceProposedPlanThreadId !== null &&
+    row.sourceProposedPlanId !== null &&
+    canExposeThreadReference(row.sourceProposedPlanThreadId, readableThreadIds)
       ? {
           sourceProposedPlan: {
             threadId: row.sourceProposedPlanThreadId,
@@ -295,15 +342,44 @@ function mapProjectShellRow(
 
 function mapProposedPlanRow(
   row: Schema.Schema.Type<typeof ProjectionThreadProposedPlanDbRowSchema>,
+  readableThreadIds?: ReadableThreadIds,
 ): OrchestrationProposedPlan {
   return {
     id: row.planId,
     turnId: row.turnId,
     planMarkdown: row.planMarkdown,
     implementedAt: row.implementedAt,
-    implementationThreadId: row.implementationThreadId,
+    implementationThreadId:
+      row.implementationThreadId === null ||
+      canExposeThreadReference(row.implementationThreadId, readableThreadIds)
+        ? row.implementationThreadId
+        : null,
     createdAt: row.createdAt,
     updatedAt: row.updatedAt,
+  };
+}
+
+function mapActivityThreadReferences(
+  row: Schema.Schema.Type<typeof ProjectionThreadActivityDbRowSchema>,
+  readableThreadIds: ReadableThreadIds,
+): { readonly summary: string; readonly payload: unknown } {
+  const payload = row.payload;
+  if (
+    readableThreadIds === undefined ||
+    row.kind !== "subagent.completed" ||
+    typeof payload !== "object" ||
+    payload === null ||
+    Array.isArray(payload)
+  ) {
+    return { summary: row.summary, payload };
+  }
+  const childThreadId = Reflect.get(payload, "childThreadId");
+  if (!isThreadId(childThreadId) || readableThreadIds.has(childThreadId)) {
+    return { summary: row.summary, payload };
+  }
+  return {
+    summary: row.summary.replaceAll(childThreadId, "[redacted thread]"),
+    payload: { ...payload, childThreadId: null },
   };
 }
 
@@ -402,6 +478,21 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
         INNER JOIN projection_projects AS projects
           ON projects.project_id = threads.project_id
         ORDER BY threads.created_at ASC, threads.thread_id ASC
+      `,
+  });
+
+  const listThreadAudienceRows = SqlSchema.findAll({
+    Request: Schema.Void,
+    Result: ProjectionThreadIdLookupRowSchema,
+    execute: () =>
+      sql`
+        SELECT
+          threads.thread_id AS "threadId",
+          projects.data_audience AS "dataAudience"
+        FROM projection_threads AS threads
+        INNER JOIN projection_projects AS projects
+          ON projects.project_id = threads.project_id
+        ORDER BY threads.thread_id ASC
       `,
   });
 
@@ -1113,6 +1204,22 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
       `,
   });
 
+  const loadReadableThreadIds = (
+    audienceCeiling: AuthAudienceCeiling,
+    operation: string,
+  ): Effect.Effect<ReadableThreadIds, ProjectionRepositoryError> =>
+    Effect.gen(function* () {
+      if (audienceCeiling === "private") {
+        return undefined;
+      }
+      const rows = yield* listThreadAudienceRows(undefined).pipe(
+        Effect.mapError(
+          toPersistenceSqlOrDecodeError(`${operation}:query`, `${operation}:decodeRows`),
+        ),
+      );
+      return readableThreadIdsForAudience(audienceCeiling, rows);
+    });
+
   const getSnapshot: ProjectionSnapshotQueryShape["getSnapshot"] = () =>
     sql
       .withTransaction(
@@ -1168,6 +1275,7 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
               threadRows: visibleThreadRows,
               sessionRows: visibleSessionRows,
               latestTurnRows: visibleLatestTurnRows,
+              readableThreadIds,
             } = scopeProjectAndThreadRows({
               audienceCeiling,
               projectRows,
@@ -1201,29 +1309,7 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
               if (latestTurnByThread.has(row.threadId)) {
                 continue;
               }
-              latestTurnByThread.set(row.threadId, {
-                turnId: row.turnId,
-                state:
-                  row.state === "error"
-                    ? "error"
-                    : row.state === "interrupted"
-                      ? "interrupted"
-                      : row.state === "completed"
-                        ? "completed"
-                        : "running",
-                requestedAt: row.requestedAt,
-                startedAt: row.startedAt,
-                completedAt: row.completedAt,
-                assistantMessageId: row.assistantMessageId,
-                ...(row.sourceProposedPlanThreadId !== null && row.sourceProposedPlanId !== null
-                  ? {
-                      sourceProposedPlan: {
-                        threadId: row.sourceProposedPlanThreadId,
-                        planId: row.sourceProposedPlanId,
-                      },
-                    }
-                  : {}),
-              });
+              latestTurnByThread.set(row.threadId, mapLatestTurn(row, readableThreadIds));
             }
 
             for (const row of visibleSessionRows) {
@@ -1277,8 +1363,7 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
               updatedAt: row.updatedAt,
               archivedAt: row.archivedAt,
               deletedAt: row.deletedAt,
-              parentThreadId: row.parentThreadId ?? null,
-              parentEnvironmentId: row.parentEnvironmentId ?? null,
+              ...mapParentThreadReference(row, readableThreadIds),
               messages: [],
               turns: [],
               proposedPlans: [],
@@ -1545,6 +1630,14 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
               ),
             ),
           ),
+          listThreadAudienceRows(undefined).pipe(
+            Effect.mapError(
+              toPersistenceSqlOrDecodeError(
+                "ProjectionSnapshotQuery.getShellSnapshot:listThreadAudiences:query",
+                "ProjectionSnapshotQuery.getShellSnapshot:listThreadAudiences:decodeRows",
+              ),
+            ),
+          ),
           listProjectionStateRows(undefined).pipe(
             Effect.mapError(
               toPersistenceSqlOrDecodeError(
@@ -1556,101 +1649,107 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
         ]),
       )
       .pipe(
-        Effect.flatMap(([projectRows, threadRows, sessionRows, latestTurnRows, stateRows]) =>
-          Effect.gen(function* () {
-            const audienceCeiling = yield* currentReadAudienceCeiling;
-            const {
-              projectRows: visibleProjectRows,
-              threadRows: visibleThreadRows,
-              sessionRows: visibleSessionRows,
-              latestTurnRows: visibleLatestTurnRows,
-            } = scopeProjectAndThreadRows({
-              audienceCeiling,
-              projectRows,
-              threadRows,
-              sessionRows,
-              latestTurnRows,
-            });
-            let updatedAt: string | null = null;
-            for (const row of visibleProjectRows) {
-              updatedAt = maxIso(updatedAt, row.updatedAt);
-            }
-            for (const row of visibleThreadRows) {
-              updatedAt = maxIso(updatedAt, row.updatedAt);
-            }
-            for (const row of visibleSessionRows) {
-              updatedAt = maxIso(updatedAt, row.updatedAt);
-            }
-            for (const row of visibleLatestTurnRows) {
-              updatedAt = maxIso(updatedAt, row.requestedAt);
-              if (row.startedAt !== null) {
-                updatedAt = maxIso(updatedAt, row.startedAt);
+        Effect.flatMap(
+          ([projectRows, threadRows, sessionRows, latestTurnRows, threadAudienceRows, stateRows]) =>
+            Effect.gen(function* () {
+              const audienceCeiling = yield* currentReadAudienceCeiling;
+              const readableThreadIds = readableThreadIdsForAudience(
+                audienceCeiling,
+                threadAudienceRows,
+              );
+              const {
+                projectRows: visibleProjectRows,
+                threadRows: visibleThreadRows,
+                sessionRows: visibleSessionRows,
+                latestTurnRows: visibleLatestTurnRows,
+              } = scopeProjectAndThreadRows({
+                audienceCeiling,
+                projectRows,
+                threadRows,
+                sessionRows,
+                latestTurnRows,
+              });
+              let updatedAt: string | null = null;
+              for (const row of visibleProjectRows) {
+                updatedAt = maxIso(updatedAt, row.updatedAt);
               }
-              if (row.completedAt !== null) {
-                updatedAt = maxIso(updatedAt, row.completedAt);
+              for (const row of visibleThreadRows) {
+                updatedAt = maxIso(updatedAt, row.updatedAt);
               }
-            }
-            for (const row of stateRows) {
-              updatedAt = maxIso(updatedAt, row.updatedAt);
-            }
+              for (const row of visibleSessionRows) {
+                updatedAt = maxIso(updatedAt, row.updatedAt);
+              }
+              for (const row of visibleLatestTurnRows) {
+                updatedAt = maxIso(updatedAt, row.requestedAt);
+                if (row.startedAt !== null) {
+                  updatedAt = maxIso(updatedAt, row.startedAt);
+                }
+                if (row.completedAt !== null) {
+                  updatedAt = maxIso(updatedAt, row.completedAt);
+                }
+              }
+              for (const row of stateRows) {
+                updatedAt = maxIso(updatedAt, row.updatedAt);
+              }
 
-            const repositoryIdentities =
-              yield* resolveRepositoryIdentitiesForProjects(visibleProjectRows);
-            const latestTurnByThread = new Map(
-              visibleLatestTurnRows.map((row) => [row.threadId, mapLatestTurn(row)] as const),
-            );
-            const sessionByThread = new Map(
-              visibleSessionRows.map((row) => [row.threadId, mapSessionRow(row)] as const),
-            );
-
-            const snapshot = {
-              snapshotSequence: computeSnapshotSequence(stateRows),
-              projects: Arr.filterMap(visibleProjectRows, (row) =>
-                row.deletedAt === null
-                  ? Result.succeed(
-                      mapProjectShellRow(row, repositoryIdentities.get(row.projectId) ?? null),
-                    )
-                  : Result.failVoid,
-              ),
-              threads: Arr.filterMap(visibleThreadRows, (row) =>
-                row.deletedAt === null
-                  ? Result.succeed({
-                      id: row.threadId,
-                      projectId: row.projectId,
-                      dataAudience: row.dataAudience,
-                      title: row.title,
-                      modelSelection: row.modelSelection,
-                      runtimeMode: row.runtimeMode,
-                      interactionMode: row.interactionMode,
-                      branch: row.branch,
-                      worktreePath: row.worktreePath,
-                      worktreeRemovable: row.worktreeRemovable > 0,
-                      worktreeRemovalPath: row.worktreeRemovalPath,
-                      latestTurn: latestTurnByThread.get(row.threadId) ?? null,
-                      createdAt: row.createdAt,
-                      updatedAt: row.updatedAt,
-                      archivedAt: row.archivedAt,
-                      session: sessionByThread.get(row.threadId) ?? null,
-                      latestUserMessageAt: row.latestUserMessageAt,
-                      hasPendingApprovals: row.pendingApprovalCount > 0,
-                      hasPendingUserInput: row.pendingUserInputCount > 0,
-                      hasActionableProposedPlan: row.hasActionableProposedPlan > 0,
-                      parentThreadId: row.parentThreadId,
-                      parentEnvironmentId: row.parentEnvironmentId ?? null,
-                    } satisfies OrchestrationThreadShell)
-                  : Result.failVoid,
-              ),
-              updatedAt: updatedAt ?? "1970-01-01T00:00:00.000Z",
-            };
-
-            return yield* decodeShellSnapshot(snapshot).pipe(
-              Effect.mapError(
-                toPersistenceDecodeError(
-                  "ProjectionSnapshotQuery.getShellSnapshot:decodeShellSnapshot",
+              const repositoryIdentities =
+                yield* resolveRepositoryIdentitiesForProjects(visibleProjectRows);
+              const latestTurnByThread = new Map(
+                visibleLatestTurnRows.map(
+                  (row) => [row.threadId, mapLatestTurn(row, readableThreadIds)] as const,
                 ),
-              ),
-            );
-          }),
+              );
+              const sessionByThread = new Map(
+                visibleSessionRows.map((row) => [row.threadId, mapSessionRow(row)] as const),
+              );
+
+              const snapshot = {
+                snapshotSequence: computeSnapshotSequence(stateRows),
+                projects: Arr.filterMap(visibleProjectRows, (row) =>
+                  row.deletedAt === null
+                    ? Result.succeed(
+                        mapProjectShellRow(row, repositoryIdentities.get(row.projectId) ?? null),
+                      )
+                    : Result.failVoid,
+                ),
+                threads: Arr.filterMap(visibleThreadRows, (row) =>
+                  row.deletedAt === null
+                    ? Result.succeed({
+                        id: row.threadId,
+                        projectId: row.projectId,
+                        dataAudience: row.dataAudience,
+                        title: row.title,
+                        modelSelection: row.modelSelection,
+                        runtimeMode: row.runtimeMode,
+                        interactionMode: row.interactionMode,
+                        branch: row.branch,
+                        worktreePath: row.worktreePath,
+                        worktreeRemovable: row.worktreeRemovable > 0,
+                        worktreeRemovalPath: row.worktreeRemovalPath,
+                        latestTurn: latestTurnByThread.get(row.threadId) ?? null,
+                        createdAt: row.createdAt,
+                        updatedAt: row.updatedAt,
+                        archivedAt: row.archivedAt,
+                        session: sessionByThread.get(row.threadId) ?? null,
+                        latestUserMessageAt: row.latestUserMessageAt,
+                        hasPendingApprovals: row.pendingApprovalCount > 0,
+                        hasPendingUserInput: row.pendingUserInputCount > 0,
+                        hasActionableProposedPlan: row.hasActionableProposedPlan > 0,
+                        ...mapParentThreadReference(row, readableThreadIds),
+                      } satisfies OrchestrationThreadShell)
+                    : Result.failVoid,
+                ),
+                updatedAt: updatedAt ?? "1970-01-01T00:00:00.000Z",
+              };
+
+              return yield* decodeShellSnapshot(snapshot).pipe(
+                Effect.mapError(
+                  toPersistenceDecodeError(
+                    "ProjectionSnapshotQuery.getShellSnapshot:decodeShellSnapshot",
+                  ),
+                ),
+              );
+            }),
         ),
         Effect.mapError((error) => {
           if (isPersistenceError(error)) {
@@ -1696,6 +1795,14 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
               ),
             ),
           ),
+          listThreadAudienceRows(undefined).pipe(
+            Effect.mapError(
+              toPersistenceSqlOrDecodeError(
+                "ProjectionSnapshotQuery.getArchivedShellSnapshot:listThreadAudiences:query",
+                "ProjectionSnapshotQuery.getArchivedShellSnapshot:listThreadAudiences:decodeRows",
+              ),
+            ),
+          ),
           listProjectionStateRows(undefined).pipe(
             Effect.mapError(
               toPersistenceSqlOrDecodeError(
@@ -1707,101 +1814,107 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
         ]),
       )
       .pipe(
-        Effect.flatMap(([projectRows, threadRows, sessionRows, latestTurnRows, stateRows]) =>
-          Effect.gen(function* () {
-            const audienceCeiling = yield* currentReadAudienceCeiling;
-            const {
-              projectRows: visibleProjectRows,
-              threadRows: visibleThreadRows,
-              sessionRows: visibleSessionRows,
-              latestTurnRows: visibleLatestTurnRows,
-            } = scopeProjectAndThreadRows({
-              audienceCeiling,
-              projectRows,
-              threadRows,
-              sessionRows,
-              latestTurnRows,
-            });
-            let updatedAt: string | null = null;
-            for (const row of visibleProjectRows) {
-              updatedAt = maxIso(updatedAt, row.updatedAt);
-            }
-            for (const row of visibleThreadRows) {
-              updatedAt = maxIso(updatedAt, row.updatedAt);
-            }
-            for (const row of visibleSessionRows) {
-              updatedAt = maxIso(updatedAt, row.updatedAt);
-            }
-            for (const row of visibleLatestTurnRows) {
-              updatedAt = maxIso(updatedAt, row.requestedAt);
-              if (row.startedAt !== null) {
-                updatedAt = maxIso(updatedAt, row.startedAt);
+        Effect.flatMap(
+          ([projectRows, threadRows, sessionRows, latestTurnRows, threadAudienceRows, stateRows]) =>
+            Effect.gen(function* () {
+              const audienceCeiling = yield* currentReadAudienceCeiling;
+              const readableThreadIds = readableThreadIdsForAudience(
+                audienceCeiling,
+                threadAudienceRows,
+              );
+              const {
+                projectRows: visibleProjectRows,
+                threadRows: visibleThreadRows,
+                sessionRows: visibleSessionRows,
+                latestTurnRows: visibleLatestTurnRows,
+              } = scopeProjectAndThreadRows({
+                audienceCeiling,
+                projectRows,
+                threadRows,
+                sessionRows,
+                latestTurnRows,
+              });
+              let updatedAt: string | null = null;
+              for (const row of visibleProjectRows) {
+                updatedAt = maxIso(updatedAt, row.updatedAt);
               }
-              if (row.completedAt !== null) {
-                updatedAt = maxIso(updatedAt, row.completedAt);
+              for (const row of visibleThreadRows) {
+                updatedAt = maxIso(updatedAt, row.updatedAt);
               }
-            }
-            for (const row of stateRows) {
-              updatedAt = maxIso(updatedAt, row.updatedAt);
-            }
+              for (const row of visibleSessionRows) {
+                updatedAt = maxIso(updatedAt, row.updatedAt);
+              }
+              for (const row of visibleLatestTurnRows) {
+                updatedAt = maxIso(updatedAt, row.requestedAt);
+                if (row.startedAt !== null) {
+                  updatedAt = maxIso(updatedAt, row.startedAt);
+                }
+                if (row.completedAt !== null) {
+                  updatedAt = maxIso(updatedAt, row.completedAt);
+                }
+              }
+              for (const row of stateRows) {
+                updatedAt = maxIso(updatedAt, row.updatedAt);
+              }
 
-            const activeProjectIds = new Set(visibleThreadRows.map((row) => row.projectId));
-            const repositoryIdentities = yield* resolveRepositoryIdentitiesForProjects(
-              visibleProjectRows.filter((row) => activeProjectIds.has(row.projectId)),
-            );
-            const latestTurnByThread = new Map(
-              visibleLatestTurnRows.map((row) => [row.threadId, mapLatestTurn(row)] as const),
-            );
-            const sessionByThread = new Map(
-              visibleSessionRows.map((row) => [row.threadId, mapSessionRow(row)] as const),
-            );
-
-            const snapshot = {
-              snapshotSequence: computeSnapshotSequence(stateRows),
-              projects: Arr.filterMap(visibleProjectRows, (row) =>
-                row.deletedAt === null && activeProjectIds.has(row.projectId)
-                  ? Result.succeed(
-                      mapProjectShellRow(row, repositoryIdentities.get(row.projectId) ?? null),
-                    )
-                  : Result.failVoid,
-              ),
-              threads: visibleThreadRows.map(
-                (row): OrchestrationThreadShell => ({
-                  id: row.threadId,
-                  projectId: row.projectId,
-                  dataAudience: row.dataAudience,
-                  title: row.title,
-                  modelSelection: row.modelSelection,
-                  runtimeMode: row.runtimeMode,
-                  interactionMode: row.interactionMode,
-                  branch: row.branch,
-                  worktreePath: row.worktreePath,
-                  worktreeRemovable: row.worktreeRemovable > 0,
-                  worktreeRemovalPath: row.worktreeRemovalPath,
-                  latestTurn: latestTurnByThread.get(row.threadId) ?? null,
-                  createdAt: row.createdAt,
-                  updatedAt: row.updatedAt,
-                  archivedAt: row.archivedAt,
-                  session: sessionByThread.get(row.threadId) ?? null,
-                  latestUserMessageAt: row.latestUserMessageAt,
-                  hasPendingApprovals: row.pendingApprovalCount > 0,
-                  hasPendingUserInput: row.pendingUserInputCount > 0,
-                  hasActionableProposedPlan: row.hasActionableProposedPlan > 0,
-                  parentThreadId: row.parentThreadId,
-                  parentEnvironmentId: row.parentEnvironmentId ?? null,
-                }),
-              ),
-              updatedAt: updatedAt ?? "1970-01-01T00:00:00.000Z",
-            };
-
-            return yield* decodeShellSnapshot(snapshot).pipe(
-              Effect.mapError(
-                toPersistenceDecodeError(
-                  "ProjectionSnapshotQuery.getArchivedShellSnapshot:decodeShellSnapshot",
+              const activeProjectIds = new Set(visibleThreadRows.map((row) => row.projectId));
+              const repositoryIdentities = yield* resolveRepositoryIdentitiesForProjects(
+                visibleProjectRows.filter((row) => activeProjectIds.has(row.projectId)),
+              );
+              const latestTurnByThread = new Map(
+                visibleLatestTurnRows.map(
+                  (row) => [row.threadId, mapLatestTurn(row, readableThreadIds)] as const,
                 ),
-              ),
-            );
-          }),
+              );
+              const sessionByThread = new Map(
+                visibleSessionRows.map((row) => [row.threadId, mapSessionRow(row)] as const),
+              );
+
+              const snapshot = {
+                snapshotSequence: computeSnapshotSequence(stateRows),
+                projects: Arr.filterMap(visibleProjectRows, (row) =>
+                  row.deletedAt === null && activeProjectIds.has(row.projectId)
+                    ? Result.succeed(
+                        mapProjectShellRow(row, repositoryIdentities.get(row.projectId) ?? null),
+                      )
+                    : Result.failVoid,
+                ),
+                threads: visibleThreadRows.map(
+                  (row): OrchestrationThreadShell => ({
+                    id: row.threadId,
+                    projectId: row.projectId,
+                    dataAudience: row.dataAudience,
+                    title: row.title,
+                    modelSelection: row.modelSelection,
+                    runtimeMode: row.runtimeMode,
+                    interactionMode: row.interactionMode,
+                    branch: row.branch,
+                    worktreePath: row.worktreePath,
+                    worktreeRemovable: row.worktreeRemovable > 0,
+                    worktreeRemovalPath: row.worktreeRemovalPath,
+                    latestTurn: latestTurnByThread.get(row.threadId) ?? null,
+                    createdAt: row.createdAt,
+                    updatedAt: row.updatedAt,
+                    archivedAt: row.archivedAt,
+                    session: sessionByThread.get(row.threadId) ?? null,
+                    latestUserMessageAt: row.latestUserMessageAt,
+                    hasPendingApprovals: row.pendingApprovalCount > 0,
+                    hasPendingUserInput: row.pendingUserInputCount > 0,
+                    hasActionableProposedPlan: row.hasActionableProposedPlan > 0,
+                    ...mapParentThreadReference(row, readableThreadIds),
+                  }),
+                ),
+                updatedAt: updatedAt ?? "1970-01-01T00:00:00.000Z",
+              };
+
+              return yield* decodeShellSnapshot(snapshot).pipe(
+                Effect.mapError(
+                  toPersistenceDecodeError(
+                    "ProjectionSnapshotQuery.getArchivedShellSnapshot:decodeShellSnapshot",
+                  ),
+                ),
+              );
+            }),
         ),
         Effect.mapError((error) => {
           if (isPersistenceError(error)) {
@@ -2033,6 +2146,10 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
       if (Option.isNone(threadRow)) {
         return Option.none<OrchestrationThreadShell>();
       }
+      const readableThreadIds = yield* loadReadableThreadIds(
+        audienceCeiling,
+        "ProjectionSnapshotQuery.getThreadShellById:listThreadAudiences",
+      );
 
       const [latestTurnRow, sessionRow] = yield* Effect.all([
         getLatestTurnRowByThread({ threadId }).pipe(
@@ -2065,7 +2182,9 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
         worktreePath: threadRow.value.worktreePath,
         worktreeRemovable: threadRow.value.worktreeRemovable > 0,
         worktreeRemovalPath: threadRow.value.worktreeRemovalPath,
-        latestTurn: Option.isSome(latestTurnRow) ? mapLatestTurn(latestTurnRow.value) : null,
+        latestTurn: Option.isSome(latestTurnRow)
+          ? mapLatestTurn(latestTurnRow.value, readableThreadIds)
+          : null,
         createdAt: threadRow.value.createdAt,
         updatedAt: threadRow.value.updatedAt,
         archivedAt: threadRow.value.archivedAt,
@@ -2074,8 +2193,7 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
         hasPendingApprovals: threadRow.value.pendingApprovalCount > 0,
         hasPendingUserInput: threadRow.value.pendingUserInputCount > 0,
         hasActionableProposedPlan: threadRow.value.hasActionableProposedPlan > 0,
-        parentThreadId: threadRow.value.parentThreadId,
-        parentEnvironmentId: threadRow.value.parentEnvironmentId ?? null,
+        ...mapParentThreadReference(threadRow.value, readableThreadIds),
       } satisfies OrchestrationThreadShell);
     });
 
@@ -2094,6 +2212,10 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
         if (Option.isNone(threadRow)) {
           return Option.none<OrchestrationThreadShell>();
         }
+        const readableThreadIds = yield* loadReadableThreadIds(
+          audienceCeiling,
+          "ProjectionSnapshotQuery.getThreadShellByIdIncludingArchived:listThreadAudiences",
+        );
 
         const [latestTurnRow, sessionRow] = yield* Effect.all([
           getLatestTurnRowByThread({ threadId }).pipe(
@@ -2126,7 +2248,9 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
           worktreePath: threadRow.value.worktreePath,
           worktreeRemovable: threadRow.value.worktreeRemovable > 0,
           worktreeRemovalPath: threadRow.value.worktreeRemovalPath,
-          latestTurn: Option.isSome(latestTurnRow) ? mapLatestTurn(latestTurnRow.value) : null,
+          latestTurn: Option.isSome(latestTurnRow)
+            ? mapLatestTurn(latestTurnRow.value, readableThreadIds)
+            : null,
           createdAt: threadRow.value.createdAt,
           updatedAt: threadRow.value.updatedAt,
           archivedAt: threadRow.value.archivedAt,
@@ -2135,8 +2259,7 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
           hasPendingApprovals: threadRow.value.pendingApprovalCount > 0,
           hasPendingUserInput: threadRow.value.pendingUserInputCount > 0,
           hasActionableProposedPlan: threadRow.value.hasActionableProposedPlan > 0,
-          parentThreadId: threadRow.value.parentThreadId,
-          parentEnvironmentId: threadRow.value.parentEnvironmentId ?? null,
+          ...mapParentThreadReference(threadRow.value, readableThreadIds),
         } satisfies OrchestrationThreadShell);
       });
 
@@ -2174,6 +2297,10 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
       if (Option.isNone(threadRow)) {
         return Option.none<OrchestrationThread>();
       }
+      const readableThreadIds = yield* loadReadableThreadIds(
+        audienceCeiling,
+        "ProjectionSnapshotQuery.getThreadDetailById:listThreadAudiences",
+      );
 
       const [
         messageRows,
@@ -2254,13 +2381,14 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
         worktreePath: threadRow.value.worktreePath,
         worktreeRemovable: threadRow.value.worktreeRemovable > 0,
         worktreeRemovalPath: threadRow.value.worktreeRemovalPath,
-        latestTurn: Option.isSome(latestTurnRow) ? mapLatestTurn(latestTurnRow.value) : null,
-        turns: turnRows.map(mapLatestTurn),
+        latestTurn: Option.isSome(latestTurnRow)
+          ? mapLatestTurn(latestTurnRow.value, readableThreadIds)
+          : null,
+        turns: turnRows.map((row) => mapLatestTurn(row, readableThreadIds)),
         createdAt: threadRow.value.createdAt,
         updatedAt: threadRow.value.updatedAt,
         archivedAt: threadRow.value.archivedAt,
-        parentThreadId: threadRow.value.parentThreadId ?? null,
-        parentEnvironmentId: threadRow.value.parentEnvironmentId ?? null,
+        ...mapParentThreadReference(threadRow.value, readableThreadIds),
         deletedAt: null,
         messages: messageRows.map((row) => {
           const message = {
@@ -2277,14 +2405,15 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
           }
           return message;
         }),
-        proposedPlans: proposedPlanRows.map(mapProposedPlanRow),
+        proposedPlans: proposedPlanRows.map((row) => mapProposedPlanRow(row, readableThreadIds)),
         activities: activityRows.map((row) => {
+          const references = mapActivityThreadReferences(row, readableThreadIds);
           const activity = {
             id: row.activityId,
             tone: row.tone,
             kind: row.kind,
-            summary: row.summary,
-            payload: row.payload,
+            summary: references.summary,
+            payload: references.payload,
             turnId: row.turnId,
             createdAt: row.createdAt,
           };
