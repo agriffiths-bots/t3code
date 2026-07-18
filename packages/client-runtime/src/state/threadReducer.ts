@@ -283,6 +283,7 @@ export function applyThreadDetailEvent(
         event.payload.role === "assistant" && event.payload.turnId !== null
           ? thread.latestTurn === null || thread.latestTurn.turnId === event.payload.turnId
             ? {
+                ...(thread.latestTurn?.turnId === event.payload.turnId ? thread.latestTurn : {}),
                 turnId: event.payload.turnId,
                 state: settlesTurn
                   ? thread.latestTurn?.state === "interrupted"
@@ -368,6 +369,7 @@ export function applyThreadDetailEvent(
       const latestTurn: OrchestrationLatestTurn | null =
         activeTurnId !== null
           ? {
+              ...(thread.latestTurn?.turnId === activeTurnId ? thread.latestTurn : {}),
               turnId: activeTurnId,
               state: "running",
               requestedAt:
@@ -518,6 +520,7 @@ export function applyThreadDetailEvent(
         : !diffTurnStillRunning &&
             (thread.latestTurn === null || thread.latestTurn.turnId === event.payload.turnId)
           ? {
+              ...(thread.latestTurn?.turnId === event.payload.turnId ? thread.latestTurn : {}),
               turnId: event.payload.turnId,
               state: checkpointStatusToTurnState(event.payload.status),
               requestedAt: thread.latestTurn?.requestedAt ?? event.payload.completedAt,
@@ -609,10 +612,16 @@ export function applyThreadDetailEvent(
         Arr.filter((activity) => activity.turnId === null || retainedTurnIds.has(activity.turnId)),
       );
       const latestCheckpoint = checkpoints.at(-1) ?? null;
+      const retainedLatestTurn =
+        latestCheckpoint === null
+          ? null
+          : (thread.turns.find((turn) => turn.turnId === latestCheckpoint.turnId) ??
+            (thread.latestTurn?.turnId === latestCheckpoint.turnId ? thread.latestTurn : null));
       const latestTurn =
         latestCheckpoint === null
           ? null
           : {
+              ...retainedLatestTurn,
               turnId: latestCheckpoint.turnId,
               state: checkpointStatusToTurnState(
                 latestCheckpoint.status as "ready" | "missing" | "error",
@@ -858,15 +867,13 @@ function turnFromCheckpoint(input: {
     input.existingTurns.find((turn) => turn.turnId === input.turnId) ??
     (input.latestTurn?.turnId === input.turnId ? input.latestTurn : null);
   return {
+    ...existing,
     turnId: input.turnId,
     state: input.state,
     requestedAt: existing?.requestedAt ?? input.completedAt,
     startedAt: existing?.startedAt ?? input.completedAt,
     completedAt: input.completedAt,
     assistantMessageId: input.assistantMessageId,
-    ...(existing?.sourceProposedPlan !== undefined
-      ? { sourceProposedPlan: existing.sourceProposedPlan }
-      : {}),
   };
 }
 

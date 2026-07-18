@@ -371,15 +371,13 @@ function turnFromCheckpoint(input: {
     input.existingTurns.find((turn) => turn.turnId === input.turnId) ??
     (input.latestTurn?.turnId === input.turnId ? input.latestTurn : null);
   return {
+    ...existing,
     turnId: input.turnId,
     state: input.state,
     requestedAt: existing?.requestedAt ?? input.completedAt,
     startedAt: existing?.startedAt ?? input.completedAt,
     completedAt: input.completedAt,
     assistantMessageId: input.assistantMessageId,
-    ...(existing?.sourceProposedPlan !== undefined
-      ? { sourceProposedPlan: existing.sourceProposedPlan }
-      : {}),
   };
 }
 
@@ -851,6 +849,7 @@ export function projectEvent(
         const latestTurn =
           activeTurnId !== null
             ? {
+                ...(thread.latestTurn?.turnId === activeTurnId ? thread.latestTurn : {}),
                 turnId: activeTurnId,
                 state: "running" as const,
                 requestedAt:
@@ -1067,6 +1066,7 @@ export function projectEvent(
               : thread.latestTurn
             : shouldUpdateLatestTurn
               ? {
+                  ...(thread.latestTurn?.turnId === payload.turnId ? thread.latestTurn : {}),
                   turnId: payload.turnId,
                   state: checkpointStatusToLatestTurnState(payload.status),
                   requestedAt:
@@ -1151,10 +1151,16 @@ export function projectEvent(
           const activities = retainThreadActivitiesAfterRevert(thread.activities, retainedTurnIds);
 
           const latestCheckpoint = checkpoints.at(-1) ?? null;
+          const retainedLatestTurn =
+            latestCheckpoint === null
+              ? null
+              : (thread.turns.find((turn) => turn.turnId === latestCheckpoint.turnId) ??
+                (thread.latestTurn?.turnId === latestCheckpoint.turnId ? thread.latestTurn : null));
           const latestTurn =
             latestCheckpoint === null
               ? null
               : {
+                  ...retainedLatestTurn,
                   turnId: latestCheckpoint.turnId,
                   state: checkpointStatusToLatestTurnState(latestCheckpoint.status),
                   requestedAt: latestCheckpoint.completedAt,
