@@ -89,6 +89,7 @@ const makeSession = (
   status: OrchestrationSession["status"],
   activeTurnId: TurnId | null = null,
   lastError: string | null = null,
+  updatedAt: string = now,
 ): OrchestrationSession => ({
   threadId,
   status,
@@ -96,7 +97,7 @@ const makeSession = (
   runtimeMode: "full-access",
   activeTurnId,
   lastError,
-  updatedAt: now,
+  updatedAt,
 });
 
 const makeThreadState = (input: {
@@ -256,6 +257,7 @@ const sessionSetEvent = (
   status: OrchestrationSession["status"],
   activeTurnId: TurnId | null = null,
   lastError: string | null = null,
+  updatedAt: string = now,
 ): OrchestrationEvent =>
   ({
     eventId: EventId.make(`evt-session-${threadId}-${status}`),
@@ -263,7 +265,10 @@ const sessionSetEvent = (
     aggregateKind: "thread",
     aggregateId: threadId,
     occurredAt: now,
-    payload: { threadId, session: makeSession(threadId, status, activeTurnId, lastError) },
+    payload: {
+      threadId,
+      session: makeSession(threadId, status, activeTurnId, lastError, updatedAt),
+    },
   }) as unknown as OrchestrationEvent;
 
 const providerTurnStartFailedEvent = (
@@ -2012,6 +2017,28 @@ describe("ChildThreadCoordinator", () => {
     }
   });
 
+  it("preserves the provider-death error when replay settles a stopped session", async () => {
+    const child = ThreadId.make("child-replayed-provider-death-reason");
+    const parent = ThreadId.make("parent-replayed-provider-death-reason");
+    const reason = "Provider process exited after signal SIGKILL.";
+    const harness = await createHarness({
+      threads: [
+        makeThreadState({
+          threadId: child,
+          parentThreadId: parent,
+          latestTurn: makeLatestTurn("running"),
+          session: makeSession(child, "stopped", null, reason),
+        }),
+      ],
+      seedChildRows: [{ threadId: child, parentThreadId: parent }],
+      persistedEvents: [sessionSetEvent(child, "stopped", null, reason)],
+    });
+
+    const result = await runtimeRun(harness, child);
+    expect(result.status).toBe("failed");
+    expect(result.error).toBe(reason);
+  });
+
   it("does not settle a stale stopped event after a replacement session is running", async () => {
     const child = ThreadId.make("child-stale-stopped-after-replacement");
     const parent = ThreadId.make("parent-stale-stopped-after-replacement");
@@ -2091,6 +2118,66 @@ describe("ChildThreadCoordinator", () => {
     expect(await harness.listDispatchLeaseChildIds()).toContain(child);
   });
 
+  for (const { timestampCase, projectedSessionAt } of [
+    {
+      timestampCase: "older",
+      projectedSessionAt: "2026-06-17T10:00:02.000Z",
+    },
+    {
+      timestampCase: "equal-timestamp",
+      projectedSessionAt: "2026-06-17T10:00:01.000Z",
+    },
+  ] as const) {
+    it(`rejects an ${timestampCase} stopped event while the projected session runs the same turn`, async () => {
+      const child = ThreadId.make(`child-${timestampCase}-stopped-same-turn-projection`);
+      const parent = ThreadId.make(`parent-${timestampCase}-stopped-same-turn-projection`);
+      const turnId = TurnId.make("reconnected-turn");
+      const stoppedSessionAt = "2026-06-17T10:00:01.000Z";
+      const harness = await createHarness({
+        threads: [
+          makeThreadState({
+            threadId: child,
+            parentThreadId: parent,
+            latestTurn: makeLatestTurn("running", turnId),
+            session: makeSession(child, "running", turnId, null, stoppedSessionAt),
+          }),
+        ],
+      });
+      await harness.register({
+        parentThreadId: parent,
+        childThreadId: child,
+        detached: false,
+        model: codexModel,
+        spawnedAtMs: 0,
+      });
+      await harness.seedDispatchLease(child);
+      await harness.feed(turnDiffEvent(child, "missing", turnId));
+      harness.setThread(
+        makeThreadState({
+          threadId: child,
+          parentThreadId: parent,
+          latestTurn: makeLatestTurn("running", turnId),
+          session: makeSession(child, "running", turnId, null, projectedSessionAt),
+        }),
+      );
+
+      await harness.feed(
+        sessionSetEvent(
+          child,
+          "stopped",
+          null,
+          "ambiguous provider process exited",
+          stoppedSessionAt,
+        ),
+      );
+
+      const entries = await runtimeListChildren(harness, parent);
+      expect(entries).toHaveLength(1);
+      expect(entries[0]!.settled).toBe(false);
+      expect(await harness.listDispatchLeaseChildIds()).toContain(child);
+    });
+  }
+
   it("settles stopped after a stale completed projection with a newer user message as failed", async () => {
     const child = ThreadId.make("child-stopped-stale-completed-newer-user");
     const parent = ThreadId.make("parent-stopped-stale-completed-newer-user");
@@ -2143,7 +2230,7 @@ describe("ChildThreadCoordinator", () => {
     });
 
     await harness.feed(turnDiffEvent(child, "missing"));
-    await harness.feed(sessionSetEvent(child, "stopped"));
+    await harness.feed(sessionSetEvent(child, "stopped", null, null, "2026-06-17T10:00:01.000Z"));
 
     const result = await runtimeRun(harness, child);
     expect(result.status).toBe("failed");
@@ -2765,12 +2852,14 @@ describe("ChildThreadCoordinator", () => {
 
     const result = await runtimeRun(harness, child);
     expect(result.status).toBe("failed");
-    expect(result.error).toBe("session error");
+    expect(result.error).toBe("provider process exited");
     const parentWakes = harness.dispatched.filter(
       (command) => command.type === "thread.turn.start" && command.threadId === parent,
     ) as Array<Extract<OrchestrationCommand, { type: "thread.turn.start" }>>;
     expect(parentWakes).toHaveLength(1);
-    expect(parentWakes[0]!.message.text).toContain(`[sub-agent ${child} failed] session error`);
+    expect(parentWakes[0]!.message.text).toContain(
+      `[sub-agent ${child} failed] provider process exited`,
+    );
   });
 
   it("does not replay a stale provider error over a replacement projected session", async () => {
@@ -2827,7 +2916,7 @@ describe("ChildThreadCoordinator", () => {
       ],
     });
 
-    await harness.feed(sessionSetEvent(child, "stopped"));
+    await harness.feed(sessionSetEvent(child, "stopped", null, null, "2026-06-17T10:00:01.000Z"));
 
     const result = await runtimeRun(harness, child);
     expect(result.status).toBe("failed");
@@ -5748,6 +5837,30 @@ describe("ChildThreadCoordinator", () => {
     );
     expect(await harness.listDispatchLeaseChildIds()).toEqual([]);
     expect(await harness.canAcquireDispatchLease()).toBe(true);
+  });
+
+  it("skips one-shot stopped settlement when replay observed a newer active turn", async () => {
+    const child = ThreadId.make("boot-stale-stopped-replayed-active-child");
+    const parent = ThreadId.make("boot-stale-stopped-replayed-active-parent");
+    const staleTurnId = TurnId.make("stale-projected-turn");
+    const activeTurnId = TurnId.make("replayed-active-turn");
+    const harness = await createHarness({
+      threads: [
+        makeThreadState({
+          threadId: child,
+          parentThreadId: parent,
+          latestTurn: makeLatestTurn("running", staleTurnId),
+          session: makeSession(child, "stopped", null, "stale provider stopped"),
+        }),
+      ],
+      seedChildRows: [{ threadId: child, parentThreadId: parent }],
+      persistedEvents: [sessionSetEvent(child, "running", activeTurnId)],
+    });
+
+    const entries = await runtimeListChildren(harness, parent);
+    expect(entries).toHaveLength(1);
+    expect(entries[0]!.settled).toBe(false);
+    expect(await harness.listDispatchLeaseChildIds()).toContain(child);
   });
 
   it("does not let stale projection terminal override replayed pending starts", async () => {

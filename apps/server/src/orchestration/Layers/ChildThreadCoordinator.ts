@@ -193,10 +193,15 @@ const terminalSessionOwnsProjectedSession = (input: {
       ) {
         return true;
       }
+      const projectedSessionUpdatedAt = parseIsoMillis(projectedSession?.updatedAt);
+      const eventSessionUpdatedAt = parseIsoMillis(input.session.updatedAt);
       return (
         input.session.status === "stopped" &&
         input.allowStoppedProjectionLag &&
         input.expectedActiveTurnId !== undefined &&
+        projectedSessionUpdatedAt !== null &&
+        eventSessionUpdatedAt !== null &&
+        projectedSessionUpdatedAt < eventSessionUpdatedAt &&
         projected.latestTurn?.state === "running" &&
         projected.latestTurn.turnId === input.expectedActiveTurnId &&
         (projectedSession?.status === "running" || projectedSession?.status === "waiting") &&
@@ -2116,6 +2121,7 @@ const make = Effect.gen(function* () {
         }
       }
       const canSettleProjectedStoppedSession =
+        !activeTurnByChild.has(childThreadId) &&
         !pendingTurnStartByChild.has(childThreadId) &&
         !pendingSameTurnStartByChild.has(childThreadId) &&
         !unarchivedTerminalChildIds.has(childThreadId);
@@ -2803,7 +2809,7 @@ const make = Effect.gen(function* () {
                 }
                 const outcome = {
                   status: "failed",
-                  error: `session ${session.status}`,
+                  error: session.lastError ?? `session ${session.status}`,
                 } as const;
                 terminalByChild.set(threadId, outcome);
                 rememberPostUnarchiveTerminal(threadId, outcome);
