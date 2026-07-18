@@ -15,4 +15,4 @@ Edge-case matrix:
 - Version skew with older logs lacking terminal turn events: marker applies only to current projection-derived session failures, preserving old live/replay event outcomes.
 - Concurrency/replacement start: existing pending replacement-start tests must still prevent stale stopped sessions from settling.
 
-Smallest-change argument: leave `turnTerminalOutcome` live-turn semantics unchanged and add a narrow projection-lifecycle wrapper/branch for terminal session projections. This avoids marking live turn-diff/session-set results while giving boot unarchive guards the structural signal they already expect.
+Smallest-change argument: leave `turnTerminalOutcome` live-turn semantics unchanged and add a narrow projected terminal-session wrapper/guard for projection lifecycle and one-shot wait/register reconciliation. This avoids marking live turn-diff/session-set results while giving boot unarchive guards the structural signal they already expect.

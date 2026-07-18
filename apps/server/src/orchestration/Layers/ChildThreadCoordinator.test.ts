@@ -19,6 +19,7 @@ import * as NodeServices from "@effect/platform-node/NodeServices";
 import * as Clock from "effect/Clock";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
+import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as ManagedRuntime from "effect/ManagedRuntime";
 import * as Option from "effect/Option";
@@ -3870,6 +3871,106 @@ describe("ChildThreadCoordinator", () => {
     const slice = await runtimeWaitSlice(harness, [child], PAST_MS);
     expect(slice.results[0]!.status).toBe("timeout");
     expect(await harness.listPendingDispatches()).toEqual([]);
+  });
+
+  it("keeps inactive unarchived stopped interrupted projections pending on boot", async () => {
+    const parent = ThreadId.make("recon-unarchive-stopped-terminal-pending-parent");
+    const terminalCases = [
+      {
+        name: "stopped-interrupted",
+        sessionStatus: "stopped",
+        latestTurn: makeLatestTurn("interrupted"),
+        reason: "Provider process exited with code 0.",
+      },
+      {
+        name: "stopped-error-turn",
+        sessionStatus: "stopped",
+        latestTurn: makeLatestTurn("error"),
+        reason: "Provider process exited with code 1.",
+      },
+      {
+        name: "error-session",
+        sessionStatus: "error",
+        latestTurn: makeLatestTurn("error"),
+        reason: "Provider process exited after signal SIGKILL.",
+      },
+    ] as const;
+    const childIds = terminalCases.map(({ name }) =>
+      ThreadId.make(`recon-unarchive-terminal-session-pending-child-${name}`),
+    );
+    const harness = await createHarness({
+      threads: terminalCases.map((terminalCase, index) =>
+        makeThreadState({
+          threadId: childIds[index]!,
+          parentThreadId: parent,
+          latestTurn: terminalCase.latestTurn,
+          session: makeSession(
+            childIds[index]!,
+            terminalCase.sessionStatus,
+            null,
+            terminalCase.reason,
+          ),
+        }),
+      ),
+      seedChildRows: childIds.map((threadId) => ({ threadId, parentThreadId: parent })),
+      persistedEvents: childIds.flatMap((threadId) => [
+        threadArchivedEvent(threadId),
+        threadUnarchivedEvent(threadId),
+      ]),
+      slowThreadDetailReadNumbers: childIds.map((threadId) => ({
+        threadId,
+        readNumbers: [2],
+      })),
+    });
+
+    const entries = await runtimeListChildren(harness, parent);
+    expect(entries).toHaveLength(terminalCases.length);
+    expect(entries.every((entry) => !entry.settled)).toBe(true);
+
+    const waitFiber = Effect.runFork(
+      harness.coordinator.waitSlice({
+        childThreadIds: childIds,
+        mode: "all",
+        budgetDeadlineMs: FAR_FUTURE_MS,
+      }),
+    );
+    try {
+      for (let index = 0; index < 50; index += 1) {
+        await Effect.runPromise(Effect.yieldNow);
+      }
+      const entriesAfterWaitCheck = await runtimeListChildren(harness, parent);
+      expect(entriesAfterWaitCheck.every((entry) => !entry.settled)).toBe(true);
+      expect(await harness.listPendingDispatches()).toEqual([]);
+    } finally {
+      await Effect.runPromise(Fiber.interrupt(waitFiber));
+    }
+  });
+
+  it("settles newer unarchived terminal session projections on boot", async () => {
+    const child = ThreadId.make("recon-unarchive-newer-terminal-session-child");
+    const parent = ThreadId.make("recon-unarchive-newer-terminal-session-parent");
+    const terminalAt = "2026-06-17T10:00:01.000Z";
+    const reason = "Provider process exited after signal SIGTERM.";
+    const harness = await createHarness({
+      threads: [
+        makeThreadState({
+          threadId: child,
+          parentThreadId: parent,
+          latestTurn: makeLatestTurn("error", TurnId.make("turn-after-unarchive"), terminalAt),
+          session: makeSession(child, "error", null, reason, terminalAt),
+        }),
+      ],
+      seedChildRows: [{ threadId: child, parentThreadId: parent }],
+      persistedEvents: [threadArchivedEvent(child), threadUnarchivedEvent(child)],
+      slowThreadDetailReadNumbers: [{ threadId: child, readNumbers: [2] }],
+    });
+
+    const entries = await runtimeListChildren(harness, parent);
+    expect(entries).toHaveLength(1);
+    expect(entries[0]!.settled).toBe(true);
+    const result = await runtimeRun(harness, child);
+    expect(result.status).toBe("failed");
+    expect(result.error).toBe(reason);
   });
 
   it("does not re-mark fully pruned archived wakes as queued on boot", async () => {
