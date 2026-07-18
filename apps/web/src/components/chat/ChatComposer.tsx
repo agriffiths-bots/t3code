@@ -406,7 +406,7 @@ const ComposerFooterPrimaryActions = memo(function ComposerFooterPrimaryActions(
 export interface ChatComposerHandle {
   focusAtEnd: () => void;
   focusAt: (cursor: number) => void;
-  insertTextAtEnd: (text: string) => boolean;
+  insertTextAtEnd: (text: string, options?: { ensureLeadingBoundary?: boolean }) => boolean;
   openModelPicker: () => void;
   toggleModelPicker: () => void;
   isModelPickerOpen: () => boolean;
@@ -1990,7 +1990,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
       focusAt: (cursor: number) => {
         composerEditorRef.current?.focusAt(cursor);
       },
-      insertTextAtEnd: (text: string) => {
+      insertTextAtEnd: (text: string, options?: { ensureLeadingBoundary?: boolean }) => {
         if (
           text.length === 0 ||
           isConnecting ||
@@ -2001,8 +2001,14 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
         ) {
           return false;
         }
-        const rangeEnd = promptRef.current.length;
-        return applyPromptReplacement(rangeEnd, rangeEnd, text);
+        const prompt = promptRef.current;
+        const needsLeadingSpace =
+          (options?.ensureLeadingBoundary ?? false) && prompt.length > 0 && !/\s$/.test(prompt);
+        return applyPromptReplacement(
+          prompt.length,
+          prompt.length,
+          needsLeadingSpace ? ` ${text}` : text,
+        );
       },
       openModelPicker: () => {
         setIsComposerModelPickerOpen(true);
