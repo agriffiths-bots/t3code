@@ -171,6 +171,7 @@ const makeHarness = Effect.fn("TestEnvironmentThreads.makeHarness")(function* (o
   const revisionCalls = yield* Ref.make(0);
   const revisionCallTimes = yield* Ref.make<ReadonlyArray<number>>([]);
   const revisionAvailable = yield* Ref.make(true);
+  const revisionGone = yield* Ref.make(false);
   const explicitRevisionSequence = yield* Ref.make<Option.Option<number>>(
     Option.fromNullishOr(options?.revisionSequence),
   );
@@ -297,6 +298,9 @@ const makeHarness = Effect.fn("TestEnvironmentThreads.makeHarness")(function* (o
         if (threadId !== THREAD_ID || !(yield* Ref.get(revisionAvailable))) {
           return { kind: "unavailable" } as const;
         }
+        if (yield* Ref.get(revisionGone)) {
+          return { kind: "gone" } as const;
+        }
         const explicit = yield* Ref.get(explicitRevisionSequence);
         const latestSequence = Option.isSome(explicit)
           ? explicit.value
@@ -399,6 +403,7 @@ const makeHarness = Effect.fn("TestEnvironmentThreads.makeHarness")(function* (o
     revisionCalls,
     revisionCallTimes,
     revisionAvailable,
+    revisionGone,
     explicitRevisionSequence,
     explicitProjectionSequence,
     explicitRevisionEventId,
@@ -769,6 +774,58 @@ describe("EnvironmentThreads", () => {
 
       expect(Option.getOrThrow(healed.data).title).toBe(healedThread.title);
       expect(yield* Ref.get(harness.loaderCalls)).toBe(1);
+    }),
+  );
+
+  it.effect("reconciles a cached thread away when its revision endpoint reports gone", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness({
+        cached: BASE_THREAD,
+        revisionSequence: CACHED_SNAPSHOT_SEQUENCE,
+      });
+      yield* awaitThreadState(harness.observed, (value) => value.status === "live");
+      yield* Ref.set(harness.revisionGone, true);
+
+      yield* advanceActiveReconcileInterval;
+
+      const reconciled = yield* Ref.get(harness.latest);
+      expect(reconciled.status).toBe("deleted");
+      expect(Option.isNone(reconciled.data)).toBe(true);
+      expect(yield* Ref.get(harness.removedThreads)).toEqual([THREAD_ID]);
+      expect(yield* Ref.get(harness.loaderCalls)).toBe(0);
+      expect(yield* Ref.get(harness.revisionCalls)).toBe(1);
+
+      yield* Queue.offer(
+        harness.inputs,
+        snapshot({ ...BASE_THREAD, title: "Late stale snapshot" }, CACHED_SNAPSHOT_SEQUENCE + 1),
+      );
+      yield* Effect.yieldNow;
+
+      yield* TestClock.adjust("2 minutes");
+      yield* Effect.yieldNow;
+      expect((yield* Ref.get(harness.latest)).status).toBe("deleted");
+      expect(yield* Ref.get(harness.revisionCalls)).toBe(1);
+      expect(yield* Ref.get(harness.removedThreads)).toEqual([THREAD_ID]);
+    }),
+  );
+
+  it.effect("retains a cached thread while its revision endpoint is unavailable", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness({
+        cached: BASE_THREAD,
+        revisionSequence: CACHED_SNAPSHOT_SEQUENCE,
+      });
+      yield* awaitThreadState(harness.observed, (value) => value.status === "live");
+      yield* Ref.set(harness.revisionAvailable, false);
+
+      yield* advanceActiveReconcileInterval;
+      yield* advanceActiveReconcileInterval;
+
+      const retained = yield* Ref.get(harness.latest);
+      expect(retained.status).toBe("live");
+      expect(Option.getOrThrow(retained.data).id).toBe(THREAD_ID);
+      expect(yield* Ref.get(harness.removedThreads)).toEqual([]);
+      expect(yield* Ref.get(harness.revisionCalls)).toBe(2);
     }),
   );
 

@@ -117,6 +117,9 @@ export type ThreadRevisionLoadResult =
       readonly responseBytes: number;
     }
   | {
+      readonly kind: "gone";
+    }
+  | {
       readonly kind: "unavailable";
     };
 
@@ -174,6 +177,13 @@ export const threadRevisionLoaderLayer: Layer.Layer<
             }),
           ),
           Effect.provideService(HttpClient.HttpClient, httpClient),
+          Effect.catchTags({
+            EnvironmentResourceNotFoundError: () =>
+              Effect.logDebug("Thread revision not found over HTTP.").pipe(
+                Effect.annotateLogs({ threadId }),
+                Effect.as({ kind: "gone" } as const),
+              ),
+          }),
           Effect.catchCause((cause) =>
             Effect.logWarning("Could not load the thread revision over HTTP.").pipe(
               Effect.annotateLogs({ threadId, cause: Cause.pretty(cause) }),
