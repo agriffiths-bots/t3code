@@ -1023,7 +1023,97 @@ describe("applyThreadDetailEvent", () => {
     });
   });
 
+  describe("thread.turn-effective-model-set", () => {
+    it("updates the matching projected turn", () => {
+      const turn = {
+        turnId: TurnId.make("turn-1"),
+        state: "completed" as const,
+        requestedAt: "2026-04-01T11:00:00.000Z",
+        startedAt: "2026-04-01T11:00:00.000Z",
+        completedAt: "2026-04-01T12:00:00.000Z",
+        assistantMessageId: null,
+      };
+      const result = applyThreadDetailEvent(
+        { ...baseThread, latestTurn: turn, turns: [turn] },
+        {
+          ...baseEventFields,
+          sequence: 13,
+          occurredAt: "2026-04-01T12:01:00.000Z",
+          aggregateKind: "thread",
+          aggregateId: ThreadId.make("thread-1"),
+          type: "thread.turn-effective-model-set",
+          payload: {
+            threadId: ThreadId.make("thread-1"),
+            turnId: TurnId.make("turn-1"),
+            effectiveModel: "claude-opus-4-8",
+          },
+        },
+      );
+
+      expect(result.kind).toBe("updated");
+      if (result.kind === "updated") {
+        expect(result.thread.latestTurn?.effectiveModel).toBe("claude-opus-4-8");
+        expect(result.thread.turns[0]?.effectiveModel).toBe("claude-opus-4-8");
+      }
+    });
+  });
+
   describe("thread.turn-diff-completed", () => {
+    it("preserves a rerouted effective model when the same turn completes a diff", () => {
+      const turn = {
+        turnId: TurnId.make("turn-1"),
+        state: "running" as const,
+        requestedAt: "2026-04-01T11:00:00.000Z",
+        startedAt: "2026-04-01T11:00:00.000Z",
+        completedAt: null,
+        assistantMessageId: null,
+      };
+      const rerouted = applyThreadDetailEvent(
+        { ...baseThread, latestTurn: turn, turns: [turn] },
+        {
+          ...baseEventFields,
+          sequence: 13,
+          occurredAt: "2026-04-01T11:01:00.000Z",
+          aggregateKind: "thread",
+          aggregateId: ThreadId.make("thread-1"),
+          type: "thread.turn-effective-model-set",
+          payload: {
+            threadId: ThreadId.make("thread-1"),
+            turnId: TurnId.make("turn-1"),
+            effectiveModel: "claude-opus-4-8",
+          },
+        },
+      );
+
+      expect(rerouted.kind).toBe("updated");
+      if (rerouted.kind !== "updated") return;
+
+      const result = applyThreadDetailEvent(rerouted.thread, {
+        ...baseEventFields,
+        sequence: 14,
+        occurredAt: "2026-04-01T12:00:00.000Z",
+        aggregateKind: "thread",
+        aggregateId: ThreadId.make("thread-1"),
+        type: "thread.turn-diff-completed",
+        payload: {
+          threadId: ThreadId.make("thread-1"),
+          turnId: TurnId.make("turn-1"),
+          checkpointTurnCount: 1,
+          checkpointRef: CheckpointRef.make("ref-1"),
+          status: "ready",
+          files: [],
+          assistantMessageId: null,
+          completedAt: "2026-04-01T12:00:00.000Z",
+        },
+      });
+
+      expect(result.kind).toBe("updated");
+      if (result.kind === "updated") {
+        expect(result.thread.latestTurn?.effectiveModel).toBe("claude-opus-4-8");
+        expect(result.thread.turns[0]?.effectiveModel).toBe("claude-opus-4-8");
+      }
+    });
+
     it("adds a checkpoint and updates latestTurn", () => {
       const result = applyThreadDetailEvent(baseThread, {
         ...baseEventFields,

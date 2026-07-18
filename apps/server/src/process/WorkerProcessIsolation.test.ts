@@ -1,4 +1,5 @@
 import * as NodeServices from "@effect/platform-node/NodeServices";
+import { HostProcessPlatform } from "@t3tools/shared/hostProcess";
 import { describe, expect, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as Duration from "effect/Duration";
@@ -13,6 +14,7 @@ import * as TestClock from "effect/testing/TestClock";
 import * as ChildProcess from "effect/unstable/process/ChildProcess";
 import * as ChildProcessSpawner from "effect/unstable/process/ChildProcessSpawner";
 
+import { collectUint8StreamText } from "../stream/collectUint8StreamText.ts";
 import * as WorkerProcessIsolation from "./WorkerProcessIsolation.ts";
 
 function makeHandle(
@@ -34,6 +36,28 @@ function makeHandle(
     getOutputFd: () => Stream.empty,
   });
 }
+
+const runPreparedWorker = Effect.fn("WorkerProcessIsolation.test.runPreparedWorker")(function* (
+  executable: WorkerProcessIsolation.WorkerLaunchExecutable,
+  args: ReadonlyArray<string>,
+) {
+  const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+  const handle = yield* spawner.spawn(
+    ChildProcess.make(executable.executablePath, args, {
+      env: executable.env,
+      extendEnv: true,
+    }),
+  );
+  const [stdout, stderr, exitCode] = yield* Effect.all(
+    [
+      collectUint8StreamText({ stream: handle.stdout }).pipe(Effect.map((result) => result.text)),
+      collectUint8StreamText({ stream: handle.stderr }).pipe(Effect.map((result) => result.text)),
+      handle.exitCode.pipe(Effect.map(Number)),
+    ],
+    { concurrency: "unbounded" },
+  );
+  return { stdout, stderr, exitCode };
+});
 
 describe("WorkerProcessIsolation", () => {
   it.effect("wraps worker spawns in a user systemd scope after configuring the slice", () =>
@@ -382,9 +406,93 @@ describe("WorkerProcessIsolation", () => {
       expect(contents).toContain("sed 's/\\$/\\$\\$/g'");
       expect(contents).toContain("CPUQuota=$quota");
       expect(contents).toContain("/bin/true");
+      expect(contents).toContain("warn_fallback");
     }).pipe(
       Effect.scoped,
       Effect.provide(Layer.mergeAll(WorkerProcessIsolation.layerTest(), NodeServices.layer)),
+    ),
+  );
+
+  it.effect(
+    "places an SDK-managed worker in a transient scope when user systemd is available",
+    () =>
+      Effect.gen(function* () {
+        if ((yield* HostProcessPlatform) !== "linux") return;
+
+        const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+        const fs = yield* FileSystem.FileSystem;
+        const directory = yield* fs.makeTempDirectoryScoped({ prefix: "t3-worker-cgroup-" });
+        const isolation = yield* WorkerProcessIsolation.WorkerProcessIsolation;
+        const executable = yield* isolation.prepareExecutable({
+          realCommand: "/bin/sh",
+          directory,
+        });
+        const { stdout, stderr, exitCode } = yield* runPreparedWorker(executable, [
+          "-c",
+          "cat /proc/self/cgroup",
+        ]);
+
+        expect(exitCode).toBe(0);
+        if (stderr.includes("worker process isolation unavailable")) {
+          yield* Effect.logInfo("worker process isolation integration test skipped", { stderr });
+          return;
+        }
+        expect(stderr).toBe("");
+        expect(stdout).toContain("factory-workers.slice");
+        expect(stdout).not.toContain("t3code.service");
+        const unitName = /\/(t3-worker-[^/\n]+\.scope)(?:\n|$)/u.exec(stdout)?.[1];
+        expect(unitName).toBeDefined();
+        if (unitName === undefined) return;
+
+        let loadState = "loaded";
+        for (let attempt = 0; attempt < 100 && loadState.trim() !== "not-found"; attempt += 1) {
+          loadState = yield* spawner.string(
+            ChildProcess.make("systemctl", [
+              "--user",
+              "show",
+              unitName,
+              "--property=LoadState",
+              "--value",
+            ]),
+          );
+        }
+        expect(loadState.trim()).toBe("not-found");
+      }).pipe(
+        Effect.scoped,
+        Effect.provide(Layer.mergeAll(WorkerProcessIsolation.layerTest(), NodeServices.layer)),
+      ),
+  );
+
+  it.effect("logs a warning and directly spawns an SDK worker when systemd-run is absent", () =>
+    Effect.gen(function* () {
+      if ((yield* HostProcessPlatform) !== "linux") return;
+
+      const fs = yield* FileSystem.FileSystem;
+      const directory = yield* fs.makeTempDirectoryScoped({ prefix: "t3-worker-fallback-" });
+      const isolation = yield* WorkerProcessIsolation.WorkerProcessIsolation;
+      const executable = yield* isolation.prepareExecutable({
+        realCommand: "/bin/sh",
+        directory,
+      });
+      const { stdout, stderr, exitCode } = yield* runPreparedWorker(executable, [
+        "-c",
+        "cat /proc/self/cgroup",
+      ]);
+
+      expect(exitCode).toBe(0);
+      expect(stdout).toContain("0::/");
+      expect(stderr).toBe("t3 worker process isolation unavailable: missing-systemd-run\n");
+    }).pipe(
+      Effect.scoped,
+      Effect.provide(
+        Layer.mergeAll(
+          WorkerProcessIsolation.layerTest({
+            systemdRunPath: "/definitely/missing/systemd-run",
+            systemctlPath: "/definitely/missing/systemctl",
+          }),
+          NodeServices.layer,
+        ),
+      ),
     ),
   );
 

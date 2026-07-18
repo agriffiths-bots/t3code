@@ -833,6 +833,7 @@ const makeOrchestrationProjectionPipeline = Effect.fn("makeOrchestrationProjecti
 
         case "thread.message-sent":
         case "thread.proposed-plan-upserted":
+        case "thread.turn-effective-model-set":
         case "thread.activity-appended":
         case "thread.approval-response-requested":
         case "thread.user-input-response-requested": {
@@ -1391,6 +1392,7 @@ const makeOrchestrationProjectionPipeline = Effect.fn("makeOrchestrationProjecti
                 ? pendingTurnStart.value.sourceProposedPlanId
                 : null,
               assistantMessageId: null,
+              effectiveModel: null,
               state: "running",
               requestedAt: Option.isSome(pendingTurnStart)
                 ? pendingTurnStart.value.requestedAt
@@ -1467,6 +1469,7 @@ const makeOrchestrationProjectionPipeline = Effect.fn("makeOrchestrationProjecti
             sourceProposedPlanThreadId: null,
             sourceProposedPlanId: null,
             assistantMessageId: event.payload.messageId,
+            effectiveModel: null,
             state: settlesTurn ? "completed" : "running",
             requestedAt: event.payload.createdAt,
             startedAt: event.payload.createdAt,
@@ -1504,6 +1507,7 @@ const makeOrchestrationProjectionPipeline = Effect.fn("makeOrchestrationProjecti
             sourceProposedPlanThreadId: null,
             sourceProposedPlanId: null,
             assistantMessageId: null,
+            effectiveModel: null,
             state: "interrupted",
             requestedAt: event.payload.createdAt,
             startedAt: event.payload.createdAt,
@@ -1608,6 +1612,7 @@ const makeOrchestrationProjectionPipeline = Effect.fn("makeOrchestrationProjecti
             sourceProposedPlanThreadId: null,
             sourceProposedPlanId: null,
             assistantMessageId: nextAssistantMessageId,
+            effectiveModel: null,
             state: turnStillRunning ? "running" : nextState,
             requestedAt: event.payload.completedAt,
             startedAt: event.payload.completedAt,
@@ -1616,6 +1621,21 @@ const makeOrchestrationProjectionPipeline = Effect.fn("makeOrchestrationProjecti
             checkpointRef: event.payload.checkpointRef,
             checkpointStatus: event.payload.status,
             checkpointFiles: event.payload.files,
+          });
+          return;
+        }
+
+        case "thread.turn-effective-model-set": {
+          const existingTurn = yield* projectionTurnRepository.getByTurnId({
+            threadId: event.payload.threadId,
+            turnId: event.payload.turnId,
+          });
+          if (Option.isNone(existingTurn)) {
+            return;
+          }
+          yield* projectionTurnRepository.upsertByTurnId({
+            ...existingTurn.value,
+            effectiveModel: event.payload.effectiveModel,
           });
           return;
         }

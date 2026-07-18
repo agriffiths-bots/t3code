@@ -51,6 +51,7 @@ import {
   getModelSelectionBooleanOptionValue,
   getModelSelectionStringOptionValue,
   getProviderOptionDescriptors,
+  normalizeModelSlug,
   resolvePromptInjectedEffort,
 } from "@t3tools/shared/model";
 import * as Cause from "effect/Cause";
@@ -71,6 +72,7 @@ import { resolveAttachmentPath } from "../../attachmentStore.ts";
 import { ServerConfig } from "../../config.ts";
 import { makeClaudeMcpServers } from "../../mcp/McpProviderInjection.ts";
 import * as McpProviderSession from "../../mcp/McpProviderSession.ts";
+import * as WorkerProcessIsolation from "../../process/WorkerProcessIsolation.ts";
 import { makeClaudeEnvironment } from "../Drivers/ClaudeHome.ts";
 import {
   getClaudeModelCapabilities,
@@ -124,6 +126,8 @@ interface ClaudeResumeState {
 interface ClaudeTurnState {
   readonly turnId: TurnId;
   readonly startedAt: string;
+  requestedModel: string | undefined;
+  effectiveModel: string | undefined;
   /**
    * True for turns auto-started by assistant output arriving without an
    * active turn (background agent/subagent responses between user prompts).
@@ -472,6 +476,40 @@ function maxClaudeContextWindowFromModelUsage(
   }
 
   return maxContextWindow;
+}
+
+function normalizeClaudeModel(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const normalized = value.trim();
+  return normalized.length > 0 ? normalized : undefined;
+}
+
+function comparableClaudeModel(value: string): string {
+  const withoutContextWindow = value.replace(/\[(?:1m|200k)\]$/u, "");
+  const normalized = normalizeModelSlug(withoutContextWindow, PROVIDER) ?? withoutContextWindow;
+  return normalized.toLowerCase().replace(/-\d{8}$/u, "");
+}
+
+function sameClaudeModel(left: string, right: string): boolean {
+  return comparableClaudeModel(left) === comparableClaudeModel(right);
+}
+
+function divergentClaudeEffectiveModel(
+  turnState: ClaudeTurnState,
+  modelUsage: Record<string, ModelUsage> | undefined,
+): string | undefined {
+  const requestedModel = turnState.requestedModel;
+  const usageModels = Object.keys(modelUsage ?? {}).flatMap((model) => {
+    const normalized = normalizeClaudeModel(model);
+    return normalized ? [normalized] : [];
+  });
+  const effectiveModel =
+    turnState.effectiveModel ?? (usageModels.length === 1 ? usageModels[0] : undefined);
+
+  if (!effectiveModel || !requestedModel || sameClaudeModel(effectiveModel, requestedModel)) {
+    return undefined;
+  }
+  return effectiveModel;
 }
 
 function selectedClaudeContextWindow(
@@ -1508,6 +1546,7 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
   const fileSystem = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
   const serverConfig = yield* ServerConfig;
+  const workerProcessIsolation = yield* WorkerProcessIsolation.currentOrDisabled;
   const crypto = yield* Crypto.Crypto;
   const claudeEnvironment = yield* makeClaudeEnvironment(claudeSettings, options?.environment).pipe(
     Effect.provideService(Path.Path, path),
@@ -2153,6 +2192,8 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
       return;
     }
 
+    const effectiveModel = divergentClaudeEffectiveModel(turnState, result?.modelUsage);
+
     for (const [index, tool] of context.inFlightTools.entries()) {
       const toolStamp = yield* makeEventStamp();
       yield* offerRuntimeEvent({
@@ -2216,6 +2257,7 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
       payload: {
         state: status,
         ...(result?.stop_reason !== undefined ? { stopReason: result.stop_reason } : {}),
+        ...(effectiveModel ? { effectiveModel } : {}),
         ...(result?.usage ? { usage: result.usage } : {}),
         ...(result?.modelUsage ? { modelUsage: result.modelUsage } : {}),
         ...(typeof result?.total_cost_usd === "number"
@@ -2645,6 +2687,8 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
     context.turnState = {
       turnId,
       startedAt,
+      requestedModel: context.session.model,
+      effectiveModel: undefined,
       synthetic: true,
       items: [],
       assistantTextBlocks: new Map(),
@@ -2695,6 +2739,13 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
       rawMethod: "claude/synthetic-turn-start",
       rawPayload: {},
     });
+
+    if (
+      context.turnState &&
+      (message.parent_tool_use_id === null || message.parent_tool_use_id === undefined)
+    ) {
+      context.turnState.effectiveModel = normalizeClaudeModel(message.message?.model);
+    }
 
     const content = message.message?.content;
     if (Array.isArray(content)) {
@@ -3626,7 +3677,19 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
       const canUseTool: CanUseTool = (toolName, toolInput, callbackOptions) =>
         runPromise(canUseToolEffect(toolName, toolInput, callbackOptions));
 
-      const workerExecutable = { executablePath: claudeSettings.binaryPath, env: {} };
+      const claudeBinaryPath = claudeSettings.binaryPath;
+      const workerExecutable =
+        input.detached === true
+          ? yield* workerProcessIsolation
+              .prepareExecutable({
+                realCommand: claudeBinaryPath,
+                directory: serverConfig.stateDir,
+              })
+              .pipe(
+                Effect.provideService(FileSystem.FileSystem, fileSystem),
+                Effect.provideService(Path.Path, path),
+              )
+          : { executablePath: claudeBinaryPath, env: {} };
       const extraArgs = parseCliArgs(claudeSettings.launchArgs).flags;
       const modelSelection =
         input.modelSelection?.instanceId === boundInstanceId ? input.modelSelection : undefined;
@@ -3661,6 +3724,7 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
         ...(ultracode ? { ultracode: true } : {}),
       };
       const mcpSession = McpProviderSession.readMcpProviderSession(input.threadId);
+      let workerStderrBuffer = "";
       const queryOptions: ClaudeQueryOptions = {
         ...(input.cwd ? { cwd: input.cwd } : {}),
         ...(apiModelId ? { model: apiModelId } : {}),
@@ -3683,6 +3747,25 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
         ...(newSessionId ? { sessionId: newSessionId } : {}),
         includePartialMessages: true,
         canUseTool,
+        ...(input.detached === true
+          ? {
+              stderr: (data: string) => {
+                const lines = `${workerStderrBuffer}${data}`.split(/\r?\n/u);
+                workerStderrBuffer = (lines.pop() ?? "").slice(-4096);
+                for (const line of lines) {
+                  const reason = WorkerProcessIsolation.parseFallbackWarningLine(line);
+                  if (reason === undefined) continue;
+                  runFork(
+                    Effect.logWarning("worker.process.isolation.sdk-fallback", {
+                      providerInstanceId: boundInstanceId,
+                      threadId,
+                      reason,
+                    }),
+                  );
+                }
+              },
+            }
+          : {}),
         env: { ...claudeEnvironment, ...workerExecutable.env },
         ...(input.cwd ? { additionalDirectories: [input.cwd] } : {}),
         ...(Object.keys(extraArgs).length > 0 ? { extraArgs } : {}),
@@ -3908,6 +3991,8 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
       const turnState: ClaudeTurnState = {
         turnId,
         startedAt: yield* nowIso,
+        requestedModel: modelSelection?.model ?? context.session.model,
+        effectiveModel: undefined,
         items: [],
         assistantTextBlocks: new Map(),
         assistantTextBlockOrder: [],
@@ -3949,6 +4034,11 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
       type: "message",
       message,
     }).pipe(Effect.mapError((cause) => toRequestError(input.threadId, "turn/start", cause)));
+
+    if (steeringTurnState) {
+      steeringTurnState.requestedModel = modelSelection?.model ?? context.session.model;
+      steeringTurnState.effectiveModel = undefined;
+    }
 
     return {
       threadId: context.session.threadId,

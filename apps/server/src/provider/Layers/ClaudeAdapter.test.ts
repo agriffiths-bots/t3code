@@ -28,6 +28,7 @@ import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
+import * as Logger from "effect/Logger";
 import * as Random from "effect/Random";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
@@ -37,6 +38,7 @@ import { attachmentRelativePath } from "../../attachmentStore.ts";
 import { ServerConfig } from "../../config.ts";
 import { makeClaudeMcpServers } from "../../mcp/McpProviderInjection.ts";
 import * as McpProviderSession from "../../mcp/McpProviderSession.ts";
+import * as WorkerProcessIsolation from "../../process/WorkerProcessIsolation.ts";
 import { ServerSettingsService } from "../../serverSettings.ts";
 import { ProviderAdapterProcessError, ProviderAdapterValidationError } from "../Errors.ts";
 import type { ClaudeAdapterShape } from "../Services/ClaudeAdapter.ts";
@@ -159,6 +161,7 @@ function makeHarness(config?: {
   readonly baseDir?: string;
   readonly claudeConfig?: Partial<ClaudeSettings>;
   readonly instanceId?: ProviderInstanceId;
+  readonly workerProcessIsolation?: WorkerProcessIsolation.WorkerProcessIsolationShape;
 }) {
   const query = new FakeClaudeQuery();
   let createInput:
@@ -201,6 +204,12 @@ function makeHarness(config?: {
         ),
       ),
       Layer.provideMerge(ServerSettingsService.layerTest()),
+      Layer.provideMerge(
+        Layer.succeed(
+          WorkerProcessIsolation.WorkerProcessIsolation,
+          config?.workerProcessIsolation ?? WorkerProcessIsolation.disabled,
+        ),
+      ),
       Layer.provideMerge(NodeServices.layer),
     ),
     query,
@@ -440,6 +449,105 @@ describe("ClaudeAdapterLive", () => {
         createInput?.options.env?.CLAUDE_CONFIG_DIR,
         NodePath.join(NodeOS.homedir(), ".claude-work"),
       );
+    }).pipe(
+      Effect.provideService(Random.Random, makeDeterministicRandomService()),
+      Effect.provide(harness.layer),
+    );
+  });
+
+  it.effect("routes detached Claude workers through worker process isolation", () => {
+    const messages: Array<ReadonlyArray<unknown>> = [];
+    const logger = Logger.make<unknown, void>(({ message }) => {
+      messages.push(message as ReadonlyArray<unknown>);
+    });
+    const prepareCalls: Array<{ readonly realCommand: string; readonly directory: string }> = [];
+    const harness = makeHarness({
+      claudeConfig: { binaryPath: "/usr/local/bin/claude" },
+      workerProcessIsolation: WorkerProcessIsolation.WorkerProcessIsolation.of({
+        ...WorkerProcessIsolation.disabled,
+        prepareExecutable: (input) =>
+          Effect.sync(() => {
+            prepareCalls.push(input);
+            return {
+              executablePath: "/tmp/t3-worker-systemd-run",
+              env: { T3_WORKER_ISOLATION_TEST: "enabled" },
+            };
+          }),
+      }),
+    });
+    return Effect.gen(function* () {
+      const adapter = yield* ClaudeAdapter;
+      yield* adapter.startSession({
+        threadId: THREAD_ID,
+        provider: ProviderDriverKind.make("claudeAgent"),
+        runtimeMode: "full-access",
+        detached: true,
+      });
+
+      const createInput = harness.getLastCreateQueryInput();
+      assert.deepEqual(prepareCalls, [
+        { realCommand: "/usr/local/bin/claude", directory: "/tmp/userdata" },
+      ]);
+      assert.equal(createInput?.options.pathToClaudeCodeExecutable, "/tmp/t3-worker-systemd-run");
+      assert.equal(createInput?.options.env?.T3_WORKER_ISOLATION_TEST, "enabled");
+      assert.isFunction(createInput?.options.stderr);
+      createInput?.options.stderr?.(
+        `untrusted child output\n${WorkerProcessIsolation.FALLBACK_WARNING_PREFIX}: arbitrary child text\n${WorkerProcessIsolation.FALLBACK_WARNING_PREFIX}: missing-system`,
+      );
+      createInput?.options.stderr?.(`d-run\n${"sensitive trailing output\n".repeat(300)}`);
+      while (messages.length === 0) yield* Effect.yieldNow;
+      assert.deepEqual(messages, [
+        [
+          "worker.process.isolation.sdk-fallback",
+          {
+            providerInstanceId: ProviderInstanceId.make("claudeAgent"),
+            threadId: THREAD_ID,
+            reason: "missing-systemd-run",
+          },
+        ],
+      ]);
+    }).pipe(
+      Effect.provideService(Random.Random, makeDeterministicRandomService()),
+      Effect.provide(
+        Layer.merge(
+          harness.layer,
+          Logger.layer([logger], {
+            mergeWithExisting: false,
+          }),
+        ),
+      ),
+    );
+  });
+
+  it.effect("keeps foreground Claude workers on their configured executable", () => {
+    let prepareCallCount = 0;
+    const harness = makeHarness({
+      claudeConfig: { binaryPath: "/usr/local/bin/claude" },
+      workerProcessIsolation: WorkerProcessIsolation.WorkerProcessIsolation.of({
+        ...WorkerProcessIsolation.disabled,
+        prepareExecutable: () =>
+          Effect.sync(() => {
+            prepareCallCount += 1;
+            return {
+              executablePath: "/tmp/t3-worker-systemd-run",
+              env: { T3_WORKER_ISOLATION_TEST: "enabled" },
+            };
+          }),
+      }),
+    });
+    return Effect.gen(function* () {
+      const adapter = yield* ClaudeAdapter;
+      yield* adapter.startSession({
+        threadId: THREAD_ID,
+        provider: ProviderDriverKind.make("claudeAgent"),
+        runtimeMode: "full-access",
+      });
+
+      const createInput = harness.getLastCreateQueryInput();
+      assert.equal(prepareCallCount, 0);
+      assert.equal(createInput?.options.pathToClaudeCodeExecutable, "/usr/local/bin/claude");
+      assert.equal(createInput?.options.env?.T3_WORKER_ISOLATION_TEST, undefined);
+      assert.isUndefined(createInput?.options.stderr);
     }).pipe(
       Effect.provideService(Random.Random, makeDeterministicRandomService()),
       Effect.provide(harness.layer),
@@ -1249,6 +1357,225 @@ describe("ClaudeAdapterLive", () => {
         output_tokens: 5,
       });
       assert.equal(completed?.payload.totalCostUsd, 0.25);
+    }).pipe(
+      Effect.provideService(Random.Random, makeDeterministicRandomService()),
+      Effect.provide(harness.layer),
+    );
+  });
+
+  it.effect("records an omitted-parent effective model with multi-model usage", () => {
+    const harness = makeHarness();
+    return Effect.gen(function* () {
+      const adapter = yield* ClaudeAdapter;
+      const requestedModel = createModelSelection(
+        ProviderInstanceId.make("claudeAgent"),
+        "claude-fable-5",
+      );
+      const runtimeEventsFiber = yield* Stream.takeUntil(
+        adapter.streamEvents,
+        (event) => event.type === "turn.completed",
+      ).pipe(Stream.runCollect, Effect.forkChild);
+
+      const session = yield* adapter.startSession({
+        threadId: THREAD_ID,
+        provider: ProviderDriverKind.make("claudeAgent"),
+        modelSelection: requestedModel,
+        runtimeMode: "full-access",
+      });
+      yield* adapter.sendTurn({
+        threadId: session.threadId,
+        input: "hello",
+        attachments: [],
+        modelSelection: requestedModel,
+      });
+
+      harness.query.emit({
+        type: "assistant",
+        session_id: "sdk-session-effective-model-rerouted",
+        uuid: "assistant-effective-model-rerouted",
+        message: {
+          id: "assistant-message-effective-model-rerouted",
+          model: "claude-opus-4-8",
+          content: [{ type: "text", text: "Rerouted answer" }],
+        },
+      } as unknown as SDKMessage);
+      harness.query.emit({
+        type: "result",
+        subtype: "success",
+        is_error: false,
+        errors: [],
+        result: "Rerouted answer",
+        session_id: "sdk-session-effective-model-rerouted",
+        uuid: "result-effective-model-rerouted",
+        modelUsage: {
+          "claude-opus-4-8": {
+            contextWindow: 1_000_000,
+            maxOutputTokens: 128_000,
+          },
+          "claude-sonnet-5": {
+            contextWindow: 200_000,
+            maxOutputTokens: 64_000,
+          },
+        },
+      } as unknown as SDKMessage);
+      harness.query.finish();
+
+      const runtimeEvents = Array.from(yield* Fiber.join(runtimeEventsFiber));
+      const completed = runtimeEvents.find((event) => event.type === "turn.completed");
+      assert.equal(completed?.type, "turn.completed");
+      if (completed?.type === "turn.completed") {
+        assert.equal(
+          (completed.payload as { readonly effectiveModel?: string }).effectiveModel,
+          "claude-opus-4-8",
+        );
+      }
+    }).pipe(
+      Effect.provideService(Random.Random, makeDeterministicRandomService()),
+      Effect.provide(harness.layer),
+    );
+  });
+
+  it.effect("omits the effective model when only a nested subagent uses another model", () => {
+    const harness = makeHarness();
+    return Effect.gen(function* () {
+      const adapter = yield* ClaudeAdapter;
+      const requestedModel = createModelSelection(
+        ProviderInstanceId.make("claudeAgent"),
+        "claude-fable-5",
+      );
+      const runtimeEventsFiber = yield* Stream.takeUntil(
+        adapter.streamEvents,
+        (event) => event.type === "turn.completed",
+      ).pipe(Stream.runCollect, Effect.forkChild);
+
+      const session = yield* adapter.startSession({
+        threadId: THREAD_ID,
+        provider: ProviderDriverKind.make("claudeAgent"),
+        modelSelection: requestedModel,
+        runtimeMode: "full-access",
+      });
+      yield* adapter.sendTurn({
+        threadId: session.threadId,
+        input: "hello",
+        attachments: [],
+        modelSelection: requestedModel,
+      });
+
+      harness.query.emit({
+        type: "assistant",
+        session_id: "sdk-session-effective-model-matched",
+        uuid: "assistant-effective-model-matched",
+        parent_tool_use_id: null,
+        message: {
+          id: "assistant-message-effective-model-matched",
+          model: "claude-fable-5",
+          content: [{ type: "text", text: "Requested-model answer" }],
+        },
+      } as unknown as SDKMessage);
+      harness.query.emit({
+        type: "assistant",
+        session_id: "sdk-session-effective-model-matched",
+        uuid: "assistant-effective-model-subagent",
+        parent_tool_use_id: "tool-use-subagent",
+        message: {
+          id: "assistant-message-effective-model-subagent",
+          model: "claude-opus-4-8",
+          content: [{ type: "text", text: "Subagent work" }],
+        },
+      } as unknown as SDKMessage);
+      harness.query.emit({
+        type: "result",
+        subtype: "success",
+        is_error: false,
+        errors: [],
+        result: "Requested-model answer",
+        session_id: "sdk-session-effective-model-matched",
+        uuid: "result-effective-model-matched",
+        modelUsage: {
+          "claude-fable-5": {
+            contextWindow: 200_000,
+            maxOutputTokens: 64_000,
+          },
+          "claude-opus-4-8": {
+            contextWindow: 1_000_000,
+            maxOutputTokens: 128_000,
+          },
+        },
+      } as unknown as SDKMessage);
+      harness.query.finish();
+
+      const runtimeEvents = Array.from(yield* Fiber.join(runtimeEventsFiber));
+      const completed = runtimeEvents.find((event) => event.type === "turn.completed");
+      assert.equal(completed?.type, "turn.completed");
+      if (completed?.type === "turn.completed") {
+        assert.equal(
+          (completed.payload as { readonly effectiveModel?: string }).effectiveModel,
+          undefined,
+        );
+      }
+    }).pipe(
+      Effect.provideService(Random.Random, makeDeterministicRandomService()),
+      Effect.provide(harness.layer),
+    );
+  });
+
+  it.effect("omits the effective model for equivalent Claude aliases and versioned ids", () => {
+    const harness = makeHarness();
+    return Effect.gen(function* () {
+      const adapter = yield* ClaudeAdapter;
+      const requestedModel = createModelSelection(ProviderInstanceId.make("claudeAgent"), "opus");
+      const runtimeEventsFiber = yield* Stream.takeUntil(
+        adapter.streamEvents,
+        (event) => event.type === "turn.completed",
+      ).pipe(Stream.runCollect, Effect.forkChild);
+
+      const session = yield* adapter.startSession({
+        threadId: THREAD_ID,
+        provider: ProviderDriverKind.make("claudeAgent"),
+        modelSelection: requestedModel,
+        runtimeMode: "full-access",
+      });
+      yield* adapter.sendTurn({
+        threadId: session.threadId,
+        input: "hello",
+        attachments: [],
+        modelSelection: requestedModel,
+      });
+
+      harness.query.emit({
+        type: "assistant",
+        session_id: "sdk-session-effective-model-alias",
+        uuid: "assistant-effective-model-alias",
+        parent_tool_use_id: null,
+        message: {
+          id: "assistant-message-effective-model-alias",
+          model: "claude-opus-4-8-20260718",
+          content: [{ type: "text", text: "Alias answer" }],
+        },
+      } as unknown as SDKMessage);
+      harness.query.emit({
+        type: "result",
+        subtype: "success",
+        is_error: false,
+        errors: [],
+        result: "Alias answer",
+        session_id: "sdk-session-effective-model-alias",
+        uuid: "result-effective-model-alias",
+        modelUsage: {
+          "claude-opus-4-8-20260718": {
+            contextWindow: 1_000_000,
+            maxOutputTokens: 128_000,
+          },
+        },
+      } as unknown as SDKMessage);
+      harness.query.finish();
+
+      const runtimeEvents = Array.from(yield* Fiber.join(runtimeEventsFiber));
+      const completed = runtimeEvents.find((event) => event.type === "turn.completed");
+      assert.equal(completed?.type, "turn.completed");
+      if (completed?.type === "turn.completed") {
+        assert.equal(completed.payload.effectiveModel, undefined);
+      }
     }).pipe(
       Effect.provideService(Random.Random, makeDeterministicRandomService()),
       Effect.provide(harness.layer),

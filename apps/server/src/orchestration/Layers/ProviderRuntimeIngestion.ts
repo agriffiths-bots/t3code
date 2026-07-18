@@ -1843,6 +1843,24 @@ const make = Effect.gen(function* () {
         });
       }
 
+      const effectiveModel =
+        event.type === "turn.completed"
+          ? event.payload.effectiveModel
+          : event.type === "model.rerouted"
+            ? event.payload.toModel
+            : undefined;
+      const effectiveModelTurnId = toTurnId(event.turnId);
+      if (effectiveModel && effectiveModelTurnId) {
+        yield* orchestrationEngine.dispatch({
+          type: "thread.turn.effective-model.set",
+          commandId: yield* providerCommandId(event, "thread-turn-effective-model-set"),
+          threadId: thread.id,
+          turnId: effectiveModelTurnId,
+          effectiveModel,
+          createdAt: now,
+        });
+      }
+
       if (event.type === "turn.diff.updated") {
         const turnId = toTurnId(event.turnId);
         const checkpointContext = turnId
