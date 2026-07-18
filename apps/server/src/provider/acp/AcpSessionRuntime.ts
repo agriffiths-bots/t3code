@@ -417,6 +417,7 @@ export const make = (
           if (action._tag === "ObserveReplay") {
             yield* observeSessionLoadAssistantSegments({
               assistantSegmentRef,
+              assistantItemRuntimeId,
               params: notification,
             });
             return;
@@ -714,6 +715,7 @@ export const make = (
           modeStateRef,
           toolCallsRef,
           assistantSegmentRef,
+          assistantItemRuntimeId,
           params: notification,
         });
       }
@@ -1027,17 +1029,19 @@ const assistantItemId = (sessionId: string, runtimeId: string, segmentIndex: num
 const ensureActiveAssistantSegmentState = ({
   assistantSegmentRef,
   sessionId,
+  assistantItemRuntimeId,
   replayOnly = false,
 }: {
   readonly assistantSegmentRef: Ref.Ref<AcpAssistantSegmentState>;
   readonly sessionId: string;
+  readonly assistantItemRuntimeId: string;
   readonly replayOnly?: boolean;
 }) =>
   Ref.update(assistantSegmentRef, (current) => {
     if (current.activeItemId) {
       return current;
     }
-    const itemId = assistantItemId(sessionId, current.nextSegmentIndex);
+    const itemId = assistantItemId(sessionId, assistantItemRuntimeId, current.nextSegmentIndex);
     return {
       nextSegmentIndex: current.nextSegmentIndex + 1,
       activeItemId: itemId,
@@ -1060,9 +1064,11 @@ const closeActiveAssistantSegmentState = ({
 
 const observeSessionLoadAssistantSegments = ({
   assistantSegmentRef,
+  assistantItemRuntimeId,
   params,
 }: {
   readonly assistantSegmentRef: Ref.Ref<AcpAssistantSegmentState>;
+  readonly assistantItemRuntimeId: string;
   readonly params: EffectAcpSchema.SessionNotification;
 }): Effect.Effect<void> =>
   Effect.gen(function* () {
@@ -1086,6 +1092,7 @@ const observeSessionLoadAssistantSegments = ({
       yield* ensureActiveAssistantSegmentState({
         assistantSegmentRef,
         sessionId: params.sessionId,
+        assistantItemRuntimeId,
         replayOnly: true,
       });
     }

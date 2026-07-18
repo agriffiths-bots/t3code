@@ -156,6 +156,7 @@ export const make = ElectronUpdater.of({
       ),
     ),
   allowDowngrade: loadAutoUpdater.pipe(Effect.map((autoUpdater) => autoUpdater.allowDowngrade)),
+  setAllowDowngrade: (value) =>
     loadAutoUpdater.pipe(
       Effect.flatMap((autoUpdater) =>
         Effect.sync(() => {

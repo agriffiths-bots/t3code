@@ -591,11 +591,15 @@ describe("AcpSessionRuntime", () => {
 
       expect(assistantStarted?._tag).toBe("AssistantItemStarted");
       if (assistantStarted?._tag === "AssistantItemStarted") {
-        expect(assistantStarted.itemId).toBe("assistant:mock-session-1:segment:0");
+        expect(assistantStarted.itemId).toMatch(
+          /^assistant:mock-session-1:runtime:[0-9a-f-]+:segment:0$/,
+        );
       }
       expect(contentDelta?._tag).toBe("ContentDelta");
       if (contentDelta?._tag === "ContentDelta") {
-        expect(contentDelta.itemId).toBe("assistant:mock-session-1:segment:0");
+        expect(contentDelta.itemId).toMatch(
+          /^assistant:mock-session-1:runtime:[0-9a-f-]+:segment:0$/,
+        );
         expect(contentDelta.text).toBe("hello from mock");
       }
     }).pipe(
@@ -670,11 +674,15 @@ describe("AcpSessionRuntime", () => {
 
       expect(assistantStarted?._tag).toBe("AssistantItemStarted");
       if (assistantStarted?._tag === "AssistantItemStarted") {
-        expect(assistantStarted.itemId).toBe("assistant:mock-session-1:segment:3");
+        expect(assistantStarted.itemId).toMatch(
+          /^assistant:mock-session-1:runtime:[0-9a-f-]+:segment:3$/,
+        );
       }
       expect(contentDelta?._tag).toBe("ContentDelta");
       if (contentDelta?._tag === "ContentDelta") {
-        expect(contentDelta.itemId).toBe("assistant:mock-session-1:segment:3");
+        expect(contentDelta.itemId).toMatch(
+          /^assistant:mock-session-1:runtime:[0-9a-f-]+:segment:3$/,
+        );
       }
     }).pipe(
       Effect.provide(
@@ -709,12 +717,16 @@ describe("AcpSessionRuntime", () => {
       const assistantStarted = notes[0];
       expect(assistantStarted?._tag).toBe("AssistantItemStarted");
       if (assistantStarted?._tag === "AssistantItemStarted") {
-        expect(assistantStarted.itemId).toBe("assistant:mock-session-1:segment:0");
+        expect(assistantStarted.itemId).toMatch(
+          /^assistant:mock-session-1:runtime:[0-9a-f-]+:segment:0$/,
+        );
       }
       const contentDelta = notes[1];
       expect(contentDelta?._tag).toBe("ContentDelta");
       if (contentDelta?._tag === "ContentDelta") {
-        expect(contentDelta.itemId).toBe("assistant:mock-session-1:segment:0");
+        expect(contentDelta.itemId).toMatch(
+          /^assistant:mock-session-1:runtime:[0-9a-f-]+:segment:0$/,
+        );
         expect(contentDelta.text).toBe(" live continuation");
       }
     }).pipe(

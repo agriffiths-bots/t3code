@@ -752,14 +752,17 @@ cursorAdapterTestLayer("CursorAdapterLive", (it) => {
       assert.isDefined(assistantStarted);
       if (assistantStarted?.type === "item.started") {
         assert.equal(String(assistantStarted.turnId), String(activeTurnId));
-        assert.equal(assistantStarted.itemId, "assistant:mock-session-1:segment:0");
+        assert.match(
+          assistantStarted.itemId,
+          /^assistant:mock-session-1:runtime:[0-9a-f-]+:segment:0$/,
+        );
       }
 
       const delta = runtimeEvents.find((event) => event.type === "content.delta");
       assert.isDefined(delta);
       if (delta?.type === "content.delta") {
         assert.equal(String(delta.turnId), String(activeTurnId));
-        assert.equal(delta.itemId, "assistant:mock-session-1:segment:0");
+        assert.match(delta.itemId, /^assistant:mock-session-1:runtime:[0-9a-f-]+:segment:0$/);
         assert.equal(delta.payload.delta, " live continuation");
       }
 
