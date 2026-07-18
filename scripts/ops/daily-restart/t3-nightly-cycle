@@ -587,6 +587,7 @@ build_release_artifacts() {
   local step_log="$run_dir/$step.log"
   local started="$SECONDS" rc=0 duration
   local rollback_sha target_sha dependency_changes pending_metadata pending_format pending_rollback pending_target pending_manager_source
+  local pending_rollback_commit pending_target_commit
   local pending_running_sha pending_successful_sha pending_reconciled=0 fallback_required=0
   : >"$step_log"
   write_event "$step" "started" "" "" "$step_log"
@@ -599,17 +600,24 @@ build_release_artifacts() {
   if [[ "$rc" -eq 0 ]]; then
     target_sha="$(capture_logged 30 "$step_log" git -C "$checkout" rev-parse origin/main)" || rc=$?
   fi
-  if [[ "$rc" -eq 0 && "$rollback_sha" != "$target_sha" ]]; then
-    if ! run_logged 60 "$step_log" git -C "$checkout" merge-base --is-ancestor "$rollback_sha" "$target_sha"; then
-      printf '[%s] target is not a fast-forward from rollback_sha; refusing prebuilt deploy before downtime\n' "$(date -u +%FT%TZ)" >>"$step_log"
-      rc=67
-    fi
-  fi
   if [[ "$rc" -eq 0 && -e "$pending_live_deploy" ]]; then
     pending_metadata="$(read_pending_live_deploy)" || rc=$?
     if [[ "$rc" -eq 0 ]]; then
       IFS=$'\t' read -r pending_format pending_target pending_manager_source <<<"$pending_metadata"
-      if [[ "$pending_format" == "legacy" ]]; then
+      pending_running_sha="$(fetch_live_deployed_sha "$step_log" || true)"
+      pending_successful_sha="$(last_successful_deployed_sha || true)"
+      if [[ "$rollback_sha" == "$pending_target" && "$pending_running_sha" == "$pending_target" &&
+        "$pending_successful_sha" == "$pending_target" ]]; then
+        live_deploy_pending=1
+        if complete_pending_live_deploy; then
+          live_deploy_pending=0
+          pending_reconciled=1
+          printf '[%s] reconciled pending live deploy already completed target_sha=%s format=%s\n' \
+            "$(date -u +%FT%TZ)" "$pending_target" "$pending_format" >>"$step_log"
+        else
+          rc=$?
+        fi
+      elif [[ "$pending_format" == "legacy" ]]; then
         pending_rollback="$(recover_legacy_pending_rollback "$rollback_sha" "$pending_target" "$step_log")" || rc=$?
         if [[ "$rc" -eq 0 ]]; then
           pending_manager_source="$rollback_sha"
@@ -620,41 +628,67 @@ build_release_artifacts() {
         if [[ "$pending_manager_source" == "rollback" ]]; then
           pending_manager_source="$pending_rollback"
         fi
-        if [[ "$rollback_sha" == "$pending_target" ]]; then
-          pending_running_sha="$(fetch_live_deployed_sha "$step_log" || true)"
-          pending_successful_sha="$(last_successful_deployed_sha || true)"
-          if [[ "$pending_running_sha" == "$pending_target" && "$pending_successful_sha" == "$pending_target" ]]; then
-            live_deploy_pending=1
-            if complete_pending_live_deploy; then
-              live_deploy_pending=0
-              pending_reconciled=1
-              printf '[%s] reconciled pending live deploy already completed target_sha=%s\n' "$(date -u +%FT%TZ)" "$pending_target" >>"$step_log"
-            else
-              rc=$?
-            fi
-          elif [[ "$pending_running_sha" == "$pending_rollback" ]]; then
-            printf '[%s] pending live deploy still runs rollback_sha=%s; retrying target_sha=%s\n' "$(date -u +%FT%TZ)" "$pending_rollback" "$pending_target" >>"$step_log"
-          else
-            printf '[%s] pending live deploy state is ambiguous; refusing stale rollback current_head=%s rollback_sha=%s target_sha=%s running_sha=%s successful_sha=%s\n' \
-              "$(date -u +%FT%TZ)" "$rollback_sha" "$pending_rollback" "$pending_target" "${pending_running_sha:-unknown}" "${pending_successful_sha:-unknown}" >>"$step_log"
-            rc=68
-          fi
-        fi
       fi
     fi
     if [[ "$rc" -eq 0 && "$pending_reconciled" -eq 0 ]]; then
-      if ! run_logged 60 "$step_log" git -C "$checkout" merge-base --is-ancestor "$pending_rollback" "$target_sha"; then
-        printf '[%s] target is not a fast-forward from pending rollback_sha; refusing live deploy before mutation\n' "$(date -u +%FT%TZ)" >>"$step_log"
+      if [[ "$pending_running_sha" != "$pending_rollback" ||
+        ( "$rollback_sha" != "$pending_rollback" && "$rollback_sha" != "$pending_target" ) ]]; then
+        printf '[%s] pending live deploy state is ambiguous; refusing retry current_head=%s rollback_sha=%s target_sha=%s running_sha=%s successful_sha=%s\n' \
+          "$(date -u +%FT%TZ)" "$rollback_sha" "$pending_rollback" "$pending_target" \
+          "${pending_running_sha:-unknown}" "${pending_successful_sha:-unknown}" >>"$step_log"
+        rc=68
+      else
+        printf '[%s] pending live deploy still runs rollback_sha=%s checkout_sha=%s; retrying stored target_sha=%s\n' \
+          "$(date -u +%FT%TZ)" "$pending_rollback" "$rollback_sha" "$pending_target" >>"$step_log"
+      fi
+    fi
+    if [[ "$rc" -eq 0 && "$pending_reconciled" -eq 0 ]]; then
+      pending_rollback_commit="$(capture_logged 30 "$step_log" git -C "$checkout" rev-parse --verify "${pending_rollback}^{commit}")" || rc=68
+      if [[ "$rc" -eq 0 && "$pending_rollback_commit" != "$pending_rollback" ]]; then
+        printf '[%s] pending rollback SHA did not resolve exactly expected=%s actual=%s\n' \
+          "$(date -u +%FT%TZ)" "$pending_rollback" "$pending_rollback_commit" >>"$step_log"
+        rc=68
+      fi
+    fi
+    if [[ "$rc" -eq 0 && "$pending_reconciled" -eq 0 ]]; then
+      pending_target_commit="$(capture_logged 30 "$step_log" git -C "$checkout" rev-parse --verify "${pending_target}^{commit}")" || rc=70
+      if [[ "$rc" -eq 0 && "$pending_target_commit" != "$pending_target" ]]; then
+        printf '[%s] stored pending target did not resolve exactly expected=%s actual=%s\n' \
+          "$(date -u +%FT%TZ)" "$pending_target" "$pending_target_commit" >>"$step_log"
+        rc=70
+      elif [[ "$rc" -eq 70 ]]; then
+        printf '[%s] stored pending target is no longer available after origin fetch target_sha=%s origin_main=%s\n' \
+          "$(date -u +%FT%TZ)" "$pending_target" "$target_sha" >>"$step_log"
+      fi
+    fi
+    if [[ "$rc" -eq 0 && "$pending_reconciled" -eq 0 ]]; then
+      if ! run_logged 60 "$step_log" git -C "$checkout" merge-base --is-ancestor "$pending_rollback" "$pending_target"; then
+        printf '[%s] stored pending target is not a fast-forward from pending rollback_sha=%s target_sha=%s\n' \
+          "$(date -u +%FT%TZ)" "$pending_rollback" "$pending_target" >>"$step_log"
         rc=67
       fi
     fi
     if [[ "$rc" -eq 0 && "$pending_reconciled" -eq 0 ]]; then
-      printf '[%s] retrying pending live deploy previous_target=%s current_target=%s\n' "$(date -u +%FT%TZ)" "$pending_target" "$target_sha" >>"$step_log"
+      if ! run_logged 60 "$step_log" git -C "$checkout" merge-base --is-ancestor "$pending_target" "$target_sha"; then
+        printf '[%s] stored pending target is no longer reachable from origin/main target_sha=%s origin_main=%s\n' \
+          "$(date -u +%FT%TZ)" "$pending_target" "$target_sha" >>"$step_log"
+        rc=70
+      fi
+    fi
+    if [[ "$rc" -eq 0 && "$pending_reconciled" -eq 0 ]]; then
+      printf '[%s] retrying pending live deploy stored_target=%s origin_main=%s\n' \
+        "$(date -u +%FT%TZ)" "$pending_target" "$target_sha" >>"$step_log"
       rc=66
       fallback_required=1
       live_deploy_rollback="$pending_rollback"
-      live_deploy_target="$target_sha"
+      live_deploy_target="$pending_target"
       live_restart_source_sha="$pending_manager_source"
+    fi
+  fi
+  if [[ "$rc" -eq 0 && "$rollback_sha" != "$target_sha" ]]; then
+    if ! run_logged 60 "$step_log" git -C "$checkout" merge-base --is-ancestor "$rollback_sha" "$target_sha"; then
+      printf '[%s] target is not a fast-forward from rollback_sha; refusing prebuilt deploy before downtime\n' "$(date -u +%FT%TZ)" >>"$step_log"
+      rc=67
     fi
   fi
   if [[ "$rc" -eq 0 && "$rollback_sha" != "$target_sha" ]]; then
@@ -961,7 +995,23 @@ record_unexpected_exit() {
   fi
 }
 
+# ShellCheck cannot infer that this function is invoked by the signal traps.
+# shellcheck disable=SC2317
+record_signal() {
+  local signal="$1" rc="$2"
+  trap - TERM INT HUP
+  if [[ "$failure_recorded" -eq 0 ]]; then
+    record_failure "signal-$signal" "$rc" "$log_file"
+    write_event "cycle" "failed" "$rc" "" "$log_file"
+    log "END FAILED signal=$signal"
+  fi
+  exit "$rc"
+}
+
 trap record_unexpected_exit EXIT
+trap 'record_signal TERM 143' TERM
+trap 'record_signal INT 130' INT
+trap 'record_signal HUP 129' HUP
 
 if ! exec 9>"$lock_file"; then
   record_failure "lock" 1 "$log_file"

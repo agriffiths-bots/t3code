@@ -133,10 +133,15 @@ runs:
    `<run-dir>/live-deploy.completed`. Restart-manager snapshots are retained by
    rollback SHA under `$T3DR_LEDGER/t3-nightly-cycle.restart-managers/`, so a
    later retry never sources orchestration code from an already-updated checkout.
+   A retry deploys the marker's stored target, even if `origin/main` has since
+   advanced, after confirming that the stored target is still contained in the
+   fetched branch. A missing or force-pushed-away stored target fails closed
+   with rc=70 and an alert instead of silently deploying the newer branch head.
    If a crash leaves the marker after a successful restart, a later cycle
    archives it only when both the latest restart result and the running service's
-   stamped `serverBuildSha` confirm the target. A confirmed rollback service is
-   retried; any other combination fails closed instead of reusing a stale base.
+   stamped `serverBuildSha` confirm the target; this reconciliation also applies
+   to legacy target-only markers. A confirmed rollback service is retried; any
+   other combination fails closed instead of reusing a stale base.
    Legacy target-only markers recover their rollback from the last successful
    restart ledger result (or, before any checkout mutation, the running service's
    stamped `serverBuildSha`), verify that commit against the target and checkout

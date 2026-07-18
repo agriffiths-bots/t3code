@@ -40,7 +40,13 @@ case "$*" in
     ;;
   *"diff --name-only"*) printf '%s\n' "${FAKE_CHANGED_FILES:-}" ;;
   *"status --porcelain"*) printf '%s\n' "${FAKE_GIT_STATUS:-}" ;;
-  *"merge-base --is-ancestor"*) exit "${FAKE_ANCESTOR_RC:-0}" ;;
+  *"merge-base --is-ancestor"*)
+    ancestor_from="${*: -2:1}"
+    if [[ -n "${FAKE_ANCESTOR_FROM_RC:-}" && "$ancestor_from" == "${FAKE_ANCESTOR_FROM_SHA:-}" ]]; then
+      exit "$FAKE_ANCESTOR_FROM_RC"
+    fi
+    exit "${FAKE_ANCESTOR_RC:-0}"
+    ;;
   *"reflog show --format=%H --max-count=64 HEAD"*)
     if [[ -n "${FAKE_REFLOG_SHAS:-}" ]]; then
       printf '%s\n' "$FAKE_REFLOG_SHAS"
@@ -137,6 +143,18 @@ SH
   cat >"$dir/fake-backup" <<'SH'
 #!/usr/bin/env bash
 echo "backup" >>"$T_LOG"
+if [[ "${FAKE_BACKUP_SIGNAL:-}" =~ ^(TERM|INT|HUP)$ ]]; then
+  parent="$PPID"
+  for _ in 1 2 3 4; do
+    args="$(/usr/bin/ps -o args= -p "$parent" 2>/dev/null)"
+    if [[ "$args" == *"t3-nightly-cycle"* ]]; then
+      kill -s "$FAKE_BACKUP_SIGNAL" "$parent"
+      break
+    fi
+    parent="$(/usr/bin/ps -o ppid= -p "$parent" 2>/dev/null | tr -d '[:space:]')"
+    [[ "$parent" =~ ^[0-9]+$ ]] || break
+  done
+fi
 exit "${FAKE_BACKUP_RC:-0}"
 SH
   cat >"$dir/fake-sync" <<'SH'
@@ -264,6 +282,16 @@ grep -Fq "RESULT FAILED step=backup rc=9" "$tmp/ledger/"*/t3-nightly-cycle.resul
 grep -Fq "END FAILED" "$tmp/ledger/"*/t3-nightly-cycle.log && pass "backup failure records failed cycle end" || fail "backup failure records failed cycle end"
 
 tmp="$(mktemp -d)"
+export FAKE_BACKUP_SIGNAL=TERM
+run_cycle "$tmp"
+unset FAKE_BACKUP_SIGNAL
+[[ "$(cat "$tmp/rc")" == "143" ]] && pass "SIGTERM exits with 143" || fail "SIGTERM exits with 143"
+grep -Fq "FAILURE step=signal-TERM rc=143" "$tmp/ledger/"*/t3-nightly-cycle.alert \
+  && grep -Fq "RESULT FAILED step=signal-TERM rc=143" "$tmp/ledger/"*/t3-nightly-cycle.result \
+  && pass "SIGTERM records an alert and failed result" \
+  || fail "SIGTERM records an alert and failed result"
+
+tmp="$(mktemp -d)"
 export FAKE_PNPM_RC=8
 run_cycle "$tmp"
 unset FAKE_PNPM_RC
@@ -358,6 +386,24 @@ grep -Fq "migrating legacy pending live deploy rollback_sha=aaaaaaaaaaaaaaaaaaaa
   || fail "legacy marker migration uses the safe current checkout"
 
 tmp="$(mktemp -d)"
+mkdir -p "$tmp/ledger/2026-07-16"
+printf '2026-07-16T03:30:00Z RESULT OK pre_sha=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa target_sha=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb snapshot=x manifest=y\n' \
+  >"$tmp/ledger/2026-07-16/t3-daily-restart.result"
+printf 'T3DR_TARGET_SHA=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n' >"$tmp/ledger/t3-nightly-cycle.pending-live-deploy"
+printf 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n' >"$tmp/fake-head"
+export FAKE_HEAD_SHA=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+export FAKE_TARGET_SHA=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+export FAKE_DEPLOYED_SHA=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+run_cycle "$tmp"
+unset FAKE_HEAD_SHA FAKE_TARGET_SHA FAKE_DEPLOYED_SHA
+[[ "$(cat "$tmp/rc")" == "0" ]] && pass "successful legacy pending marker reconciles" || fail "successful legacy pending marker reconciles"
+grep -Fq "reconciled pending live deploy already completed target_sha=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb format=legacy" "$tmp/ledger/"*/build-release-artifacts.log \
+  && grep -Fq "T3DR_TARGET_SHA=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" "$tmp/ledger/"*/live-deploy.completed \
+  && [[ ! -e "$tmp/ledger/t3-nightly-cycle.pending-live-deploy" ]] \
+  && pass "successful legacy marker is archived without retry" \
+  || fail "successful legacy marker is archived without retry"
+
+tmp="$(mktemp -d)"
 mkdir -p "$tmp/ledger/2026-07-16" "$tmp/checkout/scripts/ops/daily-restart"
 printf '2026-07-16T03:30:00Z RESULT OK pre_sha=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa target_sha=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa snapshot=x manifest=y\n' >"$tmp/ledger/2026-07-16/t3-daily-restart.result"
 printf 'T3DR_TARGET_SHA=cccccccccccccccccccccccccccccccccccccccc\n' >"$tmp/ledger/t3-nightly-cycle.pending-live-deploy"
@@ -436,6 +482,55 @@ if grep -Fq "target restart source=" "$tmp/calls.log"; then
   fail "pending live retry invoked target restart code"
 else
   pass "pending live retry never invokes target restart code"
+fi
+
+tmp="$(mktemp -d)"
+mkdir -p "$tmp/ledger"
+cat >"$tmp/ledger/t3-nightly-cycle.pending-live-deploy" <<'EOF'
+T3DR_ROLLBACK_SHA=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+T3DR_TARGET_SHA=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+T3DR_RESTART_MANAGER_SHA=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+EOF
+export FAKE_TARGET_SHA=cccccccccccccccccccccccccccccccccccccccc
+run_cycle "$tmp"
+unset FAKE_TARGET_SHA
+[[ "$(cat "$tmp/rc")" == "0" ]] && pass "advanced origin pending retry exits zero" || fail "advanced origin pending retry exits zero"
+grep -Fq "git -C $tmp/checkout merge --ff-only bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" "$tmp/calls.log" \
+  && grep -Fq "restart prebuilt=0" "$tmp/calls.log" \
+  && grep -Fq "target=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" "$tmp/calls.log" \
+  && pass "pending retry deploys the stored target" \
+  || fail "pending retry deploys the stored target"
+if grep -Fq "git -C $tmp/checkout merge --ff-only cccccccccccccccccccccccccccccccccccccccc" "$tmp/calls.log" ||
+  grep -Fq "target=cccccccccccccccccccccccccccccccccccccccc" "$tmp/calls.log"; then
+  fail "pending retry silently deployed advanced origin"
+else
+  pass "pending retry does not silently deploy advanced origin"
+fi
+
+tmp="$(mktemp -d)"
+mkdir -p "$tmp/ledger"
+cat >"$tmp/ledger/t3-nightly-cycle.pending-live-deploy" <<'EOF'
+T3DR_ROLLBACK_SHA=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+T3DR_TARGET_SHA=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+T3DR_RESTART_MANAGER_SHA=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+EOF
+export FAKE_TARGET_SHA=cccccccccccccccccccccccccccccccccccccccc
+export FAKE_ANCESTOR_FROM_SHA=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+export FAKE_ANCESTOR_FROM_RC=1
+run_cycle "$tmp"
+unset FAKE_TARGET_SHA FAKE_ANCESTOR_FROM_SHA FAKE_ANCESTOR_FROM_RC
+[[ "$(cat "$tmp/rc")" != "0" ]] && pass "unreachable stored target exits nonzero" || fail "unreachable stored target exits nonzero"
+grep -Fq "stored pending target is no longer reachable from origin/main" "$tmp/ledger/"*/build-release-artifacts.log \
+  && grep -Fq "FAILURE step=build-release-artifacts rc=70" "$tmp/ledger/"*/t3-nightly-cycle.alert \
+  && pass "unreachable stored target fails closed with rc 70" \
+  || fail "unreachable stored target fails closed with rc 70"
+[[ -e "$tmp/ledger/t3-nightly-cycle.pending-live-deploy" ]] \
+  && pass "unreachable stored target retains its pending marker" \
+  || fail "unreachable stored target retains its pending marker"
+if grep -Fq "merge --ff-only" "$tmp/calls.log" || grep -Fq "restart prebuilt=" "$tmp/calls.log"; then
+  fail "unreachable stored target mutated or restarted"
+else
+  pass "unreachable stored target aborts before mutation"
 fi
 
 tmp="$(mktemp -d)"

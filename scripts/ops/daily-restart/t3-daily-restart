@@ -144,6 +144,7 @@ resume_token_session_id=""
 resume_token_dir=""
 resume_token_file=""
 resume_token_validation_deferred=0
+result_recorded=0
 
 exec 9>"$lock_file"
 if ! flock -n 9; then
@@ -171,6 +172,7 @@ record_result() {
   printf '%s RESULT %s pre_sha=%s target_sha=%s snapshot=%s manifest=%s\n' \
     "$(date -u +%FT%TZ)" "$1" "${pre_sha:-unknown}" "${target_sha:-unknown}" \
     "${snapshot_path:-unknown}" "$manifest" | tee -a "$result_file" >&2
+  result_recorded=1
 }
 
 resolve_tool() {
@@ -523,7 +525,21 @@ on_exit() {
   cleanup_resume_token || true
   exit "$rc"
 }
+
+on_signal() {
+  local signal="$1" rc="$2"
+  trap - TERM INT HUP
+  log "received $signal; aborting with rc=$rc"
+  if [[ "$result_recorded" -eq 0 ]]; then
+    record_result "FAILED"
+  fi
+  exit "$rc"
+}
+
 trap on_exit EXIT
+trap 'on_signal TERM 143' TERM
+trap 'on_signal INT 130' INT
+trap 'on_signal HUP 129' HUP
 
 sanitize_manifest_for_post_stop_capture_failure() {
   local output
@@ -851,23 +867,23 @@ rollback() {
     record_result "ROLLBACK-FAILED"
     return 1
   fi
-  run_capture 60 git -C "$checkout" checkout "$pre_sha" || {
-    log "ROLLBACK git checkout failed"
-    record_result "ROLLBACK-FAILED"
-    return 1
-  }
-  run_capture 900 pnpm -C "$checkout" install --frozen-lockfile --prefer-offline || {
-    log "ROLLBACK dependency restore failed"
-    record_result "ROLLBACK-FAILED"
-    return 1
-  }
   restore="$(resolve_tool t3-db-restore)" || {
-    log "ROLLBACK missing t3-db-restore"
+    log "ROLLBACK missing t3-db-restore after stopping failed target"
     record_result "ROLLBACK-FAILED"
     return 1
   }
   run_capture 300 "$restore" --db "$db" --snapshot "$snapshot_path" || {
     log "ROLLBACK db restore failed"
+    record_result "ROLLBACK-FAILED"
+    return 1
+  }
+  run_capture 60 git -C "$checkout" checkout "$pre_sha" || {
+    log "ROLLBACK git checkout failed after db restore"
+    record_result "ROLLBACK-FAILED"
+    return 1
+  }
+  run_capture 900 pnpm -C "$checkout" install --frozen-lockfile --prefer-offline || {
+    log "ROLLBACK dependency restore failed after db restore"
     record_result "ROLLBACK-FAILED"
     return 1
   }

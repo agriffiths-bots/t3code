@@ -254,6 +254,9 @@ if [[ "${FAKE_PNPM_FAIL_ONCE:-0}" == "1" && ! -f "$T_TMP/pnpm-failed" ]]; then
   : >"$T_TMP/pnpm-failed"
   exit 8
 fi
+if [[ "$*" == *" install "* && -n "${FAKE_PNPM_INSTALL_RC:-}" ]]; then
+  exit "$FAKE_PNPM_INSTALL_RC"
+fi
 exit "${FAKE_PNPM_RC:-0}"
 SH
   cat >"$dir/claude" <<'SH'
@@ -335,8 +338,20 @@ export FAKE_VERIFY_RESTART_RC=9
 run_manager "$tmp"
 unset FAKE_VERIFY_RESTART_RC
 [[ "$(cat "$tmp/rc")" != "0" ]] && pass "verify-restart failure exits nonzero" || fail "verify-restart failure exits nonzero"
-assert_order "$tmp/calls.log" "systemctl --user start fake.service" "verify-restart" "systemctl --user stop fake.service" "git -C $tmp/checkout checkout aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" "pnpm -C $tmp/checkout install --frozen-lockfile --prefer-offline" "restore" "pnpm -C $tmp/checkout/apps/web run build" "pnpm -C $tmp/checkout run build:desktop" "systemctl --user start fake.service" "health"
+assert_order "$tmp/calls.log" "systemctl --user start fake.service" "verify-restart" "systemctl --user stop fake.service" "restore" "git -C $tmp/checkout checkout aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" "pnpm -C $tmp/checkout install --frozen-lockfile --prefer-offline" "pnpm -C $tmp/checkout/apps/web run build" "pnpm -C $tmp/checkout run build:desktop" "systemctl --user start fake.service" "health"
 grep -Fq "RESULT ROLLBACK-OK" "$tmp/ledger/"*/t3-daily-restart.result && pass "verify-restart failure rolls back loudly" || fail "verify-restart failure rolls back loudly"
+
+tmp="$(mktemp -d)"
+export FAKE_VERIFY_RESTART_RC=9
+export FAKE_PNPM_INSTALL_RC=8
+run_manager "$tmp"
+unset FAKE_VERIFY_RESTART_RC FAKE_PNPM_INSTALL_RC
+[[ "$(cat "$tmp/rc")" != "0" ]] && pass "rollback dependency install failure exits nonzero" || fail "rollback dependency install failure exits nonzero"
+assert_order "$tmp/calls.log" "verify-restart" "systemctl --user stop fake.service" "restore" "git -C $tmp/checkout checkout aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" "pnpm -C $tmp/checkout install --frozen-lockfile --prefer-offline"
+grep -Fq "ROLLBACK dependency restore failed after db restore" "$tmp/ledger/"*/t3-daily-restart.log \
+  && grep -Fq "RESULT ROLLBACK-FAILED" "$tmp/ledger/"*/t3-daily-restart.result \
+  && pass "rollback install failure restores quiesced database first" \
+  || fail "rollback install failure restores quiesced database first"
 
 tmp="$(mktemp -d)"
 caller_path="$tmp/nonstandard-node"
@@ -498,7 +513,7 @@ export FAKE_HEALTH_FAIL_ONCE=1
 run_manager "$tmp"
 unset FAKE_HEALTH_FAIL_ONCE
 [[ "$(cat "$tmp/rc")" != "0" ]] && pass "health rollback exits nonzero" || fail "health rollback exits nonzero"
-assert_order "$tmp/calls.log" "health" "systemctl --user stop" "git -C" "pnpm -C $tmp/checkout install --frozen-lockfile --prefer-offline" "restore" "pnpm -C $tmp/checkout/apps/web run build" "pnpm -C $tmp/checkout run build:desktop" "systemctl --user start" "health"
+assert_order "$tmp/calls.log" "health" "systemctl --user stop" "restore" "git -C" "pnpm -C $tmp/checkout install --frozen-lockfile --prefer-offline" "pnpm -C $tmp/checkout/apps/web run build" "pnpm -C $tmp/checkout run build:desktop" "systemctl --user start" "health"
 grep -Fq "RESULT ROLLBACK-OK" "$tmp/ledger/"*/t3-daily-restart.result && pass "health rollback result recorded" || fail "health rollback result recorded"
 if grep -Fq "diff --quiet" "$tmp/calls.log"; then
   fail "health rollback consulted migration diff"
