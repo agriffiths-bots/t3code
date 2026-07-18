@@ -3,18 +3,27 @@ import * as NodeHttp from "node:http";
 import * as NodeFS from "node:fs";
 import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
+import * as NodeURL from "node:url";
 
 import * as NodeHttpServer from "@effect/platform-node/NodeHttpServer";
 import * as NodeServices from "@effect/platform-node/NodeServices";
-import { EnvironmentOrchestrationHttpApi } from "@t3tools/contracts";
+import {
+  AuthProjectAudienceAdminScope,
+  AuthStandardClientScopes,
+  EnvironmentOrchestrationHttpApi,
+  ProjectId,
+} from "@t3tools/contracts";
 import * as NetService from "@t3tools/shared/Net";
 import { assert, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import * as Stream from "effect/Stream";
+import { FetchHttpClient } from "effect/unstable/http";
 import * as HttpRouter from "effect/unstable/http/HttpRouter";
 import * as HttpServer from "effect/unstable/http/HttpServer";
 import * as HttpApi from "effect/unstable/httpapi/HttpApi";
 import * as HttpApiBuilder from "effect/unstable/httpapi/HttpApiBuilder";
+import * as HttpApiClient from "effect/unstable/httpapi/HttpApiClient";
 import * as CliError from "effect/unstable/cli/CliError";
 import * as TestConsole from "effect/testing/TestConsole";
 import { Command } from "effect/unstable/cli";
@@ -25,6 +34,11 @@ import * as ProjectionSnapshotQuery from "./orchestration/Services/ProjectionSna
 import { OrchestrationLayerLive } from "./orchestration/runtimeLayer.ts";
 import { orchestrationHttpApiLayer } from "./orchestration/http.ts";
 import { layerConfig as SqlitePersistenceLayerLive } from "./persistence/Layers/Sqlite.ts";
+import { OrchestrationEventStore } from "./persistence/Services/OrchestrationEventStore.ts";
+import {
+  localProjectAudienceAdminSubject,
+  ProjectAudienceAdministrationError,
+} from "./project/ProjectAudienceAdministration.ts";
 import * as RepositoryIdentityResolver from "./project/RepositoryIdentityResolver.ts";
 import {
   makePersistedServerRuntimeState,
@@ -37,6 +51,10 @@ import { environmentAuthenticatedAuthLayer } from "./auth/http.ts";
 
 const CliRuntimeLayer = Layer.mergeAll(NodeServices.layer, NetService.layer);
 class ProjectCliHttpApi extends HttpApi.make("environment").add(EnvironmentOrchestrationHttpApi) {}
+const repositoryRoot = NodePath.resolve(
+  NodePath.dirname(NodeURL.fileURLToPath(import.meta.url)),
+  "../../..",
+);
 
 const connectCli = makeCli({ cloudEnabled: true });
 const noConnectCli = makeCli({ cloudEnabled: false });
@@ -106,7 +124,20 @@ const readPersistedSnapshot = (baseDir: string) =>
     }).pipe(Effect.provide(makeProjectPersistenceLayer(config)));
   });
 
-const withLiveProjectCliServer = <A, E, R>(baseDir: string, run: () => Effect.Effect<A, E, R>) =>
+const readPersistedAudienceEvents = (baseDir: string) =>
+  Effect.gen(function* () {
+    const config = yield* makeCliTestServerConfig(baseDir);
+    return yield* Effect.gen(function* () {
+      const eventStore = yield* OrchestrationEventStore;
+      const events = yield* Stream.runCollect(eventStore.readAll());
+      return Array.from(events).filter((event) => event.type === "project.data-audience-set");
+    }).pipe(Effect.provide(makeProjectPersistenceLayer(config)));
+  });
+
+const withLiveProjectCliServer = <A, E, R>(
+  baseDir: string,
+  run: (origin: string) => Effect.Effect<A, E, R>,
+) =>
   Effect.gen(function* () {
     const config = yield* makeCliTestServerConfig(baseDir);
     const routesLayer = HttpApiBuilder.layer(ProjectCliHttpApi).pipe(
@@ -141,14 +172,15 @@ const withLiveProjectCliServer = <A, E, R>(baseDir: string, run: () => Effect.Ef
         if (typeof address === "string" || !("port" in address)) {
           assert.fail(`Expected TCP address, got ${address}`);
         }
+        const runtimeState = yield* makePersistedServerRuntimeState({
+          config,
+          port: address.port,
+        });
         yield* persistServerRuntimeState({
           path: config.serverRuntimeStatePath,
-          state: yield* makePersistedServerRuntimeState({
-            config,
-            port: address.port,
-          }),
+          state: runtimeState,
         });
-        return yield* run();
+        return yield* run(runtimeState.origin);
       }).pipe(Effect.provide(Layer.mergeAll(appLayer, NodeServices.layer))),
     );
   });
@@ -491,6 +523,216 @@ it.layer(NodeServices.layer)("bin cli parsing", (it) => {
         }),
       );
     }),
+  );
+
+  it.effect(
+    "sets a dedicated repository audience offline and durably audits every invocation",
+    () =>
+      Effect.gen(function* () {
+        const baseDir = NodeFS.mkdtempSync(
+          NodePath.join(NodeOS.tmpdir(), "t3-cli-project-audience-audit-test-"),
+        );
+        const workspaceRoot = repositoryRoot;
+
+        yield* runCliWithRuntime([
+          "project",
+          "add",
+          workspaceRoot,
+          "--title",
+          "Factory Repository",
+          "--base-dir",
+          baseDir,
+        ]);
+        yield* runCliWithRuntime([
+          "project",
+          "set-audience-to-factory",
+          workspaceRoot,
+          "--base-dir",
+          baseDir,
+        ]);
+        yield* runCliWithRuntime([
+          "project",
+          "set-audience-to-factory",
+          workspaceRoot,
+          "--base-dir",
+          baseDir,
+        ]);
+
+        const snapshot = yield* readPersistedSnapshot(baseDir);
+        const project = snapshot.projects.find(
+          (candidate) => candidate.workspaceRoot === workspaceRoot,
+        );
+        assert.equal(project?.dataAudience, "factory");
+
+        const auditEvents = yield* readPersistedAudienceEvents(baseDir);
+        assert.equal(auditEvents.length, 2);
+        const [first, second] = auditEvents;
+        assert.equal(first?.payload.projectId, project?.id);
+        assert.equal(first?.payload.workspaceRoot, workspaceRoot);
+        assert.equal(first?.payload.oldDataAudience, "private");
+        assert.equal(first?.payload.newDataAudience, "factory");
+        assert.equal(first?.payload.actor, localProjectAudienceAdminSubject());
+        assert.equal(first?.occurredAt, first?.payload.updatedAt);
+        assert.equal(second?.payload.oldDataAudience, "factory");
+        assert.equal(second?.payload.newDataAudience, "factory");
+      }),
+  );
+
+  it.effect("rejects the broad local home root from factory classification", () =>
+    Effect.gen(function* () {
+      const baseDir = NodeFS.mkdtempSync(
+        NodePath.join(NodeOS.tmpdir(), "t3-cli-project-audience-broad-root-test-"),
+      );
+      const workspaceRoot = NodeOS.userInfo().homedir;
+
+      yield* runCliWithRuntime([
+        "project",
+        "add",
+        workspaceRoot,
+        "--title",
+        "Broad Home",
+        "--base-dir",
+        baseDir,
+      ]);
+      const error = yield* runCliWithRuntime([
+        "project",
+        "set-audience-to-factory",
+        workspaceRoot,
+        "--base-dir",
+        baseDir,
+      ]).pipe(Effect.flip);
+
+      assert.instanceOf(error, ProjectAudienceAdministrationError);
+      assert.equal(error.reason, "broad-root");
+      const snapshot = yield* readPersistedSnapshot(baseDir);
+      assert.equal(snapshot.projects[0]?.dataAudience, "private");
+    }),
+  );
+
+  it.effect("rejects a project rooted inside rather than at its dedicated repository", () =>
+    Effect.gen(function* () {
+      const baseDir = NodeFS.mkdtempSync(
+        NodePath.join(NodeOS.tmpdir(), "t3-cli-project-audience-subdir-test-"),
+      );
+      const workspaceRoot = NodePath.join(repositoryRoot, "apps", "server");
+
+      yield* runCliWithRuntime([
+        "project",
+        "add",
+        workspaceRoot,
+        "--title",
+        "Repository Subdirectory",
+        "--base-dir",
+        baseDir,
+      ]);
+      const error = yield* runCliWithRuntime([
+        "project",
+        "set-audience-to-factory",
+        workspaceRoot,
+        "--base-dir",
+        baseDir,
+      ]).pipe(Effect.flip);
+
+      assert.instanceOf(error, ProjectAudienceAdministrationError);
+      assert.equal(error.reason, "not-repository-root");
+    }),
+  );
+
+  it.effect(
+    "uses the live local-admin endpoint without exposing it to standard HTTP sessions",
+    () =>
+      Effect.gen(function* () {
+        const baseDir = NodeFS.mkdtempSync(
+          NodePath.join(NodeOS.tmpdir(), "t3-cli-project-audience-live-test-"),
+        );
+        const workspaceRoot = repositoryRoot;
+
+        yield* withLiveProjectCliServer(baseDir, (origin) =>
+          Effect.gen(function* () {
+            yield* runCliWithRuntime([
+              "project",
+              "add",
+              workspaceRoot,
+              "--title",
+              "Live Factory Repository",
+              "--base-dir",
+              baseDir,
+            ]);
+            const snapshotQuery = yield* ProjectionSnapshotQuery.ProjectionSnapshotQuery;
+            const before = yield* snapshotQuery.getSnapshot();
+            const project = before.projects.find(
+              (candidate) => candidate.workspaceRoot === workspaceRoot,
+            );
+            assert.isDefined(project);
+
+            const environmentAuth = yield* EnvironmentAuth.EnvironmentAuth;
+            const standardSession = yield* environmentAuth.issueSession({
+              audienceCeiling: "private",
+              scopes: AuthStandardClientScopes,
+              subject: "standard-http-test",
+            });
+            const standardError = yield* Effect.gen(function* () {
+              const client = yield* HttpApiClient.make(ProjectCliHttpApi, { baseUrl: origin });
+              return yield* client.orchestration.setProjectAudienceToFactory({
+                headers: { authorization: `Bearer ${standardSession.token}` },
+                payload: { projectId: project?.id ?? ProjectId.make("missing") },
+              });
+            }).pipe(Effect.provide(FetchHttpClient.layer), Effect.flip);
+            assert.equal(standardError._tag, "EnvironmentScopeRequiredError");
+            if (standardError._tag !== "EnvironmentScopeRequiredError") {
+              assert.fail(`Expected EnvironmentScopeRequiredError, got ${standardError._tag}`);
+            }
+            assert.equal(standardError.requiredScope, "admin:project-audience");
+
+            const broadRoot = NodeOS.userInfo().homedir;
+            yield* runCliWithRuntime([
+              "project",
+              "add",
+              broadRoot,
+              "--title",
+              "Live Broad Home",
+              "--base-dir",
+              baseDir,
+            ]);
+            const withBroadRoot = yield* snapshotQuery.getSnapshot();
+            const broadProject = withBroadRoot.projects.find(
+              (candidate) => candidate.workspaceRoot === broadRoot,
+            );
+            assert.isDefined(broadProject);
+            const adminSession = yield* environmentAuth.issueSession({
+              audienceCeiling: "private",
+              scopes: [AuthProjectAudienceAdminScope],
+              subject: "local-admin:http-error-test",
+            });
+            const broadRootError = yield* Effect.gen(function* () {
+              const client = yield* HttpApiClient.make(ProjectCliHttpApi, { baseUrl: origin });
+              return yield* client.orchestration.setProjectAudienceToFactory({
+                headers: { authorization: `Bearer ${adminSession.token}` },
+                payload: { projectId: broadProject?.id ?? ProjectId.make("missing") },
+              });
+            }).pipe(Effect.provide(FetchHttpClient.layer), Effect.flip);
+            assert.equal(broadRootError._tag, "EnvironmentRequestInvalidError");
+            if (broadRootError._tag !== "EnvironmentRequestInvalidError") {
+              assert.fail(`Expected EnvironmentRequestInvalidError, got ${broadRootError._tag}`);
+            }
+            assert.equal(broadRootError.code, "invalid_request");
+            assert.equal(broadRootError.reason, "invalid_command");
+
+            yield* runCliWithRuntime([
+              "project",
+              "set-audience-to-factory",
+              workspaceRoot,
+              "--base-dir",
+              baseDir,
+            ]);
+            const after = yield* snapshotQuery.getSnapshot();
+            assert.equal(
+              after.projects.find((candidate) => candidate.id === project?.id)?.dataAudience,
+              "factory",
+            );
+          }),
+        );
+      }),
   );
 
   it.effect("rejects dev-url on project commands", () =>

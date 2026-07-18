@@ -1,5 +1,6 @@
 import {
   ProjectCreatedPayload as ContractsProjectCreatedPayloadSchema,
+  ProjectDataAudienceSetPayload as ContractsProjectDataAudienceSetPayloadSchema,
   ProjectMetaUpdatedPayload as ContractsProjectMetaUpdatedPayloadSchema,
   ProjectDeletedPayload as ContractsProjectDeletedPayloadSchema,
   ThreadCreatedPayload as ContractsThreadCreatedPayloadSchema,
@@ -25,6 +26,7 @@ import {
 
 // Server-internal alias surface, backed by contract schemas as the source of truth.
 export const ProjectCreatedPayload = ContractsProjectCreatedPayloadSchema;
+export const ProjectDataAudienceSetPayload = ContractsProjectDataAudienceSetPayloadSchema;
 export const ProjectMetaUpdatedPayload = ContractsProjectMetaUpdatedPayloadSchema;
 export const ProjectDeletedPayload = ContractsProjectDeletedPayloadSchema;
 

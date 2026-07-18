@@ -605,6 +605,8 @@ export const OrchestrationSubscribeThreadInput = Schema.Struct({
   observedRevision: Schema.optionalKey(NonNegativeInt),
   /** Identity of the event at `observedRevision`; distinguishes restored replacement history. */
   observedEventId: Schema.optionalKey(Schema.NullOr(EventId)),
+  /** Audience reflected by the client's cached detail. */
+  observedDataAudience: Schema.optionalKey(DataAudience),
   /**
    * When provided, the server skips the initial snapshot frame and instead
    * replays events after this sequence before streaming live events. Clients
@@ -666,6 +668,18 @@ const ProjectMetaUpdateCommand = Schema.Struct({
   defaultModelSelection: Schema.optional(Schema.NullOr(ModelSelection)),
   scripts: Schema.optional(Schema.Array(ProjectScript)),
 });
+
+/** Trusted local-administration command; intentionally excluded from every client schema. */
+export const LocalAdminProjectDataAudienceSetCommand = Schema.Struct({
+  type: Schema.Literal("project.data-audience.set"),
+  commandId: CommandId,
+  projectId: ProjectId,
+  expectedWorkspaceRoot: TrimmedNonEmptyString,
+  actor: TrimmedNonEmptyString,
+  occurredAt: IsoDateTime,
+});
+export type LocalAdminProjectDataAudienceSetCommand =
+  typeof LocalAdminProjectDataAudienceSetCommand.Type;
 
 const ProjectDeleteCommand = Schema.Struct({
   type: Schema.Literal("project.delete"),
@@ -982,12 +996,14 @@ export type InternalOrchestrationCommand = typeof InternalOrchestrationCommand.T
 export const OrchestrationCommand = Schema.Union([
   DispatchableClientOrchestrationCommand,
   InternalOrchestrationCommand,
+  LocalAdminProjectDataAudienceSetCommand,
 ]);
 export type OrchestrationCommand = typeof OrchestrationCommand.Type;
 
 export const OrchestrationEventType = Schema.Literals([
   "project.created",
   "project.meta-updated",
+  "project.data-audience-set",
   "project.deleted",
   "thread.created",
   "thread.deleted",
@@ -1014,7 +1030,12 @@ export type OrchestrationEventType = typeof OrchestrationEventType.Type;
 
 export const OrchestrationAggregateKind = Schema.Literals(["project", "thread"]);
 export type OrchestrationAggregateKind = typeof OrchestrationAggregateKind.Type;
-export const OrchestrationActorKind = Schema.Literals(["client", "server", "provider"]);
+export const OrchestrationActorKind = Schema.Literals([
+  "client",
+  "server",
+  "provider",
+  "local-admin",
+]);
 
 export const ProjectCreatedPayload = Schema.Struct({
   projectId: ProjectId,
@@ -1035,6 +1056,15 @@ export const ProjectMetaUpdatedPayload = Schema.Struct({
   repositoryIdentity: Schema.optional(Schema.NullOr(RepositoryIdentity)),
   defaultModelSelection: Schema.optional(Schema.NullOr(ModelSelection)),
   scripts: Schema.optional(Schema.Array(ProjectScript)),
+  updatedAt: IsoDateTime,
+});
+
+export const ProjectDataAudienceSetPayload = Schema.Struct({
+  projectId: ProjectId,
+  workspaceRoot: TrimmedNonEmptyString,
+  oldDataAudience: DataAudience,
+  newDataAudience: Schema.Literal("factory"),
+  actor: TrimmedNonEmptyString,
   updatedAt: IsoDateTime,
 });
 
@@ -1227,6 +1257,11 @@ export const OrchestrationEvent = Schema.Union([
     ...EventBaseFields,
     type: Schema.Literal("project.meta-updated"),
     payload: ProjectMetaUpdatedPayload,
+  }),
+  Schema.Struct({
+    ...EventBaseFields,
+    type: Schema.Literal("project.data-audience-set"),
+    payload: ProjectDataAudienceSetPayload,
   }),
   Schema.Struct({
     ...EventBaseFields,
@@ -1450,6 +1485,11 @@ export type OrchestrationReplayEventsInput = typeof OrchestrationReplayEventsInp
 
 const OrchestrationReplayEventsResult = Schema.Array(OrchestrationEvent);
 export type OrchestrationReplayEventsResult = typeof OrchestrationReplayEventsResult.Type;
+
+export const ProjectSetAudienceToFactoryInput = Schema.Struct({
+  projectId: ProjectId,
+});
+export type ProjectSetAudienceToFactoryInput = typeof ProjectSetAudienceToFactoryInput.Type;
 
 export const OrchestrationRpcSchemas = {
   dispatchCommand: {

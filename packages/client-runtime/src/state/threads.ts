@@ -1,5 +1,6 @@
 import {
   ORCHESTRATION_WS_METHODS,
+  type DataAudience,
   type EnvironmentId as EnvironmentIdType,
   type EventId as EventIdType,
   type OrchestrationThread,
@@ -313,6 +314,7 @@ export const makeEnvironmentThreadState = Effect.fn("EnvironmentThreadState.make
     verifiedRevision?: number;
     observedRevision?: number;
     observedEventId?: EventIdType | null;
+    observedDataAudience?: DataAudience;
   } = {
     threadId,
     ...(Option.isSome(initialStorageEpoch) ? { storageEpoch: initialStorageEpoch.value } : {}),
@@ -323,6 +325,7 @@ export const makeEnvironmentThreadState = Effect.fn("EnvironmentThreadState.make
       ? { observedRevision: cached.value.observedRevision }
       : {}),
     ...(initialObservedEventId !== undefined ? { observedEventId: initialObservedEventId } : {}),
+    ...(Option.isSome(cached) ? { observedDataAudience: cached.value.thread.dataAudience } : {}),
   };
   // Sequence of the last applied destructive collection change (revert). A
   // non-advancing snapshot taken before this point may still contain pruned
@@ -424,6 +427,7 @@ export const makeEnvironmentThreadState = Effect.fn("EnvironmentThreadState.make
       yield* setDeleted();
       return;
     }
+    subscribeInput.observedDataAudience = thread.dataAudience;
     yield* SubscriptionRef.set(state, {
       data: Option.some(thread),
       status: "live",

@@ -101,6 +101,23 @@ describe("applyShellStreamEvent", () => {
       expect(next.projects[0]?.title).toBe("Updated Title");
       expect(next.snapshotSequence).toBe(2);
     });
+
+    it("propagates a project audience change to inherited thread audiences", () => {
+      const snapshot: OrchestrationShellSnapshot = {
+        ...baseSnapshot,
+        projects: [stubProject],
+        threads: [stubThread],
+      };
+
+      const next = applyShellStreamEvent(snapshot, {
+        kind: "project-upserted",
+        sequence: 2,
+        project: { ...stubProject, dataAudience: "factory" },
+      });
+
+      expect(next.projects[0]?.dataAudience).toBe("factory");
+      expect(next.threads[0]?.dataAudience).toBe("factory");
+    });
   });
 
   describe("project-removed", () => {

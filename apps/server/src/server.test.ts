@@ -2,6 +2,8 @@ import * as NodeHttpServer from "@effect/platform-node/NodeHttpServer";
 import * as NodeSocket from "@effect/platform-node/NodeSocket";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import * as NodeCrypto from "node:crypto";
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { HostProcessPlatform } from "@t3tools/shared/hostProcess";
 
 import {
@@ -13,6 +15,7 @@ import {
   EnvironmentId,
   EventId,
   GitCommandError,
+  IsoDateTime,
   KeybindingRule,
   MessageId,
   NonNegativeInt,
@@ -27,6 +30,7 @@ import {
   ProviderDriverKind,
   ProviderInstanceId,
   ResolvedKeybindingRule,
+  ScheduledTaskId,
   ThreadId,
   WS_METHODS,
   WsRpcGroup,
@@ -54,9 +58,12 @@ import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 import * as PubSub from "effect/PubSub";
 import * as Queue from "effect/Queue";
+import * as Schema from "effect/Schema";
+import * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
 import * as TestClock from "effect/testing/TestClock";
 import { ChildProcessSpawner } from "effect/unstable/process";
+import * as ChildProcess from "effect/unstable/process/ChildProcess";
 import {
   FetchHttpClient,
   HttpBody,
@@ -72,6 +79,7 @@ import * as Socket from "effect/unstable/socket/Socket";
 import { vi } from "vite-plus/test";
 
 const TEST_EPOCH = DateTime.makeUnsafe("1970-01-01T00:00:00.000Z");
+const encodeSecurityObservation = Schema.encodeSync(Schema.UnknownFromJsonString);
 
 import * as ServerConfig from "./config.ts";
 import { makeRoutesLayer } from "./server.ts";
@@ -118,6 +126,7 @@ import * as GitWorkflowService from "./git/GitWorkflowService.ts";
 import * as ReviewService from "./review/ReviewService.ts";
 import * as SourceControlRepositoryService from "./sourceControl/SourceControlRepositoryService.ts";
 import * as ServerSecretStore from "./auth/ServerSecretStore.ts";
+import * as AssetAccess from "./assets/AssetAccess.ts";
 import * as EnvironmentAuth from "./auth/EnvironmentAuth.ts";
 import * as CloudManagedEndpointRuntime from "./cloud/ManagedEndpointRuntime.ts";
 import * as CloudCliTokenManager from "./cloud/CliTokenManager.ts";
@@ -125,6 +134,9 @@ import * as ProcessDiagnostics from "./diagnostics/ProcessDiagnostics.ts";
 import * as ProcessResourceMonitor from "./diagnostics/ProcessResourceMonitor.ts";
 import * as TraceDiagnostics from "./diagnostics/TraceDiagnostics.ts";
 import * as DeviceNotifications from "./notifications/DeviceNotifications.ts";
+import * as WorkerProcessIsolation from "./process/WorkerProcessIsolation.ts";
+import * as McpSessionRegistry from "./mcp/McpSessionRegistry.ts";
+import { collectUint8StreamText } from "./stream/collectUint8StreamText.ts";
 import * as Data from "effect/Data";
 
 const defaultProjectId = ProjectId.make("project-default");
@@ -218,6 +230,250 @@ const makeDefaultOrchestrationThreadShell = (
     ...overrides,
   };
 };
+
+type SecurityAccessSurfaceId =
+  | "project-thread-snapshots"
+  | "id-lookups"
+  | "event-replay-subscriptions"
+  | "commands"
+  | "parent-child-threads"
+  | "schedules"
+  | "notifications"
+  | "assets"
+  | "project-filesystem-vcs-worktrees"
+  | "terminal"
+  | "provider-tool-subprocess"
+  | "preview"
+  | "reviews"
+  | "mcp-subagents"
+  | "diagnostics-settings"
+  | "auth-session-management";
+
+interface SecurityAccessSurfaceRow {
+  readonly id: SecurityAccessSurfaceId;
+  readonly currentAccess: "allowed" | "denied";
+  readonly sentinel: string;
+  readonly entryPoints: ReadonlyArray<string>;
+}
+
+class SecurityProbeDenied extends Data.TaggedError("SecurityProbeDenied")<{
+  readonly source: "http" | "rpc";
+}> {}
+
+class SecurityProbeTransportError extends Data.TaggedError("SecurityProbeTransportError")<{
+  readonly cause: unknown;
+}> {}
+
+interface SecurityProbeOutcome {
+  readonly access: "allowed" | "denied";
+  readonly observation: string;
+}
+
+// This is intentionally the pre-audience-guard matrix. Later data-segregation slices can
+// flip `currentAccess` row by row while retaining the same real transport probes below.
+const SECURITY_ACCESS_SURFACE_MATRIX = [
+  {
+    id: "project-thread-snapshots",
+    currentAccess: "allowed",
+    sentinel: "PRIVATE::project-thread-snapshots",
+    entryPoints: [
+      "GET /api/orchestration/snapshot",
+      "GET /api/orchestration/shell",
+      "GET /api/orchestration/threads/:threadId",
+      ORCHESTRATION_WS_METHODS.getArchivedShellSnapshot,
+    ],
+  },
+  {
+    id: "id-lookups",
+    currentAccess: "allowed",
+    sentinel: "PRIVATE::id-lookups",
+    entryPoints: [
+      "GET /api/orchestration/threads/:threadId/revision",
+      ORCHESTRATION_WS_METHODS.getTurnDiff,
+      ORCHESTRATION_WS_METHODS.getFullThreadDiff,
+    ],
+  },
+  {
+    id: "event-replay-subscriptions",
+    currentAccess: "allowed",
+    sentinel: "PRIVATE::event-replay-subscriptions",
+    entryPoints: [
+      ORCHESTRATION_WS_METHODS.replayEvents,
+      ORCHESTRATION_WS_METHODS.subscribeShell,
+      ORCHESTRATION_WS_METHODS.subscribeThread,
+    ],
+  },
+  {
+    id: "commands",
+    currentAccess: "allowed",
+    sentinel: "PRIVATE::commands",
+    entryPoints: ["POST /api/orchestration/dispatch", ORCHESTRATION_WS_METHODS.dispatchCommand],
+  },
+  {
+    id: "parent-child-threads",
+    currentAccess: "allowed",
+    sentinel: "PRIVATE::parent-child-threads",
+    entryPoints: [
+      "GET /api/orchestration/threads/:threadId",
+      ORCHESTRATION_WS_METHODS.replayEvents,
+      ORCHESTRATION_WS_METHODS.subscribeThread,
+      ORCHESTRATION_WS_METHODS.dispatchCommand,
+      "POST /mcp t3_spawn_subagent",
+    ],
+  },
+  {
+    id: "schedules",
+    currentAccess: "allowed",
+    sentinel: "PRIVATE::schedules",
+    entryPoints: [
+      ORCHESTRATION_WS_METHODS.subscribeScheduledTasks,
+      ORCHESTRATION_WS_METHODS.setScheduledTaskEnabled,
+      ORCHESTRATION_WS_METHODS.deleteScheduledTask,
+    ],
+  },
+  {
+    id: "notifications",
+    currentAccess: "allowed",
+    sentinel: "PRIVATE::notifications",
+    entryPoints: [
+      WS_METHODS.serverGetNotificationConfig,
+      WS_METHODS.serverRegisterNotificationDevice,
+      WS_METHODS.serverAckNotification,
+      WS_METHODS.subscribeNotificationEvents,
+      "POST /api/notifications/ack",
+    ],
+  },
+  {
+    id: "assets",
+    currentAccess: "allowed",
+    sentinel: "PRIVATE::assets",
+    entryPoints: [WS_METHODS.assetsCreateUrl, "GET /api/assets/:token/*"],
+  },
+  {
+    id: "project-filesystem-vcs-worktrees",
+    currentAccess: "allowed",
+    sentinel: "PRIVATE::project-filesystem-vcs-worktrees",
+    entryPoints: [
+      WS_METHODS.projectsSearchEntries,
+      WS_METHODS.projectsListEntries,
+      WS_METHODS.projectsReadFile,
+      WS_METHODS.projectsWriteFile,
+      WS_METHODS.shellOpenInEditor,
+      WS_METHODS.filesystemBrowse,
+      WS_METHODS.subscribeVcsStatus,
+      WS_METHODS.vcsRefreshStatus,
+      WS_METHODS.vcsPull,
+      WS_METHODS.vcsListRefs,
+      WS_METHODS.vcsCreateWorktree,
+      WS_METHODS.vcsRemoveWorktree,
+      WS_METHODS.vcsCreateRef,
+      WS_METHODS.vcsSwitchRef,
+      WS_METHODS.vcsInit,
+      WS_METHODS.gitRunStackedAction,
+      WS_METHODS.gitResolvePullRequest,
+      WS_METHODS.gitPreparePullRequestThread,
+      WS_METHODS.sourceControlLookupRepository,
+      WS_METHODS.sourceControlCloneRepository,
+      WS_METHODS.sourceControlPublishRepository,
+    ],
+  },
+  {
+    id: "terminal",
+    currentAccess: "allowed",
+    sentinel: "PRIVATE::terminal",
+    entryPoints: [
+      WS_METHODS.terminalOpen,
+      WS_METHODS.terminalAttach,
+      WS_METHODS.terminalWrite,
+      WS_METHODS.terminalResize,
+      WS_METHODS.terminalClear,
+      WS_METHODS.terminalRestart,
+      WS_METHODS.terminalClose,
+      WS_METHODS.subscribeTerminalEvents,
+      WS_METHODS.subscribeTerminalMetadata,
+    ],
+  },
+  {
+    id: "provider-tool-subprocess",
+    currentAccess: "allowed",
+    sentinel: "PRIVATE::provider-tool-subprocess",
+    entryPoints: ["provider/tool subprocess"],
+  },
+  {
+    id: "preview",
+    currentAccess: "allowed",
+    sentinel: "PRIVATE::preview",
+    entryPoints: [
+      WS_METHODS.previewOpen,
+      WS_METHODS.previewNavigate,
+      WS_METHODS.previewResize,
+      WS_METHODS.previewRefresh,
+      WS_METHODS.previewClose,
+      WS_METHODS.previewList,
+      WS_METHODS.previewReportStatus,
+      WS_METHODS.subscribePreviewEvents,
+      WS_METHODS.subscribeDiscoveredLocalServers,
+    ],
+  },
+  {
+    id: "reviews",
+    currentAccess: "allowed",
+    sentinel: "PRIVATE::reviews",
+    entryPoints: [WS_METHODS.reviewGetDiffPreview],
+  },
+  {
+    id: "mcp-subagents",
+    currentAccess: "allowed",
+    sentinel: "PRIVATE::mcp-subagents",
+    entryPoints: [
+      "POST /api/mcp/peer-token",
+      "POST /mcp thread tools",
+      "POST /mcp notification tools",
+      "POST /mcp t3_spawn_subagent",
+      "POST /mcp t3_check_subagent",
+      "POST /mcp t3_wait",
+      "POST /mcp t3_subagents",
+      "POST /mcp t3_list_backends",
+    ],
+  },
+  {
+    id: "diagnostics-settings",
+    currentAccess: "allowed",
+    sentinel: "PRIVATE::diagnostics-settings",
+    entryPoints: [
+      WS_METHODS.serverGetConfig,
+      WS_METHODS.serverRefreshProviders,
+      WS_METHODS.serverUpdateProvider,
+      WS_METHODS.serverUpsertKeybinding,
+      WS_METHODS.serverRemoveKeybinding,
+      WS_METHODS.serverGetSettings,
+      WS_METHODS.serverUpdateSettings,
+      WS_METHODS.serverDiscoverSourceControl,
+      WS_METHODS.serverGetTraceDiagnostics,
+      WS_METHODS.serverGetProcessDiagnostics,
+      WS_METHODS.serverGetProcessResourceHistory,
+      WS_METHODS.serverSignalProcess,
+      WS_METHODS.subscribeServerConfig,
+      WS_METHODS.subscribeServerLifecycle,
+      WS_METHODS.cloudGetRelayClientStatus,
+      WS_METHODS.cloudInstallRelayClient,
+    ],
+  },
+  {
+    id: "auth-session-management",
+    currentAccess: "allowed",
+    sentinel: "PRIVATE::auth-session-management",
+    entryPoints: [
+      "POST /api/auth/pairing-token",
+      "GET /api/auth/pairing-links",
+      "POST /api/auth/pairing-links/revoke",
+      "GET /api/auth/clients",
+      "POST /api/auth/clients/revoke",
+      "POST /api/auth/clients/revoke-others",
+      WS_METHODS.subscribeAuthAccess,
+    ],
+  },
+] as const satisfies ReadonlyArray<SecurityAccessSurfaceRow>;
 
 const browserOtlpTracingLayer = Layer.mergeAll(
   FetchHttpClient.layer,
@@ -350,6 +606,7 @@ const buildAppUnderTest = (options?: {
       ProjectSetupScriptRunner.ProjectSetupScriptRunner["Service"]
     >;
     terminalManager?: Partial<TerminalManager.TerminalManager["Service"]>;
+    previewManager?: Partial<PreviewManager.PreviewManager["Service"]>;
     orchestrationEngine?: Partial<OrchestrationEngine.OrchestrationEngineService["Service"]>;
     orchestrationEventStore?: Partial<OrchestrationEventStore.OrchestrationEventStore["Service"]>;
     worktreeLifecycleCoordinator?: WorktreeLifecycleCoordinator.WorktreeLifecycleCoordinator["Service"];
@@ -371,6 +628,8 @@ const buildAppUnderTest = (options?: {
     relayClient?: Partial<RelayClient.RelayClient["Service"]>;
     cloudCliTokenManager?: Partial<CloudCliTokenManager.CloudCliTokenManager["Service"]>;
     deviceNotifications?: Partial<DeviceNotifications.DeviceNotifications["Service"]>;
+    processDiagnostics?: Partial<ProcessDiagnostics.ProcessDiagnostics["Service"]>;
+    scheduledTaskRepository?: Partial<ScheduledTaskRepository["Service"]>;
   };
 }) =>
   Effect.gen(function* () {
@@ -650,6 +909,7 @@ const buildAppUnderTest = (options?: {
               signaled: true,
               message: Option.none(),
             }),
+          ...options?.layers?.processDiagnostics,
         }),
       ),
       Layer.provide(
@@ -757,6 +1017,7 @@ const buildAppUnderTest = (options?: {
             subscribeEvents: Effect.flatMap(PubSub.unbounded<PreviewEvent>(), (pubsub) =>
               PubSub.subscribe(pubsub),
             ),
+            ...options?.layers?.previewManager,
           }),
           Layer.mock(PortScanner.PortDiscovery)({
             scan: () => Effect.succeed([]),
@@ -821,6 +1082,7 @@ const buildAppUnderTest = (options?: {
           listAll: () => Effect.succeed([]),
           listByThread: () => Effect.succeed([]),
           revisionChanges: Stream.empty,
+          ...options?.layers?.scheduledTaskRepository,
         }),
       ),
       Layer.provide(
@@ -1365,6 +1627,737 @@ const getWsServerUrl = (
   });
 
 it.layer(NodeServices.layer)("server router seam", (it) => {
+  it.effect("characterizes current unguarded access across every data-segregation surface", () =>
+    Effect.gen(function* () {
+      const fileSystem = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const childProcessSpawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+      const workspaceDir = yield* fileSystem.makeTempDirectoryScoped({
+        prefix: "t3-security-access-matrix-",
+      });
+      const sentinel = (id: SecurityAccessSurfaceId) =>
+        SECURITY_ACCESS_SURFACE_MATRIX.find((row) => row.id === id)!.sentinel;
+      const workspaceSentinel = SECURITY_ACCESS_SURFACE_MATRIX.find(
+        (row) => row.id === "project-filesystem-vcs-worktrees",
+      )!.sentinel;
+      yield* fileSystem.writeFileString(path.join(workspaceDir, "private.txt"), workspaceSentinel);
+      yield* fileSystem.writeFileString(
+        path.join(workspaceDir, "provider-private.txt"),
+        sentinel("provider-tool-subprocess"),
+      );
+      const now = IsoDateTime.make("2026-07-17T10:00:00.000Z");
+      const dispatchedCommands: OrchestrationCommand[] = [];
+      const readModel = makeDefaultOrchestrationReadModel();
+      const snapshotReadModel = {
+        ...readModel,
+        projects: readModel.projects.map((project) => ({
+          ...project,
+          title: sentinel("project-thread-snapshots"),
+        })),
+      };
+      const threadDetailSnapshot = {
+        snapshotSequence: 11,
+        thread: {
+          ...readModel.threads[0]!,
+          title: `${sentinel("project-thread-snapshots")}::thread-detail`,
+        },
+      };
+      const replayedEvent = {
+        eventId: EventId.make("event-security-characterization"),
+        sequence: 12,
+        occurredAt: now,
+        commandId: null,
+        causationEventId: null,
+        correlationId: null,
+        metadata: {},
+        aggregateKind: "project",
+        aggregateId: defaultProjectId,
+        type: "project.created",
+        payload: {
+          projectId: defaultProjectId,
+          title: sentinel("event-replay-subscriptions"),
+          workspaceRoot: workspaceDir,
+          dataAudience: "private",
+          defaultModelSelection,
+          scripts: [],
+          createdAt: now,
+          updatedAt: now,
+        },
+      } satisfies Extract<OrchestrationEvent, { type: "project.created" }>;
+      const parentSetEvent = {
+        eventId: EventId.make("event-parent-security-characterization"),
+        sequence: 13,
+        occurredAt: now,
+        commandId: CommandId.make("command-parent-security-characterization"),
+        causationEventId: null,
+        correlationId: null,
+        metadata: {},
+        aggregateKind: "thread",
+        aggregateId: defaultThreadId,
+        type: "thread.parent-set",
+        payload: {
+          threadId: defaultThreadId,
+          parentThreadId: ThreadId.make(sentinel("parent-child-threads")),
+          updatedAt: now,
+        },
+      } satisfies Extract<OrchestrationEvent, { type: "thread.parent-set" }>;
+      const scheduledTask = {
+        taskId: ScheduledTaskId.make("schedule-security-characterization"),
+        threadId: defaultThreadId,
+        prompt: sentinel("schedules"),
+        scheduleKind: "interval" as const,
+        intervalSeconds: 3_600,
+        cronExpr: null,
+        timezoneName: "UTC",
+        enabled: NonNegativeInt.make(1),
+        busyPolicy: "skip" as const,
+        nextRunAt: now,
+        lastRunAt: null,
+        lastStatus: null,
+        lastError: null,
+        skippedCount: NonNegativeInt.make(0),
+        retryCount: NonNegativeInt.make(0),
+        queuedCount: NonNegativeInt.make(0),
+        modelSelection: null,
+        createdAt: now,
+      };
+      const terminalSnapshot = {
+        threadId: defaultThreadId,
+        terminalId: "security-characterization",
+        cwd: workspaceDir,
+        worktreePath: null,
+        status: "running" as const,
+        pid: 12_345,
+        history: "",
+        exitCode: null,
+        exitSignal: null,
+        label: `${sentinel("terminal")}::terminal-open`,
+        updatedAt: now,
+      };
+      const previewSnapshot = {
+        threadId: defaultThreadId,
+        tabId: "security-characterization",
+        navStatus: {
+          _tag: "Success" as const,
+          url: "http://127.0.0.1:4173/",
+          title: sentinel("preview"),
+        },
+        canGoBack: false,
+        canGoForward: false,
+        updatedAt: now,
+      };
+
+      const config = yield* buildAppUnderTest({
+        config: { cwd: workspaceDir },
+        layers: {
+          projectionSnapshotQuery: {
+            getSnapshot: () => Effect.succeed(snapshotReadModel),
+            getThreadDetailSnapshot: () => Effect.succeed(Option.some(threadDetailSnapshot)),
+          },
+          orchestrationEventStore: {
+            getLatestThreadRevision: () =>
+              Effect.succeed({
+                latestSequence: 11,
+                latestEventId: EventId.make(`${sentinel("id-lookups")}::revision`),
+              }),
+          },
+          checkpointDiffQuery: {
+            getTurnDiff: () =>
+              Effect.succeed({
+                threadId: defaultThreadId,
+                fromTurnCount: 0,
+                toTurnCount: 1,
+                diff: `${sentinel("id-lookups")}::turn-diff`,
+              }),
+            getFullThreadDiff: () =>
+              Effect.succeed({
+                threadId: defaultThreadId,
+                fromTurnCount: 0,
+                toTurnCount: 1,
+                diff: `${sentinel("id-lookups")}::full-thread-diff`,
+              }),
+          },
+          orchestrationEngine: {
+            dispatch: (command) =>
+              Effect.sync(() => {
+                dispatchedCommands.push(command);
+                return { sequence: dispatchedCommands.length };
+              }),
+            readEvents: () => Stream.make(replayedEvent, parentSetEvent),
+          },
+          scheduledTaskRepository: {
+            listAll: () => Effect.succeed([scheduledTask]),
+            listByThread: () => Effect.succeed([scheduledTask]),
+            revisionChanges: Stream.make(0),
+          },
+          deviceNotifications: {
+            getConfig: Effect.succeed({ vapidPublicKey: sentinel("notifications") }),
+          },
+          serverSettings: {
+            getSettings: Effect.succeed({
+              ...DEFAULT_SERVER_SETTINGS,
+              addProjectBaseDirectory: sentinel("diagnostics-settings"),
+            }),
+          },
+          vcsDriver: {
+            isInsideWorkTree: () => Effect.succeed(true),
+          },
+          gitVcsDriver: {
+            listRefs: () =>
+              Effect.succeed({
+                refs: [
+                  {
+                    name: sentinel("project-filesystem-vcs-worktrees"),
+                    current: true,
+                    isDefault: true,
+                    worktreePath: null,
+                  },
+                ],
+                isRepo: true,
+                hasPrimaryRemote: true,
+                nextCursor: null,
+                totalCount: 1,
+              }),
+            createWorktree: () =>
+              Effect.succeed({
+                worktree: {
+                  path: path.join(workspaceDir, sentinel("project-filesystem-vcs-worktrees")),
+                  refName: "main",
+                },
+              }),
+          },
+          terminalManager: {
+            open: () => Effect.succeed(terminalSnapshot),
+          },
+          previewManager: {
+            list: () => Effect.succeed({ sessions: [previewSnapshot] }),
+          },
+          reviewService: {
+            getDiffPreview: (input) =>
+              Effect.succeed({
+                cwd: input.cwd,
+                generatedAt: DateTime.nowUnsafe(),
+                sources: [
+                  {
+                    id: "working-tree",
+                    kind: "working-tree" as const,
+                    title: "Private diff",
+                    baseRef: "HEAD",
+                    headRef: null,
+                    diff: sentinel("reviews"),
+                    diffHash: "security-characterization-diff",
+                    truncated: false,
+                  },
+                ],
+              }),
+          },
+          processDiagnostics: {
+            read: Effect.succeed({
+              serverPid: process.pid,
+              readAt: TEST_EPOCH,
+              processCount: 1,
+              totalRssBytes: 1_024,
+              totalCpuPercent: 0.5,
+              processes: [
+                {
+                  pid: 12_345,
+                  ppid: process.pid,
+                  pgid: Option.some(12_345),
+                  status: "R",
+                  cpuPercent: 0.5,
+                  rssBytes: 1_024,
+                  elapsed: "00:01",
+                  command: sentinel("diagnostics-settings"),
+                  depth: 1,
+                  childPids: [],
+                },
+              ],
+              error: Option.none(),
+            }),
+          },
+          serverEnvironment: {
+            getDescriptor: Effect.succeed({
+              ...testEnvironmentDescriptor,
+              label: sentinel("mcp-subagents"),
+            }),
+          },
+        },
+      });
+
+      const attachmentId = "security-asset-characterization";
+      yield* fileSystem.makeDirectory(config.attachmentsDir, { recursive: true });
+      yield* fileSystem.writeFileString(
+        path.join(config.attachmentsDir, `${attachmentId}.bin`),
+        sentinel("assets"),
+      );
+      const configLayer = ServerConfig.layer(config);
+      const assetSetupLayer = Layer.mergeAll(
+        configLayer,
+        ServerSecretStore.layer.pipe(Layer.provide(configLayer)),
+        WorkspacePaths.layer,
+        ProjectFaviconResolver.layer.pipe(Layer.provide(WorkspacePaths.layer)),
+      ).pipe(Layer.provideMerge(NodeServices.layer));
+      const issuedAssetUrl = yield* AssetAccess.issueAssetUrl({
+        resource: { _tag: "attachment", attachmentId },
+      }).pipe(Effect.provide(assetSetupLayer));
+      const issuedMcpPeerToken = yield* McpSessionRegistry.issueActiveMcpPeerCredential({
+        sourceEnvironmentId: EnvironmentId.make("environment-security-source"),
+      });
+      assert.isDefined(issuedMcpPeerToken);
+      if (issuedMcpPeerToken === undefined) {
+        assert.fail("Expected the active MCP registry to issue a probe credential");
+      }
+
+      const ownerCookie = yield* getAuthenticatedSessionCookieHeader();
+      const wsUrl = yield* getWsServerUrl("/ws");
+      const authenticatedGet = (pathname: string) =>
+        Effect.gen(function* () {
+          const response = yield* fetchEffect(yield* getHttpServerUrl(pathname), {
+            headers: { cookie: ownerCookie },
+          });
+          if (response.status === 401 || response.status === 403) {
+            return yield* new SecurityProbeDenied({ source: "http" });
+          }
+          assert.equal(response.status, 200, `Expected ${pathname} to succeed`);
+          return yield* response.text;
+        });
+      const rpc = <A, E, R>(f: (client: WsRpcClient) => Effect.Effect<A, E, R>) =>
+        Effect.scoped(withWsRpcClient(wsUrl, f));
+
+      const processProbe = Effect.gen(function* () {
+        const isolation = yield* WorkerProcessIsolation.WorkerProcessIsolation;
+        const handle = yield* isolation
+          .wrapSpawner(childProcessSpawner)
+          .spawn(
+            ChildProcess.make(process.execPath, [
+              "-e",
+              'process.stdout.write(require("node:fs").readFileSync(process.argv[1], "utf8"))',
+              path.join(workspaceDir, "provider-private.txt"),
+            ]),
+          );
+        return (yield* collectUint8StreamText({ stream: handle.stdout })).text;
+      }).pipe(Effect.provide(WorkerProcessIsolation.layerTest()));
+
+      const mintMcpPeerToken = Effect.gen(function* () {
+        const bearerToken = yield* getAuthenticatedBearerSessionToken();
+        const tokenResponse = yield* fetchEffect(yield* getHttpServerUrl("/api/mcp/peer-token"), {
+          method: "POST",
+          headers: {
+            authorization: `Bearer ${bearerToken}`,
+            "content-type": "application/json",
+          },
+          body: jsonRequestBody({ sourceEnvironmentId: "environment-security-source" }),
+        });
+        if (tokenResponse.status === 401 || tokenResponse.status === 403) {
+          return yield* new SecurityProbeDenied({ source: "http" });
+        }
+        assert.equal(tokenResponse.status, 200);
+        return yield* responseJsonEffect<{
+          readonly token: string;
+          readonly peerTokenId: string;
+        }>(tokenResponse);
+      });
+
+      const mcpHttpProbe = Effect.gen(function* () {
+        const mcpEndpoint = (yield* getHttpServerUrl("/mcp")).toString();
+        const client = new Client(
+          { name: "security-characterization", version: "1.0.0" },
+          { capabilities: {} },
+        );
+        const transport = new StreamableHTTPClientTransport(new URL(mcpEndpoint), {
+          requestInit: { headers: { authorization: issuedMcpPeerToken.authorizationHeader } },
+        });
+        yield* Effect.tryPromise({
+          try: () => client.connect(transport as Parameters<Client["connect"]>[0]),
+          catch: (cause) => new SecurityProbeTransportError({ cause }),
+        });
+        const toolResult = yield* Effect.tryPromise({
+          try: () => client.callTool({ name: "t3_list_backends", arguments: {} }),
+          catch: (cause) => new SecurityProbeTransportError({ cause }),
+        });
+        yield* Effect.promise(() => client.close().catch(() => undefined));
+        const observation = encodeSecurityObservation(toolResult);
+        if (toolResult.isError === true) {
+          if (/authoriz|forbidden|denied/i.test(observation)) {
+            return yield* new SecurityProbeDenied({ source: "rpc" });
+          }
+          assert.fail(`MCP tool probe failed: ${observation}`);
+        }
+        return observation;
+      });
+
+      const httpClient = yield* HttpClient.HttpClient;
+      const httpServer = yield* HttpServer.HttpServer;
+      type SecurityProbeRequirements = HttpClient.HttpClient | HttpServer.HttpServer | Scope.Scope;
+      const isAuthorizationDenial = (error: unknown): boolean => {
+        if (error instanceof SecurityProbeDenied) return true;
+        if (typeof error !== "object" || error === null) return false;
+        const candidate = error as {
+          readonly _tag?: unknown;
+          readonly code?: unknown;
+          readonly operation?: unknown;
+          readonly status?: unknown;
+          readonly cause?: unknown;
+        };
+        if (candidate._tag === "EnvironmentAuthorizationError") return true;
+        if (candidate.code === 401 || candidate.code === 403) return true;
+        if (error instanceof Error && /\b(?:401|403)\b/.test(error.message)) return true;
+        if (error instanceof SecurityProbeTransportError) {
+          return isAuthorizationDenial(error.cause);
+        }
+        if (
+          candidate._tag === "McpPeerClientError" &&
+          candidate.operation === "http-status" &&
+          (candidate.status === 401 || candidate.status === 403)
+        ) {
+          return true;
+        }
+        return (
+          candidate._tag === "McpPeerClientError" &&
+          typeof candidate.cause === "object" &&
+          candidate.cause !== null &&
+          (candidate.cause as { readonly _tag?: unknown })._tag === "EnvironmentAuthorizationError"
+        );
+      };
+      const securityProbe = <E>(
+        effect: Effect.Effect<string, E, SecurityProbeRequirements>,
+      ): Effect.Effect<SecurityProbeOutcome> =>
+        Effect.scoped(
+          effect.pipe(
+            Effect.provideService(HttpClient.HttpClient, httpClient),
+            Effect.provideService(HttpServer.HttpServer, httpServer),
+            Effect.map((observation): SecurityProbeOutcome => ({ access: "allowed", observation })),
+            Effect.catch((error) =>
+              isAuthorizationDenial(error)
+                ? Effect.succeed({ access: "denied", observation: "" } as const)
+                : Effect.fail(error),
+            ),
+            Effect.orDie,
+          ),
+        );
+      const probe = <E>(
+        entryPoint: string,
+        effect: Effect.Effect<string, E, SecurityProbeRequirements>,
+        expectedSentinel?: string,
+      ) => ({
+        entryPoint,
+        ...(expectedSentinel === undefined ? {} : { expectedSentinel }),
+        run: securityProbe(effect),
+      });
+      const probes = {
+        "project-thread-snapshots": [
+          probe(
+            "GET /api/orchestration/snapshot",
+            authenticatedGet("/api/orchestration/snapshot"),
+            sentinel("project-thread-snapshots"),
+          ),
+          probe(
+            "GET /api/orchestration/threads/:threadId",
+            authenticatedGet(`/api/orchestration/threads/${defaultThreadId}`),
+            `${sentinel("project-thread-snapshots")}::thread-detail`,
+          ),
+        ],
+        "id-lookups": [
+          probe(
+            "GET /api/orchestration/threads/:threadId/revision",
+            authenticatedGet(`/api/orchestration/threads/${defaultThreadId}/revision`),
+            `${sentinel("id-lookups")}::revision`,
+          ),
+          probe(
+            ORCHESTRATION_WS_METHODS.getTurnDiff,
+            rpc((client) =>
+              client[ORCHESTRATION_WS_METHODS.getTurnDiff]({
+                threadId: defaultThreadId,
+                fromTurnCount: 0,
+                toTurnCount: 1,
+              }).pipe(Effect.map(encodeSecurityObservation)),
+            ),
+            `${sentinel("id-lookups")}::turn-diff`,
+          ),
+          probe(
+            ORCHESTRATION_WS_METHODS.getFullThreadDiff,
+            rpc((client) =>
+              client[ORCHESTRATION_WS_METHODS.getFullThreadDiff]({
+                threadId: defaultThreadId,
+                toTurnCount: 1,
+              }).pipe(Effect.map(encodeSecurityObservation)),
+            ),
+            `${sentinel("id-lookups")}::full-thread-diff`,
+          ),
+        ],
+        "event-replay-subscriptions": [
+          probe(
+            ORCHESTRATION_WS_METHODS.replayEvents,
+            rpc((client) =>
+              client[ORCHESTRATION_WS_METHODS.replayEvents]({ fromSequenceExclusive: 0 }).pipe(
+                Effect.map(encodeSecurityObservation),
+              ),
+            ),
+            sentinel("event-replay-subscriptions"),
+          ),
+        ],
+        commands: [
+          probe(
+            ORCHESTRATION_WS_METHODS.dispatchCommand,
+            rpc((client) =>
+              Effect.gen(function* () {
+                yield* client[ORCHESTRATION_WS_METHODS.dispatchCommand]({
+                  type: "thread.meta.update",
+                  commandId: CommandId.make("command-security-characterization"),
+                  threadId: defaultThreadId,
+                  title: sentinel("commands"),
+                });
+                return encodeSecurityObservation(dispatchedCommands.at(-1));
+              }),
+            ),
+            sentinel("commands"),
+          ),
+        ],
+        "parent-child-threads": [
+          probe(
+            ORCHESTRATION_WS_METHODS.replayEvents,
+            rpc((client) =>
+              client[ORCHESTRATION_WS_METHODS.replayEvents]({ fromSequenceExclusive: 12 }).pipe(
+                Effect.map(encodeSecurityObservation),
+              ),
+            ),
+            sentinel("parent-child-threads"),
+          ),
+        ],
+        schedules: [
+          probe(
+            ORCHESTRATION_WS_METHODS.subscribeScheduledTasks,
+            rpc((client) =>
+              client[ORCHESTRATION_WS_METHODS.subscribeScheduledTasks]({}).pipe(
+                Stream.take(1),
+                Stream.runCollect,
+                Effect.map((items) => encodeSecurityObservation(Array.from(items))),
+              ),
+            ),
+            sentinel("schedules"),
+          ),
+        ],
+        notifications: [
+          probe(
+            WS_METHODS.serverGetNotificationConfig,
+            rpc((client) =>
+              client[WS_METHODS.serverGetNotificationConfig]({}).pipe(
+                Effect.map(encodeSecurityObservation),
+              ),
+            ),
+            sentinel("notifications"),
+          ),
+        ],
+        assets: [
+          probe(
+            WS_METHODS.assetsCreateUrl,
+            rpc((client) =>
+              client[WS_METHODS.assetsCreateUrl]({
+                resource: { _tag: "attachment", attachmentId },
+              }).pipe(Effect.map(encodeSecurityObservation)),
+            ),
+            attachmentId,
+          ),
+          probe(
+            "GET /api/assets/:token/*",
+            Effect.gen(function* () {
+              const response = yield* fetchEffect(
+                yield* getHttpServerUrl(issuedAssetUrl.relativeUrl),
+              );
+              if (response.status === 401 || response.status === 403) {
+                return yield* new SecurityProbeDenied({ source: "http" });
+              }
+              assert.equal(response.status, 200);
+              return yield* response.text;
+            }),
+            sentinel("assets"),
+          ),
+        ],
+        "project-filesystem-vcs-worktrees": [
+          probe(
+            WS_METHODS.projectsReadFile,
+            rpc((client) =>
+              client[WS_METHODS.projectsReadFile]({
+                cwd: workspaceDir,
+                relativePath: "private.txt",
+              }).pipe(Effect.map(encodeSecurityObservation)),
+            ),
+            workspaceSentinel,
+          ),
+          probe(
+            WS_METHODS.vcsListRefs,
+            rpc((client) =>
+              client[WS_METHODS.vcsListRefs]({ cwd: workspaceDir }).pipe(
+                Effect.map(encodeSecurityObservation),
+              ),
+            ),
+            workspaceSentinel,
+          ),
+          probe(
+            WS_METHODS.vcsCreateWorktree,
+            rpc((client) =>
+              client[WS_METHODS.vcsCreateWorktree]({
+                cwd: workspaceDir,
+                refName: "main",
+                path: null,
+              }).pipe(Effect.map(encodeSecurityObservation)),
+            ),
+            workspaceSentinel,
+          ),
+        ],
+        terminal: [
+          probe(
+            WS_METHODS.terminalOpen,
+            rpc((client) =>
+              client[WS_METHODS.terminalOpen]({
+                threadId: defaultThreadId,
+                terminalId: "security-characterization",
+                cwd: workspaceDir,
+              }).pipe(Effect.map(encodeSecurityObservation)),
+            ),
+            `${sentinel("terminal")}::terminal-open`,
+          ),
+        ],
+        "provider-tool-subprocess": [
+          {
+            entryPoint: "provider/tool subprocess",
+            expectedSentinel: sentinel("provider-tool-subprocess"),
+            run: securityProbe(processProbe).pipe(
+              Effect.map(
+                (outcome): SecurityProbeOutcome => ({
+                  access: outcome.observation.includes(sentinel("provider-tool-subprocess"))
+                    ? "allowed"
+                    : "denied",
+                  observation: outcome.observation,
+                }),
+              ),
+            ),
+          },
+        ],
+        preview: [
+          probe(
+            WS_METHODS.previewList,
+            rpc((client) =>
+              client[WS_METHODS.previewList]({ threadId: defaultThreadId }).pipe(
+                Effect.map(encodeSecurityObservation),
+              ),
+            ),
+            sentinel("preview"),
+          ),
+        ],
+        reviews: [
+          probe(
+            WS_METHODS.reviewGetDiffPreview,
+            rpc((client) =>
+              client[WS_METHODS.reviewGetDiffPreview]({ cwd: workspaceDir }).pipe(
+                Effect.map(encodeSecurityObservation),
+              ),
+            ),
+            sentinel("reviews"),
+          ),
+        ],
+        "mcp-subagents": [
+          probe(
+            "POST /api/mcp/peer-token",
+            mintMcpPeerToken.pipe(Effect.map(encodeSecurityObservation)),
+            "peerTokenId",
+          ),
+          probe("POST /mcp t3_list_backends", mcpHttpProbe, sentinel("mcp-subagents")),
+        ],
+        "diagnostics-settings": [
+          probe(
+            WS_METHODS.serverGetProcessDiagnostics,
+            rpc((client) =>
+              client[WS_METHODS.serverGetProcessDiagnostics]({}).pipe(
+                Effect.map(encodeSecurityObservation),
+              ),
+            ),
+            sentinel("diagnostics-settings"),
+          ),
+          probe(
+            WS_METHODS.serverGetSettings,
+            rpc((client) =>
+              client[WS_METHODS.serverGetSettings]({}).pipe(Effect.map(encodeSecurityObservation)),
+            ),
+            sentinel("diagnostics-settings"),
+          ),
+        ],
+        "auth-session-management": [
+          probe(
+            "POST /api/auth/pairing-token",
+            Effect.gen(function* () {
+              const response = yield* fetchEffect(
+                yield* getHttpServerUrl("/api/auth/pairing-token"),
+                {
+                  method: "POST",
+                  headers: { cookie: ownerCookie, "content-type": "application/json" },
+                  body: jsonRequestBody({
+                    audienceCeiling: "private",
+                    label: sentinel("auth-session-management"),
+                  }),
+                },
+              );
+              if (response.status === 401 || response.status === 403) {
+                return yield* new SecurityProbeDenied({ source: "http" });
+              }
+              assert.equal(response.status, 200);
+              return yield* response.text;
+            }),
+            sentinel("auth-session-management"),
+          ),
+          probe("GET /api/auth/clients", authenticatedGet("/api/auth/clients")),
+        ],
+      } satisfies Record<
+        SecurityAccessSurfaceId,
+        ReadonlyArray<{
+          readonly entryPoint: string;
+          readonly expectedSentinel?: string;
+          readonly run: Effect.Effect<SecurityProbeOutcome>;
+        }>
+      >;
+
+      assert.deepEqual(
+        Object.keys(probes).toSorted(),
+        SECURITY_ACCESS_SURFACE_MATRIX.map((row) => row.id).toSorted(),
+      );
+      assert.equal(new Set(SECURITY_ACCESS_SURFACE_MATRIX.map((row) => row.id)).size, 16);
+      assert.isTrue(SECURITY_ACCESS_SURFACE_MATRIX.every((row) => row.entryPoints.length > 0));
+
+      const mutant = process.env.T3CODE_DSEG_CHARACTERIZATION_MUTANT;
+      if (mutant !== undefined) {
+        assert.isTrue(
+          SECURITY_ACCESS_SURFACE_MATRIX.some((row) => row.id === mutant),
+          `Unknown security characterization mutant: ${mutant}`,
+        );
+      }
+      yield* Effect.forEach(SECURITY_ACCESS_SURFACE_MATRIX, (row) =>
+        Effect.forEach(probes[row.id], (candidate) =>
+          candidate.run.pipe(
+            Effect.tap((outcome) =>
+              Effect.sync(() => {
+                const expectedAccess = mutant === row.id ? "denied" : row.currentAccess;
+                assert.equal(
+                  outcome.access,
+                  expectedAccess,
+                  `${row.id} (${candidate.entryPoint}): ${outcome.access} despite ${expectedAccess} expectation`,
+                );
+                if (candidate.expectedSentinel !== undefined) {
+                  assert.equal(
+                    outcome.observation.includes(candidate.expectedSentinel),
+                    expectedAccess === "allowed",
+                    `${row.id} (${candidate.entryPoint}): private sentinel fidelity mismatch`,
+                  );
+                } else if (expectedAccess === "denied") {
+                  assert.notInclude(outcome.observation, row.sentinel);
+                }
+              }),
+            ),
+          ),
+        ),
+      );
+    }).pipe(Effect.provide(NodeHttpServer.layerTest), TestClock.withLive),
+  );
+
   it.effect("serves static index content for GET / when staticDir is configured", () =>
     Effect.gen(function* () {
       const fileSystem = yield* FileSystem.FileSystem;
@@ -6589,6 +7582,8 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
         layers: {
           projectionSnapshotQuery: {
             getThreadDetailSnapshot: () => Effect.succeed(Option.some(snapshot)),
+            getThreadShellByIdIncludingArchived: () =>
+              Effect.succeed(Option.some(makeDefaultOrchestrationThreadShell())),
           },
           orchestrationEventStore: {
             storageEpoch,
@@ -6617,6 +7612,7 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
               verifiedRevision: 7,
               observedRevision: 7,
               observedEventId: EventId.make("event-discarded-marker-7"),
+              observedDataAudience: "private",
             }).pipe(Stream.take(1), Stream.runCollect),
           ),
         );
@@ -6641,6 +7637,7 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
             verifiedRevision: 6,
             observedRevision: 6,
             observedEventId: EventId.make("event-discarded-marker-6"),
+            observedDataAudience: "private",
           }).pipe(Stream.take(1), Stream.runCollect),
         ),
       );
@@ -6663,6 +7660,7 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
             verifiedRevision: 6,
             observedRevision: 6,
             observedEventId: latestEventId,
+            observedDataAudience: "private",
           }).pipe(Stream.take(1), Stream.runCollect),
         ),
       );
@@ -6687,6 +7685,7 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
               verifiedRevision: 6,
               observedRevision: 6,
               observedEventId: latestEventId,
+              observedDataAudience: "private",
             }).pipe(Stream.runDrain),
           ).pipe(Effect.forkScoped);
           yield* Deferred.await(readEventsStarted);
@@ -6704,6 +7703,7 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
             verifiedRevision: 7,
             observedRevision: 7,
             observedEventId: EventId.make("event-discarded-marker-7"),
+            observedDataAudience: "private",
           }).pipe(Stream.take(1), Stream.runCollect),
         ),
       );
@@ -6720,6 +7720,189 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
           },
         },
       ]);
+    }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+
+  it.effect("invalidates a resumable thread cache when its inherited audience is stale", () =>
+    Effect.gen(function* () {
+      const storageEpoch = "audience-change-storage-epoch";
+      const latestEventId = EventId.make("event-before-audience-change-6");
+      const snapshot = {
+        snapshotSequence: 8,
+        thread: {
+          ...makeDefaultOrchestrationReadModel().threads[0]!,
+          dataAudience: "factory" as const,
+        },
+      };
+      let readEventsCalled = false;
+
+      yield* buildAppUnderTest({
+        layers: {
+          projectionSnapshotQuery: {
+            getThreadShellByIdIncludingArchived: () =>
+              Effect.succeed(
+                Option.some(makeDefaultOrchestrationThreadShell({ dataAudience: "factory" })),
+              ),
+            getThreadDetailSnapshot: () => Effect.succeed(Option.some(snapshot)),
+          },
+          orchestrationEventStore: {
+            storageEpoch,
+            getLatestThreadRevision: () => Effect.succeed({ latestSequence: 6, latestEventId }),
+            getLatestSequence: () => Effect.succeed(8),
+          },
+          orchestrationEngine: {
+            readEvents: () => {
+              readEventsCalled = true;
+              return Stream.empty;
+            },
+          },
+        },
+      });
+
+      const wsUrl = yield* getWsServerUrl("/ws");
+      const item = yield* Effect.scoped(
+        withWsRpcClient(wsUrl, (client) =>
+          client[ORCHESTRATION_WS_METHODS.subscribeThread]({
+            threadId: defaultThreadId,
+            afterSequence: 8,
+            storageEpoch,
+            verifiedRevision: 6,
+            observedRevision: 6,
+            observedEventId: latestEventId,
+            observedDataAudience: "private",
+          }).pipe(Stream.runHead),
+        ),
+      );
+
+      assert.isTrue(Option.isSome(item));
+      if (Option.isSome(item)) {
+        assert.equal(item.value.kind, "snapshot");
+        if (item.value.kind === "snapshot") {
+          assert.equal(item.value.snapshot.thread.dataAudience, "factory");
+          assert.equal(item.value.force, true);
+        }
+      }
+      assert.equal(readEventsCalled, false);
+    }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+
+  it.effect("keeps project audience changes off the revision-tracked thread stream", () =>
+    Effect.gen(function* () {
+      const storageEpoch = "live-audience-storage-epoch";
+      const liveEvents = yield* PubSub.unbounded<OrchestrationEvent>();
+      const liveSubscriptionAttached = yield* Deferred.make<void>();
+      const makeAudienceEvent = (
+        projectId: ProjectId,
+        eventId: EventId,
+        sequence: number,
+      ): OrchestrationEvent => ({
+        eventId,
+        sequence,
+        occurredAt: "2026-07-17T10:00:00.000Z",
+        commandId: null,
+        causationEventId: null,
+        correlationId: null,
+        metadata: {},
+        aggregateKind: "project",
+        aggregateId: projectId,
+        type: "project.data-audience-set",
+        payload: {
+          projectId,
+          workspaceRoot: "/tmp/project",
+          oldDataAudience: "private",
+          newDataAudience: "factory",
+          actor: "local-admin:test",
+          updatedAt: "2026-07-17T10:00:00.000Z",
+        },
+      });
+      const handshakeEvent = makeAudienceEvent(
+        ProjectId.make("project-unrelated"),
+        EventId.make("event-live-audience-handshake"),
+        7,
+      );
+      const audienceEvent = makeAudienceEvent(
+        defaultProjectId,
+        EventId.make("event-live-audience-change"),
+        8,
+      );
+      const threadEvent: OrchestrationEvent = {
+        eventId: EventId.make("event-live-thread-change"),
+        sequence: 9,
+        occurredAt: "2026-07-17T10:01:00.000Z",
+        commandId: null,
+        causationEventId: null,
+        correlationId: null,
+        metadata: {},
+        aggregateKind: "thread",
+        aggregateId: defaultThreadId,
+        type: "thread.activity-appended",
+        payload: {
+          threadId: defaultThreadId,
+          activity: {
+            id: EventId.make("activity-live-after-audience-change"),
+            tone: "info",
+            kind: "test",
+            summary: "Thread event after audience change",
+            payload: {},
+            turnId: null,
+            sequence: 9,
+            createdAt: "2026-07-17T10:01:00.000Z",
+          },
+        },
+      };
+      const snapshot = {
+        snapshotSequence: 6,
+        thread: makeDefaultOrchestrationReadModel().threads[0]!,
+      };
+
+      yield* buildAppUnderTest({
+        layers: {
+          projectionSnapshotQuery: {
+            getThreadShellByIdIncludingArchived: () =>
+              Effect.gen(function* () {
+                yield* PubSub.publish(liveEvents, handshakeEvent);
+                yield* Deferred.await(liveSubscriptionAttached);
+                yield* PubSub.publish(liveEvents, audienceEvent);
+                yield* PubSub.publish(liveEvents, threadEvent);
+                return Option.some(makeDefaultOrchestrationThreadShell());
+              }),
+            getThreadDetailSnapshot: () => Effect.succeed(Option.some(snapshot)),
+          },
+          orchestrationEventStore: {
+            storageEpoch,
+            getLatestThreadRevision: () =>
+              Effect.succeed({
+                latestSequence: 6,
+                latestEventId: EventId.make("event-live-audience-marker-6"),
+              }),
+            getLatestSequence: () => Effect.succeed(9),
+          },
+          orchestrationEngine: {
+            streamDomainEvents: Stream.fromPubSub(liveEvents).pipe(
+              Stream.tap((event) =>
+                event.eventId === handshakeEvent.eventId
+                  ? Deferred.succeed(liveSubscriptionAttached, undefined)
+                  : Effect.void,
+              ),
+            ),
+          },
+        },
+      });
+
+      const wsUrl = yield* getWsServerUrl("/ws");
+      const items = yield* Effect.scoped(
+        withWsRpcClient(wsUrl, (client) =>
+          client[ORCHESTRATION_WS_METHODS.subscribeThread]({
+            threadId: defaultThreadId,
+          }).pipe(Stream.take(2), Stream.runCollect),
+        ),
+      );
+      const received = Array.from(items);
+      assert.equal(received[0]?.kind, "snapshot");
+      assert.equal(received[1]?.kind, "event");
+      if (received[1]?.kind === "event") {
+        assert.equal(received[1].event.eventId, threadEvent.eventId);
+      }
     }).pipe(Effect.provide(NodeHttpServer.layerTest)),
   );
 

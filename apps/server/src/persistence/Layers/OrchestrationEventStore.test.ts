@@ -84,6 +84,70 @@ layer("OrchestrationEventStore", (it) => {
     }),
   );
 
+  it.effect("derives local-admin audit attribution from the trusted event type", () =>
+    Effect.gen(function* () {
+      const eventStore = yield* OrchestrationEventStore;
+      const sql = yield* SqlClient.SqlClient;
+      const now = "2026-07-17T10:00:00.000Z";
+      const projectId = ProjectId.make("project-audience-audit-attribution");
+
+      const spoofedClientEvent = yield* eventStore.append({
+        type: "project.created",
+        eventId: EventId.make("evt-spoofed-local-admin-prefix"),
+        aggregateKind: "project",
+        aggregateId: projectId,
+        occurredAt: now,
+        commandId: CommandId.make("local-admin:spoofed-by-client"),
+        causationEventId: null,
+        correlationId: null,
+        metadata: {},
+        payload: {
+          projectId,
+          title: "Audience audit attribution",
+          workspaceRoot: "/tmp/project-audience-audit-attribution",
+          dataAudience: "private",
+          defaultModelSelection: null,
+          scripts: [],
+          createdAt: now,
+          updatedAt: now,
+        },
+      });
+      const adminEvent = yield* eventStore.append({
+        type: "project.data-audience-set",
+        eventId: EventId.make("evt-trusted-local-admin-audience"),
+        aggregateKind: "project",
+        aggregateId: projectId,
+        occurredAt: now,
+        commandId: CommandId.make("ordinary-command-id"),
+        causationEventId: null,
+        correlationId: null,
+        metadata: {},
+        payload: {
+          projectId,
+          workspaceRoot: "/tmp/project-audience-audit-attribution",
+          oldDataAudience: "private",
+          newDataAudience: "factory",
+          actor: "local-admin:test",
+          updatedAt: now,
+        },
+      });
+
+      const actorRows = yield* sql<{
+        readonly eventId: string;
+        readonly actorKind: string;
+      }>`
+        SELECT event_id AS "eventId", actor_kind AS "actorKind"
+        FROM orchestration_events
+        WHERE event_id IN (${spoofedClientEvent.eventId}, ${adminEvent.eventId})
+        ORDER BY sequence
+      `;
+      assert.deepEqual(actorRows, [
+        { eventId: spoofedClientEvent.eventId, actorKind: "client" },
+        { eventId: adminEvent.eventId, actorKind: "local-admin" },
+      ]);
+    }),
+  );
+
   it.effect("replays pre-audience project events as private", () =>
     Effect.gen(function* () {
       const eventStore = yield* OrchestrationEventStore;

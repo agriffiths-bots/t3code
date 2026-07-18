@@ -20,7 +20,12 @@ export function applyShellStreamEvent(
       const projects = snapshot.projects.some((p) => p.id === event.project.id)
         ? Arr.map(snapshot.projects, (p) => (p.id === event.project.id ? event.project : p))
         : Arr.append(snapshot.projects, event.project);
-      return { ...snapshot, projects, snapshotSequence: event.sequence };
+      const threads = Arr.map(snapshot.threads, (thread) =>
+        thread.projectId === event.project.id
+          ? { ...thread, dataAudience: event.project.dataAudience }
+          : thread,
+      );
+      return { ...snapshot, projects, threads, snapshotSequence: event.sequence };
     }
     case "project-removed":
       return {

@@ -34,6 +34,7 @@ import {
   OrchestrationShellSnapshot,
   OrchestrationThreadDetailSnapshot,
   OrchestrationThreadRevision,
+  ProjectSetAudienceToFactoryInput,
 } from "./orchestration.ts";
 import {
   RelayCloudEnvironmentHealthRequest,
@@ -511,6 +512,18 @@ export class EnvironmentOrchestrationHttpApi extends HttpApiGroup.make("orchestr
       success: DispatchResult,
       error: EnvironmentOrchestrationDispatchErrors,
     }).middleware(EnvironmentAuthenticatedAuth),
+  )
+  .add(
+    HttpApiEndpoint.post(
+      "setProjectAudienceToFactory",
+      "/api/orchestration/admin/project-audience/factory",
+      {
+        headers: OptionalBearerHeaders,
+        payload: ProjectSetAudienceToFactoryInput,
+        success: DispatchResult,
+        error: EnvironmentOrchestrationDispatchErrors,
+      },
+    ).middleware(EnvironmentAuthenticatedAuth),
   ) {}
 
 export class EnvironmentConnectHttpApi extends HttpApiGroup.make("connect")

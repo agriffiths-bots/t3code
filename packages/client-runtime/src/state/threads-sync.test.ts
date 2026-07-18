@@ -8,6 +8,7 @@ import {
   ProviderInstanceId,
   ThreadId,
   TurnId,
+  type DataAudience,
   type OrchestrationMessage,
   type OrchestrationThread,
   type OrchestrationThreadDetailSnapshot,
@@ -213,6 +214,7 @@ const makeHarness = Effect.fn("TestEnvironmentThreads.makeHarness")(function* (o
   const lastSubscribeVerifiedRevision = yield* Ref.make<number | undefined>(undefined);
   const lastSubscribeObservedRevision = yield* Ref.make<number | undefined>(undefined);
   const lastSubscribeObservedEventId = yield* Ref.make<EventId | null | undefined>(undefined);
+  const lastSubscribeObservedDataAudience = yield* Ref.make<DataAudience | undefined>(undefined);
   const subscribeAfterSequences = yield* Ref.make<ReadonlyArray<number | undefined>>([]);
   const savedThreads = yield* Ref.make<ReadonlyArray<OrchestrationThreadDetailSnapshot>>([]);
   const removedThreads = yield* Ref.make<ReadonlyArray<ThreadId>>([]);
@@ -232,6 +234,7 @@ const makeHarness = Effect.fn("TestEnvironmentThreads.makeHarness")(function* (o
       readonly verifiedRevision?: number;
       readonly observedRevision?: number;
       readonly observedEventId?: EventId | null;
+      readonly observedDataAudience?: DataAudience;
     }) =>
       Stream.unwrap(
         Ref.updateAndGet(subscriptionCount, (count) => count + 1).pipe(
@@ -240,6 +243,7 @@ const makeHarness = Effect.fn("TestEnvironmentThreads.makeHarness")(function* (o
           Effect.andThen(Ref.set(lastSubscribeVerifiedRevision, input.verifiedRevision)),
           Effect.andThen(Ref.set(lastSubscribeObservedRevision, input.observedRevision)),
           Effect.andThen(Ref.set(lastSubscribeObservedEventId, input.observedEventId)),
+          Effect.andThen(Ref.set(lastSubscribeObservedDataAudience, input.observedDataAudience)),
           Effect.andThen(
             Ref.update(subscribeAfterSequences, (current) => [...current, input.afterSequence]),
           ),
@@ -406,6 +410,7 @@ const makeHarness = Effect.fn("TestEnvironmentThreads.makeHarness")(function* (o
     lastSubscribeVerifiedRevision,
     lastSubscribeObservedRevision,
     lastSubscribeObservedEventId,
+    lastSubscribeObservedDataAudience,
     subscribeAfterSequences,
     supervisorState,
     supervisorSession,
@@ -647,6 +652,7 @@ describe("EnvironmentThreads", () => {
       // The subscription resumed from the cached sequence and never fetched the
       // full snapshot over HTTP.
       expect(yield* Ref.get(harness.lastSubscribeAfterSequence)).toBe(CACHED_SNAPSHOT_SEQUENCE);
+      expect(yield* Ref.get(harness.lastSubscribeObservedDataAudience)).toBe("private");
       expect(yield* Ref.get(harness.loaderCalls)).toBe(0);
     }),
   );
