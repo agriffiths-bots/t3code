@@ -4,8 +4,8 @@ import {
   type AuthEnvironmentScope,
 } from "@t3tools/contracts";
 
-// Until audience-aware data filtering lands, factory sessions may only inspect
-// relay connectivity. An allowlist keeps newly-added scopes denied by default.
+// Until event/stream filtering lands, factory sessions may only inspect relay
+// connectivity. An allowlist keeps newly-added scopes denied by default.
 const FACTORY_AUDIENCE_ALLOWED_SCOPES = new Set<AuthEnvironmentScope>([AuthRelayReadScope]);
 
 export function canNarrowAudienceCeiling(

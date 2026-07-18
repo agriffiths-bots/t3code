@@ -1752,6 +1752,8 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
         layers: {
           projectionSnapshotQuery: {
             getSnapshot: () => Effect.succeed(snapshotReadModel),
+            getThreadShellByIdIncludingArchived: () =>
+              Effect.succeed(Option.some(makeDefaultOrchestrationThreadShell())),
             getThreadDetailSnapshot: () => Effect.succeed(Option.some(threadDetailSnapshot)),
           },
           orchestrationEventStore: {
@@ -2471,7 +2473,18 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
 
   it.effect("serves a lightweight authenticated thread revision marker", () =>
     Effect.gen(function* () {
-      yield* buildAppUnderTest();
+      yield* buildAppUnderTest({
+        layers: {
+          projectionSnapshotQuery: {
+            getThreadShellByIdIncludingArchived: (threadId) =>
+              Effect.succeed(
+                threadId === defaultThreadId
+                  ? Option.some(makeDefaultOrchestrationThreadShell())
+                  : Option.none(),
+              ),
+          },
+        },
+      });
       const cookie = yield* getAuthenticatedSessionCookieHeader();
       const url = yield* getHttpServerUrl(`/api/orchestration/threads/${defaultThreadId}/revision`);
       const response = yield* fetchEffect(url, { headers: { cookie } });
@@ -2489,6 +2502,14 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
         latestEventId: null,
         projectionSequence: 0,
       });
+
+      const missingResponse = yield* fetchEffect(
+        yield* getHttpServerUrl("/api/orchestration/threads/thread-missing/revision"),
+        { headers: { cookie } },
+      );
+      const missingBody = yield* responseJsonEffect<{ readonly reason: string }>(missingResponse);
+      assert.equal(missingResponse.status, 404);
+      assert.equal(missingBody.reason, "thread_not_found");
     }).pipe(Effect.provide(NodeHttpServer.layerTest)),
   );
 
