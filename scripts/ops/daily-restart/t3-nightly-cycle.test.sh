@@ -5,6 +5,7 @@ set -u
 
 ROOT="$(git rev-parse --show-toplevel)"
 SCRIPT="$ROOT/scripts/ops/daily-restart/t3-nightly-cycle"
+REAL_NODE="$(command -v node)"
 
 pass_count=0
 fail_count=0
@@ -100,6 +101,21 @@ SH
 echo "curl $*" >>"$T_LOG"
 printf '{"serverBuildSha":"%s"}\n' "${FAKE_DEPLOYED_SHA:-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}"
 SH
+  cat >"$dir/node" <<'SH'
+#!/usr/bin/env bash
+case "$*" in
+  *"auth session issue"*)
+    echo "mint-live-resume-token entry=${2:-missing}" >>"$T_LOG"
+    printf '{"token":"%s","sessionId":"%s"}\n' "${FAKE_LIVE_RESUME_TOKEN:-minted-live-token}" "${FAKE_LIVE_RESUME_SESSION_ID:-minted-live-session}"
+    exit "${FAKE_LIVE_RESUME_MINT_RC:-0}"
+    ;;
+  *"auth session revoke"*)
+    echo "revoke-live-resume-token ${*: -1}" >>"$T_LOG"
+    exit "${FAKE_LIVE_RESUME_REVOKE_RC:-0}"
+    ;;
+esac
+exec "$REAL_NODE" "$@"
+SH
   cat >"$dir/pnpm" <<'SH'
 #!/usr/bin/env bash
 [[ -n "${T3CODE_BUILD_SHA:-}" ]] && echo "pnpm-env T3CODE_BUILD_SHA=$T3CODE_BUILD_SHA cmd=$*" >>"$T_LOG"
@@ -164,7 +180,7 @@ exit "${FAKE_SYNC_RC:-0}"
 SH
   cat >"$dir/fake-restart" <<'SH'
 #!/usr/bin/env bash
-echo "restart prebuilt=${T3DR_PREBUILT_TARGET:-0} checkout=${T3DR_CHECKOUT:-} ledger=${T3DR_LEDGER:-} db=${T3DR_DB:-} service=${T3DR_SERVICE:-} origin=${T3DR_ORIGIN:-} snapshot=${T3DR_SNAPSHOT_DIR:-} probe_timeout=${T3DR_PROBE_TIMEOUT:-} smoke_instance=${T3DR_SMOKE_INSTANCE:-} smoke_model=${T3DR_SMOKE_MODEL:-} rollback=${T3DR_ROLLBACK_SHA:-} target=${T3DR_TARGET_SHA:-} assets=${T3DR_PREBUILT_ASSETS_DIR:-} probe=${T3DR_PINNED_HEALTH_PROBE:-}" >>"$T_LOG"
+echo "restart prebuilt=${T3DR_PREBUILT_TARGET:-0} checkout=${T3DR_CHECKOUT:-} ledger=${T3DR_LEDGER:-} db=${T3DR_DB:-} service=${T3DR_SERVICE:-} origin=${T3DR_ORIGIN:-} snapshot=${T3DR_SNAPSHOT_DIR:-} probe_timeout=${T3DR_PROBE_TIMEOUT:-} smoke_instance=${T3DR_SMOKE_INSTANCE:-} smoke_model=${T3DR_SMOKE_MODEL:-} rollback=${T3DR_ROLLBACK_SHA:-} target=${T3DR_TARGET_SHA:-} assets=${T3DR_PREBUILT_ASSETS_DIR:-} probe=${T3DR_PINNED_HEALTH_PROBE:-} token=${T3DR_TOKEN:+set} token_session=${T3DR_TOKEN_SESSION_ID:-}" >>"$T_LOG"
 exit "${FAKE_RESTART_RC:-0}"
 SH
   chmod +x "$dir"/*
@@ -178,7 +194,7 @@ run_cycle() {
   printf '#!/usr/bin/env bash\nexit 0\n' >"$tmp/checkout/scripts/ops/daily-restart/health-probe"
   chmod +x "$tmp/checkout/scripts/ops/daily-restart/health-probe"
   make_fake_bin "$tmp/bin"
-  T_TMP="$tmp" T_LOG="$tmp/calls.log" T3DR_TEST_PATH_PREFIX="$tmp/bin" \
+  T_TMP="$tmp" T_LOG="$tmp/calls.log" REAL_NODE="$REAL_NODE" T3DR_TEST_PATH_PREFIX="$tmp/bin" \
     T3DR_CHECKOUT="$tmp/checkout" \
     T3DR_LEDGER="$tmp/ledger" \
     T3DR_DB="$tmp/state.sqlite" \
@@ -336,6 +352,7 @@ assert_order "$tmp/calls.log" \
   "git -C $tmp/checkout worktree add --detach $stage" \
   "pnpm -C $stage install --frozen-lockfile --prefer-offline" \
   "pnpm -C $stage/apps/web run build" \
+  "mint-live-resume-token" \
   "git -C $tmp/checkout merge --ff-only bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" \
   "pnpm -C $tmp/checkout install --frozen-lockfile --prefer-offline" \
   "restart prebuilt=0"
@@ -343,6 +360,9 @@ grep -Fq "restart prebuilt=0" "$tmp/calls.log" \
   && grep -Fq "rollback=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa target=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" "$tmp/calls.log" \
   && pass "live fallback forces target rebuild from the pre-cycle rollback sha" \
   || fail "live fallback forces target rebuild from the pre-cycle rollback sha"
+grep -Fq "token=set token_session=minted-live-session" "$tmp/calls.log" \
+  && pass "live fallback hands the pre-mutation token to the restart manager" \
+  || fail "live fallback hands the pre-mutation token to the restart manager"
 grep -Fq "pnpm-env T3CODE_BUILD_SHA=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb cmd=-C $stage/apps/web run build" "$tmp/calls.log" \
   && pass "live fallback stamps web build" \
   || fail "live fallback stamps web build"
@@ -645,9 +665,9 @@ export FAKE_LIVE_INSTALL_RC=8
 run_cycle "$tmp"
 unset FAKE_LIVE_INSTALL_RC
 [[ "$(cat "$tmp/rc")" != "0" ]] && pass "already-deployed pending retry failure exits nonzero" || fail "already-deployed pending retry failure exits nonzero"
-[[ "$(cat "$tmp/fake-head")" == "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" ]] \
-  && pass "already-deployed pending retry never rolls back from post-mutation state" \
-  || fail "already-deployed pending retry never rolls back from post-mutation state"
+[[ "$(cat "$tmp/fake-head")" == "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" ]] \
+  && pass "already-deployed pending retry restores the proven running rollback" \
+  || fail "already-deployed pending retry restores the proven running rollback"
 
 tmp="$(mktemp -d)"
 mkdir -p "$tmp/ledger/$(date -u +%F)"

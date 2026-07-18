@@ -54,6 +54,14 @@ echo "verify-weakened $*" >>"$T_LOG"
 WEAK
       chmod +x "$T_TMP/bin/verify-restart"
     fi
+    if [[ "${FAKE_TARGET_WEAKENS_DB_RESTORE:-0}" == "1" ]]; then
+      cat >"$T_TMP/bin/t3-db-restore" <<'WEAK'
+#!/usr/bin/env bash
+echo "restore-target $*" >>"$T_LOG"
+exit 97
+WEAK
+      chmod +x "$T_TMP/bin/t3-db-restore"
+    fi
     exit "${FAKE_GIT_RC:-0}"
     ;;
   *"diff --quiet"*) exit "${FAKE_MIGRATION_DIFF_RC:-0}" ;;
@@ -134,7 +142,7 @@ echo "$T_TMP/snapshot.sqlite"
 SH
   cat >"$dir/t3-db-restore" <<'SH'
 #!/usr/bin/env bash
-echo "restore $*" >>"$T_LOG"
+echo "restore-original $*" >>"$T_LOG"
 exit "${FAKE_RESTORE_RC:-0}"
 SH
   cat >"$dir/capture-active-threads" <<'SH'
@@ -334,6 +342,56 @@ grep -Fq "health --origin http://127.0.0.1:1 --service fake.service --instance f
 grep -Fq "verify-restart --service fake.service --origin http://127.0.0.1:1 --checkout $tmp/checkout --expected-sha bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb --previous-pid 111 --timeout 1" "$tmp/calls.log" && pass "verify-restart receives pid and target" || fail "verify-restart receives pid and target"
 
 tmp="$(mktemp -d)"
+T3DR_TOKEN=pre-minted-token T3DR_TOKEN_SESSION_ID=pre-minted-session run_manager "$tmp"
+[[ "$(cat "$tmp/rc")" == "0" ]] && pass "pre-minted resume token exits zero" || fail "pre-minted resume token exits zero"
+if grep -Fq "mint-resume-token" "$tmp/calls.log"; then
+  fail "pre-minted resume token was minted again"
+else
+  pass "pre-minted resume token skips checkout-hosted mint"
+fi
+grep -Fq "revoke-resume-token pre-minted-session" "$tmp/calls.log" \
+  && pass "pre-minted resume token session is revoked" \
+  || fail "pre-minted resume token session is revoked"
+
+tmp="$(mktemp -d)"
+export FAKE_PRE_SHA=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+run_manager "$tmp" \
+  --rollback-sha aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+  --target-sha bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+unset FAKE_PRE_SHA
+[[ "$(cat "$tmp/rc")" == "2" ]] && pass "live fallback without pre-minted token exits two" || fail "live fallback without pre-minted token exits two"
+grep -Fq "live fallback requires a resume token minted before checkout dependency mutation" "$tmp/stderr" \
+  && pass "live fallback without pre-minted token fails closed" \
+  || fail "live fallback without pre-minted token fails closed"
+
+tmp="$(mktemp -d)"
+export FAKE_PRE_SHA=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+T3DR_TOKEN=pre-minted-token T3DR_TOKEN_SESSION_ID=deferred-session \
+  T3DR_DEFER_RESUME_TOKEN_REVOKE=1 run_manager "$tmp" \
+  --rollback-sha aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+  --target-sha bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+unset FAKE_PRE_SHA
+[[ "$(cat "$tmp/rc")" == "0" ]] && pass "deferred live token handoff exits zero" || fail "deferred live token handoff exits zero"
+grep -Fq "revoke-resume-token deferred-session" "$tmp/calls.log" \
+  && pass "deferred live token revokes after a consistent server build" \
+  || fail "deferred live token revokes after a consistent server build"
+
+tmp="$(mktemp -d)"
+export FAKE_PRE_SHA=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+export FAKE_SNAPSHOT_FAIL_N=1
+T3DR_TOKEN=pre-minted-token T3DR_TOKEN_SESSION_ID=deferred-session \
+  T3DR_DEFER_RESUME_TOKEN_REVOKE=1 run_manager "$tmp" \
+  --rollback-sha aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+  --target-sha bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+unset FAKE_PRE_SHA FAKE_SNAPSHOT_FAIL_N
+[[ "$(cat "$tmp/rc")" != "0" ]] && pass "deferred live token pre-build failure exits nonzero" || fail "deferred live token pre-build failure exits nonzero"
+if grep -Fq "revoke-resume-token deferred-session" "$tmp/calls.log"; then
+  fail "deferred live token used an inconsistent server artifact for revocation"
+else
+  pass "deferred live token avoids inconsistent server artifact revocation"
+fi
+
+tmp="$(mktemp -d)"
 export FAKE_VERIFY_RESTART_RC=9
 run_manager "$tmp"
 unset FAKE_VERIFY_RESTART_RC
@@ -528,6 +586,21 @@ fi
 
 tmp="$(mktemp -d)"
 export FAKE_HEALTH_FAIL_ONCE=1
+export FAKE_TARGET_WEAKENS_DB_RESTORE=1
+run_manager "$tmp"
+unset FAKE_HEALTH_FAIL_ONCE FAKE_TARGET_WEAKENS_DB_RESTORE
+[[ "$(cat "$tmp/rc")" != "0" ]] && pass "target-tainted db restore rollback exits nonzero" || fail "target-tainted db restore rollback exits nonzero"
+grep -Fq "restore-original --db $tmp/state.sqlite" "$tmp/calls.log" \
+  && pass "rollback uses the pinned pre-update db restore" \
+  || fail "rollback uses the pinned pre-update db restore"
+if grep -Fq "restore-target" "$tmp/calls.log"; then
+  fail "rollback used the target-tainted db restore"
+else
+  pass "rollback ignores the target-tainted db restore"
+fi
+
+tmp="$(mktemp -d)"
+export FAKE_HEALTH_FAIL_ONCE=1
 export FAKE_TARGET_WEAKENS_HEALTH_PROBE=1
 run_manager "$tmp"
 unset FAKE_HEALTH_FAIL_ONCE FAKE_TARGET_WEAKENS_HEALTH_PROBE
@@ -703,7 +776,7 @@ fi
 
 tmp="$(mktemp -d)"
 export FAKE_PRE_SHA=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
-run_manager "$tmp" \
+T3DR_TOKEN=live-fallback-token run_manager "$tmp" \
   --rollback-sha aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
   --target-sha bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
 unset FAKE_PRE_SHA
@@ -719,7 +792,7 @@ grep -Fq '"pre_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"' "$tmp/ledger/"*
 tmp="$(mktemp -d)"
 export FAKE_PRE_SHA=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
 export FAKE_VERIFY_RESTART_RC=9
-run_manager "$tmp" \
+T3DR_TOKEN=live-fallback-token run_manager "$tmp" \
   --rollback-sha aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
   --target-sha bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
 unset FAKE_PRE_SHA FAKE_VERIFY_RESTART_RC

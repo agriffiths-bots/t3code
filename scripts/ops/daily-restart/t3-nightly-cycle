@@ -35,6 +35,11 @@ live_deploy_target=""
 live_deploy_rollback=""
 live_restart_source_sha=""
 live_deploy_pending=0
+live_resume_token=""
+live_resume_session_id=""
+live_resume_entry=""
+live_resume_cleanup_safe=0
+live_resume_handed_off=0
 failure_recorded=0
 
 usage() {
@@ -582,6 +587,73 @@ restore_failed_live_handoff() {
   run_logged "$build_timeout" "$step_log" pnpm -C "$checkout" install --frozen-lockfile --prefer-offline
 }
 
+server_state_home() {
+  local home="${T3CODE_HOME:-}"
+  if [[ -n "$home" ]]; then
+    printf '%s\n' "$home"
+    return 0
+  fi
+  cd "$(dirname "$db")/.." 2>/dev/null && pwd -P
+}
+
+prepare_live_resume_token() {
+  local current_head="$1" step_log="$2"
+  local home json parsed
+  if [[ -n "${T3DR_TOKEN:-}" || -n "${T3_TOKEN:-}" ]]; then
+    printf '[%s] live resume token supplied; skipping pre-mutation mint\n' "$(date -u +%FT%TZ)" >>"$step_log"
+    return 0
+  fi
+  if [[ "$current_head" != "$live_deploy_rollback" ]]; then
+    printf '[%s] refusing resume-token mint from post-mutation checkout current_head=%s rollback_sha=%s; supply T3DR_TOKEN or T3_TOKEN\n' \
+      "$(date -u +%FT%TZ)" "$current_head" "$live_deploy_rollback" >>"$step_log"
+    return 68
+  fi
+  home="$(server_state_home)" || return 1
+  if [[ -f "$checkout/apps/server/dist/bin.mjs" ]]; then
+    live_resume_entry="$checkout/apps/server/dist/bin.mjs"
+  else
+    live_resume_entry="$checkout/apps/server/src/bin.ts"
+  fi
+  json="$(
+    env -u VITE_DEV_SERVER_URL T3CODE_HOME="$home" timeout 30 node "$live_resume_entry" auth session issue \
+      --json \
+      --ttl "${T3DR_RESUME_TOKEN_TTL:-7200s}" \
+      --label daily-restart-resume-injection \
+      --subject daily-restart-resume-injection 2>>"$step_log"
+  )" || return 1
+  parsed="$(node -e 'const fs=require("node:fs"); const issued=JSON.parse(fs.readFileSync(0,"utf8")); console.log(issued.token || ""); console.log(issued.sessionId || "");' <<<"$json" 2>>"$step_log")" || return 1
+  live_resume_token="$(sed -n '1p' <<<"$parsed")"
+  live_resume_session_id="$(sed -n '2p' <<<"$parsed")"
+  if [[ -z "$live_resume_token" || -z "$live_resume_session_id" ]]; then
+    live_resume_token=""
+    live_resume_session_id=""
+    return 1
+  fi
+  live_resume_cleanup_safe=1
+  printf '[%s] minted live resume token before checkout dependency mutation\n' "$(date -u +%FT%TZ)" >>"$step_log"
+}
+
+cleanup_unhanded_live_resume_token() {
+  local home
+  if [[ -z "$live_resume_session_id" || "$live_resume_handed_off" -eq 1 ]]; then
+    return 0
+  fi
+  if [[ "$live_resume_cleanup_safe" -ne 1 || -z "$live_resume_entry" ]]; then
+    log "WARNING live resume token cannot be safely revoked from the mutated checkout; leaving it to expire"
+    return 1
+  fi
+  home="$(server_state_home)" || return 1
+  if ! env -u VITE_DEV_SERVER_URL T3CODE_HOME="$home" timeout 30 node "$live_resume_entry" \
+    auth session revoke "$live_resume_session_id" >>"$log_file" 2>&1; then
+    log "WARNING failed to revoke unhanded live resume token"
+    return 1
+  fi
+  live_resume_token=""
+  live_resume_session_id=""
+  live_resume_entry=""
+  live_resume_cleanup_safe=0
+}
+
 build_release_artifacts() {
   local step="build-release-artifacts"
   local step_log="$run_dir/$step.log"
@@ -812,6 +884,16 @@ run_live_deploy_step() {
     # shellcheck disable=SC2094
     pin_live_restart_orchestrator "$current_head" "$live_deploy_rollback" "$live_restart_source_sha" "$step_log" >>"$step_log" 2>&1 || rc=$?
   fi
+  if [[ "$rc" -eq 0 && -z "${T3DR_TOKEN:-}" && -z "${T3_TOKEN:-}" &&
+    "$current_head" != "$live_deploy_rollback" ]]; then
+    printf '[%s] restoring post-mutation checkout to running rollback before resume-token mint current_head=%s rollback_sha=%s\n' \
+      "$(date -u +%FT%TZ)" "$current_head" "$live_deploy_rollback" >>"$step_log"
+    if restore_failed_live_handoff "$step_log"; then
+      current_head="$live_deploy_rollback"
+    else
+      rc=$?
+    fi
+  fi
   if [[ "$rc" -eq 0 ]]; then
     mkdir -p "$stage_root" || rc=$?
   fi
@@ -842,6 +924,9 @@ run_live_deploy_step() {
     fi
   fi
   if [[ "$rc" -eq 0 ]]; then
+    prepare_live_resume_token "$current_head" "$step_log" || rc=$?
+  fi
+  if [[ "$rc" -eq 0 ]]; then
     write_pending_live_deploy "$live_deploy_rollback" "$live_deploy_target" "$live_restart_source_sha" || rc=$?
     if [[ "$rc" -eq 0 ]]; then
       live_deploy_pending=1
@@ -851,6 +936,7 @@ run_live_deploy_step() {
     if run_logged 120 "$step_log" git -C "$checkout" merge --ff-only "$live_deploy_target"; then
       if [[ "$current_head" != "$live_deploy_target" ]]; then
         live_checkout_mutated=1
+        live_resume_cleanup_safe=0
       fi
     else
       rc=$?
@@ -871,9 +957,14 @@ run_live_deploy_step() {
   fi
   cleanup_stage_checkout "$step_log"
   if [[ "$rc" -ne 0 && "$live_checkout_mutated" -eq 1 ]]; then
-    if ! restore_failed_live_handoff "$step_log"; then
+    if restore_failed_live_handoff "$step_log"; then
+      live_resume_cleanup_safe=1
+    else
       printf '[%s] ERROR failed to restore checkout after live handoff failure\n' "$(date -u +%FT%TZ)" >>"$step_log"
     fi
+  fi
+  if [[ "$rc" -ne 0 ]]; then
+    cleanup_unhanded_live_resume_token || true
   fi
 
   duration=$((SECONDS - started))
@@ -950,14 +1041,28 @@ run_restart_step() {
       printf '[%s] invalid no-op restart metadata in %s\n' "$(date -u +%FT%TZ)" "$prebuilt_env" >>"$step_log"
       rc=68
     else
-      env "${restart_env[@]}" \
-        T3DR_PREBUILT_TARGET=0 T3DR_ROLLBACK_SHA="$rollback" T3DR_TARGET_SHA="$target" \
-        "$restart_cmd" >>"$step_log" 2>&1
+      if [[ -n "$live_resume_token" ]]; then
+        live_resume_handed_off=1
+        T3DR_TOKEN="$live_resume_token" T3DR_TOKEN_SESSION_ID="$live_resume_session_id" \
+          env "${restart_env[@]}" T3DR_DEFER_RESUME_TOKEN_REVOKE=1 \
+          T3DR_PREBUILT_TARGET=0 T3DR_ROLLBACK_SHA="$rollback" T3DR_TARGET_SHA="$target" \
+          "$restart_cmd" >>"$step_log" 2>&1
+      else
+        env "${restart_env[@]}" \
+          T3DR_PREBUILT_TARGET=0 T3DR_ROLLBACK_SHA="$rollback" T3DR_TARGET_SHA="$target" \
+          "$restart_cmd" >>"$step_log" 2>&1
+      fi
       rc=$?
     fi
   else
     printf '[%s] missing restart metadata in %s\n' "$(date -u +%FT%TZ)" "$prebuilt_env" >>"$step_log"
     rc=68
+  fi
+  if [[ "$live_resume_handed_off" -eq 1 ]]; then
+    live_resume_token=""
+    live_resume_session_id=""
+    live_resume_entry=""
+    live_resume_cleanup_safe=0
   fi
   duration=$((SECONDS - started))
   if [[ "$rc" -eq 0 ]]; then
@@ -988,6 +1093,7 @@ assert_deadline() {
 # shellcheck disable=SC2317
 record_unexpected_exit() {
   local rc="$?"
+  cleanup_unhanded_live_resume_token || true
   if [[ "$rc" -ne 0 && "$failure_recorded" -eq 0 ]]; then
     record_failure "unexpected-exit" "$rc" "$log_file"
     write_event "cycle" "failed" "$rc" "" "$log_file"
