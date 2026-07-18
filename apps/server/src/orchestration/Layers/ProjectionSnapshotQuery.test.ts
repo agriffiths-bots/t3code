@@ -392,6 +392,20 @@ projectionSnapshotLayer("ProjectionSnapshotQuery", (it) => {
               .pipe(Effect.map(Option.isSome)),
           },
           {
+            name: "archived thread shell snapshot by id",
+            privateRead: snapshotQuery
+              .getThreadShellSnapshotByIdIncludingArchived(privateArchivedThreadId)
+              .pipe(Effect.map(({ thread }) => Option.isSome(thread))),
+            factoryRead: snapshotQuery
+              .getThreadShellSnapshotByIdIncludingArchived(factoryArchivedThreadId)
+              .pipe(Effect.map(({ thread }) => Option.isSome(thread))),
+            missingRead: snapshotQuery
+              .getThreadShellSnapshotByIdIncludingArchived(
+                ThreadId.make("thread-read-guard-missing"),
+              )
+              .pipe(Effect.map(({ thread }) => Option.isSome(thread))),
+          },
+          {
             name: "thread detail by id",
             privateRead: snapshotQuery
               .getThreadDetailById(privateActiveThreadId)
@@ -449,6 +463,291 @@ projectionSnapshotLayer("ProjectionSnapshotQuery", (it) => {
           assert.isTrue(yield* asAudience("private", surface.factoryRead), surface.name);
         }
       }),
+  );
+
+  it.effect("redacts private cross-thread references from factory-scoped snapshots", () =>
+    Effect.gen(function* () {
+      const snapshotQuery = yield* ProjectionSnapshotQuery;
+      const sql = yield* SqlClient.SqlClient;
+      const privateProjectId = asProjectId("project-reference-redaction-private");
+      const factoryProjectId = asProjectId("project-reference-redaction-factory");
+      const privateParentThreadId = ThreadId.make("thread-reference-redaction-private-parent");
+      const factoryChildThreadId = ThreadId.make("thread-reference-redaction-factory-child");
+      const factoryArchivedChildThreadId = ThreadId.make(
+        "thread-reference-redaction-factory-archived-child",
+      );
+      const factoryTurnId = asTurnId("turn-reference-redaction-factory");
+
+      yield* sql`
+        INSERT INTO projection_projects (
+          project_id,
+          title,
+          workspace_root,
+          data_audience,
+          default_model_selection_json,
+          scripts_json,
+          created_at,
+          updated_at,
+          deleted_at
+        )
+        VALUES
+          (
+            ${privateProjectId},
+            'Private reference redaction project',
+            '/tmp/reference-redaction-private',
+            'private',
+            NULL,
+            '[]',
+            '2026-07-18T01:00:00.000Z',
+            '2026-07-18T01:00:00.000Z',
+            NULL
+          ),
+          (
+            ${factoryProjectId},
+            'Factory reference redaction project',
+            '/tmp/reference-redaction-factory',
+            'factory',
+            NULL,
+            '[]',
+            '2026-07-18T01:00:01.000Z',
+            '2026-07-18T01:00:01.000Z',
+            NULL
+          )
+      `;
+      yield* sql`
+        INSERT INTO projection_threads (
+          thread_id,
+          project_id,
+          title,
+          model_selection_json,
+          runtime_mode,
+          interaction_mode,
+          branch,
+          worktree_path,
+          latest_turn_id,
+          created_at,
+          updated_at,
+          archived_at,
+          deleted_at,
+          parent_thread_id
+        )
+        VALUES
+          (
+            ${privateParentThreadId},
+            ${privateProjectId},
+            'Private reference parent',
+            '{"instanceId":"codex","model":"gpt-5.5"}',
+            'full-access',
+            'default',
+            NULL,
+            NULL,
+            NULL,
+            '2026-07-18T01:00:02.000Z',
+            '2026-07-18T01:00:02.000Z',
+            NULL,
+            NULL,
+            NULL
+          ),
+          (
+            ${factoryChildThreadId},
+            ${factoryProjectId},
+            'Factory reference child',
+            '{"instanceId":"codex","model":"gpt-5.5"}',
+            'full-access',
+            'default',
+            NULL,
+            NULL,
+            ${factoryTurnId},
+            '2026-07-18T01:00:03.000Z',
+            '2026-07-18T01:00:03.000Z',
+            NULL,
+            NULL,
+            ${privateParentThreadId}
+          ),
+          (
+            ${factoryArchivedChildThreadId},
+            ${factoryProjectId},
+            'Factory archived reference child',
+            '{"instanceId":"codex","model":"gpt-5.5"}',
+            'full-access',
+            'default',
+            NULL,
+            NULL,
+            NULL,
+            '2026-07-18T01:00:04.000Z',
+            '2026-07-18T01:00:04.000Z',
+            '2026-07-18T01:00:05.000Z',
+            NULL,
+            ${privateParentThreadId}
+          )
+      `;
+      yield* sql`
+        INSERT INTO projection_turns (
+          thread_id,
+          turn_id,
+          pending_message_id,
+          source_proposed_plan_thread_id,
+          source_proposed_plan_id,
+          assistant_message_id,
+          state,
+          requested_at,
+          started_at,
+          completed_at,
+          checkpoint_turn_count,
+          checkpoint_ref,
+          checkpoint_status,
+          checkpoint_files_json
+        )
+        VALUES (
+          ${factoryChildThreadId},
+          ${factoryTurnId},
+          NULL,
+          ${privateParentThreadId},
+          'plan-reference-redaction-private',
+          NULL,
+          'completed',
+          '2026-07-18T01:00:06.000Z',
+          '2026-07-18T01:00:06.000Z',
+          '2026-07-18T01:00:07.000Z',
+          NULL,
+          NULL,
+          NULL,
+          '[]'
+        )
+      `;
+      yield* sql`
+        INSERT INTO projection_thread_proposed_plans (
+          plan_id,
+          thread_id,
+          turn_id,
+          plan_markdown,
+          implemented_at,
+          implementation_thread_id,
+          created_at,
+          updated_at
+        )
+        VALUES (
+          'plan-reference-redaction-factory',
+          ${factoryChildThreadId},
+          ${factoryTurnId},
+          '# Implement privately',
+          '2026-07-18T01:00:08.000Z',
+          ${privateParentThreadId},
+          '2026-07-18T01:00:08.000Z',
+          '2026-07-18T01:00:08.000Z'
+        )
+      `;
+      yield* sql`
+        INSERT INTO projection_thread_activities (
+          activity_id,
+          thread_id,
+          turn_id,
+          tone,
+          kind,
+          summary,
+          payload_json,
+          created_at
+        )
+        VALUES (
+          'activity-reference-redaction-child',
+          ${factoryChildThreadId},
+          ${factoryTurnId},
+          'info',
+          'subagent.completed',
+          ${`Sub-agent ${privateParentThreadId} completed`},
+          ${encodeUnknownJsonString({
+            childThreadId: privateParentThreadId,
+            status: "completed",
+            error: null,
+          })},
+          '2026-07-18T01:00:09.000Z'
+        )
+      `;
+
+      const asAudience = <A, E, R>(
+        audienceCeiling: "private" | "factory",
+        effect: Effect.Effect<A, E, R>,
+      ) =>
+        effect.pipe(
+          Effect.provideService(EnvironmentAuthenticatedPrincipal, {
+            sessionId: AuthSessionId.make(`reference-redaction-${audienceCeiling}`),
+            subject: `reference-redaction-${audienceCeiling}`,
+            method: "bearer-access-token",
+            scopes: new Set([AuthOrchestrationReadScope]),
+            audienceCeiling,
+          }),
+        );
+      const threadById = <A extends { readonly id: ThreadId }>(
+        rows: ReadonlyArray<A>,
+        threadId: ThreadId,
+      ): A => {
+        const row = rows.find((candidate) => candidate.id === threadId);
+        assert.isDefined(row);
+        return row;
+      };
+
+      const factoryShell = yield* asAudience("factory", snapshotQuery.getShellSnapshot());
+      const factoryShellChild = threadById(factoryShell.threads, factoryChildThreadId);
+      assert.equal(factoryShellChild.parentThreadId, null);
+      assert.equal(factoryShellChild.parentEnvironmentId, null);
+      assert.isUndefined(factoryShellChild.latestTurn?.sourceProposedPlan);
+
+      const factoryArchivedShell = yield* asAudience(
+        "factory",
+        snapshotQuery.getArchivedShellSnapshot(),
+      );
+      assert.equal(
+        threadById(factoryArchivedShell.threads, factoryArchivedChildThreadId).parentThreadId,
+        null,
+      );
+
+      const factorySnapshot = yield* asAudience("factory", snapshotQuery.getSnapshot());
+      const factorySnapshotChild = threadById(factorySnapshot.threads, factoryChildThreadId);
+      assert.equal(factorySnapshotChild.parentThreadId, null);
+      assert.isUndefined(factorySnapshotChild.latestTurn?.sourceProposedPlan);
+
+      const factoryShellLookup = Option.getOrThrow(
+        yield* asAudience("factory", snapshotQuery.getThreadShellById(factoryChildThreadId)),
+      );
+      assert.equal(factoryShellLookup.parentThreadId, null);
+      assert.isUndefined(factoryShellLookup.latestTurn?.sourceProposedPlan);
+
+      const factoryDetail = Option.getOrThrow(
+        yield* asAudience("factory", snapshotQuery.getThreadDetailById(factoryChildThreadId)),
+      );
+      assert.equal(factoryDetail.parentThreadId, null);
+      assert.isUndefined(factoryDetail.latestTurn?.sourceProposedPlan);
+      assert.isUndefined(factoryDetail.turns[0]?.sourceProposedPlan);
+      assert.equal(factoryDetail.proposedPlans[0]?.implementationThreadId, null);
+      assert.deepEqual(factoryDetail.activities[0]?.payload, {
+        childThreadId: null,
+        status: "completed",
+        error: null,
+      });
+      assert.notInclude(factoryDetail.activities[0]?.summary, privateParentThreadId);
+
+      const privateShell = yield* asAudience("private", snapshotQuery.getShellSnapshot());
+      const privateShellChild = threadById(privateShell.threads, factoryChildThreadId);
+      assert.equal(privateShellChild.parentThreadId, privateParentThreadId);
+      assert.equal(
+        privateShellChild.latestTurn?.sourceProposedPlan?.threadId,
+        privateParentThreadId,
+      );
+
+      const privateDetail = Option.getOrThrow(
+        yield* asAudience("private", snapshotQuery.getThreadDetailById(factoryChildThreadId)),
+      );
+      assert.equal(privateDetail.parentThreadId, privateParentThreadId);
+      assert.equal(privateDetail.latestTurn?.sourceProposedPlan?.threadId, privateParentThreadId);
+      assert.equal(privateDetail.turns[0]?.sourceProposedPlan?.threadId, privateParentThreadId);
+      assert.equal(privateDetail.proposedPlans[0]?.implementationThreadId, privateParentThreadId);
+      assert.deepEqual(privateDetail.activities[0]?.payload, {
+        childThreadId: privateParentThreadId,
+        status: "completed",
+        error: null,
+      });
+      assert.include(privateDetail.activities[0]?.summary, privateParentThreadId);
+    }),
   );
 
   it.effect("exposes thread audience only through its parent project", () =>

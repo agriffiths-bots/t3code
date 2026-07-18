@@ -37,6 +37,11 @@ export interface ProjectionSnapshotSequence {
   readonly snapshotSequence: number;
 }
 
+export interface ProjectionThreadShellSnapshot {
+  readonly snapshotSequence: number;
+  readonly thread: Option.Option<OrchestrationThreadShell>;
+}
+
 export interface ProjectionThreadCheckpointContext {
   readonly threadId: ThreadId;
   readonly projectId: ProjectId;
@@ -191,6 +196,15 @@ export interface ProjectionSnapshotQueryShape {
   readonly getThreadShellByIdIncludingArchived: (
     threadId: ThreadId,
   ) => Effect.Effect<Option.Option<OrchestrationThreadShell>, ProjectionRepositoryError>;
+
+  /**
+   * Read a single non-deleted thread shell and the projection snapshot sequence
+   * from one consistent transaction. The thread remains audience-scoped, while
+   * the sequence is the global projection watermark.
+   */
+  readonly getThreadShellSnapshotByIdIncludingArchived: (
+    threadId: ThreadId,
+  ) => Effect.Effect<ProjectionThreadShellSnapshot, ProjectionRepositoryError>;
 
   /**
    * Read a single non-deleted thread detail snapshot by id. Archived threads are

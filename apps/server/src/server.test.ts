@@ -1067,6 +1067,21 @@ const buildAppUnderTest = (options?: {
           getProjectShellById: () => Effect.succeed(Option.none()),
           getThreadShellById: () => Effect.succeed(Option.none()),
           getThreadShellByIdIncludingArchived: () => Effect.succeed(Option.none()),
+          getThreadShellSnapshotByIdIncludingArchived: (threadId) =>
+            Effect.all({
+              thread:
+                options?.layers?.projectionSnapshotQuery?.getThreadShellByIdIncludingArchived?.(
+                  threadId,
+                ) ?? Effect.succeed(Option.none()),
+              projection:
+                options?.layers?.projectionSnapshotQuery?.getSnapshotSequence?.() ??
+                Effect.succeed({ snapshotSequence: 0 }),
+            }).pipe(
+              Effect.map(({ thread, projection }) => ({
+                snapshotSequence: projection.snapshotSequence,
+                thread,
+              })),
+            ),
           getThreadDetailById: () => Effect.succeed(Option.none()),
           getThreadDetailSnapshot: () => Effect.succeed(Option.none()),
           getCounts: () => Effect.succeed({ projectCount: 0, threadCount: 0 }),
@@ -2477,15 +2492,25 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
 
   it.effect("serves a lightweight authenticated thread revision marker", () =>
     Effect.gen(function* () {
+      let projectionSequence = 0;
+      let latestStoreSequence = 0;
       yield* buildAppUnderTest({
         layers: {
           projectionSnapshotQuery: {
-            getThreadShellByIdIncludingArchived: (threadId) =>
-              Effect.succeed(
-                threadId === defaultThreadId
-                  ? Option.some(makeDefaultOrchestrationThreadShell())
-                  : Option.none(),
-              ),
+            getSnapshotSequence: () => Effect.succeed({ snapshotSequence: projectionSequence }),
+            getThreadShellSnapshotByIdIncludingArchived: (threadId) =>
+              Effect.sync(() => {
+                const snapshotSequence = projectionSequence;
+                const thread =
+                  threadId === defaultThreadId
+                    ? Option.some(makeDefaultOrchestrationThreadShell())
+                    : Option.none();
+                projectionSequence = latestStoreSequence;
+                return { snapshotSequence, thread };
+              }),
+          },
+          orchestrationEventStore: {
+            getLatestSequence: () => Effect.succeed(latestStoreSequence),
           },
         },
       });
@@ -2507,13 +2532,43 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
         projectionSequence: 0,
       });
 
-      const missingResponse = yield* fetchEffect(
-        yield* getHttpServerUrl("/api/orchestration/threads/thread-missing/revision"),
-        { headers: { cookie } },
-      );
-      const missingBody = yield* responseJsonEffect<{ readonly reason: string }>(missingResponse);
-      assert.equal(missingResponse.status, 404);
-      assert.equal(missingBody.reason, "thread_not_found");
+      const missingThreadScenarios = [
+        {
+          name: "lagging projection",
+          projectionSequence: 0,
+          latestStoreSequence: 1,
+          status: 500,
+          tag: "EnvironmentInternalError",
+          code: "internal_error",
+          reason: "orchestration_thread_revision_failed",
+        },
+        {
+          name: "caught-up projection",
+          projectionSequence: 1,
+          latestStoreSequence: 1,
+          status: 404,
+          tag: "EnvironmentResourceNotFoundError",
+          code: "not_found",
+          reason: "thread_not_found",
+        },
+      ] as const;
+      for (const scenario of missingThreadScenarios) {
+        projectionSequence = scenario.projectionSequence;
+        latestStoreSequence = scenario.latestStoreSequence;
+        const response = yield* fetchEffect(
+          yield* getHttpServerUrl("/api/orchestration/threads/thread-missing/revision"),
+          { headers: { cookie } },
+        );
+        const body = yield* responseJsonEffect<{
+          readonly _tag: string;
+          readonly code: string;
+          readonly reason: string;
+        }>(response);
+        assert.equal(response.status, scenario.status, scenario.name);
+        assert.equal(body._tag, scenario.tag, scenario.name);
+        assert.equal(body.code, scenario.code, scenario.name);
+        assert.equal(body.reason, scenario.reason, scenario.name);
+      }
     }).pipe(Effect.provide(NodeHttpServer.layerTest)),
   );
 

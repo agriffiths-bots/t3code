@@ -94,6 +94,26 @@ describe("thread revision HTTP loader", () => {
     }),
   );
 
+  it.effect("classifies a transient revision endpoint failure as unavailable", () =>
+    Effect.gen(function* () {
+      const result = yield* loadRevisionWith(() =>
+        Promise.resolve(
+          Response.json(
+            {
+              _tag: "EnvironmentInternalError",
+              code: "internal_error",
+              reason: "orchestration_thread_revision_failed",
+              traceId: "trace-revision-projection-lag",
+            },
+            { status: 500 },
+          ),
+        ),
+      );
+
+      expect(result).toEqual({ kind: "unavailable" });
+    }),
+  );
+
   it.effect("classifies a transient fetch failure as unavailable", () =>
     Effect.gen(function* () {
       const result = yield* loadRevisionWith(() =>
