@@ -1,0 +1,44 @@
+# dseg slice 7 command guard plan
+
+## Intent
+
+Authorize orchestration mutations at the engine dispatch boundary against the target project's `dataAudience` and the caller's `audienceCeiling`. Bind `project.create` to the caller ceiling so factory-ceiling callers create factory projects, while private-ceiling callers keep the current private default.
+
+## Blast radius
+
+- `apps/server/src/orchestration/Layers/OrchestrationEngine.ts`: central serialized dispatch, receipt handling, event commit, and PubSub emission.
+- `apps/server/src/orchestration/Services/OrchestrationEngine.ts`: dispatch signatures and the coordinated-dispatch helper used by bootstrap/internal flows; every dispatch must supply either session authority or explicit trusted-system authority.
+- `packages/contracts/src/orchestration.ts`: project-create command/event schema if an internal `dataAudience` binding field is required.
+- `apps/server/src/orchestration/decider.ts`: project-created payload source for the bound audience.
+- `apps/server/src/orchestration/http.ts` and `apps/server/src/ws.ts`: pass authenticated session audience into dispatch; preserve existing scope checks.
+- `apps/server/src/orchestration/Services/BootstrapTurnStartDispatcher.ts`: pass the same audience context through bootstrap-created thread and final turn commands so bootstrap is not a bypass.
+- `apps/server/src/orchestration/Layers/OrchestrationEngine.test.ts`: command-guard regression matrix, create binding, no receipt/event side effects.
+- Consumers that could break: provider/session reactors using internal dispatch, scheduled task dispatch, MCP/subagent/thread tool dispatch, project CLI offline dispatch, startup bootstrap, projection readers, command receipts, event subscriptions, restart bootstrap from persisted projections.
+- Out of scope: read-query filters, event/stream filtering, assets/filesystem, terminal/preview/review/MCP allowlists, and broad auth scope policy.
+
+## Edge-case matrix and red-first tests
+
+| Edge                                                                 | Expected behavior                                                                                                                                                 | Red-first test                                                                                            |
+| -------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------- |
+| Factory caller mutates existing private project                      | Reject with the same client shape as a missing project; no receipt, event, projection, or PubSub emission.                                                        | `rejects factory-ceiling project commands against private targets atomically`                             |
+| Factory caller mutates existing private thread                       | Reject with the same client shape as a missing thread; no receipt, event, projection, or PubSub emission.                                                         | `rejects factory-ceiling thread commands against private targets atomically`                              |
+| Factory caller creates a thread under a private project              | Reject as missing parent project; no thread event/row.                                                                                                            | Covered in the table-driven command suite.                                                                |
+| Factory caller starts a bootstrap turn under a private project       | Reject before thread create/worktree/turn side effects; cleanup path must not be required.                                                                        | `passes command audience through bootstrap dispatch`                                                      |
+| Factory caller creates a project                                     | Persist `project.created.payload.dataAudience === "factory"` and projected project audience is factory.                                                           | `binds project creation audience to the caller ceiling`                                                   |
+| Private caller creates or mutates any audience                       | Current behavior remains unrestricted; standard project creation stays private.                                                                                   | Existing engine tests plus `keeps private-ceiling project creation private` if schema binding is touched. |
+| Target project/thread does not exist                                 | Fail closed before decision side effects; no rejected receipt is written by the guard.                                                                            | `rejects unknown command target audience without recording a receipt`                                     |
+| Target command type is new/unclassified                              | Fail closed instead of defaulting to private or factory.                                                                                                          | `rejects an unclassified mutation command target audience` via the guard helper.                          |
+| Dispatch caller omits authority                                      | Fail closed at compile/runtime instead of treating omission as unrestricted.                                                                                      | `requires explicit dispatch authority`                                                                    |
+| `thread.parent.set` links a factory target to a private local parent | Reject as missing parent thread and emit no parent-set event.                                                                                                     | `rejects cross-audience local parent links`                                                               |
+| `thread.turn.start.sourceProposedPlan` points at a private source    | Reject before the decider can leak plan/project relationship.                                                                                                     | Covered in the table if time permits; otherwise memo as uncovered.                                        |
+| Duplicate/replay of a forbidden command id                           | Still rejected without accepted/rejected receipt, so replay does not gain idempotent acceptance or leak target state.                                             | Assert the command receipt remains absent after forbidden dispatch.                                       |
+| Crash-between-steps                                                  | Guard runs before event append/projection transaction; no cleanup is needed for rejected commands.                                                                | Atomicity assertions on events/receipts/projections.                                                      |
+| Same-timestamp ties                                                  | Audience is read from current read model, not timestamps, so ordering is dispatch-queue order only.                                                               | Existing serialized dispatch tests plus table sequence checks.                                            |
+| Version skew                                                         | Missing project/thread `dataAudience` decodes private by existing defaults; factory callers therefore cannot mutate legacy rows.                                  | Covered by default-private seeded rows.                                                                   |
+| Concurrency                                                          | Guard executes inside the serialized envelope using the current command read model, so prior queued mutations are visible before the next authorization decision. | `authorizes using the serialized read model after an audience change` if time permits.                    |
+
+## Smallest-change argument
+
+Add one server-side command-audience guard module and call it once from `processEnvelope` before receipt lookup/decider/event commit. Replace implicit dispatch authority with an explicit union: authenticated session authority carries `audienceCeiling`, and genuinely server-owned continuations must pass a named trusted-system authority with a reason. Public HTTP/WS/bootstrap callers thread their authenticated session authority through; internal reactors/CLI/startup paths are updated deliberately instead of inheriting privilege by omission, keeping the PR to mutation authorization only.
+
+Self-approved for implementation.
