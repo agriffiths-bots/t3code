@@ -1363,6 +1363,225 @@ describe("ClaudeAdapterLive", () => {
     );
   });
 
+  it.effect("records an omitted-parent effective model with multi-model usage", () => {
+    const harness = makeHarness();
+    return Effect.gen(function* () {
+      const adapter = yield* ClaudeAdapter;
+      const requestedModel = createModelSelection(
+        ProviderInstanceId.make("claudeAgent"),
+        "claude-fable-5",
+      );
+      const runtimeEventsFiber = yield* Stream.takeUntil(
+        adapter.streamEvents,
+        (event) => event.type === "turn.completed",
+      ).pipe(Stream.runCollect, Effect.forkChild);
+
+      const session = yield* adapter.startSession({
+        threadId: THREAD_ID,
+        provider: ProviderDriverKind.make("claudeAgent"),
+        modelSelection: requestedModel,
+        runtimeMode: "full-access",
+      });
+      yield* adapter.sendTurn({
+        threadId: session.threadId,
+        input: "hello",
+        attachments: [],
+        modelSelection: requestedModel,
+      });
+
+      harness.query.emit({
+        type: "assistant",
+        session_id: "sdk-session-effective-model-rerouted",
+        uuid: "assistant-effective-model-rerouted",
+        message: {
+          id: "assistant-message-effective-model-rerouted",
+          model: "claude-opus-4-8",
+          content: [{ type: "text", text: "Rerouted answer" }],
+        },
+      } as unknown as SDKMessage);
+      harness.query.emit({
+        type: "result",
+        subtype: "success",
+        is_error: false,
+        errors: [],
+        result: "Rerouted answer",
+        session_id: "sdk-session-effective-model-rerouted",
+        uuid: "result-effective-model-rerouted",
+        modelUsage: {
+          "claude-opus-4-8": {
+            contextWindow: 1_000_000,
+            maxOutputTokens: 128_000,
+          },
+          "claude-sonnet-5": {
+            contextWindow: 200_000,
+            maxOutputTokens: 64_000,
+          },
+        },
+      } as unknown as SDKMessage);
+      harness.query.finish();
+
+      const runtimeEvents = Array.from(yield* Fiber.join(runtimeEventsFiber));
+      const completed = runtimeEvents.find((event) => event.type === "turn.completed");
+      assert.equal(completed?.type, "turn.completed");
+      if (completed?.type === "turn.completed") {
+        assert.equal(
+          (completed.payload as { readonly effectiveModel?: string }).effectiveModel,
+          "claude-opus-4-8",
+        );
+      }
+    }).pipe(
+      Effect.provideService(Random.Random, makeDeterministicRandomService()),
+      Effect.provide(harness.layer),
+    );
+  });
+
+  it.effect("omits the effective model when only a nested subagent uses another model", () => {
+    const harness = makeHarness();
+    return Effect.gen(function* () {
+      const adapter = yield* ClaudeAdapter;
+      const requestedModel = createModelSelection(
+        ProviderInstanceId.make("claudeAgent"),
+        "claude-fable-5",
+      );
+      const runtimeEventsFiber = yield* Stream.takeUntil(
+        adapter.streamEvents,
+        (event) => event.type === "turn.completed",
+      ).pipe(Stream.runCollect, Effect.forkChild);
+
+      const session = yield* adapter.startSession({
+        threadId: THREAD_ID,
+        provider: ProviderDriverKind.make("claudeAgent"),
+        modelSelection: requestedModel,
+        runtimeMode: "full-access",
+      });
+      yield* adapter.sendTurn({
+        threadId: session.threadId,
+        input: "hello",
+        attachments: [],
+        modelSelection: requestedModel,
+      });
+
+      harness.query.emit({
+        type: "assistant",
+        session_id: "sdk-session-effective-model-matched",
+        uuid: "assistant-effective-model-matched",
+        parent_tool_use_id: null,
+        message: {
+          id: "assistant-message-effective-model-matched",
+          model: "claude-fable-5",
+          content: [{ type: "text", text: "Requested-model answer" }],
+        },
+      } as unknown as SDKMessage);
+      harness.query.emit({
+        type: "assistant",
+        session_id: "sdk-session-effective-model-matched",
+        uuid: "assistant-effective-model-subagent",
+        parent_tool_use_id: "tool-use-subagent",
+        message: {
+          id: "assistant-message-effective-model-subagent",
+          model: "claude-opus-4-8",
+          content: [{ type: "text", text: "Subagent work" }],
+        },
+      } as unknown as SDKMessage);
+      harness.query.emit({
+        type: "result",
+        subtype: "success",
+        is_error: false,
+        errors: [],
+        result: "Requested-model answer",
+        session_id: "sdk-session-effective-model-matched",
+        uuid: "result-effective-model-matched",
+        modelUsage: {
+          "claude-fable-5": {
+            contextWindow: 200_000,
+            maxOutputTokens: 64_000,
+          },
+          "claude-opus-4-8": {
+            contextWindow: 1_000_000,
+            maxOutputTokens: 128_000,
+          },
+        },
+      } as unknown as SDKMessage);
+      harness.query.finish();
+
+      const runtimeEvents = Array.from(yield* Fiber.join(runtimeEventsFiber));
+      const completed = runtimeEvents.find((event) => event.type === "turn.completed");
+      assert.equal(completed?.type, "turn.completed");
+      if (completed?.type === "turn.completed") {
+        assert.equal(
+          (completed.payload as { readonly effectiveModel?: string }).effectiveModel,
+          undefined,
+        );
+      }
+    }).pipe(
+      Effect.provideService(Random.Random, makeDeterministicRandomService()),
+      Effect.provide(harness.layer),
+    );
+  });
+
+  it.effect("omits the effective model for equivalent Claude aliases and versioned ids", () => {
+    const harness = makeHarness();
+    return Effect.gen(function* () {
+      const adapter = yield* ClaudeAdapter;
+      const requestedModel = createModelSelection(ProviderInstanceId.make("claudeAgent"), "opus");
+      const runtimeEventsFiber = yield* Stream.takeUntil(
+        adapter.streamEvents,
+        (event) => event.type === "turn.completed",
+      ).pipe(Stream.runCollect, Effect.forkChild);
+
+      const session = yield* adapter.startSession({
+        threadId: THREAD_ID,
+        provider: ProviderDriverKind.make("claudeAgent"),
+        modelSelection: requestedModel,
+        runtimeMode: "full-access",
+      });
+      yield* adapter.sendTurn({
+        threadId: session.threadId,
+        input: "hello",
+        attachments: [],
+        modelSelection: requestedModel,
+      });
+
+      harness.query.emit({
+        type: "assistant",
+        session_id: "sdk-session-effective-model-alias",
+        uuid: "assistant-effective-model-alias",
+        parent_tool_use_id: null,
+        message: {
+          id: "assistant-message-effective-model-alias",
+          model: "claude-opus-4-8-20260718",
+          content: [{ type: "text", text: "Alias answer" }],
+        },
+      } as unknown as SDKMessage);
+      harness.query.emit({
+        type: "result",
+        subtype: "success",
+        is_error: false,
+        errors: [],
+        result: "Alias answer",
+        session_id: "sdk-session-effective-model-alias",
+        uuid: "result-effective-model-alias",
+        modelUsage: {
+          "claude-opus-4-8-20260718": {
+            contextWindow: 1_000_000,
+            maxOutputTokens: 128_000,
+          },
+        },
+      } as unknown as SDKMessage);
+      harness.query.finish();
+
+      const runtimeEvents = Array.from(yield* Fiber.join(runtimeEventsFiber));
+      const completed = runtimeEvents.find((event) => event.type === "turn.completed");
+      assert.equal(completed?.type, "turn.completed");
+      if (completed?.type === "turn.completed") {
+        assert.equal(completed.payload.effectiveModel, undefined);
+      }
+    }).pipe(
+      Effect.provideService(Random.Random, makeDeterministicRandomService()),
+      Effect.provide(harness.layer),
+    );
+  });
+
   it.effect("completes a detached active turn from an owned task-notification result", () => {
     const harness = makeHarness();
     return Effect.gen(function* () {

@@ -22,7 +22,7 @@ import * as Ref from "effect/Ref";
 import * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
 import type { OpencodeClient, Part, PermissionRequest, QuestionRequest } from "@opencode-ai/sdk/v2";
-import { getModelSelectionStringOptionValue } from "@t3tools/shared/model";
+import { getModelSelectionStringOptionValue, normalizeModelSlug } from "@t3tools/shared/model";
 
 import { resolveAttachmentPath } from "../../attachmentStore.ts";
 import { ServerConfig } from "../../config.ts";
@@ -52,6 +52,28 @@ import {
 import * as Option from "effect/Option";
 
 const PROVIDER = ProviderDriverKind.make("opencode");
+const CLAUDE_PROVIDER = ProviderDriverKind.make("claudeAgent");
+
+function comparableOpenCodeModel(value: string): string {
+  const separatorIndex = value.indexOf("/");
+  if (separatorIndex <= 0) return value;
+  const providerId = value.slice(0, separatorIndex).toLowerCase();
+  const modelId = value.slice(separatorIndex + 1);
+  if (providerId !== "anthropic") return value;
+  const normalizedModel = normalizeModelSlug(modelId, CLAUDE_PROVIDER) ?? modelId;
+  return `${providerId}/${normalizedModel.toLowerCase().replace(/-\d{8}$/u, "")}`;
+}
+
+function divergentOpenCodeEffectiveModel(
+  requestedModel: string | undefined,
+  effectiveModel: string | undefined,
+): string | undefined {
+  return requestedModel &&
+    effectiveModel &&
+    comparableOpenCodeModel(requestedModel) !== comparableOpenCodeModel(effectiveModel)
+    ? effectiveModel
+    : undefined;
+}
 
 interface OpenCodeTurnSnapshot {
   readonly id: TurnId;
@@ -80,6 +102,8 @@ interface OpenCodeSessionContext {
   readonly turns: Array<OpenCodeTurnSnapshot>;
   readonly mcpProviderSessionId?: string;
   activeTurnId: TurnId | undefined;
+  activeRequestedModel: string | undefined;
+  activeEffectiveModel: string | undefined;
   activeAgent: string | undefined;
   activeVariant: string | undefined;
   /**
@@ -673,6 +697,17 @@ export function makeOpenCodeAdapter(
         case "message.updated": {
           context.messageRoleById.set(event.properties.info.id, event.properties.info.role);
           if (event.properties.info.role === "assistant") {
+            const providerId =
+              typeof event.properties.info.providerID === "string"
+                ? event.properties.info.providerID.trim()
+                : "";
+            const modelId =
+              typeof event.properties.info.modelID === "string"
+                ? event.properties.info.modelID.trim()
+                : "";
+            if (providerId.length > 0 && modelId.length > 0) {
+              context.activeEffectiveModel = `${providerId}/${modelId}`;
+            }
             for (const part of context.partById.values()) {
               if (part.messageID !== event.properties.info.id) {
                 continue;
@@ -902,7 +937,13 @@ export function makeOpenCodeAdapter(
           }
 
           if (event.properties.status.type === "idle" && turnId) {
+            const effectiveModel = divergentOpenCodeEffectiveModel(
+              context.activeRequestedModel,
+              context.activeEffectiveModel,
+            );
             context.activeTurnId = undefined;
+            context.activeRequestedModel = undefined;
+            context.activeEffectiveModel = undefined;
             yield* updateProviderSession(context, { status: "ready" }, { clearActiveTurnId: true });
             yield* emit({
               ...(yield* buildEventBase({
@@ -913,6 +954,7 @@ export function makeOpenCodeAdapter(
               type: "turn.completed",
               payload: {
                 state: "completed",
+                ...(effectiveModel ? { effectiveModel } : {}),
               },
             });
           }
@@ -922,7 +964,13 @@ export function makeOpenCodeAdapter(
         case "session.error": {
           const message = sessionErrorMessage(event.properties.error);
           const activeTurnId = context.activeTurnId;
+          const effectiveModel = divergentOpenCodeEffectiveModel(
+            context.activeRequestedModel,
+            context.activeEffectiveModel,
+          );
           context.activeTurnId = undefined;
+          context.activeRequestedModel = undefined;
+          context.activeEffectiveModel = undefined;
           yield* updateProviderSession(
             context,
             {
@@ -941,6 +989,7 @@ export function makeOpenCodeAdapter(
               type: "turn.completed",
               payload: {
                 state: "failed",
+                ...(effectiveModel ? { effectiveModel } : {}),
                 errorMessage: message,
               },
             });
@@ -1144,6 +1193,8 @@ export function makeOpenCodeAdapter(
           turns: [],
           ...(mcpSession ? { mcpProviderSessionId: mcpSession.providerSessionId } : {}),
           activeTurnId: undefined,
+          activeRequestedModel: undefined,
+          activeEffectiveModel: undefined,
           activeAgent: undefined,
           activeVariant: undefined,
           stopped: yield* Ref.make(false),
@@ -1218,8 +1269,12 @@ export function makeOpenCodeAdapter(
 
       const agent = getModelSelectionStringOptionValue(modelSelection, "agent");
       const variant = getModelSelectionStringOptionValue(modelSelection, "variant");
+      const previousRequestedModel = context.activeRequestedModel;
+      const previousEffectiveModel = context.activeEffectiveModel;
 
       context.activeTurnId = turnId;
+      context.activeRequestedModel = modelSelection?.model ?? context.session.model;
+      context.activeEffectiveModel = undefined;
       context.activeAgent = agent ?? (input.interactionMode === "plan" ? "plan" : undefined);
       context.activeVariant = variant;
       yield* updateProviderSession(
@@ -1260,9 +1315,14 @@ export function makeOpenCodeAdapter(
         // steer leaves the still-running original turn untouched.
         Effect.tapError((requestError) =>
           steeringTurnId !== undefined
-            ? Effect.void
+            ? Effect.sync(() => {
+                context.activeRequestedModel = previousRequestedModel;
+                context.activeEffectiveModel = previousEffectiveModel;
+              })
             : Effect.gen(function* () {
                 context.activeTurnId = undefined;
+                context.activeRequestedModel = undefined;
+                context.activeEffectiveModel = undefined;
                 context.activeAgent = undefined;
                 context.activeVariant = undefined;
                 yield* updateProviderSession(

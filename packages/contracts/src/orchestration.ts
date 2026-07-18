@@ -349,6 +349,7 @@ export const OrchestrationLatestTurn = Schema.Struct({
   startedAt: Schema.NullOr(IsoDateTime),
   completedAt: Schema.NullOr(IsoDateTime),
   assistantMessageId: Schema.NullOr(MessageId),
+  effectiveModel: Schema.optional(TrimmedNonEmptyString),
   sourceProposedPlan: Schema.optional(SourceProposedPlanReference),
 });
 export type OrchestrationLatestTurn = typeof OrchestrationLatestTurn.Type;
@@ -965,6 +966,15 @@ const ThreadTurnDiffCompleteCommand = Schema.Struct({
   createdAt: IsoDateTime,
 });
 
+const ThreadTurnEffectiveModelSetCommand = Schema.Struct({
+  type: Schema.Literal("thread.turn.effective-model.set"),
+  commandId: CommandId,
+  threadId: ThreadId,
+  turnId: TurnId,
+  effectiveModel: TrimmedNonEmptyString,
+  createdAt: IsoDateTime,
+});
+
 const ThreadActivityAppendCommand = Schema.Struct({
   type: Schema.Literal("thread.activity.append"),
   commandId: CommandId,
@@ -987,6 +997,7 @@ const InternalOrchestrationCommand = Schema.Union([
   ThreadMessageAssistantCompleteCommand,
   ThreadProposedPlanUpsertCommand,
   ThreadTurnDiffCompleteCommand,
+  ThreadTurnEffectiveModelSetCommand,
   ThreadActivityAppendCommand,
   ThreadRevertCompleteCommand,
   ThreadParentSetCommand,
@@ -1023,6 +1034,7 @@ export const OrchestrationEventType = Schema.Literals([
   "thread.session-set",
   "thread.proposed-plan-upserted",
   "thread.turn-diff-completed",
+  "thread.turn-effective-model-set",
   "thread.activity-appended",
   "thread.parent-set",
 ]);
@@ -1214,6 +1226,12 @@ export const ThreadTurnDiffCompletedPayload = Schema.Struct({
   completedAt: IsoDateTime,
 });
 
+export const ThreadTurnEffectiveModelSetPayload = Schema.Struct({
+  threadId: ThreadId,
+  turnId: TurnId,
+  effectiveModel: TrimmedNonEmptyString,
+});
+
 export const ThreadActivityAppendedPayload = Schema.Struct({
   threadId: ThreadId,
   activity: OrchestrationThreadActivity,
@@ -1357,6 +1375,11 @@ export const OrchestrationEvent = Schema.Union([
     ...EventBaseFields,
     type: Schema.Literal("thread.turn-diff-completed"),
     payload: ThreadTurnDiffCompletedPayload,
+  }),
+  Schema.Struct({
+    ...EventBaseFields,
+    type: Schema.Literal("thread.turn-effective-model-set"),
+    payload: ThreadTurnEffectiveModelSetPayload,
   }),
   Schema.Struct({
     ...EventBaseFields,

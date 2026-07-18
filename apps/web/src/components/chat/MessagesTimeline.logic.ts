@@ -92,7 +92,7 @@ export interface TimelineDurationMessage {
 
 export type TimelineLatestTurn = Pick<
   OrchestrationLatestTurn,
-  "turnId" | "state" | "startedAt" | "completedAt"
+  "turnId" | "state" | "startedAt" | "completedAt" | "effectiveModel"
 > &
   Partial<Pick<OrchestrationLatestTurn, "assistantMessageId">>;
 
@@ -129,6 +129,7 @@ export type MessagesTimelineRow =
       showAssistantMeta: boolean;
       showAssistantCopyButton: boolean;
       assistantCopyStreaming: boolean;
+      effectiveModel?: string | undefined;
       assistantTurnDiffSummary?: TurnDiffSummary | undefined;
       revertTurnCount?: number | undefined;
     }
@@ -646,6 +647,15 @@ export function deriveMessagesTimelineRows(input: {
     input.timelineEntries,
     explicitFinalAssistantBoundariesByTurnId,
   );
+  const effectiveModelByTurnId = new Map<string, string>();
+  for (const turn of input.turns ?? []) {
+    if (turn.effectiveModel) {
+      effectiveModelByTurnId.set(String(turn.turnId), turn.effectiveModel);
+    }
+  }
+  if (input.latestTurn?.effectiveModel) {
+    effectiveModelByTurnId.set(String(input.latestTurn.turnId), input.latestTurn.effectiveModel);
+  }
   const terminalNullTurnAssistantMessageIds = deriveTerminalNullTurnAssistantMessageIds(
     input.timelineEntries,
   );
@@ -792,6 +802,10 @@ export function deriveMessagesTimelineRows(input: {
       showAssistantMeta,
       showAssistantCopyButton: showAssistantMeta,
       assistantCopyStreaming: timelineEntry.message.streaming || assistantTurnStillInProgress,
+      effectiveModel:
+        isFinalAssistantMessage && timelineEntry.message.turnId !== null
+          ? effectiveModelByTurnId.get(String(timelineEntry.message.turnId))
+          : undefined,
       assistantTurnDiffSummary:
         timelineEntry.message.role === "assistant"
           ? (input.turnDiffSummaryByAssistantMessageId.get(timelineEntry.message.id) ??
@@ -874,6 +888,7 @@ function isRowUnchanged(a: MessagesTimelineRow, b: MessagesTimelineRow): boolean
         a.showAssistantMeta === bm.showAssistantMeta &&
         a.showAssistantCopyButton === bm.showAssistantCopyButton &&
         a.assistantCopyStreaming === bm.assistantCopyStreaming &&
+        a.effectiveModel === bm.effectiveModel &&
         a.assistantTurnDiffSummary === bm.assistantTurnDiffSummary &&
         a.revertTurnCount === bm.revertTurnCount
       );

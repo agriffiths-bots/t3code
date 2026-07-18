@@ -60,6 +60,7 @@ import {
   ZapIcon,
 } from "lucide-react";
 import { Button } from "../ui/button";
+import { Badge } from "../ui/badge";
 import { buildExpandedImagePreview, ExpandedImagePreview } from "./ExpandedImagePreview";
 import { ProposedPlanCard } from "./ProposedPlanCard";
 import { ChangedFilesTree } from "./ChangedFilesTree";
@@ -1077,21 +1078,28 @@ function AssistantTimelineRow({ row }: { row: Extract<TimelineRow, { kind: "mess
           onOpenTurnDiff={ctx.onOpenTurnDiff}
         />
         {row.showAssistantMeta ? (
-          <div className="mt-1.5 flex items-center gap-2 text-xs tabular-nums opacity-0 transition-opacity duration-200 focus-within:opacity-100 group-hover/assistant:opacity-100">
-            <AssistantCopyButton row={row} />
-            <AssistantDictateButton row={row} />
-            {!row.message.streaming && (
-              <Tooltip>
-                <TooltipTrigger
-                  render={<p className="text-muted-foreground text-xs tabular-nums" />}
-                >
-                  {formatShortTimestamp(row.message.updatedAt, ctx.timestampFormat)}
-                </TooltipTrigger>
-                <TooltipPopup>
-                  {formatChatTimestampTooltip(row.message.updatedAt, ctx.timestampFormat)}
-                </TooltipPopup>
-              </Tooltip>
-            )}
+          <div className="mt-1.5 flex items-center gap-2 text-xs tabular-nums">
+            {row.effectiveModel ? (
+              <Badge variant="secondary" size="sm">
+                answered by {row.effectiveModel}
+              </Badge>
+            ) : null}
+            <div className="flex items-center gap-2 opacity-0 transition-opacity duration-200 focus-within:opacity-100 group-hover/assistant:opacity-100">
+              <AssistantCopyButton row={row} />
+              <AssistantDictateButton row={row} />
+              {!row.message.streaming && (
+                <Tooltip>
+                  <TooltipTrigger
+                    render={<p className="text-muted-foreground text-xs tabular-nums" />}
+                  >
+                    {formatShortTimestamp(row.message.updatedAt, ctx.timestampFormat)}
+                  </TooltipTrigger>
+                  <TooltipPopup>
+                    {formatChatTimestampTooltip(row.message.updatedAt, ctx.timestampFormat)}
+                  </TooltipPopup>
+                </Tooltip>
+              )}
+            </div>
           </div>
         ) : null}
       </div>

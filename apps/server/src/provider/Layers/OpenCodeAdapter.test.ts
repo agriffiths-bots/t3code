@@ -61,6 +61,7 @@ const runtimeMock = {
     promptCalls: [] as Array<unknown>,
     promptAsyncError: null as Error | null,
     closeError: null as Error | null,
+    eventStreamGate: null as Promise<void> | null,
     messages: [] as MessageEntry[],
     subscribedEvents: [] as unknown[],
   },
@@ -74,6 +75,7 @@ const runtimeMock = {
     this.state.promptCalls.length = 0;
     this.state.promptAsyncError = null;
     this.state.closeError = null;
+    this.state.eventStreamGate = null;
     this.state.messages = [];
     this.state.subscribedEvents = [];
   },
@@ -161,6 +163,9 @@ const OpenCodeRuntimeTestDouble: OpenCodeRuntimeShape = {
       event: {
         subscribe: async () => ({
           stream: (async function* () {
+            if (runtimeMock.state.eventStreamGate) {
+              await runtimeMock.state.eventStreamGate;
+            }
             for (const event of runtimeMock.state.subscribedEvents) {
               yield event;
             }
@@ -431,6 +436,69 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
       NodeAssert.equal(session?.status, "running");
       NodeAssert.equal(String(session?.activeTurnId), String(turn.turnId));
       NodeAssert.equal(runtimeMock.state.promptCalls.length, 2);
+    }),
+  );
+
+  it.effect("reports the assistant message model when OpenCode reroutes a turn", () =>
+    Effect.gen(function* () {
+      const adapter = yield* OpenCodeAdapter;
+      const threadId = asThreadId("thread-opencode-effective-model");
+      let releaseEvents = () => {};
+      runtimeMock.state.eventStreamGate = new Promise<void>((resolve) => {
+        releaseEvents = resolve;
+      });
+      runtimeMock.state.subscribedEvents = [
+        {
+          type: "message.updated",
+          properties: {
+            sessionID: "http://127.0.0.1:9999/session",
+            info: {
+              id: "assistant-effective-model",
+              role: "assistant",
+              providerID: "anthropic",
+              modelID: "claude-opus-4-8",
+            },
+          },
+        },
+        {
+          type: "session.status",
+          properties: {
+            sessionID: "http://127.0.0.1:9999/session",
+            status: { type: "idle" },
+          },
+        },
+      ];
+      const completedFiber = yield* adapter.streamEvents.pipe(
+        Stream.filter((event) => event.threadId === threadId && event.type === "turn.completed"),
+        Stream.take(1),
+        Stream.runCollect,
+        Effect.forkChild,
+      );
+
+      yield* adapter.startSession({
+        provider: ProviderDriverKind.make("opencode"),
+        threadId,
+        runtimeMode: "full-access",
+      });
+      const turn = yield* adapter.sendTurn({
+        threadId,
+        input: "hello",
+        modelSelection: {
+          instanceId: ProviderInstanceId.make("opencode"),
+          model: "anthropic/claude-fable-5",
+        },
+      });
+      releaseEvents();
+
+      const completedEvents = Array.from(
+        yield* Fiber.join(completedFiber).pipe(Effect.timeout("1 second")),
+      );
+      const completed = completedEvents[0];
+      NodeAssert.equal(completed?.type, "turn.completed");
+      NodeAssert.equal(String(completed?.turnId), String(turn.turnId));
+      if (completed?.type === "turn.completed") {
+        NodeAssert.equal(completed.payload.effectiveModel, "anthropic/claude-opus-4-8");
+      }
     }),
   );
 
