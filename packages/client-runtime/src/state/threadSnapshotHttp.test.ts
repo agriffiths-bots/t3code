@@ -5,7 +5,12 @@ import * as Layer from "effect/Layer";
 
 import { PrimaryConnectionTarget, type PreparedConnection } from "../connection/model.ts";
 import { remoteHttpClientLayer } from "../rpc/http.ts";
-import { ThreadRevisionLoader, threadRevisionLoaderLayer } from "./threadSnapshotHttp.ts";
+import {
+  ThreadRevisionLoader,
+  ThreadSnapshotLoader,
+  threadRevisionLoaderLayer,
+  threadSnapshotLoaderLayer,
+} from "./threadSnapshotHttp.ts";
 
 const THREAD_ID = ThreadId.make("thread-404");
 const TARGET = new PrimaryConnectionTarget({
@@ -31,6 +36,27 @@ const loadRevisionWith = (fetchFn: typeof fetch) =>
     Effect.provide(threadRevisionLoaderLayer.pipe(Layer.provide(remoteHttpClientLayer(fetchFn)))),
   );
 
+const loadSnapshotForReconcileWith = (fetchFn: typeof fetch) =>
+  Effect.gen(function* () {
+    const loader = yield* ThreadSnapshotLoader;
+    return yield* loader.loadForReconcile(PREPARED, THREAD_ID);
+  }).pipe(
+    Effect.provide(threadSnapshotLoaderLayer.pipe(Layer.provide(remoteHttpClientLayer(fetchFn)))),
+  );
+
+const scopeRequiredResponse = () =>
+  Promise.resolve(
+    Response.json(
+      {
+        _tag: "EnvironmentScopeRequiredError",
+        code: "insufficient_scope",
+        requiredScope: "orchestration:read",
+        traceId: "trace-revision-scope-required",
+      },
+      { status: 403 },
+    ),
+  );
+
 describe("thread revision HTTP loader", () => {
   it.effect("classifies a typed thread_not_found 404 as gone", () =>
     Effect.gen(function* () {
@@ -49,6 +75,22 @@ describe("thread revision HTTP loader", () => {
       );
 
       expect(result).toEqual({ kind: "gone" });
+    }),
+  );
+
+  it.effect("forces a scoped snapshot after a typed revision denial", () =>
+    Effect.gen(function* () {
+      const result = yield* loadRevisionWith(scopeRequiredResponse);
+
+      expect(result).toEqual({ kind: "snapshot-required" });
+    }),
+  );
+
+  it.effect("classifies a typed snapshot denial as missing", () =>
+    Effect.gen(function* () {
+      const result = yield* loadSnapshotForReconcileWith(scopeRequiredResponse);
+
+      expect(result).toEqual({ kind: "missing" });
     }),
   );
 

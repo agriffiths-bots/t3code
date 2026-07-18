@@ -1013,6 +1013,21 @@ export const makeEnvironmentThreadState = Effect.fn("EnvironmentThreadState.make
       yield* applyLock.withPermit(reconcileGoneThread());
       return;
     }
+    if (result.kind === "snapshot-required") {
+      const reconciliation = yield* reconcileFromProjection(0, null, 0);
+      if (reconciliation.kind === "recovered") {
+        yield* Ref.set(revisionCheckUnresolved, false);
+        yield* acknowledgeSnapshotRevision(
+          reconciliation.recoveredThroughSequence,
+          reconciliation.recoveredThroughEventId,
+        );
+        yield* recordUnchangedRevision({ latestSequence: null, responseBytes: 0 });
+        return;
+      }
+      yield* Ref.set(revisionCheckUnresolved, true);
+      yield* recordUnchangedRevision({ latestSequence: null, responseBytes: 0 });
+      return;
+    }
     let [
       verifiedRevision,
       currentPendingRevision,

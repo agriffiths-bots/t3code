@@ -43,6 +43,92 @@ const projectionSnapshotLayer = it.layer(
 );
 
 projectionSnapshotLayer("ProjectionSnapshotQuery", (it) => {
+  it.effect("fails closed when resolving event aggregate visibility", () =>
+    Effect.gen(function* () {
+      const snapshotQuery = yield* ProjectionSnapshotQuery;
+      const sql = yield* SqlClient.SqlClient;
+      const privateProjectId = asProjectId("project-event-guard-private");
+      const factoryProjectId = asProjectId("project-event-guard-factory");
+      const privateThreadId = ThreadId.make("thread-event-guard-private-deleted");
+      const factoryThreadId = ThreadId.make("thread-event-guard-factory-deleted");
+
+      yield* sql`
+        INSERT INTO projection_projects (
+          project_id, title, workspace_root, data_audience,
+          default_model_selection_json, scripts_json, created_at, updated_at, deleted_at
+        ) VALUES
+          (${privateProjectId}, 'Private event guard', '/tmp/event-guard-private', 'private',
+           NULL, '[]', '2026-07-18T00:00:00.000Z', '2026-07-18T00:00:00.000Z',
+           '2026-07-18T00:01:00.000Z'),
+          (${factoryProjectId}, 'Factory event guard', '/tmp/event-guard-factory', 'factory',
+           NULL, '[]', '2026-07-18T00:00:00.000Z', '2026-07-18T00:00:00.000Z',
+           '2026-07-18T00:01:00.000Z')
+      `;
+      yield* sql`
+        INSERT INTO projection_threads (
+          thread_id, project_id, title, model_selection_json, runtime_mode,
+          interaction_mode, branch, worktree_path, latest_turn_id,
+          created_at, updated_at, deleted_at
+        ) VALUES
+          (${privateThreadId}, ${privateProjectId}, 'Private deleted event guard',
+           '{"instanceId":"codex","model":"gpt-5.5"}',
+           'full-access', 'default', NULL, NULL, NULL,
+           '2026-07-18T00:00:00.000Z', '2026-07-18T00:00:00.000Z',
+           '2026-07-18T00:01:00.000Z'),
+          (${factoryThreadId}, ${factoryProjectId}, 'Factory deleted event guard',
+           '{"instanceId":"codex","model":"gpt-5.5"}',
+           'full-access', 'default', NULL, NULL, NULL,
+           '2026-07-18T00:00:00.000Z', '2026-07-18T00:00:00.000Z',
+           '2026-07-18T00:01:00.000Z')
+      `;
+
+      const asAudience = <A, E, R>(
+        audienceCeiling: "private" | "factory",
+        effect: Effect.Effect<A, E, R>,
+      ) =>
+        effect.pipe(
+          Effect.provideService(EnvironmentAuthenticatedPrincipal, {
+            sessionId: AuthSessionId.make(`event-guard-${audienceCeiling}`),
+            subject: `event-guard-${audienceCeiling}`,
+            method: "bearer-access-token",
+            scopes: new Set([AuthOrchestrationReadScope]),
+            audienceCeiling,
+          }),
+        );
+      const refs = [
+        { name: "private project", aggregateKind: "project", aggregateId: privateProjectId },
+        { name: "factory project", aggregateKind: "project", aggregateId: factoryProjectId },
+        { name: "private deleted thread", aggregateKind: "thread", aggregateId: privateThreadId },
+        { name: "factory deleted thread", aggregateKind: "thread", aggregateId: factoryThreadId },
+        {
+          name: "missing guessed thread",
+          aggregateKind: "thread",
+          aggregateId: ThreadId.make("thread-event-guard-missing"),
+        },
+      ] as const;
+      const canReadEventAggregate = snapshotQuery.canReadEventAggregate;
+      assert.isDefined(canReadEventAggregate);
+      if (canReadEventAggregate === undefined) {
+        return yield* Effect.die("Expected live event aggregate visibility query");
+      }
+
+      for (const ref of refs) {
+        const factoryVisible = yield* asAudience("factory", canReadEventAggregate(ref));
+        const privateVisible = yield* asAudience("private", canReadEventAggregate(ref));
+        assert.equal(factoryVisible, ref.name.startsWith("factory"), ref.name);
+        assert.equal(privateVisible, !ref.name.startsWith("missing"), ref.name);
+      }
+    }).pipe(
+      Effect.ensuring(
+        Effect.gen(function* () {
+          const sql = yield* SqlClient.SqlClient;
+          yield* sql`DELETE FROM projection_threads WHERE thread_id IN ('thread-event-guard-private-deleted', 'thread-event-guard-factory-deleted')`;
+          yield* sql`DELETE FROM projection_projects WHERE project_id IN ('project-event-guard-private', 'project-event-guard-factory')`;
+        }).pipe(Effect.orDie),
+      ),
+    ),
+  );
+
   it.effect(
     "centrally scopes every project and thread read surface by session audience ceiling",
     () =>

@@ -67,6 +67,8 @@ const environmentId = EnvironmentId.make("environment-subagent-test");
 const projectId = ProjectId.make("project-subagent-test");
 const parentThreadId = ThreadId.make("thread-subagent-parent");
 const childThreadId = ThreadId.make("thread-subagent-child");
+const factoryScheduleThreadId = ThreadId.make("thread-schedule-factory");
+const privateScheduleThreadId = ThreadId.make("thread-schedule-private");
 const codexModel: ModelSelection = {
   instanceId: ProviderInstanceId.make("codex"),
   model: "gpt-5-codex",
@@ -90,6 +92,9 @@ const parentProject: OrchestrationProjectShell = {
   updatedAt: "2026-06-17T09:00:00.000Z",
 };
 let activeProjectShell: OrchestrationProjectShell = parentProject;
+let sourceThreadAudience: "factory" | "private" = "private";
+let sourceThreadActive = true;
+let childThreadAudience: "factory" | "private" = "private";
 
 const invocation = {
   credentialKind: "provider-session" as const,
@@ -204,7 +209,7 @@ const makeChildDetail = (): OrchestrationThread => ({
 const makeChildShell = (turnState: "completed" | "running" = "completed") => ({
   id: childThreadId,
   projectId,
-  dataAudience: parentProject.dataAudience,
+  dataAudience: childThreadAudience,
   title: "Child",
   modelSelection: codexModel,
   runtimeMode: "full-access" as const,
@@ -292,11 +297,12 @@ let peerHttpHandler:
 // Fix 1 seams: the enabled provider instances (with their live model lists) the
 // schedule handlers resolve a plain `model` against, and the tasks they persist.
 let modelInstances: ReadonlyArray<unknown> = [];
-const insertedTasks: Array<Pick<ScheduledTask, "busyPolicy" | "modelSelection">> = [];
+const insertedTasks: Array<ScheduledTask> = [];
 // Existing scheduled tasks visible to t3_schedule_update (via listAll), and the
 // updated rows it writes back — so tests can assert model re-routing and preservation.
 let existingTasks: ReadonlyArray<ScheduledTask> = [];
 const updatedTasks: Array<ScheduledTask> = [];
+const deletedTaskIds: Array<ScheduledTaskId> = [];
 
 const peerEnvironmentId = EnvironmentId.make("environment-peer-b");
 const remoteChildThreadId = ThreadId.make("thread-remote-child");
@@ -514,7 +520,14 @@ const makeModelInstance = (
 const makeParentShell = () => ({
   ...makeChildShell("completed"),
   id: parentThreadId,
+  dataAudience: sourceThreadAudience,
   parentThreadId: null,
+});
+
+const makeScheduleThreadShell = (threadId: ThreadId, dataAudience: "factory" | "private") => ({
+  ...makeParentShell(),
+  id: threadId,
+  dataAudience,
 });
 
 const projectionLayer = Layer.succeed(ProjectionSnapshotQuery, {
@@ -541,8 +554,14 @@ const projectionLayer = Layer.succeed(ProjectionSnapshotQuery, {
       threadId === childThreadId
         ? Option.some(makeChildShell(childTurnState))
         : threadId === parentThreadId
-          ? Option.some(makeParentShell())
-          : Option.none(),
+          ? sourceThreadActive
+            ? Option.some(makeParentShell())
+            : Option.none()
+          : threadId === factoryScheduleThreadId
+            ? Option.some(makeScheduleThreadShell(threadId, "factory"))
+            : threadId === privateScheduleThreadId
+              ? Option.some(makeScheduleThreadShell(threadId, "private"))
+              : Option.none(),
     ),
   getThreadShellByIdIncludingArchived: (threadId) =>
     Effect.succeed(
@@ -550,7 +569,11 @@ const projectionLayer = Layer.succeed(ProjectionSnapshotQuery, {
         ? Option.some(makeChildShell(childTurnState))
         : threadId === parentThreadId
           ? Option.some(makeParentShell())
-          : Option.none(),
+          : threadId === factoryScheduleThreadId
+            ? Option.some(makeScheduleThreadShell(threadId, "factory"))
+            : threadId === privateScheduleThreadId
+              ? Option.some(makeScheduleThreadShell(threadId, "private"))
+              : Option.none(),
     ),
   getThreadShellSnapshotByIdIncludingArchived: () => unsupported(),
   getThreadDetailById: (threadId) =>
@@ -678,7 +701,7 @@ const scheduledTasksLayer = Layer.succeed(ScheduledTaskRepository, {
   listDue: () => Effect.succeed([]),
   insert: (task) => Effect.sync(() => void insertedTasks.push(task)),
   update: (task) => Effect.sync(() => void updatedTasks.push(task)),
-  delete: () => Effect.void,
+  delete: ({ taskId }) => Effect.sync(() => void deletedTaskIds.push(taskId)),
   markRun: () => Effect.void,
   listAll: () => Effect.suspend(() => Effect.succeed(existingTasks)),
   listByThread: () => Effect.succeed([]),
@@ -2813,6 +2836,293 @@ describe("SubagentToolkit", () => {
         expect(insertedTasks).toHaveLength(0);
       }),
     ).pipe(Effect.provide(TestLayer)),
+  );
+
+  it.effect("filters schedule listings by the provider thread audience", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const server = yield* McpServer.McpServer;
+        const factoryTaskId = ScheduledTaskId.make("schedule-list-factory");
+        const privateTaskId = ScheduledTaskId.make("schedule-list-private");
+        existingTasks = [
+          {
+            ...makeScheduledTask(null),
+            taskId: privateTaskId,
+            threadId: privateScheduleThreadId,
+          },
+          {
+            ...makeScheduledTask(null),
+            taskId: factoryTaskId,
+            threadId: factoryScheduleThreadId,
+          },
+        ];
+
+        const list = (threadId?: ThreadId) =>
+          server
+            .callTool({
+              name: "t3_schedule_list",
+              arguments: threadId === undefined ? {} : { threadId },
+            })
+            .pipe(
+              Effect.provideService(McpInvocationContext.McpInvocationContext, invocation),
+              Effect.provideService(McpSchema.McpServerClient, client),
+            );
+
+        sourceThreadAudience = "factory";
+        const factoryCases = [
+          { threadId: undefined, expectedTaskIds: [factoryTaskId] },
+          { threadId: privateScheduleThreadId, expectedTaskIds: [] },
+          { threadId: ThreadId.make("thread-schedule-missing"), expectedTaskIds: [] },
+        ] as const;
+        for (const testCase of factoryCases) {
+          const result = yield* list(testCase.threadId);
+          expect(result.isError).toBe(false);
+          expect(result.structuredContent).toMatchObject({
+            tasks: testCase.expectedTaskIds.map((taskId) => ({ taskId })),
+          });
+        }
+
+        sourceThreadAudience = "private";
+        const unrestricted = yield* list();
+        expect(unrestricted.isError).toBe(false);
+        expect(unrestricted.structuredContent).toMatchObject({
+          tasks: [{ taskId: privateTaskId }, { taskId: factoryTaskId }],
+        });
+      }),
+    ).pipe(
+      Effect.ensuring(
+        Effect.sync(() => {
+          sourceThreadAudience = "private";
+          existingTasks = [];
+        }),
+      ),
+      Effect.provide(TestLayer),
+    ),
+  );
+
+  it.effect("guards explicit schedule creation by the provider thread audience", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const server = yield* McpServer.McpServer;
+        sourceThreadAudience = "factory";
+        insertedTasks.length = 0;
+
+        const create = (threadId: ThreadId) =>
+          server
+            .callTool({
+              name: "t3_schedule_create",
+              arguments: { threadId, prompt: "guarded schedule", intervalSeconds: 3_600 },
+            })
+            .pipe(
+              Effect.provideService(McpInvocationContext.McpInvocationContext, invocation),
+              Effect.provideService(McpSchema.McpServerClient, client),
+            );
+
+        const denied = yield* create(privateScheduleThreadId);
+        expect(denied.isError).toBe(true);
+        const deniedContent = denied.content[0];
+        expect(deniedContent?.type).toBe("text");
+        if (deniedContent?.type !== "text") throw new Error("Expected text error content.");
+        expect(deniedContent.text).toContain(`Thread ${privateScheduleThreadId} was not found.`);
+        expect(insertedTasks).toHaveLength(0);
+
+        const allowed = yield* create(factoryScheduleThreadId);
+        expect(allowed.isError).toBe(false);
+        expect(insertedTasks.map((task) => task.threadId)).toEqual([factoryScheduleThreadId]);
+      }),
+    ).pipe(
+      Effect.ensuring(
+        Effect.sync(() => {
+          sourceThreadAudience = "private";
+          insertedTasks.length = 0;
+        }),
+      ),
+      Effect.provide(TestLayer),
+    ),
+  );
+
+  it.effect("does not create a schedule for an archived invoking thread", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const server = yield* McpServer.McpServer;
+        sourceThreadActive = false;
+        insertedTasks.length = 0;
+
+        const result = yield* server
+          .callTool({
+            name: "t3_schedule_create",
+            arguments: { prompt: "archived self schedule", intervalSeconds: 3_600 },
+          })
+          .pipe(
+            Effect.provideService(McpInvocationContext.McpInvocationContext, invocation),
+            Effect.provideService(McpSchema.McpServerClient, client),
+          );
+
+        expect(result.isError).toBe(true);
+        expect(insertedTasks).toHaveLength(0);
+      }),
+    ).pipe(
+      Effect.ensuring(
+        Effect.sync(() => {
+          sourceThreadActive = true;
+          insertedTasks.length = 0;
+        }),
+      ),
+      Effect.provide(TestLayer),
+    ),
+  );
+
+  it.effect("guards schedule updates by the owning thread audience", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const server = yield* McpServer.McpServer;
+        const privateTaskId = ScheduledTaskId.make("schedule-update-private");
+        const factoryTaskId = ScheduledTaskId.make("schedule-update-factory");
+        sourceThreadAudience = "factory";
+        updatedTasks.length = 0;
+        existingTasks = [
+          {
+            ...makeScheduledTask(null),
+            taskId: privateTaskId,
+            threadId: privateScheduleThreadId,
+          },
+          {
+            ...makeScheduledTask(null),
+            taskId: factoryTaskId,
+            threadId: factoryScheduleThreadId,
+          },
+        ];
+
+        const update = (taskId: ScheduledTaskId) =>
+          server
+            .callTool({
+              name: "t3_schedule_update",
+              arguments: { taskId, enabled: false },
+            })
+            .pipe(
+              Effect.provideService(McpInvocationContext.McpInvocationContext, invocation),
+              Effect.provideService(McpSchema.McpServerClient, client),
+            );
+
+        const denied = yield* update(privateTaskId);
+        expect(denied.isError).toBe(true);
+        const deniedContent = denied.content[0];
+        expect(deniedContent?.type).toBe("text");
+        if (deniedContent?.type !== "text") throw new Error("Expected text error content.");
+        expect(deniedContent.text).toContain(`Scheduled task ${privateTaskId} was not found.`);
+        expect(updatedTasks).toHaveLength(0);
+
+        const allowed = yield* update(factoryTaskId);
+        expect(allowed.isError).toBe(false);
+        expect(updatedTasks.map((task) => task.taskId)).toEqual([factoryTaskId]);
+      }),
+    ).pipe(
+      Effect.ensuring(
+        Effect.sync(() => {
+          sourceThreadAudience = "private";
+          existingTasks = [];
+          updatedTasks.length = 0;
+        }),
+      ),
+      Effect.provide(TestLayer),
+    ),
+  );
+
+  it.effect("guards schedule deletion by the owning thread audience", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const server = yield* McpServer.McpServer;
+        const privateTaskId = ScheduledTaskId.make("schedule-delete-private");
+        const factoryTaskId = ScheduledTaskId.make("schedule-delete-factory");
+        sourceThreadAudience = "factory";
+        deletedTaskIds.length = 0;
+        existingTasks = [
+          {
+            ...makeScheduledTask(null),
+            taskId: privateTaskId,
+            threadId: privateScheduleThreadId,
+          },
+          {
+            ...makeScheduledTask(null),
+            taskId: factoryTaskId,
+            threadId: factoryScheduleThreadId,
+          },
+        ];
+
+        const remove = (taskId: ScheduledTaskId) =>
+          server
+            .callTool({ name: "t3_schedule_delete", arguments: { taskId } })
+            .pipe(
+              Effect.provideService(McpInvocationContext.McpInvocationContext, invocation),
+              Effect.provideService(McpSchema.McpServerClient, client),
+            );
+
+        const denied = yield* remove(privateTaskId);
+        expect(denied.isError).toBe(true);
+        const deniedContent = denied.content[0];
+        expect(deniedContent?.type).toBe("text");
+        if (deniedContent?.type !== "text") throw new Error("Expected text error content.");
+        expect(deniedContent.text).toContain(`Scheduled task ${privateTaskId} was not found.`);
+        expect(deletedTaskIds).toHaveLength(0);
+
+        const allowed = yield* remove(factoryTaskId);
+        expect(allowed.isError).toBe(false);
+        expect(deletedTaskIds).toEqual([factoryTaskId]);
+      }),
+    ).pipe(
+      Effect.ensuring(
+        Effect.sync(() => {
+          sourceThreadAudience = "private";
+          existingTasks = [];
+          deletedTaskIds.length = 0;
+        }),
+      ),
+      Effect.provide(TestLayer),
+    ),
+  );
+
+  it.effect("guards sub-agent steering by the child thread audience", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const server = yield* McpServer.McpServer;
+        sourceThreadAudience = "factory";
+        childThreadAudience = "private";
+        dispatchedTurns.length = 0;
+
+        const steer = () =>
+          server
+            .callTool({
+              name: "t3_steer_subagent",
+              arguments: { childThreadId, message: "audience guarded steer" },
+            })
+            .pipe(
+              Effect.provideService(McpInvocationContext.McpInvocationContext, invocation),
+              Effect.provideService(McpSchema.McpServerClient, client),
+            );
+
+        const denied = yield* steer();
+        expect(denied.isError).toBe(true);
+        const deniedContent = denied.content[0];
+        expect(deniedContent?.type).toBe("text");
+        if (deniedContent?.type !== "text") throw new Error("Expected text error content.");
+        expect(deniedContent.text).toContain(`Sub-agent ${childThreadId} was not found.`);
+        expect(dispatchedTurns).toHaveLength(0);
+
+        childThreadAudience = "factory";
+        const allowed = yield* steer();
+        expect(allowed.isError).toBe(false);
+        expect(dispatchedTurns).toEqual([childThreadId]);
+      }),
+    ).pipe(
+      Effect.ensuring(
+        Effect.sync(() => {
+          sourceThreadAudience = "private";
+          childThreadAudience = "private";
+          dispatchedTurns.length = 0;
+        }),
+      ),
+      Effect.provide(TestLayer),
+    ),
   );
 
   it.effect("t3_schedule_update rejects a nullable model reset", () =>

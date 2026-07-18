@@ -482,7 +482,10 @@ export const planUsageRouteLayer = HttpRouter.add(
   "GET",
   PLAN_USAGE_PATH,
   Effect.gen(function* () {
-    yield* authenticateRawRouteWithScope(AuthOrchestrationReadScope);
+    const session = yield* authenticateRawRouteWithScope(AuthOrchestrationReadScope);
+    if (session.audienceCeiling === "factory") {
+      return yield* failEnvironmentScopeRequired(AuthOrchestrationReadScope);
+    }
     const request = yield* HttpServerRequest.HttpServerRequest;
     const url = HttpServerRequest.toURL(request);
     if (Option.isNone(url)) {
