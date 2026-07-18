@@ -173,6 +173,7 @@ describe("ScheduledTasksReactor", () => {
           const shell = shells.get(threadId);
           return shell ? Option.some(shell) : Option.none();
         }),
+      getThreadShellSnapshotByIdIncludingArchived: () => unsupported(),
       getThreadDetailById: () => unsupported(),
       getThreadDetailSnapshot: () => unsupported(),
     });

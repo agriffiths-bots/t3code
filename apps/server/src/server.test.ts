@@ -1063,6 +1063,21 @@ const buildAppUnderTest = (options?: {
           getProjectShellById: () => Effect.succeed(Option.none()),
           getThreadShellById: () => Effect.succeed(Option.none()),
           getThreadShellByIdIncludingArchived: () => Effect.succeed(Option.none()),
+          getThreadShellSnapshotByIdIncludingArchived: (threadId) =>
+            Effect.all({
+              thread:
+                options?.layers?.projectionSnapshotQuery?.getThreadShellByIdIncludingArchived?.(
+                  threadId,
+                ) ?? Effect.succeed(Option.none()),
+              projection:
+                options?.layers?.projectionSnapshotQuery?.getSnapshotSequence?.() ??
+                Effect.succeed({ snapshotSequence: 0 }),
+            }).pipe(
+              Effect.map(({ thread, projection }) => ({
+                snapshotSequence: projection.snapshotSequence,
+                thread,
+              })),
+            ),
           getThreadDetailById: () => Effect.succeed(Option.none()),
           getThreadDetailSnapshot: () => Effect.succeed(Option.none()),
           getCounts: () => Effect.succeed({ projectCount: 0, threadCount: 0 }),
@@ -1752,6 +1767,8 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
         layers: {
           projectionSnapshotQuery: {
             getSnapshot: () => Effect.succeed(snapshotReadModel),
+            getThreadShellByIdIncludingArchived: () =>
+              Effect.succeed(Option.some(makeDefaultOrchestrationThreadShell())),
             getThreadDetailSnapshot: () => Effect.succeed(Option.some(threadDetailSnapshot)),
           },
           orchestrationEventStore: {
@@ -2471,7 +2488,28 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
 
   it.effect("serves a lightweight authenticated thread revision marker", () =>
     Effect.gen(function* () {
-      yield* buildAppUnderTest();
+      let projectionSequence = 0;
+      let latestStoreSequence = 0;
+      yield* buildAppUnderTest({
+        layers: {
+          projectionSnapshotQuery: {
+            getSnapshotSequence: () => Effect.succeed({ snapshotSequence: projectionSequence }),
+            getThreadShellSnapshotByIdIncludingArchived: (threadId) =>
+              Effect.sync(() => {
+                const snapshotSequence = projectionSequence;
+                const thread =
+                  threadId === defaultThreadId
+                    ? Option.some(makeDefaultOrchestrationThreadShell())
+                    : Option.none();
+                projectionSequence = latestStoreSequence;
+                return { snapshotSequence, thread };
+              }),
+          },
+          orchestrationEventStore: {
+            getLatestSequence: () => Effect.succeed(latestStoreSequence),
+          },
+        },
+      });
       const cookie = yield* getAuthenticatedSessionCookieHeader();
       const url = yield* getHttpServerUrl(`/api/orchestration/threads/${defaultThreadId}/revision`);
       const response = yield* fetchEffect(url, { headers: { cookie } });
@@ -2489,6 +2527,44 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
         latestEventId: null,
         projectionSequence: 0,
       });
+
+      const missingThreadScenarios = [
+        {
+          name: "lagging projection",
+          projectionSequence: 0,
+          latestStoreSequence: 1,
+          status: 500,
+          tag: "EnvironmentInternalError",
+          code: "internal_error",
+          reason: "orchestration_thread_revision_failed",
+        },
+        {
+          name: "caught-up projection",
+          projectionSequence: 1,
+          latestStoreSequence: 1,
+          status: 404,
+          tag: "EnvironmentResourceNotFoundError",
+          code: "not_found",
+          reason: "thread_not_found",
+        },
+      ] as const;
+      for (const scenario of missingThreadScenarios) {
+        projectionSequence = scenario.projectionSequence;
+        latestStoreSequence = scenario.latestStoreSequence;
+        const response = yield* fetchEffect(
+          yield* getHttpServerUrl("/api/orchestration/threads/thread-missing/revision"),
+          { headers: { cookie } },
+        );
+        const body = yield* responseJsonEffect<{
+          readonly _tag: string;
+          readonly code: string;
+          readonly reason: string;
+        }>(response);
+        assert.equal(response.status, scenario.status, scenario.name);
+        assert.equal(body._tag, scenario.tag, scenario.name);
+        assert.equal(body.code, scenario.code, scenario.name);
+        assert.equal(body.reason, scenario.reason, scenario.name);
+      }
     }).pipe(Effect.provide(NodeHttpServer.layerTest)),
   );
 

@@ -109,6 +109,26 @@ export const orchestrationHttpApiLayer = HttpApiBuilder.group(
         Effect.fn("environment.orchestration.threadRevision")(function* (args) {
           yield* annotateEnvironmentRequest(args.endpoint.name);
           yield* requireEnvironmentScope(AuthOrchestrationReadScope);
+          const threadSnapshot = yield* projectionSnapshotQuery
+            .getThreadShellSnapshotByIdIncludingArchived(args.params.threadId)
+            .pipe(
+              Effect.catch((cause) =>
+                failEnvironmentInternal("orchestration_thread_revision_failed", cause),
+              ),
+            );
+          if (Option.isNone(threadSnapshot.thread)) {
+            const latestStoreSequence = yield* orchestrationEventStore
+              .getLatestSequence()
+              .pipe(
+                Effect.catch((cause) =>
+                  failEnvironmentInternal("orchestration_thread_revision_failed", cause),
+                ),
+              );
+            if (threadSnapshot.snapshotSequence < latestStoreSequence) {
+              return yield* failEnvironmentInternal("orchestration_thread_revision_failed");
+            }
+            return yield* failEnvironmentNotFound("thread_not_found");
+          }
           const revision = yield* Effect.all({
             latest: orchestrationEventStore.getLatestThreadRevision(args.params.threadId),
             projection: projectionSnapshotQuery.getSnapshotSequence(),

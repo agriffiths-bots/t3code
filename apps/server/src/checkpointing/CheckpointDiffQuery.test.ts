@@ -109,6 +109,8 @@ describe("CheckpointDiffQuery.layer", () => {
               }),
             getThreadShellById: () => Effect.succeed(Option.none()),
             getThreadShellByIdIncludingArchived: () => Effect.succeed(Option.none()),
+            getThreadShellSnapshotByIdIncludingArchived: () =>
+              Effect.succeed({ snapshotSequence: 0, thread: Option.none() }),
             getThreadDetailById: () => Effect.succeed(Option.none()),
             getThreadDetailSnapshot: () => Effect.succeed(Option.none()),
           }),
@@ -205,6 +207,8 @@ describe("CheckpointDiffQuery.layer", () => {
             getFullThreadDiffContext: () => Effect.die("unused"),
             getThreadShellById: () => Effect.succeed(Option.none()),
             getThreadShellByIdIncludingArchived: () => Effect.succeed(Option.none()),
+            getThreadShellSnapshotByIdIncludingArchived: () =>
+              Effect.succeed({ snapshotSequence: 0, thread: Option.none() }),
             getThreadDetailById: () => Effect.succeed(Option.none()),
             getThreadDetailSnapshot: () => Effect.succeed(Option.none()),
           }),
@@ -291,6 +295,8 @@ describe("CheckpointDiffQuery.layer", () => {
             getFullThreadDiffContext: () => Effect.die("unused"),
             getThreadShellById: () => Effect.succeed(Option.none()),
             getThreadShellByIdIncludingArchived: () => Effect.succeed(Option.none()),
+            getThreadShellSnapshotByIdIncludingArchived: () =>
+              Effect.succeed({ snapshotSequence: 0, thread: Option.none() }),
             getThreadDetailById: () => Effect.succeed(Option.none()),
             getThreadDetailSnapshot: () => Effect.succeed(Option.none()),
           }),
@@ -362,6 +368,8 @@ describe("CheckpointDiffQuery.layer", () => {
             getFullThreadDiffContext: () => Effect.die("unused"),
             getThreadShellById: () => Effect.succeed(Option.none()),
             getThreadShellByIdIncludingArchived: () => Effect.succeed(Option.none()),
+            getThreadShellSnapshotByIdIncludingArchived: () =>
+              Effect.succeed({ snapshotSequence: 0, thread: Option.none() }),
             getThreadDetailById: () => Effect.succeed(Option.none()),
             getThreadDetailSnapshot: () => Effect.succeed(Option.none()),
           }),
@@ -418,6 +426,8 @@ describe("CheckpointDiffQuery.layer", () => {
             getFullThreadDiffContext: () => Effect.succeed(Option.none()),
             getThreadShellById: () => Effect.succeed(Option.none()),
             getThreadShellByIdIncludingArchived: () => Effect.succeed(Option.none()),
+            getThreadShellSnapshotByIdIncludingArchived: () =>
+              Effect.succeed({ snapshotSequence: 0, thread: Option.none() }),
             getThreadDetailById: () => Effect.succeed(Option.none()),
             getThreadDetailSnapshot: () => Effect.succeed(Option.none()),
           }),
