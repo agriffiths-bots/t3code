@@ -1,5 +1,8 @@
 import {
+  AuthOrchestrationReadScope,
+  AuthSessionId,
   CheckpointRef,
+  EnvironmentAuthenticatedPrincipal,
   EnvironmentId,
   EventId,
   MessageId,
@@ -12,6 +15,7 @@ import { assert, it } from "@effect/vitest";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
 
@@ -39,6 +43,328 @@ const projectionSnapshotLayer = it.layer(
 );
 
 projectionSnapshotLayer("ProjectionSnapshotQuery", (it) => {
+  it.effect(
+    "centrally scopes every project and thread read surface by session audience ceiling",
+    () =>
+      Effect.gen(function* () {
+        const snapshotQuery = yield* ProjectionSnapshotQuery;
+        const sql = yield* SqlClient.SqlClient;
+        const privateProjectId = asProjectId("project-read-guard-private");
+        const factoryProjectId = asProjectId("project-read-guard-factory");
+        const privateActiveThreadId = ThreadId.make("thread-read-guard-private-active");
+        const factoryActiveThreadId = ThreadId.make("thread-read-guard-factory-active");
+        const privateArchivedThreadId = ThreadId.make("thread-read-guard-private-archived");
+        const factoryArchivedThreadId = ThreadId.make("thread-read-guard-factory-archived");
+
+        yield* sql`
+        INSERT INTO projection_projects (
+          project_id,
+          title,
+          workspace_root,
+          data_audience,
+          default_model_selection_json,
+          scripts_json,
+          created_at,
+          updated_at,
+          deleted_at
+        )
+        VALUES
+          (
+            ${privateProjectId},
+            'Private read guard project',
+            '/tmp/read-guard-private',
+            'private',
+            NULL,
+            '[]',
+            '2026-07-18T00:00:00.000Z',
+            '2026-07-18T00:00:00.000Z',
+            NULL
+          ),
+          (
+            ${factoryProjectId},
+            'Factory read guard project',
+            '/tmp/read-guard-factory',
+            'factory',
+            NULL,
+            '[]',
+            '2026-07-18T00:00:01.000Z',
+            '2026-07-18T00:00:01.000Z',
+            NULL
+          )
+      `;
+        yield* sql`
+        INSERT INTO projection_threads (
+          thread_id,
+          project_id,
+          title,
+          model_selection_json,
+          runtime_mode,
+          interaction_mode,
+          branch,
+          worktree_path,
+          latest_turn_id,
+          created_at,
+          updated_at,
+          archived_at,
+          deleted_at
+        )
+        VALUES
+          (
+            ${privateActiveThreadId},
+            ${privateProjectId},
+            'Private active read guard thread',
+            '{"instanceId":"codex","model":"gpt-5.5"}',
+            'full-access',
+            'default',
+            NULL,
+            NULL,
+            NULL,
+            '2026-07-18T00:00:02.000Z',
+            '2026-07-18T00:00:02.000Z',
+            NULL,
+            NULL
+          ),
+          (
+            ${factoryActiveThreadId},
+            ${factoryProjectId},
+            'Factory active read guard thread',
+            '{"instanceId":"codex","model":"gpt-5.5"}',
+            'full-access',
+            'default',
+            NULL,
+            NULL,
+            NULL,
+            '2026-07-18T00:00:03.000Z',
+            '2026-07-18T00:00:03.000Z',
+            NULL,
+            NULL
+          ),
+          (
+            ${privateArchivedThreadId},
+            ${privateProjectId},
+            'Private archived read guard thread',
+            '{"instanceId":"codex","model":"gpt-5.5"}',
+            'full-access',
+            'default',
+            NULL,
+            NULL,
+            NULL,
+            '2026-07-18T00:00:04.000Z',
+            '2026-07-18T00:00:04.000Z',
+            '2026-07-18T00:00:05.000Z',
+            NULL
+          ),
+          (
+            ${factoryArchivedThreadId},
+            ${factoryProjectId},
+            'Factory archived read guard thread',
+            '{"instanceId":"codex","model":"gpt-5.5"}',
+            'full-access',
+            'default',
+            NULL,
+            NULL,
+            NULL,
+            '2026-07-18T00:00:06.000Z',
+            '2026-07-18T00:00:06.000Z',
+            '2026-07-18T00:00:07.000Z',
+            NULL
+          )
+      `;
+
+        const asAudience = <A, E, R>(
+          audienceCeiling: "private" | "factory",
+          effect: Effect.Effect<A, E, R>,
+        ) =>
+          effect.pipe(
+            Effect.provideService(EnvironmentAuthenticatedPrincipal, {
+              sessionId: AuthSessionId.make(`read-guard-${audienceCeiling}`),
+              subject: `read-guard-${audienceCeiling}`,
+              method: "bearer-access-token",
+              scopes: new Set([AuthOrchestrationReadScope]),
+              audienceCeiling,
+            }),
+          );
+        const ids = <A extends { readonly id: string }>(rows: ReadonlyArray<A>) =>
+          rows.map((row) => row.id);
+        const listSurfaces = [
+          {
+            name: "full snapshot",
+            read: () =>
+              snapshotQuery.getSnapshot().pipe(
+                Effect.map((snapshot) => ({
+                  projectIds: ids(snapshot.projects),
+                  threadIds: ids(snapshot.threads),
+                })),
+              ),
+            expectedFactoryThreadId: factoryActiveThreadId,
+          },
+          {
+            name: "active shell snapshot",
+            read: () =>
+              snapshotQuery.getShellSnapshot().pipe(
+                Effect.map((snapshot) => ({
+                  projectIds: ids(snapshot.projects),
+                  threadIds: ids(snapshot.threads),
+                })),
+              ),
+            expectedFactoryThreadId: factoryActiveThreadId,
+          },
+          {
+            name: "archived shell snapshot",
+            read: () =>
+              snapshotQuery.getArchivedShellSnapshot().pipe(
+                Effect.map((snapshot) => ({
+                  projectIds: ids(snapshot.projects),
+                  threadIds: ids(snapshot.threads),
+                })),
+              ),
+            expectedFactoryThreadId: factoryArchivedThreadId,
+          },
+        ] as const;
+
+        for (const surface of listSurfaces) {
+          const factoryRead = yield* asAudience("factory", surface.read());
+          assert.include(factoryRead.projectIds, factoryProjectId, surface.name);
+          assert.notInclude(factoryRead.projectIds, privateProjectId, surface.name);
+          assert.include(factoryRead.threadIds, surface.expectedFactoryThreadId, surface.name);
+          assert.notInclude(factoryRead.threadIds, privateActiveThreadId, surface.name);
+          assert.notInclude(factoryRead.threadIds, privateArchivedThreadId, surface.name);
+
+          const privateRead = yield* asAudience("private", surface.read());
+          assert.include(privateRead.projectIds, factoryProjectId, surface.name);
+          assert.include(privateRead.projectIds, privateProjectId, surface.name);
+        }
+
+        assert.deepEqual(yield* asAudience("factory", snapshotQuery.getCounts()), {
+          projectCount: 1,
+          threadCount: 2,
+        });
+        assert.deepEqual(yield* asAudience("private", snapshotQuery.getCounts()), {
+          projectCount: 2,
+          threadCount: 4,
+        });
+
+        const lookupSurfaces = [
+          {
+            name: "project by id",
+            privateRead: snapshotQuery
+              .getProjectShellById(privateProjectId)
+              .pipe(Effect.map(Option.isSome)),
+            factoryRead: snapshotQuery
+              .getProjectShellById(factoryProjectId)
+              .pipe(Effect.map(Option.isSome)),
+            missingRead: snapshotQuery
+              .getProjectShellById(asProjectId("project-read-guard-missing"))
+              .pipe(Effect.map(Option.isSome)),
+          },
+          {
+            name: "project by workspace root",
+            privateRead: snapshotQuery
+              .getActiveProjectByWorkspaceRoot("/tmp/read-guard-private")
+              .pipe(Effect.map(Option.isSome)),
+            factoryRead: snapshotQuery
+              .getActiveProjectByWorkspaceRoot("/tmp/read-guard-factory")
+              .pipe(Effect.map(Option.isSome)),
+            missingRead: snapshotQuery
+              .getActiveProjectByWorkspaceRoot("/tmp/read-guard-missing")
+              .pipe(Effect.map(Option.isSome)),
+          },
+          {
+            name: "first active thread by project",
+            privateRead: snapshotQuery
+              .getFirstActiveThreadIdByProjectId(privateProjectId)
+              .pipe(Effect.map(Option.isSome)),
+            factoryRead: snapshotQuery
+              .getFirstActiveThreadIdByProjectId(factoryProjectId)
+              .pipe(Effect.map(Option.isSome)),
+            missingRead: snapshotQuery
+              .getFirstActiveThreadIdByProjectId(asProjectId("project-read-guard-missing"))
+              .pipe(Effect.map(Option.isSome)),
+          },
+          {
+            name: "active thread shell by id",
+            privateRead: snapshotQuery
+              .getThreadShellById(privateActiveThreadId)
+              .pipe(Effect.map(Option.isSome)),
+            factoryRead: snapshotQuery
+              .getThreadShellById(factoryActiveThreadId)
+              .pipe(Effect.map(Option.isSome)),
+            missingRead: snapshotQuery
+              .getThreadShellById(ThreadId.make("thread-read-guard-missing"))
+              .pipe(Effect.map(Option.isSome)),
+          },
+          {
+            name: "archived thread shell by id",
+            privateRead: snapshotQuery
+              .getThreadShellByIdIncludingArchived(privateArchivedThreadId)
+              .pipe(Effect.map(Option.isSome)),
+            factoryRead: snapshotQuery
+              .getThreadShellByIdIncludingArchived(factoryArchivedThreadId)
+              .pipe(Effect.map(Option.isSome)),
+            missingRead: snapshotQuery
+              .getThreadShellByIdIncludingArchived(ThreadId.make("thread-read-guard-missing"))
+              .pipe(Effect.map(Option.isSome)),
+          },
+          {
+            name: "thread detail by id",
+            privateRead: snapshotQuery
+              .getThreadDetailById(privateActiveThreadId)
+              .pipe(Effect.map(Option.isSome)),
+            factoryRead: snapshotQuery
+              .getThreadDetailById(factoryActiveThreadId)
+              .pipe(Effect.map(Option.isSome)),
+            missingRead: snapshotQuery
+              .getThreadDetailById(ThreadId.make("thread-read-guard-missing"))
+              .pipe(Effect.map(Option.isSome)),
+          },
+          {
+            name: "thread detail snapshot by id",
+            privateRead: snapshotQuery
+              .getThreadDetailSnapshot(privateActiveThreadId)
+              .pipe(Effect.map(Option.isSome)),
+            factoryRead: snapshotQuery
+              .getThreadDetailSnapshot(factoryActiveThreadId)
+              .pipe(Effect.map(Option.isSome)),
+            missingRead: snapshotQuery
+              .getThreadDetailSnapshot(ThreadId.make("thread-read-guard-missing"))
+              .pipe(Effect.map(Option.isSome)),
+          },
+          {
+            name: "thread checkpoint revision context",
+            privateRead: snapshotQuery
+              .getThreadCheckpointContext(privateActiveThreadId)
+              .pipe(Effect.map(Option.isSome)),
+            factoryRead: snapshotQuery
+              .getThreadCheckpointContext(factoryActiveThreadId)
+              .pipe(Effect.map(Option.isSome)),
+            missingRead: snapshotQuery
+              .getThreadCheckpointContext(ThreadId.make("thread-read-guard-missing"))
+              .pipe(Effect.map(Option.isSome)),
+          },
+          {
+            name: "full thread diff revision context",
+            privateRead: snapshotQuery
+              .getFullThreadDiffContext(privateActiveThreadId, 0)
+              .pipe(Effect.map(Option.isSome)),
+            factoryRead: snapshotQuery
+              .getFullThreadDiffContext(factoryActiveThreadId, 0)
+              .pipe(Effect.map(Option.isSome)),
+            missingRead: snapshotQuery
+              .getFullThreadDiffContext(ThreadId.make("thread-read-guard-missing"), 0)
+              .pipe(Effect.map(Option.isSome)),
+          },
+        ] as const;
+
+        for (const surface of lookupSurfaces) {
+          assert.isFalse(yield* asAudience("factory", surface.privateRead), surface.name);
+          assert.isFalse(yield* asAudience("factory", surface.missingRead), surface.name);
+          assert.isTrue(yield* asAudience("factory", surface.factoryRead), surface.name);
+          assert.isTrue(yield* asAudience("private", surface.privateRead), surface.name);
+          assert.isTrue(yield* asAudience("private", surface.factoryRead), surface.name);
+        }
+      }),
+  );
+
   it.effect("exposes thread audience only through its parent project", () =>
     Effect.gen(function* () {
       const snapshotQuery = yield* ProjectionSnapshotQuery;

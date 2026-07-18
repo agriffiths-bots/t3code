@@ -51,6 +51,7 @@ import {
   AssetWorkspaceContextNotFoundError,
   AssetWorkspaceContextResolutionError,
   EnvironmentAuthorizationError,
+  EnvironmentAuthenticatedPrincipal,
   ThreadId,
   type TerminalAttachStreamEvent,
   type TerminalError,
@@ -129,6 +130,11 @@ const isOrchestrationScheduledTaskMutationError = Schema.is(
 );
 
 const SHELL_REPLAY_SNAPSHOT_GAP_THRESHOLD = 1_000;
+const AUDIENCE_SCOPED_READ_RPC_METHODS = new Set<string>([
+  ORCHESTRATION_WS_METHODS.getTurnDiff,
+  ORCHESTRATION_WS_METHODS.getFullThreadDiff,
+  ORCHESTRATION_WS_METHODS.getArchivedShellSnapshot,
+]);
 
 function unexpectedCompatibilityError(error: never): never {
   throw new Error(`Unhandled compatibility error: ${String(error)}`);
@@ -432,6 +438,10 @@ const makeWsRpcLayer = (currentSession: EnvironmentAuth.AuthenticatedSession) =>
       const processResourceMonitor = yield* ProcessResourceMonitor.ProcessResourceMonitor;
       const deviceNotifications = yield* DeviceNotifications.DeviceNotifications;
       const relayClient = yield* RelayClient.RelayClient;
+      const authenticatedPrincipal = {
+        ...currentSession,
+        scopes: new Set(currentSession.scopes),
+      };
       const authorizationError = (requiredScope: AuthEnvironmentScope) =>
         new EnvironmentAuthorizationError({
           message: `The authenticated token is missing required scope: ${requiredScope}.`,
@@ -462,12 +472,18 @@ const makeWsRpcLayer = (currentSession: EnvironmentAuth.AuthenticatedSession) =>
         method: string,
         effect: Effect.Effect<A, E, R>,
         traceAttributes?: Readonly<Record<string, unknown>>,
-      ) =>
-        instrumentRpcEffect(
+      ) => {
+        const audienceScopedEffect = AUDIENCE_SCOPED_READ_RPC_METHODS.has(method)
+          ? effect.pipe(
+              Effect.provideService(EnvironmentAuthenticatedPrincipal, authenticatedPrincipal),
+            )
+          : effect;
+        return instrumentRpcEffect(
           method,
-          authorizeEffect(requiredScopeForMethod(method), effect),
+          authorizeEffect(requiredScopeForMethod(method), audienceScopedEffect),
           traceAttributes,
         );
+      };
       const observeRpcStream = <A, E, R>(
         method: string,
         stream: Stream.Stream<A, E, R>,

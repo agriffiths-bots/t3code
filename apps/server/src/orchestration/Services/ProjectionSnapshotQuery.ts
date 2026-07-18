@@ -2,7 +2,9 @@
  * ProjectionSnapshotQuery - Read-model snapshot query service interface.
  *
  * Exposes the current orchestration projection snapshot for read-only API
- * access.
+ * access. When an authenticated request principal is present, project/thread
+ * reads are narrowed to that session's audience ceiling at the live service
+ * boundary. Internal callers without a principal retain the unrestricted view.
  *
  * @module ProjectionSnapshotQuery
  */
@@ -64,6 +66,8 @@ export interface ProjectionSnapshotQueryShape {
   /**
    * Read the lightweight command snapshot used to bootstrap the in-memory
    * orchestration engine without hydrating message/activity/checkpoint bodies.
+   * This is deliberately an internal, unscoped command model; it must not be
+   * exposed as a client read query.
    */
   readonly getCommandReadModel: () => Effect.Effect<
     OrchestrationReadModel,
