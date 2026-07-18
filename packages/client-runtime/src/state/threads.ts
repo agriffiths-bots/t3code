@@ -392,11 +392,15 @@ export const makeEnvironmentThreadState = Effect.fn("EnvironmentThreadState.make
     Effect.forkScoped,
   );
 
-  const setSynchronizing = SubscriptionRef.update(state, (current) => ({
-    ...current,
-    status: "synchronizing" as const,
-    error: Option.none(),
-  }));
+  const setSynchronizing = SubscriptionRef.update(state, (current) =>
+    current.status === "deleted"
+      ? current
+      : {
+          ...current,
+          status: "synchronizing" as const,
+          error: Option.none(),
+        },
+  );
   const setReady = SubscriptionRef.update(state, (current) =>
     current.status === "live" || current.status === "deleted"
       ? current
@@ -427,12 +431,19 @@ export const makeEnvironmentThreadState = Effect.fn("EnvironmentThreadState.make
       yield* setDeleted();
       return;
     }
+    const updated = yield* SubscriptionRef.updateAndGet(state, (current) =>
+      current.status === "deleted"
+        ? current
+        : {
+            data: Option.some(thread),
+            status: "live" as const,
+            error: Option.none(),
+          },
+    );
+    if (updated.status === "deleted") {
+      return;
+    }
     subscribeInput.observedDataAudience = thread.dataAudience;
-    yield* SubscriptionRef.set(state, {
-      data: Option.some(thread),
-      status: "live",
-      error: Option.none(),
-    });
     // Persist the thread together with the sequence it reflects so the next warm
     // cache can resume from exactly here.
     if (options?.persist === false) {
@@ -601,6 +612,9 @@ export const makeEnvironmentThreadState = Effect.fn("EnvironmentThreadState.make
   ) {
     const sequence = yield* SubscriptionRef.get(lastSequence);
     const current = yield* SubscriptionRef.get(state);
+    if (current.status === "deleted") {
+      return false;
+    }
     const olderSequence = snapshot.snapshotSequence < sequence;
     const olderReconcileSnapshot = olderSequence && options?.mergeNonAdvancingSnapshot === true;
     // A snapshot taken before the last applied revert may still contain the
@@ -636,11 +650,15 @@ export const makeEnvironmentThreadState = Effect.fn("EnvironmentThreadState.make
       threadProjectionMatches(current.data.value, thread)
     ) {
       if (current.status !== "live") {
-        yield* SubscriptionRef.set(state, {
-          ...current,
-          status: "live",
-          error: Option.none(),
-        });
+        yield* SubscriptionRef.update(state, (latest) =>
+          latest.status === "deleted"
+            ? latest
+            : {
+                ...latest,
+                status: "live" as const,
+                error: Option.none(),
+              },
+        );
         yield* markThreadRecentlyActive(options?.activityReason ?? "recovery-snapshot");
       }
       return true;

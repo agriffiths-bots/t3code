@@ -809,6 +809,81 @@ describe("EnvironmentThreads", () => {
     }),
   );
 
+  it.effect("keeps deleted terminal across connection and stream transitions", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness({
+        cached: BASE_THREAD,
+        revisionSequence: CACHED_SNAPSHOT_SEQUENCE,
+      });
+      yield* awaitThreadState(harness.observed, (value) => value.status === "live");
+      yield* Ref.set(harness.revisionGone, true);
+      yield* advanceActiveReconcileInterval;
+      yield* awaitThreadState(harness.observed, (value) => value.status === "deleted");
+
+      const connectionTransitions: ReadonlyArray<SupervisorConnectionState> = [
+        {
+          desired: true,
+          network: "online",
+          phase: "connected",
+          stage: null,
+          attempt: 1,
+          generation: 1,
+          lastFailure: null,
+          retryAt: null,
+        },
+        {
+          ...AVAILABLE_CONNECTION_STATE,
+          generation: 1,
+        },
+      ];
+      for (const connectionState of connectionTransitions) {
+        yield* SubscriptionRef.set(harness.supervisorState, connectionState);
+        yield* Effect.yieldNow;
+        expect((yield* Ref.get(harness.latest)).status).toBe("deleted");
+      }
+
+      yield* Queue.offer(harness.inputs, new Error("late stream failure"));
+      const streamErrorState = yield* awaitThreadState(harness.observed, (value) =>
+        Option.isSome(value.error),
+      );
+      expect(streamErrorState.status).toBe("deleted");
+
+      yield* SubscriptionRef.set(harness.supervisorState, {
+        desired: true,
+        network: "online",
+        phase: "connecting",
+        stage: "synchronizing",
+        attempt: 2,
+        generation: 2,
+        lastFailure: null,
+        retryAt: null,
+      });
+      yield* harness.replaceSession;
+      for (let attempt = 0; attempt < 100; attempt += 1) {
+        if ((yield* Ref.get(harness.subscriptionCount)) >= 2) {
+          break;
+        }
+        yield* Effect.yieldNow;
+      }
+      expect(yield* Ref.get(harness.subscriptionCount)).toBe(2);
+      yield* Queue.offer(
+        harness.inputs,
+        snapshot(
+          { ...BASE_THREAD, title: "Late reconnect snapshot" },
+          CACHED_SNAPSHOT_SEQUENCE + 1,
+        ),
+      );
+      for (let attempt = 0; attempt < 10; attempt += 1) {
+        yield* Effect.yieldNow;
+      }
+      expect(yield* Queue.size(harness.inputs)).toBe(0);
+
+      const terminal = yield* Ref.get(harness.latest);
+      expect(terminal.status).toBe("deleted");
+      expect(Option.isNone(terminal.data)).toBe(true);
+    }),
+  );
+
   it.effect("retains a cached thread while its revision endpoint is unavailable", () =>
     Effect.gen(function* () {
       const harness = yield* makeHarness({
