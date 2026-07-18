@@ -12,4 +12,4 @@ Edge-case matrix and red-first tests:
 - Same-timestamp ties: keep existing timestamp ownership tests unchanged; the new pending-start guard is independent of timestamp ordering.
 - Version skew/concurrency: keep `error` session-set behavior unchanged and only skip ambiguous `stopped` settlement while pending starts exist.
 
-Smallest-change argument: add a stopped-only pending-start guard at the two event-handler settlement points and upgrade terminal error text through local `lastError` preference helpers. Do not add new settlement machinery; later replacement running/failure and existing wait reconciliation remain responsible for eventual settlement.
+Smallest-change argument: add a stopped-only pending replacement-start guard at the two event-handler settlement points and upgrade terminal error text through local `lastError` preference helpers. A same-turn pending marker identifies replacement-start races while preserving existing initial placeholder recovery. Do not add new settlement machinery; later replacement running/failure and existing wait reconciliation remain responsible for eventual settlement.

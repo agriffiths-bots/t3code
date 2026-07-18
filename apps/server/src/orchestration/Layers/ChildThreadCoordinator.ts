@@ -106,6 +106,14 @@ interface ChildTerminalOutcome {
   readonly fromSessionProjection?: boolean;
 }
 
+const turnTerminalOutcome = (
+  latestTurn: OrchestrationLatestTurn,
+  session: OrchestrationThread["session"] | OrchestrationThreadShell["session"],
+): ChildTerminalOutcome =>
+  latestTurn.state === "completed"
+    ? { status: "completed", error: null }
+    : { status: "failed", error: session?.lastError ?? `turn ${latestTurn.state}` };
+
 const isThreadArchivedOutcome = (outcome: ChildTerminalOutcome): boolean =>
   outcome.status === "killed" && outcome.error === "thread archived";
 
@@ -362,12 +370,13 @@ const projectedLifecycleTerminal = (thread: OrchestrationThread): ChildTerminalO
     terminalAt !== undefined &&
     (parseIsoMillis(terminalAt) ?? Number.NEGATIVE_INFINITY) >
       (parseIsoMillis(thread.archivedAt) ?? Number.POSITIVE_INFINITY);
-  const latestTurnTerminal: ChildTerminalOutcome | null = staleTerminal
-    ? null
-    : latestTurn?.state === "completed"
-      ? { status: "completed", error: null }
-      : latestTurn?.state === "error" || latestTurn?.state === "interrupted"
-        ? { status: "failed", error: `turn ${latestTurn.state}` }
+  const latestTurnTerminal: ChildTerminalOutcome | null =
+    staleTerminal || latestTurn === null
+      ? null
+      : latestTurn.state === "completed" ||
+          latestTurn.state === "error" ||
+          latestTurn.state === "interrupted"
+        ? turnTerminalOutcome(latestTurn, thread.session)
         : null;
   if (thread.archivedAt !== null) {
     return terminalAfterArchive
@@ -375,11 +384,19 @@ const projectedLifecycleTerminal = (thread: OrchestrationThread): ChildTerminalO
       : (latestTurnTerminal ?? { status: "killed", error: "thread archived" });
   }
   if (thread.session?.status === "error") {
-    return { status: "failed", error: "session error", fromSessionProjection: true };
+    return {
+      status: "failed",
+      error: thread.session.lastError ?? "session error",
+      fromSessionProjection: true,
+    };
   }
   if (thread.session?.status === "stopped") {
     if (latestTurnTerminal !== null) return latestTurnTerminal;
-    return { status: "failed", error: "session stopped", fromSessionProjection: true };
+    return {
+      status: "failed",
+      error: thread.session.lastError ?? "session stopped",
+      fromSessionProjection: true,
+    };
   }
   return null;
 };
@@ -445,6 +462,9 @@ const make = Effect.gen(function* () {
   // pending-start guard from an idle projection; otherwise an old delayed diff
   // for a previously completed turn can settle the new request.
   const pendingSameTurnStartByChild = new Map<ThreadId, TurnId>();
+  // Stopped session-set events skipped while a replacement start is pending.
+  // Once the pending start clears, wait reconciliation may settle that stopped projection.
+  const pendingStoppedSettlementByChild = new Set<ThreadId>();
   // A conservative "missing" turn diff while the projection still shows the
   // turn running is not terminal by itself, but a later stopped/error session
   // must fail the child instead of leaving the waiter pending forever.
@@ -1076,9 +1096,7 @@ const make = Effect.gen(function* () {
   ): ChildTerminalOutcome | null => {
     const terminalTurn = currentLiveProjectedTerminal(childThreadId, shell);
     if (terminalTurn === null) return null;
-    return terminalTurn.state === "completed"
-      ? { status: "completed", error: null }
-      : { status: "failed", error: `turn ${terminalTurn.state}` };
+    return turnTerminalOutcome(terminalTurn, shell.session);
   };
 
   const completeChild = (
@@ -1101,6 +1119,7 @@ const make = Effect.gen(function* () {
         activeTurnByChild.delete(childThreadId);
         pendingTurnStartByChild.delete(childThreadId);
         pendingSameTurnStartByChild.delete(childThreadId);
+        pendingStoppedSettlementByChild.delete(childThreadId);
       }
       // A detached child always wakes its parent; a promoted child (R-A: a waited
       // child whose waiter stopped) must wake too, satisfying the notify-guarantee
@@ -1637,6 +1656,7 @@ const make = Effect.gen(function* () {
         activeTurnByChild.set(threadId, reportedActiveTurnId);
         pendingTurnStartByChild.delete(threadId);
         pendingSameTurnStartByChild.delete(threadId);
+        pendingStoppedSettlementByChild.delete(threadId);
       }
       if (
         session.status !== "ready" &&
@@ -1664,7 +1684,10 @@ const make = Effect.gen(function* () {
             return;
           }
           if (turnState === "error" || turnState === "interrupted") {
-            yield* settleChild(threadId, "failed", `turn ${turnState}`);
+            const sessionLastError = Option.isSome(shellOption)
+              ? (shellOption.value.session?.lastError ?? null)
+              : null;
+            yield* settleChild(threadId, "failed", sessionLastError ?? `turn ${turnState}`);
             yield* drainChildSteers(threadId);
             return;
           }
@@ -1694,6 +1717,12 @@ const make = Effect.gen(function* () {
           expectedActiveTurnId: activeTurnByChild.get(threadId),
         })
       ) {
+        return;
+      }
+      // A pending start without a same-turn marker can be an initial placeholder;
+      // only same-turn pending starts prove a stopped event is racing a replacement.
+      if (session.status === "stopped" && pendingSameTurnStartByChild.has(threadId)) {
+        pendingStoppedSettlementByChild.add(threadId);
         return;
       }
       if (session.status === "stopped" && Option.isSome(shellOption)) {
@@ -2132,7 +2161,8 @@ const make = Effect.gen(function* () {
         }
       }
       const canSettleProjectedStoppedSession =
-        !activeTurnByChild.has(childThreadId) &&
+        (!activeTurnByChild.has(childThreadId) ||
+          pendingStoppedSettlementByChild.has(childThreadId)) &&
         !pendingTurnStartByChild.has(childThreadId) &&
         !pendingSameTurnStartByChild.has(childThreadId) &&
         !unarchivedTerminalChildIds.has(childThreadId);
@@ -2176,7 +2206,8 @@ const make = Effect.gen(function* () {
       pendingTurnStartByChild.delete(childThreadId);
       pendingSameTurnStartByChild.delete(childThreadId);
       activeTurnByChild.set(childThreadId, terminalTurn.turnId);
-      if (terminalTurn.state === "completed") {
+      const outcome = turnTerminalOutcome(terminalTurn, shell.session);
+      if (outcome.status === "completed") {
         const detail = yield* getThreadDetailBounded(childThreadId);
         if (Option.isNone(detail)) return;
         const result: ChildWaitResult = {
@@ -2194,12 +2225,12 @@ const make = Effect.gen(function* () {
           childThreadId,
           status: "failed",
           finalAssistantText: null,
-          error: `turn ${terminalTurn.state}`,
+          error: outcome.error,
         };
         if (options?.prepareWaitFallback) {
           yield* ensurePromotedWaitFallback(record, childThreadId, result);
         }
-        yield* settleChild(childThreadId, "failed", `turn ${terminalTurn.state}`, true);
+        yield* settleChild(childThreadId, "failed", outcome.error, true);
       }
       yield* drainChildSteers(childThreadId);
     });
@@ -2510,6 +2541,7 @@ const make = Effect.gen(function* () {
       const ambiguousLegacyFailureByReplayedChild = new Set<ThreadId>();
       const legacyFailureCandidateByReplayedChild = new Map<ThreadId, EventId>();
       const missingDiffWhileRunningByReplayedChild = new Set<ThreadId>();
+      const pendingStoppedSettlementByReplayedChild = new Set<ThreadId>();
       const lifecycleTerminatedByChild = new Set<ThreadId>();
       const archivedSinceLastUnarchiveByChild = new Set<ThreadId>();
       const unarchivedArchiveChildIds = new Set<ThreadId>();
@@ -2727,6 +2759,7 @@ const make = Effect.gen(function* () {
                 activeTurnByReplayedChild.set(threadId, reportedActiveTurnId);
                 pendingTurnStartByReplayedChild.delete(threadId);
                 pendingSameTurnStartByReplayedChild.delete(threadId);
+                pendingStoppedSettlementByReplayedChild.delete(threadId);
                 ambiguousLegacyFailureByReplayedChild.delete(threadId);
                 legacyFailureCandidateByReplayedChild.delete(threadId);
               }
@@ -2749,10 +2782,7 @@ const make = Effect.gen(function* () {
                   return;
                 }
                 if (latestTurn.state === "error" || latestTurn.state === "interrupted") {
-                  const outcome = {
-                    status: "failed",
-                    error: `turn ${latestTurn.state}`,
-                  } as const;
+                  const outcome = turnTerminalOutcome(latestTurn, session);
                   terminalByChild.set(threadId, outcome);
                   rememberPostUnarchiveTerminal(threadId, outcome);
                   runningByChild.set(threadId, false);
@@ -2773,6 +2803,15 @@ const make = Effect.gen(function* () {
                     expectedActiveTurnId: activeTurnByReplayedChild.get(threadId),
                   })
                 ) {
+                  return;
+                }
+                // A pending start without a same-turn marker can be an initial placeholder;
+                // only same-turn pending starts prove a stopped event is racing a replacement.
+                if (
+                  session.status === "stopped" &&
+                  pendingSameTurnStartByReplayedChild.has(threadId)
+                ) {
+                  pendingStoppedSettlementByReplayedChild.add(threadId);
                   return;
                 }
                 const priorTerminal = terminalByChild.get(threadId);
@@ -2905,6 +2944,7 @@ const make = Effect.gen(function* () {
         pendingTurnStartByReplayedChild,
         pendingSameTurnStartByReplayedChild,
         missingDiffWhileRunningByReplayedChild,
+        pendingStoppedSettlementByReplayedChild,
         unarchivedArchiveChildIds,
         unarchivedArchivedTerminalChildIds,
         unarchivedTerminalChildIds,
@@ -3031,6 +3071,7 @@ const make = Effect.gen(function* () {
         pendingTurnStartByReplayedChild,
         pendingSameTurnStartByReplayedChild,
         missingDiffWhileRunningByReplayedChild,
+        pendingStoppedSettlementByReplayedChild,
         unarchivedArchiveChildIds,
         unarchivedArchivedTerminalChildIds,
         unarchivedTerminalChildIds: replayedUnarchivedTerminalChildIds,
@@ -3050,6 +3091,9 @@ const make = Effect.gen(function* () {
       }
       for (const childThreadId of missingDiffWhileRunningByReplayedChild) {
         missingDiffWhileRunningByChild.add(childThreadId);
+      }
+      for (const childThreadId of pendingStoppedSettlementByReplayedChild) {
+        pendingStoppedSettlementByChild.add(childThreadId);
       }
       const terminalTextByStartedChild = new Map<
         ThreadId,

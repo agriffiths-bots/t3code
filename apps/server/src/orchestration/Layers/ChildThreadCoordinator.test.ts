@@ -2039,6 +2039,93 @@ describe("ChildThreadCoordinator", () => {
     expect(result.error).toBe(reason);
   });
 
+  it("surfaces provider-death lastError from non-running projected lifecycle", async () => {
+    const reason = "Provider process exited after signal SIGTERM.";
+    const cases = [
+      {
+        name: "session-error",
+        latestTurn: makeLatestTurn("error"),
+        sessionStatus: "error",
+      },
+      {
+        name: "stopped-interrupted",
+        latestTurn: makeLatestTurn("interrupted"),
+        sessionStatus: "stopped",
+      },
+    ] as const;
+
+    for (const providerDeathCase of cases) {
+      const child = ThreadId.make(`child-projected-last-error-${providerDeathCase.name}`);
+      const parent = ThreadId.make(`parent-projected-last-error-${providerDeathCase.name}`);
+      const harness = await createHarness({
+        threads: [
+          makeThreadState({
+            threadId: child,
+            parentThreadId: parent,
+            latestTurn: providerDeathCase.latestTurn,
+            session: makeSession(child, providerDeathCase.sessionStatus, null, reason),
+          }),
+        ],
+        seedChildRows: [{ threadId: child, parentThreadId: parent }],
+      });
+
+      const result = await runtimeRun(harness, child);
+      expect(result.status).toBe("failed");
+      expect(result.error).toBe(reason);
+    }
+  });
+
+  it("does not settle stale stopped while replacement start is pending", async () => {
+    const child = ThreadId.make("child-stale-stopped-pending-replacement");
+    const parent = ThreadId.make("parent-stale-stopped-pending-replacement");
+    const oldTurnId = TurnId.make("pending-race-old-turn");
+    const replacementRequestId = EventId.make("evt-pending-race-replacement-start");
+    const reason = "superseded provider process exited before replacement session-set";
+    const stoppedAt = "2026-06-17T10:00:01.000Z";
+    const harness = await createHarness({
+      threads: [
+        makeThreadState({
+          threadId: child,
+          parentThreadId: parent,
+          latestTurn: makeLatestTurn("running", oldTurnId),
+          session: makeSession(child, "running", oldTurnId),
+        }),
+      ],
+    });
+    await harness.register({
+      parentThreadId: parent,
+      childThreadId: child,
+      detached: false,
+      model: codexModel,
+      spawnedAtMs: 0,
+    });
+    await harness.seedDispatchLease(child);
+    await harness.feed(sessionSetEvent(child, "running", oldTurnId));
+    await harness.feed(turnDiffEvent(child, "missing", oldTurnId));
+    await harness.feed(turnStartRequestedEvent(child, replacementRequestId));
+    harness.setThread(
+      makeThreadState({
+        threadId: child,
+        parentThreadId: parent,
+        latestTurn: makeLatestTurn("running", oldTurnId),
+        session: makeSession(child, "stopped", null, reason, stoppedAt),
+      }),
+    );
+
+    await harness.feed(sessionSetEvent(child, "stopped", null, reason, stoppedAt));
+
+    const pendingSlice = await runtimeWaitSlice(harness, [child], FAR_FUTURE_MS);
+    expect(pendingSlice.results[0]!.status).toBe("pending");
+    expect(await harness.listDispatchLeaseChildIds()).toContain(child);
+
+    await harness.feed(providerTurnStartFailedEvent(child, replacementRequestId));
+
+    const result = await runtimeRun(harness, child);
+    expect(result.status).toBe("failed");
+    expect(result.error).toBe(reason);
+    expect(await harness.listDispatchLeaseChildIds()).not.toContain(child);
+  });
+
   it("does not settle a stale stopped event after a replacement session is running", async () => {
     const child = ThreadId.make("child-stale-stopped-after-replacement");
     const parent = ThreadId.make("parent-stale-stopped-after-replacement");
