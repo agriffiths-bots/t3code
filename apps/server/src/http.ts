@@ -537,25 +537,55 @@ export const assetRouteLayer = HttpRouter.add(
       return HttpServerResponse.text("Not Found", { status: 404 });
     }
 
-    // Asset URLs intentionally self-authenticate: DOM, native image, and browser-preview loads
-    // cannot attach bearer/DPoP headers. Resolution validates the short-lived signature and its
-    // required audience binding, so a separate request session must not be required here.
+    const serverAuth = yield* EnvironmentAuth.EnvironmentAuth;
+    const authenticatedSession = yield* serverAuth
+      .authenticateHttpRequest(request)
+      .pipe(Effect.option);
+    const requestAudienceCeiling = Option.match(authenticatedSession, {
+      onNone: () => null,
+      onSome: (session) =>
+        session.scopes.includes(AuthOrchestrationReadScope) ? session.audienceCeiling : null,
+    });
+
+    // Factory assets remain short-lived bearer URLs for DOM and browser-preview loads. Private
+    // assets additionally require a live private read session, and all path-backed assets are
+    // reclassified from the canonical target before they are served.
     const asset = yield* resolveAsset(
       suffix.slice(0, separatorIndex),
       suffix.slice(separatorIndex + 1),
+      requestAudienceCeiling,
     );
     if (!asset) {
       return HttpServerResponse.text("Not Found", { status: 404 });
     }
-    return yield* HttpServerResponse.file(asset.path, {
+    if (asset.kind === "forbidden") {
+      return HttpServerResponse.text("Forbidden", {
+        status: 403,
+        headers: { "Cache-Control": "no-store" },
+      });
+    }
+    const responseHeaders = {
+      "Cache-Control": "no-store",
+      "X-Content-Type-Options": "nosniff",
+    };
+    const contentType = Mime.getType(asset.path) ?? "application/octet-stream";
+    if (request.method === "HEAD") {
+      asset.stream.destroy();
+      return HttpServerResponse.empty({
+        status: 200,
+        headers: {
+          ...responseHeaders,
+          "Content-Length": String(asset.contentLength),
+          "Content-Type": contentType,
+        },
+      });
+    }
+    return HttpServerResponse.raw(asset.stream, {
       status: 200,
-      headers: {
-        "Cache-Control": "private, max-age=3600",
-        "X-Content-Type-Options": "nosniff",
-      },
-    }).pipe(
-      Effect.orElseSucceed(() => HttpServerResponse.text("Internal Server Error", { status: 500 })),
-    );
+      contentType,
+      contentLength: asset.contentLength,
+      headers: responseHeaders,
+    });
   }),
 );
 

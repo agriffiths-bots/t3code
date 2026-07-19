@@ -1,3 +1,7 @@
+// @effect-diagnostics nodeBuiltinImport:off
+import * as NodeFS from "node:fs";
+import * as NodeFSP from "node:fs/promises";
+
 import {
   AssetAttachmentNotFoundError,
   AuthAudienceCeiling,
@@ -9,6 +13,7 @@ import {
   AssetWorkspaceAssetInspectionError,
   AssetWorkspaceAssetNotFoundError,
   AssetWorkspaceContextNotFoundError,
+  AssetWorkspaceContextResolutionError,
   AssetWorkspacePathValidationError,
   AssetWorkspaceResolutionError,
   AssetWorkspaceRootNormalizationError,
@@ -26,6 +31,7 @@ import {
 import { PROJECT_FAVICON_FALLBACK_MARKER } from "@t3tools/shared/projectFavicon";
 import * as Clock from "effect/Clock";
 import * as Effect from "effect/Effect";
+import * as Exit from "effect/Exit";
 import * as FileSystem from "effect/FileSystem";
 import * as Option from "effect/Option";
 import * as Path from "effect/Path";
@@ -39,9 +45,15 @@ import {
   timingSafeEqualBase64Url,
 } from "../auth/utils.ts";
 import * as ServerSecretStore from "../auth/ServerSecretStore.ts";
-import { canReadDataAudience } from "../auth/audienceDataPolicy.ts";
-import { resolveAttachmentPathById } from "../attachmentStore.ts";
+import { canReadDataAudience, strictestDataAudience } from "../auth/audienceDataPolicy.ts";
+import {
+  parseThreadSegmentFromAttachmentId,
+  resolveAttachmentPathById,
+  toSafeThreadAttachmentSegment,
+} from "../attachmentStore.ts";
 import * as ServerConfig from "../config.ts";
+import * as ProjectionSnapshotQuery from "../orchestration/Services/ProjectionSnapshotQuery.ts";
+import * as ProjectFilesystemAudienceGuard from "../project/ProjectFilesystemAudienceGuard.ts";
 import * as ProjectFaviconResolver from "../project/ProjectFaviconResolver.ts";
 import * as WorkspacePaths from "../workspace/WorkspacePaths.ts";
 
@@ -105,7 +117,128 @@ const AssetClaimsJson = Schema.fromJsonString(AssetClaimsSchema);
 const decodeAssetClaims = Schema.decodeUnknownOption(AssetClaimsJson);
 const encodeAssetClaims = Schema.encodeSync(AssetClaimsJson);
 
-export type ResolvedAsset = { readonly kind: "file"; readonly path: string };
+export type ResolvedAsset = {
+  readonly kind: "file";
+  readonly path: string;
+  readonly contentLength: number;
+  readonly stream: NodeFS.ReadStream;
+};
+export type AssetResolution = ResolvedAsset | { readonly kind: "forbidden" };
+
+const forbiddenAsset = { kind: "forbidden" } as const satisfies AssetResolution;
+
+const audienceClaimsForIssue = Effect.fn("AssetAccess.audienceClaimsForIssue")(function* (input: {
+  readonly resource: AssetResource;
+  readonly claimedDataAudience: DataAudienceType;
+  readonly audienceCeiling: AuthAudienceCeilingType;
+  readonly canonicalTargetPath?: string;
+  readonly liveDataAudience?: DataAudienceType;
+}) {
+  const liveDataAudience = input.canonicalTargetPath
+    ? ((yield* ProjectFilesystemAudienceGuard.classifyPathAudience(input.canonicalTargetPath).pipe(
+        Effect.mapError(
+          (cause) => new AssetWorkspaceContextResolutionError({ resource: input.resource, cause }),
+        ),
+      )) ?? "private")
+    : (input.liveDataAudience ?? input.claimedDataAudience);
+  const dataAudience = strictestDataAudience(input.claimedDataAudience, liveDataAudience);
+  if (!canReadDataAudience(input.audienceCeiling, dataAudience)) {
+    return yield* new AssetWorkspaceContextNotFoundError({ resource: input.resource });
+  }
+  return { dataAudience, audienceCeiling: input.audienceCeiling };
+});
+
+export const classifyAttachmentAudience = Effect.fn("AssetAccess.classifyAttachmentAudience")(
+  function* (attachmentId: string) {
+    const threadSegment = parseThreadSegmentFromAttachmentId(attachmentId);
+    if (!threadSegment) return null;
+
+    const snapshotQuery = yield* ProjectionSnapshotQuery.ProjectionSnapshotQuery;
+    const snapshot = yield* snapshotQuery.getCommandReadModel();
+    const projectById = new Map(snapshot.projects.map((project) => [project.id, project]));
+    let audience: DataAudienceType | null = null;
+    for (const thread of snapshot.threads) {
+      if (toSafeThreadAttachmentSegment(thread.id) !== threadSegment) {
+        continue;
+      }
+      const project = projectById.get(thread.projectId);
+      const threadAudience = project
+        ? strictestDataAudience(thread.dataAudience, project.dataAudience)
+        : thread.dataAudience;
+      audience =
+        audience === null ? threadAudience : strictestDataAudience(audience, threadAudience);
+    }
+    return audience;
+  },
+);
+
+type OpenedAssetFile = {
+  readonly handle: NodeFSP.FileHandle;
+  readonly canonicalPath: string;
+  readonly contentLength: number;
+};
+
+const closeOpenedAssetFile = (opened: OpenedAssetFile) =>
+  Effect.promise(() => opened.handle.close().catch(() => undefined));
+
+const openResolvedAssetFile = Effect.fn("AssetAccess.openResolvedAssetFile")(function* (
+  resolvedPath: string,
+) {
+  const handle = yield* Effect.tryPromise(() =>
+    NodeFSP.open(resolvedPath, NodeFS.constants.O_RDONLY | NodeFS.constants.O_NOFOLLOW),
+  ).pipe(Effect.orElseSucceed(() => null));
+  if (!handle) return null;
+
+  const opened = yield* Effect.tryPromise(async () => {
+    const handleInfo = await handle.stat();
+    if (!handleInfo.isFile()) return null;
+
+    // Re-resolve and compare the inode after opening. This catches both final-component and
+    // ancestor swaps while retaining the exact handle that was authorized for streaming.
+    const canonicalPath = await NodeFSP.realpath(resolvedPath);
+    const pathInfo = await NodeFSP.stat(canonicalPath);
+    if (!pathInfo.isFile() || pathInfo.dev !== handleInfo.dev || pathInfo.ino !== handleInfo.ino) {
+      return null;
+    }
+    return { handle, canonicalPath, contentLength: handleInfo.size } satisfies OpenedAssetFile;
+  }).pipe(Effect.orElseSucceed(() => null));
+
+  if (!opened) {
+    yield* Effect.promise(() => handle.close().catch(() => undefined));
+  }
+  return opened;
+});
+
+const toResolvedAsset = (opened: OpenedAssetFile): ResolvedAsset => ({
+  kind: "file",
+  path: opened.canonicalPath,
+  contentLength: opened.contentLength,
+  stream: opened.handle.createReadStream({ autoClose: true }),
+});
+
+const withOpenedAssetFile = <E, R>(
+  resolvedPath: string,
+  use: (
+    opened: OpenedAssetFile,
+    transferToResponse: () => ResolvedAsset,
+  ) => Effect.Effect<AssetResolution | null, E, R>,
+): Effect.Effect<AssetResolution | null, E, R> => {
+  let transferredToResponse = false;
+  return Effect.acquireUseRelease(
+    openResolvedAssetFile(resolvedPath),
+    (opened) => {
+      if (!opened) return Effect.succeed(null);
+      return use(opened, () => {
+        transferredToResponse = true;
+        return toResolvedAsset(opened);
+      });
+    },
+    (opened, exit) =>
+      opened && !(transferredToResponse && Exit.isSuccess(exit))
+        ? closeOpenedAssetFile(opened)
+        : Effect.void,
+  );
+};
 
 function decodeClaims(encodedPayload: string): AssetClaims | null {
   try {
@@ -186,10 +319,8 @@ export const issueAssetUrl = Effect.fn("AssetAccess.issueAssetUrl")(function* (i
   const path = yield* Path.Path;
   const workspacePaths = yield* WorkspacePaths.WorkspacePaths;
   const expiresAt = (yield* Clock.currentTimeMillis) + ASSET_TOKEN_TTL_MS;
-  const audienceClaims = {
-    dataAudience: input.dataAudience ?? ("private" as const),
-    audienceCeiling: input.audienceCeiling ?? ("private" as const),
-  };
+  const claimedDataAudience = input.dataAudience ?? ("private" as const);
+  const audienceCeiling = input.audienceCeiling ?? ("private" as const);
   let claims: AssetClaims;
   let fileName: string;
 
@@ -245,6 +376,12 @@ export const issueAssetUrl = Effect.fn("AssetAccess.issueAssetUrl")(function* (i
           resource: input.resource,
         });
       }
+      const audienceClaims = yield* audienceClaimsForIssue({
+        resource: input.resource,
+        claimedDataAudience,
+        audienceCeiling,
+        canonicalTargetPath: canonicalFile,
+      });
       const canonicalWorkspaceRoot = yield* fileSystem.realPath(workspaceRoot).pipe(
         Effect.mapError(
           (cause) =>
@@ -285,6 +422,18 @@ export const issueAssetUrl = Effect.fn("AssetAccess.issueAssetUrl")(function* (i
           resource: input.resource,
         });
       }
+      const audienceClaims = yield* audienceClaimsForIssue({
+        resource: input.resource,
+        claimedDataAudience,
+        audienceCeiling,
+        liveDataAudience:
+          (yield* classifyAttachmentAudience(input.resource.attachmentId).pipe(
+            Effect.mapError(
+              (cause) =>
+                new AssetWorkspaceContextResolutionError({ resource: input.resource, cause }),
+            ),
+          )) ?? "private",
+      });
       claims = {
         version: 1,
         kind: "attachment",
@@ -316,22 +465,28 @@ export const issueAssetUrl = Effect.fn("AssetAccess.issueAssetUrl")(function* (i
         ),
       );
       const relativePath = faviconPath ? path.relative(workspaceRoot, faviconPath) : null;
-      if (
-        relativePath &&
-        !(yield* resolveCanonicalWorkspaceFile({ workspaceRoot, relativePath }).pipe(
-          Effect.mapError(
-            (cause) =>
-              new AssetProjectFaviconInspectionError({
-                resource: input.resource,
-                cause,
-              }),
-          ),
-        ))
-      ) {
+      const canonicalFaviconPath = relativePath
+        ? yield* resolveCanonicalWorkspaceFile({ workspaceRoot, relativePath }).pipe(
+            Effect.mapError(
+              (cause) =>
+                new AssetProjectFaviconInspectionError({
+                  resource: input.resource,
+                  cause,
+                }),
+            ),
+          )
+        : null;
+      if (relativePath && !canonicalFaviconPath) {
         return yield* new AssetProjectFaviconNotFoundError({
           resource: input.resource,
         });
       }
+      const audienceClaims = yield* audienceClaimsForIssue({
+        resource: input.resource,
+        claimedDataAudience,
+        audienceCeiling,
+        ...(canonicalFaviconPath ? { canonicalTargetPath: canonicalFaviconPath } : {}),
+      });
       claims = {
         version: 1,
         kind: "project-favicon",
@@ -374,6 +529,7 @@ export const issueAssetUrl = Effect.fn("AssetAccess.issueAssetUrl")(function* (i
 export const resolveAsset = Effect.fn("AssetAccess.resolveAsset")(function* (
   token: string,
   relativePath: string,
+  requestAudienceCeiling: AuthAudienceCeilingType | null = null,
 ) {
   const [encodedPayload, signature] = token.split(".");
   if (!encodedPayload || !signature) return null;
@@ -392,6 +548,38 @@ export const resolveAsset = Effect.fn("AssetAccess.resolveAsset")(function* (
   if (!canReadDataAudience(claims.audienceCeiling, claims.dataAudience)) {
     return null;
   }
+  if (!canReadDataAudience(requestAudienceCeiling ?? "factory", claims.dataAudience)) {
+    return forbiddenAsset;
+  }
+
+  const authorizeResolvedPath = Effect.fn("AssetAccess.resolveAsset.authorizeResolvedPath")(
+    function* (resolvedPath: string, signedWorkspaceRoot: string) {
+      return yield* withOpenedAssetFile(resolvedPath, (opened, transferToResponse) =>
+        Effect.gen(function* () {
+          const path = yield* Path.Path;
+          const relativeToSignedRoot = path.relative(signedWorkspaceRoot, opened.canonicalPath);
+          if (
+            relativeToSignedRoot === ".." ||
+            relativeToSignedRoot.startsWith(`..${path.sep}`) ||
+            path.isAbsolute(relativeToSignedRoot)
+          ) {
+            return null;
+          }
+          const liveDataAudience =
+            (yield* ProjectFilesystemAudienceGuard.classifyCanonicalPathAudience(
+              opened.canonicalPath,
+            ).pipe(Effect.orElseSucceed(() => null))) ?? "private";
+          if (!canReadDataAudience(claims.dataAudience, liveDataAudience)) {
+            return forbiddenAsset;
+          }
+          if (!canReadDataAudience(requestAudienceCeiling ?? "factory", liveDataAudience)) {
+            return forbiddenAsset;
+          }
+          return transferToResponse();
+        }),
+      );
+    },
+  );
 
   if (claims.kind === "attachment") {
     const config = yield* ServerConfig.ServerConfig;
@@ -400,20 +588,38 @@ export const resolveAsset = Effect.fn("AssetAccess.resolveAsset")(function* (
       attachmentId: claims.attachmentId,
     });
     if (!attachmentPath) return null;
-    const fileSystem = yield* FileSystem.FileSystem;
-    const info = yield* optionOnNotFound(fileSystem.stat(attachmentPath)).pipe(
-      Effect.tapError((cause) =>
-        Effect.logError("Failed to inspect attachment asset.", {
-          attachmentId: claims.attachmentId,
-          path: attachmentPath,
-          cause,
-        }),
-      ),
-      Effect.orElseSucceed(() => Option.none()),
+    return yield* withOpenedAssetFile(attachmentPath, (opened, transferToResponse) =>
+      Effect.gen(function* () {
+        const path = yield* Path.Path;
+        const canonicalAttachmentsDir = yield* Effect.tryPromise(() =>
+          NodeFSP.realpath(config.attachmentsDir),
+        ).pipe(Effect.orElseSucceed(() => null));
+        const attachmentRelativePath = canonicalAttachmentsDir
+          ? path.relative(canonicalAttachmentsDir, opened.canonicalPath)
+          : null;
+        if (
+          attachmentRelativePath === null ||
+          attachmentRelativePath === "" ||
+          attachmentRelativePath === ".." ||
+          attachmentRelativePath.startsWith(`..${path.sep}`) ||
+          path.isAbsolute(attachmentRelativePath)
+        ) {
+          return null;
+        }
+
+        const liveDataAudience =
+          (yield* classifyAttachmentAudience(claims.attachmentId).pipe(
+            Effect.orElseSucceed(() => null),
+          )) ?? "private";
+        if (!canReadDataAudience(claims.dataAudience, liveDataAudience)) {
+          return forbiddenAsset;
+        }
+        if (!canReadDataAudience(requestAudienceCeiling ?? "factory", liveDataAudience)) {
+          return forbiddenAsset;
+        }
+        return transferToResponse();
+      }),
     );
-    return Option.isSome(info) && info.value.type === "File"
-      ? ({ kind: "file", path: attachmentPath } satisfies ResolvedAsset)
-      : null;
   }
 
   if (claims.kind === "project-favicon") {
@@ -422,7 +628,7 @@ export const resolveAsset = Effect.fn("AssetAccess.resolveAsset")(function* (
       workspaceRoot: claims.workspaceRoot,
       relativePath: claims.relativePath,
     });
-    return faviconPath ? ({ kind: "file", path: faviconPath } satisfies ResolvedAsset) : null;
+    return faviconPath ? yield* authorizeResolvedPath(faviconPath, claims.workspaceRoot) : null;
   }
 
   const decodedPath = decodeRelativePath(relativePath);
@@ -435,7 +641,7 @@ export const resolveAsset = Effect.fn("AssetAccess.resolveAsset")(function* (
       relativePath: claims.relativePath,
     });
     return exactWorkspaceFile
-      ? ({ kind: "file", path: exactWorkspaceFile } satisfies ResolvedAsset)
+      ? yield* authorizeResolvedPath(exactWorkspaceFile, claims.workspaceRoot)
       : null;
   }
   const segments = decodedPath.split(/[\\/]/);
@@ -453,5 +659,5 @@ export const resolveAsset = Effect.fn("AssetAccess.resolveAsset")(function* (
     workspaceRoot: claims.workspaceRoot,
     relativePath: joinedRelativePath,
   });
-  return workspaceFile ? ({ kind: "file", path: workspaceFile } satisfies ResolvedAsset) : null;
+  return workspaceFile ? yield* authorizeResolvedPath(workspaceFile, claims.workspaceRoot) : null;
 });

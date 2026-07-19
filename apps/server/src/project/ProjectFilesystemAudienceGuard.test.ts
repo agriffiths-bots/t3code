@@ -10,6 +10,7 @@ import {
   type AuthAudienceCeiling,
   type OrchestrationProject,
   type OrchestrationReadModel,
+  type OrchestrationThread,
   type OrchestrationThreadShell,
 } from "@t3tools/contracts";
 import { HostProcessPlatform } from "@t3tools/shared/hostProcess";
@@ -60,7 +61,7 @@ const makeThread = (input: {
   readonly projectId: ProjectId;
   readonly dataAudience: OrchestrationThreadShell["dataAudience"];
   readonly worktreePath: string | null;
-}): OrchestrationThreadShell => ({
+}): OrchestrationThreadShell & Pick<OrchestrationThread, "deletedAt"> => ({
   id: ThreadId.make(input.id),
   projectId: input.projectId,
   dataAudience: input.dataAudience,
@@ -74,6 +75,7 @@ const makeThread = (input: {
   createdAt: now,
   updatedAt: now,
   archivedAt: null,
+  deletedAt: null,
   session: null,
   latestUserMessageAt: null,
   hasPendingApprovals: false,
@@ -283,5 +285,93 @@ describe("ProjectFilesystemAudienceGuard", () => {
 
       expect(result).toBe(true);
     }),
+  );
+
+  it.effect("ignores deleted project roots and stale or deleted worktrees", () =>
+    Effect.gen(function* () {
+      const fileSystem = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const root = yield* fileSystem.makeTempDirectoryScoped({
+        prefix: "t3-guard-readded-private-",
+      });
+      const staleAudienceWorktree = yield* fileSystem.makeTempDirectoryScoped({
+        prefix: "t3-guard-stale-audience-worktree-",
+      });
+      const privateAudienceWorktree = yield* fileSystem.makeTempDirectoryScoped({
+        prefix: "t3-guard-private-audience-worktree-",
+      });
+      const factoryRoot = yield* fileSystem.makeTempDirectoryScoped({
+        prefix: "t3-guard-active-factory-",
+      });
+      const secretPath = path.join(root, "secret.txt");
+      const staleAudienceSecretPath = path.join(staleAudienceWorktree, "secret.txt");
+      const privateAudienceSecretPath = path.join(privateAudienceWorktree, "secret.txt");
+      yield* fileSystem.writeFileString(secretPath, "private\n");
+      yield* fileSystem.writeFileString(staleAudienceSecretPath, "private worktree\n");
+      yield* fileSystem.writeFileString(privateAudienceSecretPath, "private thread worktree\n");
+
+      const deletedFactoryProject = {
+        ...makeProject("project-deleted-factory", root, "factory"),
+        deletedAt: now,
+      };
+      const privateProject = makeProject("project-readded-private", root, "private");
+      const factoryProject = makeProject("project-active-factory", factoryRoot, "factory");
+      const deletedFactoryWorktree = {
+        ...makeThread({
+          id: "thread-deleted-factory-worktree",
+          projectId: deletedFactoryProject.id,
+          dataAudience: "factory",
+          worktreePath: root,
+        }),
+        deletedAt: now,
+      };
+      const staleFactoryWorktree = makeThread({
+        id: "thread-stale-factory-worktree",
+        projectId: deletedFactoryProject.id,
+        dataAudience: "factory",
+        worktreePath: root,
+      });
+      const staleAudienceFactoryWorktree = makeThread({
+        id: "thread-stale-audience-factory-worktree",
+        projectId: privateProject.id,
+        dataAudience: "factory",
+        worktreePath: staleAudienceWorktree,
+      });
+      const privateAudienceFactoryWorktree = makeThread({
+        id: "thread-private-audience-factory-worktree",
+        projectId: factoryProject.id,
+        dataAudience: "private",
+        worktreePath: privateAudienceWorktree,
+      });
+      const projectionLayer = makeProjectionLayer({
+        projects: [deletedFactoryProject, privateProject, factoryProject],
+        threads: [
+          deletedFactoryWorktree,
+          staleFactoryWorktree,
+          staleAudienceFactoryWorktree,
+          privateAudienceFactoryWorktree,
+        ],
+      });
+
+      const runAsFactory = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
+        effect.pipe(Effect.provideService(EnvironmentAuthenticatedPrincipal, principal("factory")));
+      const result = yield* Effect.all({
+        readdedPrivateProject: runAsFactory(
+          ProjectFilesystemAudienceGuard.isPathVisibleToCurrentAudience(secretPath),
+        ),
+        staleAudienceWorktree: runAsFactory(
+          ProjectFilesystemAudienceGuard.isPathVisibleToCurrentAudience(staleAudienceSecretPath),
+        ),
+        privateAudienceWorktree: runAsFactory(
+          ProjectFilesystemAudienceGuard.isPathVisibleToCurrentAudience(privateAudienceSecretPath),
+        ),
+      }).pipe(Effect.provide(projectionLayer));
+
+      expect(result).toEqual({
+        readdedPrivateProject: false,
+        staleAudienceWorktree: false,
+        privateAudienceWorktree: false,
+      });
+    }).pipe(Effect.provide(NodeServices.layer)),
   );
 });

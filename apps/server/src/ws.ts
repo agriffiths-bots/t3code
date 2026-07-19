@@ -95,8 +95,7 @@ import * as ServerSettings from "./serverSettings.ts";
 import * as PlanUsageSnapshot from "./usage/PlanUsageSnapshot.ts";
 import * as TerminalManager from "./terminal/Manager.ts";
 import * as PreviewManager from "./preview/Manager.ts";
-import { issueAssetUrl } from "./assets/AssetAccess.ts";
-import { parseThreadSegmentFromAttachmentId } from "./attachmentStore.ts";
+import { classifyAttachmentAudience, issueAssetUrl } from "./assets/AssetAccess.ts";
 import * as PortScanner from "./preview/PortScanner.ts";
 import * as WorkspaceEntries from "./workspace/WorkspaceEntries.ts";
 import * as WorkspaceFileSystem from "./workspace/WorkspaceFileSystem.ts";
@@ -133,6 +132,7 @@ import * as VcsProcess from "./vcs/VcsProcess.ts";
 import * as PairingGrantStore from "./auth/PairingGrantStore.ts";
 import * as SessionStore from "./auth/SessionStore.ts";
 import { failEnvironmentAuthInvalid, failEnvironmentInternal } from "./auth/http.ts";
+import { strictestDataAudience } from "./auth/audienceDataPolicy.ts";
 import * as RelayClient from "@t3tools/shared/relayClient";
 import { makeServerConfigHeartbeatStream, shouldSendServerConfigHeartbeat } from "./wsKeepalive.ts";
 const isOrchestrationDispatchCommandError = Schema.is(OrchestrationDispatchCommandError);
@@ -789,30 +789,24 @@ const makeWsRpcLayer = (currentSession: EnvironmentAuth.AuthenticatedSession) =>
               return yield* new AssetWorkspaceContextNotFoundError({ resource });
             }
             return {
-              dataAudience: thread.value.dataAudience,
+              dataAudience: strictestDataAudience(
+                thread.value.dataAudience,
+                project.value.dataAudience,
+              ),
               workspaceRoot: thread.value.worktreePath ?? project.value.workspaceRoot,
             };
           }
           case "attachment": {
-            const threadSegment = parseThreadSegmentFromAttachmentId(resource.attachmentId);
-            if (!threadSegment) {
-              if (currentSession.audienceCeiling === "private") {
-                return { dataAudience: "private" as const };
-              }
-              return yield* new AssetWorkspaceContextNotFoundError({ resource });
-            }
-            const thread = yield* withAuthenticatedPrincipal(
-              projectionSnapshotQuery.getThreadShellByIdIncludingArchived(
-                ThreadId.make(threadSegment),
-              ),
+            const dataAudience = yield* withAuthenticatedPrincipal(
+              classifyAttachmentAudience(resource.attachmentId),
             );
-            if (Option.isNone(thread)) {
+            if (dataAudience === null) {
               if (currentSession.audienceCeiling === "private") {
                 return { dataAudience: "private" as const };
               }
               return yield* new AssetWorkspaceContextNotFoundError({ resource });
             }
-            return { dataAudience: thread.value.dataAudience };
+            return { dataAudience };
           }
           case "project-favicon": {
             const project = yield* withAuthenticatedPrincipal(
@@ -2003,12 +1997,14 @@ const makeWsRpcLayer = (currentSession: EnvironmentAuth.AuthenticatedSession) =>
                     }),
               ),
               Effect.flatMap((context) =>
-                issueAssetUrl({
-                  resource: input.resource,
-                  ...(context.workspaceRoot ? { workspaceRoot: context.workspaceRoot } : {}),
-                  dataAudience: context.dataAudience,
-                  audienceCeiling: currentSession.audienceCeiling,
-                }),
+                withFilesystemGuardServices(
+                  issueAssetUrl({
+                    resource: input.resource,
+                    ...(context.workspaceRoot ? { workspaceRoot: context.workspaceRoot } : {}),
+                    dataAudience: context.dataAudience,
+                    audienceCeiling: currentSession.audienceCeiling,
+                  }),
+                ),
               ),
             ),
             { "rpc.aggregate": "workspace" },

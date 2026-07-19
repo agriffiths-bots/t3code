@@ -3,7 +3,7 @@ import * as FileSystem from "effect/FileSystem";
 import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 
-import { currentReadAudienceCeiling } from "../auth/audienceDataPolicy.ts";
+import { currentReadAudienceCeiling, strictestDataAudience } from "../auth/audienceDataPolicy.ts";
 import { expandHomePath } from "../pathExpansion.ts";
 import * as ProjectionSnapshotQuery from "../orchestration/Services/ProjectionSnapshotQuery.ts";
 import * as WorkspaceEntries from "../workspace/WorkspaceEntries.ts";
@@ -27,22 +27,36 @@ const classifiedProjectRoots = Effect.fn("ProjectFilesystemAudienceGuard.classif
     const fileSystem = yield* FileSystem.FileSystem;
     const snapshotQuery = yield* ProjectionSnapshotQuery.ProjectionSnapshotQuery;
     const snapshot = yield* snapshotQuery.getCommandReadModel();
+    const activeProjects = snapshot.projects.filter((project) => project.deletedAt === null);
+    const activeProjectById = new Map(activeProjects.map((project) => [project.id, project]));
     const candidates = [
-      ...snapshot.projects.map((project) => ({
+      ...activeProjects.map((project) => ({
         path: project.workspaceRoot,
         dataAudience: project.dataAudience,
       })),
-      ...snapshot.threads.flatMap((thread) =>
-        thread.worktreePath === null
+      ...snapshot.threads.flatMap((thread) => {
+        const project = activeProjectById.get(thread.projectId);
+        return thread.deletedAt !== null || !project || thread.worktreePath === null
           ? []
-          : [{ path: thread.worktreePath, dataAudience: thread.dataAudience }],
-      ),
+          : [
+              {
+                path: thread.worktreePath,
+                dataAudience: strictestDataAudience(thread.dataAudience, project.dataAudience),
+              },
+            ];
+      }),
     ];
-    const roots: Array<{ readonly path: string; readonly dataAudience: "factory" | "private" }> =
-      [];
+    const roots: Array<{ readonly path: string; dataAudience: "factory" | "private" }> = [];
     for (const candidate of candidates) {
       const realRoot = yield* realPathOption(fileSystem, candidate.path);
-      if (Option.isSome(realRoot) && !roots.some((root) => root.path === realRoot.value)) {
+      if (Option.isNone(realRoot)) continue;
+
+      const existingRoot = roots.find((root) => root.path === realRoot.value);
+      if (existingRoot) {
+        if (candidate.dataAudience === "private") {
+          existingRoot.dataAudience = "private";
+        }
+      } else {
         roots.push({ path: realRoot.value, dataAudience: candidate.dataAudience });
       }
     }
@@ -50,13 +64,26 @@ const classifiedProjectRoots = Effect.fn("ProjectFilesystemAudienceGuard.classif
   },
 );
 
-const classifyExistingPathAudience = Effect.fn(
-  "ProjectFilesystemAudienceGuard.classifyExistingPathAudience",
+export const classifyCanonicalPathAudience = Effect.fn(
+  "ProjectFilesystemAudienceGuard.classifyCanonicalPathAudience",
 )(function* (realCandidatePath: string) {
   const path = yield* Path.Path;
   const roots = yield* classifiedProjectRoots();
   const match = roots.find((root) => isWithinRoot(path, root.path, realCandidatePath));
   return match?.dataAudience ?? null;
+});
+
+export const classifyPathAudience = Effect.fn(
+  "ProjectFilesystemAudienceGuard.classifyPathAudience",
+)(function* (candidatePath: string) {
+  const fileSystem = yield* FileSystem.FileSystem;
+  const path = yield* Path.Path;
+  const realCandidate = yield* realPathOption(
+    fileSystem,
+    path.resolve(expandHomePath(candidatePath)),
+  );
+  if (Option.isNone(realCandidate)) return null;
+  return yield* classifyCanonicalPathAudience(realCandidate.value);
 });
 
 export const isPathVisibleToCurrentAudience = Effect.fn(
@@ -65,15 +92,7 @@ export const isPathVisibleToCurrentAudience = Effect.fn(
   const audienceCeiling = yield* currentReadAudienceCeiling;
   if (audienceCeiling === "private") return true;
 
-  const fileSystem = yield* FileSystem.FileSystem;
-  const path = yield* Path.Path;
-  const realCandidate = yield* realPathOption(
-    fileSystem,
-    path.resolve(expandHomePath(candidatePath)),
-  );
-  if (Option.isNone(realCandidate)) return false;
-
-  return (yield* classifyExistingPathAudience(realCandidate.value)) === "factory";
+  return (yield* classifyPathAudience(candidatePath)) === "factory";
 });
 
 export const isMutationTargetVisibleToCurrentAudience = Effect.fn(
@@ -92,7 +111,7 @@ export const isMutationTargetVisibleToCurrentAudience = Effect.fn(
   while (true) {
     const realCandidate = yield* realPathOption(fileSystem, candidatePath);
     if (Option.isSome(realCandidate)) {
-      return (yield* classifyExistingPathAudience(realCandidate.value)) === "factory";
+      return (yield* classifyCanonicalPathAudience(realCandidate.value)) === "factory";
     }
 
     const parentPath = path.dirname(candidatePath);
