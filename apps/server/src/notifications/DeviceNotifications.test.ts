@@ -95,6 +95,15 @@ const makeNotificationsLayerForBaseDir = (
 
 const takeEvent = (queue: Queue.Queue<ServerNotificationStreamEvent>) => Queue.take(queue);
 
+const waitFor = (predicate: () => boolean, message: string) =>
+  Effect.gen(function* () {
+    for (let attempt = 0; attempt < 10_000; attempt += 1) {
+      if (predicate()) return;
+      yield* Effect.yieldNow;
+    }
+    throw new Error(message);
+  });
+
 const makeGuardLayer = (
   resolve: Parameters<typeof WebPushEndpointGuard.make>[0],
 ): Layer.Layer<WebPushEndpointGuard.WebPushEndpointGuard> =>
@@ -240,6 +249,78 @@ it.layer(NodeServices.layer)("DeviceNotifications.layer", (it) => {
     }).pipe(Effect.provide(makeNotificationsLayer())),
   );
 
+  it.effect("warns when an active web-push registration has no subscription", () =>
+    Effect.gen(function* () {
+      const logs: Array<ReadonlyArray<unknown>> = [];
+      const logger = Logger.make(({ message }) => {
+        logs.push(Array.isArray(message) ? message : [message]);
+      });
+
+      const result = yield* Effect.gen(function* () {
+        const notifications = yield* DeviceNotifications.DeviceNotifications;
+        yield* notifications.registerDevice(
+          {
+            deviceId: "missing-subscription",
+            deviceKind: "web-push",
+            deviceLabel: "Broken browser registration",
+          },
+          { audienceCeiling: "private" },
+        );
+        return yield* notifications.notify({ title: "Cannot reach this registration" });
+      }).pipe(
+        Effect.provide(
+          Layer.mergeAll(
+            makeNotificationsLayer(),
+            Logger.layer([logger], { mergeWithExisting: false }),
+          ),
+        ),
+      );
+
+      assert.equal(result.deliveredDevices, 0);
+      const warning = logs.find(
+        (message) => message[0] === "Skipped web push delivery without an active subscription",
+      );
+      assert.deepInclude(warning?.[1] as Record<string, unknown>, {
+        deviceId: "missing-subscription",
+        deviceLabel: "Broken browser registration",
+        platform: "web-push",
+      });
+    }),
+  );
+
+  it.effect("warns before replacing malformed persisted VAPID keys", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const baseDir = yield* fs.makeTempDirectoryScoped({
+        prefix: "t3-notifications-malformed-vapid-",
+      });
+      const secretsDir = path.join(baseDir, "userdata", "secrets");
+      yield* fs.makeDirectory(secretsDir, { recursive: true });
+      yield* fs.writeFileString(path.join(secretsDir, "web-push-vapid-keys.bin"), "not-json");
+      const logs: Array<ReadonlyArray<unknown>> = [];
+      const logger = Logger.make(({ message }) => {
+        logs.push(Array.isArray(message) ? message : [message]);
+      });
+
+      const config = yield* Effect.gen(function* () {
+        const notifications = yield* DeviceNotifications.DeviceNotifications;
+        return yield* notifications.getConfig;
+      }).pipe(
+        Effect.provide(
+          makeNotificationsLayerForBaseDir(baseDir).pipe(
+            Layer.provide(Logger.layer([logger], { mergeWithExisting: false })),
+          ),
+        ),
+      );
+
+      assert.isAbove(config.vapidPublicKey.length, 20);
+      assert.isTrue(
+        logs.some((message) => message[0] === "Failed to decode persisted web-push VAPID keys"),
+      );
+    }).pipe(Effect.scoped),
+  );
+
   it.effect("migrates unattributed version-one notification devices fail-closed", () =>
     Effect.gen(function* () {
       const fs = yield* FileSystem.FileSystem;
@@ -301,7 +382,7 @@ it.layer(NodeServices.layer)("DeviceNotifications.layer", (it) => {
       };
       assert.equal(delivery.privateDelivery.deliveredDevices, 1);
       assert.equal(delivery.factoryDelivery.deliveredDevices, 3);
-      assert.equal(persisted.version, 2);
+      assert.equal(persisted.version, 3);
       assert.deepEqual(
         persisted.devices.map(({ deviceId, audienceCeiling }) => ({ deviceId, audienceCeiling })),
         [
@@ -480,12 +561,12 @@ it.layer(NodeServices.layer)("DeviceNotifications.layer", (it) => {
     ),
   );
 
-  it.effect("expires 404/410 web-push devices without deleting them and logs a warning", () =>
+  it.effect("records and alerts remaining devices when a 404 expires a web-push device", () =>
     Effect.gen(function* () {
       const fs = yield* FileSystem.FileSystem;
       const path = yield* Path.Path;
       const baseDir = yield* fs.makeTempDirectoryScoped({
-        prefix: "t3-notifications-expired-records-",
+        prefix: "t3-notifications-removal-alert-",
       });
       const storePath = path.join(baseDir, "userdata", "notification-devices.json");
       const logs: Array<{
@@ -501,37 +582,41 @@ it.layer(NodeServices.layer)("DeviceNotifications.layer", (it) => {
       const sendNotification = vi
         .spyOn(webPush, "sendNotification")
         .mockImplementation((subscription) =>
-          Promise.reject(
-            new WebPushError(
-              "Subscription expired",
-              subscription.endpoint.includes("gone") ? 404 : 410,
-              {},
-              "",
-              subscription.endpoint,
-            ),
-          ),
+          subscription.endpoint.includes("expired")
+            ? Promise.reject(
+                new WebPushError("Subscription expired", 404, {}, "", subscription.endpoint),
+              )
+            : Promise.resolve({ statusCode: 201, body: "", headers: {} }),
         );
 
-      const registrations = yield* Effect.gen(function* () {
+      const notification = yield* Effect.gen(function* () {
         const notifications = yield* DeviceNotifications.DeviceNotifications;
-        const gone = yield* notifications.registerDevice(
+        yield* notifications.registerDevice(
           {
-            deviceId: "gone-web-push",
+            deviceId: "expired-android",
             deviceKind: "web-push",
-            subscription: webPushSubscription("https://gone.push.example/device"),
-          },
-          { audienceCeiling: "private" },
-        );
-        const expired = yield* notifications.registerDevice(
-          {
-            deviceId: "expired-web-push",
-            deviceKind: "web-push",
+            deviceLabel: "Adam's Android",
+            userAgent: "Android",
             subscription: webPushSubscription("https://expired.push.example/device"),
           },
           { audienceCeiling: "private" },
         );
-        const notification = yield* notifications.notify({ title: "Expire stale devices" });
-        return { gone, expired, notification };
+        yield* notifications.registerDevice(
+          {
+            deviceId: "remaining-windows",
+            deviceKind: "web-push",
+            deviceLabel: "Office PC",
+            userAgent: "Windows",
+            subscription: webPushSubscription("https://remaining.push.example/device"),
+          },
+          { audienceCeiling: "private" },
+        );
+        const result = yield* notifications.notify({ title: "Expire stale device" });
+        yield* waitFor(
+          () => sendNotification.mock.calls.length === 3,
+          "Timed out waiting for the push-subscription removal alert.",
+        );
+        return result;
       }).pipe(
         Effect.provide(
           Layer.mergeAll(
@@ -542,10 +627,16 @@ it.layer(NodeServices.layer)("DeviceNotifications.layer", (it) => {
             Logger.layer([logger], { mergeWithExisting: false }),
           ),
         ),
-        Effect.ensuring(Effect.sync(() => sendNotification.mockRestore())),
       );
 
       const persisted = decodeJson(yield* fs.readFileString(storePath)) as {
+        readonly tombstones?: ReadonlyArray<{
+          readonly deviceId: string;
+          readonly deviceLabel?: string;
+          readonly platform: string;
+          readonly reason: string;
+          readonly removedAt: string;
+        }>;
         readonly devices: ReadonlyArray<{
           readonly deviceId: string;
           readonly expiredAt?: string;
@@ -554,28 +645,189 @@ it.layer(NodeServices.layer)("DeviceNotifications.layer", (it) => {
           readonly subscription?: { readonly endpoint?: string };
         }>;
       };
-      assert.equal(registrations.notification.deliveredDevices, 0);
+      assert.equal(notification.deliveredDevices, 1);
       assert.equal(persisted.devices.length, 2);
-      for (const device of persisted.devices) {
-        assert.equal(device.status, "expired");
-        assert.isString(device.expiredAt);
-        assert.isString(device.recoveryTokenHash);
-        assert.notEqual(device.recoveryTokenHash, registrations.gone.recoveryToken);
-        assert.notEqual(device.recoveryTokenHash, registrations.expired.recoveryToken);
+      const expiredDevice = persisted.devices.find(
+        (device) => device.deviceId === "expired-android",
+      );
+      assert.isDefined(expiredDevice);
+      assert.equal(expiredDevice.status, "expired");
+      const expiredAt = expiredDevice.expiredAt;
+      if (expiredAt === undefined) {
+        assert.fail("Expected the removed device to have an expiry timestamp.");
       }
-      const expiryLogs = logs.filter((log) => log.message[0] === "Web push subscription expired");
-      assert.equal(expiryLogs.length, 2);
-      assert.deepEqual(
-        expiryLogs.map((log) => log.level),
-        ["Warn", "Warn"],
+      assert.deepEqual(persisted.tombstones, [
+        {
+          deviceId: "expired-android",
+          deviceLabel: "Adam's Android",
+          platform: "android",
+          reason: "push-service-404",
+          removedAt: expiredAt,
+        },
+      ]);
+
+      const removalLog = logs.find(
+        (log) => log.message[0] === "Web push subscription removed after push service rejection",
+      );
+      assert.equal(removalLog?.level, "Warn");
+      assert.deepInclude(removalLog?.message[1] as Record<string, unknown>, {
+        deviceId: "expired-android",
+        deviceLabel: "Adam's Android",
+        platform: "android",
+        reason: "push-service-404",
+      });
+
+      const alertBody =
+        "Push subscription for Adam's Android was removed (expired). Reopen T3 on that device to re-register.";
+      const alertCall = sendNotification.mock.calls.find(([, payload]) => {
+        const decoded = decodeJson(payload ?? "") as {
+          readonly notification?: { readonly body?: string };
+        };
+        return decoded.notification?.body === alertBody;
+      });
+      assert.equal(alertCall?.[0].endpoint, "https://remaining.push.example/device");
+    }).pipe(Effect.scoped),
+  );
+
+  it.effect("expires without recursing when delivery of a removal alert also returns 410", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const baseDir = yield* fs.makeTempDirectoryScoped({
+        prefix: "t3-notifications-removal-alert-loop-",
+      });
+      const storePath = path.join(baseDir, "userdata", "notification-devices.json");
+      const logs: Array<ReadonlyArray<unknown>> = [];
+      const logger = Logger.make(({ message }) => {
+        logs.push(Array.isArray(message) ? message : [message]);
+      });
+      let remainingDeviceCalls = 0;
+      const sendNotification = vi
+        .spyOn(webPush, "sendNotification")
+        .mockImplementation((subscription) => {
+          if (subscription.endpoint.includes("expired")) {
+            return Promise.reject(
+              new WebPushError("Subscription expired", 404, {}, "", subscription.endpoint),
+            );
+          }
+          remainingDeviceCalls += 1;
+          return remainingDeviceCalls === 1
+            ? Promise.resolve({ statusCode: 201, body: "", headers: {} })
+            : Promise.reject(
+                new WebPushError(
+                  "Removal alert target also expired",
+                  410,
+                  {},
+                  "",
+                  subscription.endpoint,
+                ),
+              );
+        });
+
+      yield* Effect.gen(function* () {
+        const notifications = yield* DeviceNotifications.DeviceNotifications;
+        yield* notifications.registerDevice(
+          {
+            deviceId: "expired-first",
+            deviceKind: "web-push",
+            deviceLabel: "Expired phone",
+            subscription: webPushSubscription("https://expired.push.example/device"),
+          },
+          { audienceCeiling: "private" },
+        );
+        yield* notifications.registerDevice(
+          {
+            deviceId: "alert-target",
+            deviceKind: "web-push",
+            deviceLabel: "Alert target",
+            subscription: webPushSubscription("https://remaining.push.example/device"),
+          },
+          { audienceCeiling: "private" },
+        );
+        yield* notifications.notify({ title: "Trigger one removal" });
+        yield* waitFor(
+          () =>
+            logs.some(
+              (message) =>
+                message[0] === "Web push subscription removed after push service rejection" &&
+                (message[1] as Record<string, unknown>).deviceId === "alert-target",
+            ),
+          "Timed out waiting for removal-alert cleanup to finish.",
+        );
+      }).pipe(
+        Effect.provide(
+          Layer.mergeAll(
+            makeNotificationsLayerForBaseDir(
+              baseDir,
+              makeGuardLayer(() => Effect.succeed([{ address: "93.184.216.34", family: 4 }])),
+            ),
+            Logger.layer([logger], { mergeWithExisting: false }),
+          ),
+        ),
+      );
+
+      const persisted = decodeJson(yield* fs.readFileString(storePath)) as {
+        readonly tombstones?: ReadonlyArray<{ readonly deviceId: string }>;
+        readonly devices: ReadonlyArray<{ readonly deviceId: string; readonly status?: string }>;
+      };
+      assert.equal(sendNotification.mock.calls.length, 3);
+      assert.isTrue(
+        logs.some((message) => message[0] === "Failed to deliver push subscription removal alert"),
       );
       assert.deepEqual(
-        new Set(expiryLogs.map((log) => (log.message[1] as Record<string, unknown>).endpointHost)),
-        new Set(["gone.push.example", "expired.push.example"]),
+        persisted.tombstones?.map(({ deviceId }) => deviceId),
+        ["expired-first", "alert-target"],
       );
+      assert.equal(
+        persisted.devices.find((device) => device.deviceId === "alert-target")?.status,
+        "expired",
+      );
+    }).pipe(Effect.scoped),
+  );
+
+  it.effect("safely handles an expired push device with no remaining devices", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const baseDir = yield* fs.makeTempDirectoryScoped({
+        prefix: "t3-notifications-removal-alert-empty-",
+      });
+      const storePath = path.join(baseDir, "userdata", "notification-devices.json");
+      const sendNotification = vi
+        .spyOn(webPush, "sendNotification")
+        .mockRejectedValue(
+          new WebPushError("Subscription expired", 404, {}, "", "https://push.example/only"),
+        );
+
+      const result = yield* Effect.gen(function* () {
+        const notifications = yield* DeviceNotifications.DeviceNotifications;
+        yield* notifications.registerDevice(
+          {
+            deviceId: "only-device",
+            deviceKind: "web-push",
+            deviceLabel: "Only phone",
+            subscription: webPushSubscription("https://push.example/only"),
+          },
+          { audienceCeiling: "private" },
+        );
+        return yield* notifications.notify({ title: "Expire the only device" });
+      }).pipe(
+        Effect.provide(
+          makeNotificationsLayerForBaseDir(
+            baseDir,
+            makeGuardLayer(() => Effect.succeed([{ address: "93.184.216.34", family: 4 }])),
+          ),
+        ),
+      );
+
+      const persisted = decodeJson(yield* fs.readFileString(storePath)) as {
+        readonly tombstones?: ReadonlyArray<{ readonly deviceId: string }>;
+      };
+      assert.equal(result.deliveredDevices, 0);
+      assert.equal(sendNotification.mock.calls.length, 1);
       assert.deepEqual(
-        new Set(expiryLogs.map((log) => (log.message[1] as Record<string, unknown>).reason)),
-        new Set(["push-service-404", "push-service-410"]),
+        persisted.tombstones?.map(({ deviceId }) => deviceId),
+        ["only-device"],
       );
     }).pipe(Effect.scoped),
   );
