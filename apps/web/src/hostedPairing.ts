@@ -1,6 +1,7 @@
+import { DEFAULT_HOSTED_APP_URL } from "@t3tools/shared/connectAuth";
+
 import { getPairingTokenFromUrl, setPairingTokenOnUrl } from "./pairingUrl";
 
-const DEFAULT_HOSTED_APP_URL = "https://app.t3.codes";
 const CLOUDFLARE_PAGES_HOST_SUFFIX = ".pages.dev";
 const DEFAULT_SERVER_BACKED_CLOUDFLARE_PAGES_HOSTS = ["dl5-5uq.pages.dev"];
 
