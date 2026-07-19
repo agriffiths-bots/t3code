@@ -1,8 +1,3 @@
-// @effect-diagnostics nodeBuiltinImport:off
-import * as NodeOS from "node:os";
-
-import { HostProcessPlatform } from "@t3tools/shared/hostProcess";
-import { isExplicitRelativePath, isWindowsAbsolutePath } from "@t3tools/shared/path";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Option from "effect/Option";
@@ -11,11 +6,7 @@ import * as Path from "effect/Path";
 import { currentReadAudienceCeiling } from "../auth/audienceDataPolicy.ts";
 import { expandHomePath } from "../pathExpansion.ts";
 import * as ProjectionSnapshotQuery from "../orchestration/Services/ProjectionSnapshotQuery.ts";
-
-function resolveHomeAwarePath(input: string): string {
-  const trimmed = input.trim();
-  return trimmed.length === 0 ? NodeOS.homedir() : expandHomePath(trimmed);
-}
+import * as WorkspaceEntries from "../workspace/WorkspaceEntries.ts";
 
 function isWithinRoot(path: Path.Path, root: string, candidate: string): boolean {
   const relative = path.relative(root, candidate);
@@ -139,23 +130,8 @@ export const isBrowseTargetVisibleToCurrentAudience = Effect.fn(
   const audienceCeiling = yield* currentReadAudienceCeiling;
   if (audienceCeiling === "private") return true;
 
-  const platform = yield* HostProcessPlatform;
-  const path = yield* Path.Path;
-  const partialPath = input.partialPath.trim();
-  if (platform !== "win32" && isWindowsAbsolutePath(partialPath)) {
-    return false;
-  }
-
-  let resolvedInputPath: string;
-  if (!isExplicitRelativePath(partialPath)) {
-    resolvedInputPath = path.resolve(resolveHomeAwarePath(partialPath));
-  } else {
-    if (!input.cwd) return false;
-    resolvedInputPath = path.resolve(resolveHomeAwarePath(input.cwd), partialPath);
-  }
-
-  const endsWithSeparator =
-    partialPath.length === 0 || /[\\/]$/.test(partialPath) || partialPath === "~";
-  const parentPath = endsWithSeparator ? resolvedInputPath : path.dirname(resolvedInputPath);
-  return yield* isPathVisibleToCurrentAudience(parentPath);
+  const target = yield* WorkspaceEntries.resolveBrowseTarget(input).pipe(Effect.option);
+  if (Option.isNone(target)) return false;
+  if (!(yield* isPathVisibleToCurrentAudience(target.value.parentPath))) return false;
+  return !(yield* hasHiddenDescendantForCurrentAudience(target.value.parentPath));
 });

@@ -214,9 +214,20 @@ describe("ProjectFilesystemAudienceGuard", () => {
             partialPath: `${privateRoot}/`,
           }),
         ),
-        factoryBrowseTarget: runAsFactory(
+        factoryBrowseTargetWithHiddenDescendant: runAsFactory(
           ProjectFilesystemAudienceGuard.isBrowseTargetVisibleToCurrentAudience({
             partialPath: `${factoryRoot}/`,
+          }),
+        ),
+        absoluteBrowseTargetIgnoresCleanFactoryCwd: runAsFactory(
+          ProjectFilesystemAudienceGuard.isBrowseTargetVisibleToCurrentAudience({
+            cwd: factoryWorktree,
+            partialPath: `${factoryRoot}/`,
+          }),
+        ),
+        cleanFactoryBrowseTarget: runAsFactory(
+          ProjectFilesystemAudienceGuard.isBrowseTargetVisibleToCurrentAudience({
+            partialPath: `${factoryWorktree}/`,
           }),
         ),
         factoryWorktreeDestination: runAsFactory(
@@ -246,7 +257,9 @@ describe("ProjectFilesystemAudienceGuard", () => {
         nestedPrivateProjectFile: false,
         symlinkEscape: false,
         privateBrowseTarget: false,
-        factoryBrowseTarget: true,
+        factoryBrowseTargetWithHiddenDescendant: false,
+        absoluteBrowseTargetIgnoresCleanFactoryCwd: false,
+        cleanFactoryBrowseTarget: true,
         factoryWorktreeDestination: true,
         privateWorktreeDestination: false,
         symlinkWorktreeDestination: false,

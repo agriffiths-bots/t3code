@@ -537,16 +537,12 @@ export const assetRouteLayer = HttpRouter.add(
       return HttpServerResponse.text("Not Found", { status: 404 });
     }
 
-    const serverAuth = yield* EnvironmentAuth.EnvironmentAuth;
-    const session = yield* serverAuth.authenticateHttpRequest(request).pipe(Effect.option);
-    if (Option.isNone(session)) {
-      return HttpServerResponse.text("Not Found", { status: 404 });
-    }
-
+    // Asset URLs intentionally self-authenticate: DOM, native image, and browser-preview loads
+    // cannot attach bearer/DPoP headers. Resolution validates the short-lived signature and its
+    // required audience binding, so a separate request session must not be required here.
     const asset = yield* resolveAsset(
       suffix.slice(0, separatorIndex),
       suffix.slice(separatorIndex + 1),
-      { audienceCeiling: session.value.audienceCeiling },
     );
     if (!asset) {
       return HttpServerResponse.text("Not Found", { status: 404 });

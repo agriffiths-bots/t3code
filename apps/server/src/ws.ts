@@ -126,6 +126,7 @@ import * as GitHubCli from "./sourceControl/GitHubCli.ts";
 import * as GitLabCli from "./sourceControl/GitLabCli.ts";
 import * as SourceControlProviderRegistry from "./sourceControl/SourceControlProviderRegistry.ts";
 import * as GitVcsDriver from "./vcs/GitVcsDriver.ts";
+import { resolveCreateWorktreePath } from "./vcs/worktreePath.ts";
 import * as VcsDriverRegistry from "./vcs/VcsDriverRegistry.ts";
 import * as VcsProjectConfig from "./vcs/VcsProjectConfig.ts";
 import * as VcsProcess from "./vcs/VcsProcess.ts";
@@ -568,22 +569,6 @@ const makeWsRpcLayer = (currentSession: EnvironmentAuth.AuthenticatedSession) =>
                 }).pipe(Effect.as(false)),
               ),
             );
-      const visibleBrowseTarget = (input: {
-        readonly cwd?: string | undefined;
-        readonly partialPath: string;
-      }): Effect.Effect<boolean, never> =>
-        currentSession.audienceCeiling === "private"
-          ? Effect.succeed(true)
-          : withFilesystemGuardServices(
-              ProjectFilesystemAudienceGuard.isBrowseTargetVisibleToCurrentAudience(input),
-            ).pipe(
-              Effect.catchCause((cause) =>
-                Effect.logWarning("filesystem browse audience guard failed closed", {
-                  input,
-                  cause,
-                }).pipe(Effect.as(false)),
-              ),
-            );
       const hasHiddenDescendant = (candidatePath: string): Effect.Effect<boolean, never> =>
         currentSession.audienceCeiling === "private"
           ? Effect.succeed(false)
@@ -675,15 +660,17 @@ const makeWsRpcLayer = (currentSession: EnvironmentAuth.AuthenticatedSession) =>
                 ),
           ),
         );
-      const ensureBrowseVisible = (input: {
-        readonly cwd?: string | undefined;
-        readonly partialPath: string;
-      }) => {
-        const parentPath = input.cwd ?? input.partialPath;
-        return visibleBrowseTarget(input).pipe(
+      const ensureBrowseVisible = (
+        input: {
+          readonly cwd?: string | undefined;
+          readonly partialPath: string;
+        },
+        target: WorkspaceEntries.ResolvedBrowseTarget,
+      ) =>
+        visiblePath(target.parentPath).pipe(
           Effect.flatMap((visible) =>
             visible
-              ? hasHiddenDescendant(parentPath).pipe(Effect.map((hidden) => !hidden))
+              ? hasHiddenDescendant(target.parentPath).pipe(Effect.map((hidden) => !hidden))
               : Effect.succeed(false),
           ),
           Effect.flatMap((visible) =>
@@ -693,12 +680,11 @@ const makeWsRpcLayer = (currentSession: EnvironmentAuth.AuthenticatedSession) =>
                   new FilesystemBrowseError({
                     ...input,
                     failure: "read_directory_failed",
-                    parentPath,
+                    parentPath: target.parentPath,
                   }),
                 ),
           ),
         );
-      };
       const gitAudienceDenied = (input: {
         readonly operation: string;
         readonly command: string;
@@ -728,6 +714,27 @@ const makeWsRpcLayer = (currentSession: EnvironmentAuth.AuthenticatedSession) =>
             visible ? Effect.void : Effect.fail(gitAudienceDenied(input)),
           ),
         );
+      const ensureGitPreparePullRequestVisible = (input: {
+        readonly cwd: string;
+        readonly mode: "local" | "worktree";
+      }) =>
+        ensureGitCwdVisible({
+          operation: "preparePullRequestThread",
+          command: "git fetch",
+          cwd: input.cwd,
+        }).pipe(
+          Effect.andThen(
+            currentSession.audienceCeiling === "factory" && input.mode === "worktree"
+              ? Effect.fail(
+                  gitAudienceDenied({
+                    operation: "preparePullRequestThread",
+                    command: "git worktree add",
+                    cwd: input.cwd,
+                  }),
+                )
+              : Effect.void,
+          ),
+        );
       const visibleMutationTarget = (input: {
         readonly cwd: string;
         readonly targetPath: string;
@@ -754,7 +761,7 @@ const makeWsRpcLayer = (currentSession: EnvironmentAuth.AuthenticatedSession) =>
         const targetPath = input.targetPath;
         return visibleMutationTarget({ cwd: input.cwd, targetPath }).pipe(
           Effect.flatMap((visible) =>
-            visible ? Effect.void : Effect.fail(gitAudienceDenied({ ...input, cwd: targetPath })),
+            visible ? Effect.void : Effect.fail(gitAudienceDenied(input)),
           ),
         );
       };
@@ -1954,16 +1961,29 @@ const makeWsRpcLayer = (currentSession: EnvironmentAuth.AuthenticatedSession) =>
         [WS_METHODS.filesystemBrowse]: (input) =>
           observeRpcEffect(
             WS_METHODS.filesystemBrowse,
-            ensureBrowseVisible(input).pipe(
-              Effect.andThen(
-                workspaceEntries.browse(input).pipe(
-                  Effect.mapError(
-                    (cause) =>
-                      new FilesystemBrowseError({
-                        ...input,
-                        ...filesystemBrowseFailureContext(cause),
-                        cause,
-                      }),
+            WorkspaceEntries.resolveBrowseTarget(input).pipe(
+              Effect.provideService(Path.Path, pathService),
+              Effect.mapError(
+                (cause) =>
+                  new FilesystemBrowseError({
+                    ...input,
+                    ...filesystemBrowseFailureContext(cause),
+                    cause,
+                  }),
+              ),
+              Effect.flatMap((target) =>
+                ensureBrowseVisible(input, target).pipe(
+                  Effect.andThen(
+                    workspaceEntries.browseResolved(input, target).pipe(
+                      Effect.mapError(
+                        (cause) =>
+                          new FilesystemBrowseError({
+                            ...input,
+                            ...filesystemBrowseFailureContext(cause),
+                            cause,
+                          }),
+                      ),
+                    ),
                   ),
                 ),
               ),
@@ -2083,11 +2103,7 @@ const makeWsRpcLayer = (currentSession: EnvironmentAuth.AuthenticatedSession) =>
         [WS_METHODS.gitPreparePullRequestThread]: (input) =>
           observeRpcEffect(
             WS_METHODS.gitPreparePullRequestThread,
-            ensureGitCwdVisible({
-              operation: "preparePullRequestThread",
-              command: "git fetch",
-              cwd: input.cwd,
-            }).pipe(
+            ensureGitPreparePullRequestVisible(input).pipe(
               Effect.andThen(
                 gitWorkflow
                   .preparePullRequestThread(input)
@@ -2111,23 +2127,34 @@ const makeWsRpcLayer = (currentSession: EnvironmentAuth.AuthenticatedSession) =>
         [WS_METHODS.vcsCreateWorktree]: (input) =>
           observeRpcEffect(
             WS_METHODS.vcsCreateWorktree,
-            ensureGitCwdVisible({
-              operation: "createWorktree",
-              command: "git worktree add",
-              cwd: input.cwd,
+            Effect.succeed({
+              ...input,
+              path: resolveCreateWorktreePath({
+                ...input,
+                worktreesDir: config.worktreesDir,
+                pathService,
+              }),
             }).pipe(
-              Effect.andThen(
-                ensureGitMutationTargetVisible({
+              Effect.flatMap((resolvedInput) =>
+                ensureGitCwdVisible({
                   operation: "createWorktree",
                   command: "git worktree add",
-                  cwd: input.cwd,
-                  targetPath: input.path,
-                }),
-              ),
-              Effect.andThen(
-                gitWorkflow
-                  .createWorktree(input)
-                  .pipe(Effect.tap(() => refreshGitStatus(input.cwd))),
+                  cwd: resolvedInput.cwd,
+                }).pipe(
+                  Effect.andThen(
+                    ensureGitMutationTargetVisible({
+                      operation: "createWorktree",
+                      command: "git worktree add",
+                      cwd: resolvedInput.cwd,
+                      targetPath: resolvedInput.path,
+                    }),
+                  ),
+                  Effect.andThen(
+                    gitWorkflow
+                      .createWorktree(resolvedInput)
+                      .pipe(Effect.tap(() => refreshGitStatus(resolvedInput.cwd))),
+                  ),
+                ),
               ),
             ),
             { "rpc.aggregate": "vcs" },

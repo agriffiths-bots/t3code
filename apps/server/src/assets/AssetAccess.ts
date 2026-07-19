@@ -62,8 +62,8 @@ const PREVIEW_ASSET_EXTENSIONS = new Set([
 ]);
 
 const AudienceBoundAssetClaimFields = {
-  dataAudience: Schema.optional(DataAudience),
-  audienceCeiling: Schema.optional(AuthAudienceCeiling),
+  dataAudience: DataAudience,
+  audienceCeiling: AuthAudienceCeiling,
 };
 
 const AssetClaimsSchema = Schema.Union([
@@ -374,7 +374,6 @@ export const issueAssetUrl = Effect.fn("AssetAccess.issueAssetUrl")(function* (i
 export const resolveAsset = Effect.fn("AssetAccess.resolveAsset")(function* (
   token: string,
   relativePath: string,
-  options?: { readonly audienceCeiling?: AuthAudienceCeilingType },
 ) {
   const [encodedPayload, signature] = token.split(".");
   if (!encodedPayload || !signature) return null;
@@ -390,13 +389,7 @@ export const resolveAsset = Effect.fn("AssetAccess.resolveAsset")(function* (
   const claims = decodeClaims(encodedPayload);
   if (!claims || claims.expiresAt <= (yield* Clock.currentTimeMillis)) return null;
 
-  const requestedAudienceCeiling = options?.audienceCeiling ?? ("private" as const);
-  const claimsAudienceCeiling = claims.audienceCeiling ?? ("private" as const);
-  const claimsDataAudience = claims.dataAudience ?? ("private" as const);
-  if (
-    claimsAudienceCeiling !== requestedAudienceCeiling ||
-    !canReadDataAudience(requestedAudienceCeiling, claimsDataAudience)
-  ) {
+  if (!canReadDataAudience(claims.audienceCeiling, claims.dataAudience)) {
     return null;
   }
 

@@ -130,6 +130,7 @@ import * as SourceControlRepositoryService from "./sourceControl/SourceControlRe
 import * as ServerSecretStore from "./auth/ServerSecretStore.ts";
 import * as AssetAccess from "./assets/AssetAccess.ts";
 import * as EnvironmentAuth from "./auth/EnvironmentAuth.ts";
+import { base64UrlDecodeUtf8, base64UrlEncode, signPayload } from "./auth/utils.ts";
 import * as CloudManagedEndpointRuntime from "./cloud/ManagedEndpointRuntime.ts";
 import * as CloudCliTokenManager from "./cloud/CliTokenManager.ts";
 import * as ProcessDiagnostics from "./diagnostics/ProcessDiagnostics.ts";
@@ -2184,7 +2185,6 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
             Effect.gen(function* () {
               const response = yield* fetchEffect(
                 yield* getHttpServerUrl(issuedAssetUrl.relativeUrl),
-                { headers: { cookie: ownerCookie } },
               );
               if (response.status === 401 || response.status === 403) {
                 return yield* new SecurityProbeDenied({ source: "http" });
@@ -6280,7 +6280,7 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
     }).pipe(Effect.provide(NodeHttpServer.layerTest)),
   );
 
-  it.effect("masks private signed asset URLs under a factory audience token", () =>
+  it.effect("serves self-authenticating asset URLs and masks invalid audience claims", () =>
     Effect.gen(function* () {
       const fileSystem = yield* FileSystem.FileSystem;
       const path = yield* Path.Path;
@@ -6304,32 +6304,72 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
         dataAudience: "private",
         audienceCeiling: "private",
       }).pipe(Effect.provide(assetSetupLayer));
+      const crossAudienceAssetUrl = yield* AssetAccess.issueAssetUrl({
+        resource: { _tag: "attachment", attachmentId },
+        dataAudience: "private",
+        audienceCeiling: "factory",
+      }).pipe(Effect.provide(assetSetupLayer));
+      const factoryAssetUrl = yield* AssetAccess.issueAssetUrl({
+        resource: { _tag: "attachment", attachmentId },
+        dataAudience: "factory",
+        audienceCeiling: "factory",
+      }).pipe(Effect.provide(assetSetupLayer));
+      const signingSecret = yield* Effect.gen(function* () {
+        const secretStore = yield* ServerSecretStore.ServerSecretStore;
+        return yield* secretStore.getOrCreateRandom("asset-access-signing-key", 32);
+      }).pipe(Effect.provide(assetSetupLayer));
 
-      const unauthenticatedResponse = yield* fetchEffect(
-        yield* getHttpServerUrl(issuedAssetUrl.relativeUrl),
+      const rewriteSignedClaims = (
+        relativeUrl: string,
+        rewrite: (claims: Record<string, unknown>) => Record<string, unknown>,
+      ): string => {
+        const suffix = relativeUrl.slice(`${AssetAccess.ASSET_ROUTE_PREFIX}/`.length);
+        const separatorIndex = suffix.indexOf("/");
+        const token = suffix.slice(0, separatorIndex);
+        const fileName = suffix.slice(separatorIndex + 1);
+        const encodedPayload = token.split(".")[0];
+        assert.isDefined(encodedPayload);
+        const claims = JSON.parse(base64UrlDecodeUtf8(encodedPayload)) as Record<string, unknown>;
+        const rewrittenPayload = base64UrlEncode(JSON.stringify(rewrite(claims)));
+        return `${AssetAccess.ASSET_ROUTE_PREFIX}/${rewrittenPayload}.${signPayload(rewrittenPayload, signingSecret)}/${fileName}`;
+      };
+      const expiredAssetUrl = rewriteSignedClaims(issuedAssetUrl.relativeUrl, (claims) => ({
+        ...claims,
+        expiresAt: 0,
+      }));
+      const legacyAssetUrl = rewriteSignedClaims(issuedAssetUrl.relativeUrl, (claims) =>
+        Object.fromEntries(
+          Object.entries(claims).filter(
+            ([key]) => key !== "dataAudience" && key !== "audienceCeiling",
+          ),
+        ),
       );
-      assert.equal(unauthenticatedResponse.status, 404);
+      const invalidAssetUrl = issuedAssetUrl.relativeUrl.replace(/\.([^./]+)\//, ".$1x/");
 
-      const ownerCookie = yield* getAuthenticatedSessionCookieHeader();
-      const unrestrictedResponse = yield* fetchEffect(
-        yield* getHttpServerUrl(issuedAssetUrl.relativeUrl),
-        { headers: { cookie: ownerCookie } },
-      );
-      assert.equal(unrestrictedResponse.status, 200);
-      assert.equal(yield* unrestrictedResponse.text, "private attachment");
+      for (const relativeUrl of [issuedAssetUrl.relativeUrl, factoryAssetUrl.relativeUrl]) {
+        const unauthenticatedResponse = yield* fetchEffect(yield* getHttpServerUrl(relativeUrl));
+        assert.equal(unauthenticatedResponse.status, 200);
+        assert.equal(yield* unauthenticatedResponse.text, "private attachment");
+      }
 
-      const { response: tokenResponse, body: tokenBody } = yield* exchangeAccessToken(
-        defaultDesktopBootstrapToken,
-        { audienceCeiling: "factory", scope: "orchestration:read" },
-      );
-      assert.equal(tokenResponse.status, 200);
-      assert.isDefined(tokenBody.access_token);
-
-      const factoryResponse = yield* fetchEffect(
-        yield* getHttpServerUrl(issuedAssetUrl.relativeUrl),
-        { headers: { authorization: `Bearer ${tokenBody.access_token ?? ""}` } },
-      );
-      assert.equal(factoryResponse.status, 404);
+      for (const relativeUrl of [
+        invalidAssetUrl,
+        expiredAssetUrl,
+        legacyAssetUrl,
+        crossAudienceAssetUrl.relativeUrl,
+      ]) {
+        const response = yield* fetchEffect(yield* getHttpServerUrl(relativeUrl));
+        const body = yield* response.text;
+        const serializedResponse = encodeSecurityObservation({
+          status: response.status,
+          headers: response.headers,
+          body,
+        });
+        assert.equal(response.status, 404);
+        assert.equal(body, "Not Found");
+        assert.notInclude(serializedResponse, attachmentId);
+        assert.notInclude(serializedResponse, "private attachment");
+      }
     }).pipe(Effect.provide(NodeHttpServer.layerTest), TestClock.withLive),
   );
 
@@ -6541,7 +6581,13 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
 
   it.effect("routes websocket rpc git methods", () =>
     Effect.gen(function* () {
-      yield* buildAppUnderTest({
+      const path = yield* Path.Path;
+      const createWorktreeInputs: Array<{
+        readonly cwd: string;
+        readonly refName: string;
+        readonly path: string | null;
+      }> = [];
+      const config = yield* buildAppUnderTest({
         config: {
           cwd: "/tmp/repo",
         },
@@ -6677,10 +6723,12 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
                 nextCursor: null,
                 totalCount: 1,
               }),
-            createWorktree: () =>
-              Effect.succeed({
+            createWorktree: (input) => {
+              createWorktreeInputs.push(input);
+              return Effect.succeed({
                 worktree: { path: "/tmp/wt", refName: "feature/demo" },
-              }),
+              });
+            },
             removeWorktree: () => Effect.void,
             createRef: (input) => Effect.succeed({ refName: input.refName }),
             switchRef: (input) => Effect.succeed({ refName: input.refName }),
@@ -6800,6 +6848,13 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
         ),
       );
       assert.equal(worktree.worktree.refName, "feature/demo");
+      assert.deepEqual(createWorktreeInputs, [
+        {
+          cwd: "/tmp/repo",
+          refName: "main",
+          path: path.join(config.worktreesDir, "repo", "main"),
+        },
+      ]);
 
       yield* Effect.scoped(
         withWsRpcClient(wsUrl, (client) =>

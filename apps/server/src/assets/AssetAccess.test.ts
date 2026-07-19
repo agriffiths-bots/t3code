@@ -202,7 +202,7 @@ describe("AssetAccess", () => {
     }).pipe(Effect.provide(testLayer)),
   );
 
-  it.effect("rejects private-context attachment URLs under a factory resolver ceiling", () =>
+  it.effect("rejects audience claims that exceed their issuing ceiling", () =>
     Effect.gen(function* () {
       const config = yield* ServerConfig.ServerConfig;
       const fileSystem = yield* FileSystem.FileSystem;
@@ -215,14 +215,27 @@ describe("AssetAccess", () => {
       const result = yield* issueAssetUrl({
         resource: { _tag: "attachment", attachmentId },
         dataAudience: "private",
-        audienceCeiling: "private",
+        audienceCeiling: "factory",
       });
       const suffix = result.relativeUrl.slice(`${ASSET_ROUTE_PREFIX}/`.length);
       const separatorIndex = suffix.indexOf("/");
       const token = suffix.slice(0, separatorIndex);
 
-      expect(yield* resolveAsset(token, "ignored.png", { audienceCeiling: "factory" })).toBeNull();
-      expect(yield* resolveAsset(token, "ignored.png", { audienceCeiling: "private" })).toEqual({
+      expect(yield* resolveAsset(token, "ignored.png")).toBeNull();
+
+      const privateResult = yield* issueAssetUrl({
+        resource: { _tag: "attachment", attachmentId },
+        dataAudience: "private",
+        audienceCeiling: "private",
+      });
+      const privateSuffix = privateResult.relativeUrl.slice(`${ASSET_ROUTE_PREFIX}/`.length);
+      const privateSeparatorIndex = privateSuffix.indexOf("/");
+      expect(
+        yield* resolveAsset(
+          privateSuffix.slice(0, privateSeparatorIndex),
+          privateSuffix.slice(privateSeparatorIndex + 1),
+        ),
+      ).toEqual({
         kind: "file",
         path: attachmentPath,
       });
