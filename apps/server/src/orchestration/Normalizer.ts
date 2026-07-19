@@ -95,10 +95,45 @@ export const canonicalizeClientCommandTimestamps = (
   };
 };
 
+// `BootstrapTurnStartDispatcher` recognises a replayed bootstrap turn by
+// fingerprinting the request against the thread it already created, and that
+// fingerprint includes `createdAt`. Canonicalizing the bootstrap timestamp onto
+// the server receipt time would give every retry a fresh value, so the replay
+// would never match and the dispatcher would create a duplicate thread. Keep
+// the client's bootstrap timestamp as the stable identity for that check; the
+// turn-level `createdAt` is still canonicalized.
+const preserveBootstrapCreateThreadTimestamp = (
+  canonicalCommand: ClientOrchestrationCommand,
+  originalCommand: ClientOrchestrationCommand,
+): ClientOrchestrationCommand => {
+  if (
+    canonicalCommand.type !== "thread.turn.start" ||
+    !canonicalCommand.bootstrap?.createThread ||
+    originalCommand.type !== "thread.turn.start" ||
+    !originalCommand.bootstrap?.createThread
+  ) {
+    return canonicalCommand;
+  }
+
+  return {
+    ...canonicalCommand,
+    bootstrap: {
+      ...canonicalCommand.bootstrap,
+      createThread: {
+        ...canonicalCommand.bootstrap.createThread,
+        createdAt: originalCommand.bootstrap.createThread.createdAt,
+      },
+    },
+  };
+};
+
 export const normalizeDispatchCommand = (command: ClientOrchestrationCommand) =>
   Effect.gen(function* () {
     const receivedAt = DateTime.formatIso(yield* DateTime.now);
-    const canonicalCommand = canonicalizeClientCommandTimestamps(command, receivedAt);
+    const canonicalCommand = preserveBootstrapCreateThreadTimestamp(
+      canonicalizeClientCommandTimestamps(command, receivedAt),
+      command,
+    );
     const fileSystem = yield* FileSystem.FileSystem;
     const path = yield* Path.Path;
     const serverConfig = yield* ServerConfig;

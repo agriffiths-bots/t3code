@@ -549,13 +549,10 @@ export function TerminalViewport({
             if (requestId !== selectionActionRequestIdRef.current) {
               return;
             }
-            const activeTerminal = terminalRef.current;
-            if (activeTerminal) {
-              writeSystemMessage(
-                activeTerminal,
-                error instanceof Error ? error.message : "Unable to copy terminal selection",
-              );
-            }
+            writeSystemMessage(
+              terminalWriterRef.current,
+              error instanceof Error ? error.message : "Unable to copy terminal selection",
+            );
           }
           if (requestId === selectionActionRequestIdRef.current) {
             terminalRef.current?.focus();
