@@ -3946,6 +3946,71 @@ describe("ChildThreadCoordinator", () => {
     }
   });
 
+  it("keeps replay-derived stopped interrupted projections pending after unarchive on boot", async () => {
+    const child = ThreadId.make("recon-unarchive-replayed-stopped-interrupted-child");
+    const parent = ThreadId.make("recon-unarchive-replayed-stopped-interrupted-parent");
+    const staleWakeId = PendingDispatchId.make(
+      "pd-recon-unarchive-replayed-stopped-interrupted-stale",
+    );
+    const turn1 = TurnId.make("turn-before-unarchive");
+    const reason = "Provider process exited with code 0.";
+    const sessionStoppedAt = "2026-06-17T09:59:59.000Z";
+    const interruptedProjectionAt = "2026-06-17T10:00:01.000Z";
+    const harness = await createHarness({
+      threads: [
+        makeThreadState({
+          threadId: parent,
+          latestTurn: makeLatestTurn("completed", TurnId.make("parent-turn")),
+          session: makeSession(parent, "ready"),
+        }),
+        makeThreadState({
+          threadId: child,
+          parentThreadId: parent,
+          latestTurn: makeLatestTurn("interrupted", turn1, interruptedProjectionAt),
+          session: makeSession(child, "stopped", null, reason, sessionStoppedAt),
+        }),
+      ],
+      seedChildRows: [{ threadId: child, parentThreadId: parent }],
+      persistedEvents: [
+        sessionSetEvent(child, "running", turn1),
+        sessionSetEvent(child, "ready"),
+        threadArchivedEvent(child),
+        threadUnarchivedEvent(child),
+      ],
+      seedPendingDispatches: [
+        {
+          id: staleWakeId,
+          kind: "parent_injection",
+          targetThreadId: parent,
+          sourceChildId: child,
+          text: null,
+          error: reason,
+          status: "failed",
+          commandId: null,
+          deliveredByWait: true,
+          waitCancellable: true,
+          createdAt: sessionStoppedAt as unknown as PendingDispatch["createdAt"],
+        },
+      ],
+      seedWaitDeliveries: [{ childThreadId: child, parentThreadId: parent }],
+      seedPromotedChildren: [{ childThreadId: child, parentThreadId: parent }],
+    });
+
+    const entries = await runtimeListChildren(harness, parent);
+    expect(entries).toHaveLength(1);
+    expect(entries[0]!.settled).toBe(false);
+    expect(await harness.listPendingDispatches()).toEqual([]);
+    expect(await harness.listWaitDeliveries()).toEqual([]);
+    expect(await harness.listPromotedChildren()).toEqual([]);
+    expect(await harness.listDispatchLeaseChildIds()).toEqual([]);
+    expect(await harness.canAcquireDispatchLease()).toBe(true);
+    expect(
+      harness.dispatched.filter(
+        (command) => command.type === "thread.turn.start" && command.threadId === parent,
+      ),
+    ).toEqual([]);
+  });
+
   it("settles newer unarchived terminal session projections on boot", async () => {
     const child = ThreadId.make("recon-unarchive-newer-terminal-session-child");
     const parent = ThreadId.make("recon-unarchive-newer-terminal-session-parent");
@@ -3954,10 +4019,15 @@ describe("ChildThreadCoordinator", () => {
     const harness = await createHarness({
       threads: [
         makeThreadState({
+          threadId: parent,
+          latestTurn: makeLatestTurn("completed", TurnId.make("parent-turn")),
+          session: makeSession(parent, "ready"),
+        }),
+        makeThreadState({
           threadId: child,
           parentThreadId: parent,
-          latestTurn: makeLatestTurn("error", TurnId.make("turn-after-unarchive"), terminalAt),
-          session: makeSession(child, "error", null, reason, terminalAt),
+          latestTurn: makeLatestTurn("interrupted", TurnId.make("turn-before-unarchive")),
+          session: makeSession(child, "stopped", null, reason, terminalAt),
         }),
       ],
       seedChildRows: [{ threadId: child, parentThreadId: parent }],
@@ -3971,6 +4041,12 @@ describe("ChildThreadCoordinator", () => {
     const result = await runtimeRun(harness, child);
     expect(result.status).toBe("failed");
     expect(result.error).toBe(reason);
+    expect(await harness.listDispatchLeaseChildIds()).not.toContain(child);
+    const parentWakes = harness.dispatched.filter(
+      (command) => command.type === "thread.turn.start" && command.threadId === parent,
+    ) as Array<Extract<OrchestrationCommand, { type: "thread.turn.start" }>>;
+    expect(parentWakes).toHaveLength(1);
+    expect(parentWakes[0]!.message.text).toContain(`[sub-agent ${child} failed] ${reason}`);
   });
 
   it("does not re-mark fully pruned archived wakes as queued on boot", async () => {
