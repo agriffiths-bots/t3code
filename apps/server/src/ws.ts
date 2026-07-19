@@ -410,6 +410,7 @@ const makeWsRpcLayer = (currentSession: EnvironmentAuth.AuthenticatedSession) =>
       const keybindings = yield* Keybindings.Keybindings;
       const externalLauncher = yield* ExternalLauncher.ExternalLauncher;
       const gitWorkflow = yield* GitWorkflowService.GitWorkflowService;
+      const vcsDriverRegistry = yield* VcsDriverRegistry.VcsDriverRegistry;
       const review = yield* ReviewService.ReviewService;
       const vcsProvisioning = yield* VcsProvisioningService.VcsProvisioningService;
       const vcsStatusBroadcaster = yield* VcsStatusBroadcaster.VcsStatusBroadcaster;
@@ -555,6 +556,7 @@ const makeWsRpcLayer = (currentSession: EnvironmentAuth.AuthenticatedSession) =>
             ProjectionSnapshotQuery.ProjectionSnapshotQuery,
             projectionSnapshotQuery,
           ),
+          Effect.provideService(VcsDriverRegistry.VcsDriverRegistry, vcsDriverRegistry),
         );
       const visiblePath = (candidatePath: string): Effect.Effect<boolean, never> =>
         currentSession.audienceCeiling === "private"
@@ -707,7 +709,19 @@ const makeWsRpcLayer = (currentSession: EnvironmentAuth.AuthenticatedSession) =>
         visiblePath(input.cwd).pipe(
           Effect.flatMap((visible) =>
             visible
-              ? hasHiddenDescendant(input.cwd).pipe(Effect.map((hidden) => !hidden))
+              ? withFilesystemGuardServices(
+                  ProjectFilesystemAudienceGuard.hasHiddenDescendantAtGitRepositoryRootForCurrentAudience(
+                    input.cwd,
+                  ),
+                ).pipe(
+                  Effect.catchCause((cause) =>
+                    Effect.logWarning("git repository audience guard failed closed", {
+                      cwd: input.cwd,
+                      cause,
+                    }).pipe(Effect.as(true)),
+                  ),
+                  Effect.map((hidden) => !hidden),
+                )
               : Effect.succeed(false),
           ),
           Effect.flatMap((visible) =>
@@ -2003,6 +2017,10 @@ const makeWsRpcLayer = (currentSession: EnvironmentAuth.AuthenticatedSession) =>
                     ...(context.workspaceRoot ? { workspaceRoot: context.workspaceRoot } : {}),
                     dataAudience: context.dataAudience,
                     audienceCeiling: currentSession.audienceCeiling,
+                    surfaceSessionId: currentSession.sessionId,
+                    ...(currentSession.expiresAt
+                      ? { surfaceSessionExpiresAt: currentSession.expiresAt }
+                      : {}),
                   }),
                 ),
               ),
@@ -2220,9 +2238,17 @@ const makeWsRpcLayer = (currentSession: EnvironmentAuth.AuthenticatedSession) =>
             { "rpc.aggregate": "vcs" },
           ),
         [WS_METHODS.reviewGetDiffPreview]: (input) =>
-          observeRpcEffect(WS_METHODS.reviewGetDiffPreview, review.getDiffPreview(input), {
-            "rpc.aggregate": "review",
-          }),
+          observeRpcEffect(
+            WS_METHODS.reviewGetDiffPreview,
+            ensureGitCwdVisible({
+              operation: "getDiffPreview",
+              command: "git diff",
+              cwd: input.cwd,
+            }).pipe(Effect.andThen(review.getDiffPreview(input))),
+            {
+              "rpc.aggregate": "review",
+            },
+          ),
         [WS_METHODS.terminalOpen]: (input) =>
           observeRpcEffect(WS_METHODS.terminalOpen, terminalManager.open(input), {
             "rpc.aggregate": "terminal",

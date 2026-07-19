@@ -22,6 +22,8 @@ import * as Path from "effect/Path";
 
 import { canReadDataAudience, currentReadAudienceCeiling } from "../auth/audienceDataPolicy.ts";
 import * as ProjectionSnapshotQuery from "../orchestration/Services/ProjectionSnapshotQuery.ts";
+import * as VcsDriverRegistry from "../vcs/VcsDriverRegistry.ts";
+import * as VcsProcess from "../vcs/VcsProcess.ts";
 import * as ProjectFilesystemAudienceGuard from "./ProjectFilesystemAudienceGuard.ts";
 
 const now = "2026-07-18T12:00:00.000Z";
@@ -136,6 +138,68 @@ const makeProjectionLayer = (input: {
   });
 
 describe("ProjectFilesystemAudienceGuard", () => {
+  it.effect("checks repo-wide Git reads from the repository root, not a clean subdirectory", () =>
+    Effect.gen(function* () {
+      const fileSystem = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const repoRoot = yield* fileSystem.makeTempDirectoryScoped({
+        prefix: "t3-guard-repo-root-",
+      });
+      const cleanSubdirectory = path.join(repoRoot, "src");
+      const privateSibling = path.join(repoRoot, "private");
+      yield* fileSystem.makeDirectory(cleanSubdirectory);
+      yield* fileSystem.makeDirectory(privateSibling);
+      yield* fileSystem.writeFileString(path.join(privateSibling, "secret.txt"), "private\n");
+
+      const registry = yield* VcsDriverRegistry.VcsDriverRegistry;
+      const git = yield* registry.get("git");
+      yield* git.execute({ operation: "test.git.init", cwd: repoRoot, args: ["init"] });
+      yield* git.execute({
+        operation: "test.git.add-private-sibling",
+        cwd: repoRoot,
+        args: ["add", "private/secret.txt"],
+      });
+      const unguardedStatus = yield* git.execute({
+        operation: "test.git.status",
+        cwd: cleanSubdirectory,
+        args: ["status", "--porcelain=2", "--branch"],
+      });
+      expect(unguardedStatus.stdout).toContain("../private/secret.txt");
+
+      const factoryProject = makeProject("project-repo-factory", repoRoot, "factory");
+      const privateProject = makeProject("project-repo-private", privateSibling, "private");
+      const projectionLayer = makeProjectionLayer({
+        projects: [factoryProject, privateProject],
+        threads: [],
+      });
+      const runAsFactory = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
+        effect.pipe(Effect.provideService(EnvironmentAuthenticatedPrincipal, principal("factory")));
+
+      const result = yield* Effect.all({
+        callerScopedCheck: runAsFactory(
+          ProjectFilesystemAudienceGuard.hasHiddenDescendantForCurrentAudience(cleanSubdirectory),
+        ),
+        repositoryScopedCheck: runAsFactory(
+          ProjectFilesystemAudienceGuard.hasHiddenDescendantAtGitRepositoryRootForCurrentAudience(
+            cleanSubdirectory,
+          ),
+        ),
+      }).pipe(Effect.provide(projectionLayer));
+
+      expect(result).toEqual({
+        callerScopedCheck: false,
+        repositoryScopedCheck: true,
+      });
+    }).pipe(
+      Effect.provide(
+        VcsDriverRegistry.layer.pipe(
+          Layer.provideMerge(VcsProcess.layer),
+          Layer.provideMerge(NodeServices.layer),
+        ),
+      ),
+    ),
+  );
+
   it.effect("keeps factory filesystem and VCS paths inside factory project roots", () =>
     Effect.gen(function* () {
       const fileSystem = yield* FileSystem.FileSystem;
