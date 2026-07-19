@@ -7,6 +7,7 @@ import { currentReadAudienceCeiling, strictestDataAudience } from "../auth/audie
 import { expandHomePath } from "../pathExpansion.ts";
 import * as ProjectionSnapshotQuery from "../orchestration/Services/ProjectionSnapshotQuery.ts";
 import * as WorkspaceEntries from "../workspace/WorkspaceEntries.ts";
+import * as VcsDriverRegistry from "../vcs/VcsDriverRegistry.ts";
 
 function isWithinRoot(path: Path.Path, root: string, candidate: string): boolean {
   const relative = path.relative(root, candidate);
@@ -141,6 +142,18 @@ export const hasHiddenDescendantForCurrentAudience = Effect.fn(
       root.path !== realCandidate.value &&
       isWithinRoot(path, realCandidate.value, root.path),
   );
+});
+
+export const hasHiddenDescendantAtGitRepositoryRootForCurrentAudience = Effect.fn(
+  "ProjectFilesystemAudienceGuard.hasHiddenDescendantAtGitRepositoryRootForCurrentAudience",
+)(function* (cwd: string) {
+  const audienceCeiling = yield* currentReadAudienceCeiling;
+  if (audienceCeiling === "private") return false;
+
+  const registry = yield* VcsDriverRegistry.VcsDriverRegistry;
+  const detected = yield* registry.detect({ cwd, requestedKind: "git", cache: "bypass" });
+  if (detected === null) return true;
+  return yield* hasHiddenDescendantForCurrentAudience(detected.repository.rootPath);
 });
 
 export const isBrowseTargetVisibleToCurrentAudience = Effect.fn(

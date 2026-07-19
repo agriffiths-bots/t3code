@@ -10,6 +10,7 @@ import {
   AssetProjectFaviconNotFoundError,
   AssetProjectFaviconResolutionError,
   AssetSigningKeyLoadError,
+  AuthSessionId,
   AssetWorkspaceAssetInspectionError,
   AssetWorkspaceAssetNotFoundError,
   AssetWorkspaceContextNotFoundError,
@@ -30,6 +31,7 @@ import {
 } from "@t3tools/shared/filePreview";
 import { PROJECT_FAVICON_FALLBACK_MARKER } from "@t3tools/shared/projectFavicon";
 import * as Clock from "effect/Clock";
+import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as FileSystem from "effect/FileSystem";
@@ -45,6 +47,7 @@ import {
   timingSafeEqualBase64Url,
 } from "../auth/utils.ts";
 import * as ServerSecretStore from "../auth/ServerSecretStore.ts";
+import * as SessionStore from "../auth/SessionStore.ts";
 import { canReadDataAudience, strictestDataAudience } from "../auth/audienceDataPolicy.ts";
 import {
   parseThreadSegmentFromAttachmentId,
@@ -58,6 +61,20 @@ import * as ProjectFaviconResolver from "../project/ProjectFaviconResolver.ts";
 import * as WorkspacePaths from "../workspace/WorkspacePaths.ts";
 
 export const ASSET_ROUTE_PREFIX = "/api/assets";
+export const ASSET_SURFACE_RELAY_PREFIX = `${ASSET_ROUTE_PREFIX}/relay`;
+export const ASSET_SURFACE_BIND_PATH = `${ASSET_SURFACE_RELAY_PREFIX}/surface`;
+export const ASSET_SURFACE_CREDENTIAL_HEADER = "x-t3-asset-surface";
+
+export function assetSurfaceCookiePrefix(sessionCookieName: string): string {
+  return `${sessionCookieName}_asset_surface_`;
+}
+
+export function assetSurfaceCookieName(
+  sessionCookieName: string,
+  surfaceBindingId: string,
+): string {
+  return `${assetSurfaceCookiePrefix(sessionCookieName)}${surfaceBindingId}`;
+}
 
 const SIGNING_SECRET_NAME = "asset-access-signing-key";
 const ASSET_TOKEN_TTL_MS = 60 * 60 * 1000;
@@ -76,7 +93,17 @@ const PREVIEW_ASSET_EXTENSIONS = new Set([
 const AudienceBoundAssetClaimFields = {
   dataAudience: DataAudience,
   audienceCeiling: AuthAudienceCeiling,
+  surfaceBindingId: Schema.NullOr(Schema.String),
 };
+
+const AssetSurfaceCredentialClaimsSchema = Schema.Struct({
+  version: Schema.Literal(1),
+  kind: Schema.Literal("asset-surface"),
+  surfaceSessionId: AuthSessionId,
+  surfaceBindingId: Schema.String,
+  expiresAt: Schema.Number,
+});
+type AssetSurfaceCredentialClaims = typeof AssetSurfaceCredentialClaimsSchema.Type;
 
 const AssetClaimsSchema = Schema.Union([
   Schema.Struct({
@@ -116,6 +143,11 @@ type AssetClaims = typeof AssetClaimsSchema.Type;
 const AssetClaimsJson = Schema.fromJsonString(AssetClaimsSchema);
 const decodeAssetClaims = Schema.decodeUnknownOption(AssetClaimsJson);
 const encodeAssetClaims = Schema.encodeSync(AssetClaimsJson);
+const AssetSurfaceCredentialClaimsJson = Schema.fromJsonString(AssetSurfaceCredentialClaimsSchema);
+const decodeAssetSurfaceCredentialClaims = Schema.decodeUnknownOption(
+  AssetSurfaceCredentialClaimsJson,
+);
+const encodeAssetSurfaceCredentialClaims = Schema.encodeSync(AssetSurfaceCredentialClaimsJson);
 
 export type ResolvedAsset = {
   readonly kind: "file";
@@ -248,6 +280,26 @@ function decodeClaims(encodedPayload: string): AssetClaims | null {
   }
 }
 
+function decodeSurfaceCredentialClaims(
+  encodedPayload: string,
+): AssetSurfaceCredentialClaims | null {
+  try {
+    return Option.getOrNull(
+      decodeAssetSurfaceCredentialClaims(base64UrlDecodeUtf8(encodedPayload)),
+    );
+  } catch {
+    return null;
+  }
+}
+
+function signToken(encodedPayload: string, signingSecret: Uint8Array): string {
+  return `${encodedPayload}.${signPayload(encodedPayload, signingSecret)}`;
+}
+
+function surfaceBindingIdForSession(sessionId: AuthSessionId, signingSecret: Uint8Array): string {
+  return signPayload(`asset-surface:${sessionId}`, signingSecret);
+}
+
 function decodeRelativePath(value: string): string | null {
   try {
     return decodeURIComponent(value);
@@ -314,11 +366,14 @@ export const issueAssetUrl = Effect.fn("AssetAccess.issueAssetUrl")(function* (i
   readonly workspaceRoot?: string;
   readonly dataAudience?: DataAudienceType;
   readonly audienceCeiling?: AuthAudienceCeilingType;
+  readonly surfaceSessionId?: AuthSessionId;
+  readonly surfaceSessionExpiresAt?: DateTime.DateTime;
 }) {
   const fileSystem = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
   const workspacePaths = yield* WorkspacePaths.WorkspacePaths;
-  const expiresAt = (yield* Clock.currentTimeMillis) + ASSET_TOKEN_TTL_MS;
+  const now = yield* Clock.currentTimeMillis;
+  let expiresAt = now + ASSET_TOKEN_TTL_MS;
   const claimedDataAudience = input.dataAudience ?? ("private" as const);
   const audienceCeiling = input.audienceCeiling ?? ("private" as const);
   let claims: AssetClaims;
@@ -398,6 +453,7 @@ export const issueAssetUrl = Effect.fn("AssetAccess.issueAssetUrl")(function* (i
             workspaceRoot: canonicalWorkspaceRoot,
             relativePath: resolved.relativePath,
             expiresAt,
+            surfaceBindingId: null,
             ...audienceClaims,
           }
         : {
@@ -406,6 +462,7 @@ export const issueAssetUrl = Effect.fn("AssetAccess.issueAssetUrl")(function* (i
             workspaceRoot: canonicalWorkspaceRoot,
             baseRelativePath: path.dirname(resolved.relativePath),
             expiresAt,
+            surfaceBindingId: null,
             ...audienceClaims,
           };
       fileName = path.basename(resolved.relativePath);
@@ -439,6 +496,7 @@ export const issueAssetUrl = Effect.fn("AssetAccess.issueAssetUrl")(function* (i
         kind: "attachment",
         attachmentId: input.resource.attachmentId,
         expiresAt,
+        surfaceBindingId: null,
         ...audienceClaims,
       };
       fileName = path.basename(attachmentPath);
@@ -501,6 +559,7 @@ export const issueAssetUrl = Effect.fn("AssetAccess.issueAssetUrl")(function* (i
         ),
         relativePath,
         expiresAt,
+        surfaceBindingId: null,
         ...audienceClaims,
       };
       fileName = relativePath ? path.basename(relativePath) : PROJECT_FAVICON_FALLBACK_MARKER;
@@ -518,18 +577,81 @@ export const issueAssetUrl = Effect.fn("AssetAccess.issueAssetUrl")(function* (i
         }),
     ),
   );
+  let surfaceSessionId: AuthSessionId | null = null;
+  let surfaceBindingId: string | null = null;
+  if (claims.dataAudience === "private") {
+    if (input.surfaceSessionId === undefined || input.surfaceSessionExpiresAt === undefined) {
+      return yield* new AssetWorkspaceContextNotFoundError({ resource: input.resource });
+    }
+    surfaceSessionId = input.surfaceSessionId;
+    surfaceBindingId = surfaceBindingIdForSession(surfaceSessionId, signingSecret);
+    expiresAt = Math.min(expiresAt, input.surfaceSessionExpiresAt.epochMilliseconds);
+    if (expiresAt <= now) {
+      return yield* new AssetWorkspaceContextNotFoundError({ resource: input.resource });
+    }
+  }
+  claims = { ...claims, surfaceBindingId, expiresAt };
   const encodedPayload = base64UrlEncode(encodeAssetClaims(claims));
-  const token = `${encodedPayload}.${signPayload(encodedPayload, signingSecret)}`;
+  const token = signToken(encodedPayload, signingSecret);
+  const surfaceCredential =
+    surfaceBindingId === null || surfaceSessionId === null
+      ? null
+      : signToken(
+          base64UrlEncode(
+            encodeAssetSurfaceCredentialClaims({
+              version: 1,
+              kind: "asset-surface",
+              surfaceSessionId,
+              surfaceBindingId,
+              expiresAt,
+            }),
+          ),
+          signingSecret,
+        );
   return {
-    relativeUrl: `${ASSET_ROUTE_PREFIX}/${token}/${encodeURIComponent(fileName)}`,
+    relativeUrl: `${surfaceBindingId === null ? ASSET_ROUTE_PREFIX : ASSET_SURFACE_RELAY_PREFIX}/${token}/${encodeURIComponent(fileName)}`,
     expiresAt,
+    surfaceCredential,
   };
 });
+
+export const verifyAssetSurfaceCredential = Effect.fn("AssetAccess.verifyAssetSurfaceCredential")(
+  function* (credential: string) {
+    const [encodedPayload, signature] = credential.split(".");
+    if (!encodedPayload || !signature) return null;
+
+    const secretStore = yield* ServerSecretStore.ServerSecretStore;
+    const signingSecret = yield* secretStore.getOrCreateRandom(SIGNING_SECRET_NAME, 32).pipe(
+      Effect.tapError((cause) =>
+        Effect.logError("Failed to load the asset surface signing key.", { cause }),
+      ),
+      Effect.orElseSucceed(() => null),
+    );
+    if (!signingSecret) return null;
+    if (!timingSafeEqualBase64Url(signature, signPayload(encodedPayload, signingSecret)))
+      return null;
+
+    const claims = decodeSurfaceCredentialClaims(encodedPayload);
+    if (!claims || claims.expiresAt <= (yield* Clock.currentTimeMillis)) return null;
+    const sessions = yield* SessionStore.SessionStore;
+    const active = yield* sessions.isActive(claims.surfaceSessionId).pipe(
+      Effect.tapError((cause) =>
+        Effect.logWarning("Failed to verify the asset surface session.", {
+          sessionId: claims.surfaceSessionId,
+          cause,
+        }),
+      ),
+      Effect.orElseSucceed(() => false),
+    );
+    if (!active) return null;
+    return claims;
+  },
+);
 
 export const resolveAsset = Effect.fn("AssetAccess.resolveAsset")(function* (
   token: string,
   relativePath: string,
-  requestAudienceCeiling: AuthAudienceCeilingType | null = null,
+  requestSurfaceCredentials: string | null | ReadonlyArray<string> = null,
 ) {
   const [encodedPayload, signature] = token.split(".");
   if (!encodedPayload || !signature) return null;
@@ -548,8 +670,21 @@ export const resolveAsset = Effect.fn("AssetAccess.resolveAsset")(function* (
   if (!canReadDataAudience(claims.audienceCeiling, claims.dataAudience)) {
     return null;
   }
-  if (!canReadDataAudience(requestAudienceCeiling ?? "factory", claims.dataAudience)) {
-    return forbiddenAsset;
+  if (claims.dataAudience === "private") {
+    if (claims.surfaceBindingId === null) return null;
+    const credentials =
+      typeof requestSurfaceCredentials === "string"
+        ? [requestSurfaceCredentials]
+        : (requestSurfaceCredentials ?? []);
+    let matchedSurface = false;
+    for (const credential of credentials) {
+      const surfaceCredential = yield* verifyAssetSurfaceCredential(credential);
+      if (surfaceCredential?.surfaceBindingId === claims.surfaceBindingId) {
+        matchedSurface = true;
+        break;
+      }
+    }
+    if (!matchedSurface) return null;
   }
 
   const authorizeResolvedPath = Effect.fn("AssetAccess.resolveAsset.authorizeResolvedPath")(
@@ -570,9 +705,6 @@ export const resolveAsset = Effect.fn("AssetAccess.resolveAsset")(function* (
               opened.canonicalPath,
             ).pipe(Effect.orElseSucceed(() => null))) ?? "private";
           if (!canReadDataAudience(claims.dataAudience, liveDataAudience)) {
-            return forbiddenAsset;
-          }
-          if (!canReadDataAudience(requestAudienceCeiling ?? "factory", liveDataAudience)) {
             return forbiddenAsset;
           }
           return transferToResponse();
@@ -612,9 +744,6 @@ export const resolveAsset = Effect.fn("AssetAccess.resolveAsset")(function* (
             Effect.orElseSucceed(() => null),
           )) ?? "private";
         if (!canReadDataAudience(claims.dataAudience, liveDataAudience)) {
-          return forbiddenAsset;
-        }
-        if (!canReadDataAudience(requestAudienceCeiling ?? "factory", liveDataAudience)) {
           return forbiddenAsset;
         }
         return transferToResponse();
