@@ -518,6 +518,95 @@ describe("OrchestrationEngine", () => {
     await system.dispose();
   });
 
+  it("replays an authorized archive cascade receipt against the requested root", async () => {
+    const createdAt = now();
+    const system = await createOrchestrationSystem();
+    const { engine } = system;
+    const projectId = asProjectId("project-archive-cascade-receipt");
+    const rootThreadId = ThreadId.make("thread-archive-cascade-receipt-root");
+    const childThreadId = ThreadId.make("thread-archive-cascade-receipt-child");
+    const modelSelection = {
+      instanceId: ProviderInstanceId.make("codex"),
+      model: "gpt-5-codex",
+    } as const;
+
+    await system.run(
+      engine.dispatch(
+        {
+          type: "project.create",
+          commandId: CommandId.make("cmd-archive-cascade-receipt-project"),
+          projectId,
+          title: "Archive cascade receipt project",
+          workspaceRoot: "/tmp/project-archive-cascade-receipt",
+          defaultModelSelection: modelSelection,
+          createdAt,
+        },
+        factoryDispatchAuthority,
+      ),
+    );
+    for (const [threadId, title] of [
+      [rootThreadId, "Archive cascade root"],
+      [childThreadId, "Archive cascade child"],
+    ] as const) {
+      await system.run(
+        engine.dispatch(
+          {
+            type: "thread.create",
+            commandId: CommandId.make(`cmd-${threadId}-create`),
+            threadId,
+            projectId,
+            title,
+            modelSelection,
+            interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+            runtimeMode: "approval-required",
+            branch: null,
+            worktreePath: null,
+            createdAt,
+          },
+          factoryDispatchAuthority,
+        ),
+      );
+    }
+    await system.run(
+      engine.dispatch(
+        {
+          type: "thread.parent.set",
+          commandId: CommandId.make("cmd-archive-cascade-receipt-parent"),
+          threadId: childThreadId,
+          parentThreadId: rootThreadId,
+          createdAt,
+        },
+        factoryDispatchAuthority,
+      ),
+    );
+
+    const archiveCommand = {
+      type: "thread.archive" as const,
+      commandId: CommandId.make("cmd-archive-cascade-receipt-replay"),
+      threadId: rootThreadId,
+    };
+    const firstResult = await system.run(engine.dispatch(archiveCommand, factoryDispatchAuthority));
+    const receipt = Option.getOrThrow(
+      await system.run(
+        system.commandReceiptRepository.getByCommandId({
+          commandId: archiveCommand.commandId,
+        }),
+      ),
+    );
+    const retryResult = await system.run(engine.dispatch(archiveCommand, factoryDispatchAuthority));
+    const events = await system.run(
+      Stream.runCollect(engine.readEvents(0)).pipe(
+        Effect.map((chunk): OrchestrationEvent[] => Array.from(chunk)),
+      ),
+    );
+
+    expect(receipt.aggregateKind).toBe("thread");
+    expect(receipt.aggregateId).toBe(rootThreadId);
+    expect(retryResult).toEqual(firstResult);
+    expect(events.filter((event) => event.commandId === archiveCommand.commandId)).toHaveLength(2);
+    await system.dispose();
+  });
+
   it("archives and unarchives threads through orchestration commands", async () => {
     const system = await createOrchestrationSystem();
     const { engine } = system;

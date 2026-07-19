@@ -171,20 +171,6 @@ function findActiveProjectByWorkspaceRoot(input: {
   );
 }
 
-function findActiveProjectWorkspaceRootCollision(input: {
-  readonly readModel: OrchestrationReadModel;
-  readonly workspaceRoot: string;
-  readonly exceptProjectId: ProjectId;
-}): OrchestrationProject | undefined {
-  const existingProject = findActiveProjectByWorkspaceRoot({
-    readModel: input.readModel,
-    workspaceRoot: input.workspaceRoot,
-  });
-  return existingProject !== undefined && existingProject.id !== input.exceptProjectId
-    ? existingProject
-    : undefined;
-}
-
 function pathContains(containerPath: string, candidatePath: string): boolean {
   const normalizedRoot = normalizeProjectPathForComparison(containerPath).replaceAll("\\", "/");
   const normalizedCandidate = normalizeProjectPathForComparison(candidatePath).replaceAll(
@@ -507,6 +493,16 @@ function requireBootstrapSideEffectsAuthorized(input: {
     );
   }
 
+  if (
+    hasHiddenAudiencePathCollision({
+      readModel: input.readModel,
+      authority: input.authority,
+      candidatePath: prepareWorktree.projectCwd,
+    })
+  ) {
+    return failAuthorization(input.command, projectNotFoundDetail(input.command, targetProject.id));
+  }
+
   const prepareProject = findActiveProjectByWorkspaceRoot({
     readModel: input.readModel,
     workspaceRoot: prepareWorktree.projectCwd,
@@ -544,14 +540,12 @@ export const authorizeOrchestrationCommandMutation = Effect.fn(
       ) {
         return yield* failAuthorization(command, projectNotFoundDetail(command, command.projectId));
       }
-      const workspaceRootCollision = findActiveProjectWorkspaceRootCollision({
-        readModel,
-        workspaceRoot: command.workspaceRoot,
-        exceptProjectId: command.projectId,
-      });
       if (
-        workspaceRootCollision !== undefined &&
-        !canAccessAudience(authority, workspaceRootCollision.dataAudience)
+        hasHiddenAudiencePathCollision({
+          readModel,
+          authority,
+          candidatePath: command.workspaceRoot,
+        })
       ) {
         return yield* failAuthorization(command, projectNotFoundDetail(command, command.projectId));
       }
@@ -565,14 +559,12 @@ export const authorizeOrchestrationCommandMutation = Effect.fn(
         projectId: command.projectId,
       });
       if (command.workspaceRoot !== undefined) {
-        const workspaceRootCollision = findActiveProjectWorkspaceRootCollision({
-          readModel,
-          workspaceRoot: command.workspaceRoot,
-          exceptProjectId: command.projectId,
-        });
         if (
-          workspaceRootCollision !== undefined &&
-          !canAccessAudience(authority, workspaceRootCollision.dataAudience)
+          hasHiddenAudiencePathCollision({
+            readModel,
+            authority,
+            candidatePath: command.workspaceRoot,
+          })
         ) {
           return yield* failAuthorization(
             command,

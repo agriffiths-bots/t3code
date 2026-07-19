@@ -648,6 +648,76 @@ describe("authorizeOrchestrationCommandMutation", () => {
     }),
   );
 
+  it.effect("rejects project creates whose roots contain or are contained by hidden roots", () =>
+    Effect.gen(function* () {
+      const collisions = [
+        {
+          commandId: "cmd-private-guard-project-create-root-nested",
+          projectId: "project-factory-root-nested",
+          workspaceRoot: "/tmp/private-command-guard/nested",
+        },
+        {
+          commandId: "cmd-private-guard-project-create-root-parent",
+          projectId: "project-factory-root-parent",
+          workspaceRoot: "/tmp",
+        },
+      ] as const;
+
+      for (const collision of collisions) {
+        const exit = yield* authorizeFailureEffect({
+          type: "project.create",
+          commandId: CommandId.make(collision.commandId),
+          projectId: asProjectId(collision.projectId),
+          title: "Factory overlapping root",
+          workspaceRoot: collision.workspaceRoot,
+          defaultModelSelection: modelSelection,
+          createdAt,
+        });
+        const rendered = String(exit);
+        expect(rendered).toContain(`Project '${collision.projectId}' does not exist`);
+        expect(rendered).not.toContain("project-private-command-guard");
+        expect(rendered).not.toContain("/tmp/private-command-guard");
+      }
+    }),
+  );
+
+  it.effect("rejects project creates that overlap a hidden thread worktree", () =>
+    Effect.gen(function* () {
+      const hiddenWorktreePath = "/tmp/private-command-guard-thread-worktree";
+      const model = readModel();
+      const modelWithHiddenWorktree = {
+        ...model,
+        threads: model.threads.map((thread) =>
+          thread.id === privateThreadId
+            ? {
+                ...thread,
+                worktreePath: hiddenWorktreePath,
+                worktreeRemovalPath: hiddenWorktreePath,
+              }
+            : thread,
+        ),
+      };
+      const projectId = asProjectId("project-factory-hidden-worktree-collision");
+      const exit = yield* authorizeFailureEffect(
+        {
+          type: "project.create",
+          commandId: CommandId.make("cmd-private-guard-project-create-worktree-collision"),
+          projectId,
+          title: "Factory hidden worktree collision",
+          workspaceRoot: hiddenWorktreePath,
+          defaultModelSelection: modelSelection,
+          createdAt,
+        },
+        factoryAuthority,
+        modelWithHiddenWorktree,
+      );
+      const rendered = String(exit);
+      expect(rendered).toContain(`Project '${projectId}' does not exist`);
+      expect(rendered).not.toContain("thread-private-command-guard");
+      expect(rendered).not.toContain(hiddenWorktreePath);
+    }),
+  );
+
   it.effect("rejects direct thread.create worktree metadata from factory sessions", () =>
     Effect.gen(function* () {
       const exit = yield* authorizeFailureEffect({
