@@ -334,6 +334,7 @@ export const normalizeAuthorizedDispatchCommand = (
   authority: OrchestrationCommandDispatchAuthority,
 ) =>
   Effect.gen(function* () {
+    const fileSystem = yield* FileSystem.FileSystem;
     const path = yield* Path.Path;
     const commandReceiptRepository = yield* OrchestrationCommandReceiptRepository;
     const projectionSnapshotQuery = yield* ProjectionSnapshotQuery;
@@ -355,6 +356,8 @@ export const normalizeAuthorizedDispatchCommand = (
       command: normalizeDispatchCommandForAuthorization(command, path),
       readModel,
       authority,
+      fileSystem,
+      path,
     });
     return yield* normalizeDispatchCommand(command);
   });

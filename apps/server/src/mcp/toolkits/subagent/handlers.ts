@@ -998,10 +998,10 @@ const spawnSubagent = Effect.fn("SubagentToolkit.spawn")(function* (
       );
     }
     yield* requirePeerParentAccess(invocation, remoteParentThreadId);
-    const { output: started, targetProject } = yield* spawnRuntime(threadStartInput, invocation);
+    const { output: started } = yield* spawnRuntime(threadStartInput, invocation);
     const startedThreadAuthority = sessionDispatchAuthority({
-      subject: `provider-thread:${started.threadId}`,
-      audienceCeiling: targetProject.dataAudience,
+      subject: `mcp-peer:${invocation.peerTokenId}`,
+      audienceCeiling: "factory",
     });
     yield* dispatchParentSet(
       runtime,

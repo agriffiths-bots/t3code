@@ -12,6 +12,7 @@ import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Metric from "effect/Metric";
 import * as Option from "effect/Option";
+import * as Path from "effect/Path";
 import * as PubSub from "effect/PubSub";
 import * as Queue from "effect/Queue";
 import * as Schema from "effect/Schema";
@@ -76,6 +77,7 @@ const makeOrchestrationEngine = Effect.gen(function* () {
   const projectionSnapshotQuery = yield* ProjectionSnapshotQuery;
   const worktreeLifecycle = yield* WorktreeLifecycleCoordinator;
   const fileSystem = yield* FileSystem.FileSystem;
+  const path = yield* Path.Path;
   const crypto = yield* Crypto.Crypto;
 
   const nowIso = Effect.map(DateTime.now, DateTime.formatIso);
@@ -154,6 +156,8 @@ const makeOrchestrationEngine = Effect.gen(function* () {
           command: envelope.command,
           readModel: commandReadModel,
           authority: envelope.authority,
+          fileSystem,
+          path,
         });
 
         yield* requireUnarchiveWorktreeLifecycleReady(command);

@@ -108,7 +108,7 @@ interface SourceCwdProjectContext {
 
 export interface ActiveThreadStartResult {
   readonly output: ThreadStartToolOutput;
-  readonly targetProject: Pick<OrchestrationProjectShell, "id" | "dataAudience">;
+  readonly targetProject: Pick<OrchestrationProjectShell, "id">;
 }
 
 export type ActiveThreadStartRuntime = (
@@ -528,6 +528,9 @@ const makeActiveThreadStartRuntime = Effect.fn("ThreadToolkit.makeActiveRuntime"
         `Peer-scoped sub-agent spawn directory "${explicitDirectory}" is not inside an active target project.`,
       );
     }
+    if (project.dataAudience !== "factory") {
+      return yield* fail("Peer-scoped sub-agent spawn may target only an active factory project.");
+    }
     let inheritedModelSelection = input.modelSelection ?? project.defaultModelSelection;
     if (inheritedModelSelection === null) {
       if (input.model === undefined) {
@@ -566,7 +569,7 @@ const makeActiveThreadStartRuntime = Effect.fn("ThreadToolkit.makeActiveRuntime"
     const sourceThread: OrchestrationThreadShell = {
       id: ThreadId.make("remote-parent"),
       projectId: project.id,
-      dataAudience: project.dataAudience,
+      dataAudience: "factory",
       title: "Remote parent",
       modelSelection: inheritedModelSelection,
       runtimeMode: input.runtimeMode ?? DEFAULT_RUNTIME_MODE,
@@ -754,6 +757,15 @@ const makeActiveThreadStartRuntime = Effect.fn("ThreadToolkit.makeActiveRuntime"
       return yield* fail("existing_worktree mode requires worktreePath.");
     }
 
+    const dispatchAuthority = McpInvocationContext.isProviderInvocationScope(invocation)
+      ? sessionDispatchAuthority({
+          subject: `provider-thread:${sourceThread.id}`,
+          audienceCeiling: sourceThread.dataAudience,
+        })
+      : sessionDispatchAuthority({
+          subject: `mcp-peer:${invocation.peerTokenId}`,
+          audienceCeiling: "factory",
+        });
     yield* BootstrapTurnStartDispatcher.dispatchActive(
       {
         type: "thread.turn.start",
@@ -799,10 +811,7 @@ const makeActiveThreadStartRuntime = Effect.fn("ThreadToolkit.makeActiveRuntime"
         },
         createdAt,
       },
-      sessionDispatchAuthority({
-        subject: `provider-thread:${sourceThread.id}`,
-        audienceCeiling: sourceThread.dataAudience,
-      }),
+      dispatchAuthority,
     ).pipe(
       // Dispatch authorization can reference a project selected from the
       // explicit directory. Never expose those internal identifiers back to
@@ -835,7 +844,6 @@ const makeActiveThreadStartRuntime = Effect.fn("ThreadToolkit.makeActiveRuntime"
       },
       targetProject: {
         id: project.id,
-        dataAudience: project.dataAudience,
       },
     } satisfies ActiveThreadStartResult;
   });

@@ -1,3 +1,4 @@
+import * as NodeServices from "@effect/platform-node/NodeServices";
 import {
   ApprovalRequestId,
   CheckpointRef,
@@ -13,6 +14,8 @@ import {
   ProviderInstanceId,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
+import * as FileSystem from "effect/FileSystem";
+import * as Path from "effect/Path";
 import { describe, expect, it } from "@effect/vitest";
 
 import {
@@ -165,7 +168,17 @@ function authorizeEffect(
   authority = factoryAuthority,
   model = readModel(),
 ) {
-  return authorizeOrchestrationCommandMutation({ command, readModel: model, authority });
+  return Effect.gen(function* () {
+    const fileSystem = yield* FileSystem.FileSystem;
+    const path = yield* Path.Path;
+    return yield* authorizeOrchestrationCommandMutation({
+      command,
+      readModel: model,
+      authority,
+      fileSystem,
+      path,
+    });
+  }).pipe(Effect.provide(NodeServices.layer));
 }
 
 function authorizeFailureEffect(
@@ -179,6 +192,8 @@ function authorizeFailureEffect(
 describe("authorizeOrchestrationCommandMutation", () => {
   it.effect("requires explicit dispatch authority", () =>
     Effect.gen(function* () {
+      const fileSystem = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
       const exit = yield* Effect.exit(
         authorizeOrchestrationCommandMutation({
           command: {
@@ -192,10 +207,12 @@ describe("authorizeOrchestrationCommandMutation", () => {
           },
           readModel: readModel(),
           authority: undefined,
+          fileSystem,
+          path,
         }),
       );
       expect(String(exit)).toContain("dispatch authority");
-    }),
+    }).pipe(Effect.provide(NodeServices.layer)),
   );
 
   it.effect("binds project creation audience to the caller ceiling", () =>
@@ -1242,6 +1259,279 @@ describe("authorizeOrchestrationCommandMutation", () => {
         };
         expect(yield* authorizeEffect(command)).toMatchObject(command);
       }),
+  );
+
+  it.effect("allows prepareWorktree from a subdirectory of the authorized project", () =>
+    Effect.gen(function* () {
+      const command: OrchestrationCommand = {
+        type: "thread.turn.start",
+        commandId: CommandId.make("cmd-factory-guard-create-thread-project-subdirectory"),
+        threadId: ThreadId.make("thread-factory-command-guard-project-subdirectory"),
+        message: {
+          messageId: asMessageId("msg-factory-guard-create-thread-project-subdirectory"),
+          role: "user",
+          text: "prepare from an authorized monorepo package",
+          attachments: [],
+        },
+        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+        runtimeMode: "full-access",
+        bootstrap: {
+          createThread: {
+            projectId: factoryProjectId,
+            title: "Factory package thread",
+            modelSelection,
+            interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+            runtimeMode: "full-access",
+            branch: null,
+            worktreePath: null,
+            createdAt,
+          },
+          prepareWorktree: {
+            projectCwd: "/tmp/factory-command-guard/packages/app",
+            baseBranch: "main",
+            branch: "factory-package-side-effect",
+          },
+        },
+        createdAt,
+      };
+
+      expect(yield* authorizeEffect(command)).toMatchObject(command);
+    }),
+  );
+
+  it.effect("canonicalizes symlinks before hidden-audience path collision checks", () =>
+    Effect.acquireUseRelease(
+      Effect.gen(function* () {
+        const fileSystem = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const root = yield* fileSystem.makeTempDirectory({ prefix: "t3-guard-symlink-" });
+        const privateRoot = path.join(root, "private");
+        const factoryAlias = path.join(root, "factory-alias");
+        yield* fileSystem.makeDirectory(privateRoot);
+        yield* fileSystem.symlink(privateRoot, factoryAlias);
+        return { root, privateRoot, factoryAlias };
+      }),
+      ({ privateRoot, factoryAlias }) =>
+        Effect.gen(function* () {
+          const model = readModel();
+          const symlinkModel: OrchestrationReadModel = {
+            ...model,
+            projects: model.projects.map((candidate) =>
+              candidate.id === privateProjectId
+                ? { ...candidate, workspaceRoot: privateRoot }
+                : candidate,
+            ),
+          };
+          const exit = yield* authorizeFailureEffect(
+            {
+              type: "project.create",
+              commandId: CommandId.make("cmd-factory-guard-symlink-private-collision"),
+              projectId: asProjectId("project-factory-symlink-private-collision"),
+              title: "Factory alias into private checkout",
+              workspaceRoot: factoryAlias,
+              defaultModelSelection: modelSelection,
+              createdAt,
+            },
+            factoryAuthority,
+            symlinkModel,
+          );
+
+          const rendered = String(exit);
+          expect(rendered).toContain(
+            "Project 'project-factory-symlink-private-collision' does not exist",
+          );
+          expect(rendered).not.toContain(privateProjectId);
+          expect(rendered).not.toContain(privateRoot);
+        }),
+      ({ root }) =>
+        Effect.flatMap(FileSystem.FileSystem, (fileSystem) =>
+          fileSystem.remove(root, { recursive: true }),
+        ),
+    ).pipe(Effect.provide(NodeServices.layer)),
+  );
+
+  it.effect("rejects dangling symlinks whose future target is under a hidden root", () =>
+    Effect.acquireUseRelease(
+      Effect.gen(function* () {
+        const fileSystem = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const root = yield* fileSystem.makeTempDirectory({ prefix: "t3-guard-dangling-link-" });
+        const privateRoot = path.join(root, "private");
+        const factoryAlias = path.join(root, "factory-alias");
+        yield* fileSystem.makeDirectory(privateRoot);
+        yield* fileSystem.symlink(path.join(privateRoot, "future"), factoryAlias);
+        return { root, privateRoot, factoryAlias };
+      }),
+      ({ privateRoot, factoryAlias }) =>
+        Effect.gen(function* () {
+          const model = readModel();
+          const hiddenTargetModel: OrchestrationReadModel = {
+            ...model,
+            projects: model.projects.map((project) =>
+              project.id === privateProjectId
+                ? { ...project, workspaceRoot: privateRoot }
+                : project,
+            ),
+          };
+          const exit = yield* authorizeFailureEffect(
+            {
+              type: "project.create",
+              commandId: CommandId.make("cmd-factory-guard-dangling-private-collision"),
+              projectId: asProjectId("project-factory-dangling-private-collision"),
+              title: "Dangling alias into private checkout",
+              workspaceRoot: factoryAlias,
+              defaultModelSelection: modelSelection,
+              createdAt,
+            },
+            factoryAuthority,
+            hiddenTargetModel,
+          );
+
+          const rendered = String(exit);
+          expect(rendered).toContain(
+            "Project 'project-factory-dangling-private-collision' does not exist",
+          );
+          expect(rendered).not.toContain(privateRoot);
+        }),
+      ({ root }) =>
+        Effect.flatMap(FileSystem.FileSystem, (fileSystem) =>
+          fileSystem.remove(root, { recursive: true }),
+        ),
+    ).pipe(Effect.provide(NodeServices.layer)),
+  );
+
+  it.effect("binds authorized project and bootstrap paths to their canonical locations", () =>
+    Effect.acquireUseRelease(
+      Effect.gen(function* () {
+        const fileSystem = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const root = yield* fileSystem.makeTempDirectory({ prefix: "t3-guard-canonical-bind-" });
+        const factoryRoot = path.join(root, "factory");
+        const factoryAlias = path.join(root, "factory-alias");
+        yield* fileSystem.makeDirectory(factoryRoot);
+        yield* fileSystem.symlink(factoryRoot, factoryAlias);
+        return { root, factoryRoot, factoryAlias };
+      }),
+      ({ factoryRoot, factoryAlias }) =>
+        Effect.gen(function* () {
+          const model = readModel();
+          const canonicalModel: OrchestrationReadModel = {
+            ...model,
+            projects: model.projects.map((project) =>
+              project.id === factoryProjectId
+                ? { ...project, workspaceRoot: factoryRoot }
+                : project,
+            ),
+          };
+          const projectCommand = yield* authorizeEffect(
+            {
+              type: "project.create",
+              commandId: CommandId.make("cmd-factory-guard-canonical-project-bind"),
+              projectId: asProjectId("project-factory-canonical-bind"),
+              title: "Canonical factory project",
+              workspaceRoot: factoryAlias,
+              defaultModelSelection: modelSelection,
+              createdAt,
+            },
+            factoryAuthority,
+            canonicalModel,
+          );
+          expect(projectCommand).toMatchObject({ workspaceRoot: factoryRoot });
+
+          const bootstrapCommand = yield* authorizeEffect(
+            {
+              type: "thread.turn.start",
+              commandId: CommandId.make("cmd-factory-guard-canonical-bootstrap-bind"),
+              threadId: ThreadId.make("thread-factory-canonical-bootstrap-bind"),
+              message: {
+                messageId: asMessageId("msg-factory-canonical-bootstrap-bind"),
+                role: "user",
+                text: "prepare from the canonical project",
+                attachments: [],
+              },
+              interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+              runtimeMode: "full-access",
+              bootstrap: {
+                createThread: {
+                  projectId: factoryProjectId,
+                  title: "Canonical bootstrap",
+                  modelSelection,
+                  interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+                  runtimeMode: "full-access",
+                  branch: null,
+                  worktreePath: null,
+                  createdAt,
+                },
+                prepareWorktree: {
+                  projectCwd: factoryAlias,
+                  baseBranch: "main",
+                },
+              },
+              createdAt,
+            },
+            factoryAuthority,
+            canonicalModel,
+          );
+          expect(bootstrapCommand).toMatchObject({
+            bootstrap: { prepareWorktree: { projectCwd: factoryRoot } },
+          });
+        }),
+      ({ root }) =>
+        Effect.flatMap(FileSystem.FileSystem, (fileSystem) =>
+          fileSystem.remove(root, { recursive: true }),
+        ),
+    ).pipe(Effect.provide(NodeServices.layer)),
+  );
+
+  it.effect("rejects paths that cannot be canonicalized without defecting", () =>
+    Effect.gen(function* () {
+      const exit = yield* authorizeFailureEffect({
+        type: "project.create",
+        commandId: CommandId.make("cmd-factory-guard-invalid-canonical-path"),
+        projectId: asProjectId("project-factory-invalid-canonical-path"),
+        title: "Invalid canonical path",
+        workspaceRoot: "/tmp/invalid\0path",
+        defaultModelSelection: modelSelection,
+        createdAt,
+      });
+
+      expect(String(exit)).toContain(
+        "Project 'project-factory-invalid-canonical-path' does not exist",
+      );
+    }),
+  );
+
+  it.effect("fails closed when a hidden audience path cannot be canonicalized", () =>
+    Effect.gen(function* () {
+      const model = readModel();
+      const hiddenPathModel: OrchestrationReadModel = {
+        ...model,
+        projects: model.projects.map((project) =>
+          project.id === privateProjectId
+            ? { ...project, workspaceRoot: "/tmp/private-invalid\0path" }
+            : project,
+        ),
+      };
+      const exit = yield* authorizeFailureEffect(
+        {
+          type: "project.create",
+          commandId: CommandId.make("cmd-factory-guard-hidden-invalid-canonical-path"),
+          projectId: asProjectId("project-factory-hidden-invalid-canonical-path"),
+          title: "Ancestor of unresolved private path",
+          workspaceRoot: "/tmp",
+          defaultModelSelection: modelSelection,
+          createdAt,
+        },
+        factoryAuthority,
+        hiddenPathModel,
+      );
+
+      const rendered = String(exit);
+      expect(rendered).toContain(
+        "Project 'project-factory-hidden-invalid-canonical-path' does not exist",
+      );
+      expect(rendered).not.toContain("private-invalid");
+    }),
   );
 
   it.effect(

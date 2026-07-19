@@ -22,6 +22,7 @@ import * as DateTime from "effect/DateTime";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as PlatformError from "effect/PlatformError";
+import * as Path from "effect/Path";
 import * as Stream from "effect/Stream";
 import { McpSchema, McpServer } from "effect/unstable/ai";
 
@@ -193,6 +194,7 @@ const makeModelInstance = (
 interface TestLayerOptions {
   readonly providerInstances?: ReadonlyArray<ProviderInstance>;
   readonly project?: OrchestrationProjectShell;
+  readonly projects?: ReadonlyArray<OrchestrationProjectShell>;
   readonly sourceThread?: OrchestrationThreadShell;
   readonly threadShells?: ReadonlyArray<OrchestrationThreadShell>;
   readonly settledChildThreadIds?: ReadonlySet<ThreadId>;
@@ -290,6 +292,7 @@ const nonRepoStatus = {
 
 const makeTestLayer = (commands: OrchestrationCommand[], options: TestLayerOptions = {}) => {
   const testProject = options.project ?? project;
+  const testProjects = options.projects ?? [testProject];
   const testSourceThread = options.sourceThread ?? sourceThread;
   const providerInstances = options.providerInstances ?? [];
   const threadShells = new Map(
@@ -331,7 +334,19 @@ const makeTestLayer = (commands: OrchestrationCommand[], options: TestLayerOptio
     Layer.provideMerge(McpServer.McpServer.layer),
     Layer.provide(
       Layer.mock(ProjectionSnapshotQuery)({
-        getProjectShellById: () => Effect.succeed(Option.some(testProject)),
+        getProjectShellById: (requestedProjectId) =>
+          Effect.succeed(
+            Option.fromUndefinedOr(
+              testProjects.find((candidate) => candidate.id === requestedProjectId),
+            ),
+          ),
+        getShellSnapshot: () =>
+          Effect.succeed({
+            snapshotSequence: 1,
+            updatedAt: testSourceThread.updatedAt,
+            projects: testProjects,
+            threads: [...threadShells.values()],
+          }),
         getThreadShellById: (threadId) =>
           Effect.succeed(Option.fromUndefinedOr(threadShells.get(threadId))),
         getThreadShellByIdIncludingArchived: (threadId) =>
@@ -379,11 +394,12 @@ const callStartTool = (
   arguments_: Record<string, unknown>,
   commands: OrchestrationCommand[],
   options: TestLayerOptions = {},
+  scope: McpInvocationContext.McpInvocationScope = invocation,
 ) =>
   Effect.gen(function* () {
     const runtime = activeThreadStartRuntimeOf();
     if (runtime === null) return yield* Effect.die("Thread start runtime is unavailable in test.");
-    return yield* runtime(arguments_ as ThreadStartInternalInput, invocation).pipe(
+    return yield* runtime(arguments_ as ThreadStartInternalInput, scope).pipe(
       Effect.map(({ output }) => ({
         isError: false as const,
         structuredContent: output,
@@ -943,31 +959,28 @@ it.effect("inherits factory audience when an explicit directory targets a privat
         project: factoryProject,
         sourceThread: factorySourceThread,
         bootstrapDispatch: (command, authority) =>
-          Effect.sync(() => {
+          Effect.gen(function* () {
             observedAuthority = authority;
-          }).pipe(
-            Effect.andThen(
-              authorizeOrchestrationCommandMutation({
-                command,
-                readModel: authorizationModel,
-                authority,
-              }).pipe(
-                Effect.mapError(
-                  (cause) =>
-                    new OrchestrationDispatchCommandError({
-                      message: "Bootstrap command was not authorized.",
-                      cause,
-                    }),
-                ),
+            const fileSystem = yield* FileSystem.FileSystem;
+            const path = yield* Path.Path;
+            yield* authorizeOrchestrationCommandMutation({
+              command,
+              readModel: authorizationModel,
+              authority,
+              fileSystem,
+              path,
+            }).pipe(
+              Effect.mapError(
+                (cause) =>
+                  new OrchestrationDispatchCommandError({
+                    message: "Bootstrap command was not authorized.",
+                    cause,
+                  }),
               ),
-            ),
-            Effect.tap(() =>
-              Effect.sync(() => {
-                worktreeSideEffectCount += 1;
-              }),
-            ),
-            Effect.as({ sequence: 1 }),
-          ),
+            );
+            worktreeSideEffectCount += 1;
+            return { sequence: 1 };
+          }).pipe(Effect.provide(NodeServices.layer)),
       },
     );
 
@@ -980,6 +993,40 @@ it.effect("inherits factory audience when an explicit directory targets a privat
       kind: "session",
       audienceCeiling: "factory",
     });
+  }),
+);
+
+it.effect("rejects a peer-scoped spawn whose directory selects a private project", () =>
+  Effect.gen(function* () {
+    const commands: OrchestrationCommand[] = [];
+    const explicitPrivateDir = yield* makeTempDirectory("t3-peer-private-project-");
+    const privateTarget = {
+      ...project,
+      id: ProjectId.make("project-peer-private-target"),
+      workspaceRoot: explicitPrivateDir,
+      dataAudience: "private" as const,
+    };
+    const peerInvocation: McpInvocationContext.PeerMcpInvocationScope = {
+      credentialKind: "peer",
+      environmentId: EnvironmentId.make("peer-private-target-environment"),
+      peerTokenId: "peer-private-target-token",
+      capabilities: new Set(["subagent:spawn"]),
+      issuedAt: 1,
+      expiresAt: null,
+    };
+
+    const result = yield* callStartTool(
+      { prompt: "Do not mint private authority", directory: explicitPrivateDir },
+      commands,
+      { project: privateTarget, projects: [privateTarget] },
+      peerInvocation,
+    );
+
+    expect(result.isError).toBe(true);
+    expect(errorText(result.content)).toContain("factory project");
+    expect(errorText(result.content)).not.toContain(privateTarget.id);
+    expect(errorText(result.content)).not.toContain(explicitPrivateDir);
+    expect(commands).toHaveLength(0);
   }),
 );
 

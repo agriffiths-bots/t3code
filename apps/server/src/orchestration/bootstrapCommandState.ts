@@ -31,6 +31,7 @@ export function threadMatchesBootstrapCreate(
   thread: OrchestrationThread,
   createThread: BootstrapCreateThreadCommand,
   hasPrepareWorktree: boolean,
+  worktreePathsMatch = thread.worktreePath === createThread.worktreePath,
 ): boolean {
   if (thread.archivedAt !== null || thread.deletedAt !== null) return false;
   if (thread.messages.length > 0 || thread.latestTurn !== null) return false;
@@ -42,7 +43,9 @@ export function threadMatchesBootstrapCreate(
   if (thread.runtimeMode !== createThread.runtimeMode) return false;
   if (thread.interactionMode !== createThread.interactionMode) return false;
   if (!hasPrepareWorktree && thread.branch !== createThread.branch) return false;
-  if (!hasPrepareWorktree && thread.worktreePath !== createThread.worktreePath) return false;
+  if (!hasPrepareWorktree && !worktreePathsMatch) {
+    return false;
+  }
   return true;
 }
 
@@ -50,6 +53,8 @@ export function threadHasPreparedBootstrapWorktree(
   thread: OrchestrationThread,
   createThread: BootstrapCreateThreadCommand | undefined,
   prepareWorktree: BootstrapPrepareWorktreeCommand,
+  worktreePathsMatch = createThread !== undefined &&
+    thread.worktreePath === createThread.worktreePath,
 ): boolean {
   if (thread.archivedAt !== null || thread.deletedAt !== null || thread.worktreePath === null) {
     return false;
@@ -61,11 +66,7 @@ export function threadHasPreparedBootstrapWorktree(
   } else if (!createThread) {
     return false;
   }
-  if (
-    createThread &&
-    thread.branch === createThread.branch &&
-    thread.worktreePath === createThread.worktreePath
-  ) {
+  if (createThread && thread.branch === createThread.branch && worktreePathsMatch) {
     return false;
   }
   return true;

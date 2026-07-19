@@ -1708,6 +1708,7 @@ describe("SubagentToolkit", () => {
         activeProjectShell = {
           ...parentProject,
           workspaceRoot: targetDirectory,
+          dataAudience: "factory",
           repositoryIdentity: {
             canonicalKey: `git-local:${targetDirectory}`,
             locator: {

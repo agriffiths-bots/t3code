@@ -10,6 +10,8 @@ import type {
 } from "@t3tools/contracts";
 import { normalizeProjectPathForComparison } from "@t3tools/shared/path";
 import * as Effect from "effect/Effect";
+import * as FileSystem from "effect/FileSystem";
+import * as Path from "effect/Path";
 
 import { OrchestrationCommandAudienceAuthorizationError } from "./Errors.ts";
 import {
@@ -159,24 +161,99 @@ function findThread(
   return readModel.threads.find((thread) => thread.id === threadId);
 }
 
-function findActiveProjectByWorkspaceRoot(input: {
-  readonly readModel: OrchestrationReadModel;
-  readonly workspaceRoot: string;
-}): OrchestrationProject | undefined {
-  const normalizedWorkspaceRoot = normalizeProjectPathForComparison(input.workspaceRoot);
-  return input.readModel.projects.find(
-    (project) =>
-      project.deletedAt === null &&
-      normalizeProjectPathForComparison(project.workspaceRoot) === normalizedWorkspaceRoot,
-  );
-}
+const canonicalPathForComparison = Effect.fn("canonicalPathForComparison")(function* (
+  inputPath: string,
+  fileSystem: FileSystem.FileSystem,
+  path: Path.Path,
+) {
+  let existingAncestor = path.resolve(inputPath);
+  const missingSegments: string[] = [];
 
-function pathContains(containerPath: string, candidatePath: string): boolean {
-  const normalizedRoot = normalizeProjectPathForComparison(containerPath).replaceAll("\\", "/");
-  const normalizedCandidate = normalizeProjectPathForComparison(candidatePath).replaceAll(
+  while (true) {
+    const realPathResult = yield* fileSystem.realPath(existingAncestor).pipe(
+      Effect.match({
+        onFailure: (cause) => ({ _tag: "failure" as const, cause }),
+        onSuccess: (realPath) => ({ _tag: "success" as const, realPath }),
+      }),
+    );
+    if (realPathResult._tag === "success") {
+      return normalizeProjectPathForComparison(
+        path.join(realPathResult.realPath, ...missingSegments),
+      ).replaceAll("\\", "/");
+    }
+    if (realPathResult.cause.reason._tag !== "NotFound") return null;
+    const readLinkResult = yield* fileSystem.readLink(existingAncestor).pipe(
+      Effect.match({
+        onFailure: (cause) => ({ _tag: "failure" as const, cause }),
+        onSuccess: (target) => ({ _tag: "success" as const, target }),
+      }),
+    );
+    if (readLinkResult._tag === "success") return null;
+    if (readLinkResult.cause.reason._tag !== "NotFound") return null;
+    const parent = path.dirname(existingAncestor);
+    if (parent === existingAncestor) return null;
+    missingSegments.unshift(path.basename(existingAncestor));
+    existingAncestor = parent;
+  }
+});
+
+const canonicalPathsEqual = Effect.fn("canonicalPathsEqual")(function* (
+  leftPath: string | null,
+  rightPath: string | null,
+  fileSystem: FileSystem.FileSystem,
+  path: Path.Path,
+) {
+  if (leftPath === null || rightPath === null) return leftPath === rightPath;
+  const canonicalLeft = yield* canonicalPathForComparison(leftPath, fileSystem, path);
+  const canonicalRight = yield* canonicalPathForComparison(rightPath, fileSystem, path);
+  return canonicalLeft !== null && canonicalRight !== null && canonicalLeft === canonicalRight;
+});
+
+const isCanonicalPathBinding = Effect.fn("isCanonicalPathBinding")(function* (
+  inputPath: string,
+  fileSystem: FileSystem.FileSystem,
+  path: Path.Path,
+) {
+  const canonicalPath = yield* canonicalPathForComparison(inputPath, fileSystem, path);
+  const lexicalPath = normalizeProjectPathForComparison(path.resolve(inputPath)).replaceAll(
     "\\",
     "/",
   );
+  return canonicalPath !== null && canonicalPath === lexicalPath;
+});
+
+const findActiveProjectContainingPath = Effect.fn("findActiveProjectContainingPath")(
+  function* (input: {
+    readonly readModel: OrchestrationReadModel;
+    readonly candidatePath: string;
+    readonly fileSystem: FileSystem.FileSystem;
+    readonly path: Path.Path;
+  }) {
+    const canonicalCandidate = yield* canonicalPathForComparison(
+      input.candidatePath,
+      input.fileSystem,
+      input.path,
+    );
+    if (canonicalCandidate === null) return undefined;
+    const candidates: Array<{ project: OrchestrationProject; canonicalRoot: string }> = [];
+    for (const project of input.readModel.projects) {
+      if (project.deletedAt !== null) continue;
+      const canonicalRoot = yield* canonicalPathForComparison(
+        project.workspaceRoot,
+        input.fileSystem,
+        input.path,
+      );
+      if (canonicalRoot !== null && pathContainsCanonical(canonicalRoot, canonicalCandidate)) {
+        candidates.push({ project, canonicalRoot });
+      }
+    }
+    return candidates.toSorted(
+      (left, right) => right.canonicalRoot.length - left.canonicalRoot.length,
+    )[0]?.project;
+  },
+);
+
+function pathContainsCanonical(normalizedRoot: string, normalizedCandidate: string): boolean {
   return (
     normalizedCandidate === normalizedRoot ||
     normalizedCandidate.startsWith(
@@ -185,37 +262,71 @@ function pathContains(containerPath: string, candidatePath: string): boolean {
   );
 }
 
-function pathsOverlap(leftPath: string, rightPath: string): boolean {
-  return pathContains(leftPath, rightPath) || pathContains(rightPath, leftPath);
-}
-
-function hasHiddenAudiencePathCollision(input: {
-  readonly readModel: OrchestrationReadModel;
-  readonly authority: OrchestrationCommandDispatchAuthority;
-  readonly candidatePath: string | null | undefined;
-}): boolean {
-  if (input.candidatePath == null) return false;
-  const candidatePath = input.candidatePath;
-  const collidesWithHiddenProject = input.readModel.projects.some(
-    (project) =>
-      project.deletedAt === null &&
-      pathsOverlap(project.workspaceRoot, candidatePath) &&
-      !canAccessAudience(input.authority, project.dataAudience),
+const pathsOverlap = Effect.fn("pathsOverlap")(function* (
+  leftPath: string,
+  rightPath: string,
+  fileSystem: FileSystem.FileSystem,
+  path: Path.Path,
+) {
+  const canonicalLeft = yield* canonicalPathForComparison(leftPath, fileSystem, path);
+  const canonicalRight = yield* canonicalPathForComparison(rightPath, fileSystem, path);
+  if (canonicalLeft === null || canonicalRight === null) return null;
+  return (
+    pathContainsCanonical(canonicalLeft, canonicalRight) ||
+    pathContainsCanonical(canonicalRight, canonicalLeft)
   );
-  if (collidesWithHiddenProject) return true;
+});
 
-  // Deleted and archived thread rows intentionally remain in the complete
-  // projection, and their worktrees may still exist after failed cleanup.
-  // Keep them in this collision check so a bootstrap retry cannot run setup
-  // inside a hidden checkout merely because its owning thread is inactive.
-  return input.readModel.threads.some((thread) => {
-    if (canAccessAudience(input.authority, thread.dataAudience)) return false;
-    return [thread.worktreePath, thread.worktreeRemovalPath].some(
-      (hiddenPath) =>
-        hiddenPath !== null && hiddenPath !== undefined && pathsOverlap(hiddenPath, candidatePath),
-    );
-  });
-}
+const hasHiddenAudiencePathCollision = Effect.fn("hasHiddenAudiencePathCollision")(
+  function* (input: {
+    readonly readModel: OrchestrationReadModel;
+    readonly authority: OrchestrationCommandDispatchAuthority;
+    readonly candidatePath: string | null | undefined;
+    readonly fileSystem: FileSystem.FileSystem;
+    readonly path: Path.Path;
+  }) {
+    if (input.candidatePath == null) return false;
+    const candidatePath = input.candidatePath;
+    // A caller-selected path that cannot be canonicalized is never authorized:
+    // lexical fallback would reintroduce symlink and inaccessible-ancestor gaps.
+    if ((yield* canonicalPathForComparison(candidatePath, input.fileSystem, input.path)) === null) {
+      return true;
+    }
+    for (const project of input.readModel.projects) {
+      if (project.deletedAt !== null || canAccessAudience(input.authority, project.dataAudience)) {
+        continue;
+      }
+      const overlap = yield* pathsOverlap(
+        project.workspaceRoot,
+        candidatePath,
+        input.fileSystem,
+        input.path,
+      );
+      if (overlap !== false) {
+        return true;
+      }
+    }
+
+    // Deleted and archived thread rows intentionally remain in the complete
+    // projection, and their worktrees may still exist after failed cleanup.
+    // Keep them in this collision check so a bootstrap retry cannot run setup
+    // inside a hidden checkout merely because its owning thread is inactive.
+    for (const thread of input.readModel.threads) {
+      if (canAccessAudience(input.authority, thread.dataAudience)) continue;
+      for (const hiddenPath of [thread.worktreePath, thread.worktreeRemovalPath]) {
+        if (hiddenPath === null || hiddenPath === undefined) continue;
+        const overlap = yield* pathsOverlap(
+          hiddenPath,
+          candidatePath,
+          input.fileSystem,
+          input.path,
+        );
+        if (overlap !== false) return true;
+      }
+    }
+    return false;
+  },
+);
 
 function collectUnarchivedDescendantThreads(
   readModel: OrchestrationReadModel,
@@ -405,118 +516,179 @@ function requireSameBootstrapProjectAsThread(input: {
   return Effect.void;
 }
 
-function requireBootstrapSideEffectsAuthorized(input: {
-  readonly command: Extract<OrchestrationCommand, { type: "thread.turn.start" }>;
-  readonly readModel: OrchestrationReadModel;
-  readonly authority: OrchestrationCommandDispatchAuthority;
-  readonly targetProject: OrchestrationProject | undefined;
-  readonly existingThread: OrchestrationThread | undefined;
-}): Effect.Effect<void, OrchestrationCommandAudienceAuthorizationError> {
-  const bootstrap = input.command.bootstrap;
-  if (bootstrap === undefined) {
-    return Effect.void;
-  }
-  if (!isFactorySessionAuthority(input.authority)) {
-    return Effect.void;
-  }
+const requireBootstrapSideEffectsAuthorized = Effect.fn("requireBootstrapSideEffectsAuthorized")(
+  function* (input: {
+    readonly command: Extract<OrchestrationCommand, { type: "thread.turn.start" }>;
+    readonly readModel: OrchestrationReadModel;
+    readonly authority: OrchestrationCommandDispatchAuthority;
+    readonly targetProject: OrchestrationProject | undefined;
+    readonly existingThread: OrchestrationThread | undefined;
+    readonly fileSystem: FileSystem.FileSystem;
+    readonly path: Path.Path;
+  }) {
+    const bootstrap = input.command.bootstrap;
+    if (bootstrap === undefined) {
+      return;
+    }
+    if (!isFactorySessionAuthority(input.authority)) {
+      return;
+    }
 
-  const createThreadWorktreePath = bootstrap.createThread?.worktreePath ?? null;
-  const createThreadWorktreeRemovalPath = bootstrap.createThread?.worktreeRemovalPath ?? null;
-  if (createThreadWorktreePath !== null || createThreadWorktreeRemovalPath !== null) {
-    if (input.targetProject === undefined) {
-      return failAuthorization(
+    const createThreadWorktreePath = bootstrap.createThread?.worktreePath ?? null;
+    const createThreadWorktreeRemovalPath = bootstrap.createThread?.worktreeRemovalPath ?? null;
+    if (createThreadWorktreePath !== null || createThreadWorktreeRemovalPath !== null) {
+      if (input.targetProject === undefined) {
+        return yield* failAuthorization(
+          input.command,
+          threadNotFoundDetail(input.command, input.command.threadId),
+        );
+      }
+      return yield* failAuthorization(
         input.command,
-        threadNotFoundDetail(input.command, input.command.threadId),
+        projectNotFoundDetail(input.command, input.targetProject.id),
       );
     }
-    return failAuthorization(
-      input.command,
-      projectNotFoundDetail(input.command, input.targetProject.id),
-    );
-  }
 
-  if (bootstrap.runSetupScript === true) {
-    if (input.existingThread !== undefined) {
-      const createThread = bootstrap.createThread;
-      const prepareWorktree = bootstrap.prepareWorktree;
-      const matchesPrePreparationState =
-        createThread !== undefined &&
-        input.existingThread.branch === createThread.branch &&
-        input.existingThread.worktreePath === createThread.worktreePath;
-      const compatibleRetry =
-        createThread !== undefined &&
-        threadMatchesBootstrapCreate(
-          input.existingThread,
-          createThread,
-          prepareWorktree !== undefined,
-        ) &&
-        (prepareWorktree === undefined ||
-          matchesPrePreparationState ||
-          threadHasPreparedBootstrapWorktree(input.existingThread, createThread, prepareWorktree));
-      if (
-        !compatibleRetry ||
-        hasHiddenAudiencePathCollision({
+    if (bootstrap.runSetupScript === true) {
+      if (input.existingThread !== undefined) {
+        const createThread = bootstrap.createThread;
+        const prepareWorktree = bootstrap.prepareWorktree;
+        const worktreePathsMatch =
+          createThread !== undefined &&
+          (yield* canonicalPathsEqual(
+            input.existingThread.worktreePath,
+            createThread.worktreePath,
+            input.fileSystem,
+            input.path,
+          ));
+        const matchesPrePreparationState =
+          createThread !== undefined &&
+          input.existingThread.branch === createThread.branch &&
+          worktreePathsMatch;
+        const compatibleRetry =
+          createThread !== undefined &&
+          threadMatchesBootstrapCreate(
+            input.existingThread,
+            createThread,
+            prepareWorktree !== undefined,
+            worktreePathsMatch,
+          ) &&
+          (prepareWorktree === undefined ||
+            matchesPrePreparationState ||
+            threadHasPreparedBootstrapWorktree(
+              input.existingThread,
+              createThread,
+              prepareWorktree,
+              worktreePathsMatch,
+            ));
+        const hiddenWorktreeCollision = yield* hasHiddenAudiencePathCollision({
           readModel: input.readModel,
           authority: input.authority,
           candidatePath: input.existingThread.worktreePath,
-        }) ||
-        hasHiddenAudiencePathCollision({
+          fileSystem: input.fileSystem,
+          path: input.path,
+        });
+        const hiddenRemovalPathCollision = yield* hasHiddenAudiencePathCollision({
           readModel: input.readModel,
           authority: input.authority,
           candidatePath: input.existingThread.worktreeRemovalPath,
-        })
-      ) {
-        return failAuthorization(
+          fileSystem: input.fileSystem,
+          path: input.path,
+        });
+        const worktreePathIsCanonical =
+          input.existingThread.worktreePath === null ||
+          (yield* isCanonicalPathBinding(
+            input.existingThread.worktreePath,
+            input.fileSystem,
+            input.path,
+          ));
+        const removalPathIsCanonical =
+          input.existingThread.worktreeRemovalPath == null ||
+          (yield* isCanonicalPathBinding(
+            input.existingThread.worktreeRemovalPath,
+            input.fileSystem,
+            input.path,
+          ));
+        if (
+          !compatibleRetry ||
+          hiddenWorktreeCollision ||
+          hiddenRemovalPathCollision ||
+          !worktreePathIsCanonical ||
+          !removalPathIsCanonical
+        ) {
+          return yield* failAuthorization(
+            input.command,
+            threadNotFoundDetail(input.command, input.command.threadId),
+          );
+        }
+      }
+      if (input.targetProject === undefined) {
+        return yield* failAuthorization(
           input.command,
           threadNotFoundDetail(input.command, input.command.threadId),
         );
       }
     }
-    if (input.targetProject === undefined) {
-      return failAuthorization(
+
+    const prepareWorktree = bootstrap.prepareWorktree;
+    if (prepareWorktree === undefined) {
+      return;
+    }
+
+    const targetProject = input.targetProject;
+    if (targetProject === undefined) {
+      return yield* failAuthorization(
         input.command,
         threadNotFoundDetail(input.command, input.command.threadId),
       );
     }
-  }
 
-  const prepareWorktree = bootstrap.prepareWorktree;
-  if (prepareWorktree === undefined) {
-    return Effect.void;
-  }
-
-  const targetProject = input.targetProject;
-  if (targetProject === undefined) {
-    return failAuthorization(
-      input.command,
-      threadNotFoundDetail(input.command, input.command.threadId),
+    const canonicalProjectCwd = yield* canonicalPathForComparison(
+      prepareWorktree.projectCwd,
+      input.fileSystem,
+      input.path,
     );
-  }
+    if (canonicalProjectCwd === null) {
+      return yield* failAuthorization(
+        input.command,
+        projectNotFoundDetail(input.command, targetProject.id),
+      );
+    }
 
-  if (
-    hasHiddenAudiencePathCollision({
+    if (
+      yield* hasHiddenAudiencePathCollision({
+        readModel: input.readModel,
+        authority: input.authority,
+        candidatePath: canonicalProjectCwd,
+        fileSystem: input.fileSystem,
+        path: input.path,
+      })
+    ) {
+      return yield* failAuthorization(
+        input.command,
+        projectNotFoundDetail(input.command, targetProject.id),
+      );
+    }
+
+    const prepareProject = yield* findActiveProjectContainingPath({
       readModel: input.readModel,
-      authority: input.authority,
-      candidatePath: prepareWorktree.projectCwd,
-    })
-  ) {
-    return failAuthorization(input.command, projectNotFoundDetail(input.command, targetProject.id));
-  }
-
-  const prepareProject = findActiveProjectByWorkspaceRoot({
-    readModel: input.readModel,
-    workspaceRoot: prepareWorktree.projectCwd,
-  });
-  if (
-    prepareProject === undefined ||
-    prepareProject.id !== targetProject.id ||
-    !canAccessAudience(input.authority, prepareProject.dataAudience)
-  ) {
-    return failAuthorization(input.command, projectNotFoundDetail(input.command, targetProject.id));
-  }
-
-  return Effect.void;
-}
+      candidatePath: canonicalProjectCwd,
+      fileSystem: input.fileSystem,
+      path: input.path,
+    });
+    if (
+      prepareProject === undefined ||
+      prepareProject.id !== targetProject.id ||
+      !canAccessAudience(input.authority, prepareProject.dataAudience)
+    ) {
+      return yield* failAuthorization(
+        input.command,
+        projectNotFoundDetail(input.command, targetProject.id),
+      );
+    }
+    return canonicalProjectCwd;
+  },
+);
 
 export const authorizeOrchestrationCommandMutation = Effect.fn(
   "authorizeOrchestrationCommandMutation",
@@ -524,8 +696,10 @@ export const authorizeOrchestrationCommandMutation = Effect.fn(
   readonly command: OrchestrationCommand;
   readonly readModel: OrchestrationReadModel;
   readonly authority: OrchestrationCommandDispatchAuthority | undefined;
+  readonly fileSystem: FileSystem.FileSystem;
+  readonly path: Path.Path;
 }) {
-  const { command, readModel } = input;
+  const { command, fileSystem, path, readModel } = input;
   const authority = input.authority;
   if (authority === undefined) {
     return yield* failAuthorization(command, "Orchestration dispatch authority is required.");
@@ -540,16 +714,24 @@ export const authorizeOrchestrationCommandMutation = Effect.fn(
       ) {
         return yield* failAuthorization(command, projectNotFoundDetail(command, command.projectId));
       }
+      const canonicalWorkspaceRoot = yield* canonicalPathForComparison(
+        command.workspaceRoot,
+        fileSystem,
+        path,
+      );
       if (
-        hasHiddenAudiencePathCollision({
+        canonicalWorkspaceRoot === null ||
+        (yield* hasHiddenAudiencePathCollision({
           readModel,
           authority,
-          candidatePath: command.workspaceRoot,
-        })
+          candidatePath: canonicalWorkspaceRoot,
+          fileSystem,
+          path,
+        }))
       ) {
         return yield* failAuthorization(command, projectNotFoundDetail(command, command.projectId));
       }
-      return bindProjectCreate(command, authority);
+      return bindProjectCreate({ ...command, workspaceRoot: canonicalWorkspaceRoot }, authority);
     }
     case "project.meta.update": {
       yield* requireProjectAudience({
@@ -559,18 +741,27 @@ export const authorizeOrchestrationCommandMutation = Effect.fn(
         projectId: command.projectId,
       });
       if (command.workspaceRoot !== undefined) {
+        const canonicalWorkspaceRoot = yield* canonicalPathForComparison(
+          command.workspaceRoot,
+          fileSystem,
+          path,
+        );
         if (
-          hasHiddenAudiencePathCollision({
+          canonicalWorkspaceRoot === null ||
+          (yield* hasHiddenAudiencePathCollision({
             readModel,
             authority,
-            candidatePath: command.workspaceRoot,
-          })
+            candidatePath: canonicalWorkspaceRoot,
+            fileSystem,
+            path,
+          }))
         ) {
           return yield* failAuthorization(
             command,
             projectNotFoundDetail(command, command.projectId),
           );
         }
+        return { ...command, workspaceRoot: canonicalWorkspaceRoot };
       }
       return command;
     }
@@ -624,7 +815,27 @@ export const authorizeOrchestrationCommandMutation = Effect.fn(
       if (isFactorySessionAuthority(authority) && hasThreadCreateWorktreeMetadata(command)) {
         return yield* failAuthorization(command, projectNotFoundDetail(command, command.projectId));
       }
-      return command;
+      const canonicalWorktreePath =
+        command.worktreePath === null
+          ? null
+          : yield* canonicalPathForComparison(command.worktreePath, fileSystem, path);
+      const canonicalRemovalPath =
+        command.worktreeRemovalPath == null
+          ? command.worktreeRemovalPath
+          : yield* canonicalPathForComparison(command.worktreeRemovalPath, fileSystem, path);
+      if (
+        (command.worktreePath !== null && canonicalWorktreePath === null) ||
+        (command.worktreeRemovalPath != null && canonicalRemovalPath === null)
+      ) {
+        return yield* failAuthorization(command, projectNotFoundDetail(command, command.projectId));
+      }
+      return {
+        ...command,
+        worktreePath: canonicalWorktreePath,
+        ...(command.worktreeRemovalPath !== undefined
+          ? { worktreeRemovalPath: canonicalRemovalPath }
+          : {}),
+      };
     }
 
     case "thread.parent.set": {
@@ -695,12 +906,14 @@ export const authorizeOrchestrationCommandMutation = Effect.fn(
       } else {
         return yield* failAuthorization(command, threadNotFoundDetail(command, command.threadId));
       }
-      yield* requireBootstrapSideEffectsAuthorized({
+      const canonicalPrepareProjectCwd = yield* requireBootstrapSideEffectsAuthorized({
         command,
         readModel,
         authority,
         targetProject,
         existingThread: thread,
+        fileSystem,
+        path,
       });
       if (command.sourceProposedPlan !== undefined) {
         const sourceThread = yield* requireThreadAudience({
@@ -716,15 +929,51 @@ export const authorizeOrchestrationCommandMutation = Effect.fn(
           targetAudience,
         });
       }
+      if (
+        canonicalPrepareProjectCwd !== undefined &&
+        command.bootstrap?.prepareWorktree !== undefined
+      ) {
+        return {
+          ...command,
+          bootstrap: {
+            ...command.bootstrap,
+            prepareWorktree: {
+              ...command.bootstrap.prepareWorktree,
+              projectCwd: canonicalPrepareProjectCwd,
+            },
+          },
+        };
+      }
       return command;
     }
 
-    case "thread.meta.update":
+    case "thread.meta.update": {
       yield* requireThreadAudience({ command, readModel, authority, threadId: command.threadId });
       if (isFactorySessionAuthority(authority) && hasThreadMetaWorktreeMutation(command)) {
         return yield* failAuthorization(command, threadNotFoundDetail(command, command.threadId));
       }
-      return command;
+      const canonicalWorktreePath =
+        command.worktreePath == null
+          ? command.worktreePath
+          : yield* canonicalPathForComparison(command.worktreePath, fileSystem, path);
+      const canonicalRemovalPath =
+        command.worktreeRemovalPath == null
+          ? command.worktreeRemovalPath
+          : yield* canonicalPathForComparison(command.worktreeRemovalPath, fileSystem, path);
+      if (
+        (command.worktreePath != null && canonicalWorktreePath === null) ||
+        (command.worktreeRemovalPath != null && canonicalRemovalPath === null)
+      ) {
+        return yield* failAuthorization(command, threadNotFoundDetail(command, command.threadId));
+      }
+      return {
+        ...command,
+        ...(command.worktreePath !== undefined ? { worktreePath: canonicalWorktreePath } : {}),
+        ...(command.worktreeRemovalPath !== undefined
+          ? { worktreeRemovalPath: canonicalRemovalPath }
+          : {}),
+      };
+    }
 
     case "thread.delete":
     case "thread.unarchive":

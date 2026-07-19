@@ -12,6 +12,7 @@ import * as Context from "effect/Context";
 import * as Crypto from "effect/Crypto";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
+import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Path from "effect/Path";
@@ -162,6 +163,7 @@ export const layer = Layer.effect(
     const gitWorkflow = yield* GitWorkflowService;
     const projectSetupScriptRunner = yield* ProjectSetupScriptRunner;
     const vcsStatusBroadcaster = yield* VcsStatusBroadcaster;
+    const fileSystem = yield* FileSystem.FileSystem;
     const path = yield* Path.Path;
     const worktreeLifecycle = yield* WorktreeLifecycleCoordinator;
     const bootstrapLocksRef = yield* SynchronizedRef.make(new Map<string, Semaphore.Semaphore>());
@@ -288,7 +290,7 @@ export const layer = Layer.effect(
       command: ThreadTurnStartCommand,
       authority: OrchestrationCommandDispatchAuthority,
     ) {
-      const bootstrap = command.bootstrap;
+      let bootstrap = command.bootstrap;
       const { bootstrap: _bootstrap, ...finalTurnStartCommand } = command;
       let createdThread = false;
       let targetProjectId = bootstrap?.createThread?.projectId;
@@ -412,7 +414,10 @@ export const layer = Layer.effect(
         });
 
       const authorizeBootstrapCommand = (): Effect.Effect<
-        DataAudience,
+        {
+          readonly authorizedCommand: ThreadTurnStartCommand;
+          readonly targetAudience: DataAudience;
+        },
         OrchestrationDispatchCommandError
       > =>
         Effect.gen(function* () {
@@ -423,11 +428,22 @@ export const layer = Layer.effect(
                 toDispatchCommandError(cause, "Failed to read bootstrap authorization model."),
               ),
             );
-          yield* authorizeOrchestrationCommandMutation({ command, readModel, authority }).pipe(
+          const authorizedCommand = yield* authorizeOrchestrationCommandMutation({
+            command,
+            readModel,
+            authority,
+            fileSystem,
+            path,
+          }).pipe(
             Effect.mapError((cause) =>
               toDispatchCommandError(cause, "Bootstrap turn start command is not authorized."),
             ),
           );
+          if (authorizedCommand.type !== "thread.turn.start") {
+            return yield* new OrchestrationDispatchCommandError({
+              message: "Bootstrap authorization returned an unexpected command type.",
+            });
+          }
           const targetAudience =
             readModel.threads.find((thread) => thread.id === command.threadId)?.dataAudience ??
             readModel.projects.find((project) => project.id === bootstrap?.createThread?.projectId)
@@ -437,7 +453,7 @@ export const layer = Layer.effect(
               message: "Bootstrap turn start target audience could not be resolved.",
             });
           }
-          return targetAudience;
+          return { authorizedCommand, targetAudience };
         });
 
       const getFinalTurnReceipt = () =>
@@ -640,11 +656,15 @@ export const layer = Layer.effect(
           );
         }
 
-        const targetAudience = yield* authorizeBootstrapCommand();
+        const authorization = yield* authorizeBootstrapCommand();
+        bootstrap = authorization.authorizedCommand.bootstrap;
+        targetProjectId = bootstrap?.createThread?.projectId;
+        targetProjectCwd = bootstrap?.prepareWorktree?.projectCwd;
+        targetWorktreePath = bootstrap?.createThread?.worktreePath ?? null;
         internalAuthority = audienceBoundSystemDispatchAuthority({
           reason: "bootstrap-turn-start",
           sourceThreadId: command.threadId,
-          dataAudience: targetAudience,
+          dataAudience: authorization.targetAudience,
         });
 
         if (bootstrap?.createThread) {
