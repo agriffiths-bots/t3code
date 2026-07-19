@@ -1074,6 +1074,9 @@ const make = Effect.gen(function* () {
   const getThreadShell = (threadId: ThreadId) =>
     projectionSnapshotQuery.getThreadShellById(threadId).pipe(Effect.orDie);
 
+  const getThreadShellIncludingArchived = (threadId: ThreadId) =>
+    projectionSnapshotQuery.getThreadShellByIdIncludingArchived(threadId).pipe(Effect.orDie);
+
   const getThreadDetail = (threadId: ThreadId) =>
     projectionSnapshotQuery.getThreadDetailById(threadId).pipe(Effect.orDie);
 
@@ -3489,12 +3492,40 @@ const make = Effect.gen(function* () {
       // Remaining non-terminal children: validate the provider instance still exists.
       // Seed the dispatch limiter for survivors so a restart cannot launch a
       // full new cap on top of already-running sub-agents.
+      const orphanReasonByParent = new Map<ThreadId, string | null>();
+      const orphanReasonForParent = Effect.fn("ChildThreadCoordinator.orphanReasonForParent")(
+        function* (parentThreadId: ThreadId): Effect.fn.Return<string | null> {
+          if (orphanReasonByParent.has(parentThreadId)) {
+            return orphanReasonByParent.get(parentThreadId) ?? null;
+          }
+          const parent = yield* getThreadShellIncludingArchived(parentThreadId);
+          const reason = Option.match(parent, {
+            onNone: () => "orphaned by deleted or retired parent",
+            onSome: (shell) => (shell.archivedAt === null ? null : "orphaned by archived parent"),
+          });
+          orphanReasonByParent.set(parentThreadId, reason);
+          return reason;
+        },
+      );
       for (const childThreadId of knownChildIds) {
         if (terminalByChild.has(childThreadId)) continue;
         const record = children.get(childThreadId);
         if (!record) continue;
         const done = yield* Deferred.isDone(record.terminal);
         if (done) continue;
+        const orphanReason = yield* orphanReasonForParent(record.parentThreadId);
+        if (orphanReason !== null) {
+          yield* Effect.logWarning(
+            "reconciled non-terminal sub-agent lost its harvestable parent; terminating",
+            {
+              childThreadId,
+              parentThreadId: record.parentThreadId,
+              reason: orphanReason,
+            },
+          );
+          yield* settleChild(childThreadId, "killed", orphanReason);
+          continue;
+        }
         const instance = yield* registry.getInstance(record.model.instanceId);
         if (instance === undefined) {
           yield* Effect.logWarning(
