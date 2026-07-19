@@ -3556,6 +3556,49 @@ it.effect(
 );
 
 fanout.layer("ProviderServiceLive fanout", (it) => {
+  it.effect("KNOWN: accepts an old nonterminal lifecycle event across a same-thread restart", () =>
+    Effect.gen(function* () {
+      const provider = yield* ProviderService.ProviderService;
+      const threadId = asThreadId("thread-known-old-lifecycle-after-restart");
+      yield* provider.startSession(threadId, {
+        provider: CODEX_DRIVER,
+        providerInstanceId: codexInstanceId,
+        threadId,
+        runtimeMode: "full-access",
+      });
+
+      const receivedFiber = yield* Stream.runHead(provider.streamEvents).pipe(Effect.forkChild);
+      yield* advanceTestClock(50);
+      const releaseRuntimeEvent = yield* fanout.codex.pauseRuntimeEvents;
+      fanout.codex.emit({
+        type: "session.state.changed",
+        eventId: asEventId("evt-known-old-lifecycle-after-restart"),
+        provider: CODEX_DRIVER,
+        createdAt: "2026-01-01T00:00:00.000Z",
+        threadId,
+        payload: { state: "running" },
+      });
+
+      const replacement = yield* provider.startSession(threadId, {
+        provider: CODEX_DRIVER,
+        providerInstanceId: codexInstanceId,
+        threadId,
+        runtimeMode: "full-access",
+      });
+      yield* releaseRuntimeEvent;
+
+      const received = Option.getOrThrow(yield* Fiber.join(receivedFiber));
+      assert.equal(received.eventId, "evt-known-old-lifecycle-after-restart");
+      assert.deepEqual(getCapturedProviderRuntimeEventBinding(received), {
+        threadId: replacement.threadId,
+        provider: replacement.provider,
+        providerInstanceId: codexInstanceId,
+        runtimeMode: replacement.runtimeMode,
+        cwd: replacement.cwd,
+      });
+    }),
+  );
+
   it.effect("captures queued ingress authority but not stopped historical bindings", () =>
     Effect.gen(function* () {
       const provider = yield* ProviderService.ProviderService;
