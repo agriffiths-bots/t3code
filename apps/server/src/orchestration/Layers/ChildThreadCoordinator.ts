@@ -36,6 +36,7 @@ import {
 import { OrchestrationEngineService } from "../Services/OrchestrationEngine.ts";
 import { ProjectionSnapshotQuery } from "../Services/ProjectionSnapshotQuery.ts";
 import { ProviderInstanceRegistry } from "../../provider/Services/ProviderInstanceRegistry.ts";
+import { ProviderService } from "../../provider/Services/ProviderService.ts";
 import { SubagentDispatchLimiter } from "../../mcp/toolkits/subagent/SubagentDispatchLimiter.ts";
 import {
   PendingDispatchRepository,
@@ -46,6 +47,7 @@ import { SqlClient } from "effect/unstable/sql/SqlClient";
 import * as SqlSchema from "effect/unstable/sql/SqlSchema";
 import * as Schema from "effect/Schema";
 import { ThreadStartToolError } from "../../mcp/toolkits/thread/tools.ts";
+import { stopAndRecordProviderSession } from "./ThreadDeletionReactor.ts";
 import {
   ChildThreadCoordinator,
   MAX_DEPTH,
@@ -436,6 +438,7 @@ const make = Effect.gen(function* () {
   const orchestrationEngine = yield* OrchestrationEngineService;
   const projectionSnapshotQuery = yield* ProjectionSnapshotQuery;
   const registry = yield* ProviderInstanceRegistry;
+  const providerService = yield* ProviderService;
   const dispatchLimiter = yield* SubagentDispatchLimiter;
   const pendingDispatches = yield* PendingDispatchRepository;
   const sql = yield* SqlClient;
@@ -500,6 +503,10 @@ const make = Effect.gen(function* () {
   // turn running is not terminal by itself, but a later stopped/error session
   // must fail the child instead of leaving the waiter pending forever.
   const missingDiffWhileRunningByChild = new Set<ThreadId>();
+  // Boot reconciliation classifies these children as unharvestable before any
+  // terminal path runs. Suppression remains process-local because orphan
+  // injections are never persisted and any stale rows are pruned during boot.
+  const suppressParentWakeChildIds = new Set<ThreadId>();
   // Per-child guard so a deferred child_steer drain (R-C) is serialised and
   // never double-dispatches against the same child.
   const childSteerLocks = new Map<ThreadId, Semaphore.Semaphore>();
@@ -1074,8 +1081,23 @@ const make = Effect.gen(function* () {
   const getThreadShell = (threadId: ThreadId) =>
     projectionSnapshotQuery.getThreadShellById(threadId).pipe(Effect.orDie);
 
-  const getThreadShellIncludingArchived = (threadId: ThreadId) =>
-    projectionSnapshotQuery.getThreadShellByIdIncludingArchived(threadId).pipe(Effect.orDie);
+  const getThreadShellIncludingArchivedBounded = (threadId: ThreadId) =>
+    projectionSnapshotQuery.getThreadShellByIdIncludingArchived(threadId).pipe(
+      Effect.timeoutOption(`${PROJECTION_READ_TIMEOUT_MS} millis`),
+      Effect.map(
+        Option.match({
+          onNone: () => ({ _tag: "Unavailable" as const, cause: "timeout" }),
+          onSome: (shell) =>
+            Option.match(shell, {
+              onNone: () => ({ _tag: "Missing" as const }),
+              onSome: (value) => ({ _tag: "Found" as const, shell: value }),
+            }),
+        }),
+      ),
+      Effect.catchCause((cause) =>
+        Effect.succeed({ _tag: "Unavailable" as const, cause: Cause.pretty(cause) }),
+      ),
+    );
 
   const getThreadDetail = (threadId: ThreadId) =>
     projectionSnapshotQuery.getThreadDetailById(threadId).pipe(Effect.orDie);
@@ -1188,6 +1210,7 @@ const make = Effect.gen(function* () {
       if (
         settled &&
         (record.detached || promotedChildren.has(childThreadId)) &&
+        !suppressParentWakeChildIds.has(childThreadId) &&
         !queuedWakeChildren.has(childThreadId)
       ) {
         yield* wakeParent(record, { childThreadId, status, finalAssistantText, error });
@@ -3109,6 +3132,7 @@ const make = Effect.gen(function* () {
       const rows = yield* listPersistedChildRows().pipe(Effect.orDie);
       const knownChildIds = new Set<ThreadId>();
       const projectedTerminalByChild = new Map<ThreadId, ChildTerminalOutcome>();
+      const restoredDetailByChild = new Map<ThreadId, OrchestrationThread>();
       for (const row of rows) {
         if (row.parentThreadId === null) continue;
         const childThreadId = row.threadId as ThreadId;
@@ -3126,6 +3150,7 @@ const make = Effect.gen(function* () {
           continue;
         }
         const detail = detailOption.value;
+        restoredDetailByChild.set(childThreadId, detail);
         const projectedTerminal = projectedLifecycleTerminal(detail);
         if (projectedTerminal !== null) {
           projectedTerminalByChild.set(childThreadId, projectedTerminal);
@@ -3223,6 +3248,93 @@ const make = Effect.gen(function* () {
           staleSessionProjectionChildIds.add(childThreadId);
         }
       }
+
+      // Classify the full recorded ancestry before any boot settlement can wake
+      // a parent. The DFS order settles ancestors before descendants; the shell
+      // walk also covers ancestors that are not themselves restored children.
+      const orphanReasonByThread = new Map<ThreadId, string | null>();
+      let orphanReasonForThread: (
+        threadId: ThreadId,
+        ancestry: ReadonlySet<ThreadId>,
+      ) => Effect.Effect<string | null>;
+      orphanReasonForThread = (threadId, ancestry) =>
+        Effect.gen(function* () {
+          if (orphanReasonByThread.has(threadId)) {
+            return orphanReasonByThread.get(threadId) ?? null;
+          }
+          if (ancestry.has(threadId)) {
+            yield* Effect.logWarning(
+              "orphan ancestry contains a cycle; treating ancestor as live",
+              {
+                threadId,
+              },
+            );
+            orphanReasonByThread.set(threadId, null);
+            return null;
+          }
+          const read = yield* getThreadShellIncludingArchivedBounded(threadId);
+          if (read._tag === "Unavailable") {
+            yield* Effect.logWarning(
+              "orphan ancestry projection read unavailable; treating ancestor as live",
+              {
+                threadId,
+                cause: read.cause,
+              },
+            );
+            orphanReasonByThread.set(threadId, null);
+            return null;
+          }
+          if (read._tag === "Missing") {
+            const reason = "orphaned by deleted or retired parent";
+            orphanReasonByThread.set(threadId, reason);
+            return reason;
+          }
+          if (read.shell.archivedAt !== null) {
+            const reason = "orphaned by archived parent";
+            orphanReasonByThread.set(threadId, reason);
+            return reason;
+          }
+          const ancestorThreadId = read.shell.parentThreadId;
+          if (ancestorThreadId === null) {
+            orphanReasonByThread.set(threadId, null);
+            return null;
+          }
+          const nextAncestry = new Set(ancestry);
+          nextAncestry.add(threadId);
+          const reason = yield* orphanReasonForThread(ancestorThreadId, nextAncestry);
+          orphanReasonByThread.set(threadId, reason);
+          return reason;
+        });
+
+      const bootChildOrder: Array<ThreadId> = [];
+      const orderedBootChildren = new Set<ThreadId>();
+      const orderingBootChildren = new Set<ThreadId>();
+      const orderBootChild = (childThreadId: ThreadId): void => {
+        if (orderedBootChildren.has(childThreadId) || orderingBootChildren.has(childThreadId)) {
+          return;
+        }
+        orderingBootChildren.add(childThreadId);
+        const parentThreadId = children.get(childThreadId)?.parentThreadId;
+        if (parentThreadId !== undefined && knownChildIds.has(parentThreadId)) {
+          orderBootChild(parentThreadId);
+        }
+        orderingBootChildren.delete(childThreadId);
+        orderedBootChildren.add(childThreadId);
+        bootChildOrder.push(childThreadId);
+      };
+      for (const childThreadId of knownChildIds) orderBootChild(childThreadId);
+
+      const orphanReasonByBootChild = new Map<ThreadId, string>();
+      for (const childThreadId of bootChildOrder) {
+        const record = children.get(childThreadId);
+        if (record === undefined) continue;
+        const reason = yield* orphanReasonForThread(record.parentThreadId, new Set());
+        if (reason === null) continue;
+        orphanReasonByBootChild.set(childThreadId, reason);
+        suppressParentWakeChildIds.add(childThreadId);
+        orphanReasonByThread.set(childThreadId, reason);
+      }
+
       const terminalTextByStartedChild = new Map<
         ThreadId,
         { readonly text: string | null; readonly textUnavailable: boolean }
@@ -3287,6 +3399,9 @@ const make = Effect.gen(function* () {
       const staleWakeRows = persisted.filter((row) => {
         if (row.kind !== "parent_injection" || row.sourceChildId === null) return false;
         const childThreadId = row.sourceChildId as ThreadId;
+        // Orphan children never have a harvestable parent. Prune by the boot
+        // classification, independent of historical result/error wording.
+        if (orphanReasonByBootChild.has(childThreadId)) return true;
         if (staleSessionProjectionChildIds.has(childThreadId)) return true;
         if (
           unarchivedArchiveChildIds.has(childThreadId) &&
@@ -3492,29 +3607,15 @@ const make = Effect.gen(function* () {
       // Remaining non-terminal children: validate the provider instance still exists.
       // Seed the dispatch limiter for survivors so a restart cannot launch a
       // full new cap on top of already-running sub-agents.
-      const orphanReasonByParent = new Map<ThreadId, string | null>();
-      const orphanReasonForParent = Effect.fn("ChildThreadCoordinator.orphanReasonForParent")(
-        function* (parentThreadId: ThreadId): Effect.fn.Return<string | null> {
-          if (orphanReasonByParent.has(parentThreadId)) {
-            return orphanReasonByParent.get(parentThreadId) ?? null;
-          }
-          const parent = yield* getThreadShellIncludingArchived(parentThreadId);
-          const reason = Option.match(parent, {
-            onNone: () => "orphaned by deleted or retired parent",
-            onSome: (shell) => (shell.archivedAt === null ? null : "orphaned by archived parent"),
-          });
-          orphanReasonByParent.set(parentThreadId, reason);
-          return reason;
-        },
-      );
-      for (const childThreadId of knownChildIds) {
+      const bootRuntimeSessions = yield* providerService.listSessions();
+      for (const childThreadId of bootChildOrder) {
         if (terminalByChild.has(childThreadId)) continue;
         const record = children.get(childThreadId);
         if (!record) continue;
         const done = yield* Deferred.isDone(record.terminal);
         if (done) continue;
-        const orphanReason = yield* orphanReasonForParent(record.parentThreadId);
-        if (orphanReason !== null) {
+        const orphanReason = orphanReasonByBootChild.get(childThreadId);
+        if (orphanReason !== undefined) {
           yield* Effect.logWarning(
             "reconciled non-terminal sub-agent lost its harvestable parent; terminating",
             {
@@ -3523,8 +3624,40 @@ const make = Effect.gen(function* () {
               reason: orphanReason,
             },
           );
-          yield* settleChild(childThreadId, "killed", orphanReason);
-          continue;
+          const projectedSession = restoredDetailByChild.get(childThreadId)?.session ?? null;
+          const runtimeSession = bootRuntimeSessions.find(
+            (session) => session.threadId === childThreadId,
+          );
+          const requiresProviderCleanup =
+            runtimeSession !== undefined ||
+            (projectedSession !== null && !isTerminalSessionProjection(projectedSession));
+          const cleanupSucceeded = requiresProviderCleanup
+            ? yield* stopAndRecordProviderSession({
+                threadId: childThreadId,
+                projectedSession,
+                runtimeSession,
+                providerService,
+                orchestrationEngine,
+                commandId: yield* newCommandId("orphan-session-stop"),
+                createdAt: yield* nowIso,
+                lastError: orphanReason,
+              }).pipe(
+                Effect.as(true),
+                Effect.catchCause((cause) =>
+                  Effect.logWarning("orphan provider cleanup failed; retaining child lease", {
+                    childThreadId,
+                    parentThreadId: record.parentThreadId,
+                    cause: Cause.pretty(cause),
+                  }).pipe(Effect.as(false)),
+                ),
+              )
+            : true;
+          if (cleanupSucceeded) {
+            // Bounded final-text lookup and wake suppression are both required
+            // here: cleanup completes before Deferred settlement releases state.
+            yield* settleChild(childThreadId, "killed", orphanReason, true);
+            continue;
+          }
         }
         const instance = yield* registry.getInstance(record.model.instanceId);
         if (instance === undefined) {

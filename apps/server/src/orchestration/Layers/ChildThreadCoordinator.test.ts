@@ -11,6 +11,7 @@ import {
   type OrchestrationCommand,
   type OrchestrationEvent,
   type OrchestrationLatestTurn,
+  type ProviderSession,
   type OrchestrationSession,
   type OrchestrationThread,
   type OrchestrationThreadShell,
@@ -21,6 +22,7 @@ import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
+import * as Logger from "effect/Logger";
 import * as ManagedRuntime from "effect/ManagedRuntime";
 import * as Option from "effect/Option";
 import * as Queue from "effect/Queue";
@@ -37,6 +39,10 @@ import {
   type PendingDispatch,
 } from "../../persistence/Services/PendingDispatches.ts";
 import { ProviderInstanceRegistry } from "../../provider/Services/ProviderInstanceRegistry.ts";
+import {
+  ProviderService,
+  type ProviderServiceShape,
+} from "../../provider/Services/ProviderService.ts";
 import {
   ActiveBootstrapTurnStartDispatcherLive,
   BootstrapTurnStartDispatcher,
@@ -421,6 +427,13 @@ describe("ChildThreadCoordinator", () => {
       threadStates.set(state.shell.id, state);
     }
     const dispatched: Array<OrchestrationCommand> = [];
+    const capturedLogs: Array<{ readonly level: string; readonly message: string }> = [];
+    const captureLogger = Logger.make(({ logLevel, message }) => {
+      capturedLogs.push({
+        level: String(logLevel),
+        message: JSON.stringify(message),
+      });
+    });
     const knownInstances = new Set(input?.knownInstances ?? ["codex"]);
     const persistedParentIds = new Set(
       (input?.seedChildRows ?? []).map((row) => String(row.parentThreadId)),
@@ -450,6 +463,27 @@ describe("ChildThreadCoordinator", () => {
     for (const sequence of input?.shellReadSequences ?? []) {
       shellReadSequences.set(String(sequence.threadId), sequence.states);
     }
+    const runtimeSessions: Array<ProviderSession> = [...threadStates.values()]
+      .filter(
+        ({ shell }) =>
+          shell.session !== null &&
+          shell.session.status !== "stopped" &&
+          shell.session.status !== "error",
+      )
+      .map(
+        ({ shell }) =>
+          ({
+            provider: "codex",
+            providerInstanceId: ProviderInstanceId.make("codex"),
+            status: shell.session!.status,
+            runtimeMode: shell.runtimeMode,
+            threadId: shell.id,
+            resumeCursor: { opaque: `resume-${shell.id}` },
+            createdAt: now,
+            updatedAt: now,
+          }) as ProviderSession,
+      );
+    const stoppedProviderSessionIds: Array<ThreadId> = [];
 
     const eventQueue = Effect.runSync(Queue.unbounded<OrchestrationEvent>());
     let streamSubscribed = false;
@@ -482,6 +516,15 @@ describe("ChildThreadCoordinator", () => {
           enqueueSync,
           (state) => void threadStates.set(state.shell.id, state),
         );
+      }
+      if (command.type === "thread.session.set") {
+        const state = threadStates.get(command.threadId);
+        if (state !== undefined) {
+          threadStates.set(command.threadId, {
+            shell: { ...state.shell, session: command.session },
+            detail: { ...state.detail, session: command.session },
+          });
+        }
       }
       return { sequence };
     };
@@ -580,6 +623,26 @@ describe("ChildThreadCoordinator", () => {
       subscribeChanges: unsupported(),
     });
 
+    const providerService: ProviderServiceShape = {
+      startSession: () => unsupported(),
+      sendTurn: () => unsupported(),
+      interruptTurn: () => unsupported(),
+      respondToRequest: () => unsupported(),
+      respondToUserInput: () => unsupported(),
+      stopSession: ({ threadId }) =>
+        Effect.sync(() => {
+          stoppedProviderSessionIds.push(threadId);
+          const index = runtimeSessions.findIndex((session) => session.threadId === threadId);
+          if (index >= 0) runtimeSessions.splice(index, 1);
+        }),
+      stopFailedSession: () => unsupported(),
+      listSessions: () => Effect.succeed(runtimeSessions),
+      getCapabilities: () => unsupported(),
+      getInstanceInfo: () => unsupported(),
+      rollbackConversation: () => unsupported(),
+      streamEvents: Stream.empty,
+    };
+
     // Fake bootstrap dispatcher + global-capture so `dispatchActive` resolves
     // and records turn-start commands the same way the real server does.
     const dispatcherLayer = Layer.succeed(BootstrapTurnStartDispatcher, {
@@ -594,10 +657,12 @@ describe("ChildThreadCoordinator", () => {
       Layer.provideMerge(engineLayer),
       Layer.provideMerge(projectionLayer),
       Layer.provideMerge(registryLayer),
+      Layer.provideMerge(Layer.succeed(ProviderService, providerService)),
       Layer.provideMerge(activeDispatcherLayer),
       Layer.provideMerge(SubagentDispatchLimiter.layerTest()),
       Layer.provideMerge(SqlitePersistenceMemory),
       Layer.provideMerge(NodeServices.layer),
+      Layer.provideMerge(Logger.layer([captureLogger], { mergeWithExisting: false })),
     );
 
     runtime = ManagedRuntime.make(layer);
@@ -683,7 +748,7 @@ describe("ChildThreadCoordinator", () => {
 
     const coordinator = await activeRuntime.runPromise(Effect.service(ChildThreadCoordinator));
     scope = await Effect.runPromise(Scope.make("sequential"));
-    await Effect.runPromise(coordinator.start().pipe(Scope.provide(scope)));
+    await activeRuntime.runPromise(coordinator.start().pipe(Scope.provide(scope)));
 
     const setThread = (state: ThreadState) => threadStates.set(state.shell.id, state);
     const setShellSlow = (threadId: ThreadId, slow: boolean) => {
@@ -856,6 +921,8 @@ describe("ChildThreadCoordinator", () => {
     return {
       coordinator,
       dispatched,
+      capturedLogs,
+      stoppedProviderSessionIds,
       setThread,
       setShellSlow,
       setDetailSlow,
@@ -6248,6 +6315,141 @@ describe("ChildThreadCoordinator", () => {
     expect(slice.results.map(({ status, error }) => ({ status, error }))).toEqual([
       { status: "killed", error: "orphaned by archived parent" },
     ]);
+    expect(await harness.listDispatchLeaseChildIds()).toEqual([]);
+  });
+
+  it("settles an archived-parent orphan without leaving a durable wake to drain after unarchive", async () => {
+    const parent = ThreadId.make("boot-orphan-no-wake-parent");
+    const child = ThreadId.make("boot-orphan-no-wake-child");
+    const childTurn = TurnId.make("boot-orphan-no-wake-child-turn");
+    const harness = await createHarness({
+      threads: [
+        makeThreadState({ threadId: parent, archivedAt: now }),
+        makeThreadState({
+          threadId: child,
+          parentThreadId: parent,
+          latestTurn: makeLatestTurn("running", childTurn),
+          session: makeSession(child, "running", childTurn),
+        }),
+      ],
+      seedChildRows: [{ threadId: child, parentThreadId: parent }],
+      persistedEvents: [],
+    });
+
+    expect(await harness.listPendingDispatches()).toEqual([]);
+    harness.setThread(makeThreadState({ threadId: parent }));
+    await harness.feed(threadUnarchivedEvent(parent));
+    await harness.feed(turnDiffEvent(parent, "ready"));
+
+    expect(await harness.listPendingDispatches()).toEqual([]);
+    expect(harness.dispatched.filter((command) => command.type === "thread.turn.start")).toEqual(
+      [],
+    );
+  });
+
+  it("settles every descendant of an archived root as orphaned without seeding leases", async () => {
+    const root = ThreadId.make("boot-orphan-root");
+    const child = ThreadId.make("boot-orphan-child");
+    const grandchild = ThreadId.make("boot-orphan-grandchild");
+    const childTurn = TurnId.make("boot-orphan-child-turn");
+    const grandchildTurn = TurnId.make("boot-orphan-grandchild-turn");
+    const harness = await createHarness({
+      threads: [
+        makeThreadState({ threadId: root, archivedAt: now }),
+        makeThreadState({
+          threadId: child,
+          parentThreadId: root,
+          latestTurn: makeLatestTurn("running", childTurn),
+          session: makeSession(child, "running", childTurn),
+        }),
+        makeThreadState({
+          threadId: grandchild,
+          parentThreadId: child,
+          latestTurn: makeLatestTurn("running", grandchildTurn),
+          session: makeSession(grandchild, "running", grandchildTurn),
+        }),
+      ],
+      seedChildRows: [
+        { threadId: child, parentThreadId: root },
+        { threadId: grandchild, parentThreadId: child },
+      ],
+      persistedEvents: [],
+    });
+
+    const childSlice = await runtimeWaitSlice(harness, [child], FAR_FUTURE_MS);
+    const grandchildSlice = await runtimeWaitSlice(harness, [grandchild], FAR_FUTURE_MS);
+    expect(childSlice.results[0]).toMatchObject({
+      status: "killed",
+      error: "orphaned by archived parent",
+    });
+    expect(grandchildSlice.results[0]).toMatchObject({
+      status: "killed",
+      error: "orphaned by archived parent",
+    });
+    expect(await harness.listDispatchLeaseChildIds()).toEqual([]);
+  });
+
+  it("bounds stalled orphan ancestry reads and conservatively seeds the child", async () => {
+    const parent = ThreadId.make("boot-orphan-stalled-parent");
+    const child = ThreadId.make("boot-orphan-stalled-child");
+    const childTurn = TurnId.make("boot-orphan-stalled-child-turn");
+    const startedAt = await Effect.runPromise(Clock.currentTimeMillis);
+    const harness = await createHarness({
+      threads: [
+        makeThreadState({ threadId: parent, archivedAt: now }),
+        makeThreadState({
+          threadId: child,
+          parentThreadId: parent,
+          latestTurn: makeLatestTurn("running", childTurn),
+          session: makeSession(child, "running", childTurn),
+        }),
+      ],
+      slowThreadShellIds: [parent],
+      seedChildRows: [{ threadId: child, parentThreadId: parent }],
+      persistedEvents: [],
+    });
+
+    expect((await Effect.runPromise(Clock.currentTimeMillis)) - startedAt).toBeLessThan(1_500);
+    expect(await harness.listDispatchLeaseChildIds()).toEqual([child]);
+    expect(harness.capturedLogs).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          level: "Warn",
+          message: expect.stringContaining("orphan ancestry projection read unavailable"),
+        }),
+      ]),
+    );
+  });
+
+  it("stops a running orphan provider session before terminal settlement releases its lease", async () => {
+    const parent = ThreadId.make("boot-orphan-cleanup-parent");
+    const child = ThreadId.make("boot-orphan-cleanup-child");
+    const childTurn = TurnId.make("boot-orphan-cleanup-child-turn");
+    const harness = await createHarness({
+      threads: [
+        makeThreadState({ threadId: parent, archivedAt: now }),
+        makeThreadState({
+          threadId: child,
+          parentThreadId: parent,
+          latestTurn: makeLatestTurn("running", childTurn),
+          session: makeSession(child, "running", childTurn),
+        }),
+      ],
+      seedChildRows: [{ threadId: child, parentThreadId: parent }],
+      persistedEvents: [],
+    });
+
+    expect(harness.stoppedProviderSessionIds).toEqual([child]);
+    expect(
+      harness.dispatched.some(
+        (command) => command.type === "thread.session.set" && command.threadId === child,
+      ),
+    ).toBe(true);
+    const slice = await runtimeWaitSlice(harness, [child], FAR_FUTURE_MS);
+    expect(slice.results[0]).toMatchObject({
+      status: "killed",
+      error: "orphaned by archived parent",
+    });
     expect(await harness.listDispatchLeaseChildIds()).toEqual([]);
   });
 
