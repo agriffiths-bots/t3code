@@ -2189,6 +2189,7 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
             Effect.gen(function* () {
               const response = yield* fetchEffect(
                 yield* getHttpServerUrl(issuedAssetUrl.relativeUrl),
+                { headers: { cookie: ownerCookie } },
               );
               if (response.status === 401 || response.status === 403) {
                 return yield* new SecurityProbeDenied({ source: "http" });
