@@ -2830,6 +2830,36 @@ describe("ChildThreadCoordinator", () => {
     expect(slice.results[0]!.finalAssistantText).toBe("reconciled");
   });
 
+  it("bounds the replayed terminal settlement read after a boot detail timeout", async () => {
+    const child = ThreadId.make("recon-terminal-slow-detail-child");
+    const parent = ThreadId.make("recon-terminal-slow-detail-parent");
+    const startedMs = await Effect.runPromise(Clock.currentTimeMillis);
+    const harness = await createHarness({
+      threads: [
+        makeThreadState({
+          threadId: child,
+          parentThreadId: parent,
+          latestTurn: makeLatestTurn("completed"),
+          assistantText: "reconciled",
+        }),
+      ],
+      seedChildRows: [{ threadId: child, parentThreadId: parent }],
+      persistedEvents: [turnDiffEvent(child, "ready")],
+      // Every detail read for this child sleeps far past the projection bound:
+      // the reconciliation read is unavailable AND so is the settlement read.
+      slowThreadDetailIds: [child],
+    });
+    const elapsedMs = (await Effect.runPromise(Clock.currentTimeMillis)) - startedMs;
+
+    // start() must not have waited on the unbounded projection read.
+    expect(elapsedMs).toBeLessThan(WAIT_SLICE_SECONDS * 1_000);
+    const slice = await runtimeWaitSlice(harness, [child], FAR_FUTURE_MS);
+    expect(slice.results[0]!.status).toBe("completed");
+    // No boot snapshot and no bounded settlement read: the text is unknown, not
+    // fabricated. An unbounded read here would have returned "reconciled".
+    expect(slice.results[0]!.finalAssistantText).toBe(null);
+  });
+
   it("does NOT reconcile a running placeholder missing turn-diff as terminal", async () => {
     const child = ThreadId.make("recon-running-missing");
     const parent = ThreadId.make("recon-running-missing-parent");

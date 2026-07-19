@@ -3466,6 +3466,30 @@ const make = Effect.gen(function* () {
         knownChildIds.add(childThreadId);
       }
 
+      // Every settlement on the boot path must re-read the child's detail under
+      // the same bound as the reconciliation read above. An unbounded read here
+      // would re-enter the projection that just timed out for this child and
+      // block start() indefinitely. The boot snapshot is the fallback so a
+      // bounded miss cannot silently downgrade a completed child to empty text.
+      const settleBootChild = (
+        childThreadId: ThreadId,
+        status: ChildTerminalStatus,
+        error: string | null,
+      ) =>
+        Effect.gen(function* () {
+          const detailRead = yield* getThreadDetailForBoot(childThreadId);
+          const detail =
+            detailRead._tag === "Found"
+              ? detailRead.value
+              : restoredDetailByChild.get(childThreadId);
+          yield* completeChild(
+            childThreadId,
+            status,
+            detail === undefined ? null : finalAssistantTextFromThread(detail),
+            error,
+          );
+        });
+
       // (2) Determine terminal-ness from the persisted immutable log.
       const {
         terminalByChild,
@@ -3863,7 +3887,7 @@ const make = Effect.gen(function* () {
           // stale projection stays pending without consuming a dispatch lease.
           continue;
         }
-        yield* settleChild(childThreadId, outcome.status, outcome.error);
+        yield* settleBootChild(childThreadId, outcome.status, outcome.error);
       }
       for (const childThreadId of durableOrphanSettlementChildIds) {
         const outcome = terminalByChild.get(childThreadId);
@@ -3951,7 +3975,7 @@ const make = Effect.gen(function* () {
             continue;
           }
         }
-        yield* settleChild(childThreadId, projectedTerminal.status, projectedTerminal.error);
+        yield* settleBootChild(childThreadId, projectedTerminal.status, projectedTerminal.error);
       }
       for (const childThreadId of activeArchiveByReplayedChild) {
         const record = children.get(childThreadId);
@@ -4146,7 +4170,7 @@ const make = Effect.gen(function* () {
               parentThreadId: record.parentThreadId,
             },
           );
-          yield* settleChild(childThreadId, "killed", "provider instance removed");
+          yield* settleBootChild(childThreadId, "killed", "provider instance removed");
           continue;
         }
         if (instanceRead._tag === "Unavailable") {
