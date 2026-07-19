@@ -41,6 +41,10 @@ import {
 import { ServerSettingsService } from "../../serverSettings.ts";
 
 import { threadAudienceSystemDispatchAuthority } from "../commandAudienceGuard.ts";
+import {
+  hasIndependentRuntimeEventSourceProvenance,
+  warnDroppedUnprovenRuntimeEvent,
+} from "../providerRuntimeEventProvenance.ts";
 const providerTurnKey = (threadId: ThreadId, turnId: TurnId) => `${threadId}:${turnId}`;
 
 interface AssistantSegmentState {
@@ -93,6 +97,10 @@ function sameId(left: string | null | undefined, right: string | null | undefine
     return false;
   }
   return left === right;
+}
+
+function isSessionLifecycleRuntimeEvent(event: ProviderRuntimeEvent): boolean {
+  return event.type.startsWith("session.");
 }
 
 function hasAssistantMessageForTurn(
@@ -1380,6 +1388,14 @@ const make = Effect.gen(function* () {
 
   const processRuntimeEvent = (event: ProviderRuntimeEvent) =>
     Effect.gen(function* () {
+      if (
+        !isSessionLifecycleRuntimeEvent(event) &&
+        !hasIndependentRuntimeEventSourceProvenance(event)
+      ) {
+        yield* warnDroppedUnprovenRuntimeEvent("ProviderRuntimeIngestion", event);
+        return;
+      }
+
       const thread = yield* resolveThreadShell(event.threadId);
       if (!thread) return;
       const runtimeAuthority = threadAudienceSystemDispatchAuthority(

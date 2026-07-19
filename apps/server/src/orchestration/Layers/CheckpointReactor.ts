@@ -38,6 +38,10 @@ import { VcsStatusBroadcaster } from "../../vcs/VcsStatusBroadcaster.ts";
 import * as WorkspaceEntries from "../../workspace/WorkspaceEntries.ts";
 
 import { threadAudienceSystemDispatchAuthority } from "../commandAudienceGuard.ts";
+import {
+  hasIndependentRuntimeEventSourceProvenance,
+  warnDroppedUnprovenRuntimeEvent,
+} from "../providerRuntimeEventProvenance.ts";
 const nowIso = Effect.map(DateTime.now, DateTime.formatIso);
 
 type ReactorInput =
@@ -810,6 +814,11 @@ const make = Effect.gen(function* () {
   const processRuntimeEvent = Effect.fn("processRuntimeEvent")(function* (
     event: ProviderRuntimeEvent,
   ) {
+    if (!hasIndependentRuntimeEventSourceProvenance(event)) {
+      yield* warnDroppedUnprovenRuntimeEvent("CheckpointReactor", event);
+      return;
+    }
+
     if (event.type === "turn.started") {
       yield* ensurePreTurnBaselineFromTurnStart(event);
       return;
