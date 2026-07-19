@@ -39,9 +39,9 @@ import * as WorkspaceEntries from "../../workspace/WorkspaceEntries.ts";
 
 import { threadAudienceSystemDispatchAuthority } from "../commandAudienceGuard.ts";
 import {
-  hasIndependentRuntimeEventSourceProvenance,
-  warnDroppedUnprovenRuntimeEvent,
-} from "../providerRuntimeEventProvenance.ts";
+  resolveProviderRuntimeEventBinding,
+  type ProviderRuntimeEventBinding,
+} from "../providerRuntimeEventBinding.ts";
 const nowIso = Effect.map(DateTime.now, DateTime.formatIso);
 
 type ReactorInput =
@@ -378,13 +378,16 @@ const make = Effect.gen(function* () {
 
   // Captures a real git checkpoint when a turn completes via a runtime event.
   const captureCheckpointFromTurnCompletion = Effect.fn("captureCheckpointFromTurnCompletion")(
-    function* (event: Extract<ProviderRuntimeEvent, { type: "turn.completed" }>) {
+    function* (
+      event: Extract<ProviderRuntimeEvent, { type: "turn.completed" }>,
+      threadId: ThreadId,
+    ) {
       const turnId = toTurnId(event.turnId);
       if (!turnId) {
         return;
       }
 
-      const thread = yield* resolveThreadDetail(event.threadId);
+      const thread = yield* resolveThreadDetail(threadId);
       if (!thread) {
         return;
       }
@@ -505,13 +508,13 @@ const make = Effect.gen(function* () {
   });
 
   const ensurePreTurnBaselineFromTurnStart = Effect.fn("ensurePreTurnBaselineFromTurnStart")(
-    function* (event: Extract<ProviderRuntimeEvent, { type: "turn.started" }>) {
+    function* (event: Extract<ProviderRuntimeEvent, { type: "turn.started" }>, threadId: ThreadId) {
       const turnId = toTurnId(event.turnId);
       if (!turnId) {
         return;
       }
 
-      const thread = yield* resolveThreadDetail(event.threadId);
+      const thread = yield* resolveThreadDetail(threadId);
       if (!thread) {
         return;
       }
@@ -556,18 +559,20 @@ const make = Effect.gen(function* () {
 
   const refreshLocalGitStatusFromTurnCompletion = Effect.fn(
     "refreshLocalGitStatusFromTurnCompletion",
-  )(function* (event: Extract<ProviderRuntimeEvent, { type: "turn.completed" }>) {
-    const sessionRuntime = yield* resolveSessionRuntimeForThread(event.threadId);
-    if (Option.isNone(sessionRuntime)) {
+  )(function* (
+    event: Extract<ProviderRuntimeEvent, { type: "turn.completed" }>,
+    binding: ProviderRuntimeEventBinding,
+  ) {
+    if (binding.cwd === undefined) {
       return;
     }
 
-    yield* vcsStatusBroadcaster.refreshLocalStatus(sessionRuntime.value.cwd).pipe(
+    yield* vcsStatusBroadcaster.refreshLocalStatus(binding.cwd).pipe(
       Effect.catch((error) =>
         Effect.logWarning("failed to refresh local git status after turn completion", {
-          threadId: event.threadId,
+          threadId: binding.threadId,
           turnId: event.turnId ?? null,
-          cwd: sessionRuntime.value.cwd,
+          cwd: binding.cwd,
           detail: error.message,
         }),
       ),
@@ -814,24 +819,27 @@ const make = Effect.gen(function* () {
   const processRuntimeEvent = Effect.fn("processRuntimeEvent")(function* (
     event: ProviderRuntimeEvent,
   ) {
-    if (!hasIndependentRuntimeEventSourceProvenance(event)) {
-      yield* warnDroppedUnprovenRuntimeEvent("CheckpointReactor", event);
+    const binding = yield* resolveProviderRuntimeEventBinding({
+      consumer: "CheckpointReactor",
+      event,
+    });
+    if (binding === undefined) {
       return;
     }
 
     if (event.type === "turn.started") {
-      yield* ensurePreTurnBaselineFromTurnStart(event);
+      yield* ensurePreTurnBaselineFromTurnStart(event, binding.threadId);
       return;
     }
 
     if (event.type === "turn.completed") {
       const turnId = toTurnId(event.turnId);
-      yield* refreshLocalGitStatusFromTurnCompletion(event);
-      yield* captureCheckpointFromTurnCompletion(event).pipe(
+      yield* refreshLocalGitStatusFromTurnCompletion(event, binding);
+      yield* captureCheckpointFromTurnCompletion(event, binding.threadId).pipe(
         Effect.catch((error) =>
           Effect.flatMap(nowIso, (createdAt) =>
             appendCaptureFailureActivity({
-              threadId: event.threadId,
+              threadId: binding.threadId,
               turnId,
               detail: error.message,
               createdAt,

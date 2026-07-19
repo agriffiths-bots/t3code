@@ -24,6 +24,7 @@ import * as Clock from "effect/Clock";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Layer from "effect/Layer";
+import * as Logger from "effect/Logger";
 import * as ManagedRuntime from "effect/ManagedRuntime";
 import * as PubSub from "effect/PubSub";
 import * as Scope from "effect/Scope";
@@ -54,6 +55,7 @@ import {
   ProviderService,
   type ProviderServiceShape,
 } from "../../provider/Services/ProviderService.ts";
+import { captureProviderRuntimeEventBinding } from "../../provider/runtimeEventBindingRegistry.ts";
 import { checkpointRefForThreadTurn } from "../../checkpointing/Utils.ts";
 import { ServerConfig } from "../../config.ts";
 import * as WorkspaceEntries from "../../workspace/WorkspaceEntries.ts";
@@ -61,9 +63,8 @@ import * as WorkspacePaths from "../../workspace/WorkspacePaths.ts";
 
 import { trustedSystemDispatchAuthority } from "../commandAudienceGuard.ts";
 const testDispatchAuthority = trustedSystemDispatchAuthority("orchestration-test");
-// These runtime-event behaviors are retained as restoration markers for the
-// trusted-source-envelope follow-up; domain-event checkpointing remains active.
-const xit = it.skip;
+// Retained alias keeps the restored runtime-event coverage easy to distinguish.
+const xit = it;
 
 const asProjectId = (value: string): ProjectId => ProjectId.make(value);
 const asTurnId = (value: string): TurnId => TurnId.make(value);
@@ -84,7 +85,7 @@ type LegacyProviderRuntimeEvent = {
 function createProviderServiceHarness(
   cwd: string,
   hasSession = true,
-  sessionCwd = cwd,
+  sessionCwd: string | undefined = cwd,
   providerName: ProviderSession["provider"] = ProviderDriverKind.make("codex"),
 ) {
   const now = "2026-01-01T00:00:00.000Z";
@@ -100,10 +101,11 @@ function createProviderServiceHarness(
       ? Effect.succeed([
           {
             provider: providerName,
+            providerInstanceId: ProviderInstanceId.make(String(providerName)),
             status: "ready",
             runtimeMode: "full-access",
             threadId: ThreadId.make("thread-1"),
-            cwd: sessionCwd,
+            ...(sessionCwd !== undefined ? { cwd: sessionCwd } : {}),
             createdAt: now,
             updatedAt: now,
           },
@@ -136,14 +138,32 @@ function createProviderServiceHarness(
     },
   };
 
+  const publish = (event: LegacyProviderRuntimeEvent): void => {
+    const runtimeEvent = event as unknown as ProviderRuntimeEvent;
+    if (hasSession && runtimeEvent.threadId === ThreadId.make("thread-1")) {
+      captureProviderRuntimeEventBinding(runtimeEvent, {
+        threadId: ThreadId.make("thread-1"),
+        provider: providerName,
+        providerInstanceId: ProviderInstanceId.make(String(providerName)),
+        runtimeMode: "full-access",
+        cwd: sessionCwd,
+      });
+    }
+    Effect.runSync(PubSub.publish(runtimeEventPubSub, runtimeEvent));
+  };
   const emit = (event: LegacyProviderRuntimeEvent): void => {
-    Effect.runSync(PubSub.publish(runtimeEventPubSub, event as unknown as ProviderRuntimeEvent));
+    publish({
+      ...event,
+      providerInstanceId:
+        event.providerInstanceId ?? ProviderInstanceId.make(String(event.provider)),
+    });
   };
 
   return {
     service,
     rollbackConversation,
     emit,
+    emitUnstamped: publish,
   };
 }
 
@@ -286,17 +306,24 @@ describe("CheckpointReactor", () => {
     readonly projectWorkspaceRoot?: string;
     readonly threadWorktreePath?: string | null;
     readonly providerSessionCwd?: string;
+    readonly omitProviderSessionCwd?: boolean;
     readonly providerName?: ProviderDriverKind;
     readonly gitStatusRefreshCalls?: Array<string>;
   }) {
     const cwd = createGitRepository();
     tempDirs.push(cwd);
+    const hasProviderSession = options?.hasSession ?? true;
+    const trackedProvider = options?.providerName ?? ProviderDriverKind.make("codex");
     const provider = createProviderServiceHarness(
       cwd,
-      options?.hasSession ?? true,
-      options?.providerSessionCwd ?? cwd,
-      options?.providerName ?? ProviderDriverKind.make("codex"),
+      hasProviderSession,
+      options?.omitProviderSessionCwd === true ? undefined : (options?.providerSessionCwd ?? cwd),
+      trackedProvider,
     );
+    const auditLogs: string[] = [];
+    const captureLogger = Logger.make<unknown, void>(({ message }) => {
+      auditLogs.push(JSON.stringify(message));
+    });
     const orchestrationLayer = OrchestrationEngineLive.pipe(
       Layer.provide(OrchestrationProjectionSnapshotQueryLive),
       Layer.provide(OrchestrationProjectionPipelineLive),
@@ -331,7 +358,6 @@ describe("CheckpointReactor", () => {
       refreshStatus: () => Effect.die("refreshStatus should not be called in this test"),
       streamStatus: () => Stream.empty,
     });
-
     const layer = CheckpointReactorLive.pipe(
       Layer.provideMerge(orchestrationLayer),
       Layer.provideMerge(projectionSnapshotLayer),
@@ -349,6 +375,7 @@ describe("CheckpointReactor", () => {
       Layer.provideMerge(VcsProcess.layer),
       Layer.provideMerge(ServerConfigLayer),
       Layer.provideMerge(NodeServices.layer),
+      Layer.provideMerge(Logger.layer([captureLogger])),
     );
 
     runtime = ManagedRuntime.make(layer);
@@ -429,12 +456,13 @@ describe("CheckpointReactor", () => {
       engine,
       readModel: () => readDetailedReadModel(snapshotQuery),
       provider,
+      auditLogs,
       cwd,
       drain,
     };
   }
 
-  it("drops unproven turn.started and turn.completed runtime events", async () => {
+  it("drops target-mismatched turn lifecycle events with an audited outcome", async () => {
     const harness = await createHarness({ seedFilesystemCheckpoints: false });
     const createdAt = "2026-01-01T00:00:00.000Z";
 
@@ -493,6 +521,37 @@ describe("CheckpointReactor", () => {
     expect(
       gitRefExists(harness.cwd, checkpointRefForThreadTurn(ThreadId.make("thread-1"), 1)),
     ).toBe(false);
+    expect(
+      harness.auditLogs.some(
+        (entry) =>
+          entry.includes("provider runtime event target mismatch dropped") &&
+          entry.includes("target-mismatch"),
+      ),
+    ).toBe(true);
+  });
+
+  it("drops an event with missing instance identity in the checkpoint consumer", async () => {
+    const harness = await createHarness({ seedFilesystemCheckpoints: false });
+
+    harness.provider.emitUnstamped({
+      type: "turn.started",
+      eventId: EventId.make("evt-checkpoint-missing-instance"),
+      provider: ProviderDriverKind.make("codex"),
+      createdAt: "2026-01-01T00:00:00.000Z",
+      threadId: ThreadId.make("thread-1"),
+      turnId: asTurnId("turn-checkpoint-missing-instance"),
+    });
+    await harness.drain();
+
+    expect(
+      gitRefExists(harness.cwd, checkpointRefForThreadTurn(ThreadId.make("thread-1"), 0)),
+    ).toBe(false);
+    expect(
+      harness.auditLogs.some(
+        (entry) =>
+          entry.includes("evt-checkpoint-missing-instance") && entry.includes("target-mismatch"),
+      ),
+    ).toBe(true);
   });
 
   xit("refreshes local git status state on turn completion using the session cwd", async () => {
@@ -708,7 +767,6 @@ describe("CheckpointReactor", () => {
 
   it("captures pre-turn baseline from project workspace root when thread worktree is unset", async () => {
     const harness = await createHarness({
-      hasSession: false,
       seedFilesystemCheckpoints: false,
       threadWorktreePath: null,
     });
@@ -748,9 +806,9 @@ describe("CheckpointReactor", () => {
 
   xit("captures turn completion checkpoint from project workspace root when provider session cwd is unavailable", async () => {
     const harness = await createHarness({
-      hasSession: false,
       seedFilesystemCheckpoints: false,
       threadWorktreePath: null,
+      omitProviderSessionCwd: true,
     });
     const createdAt = "2026-01-01T00:00:00.000Z";
 

@@ -30,7 +30,9 @@ import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Layer from "effect/Layer";
+import * as Logger from "effect/Logger";
 import * as ManagedRuntime from "effect/ManagedRuntime";
+import * as Metric from "effect/Metric";
 import * as Option from "effect/Option";
 import * as PubSub from "effect/PubSub";
 import * as Schema from "effect/Schema";
@@ -47,11 +49,15 @@ import * as SubagentDispatchLimiter from "../../mcp/toolkits/subagent/SubagentDi
 import { makeCodexAdapter } from "../../provider/Layers/CodexAdapter.ts";
 import type { CodexAdapterShape } from "../../provider/Services/CodexAdapter.ts";
 import { ProviderInstanceRegistry } from "../../provider/Services/ProviderInstanceRegistry.ts";
-import { ProviderSessionDirectory } from "../../provider/Services/ProviderSessionDirectory.ts";
+import {
+  ProviderSessionDirectory,
+  type ProviderRuntimeBinding,
+} from "../../provider/Services/ProviderSessionDirectory.ts";
 import {
   ProviderService,
   type ProviderServiceShape,
 } from "../../provider/Services/ProviderService.ts";
+import { captureProviderRuntimeEventBinding } from "../../provider/runtimeEventBindingRegistry.ts";
 import * as RepositoryIdentityResolver from "../../project/RepositoryIdentityResolver.ts";
 import { ChildThreadCoordinatorLive } from "./ChildThreadCoordinator.ts";
 import { OrchestrationEngineLive } from "./OrchestrationEngine.ts";
@@ -70,9 +76,8 @@ import * as NodeServices from "@effect/platform-node/NodeServices";
 
 import { trustedSystemDispatchAuthority } from "../commandAudienceGuard.ts";
 const testDispatchAuthority = trustedSystemDispatchAuthority("orchestration-test");
-// These tests retain the behavior the trusted-source-envelope slice must restore.
-// Production cannot safely exercise them until runtime events carry source proof.
-const xit = it.skip;
+// Retained alias keeps the restored runtime-event coverage easy to distinguish.
+const xit = it;
 
 function makeTestServerSettingsLayer(overrides: Partial<ServerSettings> = {}) {
   return ServerSettingsService.layerTest(overrides);
@@ -90,7 +95,7 @@ class RecordedCodexAdapter extends Context.Service<RecordedCodexAdapter, CodexAd
   "t3/orchestration/Layers/ProviderRuntimeIngestion.test/RecordedCodexAdapter",
 ) {}
 
-const providerSessionDirectoryTestLayer = Layer.succeed(ProviderSessionDirectory, {
+const adapterProviderSessionDirectoryTestLayer = Layer.succeed(ProviderSessionDirectory, {
   upsert: () => Effect.void,
   getProvider: () =>
     Effect.die(new Error("ProviderSessionDirectory.getProvider is not used in this test")),
@@ -132,6 +137,7 @@ function isLegacyTurnCompletedEvent(
 function createProviderServiceHarness(adapter?: CodexAdapterShape) {
   const runtimeEventPubSub = Effect.runSync(PubSub.unbounded<ProviderRuntimeEvent>());
   const runtimeSessions: ProviderSession[] = [];
+  const persistedBindings = new Map<ThreadId, ProviderRuntimeBinding>();
 
   const unsupported = () => Effect.die(new Error("Unsupported provider call in test")) as never;
   const service: ProviderServiceShape = {
@@ -159,17 +165,71 @@ function createProviderServiceHarness(adapter?: CodexAdapterShape) {
     },
     rollbackConversation: () => unsupported(),
     get streamEvents() {
-      return adapter?.streamEvents ?? Stream.fromPubSub(runtimeEventPubSub);
+      return adapter
+        ? adapter.streamEvents.pipe(
+            Stream.map((event) => {
+              const canonicalEvent = {
+                ...event,
+                providerInstanceId:
+                  event.providerInstanceId ?? ProviderInstanceId.make(String(event.provider)),
+              };
+              captureBinding(canonicalEvent);
+              return canonicalEvent;
+            }),
+          )
+        : Stream.fromPubSub(runtimeEventPubSub);
     },
   };
 
   const setSession = (session: ProviderSession): void => {
-    const existingIndex = runtimeSessions.findIndex((entry) => entry.threadId === session.threadId);
+    const normalizedSession = {
+      ...session,
+      providerInstanceId:
+        session.providerInstanceId ?? ProviderInstanceId.make(String(session.provider)),
+    } satisfies ProviderSession;
+    const existingIndex = runtimeSessions.findIndex(
+      (entry) => entry.threadId === normalizedSession.threadId,
+    );
     if (existingIndex >= 0) {
-      runtimeSessions[existingIndex] = session;
+      runtimeSessions[existingIndex] = normalizedSession;
+    } else {
+      runtimeSessions.push(normalizedSession);
+    }
+    persistedBindings.set(normalizedSession.threadId, {
+      threadId: normalizedSession.threadId,
+      provider: normalizedSession.provider,
+      providerInstanceId: normalizedSession.providerInstanceId,
+      runtimeMode: normalizedSession.runtimeMode,
+    });
+  };
+
+  const removeLiveSession = (threadId: ThreadId): void => {
+    const index = runtimeSessions.findIndex((entry) => entry.threadId === threadId);
+    if (index >= 0) runtimeSessions.splice(index, 1);
+  };
+
+  const captureBinding = (event: ProviderRuntimeEvent): void => {
+    const liveBinding = runtimeSessions.find((session) => session.threadId === event.threadId);
+    const persistedBinding = persistedBindings.get(event.threadId);
+    if (liveBinding !== undefined) {
+      captureProviderRuntimeEventBinding(event, {
+        threadId: liveBinding.threadId,
+        provider: liveBinding.provider,
+        providerInstanceId: liveBinding.providerInstanceId,
+        runtimeMode: liveBinding.runtimeMode,
+        cwd: liveBinding.cwd,
+      });
       return;
     }
-    runtimeSessions.push(session);
+    if (event.type === "session.exited" && persistedBinding !== undefined) {
+      captureProviderRuntimeEventBinding(event, {
+        threadId: persistedBinding.threadId,
+        provider: persistedBinding.provider,
+        providerInstanceId: persistedBinding.providerInstanceId,
+        runtimeMode: persistedBinding.runtimeMode,
+        cwd: undefined,
+      });
+    }
   };
 
   const normalizeLegacyEvent = (event: LegacyProviderRuntimeEvent): ProviderRuntimeEvent => {
@@ -187,13 +247,78 @@ function createProviderServiceHarness(adapter?: CodexAdapterShape) {
     return event as ProviderRuntimeEvent;
   };
 
+  const publish = (event: ProviderRuntimeEvent): void => {
+    captureBinding(event);
+    Effect.runSync(PubSub.publish(runtimeEventPubSub, event));
+  };
+
   const emit = (event: LegacyProviderRuntimeEvent): void => {
-    Effect.runSync(PubSub.publish(runtimeEventPubSub, normalizeLegacyEvent(event)));
+    const normalized = normalizeLegacyEvent(event);
+    if (normalized.providerInstanceId === undefined) {
+      const providerInstanceId = ProviderInstanceId.make(String(normalized.provider));
+      const existing = runtimeSessions.find((session) => session.threadId === normalized.threadId);
+      if (existing !== undefined) {
+        setSession({
+          ...existing,
+          provider: normalized.provider,
+          providerInstanceId,
+        });
+      } else {
+        setSession({
+          provider: normalized.provider,
+          providerInstanceId,
+          status: "ready",
+          runtimeMode: "approval-required",
+          threadId: normalized.threadId,
+          createdAt: normalized.createdAt,
+          updatedAt: normalized.createdAt,
+        });
+      }
+    }
+    publish({
+      ...normalized,
+      providerInstanceId:
+        normalized.providerInstanceId ?? ProviderInstanceId.make(String(normalized.provider)),
+    });
+  };
+
+  const emitUnstamped = (event: LegacyProviderRuntimeEvent): void => {
+    publish(normalizeLegacyEvent(event));
+  };
+
+  const emitWithCapturedBinding = (
+    event: LegacyProviderRuntimeEvent,
+    binding: Parameters<typeof captureProviderRuntimeEventBinding>[1],
+  ): void => {
+    const normalized = normalizeLegacyEvent(event);
+    captureProviderRuntimeEventBinding(normalized, binding);
+    Effect.runSync(PubSub.publish(runtimeEventPubSub, normalized));
+  };
+
+  const emitQueuedBeforeLiveRemoval = (
+    events: ReadonlyArray<LegacyProviderRuntimeEvent>,
+    threadId: ThreadId,
+  ): void => {
+    const canonicalEvents = events.map((event) => {
+      const normalized = normalizeLegacyEvent(event);
+      return {
+        ...normalized,
+        providerInstanceId:
+          normalized.providerInstanceId ?? ProviderInstanceId.make(String(normalized.provider)),
+      } satisfies ProviderRuntimeEvent;
+    });
+    for (const event of canonicalEvents) captureBinding(event);
+    removeLiveSession(threadId);
+    for (const event of canonicalEvents) publish(event);
   };
 
   return {
     service,
     emit,
+    emitQueuedBeforeLiveRemoval,
+    emitUnstamped,
+    emitWithCapturedBinding,
+    removeLiveSession,
     setSession,
   };
 }
@@ -257,7 +382,7 @@ describe("ProviderRuntimeIngestion", () => {
     ).pipe(
       Layer.provideMerge(ServerConfig.layerTest(process.cwd(), process.cwd())),
       Layer.provideMerge(ServerSettingsService.layerTest()),
-      Layer.provideMerge(providerSessionDirectoryTestLayer),
+      Layer.provideMerge(adapterProviderSessionDirectoryTestLayer),
       Layer.provideMerge(NodeServices.layer),
     );
     adapterScope = await Effect.runPromise(Scope.make("sequential"));
@@ -290,9 +415,13 @@ describe("ProviderRuntimeIngestion", () => {
   }) {
     const workspaceRoot = makeTempDir("t3-provider-project-");
     NodeFS.mkdirSync(NodePath.join(workspaceRoot, ".git"));
-    const provider = createProviderServiceHarness(options?.providerAdapter);
     const providerDriver = options?.provider ?? ProviderDriverKind.make("codex");
     const providerInstanceId = ProviderInstanceId.make(String(providerDriver));
+    const provider = createProviderServiceHarness(options?.providerAdapter);
+    const auditLogs: string[] = [];
+    const captureLogger = Logger.make<unknown, void>(({ message }) => {
+      auditLogs.push(JSON.stringify(message));
+    });
     const modelSelection = {
       instanceId: providerInstanceId,
       model: providerDriver === "codex" ? "gpt-5.4-mini" : `${providerDriver}-test-model`,
@@ -331,6 +460,7 @@ describe("ProviderRuntimeIngestion", () => {
       Layer.provideMerge(makeTestServerSettingsLayer(options?.serverSettings)),
       Layer.provideMerge(ServerConfig.layerTest(process.cwd(), process.cwd())),
       Layer.provideMerge(NodeServices.layer),
+      Layer.provideMerge(Logger.layer([captureLogger])),
     );
     const managedRuntime = ManagedRuntime.make(layer);
     runtime = managedRuntime;
@@ -348,6 +478,7 @@ describe("ProviderRuntimeIngestion", () => {
       for (let index = 0; index < 50; index += 1) {
         await Effect.runPromise(Effect.yieldNow);
       }
+      await Effect.runPromise(ingestion.drain);
       await Effect.runPromise(coordinator.drain);
     };
 
@@ -394,6 +525,7 @@ describe("ProviderRuntimeIngestion", () => {
             threadId: ThreadId.make("thread-1"),
             status: "ready",
             providerName: providerDriver,
+            providerInstanceId,
             runtimeMode: "approval-required",
             activeTurnId: null,
             updatedAt: createdAt,
@@ -406,6 +538,7 @@ describe("ProviderRuntimeIngestion", () => {
     );
     provider.setSession({
       provider: providerDriver,
+      providerInstanceId,
       status: "ready",
       runtimeMode: "approval-required",
       threadId: ThreadId.make("thread-1"),
@@ -424,7 +557,30 @@ describe("ProviderRuntimeIngestion", () => {
           ),
         ),
       emit: provider.emit,
+      emitQueuedBeforeLiveRemoval: provider.emitQueuedBeforeLiveRemoval,
+      emitUnstamped: provider.emitUnstamped,
+      emitWithCapturedBinding: provider.emitWithCapturedBinding,
       setProviderSession: provider.setSession,
+      removeLiveProviderSession: provider.removeLiveSession,
+      auditLogs,
+      readBindingDropCount: (outcome: "no-binding" | "target-mismatch") =>
+        managedRuntime.runPromise(
+          Metric.snapshot.pipe(
+            Effect.map((snapshots) =>
+              snapshots.reduce((count, snapshot) => {
+                if (
+                  snapshot.type !== "Counter" ||
+                  snapshot.id !== "t3_provider_runtime_event_binding_drops_total" ||
+                  snapshot.attributes?.consumer !== "ProviderRuntimeIngestion" ||
+                  snapshot.attributes.outcome !== outcome
+                ) {
+                  return count;
+                }
+                return count + Number(snapshot.state.count);
+              }, 0),
+            ),
+          ),
+        ),
       coordinator,
       modelSelection,
       acquireDispatchLease: (childThreadId: ThreadId) =>
@@ -471,7 +627,7 @@ describe("ProviderRuntimeIngestion", () => {
     };
   }
 
-  it("drops a forged factory runtime event that names an unrelated private thread", async () => {
+  it("drops an unbound runtime event and increments the no-binding counter", async () => {
     const harness = await createHarness({
       serverSettings: { enableAssistantStreaming: true },
     });
@@ -497,6 +653,7 @@ describe("ProviderRuntimeIngestion", () => {
       ),
     );
 
+    const dropsBefore = await harness.readBindingDropCount("no-binding");
     harness.emit({
       type: "content.delta",
       eventId: asEventId("evt-forged-private-target"),
@@ -518,9 +675,17 @@ describe("ProviderRuntimeIngestion", () => {
     );
     expect(privateThread?.messages).toEqual([]);
     expect(privateThread?.activities).toEqual([]);
+    expect(
+      harness.auditLogs.some(
+        (entry) =>
+          entry.includes("provider runtime event without tracked binding dropped") &&
+          entry.includes("no-binding"),
+      ),
+    ).toBe(true);
+    expect(await harness.readBindingDropCount("no-binding")).toBe(dropsBefore + 1);
   });
 
-  it("drops an ordinary runtime event until independent source provenance exists", async () => {
+  it("drops a spoofed bound-thread target and emits a target-mismatch audit", async () => {
     const harness = await createHarness({
       serverSettings: { enableAssistantStreaming: true },
     });
@@ -529,14 +694,14 @@ describe("ProviderRuntimeIngestion", () => {
       type: "content.delta",
       eventId: asEventId("evt-unproven-ordinary-target"),
       provider: ProviderDriverKind.make("codex"),
-      providerInstanceId: harness.modelSelection.instanceId,
+      providerInstanceId: ProviderInstanceId.make("codex-spoofed-instance"),
       threadId: asThreadId("thread-1"),
       turnId: asTurnId("turn-unproven-ordinary-target"),
       itemId: asItemId("item-unproven-ordinary-target"),
       createdAt: "2026-01-01T00:00:00.000Z",
       payload: {
         streamKind: "assistant_text",
-        delta: "disabled until trusted source envelopes exist",
+        delta: "must not project under a spoofed provider target",
       },
     });
     await harness.drain();
@@ -546,6 +711,330 @@ describe("ProviderRuntimeIngestion", () => {
     );
     expect(thread?.messages).toEqual([]);
     expect(thread?.activities).toEqual([]);
+    expect(
+      harness.auditLogs.some(
+        (entry) =>
+          entry.includes("provider runtime event target mismatch dropped") &&
+          entry.includes("target-mismatch"),
+      ),
+    ).toBe(true);
+  });
+
+  it("drops an event with missing instance identity in runtime ingestion", async () => {
+    const harness = await createHarness({
+      serverSettings: { enableAssistantStreaming: true },
+    });
+
+    harness.emitUnstamped({
+      type: "content.delta",
+      eventId: asEventId("evt-missing-instance-identity"),
+      provider: ProviderDriverKind.make("codex"),
+      threadId: asThreadId("thread-1"),
+      turnId: asTurnId("turn-missing-instance-identity"),
+      itemId: asItemId("item-missing-instance-identity"),
+      createdAt: "2026-01-01T00:00:00.000Z",
+      payload: {
+        streamKind: "assistant_text",
+        delta: "must not project without an exact instance target",
+      },
+    });
+    await harness.drain();
+
+    const thread = (await harness.readModel()).threads.find(
+      (entry) => entry.id === asThreadId("thread-1"),
+    );
+    expect(thread?.messages).toEqual([]);
+    expect(
+      harness.auditLogs.some(
+        (entry) =>
+          entry.includes("evt-missing-instance-identity") && entry.includes("target-mismatch"),
+      ),
+    ).toBe(true);
+  });
+
+  it("drops an event when both claimed and captured instance identity are absent", async () => {
+    const harness = await createHarness({
+      serverSettings: { enableAssistantStreaming: true },
+    });
+    const threadId = asThreadId("thread-1");
+    harness.emitWithCapturedBinding(
+      {
+        type: "content.delta",
+        eventId: asEventId("evt-both-missing-instance-identity"),
+        provider: ProviderDriverKind.make("codex"),
+        threadId,
+        turnId: asTurnId("turn-both-missing-instance-identity"),
+        itemId: asItemId("item-both-missing-instance-identity"),
+        createdAt: "2026-01-01T00:00:00.000Z",
+        payload: {
+          streamKind: "assistant_text",
+          delta: "must not project without either instance identity",
+        },
+      },
+      {
+        threadId,
+        provider: ProviderDriverKind.make("codex"),
+        providerInstanceId: undefined,
+        runtimeMode: "approval-required",
+        cwd: undefined,
+      },
+    );
+    await harness.drain();
+
+    const thread = (await harness.readModel()).threads.find((entry) => entry.id === threadId);
+    expect(thread?.messages).toEqual([]);
+    expect(
+      harness.auditLogs.some(
+        (entry) =>
+          entry.includes("evt-both-missing-instance-identity") && entry.includes("target-mismatch"),
+      ),
+    ).toBe(true);
+  });
+
+  it("preserves a restricted session mode when captured mode metadata is absent", async () => {
+    const harness = await createHarness();
+    const threadId = asThreadId("thread-1");
+    harness.emitWithCapturedBinding(
+      {
+        type: "session.state.changed",
+        eventId: asEventId("evt-session-state-without-captured-mode"),
+        provider: ProviderDriverKind.make("codex"),
+        providerInstanceId: harness.modelSelection.instanceId,
+        threadId,
+        createdAt: "2026-01-01T00:00:00.000Z",
+        payload: { state: "waiting", reason: "awaiting approval" },
+      },
+      {
+        threadId,
+        provider: ProviderDriverKind.make("codex"),
+        providerInstanceId: harness.modelSelection.instanceId,
+        runtimeMode: undefined,
+        cwd: undefined,
+      },
+    );
+
+    const thread = await waitForThread(
+      harness.readModel,
+      (entry) => entry.session?.status === "waiting",
+    );
+    expect(thread.session?.runtimeMode).toBe("approval-required");
+  });
+
+  it("drops a nonterminal event after its live session binding is removed", async () => {
+    const harness = await createHarness({
+      serverSettings: { enableAssistantStreaming: true },
+    });
+    const threadId = asThreadId("thread-1");
+    const dropsBefore = await harness.readBindingDropCount("no-binding");
+    harness.removeLiveProviderSession(threadId);
+
+    harness.emit({
+      type: "content.delta",
+      eventId: asEventId("evt-nonterminal-after-live-removal"),
+      provider: ProviderDriverKind.make("codex"),
+      providerInstanceId: harness.modelSelection.instanceId,
+      threadId,
+      turnId: asTurnId("turn-nonterminal-after-live-removal"),
+      itemId: asItemId("item-nonterminal-after-live-removal"),
+      createdAt: "2026-01-01T00:00:00.000Z",
+      payload: {
+        streamKind: "assistant_text",
+        delta: "must not project after teardown",
+      },
+    });
+    await harness.drain();
+
+    const thread = (await harness.readModel()).threads.find((entry) => entry.id === threadId);
+    expect(thread?.messages).toEqual([]);
+    expect(await harness.readBindingDropCount("no-binding")).toBe(dropsBefore + 1);
+  });
+
+  it("projects trailing delta and completion after terminal state with multiple live sessions", async () => {
+    const cursor = ProviderDriverKind.make("cursor");
+    const instanceId = ProviderInstanceId.make("cursor");
+    const harness = await createHarness({ provider: cursor });
+    const now = "2026-01-01T00:00:00.000Z";
+    const threadId = asThreadId("thread-1");
+    const turnId = asTurnId("turn-multi-session-terminal-late");
+    harness.setProviderSession({
+      provider: cursor,
+      providerInstanceId: instanceId,
+      status: "ready",
+      runtimeMode: "approval-required",
+      threadId: asThreadId("thread-peer-on-cursor"),
+      createdAt: now,
+      updatedAt: now,
+    });
+
+    harness.emit({
+      type: "turn.started",
+      eventId: asEventId("evt-multi-session-terminal-started"),
+      provider: cursor,
+      providerInstanceId: instanceId,
+      threadId,
+      turnId,
+      createdAt: now,
+    });
+    harness.emit({
+      type: "turn.completed",
+      eventId: asEventId("evt-multi-session-terminal-completed"),
+      provider: cursor,
+      providerInstanceId: instanceId,
+      threadId,
+      turnId,
+      createdAt: now,
+      payload: { state: "completed" },
+    });
+    await waitForThread(
+      harness.readModel,
+      (thread) => thread.session?.status === "ready" && thread.session.activeTurnId === null,
+    );
+
+    harness.emitQueuedBeforeLiveRemoval(
+      [
+        {
+          type: "content.delta",
+          eventId: asEventId("evt-multi-session-terminal-late-delta"),
+          provider: cursor,
+          providerInstanceId: instanceId,
+          threadId,
+          turnId,
+          itemId: asItemId("item-multi-session-terminal-late"),
+          createdAt: now,
+          payload: {
+            streamKind: "assistant_text",
+            delta: "late output after terminal state",
+          },
+        },
+        {
+          type: "turn.completed",
+          eventId: asEventId("evt-multi-session-terminal-trailing-completed"),
+          provider: cursor,
+          providerInstanceId: instanceId,
+          threadId,
+          turnId,
+          createdAt: now,
+          payload: { state: "completed" },
+        },
+      ],
+      threadId,
+    );
+
+    const thread = await waitForThread(harness.readModel, (entry) =>
+      entry.messages.some(
+        (message) =>
+          message.id === "assistant:item-multi-session-terminal-late" &&
+          message.turnId === turnId &&
+          message.text === "late output after terminal state" &&
+          !message.streaming,
+      ),
+    );
+    expect(thread.latestTurn).toMatchObject({ turnId, state: "completed" });
+  });
+
+  it("projects old-turn trailing events after a later turn starts with multiple live sessions", async () => {
+    const cursor = ProviderDriverKind.make("cursor");
+    const instanceId = ProviderInstanceId.make("cursor");
+    const harness = await createHarness({ provider: cursor });
+    const now = "2026-01-01T00:00:00.000Z";
+    const threadId = asThreadId("thread-1");
+    const oldTurnId = asTurnId("turn-multi-session-old");
+    const activeTurnId = asTurnId("turn-multi-session-active");
+    harness.setProviderSession({
+      provider: cursor,
+      providerInstanceId: instanceId,
+      status: "ready",
+      runtimeMode: "approval-required",
+      threadId: asThreadId("thread-peer-on-cursor-active"),
+      createdAt: now,
+      updatedAt: now,
+    });
+
+    harness.emit({
+      type: "turn.started",
+      eventId: asEventId("evt-multi-session-old-started"),
+      provider: cursor,
+      providerInstanceId: instanceId,
+      threadId,
+      turnId: oldTurnId,
+      createdAt: now,
+    });
+    harness.emit({
+      type: "turn.completed",
+      eventId: asEventId("evt-multi-session-old-completed"),
+      provider: cursor,
+      providerInstanceId: instanceId,
+      threadId,
+      turnId: oldTurnId,
+      createdAt: now,
+      payload: { state: "completed" },
+    });
+    await waitForThread(
+      harness.readModel,
+      (thread) => thread.session?.status === "ready" && thread.session.activeTurnId === null,
+    );
+
+    harness.setProviderSession({
+      provider: cursor,
+      providerInstanceId: instanceId,
+      status: "running",
+      runtimeMode: "approval-required",
+      threadId,
+      activeTurnId,
+      createdAt: now,
+      updatedAt: now,
+    });
+    harness.emit({
+      type: "turn.started",
+      eventId: asEventId("evt-multi-session-active-started"),
+      provider: cursor,
+      providerInstanceId: instanceId,
+      threadId,
+      turnId: activeTurnId,
+      createdAt: now,
+    });
+    await waitForThread(
+      harness.readModel,
+      (thread) =>
+        thread.session?.status === "running" && thread.session.activeTurnId === activeTurnId,
+    );
+
+    harness.emit({
+      type: "content.delta",
+      eventId: asEventId("evt-multi-session-old-trailing-delta"),
+      provider: cursor,
+      providerInstanceId: instanceId,
+      threadId,
+      turnId: oldTurnId,
+      itemId: asItemId("item-multi-session-old-trailing"),
+      createdAt: now,
+      payload: {
+        streamKind: "assistant_text",
+        delta: "old output after the next turn started",
+      },
+    });
+    harness.emit({
+      type: "turn.completed",
+      eventId: asEventId("evt-multi-session-old-trailing-completed"),
+      provider: cursor,
+      providerInstanceId: instanceId,
+      threadId,
+      turnId: oldTurnId,
+      createdAt: now,
+      payload: { state: "completed" },
+    });
+
+    const thread = await waitForThread(harness.readModel, (entry) =>
+      entry.messages.some(
+        (message) =>
+          message.id === "assistant:item-multi-session-old-trailing" &&
+          message.turnId === oldTurnId &&
+          message.text === "old output after the next turn started" &&
+          !message.streaming,
+      ),
+    );
+    expect(thread.session).toMatchObject({ status: "running", activeTurnId });
+    expect(thread.latestTurn).toMatchObject({ turnId: activeTurnId, state: "running" });
   });
 
   xit("maps turn started/completed events into thread session updates", async () => {
@@ -666,7 +1155,7 @@ describe("ProviderRuntimeIngestion", () => {
     expect(reroutedThread.latestTurn?.turnId).toBe(codexTurnId);
   });
 
-  xit("fails a running turn when the provider process exits without a graceful tag", async () => {
+  xit("projects a session exit from the persisted binding after live removal", async () => {
     const harness = await createHarness();
     const turnId = asTurnId("turn-provider-process-exit");
 
@@ -682,6 +1171,7 @@ describe("ProviderRuntimeIngestion", () => {
       harness.readModel,
       (thread) => thread.latestTurn?.turnId === turnId && thread.latestTurn.state === "running",
     );
+    harness.removeLiveProviderSession(asThreadId("thread-1"));
 
     harness.emit({
       type: "session.exited",

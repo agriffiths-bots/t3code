@@ -41,10 +41,7 @@ import {
 import { ServerSettingsService } from "../../serverSettings.ts";
 
 import { threadAudienceSystemDispatchAuthority } from "../commandAudienceGuard.ts";
-import {
-  hasIndependentRuntimeEventSourceProvenance,
-  warnDroppedUnprovenRuntimeEvent,
-} from "../providerRuntimeEventProvenance.ts";
+import { resolveProviderRuntimeEventBinding } from "../providerRuntimeEventBinding.ts";
 const providerTurnKey = (threadId: ThreadId, turnId: TurnId) => `${threadId}:${turnId}`;
 
 interface AssistantSegmentState {
@@ -97,10 +94,6 @@ function sameId(left: string | null | undefined, right: string | null | undefine
     return false;
   }
   return left === right;
-}
-
-function isSessionLifecycleRuntimeEvent(event: ProviderRuntimeEvent): boolean {
-  return event.type.startsWith("session.");
 }
 
 function hasAssistantMessageForTurn(
@@ -1388,15 +1381,15 @@ const make = Effect.gen(function* () {
 
   const processRuntimeEvent = (event: ProviderRuntimeEvent) =>
     Effect.gen(function* () {
-      if (
-        !isSessionLifecycleRuntimeEvent(event) &&
-        !hasIndependentRuntimeEventSourceProvenance(event)
-      ) {
-        yield* warnDroppedUnprovenRuntimeEvent("ProviderRuntimeIngestion", event);
+      const binding = yield* resolveProviderRuntimeEventBinding({
+        consumer: "ProviderRuntimeIngestion",
+        event,
+      });
+      if (binding === undefined) {
         return;
       }
 
-      const thread = yield* resolveThreadShell(event.threadId);
+      const thread = yield* resolveThreadShell(binding.threadId);
       if (!thread) return;
       const runtimeAuthority = threadAudienceSystemDispatchAuthority(
         thread,
@@ -1572,11 +1565,11 @@ const make = Effect.gen(function* () {
               session: {
                 threadId: thread.id,
                 status,
-                providerName: event.provider,
-                ...(event.providerInstanceId !== undefined
-                  ? { providerInstanceId: event.providerInstanceId }
+                providerName: binding.provider,
+                ...(binding.providerInstanceId !== undefined
+                  ? { providerInstanceId: binding.providerInstanceId }
                   : {}),
-                runtimeMode: thread.session?.runtimeMode ?? "full-access",
+                runtimeMode: binding.runtimeMode ?? thread.session?.runtimeMode ?? "full-access",
                 activeTurnId: nextActiveTurnId,
                 lastError,
                 updatedAt: now,
@@ -1879,11 +1872,11 @@ const make = Effect.gen(function* () {
               session: {
                 threadId: thread.id,
                 status: "error",
-                providerName: event.provider,
-                ...(event.providerInstanceId !== undefined
-                  ? { providerInstanceId: event.providerInstanceId }
+                providerName: binding.provider,
+                ...(binding.providerInstanceId !== undefined
+                  ? { providerInstanceId: binding.providerInstanceId }
                   : {}),
-                runtimeMode: thread.session?.runtimeMode ?? "full-access",
+                runtimeMode: binding.runtimeMode ?? thread.session?.runtimeMode ?? "full-access",
                 activeTurnId: eventTurnId ?? null,
                 lastError: runtimeErrorMessage,
                 updatedAt: now,

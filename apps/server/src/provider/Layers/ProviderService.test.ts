@@ -49,6 +49,7 @@ import type { ProviderAdapterShape } from "../Services/ProviderAdapter.ts";
 import * as ProviderAdapterRegistry from "../Services/ProviderAdapterRegistry.ts";
 import * as ProviderService from "../Services/ProviderService.ts";
 import * as ProviderSessionDirectory from "../Services/ProviderSessionDirectory.ts";
+import { getCapturedProviderRuntimeEventBinding } from "../runtimeEventBindingRegistry.ts";
 import { makeProviderServiceLive, type ProviderServiceLiveOptions } from "./ProviderService.ts";
 import * as ProviderEventLoggers from "./ProviderEventLoggers.ts";
 import { ProviderSessionDirectoryLive } from "./ProviderSessionDirectory.ts";
@@ -2879,7 +2880,7 @@ routing.layer("ProviderServiceLive routing", (it) => {
           schemaVersion: 1,
           sessionId: "stale-cursor-session",
         };
-        firstCursor.emit({
+        const staleGenerationEvent: LegacyProviderRuntimeEvent = {
           type: "session.state.changed",
           eventId: asEventId("evt-stale-generation-cursor-resume-ready"),
           provider: CURSOR_DRIVER,
@@ -2889,8 +2890,16 @@ routing.layer("ProviderServiceLive routing", (it) => {
             state: "ready",
             detail: { resumeCursor: staleResumeCursor },
           },
-        });
+        };
+        firstCursor.emit(staleGenerationEvent);
         yield* advanceTestClock(50);
+
+        assert.equal(
+          getCapturedProviderRuntimeEventBinding(
+            staleGenerationEvent as unknown as ProviderRuntimeEvent,
+          ),
+          undefined,
+        );
 
         const runtime = yield* runtimeRepository.getByThreadId({ threadId });
         assert.equal(Option.isSome(runtime), true);
@@ -3547,6 +3556,69 @@ it.effect(
 );
 
 fanout.layer("ProviderServiceLive fanout", (it) => {
+  it.effect("captures queued ingress authority but not stopped historical bindings", () =>
+    Effect.gen(function* () {
+      const provider = yield* ProviderService.ProviderService;
+      const directory = yield* ProviderSessionDirectory.ProviderSessionDirectory;
+      const threadId = asThreadId("thread-ingress-binding-race");
+      yield* provider.startSession(threadId, {
+        provider: ProviderDriverKind.make("codex"),
+        providerInstanceId: codexInstanceId,
+        threadId,
+        runtimeMode: "full-access",
+      });
+
+      const receivedFiber = yield* Stream.runHead(provider.streamEvents).pipe(Effect.forkChild);
+      yield* advanceTestClock(50);
+      const releaseRuntimeEvent = yield* fanout.codex.pauseRuntimeEvents;
+      fanout.codex.emit({
+        type: "content.delta",
+        eventId: asEventId("evt-ingress-binding-race"),
+        provider: ProviderDriverKind.make("codex"),
+        createdAt: "2026-01-01T00:00:00.000Z",
+        threadId,
+        turnId: asTurnId("turn-ingress-binding-race"),
+        itemId: "item-ingress-binding-race",
+        delta: "queued before teardown",
+        streamKind: "assistant_text",
+      });
+      fanout.codex.sessions.delete(threadId);
+      yield* releaseRuntimeEvent;
+
+      const received = Option.getOrThrow(yield* Fiber.join(receivedFiber));
+      assert.deepEqual(getCapturedProviderRuntimeEventBinding(received), {
+        threadId,
+        provider: ProviderDriverKind.make("codex"),
+        providerInstanceId: codexInstanceId,
+        runtimeMode: "full-access",
+        cwd: undefined,
+      });
+
+      yield* directory.upsert({
+        threadId,
+        provider: ProviderDriverKind.make("codex"),
+        providerInstanceId: codexInstanceId,
+        runtimeMode: "full-access",
+        status: "stopped",
+      });
+      const stoppedEventFiber = yield* Stream.runHead(provider.streamEvents).pipe(Effect.forkChild);
+      yield* advanceTestClock(50);
+      fanout.codex.emit({
+        type: "content.delta",
+        eventId: asEventId("evt-after-stopped-binding"),
+        provider: ProviderDriverKind.make("codex"),
+        createdAt: "2026-01-01T00:00:01.000Z",
+        threadId,
+        turnId: asTurnId("turn-after-stopped-binding"),
+        itemId: "item-after-stopped-binding",
+        delta: "must remain unauthoritative",
+        streamKind: "assistant_text",
+      });
+      const stoppedEvent = Option.getOrThrow(yield* Fiber.join(stoppedEventFiber));
+      assert.equal(getCapturedProviderRuntimeEventBinding(stoppedEvent), undefined);
+    }),
+  );
+
   it.effect("fans out adapter turn completion events", () =>
     Effect.gen(function* () {
       const provider = yield* ProviderService.ProviderService;
