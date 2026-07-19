@@ -10,11 +10,12 @@ import {
   EventId,
   IsoDateTime,
   MessageId,
-  type ModelSelection,
+  ModelSelection,
   type OrchestrationEvent,
   type OrchestrationLatestTurn,
   type OrchestrationThread,
   type OrchestrationThreadShell,
+  type ProviderSession,
   type ThreadId,
   type TurnId,
 } from "@t3tools/contracts";
@@ -26,6 +27,7 @@ import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
+import * as Schedule from "effect/Schedule";
 import * as Semaphore from "effect/Semaphore";
 import * as Stream from "effect/Stream";
 
@@ -47,7 +49,6 @@ import { SqlClient } from "effect/unstable/sql/SqlClient";
 import * as SqlSchema from "effect/unstable/sql/SqlSchema";
 import * as Schema from "effect/Schema";
 import { ThreadStartToolError } from "../../mcp/toolkits/thread/tools.ts";
-import { stopAndRecordProviderSession } from "./ThreadDeletionReactor.ts";
 import {
   ChildThreadCoordinator,
   MAX_DEPTH,
@@ -101,6 +102,11 @@ type ActivityAppendedEvent = Extract<OrchestrationEvent, { type: "thread.activit
 type ThreadArchivedEvent = Extract<OrchestrationEvent, { type: "thread.archived" }>;
 type ThreadUnarchivedEvent = Extract<OrchestrationEvent, { type: "thread.unarchived" }>;
 type ThreadDeletedEvent = Extract<OrchestrationEvent, { type: "thread.deleted" }>;
+
+const ORPHAN_SETTLED_ACTIVITY_KIND = "subagent.orphan.settled";
+const ORPHAN_ARCHIVED_PARENT_REASON = "orphaned by archived parent";
+const ORPHAN_RETIRED_PARENT_REASON = "orphaned by deleted or retired parent";
+const BOOT_EXTERNAL_CALL_TIMEOUT_MS = PROJECTION_READ_TIMEOUT_MS;
 
 const latestTurnTerminalAt = (latestTurn: OrchestrationLatestTurn | null): string | null =>
   latestTurn?.completedAt ?? latestTurn?.startedAt ?? latestTurn?.requestedAt ?? null;
@@ -163,6 +169,7 @@ const isThreadArchivedOutcome = (outcome: ChildTerminalOutcome): boolean =>
 const ChildRowSchema = Schema.Struct({
   threadId: Schema.String,
   parentThreadId: Schema.NullOr(Schema.String),
+  modelSelection: Schema.fromJsonString(ModelSelection),
 });
 
 const WaitDeliveryRowSchema = Schema.Struct({
@@ -325,6 +332,31 @@ const failedTurnStartRequestId = (
   }
   return EventId.make(activity.payload.turnStartRequestId);
 };
+
+const orphanSettlementReason = (
+  activity: ActivityAppendedEvent["payload"]["activity"],
+): string | null => {
+  if (
+    activity.kind !== ORPHAN_SETTLED_ACTIVITY_KIND ||
+    activity.payload === null ||
+    typeof activity.payload !== "object" ||
+    Array.isArray(activity.payload) ||
+    !("reason" in activity.payload) ||
+    typeof activity.payload.reason !== "string" ||
+    !("status" in activity.payload) ||
+    activity.payload.status !== "killed" ||
+    (activity.payload.reason !== ORPHAN_ARCHIVED_PARENT_REASON &&
+      activity.payload.reason !== ORPHAN_RETIRED_PARENT_REASON)
+  ) {
+    return null;
+  }
+  return activity.payload.reason;
+};
+
+const isDurableOrphanSettlement = (outcome: ChildTerminalOutcome): boolean =>
+  outcome.status === "killed" &&
+  (outcome.error === ORPHAN_ARCHIVED_PARENT_REASON ||
+    outcome.error === ORPHAN_RETIRED_PARENT_REASON);
 
 const clearFailedPendingTurnStart = (input: {
   readonly threadId: ThreadId;
@@ -578,7 +610,8 @@ const make = Effect.gen(function* () {
       sql`
         SELECT
           thread_id AS "threadId",
-          parent_thread_id AS "parentThreadId"
+          parent_thread_id AS "parentThreadId",
+          model_selection_json AS "modelSelection"
         FROM projection_threads
         WHERE parent_thread_id IS NOT NULL
           AND parent_environment_id IS NULL
@@ -1111,6 +1144,7 @@ const make = Effect.gen(function* () {
     getThreadShell(threadId).pipe(
       Effect.timeoutOption(`${PROJECTION_READ_TIMEOUT_MS} millis`),
       Effect.map(Option.flatten),
+      Effect.catchCause(() => Effect.succeed(Option.none())),
     );
 
   const runningParentTurnIdForWait = (parentThreadId: ThreadId): Effect.Effect<TurnId | null> =>
@@ -1123,13 +1157,154 @@ const make = Effect.gen(function* () {
     );
 
   const getThreadShellForDrain = (threadId: ThreadId) =>
-    getThreadShell(threadId).pipe(Effect.timeoutOption(`${PROJECTION_READ_TIMEOUT_MS} millis`));
+    getThreadShell(threadId).pipe(
+      Effect.timeoutOption(`${PROJECTION_READ_TIMEOUT_MS} millis`),
+      Effect.catchCause(() => Effect.succeed(Option.none())),
+    );
 
   const getThreadDetailBounded = (threadId: ThreadId) =>
     getThreadDetail(threadId).pipe(
       Effect.timeoutOption(`${PROJECTION_READ_TIMEOUT_MS} millis`),
       Effect.map(Option.flatten),
+      Effect.catchCause(() => Effect.succeed(Option.none())),
     );
+
+  const getThreadDetailForBoot = (threadId: ThreadId) =>
+    projectionSnapshotQuery.getThreadDetailById(threadId).pipe(
+      Effect.timeoutOption(`${PROJECTION_READ_TIMEOUT_MS} millis`),
+      Effect.map(
+        Option.match({
+          onNone: () => ({ _tag: "Unavailable" as const, cause: "timeout" }),
+          onSome: Option.match({
+            onNone: () => ({ _tag: "Missing" as const }),
+            onSome: (detail) => ({ _tag: "Found" as const, detail }),
+          }),
+        }),
+      ),
+      Effect.catchCause((cause) =>
+        Effect.succeed({ _tag: "Unavailable" as const, cause: Cause.pretty(cause) }),
+      ),
+    );
+
+  const listBootRuntimeSessions = () =>
+    providerService.listSessions().pipe(
+      Effect.timeoutOption(`${BOOT_EXTERNAL_CALL_TIMEOUT_MS} millis`),
+      Effect.map(
+        Option.match({
+          onNone: () => ({ _tag: "Unavailable" as const, cause: "timeout" }),
+          onSome: (sessions) => ({ _tag: "Available" as const, sessions }),
+        }),
+      ),
+      Effect.catchCause((cause) =>
+        Effect.succeed({ _tag: "Unavailable" as const, cause: Cause.pretty(cause) }),
+      ),
+    );
+
+  const stopBootProviderSession = (threadId: ThreadId) =>
+    providerService.stopSession({ threadId }).pipe(
+      Effect.timeoutOption(`${BOOT_EXTERNAL_CALL_TIMEOUT_MS} millis`),
+      Effect.map(
+        Option.match({
+          onNone: () => ({ _tag: "Indeterminate" as const, cause: "timeout" }),
+          onSome: () => ({ _tag: "Stopped" as const }),
+        }),
+      ),
+      Effect.catchCause((cause) =>
+        Effect.succeed({ _tag: "Indeterminate" as const, cause: Cause.pretty(cause) }),
+      ),
+    );
+
+  const getProviderInstanceForBoot = (instanceId: ModelSelection["instanceId"]) =>
+    registry.getInstance(instanceId).pipe(
+      Effect.timeoutOption(`${BOOT_EXTERNAL_CALL_TIMEOUT_MS} millis`),
+      Effect.map(
+        Option.match({
+          onNone: () => ({ _tag: "Unavailable" as const, cause: "timeout" }),
+          onSome: (instance) =>
+            instance === undefined ? { _tag: "Missing" as const } : { _tag: "Found" as const },
+        }),
+      ),
+      Effect.catchCause((cause) =>
+        Effect.succeed({ _tag: "Unavailable" as const, cause: Cause.pretty(cause) }),
+      ),
+    );
+
+  const recordOrphanSettlement = Effect.fn("recordOrphanSettlement")(function* (input: {
+    readonly threadId: ThreadId;
+    readonly reason: string;
+    readonly createdAt: string;
+    readonly commandId: CommandId;
+    readonly activityId: EventId;
+  }) {
+    yield* orchestrationEngine.dispatch({
+      type: "thread.activity.append",
+      commandId: input.commandId,
+      threadId: input.threadId,
+      activity: {
+        id: input.activityId,
+        tone: "info",
+        kind: ORPHAN_SETTLED_ACTIVITY_KIND,
+        summary: "Sub-agent orphan settled",
+        payload: { status: "killed", reason: input.reason },
+        turnId: null,
+        createdAt: input.createdAt,
+      },
+      createdAt: input.createdAt,
+    });
+  });
+
+  const recordStoppedOrphanSession = Effect.fn("recordStoppedOrphanSession")(function* (input: {
+    readonly threadId: ThreadId;
+    readonly projectedSession: OrchestrationThread["session"];
+    readonly runtimeSession: ProviderSession | undefined;
+    readonly createdAt: string;
+    readonly lastError: string;
+    readonly commandId: CommandId;
+  }) {
+    const providerInstanceId =
+      input.projectedSession?.providerInstanceId ?? input.runtimeSession?.providerInstanceId;
+    yield* orchestrationEngine.dispatch({
+      type: "thread.session.set",
+      commandId: input.commandId,
+      threadId: input.threadId,
+      session: {
+        threadId: input.threadId,
+        status: "stopped",
+        providerName:
+          input.projectedSession?.providerName ?? input.runtimeSession?.provider ?? null,
+        ...(providerInstanceId !== undefined ? { providerInstanceId } : {}),
+        runtimeMode:
+          input.projectedSession?.runtimeMode ?? input.runtimeSession?.runtimeMode ?? "full-access",
+        activeTurnId: null,
+        lastError: input.lastError,
+        updatedAt: input.createdAt,
+      },
+      createdAt: input.createdAt,
+    });
+  });
+
+  const confirmOrphanProviderCleanup = Effect.fn("confirmOrphanProviderCleanup")(function* (input: {
+    readonly threadId: ThreadId;
+    readonly projectedSession: OrchestrationThread["session"];
+  }) {
+    const snapshot = yield* listBootRuntimeSessions();
+    const runtimeSession =
+      snapshot._tag === "Available"
+        ? snapshot.sessions.find((session) => session.threadId === input.threadId)
+        : undefined;
+    const requiresPhysicalStop = runtimeSession !== undefined || snapshot._tag === "Unavailable";
+    if (requiresPhysicalStop) {
+      const stopResult = yield* stopBootProviderSession(input.threadId);
+      if (stopResult._tag === "Indeterminate") {
+        return yield* Effect.fail(stopResult.cause);
+      }
+    }
+    const requiresSessionRecording =
+      snapshot._tag === "Unavailable" ||
+      runtimeSession !== undefined ||
+      (input.projectedSession !== null && !isTerminalSessionProjection(input.projectedSession));
+    return { runtimeSession, requiresSessionRecording };
+  });
 
   const currentProjectedTerminal = (
     shell: OrchestrationThreadShell,
@@ -2146,16 +2321,24 @@ const make = Effect.gen(function* () {
     });
 
   const handleActivityAppended = (event: ActivityAppendedEvent) =>
-    Effect.sync(() => {
+    Effect.gen(function* () {
       const { threadId, activity } = event.payload;
-      if (!children.has(threadId) || activity.kind !== "provider.turn.start.failed") return;
-      clearFailedPendingTurnStart({
-        threadId,
-        failedRequestId: failedTurnStartRequestId(activity),
-        activeTurns: activeTurnByChild,
-        pendingStarts: pendingTurnStartByChild,
-        pendingSameTurnStarts: pendingSameTurnStartByChild,
-      });
+      if (!children.has(threadId)) return;
+      const settledOrphanReason = orphanSettlementReason(activity);
+      if (settledOrphanReason !== null) {
+        suppressParentWakeChildIds.add(threadId);
+        yield* settleChild(threadId, "killed", settledOrphanReason, true);
+        return;
+      }
+      if (activity.kind === "provider.turn.start.failed") {
+        clearFailedPendingTurnStart({
+          threadId,
+          failedRequestId: failedTurnStartRequestId(activity),
+          activeTurns: activeTurnByChild,
+          pendingStarts: pendingTurnStartByChild,
+          pendingSameTurnStarts: pendingSameTurnStartByChild,
+        });
+      }
     });
 
   const processEvent = (event: OrchestrationEvent) => {
@@ -2806,6 +2989,15 @@ const make = Effect.gen(function* () {
             case "thread.activity-appended": {
               const { threadId, activity } = event.payload;
               if (!knownChildIds.has(threadId)) return;
+              const settledOrphanReason = orphanSettlementReason(activity);
+              if (settledOrphanReason !== null) {
+                markLifecycleTerminal(
+                  threadId,
+                  nonSessionTerminalOutcome("killed", settledOrphanReason, activity.createdAt),
+                  { preserveExistingTerminal: false },
+                );
+                return;
+              }
               if (lifecycleTerminatedByChild.has(threadId)) return;
               if (activeArchiveByReplayedChild.has(threadId)) return;
               if (activity.kind !== "provider.turn.start.failed") return;
@@ -3141,19 +3333,26 @@ const make = Effect.gen(function* () {
           promotedParentByChild.get(childThreadId) === parentThreadId &&
           !stalePromotedChildIds.has(childThreadId);
         if (children.has(childThreadId)) continue;
-        const detailOption = yield* getThreadDetail(childThreadId);
-        if (Option.isNone(detailOption)) {
+        const detailRead = yield* getThreadDetailForBoot(childThreadId);
+        if (detailRead._tag === "Missing") {
           // No detail row yet (projection lag): do NOT fabricate a model or
           // settle this child. It will be validated when it calls register().
           // Settling it here on a fabricated "unknown" instance would wrongly
           // kill a child that is still running (wake CRITICAL #2).
           continue;
         }
-        const detail = detailOption.value;
-        restoredDetailByChild.set(childThreadId, detail);
-        const projectedTerminal = projectedLifecycleTerminal(detail);
-        if (projectedTerminal !== null) {
-          projectedTerminalByChild.set(childThreadId, projectedTerminal);
+        if (detailRead._tag === "Unavailable") {
+          yield* Effect.logWarning(
+            "child detail unavailable during reconciliation; preserving conservative lease",
+            { childThreadId, cause: detailRead.cause },
+          );
+        } else {
+          const detail = detailRead.detail;
+          restoredDetailByChild.set(childThreadId, detail);
+          const projectedTerminal = projectedLifecycleTerminal(detail);
+          if (projectedTerminal !== null) {
+            projectedTerminalByChild.set(childThreadId, projectedTerminal);
+          }
         }
         const terminal = yield* Deferred.make<ChildWaitResult>();
         trackChild(childThreadId, {
@@ -3166,7 +3365,8 @@ const make = Effect.gen(function* () {
             !restoredPromoted &&
             !pendingWakeChildIds.has(childThreadId) &&
             !waitDeliveredChildIds.has(childThreadId),
-          model: detail.modelSelection,
+          model:
+            detailRead._tag === "Found" ? detailRead.detail.modelSelection : row.modelSelection,
           spawnedAtMs: 0,
           depth: 1,
           terminal,
@@ -3285,12 +3485,12 @@ const make = Effect.gen(function* () {
             return null;
           }
           if (read._tag === "Missing") {
-            const reason = "orphaned by deleted or retired parent";
+            const reason = ORPHAN_RETIRED_PARENT_REASON;
             orphanReasonByThread.set(threadId, reason);
             return reason;
           }
           if (read.shell.archivedAt !== null) {
-            const reason = "orphaned by archived parent";
+            const reason = ORPHAN_ARCHIVED_PARENT_REASON;
             orphanReasonByThread.set(threadId, reason);
             return reason;
           }
@@ -3551,6 +3751,39 @@ const make = Effect.gen(function* () {
         }
         yield* settleChild(childThreadId, outcome.status, outcome.error);
       }
+      for (const [childThreadId, outcome] of terminalByChild) {
+        if (!isDurableOrphanSettlement(outcome)) continue;
+        const projectedSession = restoredDetailByChild.get(childThreadId)?.session ?? null;
+        if (projectedSession === null || isTerminalSessionProjection(projectedSession)) continue;
+        // A durable orphan-settlement activity is written only after physical
+        // cleanup is confirmed. Repair the secondary session projection if the
+        // process crashed between those two durable writes.
+        const repairSessionProjection = recordStoppedOrphanSession({
+          threadId: childThreadId,
+          projectedSession,
+          runtimeSession: undefined,
+          createdAt: yield* nowIso,
+          lastError: outcome.error ?? ORPHAN_RETIRED_PARENT_REASON,
+          commandId: yield* newCommandId("orphan-session-repair"),
+        });
+        const repaired = yield* repairSessionProjection.pipe(
+          Effect.as(true),
+          Effect.catchCause((cause) =>
+            Effect.logWarning("durable orphan session projection repair failed; retrying", {
+              childThreadId,
+              cause: Cause.pretty(cause),
+            }).pipe(Effect.as(false)),
+          ),
+        );
+        if (!repaired) {
+          yield* Effect.forkScoped(
+            repairSessionProjection.pipe(
+              Effect.catchCause((cause) => Effect.fail(Cause.pretty(cause))),
+              Effect.retry(Schedule.spaced("2 seconds")),
+            ),
+          );
+        }
+      }
 
       const inactiveProjectionUnarchivedChildIds = new Set<ThreadId>();
 
@@ -3607,7 +3840,10 @@ const make = Effect.gen(function* () {
       // Remaining non-terminal children: validate the provider instance still exists.
       // Seed the dispatch limiter for survivors so a restart cannot launch a
       // full new cap on top of already-running sub-agents.
-      const bootRuntimeSessions = yield* providerService.listSessions();
+      let bootRuntimeSessionsSnapshot:
+        | { readonly _tag: "Available"; readonly sessions: ReadonlyArray<ProviderSession> }
+        | { readonly _tag: "Unavailable"; readonly cause: string }
+        | undefined;
       for (const childThreadId of bootChildOrder) {
         if (terminalByChild.has(childThreadId)) continue;
         const record = children.get(childThreadId);
@@ -3624,43 +3860,155 @@ const make = Effect.gen(function* () {
               reason: orphanReason,
             },
           );
+          if (bootRuntimeSessionsSnapshot === undefined) {
+            bootRuntimeSessionsSnapshot = yield* listBootRuntimeSessions();
+            if (bootRuntimeSessionsSnapshot._tag === "Unavailable") {
+              yield* Effect.logWarning(
+                "orphan provider snapshot unavailable; attempting conservative cleanup",
+                { cause: bootRuntimeSessionsSnapshot.cause },
+              );
+            }
+          }
           const projectedSession = restoredDetailByChild.get(childThreadId)?.session ?? null;
-          const runtimeSession = bootRuntimeSessions.find(
-            (session) => session.threadId === childThreadId,
+          const runtimeSession =
+            bootRuntimeSessionsSnapshot._tag === "Available"
+              ? bootRuntimeSessionsSnapshot.sessions.find(
+                  (session) => session.threadId === childThreadId,
+                )
+              : undefined;
+          const createdAt = yield* nowIso;
+          const settlementInput = {
+            threadId: childThreadId,
+            reason: orphanReason,
+            createdAt,
+            commandId: yield* newCommandId("orphan-settlement"),
+            activityId: EventId.make(yield* randomUUID),
+          } as const;
+          const sessionCommandId = yield* newCommandId("orphan-session-stop");
+          const retrySettlement = recordOrphanSettlement(settlementInput).pipe(
+            Effect.catchCause((cause) => Effect.fail(Cause.pretty(cause))),
+            Effect.retry(Schedule.spaced("2 seconds")),
           );
-          const requiresProviderCleanup =
+          const retryPhysicalCleanup = confirmOrphanProviderCleanup({
+            threadId: childThreadId,
+            projectedSession,
+          }).pipe(
+            Effect.catchCause((cause) => Effect.fail(Cause.pretty(cause))),
+            Effect.retry(Schedule.spaced("2 seconds")),
+          );
+          const retrySessionRecording = (confirmation: {
+            readonly runtimeSession: ProviderSession | undefined;
+            readonly requiresSessionRecording: boolean;
+          }) =>
+            confirmation.requiresSessionRecording
+              ? recordStoppedOrphanSession({
+                  threadId: childThreadId,
+                  projectedSession,
+                  runtimeSession: confirmation.runtimeSession,
+                  createdAt,
+                  lastError: orphanReason,
+                  commandId: sessionCommandId,
+                }).pipe(
+                  Effect.catchCause((cause) => Effect.fail(Cause.pretty(cause))),
+                  Effect.retry(Schedule.spaced("2 seconds")),
+                )
+              : Effect.void;
+          const requiresSessionRecording =
+            bootRuntimeSessionsSnapshot._tag === "Unavailable" ||
             runtimeSession !== undefined ||
             (projectedSession !== null && !isTerminalSessionProjection(projectedSession));
-          const cleanupSucceeded = requiresProviderCleanup
-            ? yield* stopAndRecordProviderSession({
-                threadId: childThreadId,
-                projectedSession,
-                runtimeSession,
-                providerService,
-                orchestrationEngine,
-                commandId: yield* newCommandId("orphan-session-stop"),
-                createdAt: yield* nowIso,
-                lastError: orphanReason,
-              }).pipe(
-                Effect.as(true),
-                Effect.catchCause((cause) =>
-                  Effect.logWarning("orphan provider cleanup failed; retaining child lease", {
+          const requiresPhysicalStop =
+            runtimeSession !== undefined || bootRuntimeSessionsSnapshot._tag === "Unavailable";
+          let cleanupConfirmation:
+            | {
+                readonly runtimeSession: ProviderSession | undefined;
+                readonly requiresSessionRecording: boolean;
+              }
+            | undefined = { runtimeSession, requiresSessionRecording };
+          if (requiresPhysicalStop) {
+            const stopResult = yield* stopBootProviderSession(childThreadId);
+            if (stopResult._tag === "Indeterminate") {
+              cleanupConfirmation = undefined;
+              yield* Effect.logWarning(
+                "orphan provider cleanup indeterminate; quarantining and retrying",
+                {
+                  childThreadId,
+                  parentThreadId: record.parentThreadId,
+                  cause: stopResult.cause,
+                },
+              );
+            }
+          }
+          if (cleanupConfirmation === undefined) {
+            // Keep the active projection untouched until physical cleanup is
+            // confirmed. A crash therefore re-enters orphan classification,
+            // while the current waiter receives its killed outcome immediately.
+            yield* settleChild(childThreadId, "killed", orphanReason, true);
+            yield* Effect.forkScoped(
+              retryPhysicalCleanup.pipe(
+                Effect.flatMap((confirmation) =>
+                  retrySettlement.pipe(Effect.andThen(retrySessionRecording(confirmation))),
+                ),
+              ),
+            );
+            continue;
+          }
+          const settlementRecorded = yield* recordOrphanSettlement(settlementInput).pipe(
+            Effect.catchCause((cause) => Effect.fail(Cause.pretty(cause))),
+            Effect.retry({ times: 2 }),
+            Effect.as(true),
+            Effect.catch((cause) =>
+              Effect.logWarning(
+                "orphan settlement recording retries exhausted; retrying in background",
+                {
+                  childThreadId,
+                  parentThreadId: record.parentThreadId,
+                  cause,
+                },
+              ).pipe(Effect.as(false)),
+            ),
+          );
+          if (!settlementRecorded) {
+            // Physical cleanup is already confirmed, so persistence retry can
+            // proceed without keeping a live provider behind the released lease.
+            yield* settleChild(childThreadId, "killed", orphanReason, true);
+            yield* Effect.forkScoped(
+              retrySettlement.pipe(Effect.andThen(retrySessionRecording(cleanupConfirmation))),
+            );
+            continue;
+          }
+          if (cleanupConfirmation.requiresSessionRecording) {
+            const sessionRecorded = yield* recordStoppedOrphanSession({
+              threadId: childThreadId,
+              projectedSession,
+              runtimeSession: cleanupConfirmation.runtimeSession,
+              createdAt,
+              lastError: orphanReason,
+              commandId: sessionCommandId,
+            }).pipe(
+              Effect.as(true),
+              Effect.catchCause((cause) =>
+                Effect.logWarning(
+                  "orphan cleanup succeeded but session projection recording failed; retrying",
+                  {
                     childThreadId,
                     parentThreadId: record.parentThreadId,
                     cause: Cause.pretty(cause),
-                  }).pipe(Effect.as(false)),
-                ),
-              )
-            : true;
-          if (cleanupSucceeded) {
-            // Bounded final-text lookup and wake suppression are both required
-            // here: cleanup completes before Deferred settlement releases state.
-            yield* settleChild(childThreadId, "killed", orphanReason, true);
-            continue;
+                  },
+                ).pipe(Effect.as(false)),
+              ),
+            );
+            if (!sessionRecorded) {
+              yield* Effect.forkScoped(retrySessionRecording(cleanupConfirmation));
+            }
           }
+          // The killed lifecycle signal is durable before this Deferred is
+          // released, so replay returns the same terminal classification.
+          yield* settleChild(childThreadId, "killed", orphanReason, true);
+          continue;
         }
-        const instance = yield* registry.getInstance(record.model.instanceId);
-        if (instance === undefined) {
+        const instanceRead = yield* getProviderInstanceForBoot(record.model.instanceId);
+        if (instanceRead._tag === "Missing") {
           yield* Effect.logWarning(
             "reconciled non-terminal sub-agent lost its provider instance; terminating",
             {
@@ -3671,6 +4019,16 @@ const make = Effect.gen(function* () {
           );
           yield* settleChild(childThreadId, "killed", "provider instance removed");
           continue;
+        }
+        if (instanceRead._tag === "Unavailable") {
+          yield* Effect.logWarning(
+            "provider instance read unavailable during child reconciliation; assuming live",
+            {
+              childThreadId,
+              instanceId: record.model.instanceId,
+              cause: instanceRead.cause,
+            },
+          );
         }
         if (inactiveProjectionUnarchivedChildIds.has(childThreadId)) continue;
         yield* dispatchLimiter.seedChild(childThreadId);
