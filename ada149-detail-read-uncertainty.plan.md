@@ -75,7 +75,7 @@ design, which this brief forbids.
 | edge case                                                    | test                                                                                                                             |
 | ------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------- |
 | replay archive, detail read times out                        | `replayed archive keeps a child active when the detail read is unavailable`                                                      |
-| replay archive, detail row genuinely missing                 | `replayed archive still kills a child whose detail row is missing` (pins Missing ≠ Unavailable)                                  |
+| replay archive, detail row genuinely missing                 | `still settles a replayed archive whose detail row is genuinely missing` (pins Missing ≠ Unavailable)                            |
 | live archive, detail unavailable, no shell evidence          | `live archive leaves a child pending when the detail read is unavailable`                                                        |
 | live archive, detail unavailable, shell IS terminal          | shell evidence still settles (existing coverage at `:1324`)                                                                      |
 | live archive, shell says completed, text re-read unavailable | `live archive does not deliver an empty completed result when the text re-read is unavailable`                                   |
@@ -85,6 +85,13 @@ design, which this brief forbids.
 Harness note: `detailUnavailableIds` returns `Option.none()`, i.e. **Missing**.
 The real `Unavailable` lever is `slowThreadDetailIds` / `slowThreadShellIds`
 (timeout). New tests use the slow levers.
+
+Correction after implementation: the Missing companion was planned to assert
+`killed` / "thread archived". It actually settles `failed` — boot session
+reconciliation reaches a running session with no detail row before the replay
+archive branch does. Verified pre-existing on HEAD (same result with the fix
+reverted), so the test asserts the real value. The contrast it pins is
+unchanged and is the point: **Missing settles, Unavailable stays pending.**
 
 ## Revert-mutation proof
 

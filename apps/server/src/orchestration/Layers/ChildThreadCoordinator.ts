@@ -1203,15 +1203,20 @@ const make = Effect.gen(function* () {
       Effect.catchCause(() => Effect.succeed(Option.none())),
     );
 
+  const getThreadDetailReadBounded = (threadId: ThreadId) =>
+    boundedProjectionRead(projectionSnapshotQuery.getThreadDetailById(threadId));
+
+  // Compatibility view, mirroring getThreadShellBounded: only for callers where
+  // a missing row and an unavailable read already take the same conservative
+  // direction (return without settling). Callers that act terminally on absence
+  // must use the tagged read so a timeout or defect cannot pose as a real
+  // negative.
   const getThreadDetailBounded = (threadId: ThreadId) =>
-    getThreadDetail(threadId).pipe(
-      Effect.timeoutOption(`${PROJECTION_READ_TIMEOUT_MS} millis`),
-      Effect.map(Option.flatten),
-      Effect.catchCause(() => Effect.succeed(Option.none())),
+    getThreadDetailReadBounded(threadId).pipe(
+      Effect.map((read) => (read._tag === "Found" ? Option.some(read.value) : Option.none())),
     );
 
-  const getThreadDetailForBoot = (threadId: ThreadId) =>
-    boundedProjectionRead(projectionSnapshotQuery.getThreadDetailById(threadId));
+  const getThreadDetailForBoot = getThreadDetailReadBounded;
 
   const listBootRuntimeSessions = () =>
     providerService.listSessions().pipe(
@@ -2055,31 +2060,49 @@ const make = Effect.gen(function* () {
     Effect.gen(function* () {
       const { threadId, archivedAt } = event.payload;
       archivedChildIds.add(threadId);
-      const detail = yield* getThreadDetailBounded(threadId);
+      const detailRead = yield* getThreadDetailReadBounded(threadId);
       if (children.has(threadId)) {
-        const projectedOutcome = Option.match(detail, {
-          onNone: () => null,
-          onSome: (thread) => projectedLifecycleTerminal({ ...thread, archivedAt }),
-        });
-        if (projectedOutcome === null && Option.isNone(detail)) {
+        const projectedOutcome =
+          detailRead._tag === "Found"
+            ? projectedLifecycleTerminal({ ...detailRead.value, archivedAt })
+            : null;
+        if (projectedOutcome === null && detailRead._tag !== "Found") {
           const shell = yield* getThreadShellBounded(threadId);
           const shellOutcome = Option.isSome(shell)
             ? shellTerminalOutcome(threadId, shell.value)
             : null;
           if (shellOutcome !== null) {
+            const terminalDetailRead = yield* getThreadDetailReadBounded(threadId);
+            // The shell is positive evidence that this child reached a terminal
+            // state, so the archive markers must be cleared either way. Leaving
+            // them set would let the next turn-diff or session event settle the
+            // child as killed/"thread archived" (see handleTurnDiffCompleted and
+            // handleSessionSet), throwing away the outcome the shell just proved.
             archivedChildIds.delete(threadId);
             archivedActiveChildIds.delete(threadId);
-            const terminalDetail = yield* getThreadDetailBounded(threadId);
-            const finalAssistantText = Option.match(terminalDetail, {
-              onNone: () => null,
-              onSome: finalAssistantTextFromThread,
-            });
+            if (terminalDetailRead._tag === "Unavailable" && shellOutcome.status === "completed") {
+              // An unavailable text read cannot prove the result was empty.
+              // Delivering null would record a completed child with no output;
+              // stay pending and let reconciliation settle it with the real text.
+              return;
+            }
+            const finalAssistantText =
+              terminalDetailRead._tag === "Found"
+                ? finalAssistantTextFromThread(terminalDetailRead.value)
+                : null;
             yield* completeChild(
               threadId,
               shellOutcome.status,
               finalAssistantText,
               shellOutcome.error,
             );
+            return;
+          }
+          if (detailRead._tag === "Unavailable") {
+            // No detail, no shell evidence: nothing here proves the child ended.
+            // Killing it on an unavailable read would report a possibly-running
+            // (or already completed) child as killed by the archive.
+            archivedActiveChildIds.add(threadId);
             return;
           }
         }
@@ -2094,14 +2117,13 @@ const make = Effect.gen(function* () {
         if (!isThreadArchivedOutcome(outcome)) {
           archivedChildIds.delete(threadId);
         }
-        const finalAssistantText = Option.match(detail, {
-          onNone: () => null,
-          onSome: finalAssistantTextFromThread,
-        });
+        const finalAssistantText =
+          detailRead._tag === "Found" ? finalAssistantTextFromThread(detailRead.value) : null;
         yield* completeChild(threadId, outcome.status, finalAssistantText, outcome.error);
         return;
       }
-      if (Option.isNone(detail)) return;
+      if (detailRead._tag !== "Found") return;
+      const detail = detailRead;
       const outcome = projectedLifecycleTerminal({ ...detail.value, archivedAt });
       if (outcome === null) {
         if (detail.value.parentThreadId !== undefined && detail.value.parentThreadId !== null) {
@@ -3247,15 +3269,22 @@ const make = Effect.gen(function* () {
               }
               unarchivedArchiveChildIds.delete(threadId);
               unarchivedTerminalChildIds.delete(threadId);
-              const detail = yield* getThreadDetailBounded(threadId);
-              if (Option.isNone(detail)) {
+              const detailRead = yield* getThreadDetailReadBounded(threadId);
+              if (detailRead._tag === "Unavailable") {
+                // An unavailable read is not evidence that the thread is gone.
+                // Treat the archive as active so live reconciliation decides,
+                // rather than killing a child the detail may show as running.
+                activeArchiveByReplayedChild.add(threadId);
+                return;
+              }
+              if (detailRead._tag === "Missing") {
                 markLifecycleTerminal(
                   threadId,
                   nonSessionTerminalOutcome("killed", "thread archived", archivedAt),
                 );
                 return;
               }
-              const outcome = projectedLifecycleTerminal({ ...detail.value, archivedAt });
+              const outcome = projectedLifecycleTerminal({ ...detailRead.value, archivedAt });
               if (outcome === null) {
                 activeArchiveByReplayedChild.add(threadId);
                 return;

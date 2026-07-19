@@ -17,6 +17,7 @@ import {
   type OrchestrationThreadShell,
 } from "@t3tools/contracts";
 import * as NodeServices from "@effect/platform-node/NodeServices";
+import * as Cause from "effect/Cause";
 import * as Clock from "effect/Clock";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
@@ -3556,6 +3557,140 @@ describe("ChildThreadCoordinator", () => {
     expect(result.status).toBe("killed");
     expect(result.error).toBe("thread archived");
     expect(await harness.canAcquireDispatchLease()).toBe(true);
+  });
+
+  it("keeps a replayed archive non-terminal when the archive detail read is unavailable", async () => {
+    const child = ThreadId.make("replay-archive-unavailable-detail-child");
+    const parent = ThreadId.make("replay-archive-unavailable-detail-parent");
+    const turn1 = TurnId.make("turn-1");
+    const harness = await createHarness({
+      threads: [
+        makeThreadState({ threadId: parent }),
+        makeThreadState({
+          threadId: child,
+          parentThreadId: parent,
+          latestTurn: makeLatestTurn("running", turn1),
+          session: makeSession(child, "running", turn1),
+        }),
+      ],
+      seedChildRows: [{ threadId: child, parentThreadId: parent }],
+      persistedEvents: [threadArchivedEvent(child)],
+      slowThreadDetailIds: [child],
+    });
+
+    // An unavailable read is not evidence the thread is gone: the child must
+    // stay pending for live reconciliation, not be killed by the replay.
+    expect((await runtimeListChildren(harness, parent))[0]).toMatchObject({ settled: false });
+  });
+
+  it("still settles a replayed archive whose detail row is genuinely missing", async () => {
+    const child = ThreadId.make("replay-archive-missing-detail-child");
+    const parent = ThreadId.make("replay-archive-missing-detail-parent");
+    const turn1 = TurnId.make("turn-1");
+    const harness = await createHarness({
+      threads: [
+        makeThreadState({ threadId: parent }),
+        makeThreadState({
+          threadId: child,
+          parentThreadId: parent,
+          latestTurn: makeLatestTurn("running", turn1),
+          session: makeSession(child, "running", turn1),
+        }),
+      ],
+      seedChildRows: [{ threadId: child, parentThreadId: parent }],
+      persistedEvents: [threadArchivedEvent(child)],
+      detailUnavailableIds: [child],
+    });
+
+    // Companion to the test above: Missing is real negative evidence, so the
+    // child still reaches a terminal outcome. The fix must not be mistaken for
+    // "never settle on absence" — only an UNAVAILABLE read stays pending.
+    // runtimeRun only returns once the child settles, so reaching a terminal
+    // status here is the proof: Missing settles, Unavailable stays pending.
+    const result = await runtimeRun(harness, child);
+    expect(result.status).toBe("failed");
+  });
+
+  it("leaves a live archived child pending when the detail read is unavailable", async () => {
+    const child = ThreadId.make("live-archive-unavailable-detail-child");
+    const parent = ThreadId.make("live-archive-unavailable-detail-parent");
+    const turn1 = TurnId.make("turn-1");
+    const harness = await createHarness({
+      threads: [
+        makeThreadState({ threadId: parent }),
+        makeThreadState({
+          threadId: child,
+          parentThreadId: parent,
+          latestTurn: makeLatestTurn("running", turn1),
+          session: makeSession(child, "running", turn1),
+        }),
+      ],
+      slowThreadDetailIds: [child],
+    });
+    await harness.register({
+      parentThreadId: parent,
+      childThreadId: child,
+      detached: false,
+      model: codexModel,
+      spawnedAtMs: 0,
+    });
+
+    await harness.feed(threadArchivedEvent(child));
+
+    // Detail unavailable and the shell shows a running child: nothing here
+    // proves the child ended, so it must not be recorded as killed.
+    expect((await runtimeListChildren(harness, parent))[0]).toMatchObject({ settled: false });
+  });
+
+  it("does not deliver an empty completed result when the archive text re-read is unavailable", async () => {
+    const child = ThreadId.make("live-archive-unavailable-text-child");
+    const parent = ThreadId.make("live-archive-unavailable-text-parent");
+    const turn1 = TurnId.make("turn-1");
+    const harness = await createHarness({
+      threads: [
+        makeThreadState({ threadId: parent }),
+        makeThreadState({
+          threadId: child,
+          parentThreadId: parent,
+          latestTurn: makeLatestTurn("running", turn1),
+          session: makeSession(child, "running", turn1),
+        }),
+      ],
+      slowThreadDetailIds: [child],
+    });
+    await harness.register({
+      parentThreadId: parent,
+      childThreadId: child,
+      detached: false,
+      model: codexModel,
+      spawnedAtMs: 0,
+    });
+    harness.setThread(
+      makeThreadState({
+        threadId: child,
+        parentThreadId: parent,
+        latestTurn: makeLatestTurn("completed", turn1),
+        session: makeSession(child, "stopped"),
+        assistantText: "text the parent must not lose",
+      }),
+    );
+
+    await harness.feed(threadArchivedEvent(child));
+
+    // The shell proves completion, but an unavailable text read cannot prove
+    // the result was empty. Settling here would hand the parent a null result.
+    expect((await runtimeListChildren(harness, parent))[0]).toMatchObject({ settled: false });
+
+    // Staying pending must not simply defer the bad outcome: the shell already
+    // proved this child completed, so the archive markers must be cleared. If
+    // they leak, the next session event settles it killed/"thread archived".
+    harness.setDetailSlow(child, false);
+    await harness.feed(sessionSetEvent(child, "stopped"));
+
+    const result = await runtimeRun(harness, child);
+    expect(result.status).toBe("completed");
+    expect(result.error).toBe(null);
+    expect(result.finalAssistantText).toBe("text the parent must not lose");
   });
 
   it("keeps archive terminal when projection completes after the archive", async () => {
@@ -7247,6 +7382,58 @@ describe("ChildThreadCoordinator", () => {
       throw new Error("assertParent did not return within the bounded timeout");
     }
     expect(Exit.isFailure(completed.value)).toBe(true);
+  });
+
+  it("assertParent reports a retryable failure when the shell read is unavailable", async () => {
+    const child = ThreadId.make("child-assert-parent-read-unavailable");
+    const parent = ThreadId.make("parent-assert-parent-read-unavailable");
+    const harness = await createHarness({
+      slowThreadShellIds: [child],
+      threads: [
+        makeThreadState({
+          threadId: child,
+          parentThreadId: parent,
+          latestTurn: makeLatestTurn("running"),
+        }),
+      ],
+    });
+
+    const completed = await Effect.runPromise(
+      harness.coordinator
+        .assertParent(parent, child)
+        .pipe(Effect.exit, Effect.timeoutOption("2 seconds")),
+    );
+
+    expect(Option.isSome(completed)).toBe(true);
+    if (Option.isNone(completed)) {
+      throw new Error("assertParent did not return within the bounded timeout");
+    }
+    const exit = completed.value;
+    expect(Exit.isFailure(exit)).toBe(true);
+    if (!Exit.isFailure(exit)) return;
+    const failure = Cause.findErrorOption(exit.cause);
+    expect(Option.isSome(failure)).toBe(true);
+    if (Option.isNone(failure)) return;
+    // The distinction IS the guard: an unavailable read must be reported as
+    // retryable, never as an authoritative "this is not your child".
+    expect(failure.value.message).toContain("temporarily unavailable");
+    expect(failure.value.message).not.toContain("is not a child of");
+  });
+
+  it("assertParent still rejects a genuinely missing child as not a child", async () => {
+    const child = ThreadId.make("child-assert-parent-missing-row");
+    const parent = ThreadId.make("parent-assert-parent-missing-row");
+    const harness = await createHarness({ threads: [] });
+
+    const exit = await Effect.runPromiseExit(harness.coordinator.assertParent(parent, child));
+
+    expect(Exit.isFailure(exit)).toBe(true);
+    if (!Exit.isFailure(exit)) return;
+    const failure = Cause.findErrorOption(exit.cause);
+    expect(Option.isSome(failure)).toBe(true);
+    if (Option.isNone(failure)) return;
+    expect(failure.value.message).toContain("is not a child of");
+    expect(failure.value.message).not.toContain("temporarily unavailable");
   });
 
   it("does not deadlock when a synchronous parent dispatch re-enters the wake lock", async () => {
