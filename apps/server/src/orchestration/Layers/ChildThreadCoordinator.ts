@@ -519,6 +519,10 @@ const make = Effect.gen(function* () {
   };
   const waitDeliveryMarkedAt = new Map<ThreadId, string>();
   const waitDeliveryParentTurnAt = new Map<ThreadId, TurnId>();
+  // An absent public parentTurnIdAtWait is legacy-compatible and means null.
+  // Track unavailable internal reads by result identity so they remain distinct
+  // without leaking a new sentinel through the service response shape.
+  const unavailableParentTurnWaitResults = new WeakSet<WaitChildResult>();
   // Children that already have a durable parent wake row. On restart this lets
   // log reconciliation settle the child without creating a second wake row.
   const queuedWakeChildren = new Set<ThreadId>();
@@ -1041,8 +1045,11 @@ const make = Effect.gen(function* () {
       error: mark.error,
     };
   };
-  const parentTurnIdAtWaitFromMark = (mark: WaitDeliveredMark): TurnId | null | undefined =>
-    typeof mark === "string" ? null : mark.parentTurnIdAtWait;
+  const parentTurnIdAtWaitFromMark = (mark: WaitDeliveredMark): TurnId | null | undefined => {
+    if (typeof mark === "string") return null;
+    if (unavailableParentTurnWaitResults.has(mark)) return undefined;
+    return mark.parentTurnIdAtWait ?? null;
+  };
 
   const markPromotedWakeDeliveredByWait = (
     record: ChildRecord,
@@ -2772,6 +2779,13 @@ const make = Effect.gen(function* () {
       if (protectPromotedWait) {
         beginActivePromotedWait(childThreadId);
       }
+      const attachParentTurnAtWait = (result: WaitChildResult): WaitChildResult => {
+        if (parentTurnIdAtWait === undefined) {
+          unavailableParentTurnWaitResults.add(result);
+          return result;
+        }
+        return { ...result, parentTurnIdAtWait };
+      };
       return yield* Effect.gen(function* () {
         // Re-check the projection in case it caught up after the hot-subscribe gap.
         // The active promoted-wait marker must cover this bounded read too: a live
@@ -2786,21 +2800,19 @@ const make = Effect.gen(function* () {
           if (protectPromotedWait) {
             endActivePromotedWait(childThreadId);
           }
-          return {
+          return attachParentTurnAtWait({
             childThreadId,
-            status: "pending" as const,
+            status: "pending",
             finalAssistantText: null,
             error: null,
-            ...(parentTurnIdAtWait === undefined ? {} : { parentTurnIdAtWait }),
-          } satisfies WaitChildResult;
+          });
         }
-        return {
+        return attachParentTurnAtWait({
           childThreadId,
           status: raced.status,
           finalAssistantText: raced.finalAssistantText,
           error: raced.error,
-          ...(parentTurnIdAtWait === undefined ? {} : { parentTurnIdAtWait }),
-        } satisfies WaitChildResult;
+        });
       }).pipe(
         Effect.onInterrupt(() =>
           Effect.sync(() => {
@@ -2819,15 +2831,19 @@ const make = Effect.gen(function* () {
       const budgetExhausted = now >= input.budgetDeadlineMs;
       const results: Array<WaitChildResult> = sliceResults.map((result) => {
         if (result.status === "pending" && budgetExhausted) {
-          return {
+          const timeoutResult: WaitChildResult = {
             childThreadId: result.childThreadId,
-            status: "timeout" as const,
+            status: "timeout",
             finalAssistantText: null,
             error: `wait exceeded budget`,
             ...(result.parentTurnIdAtWait === undefined
               ? {}
               : { parentTurnIdAtWait: result.parentTurnIdAtWait }),
-          } satisfies WaitChildResult;
+          };
+          if (unavailableParentTurnWaitResults.has(result)) {
+            unavailableParentTurnWaitResults.add(timeoutResult);
+          }
+          return timeoutResult;
         }
         return result;
       });
