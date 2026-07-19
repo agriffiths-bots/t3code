@@ -118,6 +118,11 @@ interface ChildTerminalOutcome {
   readonly terminalAt: string | null;
 }
 
+type BoundedProjectionRead<A> =
+  | { readonly _tag: "Found"; readonly value: A }
+  | { readonly _tag: "Missing" }
+  | { readonly _tag: "Unavailable"; readonly cause: string };
+
 const nonSessionTerminalOutcome = (
   status: ChildTerminalStatus,
   error: string | null,
@@ -882,12 +887,15 @@ const make = Effect.gen(function* () {
       }),
     );
 
-  const recordWaitDelivery = (parentThreadId: ThreadId, childThreadId: ThreadId) =>
+  const recordWaitDelivery = (
+    parentThreadId: ThreadId,
+    childThreadId: ThreadId,
+    parentShell: OrchestrationThreadShell,
+  ) =>
     Effect.gen(function* () {
       const existing = waitDeliveryMarkedAt.get(childThreadId);
       if (existing !== undefined) return existing;
-      const shellOption = yield* getThreadShellBounded(parentThreadId);
-      const latestTurn = Option.isSome(shellOption) ? shellOption.value.latestTurn : null;
+      const latestTurn = parentShell.latestTurn;
       const parentTurnIdAtDelivery =
         latestTurn?.state === "running" ? String(latestTurn.turnId) : null;
       const deliveredAt = yield* nowIso;
@@ -908,12 +916,28 @@ const make = Effect.gen(function* () {
     parentThreadId: ThreadId,
     childThreadId: ThreadId,
     dispatchIds: ReadonlyArray<PendingDispatchId>,
-    expectedParentTurnId: TurnId | null,
+    expectedParentTurnId: TurnId | null | undefined,
   ): Effect.Effect<"committed" | "refused-drain" | "refused-retain"> =>
     Effect.gen(function* () {
+      if (expectedParentTurnId === undefined) {
+        // Retaining the durable fallback is conservative: the parent-turn read
+        // at wait time was unavailable, so no later snapshot can prove delivery.
+        return "refused-retain";
+      }
       const existing = waitDeliveryMarkedAt.get(childThreadId);
+      const shellRead =
+        existing === undefined ? yield* getThreadShellReadBounded(parentThreadId) : null;
+      if (shellRead?._tag === "Unavailable") {
+        // Retaining the durable fallback is conservative: an unavailable read
+        // cannot prove which parent turn, if any, received the foreground result.
+        yield* Effect.logWarning(
+          "parent shell unavailable while committing wait delivery; retaining fallback",
+          { parentThreadId, childThreadId, cause: shellRead.cause },
+        );
+        return "refused-retain";
+      }
       const shellOption =
-        existing === undefined ? yield* getThreadShellBounded(parentThreadId) : Option.none();
+        shellRead?._tag === "Found" ? Option.some(shellRead.value) : Option.none();
       const shell = Option.isSome(shellOption) ? shellOption.value : null;
       const latestTurn = Option.isSome(shellOption) ? shellOption.value.latestTurn : null;
       if (existing === undefined && expectedParentTurnId !== null) {
@@ -1017,13 +1041,13 @@ const make = Effect.gen(function* () {
       error: mark.error,
     };
   };
-  const parentTurnIdAtWaitFromMark = (mark: WaitDeliveredMark): TurnId | null =>
-    typeof mark === "string" ? null : (mark.parentTurnIdAtWait ?? null);
+  const parentTurnIdAtWaitFromMark = (mark: WaitDeliveredMark): TurnId | null | undefined =>
+    typeof mark === "string" ? null : mark.parentTurnIdAtWait;
 
   const markPromotedWakeDeliveredByWait = (
     record: ChildRecord,
     childThreadId: ThreadId,
-    expectedParentTurnId: TurnId | null,
+    expectedParentTurnId: TurnId | null | undefined,
     deliveredResult?: ChildWaitResult,
   ) =>
     Effect.gen(function* () {
@@ -1114,17 +1138,18 @@ const make = Effect.gen(function* () {
   const getThreadShell = (threadId: ThreadId) =>
     projectionSnapshotQuery.getThreadShellById(threadId).pipe(Effect.orDie);
 
-  const getThreadShellIncludingArchivedBounded = (threadId: ThreadId) =>
-    projectionSnapshotQuery.getThreadShellByIdIncludingArchived(threadId).pipe(
+  const boundedProjectionRead = <A, E, R>(
+    read: Effect.Effect<Option.Option<A>, E, R>,
+  ): Effect.Effect<BoundedProjectionRead<A>, never, R> =>
+    read.pipe(
       Effect.timeoutOption(`${PROJECTION_READ_TIMEOUT_MS} millis`),
       Effect.map(
         Option.match({
           onNone: () => ({ _tag: "Unavailable" as const, cause: "timeout" }),
-          onSome: (shell) =>
-            Option.match(shell, {
-              onNone: () => ({ _tag: "Missing" as const }),
-              onSome: (value) => ({ _tag: "Found" as const, shell: value }),
-            }),
+          onSome: Option.match({
+            onNone: () => ({ _tag: "Missing" as const }),
+            onSome: (value) => ({ _tag: "Found" as const, value }),
+          }),
         }),
       ),
       Effect.catchCause((cause) =>
@@ -1132,26 +1157,35 @@ const make = Effect.gen(function* () {
       ),
     );
 
+  const getThreadShellIncludingArchivedBounded = (threadId: ThreadId) =>
+    boundedProjectionRead(projectionSnapshotQuery.getThreadShellByIdIncludingArchived(threadId));
+
   const getThreadDetail = (threadId: ThreadId) =>
     projectionSnapshotQuery.getThreadDetailById(threadId).pipe(Effect.orDie);
 
-  // Bounded projection read for synchronous request/startup paths. A stalled
-  // projection must never block past the slice timeout, so a read that exceeds
-  // PROJECTION_READ_TIMEOUT_MS resolves to Option.none for request callers
-  // (treated as "not yet terminal"; the caller falls through to the bounded
-  // Deferred race).
+  const getThreadShellReadBounded = (threadId: ThreadId) =>
+    boundedProjectionRead(projectionSnapshotQuery.getThreadShellById(threadId));
+
+  // Compatibility view for callers where both missing and unavailable already
+  // take the same conservative direction: stay pending, retain the lease, or
+  // preserve a queued wake. Callers that act on absence must use the tagged read.
   const getThreadShellBounded = (threadId: ThreadId) =>
-    getThreadShell(threadId).pipe(
-      Effect.timeoutOption(`${PROJECTION_READ_TIMEOUT_MS} millis`),
-      Effect.map(Option.flatten),
-      Effect.catchCause(() => Effect.succeed(Option.none())),
+    getThreadShellReadBounded(threadId).pipe(
+      Effect.map((read) => (read._tag === "Found" ? Option.some(read.value) : Option.none())),
     );
 
-  const runningParentTurnIdForWait = (parentThreadId: ThreadId): Effect.Effect<TurnId | null> =>
-    getThreadShellBounded(parentThreadId).pipe(
-      Effect.map((shellOption) => {
-        if (Option.isNone(shellOption)) return null;
-        const latestTurn = shellOption.value.latestTurn;
+  const runningParentTurnIdForWait = (
+    parentThreadId: ThreadId,
+  ): Effect.Effect<TurnId | null | undefined> =>
+    getThreadShellReadBounded(parentThreadId).pipe(
+      Effect.map((shellRead) => {
+        if (shellRead._tag === "Unavailable") {
+          // Undefined preserves uncertainty through wait delivery: a later read
+          // must not credit an unknown parent turn with receiving this result.
+          return undefined;
+        }
+        if (shellRead._tag === "Missing") return null;
+        const latestTurn = shellRead.value.latestTurn;
         return latestTurn?.state === "running" ? latestTurn.turnId : null;
       }),
     );
@@ -1170,21 +1204,7 @@ const make = Effect.gen(function* () {
     );
 
   const getThreadDetailForBoot = (threadId: ThreadId) =>
-    projectionSnapshotQuery.getThreadDetailById(threadId).pipe(
-      Effect.timeoutOption(`${PROJECTION_READ_TIMEOUT_MS} millis`),
-      Effect.map(
-        Option.match({
-          onNone: () => ({ _tag: "Unavailable" as const, cause: "timeout" }),
-          onSome: Option.match({
-            onNone: () => ({ _tag: "Missing" as const }),
-            onSome: (detail) => ({ _tag: "Found" as const, detail }),
-          }),
-        }),
-      ),
-      Effect.catchCause((cause) =>
-        Effect.succeed({ _tag: "Unavailable" as const, cause: Cause.pretty(cause) }),
-      ),
-    );
+    boundedProjectionRead(projectionSnapshotQuery.getThreadDetailById(threadId));
 
   const listBootRuntimeSessions = () =>
     providerService.listSessions().pipe(
@@ -1286,6 +1306,7 @@ const make = Effect.gen(function* () {
   const confirmOrphanProviderCleanup = Effect.fn("confirmOrphanProviderCleanup")(function* (input: {
     readonly threadId: ThreadId;
     readonly projectedSession: OrchestrationThread["session"];
+    readonly projectionSessionReadUnavailable: boolean;
   }) {
     const snapshot = yield* listBootRuntimeSessions();
     const runtimeSession =
@@ -1300,6 +1321,7 @@ const make = Effect.gen(function* () {
       }
     }
     const requiresSessionRecording =
+      input.projectionSessionReadUnavailable ||
       snapshot._tag === "Unavailable" ||
       runtimeSession !== undefined ||
       (input.projectedSession !== null && !isTerminalSessionProjection(input.projectedSession));
@@ -1522,7 +1544,7 @@ const make = Effect.gen(function* () {
               isThreadIdle(shellOption.value) &&
               parentCompletedAfterWaitDelivery(shellOption.value, result.childThreadId)
             ) {
-              yield* recordWaitDelivery(parentThreadId, result.childThreadId);
+              yield* recordWaitDelivery(parentThreadId, result.childThreadId, shellOption.value);
               waitDeliveredPromotedChildren.delete(result.childThreadId);
               promotedChildren.delete(result.childThreadId);
               activePromotedWaitChildren.delete(result.childThreadId);
@@ -1680,7 +1702,7 @@ const make = Effect.gen(function* () {
           ];
           if (prunedDeliveredByWaitEntries.length > 0) {
             for (const entry of prunedDeliveredByWaitEntries) {
-              yield* recordWaitDelivery(parentThreadId, entry.childThreadId);
+              yield* recordWaitDelivery(parentThreadId, entry.childThreadId, shell);
             }
             yield* deleteDispatchRowsAndClearWakeState(prunedDeliveredByWaitEntries);
           }
@@ -2580,12 +2602,15 @@ const make = Effect.gen(function* () {
     Effect.gen(function* () {
       const record = children.get(childThreadId);
       if (record && record.parentThreadId === parentThreadId) return;
-      const shellOption = yield* getThreadShellBounded(childThreadId);
-      const matches = Option.match(shellOption, {
-        onNone: () => false,
-        onSome: (shell) => shell.parentThreadId === parentThreadId,
-      });
-      if (matches) return;
+      const shellRead = yield* getThreadShellReadBounded(childThreadId);
+      if (shellRead._tag === "Unavailable") {
+        // Reject this attempt as retryable without claiming the relationship is
+        // absent; read unavailability is not authoritative authorization evidence.
+        return yield* fail(
+          `Unable to verify thread ${childThreadId}'s parent because the projection is temporarily unavailable; retry.`,
+        );
+      }
+      if (shellRead._tag === "Found" && shellRead.value.parentThreadId === parentThreadId) return;
       return yield* fail(`Thread ${childThreadId} is not a child of ${parentThreadId}.`);
     });
 
@@ -2697,12 +2722,22 @@ const make = Effect.gen(function* () {
   const waitForChild = (childThreadId: ThreadId): Effect.Effect<WaitChildResult> =>
     Effect.gen(function* () {
       if (!children.has(childThreadId)) {
-        const shellOption = yield* getThreadShellBounded(childThreadId);
+        const shellRead = yield* getThreadShellReadBounded(childThreadId);
         // Re-check in case register() ran concurrently between the map lookup
         // and the (bounded) projection read; if so, fall through to the normal
         // tracked path rather than reporting a misleading error.
         if (!children.has(childThreadId)) {
-          if (Option.isNone(shellOption)) {
+          if (shellRead._tag === "Unavailable") {
+            // Staying pending is conservative: a timed-out or failed read cannot
+            // prove that this child is genuinely absent from the projection.
+            return {
+              childThreadId,
+              status: "pending" as const,
+              finalAssistantText: null,
+              error: null,
+            } satisfies WaitChildResult;
+          }
+          if (shellRead._tag === "Missing") {
             // Never registered AND not in projection: terminal error, never hang.
             return {
               childThreadId,
@@ -2756,7 +2791,7 @@ const make = Effect.gen(function* () {
             status: "pending" as const,
             finalAssistantText: null,
             error: null,
-            parentTurnIdAtWait,
+            ...(parentTurnIdAtWait === undefined ? {} : { parentTurnIdAtWait }),
           } satisfies WaitChildResult;
         }
         return {
@@ -2764,7 +2799,7 @@ const make = Effect.gen(function* () {
           status: raced.status,
           finalAssistantText: raced.finalAssistantText,
           error: raced.error,
-          parentTurnIdAtWait,
+          ...(parentTurnIdAtWait === undefined ? {} : { parentTurnIdAtWait }),
         } satisfies WaitChildResult;
       }).pipe(
         Effect.onInterrupt(() =>
@@ -2839,6 +2874,7 @@ const make = Effect.gen(function* () {
       const postUnarchiveTerminalByStartedChild = new Map<ThreadId, ChildTerminalOutcome>();
       const rearchivedUnarchivedTerminalStartedChildIds = new Set<ThreadId>();
       const activeArchiveByReplayedChild = new Set<ThreadId>();
+      const authoritativeDurableOrphanSettlementByChild = new Map<ThreadId, ChildTerminalOutcome>();
       let maxSequence = 0;
       const rememberPostUnarchiveTerminal = (threadId: ThreadId, outcome: ChildTerminalOutcome) => {
         if (unarchivedTerminalStartedChildIds.has(threadId)) {
@@ -2973,6 +3009,9 @@ const make = Effect.gen(function* () {
                 pendingStarts: pendingTurnStartByReplayedChild,
                 pendingSameTurnStarts: pendingSameTurnStartByReplayedChild,
               });
+              // An accepted replacement start supersedes the prior orphan
+              // lifecycle. A later orphan settlement will add the child again.
+              authoritativeDurableOrphanSettlementByChild.delete(threadId);
               runningByChild.set(threadId, true);
               terminalByChild.delete(threadId);
               if (
@@ -2991,11 +3030,13 @@ const make = Effect.gen(function* () {
               if (!knownChildIds.has(threadId)) return;
               const settledOrphanReason = orphanSettlementReason(activity);
               if (settledOrphanReason !== null) {
-                markLifecycleTerminal(
-                  threadId,
-                  nonSessionTerminalOutcome("killed", settledOrphanReason, activity.createdAt),
-                  { preserveExistingTerminal: false },
+                const outcome = nonSessionTerminalOutcome(
+                  "killed",
+                  settledOrphanReason,
+                  activity.createdAt,
                 );
+                authoritativeDurableOrphanSettlementByChild.set(threadId, outcome);
+                markLifecycleTerminal(threadId, outcome, { preserveExistingTerminal: false });
                 return;
               }
               if (lifecycleTerminatedByChild.has(threadId)) return;
@@ -3256,6 +3297,7 @@ const make = Effect.gen(function* () {
         postUnarchiveTerminalByStartedChild,
         rearchivedUnarchivedTerminalStartedChildIds,
         activeArchiveByReplayedChild,
+        authoritativeDurableOrphanSettlementByChild,
         maxSequence,
       };
     });
@@ -3325,6 +3367,7 @@ const make = Effect.gen(function* () {
       const knownChildIds = new Set<ThreadId>();
       const projectedTerminalByChild = new Map<ThreadId, ChildTerminalOutcome>();
       const restoredDetailByChild = new Map<ThreadId, OrchestrationThread>();
+      const projectionDetailUnavailableChildIds = new Set<ThreadId>();
       for (const row of rows) {
         if (row.parentThreadId === null) continue;
         const childThreadId = row.threadId as ThreadId;
@@ -3342,12 +3385,13 @@ const make = Effect.gen(function* () {
           continue;
         }
         if (detailRead._tag === "Unavailable") {
+          projectionDetailUnavailableChildIds.add(childThreadId);
           yield* Effect.logWarning(
             "child detail unavailable during reconciliation; preserving conservative lease",
             { childThreadId, cause: detailRead.cause },
           );
         } else {
-          const detail = detailRead.detail;
+          const detail = detailRead.value;
           restoredDetailByChild.set(childThreadId, detail);
           const projectedTerminal = projectedLifecycleTerminal(detail);
           if (projectedTerminal !== null) {
@@ -3365,8 +3409,7 @@ const make = Effect.gen(function* () {
             !restoredPromoted &&
             !pendingWakeChildIds.has(childThreadId) &&
             !waitDeliveredChildIds.has(childThreadId),
-          model:
-            detailRead._tag === "Found" ? detailRead.detail.modelSelection : row.modelSelection,
+          model: detailRead._tag === "Found" ? detailRead.value.modelSelection : row.modelSelection,
           spawnedAtMs: 0,
           depth: 1,
           terminal,
@@ -3394,7 +3437,20 @@ const make = Effect.gen(function* () {
         postUnarchiveTerminalByStartedChild,
         rearchivedUnarchivedTerminalStartedChildIds,
         activeArchiveByReplayedChild,
+        authoritativeDurableOrphanSettlementByChild,
       } = yield* reconcileFromLog(knownChildIds);
+      const durableOrphanSettlementChildIds = new Set<ThreadId>();
+      for (const [childThreadId, outcome] of authoritativeDurableOrphanSettlementByChild) {
+        if (!isDurableOrphanSettlement(outcome)) continue;
+        durableOrphanSettlementChildIds.add(childThreadId);
+        // Delayed events from the settled lifecycle are not replacement evidence.
+        // Preserve the durable outcome until an accepted start explicitly clears it.
+        terminalByChild.set(childThreadId, outcome);
+        // The durable settlement is authoritative even if the live parent was
+        // later unarchived. Only a replayed replacement child start supersedes
+        // it; changing live ancestry alone cannot make an old wake safe.
+        suppressParentWakeChildIds.add(childThreadId);
+      }
       for (const [childThreadId, turnId] of activeTurnByReplayedChild) {
         activeTurnByChild.set(childThreadId, turnId);
       }
@@ -3489,12 +3545,12 @@ const make = Effect.gen(function* () {
             orphanReasonByThread.set(threadId, reason);
             return reason;
           }
-          if (read.shell.archivedAt !== null) {
+          if (read.value.archivedAt !== null) {
             const reason = ORPHAN_ARCHIVED_PARENT_REASON;
             orphanReasonByThread.set(threadId, reason);
             return reason;
           }
-          const ancestorThreadId = read.shell.parentThreadId;
+          const ancestorThreadId = read.value.parentThreadId;
           if (ancestorThreadId === null) {
             orphanReasonByThread.set(threadId, null);
             return null;
@@ -3539,12 +3595,15 @@ const make = Effect.gen(function* () {
         ThreadId,
         { readonly text: string | null; readonly textUnavailable: boolean }
       >();
+      const terminalTextReadUnavailableChildIds = new Set<ThreadId>();
       for (const childThreadId of replayedUnarchivedTerminalStartedChildIds) {
         if (!terminalByChild.has(childThreadId)) continue;
-        const detail = yield* getThreadDetailBounded(childThreadId);
-        if (Option.isSome(detail)) {
-          const text = finalAssistantTextFromThread(detail.value);
-          const latestTurn = detail.value.latestTurn;
+        const detailRead = yield* getThreadDetailForBoot(childThreadId);
+        if (detailRead._tag === "Unavailable") {
+          terminalTextReadUnavailableChildIds.add(childThreadId);
+        } else if (detailRead._tag === "Found") {
+          const text = finalAssistantTextFromThread(detailRead.value);
+          const latestTurn = detailRead.value.latestTurn;
           terminalTextByStartedChild.set(childThreadId, {
             text,
             textUnavailable:
@@ -3601,7 +3660,12 @@ const make = Effect.gen(function* () {
         const childThreadId = row.sourceChildId as ThreadId;
         // Orphan children never have a harvestable parent. Prune by the boot
         // classification, independent of historical result/error wording.
-        if (orphanReasonByBootChild.has(childThreadId)) return true;
+        if (
+          orphanReasonByBootChild.has(childThreadId) ||
+          durableOrphanSettlementChildIds.has(childThreadId)
+        ) {
+          return true;
+        }
         if (staleSessionProjectionChildIds.has(childThreadId)) return true;
         if (
           unarchivedArchiveChildIds.has(childThreadId) &&
@@ -3628,6 +3692,11 @@ const make = Effect.gen(function* () {
         }
         if (terminal.status !== "completed") return false;
         const projectedText = terminalTextByStartedChild.get(childThreadId);
+        if (terminalTextReadUnavailableChildIds.has(childThreadId)) {
+          // Preserving the durable wake is conservative: an unavailable detail
+          // read cannot prove that its text is stale or safe to replace.
+          return false;
+        }
         if (projectedText === undefined) return row.commandId === null;
         if (projectedText.textUnavailable && row.commandId !== null) return false;
         return row.text !== projectedText.text;
@@ -3751,13 +3820,22 @@ const make = Effect.gen(function* () {
         }
         yield* settleChild(childThreadId, outcome.status, outcome.error);
       }
-      for (const [childThreadId, outcome] of terminalByChild) {
-        if (!isDurableOrphanSettlement(outcome)) continue;
+      for (const childThreadId of durableOrphanSettlementChildIds) {
+        const outcome = terminalByChild.get(childThreadId);
+        if (outcome === undefined) continue;
         const projectedSession = restoredDetailByChild.get(childThreadId)?.session ?? null;
-        if (projectedSession === null || isTerminalSessionProjection(projectedSession)) continue;
+        const projectionSessionReadUnavailable =
+          projectionDetailUnavailableChildIds.has(childThreadId);
+        if (
+          !projectionSessionReadUnavailable &&
+          (projectedSession === null || isTerminalSessionProjection(projectedSession))
+        ) {
+          continue;
+        }
         // A durable orphan-settlement activity is written only after physical
         // cleanup is confirmed. Repair the secondary session projection if the
-        // process crashed between those two durable writes.
+        // process crashed between those two durable writes. When the detail read
+        // is unavailable, recording a redundant stop is the conservative direction.
         const repairSessionProjection = recordStoppedOrphanSession({
           threadId: childThreadId,
           projectedSession,
@@ -3870,6 +3948,8 @@ const make = Effect.gen(function* () {
             }
           }
           const projectedSession = restoredDetailByChild.get(childThreadId)?.session ?? null;
+          const projectionSessionReadUnavailable =
+            projectionDetailUnavailableChildIds.has(childThreadId);
           const runtimeSession =
             bootRuntimeSessionsSnapshot._tag === "Available"
               ? bootRuntimeSessionsSnapshot.sessions.find(
@@ -3892,6 +3972,7 @@ const make = Effect.gen(function* () {
           const retryPhysicalCleanup = confirmOrphanProviderCleanup({
             threadId: childThreadId,
             projectedSession,
+            projectionSessionReadUnavailable,
           }).pipe(
             Effect.catchCause((cause) => Effect.fail(Cause.pretty(cause))),
             Effect.retry(Schedule.spaced("2 seconds")),
@@ -3913,7 +3994,10 @@ const make = Effect.gen(function* () {
                   Effect.retry(Schedule.spaced("2 seconds")),
                 )
               : Effect.void;
+          // Recording a redundant stop is conservative when detail is unavailable:
+          // silence cannot prove the projection has no live session to clear.
           const requiresSessionRecording =
+            projectionSessionReadUnavailable ||
             bootRuntimeSessionsSnapshot._tag === "Unavailable" ||
             runtimeSession !== undefined ||
             (projectedSession !== null && !isTerminalSessionProjection(projectedSession));

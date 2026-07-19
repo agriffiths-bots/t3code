@@ -411,6 +411,8 @@ describe("ChildThreadCoordinator", () => {
     readonly seedAcceptedCommandIds?: ReadonlyArray<string>;
     /** Thread ids whose `getThreadShellById` read sleeps far longer than a slice. */
     readonly slowThreadShellIds?: ReadonlyArray<ThreadId>;
+    /** Thread ids whose `getThreadShellById` read defects. */
+    readonly defectThreadShellIds?: ReadonlyArray<ThreadId>;
     /** Thread ids whose next N `getThreadShellById` reads sleep far longer than a slice. */
     readonly slowThreadShellReadCounts?: ReadonlyArray<{
       readonly threadId: ThreadId;
@@ -444,6 +446,8 @@ describe("ChildThreadCoordinator", () => {
     readonly dropEventsBeforeStreamSubscription?: boolean;
     /** Provider aggregate snapshot behavior during coordinator boot. */
     readonly providerListSessionsMode?: "ok" | "defect" | "hang";
+    /** Projected sessions intentionally absent from the provider aggregate snapshot. */
+    readonly providerMissingRuntimeSessionIds?: ReadonlyArray<ThreadId>;
     /** Physical orphan stop behavior during coordinator boot. */
     readonly providerStopSessionMode?: "ok" | "defect" | "hang";
     /** Fail this many session-set recording attempts after physical provider stop. */
@@ -471,6 +475,7 @@ describe("ChildThreadCoordinator", () => {
       (input?.retiredParentIds ?? []).map((threadId) => String(threadId)),
     );
     const slowShellIds = new Set((input?.slowThreadShellIds ?? []).map((id) => String(id)));
+    const defectShellIds = new Set((input?.defectThreadShellIds ?? []).map((id) => String(id)));
     const slowShellReadCounts = new Map<string, number>();
     for (const slowReadCount of input?.slowThreadShellReadCounts ?? []) {
       slowShellReadCounts.set(String(slowReadCount.threadId), slowReadCount.count);
@@ -497,7 +502,10 @@ describe("ChildThreadCoordinator", () => {
         ({ shell }) =>
           shell.session !== null &&
           shell.session.status !== "stopped" &&
-          shell.session.status !== "error",
+          shell.session.status !== "error" &&
+          !(input?.providerMissingRuntimeSessionIds ?? []).some(
+            (threadId) => threadId === shell.id,
+          ),
       )
       .map(
         ({ shell }) =>
@@ -591,6 +599,9 @@ describe("ChildThreadCoordinator", () => {
     const readThreadShellByIdIncludingArchived: ProjectionSnapshotQuery["Service"]["getThreadShellByIdIncludingArchived"] =
       (threadId) =>
         Effect.gen(function* () {
+          if (defectShellIds.has(String(threadId))) {
+            return yield* Effect.die(new Error("simulated projection shell read defect"));
+          }
           const slowReadCount = slowShellReadCounts.get(String(threadId)) ?? 0;
           if (slowShellIds.has(String(threadId)) || slowReadCount > 0) {
             if (slowReadCount > 0) {
@@ -2581,6 +2592,34 @@ describe("ChildThreadCoordinator", () => {
     expect(slice.results).toHaveLength(1);
     expect(slice.results[0]!.status).toBe("failed");
     expect(slice.results[0]!.error).toContain("never registered");
+  });
+
+  it("keeps an untracked child pending when its projection shell read defects", async () => {
+    const child = ThreadId.make("untracked-child-defected-projection-read");
+    const parent = ThreadId.make("untracked-child-defected-projection-parent");
+    const harness = await createHarness({
+      threads: [
+        makeThreadState({
+          threadId: child,
+          parentThreadId: parent,
+          latestTurn: makeLatestTurn("running"),
+        }),
+      ],
+      defectThreadShellIds: [child],
+    });
+
+    const slice = await runtimeWaitSlice(harness, [child], FAR_FUTURE_MS);
+
+    expect(slice.results).toEqual([
+      {
+        childThreadId: child,
+        status: "pending",
+        finalAssistantText: null,
+        error: null,
+      },
+    ]);
+    expect(slice.pending).toBe(true);
+    expect(slice.settledCount).toBe(0);
   });
 
   it("never dispatches a resume to a turnCount-0 (fresh) detached parent (bug #2336)", async () => {
@@ -5747,7 +5786,7 @@ describe("ChildThreadCoordinator", () => {
     expect(pendingRows[0]!.text).toBe(null);
   });
 
-  it("replaces unclaimed terminal wakes when replay text detail is unavailable", async () => {
+  it("preserves unclaimed terminal wakes when replay text detail is unavailable", async () => {
     const child = ThreadId.make("recon-unarchive-terminal-unclaimed-detail-lag-child");
     const parent = ThreadId.make("recon-unarchive-terminal-unclaimed-detail-lag-parent");
     const parentTurn = TurnId.make("parent-turn");
@@ -5797,8 +5836,8 @@ describe("ChildThreadCoordinator", () => {
 
     const pendingRows = await harness.listPendingDispatches();
     expect(pendingRows).toHaveLength(1);
-    expect(pendingRows[0]!.id).not.toBe(staleWakeId);
-    expect(pendingRows[0]!.text).toBe("unclaimed replacement result");
+    expect(pendingRows[0]!.id).toBe(staleWakeId);
+    expect(pendingRows[0]!.text).toBe("old unclaimed result");
   });
 
   it("reopens projection-only unarchived terminal children on replacement turn start", async () => {
@@ -6564,6 +6603,170 @@ describe("ChildThreadCoordinator", () => {
     expect(await harness.listDispatchLeaseChildIds()).toEqual([]);
   });
 
+  it("suppresses durable orphan wakes after the parent was unarchived before restart", async () => {
+    const parent = ThreadId.make("boot-replay-orphan-unarchived-parent");
+    const childWithoutWake = ThreadId.make("boot-replay-orphan-unarchived-child");
+    const childWithStaleWake = ThreadId.make("boot-replay-orphan-stale-wake-child");
+    const orphanReason = "orphaned by archived parent";
+    const staleWakeId = PendingDispatchId.make("pd-replayed-orphan-stale-wake");
+    const childState = (threadId: ThreadId) =>
+      makeThreadState({
+        threadId,
+        parentThreadId: parent,
+        latestTurn: makeLatestTurn("running"),
+        session: makeSession(threadId, "stopped", null, orphanReason),
+      });
+    const harness = await createHarness({
+      threads: [
+        makeThreadState({
+          threadId: parent,
+          latestTurn: makeLatestTurn("completed"),
+          session: makeSession(parent, "ready"),
+        }),
+        childState(childWithoutWake),
+        childState(childWithStaleWake),
+      ],
+      seedChildRows: [
+        { threadId: childWithoutWake, parentThreadId: parent },
+        { threadId: childWithStaleWake, parentThreadId: parent },
+      ],
+      seedPendingDispatches: [
+        {
+          id: staleWakeId,
+          kind: "parent_injection",
+          targetThreadId: parent,
+          sourceChildId: childWithStaleWake,
+          text: null,
+          error: orphanReason,
+          status: "killed",
+          commandId: null,
+          deliveredByWait: false,
+          waitCancellable: false,
+          createdAt: now as unknown as PendingDispatch["createdAt"],
+        },
+      ],
+      persistedEvents: [
+        orphanSettledEvent(childWithoutWake, orphanReason),
+        orphanSettledEvent(childWithStaleWake, orphanReason),
+      ],
+    });
+
+    expect(
+      harness.dispatched.filter(
+        (command) => command.type === "thread.turn.start" && command.threadId === parent,
+      ),
+    ).toEqual([]);
+    expect(await harness.listPendingDispatches()).toEqual([]);
+    const slice = await runtimeWaitSlice(
+      harness,
+      [childWithoutWake, childWithStaleWake],
+      FAR_FUTURE_MS,
+    );
+    expect(slice.results.map(({ status, error }) => ({ status, error }))).toEqual([
+      { status: "killed", error: orphanReason },
+      { status: "killed", error: orphanReason },
+    ]);
+  });
+
+  it("does not apply a superseded durable orphan settlement to a replacement child turn", async () => {
+    const parent = ThreadId.make("boot-replay-orphan-restarted-parent");
+    const child = ThreadId.make("boot-replay-orphan-restarted-child");
+    const replacementTurn = TurnId.make("boot-replay-orphan-replacement-turn");
+    const replacementWakeId = PendingDispatchId.make("pd-replayed-orphan-replacement-wake");
+    const orphanReason = "orphaned by archived parent";
+    const harness = await createHarness({
+      threads: [
+        makeThreadState({ threadId: parent, session: makeSession(parent, "ready") }),
+        makeThreadState({
+          threadId: child,
+          parentThreadId: parent,
+          latestTurn: makeLatestTurn("completed", replacementTurn),
+          session: makeSession(child, "ready"),
+          assistantText: "replacement child result",
+        }),
+      ],
+      seedChildRows: [{ threadId: child, parentThreadId: parent }],
+      seedPendingDispatches: [
+        {
+          id: replacementWakeId,
+          kind: "parent_injection",
+          targetThreadId: parent,
+          sourceChildId: child,
+          text: "replacement child result",
+          error: null,
+          status: "completed",
+          commandId: null,
+          deliveredByWait: false,
+          waitCancellable: false,
+          createdAt: now as unknown as PendingDispatch["createdAt"],
+        },
+      ],
+      persistedEvents: [
+        orphanSettledEvent(child, orphanReason),
+        threadUnarchivedEvent(child),
+        turnStartRequestedEvent(child),
+        sessionSetEvent(child, "running", replacementTurn),
+        turnDiffEvent(child, "ready", replacementTurn),
+      ],
+    });
+
+    expect((await harness.listPendingDispatches()).map((row) => row.id)).toEqual([
+      replacementWakeId,
+    ]);
+    expect((await runtimeWaitSlice(harness, [child], FAR_FUTURE_MS)).results[0]).toMatchObject({
+      status: "completed",
+      finalAssistantText: "replacement child result",
+      error: null,
+    });
+  });
+
+  it("keeps a durable orphan settlement authoritative over delayed pre-restart events", async () => {
+    const parent = ThreadId.make("boot-replay-orphan-delayed-event-parent");
+    const child = ThreadId.make("boot-replay-orphan-delayed-event-child");
+    const oldTurn = TurnId.make("boot-replay-orphan-delayed-event-turn");
+    const staleWakeId = PendingDispatchId.make("pd-replayed-orphan-delayed-event-wake");
+    const orphanReason = "orphaned by archived parent";
+    const harness = await createHarness({
+      threads: [
+        makeThreadState({ threadId: parent, session: makeSession(parent, "ready") }),
+        makeThreadState({
+          threadId: child,
+          parentThreadId: parent,
+          latestTurn: makeLatestTurn("completed", oldTurn),
+          session: makeSession(child, "stopped", null, orphanReason),
+          assistantText: "late completion from settled lifecycle",
+        }),
+      ],
+      seedChildRows: [{ threadId: child, parentThreadId: parent }],
+      seedPendingDispatches: [
+        {
+          id: staleWakeId,
+          kind: "parent_injection",
+          targetThreadId: parent,
+          sourceChildId: child,
+          text: null,
+          error: orphanReason,
+          status: "killed",
+          commandId: null,
+          deliveredByWait: false,
+          waitCancellable: false,
+          createdAt: now as unknown as PendingDispatch["createdAt"],
+        },
+      ],
+      persistedEvents: [
+        orphanSettledEvent(child, orphanReason),
+        threadUnarchivedEvent(child),
+        turnDiffEvent(child, "ready", oldTurn),
+      ],
+    });
+
+    expect(await harness.listPendingDispatches()).toEqual([]);
+    expect((await runtimeWaitSlice(harness, [child], FAR_FUTURE_MS)).results[0]).toMatchObject({
+      status: "killed",
+      error: orphanReason,
+    });
+  });
+
   it("repairs a non-terminal session projection after replaying durable orphan settlement", async () => {
     const parent = ThreadId.make("boot-replay-orphan-repair-parent");
     const child = ThreadId.make("boot-replay-orphan-repair-child");
@@ -6596,6 +6799,43 @@ describe("ChildThreadCoordinator", () => {
     expect(harness.providerListSessionsCallCount()).toBe(0);
     expect(harness.providerStopSessionCallCount()).toBe(0);
     expect(await harness.listDispatchLeaseChildIds()).toEqual([]);
+  });
+
+  it("records the conservative durable-orphan session repair when detail is unavailable", async () => {
+    const parent = ThreadId.make("boot-replay-orphan-unavailable-detail-parent");
+    const child = ThreadId.make("boot-replay-orphan-unavailable-detail-child");
+    const childTurn = TurnId.make("boot-replay-orphan-unavailable-detail-turn");
+    const orphanReason = "orphaned by archived parent";
+    const harness = await createHarness({
+      threads: [
+        makeThreadState({ threadId: parent }),
+        makeThreadState({
+          threadId: child,
+          parentThreadId: parent,
+          latestTurn: makeLatestTurn("running", childTurn),
+          session: makeSession(child, "running", childTurn),
+        }),
+      ],
+      seedChildRows: [{ threadId: child, parentThreadId: parent }],
+      persistedEvents: [orphanSettledEvent(child, orphanReason)],
+      slowThreadDetailReadNumbers: [{ threadId: child, readNumbers: [1] }],
+    });
+
+    expect(
+      harness.dispatched.some(
+        (command) =>
+          command.type === "thread.session.set" &&
+          command.threadId === child &&
+          command.session.status === "stopped" &&
+          command.session.lastError === orphanReason,
+      ),
+    ).toBe(true);
+    expect(harness.providerListSessionsCallCount()).toBe(0);
+    expect(harness.providerStopSessionCallCount()).toBe(0);
+    expect((await runtimeWaitSlice(harness, [child], FAR_FUTURE_MS)).results[0]).toMatchObject({
+      status: "killed",
+      error: orphanReason,
+    });
   });
 
   it("does not query provider aggregates when boot has no orphan cleanup candidates", async () => {
@@ -6650,6 +6890,42 @@ describe("ChildThreadCoordinator", () => {
         }),
       ]),
     );
+  });
+
+  it("records an orphan session stop when detail is unavailable and runtime is already gone", async () => {
+    const parent = ThreadId.make("boot-orphan-unavailable-detail-parent");
+    const child = ThreadId.make("boot-orphan-unavailable-detail-child");
+    const childTurn = TurnId.make("boot-orphan-unavailable-detail-turn");
+    const orphanReason = "orphaned by archived parent";
+    const harness = await createHarness({
+      threads: [
+        makeThreadState({ threadId: parent, archivedAt: now }),
+        makeThreadState({
+          threadId: child,
+          parentThreadId: parent,
+          latestTurn: makeLatestTurn("running", childTurn),
+          session: makeSession(child, "running", childTurn),
+        }),
+      ],
+      seedChildRows: [{ threadId: child, parentThreadId: parent }],
+      persistedEvents: [],
+      slowThreadDetailReadNumbers: [{ threadId: child, readNumbers: [1] }],
+      providerMissingRuntimeSessionIds: [child],
+    });
+
+    expect(harness.providerListSessionsCallCount()).toBe(1);
+    expect(harness.providerStopSessionCallCount()).toBe(0);
+    expect(
+      harness.dispatched.some(
+        (command) =>
+          command.type === "thread.session.set" &&
+          command.threadId === child &&
+          command.session.status === "stopped" &&
+          command.session.lastError === orphanReason,
+      ),
+    ).toBe(true);
+    const slice = await runtimeWaitSlice(harness, [child], FAR_FUTURE_MS);
+    expect(slice.results[0]).toMatchObject({ status: "killed", error: orphanReason });
   });
 
   it.each(["defect", "hang"] as const)(
@@ -7595,9 +7871,10 @@ describe("ChildThreadCoordinator", () => {
     expect(await harness.listPendingDispatches()).toHaveLength(0);
   });
 
-  it("R-A: wait delivery bounds the parent snapshot read", async () => {
+  it("R-A: unavailable parent snapshots retain wait fallbacks as non-delivered", async () => {
     const child = ThreadId.make("promote-wait-delivery-bounded-parent-child");
     const parent = ThreadId.make("promote-wait-delivery-bounded-parent");
+    const parentTurn = TurnId.make("turn-parent");
     const harness = await createHarness({
       slowThreadShellIds: [parent],
       threads: [
@@ -7609,8 +7886,8 @@ describe("ChildThreadCoordinator", () => {
         }),
         makeThreadState({
           threadId: parent,
-          latestTurn: makeLatestTurn("running", TurnId.make("turn-parent")),
-          session: makeSession(parent, "running", TurnId.make("turn-parent")),
+          latestTurn: makeLatestTurn("running", parentTurn),
+          session: makeSession(parent, "running", parentTurn),
         }),
       ],
     });
@@ -7631,6 +7908,7 @@ describe("ChildThreadCoordinator", () => {
             status: "completed",
             finalAssistantText: "bounded parent snapshot",
             error: null,
+            parentTurnIdAtWait: parentTurn,
           },
         ])
         .pipe(Effect.as(true), Effect.timeoutOption("2 seconds")),
@@ -7642,12 +7920,69 @@ describe("ChildThreadCoordinator", () => {
     expect(pendingRows[0]).toMatchObject({
       sourceChildId: child,
       targetThreadId: parent,
-      deliveredByWait: true,
+      deliveredByWait: false,
       waitCancellable: true,
     });
-    expect(await harness.listWaitDeliveries()).toEqual([
-      { childThreadId: String(child), parentThreadId: String(parent) },
-    ]);
+    expect(await harness.listWaitDeliveries()).toEqual([]);
+  });
+
+  it("R-A: an unavailable wait-time parent read cannot be credited by a later snapshot", async () => {
+    const child = ThreadId.make("promote-wait-initial-parent-read-child");
+    const parent = ThreadId.make("promote-wait-initial-parent-read-parent");
+    const childTurn = TurnId.make("turn-child");
+    const parentTurn = TurnId.make("turn-parent");
+    const harness = await createHarness({
+      slowThreadShellReadCounts: [{ threadId: parent, count: 1 }],
+      threads: [
+        makeThreadState({
+          threadId: child,
+          parentThreadId: parent,
+          latestTurn: makeLatestTurn("running", childTurn),
+          session: makeSession(child, "running", childTurn),
+        }),
+        makeThreadState({
+          threadId: parent,
+          latestTurn: makeLatestTurn("running", parentTurn),
+          session: makeSession(parent, "running", parentTurn),
+        }),
+      ],
+    });
+    await harness.register({
+      parentThreadId: parent,
+      childThreadId: child,
+      detached: false,
+      model: codexModel,
+      spawnedAtMs: 0,
+    });
+    await Effect.runPromise(harness.coordinator.promoteToWake([child]));
+
+    const waitPromise = runtimeWaitSlice(harness, [child], FAR_FUTURE_MS);
+    await Effect.runPromise(Effect.sleep("1100 millis"));
+    harness.setThread(
+      makeThreadState({
+        threadId: child,
+        parentThreadId: parent,
+        latestTurn: makeLatestTurn("completed", childTurn),
+        session: makeSession(child, "ready"),
+        assistantText: "not safely attributable",
+      }),
+    );
+    await harness.feed(turnDiffEvent(child, "ready", childTurn));
+    const result = (await waitPromise).results[0]!;
+    expect(result.status).toBe("completed");
+    expect(result.parentTurnIdAtWait).toBeUndefined();
+
+    await Effect.runPromise(harness.coordinator.markWaitDelivered([result]));
+
+    const pendingRows = await harness.listPendingDispatches();
+    expect(pendingRows).toHaveLength(1);
+    expect(pendingRows[0]).toMatchObject({
+      sourceChildId: child,
+      targetThreadId: parent,
+      deliveredByWait: false,
+      waitCancellable: true,
+    });
+    expect(await harness.listWaitDeliveries()).toEqual([]);
   });
 
   it("R-A: interrupted wait delivery leaves a new fallback non-delivered", async () => {
