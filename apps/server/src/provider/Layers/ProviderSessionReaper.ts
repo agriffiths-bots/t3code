@@ -29,7 +29,7 @@ import {
 } from "../Services/ProviderSessionReaper.ts";
 import { ProviderService } from "../Services/ProviderService.ts";
 
-import { trustedSystemDispatchAuthority } from "../../orchestration/commandAudienceGuard.ts";
+import { threadAudienceSystemDispatchAuthority } from "../../orchestration/commandAudienceGuard.ts";
 const DEFAULT_INACTIVITY_THRESHOLD_MS = 30 * 60 * 1000;
 const DEFAULT_SWEEP_INTERVAL_MS = 5 * 60 * 1000;
 const DEFAULT_PERMISSION_REQUEST_TIMEOUT_MS = 4 * 60 * 60 * 1000;
@@ -254,7 +254,7 @@ const makeProviderSessionReaper = (options?: ProviderSessionReaperLiveOptions) =
               },
               createdAt: input.failedAt,
             },
-            trustedSystemDispatchAuthority("ProviderSessionReaper"),
+            threadAudienceSystemDispatchAuthority(input.thread, "ProviderSessionReaper"),
           );
 
           yield* Effect.forEach(
@@ -279,7 +279,7 @@ const makeProviderSessionReaper = (options?: ProviderSessionReaperLiveOptions) =
                   },
                   createdAt: input.failedAt,
                 },
-                trustedSystemDispatchAuthority("ProviderSessionReaper"),
+                threadAudienceSystemDispatchAuthority(input.thread, "ProviderSessionReaper"),
               ),
             { concurrency: 1 },
           ).pipe(Effect.asVoid);
@@ -303,7 +303,7 @@ const makeProviderSessionReaper = (options?: ProviderSessionReaperLiveOptions) =
               },
               createdAt: input.failedAt,
             },
-            trustedSystemDispatchAuthority("ProviderSessionReaper"),
+            threadAudienceSystemDispatchAuthority(input.thread, "ProviderSessionReaper"),
           );
           yield* persistReleasedBinding({
             binding: input.binding,
@@ -494,7 +494,7 @@ const makeProviderSessionReaper = (options?: ProviderSessionReaperLiveOptions) =
           terminalFailedSession !== null && thread?.latestTurn?.state === "error"
             ? thread.latestTurn
             : null;
-        if (terminalFailedSession !== null && terminalFailedTurn !== null) {
+        if (terminalFailedSession !== null && terminalFailedTurn !== null && thread !== undefined) {
           const releasedAt = DateTime.formatIso(yield* DateTime.now);
           const reason = terminalFailedSession.lastError ?? "Provider turn failed";
           const runtimePayload: Record<string, unknown> =
@@ -538,7 +538,7 @@ const makeProviderSessionReaper = (options?: ProviderSessionReaperLiveOptions) =
                   },
                   createdAt: releasedAt,
                 },
-                trustedSystemDispatchAuthority("ProviderSessionReaper"),
+                threadAudienceSystemDispatchAuthority(thread, "ProviderSessionReaper"),
               );
               yield* persistReleasedBinding({
                 binding,

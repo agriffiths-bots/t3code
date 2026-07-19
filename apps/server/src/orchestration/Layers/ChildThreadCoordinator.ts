@@ -63,7 +63,7 @@ import {
   type WaitSliceResult,
 } from "../Services/ChildThreadCoordinator.ts";
 
-import { trustedSystemDispatchAuthority } from "../commandAudienceGuard.ts";
+import { threadAudienceSystemDispatchAuthority } from "../commandAudienceGuard.ts";
 interface ChildRecord {
   readonly parentThreadId: ThreadId;
   readonly detached: boolean;
@@ -1127,7 +1127,7 @@ const make = Effect.gen(function* () {
           interactionMode: shell.interactionMode,
           createdAt,
         },
-        trustedSystemDispatchAuthority("ChildThreadCoordinator"),
+        threadAudienceSystemDispatchAuthority(shell, "ChildThreadCoordinator"),
       );
     });
 
@@ -1151,11 +1151,14 @@ const make = Effect.gen(function* () {
           interactionMode: shell.interactionMode,
           createdAt,
         },
-        trustedSystemDispatchAuthority("ChildThreadCoordinator"),
+        threadAudienceSystemDispatchAuthority(shell, "ChildThreadCoordinator"),
       );
     });
 
-  const appendSubagentActivity = (parentThreadId: ThreadId, result: ChildWaitResult) =>
+  const appendSubagentActivity = (
+    parentThread: OrchestrationThreadShell,
+    result: ChildWaitResult,
+  ) =>
     Effect.gen(function* () {
       const commandId = yield* newCommandId("subagent-activity");
       const activityId = EventId.make(yield* randomUUID);
@@ -1164,7 +1167,7 @@ const make = Effect.gen(function* () {
         {
           type: "thread.activity.append",
           commandId,
-          threadId: parentThreadId,
+          threadId: parentThread.id,
           activity: {
             id: activityId,
             tone: result.status === "completed" ? "info" : "error",
@@ -1180,7 +1183,7 @@ const make = Effect.gen(function* () {
           },
           createdAt,
         },
-        trustedSystemDispatchAuthority("ChildThreadCoordinator"),
+        threadAudienceSystemDispatchAuthority(parentThread, "ChildThreadCoordinator"),
       );
     });
 
@@ -1285,9 +1288,7 @@ const make = Effect.gen(function* () {
             );
             return;
           }
-          yield* appendSubagentActivity(parentThreadId, result).pipe(
-            Effect.ignoreCause({ log: true }),
-          );
+          yield* appendSubagentActivity(shell, result).pipe(Effect.ignoreCause({ log: true }));
           enqueuePending(parentThreadId, entry);
         }),
       );

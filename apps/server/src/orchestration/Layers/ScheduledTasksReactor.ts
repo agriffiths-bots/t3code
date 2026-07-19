@@ -36,7 +36,7 @@ import {
   type ScheduledTasksReactorShape,
 } from "../Services/ScheduledTasksReactor.ts";
 
-import { trustedSystemDispatchAuthority } from "../commandAudienceGuard.ts";
+import { threadAudienceSystemDispatchAuthority } from "../commandAudienceGuard.ts";
 /** A failed dispatch increments retry_count; the task is disabled past this. */
 const MAX_RETRIES = 5;
 
@@ -152,7 +152,7 @@ const makeScheduledTasksReactor = Effect.gen(function* () {
           bootstrap: undefined,
           createdAt,
         },
-        trustedSystemDispatchAuthority("ScheduledTasksReactor"),
+        threadAudienceSystemDispatchAuthority(shell, "ScheduledTasksReactor"),
       );
     }).pipe(Effect.timeout(Duration.seconds(DISPATCH_TIMEOUT_SECONDS)));
 

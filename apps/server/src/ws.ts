@@ -69,7 +69,7 @@ import * as Keybindings from "./keybindings.ts";
 import * as ExternalLauncher from "./process/externalLauncher.ts";
 import {
   cleanupPersistedCommandAttachments,
-  normalizeDispatchCommand,
+  normalizeAuthorizedDispatchCommand,
 } from "./orchestration/Normalizer.ts";
 import { sessionDispatchAuthority } from "./orchestration/commandAudienceGuard.ts";
 import * as OrchestrationEngine from "./orchestration/Services/OrchestrationEngine.ts";
@@ -752,16 +752,14 @@ const makeWsRpcLayer = (currentSession: EnvironmentAuth.AuthenticatedSession) =>
           observeRpcEffect(
             ORCHESTRATION_WS_METHODS.dispatchCommand,
             Effect.gen(function* () {
-              const normalizedCommand = yield* normalizeDispatchCommand(command);
+              const normalizedCommand = yield* normalizeAuthorizedDispatchCommand(
+                command,
+                sessionDispatchAuthority(currentSession),
+              );
               return yield* dispatchNormalizedCommand(normalizedCommand);
             }).pipe(
               Effect.mapError((cause) =>
-                isOrchestrationDispatchCommandError(cause)
-                  ? cause
-                  : new OrchestrationDispatchCommandError({
-                      message: "Failed to dispatch orchestration command",
-                      cause,
-                    }),
+                toDispatchCommandError(cause, "Failed to dispatch orchestration command"),
               ),
             ),
             { "rpc.aggregate": "orchestration" },

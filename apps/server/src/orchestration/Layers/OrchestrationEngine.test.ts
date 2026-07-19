@@ -2,7 +2,9 @@ import {
   CheckpointRef,
   CommandId,
   DEFAULT_PROVIDER_INTERACTION_MODE,
+  IsoDateTime,
   MessageId,
+  NonNegativeInt,
   ProjectId,
   ThreadId,
   TurnId,
@@ -21,6 +23,7 @@ import { describe, expect, it } from "vite-plus/test";
 
 import { PersistenceSqlError } from "../../persistence/Errors.ts";
 import { OrchestrationCommandReceiptRepositoryLive } from "../../persistence/Layers/OrchestrationCommandReceipts.ts";
+import { OrchestrationCommandReceiptRepository } from "../../persistence/Services/OrchestrationCommandReceipts.ts";
 import { OrchestrationEventStoreLive } from "../../persistence/Layers/OrchestrationEventStore.ts";
 import { SqlitePersistenceMemory } from "../../persistence/Layers/Sqlite.ts";
 import {
@@ -68,7 +71,7 @@ async function createOrchestrationSystem() {
     OrchestrationProjectionSnapshotQueryLive,
   ).pipe(
     Layer.provide(OrchestrationEventStoreLive),
-    Layer.provide(OrchestrationCommandReceiptRepositoryLive),
+    Layer.provideMerge(OrchestrationCommandReceiptRepositoryLive),
     Layer.provide(RepositoryIdentityResolver.layer),
     Layer.provide(SqlitePersistenceMemory),
     Layer.provideMerge(ServerConfigLayer),
@@ -76,10 +79,14 @@ async function createOrchestrationSystem() {
   );
   const runtime = ManagedRuntime.make(orchestrationLayer);
   const engine = await runtime.runPromise(Effect.service(OrchestrationEngineService));
+  const commandReceiptRepository = await runtime.runPromise(
+    Effect.service(OrchestrationCommandReceiptRepository),
+  );
   const snapshotQuery = await runtime.runPromise(Effect.service(ProjectionSnapshotQuery));
   const worktreeLifecycle = await runtime.runPromise(Effect.service(WorktreeLifecycleCoordinator));
   return {
     engine,
+    commandReceiptRepository,
     snapshotQuery,
     worktreeLifecycle,
     readModel: () => readDetailedReadModel(snapshotQuery),
@@ -405,6 +412,109 @@ describe("OrchestrationEngine", () => {
       "thread.message-sent",
       "thread.turn-start-requested",
     ]);
+    await system.dispose();
+  });
+
+  it("replays an authorized receipt before current bootstrap-state authorization", async () => {
+    const createdAt = now();
+    const system = await createOrchestrationSystem();
+    const { engine } = system;
+    const projectId = asProjectId("project-bootstrap-receipt-replay");
+    const threadId = ThreadId.make("thread-bootstrap-receipt-replay");
+    const commandId = CommandId.make("cmd-bootstrap-receipt-replay");
+    const modelSelection = {
+      instanceId: ProviderInstanceId.make("codex"),
+      model: "gpt-5-codex",
+    } as const;
+
+    await system.run(
+      engine.dispatch(
+        {
+          type: "project.create",
+          commandId: CommandId.make("cmd-bootstrap-receipt-project-create"),
+          projectId,
+          title: "Bootstrap receipt project",
+          workspaceRoot: "/tmp/project-bootstrap-receipt-replay",
+          defaultModelSelection: modelSelection,
+          createdAt,
+        },
+        factoryDispatchAuthority,
+      ),
+    );
+    await system.run(
+      engine.dispatch(
+        {
+          type: "thread.create",
+          commandId: CommandId.make("cmd-bootstrap-receipt-thread-create"),
+          threadId,
+          projectId,
+          title: "Bootstrap receipt thread",
+          modelSelection,
+          interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+          runtimeMode: "approval-required",
+          branch: null,
+          worktreePath: null,
+          createdAt,
+        },
+        factoryDispatchAuthority,
+      ),
+    );
+    await system.run(
+      engine.dispatch(
+        {
+          type: "thread.archive",
+          commandId: CommandId.make("cmd-bootstrap-receipt-thread-archive"),
+          threadId,
+        },
+        factoryDispatchAuthority,
+      ),
+    );
+    await system.run(
+      system.commandReceiptRepository.upsert({
+        commandId,
+        aggregateKind: "thread",
+        aggregateId: threadId,
+        acceptedAt: IsoDateTime.make(createdAt),
+        resultSequence: NonNegativeInt.make(777),
+        status: "accepted",
+        error: null,
+      }),
+    );
+
+    const result = await system.run(
+      engine.dispatch(
+        {
+          type: "thread.turn.start",
+          commandId,
+          threadId,
+          message: {
+            messageId: asMessageId("msg-bootstrap-receipt-replay"),
+            role: "user",
+            text: "replay the accepted command",
+            attachments: [],
+          },
+          interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+          runtimeMode: "approval-required",
+          bootstrap: {
+            createThread: {
+              projectId,
+              title: "Bootstrap receipt thread",
+              modelSelection,
+              interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+              runtimeMode: "approval-required",
+              branch: null,
+              worktreePath: null,
+              createdAt,
+            },
+            runSetupScript: true,
+          },
+          createdAt,
+        },
+        factoryDispatchAuthority,
+      ),
+    );
+
+    expect(result).toEqual({ sequence: 777 });
     await system.dispose();
   });
 

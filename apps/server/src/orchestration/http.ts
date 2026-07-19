@@ -12,7 +12,10 @@ import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 import * as HttpApiBuilder from "effect/unstable/httpapi/HttpApiBuilder";
 
-import { cleanupPersistedCommandAttachments, normalizeDispatchCommand } from "./Normalizer.ts";
+import {
+  cleanupPersistedCommandAttachments,
+  normalizeAuthorizedDispatchCommand,
+} from "./Normalizer.ts";
 import { sessionDispatchAuthority } from "./commandAudienceGuard.ts";
 import {
   annotateEnvironmentRequest,
@@ -135,28 +138,29 @@ export const orchestrationHttpApiLayer = HttpApiBuilder.group(
         Effect.fn("environment.orchestration.dispatch")(function* (args) {
           yield* annotateEnvironmentRequest(args.endpoint.name);
           const session = yield* requireEnvironmentScope(AuthOrchestrationOperateScope);
-          const normalizedCommandExit = yield* Effect.exit(normalizeDispatchCommand(args.payload));
+          const authority = sessionDispatchAuthority(session);
+          const normalizedCommandExit = yield* Effect.exit(
+            normalizeAuthorizedDispatchCommand(args.payload, authority),
+          );
           if (Exit.isFailure(normalizedCommandExit)) {
             const cause = Cause.squash(normalizedCommandExit.cause);
-            if (isOrchestrationDispatchCommandError(cause)) {
+            if (isOrchestrationDispatchCommandError(cause) || isClientCommandDispatchError(cause)) {
               return yield* failEnvironmentInvalidRequest("invalid_command");
             }
             return yield* failEnvironmentInternal("orchestration_dispatch_failed", cause);
           }
           const normalizedCommand = normalizedCommandExit.value;
-          return yield* orchestrationEngine
-            .dispatch(normalizedCommand, sessionDispatchAuthority(session))
-            .pipe(
-              Effect.catch((cause) =>
-                Effect.gen(function* () {
-                  yield* cleanupPersistedCommandAttachments(normalizedCommand);
-                  if (isClientCommandDispatchError(cause)) {
-                    return yield* failEnvironmentInvalidRequest("invalid_command");
-                  }
-                  return yield* failEnvironmentInternal("orchestration_dispatch_failed", cause);
-                }),
-              ),
-            );
+          return yield* orchestrationEngine.dispatch(normalizedCommand, authority).pipe(
+            Effect.catch((cause) =>
+              Effect.gen(function* () {
+                yield* cleanupPersistedCommandAttachments(normalizedCommand);
+                if (isClientCommandDispatchError(cause)) {
+                  return yield* failEnvironmentInvalidRequest("invalid_command");
+                }
+                return yield* failEnvironmentInternal("orchestration_dispatch_failed", cause);
+              }),
+            ),
+          );
         }),
       )
       .handle(

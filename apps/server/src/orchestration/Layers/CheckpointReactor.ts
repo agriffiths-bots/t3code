@@ -7,6 +7,7 @@ import {
   ThreadId,
   TurnId,
   type OrchestrationEvent,
+  type OrchestrationThread,
   type ProviderRuntimeEvent,
 } from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
@@ -36,7 +37,7 @@ import { isGitRepository } from "../../git/Utils.ts";
 import { VcsStatusBroadcaster } from "../../vcs/VcsStatusBroadcaster.ts";
 import * as WorkspaceEntries from "../../workspace/WorkspaceEntries.ts";
 
-import { trustedSystemDispatchAuthority } from "../commandAudienceGuard.ts";
+import { threadAudienceSystemDispatchAuthority } from "../commandAudienceGuard.ts";
 const nowIso = Effect.map(DateTime.now, DateTime.formatIso);
 
 type ReactorInput =
@@ -98,26 +99,34 @@ const make = Effect.gen(function* () {
       activityId: serverEventId,
     }).pipe(
       Effect.flatMap(({ commandId, activityId }) =>
-        orchestrationEngine.dispatch(
-          {
-            type: "thread.activity.append",
-            commandId,
-            threadId: input.threadId,
-            activity: {
-              id: activityId,
-              tone: "error",
-              kind: "checkpoint.revert.failed",
-              summary: "Checkpoint revert failed",
-              payload: {
-                turnCount: input.turnCount,
-                detail: input.detail,
-              },
-              turnId: null,
-              createdAt: input.createdAt,
-            },
-            createdAt: input.createdAt,
-          },
-          trustedSystemDispatchAuthority("CheckpointReactor"),
+        projectionSnapshotQuery.getThreadDetailById(input.threadId).pipe(
+          Effect.flatMap(
+            Option.match({
+              onNone: () => Effect.void,
+              onSome: (thread) =>
+                orchestrationEngine.dispatch(
+                  {
+                    type: "thread.activity.append",
+                    commandId,
+                    threadId: input.threadId,
+                    activity: {
+                      id: activityId,
+                      tone: "error",
+                      kind: "checkpoint.revert.failed",
+                      summary: "Checkpoint revert failed",
+                      payload: {
+                        turnCount: input.turnCount,
+                        detail: input.detail,
+                      },
+                      turnId: null,
+                      createdAt: input.createdAt,
+                    },
+                    createdAt: input.createdAt,
+                  },
+                  threadAudienceSystemDispatchAuthority(thread, "CheckpointReactor"),
+                ),
+            }),
+          ),
         ),
       ),
     );
@@ -133,25 +142,33 @@ const make = Effect.gen(function* () {
       activityId: serverEventId,
     }).pipe(
       Effect.flatMap(({ commandId, activityId }) =>
-        orchestrationEngine.dispatch(
-          {
-            type: "thread.activity.append",
-            commandId,
-            threadId: input.threadId,
-            activity: {
-              id: activityId,
-              tone: "error",
-              kind: "checkpoint.capture.failed",
-              summary: "Checkpoint capture failed",
-              payload: {
-                detail: input.detail,
-              },
-              turnId: input.turnId,
-              createdAt: input.createdAt,
-            },
-            createdAt: input.createdAt,
-          },
-          trustedSystemDispatchAuthority("CheckpointReactor"),
+        projectionSnapshotQuery.getThreadDetailById(input.threadId).pipe(
+          Effect.flatMap(
+            Option.match({
+              onNone: () => Effect.void,
+              onSome: (thread) =>
+                orchestrationEngine.dispatch(
+                  {
+                    type: "thread.activity.append",
+                    commandId,
+                    threadId: input.threadId,
+                    activity: {
+                      id: activityId,
+                      tone: "error",
+                      kind: "checkpoint.capture.failed",
+                      summary: "Checkpoint capture failed",
+                      payload: {
+                        detail: input.detail,
+                      },
+                      turnId: input.turnId,
+                      createdAt: input.createdAt,
+                    },
+                    createdAt: input.createdAt,
+                  },
+                  threadAudienceSystemDispatchAuthority(thread, "CheckpointReactor"),
+                ),
+            }),
+          ),
         ),
       ),
     );
@@ -225,13 +242,7 @@ const make = Effect.gen(function* () {
   const captureAndDispatchCheckpoint = Effect.fn("captureAndDispatchCheckpoint")(function* (input: {
     readonly threadId: ThreadId;
     readonly turnId: TurnId;
-    readonly thread: {
-      readonly messages: ReadonlyArray<{
-        readonly id: MessageId;
-        readonly role: string;
-        readonly turnId: TurnId | null;
-      }>;
-    };
+    readonly thread: Pick<OrchestrationThread, "id" | "dataAudience" | "messages">;
     readonly cwd: string;
     readonly turnCount: number;
     readonly status: "ready" | "missing" | "error";
@@ -319,7 +330,7 @@ const make = Effect.gen(function* () {
         checkpointTurnCount: input.turnCount,
         createdAt: input.createdAt,
       },
-      trustedSystemDispatchAuthority("CheckpointReactor"),
+      threadAudienceSystemDispatchAuthority(input.thread, "CheckpointReactor"),
     );
     yield* receiptBus.publish({
       type: "checkpoint.diff.finalized",
@@ -357,7 +368,7 @@ const make = Effect.gen(function* () {
         },
         createdAt: input.createdAt,
       },
-      trustedSystemDispatchAuthority("CheckpointReactor"),
+      threadAudienceSystemDispatchAuthority(input.thread, "CheckpointReactor"),
     );
   });
 
@@ -738,7 +749,7 @@ const make = Effect.gen(function* () {
           turnCount: event.payload.turnCount,
           createdAt: now,
         },
-        trustedSystemDispatchAuthority("CheckpointReactor"),
+        threadAudienceSystemDispatchAuthority(thread, "CheckpointReactor"),
       )
       .pipe(
         Effect.catch((error) =>

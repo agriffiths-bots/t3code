@@ -90,6 +90,7 @@ const parentProject: OrchestrationProjectShell = {
   updatedAt: "2026-06-17T09:00:00.000Z",
 };
 let activeProjectShell: OrchestrationProjectShell = parentProject;
+let failProjectShellLookup = false;
 
 const invocation = {
   credentialKind: "provider-session" as const,
@@ -532,7 +533,16 @@ const projectionLayer = Layer.succeed(ProjectionSnapshotQuery, {
   getCounts: () => unsupported(),
   getActiveProjectByWorkspaceRoot: () => unsupported(),
   getProjectShellById: (id) =>
-    Effect.succeed(id === activeProjectShell.id ? Option.some(activeProjectShell) : Option.none()),
+    failProjectShellLookup
+      ? Effect.fail(
+          new PersistenceSqlError({
+            operation: "ProjectionSnapshotQuery.getProjectShellById:test",
+            detail: "project shell lookup failed",
+          }),
+        )
+      : Effect.succeed(
+          id === activeProjectShell.id ? Option.some(activeProjectShell) : Option.none(),
+        ),
   getFirstActiveThreadIdByProjectId: () => unsupported(),
   getThreadCheckpointContext: () => unsupported(),
   getFullThreadDiffContext: () => unsupported(),
@@ -1663,7 +1673,7 @@ describe("SubagentToolkit", () => {
     ),
   );
 
-  it.effect("peer-scoped receiver spawn requires directory and records remote parent", () =>
+  it.effect("peer-scoped receiver spawn resolves child authority before dispatch", () =>
     Effect.scoped(
       Effect.gen(function* () {
         const server = yield* McpServer.McpServer;
@@ -1686,6 +1696,7 @@ describe("SubagentToolkit", () => {
         engineCommands.length = 0;
         dispatchedTurnCommands.length = 0;
         registeredChildren.length = 0;
+        failProjectShellLookup = true;
         const sourceEnvironmentId = EnvironmentId.make("environment-source-a");
 
         const result = yield* server
@@ -1726,6 +1737,7 @@ describe("SubagentToolkit", () => {
       Effect.ensuring(
         Effect.sync(() => {
           activeProjectShell = parentProject;
+          failProjectShellLookup = false;
           engineCommands.length = 0;
           dispatchedTurnCommands.length = 0;
           registeredChildren.length = 0;

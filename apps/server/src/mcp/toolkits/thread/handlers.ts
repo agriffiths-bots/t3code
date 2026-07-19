@@ -51,7 +51,7 @@ import {
 } from "./tools.ts";
 import { applyMcpReasoningEffort } from "./reasoningEffort.ts";
 
-import { trustedSystemDispatchAuthority } from "../../../orchestration/commandAudienceGuard.ts";
+import { sessionDispatchAuthority } from "../../../orchestration/commandAudienceGuard.ts";
 const nowIso = Effect.map(DateTime.now, DateTime.formatIso);
 const isThreadStartToolError = Schema.is(ThreadStartToolError);
 const isVcsProcessSpawnError = Schema.is(VcsProcessSpawnError);
@@ -106,13 +106,18 @@ interface SourceCwdProjectContext {
   readonly workspaceRelativePath: string | null;
 }
 
+export interface ActiveThreadStartResult {
+  readonly output: ThreadStartToolOutput;
+  readonly targetProject: Pick<OrchestrationProjectShell, "id" | "dataAudience">;
+}
+
 export type ActiveThreadStartRuntime = (
   input: ThreadStartInternalInput,
   invocation: McpInvocationContext.McpInvocationScope,
   options?: {
     readonly providerSessionDetached?: boolean;
   },
-) => Effect.Effect<ThreadStartToolOutput, ThreadStartToolError>;
+) => Effect.Effect<ActiveThreadStartResult, ThreadStartToolError>;
 
 type ActiveThreadArchiveRuntime = (
   input: ThreadArchiveToolInput,
@@ -794,35 +799,45 @@ const makeActiveThreadStartRuntime = Effect.fn("ThreadToolkit.makeActiveRuntime"
         },
         createdAt,
       },
-      trustedSystemDispatchAuthority("handlers"),
+      sessionDispatchAuthority({
+        subject: `provider-thread:${sourceThread.id}`,
+        audienceCeiling: sourceThread.dataAudience,
+      }),
     ).pipe(
-      Effect.mapError((error) =>
-        fail(error instanceof Error ? error.message : "Failed to start child thread."),
-      ),
+      // Dispatch authorization can reference a project selected from the
+      // explicit directory. Never expose those internal identifiers back to
+      // a provider-scoped caller when the target is outside its audience.
+      Effect.mapError(() => fail("Failed to start child thread.")),
     );
 
     return {
-      threadId: ids.threadId,
-      projectId: project.id,
-      mode,
-      branch,
-      worktreePath,
-      ...(shouldUseCurrentCheckout
-        ? {
-            warning: WORKTREE_DEGRADE_WARNING,
-          }
-        : mode === "current_checkout"
+      output: {
+        threadId: ids.threadId,
+        projectId: project.id,
+        mode,
+        branch,
+        worktreePath,
+        ...(shouldUseCurrentCheckout
           ? {
-              warning:
-                "Child thread was started on the current checkout and may conflict with concurrent writes.",
+              warning: WORKTREE_DEGRADE_WARNING,
             }
-          : mode === "new_worktree" && explicitForeignDirectory
+          : mode === "current_checkout"
             ? {
                 warning:
-                  "Worktree was created in an explicitly targeted repository and is not auto-cleaned; remove it manually when the work is done.",
+                  "Child thread was started on the current checkout and may conflict with concurrent writes.",
               }
-            : {}),
-    };
+            : mode === "new_worktree" && explicitForeignDirectory
+              ? {
+                  warning:
+                    "Worktree was created in an explicitly targeted repository and is not auto-cleaned; remove it manually when the work is done.",
+                }
+              : {}),
+      },
+      targetProject: {
+        id: project.id,
+        dataAudience: project.dataAudience,
+      },
+    } satisfies ActiveThreadStartResult;
   });
 });
 
@@ -940,7 +955,10 @@ const makeActiveThreadArchiveRuntime = Effect.fn("ThreadToolkit.makeActiveArchiv
             commandId: CommandId.make(`mcp-admin:thread-archive:${commandUuid}`),
             threadId: target.id,
           },
-          trustedSystemDispatchAuthority("handlers"),
+          sessionDispatchAuthority({
+            subject: `provider-thread:${source.id}`,
+            audienceCeiling: source.dataAudience,
+          }),
         )
         .pipe(
           Effect.mapError((error) => toToolError(error, `Failed to archive thread ${target.id}.`)),
@@ -1006,7 +1024,7 @@ const startThread = Effect.fn("ThreadToolkit.startThread")(function* (
   ).pipe(Effect.mapError((error) => fail(error.message)));
   const runtime = activeThreadStartRuntime;
   if (!runtime) return yield* fail("Thread start runtime is not available.");
-  return yield* runtime(input, invocation);
+  return (yield* runtime(input, invocation)).output;
 });
 
 const archiveThread = Effect.fn("ThreadToolkit.archiveThread")(function* (

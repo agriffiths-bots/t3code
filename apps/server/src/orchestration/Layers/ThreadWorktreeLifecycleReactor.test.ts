@@ -45,11 +45,14 @@ const snapshot = (input: {
 }): OrchestrationReadModel =>
   ({
     snapshotSequence: 2,
-    projects: [{ id: PROJECT_ID, workspaceRoot: PROJECT_ROOT, deletedAt: null }],
+    projects: [
+      { id: PROJECT_ID, workspaceRoot: PROJECT_ROOT, dataAudience: "private", deletedAt: null },
+    ],
     threads: [
       {
         id: THREAD_ID,
         projectId: PROJECT_ID,
+        dataAudience: "private",
         worktreePath: `${WORKTREE_ROOT}/packages/app`,
         worktreeRemovable: true,
         worktreeRemovalPath: WORKTREE_ROOT,
@@ -62,6 +65,7 @@ const snapshot = (input: {
             {
               id: ThreadId.make("thread-worktree-consumer"),
               projectId: PROJECT_ID,
+              dataAudience: "private",
               worktreePath: `${WORKTREE_ROOT}/packages/web`,
               worktreeRemovable: false,
               worktreeRemovalPath: WORKTREE_ROOT,
@@ -76,6 +80,7 @@ const snapshot = (input: {
             {
               id: ThreadId.make("thread-worktree-ancestor-consumer"),
               projectId: PROJECT_ID,
+              dataAudience: "private",
               worktreePath: "/worktrees",
               worktreeRemovable: false,
               worktreeRemovalPath: null,
@@ -221,6 +226,7 @@ async function createHarness(input: {
             Effect.succeed(
               Option.some({
                 id: THREAD_ID,
+                dataAudience: input.snapshot.threads[0]?.dataAudience ?? "private",
                 archivedAt: input.snapshot.threads[0]?.archivedAt ?? null,
                 session: input.projectedSessionStatus
                   ? {
@@ -326,8 +332,10 @@ describe("ThreadDeletionReactor owned worktree lifecycle", () => {
           worktreeRemovalPath: null,
         }),
         expect.objectContaining({
-          kind: "trusted-system",
+          kind: "audience-bound-system",
           reason: "ThreadDeletionReactor",
+          sourceThreadId: THREAD_ID,
+          dataAudience: "private",
         }),
       );
       expect(harness.operations).toEqual(["close", "remove", "prune", "metadata"]);
@@ -444,8 +452,10 @@ describe("ThreadDeletionReactor owned worktree lifecycle", () => {
       expect(harness.dispatch).toHaveBeenCalledWith(
         expect.objectContaining({ type: "thread.session.stop", threadId: THREAD_ID }),
         expect.objectContaining({
-          kind: "trusted-system",
+          kind: "audience-bound-system",
           reason: "ThreadDeletionReactor",
+          sourceThreadId: THREAD_ID,
+          dataAudience: "private",
         }),
       );
       expect(harness.removeWorktree).not.toHaveBeenCalled();
@@ -457,15 +467,19 @@ describe("ThreadDeletionReactor owned worktree lifecycle", () => {
           [
             expect.objectContaining({ type: "thread.session.stop", threadId: THREAD_ID }),
             expect.objectContaining({
-              kind: "trusted-system",
+              kind: "audience-bound-system",
               reason: "ThreadDeletionReactor",
+              sourceThreadId: THREAD_ID,
+              dataAudience: "private",
             }),
           ],
           [
             expect.objectContaining({ type: "thread.session.stop", threadId: THREAD_ID }),
             expect.objectContaining({
-              kind: "trusted-system",
+              kind: "audience-bound-system",
               reason: "ThreadDeletionReactor",
+              sourceThreadId: THREAD_ID,
+              dataAudience: "private",
             }),
           ],
         ]),

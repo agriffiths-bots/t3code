@@ -7076,6 +7076,7 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
         layers: {
           projectionSnapshotQuery: {
             getSnapshot: () => Effect.succeed(snapshot),
+            getCommandReadModel: () => Effect.succeed(snapshot),
           },
           orchestrationEngine: {
             dispatch: () => Effect.succeed({ sequence: 7 }),
@@ -8440,11 +8441,21 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
   it.effect("dispatches archive without transport-scoped cleanup", () =>
     Effect.gen(function* () {
       const threadId = ThreadId.make("thread-archive");
+      const baseReadModel = makeDefaultOrchestrationReadModel();
+      const commandReadModel = {
+        ...baseReadModel,
+        threads: baseReadModel.threads.map((thread, index) =>
+          index === 0 ? { ...thread, id: threadId } : thread,
+        ),
+      };
       const effects: string[] = [];
       const dispatchedCommands: Array<OrchestrationCommand> = [];
 
       yield* buildAppUnderTest({
         layers: {
+          projectionSnapshotQuery: {
+            getCommandReadModel: () => Effect.succeed(commandReadModel),
+          },
           terminalManager: {
             close: (input) =>
               Effect.sync(() => {
@@ -8914,6 +8925,14 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
           >[0],
         ) => Effect.die(new Error("unexpected setup script")),
       );
+      const baseReadModel = makeDefaultOrchestrationReadModel();
+      const receiptThread = {
+        ...baseReadModel.threads[0]!,
+        id: threadId,
+        projectId: defaultProjectId,
+        createdAt,
+        updatedAt: createdAt,
+      };
 
       yield* buildAppUnderTest({
         layers: {
@@ -8922,6 +8941,13 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
           },
           projectSetupScriptRunner: {
             runForThread,
+          },
+          projectionSnapshotQuery: {
+            getCommandReadModel: () =>
+              Effect.succeed({
+                ...baseReadModel,
+                threads: [receiptThread],
+              }),
           },
           orchestrationCommandReceiptRepository: {
             getByCommandId: (input) =>

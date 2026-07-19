@@ -1,5 +1,6 @@
 import {
   CommandId,
+  type DataAudience,
   EventId,
   type OrchestrationThread,
   OrchestrationDispatchCommandError,
@@ -27,8 +28,13 @@ import {
 import { VcsStatusBroadcaster } from "../../vcs/VcsStatusBroadcaster.ts";
 import { OrchestrationCommandInvariantError } from "../Errors.ts";
 import {
+  threadHasPreparedBootstrapWorktree,
+  threadMatchesBootstrapCreate,
+  type BootstrapCreateThreadCommand,
+} from "../bootstrapCommandState.ts";
+import {
+  audienceBoundSystemDispatchAuthority,
   authorizeOrchestrationCommandMutation,
-  trustedSystemDispatchAuthority,
   type OrchestrationCommandDispatchAuthority,
 } from "../commandAudienceGuard.ts";
 import { dispatchAlreadyCoordinated, OrchestrationEngineService } from "./OrchestrationEngine.ts";
@@ -36,18 +42,10 @@ import { ProjectionSnapshotQuery } from "./ProjectionSnapshotQuery.ts";
 import { WorktreeLifecycleCoordinator } from "./WorktreeLifecycleCoordinator.ts";
 
 type ThreadTurnStartCommand = Extract<OrchestrationCommand, { type: "thread.turn.start" }>;
-type BootstrapCreateThreadCommand = NonNullable<
-  NonNullable<ThreadTurnStartCommand["bootstrap"]>["createThread"]
->;
-type BootstrapPrepareWorktreeCommand = NonNullable<
-  NonNullable<ThreadTurnStartCommand["bootstrap"]>["prepareWorktree"]
->;
-
 const isOrchestrationCommandInvariantError = Schema.is(OrchestrationCommandInvariantError);
 const isOrchestrationDispatchCommandError = Schema.is(OrchestrationDispatchCommandError);
 
 const nowIso = Effect.map(DateTime.now, DateTime.formatIso);
-const bootstrapInternalAuthority = trustedSystemDispatchAuthority("bootstrap-turn-start");
 
 function unexpectedCompatibilityError(error: never): never {
   throw new Error(`Unhandled compatibility error: ${String(error)}`);
@@ -107,67 +105,6 @@ function isArchivedFinalTurnStartCause(cause: Cause.Cause<unknown>, threadId: Th
     return error.message.includes(detail);
   }
   return error instanceof Error && error.message.includes(detail);
-}
-
-function toCanonicalJson(value: unknown): string {
-  return JSON.stringify(toCanonicalJsonValue(value));
-}
-
-function toCanonicalJsonValue(value: unknown): unknown {
-  if (Array.isArray(value)) {
-    return value.map(toCanonicalJsonValue);
-  }
-  if (typeof value !== "object" || value === null) {
-    return value;
-  }
-  return Object.fromEntries(
-    Object.entries(value)
-      .filter(([, entryValue]) => entryValue !== undefined)
-      .sort(([leftKey], [rightKey]) => leftKey.localeCompare(rightKey))
-      .map(([entryKey, entryValue]) => [entryKey, toCanonicalJsonValue(entryValue)]),
-  );
-}
-
-function threadMatchesBootstrapCreate(
-  thread: OrchestrationThread,
-  createThread: BootstrapCreateThreadCommand,
-  hasPrepareWorktree: boolean,
-) {
-  if (thread.deletedAt !== null) return false;
-  if (thread.messages.length > 0 || thread.latestTurn !== null) return false;
-  if (thread.projectId !== createThread.projectId) return false;
-  if (thread.createdAt !== createThread.createdAt) return false;
-  if (toCanonicalJson(thread.modelSelection) !== toCanonicalJson(createThread.modelSelection)) {
-    return false;
-  }
-  if (thread.runtimeMode !== createThread.runtimeMode) return false;
-  if (thread.interactionMode !== createThread.interactionMode) return false;
-  if (!hasPrepareWorktree && thread.branch !== createThread.branch) return false;
-  if (!hasPrepareWorktree && thread.worktreePath !== createThread.worktreePath) return false;
-  return true;
-}
-
-function threadHasPreparedBootstrapWorktree(
-  thread: OrchestrationThread,
-  createThread: BootstrapCreateThreadCommand | undefined,
-  prepareWorktree: BootstrapPrepareWorktreeCommand,
-) {
-  if (thread.deletedAt !== null || thread.worktreePath === null) return false;
-  if (prepareWorktree.branch !== undefined) {
-    if (thread.branch !== prepareWorktree.branch) {
-      return false;
-    }
-  } else if (!createThread) {
-    return false;
-  }
-  if (
-    createThread &&
-    thread.branch === createThread.branch &&
-    thread.worktreePath === createThread.worktreePath
-  ) {
-    return false;
-  }
-  return true;
 }
 
 export interface BootstrapTurnStartDispatcherShape {
@@ -358,6 +295,7 @@ export const layer = Layer.effect(
       let targetProjectCwd = bootstrap?.prepareWorktree?.projectCwd;
       let targetWorktreePath = bootstrap?.createThread?.worktreePath ?? null;
       let skipWorktreePreparation = false;
+      let internalAuthority: OrchestrationCommandDispatchAuthority = authority;
       // The worktree THIS bootstrap created (if any), for cleanup on failure.
       // A failed bootstrap must not leave its worktree behind — and for
       // directory-targeted (non-removable, foreign-repo) worktrees lifecycle
@@ -473,24 +411,34 @@ export const layer = Layer.effect(
           );
         });
 
-      const authorizeBootstrapCommand = () =>
-        projectionSnapshotQuery.getCommandReadModel().pipe(
-          Effect.mapError((cause) =>
-            toDispatchCommandError(cause, "Failed to read bootstrap authorization model."),
-          ),
-          Effect.flatMap((readModel) =>
-            authorizeOrchestrationCommandMutation({
-              command,
-              readModel,
-              authority,
-            }).pipe(
+      const authorizeBootstrapCommand = (): Effect.Effect<
+        DataAudience,
+        OrchestrationDispatchCommandError
+      > =>
+        Effect.gen(function* () {
+          const readModel = yield* projectionSnapshotQuery
+            .getCommandReadModel()
+            .pipe(
               Effect.mapError((cause) =>
-                toDispatchCommandError(cause, "Bootstrap turn start command is not authorized."),
+                toDispatchCommandError(cause, "Failed to read bootstrap authorization model."),
               ),
+            );
+          yield* authorizeOrchestrationCommandMutation({ command, readModel, authority }).pipe(
+            Effect.mapError((cause) =>
+              toDispatchCommandError(cause, "Bootstrap turn start command is not authorized."),
             ),
-          ),
-          Effect.asVoid,
-        );
+          );
+          const targetAudience =
+            readModel.threads.find((thread) => thread.id === command.threadId)?.dataAudience ??
+            readModel.projects.find((project) => project.id === bootstrap?.createThread?.projectId)
+              ?.dataAudience;
+          if (targetAudience === undefined) {
+            return yield* new OrchestrationDispatchCommandError({
+              message: "Bootstrap turn start target audience could not be resolved.",
+            });
+          }
+          return targetAudience;
+        });
 
       const getFinalTurnReceipt = () =>
         commandReceiptRepository
@@ -652,7 +600,7 @@ export const layer = Layer.effect(
                 (bootstrap?.prepareWorktree === undefined ? createThread.worktreePath : null),
               createdAt: createThread.createdAt,
             },
-            bootstrapInternalAuthority,
+            internalAuthority,
           ).pipe(
             Effect.matchEffect({
               onFailure: (error) => {
@@ -683,8 +631,6 @@ export const layer = Layer.effect(
         });
 
       const bootstrapProgram = Effect.gen(function* () {
-        yield* authorizeBootstrapCommand();
-
         const existingFinalTurnReceipt = yield* getFinalTurnReceipt();
         if (Option.isSome(existingFinalTurnReceipt)) {
           return yield* dispatchAlreadyCoordinated(
@@ -693,6 +639,13 @@ export const layer = Layer.effect(
             authority,
           );
         }
+
+        const targetAudience = yield* authorizeBootstrapCommand();
+        internalAuthority = audienceBoundSystemDispatchAuthority({
+          reason: "bootstrap-turn-start",
+          sourceThreadId: command.threadId,
+          dataAudience: targetAudience,
+        });
 
         if (bootstrap?.createThread) {
           yield* dispatchCreateThread(bootstrap.createThread);
@@ -748,7 +701,7 @@ export const layer = Layer.effect(
               worktreeRemovable: preparedWorktreeRemovable,
               worktreeRemovalPath: preparedWorktreeRemovable ? worktree.worktree.path : null,
             },
-            bootstrapInternalAuthority,
+            internalAuthority,
           );
           yield* refreshGitStatus(targetWorktreePath);
         }

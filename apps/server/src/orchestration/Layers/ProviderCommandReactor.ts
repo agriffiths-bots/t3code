@@ -4,6 +4,7 @@ import {
   EventId,
   type MessageId,
   type ModelSelection,
+  OrchestrationDispatchCommandError,
   type OrchestrationEvent,
   ProviderDriverKind,
   type ProjectId,
@@ -51,7 +52,7 @@ import { ServerSettingsService } from "../../serverSettings.ts";
 import { VcsStatusBroadcaster } from "../../vcs/VcsStatusBroadcaster.ts";
 import { GitWorkflowService } from "../../git/GitWorkflowService.ts";
 import { WorktreeLifecycleCoordinator } from "../Services/WorktreeLifecycleCoordinator.ts";
-import { trustedSystemDispatchAuthority } from "../commandAudienceGuard.ts";
+import { threadAudienceSystemDispatchAuthority } from "../commandAudienceGuard.ts";
 const isProviderAdapterRequestError = Schema.is(ProviderAdapterRequestError);
 const isProviderSendTurnFailedError = Schema.is(ProviderSendTurnFailedError);
 const isProviderSessionStartTimeoutError = Schema.is(ProviderSessionStartTimeoutError);
@@ -266,6 +267,27 @@ const make = Effect.gen(function* () {
 
   const threadModelSelections = new Map<string, ModelSelection>();
 
+  const authorityForThreadIncludingArchived = Effect.fn(
+    "ProviderCommandReactor.authorityForThreadIncludingArchived",
+  )(function* (threadId: ThreadId) {
+    const thread = yield* projectionSnapshotQuery
+      .getThreadShellByIdIncludingArchived(threadId)
+      .pipe(
+        Effect.flatMap(
+          Option.match({
+            onNone: () =>
+              Effect.fail(
+                new OrchestrationDispatchCommandError({
+                  message: "Provider command target audience could not be resolved.",
+                }),
+              ),
+            onSome: Effect.succeed,
+          }),
+        ),
+      );
+    return threadAudienceSystemDispatchAuthority(thread, "ProviderCommandReactor");
+  });
+
   const appendProviderFailureActivity = (input: {
     readonly threadId: ThreadId;
     readonly kind:
@@ -285,8 +307,9 @@ const make = Effect.gen(function* () {
     Effect.all({
       commandId: serverCommandId("provider-failure-activity"),
       eventId: serverEventId(),
+      authority: authorityForThreadIncludingArchived(input.threadId),
     }).pipe(
-      Effect.flatMap(({ commandId, eventId }) =>
+      Effect.flatMap(({ commandId, eventId, authority }) =>
         orchestrationEngine.dispatch(
           {
             type: "thread.activity.append",
@@ -312,7 +335,7 @@ const make = Effect.gen(function* () {
             },
             createdAt: input.createdAt,
           },
-          trustedSystemDispatchAuthority("ProviderCommandReactor"),
+          authority,
         ),
       ),
     );
@@ -345,8 +368,11 @@ const make = Effect.gen(function* () {
     readonly session: OrchestrationSession;
     readonly createdAt: string;
   }) =>
-    serverCommandId("provider-session-set").pipe(
-      Effect.flatMap((commandId) =>
+    Effect.all({
+      commandId: serverCommandId("provider-session-set"),
+      authority: authorityForThreadIncludingArchived(input.threadId),
+    }).pipe(
+      Effect.flatMap(({ commandId, authority }) =>
         orchestrationEngine.dispatch(
           {
             type: "thread.session.set",
@@ -355,7 +381,7 @@ const make = Effect.gen(function* () {
             session: input.session,
             createdAt: input.createdAt,
           },
-          trustedSystemDispatchAuthority("ProviderCommandReactor"),
+          authority,
         ),
       ),
     );
@@ -616,6 +642,7 @@ const make = Effect.gen(function* () {
     readonly createdAt: string;
   }) {
     const commandId = yield* serverCommandId("provider-archived-session-stop");
+    const authority = yield* authorityForThreadIncludingArchived(input.threadId);
     yield* orchestrationEngine.dispatch(
       {
         type: "thread.session.stop",
@@ -623,7 +650,7 @@ const make = Effect.gen(function* () {
         threadId: input.threadId,
         createdAt: input.createdAt,
       },
-      trustedSystemDispatchAuthority("ProviderCommandReactor"),
+      authority,
     );
   });
   const archivedTurnStartCancellationDetail = (threadId: ThreadId) =>
@@ -1147,7 +1174,7 @@ const make = Effect.gen(function* () {
               branch: renamed.branch,
               worktreePath: cwd,
             },
-            trustedSystemDispatchAuthority("ProviderCommandReactor"),
+            threadAudienceSystemDispatchAuthority(currentThread, "ProviderCommandReactor"),
           );
           yield* vcsStatusBroadcaster.refreshStatus(cwd).pipe(Effect.ignoreCause({ log: true }));
         }),
@@ -1204,7 +1231,7 @@ const make = Effect.gen(function* () {
             threadId: input.threadId,
             title: generated.title,
           },
-          trustedSystemDispatchAuthority("ProviderCommandReactor"),
+          threadAudienceSystemDispatchAuthority(thread, "ProviderCommandReactor"),
         );
       }).pipe(
         Effect.catchCause((cause) =>

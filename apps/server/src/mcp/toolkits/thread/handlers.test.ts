@@ -9,6 +9,8 @@ import {
   VcsUnsupportedOperationError,
   type ModelSelection,
   type OrchestrationCommand,
+  OrchestrationDispatchCommandError,
+  type OrchestrationReadModel,
   type OrchestrationProjectShell,
   type OrchestrationThreadShell,
 } from "@t3tools/contracts";
@@ -26,6 +28,10 @@ import { McpSchema, McpServer } from "effect/unstable/ai";
 import { GitWorkflowService } from "../../../git/GitWorkflowService.ts";
 import * as VcsDriverRegistry from "../../../vcs/VcsDriverRegistry.ts";
 import * as BootstrapTurnStartDispatcher from "../../../orchestration/Services/BootstrapTurnStartDispatcher.ts";
+import {
+  authorizeOrchestrationCommandMutation,
+  type OrchestrationCommandDispatchAuthority,
+} from "../../../orchestration/commandAudienceGuard.ts";
 import {
   ChildThreadCoordinator,
   type ChildListEntry,
@@ -192,6 +198,7 @@ interface TestLayerOptions {
   readonly settledChildThreadIds?: ReadonlySet<ThreadId>;
   readonly gitWorkflow?: Partial<GitWorkflowService["Service"]>;
   readonly vcsDetect?: VcsDriverRegistry.VcsDriverRegistry["Service"]["detect"];
+  readonly bootstrapDispatch?: BootstrapTurnStartDispatcher.BootstrapTurnStartDispatcherShape["dispatch"];
 }
 
 const vcsFreshness = {
@@ -304,11 +311,13 @@ const makeTestLayer = (commands: OrchestrationCommand[], options: TestLayerOptio
   const bootstrapTurnStartDispatcherLayer = Layer.mock(
     BootstrapTurnStartDispatcher.BootstrapTurnStartDispatcher,
   )({
-    dispatch: (command) =>
-      Effect.sync(() => {
-        commands.push(command);
-        return { sequence: 1 };
-      }),
+    dispatch:
+      options.bootstrapDispatch ??
+      ((command) =>
+        Effect.sync(() => {
+          commands.push(command);
+          return { sequence: 1 };
+        })),
   });
 
   return ThreadToolkitRegistrationLive.pipe(
@@ -375,7 +384,7 @@ const callStartTool = (
     const runtime = activeThreadStartRuntimeOf();
     if (runtime === null) return yield* Effect.die("Thread start runtime is unavailable in test.");
     return yield* runtime(arguments_ as ThreadStartInternalInput, invocation).pipe(
-      Effect.map((output) => ({
+      Effect.map(({ output }) => ({
         isError: false as const,
         structuredContent: output,
         content: [{ type: "text" as const, text: JSON.stringify(output) }],
@@ -882,6 +891,95 @@ it.effect("bases the child on an explicit git directory with a new worktree", ()
     // The caller project's setup script must never run inside an explicitly
     // targeted other repository.
     expect(command.bootstrap?.runSetupScript).toBe(false);
+  }),
+);
+
+it.effect("inherits factory audience when an explicit directory targets a private project", () =>
+  Effect.gen(function* () {
+    const commands: OrchestrationCommand[] = [];
+    const explicitPrivateDir = yield* makeTempDirectory("t3-dir-private-project-");
+    const factorySourceThread = {
+      ...sourceThread,
+      dataAudience: "factory" as const,
+    };
+    const factoryProject = {
+      ...project,
+      dataAudience: "factory" as const,
+    };
+    const privateProjectId = ProjectId.make("project-thread-mcp-private-target");
+    const authorizationModel: OrchestrationReadModel = {
+      snapshotSequence: 1,
+      updatedAt: sourceThread.updatedAt,
+      projects: [
+        { ...factoryProject, deletedAt: null },
+        {
+          ...project,
+          id: privateProjectId,
+          title: "Private target",
+          workspaceRoot: explicitPrivateDir,
+          dataAudience: "private",
+          deletedAt: null,
+        },
+      ],
+      threads: [
+        {
+          ...factorySourceThread,
+          deletedAt: null,
+          messages: [],
+          turns: [],
+          proposedPlans: [],
+          activities: [],
+          checkpoints: [],
+        },
+      ],
+    };
+    let observedAuthority: OrchestrationCommandDispatchAuthority | null = null;
+    let worktreeSideEffectCount = 0;
+
+    const result = yield* callStartTool(
+      { prompt: "Do not enter the private checkout", directory: explicitPrivateDir },
+      commands,
+      {
+        project: factoryProject,
+        sourceThread: factorySourceThread,
+        bootstrapDispatch: (command, authority) =>
+          Effect.sync(() => {
+            observedAuthority = authority;
+          }).pipe(
+            Effect.andThen(
+              authorizeOrchestrationCommandMutation({
+                command,
+                readModel: authorizationModel,
+                authority,
+              }).pipe(
+                Effect.mapError(
+                  (cause) =>
+                    new OrchestrationDispatchCommandError({
+                      message: "Bootstrap command was not authorized.",
+                      cause,
+                    }),
+                ),
+              ),
+            ),
+            Effect.tap(() =>
+              Effect.sync(() => {
+                worktreeSideEffectCount += 1;
+              }),
+            ),
+            Effect.as({ sequence: 1 }),
+          ),
+      },
+    );
+
+    expect(result.isError).toBe(true);
+    expect(errorText(result.content)).toBe("Failed to start child thread.");
+    expect(errorText(result.content)).not.toContain(privateProjectId);
+    expect(errorText(result.content)).not.toContain(explicitPrivateDir);
+    expect(worktreeSideEffectCount).toBe(0);
+    expect(observedAuthority).toMatchObject({
+      kind: "session",
+      audienceCeiling: "factory",
+    });
   }),
 );
 

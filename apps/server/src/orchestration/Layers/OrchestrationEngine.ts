@@ -1,9 +1,4 @@
-import type {
-  OrchestrationEvent,
-  OrchestrationReadModel,
-  ProjectId,
-  ThreadId,
-} from "@t3tools/contracts";
+import type { OrchestrationEvent, OrchestrationReadModel, ThreadId } from "@t3tools/contracts";
 import { OrchestrationCommand } from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
 import * as Clock from "effect/Clock";
@@ -40,7 +35,9 @@ import {
   type OrchestrationProjectorDecodeError,
 } from "../Errors.ts";
 import {
+  authorizeOrchestrationCommandReceiptReplay,
   authorizeOrchestrationCommandMutation,
+  orchestrationCommandAggregateRef,
   type OrchestrationCommandDispatchAuthority,
 } from "../commandAudienceGuard.ts";
 import { decideOrchestrationCommand } from "../decider.ts";
@@ -69,27 +66,6 @@ interface CommandEnvelope {
   authority: OrchestrationCommandDispatchAuthority | undefined;
   result: Deferred.Deferred<{ sequence: number }, OrchestrationDispatchError>;
   startedAtMs: number;
-}
-
-function commandToAggregateRef(command: OrchestrationCommand): {
-  readonly aggregateKind: "project" | "thread";
-  readonly aggregateId: ProjectId | ThreadId;
-} {
-  switch (command.type) {
-    case "project.create":
-    case "project.meta.update":
-    case "project.data-audience.set":
-    case "project.delete":
-      return {
-        aggregateKind: "project",
-        aggregateId: command.projectId,
-      };
-    default:
-      return {
-        aggregateKind: "thread",
-        aggregateId: command.threadId,
-      };
-  }
 }
 
 const makeOrchestrationEngine = Effect.gen(function* () {
@@ -123,7 +99,7 @@ const makeOrchestrationEngine = Effect.gen(function* () {
   const processEnvelope = (envelope: CommandEnvelope): Effect.Effect<void> => {
     const dispatchStartSequence = commandReadModel.snapshotSequence;
     let processingStartedAtMs = 0;
-    const aggregateRef = commandToAggregateRef(envelope.command);
+    const aggregateRef = orchestrationCommandAggregateRef(envelope.command);
     const baseMetricAttributes = {
       commandType: envelope.command.type,
       aggregateKind: aggregateRef.aggregateKind,
@@ -153,16 +129,16 @@ const makeOrchestrationEngine = Effect.gen(function* () {
           "orchestration.aggregate_id": aggregateRef.aggregateId,
         });
 
-        const command = yield* authorizeOrchestrationCommandMutation({
-          command: envelope.command,
-          readModel: commandReadModel,
-          authority: envelope.authority,
-        });
-
         const existingReceipt = yield* commandReceiptRepository.getByCommandId({
-          commandId: command.commandId,
+          commandId: envelope.command.commandId,
         });
         if (Option.isSome(existingReceipt)) {
+          yield* authorizeOrchestrationCommandReceiptReplay({
+            command: envelope.command,
+            readModel: commandReadModel,
+            authority: envelope.authority,
+            receipt: existingReceipt.value,
+          });
           if (existingReceipt.value.status === "accepted") {
             return {
               sequence: existingReceipt.value.resultSequence,
@@ -173,6 +149,12 @@ const makeOrchestrationEngine = Effect.gen(function* () {
             detail: existingReceipt.value.error ?? "Previously rejected.",
           });
         }
+
+        const command = yield* authorizeOrchestrationCommandMutation({
+          command: envelope.command,
+          readModel: commandReadModel,
+          authority: envelope.authority,
+        });
 
         yield* requireUnarchiveWorktreeLifecycleReady(command);
 

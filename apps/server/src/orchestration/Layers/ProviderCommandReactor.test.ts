@@ -769,35 +769,36 @@ describe("ProviderCommandReactor", () => {
         createdAt: now,
       },
     };
+    const archivedThread = () => ({
+      id: threadId,
+      projectId: asProjectId("project-1"),
+      dataAudience: "private" as const,
+      title: "Archived child",
+      archivedAt: now,
+      modelSelection,
+      runtimeMode: "approval-required" as const,
+      interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+      branch: null,
+      worktreePath: null,
+      session: projectedSession,
+      messages: [
+        {
+          id: messageId,
+          role: "user" as const,
+          text: "queued before archive",
+          attachments: [],
+        },
+      ],
+    });
 
     const layer = ProviderCommandReactorLive.pipe(
       Layer.provideMerge(WorktreeLifecycleCoordinatorLive),
       Layer.provideMerge(Layer.succeed(OrchestrationEngineService, engine)),
       Layer.provideMerge(
         Layer.mock(ProjectionSnapshotQuery)({
-          getThreadDetailById: () =>
-            Effect.succeed(
-              Option.some({
-                id: threadId,
-                projectId: asProjectId("project-1"),
-                title: "Archived child",
-                archivedAt: now,
-                modelSelection,
-                runtimeMode: "approval-required",
-                interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
-                branch: null,
-                worktreePath: null,
-                session: projectedSession,
-                messages: [
-                  {
-                    id: messageId,
-                    role: "user",
-                    text: "queued before archive",
-                    attachments: [],
-                  },
-                ],
-              } as never),
-            ),
+          getThreadDetailById: () => Effect.succeed(Option.some(archivedThread() as never)),
+          getThreadShellByIdIncludingArchived: () =>
+            Effect.succeed(Option.some(archivedThread() as never)),
         }),
       ),
       Layer.provideMerge(Layer.succeed(ProviderService, providerService)),

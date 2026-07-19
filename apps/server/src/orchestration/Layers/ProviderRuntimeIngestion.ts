@@ -4,6 +4,7 @@ import {
   CommandId,
   MessageId,
   type OrchestrationEvent,
+  OrchestrationDispatchCommandError,
   type OrchestrationMessage,
   type OrchestrationProposedPlanId,
   CheckpointRef,
@@ -39,7 +40,7 @@ import {
 } from "../Services/ProviderRuntimeIngestion.ts";
 import { ServerSettingsService } from "../../serverSettings.ts";
 
-import { trustedSystemDispatchAuthority } from "../commandAudienceGuard.ts";
+import { threadAudienceSystemDispatchAuthority } from "../commandAudienceGuard.ts";
 const providerTurnKey = (threadId: ThreadId, turnId: TurnId) => `${threadId}:${turnId}`;
 
 interface AssistantSegmentState {
@@ -695,6 +696,18 @@ const make = Effect.gen(function* () {
       .pipe(Effect.map(Option.getOrUndefined));
   });
 
+  const authorityForThread = Effect.fn("ProviderRuntimeIngestion.authorityForThread")(function* (
+    threadId: ThreadId,
+  ) {
+    const thread = yield* resolveThreadShell(threadId);
+    if (thread === undefined) {
+      return yield* new OrchestrationDispatchCommandError({
+        message: "Provider runtime target audience could not be resolved.",
+      });
+    }
+    return threadAudienceSystemDispatchAuthority(thread, "ProviderRuntimeIngestion");
+  });
+
   const rememberAssistantMessageId = (threadId: ThreadId, turnId: TurnId, messageId: MessageId) =>
     Cache.getOption(turnMessageIdsByTurnKey, providerTurnKey(threadId, turnId)).pipe(
       Effect.flatMap((existingIds) =>
@@ -971,7 +984,7 @@ const make = Effect.gen(function* () {
           ...(input.turnId ? { turnId: input.turnId } : {}),
           createdAt: input.createdAt,
         },
-        trustedSystemDispatchAuthority("ProviderRuntimeIngestion"),
+        yield* authorityForThread(input.threadId),
       );
       return true;
     });
@@ -1041,7 +1054,7 @@ const make = Effect.gen(function* () {
             ...(input.turnId ? { turnId: input.turnId } : {}),
             createdAt: input.createdAt,
           },
-          trustedSystemDispatchAuthority("ProviderRuntimeIngestion"),
+          yield* authorityForThread(input.threadId),
         );
       }
 
@@ -1055,7 +1068,7 @@ const make = Effect.gen(function* () {
             ...(input.turnId ? { turnId: input.turnId } : {}),
             createdAt: input.createdAt,
           },
-          trustedSystemDispatchAuthority("ProviderRuntimeIngestion"),
+          yield* authorityForThread(input.threadId),
         );
       }
       yield* clearAssistantMessageState(input.messageId);
@@ -1181,7 +1194,7 @@ const make = Effect.gen(function* () {
           },
           createdAt: input.updatedAt,
         },
-        trustedSystemDispatchAuthority("ProviderRuntimeIngestion"),
+        yield* authorityForThread(input.threadId),
       );
     });
 
@@ -1360,7 +1373,7 @@ const make = Effect.gen(function* () {
           },
           createdAt: implementedAt,
         },
-        trustedSystemDispatchAuthority("ProviderRuntimeIngestion"),
+        threadAudienceSystemDispatchAuthority(sourceThread, "ProviderRuntimeIngestion"),
       );
     },
   );
@@ -1369,6 +1382,10 @@ const make = Effect.gen(function* () {
     Effect.gen(function* () {
       const thread = yield* resolveThreadShell(event.threadId);
       if (!thread) return;
+      const runtimeAuthority = threadAudienceSystemDispatchAuthority(
+        thread,
+        "ProviderRuntimeIngestion",
+      );
 
       let loadedThreadDetail: OrchestrationThread | null | undefined;
       const getLoadedThreadDetail = () =>
@@ -1550,7 +1567,7 @@ const make = Effect.gen(function* () {
               },
               createdAt: now,
             },
-            trustedSystemDispatchAuthority("ProviderRuntimeIngestion"),
+            runtimeAuthority,
           );
         }
       }
@@ -1598,7 +1615,7 @@ const make = Effect.gen(function* () {
                 ...(turnId ? { turnId } : {}),
                 createdAt: now,
               },
-              trustedSystemDispatchAuthority("ProviderRuntimeIngestion"),
+              runtimeAuthority,
             );
             hasProjectedMessage = true;
           }
@@ -1625,7 +1642,7 @@ const make = Effect.gen(function* () {
               ...(turnId ? { turnId } : {}),
               createdAt: now,
             },
-            trustedSystemDispatchAuthority("ProviderRuntimeIngestion"),
+            runtimeAuthority,
           );
           if (shouldFinalizeTerminalDelta) {
             yield* finalizeAssistantMessage({
@@ -1857,7 +1874,7 @@ const make = Effect.gen(function* () {
               },
               createdAt: now,
             },
-            trustedSystemDispatchAuthority("ProviderRuntimeIngestion"),
+            runtimeAuthority,
           );
         }
       }
@@ -1870,7 +1887,7 @@ const make = Effect.gen(function* () {
             threadId: thread.id,
             title: event.payload.name,
           },
-          trustedSystemDispatchAuthority("ProviderRuntimeIngestion"),
+          runtimeAuthority,
         );
       }
 
@@ -1891,7 +1908,7 @@ const make = Effect.gen(function* () {
             effectiveModel,
             createdAt: now,
           },
-          trustedSystemDispatchAuthority("ProviderRuntimeIngestion"),
+          runtimeAuthority,
         );
       }
 
@@ -1932,7 +1949,7 @@ const make = Effect.gen(function* () {
                 checkpointTurnCount: maxCheckpointTurnCount(checkpointContext.checkpoints) + 1,
                 createdAt: now,
               },
-              trustedSystemDispatchAuthority("ProviderRuntimeIngestion"),
+              runtimeAuthority,
             );
           }
         }
@@ -1950,7 +1967,7 @@ const make = Effect.gen(function* () {
                 activity,
                 createdAt: activity.createdAt,
               },
-              trustedSystemDispatchAuthority("ProviderRuntimeIngestion"),
+              runtimeAuthority,
             ),
           ),
         ),
