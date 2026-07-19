@@ -91,6 +91,26 @@ const BASE_THREAD: OrchestrationThread = {
   checkpoints: [],
   session: null,
 };
+const ACTIVE_THREAD: OrchestrationThread = {
+  ...BASE_THREAD,
+  latestTurn: {
+    turnId: TurnId.make("turn-1"),
+    state: "running",
+    requestedAt: "2026-04-01T00:01:00.000Z",
+    startedAt: "2026-04-01T00:01:00.000Z",
+    completedAt: null,
+    assistantMessageId: null,
+  },
+  session: {
+    threadId: THREAD_ID,
+    status: "running",
+    providerName: "codex",
+    runtimeMode: "full-access",
+    activeTurnId: TurnId.make("turn-1"),
+    lastError: null,
+    updatedAt: "2026-04-01T00:01:00.000Z",
+  },
+};
 
 const RUNNING_TURN_ID = TurnId.make("turn-running-1");
 
@@ -171,6 +191,8 @@ const makeHarness = Effect.fn("TestEnvironmentThreads.makeHarness")(function* (o
   const revisionCalls = yield* Ref.make(0);
   const revisionCallTimes = yield* Ref.make<ReadonlyArray<number>>([]);
   const revisionAvailable = yield* Ref.make(true);
+  const revisionGone = yield* Ref.make(false);
+  const revisionSnapshotRequired = yield* Ref.make(false);
   const explicitRevisionSequence = yield* Ref.make<Option.Option<number>>(
     Option.fromNullishOr(options?.revisionSequence),
   );
@@ -297,6 +319,12 @@ const makeHarness = Effect.fn("TestEnvironmentThreads.makeHarness")(function* (o
         if (threadId !== THREAD_ID || !(yield* Ref.get(revisionAvailable))) {
           return { kind: "unavailable" } as const;
         }
+        if (yield* Ref.get(revisionGone)) {
+          return { kind: "gone" } as const;
+        }
+        if (yield* Ref.get(revisionSnapshotRequired)) {
+          return { kind: "snapshot-required" } as const;
+        }
         const explicit = yield* Ref.get(explicitRevisionSequence);
         const latestSequence = Option.isSome(explicit)
           ? explicit.value
@@ -399,6 +427,8 @@ const makeHarness = Effect.fn("TestEnvironmentThreads.makeHarness")(function* (o
     revisionCalls,
     revisionCallTimes,
     revisionAvailable,
+    revisionGone,
+    revisionSnapshotRequired,
     explicitRevisionSequence,
     explicitProjectionSequence,
     explicitRevisionEventId,
@@ -724,6 +754,39 @@ describe("EnvironmentThreads", () => {
       }),
   );
 
+  it.effect("backs off repeated snapshot-required recoveries on idle threads", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness({
+        cached: BASE_THREAD,
+        reconciliationPolicy: {
+          fastIntervalMs: 2_000,
+          fastWindowMs: 0,
+          backoffMultiplier: 2,
+          maxBackoffMs: 60_000,
+        },
+      });
+      yield* awaitThreadState(harness.observed, (value) => value.status === "live");
+      yield* Ref.set(harness.revisionSnapshotRequired, true);
+      yield* Ref.set(
+        harness.httpSnapshot,
+        Option.some({
+          snapshotSequence: CACHED_SNAPSHOT_SEQUENCE,
+          thread: BASE_THREAD,
+          storageEpoch: STORAGE_EPOCH,
+          latestSequence: CACHED_SNAPSHOT_SEQUENCE,
+          latestEventId: markerEventId(CACHED_SNAPSHOT_SEQUENCE),
+        }),
+      );
+
+      for (const delay of [2, 4, 8]) {
+        yield* TestClock.adjust(`${delay} seconds`);
+        yield* Effect.yieldNow;
+      }
+
+      expect(yield* Ref.get(harness.revisionCallTimes)).toEqual([2_000, 6_000, 14_000]);
+    }),
+  );
+
   it.effect("keeps polling an idle mounted thread after the fast window", () =>
     Effect.gen(function* () {
       const harness = yield* makeHarness({
@@ -769,6 +832,196 @@ describe("EnvironmentThreads", () => {
 
       expect(Option.getOrThrow(healed.data).title).toBe(healedThread.title);
       expect(yield* Ref.get(harness.loaderCalls)).toBe(1);
+    }),
+  );
+
+  it.effect("reconciles a cached thread away when its revision endpoint reports gone", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness({
+        cached: BASE_THREAD,
+        revisionSequence: CACHED_SNAPSHOT_SEQUENCE,
+      });
+      yield* awaitThreadState(harness.observed, (value) => value.status === "live");
+      yield* Ref.set(harness.revisionGone, true);
+
+      yield* advanceActiveReconcileInterval;
+
+      const reconciled = yield* Ref.get(harness.latest);
+      expect(reconciled.status).toBe("deleted");
+      expect(Option.isNone(reconciled.data)).toBe(true);
+      expect(yield* Ref.get(harness.removedThreads)).toEqual([THREAD_ID]);
+      expect(yield* Ref.get(harness.loaderCalls)).toBe(0);
+      expect(yield* Ref.get(harness.revisionCalls)).toBe(1);
+
+      yield* Queue.offer(
+        harness.inputs,
+        snapshot({ ...BASE_THREAD, title: "Late stale snapshot" }, CACHED_SNAPSHOT_SEQUENCE + 1),
+      );
+      yield* Effect.yieldNow;
+
+      yield* TestClock.adjust("2 minutes");
+      yield* Effect.yieldNow;
+      expect((yield* Ref.get(harness.latest)).status).toBe("deleted");
+      expect(yield* Ref.get(harness.revisionCalls)).toBe(1);
+      expect(yield* Ref.get(harness.removedThreads)).toEqual([THREAD_ID]);
+    }),
+  );
+
+  it.effect("keeps deleted terminal across connection and stream transitions", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness({
+        cached: BASE_THREAD,
+        revisionSequence: CACHED_SNAPSHOT_SEQUENCE,
+      });
+      yield* awaitThreadState(harness.observed, (value) => value.status === "live");
+      yield* Ref.set(harness.revisionGone, true);
+      yield* advanceActiveReconcileInterval;
+      yield* awaitThreadState(harness.observed, (value) => value.status === "deleted");
+
+      const connectionTransitions: ReadonlyArray<SupervisorConnectionState> = [
+        {
+          desired: true,
+          network: "online",
+          phase: "connected",
+          stage: null,
+          attempt: 1,
+          generation: 1,
+          lastFailure: null,
+          retryAt: null,
+        },
+        {
+          ...AVAILABLE_CONNECTION_STATE,
+          generation: 1,
+        },
+      ];
+      for (const connectionState of connectionTransitions) {
+        yield* SubscriptionRef.set(harness.supervisorState, connectionState);
+        yield* Effect.yieldNow;
+        expect((yield* Ref.get(harness.latest)).status).toBe("deleted");
+      }
+
+      yield* Queue.offer(harness.inputs, new Error("late stream failure"));
+      const streamErrorState = yield* awaitThreadState(harness.observed, (value) =>
+        Option.isSome(value.error),
+      );
+      expect(streamErrorState.status).toBe("deleted");
+
+      yield* SubscriptionRef.set(harness.supervisorState, {
+        desired: true,
+        network: "online",
+        phase: "connecting",
+        stage: "synchronizing",
+        attempt: 2,
+        generation: 2,
+        lastFailure: null,
+        retryAt: null,
+      });
+      yield* harness.replaceSession;
+      for (let attempt = 0; attempt < 100; attempt += 1) {
+        if ((yield* Ref.get(harness.subscriptionCount)) >= 2) {
+          break;
+        }
+        yield* Effect.yieldNow;
+      }
+      expect(yield* Ref.get(harness.subscriptionCount)).toBe(2);
+      yield* Queue.offer(
+        harness.inputs,
+        snapshot(
+          { ...BASE_THREAD, title: "Late reconnect snapshot" },
+          CACHED_SNAPSHOT_SEQUENCE + 1,
+        ),
+      );
+      for (let attempt = 0; attempt < 10; attempt += 1) {
+        yield* Effect.yieldNow;
+      }
+      expect(yield* Queue.size(harness.inputs)).toBe(0);
+
+      const terminal = yield* Ref.get(harness.latest);
+      expect(terminal.status).toBe("deleted");
+      expect(Option.isNone(terminal.data)).toBe(true);
+    }),
+  );
+
+  it.effect("retains a cached thread while its revision endpoint is unavailable", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness({
+        cached: BASE_THREAD,
+        revisionSequence: CACHED_SNAPSHOT_SEQUENCE,
+      });
+      yield* awaitThreadState(harness.observed, (value) => value.status === "live");
+      yield* Ref.set(harness.revisionAvailable, false);
+
+      yield* advanceActiveReconcileInterval;
+      yield* advanceActiveReconcileInterval;
+
+      const retained = yield* Ref.get(harness.latest);
+      expect(retained.status).toBe("live");
+      expect(Option.getOrThrow(retained.data).id).toBe(THREAD_ID);
+      expect(yield* Ref.get(harness.removedThreads)).toEqual([]);
+      expect(yield* Ref.get(harness.revisionCalls)).toBe(2);
+    }),
+  );
+
+  it.effect("evicts a cached thread when revision denial reconciles to a scoped 404", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness({
+        cached: BASE_THREAD,
+        revisionSequence: CACHED_SNAPSHOT_SEQUENCE,
+      });
+      yield* awaitThreadState(harness.observed, (value) => value.status === "live");
+      yield* Ref.set(harness.revisionSnapshotRequired, true);
+      yield* Ref.set(harness.httpReconcileResult, Option.some({ kind: "missing" }));
+
+      yield* advanceActiveReconcileInterval;
+
+      const reconciled = yield* Ref.get(harness.latest);
+      expect(reconciled.status).toBe("deleted");
+      expect(Option.isNone(reconciled.data)).toBe(true);
+      expect(yield* Ref.get(harness.removedThreads)).toEqual([THREAD_ID]);
+      expect(yield* Ref.get(harness.loaderCalls)).toBe(1);
+      expect(yield* Ref.get(harness.revisionCalls)).toBe(1);
+    }),
+  );
+
+  it.effect("refreshes a visible thread when revision denial reconciles to a scoped snapshot", () =>
+    Effect.gen(function* () {
+      const refreshedThread = {
+        ...BASE_THREAD,
+        dataAudience: "factory" as const,
+        title: "Factory-visible refresh",
+        updatedAt: "2026-07-18T14:00:00.000Z",
+      };
+      const harness = yield* makeHarness({
+        cached: BASE_THREAD,
+        revisionSequence: CACHED_SNAPSHOT_SEQUENCE,
+      });
+      yield* awaitThreadState(harness.observed, (value) => value.status === "live");
+      yield* Ref.set(harness.revisionSnapshotRequired, true);
+      yield* Ref.set(
+        harness.httpReconcileResult,
+        Option.some({
+          kind: "found",
+          snapshot: {
+            snapshotSequence: CACHED_SNAPSHOT_SEQUENCE + 1,
+            thread: refreshedThread,
+            storageEpoch: STORAGE_EPOCH,
+            latestSequence: CACHED_SNAPSHOT_SEQUENCE + 1,
+            latestEventId: markerEventId(CACHED_SNAPSHOT_SEQUENCE + 1),
+          },
+        }),
+      );
+
+      yield* advanceActiveReconcileInterval;
+
+      const reconciled = yield* awaitThreadState(
+        harness.observed,
+        (value) => Option.isSome(value.data) && value.data.value.title === refreshedThread.title,
+      );
+      expect(reconciled.status).toBe("live");
+      expect(Option.getOrThrow(reconciled.data).dataAudience).toBe("factory");
+      expect(yield* Ref.get(harness.removedThreads)).toEqual([]);
+      expect(yield* Ref.get(harness.loaderCalls)).toBe(1);
+      expect(yield* Ref.get(harness.revisionCalls)).toBe(1);
     }),
   );
 
@@ -1349,6 +1602,31 @@ describe("EnvironmentThreads", () => {
       expect((yield* Ref.get(harness.savedThreads)).at(-1)?.snapshotSequence).toBe(
         CACHED_SNAPSHOT_SEQUENCE + 2,
       );
+    }),
+  );
+
+  it.effect("does not persist active thread snapshots during streaming or teardown", () =>
+    Effect.gen(function* () {
+      const savedThreads = yield* Effect.scoped(
+        Effect.gen(function* () {
+          const harness = yield* makeHarness({ cached: ACTIVE_THREAD });
+          yield* awaitThreadState(
+            harness.observed,
+            (value) =>
+              value.status === "live" &&
+              Option.isSome(value.data) &&
+              value.data.value.session?.status === "running",
+          );
+
+          yield* TestClock.adjust("500 millis");
+          yield* Effect.yieldNow;
+
+          expect(yield* Ref.get(harness.savedThreads)).toEqual([]);
+          return harness.savedThreads;
+        }),
+      );
+
+      expect(yield* Ref.get(savedThreads)).toEqual([]);
     }),
   );
 

@@ -25,6 +25,7 @@ import * as DeviceNotifications from "./DeviceNotifications.ts";
 import * as WebPushEndpointGuard from "./WebPushEndpointGuard.ts";
 
 const decodeJson = Schema.decodeUnknownSync(Schema.UnknownFromJsonString);
+const encodeJson = Schema.encodeSync(Schema.UnknownFromJsonString);
 
 const TEST_PUSH_SERVER_KEY = `-----BEGIN PRIVATE KEY-----
 MIIEvAIBADANBgkqhkiG9w0BAQEFAASCBKYwggSiAgEAAoIBAQCn9YCqyzB0eWu4
@@ -93,6 +94,15 @@ const makeNotificationsLayerForBaseDir = (
   );
 
 const takeEvent = (queue: Queue.Queue<ServerNotificationStreamEvent>) => Queue.take(queue);
+
+const waitFor = (predicate: () => boolean, message: string) =>
+  Effect.gen(function* () {
+    for (let attempt = 0; attempt < 10_000; attempt += 1) {
+      if (predicate()) return;
+      yield* Effect.yieldNow;
+    }
+    throw new Error(message);
+  });
 
 const makeGuardLayer = (
   resolve: Parameters<typeof WebPushEndpointGuard.make>[0],
@@ -219,11 +229,14 @@ it.layer(NodeServices.layer)("DeviceNotifications.layer", (it) => {
     Effect.gen(function* () {
       const notifications = yield* DeviceNotifications.DeviceNotifications;
 
-      yield* notifications.registerDevice({
-        deviceId: "desktop-1",
-        deviceKind: "desktop",
-        deviceLabel: "Desktop app",
-      });
+      yield* notifications.registerDevice(
+        {
+          deviceId: "desktop-1",
+          deviceKind: "desktop",
+          deviceLabel: "Desktop app",
+        },
+        { audienceCeiling: "private" },
+      );
 
       const config = yield* notifications.getConfig;
       const result = yield* notifications.notify({
@@ -233,6 +246,245 @@ it.layer(NodeServices.layer)("DeviceNotifications.layer", (it) => {
 
       assert.isAbove(config.vapidPublicKey.length, 20);
       assert.equal(result.deliveredDevices, 1);
+    }).pipe(Effect.provide(makeNotificationsLayer())),
+  );
+
+  it.effect("warns when an active web-push registration has no subscription", () =>
+    Effect.gen(function* () {
+      const logs: Array<ReadonlyArray<unknown>> = [];
+      const logger = Logger.make(({ message }) => {
+        logs.push(Array.isArray(message) ? message : [message]);
+      });
+
+      const result = yield* Effect.gen(function* () {
+        const notifications = yield* DeviceNotifications.DeviceNotifications;
+        yield* notifications.registerDevice(
+          {
+            deviceId: "missing-subscription",
+            deviceKind: "web-push",
+            deviceLabel: "Broken browser registration",
+          },
+          { audienceCeiling: "private" },
+        );
+        return yield* notifications.notify({ title: "Cannot reach this registration" });
+      }).pipe(
+        Effect.provide(
+          Layer.mergeAll(
+            makeNotificationsLayer(),
+            Logger.layer([logger], { mergeWithExisting: false }),
+          ),
+        ),
+      );
+
+      assert.equal(result.deliveredDevices, 0);
+      const warning = logs.find(
+        (message) => message[0] === "Skipped web push delivery without an active subscription",
+      );
+      assert.deepInclude(warning?.[1] as Record<string, unknown>, {
+        deviceId: "missing-subscription",
+        deviceLabel: "Broken browser registration",
+        platform: "web-push",
+      });
+    }),
+  );
+
+  it.effect("warns before replacing malformed persisted VAPID keys", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const baseDir = yield* fs.makeTempDirectoryScoped({
+        prefix: "t3-notifications-malformed-vapid-",
+      });
+      const secretsDir = path.join(baseDir, "userdata", "secrets");
+      yield* fs.makeDirectory(secretsDir, { recursive: true });
+      yield* fs.writeFileString(path.join(secretsDir, "web-push-vapid-keys.bin"), "not-json");
+      const logs: Array<ReadonlyArray<unknown>> = [];
+      const logger = Logger.make(({ message }) => {
+        logs.push(Array.isArray(message) ? message : [message]);
+      });
+
+      const config = yield* Effect.gen(function* () {
+        const notifications = yield* DeviceNotifications.DeviceNotifications;
+        return yield* notifications.getConfig;
+      }).pipe(
+        Effect.provide(
+          makeNotificationsLayerForBaseDir(baseDir).pipe(
+            Layer.provide(Logger.layer([logger], { mergeWithExisting: false })),
+          ),
+        ),
+      );
+
+      assert.isAbove(config.vapidPublicKey.length, 20);
+      assert.isTrue(
+        logs.some((message) => message[0] === "Failed to decode persisted web-push VAPID keys"),
+      );
+    }).pipe(Effect.scoped),
+  );
+
+  it.effect("migrates unattributed version-one notification devices fail-closed", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const baseDir = yield* fs.makeTempDirectoryScoped({
+        prefix: "t3-notifications-v1-migration-",
+      });
+      const storePath = path.join(baseDir, "userdata", "notification-devices.json");
+      yield* fs.makeDirectory(path.dirname(storePath), { recursive: true });
+      yield* fs.writeFileString(
+        storePath,
+        encodeJson({
+          version: 1,
+          devices: [
+            {
+              deviceId: "legacy-unattributed-desktop",
+              deviceKind: "desktop",
+              createdAt: "2026-07-17T12:00:00.000Z",
+              updatedAt: "2026-07-17T12:00:00.000Z",
+            },
+            {
+              deviceId: "legacy-factory-desktop",
+              deviceKind: "desktop",
+              audienceCeiling: "factory",
+              createdAt: "2026-07-17T12:00:00.000Z",
+              updatedAt: "2026-07-17T12:00:00.000Z",
+            },
+            {
+              deviceId: "legacy-private-desktop",
+              deviceKind: "desktop",
+              audienceCeiling: "private",
+              createdAt: "2026-07-17T12:00:00.000Z",
+              updatedAt: "2026-07-17T12:00:00.000Z",
+            },
+          ],
+        }),
+      );
+
+      const delivery = yield* Effect.gen(function* () {
+        const notifications = yield* DeviceNotifications.DeviceNotifications;
+        const privateDelivery = yield* notifications.notify({ title: "Legacy private delivery" });
+        const factoryDelivery = yield* notifications.notify(
+          { title: "Legacy factory delivery" },
+          { dataAudience: "factory" },
+        );
+        yield* notifications.registerDevice(
+          { deviceId: "current-private-desktop", deviceKind: "desktop" },
+          { audienceCeiling: "private" },
+        );
+        return { privateDelivery, factoryDelivery };
+      }).pipe(Effect.provide(makeNotificationsLayerForBaseDir(baseDir)));
+
+      const persisted = decodeJson(yield* fs.readFileString(storePath)) as {
+        readonly version: number;
+        readonly devices: ReadonlyArray<{
+          readonly deviceId: string;
+          readonly audienceCeiling?: string;
+        }>;
+      };
+      assert.equal(delivery.privateDelivery.deliveredDevices, 1);
+      assert.equal(delivery.factoryDelivery.deliveredDevices, 3);
+      assert.equal(persisted.version, 3);
+      assert.deepEqual(
+        persisted.devices.map(({ deviceId, audienceCeiling }) => ({ deviceId, audienceCeiling })),
+        [
+          { deviceId: "current-private-desktop", audienceCeiling: "private" },
+          { deviceId: "legacy-factory-desktop", audienceCeiling: "factory" },
+          { deviceId: "legacy-private-desktop", audienceCeiling: "private" },
+          { deviceId: "legacy-unattributed-desktop", audienceCeiling: "factory" },
+        ],
+      );
+    }).pipe(Effect.scoped),
+  );
+
+  it.effect("rejects unattributed version-two notification devices", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const baseDir = yield* fs.makeTempDirectoryScoped({
+        prefix: "t3-notifications-v2-fail-closed-",
+      });
+      const storePath = path.join(baseDir, "userdata", "notification-devices.json");
+      yield* fs.makeDirectory(path.dirname(storePath), { recursive: true });
+      yield* fs.writeFileString(
+        storePath,
+        encodeJson({
+          version: 2,
+          devices: [
+            {
+              deviceId: "unattributed-v2-desktop",
+              deviceKind: "desktop",
+              createdAt: "2026-07-18T10:00:00.000Z",
+              updatedAt: "2026-07-18T10:00:00.000Z",
+            },
+          ],
+        }),
+      );
+
+      const delivery = yield* Effect.gen(function* () {
+        const notifications = yield* DeviceNotifications.DeviceNotifications;
+        return yield* notifications.notify({ title: "Must not reach an unattributed device" });
+      }).pipe(Effect.provide(makeNotificationsLayerForBaseDir(baseDir)));
+
+      assert.equal(delivery.deliveredDevices, 0);
+    }).pipe(Effect.scoped),
+  );
+
+  it.effect("scopes notification streams, acknowledgements, and devices by audience", () =>
+    Effect.gen(function* () {
+      const notifications = yield* DeviceNotifications.DeviceNotifications;
+      yield* notifications.registerDevice(
+        { deviceId: "desktop-private", deviceKind: "desktop" },
+        { audienceCeiling: "private" },
+      );
+      yield* notifications.registerDevice(
+        { deviceId: "desktop-factory", deviceKind: "desktop" },
+        { audienceCeiling: "factory" },
+      );
+      const factoryEventsFiber = yield* notifications
+        .eventsForAudience("factory")
+        .pipe(Stream.take(1), Stream.runCollect, Effect.forkChild({ startImmediately: true }));
+      const privateEventsFiber = yield* notifications
+        .eventsForAudience("private")
+        .pipe(Stream.take(2), Stream.runCollect, Effect.forkChild({ startImmediately: true }));
+      yield* Effect.yieldNow;
+
+      const privateDelivery = yield* notifications.notify(
+        { title: "PRIVATE::notification" },
+        { dataAudience: "private" },
+      );
+      const factoryDelivery = yield* notifications.notify(
+        { title: "Factory notification" },
+        { dataAudience: "factory", resultAudienceCeiling: "factory" },
+      );
+      const factoryEvents = Array.from(yield* Fiber.join(factoryEventsFiber));
+      const privateEvents = Array.from(yield* Fiber.join(privateEventsFiber));
+
+      assert.equal(privateDelivery.deliveredDevices, 1);
+      assert.equal(factoryDelivery.deliveredDevices, 1);
+      assert.deepEqual(
+        factoryEvents.flatMap((event) => (event.type === "show" ? [event.notification.title] : [])),
+        ["Factory notification"],
+      );
+      assert.deepEqual(
+        privateEvents.flatMap((event) => (event.type === "show" ? [event.notification.title] : [])),
+        ["PRIVATE::notification", "Factory notification"],
+      );
+
+      const privateProbe = yield* notifications.ackNotification(
+        { notificationId: privateDelivery.notificationId, action: "dismissed" },
+        { audienceCeiling: "factory" },
+      );
+      const missingProbe = yield* notifications.ackNotification(
+        { notificationId: "notification-does-not-exist", action: "dismissed" },
+        { audienceCeiling: "factory" },
+      );
+      assert.deepEqual(privateProbe, {
+        notificationId: privateDelivery.notificationId,
+        accepted: false,
+      });
+      assert.deepEqual(missingProbe, {
+        notificationId: "notification-does-not-exist",
+        accepted: false,
+      });
     }).pipe(Effect.provide(makeNotificationsLayer())),
   );
 
@@ -249,11 +501,14 @@ it.layer(NodeServices.layer)("DeviceNotifications.layer", (it) => {
         const notifications = yield* DeviceNotifications.DeviceNotifications;
         yield* fs.makeDirectory(storePath);
         const registrationExit = yield* Effect.exit(
-          notifications.registerDevice({
-            deviceId: "desktop-persist-fails",
-            deviceKind: "desktop",
-            deviceLabel: "Unpersistable desktop",
-          }),
+          notifications.registerDevice(
+            {
+              deviceId: "desktop-persist-fails",
+              deviceKind: "desktop",
+              deviceLabel: "Unpersistable desktop",
+            },
+            { audienceCeiling: "private" },
+          ),
         );
         const notification = yield* notifications.notify({
           title: "Should not count failed registration",
@@ -270,21 +525,30 @@ it.layer(NodeServices.layer)("DeviceNotifications.layer", (it) => {
     Effect.gen(function* () {
       const notifications = yield* DeviceNotifications.DeviceNotifications;
       const subscription = webPushSubscription("https://push.example/unchanged-registration");
-      const first = yield* notifications.registerDevice({
-        deviceId: "idempotent-registration",
-        deviceKind: "web-push",
-        subscription,
-      });
-      const replayed = yield* notifications.registerDevice({
-        deviceId: "idempotent-registration",
-        deviceKind: "web-push",
-        subscription,
-      });
-      const changed = yield* notifications.registerDevice({
-        deviceId: "idempotent-registration",
-        deviceKind: "web-push",
-        subscription: webPushSubscription("https://push.example/changed-registration"),
-      });
+      const first = yield* notifications.registerDevice(
+        {
+          deviceId: "idempotent-registration",
+          deviceKind: "web-push",
+          subscription,
+        },
+        { audienceCeiling: "private" },
+      );
+      const replayed = yield* notifications.registerDevice(
+        {
+          deviceId: "idempotent-registration",
+          deviceKind: "web-push",
+          subscription,
+        },
+        { audienceCeiling: "private" },
+      );
+      const changed = yield* notifications.registerDevice(
+        {
+          deviceId: "idempotent-registration",
+          deviceKind: "web-push",
+          subscription: webPushSubscription("https://push.example/changed-registration"),
+        },
+        { audienceCeiling: "private" },
+      );
 
       assert.equal(replayed.recoveryToken, first.recoveryToken);
       assert.notEqual(changed.recoveryToken, first.recoveryToken);
@@ -297,12 +561,12 @@ it.layer(NodeServices.layer)("DeviceNotifications.layer", (it) => {
     ),
   );
 
-  it.effect("expires 404/410 web-push devices without deleting them and logs a warning", () =>
+  it.effect("records and alerts remaining devices when a 404 expires a web-push device", () =>
     Effect.gen(function* () {
       const fs = yield* FileSystem.FileSystem;
       const path = yield* Path.Path;
       const baseDir = yield* fs.makeTempDirectoryScoped({
-        prefix: "t3-notifications-expired-records-",
+        prefix: "t3-notifications-removal-alert-",
       });
       const storePath = path.join(baseDir, "userdata", "notification-devices.json");
       const logs: Array<{
@@ -318,31 +582,41 @@ it.layer(NodeServices.layer)("DeviceNotifications.layer", (it) => {
       const sendNotification = vi
         .spyOn(webPush, "sendNotification")
         .mockImplementation((subscription) =>
-          Promise.reject(
-            new WebPushError(
-              "Subscription expired",
-              subscription.endpoint.includes("gone") ? 404 : 410,
-              {},
-              "",
-              subscription.endpoint,
-            ),
-          ),
+          subscription.endpoint.includes("expired")
+            ? Promise.reject(
+                new WebPushError("Subscription expired", 404, {}, "", subscription.endpoint),
+              )
+            : Promise.resolve({ statusCode: 201, body: "", headers: {} }),
         );
 
-      const registrations = yield* Effect.gen(function* () {
+      const notification = yield* Effect.gen(function* () {
         const notifications = yield* DeviceNotifications.DeviceNotifications;
-        const gone = yield* notifications.registerDevice({
-          deviceId: "gone-web-push",
-          deviceKind: "web-push",
-          subscription: webPushSubscription("https://gone.push.example/device"),
-        });
-        const expired = yield* notifications.registerDevice({
-          deviceId: "expired-web-push",
-          deviceKind: "web-push",
-          subscription: webPushSubscription("https://expired.push.example/device"),
-        });
-        const notification = yield* notifications.notify({ title: "Expire stale devices" });
-        return { gone, expired, notification };
+        yield* notifications.registerDevice(
+          {
+            deviceId: "expired-android",
+            deviceKind: "web-push",
+            deviceLabel: "Adam's Android",
+            userAgent: "Android",
+            subscription: webPushSubscription("https://expired.push.example/device"),
+          },
+          { audienceCeiling: "private" },
+        );
+        yield* notifications.registerDevice(
+          {
+            deviceId: "remaining-windows",
+            deviceKind: "web-push",
+            deviceLabel: "Office PC",
+            userAgent: "Windows",
+            subscription: webPushSubscription("https://remaining.push.example/device"),
+          },
+          { audienceCeiling: "private" },
+        );
+        const result = yield* notifications.notify({ title: "Expire stale device" });
+        yield* waitFor(
+          () => sendNotification.mock.calls.length === 3,
+          "Timed out waiting for the push-subscription removal alert.",
+        );
+        return result;
       }).pipe(
         Effect.provide(
           Layer.mergeAll(
@@ -353,10 +627,16 @@ it.layer(NodeServices.layer)("DeviceNotifications.layer", (it) => {
             Logger.layer([logger], { mergeWithExisting: false }),
           ),
         ),
-        Effect.ensuring(Effect.sync(() => sendNotification.mockRestore())),
       );
 
       const persisted = decodeJson(yield* fs.readFileString(storePath)) as {
+        readonly tombstones?: ReadonlyArray<{
+          readonly deviceId: string;
+          readonly deviceLabel?: string;
+          readonly platform: string;
+          readonly reason: string;
+          readonly removedAt: string;
+        }>;
         readonly devices: ReadonlyArray<{
           readonly deviceId: string;
           readonly expiredAt?: string;
@@ -365,28 +645,189 @@ it.layer(NodeServices.layer)("DeviceNotifications.layer", (it) => {
           readonly subscription?: { readonly endpoint?: string };
         }>;
       };
-      assert.equal(registrations.notification.deliveredDevices, 0);
+      assert.equal(notification.deliveredDevices, 1);
       assert.equal(persisted.devices.length, 2);
-      for (const device of persisted.devices) {
-        assert.equal(device.status, "expired");
-        assert.isString(device.expiredAt);
-        assert.isString(device.recoveryTokenHash);
-        assert.notEqual(device.recoveryTokenHash, registrations.gone.recoveryToken);
-        assert.notEqual(device.recoveryTokenHash, registrations.expired.recoveryToken);
+      const expiredDevice = persisted.devices.find(
+        (device) => device.deviceId === "expired-android",
+      );
+      assert.isDefined(expiredDevice);
+      assert.equal(expiredDevice.status, "expired");
+      const expiredAt = expiredDevice.expiredAt;
+      if (expiredAt === undefined) {
+        assert.fail("Expected the removed device to have an expiry timestamp.");
       }
-      const expiryLogs = logs.filter((log) => log.message[0] === "Web push subscription expired");
-      assert.equal(expiryLogs.length, 2);
-      assert.deepEqual(
-        expiryLogs.map((log) => log.level),
-        ["Warn", "Warn"],
+      assert.deepEqual(persisted.tombstones, [
+        {
+          deviceId: "expired-android",
+          deviceLabel: "Adam's Android",
+          platform: "android",
+          reason: "push-service-404",
+          removedAt: expiredAt,
+        },
+      ]);
+
+      const removalLog = logs.find(
+        (log) => log.message[0] === "Web push subscription removed after push service rejection",
+      );
+      assert.equal(removalLog?.level, "Warn");
+      assert.deepInclude(removalLog?.message[1] as Record<string, unknown>, {
+        deviceId: "expired-android",
+        deviceLabel: "Adam's Android",
+        platform: "android",
+        reason: "push-service-404",
+      });
+
+      const alertBody =
+        "Push subscription for Adam's Android was removed (expired). Reopen T3 on that device to re-register.";
+      const alertCall = sendNotification.mock.calls.find(([, payload]) => {
+        const decoded = decodeJson(payload ?? "") as {
+          readonly notification?: { readonly body?: string };
+        };
+        return decoded.notification?.body === alertBody;
+      });
+      assert.equal(alertCall?.[0].endpoint, "https://remaining.push.example/device");
+    }).pipe(Effect.scoped),
+  );
+
+  it.effect("expires without recursing when delivery of a removal alert also returns 410", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const baseDir = yield* fs.makeTempDirectoryScoped({
+        prefix: "t3-notifications-removal-alert-loop-",
+      });
+      const storePath = path.join(baseDir, "userdata", "notification-devices.json");
+      const logs: Array<ReadonlyArray<unknown>> = [];
+      const logger = Logger.make(({ message }) => {
+        logs.push(Array.isArray(message) ? message : [message]);
+      });
+      let remainingDeviceCalls = 0;
+      const sendNotification = vi
+        .spyOn(webPush, "sendNotification")
+        .mockImplementation((subscription) => {
+          if (subscription.endpoint.includes("expired")) {
+            return Promise.reject(
+              new WebPushError("Subscription expired", 404, {}, "", subscription.endpoint),
+            );
+          }
+          remainingDeviceCalls += 1;
+          return remainingDeviceCalls === 1
+            ? Promise.resolve({ statusCode: 201, body: "", headers: {} })
+            : Promise.reject(
+                new WebPushError(
+                  "Removal alert target also expired",
+                  410,
+                  {},
+                  "",
+                  subscription.endpoint,
+                ),
+              );
+        });
+
+      yield* Effect.gen(function* () {
+        const notifications = yield* DeviceNotifications.DeviceNotifications;
+        yield* notifications.registerDevice(
+          {
+            deviceId: "expired-first",
+            deviceKind: "web-push",
+            deviceLabel: "Expired phone",
+            subscription: webPushSubscription("https://expired.push.example/device"),
+          },
+          { audienceCeiling: "private" },
+        );
+        yield* notifications.registerDevice(
+          {
+            deviceId: "alert-target",
+            deviceKind: "web-push",
+            deviceLabel: "Alert target",
+            subscription: webPushSubscription("https://remaining.push.example/device"),
+          },
+          { audienceCeiling: "private" },
+        );
+        yield* notifications.notify({ title: "Trigger one removal" });
+        yield* waitFor(
+          () =>
+            logs.some(
+              (message) =>
+                message[0] === "Web push subscription removed after push service rejection" &&
+                (message[1] as Record<string, unknown>).deviceId === "alert-target",
+            ),
+          "Timed out waiting for removal-alert cleanup to finish.",
+        );
+      }).pipe(
+        Effect.provide(
+          Layer.mergeAll(
+            makeNotificationsLayerForBaseDir(
+              baseDir,
+              makeGuardLayer(() => Effect.succeed([{ address: "93.184.216.34", family: 4 }])),
+            ),
+            Logger.layer([logger], { mergeWithExisting: false }),
+          ),
+        ),
+      );
+
+      const persisted = decodeJson(yield* fs.readFileString(storePath)) as {
+        readonly tombstones?: ReadonlyArray<{ readonly deviceId: string }>;
+        readonly devices: ReadonlyArray<{ readonly deviceId: string; readonly status?: string }>;
+      };
+      assert.equal(sendNotification.mock.calls.length, 3);
+      assert.isTrue(
+        logs.some((message) => message[0] === "Failed to deliver push subscription removal alert"),
       );
       assert.deepEqual(
-        new Set(expiryLogs.map((log) => (log.message[1] as Record<string, unknown>).endpointHost)),
-        new Set(["gone.push.example", "expired.push.example"]),
+        persisted.tombstones?.map(({ deviceId }) => deviceId),
+        ["expired-first", "alert-target"],
       );
+      assert.equal(
+        persisted.devices.find((device) => device.deviceId === "alert-target")?.status,
+        "expired",
+      );
+    }).pipe(Effect.scoped),
+  );
+
+  it.effect("safely handles an expired push device with no remaining devices", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const baseDir = yield* fs.makeTempDirectoryScoped({
+        prefix: "t3-notifications-removal-alert-empty-",
+      });
+      const storePath = path.join(baseDir, "userdata", "notification-devices.json");
+      const sendNotification = vi
+        .spyOn(webPush, "sendNotification")
+        .mockRejectedValue(
+          new WebPushError("Subscription expired", 404, {}, "", "https://push.example/only"),
+        );
+
+      const result = yield* Effect.gen(function* () {
+        const notifications = yield* DeviceNotifications.DeviceNotifications;
+        yield* notifications.registerDevice(
+          {
+            deviceId: "only-device",
+            deviceKind: "web-push",
+            deviceLabel: "Only phone",
+            subscription: webPushSubscription("https://push.example/only"),
+          },
+          { audienceCeiling: "private" },
+        );
+        return yield* notifications.notify({ title: "Expire the only device" });
+      }).pipe(
+        Effect.provide(
+          makeNotificationsLayerForBaseDir(
+            baseDir,
+            makeGuardLayer(() => Effect.succeed([{ address: "93.184.216.34", family: 4 }])),
+          ),
+        ),
+      );
+
+      const persisted = decodeJson(yield* fs.readFileString(storePath)) as {
+        readonly tombstones?: ReadonlyArray<{ readonly deviceId: string }>;
+      };
+      assert.equal(result.deliveredDevices, 0);
+      assert.equal(sendNotification.mock.calls.length, 1);
       assert.deepEqual(
-        new Set(expiryLogs.map((log) => (log.message[1] as Record<string, unknown>).reason)),
-        new Set(["push-service-404", "push-service-410"]),
+        persisted.tombstones?.map(({ deviceId }) => deviceId),
+        ["only-device"],
       );
     }).pipe(Effect.scoped),
   );
@@ -397,11 +838,14 @@ it.layer(NodeServices.layer)("DeviceNotifications.layer", (it) => {
         new WebPushError("Subscription expired", 410, {}, "", "https://push.example/old"),
       );
       const notifications = yield* DeviceNotifications.DeviceNotifications;
-      const first = yield* notifications.registerDevice({
-        deviceId: "recoverable-web-push",
-        deviceKind: "web-push",
-        subscription: webPushSubscription("https://push.example/old"),
-      });
+      const first = yield* notifications.registerDevice(
+        {
+          deviceId: "recoverable-web-push",
+          deviceKind: "web-push",
+          subscription: webPushSubscription("https://push.example/old"),
+        },
+        { audienceCeiling: "private" },
+      );
 
       const wrongToken = yield* notifications.recoverSubscription({
         oldEndpoint: "https://push.example/old",
@@ -460,11 +904,14 @@ it.layer(NodeServices.layer)("DeviceNotifications.layer", (it) => {
 
       const firstAttempt = yield* Effect.gen(function* () {
         const notifications = yield* DeviceNotifications.DeviceNotifications;
-        const registered = yield* notifications.registerDevice({
-          deviceId: "lost-recovery-response",
-          deviceKind: "web-push",
-          subscription: webPushSubscription("https://push.example/original"),
-        });
+        const registered = yield* notifications.registerDevice(
+          {
+            deviceId: "lost-recovery-response",
+            deviceKind: "web-push",
+            subscription: webPushSubscription("https://push.example/original"),
+          },
+          { audienceCeiling: "private" },
+        );
         const recovered = yield* notifications.recoverSubscription({
           oldEndpoint: "https://push.example/original",
           recoveryToken: registered.recoveryToken,
@@ -487,11 +934,14 @@ it.layer(NodeServices.layer)("DeviceNotifications.layer", (it) => {
           recoveryToken: firstAttempt.registered.recoveryToken,
           newSubscription: webPushSubscription("https://push.example/attacker-changed-replay"),
         });
-        const unchangedRegistration = yield* notifications.registerDevice({
-          deviceId: "lost-recovery-response",
-          deviceKind: "web-push",
-          subscription: replacement,
-        });
+        const unchangedRegistration = yield* notifications.registerDevice(
+          {
+            deviceId: "lost-recovery-response",
+            deviceKind: "web-push",
+            subscription: replacement,
+          },
+          { audienceCeiling: "private" },
+        );
         const rotatedAgain = yield* notifications.recoverSubscription({
           oldEndpoint: replacement.endpoint,
           recoveryToken: replayed?.recoveryToken ?? "",
@@ -547,11 +997,14 @@ it.layer(NodeServices.layer)("DeviceNotifications.layer", (it) => {
           })
           .mockResolvedValue({ statusCode: 201, body: "", headers: {} });
         const notifications = yield* DeviceNotifications.DeviceNotifications;
-        const registered = yield* notifications.registerDevice({
-          deviceId: "concurrent-recovery",
-          deviceKind: "web-push",
-          subscription: webPushSubscription("https://push.example/replaced"),
-        });
+        const registered = yield* notifications.registerDevice(
+          {
+            deviceId: "concurrent-recovery",
+            deviceKind: "web-push",
+            subscription: webPushSubscription("https://push.example/replaced"),
+          },
+          { audienceCeiling: "private" },
+        );
 
         const inFlightNotify = yield* notifications
           .notify({ title: "Send through the old subscription" })
@@ -596,11 +1049,14 @@ it.layer(NodeServices.layer)("DeviceNotifications.layer", (it) => {
 
       const recovered = yield* Effect.gen(function* () {
         const notifications = yield* DeviceNotifications.DeviceNotifications;
-        const registered = yield* notifications.registerDevice({
-          deviceId: "expired-past-ttl",
-          deviceKind: "web-push",
-          subscription: webPushSubscription("https://push.example/old"),
-        });
+        const registered = yield* notifications.registerDevice(
+          {
+            deviceId: "expired-past-ttl",
+            deviceKind: "web-push",
+            subscription: webPushSubscription("https://push.example/old"),
+          },
+          { audienceCeiling: "private" },
+        );
         yield* notifications.notify({ title: "Expire this device" });
         yield* TestClock.adjust("720 hours");
         yield* TestClock.adjust("1 millis");
@@ -646,18 +1102,21 @@ it.layer(NodeServices.layer)("DeviceNotifications.layer", (it) => {
 
       const result = yield* Effect.gen(function* () {
         const notifications = yield* DeviceNotifications.DeviceNotifications;
-        yield* notifications.registerDevice({
-          deviceId: "stale-web-push",
-          deviceKind: "web-push",
-          subscription: {
-            endpoint: "https://push.example/device",
-            expirationTime: null,
-            keys: {
-              p256dh: "p256dh",
-              auth: "auth",
+        yield* notifications.registerDevice(
+          {
+            deviceId: "stale-web-push",
+            deviceKind: "web-push",
+            subscription: {
+              endpoint: "https://push.example/device",
+              expirationTime: null,
+              keys: {
+                p256dh: "p256dh",
+                auth: "auth",
+              },
             },
           },
-        });
+          { audienceCeiling: "private" },
+        );
         yield* fs.remove(storePath);
         yield* fs.makeDirectory(storePath);
         const notification = yield* notifications.notify({
@@ -736,11 +1195,14 @@ it.layer(NodeServices.layer)("DeviceNotifications.layer", (it) => {
       const notifications = yield* DeviceNotifications.DeviceNotifications;
 
       const exit = yield* notifications
-        .registerDevice({
-          deviceId: "web-1",
-          deviceKind: "web-push",
-          subscription: webPushSubscription(),
-        })
+        .registerDevice(
+          {
+            deviceId: "web-1",
+            deviceKind: "web-push",
+            subscription: webPushSubscription(),
+          },
+          { audienceCeiling: "private" },
+        )
         .pipe(Effect.exit);
       const result = yield* notifications.notify({ title: "Should not deliver" });
 
@@ -766,11 +1228,14 @@ it.layer(NodeServices.layer)("DeviceNotifications.layer", (it) => {
         .mockResolvedValue({ statusCode: 201, body: "", headers: {} });
       const notifications = yield* DeviceNotifications.DeviceNotifications;
 
-      yield* notifications.registerDevice({
-        deviceId: "web-1",
-        deviceKind: "web-push",
-        subscription: webPushSubscription(),
-      });
+      yield* notifications.registerDevice(
+        {
+          deviceId: "web-1",
+          deviceKind: "web-push",
+          subscription: webPushSubscription(),
+        },
+        { audienceCeiling: "private" },
+      );
       const result = yield* notifications.notify({ title: "Blocked by send guard" });
 
       assert.equal(result.deliveredDevices, 0);
@@ -784,12 +1249,15 @@ it.layer(NodeServices.layer)("DeviceNotifications.layer", (it) => {
 
       const result = yield* Effect.gen(function* () {
         const notifications = yield* DeviceNotifications.DeviceNotifications;
-        yield* notifications.registerDevice({
-          deviceId: "web-push-post",
-          deviceKind: "web-push",
-          ackUrl: "https://app.example.test/api/notifications/ack",
-          subscription: webPushSubscription(mockPush.endpoint),
-        });
+        yield* notifications.registerDevice(
+          {
+            deviceId: "web-push-post",
+            deviceKind: "web-push",
+            ackUrl: "https://app.example.test/api/notifications/ack",
+            subscription: webPushSubscription(mockPush.endpoint),
+          },
+          { audienceCeiling: "private" },
+        );
         return yield* notifications.notify({
           title: "Accepted POST",
           body: "This should reach the mock push service.",
@@ -818,13 +1286,16 @@ it.layer(NodeServices.layer)("DeviceNotifications.layer", (it) => {
         .mockResolvedValue({ statusCode: 201, body: "", headers: {} });
       const notifications = yield* DeviceNotifications.DeviceNotifications;
 
-      yield* notifications.registerDevice({
-        deviceId: "web-1",
-        deviceKind: "web-push",
-        subscription: webPushSubscription(
-          "https://updates.push.services.mozilla.com/wpush/v2/test",
-        ),
-      });
+      yield* notifications.registerDevice(
+        {
+          deviceId: "web-1",
+          deviceKind: "web-push",
+          subscription: webPushSubscription(
+            "https://updates.push.services.mozilla.com/wpush/v2/test",
+          ),
+        },
+        { audienceCeiling: "private" },
+      );
       const result = yield* notifications.notify({ title: "Delivered" });
 
       assert.equal(result.deliveredDevices, 1);

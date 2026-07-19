@@ -22,6 +22,7 @@ import {
   failEnvironmentInternal,
   failEnvironmentInvalidRequest,
   failEnvironmentNotFound,
+  failEnvironmentScopeRequired,
   requireEnvironmentScope,
 } from "../auth/http.ts";
 import { OrchestrationEngineService } from "./Services/OrchestrationEngine.ts";
@@ -117,7 +118,30 @@ export const orchestrationHttpApiLayer = HttpApiBuilder.group(
         "threadRevision",
         Effect.fn("environment.orchestration.threadRevision")(function* (args) {
           yield* annotateEnvironmentRequest(args.endpoint.name);
-          yield* requireEnvironmentScope(AuthOrchestrationReadScope);
+          const session = yield* requireEnvironmentScope(AuthOrchestrationReadScope);
+          if (session.audienceCeiling === "factory") {
+            return yield* failEnvironmentScopeRequired(AuthOrchestrationReadScope);
+          }
+          const threadSnapshot = yield* projectionSnapshotQuery
+            .getThreadShellSnapshotByIdIncludingArchived(args.params.threadId)
+            .pipe(
+              Effect.catch((cause) =>
+                failEnvironmentInternal("orchestration_thread_revision_failed", cause),
+              ),
+            );
+          if (Option.isNone(threadSnapshot.thread)) {
+            const latestStoreSequence = yield* orchestrationEventStore
+              .getLatestSequence()
+              .pipe(
+                Effect.catch((cause) =>
+                  failEnvironmentInternal("orchestration_thread_revision_failed", cause),
+                ),
+              );
+            if (threadSnapshot.snapshotSequence < latestStoreSequence) {
+              return yield* failEnvironmentInternal("orchestration_thread_revision_failed");
+            }
+            return yield* failEnvironmentNotFound("thread_not_found");
+          }
           const revision = yield* Effect.all({
             latest: orchestrationEventStore.getLatestThreadRevision(args.params.threadId),
             projection: projectionSnapshotQuery.getSnapshotSequence(),

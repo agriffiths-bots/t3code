@@ -2,7 +2,9 @@
  * ProjectionSnapshotQuery - Read-model snapshot query service interface.
  *
  * Exposes the current orchestration projection snapshot for read-only API
- * access.
+ * access. When an authenticated request principal is present, project/thread
+ * reads are narrowed to that session's audience ceiling at the live service
+ * boundary. Internal callers without a principal retain the unrestricted view.
  *
  * @module ProjectionSnapshotQuery
  */
@@ -35,6 +37,11 @@ export interface ProjectionSnapshotSequence {
   readonly snapshotSequence: number;
 }
 
+export interface ProjectionThreadShellSnapshot {
+  readonly snapshotSequence: number;
+  readonly thread: Option.Option<OrchestrationThreadShell>;
+}
+
 export interface ProjectionThreadCheckpointContext {
   readonly threadId: ThreadId;
   readonly projectId: ProjectId;
@@ -57,13 +64,33 @@ export interface ProjectionFullThreadDiffContext {
   readonly toCheckpointRef: CheckpointRef | null;
 }
 
+export interface ProjectionEventAggregateRef {
+  readonly aggregateKind: "project" | "thread";
+  readonly aggregateId: ProjectId | ThreadId;
+}
+
 /**
  * ProjectionSnapshotQueryShape - Service API for read-model snapshots.
  */
 export interface ProjectionSnapshotQueryShape {
   /**
+   * Resolve whether the current authenticated principal may observe an event
+   * aggregate. Deleted projection rows remain classifiable so replayed
+   * tombstones can be delivered without exposing cross-audience ids. Missing
+   * projection rows fail closed.
+   *
+   * Optional only for narrow test doubles created before the event delivery
+   * guard; production delivery treats an absent implementation as invisible.
+   */
+  readonly canReadEventAggregate?: (
+    input: ProjectionEventAggregateRef,
+  ) => Effect.Effect<boolean, ProjectionRepositoryError>;
+
+  /**
    * Read the lightweight command snapshot used to bootstrap the in-memory
    * orchestration engine without hydrating message/activity/checkpoint bodies.
+   * This is deliberately an internal, unscoped command model; it must not be
+   * exposed as a client read query.
    */
   readonly getCommandReadModel: () => Effect.Effect<
     OrchestrationReadModel,
@@ -169,6 +196,15 @@ export interface ProjectionSnapshotQueryShape {
   readonly getThreadShellByIdIncludingArchived: (
     threadId: ThreadId,
   ) => Effect.Effect<Option.Option<OrchestrationThreadShell>, ProjectionRepositoryError>;
+
+  /**
+   * Read a single non-deleted thread shell and the projection snapshot sequence
+   * from one consistent transaction. The thread remains audience-scoped, while
+   * the sequence is the global projection watermark.
+   */
+  readonly getThreadShellSnapshotByIdIncludingArchived: (
+    threadId: ThreadId,
+  ) => Effect.Effect<ProjectionThreadShellSnapshot, ProjectionRepositoryError>;
 
   /**
    * Read a single non-deleted thread detail snapshot by id. Archived threads are

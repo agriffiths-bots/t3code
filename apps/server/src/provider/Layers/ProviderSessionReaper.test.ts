@@ -326,6 +326,7 @@ describe("ProviderSessionReaper", () => {
           getThreadShellById: (threadId) => Effect.sync(() => getThreadShell(threadId)),
           getThreadShellByIdIncludingArchived: (threadId) =>
             Effect.sync(() => getThreadShell(threadId)),
+          getThreadShellSnapshotByIdIncludingArchived: () => Effect.die("unused"),
           getThreadDetailById: () => Effect.die("unused"),
           getThreadDetailSnapshot: () => Effect.die("unused"),
         }),

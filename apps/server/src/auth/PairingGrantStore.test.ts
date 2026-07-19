@@ -226,6 +226,7 @@ it.layer(NodeServices.layer)("PairingGrantStore.layer", (it) => {
         "factory",
       );
       expect(activeBeforeRevoke.find((entry) => entry.id === second.id)?.scopes).toEqual([
+        "orchestration:read",
         "relay:read",
       ]);
 
@@ -247,7 +248,7 @@ it.layer(NodeServices.layer)("PairingGrantStore.layer", (it) => {
       const error = yield* bootstrapCredentials
         .issueOneTimeToken({
           audienceCeiling: "factory",
-          scopes: ["orchestration:read", "access:write"],
+          scopes: ["orchestration:operate", "access:write"],
         })
         .pipe(Effect.flip);
       const active = yield* bootstrapCredentials.listActive();

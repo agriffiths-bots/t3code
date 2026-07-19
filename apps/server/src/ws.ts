@@ -27,7 +27,6 @@ import {
   NonNegativeInt,
   OrchestrationDispatchCommandError,
   type OrchestrationEvent,
-  type OrchestrationShellStreamEvent,
   type OrchestrationShellStreamItem,
   type OrchestrationThreadStreamItem,
   OrchestrationGetFullThreadDiffError,
@@ -51,6 +50,7 @@ import {
   AssetWorkspaceContextNotFoundError,
   AssetWorkspaceContextResolutionError,
   EnvironmentAuthorizationError,
+  EnvironmentAuthenticatedPrincipal,
   ThreadId,
   type TerminalAttachStreamEvent,
   type TerminalError,
@@ -74,6 +74,7 @@ import {
 import { sessionDispatchAuthority } from "./orchestration/commandAudienceGuard.ts";
 import * as OrchestrationEngine from "./orchestration/Services/OrchestrationEngine.ts";
 import * as ProjectionSnapshotQuery from "./orchestration/Services/ProjectionSnapshotQuery.ts";
+import { scopeScheduledTaskStreamForAudience } from "./orchestration/scheduledTaskAudienceStream.ts";
 import { coveredThreadRevision } from "./orchestration/threadRevision.ts";
 import { ScheduledTaskRepository, toScheduleEntry } from "./persistence/Services/ScheduledTasks.ts";
 import { OrchestrationEventStore } from "./persistence/Services/OrchestrationEventStore.ts";
@@ -103,6 +104,10 @@ import * as RepositoryIdentityResolver from "./project/RepositoryIdentityResolve
 import * as BootstrapTurnStartDispatcher from "./orchestration/Services/BootstrapTurnStartDispatcher.ts";
 import * as ServerEnvironment from "./environment/ServerEnvironment.ts";
 import * as EnvironmentAuth from "./auth/EnvironmentAuth.ts";
+import {
+  isAudienceScopedReadRpcMethod,
+  isRpcMethodAllowedForAudienceCeiling,
+} from "./auth/audienceScopePolicy.ts";
 import * as ProcessDiagnostics from "./diagnostics/ProcessDiagnostics.ts";
 import * as ProcessResourceMonitor from "./diagnostics/ProcessResourceMonitor.ts";
 import * as TraceDiagnostics from "./diagnostics/TraceDiagnostics.ts";
@@ -125,12 +130,12 @@ import * as RelayClient from "@t3tools/shared/relayClient";
 import { makeServerConfigHeartbeatStream, shouldSendServerConfigHeartbeat } from "./wsKeepalive.ts";
 const isOrchestrationDispatchCommandError = Schema.is(OrchestrationDispatchCommandError);
 const isOrchestrationGetSnapshotError = Schema.is(OrchestrationGetSnapshotError);
+const isOrchestrationReplayEventsError = Schema.is(OrchestrationReplayEventsError);
 const isOrchestrationScheduledTaskMutationError = Schema.is(
   OrchestrationScheduledTaskMutationError,
 );
 
 const SHELL_REPLAY_SNAPSHOT_GAP_THRESHOLD = 1_000;
-
 function unexpectedCompatibilityError(error: never): never {
   throw new Error(`Unhandled compatibility error: ${String(error)}`);
 }
@@ -296,7 +301,7 @@ const RPC_REQUIRED_SCOPE = new Map<string, AuthEnvironmentScope>([
   [WS_METHODS.serverSignalProcess, AuthOrchestrationOperateScope],
   [WS_METHODS.serverGetNotificationConfig, AuthOrchestrationReadScope],
   [WS_METHODS.serverRegisterNotificationDevice, AuthOrchestrationOperateScope],
-  [WS_METHODS.serverAckNotification, AuthOrchestrationOperateScope],
+  [WS_METHODS.serverAckNotification, AuthOrchestrationReadScope],
   [WS_METHODS.cloudGetRelayClientStatus, AuthRelayWriteScope],
   [WS_METHODS.cloudInstallRelayClient, AuthRelayWriteScope],
   [WS_METHODS.sourceControlLookupRepository, AuthOrchestrationReadScope],
@@ -342,7 +347,7 @@ const RPC_REQUIRED_SCOPE = new Map<string, AuthEnvironmentScope>([
   [WS_METHODS.subscribeDiscoveredLocalServers, AuthOrchestrationReadScope],
   [WS_METHODS.subscribeServerConfig, AuthOrchestrationReadScope],
   [WS_METHODS.subscribeServerLifecycle, AuthOrchestrationReadScope],
-  [WS_METHODS.subscribeNotificationEvents, AuthOrchestrationOperateScope],
+  [WS_METHODS.subscribeNotificationEvents, AuthOrchestrationReadScope],
   [WS_METHODS.subscribeAuthAccess, AuthAccessReadScope],
 ]);
 
@@ -435,25 +440,35 @@ const makeWsRpcLayer = (currentSession: EnvironmentAuth.AuthenticatedSession) =>
       const processResourceMonitor = yield* ProcessResourceMonitor.ProcessResourceMonitor;
       const deviceNotifications = yield* DeviceNotifications.DeviceNotifications;
       const relayClient = yield* RelayClient.RelayClient;
-      const authorizationError = (requiredScope: AuthEnvironmentScope) =>
+      const authenticatedPrincipal = {
+        ...currentSession,
+        scopes: new Set(currentSession.scopes),
+      };
+      const authorizationError = (requiredScope: AuthEnvironmentScope, method: string) =>
         new EnvironmentAuthorizationError({
-          message: `The authenticated token is missing required scope: ${requiredScope}.`,
+          message: currentSession.scopes.includes(requiredScope)
+            ? `RPC method ${method} is unavailable for the authenticated audience ceiling.`
+            : `The authenticated token is missing required scope: ${requiredScope}.`,
           requiredScope,
         });
       const authorizeEffect = <A, E, R>(
+        method: string,
         requiredScope: AuthEnvironmentScope,
         effect: Effect.Effect<A, E, R>,
       ): Effect.Effect<A, E | EnvironmentAuthorizationError, R> =>
-        currentSession.scopes.includes(requiredScope)
+        currentSession.scopes.includes(requiredScope) &&
+        isRpcMethodAllowedForAudienceCeiling(method, requiredScope, currentSession.audienceCeiling)
           ? effect
-          : Effect.fail(authorizationError(requiredScope));
+          : Effect.fail(authorizationError(requiredScope, method));
       const authorizeStream = <A, E, R>(
+        method: string,
         requiredScope: AuthEnvironmentScope,
         stream: Stream.Stream<A, E, R>,
       ): Stream.Stream<A, E | EnvironmentAuthorizationError, R> =>
-        currentSession.scopes.includes(requiredScope)
+        currentSession.scopes.includes(requiredScope) &&
+        isRpcMethodAllowedForAudienceCeiling(method, requiredScope, currentSession.audienceCeiling)
           ? stream
-          : Stream.fail(authorizationError(requiredScope));
+          : Stream.fail(authorizationError(requiredScope, method));
       const requiredScopeForMethod = (method: string): AuthEnvironmentScope => {
         const requiredScope = RPC_REQUIRED_SCOPE.get(method);
         if (requiredScope === undefined) {
@@ -465,22 +480,34 @@ const makeWsRpcLayer = (currentSession: EnvironmentAuth.AuthenticatedSession) =>
         method: string,
         effect: Effect.Effect<A, E, R>,
         traceAttributes?: Readonly<Record<string, unknown>>,
-      ) =>
-        instrumentRpcEffect(
+      ) => {
+        const audienceScopedEffect = isAudienceScopedReadRpcMethod(method)
+          ? effect.pipe(
+              Effect.provideService(EnvironmentAuthenticatedPrincipal, authenticatedPrincipal),
+            )
+          : effect;
+        return instrumentRpcEffect(
           method,
-          authorizeEffect(requiredScopeForMethod(method), effect),
+          authorizeEffect(method, requiredScopeForMethod(method), audienceScopedEffect),
           traceAttributes,
         );
+      };
       const observeRpcStream = <A, E, R>(
         method: string,
         stream: Stream.Stream<A, E, R>,
         traceAttributes?: Readonly<Record<string, unknown>>,
-      ) =>
-        instrumentRpcStream(
+      ) => {
+        const audienceScopedStream = isAudienceScopedReadRpcMethod(method)
+          ? stream.pipe(
+              Stream.provideService(EnvironmentAuthenticatedPrincipal, authenticatedPrincipal),
+            )
+          : stream;
+        return instrumentRpcStream(
           method,
-          authorizeStream(requiredScopeForMethod(method), stream),
+          authorizeStream(method, requiredScopeForMethod(method), audienceScopedStream),
           traceAttributes,
         );
+      };
       const observeRpcStreamEffect = <A, StreamError, StreamContext, EffectError, EffectContext>(
         method: string,
         effect: Effect.Effect<
@@ -489,12 +516,23 @@ const makeWsRpcLayer = (currentSession: EnvironmentAuth.AuthenticatedSession) =>
           EffectContext
         >,
         traceAttributes?: Readonly<Record<string, unknown>>,
-      ) =>
-        instrumentRpcStreamEffect(
+      ) => {
+        const audienceScopedEffect = isAudienceScopedReadRpcMethod(method)
+          ? effect.pipe(
+              Effect.provideService(EnvironmentAuthenticatedPrincipal, authenticatedPrincipal),
+              Effect.map((stream) =>
+                stream.pipe(
+                  Stream.provideService(EnvironmentAuthenticatedPrincipal, authenticatedPrincipal),
+                ),
+              ),
+            )
+          : effect;
+        return instrumentRpcStreamEffect(
           method,
-          authorizeEffect(requiredScopeForMethod(method), effect),
+          authorizeEffect(method, requiredScopeForMethod(method), audienceScopedEffect),
           traceAttributes,
         );
+      };
       const toDispatchCommandError = (cause: unknown, fallbackMessage: string) =>
         isOrchestrationDispatchCommandError(cause)
           ? cause
@@ -514,6 +552,15 @@ const makeWsRpcLayer = (currentSession: EnvironmentAuth.AuthenticatedSession) =>
               }),
           ),
         );
+
+      const requireAudienceOpaqueEventCursor = <E>(makeError: (message: string) => E) =>
+        currentSession.audienceCeiling === "factory"
+          ? Effect.fail(
+              makeError(
+                "Audience-scoped event cursors are unavailable for restricted-audience sessions",
+              ),
+            )
+          : Effect.void;
 
       const enrichProjectEvent = (
         event: OrchestrationEvent,
@@ -562,17 +609,38 @@ const makeWsRpcLayer = (currentSession: EnvironmentAuth.AuthenticatedSession) =>
       const enrichOrchestrationEvents = (events: ReadonlyArray<OrchestrationEvent>) =>
         Effect.forEach(events, enrichProjectEvent, { concurrency: 4 });
 
+      const canReadAggregate = (input: ProjectionSnapshotQuery.ProjectionEventAggregateRef) =>
+        currentSession.audienceCeiling === "private"
+          ? Effect.succeed(true)
+          : (projectionSnapshotQuery.canReadEventAggregate?.(input) ?? Effect.succeed(false)).pipe(
+              Effect.mapError(
+                (cause) =>
+                  new OrchestrationGetSnapshotError({
+                    message: `Failed to resolve ${input.aggregateKind} event visibility`,
+                    cause,
+                  }),
+              ),
+            );
+
+      const canReadEventAggregate = (event: OrchestrationEvent) =>
+        canReadAggregate({
+          aggregateKind: event.aggregateKind,
+          aggregateId: event.aggregateId,
+        });
+
+      const visibleOrchestrationEvents = <E, R>(stream: Stream.Stream<OrchestrationEvent, E, R>) =>
+        stream.pipe(Stream.filterEffect(canReadEventAggregate));
+
       const toShellStreamEvent = (
         event: OrchestrationEvent,
       ): Effect.Effect<
-        Option.Option<OrchestrationShellStreamEvent>,
+        Option.Option<OrchestrationShellStreamItem>,
         OrchestrationGetSnapshotError,
         never
       > => {
         switch (event.type) {
           case "project.created":
           case "project.meta-updated":
-          case "project.data-audience-set":
             return projectionSnapshotQuery.getProjectShellById(event.payload.projectId).pipe(
               Effect.map((project) =>
                 Option.map(project, (nextProject) => ({
@@ -585,6 +653,41 @@ const makeWsRpcLayer = (currentSession: EnvironmentAuth.AuthenticatedSession) =>
                 (cause) =>
                   new OrchestrationGetSnapshotError({
                     message: "Failed to load orchestration project shell",
+                    cause,
+                  }),
+              ),
+            );
+          case "project.data-audience-set":
+            if (currentSession.audienceCeiling === "private") {
+              return projectionSnapshotQuery.getProjectShellById(event.payload.projectId).pipe(
+                Effect.map((project) =>
+                  Option.map(project, (nextProject) => ({
+                    kind: "project-upserted" as const,
+                    sequence: event.sequence,
+                    project: nextProject,
+                  })),
+                ),
+                Effect.mapError(
+                  (cause) =>
+                    new OrchestrationGetSnapshotError({
+                      message: "Failed to load orchestration project shell",
+                      cause,
+                    }),
+                ),
+              );
+            }
+            return projectionSnapshotQuery.getShellSnapshot().pipe(
+              Effect.map((snapshot) =>
+                Option.some({
+                  kind: "snapshot" as const,
+                  snapshot,
+                  force: true,
+                }),
+              ),
+              Effect.mapError(
+                (cause) =>
+                  new OrchestrationGetSnapshotError({
+                    message: "Failed to refresh orchestration shell after audience promotion",
                     cause,
                   }),
               ),
@@ -795,22 +898,30 @@ const makeWsRpcLayer = (currentSession: EnvironmentAuth.AuthenticatedSession) =>
         [ORCHESTRATION_WS_METHODS.replayEvents]: (input) =>
           observeRpcEffect(
             ORCHESTRATION_WS_METHODS.replayEvents,
-            Stream.runCollect(
-              orchestrationEngine.readEvents(
-                clamp(input.fromSequenceExclusive, {
-                  maximum: Number.MAX_SAFE_INTEGER,
-                  minimum: 0,
-                }),
-              ),
-            ).pipe(
+            Effect.gen(function* () {
+              yield* requireAudienceOpaqueEventCursor(
+                (message) => new OrchestrationReplayEventsError({ message }),
+              );
+              return yield* Stream.runCollect(
+                visibleOrchestrationEvents(
+                  orchestrationEngine.readEvents(
+                    clamp(input.fromSequenceExclusive, {
+                      maximum: Number.MAX_SAFE_INTEGER,
+                      minimum: 0,
+                    }),
+                  ),
+                ),
+              );
+            }).pipe(
               Effect.map((events) => Array.from(events)),
               Effect.flatMap(enrichOrchestrationEvents),
-              Effect.mapError(
-                (cause) =>
-                  new OrchestrationReplayEventsError({
-                    message: "Failed to replay orchestration events",
-                    cause,
-                  }),
+              Effect.mapError((cause) =>
+                isOrchestrationReplayEventsError(cause)
+                  ? cause
+                  : new OrchestrationReplayEventsError({
+                      message: "Failed to replay orchestration events",
+                      cause,
+                    }),
               ),
             ),
             { "rpc.aggregate": "orchestration" },
@@ -819,10 +930,13 @@ const makeWsRpcLayer = (currentSession: EnvironmentAuth.AuthenticatedSession) =>
           observeRpcStreamEffect(
             ORCHESTRATION_WS_METHODS.subscribeShell,
             Effect.gen(function* () {
+              yield* requireAudienceOpaqueEventCursor(
+                (message) => new OrchestrationGetSnapshotError({ message }),
+              );
               const liveStream: Stream.Stream<
                 OrchestrationShellStreamItem,
                 OrchestrationGetSnapshotError
-              > = orchestrationEngine.streamDomainEvents.pipe(
+              > = visibleOrchestrationEvents(orchestrationEngine.streamDomainEvents).pipe(
                 Stream.mapEffect(toShellStreamEvent),
                 Stream.flatMap((event) =>
                   Option.isSome(event) ? Stream.succeed(event.value) : Stream.empty,
@@ -917,22 +1031,22 @@ const makeWsRpcLayer = (currentSession: EnvironmentAuth.AuthenticatedSession) =>
                         liveBufferStream,
                       );
                     }
-                    const catchUpStream = orchestrationEngine
-                      .readEvents(afterSequence, Number.MAX_SAFE_INTEGER)
-                      .pipe(
-                        Stream.mapEffect(toShellStreamEvent),
-                        Stream.flatMap((event) =>
-                          Option.isSome(event) ? Stream.succeed(event.value) : Stream.empty,
-                        ),
-                        Stream.mapError((cause) =>
-                          isOrchestrationGetSnapshotError(cause)
-                            ? cause
-                            : new OrchestrationGetSnapshotError({
-                                message: "Failed to replay orchestration shell events",
-                                cause,
-                              }),
-                        ),
-                      );
+                    const catchUpStream = visibleOrchestrationEvents(
+                      orchestrationEngine.readEvents(afterSequence, Number.MAX_SAFE_INTEGER),
+                    ).pipe(
+                      Stream.mapEffect(toShellStreamEvent),
+                      Stream.flatMap((event) =>
+                        Option.isSome(event) ? Stream.succeed(event.value) : Stream.empty,
+                      ),
+                      Stream.mapError((cause) =>
+                        isOrchestrationGetSnapshotError(cause)
+                          ? cause
+                          : new OrchestrationGetSnapshotError({
+                              message: "Failed to replay orchestration shell events",
+                              cause,
+                            }),
+                      ),
+                    );
                     return Stream.concat(
                       catchUpStream,
                       Stream.concat(
@@ -990,14 +1104,29 @@ const makeWsRpcLayer = (currentSession: EnvironmentAuth.AuthenticatedSession) =>
         [ORCHESTRATION_WS_METHODS.subscribeThread]: (input) =>
           observeRpcStreamEffect(
             ORCHESTRATION_WS_METHODS.subscribeThread,
-            Effect.sync(() => {
+            Effect.gen(function* () {
+              yield* requireAudienceOpaqueEventCursor(
+                (message) => new OrchestrationGetSnapshotError({ message }),
+              );
+              const canReadThread = yield* canReadAggregate({
+                aggregateKind: "thread",
+                aggregateId: input.threadId,
+              });
+              if (!canReadThread) {
+                return yield* new OrchestrationGetSnapshotError({
+                  message: `Thread ${input.threadId} was not found`,
+                  cause: input.threadId,
+                });
+              }
               const isThisThreadDetailEvent = (event: OrchestrationEvent) =>
                 event.aggregateKind === "thread" &&
                 event.aggregateId === input.threadId &&
                 isThreadDetailEvent(event);
               const storageEpoch = orchestrationEventStore.storageEpoch;
 
-              const liveStream = orchestrationEngine.streamDomainEvents.pipe(
+              const liveStream = visibleOrchestrationEvents(
+                orchestrationEngine.streamDomainEvents,
+              ).pipe(
                 Stream.filter(isThisThreadDetailEvent),
                 Stream.map((event) => ({
                   kind: "event" as const,
@@ -1075,23 +1204,26 @@ const makeWsRpcLayer = (currentSession: EnvironmentAuth.AuthenticatedSession) =>
                     ) &&
                     observedIdentityMatches;
                   if (canResumeFromCursor && requestedAfterSequence !== undefined) {
-                    const catchUpStream = orchestrationEngine
-                      .readEvents(requestedAfterSequence, Number.MAX_SAFE_INTEGER)
-                      .pipe(
-                        Stream.filter(isThisThreadDetailEvent),
-                        Stream.map((event) => ({
-                          kind: "event" as const,
-                          storageEpoch,
-                          event,
-                        })),
-                        Stream.mapError(
-                          (cause) =>
-                            new OrchestrationGetSnapshotError({
-                              message: `Failed to replay thread ${input.threadId} events`,
-                              cause,
-                            }),
-                        ),
-                      );
+                    const catchUpStream = visibleOrchestrationEvents(
+                      orchestrationEngine.readEvents(
+                        requestedAfterSequence,
+                        Number.MAX_SAFE_INTEGER,
+                      ),
+                    ).pipe(
+                      Stream.filter(isThisThreadDetailEvent),
+                      Stream.map((event) => ({
+                        kind: "event" as const,
+                        storageEpoch,
+                        event,
+                      })),
+                      Stream.mapError(
+                        (cause) =>
+                          new OrchestrationGetSnapshotError({
+                            message: `Failed to replay thread ${input.threadId} events`,
+                            cause,
+                          }),
+                      ),
+                    );
                     return Stream.concat(catchUpStream, liveBufferStream);
                   }
 
@@ -1196,6 +1328,17 @@ const makeWsRpcLayer = (currentSession: EnvironmentAuth.AuthenticatedSession) =>
             Effect.sync(() => {
               let sequence = 0;
               const loadSnapshot = scheduledTaskRepository.listAll().pipe(
+                Effect.flatMap((tasks) =>
+                  Effect.forEach(
+                    tasks,
+                    (task) =>
+                      canReadAggregate({
+                        aggregateKind: "thread",
+                        aggregateId: task.threadId,
+                      }).pipe(Effect.map((visible) => (visible ? [task] : []))),
+                    { concurrency: 8 },
+                  ).pipe(Effect.map((visible) => visible.flat())),
+                ),
                 Effect.map((tasks) => ({
                   kind: "snapshot" as const,
                   snapshot: {
@@ -1215,9 +1358,21 @@ const makeWsRpcLayer = (currentSession: EnvironmentAuth.AuthenticatedSession) =>
                 ),
               );
 
-              return scheduledTaskRepository.revisionChanges.pipe(
-                Stream.mapEffect(() => loadSnapshot),
-              );
+              const refreshes =
+                currentSession.audienceCeiling === "factory"
+                  ? Stream.merge(
+                      scheduledTaskRepository.revisionChanges,
+                      orchestrationEngine.streamDomainEvents.pipe(
+                        Stream.filter((event) => event.type === "project.data-audience-set"),
+                        Stream.map(() => 0),
+                      ),
+                    )
+                  : scheduledTaskRepository.revisionChanges;
+
+              const snapshots = refreshes.pipe(Stream.mapEffect(() => loadSnapshot));
+              return currentSession.audienceCeiling === "factory"
+                ? scopeScheduledTaskStreamForAudience(snapshots)
+                : snapshots;
             }),
             { "rpc.aggregate": "orchestration" },
           ),
@@ -1352,7 +1507,9 @@ const makeWsRpcLayer = (currentSession: EnvironmentAuth.AuthenticatedSession) =>
         [WS_METHODS.serverRegisterNotificationDevice]: (input) =>
           observeRpcEffect(
             WS_METHODS.serverRegisterNotificationDevice,
-            deviceNotifications.registerDevice(input),
+            deviceNotifications.registerDevice(input, {
+              audienceCeiling: currentSession.audienceCeiling,
+            }),
             {
               "rpc.aggregate": "server",
             },
@@ -1360,7 +1517,9 @@ const makeWsRpcLayer = (currentSession: EnvironmentAuth.AuthenticatedSession) =>
         [WS_METHODS.serverAckNotification]: (input) =>
           observeRpcEffect(
             WS_METHODS.serverAckNotification,
-            deviceNotifications.ackNotification(input),
+            deviceNotifications.ackNotification(input, {
+              audienceCeiling: currentSession.audienceCeiling,
+            }),
             {
               "rpc.aggregate": "server",
             },
@@ -1856,9 +2015,13 @@ const makeWsRpcLayer = (currentSession: EnvironmentAuth.AuthenticatedSession) =>
             { "rpc.aggregate": "server" },
           ),
         [WS_METHODS.subscribeNotificationEvents]: (_input) =>
-          observeRpcStream(WS_METHODS.subscribeNotificationEvents, deviceNotifications.events, {
-            "rpc.aggregate": "server",
-          }),
+          observeRpcStream(
+            WS_METHODS.subscribeNotificationEvents,
+            deviceNotifications.eventsForAudience(currentSession.audienceCeiling),
+            {
+              "rpc.aggregate": "server",
+            },
+          ),
         [WS_METHODS.subscribeAuthAccess]: (_input) =>
           observeRpcStreamEffect(
             WS_METHODS.subscribeAuthAccess,

@@ -227,6 +227,11 @@ function formatThreadError(cause: Cause.Cause<unknown>): string {
     : "Could not synchronize the thread.";
 }
 
+function shouldPersistThread(thread: OrchestrationThread): boolean {
+  const status = thread.session?.status;
+  return status !== "starting" && status !== "running";
+}
+
 export const makeEnvironmentThreadState = Effect.fn("EnvironmentThreadState.make")(function* (
   threadId: ThreadIdType,
   options?: EnvironmentThreadStateOptions,
@@ -392,11 +397,15 @@ export const makeEnvironmentThreadState = Effect.fn("EnvironmentThreadState.make
     Effect.forkScoped,
   );
 
-  const setSynchronizing = SubscriptionRef.update(state, (current) => ({
-    ...current,
-    status: "synchronizing" as const,
-    error: Option.none(),
-  }));
+  const setSynchronizing = SubscriptionRef.update(state, (current) =>
+    current.status === "deleted"
+      ? current
+      : {
+          ...current,
+          status: "synchronizing" as const,
+          error: Option.none(),
+        },
+  );
   const setReady = SubscriptionRef.update(state, (current) =>
     current.status === "live" || current.status === "deleted"
       ? current
@@ -427,15 +436,28 @@ export const makeEnvironmentThreadState = Effect.fn("EnvironmentThreadState.make
       yield* setDeleted();
       return;
     }
+    const updated = yield* SubscriptionRef.updateAndGet(state, (current) =>
+      current.status === "deleted"
+        ? current
+        : {
+            data: Option.some(thread),
+            status: "live" as const,
+            error: Option.none(),
+          },
+    );
+    if (updated.status === "deleted") {
+      return;
+    }
     subscribeInput.observedDataAudience = thread.dataAudience;
-    yield* SubscriptionRef.set(state, {
-      data: Option.some(thread),
-      status: "live",
-      error: Option.none(),
-    });
     // Persist the thread together with the sequence it reflects so the next warm
     // cache can resume from exactly here.
     if (options?.persist === false) {
+      return;
+    }
+    // Active threads can update many times per second and retain large tool
+    // payloads. The server remains the source of truth while a turn is active;
+    // persist once it settles so cache encoding stays off the streaming path.
+    if (!shouldPersistThread(thread)) {
       return;
     }
     const snapshotSequence = yield* SubscriptionRef.get(lastSequence);
@@ -601,6 +623,9 @@ export const makeEnvironmentThreadState = Effect.fn("EnvironmentThreadState.make
   ) {
     const sequence = yield* SubscriptionRef.get(lastSequence);
     const current = yield* SubscriptionRef.get(state);
+    if (current.status === "deleted") {
+      return false;
+    }
     const olderSequence = snapshot.snapshotSequence < sequence;
     const olderReconcileSnapshot = olderSequence && options?.mergeNonAdvancingSnapshot === true;
     // A snapshot taken before the last applied revert may still contain the
@@ -636,11 +661,15 @@ export const makeEnvironmentThreadState = Effect.fn("EnvironmentThreadState.make
       threadProjectionMatches(current.data.value, thread)
     ) {
       if (current.status !== "live") {
-        yield* SubscriptionRef.set(state, {
-          ...current,
-          status: "live",
-          error: Option.none(),
-        });
+        yield* SubscriptionRef.update(state, (latest) =>
+          latest.status === "deleted"
+            ? latest
+            : {
+                ...latest,
+                status: "live" as const,
+                error: Option.none(),
+              },
+        );
         yield* markThreadRecentlyActive(options?.activityReason ?? "recovery-snapshot");
       }
       return true;
@@ -680,6 +709,9 @@ export const makeEnvironmentThreadState = Effect.fn("EnvironmentThreadState.make
   const applyItemLocked = Effect.fn("EnvironmentThreadState.applyItemLocked")(function* (
     item: OrchestrationThreadStreamItem,
   ) {
+    if ((yield* SubscriptionRef.get(state)).status === "deleted") {
+      return;
+    }
     const storageEpoch = yield* Ref.get(currentStorageEpoch);
     const itemStorageEpoch = Option.fromNullishOr(item.storageEpoch);
     const storageEpochChanged = Option.match(itemStorageEpoch, {
@@ -963,6 +995,24 @@ export const makeEnvironmentThreadState = Effect.fn("EnvironmentThreadState.make
     },
   );
 
+  const reconcileGoneThread = Effect.fn("EnvironmentThreadState.reconcileGoneThread")(function* () {
+    yield* Effect.logWarning(
+      "Thread revision endpoint reported the thread gone; removing cached detail.",
+    ).pipe(
+      Effect.annotateLogs({
+        environmentId,
+        threadId,
+        reconciliationReason: "revision-not-found",
+      }),
+    );
+    yield* setDeleted();
+    yield* Effect.all([
+      Ref.set(pendingRevision, 0),
+      Ref.set(observedRevisionEventId, undefined),
+      Ref.set(authoritativeResetPending, false),
+    ]);
+  });
+
   const checkThreadRevision = Effect.fn("EnvironmentThreadState.checkThreadRevision")(function* () {
     const prepared = yield* SubscriptionRef.get(supervisor.prepared);
     if (Option.isNone(prepared)) {
@@ -970,6 +1020,25 @@ export const makeEnvironmentThreadState = Effect.fn("EnvironmentThreadState.make
     }
     const result = yield* revisionLoader.load(prepared.value, threadId);
     yield* Ref.set(revisionCheckUnresolved, result.kind === "unavailable");
+    if (result.kind === "gone") {
+      yield* applyLock.withPermit(reconcileGoneThread());
+      return;
+    }
+    if (result.kind === "snapshot-required") {
+      const reconciliation = yield* reconcileFromProjection(0, null, 0);
+      if (reconciliation.kind === "recovered") {
+        yield* Ref.set(revisionCheckUnresolved, false);
+        yield* acknowledgeSnapshotRevision(
+          reconciliation.recoveredThroughSequence,
+          reconciliation.recoveredThroughEventId,
+        );
+        yield* recordUnchangedRevision({ latestSequence: null, responseBytes: 0 });
+        return;
+      }
+      yield* Ref.set(revisionCheckUnresolved, true);
+      yield* recordUnchangedRevision({ latestSequence: null, responseBytes: 0 });
+      return;
+    }
     let [
       verifiedRevision,
       currentPendingRevision,
@@ -1302,7 +1371,8 @@ export const makeEnvironmentThreadState = Effect.fn("EnvironmentThreadState.make
       Effect.flatMap(([current, snapshotSequence]) =>
         Option.match(current.data, {
           onNone: () => Effect.void,
-          onSome: (thread) => persist({ snapshotSequence, thread }),
+          onSome: (thread) =>
+            shouldPersistThread(thread) ? persist({ snapshotSequence, thread }) : Effect.void,
         }),
       ),
     ),

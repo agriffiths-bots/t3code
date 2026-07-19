@@ -20,6 +20,7 @@ import {
   ThreadId,
   type ModelSelection,
   type OrchestrationThread,
+  type OrchestrationThreadShell,
   type ProviderInstanceId,
 } from "@t3tools/contracts";
 import {
@@ -49,6 +50,7 @@ import type {
 import { dispatchActive } from "../../../orchestration/Services/BootstrapTurnStartDispatcher.ts";
 import { OrchestrationEngineService } from "../../../orchestration/Services/OrchestrationEngine.ts";
 import { ProjectionSnapshotQuery } from "../../../orchestration/Services/ProjectionSnapshotQuery.ts";
+import { canReadDataAudience } from "../../../auth/audienceDataPolicy.ts";
 import {
   ScheduledTaskRepository,
   toScheduleEntry,
@@ -341,6 +343,46 @@ const loadThreadShell = (runtime: SubagentRuntime, threadId: ThreadId) =>
   runtime.projectionSnapshotQuery
     .getThreadShellById(threadId)
     .pipe(Effect.mapError((error) => toToolError(error, "Failed to load thread.")));
+
+const loadThreadShellIncludingArchived = (runtime: SubagentRuntime, threadId: ThreadId) =>
+  runtime.projectionSnapshotQuery
+    .getThreadShellByIdIncludingArchived(threadId)
+    .pipe(Effect.mapError((error) => toToolError(error, "Failed to load thread.")));
+
+const loadProviderSourceThread = Effect.fn("SubagentToolkit.loadProviderSourceThread")(function* (
+  runtime: SubagentRuntime,
+  invocation: McpInvocationContext.ProviderMcpInvocationScope,
+) {
+  return yield* loadThreadShellIncludingArchived(runtime, invocation.threadId).pipe(
+    Effect.flatMap(
+      Option.match({
+        onNone: () => Effect.fail(fail(`Thread ${invocation.threadId} was not found.`)),
+        onSome: Effect.succeed,
+      }),
+    ),
+  );
+});
+
+const loadAudienceVisibleTargetThread = Effect.fn(
+  "SubagentToolkit.loadAudienceVisibleTargetThread",
+)(function* (
+  runtime: SubagentRuntime,
+  sourceThread: OrchestrationThreadShell,
+  targetThreadId: ThreadId,
+  notFoundMessage: string,
+  options?: { readonly includingArchived?: boolean },
+) {
+  const targetThread = yield* options?.includingArchived === true
+    ? loadThreadShellIncludingArchived(runtime, targetThreadId)
+    : loadThreadShell(runtime, targetThreadId);
+  if (
+    Option.isNone(targetThread) ||
+    !canReadDataAudience(sourceThread.dataAudience, targetThread.value.dataAudience)
+  ) {
+    return yield* fail(notFoundMessage);
+  }
+  return targetThread.value;
+});
 
 const requirePeerChildAccess = (
   runtime: SubagentRuntime,
@@ -1163,25 +1205,15 @@ const steerSubagent = Effect.fn("SubagentToolkit.steer")(function* (input: Steer
   const runtime = yield* requireRuntime();
   const coordinator = yield* requireCoordinator();
 
+  const sourceThread = yield* loadProviderSourceThread(runtime, invocation);
+  const child = yield* loadAudienceVisibleTargetThread(
+    runtime,
+    sourceThread,
+    input.childThreadId,
+    `Sub-agent ${input.childThreadId} was not found.`,
+  );
+
   yield* coordinator.assertParent(invocation.threadId, input.childThreadId);
-
-  const source = yield* loadThreadShell(runtime, invocation.threadId).pipe(
-    Effect.flatMap(
-      Option.match({
-        onNone: () => Effect.fail(fail(`Source thread ${invocation.threadId} was not found.`)),
-        onSome: Effect.succeed,
-      }),
-    ),
-  );
-
-  const child = yield* loadThreadShell(runtime, input.childThreadId).pipe(
-    Effect.flatMap((shell) =>
-      Option.match(shell, {
-        onNone: () => Effect.fail(fail(`Sub-agent ${input.childThreadId} was not found.`)),
-        onSome: Effect.succeed,
-      }),
-    ),
-  );
 
   // R-C: pick a provider-safe mechanism from the child's turn state + driver.
   // An idle child is steered now; a mid-turn child dispatches now for every known
@@ -1237,7 +1269,7 @@ const steerSubagent = Effect.fn("SubagentToolkit.steer")(function* (input: Steer
       bootstrap: undefined,
       createdAt,
     },
-    providerThreadAuthority(source),
+    providerThreadAuthority(sourceThread),
   ).pipe(Effect.mapError((error) => toToolError(error, "Failed to steer sub-agent.")));
 
   return {
@@ -1498,13 +1530,12 @@ const scheduleCreate = Effect.fn("SubagentToolkit.scheduleCreate")(function* (
   const intervalSeconds = input.intervalSeconds ?? null;
   if (cronExpr !== null) yield* validateCron(cronExpr, timezone);
 
-  const shell = yield* loadThreadShell(runtime, threadId).pipe(
-    Effect.flatMap((shellOption) =>
-      Option.match(shellOption, {
-        onNone: () => Effect.fail(fail(`Thread ${threadId} was not found.`)),
-        onSome: Effect.succeed,
-      }),
-    ),
+  const sourceThread = yield* loadProviderSourceThread(runtime, invocation);
+  const shell = yield* loadAudienceVisibleTargetThread(
+    runtime,
+    sourceThread,
+    threadId,
+    `Thread ${threadId} was not found.`,
   );
 
   // Resolve an explicit plain `model` to a full selection (provider/harness
@@ -1551,8 +1582,10 @@ const scheduleCreate = Effect.fn("SubagentToolkit.scheduleCreate")(function* (
 const scheduleList = Effect.fn("SubagentToolkit.scheduleList")(function* (
   input: ScheduleListInput,
 ) {
-  yield* requireProviderInvocation;
+  const invocation = yield* requireProviderInvocation;
   const runtime = yield* requireRuntime();
+
+  const sourceThread = yield* loadProviderSourceThread(runtime, invocation);
 
   const tasks = yield* (
     input.threadId !== undefined
@@ -1560,7 +1593,23 @@ const scheduleList = Effect.fn("SubagentToolkit.scheduleList")(function* (
       : runtime.scheduledTasks.listAll()
   ).pipe(Effect.mapError((error) => toToolError(error, "Failed to list scheduled tasks.")));
 
-  return { tasks: tasks.map(toScheduleEntry) };
+  const visibility = yield* Effect.forEach(
+    tasks,
+    (task) =>
+      runtime.projectionSnapshotQuery.getThreadShellByIdIncludingArchived(task.threadId).pipe(
+        Effect.mapError((error) => toToolError(error, "Failed to filter scheduled tasks.")),
+        Effect.map(
+          Option.exists((targetThread) =>
+            canReadDataAudience(sourceThread.dataAudience, targetThread.dataAudience),
+          ),
+        ),
+      ),
+    { concurrency: 8 },
+  );
+
+  return {
+    tasks: tasks.filter((_, index) => visibility[index] === true).map(toScheduleEntry),
+  };
 });
 
 const loadTaskById = (
@@ -1580,10 +1629,18 @@ const loadTaskById = (
 const scheduleUpdate = Effect.fn("SubagentToolkit.scheduleUpdate")(function* (
   input: ScheduleUpdateInput,
 ) {
-  yield* requireProviderInvocation;
+  const invocation = yield* requireProviderInvocation;
   const runtime = yield* requireRuntime();
 
   const existing = yield* loadTaskById(runtime, input.taskId);
+  const sourceThread = yield* loadProviderSourceThread(runtime, invocation);
+  yield* loadAudienceVisibleTargetThread(
+    runtime,
+    sourceThread,
+    existing.threadId,
+    `Scheduled task ${input.taskId} was not found.`,
+    { includingArchived: true },
+  );
 
   const scheduleKind: "interval" | "cron" =
     input.cronExpr !== undefined
@@ -1666,8 +1723,18 @@ const scheduleUpdate = Effect.fn("SubagentToolkit.scheduleUpdate")(function* (
 const scheduleDelete = Effect.fn("SubagentToolkit.scheduleDelete")(function* (
   input: ScheduleDeleteInput,
 ) {
-  yield* requireProviderInvocation;
+  const invocation = yield* requireProviderInvocation;
   const runtime = yield* requireRuntime();
+
+  const existing = yield* loadTaskById(runtime, input.taskId);
+  const sourceThread = yield* loadProviderSourceThread(runtime, invocation);
+  yield* loadAudienceVisibleTargetThread(
+    runtime,
+    sourceThread,
+    existing.threadId,
+    `Scheduled task ${input.taskId} was not found.`,
+    { includingArchived: true },
+  );
 
   yield* runtime.scheduledTasks
     .delete({ taskId: input.taskId })
