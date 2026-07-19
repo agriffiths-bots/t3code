@@ -50,6 +50,7 @@ const VAPID_SUBJECT = "mailto:t3code@localhost";
 const ACTIVE_NOTIFICATION_TTL_MILLIS = 24 * 60 * 60 * 1000;
 const EXPIRED_DEVICE_TTL_MILLIS = 30 * 24 * 60 * 60 * 1000;
 const MAX_ACTIVE_NOTIFICATIONS = 1_000;
+const MAX_DEVICE_REMOVAL_TOMBSTONES = 100;
 const RECOVERY_TOKEN_BYTES = 32;
 const DUMMY_RECOVERY_TOKEN_HASH = Encoding.encodeBase64Url(new Uint8Array(32));
 
@@ -88,13 +89,29 @@ const LegacyNotificationDeviceStore = Schema.Struct({
   version: Schema.Literal(1),
   devices: Schema.Array(LegacyNotificationDeviceRecord),
 });
-const NotificationDeviceStore = Schema.Struct({
+const NotificationDeviceStoreV2 = Schema.Struct({
   version: Schema.Literal(2),
   devices: Schema.Array(NotificationDeviceRecord),
+});
+const NotificationDeviceRemovalReason = Schema.Literals(["push-service-404", "push-service-410"]);
+type NotificationDeviceRemovalReason = typeof NotificationDeviceRemovalReason.Type;
+const NotificationDeviceRemovalTombstone = Schema.Struct({
+  deviceId: Schema.String,
+  deviceLabel: Schema.optional(Schema.String),
+  platform: Schema.String,
+  reason: NotificationDeviceRemovalReason,
+  removedAt: Schema.String,
+});
+type NotificationDeviceRemovalTombstone = typeof NotificationDeviceRemovalTombstone.Type;
+const NotificationDeviceStore = Schema.Struct({
+  version: Schema.Literal(3),
+  devices: Schema.Array(NotificationDeviceRecord),
+  tombstones: Schema.Array(NotificationDeviceRemovalTombstone),
 });
 type NotificationDeviceStore = typeof NotificationDeviceStore.Type;
 const PersistedNotificationDeviceStore = Schema.Union([
   LegacyNotificationDeviceStore,
+  NotificationDeviceStoreV2,
   NotificationDeviceStore,
 ]);
 
@@ -117,6 +134,7 @@ const NotificationDismissPayload = Schema.Struct({
 
 interface NotificationState {
   readonly devices: ReadonlyMap<string, NotificationDeviceRecord>;
+  readonly removalTombstones: ReadonlyArray<NotificationDeviceRemovalTombstone>;
   readonly activeNotifications: ReadonlyMap<string, ActiveNotificationEntry>;
   readonly subscribers: ReadonlySet<Queue.Queue<AudienceNotificationStreamEntry>>;
 }
@@ -177,6 +195,11 @@ interface ActiveNotificationEntry {
   readonly notification: ServerDeviceNotification;
   readonly dataAudience: DataAudience;
   readonly expiresAtMillis: number;
+  readonly isRemovalAlert: boolean;
+}
+
+interface WebPushDeliveryOptions {
+  readonly isRemovalAlert?: boolean;
 }
 
 function toPushSubscription(record: NotificationDeviceRecord): PushSubscription | null {
@@ -231,12 +254,16 @@ function notificationTopic(notificationId: string): string {
   return notificationId.replace(/[^A-Za-z0-9_-]/g, "").slice(0, 32) || "t3-notification";
 }
 
-function serializeStore(devices: ReadonlyMap<string, NotificationDeviceRecord>): string {
+function serializeStore(
+  devices: ReadonlyMap<string, NotificationDeviceRecord>,
+  tombstones: ReadonlyArray<NotificationDeviceRemovalTombstone>,
+): string {
   const store: NotificationDeviceStore = {
-    version: 2,
+    version: 3,
     devices: Array.from(devices.values()).toSorted((left, right) =>
       left.deviceId.localeCompare(right.deviceId),
     ),
+    tombstones,
   };
   return `${encodeDeviceStoreJson(store)}\n`;
 }
@@ -268,12 +295,15 @@ const readDeviceStore = Effect.fn("DeviceNotifications.readDeviceStore")(functio
       ),
     );
   if (raw === null) {
-    return new Map();
+    return {
+      devices: new Map<string, NotificationDeviceRecord>(),
+      tombstones: [] as ReadonlyArray<NotificationDeviceRemovalTombstone>,
+    };
   }
   const parsed = yield* decodeDeviceStoreJson(raw).pipe(
     Effect.catch((cause) =>
       Effect.logWarning("Failed to decode notification device store", { cause }).pipe(
-        Effect.as({ version: 2, devices: [] } satisfies NotificationDeviceStore),
+        Effect.as({ version: 3, devices: [], tombstones: [] } satisfies NotificationDeviceStore),
       ),
     ),
   );
@@ -284,17 +314,21 @@ const readDeviceStore = Effect.fn("DeviceNotifications.readDeviceStore")(functio
           audienceCeiling: device.audienceCeiling ?? ("factory" as const),
         }))
       : parsed.devices;
-  return new Map(devices.map((device) => [device.deviceId, device]));
+  return {
+    devices: new Map(devices.map((device) => [device.deviceId, device])),
+    tombstones: parsed.version === 3 ? parsed.tombstones : [],
+  };
 });
 
 const persistDeviceStore = Effect.fn("DeviceNotifications.persistDeviceStore")(function* (
   filePath: string,
   devices: ReadonlyMap<string, NotificationDeviceRecord>,
+  tombstones: ReadonlyArray<NotificationDeviceRemovalTombstone>,
   operation: ServerNotificationPersistenceError["operation"],
 ) {
   yield* writeFileStringAtomically({
     filePath,
-    contents: serializeStore(devices),
+    contents: serializeStore(devices, tombstones),
   }).pipe(
     Effect.mapError(
       (cause) =>
@@ -316,6 +350,7 @@ const getOrCreateVapidKeys = Effect.fn("DeviceNotifications.getOrCreateVapidKeys
   const existing = yield* secrets.get(VAPID_KEYS_SECRET);
   if (Option.isSome(existing)) {
     const decoded = yield* decodeVapidKeyPairJson(textDecoder.decode(existing.value)).pipe(
+      Effect.tapError(() => Effect.logWarning("Failed to decode persisted web-push VAPID keys")),
       Effect.option,
     );
     if (Option.isSome(decoded)) {
@@ -411,6 +446,28 @@ function endpointHost(endpoint: string): string {
   }
 }
 
+function deviceDisplayName(device: NotificationDeviceRecord): string {
+  return device.deviceLabel ?? device.deviceId;
+}
+
+function devicePlatform(device: NotificationDeviceRecord): string {
+  const userAgent = device.userAgent;
+  if (userAgent === undefined) return device.deviceKind;
+  if (/Android/i.test(userAgent)) return "android";
+  if (/iPhone|iPad|iPod/i.test(userAgent)) return "ios";
+  if (/Windows/i.test(userAgent)) return "windows";
+  if (/Macintosh|Mac OS/i.test(userAgent)) return "macos";
+  if (/Linux/i.test(userAgent)) return "linux";
+  return device.deviceKind;
+}
+
+function appendRemovalTombstone(
+  tombstones: ReadonlyArray<NotificationDeviceRemovalTombstone>,
+  tombstone: NotificationDeviceRemovalTombstone,
+): ReadonlyArray<NotificationDeviceRemovalTombstone> {
+  return [...tombstones, tombstone].slice(-MAX_DEVICE_REMOVAL_TOMBSTONES);
+}
+
 function makeDismissPayload(notificationId: string): string {
   return encodeNotificationDismissPayloadJson({
     kind: "dismiss",
@@ -484,14 +541,15 @@ export const make = Effect.fn("DeviceNotifications.make")(function* () {
   webPush.setVapidDetails(VAPID_SUBJECT, vapidKeys.publicKey, vapidKeys.privateKey);
 
   const storePath = path.join(config.stateDir, DEVICE_STORE_FILE);
-  const initialDevices = yield* readDeviceStore(storePath).pipe(
+  const initialStore = yield* readDeviceStore(storePath).pipe(
     Effect.provideService(FileSystem.FileSystem, fileSystem),
   );
-  const persistDevices = (
+  const persistStore = (
     devices: ReadonlyMap<string, NotificationDeviceRecord>,
+    tombstones: ReadonlyArray<NotificationDeviceRemovalTombstone>,
     operation: ServerNotificationPersistenceError["operation"],
   ) =>
-    persistDeviceStore(storePath, devices, operation).pipe(
+    persistDeviceStore(storePath, devices, tombstones, operation).pipe(
       Effect.provideService(FileSystem.FileSystem, fileSystem),
       Effect.provideService(Path.Path, path),
     );
@@ -516,7 +574,8 @@ export const make = Effect.fn("DeviceNotifications.make")(function* () {
     return { recoveryToken, recoveryTokenHash };
   });
   const state = yield* SynchronizedRef.make<NotificationState>({
-    devices: initialDevices,
+    devices: initialStore.devices,
+    removalTombstones: initialStore.tombstones,
     activeNotifications: new Map(),
     subscribers: new Set(),
   });
@@ -532,19 +591,52 @@ export const make = Effect.fn("DeviceNotifications.make")(function* () {
     );
   });
 
+  const prepareNotificationDelivery = Effect.fn("DeviceNotifications.prepareNotificationDelivery")(
+    function* (input: ServerNotifyInput, dataAudience: DataAudience, isRemovalAlert: boolean) {
+      const notification = yield* makeDeviceNotification(input);
+      const nowMillis = yield* Clock.currentTimeMillis;
+      const event: ServerNotificationStreamEvent = { type: "show", notification };
+      const devices = yield* SynchronizedRef.modify(state, (current) => {
+        const nextActive = new Map(
+          pruneActiveNotifications(current.activeNotifications, nowMillis),
+        );
+        nextActive.set(notification.notificationId, {
+          notification,
+          dataAudience,
+          expiresAtMillis: nowMillis + ACTIVE_NOTIFICATION_TTL_MILLIS,
+          isRemovalAlert,
+        });
+        const boundedActive = pruneActiveNotifications(nextActive, nowMillis);
+        const activeDevices = new Map(
+          Array.from(current.devices).filter(([, device]) => device.status !== "expired"),
+        );
+        return [activeDevices, { ...current, activeNotifications: boundedActive }] as const;
+      });
+
+      yield* publish({ event, dataAudience });
+      return {
+        notification,
+        visibleDevices: Array.from(devices.values()).filter((device) =>
+          canReadDataAudience(device.audienceCeiling, dataAudience),
+        ),
+      };
+    },
+  );
+
   const expireDevice = Effect.fn("DeviceNotifications.expireDevice")(function* (
     deviceId: string,
     failedSubscription: PushSubscription,
     timestamp: string,
+    reason: NotificationDeviceRemovalReason,
   ) {
-    yield* SynchronizedRef.modifyEffect(state, (current) => {
+    return yield* SynchronizedRef.modifyEffect(state, (current) => {
       const existing = current.devices.get(deviceId);
       if (
         existing === undefined ||
         existing.status === "expired" ||
         !subscriptionMatches(existing, failedSubscription)
       ) {
-        return Effect.succeed([undefined, current] as const);
+        return Effect.succeed([null, current] as const);
       }
       const nextDevices = new Map(current.devices);
       nextDevices.set(deviceId, {
@@ -553,71 +645,169 @@ export const make = Effect.fn("DeviceNotifications.make")(function* () {
         expiredAt: timestamp,
         updatedAt: timestamp,
       });
-      return persistDevices(nextDevices, "expire-device").pipe(
-        Effect.as([undefined, { ...current, devices: nextDevices }] as const),
+      const tombstone: NotificationDeviceRemovalTombstone = {
+        deviceId,
+        ...(existing.deviceLabel === undefined ? {} : { deviceLabel: existing.deviceLabel }),
+        platform: devicePlatform(existing),
+        reason,
+        removedAt: timestamp,
+      };
+      const nextTombstones = appendRemovalTombstone(current.removalTombstones, tombstone);
+      const remainingDeviceCount = Array.from(nextDevices.values()).filter(
+        (device) => device.status !== "expired",
+      ).length;
+      return persistStore(nextDevices, nextTombstones, "expire-device").pipe(
+        Effect.as([
+          { tombstone, remainingDeviceCount },
+          {
+            ...current,
+            devices: nextDevices,
+            removalTombstones: nextTombstones,
+          },
+        ] as const),
       );
     });
   });
 
-  const sendWebPush = Effect.fn("DeviceNotifications.sendWebPush")(function* (
+  const expireAfterPushServiceRejection: (
+    device: NotificationDeviceRecord,
+    subscription: PushSubscription,
+    reason: NotificationDeviceRemovalReason,
+    suppressRemovalAlert: boolean,
+  ) => Effect.Effect<boolean> = Effect.fn("DeviceNotifications.expireAfterPushServiceRejection")(
+    function* (device, subscription, reason, suppressRemovalAlert) {
+      const timestamp = yield* nowIso;
+      const removal = yield* expireDevice(device.deviceId, subscription, timestamp, reason).pipe(
+        Effect.catch((expireCause) =>
+          Effect.logWarning("Failed to expire notification device", {
+            cause: expireCause,
+            deviceId: device.deviceId,
+            deviceLabel: deviceDisplayName(device),
+            platform: devicePlatform(device),
+            reason,
+          }).pipe(Effect.as(null)),
+        ),
+      );
+      if (removal === null) {
+        return false;
+      }
+
+      yield* Effect.logWarning("Web push subscription removed after push service rejection", {
+        deviceId: removal.tombstone.deviceId,
+        deviceLabel: removal.tombstone.deviceLabel ?? removal.tombstone.deviceId,
+        platform: removal.tombstone.platform,
+        endpointHost: endpointHost(subscription.endpoint),
+        reason: removal.tombstone.reason,
+      });
+      if (suppressRemovalAlert || removal.remainingDeviceCount === 0) {
+        return false;
+      }
+
+      const removalAlert = Effect.gen(function* () {
+        const prepared = yield* prepareNotificationDelivery(
+          {
+            title: "Push subscription removed",
+            body: `Push subscription for ${deviceDisplayName(device)} was removed (expired). Reopen T3 on that device to re-register.`,
+          },
+          "private",
+          true,
+        );
+        yield* Effect.forEach(
+          prepared.visibleDevices,
+          (remainingDevice) =>
+            remainingDevice.deviceKind === "web-push"
+              ? sendWebPush(
+                  remainingDevice,
+                  makeShowPayload(prepared.notification, remainingDevice.ackUrl),
+                  prepared.notification.notificationId,
+                  { isRemovalAlert: true },
+                )
+              : Effect.void,
+          { concurrency: 8, discard: true },
+        );
+      }).pipe(
+        Effect.catchCause((alertCause) =>
+          Effect.logWarning("Failed to dispatch push subscription removal alert", {
+            cause: alertCause,
+            deviceId: removal.tombstone.deviceId,
+            reason: removal.tombstone.reason,
+          }),
+        ),
+      );
+      yield* removalAlert.pipe(Effect.forkDetach({ startImmediately: true }), Effect.asVoid);
+      return false;
+    },
+  );
+
+  const sendWebPush: (
     device: NotificationDeviceRecord,
     payload: string,
     notificationId: string,
-  ) {
-    const subscription = toPushSubscription(device);
-    if (subscription === null) {
-      return false;
-    }
-    const guardedEndpoint = yield* endpointGuard.prepare(subscription.endpoint).pipe(
-      Effect.catch((cause) =>
-        Effect.logWarning("Rejected unsafe web push endpoint before send", {
-          cause,
-          deviceId: device.deviceId,
-        }).pipe(Effect.as(null)),
-      ),
-    );
-    if (guardedEndpoint === null) {
-      return false;
-    }
-    return yield* Effect.tryPromise({
-      try: () =>
-        webPush.sendNotification(subscription, payload, {
-          agent: guardedEndpoint.agent,
-          TTL: 60 * 60 * 24,
-          urgency: "high",
-          topic: notificationTopic(notificationId),
-        }),
-      catch: (cause) => new WebPushSendError({ cause }),
-    }).pipe(
-      Effect.as(true),
-      Effect.catch((cause) => {
-        const status = expiredPushStatus(cause);
-        if (status === null) {
-          return Effect.logWarning("Failed to send web push notification", {
+    options?: WebPushDeliveryOptions,
+  ) => Effect.Effect<boolean> = Effect.fn("DeviceNotifications.sendWebPush")(
+    function* (device, payload, notificationId, options) {
+      const subscription = toPushSubscription(device);
+      if (subscription === null) {
+        if (device.status !== "expired") {
+          yield* Effect.logWarning("Skipped web push delivery without an active subscription", {
+            deviceId: device.deviceId,
+            deviceLabel: deviceDisplayName(device),
+            platform: devicePlatform(device),
+          });
+        }
+        return false;
+      }
+      const guardedEndpoint = yield* endpointGuard.prepare(subscription.endpoint).pipe(
+        Effect.catch((cause) =>
+          Effect.logWarning("Rejected unsafe web push endpoint before send", {
             cause,
             deviceId: device.deviceId,
-          }).pipe(Effect.as(false));
-        }
-        return Effect.gen(function* () {
-          yield* Effect.logWarning("Web push subscription expired", {
-            deviceId: device.deviceId,
-            endpointHost: endpointHost(subscription.endpoint),
-            reason: `push-service-${status}`,
-          });
-          const timestamp = yield* nowIso;
-          yield* expireDevice(device.deviceId, subscription, timestamp).pipe(
-            Effect.catch((expireCause) =>
-              Effect.logWarning("Failed to expire notification device", {
-                cause: expireCause,
-                deviceId: device.deviceId,
-              }),
-            ),
-          );
-          return false;
-        });
-      }),
-    );
-  });
+            deviceLabel: deviceDisplayName(device),
+            platform: devicePlatform(device),
+          }).pipe(Effect.as(null)),
+        ),
+      );
+      if (guardedEndpoint === null) {
+        return false;
+      }
+      return yield* Effect.tryPromise({
+        try: () =>
+          webPush.sendNotification(subscription, payload, {
+            agent: guardedEndpoint.agent,
+            TTL: 60 * 60 * 24,
+            urgency: "high",
+            topic: notificationTopic(notificationId),
+          }),
+        catch: (cause) => new WebPushSendError({ cause }),
+      }).pipe(
+        Effect.as(true),
+        Effect.catch((cause) => {
+          const status = expiredPushStatus(cause);
+          if (status === null) {
+            return Effect.logWarning("Failed to send web push notification", {
+              cause,
+              deviceId: device.deviceId,
+              deviceLabel: deviceDisplayName(device),
+              platform: devicePlatform(device),
+            }).pipe(Effect.as(false));
+          }
+          const reason: NotificationDeviceRemovalReason = `push-service-${status}`;
+          if (options?.isRemovalAlert === true) {
+            return Effect.logWarning("Failed to deliver push subscription removal alert", {
+              deviceId: device.deviceId,
+              deviceLabel: deviceDisplayName(device),
+              platform: devicePlatform(device),
+              endpointHost: endpointHost(subscription.endpoint),
+              reason,
+            }).pipe(
+              Effect.andThen(expireAfterPushServiceRejection(device, subscription, reason, true)),
+            );
+          }
+          return expireAfterPushServiceRejection(device, subscription, reason, false);
+        }),
+      );
+    },
+  );
 
   const getConfig: DeviceNotifications["Service"]["getConfig"] = Effect.succeed({
     vapidPublicKey: vapidKeys.publicKey,
@@ -641,7 +831,7 @@ export const make = Effect.fn("DeviceNotifications.make")(function* () {
         recovery.recoveryTokenHash,
         options.audienceCeiling,
       );
-      return persistDevices(nextDevices, "register-device").pipe(
+      return persistStore(nextDevices, current.removalTombstones, "register-device").pipe(
         Effect.as([undefined, { ...current, devices: nextDevices }] as const),
       );
     });
@@ -709,7 +899,11 @@ export const make = Effect.fn("DeviceNotifications.make")(function* () {
         if (retainedDevices.size === current.devices.size) {
           return Effect.succeed([null, current] as const);
         }
-        return persistDevices(retainedDevices, "purge-expired-devices").pipe(
+        return persistStore(
+          retainedDevices,
+          current.removalTombstones,
+          "purge-expired-devices",
+        ).pipe(
           Effect.catch(() => Effect.void),
           Effect.as([null, { ...current, devices: retainedDevices }] as const),
         );
@@ -720,7 +914,11 @@ export const make = Effect.fn("DeviceNotifications.make")(function* () {
         if (retainedDevices.size === current.devices.size) {
           return Effect.succeed([result, current] as const);
         }
-        return persistDevices(retainedDevices, "purge-expired-devices").pipe(
+        return persistStore(
+          retainedDevices,
+          current.removalTombstones,
+          "purge-expired-devices",
+        ).pipe(
           Effect.catch(() => Effect.void),
           Effect.as([result, { ...current, devices: retainedDevices }] as const),
         );
@@ -746,7 +944,7 @@ export const make = Effect.fn("DeviceNotifications.make")(function* () {
             },
             updatedAt: timestamp,
           });
-          return persistDevices(nextDevices, "recover-device").pipe(
+          return persistStore(nextDevices, current.removalTombstones, "recover-device").pipe(
             Effect.as([
               { recoveryToken: rotatedToken },
               { ...current, devices: nextDevices },
@@ -761,46 +959,24 @@ export const make = Effect.fn("DeviceNotifications.make")(function* () {
     function* (input, options) {
       const dataAudience = options?.dataAudience ?? "private";
       const resultAudienceCeiling = options?.resultAudienceCeiling ?? "private";
-      const notification = yield* makeDeviceNotification(input);
-      const nowMillis = yield* Clock.currentTimeMillis;
-      const event: ServerNotificationStreamEvent = { type: "show", notification };
-      const devices = yield* SynchronizedRef.modify(state, (current) => {
-        const nextActive = new Map(
-          pruneActiveNotifications(current.activeNotifications, nowMillis),
-        );
-        nextActive.set(notification.notificationId, {
-          notification,
-          dataAudience,
-          expiresAtMillis: nowMillis + ACTIVE_NOTIFICATION_TTL_MILLIS,
-        });
-        const boundedActive = pruneActiveNotifications(nextActive, nowMillis);
-        const activeDevices = new Map(
-          Array.from(current.devices).filter(([, device]) => device.status !== "expired"),
-        );
-        return [activeDevices, { ...current, activeNotifications: boundedActive }] as const;
-      });
-
-      yield* publish({ event, dataAudience });
-      const visibleDevices = Array.from(devices.values()).filter((device) =>
-        canReadDataAudience(device.audienceCeiling, dataAudience),
-      );
+      const prepared = yield* prepareNotificationDelivery(input, dataAudience, false);
       const delivered = yield* Effect.forEach(
-        visibleDevices,
+        prepared.visibleDevices,
         (device) =>
           device.deviceKind === "web-push"
             ? sendWebPush(
                 device,
-                makeShowPayload(notification, device.ackUrl),
-                notification.notificationId,
+                makeShowPayload(prepared.notification, device.ackUrl),
+                prepared.notification.notificationId,
               )
             : Effect.succeed(false),
         { concurrency: 8 },
       );
 
       return {
-        notificationId: notification.notificationId,
+        notificationId: prepared.notification.notificationId,
         deliveredDevices: NonNegativeInt.make(
-          visibleDevices.reduce(
+          prepared.visibleDevices.reduce(
             (count, device, index) =>
               canReadDataAudience(resultAudienceCeiling, device.audienceCeiling) &&
               (device.deviceKind === "desktop" || delivered[index] === true)
@@ -887,7 +1063,9 @@ export const make = Effect.fn("DeviceNotifications.make")(function* () {
       ),
       (device) =>
         device.deviceKind === "web-push" && device.status !== "expired"
-          ? sendWebPush(device, makeDismissPayload(input.notificationId), input.notificationId)
+          ? sendWebPush(device, makeDismissPayload(input.notificationId), input.notificationId, {
+              isRemovalAlert: dismissedNotification.isRemovalAlert,
+            })
           : Effect.void,
       { concurrency: 8, discard: true },
     );
