@@ -916,6 +916,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
   const [isComposerModelPickerOpen, setIsComposerModelPickerOpen] = useState(false);
   const [isComposerFocused, setIsComposerFocused] = useState(false);
   const isMobileViewport = useMediaQuery("max-sm");
+  const hasCoarsePointer = useMediaQuery({ pointer: "coarse" });
   const isComposerCollapsedMobile =
     isMobileViewport && !forceExpandedOnMobile && !isComposerFocused;
 
@@ -1800,7 +1801,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     }
     if (
       key === "Enter" &&
-      shouldSubmitComposerOnEnter({ isMobileViewport, shiftKey: event.shiftKey })
+      shouldSubmitComposerOnEnter({ isMobileViewport, hasCoarsePointer, shiftKey: event.shiftKey })
     ) {
       submitComposer();
       return true;
@@ -2006,8 +2007,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
           isConnecting ||
           isComposerApprovalState ||
           pendingUserInputs.length > 0 ||
-          projectSelectionRequired ||
-          (environmentUnavailable !== null && activePendingProgress === null)
+          projectSelectionRequired
         ) {
           return false;
         }
@@ -2542,12 +2542,10 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
                               ? "Ask for follow-up changes or attach images"
                               : "Ask anything, @tag files/folders, $use skills, or / for commands"
                 }
-                disabled={
-                  isConnecting ||
-                  isComposerApprovalState ||
-                  projectSelectionRequired ||
-                  (environmentUnavailable !== null && activePendingProgress === null)
-                }
+                // An unavailable environment must not lock the editor: this fork
+                // queues sends made while disconnected (`shouldQueueInitialSend`),
+                // so the user has to be able to type the message that gets queued.
+                disabled={isConnecting || isComposerApprovalState || projectSelectionRequired}
               />
               {showMobilePendingAnswerActions ? (
                 <div
