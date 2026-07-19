@@ -92,7 +92,7 @@ import {
 import type { ThreadContentPresentation } from "./threadContentPresentation";
 import { ThreadWorkGroupToggle, ThreadWorkLog } from "./thread-work-log";
 import { useMarkdownCodeHighlight } from "./markdownCodeHighlightState";
-import { useAssetUrl } from "../../state/assets";
+import { useAssetRequestSource } from "../../state/assets";
 import { resolveWorkspaceRelativeFilePath } from "../files/filePath";
 
 const MESSAGE_TIME_FORMATTER = new Intl.DateTimeFormat(undefined, {
@@ -147,12 +147,12 @@ function MessageAttachmentImage(props: {
   readonly className: string;
   readonly onPressImage: (uri: string, headers?: Record<string, string>) => void;
 }) {
-  const uri = useAssetUrl(props.environmentId, {
+  const source = useAssetRequestSource(props.environmentId, {
     _tag: "attachment",
     attachmentId: props.attachmentId,
   });
 
-  if (uri === null) {
+  if (source === null) {
     return (
       <View className={`${props.className} items-center justify-center`}>
         <ActivityIndicator />
@@ -161,8 +161,15 @@ function MessageAttachmentImage(props: {
   }
 
   return (
-    <TouchableOpacity activeOpacity={0.7} onPress={() => props.onPressImage(uri)}>
-      <Image source={{ uri }} className={props.className} resizeMode="cover" />
+    <TouchableOpacity
+      activeOpacity={0.7}
+      onPress={() => props.onPressImage(source.uri, source.headers)}
+    >
+      <Image
+        source={{ uri: source.uri, headers: source.headers }}
+        className={props.className}
+        resizeMode="cover"
+      />
     </TouchableOpacity>
   );
 }

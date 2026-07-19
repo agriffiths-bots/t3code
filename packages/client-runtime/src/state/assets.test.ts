@@ -5,10 +5,106 @@ import { Atom } from "effect/unstable/reactivity";
 
 import type { EnvironmentRegistry } from "../connection/registry.ts";
 import {
+  bindAssetSurface,
   createAssetEnvironmentAtoms,
   InvalidAssetCollectionKeyError,
   parseAssetCollectionKey,
 } from "./assets.ts";
+
+describe("asset surface binding", () => {
+  it("installs a private surface credential on the app relay origin", async () => {
+    const requests: Array<{ readonly input: string; readonly init: RequestInit | undefined }> = [];
+    const fetchImpl: typeof fetch = async (input, init) => {
+      requests.push({ input: String(input), init });
+      return new Response(null, { status: 204 });
+    };
+
+    await expect(
+      bindAssetSurface(
+        "https://private-app.example/base/",
+        {
+          relativeUrl: "/api/assets/relay/signed/private.png",
+          expiresAt: 123,
+          surfaceCredential: "surface.credential",
+        },
+        fetchImpl,
+      ),
+    ).resolves.toBe("https://private-app.example/api/assets/relay/signed/private.png");
+    expect(requests).toEqual([
+      {
+        input: "https://private-app.example/api/assets/relay/surface",
+        init: {
+          method: "POST",
+          credentials: "include",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ credential: "surface.credential" }),
+        },
+      },
+    ]);
+  });
+
+  it("refuses to bind private credentials to the direct cross-site asset path", async () => {
+    let fetched = false;
+    const fetchImpl: typeof fetch = async () => {
+      fetched = true;
+      return new Response(null, { status: 204 });
+    };
+
+    await expect(
+      bindAssetSurface(
+        "https://environment.example/",
+        {
+          relativeUrl: "/api/assets/signed/private.png",
+          expiresAt: 123,
+          surfaceCredential: "surface.credential",
+        },
+        fetchImpl,
+      ),
+    ).resolves.toBeNull();
+    expect(fetched).toBe(false);
+  });
+
+  it("keeps public factory asset URLs cookie-free", async () => {
+    let fetched = false;
+    const fetchImpl: typeof fetch = async () => {
+      fetched = true;
+      return new Response(null, { status: 204 });
+    };
+
+    await expect(
+      bindAssetSurface(
+        "https://environment.example/",
+        {
+          relativeUrl: "/api/assets/signed/factory.png",
+          expiresAt: 123,
+          surfaceCredential: null,
+        },
+        fetchImpl,
+      ),
+    ).resolves.toBe("https://environment.example/api/assets/signed/factory.png");
+    expect(fetched).toBe(false);
+  });
+
+  it("accepts an unbound URL decoded from an old server result", async () => {
+    let fetched = false;
+    const fetchImpl: typeof fetch = async () => {
+      fetched = true;
+      return new Response(null, { status: 204 });
+    };
+
+    await expect(
+      bindAssetSurface(
+        "https://environment.example/",
+        {
+          relativeUrl: "/api/assets/signed/legacy.png",
+          expiresAt: 123,
+        },
+        fetchImpl,
+      ),
+    ).resolves.toBe("https://environment.example/api/assets/signed/legacy.png");
+    expect(fetched).toBe(false);
+  });
+});
 
 describe("asset collection keys", () => {
   it("preserves malformed JSON and its native cause", () => {

@@ -1,25 +1,74 @@
 import * as NodeServices from "@effect/platform-node/NodeServices";
-import { ThreadId, type OrchestrationReadModel } from "@t3tools/contracts";
+import {
+  ASSET_SAME_ORIGIN_RELAY_V1_CAPABILITY,
+  AuthSessionId,
+  ThreadId,
+  type OrchestrationReadModel,
+} from "@t3tools/contracts";
 import { PROJECT_FAVICON_FALLBACK_MARKER } from "@t3tools/shared/projectFavicon";
 import { describe, expect, it } from "@effect/vitest";
+import * as Clock from "effect/Clock";
+import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Path from "effect/Path";
 import * as PlatformError from "effect/PlatformError";
+import * as TestClock from "effect/testing/TestClock";
 
 import * as ServerSecretStore from "../auth/ServerSecretStore.ts";
+import * as SessionStore from "../auth/SessionStore.ts";
 import * as ServerConfig from "../config.ts";
 import * as ProjectFaviconResolver from "../project/ProjectFaviconResolver.ts";
 import * as ProjectionSnapshotQuery from "../orchestration/Services/ProjectionSnapshotQuery.ts";
 import * as WorkspacePaths from "../workspace/WorkspacePaths.ts";
 import {
   ASSET_ROUTE_PREFIX,
+  ASSET_SURFACE_RELAY_PREFIX,
   classifyAttachmentAudience,
-  issueAssetUrl,
-  resolveAsset,
+  issueAssetUrl as issueAssetUrlImpl,
+  resolveAsset as resolveAssetImpl,
   type AssetResolution,
 } from "./AssetAccess.ts";
+
+const TEST_SURFACE_SESSION_ID = AuthSessionId.make("asset-access-test-surface");
+const TEST_SURFACE_SESSION_EXPIRES_AT = DateTime.makeUnsafe("2999-01-01T00:00:00.000Z");
+const issuedSurfaceCredentialByToken = new Map<string, string>();
+
+const assetRouteSuffix = (relativeUrl: string) => {
+  const prefix = relativeUrl.startsWith(`${ASSET_SURFACE_RELAY_PREFIX}/`)
+    ? ASSET_SURFACE_RELAY_PREFIX
+    : ASSET_ROUTE_PREFIX;
+  return relativeUrl.slice(`${prefix}/`.length);
+};
+
+const issueAssetUrl = (input: Parameters<typeof issueAssetUrlImpl>[0]) =>
+  issueAssetUrlImpl({
+    ...input,
+    clientCapabilities: [ASSET_SAME_ORIGIN_RELAY_V1_CAPABILITY],
+    surfaceSessionId: TEST_SURFACE_SESSION_ID,
+    surfaceSessionExpiresAt: TEST_SURFACE_SESSION_EXPIRES_AT,
+  }).pipe(
+    Effect.tap((result) =>
+      Effect.sync(() => {
+        const token = assetRouteSuffix(result.relativeUrl).split("/", 1)[0];
+        if (token && result.surfaceCredential) {
+          issuedSurfaceCredentialByToken.set(token, result.surfaceCredential);
+        }
+      }),
+    ),
+  );
+
+const resolveAsset = (token: string, relativePath: string, requestProof: string | null = null) =>
+  resolveAssetImpl(
+    token,
+    relativePath,
+    requestProof === "private"
+      ? (issuedSurfaceCredentialByToken.get(token) ?? null)
+      : requestProof === "factory"
+        ? null
+        : requestProof,
+  );
 
 const summarizeAssetResolution = (resolution: AssetResolution | null) => {
   if (resolution?.kind !== "file") return resolution;
@@ -35,6 +84,10 @@ const testLayer = Layer.mergeAll(
   WorkspacePaths.layer,
   ProjectFaviconResolver.layer.pipe(Layer.provide(WorkspacePaths.layer)),
   ServerSecretStore.layer.pipe(Layer.provide(configLayer)),
+  Layer.mock(SessionStore.SessionStore)({
+    cookieName: "t3_asset_access_test",
+    isActive: () => Effect.succeed(true),
+  }),
   Layer.mock(ProjectionSnapshotQuery.ProjectionSnapshotQuery)({
     getCommandReadModel: () =>
       Effect.succeed({
@@ -70,7 +123,7 @@ describe("AssetAccess", () => {
         },
         workspaceRoot: root,
       });
-      const suffix = result.relativeUrl.slice(`${ASSET_ROUTE_PREFIX}/`.length);
+      const suffix = assetRouteSuffix(result.relativeUrl);
       const separatorIndex = suffix.indexOf("/");
       const token = suffix.slice(0, separatorIndex);
 
@@ -185,7 +238,7 @@ describe("AssetAccess", () => {
         },
         workspaceRoot: root,
       });
-      const suffix = result.relativeUrl.slice(`${ASSET_ROUTE_PREFIX}/`.length);
+      const suffix = assetRouteSuffix(result.relativeUrl);
       const separatorIndex = suffix.indexOf("/");
       const token = suffix.slice(0, separatorIndex);
 
@@ -221,7 +274,7 @@ describe("AssetAccess", () => {
         },
         workspaceRoot: root,
       });
-      const suffix = result.relativeUrl.slice(`${ASSET_ROUTE_PREFIX}/`.length);
+      const suffix = assetRouteSuffix(result.relativeUrl);
       const separatorIndex = suffix.indexOf("/");
       const resolution = yield* resolveAsset(
         suffix.slice(0, separatorIndex),
@@ -268,7 +321,7 @@ describe("AssetAccess", () => {
         },
         workspaceRoot: root,
       });
-      const suffix = result.relativeUrl.slice(`${ASSET_ROUTE_PREFIX}/`.length);
+      const suffix = assetRouteSuffix(result.relativeUrl);
       const separatorIndex = suffix.indexOf("/");
 
       yield* fileSystem.rename(root, retiredRoot);
@@ -330,7 +383,7 @@ describe("AssetAccess", () => {
       const result = yield* issueAssetUrl({
         resource: { _tag: "attachment", attachmentId },
       });
-      const suffix = result.relativeUrl.slice(`${ASSET_ROUTE_PREFIX}/`.length);
+      const suffix = assetRouteSuffix(result.relativeUrl);
       const separatorIndex = suffix.indexOf("/");
       const token = suffix.slice(0, separatorIndex);
 
@@ -362,17 +415,96 @@ describe("AssetAccess", () => {
         dataAudience: "private",
         audienceCeiling: "private",
       });
-      const privateSuffix = privateResult.relativeUrl.slice(`${ASSET_ROUTE_PREFIX}/`.length);
+      const privateSuffix = assetRouteSuffix(privateResult.relativeUrl);
       const privateSeparatorIndex = privateSuffix.indexOf("/");
       const privateToken = privateSuffix.slice(0, privateSeparatorIndex);
       const privateFileName = privateSuffix.slice(privateSeparatorIndex + 1);
-      expect(yield* resolveAsset(privateToken, privateFileName)).toEqual({ kind: "forbidden" });
-      expect(yield* resolveAsset(privateToken, privateFileName, "factory")).toEqual({
-        kind: "forbidden",
-      });
+      expect(yield* resolveAsset(privateToken, privateFileName)).toBeNull();
+      expect(yield* resolveAsset(privateToken, privateFileName, "factory")).toBeNull();
       expect(
         summarizeAssetResolution(yield* resolveAsset(privateToken, privateFileName, "private")),
       ).toEqual({ kind: "file", path: attachmentPath });
+    }).pipe(Effect.provide(testLayer)),
+  );
+
+  it.effect("binds private capabilities to the surface session that minted them", () =>
+    Effect.gen(function* () {
+      const config = yield* ServerConfig.ServerConfig;
+      const fileSystem = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const attachmentId = "thread-surface-00000000-0000-4000-8000-000000000004";
+      const attachmentPath = path.join(config.attachmentsDir, `${attachmentId}.png`);
+      yield* fileSystem.makeDirectory(config.attachmentsDir, { recursive: true });
+      yield* fileSystem.writeFile(attachmentPath, new Uint8Array([1, 2, 3]));
+      const sessionExpiresAt = DateTime.makeUnsafe((yield* Clock.currentTimeMillis) + 5 * 60_000);
+
+      const owner = yield* issueAssetUrlImpl({
+        resource: { _tag: "attachment", attachmentId },
+        clientCapabilities: [ASSET_SAME_ORIGIN_RELAY_V1_CAPABILITY],
+        surfaceSessionId: AuthSessionId.make("surface-owner"),
+        surfaceSessionExpiresAt: sessionExpiresAt,
+      });
+      const other = yield* issueAssetUrlImpl({
+        resource: { _tag: "attachment", attachmentId },
+        clientCapabilities: [ASSET_SAME_ORIGIN_RELAY_V1_CAPABILITY],
+        surfaceSessionId: AuthSessionId.make("surface-other"),
+        surfaceSessionExpiresAt: sessionExpiresAt,
+      });
+      const suffix = assetRouteSuffix(owner.relativeUrl);
+      const separatorIndex = suffix.indexOf("/");
+      const token = suffix.slice(0, separatorIndex);
+      const fileName = suffix.slice(separatorIndex + 1);
+
+      expect(yield* resolveAssetImpl(token, fileName)).toBeNull();
+      expect(yield* resolveAssetImpl(token, fileName, other.surfaceCredential)).toBeNull();
+      expect(
+        summarizeAssetResolution(yield* resolveAssetImpl(token, fileName, owner.surfaceCredential)),
+      ).toEqual({ kind: "file", path: attachmentPath });
+      expect(owner.expiresAt).toBe(sessionExpiresAt.epochMilliseconds);
+
+      expect(
+        yield* resolveAssetImpl(token, fileName, owner.surfaceCredential).pipe(
+          Effect.provide(
+            Layer.mock(SessionStore.SessionStore)({
+              cookieName: "t3_asset_access_revoked_test",
+              isActive: () => Effect.succeed(false),
+            }),
+          ),
+        ),
+      ).toBeNull();
+    }).pipe(Effect.provide(testLayer)),
+  );
+
+  it.effect("issues a stable surface credential across asset refreshes in one session", () =>
+    Effect.gen(function* () {
+      const config = yield* ServerConfig.ServerConfig;
+      const fileSystem = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const attachmentId = "thread-surface-stable-00000000-0000-4000-8000-000000000005";
+      const attachmentPath = path.join(config.attachmentsDir, `${attachmentId}.png`);
+      yield* fileSystem.makeDirectory(config.attachmentsDir, { recursive: true });
+      yield* fileSystem.writeFile(attachmentPath, new Uint8Array([1, 2, 3]));
+      const sessionId = AuthSessionId.make("surface-stable");
+      const sessionExpiresAt = DateTime.makeUnsafe(
+        (yield* Clock.currentTimeMillis) + 2 * 60 * 60_000,
+      );
+
+      const first = yield* issueAssetUrlImpl({
+        resource: { _tag: "attachment", attachmentId },
+        clientCapabilities: [ASSET_SAME_ORIGIN_RELAY_V1_CAPABILITY],
+        surfaceSessionId: sessionId,
+        surfaceSessionExpiresAt: sessionExpiresAt,
+      });
+      yield* TestClock.adjust("1 minute");
+      const refreshed = yield* issueAssetUrlImpl({
+        resource: { _tag: "attachment", attachmentId },
+        clientCapabilities: [ASSET_SAME_ORIGIN_RELAY_V1_CAPABILITY],
+        surfaceSessionId: sessionId,
+        surfaceSessionExpiresAt: sessionExpiresAt,
+      });
+
+      expect(refreshed.expiresAt).toBeGreaterThan(first.expiresAt);
+      expect(refreshed.surfaceCredential).toBe(first.surfaceCredential);
     }).pipe(Effect.provide(testLayer)),
   );
 
@@ -390,7 +522,7 @@ describe("AssetAccess", () => {
       const faviconResult = yield* issueAssetUrl({
         resource: { _tag: "project-favicon", cwd: root },
       });
-      const faviconSuffix = faviconResult.relativeUrl.slice(`${ASSET_ROUTE_PREFIX}/`.length);
+      const faviconSuffix = assetRouteSuffix(faviconResult.relativeUrl);
       const faviconSeparatorIndex = faviconSuffix.indexOf("/");
       expect(
         summarizeAssetResolution(
@@ -407,7 +539,7 @@ describe("AssetAccess", () => {
         resource: { _tag: "project-favicon", cwd: root },
       });
       expect(fallbackResult.relativeUrl.endsWith(`/${PROJECT_FAVICON_FALLBACK_MARKER}`)).toBe(true);
-      const fallbackSuffix = fallbackResult.relativeUrl.slice(`${ASSET_ROUTE_PREFIX}/`.length);
+      const fallbackSuffix = assetRouteSuffix(fallbackResult.relativeUrl);
       const fallbackSeparatorIndex = fallbackSuffix.indexOf("/");
       expect(
         yield* resolveAsset(

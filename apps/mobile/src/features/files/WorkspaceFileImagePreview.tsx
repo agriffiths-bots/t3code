@@ -7,16 +7,21 @@ import { AsyncResult } from "effect/unstable/reactivity";
 import { AppText as Text } from "../../components/AppText";
 import { EmptyState } from "../../components/EmptyState";
 import { workspaceFileImageAtom } from "./workspace-file-image-cache";
+import type { AssetRequestSource } from "../../state/assets";
 
 function ResolvedWorkspaceFileImagePreview(props: {
   readonly accessibilityLabel: string;
-  readonly uri: string;
+  readonly source: AssetRequestSource;
 }) {
   const [loadError, setLoadError] = useState<string | null>(null);
   const [fullScreenVisible, setFullScreenVisible] = useState(false);
   const imageSource = useMemo(
-    () => ({ uri: props.uri, cache: "force-cache" as const }),
-    [props.uri],
+    () => ({
+      uri: props.source.uri,
+      headers: props.source.headers,
+      cache: "force-cache" as const,
+    }),
+    [props.source],
   );
   const fullScreenImages = useMemo(() => [imageSource], [imageSource]);
 
@@ -89,16 +94,16 @@ function CachedWorkspaceFileImagePreview(props: {
   return (
     <ResolvedWorkspaceFileImagePreview
       accessibilityLabel={props.accessibilityLabel}
-      uri={imageResult.value}
+      source={{ uri: imageResult.value }}
     />
   );
 }
 
 export function WorkspaceFileImagePreview(props: {
   readonly accessibilityLabel: string;
-  readonly uri: string | null;
+  readonly source: AssetRequestSource | null;
 }) {
-  if (props.uri === null) {
+  if (props.source === null) {
     return (
       <View className="flex-1 items-center justify-center gap-3 bg-card px-6">
         <ActivityIndicator />
@@ -109,10 +114,15 @@ export function WorkspaceFileImagePreview(props: {
     );
   }
 
-  return (
+  return props.source.headers === undefined ? (
     <CachedWorkspaceFileImagePreview
       accessibilityLabel={props.accessibilityLabel}
-      uri={props.uri}
+      uri={props.source.uri}
+    />
+  ) : (
+    <ResolvedWorkspaceFileImagePreview
+      accessibilityLabel={props.accessibilityLabel}
+      source={props.source}
     />
   );
 }

@@ -1,4 +1,10 @@
-import { AssetResource, EnvironmentId, WS_METHODS } from "@t3tools/contracts";
+import {
+  ASSET_SAME_ORIGIN_RELAY_V1_CAPABILITY,
+  AssetResource,
+  EnvironmentId,
+  WS_METHODS,
+  type AssetCreateUrlResult,
+} from "@t3tools/contracts";
 import * as Schema from "effect/Schema";
 import { Atom } from "effect/unstable/reactivity";
 
@@ -8,6 +14,8 @@ import { createEnvironmentRpcQueryAtomFamily } from "./runtime.ts";
 const ASSET_URL_REFRESH_INTERVAL_MS = 30 * 60_000;
 const ASSET_URL_STALE_TIME_MS = 5 * 60_000;
 const ASSET_URL_IDLE_TTL_MS = 60 * 60_000;
+const ASSET_SURFACE_RELAY_PREFIX = "/api/assets/relay/";
+const ASSET_SURFACE_BIND_PATH = `${ASSET_SURFACE_RELAY_PREFIX}surface`;
 
 export class InvalidAssetCollectionKeyError extends Schema.TaggedErrorClass<InvalidAssetCollectionKeyError>()(
   "InvalidAssetCollectionKeyError",
@@ -43,16 +51,61 @@ export function resolveAssetUrl(httpBaseUrl: string, relativeUrl: string): strin
   }
 }
 
+export async function bindAssetSurface(
+  httpBaseUrl: string,
+  asset: AssetCreateUrlResult,
+  fetchImpl: typeof fetch = globalThis.fetch,
+): Promise<string | null> {
+  const assetUrl = resolveAssetUrl(httpBaseUrl, asset.relativeUrl);
+  if (
+    assetUrl === null ||
+    asset.surfaceCredential === null ||
+    asset.surfaceCredential === undefined
+  ) {
+    return assetUrl;
+  }
+  if (!asset.relativeUrl.startsWith(ASSET_SURFACE_RELAY_PREFIX)) return null;
+
+  let bindingUrl: string;
+  try {
+    bindingUrl = new URL(ASSET_SURFACE_BIND_PATH, httpBaseUrl).toString();
+  } catch {
+    return null;
+  }
+  try {
+    const response = await fetchImpl(bindingUrl, {
+      method: "POST",
+      credentials: "include",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ credential: asset.surfaceCredential }),
+    });
+    return response.ok ? assetUrl : null;
+  } catch {
+    return null;
+  }
+}
+
 export function createAssetEnvironmentAtoms<R, E>(
   runtime: Atom.AtomRuntime<EnvironmentRegistry | R, E>,
 ) {
-  const createUrl = createEnvironmentRpcQueryAtomFamily(runtime, {
+  const createUrlQuery = createEnvironmentRpcQueryAtomFamily(runtime, {
     label: "environment-data:assets:create-url",
     tag: WS_METHODS.assetsCreateUrl,
     staleTimeMs: ASSET_URL_STALE_TIME_MS,
     idleTtlMs: ASSET_URL_IDLE_TTL_MS,
     refreshIntervalMs: ASSET_URL_REFRESH_INTERVAL_MS,
   });
+  const createUrl = (target: {
+    readonly environmentId: EnvironmentId;
+    readonly input: { readonly resource: AssetResource };
+  }) =>
+    createUrlQuery({
+      environmentId: target.environmentId,
+      input: {
+        resource: target.input.resource,
+        capabilities: [ASSET_SAME_ORIGIN_RELAY_V1_CAPABILITY],
+      },
+    });
   const createUrlsFamily = Atom.family((key: string) => {
     const [environmentId, resources] = parseAssetCollectionKey(key);
     return Atom.make((get) =>
