@@ -19,6 +19,7 @@ import * as NodeServices from "@effect/platform-node/NodeServices";
 import * as Clock from "effect/Clock";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
+import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as ManagedRuntime from "effect/ManagedRuntime";
 import * as Option from "effect/Option";
@@ -89,6 +90,7 @@ const makeSession = (
   status: OrchestrationSession["status"],
   activeTurnId: TurnId | null = null,
   lastError: string | null = null,
+  updatedAt: string = now,
 ): OrchestrationSession => ({
   threadId,
   status,
@@ -96,7 +98,7 @@ const makeSession = (
   runtimeMode: "full-access",
   activeTurnId,
   lastError,
-  updatedAt: now,
+  updatedAt,
 });
 
 const makeThreadState = (input: {
@@ -256,6 +258,7 @@ const sessionSetEvent = (
   status: OrchestrationSession["status"],
   activeTurnId: TurnId | null = null,
   lastError: string | null = null,
+  updatedAt: string = now,
 ): OrchestrationEvent =>
   ({
     eventId: EventId.make(`evt-session-${threadId}-${status}`),
@@ -263,7 +266,10 @@ const sessionSetEvent = (
     aggregateKind: "thread",
     aggregateId: threadId,
     occurredAt: now,
-    payload: { threadId, session: makeSession(threadId, status, activeTurnId, lastError) },
+    payload: {
+      threadId,
+      session: makeSession(threadId, status, activeTurnId, lastError, updatedAt),
+    },
   }) as unknown as OrchestrationEvent;
 
 const providerTurnStartFailedEvent = (
@@ -1461,6 +1467,37 @@ describe("ChildThreadCoordinator", () => {
     expect(turnStarts[0]!.message.text).toContain(`[sub-agent ${child} failed] session error`);
   });
 
+  it("settles a stopped running session and releases its lease during one-shot register", async () => {
+    const child = ThreadId.make("child-stopped-before-register");
+    const parent = ThreadId.make("parent-stopped-before-register");
+    const reason = "Provider process exited before child registration.";
+    const harness = await createHarness({
+      threads: [
+        makeThreadState({
+          threadId: child,
+          parentThreadId: parent,
+          latestTurn: makeLatestTurn("running"),
+          session: makeSession(child, "stopped", null, reason),
+        }),
+      ],
+    });
+    await harness.seedDispatchLease(child);
+
+    await harness.register({
+      parentThreadId: parent,
+      childThreadId: child,
+      detached: false,
+      model: codexModel,
+      spawnedAtMs: 0,
+    });
+
+    const result = await runtimeRun(harness, child);
+    expect(result.status).toBe("failed");
+    expect(result.error).toBe(reason);
+    expect(await harness.listDispatchLeaseChildIds()).not.toContain(child);
+    expect(await harness.canAcquireDispatchLease()).toBe(true);
+  });
+
   it("settles session-set ready with a completed projected turn as completed", async () => {
     const child = ThreadId.make("child-ready-completed");
     const parent = ThreadId.make("parent-ready-completed");
@@ -1910,16 +1947,150 @@ describe("ChildThreadCoordinator", () => {
     expect(result.finalAssistantText).toBe("same turn stopped complete");
   });
 
-  it("does NOT settle session-set stopped while the latest turn is still running", async () => {
-    const child = ThreadId.make("child-stopped-running");
-    const parent = ThreadId.make("parent-4b");
+  it("settles provider-death session states and releases capacity", async () => {
+    const deathCases = [
+      {
+        name: "zero-exit",
+        status: "stopped",
+        reason: "Provider process exited with code 0.",
+      },
+      {
+        name: "nonzero-exit",
+        status: "error",
+        reason: "Provider process exited with code 1.",
+      },
+      {
+        name: "signal",
+        status: "error",
+        reason: "Provider process exited after signal SIGKILL.",
+      },
+      {
+        name: "supervisor-reap",
+        status: "stopped",
+        reason: "Provider session was reaped after its process disappeared.",
+      },
+      {
+        name: "spawn-failure",
+        status: "error",
+        reason: "Provider process spawn failed after session creation.",
+      },
+    ] as const;
+    const parent = ThreadId.make("parent-provider-death");
+    const children = deathCases.map(({ name }) => ThreadId.make(`child-provider-death-${name}`));
+    const harness = await createHarness({
+      threads: deathCases.map((_, index) =>
+        makeThreadState({
+          threadId: children[index]!,
+          parentThreadId: parent,
+          latestTurn: makeLatestTurn("running"),
+          session: makeSession(children[index]!, "running", TurnId.make("turn-1")),
+        }),
+      ),
+    });
+
+    for (const [index, deathCase] of deathCases.entries()) {
+      const child = children[index]!;
+      await harness.register({
+        parentThreadId: parent,
+        childThreadId: child,
+        detached: false,
+        model: codexModel,
+        spawnedAtMs: 0,
+      });
+      await harness.seedDispatchLease(child);
+      harness.setThread(
+        makeThreadState({
+          threadId: child,
+          parentThreadId: parent,
+          latestTurn: makeLatestTurn("running"),
+          session: makeSession(child, deathCase.status, null, deathCase.reason),
+        }),
+      );
+
+      await harness.feed(sessionSetEvent(child, deathCase.status, null, deathCase.reason));
+
+      const slice = await runtimeWaitSlice(harness, [child], FAR_FUTURE_MS);
+      expect(slice.results[0]).toMatchObject({
+        status: "failed",
+        error: deathCase.reason,
+      });
+      expect(await harness.listDispatchLeaseChildIds()).not.toContain(child);
+      expect(await harness.canAcquireDispatchLease()).toBe(true);
+    }
+  });
+
+  it("preserves the provider-death error when replay settles a stopped session", async () => {
+    const child = ThreadId.make("child-replayed-provider-death-reason");
+    const parent = ThreadId.make("parent-replayed-provider-death-reason");
+    const reason = "Provider process exited after signal SIGKILL.";
     const harness = await createHarness({
       threads: [
         makeThreadState({
           threadId: child,
           parentThreadId: parent,
           latestTurn: makeLatestTurn("running"),
-          session: makeSession(child, "stopped"),
+          session: makeSession(child, "stopped", null, reason),
+        }),
+      ],
+      seedChildRows: [{ threadId: child, parentThreadId: parent }],
+      persistedEvents: [sessionSetEvent(child, "stopped", null, reason)],
+    });
+
+    const result = await runtimeRun(harness, child);
+    expect(result.status).toBe("failed");
+    expect(result.error).toBe(reason);
+  });
+
+  it("surfaces provider-death lastError from non-running projected lifecycle", async () => {
+    const reason = "Provider process exited after signal SIGTERM.";
+    const cases = [
+      {
+        name: "session-error",
+        latestTurn: makeLatestTurn("error"),
+        sessionStatus: "error",
+      },
+      {
+        name: "stopped-interrupted",
+        latestTurn: makeLatestTurn("interrupted"),
+        sessionStatus: "stopped",
+      },
+    ] as const;
+
+    for (const providerDeathCase of cases) {
+      const child = ThreadId.make(`child-projected-last-error-${providerDeathCase.name}`);
+      const parent = ThreadId.make(`parent-projected-last-error-${providerDeathCase.name}`);
+      const harness = await createHarness({
+        threads: [
+          makeThreadState({
+            threadId: child,
+            parentThreadId: parent,
+            latestTurn: providerDeathCase.latestTurn,
+            session: makeSession(child, providerDeathCase.sessionStatus, null, reason),
+          }),
+        ],
+        seedChildRows: [{ threadId: child, parentThreadId: parent }],
+      });
+
+      const result = await runtimeRun(harness, child);
+      expect(result.status).toBe("failed");
+      expect(result.error).toBe(reason);
+    }
+  });
+
+  it("does not settle stale stopped while replacement start is pending", async () => {
+    const child = ThreadId.make("child-stale-stopped-pending-replacement");
+    const parent = ThreadId.make("parent-stale-stopped-pending-replacement");
+    const oldTurnId = TurnId.make("pending-race-old-turn");
+    const replacementRequestId = EventId.make("evt-pending-race-replacement-start");
+    const reason = "superseded provider process exited before replacement session-set";
+    const stoppedAt = "2026-06-17T10:00:01.000Z";
+    const harness = await createHarness({
+      threads: [
+        makeThreadState({
+          threadId: child,
+          parentThreadId: parent,
+          latestTurn: makeLatestTurn("running", oldTurnId),
+          session: makeSession(child, "running", oldTurnId),
         }),
       ],
     });
@@ -1930,10 +2101,171 @@ describe("ChildThreadCoordinator", () => {
       model: codexModel,
       spawnedAtMs: 0,
     });
-    await harness.feed(sessionSetEvent(child, "stopped"));
+    await harness.seedDispatchLease(child);
+    await harness.feed(sessionSetEvent(child, "running", oldTurnId));
+    await harness.feed(turnDiffEvent(child, "missing", oldTurnId));
+    await harness.feed(turnStartRequestedEvent(child, replacementRequestId));
+    harness.setThread(
+      makeThreadState({
+        threadId: child,
+        parentThreadId: parent,
+        latestTurn: makeLatestTurn("running", oldTurnId),
+        session: makeSession(child, "stopped", null, reason, stoppedAt),
+      }),
+    );
+
+    await harness.feed(sessionSetEvent(child, "stopped", null, reason, stoppedAt));
+
+    const pendingSlice = await runtimeWaitSlice(harness, [child], FAR_FUTURE_MS);
+    expect(pendingSlice.results[0]!.status).toBe("pending");
+    expect(await harness.listDispatchLeaseChildIds()).toContain(child);
+
+    await harness.feed(providerTurnStartFailedEvent(child, replacementRequestId));
+
+    const result = await runtimeRun(harness, child);
+    expect(result.status).toBe("failed");
+    expect(result.error).toBe(reason);
+    expect(await harness.listDispatchLeaseChildIds()).not.toContain(child);
+  });
+
+  it("does not settle a stale stopped event after a replacement session is running", async () => {
+    const child = ThreadId.make("child-stale-stopped-after-replacement");
+    const parent = ThreadId.make("parent-stale-stopped-after-replacement");
+    const oldTurnId = TurnId.make("superseded-turn");
+    const replacementTurnId = TurnId.make("replacement-turn");
+    const harness = await createHarness({
+      threads: [
+        makeThreadState({
+          threadId: child,
+          parentThreadId: parent,
+          latestTurn: makeLatestTurn("running", oldTurnId),
+          session: makeSession(child, "running", oldTurnId),
+        }),
+      ],
+    });
+    await harness.register({
+      parentThreadId: parent,
+      childThreadId: child,
+      detached: false,
+      model: codexModel,
+      spawnedAtMs: 0,
+    });
+    await harness.seedDispatchLease(child);
+    await harness.feed(turnDiffEvent(child, "missing", oldTurnId));
+    await harness.feed(turnStartRequestedEvent(child));
+    harness.setThread(
+      makeThreadState({
+        threadId: child,
+        parentThreadId: parent,
+        latestTurn: makeLatestTurn("running", replacementTurnId),
+        session: makeSession(child, "running", replacementTurnId),
+      }),
+    );
+    await harness.feed(sessionSetEvent(child, "running", replacementTurnId));
+
+    await harness.feed(
+      sessionSetEvent(child, "stopped", null, "superseded provider process exited"),
+    );
+
     const slice = await runtimeWaitSlice(harness, [child], FAR_FUTURE_MS);
     expect(slice.results[0]!.status).toBe("pending");
+    expect(await harness.listDispatchLeaseChildIds()).toContain(child);
   });
+
+  it("does not settle stale stopped after a same-turn replacement session is running", async () => {
+    const child = ThreadId.make("child-stale-stopped-after-same-turn-replacement");
+    const parent = ThreadId.make("parent-stale-stopped-after-same-turn-replacement");
+    const turnId = TurnId.make("reused-turn");
+    const harness = await createHarness({
+      threads: [
+        makeThreadState({
+          threadId: child,
+          parentThreadId: parent,
+          latestTurn: makeLatestTurn("running", turnId),
+          session: makeSession(child, "running", turnId),
+        }),
+      ],
+    });
+    await harness.register({
+      parentThreadId: parent,
+      childThreadId: child,
+      detached: false,
+      model: codexModel,
+      spawnedAtMs: 0,
+    });
+    await harness.seedDispatchLease(child);
+    await harness.feed(turnDiffEvent(child, "missing", turnId));
+    await harness.feed(turnStartRequestedEvent(child));
+    await harness.feed(sessionSetEvent(child, "running", turnId));
+
+    await harness.feed(
+      sessionSetEvent(child, "stopped", null, "superseded same-turn provider exited"),
+    );
+
+    const slice = await runtimeWaitSlice(harness, [child], FAR_FUTURE_MS);
+    expect(slice.results[0]!.status).toBe("pending");
+    expect(await harness.listDispatchLeaseChildIds()).toContain(child);
+  });
+
+  for (const { timestampCase, projectedSessionAt } of [
+    {
+      timestampCase: "older",
+      projectedSessionAt: "2026-06-17T10:00:02.000Z",
+    },
+    {
+      timestampCase: "equal-timestamp",
+      projectedSessionAt: "2026-06-17T10:00:01.000Z",
+    },
+  ] as const) {
+    it(`rejects an ${timestampCase} stopped event while the projected session runs the same turn`, async () => {
+      const child = ThreadId.make(`child-${timestampCase}-stopped-same-turn-projection`);
+      const parent = ThreadId.make(`parent-${timestampCase}-stopped-same-turn-projection`);
+      const turnId = TurnId.make("reconnected-turn");
+      const stoppedSessionAt = "2026-06-17T10:00:01.000Z";
+      const harness = await createHarness({
+        threads: [
+          makeThreadState({
+            threadId: child,
+            parentThreadId: parent,
+            latestTurn: makeLatestTurn("running", turnId),
+            session: makeSession(child, "running", turnId, null, stoppedSessionAt),
+          }),
+        ],
+      });
+      await harness.register({
+        parentThreadId: parent,
+        childThreadId: child,
+        detached: false,
+        model: codexModel,
+        spawnedAtMs: 0,
+      });
+      await harness.seedDispatchLease(child);
+      await harness.feed(turnDiffEvent(child, "missing", turnId));
+      harness.setThread(
+        makeThreadState({
+          threadId: child,
+          parentThreadId: parent,
+          latestTurn: makeLatestTurn("running", turnId),
+          session: makeSession(child, "running", turnId, null, projectedSessionAt),
+        }),
+      );
+
+      await harness.feed(
+        sessionSetEvent(
+          child,
+          "stopped",
+          null,
+          "ambiguous provider process exited",
+          stoppedSessionAt,
+        ),
+      );
+
+      const entries = await runtimeListChildren(harness, parent);
+      expect(entries).toHaveLength(1);
+      expect(entries[0]!.settled).toBe(false);
+      expect(await harness.listDispatchLeaseChildIds()).toContain(child);
+    });
+  }
 
   it("settles stopped after a stale completed projection with a newer user message as failed", async () => {
     const child = ThreadId.make("child-stopped-stale-completed-newer-user");
@@ -1987,7 +2319,7 @@ describe("ChildThreadCoordinator", () => {
     });
 
     await harness.feed(turnDiffEvent(child, "missing"));
-    await harness.feed(sessionSetEvent(child, "stopped"));
+    await harness.feed(sessionSetEvent(child, "stopped", null, null, "2026-06-17T10:00:01.000Z"));
 
     const result = await runtimeRun(harness, child);
     expect(result.status).toBe("failed");
@@ -2609,12 +2941,14 @@ describe("ChildThreadCoordinator", () => {
 
     const result = await runtimeRun(harness, child);
     expect(result.status).toBe("failed");
-    expect(result.error).toBe("session error");
+    expect(result.error).toBe("provider process exited");
     const parentWakes = harness.dispatched.filter(
       (command) => command.type === "thread.turn.start" && command.threadId === parent,
     ) as Array<Extract<OrchestrationCommand, { type: "thread.turn.start" }>>;
     expect(parentWakes).toHaveLength(1);
-    expect(parentWakes[0]!.message.text).toContain(`[sub-agent ${child} failed] session error`);
+    expect(parentWakes[0]!.message.text).toContain(
+      `[sub-agent ${child} failed] provider process exited`,
+    );
   });
 
   it("does not replay a stale provider error over a replacement projected session", async () => {
@@ -2671,7 +3005,7 @@ describe("ChildThreadCoordinator", () => {
       ],
     });
 
-    await harness.feed(sessionSetEvent(child, "stopped"));
+    await harness.feed(sessionSetEvent(child, "stopped", null, null, "2026-06-17T10:00:01.000Z"));
 
     const result = await runtimeRun(harness, child);
     expect(result.status).toBe("failed");
@@ -3514,6 +3848,206 @@ describe("ChildThreadCoordinator", () => {
     const slice = await runtimeWaitSlice(harness, [childIds[0]!], PAST_MS);
     expect(slice.results[0]!.status).toBe("timeout");
     expect(await harness.canAcquireDispatchLease()).toBe(true);
+  });
+
+  it("keeps inactive unarchived provider-death projections pending on boot", async () => {
+    const parent = ThreadId.make("recon-unarchive-provider-death-pending-parent");
+    const child = ThreadId.make("recon-unarchive-provider-death-pending-child");
+    const harness = await createHarness({
+      threads: [
+        makeThreadState({
+          threadId: child,
+          parentThreadId: parent,
+          latestTurn: makeLatestTurn("running"),
+          session: makeSession(child, "stopped", null, "Provider process exited with code 0."),
+        }),
+      ],
+      seedChildRows: [{ threadId: child, parentThreadId: parent }],
+      persistedEvents: [threadArchivedEvent(child), threadUnarchivedEvent(child)],
+    });
+
+    const entries = await runtimeListChildren(harness, parent);
+    expect(entries).toHaveLength(1);
+    expect(entries[0]!.settled).toBe(false);
+    const slice = await runtimeWaitSlice(harness, [child], PAST_MS);
+    expect(slice.results[0]!.status).toBe("timeout");
+    expect(await harness.listPendingDispatches()).toEqual([]);
+  });
+
+  it("keeps inactive unarchived stopped interrupted projections pending on boot", async () => {
+    const parent = ThreadId.make("recon-unarchive-stopped-terminal-pending-parent");
+    const terminalCases = [
+      {
+        name: "stopped-interrupted",
+        sessionStatus: "stopped",
+        latestTurn: makeLatestTurn("interrupted"),
+        reason: "Provider process exited with code 0.",
+      },
+      {
+        name: "stopped-error-turn",
+        sessionStatus: "stopped",
+        latestTurn: makeLatestTurn("error"),
+        reason: "Provider process exited with code 1.",
+      },
+      {
+        name: "error-session",
+        sessionStatus: "error",
+        latestTurn: makeLatestTurn("error"),
+        reason: "Provider process exited after signal SIGKILL.",
+      },
+    ] as const;
+    const childIds = terminalCases.map(({ name }) =>
+      ThreadId.make(`recon-unarchive-terminal-session-pending-child-${name}`),
+    );
+    const harness = await createHarness({
+      threads: terminalCases.map((terminalCase, index) =>
+        makeThreadState({
+          threadId: childIds[index]!,
+          parentThreadId: parent,
+          latestTurn: terminalCase.latestTurn,
+          session: makeSession(
+            childIds[index]!,
+            terminalCase.sessionStatus,
+            null,
+            terminalCase.reason,
+          ),
+        }),
+      ),
+      seedChildRows: childIds.map((threadId) => ({ threadId, parentThreadId: parent })),
+      persistedEvents: childIds.flatMap((threadId) => [
+        threadArchivedEvent(threadId),
+        threadUnarchivedEvent(threadId),
+      ]),
+      slowThreadDetailReadNumbers: childIds.map((threadId) => ({
+        threadId,
+        readNumbers: [2],
+      })),
+    });
+
+    const entries = await runtimeListChildren(harness, parent);
+    expect(entries).toHaveLength(terminalCases.length);
+    expect(entries.every((entry) => !entry.settled)).toBe(true);
+
+    const waitFiber = Effect.runFork(
+      harness.coordinator.waitSlice({
+        childThreadIds: childIds,
+        mode: "all",
+        budgetDeadlineMs: FAR_FUTURE_MS,
+      }),
+    );
+    try {
+      for (let index = 0; index < 50; index += 1) {
+        await Effect.runPromise(Effect.yieldNow);
+      }
+      const entriesAfterWaitCheck = await runtimeListChildren(harness, parent);
+      expect(entriesAfterWaitCheck.every((entry) => !entry.settled)).toBe(true);
+      expect(await harness.listPendingDispatches()).toEqual([]);
+    } finally {
+      await Effect.runPromise(Fiber.interrupt(waitFiber));
+    }
+  });
+
+  it("keeps replay-derived stopped interrupted projections pending after unarchive on boot", async () => {
+    const child = ThreadId.make("recon-unarchive-replayed-stopped-interrupted-child");
+    const parent = ThreadId.make("recon-unarchive-replayed-stopped-interrupted-parent");
+    const staleWakeId = PendingDispatchId.make(
+      "pd-recon-unarchive-replayed-stopped-interrupted-stale",
+    );
+    const turn1 = TurnId.make("turn-before-unarchive");
+    const reason = "Provider process exited with code 0.";
+    const sessionStoppedAt = "2026-06-17T09:59:59.000Z";
+    const interruptedProjectionAt = "2026-06-17T10:00:01.000Z";
+    const harness = await createHarness({
+      threads: [
+        makeThreadState({
+          threadId: parent,
+          latestTurn: makeLatestTurn("completed", TurnId.make("parent-turn")),
+          session: makeSession(parent, "ready"),
+        }),
+        makeThreadState({
+          threadId: child,
+          parentThreadId: parent,
+          latestTurn: makeLatestTurn("interrupted", turn1, interruptedProjectionAt),
+          session: makeSession(child, "stopped", null, reason, sessionStoppedAt),
+        }),
+      ],
+      seedChildRows: [{ threadId: child, parentThreadId: parent }],
+      persistedEvents: [
+        sessionSetEvent(child, "running", turn1),
+        sessionSetEvent(child, "ready"),
+        threadArchivedEvent(child),
+        threadUnarchivedEvent(child),
+      ],
+      seedPendingDispatches: [
+        {
+          id: staleWakeId,
+          kind: "parent_injection",
+          targetThreadId: parent,
+          sourceChildId: child,
+          text: null,
+          error: reason,
+          status: "failed",
+          commandId: null,
+          deliveredByWait: true,
+          waitCancellable: true,
+          createdAt: sessionStoppedAt as unknown as PendingDispatch["createdAt"],
+        },
+      ],
+      seedWaitDeliveries: [{ childThreadId: child, parentThreadId: parent }],
+      seedPromotedChildren: [{ childThreadId: child, parentThreadId: parent }],
+    });
+
+    const entries = await runtimeListChildren(harness, parent);
+    expect(entries).toHaveLength(1);
+    expect(entries[0]!.settled).toBe(false);
+    expect(await harness.listPendingDispatches()).toEqual([]);
+    expect(await harness.listWaitDeliveries()).toEqual([]);
+    expect(await harness.listPromotedChildren()).toEqual([]);
+    expect(await harness.listDispatchLeaseChildIds()).toEqual([]);
+    expect(await harness.canAcquireDispatchLease()).toBe(true);
+    expect(
+      harness.dispatched.filter(
+        (command) => command.type === "thread.turn.start" && command.threadId === parent,
+      ),
+    ).toEqual([]);
+  });
+
+  it("settles newer unarchived terminal session projections on boot", async () => {
+    const child = ThreadId.make("recon-unarchive-newer-terminal-session-child");
+    const parent = ThreadId.make("recon-unarchive-newer-terminal-session-parent");
+    const terminalAt = "2026-06-17T10:00:01.000Z";
+    const reason = "Provider process exited after signal SIGTERM.";
+    const harness = await createHarness({
+      threads: [
+        makeThreadState({
+          threadId: parent,
+          latestTurn: makeLatestTurn("completed", TurnId.make("parent-turn")),
+          session: makeSession(parent, "ready"),
+        }),
+        makeThreadState({
+          threadId: child,
+          parentThreadId: parent,
+          latestTurn: makeLatestTurn("interrupted", TurnId.make("turn-before-unarchive")),
+          session: makeSession(child, "stopped", null, reason, terminalAt),
+        }),
+      ],
+      seedChildRows: [{ threadId: child, parentThreadId: parent }],
+      persistedEvents: [threadArchivedEvent(child), threadUnarchivedEvent(child)],
+      slowThreadDetailReadNumbers: [{ threadId: child, readNumbers: [2] }],
+    });
+
+    const entries = await runtimeListChildren(harness, parent);
+    expect(entries).toHaveLength(1);
+    expect(entries[0]!.settled).toBe(true);
+    const result = await runtimeRun(harness, child);
+    expect(result.status).toBe("failed");
+    expect(result.error).toBe(reason);
+    expect(await harness.listDispatchLeaseChildIds()).not.toContain(child);
+    const parentWakes = harness.dispatched.filter(
+      (command) => command.type === "thread.turn.start" && command.threadId === parent,
+    ) as Array<Extract<OrchestrationCommand, { type: "thread.turn.start" }>>;
+    expect(parentWakes).toHaveLength(1);
+    expect(parentWakes[0]!.message.text).toContain(`[sub-agent ${child} failed] ${reason}`);
   });
 
   it("does not re-mark fully pruned archived wakes as queued on boot", async () => {
@@ -5552,18 +6086,31 @@ describe("ChildThreadCoordinator", () => {
     expect(result.error).toBe("session stopped");
   });
 
-  it("keeps boot-reconciled stopped running children pending", async () => {
+  it("settles boot-reconciled provider-dead running children and frees all six leases", async () => {
     const parent = ThreadId.make("boot-stopped-running-parent");
-    const childIds = Array.from({ length: 6 }, (_, index) =>
-      ThreadId.make(`boot-stopped-running-child-${index + 1}`),
+    const bootDeathCases = [
+      { name: "zero-exit", status: "stopped", reason: "Provider process exited with code 0." },
+      { name: "reaped", status: "stopped", reason: "Provider session process was reaped." },
+      { name: "gone", status: "stopped", reason: "Provider instance disappeared." },
+      { name: "nonzero", status: "error", reason: "Provider process exited with code 1." },
+      { name: "signal", status: "error", reason: "Provider process received SIGKILL." },
+      { name: "spawn", status: "error", reason: "Provider process spawn failed." },
+    ] as const;
+    const childIds = bootDeathCases.map(({ name }) =>
+      ThreadId.make(`boot-stopped-running-child-${name}`),
     );
     const harness = await createHarness({
-      threads: childIds.map((threadId) =>
+      threads: childIds.map((threadId, index) =>
         makeThreadState({
           threadId,
           parentThreadId: parent,
           latestTurn: makeLatestTurn("running"),
-          session: makeSession(threadId, "stopped"),
+          session: makeSession(
+            threadId,
+            bootDeathCases[index]!.status,
+            null,
+            bootDeathCases[index]!.reason,
+          ),
         }),
       ),
       seedChildRows: childIds.map((threadId) => ({ threadId, parentThreadId: parent })),
@@ -5572,8 +6119,37 @@ describe("ChildThreadCoordinator", () => {
 
     const entries = await runtimeListChildren(harness, parent);
     expect(entries).toHaveLength(6);
-    expect(entries.every((entry) => !entry.settled)).toBe(true);
-    expect(await harness.canAcquireDispatchLease()).toBe(false);
+    expect(entries.every((entry) => entry.settled)).toBe(true);
+    const slice = await runtimeWaitSlice(harness, childIds, FAR_FUTURE_MS);
+    expect(slice.results.map(({ status, error }) => ({ status, error }))).toEqual(
+      bootDeathCases.map(({ reason }) => ({ status: "failed", error: reason })),
+    );
+    expect(await harness.listDispatchLeaseChildIds()).toEqual([]);
+    expect(await harness.canAcquireDispatchLease()).toBe(true);
+  });
+
+  it("skips one-shot stopped settlement when replay observed a newer active turn", async () => {
+    const child = ThreadId.make("boot-stale-stopped-replayed-active-child");
+    const parent = ThreadId.make("boot-stale-stopped-replayed-active-parent");
+    const staleTurnId = TurnId.make("stale-projected-turn");
+    const activeTurnId = TurnId.make("replayed-active-turn");
+    const harness = await createHarness({
+      threads: [
+        makeThreadState({
+          threadId: child,
+          parentThreadId: parent,
+          latestTurn: makeLatestTurn("running", staleTurnId),
+          session: makeSession(child, "stopped", null, "stale provider stopped"),
+        }),
+      ],
+      seedChildRows: [{ threadId: child, parentThreadId: parent }],
+      persistedEvents: [sessionSetEvent(child, "running", activeTurnId)],
+    });
+
+    const entries = await runtimeListChildren(harness, parent);
+    expect(entries).toHaveLength(1);
+    expect(entries[0]!.settled).toBe(false);
+    expect(await harness.listDispatchLeaseChildIds()).toContain(child);
   });
 
   it("does not let stale projection terminal override replayed pending starts", async () => {
