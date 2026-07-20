@@ -505,7 +505,7 @@ cursorAdapterTestLayer("CursorAdapterLive", (it) => {
     }),
   );
 
-  it.effect("settles a completed turn when the Cursor notification stream exits before drain", () =>
+  it.effect("settles a turn when the Cursor notification stream exits before drain", () =>
     Effect.gen(function* () {
       const adapter = yield* CursorAdapter;
       const settings = yield* ServerSettingsService;
@@ -547,11 +547,142 @@ cursorAdapterTestLayer("CursorAdapterLive", (it) => {
         })
         .pipe(Effect.timeout("2 seconds"));
       const completed = yield* Deferred.await(turnCompleted).pipe(Effect.timeout("2 seconds"));
-      assert.equal(completed.payload.state, "completed");
+      // The agent exited without emitting any assistant output, so the turn
+      // must settle as an explicit empty-response failure, never a silent
+      // successful completion.
+      assert.equal(completed.payload.state, "failed");
+      assert.ok(completed.payload.errorMessage);
 
       yield* adapter.stopSession(threadId);
       yield* Fiber.interrupt(runtimeEventsFiber);
     }),
+  );
+
+  it.effect("fails a completed turn that produced no assistant output", () =>
+    Effect.gen(function* () {
+      const adapter = yield* CursorAdapter;
+      const settings = yield* ServerSettingsService;
+      const threadId = ThreadId.make("cursor-empty-turn-fails-thread");
+      const turnCompleted =
+        yield* Deferred.make<Extract<ProviderRuntimeEvent, { type: "turn.completed" }>>();
+      const contentDeltas: Array<string> = [];
+
+      const wrapperPath = yield* Effect.promise(() =>
+        makeMockAgentWrapper({
+          T3_ACP_EMIT_EMPTY_TURN: "1",
+        }),
+      );
+      yield* settings.updateSettings({ providers: { cursor: { binaryPath: wrapperPath } } });
+
+      const runtimeEventsFiber = yield* Stream.runForEach(adapter.streamEvents, (event) =>
+        Effect.gen(function* () {
+          if (String(event.threadId) !== String(threadId)) {
+            return;
+          }
+          if (event.type === "content.delta") {
+            contentDeltas.push(event.payload.delta);
+            return;
+          }
+          if (event.type === "turn.completed") {
+            yield* Deferred.succeed(turnCompleted, event).pipe(Effect.ignore);
+          }
+        }),
+      ).pipe(Effect.forkChild);
+
+      yield* adapter.startSession({
+        threadId,
+        provider: ProviderDriverKind.make("cursor"),
+        cwd: process.cwd(),
+        runtimeMode: "full-access",
+        modelSelection: { instanceId: ProviderInstanceId.make("cursor"), model: "default" },
+      });
+
+      yield* adapter
+        .sendTurn({ threadId, input: "reply with nothing", attachments: [] })
+        .pipe(Effect.timeout("2 seconds"));
+      const completed = yield* Deferred.await(turnCompleted).pipe(Effect.timeout("2 seconds"));
+
+      assert.deepEqual(contentDeltas, []);
+      assert.equal(completed.payload.state, "failed");
+      assert.equal(completed.payload.stopReason, "end_turn");
+      assert.ok(completed.payload.errorMessage);
+
+      yield* adapter.stopSession(threadId);
+      yield* Fiber.interrupt(runtimeEventsFiber);
+    }),
+  );
+
+  it.effect(
+    "emits coalesced message chunks before turn completion and never exposes thoughts",
+    () =>
+      Effect.gen(function* () {
+        const adapter = yield* CursorAdapter;
+        const settings = yield* ServerSettingsService;
+        const threadId = ThreadId.make("cursor-coalesced-buffer-thread");
+        const turnCompleted = yield* Deferred.make<void>();
+        const observed: Array<{ type: string; text?: string }> = [];
+
+        const wrapperPath = yield* Effect.promise(() =>
+          makeMockAgentWrapper({
+            T3_ACP_EMIT_COALESCED_THOUGHT_MESSAGE_BUFFER: "1",
+          }),
+        );
+        yield* settings.updateSettings({ providers: { cursor: { binaryPath: wrapperPath } } });
+
+        const runtimeEventsFiber = yield* Stream.runForEach(adapter.streamEvents, (event) =>
+          Effect.gen(function* () {
+            if (String(event.threadId) !== String(threadId)) {
+              return;
+            }
+            if (event.type === "content.delta") {
+              observed.push({ type: event.type, text: event.payload.delta });
+              return;
+            }
+            if (event.type === "item.started" || event.type === "item.completed") {
+              observed.push({ type: event.type });
+              return;
+            }
+            if (event.type === "turn.completed") {
+              observed.push({ type: event.type });
+              yield* Deferred.succeed(turnCompleted, undefined).pipe(Effect.ignore);
+            }
+          }),
+        ).pipe(Effect.forkChild);
+
+        yield* adapter.startSession({
+          threadId,
+          provider: ProviderDriverKind.make("cursor"),
+          cwd: process.cwd(),
+          runtimeMode: "full-access",
+          modelSelection: { instanceId: ProviderInstanceId.make("cursor"), model: "default" },
+        });
+
+        yield* adapter
+          .sendTurn({ threadId, input: "answer from one buffer", attachments: [] })
+          .pipe(Effect.timeout("2 seconds"));
+        yield* Deferred.await(turnCompleted).pipe(Effect.timeout("2 seconds"));
+
+        const deltas = observed.filter((entry) => entry.type === "content.delta");
+        const completedIndex = observed.findIndex((entry) => entry.type === "turn.completed");
+        const expectedText = Array.from({ length: 6 }, (_, index) => `answer ${index} `).join("");
+        assert.equal(deltas.map((entry) => entry.text).join(""), expectedText);
+        // Every visible chunk (and its item lifecycle events) must precede the
+        // turn completion; reasoning chunks must never surface as content.
+        assert.ok(completedIndex >= 0);
+        assert.equal(
+          observed.slice(completedIndex + 1).filter((entry) => entry.type === "content.delta")
+            .length,
+          0,
+        );
+        assert.ok(observed.slice(0, completedIndex).some((entry) => entry.type === "item.started"));
+        assert.ok(
+          observed.slice(0, completedIndex).some((entry) => entry.type === "item.completed"),
+        );
+        assert.ok(observed.every((entry) => !(entry.text ?? "").includes("secret thought")));
+
+        yield* adapter.stopSession(threadId);
+        yield* Fiber.interrupt(runtimeEventsFiber);
+      }),
   );
 
   it.effect("clears a resumed active turn when interrupted before a local prompt", () =>

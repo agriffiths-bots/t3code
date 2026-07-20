@@ -438,6 +438,12 @@ export const make = (
         // One runtime projects one root ACP session. Child-session updates need
         // explicit lineage routing and must never be flattened into this stream.
         if (activeSessionId === undefined || notification.sessionId !== activeSessionId) {
+          yield* Effect.logDebug("ACP session update dropped for non-root session").pipe(
+            Effect.annotateLogs({
+              updateType: notification.update.sessionUpdate,
+              sessionIdMatch: false,
+            }),
+          );
           return;
         }
         yield* handleSessionUpdate({
