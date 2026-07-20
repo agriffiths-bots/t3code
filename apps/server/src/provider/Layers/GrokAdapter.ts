@@ -73,6 +73,25 @@ const encodeUnknownJsonStringExit = Schema.encodeUnknownExit(Schema.UnknownFromJ
 
 const PROVIDER = ProviderDriverKind.make("grok");
 const GROK_RESUME_VERSION = 1 as const;
+const GROK_EMPTY_TURN_ERROR_MESSAGE =
+  "Grok completed the turn without returning any assistant output. The response was empty or was not delivered to this session.";
+
+function grokCompletedTurnPayload(
+  stopReason: EffectAcpSchema.StopReason | null,
+  hasVisibleOutput: boolean,
+): Extract<ProviderRuntimeEvent, { type: "turn.completed" }>["payload"] {
+  if (stopReason === "cancelled") {
+    return { state: "cancelled", stopReason };
+  }
+  if (!hasVisibleOutput) {
+    return {
+      state: "failed",
+      stopReason,
+      errorMessage: GROK_EMPTY_TURN_ERROR_MESSAGE,
+    };
+  }
+  return { state: "completed", stopReason };
+}
 
 function encodeJsonStringForDiagnostics(input: unknown): string | undefined {
   const result = encodeUnknownJsonStringExit(input);
@@ -113,6 +132,8 @@ interface GrokSessionContext {
   activeTurnId: TurnId | undefined;
   /** Turns already interrupted; late prompt RPCs must not resurrect them. */
   interruptedTurnIds: Set<TurnId>;
+  /** Turn ids that produced output surfaced by the runtime. */
+  readonly turnsWithVisibleOutput: Set<string>;
   /** Number of sendTurn prompts currently in flight or being prepared.
    * >0 means a turn is actively running, so a new sendTurn is a steer that
    * continues it, and only the last remaining prompt settles the turn. */
@@ -349,13 +370,14 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
                 provider: PROVIDER,
                 threadId,
                 turnId,
-                payload: {
-                  state: options.completedStopReason === "cancelled" ? "cancelled" : "completed",
-                  stopReason: options.completedStopReason ?? null,
-                },
+                payload: grokCompletedTurnPayload(
+                  options.completedStopReason,
+                  liveCtx.turnsWithVisibleOutput.has(String(turnId)),
+                ),
               });
             }
           }
+          liveCtx.turnsWithVisibleOutput.delete(String(turnId));
           return;
         }
         let settleTurnId = turnId;
@@ -374,6 +396,7 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
                   updatedAt,
                 };
               }
+              liveCtx.turnsWithVisibleOutput.delete(String(turnId));
               return;
             }
             settleTurnId = fallbackTurnId;
@@ -396,6 +419,7 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
         const shouldEmitFailedTurn = options?.errorMessage !== undefined && canEmitTurnCompletion;
         const shouldEmitCompletedTurn =
           options?.completedStopReason !== undefined && canEmitTurnCompletion;
+        const hasVisibleOutput = liveCtx.turnsWithVisibleOutput.has(String(settleTurnId));
         const { activeTurnId: _activeTurnId, ...readySession } = liveCtx.session;
         liveCtx.activeTurnId = undefined;
         liveCtx.session = {
@@ -404,6 +428,7 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
           updatedAt,
         };
         if (options?.emitTurnCompletion === false) {
+          liveCtx.turnsWithVisibleOutput.delete(String(settleTurnId));
           return;
         }
         if (shouldEmitFailedTurn) {
@@ -425,12 +450,11 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
             provider: PROVIDER,
             threadId,
             turnId: settleTurnId,
-            payload: {
-              state: options.completedStopReason === "cancelled" ? "cancelled" : "completed",
-              stopReason: options.completedStopReason ?? null,
-            },
+            payload: grokCompletedTurnPayload(options.completedStopReason, hasVisibleOutput),
           });
         }
+        liveCtx.interruptedTurnIds.delete(settleTurnId);
+        liveCtx.turnsWithVisibleOutput.delete(String(settleTurnId));
       });
 
     const logNative = (threadId: ThreadId, method: string, payload: unknown) =>
@@ -482,6 +506,9 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
           return;
         }
         ctx.lastPlanFingerprint = fingerprint;
+        if (turnId !== undefined) {
+          ctx.turnsWithVisibleOutput.add(String(turnId));
+        }
         yield* offerRuntimeEvent(
           makeAcpPlanUpdatedEvent({
             stamp,
@@ -624,6 +651,9 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
                       const runtimeRequestId = RuntimeRequestId.make(requestId);
                       const resolution = yield* Deferred.make<PendingUserInputResolution>();
                       const turnId = resolveSessionCallbackTurnId(sessions, input.threadId);
+                      if (turnId !== undefined) {
+                        sessions.get(input.threadId)?.turnsWithVisibleOutput.add(String(turnId));
+                      }
                       pendingUserInputs.set(requestId, { resolution });
                       yield* offerRuntimeEvent({
                         type: "user-input.requested",
@@ -687,6 +717,9 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
                   const runtimeRequestId = RuntimeRequestId.make(requestId);
                   const decision = yield* Deferred.make<ProviderApprovalDecision>();
                   const turnId = resolveSessionCallbackTurnId(sessions, input.threadId);
+                  if (turnId !== undefined) {
+                    sessions.get(input.threadId)?.turnsWithVisibleOutput.add(String(turnId));
+                  }
                   pendingApprovals.set(requestId, { decision });
                   yield* offerRuntimeEvent(
                     makeAcpRequestOpenedEvent({
@@ -781,6 +814,7 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
             lastPlanFingerprint: undefined,
             activeTurnId: undefined,
             interruptedTurnIds: new Set(),
+            turnsWithVisibleOutput: new Set(),
             promptsInFlight: 0,
             currentModelId: boundModelId,
             stopped: false,
@@ -850,6 +884,7 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
                     );
                     return;
                   case "ToolCallUpdated":
+                    ctx.turnsWithVisibleOutput.add(String(notificationTurnId));
                     yield* offerRuntimeEvent(
                       makeAcpToolCallEvent({
                         stamp,
@@ -862,6 +897,9 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
                     );
                     return;
                   case "ContentDelta":
+                    if (event.text.trim().length > 0) {
+                      ctx.turnsWithVisibleOutput.add(String(notificationTurnId));
+                    }
                     yield* offerRuntimeEvent(
                       makeAcpContentDeltaEvent({
                         stamp,
@@ -1155,51 +1193,13 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
                 updatedAt: yield* nowIso,
                 ...(prepared.displayModel ? { model: prepared.displayModel } : {}),
               };
-              const remainingPrompts = Math.max(0, ctx.promptsInFlight - 1);
-              ctx.promptsInFlight = remainingPrompts;
-
               // Only the last remaining prompt settles the turn. A steer-
               // superseded prompt resolving while another is in flight or
               // pending must leave the merged turn running.
-              if (
-                remainingPrompts === 0 &&
-                ctx.activeTurnId === prepared.turnId &&
-                ctx.session.activeTurnId === prepared.turnId
-              ) {
-                if (ctx.interruptedTurnIds.has(prepared.turnId)) {
-                  yield* Ref.set(promptSettled, true);
-                  return {
-                    threadId: input.threadId,
-                    turnId: prepared.turnId,
-                    resumeCursor: ctx.session.resumeCursor,
-                  };
-                }
-                const completedAt = yield* nowIso;
-                const { activeTurnId: _completedTurnId, ...readySession } = ctx.session;
-                ctx.activeTurnId = undefined;
-                ctx.session = {
-                  ...readySession,
-                  status: "ready",
-                  updatedAt: completedAt,
-                  ...(prepared.displayModel ? { model: prepared.displayModel } : {}),
-                };
-                const completedStopReason = completedStopReasonFromPromptResponse(result);
-                yield* offerRuntimeEvent({
-                  type: "turn.completed",
-                  ...(yield* makeEventStamp()),
-                  provider: PROVIDER,
-                  threadId: input.threadId,
-                  turnId: prepared.turnId,
-                  payload: {
-                    state: result.stopReason === "cancelled" ? "cancelled" : "completed",
-                    stopReason: completedStopReason,
-                  },
-                });
-                ctx.interruptedTurnIds.delete(prepared.turnId);
-                yield* Ref.set(promptSettled, true);
-              } else if (remainingPrompts > 0) {
-                yield* Ref.set(promptSettled, true);
-              }
+              yield* settlePromptInFlight(input.threadId, prepared.turnId, prepared.acpSessionId, {
+                completedStopReason: completedStopReasonFromPromptResponse(result),
+              });
+              yield* Ref.set(promptSettled, true);
 
               return {
                 threadId: input.threadId,

@@ -188,6 +188,47 @@ it.layer(grokAdapterTestLayer)("GrokAdapterLive", (it) => {
     }),
   );
 
+  it.effect("fails loudly when an undecodable update is the only Grok output", () =>
+    Effect.gen(function* () {
+      const threadId = ThreadId.make("grok-undecodable-only-output");
+      const wrapperPath = yield* Effect.promise(() =>
+        makeMockGrokWrapper({
+          T3_ACP_EMIT_UNDECODABLE_SESSION_UPDATE: "1",
+          T3_ACP_EMIT_EMPTY_TURN: "1",
+        }),
+      );
+      const adapter = yield* makeTestAdapter(wrapperPath);
+      const turnCompleted =
+        yield* Deferred.make<Extract<ProviderRuntimeEvent, { type: "turn.completed" }>>();
+      const runtimeEventsFiber = yield* Stream.runForEach(adapter.streamEvents, (event) =>
+        event.type === "turn.completed" && String(event.threadId) === String(threadId)
+          ? Deferred.succeed(turnCompleted, event).pipe(Effect.asVoid)
+          : Effect.void,
+      ).pipe(Effect.forkChild);
+
+      yield* adapter.startSession({
+        threadId,
+        provider: ProviderDriverKind.make("grok"),
+        cwd: process.cwd(),
+        runtimeMode: "full-access",
+      });
+
+      yield* adapter.sendTurn({
+        threadId,
+        input: "emit only a future update variant",
+        attachments: [],
+      });
+      const completed = yield* Deferred.await(turnCompleted).pipe(Effect.timeout("2 seconds"));
+
+      assert.equal(completed.payload.state, "failed");
+      assert.equal(completed.payload.stopReason, "end_turn");
+      assert.ok(completed.payload.errorMessage);
+
+      yield* Fiber.interrupt(runtimeEventsFiber);
+      yield* adapter.stopSession(threadId);
+    }),
+  );
+
   it.effect("closes the ACP child process when a session stops", () =>
     Effect.gen(function* () {
       const threadId = ThreadId.make("grok-stop-session-close");

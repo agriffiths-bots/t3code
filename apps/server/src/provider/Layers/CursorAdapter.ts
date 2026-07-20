@@ -1510,7 +1510,7 @@ export function makeCursorAdapter(
           // superseded prompt resolving (usually cancelled) while another is
           // in flight or pending must leave the merged turn running.
           const locallyCancelledPrompt = ctx.locallyCancelledPromptsInFlight > 0;
-          const cancelledResult = result.stopReason === "cancelled" || locallyCancelledPrompt;
+          let cancelledResult = result.stopReason === "cancelled" || locallyCancelledPrompt;
           if (locallyCancelledPrompt) {
             yield* drainLocalCancelEventsOrTimeout(ctx);
             ctx.locallyCancelledPromptsInFlight = Math.max(
@@ -1529,8 +1529,48 @@ export function makeCursorAdapter(
             }
             if (!cancelledResult) {
               yield* drainEventsOrSessionEnd(ctx);
+              if (
+                !ctx.stopped &&
+                ctx.promptsInFlight === 1 &&
+                ctx.activeTurnId === turnId &&
+                ctx.session.activeTurnId === turnId &&
+                ctx.localCancelRequestsInFlight === 0 &&
+                ctx.locallyCancelledPromptsInFlight === 0 &&
+                !ctx.turnsWithVisibleOutput.has(String(turnId))
+              ) {
+                yield* liveDelay(CURSOR_COMPLETED_TURN_LATE_UPDATE_GRACE_MS);
+                yield* drainEventsOrSessionEnd(ctx);
+              }
+            }
+            if (!cancelledResult && ctx.locallyCancelledPromptsInFlight > 0) {
+              yield* drainLocalCancelEventsOrTimeout(ctx);
+              ctx.locallyCancelledPromptsInFlight = Math.max(
+                0,
+                ctx.locallyCancelledPromptsInFlight - 1,
+              );
+              clearLocalCancelDropForQueuedPrompt(ctx);
+              cancelledResult = true;
             }
             if (ctx.stopped) {
+              return {
+                threadId: input.threadId,
+                turnId,
+                resumeCursor: ctx.session.resumeCursor,
+              };
+            }
+            const turnStillOwnsSettlement =
+              ctx.promptsInFlight === 1 &&
+              ctx.activeTurnId === turnId &&
+              ctx.session.activeTurnId === turnId;
+            if (!turnStillOwnsSettlement) {
+              if (ctx.activeTurnId === turnId && ctx.session.activeTurnId === turnId) {
+                ctx.session = {
+                  ...ctx.session,
+                  status: "running",
+                  updatedAt: yield* nowIso,
+                  model: resolvedModel,
+                };
+              }
               return {
                 threadId: input.threadId,
                 turnId,

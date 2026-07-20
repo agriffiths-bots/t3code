@@ -612,6 +612,193 @@ cursorAdapterTestLayer("CursorAdapterLive", (it) => {
     }),
   );
 
+  it.effect("waits for detached late output before classifying a completed turn as empty", () =>
+    Effect.gen(function* () {
+      const adapter = yield* CursorAdapter;
+      const settings = yield* ServerSettingsService;
+      const threadId = ThreadId.make("cursor-late-only-output-completes-thread");
+      const runtimeEvents: ProviderRuntimeEvent[] = [];
+      const turnCompleted =
+        yield* Deferred.make<Extract<ProviderRuntimeEvent, { type: "turn.completed" }>>();
+
+      const wrapperPath = yield* Effect.promise(() =>
+        makeMockAgentWrapper({
+          T3_ACP_EMIT_EMPTY_TURN: "1",
+          T3_ACP_EMIT_DETACHED_LATE_UPDATE_AFTER_PROMPT_RETURN: "1",
+          T3_ACP_DETACHED_LATE_UPDATE_AFTER_PROMPT_RETURN_DELAY_MS: "100",
+        }),
+      );
+      yield* settings.updateSettings({ providers: { cursor: { binaryPath: wrapperPath } } });
+
+      const runtimeEventsFiber = yield* Stream.runForEach(adapter.streamEvents, (event) =>
+        Effect.sync(() => {
+          if (String(event.threadId) !== String(threadId)) {
+            return;
+          }
+          runtimeEvents.push(event);
+        }).pipe(
+          Effect.andThen(
+            event.type === "turn.completed" && String(event.threadId) === String(threadId)
+              ? Deferred.succeed(turnCompleted, event).pipe(Effect.asVoid)
+              : Effect.void,
+          ),
+        ),
+      ).pipe(Effect.forkChild);
+
+      yield* adapter.startSession({
+        threadId,
+        provider: ProviderDriverKind.make("cursor"),
+        cwd: process.cwd(),
+        runtimeMode: "full-access",
+        modelSelection: { instanceId: ProviderInstanceId.make("cursor"), model: "default" },
+      });
+
+      yield* adapter.sendTurn({
+        threadId,
+        input: "return the answer just after the prompt response",
+        attachments: [],
+      });
+      const completed = yield* Deferred.await(turnCompleted).pipe(Effect.timeout("2 seconds"));
+      const lateDeltaIndex = runtimeEvents.findIndex(
+        (event) =>
+          event.type === "content.delta" &&
+          event.payload.delta === "detached late after completion",
+      );
+      const completionIndex = runtimeEvents.findIndex((event) => event.type === "turn.completed");
+
+      assert.equal(completed.payload.state, "completed");
+      assert.isAtLeast(lateDeltaIndex, 0);
+      assert.isAbove(completionIndex, lateDeltaIndex);
+
+      yield* Fiber.interrupt(runtimeEventsFiber);
+      yield* adapter.stopSession(threadId);
+    }),
+  );
+
+  it.effect("keeps a steer from being settled by an earlier prompt's late-output grace", () =>
+    Effect.gen(function* () {
+      const adapter = yield* CursorAdapter;
+      const settings = yield* ServerSettingsService;
+      const threadId = ThreadId.make("cursor-steer-during-empty-turn-grace");
+      const turnStarted = yield* Deferred.make<void>();
+      const turnCompleted =
+        yield* Deferred.make<Extract<ProviderRuntimeEvent, { type: "turn.completed" }>>();
+      const terminalEvents: Array<Extract<ProviderRuntimeEvent, { type: "turn.completed" }>> = [];
+
+      const wrapperPath = yield* Effect.promise(() =>
+        makeMockAgentWrapper({
+          T3_ACP_EMIT_EMPTY_TURN: "1",
+          T3_ACP_EMIT_DETACHED_LATE_UPDATE_AFTER_PROMPT_RETURN: "1",
+          T3_ACP_DETACHED_LATE_UPDATE_AFTER_PROMPT_RETURN_DELAY_MS: "100",
+        }),
+      );
+      yield* settings.updateSettings({ providers: { cursor: { binaryPath: wrapperPath } } });
+
+      const runtimeEventsFiber = yield* Stream.runForEach(adapter.streamEvents, (event) =>
+        Effect.gen(function* () {
+          if (String(event.threadId) !== String(threadId)) {
+            return;
+          }
+          if (event.type === "turn.started") {
+            yield* Deferred.succeed(turnStarted, undefined).pipe(Effect.ignore);
+            return;
+          }
+          if (event.type === "turn.completed") {
+            terminalEvents.push(event);
+            yield* Deferred.succeed(turnCompleted, event).pipe(Effect.ignore);
+          }
+        }),
+      ).pipe(Effect.forkChild);
+
+      yield* adapter.startSession({
+        threadId,
+        provider: ProviderDriverKind.make("cursor"),
+        cwd: process.cwd(),
+        runtimeMode: "full-access",
+        modelSelection: { instanceId: ProviderInstanceId.make("cursor"), model: "default" },
+      });
+
+      const firstPrompt = yield* adapter
+        .sendTurn({ threadId, input: "first prompt", attachments: [] })
+        .pipe(Effect.forkChild);
+      yield* Deferred.await(turnStarted).pipe(Effect.timeout("2 seconds"));
+      yield* Effect.sleep("25 millis");
+      const steeringPrompt = yield* adapter
+        .sendTurn({ threadId, input: "steer during grace", attachments: [] })
+        .pipe(Effect.forkChild);
+
+      const firstResult = yield* Fiber.join(firstPrompt).pipe(Effect.timeout("2 seconds"));
+      const steeringResult = yield* Fiber.join(steeringPrompt).pipe(Effect.timeout("2 seconds"));
+      const completed = yield* Deferred.await(turnCompleted).pipe(Effect.timeout("2 seconds"));
+
+      assert.equal(String(firstResult.turnId), String(steeringResult.turnId));
+      assert.equal(completed.payload.state, "completed");
+      assert.lengthOf(terminalEvents, 1);
+
+      yield* Fiber.interrupt(runtimeEventsFiber);
+      yield* adapter.stopSession(threadId);
+    }).pipe(TestClock.withLive),
+  );
+
+  it.effect("does not double-complete a turn cancelled during late-output grace", () =>
+    Effect.gen(function* () {
+      const adapter = yield* CursorAdapter;
+      const settings = yield* ServerSettingsService;
+      const threadId = ThreadId.make("cursor-cancel-during-empty-turn-grace");
+      const turnStarted = yield* Deferred.make<void>();
+      const turnCompleted = yield* Deferred.make<void>();
+      const terminalEvents: Array<Extract<ProviderRuntimeEvent, { type: "turn.completed" }>> = [];
+
+      const wrapperPath = yield* Effect.promise(() =>
+        makeMockAgentWrapper({
+          T3_ACP_EMIT_EMPTY_TURN: "1",
+          T3_ACP_EMIT_DETACHED_LATE_UPDATE_AFTER_PROMPT_RETURN: "1",
+          T3_ACP_DETACHED_LATE_UPDATE_AFTER_PROMPT_RETURN_DELAY_MS: "150",
+        }),
+      );
+      yield* settings.updateSettings({ providers: { cursor: { binaryPath: wrapperPath } } });
+
+      const runtimeEventsFiber = yield* Stream.runForEach(adapter.streamEvents, (event) =>
+        Effect.gen(function* () {
+          if (String(event.threadId) !== String(threadId)) {
+            return;
+          }
+          if (event.type === "turn.started") {
+            yield* Deferred.succeed(turnStarted, undefined).pipe(Effect.ignore);
+            return;
+          }
+          if (event.type === "turn.completed") {
+            terminalEvents.push(event);
+            yield* Deferred.succeed(turnCompleted, undefined).pipe(Effect.ignore);
+          }
+        }),
+      ).pipe(Effect.forkChild);
+
+      yield* adapter.startSession({
+        threadId,
+        provider: ProviderDriverKind.make("cursor"),
+        cwd: process.cwd(),
+        runtimeMode: "full-access",
+        modelSelection: { instanceId: ProviderInstanceId.make("cursor"), model: "default" },
+      });
+
+      const sendTurnFiber = yield* adapter
+        .sendTurn({ threadId, input: "cancel during grace", attachments: [] })
+        .pipe(Effect.forkChild);
+      yield* Deferred.await(turnStarted).pipe(Effect.timeout("2 seconds"));
+      yield* Effect.sleep("50 millis");
+      yield* adapter.interruptTurn(threadId).pipe(Effect.timeout("2 seconds"));
+      yield* Fiber.join(sendTurnFiber).pipe(Effect.timeout("2 seconds"));
+      yield* Deferred.await(turnCompleted).pipe(Effect.timeout("2 seconds"));
+
+      assert.lengthOf(terminalEvents, 1);
+      assert.equal(terminalEvents[0]?.payload.state, "cancelled");
+
+      yield* Fiber.interrupt(runtimeEventsFiber);
+      yield* adapter.stopSession(threadId);
+    }).pipe(TestClock.withLive),
+  );
+
   it.effect(
     "emits coalesced message chunks before turn completion and never exposes thoughts",
     () =>
