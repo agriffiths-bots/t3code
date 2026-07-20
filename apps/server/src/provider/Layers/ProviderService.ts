@@ -59,6 +59,10 @@ import type { ProviderAdapterShape } from "../Services/ProviderAdapter.ts";
 import * as ProviderAdapterRegistry from "../Services/ProviderAdapterRegistry.ts";
 import * as ProviderService from "../Services/ProviderService.ts";
 import * as ProviderSessionDirectory from "../Services/ProviderSessionDirectory.ts";
+import {
+  captureProviderRuntimeEventBinding,
+  type CapturedProviderRuntimeEventBinding,
+} from "../runtimeEventBindingRegistry.ts";
 import { type EventNdjsonLogger } from "./EventNdjsonLogger.ts";
 import * as ProviderEventLoggers from "./ProviderEventLoggers.ts";
 import * as AnalyticsService from "../../telemetry/AnalyticsService.ts";
@@ -791,8 +795,12 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
     );
   });
 
-  const publishRuntimeEvent = (event: ProviderRuntimeEvent): Effect.Effect<void> =>
+  const publishRuntimeEvent = (
+    event: ProviderRuntimeEvent,
+    binding: CapturedProviderRuntimeEventBinding | undefined,
+  ): Effect.Effect<void> =>
     Effect.succeed(event).pipe(
+      Effect.tap(() => Effect.sync(() => captureProviderRuntimeEventBinding(event, binding))),
       Effect.tap((canonicalEvent) =>
         canonicalEventLogger
           ? canonicalEventLogger.write(canonicalEvent, canonicalEvent.threadId)
@@ -1485,6 +1493,72 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
         readonly duringPendingStart: boolean;
       },
     ) {
+      if (!(yield* isCurrentAdapterGeneration(source.instanceId, source.adapterGeneration))) {
+        yield* Effect.logWarning("provider.runtime-event.stale-adapter-generation-dropped", {
+          outcome: "stale-adapter-generation",
+          eventId: canonicalEvent.eventId,
+          eventType: canonicalEvent.type,
+          threadId: canonicalEvent.threadId,
+          provider: canonicalEvent.provider,
+          providerInstanceId: source.instanceId,
+          adapterGeneration: source.adapterGeneration,
+        });
+        return;
+      }
+
+      const liveSessions = yield* source.adapter.listSessions().pipe(
+        Effect.catchCause((cause) =>
+          Effect.logWarning("provider.runtime-event.live-binding-read-failed", {
+            threadId: canonicalEvent.threadId,
+            provider: canonicalEvent.provider,
+            cause,
+          }).pipe(Effect.as([] as ReadonlyArray<ProviderSession>)),
+        ),
+      );
+      const liveBinding = liveSessions.find(
+        (session) => session.threadId === canonicalEvent.threadId,
+      );
+      const persistedBinding =
+        liveBinding === undefined
+          ? Option.getOrUndefined(
+              yield* directory.getBinding(canonicalEvent.threadId).pipe(
+                Effect.catchCause((cause) =>
+                  Effect.logWarning("provider.runtime-event.persisted-binding-read-failed", {
+                    threadId: canonicalEvent.threadId,
+                    provider: canonicalEvent.provider,
+                    cause,
+                  }).pipe(
+                    Effect.as(Option.none<ProviderSessionDirectory.ProviderRuntimeBinding>()),
+                  ),
+                ),
+              ),
+            )
+          : undefined;
+      const persistedBindingIsEligible =
+        persistedBinding !== undefined &&
+        (canonicalEvent.type === "session.exited" ||
+          persistedBinding.status === "starting" ||
+          persistedBinding.status === "running" ||
+          persistedBinding.status === "waiting");
+      const binding: CapturedProviderRuntimeEventBinding | undefined =
+        liveBinding !== undefined
+          ? {
+              threadId: liveBinding.threadId,
+              provider: liveBinding.provider,
+              providerInstanceId: source.instanceId,
+              runtimeMode: liveBinding.runtimeMode,
+              cwd: liveBinding.cwd,
+            }
+          : persistedBindingIsEligible
+            ? {
+                threadId: persistedBinding.threadId,
+                provider: persistedBinding.provider,
+                providerInstanceId: persistedBinding.providerInstanceId,
+                runtimeMode: persistedBinding.runtimeMode,
+                cwd: undefined,
+              }
+            : undefined;
+
       const handleEvent = Effect.gen(function* () {
         const shouldFence = yield* shouldFenceRuntimeEventAfterSendFailure(
           source,
@@ -1550,7 +1624,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
             duringPendingStart: sessionEndContext.duringPendingStart,
           }).pipe(Effect.forkDetach, Effect.asVoid);
         }
-        yield* publishRuntimeEvent(canonicalEvent);
+        yield* publishRuntimeEvent(canonicalEvent, binding);
       });
 
       const mustOrderAgainstSendFailure =

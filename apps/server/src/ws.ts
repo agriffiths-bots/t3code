@@ -69,8 +69,9 @@ import * as Keybindings from "./keybindings.ts";
 import * as ExternalLauncher from "./process/externalLauncher.ts";
 import {
   cleanupPersistedCommandAttachments,
-  normalizeDispatchCommand,
+  normalizeAuthorizedDispatchCommand,
 } from "./orchestration/Normalizer.ts";
+import { sessionDispatchAuthority } from "./orchestration/commandAudienceGuard.ts";
 import * as OrchestrationEngine from "./orchestration/Services/OrchestrationEngine.ts";
 import * as ProjectionSnapshotQuery from "./orchestration/Services/ProjectionSnapshotQuery.ts";
 import { scopeScheduledTaskStreamForAudience } from "./orchestration/scheduledTaskAudienceStream.ts";
@@ -286,6 +287,7 @@ const RPC_REQUIRED_SCOPE = new Map<string, AuthEnvironmentScope>([
   [ORCHESTRATION_WS_METHODS.subscribeScheduledTasks, AuthOrchestrationReadScope],
   [ORCHESTRATION_WS_METHODS.setScheduledTaskEnabled, AuthOrchestrationOperateScope],
   [ORCHESTRATION_WS_METHODS.deleteScheduledTask, AuthOrchestrationOperateScope],
+  [WS_METHODS.serverProbe, AuthOrchestrationReadScope],
   [WS_METHODS.serverGetConfig, AuthOrchestrationReadScope],
   [WS_METHODS.serverRefreshProviders, AuthOrchestrationOperateScope],
   [WS_METHODS.serverUpdateProvider, AuthOrchestrationOperateScope],
@@ -753,7 +755,10 @@ const makeWsRpcLayer = (currentSession: EnvironmentAuth.AuthenticatedSession) =>
       const dispatchBootstrapTurnStart = (
         command: Extract<OrchestrationCommand, { type: "thread.turn.start" }>,
       ): Effect.Effect<{ readonly sequence: number }, OrchestrationDispatchCommandError> =>
-        BootstrapTurnStartDispatcher.dispatchActive(command);
+        BootstrapTurnStartDispatcher.dispatchActive(
+          command,
+          sessionDispatchAuthority(currentSession),
+        );
 
       const dispatchNormalizedCommand = (
         normalizedCommand: OrchestrationCommand,
@@ -762,7 +767,7 @@ const makeWsRpcLayer = (currentSession: EnvironmentAuth.AuthenticatedSession) =>
           normalizedCommand.type === "thread.turn.start" && normalizedCommand.bootstrap
             ? dispatchBootstrapTurnStart(normalizedCommand)
             : orchestrationEngine
-                .dispatch(normalizedCommand)
+                .dispatch(normalizedCommand, sessionDispatchAuthority(currentSession))
                 .pipe(
                   Effect.mapError((cause) =>
                     toDispatchCommandError(cause, "Failed to dispatch orchestration command"),
@@ -851,16 +856,14 @@ const makeWsRpcLayer = (currentSession: EnvironmentAuth.AuthenticatedSession) =>
           observeRpcEffect(
             ORCHESTRATION_WS_METHODS.dispatchCommand,
             Effect.gen(function* () {
-              const normalizedCommand = yield* normalizeDispatchCommand(command);
+              const normalizedCommand = yield* normalizeAuthorizedDispatchCommand(
+                command,
+                sessionDispatchAuthority(currentSession),
+              );
               return yield* dispatchNormalizedCommand(normalizedCommand);
             }).pipe(
               Effect.mapError((cause) =>
-                isOrchestrationDispatchCommandError(cause)
-                  ? cause
-                  : new OrchestrationDispatchCommandError({
-                      message: "Failed to dispatch orchestration command",
-                      cause,
-                    }),
+                toDispatchCommandError(cause, "Failed to dispatch orchestration command"),
               ),
             ),
             { "rpc.aggregate": "orchestration" },
@@ -1404,6 +1407,10 @@ const makeWsRpcLayer = (currentSession: EnvironmentAuth.AuthenticatedSession) =>
             ),
             { "rpc.aggregate": "orchestration" },
           ),
+        [WS_METHODS.serverProbe]: (_input) =>
+          observeRpcEffect(WS_METHODS.serverProbe, Effect.succeed({}), {
+            "rpc.aggregate": "server",
+          }),
         [WS_METHODS.serverGetConfig]: (_input) =>
           observeRpcEffect(WS_METHODS.serverGetConfig, loadServerConfig, {
             "rpc.aggregate": "server",

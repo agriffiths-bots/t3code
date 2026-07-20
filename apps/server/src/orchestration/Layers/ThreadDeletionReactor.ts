@@ -37,6 +37,8 @@ import {
 } from "../Services/ThreadDeletionReactor.ts";
 import { WorktreeLifecycleCoordinator } from "../Services/WorktreeLifecycleCoordinator.ts";
 
+import { threadAudienceSystemDispatchAuthority } from "../commandAudienceGuard.ts";
+import type { OrchestrationCommandDispatchAuthority } from "../commandAudienceGuard.ts";
 type ThreadDeletedEvent = Extract<OrchestrationEvent, { type: "thread.deleted" }>;
 type ThreadArchivedEvent = Extract<OrchestrationEvent, { type: "thread.archived" }>;
 type ThreadSessionSetEvent = Extract<OrchestrationEvent, { type: "thread.session-set" }>;
@@ -114,6 +116,7 @@ export const stopAndRecordProviderSession = Effect.fn("stopAndRecordProviderSess
     readonly runtimeSession: ProviderSession | undefined;
     readonly providerService: Pick<ProviderServiceShape, "stopSession">;
     readonly orchestrationEngine: OrchestrationEngineService["Service"];
+    readonly authority: OrchestrationCommandDispatchAuthority;
     readonly commandId: CommandId;
     readonly createdAt: string;
     readonly lastError?: string | null;
@@ -123,24 +126,29 @@ export const stopAndRecordProviderSession = Effect.fn("stopAndRecordProviderSess
     }
     const providerInstanceId =
       input.projectedSession?.providerInstanceId ?? input.runtimeSession?.providerInstanceId;
-    yield* input.orchestrationEngine.dispatch({
-      type: "thread.session.set",
-      commandId: input.commandId,
-      threadId: input.threadId,
-      session: {
+    yield* input.orchestrationEngine.dispatch(
+      {
+        type: "thread.session.set",
+        commandId: input.commandId,
         threadId: input.threadId,
-        status: "stopped",
-        providerName:
-          input.projectedSession?.providerName ?? input.runtimeSession?.provider ?? null,
-        ...(providerInstanceId !== undefined ? { providerInstanceId } : {}),
-        runtimeMode:
-          input.projectedSession?.runtimeMode ?? input.runtimeSession?.runtimeMode ?? "full-access",
-        activeTurnId: null,
-        lastError: input.lastError ?? input.projectedSession?.lastError ?? null,
-        updatedAt: input.createdAt,
+        session: {
+          threadId: input.threadId,
+          status: "stopped",
+          providerName:
+            input.projectedSession?.providerName ?? input.runtimeSession?.provider ?? null,
+          ...(providerInstanceId !== undefined ? { providerInstanceId } : {}),
+          runtimeMode:
+            input.projectedSession?.runtimeMode ??
+            input.runtimeSession?.runtimeMode ??
+            "full-access",
+          activeTurnId: null,
+          lastError: input.lastError ?? input.projectedSession?.lastError ?? null,
+          updatedAt: input.createdAt,
+        },
+        createdAt: input.createdAt,
       },
-      createdAt: input.createdAt,
-    });
+      input.authority,
+    );
   },
 );
 
@@ -293,6 +301,19 @@ const make = Effect.gen(function* () {
   const unknownArchiveRetryRequests = yield* PubSub.unbounded<ThreadArchivedCleanupWorkItem>();
   const teardownRetryRequests = yield* PubSub.unbounded<ThreadCleanupWorkItem>();
 
+  const authorityForThread = Effect.fn("ThreadDeletionReactor.authorityForThread")(function* (
+    threadId: ThreadId,
+  ) {
+    const thread = yield* projectionSnapshotQuery.getThreadShellByIdIncludingArchived(threadId);
+    if (Option.isNone(thread)) {
+      return yield* new WorktreeLifecycleTeardownError({
+        threadId,
+        detail: "Thread audience could not be resolved for lifecycle dispatch.",
+      });
+    }
+    return threadAudienceSystemDispatchAuthority(thread.value, "ThreadDeletionReactor");
+  });
+
   const readArchiveSnapshotState = (event: ThreadArchivedEvent) =>
     projectionSnapshotQuery.getThreadShellByIdIncludingArchived(event.payload.threadId).pipe(
       Effect.map(
@@ -359,12 +380,16 @@ const make = Effect.gen(function* () {
     source: ThreadCleanupEventSource,
     teardownRetry: number,
   ) {
-    yield* orchestrationEngine.dispatch({
-      type: "thread.session.stop",
-      commandId: yield* sessionStopCommandIdForArchive(event, source, teardownRetry),
-      threadId: event.payload.threadId,
-      createdAt: event.occurredAt,
-    });
+    const authority = yield* authorityForThread(event.payload.threadId);
+    yield* orchestrationEngine.dispatch(
+      {
+        type: "thread.session.stop",
+        commandId: yield* sessionStopCommandIdForArchive(event, source, teardownRetry),
+        threadId: event.payload.threadId,
+        createdAt: event.occurredAt,
+      },
+      authority,
+    );
   });
 
   const sessionSetCommandIdForArchiveReplay = (event: ThreadArchivedEvent) =>
@@ -380,12 +405,14 @@ const make = Effect.gen(function* () {
     }) {
       const { event, projectedSession, runtimeSession } = input;
       const threadId = event.payload.threadId;
+      const authority = yield* authorityForThread(threadId);
       yield* stopAndRecordProviderSession({
         threadId,
         projectedSession,
         runtimeSession,
         providerService,
         orchestrationEngine,
+        authority,
         commandId: yield* sessionSetCommandIdForArchiveReplay(event),
         createdAt: event.occurredAt,
       });
@@ -438,6 +465,17 @@ const make = Effect.gen(function* () {
     if (candidate === null) {
       return;
     }
+    const authorityThread = snapshot.threads.find((thread) => thread.id === candidate.threadId);
+    if (authorityThread === undefined) {
+      return yield* new WorktreeLifecycleTeardownError({
+        threadId: candidate.threadId,
+        detail: "Thread audience could not be resolved for worktree teardown.",
+      });
+    }
+    const authority = threadAudienceSystemDispatchAuthority(
+      authorityThread,
+      "ThreadDeletionReactor",
+    );
 
     if (event.type === "thread.session-set") {
       yield* closeThreadTerminals(candidate.threadId, candidate.force);
@@ -533,14 +571,18 @@ const make = Effect.gen(function* () {
     } else {
       yield* gitWorkflow.pruneWorktrees(candidate.projectCwd);
     }
-    yield* dispatchAlreadyCoordinated(orchestrationEngine, {
-      type: "thread.meta.update",
-      commandId: CommandId.make(`server:worktree-teardown:${event.eventId}`),
-      threadId: candidate.threadId,
-      worktreePath: null,
-      worktreeRemovable: false,
-      worktreeRemovalPath: null,
-    });
+    yield* dispatchAlreadyCoordinated(
+      orchestrationEngine,
+      {
+        type: "thread.meta.update",
+        commandId: CommandId.make(`server:worktree-teardown:${event.eventId}`),
+        threadId: candidate.threadId,
+        worktreePath: null,
+        worktreeRemovable: false,
+        worktreeRemovalPath: null,
+      },
+      authority,
+    );
     if (!candidate.force) {
       yield* worktreeLifecycle.clearTeardownPending(candidate.threadId);
     }
@@ -555,6 +597,10 @@ const make = Effect.gen(function* () {
   const processThreadDeleted = Effect.fn("processThreadDeleted")(function* (
     event: ThreadDeletedEvent,
   ) {
+    // Deleted rows remain in the complete projection snapshot (with their
+    // audience) even though public shell/detail lookups hide them. Stop the
+    // runtime directly, then let teardown derive its exact authority from that
+    // retained row for the workspace-only metadata clear.
     yield* stopRuntimeIfPresent(event.payload.threadId);
     yield* closeThreadTerminals(event.payload.threadId, true);
     yield* teardownWorktree(event, "deleted");

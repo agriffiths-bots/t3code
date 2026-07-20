@@ -40,6 +40,19 @@ export class OrchestrationCommandInvariantError extends Schema.TaggedErrorClass<
   }
 }
 
+export class OrchestrationCommandAudienceAuthorizationError extends Schema.TaggedErrorClass<OrchestrationCommandAudienceAuthorizationError>()(
+  "OrchestrationCommandAudienceAuthorizationError",
+  {
+    commandType: Schema.String,
+    detail: Schema.String,
+    cause: Schema.optional(Schema.Defect()),
+  },
+) {
+  override get message(): string {
+    return `Orchestration command authorization failed (${this.commandType}): ${this.detail}`;
+  }
+}
+
 export class OrchestrationCommandPreviouslyRejectedError extends Schema.TaggedErrorClass<OrchestrationCommandPreviouslyRejectedError>()(
   "OrchestrationCommandPreviouslyRejectedError",
   {
@@ -82,6 +95,7 @@ export class OrchestrationListenerCallbackError extends Schema.TaggedErrorClass<
 export type OrchestrationDispatchError =
   | ProjectionRepositoryError
   | OrchestrationCommandInvariantError
+  | OrchestrationCommandAudienceAuthorizationError
   | OrchestrationCommandPreviouslyRejectedError
   | OrchestrationProjectorDecodeError
   | OrchestrationListenerCallbackError;

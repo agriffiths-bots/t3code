@@ -43,6 +43,7 @@ import {
 import * as WorkspacePaths from "../workspace/WorkspacePaths.ts";
 import { type CliAuthLocationFlags, projectLocationFlags, resolveCliAuthConfig } from "./config.ts";
 
+import { trustedSystemDispatchAuthority } from "../orchestration/commandAudienceGuard.ts";
 type ProjectMutationTarget = {
   readonly id: ProjectId;
   readonly title: string;
@@ -463,7 +464,8 @@ const runProjectMutation = Effect.fn("runProjectMutation")(function* (
       const orchestrationEngine = yield* OrchestrationEngine.OrchestrationEngineService;
       const output = yield* run({
         snapshot,
-        dispatch: (command) => orchestrationEngine.dispatch(command),
+        dispatch: (command) =>
+          orchestrationEngine.dispatch(command, trustedSystemDispatchAuthority("project")),
         mode: "offline",
       });
       yield* Console.log(output);

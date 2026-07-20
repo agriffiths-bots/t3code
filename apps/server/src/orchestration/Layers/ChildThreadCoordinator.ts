@@ -7,6 +7,7 @@
  */
 import {
   CommandId,
+  DataAudience,
   EventId,
   IsoDateTime,
   MessageId,
@@ -66,6 +67,10 @@ import {
   type WaitSliceResult,
 } from "../Services/ChildThreadCoordinator.ts";
 
+import {
+  audienceBoundSystemDispatchAuthority,
+  threadAudienceSystemDispatchAuthority,
+} from "../commandAudienceGuard.ts";
 interface ChildRecord {
   readonly parentThreadId: ThreadId;
   readonly detached: boolean;
@@ -174,6 +179,7 @@ const isThreadArchivedOutcome = (outcome: ChildTerminalOutcome): boolean =>
 const ChildRowSchema = Schema.Struct({
   threadId: Schema.String,
   parentThreadId: Schema.NullOr(Schema.String),
+  dataAudience: DataAudience,
   modelSelection: Schema.fromJsonString(ModelSelection),
 });
 
@@ -659,12 +665,15 @@ const make = Effect.gen(function* () {
     execute: () =>
       sql`
         SELECT
-          thread_id AS "threadId",
-          parent_thread_id AS "parentThreadId",
-          model_selection_json AS "modelSelection"
-        FROM projection_threads
-        WHERE parent_thread_id IS NOT NULL
-          AND parent_environment_id IS NULL
+          threads.thread_id AS "threadId",
+          threads.parent_thread_id AS "parentThreadId",
+          projects.data_audience AS "dataAudience",
+          threads.model_selection_json AS "modelSelection"
+        FROM projection_threads AS threads
+        INNER JOIN projection_projects AS projects
+          ON projects.project_id = threads.project_id
+        WHERE threads.parent_thread_id IS NOT NULL
+          AND threads.parent_environment_id IS NULL
       `,
   });
 
@@ -1308,22 +1317,30 @@ const make = Effect.gen(function* () {
     readonly createdAt: string;
     readonly commandId: CommandId;
     readonly activityId: EventId;
+    readonly dataAudience: DataAudience;
   }) {
-    yield* orchestrationEngine.dispatch({
-      type: "thread.activity.append",
-      commandId: input.commandId,
-      threadId: input.threadId,
-      activity: {
-        id: input.activityId,
-        tone: "info",
-        kind: ORPHAN_SETTLED_ACTIVITY_KIND,
-        summary: "Sub-agent orphan settled",
-        payload: { status: "killed", reason: input.reason },
-        turnId: null,
+    yield* orchestrationEngine.dispatch(
+      {
+        type: "thread.activity.append",
+        commandId: input.commandId,
+        threadId: input.threadId,
+        activity: {
+          id: input.activityId,
+          tone: "info",
+          kind: ORPHAN_SETTLED_ACTIVITY_KIND,
+          summary: "Sub-agent orphan settled",
+          payload: { status: "killed", reason: input.reason },
+          turnId: null,
+          createdAt: input.createdAt,
+        },
         createdAt: input.createdAt,
       },
-      createdAt: input.createdAt,
-    });
+      audienceBoundSystemDispatchAuthority({
+        reason: "ChildThreadCoordinator",
+        sourceThreadId: input.threadId,
+        dataAudience: input.dataAudience,
+      }),
+    );
   });
 
   const recordStoppedOrphanSession = Effect.fn("recordStoppedOrphanSession")(function* (input: {
@@ -1333,27 +1350,37 @@ const make = Effect.gen(function* () {
     readonly createdAt: string;
     readonly lastError: string;
     readonly commandId: CommandId;
+    readonly dataAudience: DataAudience;
   }) {
     const providerInstanceId =
       input.projectedSession?.providerInstanceId ?? input.runtimeSession?.providerInstanceId;
-    yield* orchestrationEngine.dispatch({
-      type: "thread.session.set",
-      commandId: input.commandId,
-      threadId: input.threadId,
-      session: {
+    yield* orchestrationEngine.dispatch(
+      {
+        type: "thread.session.set",
+        commandId: input.commandId,
         threadId: input.threadId,
-        status: "stopped",
-        providerName:
-          input.projectedSession?.providerName ?? input.runtimeSession?.provider ?? null,
-        ...(providerInstanceId !== undefined ? { providerInstanceId } : {}),
-        runtimeMode:
-          input.projectedSession?.runtimeMode ?? input.runtimeSession?.runtimeMode ?? "full-access",
-        activeTurnId: null,
-        lastError: input.lastError,
-        updatedAt: input.createdAt,
+        session: {
+          threadId: input.threadId,
+          status: "stopped",
+          providerName:
+            input.projectedSession?.providerName ?? input.runtimeSession?.provider ?? null,
+          ...(providerInstanceId !== undefined ? { providerInstanceId } : {}),
+          runtimeMode:
+            input.projectedSession?.runtimeMode ??
+            input.runtimeSession?.runtimeMode ??
+            "full-access",
+          activeTurnId: null,
+          lastError: input.lastError,
+          updatedAt: input.createdAt,
+        },
+        createdAt: input.createdAt,
       },
-      createdAt: input.createdAt,
-    });
+      audienceBoundSystemDispatchAuthority({
+        reason: "ChildThreadCoordinator",
+        sourceThreadId: input.threadId,
+        dataAudience: input.dataAudience,
+      }),
+    );
   });
 
   const confirmOrphanProviderCleanup = Effect.fn("confirmOrphanProviderCleanup")(function* (input: {
@@ -1509,15 +1536,18 @@ const make = Effect.gen(function* () {
     Effect.gen(function* () {
       const messageId = MessageId.make(yield* randomUUID);
       const createdAt = yield* nowIso;
-      yield* dispatchActive({
-        type: "thread.turn.start",
-        commandId,
-        threadId: shell.id,
-        message: { messageId, role: "system", text, attachments: [] },
-        runtimeMode: shell.runtimeMode,
-        interactionMode: shell.interactionMode,
-        createdAt,
-      });
+      yield* dispatchActive(
+        {
+          type: "thread.turn.start",
+          commandId,
+          threadId: shell.id,
+          message: { messageId, role: "system", text, attachments: [] },
+          runtimeMode: shell.runtimeMode,
+          interactionMode: shell.interactionMode,
+          createdAt,
+        },
+        threadAudienceSystemDispatchAuthority(shell, "ChildThreadCoordinator"),
+      );
     });
 
   // Dispatch a deferred steer to a now-idle child as a fresh user turn (R-C).
@@ -1530,41 +1560,50 @@ const make = Effect.gen(function* () {
     Effect.gen(function* () {
       const messageId = MessageId.make(yield* randomUUID);
       const createdAt = yield* nowIso;
-      yield* dispatchActive({
-        type: "thread.turn.start",
-        commandId,
-        threadId: shell.id,
-        message: { messageId, role: "user", text, attachments: [] },
-        runtimeMode: shell.runtimeMode,
-        interactionMode: shell.interactionMode,
-        createdAt,
-      });
+      yield* dispatchActive(
+        {
+          type: "thread.turn.start",
+          commandId,
+          threadId: shell.id,
+          message: { messageId, role: "user", text, attachments: [] },
+          runtimeMode: shell.runtimeMode,
+          interactionMode: shell.interactionMode,
+          createdAt,
+        },
+        threadAudienceSystemDispatchAuthority(shell, "ChildThreadCoordinator"),
+      );
     });
 
-  const appendSubagentActivity = (parentThreadId: ThreadId, result: ChildWaitResult) =>
+  const appendSubagentActivity = (
+    parentThread: OrchestrationThreadShell,
+    result: ChildWaitResult,
+  ) =>
     Effect.gen(function* () {
       const commandId = yield* newCommandId("subagent-activity");
       const activityId = EventId.make(yield* randomUUID);
       const createdAt = yield* nowIso;
-      yield* orchestrationEngine.dispatch({
-        type: "thread.activity.append",
-        commandId,
-        threadId: parentThreadId,
-        activity: {
-          id: activityId,
-          tone: result.status === "completed" ? "info" : "error",
-          kind: "subagent.completed",
-          summary: `Sub-agent ${result.childThreadId} ${result.status}`,
-          payload: {
-            childThreadId: result.childThreadId,
-            status: result.status,
-            error: result.error,
+      yield* orchestrationEngine.dispatch(
+        {
+          type: "thread.activity.append",
+          commandId,
+          threadId: parentThread.id,
+          activity: {
+            id: activityId,
+            tone: result.status === "completed" ? "info" : "error",
+            kind: "subagent.completed",
+            summary: `Sub-agent ${result.childThreadId} ${result.status}`,
+            payload: {
+              childThreadId: result.childThreadId,
+              status: result.status,
+              error: result.error,
+            },
+            turnId: null,
+            createdAt,
           },
-          turnId: null,
           createdAt,
         },
-        createdAt,
-      });
+        threadAudienceSystemDispatchAuthority(parentThread, "ChildThreadCoordinator"),
+      );
     });
 
   // Atomic per-parent idle-check + dispatch: never resume a turnCount-0 parent,
@@ -1668,9 +1707,7 @@ const make = Effect.gen(function* () {
             );
             return;
           }
-          yield* appendSubagentActivity(parentThreadId, result).pipe(
-            Effect.ignoreCause({ log: true }),
-          );
+          yield* appendSubagentActivity(shell, result).pipe(Effect.ignoreCause({ log: true }));
           enqueuePending(parentThreadId, entry);
         }),
       );
@@ -3486,6 +3523,7 @@ const make = Effect.gen(function* () {
       // (1) Load all parent-linked children from the projection.
       const rows = yield* listPersistedChildRows().pipe(Effect.orDie);
       const knownChildIds = new Set<ThreadId>();
+      const dataAudienceByChild = new Map<ThreadId, DataAudience>();
       const projectedTerminalByChild = new Map<ThreadId, ChildTerminalOutcome>();
       const restoredDetailByChild = new Map<ThreadId, OrchestrationThread>();
       const projectionDetailUnavailableChildIds = new Set<ThreadId>();
@@ -3493,6 +3531,7 @@ const make = Effect.gen(function* () {
         if (row.parentThreadId === null) continue;
         const childThreadId = row.threadId as ThreadId;
         const parentThreadId = row.parentThreadId as ThreadId;
+        dataAudienceByChild.set(childThreadId, row.dataAudience);
         const restoredPromoted =
           promotedParentByChild.get(childThreadId) === parentThreadId &&
           !stalePromotedChildIds.has(childThreadId);
@@ -4096,6 +4135,7 @@ const make = Effect.gen(function* () {
           createdAt: yield* nowIso,
           lastError: outcome.error ?? ORPHAN_RETIRED_PARENT_REASON,
           commandId: yield* newCommandId("orphan-session-repair"),
+          dataAudience: dataAudienceByChild.get(childThreadId)!,
         });
         const repaired = yield* repairSessionProjection.pipe(
           Effect.as(true),
@@ -4221,6 +4261,7 @@ const make = Effect.gen(function* () {
             createdAt,
             commandId: yield* newCommandId("orphan-settlement"),
             activityId: EventId.make(yield* randomUUID),
+            dataAudience: dataAudienceByChild.get(childThreadId)!,
           } as const;
           const sessionCommandId = yield* newCommandId("orphan-session-stop");
           // Captured before the retries below can be forked. Each of them keeps
@@ -4266,6 +4307,7 @@ const make = Effect.gen(function* () {
                     createdAt,
                     lastError: orphanReason,
                     commandId: sessionCommandId,
+                    dataAudience: dataAudienceByChild.get(childThreadId)!,
                   }),
                 ).pipe(
                   Effect.catchCause((cause) => Effect.fail(Cause.pretty(cause))),
@@ -4354,6 +4396,7 @@ const make = Effect.gen(function* () {
               createdAt,
               lastError: orphanReason,
               commandId: sessionCommandId,
+              dataAudience: dataAudienceByChild.get(childThreadId)!,
             }).pipe(
               Effect.as(true),
               Effect.catchCause((cause) =>

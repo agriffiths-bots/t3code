@@ -7,6 +7,7 @@ import {
   ProjectId,
   ThreadId,
   TurnId,
+  type DataAudience,
   type ModelSelection,
   type OrchestrationCommand,
   type OrchestrationEvent,
@@ -50,6 +51,7 @@ import {
 } from "../Services/BootstrapTurnStartDispatcher.ts";
 import { OrchestrationEngineService } from "../Services/OrchestrationEngine.ts";
 import { ProjectionSnapshotQuery } from "../Services/ProjectionSnapshotQuery.ts";
+import type { OrchestrationCommandDispatchAuthority } from "../commandAudienceGuard.ts";
 import {
   ChildThreadCoordinator,
   MAX_DEPTH,
@@ -382,6 +384,7 @@ describe("ChildThreadCoordinator", () => {
     readonly threads?: ReadonlyArray<ThreadState>;
     readonly persistedEvents?: ReadonlyArray<OrchestrationEvent>;
     readonly knownInstances?: ReadonlyArray<string>;
+    readonly projectDataAudience?: DataAudience;
     /** Parent ids intentionally absent from the projection (deleted/retired). */
     readonly retiredParentIds?: ReadonlyArray<ThreadId>;
     readonly seedChildRows?: ReadonlyArray<{
@@ -461,6 +464,10 @@ describe("ChildThreadCoordinator", () => {
       threadStates.set(state.shell.id, state);
     }
     const dispatched: Array<OrchestrationCommand> = [];
+    const dispatches: Array<{
+      readonly command: OrchestrationCommand;
+      readonly authority: OrchestrationCommandDispatchAuthority;
+    }> = [];
     const capturedLogs: Array<{ readonly level: string; readonly message: string }> = [];
     const captureLogger = Logger.make(({ logLevel, message }) => {
       capturedLogs.push({
@@ -544,7 +551,10 @@ describe("ChildThreadCoordinator", () => {
       // this commandId returns the existing sequence without re-appending.
       acceptedByCommandId.set(commandId, acceptedByCommandId.size + 1);
     }
-    const recordDispatch = (command: OrchestrationCommand) => {
+    const recordDispatch = (
+      command: OrchestrationCommand,
+      authority: OrchestrationCommandDispatchAuthority,
+    ) => {
       if (
         command.type === "thread.activity.append" &&
         command.activity.kind === "subagent.orphan.settled" &&
@@ -562,6 +572,7 @@ describe("ChildThreadCoordinator", () => {
         return { sequence: existing };
       }
       dispatched.push(command);
+      dispatches.push({ command, authority });
       const sequence = dispatched.length;
       acceptedByCommandId.set(command.commandId, sequence);
       if (command.type === "thread.turn.start") {
@@ -593,7 +604,7 @@ describe("ChildThreadCoordinator", () => {
             return Stream.fromQueue(eventQueue);
           }),
         ),
-        dispatch: (command) => Effect.sync(() => recordDispatch(command)),
+        dispatch: (command, authority) => Effect.sync(() => recordDispatch(command, authority)),
       }),
     );
 
@@ -722,7 +733,7 @@ describe("ChildThreadCoordinator", () => {
     // Fake bootstrap dispatcher + global-capture so `dispatchActive` resolves
     // and records turn-start commands the same way the real server does.
     const dispatcherLayer = Layer.succeed(BootstrapTurnStartDispatcher, {
-      dispatch: (command) => Effect.sync(() => recordDispatch(command)),
+      dispatch: (command, authority) => Effect.sync(() => recordDispatch(command, authority)),
     });
     const activeDispatcherLayer = ActiveBootstrapTurnStartDispatcherLive.pipe(
       Layer.provide(dispatcherLayer),
@@ -744,7 +755,37 @@ describe("ChildThreadCoordinator", () => {
     runtime = ManagedRuntime.make(layer);
 
     const activeRuntime = runtime;
-    if (input?.seedChildRows) {
+    if (input?.seedChildRows && input.seedChildRows.length > 0) {
+      await activeRuntime.runPromise(
+        Effect.flatMap(
+          Effect.service(SqlClient),
+          (sql) =>
+            sql`
+              INSERT INTO projection_projects (
+                project_id,
+                title,
+                workspace_root,
+                data_audience,
+                default_model_selection_json,
+                scripts_json,
+                created_at,
+                updated_at,
+                deleted_at
+              )
+              VALUES (
+                ${projectId},
+                ${"Coordinator test project"},
+                ${"/tmp/coordinator-test"},
+                ${input.projectDataAudience ?? "private"},
+                ${null},
+                ${"[]"},
+                ${now},
+                ${now},
+                ${null}
+              )
+            `,
+        ),
+      );
       for (const row of input.seedChildRows) {
         await activeRuntime.runPromise(
           Effect.flatMap(
@@ -997,6 +1038,7 @@ describe("ChildThreadCoordinator", () => {
     return {
       coordinator,
       dispatched,
+      dispatches,
       capturedLogs,
       stoppedProviderSessionIds,
       providerListSessionsCallCount: () => providerListSessionsCallCount,
@@ -7543,6 +7585,49 @@ describe("ChildThreadCoordinator", () => {
     ).toBe(true);
     const slice = await runtimeWaitSlice(harness, [child], FAR_FUTURE_MS);
     expect(slice.results[0]).toMatchObject({ status: "killed", error: orphanReason });
+  });
+
+  it("binds orphan settlement dispatches to the persisted child row audience", async () => {
+    const parent = ThreadId.make("boot-orphan-audience-parent");
+    const child = ThreadId.make("boot-orphan-audience-child");
+    const childTurn = TurnId.make("boot-orphan-audience-turn");
+    const harness = await createHarness({
+      threads: [
+        makeThreadState({ threadId: parent, archivedAt: now }),
+        makeThreadState({
+          threadId: child,
+          parentThreadId: parent,
+          latestTurn: makeLatestTurn("running", childTurn),
+          session: makeSession(child, "running", childTurn),
+        }),
+      ],
+      seedChildRows: [{ threadId: child, parentThreadId: parent }],
+      projectDataAudience: "factory",
+      persistedEvents: [],
+    });
+
+    const durableOrphanWrites = harness.dispatches.filter(
+      ({ command }) =>
+        (command.type === "thread.session.set" && command.threadId === child) ||
+        (command.type === "thread.activity.append" &&
+          command.threadId === child &&
+          command.activity.kind === "subagent.orphan.settled"),
+    );
+    expect(durableOrphanWrites).toHaveLength(2);
+    expect(durableOrphanWrites.map(({ authority }) => authority)).toEqual([
+      {
+        kind: "audience-bound-system",
+        reason: "ChildThreadCoordinator",
+        sourceThreadId: child,
+        dataAudience: "factory",
+      },
+      {
+        kind: "audience-bound-system",
+        reason: "ChildThreadCoordinator",
+        sourceThreadId: child,
+        dataAudience: "factory",
+      },
+    ]);
   });
 
   it.each(["defect", "hang"] as const)(

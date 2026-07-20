@@ -36,6 +36,9 @@ import { OrchestrationEngineService } from "../Services/OrchestrationEngine.ts";
 import { OrchestrationProjectionPipeline } from "../Services/ProjectionPipeline.ts";
 import { ServerConfig } from "../../config.ts";
 
+import { trustedSystemDispatchAuthority } from "../commandAudienceGuard.ts";
+const testDispatchAuthority = trustedSystemDispatchAuthority("orchestration-test");
+
 const makeProjectionPipelinePrefixedTestLayer = (prefix: string) =>
   OrchestrationProjectionPipelineLive.pipe(
     Layer.provideMerge(OrchestrationEventStoreLive),
@@ -3923,18 +3926,21 @@ engineLayer("OrchestrationProjectionPipeline via engine dispatch", (it) => {
       const sql = yield* SqlClient.SqlClient;
       const createdAt = "2026-01-01T00:00:00.000Z";
 
-      yield* engine.dispatch({
-        type: "project.create",
-        commandId: CommandId.make("cmd-live-project"),
-        projectId: ProjectId.make("project-live"),
-        title: "Live Project",
-        workspaceRoot: "/tmp/project-live",
-        defaultModelSelection: {
-          instanceId: ProviderInstanceId.make("codex"),
-          model: "gpt-5-codex",
+      yield* engine.dispatch(
+        {
+          type: "project.create",
+          commandId: CommandId.make("cmd-live-project"),
+          projectId: ProjectId.make("project-live"),
+          title: "Live Project",
+          workspaceRoot: "/tmp/project-live",
+          defaultModelSelection: {
+            instanceId: ProviderInstanceId.make("codex"),
+            model: "gpt-5-codex",
+          },
+          createdAt,
         },
-        createdAt,
-      });
+        testDispatchAuthority,
+      );
 
       const projectRows = yield* sql<{ readonly title: string; readonly scriptsJson: string }>`
         SELECT
@@ -3961,37 +3967,43 @@ engineLayer("OrchestrationProjectionPipeline via engine dispatch", (it) => {
       const sql = yield* SqlClient.SqlClient;
       const createdAt = "2026-01-01T00:00:00.000Z";
 
-      yield* engine.dispatch({
-        type: "project.create",
-        commandId: CommandId.make("cmd-scripts-project-create"),
-        projectId: ProjectId.make("project-scripts"),
-        title: "Scripts Project",
-        workspaceRoot: "/tmp/project-scripts",
-        defaultModelSelection: {
-          instanceId: ProviderInstanceId.make("codex"),
-          model: "gpt-5-codex",
-        },
-        createdAt,
-      });
-
-      yield* engine.dispatch({
-        type: "project.meta.update",
-        commandId: CommandId.make("cmd-scripts-project-update"),
-        projectId: ProjectId.make("project-scripts"),
-        scripts: [
-          {
-            id: "script-1",
-            name: "Build",
-            command: "bun run build",
-            icon: "build",
-            runOnWorktreeCreate: false,
+      yield* engine.dispatch(
+        {
+          type: "project.create",
+          commandId: CommandId.make("cmd-scripts-project-create"),
+          projectId: ProjectId.make("project-scripts"),
+          title: "Scripts Project",
+          workspaceRoot: "/tmp/project-scripts",
+          defaultModelSelection: {
+            instanceId: ProviderInstanceId.make("codex"),
+            model: "gpt-5-codex",
           },
-        ],
-        defaultModelSelection: {
-          instanceId: ProviderInstanceId.make("codex"),
-          model: "gpt-5",
+          createdAt,
         },
-      });
+        testDispatchAuthority,
+      );
+
+      yield* engine.dispatch(
+        {
+          type: "project.meta.update",
+          commandId: CommandId.make("cmd-scripts-project-update"),
+          projectId: ProjectId.make("project-scripts"),
+          scripts: [
+            {
+              id: "script-1",
+              name: "Build",
+              command: "bun run build",
+              icon: "build",
+              runOnWorktreeCreate: false,
+            },
+          ],
+          defaultModelSelection: {
+            instanceId: ProviderInstanceId.make("codex"),
+            model: "gpt-5",
+          },
+        },
+        testDispatchAuthority,
+      );
 
       const projectRows = yield* sql<{
         readonly scriptsJson: string;

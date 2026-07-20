@@ -36,6 +36,7 @@ import {
   type ScheduledTasksReactorShape,
 } from "../Services/ScheduledTasksReactor.ts";
 
+import { threadAudienceSystemDispatchAuthority } from "../commandAudienceGuard.ts";
 /** A failed dispatch increments retry_count; the task is disabled past this. */
 const MAX_RETRIES = 5;
 
@@ -134,22 +135,25 @@ const makeScheduledTasksReactor = Effect.gen(function* () {
       const commandId = yield* newCommandId;
       const messageId = MessageId.make(yield* randomUUID);
       const createdAt = DateTime.formatIso(yield* DateTime.now);
-      yield* dispatcher.dispatch({
-        type: "thread.turn.start",
-        commandId,
-        threadId: task.threadId,
-        message: { messageId, role: "user", text: task.prompt, attachments: [] },
-        // A schedule may pin its own model/harness (Fix 1); dispatch it as a
-        // per-turn override. Fall back to the thread's current model so an
-        // unpinned run always re-asserts the thread's model explicitly and never
-        // inherits a selection cached in-process by a different pinned schedule
-        // that fired on the same thread.
-        modelSelection: task.modelSelection ?? shell.modelSelection,
-        runtimeMode: shell.runtimeMode,
-        interactionMode: shell.interactionMode,
-        bootstrap: undefined,
-        createdAt,
-      });
+      yield* dispatcher.dispatch(
+        {
+          type: "thread.turn.start",
+          commandId,
+          threadId: task.threadId,
+          message: { messageId, role: "user", text: task.prompt, attachments: [] },
+          // A schedule may pin its own model/harness (Fix 1); dispatch it as a
+          // per-turn override. Fall back to the thread's current model so an
+          // unpinned run always re-asserts the thread's model explicitly and never
+          // inherits a selection cached in-process by a different pinned schedule
+          // that fired on the same thread.
+          modelSelection: task.modelSelection ?? shell.modelSelection,
+          runtimeMode: shell.runtimeMode,
+          interactionMode: shell.interactionMode,
+          bootstrap: undefined,
+          createdAt,
+        },
+        threadAudienceSystemDispatchAuthority(shell, "ScheduledTasksReactor"),
+      );
     }).pipe(Effect.timeout(Duration.seconds(DISPATCH_TIMEOUT_SECONDS)));
 
   // Fire a due task: advance next_run_at (committed) then dispatch.

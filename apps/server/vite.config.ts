@@ -8,6 +8,7 @@ import {
   resolveBarePackageName,
 } from "../../scripts/lib/package-names.ts";
 import { loadRepoEnv } from "../../scripts/lib/public-config.ts";
+import packageJson from "./package.json" with { type: "json" };
 
 const externalRuntimePackageNames = new Set([
   "@effect/platform-bun",
@@ -34,6 +35,7 @@ export function shouldBundleCliDependency(id: string): boolean {
 }
 
 const repoEnv = loadRepoEnv();
+const cliBuildChannel = packageJson.version.includes("-nightly.") ? "nightly" : "latest";
 
 function resolveBuildSha(): string {
   const envSha = process.env.T3CODE_BUILD_SHA?.trim() ?? "";
@@ -70,6 +72,7 @@ export default mergeConfig(
       define: {
         __T3CODE_BUILD_SHA__: JSON.stringify(buildSha),
         __T3CODE_BUILD_VERSION__: JSON.stringify(buildVersion),
+        __T3CODE_BUILD_CHANNEL__: JSON.stringify(cliBuildChannel),
         __T3CODE_BUILD_RELAY_URL__: JSON.stringify(repoEnv.T3CODE_RELAY_URL?.trim() ?? ""),
         __T3CODE_BUILD_CLERK_PUBLISHABLE_KEY__: JSON.stringify(
           repoEnv.T3CODE_CLERK_PUBLISHABLE_KEY?.trim() ?? "",
