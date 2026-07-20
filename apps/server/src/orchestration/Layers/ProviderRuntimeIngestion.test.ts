@@ -5,7 +5,9 @@ import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
 import * as NodeURL from "node:url";
 
+import type { SDKMessage, SDKUserMessage } from "@anthropic-ai/claude-agent-sdk";
 import {
+  ClaudeSettings,
   CodexSettings,
   OrchestrationReadModel,
   ProviderDriverKind,
@@ -46,6 +48,7 @@ import { OrchestrationCommandReceiptRepositoryLive } from "../../persistence/Lay
 import { PendingDispatchRepositoryLive } from "../../persistence/Layers/PendingDispatches.ts";
 import { SqlitePersistenceMemory } from "../../persistence/Layers/Sqlite.ts";
 import * as SubagentDispatchLimiter from "../../mcp/toolkits/subagent/SubagentDispatchLimiter.ts";
+import { makeClaudeAdapter } from "../../provider/Layers/ClaudeAdapter.ts";
 import { makeCodexAdapter } from "../../provider/Layers/CodexAdapter.ts";
 import { PROVIDER_EMPTY_RESPONSE_ERROR } from "../../provider/Layers/providerFailureMessages.ts";
 import type { ProviderAdapterError } from "../../provider/Errors.ts";
@@ -101,11 +104,79 @@ const asEventId = (value: string): EventId => EventId.make(value);
 const asMessageId = (value: string): MessageId => MessageId.make(value);
 const asThreadId = (value: string): ThreadId => ThreadId.make(value);
 const asTurnId = (value: string): TurnId => TurnId.make(value);
+const decodeClaudeSettings = Schema.decodeSync(ClaudeSettings);
 const decodeCodexSettings = Schema.decodeSync(CodexSettings);
 
 class RecordedCodexAdapter extends Context.Service<RecordedCodexAdapter, CodexAdapterShape>()(
   "t3/orchestration/Layers/ProviderRuntimeIngestion.test/RecordedCodexAdapter",
 ) {}
+
+class RecordedClaudeAdapter extends Context.Service<
+  RecordedClaudeAdapter,
+  ProviderAdapterShape<ProviderAdapterError>
+>()("t3/orchestration/Layers/ProviderRuntimeIngestion.test/RecordedClaudeAdapter") {}
+
+type RecordedClaudeScenario = "success" | "empty" | "death";
+
+function makeRecordedClaudeQuery(
+  fixturePath: string,
+  scenario: RecordedClaudeScenario,
+): (input: { readonly prompt: AsyncIterable<SDKUserMessage> }) => {
+  readonly interrupt: () => Promise<void>;
+  readonly setModel: () => Promise<void>;
+  readonly setPermissionMode: () => Promise<void>;
+  readonly setMaxThinkingTokens: () => Promise<void>;
+  readonly close: () => void;
+  readonly [Symbol.asyncIterator]: () => AsyncIterator<SDKMessage>;
+} {
+  const recordedMessages = NodeFS.readFileSync(fixturePath, "utf8")
+    .trimEnd()
+    .split("\n")
+    .map((line) => JSON.parse(line) as SDKMessage);
+
+  return ({ prompt }) => {
+    let closed = false;
+    const iterate = async function* (): AsyncGenerator<SDKMessage> {
+      const [init, ...turnMessages] = recordedMessages;
+      if (init !== undefined) yield init;
+
+      const promptIterator = prompt[Symbol.asyncIterator]();
+      const nextPrompt = await promptIterator.next();
+      if (nextPrompt.done || closed) return;
+
+      let emittedTextDelta = false;
+      for (const message of turnMessages) {
+        if (closed) return;
+        const isTextDelta =
+          message.type === "stream_event" &&
+          message.event.type === "content_block_delta" &&
+          message.event.delta.type === "text_delta";
+        const isAssistant = message.type === "assistant";
+        if (scenario === "empty" && (isTextDelta || isAssistant)) continue;
+        yield message;
+        if (isTextDelta && !emittedTextDelta) {
+          emittedTextDelta = true;
+          if (scenario === "death") {
+            throw new Error("Recorded Claude Agent process exited with code 17.");
+          }
+        }
+      }
+    };
+
+    return {
+      [Symbol.asyncIterator]: iterate,
+      interrupt: async () => {
+        closed = true;
+      },
+      setModel: async () => undefined,
+      setPermissionMode: async () => undefined,
+      setMaxThinkingTokens: async () => undefined,
+      close: () => {
+        closed = true;
+      },
+    };
+  };
+}
 
 type LegacyProviderRuntimeEvent = {
   readonly type: string;
@@ -442,6 +513,70 @@ describe("ProviderRuntimeIngestion", () => {
     );
   }
 
+  async function createRecordedClaudeStack(scenario: RecordedClaudeScenario = "success") {
+    const fixturePath = NodePath.join(
+      NodePath.dirname(NodeURL.fileURLToPath(import.meta.url)),
+      "../../provider/Layers/fixtures/recorded-claude-agent-2.1.207-turn.jsonl",
+    );
+    const sqliteLayer = SqlitePersistenceMemory;
+    const runtimeRepositoryLayer = ProviderSessionRuntime.layer.pipe(Layer.provide(sqliteLayer));
+    const directoryLayer = ProviderSessionDirectoryLive.pipe(Layer.provide(runtimeRepositoryLayer));
+    const serverSettingsLayer = ServerSettingsService.layerTest();
+    const serverConfigLayer = ServerConfig.layerTest(process.cwd(), process.cwd());
+    const adapterLayer = Layer.effect(
+      RecordedClaudeAdapter,
+      makeClaudeAdapter(decodeClaudeSettings({}), {
+        environment: { ...process.env },
+        createQuery: makeRecordedClaudeQuery(fixturePath, scenario),
+      }),
+    ).pipe(
+      Layer.provideMerge(serverConfigLayer),
+      Layer.provideMerge(serverSettingsLayer),
+      Layer.provideMerge(NodeServices.layer),
+    );
+    const adapterRegistryLayer = Layer.effect(
+      ProviderAdapterRegistry,
+      Effect.gen(function* () {
+        const adapter = yield* RecordedClaudeAdapter;
+        return makeAdapterRegistryMock({
+          [ProviderDriverKind.make("claudeAgent")]: adapter,
+        });
+      }),
+    ).pipe(Layer.provide(adapterLayer));
+    const providerServiceLayer = makeProviderServiceLive().pipe(
+      Layer.provide(adapterRegistryLayer),
+      Layer.provide(directoryLayer),
+      Layer.provide(serverSettingsLayer),
+      Layer.provideMerge(AnalyticsService.layerTest),
+      Layer.provide(
+        Layer.succeed(
+          ProviderEventLoggers.ProviderEventLoggers,
+          ProviderEventLoggers.NoOpProviderEventLoggers,
+        ),
+      ),
+    );
+    const layer = Layer.mergeAll(
+      adapterLayer,
+      providerServiceLayer,
+      directoryLayer,
+      runtimeRepositoryLayer,
+    ).pipe(
+      Layer.provideMerge(sqliteLayer),
+      Layer.provideMerge(serverConfigLayer),
+      Layer.provideMerge(serverSettingsLayer),
+      Layer.provideMerge(NodeServices.layer),
+    );
+    providerStackScope = await Effect.runPromise(Scope.make("sequential"));
+    const context = await Effect.runPromise(Layer.buildWithScope(layer, providerStackScope));
+    return Effect.runPromise(
+      Effect.all({
+        adapter: Effect.service(RecordedClaudeAdapter),
+        providerService: Effect.service(ProviderService),
+        directory: Effect.service(ProviderSessionDirectory),
+      }).pipe(Effect.provide(context)),
+    );
+  }
+
   afterEach(async () => {
     if (watchdogScope) {
       await Effect.runPromise(Scope.close(watchdogScope, Exit.void));
@@ -469,6 +604,7 @@ describe("ProviderRuntimeIngestion", () => {
     provider?: ProviderDriverKind;
     providerAdapter?: CodexAdapterShape;
     providerService?: ProviderServiceShape;
+    model?: string;
   }) {
     const workspaceRoot = makeTempDir("t3-provider-project-");
     NodeFS.mkdirSync(NodePath.join(workspaceRoot, ".git"));
@@ -481,7 +617,9 @@ describe("ProviderRuntimeIngestion", () => {
     });
     const modelSelection = {
       instanceId: providerInstanceId,
-      model: providerDriver === "codex" ? "gpt-5.4-mini" : `${providerDriver}-test-model`,
+      model:
+        options?.model ??
+        (providerDriver === "codex" ? "gpt-5.4-mini" : `${providerDriver}-test-model`),
     };
     const orchestrationLayer = OrchestrationEngineLive.pipe(
       Layer.provide(OrchestrationProjectionSnapshotQueryLive),
@@ -691,7 +829,9 @@ describe("ProviderRuntimeIngestion", () => {
 
   async function startProviderWatchdog(
     harness: Awaited<ReturnType<typeof createHarness>>,
-    stack: Awaited<ReturnType<typeof createRecordedCodexStack>>,
+    stack:
+      | Awaited<ReturnType<typeof createRecordedCodexStack>>
+      | Awaited<ReturnType<typeof createRecordedClaudeStack>>,
     providerService: ProviderServiceShape = stack.providerService,
   ) {
     if (!runtime) throw new Error("Provider runtime ingestion harness is not initialized.");
@@ -1677,6 +1817,261 @@ describe("ProviderRuntimeIngestion", () => {
       { turnId: providerTurnId, state: "error" },
     ]);
     expect(disappearedStopAttempts).toBeGreaterThan(0);
+  });
+
+  it("replays a real Claude Agent stream through the adapter and persistent turn pipeline", async () => {
+    const stack = await createRecordedClaudeStack();
+    const runtimeEvents: ProviderRuntimeEvent[] = [];
+    const observedProviderService: ProviderServiceShape = {
+      ...stack.providerService,
+      streamEvents: stack.providerService.streamEvents.pipe(
+        Stream.tap((event) =>
+          Effect.sync(() => {
+            runtimeEvents.push(event);
+          }),
+        ),
+      ),
+    };
+    const harness = await createHarness({
+      provider: ProviderDriverKind.make("claudeAgent"),
+      providerService: observedProviderService,
+      model: "claude-sonnet-5",
+    });
+    const threadId = asThreadId("thread-1");
+
+    await Effect.runPromise(
+      harness.engine.dispatch(
+        {
+          type: "thread.turn.start",
+          commandId: CommandId.make("cmd-recorded-claude-turn"),
+          threadId,
+          message: {
+            messageId: asMessageId("message-recorded-claude-turn"),
+            role: "user",
+            text: "test",
+            attachments: [],
+          },
+          interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+          runtimeMode: "approval-required",
+          createdAt: "2026-01-01T00:00:01.000Z",
+        },
+        testDispatchAuthority,
+      ),
+    );
+    await Effect.runPromise(
+      stack.providerService.startSession(threadId, {
+        provider: ProviderDriverKind.make("claudeAgent"),
+        providerInstanceId: harness.modelSelection.instanceId,
+        threadId,
+        cwd: harness.workspaceRoot,
+        modelSelection: harness.modelSelection,
+        runtimeMode: "approval-required",
+      }),
+    );
+    const turn = await Effect.runPromise(
+      stack.providerService
+        .sendTurn({
+          threadId,
+          input: "test",
+          modelSelection: harness.modelSelection,
+          attachments: [],
+        })
+        .pipe(Effect.timeout("5 seconds")),
+    );
+    const expectedText =
+      "I see your message \"test\" — looks like you're checking that things are working. Everything's connected and ready. What would you like to do?";
+    const completedThread = await waitForThread(
+      harness.readModel,
+      (thread) =>
+        thread.latestTurn?.turnId === turn.turnId &&
+        thread.latestTurn.state === "completed" &&
+        thread.session?.activeTurnId === null,
+      5_000,
+      threadId,
+    );
+    await harness.drain();
+
+    expect(
+      runtimeEvents
+        .filter(
+          (event): event is Extract<ProviderRuntimeEvent, { type: "content.delta" }> =>
+            event.type === "content.delta" && event.payload.streamKind === "assistant_text",
+        )
+        .map((event) => event.payload.delta),
+    ).toEqual([
+      "I",
+      " see your message \"test\" — looks like you're checking that things are working. Everything's conn",
+      "ected and ready. What would you like to do?",
+    ]);
+    const assistantMessage = completedThread.messages.find(
+      (message) => message.role === "assistant" && message.text === expectedText,
+    );
+    expect(assistantMessage?.id).toEqual(expect.any(String));
+    expect(assistantMessage?.id).not.toBeNull();
+    expect(await harness.readProjectedTurns(threadId)).toEqual([
+      { turnId: turn.turnId, state: "completed" },
+    ]);
+  });
+
+  it("fails a recorded Claude Agent turn explicitly when the assistant response is empty", async () => {
+    const stack = await createRecordedClaudeStack("empty");
+    const harness = await createHarness({
+      provider: ProviderDriverKind.make("claudeAgent"),
+      providerService: stack.providerService,
+      model: "claude-sonnet-5",
+    });
+    const threadId = asThreadId("thread-1");
+
+    await Effect.runPromise(
+      harness.engine.dispatch(
+        {
+          type: "thread.turn.start",
+          commandId: CommandId.make("cmd-recorded-claude-empty-turn"),
+          threadId,
+          message: {
+            messageId: asMessageId("message-recorded-claude-empty-turn"),
+            role: "user",
+            text: "test",
+            attachments: [],
+          },
+          interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+          runtimeMode: "approval-required",
+          createdAt: "2026-01-01T00:00:01.000Z",
+        },
+        testDispatchAuthority,
+      ),
+    );
+    await Effect.runPromise(
+      stack.providerService.startSession(threadId, {
+        provider: ProviderDriverKind.make("claudeAgent"),
+        providerInstanceId: harness.modelSelection.instanceId,
+        threadId,
+        cwd: harness.workspaceRoot,
+        modelSelection: harness.modelSelection,
+        runtimeMode: "approval-required",
+      }),
+    );
+    const turn = await Effect.runPromise(
+      stack.providerService.sendTurn({
+        threadId,
+        input: "test",
+        modelSelection: harness.modelSelection,
+        attachments: [],
+      }),
+    );
+    const failedThread = await waitForThread(
+      harness.readModel,
+      (thread) =>
+        thread.latestTurn?.turnId === turn.turnId && thread.latestTurn.state !== "running",
+      5_000,
+      threadId,
+    );
+    await harness.drain();
+
+    expect(failedThread.session?.lastError).toBe(
+      "Provider completed the turn without emitting an assistant response.",
+    );
+    expect(failedThread.latestTurn?.state).toBe("error");
+    expect(failedThread.session?.activeTurnId).toBeNull();
+    expect(failedThread.messages.filter((message) => message.role === "assistant")).toEqual([]);
+    expect(await harness.readProjectedTurns(threadId)).toEqual([
+      { turnId: turn.turnId, state: "error" },
+    ]);
+  });
+
+  it("lets the watchdog fail a recorded Claude Agent turn after stream death loses terminal events", async () => {
+    const stack = await createRecordedClaudeStack("death");
+    const providerServiceWithoutTerminalEvents: ProviderServiceShape = {
+      ...stack.providerService,
+      streamEvents: stack.providerService.streamEvents.pipe(
+        Stream.filter(
+          (event) =>
+            event.type !== "runtime.error" &&
+            event.type !== "turn.completed" &&
+            event.type !== "session.exited",
+        ),
+      ),
+    };
+    const harness = await createHarness({
+      provider: ProviderDriverKind.make("claudeAgent"),
+      providerService: providerServiceWithoutTerminalEvents,
+      model: "claude-sonnet-5",
+    });
+    const threadId = asThreadId("thread-1");
+
+    await Effect.runPromise(
+      harness.engine.dispatch(
+        {
+          type: "thread.turn.start",
+          commandId: CommandId.make("cmd-recorded-claude-process-death"),
+          threadId,
+          message: {
+            messageId: asMessageId("message-recorded-claude-process-death"),
+            role: "user",
+            text: "test",
+            attachments: [],
+          },
+          interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+          runtimeMode: "approval-required",
+          createdAt: "2026-01-01T00:00:01.000Z",
+        },
+        testDispatchAuthority,
+      ),
+    );
+    await Effect.runPromise(
+      stack.providerService.startSession(threadId, {
+        provider: ProviderDriverKind.make("claudeAgent"),
+        providerInstanceId: harness.modelSelection.instanceId,
+        threadId,
+        cwd: harness.workspaceRoot,
+        modelSelection: harness.modelSelection,
+        runtimeMode: "approval-required",
+      }),
+    );
+    const turn = await Effect.runPromise(
+      stack.providerService.sendTurn({
+        threadId,
+        input: "test",
+        modelSelection: harness.modelSelection,
+        attachments: [],
+      }),
+    );
+
+    await waitForThread(
+      harness.readModel,
+      (thread) =>
+        thread.latestTurn?.turnId === turn.turnId &&
+        thread.latestTurn.state === "running" &&
+        thread.session?.activeTurnId === turn.turnId,
+      5_000,
+      threadId,
+    );
+    await startProviderWatchdog(harness, stack);
+    const failedThread = await waitForThread(
+      harness.readModel,
+      (thread) =>
+        thread.latestTurn?.turnId === turn.turnId &&
+        thread.latestTurn.state === "error" &&
+        thread.session?.activeTurnId === null,
+      5_000,
+      threadId,
+    );
+    await harness.drain();
+
+    expect(failedThread.session?.lastError).toBe(
+      "Provider session closed while the turn was running.",
+    );
+    const binding = Option.getOrThrow(
+      await Effect.runPromise(stack.directory.getBinding(threadId)),
+    );
+    expect(binding.runtimePayload).toMatchObject({
+      activeTurnId: null,
+      lastTerminalTurnId: turn.turnId,
+      lastRuntimeEvent: "provider.turn.watchdog.failed",
+    });
+    expect(await harness.readProjectedTurns(threadId)).toEqual([
+      { turnId: turn.turnId, state: "error" },
+    ]);
   });
 
   xit.each(["codex", "grok", "claudeAgent"] as const)(
