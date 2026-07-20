@@ -502,6 +502,7 @@ describe("ChildThreadCoordinator", () => {
     );
     const shellReadSequences = new Map<string, ReadonlyArray<ThreadState>>();
     const shellReadCounts = new Map<string, number>();
+    const blockedShellReads = new Map<string, Promise<void>>();
     for (const sequence of input?.shellReadSequences ?? []) {
       shellReadSequences.set(String(sequence.threadId), sequence.states);
     }
@@ -611,6 +612,10 @@ describe("ChildThreadCoordinator", () => {
     const readThreadShellByIdIncludingArchived: ProjectionSnapshotQuery["Service"]["getThreadShellByIdIncludingArchived"] =
       (threadId) =>
         Effect.gen(function* () {
+          const blockedShellRead = blockedShellReads.get(String(threadId));
+          if (blockedShellRead !== undefined) {
+            yield* Effect.promise(() => blockedShellRead);
+          }
           if (defectShellIds.has(String(threadId))) {
             return yield* Effect.die(new Error("simulated projection shell read defect"));
           }
@@ -882,6 +887,17 @@ describe("ChildThreadCoordinator", () => {
         slowDetailIds.delete(String(threadId));
       }
     };
+    const blockShellRead = (threadId: ThreadId) => {
+      let release!: () => void;
+      const blocked = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      blockedShellReads.set(String(threadId), blocked);
+      return () => {
+        blockedShellReads.delete(String(threadId));
+        release();
+      };
+    };
 
     // Simulate a deleted thread: subsequent getThreadShellById reads return none.
     const removeThread = (threadId: ThreadId) => threadStates.delete(threadId);
@@ -1022,13 +1038,20 @@ describe("ChildThreadCoordinator", () => {
         ),
       );
 
-    // Offer an event, then wait until the coordinator has finished processing it.
-    const feed = async (event: OrchestrationEvent) => {
+    // Offer an event and let the hot-stream fiber enqueue it without waiting for
+    // the coordinator worker. Concurrency tests use this to hold one event in
+    // the worker while proving that a later observed event fences background work.
+    const enqueueWithoutDrain = async (event: OrchestrationEvent) => {
       await Effect.runPromise(Queue.offer(eventQueue, event));
-      // Let the forked hot-stream fiber pull and enqueue, then wait for the worker.
+      // Let the forked hot-stream fiber pull and enqueue.
       for (let i = 0; i < 50; i += 1) {
         await Effect.runPromise(Effect.yieldNow);
       }
+    };
+
+    // Offer an event, then wait until the coordinator has finished processing it.
+    const feed = async (event: OrchestrationEvent) => {
+      await enqueueWithoutDrain(event);
       await Effect.runPromise(coordinator.drain);
     };
 
@@ -1046,8 +1069,10 @@ describe("ChildThreadCoordinator", () => {
       setThread,
       setShellSlow,
       setDetailSlow,
+      blockShellRead,
       removeThread,
       feed,
+      enqueueWithoutDrain,
       register,
       listPendingDispatches,
       listWaitDeliveries,
@@ -3683,6 +3708,37 @@ describe("ChildThreadCoordinator", () => {
     expect(result.status).toBe("failed");
   });
 
+  it("preserves replayed completion across unavailable archive detail and cleanup session", async () => {
+    const child = ThreadId.make("replay-completed-unavailable-archive-cleanup-child");
+    const parent = ThreadId.make("replay-completed-unavailable-archive-cleanup-parent");
+    const turn1 = TurnId.make("replay-completed-unavailable-archive-cleanup-turn");
+    const harness = await createHarness({
+      threads: [
+        makeThreadState({ threadId: parent }),
+        makeThreadState({
+          threadId: child,
+          parentThreadId: parent,
+          latestTurn: makeLatestTurn("completed", turn1),
+          session: makeSession(child, "stopped"),
+          assistantText: "completed before uncertain archive cleanup",
+        }),
+      ],
+      seedChildRows: [{ threadId: child, parentThreadId: parent }],
+      persistedEvents: [
+        turnDiffEvent(child, "ready", turn1),
+        threadArchivedEvent(child),
+        sessionSetEvent(child, "stopped"),
+      ],
+      // Read 1 restores the child; read 2 is the archive-time detail lookup.
+      slowThreadDetailReadNumbers: [{ threadId: child, readNumbers: [2] }],
+    });
+
+    const result = await runtimeRun(harness, child);
+    expect(result.status).toBe("completed");
+    expect(result.error).toBe(null);
+    expect(result.finalAssistantText).toBe("completed before uncertain archive cleanup");
+  });
+
   it("leaves a live archived child pending when the detail read is unavailable", async () => {
     const child = ThreadId.make("live-archive-unavailable-detail-child");
     const parent = ThreadId.make("live-archive-unavailable-detail-parent");
@@ -3711,6 +3767,42 @@ describe("ChildThreadCoordinator", () => {
 
     // Detail unavailable and the shell shows a running child: nothing here
     // proves the child ended, so it must not be recorded as killed.
+    expect((await runtimeListChildren(harness, parent))[0]).toMatchObject({ settled: false });
+  });
+
+  it("keeps an uncertain live archive pending through a one-shot wait check", async () => {
+    const child = ThreadId.make("live-archive-unavailable-one-shot-child");
+    const parent = ThreadId.make("live-archive-unavailable-one-shot-parent");
+    const turn1 = TurnId.make("live-archive-unavailable-one-shot-turn");
+    const harness = await createHarness({
+      threads: [
+        makeThreadState({ threadId: parent }),
+        makeThreadState({
+          threadId: child,
+          parentThreadId: parent,
+          latestTurn: makeLatestTurn("running", turn1),
+          session: makeSession(child, "running", turn1),
+        }),
+      ],
+      slowThreadDetailIds: [child],
+    });
+    await harness.register({
+      parentThreadId: parent,
+      childThreadId: child,
+      detached: true,
+      model: codexModel,
+      spawnedAtMs: 0,
+    });
+
+    await harness.feed(threadArchivedEvent(child));
+    // The maintenance sweep invokes the same one-shot check as waitSlice entry
+    // without spending a full wait slice on a deliberately pending child.
+    await Effect.runPromise(Effect.sleep("2100 millis"));
+    expect((await runtimeListChildren(harness, parent))[0]).toMatchObject({ settled: false });
+
+    // The active-archive marker tracks lease/unarchive work only. A later
+    // session projection event is still not terminal evidence for the archive.
+    await harness.feed(sessionSetEvent(child, "running", turn1));
     expect((await runtimeListChildren(harness, parent))[0]).toMatchObject({ settled: false });
   });
 
@@ -4005,6 +4097,43 @@ describe("ChildThreadCoordinator", () => {
     const result = await runtimeRun(harness, child);
     expect(result.status).toBe("completed");
     expect(result.finalAssistantText).toBe("replacement turn done");
+  });
+
+  it("restores a live orphan settlement when its correlated replacement start fails", async () => {
+    const child = ThreadId.make("live-orphan-failed-replacement-child");
+    const parent = ThreadId.make("live-orphan-failed-replacement-parent");
+    const turn1 = TurnId.make("live-orphan-failed-replacement-turn");
+    const replacementRequestId = EventId.make("live-orphan-failed-replacement-request");
+    const orphanReason = "orphaned by archived parent";
+    const harness = await createHarness({
+      threads: [
+        makeThreadState({ threadId: parent }),
+        makeThreadState({
+          threadId: child,
+          parentThreadId: parent,
+          latestTurn: makeLatestTurn("running", turn1),
+          session: makeSession(child, "running", turn1),
+        }),
+      ],
+    });
+    await harness.register({
+      parentThreadId: parent,
+      childThreadId: child,
+      detached: false,
+      model: codexModel,
+      spawnedAtMs: 0,
+    });
+
+    await harness.feed(orphanSettledEvent(child, orphanReason));
+    await harness.feed(turnStartRequestedEvent(child, replacementRequestId));
+    await harness.feed(providerTurnStartFailedEvent(child, replacementRequestId));
+
+    expect((await runtimeListChildren(harness, parent))[0]).toMatchObject({ settled: true });
+    expect((await runtimeWaitSlice(harness, [child], PAST_MS)).results[0]).toMatchObject({
+      status: "killed",
+      error: orphanReason,
+    });
+    expect(await harness.listDispatchLeaseChildIds()).toEqual([]);
   });
 
   it("re-enables the parent wake when a replacement turn supersedes an orphan settlement", async () => {
@@ -7189,6 +7318,149 @@ describe("ChildThreadCoordinator", () => {
     expect(await harness.listDispatchLeaseChildIds()).toEqual([child]);
   });
 
+  it("restores a replayed orphan settlement when its correlated replacement start fails", async () => {
+    const parent = ThreadId.make("boot-orphan-failed-replacement-parent");
+    const child = ThreadId.make("boot-orphan-failed-replacement-child");
+    const childTurn = TurnId.make("boot-orphan-failed-replacement-turn");
+    const replacementRequestId = EventId.make("boot-orphan-failed-replacement-request");
+    const orphanReason = "orphaned by archived parent";
+    const harness = await createHarness({
+      threads: [
+        makeThreadState({ threadId: parent }),
+        makeThreadState({
+          threadId: child,
+          parentThreadId: parent,
+          latestTurn: makeLatestTurn("running", childTurn),
+          session: makeSession(child, "running", childTurn),
+        }),
+      ],
+      seedChildRows: [{ threadId: child, parentThreadId: parent }],
+      persistedEvents: [
+        orphanSettledEvent(child, orphanReason),
+        turnStartRequestedEvent(child, replacementRequestId),
+        providerTurnStartFailedEvent(child, replacementRequestId),
+      ],
+    });
+
+    expect((await runtimeListChildren(harness, parent))[0]).toMatchObject({ settled: true });
+    expect((await runtimeWaitSlice(harness, [child], PAST_MS)).results[0]).toMatchObject({
+      status: "killed",
+      error: orphanReason,
+    });
+    expect(await harness.listDispatchLeaseChildIds()).toEqual([]);
+  });
+
+  it("restores a replayed orphan settlement after an uncertain archive", async () => {
+    const parent = ThreadId.make("boot-orphan-failed-after-archive-parent");
+    const child = ThreadId.make("boot-orphan-failed-after-archive-child");
+    const childTurn = TurnId.make("boot-orphan-failed-after-archive-turn");
+    const replacementRequestId = EventId.make("boot-orphan-failed-after-archive-request");
+    const orphanReason = "orphaned by archived parent";
+    const harness = await createHarness({
+      threads: [
+        makeThreadState({ threadId: parent }),
+        makeThreadState({
+          threadId: child,
+          parentThreadId: parent,
+          latestTurn: makeLatestTurn("running", childTurn),
+          session: makeSession(child, "running", childTurn),
+        }),
+      ],
+      seedChildRows: [{ threadId: child, parentThreadId: parent }],
+      persistedEvents: [
+        orphanSettledEvent(child, orphanReason),
+        turnStartRequestedEvent(child, replacementRequestId),
+        threadArchivedEvent(child),
+        providerTurnStartFailedEvent(child, replacementRequestId),
+      ],
+      // Read 1 restores the child; read 2 is the archive-time detail lookup.
+      slowThreadDetailReadNumbers: [{ threadId: child, readNumbers: [2] }],
+    });
+
+    expect((await runtimeListChildren(harness, parent))[0]).toMatchObject({ settled: true });
+    expect((await runtimeWaitSlice(harness, [child], PAST_MS)).results[0]).toMatchObject({
+      status: "killed",
+      error: orphanReason,
+    });
+    expect(await harness.listDispatchLeaseChildIds()).toEqual([]);
+  });
+
+  it("restores a replayed orphan settlement when its failure arrives live", async () => {
+    const parent = ThreadId.make("boot-orphan-live-failure-parent");
+    const child = ThreadId.make("boot-orphan-live-failure-child");
+    const childTurn = TurnId.make("boot-orphan-live-failure-turn");
+    const replacementRequestId = EventId.make("boot-orphan-live-failure-request");
+    const orphanReason = "orphaned by archived parent";
+    const harness = await createHarness({
+      threads: [
+        makeThreadState({ threadId: parent }),
+        makeThreadState({
+          threadId: child,
+          parentThreadId: parent,
+          latestTurn: makeLatestTurn("running", childTurn),
+          session: makeSession(child, "running", childTurn),
+        }),
+      ],
+      seedChildRows: [{ threadId: child, parentThreadId: parent }],
+      persistedEvents: [
+        orphanSettledEvent(child, orphanReason),
+        turnStartRequestedEvent(child, replacementRequestId),
+      ],
+    });
+
+    await harness.feed(providerTurnStartFailedEvent(child, replacementRequestId));
+
+    expect((await runtimeListChildren(harness, parent))[0]).toMatchObject({ settled: true });
+    expect((await runtimeWaitSlice(harness, [child], PAST_MS)).results[0]).toMatchObject({
+      status: "killed",
+      error: orphanReason,
+    });
+    expect(await harness.listDispatchLeaseChildIds()).toEqual([]);
+  });
+
+  it("defers boot orphan cleanup for a replayed provisional replacement", async () => {
+    const parent = ThreadId.make("boot-orphan-provisional-parent");
+    const child = ThreadId.make("boot-orphan-provisional-child");
+    const childTurn = TurnId.make("boot-orphan-provisional-turn");
+    const replacementRequestId = EventId.make("boot-orphan-provisional-request");
+    const orphanReason = "orphaned by archived parent";
+    const harness = await createHarness({
+      threads: [
+        // Projection lag can still show the parent archived after the immutable
+        // log accepted the child's replacement request.
+        makeThreadState({ threadId: parent, archivedAt: now }),
+        makeThreadState({
+          threadId: child,
+          parentThreadId: parent,
+          latestTurn: makeLatestTurn("running", childTurn),
+          session: makeSession(child, "running", childTurn),
+        }),
+      ],
+      seedChildRows: [{ threadId: child, parentThreadId: parent }],
+      persistedEvents: [
+        orphanSettledEvent(child, orphanReason),
+        turnStartRequestedEvent(child, replacementRequestId),
+      ],
+    });
+
+    expect((await runtimeListChildren(harness, parent))[0]).toMatchObject({ settled: false });
+    expect(harness.providerStopSessionCallCount()).toBe(0);
+    expect(
+      harness.dispatched.some(
+        (command) =>
+          command.type === "thread.activity.append" &&
+          command.threadId === child &&
+          command.activity.kind === "subagent.orphan.settled",
+      ),
+    ).toBe(false);
+
+    await harness.feed(providerTurnStartFailedEvent(child, replacementRequestId));
+    expect((await runtimeWaitSlice(harness, [child], PAST_MS)).results[0]).toMatchObject({
+      status: "killed",
+      error: orphanReason,
+    });
+  });
+
   it("propagates a durable orphan settlement to a descendant of the settled child", async () => {
     const parent = ThreadId.make("boot-orphan-descendant-parent");
     const child = ThreadId.make("boot-orphan-descendant-child");
@@ -7764,10 +8036,203 @@ describe("ChildThreadCoordinator", () => {
     );
   });
 
+  it("fences orphan settlement retries when a replacement start is queued but unprocessed", async () => {
+    const parent = ThreadId.make("boot-orphan-queued-start-parent");
+    const child = ThreadId.make("boot-orphan-queued-start-child");
+    const childTurn = TurnId.make("boot-orphan-queued-start-turn");
+    const blocker = ThreadId.make("boot-orphan-queued-start-blocker");
+    const blockerParent = ThreadId.make("boot-orphan-queued-start-blocker-parent");
+    const blockerTurn = TurnId.make("boot-orphan-queued-start-blocker-turn");
+    const harness = await createHarness({
+      threads: [
+        makeThreadState({ threadId: parent, archivedAt: now }),
+        makeThreadState({
+          threadId: child,
+          parentThreadId: parent,
+          latestTurn: makeLatestTurn("running", childTurn),
+          session: makeSession(child, "running", childTurn),
+        }),
+        makeThreadState({ threadId: blockerParent }),
+        makeThreadState({
+          threadId: blocker,
+          parentThreadId: blockerParent,
+          latestTurn: makeLatestTurn("running", blockerTurn),
+          session: makeSession(blocker, "running", blockerTurn),
+        }),
+      ],
+      seedChildRows: [{ threadId: child, parentThreadId: parent }],
+      // Three boot attempts and the retry fiber's immediate attempt fail. Its
+      // next attempt wakes after 2s while the replacement start is queued.
+      failOrphanSettlementDispatchCount: 4,
+    });
+    await harness.register({
+      parentThreadId: blockerParent,
+      childThreadId: blocker,
+      detached: false,
+      model: codexModel,
+      spawnedAtMs: 0,
+    });
+
+    harness.setShellSlow(blocker, true);
+    await harness.enqueueWithoutDrain(sessionSetEvent(blocker, "stopped"));
+    await Effect.runPromise(Effect.sleep("750 millis"));
+    await harness.enqueueWithoutDrain(turnStartRequestedEvent(child));
+
+    // The worker is still blocked in the preceding event, so the in-memory
+    // orphan supersession handler has not run. Stream order alone must fence
+    // the retry before its next 2s attempt.
+    await Effect.runPromise(Effect.sleep("2100 millis"));
+    expect(
+      harness.dispatched.some(
+        (command) =>
+          command.type === "thread.activity.append" &&
+          command.threadId === child &&
+          command.activity.kind === "subagent.orphan.settled",
+      ),
+    ).toBe(false);
+  });
+
+  it("resumes an orphan settlement retry when the queued replacement start fails", async () => {
+    const parent = ThreadId.make("boot-orphan-failed-start-resume-parent");
+    const child = ThreadId.make("boot-orphan-failed-start-resume-child");
+    const childTurn = TurnId.make("boot-orphan-failed-start-resume-turn");
+    const replacementRequestId = EventId.make("boot-orphan-failed-start-resume-request");
+    const orphanReason = "orphaned by archived parent";
+    const harness = await createHarness({
+      threads: [
+        makeThreadState({ threadId: parent, archivedAt: now }),
+        makeThreadState({
+          threadId: child,
+          parentThreadId: parent,
+          latestTurn: makeLatestTurn("running", childTurn),
+          session: makeSession(child, "running", childTurn),
+        }),
+      ],
+      seedChildRows: [{ threadId: child, parentThreadId: parent }],
+      // Leave the durable append retry asleep when boot returns.
+      failOrphanSettlementDispatchCount: 4,
+    });
+
+    await harness.feed(turnStartRequestedEvent(child, replacementRequestId));
+    await harness.feed(providerTurnStartFailedEvent(child, replacementRequestId));
+
+    expect((await runtimeListChildren(harness, parent))[0]).toMatchObject({ settled: true });
+    expect((await runtimeWaitSlice(harness, [child], PAST_MS)).results[0]).toMatchObject({
+      status: "killed",
+      error: orphanReason,
+    });
+    await Effect.runPromise(Effect.sleep("2100 millis"));
+    expect(
+      harness.dispatched.some(
+        (command) =>
+          command.type === "thread.activity.append" &&
+          command.threadId === child &&
+          command.activity.kind === "subagent.orphan.settled",
+      ),
+    ).toBe(true);
+  });
+
+  it("resumes orphan cleanup when a newer settlement supersedes a queued start", async () => {
+    const parent = ThreadId.make("boot-orphan-newer-settlement-parent");
+    const child = ThreadId.make("boot-orphan-newer-settlement-child");
+    const childTurn = TurnId.make("boot-orphan-newer-settlement-turn");
+    const replacementRequestId = EventId.make("boot-orphan-newer-settlement-request");
+    const orphanReason = "orphaned by archived parent";
+    const harness = await createHarness({
+      threads: [
+        makeThreadState({ threadId: parent, archivedAt: now }),
+        makeThreadState({
+          threadId: child,
+          parentThreadId: parent,
+          latestTurn: makeLatestTurn("running", childTurn),
+          session: makeSession(child, "running", childTurn),
+        }),
+      ],
+      seedChildRows: [{ threadId: child, parentThreadId: parent }],
+      // Leave the durable append retry asleep when boot returns.
+      failOrphanSettlementDispatchCount: 4,
+    });
+
+    await harness.feed(turnStartRequestedEvent(child, replacementRequestId));
+    await harness.feed(orphanSettledEvent(child, orphanReason));
+
+    expect((await runtimeWaitSlice(harness, [child], PAST_MS)).results[0]).toMatchObject({
+      status: "killed",
+      error: orphanReason,
+    });
+    await Effect.runPromise(Effect.sleep("2100 millis"));
+    expect(
+      harness.dispatched.some(
+        (command) =>
+          command.type === "thread.activity.append" &&
+          command.threadId === child &&
+          command.activity.kind === "subagent.orphan.settled",
+      ),
+    ).toBe(true);
+  });
+
+  it("does not let an earlier queued session confirm a later replacement request", async () => {
+    const parent = ThreadId.make("boot-orphan-ordered-pause-parent");
+    const child = ThreadId.make("boot-orphan-ordered-pause-child");
+    const childTurn = TurnId.make("boot-orphan-ordered-pause-turn");
+    const replacementTurn = TurnId.make("boot-orphan-ordered-pause-replacement-turn");
+    const replacementRequestId = EventId.make("boot-orphan-ordered-pause-request");
+    const blocker = ThreadId.make("boot-orphan-ordered-pause-blocker");
+    const blockerParent = ThreadId.make("boot-orphan-ordered-pause-blocker-parent");
+    const blockerTurn = TurnId.make("boot-orphan-ordered-pause-blocker-turn");
+    const harness = await createHarness({
+      threads: [
+        makeThreadState({ threadId: parent, archivedAt: now }),
+        makeThreadState({
+          threadId: child,
+          parentThreadId: parent,
+          latestTurn: makeLatestTurn("running", childTurn),
+          session: makeSession(child, "running", childTurn),
+        }),
+        makeThreadState({ threadId: blockerParent }),
+        makeThreadState({
+          threadId: blocker,
+          parentThreadId: blockerParent,
+          latestTurn: makeLatestTurn("running", blockerTurn),
+          session: makeSession(blocker, "running", blockerTurn),
+        }),
+      ],
+      seedChildRows: [{ threadId: child, parentThreadId: parent }],
+      failOrphanSettlementDispatchCount: 4,
+    });
+    await harness.register({
+      parentThreadId: blockerParent,
+      childThreadId: blocker,
+      detached: false,
+      model: codexModel,
+      spawnedAtMs: 0,
+    });
+
+    const releaseBlocker = harness.blockShellRead(blocker);
+    await harness.enqueueWithoutDrain(sessionSetEvent(blocker, "stopped"));
+    await harness.enqueueWithoutDrain(sessionSetEvent(child, "running", replacementTurn));
+    await harness.enqueueWithoutDrain(turnStartRequestedEvent(child, replacementRequestId));
+    releaseBlocker();
+    await Effect.runPromise(harness.coordinator.drain);
+
+    await harness.feed(providerTurnStartFailedEvent(child, replacementRequestId));
+    expect((await runtimeListChildren(harness, parent))[0]).toMatchObject({ settled: true });
+    await Effect.runPromise(Effect.sleep("2100 millis"));
+    expect(
+      harness.dispatched.some(
+        (command) =>
+          command.type === "thread.activity.append" &&
+          command.threadId === child &&
+          command.activity.kind === "subagent.orphan.settled",
+      ),
+    ).toBe(true);
+  });
+
   it("abandons an in-flight orphan settlement retry once a replacement start supersedes it", async () => {
     const parent = ThreadId.make("boot-orphan-superseded-retry-parent");
     const child = ThreadId.make("boot-orphan-superseded-retry-child");
     const childTurn = TurnId.make("boot-orphan-superseded-retry-turn");
+    const replacementTurn = TurnId.make("boot-orphan-superseded-retry-replacement-turn");
     const harness = await createHarness({
       threads: [
         makeThreadState({ threadId: parent, archivedAt: now }),
@@ -7798,6 +8263,7 @@ describe("ChildThreadCoordinator", () => {
     // The parent came back and started a replacement turn while the settlement
     // retry was still sleeping between attempts.
     await harness.feed(turnStartRequestedEvent(child));
+    await harness.feed(sessionSetEvent(child, "running", replacementTurn));
     expect((await runtimeWaitSlice(harness, [child], PAST_MS)).results[0]!.status).toBe("timeout");
 
     // Past the 2s retry spacing: the abandoned retry must never land the stale
@@ -7819,6 +8285,7 @@ describe("ChildThreadCoordinator", () => {
     const parent = ThreadId.make("boot-orphan-superseded-stop-parent");
     const child = ThreadId.make("boot-orphan-superseded-stop-child");
     const childTurn = TurnId.make("boot-orphan-superseded-stop-turn");
+    const replacementTurn = TurnId.make("boot-orphan-superseded-stop-replacement-turn");
     const harness = await createHarness({
       threads: [
         makeThreadState({ threadId: parent, archivedAt: now }),
@@ -7837,6 +8304,7 @@ describe("ChildThreadCoordinator", () => {
     });
 
     await harness.feed(turnStartRequestedEvent(child));
+    await harness.feed(sessionSetEvent(child, "running", replacementTurn));
     expect((await runtimeWaitSlice(harness, [child], PAST_MS)).results[0]!.status).toBe("timeout");
     const stopCallsAtSupersession = harness.providerStopSessionCallCount();
 

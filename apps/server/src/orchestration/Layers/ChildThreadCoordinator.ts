@@ -375,12 +375,12 @@ const clearFailedPendingTurnStart = (input: {
   readonly activeTurns: Map<ThreadId, TurnId>;
   readonly pendingStarts: Map<ThreadId, EventId>;
   readonly pendingSameTurnStarts: Map<ThreadId, TurnId>;
-}): void => {
+}): boolean => {
   if (
     input.failedRequestId === undefined ||
     input.pendingStarts.get(input.threadId) !== input.failedRequestId
   ) {
-    return;
+    return false;
   }
   const preservedActiveTurnId = input.pendingSameTurnStarts.get(input.threadId);
   input.pendingStarts.delete(input.threadId);
@@ -388,6 +388,7 @@ const clearFailedPendingTurnStart = (input: {
   if (preservedActiveTurnId !== undefined) {
     input.activeTurns.set(input.threadId, preservedActiveTurnId);
   }
+  return true;
 };
 
 const parseIsoMillis = (value: string | null | undefined): number | null => {
@@ -558,13 +559,20 @@ const make = Effect.gen(function* () {
   // accepted replacement start supersedes that settlement, so this tracks which
   // suppressions are revocable; every other suppression is permanent.
   const orphanSettledChildIds = new Set<ThreadId>();
+  // Reopening an orphan terminal at turn-start request time is provisional: the
+  // provider may reject that exact request before a replacement lifecycle exists.
+  // Retain the prior result so a correlated failure can restore it losslessly.
+  const pendingOrphanSupersessionByChild = new Map<
+    ThreadId,
+    { readonly requestId: EventId; readonly result: ChildWaitResult }
+  >();
   // Boot orphan cleanup keeps retrying its durable writes in forked fibers, and
   // the live event stream starts while those fibers are still sleeping between
-  // attempts. A replacement start arriving in that window revokes the settlement
-  // those writes describe, so each child carries a generation that a supersession
-  // bumps; a retry whose captured generation is stale must abandon rather than
-  // stop or re-settle the replacement it would otherwise be acting on.
+  // attempts. A queued replacement request pauses those retries before worker
+  // handling; a confirmed provider turn bumps the generation permanently, while
+  // a correlated start failure unpauses the original cleanup.
   const orphanCleanupGenerationByChild = new Map<ThreadId, number>();
+  const orphanCleanupPauseRequestByChild = new Map<ThreadId, EventId>();
   // Per-child guard so a deferred child_steer drain (R-C) is serialised and
   // never double-dispatches against the same child.
   const childSteerLocks = new Map<ThreadId, Semaphore.Semaphore>();
@@ -587,22 +595,44 @@ const make = Effect.gen(function* () {
     unarchivedTerminalMarkedAtByChild.delete(threadId);
   };
   const markOrphanSettledChild = (threadId: ThreadId) => {
+    const supersededRequestId = pendingOrphanSupersessionByChild.get(threadId)?.requestId;
+    pendingOrphanSupersessionByChild.delete(threadId);
+    if (
+      supersededRequestId !== undefined &&
+      orphanCleanupPauseRequestByChild.get(threadId) === supersededRequestId
+    ) {
+      orphanCleanupPauseRequestByChild.delete(threadId);
+    }
     orphanSettledChildIds.add(threadId);
     suppressParentWakeChildIds.add(threadId);
   };
-  const clearOrphanSettledChild = (threadId: ThreadId) => {
-    if (!orphanSettledChildIds.delete(threadId)) return;
-    suppressParentWakeChildIds.delete(threadId);
-    // Only a real supersession bumps the generation, so a child settled, then
-    // superseded, then settled again cannot have its second cleanup abandoned
-    // by the first supersession.
+  const advanceOrphanCleanupGeneration = (threadId: ThreadId) => {
     orphanCleanupGenerationByChild.set(
       threadId,
       (orphanCleanupGenerationByChild.get(threadId) ?? 0) + 1,
     );
   };
+  const clearOrphanSettledChild = (threadId: ThreadId) => {
+    if (!orphanSettledChildIds.delete(threadId)) return;
+    suppressParentWakeChildIds.delete(threadId);
+  };
+  const confirmOrphanSupersession = (threadId: ThreadId) => {
+    const pending = pendingOrphanSupersessionByChild.get(threadId);
+    if (pending === undefined) return;
+    pendingOrphanSupersessionByChild.delete(threadId);
+    if (orphanCleanupPauseRequestByChild.get(threadId) === pending.requestId) {
+      orphanCleanupPauseRequestByChild.delete(threadId);
+    }
+    advanceOrphanCleanupGeneration(threadId);
+  };
   const currentOrphanCleanupGeneration = (threadId: ThreadId): number =>
     orphanCleanupGenerationByChild.get(threadId) ?? 0;
+  const waitUntilOrphanCleanupUnpaused = (threadId: ThreadId): Effect.Effect<void> =>
+    Effect.suspend(() =>
+      orphanCleanupPauseRequestByChild.has(threadId)
+        ? Effect.sleep("50 millis").pipe(Effect.andThen(waitUntilOrphanCleanupUnpaused(threadId)))
+        : Effect.void,
+    );
   // Re-checked on every retry attempt rather than once at fork time: the window
   // this closes is the sleep between attempts, so a fork-time check would prove
   // nothing. `Effect.suspend` keeps the read inside the retried effect.
@@ -611,10 +641,14 @@ const make = Effect.gen(function* () {
     generation: number,
     effect: Effect.Effect<A, E, R>,
   ): Effect.Effect<Option.Option<A>, E, R> =>
-    Effect.suspend(() =>
-      currentOrphanCleanupGeneration(threadId) !== generation
-        ? Effect.succeedNone
-        : Effect.asSome(effect),
+    waitUntilOrphanCleanupUnpaused(threadId).pipe(
+      Effect.andThen(
+        Effect.suspend(() =>
+          currentOrphanCleanupGeneration(threadId) !== generation
+            ? Effect.succeedNone
+            : Effect.asSome(effect),
+        ),
+      ),
     );
   const terminalProjectionAtOrBeforeUnarchive = (
     childThreadId: ThreadId,
@@ -1933,7 +1967,7 @@ const make = Effect.gen(function* () {
       if (children.has(threadId)) {
         const record = children.get(threadId)!;
         const shellOption = yield* getThreadShellBounded(threadId);
-        if (archivedChildIds.has(threadId) || archivedActiveChildIds.has(threadId)) {
+        if (archivedChildIds.has(threadId)) {
           yield* settleChild(threadId, "killed", "thread archived", true);
           return;
         }
@@ -2026,6 +2060,9 @@ const make = Effect.gen(function* () {
       if (!record) return;
       const reportedActiveTurnId = activeTurnReportedBySession(session);
       if (reportedActiveTurnId !== undefined) {
+        // A real provider turn now exists, so a later failure activity for the
+        // request cannot restore the orphan lifecycle it provisionally replaced.
+        confirmOrphanSupersession(threadId);
         if (
           activeTurnByChild.get(threadId) !== reportedActiveTurnId ||
           pendingSameTurnStartByChild.get(threadId) === reportedActiveTurnId
@@ -2044,7 +2081,7 @@ const make = Effect.gen(function* () {
       ) {
         return;
       }
-      if (archivedChildIds.has(threadId) || archivedActiveChildIds.has(threadId)) {
+      if (archivedChildIds.has(threadId)) {
         yield* settleChild(threadId, "killed", "thread archived", true);
         yield* drainChildSteers(threadId);
         return;
@@ -2180,6 +2217,7 @@ const make = Effect.gen(function* () {
             // No detail, no shell evidence: nothing here proves the child ended.
             // Killing it on an unavailable read would report a possibly-running
             // (or already completed) child as killed by the archive.
+            archivedChildIds.delete(threadId);
             archivedActiveChildIds.add(threadId);
             return;
           }
@@ -2428,6 +2466,16 @@ const make = Effect.gen(function* () {
       let record = children.get(threadId);
       if (!record) return;
       let done = yield* Deferred.isDone(record.terminal);
+      const pendingOrphanSupersession = pendingOrphanSupersessionByChild.get(threadId);
+      if (pendingOrphanSupersession !== undefined) {
+        // Overlapping requests still describe one provisional replacement. A
+        // stale failure for an older request must not restore the orphan while
+        // the newest request remains pending.
+        pendingOrphanSupersessionByChild.set(threadId, {
+          ...pendingOrphanSupersession,
+          requestId: event.eventId,
+        });
+      }
       // An orphan settlement is superseded by an accepted replacement start the
       // same way an unarchived terminal is: the child is live again, so its
       // Deferred must reopen and its parent-wake suppression must be lifted.
@@ -2435,6 +2483,12 @@ const make = Effect.gen(function* () {
         done &&
         (unarchivedTerminalChildIds.has(threadId) || orphanSettledChildIds.has(threadId))
       ) {
+        if (orphanSettledChildIds.has(threadId)) {
+          pendingOrphanSupersessionByChild.set(threadId, {
+            requestId: event.eventId,
+            result: yield* Deferred.await(record.terminal),
+          });
+        }
         yield* discardQueuedChildWakes(threadId);
         const terminal = yield* Deferred.make<ChildWaitResult>();
         record = children.get(threadId) ?? record;
@@ -2443,6 +2497,15 @@ const make = Effect.gen(function* () {
         clearUnarchivedTerminalChild(threadId);
         clearOrphanSettledChild(threadId);
         done = false;
+      }
+      if (
+        orphanCleanupPauseRequestByChild.get(threadId) === event.eventId &&
+        !pendingOrphanSupersessionByChild.has(threadId)
+      ) {
+        // The stream observer saw this request while older worker items still
+        // made the child look orphan-settled. Ordered handling has now proved it
+        // is not an orphan supersession, so its request-specific pause is stale.
+        orphanCleanupPauseRequestByChild.delete(threadId);
       }
       if (!done) {
         yield* dispatchLimiter.seedChild(threadId);
@@ -2467,13 +2530,32 @@ const make = Effect.gen(function* () {
         return;
       }
       if (activity.kind === "provider.turn.start.failed") {
-        clearFailedPendingTurnStart({
+        const failedRequestId = failedTurnStartRequestId(activity);
+        const cleared = clearFailedPendingTurnStart({
           threadId,
-          failedRequestId: failedTurnStartRequestId(activity),
+          failedRequestId,
           activeTurns: activeTurnByChild,
           pendingStarts: pendingTurnStartByChild,
           pendingSameTurnStarts: pendingSameTurnStartByChild,
         });
+        const pendingOrphanSupersession = pendingOrphanSupersessionByChild.get(threadId);
+        if (
+          cleared &&
+          failedRequestId !== undefined &&
+          pendingOrphanSupersession?.requestId === failedRequestId
+        ) {
+          pendingOrphanSupersessionByChild.delete(threadId);
+          if (orphanCleanupPauseRequestByChild.get(threadId) === failedRequestId) {
+            orphanCleanupPauseRequestByChild.delete(threadId);
+          }
+          markOrphanSettledChild(threadId);
+          yield* settleChild(
+            threadId,
+            pendingOrphanSupersession.result.status,
+            pendingOrphanSupersession.result.error,
+            true,
+          );
+        }
       }
     });
 
@@ -2998,6 +3080,14 @@ const make = Effect.gen(function* () {
       const rearchivedUnarchivedTerminalStartedChildIds = new Set<ThreadId>();
       const activeArchiveByReplayedChild = new Set<ThreadId>();
       const authoritativeDurableOrphanSettlementByChild = new Map<ThreadId, ChildTerminalOutcome>();
+      const pendingOrphanSupersessionByReplayedChild = new Map<
+        ThreadId,
+        {
+          readonly requestId: EventId;
+          readonly outcome: ChildTerminalOutcome;
+          readonly settledAtOrdinal: number;
+        }
+      >();
       // Log position of each durable orphan settlement and of each accepted
       // start, so descendant propagation can compare them. A local ordinal is
       // used rather than event.sequence: sequence is optional on the event
@@ -3025,6 +3115,16 @@ const make = Effect.gen(function* () {
         pendingTurnStartByReplayedChild.delete(threadId);
         pendingSameTurnStartByReplayedChild.delete(threadId);
         missingDiffWhileRunningByReplayedChild.delete(threadId);
+      };
+      const restoreFailedOrphanSupersession = (threadId: ThreadId, failedRequestId: EventId) => {
+        const pending = pendingOrphanSupersessionByReplayedChild.get(threadId);
+        if (pending?.requestId !== failedRequestId) return;
+        pendingOrphanSupersessionByReplayedChild.delete(threadId);
+        authoritativeDurableOrphanSettlementByChild.set(threadId, pending.outcome);
+        durableOrphanSettlementOrdinalByChild.set(threadId, pending.settledAtOrdinal);
+        acceptedStartOrdinalByChild.delete(threadId);
+        activeArchiveByReplayedChild.delete(threadId);
+        markLifecycleTerminal(threadId, pending.outcome, { preserveExistingTerminal: false });
       };
       yield* Stream.runForEach(orchestrationEngine.readEvents(0), (event) =>
         Effect.gen(function* () {
@@ -3123,11 +3223,24 @@ const make = Effect.gen(function* () {
             case "thread.turn-start-requested": {
               const { threadId } = event.payload;
               if (!knownChildIds.has(threadId)) return;
+              const pendingOrphanSupersession =
+                pendingOrphanSupersessionByReplayedChild.get(threadId);
+              if (pendingOrphanSupersession !== undefined) {
+                pendingOrphanSupersessionByReplayedChild.set(threadId, {
+                  ...pendingOrphanSupersession,
+                  requestId: event.eventId,
+                });
+              }
               if (lifecycleTerminatedByChild.has(threadId)) {
                 // A durable orphan settlement is the one lifecycle terminal a
                 // replacement start may supersede; without this the supersession
                 // below is unreachable and the child replays killed forever.
                 if (!authoritativeDurableOrphanSettlementByChild.has(threadId)) return;
+                pendingOrphanSupersessionByReplayedChild.set(threadId, {
+                  requestId: event.eventId,
+                  outcome: authoritativeDurableOrphanSettlementByChild.get(threadId)!,
+                  settledAtOrdinal: durableOrphanSettlementOrdinalByChild.get(threadId)!,
+                });
                 lifecycleTerminatedByChild.delete(threadId);
               }
               if (activeArchiveByReplayedChild.has(threadId)) return;
@@ -3178,6 +3291,7 @@ const make = Effect.gen(function* () {
               if (!knownChildIds.has(threadId)) return;
               const settledOrphanReason = orphanSettlementReason(activity);
               if (settledOrphanReason !== null) {
+                pendingOrphanSupersessionByReplayedChild.delete(threadId);
                 const outcome = nonSessionTerminalOutcome(
                   "killed",
                   settledOrphanReason,
@@ -3189,7 +3303,6 @@ const make = Effect.gen(function* () {
                 return;
               }
               if (lifecycleTerminatedByChild.has(threadId)) return;
-              if (activeArchiveByReplayedChild.has(threadId)) return;
               if (activity.kind !== "provider.turn.start.failed") return;
               const failedRequestId = failedTurnStartRequestId(activity);
               if (failedRequestId === undefined) {
@@ -3202,13 +3315,16 @@ const make = Effect.gen(function* () {
                 }
                 return;
               }
-              clearFailedPendingTurnStart({
+              const cleared = clearFailedPendingTurnStart({
                 threadId,
                 failedRequestId,
                 activeTurns: activeTurnByReplayedChild,
                 pendingStarts: pendingTurnStartByReplayedChild,
                 pendingSameTurnStarts: pendingSameTurnStartByReplayedChild,
               });
+              if (cleared && failedRequestId !== undefined) {
+                restoreFailedOrphanSupersession(threadId, failedRequestId);
+              }
               if (!pendingTurnStartByReplayedChild.has(threadId)) {
                 ambiguousLegacyFailureByReplayedChild.delete(threadId);
                 legacyFailureCandidateByReplayedChild.delete(threadId);
@@ -3236,6 +3352,7 @@ const make = Effect.gen(function* () {
               }
               const reportedActiveTurnId = activeTurnReportedBySession(session);
               if (reportedActiveTurnId !== undefined) {
+                pendingOrphanSupersessionByReplayedChild.delete(threadId);
                 if (
                   activeTurnByReplayedChild.get(threadId) !== reportedActiveTurnId ||
                   pendingSameTurnStartByReplayedChild.get(threadId) === reportedActiveTurnId
@@ -3382,6 +3499,15 @@ const make = Effect.gen(function* () {
               unarchivedTerminalChildIds.delete(threadId);
               const detailRead = yield* getThreadDetailReadBounded(threadId);
               if (detailRead._tag === "Unavailable") {
+                const priorTerminal = terminalByChild.get(threadId);
+                if (priorTerminal !== undefined) {
+                  // The archive is terminal evidence, but the unavailable detail
+                  // read cannot replace an already-proven outcome. Seal that
+                  // outcome exactly as the successful-detail path does so later
+                  // archive-cleanup session events cannot overwrite it.
+                  markLifecycleTerminal(threadId, priorTerminal);
+                  return;
+                }
                 // An unavailable read is not evidence that the thread is gone.
                 // Treat the archive as active so live reconciliation decides,
                 // rather than killing a child the detail may show as running.
@@ -3430,13 +3556,16 @@ const make = Effect.gen(function* () {
       ).pipe(Effect.orDie);
       for (const [threadId, failedRequestId] of legacyFailureCandidateByReplayedChild) {
         if (ambiguousLegacyFailureByReplayedChild.has(threadId)) continue;
-        clearFailedPendingTurnStart({
+        const cleared = clearFailedPendingTurnStart({
           threadId,
           failedRequestId,
           activeTurns: activeTurnByReplayedChild,
           pendingStarts: pendingTurnStartByReplayedChild,
           pendingSameTurnStarts: pendingSameTurnStartByReplayedChild,
         });
+        if (cleared) {
+          restoreFailedOrphanSupersession(threadId, failedRequestId);
+        }
       }
       return {
         terminalByChild,
@@ -3454,6 +3583,7 @@ const make = Effect.gen(function* () {
         rearchivedUnarchivedTerminalStartedChildIds,
         activeArchiveByReplayedChild,
         authoritativeDurableOrphanSettlementByChild,
+        pendingOrphanSupersessionByReplayedChild,
         durableOrphanSettlementOrdinalByChild,
         acceptedStartOrdinalByChild,
         maxSequence,
@@ -3622,6 +3752,7 @@ const make = Effect.gen(function* () {
         rearchivedUnarchivedTerminalStartedChildIds,
         activeArchiveByReplayedChild,
         authoritativeDurableOrphanSettlementByChild,
+        pendingOrphanSupersessionByReplayedChild,
         durableOrphanSettlementOrdinalByChild,
         acceptedStartOrdinalByChild,
       } = yield* reconcileFromLog(knownChildIds);
@@ -3642,6 +3773,17 @@ const make = Effect.gen(function* () {
       }
       for (const [childThreadId, requestId] of pendingTurnStartByReplayedChild) {
         pendingTurnStartByChild.set(childThreadId, requestId);
+      }
+      for (const [childThreadId, pending] of pendingOrphanSupersessionByReplayedChild) {
+        pendingOrphanSupersessionByChild.set(childThreadId, {
+          requestId: pending.requestId,
+          result: {
+            childThreadId,
+            status: pending.outcome.status,
+            finalAssistantText: null,
+            error: pending.outcome.error,
+          },
+        });
       }
       for (const [childThreadId, turnId] of pendingSameTurnStartByReplayedChild) {
         pendingSameTurnStartByChild.set(childThreadId, turnId);
@@ -3848,6 +3990,15 @@ const make = Effect.gen(function* () {
       for (const childThreadId of bootChildOrder) {
         const record = children.get(childThreadId);
         if (record === undefined) continue;
+        if (pendingOrphanSupersessionByReplayedChild.has(childThreadId)) {
+          // Replay ended after the replacement request but before its provider
+          // result. The current parent shell may still be archived because the
+          // projection lags that request; treating it as current orphan evidence
+          // would stop the replacement synchronously before the live failure or
+          // active-session event can decide the provisional supersession.
+          orphanReasonByThread.set(childThreadId, LIVE_CLASSIFICATION);
+          continue;
+        }
         const classification = yield* orphanReasonForThread(record.parentThreadId, new Set());
         if (classification.reason === null) continue;
         // Live processing revokes an inferred orphan settlement when a start is
@@ -4492,7 +4643,21 @@ const make = Effect.gen(function* () {
       // parent turns. Those drain-generated events are not in the immutable-log
       // replay above, so the subscription must be live first.
       yield* Effect.forkScoped(
-        Stream.runForEach(orchestrationEngine.streamDomainEvents, (event) => worker.enqueue(event)),
+        Stream.runForEach(orchestrationEngine.streamDomainEvents, (event) =>
+          Effect.sync(() => {
+            if (
+              event.type === "thread.turn-start-requested" &&
+              (orphanSettledChildIds.has(event.payload.threadId) ||
+                pendingOrphanSupersessionByChild.has(event.payload.threadId))
+            ) {
+              // Observe persisted stream order before the event waits behind
+              // older worker items. A sleeping orphan retry must not act in the
+              // append-to-handler gap. Pause rather than cancel: a correlated
+              // start failure must let the original durable cleanup continue.
+              orphanCleanupPauseRequestByChild.set(event.payload.threadId, event.eventId);
+            }
+          }).pipe(Effect.andThen(worker.enqueue(event))),
+        ),
       );
       yield* Effect.yieldNow;
 
