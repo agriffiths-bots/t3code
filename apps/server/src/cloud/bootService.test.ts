@@ -19,6 +19,7 @@ import * as BootService from "./bootService.ts";
 
 const isUnsupportedError = Schema.is(BootService.BootServiceUnsupportedError);
 const isCommandError = Schema.is(BootService.BootServiceCommandError);
+const isOwnershipError = Schema.is(BootService.BootServiceOwnershipError);
 
 interface RecordedCommand {
   readonly command: string;
@@ -203,6 +204,7 @@ it.layer(NodeServices.layer)("BootService", (it) => {
       assert.include(unit, `Environment=T3CODE_HOME=${dirs.baseDir}`);
 
       const status = yield* service.status;
+      assert.equal(status.unitPath, unitPath);
       assert.isTrue(status.supported);
       assert.isTrue(status.installed);
       assert.isTrue(status.current);
@@ -498,6 +500,32 @@ it.layer(NodeServices.layer)("BootService", (it) => {
       assert.isTrue(
         yield* fs.exists(path.join(dirs.home, ".config", "systemd", "user", "t3code.service")),
       );
+    }),
+  );
+
+  it.effect("refuses to stop or remove a foreign unit", () =>
+    Effect.gen(function* () {
+      const { dirs, fs, path } = yield* makeTestContext();
+      const unitPath = path.join(dirs.home, ".config", "systemd", "user", "t3code.service");
+      const foreignUnit = "[Unit]\nDescription=T3 Code VPS server\n";
+      yield* fs.makeDirectory(path.dirname(unitPath), { recursive: true });
+      yield* fs.writeFileString(unitPath, foreignUnit);
+
+      const commands: Array<RecordedCommand> = [];
+      const service = yield* BootService.make({
+        baseDir: dirs.baseDir,
+        logsDir: dirs.logsDir,
+        cliVersion: "0.0.27",
+        host: makeHost(dirs.stableEntry),
+      }).pipe(Effect.provide(makeRecordingRunnerLayer(commands)), provideHostRefs(dirs.home));
+
+      const error = yield* service.uninstall.pipe(Effect.flip);
+
+      assert.isTrue(isOwnershipError(error));
+      if (!isOwnershipError(error)) return;
+      assert.equal(error.unitPath, unitPath);
+      assert.lengthOf(commands, 0);
+      assert.equal(yield* fs.readFileString(unitPath), foreignUnit);
     }),
   );
 

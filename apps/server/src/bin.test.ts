@@ -15,6 +15,7 @@ import {
 } from "@t3tools/contracts";
 import * as NetService from "@t3tools/shared/Net";
 import { assert, it } from "@effect/vitest";
+import * as ConfigProvider from "effect/ConfigProvider";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Stream from "effect/Stream";
@@ -60,7 +61,19 @@ const connectCli = makeCli({ cloudEnabled: true });
 const noConnectCli = makeCli({ cloudEnabled: false });
 const runCli = (args: ReadonlyArray<string>, command = cli) =>
   Command.runWith(command, { version: "0.0.0" })(args);
-const runConnectCli = (args: ReadonlyArray<string>) => runCli(args, connectCli);
+const runConnectCli = (args: ReadonlyArray<string>, testHome: string) =>
+  runCli(args, connectCli).pipe(
+    Effect.provide(
+      ConfigProvider.layer(
+        ConfigProvider.fromEnv({
+          env: {
+            HOME: testHome,
+            XDG_CONFIG_HOME: NodePath.join(testHome, ".config"),
+          },
+        }),
+      ),
+    ),
+  );
 const runCliWithRuntime = (args: ReadonlyArray<string>) =>
   runCli(args).pipe(Effect.provide(CliRuntimeLayer));
 
@@ -234,7 +247,7 @@ it.layer(NodeServices.layer)("bin cli parsing", (it) => {
         NodePath.join(NodeOS.tmpdir(), "t3-cli-cloud-status-test-"),
       );
       const { output } = yield* captureStdout(
-        runConnectCli(["connect", "status", "--base-dir", baseDir, "--json"]),
+        runConnectCli(["connect", "status", "--base-dir", baseDir, "--json"], baseDir),
       );
       // @effect-diagnostics-next-line preferSchemaOverJson:off - CLI JSON output is decoded as a presentation DTO.
       const status = JSON.parse(output) as {
@@ -259,7 +272,7 @@ it.layer(NodeServices.layer)("bin cli parsing", (it) => {
         NodePath.join(NodeOS.tmpdir(), "t3-cli-cloud-status-human-test-"),
       );
       const { output } = yield* captureStdout(
-        runConnectCli(["connect", "status", "--base-dir", baseDir]),
+        runConnectCli(["connect", "status", "--base-dir", baseDir], baseDir),
       );
 
       assert.include(output, "T3 Connect\n  Exposure: disabled");
@@ -287,10 +300,10 @@ it.layer(NodeServices.layer)("bin cli parsing", (it) => {
       );
 
       const login = yield* captureStdout(
-        runConnectCli(["connect", "login", "--base-dir", baseDir, "--headless"]),
+        runConnectCli(["connect", "login", "--base-dir", baseDir, "--headless"], baseDir),
       );
       const status = yield* captureStdout(
-        runConnectCli(["connect", "status", "--base-dir", baseDir, "--json"]),
+        runConnectCli(["connect", "status", "--base-dir", baseDir, "--json"], baseDir),
       );
       // @effect-diagnostics-next-line preferSchemaOverJson:off - CLI JSON output is decoded as a presentation DTO.
       const decoded = JSON.parse(status.output) as {
@@ -310,7 +323,7 @@ it.layer(NodeServices.layer)("bin cli parsing", (it) => {
         NodePath.join(NodeOS.tmpdir(), "t3-cli-cloud-unlink-test-"),
       );
       const { output } = yield* captureStdout(
-        runConnectCli(["connect", "unlink", "--base-dir", baseDir]),
+        runConnectCli(["connect", "unlink", "--base-dir", baseDir], baseDir),
       );
 
       assert.equal(output, "T3 Connect is disabled locally.");
@@ -328,7 +341,7 @@ it.layer(NodeServices.layer)("bin cli parsing", (it) => {
       NodeFS.writeFileSync(tokenPath, "invalid persisted token");
 
       const { output } = yield* captureStdout(
-        runConnectCli(["connect", "logout", "--base-dir", baseDir]),
+        runConnectCli(["connect", "logout", "--base-dir", baseDir], baseDir),
       );
 
       assert.equal(output, "Signed out of T3 Connect locally.");
