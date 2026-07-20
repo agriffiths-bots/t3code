@@ -1,3 +1,5 @@
+import * as NodeTimersPromises from "node:timers/promises";
+
 import {
   ApprovalRequestId,
   type GrokSettings,
@@ -73,8 +75,12 @@ const encodeUnknownJsonStringExit = Schema.encodeUnknownExit(Schema.UnknownFromJ
 
 const PROVIDER = ProviderDriverKind.make("grok");
 const GROK_RESUME_VERSION = 1 as const;
+const GROK_COMPLETED_TURN_LATE_UPDATE_GRACE_MS = 200;
 const GROK_EMPTY_TURN_ERROR_MESSAGE =
   "Grok completed the turn without returning any assistant output. The response was empty or was not delivered to this session.";
+
+const liveDelay = (milliseconds: number) =>
+  Effect.promise<void>(() => NodeTimersPromises.setTimeout(milliseconds).then(() => undefined));
 
 function grokCompletedTurnPayload(
   stopReason: EffectAcpSchema.StopReason | null,
@@ -412,6 +418,14 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
             return;
           }
           liveCtx.promptsInFlight = remainingPrompts;
+        }
+        if (
+          options?.completedStopReason !== undefined &&
+          options.completedStopReason !== "cancelled" &&
+          !liveCtx.turnsWithVisibleOutput.has(String(settleTurnId))
+        ) {
+          yield* liveDelay(GROK_COMPLETED_TURN_LATE_UPDATE_GRACE_MS);
+          yield* liveCtx.acp.drainEvents;
         }
         const updatedAt = yield* nowIso;
         const canEmitTurnCompletion =
