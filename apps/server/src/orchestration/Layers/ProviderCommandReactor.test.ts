@@ -967,6 +967,104 @@ describe("ProviderCommandReactor", () => {
     });
   });
 
+  it("contains an untyped session-start defect to one turn and keeps accepting other threads", async () => {
+    const harness = await createHarness();
+    const now = "2026-01-01T00:00:00.000Z";
+    const secondThreadId = ThreadId.make("thread-after-session-start-defect");
+    await runtime!.runPromise(
+      harness.engine.dispatch(
+        {
+          type: "thread.create",
+          commandId: CommandId.make("cmd-thread-create-after-session-start-defect"),
+          threadId: secondThreadId,
+          projectId: asProjectId("project-1"),
+          title: "Healthy thread",
+          modelSelection: {
+            instanceId: ProviderInstanceId.make("codex"),
+            model: "gpt-5-codex",
+          },
+          interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+          runtimeMode: "approval-required",
+          branch: null,
+          worktreePath: null,
+          createdAt: now,
+        },
+        testDispatchAuthority,
+      ),
+    );
+
+    harness.startSession.mockImplementationOnce(() => {
+      throw new SyntaxError("simulated adapter construction defect");
+    });
+    await runtime!.runPromise(
+      harness.engine.dispatch(
+        {
+          type: "thread.turn.start",
+          commandId: CommandId.make("cmd-turn-start-session-defect"),
+          threadId: ThreadId.make("thread-1"),
+          message: {
+            messageId: asMessageId("user-message-session-defect"),
+            role: "user",
+            text: "trigger the adapter defect",
+            attachments: [],
+          },
+          interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+          runtimeMode: "approval-required",
+          createdAt: now,
+        },
+        testDispatchAuthority,
+      ),
+    );
+
+    await waitFor(async () => {
+      const poisonedThread = (await harness.readModel()).threads.find(
+        (thread) => thread.id === ThreadId.make("thread-1"),
+      );
+      return poisonedThread?.session?.status === "error";
+    });
+
+    const healthyCommand = {
+      type: "thread.turn.start",
+      commandId: CommandId.make("cmd-turn-start-after-session-defect"),
+      threadId: secondThreadId,
+      message: {
+        messageId: asMessageId("user-message-after-session-defect"),
+        role: "user",
+        text: "continue on the healthy thread",
+        attachments: [],
+      },
+      interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+      runtimeMode: "approval-required",
+      createdAt: now,
+    } as const;
+    const accepted = await runtime!.runPromise(
+      harness.engine.dispatch(healthyCommand, testDispatchAuthority),
+    );
+    const replayedReceipt = await runtime!.runPromise(
+      harness.engine.dispatch(healthyCommand, testDispatchAuthority),
+    );
+
+    await waitFor(() => harness.startSession.mock.calls.some((call) => call[0] === secondThreadId));
+    await waitFor(() =>
+      harness.sendTurn.mock.calls.some(
+        (call) => (call[0] as { readonly threadId?: ThreadId }).threadId === secondThreadId,
+      ),
+    );
+    expect(replayedReceipt).toEqual(accepted);
+
+    const poisonedThread = (await harness.readModel()).threads.find(
+      (thread) => thread.id === ThreadId.make("thread-1"),
+    );
+    expect(poisonedThread?.session).toMatchObject({
+      status: "error",
+      activeTurnId: null,
+      lastError: expect.stringContaining("simulated adapter construction defect"),
+    });
+    expect(
+      poisonedThread?.activities.find((activity) => activity.kind === "provider.turn.start.failed"),
+    ).toBeDefined();
+  });
+
   it("fails and releases the turn through stopFailedSession when provider startup times out", async () => {
     const harness = await createHarness();
     const now = "2026-01-01T00:00:00.000Z";

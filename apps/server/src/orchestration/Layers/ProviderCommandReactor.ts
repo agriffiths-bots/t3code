@@ -1525,9 +1525,14 @@ const make = Effect.gen(function* () {
       yield* providerService.sendTurn(sendTurnRequest.value);
     });
 
-    yield* worktreeLifecycle
-      .withPermit(activateProviderTurn)
-      .pipe(Effect.catchCause(recoverTurnStartFailure), Effect.forkScoped);
+    // Session construction executes third-party adapter code. Keep both effect
+    // defects and synchronous throws inside a child fiber whose only failure
+    // path is the per-turn recovery above; neither may escape into the shared
+    // command-reactor worker.
+    yield* Effect.suspend(() => worktreeLifecycle.withPermit(activateProviderTurn)).pipe(
+      Effect.catchCause(recoverTurnStartFailure),
+      Effect.forkScoped,
+    );
   });
 
   const processTurnInterruptRequested = Effect.fn("processTurnInterruptRequested")(function* (
@@ -1793,7 +1798,7 @@ const make = Effect.gen(function* () {
   });
 
   const processDomainEventSafely = (event: ProviderIntentEvent) =>
-    processDomainEvent(event).pipe(
+    Effect.suspend(() => processDomainEvent(event)).pipe(
       Effect.catchCause((cause) => {
         if (Cause.hasInterruptsOnly(cause)) {
           return Effect.failCause(cause);
