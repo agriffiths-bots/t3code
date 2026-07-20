@@ -4,6 +4,7 @@ import {
   CheckpointRef,
   CommandId,
   DEFAULT_PROVIDER_INTERACTION_MODE,
+  EnvironmentId,
   EventId,
   MessageId,
   ProjectId,
@@ -21,6 +22,7 @@ import { describe, expect, it } from "@effect/vitest";
 import {
   audienceBoundSystemDispatchAuthority,
   authorizeOrchestrationCommandMutation,
+  peerSessionDispatchAuthority,
   sessionDispatchAuthority,
   trustedSystemDispatchAuthority,
 } from "../commandAudienceGuard.ts";
@@ -162,6 +164,21 @@ const privateAuthority = sessionDispatchAuthority({
 const trustedAuthority = trustedSystemDispatchAuthority(
   "orchestration-command-audience-guard-test-seed",
 );
+const peerEnvironmentId = EnvironmentId.make("environment-peer-command-guard");
+const otherEnvironmentId = EnvironmentId.make("environment-other-command-guard");
+// A parent living in the caller's environment: deliberately absent from the local read model, which
+// is exactly why the guard cannot fall back to the local same-audience check for remote parents.
+const remoteParentThreadId = ThreadId.make("thread-remote-parent-command-guard");
+const peerAuthority = peerSessionDispatchAuthority({
+  subject: "mcp-peer:peer-token-command-guard",
+  audienceCeiling: "factory",
+  sourceEnvironmentId: peerEnvironmentId,
+});
+const privateCeilingPeerAuthority = peerSessionDispatchAuthority({
+  subject: "mcp-peer:private-peer-token-command-guard",
+  audienceCeiling: "private",
+  sourceEnvironmentId: peerEnvironmentId,
+});
 
 function authorizeEffect(
   command: OrchestrationCommand,
@@ -1692,6 +1709,124 @@ describe("authorizeOrchestrationCommandMutation", () => {
       expect(String(sourcePlanExit)).toContain(
         "Thread 'thread-private-command-guard' does not exist",
       );
+    }),
+  );
+
+  // Environment identity is not audience identity: threads of every audience share an environment,
+  // so a matching source environment proves nothing about whether the caller may reach the parent's
+  // data. The remote-parent branch is taken precisely when the parent is absent from the local read
+  // model, so its audience cannot be checked — a factory-ceiling caller must therefore fail closed.
+  it.effect(
+    "refuses a remote parent for a factory-ceiling peer session whose source environment matches",
+    () =>
+      Effect.gen(function* () {
+        const exit = yield* authorizeFailureEffect(
+          {
+            type: "thread.parent.set",
+            commandId: CommandId.make("cmd-peer-remote-parent-factory-ceiling"),
+            threadId: factoryThreadId,
+            parentThreadId: remoteParentThreadId,
+            parentEnvironmentId: peerEnvironmentId,
+            createdAt,
+          },
+          peerAuthority,
+        );
+        expect(String(exit)).toContain(`Thread '${remoteParentThreadId}' does not exist`);
+      }),
+  );
+
+  // Companion to the case above: the narrowing is a ceiling narrowing, not "refuse every peer".
+  it.effect(
+    "permits a remote parent for a non-factory-ceiling peer session whose source environment matches",
+    () =>
+      Effect.gen(function* () {
+        const command = yield* authorizeEffect(
+          {
+            type: "thread.parent.set",
+            commandId: CommandId.make("cmd-peer-remote-parent-match"),
+            threadId: factoryThreadId,
+            parentThreadId: remoteParentThreadId,
+            parentEnvironmentId: peerEnvironmentId,
+            createdAt,
+          },
+          privateCeilingPeerAuthority,
+        );
+        expect(command).toMatchObject({
+          type: "thread.parent.set",
+          parentThreadId: remoteParentThreadId,
+          parentEnvironmentId: peerEnvironmentId,
+        });
+      }),
+  );
+
+  it.effect("rejects a remote parent whose environment does not match the peer session", () =>
+    Effect.gen(function* () {
+      const exit = yield* authorizeFailureEffect(
+        {
+          type: "thread.parent.set",
+          commandId: CommandId.make("cmd-peer-remote-parent-mismatch"),
+          threadId: factoryThreadId,
+          parentThreadId: remoteParentThreadId,
+          parentEnvironmentId: otherEnvironmentId,
+          createdAt,
+        },
+        peerAuthority,
+      );
+      expect(String(exit)).toContain(`Thread '${remoteParentThreadId}' does not exist`);
+    }),
+  );
+
+  it.effect("rejects a remote parent for a non-peer factory session", () =>
+    Effect.gen(function* () {
+      const exit = yield* authorizeFailureEffect(
+        {
+          type: "thread.parent.set",
+          commandId: CommandId.make("cmd-non-peer-remote-parent"),
+          threadId: factoryThreadId,
+          parentThreadId: remoteParentThreadId,
+          parentEnvironmentId: peerEnvironmentId,
+          createdAt,
+        },
+        factoryAuthority,
+      );
+      expect(String(exit)).toContain(`Thread '${remoteParentThreadId}' does not exist`);
+    }),
+  );
+
+  it.effect("rejects a remote parent for a factory audience-bound system authority", () =>
+    Effect.gen(function* () {
+      const exit = yield* authorizeFailureEffect(
+        {
+          type: "thread.parent.set",
+          commandId: CommandId.make("cmd-audience-bound-remote-parent"),
+          threadId: factoryThreadId,
+          parentThreadId: remoteParentThreadId,
+          parentEnvironmentId: peerEnvironmentId,
+          createdAt,
+        },
+        audienceBoundSystemDispatchAuthority({
+          reason: "remote-parent-guard-test",
+          sourceThreadId: factoryThreadId,
+          dataAudience: "factory",
+        }),
+      );
+      expect(String(exit)).toContain(`Thread '${remoteParentThreadId}' does not exist`);
+    }),
+  );
+
+  it.effect("does not let a peer session bypass the local parent audience check", () =>
+    Effect.gen(function* () {
+      const exit = yield* authorizeFailureEffect(
+        {
+          type: "thread.parent.set",
+          commandId: CommandId.make("cmd-peer-local-parent"),
+          threadId: factoryThreadId,
+          parentThreadId: privateThreadId,
+          createdAt,
+        },
+        peerAuthority,
+      );
+      expect(String(exit)).toContain(`Thread '${privateThreadId}' does not exist`);
     }),
   );
 

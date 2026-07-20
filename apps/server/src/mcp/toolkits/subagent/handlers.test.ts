@@ -38,6 +38,7 @@ import {
   BootstrapTurnStartDispatcher,
 } from "../../../orchestration/Services/BootstrapTurnStartDispatcher.ts";
 import { OrchestrationEngineService } from "../../../orchestration/Services/OrchestrationEngine.ts";
+import type { OrchestrationCommandDispatchAuthority } from "../../../orchestration/commandAudienceGuard.ts";
 import { ProjectionSnapshotQuery } from "../../../orchestration/Services/ProjectionSnapshotQuery.ts";
 import {
   PendingDispatchRepository,
@@ -246,6 +247,10 @@ const registeredChildren: Array<{
   readonly parentThreadId: ThreadId;
 }> = [];
 const engineCommands: OrchestrationCommand[] = [];
+const engineAuthorities: {
+  readonly command: OrchestrationCommand;
+  readonly authority: OrchestrationCommandDispatchAuthority | undefined;
+}[] = [];
 let childDetailDelayMs = 0;
 let childDetailUnavailable = false;
 let childDetailFailOnCall: number | null = null;
@@ -691,9 +696,12 @@ const coordinatorLayer = Layer.succeed(ChildThreadCoordinator, {
 
 const engineLayer = Layer.succeed(OrchestrationEngineService, {
   readEvents: () => unsupported(),
-  dispatch: (command) =>
+  dispatch: (command, authority) =>
     Effect.sync(() => {
       engineCommands.push(command);
+      // Record the authority instead of discarding it: the guard runs behind the real engine, so
+      // dropping this argument here is what let a broken peer authority pass these tests.
+      engineAuthorities.push({ command, authority });
       return { sequence: engineCommands.length };
     }),
   streamDomainEvents: unsupported(),
@@ -1719,6 +1727,7 @@ describe("SubagentToolkit", () => {
           },
         };
         engineCommands.length = 0;
+        engineAuthorities.length = 0;
         dispatchedTurnCommands.length = 0;
         registeredChildren.length = 0;
         failProjectShellLookup = true;
@@ -1753,6 +1762,18 @@ describe("SubagentToolkit", () => {
           type: "thread.parent.set",
           parentThreadId,
           parentEnvironmentId: sourceEnvironmentId,
+        });
+        // The engine's guard permits this remote parent only when the dispatch authority carries the
+        // peer token's source environment. Without it the real guard rejects every peer spawn, so
+        // pin the authority the handler actually passes — not just the command.
+        const parentSetAuthority = engineAuthorities.find(
+          (entry) => entry.command.type === "thread.parent.set",
+        )?.authority;
+        expect(parentSetAuthority).toEqual({
+          kind: "session",
+          subject: `mcp-peer:${unrestrictedPeerInvocation.peerTokenId}`,
+          audienceCeiling: "factory",
+          peerSourceEnvironmentId: sourceEnvironmentId,
         });
         expect(result.structuredContent).toMatchObject({
           parentThreadId,

@@ -97,6 +97,7 @@ import {
 } from "./tools.ts";
 
 import {
+  peerSessionDispatchAuthority,
   sessionDispatchAuthority,
   type OrchestrationCommandDispatchAuthority,
 } from "../../../orchestration/commandAudienceGuard.ts";
@@ -999,9 +1000,10 @@ const spawnSubagent = Effect.fn("SubagentToolkit.spawn")(function* (
     }
     yield* requirePeerParentAccess(invocation, remoteParentThreadId);
     const { output: started } = yield* spawnRuntime(threadStartInput, invocation);
-    const startedThreadAuthority = sessionDispatchAuthority({
+    const startedThreadAuthority = peerSessionDispatchAuthority({
       subject: `mcp-peer:${invocation.peerTokenId}`,
       audienceCeiling: "factory",
+      sourceEnvironmentId: parentEnvironmentId,
     });
     yield* dispatchParentSet(
       runtime,

@@ -1,6 +1,7 @@
 import type {
   AuthAudienceCeiling,
   DataAudience,
+  EnvironmentId,
   OrchestrationCommand,
   OrchestrationProject,
   OrchestrationReadModel,
@@ -24,6 +25,12 @@ export type OrchestrationCommandDispatchAuthority =
       readonly kind: "session";
       readonly subject: string;
       readonly audienceCeiling: AuthAudienceCeiling;
+      /**
+       * Set only for sessions authenticated by a peer backend token. Carries that token's
+       * `sourceEnvironmentId` so the guard can recognise a remote parent link back to the very
+       * environment the caller authenticated as. Absent for every ordinary user session.
+       */
+      readonly peerSourceEnvironmentId?: EnvironmentId;
     }
   | {
       readonly kind: "trusted-system";
@@ -44,6 +51,24 @@ export function sessionDispatchAuthority(input: {
     kind: "session",
     subject: input.subject,
     audienceCeiling: input.audienceCeiling,
+  };
+}
+
+/**
+ * Authority for a session authenticated by a peer backend token. Identical to a session authority
+ * except that it records the environment the peer authenticated as, which lets the guard permit a
+ * remote parent link into that same environment without relaxing the rule for anything else.
+ */
+export function peerSessionDispatchAuthority(input: {
+  readonly subject: string;
+  readonly audienceCeiling: AuthAudienceCeiling;
+  readonly sourceEnvironmentId: EnvironmentId;
+}): OrchestrationCommandDispatchAuthority {
+  return {
+    kind: "session",
+    subject: input.subject,
+    audienceCeiling: input.audienceCeiling,
+    peerSourceEnvironmentId: input.sourceEnvironmentId,
   };
 }
 
@@ -478,7 +503,26 @@ function requireRemoteParentAllowed(input: {
   readonly command: OrchestrationCommand;
   readonly authority: OrchestrationCommandDispatchAuthority;
   readonly parentThreadId: ThreadId;
+  readonly parentEnvironmentId: EnvironmentId;
 }): Effect.Effect<void, OrchestrationCommandAudienceAuthorizationError> {
+  // A peer-authenticated session may link a parent that lives in the exact environment its token
+  // authenticated as; the spawn handler has already proven that equality before dispatching. Any
+  // other environment stays subject to the rule below.
+  //
+  // Environment identity is NOT audience identity: threads of every audience share an environment,
+  // so the match above says nothing about whether the caller may reach the parent's data. This
+  // branch runs only when the parent is absent from the local read model, so its `dataAudience` is
+  // unreadable here and the ceiling is the only segregation left. A factory-ceiling caller is
+  // therefore excluded from the permit and falls through to the refusal below — fail closed.
+  // Restoring the capability requires authenticating the remote parent's audience (ADA-184).
+  if (
+    input.authority.kind === "session" &&
+    input.authority.audienceCeiling !== "factory" &&
+    input.authority.peerSourceEnvironmentId !== undefined &&
+    input.authority.peerSourceEnvironmentId === input.parentEnvironmentId
+  ) {
+    return Effect.void;
+  }
   if (
     (input.authority.kind === "session" && input.authority.audienceCeiling === "factory") ||
     (input.authority.kind === "audience-bound-system" && input.authority.dataAudience === "factory")
@@ -863,6 +907,7 @@ export const authorizeOrchestrationCommandMutation = Effect.fn(
           command,
           authority,
           parentThreadId: command.parentThreadId,
+          parentEnvironmentId: command.parentEnvironmentId,
         });
       }
       return command;
