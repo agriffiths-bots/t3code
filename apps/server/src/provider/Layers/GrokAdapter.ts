@@ -426,6 +426,14 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
         ) {
           yield* liveDelay(GROK_COMPLETED_TURN_LATE_UPDATE_GRACE_MS);
           yield* liveCtx.acp.drainEvents;
+          if (
+            liveCtx.acpSessionId !== expectedAcpSessionId ||
+            liveCtx.activeTurnId !== settleTurnId ||
+            liveCtx.session.activeTurnId !== settleTurnId ||
+            liveCtx.interruptedTurnIds.has(settleTurnId)
+          ) {
+            return;
+          }
         }
         const updatedAt = yield* nowIso;
         const canEmitTurnCompletion =
