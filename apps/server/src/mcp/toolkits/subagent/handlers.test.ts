@@ -1763,9 +1763,11 @@ describe("SubagentToolkit", () => {
           parentThreadId,
           parentEnvironmentId: sourceEnvironmentId,
         });
-        // The engine's guard permits this remote parent only when the dispatch authority carries the
-        // peer token's source environment. Without it the real guard rejects every peer spawn, so
-        // pin the authority the handler actually passes — not just the command.
+        // Pin the exact authority the handler passes, not just the command. NOTE: the engine here
+        // is a test double, so this asserts the handler's output shape only — it does NOT show the
+        // real guard accepting the link. The real guard refuses a factory-ceiling remote parent
+        // regardless of `peerSourceEnvironmentId`, which is provenance rather than a capability
+        // (see the refusal test in OrchestrationCommandAudienceGuard.test.ts).
         const parentSetAuthority = engineAuthorities.find(
           (entry) => entry.command.type === "thread.parent.set",
         )?.authority;
