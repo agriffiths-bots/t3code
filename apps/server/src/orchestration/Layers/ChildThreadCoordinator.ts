@@ -548,6 +548,17 @@ const make = Effect.gen(function* () {
   // terminal path runs. Suppression remains process-local because orphan
   // injections are never persisted and any stale rows are pruned during boot.
   const suppressParentWakeChildIds = new Set<ThreadId>();
+  // Children whose current terminal state came from an orphan settlement. An
+  // accepted replacement start supersedes that settlement, so this tracks which
+  // suppressions are revocable; every other suppression is permanent.
+  const orphanSettledChildIds = new Set<ThreadId>();
+  // Boot orphan cleanup keeps retrying its durable writes in forked fibers, and
+  // the live event stream starts while those fibers are still sleeping between
+  // attempts. A replacement start arriving in that window revokes the settlement
+  // those writes describe, so each child carries a generation that a supersession
+  // bumps; a retry whose captured generation is stale must abandon rather than
+  // stop or re-settle the replacement it would otherwise be acting on.
+  const orphanCleanupGenerationByChild = new Map<ThreadId, number>();
   // Per-child guard so a deferred child_steer drain (R-C) is serialised and
   // never double-dispatches against the same child.
   const childSteerLocks = new Map<ThreadId, Semaphore.Semaphore>();
@@ -569,6 +580,36 @@ const make = Effect.gen(function* () {
     unarchivedTerminalChildIds.delete(threadId);
     unarchivedTerminalMarkedAtByChild.delete(threadId);
   };
+  const markOrphanSettledChild = (threadId: ThreadId) => {
+    orphanSettledChildIds.add(threadId);
+    suppressParentWakeChildIds.add(threadId);
+  };
+  const clearOrphanSettledChild = (threadId: ThreadId) => {
+    if (!orphanSettledChildIds.delete(threadId)) return;
+    suppressParentWakeChildIds.delete(threadId);
+    // Only a real supersession bumps the generation, so a child settled, then
+    // superseded, then settled again cannot have its second cleanup abandoned
+    // by the first supersession.
+    orphanCleanupGenerationByChild.set(
+      threadId,
+      (orphanCleanupGenerationByChild.get(threadId) ?? 0) + 1,
+    );
+  };
+  const currentOrphanCleanupGeneration = (threadId: ThreadId): number =>
+    orphanCleanupGenerationByChild.get(threadId) ?? 0;
+  // Re-checked on every retry attempt rather than once at fork time: the window
+  // this closes is the sleep between attempts, so a fork-time check would prove
+  // nothing. `Effect.suspend` keeps the read inside the retried effect.
+  const whileOrphanCleanupCurrent = <A, E, R>(
+    threadId: ThreadId,
+    generation: number,
+    effect: Effect.Effect<A, E, R>,
+  ): Effect.Effect<Option.Option<A>, E, R> =>
+    Effect.suspend(() =>
+      currentOrphanCleanupGeneration(threadId) !== generation
+        ? Effect.succeedNone
+        : Effect.asSome(effect),
+    );
   const terminalProjectionAtOrBeforeUnarchive = (
     childThreadId: ThreadId,
     terminalAt: string | null | undefined,
@@ -2350,13 +2391,20 @@ const make = Effect.gen(function* () {
       let record = children.get(threadId);
       if (!record) return;
       let done = yield* Deferred.isDone(record.terminal);
-      if (done && unarchivedTerminalChildIds.has(threadId)) {
+      // An orphan settlement is superseded by an accepted replacement start the
+      // same way an unarchived terminal is: the child is live again, so its
+      // Deferred must reopen and its parent-wake suppression must be lifted.
+      if (
+        done &&
+        (unarchivedTerminalChildIds.has(threadId) || orphanSettledChildIds.has(threadId))
+      ) {
         yield* discardQueuedChildWakes(threadId);
         const terminal = yield* Deferred.make<ChildWaitResult>();
         record = children.get(threadId) ?? record;
         record = { ...record, terminal };
         children.set(threadId, record);
         clearUnarchivedTerminalChild(threadId);
+        clearOrphanSettledChild(threadId);
         done = false;
       }
       if (!done) {
@@ -2377,7 +2425,7 @@ const make = Effect.gen(function* () {
       if (!children.has(threadId)) return;
       const settledOrphanReason = orphanSettlementReason(activity);
       if (settledOrphanReason !== null) {
-        suppressParentWakeChildIds.add(threadId);
+        markOrphanSettledChild(threadId);
         yield* settleChild(threadId, "killed", settledOrphanReason, true);
         return;
       }
@@ -2913,6 +2961,13 @@ const make = Effect.gen(function* () {
       const rearchivedUnarchivedTerminalStartedChildIds = new Set<ThreadId>();
       const activeArchiveByReplayedChild = new Set<ThreadId>();
       const authoritativeDurableOrphanSettlementByChild = new Map<ThreadId, ChildTerminalOutcome>();
+      // Log position of each durable orphan settlement and of each accepted
+      // start, so descendant propagation can compare them. A local ordinal is
+      // used rather than event.sequence: sequence is optional on the event
+      // shape, and only the relative order within this replay matters.
+      const durableOrphanSettlementOrdinalByChild = new Map<ThreadId, number>();
+      const acceptedStartOrdinalByChild = new Map<ThreadId, number>();
+      let replayOrdinal = 0;
       let maxSequence = 0;
       const rememberPostUnarchiveTerminal = (threadId: ThreadId, outcome: ChildTerminalOutcome) => {
         if (unarchivedTerminalStartedChildIds.has(threadId)) {
@@ -2936,6 +2991,7 @@ const make = Effect.gen(function* () {
       };
       yield* Stream.runForEach(orchestrationEngine.readEvents(0), (event) =>
         Effect.gen(function* () {
+          replayOrdinal += 1;
           const sequence = (event as { sequence?: number }).sequence;
           if (typeof sequence === "number" && sequence > maxSequence) {
             maxSequence = sequence;
@@ -3030,7 +3086,13 @@ const make = Effect.gen(function* () {
             case "thread.turn-start-requested": {
               const { threadId } = event.payload;
               if (!knownChildIds.has(threadId)) return;
-              if (lifecycleTerminatedByChild.has(threadId)) return;
+              if (lifecycleTerminatedByChild.has(threadId)) {
+                // A durable orphan settlement is the one lifecycle terminal a
+                // replacement start may supersede; without this the supersession
+                // below is unreachable and the child replays killed forever.
+                if (!authoritativeDurableOrphanSettlementByChild.has(threadId)) return;
+                lifecycleTerminatedByChild.delete(threadId);
+              }
               if (activeArchiveByReplayedChild.has(threadId)) return;
               const priorTerminal = terminalByChild.get(threadId);
               if (priorTerminal !== undefined && unarchivedTerminalStartedChildIds.has(threadId)) {
@@ -3041,6 +3103,13 @@ const make = Effect.gen(function* () {
               } else {
                 ambiguousLegacyFailureByReplayedChild.delete(threadId);
               }
+              // A request arriving while a turn is still active is a steer
+              // attached to that turn, not a new lifecycle -- recordPendingTurnStart
+              // records it as a same-turn start. Only a request that begins a new
+              // turn is replacement evidence; counting steers would let a steer
+              // delivered after an ancestor settlement cancel inherited orphan
+              // cleanup for a child whose turn started before it.
+              const startsNewLifecycle = !activeTurnByReplayedChild.has(threadId);
               recordPendingTurnStart({
                 event,
                 activeTurns: activeTurnByReplayedChild,
@@ -3050,6 +3119,10 @@ const make = Effect.gen(function* () {
               // An accepted replacement start supersedes the prior orphan
               // lifecycle. A later orphan settlement will add the child again.
               authoritativeDurableOrphanSettlementByChild.delete(threadId);
+              durableOrphanSettlementOrdinalByChild.delete(threadId);
+              if (startsNewLifecycle) {
+                acceptedStartOrdinalByChild.set(threadId, replayOrdinal);
+              }
               runningByChild.set(threadId, true);
               terminalByChild.delete(threadId);
               if (
@@ -3074,6 +3147,7 @@ const make = Effect.gen(function* () {
                   activity.createdAt,
                 );
                 authoritativeDurableOrphanSettlementByChild.set(threadId, outcome);
+                durableOrphanSettlementOrdinalByChild.set(threadId, replayOrdinal);
                 markLifecycleTerminal(threadId, outcome, { preserveExistingTerminal: false });
                 return;
               }
@@ -3343,6 +3417,8 @@ const make = Effect.gen(function* () {
         rearchivedUnarchivedTerminalStartedChildIds,
         activeArchiveByReplayedChild,
         authoritativeDurableOrphanSettlementByChild,
+        durableOrphanSettlementOrdinalByChild,
+        acceptedStartOrdinalByChild,
         maxSequence,
       };
     });
@@ -3507,6 +3583,8 @@ const make = Effect.gen(function* () {
         rearchivedUnarchivedTerminalStartedChildIds,
         activeArchiveByReplayedChild,
         authoritativeDurableOrphanSettlementByChild,
+        durableOrphanSettlementOrdinalByChild,
+        acceptedStartOrdinalByChild,
       } = yield* reconcileFromLog(knownChildIds);
       const durableOrphanSettlementChildIds = new Set<ThreadId>();
       for (const [childThreadId, outcome] of authoritativeDurableOrphanSettlementByChild) {
@@ -3518,7 +3596,7 @@ const make = Effect.gen(function* () {
         // The durable settlement is authoritative even if the live parent was
         // later unarchived. Only a replayed replacement child start supersedes
         // it; changing live ancestry alone cannot make an old wake safe.
-        suppressParentWakeChildIds.add(childThreadId);
+        markOrphanSettledChild(childThreadId);
       }
       for (const [childThreadId, turnId] of activeTurnByReplayedChild) {
         activeTurnByChild.set(childThreadId, turnId);
@@ -3577,15 +3655,43 @@ const make = Effect.gen(function* () {
       // Classify the full recorded ancestry before any boot settlement can wake
       // a parent. The DFS order settles ancestors before descendants; the shell
       // walk also covers ancestors that are not themselves restored children.
-      const orphanReasonByThread = new Map<ThreadId, string | null>();
+      // An inherited orphan reason carries the log position of the durable
+      // settlement it came from, so a descendant can tell whether its own start
+      // is a replacement accepted *after* that settlement. Reasons derived from
+      // the live shell (archived/missing ancestor) have no log position and are
+      // never superseded -- only a durable settlement is order-comparable.
+      type OrphanClassification = {
+        readonly reason: string | null;
+        readonly settledAtOrdinal: number | null;
+      };
+      const LIVE_CLASSIFICATION: OrphanClassification = { reason: null, settledAtOrdinal: null };
+      const shellClassification = (reason: string): OrphanClassification => ({
+        reason,
+        settledAtOrdinal: null,
+      });
+      const orphanReasonByThread = new Map<ThreadId, OrphanClassification>();
+      // A durably settled orphan is an orphan for its own descendants too. The
+      // ancestry walk below reads live shells, and an unarchived-then-restarted
+      // ancestor reads back as live even though this child's lifecycle already
+      // ended -- leaving a survivor grandchild that can only wake a Deferred
+      // this boot already killed. Memoize the durable reason so the walk stops
+      // at the settlement rather than at the live shell.
+      for (const childThreadId of durableOrphanSettlementChildIds) {
+        const outcome = terminalByChild.get(childThreadId);
+        orphanReasonByThread.set(childThreadId, {
+          reason: outcome?.error ?? ORPHAN_RETIRED_PARENT_REASON,
+          settledAtOrdinal: durableOrphanSettlementOrdinalByChild.get(childThreadId) ?? null,
+        });
+      }
       let orphanReasonForThread: (
         threadId: ThreadId,
         ancestry: ReadonlySet<ThreadId>,
-      ) => Effect.Effect<string | null>;
+      ) => Effect.Effect<OrphanClassification>;
       orphanReasonForThread = (threadId, ancestry) =>
         Effect.gen(function* () {
-          if (orphanReasonByThread.has(threadId)) {
-            return orphanReasonByThread.get(threadId) ?? null;
+          const memoized = orphanReasonByThread.get(threadId);
+          if (memoized !== undefined) {
+            return memoized;
           }
           if (ancestry.has(threadId)) {
             yield* Effect.logWarning(
@@ -3594,8 +3700,8 @@ const make = Effect.gen(function* () {
                 threadId,
               },
             );
-            orphanReasonByThread.set(threadId, null);
-            return null;
+            orphanReasonByThread.set(threadId, LIVE_CLASSIFICATION);
+            return LIVE_CLASSIFICATION;
           }
           const read = yield* getThreadShellIncludingArchivedBounded(threadId);
           if (read._tag === "Unavailable") {
@@ -3606,29 +3712,52 @@ const make = Effect.gen(function* () {
                 cause: read.cause,
               },
             );
-            orphanReasonByThread.set(threadId, null);
-            return null;
+            orphanReasonByThread.set(threadId, LIVE_CLASSIFICATION);
+            return LIVE_CLASSIFICATION;
           }
           if (read._tag === "Missing") {
-            const reason = ORPHAN_RETIRED_PARENT_REASON;
-            orphanReasonByThread.set(threadId, reason);
-            return reason;
+            const classification = shellClassification(ORPHAN_RETIRED_PARENT_REASON);
+            orphanReasonByThread.set(threadId, classification);
+            return classification;
           }
           if (read.value.archivedAt !== null) {
-            const reason = ORPHAN_ARCHIVED_PARENT_REASON;
-            orphanReasonByThread.set(threadId, reason);
-            return reason;
+            const classification = shellClassification(ORPHAN_ARCHIVED_PARENT_REASON);
+            orphanReasonByThread.set(threadId, classification);
+            return classification;
           }
           const ancestorThreadId = read.value.parentThreadId;
           if (ancestorThreadId === null) {
-            orphanReasonByThread.set(threadId, null);
-            return null;
+            orphanReasonByThread.set(threadId, LIVE_CLASSIFICATION);
+            return LIVE_CLASSIFICATION;
           }
           const nextAncestry = new Set(ancestry);
           nextAncestry.add(threadId);
-          const reason = yield* orphanReasonForThread(ancestorThreadId, nextAncestry);
-          orphanReasonByThread.set(threadId, reason);
-          return reason;
+          const classification = yield* orphanReasonForThread(ancestorThreadId, nextAncestry);
+          orphanReasonByThread.set(threadId, classification);
+          return classification;
+        });
+
+      // Classify a superseding replacement child from its own shell alone. No
+      // ancestor recursion: the supersession already decided that the durable
+      // settlement above it no longer applies. Only this thread's later fate
+      // (archived, deleted) can still orphan its descendants.
+      const replacementShellClassification = (threadId: ThreadId) =>
+        Effect.gen(function* () {
+          const read = yield* getThreadShellIncludingArchivedBounded(threadId);
+          if (read._tag === "Unavailable") {
+            yield* Effect.logWarning(
+              "replacement orphan ancestry read unavailable; treating replacement as live",
+              { threadId, cause: read.cause },
+            );
+            return LIVE_CLASSIFICATION;
+          }
+          if (read._tag === "Missing") {
+            return shellClassification(ORPHAN_RETIRED_PARENT_REASON);
+          }
+          if (read.value.archivedAt !== null) {
+            return shellClassification(ORPHAN_ARCHIVED_PARENT_REASON);
+          }
+          return LIVE_CLASSIFICATION;
         });
 
       const bootChildOrder: Array<ThreadId> = [];
@@ -3649,15 +3778,70 @@ const make = Effect.gen(function* () {
       };
       for (const childThreadId of knownChildIds) orderBootChild(childThreadId);
 
+      // The invariant every branch below maintains: a thread's classification is
+      // the NEWEST durable orphan fact at or above it. Neither an own nor an
+      // inherited settlement is unconditionally newer -- both
+      // `own -> ancestor` and `ancestor -> own` orderings occur -- so the two
+      // are compared by log ordinal rather than by which one is closer. A
+      // shell-derived reason carries no ordinal because it describes the
+      // ancestor's CURRENT state, which is newer than any logged event.
+      const ownDurableSettlementOrdinal = (childThreadId: ThreadId): number | null =>
+        durableOrphanSettlementChildIds.has(childThreadId)
+          ? (durableOrphanSettlementOrdinalByChild.get(childThreadId) ?? null)
+          : null;
+      const memoizeNewestClassification = (
+        childThreadId: ThreadId,
+        inherited: OrphanClassification,
+      ): void => {
+        const ownOrdinal = ownDurableSettlementOrdinal(childThreadId);
+        if (
+          ownOrdinal !== null &&
+          inherited.settledAtOrdinal !== null &&
+          ownOrdinal >= inherited.settledAtOrdinal
+        ) {
+          // The pre-seeded own settlement is the newer fact; keep it.
+          return;
+        }
+        orphanReasonByThread.set(childThreadId, inherited);
+      };
+
       const orphanReasonByBootChild = new Map<ThreadId, string>();
       for (const childThreadId of bootChildOrder) {
         const record = children.get(childThreadId);
         if (record === undefined) continue;
-        const reason = yield* orphanReasonForThread(record.parentThreadId, new Set());
-        if (reason === null) continue;
-        orphanReasonByBootChild.set(childThreadId, reason);
-        suppressParentWakeChildIds.add(childThreadId);
-        orphanReasonByThread.set(childThreadId, reason);
+        const classification = yield* orphanReasonForThread(record.parentThreadId, new Set());
+        if (classification.reason === null) continue;
+        // Live processing revokes an inferred orphan settlement when a start is
+        // accepted afterwards (handleTurnStartRequested), so replay must not
+        // kill a descendant whose start is newer than the settlement it would
+        // inherit -- that would discard a valid replacement turn and its lease.
+        const settledAtOrdinal = classification.settledAtOrdinal;
+        const startedAtOrdinal = acceptedStartOrdinalByChild.get(childThreadId);
+        // A child holding its own durable settlement cannot be superseding: an
+        // accepted start clears that settlement during replay, so a settlement
+        // that survived is necessarily newer than the child's last start.
+        if (
+          ownDurableSettlementOrdinal(childThreadId) === null &&
+          settledAtOrdinal !== null &&
+          startedAtOrdinal !== undefined &&
+          startedAtOrdinal > settledAtOrdinal
+        ) {
+          // The replacement makes this child live again relative to the
+          // INHERITED settlement, so stop inheriting -- but the child's own
+          // fate after that start still decides what it is to its descendants.
+          // The shell decides: a child archived or deleted after the
+          // replacement start is an orphan source in its own right, and
+          // memoizing a blanket "live" here would shield its descendants from
+          // boot cleanup and leak their leases.
+          orphanReasonByThread.set(
+            childThreadId,
+            yield* replacementShellClassification(childThreadId),
+          );
+          continue;
+        }
+        orphanReasonByBootChild.set(childThreadId, classification.reason);
+        markOrphanSettledChild(childThreadId);
+        memoizeNewestClassification(childThreadId, classification);
       }
 
       const terminalTextByStartedChild = new Map<
@@ -3923,8 +4107,13 @@ const make = Effect.gen(function* () {
           ),
         );
         if (!repaired) {
+          const repairGeneration = currentOrphanCleanupGeneration(childThreadId);
           yield* Effect.forkScoped(
-            repairSessionProjection.pipe(
+            whileOrphanCleanupCurrent(
+              childThreadId,
+              repairGeneration,
+              repairSessionProjection,
+            ).pipe(
               Effect.catchCause((cause) => Effect.fail(Cause.pretty(cause))),
               Effect.retry(Schedule.spaced("2 seconds")),
             ),
@@ -4034,15 +4223,31 @@ const make = Effect.gen(function* () {
             activityId: EventId.make(yield* randomUUID),
           } as const;
           const sessionCommandId = yield* newCommandId("orphan-session-stop");
-          const retrySettlement = recordOrphanSettlement(settlementInput).pipe(
+          // Captured before the retries below can be forked. Each of them keeps
+          // running after the live stream starts, and each performs an
+          // externally visible act -- stopping the provider session for this
+          // thread, appending the durable settlement, clobbering the session
+          // projection. Once a replacement start supersedes the settlement they
+          // describe, that thread's provider session and projection belong to the
+          // replacement, so every one of them must abandon instead of acting.
+          const cleanupGeneration = currentOrphanCleanupGeneration(childThreadId);
+          const retrySettlement = whileOrphanCleanupCurrent(
+            childThreadId,
+            cleanupGeneration,
+            recordOrphanSettlement(settlementInput),
+          ).pipe(
             Effect.catchCause((cause) => Effect.fail(Cause.pretty(cause))),
             Effect.retry(Schedule.spaced("2 seconds")),
           );
-          const retryPhysicalCleanup = confirmOrphanProviderCleanup({
-            threadId: childThreadId,
-            projectedSession,
-            projectionSessionReadUnavailable,
-          }).pipe(
+          const retryPhysicalCleanup = whileOrphanCleanupCurrent(
+            childThreadId,
+            cleanupGeneration,
+            confirmOrphanProviderCleanup({
+              threadId: childThreadId,
+              projectedSession,
+              projectionSessionReadUnavailable,
+            }),
+          ).pipe(
             Effect.catchCause((cause) => Effect.fail(Cause.pretty(cause))),
             Effect.retry(Schedule.spaced("2 seconds")),
           );
@@ -4051,14 +4256,18 @@ const make = Effect.gen(function* () {
             readonly requiresSessionRecording: boolean;
           }) =>
             confirmation.requiresSessionRecording
-              ? recordStoppedOrphanSession({
-                  threadId: childThreadId,
-                  projectedSession,
-                  runtimeSession: confirmation.runtimeSession,
-                  createdAt,
-                  lastError: orphanReason,
-                  commandId: sessionCommandId,
-                }).pipe(
+              ? whileOrphanCleanupCurrent(
+                  childThreadId,
+                  cleanupGeneration,
+                  recordStoppedOrphanSession({
+                    threadId: childThreadId,
+                    projectedSession,
+                    runtimeSession: confirmation.runtimeSession,
+                    createdAt,
+                    lastError: orphanReason,
+                    commandId: sessionCommandId,
+                  }),
+                ).pipe(
                   Effect.catchCause((cause) => Effect.fail(Cause.pretty(cause))),
                   Effect.retry(Schedule.spaced("2 seconds")),
                 )
@@ -4099,8 +4308,15 @@ const make = Effect.gen(function* () {
             yield* settleChild(childThreadId, "killed", orphanReason, true);
             yield* Effect.forkScoped(
               retryPhysicalCleanup.pipe(
-                Effect.flatMap((confirmation) =>
-                  retrySettlement.pipe(Effect.andThen(retrySessionRecording(confirmation))),
+                Effect.flatMap(
+                  Option.match({
+                    // Abandoned: a replacement start superseded this settlement
+                    // before physical cleanup was ever confirmed, so there is
+                    // nothing left to settle or record.
+                    onNone: () => Effect.void,
+                    onSome: (confirmation) =>
+                      retrySettlement.pipe(Effect.andThen(retrySessionRecording(confirmation))),
+                  }),
                 ),
               ),
             );

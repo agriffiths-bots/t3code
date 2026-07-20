@@ -105,3 +105,146 @@ passes identically before and after.
 `BoundedProjectionRead` already exists and is the right shape. This adds one
 tagged reader, one documented compatibility view, and three consumer branches.
 No new type, no parallel mechanism, no change to `ThreadDeletionReactor`.
+
+---
+
+## Follow-on: orphan settlement live/replay symmetry (rounds 6-7)
+
+### Intent
+
+Every state transition and activity kind this branch's orphan machinery
+introduces must land identically whether it arrives live or is reconstructed by
+`reconcileFromLog`. Four defects on this PR were the same class: an orphan
+settlement treated as permanent on one path and revocable on the other.
+
+### The class
+
+`reconcileFromLog` is a second, hand-written implementation of the live
+handlers. Any state the live path can _revoke_ must be revocable on replay too,
+in the same order, or a restart silently changes a child's outcome.
+
+### Round 7 defect (gate P1, `ChildThreadCoordinator.ts:3610`, conf 0.89)
+
+Round 6 memoized every durable orphan settlement into the ancestry memo before
+the boot DFS. That made the walk kill **all** descendant cleanup candidates
+regardless of ordering. Live processing survives it because
+`markOrphanSettledChild` made the inferred settlement revocable by a later
+start; replay did not compare order, so after a restart the history
+_ancestor orphan settlement -> descendant replacement start_ settled the
+descendant `killed`, discarding a valid replacement turn and leaking its lease.
+
+### Change
+
+`reconcileFromLog` records a local monotonic `replayOrdinal` per event and two
+maps: `durableOrphanSettlementOrdinalByChild` (set with the settlement, cleared
+by an accepted start, same lifetime as `authoritativeDurableOrphanSettlementByChild`)
+and `acceptedStartOrdinalByChild`. The ancestry memo now holds
+`{reason, settledAtOrdinal}` instead of a bare reason, so an inherited reason
+carries the log position of the settlement it came from. A boot child skips
+propagation only when it has an accepted start strictly newer than that
+settlement, and is then memoized live so its own descendants are not killed
+either. Reasons derived from the live shell (archived/missing ancestor) carry
+no ordinal and are never superseded — propagation is preserved, not disabled.
+
+A local ordinal is used rather than `event.sequence` because `sequence` is
+optional on the event shape and only intra-replay order matters.
+
+### Live vs replay symmetry table
+
+| state                                         | live write                            | replay write            | revoke (both paths)                  |
+| --------------------------------------------- | ------------------------------------- | ----------------------- | ------------------------------------ |
+| `ORPHAN_SETTLED_ACTIVITY_KIND`                | emit `:1290`, consume `:2397`         | consume `:3104`         | same `orphanSettlementReason` helper |
+| `orphanSettledChildIds`                       | `:2399`                               | `:3561`, `:3743`        | `clearOrphanSettledChild` `:2378`    |
+| `suppressParentWakeChildIds`                  | `:578` (via `markOrphanSettledChild`) | same                    | `:582`; sole reader `:1434`          |
+| `authoritativeDurableOrphanSettlementByChild` | n/a (replay-local)                    | `:3111`                 | `:3085` on accepted start            |
+| `durableOrphanSettlementOrdinalByChild`       | n/a (replay-local)                    | `:3112`                 | `:3086` on accepted start            |
+| `lifecycleTerminatedByChild`                  | n/a (replay-local)                    | `markLifecycleTerminal` | `:3060-3065` orphan escape hatch     |
+
+`lifecycleTerminatedByChild` / `markLifecycleTerminal` pre-exist on `origin/main`
+(7 / 6 hits); every other row has **zero** hits there and is in-diff.
+
+### Round 7 second defect (gate P1, `:3739`, conf 0.95)
+
+The first cut memoized a superseding child as unconditionally live, which
+masked that child's own later shell state: with the order
+_ancestor settlement -> child start -> child archived_, descendants read the
+blanket-live memo instead of the archived shell and survived boot cleanup
+holding their leases. Supersession now stops inheritance only — the child is
+re-classified from its **own** shell (`replacementShellClassification`, no
+ancestor recursion, same Unavailable/Missing/archived semantics as the walk),
+so a replacement archived or deleted afterwards still orphans what is below it.
+
+### Round 7 third defect (gate P1, `:3766`, conf 0.96)
+
+A superseding child may be durably settled again _after_ the start that
+superseded its ancestor's settlement. With the order
+_ancestor settlement -> child start -> child settlement_, replacing the child's
+pre-seeded memo with the shell classification kept the child itself killed but
+stopped its descendants inheriting, leaving them alive on leases. The shell
+classification is now consulted only when the child has no durable settlement
+of its own; its own settlement is by construction the newer durable fact and
+stays authoritative.
+
+The six round-7 defects are one sub-class: **supersession bounds inheritance,
+it does not assert liveness.** Each fix narrows what the supersession branch is
+allowed to claim about the child.
+
+### Round 7 fourth defect (gate P1, `:3780`, conf 0.97)
+
+The same overwrite on the non-superseding branch. With nested settlements
+(_ancestor settled -> descendant start -> intermediate child settled_), the
+intermediate child inherits the ancestor's older classification and its own
+newer memo is replaced, so the descendant compares its start against the
+ancestor's ordinal, reads as a replacement, and keeps its lease. Both branches
+now write through one `memoizeInheritedClassification` helper that refuses to
+overwrite a child's own durable settlement — the invariant stated once rather
+than re-checked per branch.
+
+### Round 7 fifth defect (gate P1, `:3751`, conf 0.97)
+
+The helper asserted that a child's own settlement is always the newer fact.
+Both orderings occur: with _intermediate settled -> descendant start ->
+ancestor settled_ the intermediate's own classification is the OLDER one, and
+keeping it let the descendant read as a replacement and retain its lease. The
+helper now states the real invariant — **a thread is classified by the newest
+durable orphan fact at or above it** — and compares log ordinals in both
+directions. A shell-derived reason has no ordinal because it describes current
+state, which is newer than any logged event. The supersession branch is also
+skipped for a child holding its own settlement: an accepted start clears that
+settlement during replay, so one that survived is necessarily newer than the
+child's last start.
+
+Rounds 7.2-7.5 were all the same mistake — asserting a fixed precedence
+(live / own / closest) instead of comparing recency. Ordinal comparison is the
+fix; the earlier guards were special cases of it.
+
+### Round 7 sixth defect (gate P1, `:3087`, conf 0.93)
+
+`acceptedStartOrdinalByChild` stamped every `thread.turn-start-requested`,
+but a request arriving while a turn is still active is a **steer** into that
+turn (`recordPendingTurnStart` records it via `pendingSameTurnStarts`), not a
+new lifecycle. A steer delivered after an ancestor settlement therefore looked
+like a replacement and cancelled inherited cleanup for a descendant whose turn
+began before the settlement. Only requests that begin a new turn are stamped.
+
+### Edge-case matrix → named red-first test
+
+| edge case                                       | test                                                                                  |
+| ----------------------------------------------- | ------------------------------------------------------------------------------------- |
+| descendant start newer than ancestor settlement | `preserves a descendant replacement start newer than the ancestor settlement`         |
+| replacement child archived after its start      | `still settles descendants of a replacement child archived after its start`           |
+| descendant start older than ancestor settlement | `still settles a descendant whose replacement start predates the ancestor settlement` |
+| descendant with no start at all                 | `propagates a durable orphan settlement to a descendant of the settled child`         |
+| suppression lifted on supersession              | `re-enables the parent wake when a replacement turn supersedes an orphan settlement`  |
+| replacement child settled again after its start | `propagates a replacement child's own settlement newer than the inherited one`        |
+
+### Revert-mutation proof
+
+Eight mutations, each isolating one guard; counts in the commit message.
+
+### Smallest-change argument
+
+No new mechanism: the memo already existed and already flowed the reason down
+the ancestry. This widens its value by one field and adds one comparison at the
+single propagation site. Ordinals are local to `reconcileFromLog`, so no
+persisted shape changes and no client/migration blast radius.
