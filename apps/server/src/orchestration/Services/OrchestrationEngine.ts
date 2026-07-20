@@ -16,6 +16,7 @@ import type * as Effect from "effect/Effect";
 import type * as Stream from "effect/Stream";
 
 import type { OrchestrationDispatchError } from "../Errors.ts";
+import type { OrchestrationCommandDispatchAuthority } from "../commandAudienceGuard.ts";
 import type { OrchestrationEventStoreError } from "../../persistence/Errors.ts";
 
 /**
@@ -48,6 +49,7 @@ export interface OrchestrationEngineShape {
    */
   readonly dispatch: (
     command: OrchestrationCommand,
+    authority: OrchestrationCommandDispatchAuthority,
   ) => Effect.Effect<{ sequence: number }, OrchestrationDispatchError, never>;
 
   /**
@@ -56,6 +58,7 @@ export interface OrchestrationEngineShape {
    */
   readonly dispatchCoordinated?: (
     command: OrchestrationCommand,
+    authority: OrchestrationCommandDispatchAuthority,
   ) => Effect.Effect<{ sequence: number }, OrchestrationDispatchError, never>;
 
   /**
@@ -85,4 +88,5 @@ export class OrchestrationEngineService extends Context.Service<
 export const dispatchAlreadyCoordinated = (
   engine: OrchestrationEngineShape,
   command: OrchestrationCommand,
-) => (engine.dispatchCoordinated ?? engine.dispatch)(command);
+  authority: OrchestrationCommandDispatchAuthority,
+) => (engine.dispatchCoordinated ?? engine.dispatch)(command, authority);

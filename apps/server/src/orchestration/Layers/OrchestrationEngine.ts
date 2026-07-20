@@ -1,9 +1,4 @@
-import type {
-  OrchestrationEvent,
-  OrchestrationReadModel,
-  ProjectId,
-  ThreadId,
-} from "@t3tools/contracts";
+import type { OrchestrationEvent, OrchestrationReadModel, ThreadId } from "@t3tools/contracts";
 import { OrchestrationCommand } from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
 import * as Clock from "effect/Clock";
@@ -17,6 +12,7 @@ import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Metric from "effect/Metric";
 import * as Option from "effect/Option";
+import * as Path from "effect/Path";
 import * as PubSub from "effect/PubSub";
 import * as Queue from "effect/Queue";
 import * as Schema from "effect/Schema";
@@ -33,11 +29,18 @@ import { toPersistenceSqlError } from "../../persistence/Errors.ts";
 import { OrchestrationEventStore } from "../../persistence/Services/OrchestrationEventStore.ts";
 import { OrchestrationCommandReceiptRepository } from "../../persistence/Services/OrchestrationCommandReceipts.ts";
 import {
+  OrchestrationCommandAudienceAuthorizationError,
   OrchestrationCommandInvariantError,
   OrchestrationCommandPreviouslyRejectedError,
   type OrchestrationDispatchError,
   type OrchestrationProjectorDecodeError,
 } from "../Errors.ts";
+import {
+  authorizeOrchestrationCommandReceiptReplay,
+  authorizeOrchestrationCommandMutation,
+  orchestrationCommandAggregateRef,
+  type OrchestrationCommandDispatchAuthority,
+} from "../commandAudienceGuard.ts";
 import { decideOrchestrationCommand } from "../decider.ts";
 import { createEmptyReadModel, projectEvent } from "../projector.ts";
 import { OrchestrationProjectionPipeline } from "../Services/ProjectionPipeline.ts";
@@ -55,32 +58,15 @@ const isOrchestrationCommandPreviouslyRejectedError = Schema.is(
   OrchestrationCommandPreviouslyRejectedError,
 );
 const isOrchestrationCommandInvariantError = Schema.is(OrchestrationCommandInvariantError);
+const isOrchestrationCommandAudienceAuthorizationError = Schema.is(
+  OrchestrationCommandAudienceAuthorizationError,
+);
 
 interface CommandEnvelope {
   command: OrchestrationCommand;
+  authority: OrchestrationCommandDispatchAuthority | undefined;
   result: Deferred.Deferred<{ sequence: number }, OrchestrationDispatchError>;
   startedAtMs: number;
-}
-
-function commandToAggregateRef(command: OrchestrationCommand): {
-  readonly aggregateKind: "project" | "thread";
-  readonly aggregateId: ProjectId | ThreadId;
-} {
-  switch (command.type) {
-    case "project.create":
-    case "project.meta.update":
-    case "project.data-audience.set":
-    case "project.delete":
-      return {
-        aggregateKind: "project",
-        aggregateId: command.projectId,
-      };
-    default:
-      return {
-        aggregateKind: "thread",
-        aggregateId: command.threadId,
-      };
-  }
 }
 
 const makeOrchestrationEngine = Effect.gen(function* () {
@@ -91,6 +77,7 @@ const makeOrchestrationEngine = Effect.gen(function* () {
   const projectionSnapshotQuery = yield* ProjectionSnapshotQuery;
   const worktreeLifecycle = yield* WorktreeLifecycleCoordinator;
   const fileSystem = yield* FileSystem.FileSystem;
+  const path = yield* Path.Path;
   const crypto = yield* Crypto.Crypto;
 
   const nowIso = Effect.map(DateTime.now, DateTime.formatIso);
@@ -114,7 +101,7 @@ const makeOrchestrationEngine = Effect.gen(function* () {
   const processEnvelope = (envelope: CommandEnvelope): Effect.Effect<void> => {
     const dispatchStartSequence = commandReadModel.snapshotSequence;
     let processingStartedAtMs = 0;
-    const aggregateRef = commandToAggregateRef(envelope.command);
+    const aggregateRef = orchestrationCommandAggregateRef(envelope.command);
     const baseMetricAttributes = {
       commandType: envelope.command.type,
       aggregateKind: aggregateRef.aggregateKind,
@@ -148,6 +135,12 @@ const makeOrchestrationEngine = Effect.gen(function* () {
           commandId: envelope.command.commandId,
         });
         if (Option.isSome(existingReceipt)) {
+          yield* authorizeOrchestrationCommandReceiptReplay({
+            command: envelope.command,
+            readModel: commandReadModel,
+            authority: envelope.authority,
+            receipt: existingReceipt.value,
+          });
           if (existingReceipt.value.status === "accepted") {
             return {
               sequence: existingReceipt.value.resultSequence,
@@ -159,8 +152,18 @@ const makeOrchestrationEngine = Effect.gen(function* () {
           });
         }
 
-        const eventBase = yield* decideOrchestrationCommand({
+        const command = yield* authorizeOrchestrationCommandMutation({
           command: envelope.command,
+          readModel: commandReadModel,
+          authority: envelope.authority,
+          fileSystem,
+          path,
+        });
+
+        yield* requireUnarchiveWorktreeLifecycleReady(command);
+
+        const eventBase = yield* decideOrchestrationCommand({
+          command,
           readModel: commandReadModel,
         }).pipe(
           Effect.provideService(Crypto.Crypto, crypto),
@@ -168,7 +171,7 @@ const makeOrchestrationEngine = Effect.gen(function* () {
             isOrchestrationCommandInvariantError(cause)
               ? cause
               : new OrchestrationCommandInvariantError({
-                  commandType: envelope.command.type,
+                  commandType: command.type,
                   detail: "Failed to generate an event identifier.",
                   cause,
                 }),
@@ -191,15 +194,15 @@ const makeOrchestrationEngine = Effect.gen(function* () {
               const lastSavedEvent = committedEvents.at(-1) ?? null;
               if (lastSavedEvent === null) {
                 return yield* new OrchestrationCommandInvariantError({
-                  commandType: envelope.command.type,
+                  commandType: command.type,
                   detail: "Command produced no events.",
                 });
               }
 
               yield* commandReceiptRepository.upsert({
-                commandId: envelope.command.commandId,
-                aggregateKind: lastSavedEvent.aggregateKind,
-                aggregateId: lastSavedEvent.aggregateId,
+                commandId: command.commandId,
+                aggregateKind: aggregateRef.aggregateKind,
+                aggregateId: aggregateRef.aggregateId,
                 acceptedAt: lastSavedEvent.occurredAt,
                 resultSequence: lastSavedEvent.sequence,
                 status: "accepted",
@@ -271,7 +274,10 @@ const makeOrchestrationEngine = Effect.gen(function* () {
           }
 
           const error = Cause.squash(exit.cause) as OrchestrationDispatchError;
-          if (!isOrchestrationCommandPreviouslyRejectedError(error)) {
+          if (
+            !isOrchestrationCommandPreviouslyRejectedError(error) &&
+            !isOrchestrationCommandAudienceAuthorizationError(error)
+          ) {
             yield* reconcileReadModelAfterDispatchFailure.pipe(
               Effect.catch(() =>
                 Effect.logWarning(
@@ -318,11 +324,15 @@ const makeOrchestrationEngine = Effect.gen(function* () {
   const readEvents: OrchestrationEngineShape["readEvents"] = (fromSequenceExclusive, limit) =>
     eventStore.readFromSequence(fromSequenceExclusive, limit);
 
-  const dispatchQueued: NonNullable<OrchestrationEngineShape["dispatchCoordinated"]> = (command) =>
+  const dispatchQueued: NonNullable<OrchestrationEngineShape["dispatchCoordinated"]> = (
+    command,
+    authority,
+  ) =>
     Effect.gen(function* () {
       const result = yield* Deferred.make<{ sequence: number }, OrchestrationDispatchError>();
       yield* Queue.offer(commandQueue, {
         command,
+        authority,
         result,
         startedAtMs: yield* Clock.currentTimeMillis,
       });
@@ -344,25 +354,28 @@ const makeOrchestrationEngine = Effect.gen(function* () {
     );
   };
 
-  const dispatch: OrchestrationEngineShape["dispatch"] = (command) => {
-    if (!commandRequiresWorktreeLifecycle(command)) {
-      return dispatchQueued(command);
+  const requireUnarchiveWorktreeLifecycleReady = (command: OrchestrationCommand) => {
+    if (command.type !== "thread.unarchive") {
+      return Effect.void;
     }
-    return worktreeLifecycle.withPermit(
-      Effect.gen(function* () {
-        if (
-          command.type === "thread.unarchive" &&
-          ((yield* worktreeLifecycle.isTeardownPending(command.threadId)) ||
-            (yield* archivedOwnedWorktreeIsMissing(command.threadId)))
-        ) {
-          return yield* new OrchestrationCommandInvariantError({
-            commandType: command.type,
-            detail: `Thread '${command.threadId}' cannot be unarchived while its owned worktree teardown is pending.`,
-          });
-        }
-        return yield* dispatchQueued(command);
-      }),
-    );
+    return Effect.gen(function* () {
+      if (
+        (yield* worktreeLifecycle.isTeardownPending(command.threadId)) ||
+        (yield* archivedOwnedWorktreeIsMissing(command.threadId))
+      ) {
+        return yield* new OrchestrationCommandInvariantError({
+          commandType: command.type,
+          detail: `Thread '${command.threadId}' cannot be unarchived while its owned worktree teardown is pending.`,
+        });
+      }
+    });
+  };
+
+  const dispatch: OrchestrationEngineShape["dispatch"] = (command, authority) => {
+    if (!commandRequiresWorktreeLifecycle(command)) {
+      return dispatchQueued(command, authority);
+    }
+    return worktreeLifecycle.withPermit(dispatchQueued(command, authority));
   };
 
   return {

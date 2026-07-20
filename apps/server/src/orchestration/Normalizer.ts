@@ -16,8 +16,15 @@ import {
 import { createAttachmentId, resolveAttachmentPath } from "../attachmentStore.ts";
 import { ServerConfig } from "../config.ts";
 import { parseBase64DataUrl } from "../imageMime.ts";
+import { expandHomePath } from "../pathExpansion.ts";
 import { OrchestrationCommandReceiptRepository } from "../persistence/Services/OrchestrationCommandReceipts.ts";
 import * as WorkspacePaths from "../workspace/WorkspacePaths.ts";
+import { ProjectionSnapshotQuery } from "./Services/ProjectionSnapshotQuery.ts";
+import {
+  authorizeOrchestrationCommandReceiptReplay,
+  authorizeOrchestrationCommandMutation,
+  type OrchestrationCommandDispatchAuthority,
+} from "./commandAudienceGuard.ts";
 
 const isPersistedChatAttachment = (attachment: unknown): attachment is ChatAttachment =>
   typeof attachment === "object" &&
@@ -290,4 +297,67 @@ export const normalizeDispatchCommand = (command: ClientOrchestrationCommand) =>
     );
 
     return commandWithPersistedAttachments;
+  });
+
+const normalizeDispatchCommandForAuthorization = (
+  command: ClientOrchestrationCommand,
+  path: Path.Path,
+): OrchestrationCommand => {
+  if (command.type === "project.create") {
+    return {
+      ...command,
+      workspaceRoot: path.resolve(expandHomePath(command.workspaceRoot.trim())),
+    };
+  }
+  if (command.type === "project.meta.update" && command.workspaceRoot !== undefined) {
+    return {
+      ...command,
+      workspaceRoot: path.resolve(expandHomePath(command.workspaceRoot.trim())),
+    };
+  }
+  if (command.type === "thread.turn.start") {
+    return {
+      ...command,
+      message: {
+        ...command.message,
+        // Attachment payloads do not participate in audience authorization.
+        // Keep the preflight side-effect free; persistence happens only after approval.
+        attachments: [],
+      },
+    };
+  }
+  return command;
+};
+
+export const normalizeAuthorizedDispatchCommand = (
+  command: ClientOrchestrationCommand,
+  authority: OrchestrationCommandDispatchAuthority,
+) =>
+  Effect.gen(function* () {
+    const fileSystem = yield* FileSystem.FileSystem;
+    const path = yield* Path.Path;
+    const commandReceiptRepository = yield* OrchestrationCommandReceiptRepository;
+    const projectionSnapshotQuery = yield* ProjectionSnapshotQuery;
+    const readModel = yield* projectionSnapshotQuery.getCommandReadModel();
+    const existingReceipt = yield* commandReceiptRepository.getByCommandId({
+      commandId: command.commandId,
+    });
+    if (Option.isSome(existingReceipt)) {
+      const replayCommand = command as unknown as OrchestrationCommand;
+      yield* authorizeOrchestrationCommandReceiptReplay({
+        command: replayCommand,
+        readModel,
+        authority,
+        receipt: existingReceipt.value,
+      });
+      return replayCommand;
+    }
+    yield* authorizeOrchestrationCommandMutation({
+      command: normalizeDispatchCommandForAuthorization(command, path),
+      readModel,
+      authority,
+      fileSystem,
+      path,
+    });
+    return yield* normalizeDispatchCommand(command);
   });

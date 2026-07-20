@@ -7,6 +7,7 @@ import {
   ThreadId,
   TurnId,
   type OrchestrationEvent,
+  type OrchestrationThread,
   type ProviderRuntimeEvent,
 } from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
@@ -36,6 +37,11 @@ import { isGitRepository } from "../../git/Utils.ts";
 import { VcsStatusBroadcaster } from "../../vcs/VcsStatusBroadcaster.ts";
 import * as WorkspaceEntries from "../../workspace/WorkspaceEntries.ts";
 
+import { threadAudienceSystemDispatchAuthority } from "../commandAudienceGuard.ts";
+import {
+  resolveProviderRuntimeEventBinding,
+  type ProviderRuntimeEventBinding,
+} from "../providerRuntimeEventBinding.ts";
 const nowIso = Effect.map(DateTime.now, DateTime.formatIso);
 
 type ReactorInput =
@@ -97,24 +103,35 @@ const make = Effect.gen(function* () {
       activityId: serverEventId,
     }).pipe(
       Effect.flatMap(({ commandId, activityId }) =>
-        orchestrationEngine.dispatch({
-          type: "thread.activity.append",
-          commandId,
-          threadId: input.threadId,
-          activity: {
-            id: activityId,
-            tone: "error",
-            kind: "checkpoint.revert.failed",
-            summary: "Checkpoint revert failed",
-            payload: {
-              turnCount: input.turnCount,
-              detail: input.detail,
-            },
-            turnId: null,
-            createdAt: input.createdAt,
-          },
-          createdAt: input.createdAt,
-        }),
+        projectionSnapshotQuery.getThreadDetailById(input.threadId).pipe(
+          Effect.flatMap(
+            Option.match({
+              onNone: () => Effect.void,
+              onSome: (thread) =>
+                orchestrationEngine.dispatch(
+                  {
+                    type: "thread.activity.append",
+                    commandId,
+                    threadId: input.threadId,
+                    activity: {
+                      id: activityId,
+                      tone: "error",
+                      kind: "checkpoint.revert.failed",
+                      summary: "Checkpoint revert failed",
+                      payload: {
+                        turnCount: input.turnCount,
+                        detail: input.detail,
+                      },
+                      turnId: null,
+                      createdAt: input.createdAt,
+                    },
+                    createdAt: input.createdAt,
+                  },
+                  threadAudienceSystemDispatchAuthority(thread, "CheckpointReactor"),
+                ),
+            }),
+          ),
+        ),
       ),
     );
 
@@ -129,23 +146,34 @@ const make = Effect.gen(function* () {
       activityId: serverEventId,
     }).pipe(
       Effect.flatMap(({ commandId, activityId }) =>
-        orchestrationEngine.dispatch({
-          type: "thread.activity.append",
-          commandId,
-          threadId: input.threadId,
-          activity: {
-            id: activityId,
-            tone: "error",
-            kind: "checkpoint.capture.failed",
-            summary: "Checkpoint capture failed",
-            payload: {
-              detail: input.detail,
-            },
-            turnId: input.turnId,
-            createdAt: input.createdAt,
-          },
-          createdAt: input.createdAt,
-        }),
+        projectionSnapshotQuery.getThreadDetailById(input.threadId).pipe(
+          Effect.flatMap(
+            Option.match({
+              onNone: () => Effect.void,
+              onSome: (thread) =>
+                orchestrationEngine.dispatch(
+                  {
+                    type: "thread.activity.append",
+                    commandId,
+                    threadId: input.threadId,
+                    activity: {
+                      id: activityId,
+                      tone: "error",
+                      kind: "checkpoint.capture.failed",
+                      summary: "Checkpoint capture failed",
+                      payload: {
+                        detail: input.detail,
+                      },
+                      turnId: input.turnId,
+                      createdAt: input.createdAt,
+                    },
+                    createdAt: input.createdAt,
+                  },
+                  threadAudienceSystemDispatchAuthority(thread, "CheckpointReactor"),
+                ),
+            }),
+          ),
+        ),
       ),
     );
 
@@ -218,13 +246,7 @@ const make = Effect.gen(function* () {
   const captureAndDispatchCheckpoint = Effect.fn("captureAndDispatchCheckpoint")(function* (input: {
     readonly threadId: ThreadId;
     readonly turnId: TurnId;
-    readonly thread: {
-      readonly messages: ReadonlyArray<{
-        readonly id: MessageId;
-        readonly role: string;
-        readonly turnId: TurnId | null;
-      }>;
-    };
+    readonly thread: Pick<OrchestrationThread, "id" | "dataAudience" | "messages">;
     readonly cwd: string;
     readonly turnCount: number;
     readonly status: "ready" | "missing" | "error";
@@ -298,19 +320,22 @@ const make = Effect.gen(function* () {
         .find((entry) => entry.role === "assistant" && entry.turnId === input.turnId)?.id ??
       MessageId.make(`assistant:${input.turnId}`);
 
-    yield* orchestrationEngine.dispatch({
-      type: "thread.turn.diff.complete",
-      commandId: yield* serverCommandId("checkpoint-turn-diff-complete"),
-      threadId: input.threadId,
-      turnId: input.turnId,
-      completedAt: input.createdAt,
-      checkpointRef: targetCheckpointRef,
-      status: input.status,
-      files,
-      assistantMessageId,
-      checkpointTurnCount: input.turnCount,
-      createdAt: input.createdAt,
-    });
+    yield* orchestrationEngine.dispatch(
+      {
+        type: "thread.turn.diff.complete",
+        commandId: yield* serverCommandId("checkpoint-turn-diff-complete"),
+        threadId: input.threadId,
+        turnId: input.turnId,
+        completedAt: input.createdAt,
+        checkpointRef: targetCheckpointRef,
+        status: input.status,
+        files,
+        assistantMessageId,
+        checkpointTurnCount: input.turnCount,
+        createdAt: input.createdAt,
+      },
+      threadAudienceSystemDispatchAuthority(input.thread, "CheckpointReactor"),
+    );
     yield* receiptBus.publish({
       type: "checkpoint.diff.finalized",
       threadId: input.threadId,
@@ -328,35 +353,41 @@ const make = Effect.gen(function* () {
       createdAt: input.createdAt,
     });
 
-    yield* orchestrationEngine.dispatch({
-      type: "thread.activity.append",
-      commandId: yield* serverCommandId("checkpoint-captured-activity"),
-      threadId: input.threadId,
-      activity: {
-        id: EventId.make(yield* randomUUID),
-        tone: "info",
-        kind: "checkpoint.captured",
-        summary: "Checkpoint captured",
-        payload: {
-          turnCount: input.turnCount,
-          status: input.status,
+    yield* orchestrationEngine.dispatch(
+      {
+        type: "thread.activity.append",
+        commandId: yield* serverCommandId("checkpoint-captured-activity"),
+        threadId: input.threadId,
+        activity: {
+          id: EventId.make(yield* randomUUID),
+          tone: "info",
+          kind: "checkpoint.captured",
+          summary: "Checkpoint captured",
+          payload: {
+            turnCount: input.turnCount,
+            status: input.status,
+          },
+          turnId: input.turnId,
+          createdAt: input.createdAt,
         },
-        turnId: input.turnId,
         createdAt: input.createdAt,
       },
-      createdAt: input.createdAt,
-    });
+      threadAudienceSystemDispatchAuthority(input.thread, "CheckpointReactor"),
+    );
   });
 
   // Captures a real git checkpoint when a turn completes via a runtime event.
   const captureCheckpointFromTurnCompletion = Effect.fn("captureCheckpointFromTurnCompletion")(
-    function* (event: Extract<ProviderRuntimeEvent, { type: "turn.completed" }>) {
+    function* (
+      event: Extract<ProviderRuntimeEvent, { type: "turn.completed" }>,
+      threadId: ThreadId,
+    ) {
       const turnId = toTurnId(event.turnId);
       if (!turnId) {
         return;
       }
 
-      const thread = yield* resolveThreadDetail(event.threadId);
+      const thread = yield* resolveThreadDetail(threadId);
       if (!thread) {
         return;
       }
@@ -477,13 +508,13 @@ const make = Effect.gen(function* () {
   });
 
   const ensurePreTurnBaselineFromTurnStart = Effect.fn("ensurePreTurnBaselineFromTurnStart")(
-    function* (event: Extract<ProviderRuntimeEvent, { type: "turn.started" }>) {
+    function* (event: Extract<ProviderRuntimeEvent, { type: "turn.started" }>, threadId: ThreadId) {
       const turnId = toTurnId(event.turnId);
       if (!turnId) {
         return;
       }
 
-      const thread = yield* resolveThreadDetail(event.threadId);
+      const thread = yield* resolveThreadDetail(threadId);
       if (!thread) {
         return;
       }
@@ -528,18 +559,20 @@ const make = Effect.gen(function* () {
 
   const refreshLocalGitStatusFromTurnCompletion = Effect.fn(
     "refreshLocalGitStatusFromTurnCompletion",
-  )(function* (event: Extract<ProviderRuntimeEvent, { type: "turn.completed" }>) {
-    const sessionRuntime = yield* resolveSessionRuntimeForThread(event.threadId);
-    if (Option.isNone(sessionRuntime)) {
+  )(function* (
+    event: Extract<ProviderRuntimeEvent, { type: "turn.completed" }>,
+    binding: ProviderRuntimeEventBinding,
+  ) {
+    if (binding.cwd === undefined) {
       return;
     }
 
-    yield* vcsStatusBroadcaster.refreshLocalStatus(sessionRuntime.value.cwd).pipe(
+    yield* vcsStatusBroadcaster.refreshLocalStatus(binding.cwd).pipe(
       Effect.catch((error) =>
         Effect.logWarning("failed to refresh local git status after turn completion", {
-          threadId: event.threadId,
+          threadId: binding.threadId,
           turnId: event.turnId ?? null,
-          cwd: sessionRuntime.value.cwd,
+          cwd: binding.cwd,
           detail: error.message,
         }),
       ),
@@ -717,13 +750,16 @@ const make = Effect.gen(function* () {
     }
 
     yield* orchestrationEngine
-      .dispatch({
-        type: "thread.revert.complete",
-        commandId: yield* serverCommandId("checkpoint-revert-complete"),
-        threadId: event.payload.threadId,
-        turnCount: event.payload.turnCount,
-        createdAt: now,
-      })
+      .dispatch(
+        {
+          type: "thread.revert.complete",
+          commandId: yield* serverCommandId("checkpoint-revert-complete"),
+          threadId: event.payload.threadId,
+          turnCount: event.payload.turnCount,
+          createdAt: now,
+        },
+        threadAudienceSystemDispatchAuthority(thread, "CheckpointReactor"),
+      )
       .pipe(
         Effect.catch((error) =>
           appendRevertFailureActivity({
@@ -783,19 +819,27 @@ const make = Effect.gen(function* () {
   const processRuntimeEvent = Effect.fn("processRuntimeEvent")(function* (
     event: ProviderRuntimeEvent,
   ) {
+    const binding = yield* resolveProviderRuntimeEventBinding({
+      consumer: "CheckpointReactor",
+      event,
+    });
+    if (binding === undefined) {
+      return;
+    }
+
     if (event.type === "turn.started") {
-      yield* ensurePreTurnBaselineFromTurnStart(event);
+      yield* ensurePreTurnBaselineFromTurnStart(event, binding.threadId);
       return;
     }
 
     if (event.type === "turn.completed") {
       const turnId = toTurnId(event.turnId);
-      yield* refreshLocalGitStatusFromTurnCompletion(event);
-      yield* captureCheckpointFromTurnCompletion(event).pipe(
+      yield* refreshLocalGitStatusFromTurnCompletion(event, binding);
+      yield* captureCheckpointFromTurnCompletion(event, binding.threadId).pipe(
         Effect.catch((error) =>
           Effect.flatMap(nowIso, (createdAt) =>
             appendCaptureFailureActivity({
-              threadId: event.threadId,
+              threadId: binding.threadId,
               turnId,
               detail: error.message,
               createdAt,

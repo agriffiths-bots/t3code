@@ -96,6 +96,11 @@ import {
   type SubagentsInput,
 } from "./tools.ts";
 
+import {
+  peerSessionDispatchAuthority,
+  sessionDispatchAuthority,
+  type OrchestrationCommandDispatchAuthority,
+} from "../../../orchestration/commandAudienceGuard.ts";
 const nowIso = Effect.map(DateTime.now, DateTime.formatIso);
 const isThreadStartToolError = Schema.is(ThreadStartToolError);
 const isSubagentPeerTargetNotFoundError = Schema.is(
@@ -118,6 +123,14 @@ const encodeSpawnSubagentOutput = Schema.encodeUnknownEffect(SpawnSubagentOutput
 
 const toToolError = (error: unknown, fallback: string): ThreadStartToolError =>
   isThreadStartToolError(error) ? error : fail(error instanceof Error ? error.message : fallback);
+
+const providerThreadAuthority = (
+  thread: Pick<OrchestrationThread, "id" | "dataAudience">,
+): OrchestrationCommandDispatchAuthority =>
+  sessionDispatchAuthority({
+    subject: `provider-thread:${thread.id}`,
+    audienceCeiling: thread.dataAudience,
+  });
 
 const requireCoordinator = (): Effect.Effect<ChildThreadCoordinatorShape, ThreadStartToolError> => {
   const coordinator = coordinatorActive();
@@ -986,16 +999,34 @@ const spawnSubagent = Effect.fn("SubagentToolkit.spawn")(function* (
       );
     }
     yield* requirePeerParentAccess(invocation, remoteParentThreadId);
-    const started = yield* spawnRuntime(threadStartInput, invocation);
+    const { output: started } = yield* spawnRuntime(threadStartInput, invocation);
+    // CONSEQUENCE, not just mechanism: this ceiling makes the `thread.parent.set` below FAIL. A
+    // peer spawn always carries `parentEnvironmentId`, so the guard routes it to
+    // `requireRemoteParentAllowed`, which refuses factory-ceiling callers (the remote parent is
+    // absent from the local read model, so its audience cannot be checked and the guard fails
+    // closed). The net effect is that peer-scoped remote sub-agent spawn is currently REFUSED:
+    // the child is started, the link is rejected, and the `Effect.onError` below deletes it.
+    // This is a deliberate narrowing, not an oversight — ADA-184 tracks restoring the capability
+    // by authenticating the remote parent's audience rather than trusting the caller's ceiling.
+    // Pinned end to end by "peer-scoped receiver spawn is refused by the real guard and deletes
+    // the started child" in handlers.test.ts.
+    const startedThreadAuthority = peerSessionDispatchAuthority({
+      subject: `mcp-peer:${invocation.peerTokenId}`,
+      audienceCeiling: "factory",
+      sourceEnvironmentId: parentEnvironmentId,
+    });
     yield* dispatchParentSet(
       runtime,
       started.threadId,
       remoteParentThreadId,
+      startedThreadAuthority,
       parentEnvironmentId,
     ).pipe(
       Effect.mapError((error) => toToolError(error, "Failed to link remote sub-agent parent.")),
       Effect.onError(() =>
-        dispatchStartedChildDelete(runtime, started.threadId).pipe(Effect.catch(() => Effect.void)),
+        dispatchStartedChildDelete(runtime, started.threadId, startedThreadAuthority).pipe(
+          Effect.catch(() => Effect.void),
+        ),
       ),
     );
     return {
@@ -1052,6 +1083,7 @@ const spawnSubagent = Effect.fn("SubagentToolkit.spawn")(function* (
     parentThreadId: providerInvocation.threadId,
     model: modelSelection,
   });
+  const sourceAuthority = providerThreadAuthority(source);
 
   // Spawn with the ALREADY-resolved selection (drop `model`) so the thread
   // runtime does not re-resolve against a possibly-different registry snapshot —
@@ -1068,20 +1100,31 @@ const spawnSubagent = Effect.fn("SubagentToolkit.spawn")(function* (
       );
       const releaseDispatchLease: Effect.Effect<void, never, never> =
         runtime.dispatchLimiter.release(dispatchLease);
-      const started = yield* spawnRuntime(
+      const { output: started } = yield* spawnRuntime(
         { ...threadStartInputBase, modelSelection },
         providerInvocation,
         { providerSessionDetached: true },
       ).pipe(Effect.onError(() => releaseDispatchLease));
       yield* runtime.dispatchLimiter.bindChild(dispatchLease, started.threadId);
       const cleanupAndReleaseFromDelete = (reason: string) =>
-        cleanupStartedChild(runtime, started.threadId, reason, releaseDispatchLease);
+        cleanupStartedChild(
+          runtime,
+          started.threadId,
+          sourceAuthority,
+          reason,
+          releaseDispatchLease,
+        );
       const spawnedAtMs = yield* Effect.clockWith((clock) => clock.currentTimeMillis);
 
       // Persist the parent linkage before registration relies on the in-memory
       // limiter binding; restart reconciliation seeds running children from
       // this durable link.
-      yield* dispatchParentSet(runtime, started.threadId, providerInvocation.threadId).pipe(
+      yield* dispatchParentSet(
+        runtime,
+        started.threadId,
+        providerInvocation.threadId,
+        sourceAuthority,
+      ).pipe(
         Effect.mapError((error) => toToolError(error, "Failed to link sub-agent to parent.")),
         Effect.onError(() => cleanupAndReleaseFromDelete("parent link failed")),
       );
@@ -1115,38 +1158,50 @@ const dispatchParentSet = Effect.fn("SubagentToolkit.dispatchParentSet")(functio
   runtime: SubagentRuntime,
   childThreadId: ThreadId,
   parentThreadId: ThreadId,
+  authority: OrchestrationCommandDispatchAuthority,
   parentEnvironmentId?: EnvironmentId,
 ) {
   const uuid = yield* runtime.crypto.randomUUIDv4.pipe(Effect.orDie);
   const createdAt = yield* nowIso;
-  yield* runtime.orchestrationEngine.dispatch({
-    type: "thread.parent.set",
-    commandId: CommandId.make(`server:subagent-link:${uuid}`),
-    threadId: childThreadId,
-    parentThreadId,
-    ...(parentEnvironmentId !== undefined ? { parentEnvironmentId } : {}),
-    createdAt,
-  });
+  yield* runtime.orchestrationEngine.dispatch(
+    {
+      type: "thread.parent.set",
+      commandId: CommandId.make(`server:subagent-link:${uuid}`),
+      threadId: childThreadId,
+      parentThreadId,
+      ...(parentEnvironmentId !== undefined ? { parentEnvironmentId } : {}),
+      createdAt,
+    },
+    authority,
+  );
 });
 
 const dispatchStartedChildDelete = Effect.fn("SubagentToolkit.dispatchStartedChildDelete")(
-  function* (runtime: SubagentRuntime, childThreadId: ThreadId) {
+  function* (
+    runtime: SubagentRuntime,
+    childThreadId: ThreadId,
+    authority: OrchestrationCommandDispatchAuthority,
+  ) {
     const uuid = yield* runtime.crypto.randomUUIDv4.pipe(Effect.orDie);
-    yield* runtime.orchestrationEngine.dispatch({
-      type: "thread.delete",
-      commandId: CommandId.make(`server:subagent-cleanup:${uuid}`),
-      threadId: childThreadId,
-    });
+    yield* runtime.orchestrationEngine.dispatch(
+      {
+        type: "thread.delete",
+        commandId: CommandId.make(`server:subagent-cleanup:${uuid}`),
+        threadId: childThreadId,
+      },
+      authority,
+    );
   },
 );
 
 const cleanupStartedChild = (
   runtime: SubagentRuntime,
   childThreadId: ThreadId,
+  authority: OrchestrationCommandDispatchAuthority,
   reason: string,
   releaseDispatchLease: Effect.Effect<void, never, never>,
 ): Effect.Effect<void, never, never> =>
-  dispatchStartedChildDelete(runtime, childThreadId).pipe(
+  dispatchStartedChildDelete(runtime, childThreadId, authority).pipe(
     Effect.catchCause((cause) =>
       Effect.logWarning("failed to delete sub-agent after spawn registration failure", {
         childThreadId,
@@ -1215,16 +1270,19 @@ const steerSubagent = Effect.fn("SubagentToolkit.steer")(function* (input: Steer
   const uuid = yield* runtime.crypto.randomUUIDv4.pipe(Effect.orDie);
   const messageId = MessageId.make(yield* runtime.crypto.randomUUIDv4.pipe(Effect.orDie));
   const createdAt = yield* nowIso;
-  yield* dispatchActive({
-    type: "thread.turn.start",
-    commandId: CommandId.make(`server:subagent-steer:${uuid}`),
-    threadId: input.childThreadId,
-    message: { messageId, role: "user", text: input.message, attachments: [] },
-    runtimeMode: child.runtimeMode,
-    interactionMode: child.interactionMode,
-    bootstrap: undefined,
-    createdAt,
-  }).pipe(Effect.mapError((error) => toToolError(error, "Failed to steer sub-agent.")));
+  yield* dispatchActive(
+    {
+      type: "thread.turn.start",
+      commandId: CommandId.make(`server:subagent-steer:${uuid}`),
+      threadId: input.childThreadId,
+      message: { messageId, role: "user", text: input.message, attachments: [] },
+      runtimeMode: child.runtimeMode,
+      interactionMode: child.interactionMode,
+      bootstrap: undefined,
+      createdAt,
+    },
+    providerThreadAuthority(sourceThread),
+  ).pipe(Effect.mapError((error) => toToolError(error, "Failed to steer sub-agent.")));
 
   return {
     childThreadId: input.childThreadId,

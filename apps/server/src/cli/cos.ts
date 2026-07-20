@@ -42,6 +42,7 @@ import {
 import { layer as WorkspacePathsLive } from "../workspace/WorkspacePaths.ts";
 import { type CliAuthLocationFlags, projectLocationFlags, resolveCliAuthConfig } from "./config.ts";
 
+import { trustedSystemDispatchAuthority } from "../orchestration/commandAudienceGuard.ts";
 type CosCliDispatchCommand = Extract<
   OrchestrationCommand,
   { type: "thread.turn.start" } | { type: "thread.parent.set" }
@@ -253,7 +254,10 @@ const runCosCommand = Effect.fn("runCosCommand")(function* <A, E>(
       const orchestrationEngine = yield* OrchestrationEngineService;
       return yield* run({
         snapshot,
-        dispatch: (command) => orchestrationEngine.dispatch(command).pipe(Effect.asVoid),
+        dispatch: (command) =>
+          orchestrationEngine
+            .dispatch(command, trustedSystemDispatchAuthority("cos"))
+            .pipe(Effect.asVoid),
       });
     }).pipe(Effect.provide(offlineRuntimeLayer));
   }).pipe(

@@ -1,8 +1,10 @@
 import {
   EventId,
+  type DataAudience,
   type OrchestrationCommand,
   type OrchestrationEvent,
   type OrchestrationReadModel,
+  DEFAULT_DATA_AUDIENCE,
   type ThreadId,
 } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
@@ -24,6 +26,12 @@ import {
 import { projectEvent } from "./projector.ts";
 
 const nowIso = Effect.map(DateTime.now, DateTime.formatIso);
+
+function projectCreateDataAudience(command: OrchestrationCommand): DataAudience {
+  return (
+    (command as { readonly dataAudience?: DataAudience }).dataAudience ?? DEFAULT_DATA_AUDIENCE
+  );
+}
 
 function withEventBase(
   input: Pick<OrchestrationCommand, "commandId"> & {
@@ -181,7 +189,7 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
           projectId: command.projectId,
           title: command.title,
           workspaceRoot: command.workspaceRoot,
-          dataAudience: "private",
+          dataAudience: projectCreateDataAudience(command),
           defaultModelSelection: command.defaultModelSelection ?? null,
           scripts: [],
           createdAt: command.createdAt,

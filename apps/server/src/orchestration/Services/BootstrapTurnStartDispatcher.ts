@@ -1,5 +1,6 @@
 import {
   CommandId,
+  type DataAudience,
   EventId,
   type OrchestrationThread,
   OrchestrationDispatchCommandError,
@@ -11,6 +12,7 @@ import * as Context from "effect/Context";
 import * as Crypto from "effect/Crypto";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
+import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Path from "effect/Path";
@@ -26,18 +28,21 @@ import {
 } from "../../project/ProjectSetupScriptRunner.ts";
 import { VcsStatusBroadcaster } from "../../vcs/VcsStatusBroadcaster.ts";
 import { OrchestrationCommandInvariantError } from "../Errors.ts";
+import {
+  threadHasPreparedBootstrapWorktree,
+  threadMatchesBootstrapCreate,
+  type BootstrapCreateThreadCommand,
+} from "../bootstrapCommandState.ts";
+import {
+  audienceBoundSystemDispatchAuthority,
+  authorizeOrchestrationCommandMutation,
+  type OrchestrationCommandDispatchAuthority,
+} from "../commandAudienceGuard.ts";
 import { dispatchAlreadyCoordinated, OrchestrationEngineService } from "./OrchestrationEngine.ts";
 import { ProjectionSnapshotQuery } from "./ProjectionSnapshotQuery.ts";
 import { WorktreeLifecycleCoordinator } from "./WorktreeLifecycleCoordinator.ts";
 
 type ThreadTurnStartCommand = Extract<OrchestrationCommand, { type: "thread.turn.start" }>;
-type BootstrapCreateThreadCommand = NonNullable<
-  NonNullable<ThreadTurnStartCommand["bootstrap"]>["createThread"]
->;
-type BootstrapPrepareWorktreeCommand = NonNullable<
-  NonNullable<ThreadTurnStartCommand["bootstrap"]>["prepareWorktree"]
->;
-
 const isOrchestrationCommandInvariantError = Schema.is(OrchestrationCommandInvariantError);
 const isOrchestrationDispatchCommandError = Schema.is(OrchestrationDispatchCommandError);
 
@@ -103,70 +108,10 @@ function isArchivedFinalTurnStartCause(cause: Cause.Cause<unknown>, threadId: Th
   return error instanceof Error && error.message.includes(detail);
 }
 
-function toCanonicalJson(value: unknown): string {
-  return JSON.stringify(toCanonicalJsonValue(value));
-}
-
-function toCanonicalJsonValue(value: unknown): unknown {
-  if (Array.isArray(value)) {
-    return value.map(toCanonicalJsonValue);
-  }
-  if (typeof value !== "object" || value === null) {
-    return value;
-  }
-  return Object.fromEntries(
-    Object.entries(value)
-      .filter(([, entryValue]) => entryValue !== undefined)
-      .sort(([leftKey], [rightKey]) => leftKey.localeCompare(rightKey))
-      .map(([entryKey, entryValue]) => [entryKey, toCanonicalJsonValue(entryValue)]),
-  );
-}
-
-function threadMatchesBootstrapCreate(
-  thread: OrchestrationThread,
-  createThread: BootstrapCreateThreadCommand,
-  hasPrepareWorktree: boolean,
-) {
-  if (thread.deletedAt !== null) return false;
-  if (thread.messages.length > 0 || thread.latestTurn !== null) return false;
-  if (thread.projectId !== createThread.projectId) return false;
-  if (thread.createdAt !== createThread.createdAt) return false;
-  if (toCanonicalJson(thread.modelSelection) !== toCanonicalJson(createThread.modelSelection)) {
-    return false;
-  }
-  if (thread.runtimeMode !== createThread.runtimeMode) return false;
-  if (thread.interactionMode !== createThread.interactionMode) return false;
-  if (!hasPrepareWorktree && thread.branch !== createThread.branch) return false;
-  if (!hasPrepareWorktree && thread.worktreePath !== createThread.worktreePath) return false;
-  return true;
-}
-
-function threadHasPreparedBootstrapWorktree(
-  thread: OrchestrationThread,
-  createThread: BootstrapCreateThreadCommand | undefined,
-  prepareWorktree: BootstrapPrepareWorktreeCommand,
-) {
-  if (thread.deletedAt !== null || thread.worktreePath === null) return false;
-  if (prepareWorktree.branch !== undefined) {
-    if (thread.branch !== prepareWorktree.branch) {
-      return false;
-    }
-  } else if (!createThread) {
-    return false;
-  }
-  if (
-    createThread &&
-    thread.branch === createThread.branch &&
-    thread.worktreePath === createThread.worktreePath
-  ) {
-    return false;
-  }
-  return true;
-}
-
 export interface BootstrapTurnStartDispatcherShape {
   readonly dispatch: (
     command: ThreadTurnStartCommand,
+    authority: OrchestrationCommandDispatchAuthority,
   ) => Effect.Effect<{ readonly sequence: number }, OrchestrationDispatchCommandError>;
 }
 
@@ -179,6 +124,7 @@ let activeDispatcher: BootstrapTurnStartDispatcherShape | null = null;
 
 export const dispatchActive = (
   command: ThreadTurnStartCommand,
+  authority: OrchestrationCommandDispatchAuthority,
 ): Effect.Effect<{ readonly sequence: number }, OrchestrationDispatchCommandError> => {
   const dispatcher = activeDispatcher;
   if (!dispatcher) {
@@ -188,7 +134,7 @@ export const dispatchActive = (
       }),
     );
   }
-  return dispatcher.dispatch(command);
+  return dispatcher.dispatch(command, authority);
 };
 
 export const ActiveBootstrapTurnStartDispatcherLive = Layer.effectDiscard(
@@ -217,6 +163,7 @@ export const layer = Layer.effect(
     const gitWorkflow = yield* GitWorkflowService;
     const projectSetupScriptRunner = yield* ProjectSetupScriptRunner;
     const vcsStatusBroadcaster = yield* VcsStatusBroadcaster;
+    const fileSystem = yield* FileSystem.FileSystem;
     const path = yield* Path.Path;
     const worktreeLifecycle = yield* WorktreeLifecycleCoordinator;
     const bootstrapLocksRef = yield* SynchronizedRef.make(new Map<string, Semaphore.Semaphore>());
@@ -244,27 +191,31 @@ export const layer = Layer.effect(
       readonly createdAt: string;
       readonly payload: Record<string, unknown>;
       readonly tone: "info" | "error";
+      readonly authority: OrchestrationCommandDispatchAuthority;
     }) =>
       Effect.all({
         commandId: serverCommandId("setup-script-activity"),
         activityId: serverEventId,
       }).pipe(
         Effect.flatMap(({ commandId, activityId }) =>
-          orchestrationEngine.dispatch({
-            type: "thread.activity.append",
-            commandId,
-            threadId: input.threadId,
-            activity: {
-              id: activityId,
-              tone: input.tone,
-              kind: input.kind,
-              summary: input.summary,
-              payload: input.payload,
-              turnId: null,
+          orchestrationEngine.dispatch(
+            {
+              type: "thread.activity.append",
+              commandId,
+              threadId: input.threadId,
+              activity: {
+                id: activityId,
+                tone: input.tone,
+                kind: input.kind,
+                summary: input.summary,
+                payload: input.payload,
+                turnId: null,
+                createdAt: input.createdAt,
+              },
               createdAt: input.createdAt,
             },
-            createdAt: input.createdAt,
-          }),
+            input.authority,
+          ),
         ),
       );
 
@@ -337,14 +288,16 @@ export const layer = Layer.effect(
 
     const dispatch = Effect.fn("BootstrapTurnStartDispatcher.dispatch")(function* (
       command: ThreadTurnStartCommand,
+      authority: OrchestrationCommandDispatchAuthority,
     ) {
-      const bootstrap = command.bootstrap;
+      let bootstrap = command.bootstrap;
       const { bootstrap: _bootstrap, ...finalTurnStartCommand } = command;
       let createdThread = false;
       let targetProjectId = bootstrap?.createThread?.projectId;
       let targetProjectCwd = bootstrap?.prepareWorktree?.projectCwd;
       let targetWorktreePath = bootstrap?.createThread?.worktreePath ?? null;
       let skipWorktreePreparation = false;
+      let internalAuthority: OrchestrationCommandDispatchAuthority = authority;
       // The worktree THIS bootstrap created (if any), for cleanup on failure.
       // A failed bootstrap must not leave its worktree behind — and for
       // directory-targeted (non-removable, foreign-repo) worktrees lifecycle
@@ -355,11 +308,15 @@ export const layer = Layer.effect(
         createdThread
           ? serverCommandId("bootstrap-thread-delete").pipe(
               Effect.flatMap((commandId) =>
-                dispatchAlreadyCoordinated(orchestrationEngine, {
-                  type: "thread.delete",
-                  commandId,
-                  threadId: command.threadId,
-                }),
+                dispatchAlreadyCoordinated(
+                  orchestrationEngine,
+                  {
+                    type: "thread.delete",
+                    commandId,
+                    threadId: command.threadId,
+                  },
+                  authority,
+                ),
               ),
               Effect.ignoreCause({ log: true }),
             )
@@ -392,6 +349,7 @@ export const layer = Layer.effect(
             worktreePath: input.worktreePath,
           },
           tone: "error",
+          authority,
         }).pipe(
           Effect.ignoreCause({ log: false }),
           Effect.flatMap(() =>
@@ -427,6 +385,7 @@ export const layer = Layer.effect(
               createdAt: input.requestedAt,
               payload,
               tone: "info",
+              authority,
             }),
             appendSetupScriptActivity({
               threadId: command.threadId,
@@ -435,6 +394,7 @@ export const layer = Layer.effect(
               createdAt: startedAt,
               payload,
               tone: "info",
+              authority,
             }),
           ]).pipe(
             Effect.asVoid,
@@ -451,6 +411,49 @@ export const layer = Layer.effect(
               ),
             ),
           );
+        });
+
+      const authorizeBootstrapCommand = (): Effect.Effect<
+        {
+          readonly authorizedCommand: ThreadTurnStartCommand;
+          readonly targetAudience: DataAudience;
+        },
+        OrchestrationDispatchCommandError
+      > =>
+        Effect.gen(function* () {
+          const readModel = yield* projectionSnapshotQuery
+            .getCommandReadModel()
+            .pipe(
+              Effect.mapError((cause) =>
+                toDispatchCommandError(cause, "Failed to read bootstrap authorization model."),
+              ),
+            );
+          const authorizedCommand = yield* authorizeOrchestrationCommandMutation({
+            command,
+            readModel,
+            authority,
+            fileSystem,
+            path,
+          }).pipe(
+            Effect.mapError((cause) =>
+              toDispatchCommandError(cause, "Bootstrap turn start command is not authorized."),
+            ),
+          );
+          if (authorizedCommand.type !== "thread.turn.start") {
+            return yield* new OrchestrationDispatchCommandError({
+              message: "Bootstrap authorization returned an unexpected command type.",
+            });
+          }
+          const targetAudience =
+            readModel.threads.find((thread) => thread.id === command.threadId)?.dataAudience ??
+            readModel.projects.find((project) => project.id === bootstrap?.createThread?.projectId)
+              ?.dataAudience;
+          if (targetAudience === undefined) {
+            return yield* new OrchestrationDispatchCommandError({
+              message: "Bootstrap turn start target audience could not be resolved.",
+            });
+          }
+          return { authorizedCommand, targetAudience };
         });
 
       const getFinalTurnReceipt = () =>
@@ -473,9 +476,11 @@ export const layer = Layer.effect(
               onSome: (thread) =>
                 thread.archivedAt === null
                   ? Effect.void
-                  : dispatchAlreadyCoordinated(orchestrationEngine, finalTurnStartCommand).pipe(
-                      Effect.asVoid,
-                    ),
+                  : dispatchAlreadyCoordinated(
+                      orchestrationEngine,
+                      finalTurnStartCommand,
+                      authority,
+                    ).pipe(Effect.asVoid),
             }),
           ),
         );
@@ -591,24 +596,28 @@ export const layer = Layer.effect(
             return;
           }
 
-          yield* dispatchAlreadyCoordinated(orchestrationEngine, {
-            type: "thread.create",
-            commandId: yield* serverCommandId("bootstrap-thread-create"),
-            threadId: command.threadId,
-            projectId: createThread.projectId,
-            title: createThread.title,
-            modelSelection: createThread.modelSelection,
-            runtimeMode: createThread.runtimeMode,
-            interactionMode: createThread.interactionMode,
-            branch: createThread.branch,
-            worktreePath: createThread.worktreePath,
-            worktreeRemovable:
-              createThread.worktreeRemovable ?? bootstrap?.prepareWorktree !== undefined,
-            worktreeRemovalPath:
-              createThread.worktreeRemovalPath ??
-              (bootstrap?.prepareWorktree === undefined ? createThread.worktreePath : null),
-            createdAt: createThread.createdAt,
-          }).pipe(
+          yield* dispatchAlreadyCoordinated(
+            orchestrationEngine,
+            {
+              type: "thread.create",
+              commandId: yield* serverCommandId("bootstrap-thread-create"),
+              threadId: command.threadId,
+              projectId: createThread.projectId,
+              title: createThread.title,
+              modelSelection: createThread.modelSelection,
+              runtimeMode: createThread.runtimeMode,
+              interactionMode: createThread.interactionMode,
+              branch: createThread.branch,
+              worktreePath: createThread.worktreePath,
+              worktreeRemovable:
+                createThread.worktreeRemovable ?? bootstrap?.prepareWorktree !== undefined,
+              worktreeRemovalPath:
+                createThread.worktreeRemovalPath ??
+                (bootstrap?.prepareWorktree === undefined ? createThread.worktreePath : null),
+              createdAt: createThread.createdAt,
+            },
+            internalAuthority,
+          ).pipe(
             Effect.matchEffect({
               onFailure: (error) => {
                 const dispatchError = toDispatchCommandError(
@@ -640,8 +649,23 @@ export const layer = Layer.effect(
       const bootstrapProgram = Effect.gen(function* () {
         const existingFinalTurnReceipt = yield* getFinalTurnReceipt();
         if (Option.isSome(existingFinalTurnReceipt)) {
-          return yield* dispatchAlreadyCoordinated(orchestrationEngine, finalTurnStartCommand);
+          return yield* dispatchAlreadyCoordinated(
+            orchestrationEngine,
+            finalTurnStartCommand,
+            authority,
+          );
         }
+
+        const authorization = yield* authorizeBootstrapCommand();
+        bootstrap = authorization.authorizedCommand.bootstrap;
+        targetProjectId = bootstrap?.createThread?.projectId;
+        targetProjectCwd = bootstrap?.prepareWorktree?.projectCwd;
+        targetWorktreePath = bootstrap?.createThread?.worktreePath ?? null;
+        internalAuthority = audienceBoundSystemDispatchAuthority({
+          reason: "bootstrap-turn-start",
+          sourceThreadId: command.threadId,
+          dataAudience: authorization.targetAudience,
+        });
 
         if (bootstrap?.createThread) {
           yield* dispatchCreateThread(bootstrap.createThread);
@@ -686,21 +710,29 @@ export const layer = Layer.effect(
           // non-removable there because lifecycle teardown runs against the
           // project's repository and cannot safely remove a foreign checkout.
           const preparedWorktreeRemovable = bootstrap.createThread?.worktreeRemovable ?? true;
-          yield* dispatchAlreadyCoordinated(orchestrationEngine, {
-            type: "thread.meta.update",
-            commandId: yield* serverCommandId("bootstrap-thread-meta-update"),
-            threadId: command.threadId,
-            branch: worktree.worktree.refName,
-            worktreePath: targetWorktreePath,
-            worktreeRemovable: preparedWorktreeRemovable,
-            worktreeRemovalPath: preparedWorktreeRemovable ? worktree.worktree.path : null,
-          });
+          yield* dispatchAlreadyCoordinated(
+            orchestrationEngine,
+            {
+              type: "thread.meta.update",
+              commandId: yield* serverCommandId("bootstrap-thread-meta-update"),
+              threadId: command.threadId,
+              branch: worktree.worktree.refName,
+              worktreePath: targetWorktreePath,
+              worktreeRemovable: preparedWorktreeRemovable,
+              worktreeRemovalPath: preparedWorktreeRemovable ? worktree.worktree.path : null,
+            },
+            internalAuthority,
+          );
           yield* refreshGitStatus(targetWorktreePath);
         }
 
         yield* runSetupProgram();
 
-        return yield* dispatchAlreadyCoordinated(orchestrationEngine, finalTurnStartCommand);
+        return yield* dispatchAlreadyCoordinated(
+          orchestrationEngine,
+          finalTurnStartCommand,
+          authority,
+        );
       });
 
       const guardedBootstrapProgram = bootstrapProgram.pipe(
