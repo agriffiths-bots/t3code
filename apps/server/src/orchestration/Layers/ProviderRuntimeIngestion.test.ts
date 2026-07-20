@@ -47,7 +47,10 @@ import { PendingDispatchRepositoryLive } from "../../persistence/Layers/PendingD
 import { SqlitePersistenceMemory } from "../../persistence/Layers/Sqlite.ts";
 import * as SubagentDispatchLimiter from "../../mcp/toolkits/subagent/SubagentDispatchLimiter.ts";
 import { makeCodexAdapter } from "../../provider/Layers/CodexAdapter.ts";
+import type { ProviderAdapterError } from "../../provider/Errors.ts";
 import type { CodexAdapterShape } from "../../provider/Services/CodexAdapter.ts";
+import type { ProviderAdapterShape } from "../../provider/Services/ProviderAdapter.ts";
+import { ProviderAdapterRegistry } from "../../provider/Services/ProviderAdapterRegistry.ts";
 import { ProviderInstanceRegistry } from "../../provider/Services/ProviderInstanceRegistry.ts";
 import {
   ProviderSessionDirectory,
@@ -57,6 +60,14 @@ import {
   ProviderService,
   type ProviderServiceShape,
 } from "../../provider/Services/ProviderService.ts";
+import { makeProviderServiceLive } from "../../provider/Layers/ProviderService.ts";
+import { ProviderSessionDirectoryLive } from "../../provider/Layers/ProviderSessionDirectory.ts";
+import { makeProviderSessionReaperLive } from "../../provider/Layers/ProviderSessionReaper.ts";
+import * as ProviderEventLoggers from "../../provider/Layers/ProviderEventLoggers.ts";
+import { ProviderSessionReaper } from "../../provider/Services/ProviderSessionReaper.ts";
+import * as ProviderSessionRuntime from "../../persistence/ProviderSessionRuntime.ts";
+import * as AnalyticsService from "../../telemetry/AnalyticsService.ts";
+import { makeAdapterRegistryMock } from "../../provider/testUtils/providerAdapterRegistryMock.ts";
 import { captureProviderRuntimeEventBinding } from "../../provider/runtimeEventBindingRegistry.ts";
 import * as RepositoryIdentityResolver from "../../project/RepositoryIdentityResolver.ts";
 import { ChildThreadCoordinatorLive } from "./ChildThreadCoordinator.ts";
@@ -94,15 +105,6 @@ const decodeCodexSettings = Schema.decodeSync(CodexSettings);
 class RecordedCodexAdapter extends Context.Service<RecordedCodexAdapter, CodexAdapterShape>()(
   "t3/orchestration/Layers/ProviderRuntimeIngestion.test/RecordedCodexAdapter",
 ) {}
-
-const adapterProviderSessionDirectoryTestLayer = Layer.succeed(ProviderSessionDirectory, {
-  upsert: () => Effect.void,
-  getProvider: () =>
-    Effect.die(new Error("ProviderSessionDirectory.getProvider is not used in this test")),
-  getBinding: () => Effect.succeed(Option.none()),
-  listThreadIds: () => Effect.succeed([]),
-  listBindings: () => Effect.succeed([]),
-});
 
 type LegacyProviderRuntimeEvent = {
   readonly type: string;
@@ -362,7 +364,8 @@ describe("ProviderRuntimeIngestion", () => {
     unknown
   > | null = null;
   let scope: Scope.Closeable | null = null;
-  let adapterScope: Scope.Closeable | null = null;
+  let providerStackScope: Scope.Closeable | null = null;
+  let watchdogScope: Scope.Closeable | null = null;
   const tempDirs: string[] = [];
 
   function makeTempDir(prefix: string): string {
@@ -371,34 +374,86 @@ describe("ProviderRuntimeIngestion", () => {
     return dir;
   }
 
-  async function createRecordedCodexAdapter() {
+  async function createRecordedCodexStack(scenario: "success" | "empty" | "death" = "success") {
     const fixtureBinary = NodePath.join(
       NodePath.dirname(NodeURL.fileURLToPath(import.meta.url)),
       "../../provider/Layers/fixtures/replay-codex-app-server-turn.mjs",
     );
-    const layer = Layer.effect(
+    const sqliteLayer = SqlitePersistenceMemory;
+    const runtimeRepositoryLayer = ProviderSessionRuntime.layer.pipe(Layer.provide(sqliteLayer));
+    const directoryLayer = ProviderSessionDirectoryLive.pipe(Layer.provide(runtimeRepositoryLayer));
+    const serverSettingsLayer = ServerSettingsService.layerTest();
+    const serverConfigLayer = ServerConfig.layerTest(process.cwd(), process.cwd());
+    const adapterLayer = Layer.effect(
       RecordedCodexAdapter,
-      makeCodexAdapter(decodeCodexSettings({ binaryPath: fixtureBinary })),
+      makeCodexAdapter(decodeCodexSettings({ binaryPath: fixtureBinary }), {
+        environment: {
+          ...process.env,
+          T3_PROVIDER_E2E_SCENARIO: scenario,
+        },
+      }),
     ).pipe(
-      Layer.provideMerge(ServerConfig.layerTest(process.cwd(), process.cwd())),
-      Layer.provideMerge(ServerSettingsService.layerTest()),
-      Layer.provideMerge(adapterProviderSessionDirectoryTestLayer),
+      Layer.provideMerge(directoryLayer),
+      Layer.provideMerge(serverConfigLayer),
+      Layer.provideMerge(serverSettingsLayer),
       Layer.provideMerge(NodeServices.layer),
     );
-    adapterScope = await Effect.runPromise(Scope.make("sequential"));
-    const context = await Effect.runPromise(Layer.buildWithScope(layer, adapterScope));
-    return Effect.runPromise(Effect.service(RecordedCodexAdapter).pipe(Effect.provide(context)));
+    const adapterRegistryLayer = Layer.effect(
+      ProviderAdapterRegistry,
+      Effect.gen(function* () {
+        const adapter = yield* RecordedCodexAdapter;
+        return makeAdapterRegistryMock({
+          [ProviderDriverKind.make("codex")]: adapter as ProviderAdapterShape<ProviderAdapterError>,
+        });
+      }),
+    ).pipe(Layer.provide(adapterLayer));
+    const providerServiceLayer = makeProviderServiceLive().pipe(
+      Layer.provide(adapterRegistryLayer),
+      Layer.provide(directoryLayer),
+      Layer.provide(serverSettingsLayer),
+      Layer.provideMerge(AnalyticsService.layerTest),
+      Layer.provide(
+        Layer.succeed(
+          ProviderEventLoggers.ProviderEventLoggers,
+          ProviderEventLoggers.NoOpProviderEventLoggers,
+        ),
+      ),
+    );
+    const layer = Layer.mergeAll(
+      adapterLayer,
+      providerServiceLayer,
+      directoryLayer,
+      runtimeRepositoryLayer,
+    ).pipe(
+      Layer.provideMerge(sqliteLayer),
+      Layer.provideMerge(serverConfigLayer),
+      Layer.provideMerge(serverSettingsLayer),
+      Layer.provideMerge(NodeServices.layer),
+    );
+    providerStackScope = await Effect.runPromise(Scope.make("sequential"));
+    const context = await Effect.runPromise(Layer.buildWithScope(layer, providerStackScope));
+    return Effect.runPromise(
+      Effect.all({
+        adapter: Effect.service(RecordedCodexAdapter),
+        providerService: Effect.service(ProviderService),
+        directory: Effect.service(ProviderSessionDirectory),
+      }).pipe(Effect.provide(context)),
+    );
   }
 
   afterEach(async () => {
+    if (watchdogScope) {
+      await Effect.runPromise(Scope.close(watchdogScope, Exit.void));
+    }
+    watchdogScope = null;
     if (scope) {
       await Effect.runPromise(Scope.close(scope, Exit.void));
     }
     scope = null;
-    if (adapterScope) {
-      await Effect.runPromise(Scope.close(adapterScope, Exit.void));
+    if (providerStackScope) {
+      await Effect.runPromise(Scope.close(providerStackScope, Exit.void));
     }
-    adapterScope = null;
+    providerStackScope = null;
     if (runtime) {
       await runtime.dispose();
     }
@@ -412,6 +467,7 @@ describe("ProviderRuntimeIngestion", () => {
     serverSettings?: Partial<ServerSettings>;
     provider?: ProviderDriverKind;
     providerAdapter?: CodexAdapterShape;
+    providerService?: ProviderServiceShape;
   }) {
     const workspaceRoot = makeTempDir("t3-provider-project-");
     NodeFS.mkdirSync(NodePath.join(workspaceRoot, ".git"));
@@ -454,7 +510,9 @@ describe("ProviderRuntimeIngestion", () => {
       Layer.provideMerge(orchestrationLayer),
       Layer.provideMerge(projectionSnapshotLayer),
       Layer.provideMerge(SqlitePersistenceMemory),
-      Layer.provideMerge(Layer.succeed(ProviderService, provider.service)),
+      Layer.provideMerge(
+        Layer.succeed(ProviderService, options?.providerService ?? provider.service),
+      ),
       Layer.provideMerge(providerInstanceRegistryLayer),
       Layer.provideMerge(SubagentDispatchLimiter.layerTest(1)),
       Layer.provideMerge(makeTestServerSettingsLayer(options?.serverSettings)),
@@ -470,6 +528,7 @@ describe("ProviderRuntimeIngestion", () => {
       Effect.service(ProviderRuntimeIngestionService),
     );
     const coordinator = await managedRuntime.runPromise(Effect.service(ChildThreadCoordinator));
+    const sqlClient = await managedRuntime.runPromise(Effect.service(SqlClient));
     scope = await Effect.runPromise(Scope.make("sequential"));
     await Effect.runPromise(coordinator.start().pipe(Scope.provide(scope)));
     await Effect.runPromise(ingestion.start().pipe(Scope.provide(scope)));
@@ -548,6 +607,8 @@ describe("ProviderRuntimeIngestion", () => {
 
     return {
       engine,
+      snapshotQuery,
+      sqlClient,
       workspaceRoot,
       readModel: () => readDetailedReadModel(snapshotQuery),
       readEvents: (fromSequence: number) =>
@@ -625,6 +686,29 @@ describe("ProviderRuntimeIngestion", () => {
         ),
       drain,
     };
+  }
+
+  async function startProviderWatchdog(
+    harness: Awaited<ReturnType<typeof createHarness>>,
+    stack: Awaited<ReturnType<typeof createRecordedCodexStack>>,
+  ) {
+    if (!runtime) throw new Error("Provider runtime ingestion harness is not initialized.");
+    const layer = makeProviderSessionReaperLive({
+      sweepIntervalMs: 10,
+      stopTimeoutMs: 1_000,
+    }).pipe(
+      Layer.provideMerge(Layer.succeed(ProviderService, stack.providerService)),
+      Layer.provideMerge(Layer.succeed(ProviderSessionDirectory, stack.directory)),
+      Layer.provideMerge(Layer.succeed(ProjectionSnapshotQuery, harness.snapshotQuery)),
+      Layer.provideMerge(Layer.succeed(OrchestrationEngineService, harness.engine)),
+      Layer.provideMerge(Layer.succeed(SqlClient, harness.sqlClient)),
+    );
+    watchdogScope = await Effect.runPromise(Scope.make("sequential"));
+    const context = await Effect.runPromise(Layer.buildWithScope(layer, watchdogScope));
+    const reaper = await Effect.runPromise(
+      Effect.service(ProviderSessionReaper).pipe(Effect.provide(context)),
+    );
+    await Effect.runPromise(reaper.start().pipe(Scope.provide(watchdogScope)));
   }
 
   it("drops an unbound runtime event and increments the no-binding counter", async () => {
@@ -1269,8 +1353,8 @@ describe("ProviderRuntimeIngestion", () => {
   });
 
   xit("replays a live Codex PONG stream through projection and releases the child lease", async () => {
-    const adapter = await createRecordedCodexAdapter();
-    const harness = await createHarness({ providerAdapter: adapter });
+    const stack = await createRecordedCodexStack();
+    const harness = await createHarness({ providerService: stack.providerService });
     const childThreadId = asThreadId("thread-1");
     const parentThreadId = asThreadId("recorded-codex-parent");
     const providerTurnId = asTurnId("019f682e-41b8-7a13-9074-e6404b1747b0");
@@ -1311,12 +1395,23 @@ describe("ProviderRuntimeIngestion", () => {
     ]);
     expect(await harness.leasedChildThreadIds()).toEqual([childThreadId]);
 
+    const runtimeEventsPromise = Effect.runPromise(
+      stack.providerService.streamEvents.pipe(
+        Stream.filter((event) => event.threadId === childThreadId),
+        Stream.takeUntil((event) => event.type === "turn.completed"),
+        Stream.runCollect,
+        Effect.map((events) => Array.from(events)),
+      ),
+    );
+    await Effect.runPromise(Effect.yieldNow);
+
     // Each runPromise is a short-lived caller, matching ProviderCommandReactor's
     // per-event fiber. The adapter must keep forwarding events after startSession
     // returns and that caller exits.
     await Effect.runPromise(
-      adapter.startSession({
+      stack.providerService.startSession(childThreadId, {
         provider: ProviderDriverKind.make("codex"),
+        providerInstanceId: harness.modelSelection.instanceId,
         threadId: childThreadId,
         cwd: harness.workspaceRoot,
         modelSelection: harness.modelSelection,
@@ -1324,13 +1419,14 @@ describe("ProviderRuntimeIngestion", () => {
       }),
     );
     await Effect.runPromise(
-      adapter.sendTurn({
+      stack.providerService.sendTurn({
         threadId: childThreadId,
         input: "Reply exactly PONG.",
         modelSelection: harness.modelSelection,
         attachments: [],
       }),
     );
+    const runtimeEvents = await runtimeEventsPromise;
 
     const completedThread = await waitForThread(
       harness.readModel,
@@ -1344,11 +1440,23 @@ describe("ProviderRuntimeIngestion", () => {
     );
     await harness.drain();
 
-    expect(completedThread.messages.some((message) => message.text === "PONG")).toBe(true);
+    expect(
+      runtimeEvents
+        .filter(
+          (event): event is Extract<ProviderRuntimeEvent, { type: "content.delta" }> =>
+            event.type === "content.delta" && event.payload.streamKind === "assistant_text",
+        )
+        .map((event) => event.payload.delta),
+    ).toEqual(["P", "ONG"]);
+    const assistantMessage = completedThread.messages.find(
+      (message) => message.role === "assistant" && message.text === "PONG",
+    );
+    expect(assistantMessage?.id).toEqual(expect.any(String));
+    expect(assistantMessage?.id).not.toBeNull();
     expect(await harness.readProjectedTurns(childThreadId)).toEqual([
       { turnId: providerTurnId, state: "completed" },
     ]);
-    expect(await Effect.runPromise(adapter.listSessions())).toEqual([
+    expect(await Effect.runPromise(stack.providerService.listSessions())).toEqual([
       expect.objectContaining({
         threadId: childThreadId,
         status: "ready",
@@ -1373,6 +1481,161 @@ describe("ProviderRuntimeIngestion", () => {
       },
     ]);
     expect(await harness.leasedChildThreadIds()).toEqual([]);
+  });
+
+  it("fails a recorded Codex turn explicitly when the assistant response is empty", async () => {
+    const stack = await createRecordedCodexStack("empty");
+    const harness = await createHarness({ providerService: stack.providerService });
+    const threadId = asThreadId("thread-1");
+    const providerTurnId = asTurnId("019f682e-41b8-7a13-9074-e6404b1747b0");
+    const createdAt = "2026-01-01T00:00:01.000Z";
+
+    await Effect.runPromise(
+      harness.engine.dispatch(
+        {
+          type: "thread.turn.start",
+          commandId: CommandId.make("cmd-recorded-codex-empty-turn"),
+          threadId,
+          message: {
+            messageId: asMessageId("message-recorded-codex-empty-turn"),
+            role: "user",
+            text: "Reply exactly PONG.",
+            attachments: [],
+          },
+          interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+          runtimeMode: "approval-required",
+          createdAt,
+        },
+        testDispatchAuthority,
+      ),
+    );
+    await Effect.runPromise(
+      stack.providerService.startSession(threadId, {
+        provider: ProviderDriverKind.make("codex"),
+        providerInstanceId: harness.modelSelection.instanceId,
+        threadId,
+        cwd: harness.workspaceRoot,
+        modelSelection: harness.modelSelection,
+        runtimeMode: "approval-required",
+      }),
+    );
+    await Effect.runPromise(
+      stack.providerService.sendTurn({
+        threadId,
+        input: "Reply exactly PONG.",
+        modelSelection: harness.modelSelection,
+        attachments: [],
+      }),
+    );
+
+    const failedThread = await waitForThread(
+      harness.readModel,
+      (thread) =>
+        thread.latestTurn?.turnId === providerTurnId &&
+        thread.latestTurn.state === "error" &&
+        thread.session?.status === "error" &&
+        thread.session.activeTurnId === null,
+      5_000,
+      threadId,
+    );
+    await harness.drain();
+
+    expect(failedThread.session?.lastError).toBe(
+      "Provider completed the turn without emitting an assistant response.",
+    );
+    expect(failedThread.messages.filter((message) => message.role === "assistant")).toEqual([]);
+    expect(await harness.readProjectedTurns(threadId)).toEqual([
+      { turnId: providerTurnId, state: "error" },
+    ]);
+  });
+
+  it("lets the watchdog fail a recorded Codex turn after process death loses its terminal event", async () => {
+    const stack = await createRecordedCodexStack("death");
+    const providerServiceWithoutTerminalEvents: ProviderServiceShape = {
+      ...stack.providerService,
+      streamEvents: stack.providerService.streamEvents.pipe(
+        Stream.filter((event) => event.type !== "session.exited"),
+      ),
+    };
+    const harness = await createHarness({
+      providerService: providerServiceWithoutTerminalEvents,
+    });
+    const threadId = asThreadId("thread-1");
+    const providerTurnId = asTurnId("019f682e-41b8-7a13-9074-e6404b1747b0");
+    const createdAt = "2026-01-01T00:00:01.000Z";
+
+    await Effect.runPromise(
+      harness.engine.dispatch(
+        {
+          type: "thread.turn.start",
+          commandId: CommandId.make("cmd-recorded-codex-process-death"),
+          threadId,
+          message: {
+            messageId: asMessageId("message-recorded-codex-process-death"),
+            role: "user",
+            text: "Reply exactly PONG.",
+            attachments: [],
+          },
+          interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+          runtimeMode: "approval-required",
+          createdAt,
+        },
+        testDispatchAuthority,
+      ),
+    );
+    await Effect.runPromise(
+      stack.providerService.startSession(threadId, {
+        provider: ProviderDriverKind.make("codex"),
+        providerInstanceId: harness.modelSelection.instanceId,
+        threadId,
+        cwd: harness.workspaceRoot,
+        modelSelection: harness.modelSelection,
+        runtimeMode: "approval-required",
+      }),
+    );
+    await Effect.runPromise(
+      stack.providerService.sendTurn({
+        threadId,
+        input: "Reply exactly PONG.",
+        modelSelection: harness.modelSelection,
+        attachments: [],
+      }),
+    );
+
+    await waitForThread(
+      harness.readModel,
+      (thread) =>
+        thread.latestTurn?.turnId === providerTurnId &&
+        thread.latestTurn.state === "running" &&
+        thread.session?.activeTurnId === providerTurnId,
+      5_000,
+      threadId,
+    );
+    await startProviderWatchdog(harness, stack);
+    const failedThread = await waitForThread(
+      harness.readModel,
+      (thread) =>
+        thread.latestTurn?.turnId === providerTurnId &&
+        thread.latestTurn.state === "error" &&
+        thread.session?.status === "stopped" &&
+        thread.session.activeTurnId === null,
+      5_000,
+      threadId,
+    );
+    await harness.drain();
+
+    expect(failedThread.session?.lastError).toContain("Provider session disappeared while turn");
+    const binding = Option.getOrThrow(
+      await Effect.runPromise(stack.directory.getBinding(threadId)),
+    );
+    expect(binding.runtimePayload).toMatchObject({
+      activeTurnId: null,
+      lastTerminalTurnId: providerTurnId,
+      lastRuntimeEvent: "provider.turn.watchdog.failed",
+    });
+    expect(await harness.readProjectedTurns(threadId)).toEqual([
+      { turnId: providerTurnId, state: "error" },
+    ]);
   });
 
   xit.each(["codex", "grok", "claudeAgent"] as const)(

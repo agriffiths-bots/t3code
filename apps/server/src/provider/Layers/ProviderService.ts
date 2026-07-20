@@ -365,6 +365,9 @@ const isTerminalTurnRuntimeEvent = (event: ProviderRuntimeEvent): boolean =>
 const isStartedTurnRuntimeEvent = (event: ProviderRuntimeEvent): boolean =>
   event.type === "turn.started";
 
+const EMPTY_ASSISTANT_RESPONSE_ERROR =
+  "Provider completed the turn without emitting an assistant response.";
+
 interface AdapterGenerationRecord {
   readonly currentAdapter: ProviderAdapterShape<ProviderAdapterError>;
   readonly currentGeneration: number;
@@ -389,6 +392,119 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
   const registry = yield* ProviderAdapterRegistry.ProviderAdapterRegistry;
   const directory = yield* ProviderSessionDirectory.ProviderSessionDirectory;
   const runtimeEventPubSub = yield* PubSub.unbounded<ProviderRuntimeEvent>();
+  const turnsWithAssistantOutputByAdapter = new WeakMap<
+    ProviderAdapterShape<ProviderAdapterError>,
+    Map<ProviderInstanceId, Map<ThreadId, Set<string>>>
+  >();
+
+  const clearTrackedSessionOutput = (
+    adapter: ProviderAdapterShape<ProviderAdapterError>,
+    instanceId: ProviderInstanceId,
+    threadId: ThreadId,
+  ) => {
+    const instances = turnsWithAssistantOutputByAdapter.get(adapter);
+    const sessions = instances?.get(instanceId);
+    if (sessions === undefined) return;
+    sessions.delete(threadId);
+    if (sessions.size === 0) instances?.delete(instanceId);
+    if (instances?.size === 0) turnsWithAssistantOutputByAdapter.delete(adapter);
+  };
+
+  const clearTrackedTurnOutput = (
+    adapter: ProviderAdapterShape<ProviderAdapterError>,
+    instanceId: ProviderInstanceId,
+    threadId: ThreadId,
+    turnId: TurnId | string,
+  ): boolean => {
+    const sessions = turnsWithAssistantOutputByAdapter.get(adapter)?.get(instanceId);
+    const turns = sessions?.get(threadId);
+    if (turns === undefined) return false;
+    const hadOutput = turns.delete(String(turnId));
+    if (turns.size === 0) clearTrackedSessionOutput(adapter, instanceId, threadId);
+    return hadOutput;
+  };
+
+  const guardEmptyAssistantResponse = (
+    source: {
+      readonly adapter: ProviderAdapterShape<ProviderAdapterError>;
+      readonly instanceId: ProviderInstanceId;
+    },
+    event: ProviderRuntimeEvent,
+  ): ProviderRuntimeEvent => {
+    const turnId = event.turnId;
+    if (event.type === "session.exited") {
+      clearTrackedSessionOutput(source.adapter, source.instanceId, event.threadId);
+      return event;
+    }
+    if (turnId === undefined) return event;
+
+    const payload =
+      "payload" in event && typeof event.payload === "object" && event.payload !== null
+        ? event.payload
+        : undefined;
+    if (event.type === "turn.started") {
+      // A provider session can run only one turn at a time. Reset the whole
+      // session bucket so a missing terminal event cannot leak output state
+      // into a later turn (or retain orphaned turn ids indefinitely).
+      clearTrackedSessionOutput(source.adapter, source.instanceId, event.threadId);
+      return event;
+    }
+    if (
+      (event.type === "content.delta" &&
+        payload !== undefined &&
+        "streamKind" in payload &&
+        payload.streamKind === "assistant_text" &&
+        "delta" in payload &&
+        typeof payload.delta === "string" &&
+        payload.delta.trim().length > 0) ||
+      (event.type === "item.completed" &&
+        payload !== undefined &&
+        "itemType" in payload &&
+        payload.itemType === "assistant_message" &&
+        "detail" in payload &&
+        typeof payload.detail === "string" &&
+        payload.detail.trim().length > 0)
+    ) {
+      const instances =
+        turnsWithAssistantOutputByAdapter.get(source.adapter) ??
+        new Map<ProviderInstanceId, Map<ThreadId, Set<string>>>();
+      const sessions = instances.get(source.instanceId) ?? new Map<ThreadId, Set<string>>();
+      const turns = sessions.get(event.threadId) ?? new Set<string>();
+      turns.add(String(turnId));
+      sessions.set(event.threadId, turns);
+      instances.set(source.instanceId, sessions);
+      turnsWithAssistantOutputByAdapter.set(source.adapter, instances);
+      return event;
+    }
+    if (event.type === "turn.aborted") {
+      clearTrackedTurnOutput(source.adapter, source.instanceId, event.threadId, turnId);
+      return event;
+    }
+    if (event.type !== "turn.completed") return event;
+
+    const hasAssistantOutput = clearTrackedTurnOutput(
+      source.adapter,
+      source.instanceId,
+      event.threadId,
+      turnId,
+    );
+    if (
+      payload === undefined ||
+      !("state" in payload) ||
+      payload.state !== "completed" ||
+      hasAssistantOutput
+    ) {
+      return event;
+    }
+    return {
+      ...event,
+      payload: {
+        ...event.payload,
+        state: "failed",
+        errorMessage: EMPTY_ASSISTANT_RESPONSE_ERROR,
+      },
+    };
+  };
   const nowIso = Effect.map(DateTime.now, DateTime.formatIso);
   const mcpEndCleanupRetryDelay = "250 millis";
   const sessionExitLivenessPollDelay = "50 millis";
@@ -1594,37 +1710,38 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
           ),
         );
         if (!sessionStateAccepted) return;
-        yield* persistStartedTurnRuntimeState(source, canonicalEvent).pipe(
+        const acceptedEvent = guardEmptyAssistantResponse(source, canonicalEvent);
+        yield* persistStartedTurnRuntimeState(source, acceptedEvent).pipe(
           Effect.catchCause((cause) =>
             Effect.logWarning("provider.session.turn-start-persist-failed", {
-              threadId: canonicalEvent.threadId,
-              provider: canonicalEvent.provider,
+              threadId: acceptedEvent.threadId,
+              provider: acceptedEvent.provider,
               cause,
             }),
           ),
         );
-        yield* persistTerminalTurnRuntimeState(source, canonicalEvent).pipe(
+        yield* persistTerminalTurnRuntimeState(source, acceptedEvent).pipe(
           Effect.catchCause((cause) =>
             Effect.logWarning("provider.session.terminal-turn-persist-failed", {
-              threadId: canonicalEvent.threadId,
-              provider: canonicalEvent.provider,
+              threadId: acceptedEvent.threadId,
+              provider: acceptedEvent.provider,
               cause,
             }),
           ),
         );
         yield* increment(providerRuntimeEventsTotal, {
-          provider: canonicalEvent.provider,
-          eventType: canonicalEvent.type,
+          provider: acceptedEvent.provider,
+          eventType: acceptedEvent.type,
         });
         if (sessionEndContext !== undefined) {
-          yield* clearMcpSessionAfterProviderSessionEnds(source, canonicalEvent, {
+          yield* clearMcpSessionAfterProviderSessionEnds(source, acceptedEvent, {
             ...(sessionEndContext.providerSessionId !== undefined
               ? { providerSessionId: sessionEndContext.providerSessionId }
               : {}),
             duringPendingStart: sessionEndContext.duringPendingStart,
           }).pipe(Effect.forkDetach, Effect.asVoid);
         }
-        yield* publishRuntimeEvent(canonicalEvent, binding);
+        yield* publishRuntimeEvent(acceptedEvent, binding);
       });
 
       const mustOrderAgainstSendFailure =
