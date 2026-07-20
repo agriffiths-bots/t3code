@@ -188,6 +188,160 @@ it.layer(grokAdapterTestLayer)("GrokAdapterLive", (it) => {
     }),
   );
 
+  it.effect("fails loudly when an undecodable update is the only Grok output", () =>
+    Effect.gen(function* () {
+      const threadId = ThreadId.make("grok-undecodable-only-output");
+      const wrapperPath = yield* Effect.promise(() =>
+        makeMockGrokWrapper({
+          T3_ACP_EMIT_UNDECODABLE_SESSION_UPDATE: "1",
+          T3_ACP_EMIT_EMPTY_TURN: "1",
+        }),
+      );
+      const adapter = yield* makeTestAdapter(wrapperPath);
+      const turnCompleted =
+        yield* Deferred.make<Extract<ProviderRuntimeEvent, { type: "turn.completed" }>>();
+      const runtimeEventsFiber = yield* Stream.runForEach(adapter.streamEvents, (event) =>
+        event.type === "turn.completed" && String(event.threadId) === String(threadId)
+          ? Deferred.succeed(turnCompleted, event).pipe(Effect.asVoid)
+          : Effect.void,
+      ).pipe(Effect.forkChild);
+
+      yield* adapter.startSession({
+        threadId,
+        provider: ProviderDriverKind.make("grok"),
+        cwd: process.cwd(),
+        runtimeMode: "full-access",
+      });
+
+      yield* adapter.sendTurn({
+        threadId,
+        input: "emit only a future update variant",
+        attachments: [],
+      });
+      const completed = yield* Deferred.await(turnCompleted).pipe(Effect.timeout("2 seconds"));
+
+      assert.equal(completed.payload.state, "failed");
+      assert.equal(completed.payload.stopReason, "end_turn");
+      assert.ok(completed.payload.errorMessage);
+
+      yield* Fiber.interrupt(runtimeEventsFiber);
+      yield* adapter.stopSession(threadId);
+    }),
+  );
+
+  it.effect("waits for detached late Grok output before classifying the turn as empty", () =>
+    Effect.gen(function* () {
+      const threadId = ThreadId.make("grok-late-only-output-completes");
+      const wrapperPath = yield* Effect.promise(() =>
+        makeMockGrokWrapper({
+          T3_ACP_EMIT_EMPTY_TURN: "1",
+          T3_ACP_EMIT_DETACHED_LATE_UPDATE_AFTER_PROMPT_RETURN: "1",
+          T3_ACP_DETACHED_LATE_UPDATE_AFTER_PROMPT_RETURN_DELAY_MS: "100",
+        }),
+      );
+      const adapter = yield* makeTestAdapter(wrapperPath);
+      const runtimeEvents: ProviderRuntimeEvent[] = [];
+      const turnCompleted =
+        yield* Deferred.make<Extract<ProviderRuntimeEvent, { type: "turn.completed" }>>();
+      const runtimeEventsFiber = yield* Stream.runForEach(adapter.streamEvents, (event) =>
+        Effect.sync(() => {
+          if (String(event.threadId) !== String(threadId)) {
+            return;
+          }
+          runtimeEvents.push(event);
+        }).pipe(
+          Effect.andThen(
+            event.type === "turn.completed" && String(event.threadId) === String(threadId)
+              ? Deferred.succeed(turnCompleted, event).pipe(Effect.asVoid)
+              : Effect.void,
+          ),
+        ),
+      ).pipe(Effect.forkChild);
+
+      yield* adapter.startSession({
+        threadId,
+        provider: ProviderDriverKind.make("grok"),
+        cwd: process.cwd(),
+        runtimeMode: "full-access",
+      });
+
+      yield* adapter.sendTurn({
+        threadId,
+        input: "return the Grok answer just after the prompt response",
+        attachments: [],
+      });
+      const completed = yield* Deferred.await(turnCompleted).pipe(Effect.timeout("2 seconds"));
+      const lateDeltaIndex = runtimeEvents.findIndex(
+        (event) =>
+          event.type === "content.delta" &&
+          event.payload.delta === "detached late after completion",
+      );
+      const completionIndex = runtimeEvents.findIndex((event) => event.type === "turn.completed");
+
+      assert.equal(completed.payload.state, "completed");
+      assert.isAtLeast(lateDeltaIndex, 0);
+      assert.isAbove(completionIndex, lateDeltaIndex);
+
+      yield* Fiber.interrupt(runtimeEventsFiber);
+      yield* adapter.stopSession(threadId);
+    }),
+  );
+
+  it.effect("honors an interrupt pre-marked during the Grok late-output grace", () =>
+    Effect.gen(function* () {
+      const threadId = ThreadId.make("grok-interrupt-during-late-output-grace");
+      const wrapperPath = yield* Effect.promise(() =>
+        makeMockGrokWrapper({
+          T3_ACP_EMIT_EMPTY_TURN: "1",
+          T3_ACP_EMIT_DETACHED_LATE_UPDATE_AFTER_PROMPT_RETURN: "1",
+          T3_ACP_DETACHED_LATE_UPDATE_AFTER_PROMPT_RETURN_DELAY_MS: "150",
+        }),
+      );
+      const adapter = yield* makeTestAdapter(wrapperPath);
+      const turnStarted = yield* Deferred.make<TurnId>();
+      const turnCompleted =
+        yield* Deferred.make<Extract<ProviderRuntimeEvent, { type: "turn.completed" }>>();
+      const terminalEvents: Array<Extract<ProviderRuntimeEvent, { type: "turn.completed" }>> = [];
+      const runtimeEventsFiber = yield* Stream.runForEach(adapter.streamEvents, (event) =>
+        Effect.gen(function* () {
+          if (String(event.threadId) !== String(threadId)) {
+            return;
+          }
+          if (event.type === "turn.started" && event.turnId !== undefined) {
+            yield* Deferred.succeed(turnStarted, event.turnId).pipe(Effect.ignore);
+            return;
+          }
+          if (event.type === "turn.completed") {
+            terminalEvents.push(event);
+            yield* Deferred.succeed(turnCompleted, event).pipe(Effect.ignore);
+          }
+        }),
+      ).pipe(Effect.forkChild);
+
+      yield* adapter.startSession({
+        threadId,
+        provider: ProviderDriverKind.make("grok"),
+        cwd: process.cwd(),
+        runtimeMode: "full-access",
+      });
+
+      const sendTurnFiber = yield* adapter
+        .sendTurn({ threadId, input: "interrupt during Grok grace", attachments: [] })
+        .pipe(Effect.forkChild);
+      const turnId = yield* Deferred.await(turnStarted).pipe(Effect.timeout("2 seconds"));
+      yield* Effect.sleep("50 millis");
+      yield* adapter.interruptTurn(threadId, turnId).pipe(Effect.timeout("2 seconds"));
+      yield* Fiber.join(sendTurnFiber).pipe(Effect.timeout("2 seconds"));
+      const completed = yield* Deferred.await(turnCompleted).pipe(Effect.timeout("2 seconds"));
+
+      assert.equal(completed.payload.state, "cancelled");
+      assert.lengthOf(terminalEvents, 1);
+
+      yield* Fiber.interrupt(runtimeEventsFiber);
+      yield* adapter.stopSession(threadId);
+    }).pipe(TestClock.withLive),
+  );
+
   it.effect("closes the ACP child process when a session stops", () =>
     Effect.gen(function* () {
       const threadId = ThreadId.make("grok-stop-session-close");

@@ -15,6 +15,10 @@ import type * as AcpSchema from "effect-acp/schema";
 const requestLogPath = process.env.T3_ACP_REQUEST_LOG_PATH;
 const exitLogPath = process.env.T3_ACP_EXIT_LOG_PATH;
 const emitToolCalls = process.env.T3_ACP_EMIT_TOOL_CALLS === "1";
+const emitEmptyTurn = process.env.T3_ACP_EMIT_EMPTY_TURN === "1";
+const emitUndecodableSessionUpdate = process.env.T3_ACP_EMIT_UNDECODABLE_SESSION_UPDATE === "1";
+const emitCoalescedThoughtMessageBuffer =
+  process.env.T3_ACP_EMIT_COALESCED_THOUGHT_MESSAGE_BUFFER === "1";
 const emitInterleavedAssistantToolCalls =
   process.env.T3_ACP_EMIT_INTERLEAVED_ASSISTANT_TOOL_CALLS === "1";
 const emitGenericToolPlaceholders = process.env.T3_ACP_EMIT_GENERIC_TOOL_PLACEHOLDERS === "1";
@@ -670,6 +674,74 @@ const program = Effect.gen(function* () {
         return yield* AcpError.AcpRequestError.internalError("Mock prompt failure");
       }
 
+      const scheduleDetachedLateUpdateAfterPromptReturn = Effect.forkIn(
+        Effect.gen(function* () {
+          yield* Effect.sleep(`${detachedLateUpdateAfterPromptReturnDelayMs} millis`);
+          writeJsonRpcNotification("session/update", {
+            sessionId: requestedSessionId,
+            update: {
+              sessionUpdate: "agent_message_chunk",
+              content: { type: "text", text: "detached late after completion" },
+            },
+          });
+        }),
+        programScope,
+      ).pipe(Effect.asVoid);
+
+      if (emitUndecodableSessionUpdate) {
+        writeJsonRpcNotification("session/update", {
+          sessionId: requestedSessionId,
+          update: {
+            sessionUpdate: "future_agent_message_chunk",
+            content: { type: "text", text: "must never be logged" },
+          },
+        });
+      }
+
+      if (emitEmptyTurn) {
+        if (emitDetachedLateUpdateAfterPromptReturn) {
+          yield* scheduleDetachedLateUpdateAfterPromptReturn;
+        }
+        return { stopReason: "end_turn" };
+      }
+
+      if (emitCoalescedThoughtMessageBuffer) {
+        // Write the whole turn's notifications as one stdout buffer so the
+        // client decodes them from a single read, mirroring a fast provider
+        // flushing reasoning and answer chunks together.
+        const notifications: Array<{ jsonrpc: "2.0"; method: string; params: unknown }> = [];
+        for (let index = 0; index < 6; index++) {
+          notifications.push({
+            jsonrpc: "2.0",
+            method: "session/update",
+            params: {
+              sessionId: requestedSessionId,
+              update: {
+                sessionUpdate: "agent_thought_chunk",
+                content: { type: "text", text: `secret thought ${index}` },
+              },
+            },
+          });
+        }
+        for (let index = 0; index < 6; index++) {
+          notifications.push({
+            jsonrpc: "2.0",
+            method: "session/update",
+            params: {
+              sessionId: requestedSessionId,
+              update: {
+                sessionUpdate: "agent_message_chunk",
+                content: { type: "text", text: `answer ${index} ` },
+              },
+            },
+          });
+        }
+        process.stdout.write(
+          notifications.map((notification) => `${JSON.stringify(notification)}\n`).join(""),
+        );
+        return { stopReason: "end_turn" };
+      }
+
       if (exitAfterPromptReturn) {
         yield* Effect.forkIn(
           Effect.sleep("5 millis").pipe(Effect.andThen(Effect.sync(() => process.exit(0)))),
@@ -1090,19 +1162,7 @@ const program = Effect.gen(function* () {
       });
 
       if (emitDetachedLateUpdateAfterPromptReturn) {
-        yield* Effect.forkIn(
-          Effect.gen(function* () {
-            yield* Effect.sleep(`${detachedLateUpdateAfterPromptReturnDelayMs} millis`);
-            writeJsonRpcNotification("session/update", {
-              sessionId: requestedSessionId,
-              update: {
-                sessionUpdate: "agent_message_chunk",
-                content: { type: "text", text: "detached late after completion" },
-              },
-            });
-          }),
-          programScope,
-        );
+        yield* scheduleDetachedLateUpdateAfterPromptReturn;
       }
 
       return { stopReason: "end_turn" };

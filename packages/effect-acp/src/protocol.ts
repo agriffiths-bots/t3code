@@ -243,6 +243,37 @@ export const makeAcpPatchedProtocol = Effect.fn("makeAcpPatchedProtocol")(functi
       },
     });
 
+  // A notification whose payload fails schema decoding must never terminate
+  // the transport or abort the remaining messages decoded from the same
+  // buffer: agents ship new session/update variants ahead of this client, and
+  // a prompt response following the poison message still has to be routed.
+  const dropUndecodableNotification = (error: AcpError.AcpProtocolParseError) =>
+    logProtocol({
+      direction: "incoming",
+      stage: "decode_failed",
+      payload: {
+        operation: error.operation,
+        ...(error.method === undefined ? {} : { method: error.method }),
+        ...(error.issueCount === undefined ? {} : { issueCount: error.issueCount }),
+        ...(error.issueKinds === undefined ? {} : { issueKinds: error.issueKinds }),
+        ...(error.maximumPathDepth === undefined
+          ? {}
+          : { maximumPathDepth: error.maximumPathDepth }),
+      },
+    }).pipe(
+      // Never log the error object itself: its schema cause embeds the
+      // rejected notification values.
+      Effect.andThen(
+        Effect.logWarning("Dropped ACP notification with undecodable payload.").pipe(
+          Effect.annotateLogs({
+            operation: error.operation,
+            ...(error.method === undefined ? {} : { method: error.method }),
+            ...(error.issueCount === undefined ? {} : { issueCount: error.issueCount }),
+          }),
+        ),
+      ),
+    );
+
   const handleExtRequest = (message: RpcMessage.RequestEncoded) => {
     if (!options.onExtRequest) {
       return respondWithError(message.id, AcpError.AcpRequestError.methodNotFound(message.tag));
@@ -279,6 +310,7 @@ export const makeAcpPatchedProtocol = Effect.fn("makeAcpPatchedProtocol")(functi
             ),
           ),
           Effect.flatMap(dispatchNotification),
+          Effect.catchTag("AcpProtocolParseError", dropUndecodableNotification),
         );
       }
       if (message.tag === CLIENT_METHODS.session_elicitation_complete) {
@@ -299,6 +331,7 @@ export const makeAcpPatchedProtocol = Effect.fn("makeAcpPatchedProtocol")(functi
             ),
           ),
           Effect.flatMap(dispatchNotification),
+          Effect.catchTag("AcpProtocolParseError", dropUndecodableNotification),
         );
       }
       return dispatchNotification({
