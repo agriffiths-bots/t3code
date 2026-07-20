@@ -286,6 +286,7 @@ const RPC_REQUIRED_SCOPE = new Map<string, AuthEnvironmentScope>([
   [ORCHESTRATION_WS_METHODS.subscribeScheduledTasks, AuthOrchestrationReadScope],
   [ORCHESTRATION_WS_METHODS.setScheduledTaskEnabled, AuthOrchestrationOperateScope],
   [ORCHESTRATION_WS_METHODS.deleteScheduledTask, AuthOrchestrationOperateScope],
+  [WS_METHODS.serverProbe, AuthOrchestrationReadScope],
   [WS_METHODS.serverGetConfig, AuthOrchestrationReadScope],
   [WS_METHODS.serverRefreshProviders, AuthOrchestrationOperateScope],
   [WS_METHODS.serverUpdateProvider, AuthOrchestrationOperateScope],
@@ -1404,6 +1405,10 @@ const makeWsRpcLayer = (currentSession: EnvironmentAuth.AuthenticatedSession) =>
             ),
             { "rpc.aggregate": "orchestration" },
           ),
+        [WS_METHODS.serverProbe]: (_input) =>
+          observeRpcEffect(WS_METHODS.serverProbe, Effect.succeed({}), {
+            "rpc.aggregate": "server",
+          }),
         [WS_METHODS.serverGetConfig]: (_input) =>
           observeRpcEffect(WS_METHODS.serverGetConfig, loadServerConfig, {
             "rpc.aggregate": "server",
