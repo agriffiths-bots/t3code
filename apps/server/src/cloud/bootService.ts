@@ -30,6 +30,7 @@ const BOOT_SERVICE_NAME = "t3code";
 const BOOT_RUNTIME_DIR = "runtime";
 
 const BOOT_SERVICE_UNIT_FILE = `${BOOT_SERVICE_NAME}.service`;
+const BOOT_SERVICE_UNIT_MARKER = "Description=T3 Code server (T3 Connect)";
 const PINNED_RUNTIME_INSTALL_TIMEOUT = Duration.minutes(10);
 
 const EPHEMERAL_CACHE_SEGMENTS = [
@@ -92,7 +93,7 @@ export function renderBootServiceUnit(plan: BootServicePlan): string {
   // relay connection, and Restart=always covers early-boot failures.
   return [
     "[Unit]",
-    "Description=T3 Code server (T3 Connect)",
+    BOOT_SERVICE_UNIT_MARKER,
     // Give up after 5 crashes in 5 minutes so a persistently broken install
     // (deleted runtime, broken workspace) stops instead of restarting every
     // 5s forever and growing the unrotated append log without bound.
@@ -150,10 +151,20 @@ export class BootServiceInstallError extends Schema.TaggedErrorClass<BootService
   }
 }
 
+export class BootServiceOwnershipError extends Schema.TaggedErrorClass<BootServiceOwnershipError>()(
+  "BootServiceOwnershipError",
+  { unitPath: Schema.String },
+) {
+  override get message(): string {
+    return `Refusing to remove '${this.unitPath}' because it is not a T3 Connect background service.`;
+  }
+}
+
 export type BootServiceError =
   | BootServiceUnsupportedError
   | BootServiceCommandError
-  | BootServiceInstallError;
+  | BootServiceInstallError
+  | BootServiceOwnershipError;
 
 export interface BootServiceStatus {
   readonly supported: boolean;
@@ -406,6 +417,13 @@ export const make = Effect.fn("cloud.boot_service.make")(function* (input: {
       .pipe(Effect.mapError((cause) => new BootServiceInstallError({ cause })));
     if (!exists) {
       return false;
+    }
+    const unit = yield* fs
+      .readFileString(unitPath)
+      .pipe(Effect.mapError((cause) => new BootServiceInstallError({ cause })));
+    const isT3ConnectUnit = unit.split(/\r?\n/u).includes(BOOT_SERVICE_UNIT_MARKER);
+    if (!isT3ConnectUnit) {
+      return yield* new BootServiceOwnershipError({ unitPath });
     }
     yield* runStep("stopping the service", "systemctl", [
       "--user",
