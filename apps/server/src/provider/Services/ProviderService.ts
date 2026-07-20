@@ -32,6 +32,10 @@ import type * as Stream from "effect/Stream";
 import type { ProviderServiceError } from "../Errors.ts";
 import type { ProviderAdapterCapabilities } from "./ProviderAdapter.ts";
 import type { ProviderInstanceRoutingInfo } from "./ProviderAdapterRegistry.ts";
+import type {
+  ProviderRuntimeBinding,
+  ProviderRuntimeBindingWithMetadata,
+} from "./ProviderSessionDirectory.ts";
 
 /**
  * ProviderServiceShape - Service API for provider session and turn orchestration.
@@ -79,6 +83,29 @@ export interface ProviderServiceShape {
   readonly stopSession: (
     input: ProviderStopSessionInput,
   ) => Effect.Effect<void, ProviderServiceError>;
+
+  /**
+   * Stop an inactive session only while the persisted binding is semantically
+   * equivalent to the metadata-bearing snapshot observed by the reaper.
+   * Implementations validate and stop under the per-thread session lock.
+   */
+  readonly stopInactiveSession?: (input: {
+    readonly threadId: ThreadId;
+    readonly expectedBinding: ProviderRuntimeBindingWithMetadata;
+  }) => Effect.Effect<boolean, ProviderServiceError>;
+
+  /**
+   * Publish a forced terminal outcome only while the exact stale terminal
+   * binding is still current. Both callbacks run under the per-thread session
+   * lock after the binding/turn fence succeeds.
+   */
+  readonly forceFailStaleSession?: <EOwned, ROwned, ESettled, RSettled>(input: {
+    readonly threadId: ThreadId;
+    readonly turnId: TurnId;
+    readonly expectedBinding: ProviderRuntimeBinding;
+    readonly onOwned: Effect.Effect<void, EOwned, ROwned>;
+    readonly onSettled: Effect.Effect<void, ESettled, RSettled>;
+  }) => Effect.Effect<boolean, ProviderServiceError | EOwned | ESettled, ROwned | RSettled>;
 
   /**
    * Stop a failed provider session only while its persisted binding still

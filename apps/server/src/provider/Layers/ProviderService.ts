@@ -287,6 +287,64 @@ function resumeCursorEquals(left: unknown, right: unknown): boolean {
   return leftJson !== undefined && leftJson === encodeStableJson(right);
 }
 
+function bindingMatchesSnapshot(
+  expected: ProviderSessionDirectory.ProviderRuntimeBinding,
+  latest: ProviderSessionDirectory.ProviderRuntimeBinding | undefined,
+): boolean {
+  if (latest === undefined) {
+    return false;
+  }
+  return (
+    latest.threadId === expected.threadId &&
+    latest.provider === expected.provider &&
+    latest.providerInstanceId === expected.providerInstanceId &&
+    latest.adapterKey === expected.adapterKey &&
+    latest.status === expected.status &&
+    latest.runtimeMode === expected.runtimeMode &&
+    resumeCursorEquals(latest.resumeCursor, expected.resumeCursor) &&
+    resumeCursorEquals(latest.runtimePayload, expected.runtimePayload)
+  );
+}
+
+function inactiveBindingMatchesSnapshot(
+  expected: ProviderSessionDirectory.ProviderRuntimeBindingWithMetadata,
+  latest: ProviderSessionDirectory.ProviderRuntimeBinding | undefined,
+): boolean {
+  if (
+    latest === undefined ||
+    !bindingMatchesSnapshot(expected, latest) ||
+    latest.status === "stopped" ||
+    readPersistedActiveTurnId(latest.runtimePayload) !== undefined
+  ) {
+    return false;
+  }
+  const latestLastSeenAt =
+    "lastSeenAt" in latest && typeof latest.lastSeenAt === "string" ? latest.lastSeenAt : undefined;
+  return latestLastSeenAt === expected.lastSeenAt;
+}
+
+function terminalBindingMatchesSnapshot(input: {
+  readonly expected: ProviderSessionDirectory.ProviderRuntimeBinding;
+  readonly latest: ProviderSessionDirectory.ProviderRuntimeBinding | undefined;
+  readonly turnId: TurnId;
+}): boolean {
+  if (
+    !bindingMatchesSnapshot(input.expected, input.latest) ||
+    (input.latest?.status !== "error" && input.latest?.status !== "stopped")
+  ) {
+    return false;
+  }
+  const runtimePayload = readRecord(input.latest.runtimePayload) ?? {};
+  const activeTurnId = runtimePayload.activeTurnId;
+  const lastTerminalTurnId = runtimePayload.lastTerminalTurnId;
+  return (
+    (activeTurnId === null || activeTurnId === undefined || activeTurnId === input.turnId) &&
+    (lastTerminalTurnId === null ||
+      lastTerminalTurnId === undefined ||
+      lastTerminalTurnId === input.turnId)
+  );
+}
+
 function withActiveTurnFallback<T extends ProviderSession>(
   session: T,
   activeTurnId: TurnId | undefined,
@@ -2615,6 +2673,45 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
     },
   );
 
+  const stopInactiveSession: NonNullable<
+    ProviderService.ProviderServiceShape["stopInactiveSession"]
+  > = Effect.fn("ProviderService.stopInactiveSession")(function* (input) {
+    return yield* withThreadSessionLock(
+      input.threadId,
+      Effect.gen(function* () {
+        const latestBinding = Option.getOrUndefined(yield* directory.getBinding(input.threadId));
+        if (!inactiveBindingMatchesSnapshot(input.expectedBinding, latestBinding)) {
+          return false;
+        }
+        yield* stopSession({ threadId: input.threadId });
+        return true;
+      }),
+    );
+  });
+
+  const forceFailStaleSession: NonNullable<
+    ProviderService.ProviderServiceShape["forceFailStaleSession"]
+  > = Effect.fn("ProviderService.forceFailStaleSession")(function* (input) {
+    return yield* withThreadSessionLock(
+      input.threadId,
+      Effect.gen(function* () {
+        const latestBinding = Option.getOrUndefined(yield* directory.getBinding(input.threadId));
+        if (
+          !terminalBindingMatchesSnapshot({
+            expected: input.expectedBinding,
+            latest: latestBinding,
+            turnId: input.turnId,
+          })
+        ) {
+          return false;
+        }
+        yield* input.onOwned;
+        yield* input.onSettled;
+        return true;
+      }),
+    );
+  });
+
   const stopFailedSession: ProviderService.ProviderServiceShape["stopFailedSession"] = Effect.fn(
     "ProviderService.stopFailedSession",
   )(function* (input) {
@@ -2941,6 +3038,8 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
     respondToRequest,
     respondToUserInput,
     stopSession,
+    stopInactiveSession,
+    forceFailStaleSession,
     stopFailedSession,
     listSessions,
     getCapabilities,

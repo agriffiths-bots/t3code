@@ -59,6 +59,7 @@ import {
   providerErrorLabel,
   providerErrorLabelFromInstanceHint,
   ProviderCommandReactorLive,
+  makeProviderCommandReactorLive,
 } from "./ProviderCommandReactor.ts";
 import { OrchestrationEngineService } from "../Services/OrchestrationEngine.ts";
 import { ProviderCommandReactor } from "../Services/ProviderCommandReactor.ts";
@@ -160,6 +161,7 @@ describe("ProviderCommandReactor", () => {
     readonly sessionModelSwitch?: "unsupported" | "in-session";
     readonly requiresNewThreadForModelChange?: boolean;
     readonly stopFailedSessionImplementation?: ProviderServiceShape["stopFailedSession"];
+    readonly turnStartLifecycleGraceMs?: number;
   }) {
     const now = "2026-01-01T00:00:00.000Z";
     const baseDir =
@@ -394,7 +396,13 @@ describe("ProviderCommandReactor", () => {
       Layer.provide(RepositoryIdentityResolver.layer),
       Layer.provide(SqlitePersistenceMemory),
     );
-    const layer = ProviderCommandReactorLive.pipe(
+    const reactorLayer =
+      input?.turnStartLifecycleGraceMs !== undefined
+        ? makeProviderCommandReactorLive({
+            turnStartLifecycleGraceMs: input.turnStartLifecycleGraceMs,
+          })
+        : ProviderCommandReactorLive;
+    const layer = reactorLayer.pipe(
       Layer.provideMerge(orchestrationLayer),
       Layer.provideMerge(projectionSnapshotLayer),
       Layer.provideMerge(Layer.succeed(ProviderService, service)),
@@ -527,6 +535,104 @@ describe("ProviderCommandReactor", () => {
     const thread = readModel.threads.find((entry) => entry.id === ThreadId.make("thread-1"));
     expect(thread?.session?.threadId).toBe("thread-1");
     expect(thread?.session?.runtimeMode).toBe("approval-required");
+  });
+
+  it("keeps turn starts flowing on other threads while one provider's sendTurn never resolves", async () => {
+    const harness = await createHarness({ turnStartLifecycleGraceMs: 200 });
+    const now = "2026-01-01T00:00:00.000Z";
+
+    // Wedge regression (grok skills-reload, 2026-07-20): a provider whose
+    // sendTurn hangs for the whole turn must not hold the global worktree
+    // lifecycle permit, or every other thread's turn-start dispatch blocks.
+    harness.sendTurn.mockImplementation((input: unknown) => {
+      const threadId =
+        typeof input === "object" && input !== null && "threadId" in input
+          ? String((input as { threadId: unknown }).threadId)
+          : "";
+      if (threadId === "thread-1") {
+        return Effect.never;
+      }
+      return Effect.succeed({
+        threadId: ThreadId.make(threadId),
+        turnId: asTurnId("turn-2"),
+      });
+    });
+
+    await runtime!.runPromise(
+      harness.engine.dispatch(
+        {
+          type: "thread.create",
+          commandId: CommandId.make("cmd-thread-create-2"),
+          threadId: ThreadId.make("thread-2"),
+          projectId: asProjectId("project-1"),
+          title: "Second thread",
+          modelSelection: {
+            instanceId: ProviderInstanceId.make("codex"),
+            model: "gpt-5-codex",
+          },
+          interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+          runtimeMode: "approval-required",
+          branch: null,
+          worktreePath: null,
+          createdAt: now,
+        },
+        testDispatchAuthority,
+      ),
+    );
+
+    await runtime!.runPromise(
+      harness.engine.dispatch(
+        {
+          type: "thread.turn.start",
+          commandId: CommandId.make("cmd-turn-start-wedged"),
+          threadId: ThreadId.make("thread-1"),
+          message: {
+            messageId: asMessageId("user-message-wedged"),
+            role: "user",
+            text: "this turn never settles",
+            attachments: [],
+          },
+          interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+          runtimeMode: "approval-required",
+          createdAt: now,
+        },
+        testDispatchAuthority,
+      ),
+    );
+    await waitFor(() => harness.sendTurn.mock.calls.length === 1);
+
+    // Pre-fix this dispatch waits forever on the worktree lifecycle permit
+    // still held by the hung sendTurn above.
+    const dispatched = await runtime!.runPromise(
+      harness.engine
+        .dispatch(
+          {
+            type: "thread.turn.start",
+            commandId: CommandId.make("cmd-turn-start-healthy"),
+            threadId: ThreadId.make("thread-2"),
+            message: {
+              messageId: asMessageId("user-message-healthy"),
+              role: "user",
+              text: "hello from a healthy thread",
+              attachments: [],
+            },
+            interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+            runtimeMode: "approval-required",
+            createdAt: now,
+          },
+          testDispatchAuthority,
+        )
+        .pipe(Effect.timeoutOption("5 seconds")),
+    );
+    expect(Option.isSome(dispatched)).toBe(true);
+
+    await waitFor(() => harness.sendTurn.mock.calls.length === 2);
+    const sendTurnThreadIds = harness.sendTurn.mock.calls.map((call) =>
+      typeof call[0] === "object" && call[0] !== null && "threadId" in call[0]
+        ? String((call[0] as { threadId: unknown }).threadId)
+        : "",
+    );
+    expect(sendTurnThreadIds).toContain("thread-2");
   });
 
   it.each([
