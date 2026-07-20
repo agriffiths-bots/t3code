@@ -1000,6 +1000,16 @@ const spawnSubagent = Effect.fn("SubagentToolkit.spawn")(function* (
     }
     yield* requirePeerParentAccess(invocation, remoteParentThreadId);
     const { output: started } = yield* spawnRuntime(threadStartInput, invocation);
+    // CONSEQUENCE, not just mechanism: this ceiling makes the `thread.parent.set` below FAIL. A
+    // peer spawn always carries `parentEnvironmentId`, so the guard routes it to
+    // `requireRemoteParentAllowed`, which refuses factory-ceiling callers (the remote parent is
+    // absent from the local read model, so its audience cannot be checked and the guard fails
+    // closed). The net effect is that peer-scoped remote sub-agent spawn is currently REFUSED:
+    // the child is started, the link is rejected, and the `Effect.onError` below deletes it.
+    // This is a deliberate narrowing, not an oversight — ADA-184 tracks restoring the capability
+    // by authenticating the remote parent's audience rather than trusting the caller's ceiling.
+    // Pinned end to end by "peer-scoped receiver spawn is refused by the real guard and deletes
+    // the started child" in handlers.test.ts.
     const startedThreadAuthority = peerSessionDispatchAuthority({
       subject: `mcp-peer:${invocation.peerTokenId}`,
       audienceCeiling: "factory",

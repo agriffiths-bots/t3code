@@ -1,4 +1,5 @@
 import {
+  DEFAULT_PROVIDER_INTERACTION_MODE,
   EnvironmentId,
   IsoDateTime,
   NonNegativeInt,
@@ -8,6 +9,7 @@ import {
   type ModelSelection,
   type OrchestrationCommand,
   type OrchestrationProjectShell,
+  type OrchestrationReadModel,
   type OrchestrationThread,
 } from "@t3tools/contracts";
 import * as NodeServices from "@effect/platform-node/NodeServices";
@@ -19,6 +21,7 @@ import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
+import * as Path from "effect/Path";
 import * as Stream from "effect/Stream";
 import * as Option from "effect/Option";
 import * as TestClock from "effect/testing/TestClock";
@@ -38,7 +41,10 @@ import {
   BootstrapTurnStartDispatcher,
 } from "../../../orchestration/Services/BootstrapTurnStartDispatcher.ts";
 import { OrchestrationEngineService } from "../../../orchestration/Services/OrchestrationEngine.ts";
-import type { OrchestrationCommandDispatchAuthority } from "../../../orchestration/commandAudienceGuard.ts";
+import {
+  authorizeOrchestrationCommandMutation,
+  type OrchestrationCommandDispatchAuthority,
+} from "../../../orchestration/commandAudienceGuard.ts";
 import { ProjectionSnapshotQuery } from "../../../orchestration/Services/ProjectionSnapshotQuery.ts";
 import {
   PendingDispatchRepository,
@@ -694,18 +700,88 @@ const coordinatorLayer = Layer.succeed(ChildThreadCoordinator, {
   drain: Effect.void,
 } satisfies ChildThreadCoordinatorShape);
 
-const engineLayer = Layer.succeed(OrchestrationEngineService, {
-  readEvents: () => unsupported(),
-  dispatch: (command, authority) =>
-    Effect.sync(() => {
-      engineCommands.push(command);
-      // Record the authority instead of discarding it: the guard runs behind the real engine, so
-      // dropping this argument here is what let a broken peer authority pass these tests.
-      engineAuthorities.push({ command, authority });
-      return { sequence: engineCommands.length };
-    }),
-  streamDomainEvents: unsupported(),
+// Opt-in seam for running the REAL audience guard in front of the recording double. Default null =
+// record-only, which is what most tests here want (they assert handler output shape). A test that
+// needs the guard's actual verdict — not this double's willingness to accept anything — sets this
+// to a read-model builder; dispatch then runs `authorizeOrchestrationCommandMutation` first and
+// fails exactly as production does, so a refused command is never recorded.
+let realGuardReadModel: (() => OrchestrationReadModel) | null = null;
+
+// A read model shaped like the receiver environment during a peer-scoped spawn: one factory project
+// and the child thread the spawn just started. The remote parent is deliberately ABSENT — it lives
+// on the caller's backend, which is the whole reason the guard cannot fall back to a local
+// same-audience check and must decide on the caller's ceiling alone.
+const peerSpawnReceiverReadModel = (startedChildThreadId: ThreadId): OrchestrationReadModel => ({
+  snapshotSequence: 1,
+  updatedAt: "2026-06-17T09:00:00.000Z",
+  projects: [
+    {
+      id: projectId,
+      title: "Factory",
+      workspaceRoot: "/repo",
+      dataAudience: "factory",
+      defaultModelSelection: codexModel,
+      scripts: [],
+      createdAt: "2026-06-17T09:00:00.000Z",
+      updatedAt: "2026-06-17T09:00:00.000Z",
+      deletedAt: null,
+    },
+  ],
+  threads: [
+    {
+      id: startedChildThreadId,
+      projectId,
+      dataAudience: "factory",
+      title: "Started Child",
+      modelSelection: codexModel,
+      interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+      runtimeMode: "full-access",
+      branch: null,
+      worktreePath: null,
+      latestTurn: null,
+      createdAt: "2026-06-17T09:00:00.000Z",
+      updatedAt: "2026-06-17T09:00:00.000Z",
+      archivedAt: null,
+      deletedAt: null,
+      messages: [],
+      turns: [],
+      proposedPlans: [],
+      activities: [],
+      checkpoints: [],
+      session: null,
+    },
+  ],
 });
+
+const engineLayer = Layer.effect(
+  OrchestrationEngineService,
+  Effect.gen(function* () {
+    const fileSystem = yield* FileSystem.FileSystem;
+    const path = yield* Path.Path;
+    return {
+      readEvents: () => unsupported(),
+      dispatch: (command: OrchestrationCommand, authority: OrchestrationCommandDispatchAuthority) =>
+        Effect.gen(function* () {
+          const buildReadModel = realGuardReadModel;
+          if (buildReadModel !== null) {
+            yield* authorizeOrchestrationCommandMutation({
+              command,
+              readModel: buildReadModel(),
+              authority,
+              fileSystem,
+              path,
+            });
+          }
+          engineCommands.push(command);
+          // Record the authority instead of discarding it: the guard runs behind the real engine, so
+          // dropping this argument here is what let a broken peer authority pass these tests.
+          engineAuthorities.push({ command, authority });
+          return { sequence: engineCommands.length };
+        }),
+      streamDomainEvents: unsupported(),
+    };
+  }),
+);
 
 const providerRegistryLayer = Layer.succeed(ProviderInstanceRegistry, {
   getInstance: () =>
@@ -1764,10 +1840,14 @@ describe("SubagentToolkit", () => {
           parentEnvironmentId: sourceEnvironmentId,
         });
         // Pin the exact authority the handler passes, not just the command. NOTE: the engine here
-        // is a test double, so this asserts the handler's output shape only — it does NOT show the
-        // real guard accepting the link. The real guard refuses a factory-ceiling remote parent
-        // regardless of `peerSourceEnvironmentId`, which is provenance rather than a capability
-        // (see the refusal test in OrchestrationCommandAudienceGuard.test.ts).
+        // is a record-only double (`realGuardReadModel` is null), so `isError === false` above is a
+        // statement about the HANDLER IN ISOLATION, not about production. Run end to end, this same
+        // call fails: the real guard refuses a factory-ceiling remote parent regardless of
+        // `peerSourceEnvironmentId`, which is provenance rather than a capability. The assertion is
+        // kept because what it pins — the handler resolving the child authority before dispatch —
+        // is still correct and worth pinning; the production outcome is pinned separately by
+        // "peer-scoped receiver spawn is refused by the real guard and deletes the started child"
+        // below, and by the refusal test in OrchestrationCommandAudienceGuard.test.ts.
         const parentSetAuthority = engineAuthorities.find(
           (entry) => entry.command.type === "thread.parent.set",
         )?.authority;
@@ -1793,6 +1873,114 @@ describe("SubagentToolkit", () => {
       ),
       Effect.provide(TestLayer),
     ),
+  );
+
+  // Pins the CONSEQUENCE of the remote-parent narrowing end to end, through the real guard rather
+  // than the record-only double: peer-scoped remote sub-agent spawn is currently DEAD for
+  // factory-ceiling sessions. The handler hardcodes `audienceCeiling: "factory"`, the guard refuses
+  // the resulting `thread.parent.set`, and the handler's compensation deletes the child it just
+  // started — so the caller gets an error and no orphan. This is deliberate (ADA-184 tracks
+  // restoring it behind remote-parent audience authentication); the test exists so that restoring
+  // or further changing the behaviour breaks a named test instead of passing silently.
+  it.effect(
+    "peer-scoped receiver spawn is refused by the real guard and deletes the started child",
+    () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const server = yield* McpServer.McpServer;
+          const fileSystem = yield* FileSystem.FileSystem;
+          const targetDirectory = yield* fileSystem.makeTempDirectoryScoped({
+            prefix: "t3-peer-spawn-guarded-",
+          });
+          activeProjectShell = {
+            ...parentProject,
+            workspaceRoot: targetDirectory,
+            dataAudience: "factory",
+            repositoryIdentity: {
+              canonicalKey: `git-local:${targetDirectory}`,
+              locator: { source: "git-local", rootPath: targetDirectory },
+              rootPath: targetDirectory,
+            },
+          };
+          engineCommands.length = 0;
+          engineAuthorities.length = 0;
+          dispatchedTurnCommands.length = 0;
+          registeredChildren.length = 0;
+          failProjectShellLookup = true;
+          const sourceEnvironmentId = EnvironmentId.make("environment-source-guarded");
+          // Arm the real guard. The read model is built lazily so it can name the child thread the
+          // spawn just started — the id is only known once the turn-start dispatch has happened.
+          realGuardReadModel = () => {
+            const startedChildThreadId = dispatchedTurnCommands[0]?.threadId;
+            if (startedChildThreadId === undefined) {
+              throw new Error("Expected the spawn to have started a child before engine dispatch.");
+            }
+            return peerSpawnReceiverReadModel(startedChildThreadId);
+          };
+
+          const result = yield* server
+            .callTool({
+              name: "t3_spawn_subagent",
+              arguments: {
+                prompt: "run on receiver",
+                directory: targetDirectory,
+                detached: true,
+                remoteParentThreadId: parentThreadId,
+              },
+            })
+            .pipe(
+              Effect.provideService(McpInvocationContext.McpInvocationContext, {
+                ...unrestrictedPeerInvocation,
+                sourceEnvironmentId,
+              }),
+              Effect.provideService(McpSchema.McpServerClient, client),
+            );
+
+          // The production refusal, by identity. The guard's own message reaches the caller
+          // verbatim (`toToolError`'s "Failed to link remote sub-agent parent." fallback applies
+          // only to errors that carry no message of their own), and the detail is masked as
+          // not-found so a caller cannot probe for the remote parent's existence.
+          expect(result.isError).toBe(true);
+          const content = result.content?.[0];
+          expect(content?.type).toBe("text");
+          if (content?.type === "text") {
+            expect(content.text).toContain(
+              "Orchestration command authorization failed (thread.parent.set)",
+            );
+            expect(content.text).toContain(
+              `Thread '${parentThreadId}' does not exist for command 'thread.parent.set'.`,
+            );
+          }
+
+          // The child was started, then compensated away. `engineCommands` holds only what the
+          // guard let through, so the refused parent.set is absent and the cleanup delete is present.
+          const startedChildThreadId = dispatchedTurnCommands[0]?.threadId;
+          expect(dispatchedTurnCommands).toHaveLength(1);
+          expect(engineCommands.some((command) => command.type === "thread.parent.set")).toBe(
+            false,
+          );
+          expect(
+            engineCommands.find(
+              (command): command is Extract<OrchestrationCommand, { type: "thread.delete" }> =>
+                command.type === "thread.delete",
+            ),
+          ).toMatchObject({ type: "thread.delete", threadId: startedChildThreadId });
+          expect(registeredChildren).toEqual([]);
+        }),
+      ).pipe(
+        Effect.ensuring(
+          Effect.sync(() => {
+            realGuardReadModel = null;
+            activeProjectShell = parentProject;
+            failProjectShellLookup = false;
+            engineCommands.length = 0;
+            engineAuthorities.length = 0;
+            dispatchedTurnCommands.length = 0;
+            registeredChildren.length = 0;
+          }),
+        ),
+        Effect.provide(TestLayer),
+      ),
   );
 
   it.effect("rejects peer-scoped receiver spawn with a spoofed parent environment id", () =>

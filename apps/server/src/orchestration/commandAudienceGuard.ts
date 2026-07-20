@@ -515,7 +515,13 @@ function requireRemoteParentAllowed(input: {
   // that parent's data. This branch runs only when the parent is absent from the local read model,
   // so the parent's `dataAudience` is unreadable and the caller's ceiling is the only segregation
   // left — hence the ceiling check below is the whole decision, and it fails closed.
-  // Restoring the capability requires authenticating the remote parent's audience (ADA-184).
+  //
+  // What this costs, stated plainly: every peer-scoped remote sub-agent spawn arrives here with a
+  // factory ceiling (subagent/handlers.ts hardcodes it), so this refusal currently disables that
+  // shipped capability end to end — the caller gets a masked not-found and the started child is
+  // deleted. That is a deliberate trade, not a bug; restoring the capability requires
+  // authenticating the remote parent's audience rather than trusting the caller's ceiling
+  // (ADA-184). Non-factory ceilings are unaffected, which is what the companion permit test pins.
   if (
     (input.authority.kind === "session" && input.authority.audienceCeiling === "factory") ||
     (input.authority.kind === "audience-bound-system" && input.authority.dataAudience === "factory")
