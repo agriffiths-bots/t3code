@@ -23,8 +23,9 @@ import { Atom } from "effect/unstable/reactivity";
 import { EnvironmentRegistry } from "../connection/registry.ts";
 import { connectionProjectionPhase } from "../connection/model.ts";
 import { EnvironmentSupervisor } from "../connection/supervisor.ts";
+import * as ConnectionWakeups from "../connection/wakeups.ts";
 import { EnvironmentCacheStore } from "../platform/persistence.ts";
-import { subscribe } from "../rpc/client.ts";
+import { subscribeDynamic } from "../rpc/client.ts";
 import { ThreadRevisionLoader, ThreadSnapshotLoader } from "./threadSnapshotHttp.ts";
 import { ThreadReconciliationActivity } from "./threadReconciliationActivity.ts";
 import { parseThreadKey, threadKey } from "./entities.ts";
@@ -243,6 +244,7 @@ export const makeEnvironmentThreadState = Effect.fn("EnvironmentThreadState.make
   const reconciliationActivity = yield* ThreadReconciliationActivity;
   const reconciliationPolicy =
     options?.reconciliationPolicy ?? DEFAULT_THREAD_RECONCILIATION_POLICY;
+  const wakeups = yield* Effect.serviceOption(ConnectionWakeups.ConnectionWakeups);
   const environmentId = supervisor.target.environmentId;
   const cached = yield* cache.loadThread(environmentId, threadId).pipe(
     Effect.catch((error) =>
@@ -284,6 +286,7 @@ export const makeEnvironmentThreadState = Effect.fn("EnvironmentThreadState.make
     onSome: (snapshot) =>
       snapshot.observedEventId !== undefined ? snapshot.observedEventId : initialVerifiedEventId,
   });
+  const awaitingCompletion = yield* Ref.make(false);
   const persistence = yield* Queue.sliding<OrchestrationThreadDetailSnapshot>(1);
   const reconciliationWake = yield* Queue.sliding<ThreadReconciliationReason>(1);
   const reconcileFastUntil = yield* Ref.make(0);
@@ -415,16 +418,24 @@ export const makeEnvironmentThreadState = Effect.fn("EnvironmentThreadState.make
           error: Option.none(),
         },
   );
-  const setDisconnected = SubscriptionRef.update(state, (current) => ({
-    ...current,
-    status: current.status === "deleted" ? current.status : statusWithoutLiveData(current.data),
-  }));
-  const setStreamError = (cause: Cause.Cause<unknown>) =>
-    SubscriptionRef.update(state, (current) => ({
+  const setDisconnected = Effect.gen(function* () {
+    yield* Ref.set(awaitingCompletion, false);
+    yield* SubscriptionRef.update(state, (current) => ({
       ...current,
       status: current.status === "deleted" ? current.status : statusWithoutLiveData(current.data),
-      error: Option.some(formatThreadError(cause)),
     }));
+  });
+  const setStreamError = (cause: Cause.Cause<unknown>) =>
+    Ref.set(awaitingCompletion, false).pipe(
+      Effect.andThen(
+        SubscriptionRef.update(state, (current) => ({
+          ...current,
+          status:
+            current.status === "deleted" ? current.status : statusWithoutLiveData(current.data),
+          error: Option.some(formatThreadError(cause)),
+        })),
+      ),
+    );
 
   const setThread = Effect.fn("EnvironmentThreadState.setThread")(function* (
     thread: OrchestrationThread,
@@ -436,12 +447,13 @@ export const makeEnvironmentThreadState = Effect.fn("EnvironmentThreadState.make
       yield* setDeleted();
       return;
     }
+    const waiting = yield* Ref.get(awaitingCompletion);
     const updated = yield* SubscriptionRef.updateAndGet(state, (current) =>
       current.status === "deleted"
         ? current
         : {
             data: Option.some(thread),
-            status: "live" as const,
+            status: waiting ? ("synchronizing" as const) : ("live" as const),
             error: Option.none(),
           },
     );
@@ -593,6 +605,7 @@ export const makeEnvironmentThreadState = Effect.fn("EnvironmentThreadState.make
   });
 
   const setDeleted = Effect.fn("EnvironmentThreadState.setDeleted")(function* () {
+    yield* Ref.set(awaitingCompletion, false);
     yield* SubscriptionRef.set(state, {
       data: Option.none(),
       status: "deleted",
@@ -710,6 +723,15 @@ export const makeEnvironmentThreadState = Effect.fn("EnvironmentThreadState.make
     item: OrchestrationThreadStreamItem,
   ) {
     if ((yield* SubscriptionRef.get(state)).status === "deleted") {
+      return;
+    }
+    if (item.kind === "synchronized") {
+      yield* Ref.set(awaitingCompletion, false);
+      yield* SubscriptionRef.update(state, (current) =>
+        Option.isSome(current.data) && current.status !== "deleted"
+          ? { ...current, status: "live" as const, error: Option.none() }
+          : current,
+      );
       return;
     }
     const storageEpoch = yield* Ref.get(currentStorageEpoch);
@@ -1264,106 +1286,138 @@ export const makeEnvironmentThreadState = Effect.fn("EnvironmentThreadState.make
     Effect.forkScoped,
   );
 
+  const foregroundResubscriptions = Option.match(wakeups, {
+    onNone: () => Stream.never,
+    onSome: (service) =>
+      service.changes.pipe(Stream.filter((reason) => reason === "application-active")),
+  });
+
+  const logSubscriptionLifecycle = (phase: "start" | "stop") =>
+    Effect.all([SubscriptionRef.get(lastSequence), SubscriptionRef.get(supervisor.state)]).pipe(
+      Effect.flatMap(([lastAppliedSequence, connectionState]) =>
+        Effect.logDebug(`Thread subscription ${phase}.`).pipe(
+          Effect.annotateLogs({
+            environmentId,
+            threadId,
+            subscriptionPhase: phase,
+            connectionGeneration: connectionState.generation,
+            lastAppliedSequence,
+          }),
+        ),
+      ),
+    );
+
+  const prepareSubscription = Effect.gen(function* () {
+    const [storageEpoch, current, lastAppliedSequence] = yield* Effect.all([
+      Ref.get(currentStorageEpoch),
+      SubscriptionRef.get(state),
+      SubscriptionRef.get(lastSequence),
+    ]);
+    // A cursor without an epoch cannot prove that it belongs to the
+    // server's current history. Discard it at every session boundary so a
+    // legacy server is asked for an authoritative snapshot again instead
+    // of resuming a potentially restored-behind cache.
+    if (Option.isNone(storageEpoch) && (lastAppliedSequence > 0 || Option.isSome(current.data))) {
+      yield* applyLock.withPermit(resetReconciliationCursors(undefined, "unknown-storage-epoch"));
+    }
+    yield* logSubscriptionLifecycle("start");
+  });
+
   yield* setSynchronizing;
   yield* Effect.forkScoped(
-    Effect.gen(function* () {
-      // Establish the base snapshot to resume from, minimizing bytes over the
-      // wire:
-      // - Warm cache: reuse the cached snapshot (zero network) and resume via
-      //   `afterSequence` so we only receive events since the cached sequence.
-      // - Cold cache: load the full snapshot over HTTP (gzip-compressible, and
-      //   off the socket), then resume via `afterSequence`.
-      // If no base can be established we fall back to the socket-embedded
-      // snapshot so the thread still synchronizes. Overlapping/replayed events
-      // are deduped by sequence in applyItem.
-      const base = Option.isSome(cached)
-        ? cached
-        : yield* Effect.gen(function* () {
-            // Cold cache only: wait for a prepared connection so we can
-            // authenticate the HTTP request; this mirrors the socket path, which
-            // likewise waits for a live session.
-            const prepared = yield* SubscriptionRef.changes(supervisor.prepared).pipe(
-              Stream.filter(Option.isSome),
-              Stream.map((current) => current.value),
-              Stream.runHead,
-            );
-            return Option.isSome(prepared)
-              ? yield* snapshotLoader.load(prepared.value, threadId)
-              : Option.none<OrchestrationThreadDetailSnapshot>();
-          });
-
-      if (Option.isSome(base)) {
-        const baseStorageEpoch = Option.fromNullishOr(base.value.storageEpoch);
-        if (Option.isSome(baseStorageEpoch)) {
-          yield* Ref.set(currentStorageEpoch, baseStorageEpoch);
-          subscribeInput.storageEpoch = baseStorageEpoch.value;
-          yield* applyItem({
-            kind: "snapshot",
-            storageEpoch: baseStorageEpoch.value,
-            snapshot: base.value,
-          });
-          yield* advanceLastSequence(base.value.snapshotSequence);
-        } else {
-          const accepted = yield* applySnapshot(base.value, {
-            allowCurrentSequence: true,
-            skipMatchingCurrentSequence: true,
-          });
-          if (accepted) {
-            yield* acknowledgeSnapshotRevision(
-              base.value.latestSequence ?? base.value.snapshotSequence,
-              base.value.latestEventId,
-              base.value.latestSequence !== undefined && base.value.latestEventId !== undefined,
-            );
-          }
-          delete subscribeInput.afterSequence;
-        }
-      } else {
-        delete subscribeInput.afterSequence;
-      }
-
-      const logSubscriptionLifecycle = (phase: "start" | "stop") =>
-        Effect.all([SubscriptionRef.get(lastSequence), SubscriptionRef.get(supervisor.state)]).pipe(
-          Effect.flatMap(([lastAppliedSequence, connectionState]) =>
-            Effect.logDebug(`Thread subscription ${phase}.`).pipe(
-              Effect.annotateLogs({
-                environmentId,
-                threadId,
-                subscriptionPhase: phase,
-                connectionGeneration: connectionState.generation,
-                lastAppliedSequence,
-              }),
-            ),
-          ),
+    subscribeDynamic(
+      ORCHESTRATION_WS_METHODS.subscribeThread,
+      Effect.fn("EnvironmentThreadState.makeSubscribeInput")(function* (session) {
+        const supportsCompletionMarker = yield* session.initialConfig.pipe(
+          Effect.map((config) => config.threadResumeCompletionMarker === true),
+          Effect.orElseSucceed(() => false),
         );
+        yield* Ref.set(awaitingCompletion, supportsCompletionMarker);
+        yield* setSynchronizing;
 
-      const prepareSubscription = Effect.gen(function* () {
-        const [storageEpoch, current, lastAppliedSequence] = yield* Effect.all([
-          Ref.get(currentStorageEpoch),
-          SubscriptionRef.get(state),
-          SubscriptionRef.get(lastSequence),
-        ]);
-        // A cursor without an epoch cannot prove that it belongs to the
-        // server's current history. Discard it at every session boundary so a
-        // legacy server is asked for an authoritative snapshot again instead
-        // of resuming a potentially restored-behind cache.
-        if (
-          Option.isNone(storageEpoch) &&
-          (lastAppliedSequence > 0 || Option.isSome(current.data))
-        ) {
-          yield* applyLock.withPermit(
-            resetReconciliationCursors(undefined, "unknown-storage-epoch"),
-          );
+        let current = yield* SubscriptionRef.get(state);
+        if (Option.isNone(current.data) && current.status !== "deleted") {
+          // Establish the base snapshot to resume from, minimizing bytes over
+          // the wire: reuse the warm cache when present, otherwise cold-load the
+          // authoritative snapshot over HTTP. Overlapping/replayed events are
+          // deduped by sequence in applyItem. Only runs when we have no data
+          // yet, so foreground resubscribes resume via the cursor instead.
+          const base = Option.isSome(cached)
+            ? cached
+            : yield* Effect.gen(function* () {
+                const prepared = yield* SubscriptionRef.get(supervisor.prepared).pipe(
+                  Effect.flatMap(
+                    Option.match({
+                      onSome: Effect.succeed,
+                      onNone: () =>
+                        SubscriptionRef.changes(supervisor.prepared).pipe(
+                          Stream.filter(Option.isSome),
+                          Stream.map((value) => value.value),
+                          Stream.runHead,
+                          Effect.map(Option.getOrThrow),
+                        ),
+                    }),
+                  ),
+                );
+                return yield* snapshotLoader.load(prepared, threadId);
+              });
+
+          if (Option.isSome(base)) {
+            const baseStorageEpoch = Option.fromNullishOr(base.value.storageEpoch);
+            if (Option.isSome(baseStorageEpoch)) {
+              yield* Ref.set(currentStorageEpoch, baseStorageEpoch);
+              subscribeInput.storageEpoch = baseStorageEpoch.value;
+              yield* applyItem({
+                kind: "snapshot",
+                storageEpoch: baseStorageEpoch.value,
+                snapshot: base.value,
+              });
+              yield* advanceLastSequence(base.value.snapshotSequence);
+            } else {
+              const accepted = yield* applySnapshot(base.value, {
+                allowCurrentSequence: true,
+                skipMatchingCurrentSequence: true,
+              });
+              if (accepted) {
+                yield* acknowledgeSnapshotRevision(
+                  base.value.latestSequence ?? base.value.snapshotSequence,
+                  base.value.latestEventId,
+                  base.value.latestSequence !== undefined &&
+                    base.value.latestEventId !== undefined,
+                );
+              }
+              delete subscribeInput.afterSequence;
+            }
+          } else {
+            delete subscribeInput.afterSequence;
+          }
+          current = yield* SubscriptionRef.get(state);
         }
-        yield* logSubscriptionLifecycle("start");
-      });
 
-      yield* subscribe(ORCHESTRATION_WS_METHODS.subscribeThread, subscribeInput, {
+        const canResume = Option.isSome(current.data);
+        if (!supportsCompletionMarker && canResume) {
+          yield* SubscriptionRef.update(state, (value) => ({
+            ...value,
+            status: value.status === "deleted" ? value.status : ("live" as const),
+            error: Option.none(),
+          }));
+        }
+
+        // Resume from the reconciliation cursor, which carries the epoch and
+        // revision markers the server needs to reconcile restored history.
+        return {
+          ...subscribeInput,
+          ...(supportsCompletionMarker ? { requestCompletionMarker: true as const } : {}),
+        };
+      }),
+      {
         onExpectedFailure: setStreamError,
         retryExpectedFailureAfter: "250 millis",
         onSessionStart: () => prepareSubscription,
         onSessionStop: () => logSubscriptionLifecycle("stop"),
-      }).pipe(Stream.runForEach(applyItem));
-    }),
+        resubscribe: foregroundResubscriptions,
+      },
+    ).pipe(Stream.runForEach(applyItem)),
   );
 
   yield* Effect.addFinalizer(() =>

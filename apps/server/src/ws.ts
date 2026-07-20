@@ -818,6 +818,8 @@ const makeWsRpcLayer = (currentSession: EnvironmentAuth.AuthenticatedSession) =>
             otlpMetricsEnabled: config.otlpMetricsUrl !== undefined,
           },
           settings,
+          shellResumeCompletionMarker: true,
+          threadResumeCompletionMarker: true,
         };
       });
 
@@ -1005,6 +1007,13 @@ const makeWsRpcLayer = (currentSession: EnvironmentAuth.AuthenticatedSession) =>
                             }),
                         ),
                       );
+                    // Emit upstream's "synchronized" completion marker (when the
+                    // client requested one) after our own markers, so a
+                    // completion-aware client can leave the synchronizing state.
+                    const withCompletionMarker = (rest: typeof liveBufferStream) =>
+                      input.requestCompletionMarker === true
+                        ? Stream.concat(Stream.make({ kind: "synchronized" as const }), rest)
+                        : rest;
                     const isClientCursorAhead = afterSequence > currentSequence.snapshotSequence;
                     if (
                       isClientCursorAhead ||
@@ -1029,7 +1038,7 @@ const makeWsRpcLayer = (currentSession: EnvironmentAuth.AuthenticatedSession) =>
                           snapshot,
                           ...(isClientCursorAhead ? { force: true } : {}),
                         }),
-                        liveBufferStream,
+                        withCompletionMarker(liveBufferStream),
                       );
                     }
                     const catchUpStream = visibleOrchestrationEvents(
@@ -1055,13 +1064,21 @@ const makeWsRpcLayer = (currentSession: EnvironmentAuth.AuthenticatedSession) =>
                           kind: "caught-up" as const,
                           sequence: currentSequence.snapshotSequence,
                         }),
-                        liveBufferStream,
+                        withCompletionMarker(liveBufferStream),
                       ),
                     );
                   }),
                 );
               }
 
+              // The full-snapshot fallback needs the same replay-window safety
+              // as the resume path: subscribe before loading the projection so
+              // events published while the snapshot is read are buffered.
+              const liveBuffer = yield* Queue.unbounded<OrchestrationShellStreamItem>();
+              yield* Effect.forkScoped(
+                liveStream.pipe(Stream.runForEach((item) => Queue.offer(liveBuffer, item))),
+              );
+              const bufferedLiveStream = Stream.fromQueue(liveBuffer);
               const snapshot = yield* projectionSnapshotQuery.getShellSnapshot().pipe(
                 Effect.tapError((cause) =>
                   Effect.logError("orchestration shell snapshot load failed", { cause }),
@@ -1075,12 +1092,21 @@ const makeWsRpcLayer = (currentSession: EnvironmentAuth.AuthenticatedSession) =>
                 ),
               );
 
+              const afterSnapshot =
+                input.requestCompletionMarker === true
+                  ? Stream.concat(
+                      Stream.fromEffect(
+                        Queue.offer(liveBuffer, { kind: "synchronized" as const }),
+                      ).pipe(Stream.drain),
+                      bufferedLiveStream,
+                    )
+                  : bufferedLiveStream;
               return Stream.concat(
                 Stream.make({
                   kind: "snapshot" as const,
                   snapshot,
                 }),
-                liveStream,
+                afterSnapshot,
               );
             }),
             { "rpc.aggregate": "orchestration" },
@@ -1185,6 +1211,19 @@ const makeWsRpcLayer = (currentSession: EnvironmentAuth.AuthenticatedSession) =>
                     ),
                   );
                   const liveBufferStream = Stream.fromQueue(liveBuffer);
+                  // Emit upstream's "synchronized" completion marker (when the
+                  // client requested one) after replay, ordered at the current
+                  // tail of the live buffer so a completion-aware client can
+                  // leave the synchronizing state.
+                  const withCompletionMarker =
+                    input.requestCompletionMarker === true
+                      ? Stream.concat(
+                          Stream.fromEffect(
+                            Queue.offer(liveBuffer, { kind: "synchronized" as const }),
+                          ).pipe(Stream.drain),
+                          liveBufferStream,
+                        )
+                      : liveBufferStream;
                   const observedIdentityMatches =
                     input.observedRevision === latestRevision.latestSequence &&
                     (input.observedRevision === 0
@@ -1225,7 +1264,7 @@ const makeWsRpcLayer = (currentSession: EnvironmentAuth.AuthenticatedSession) =>
                           }),
                       ),
                     );
-                    return Stream.concat(catchUpStream, liveBufferStream);
+                    return Stream.concat(catchUpStream, withCompletionMarker);
                   }
 
                   const snapshot = yield* projectionSnapshotQuery
@@ -1311,11 +1350,9 @@ const makeWsRpcLayer = (currentSession: EnvironmentAuth.AuthenticatedSession) =>
                         ...coveredThreadRevision(snapshot.value.snapshotSequence, latestRevision),
                       },
                     }),
-                    liveBufferStream,
+                    withCompletionMarker,
                   );
                 }),
-              );
-            }),
             { "rpc.aggregate": "orchestration" },
           ),
         // `scheduled_tasks` is not event-sourced, so freshness comes from the
