@@ -42,6 +42,13 @@ const SessionUpdateNotification = jsonRpcNotification(
   AcpSchema.SessionNotification,
 );
 const encodeUnknownJsonString = Schema.encodeUnknownSync(Schema.UnknownFromJsonString);
+const decodeJsonRpcResponseId = Schema.decodeUnknownSync(
+  Schema.fromJsonString(
+    Schema.Struct({
+      id: Schema.Union([Schema.String, Schema.Number]),
+    }),
+  ),
+);
 const decodePromptRequestLine = Schema.decodeEffect(Schema.fromJsonString(PromptRequest));
 const XAiPromptCompleteNotification = jsonRpcNotification(
   "_x.ai/session/prompt_complete",
@@ -598,6 +605,57 @@ it.layer(NodeServices.layer)("effect-acp client", (it) => {
         );
         assert.strictEqual(response.id, id);
       }
+
+      yield* Scope.close(scope, Exit.void);
+    }).pipe(TestClock.withLive),
+  );
+
+  it.effect("keeps mixed string and numeric request ids aligned within a JSON-RPC batch", () =>
+    Effect.gen(function* () {
+      const { stdio, input, output } = yield* makeInMemoryStdio();
+      const scope = yield* Scope.make();
+      const acp = yield* AcpClient.make(stdio).pipe(Effect.provideService(Scope.Scope, scope));
+      yield* acp.handleRequestPermission(() =>
+        Effect.succeed({
+          outcome: {
+            outcome: "selected",
+            optionId: "allow",
+          },
+        }),
+      );
+
+      const makePermissionRequest = (id: string | number) => ({
+        jsonrpc: "2.0" as const,
+        id,
+        method: "session/request_permission" as const,
+        params: {
+          sessionId: "session-1",
+          toolCall: {
+            toolCallId: `tool-${id}`,
+            title: "Allow mock action",
+          },
+          options: [{ optionId: "allow", name: "Allow", kind: "allow_once" as const }],
+        },
+        headers: [],
+      });
+      yield* Queue.offer(
+        input,
+        new TextEncoder().encode(
+          `${encodeUnknownJsonString([
+            makePermissionRequest("batch-string-id"),
+            makePermissionRequest(73),
+          ])}\n`,
+        ),
+      );
+
+      const responses = (yield* Queue.take(output).pipe(Effect.timeout("1 second")))
+        .trim()
+        .split("\n")
+        .map((line) => decodeJsonRpcResponseId(line));
+      assert.deepEqual(
+        responses.map((response) => response.id),
+        ["batch-string-id", 73],
+      );
 
       yield* Scope.close(scope, Exit.void);
     }).pipe(TestClock.withLive),

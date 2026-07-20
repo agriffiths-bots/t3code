@@ -91,9 +91,6 @@ const requestIdKey = (requestId: unknown): string => `${typeof requestId}:${Stri
 const isInternalNumericResponseId = (requestId: unknown): requestId is number =>
   typeof requestId === "number" && Number.isInteger(requestId);
 
-const flattenJsonRpcFrames = (frames: ReadonlyArray<unknown>): Array<unknown> =>
-  frames.flatMap((frame) => (Array.isArray(frame) ? frame : [frame]));
-
 export const makeAcpPatchedProtocol = Effect.fn("makeAcpPatchedProtocol")(function* (
   options: AcpPatchedProtocolOptions,
 ): Effect.fn.Return<AcpPatchedProtocol, never, Scope.Scope> {
@@ -120,26 +117,17 @@ export const makeAcpPatchedProtocol = Effect.fn("makeAcpPatchedProtocol")(functi
     return requestId;
   };
 
-  const translateIncomingRequestIds = (
-    messages: ReadonlyArray<RpcMessage.FromClientEncoded | RpcMessage.FromServerEncoded>,
-    rawFrames: ReadonlyArray<unknown>,
-  ): ReadonlyArray<RpcMessage.FromClientEncoded | RpcMessage.FromServerEncoded> => {
-    const rawMessages = flattenJsonRpcFrames(rawFrames);
-    if (messages.length !== rawMessages.length) {
-      throw new Error(
-        `ACP JSON-RPC decoder produced ${messages.length} messages for ${rawMessages.length} wire frames.`,
-      );
-    }
+  const translateIncomingWireRequestIds = (rawFrames: ReadonlyArray<unknown>): string => {
+    const translateMessage = (rawMessage: unknown): unknown => {
+      if (!isRecord(rawMessage)) {
+        return rawMessage;
+      }
 
-    return messages.map((message, index) => {
-      const rawMessage = rawMessages[index];
-      const hasWireId = isRecord(rawMessage) && hasOwn(rawMessage, "id");
-      const wireId = hasWireId ? rawMessage.id : undefined;
-
-      if (message._tag === "Request") {
-        if (!hasWireId || wireId === null || wireId === undefined) {
-          return message;
+      if (hasOwn(rawMessage, "method")) {
+        if (!hasOwn(rawMessage, "id") || rawMessage.id === null || rawMessage.id === undefined) {
+          return rawMessage;
         }
+        const wireId = rawMessage.id;
         if (typeof wireId !== "string" && typeof wireId !== "number") {
           throw new TypeError("JSON-RPC request ids must be strings or numbers.");
         }
@@ -151,15 +139,12 @@ export const makeAcpPatchedProtocol = Effect.fn("makeAcpPatchedProtocol")(functi
             : allocateTranslatedRequestId();
         serverRequestIds.set(internalId, wireId);
         return {
-          ...message,
-          id: internalId,
+          ...rawMessage,
+          id: Number(internalId),
         };
       }
 
-      if (message._tag !== "Exit" && message._tag !== "Chunk") {
-        return message;
-      }
-
+      const wireId = hasOwn(rawMessage, "id") ? rawMessage.id : undefined;
       const wireKey = requestIdKey(wireId);
       // This transport emits its own RPC request ids as JSON numbers. Only a
       // numeric response may therefore address a local pending request;
@@ -171,14 +156,23 @@ export const makeAcpPatchedProtocol = Effect.fn("makeAcpPatchedProtocol")(functi
       if (!isInternalNumericResponseId(wireId) && !opaqueClientResponseIds.has(wireKey)) {
         opaqueClientResponseIds.set(wireKey, internalId);
       }
-      if (message._tag === "Exit") {
+      if (rawMessage.chunk !== true) {
         opaqueClientResponseIds.delete(wireKey);
       }
       return {
-        ...message,
-        requestId: internalId,
+        ...rawMessage,
+        id: Number(internalId),
       };
-    });
+    };
+
+    return rawFrames
+      .map((frame) =>
+        JSON.stringify(
+          Array.isArray(frame) ? frame.map(translateMessage) : translateMessage(frame),
+        ),
+      )
+      .join("\n")
+      .concat("\n");
   };
 
   const encodeWithPreservedRequestIds = (
@@ -586,10 +580,12 @@ export const makeAcpPatchedProtocol = Effect.fn("makeAcpPatchedProtocol")(functi
           Effect.try({
             try: () => {
               const rawFrames = incomingJsonLines.decode(data);
-              const messages = parser.decode(data) as ReadonlyArray<
+              if (rawFrames.length === 0) {
+                return [];
+              }
+              return parser.decode(translateIncomingWireRequestIds(rawFrames)) as ReadonlyArray<
                 RpcMessage.FromClientEncoded | RpcMessage.FromServerEncoded
               >;
-              return translateIncomingRequestIds(messages, rawFrames);
             },
             catch: (cause) =>
               new AcpError.AcpProtocolParseError({
