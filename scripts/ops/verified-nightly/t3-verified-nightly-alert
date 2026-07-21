@@ -1,0 +1,125 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+umask 077
+
+readonly GH_BIN="${VERIFIED_NIGHTLY_GH_BIN:-gh}"
+readonly ALERT_BIN="${VERIFIED_NIGHTLY_ALERT_BIN:-/home/adam/.openclaw/bin/wizzo-alert}"
+readonly REPOSITORY="${VERIFIED_NIGHTLY_REPOSITORY:-agriffiths-bots/t3code}"
+readonly STATE_FILE="${VERIFIED_NIGHTLY_STATE_FILE:-/home/adam/.openclaw/state/verified-nightly-alert.processed-runs}"
+readonly STATE_KEEP="${VERIFIED_NIGHTLY_STATE_KEEP:-500}"
+
+if [[ "$STATE_FILE" != /* ]]; then
+  echo "VERIFIED_NIGHTLY_STATE_FILE must be absolute." >&2
+  exit 2
+fi
+if [[ ! -x "$ALERT_BIN" ]]; then
+  echo "wizzo-alert is unavailable at $ALERT_BIN." >&2
+  exit 1
+fi
+if [[ ! "$STATE_KEEP" =~ ^[1-9][0-9]*$ ]]; then
+  echo "VERIFIED_NIGHTLY_STATE_KEEP must be a positive integer." >&2
+  exit 2
+fi
+
+state_dir="${STATE_FILE%/*}"
+mkdir -p -- "$state_dir"
+exec 9>"${STATE_FILE}.lock"
+flock -x 9
+
+declare -A processed_run_ids=()
+if [[ -f "$STATE_FILE" ]]; then
+  while IFS= read -r processed_run_id; do
+    if [[ ! "$processed_run_id" =~ ^[0-9]+$ ]]; then
+      echo "Invalid verified-nightly alert state: $processed_run_id" >&2
+      exit 1
+    fi
+    processed_run_ids["$processed_run_id"]=1
+  done < "$STATE_FILE"
+fi
+
+runs_json="$(
+  "$GH_BIN" run list \
+    --repo "$REPOSITORY" \
+    --workflow verified-nightly-promotion.yml \
+    --status completed \
+    --limit "$STATE_KEEP" \
+    --json databaseId,conclusion,url,updatedAt
+)"
+
+mapfile -t encoded_runs < <(
+  jq -r 'sort_by(.updatedAt, .databaseId)[] | @base64' <<< "$runs_json"
+)
+
+for encoded_run in "${encoded_runs[@]}"; do
+  run_json="$(base64 -d <<< "$encoded_run")"
+  run_id="$(jq -r .databaseId <<< "$run_json")"
+  if [[ ! "$run_id" =~ ^[0-9]+$ ]] || [[ -n "${processed_run_ids[$run_id]:-}" ]]; then
+    continue
+  fi
+
+  conclusion="$(jq -r .conclusion <<< "$run_json")"
+  run_url="$(jq -r .url <<< "$run_json")"
+  jobs_json="$("$GH_BIN" run view "$run_id" --repo "$REPOSITORY" --json jobs)"
+
+  if [[ "$conclusion" == "success" ]]; then
+    release_tag="$(
+      jq -r '
+        [.jobs[].name
+         | capture("^Publish (?<tag>v[0-9]+\\.[0-9]+\\.[0-9]+) verified stable$").tag]
+        | first // empty
+      ' <<< "$jobs_json"
+    )"
+    if [[ -z "$release_tag" ]]; then
+      echo "Successful promotion run $run_id has no verified stable publish job." >&2
+      exit 1
+    fi
+    release_json="$(
+      "$GH_BIN" release view "$release_tag" \
+        --repo "$REPOSITORY" \
+        --json isDraft,isPrerelease,targetCommitish,url
+    )"
+    jq -e '.isDraft == false and .isPrerelease == false' <<< "$release_json" >/dev/null
+    release_url="$(jq -r .url <<< "$release_json")"
+    commit="$(jq -r .targetCommitish <<< "$release_json")"
+    subject="$release_tag verified nightly promotion"
+    body="Verified nightly promotion published $release_tag as Latest from $commit. Release: $release_url Run: $run_url"
+    fingerprint="verified-$release_tag"
+  else
+    failure_json="$(
+      jq -c '
+        [.jobs[] | select(.conclusion == "failure" or .conclusion == "cancelled")][0] // {}
+      ' <<< "$jobs_json"
+    )"
+    failed_job="$(jq -r '.name // empty' <<< "$failure_json")"
+    failed_step="$(
+      jq -r '[.steps[]? | select(.conclusion == "failure")][0].name // empty' \
+        <<< "$failure_json"
+    )"
+    if [[ -z "$failed_job" ]]; then
+      failed_job="workflow $conclusion"
+    fi
+    failure_detail="$failed_job"
+    if [[ -n "$failed_step" ]]; then
+      failure_detail="$failure_detail / $failed_step"
+    fi
+    subject="Nightly promotion refused: $failed_job"
+    body="No stable release was promoted. Failing check: $failure_detail. Conclusion: $conclusion. Run: $run_url"
+    fingerprint="refused-$conclusion"
+  fi
+
+  "$ALERT_BIN" \
+    --key "verified-nightly.$run_id" \
+    --fingerprint "$fingerprint" \
+    --subject "$subject" \
+    --body "$body"
+
+  temp_state="$(mktemp "$state_dir/.verified-nightly-alert.XXXXXX")"
+  {
+    [[ ! -f "$STATE_FILE" ]] || cp "$STATE_FILE" /dev/stdout
+    printf '%s\n' "$run_id"
+  } | awk '/^[0-9]+$/ && !seen[$0]++' | tail -n "$STATE_KEEP" > "$temp_state"
+  chmod 600 "$temp_state"
+  mv -f -- "$temp_state" "$STATE_FILE"
+  processed_run_ids["$run_id"]=1
+done

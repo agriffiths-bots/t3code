@@ -29,6 +29,16 @@ on:
         required: false
         default: false
         type: boolean
+      publish_release:
+        description: "Publish a GitHub Release instead of returning assembled release assets"
+        required: false
+        default: true
+        type: boolean
+      artifact_suffix:
+        description: "Suffix used to isolate artifacts when this workflow is called more than once"
+        required: false
+        default: ""
+        type: string
       windows_signing:
         description: "Enable Windows signing when Azure Trusted Signing secrets are configured"
         required: false
@@ -225,7 +235,7 @@ jobs:
       - name: Upload node-pty prebuild
         uses: actions/upload-artifact@v7
         with:
-          name: wsl-node-pty-x64
+          name: wsl-node-pty-x64${{ inputs.artifact_suffix }}
           path: wsl-prebuild/pty.node
           if-no-files-found: error
 
@@ -272,7 +282,7 @@ jobs:
       - name: Download WSL node-pty prebuild
         uses: actions/download-artifact@v7
         with:
-          name: wsl-node-pty-x64
+          name: wsl-node-pty-x64${{ inputs.artifact_suffix }}
           path: wsl-prebuild
 
       - name: Ensure Electron runtime is installed
@@ -404,7 +414,7 @@ jobs:
       - name: Upload Windows artifact
         uses: actions/upload-artifact@v7
         with:
-          name: windows-x64
+          name: windows-x64${{ inputs.artifact_suffix }}
           path: release-publish/*
           if-no-files-found: error
 
@@ -429,7 +439,7 @@ jobs:
       - name: Download Windows artifact
         uses: actions/download-artifact@v7
         with:
-          name: windows-x64
+          name: windows-x64${{ inputs.artifact_suffix }}
           path: release-assets
 
       - id: install
@@ -523,7 +533,7 @@ jobs:
         run: node scripts/desktop-launch-smoke.mjs --command "${{ steps.install.outputs.app_exe }}" --timeout-ms 90000
 
   publish_release:
-    name: Publish GitHub Release
+    name: Finalize release artifacts
     needs: [server_e2e_gate, windows_x64, windows_launch_smoke]
     # Mobile app builds are deprecated; publish only the Windows desktop release
     # assets produced by this reusable workflow.
@@ -542,7 +552,7 @@ jobs:
       - name: Download release assets
         uses: actions/download-artifact@v7
         with:
-          pattern: "*"
+          pattern: "*${{ inputs.artifact_suffix }}"
           merge-multiple: true
           path: release-assets
 
@@ -567,6 +577,7 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       - name: Publish release
+        if: inputs.publish_release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ inputs.release_tag }}
@@ -577,3 +588,12 @@ jobs:
           files: ${{ steps.release_files.outputs.files }}
           fail_on_unmatched_files: true
           token: ${{ github.token }}
+
+      - name: Upload assembled release assets
+        if: ${{ !inputs.publish_release }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-assets${{ inputs.artifact_suffix }}
+          path: ${{ steps.release_files.outputs.files }}
+          if-no-files-found: error
+          retention-days: 7
