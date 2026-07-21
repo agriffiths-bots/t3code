@@ -178,6 +178,7 @@ describe("ThreadDeletionReactor", () => {
       const engine = {
         readEvents: () => Stream.empty,
         streamDomainEvents: Stream.fromPubSub(domainEvents),
+        latestSequence: Effect.succeed(0),
         dispatch: (command: OrchestrationCommand) =>
           Effect.gen(function* () {
             dispatchedCommands.push(command);
@@ -345,6 +346,7 @@ describe("ThreadDeletionReactor", () => {
       const engine = {
         readEvents: () => Stream.fromIterable([archiveEvent]),
         streamDomainEvents: Stream.fromPubSub(domainEvents),
+        latestSequence: Effect.succeed(0),
         dispatch: (command: OrchestrationCommand) =>
           Effect.sync(() => {
             dispatchedCommands.push(command);
@@ -451,6 +453,7 @@ describe("ThreadDeletionReactor", () => {
       const engine = {
         readEvents: () => Stream.fromIterable([archiveEvent]),
         streamDomainEvents: Stream.fromPubSub(domainEvents),
+        latestSequence: Effect.succeed(0),
         dispatch: (command: OrchestrationCommand) =>
           Effect.sync(() => {
             dispatchedCommands.push(command);
@@ -568,6 +571,7 @@ describe("ThreadDeletionReactor", () => {
         const engine = {
           readEvents: () => Stream.empty,
           streamDomainEvents: Stream.fromPubSub(domainEvents),
+          latestSequence: Effect.succeed(0),
           dispatch: (command: OrchestrationCommand) =>
             Effect.sync(() => {
               dispatchedCommands.push(command);
@@ -665,6 +669,7 @@ describe("ThreadDeletionReactor", () => {
       const engine = {
         readEvents: () => Stream.empty,
         streamDomainEvents: Stream.fromPubSub(domainEvents),
+        latestSequence: Effect.succeed(0),
         dispatch: (command: OrchestrationCommand) =>
           Effect.sync(() => {
             dispatchedCommands.push(command);
@@ -761,6 +766,7 @@ describe("ThreadDeletionReactor", () => {
         const engine = {
           readEvents: () => Stream.empty,
           streamDomainEvents: Stream.fromPubSub(domainEvents),
+          latestSequence: Effect.succeed(0),
           dispatch: () => unsupported(),
         } satisfies OrchestrationEngineService["Service"];
 

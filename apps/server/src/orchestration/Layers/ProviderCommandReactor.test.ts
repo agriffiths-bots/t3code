@@ -746,6 +746,7 @@ describe("ProviderCommandReactor", () => {
           }
           return { sequence: dispatchedCommands.length + 1 };
         }),
+      latestSequence: Effect.succeed(0),
     } satisfies OrchestrationEngineService["Service"];
     const archivedTurnStartEvent: Extract<
       OrchestrationEvent,

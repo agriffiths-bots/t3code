@@ -606,6 +606,7 @@ describe("ChildThreadCoordinator", () => {
           }),
         ),
         dispatch: (command, authority) => Effect.sync(() => recordDispatch(command, authority)),
+        latestSequence: Effect.succeed(0),
       }),
     );
 

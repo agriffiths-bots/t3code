@@ -70,6 +70,7 @@ function makeDesktopWindowLayer(input: { readonly activateCount: Ref.Ref<number>
     handleBackendNotReady: Effect.die("unexpected handleBackendNotReady"),
     dispatchMenuAction: () => Effect.die("unexpected dispatchMenuAction"),
     syncAppearance: Effect.void,
+    flushMainWindowBounds: Effect.void,
   } satisfies DesktopWindow.DesktopWindow["Service"]);
 }
 
