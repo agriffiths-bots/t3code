@@ -415,6 +415,9 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
             liveCtx.session.activeTurnId !== settleTurnId
           ) {
             liveCtx.promptsInFlight = remainingPrompts;
+            // Visible output belongs to the merged turn, not to one prompt.
+            // A steered sibling (remainingPrompts > 0) still needs this flag;
+            // only the turn's terminal settlement may clear it below.
             return;
           }
           liveCtx.promptsInFlight = remainingPrompts;
