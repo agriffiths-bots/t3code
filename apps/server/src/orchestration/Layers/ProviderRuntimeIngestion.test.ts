@@ -50,7 +50,10 @@ import { SqlitePersistenceMemory } from "../../persistence/Layers/Sqlite.ts";
 import * as SubagentDispatchLimiter from "../../mcp/toolkits/subagent/SubagentDispatchLimiter.ts";
 import { makeClaudeAdapter } from "../../provider/Layers/ClaudeAdapter.ts";
 import { makeCodexAdapter } from "../../provider/Layers/CodexAdapter.ts";
-import { PROVIDER_EMPTY_RESPONSE_ERROR } from "../../provider/Layers/providerFailureMessages.ts";
+import {
+  PROVIDER_EMPTY_RESPONSE_ERROR,
+  PROVIDER_SESSION_CLOSED_DURING_TURN_ERROR,
+} from "../../provider/Layers/providerFailureMessages.ts";
 import type { ProviderAdapterError } from "../../provider/Errors.ts";
 import type { CodexAdapterShape } from "../../provider/Services/CodexAdapter.ts";
 import type { ProviderAdapterShape } from "../../provider/Services/ProviderAdapter.ts";
@@ -1968,9 +1971,7 @@ describe("ProviderRuntimeIngestion", () => {
     );
     await harness.drain();
 
-    expect(failedThread.session?.lastError).toBe(
-      "Provider completed the turn without emitting an assistant response.",
-    );
+    expect(failedThread.session?.lastError).toBe(PROVIDER_EMPTY_RESPONSE_ERROR);
     expect(failedThread.latestTurn?.state).toBe("error");
     expect(failedThread.session?.activeTurnId).toBeNull();
     expect(failedThread.messages.filter((message) => message.role === "assistant")).toEqual([]);
@@ -2046,6 +2047,17 @@ describe("ProviderRuntimeIngestion", () => {
       5_000,
       threadId,
     );
+    const terminalBindingDeadline = (await Effect.runPromise(Clock.currentTimeMillis)) + 5_000;
+    while (true) {
+      const binding = Option.getOrUndefined(
+        await Effect.runPromise(stack.directory.getBinding(threadId)),
+      );
+      if (binding?.status === "stopped") break;
+      if ((await Effect.runPromise(Clock.currentTimeMillis)) >= terminalBindingDeadline) {
+        throw new Error("Timed out waiting for the recorded Claude session to stop");
+      }
+      await Effect.runPromise(Effect.yieldNow);
+    }
     await startProviderWatchdog(harness, stack);
     const failedThread = await waitForThread(
       harness.readModel,
@@ -2058,9 +2070,7 @@ describe("ProviderRuntimeIngestion", () => {
     );
     await harness.drain();
 
-    expect(failedThread.session?.lastError).toBe(
-      "Provider session closed while the turn was running.",
-    );
+    expect(failedThread.session?.lastError).toBe(PROVIDER_SESSION_CLOSED_DURING_TURN_ERROR);
     const binding = Option.getOrThrow(
       await Effect.runPromise(stack.directory.getBinding(threadId)),
     );
