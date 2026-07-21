@@ -73,6 +73,31 @@ function waitForFileContent(
   return readAttempt(attempts);
 }
 
+function waitForFileOccurrenceCount(
+  filePath: string,
+  pattern: string,
+  expectedCount: number,
+  attempts = 80,
+): Effect.Effect<void> {
+  const readAttempt = (remainingAttempts: number): Effect.Effect<void> =>
+    Effect.gen(function* () {
+      if (remainingAttempts <= 0) {
+        return yield* Effect.die(
+          new Error(`Timed out waiting for ${expectedCount} '${pattern}' entries at ${filePath}`),
+        );
+      }
+      const raw = yield* Effect.tryPromise(() => NodeFSP.readFile(filePath, "utf8")).pipe(
+        Effect.orElseSucceed(() => ""),
+      );
+      if (raw.split(pattern).length - 1 >= expectedCount) {
+        return;
+      }
+      yield* Effect.sleep("25 millis");
+      return yield* readAttempt(remainingAttempts - 1);
+    });
+  return readAttempt(attempts);
+}
+
 async function readJsonLines(filePath: string) {
   const raw = await NodeFSP.readFile(filePath, "utf8");
   return raw
@@ -285,6 +310,84 @@ it.layer(grokAdapterTestLayer)("GrokAdapterLive", (it) => {
       yield* Fiber.interrupt(runtimeEventsFiber);
       yield* adapter.stopSession(threadId);
     }),
+  );
+
+  it.effect("preserves visible output until a steered shared turn settles", () =>
+    Effect.gen(function* () {
+      const threadId = ThreadId.make("grok-steered-visible-output");
+      const tempDir = yield* Effect.promise(() =>
+        NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "grok-steered-visible-output-")),
+      );
+      const requestLogPath = NodePath.join(tempDir, "requests.ndjson");
+      const wrapperPath = yield* Effect.promise(() =>
+        makeMockGrokWrapper({
+          T3_ACP_REQUEST_LOG_PATH: requestLogPath,
+          T3_ACP_EMPTY_PROMPT_CONTAINING: "steer without more output",
+          T3_ACP_FIRST_PROMPT_RETURN_DELAY_MS: "100",
+          T3_ACP_SECOND_PROMPT_DELAY_MS: "3000",
+          T3_ACP_PROMPT_RESPONSE_TEXT: "visible before steer settlement",
+        }),
+      );
+      const adapter = yield* makeTestAdapter(wrapperPath);
+      const runtimeEvents: ProviderRuntimeEvent[] = [];
+      const visibleOutput = yield* Deferred.make<void>();
+      const turnCompleted =
+        yield* Deferred.make<Extract<ProviderRuntimeEvent, { type: "turn.completed" }>>();
+      const runtimeEventsFiber = yield* Stream.runForEach(adapter.streamEvents, (event) =>
+        Effect.gen(function* () {
+          if (String(event.threadId) !== String(threadId)) {
+            return;
+          }
+          runtimeEvents.push(event);
+          if (
+            event.type === "content.delta" &&
+            event.payload.delta === "visible before steer settlement"
+          ) {
+            yield* Deferred.succeed(visibleOutput, undefined).pipe(Effect.ignore);
+          }
+          if (event.type === "turn.completed") {
+            yield* Deferred.succeed(turnCompleted, event).pipe(Effect.ignore);
+          }
+        }),
+      ).pipe(Effect.forkChild);
+
+      yield* adapter.startSession({
+        threadId,
+        provider: ProviderDriverKind.make("grok"),
+        cwd: process.cwd(),
+        runtimeMode: "full-access",
+      });
+
+      const firstPrompt = yield* adapter
+        .sendTurn({ threadId, input: "emit visible output first", attachments: [] })
+        .pipe(Effect.forkChild);
+      yield* Deferred.await(visibleOutput).pipe(Effect.timeout("2 seconds"));
+      const steeringPrompt = yield* adapter
+        .sendTurn({ threadId, input: "steer without more output", attachments: [] })
+        .pipe(Effect.forkChild);
+      yield* waitForFileOccurrenceCount(requestLogPath, '"method":"session/prompt"', 2);
+
+      const firstResult = yield* Fiber.join(firstPrompt).pipe(Effect.timeout("2 seconds"));
+      const runningSessions = yield* adapter.listSessions();
+      assert.equal(
+        runningSessions.find((session) => session.threadId === threadId)?.status,
+        "running",
+      );
+      const steeringResult = yield* Fiber.join(steeringPrompt).pipe(Effect.timeout("5 seconds"));
+      const completed = yield* Deferred.await(turnCompleted).pipe(Effect.timeout("2 seconds"));
+      const turnCompletedEvents = runtimeEvents.filter(
+        (event): event is Extract<ProviderRuntimeEvent, { type: "turn.completed" }> =>
+          event.type === "turn.completed",
+      );
+
+      assert.equal(String(firstResult.turnId), String(steeringResult.turnId));
+      assert.lengthOf(turnCompletedEvents, 1);
+      assert.equal(String(completed.turnId), String(firstResult.turnId));
+      assert.equal(completed.payload.state, "completed");
+
+      yield* Fiber.interrupt(runtimeEventsFiber);
+      yield* adapter.stopSession(threadId);
+    }).pipe(TestClock.withLive),
   );
 
   it.effect("honors an interrupt pre-marked during the Grok late-output grace", () =>

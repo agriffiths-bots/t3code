@@ -16,6 +16,7 @@ const requestLogPath = process.env.T3_ACP_REQUEST_LOG_PATH;
 const exitLogPath = process.env.T3_ACP_EXIT_LOG_PATH;
 const emitToolCalls = process.env.T3_ACP_EMIT_TOOL_CALLS === "1";
 const emitEmptyTurn = process.env.T3_ACP_EMIT_EMPTY_TURN === "1";
+const emptyPromptContaining = process.env.T3_ACP_EMPTY_PROMPT_CONTAINING;
 const emitUndecodableSessionUpdate = process.env.T3_ACP_EMIT_UNDECODABLE_SESSION_UPDATE === "1";
 const emitCoalescedThoughtMessageBuffer =
   process.env.T3_ACP_EMIT_COALESCED_THOUGHT_MESSAGE_BUFFER === "1";
@@ -79,6 +80,7 @@ const secondPromptDelayMs =
   process.env.T3_ACP_SECOND_PROMPT_DELAY_MS === undefined
     ? undefined
     : Number(process.env.T3_ACP_SECOND_PROMPT_DELAY_MS);
+const firstPromptReturnDelayMs = Number(process.env.T3_ACP_FIRST_PROMPT_RETURN_DELAY_MS ?? "0");
 const permissionOptionIds = {
   allowOnce: process.env.T3_ACP_ALLOW_ONCE_OPTION_ID ?? "allow-once",
   allowAlways: process.env.T3_ACP_ALLOW_ALWAYS_OPTION_ID ?? "allow-always",
@@ -655,6 +657,7 @@ const program = Effect.gen(function* () {
     Effect.gen(function* () {
       const requestedSessionId = String(request.sessionId ?? sessionId);
       promptCount += 1;
+      const currentPromptCount = promptCount;
 
       const effectivePromptDelayMs =
         promptCount === 1 && firstPromptDelayMs !== undefined
@@ -702,6 +705,15 @@ const program = Effect.gen(function* () {
         if (emitDetachedLateUpdateAfterPromptReturn) {
           yield* scheduleDetachedLateUpdateAfterPromptReturn;
         }
+        return { stopReason: "end_turn" };
+      }
+
+      if (
+        emptyPromptContaining !== undefined &&
+        request.prompt.some(
+          (block) => block.type === "text" && block.text.includes(emptyPromptContaining),
+        )
+      ) {
         return { stopReason: "end_turn" };
       }
 
@@ -1160,6 +1172,14 @@ const program = Effect.gen(function* () {
           content: { type: "text", text: promptResponseText ?? "hello from mock" },
         },
       });
+
+      if (
+        currentPromptCount === 1 &&
+        Number.isFinite(firstPromptReturnDelayMs) &&
+        firstPromptReturnDelayMs > 0
+      ) {
+        yield* Effect.sleep(`${firstPromptReturnDelayMs} millis`);
+      }
 
       if (emitDetachedLateUpdateAfterPromptReturn) {
         yield* scheduleDetachedLateUpdateAfterPromptReturn;
