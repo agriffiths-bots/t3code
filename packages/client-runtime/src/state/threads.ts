@@ -6,6 +6,7 @@ import {
   type OrchestrationThread,
   type OrchestrationThreadDetailSnapshot,
   type OrchestrationThreadStreamItem,
+  OrchestrationGetSnapshotError,
   type ThreadId as ThreadIdType,
 } from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
@@ -15,6 +16,7 @@ import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
 import * as Queue from "effect/Queue";
 import * as Ref from "effect/Ref";
+import * as Schema from "effect/Schema";
 import * as Semaphore from "effect/Semaphore";
 import * as Stream from "effect/Stream";
 import * as SubscriptionRef from "effect/SubscriptionRef";
@@ -52,6 +54,32 @@ export const DEFAULT_THREAD_RECONCILIATION_POLICY: ThreadReconciliationPolicy = 
   backoffMultiplier: 2,
   maxBackoffMs: 60_000,
 });
+
+const THREAD_SUBSCRIPTION_RETRY_BASE_MS = 250;
+const THREAD_SUBSCRIPTION_RETRY_MAX_MS = 4_000;
+const THREAD_SUBSCRIPTION_MAX_RETRIES = 4;
+const isOrchestrationGetSnapshotError = Schema.is(OrchestrationGetSnapshotError);
+
+function threadSubscriptionRetryDelay(failureCount: number): Duration.Duration {
+  return Duration.millis(
+    Math.min(
+      THREAD_SUBSCRIPTION_RETRY_BASE_MS * 2 ** Math.max(0, failureCount - 1),
+      THREAD_SUBSCRIPTION_RETRY_MAX_MS,
+    ),
+  );
+}
+
+function isThreadNotFoundCause(cause: Cause.Cause<unknown>): boolean {
+  return (
+    cause.reasons.length > 0 &&
+    cause.reasons.every(
+      (reason) =>
+        reason._tag === "Fail" &&
+        isOrchestrationGetSnapshotError(reason.error) &&
+        reason.error.reason === "not-found",
+    )
+  );
+}
 
 type ThreadReconciliationReason =
   | "recovery-snapshot"
@@ -1414,8 +1442,11 @@ export const makeEnvironmentThreadState = Effect.fn("EnvironmentThreadState.make
     Effect.gen(function* () {
       yield* establishBase;
       yield* subscribeDynamic(ORCHESTRATION_WS_METHODS.subscribeThread, makeSubscribeInput, {
-        onExpectedFailure: setStreamError,
-        retryExpectedFailureAfter: "250 millis",
+        onExpectedFailure: (cause) =>
+          isThreadNotFoundCause(cause) ? setDeleted() : setStreamError(cause),
+        retryExpectedFailureAfter: threadSubscriptionRetryDelay,
+        maxExpectedFailureRetries: THREAD_SUBSCRIPTION_MAX_RETRIES,
+        shouldRetryExpectedFailure: (cause) => !isThreadNotFoundCause(cause),
         onSessionStart: () => prepareSubscription,
         onSessionStop: () => logSubscriptionLifecycle("stop"),
         resubscribe: foregroundResubscriptions,

@@ -4,6 +4,7 @@ import {
   EventId,
   MessageId,
   ORCHESTRATION_WS_METHODS,
+  OrchestrationGetSnapshotError,
   ProjectId,
   ProviderInstanceId,
   ThreadId,
@@ -3207,6 +3208,30 @@ describe("EnvironmentThreads", () => {
       expect(Option.isNone(recovered.error)).toBe(true);
       expect(yield* Ref.get(harness.subscriptionCount)).toBe(2);
       expect(yield* Ref.get(harness.retryCount)).toBe(0);
+    }),
+  );
+
+  it.effect("treats thread not found as terminal without retrying the subscription", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness({ cached: BASE_THREAD });
+      yield* Queue.offer(
+        harness.inputs,
+        new OrchestrationGetSnapshotError({
+          message: `Thread ${THREAD_ID} was not found`,
+          reason: "not-found",
+        }),
+      );
+
+      const deletedState = yield* awaitThreadState(
+        harness.observed,
+        (value) => value.status === "deleted",
+      );
+      yield* TestClock.adjust("1 minute");
+      yield* Effect.yieldNow;
+
+      expect(Option.isNone(deletedState.data)).toBe(true);
+      expect(yield* Ref.get(harness.subscriptionCount)).toBe(1);
+      expect(yield* Ref.get(harness.removedThreads)).toEqual([THREAD_ID]);
     }),
   );
 
