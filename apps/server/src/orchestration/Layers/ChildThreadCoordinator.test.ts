@@ -489,6 +489,7 @@ describe("ChildThreadCoordinator", () => {
           }),
         ),
         dispatch: (command) => Effect.sync(() => recordDispatch(command)),
+        latestSequence: Effect.succeed(0),
       }),
     );
 

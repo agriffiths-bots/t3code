@@ -532,7 +532,11 @@ const titleUpdated = (
 });
 
 const legacyTitleUpdated = (title: string, sequence: number): OrchestrationThreadStreamItem => {
-  const { storageEpoch: _storageEpoch, ...item } = titleUpdated(title, sequence);
+  const full = titleUpdated(title, sequence);
+  if (full.kind !== "event") {
+    throw new Error(`expected an event frame, received ${full.kind}`);
+  }
+  const { storageEpoch: _storageEpoch, ...item } = full;
   return item;
 };
 
@@ -603,14 +607,21 @@ const deleted = (sequence = 3, storageEpoch = STORAGE_EPOCH): OrchestrationThrea
 });
 
 const legacyDeleted = (sequence: number): OrchestrationThreadStreamItem => {
-  const { storageEpoch: _storageEpoch, ...item } = deleted(sequence);
+  const full = deleted(sequence);
+  if (full.kind !== "event") {
+    throw new Error(`expected an event frame, received ${full.kind}`);
+  }
+  const { storageEpoch: _storageEpoch, ...item } = full;
   return item;
 };
 
-const forcedDeleted = (sequence: number): OrchestrationThreadStreamItem => ({
-  ...deleted(sequence),
-  force: true,
-});
+const forcedDeleted = (sequence: number): OrchestrationThreadStreamItem => {
+  const base = deleted(sequence);
+  if (base.kind !== "event") {
+    throw new Error(`expected an event frame, received ${base.kind}`);
+  }
+  return { ...base, force: true };
+};
 
 const archived = (sequence = 3, storageEpoch = STORAGE_EPOCH): OrchestrationThreadStreamItem => ({
   kind: "event",
@@ -1774,8 +1785,10 @@ describe("EnvironmentThreads", () => {
           thread: { ...BASE_THREAD, title: "Stale HTTP thread" },
         }),
       });
-      yield* Queue.offer(harness.inputs, snapshot(BASE_THREAD));
-      yield* Queue.offer(harness.inputs, deleted());
+      // The fork seeds the resume cursor from the warm cache (CACHED_SNAPSHOT_SEQUENCE),
+      // so live frames must advance past it to apply; otherwise they are deduped as stale.
+      yield* Queue.offer(harness.inputs, snapshot(BASE_THREAD, CACHED_SNAPSHOT_SEQUENCE + 1));
+      yield* Queue.offer(harness.inputs, deleted(CACHED_SNAPSHOT_SEQUENCE + 2));
       yield* awaitThreadState(harness.observed, (value) => value.status === "deleted");
 
       expect(yield* Ref.get(harness.loaderCalls)).toBe(0);

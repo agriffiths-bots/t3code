@@ -38,6 +38,7 @@ import * as ServerConfig from "./config.ts";
 import * as ProjectionSnapshotQuery from "./orchestration/Services/ProjectionSnapshotQuery.ts";
 import * as OrchestrationEngine from "./orchestration/Services/OrchestrationEngine.ts";
 import { OrchestrationLayerLive } from "./orchestration/runtimeLayer.ts";
+import { trustedSystemDispatchAuthority } from "./orchestration/commandAudienceGuard.ts";
 import { orchestrationHttpApiLayer } from "./orchestration/http.ts";
 import { layerConfig as SqlitePersistenceLayerLive } from "./persistence/Layers/Sqlite.ts";
 import { OrchestrationEventStore } from "./persistence/Services/OrchestrationEventStore.ts";
@@ -530,22 +531,25 @@ it.layer(NodeServices.layer)("bin cli parsing", (it) => {
       const config = yield* makeCliTestServerConfig(baseDir);
       yield* Effect.gen(function* () {
         const engine = yield* OrchestrationEngine.OrchestrationEngineService;
-        yield* engine.dispatch({
-          type: "thread.create",
-          commandId: CommandId.make("cmd-cli-force-remove-thread"),
-          threadId: ThreadId.make("thread-cli-force-remove"),
-          projectId: project!.id,
-          title: "Thread",
-          modelSelection: {
-            instanceId: ProviderInstanceId.make("codex"),
-            model: "gpt-5-codex",
+        yield* engine.dispatch(
+          {
+            type: "thread.create",
+            commandId: CommandId.make("cmd-cli-force-remove-thread"),
+            threadId: ThreadId.make("thread-cli-force-remove"),
+            projectId: project!.id,
+            title: "Thread",
+            modelSelection: {
+              instanceId: ProviderInstanceId.make("codex"),
+              model: "gpt-5-codex",
+            },
+            interactionMode: "default",
+            runtimeMode: "approval-required",
+            branch: null,
+            worktreePath: null,
+            createdAt: DateTime.formatIso(yield* DateTime.now),
           },
-          interactionMode: "default",
-          runtimeMode: "approval-required",
-          branch: null,
-          worktreePath: null,
-          createdAt: DateTime.formatIso(yield* DateTime.now),
-        });
+          trustedSystemDispatchAuthority("cli-test"),
+        );
       }).pipe(Effect.provide(makeProjectPersistenceLayer(config)));
 
       yield* runCliWithRuntime([

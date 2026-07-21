@@ -26,6 +26,7 @@ import { EnvironmentSupervisor } from "../connection/supervisor.ts";
 import * as ConnectionWakeups from "../connection/wakeups.ts";
 import { EnvironmentCacheStore } from "../platform/persistence.ts";
 import { subscribeDynamic } from "../rpc/client.ts";
+import type { RpcSession } from "../rpc/session.ts";
 import { ThreadRevisionLoader, ThreadSnapshotLoader } from "./threadSnapshotHttp.ts";
 import { ThreadReconciliationActivity } from "./threadReconciliationActivity.ts";
 import { parseThreadKey, threadKey } from "./entities.ts";
@@ -1323,101 +1324,103 @@ export const makeEnvironmentThreadState = Effect.fn("EnvironmentThreadState.make
     yield* logSubscriptionLifecycle("start");
   });
 
+  // Establish the base snapshot to resume from exactly once, minimizing bytes
+  // over the wire: reuse the warm cache when present, otherwise cold-load the
+  // authoritative snapshot over HTTP. Overlapping/replayed events are deduped by
+  // sequence in applyItem. Session boundaries revalidate via prepareSubscription
+  // (which discards an untrustworthy epochless cursor), and foreground
+  // resubscribes resume from the live cursor rather than re-applying a stale base.
+  const establishBase = Effect.gen(function* () {
+    const base = Option.isSome(cached)
+      ? cached
+      : yield* Effect.gen(function* () {
+          const prepared = yield* SubscriptionRef.get(supervisor.prepared).pipe(
+            Effect.flatMap(
+              Option.match({
+                onSome: Effect.succeed,
+                onNone: () =>
+                  SubscriptionRef.changes(supervisor.prepared).pipe(
+                    Stream.filter(Option.isSome),
+                    Stream.map((value) => value.value),
+                    Stream.runHead,
+                    Effect.map(Option.getOrThrow),
+                  ),
+              }),
+            ),
+          );
+          return yield* snapshotLoader.load(prepared, threadId);
+        });
+
+    if (Option.isSome(base)) {
+      const baseStorageEpoch = Option.fromNullishOr(base.value.storageEpoch);
+      if (Option.isSome(baseStorageEpoch)) {
+        yield* Ref.set(currentStorageEpoch, baseStorageEpoch);
+        subscribeInput.storageEpoch = baseStorageEpoch.value;
+        yield* applyItem({
+          kind: "snapshot",
+          storageEpoch: baseStorageEpoch.value,
+          snapshot: base.value,
+        });
+        yield* advanceLastSequence(base.value.snapshotSequence);
+      } else {
+        const accepted = yield* applySnapshot(base.value, {
+          allowCurrentSequence: true,
+          skipMatchingCurrentSequence: true,
+        });
+        if (accepted) {
+          yield* acknowledgeSnapshotRevision(
+            base.value.latestSequence ?? base.value.snapshotSequence,
+            base.value.latestEventId,
+            base.value.latestSequence !== undefined && base.value.latestEventId !== undefined,
+          );
+        }
+        delete subscribeInput.afterSequence;
+      }
+    } else {
+      delete subscribeInput.afterSequence;
+    }
+  });
+
+  const makeSubscribeInput = Effect.fn("EnvironmentThreadState.makeSubscribeInput")(function* (
+    session: RpcSession,
+  ) {
+    const supportsCompletionMarker = yield* session.initialConfig.pipe(
+      Effect.map((config) => config.threadResumeCompletionMarker === true),
+      Effect.orElseSucceed(() => false),
+    );
+    yield* Ref.set(awaitingCompletion, supportsCompletionMarker);
+    yield* setSynchronizing;
+
+    const current = yield* SubscriptionRef.get(state);
+    const canResume = Option.isSome(current.data);
+    if (!supportsCompletionMarker && canResume) {
+      yield* SubscriptionRef.update(state, (value) => ({
+        ...value,
+        status: value.status === "deleted" ? value.status : ("live" as const),
+        error: Option.none(),
+      }));
+    }
+
+    // Resume from the reconciliation cursor, which carries the epoch and
+    // revision markers the server needs to reconcile restored history.
+    return {
+      ...subscribeInput,
+      ...(supportsCompletionMarker ? { requestCompletionMarker: true as const } : {}),
+    };
+  });
+
   yield* setSynchronizing;
   yield* Effect.forkScoped(
-    subscribeDynamic(
-      ORCHESTRATION_WS_METHODS.subscribeThread,
-      Effect.fn("EnvironmentThreadState.makeSubscribeInput")(function* (session) {
-        const supportsCompletionMarker = yield* session.initialConfig.pipe(
-          Effect.map((config) => config.threadResumeCompletionMarker === true),
-          Effect.orElseSucceed(() => false),
-        );
-        yield* Ref.set(awaitingCompletion, supportsCompletionMarker);
-        yield* setSynchronizing;
-
-        let current = yield* SubscriptionRef.get(state);
-        if (Option.isNone(current.data) && current.status !== "deleted") {
-          // Establish the base snapshot to resume from, minimizing bytes over
-          // the wire: reuse the warm cache when present, otherwise cold-load the
-          // authoritative snapshot over HTTP. Overlapping/replayed events are
-          // deduped by sequence in applyItem. Only runs when we have no data
-          // yet, so foreground resubscribes resume via the cursor instead.
-          const base = Option.isSome(cached)
-            ? cached
-            : yield* Effect.gen(function* () {
-                const prepared = yield* SubscriptionRef.get(supervisor.prepared).pipe(
-                  Effect.flatMap(
-                    Option.match({
-                      onSome: Effect.succeed,
-                      onNone: () =>
-                        SubscriptionRef.changes(supervisor.prepared).pipe(
-                          Stream.filter(Option.isSome),
-                          Stream.map((value) => value.value),
-                          Stream.runHead,
-                          Effect.map(Option.getOrThrow),
-                        ),
-                    }),
-                  ),
-                );
-                return yield* snapshotLoader.load(prepared, threadId);
-              });
-
-          if (Option.isSome(base)) {
-            const baseStorageEpoch = Option.fromNullishOr(base.value.storageEpoch);
-            if (Option.isSome(baseStorageEpoch)) {
-              yield* Ref.set(currentStorageEpoch, baseStorageEpoch);
-              subscribeInput.storageEpoch = baseStorageEpoch.value;
-              yield* applyItem({
-                kind: "snapshot",
-                storageEpoch: baseStorageEpoch.value,
-                snapshot: base.value,
-              });
-              yield* advanceLastSequence(base.value.snapshotSequence);
-            } else {
-              const accepted = yield* applySnapshot(base.value, {
-                allowCurrentSequence: true,
-                skipMatchingCurrentSequence: true,
-              });
-              if (accepted) {
-                yield* acknowledgeSnapshotRevision(
-                  base.value.latestSequence ?? base.value.snapshotSequence,
-                  base.value.latestEventId,
-                  base.value.latestSequence !== undefined &&
-                    base.value.latestEventId !== undefined,
-                );
-              }
-              delete subscribeInput.afterSequence;
-            }
-          } else {
-            delete subscribeInput.afterSequence;
-          }
-          current = yield* SubscriptionRef.get(state);
-        }
-
-        const canResume = Option.isSome(current.data);
-        if (!supportsCompletionMarker && canResume) {
-          yield* SubscriptionRef.update(state, (value) => ({
-            ...value,
-            status: value.status === "deleted" ? value.status : ("live" as const),
-            error: Option.none(),
-          }));
-        }
-
-        // Resume from the reconciliation cursor, which carries the epoch and
-        // revision markers the server needs to reconcile restored history.
-        return {
-          ...subscribeInput,
-          ...(supportsCompletionMarker ? { requestCompletionMarker: true as const } : {}),
-        };
-      }),
-      {
+    Effect.gen(function* () {
+      yield* establishBase;
+      yield* subscribeDynamic(ORCHESTRATION_WS_METHODS.subscribeThread, makeSubscribeInput, {
         onExpectedFailure: setStreamError,
         retryExpectedFailureAfter: "250 millis",
         onSessionStart: () => prepareSubscription,
         onSessionStop: () => logSubscriptionLifecycle("stop"),
         resubscribe: foregroundResubscriptions,
-      },
-    ).pipe(Stream.runForEach(applyItem)),
+      }).pipe(Stream.runForEach(applyItem));
+    }),
   );
 
   yield* Effect.addFinalizer(() =>

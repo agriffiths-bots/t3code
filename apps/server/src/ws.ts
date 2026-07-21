@@ -27,6 +27,7 @@ import {
   NonNegativeInt,
   OrchestrationDispatchCommandError,
   type OrchestrationEvent,
+  type OrchestrationShellStreamEvent,
   type OrchestrationShellStreamItem,
   type OrchestrationThreadStreamItem,
   OrchestrationGetFullThreadDiffError,
@@ -642,11 +643,7 @@ const makeWsRpcLayer = (currentSession: EnvironmentAuth.AuthenticatedSession) =>
 
       const toShellStreamEvent = (
         event: OrchestrationEvent,
-      ): Effect.Effect<
-        Option.Option<OrchestrationShellStreamItem>,
-        OrchestrationGetSnapshotError,
-        never
-      > => {
+      ): Effect.Effect<Option.Option<OrchestrationShellStreamItem>, never, never> => {
         switch (event.type) {
           case "project.created":
           case "project.meta-updated":
@@ -655,21 +652,19 @@ const makeWsRpcLayer = (currentSession: EnvironmentAuth.AuthenticatedSession) =>
             if (currentSession.audienceCeiling === "private") {
               return projectUpsertOrRemove(event.payload.projectId, event.sequence);
             }
+            // A non-private audience change can reveal or hide aggregates beyond
+            // the project row itself, so force a fresh authoritative shell. If
+            // that read fails, fall back to re-emitting just the project so the
+            // coalescing stream never fails (matching the retry-backed helpers).
             return projectionSnapshotQuery.getShellSnapshot().pipe(
               Effect.map((snapshot) =>
-                Option.some({
+                Option.some<OrchestrationShellStreamItem>({
                   kind: "snapshot" as const,
                   snapshot,
                   force: true,
                 }),
               ),
-              Effect.mapError(
-                (cause) =>
-                  new OrchestrationGetSnapshotError({
-                    message: "Failed to refresh orchestration shell after audience promotion",
-                    cause,
-                  }),
-              ),
+              Effect.catch(() => projectUpsertOrRemove(event.payload.projectId, event.sequence)),
             );
           case "project.deleted":
             return Effect.succeed(
@@ -804,7 +799,7 @@ const makeWsRpcLayer = (currentSession: EnvironmentAuth.AuthenticatedSession) =>
       const SHELL_REFETCH_CONCURRENCY = 8;
       const coalesceShellEvents = (
         events: ReadonlyArray<OrchestrationEvent>,
-      ): Effect.Effect<ReadonlyArray<OrchestrationShellStreamEvent>, never, never> =>
+      ): Effect.Effect<ReadonlyArray<OrchestrationShellStreamItem>, never, never> =>
         Effect.gen(function* () {
           if (events.length === 0) {
             return [];
@@ -830,7 +825,7 @@ const makeWsRpcLayer = (currentSession: EnvironmentAuth.AuthenticatedSession) =>
       const SHELL_COALESCE_MAX_CHUNK = 512;
       const coalesceShellStream = <E, R>(
         stream: Stream.Stream<OrchestrationEvent, E, R>,
-      ): Stream.Stream<OrchestrationShellStreamEvent, E, R> =>
+      ): Stream.Stream<OrchestrationShellStreamItem, E, R> =>
         stream.pipe(
           Stream.groupedWithin(SHELL_COALESCE_MAX_CHUNK, SHELL_COALESCE_WINDOW),
           Stream.mapEffect(coalesceShellEvents),
@@ -1404,6 +1399,8 @@ const makeWsRpcLayer = (currentSession: EnvironmentAuth.AuthenticatedSession) =>
                     withCompletionMarker,
                   );
                 }),
+              );
+            }),
             { "rpc.aggregate": "orchestration" },
           ),
         // `scheduled_tasks` is not event-sourced, so freshness comes from the
