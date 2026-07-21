@@ -1188,6 +1188,7 @@ const makeWsRpcLayer = (currentSession: EnvironmentAuth.AuthenticatedSession) =>
               if (!canReadThread) {
                 return yield* new OrchestrationGetSnapshotError({
                   message: `Thread ${input.threadId} was not found`,
+                  reason: "not-found",
                   cause: input.threadId,
                 });
               }
@@ -1381,6 +1382,7 @@ const makeWsRpcLayer = (currentSession: EnvironmentAuth.AuthenticatedSession) =>
                     }
                     return yield* new OrchestrationGetSnapshotError({
                       message: `Thread ${input.threadId} was not found`,
+                      reason: "not-found",
                       cause: input.threadId,
                     });
                   }
