@@ -10,6 +10,7 @@ import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
 import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
@@ -208,6 +209,55 @@ it.layer(grokAdapterTestLayer)("GrokAdapterLive", (it) => {
       if (delta?.type === "content.delta") {
         assert.equal(delta.payload.delta, "hello from mock");
       }
+
+      yield* adapter.stopSession(threadId);
+    }),
+  );
+
+  it.effect("keeps the Grok notification consumer alive after the start caller exits", () =>
+    Effect.gen(function* () {
+      const threadId = ThreadId.make("grok-start-caller-exited");
+      const wrapperPath = yield* Effect.promise(() => makeMockGrokWrapper());
+      const adapter = yield* makeTestAdapter(wrapperPath);
+      const runtimeEvents: ProviderRuntimeEvent[] = [];
+      const turnCompleted = yield* Deferred.make<void>();
+      const runtimeEventsFiber = yield* Stream.runForEach(adapter.streamEvents, (event) =>
+        Effect.sync(() => {
+          runtimeEvents.push(event);
+        }).pipe(
+          Effect.andThen(
+            event.type === "turn.completed" && String(event.threadId) === String(threadId)
+              ? Deferred.succeed(turnCompleted, undefined)
+              : Effect.void,
+          ),
+        ),
+      ).pipe(Effect.forkChild);
+
+      const startFiber = yield* adapter
+        .startSession({
+          threadId,
+          provider: ProviderDriverKind.make("grok"),
+          cwd: process.cwd(),
+          runtimeMode: "full-access",
+        })
+        .pipe(Effect.forkChild);
+      yield* Fiber.join(startFiber);
+
+      const turnResult = yield* adapter
+        .sendTurn({
+          threadId,
+          input: "PONG",
+          attachments: [],
+        })
+        .pipe(Effect.timeoutOption("1 second"));
+
+      assert.isTrue(Option.isSome(turnResult));
+      yield* Deferred.await(turnCompleted);
+      yield* Fiber.interrupt(runtimeEventsFiber);
+      assert.includeMembers(
+        runtimeEvents.map((event) => event.type),
+        ["turn.started", "content.delta", "turn.completed"] as const,
+      );
 
       yield* adapter.stopSession(threadId);
     }),

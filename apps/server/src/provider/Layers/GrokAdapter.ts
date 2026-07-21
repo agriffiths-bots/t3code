@@ -944,7 +944,7 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
             Effect.catch((cause) =>
               Effect.logError("Failed to process Grok runtime notification.", { cause }),
             ),
-            Effect.forkChild,
+            Effect.forkIn(sessionScope),
           );
 
           ctx.notificationFiber = nf;
