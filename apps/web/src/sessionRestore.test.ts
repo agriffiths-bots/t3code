@@ -6,7 +6,7 @@ const connectedInput = {
   catalogReady: true,
   environmentPresent: true,
   connectionPhase: "connected" as const,
-  shellBootstrapped: true,
+  shellAuthoritative: true,
   shellHasThread: true,
   draftExists: false,
   timedOut: false,
@@ -36,13 +36,13 @@ describe("session restore launch smoke", () => {
       resolveSessionRestore({
         ...connectedInput,
         connectionPhase: "connecting",
-        shellBootstrapped: false,
+        shellAuthoritative: false,
       }),
     ).toEqual({ kind: "connecting" });
     expect(
       resolveSessionRestore({
         ...connectedInput,
-        shellBootstrapped: false,
+        shellAuthoritative: false,
       }),
     ).toEqual({ kind: "restoring" });
   });
@@ -52,16 +52,44 @@ describe("session restore launch smoke", () => {
       resolveSessionRestore({
         ...connectedInput,
         connectionPhase: "reconnecting",
-        shellBootstrapped: false,
+        shellAuthoritative: false,
         timedOut: true,
       }),
     ).toEqual({ kind: "connection-error" });
     expect(
       resolveSessionRestore({
         ...connectedInput,
-        shellBootstrapped: false,
+        shellAuthoritative: false,
         timedOut: true,
       }),
     ).toEqual({ kind: "restore-error" });
+  });
+
+  it("waits for a live shell before rejecting a thread absent from cache", () => {
+    expect(
+      resolveSessionRestore({
+        ...connectedInput,
+        shellAuthoritative: false,
+        shellHasThread: false,
+      }),
+    ).toEqual({ kind: "restoring" });
+    expect(
+      resolveSessionRestore({
+        ...connectedInput,
+        shellAuthoritative: true,
+        shellHasThread: false,
+      }),
+    ).toEqual({ kind: "stale" });
+  });
+
+  it("keeps a known restored thread mounted while the live shell resynchronizes", () => {
+    expect(
+      resolveSessionRestore({
+        ...connectedInput,
+        shellAuthoritative: false,
+        detailStatus: "ready",
+        timedOut: true,
+      }),
+    ).toEqual({ kind: "ready" });
   });
 });

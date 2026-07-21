@@ -115,7 +115,7 @@ function RestoringThread(props: {
     catalogReady: true,
     environmentPresent: true,
     connectionPhase: "connected",
-    shellBootstrapped: true,
+    shellAuthoritative: true,
     shellHasThread: true,
     draftExists: props.draftThreadExists,
     detailStatus,
@@ -171,7 +171,7 @@ function ChatThreadRouteView() {
   );
   const serverThreadShell = useThreadShell(threadRef);
   const environmentThreadRefs = useEnvironmentThreadRefs(threadRef?.environmentId ?? null);
-  const shellBootstrapped = shell.data?.snapshot._tag === "Some";
+  const shellAuthoritative = shell.data?.status === "live";
   const shellHasThread =
     serverThreadShell !== null ||
     (threadRef !== null &&
@@ -186,7 +186,7 @@ function ChatThreadRouteView() {
     catalogReady,
     environmentPresent: environment !== null,
     connectionPhase: environment?.connection.phase ?? null,
-    shellBootstrapped,
+    shellAuthoritative,
     shellHasThread,
     draftExists: draftThreadExists,
     ...(shellHasThread ? { detailStatus: "ready" as const } : {}),

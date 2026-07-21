@@ -15,7 +15,7 @@ export function resolveSessionRestore(input: {
   readonly catalogReady: boolean;
   readonly environmentPresent: boolean;
   readonly connectionPhase: EnvironmentConnectionPhase | null;
-  readonly shellBootstrapped: boolean;
+  readonly shellAuthoritative: boolean;
   readonly shellHasThread: boolean;
   readonly draftExists: boolean;
   readonly detailStatus?: "pending" | "ready" | "deleted" | "error";
@@ -33,14 +33,14 @@ export function resolveSessionRestore(input: {
     }
     return { kind: "connecting" };
   }
-  if (!input.shellBootstrapped) {
-    return input.timedOut ? { kind: "restore-error" } : { kind: "restoring" };
-  }
-  if (!input.shellHasThread && !input.draftExists) {
-    return { kind: "stale" };
-  }
   if (input.draftExists) {
     return { kind: "ready" };
+  }
+  if (!input.shellHasThread) {
+    if (!input.shellAuthoritative) {
+      return input.timedOut ? { kind: "restore-error" } : { kind: "restoring" };
+    }
+    return { kind: "stale" };
   }
   switch (input.detailStatus) {
     case "ready":
