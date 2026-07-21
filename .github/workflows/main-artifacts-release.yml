@@ -23,11 +23,13 @@ jobs:
       release_tag: ${{ steps.nightly.outputs.tag }}
       release_name: ${{ steps.nightly.outputs.name }}
       release_version: ${{ steps.nightly.outputs.version }}
+      stable_baseline_tag: ${{ steps.stable_baseline.outputs.latest_tag }}
     steps:
       - name: Checkout
         uses: actions/checkout@v6
         with:
           ref: ${{ github.sha }}
+          fetch-depth: 0
 
       - name: Setup Vite+
         uses: voidzero-dev/setup-vp@v1
@@ -46,6 +48,16 @@ jobs:
             --date "$nightly_date" \
             --run-number "${{ github.run_number }}" \
             --sha "$GITHUB_SHA" \
+            --github-output
+
+      - id: stable_baseline
+        name: Snapshot latest stable tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          git tag --list 'v*' > "$RUNNER_TEMP/stable-tags.txt"
+          node scripts/resolve-stable-promotion.ts \
+            --tags-file "$RUNNER_TEMP/stable-tags.txt" \
             --github-output
 
   public_config:
@@ -144,6 +156,46 @@ jobs:
       prerelease: true
       windows_signing: true
     secrets: inherit
+
+  record_nightly_source:
+    name: Record verified-nightly source
+    needs: [metadata, publish_artifacts]
+    if: ${{ github.ref == 'refs/heads/main' && needs.publish_artifacts.result == 'success' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Write immutable source metadata
+        env:
+          NIGHTLY_TAG: ${{ needs.metadata.outputs.release_tag }}
+          NIGHTLY_VERSION: ${{ needs.metadata.outputs.release_version }}
+          STABLE_BASELINE_TAG: ${{ needs.metadata.outputs.stable_baseline_tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          jq -n \
+            --arg commit "$GITHUB_SHA" \
+            --arg nightlyTag "$NIGHTLY_TAG" \
+            --arg nightlyVersion "$NIGHTLY_VERSION" \
+            --arg stableBaselineTag "$STABLE_BASELINE_TAG" \
+            --argjson sourceRunId "$GITHUB_RUN_ID" \
+            --arg sourceRunUrl "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+            '{
+              schemaVersion: 1,
+              commit: $commit,
+              nightlyTag: $nightlyTag,
+              nightlyVersion: $nightlyVersion,
+              stableBaselineTag: $stableBaselineTag,
+              sourceRunId: $sourceRunId,
+              sourceRunUrl: $sourceRunUrl
+            }' > verified-nightly-source.json
+
+      - name: Upload verified-nightly source metadata
+        uses: actions/upload-artifact@v7
+        with:
+          name: verified-nightly-source
+          path: verified-nightly-source.json
+          if-no-files-found: error
+          retention-days: 14
 
   prune_nightly:
     name: Prune old nightly releases

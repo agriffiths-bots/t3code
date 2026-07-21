@@ -213,12 +213,16 @@ describe("artifact release workflows", () => {
       const reusableWorkflowPath = yield* path.fromFileUrl(
         new URL("../../../.github/workflows/reusable-build-release-artifacts.yml", import.meta.url),
       );
+      const verifiedNightlyWorkflowPath = yield* path.fromFileUrl(
+        new URL("../../../.github/workflows/verified-nightly-promotion.yml", import.meta.url),
+      );
       const ciWorkflowPath = yield* path.fromFileUrl(
         new URL("../../../.github/workflows/ci.yml", import.meta.url),
       );
       const stableWorkflow = yield* fileSystem.readFileString(stableWorkflowPath);
       const mainWorkflow = yield* fileSystem.readFileString(mainWorkflowPath);
       const reusableWorkflow = yield* fileSystem.readFileString(reusableWorkflowPath);
+      const verifiedNightlyWorkflow = yield* fileSystem.readFileString(verifiedNightlyWorkflowPath);
       const ciWorkflow = yield* fileSystem.readFileString(ciWorkflowPath);
 
       for (const workflow of [stableWorkflow, mainWorkflow]) {
@@ -278,6 +282,9 @@ describe("artifact release workflows", () => {
       expect(mainWorkflow).not.toContain("inputs.prerelease");
       expect(mainWorkflow).toContain("prerelease: true");
       expect(mainWorkflow).toContain("windows_signing: true");
+      expect(mainWorkflow).toContain("stable_baseline_tag:");
+      expect(mainWorkflow).toContain("name: verified-nightly-source");
+      expect(mainWorkflow).toContain("sourceRunId: $sourceRunId");
       // Nightly prereleases would otherwise accumulate one release/day forever;
       // a retention job prunes stale nightly prereleases after a successful publish.
       expect(mainWorkflow).toContain("prune_nightly:");
@@ -324,6 +331,45 @@ describe("artifact release workflows", () => {
       expect(reusableWorkflow).not.toContain("inputs.platform");
       expect(reusableWorkflow).toContain("needs.windows_x64.result == 'success'");
       expect(reusableWorkflow).toContain("needs.windows_launch_smoke.result == 'success'");
+      expect(reusableWorkflow).toContain("publish_release:");
+      expect(reusableWorkflow).toContain("artifact_suffix:");
+      expect(reusableWorkflow).toContain("if: inputs.publish_release");
+      expect(reusableWorkflow).toContain("if: ${{ !inputs.publish_release }}");
+      expect(reusableWorkflow).toContain("name: release-assets${{ inputs.artifact_suffix }}");
+
+      expect(verifiedNightlyWorkflow).toContain("name: Verified Nightly Promotion");
+      expect(verifiedNightlyWorkflow).toContain('workflows: ["Main Artifact Release"]');
+      expect(verifiedNightlyWorkflow).toContain("Refuse rerun-to-green promotion");
+      expect(verifiedNightlyWorkflow).toContain("Refuse rerun-to-green publication");
+      expect(verifiedNightlyWorkflow).toContain("github.event.workflow_run.run_attempt != 1");
+      expect(verifiedNightlyWorkflow).toContain("Provider E2E Gate");
+      expect(verifiedNightlyWorkflow).toContain(
+        "apps/server/src/orchestration/Layers/ProviderRuntimeIngestion.test.ts",
+      );
+      expect(verifiedNightlyWorkflow).toContain(
+        "apps/server/src/provider/Layers/fixtures/recorded-claude-agent-*-turn.jsonl",
+      );
+      expect(verifiedNightlyWorkflow).toContain(
+        "apps/server/src/provider/Layers/CursorAdapter.test.ts",
+      );
+      expect(verifiedNightlyWorkflow).toContain("Peer-spawn Characterization Gate");
+      expect(verifiedNightlyWorkflow).toContain(
+        "apps/server/src/mcp/toolkits/subagent/handlers.test.ts",
+      );
+      expect(verifiedNightlyWorkflow).toContain(
+        "run-id: ${{ needs.source.outputs.source_run_id }}",
+      );
+      expect(verifiedNightlyWorkflow).toContain("name: windows-x64");
+      expect(verifiedNightlyWorkflow).toContain("publish_release: false");
+      expect(verifiedNightlyWorkflow).toContain("artifact_suffix: -stable-promotion");
+      expect(verifiedNightlyWorkflow).toContain('--expected-latest "$STABLE_BASELINE_TAG"');
+      expect(verifiedNightlyWorkflow).toContain('gh release create "$RELEASE_TAG"');
+      expect(verifiedNightlyWorkflow).toContain(
+        'gh api --method POST "repos/$GITHUB_REPOSITORY/git/refs"',
+      );
+      expect(verifiedNightlyWorkflow).toContain('-f sha="$SOURCE_SHA"');
+      expect(verifiedNightlyWorkflow).toContain("--verify-tag");
+      expect(verifiedNightlyWorkflow).toContain("--latest");
       expect(ciWorkflow).not.toContain("mobile_native_static_analysis:");
       expect(ciWorkflow).not.toContain("brew bundle install --file apps/mobile/Brewfile");
       expect(ciWorkflow).not.toContain("run: vp run lint:mobile");
