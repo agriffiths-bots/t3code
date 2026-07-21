@@ -1585,14 +1585,11 @@ describe("ProviderRuntimeIngestion", () => {
           return stack.providerService.stopFailedSession(input);
         }
         disappearedStopAttempts += 1;
-        if (input.requireSessionAbsent !== true) {
-          return stack.providerService.stopFailedSession(input);
-        }
-        const { requireSessionAbsent: _requireSessionAbsent, ...ownedInput } = input;
-        return stack.providerService.stopFailedSession({
-          ...ownedInput,
-          allowLegacyActiveTurnMatch: true,
-        });
+        // This double models a provider process that is already absent. Run
+        // the watchdog's ownership/projection callbacks without delegating to
+        // the stale recorded service, whose session snapshot intentionally no
+        // longer represents the live provider.
+        return input.onOwned.pipe(Effect.andThen(input.onStopped), Effect.as(true));
       },
     };
     const harness = await createHarness({
