@@ -35,6 +35,14 @@ jobs:
           echo "::error::Neither the nightly build nor its promotion may be retried to green. Wait for a new nightly artifact."
           exit 1
 
+      - name: Checkout nightly commit
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          fetch-depth: 0
+
+      # Checkout cleans untracked paths, so the immutable source evidence must
+      # be downloaded afterwards or `source/` is removed before validation.
       - name: Download source metadata
         uses: actions/download-artifact@v7
         with:
@@ -43,12 +51,6 @@ jobs:
           run-id: ${{ github.event.workflow_run.id }}
           name: verified-nightly-source
           path: source
-
-      - name: Checkout nightly commit
-        uses: actions/checkout@v6
-        with:
-          ref: ${{ github.event.workflow_run.head_sha }}
-          fetch-depth: 0
 
       - id: source
         name: Verify release and commit identity
