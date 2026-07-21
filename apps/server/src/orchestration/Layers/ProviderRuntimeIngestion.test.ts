@@ -691,13 +691,14 @@ describe("ProviderRuntimeIngestion", () => {
   async function startProviderWatchdog(
     harness: Awaited<ReturnType<typeof createHarness>>,
     stack: Awaited<ReturnType<typeof createRecordedCodexStack>>,
+    providerService: ProviderServiceShape = stack.providerService,
   ) {
     if (!runtime) throw new Error("Provider runtime ingestion harness is not initialized.");
     const layer = makeProviderSessionReaperLive({
       sweepIntervalMs: 10,
       stopTimeoutMs: 1_000,
     }).pipe(
-      Layer.provideMerge(Layer.succeed(ProviderService, stack.providerService)),
+      Layer.provideMerge(Layer.succeed(ProviderService, providerService)),
       Layer.provideMerge(Layer.succeed(ProviderSessionDirectory, stack.directory)),
       Layer.provideMerge(Layer.succeed(ProjectionSnapshotQuery, harness.snapshotQuery)),
       Layer.provideMerge(Layer.succeed(OrchestrationEngineService, harness.engine)),
@@ -1551,11 +1552,48 @@ describe("ProviderRuntimeIngestion", () => {
 
   it("lets the watchdog fail a recorded Codex turn after process death loses its terminal event", async () => {
     const stack = await createRecordedCodexStack("death");
+    const disappearedThreadIds = new Set<ThreadId>();
+    let disappearedStopAttempts = 0;
     const providerServiceWithoutTerminalEvents: ProviderServiceShape = {
       ...stack.providerService,
+      sendTurn: (input) =>
+        stack.providerService.sendTurn(input).pipe(
+          Effect.tap(() =>
+            Effect.sync(() => {
+              disappearedThreadIds.add(input.threadId);
+            }),
+          ),
+        ),
       streamEvents: stack.providerService.streamEvents.pipe(
+        Stream.tap((event) =>
+          event.type === "session.exited"
+            ? Effect.sync(() => disappearedThreadIds.add(event.threadId))
+            : Effect.void,
+        ),
         Stream.filter((event) => event.type !== "session.exited"),
       ),
+      listSessions: () =>
+        stack.providerService
+          .listSessions()
+          .pipe(
+            Effect.map((sessions) =>
+              sessions.filter((session) => !disappearedThreadIds.has(session.threadId)),
+            ),
+          ),
+      stopFailedSession: (input) => {
+        if (!disappearedThreadIds.has(input.threadId)) {
+          return stack.providerService.stopFailedSession(input);
+        }
+        disappearedStopAttempts += 1;
+        if (input.requireSessionAbsent !== true) {
+          return stack.providerService.stopFailedSession(input);
+        }
+        const { requireSessionAbsent: _requireSessionAbsent, ...ownedInput } = input;
+        return stack.providerService.stopFailedSession({
+          ...ownedInput,
+          allowLegacyActiveTurnMatch: true,
+        });
+      },
     };
     const harness = await createHarness({
       providerService: providerServiceWithoutTerminalEvents,
@@ -1594,7 +1632,7 @@ describe("ProviderRuntimeIngestion", () => {
       }),
     );
     await Effect.runPromise(
-      stack.providerService.sendTurn({
+      providerServiceWithoutTerminalEvents.sendTurn({
         threadId,
         input: "Reply exactly PONG.",
         modelSelection: harness.modelSelection,
@@ -1611,7 +1649,12 @@ describe("ProviderRuntimeIngestion", () => {
       5_000,
       threadId,
     );
-    await startProviderWatchdog(harness, stack);
+    expect(
+      (await Effect.runPromise(providerServiceWithoutTerminalEvents.listSessions())).some(
+        (session) => session.threadId === threadId,
+      ),
+    ).toBe(false);
+    await startProviderWatchdog(harness, stack, providerServiceWithoutTerminalEvents);
     const failedThread = await waitForThread(
       harness.readModel,
       (thread) =>
@@ -1636,6 +1679,7 @@ describe("ProviderRuntimeIngestion", () => {
     expect(await harness.readProjectedTurns(threadId)).toEqual([
       { turnId: providerTurnId, state: "error" },
     ]);
+    expect(disappearedStopAttempts).toBeGreaterThan(0);
   });
 
   xit.each(["codex", "grok", "claudeAgent"] as const)(

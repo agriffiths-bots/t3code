@@ -62,7 +62,10 @@ import {
 } from "../../persistence/Layers/Sqlite.ts";
 import * as ServerSettings from "../../serverSettings.ts";
 import * as AnalyticsService from "../../telemetry/AnalyticsService.ts";
-import { makeAdapterRegistryMock } from "../testUtils/providerAdapterRegistryMock.ts";
+import {
+  makeAdapterRegistryMock,
+  type KindAdapterMap,
+} from "../testUtils/providerAdapterRegistryMock.ts";
 
 const defaultServerSettingsLayer = ServerSettings.ServerSettingsService.layerTest();
 
@@ -73,9 +76,11 @@ const asTurnId = (value: string): TurnId => TurnId.make(value);
 const environmentId = EnvironmentId.make("environment-provider-service-test");
 const codexInstanceId = ProviderInstanceId.make("codex");
 const claudeAgentInstanceId = ProviderInstanceId.make("claudeAgent");
+const grokInstanceId = ProviderInstanceId.make("grok");
 const cursorInstanceId = ProviderInstanceId.make("cursor");
 const CODEX_DRIVER = ProviderDriverKind.make("codex");
 const CLAUDE_AGENT_DRIVER = ProviderDriverKind.make("claudeAgent");
+const GROK_DRIVER = ProviderDriverKind.make("grok");
 const CURSOR_DRIVER = ProviderDriverKind.make("cursor");
 
 type LegacyProviderRuntimeEvent = {
@@ -293,6 +298,74 @@ function makeFakeCodexAdapter(provider: ProviderDriverKind = CODEX_DRIVER) {
 const advanceTestClock = (ms: number) =>
   TestClock.adjust(`${ms} millis`).pipe(Effect.andThen(Effect.yieldNow));
 
+interface MeaningfulOutputCase {
+  readonly name: string;
+  readonly provider: ProviderDriverKind;
+  readonly providerInstanceId: ProviderInstanceId;
+  readonly output: Pick<LegacyProviderRuntimeEvent, "type" | "payload"> & {
+    readonly itemId?: string;
+  };
+}
+
+const assertSuccessfulOutputOnlyTurn = (
+  testCase: MeaningfulOutputCase,
+  adapter: ReturnType<typeof makeFakeCodexAdapter>,
+) =>
+  Effect.gen(function* () {
+    const provider = yield* ProviderService.ProviderService;
+    const testId = testCase.name.toLowerCase().replaceAll(" ", "-");
+    const threadId = asThreadId(`thread-${testId}`);
+    const turnId = asTurnId(`turn-${testId}`);
+    yield* provider.startSession(threadId, {
+      provider: testCase.provider,
+      providerInstanceId: testCase.providerInstanceId,
+      threadId,
+      runtimeMode: "full-access",
+    });
+    const completedEventId = asEventId(`evt-${testId}-completed`);
+    const completed = yield* provider.streamEvents.pipe(
+      Stream.filter((event) => event.eventId === completedEventId),
+      Stream.take(1),
+      Stream.runCollect,
+      Effect.forkChild,
+    );
+    yield* advanceTestClock(50);
+
+    adapter.emit({
+      type: "turn.started",
+      eventId: asEventId(`evt-${testId}-started`),
+      provider: testCase.provider,
+      createdAt: "2026-01-01T00:00:00.000Z",
+      threadId,
+      turnId,
+      payload: {},
+    });
+    adapter.emit({
+      ...testCase.output,
+      eventId: asEventId(`evt-${testId}-output`),
+      provider: testCase.provider,
+      createdAt: "2026-01-01T00:00:01.000Z",
+      threadId,
+      turnId,
+    });
+    adapter.emit({
+      type: "turn.completed",
+      eventId: completedEventId,
+      provider: testCase.provider,
+      createdAt: "2026-01-01T00:00:02.000Z",
+      threadId,
+      turnId,
+      payload: { state: "completed" },
+    });
+
+    const events = Array.from(yield* Fiber.join(completed));
+    assert.equal(events[0]?.type, "turn.completed");
+    if (events[0]?.type === "turn.completed") {
+      assert.equal(events[0].payload.state, "completed");
+      assert.equal(events[0].payload.errorMessage, undefined);
+    }
+  });
+
 const hasMetricSnapshot = (
   snapshots: ReadonlyArray<Metric.Metric.Snapshot>,
   id: string,
@@ -304,15 +377,17 @@ const hasMetricSnapshot = (
       Object.entries(attributes).every(([key, value]) => snapshot.attributes?.[key] === value),
   );
 
-function makeProviderServiceLayer(options?: ProviderServiceLiveOptions) {
+function makeProviderServiceLayer(options?: ProviderServiceLiveOptions, adapters?: KindAdapterMap) {
   const codex = makeFakeCodexAdapter();
   const claude = makeFakeCodexAdapter(CLAUDE_AGENT_DRIVER);
   const cursor = makeFakeCodexAdapter(CURSOR_DRIVER);
-  const registry = makeAdapterRegistryMock({
-    [ProviderDriverKind.make("codex")]: codex.adapter,
-    [ProviderDriverKind.make("claudeAgent")]: claude.adapter,
-    [ProviderDriverKind.make("cursor")]: cursor.adapter,
-  });
+  const registry = makeAdapterRegistryMock(
+    adapters ?? {
+      [ProviderDriverKind.make("codex")]: codex.adapter,
+      [ProviderDriverKind.make("claudeAgent")]: claude.adapter,
+      [ProviderDriverKind.make("cursor")]: cursor.adapter,
+    },
+  );
 
   const providerAdapterLayer = Layer.succeed(
     ProviderAdapterRegistry.ProviderAdapterRegistry,
@@ -3424,6 +3499,10 @@ routing.layer("ProviderServiceLive routing", (it) => {
 });
 
 const fanout = makeProviderServiceLayer();
+const grokOutputAdapter = makeFakeCodexAdapter(GROK_DRIVER);
+const grokFanout = makeProviderServiceLayer(undefined, {
+  [GROK_DRIVER]: grokOutputAdapter.adapter,
+});
 it.effect("ProviderServiceLive clears MCP credentials when a provider adapter is replaced", () =>
   Effect.gen(function* () {
     const firstCodex = makeFakeCodexAdapter();
@@ -3820,7 +3899,7 @@ fanout.layer("ProviderServiceLive fanout", (it) => {
     }),
   );
 
-  it.effect("turns an empty successful adapter response into an explicit failure", () =>
+  it.effect("turns a control-only successful adapter response into an explicit failure", () =>
     Effect.gen(function* () {
       const provider = yield* ProviderService.ProviderService;
       const session = yield* provider.startSession(asThreadId("thread-empty-response"), {
@@ -3838,10 +3917,77 @@ fanout.layer("ProviderServiceLive fanout", (it) => {
       yield* advanceTestClock(50);
 
       fanout.codex.emit({
+        type: "turn.started",
+        eventId: asEventId("evt-empty-response-started"),
+        provider: ProviderDriverKind.make("codex"),
+        createdAt: "2026-01-01T00:00:00.000Z",
+        threadId: session.threadId,
+        turnId: asTurnId("turn-empty-response"),
+        payload: {},
+      });
+      fanout.codex.emit({
+        type: "thread.token-usage.updated",
+        eventId: asEventId("evt-empty-response-usage"),
+        provider: ProviderDriverKind.make("codex"),
+        createdAt: "2026-01-01T00:00:01.000Z",
+        threadId: session.threadId,
+        turnId: asTurnId("turn-empty-response"),
+        payload: { usage: { usedTokens: 1 } },
+      });
+      fanout.codex.emit({
+        type: "turn.proposed.delta",
+        eventId: asEventId("evt-empty-response-blank-plan"),
+        provider: ProviderDriverKind.make("codex"),
+        createdAt: "2026-01-01T00:00:02.000Z",
+        threadId: session.threadId,
+        turnId: asTurnId("turn-empty-response"),
+        payload: { delta: "   " },
+      });
+      fanout.codex.emit({
+        type: "item.completed",
+        eventId: asEventId("evt-empty-response-assistant-shell"),
+        provider: ProviderDriverKind.make("codex"),
+        createdAt: "2026-01-01T00:00:03.000Z",
+        threadId: session.threadId,
+        turnId: asTurnId("turn-empty-response"),
+        itemId: "item-empty-response-assistant-shell",
+        payload: { itemType: "assistant_message", status: "completed" },
+      });
+      fanout.codex.emit({
+        type: "item.completed",
+        eventId: asEventId("evt-empty-response-reasoning-shell"),
+        provider: ProviderDriverKind.make("codex"),
+        createdAt: "2026-01-01T00:00:04.000Z",
+        threadId: session.threadId,
+        turnId: asTurnId("turn-empty-response"),
+        itemId: "item-empty-response-reasoning-shell",
+        payload: { itemType: "reasoning", status: "completed" },
+      });
+      fanout.codex.emit({
+        type: "item.started",
+        eventId: asEventId("evt-empty-response-tool-started"),
+        provider: ProviderDriverKind.make("codex"),
+        createdAt: "2026-01-01T00:00:05.000Z",
+        threadId: session.threadId,
+        turnId: asTurnId("turn-empty-response"),
+        itemId: "item-empty-response-tool",
+        payload: { itemType: "command_execution", status: "inProgress" },
+      });
+      fanout.codex.emit({
+        type: "item.updated",
+        eventId: asEventId("evt-empty-response-tool-progress"),
+        provider: ProviderDriverKind.make("codex"),
+        createdAt: "2026-01-01T00:00:06.000Z",
+        threadId: session.threadId,
+        turnId: asTurnId("turn-empty-response"),
+        itemId: "item-empty-response-tool",
+        payload: { itemType: "command_execution", status: "inProgress" },
+      });
+      fanout.codex.emit({
         type: "turn.completed",
         eventId: asEventId("evt-empty-response-completed"),
         provider: ProviderDriverKind.make("codex"),
-        createdAt: "2026-01-01T00:00:00.000Z",
+        createdAt: "2026-01-01T00:00:07.000Z",
         threadId: session.threadId,
         turnId: asTurnId("turn-empty-response"),
         payload: { state: "completed" },
@@ -3853,7 +3999,7 @@ fanout.layer("ProviderServiceLive fanout", (it) => {
         eventId: asEventId("evt-empty-response-completed"),
         provider: ProviderDriverKind.make("codex"),
         providerInstanceId: codexInstanceId,
-        createdAt: "2026-01-01T00:00:00.000Z",
+        createdAt: "2026-01-01T00:00:07.000Z",
         threadId: session.threadId,
         turnId: asTurnId("turn-empty-response"),
         payload: {
@@ -3862,6 +4008,117 @@ fanout.layer("ProviderServiceLive fanout", (it) => {
         },
       });
     }),
+  );
+
+  it.effect.each<
+    MeaningfulOutputCase & {
+      readonly adapter: "codex" | "claude" | "cursor";
+    }
+  >([
+    {
+      name: "Codex proposed plan",
+      adapter: "codex",
+      provider: CODEX_DRIVER,
+      providerInstanceId: codexInstanceId,
+      output: {
+        type: "turn.proposed.completed",
+        payload: { planMarkdown: "# Proposed plan" },
+      },
+    },
+    {
+      name: "Codex proposed plan delta",
+      adapter: "codex",
+      provider: CODEX_DRIVER,
+      providerInstanceId: codexInstanceId,
+      output: {
+        type: "turn.proposed.delta",
+        payload: { delta: "Draft the migration steps" },
+      },
+    },
+    {
+      name: "Codex reasoning delta",
+      adapter: "codex",
+      provider: CODEX_DRIVER,
+      providerInstanceId: codexInstanceId,
+      output: {
+        type: "content.delta",
+        payload: { streamKind: "reasoning_text", delta: "Consider the constraints" },
+      },
+    },
+    {
+      name: "Codex diff",
+      adapter: "codex",
+      provider: CODEX_DRIVER,
+      providerInstanceId: codexInstanceId,
+      output: {
+        type: "turn.diff.updated",
+        payload: { unifiedDiff: "@@ -1 +1 @@\n-before\n+after" },
+      },
+    },
+    {
+      name: "Codex tool result",
+      adapter: "codex",
+      provider: CODEX_DRIVER,
+      providerInstanceId: codexInstanceId,
+      output: {
+        type: "item.completed",
+        itemId: "codex-tool-item",
+        payload: { itemType: "command_execution", status: "completed" },
+      },
+    },
+    {
+      name: "Claude proposed plan",
+      adapter: "claude",
+      provider: CLAUDE_AGENT_DRIVER,
+      providerInstanceId: claudeAgentInstanceId,
+      output: {
+        type: "turn.proposed.completed",
+        payload: { planMarkdown: "# Claude plan" },
+      },
+    },
+    {
+      name: "Claude task completion",
+      adapter: "claude",
+      provider: CLAUDE_AGENT_DRIVER,
+      providerInstanceId: claudeAgentInstanceId,
+      output: {
+        type: "task.completed",
+        payload: { taskId: "claude-task", status: "completed", summary: "Task finished" },
+      },
+    },
+    {
+      name: "Claude hook completion",
+      adapter: "claude",
+      provider: CLAUDE_AGENT_DRIVER,
+      providerInstanceId: claudeAgentInstanceId,
+      output: {
+        type: "hook.completed",
+        payload: { hookId: "claude-hook", outcome: "success", output: "Hook finished" },
+      },
+    },
+    {
+      name: "Cursor proposed plan",
+      adapter: "cursor",
+      provider: CURSOR_DRIVER,
+      providerInstanceId: cursorInstanceId,
+      output: {
+        type: "turn.proposed.completed",
+        payload: { planMarkdown: "# Cursor plan" },
+      },
+    },
+    {
+      name: "Cursor tool result",
+      adapter: "cursor",
+      provider: CURSOR_DRIVER,
+      providerInstanceId: cursorInstanceId,
+      output: {
+        type: "item.completed",
+        itemId: "cursor-tool-item",
+        payload: { itemType: "file_change", status: "completed" },
+      },
+    },
+  ])("preserves successful $name-only turns", (testCase) =>
+    assertSuccessfulOutputOnlyTurn(testCase, fanout[testCase.adapter]),
   );
 
   it.effect("fans out canonical runtime events in emission order", () =>
@@ -5344,6 +5601,32 @@ fanout.layer("ProviderServiceLive fanout", (it) => {
           true,
         );
       }),
+  );
+});
+
+grokFanout.layer("ProviderServiceLive Grok output guard", (it) => {
+  it.effect.each<MeaningfulOutputCase>([
+    {
+      name: "Grok plan update",
+      provider: GROK_DRIVER,
+      providerInstanceId: grokInstanceId,
+      output: {
+        type: "turn.plan.updated",
+        payload: { plan: [{ step: "Inspect", status: "completed" }] },
+      },
+    },
+    {
+      name: "Grok tool result",
+      provider: GROK_DRIVER,
+      providerInstanceId: grokInstanceId,
+      output: {
+        type: "item.completed",
+        itemId: "grok-tool-item",
+        payload: { itemType: "dynamic_tool_call", status: "completed" },
+      },
+    },
+  ])("preserves successful $name-only turns", (testCase) =>
+    assertSuccessfulOutputOnlyTurn(testCase, grokOutputAdapter),
   );
 });
 

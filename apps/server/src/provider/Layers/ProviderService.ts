@@ -365,6 +365,63 @@ const isTerminalTurnRuntimeEvent = (event: ProviderRuntimeEvent): boolean =>
 const isStartedTurnRuntimeEvent = (event: ProviderRuntimeEvent): boolean =>
   event.type === "turn.started";
 
+const hasNonWhitespaceText = (value: unknown): value is string =>
+  typeof value === "string" && value.trim().length > 0;
+
+const isMeaningfulCompletedItem = (
+  payload: Extract<
+    ProviderRuntimeEvent,
+    { readonly type: "item.started" | "item.updated" | "item.completed" }
+  >["payload"],
+): boolean => {
+  switch (payload.itemType) {
+    case "assistant_message":
+    case "reasoning":
+    case "plan":
+      return hasNonWhitespaceText(payload.detail);
+    case "user_message":
+    case "error":
+    case "unknown":
+      return false;
+    default:
+      return true;
+  }
+};
+
+const isMeaningfulTurnOutputEvent = (event: ProviderRuntimeEvent): boolean => {
+  switch (event.type) {
+    case "turn.plan.updated":
+      return event.payload.plan.length > 0 || hasNonWhitespaceText(event.payload.explanation);
+    case "turn.proposed.delta":
+      return hasNonWhitespaceText(event.payload.delta);
+    case "turn.proposed.completed":
+      return hasNonWhitespaceText(event.payload.planMarkdown);
+    case "turn.diff.updated":
+      return hasNonWhitespaceText(event.payload.unifiedDiff);
+    case "content.delta":
+      return hasNonWhitespaceText(event.payload.delta);
+    case "item.completed":
+      // Providers emit empty assistant/reasoning/plan lifecycle shells around
+      // their actual deltas. Only detail-bearing shells count; tool and other
+      // structured work items are meaningful by their lifecycle alone.
+      return isMeaningfulCompletedItem(event.payload);
+    case "item.updated":
+      return event.payload.status !== undefined && event.payload.status !== "inProgress"
+        ? isMeaningfulCompletedItem(event.payload)
+        : false;
+    case "thread.realtime.audio.delta":
+    case "task.completed":
+    case "hook.completed":
+    case "tool.summary":
+    case "tool.denied":
+      return true;
+    case "files.persisted":
+      return event.payload.files.length > 0;
+    default:
+      return false;
+  }
+};
+
 const EMPTY_ASSISTANT_RESPONSE_ERROR =
   "Provider completed the turn without emitting an assistant response.";
 
@@ -392,7 +449,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
   const registry = yield* ProviderAdapterRegistry.ProviderAdapterRegistry;
   const directory = yield* ProviderSessionDirectory.ProviderSessionDirectory;
   const runtimeEventPubSub = yield* PubSub.unbounded<ProviderRuntimeEvent>();
-  const turnsWithAssistantOutputByAdapter = new WeakMap<
+  const turnsWithMeaningfulOutputByAdapter = new WeakMap<
     ProviderAdapterShape<ProviderAdapterError>,
     Map<ProviderInstanceId, Map<ThreadId, Set<string>>>
   >();
@@ -402,12 +459,12 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
     instanceId: ProviderInstanceId,
     threadId: ThreadId,
   ) => {
-    const instances = turnsWithAssistantOutputByAdapter.get(adapter);
+    const instances = turnsWithMeaningfulOutputByAdapter.get(adapter);
     const sessions = instances?.get(instanceId);
     if (sessions === undefined) return;
     sessions.delete(threadId);
     if (sessions.size === 0) instances?.delete(instanceId);
-    if (instances?.size === 0) turnsWithAssistantOutputByAdapter.delete(adapter);
+    if (instances?.size === 0) turnsWithMeaningfulOutputByAdapter.delete(adapter);
   };
 
   const clearTrackedTurnOutput = (
@@ -416,7 +473,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
     threadId: ThreadId,
     turnId: TurnId | string,
   ): boolean => {
-    const sessions = turnsWithAssistantOutputByAdapter.get(adapter)?.get(instanceId);
+    const sessions = turnsWithMeaningfulOutputByAdapter.get(adapter)?.get(instanceId);
     const turns = sessions?.get(threadId);
     if (turns === undefined) return false;
     const hadOutput = turns.delete(String(turnId));
@@ -449,31 +506,16 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
       clearTrackedSessionOutput(source.adapter, source.instanceId, event.threadId);
       return event;
     }
-    if (
-      (event.type === "content.delta" &&
-        payload !== undefined &&
-        "streamKind" in payload &&
-        payload.streamKind === "assistant_text" &&
-        "delta" in payload &&
-        typeof payload.delta === "string" &&
-        payload.delta.trim().length > 0) ||
-      (event.type === "item.completed" &&
-        payload !== undefined &&
-        "itemType" in payload &&
-        payload.itemType === "assistant_message" &&
-        "detail" in payload &&
-        typeof payload.detail === "string" &&
-        payload.detail.trim().length > 0)
-    ) {
+    if (isMeaningfulTurnOutputEvent(event)) {
       const instances =
-        turnsWithAssistantOutputByAdapter.get(source.adapter) ??
+        turnsWithMeaningfulOutputByAdapter.get(source.adapter) ??
         new Map<ProviderInstanceId, Map<ThreadId, Set<string>>>();
       const sessions = instances.get(source.instanceId) ?? new Map<ThreadId, Set<string>>();
       const turns = sessions.get(event.threadId) ?? new Set<string>();
       turns.add(String(turnId));
       sessions.set(event.threadId, turns);
       instances.set(source.instanceId, sessions);
-      turnsWithAssistantOutputByAdapter.set(source.adapter, instances);
+      turnsWithMeaningfulOutputByAdapter.set(source.adapter, instances);
       return event;
     }
     if (event.type === "turn.aborted") {
@@ -482,7 +524,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
     }
     if (event.type !== "turn.completed") return event;
 
-    const hasAssistantOutput = clearTrackedTurnOutput(
+    const hasMeaningfulOutput = clearTrackedTurnOutput(
       source.adapter,
       source.instanceId,
       event.threadId,
@@ -492,7 +534,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
       payload === undefined ||
       !("state" in payload) ||
       payload.state !== "completed" ||
-      hasAssistantOutput
+      hasMeaningfulOutput
     ) {
       return event;
     }
