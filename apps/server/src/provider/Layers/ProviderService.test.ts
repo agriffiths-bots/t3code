@@ -5577,8 +5577,202 @@ fanout.layer("ProviderServiceLive fanout", (it) => {
     }),
   );
 
+  it.effect("stops an inactive session only while its full binding snapshot remains current", () =>
+    Effect.gen(function* () {
+      const threadId = asThreadId("thread-inactive-stop-binding-fence");
+      const provider = yield* ProviderService.ProviderService;
+      const directory = yield* ProviderSessionDirectory.ProviderSessionDirectory;
+      const stopInactiveSession = provider.stopInactiveSession;
+      if (stopInactiveSession === undefined) {
+        return assert.fail("Expected the live provider service to support fenced inactive stops");
+      }
+      yield* provider.startSession(threadId, {
+        provider: ProviderDriverKind.make("codex"),
+        providerInstanceId: codexInstanceId,
+        threadId,
+        runtimeMode: "full-access",
+      });
+      const expectedBinding = Option.getOrThrow(
+        Option.fromUndefinedOr(
+          (yield* directory.listBindings()).find((binding) => binding.threadId === threadId),
+        ),
+      );
+      const stopsBefore = fanout.codex.stopSession.mock.calls.length;
+
+      yield* advanceTestClock(1);
+      yield* directory.upsert(expectedBinding);
+      const refreshedBinding = Option.getOrThrow(
+        Option.fromUndefinedOr(
+          (yield* directory.listBindings()).find((binding) => binding.threadId === threadId),
+        ),
+      );
+      assert.notEqual(refreshedBinding.lastSeenAt, expectedBinding.lastSeenAt);
+
+      assert.equal(yield* stopInactiveSession({ threadId, expectedBinding }), false);
+      assert.equal(fanout.codex.stopSession.mock.calls.length, stopsBefore);
+      assert.notEqual(Option.getOrThrow(yield* directory.getBinding(threadId)).status, "stopped");
+
+      assert.equal(
+        yield* stopInactiveSession({ threadId, expectedBinding: refreshedBinding }),
+        true,
+      );
+      assert.equal(fanout.codex.stopSession.mock.calls.length, stopsBefore + 1);
+      assert.equal(Option.getOrThrow(yield* directory.getBinding(threadId)).status, "stopped");
+    }),
+  );
+
+  it.effect("serializes a fenced inactive stop against a replacement start", () =>
+    Effect.gen(function* () {
+      const threadId = asThreadId("thread-inactive-stop-replacement-race");
+      const provider = yield* ProviderService.ProviderService;
+      const directory = yield* ProviderSessionDirectory.ProviderSessionDirectory;
+      const stopInactiveSession = provider.stopInactiveSession;
+      if (stopInactiveSession === undefined) {
+        return assert.fail("Expected the live provider service to support fenced inactive stops");
+      }
+      yield* provider.startSession(threadId, {
+        provider: ProviderDriverKind.make("codex"),
+        providerInstanceId: codexInstanceId,
+        threadId,
+        runtimeMode: "full-access",
+      });
+      const expectedBinding = Option.getOrThrow(
+        Option.fromUndefinedOr(
+          (yield* directory.listBindings()).find((binding) => binding.threadId === threadId),
+        ),
+      );
+      const previousOwnershipId = (
+        expectedBinding.runtimePayload as { readonly sessionOwnershipId?: unknown }
+      ).sessionOwnershipId;
+      const stopEntered = yield* Deferred.make<void>();
+      const allowStop = yield* Deferred.make<void>();
+      fanout.codex.stopSession.mockImplementationOnce(() =>
+        Effect.gen(function* () {
+          yield* Deferred.succeed(stopEntered, undefined);
+          yield* Deferred.await(allowStop);
+        }),
+      );
+
+      const stopFiber = yield* stopInactiveSession({ threadId, expectedBinding }).pipe(
+        Effect.forkChild,
+      );
+      yield* Deferred.await(stopEntered);
+      const replacementFiber = yield* provider
+        .startSession(threadId, {
+          provider: ProviderDriverKind.make("codex"),
+          providerInstanceId: codexInstanceId,
+          threadId,
+          runtimeMode: "full-access",
+        })
+        .pipe(Effect.forkChild);
+      yield* Effect.yieldNow;
+      yield* Deferred.succeed(allowStop, undefined);
+
+      assert.equal(yield* Fiber.join(stopFiber), true);
+      yield* Fiber.join(replacementFiber);
+      const replacementBinding = Option.getOrThrow(yield* directory.getBinding(threadId));
+      assert.equal(replacementBinding.status, "running");
+      assert.notEqual(
+        (replacementBinding.runtimePayload as { readonly sessionOwnershipId?: unknown })
+          .sessionOwnershipId,
+        previousOwnershipId,
+      );
+    }),
+  );
+
+  it.effect("serializes a forced stale failure projection against a replacement start", () =>
+    Effect.gen(function* () {
+      const threadId = asThreadId("thread-force-fail-replacement-race");
+      const turnId = asTurnId("turn-force-fail-replacement-race");
+      const provider = yield* ProviderService.ProviderService;
+      const directory = yield* ProviderSessionDirectory.ProviderSessionDirectory;
+      const forceFailStaleSession = provider.forceFailStaleSession;
+      if (forceFailStaleSession === undefined) {
+        return assert.fail("Expected the live provider service to support fenced force failures");
+      }
+      yield* provider.startSession(threadId, {
+        provider: ProviderDriverKind.make("codex"),
+        providerInstanceId: codexInstanceId,
+        threadId,
+        runtimeMode: "full-access",
+      });
+      const runningBinding = Option.getOrThrow(yield* directory.getBinding(threadId));
+      const runningPayload = runningBinding.runtimePayload as Record<string, unknown>;
+      yield* directory.upsert({
+        ...runningBinding,
+        status: "error",
+        runtimePayload: {
+          ...runningPayload,
+          activeTurnId: null,
+          lastTerminalTurnId: turnId,
+        },
+      });
+      const expectedBinding = Option.getOrThrow(yield* directory.getBinding(threadId));
+      const previousOwnershipId = (
+        expectedBinding.runtimePayload as { readonly sessionOwnershipId?: unknown }
+      ).sessionOwnershipId;
+      const projectionEntered = yield* Deferred.make<void>();
+      const allowProjection = yield* Deferred.make<void>();
+      const order = yield* Ref.make<ReadonlyArray<string>>([]);
+
+      const forceFiber = yield* forceFailStaleSession({
+        threadId,
+        turnId,
+        expectedBinding,
+        onOwned: Effect.gen(function* () {
+          yield* Ref.update(order, (events) => [...events, "projection-started"]);
+          yield* Deferred.succeed(projectionEntered, undefined);
+          yield* Deferred.await(allowProjection);
+          yield* Ref.update(order, (events) => [...events, "projection-finished"]);
+        }),
+        onSettled: directory
+          .upsert({
+            ...expectedBinding,
+            status: "stopped",
+            runtimePayload: {
+              ...(expectedBinding.runtimePayload as Record<string, unknown>),
+              activeTurnId: null,
+              lastTerminalTurnId: turnId,
+            },
+          })
+          .pipe(Effect.tap(() => Ref.update(order, (events) => [...events, "settled"]))),
+      }).pipe(Effect.forkChild);
+      yield* Deferred.await(projectionEntered);
+      const replacementFiber = yield* provider
+        .startSession(threadId, {
+          provider: ProviderDriverKind.make("codex"),
+          providerInstanceId: codexInstanceId,
+          threadId,
+          runtimeMode: "full-access",
+        })
+        .pipe(
+          Effect.tap(() => Ref.update(order, (events) => [...events, "replacement-started"])),
+          Effect.forkChild,
+        );
+      yield* Effect.yieldNow;
+      yield* Deferred.succeed(allowProjection, undefined);
+
+      assert.equal(yield* Fiber.join(forceFiber), true);
+      yield* Fiber.join(replacementFiber);
+      assert.deepEqual(yield* Ref.get(order), [
+        "projection-started",
+        "projection-finished",
+        "settled",
+        "replacement-started",
+      ]);
+      const replacementBinding = Option.getOrThrow(yield* directory.getBinding(threadId));
+      assert.equal(replacementBinding.status, "running");
+      assert.notEqual(
+        (replacementBinding.runtimePayload as { readonly sessionOwnershipId?: unknown })
+          .sessionOwnershipId,
+        previousOwnershipId,
+      );
+    }),
+  );
+
   it.effect("does not stop a replacement session when failed cleanup loses the start race", () =>
     Effect.gen(function* () {
+      fanout.codex.stopSession.mockClear();
       const threadId = asThreadId("thread-failed-cleanup-replacement-race");
       const provider = yield* ProviderService.ProviderService;
       const directory = yield* ProviderSessionDirectory.ProviderSessionDirectory;

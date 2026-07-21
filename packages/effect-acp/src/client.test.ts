@@ -917,4 +917,46 @@ it.layer(NodeServices.layer)("effect-acp client", (it) => {
       yield* Scope.close(scope, Exit.void);
     }),
   );
+
+  it.effect(
+    "drops a foreign string-id response (grok skills-reload leak) without killing the receive loop",
+    () =>
+      Effect.gen(function* () {
+        const { stdio, input, output } = yield* makeInMemoryStdio();
+        const scope = yield* Scope.make();
+        const acp = yield* AcpClient.make(stdio).pipe(Effect.provideService(Scope.Scope, scope));
+
+        const promptFiber = yield* acp.agent
+          .prompt({
+            sessionId: "grok-session-1",
+            prompt: [{ type: "text", text: "hello" }],
+          })
+          .pipe(Effect.forkScoped);
+
+        const outbound = yield* Queue.take(output);
+        const decodedPrompt = yield* decodePromptRequestLine(outbound);
+
+        // Recorded from grok CLI 0.2.93: a skills-directory change broadcasts a JSON-RPC
+        // response with the fixed string id "skills-reload" to every session. It matches no
+        // outstanding request and its id is not numeric, so it must be dropped rather than
+        // forwarded into the RPC client, whose request-id decoding requires numeric ids.
+        const skillsReloadLeak = new TextEncoder().encode(
+          '{"jsonrpc":"2.0","id":"skills-reload","result":{"result":{"reloaded":1}}}\n',
+        );
+        yield* Queue.offer(input, skillsReloadLeak);
+        yield* Queue.offer(input, skillsReloadLeak);
+
+        yield* Queue.offer(
+          input,
+          yield* encodeJsonl(PromptResponse, {
+            jsonrpc: "2.0",
+            id: decodedPrompt.id,
+            result: { stopReason: "end_turn" },
+          }),
+        );
+
+        assert.deepEqual(yield* Fiber.join(promptFiber), { stopReason: "end_turn" });
+        yield* Scope.close(scope, Exit.void);
+      }),
+  );
 });

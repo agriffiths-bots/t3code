@@ -49,6 +49,7 @@ const decodeRequestPermissionResponse = Schema.decodeEffect(
   Schema.fromJsonString(RequestPermissionResponse),
 );
 const encodeUnknownJsonString = Schema.encodeUnknownSync(Schema.UnknownFromJsonString);
+const decodeUnknownJsonString = Schema.decodeUnknownEffect(Schema.UnknownFromJsonString);
 const encoder = new TextEncoder();
 const mockPeerPath = Effect.map(Effect.service(Path.Path), (path) =>
   path.join(import.meta.dirname, "../test/fixtures/acp-mock-peer.ts"),
@@ -368,6 +369,100 @@ it.layer(NodeServices.layer)("effect-acp protocol", (it) => {
     }),
   );
 
+  it.effect("preserves string ids for inbound extension request replies", () =>
+    Effect.gen(function* () {
+      const { stdio, input, output } = yield* makeInMemoryStdio();
+      yield* AcpProtocol.makeAcpPatchedProtocol({
+        stdio,
+        serverRequestMethods: new Set(),
+        onExtRequest: (method, params) => Effect.succeed({ method, params }),
+      });
+
+      for (const id of ["skills-reload", "42"]) {
+        yield* Queue.offer(
+          input,
+          encoder.encode(
+            `${encodeUnknownJsonString({
+              jsonrpc: "2.0",
+              id,
+              method: "x/test",
+              params: { hello: "world" },
+            })}\n`,
+          ),
+        );
+
+        assert.deepEqual(yield* decodeUnknownJsonString(yield* Queue.take(output)), {
+          jsonrpc: "2.0",
+          id,
+          result: { method: "x/test", params: { hello: "world" } },
+        });
+      }
+    }),
+  );
+
+  it.effect("drops a string-typed Exit that resembles a pending numeric extension request", () =>
+    Effect.gen(function* () {
+      const { stdio, input, output } = yield* makeInMemoryStdio();
+      const transport = yield* AcpProtocol.makeAcpPatchedProtocol({
+        stdio,
+        serverRequestMethods: new Set(),
+      });
+      const response = yield* transport
+        .request("x/test", { hello: "world" })
+        .pipe(Effect.forkScoped);
+      yield* Queue.take(output);
+
+      yield* Queue.offer(
+        input,
+        encoder.encode(
+          `${encodeUnknownJsonString({
+            jsonrpc: "2.0",
+            id: "1",
+            result: { foreign: true },
+          })}\n${encodeUnknownJsonString({
+            jsonrpc: "2.0",
+            id: 1,
+            result: { ok: true },
+          })}\n`,
+        ),
+      );
+
+      assert.deepEqual(yield* Fiber.join(response), { ok: true });
+    }),
+  );
+
+  it.effect("drops a string-typed Chunk that resembles a pending numeric extension request", () =>
+    Effect.gen(function* () {
+      const { stdio, input, output } = yield* makeInMemoryStdio();
+      const transport = yield* AcpProtocol.makeAcpPatchedProtocol({
+        stdio,
+        serverRequestMethods: new Set(),
+      });
+      const response = yield* transport
+        .request("x/test", { hello: "world" })
+        .pipe(Effect.forkScoped);
+      yield* Queue.take(output);
+
+      yield* Queue.offer(
+        input,
+        encoder.encode(
+          `${encodeUnknownJsonString({
+            jsonrpc: "2.0",
+            id: "1",
+            chunk: true,
+            result: ["foreign"],
+          })}\n${encodeUnknownJsonString({
+            jsonrpc: "2.0",
+            id: 1,
+            result: { ok: true },
+          })}\n`,
+        ),
+      );
+
+      assert.deepEqual(yield* Fiber.join(response), { ok: true });
+    }),
+  );
+
   it.effect("correlates extension response errors with the originating request", () =>
     Effect.gen(function* () {
       const { stdio, input, output } = yield* makeInMemoryStdio();
@@ -456,7 +551,7 @@ it.layer(NodeServices.layer)("effect-acp protocol", (it) => {
       const message = yield* Deferred.await(inboundRequest);
       assert.deepEqual(message, {
         _tag: "Request",
-        id: "0",
+        id: "-1",
         tag: "session/request_permission",
         payload: {
           sessionId: "session-1",
@@ -471,7 +566,7 @@ it.layer(NodeServices.layer)("effect-acp protocol", (it) => {
 
       yield* transport.serverProtocol.send(0, {
         _tag: "Exit",
-        requestId: "0",
+        requestId: "-1",
         exit: {
           _tag: "Success",
           value: {
@@ -494,6 +589,948 @@ it.layer(NodeServices.layer)("effect-acp protocol", (it) => {
           },
         },
       });
+    }),
+  );
+
+  it.effect(
+    "remaps a core-method request with a string id across the RPC bridge and echoes it back",
+    () =>
+      Effect.gen(function* () {
+        const { stdio, input, output } = yield* makeInMemoryStdio();
+        const transport = yield* AcpProtocol.makeAcpPatchedProtocol({
+          stdio,
+          serverRequestMethods: new Set(["session/request_permission"]),
+        });
+        const inboundRequest = yield* Deferred.make<unknown>();
+
+        yield* transport.serverProtocol
+          .run((_clientId, message) =>
+            Deferred.succeed(inboundRequest, message).pipe(Effect.asVoid),
+          )
+          .pipe(Effect.forkScoped);
+
+        const permissionParams = {
+          sessionId: "session-1",
+          toolCall: {
+            toolCallId: "tool-1",
+            title: "Allow mock action",
+          },
+          options: [{ optionId: "allow", name: "Allow", kind: "allow_once" as const }],
+        };
+        // The RPC server derives request keys with BigInt, so a peer-chosen
+        // string id (legal JSON-RPC) must cross the bridge under an internal
+        // integer alias and be restored on the response wire line.
+        yield* Queue.offer(
+          input,
+          encoder.encode(
+            '{"jsonrpc":"2.0","id":"permission-42","method":"session/request_permission",' +
+              '"params":{"sessionId":"session-1","toolCall":{"toolCallId":"tool-1",' +
+              '"title":"Allow mock action"},"options":[{"optionId":"allow","name":"Allow",' +
+              '"kind":"allow_once"}]}}\n',
+          ),
+        );
+
+        const message = yield* Deferred.await(inboundRequest);
+        assert.deepEqual(message, {
+          _tag: "Request",
+          id: "-1",
+          tag: "session/request_permission",
+          payload: permissionParams,
+          headers: [],
+        });
+
+        yield* transport.serverProtocol.send(0, {
+          _tag: "Exit",
+          requestId: "-1",
+          exit: {
+            _tag: "Success",
+            value: {
+              outcome: {
+                outcome: "selected",
+                optionId: "allow",
+              },
+            },
+          },
+        });
+
+        const outbound = yield* Queue.take(output);
+        const outboundLine =
+          typeof outbound === "string" ? outbound : new TextDecoder().decode(outbound);
+        assert.deepEqual(yield* decodeUnknownJsonString(outboundLine), {
+          jsonrpc: "2.0",
+          id: "permission-42",
+          result: {
+            outcome: {
+              outcome: "selected",
+              optionId: "allow",
+            },
+          },
+        });
+      }),
+  );
+
+  it.effect("remaps follow-up controls for an aliased core request", () =>
+    Effect.gen(function* () {
+      const { stdio, input, output } = yield* makeInMemoryStdio();
+      const transport = yield* AcpProtocol.makeAcpPatchedProtocol({
+        stdio,
+        serverRequestMethods: new Set(["session/request_permission"]),
+      });
+      const inboundMessages: Array<unknown> = [];
+      const receivedControls = yield* Deferred.make<void>();
+      const receivedReplay = yield* Deferred.make<void>();
+
+      yield* transport.serverProtocol
+        .run((_clientId, message) =>
+          Effect.sync(() => {
+            inboundMessages.push(message);
+          }).pipe(
+            Effect.flatMap(() => {
+              if (inboundMessages.length === 3) {
+                return Deferred.succeed(receivedControls, void 0);
+              }
+              if (inboundMessages.length === 4) {
+                return Deferred.succeed(receivedReplay, void 0);
+              }
+              return Effect.void;
+            }),
+            Effect.asVoid,
+          ),
+        )
+        .pipe(Effect.forkScoped);
+
+      const params = {
+        sessionId: "session-1",
+        toolCall: { toolCallId: "tool-1", title: "Allow mock action" },
+        options: [{ optionId: "allow", name: "Allow", kind: "allow_once" }],
+      };
+      yield* Queue.offer(
+        input,
+        encoder.encode(
+          `${encodeUnknownJsonString({
+            jsonrpc: "2.0",
+            id: "permission-42",
+            method: "session/request_permission",
+            params,
+          })}\n`,
+        ),
+      );
+      yield* Queue.offer(
+        input,
+        encoder.encode(
+          `${encodeUnknownJsonString({
+            jsonrpc: "2.0",
+            method: "@effect/rpc/Interrupt",
+            params: { requestId: "permission-42" },
+          })}\n`,
+        ),
+      );
+      yield* Queue.offer(
+        input,
+        encoder.encode(
+          `${encodeUnknownJsonString({
+            jsonrpc: "2.0",
+            id: null,
+            method: "@effect/rpc/Ack",
+            params: { requestId: "permission-42" },
+          })}\n`,
+        ),
+      );
+      yield* Deferred.await(receivedControls);
+
+      assert.deepEqual(inboundMessages, [
+        {
+          _tag: "Request",
+          id: "-1",
+          tag: "session/request_permission",
+          payload: params,
+          headers: [],
+        },
+        { _tag: "Interrupt", requestId: "-1" },
+        { _tag: "Ack", requestId: "-1" },
+      ]);
+
+      yield* transport.serverProtocol.send(0, {
+        _tag: "Exit",
+        requestId: "-1",
+        exit: { _tag: "Success", value: { outcome: { outcome: "cancelled" } } },
+      });
+      yield* Queue.take(output);
+      yield* Queue.offer(
+        input,
+        encoder.encode(
+          `${encodeUnknownJsonString({
+            jsonrpc: "2.0",
+            method: "@effect/rpc/Ack",
+            params: { requestId: "permission-42" },
+          })}\n`,
+        ),
+      );
+      yield* Deferred.await(receivedReplay);
+
+      assert.deepEqual(inboundMessages[3], {
+        _tag: "Ack",
+        requestId: "permission-42",
+      });
+    }),
+  );
+
+  it.effect("preserves multibyte request payloads split across input chunks", () =>
+    Effect.gen(function* () {
+      const { stdio, input } = yield* makeInMemoryStdio();
+      const transport = yield* AcpProtocol.makeAcpPatchedProtocol({
+        stdio,
+        serverRequestMethods: new Set(["session/request_permission"]),
+      });
+      const inboundRequest = yield* Deferred.make<{ readonly payload: unknown }>();
+      yield* transport.serverProtocol
+        .run((_clientId, message) =>
+          message._tag === "Request"
+            ? Deferred.succeed(inboundRequest, message).pipe(Effect.asVoid)
+            : Effect.void,
+        )
+        .pipe(Effect.forkScoped);
+
+      const params = {
+        sessionId: "session-1",
+        toolCall: { toolCallId: "tool-1", title: "Allow café 🚀" },
+        options: [{ optionId: "allow", name: "Allow", kind: "allow_once" }],
+      };
+      const wire = encoder.encode(
+        `${encodeUnknownJsonString({
+          jsonrpc: "2.0",
+          id: "permission-utf8",
+          method: "session/request_permission",
+          params,
+        })}\n`,
+      );
+      const rocketStart = wire.indexOf(0xf0);
+      assert.isAtLeast(rocketStart, 0);
+      const splitAt = rocketStart + 2;
+      yield* Queue.offer(input, wire.slice(0, splitAt));
+      yield* Queue.offer(input, wire.slice(splitAt));
+
+      assert.deepEqual((yield* Deferred.await(inboundRequest)).payload, params);
+    }),
+  );
+
+  it.effect("restores an aliased request id on chunks and the terminal reply", () =>
+    Effect.gen(function* () {
+      const { stdio, input, output } = yield* makeInMemoryStdio();
+      const transport = yield* AcpProtocol.makeAcpPatchedProtocol({
+        stdio,
+        serverRequestMethods: new Set(["session/request_permission"]),
+      });
+      const inboundRequest = yield* Deferred.make<{ readonly id: string }>();
+
+      yield* transport.serverProtocol
+        .run((_clientId, message) =>
+          message._tag === "Request"
+            ? Deferred.succeed(inboundRequest, message).pipe(Effect.asVoid)
+            : Effect.void,
+        )
+        .pipe(Effect.forkScoped);
+
+      yield* Queue.offer(
+        input,
+        encoder.encode(
+          `${encodeUnknownJsonString({
+            jsonrpc: "2.0",
+            id: "permission-42",
+            method: "session/request_permission",
+            params: {
+              sessionId: "session-1",
+              toolCall: { toolCallId: "tool-1", title: "Allow mock action" },
+              options: [{ optionId: "allow", name: "Allow", kind: "allow_once" }],
+            },
+          })}\n`,
+        ),
+      );
+      const request = yield* Deferred.await(inboundRequest);
+      assert.equal(request.id, "-1");
+
+      yield* transport.serverProtocol.send(0, {
+        _tag: "Chunk",
+        requestId: request.id,
+        values: ["partial"],
+      });
+      assert.deepEqual(yield* decodeUnknownJsonString(yield* Queue.take(output)), {
+        jsonrpc: "2.0",
+        chunk: true,
+        id: "permission-42",
+        result: ["partial"],
+      });
+
+      yield* transport.serverProtocol.send(0, {
+        _tag: "Exit",
+        requestId: request.id,
+        exit: { _tag: "Success", value: { outcome: { outcome: "cancelled" } } },
+      });
+      assert.deepEqual(yield* decodeUnknownJsonString(yield* Queue.take(output)), {
+        jsonrpc: "2.0",
+        id: "permission-42",
+        result: { outcome: { outcome: "cancelled" } },
+      });
+    }),
+  );
+
+  it.effect("falls back to the previous reverse alias after a duplicate request exits", () =>
+    Effect.gen(function* () {
+      const { stdio, input, output } = yield* makeInMemoryStdio();
+      const transport = yield* AcpProtocol.makeAcpPatchedProtocol({
+        stdio,
+        serverRequestMethods: new Set(["session/request_permission"]),
+      });
+      const inboundMessages: Array<unknown> = [];
+      const receivedFirstControl = yield* Deferred.make<void>();
+      const receivedFallbackControl = yield* Deferred.make<void>();
+
+      yield* transport.serverProtocol
+        .run((_clientId, message) =>
+          Effect.sync(() => {
+            inboundMessages.push(message);
+          }).pipe(
+            Effect.flatMap(() => {
+              if (inboundMessages.length === 3) {
+                return Deferred.succeed(receivedFirstControl, void 0);
+              }
+              if (inboundMessages.length === 4) {
+                return Deferred.succeed(receivedFallbackControl, void 0);
+              }
+              return Effect.void;
+            }),
+            Effect.asVoid,
+          ),
+        )
+        .pipe(Effect.forkScoped);
+
+      const requestLine = `${encodeUnknownJsonString({
+        jsonrpc: "2.0",
+        id: "permission-42",
+        method: "session/request_permission",
+        params: {
+          sessionId: "session-1",
+          toolCall: { toolCallId: "tool-1", title: "Allow mock action" },
+          options: [{ optionId: "allow", name: "Allow", kind: "allow_once" }],
+        },
+      })}\n`;
+      yield* Queue.offer(input, encoder.encode(requestLine));
+      yield* Queue.offer(input, encoder.encode(requestLine));
+      yield* Queue.offer(
+        input,
+        encoder.encode(
+          `${encodeUnknownJsonString({
+            jsonrpc: "2.0",
+            method: "@effect/rpc/Ack",
+            params: { requestId: "permission-42" },
+          })}\n`,
+        ),
+      );
+      yield* Deferred.await(receivedFirstControl);
+      assert.deepEqual(
+        inboundMessages.map((message) =>
+          typeof message === "object" && message !== null && "id" in message
+            ? message.id
+            : typeof message === "object" && message !== null && "requestId" in message
+              ? message.requestId
+              : null,
+        ),
+        ["-1", "-2", "-2"],
+      );
+
+      yield* transport.serverProtocol.send(0, {
+        _tag: "Exit",
+        requestId: "-2",
+        exit: { _tag: "Success", value: { outcome: { outcome: "cancelled" } } },
+      });
+      yield* Queue.take(output);
+      yield* Queue.offer(
+        input,
+        encoder.encode(
+          `${encodeUnknownJsonString({
+            jsonrpc: "2.0",
+            method: "@effect/rpc/Interrupt",
+            params: { requestId: "permission-42" },
+          })}\n`,
+        ),
+      );
+      yield* Deferred.await(receivedFallbackControl);
+      assert.deepEqual(inboundMessages[3], { _tag: "Interrupt", requestId: "-1" });
+    }),
+  );
+
+  it.effect("keeps numeric and numeric-looking string control ids distinct", () =>
+    Effect.gen(function* () {
+      const { stdio, input } = yield* makeInMemoryStdio();
+      const transport = yield* AcpProtocol.makeAcpPatchedProtocol({
+        stdio,
+        serverRequestMethods: new Set(["session/request_permission"]),
+      });
+      const inboundMessages: Array<unknown> = [];
+      const received = yield* Deferred.make<void>();
+
+      yield* transport.serverProtocol
+        .run((_clientId, message) =>
+          Effect.sync(() => {
+            inboundMessages.push(message);
+          }).pipe(
+            Effect.flatMap(() =>
+              inboundMessages.length === 4 ? Deferred.succeed(received, void 0) : Effect.void,
+            ),
+            Effect.asVoid,
+          ),
+        )
+        .pipe(Effect.forkScoped);
+
+      const params = {
+        sessionId: "session-1",
+        toolCall: { toolCallId: "tool-1", title: "Allow mock action" },
+        options: [{ optionId: "allow", name: "Allow", kind: "allow_once" }],
+      };
+      for (const id of [42, "42"]) {
+        yield* Queue.offer(
+          input,
+          encoder.encode(
+            `${encodeUnknownJsonString({
+              jsonrpc: "2.0",
+              id,
+              method: "session/request_permission",
+              params,
+            })}\n`,
+          ),
+        );
+      }
+      yield* Queue.offer(
+        input,
+        encoder.encode(
+          `${encodeUnknownJsonString({
+            jsonrpc: "2.0",
+            method: "@effect/rpc/Ack",
+            params: { requestId: 42 },
+          })}\n`,
+        ),
+      );
+      yield* Queue.offer(
+        input,
+        encoder.encode(
+          `${encodeUnknownJsonString({
+            jsonrpc: "2.0",
+            method: "@effect/rpc/Interrupt",
+            params: { requestId: "42" },
+          })}\n`,
+        ),
+      );
+      yield* Deferred.await(received);
+
+      assert.deepEqual(
+        inboundMessages.map((message) =>
+          typeof message === "object" &&
+          message !== null &&
+          ("id" in message || "requestId" in message)
+            ? "id" in message
+              ? message.id
+              : message.requestId
+            : null,
+        ),
+        ["42", "-1", "42", "-1"],
+      );
+    }),
+  );
+
+  it.effect("aliases numeric zero requests and their follow-up controls before decoding", () =>
+    Effect.gen(function* () {
+      const { stdio, input, output } = yield* makeInMemoryStdio();
+      const transport = yield* AcpProtocol.makeAcpPatchedProtocol({
+        stdio,
+        serverRequestMethods: new Set(["session/request_permission"]),
+      });
+      const inboundMessages: Array<unknown> = [];
+      const received = yield* Deferred.make<void>();
+      yield* transport.serverProtocol
+        .run((_clientId, message) =>
+          Effect.sync(() => inboundMessages.push(message)).pipe(
+            Effect.flatMap(() =>
+              inboundMessages.length === 4 ? Deferred.succeed(received, void 0) : Effect.void,
+            ),
+            Effect.asVoid,
+          ),
+        )
+        .pipe(Effect.forkScoped);
+
+      const params = {
+        sessionId: "session-1",
+        toolCall: { toolCallId: "tool-1", title: "Allow mock action" },
+        options: [{ optionId: "allow", name: "Allow", kind: "allow_once" }],
+      };
+      yield* Queue.offer(
+        input,
+        encoder.encode(
+          `${encodeUnknownJsonString([
+            { jsonrpc: "2.0", id: 0, method: "session/request_permission", params },
+            { jsonrpc: "2.0", id: 1, method: "session/request_permission", params },
+          ])}\n`,
+        ),
+      );
+      for (const method of ["@effect/rpc/Ack", "@effect/rpc/Interrupt"]) {
+        yield* Queue.offer(
+          input,
+          encoder.encode(
+            `${encodeUnknownJsonString({ jsonrpc: "2.0", method, params: { requestId: 0 } })}\n`,
+          ),
+        );
+      }
+      yield* Deferred.await(received);
+      assert.deepEqual(inboundMessages, [
+        {
+          _tag: "Request",
+          id: "-1",
+          tag: "session/request_permission",
+          payload: params,
+          headers: [],
+        },
+        {
+          _tag: "Request",
+          id: "1",
+          tag: "session/request_permission",
+          payload: params,
+          headers: [],
+        },
+        { _tag: "Ack", requestId: "-1" },
+        { _tag: "Interrupt", requestId: "-1" },
+      ]);
+
+      const sendReply = (requestId: string, optionId: string) =>
+        transport.serverProtocol.send(0, {
+          _tag: "Exit",
+          requestId,
+          exit: {
+            _tag: "Success",
+            value: { outcome: { outcome: "selected", optionId } },
+          },
+        });
+      yield* sendReply("-1", "zero");
+      yield* sendReply("1", "one");
+      const responses = yield* Effect.forEach(
+        (yield* Queue.take(output)).split("\n").filter((line) => line.length > 0),
+        (line) => decodeUnknownJsonString(line),
+      );
+      assert.deepEqual(
+        responses.map((response) =>
+          typeof response === "object" && response !== null && "id" in response
+            ? response.id
+            : undefined,
+        ),
+        [0, 1],
+      );
+    }),
+  );
+
+  it.effect("completes a mixed batch containing an aliased core request in both reply orders", () =>
+    Effect.gen(function* () {
+      for (const aliasFirst of [true, false]) {
+        const { stdio, input, output } = yield* makeInMemoryStdio();
+        const transport = yield* AcpProtocol.makeAcpPatchedProtocol({
+          stdio,
+          serverRequestMethods: new Set(["session/request_permission"]),
+        });
+        const inboundRequests: Array<{ readonly id: string }> = [];
+        const receivedBatch = yield* Deferred.make<void>();
+
+        yield* transport.serverProtocol
+          .run((_clientId, message) => {
+            if (message._tag !== "Request") {
+              return Effect.void;
+            }
+            return Effect.sync(() => {
+              inboundRequests.push(message);
+            }).pipe(
+              Effect.flatMap(() =>
+                inboundRequests.length === 2
+                  ? Deferred.succeed(receivedBatch, void 0)
+                  : Effect.void,
+              ),
+              Effect.asVoid,
+            );
+          })
+          .pipe(Effect.forkScoped);
+
+        const params = {
+          sessionId: "session-1",
+          toolCall: { toolCallId: "tool-1", title: "Allow mock action" },
+          options: [{ optionId: "allow", name: "Allow", kind: "allow_once" }],
+        };
+        yield* Queue.offer(
+          input,
+          encoder.encode(
+            `${encodeUnknownJsonString([
+              {
+                jsonrpc: "2.0",
+                id: "permission-42",
+                method: "session/request_permission",
+                params,
+              },
+              {
+                jsonrpc: "2.0",
+                id: 7,
+                method: "session/request_permission",
+                params,
+              },
+            ])}\n`,
+          ),
+        );
+        yield* Deferred.await(receivedBatch);
+        assert.deepEqual(
+          inboundRequests.map((request) => request.id),
+          ["-1", "7"],
+        );
+
+        yield* transport.serverProtocol.send(0, {
+          _tag: "Chunk",
+          requestId: "-1",
+          values: ["partial"],
+        });
+        assert.deepEqual(yield* decodeUnknownJsonString(yield* Queue.take(output)), {
+          jsonrpc: "2.0",
+          chunk: true,
+          id: "permission-42",
+          result: ["partial"],
+        });
+
+        const sendReply = (requestId: string, optionId: string) =>
+          transport.serverProtocol.send(0, {
+            _tag: "Exit",
+            requestId,
+            exit: {
+              _tag: "Success",
+              value: { outcome: { outcome: "selected", optionId } },
+            },
+          });
+        if (aliasFirst) {
+          yield* sendReply("-1", "alias");
+          yield* sendReply("7", "numeric");
+        } else {
+          yield* sendReply("7", "numeric");
+          yield* sendReply("-1", "alias");
+        }
+
+        const outbound = yield* Queue.take(output);
+        const responses = (yield* Effect.forEach(
+          outbound.split("\n").filter((line) => line.length > 0),
+          (line) => decodeUnknownJsonString(line),
+        )) as ReadonlyArray<{
+          readonly id: unknown;
+          readonly result?: { readonly outcome?: { readonly optionId?: string } };
+        }>;
+        assert.lengthOf(responses, 2);
+        assert.equal(
+          responses.find((response) => response.id === "permission-42")?.result?.outcome?.optionId,
+          "alias",
+        );
+        assert.equal(
+          responses.find((response) => response.id === 7)?.result?.outcome?.optionId,
+          "numeric",
+        );
+      }
+    }),
+  );
+
+  it.effect("keeps aliased reply restoration scoped across concurrent batches", () =>
+    Effect.gen(function* () {
+      const { stdio, input, output } = yield* makeInMemoryStdio();
+      const transport = yield* AcpProtocol.makeAcpPatchedProtocol({
+        stdio,
+        serverRequestMethods: new Set(["session/request_permission"]),
+      });
+      const inboundRequests: Array<{ readonly id: string }> = [];
+      const received = yield* Deferred.make<void>();
+      yield* transport.serverProtocol
+        .run((_clientId, message) => {
+          if (message._tag !== "Request") {
+            return Effect.void;
+          }
+          return Effect.sync(() => inboundRequests.push(message)).pipe(
+            Effect.flatMap(() =>
+              inboundRequests.length === 4 ? Deferred.succeed(received, void 0) : Effect.void,
+            ),
+            Effect.asVoid,
+          );
+        })
+        .pipe(Effect.forkScoped);
+
+      const params = {
+        sessionId: "session-1",
+        toolCall: { toolCallId: "tool-1", title: "Allow mock action" },
+        options: [{ optionId: "allow", name: "Allow", kind: "allow_once" }],
+      };
+      for (const batch of [
+        [
+          { jsonrpc: "2.0", id: "batch-a", method: "session/request_permission", params },
+          { jsonrpc: "2.0", id: 101, method: "session/request_permission", params },
+        ],
+        [
+          { jsonrpc: "2.0", id: "batch-b", method: "session/request_permission", params },
+          { jsonrpc: "2.0", id: 201, method: "session/request_permission", params },
+        ],
+      ]) {
+        yield* Queue.offer(input, encoder.encode(`${encodeUnknownJsonString(batch)}\n`));
+      }
+      yield* Deferred.await(received);
+      assert.deepEqual(
+        inboundRequests.map((request) => request.id),
+        ["-1", "101", "-2", "201"],
+      );
+
+      const sendReply = (requestId: string, optionId: string) =>
+        transport.serverProtocol.send(0, {
+          _tag: "Exit",
+          requestId,
+          exit: {
+            _tag: "Success",
+            value: { outcome: { outcome: "selected", optionId } },
+          },
+        });
+      yield* sendReply("-1", "a-alias");
+      yield* sendReply("-2", "b-alias");
+      yield* sendReply("101", "a-numeric");
+      const batchA = yield* Effect.forEach(
+        (yield* Queue.take(output)).split("\n").filter((line) => line.length > 0),
+        (line) => decodeUnknownJsonString(line),
+      );
+      yield* sendReply("201", "b-numeric");
+      const batchB = yield* Effect.forEach(
+        (yield* Queue.take(output)).split("\n").filter((line) => line.length > 0),
+        (line) => decodeUnknownJsonString(line),
+      );
+
+      assert.deepEqual(
+        batchA.map((response) =>
+          typeof response === "object" && response !== null && "id" in response
+            ? response.id
+            : undefined,
+        ),
+        ["batch-a", 101],
+      );
+      assert.deepEqual(
+        batchB.map((response) =>
+          typeof response === "object" && response !== null && "id" in response
+            ? response.id
+            : undefined,
+        ),
+        ["batch-b", 201],
+      );
+    }),
+  );
+
+  it.effect("keeps numeric and same-text string ids distinct within one batch", () =>
+    Effect.gen(function* () {
+      for (const aliasFirst of [true, false]) {
+        const { stdio, input, output } = yield* makeInMemoryStdio();
+        const transport = yield* AcpProtocol.makeAcpPatchedProtocol({
+          stdio,
+          serverRequestMethods: new Set(["session/request_permission"]),
+        });
+        const inboundRequests: Array<{ readonly id: string }> = [];
+        const received = yield* Deferred.make<void>();
+        yield* transport.serverProtocol
+          .run((_clientId, message) => {
+            if (message._tag !== "Request") {
+              return Effect.void;
+            }
+            return Effect.sync(() => inboundRequests.push(message)).pipe(
+              Effect.flatMap(() =>
+                inboundRequests.length === 2 ? Deferred.succeed(received, void 0) : Effect.void,
+              ),
+              Effect.asVoid,
+            );
+          })
+          .pipe(Effect.forkScoped);
+
+        const params = {
+          sessionId: "session-1",
+          toolCall: { toolCallId: "tool-1", title: "Allow mock action" },
+          options: [{ optionId: "allow", name: "Allow", kind: "allow_once" }],
+        };
+        yield* Queue.offer(
+          input,
+          encoder.encode(
+            `${encodeUnknownJsonString([
+              { jsonrpc: "2.0", id: 42, method: "session/request_permission", params },
+              { jsonrpc: "2.0", id: "42", method: "session/request_permission", params },
+            ])}\n`,
+          ),
+        );
+        yield* Deferred.await(received);
+        assert.deepEqual(
+          inboundRequests.map((request) => request.id),
+          ["42", "-1"],
+        );
+
+        const sendReply = (requestId: string, optionId: string) =>
+          transport.serverProtocol.send(0, {
+            _tag: "Exit",
+            requestId,
+            exit: {
+              _tag: "Success",
+              value: { outcome: { outcome: "selected", optionId } },
+            },
+          });
+        if (aliasFirst) {
+          yield* sendReply("-1", "string");
+          yield* sendReply("42", "number");
+        } else {
+          yield* sendReply("42", "number");
+          yield* sendReply("-1", "string");
+        }
+        const responses = (yield* Effect.forEach(
+          (yield* Queue.take(output)).split("\n").filter((line) => line.length > 0),
+          (line) => decodeUnknownJsonString(line),
+        )) as ReadonlyArray<{
+          readonly id: unknown;
+          readonly result?: { readonly outcome?: { readonly optionId?: string } };
+        }>;
+        assert.lengthOf(responses, 2);
+        assert.equal(
+          responses.find((response) => response.id === 42)?.result?.outcome?.optionId,
+          "number",
+        );
+        assert.equal(
+          responses.find((response) => response.id === "42")?.result?.outcome?.optionId,
+          "string",
+        );
+      }
+    }),
+  );
+
+  it.effect("never allocates an alias colliding with an in-flight negative peer request id", () =>
+    Effect.gen(function* () {
+      const { stdio, input, output } = yield* makeInMemoryStdio();
+      const transport = yield* AcpProtocol.makeAcpPatchedProtocol({
+        stdio,
+        serverRequestMethods: new Set(["session/request_permission"]),
+      });
+      const inboundRequests: Array<unknown> = [];
+      const secondInbound = yield* Deferred.make<void>();
+
+      yield* transport.serverProtocol
+        .run((_clientId, message) =>
+          Effect.sync(() => {
+            inboundRequests.push(message);
+          }).pipe(
+            Effect.flatMap(() =>
+              inboundRequests.length >= 2 ? Deferred.succeed(secondInbound, void 0) : Effect.void,
+            ),
+            Effect.asVoid,
+          ),
+        )
+        .pipe(Effect.forkScoped);
+
+      const paramsJson =
+        '{"sessionId":"session-1","toolCall":{"toolCallId":"tool-1",' +
+        '"title":"Allow mock action"},"options":[{"optionId":"allow","name":"Allow",' +
+        '"kind":"allow_once"}]}';
+      // A negative integer is a valid peer-chosen id; the alias allocator must
+      // skip it instead of forwarding two requests under the same bridge key.
+      yield* Queue.offer(
+        input,
+        encoder.encode(
+          `{"jsonrpc":"2.0","id":-1,"method":"session/request_permission","params":${paramsJson}}\n`,
+        ),
+      );
+      yield* Queue.offer(
+        input,
+        encoder.encode(
+          `{"jsonrpc":"2.0","id":"permission-42","method":"session/request_permission","params":${paramsJson}}\n`,
+        ),
+      );
+
+      yield* Deferred.await(secondInbound);
+
+      const inboundIds = inboundRequests.map((message) =>
+        typeof message === "object" && message !== null && "id" in message ? message.id : null,
+      );
+      assert.deepEqual(inboundIds, ["-1", "-2"]);
+
+      yield* transport.serverProtocol.send(0, {
+        _tag: "Exit",
+        requestId: "-1",
+        exit: { _tag: "Success", value: { outcome: { outcome: "cancelled" } } },
+      });
+      yield* transport.serverProtocol.send(0, {
+        _tag: "Exit",
+        requestId: "-2",
+        exit: { _tag: "Success", value: { outcome: { outcome: "cancelled" } } },
+      });
+
+      const firstOutbound = yield* Queue.take(output);
+      const secondOutbound = yield* Queue.take(output);
+      const firstDecoded = yield* decodeUnknownJsonString(
+        typeof firstOutbound === "string" ? firstOutbound : new TextDecoder().decode(firstOutbound),
+      );
+      const secondDecoded = yield* decodeUnknownJsonString(
+        typeof secondOutbound === "string"
+          ? secondOutbound
+          : new TextDecoder().decode(secondOutbound),
+      );
+      assert.deepEqual(firstDecoded, {
+        jsonrpc: "2.0",
+        id: -1,
+        result: { outcome: { outcome: "cancelled" } },
+      });
+      assert.deepEqual(secondDecoded, {
+        jsonrpc: "2.0",
+        id: "permission-42",
+        result: { outcome: { outcome: "cancelled" } },
+      });
+    }),
+  );
+
+  it.effect("round-trips a numeric-looking string request id with its wire type preserved", () =>
+    Effect.gen(function* () {
+      const { stdio, input, output } = yield* makeInMemoryStdio();
+      const transport = yield* AcpProtocol.makeAcpPatchedProtocol({
+        stdio,
+        serverRequestMethods: new Set(["session/request_permission"]),
+      });
+      const inboundRequest = yield* Deferred.make<unknown>();
+
+      yield* transport.serverProtocol
+        .run((_clientId, message) => Deferred.succeed(inboundRequest, message).pipe(Effect.asVoid))
+        .pipe(Effect.forkScoped);
+
+      // `"42"` (a JSON string) and `42` (a JSON number) are distinct JSON-RPC
+      // ids; the response must echo the exact type the peer chose.
+      yield* Queue.offer(
+        input,
+        encoder.encode(
+          '{"jsonrpc":"2.0","id":"42","method":"session/request_permission",' +
+            '"params":{"sessionId":"session-1","toolCall":{"toolCallId":"tool-1",' +
+            '"title":"Allow mock action"},"options":[{"optionId":"allow","name":"Allow",' +
+            '"kind":"allow_once"}]}}\n',
+        ),
+      );
+
+      const message = yield* Deferred.await(inboundRequest);
+      const forwardedId =
+        typeof message === "object" && message !== null && "id" in message ? message.id : null;
+      assert.equal(forwardedId, "-1");
+
+      yield* transport.serverProtocol.send(0, {
+        _tag: "Exit",
+        requestId: "-1",
+        exit: { _tag: "Success", value: { outcome: { outcome: "cancelled" } } },
+      });
+
+      const outbound = yield* Queue.take(output);
+      assert.deepEqual(
+        yield* decodeUnknownJsonString(
+          typeof outbound === "string" ? outbound : new TextDecoder().decode(outbound),
+        ),
+        {
+          jsonrpc: "2.0",
+          id: "42",
+          result: { outcome: { outcome: "cancelled" } },
+        },
+      );
     }),
   );
 
