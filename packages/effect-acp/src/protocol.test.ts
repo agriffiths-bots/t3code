@@ -134,16 +134,34 @@ it.layer(NodeServices.layer)("effect-acp protocol", (it) => {
       }),
   );
 
-  it.effect("keeps invalid core notification values only in the schema cause", () =>
+  it.effect("drops invalid core notifications with sanitized diagnostics and stays alive", () =>
     Effect.gen(function* () {
       const secret = "acp-core-notification-secret-sentinel";
       const { stdio, input } = yield* makeInMemoryStdio();
-      const termination = yield* Deferred.make<AcpError.AcpError>();
-      yield* AcpProtocol.makeAcpPatchedProtocol({
+      const terminated = yield* Deferred.make<AcpError.AcpError>();
+      const decodeFailures: Array<unknown> = [];
+      const transport = yield* AcpProtocol.makeAcpPatchedProtocol({
         stdio,
         serverRequestMethods: new Set(),
-        onTermination: (error) => Deferred.succeed(termination, error).pipe(Effect.asVoid),
+        onTermination: (error) => Deferred.succeed(terminated, error).pipe(Effect.asVoid),
+        logIncoming: true,
+        logger: (event) =>
+          Effect.sync(() => {
+            if (event.stage === "decode_failed") {
+              decodeFailures.push(event.payload);
+            }
+          }),
       });
+
+      const dispatched: Array<AcpProtocol.AcpIncomingNotification> = [];
+      yield* transport.incoming.pipe(
+        Stream.runForEach((notification) =>
+          Effect.sync(() => {
+            dispatched.push(notification);
+          }),
+        ),
+        Effect.forkScoped,
+      );
 
       yield* Queue.offer(
         input,
@@ -158,22 +176,44 @@ it.layer(NodeServices.layer)("effect-acp protocol", (it) => {
                 entries: [],
               },
             },
+          })}\n${encodeUnknownJsonString({
+            jsonrpc: "2.0",
+            method: "session/update",
+            params: {
+              sessionId: "session-1",
+              update: {
+                sessionUpdate: "agent_message_chunk",
+                content: { type: "text", text: "still alive" },
+              },
+            },
           })}\n`,
         ),
       );
 
-      const error = yield* Deferred.await(termination);
-      assert.instanceOf(error, AcpError.AcpProtocolParseError);
-      const parseError = error as AcpError.AcpProtocolParseError;
-      const { cause, ...directDiagnostics } = parseError;
-      assert.equal(parseError.operation, "decode-notification-payload");
-      assert.equal(parseError.method, "session/update");
-      assert.isAbove(parseError.issueCount ?? 0, 0);
-      assert.include(parseError.issueKinds ?? [], "Pointer");
-      assert.isAbove(parseError.maximumPathDepth ?? 0, 0);
-      assert.isTrue(Schema.isSchemaError(cause));
-      assert.notInclude(parseError.message, secret);
-      assert.notInclude(encodeUnknownJsonString(directDiagnostics), secret);
+      for (let attempt = 0; attempt < 100 && dispatched.length < 1; attempt++) {
+        yield* Effect.yieldNow;
+      }
+
+      // An undecodable core notification must not terminate the transport or
+      // block later messages decoded from the same buffer.
+      assert.equal(dispatched.length, 1);
+      assert.equal(dispatched[0]?._tag, "SessionUpdate");
+      assert.isFalse(yield* Deferred.isDone(terminated));
+
+      assert.equal(decodeFailures.length, 1);
+      const diagnostics = decodeFailures[0] as {
+        operation: string;
+        method?: string;
+        issueCount?: number;
+        issueKinds?: ReadonlyArray<string>;
+        maximumPathDepth?: number;
+      };
+      assert.equal(diagnostics.operation, "decode-notification-payload");
+      assert.equal(diagnostics.method, "session/update");
+      assert.isAbove(diagnostics.issueCount ?? 0, 0);
+      assert.include(diagnostics.issueKinds ?? [], "Pointer");
+      assert.isAbove(diagnostics.maximumPathDepth ?? 0, 0);
+      assert.notInclude(encodeUnknownJsonString(diagnostics), secret);
     }),
   );
 
@@ -211,7 +251,7 @@ it.layer(NodeServices.layer)("effect-acp protocol", (it) => {
           direction: "outgoing",
           stage: "raw",
           payload:
-            '{"jsonrpc":"2.0","method":"session/cancel","params":{"sessionId":"session-1"},"id":"","headers":[]}\n',
+            '{"jsonrpc":"2.0","method":"session/cancel","params":{"sessionId":"session-1"},"headers":[]}\n',
         },
       ]);
     }),

@@ -76,11 +76,27 @@ const decodeElicitationComplete = Schema.decodeUnknownEffect(
   AcpSchema.ElicitationCompleteNotification,
 );
 const parserFactory = RpcSerialization.ndJsonRpc();
+const rawJsonLinesFactory = RpcSerialization.ndjson;
+
+type JsonRpcRequestId = string | number;
+
+const isRecord = (value: unknown): value is Record<string, unknown> =>
+  typeof value === "object" && value !== null;
+
+const hasOwn = (value: object, key: PropertyKey): boolean =>
+  Object.prototype.hasOwnProperty.call(value, key);
+
+const requestIdKey = (requestId: unknown): string => `${typeof requestId}:${String(requestId)}`;
+
+const isInternalNumericResponseId = (requestId: unknown): requestId is number =>
+  typeof requestId === "number" && Number.isInteger(requestId);
 
 export const makeAcpPatchedProtocol = Effect.fn("makeAcpPatchedProtocol")(function* (
   options: AcpPatchedProtocolOptions,
 ): Effect.fn.Return<AcpPatchedProtocol, never, Scope.Scope> {
   const parser = parserFactory.makeUnsafe();
+  const incomingJsonLines = rawJsonLinesFactory.makeUnsafe();
+  const outgoingJsonLines = rawJsonLinesFactory.makeUnsafe();
   const serverQueue = yield* Queue.unbounded<RpcMessage.FromClientEncoded>();
   const clientQueue = yield* Queue.unbounded<RpcMessage.FromServerEncoded>();
   const notificationQueue = yield* Queue.unbounded<AcpIncomingNotification>();
@@ -89,6 +105,122 @@ export const makeAcpPatchedProtocol = Effect.fn("makeAcpPatchedProtocol")(functi
   const nextRequestId = yield* Ref.make(1n);
   const terminationHandled = yield* Ref.make(false);
   const extPending = yield* Ref.make(new Map<string, AcpPendingRequest>());
+  let nextTranslatedRequestId = -1n;
+  const serverRequestIds = new Map<string, JsonRpcRequestId>();
+  const opaqueClientResponseIds = new Map<string, string>();
+
+  const allocateTranslatedRequestId = (): string => {
+    let requestId: string;
+    do {
+      requestId = String(nextTranslatedRequestId--);
+    } while (serverRequestIds.has(requestId));
+    return requestId;
+  };
+
+  const translateIncomingWireRequestIds = (rawFrames: ReadonlyArray<unknown>): string => {
+    const translateMessage = (rawMessage: unknown): unknown => {
+      if (!isRecord(rawMessage)) {
+        return rawMessage;
+      }
+
+      if (hasOwn(rawMessage, "method")) {
+        if (!hasOwn(rawMessage, "id") || rawMessage.id === null || rawMessage.id === undefined) {
+          return rawMessage;
+        }
+        const wireId = rawMessage.id;
+        if (typeof wireId !== "string" && typeof wireId !== "number") {
+          throw new TypeError("JSON-RPC request ids must be strings or numbers.");
+        }
+        const internalId =
+          typeof wireId === "number" &&
+          Number.isInteger(wireId) &&
+          !serverRequestIds.has(String(wireId))
+            ? String(wireId)
+            : allocateTranslatedRequestId();
+        serverRequestIds.set(internalId, wireId);
+        return {
+          ...rawMessage,
+          id: Number(internalId),
+        };
+      }
+
+      const wireId = hasOwn(rawMessage, "id") ? rawMessage.id : undefined;
+      const wireKey = requestIdKey(wireId);
+      // This transport emits its own RPC request ids as JSON numbers. Only a
+      // numeric response may therefore address a local pending request;
+      // numeric-looking strings are distinct JSON-RPC ids and stay quarantined.
+      const internalId =
+        (isInternalNumericResponseId(wireId) ? String(wireId) : undefined) ??
+        opaqueClientResponseIds.get(wireKey) ??
+        allocateTranslatedRequestId();
+      if (!isInternalNumericResponseId(wireId) && !opaqueClientResponseIds.has(wireKey)) {
+        opaqueClientResponseIds.set(wireKey, internalId);
+      }
+      if (rawMessage.chunk !== true) {
+        opaqueClientResponseIds.delete(wireKey);
+      }
+      return {
+        ...rawMessage,
+        id: Number(internalId),
+      };
+    };
+
+    return rawFrames
+      .map((frame) =>
+        JSON.stringify(
+          Array.isArray(frame) ? frame.map(translateMessage) : translateMessage(frame),
+        ),
+      )
+      .join("\n")
+      .concat("\n");
+  };
+
+  const encodeWithPreservedRequestIds = (
+    message: RpcMessage.FromClientEncoded | RpcMessage.FromServerEncoded,
+  ): string | Uint8Array | undefined => {
+    const encoded = parser.encode(message);
+    if (encoded === undefined) {
+      return undefined;
+    }
+
+    const frames = outgoingJsonLines.decode(encoded);
+    const isNotification = message._tag === "Request" && message.id === "";
+    const completedServerRequestIds: Array<string> = [];
+    let restoredAnyId = false;
+    const restoredFrames = frames.map((frame) => {
+      if (!isRecord(frame) || !hasOwn(frame, "id")) {
+        return frame;
+      }
+      if (isNotification) {
+        const { id: _, ...notification } = frame;
+        restoredAnyId = true;
+        return notification;
+      }
+      const internalId = String(frame.id);
+      if (!serverRequestIds.has(internalId)) {
+        return frame;
+      }
+      restoredAnyId = true;
+      if (frame.chunk !== true) {
+        completedServerRequestIds.push(internalId);
+      }
+      return {
+        ...frame,
+        id: serverRequestIds.get(internalId),
+      };
+    });
+    if (!restoredAnyId) {
+      return encoded;
+    }
+
+    const restored = outgoingJsonLines.encode(
+      restoredFrames.length === 1 ? restoredFrames[0] : restoredFrames,
+    );
+    for (const internalId of completedServerRequestIds) {
+      serverRequestIds.delete(internalId);
+    }
+    return restored;
+  };
 
   const logProtocol = (event: AcpProtocolLogEvent) => {
     if (event.direction === "incoming" && !options.logIncoming) {
@@ -121,7 +253,7 @@ export const makeAcpPatchedProtocol = Effect.fn("makeAcpPatchedProtocol")(functi
           : undefined;
     const requestId = encodedRequestId === "" ? undefined : encodedRequestId;
     const encoded = yield* Effect.try({
-      try: () => parser.encode(message),
+      try: () => encodeWithPreservedRequestIds(message),
       catch: (cause) => AcpError.AcpProtocolParseError.fromEncodingError(method, requestId, cause),
     });
 
@@ -243,6 +375,37 @@ export const makeAcpPatchedProtocol = Effect.fn("makeAcpPatchedProtocol")(functi
       },
     });
 
+  // A notification whose payload fails schema decoding must never terminate
+  // the transport or abort the remaining messages decoded from the same
+  // buffer: agents ship new session/update variants ahead of this client, and
+  // a prompt response following the poison message still has to be routed.
+  const dropUndecodableNotification = (error: AcpError.AcpProtocolParseError) =>
+    logProtocol({
+      direction: "incoming",
+      stage: "decode_failed",
+      payload: {
+        operation: error.operation,
+        ...(error.method === undefined ? {} : { method: error.method }),
+        ...(error.issueCount === undefined ? {} : { issueCount: error.issueCount }),
+        ...(error.issueKinds === undefined ? {} : { issueKinds: error.issueKinds }),
+        ...(error.maximumPathDepth === undefined
+          ? {}
+          : { maximumPathDepth: error.maximumPathDepth }),
+      },
+    }).pipe(
+      // Never log the error object itself: its schema cause embeds the
+      // rejected notification values.
+      Effect.andThen(
+        Effect.logWarning("Dropped ACP notification with undecodable payload.").pipe(
+          Effect.annotateLogs({
+            operation: error.operation,
+            ...(error.method === undefined ? {} : { method: error.method }),
+            ...(error.issueCount === undefined ? {} : { issueCount: error.issueCount }),
+          }),
+        ),
+      ),
+    );
+
   const handleExtRequest = (message: RpcMessage.RequestEncoded) => {
     if (!options.onExtRequest) {
       return respondWithError(message.id, AcpError.AcpRequestError.methodNotFound(message.tag));
@@ -279,6 +442,7 @@ export const makeAcpPatchedProtocol = Effect.fn("makeAcpPatchedProtocol")(functi
             ),
           ),
           Effect.flatMap(dispatchNotification),
+          Effect.catchTag("AcpProtocolParseError", dropUndecodableNotification),
         );
       }
       if (message.tag === CLIENT_METHODS.session_elicitation_complete) {
@@ -299,6 +463,7 @@ export const makeAcpPatchedProtocol = Effect.fn("makeAcpPatchedProtocol")(functi
             ),
           ),
           Effect.flatMap(dispatchNotification),
+          Effect.catchTag("AcpProtocolParseError", dropUndecodableNotification),
         );
       }
       return dispatchNotification({
@@ -413,10 +578,15 @@ export const makeAcpPatchedProtocol = Effect.fn("makeAcpPatchedProtocol")(functi
       }).pipe(
         Effect.flatMap(() =>
           Effect.try({
-            try: () =>
-              parser.decode(data) as ReadonlyArray<
+            try: () => {
+              const rawFrames = incomingJsonLines.decode(data);
+              if (rawFrames.length === 0) {
+                return [];
+              }
+              return parser.decode(translateIncomingWireRequestIds(rawFrames)) as ReadonlyArray<
                 RpcMessage.FromClientEncoded | RpcMessage.FromServerEncoded
-              >,
+              >;
+            },
             catch: (cause) =>
               new AcpError.AcpProtocolParseError({
                 operation: "decode-wire-message",

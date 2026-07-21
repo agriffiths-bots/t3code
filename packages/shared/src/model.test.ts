@@ -17,6 +17,7 @@ import {
   getProviderOptionBooleanSelectionValue,
   getProviderOptionStringSelectionValue,
   isClaudeUltrathinkPrompt,
+  normalizeCustomModelSlug,
   normalizeModelSlug,
   pickModelSelectionFromInstances,
   type ProviderModelSource,
@@ -568,5 +569,14 @@ describe("pickModelSelectionFromInstances", () => {
     expect(pickModelSelectionFromInstances("   ", sources)).toBeNull();
     expect(pickModelSelectionFromInstances(null, sources)).toBeNull();
     expect(pickModelSelectionFromInstances("gpt-5.4", [])).toBeNull();
+  });
+});
+
+describe("model slug normalization", () => {
+  it("preserves exact custom slugs instead of expanding provider aliases", () => {
+    const claude = ProviderDriverKind.make("claudeAgent");
+
+    expect(normalizeModelSlug("opus", claude)).toBe("claude-opus-4-8");
+    expect(normalizeCustomModelSlug(" opus ")).toBe("opus");
   });
 });

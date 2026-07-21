@@ -171,6 +171,7 @@ function makeLayer(
             handleBackendNotReady: Effect.die("unused"),
             dispatchMenuAction: () => Effect.die("unused"),
             syncAppearance: Effect.die("unused"),
+            flushMainWindowBounds: Effect.die("unused"),
           }),
         ),
         Layer.succeed(

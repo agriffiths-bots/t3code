@@ -472,19 +472,15 @@ export const OrchestrationShellStreamEvent = Schema.Union([
 ]);
 export type OrchestrationShellStreamEvent = typeof OrchestrationShellStreamEvent.Type;
 
-export const OrchestrationShellCaughtUp = Schema.Struct({
-  kind: Schema.Literal("caught-up"),
-  sequence: NonNegativeInt,
-});
-export type OrchestrationShellCaughtUp = typeof OrchestrationShellCaughtUp.Type;
-
 export const OrchestrationShellStreamItem = Schema.Union([
+  Schema.Struct({
+    kind: Schema.Literal("synchronized"),
+  }),
   Schema.Struct({
     kind: Schema.Literal("snapshot"),
     snapshot: OrchestrationShellSnapshot,
     force: Schema.optional(Schema.Boolean),
   }),
-  OrchestrationShellCaughtUp,
   OrchestrationShellStreamEvent,
 ]);
 export type OrchestrationShellStreamItem = typeof OrchestrationShellStreamItem.Type;
@@ -589,6 +585,11 @@ export const OrchestrationSubscribeShellInput = Schema.Struct({
    * client).
    */
   afterSequence: Schema.optionalKey(NonNegativeInt),
+  /**
+   * Requests an explicit marker after the subscription has emitted its initial
+   * snapshot or catch-up replay and before it begins emitting live events.
+   */
+  requestCompletionMarker: Schema.optionalKey(Schema.Boolean),
 });
 export type OrchestrationSubscribeShellInput = typeof OrchestrationSubscribeShellInput.Type;
 
@@ -616,6 +617,11 @@ export const OrchestrationSubscribeThreadInput = Schema.Struct({
    * sequence on the client).
    */
   afterSequence: Schema.optionalKey(NonNegativeInt),
+  /**
+   * Requests an explicit marker after the subscription has emitted its initial
+   * snapshot or catch-up replay and before it begins emitting live events.
+   */
+  requestCompletionMarker: Schema.optionalKey(Schema.Boolean),
 });
 export type OrchestrationSubscribeThreadInput = typeof OrchestrationSubscribeThreadInput.Type;
 
@@ -1395,6 +1401,9 @@ export const OrchestrationEvent = Schema.Union([
 export type OrchestrationEvent = typeof OrchestrationEvent.Type;
 
 export const OrchestrationThreadStreamItem = Schema.Union([
+  Schema.Struct({
+    kind: Schema.Literal("synchronized"),
+  }),
   Schema.Struct({
     kind: Schema.Literal("snapshot"),
     /** Missing for stream frames produced by older environment servers. */

@@ -779,6 +779,7 @@ const engineLayer = Layer.effect(
           return { sequence: engineCommands.length };
         }),
       streamDomainEvents: unsupported(),
+      latestSequence: Effect.succeed(0),
     };
   }),
 );

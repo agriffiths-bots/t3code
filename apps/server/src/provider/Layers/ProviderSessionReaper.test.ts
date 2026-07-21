@@ -307,6 +307,7 @@ describe("ProviderSessionReaper", () => {
           readEvents: () => Stream.empty,
           dispatch,
           streamDomainEvents: Stream.empty,
+          latestSequence: Effect.succeed(0),
         }),
       ),
       Layer.provideMerge(
