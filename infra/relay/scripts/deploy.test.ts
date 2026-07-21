@@ -342,6 +342,14 @@ describe("artifact release workflows", () => {
       expect(verifiedNightlyWorkflow).toContain("Refuse rerun-to-green promotion");
       expect(verifiedNightlyWorkflow).toContain("Refuse rerun-to-green publication");
       expect(verifiedNightlyWorkflow).toContain("github.event.workflow_run.run_attempt != 1");
+      const sourceCheckoutIndex = verifiedNightlyWorkflow.indexOf(
+        "- name: Checkout nightly commit",
+      );
+      const sourceDownloadIndex = verifiedNightlyWorkflow.indexOf(
+        "- name: Download source metadata",
+      );
+      expect(sourceCheckoutIndex).toBeGreaterThan(-1);
+      expect(sourceDownloadIndex).toBeGreaterThan(sourceCheckoutIndex);
       expect(verifiedNightlyWorkflow).toContain("Provider E2E Gate");
       expect(verifiedNightlyWorkflow).toContain(
         "apps/server/src/orchestration/Layers/ProviderRuntimeIngestion.test.ts",
