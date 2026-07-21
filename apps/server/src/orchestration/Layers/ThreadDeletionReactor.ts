@@ -21,7 +21,10 @@ import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 
 import { GitWorkflowService } from "../../git/GitWorkflowService.ts";
-import { ProviderService } from "../../provider/Services/ProviderService.ts";
+import {
+  ProviderService,
+  type ProviderServiceShape,
+} from "../../provider/Services/ProviderService.ts";
 import * as TerminalManager from "../../terminal/Manager.ts";
 import {
   dispatchAlreadyCoordinated,
@@ -35,6 +38,7 @@ import {
 import { WorktreeLifecycleCoordinator } from "../Services/WorktreeLifecycleCoordinator.ts";
 
 import { threadAudienceSystemDispatchAuthority } from "../commandAudienceGuard.ts";
+import type { OrchestrationCommandDispatchAuthority } from "../commandAudienceGuard.ts";
 type ThreadDeletedEvent = Extract<OrchestrationEvent, { type: "thread.deleted" }>;
 type ThreadArchivedEvent = Extract<OrchestrationEvent, { type: "thread.archived" }>;
 type ThreadSessionSetEvent = Extract<OrchestrationEvent, { type: "thread.session-set" }>;
@@ -104,6 +108,49 @@ const ARCHIVE_SNAPSHOT_UNKNOWN_FAST_RETRY_LIMIT = 5;
 const ARCHIVE_SNAPSHOT_UNKNOWN_DELAYED_RETRY = "250 millis";
 const TEARDOWN_RETRY_LIMIT = 5;
 const TEARDOWN_RETRY_DELAY = "250 millis";
+
+export const stopAndRecordProviderSession = Effect.fn("stopAndRecordProviderSession")(
+  function* (input: {
+    readonly threadId: ThreadId;
+    readonly projectedSession: OrchestrationSession | null;
+    readonly runtimeSession: ProviderSession | undefined;
+    readonly providerService: Pick<ProviderServiceShape, "stopSession">;
+    readonly orchestrationEngine: OrchestrationEngineService["Service"];
+    readonly authority: OrchestrationCommandDispatchAuthority;
+    readonly commandId: CommandId;
+    readonly createdAt: string;
+    readonly lastError?: string | null;
+  }) {
+    if (input.runtimeSession !== undefined) {
+      yield* input.providerService.stopSession({ threadId: input.threadId });
+    }
+    const providerInstanceId =
+      input.projectedSession?.providerInstanceId ?? input.runtimeSession?.providerInstanceId;
+    yield* input.orchestrationEngine.dispatch(
+      {
+        type: "thread.session.set",
+        commandId: input.commandId,
+        threadId: input.threadId,
+        session: {
+          threadId: input.threadId,
+          status: "stopped",
+          providerName:
+            input.projectedSession?.providerName ?? input.runtimeSession?.provider ?? null,
+          ...(providerInstanceId !== undefined ? { providerInstanceId } : {}),
+          runtimeMode:
+            input.projectedSession?.runtimeMode ??
+            input.runtimeSession?.runtimeMode ??
+            "full-access",
+          activeTurnId: null,
+          lastError: input.lastError ?? input.projectedSession?.lastError ?? null,
+          updatedAt: input.createdAt,
+        },
+        createdAt: input.createdAt,
+      },
+      input.authority,
+    );
+  },
+);
 
 class WorktreeLifecycleTeardownError extends Schema.TaggedErrorClass<WorktreeLifecycleTeardownError>()(
   "WorktreeLifecycleTeardownError",
@@ -359,31 +406,16 @@ const make = Effect.gen(function* () {
       const { event, projectedSession, runtimeSession } = input;
       const threadId = event.payload.threadId;
       const authority = yield* authorityForThread(threadId);
-      if (runtimeSession !== undefined) {
-        yield* providerService.stopSession({ threadId });
-      }
-      const providerInstanceId =
-        projectedSession?.providerInstanceId ?? runtimeSession?.providerInstanceId;
-      yield* orchestrationEngine.dispatch(
-        {
-          type: "thread.session.set",
-          commandId: yield* sessionSetCommandIdForArchiveReplay(event),
-          threadId,
-          session: {
-            threadId,
-            status: "stopped",
-            providerName: projectedSession?.providerName ?? runtimeSession?.provider ?? null,
-            ...(providerInstanceId !== undefined ? { providerInstanceId } : {}),
-            runtimeMode:
-              projectedSession?.runtimeMode ?? runtimeSession?.runtimeMode ?? "full-access",
-            activeTurnId: null,
-            lastError: projectedSession?.lastError ?? null,
-            updatedAt: event.occurredAt,
-          },
-          createdAt: event.occurredAt,
-        },
+      yield* stopAndRecordProviderSession({
+        threadId,
+        projectedSession,
+        runtimeSession,
+        providerService,
+        orchestrationEngine,
         authority,
-      );
+        commandId: yield* sessionSetCommandIdForArchiveReplay(event),
+        createdAt: event.occurredAt,
+      });
     },
   );
 
