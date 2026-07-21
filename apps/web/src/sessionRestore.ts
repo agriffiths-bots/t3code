@@ -11,6 +11,34 @@ export type SessionRestoreResolution =
   | { readonly kind: "stale" }
   | { readonly kind: "ready" };
 
+export type SessionRestoreWaitingStage = "connecting" | "restoring";
+
+export function sessionRestoreWaitingStage(
+  resolution: SessionRestoreResolution,
+): SessionRestoreWaitingStage | null {
+  return resolution.kind === "connecting" || resolution.kind === "restoring"
+    ? resolution.kind
+    : null;
+}
+
+export function resolveSessionDetailStatus(input: {
+  readonly deleted: boolean;
+  readonly hasDetail: boolean;
+  readonly hasError: boolean;
+}): "pending" | "ready" | "deleted" | "error" {
+  if (input.deleted) return "deleted";
+  if (input.hasDetail) return "ready";
+  return input.hasError ? "error" : "pending";
+}
+
+export function shouldSubscribeToServerThread(input: {
+  readonly draftExists: boolean;
+  readonly draftPromoted: boolean;
+  readonly shellPresent: boolean;
+}): boolean {
+  return !input.draftExists || input.draftPromoted || input.shellPresent;
+}
+
 export function resolveSessionRestore(input: {
   readonly catalogReady: boolean;
   readonly environmentPresent: boolean;

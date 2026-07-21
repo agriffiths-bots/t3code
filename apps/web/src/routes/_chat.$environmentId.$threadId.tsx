@@ -11,7 +11,10 @@ import { finalizePromotedDraftThreadByRef, useComposerDraftStore } from "../comp
 import {
   SESSION_CONNECT_TIMEOUT_MS,
   SESSION_RESTORE_TIMEOUT_MS,
+  resolveSessionDetailStatus,
   resolveSessionRestore,
+  sessionRestoreWaitingStage,
+  shouldSubscribeToServerThread,
   type SessionRestoreResolution,
 } from "../sessionRestore";
 import { useEnvironment, useEnvironments } from "../state/environments";
@@ -21,23 +24,27 @@ import { environmentShell } from "../state/shell";
 import { useEnvironmentThread } from "../state/threads";
 import { resolveThreadRouteRef } from "../threadRoutes";
 
-function useRestoreTimeout(stage: "connecting" | "restoring" | null): boolean {
-  const [timedOutStage, setTimedOutStage] = useState<typeof stage>(null);
+function useRestoreTimeout(
+  stage: "connecting" | "restoring" | null,
+  resetKey: string | null,
+): boolean {
+  const timeoutIdentity = stage !== null && resetKey !== null ? `${resetKey}:${stage}` : null;
+  const [timedOutIdentity, setTimedOutIdentity] = useState<string | null>(null);
 
   useEffect(() => {
-    if (stage === null) {
-      setTimedOutStage(null);
+    if (timeoutIdentity === null || stage === null) {
+      setTimedOutIdentity(null);
       return;
     }
-    setTimedOutStage(null);
+    setTimedOutIdentity(null);
     const timeout = window.setTimeout(
-      () => setTimedOutStage(stage),
+      () => setTimedOutIdentity(timeoutIdentity),
       stage === "connecting" ? SESSION_CONNECT_TIMEOUT_MS : SESSION_RESTORE_TIMEOUT_MS,
     );
     return () => window.clearTimeout(timeout);
-  }, [stage]);
+  }, [stage, timeoutIdentity]);
 
-  return stage !== null && timedOutStage === stage;
+  return timeoutIdentity !== null && timedOutIdentity === timeoutIdentity;
 }
 
 function SessionRestoreStatus(props: {
@@ -94,24 +101,29 @@ function SessionRestoreStatus(props: {
 function RestoringThread(props: {
   readonly threadRef: NonNullable<ReturnType<typeof resolveThreadRouteRef>>;
   readonly draftThreadExists: boolean;
+  readonly draftThreadPromoted: boolean;
   readonly environmentLabel: string;
+  readonly shellHasThread: boolean;
 }) {
   const navigate = useNavigate();
-  const serverThreadDetail = useThreadDetail(props.threadRef);
-  const threadState = useEnvironmentThread(props.threadRef.environmentId, props.threadRef.threadId);
+  const shouldSubscribe = shouldSubscribeToServerThread({
+    draftExists: props.draftThreadExists,
+    draftPromoted: props.draftThreadPromoted,
+    shellPresent: props.shellHasThread,
+  });
+  const serverThreadDetail = useThreadDetail(shouldSubscribe ? props.threadRef : null);
+  const threadState = useEnvironmentThread(
+    shouldSubscribe ? props.threadRef.environmentId : null,
+    shouldSubscribe ? props.threadRef.threadId : null,
+  );
   const draftThread = useComposerDraftStore((store) => store.getDraftThreadByRef(props.threadRef));
   const serverThreadStarted = threadHasStarted(serverThreadDetail);
-  const stage = serverThreadDetail === null && !props.draftThreadExists ? "restoring" : null;
-  const timedOut = useRestoreTimeout(stage);
-  const detailStatus =
-    threadState.status === "deleted"
-      ? ("deleted" as const)
-      : threadState.error._tag === "Some"
-        ? ("error" as const)
-        : serverThreadDetail !== null
-          ? ("ready" as const)
-          : ("pending" as const);
-  const resolution = resolveSessionRestore({
+  const detailStatus = resolveSessionDetailStatus({
+    deleted: threadState.status === "deleted",
+    hasDetail: serverThreadDetail !== null,
+    hasError: threadState.error._tag === "Some",
+  });
+  const restoreInput = {
     catalogReady: true,
     environmentPresent: true,
     connectionPhase: "connected",
@@ -119,8 +131,15 @@ function RestoringThread(props: {
     shellHasThread: true,
     draftExists: props.draftThreadExists,
     detailStatus,
-    timedOut,
-  });
+  } as const;
+  const pendingResolution = resolveSessionRestore({ ...restoreInput, timedOut: false });
+  const timedOut = useRestoreTimeout(
+    sessionRestoreWaitingStage(pendingResolution),
+    `${props.threadRef.environmentId}:${props.threadRef.threadId}`,
+  );
+  const resolution = timedOut
+    ? resolveSessionRestore({ ...restoreInput, timedOut: true })
+    : pendingResolution;
 
   useEffect(() => {
     if (resolution.kind === "stale") {
@@ -176,13 +195,11 @@ function ChatThreadRouteView() {
     serverThreadShell !== null ||
     (threadRef !== null &&
       environmentThreadRefs.some((candidate) => candidate.threadId === threadRef.threadId));
-  const draftThreadExists = useComposerDraftStore((store) =>
-    threadRef ? store.getDraftThreadByRef(threadRef) !== null : false,
+  const draftThread = useComposerDraftStore((store) =>
+    threadRef ? store.getDraftThreadByRef(threadRef) : null,
   );
-  const stage =
-    environment?.connection.phase === "connected" ? "restoring" : ("connecting" as const);
-  const timedOut = useRestoreTimeout(threadRef === null ? null : stage);
-  const resolution = resolveSessionRestore({
+  const draftThreadExists = draftThread !== null;
+  const restoreInput = {
     catalogReady,
     environmentPresent: environment !== null,
     connectionPhase: environment?.connection.phase ?? null,
@@ -190,8 +207,15 @@ function ChatThreadRouteView() {
     shellHasThread,
     draftExists: draftThreadExists,
     ...(shellHasThread ? { detailStatus: "ready" as const } : {}),
-    timedOut,
-  });
+  } as const;
+  const pendingResolution = resolveSessionRestore({ ...restoreInput, timedOut: false });
+  const timedOut = useRestoreTimeout(
+    threadRef === null ? null : sessionRestoreWaitingStage(pendingResolution),
+    threadRef === null ? null : `${threadRef.environmentId}:${threadRef.threadId}`,
+  );
+  const resolution = timedOut
+    ? resolveSessionRestore({ ...restoreInput, timedOut: true })
+    : pendingResolution;
 
   useEffect(() => {
     if (threadRef !== null && resolution.kind === "stale") {
@@ -220,7 +244,9 @@ function ChatThreadRouteView() {
   return (
     <RestoringThread
       draftThreadExists={draftThreadExists}
+      draftThreadPromoted={draftThread?.promotedTo != null}
       environmentLabel={environment?.label ?? "backend"}
+      shellHasThread={shellHasThread}
       threadRef={threadRef}
     />
   );

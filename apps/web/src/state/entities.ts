@@ -18,6 +18,7 @@ import type { EnvironmentId, ThreadId } from "@t3tools/contracts";
 import { Atom } from "effect/unstable/reactivity";
 import { useMemo } from "react";
 import { appAtomRegistry } from "../rpc/atomRegistry";
+import { shouldSubscribeToServerThread } from "../sessionRestore";
 import { environmentProjects } from "./projects";
 import { environmentServerConfigsAtom } from "./server";
 import { allEnvironmentShellsBootstrappedAtom } from "./shell";
@@ -145,6 +146,22 @@ export function useThread(ref: ScopedThreadRef | null): EnvironmentThread | null
   const shell = useThreadShell(ref);
   const detail = useThreadDetail(ref);
   return useMemo(() => mergeEnvironmentThread(detail, shell), [detail, shell]);
+}
+
+export function useDraftAwareThread(
+  ref: ScopedThreadRef | null,
+  draft: { readonly promotedTo?: ScopedThreadRef | null } | null,
+): EnvironmentThread | null {
+  const shell = useThreadShell(ref);
+  return useThread(
+    shouldSubscribeToServerThread({
+      draftExists: draft !== null,
+      draftPromoted: draft?.promotedTo != null,
+      shellPresent: shell !== null,
+    })
+      ? ref
+      : null,
+  );
 }
 
 export function useThreadMessages(

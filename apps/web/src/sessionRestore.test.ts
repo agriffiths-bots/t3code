@@ -1,6 +1,11 @@
 import { describe, expect, it } from "vite-plus/test";
 
-import { resolveSessionRestore } from "./sessionRestore";
+import {
+  resolveSessionDetailStatus,
+  resolveSessionRestore,
+  sessionRestoreWaitingStage,
+  shouldSubscribeToServerThread,
+} from "./sessionRestore";
 
 const connectedInput = {
   catalogReady: true,
@@ -91,5 +96,44 @@ describe("session restore launch smoke", () => {
         timedOut: true,
       }),
     ).toEqual({ kind: "ready" });
+  });
+
+  it("arms a timeout only for a currently waiting resolution", () => {
+    expect(sessionRestoreWaitingStage({ kind: "connecting" })).toBe("connecting");
+    expect(sessionRestoreWaitingStage({ kind: "restoring" })).toBe("restoring");
+    expect(sessionRestoreWaitingStage({ kind: "ready" })).toBeNull();
+  });
+
+  it("keeps cached detail usable after a transient stream error", () => {
+    expect(resolveSessionDetailStatus({ deleted: false, hasDetail: true, hasError: true })).toBe(
+      "ready",
+    );
+    expect(resolveSessionDetailStatus({ deleted: true, hasDetail: true, hasError: true })).toBe(
+      "deleted",
+    );
+  });
+
+  it("defers draft detail subscriptions until the server thread is discoverable", () => {
+    expect(
+      shouldSubscribeToServerThread({
+        draftExists: true,
+        draftPromoted: false,
+        shellPresent: false,
+      }),
+    ).toBe(false);
+    expect(
+      shouldSubscribeToServerThread({
+        draftExists: true,
+        draftPromoted: false,
+        shellPresent: true,
+      }),
+    ).toBe(true);
+    expect(
+      shouldSubscribeToServerThread({
+        draftExists: true,
+        draftPromoted: true,
+        shellPresent: false,
+      }),
+    ).toBe(true);
   });
 });

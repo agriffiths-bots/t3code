@@ -11,7 +11,7 @@ import {
 import { memo, useMemo } from "react";
 
 import { useComposerDraftStore, type DraftId } from "../composerDraftStore";
-import { useProject, useThread } from "../state/entities";
+import { useDraftAwareThread, useProject } from "../state/entities";
 import { useIsMobile } from "../hooks/useMediaQuery";
 import {
   type EnvMode,
@@ -213,10 +213,10 @@ export const BranchToolbar = memo(function BranchToolbar({
     () => scopeThreadRef(environmentId, threadId),
     [environmentId, threadId],
   );
-  const serverThread = useThread(threadRef);
   const draftThread = useComposerDraftStore((store) =>
     draftId ? store.getDraftSession(draftId) : store.getDraftThreadByRef(threadRef),
   );
+  const serverThread = useDraftAwareThread(threadRef, draftThread);
   const activeProjectRef = serverThread
     ? scopeProjectRef(serverThread.environmentId, serverThread.projectId)
     : draftThread
