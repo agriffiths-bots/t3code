@@ -47,6 +47,7 @@ import { PendingDispatchRepositoryLive } from "../../persistence/Layers/PendingD
 import { SqlitePersistenceMemory } from "../../persistence/Layers/Sqlite.ts";
 import * as SubagentDispatchLimiter from "../../mcp/toolkits/subagent/SubagentDispatchLimiter.ts";
 import { makeCodexAdapter } from "../../provider/Layers/CodexAdapter.ts";
+import { PROVIDER_EMPTY_RESPONSE_ERROR } from "../../provider/Layers/providerFailureMessages.ts";
 import type { ProviderAdapterError } from "../../provider/Errors.ts";
 import type { CodexAdapterShape } from "../../provider/Services/CodexAdapter.ts";
 import type { ProviderAdapterShape } from "../../provider/Services/ProviderAdapter.ts";
@@ -1542,9 +1543,7 @@ describe("ProviderRuntimeIngestion", () => {
     );
     await harness.drain();
 
-    expect(failedThread.session?.lastError).toBe(
-      "Provider completed the turn without emitting an assistant response.",
-    );
+    expect(failedThread.session?.lastError).toBe(PROVIDER_EMPTY_RESPONSE_ERROR);
     expect(failedThread.messages.filter((message) => message.role === "assistant")).toEqual([]);
     expect(await harness.readProjectedTurns(threadId)).toEqual([
       { turnId: providerTurnId, state: "error" },
