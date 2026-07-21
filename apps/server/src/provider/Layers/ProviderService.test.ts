@@ -1458,7 +1458,7 @@ routing.layer("ProviderServiceLive routing", (it) => {
     }),
   );
 
-  it.effect("cleans orphaned output when an accepted start advances to a new turn", () =>
+  it.effect("does not rewrite a stale completion after ownership advances", () =>
     Effect.gen(function* () {
       const provider = yield* ProviderService.ProviderService;
       const directory = yield* ProviderSessionDirectory.ProviderSessionDirectory;
@@ -1546,11 +1546,8 @@ routing.layer("ProviderServiceLive routing", (it) => {
       const events = Array.from(yield* Fiber.join(orphanedCompletionFiber));
       assert.equal(events[0]?.type, "turn.completed");
       if (events[0]?.type === "turn.completed") {
-        assert.equal(events[0].payload.state, "failed");
-        assert.equal(
-          events[0].payload.errorMessage,
-          "Provider completed the turn without emitting an assistant response.",
-        );
+        assert.equal(events[0].payload.state, "completed");
+        assert.equal(events[0].payload.errorMessage, undefined);
       }
     }),
   );
@@ -3510,6 +3507,132 @@ routing.layer("ProviderServiceLive routing", (it) => {
     }).pipe(Effect.provide(NodeServices.layer)),
   );
 
+  it.effect("preserves a recovered active turn completion after service restart", () =>
+    Effect.gen(function* () {
+      const tempDir = NodeFS.mkdtempSync(
+        NodePath.join(NodeOS.tmpdir(), "t3-provider-service-output-restart-"),
+      );
+      const dbPath = NodePath.join(tempDir, "orchestration.sqlite");
+      const persistenceLayer = makeSqlitePersistenceLive(dbPath);
+      const runtimeRepositoryLayer = ProviderSessionRuntime.layer.pipe(
+        Layer.provide(persistenceLayer),
+      );
+
+      const firstCursor = makeFakeCodexAdapter(CURSOR_DRIVER);
+      const firstRegistry = makeAdapterRegistryMock({
+        [CURSOR_DRIVER]: firstCursor.adapter,
+      });
+      const firstDirectoryLayer = ProviderSessionDirectoryLive.pipe(
+        Layer.provide(runtimeRepositoryLayer),
+      );
+      const firstProviderLayer = makeProviderServiceLive().pipe(
+        Layer.provide(
+          Layer.succeed(ProviderAdapterRegistry.ProviderAdapterRegistry, firstRegistry),
+        ),
+        Layer.provide(firstDirectoryLayer),
+        Layer.provide(defaultServerSettingsLayer),
+        Layer.provide(AnalyticsService.layerTest),
+        Layer.provide(
+          Layer.succeed(
+            ProviderEventLoggers.ProviderEventLoggers,
+            ProviderEventLoggers.NoOpProviderEventLoggers,
+          ),
+        ),
+      );
+      const threadId = asThreadId("thread-cursor-output-restart");
+      const outputEventId = asEventId("evt-cursor-output-before-restart");
+      const turnId = yield* Effect.gen(function* () {
+        const provider = yield* ProviderService.ProviderService;
+        yield* provider.startSession(threadId, {
+          provider: CURSOR_DRIVER,
+          providerInstanceId: cursorInstanceId,
+          threadId,
+          runtimeMode: "full-access",
+        });
+        const turn = yield* provider.sendTurn({
+          threadId,
+          input: "continue",
+          attachments: [],
+        });
+        const observedOutput = yield* provider.streamEvents.pipe(
+          Stream.filter((event) => event.eventId === outputEventId),
+          Stream.take(1),
+          Stream.runCollect,
+          Effect.forkChild,
+        );
+        yield* advanceTestClock(50);
+        firstCursor.emit({
+          type: "content.delta",
+          eventId: outputEventId,
+          provider: CURSOR_DRIVER,
+          createdAt: "2026-01-01T00:00:01.000Z",
+          threadId,
+          turnId: turn.turnId,
+          itemId: "item-cursor-output-before-restart",
+          payload: {
+            streamKind: "assistant_text",
+            delta: "persisted before restart",
+          },
+        });
+        yield* Fiber.join(observedOutput);
+        return turn.turnId;
+      }).pipe(Effect.provide(firstProviderLayer));
+
+      const secondCursor = makeFakeCodexAdapter(CURSOR_DRIVER);
+      const secondRegistry = makeAdapterRegistryMock({
+        [CURSOR_DRIVER]: secondCursor.adapter,
+      });
+      const secondDirectoryLayer = ProviderSessionDirectoryLive.pipe(
+        Layer.provide(runtimeRepositoryLayer),
+      );
+      const secondProviderLayer = makeProviderServiceLive().pipe(
+        Layer.provide(
+          Layer.succeed(ProviderAdapterRegistry.ProviderAdapterRegistry, secondRegistry),
+        ),
+        Layer.provide(secondDirectoryLayer),
+        Layer.provide(defaultServerSettingsLayer),
+        Layer.provide(AnalyticsService.layerTest),
+        Layer.provide(
+          Layer.succeed(
+            ProviderEventLoggers.ProviderEventLoggers,
+            ProviderEventLoggers.NoOpProviderEventLoggers,
+          ),
+        ),
+      );
+
+      const completedEventId = asEventId("evt-cursor-output-after-restart-completed");
+      const completion = yield* Effect.gen(function* () {
+        const provider = yield* ProviderService.ProviderService;
+        yield* provider.interruptTurn({ threadId, turnId });
+        const completed = yield* provider.streamEvents.pipe(
+          Stream.filter((event) => event.eventId === completedEventId),
+          Stream.take(1),
+          Stream.runCollect,
+          Effect.forkChild,
+        );
+        yield* advanceTestClock(50);
+        secondCursor.emit({
+          type: "turn.completed",
+          eventId: completedEventId,
+          provider: CURSOR_DRIVER,
+          createdAt: "2026-01-01T00:00:02.000Z",
+          threadId,
+          turnId,
+          payload: { state: "completed", stopReason: "end_turn" },
+        });
+        yield* advanceTestClock(200);
+        return Array.from(yield* Fiber.join(completed));
+      }).pipe(Effect.provide(secondProviderLayer));
+
+      assert.equal(completion[0]?.type, "turn.completed");
+      if (completion[0]?.type === "turn.completed") {
+        assert.equal(completion[0].payload.state, "completed");
+        assert.equal(completion[0].payload.errorMessage, undefined);
+      }
+      NodeFS.rmSync(tempDir, { recursive: true, force: true });
+    }).pipe(Effect.provide(NodeServices.layer)),
+  );
+
   it.effect("does not resume persisted active turns for adapters without active-turn resume", () =>
     Effect.gen(function* () {
       const tempDir = NodeFS.mkdtempSync(
@@ -4209,10 +4332,12 @@ fanout.layer("ProviderServiceLive fanout", (it) => {
         runtimeMode: "full-access",
       });
 
-      const eventsRef = yield* Ref.make<Array<ProviderRuntimeEvent>>([]);
-      const consumer = yield* Stream.runForEach(provider.streamEvents, (event) =>
-        Ref.update(eventsRef, (current) => [...current, event]),
-      ).pipe(Effect.forkChild);
+      const completed = yield* provider.streamEvents.pipe(
+        Stream.filter((event) => event.eventId === asEventId("evt-1")),
+        Stream.take(1),
+        Stream.runCollect,
+        Effect.forkChild,
+      );
       yield* advanceTestClock(50);
 
       const completedEvent: LegacyProviderRuntimeEvent = {
@@ -4239,22 +4364,10 @@ fanout.layer("ProviderServiceLive fanout", (it) => {
         },
       });
       fanout.codex.emit(completedEvent);
-      yield* advanceTestClock(50);
+      const events = Array.from(yield* Fiber.join(completed));
 
-      const events = yield* Ref.get(eventsRef);
-      yield* Fiber.interrupt(consumer);
-
-      assert.equal(
-        events.some((entry) => entry.type === "turn.completed"),
-        true,
-      );
-      assert.equal(
-        events.some(
-          (entry) =>
-            entry.type === "turn.completed" && entry.providerInstanceId === codexInstanceId,
-        ),
-        true,
-      );
+      assert.equal(events[0]?.type, "turn.completed");
+      assert.equal(events[0]?.providerInstanceId, codexInstanceId);
     }),
   );
 
@@ -4643,7 +4756,8 @@ fanout.layer("ProviderServiceLive fanout", (it) => {
       const staleCompleted = events[0];
       assert.equal(staleCompleted?.type, "turn.completed");
       if (staleCompleted?.type === "turn.completed") {
-        assert.equal(staleCompleted.payload.state, "failed");
+        assert.equal(staleCompleted.payload.state, "completed");
+        assert.equal(staleCompleted.payload.errorMessage, undefined);
       }
       const activeCompleted = events[1];
       assert.equal(activeCompleted?.type, "turn.completed");

@@ -549,6 +549,18 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
     turnsWithMeaningfulOutputByAdapter.set(adapter, instances);
   };
 
+  const preserveRecoveredActiveTurnOutput = (
+    adapter: ProviderAdapterShape<ProviderAdapterError>,
+    instanceId: ProviderInstanceId,
+    threadId: ThreadId,
+    activeTurnId: TurnId,
+  ) => {
+    // A rebuilt ProviderService cannot reconstruct whether this already-active
+    // turn emitted output before the rebuild. Treat that absence as
+    // inconclusive so a terminal-only resume cannot fabricate an empty turn.
+    trackTurnOutput(adapter, instanceId, threadId, activeTurnId);
+  };
+
   const getPendingEmptyResponseCompletion = (
     source: ProviderRuntimeEventSource,
     threadId: ThreadId,
@@ -603,6 +615,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
     },
     event: ProviderRuntimeEvent,
     startedTurnAccepted: boolean,
+    terminalTurnOwned: boolean,
   ): ProviderRuntimeEvent => {
     const turnId = event.turnId;
     if (event.type === "session.exited") {
@@ -634,10 +647,14 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
       return event;
     }
     if (event.type === "turn.aborted") {
-      clearTrackedTurnOutput(source.adapter, source.instanceId, event.threadId, turnId);
+      if (terminalTurnOwned) {
+        clearTrackedTurnOutput(source.adapter, source.instanceId, event.threadId, turnId);
+      }
       return event;
     }
     if (event.type !== "turn.completed") return event;
+
+    if (!terminalTurnOwned) return event;
 
     const hasMeaningfulOutput = clearTrackedTurnOutput(
       source.adapter,
@@ -1877,10 +1894,23 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
             }).pipe(Effect.as(false)),
           ),
         );
+        const terminalTurnOwned = yield* terminalEventOwnsPersistedActiveTurn(
+          source,
+          canonicalEvent,
+        ).pipe(
+          Effect.catchCause((cause) =>
+            Effect.logWarning("provider.session.terminal-turn-ownership-read-failed", {
+              threadId: canonicalEvent.threadId,
+              provider: canonicalEvent.provider,
+              cause,
+            }).pipe(Effect.as(false)),
+          ),
+        );
         const acceptedEvent = guardEmptyAssistantResponse(
           source,
           canonicalEvent,
           startedTurnAccepted,
+          terminalTurnOwned,
         );
         yield* persistTerminalTurnRuntimeState(source, acceptedEvent).pipe(
           Effect.catchCause((cause) =>
@@ -1908,6 +1938,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
 
       const mustOrderAgainstSendFailure =
         canonicalEvent.type === "turn.started" ||
+        isTerminalTurnRuntimeEvent(canonicalEvent) ||
         (canonicalEvent.type === "session.state.changed" &&
           canonicalEvent.payload.state !== "error" &&
           canonicalEvent.payload.state !== "stopped");
@@ -2064,10 +2095,10 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
     });
   };
 
-  const completionOwnsPersistedActiveTurn = Effect.fn(
-    "ProviderService.completionOwnsPersistedActiveTurn",
+  const terminalEventOwnsPersistedActiveTurn = Effect.fn(
+    "ProviderService.terminalEventOwnsPersistedActiveTurn",
   )(function* (source: ProviderRuntimeEventSource, event: ProviderRuntimeEvent) {
-    if (event.type !== "turn.completed" || event.turnId === undefined) return false;
+    if (!isTerminalTurnRuntimeEvent(event) || event.turnId === undefined) return false;
     const binding = Option.getOrUndefined(
       yield* directory
         .getBinding(event.threadId)
@@ -2147,7 +2178,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
               correlatedEvent.turnId,
             ) &&
             (yield* isCurrentAdapterGeneration(source.instanceId, source.adapterGeneration)) &&
-            (yield* completionOwnsPersistedActiveTurn(source, correlatedEvent))
+            (yield* terminalEventOwnsPersistedActiveTurn(source, correlatedEvent))
           ) {
             const settlement = yield* Deferred.make<void>();
             const pendingCompletion: PendingEmptyResponseCompletion = {
@@ -2295,6 +2326,14 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
             readResumableActiveTurnId(input.binding.provider, input.binding.runtimePayload),
           );
           yield* upsertSessionBinding(existingWithInstance, input.binding.threadId);
+          if (existingWithInstance.activeTurnId !== undefined) {
+            preserveRecoveredActiveTurnOutput(
+              adapter,
+              bindingInstanceId,
+              input.binding.threadId,
+              existingWithInstance.activeTurnId,
+            );
+          }
           yield* analytics.record("provider.session.recovered", {
             provider: existingWithInstance.provider,
             strategy: "adopt-existing",
@@ -2381,6 +2420,14 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
         persistedActiveTurnId,
       );
       yield* upsertSessionBinding(resumedWithInstance, input.binding.threadId);
+      if (resumedWithInstance.activeTurnId !== undefined) {
+        preserveRecoveredActiveTurnOutput(
+          adapter,
+          bindingInstanceId,
+          input.binding.threadId,
+          resumedWithInstance.activeTurnId,
+        );
+      }
       yield* analytics.record("provider.session.recovered", {
         provider: resumedWithInstance.provider,
         strategy: "resume-thread",
@@ -2701,6 +2748,14 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
               ? { mcpProviderSessionId: preparedMcpSession.providerSessionId }
               : {}),
           });
+          if (effectiveActiveTurnId !== undefined) {
+            preserveRecoveredActiveTurnOutput(
+              adapter,
+              resolvedInstanceId,
+              threadId,
+              effectiveActiveTurnId,
+            );
+          }
           yield* analytics.record("provider.session.started", {
             provider: sessionWithInstance.provider,
             runtimeMode: input.runtimeMode,
