@@ -1762,7 +1762,14 @@ const makeWsRpcLayer = (currentSession: EnvironmentAuth.AuthenticatedSession) =>
             WS_METHODS.assetsCreateUrl,
             Effect.gen(function* () {
               if (input.resource._tag !== "workspace-file") {
-                return yield* issueAssetUrl({ resource: input.resource });
+                return yield* issueAssetUrl({
+                  resource: input.resource,
+                  ...(input.capabilities ? { clientCapabilities: input.capabilities } : {}),
+                  surfaceSessionId: currentSession.sessionId,
+                  ...(currentSession.expiresAt
+                    ? { surfaceSessionExpiresAt: currentSession.expiresAt }
+                    : {}),
+                });
               }
               const thread = yield* projectionSnapshotQuery
                 .getThreadShellById(input.resource.threadId)
@@ -1799,6 +1806,11 @@ const makeWsRpcLayer = (currentSession: EnvironmentAuth.AuthenticatedSession) =>
               return yield* issueAssetUrl({
                 resource: input.resource,
                 workspaceRoot: thread.value.worktreePath ?? project.value.workspaceRoot,
+                ...(input.capabilities ? { clientCapabilities: input.capabilities } : {}),
+                surfaceSessionId: currentSession.sessionId,
+                ...(currentSession.expiresAt
+                  ? { surfaceSessionExpiresAt: currentSession.expiresAt }
+                  : {}),
               });
             }),
             { "rpc.aggregate": "workspace" },

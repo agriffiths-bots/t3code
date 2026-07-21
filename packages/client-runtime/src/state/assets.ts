@@ -1,4 +1,10 @@
-import { AssetResource, EnvironmentId, WS_METHODS } from "@t3tools/contracts";
+import {
+  ASSET_SAME_ORIGIN_RELAY_V1_CAPABILITY,
+  AssetResource,
+  EnvironmentId,
+  WS_METHODS,
+  type AssetCreateUrlInput,
+} from "@t3tools/contracts";
 import * as Schema from "effect/Schema";
 import { Atom } from "effect/unstable/reactivity";
 
@@ -43,16 +49,33 @@ export function resolveAssetUrl(httpBaseUrl: string, relativeUrl: string): strin
   }
 }
 
+export function withAssetClientCapabilities(input: {
+  readonly resource: AssetResource;
+}): AssetCreateUrlInput {
+  return {
+    resource: input.resource,
+    capabilities: [ASSET_SAME_ORIGIN_RELAY_V1_CAPABILITY],
+  };
+}
+
 export function createAssetEnvironmentAtoms<R, E>(
   runtime: Atom.AtomRuntime<EnvironmentRegistry | R, E>,
 ) {
-  const createUrl = createEnvironmentRpcQueryAtomFamily(runtime, {
+  const createUrlQuery = createEnvironmentRpcQueryAtomFamily(runtime, {
     label: "environment-data:assets:create-url",
     tag: WS_METHODS.assetsCreateUrl,
     staleTimeMs: ASSET_URL_STALE_TIME_MS,
     idleTtlMs: ASSET_URL_IDLE_TTL_MS,
     refreshIntervalMs: ASSET_URL_REFRESH_INTERVAL_MS,
   });
+  const createUrl = (target: {
+    readonly environmentId: EnvironmentId;
+    readonly input: { readonly resource: AssetResource };
+  }) =>
+    createUrlQuery({
+      environmentId: target.environmentId,
+      input: withAssetClientCapabilities(target.input),
+    });
   const createUrlsFamily = Atom.family((key: string) => {
     const [environmentId, resources] = parseAssetCollectionKey(key);
     return Atom.make((get) =>

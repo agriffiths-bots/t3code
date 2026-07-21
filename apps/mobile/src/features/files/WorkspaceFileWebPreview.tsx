@@ -1,15 +1,30 @@
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import { ActivityIndicator, View } from "react-native";
 import { WebView } from "react-native-webview";
 
 import { AppText as Text } from "../../components/AppText";
 import { LoadingStrip } from "../../components/LoadingStrip";
+import type { AssetRequestSource } from "../../state/assets";
 
-export function WorkspaceFileWebPreview(props: { readonly uri: string | null }) {
+export function WorkspaceFileWebPreview(props: { readonly source: AssetRequestSource | null }) {
   const [loadProgress, setLoadProgress] = useState(0);
   const [loadError, setLoadError] = useState<string | null>(null);
+  const webViewSource = useMemo(() => {
+    if (props.source === null) return null;
+    if (props.source.surfaceBinding === undefined) return { uri: props.source.uri };
+    const assetUrl = new URL(props.source.uri);
+    return {
+      uri: props.source.surfaceBinding.uri,
+      method: "POST" as const,
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        credential: props.source.surfaceBinding.credential,
+        redirect: `${assetUrl.pathname}${assetUrl.search}`,
+      }),
+    };
+  }, [props.source]);
 
-  if (props.uri === null) {
+  if (webViewSource === null) {
     return (
       <View className="flex-1 items-center justify-center gap-3 bg-card px-6">
         <ActivityIndicator />
@@ -28,7 +43,7 @@ export function WorkspaceFileWebPreview(props: { readonly uri: string | null }) 
         </View>
       ) : null}
       <WebView
-        source={{ uri: props.uri }}
+        source={webViewSource}
         originWhitelist={["*"]}
         allowsBackForwardNavigationGestures
         allowsFullscreenVideo

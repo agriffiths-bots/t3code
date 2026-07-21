@@ -1,5 +1,5 @@
 import { describe, expect, it } from "@effect/vitest";
-import { EnvironmentId } from "@t3tools/contracts";
+import { ASSET_SAME_ORIGIN_RELAY_V1_CAPABILITY, EnvironmentId } from "@t3tools/contracts";
 import * as Layer from "effect/Layer";
 import { Atom } from "effect/unstable/reactivity";
 
@@ -8,7 +8,19 @@ import {
   createAssetEnvironmentAtoms,
   InvalidAssetCollectionKeyError,
   parseAssetCollectionKey,
+  withAssetClientCapabilities,
 } from "./assets.ts";
+
+describe("asset client capabilities", () => {
+  it("advertises same-origin relay support on every asset URL request", () => {
+    const resource = { _tag: "attachment" as const, attachmentId: "attachment-1" };
+
+    expect(withAssetClientCapabilities({ resource })).toEqual({
+      resource,
+      capabilities: [ASSET_SAME_ORIGIN_RELAY_V1_CAPABILITY],
+    });
+  });
+});
 
 describe("asset collection keys", () => {
   it("preserves malformed JSON and its native cause", () => {

@@ -3,6 +3,15 @@ import * as Schema from "effect/Schema";
 import { ThreadId, TrimmedNonEmptyString } from "./baseSchemas.ts";
 
 const ASSET_PATH_MAX_LENGTH = 1024;
+const ASSET_CLIENT_CAPABILITY_MAX_LENGTH = 64;
+const ASSET_CLIENT_CAPABILITIES_MAX_LENGTH = 16;
+
+export const ASSET_SAME_ORIGIN_RELAY_V1_CAPABILITY = "same-origin-relay-v1" as const;
+
+export const AssetClientCapability = TrimmedNonEmptyString.check(
+  Schema.isMaxLength(ASSET_CLIENT_CAPABILITY_MAX_LENGTH),
+);
+export type AssetClientCapability = typeof AssetClientCapability.Type;
 
 export const AssetResource = Schema.Union([
   Schema.TaggedStruct("workspace-file", {
@@ -20,14 +29,34 @@ export type AssetResource = typeof AssetResource.Type;
 
 export const AssetCreateUrlInput = Schema.Struct({
   resource: AssetResource,
+  capabilities: Schema.optionalKey(
+    Schema.Array(AssetClientCapability).check(
+      Schema.isMaxLength(ASSET_CLIENT_CAPABILITIES_MAX_LENGTH),
+    ),
+  ),
 });
 export type AssetCreateUrlInput = typeof AssetCreateUrlInput.Type;
 
 export const AssetCreateUrlResult = Schema.Struct({
   relativeUrl: TrimmedNonEmptyString.check(Schema.isMaxLength(4096)),
   expiresAt: Schema.Number,
+  surfaceCredential: Schema.optionalKey(
+    Schema.NullOr(TrimmedNonEmptyString.check(Schema.isMaxLength(4096))),
+  ),
 });
 export type AssetCreateUrlResult = typeof AssetCreateUrlResult.Type;
+
+export class AssetClientUpgradeRequiredError extends Schema.TaggedErrorClass<AssetClientUpgradeRequiredError>()(
+  "AssetClientUpgradeRequiredError",
+  {
+    resource: AssetResource,
+    requiredCapability: Schema.Literal(ASSET_SAME_ORIGIN_RELAY_V1_CAPABILITY),
+  },
+) {
+  override get message(): string {
+    return "Upgrade the client to load private assets.";
+  }
+}
 
 export class AssetWorkspaceContextNotFoundError extends Schema.TaggedErrorClass<AssetWorkspaceContextNotFoundError>()(
   "AssetWorkspaceContextNotFoundError",
@@ -181,6 +210,7 @@ export class AssetSigningKeyLoadError extends Schema.TaggedErrorClass<AssetSigni
 }
 
 export const AssetAccessError = Schema.Union([
+  AssetClientUpgradeRequiredError,
   AssetWorkspaceContextNotFoundError,
   AssetWorkspaceContextResolutionError,
   AssetWorkspaceRootNormalizationError,
