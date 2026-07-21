@@ -174,9 +174,10 @@ export const makeAcpPatchedProtocol = Effect.fn("makeAcpPatchedProtocol")(functi
     }
   };
 
-  // Alias core request ids before the JSON-RPC parser records batch keys. The
+  // Normalize request ids before the JSON-RPC parser records batch keys. The
   // parser stringifies ids, so raw `42` and `"42"` otherwise collide before
-  // the later routing layer can distinguish them.
+  // the later routing layer can distinguish them, and extension replies also
+  // need the original JSON type restored.
   let inboundWireBuffer = "";
   const prepareInboundChunk = (
     chunkText: string,
@@ -229,7 +230,6 @@ export const makeAcpPatchedProtocol = Effect.fn("makeAcpPatchedProtocol")(functi
           if (
             !("method" in value) ||
             typeof value.method !== "string" ||
-            !options.serverRequestMethods.has(value.method) ||
             !("id" in value) ||
             (typeof value.id !== "string" && typeof value.id !== "number")
           ) {
@@ -643,7 +643,7 @@ export const makeAcpPatchedProtocol = Effect.fn("makeAcpPatchedProtocol")(functi
       );
     }
 
-    // Core ids were normalized before parser.decode so the parser and RPC
+    // Request ids were normalized before parser.decode so the parser and RPC
     // bridge share the same unique batch/request key.
     return Queue.offer(serverQueue, message).pipe(Effect.asVoid);
   };
@@ -661,18 +661,17 @@ export const makeAcpPatchedProtocol = Effect.fn("makeAcpPatchedProtocol")(functi
       Effect.annotateLogs({ tag, requestId }),
     );
 
-  const handleExitEncoded = (message: RpcMessage.ResponseExitEncoded, idWasString?: boolean) =>
-    Ref.get(extPending).pipe(
+  const isForeignPeerResponseId = (requestId: string, idWasString?: boolean) =>
+    idWasString === true || !isForwardableRequestId(requestId);
+
+  const handleExitEncoded = (message: RpcMessage.ResponseExitEncoded, idWasString?: boolean) => {
+    if (isForeignPeerResponseId(message.requestId, idWasString)) {
+      return dropForeignPeerMessage("Exit", message.requestId);
+    }
+    return Ref.get(extPending).pipe(
       Effect.flatMap((pending) => {
         const pendingRequest = pending.get(message.requestId);
         if (!pendingRequest) {
-          // This client only issues integer ids, and JSON-RPC treats the
-          // string `"42"` and the number `42` as distinct — a string-typed or
-          // non-numeric id that matches no tracked extension request answers
-          // nothing we sent.
-          if (idWasString === true || !isForwardableRequestId(message.requestId)) {
-            return dropForeignPeerMessage("Exit", message.requestId);
-          }
           return Queue.offer(clientQueue, message).pipe(Effect.asVoid);
         }
         if (message.exit._tag === "Success") {
@@ -699,6 +698,7 @@ export const makeAcpPatchedProtocol = Effect.fn("makeAcpPatchedProtocol")(functi
         );
       }),
     );
+  };
 
   const routeDecodedMessage = (
     message: RpcMessage.FromClientEncoded | RpcMessage.FromServerEncoded,
@@ -710,6 +710,9 @@ export const makeAcpPatchedProtocol = Effect.fn("makeAcpPatchedProtocol")(functi
       case "Exit":
         return handleExitEncoded(message, idWasString);
       case "Chunk":
+        if (isForeignPeerResponseId(message.requestId, idWasString)) {
+          return dropForeignPeerMessage("Chunk", message.requestId);
+        }
         return Ref.get(extPending).pipe(
           Effect.flatMap((pending) => {
             const pendingRequest = pending.get(message.requestId);
@@ -721,9 +724,6 @@ export const makeAcpPatchedProtocol = Effect.fn("makeAcpPatchedProtocol")(functi
                   message.requestId,
                 ),
               );
-            }
-            if (idWasString === true || !isForwardableRequestId(message.requestId)) {
-              return dropForeignPeerMessage("Chunk", message.requestId);
             }
             return Queue.offer(clientQueue, message).pipe(Effect.asVoid);
           }),

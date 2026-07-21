@@ -369,6 +369,100 @@ it.layer(NodeServices.layer)("effect-acp protocol", (it) => {
     }),
   );
 
+  it.effect("preserves string ids for inbound extension request replies", () =>
+    Effect.gen(function* () {
+      const { stdio, input, output } = yield* makeInMemoryStdio();
+      yield* AcpProtocol.makeAcpPatchedProtocol({
+        stdio,
+        serverRequestMethods: new Set(),
+        onExtRequest: (method, params) => Effect.succeed({ method, params }),
+      });
+
+      for (const id of ["skills-reload", "42"]) {
+        yield* Queue.offer(
+          input,
+          encoder.encode(
+            `${encodeUnknownJsonString({
+              jsonrpc: "2.0",
+              id,
+              method: "x/test",
+              params: { hello: "world" },
+            })}\n`,
+          ),
+        );
+
+        assert.deepEqual(yield* decodeUnknownJsonString(yield* Queue.take(output)), {
+          jsonrpc: "2.0",
+          id,
+          result: { method: "x/test", params: { hello: "world" } },
+        });
+      }
+    }),
+  );
+
+  it.effect("drops a string-typed Exit that resembles a pending numeric extension request", () =>
+    Effect.gen(function* () {
+      const { stdio, input, output } = yield* makeInMemoryStdio();
+      const transport = yield* AcpProtocol.makeAcpPatchedProtocol({
+        stdio,
+        serverRequestMethods: new Set(),
+      });
+      const response = yield* transport
+        .request("x/test", { hello: "world" })
+        .pipe(Effect.forkScoped);
+      yield* Queue.take(output);
+
+      yield* Queue.offer(
+        input,
+        encoder.encode(
+          `${encodeUnknownJsonString({
+            jsonrpc: "2.0",
+            id: "1",
+            result: { foreign: true },
+          })}\n${encodeUnknownJsonString({
+            jsonrpc: "2.0",
+            id: 1,
+            result: { ok: true },
+          })}\n`,
+        ),
+      );
+
+      assert.deepEqual(yield* Fiber.join(response), { ok: true });
+    }),
+  );
+
+  it.effect("drops a string-typed Chunk that resembles a pending numeric extension request", () =>
+    Effect.gen(function* () {
+      const { stdio, input, output } = yield* makeInMemoryStdio();
+      const transport = yield* AcpProtocol.makeAcpPatchedProtocol({
+        stdio,
+        serverRequestMethods: new Set(),
+      });
+      const response = yield* transport
+        .request("x/test", { hello: "world" })
+        .pipe(Effect.forkScoped);
+      yield* Queue.take(output);
+
+      yield* Queue.offer(
+        input,
+        encoder.encode(
+          `${encodeUnknownJsonString({
+            jsonrpc: "2.0",
+            id: "1",
+            chunk: true,
+            result: ["foreign"],
+          })}\n${encodeUnknownJsonString({
+            jsonrpc: "2.0",
+            id: 1,
+            result: { ok: true },
+          })}\n`,
+        ),
+      );
+
+      assert.deepEqual(yield* Fiber.join(response), { ok: true });
+    }),
+  );
+
   it.effect("correlates extension response errors with the originating request", () =>
     Effect.gen(function* () {
       const { stdio, input, output } = yield* makeInMemoryStdio();

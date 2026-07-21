@@ -7,8 +7,8 @@ Blast radius: inbound raw-frame preparation, extension request dispatch/reply en
 Edge-case matrix / red-first tests:
 
 - String extension request ID and numeric-looking string extension request ID → `preserves string ids for inbound extension request replies` proves exact wire value/type restoration.
-- String `Exit` matching a pending numeric extension ID → `drops string-typed Exit and Chunk ids that resemble pending numeric extension requests` proves the pending request remains live until the numeric response.
-- String `Chunk` matching a pending numeric extension ID → same named test proves no false unsupported-streaming failure.
+- String `Exit` matching a pending numeric extension ID → `drops a string-typed Exit that resembles a pending numeric extension request` proves the pending request remains live until the numeric response.
+- String `Chunk` matching a pending numeric extension ID → `drops a string-typed Chunk that resembles a pending numeric extension request` proves no false unsupported-streaming failure.
 - Reply before/after unrelated traffic, duplicate/replayed foreign response, crash-between-steps, same-timestamp ties, version skew → no new state or persistence; aliases remain request-lifetime scoped and foreign responses are idempotently dropped.
 - Concurrent/batched core and extension requests → existing mixed-batch and alias-collision tests guard parser bookkeeping; run the full effect-acp protocol test file.
 
