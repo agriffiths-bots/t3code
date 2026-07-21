@@ -29,6 +29,11 @@ import {
   type ProviderSessionReaperShape,
 } from "../Services/ProviderSessionReaper.ts";
 import { ProviderService } from "../Services/ProviderService.ts";
+import {
+  PROVIDER_SESSION_CLOSED_DURING_TURN_ERROR,
+  PROVIDER_SESSION_FAILED_DURING_TURN_ERROR,
+  providerSessionDisappearedDuringTurnError,
+} from "./providerFailureMessages.ts";
 
 import { threadAudienceSystemDispatchAuthority } from "../../orchestration/commandAudienceGuard.ts";
 const DEFAULT_INACTIVITY_THRESHOLD_MS = 30 * 60 * 1000;
@@ -661,8 +666,8 @@ const makeProviderSessionReaper = (options?: ProviderSessionReaperLiveOptions) =
               turnId: activeTurnId,
               reason:
                 binding.status === "error"
-                  ? "Provider session failed while the turn was running."
-                  : "Provider session closed while the turn was running.",
+                  ? PROVIDER_SESSION_FAILED_DURING_TURN_ERROR
+                  : PROVIDER_SESSION_CLOSED_DURING_TURN_ERROR,
               failedAt,
               expiredApprovalRequestIds,
             });
@@ -702,8 +707,8 @@ const makeProviderSessionReaper = (options?: ProviderSessionReaperLiveOptions) =
               reason:
                 liveSession.lastError ??
                 (liveSession.status === "error"
-                  ? "Provider session failed while the turn was running."
-                  : "Provider session closed while the turn was running."),
+                  ? PROVIDER_SESSION_FAILED_DURING_TURN_ERROR
+                  : PROVIDER_SESSION_CLOSED_DURING_TURN_ERROR),
               failedAt,
               expiredApprovalRequestIds,
             });
@@ -725,7 +730,7 @@ const makeProviderSessionReaper = (options?: ProviderSessionReaperLiveOptions) =
             binding,
             thread,
             turnId: activeTurnId,
-            reason: `Provider session disappeared while turn '${activeTurnId}' was running.`,
+            reason: providerSessionDisappearedDuringTurnError(activeTurnId),
             failedAt,
             expiredApprovalRequestIds,
           });

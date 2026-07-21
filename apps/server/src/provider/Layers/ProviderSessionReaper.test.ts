@@ -40,6 +40,10 @@ import { ProviderSessionReaper } from "../Services/ProviderSessionReaper.ts";
 import { ProviderService, type ProviderServiceShape } from "../Services/ProviderService.ts";
 import { ProviderSessionDirectoryLive } from "./ProviderSessionDirectory.ts";
 import { makeProviderSessionReaperLive } from "./ProviderSessionReaper.ts";
+import {
+  PROVIDER_SESSION_FAILED_DURING_TURN_ERROR,
+  providerSessionDisappearedDuringTurnError,
+} from "./providerFailureMessages.ts";
 
 const defaultModelSelection = {
   instanceId: ProviderInstanceId.make("codex"),
@@ -566,7 +570,7 @@ describe("ProviderSessionReaper", () => {
     expect(thread?.session).toMatchObject({
       status: "stopped",
       activeTurnId: null,
-      lastError: expect.stringContaining("disappeared"),
+      lastError: providerSessionDisappearedDuringTurnError(turnId),
     });
     expect(harness.stopSession).toHaveBeenCalledWith({ threadId });
     const released = Option.getOrThrow(
@@ -828,7 +832,7 @@ describe("ProviderSessionReaper", () => {
     expect(harness.stopSession).toHaveBeenCalledWith({ threadId });
     expect(harness.readModel().threads[0]?.session).toMatchObject({
       status: "stopped",
-      lastError: expect.stringContaining("disappeared"),
+      lastError: providerSessionDisappearedDuringTurnError(turnId),
     });
   });
 
@@ -957,7 +961,7 @@ describe("ProviderSessionReaper", () => {
     expect(harness.readModel().threads[0]?.session).toMatchObject({
       status: "error",
       activeTurnId: null,
-      lastError: "Provider session failed while the turn was running.",
+      lastError: PROVIDER_SESSION_FAILED_DURING_TURN_ERROR,
     });
     const binding = Option.getOrThrow(
       await runtime!.runPromise(repository.getByThreadId({ threadId })),
@@ -1459,7 +1463,7 @@ describe("ProviderSessionReaper", () => {
     expect(harness.readModel().threads[0]?.session).toMatchObject({
       status: "stopped",
       activeTurnId: null,
-      lastError: expect.stringContaining("disappeared"),
+      lastError: providerSessionDisappearedDuringTurnError(turnId),
     });
     expect(harness.readModel().threads[0]?.session?.lastError).not.toContain(String(requestId));
     expect(
