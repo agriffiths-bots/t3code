@@ -28,7 +28,6 @@ import {
 } from "@t3tools/contracts";
 import { causeErrorTag } from "@t3tools/shared/observability";
 import * as DateTime from "effect/DateTime";
-import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
@@ -73,13 +72,6 @@ const isModelSelection = Schema.is(ModelSelection);
 const isTurnId = Schema.is(TurnId);
 
 const supportsActiveTurnResume = (provider: ProviderDriverKind): boolean => provider === "cursor";
-
-// Cursor intentionally keeps the completed turn as the notification owner for
-// this 200ms late-update window before a follow-up prompt can start. Mirror that
-// existing adapter boundary here so the empty-response decision observes every
-// delta that Cursor can still attribute to the completed turn.
-const emptyResponseCompletionGraceMs = (provider: ProviderDriverKind): number | undefined =>
-  provider === "cursor" ? 200 : undefined;
 
 /**
  * Hook for tests that want to override the canonical event logger pulled
@@ -373,66 +365,6 @@ const isTerminalTurnRuntimeEvent = (event: ProviderRuntimeEvent): boolean =>
 const isStartedTurnRuntimeEvent = (event: ProviderRuntimeEvent): boolean =>
   event.type === "turn.started";
 
-const hasNonWhitespaceText = (value: unknown): value is string =>
-  typeof value === "string" && value.trim().length > 0;
-
-const isMeaningfulCompletedItem = (
-  payload: Extract<
-    ProviderRuntimeEvent,
-    { readonly type: "item.started" | "item.updated" | "item.completed" }
-  >["payload"],
-): boolean => {
-  switch (payload.itemType) {
-    case "assistant_message":
-    case "reasoning":
-    case "plan":
-      return hasNonWhitespaceText(payload.detail);
-    case "user_message":
-    case "error":
-    case "unknown":
-      return false;
-    default:
-      return true;
-  }
-};
-
-const isMeaningfulTurnOutputEvent = (event: ProviderRuntimeEvent): boolean => {
-  switch (event.type) {
-    case "turn.plan.updated":
-      return event.payload.plan.length > 0 || hasNonWhitespaceText(event.payload.explanation);
-    case "turn.proposed.delta":
-      return hasNonWhitespaceText(event.payload.delta);
-    case "turn.proposed.completed":
-      return hasNonWhitespaceText(event.payload.planMarkdown);
-    case "turn.diff.updated":
-      return hasNonWhitespaceText(event.payload.unifiedDiff);
-    case "content.delta":
-      return hasNonWhitespaceText(event.payload.delta);
-    case "item.completed":
-      // Providers emit empty assistant/reasoning/plan lifecycle shells around
-      // their actual deltas. Only detail-bearing shells count; tool and other
-      // structured work items are meaningful by their lifecycle alone.
-      return isMeaningfulCompletedItem(event.payload);
-    case "item.updated":
-      return event.payload.status !== undefined && event.payload.status !== "inProgress"
-        ? isMeaningfulCompletedItem(event.payload)
-        : false;
-    case "thread.realtime.audio.delta":
-    case "task.completed":
-    case "hook.completed":
-    case "tool.summary":
-    case "tool.denied":
-      return true;
-    case "files.persisted":
-      return event.payload.files.length > 0;
-    default:
-      return false;
-  }
-};
-
-const EMPTY_ASSISTANT_RESPONSE_ERROR =
-  "Provider completed the turn without emitting an assistant response.";
-
 interface AdapterGenerationRecord {
   readonly currentAdapter: ProviderAdapterShape<ProviderAdapterError>;
   readonly currentGeneration: number;
@@ -441,33 +373,6 @@ interface AdapterGenerationRecord {
 interface TrackedMcpSessionRecord {
   readonly adapterGeneration: number;
   readonly providerSessionId: string;
-}
-
-interface ProviderRuntimeEventSource {
-  readonly instanceId: ProviderInstanceId;
-  readonly provider: ProviderDriverKind;
-  readonly adapterGeneration: number;
-  readonly adapter: ProviderAdapterShape<ProviderAdapterError>;
-}
-
-interface ProviderSessionEndContext {
-  readonly providerSessionId?: string;
-  readonly duringPendingStart: boolean;
-}
-
-interface BufferedProviderRuntimeEvent {
-  readonly event: ProviderRuntimeEvent;
-  readonly sessionEndContext?: ProviderSessionEndContext;
-}
-
-interface PendingEmptyResponseCompletion {
-  readonly source: ProviderRuntimeEventSource;
-  readonly threadId: ThreadId;
-  readonly turnId: TurnId | string;
-  readonly events: Array<BufferedProviderRuntimeEvent>;
-  readonly settled: Deferred.Deferred<void>;
-  draining: boolean;
-  closed: boolean;
 }
 
 const makeProviderService = Effect.fn("makeProviderService")(function* (
@@ -484,201 +389,6 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
   const registry = yield* ProviderAdapterRegistry.ProviderAdapterRegistry;
   const directory = yield* ProviderSessionDirectory.ProviderSessionDirectory;
   const runtimeEventPubSub = yield* PubSub.unbounded<ProviderRuntimeEvent>();
-  const turnsWithMeaningfulOutputByAdapter = new WeakMap<
-    ProviderAdapterShape<ProviderAdapterError>,
-    Map<ProviderInstanceId, Map<ThreadId, Set<string>>>
-  >();
-  const pendingEmptyResponseCompletionsByAdapter = new WeakMap<
-    ProviderAdapterShape<ProviderAdapterError>,
-    Map<ProviderInstanceId, Map<ThreadId, PendingEmptyResponseCompletion>>
-  >();
-
-  const clearTrackedSessionOutput = (
-    adapter: ProviderAdapterShape<ProviderAdapterError>,
-    instanceId: ProviderInstanceId,
-    threadId: ThreadId,
-  ) => {
-    const instances = turnsWithMeaningfulOutputByAdapter.get(adapter);
-    const sessions = instances?.get(instanceId);
-    if (sessions === undefined) return;
-    sessions.delete(threadId);
-    if (sessions.size === 0) instances?.delete(instanceId);
-    if (instances?.size === 0) turnsWithMeaningfulOutputByAdapter.delete(adapter);
-  };
-
-  const clearTrackedTurnOutput = (
-    adapter: ProviderAdapterShape<ProviderAdapterError>,
-    instanceId: ProviderInstanceId,
-    threadId: ThreadId,
-    turnId: TurnId | string,
-  ): boolean => {
-    const sessions = turnsWithMeaningfulOutputByAdapter.get(adapter)?.get(instanceId);
-    const turns = sessions?.get(threadId);
-    if (turns === undefined) return false;
-    const hadOutput = turns.delete(String(turnId));
-    if (turns.size === 0) clearTrackedSessionOutput(adapter, instanceId, threadId);
-    return hadOutput;
-  };
-
-  const hasTrackedTurnOutput = (
-    adapter: ProviderAdapterShape<ProviderAdapterError>,
-    instanceId: ProviderInstanceId,
-    threadId: ThreadId,
-    turnId: TurnId | string,
-  ): boolean =>
-    turnsWithMeaningfulOutputByAdapter
-      .get(adapter)
-      ?.get(instanceId)
-      ?.get(threadId)
-      ?.has(String(turnId)) === true;
-
-  const trackTurnOutput = (
-    adapter: ProviderAdapterShape<ProviderAdapterError>,
-    instanceId: ProviderInstanceId,
-    threadId: ThreadId,
-    turnId: TurnId | string,
-  ) => {
-    const instances =
-      turnsWithMeaningfulOutputByAdapter.get(adapter) ??
-      new Map<ProviderInstanceId, Map<ThreadId, Set<string>>>();
-    const sessions = instances.get(instanceId) ?? new Map<ThreadId, Set<string>>();
-    const turns = sessions.get(threadId) ?? new Set<string>();
-    turns.add(String(turnId));
-    sessions.set(threadId, turns);
-    instances.set(instanceId, sessions);
-    turnsWithMeaningfulOutputByAdapter.set(adapter, instances);
-  };
-
-  const preserveRecoveredActiveTurnOutput = (
-    adapter: ProviderAdapterShape<ProviderAdapterError>,
-    instanceId: ProviderInstanceId,
-    threadId: ThreadId,
-    activeTurnId: TurnId,
-  ) => {
-    // A rebuilt ProviderService cannot reconstruct whether this already-active
-    // turn emitted output before the rebuild. Treat that absence as
-    // inconclusive so a terminal-only resume cannot fabricate an empty turn.
-    trackTurnOutput(adapter, instanceId, threadId, activeTurnId);
-  };
-
-  const getPendingEmptyResponseCompletion = (
-    source: ProviderRuntimeEventSource,
-    threadId: ThreadId,
-  ): PendingEmptyResponseCompletion | undefined =>
-    pendingEmptyResponseCompletionsByAdapter
-      .get(source.adapter)
-      ?.get(source.instanceId)
-      ?.get(threadId);
-
-  const setPendingEmptyResponseCompletion = (pending: PendingEmptyResponseCompletion) => {
-    const instances =
-      pendingEmptyResponseCompletionsByAdapter.get(pending.source.adapter) ??
-      new Map<ProviderInstanceId, Map<ThreadId, PendingEmptyResponseCompletion>>();
-    const sessions =
-      instances.get(pending.source.instanceId) ??
-      new Map<ThreadId, PendingEmptyResponseCompletion>();
-    sessions.set(pending.threadId, pending);
-    instances.set(pending.source.instanceId, sessions);
-    pendingEmptyResponseCompletionsByAdapter.set(pending.source.adapter, instances);
-  };
-
-  const deletePendingEmptyResponseCompletion = (pending: PendingEmptyResponseCompletion) => {
-    const instances = pendingEmptyResponseCompletionsByAdapter.get(pending.source.adapter);
-    const sessions = instances?.get(pending.source.instanceId);
-    if (sessions?.get(pending.threadId) !== pending) return;
-    sessions.delete(pending.threadId);
-    if (sessions.size === 0) instances?.delete(pending.source.instanceId);
-    if (instances?.size === 0) {
-      pendingEmptyResponseCompletionsByAdapter.delete(pending.source.adapter);
-    }
-  };
-
-  const clearTrackedSessionOutputExceptTurn = (
-    adapter: ProviderAdapterShape<ProviderAdapterError>,
-    instanceId: ProviderInstanceId,
-    threadId: ThreadId,
-    turnId: TurnId | string,
-  ) => {
-    const turns = turnsWithMeaningfulOutputByAdapter.get(adapter)?.get(instanceId)?.get(threadId);
-    if (turns === undefined) return;
-    const incomingTurnId = String(turnId);
-    for (const trackedTurnId of turns) {
-      if (trackedTurnId !== incomingTurnId) turns.delete(trackedTurnId);
-    }
-    if (turns.size === 0) clearTrackedSessionOutput(adapter, instanceId, threadId);
-  };
-
-  const guardEmptyAssistantResponse = (
-    source: {
-      readonly adapter: ProviderAdapterShape<ProviderAdapterError>;
-      readonly instanceId: ProviderInstanceId;
-    },
-    event: ProviderRuntimeEvent,
-    startedTurnAccepted: boolean,
-    terminalTurnOwned: boolean,
-  ): ProviderRuntimeEvent => {
-    const turnId = event.turnId;
-    if (event.type === "session.exited") {
-      clearTrackedSessionOutput(source.adapter, source.instanceId, event.threadId);
-      return event;
-    }
-    if (turnId === undefined) return event;
-
-    const payload =
-      "payload" in event && typeof event.payload === "object" && event.payload !== null
-        ? event.payload
-        : undefined;
-    if (event.type === "turn.started") {
-      if (startedTurnAccepted) {
-        // The persisted active turn is authoritative. Prune orphaned output
-        // from older turns while preserving this id so duplicate starts and
-        // output that raced ahead of the start remain idempotent.
-        clearTrackedSessionOutputExceptTurn(
-          source.adapter,
-          source.instanceId,
-          event.threadId,
-          turnId,
-        );
-      }
-      return event;
-    }
-    if (isMeaningfulTurnOutputEvent(event)) {
-      trackTurnOutput(source.adapter, source.instanceId, event.threadId, turnId);
-      return event;
-    }
-    if (event.type === "turn.aborted") {
-      if (terminalTurnOwned) {
-        clearTrackedTurnOutput(source.adapter, source.instanceId, event.threadId, turnId);
-      }
-      return event;
-    }
-    if (event.type !== "turn.completed") return event;
-
-    if (!terminalTurnOwned) return event;
-
-    const hasMeaningfulOutput = clearTrackedTurnOutput(
-      source.adapter,
-      source.instanceId,
-      event.threadId,
-      turnId,
-    );
-    if (
-      payload === undefined ||
-      !("state" in payload) ||
-      payload.state !== "completed" ||
-      hasMeaningfulOutput
-    ) {
-      return event;
-    }
-    return {
-      ...event,
-      payload: {
-        ...event.payload,
-        state: "failed",
-        errorMessage: EMPTY_ASSISTANT_RESPONSE_ERROR,
-      },
-    };
-  };
   const nowIso = Effect.map(DateTime.now, DateTime.formatIso);
   const mcpEndCleanupRetryDelay = "250 millis";
   const sessionExitLivenessPollDelay = "50 millis";
@@ -1509,7 +1219,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
     event: ProviderRuntimeEvent,
   ) => {
     if (!isStartedTurnRuntimeEvent(event) || event.turnId === undefined) {
-      return Effect.succeed(false);
+      return Effect.void;
     }
 
     return Effect.gen(function* () {
@@ -1523,16 +1233,16 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
           ),
       );
       if (!binding) {
-        return false;
+        return;
       }
       if (
         binding.provider !== source.provider ||
         binding.providerInstanceId !== source.instanceId
       ) {
-        return false;
+        return;
       }
       if (!(yield* isCurrentAdapterGeneration(source.instanceId, source.adapterGeneration))) {
-        return false;
+        return;
       }
       const previousPayload = readRecord(binding.runtimePayload) ?? {};
       const lastTerminalTurnId = previousPayload.lastTerminalTurnId;
@@ -1541,7 +1251,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
         lastTerminalTurnId !== undefined &&
         String(lastTerminalTurnId) === String(event.turnId)
       ) {
-        return false;
+        return;
       }
       const persistedActiveTurnId = previousPayload.activeTurnId;
       if (
@@ -1549,7 +1259,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
         persistedActiveTurnId !== undefined &&
         String(persistedActiveTurnId) !== String(event.turnId)
       ) {
-        return false;
+        return;
       }
 
       yield* directory.upsert({
@@ -1570,7 +1280,6 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
           lastRuntimeEventAt: event.createdAt,
         },
       });
-      return true;
     });
   };
 
@@ -1770,7 +1479,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
     return true;
   });
 
-  const handleAcceptedRuntimeEventNow = Effect.fn("ProviderService.handleAcceptedRuntimeEventNow")(
+  const handleAcceptedRuntimeEvent = Effect.fn("ProviderService.handleAcceptedRuntimeEvent")(
     function* (
       source: {
         readonly instanceId: ProviderInstanceId;
@@ -1779,7 +1488,10 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
         readonly adapter: ProviderAdapterShape<ProviderAdapterError>;
       },
       canonicalEvent: ProviderRuntimeEvent,
-      sessionEndContext?: ProviderSessionEndContext,
+      sessionEndContext?: {
+        readonly providerSessionId?: string;
+        readonly duringPendingStart: boolean;
+      },
     ) {
       if (!(yield* isCurrentAdapterGeneration(source.instanceId, source.adapterGeneration))) {
         yield* Effect.logWarning("provider.runtime-event.stale-adapter-generation-dropped", {
@@ -1882,63 +1594,41 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
           ),
         );
         if (!sessionStateAccepted) return;
-        const startedTurnAccepted = yield* persistStartedTurnRuntimeState(
-          source,
-          canonicalEvent,
-        ).pipe(
+        yield* persistStartedTurnRuntimeState(source, canonicalEvent).pipe(
           Effect.catchCause((cause) =>
             Effect.logWarning("provider.session.turn-start-persist-failed", {
               threadId: canonicalEvent.threadId,
               provider: canonicalEvent.provider,
               cause,
-            }).pipe(Effect.as(false)),
+            }),
           ),
         );
-        const terminalTurnOwned = yield* terminalEventOwnsPersistedActiveTurn(
-          source,
-          canonicalEvent,
-        ).pipe(
-          Effect.catchCause((cause) =>
-            Effect.logWarning("provider.session.terminal-turn-ownership-read-failed", {
-              threadId: canonicalEvent.threadId,
-              provider: canonicalEvent.provider,
-              cause,
-            }).pipe(Effect.as(false)),
-          ),
-        );
-        const acceptedEvent = guardEmptyAssistantResponse(
-          source,
-          canonicalEvent,
-          startedTurnAccepted,
-          terminalTurnOwned,
-        );
-        yield* persistTerminalTurnRuntimeState(source, acceptedEvent).pipe(
+        yield* persistTerminalTurnRuntimeState(source, canonicalEvent).pipe(
           Effect.catchCause((cause) =>
             Effect.logWarning("provider.session.terminal-turn-persist-failed", {
-              threadId: acceptedEvent.threadId,
-              provider: acceptedEvent.provider,
+              threadId: canonicalEvent.threadId,
+              provider: canonicalEvent.provider,
               cause,
             }),
           ),
         );
         yield* increment(providerRuntimeEventsTotal, {
-          provider: acceptedEvent.provider,
-          eventType: acceptedEvent.type,
+          provider: canonicalEvent.provider,
+          eventType: canonicalEvent.type,
         });
         if (sessionEndContext !== undefined) {
-          yield* clearMcpSessionAfterProviderSessionEnds(source, acceptedEvent, {
+          yield* clearMcpSessionAfterProviderSessionEnds(source, canonicalEvent, {
             ...(sessionEndContext.providerSessionId !== undefined
               ? { providerSessionId: sessionEndContext.providerSessionId }
               : {}),
             duringPendingStart: sessionEndContext.duringPendingStart,
           }).pipe(Effect.forkDetach, Effect.asVoid);
         }
-        yield* publishRuntimeEvent(acceptedEvent, binding);
+        yield* publishRuntimeEvent(canonicalEvent, binding);
       });
 
       const mustOrderAgainstSendFailure =
         canonicalEvent.type === "turn.started" ||
-        isTerminalTurnRuntimeEvent(canonicalEvent) ||
         (canonicalEvent.type === "session.state.changed" &&
           canonicalEvent.payload.state !== "error" &&
           canonicalEvent.payload.state !== "stopped");
@@ -1948,257 +1638,55 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
     },
   );
 
-  const processCorrelatedRuntimeEvent = Effect.fn("ProviderService.processCorrelatedRuntimeEvent")(
-    function* (
-      source: ProviderRuntimeEventSource,
-      correlatedEvent: ProviderRuntimeEvent,
-      capturedSessionEndContext?: ProviderSessionEndContext,
-    ) {
-      const isSessionEnd = isProviderSessionEndEvent(correlatedEvent);
-      if (isSessionEnd) {
-        let sessionEndContext = capturedSessionEndContext;
-        if (sessionEndContext === undefined) {
-          const observedMcpSession = McpProviderSession.readMcpProviderSession(
-            correlatedEvent.threadId,
-          );
-          sessionEndContext = {
-            ...(observedMcpSession !== undefined
-              ? { providerSessionId: observedMcpSession.providerSessionId }
-              : {}),
-            duringPendingStart: yield* hasPendingMcpSessionStart(correlatedEvent.threadId),
-          };
-        }
-        const correlatedSessionExit = yield* persistSessionExitRuntimeState(
-          source,
-          correlatedEvent,
-          (canonicalEvent) =>
-            handleAcceptedRuntimeEventNow(source, canonicalEvent, {
-              ...(sessionEndContext.providerSessionId !== undefined
-                ? { providerSessionId: sessionEndContext.providerSessionId }
-                : {}),
-              duringPendingStart: sessionEndContext.duringPendingStart,
-            }),
-        ).pipe(
-          Effect.catchCause((cause) =>
-            Effect.logWarning("provider.session.exit-persist-failed", {
-              threadId: correlatedEvent.threadId,
-              provider: correlatedEvent.provider,
-              cause,
-            }).pipe(Effect.as(Option.none<ProviderRuntimeEvent>())),
-          ),
-        );
-        if (Option.isNone(correlatedSessionExit)) {
-          yield* Effect.logDebug("provider.session.stale-exit-ignored", {
-            threadId: correlatedEvent.threadId,
-            provider: correlatedEvent.provider,
-            eventId: correlatedEvent.eventId,
-          });
-        }
-        return;
-      }
-      yield* handleAcceptedRuntimeEventNow(source, correlatedEvent);
-    },
-  );
-
-  const drainPendingEmptyResponseCompletion = Effect.fn(
-    "ProviderService.drainPendingEmptyResponseCompletion",
-  )(function* (pending: PendingEmptyResponseCompletion) {
-    if (pending.draining) {
-      yield* Deferred.await(pending.settled);
-      return;
-    }
-    pending.draining = true;
-    const closePending = () => {
-      if (pending.closed) return;
-      pending.closed = true;
-      clearTrackedTurnOutput(
-        pending.source.adapter,
-        pending.source.instanceId,
-        pending.threadId,
-        pending.turnId,
-      );
-      deletePendingEmptyResponseCompletion(pending);
-    };
-
-    // Freeze the empty-response decision at the grace boundary, then replay
-    // every buffered event in source order. Pre-tracking lets completion stay
-    // ahead of its late delta without misclassifying the turn as empty.
-    const outputBoundaryIndex = pending.events.findIndex(
-      ({ event }, index) =>
-        index > 0 &&
-        (isProviderSessionEndEvent(event) ||
-          ((event.type === "turn.aborted" ||
-            (event.type === "turn.completed" && event.payload.state !== "completed")) &&
-            event.turnId !== undefined &&
-            String(event.turnId) === String(pending.turnId)) ||
-          (event.type === "session.state.changed" &&
-            (event.payload.state === "error" || event.payload.state === "stopped"))),
-    );
-    const outputBoundary = outputBoundaryIndex === -1 ? pending.events.length : outputBoundaryIndex;
-    const observedLateOutput = pending.events
-      .slice(0, outputBoundary)
-      .some(
-        ({ event }) =>
-          event.turnId !== undefined &&
-          String(event.turnId) === String(pending.turnId) &&
-          isMeaningfulTurnOutputEvent(event),
-      );
-    if (observedLateOutput) {
-      trackTurnOutput(
-        pending.source.adapter,
-        pending.source.instanceId,
-        pending.threadId,
-        pending.turnId,
-      );
-    }
-
-    yield* Effect.gen(function* () {
-      let eventIndex = 0;
-      while (true) {
-        if (eventIndex >= pending.events.length) {
-          // Closing and removing the buffer is synchronous with the final
-          // length check. An ingress fiber that resumes afterward will fail
-          // its identity recheck and process the event normally.
-          closePending();
-          break;
-        }
-        const buffered = pending.events[eventIndex];
-        eventIndex += 1;
-        if (buffered !== undefined) {
-          yield* processCorrelatedRuntimeEvent(
-            pending.source,
-            buffered.event,
-            buffered.sessionEndContext,
-          );
-        }
-      }
-    }).pipe(
-      Effect.ensuring(
-        Effect.sync(() => {
-          closePending();
-        }).pipe(Effect.andThen(Deferred.succeed(pending.settled, undefined)), Effect.asVoid),
-      ),
-    );
-  });
-
-  const flushPendingEmptyResponseCompletionsForAdapter = (
-    adapter: ProviderAdapterShape<ProviderAdapterError>,
-    instanceId: ProviderInstanceId,
-  ): Effect.Effect<void> => {
-    const instances = pendingEmptyResponseCompletionsByAdapter.get(adapter);
-    const sessions = instances?.get(instanceId);
-    if (sessions === undefined) return Effect.void;
-    const pending = Array.from(sessions.values());
-    return Effect.forEach(pending, drainPendingEmptyResponseCompletion, {
-      concurrency: "unbounded",
-      discard: true,
-    });
-  };
-
-  const terminalEventOwnsPersistedActiveTurn = Effect.fn(
-    "ProviderService.terminalEventOwnsPersistedActiveTurn",
-  )(function* (source: ProviderRuntimeEventSource, event: ProviderRuntimeEvent) {
-    if (!isTerminalTurnRuntimeEvent(event) || event.turnId === undefined) return false;
-    const binding = Option.getOrUndefined(
-      yield* directory
-        .getBinding(event.threadId)
-        .pipe(
-          Effect.orElseSucceed(() =>
-            Option.none<ProviderSessionDirectory.ProviderRuntimeBinding>(),
-          ),
-        ),
-    );
-    if (
-      binding === undefined ||
-      binding.provider !== source.provider ||
-      binding.providerInstanceId !== source.instanceId
-    ) {
-      return false;
-    }
-    const activeTurnId = (readRecord(binding.runtimePayload) ?? {}).activeTurnId;
-    return (
-      activeTurnId !== null &&
-      activeTurnId !== undefined &&
-      String(activeTurnId) === String(event.turnId)
-    );
-  });
-
-  const captureBufferedRuntimeEvent = Effect.fn("ProviderService.captureBufferedRuntimeEvent")(
-    function* (event: ProviderRuntimeEvent): Effect.fn.Return<BufferedProviderRuntimeEvent> {
-      if (!isProviderSessionEndEvent(event)) return { event };
-      const observedMcpSession = McpProviderSession.readMcpProviderSession(event.threadId);
-      const duringPendingStart = yield* hasPendingMcpSessionStart(event.threadId);
-      return {
-        event,
-        sessionEndContext: {
-          ...(observedMcpSession !== undefined
-            ? { providerSessionId: observedMcpSession.providerSessionId }
-            : {}),
-          duringPendingStart,
-        },
-      };
-    },
-  );
-
   const processRuntimeEvent = (
-    source: ProviderRuntimeEventSource,
+    source: {
+      readonly instanceId: ProviderInstanceId;
+      readonly provider: ProviderDriverKind;
+      readonly adapterGeneration: number;
+      readonly adapter: ProviderAdapterShape<ProviderAdapterError>;
+    },
     event: ProviderRuntimeEvent,
   ): Effect.Effect<void> =>
     Effect.sync(() => correlateRuntimeEventWithInstance(source, event)).pipe(
-      Effect.flatMap((correlatedEvent) =>
+      Effect.flatMap((uncorrelatedEvent) =>
         Effect.gen(function* () {
-          const pending = getPendingEmptyResponseCompletion(source, correlatedEvent.threadId);
-          if (pending !== undefined) {
-            const bufferedEvent = yield* captureBufferedRuntimeEvent(correlatedEvent);
-            // Capturing session-end context can yield. If the grace drain
-            // settled in the meantime, process this event normally instead
-            // of appending it to a buffer that is no longer reachable.
-            if (getPendingEmptyResponseCompletion(source, correlatedEvent.threadId) !== pending) {
-              yield* processCorrelatedRuntimeEvent(
-                source,
-                bufferedEvent.event,
-                bufferedEvent.sessionEndContext,
-              );
-              return;
-            }
-            pending.events.push(bufferedEvent);
-            return;
-          }
-
-          const completionGraceMs = emptyResponseCompletionGraceMs(source.provider);
-          if (
-            completionGraceMs !== undefined &&
-            correlatedEvent.type === "turn.completed" &&
-            correlatedEvent.payload.state === "completed" &&
-            correlatedEvent.turnId !== undefined &&
-            !hasTrackedTurnOutput(
-              source.adapter,
-              source.instanceId,
-              correlatedEvent.threadId,
-              correlatedEvent.turnId,
-            ) &&
-            (yield* isCurrentAdapterGeneration(source.instanceId, source.adapterGeneration)) &&
-            (yield* terminalEventOwnsPersistedActiveTurn(source, correlatedEvent))
-          ) {
-            const settlement = yield* Deferred.make<void>();
-            const pendingCompletion: PendingEmptyResponseCompletion = {
+          const isSessionEnd = isProviderSessionEndEvent(uncorrelatedEvent);
+          const observedMcpSession = isSessionEnd
+            ? McpProviderSession.readMcpProviderSession(uncorrelatedEvent.threadId)
+            : undefined;
+          const observedDuringPendingStart = isSessionEnd
+            ? yield* hasPendingMcpSessionStart(uncorrelatedEvent.threadId)
+            : false;
+          if (isSessionEnd) {
+            const correlatedSessionExit = yield* persistSessionExitRuntimeState(
               source,
-              threadId: correlatedEvent.threadId,
-              turnId: correlatedEvent.turnId,
-              events: [{ event: correlatedEvent }],
-              settled: settlement,
-              draining: false,
-              closed: false,
-            };
-            setPendingEmptyResponseCompletion(pendingCompletion);
-            yield* Effect.sleep(`${completionGraceMs} millis`).pipe(
-              Effect.andThen(drainPendingEmptyResponseCompletion(pendingCompletion)),
-              Effect.forkDetach,
+              uncorrelatedEvent,
+              (canonicalEvent) =>
+                handleAcceptedRuntimeEvent(source, canonicalEvent, {
+                  ...(observedMcpSession !== undefined
+                    ? { providerSessionId: observedMcpSession.providerSessionId }
+                    : {}),
+                  duringPendingStart: observedDuringPendingStart,
+                }),
+            ).pipe(
+              Effect.catchCause((cause) =>
+                Effect.logWarning("provider.session.exit-persist-failed", {
+                  threadId: uncorrelatedEvent.threadId,
+                  provider: uncorrelatedEvent.provider,
+                  cause,
+                }).pipe(Effect.as(Option.none<ProviderRuntimeEvent>())),
+              ),
             );
+            if (Option.isNone(correlatedSessionExit)) {
+              yield* Effect.logDebug("provider.session.stale-exit-ignored", {
+                threadId: uncorrelatedEvent.threadId,
+                provider: uncorrelatedEvent.provider,
+                eventId: uncorrelatedEvent.eventId,
+              });
+            }
             return;
           }
-
-          yield* processCorrelatedRuntimeEvent(source, correlatedEvent);
+          yield* handleAcceptedRuntimeEvent(source, uncorrelatedEvent);
         }),
       ),
     );
@@ -2235,13 +1723,9 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
         .pipe(Effect.tapError(Effect.logWarning), Effect.option);
       if (Option.isNone(adapterOption)) continue;
       const adapter = adapterOption.value;
-      const previousAdapter = previous.get(id);
-      if (previousAdapter !== undefined && previousAdapter !== adapter) {
-        yield* flushPendingEmptyResponseCompletionsForAdapter(previousAdapter, id);
-      }
       const adapterGeneration = yield* observeAdapterGeneration(id, adapter);
       next.set(id, adapter);
-      if (previousAdapter !== adapter) {
+      if (previous.get(id) !== adapter) {
         yield* Stream.runForEach(adapter.streamEvents, (event) =>
           processRuntimeEvent(
             {
@@ -2259,8 +1743,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
       previous,
       ([instanceId, adapter]) => {
         if (next.get(instanceId) === adapter) return Effect.void;
-        return flushPendingEmptyResponseCompletionsForAdapter(adapter, instanceId).pipe(
-          Effect.andThen(getCurrentAdapterGeneration(instanceId)),
+        return getCurrentAdapterGeneration(instanceId).pipe(
           Effect.flatMap((retainAdapterGeneration) =>
             clearMcpSessionsForProviderInstance(
               instanceId,
@@ -2326,14 +1809,6 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
             readResumableActiveTurnId(input.binding.provider, input.binding.runtimePayload),
           );
           yield* upsertSessionBinding(existingWithInstance, input.binding.threadId);
-          if (existingWithInstance.activeTurnId !== undefined) {
-            preserveRecoveredActiveTurnOutput(
-              adapter,
-              bindingInstanceId,
-              input.binding.threadId,
-              existingWithInstance.activeTurnId,
-            );
-          }
           yield* analytics.record("provider.session.recovered", {
             provider: existingWithInstance.provider,
             strategy: "adopt-existing",
@@ -2420,14 +1895,6 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
         persistedActiveTurnId,
       );
       yield* upsertSessionBinding(resumedWithInstance, input.binding.threadId);
-      if (resumedWithInstance.activeTurnId !== undefined) {
-        preserveRecoveredActiveTurnOutput(
-          adapter,
-          bindingInstanceId,
-          input.binding.threadId,
-          resumedWithInstance.activeTurnId,
-        );
-      }
       yield* analytics.record("provider.session.recovered", {
         provider: resumedWithInstance.provider,
         strategy: "resume-thread",
@@ -2748,14 +2215,6 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
               ? { mcpProviderSessionId: preparedMcpSession.providerSessionId }
               : {}),
           });
-          if (effectiveActiveTurnId !== undefined) {
-            preserveRecoveredActiveTurnOutput(
-              adapter,
-              resolvedInstanceId,
-              threadId,
-              effectiveActiveTurnId,
-            );
-          }
           yield* analytics.record("provider.session.started", {
             provider: sessionWithInstance.provider,
             runtimeMode: input.runtimeMode,
