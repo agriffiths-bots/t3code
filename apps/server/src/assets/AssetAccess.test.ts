@@ -80,11 +80,14 @@ describe("AssetAccess", () => {
       });
       const htmlPath = path.join(root, "report.html");
       const cssPath = path.join(root, "report.css");
+      const percentCssPath = path.join(root, "theme%20.css");
       yield* fileSystem.writeFileString(htmlPath, '<link rel="stylesheet" href="report.css">');
       yield* fileSystem.writeFileString(cssPath, "body { color: red; }");
+      yield* fileSystem.writeFileString(percentCssPath, "body { color: blue; }");
       yield* fileSystem.writeFileString(path.join(root, ".env"), "SECRET=value");
       const canonicalHtmlPath = yield* fileSystem.realPath(htmlPath);
       const canonicalCssPath = yield* fileSystem.realPath(cssPath);
+      const canonicalPercentCssPath = yield* fileSystem.realPath(percentCssPath);
 
       const result = yield* issueAssetUrl({
         resource: {
@@ -114,13 +117,18 @@ describe("AssetAccess", () => {
         kind: "file",
         path: canonicalCssPath,
       });
+      expect(yield* resolveAsset(token, "theme%2520.css")).toEqual({
+        kind: "file",
+        path: canonicalPercentCssPath,
+      });
+      expect(yield* resolveAsset(token, "broken%ZZ.css")).toBeNull();
       expect(yield* resolveAsset(token, "../secret.txt")).toBeNull();
       expect(yield* resolveAsset(token, ".env")).toBeNull();
       expect(yield* resolveAsset(`${token}tampered`, "report.html")).toBeNull();
       expect(
         yield* resolveLocalAssetRelay({
           token,
-          relativePath: "report.html",
+          encodedRelativePath: "report.html",
           viewerSessionId: OTHER_SURFACE_SESSION_ID,
           viewerAudienceCeiling: "factory",
         }),
@@ -281,7 +289,7 @@ describe("AssetAccess", () => {
       expect(
         yield* resolveLocalAssetRelay({
           token,
-          relativePath: "ignored.png",
+          encodedRelativePath: "ignored.png",
           viewerSessionId: OTHER_SURFACE_SESSION_ID,
           viewerAudienceCeiling: "factory",
         }),

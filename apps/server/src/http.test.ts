@@ -39,6 +39,17 @@ describe("http dev routing", () => {
 });
 
 describe("asset app relay routing", () => {
+  it("preserves the encoded asset path for the single downstream decode boundary", () => {
+    expect(
+      __assetRelayTesting.parseAssetRelayPath(
+        "/_asset-relay/signed-token/styles/my%20theme%23snowman-%E2%98%83.css",
+      ),
+    ).toEqual({
+      token: "signed-token",
+      encodedRelativePath: "styles/my%20theme%23snowman-%E2%98%83.css",
+    });
+  });
+
   it("selects only the peer whose environment id issued the claim", () => {
     const peers = [peer("backend-a"), peer("backend-b")];
 

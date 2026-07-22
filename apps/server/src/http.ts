@@ -626,7 +626,7 @@ const maskedAssetRelayResponse = () =>
 
 function parseAssetRelayPath(pathname: string): {
   readonly token: string;
-  readonly relativePath: string;
+  readonly encodedRelativePath: string;
 } | null {
   const prefix = `${ASSET_APP_RELAY_PREFIX}/`;
   if (!pathname.startsWith(prefix)) return null;
@@ -636,7 +636,7 @@ function parseAssetRelayPath(pathname: string): {
   if (token.length === 0 || token.length > ASSET_RELAY_CLAIM_MAX_LENGTH) return null;
   return {
     token,
-    relativePath: separatorIndex === -1 ? "" : suffix.slice(separatorIndex + 1),
+    encodedRelativePath: separatorIndex === -1 ? "" : suffix.slice(separatorIndex + 1),
   };
 }
 
@@ -761,7 +761,7 @@ const makeAssetAppRelayRouteLayer = (
       ) {
         const asset = yield* resolveLocalAssetRelay({
           token: parsed.token,
-          relativePath: parsed.relativePath,
+          encodedRelativePath: parsed.encodedRelativePath,
           viewerSessionId: viewer.sessionId,
           viewerAudienceCeiling: viewer.audienceCeiling,
           ...(viewer.expiresAt ? { viewerSessionExpiresAt: viewer.expiresAt } : {}),
@@ -816,6 +816,7 @@ export const assetAppRelayRouteLayer = Layer.unwrap(
 ).pipe(Layer.provide(SubagentPeerRegistry.layer));
 
 export const __assetRelayTesting = {
+  parseAssetRelayPath,
   relayContentLength,
   selectAssetRelayPeer,
   trustedAssetRelayHeaders,

@@ -586,7 +586,7 @@ export const resolveAsset = Effect.fn("AssetAccess.resolveAsset")(function* (
 export const resolveLocalAssetRelay = Effect.fn("AssetAccess.resolveLocalAssetRelay")(
   function* (input: {
     readonly token: string;
-    readonly relativePath: string;
+    readonly encodedRelativePath: string;
     readonly viewerSessionId: AuthSessionId;
     readonly viewerAudienceCeiling: AuthAudienceCeiling;
     readonly viewerSessionExpiresAt?: DateTime.DateTime;
@@ -603,7 +603,7 @@ export const resolveLocalAssetRelay = Effect.fn("AssetAccess.resolveLocalAssetRe
     if (claim.surfaceBindingId === null) {
       return audience === "private"
         ? null
-        : yield* resolveAsset(input.token, input.relativePath, { allowUnbound: true });
+        : yield* resolveAsset(input.token, input.encodedRelativePath, { allowUnbound: true });
     }
 
     const now = yield* Clock.currentTimeMillis;
@@ -624,7 +624,7 @@ export const resolveLocalAssetRelay = Effect.fn("AssetAccess.resolveLocalAssetRe
       ),
       signingSecret,
     );
-    return yield* resolveAsset(input.token, input.relativePath, {
+    return yield* resolveAsset(input.token, input.encodedRelativePath, {
       surfaceCredentials: [relayProof],
     });
   },
