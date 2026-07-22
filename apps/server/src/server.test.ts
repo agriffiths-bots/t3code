@@ -2443,7 +2443,7 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
       assert.equal(yield* nativeResponse.text, "same-surface-private-asset");
 
       for (const origin of ["null", "not an origin"]) {
-        const rejectedBindingResponse = yield* fetchEffect(
+        const nonHttpsBindingResponse = yield* fetchEffect(
           yield* getHttpServerUrl("/api/assets/relay/surface"),
           {
             method: "POST",
@@ -2455,8 +2455,11 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
             }),
           },
         );
-        assert.equal(rejectedBindingResponse.status, 404);
-        assert.isUndefined(rejectedBindingResponse.headers["set-cookie"]);
+        assert.equal(nonHttpsBindingResponse.status, 303);
+        assert.equal(nonHttpsBindingResponse.headers.location, issued.relativeUrl);
+        const nonHttpsSurfaceCookie = nonHttpsBindingResponse.headers["set-cookie"];
+        assert.isString(nonHttpsSurfaceCookie);
+        assert.notInclude(nonHttpsSurfaceCookie ?? "", "Secure");
       }
 
       const bindingResponse = yield* fetchEffect(

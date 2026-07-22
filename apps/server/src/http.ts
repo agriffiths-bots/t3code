@@ -664,9 +664,6 @@ export const assetSurfaceBindingRouteLayer = HttpRouter.add(
     const sessions = yield* SessionStore.SessionStore;
     const requestOrigin = normalizeCorsOrigin(request.headers.origin);
     const requestOriginUrl = requestOrigin === null ? null : parseAbsoluteUrl(requestOrigin);
-    if (requestOrigin !== null && requestOriginUrl === null) {
-      return HttpServerResponse.text("Not Found", { status: 404 });
-    }
     const forwardedProtocol = request.headers["x-forwarded-proto"]
       ?.split(",", 1)[0]
       ?.trim()

@@ -12,18 +12,23 @@ import {
 } from "./assets.ts";
 
 describe("asset client capabilities", () => {
-  it("does not advertise same-origin relay support for bearer/DPoP web clients", () => {
+  it("keeps plain-URL web image consumers on legacy asset URLs", () => {
     const resource = { _tag: "attachment" as const, attachmentId: "attachment-1" };
 
-    expect(withAssetClientCapabilities({ resource, supportsSurfaceCredentials: false })).toEqual({
+    expect(withAssetClientCapabilities({ resource, surfaceCredentialBinding: "none" })).toEqual({
       resource,
     });
   });
 
-  it("advertises same-origin relay support for clients that present surface credentials", () => {
+  it("advertises same-origin relay support for native header/cookie binding", () => {
     const resource = { _tag: "attachment" as const, attachmentId: "attachment-1" };
 
-    expect(withAssetClientCapabilities({ resource, supportsSurfaceCredentials: true })).toEqual({
+    expect(
+      withAssetClientCapabilities({
+        resource,
+        surfaceCredentialBinding: "native-header-or-cookie",
+      }),
+    ).toEqual({
       resource,
       capabilities: [ASSET_SAME_ORIGIN_RELAY_V1_CAPABILITY],
     });
@@ -58,7 +63,7 @@ describe("createAssetEnvironmentAtoms", () => {
       EnvironmentRegistry,
       never
     >;
-    const assets = createAssetEnvironmentAtoms(runtime);
+    const assets = createAssetEnvironmentAtoms(runtime, { surfaceCredentialBinding: "none" });
     const environmentId = EnvironmentId.make("environment-1");
     const originalTarget = {
       environmentId,
@@ -105,7 +110,7 @@ describe("createAssetEnvironmentAtoms", () => {
       EnvironmentRegistry,
       never
     >;
-    const assets = createAssetEnvironmentAtoms(runtime);
+    const assets = createAssetEnvironmentAtoms(runtime, { surfaceCredentialBinding: "none" });
     const environmentId = EnvironmentId.make("environment-1");
     const resources = [
       { _tag: "attachment" as const, attachmentId: "attachment-1" },

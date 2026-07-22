@@ -8,6 +8,7 @@ import { AppText as Text } from "../../components/AppText";
 import { EmptyState } from "../../components/EmptyState";
 import { workspaceFileImageAtom } from "./workspace-file-image-cache";
 import type { AssetRequestSource } from "../../state/assets";
+import { workspaceFileImageSource } from "./workspaceFileImageSource";
 
 function ResolvedWorkspaceFileImagePreview(props: {
   readonly accessibilityLabel: string;
@@ -15,14 +16,7 @@ function ResolvedWorkspaceFileImagePreview(props: {
 }) {
   const [loadError, setLoadError] = useState<string | null>(null);
   const [fullScreenVisible, setFullScreenVisible] = useState(false);
-  const imageSource = useMemo(
-    () => ({
-      uri: props.source.uri,
-      headers: props.source.headers,
-      ...(props.source.headers === undefined ? { cache: "force-cache" as const } : {}),
-    }),
-    [props.source],
-  );
+  const imageSource = useMemo(() => workspaceFileImageSource(props.source), [props.source]);
   const fullScreenImages = useMemo(() => [imageSource], [imageSource]);
 
   return (

@@ -7,7 +7,8 @@ import { connectionAtomRuntime } from "../connection/runtime";
 import { usePreparedConnection } from "./session";
 
 export const assetEnvironment = createAssetEnvironmentAtoms(connectionAtomRuntime, {
-  supportsSurfaceCredentials: true,
+  // Native images attach the credential header and native WebViews bind the relay cookie.
+  surfaceCredentialBinding: "native-header-or-cookie",
 });
 const ASSET_SURFACE_CREDENTIAL_HEADER = "x-t3-asset-surface";
 
