@@ -1,5 +1,6 @@
 import Mime from "@effect/platform-node/Mime";
 import {
+  type AuthAudienceCeiling,
   type AuthSessionId,
   AuthOrchestrationOperateScope,
   AuthOrchestrationReadScope,
@@ -669,6 +670,64 @@ function safeContentLength(value: string | undefined): number | undefined {
   return Number.isSafeInteger(parsed) ? parsed : undefined;
 }
 
+function relayContentLength(headers: Readonly<Record<string, string | undefined>>) {
+  return headers["content-encoding"] === undefined
+    ? safeContentLength(headers["content-length"])
+    : undefined;
+}
+
+type AssetRelayViewer = {
+  readonly sessionId: AuthSessionId;
+  readonly audienceCeiling: AuthAudienceCeiling;
+  readonly expiresAt?: DateTime.DateTime;
+};
+
+const authenticateAssetRelayViewer = Effect.fn("http.authenticateAssetRelayViewer")(function* (
+  request: HttpServerRequest.HttpServerRequest,
+): Effect.fn.Return<
+  AssetRelayViewer | null,
+  never,
+  EnvironmentAuth.EnvironmentAuth | SessionStore.SessionStore
+> {
+  const serverAuth = yield* EnvironmentAuth.EnvironmentAuth;
+  const environmentSession = yield* serverAuth.authenticateHttpRequest(request).pipe(Effect.option);
+  if (
+    Option.isSome(environmentSession) &&
+    environmentSession.value.scopes.includes(AuthOrchestrationReadScope)
+  ) {
+    return {
+      sessionId: environmentSession.value.sessionId,
+      audienceCeiling: environmentSession.value.audienceCeiling,
+      ...(environmentSession.value.expiresAt
+        ? { expiresAt: environmentSession.value.expiresAt }
+        : {}),
+    };
+  }
+
+  const authorization = request.headers.authorization;
+  const rawToken =
+    authorization?.startsWith("Bearer ") === true
+      ? authorization.slice("Bearer ".length).trim()
+      : "";
+  const invocation = yield* McpSessionRegistry.resolveActiveMcpInvocation(rawToken);
+  if (invocation?.credentialKind !== "peer" || invocation.sourceSessionId === undefined) {
+    return null;
+  }
+
+  const sessions = yield* SessionStore.SessionStore;
+  const sourceSession = (yield* sessions.listActive().pipe(Effect.orElseSucceed(() => []))).find(
+    (session) => session.sessionId === invocation.sourceSessionId,
+  );
+  if (sourceSession === undefined || !sourceSession.scopes.includes(AuthOrchestrationReadScope)) {
+    return null;
+  }
+  return {
+    sessionId: sourceSession.sessionId,
+    audienceCeiling: sourceSession.audienceCeiling,
+    expiresAt: sourceSession.expiresAt,
+  };
+});
+
 const makeAssetAppRelayRouteLayer = (
   peerRegistry: SubagentPeerRegistry.SubagentPeerRegistryShape,
 ) =>
@@ -682,20 +741,14 @@ const makeAssetAppRelayRouteLayer = (
       const parsed = parseAssetRelayPath(url.value.pathname);
       if (parsed === null) return maskedAssetRelayResponse();
 
-      const serverAuth = yield* EnvironmentAuth.EnvironmentAuth;
-      const viewer = yield* serverAuth.authenticateHttpRequest(request).pipe(Effect.option);
-      if (Option.isNone(viewer) || !viewer.value.scopes.includes(AuthOrchestrationReadScope)) {
-        return maskedAssetRelayResponse();
-      }
+      const viewer = yield* authenticateAssetRelayViewer(request);
+      if (viewer === null) return maskedAssetRelayResponse();
 
       const routingClaim = decodeAssetRelayRoutingClaim(parsed.token);
       if (
         routingClaim === null ||
         routingClaim.expiresAt <= (yield* Clock.currentTimeMillis) ||
-        !canReadDataAudience(
-          viewer.value.audienceCeiling,
-          effectiveAssetClaimAudience(routingClaim),
-        )
+        !canReadDataAudience(viewer.audienceCeiling, effectiveAssetClaimAudience(routingClaim))
       ) {
         return maskedAssetRelayResponse();
       }
@@ -709,9 +762,9 @@ const makeAssetAppRelayRouteLayer = (
         const asset = yield* resolveLocalAssetRelay({
           token: parsed.token,
           relativePath: parsed.relativePath,
-          viewerSessionId: viewer.value.sessionId,
-          viewerAudienceCeiling: viewer.value.audienceCeiling,
-          ...(viewer.value.expiresAt ? { viewerSessionExpiresAt: viewer.value.expiresAt } : {}),
+          viewerSessionId: viewer.sessionId,
+          viewerAudienceCeiling: viewer.audienceCeiling,
+          ...(viewer.expiresAt ? { viewerSessionExpiresAt: viewer.expiresAt } : {}),
         });
         if (asset === null) return maskedAssetRelayResponse();
         return yield* HttpServerResponse.file(asset.path, {
@@ -739,7 +792,7 @@ const makeAssetAppRelayRouteLayer = (
       if (upstream === null || upstream.status !== 200) return maskedAssetRelayResponse();
 
       const contentType = upstream.headers["content-type"];
-      const contentLength = safeContentLength(upstream.headers["content-length"]);
+      const contentLength = relayContentLength(upstream.headers);
       return HttpServerResponse.stream(upstream.stream, {
         status: 200,
         headers: {
@@ -763,6 +816,7 @@ export const assetAppRelayRouteLayer = Layer.unwrap(
 ).pipe(Layer.provide(SubagentPeerRegistry.layer));
 
 export const __assetRelayTesting = {
+  relayContentLength,
   selectAssetRelayPeer,
   trustedAssetRelayHeaders,
 };

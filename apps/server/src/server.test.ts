@@ -138,6 +138,7 @@ import * as TraceDiagnostics from "./diagnostics/TraceDiagnostics.ts";
 import * as DeviceNotifications from "./notifications/DeviceNotifications.ts";
 import * as WorkerProcessIsolation from "./process/WorkerProcessIsolation.ts";
 import * as McpSessionRegistry from "./mcp/McpSessionRegistry.ts";
+import { decodeAssetRelayRoutingClaim } from "./assets/AssetAccess.ts";
 import { collectUint8StreamText } from "./stream/collectUint8StreamText.ts";
 import * as Data from "effect/Data";
 
@@ -2382,12 +2383,37 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
     Effect.gen(function* () {
       const fileSystem = yield* FileSystem.FileSystem;
       const path = yield* Path.Path;
-      const config = yield* buildAppUnderTest();
+      const orphanedThreadId = ThreadId.make("thread-asset-orphaned-project");
+      const orphanedProjectId = ProjectId.make("project-asset-orphaned");
+      const orphanedAttachmentId =
+        "thread-asset-orphaned-project-00000000-0000-4000-8000-000000000001";
+      const orphanedReadModel = makeDefaultOrchestrationReadModel();
+      const config = yield* buildAppUnderTest({
+        layers: {
+          projectionSnapshotQuery: {
+            getCommandReadModel: () =>
+              Effect.succeed({
+                ...orphanedReadModel,
+                projects: [],
+                threads: orphanedReadModel.threads.map((thread) => ({
+                  ...thread,
+                  id: orphanedThreadId,
+                  projectId: orphanedProjectId,
+                  dataAudience: "factory" as const,
+                })),
+              }),
+          },
+        },
+      });
       const attachmentId = "asset-session-binding-integration";
       yield* fileSystem.makeDirectory(config.attachmentsDir, { recursive: true });
       yield* fileSystem.writeFileString(
         path.join(config.attachmentsDir, `${attachmentId}.bin`),
         "same-surface-private-asset",
+      );
+      yield* fileSystem.writeFileString(
+        path.join(config.attachmentsDir, `${orphanedAttachmentId}.bin`),
+        "orphaned-project-private-asset",
       );
 
       const issuerCookie = yield* getAuthenticatedSessionCookieHeader();
@@ -2413,12 +2439,30 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
       const rpc = <A, E, R>(f: (client: WsRpcClient) => Effect.Effect<A, E, R>) =>
         Effect.scoped(withWsRpcClient(wsUrl, f));
 
-      const legacyError = yield* rpc((client) =>
+      const orphanedIssued = yield* rpc((client) =>
+        client[WS_METHODS.assetsCreateUrl]({
+          resource: { _tag: "attachment", attachmentId: orphanedAttachmentId },
+          capabilities: [ASSET_SAME_ORIGIN_RELAY_V1_CAPABILITY],
+        }),
+      );
+      const orphanedToken = orphanedIssued.relativeUrl.split("/").at(-2);
+      assert.isDefined(orphanedToken);
+      assert.deepInclude(decodeAssetRelayRoutingClaim(orphanedToken ?? ""), {
+        dataAudience: "private",
+        issuingAudience: "private",
+      });
+
+      const legacyIssued = yield* rpc((client) =>
         client[WS_METHODS.assetsCreateUrl]({
           resource: { _tag: "attachment", attachmentId },
-        }).pipe(Effect.flip),
+        }),
       );
-      assert.equal(legacyError._tag, "AssetClientUpgradeRequiredError");
+      assert.include(legacyIssued.relativeUrl, "/api/assets/");
+      assert.notInclude(legacyIssued.relativeUrl, "/api/assets/relay/");
+      assert.notProperty(legacyIssued, "surfaceCredential");
+      const legacyResponse = yield* fetchEffect(yield* getHttpServerUrl(legacyIssued.relativeUrl));
+      assert.equal(legacyResponse.status, 200);
+      assert.equal(yield* legacyResponse.text, "same-surface-private-asset");
 
       const issued = yield* rpc((client) =>
         client[WS_METHODS.assetsCreateUrl]({
@@ -2464,6 +2508,24 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
       assert.isUndefined(sameSurfaceRelay.headers.location);
       assert.isUndefined(sameSurfaceRelay.headers["set-cookie"]);
       assert.equal(sameSurfaceRelayBody, "same-surface-private-asset");
+
+      const relaySourceToken = yield* getAuthenticatedBearerSessionToken();
+      const peerTokenResponse = yield* fetchEffect(yield* getHttpServerUrl("/api/mcp/peer-token"), {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${relaySourceToken}`,
+          "content-type": "application/json",
+        },
+        body: jsonRequestBody({ sourceEnvironmentId: "asset-relay-source" }),
+      });
+      assert.equal(peerTokenResponse.status, 200);
+      const peerToken = yield* responseJsonEffect<{ readonly token: string }>(peerTokenResponse);
+      const peerRelayResponse = yield* fetchEffect(yield* getHttpServerUrl(appRelayPath), {
+        headers: { authorization: `Bearer ${peerToken.token}` },
+      });
+      assert.equal(peerRelayResponse.status, 200);
+      assert.equal(yield* peerRelayResponse.text, "same-surface-private-asset");
+
       const otherPrivateSurfaceRelay = yield* fetchEffect(yield* getHttpServerUrl(appRelayPath), {
         headers: { cookie: otherCookie },
       });

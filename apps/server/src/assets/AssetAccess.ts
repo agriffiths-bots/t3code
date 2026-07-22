@@ -2,7 +2,6 @@ import {
   ASSET_SAME_ORIGIN_RELAY_V1_CAPABILITY,
   AssetClaimJson,
   AssetAttachmentNotFoundError,
-  AssetClientUpgradeRequiredError,
   AssetPreviewTypeValidationError,
   AssetProjectFaviconInspectionError,
   AssetProjectFaviconNotFoundError,
@@ -219,6 +218,8 @@ const resolveCanonicalWorkspaceFileForRequest = (input: {
 export const issueAssetUrl = Effect.fn("AssetAccess.issueAssetUrl")(function* (input: {
   readonly resource: AssetResource;
   readonly workspaceRoot?: string;
+  readonly dataAudience?: DataAudience;
+  readonly issuingAudience?: DataAudience;
   readonly clientCapabilities?: ReadonlyArray<AssetClientCapability>;
   readonly surfaceSessionId?: AuthSessionId;
   readonly surfaceSessionExpiresAt?: DateTime.DateTime;
@@ -230,6 +231,12 @@ export const issueAssetUrl = Effect.fn("AssetAccess.issueAssetUrl")(function* (i
   let expiresAt = now + ASSET_TOKEN_TTL_MS;
   const serverEnvironment = yield* ServerEnvironment.ServerEnvironment;
   const issuingBackendId = yield* serverEnvironment.getEnvironmentId;
+  const dataAudience = input.dataAudience ?? "private";
+  const issuingAudience = input.issuingAudience ?? "private";
+  if (!canReadDataAudience(issuingAudience, dataAudience)) {
+    return yield* new AssetWorkspaceContextNotFoundError({ resource: input.resource });
+  }
+  const audienceClaims = { dataAudience, issuingAudience, issuingBackendId };
   let claims: AssetClaim;
   let fileName: string;
 
@@ -301,9 +308,7 @@ export const issueAssetUrl = Effect.fn("AssetAccess.issueAssetUrl")(function* (i
             workspaceRoot: canonicalWorkspaceRoot,
             relativePath: resolved.relativePath,
             expiresAt,
-            dataAudience: "private",
-            issuingAudience: "private",
-            issuingBackendId,
+            ...audienceClaims,
             surfaceBindingId: null,
           }
         : {
@@ -312,9 +317,7 @@ export const issueAssetUrl = Effect.fn("AssetAccess.issueAssetUrl")(function* (i
             workspaceRoot: canonicalWorkspaceRoot,
             baseRelativePath: path.dirname(resolved.relativePath),
             expiresAt,
-            dataAudience: "private",
-            issuingAudience: "private",
-            issuingBackendId,
+            ...audienceClaims,
             surfaceBindingId: null,
           };
       fileName = path.basename(resolved.relativePath);
@@ -336,9 +339,7 @@ export const issueAssetUrl = Effect.fn("AssetAccess.issueAssetUrl")(function* (i
         kind: "attachment",
         attachmentId: input.resource.attachmentId,
         expiresAt,
-        dataAudience: "private",
-        issuingAudience: "private",
-        issuingBackendId,
+        ...audienceClaims,
         surfaceBindingId: null,
       };
       fileName = path.basename(attachmentPath);
@@ -395,21 +396,12 @@ export const issueAssetUrl = Effect.fn("AssetAccess.issueAssetUrl")(function* (i
         ),
         relativePath,
         expiresAt,
-        dataAudience: "private",
-        issuingAudience: "private",
-        issuingBackendId,
+        ...audienceClaims,
         surfaceBindingId: null,
       };
       fileName = relativePath ? path.basename(relativePath) : PROJECT_FAVICON_FALLBACK_MARKER;
       break;
     }
-  }
-
-  if (!input.clientCapabilities?.includes(ASSET_SAME_ORIGIN_RELAY_V1_CAPABILITY)) {
-    return yield* new AssetClientUpgradeRequiredError({
-      resource: input.resource,
-      requiredCapability: ASSET_SAME_ORIGIN_RELAY_V1_CAPABILITY,
-    });
   }
 
   const secretStore = yield* ServerSecretStore.ServerSecretStore;
@@ -422,6 +414,13 @@ export const issueAssetUrl = Effect.fn("AssetAccess.issueAssetUrl")(function* (i
         }),
     ),
   );
+  if (!input.clientCapabilities?.includes(ASSET_SAME_ORIGIN_RELAY_V1_CAPABILITY)) {
+    const encodedPayload = base64UrlEncode(encodeAssetClaims(claims));
+    return {
+      relativeUrl: `${ASSET_ROUTE_PREFIX}/${signToken(encodedPayload, signingSecret)}/${encodeURIComponent(fileName)}`,
+      expiresAt,
+    };
+  }
   if (input.surfaceSessionId === undefined) {
     return yield* new AssetWorkspaceContextNotFoundError({ resource: input.resource });
   }

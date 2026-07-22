@@ -93,10 +93,18 @@ describe("AssetAccess", () => {
           path: htmlPath,
         },
         workspaceRoot: root,
+        dataAudience: "factory",
+        issuingAudience: "factory",
       });
       const suffix = assetRouteSuffix(result.relativeUrl);
       const separatorIndex = suffix.indexOf("/");
       const token = suffix.slice(0, separatorIndex);
+
+      expect(decodeAssetRelayRoutingClaim(token)).toMatchObject({
+        kind: "workspace-file",
+        dataAudience: "factory",
+        issuingAudience: "factory",
+      });
 
       expect(yield* resolveAsset(token, "report.html")).toEqual({
         kind: "file",
@@ -109,6 +117,14 @@ describe("AssetAccess", () => {
       expect(yield* resolveAsset(token, "../secret.txt")).toBeNull();
       expect(yield* resolveAsset(token, ".env")).toBeNull();
       expect(yield* resolveAsset(`${token}tampered`, "report.html")).toBeNull();
+      expect(
+        yield* resolveLocalAssetRelay({
+          token,
+          relativePath: "report.html",
+          viewerSessionId: OTHER_SURFACE_SESSION_ID,
+          viewerAudienceCeiling: "factory",
+        }),
+      ).toEqual({ kind: "file", path: canonicalHtmlPath });
     }).pipe(Effect.provide(testLayer)),
   );
 
@@ -210,10 +226,18 @@ describe("AssetAccess", () => {
           path: imagePath,
         },
         workspaceRoot: root,
+        dataAudience: "factory",
+        issuingAudience: "factory",
       });
       const suffix = assetRouteSuffix(result.relativeUrl);
       const separatorIndex = suffix.indexOf("/");
       const token = suffix.slice(0, separatorIndex);
+
+      expect(decodeAssetRelayRoutingClaim(token)).toMatchObject({
+        kind: "workspace-file-exact",
+        dataAudience: "factory",
+        issuingAudience: "factory",
+      });
 
       expect(yield* resolveAsset(token, "icon.png")).toEqual({
         kind: "file",
@@ -236,13 +260,16 @@ describe("AssetAccess", () => {
 
       const result = yield* issueAssetUrl({
         resource: { _tag: "attachment", attachmentId },
+        dataAudience: "factory",
+        issuingAudience: "factory",
       });
       const suffix = assetRouteSuffix(result.relativeUrl);
       const separatorIndex = suffix.indexOf("/");
       const token = suffix.slice(0, separatorIndex);
 
       expect(decodeAssetRelayRoutingClaim(token)).toMatchObject({
-        issuingAudience: "private",
+        dataAudience: "factory",
+        issuingAudience: "factory",
         issuingBackendId: TEST_ENVIRONMENT_ID,
       });
       expect(yield* resolveAsset(token, "ignored.png")).toEqual({
@@ -256,23 +283,15 @@ describe("AssetAccess", () => {
           token,
           relativePath: "ignored.png",
           viewerSessionId: OTHER_SURFACE_SESSION_ID,
-          viewerAudienceCeiling: "private",
-        }),
-      ).toEqual({ kind: "file", path: attachmentPath });
-      expect(
-        yield* resolveLocalAssetRelay({
-          token,
-          relativePath: "ignored.png",
-          viewerSessionId: OTHER_SURFACE_SESSION_ID,
           viewerAudienceCeiling: "factory",
         }),
-      ).toBeNull();
+      ).toEqual({ kind: "file", path: attachmentPath });
       expect(result.relativeUrl).not.toContain(TEST_SURFACE_SESSION_ID);
       expect(result.relativeUrl).not.toContain(result.surfaceCredential);
     }).pipe(Effect.provide(testLayer)),
   );
 
-  it.effect("requires relay capability from old clients before issuing private URLs", () =>
+  it.effect("preserves signed direct URLs for web clients without relay capability", () =>
     Effect.gen(function* () {
       const config = yield* ServerConfig.ServerConfig;
       const fileSystem = yield* FileSystem.FileSystem;
@@ -284,15 +303,23 @@ describe("AssetAccess", () => {
         new Uint8Array([1, 2, 3]),
       );
 
-      const error = yield* issueAssetUrlImpl({
+      const result = yield* issueAssetUrlImpl({
         resource: { _tag: "attachment", attachmentId },
         surfaceSessionId: TEST_SURFACE_SESSION_ID,
-      }).pipe(Effect.flip);
+      });
+      const suffix = assetRouteSuffix(result.relativeUrl);
+      const separatorIndex = suffix.indexOf("/");
+      const token = suffix.slice(0, separatorIndex);
 
-      expect(error).toMatchObject({
-        _tag: "AssetClientUpgradeRequiredError",
-        requiredCapability: ASSET_SAME_ORIGIN_RELAY_V1_CAPABILITY,
-        resource: { _tag: "attachment", attachmentId },
+      expect(result).toEqual({
+        relativeUrl: expect.stringMatching(/^\/api\/assets\/(?!relay\/)/),
+        expiresAt: expect.any(Number),
+      });
+      expect(result).not.toHaveProperty("surfaceCredential");
+      expect(yield* resolveAssetImpl(token, "ignored.png")).toBeNull();
+      expect(yield* resolveAssetImpl(token, "ignored.png", { allowUnbound: true })).toEqual({
+        kind: "file",
+        path: path.join(config.attachmentsDir, `${attachmentId}.png`),
       });
     }).pipe(Effect.provide(testLayer)),
   );
@@ -310,9 +337,18 @@ describe("AssetAccess", () => {
 
       const faviconResult = yield* issueAssetUrl({
         resource: { _tag: "project-favicon", cwd: root },
+        dataAudience: "factory",
+        issuingAudience: "factory",
       });
       const faviconSuffix = assetRouteSuffix(faviconResult.relativeUrl);
       const faviconSeparatorIndex = faviconSuffix.indexOf("/");
+      expect(
+        decodeAssetRelayRoutingClaim(faviconSuffix.slice(0, faviconSeparatorIndex)),
+      ).toMatchObject({
+        kind: "project-favicon",
+        dataAudience: "factory",
+        issuingAudience: "factory",
+      });
       expect(
         yield* resolveAsset(
           faviconSuffix.slice(0, faviconSeparatorIndex),
@@ -323,6 +359,8 @@ describe("AssetAccess", () => {
       yield* fileSystem.remove(faviconPath);
       const fallbackResult = yield* issueAssetUrl({
         resource: { _tag: "project-favicon", cwd: root },
+        dataAudience: "factory",
+        issuingAudience: "factory",
       });
       expect(fallbackResult.relativeUrl.endsWith(`/${PROJECT_FAVICON_FALLBACK_MARKER}`)).toBe(true);
       const fallbackSuffix = assetRouteSuffix(fallbackResult.relativeUrl);

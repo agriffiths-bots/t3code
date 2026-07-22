@@ -84,4 +84,15 @@ describe("asset app relay routing", () => {
       ),
     ).toBeNull();
   });
+
+  it("forwards valid lengths only for unencoded upstream bodies", () => {
+    expect(__assetRelayTesting.relayContentLength({ "content-length": "42" })).toBe(42);
+    expect(
+      __assetRelayTesting.relayContentLength({
+        "content-encoding": "gzip",
+        "content-length": "24",
+      }),
+    ).toBeUndefined();
+    expect(__assetRelayTesting.relayContentLength({ "content-length": "invalid" })).toBeUndefined();
+  });
 });

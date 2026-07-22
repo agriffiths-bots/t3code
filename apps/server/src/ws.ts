@@ -18,9 +18,11 @@ import {
   AuthAccessReadScope,
   AuthAccessStreamError,
   type AuthAccessStreamEvent,
+  type AssetResource,
   type AuthEnvironmentScope,
   AuthSessionId,
   type DiscoveredLocalServerList,
+  type DataAudience,
   type OrchestrationCommand,
   type GitActionProgressEvent,
   type GitManagerServiceError,
@@ -94,6 +96,10 @@ import * as PlanUsageSnapshot from "./usage/PlanUsageSnapshot.ts";
 import * as TerminalManager from "./terminal/Manager.ts";
 import * as PreviewManager from "./preview/Manager.ts";
 import { issueAssetUrl } from "./assets/AssetAccess.ts";
+import {
+  parseThreadSegmentFromAttachmentId,
+  toSafeThreadAttachmentSegment,
+} from "./attachmentStore.ts";
 import * as PortScanner from "./preview/PortScanner.ts";
 import * as WorkspaceEntries from "./workspace/WorkspaceEntries.ts";
 import * as WorkspaceFileSystem from "./workspace/WorkspaceFileSystem.ts";
@@ -138,6 +144,9 @@ const isOrchestrationScheduledTaskMutationError = Schema.is(
 );
 
 const SHELL_REPLAY_SNAPSHOT_GAP_THRESHOLD = 1_000;
+const strictestDataAudience = (left: DataAudience, right: DataAudience): DataAudience =>
+  left === "private" || right === "private" ? "private" : "factory";
+
 function unexpectedCompatibilityError(error: never): never {
   throw new Error(`Unhandled compatibility error: ${String(error)}`);
 }
@@ -454,6 +463,71 @@ const makeWsRpcLayer = (currentSession: EnvironmentAuth.AuthenticatedSession) =>
         ...currentSession,
         scopes: new Set(currentSession.scopes),
       };
+      const classifyAttachmentAudience = Effect.fn("ws.classifyAttachmentAudience")(function* (
+        attachmentId: string,
+      ) {
+        const threadSegment = parseThreadSegmentFromAttachmentId(attachmentId);
+        if (threadSegment === null) return null;
+
+        const snapshot = yield* projectionSnapshotQuery.getCommandReadModel();
+        const projectById = new Map(snapshot.projects.map((project) => [project.id, project]));
+        let audience: DataAudience | null = null;
+        for (const thread of snapshot.threads) {
+          if (toSafeThreadAttachmentSegment(thread.id) !== threadSegment) continue;
+          const project = projectById.get(thread.projectId);
+          const threadAudience =
+            project === undefined
+              ? "private"
+              : strictestDataAudience(thread.dataAudience, project.dataAudience);
+          audience =
+            audience === null ? threadAudience : strictestDataAudience(audience, threadAudience);
+        }
+        return audience;
+      });
+      const resolveAssetContext = Effect.fn("ws.resolveAssetContext")(function* (
+        resource: AssetResource,
+      ) {
+        switch (resource._tag) {
+          case "workspace-file": {
+            const thread = yield* projectionSnapshotQuery.getThreadShellById(resource.threadId);
+            if (Option.isNone(thread)) {
+              return yield* new AssetWorkspaceContextNotFoundError({ resource });
+            }
+            const project = yield* projectionSnapshotQuery.getProjectShellById(
+              thread.value.projectId,
+            );
+            if (Option.isNone(project)) {
+              return yield* new AssetWorkspaceContextNotFoundError({ resource });
+            }
+            return {
+              dataAudience: strictestDataAudience(
+                thread.value.dataAudience,
+                project.value.dataAudience,
+              ),
+              workspaceRoot: thread.value.worktreePath ?? project.value.workspaceRoot,
+            };
+          }
+          case "attachment": {
+            const dataAudience = yield* classifyAttachmentAudience(resource.attachmentId);
+            if (dataAudience === null) {
+              if (currentSession.audienceCeiling === "private") {
+                return { dataAudience: "private" as const };
+              }
+              return yield* new AssetWorkspaceContextNotFoundError({ resource });
+            }
+            return { dataAudience };
+          }
+          case "project-favicon": {
+            const project = yield* projectionSnapshotQuery.getActiveProjectByWorkspaceRoot(
+              resource.cwd,
+            );
+            if (Option.isNone(project)) {
+              return yield* new AssetWorkspaceContextNotFoundError({ resource });
+            }
+            return { dataAudience: project.value.dataAudience };
+          }
+        }
+      });
       const authorizationError = (requiredScope: AuthEnvironmentScope, method: string) =>
         new EnvironmentAuthorizationError({
           message: currentSession.scopes.includes(requiredScope)
@@ -1760,59 +1834,31 @@ const makeWsRpcLayer = (currentSession: EnvironmentAuth.AuthenticatedSession) =>
         [WS_METHODS.assetsCreateUrl]: (input) =>
           observeRpcEffect(
             WS_METHODS.assetsCreateUrl,
-            Effect.gen(function* () {
-              if (input.resource._tag !== "workspace-file") {
-                return yield* issueAssetUrl({
+            resolveAssetContext(input.resource).pipe(
+              Effect.mapError((cause) =>
+                cause._tag === "AssetWorkspaceContextNotFoundError"
+                  ? cause
+                  : new AssetWorkspaceContextResolutionError({
+                      resource: input.resource,
+                      cause,
+                    }),
+              ),
+              Effect.flatMap((context) =>
+                issueAssetUrl({
                   resource: input.resource,
+                  ...(context.workspaceRoot === undefined
+                    ? {}
+                    : { workspaceRoot: context.workspaceRoot }),
+                  dataAudience: context.dataAudience,
+                  issuingAudience: currentSession.audienceCeiling,
                   ...(input.capabilities ? { clientCapabilities: input.capabilities } : {}),
                   surfaceSessionId: currentSession.sessionId,
                   ...(currentSession.expiresAt
                     ? { surfaceSessionExpiresAt: currentSession.expiresAt }
                     : {}),
-                });
-              }
-              const thread = yield* projectionSnapshotQuery
-                .getThreadShellById(input.resource.threadId)
-                .pipe(
-                  Effect.mapError(
-                    (cause) =>
-                      new AssetWorkspaceContextResolutionError({
-                        resource: input.resource,
-                        cause,
-                      }),
-                  ),
-                );
-              if (Option.isNone(thread)) {
-                return yield* new AssetWorkspaceContextNotFoundError({
-                  resource: input.resource,
-                });
-              }
-              const project = yield* projectionSnapshotQuery
-                .getProjectShellById(thread.value.projectId)
-                .pipe(
-                  Effect.mapError(
-                    (cause) =>
-                      new AssetWorkspaceContextResolutionError({
-                        resource: input.resource,
-                        cause,
-                      }),
-                  ),
-                );
-              if (Option.isNone(project)) {
-                return yield* new AssetWorkspaceContextNotFoundError({
-                  resource: input.resource,
-                });
-              }
-              return yield* issueAssetUrl({
-                resource: input.resource,
-                workspaceRoot: thread.value.worktreePath ?? project.value.workspaceRoot,
-                ...(input.capabilities ? { clientCapabilities: input.capabilities } : {}),
-                surfaceSessionId: currentSession.sessionId,
-                ...(currentSession.expiresAt
-                  ? { surfaceSessionExpiresAt: currentSession.expiresAt }
-                  : {}),
-              });
-            }),
+                }),
+              ),
+            ),
             { "rpc.aggregate": "workspace" },
           ),
         [WS_METHODS.subscribeVcsStatus]: (input) =>
