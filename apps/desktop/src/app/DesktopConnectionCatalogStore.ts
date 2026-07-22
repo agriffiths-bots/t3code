@@ -12,6 +12,7 @@ import {
 } from "@t3tools/client-runtime/platform";
 import type { PersistedSavedEnvironmentRecord } from "@t3tools/contracts";
 import { fromLenientJson } from "@t3tools/shared/schemaJson";
+import * as Clock from "effect/Clock";
 import * as Context from "effect/Context";
 import * as Crypto from "effect/Crypto";
 import * as Effect from "effect/Effect";
@@ -20,7 +21,9 @@ import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Path from "effect/Path";
+import * as Result from "effect/Result";
 import * as Schema from "effect/Schema";
+import * as Semaphore from "effect/Semaphore";
 
 import * as ElectronSafeStorage from "../electron/ElectronSafeStorage.ts";
 import * as DesktopSavedEnvironments from "../settings/DesktopSavedEnvironments.ts";
@@ -32,9 +35,16 @@ const EncryptedConnectionCatalogDocument = Schema.Struct({
 });
 type EncryptedConnectionCatalogDocument = typeof EncryptedConnectionCatalogDocument.Type;
 
+const ConnectionCatalogVersionEnvelope = Schema.Struct({
+  version: Schema.Number,
+});
+
 const EncryptedConnectionCatalogDocumentJson = fromLenientJson(EncryptedConnectionCatalogDocument);
 const decodeEncryptedConnectionCatalogDocumentJson = Schema.decodeEffect(
   EncryptedConnectionCatalogDocumentJson,
+);
+const decodeConnectionCatalogVersionEnvelopeJson = Schema.decodeEffect(
+  fromLenientJson(ConnectionCatalogVersionEnvelope),
 );
 const encodeEncryptedConnectionCatalogDocumentJson = Schema.encodeEffect(
   EncryptedConnectionCatalogDocumentJson,
@@ -51,7 +61,9 @@ const DesktopConnectionCatalogStoreWriteOperation = Schema.Literals([
   "encode-document",
   "create-directory",
   "write-temporary-file",
+  "sync-temporary-file",
   "replace-catalog-file",
+  "quarantine-corrupt-catalog",
 ]);
 
 const DesktopConnectionCatalogStoreMigrationOperation = Schema.Literals([
@@ -117,6 +129,18 @@ export class DesktopConnectionCatalogStoreDocumentDecodeError extends Schema.Tag
   }
 }
 
+export class DesktopConnectionCatalogStoreUnsupportedVersionError extends Schema.TaggedErrorClass<DesktopConnectionCatalogStoreUnsupportedVersionError>()(
+  "DesktopConnectionCatalogStoreUnsupportedVersionError",
+  {
+    catalogPath: Schema.String,
+    version: Schema.Number,
+  },
+) {
+  override get message(): string {
+    return `Desktop connection catalog version ${this.version} at ${this.catalogPath} is newer than this application supports.`;
+  }
+}
+
 export class DesktopConnectionCatalogStoreMigrationError extends Schema.TaggedErrorClass<DesktopConnectionCatalogStoreMigrationError>()(
   "DesktopConnectionCatalogStoreMigrationError",
   {
@@ -152,7 +176,8 @@ export class DesktopConnectionCatalogStore extends Context.Service<
     readonly get: Effect.Effect<
       Option.Option<string>,
       | DesktopConnectionCatalogStoreReadError
-      | DesktopConnectionCatalogStoreDocumentDecodeError
+      | DesktopConnectionCatalogStoreUnsupportedVersionError
+      | DesktopConnectionCatalogStoreWriteError
       | DesktopConnectionCatalogStoreDecodeError
       | DesktopConnectionCatalogStoreMigrationError
       | DesktopConnectionCatalogStoreProtectionError
@@ -188,7 +213,9 @@ const readDocument = (
   catalogPath: string,
 ): Effect.Effect<
   Option.Option<EncryptedConnectionCatalogDocument>,
-  DesktopConnectionCatalogStoreReadError | DesktopConnectionCatalogStoreDocumentDecodeError
+  | DesktopConnectionCatalogStoreReadError
+  | DesktopConnectionCatalogStoreDocumentDecodeError
+  | DesktopConnectionCatalogStoreUnsupportedVersionError
 > =>
   fileSystem.readFileString(catalogPath).pipe(
     Effect.catch((error) =>
@@ -206,12 +233,26 @@ const readDocument = (
         ? Effect.succeed(Option.none<EncryptedConnectionCatalogDocument>())
         : decodeEncryptedConnectionCatalogDocumentJson(raw).pipe(
             Effect.map(Option.some),
-            Effect.mapError(
-              (cause) =>
-                new DesktopConnectionCatalogStoreDocumentDecodeError({
+            Effect.catch((cause) =>
+              Effect.gen(function* () {
+                const envelopeResult = yield* Effect.result(
+                  decodeConnectionCatalogVersionEnvelopeJson(raw),
+                );
+                if (
+                  Result.isSuccess(envelopeResult) &&
+                  Number.isSafeInteger(envelopeResult.success.version) &&
+                  envelopeResult.success.version > 1
+                ) {
+                  return yield* new DesktopConnectionCatalogStoreUnsupportedVersionError({
+                    catalogPath,
+                    version: envelopeResult.success.version,
+                  });
+                }
+                return yield* new DesktopConnectionCatalogStoreDocumentDecodeError({
                   catalogPath,
                   cause,
-                }),
+                });
+              }),
             ),
           ),
     ),
@@ -255,6 +296,19 @@ const writeDocument = Effect.fn("desktop.connectionCatalogStore.writeDocument")(
             path: tempPath,
             cause,
           }),
+      ),
+    );
+    yield* Effect.scoped(
+      input.fileSystem.open(tempPath, { flag: "r+" }).pipe(
+        Effect.flatMap((file) => file.sync),
+        Effect.mapError(
+          (cause) =>
+            new DesktopConnectionCatalogStoreWriteError({
+              operation: "sync-temporary-file",
+              path: tempPath,
+              cause,
+            }),
+        ),
       ),
     );
     yield* input.fileSystem.rename(tempPath, input.catalogPath).pipe(
@@ -382,6 +436,7 @@ export const make = Effect.gen(function* () {
   const safeStorage = yield* ElectronSafeStorage.ElectronSafeStorage;
   const crypto = yield* Crypto.Crypto;
   const savedEnvironments = yield* DesktopSavedEnvironments.DesktopSavedEnvironments;
+  const lock = yield* Semaphore.make(1);
   const catalogPath = path.join(environment.stateDir, "connection-catalog.json");
   const encryptionAvailable = safeStorage.isEncryptionAvailable.pipe(
     Effect.mapError(
@@ -469,47 +524,107 @@ export const make = Effect.gen(function* () {
     return Option.some(encoded);
   });
 
+  const quarantineCorruptCatalog = Effect.fn(
+    "desktop.connectionCatalogStore.quarantineCorruptCatalog",
+  )(function* (error: DesktopConnectionCatalogStoreDocumentDecodeError) {
+    let quarantineTimestamp = yield* Clock.currentTimeMillis;
+    let quarantinePath = `${catalogPath}.corrupt-${quarantineTimestamp}`;
+    while (
+      yield* fileSystem.exists(quarantinePath).pipe(
+        Effect.mapError(
+          (cause) =>
+            new DesktopConnectionCatalogStoreWriteError({
+              operation: "quarantine-corrupt-catalog",
+              path: quarantinePath,
+              cause,
+            }),
+        ),
+      )
+    ) {
+      quarantineTimestamp += 1;
+      quarantinePath = `${catalogPath}.corrupt-${quarantineTimestamp}`;
+    }
+    yield* fileSystem.rename(catalogPath, quarantinePath).pipe(
+      Effect.mapError(
+        (cause) =>
+          new DesktopConnectionCatalogStoreWriteError({
+            operation: "quarantine-corrupt-catalog",
+            path: quarantinePath,
+            cause,
+          }),
+      ),
+    );
+    yield* Effect.logWarning(
+      "Recovered a corrupt desktop connection catalog; the original was preserved for recovery.",
+      {
+        catalogPath,
+        quarantinePath,
+        error: error.message,
+      },
+    );
+  });
+
   return DesktopConnectionCatalogStore.of({
-    get: Effect.gen(function* () {
-      const document = yield* readDocument(fileSystem, catalogPath);
-      if (Option.isNone(document)) {
-        return yield* migrateLegacyCatalog;
-      }
-      if (!(yield* encryptionAvailable)) {
-        return Option.none<string>();
-      }
-      const decrypted = yield* decodeSecretBytes(catalogPath, document.value.encryptedCatalog).pipe(
-        Effect.flatMap((encryptedCatalog) =>
-          safeStorage.decryptString(encryptedCatalog).pipe(
-            Effect.mapError(
-              (cause) =>
-                new DesktopConnectionCatalogStoreProtectionError({
-                  operation: "decrypt-catalog",
-                  catalogPath,
-                  cause,
-                }),
+    get: lock
+      .withPermits(1)(
+        Effect.gen(function* () {
+          const document = yield* readDocument(fileSystem, catalogPath).pipe(
+            Effect.catchTag("DesktopConnectionCatalogStoreDocumentDecodeError", (error) =>
+              quarantineCorruptCatalog(error).pipe(
+                Effect.as(Option.none<EncryptedConnectionCatalogDocument>()),
+              ),
             ),
+          );
+          if (Option.isNone(document)) {
+            return yield* migrateLegacyCatalog;
+          }
+          if (!(yield* encryptionAvailable)) {
+            return Option.none<string>();
+          }
+          const decrypted = yield* decodeSecretBytes(
+            catalogPath,
+            document.value.encryptedCatalog,
+          ).pipe(
+            Effect.flatMap((encryptedCatalog) =>
+              safeStorage.decryptString(encryptedCatalog).pipe(
+                Effect.mapError(
+                  (cause) =>
+                    new DesktopConnectionCatalogStoreProtectionError({
+                      operation: "decrypt-catalog",
+                      catalogPath,
+                      cause,
+                    }),
+                ),
+              ),
+            ),
+          );
+          return Option.some(decrypted);
+        }),
+      )
+      .pipe(Effect.withSpan("desktop.connectionCatalogStore.get")),
+    set: Effect.fn("desktop.connectionCatalogStore.set")(function* (catalog) {
+      return yield* lock.withPermits(1)(
+        Effect.gen(function* () {
+          if (!(yield* encryptionAvailable)) {
+            return false;
+          }
+          yield* writeCatalog(catalog);
+          return true;
+        }),
+      );
+    }),
+    clear: lock
+      .withPermits(1)(
+        fileSystem.remove(catalogPath, { force: true }).pipe(
+          Effect.catch((error) =>
+            Effect.logWarning("Could not clear the desktop connection catalog.", {
+              catalogPath,
+              error,
+            }),
           ),
         ),
-      );
-      return Option.some(decrypted);
-    }).pipe(Effect.withSpan("desktop.connectionCatalogStore.get")),
-    set: Effect.fn("desktop.connectionCatalogStore.set")(function* (catalog) {
-      if (!(yield* encryptionAvailable)) {
-        return false;
-      }
-      yield* writeCatalog(catalog);
-      return true;
-    }),
-    clear: fileSystem.remove(catalogPath, { force: true }).pipe(
-      Effect.catch((error) =>
-        Effect.logWarning("Could not clear the desktop connection catalog.", {
-          catalogPath,
-          error,
-        }),
-      ),
-      Effect.withSpan("desktop.connectionCatalogStore.clear"),
-    ),
+      )
+      .pipe(Effect.withSpan("desktop.connectionCatalogStore.clear")),
   });
 });
 
