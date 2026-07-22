@@ -109,4 +109,9 @@ export const dispatchAlreadyCoordinated = (
   command: OrchestrationCommand,
   authority: OrchestrationCommandDispatchAuthority,
   acceptanceGuard?: OrchestrationCommandAcceptanceGuard,
-) => (engine.dispatchCoordinated ?? engine.dispatch)(command, authority, acceptanceGuard);
+) => {
+  const dispatch = engine.dispatchCoordinated ?? engine.dispatch;
+  return acceptanceGuard === undefined
+    ? dispatch(command, authority)
+    : dispatch(command, authority, acceptanceGuard);
+};
