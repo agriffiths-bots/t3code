@@ -36,6 +36,7 @@ const STATUS_LABEL_BY_STATUS: Partial<
   input: { label: "Input", className: "text-amber-700 dark:text-amber-300" },
   working: { label: "Working", className: "text-blue-600 dark:text-blue-400" },
   failed: { label: "Failed", className: "text-red-700 dark:text-red-300" },
+  plan: { label: "Plan ready", className: "text-violet-700 dark:text-violet-300" },
 };
 
 function threadTimeLabel(thread: EnvironmentThreadShell): string {
@@ -108,6 +109,9 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
   /** False on environments whose server predates thread.settle/unsettle:
       swipe + menu fall back to Archive instead of failing on use. */
   readonly settlementSupported: boolean;
+  readonly selected?: boolean;
+  readonly surface?: "screen" | "sidebar";
+  readonly fullSwipeWidth?: number;
   readonly onSwipeableWillOpen: (methods: SwipeableMethods) => void;
   readonly onSwipeableClose: (methods: SwipeableMethods) => void;
   readonly simultaneousSwipeGesture?: ComponentProps<
@@ -126,6 +130,8 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
   } = props;
 
   const screenColor = useThemeColor("--color-screen");
+  const drawerColor = useThemeColor("--color-drawer");
+  const surfaceColor = props.surface === "sidebar" ? drawerColor : screenColor;
 
   const status = resolveThreadListV2Status(thread);
   const statusLabel = STATUS_LABEL_BY_STATUS[status];
@@ -195,13 +201,15 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
         }}
         style={({ pressed }) => ({ opacity: pressed ? 0.7 : 1 })}
       >
-        <View className="bg-screen px-4 py-1">
+        <View className="px-4 py-1" style={{ backgroundColor: surfaceColor }}>
           <View
             className={cn(
               "overflow-hidden",
-              status === "ready"
-                ? "bg-black/[0.025] dark:bg-white/[0.025]"
-                : "bg-black/[0.04] dark:bg-white/[0.04]",
+              props.selected
+                ? "bg-primary/15 dark:bg-primary/25"
+                : status === "ready"
+                  ? "bg-black/[0.025] dark:bg-white/[0.025]"
+                  : "bg-black/[0.04] dark:bg-white/[0.04]",
             )}
             style={{ borderRadius: 12, borderCurve: "continuous", minHeight: 84 }}
           >
@@ -267,15 +275,22 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
         accessibilityHint={`Opens the thread. Swipe left to ${primaryAction.label.toLowerCase()}.`}
         accessibilityLabel={thread.title}
         accessibilityRole="button"
-        className="bg-screen"
+        style={({ pressed }) => ({
+          backgroundColor: surfaceColor,
+          opacity: pressed ? 0.7 : 1,
+        })}
         onPress={() => {
           close();
           onSelectThread(thread);
         }}
-        style={({ pressed }) => ({ opacity: pressed ? 0.7 : 1 })}
       >
         {/* Settled history recedes: dimmed favicon + muted title. */}
-        <View className="min-h-[44px] flex-row items-center gap-2.5 px-5 py-2">
+        <View
+          className={cn(
+            "min-h-[44px] flex-row items-center gap-2.5 px-5 py-2",
+            props.selected ? "bg-primary/15 dark:bg-primary/25" : null,
+          )}
+        >
           {props.project ? (
             <View className="opacity-40">
               <ProjectFavicon
@@ -303,12 +318,12 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
     <>
       {props.showSettledDivider ? <ThreadListV2SettledDivider /> : null}
       <ThreadSwipeable
-        backgroundColor={screenColor}
+        backgroundColor={surfaceColor}
         enableTrackpadSwipe
         // Full swipe commits the advertised lifecycle action (Settle /
         // Un-settle), never the destructive delete.
         fullSwipeAction="primary"
-        fullSwipeWidth={windowWidth - 32}
+        fullSwipeWidth={props.fullSwipeWidth ?? windowWidth - 32}
         onDelete={handleDelete}
         onSwipeableClose={props.onSwipeableClose}
         onSwipeableWillOpen={props.onSwipeableWillOpen}

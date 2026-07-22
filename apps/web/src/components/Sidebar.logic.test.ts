@@ -657,7 +657,13 @@ describe("resolveSidebarV2Status", () => {
     updatedAt: "2026-03-09T10:00:00.000Z",
   };
 
-  const idle = { hasPendingApprovals: false, hasPendingUserInput: false };
+  const idle = {
+    hasActionableProposedPlan: false,
+    hasPendingApprovals: false,
+    hasPendingUserInput: false,
+    interactionMode: "default" as const,
+    latestTurn: null,
+  };
 
   it("prioritizes approval over a running session", () => {
     expect(resolveSidebarV2Status({ ...idle, hasPendingApprovals: true, session })).toBe(
@@ -718,6 +724,18 @@ describe("resolveSidebarV2Status", () => {
         session: { ...session, status: "ready" as const, lastError: "persisted" },
       }),
     ).toBe("ready");
+  });
+
+  it("keeps an actionable proposed plan visible after the session settles", () => {
+    expect(
+      resolveSidebarV2Status({
+        ...idle,
+        hasActionableProposedPlan: true,
+        interactionMode: "plan",
+        latestTurn: makeLatestTurn(),
+        session: null,
+      }),
+    ).toBe("plan");
   });
 
   it("defaults to ready with no session", () => {

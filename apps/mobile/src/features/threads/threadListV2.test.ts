@@ -67,6 +67,27 @@ describe("resolveThreadListV2Status", () => {
     );
   });
 
+  it("keeps an actionable proposed plan visible after the session settles", () => {
+    expect(
+      resolveThreadListV2Status(
+        makeThread({
+          id: ThreadId.make("plan-ready"),
+          title: "Plan ready",
+          hasActionableProposedPlan: true,
+          interactionMode: "plan",
+          latestTurn: {
+            turnId: TurnId.make("plan-turn"),
+            state: "completed",
+            assistantMessageId: null,
+            requestedAt: NOW,
+            startedAt: NOW,
+            completedAt: NOW,
+          },
+        }),
+      ),
+    ).toBe("plan");
+  });
+
   it("treats waiting as working only while it carries an active turn", () => {
     const waiting = makeThread({
       id: ThreadId.make("waiting"),

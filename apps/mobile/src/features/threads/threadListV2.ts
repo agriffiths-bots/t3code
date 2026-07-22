@@ -13,10 +13,18 @@ import type { EnvironmentId, ProjectId } from "@t3tools/contracts";
  * (approval), "in motion" (working), and "broken" (failed). Ready is the
  * unlabeled resting state.
  */
-export type ThreadListV2Status = "approval" | "input" | "working" | "failed" | "ready";
+export type ThreadListV2Status = "approval" | "input" | "working" | "failed" | "plan" | "ready";
 
 export function resolveThreadListV2Status(
-  thread: Pick<EnvironmentThreadShell, "hasPendingApprovals" | "hasPendingUserInput" | "session">,
+  thread: Pick<
+    EnvironmentThreadShell,
+    | "hasActionableProposedPlan"
+    | "hasPendingApprovals"
+    | "hasPendingUserInput"
+    | "interactionMode"
+    | "latestTurn"
+    | "session"
+  >,
 ): ThreadListV2Status {
   if (thread.hasPendingApprovals) {
     return "approval";
@@ -29,6 +37,13 @@ export function resolveThreadListV2Status(
   }
   if (thread.session?.status === "error") {
     return "failed";
+  }
+  const latestTurnSettled =
+    thread.latestTurn?.startedAt != null &&
+    thread.latestTurn.completedAt != null &&
+    !hasActiveThreadSession(thread.session);
+  if (thread.interactionMode === "plan" && latestTurnSettled && thread.hasActionableProposedPlan) {
+    return "plan";
   }
   return "ready";
 }

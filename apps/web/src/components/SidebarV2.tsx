@@ -136,6 +136,12 @@ const SidebarV2PrStateReporter = memo(function SidebarV2PrStateReporter(props: {
   useEffect(() => {
     onChangeRequestState(threadKey, prState);
   }, [onChangeRequestState, prState, threadKey]);
+  useEffect(
+    () => () => {
+      onChangeRequestState(threadKey, null);
+    },
+    [onChangeRequestState, threadKey],
+  );
 
   return null;
 });
@@ -181,7 +187,6 @@ const SidebarV2Row = memo(function SidebarV2Row(props: {
   onContextMenu: (threadRef: ScopedThreadRef, position: { x: number; y: number }) => void;
   onSettle: (threadRef: ScopedThreadRef) => void;
   onUnsettle: (threadRef: ScopedThreadRef) => void;
-  onChangeRequestState: (threadKey: string, state: "open" | "closed" | "merged" | null) => void;
   treeDepth: number;
   directChildCount: number;
   unsettledDescendantCount: number;
@@ -191,7 +196,6 @@ const SidebarV2Row = memo(function SidebarV2Row(props: {
   const {
     isRenaming,
     onCancelRename,
-    onChangeRequestState,
     onCommitRename,
     onContextMenu,
     onRenameTitleChange,
@@ -239,19 +243,25 @@ const SidebarV2Row = memo(function SidebarV2Row(props: {
               icon: null,
               className: "font-semibold text-amber-700 dark:text-amber-300",
             }
-          : status === "failed"
+          : status === "plan"
             ? {
-                label: "Failed",
+                label: "Plan ready",
                 icon: null,
-                className: "font-semibold text-red-700 dark:text-red-300",
+                className: "font-semibold text-violet-700 dark:text-violet-300",
               }
-            : isUnread
+            : status === "failed"
               ? {
-                  label: "Done",
-                  icon: "done" as const,
-                  className: "font-semibold text-emerald-700 dark:text-emerald-300",
+                  label: "Failed",
+                  icon: null,
+                  className: "font-semibold text-red-700 dark:text-red-300",
                 }
-              : null;
+              : isUnread
+                ? {
+                    label: "Done",
+                    icon: "done" as const,
+                    className: "font-semibold text-emerald-700 dark:text-emerald-300",
+                  }
+                : null;
 
   const gitCwd = thread.worktreePath ?? props.projectCwd;
   const gitStatus = useEnvironmentQuery(
@@ -264,10 +274,6 @@ const SidebarV2Row = memo(function SidebarV2Row(props: {
   );
   const pr = resolveThreadPr(thread.branch, gitStatus.data);
   const prStatus = prStatusIndicator(pr, gitStatus.data?.sourceControlProvider);
-  const prState = pr?.state ?? null;
-  useEffect(() => {
-    onChangeRequestState(threadKey, prState);
-  }, [onChangeRequestState, prState, threadKey]);
   const modelInstanceId = thread.session?.providerInstanceId ?? thread.modelSelection.instanceId;
   const driverKind = props.providerEntryByInstanceId.get(modelInstanceId)?.driverKind ?? null;
 
@@ -855,17 +861,46 @@ export default function SidebarV2() {
   // merging, no optimistic holds. Archived threads remain hidden here —
   // archive keeps its original "remove from sidebar" meaning.
   const serverConfigs = useAtomValue(environmentServerConfigsAtom);
+  const visibleThreads = useMemo(
+    () =>
+      threads.filter(
+        (thread) =>
+          thread.archivedAt === null &&
+          (scopedProject === null ||
+            (thread.environmentId === scopedProject.environmentId &&
+              thread.projectId === scopedProject.id)),
+      ),
+    [scopedProject, threads],
+  );
+  const partitionNow = `${nowMinute}:00.000Z`;
+  // Observe every thread whose settlement can be changed by a PR closing,
+  // independent of its current PR state and settled-tail page. This keeps a
+  // deep settled row subscribed so a reopened PR immediately returns it to
+  // the inbox.
+  const prStateReporterThreads = useMemo(
+    () =>
+      visibleThreads.filter((thread) => {
+        const supportsSettlement =
+          serverConfigs.get(thread.environmentId)?.environment.capabilities.threadSettlement ===
+          true;
+        if (!supportsSettlement) return false;
+        const activeWithoutPr = !effectiveSettled(thread, {
+          now: partitionNow,
+          autoSettleAfterDays,
+          changeRequestState: null,
+        });
+        const settledWithClosedPr = effectiveSettled(thread, {
+          now: partitionNow,
+          autoSettleAfterDays,
+          changeRequestState: "closed",
+        });
+        return activeWithoutPr && settledWithClosedPr;
+      }),
+    [autoSettleAfterDays, partitionNow, serverConfigs, visibleThreads],
+  );
   const { activeRows, settledGroups, settledThreadKeys } = useMemo(() => {
-    const now = `${nowMinute}:00.000Z`;
-    const visible = threads.filter(
-      (thread) =>
-        thread.archivedAt === null &&
-        (scopedProject === null ||
-          (thread.environmentId === scopedProject.environmentId &&
-            thread.projectId === scopedProject.id)),
-    );
     const settledByThreadKey = new Map<string, boolean>();
-    for (const thread of visible) {
+    for (const thread of visibleThreads) {
       // Threads on servers without the settlement capability (old server,
       // or descriptor not loaded yet) never classify as settled: the user
       // could neither un-settle nor pin them, so auto-settling them would
@@ -876,11 +911,15 @@ export default function SidebarV2() {
       const changeRequestState = changeRequestStateByKey.get(threadKey) ?? null;
       const settled =
         supportsSettlement &&
-        effectiveSettled(thread, { now, autoSettleAfterDays, changeRequestState });
+        effectiveSettled(thread, {
+          now: partitionNow,
+          autoSettleAfterDays,
+          changeRequestState,
+        });
       settledByThreadKey.set(threadKey, settled);
     }
     const partition = partitionSidebarV2ThreadTreeRows(
-      sortThreadsForSidebarV2(visible),
+      sortThreadsForSidebarV2(visibleThreads),
       (thread) =>
         settledByThreadKey.get(scopedThreadKey(scopeThreadRef(thread.environmentId, thread.id))) ??
         false,
@@ -902,14 +941,7 @@ export default function SidebarV2() {
           .map(([threadKey]) => threadKey),
       ),
     };
-  }, [
-    autoSettleAfterDays,
-    changeRequestStateByKey,
-    nowMinute,
-    scopedProject,
-    serverConfigs,
-    threads,
-  ]);
+  }, [autoSettleAfterDays, changeRequestStateByKey, partitionNow, serverConfigs, visibleThreads]);
 
   // The settled tail renders in pages: history shouldn't dominate the
   // sidebar, and the common lookups are recent. Expansion resets when the
@@ -957,23 +989,6 @@ export default function SidebarV2() {
     () => [...expandedActiveRows, ...expandedSettledRows],
     [expandedActiveRows, expandedSettledRows],
   );
-  const prStateReporterThreads = useMemo(() => {
-    const renderedKeys = new Set(
-      orderedRows.map((row) =>
-        scopedThreadKey(scopeThreadRef(row.thread.environmentId, row.thread.id)),
-      ),
-    );
-    // Rendered rows already own the VCS subscription used by their PR icon.
-    // Add reporters only for descendants hidden by tree collapse in the
-    // current active partition or visible settled page. This preserves child
-    // auto-settlement without subscribing unrelated scopes or the deep tail.
-    return [...activeRows, ...visibleSettledRows]
-      .map((row) => row.thread)
-      .filter(
-        (thread) =>
-          !renderedKeys.has(scopedThreadKey(scopeThreadRef(thread.environmentId, thread.id))),
-      );
-  }, [activeRows, orderedRows, visibleSettledRows]);
   const orderedThreads = useMemo(() => orderedRows.map((row) => row.thread), [orderedRows]);
   const firstSettledTailThreadKey = expandedSettledRows[0]
     ? scopedThreadKey(
@@ -1759,7 +1774,6 @@ export default function SidebarV2() {
                   onContextMenu={handleThreadContextMenu}
                   onSettle={attemptSettle}
                   onUnsettle={attemptUnsettle}
-                  onChangeRequestState={handleChangeRequestState}
                   treeDepth={row.depth}
                   directChildCount={row.directChildCount}
                   unsettledDescendantCount={row.unsettledDescendantCount}
