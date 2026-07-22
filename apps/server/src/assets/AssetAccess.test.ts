@@ -239,7 +239,7 @@ describe("AssetAccess", () => {
     }).pipe(Effect.provide(testLayer)),
   );
 
-  it.effect("requires the negotiated capability before returning a private asset URL", () =>
+  it.effect("preserves signed direct URLs for clients without surface credentials", () =>
     Effect.gen(function* () {
       const config = yield* ServerConfig.ServerConfig;
       const fileSystem = yield* FileSystem.FileSystem;
@@ -251,16 +251,24 @@ describe("AssetAccess", () => {
         new Uint8Array([1, 2, 3]),
       );
 
-      const error = yield* issueAssetUrlImpl({
+      const result = yield* issueAssetUrlImpl({
         resource: { _tag: "attachment", attachmentId },
         surfaceSessionId: TEST_SURFACE_SESSION_ID,
-      }).pipe(Effect.flip);
-
-      expect(error).toMatchObject({
-        _tag: "AssetClientUpgradeRequiredError",
-        requiredCapability: ASSET_SAME_ORIGIN_RELAY_V1_CAPABILITY,
       });
-      expect(error).not.toHaveProperty("relativeUrl");
+      const suffix = assetRouteSuffix(result.relativeUrl);
+      const separatorIndex = suffix.indexOf("/");
+      const token = suffix.slice(0, separatorIndex);
+
+      expect(result).toEqual({
+        relativeUrl: expect.stringMatching(/^\/api\/assets\/(?!relay\/)/),
+        expiresAt: expect.any(Number),
+      });
+      expect(yield* resolveAssetImpl(token, "ignored.png")).toBeNull();
+      expect(
+        yield* resolveAssetImpl(token, "ignored.png", {
+          allowUnbound: true,
+        }),
+      ).toEqual({ kind: "file", path: path.join(config.attachmentsDir, `${attachmentId}.png`) });
     }).pipe(Effect.provide(testLayer)),
   );
 

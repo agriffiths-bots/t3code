@@ -12,10 +12,18 @@ import {
 } from "./assets.ts";
 
 describe("asset client capabilities", () => {
-  it("advertises same-origin relay support on every asset URL request", () => {
+  it("does not advertise same-origin relay support for bearer/DPoP web clients", () => {
     const resource = { _tag: "attachment" as const, attachmentId: "attachment-1" };
 
-    expect(withAssetClientCapabilities({ resource })).toEqual({
+    expect(withAssetClientCapabilities({ resource, supportsSurfaceCredentials: false })).toEqual({
+      resource,
+    });
+  });
+
+  it("advertises same-origin relay support for clients that present surface credentials", () => {
+    const resource = { _tag: "attachment" as const, attachmentId: "attachment-1" };
+
+    expect(withAssetClientCapabilities({ resource, supportsSurfaceCredentials: true })).toEqual({
       resource,
       capabilities: [ASSET_SAME_ORIGIN_RELAY_V1_CAPABILITY],
     });

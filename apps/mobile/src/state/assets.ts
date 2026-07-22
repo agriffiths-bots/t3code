@@ -6,7 +6,9 @@ import { AsyncResult, Atom } from "effect/unstable/reactivity";
 import { connectionAtomRuntime } from "../connection/runtime";
 import { usePreparedConnection } from "./session";
 
-export const assetEnvironment = createAssetEnvironmentAtoms(connectionAtomRuntime);
+export const assetEnvironment = createAssetEnvironmentAtoms(connectionAtomRuntime, {
+  supportsSurfaceCredentials: true,
+});
 const ASSET_SURFACE_CREDENTIAL_HEADER = "x-t3-asset-surface";
 
 export interface AssetRequestSource {

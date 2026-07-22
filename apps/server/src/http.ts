@@ -579,6 +579,7 @@ export const assetRouteLayer = HttpRouter.add(
           ? { sessionId: authenticatedSession.value.sessionId }
           : {}),
         surfaceCredentials: requestSurfaceCredentials,
+        allowUnbound: !isSurfaceRelay,
       },
     );
     if (!asset) {
@@ -610,6 +611,14 @@ const AssetSurfaceBindingInput = Schema.Struct({
   redirect: Schema.optionalKey(Schema.String.check(Schema.isMaxLength(4096))),
 });
 const decodeAssetSurfaceBindingInput = Schema.decodeUnknownOption(AssetSurfaceBindingInput);
+
+function parseAbsoluteUrl(value: string): URL | null {
+  try {
+    return new URL(value);
+  } catch {
+    return null;
+  }
+}
 
 function validateAssetSurfaceRedirect(value: string): string | null {
   if (!value.startsWith("/") || value.startsWith("//")) return null;
@@ -654,12 +663,16 @@ export const assetSurfaceBindingRouteLayer = HttpRouter.add(
 
     const sessions = yield* SessionStore.SessionStore;
     const requestOrigin = normalizeCorsOrigin(request.headers.origin);
+    const requestOriginUrl = requestOrigin === null ? null : parseAbsoluteUrl(requestOrigin);
+    if (requestOrigin !== null && requestOriginUrl === null) {
+      return HttpServerResponse.text("Not Found", { status: 404 });
+    }
     const forwardedProtocol = request.headers["x-forwarded-proto"]
       ?.split(",", 1)[0]
       ?.trim()
       .toLowerCase();
     const secure =
-      (requestOrigin !== null && new URL(requestOrigin).protocol === "https:") ||
+      requestOriginUrl?.protocol === "https:" ||
       forwardedProtocol === "https:" ||
       forwardedProtocol === "https" ||
       (() => {

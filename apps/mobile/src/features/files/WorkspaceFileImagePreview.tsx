@@ -19,7 +19,7 @@ function ResolvedWorkspaceFileImagePreview(props: {
     () => ({
       uri: props.source.uri,
       headers: props.source.headers,
-      cache: "force-cache" as const,
+      ...(props.source.headers === undefined ? { cache: "force-cache" as const } : {}),
     }),
     [props.source],
   );

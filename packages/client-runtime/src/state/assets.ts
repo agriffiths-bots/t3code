@@ -51,15 +51,19 @@ export function resolveAssetUrl(httpBaseUrl: string, relativeUrl: string): strin
 
 export function withAssetClientCapabilities(input: {
   readonly resource: AssetResource;
+  readonly supportsSurfaceCredentials?: boolean;
 }): AssetCreateUrlInput {
   return {
     resource: input.resource,
-    capabilities: [ASSET_SAME_ORIGIN_RELAY_V1_CAPABILITY],
+    ...(input.supportsSurfaceCredentials === true
+      ? { capabilities: [ASSET_SAME_ORIGIN_RELAY_V1_CAPABILITY] }
+      : {}),
   };
 }
 
 export function createAssetEnvironmentAtoms<R, E>(
   runtime: Atom.AtomRuntime<EnvironmentRegistry | R, E>,
+  options: { readonly supportsSurfaceCredentials?: boolean } = {},
 ) {
   const createUrlQuery = createEnvironmentRpcQueryAtomFamily(runtime, {
     label: "environment-data:assets:create-url",
@@ -74,7 +78,10 @@ export function createAssetEnvironmentAtoms<R, E>(
   }) =>
     createUrlQuery({
       environmentId: target.environmentId,
-      input: withAssetClientCapabilities(target.input),
+      input: withAssetClientCapabilities({
+        ...target.input,
+        supportsSurfaceCredentials: options.supportsSurfaceCredentials === true,
+      }),
     });
   const createUrlsFamily = Atom.family((key: string) => {
     const [environmentId, resources] = parseAssetCollectionKey(key);

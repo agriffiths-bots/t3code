@@ -2400,13 +2400,17 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
       const rpc = <A, E, R>(f: (client: WsRpcClient) => Effect.Effect<A, E, R>) =>
         Effect.scoped(withWsRpcClient(wsUrl, f));
 
-      const oldClientError = yield* rpc((client) =>
+      const legacyIssued = yield* rpc((client) =>
         client[WS_METHODS.assetsCreateUrl]({
           resource: { _tag: "attachment", attachmentId },
         }),
-      ).pipe(Effect.flip);
-      assert.equal(oldClientError._tag, "AssetClientUpgradeRequiredError");
-      assert.notProperty(oldClientError, "relativeUrl");
+      );
+      assert.include(legacyIssued.relativeUrl, "/api/assets/");
+      assert.notInclude(legacyIssued.relativeUrl, "/api/assets/relay/");
+      assert.notProperty(legacyIssued, "surfaceCredential");
+      const legacyResponse = yield* fetchEffect(yield* getHttpServerUrl(legacyIssued.relativeUrl));
+      assert.equal(legacyResponse.status, 200);
+      assert.equal(yield* legacyResponse.text, "same-surface-private-asset");
 
       const issued = yield* rpc((client) =>
         client[WS_METHODS.assetsCreateUrl]({
@@ -2437,6 +2441,23 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
       });
       assert.equal(nativeResponse.status, 200);
       assert.equal(yield* nativeResponse.text, "same-surface-private-asset");
+
+      for (const origin of ["null", "not an origin"]) {
+        const rejectedBindingResponse = yield* fetchEffect(
+          yield* getHttpServerUrl("/api/assets/relay/surface"),
+          {
+            method: "POST",
+            redirect: "manual",
+            headers: { "content-type": "application/json", origin },
+            body: jsonRequestBody({
+              credential: issued.surfaceCredential,
+              redirect: issued.relativeUrl,
+            }),
+          },
+        );
+        assert.equal(rejectedBindingResponse.status, 404);
+        assert.isUndefined(rejectedBindingResponse.headers["set-cookie"]);
+      }
 
       const bindingResponse = yield* fetchEffect(
         yield* getHttpServerUrl("/api/assets/relay/surface"),
