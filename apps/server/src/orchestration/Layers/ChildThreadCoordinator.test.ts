@@ -35,6 +35,7 @@ import { SqlClient } from "effect/unstable/sql/SqlClient";
 import { afterEach, describe, expect, it } from "vite-plus/test";
 
 import { SqlitePersistenceMemory } from "../../persistence/Layers/Sqlite.ts";
+import { backfillPreexistingLocalSubagentTerminalDeliveries } from "../../persistence/Migrations/054_BackfillPreexistingLocalSubagentTerminalDeliveries.ts";
 import { PendingDispatchRepositoryLive } from "../../persistence/Layers/PendingDispatches.ts";
 import {
   PendingDispatchId,
@@ -414,6 +415,8 @@ describe("ChildThreadCoordinator", () => {
       readonly claimedSequence: number;
       readonly terminalKind?: "completed" | "failed" | "killed" | "archived";
     }>;
+    /** Run migration 054's backfill after seeding projection rows but before coordinator boot. */
+    readonly backfillPreexistingTerminalDeliveriesBeforeStart?: boolean;
     /** subagent_promoted_children rows inserted BEFORE start() (simulated restart). */
     readonly seedPromotedChildren?: ReadonlyArray<{
       readonly childThreadId: ThreadId;
@@ -942,6 +945,127 @@ describe("ChildThreadCoordinator", () => {
         );
       }
     }
+    if (input?.backfillPreexistingTerminalDeliveriesBeforeStart) {
+      for (const event of input.persistedEvents ?? []) {
+        const sequence = (event as { readonly sequence?: number }).sequence;
+        if (sequence === undefined) continue;
+        await activeRuntime.runPromise(
+          Effect.flatMap(
+            Effect.service(SqlClient),
+            (sql) => sql`
+              INSERT INTO orchestration_events (
+                sequence,
+                event_id,
+                aggregate_kind,
+                stream_id,
+                stream_version,
+                event_type,
+                occurred_at,
+                actor_kind,
+                payload_json,
+                metadata_json
+              )
+              VALUES (
+                ${sequence},
+                ${event.eventId},
+                ${event.aggregateKind},
+                ${event.aggregateId},
+                ${sequence},
+                ${event.type},
+                ${event.occurredAt},
+                ${"server"},
+                ${JSON.stringify(event.payload)},
+                ${"{}"}
+              )
+            `,
+          ),
+        );
+      }
+      for (const [rowIndex, row] of (input.seedChildRows ?? []).entries()) {
+        const state = threadStates.get(row.threadId);
+        if (state === undefined) continue;
+        const latestTurn = state.shell.latestTurn;
+        await activeRuntime.runPromise(
+          Effect.flatMap(Effect.service(SqlClient), (sql) =>
+            Effect.gen(function* () {
+              yield* sql`
+                  UPDATE projection_threads
+                  SET
+                    latest_turn_id = ${latestTurn?.turnId ?? null},
+                    archived_at = ${state.shell.archivedAt ?? null},
+                    deleted_at = ${state.detail.deletedAt ?? null}
+                  WHERE thread_id = ${row.threadId}
+                `;
+              if (latestTurn !== null) {
+                yield* sql`
+                    INSERT INTO projection_turns (
+                      thread_id,
+                      turn_id,
+                      state,
+                      requested_at,
+                      started_at,
+                      completed_at,
+                      checkpoint_files_json
+                    )
+                    VALUES (
+                      ${row.threadId},
+                      ${latestTurn.turnId},
+                      ${latestTurn.state},
+                      ${latestTurn.requestedAt},
+                      ${latestTurn.startedAt},
+                      ${latestTurn.completedAt},
+                      ${"[]"}
+                    )
+                  `;
+              }
+              if (state.shell.session !== null) {
+                yield* sql`
+                    INSERT INTO projection_thread_sessions (
+                      thread_id,
+                      status,
+                      active_turn_id,
+                      updated_at
+                    )
+                    VALUES (
+                      ${row.threadId},
+                      ${state.shell.session.status},
+                      ${state.shell.session.activeTurnId},
+                      ${state.shell.session.updatedAt}
+                    )
+                  `;
+              }
+              yield* sql`
+                  INSERT INTO orchestration_events (
+                    sequence,
+                    event_id,
+                    aggregate_kind,
+                    stream_id,
+                    stream_version,
+                    event_type,
+                    occurred_at,
+                    actor_kind,
+                    payload_json,
+                    metadata_json
+                  )
+                  VALUES (
+                    ${10_000 + rowIndex},
+                    ${`terminal-backfill-delivered-${row.threadId}`},
+                    ${"thread"},
+                    ${row.parentThreadId},
+                    ${10_000 + rowIndex},
+                    ${"thread.message-sent"},
+                    ${now},
+                    ${"server"},
+                    ${`{"role":"system","text":"[sub-agent ${row.threadId} completed]"}`},
+                    ${"{}"}
+                  )
+                `;
+            }),
+          ),
+        );
+      }
+      await activeRuntime.runPromise(backfillPreexistingLocalSubagentTerminalDeliveries());
+    }
     if (input?.seedPromotedChildren) {
       for (const row of input.seedPromotedChildren) {
         await activeRuntime.runPromise(
@@ -1302,6 +1426,76 @@ describe("ChildThreadCoordinator", () => {
       ),
     ).toEqual([]);
   };
+
+  it("backfills a pre-existing terminal child and emits zero wakes across restarts", async () => {
+    const child = ThreadId.make("terminal-delivery-preexisting-backfill-child");
+    const parent = ThreadId.make("terminal-delivery-preexisting-backfill-parent");
+    const childTurn = TurnId.make("terminal-delivery-preexisting-backfill-turn");
+    const parentState = makeThreadState({
+      threadId: parent,
+      latestTurn: makeLatestTurn("completed", TurnId.make("preexisting-backfill-parent-turn")),
+      session: makeSession(parent, "ready"),
+    });
+    const childState = makeThreadState({
+      threadId: child,
+      parentThreadId: parent,
+      latestTurn: makeLatestTurn("completed", childTurn),
+      session: makeSession(child, "ready"),
+      assistantText: "completed before durable claims deployed",
+    });
+    const persistedEvents = [
+      turnStartRequestedEvent(child),
+      sessionSetEvent(child, "running", childTurn),
+      turnDiffEvent(child, "ready", childTurn),
+    ].map((event, index) => ({ ...event, sequence: index + 1 }));
+    const harnessInput = {
+      threads: [parentState, childState],
+      seedChildRows: [{ threadId: child, parentThreadId: parent }],
+      persistedEvents,
+    };
+
+    let harness = await createHarness({
+      ...harnessInput,
+      backfillPreexistingTerminalDeliveriesBeforeStart: true,
+    });
+    const [claim] = await harness.listTerminalDeliveries();
+    expect(claim).toMatchObject({
+      childThreadId: String(child),
+      parentThreadId: String(parent),
+      claimId: `migration:054:${child}`,
+      claimedSequence: 3,
+      terminalKind: "completed",
+    });
+
+    let wakeCount = harness.dispatched.filter(
+      (command) => command.type === "thread.turn.start" && command.threadId === parent,
+    ).length;
+    expect(await harness.listPendingDispatches()).toEqual([]);
+
+    const simulatedRestarts = 3;
+    for (let restart = 0; restart < simulatedRestarts; restart += 1) {
+      await disposeActiveHarness();
+      harness = await createHarness({
+        ...harnessInput,
+        seedTerminalDeliveries: [
+          {
+            childThreadId: child,
+            parentThreadId: parent,
+            claimId: claim!.claimId,
+            claimedAt: claim!.claimedAt,
+            claimedSequence: claim!.claimedSequence,
+            terminalKind: claim!.terminalKind,
+          },
+        ],
+      });
+      wakeCount += harness.dispatched.filter(
+        (command) => command.type === "thread.turn.start" && command.threadId === parent,
+      ).length;
+      expect(await harness.listPendingDispatches()).toEqual([]);
+    }
+
+    expect(wakeCount).toBe(0);
+  });
 
   for (const terminalKind of ["completed", "failed", "killed", "archived"] as const) {
     it(`delivers one ${terminalKind} parent wake across repeated restart replay`, async () => {

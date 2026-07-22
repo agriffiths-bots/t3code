@@ -65,6 +65,7 @@ import Migration0050 from "./Migrations/050_ProjectionProjectDataAudience.ts";
 import Migration0051 from "./Migrations/051_AuthAudienceCeilings.ts";
 import Migration0052 from "./Migrations/052_ProjectionTurnsEffectiveModel.ts";
 import Migration0053 from "./Migrations/053_LocalSubagentTerminalDeliveries.ts";
+import Migration0054 from "./Migrations/054_BackfillPreexistingLocalSubagentTerminalDeliveries.ts";
 
 /**
  * Migration loader with all migrations defined inline.
@@ -129,6 +130,7 @@ export const migrationEntries = [
   [51, "AuthAudienceCeilings", Migration0051],
   [52, "ProjectionTurnsEffectiveModel", Migration0052],
   [53, "LocalSubagentTerminalDeliveries", Migration0053],
+  [54, "BackfillPreexistingLocalSubagentTerminalDeliveries", Migration0054],
 ] as const;
 
 export const makeMigrationLoader = (throughId?: number) =>
