@@ -1570,6 +1570,12 @@ export type OrchestrationGetFullThreadDiffResult = typeof OrchestrationGetFullTh
 
 export const OrchestrationReplayEventsInput = Schema.Struct({
   fromSequenceExclusive: NonNegativeInt,
+  /**
+   * Opts into raw thread.settled/thread.unsettled events. Optional and false
+   * by default so older clients can replay across a mixed-version deployment
+   * without receiving OrchestrationEvent union variants they cannot decode.
+   */
+  supportsThreadSettlementEvents: Schema.optionalKey(Schema.Boolean),
 });
 export type OrchestrationReplayEventsInput = typeof OrchestrationReplayEventsInput.Type;
 

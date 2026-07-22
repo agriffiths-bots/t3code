@@ -283,6 +283,18 @@ export function isThreadDetailEvent(
   );
 }
 
+/** Mixed-version replay guard: settlement union variants are only exposed to
+ * clients that explicitly advertise their decoder support. */
+export function isReplayEventSupported(
+  event: OrchestrationEvent,
+  supportsThreadSettlementEvents = false,
+): boolean {
+  return (
+    supportsThreadSettlementEvents ||
+    (event.type !== "thread.settled" && event.type !== "thread.unsettled")
+  );
+}
+
 const PROVIDER_STATUS_DEBOUNCE_MS = 200;
 
 // When a resuming client's cursor is more than this many events behind the
@@ -1037,6 +1049,10 @@ const makeWsRpcLayer = (currentSession: EnvironmentAuth.AuthenticatedSession) =>
                       maximum: Number.MAX_SAFE_INTEGER,
                       minimum: 0,
                     }),
+                  ),
+                ).pipe(
+                  Stream.filter((event) =>
+                    isReplayEventSupported(event, input.supportsThreadSettlementEvents === true),
                   ),
                 ),
               );

@@ -1,7 +1,7 @@
 import { CommandId, EventId, ThreadId, type OrchestrationEvent } from "@t3tools/contracts";
 import { describe, expect, it } from "vite-plus/test";
 
-import { isThreadDetailEvent } from "./ws.ts";
+import { isReplayEventSupported, isThreadDetailEvent } from "./ws.ts";
 
 const threadId = ThreadId.make("thread-settlement-stream");
 const occurredAt = "2026-07-22T00:00:00.000Z";
@@ -37,5 +37,14 @@ describe("isThreadDetailEvent settlement lifecycle", () => {
     expect(isThreadDetailEvent(settlementEvent("thread.unsettled"))).toBe(false);
     expect(isThreadDetailEvent(settlementEvent("thread.settled"), true)).toBe(true);
     expect(isThreadDetailEvent(settlementEvent("thread.unsettled"), true)).toBe(true);
+  });
+});
+
+describe("isReplayEventSupported settlement lifecycle", () => {
+  it("requires explicit negotiation before replaying new settlement variants", () => {
+    expect(isReplayEventSupported(settlementEvent("thread.settled"))).toBe(false);
+    expect(isReplayEventSupported(settlementEvent("thread.unsettled"))).toBe(false);
+    expect(isReplayEventSupported(settlementEvent("thread.settled"), true)).toBe(true);
+    expect(isReplayEventSupported(settlementEvent("thread.unsettled"), true)).toBe(true);
   });
 });

@@ -17,6 +17,7 @@ import {
   ProjectCreatedPayload,
   ProjectMetaUpdatedPayload,
   OrchestrationProposedPlan,
+  OrchestrationReplayEventsInput,
   OrchestrationSession,
   OrchestrationThreadStreamItem,
   OrchestrationThread,
@@ -66,7 +67,23 @@ const decodeOrchestrationEvent = Schema.decodeUnknownEffect(OrchestrationEvent);
 const decodeOrchestrationThreadStreamItem = Schema.decodeUnknownEffect(
   OrchestrationThreadStreamItem,
 );
+const decodeReplayEventsInput = Schema.decodeUnknownEffect(OrchestrationReplayEventsInput);
 const decodeThreadMetaUpdatedPayload = Schema.decodeUnknownEffect(ThreadMetaUpdatedPayload);
+
+it.effect("keeps replay settlement-event negotiation optional for rolling upgrades", () =>
+  Effect.gen(function* () {
+    assert.deepStrictEqual(yield* decodeReplayEventsInput({ fromSequenceExclusive: 4 }), {
+      fromSequenceExclusive: 4,
+    });
+    assert.deepStrictEqual(
+      yield* decodeReplayEventsInput({
+        fromSequenceExclusive: 4,
+        supportsThreadSettlementEvents: true,
+      }),
+      { fromSequenceExclusive: 4, supportsThreadSettlementEvents: true },
+    );
+  }),
+);
 
 it.effect(
   "keeps project audience administration out of client and WebSocket dispatch schemas",
