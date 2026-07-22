@@ -238,9 +238,18 @@ const decideCommandSequence = Effect.fn("decideCommandSequence")(function* ({
 export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand")(function* ({
   command,
   readModel,
+  settlementContext,
 }: {
   readonly command: OrchestrationCommand;
   readonly readModel: OrchestrationReadModel;
+  /** Targeted, uncapped projection summary supplied by the production engine
+   * for thread.settle. Direct decider tests may omit it and exercise the
+   * event-derived fallback instead. */
+  readonly settlementContext?: {
+    readonly hasPendingApprovals: boolean;
+    readonly hasPendingUserInput: boolean;
+    readonly latestPromptMessageAt: string | null;
+  };
 }): Effect.fn.Return<
   DecideOrchestrationCommandResult,
   OrchestrationCommandInvariantError | PlatformError.PlatformError,
@@ -560,7 +569,10 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
       // Pending approval / user-input requests are blocked-on-you work: a
       // raced or stale client must not park them behind a settled override
       // that would surface only after the request resolves.
-      if (hasOpenBlockingRequest(thread)) {
+      const hasPendingInteraction = settlementContext
+        ? settlementContext.hasPendingApprovals || settlementContext.hasPendingUserInput
+        : hasOpenBlockingRequest(thread);
+      if (hasPendingInteraction) {
         return yield* Effect.fail(
           new OrchestrationCommandInvariantError({
             commandType: command.type,
@@ -580,13 +592,17 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
       // last prompt message postdates their turn timestamps (older-server
       // data, mid-turn messages) must stay settleable. A failed session
       // start (status "error") clears the block immediately.
-      const latestPromptMessageAtMs = thread.messages.reduce(
-        (latest, message) =>
-          isQueuedTurnPromptMessage(message)
-            ? Math.max(latest, Date.parse(message.createdAt))
-            : latest,
-        Number.NEGATIVE_INFINITY,
-      );
+      const latestPromptMessageAtMs = settlementContext
+        ? settlementContext.latestPromptMessageAt === null
+          ? Number.NEGATIVE_INFINITY
+          : Date.parse(settlementContext.latestPromptMessageAt)
+        : thread.messages.reduce(
+            (latest, message) =>
+              isQueuedTurnPromptMessage(message)
+                ? Math.max(latest, Date.parse(message.createdAt))
+                : latest,
+            Number.NEGATIVE_INFINITY,
+          );
       const latestTurnAtMs =
         thread.latestTurn === null
           ? Number.NEGATIVE_INFINITY

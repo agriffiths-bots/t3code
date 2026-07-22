@@ -85,9 +85,9 @@ export interface ThreadListV2Layout {
 
 /**
  * Partitions visible threads into the active card block (creation order) and
- * the settled recency tail, matching the web v2 list. `autoSettleAfterDays`
- * mirrors the web default of 3 — mobile has no client-settings sync yet, so
- * the default is fixed here rather than user-configurable.
+ * the settled recency tail, matching the web v2 list. Mobile has no
+ * client-settings sync yet, so inactivity settlement defaults off here just
+ * as it does in the shared web/desktop settings.
  */
 export function buildThreadListV2Items(input: {
   readonly threads: ReadonlyArray<EnvironmentThreadShell>;
@@ -103,14 +103,14 @@ export function buildThreadListV2Items(input: {
       other environments never classify as settled — the user could neither
       un-settle nor pin them. Absent = no gating (tests). */
   readonly settlementEnvironmentIds?: ReadonlySet<EnvironmentId>;
-  readonly autoSettleAfterDays?: number;
+  readonly autoSettleAfterDays?: number | null;
   /** Max settled rows to render; the rest are counted, not built. */
   readonly settledLimit?: number;
   /** Injectable for tests; defaults to now. */
   readonly now?: string;
 }): ThreadListV2Layout {
   const now = input.now ?? new Date().toISOString();
-  const autoSettleAfterDays = input.autoSettleAfterDays ?? 3;
+  const autoSettleAfterDays = input.autoSettleAfterDays ?? null;
   const query = input.searchQuery.trim().toLocaleLowerCase();
 
   const active: EnvironmentThreadShell[] = [];

@@ -9,6 +9,7 @@ import {
 import type { ScopedThreadRef } from "@t3tools/contracts";
 import {
   CheckIcon,
+  CalendarClockIcon,
   ChevronRightIcon,
   CircleCheckIcon,
   CircleDashedIcon,
@@ -67,6 +68,7 @@ import {
 import { useClientSettings } from "../hooks/useSettings";
 import { useEnvironments, usePrimaryEnvironmentId } from "../state/environments";
 import { useProjects, useThreadShells } from "../state/entities";
+import { useScheduledTasksAcrossEnvironments } from "../state/schedules";
 import { environmentServerConfigsAtom, primaryServerKeybindingsAtom } from "../state/server";
 import { vcsEnvironment } from "../state/vcs";
 import { threadEnvironment } from "../state/threads";
@@ -112,6 +114,31 @@ import { Tooltip, TooltipPopup, TooltipTrigger } from "./ui/tooltip";
 // stays behind an explicit Show more.
 const SETTLED_TAIL_INITIAL_COUNT = 10;
 const SETTLED_TAIL_PAGE_COUNT = 25;
+
+const SidebarV2PrStateReporter = memo(function SidebarV2PrStateReporter(props: {
+  thread: SidebarThreadSummary;
+  projectCwd: string | null;
+  onChangeRequestState: (threadKey: string, state: "open" | "closed" | "merged" | null) => void;
+}) {
+  const { onChangeRequestState, projectCwd, thread } = props;
+  const threadKey = scopedThreadKey(scopeThreadRef(thread.environmentId, thread.id));
+  const gitCwd = thread.worktreePath ?? projectCwd;
+  const gitStatus = useEnvironmentQuery(
+    thread.branch !== null && gitCwd !== null
+      ? vcsEnvironment.status({
+          environmentId: thread.environmentId,
+          input: { cwd: gitCwd },
+        })
+      : null,
+  );
+  const prState = resolveThreadPr(thread.branch, gitStatus.data)?.state ?? null;
+
+  useEffect(() => {
+    onChangeRequestState(threadKey, prState);
+  }, [onChangeRequestState, prState, threadKey]);
+
+  return null;
+});
 
 function compactSidebarTimeLabel(label: string): string {
   if (label === "just now") return "now";
@@ -163,8 +190,8 @@ const SidebarV2Row = memo(function SidebarV2Row(props: {
 }) {
   const {
     isRenaming,
-    onChangeRequestState,
     onCancelRename,
+    onChangeRequestState,
     onCommitRename,
     onContextMenu,
     onRenameTitleChange,
@@ -237,13 +264,10 @@ const SidebarV2Row = memo(function SidebarV2Row(props: {
   );
   const pr = resolveThreadPr(thread.branch, gitStatus.data);
   const prStatus = prStatusIndicator(pr, gitStatus.data?.sourceControlProvider);
-  // Report the PR state up: the parent partitions rows with effectiveSettled,
-  // and a merged/closed PR auto-settles a thread — data only rows have.
   const prState = pr?.state ?? null;
   useEffect(() => {
     onChangeRequestState(threadKey, prState);
   }, [onChangeRequestState, prState, threadKey]);
-
   const modelInstanceId = thread.session?.providerInstanceId ?? thread.modelSelection.instanceId;
   const driverKind = props.providerEntryByInstanceId.get(modelInstanceId)?.driverKind ?? null;
 
@@ -696,6 +720,11 @@ export default function SidebarV2() {
   const openAddProjectCommandPalette = useOpenAddProjectCommandPalette();
   const { environments } = useEnvironments();
   const primaryEnvironmentId = usePrimaryEnvironmentId();
+  const scheduledTasks = useScheduledTasksAcrossEnvironments();
+  const enabledScheduleCount = useMemo(
+    () => scheduledTasks.filter(({ task }) => task.enabled).length,
+    [scheduledTasks],
+  );
   const clearSelection = useThreadSelectionStore((s) => s.clearSelection);
   const setSelectionAnchor = useThreadSelectionStore((s) => s.setAnchor);
   const toggleThreadSelection = useThreadSelectionStore((s) => s.toggleThread);
@@ -768,8 +797,8 @@ export default function SidebarV2() {
     return () => window.clearInterval(id);
   }, []);
 
-  // PR states stream in per-row (rows own the VCS subscriptions); a merged or
-  // closed PR auto-settles its thread on the next partition.
+  // PR states stream independently of rendered rows so a collapsed child can
+  // still auto-settle after its change request closes or merges.
   const [changeRequestStateByKey, setChangeRequestStateByKey] = useState<
     ReadonlyMap<string, "open" | "closed" | "merged">
   >(() => new Map());
@@ -788,6 +817,11 @@ export default function SidebarV2() {
     },
     [],
   );
+
+  const handleScheduledClick = useCallback(() => {
+    if (isMobile) setOpenMobile(false);
+    void router.navigate({ to: "/scheduled" });
+  }, [isMobile, router, setOpenMobile]);
 
   // Project scope: chips above the list. Scoping filters the list AND
   // becomes the new-thread target — one visible control doing both jobs the
@@ -923,6 +957,23 @@ export default function SidebarV2() {
     () => [...expandedActiveRows, ...expandedSettledRows],
     [expandedActiveRows, expandedSettledRows],
   );
+  const prStateReporterThreads = useMemo(() => {
+    const renderedKeys = new Set(
+      orderedRows.map((row) =>
+        scopedThreadKey(scopeThreadRef(row.thread.environmentId, row.thread.id)),
+      ),
+    );
+    // Rendered rows already own the VCS subscription used by their PR icon.
+    // Add reporters only for descendants hidden by tree collapse in the
+    // current active partition or visible settled page. This preserves child
+    // auto-settlement without subscribing unrelated scopes or the deep tail.
+    return [...activeRows, ...visibleSettledRows]
+      .map((row) => row.thread)
+      .filter(
+        (thread) =>
+          !renderedKeys.has(scopedThreadKey(scopeThreadRef(thread.environmentId, thread.id))),
+      );
+  }, [activeRows, orderedRows, visibleSettledRows]);
   const orderedThreads = useMemo(() => orderedRows.map((row) => row.thread), [orderedRows]);
   const firstSettledTailThreadKey = expandedSettledRows[0]
     ? scopedThreadKey(
@@ -1156,10 +1207,21 @@ export default function SidebarV2() {
       );
       if (threadKeys.length === 0) return;
       const count = threadKeys.length;
+      const settleableThreadKeys = threadKeys.filter((threadKey) => {
+        const thread = threadByKeyRef.current.get(threadKey);
+        return (
+          thread !== undefined &&
+          thread.settledOverride !== "settled" &&
+          serverConfigs.get(thread.environmentId)?.environment.capabilities.threadSettlement ===
+            true
+        );
+      });
       const clicked = await settlePromise(() =>
         api.contextMenu.show(
           [
-            { id: "settle", label: `Settle (${count})` },
+            ...(settleableThreadKeys.length > 0
+              ? [{ id: "settle", label: `Settle (${settleableThreadKeys.length})` }]
+              : []),
             { id: "mark-unread", label: `Mark unread (${count})` },
             { id: "delete", label: `Delete (${count})`, destructive: true },
           ],
@@ -1172,10 +1234,10 @@ export default function SidebarV2() {
         // batch — they are all leaving the card block together. Rows that
         // are already explicitly settled are skipped: nothing to do on a
         // valid mixed selection.
-        const coSettlingKeys = new Set(threadKeys);
-        for (const threadKey of threadKeys) {
+        const coSettlingKeys = new Set(settleableThreadKeys);
+        for (const threadKey of settleableThreadKeys) {
           const thread = threadByKeyRef.current.get(threadKey);
-          if (!thread || thread.settledOverride === "settled") continue;
+          if (!thread) continue;
           attemptSettle(scopeThreadRef(thread.environmentId, thread.id), { coSettlingKeys });
         }
         clearSelection();
@@ -1236,6 +1298,7 @@ export default function SidebarV2() {
       deleteThread,
       markThreadUnread,
       removeFromSelection,
+      serverConfigs,
     ],
   );
 
@@ -1504,6 +1567,19 @@ export default function SidebarV2() {
 
   return (
     <>
+      {prStateReporterThreads.map((thread) => {
+        const projectCwd =
+          projectCwdByKey.get(`${thread.environmentId}:${thread.projectId}`) ?? null;
+        if (thread.branch === null || (thread.worktreePath ?? projectCwd) === null) return null;
+        return (
+          <SidebarV2PrStateReporter
+            key={`pr-state:${thread.environmentId}:${thread.id}`}
+            thread={thread}
+            projectCwd={projectCwd}
+            onChangeRequestState={handleChangeRequestState}
+          />
+        );
+      })}
       <SidebarChromeHeader isElectron={isElectron} />
       <SidebarContent className="gap-0">
         <SidebarGroup className="px-2 pb-2 pt-3">
@@ -1526,6 +1602,20 @@ export default function SidebarV2() {
                   </Kbd>
                 ) : null}
               </CommandDialogTrigger>
+            </SidebarMenuItem>
+            <SidebarMenuItem className="shrink-0">
+              <SidebarMenuButton
+                size="sm"
+                className="h-7 min-w-7 justify-center gap-1 border border-border bg-background/60 px-1.5 text-muted-foreground/70 hover:bg-accent hover:text-foreground"
+                onClick={handleScheduledClick}
+                aria-label="Scheduled tasks"
+                tooltip={{ children: "Scheduled tasks", side: "right" }}
+              >
+                <CalendarClockIcon className="size-3.5" />
+                {enabledScheduleCount > 0 ? (
+                  <span className="text-[10px] tabular-nums">{enabledScheduleCount}</span>
+                ) : null}
+              </SidebarMenuButton>
             </SidebarMenuItem>
             <SidebarMenuItem className="shrink-0">
               <SidebarMenuButton

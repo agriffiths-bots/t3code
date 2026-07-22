@@ -233,6 +233,40 @@ it.layer(NodeServices.layer)("settled thread decider", (it) => {
     }),
   );
 
+  it.effect("uses targeted projection settlement context instead of capped activity history", () =>
+    Effect.gen(function* () {
+      const pendingError = yield* decideOrchestrationCommand({
+        command: {
+          type: "thread.settle",
+          commandId: CommandId.make("cmd-settle-targeted-pending"),
+          threadId: ThreadId.make("thread-1"),
+        },
+        readModel: makeReadModel(null),
+        settlementContext: {
+          hasPendingApprovals: true,
+          hasPendingUserInput: false,
+          latestPromptMessageAt: null,
+        },
+      }).pipe(Effect.flip);
+      expect(pendingError._tag).toBe("OrchestrationCommandInvariantError");
+
+      const queuedError = yield* decideOrchestrationCommand({
+        command: {
+          type: "thread.settle",
+          commandId: CommandId.make("cmd-settle-targeted-queued"),
+          threadId: ThreadId.make("thread-1"),
+        },
+        readModel: makeReadModel(null),
+        settlementContext: {
+          hasPendingApprovals: false,
+          hasPendingUserInput: false,
+          latestPromptMessageAt: "1969-12-31T23:59:30.000Z",
+        },
+      }).pipe(Effect.flip);
+      expect(queuedError._tag).toBe("OrchestrationCommandInvariantError");
+    }),
+  );
+
   it.effect("clears an open request when its respond failure marks it stale", () =>
     Effect.gen(function* () {
       const activity = (

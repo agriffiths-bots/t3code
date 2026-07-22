@@ -172,9 +172,31 @@ const makeOrchestrationEngine = Effect.gen(function* () {
           yield* envelope.acceptanceGuard;
         }
 
+        // Settlement guards need the current prompt recency and uncapped
+        // pending-interaction counters. Read that narrow shell only for the
+        // target settle command; the global command model intentionally stays
+        // free of conversation/activity bodies for bootstrap and preflight.
+        const settlementContext =
+          command.type === "thread.settle"
+            ? Option.getOrUndefined(
+                yield* projectionSnapshotQuery.getThreadShellByIdIncludingArchived(
+                  command.threadId,
+                ),
+              )
+            : undefined;
+
         const eventBase = yield* decideOrchestrationCommand({
           command,
           readModel: commandReadModel,
+          ...(settlementContext === undefined
+            ? {}
+            : {
+                settlementContext: {
+                  hasPendingApprovals: settlementContext.hasPendingApprovals,
+                  hasPendingUserInput: settlementContext.hasPendingUserInput,
+                  latestPromptMessageAt: settlementContext.latestUserMessageAt,
+                },
+              }),
         }).pipe(
           Effect.provideService(Crypto.Crypto, crypto),
           Effect.mapError((cause) =>

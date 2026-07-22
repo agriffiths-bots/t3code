@@ -202,6 +202,25 @@ describe("buildThreadListV2Items", () => {
 });
 
 describe("buildThreadListV2Items settled paging", () => {
+  it("does not auto-settle inactive threads when no mobile threshold is configured", () => {
+    const inactive = makeThread({
+      id: ThreadId.make("inactive"),
+      title: "Inactive but open",
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+    });
+
+    const layout = buildThreadListV2Items({
+      threads: [inactive],
+      environmentId: null,
+      searchQuery: "",
+      now: NOW,
+    });
+
+    expect(layout.items).toHaveLength(1);
+    expect(layout.items[0]?.variant).toBe("card");
+  });
+
   it("caps the settled tail at settledLimit and reports the hidden count", () => {
     const threads = [
       makeThread({ id: ThreadId.make("active"), title: "Active" }),

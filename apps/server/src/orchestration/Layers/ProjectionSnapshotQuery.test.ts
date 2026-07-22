@@ -1775,8 +1775,8 @@ projectionSnapshotLayer("ProjectionSnapshotQuery", (it) => {
           NULL,
           NULL,
           NULL,
-          NULL,
-          0,
+          '2026-04-06T00:00:03.000Z',
+          1,
           0,
           0,
           '2026-04-06T00:00:02.000Z',
@@ -1858,21 +1858,28 @@ projectionSnapshotLayer("ProjectionSnapshotQuery", (it) => {
       assert.equal(shellSnapshot.threads[0]?.settledOverride, "settled");
       assert.equal(shellSnapshot.threads[0]?.settledAt, "2026-04-06T00:00:04.000Z");
 
-      // And the full command read model carries them too.
+      // The global command model carries lifecycle metadata but deliberately
+      // does not hydrate conversation/activity bodies.
       const readModel = yield* snapshotQuery.getCommandReadModel();
       const thread = readModel.threads.find(
         (candidate) => candidate.id === ThreadId.make("thread-settled"),
       );
       assert.equal(thread?.settledOverride, "settled");
       assert.equal(thread?.settledAt, "2026-04-06T00:00:04.000Z");
-      assert.deepEqual(
-        thread?.messages.map((message) => [message.role, message.text]),
-        [["user", "Queued before restart"]],
+      assert.deepEqual(thread?.messages, []);
+      assert.deepEqual(thread?.activities, []);
+
+      // Settle-time guards use the narrow shell query: it retains prompt
+      // recency and uncapped projection counters without loading either body.
+      const settleShell = yield* snapshotQuery.getThreadShellByIdIncludingArchived(
+        ThreadId.make("thread-settled"),
       );
-      assert.deepEqual(
-        thread?.activities.map((activity) => [activity.kind, activity.payload]),
-        [["approval.requested", { requestId: "request-before-restart" }]],
-      );
+      assert.equal(settleShell._tag, "Some");
+      if (settleShell._tag === "Some") {
+        assert.equal(settleShell.value.latestUserMessageAt, "2026-04-06T00:00:03.000Z");
+        assert.equal(settleShell.value.hasPendingApprovals, true);
+        assert.equal(settleShell.value.hasPendingUserInput, false);
+      }
     }),
   );
 
