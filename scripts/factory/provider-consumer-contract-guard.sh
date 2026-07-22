@@ -23,7 +23,7 @@ if [ "$MODE" = "--staged" ]; then
         break
         ;;
     esac
-  done < <(git diff --cached --name-only)
+  done < <(git diff --cached --name-only --no-renames)
   [ "$relevant" -eq 1 ] || exit 0
 fi
 
