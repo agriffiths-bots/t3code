@@ -43,6 +43,7 @@ import { ProjectionSnapshotQuery } from "../Services/ProjectionSnapshotQuery.ts"
 import { WorktreeLifecycleCoordinator } from "../Services/WorktreeLifecycleCoordinator.ts";
 import { readDetailedReadModel } from "../testUtils/readModel.ts";
 import { ServerConfig } from "../../config.ts";
+import { OrchestrationCommandAcceptanceDeferredError } from "../Errors.ts";
 
 import {
   sessionDispatchAuthority,
@@ -411,6 +412,116 @@ describe("OrchestrationEngine", () => {
       2,
     );
     expect(events.map((event) => event.type)).toEqual([
+      "project.created",
+      "thread.created",
+      "thread.message-sent",
+      "thread.turn-start-requested",
+    ]);
+    await system.dispose();
+  });
+
+  it("does not receipt a deferred acceptance guard failure", async () => {
+    const createdAt = now();
+    const system = await createOrchestrationSystem();
+    const { commandReceiptRepository, engine } = system;
+    const projectId = asProjectId("project-acceptance-guard");
+    const threadId = ThreadId.make("thread-acceptance-guard");
+    const modelSelection = {
+      instanceId: ProviderInstanceId.make("codex"),
+      model: "gpt-5-codex",
+    } as const;
+
+    await system.run(
+      engine.dispatch(
+        {
+          type: "project.create",
+          commandId: CommandId.make("cmd-acceptance-guard-project-create"),
+          projectId,
+          title: "Acceptance guard project",
+          workspaceRoot: "/tmp/project-acceptance-guard",
+          defaultModelSelection: modelSelection,
+          createdAt,
+        },
+        testDispatchAuthority,
+      ),
+    );
+    await system.run(
+      engine.dispatch(
+        {
+          type: "thread.create",
+          commandId: CommandId.make("cmd-acceptance-guard-thread-create"),
+          threadId,
+          projectId,
+          title: "Acceptance guard thread",
+          modelSelection,
+          interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+          runtimeMode: "approval-required",
+          branch: null,
+          worktreePath: null,
+          createdAt,
+        },
+        testDispatchAuthority,
+      ),
+    );
+
+    const guardedTurnStart = {
+      type: "thread.turn.start",
+      commandId: CommandId.make("cmd-acceptance-guard-turn-start"),
+      threadId,
+      message: {
+        messageId: asMessageId("message-acceptance-guard"),
+        role: "system",
+        text: "append after the guard clears",
+        attachments: [],
+      },
+      interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+      runtimeMode: "approval-required",
+      createdAt,
+    } as const;
+    let guardRuns = 0;
+    await expect(
+      system.run(
+        engine.dispatch(
+          guardedTurnStart,
+          testDispatchAuthority,
+          Effect.gen(function* () {
+            guardRuns += 1;
+            return yield* new OrchestrationCommandAcceptanceDeferredError({
+              commandType: "thread.turn.start",
+              detail: "acceptance guard deferred test command",
+            });
+          }),
+        ),
+      ),
+    ).rejects.toThrow("acceptance guard deferred test command");
+
+    const deferredEvents = await system.run(
+      Stream.runCollect(engine.readEvents(0)).pipe(
+        Effect.map((chunk): OrchestrationEvent[] => Array.from(chunk)),
+      ),
+    );
+    expect(guardRuns).toBe(1);
+    expect(deferredEvents.map((event) => event.type)).toEqual([
+      "project.created",
+      "thread.created",
+    ]);
+    expect(
+      Option.isNone(
+        await system.run(
+          commandReceiptRepository.getByCommandId({
+            commandId: guardedTurnStart.commandId,
+          }),
+        ),
+      ),
+    ).toBe(true);
+
+    await system.run(engine.dispatch(guardedTurnStart, testDispatchAuthority));
+    const retriedEvents = await system.run(
+      Stream.runCollect(engine.readEvents(0)).pipe(
+        Effect.map((chunk): OrchestrationEvent[] => Array.from(chunk)),
+      ),
+    );
+    expect(retriedEvents.map((event) => event.type)).toEqual([
       "project.created",
       "thread.created",
       "thread.message-sent",

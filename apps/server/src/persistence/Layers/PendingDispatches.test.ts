@@ -43,6 +43,7 @@ layer("PendingDispatchRepository", (it) => {
           id: PendingDispatchId.make("rt-inject-a"),
           targetThreadId: parent,
           sourceChildId: child,
+          sourceTerminalSequence: 42,
           createdAt: "2026-06-17T09:00:00.000Z",
         }),
       );
@@ -75,6 +76,7 @@ layer("PendingDispatchRepository", (it) => {
       );
       assert.equal(injections[0]?.text, "child completed");
       assert.equal(injections[0]?.sourceChildId, child);
+      assert.equal(injections[0]?.sourceTerminalSequence, 42);
 
       const steers = yield* repository.listByTarget({
         kind: "child_steer",

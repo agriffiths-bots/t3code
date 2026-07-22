@@ -64,6 +64,7 @@ import Migration0049 from "./Migrations/049_OrchestrationThreadRevisionCoveringI
 import Migration0050 from "./Migrations/050_ProjectionProjectDataAudience.ts";
 import Migration0051 from "./Migrations/051_AuthAudienceCeilings.ts";
 import Migration0052 from "./Migrations/052_ProjectionTurnsEffectiveModel.ts";
+import Migration0053 from "./Migrations/053_LocalSubagentTerminalDeliveries.ts";
 
 /**
  * Migration loader with all migrations defined inline.
@@ -127,6 +128,7 @@ export const migrationEntries = [
   [50, "ProjectionProjectDataAudience", Migration0050],
   [51, "AuthAudienceCeilings", Migration0051],
   [52, "ProjectionTurnsEffectiveModel", Migration0052],
+  [53, "LocalSubagentTerminalDeliveries", Migration0053],
 ] as const;
 
 export const makeMigrationLoader = (throughId?: number) =>

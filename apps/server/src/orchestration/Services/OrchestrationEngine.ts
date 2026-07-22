@@ -20,6 +20,16 @@ import type { OrchestrationCommandDispatchAuthority } from "../commandAudienceGu
 import type { OrchestrationEventStoreError } from "../../persistence/Errors.ts";
 
 /**
+ * Trusted in-process condition evaluated when a command reaches the head of
+ * the engine's serialized queue. Transport callers cannot provide one.
+ */
+export type OrchestrationCommandAcceptanceGuard = Effect.Effect<
+  void,
+  OrchestrationDispatchError,
+  never
+>;
+
+/**
  * OrchestrationEngineShape - Service API for orchestration command and event flow.
  */
 export interface OrchestrationEngineShape {
@@ -50,6 +60,7 @@ export interface OrchestrationEngineShape {
   readonly dispatch: (
     command: OrchestrationCommand,
     authority: OrchestrationCommandDispatchAuthority,
+    acceptanceGuard?: OrchestrationCommandAcceptanceGuard,
   ) => Effect.Effect<{ sequence: number }, OrchestrationDispatchError, never>;
 
   /**
@@ -59,6 +70,7 @@ export interface OrchestrationEngineShape {
   readonly dispatchCoordinated?: (
     command: OrchestrationCommand,
     authority: OrchestrationCommandDispatchAuthority,
+    acceptanceGuard?: OrchestrationCommandAcceptanceGuard,
   ) => Effect.Effect<{ sequence: number }, OrchestrationDispatchError, never>;
 
   /**
@@ -96,4 +108,10 @@ export const dispatchAlreadyCoordinated = (
   engine: OrchestrationEngineShape,
   command: OrchestrationCommand,
   authority: OrchestrationCommandDispatchAuthority,
-) => (engine.dispatchCoordinated ?? engine.dispatch)(command, authority);
+  acceptanceGuard?: OrchestrationCommandAcceptanceGuard,
+) => {
+  const dispatch = engine.dispatchCoordinated ?? engine.dispatch;
+  return acceptanceGuard === undefined
+    ? dispatch(command, authority)
+    : dispatch(command, authority, acceptanceGuard);
+};
