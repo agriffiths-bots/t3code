@@ -1,5 +1,10 @@
 import * as NodeServices from "@effect/platform-node/NodeServices";
-import { ASSET_SAME_ORIGIN_RELAY_V1_CAPABILITY, AuthSessionId, ThreadId } from "@t3tools/contracts";
+import {
+  ASSET_SAME_ORIGIN_RELAY_V1_CAPABILITY,
+  AuthSessionId,
+  EnvironmentId,
+  ThreadId,
+} from "@t3tools/contracts";
 import { PROJECT_FAVICON_FALLBACK_MARKER } from "@t3tools/shared/projectFavicon";
 import { describe, expect, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
@@ -11,17 +16,21 @@ import * as PlatformError from "effect/PlatformError";
 import * as ServerSecretStore from "../auth/ServerSecretStore.ts";
 import * as SessionStore from "../auth/SessionStore.ts";
 import * as ServerConfig from "../config.ts";
+import * as ServerEnvironment from "../environment/ServerEnvironment.ts";
 import * as ProjectFaviconResolver from "../project/ProjectFaviconResolver.ts";
 import * as WorkspacePaths from "../workspace/WorkspacePaths.ts";
 import {
   ASSET_ROUTE_PREFIX,
   ASSET_SURFACE_RELAY_PREFIX,
+  decodeAssetRelayRoutingClaim,
   issueAssetUrl as issueAssetUrlImpl,
   resolveAsset as resolveAssetImpl,
+  resolveLocalAssetRelay,
 } from "./AssetAccess.ts";
 
 const TEST_SURFACE_SESSION_ID = AuthSessionId.make("asset-access-test-surface");
 const OTHER_SURFACE_SESSION_ID = AuthSessionId.make("asset-access-other-surface");
+const TEST_ENVIRONMENT_ID = EnvironmentId.make("asset-access-environment");
 
 const assetRouteSuffix = (relativeUrl: string) => {
   const prefix = relativeUrl.startsWith(`${ASSET_SURFACE_RELAY_PREFIX}/`)
@@ -54,6 +63,10 @@ const testLayer = Layer.mergeAll(
   Layer.mock(SessionStore.SessionStore)({
     cookieName: "t3_asset_access_test",
     isActive: () => Effect.succeed(true),
+  }),
+  Layer.mock(ServerEnvironment.ServerEnvironment)({
+    getEnvironmentId: Effect.succeed(TEST_ENVIRONMENT_ID),
+    getDescriptor: Effect.die("unused test environment descriptor"),
   }),
 ).pipe(Layer.provideMerge(NodeServices.layer));
 
@@ -228,18 +241,38 @@ describe("AssetAccess", () => {
       const separatorIndex = suffix.indexOf("/");
       const token = suffix.slice(0, separatorIndex);
 
+      expect(decodeAssetRelayRoutingClaim(token)).toMatchObject({
+        issuingAudience: "private",
+        issuingBackendId: TEST_ENVIRONMENT_ID,
+      });
       expect(yield* resolveAsset(token, "ignored.png")).toEqual({
         kind: "file",
         path: attachmentPath,
       });
       expect(yield* resolveAsset(token, "ignored.png", OTHER_SURFACE_SESSION_ID)).toBeNull();
       expect(yield* resolveAssetImpl(token, "ignored.png")).toBeNull();
+      expect(
+        yield* resolveLocalAssetRelay({
+          token,
+          relativePath: "ignored.png",
+          viewerSessionId: OTHER_SURFACE_SESSION_ID,
+          viewerAudienceCeiling: "private",
+        }),
+      ).toEqual({ kind: "file", path: attachmentPath });
+      expect(
+        yield* resolveLocalAssetRelay({
+          token,
+          relativePath: "ignored.png",
+          viewerSessionId: OTHER_SURFACE_SESSION_ID,
+          viewerAudienceCeiling: "factory",
+        }),
+      ).toBeNull();
       expect(result.relativeUrl).not.toContain(TEST_SURFACE_SESSION_ID);
       expect(result.relativeUrl).not.toContain(result.surfaceCredential);
     }).pipe(Effect.provide(testLayer)),
   );
 
-  it.effect("preserves signed direct URLs for clients without surface credentials", () =>
+  it.effect("requires relay capability from old clients before issuing private URLs", () =>
     Effect.gen(function* () {
       const config = yield* ServerConfig.ServerConfig;
       const fileSystem = yield* FileSystem.FileSystem;
@@ -251,24 +284,16 @@ describe("AssetAccess", () => {
         new Uint8Array([1, 2, 3]),
       );
 
-      const result = yield* issueAssetUrlImpl({
+      const error = yield* issueAssetUrlImpl({
         resource: { _tag: "attachment", attachmentId },
         surfaceSessionId: TEST_SURFACE_SESSION_ID,
-      });
-      const suffix = assetRouteSuffix(result.relativeUrl);
-      const separatorIndex = suffix.indexOf("/");
-      const token = suffix.slice(0, separatorIndex);
+      }).pipe(Effect.flip);
 
-      expect(result).toEqual({
-        relativeUrl: expect.stringMatching(/^\/api\/assets\/(?!relay\/)/),
-        expiresAt: expect.any(Number),
+      expect(error).toMatchObject({
+        _tag: "AssetClientUpgradeRequiredError",
+        requiredCapability: ASSET_SAME_ORIGIN_RELAY_V1_CAPABILITY,
+        resource: { _tag: "attachment", attachmentId },
       });
-      expect(yield* resolveAssetImpl(token, "ignored.png")).toBeNull();
-      expect(
-        yield* resolveAssetImpl(token, "ignored.png", {
-          allowUnbound: true,
-        }),
-      ).toEqual({ kind: "file", path: path.join(config.attachmentsDir, `${attachmentId}.png`) });
     }).pipe(Effect.provide(testLayer)),
   );
 

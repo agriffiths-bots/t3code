@@ -2,7 +2,7 @@ import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 import * as SchemaGetter from "effect/SchemaGetter";
 
-import { AuthSessionId, TrimmedNonEmptyString } from "./baseSchemas.ts";
+import { AuthSessionId, EnvironmentId, TrimmedNonEmptyString } from "./baseSchemas.ts";
 import { DataAudience, type DataAudience as DataAudienceType } from "./orchestration.ts";
 
 const ASSET_SESSION_BINDING_ID_MAX_LENGTH = 256;
@@ -22,6 +22,24 @@ const AssetClaimDataAudience = Schema.optionalKey(DataAudience).pipe(
   }),
 );
 
+// Relay routing fields were added after the initial audience-bound claim. Old
+// claims remain decodable, but default to the strictest audience and the local
+// backend so they can never acquire cross-backend authority during upgrade.
+const AssetClaimIssuingAudience = Schema.optionalKey(DataAudience).pipe(
+  Schema.decodeTo(Schema.toType(DataAudience), {
+    decode: SchemaGetter.withDefault(Effect.succeed<DataAudienceType>("private")),
+    encode: SchemaGetter.required(),
+  }),
+);
+
+const NullableAssetIssuingBackendId = Schema.NullOr(EnvironmentId);
+const AssetClaimIssuingBackendId = Schema.optionalKey(NullableAssetIssuingBackendId).pipe(
+  Schema.decodeTo(Schema.toType(NullableAssetIssuingBackendId), {
+    decode: SchemaGetter.withDefault(Effect.succeed<EnvironmentId | null>(null)),
+    encode: SchemaGetter.required(),
+  }),
+);
+
 const NullableAssetSessionBindingId = Schema.NullOr(AssetSessionBindingId);
 const AssetClaimSessionBindingId = Schema.optionalKey(NullableAssetSessionBindingId).pipe(
   Schema.decodeTo(Schema.toType(NullableAssetSessionBindingId), {
@@ -32,6 +50,8 @@ const AssetClaimSessionBindingId = Schema.optionalKey(NullableAssetSessionBindin
 
 const AudienceBoundAssetClaimFields = {
   dataAudience: AssetClaimDataAudience,
+  issuingAudience: AssetClaimIssuingAudience,
+  issuingBackendId: AssetClaimIssuingBackendId,
   surfaceBindingId: AssetClaimSessionBindingId,
 };
 
