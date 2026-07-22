@@ -7,6 +7,7 @@ import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/
 import { HostProcessPlatform } from "@t3tools/shared/hostProcess";
 
 import {
+  ASSET_SAME_ORIGIN_RELAY_V1_CAPABILITY,
   AuthAccessTokenType,
   AuthEnvironmentBootstrapTokenType,
   AuthTokenExchangeGrantType,
@@ -128,7 +129,6 @@ import * as GitWorkflowService from "./git/GitWorkflowService.ts";
 import * as ReviewService from "./review/ReviewService.ts";
 import * as SourceControlRepositoryService from "./sourceControl/SourceControlRepositoryService.ts";
 import * as ServerSecretStore from "./auth/ServerSecretStore.ts";
-import * as AssetAccess from "./assets/AssetAccess.ts";
 import * as EnvironmentAuth from "./auth/EnvironmentAuth.ts";
 import * as CloudManagedEndpointRuntime from "./cloud/ManagedEndpointRuntime.ts";
 import * as CloudCliTokenManager from "./cloud/CliTokenManager.ts";
@@ -1912,16 +1912,6 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
         path.join(config.attachmentsDir, `${attachmentId}.bin`),
         sentinel("assets"),
       );
-      const configLayer = ServerConfig.layer(config);
-      const assetSetupLayer = Layer.mergeAll(
-        configLayer,
-        ServerSecretStore.layer.pipe(Layer.provide(configLayer)),
-        WorkspacePaths.layer,
-        ProjectFaviconResolver.layer.pipe(Layer.provide(WorkspacePaths.layer)),
-      ).pipe(Layer.provideMerge(NodeServices.layer));
-      const issuedAssetUrl = yield* AssetAccess.issueAssetUrl({
-        resource: { _tag: "attachment", attachmentId },
-      }).pipe(Effect.provide(assetSetupLayer));
       const issuedMcpPeerToken = yield* McpSessionRegistry.issueActiveMcpPeerCredential({
         sourceEnvironmentId: EnvironmentId.make("environment-security-source"),
       });
@@ -1931,7 +1921,7 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
       }
 
       const ownerCookie = yield* getAuthenticatedSessionCookieHeader();
-      const wsUrl = yield* getWsServerUrl("/ws");
+      const wsUrl = appendSessionCookieToWsUrl(yield* getWsServerUrl("/ws"), ownerCookie);
       const authenticatedGet = (pathname: string) =>
         Effect.gen(function* () {
           const response = yield* fetchEffect(yield* getHttpServerUrl(pathname), {
@@ -1945,6 +1935,12 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
         });
       const rpc = <A, E, R>(f: (client: WsRpcClient) => Effect.Effect<A, E, R>) =>
         Effect.scoped(withWsRpcClient(wsUrl, f));
+      const issuedAssetUrl = yield* rpc((client) =>
+        client[WS_METHODS.assetsCreateUrl]({
+          resource: { _tag: "attachment", attachmentId },
+          capabilities: [ASSET_SAME_ORIGIN_RELAY_V1_CAPABILITY],
+        }),
+      );
 
       const processProbe = Effect.gen(function* () {
         const isolation = yield* WorkerProcessIsolation.WorkerProcessIsolation;
@@ -2176,6 +2172,7 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
             rpc((client) =>
               client[WS_METHODS.assetsCreateUrl]({
                 resource: { _tag: "attachment", attachmentId },
+                capabilities: [ASSET_SAME_ORIGIN_RELAY_V1_CAPABILITY],
               }).pipe(Effect.map(encodeSecurityObservation)),
             ),
             attachmentId,
@@ -2185,6 +2182,7 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
             Effect.gen(function* () {
               const response = yield* fetchEffect(
                 yield* getHttpServerUrl(issuedAssetUrl.relativeUrl),
+                { headers: { cookie: ownerCookie } },
               );
               if (response.status === 401 || response.status === 403) {
                 return yield* new SecurityProbeDenied({ source: "http" });
@@ -2377,6 +2375,113 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
           ),
         ),
       );
+    }).pipe(Effect.provide(NodeHttpServer.layerTest), TestClock.withLive),
+  );
+
+  it.effect("binds private asset URLs to the issuing same-surface session", () =>
+    Effect.gen(function* () {
+      const fileSystem = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const config = yield* buildAppUnderTest();
+      const attachmentId = "asset-session-binding-integration";
+      yield* fileSystem.makeDirectory(config.attachmentsDir, { recursive: true });
+      yield* fileSystem.writeFileString(
+        path.join(config.attachmentsDir, `${attachmentId}.bin`),
+        "same-surface-private-asset",
+      );
+
+      const issuerCookie = yield* getAuthenticatedSessionCookieHeader();
+      const otherCookie = yield* getAuthenticatedSessionCookieHeader();
+      assert.notEqual(issuerCookie, otherCookie);
+      const wsUrl = appendSessionCookieToWsUrl(
+        yield* getWsServerUrl("/ws", { authenticated: false }),
+        issuerCookie,
+      );
+      const rpc = <A, E, R>(f: (client: WsRpcClient) => Effect.Effect<A, E, R>) =>
+        Effect.scoped(withWsRpcClient(wsUrl, f));
+
+      const legacyIssued = yield* rpc((client) =>
+        client[WS_METHODS.assetsCreateUrl]({
+          resource: { _tag: "attachment", attachmentId },
+        }),
+      );
+      assert.include(legacyIssued.relativeUrl, "/api/assets/");
+      assert.notInclude(legacyIssued.relativeUrl, "/api/assets/relay/");
+      assert.notProperty(legacyIssued, "surfaceCredential");
+      const legacyResponse = yield* fetchEffect(yield* getHttpServerUrl(legacyIssued.relativeUrl));
+      assert.equal(legacyResponse.status, 200);
+      assert.equal(yield* legacyResponse.text, "same-surface-private-asset");
+
+      const issued = yield* rpc((client) =>
+        client[WS_METHODS.assetsCreateUrl]({
+          resource: { _tag: "attachment", attachmentId },
+          capabilities: [ASSET_SAME_ORIGIN_RELAY_V1_CAPABILITY],
+        }),
+      );
+      assert.include(issued.relativeUrl, "/api/assets/relay/");
+      assert.isString(issued.surfaceCredential);
+      assert.notInclude(issued.relativeUrl, issued.surfaceCredential ?? "surface-credential");
+
+      const assetUrl = yield* getHttpServerUrl(issued.relativeUrl);
+      const unboundResponse = yield* fetchEffect(assetUrl);
+      assert.equal(unboundResponse.status, 404);
+      const crossSurfaceResponse = yield* fetchEffect(assetUrl, {
+        headers: { cookie: otherCookie },
+      });
+      assert.equal(crossSurfaceResponse.status, 404);
+      const sameSurfaceResponse = yield* fetchEffect(assetUrl, {
+        headers: { cookie: issuerCookie },
+      });
+      assert.equal(sameSurfaceResponse.status, 200);
+      assert.equal(sameSurfaceResponse.headers["cache-control"], "no-store");
+      assert.equal(yield* sameSurfaceResponse.text, "same-surface-private-asset");
+
+      const nativeResponse = yield* fetchEffect(assetUrl, {
+        headers: { "x-t3-asset-surface": issued.surfaceCredential ?? "" },
+      });
+      assert.equal(nativeResponse.status, 200);
+      assert.equal(yield* nativeResponse.text, "same-surface-private-asset");
+
+      for (const origin of ["null", "not an origin"]) {
+        const nonHttpsBindingResponse = yield* fetchEffect(
+          yield* getHttpServerUrl("/api/assets/relay/surface"),
+          {
+            method: "POST",
+            redirect: "manual",
+            headers: { "content-type": "application/json", origin },
+            body: jsonRequestBody({
+              credential: issued.surfaceCredential,
+              redirect: issued.relativeUrl,
+            }),
+          },
+        );
+        assert.equal(nonHttpsBindingResponse.status, 303);
+        assert.equal(nonHttpsBindingResponse.headers.location, issued.relativeUrl);
+        const nonHttpsSurfaceCookie = nonHttpsBindingResponse.headers["set-cookie"];
+        assert.isString(nonHttpsSurfaceCookie);
+        assert.notInclude(nonHttpsSurfaceCookie ?? "", "Secure");
+      }
+
+      const bindingResponse = yield* fetchEffect(
+        yield* getHttpServerUrl("/api/assets/relay/surface"),
+        {
+          method: "POST",
+          redirect: "manual",
+          headers: { "content-type": "application/json" },
+          body: jsonRequestBody({
+            credential: issued.surfaceCredential,
+            redirect: issued.relativeUrl,
+          }),
+        },
+      );
+      assert.equal(bindingResponse.status, 303);
+      assert.equal(bindingResponse.headers.location, issued.relativeUrl);
+      const surfaceCookie = bindingResponse.headers["set-cookie"];
+      assert.isString(surfaceCookie);
+      assert.include(surfaceCookie ?? "", "HttpOnly");
+      assert.include(surfaceCookie ?? "", "SameSite=Lax");
+      assert.include(surfaceCookie ?? "", "Path=/api/assets/relay");
+      assert.notInclude((surfaceCookie ?? "").toLowerCase(), "domain=");
     }).pipe(Effect.provide(NodeHttpServer.layerTest), TestClock.withLive),
   );
 

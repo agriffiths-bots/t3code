@@ -40,6 +40,7 @@ import { SourceFileSurface } from "./SourceFileSurface";
 import { ThreadFileNavigatorPane } from "./thread-file-navigator-pane";
 import { WorkspaceFileImagePreview } from "./WorkspaceFileImagePreview";
 import { WorkspaceFileWebPreview } from "./WorkspaceFileWebPreview";
+import type { AssetRequestSource } from "../../state/assets";
 import {
   basename,
   isBrowserPreviewFile,
@@ -83,7 +84,7 @@ function defaultViewMode(path: string | null): FileViewMode {
 
 function FileContent(props: {
   readonly activeMode: FileViewMode;
-  readonly previewUri: string | null;
+  readonly previewSource: AssetRequestSource | null;
   readonly fileContents: string | null;
   readonly fileError: string | null;
   readonly relativePath: string;
@@ -97,18 +98,18 @@ function FileContent(props: {
 
   if (props.activeMode === "preview" && isImageFile) {
     if (isSvgImagePreviewFile(props.relativePath)) {
-      return <WorkspaceFileWebPreview uri={props.previewUri} />;
+      return <WorkspaceFileWebPreview source={props.previewSource} />;
     }
     return (
       <WorkspaceFileImagePreview
         accessibilityLabel={basename(props.relativePath)}
-        uri={props.previewUri}
+        source={props.previewSource}
       />
     );
   }
 
   if (props.activeMode === "preview" && isBrowserFile) {
-    return <WorkspaceFileWebPreview uri={props.previewUri} />;
+    return <WorkspaceFileWebPreview source={props.previewSource} />;
   }
 
   if (props.fileError && props.fileContents === null) {
@@ -482,16 +483,19 @@ export function ThreadFileScreen(props: ThreadFileRouteScreenProps) {
       : defaultViewMode(relativePath);
   const resolvedActiveMode = canPreview ? activeMode : "source";
   const assetPreviewPath = isBrowserFile || isImageFile ? relativePath : null;
-  const assetPreviewUri = useWorkspaceFileAssetUrl({
+  const assetPreviewSource = useWorkspaceFileAssetUrl({
     cwd,
     environmentId,
     relativePath: assetPreviewPath,
     threadId,
   });
-  const previewUri =
-    assetPreviewUri === null || previewRevision === 0
-      ? assetPreviewUri
-      : `${assetPreviewUri}${assetPreviewUri.includes("?") ? "&" : "?"}revision=${previewRevision}`;
+  const previewSource =
+    assetPreviewSource === null || previewRevision === 0
+      ? assetPreviewSource
+      : {
+          ...assetPreviewSource,
+          uri: `${assetPreviewSource.uri}${assetPreviewSource.uri.includes("?") ? "&" : "?"}revision=${previewRevision}`,
+        };
   const needsFileContents =
     relativePath !== null &&
     (resolvedActiveMode === "source" || isMarkdownPreviewFile(relativePath));
@@ -629,11 +633,13 @@ export function ThreadFileScreen(props: ThreadFileRouteScreenProps) {
             >
               Copy path
             </NativeHeaderToolbar.MenuAction>
-            {isBrowserFile && typeof assetPreviewUri === "string" ? (
+            {isBrowserFile &&
+            assetPreviewSource !== null &&
+            assetPreviewSource.headers === undefined ? (
               <NativeHeaderToolbar.MenuAction
                 icon="safari"
                 onPress={() => {
-                  void tryOpenExternalUrl(assetPreviewUri, "file-preview");
+                  void tryOpenExternalUrl(assetPreviewSource.uri, "file-preview");
                 }}
               >
                 Open in Safari
@@ -653,7 +659,7 @@ export function ThreadFileScreen(props: ThreadFileRouteScreenProps) {
         </NativeHeaderToolbar>
         <FileContent
           activeMode={resolvedActiveMode}
-          previewUri={previewUri}
+          previewSource={previewSource}
           fileContents={fileData?.contents ?? null}
           fileError={fileQuery.error}
           initialLine={targetLine}

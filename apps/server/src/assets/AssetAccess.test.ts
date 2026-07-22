@@ -1,5 +1,5 @@
 import * as NodeServices from "@effect/platform-node/NodeServices";
-import { ThreadId } from "@t3tools/contracts";
+import { ASSET_SAME_ORIGIN_RELAY_V1_CAPABILITY, AuthSessionId, ThreadId } from "@t3tools/contracts";
 import { PROJECT_FAVICON_FALLBACK_MARKER } from "@t3tools/shared/projectFavicon";
 import { describe, expect, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
@@ -9,10 +9,39 @@ import * as Path from "effect/Path";
 import * as PlatformError from "effect/PlatformError";
 
 import * as ServerSecretStore from "../auth/ServerSecretStore.ts";
+import * as SessionStore from "../auth/SessionStore.ts";
 import * as ServerConfig from "../config.ts";
 import * as ProjectFaviconResolver from "../project/ProjectFaviconResolver.ts";
 import * as WorkspacePaths from "../workspace/WorkspacePaths.ts";
-import { ASSET_ROUTE_PREFIX, issueAssetUrl, resolveAsset } from "./AssetAccess.ts";
+import {
+  ASSET_ROUTE_PREFIX,
+  ASSET_SURFACE_RELAY_PREFIX,
+  issueAssetUrl as issueAssetUrlImpl,
+  resolveAsset as resolveAssetImpl,
+} from "./AssetAccess.ts";
+
+const TEST_SURFACE_SESSION_ID = AuthSessionId.make("asset-access-test-surface");
+const OTHER_SURFACE_SESSION_ID = AuthSessionId.make("asset-access-other-surface");
+
+const assetRouteSuffix = (relativeUrl: string) => {
+  const prefix = relativeUrl.startsWith(`${ASSET_SURFACE_RELAY_PREFIX}/`)
+    ? ASSET_SURFACE_RELAY_PREFIX
+    : ASSET_ROUTE_PREFIX;
+  return relativeUrl.slice(`${prefix}/`.length);
+};
+
+const issueAssetUrl = (input: Parameters<typeof issueAssetUrlImpl>[0]) =>
+  issueAssetUrlImpl({
+    ...input,
+    clientCapabilities: [ASSET_SAME_ORIGIN_RELAY_V1_CAPABILITY],
+    surfaceSessionId: TEST_SURFACE_SESSION_ID,
+  });
+
+const resolveAsset = (
+  token: string,
+  relativePath: string,
+  sessionId: AuthSessionId = TEST_SURFACE_SESSION_ID,
+) => resolveAssetImpl(token, relativePath, { sessionId });
 
 const configLayer = ServerConfig.ServerConfig.layerTest(process.cwd(), {
   prefix: "t3-asset-access-test-",
@@ -22,6 +51,10 @@ const testLayer = Layer.mergeAll(
   WorkspacePaths.layer,
   ProjectFaviconResolver.layer.pipe(Layer.provide(WorkspacePaths.layer)),
   ServerSecretStore.layer.pipe(Layer.provide(configLayer)),
+  Layer.mock(SessionStore.SessionStore)({
+    cookieName: "t3_asset_access_test",
+    isActive: () => Effect.succeed(true),
+  }),
 ).pipe(Layer.provideMerge(NodeServices.layer));
 
 describe("AssetAccess", () => {
@@ -48,7 +81,7 @@ describe("AssetAccess", () => {
         },
         workspaceRoot: root,
       });
-      const suffix = result.relativeUrl.slice(`${ASSET_ROUTE_PREFIX}/`.length);
+      const suffix = assetRouteSuffix(result.relativeUrl);
       const separatorIndex = suffix.indexOf("/");
       const token = suffix.slice(0, separatorIndex);
 
@@ -165,7 +198,7 @@ describe("AssetAccess", () => {
         },
         workspaceRoot: root,
       });
-      const suffix = result.relativeUrl.slice(`${ASSET_ROUTE_PREFIX}/`.length);
+      const suffix = assetRouteSuffix(result.relativeUrl);
       const separatorIndex = suffix.indexOf("/");
       const token = suffix.slice(0, separatorIndex);
 
@@ -191,7 +224,7 @@ describe("AssetAccess", () => {
       const result = yield* issueAssetUrl({
         resource: { _tag: "attachment", attachmentId },
       });
-      const suffix = result.relativeUrl.slice(`${ASSET_ROUTE_PREFIX}/`.length);
+      const suffix = assetRouteSuffix(result.relativeUrl);
       const separatorIndex = suffix.indexOf("/");
       const token = suffix.slice(0, separatorIndex);
 
@@ -199,6 +232,43 @@ describe("AssetAccess", () => {
         kind: "file",
         path: attachmentPath,
       });
+      expect(yield* resolveAsset(token, "ignored.png", OTHER_SURFACE_SESSION_ID)).toBeNull();
+      expect(yield* resolveAssetImpl(token, "ignored.png")).toBeNull();
+      expect(result.relativeUrl).not.toContain(TEST_SURFACE_SESSION_ID);
+      expect(result.relativeUrl).not.toContain(result.surfaceCredential);
+    }).pipe(Effect.provide(testLayer)),
+  );
+
+  it.effect("preserves signed direct URLs for clients without surface credentials", () =>
+    Effect.gen(function* () {
+      const config = yield* ServerConfig.ServerConfig;
+      const fileSystem = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const attachmentId = "thread-old-client-00000000-0000-4000-8000-000000000001";
+      yield* fileSystem.makeDirectory(config.attachmentsDir, { recursive: true });
+      yield* fileSystem.writeFile(
+        path.join(config.attachmentsDir, `${attachmentId}.png`),
+        new Uint8Array([1, 2, 3]),
+      );
+
+      const result = yield* issueAssetUrlImpl({
+        resource: { _tag: "attachment", attachmentId },
+        surfaceSessionId: TEST_SURFACE_SESSION_ID,
+      });
+      const suffix = assetRouteSuffix(result.relativeUrl);
+      const separatorIndex = suffix.indexOf("/");
+      const token = suffix.slice(0, separatorIndex);
+
+      expect(result).toEqual({
+        relativeUrl: expect.stringMatching(/^\/api\/assets\/(?!relay\/)/),
+        expiresAt: expect.any(Number),
+      });
+      expect(yield* resolveAssetImpl(token, "ignored.png")).toBeNull();
+      expect(
+        yield* resolveAssetImpl(token, "ignored.png", {
+          allowUnbound: true,
+        }),
+      ).toEqual({ kind: "file", path: path.join(config.attachmentsDir, `${attachmentId}.png`) });
     }).pipe(Effect.provide(testLayer)),
   );
 
@@ -216,7 +286,7 @@ describe("AssetAccess", () => {
       const faviconResult = yield* issueAssetUrl({
         resource: { _tag: "project-favicon", cwd: root },
       });
-      const faviconSuffix = faviconResult.relativeUrl.slice(`${ASSET_ROUTE_PREFIX}/`.length);
+      const faviconSuffix = assetRouteSuffix(faviconResult.relativeUrl);
       const faviconSeparatorIndex = faviconSuffix.indexOf("/");
       expect(
         yield* resolveAsset(
@@ -230,7 +300,7 @@ describe("AssetAccess", () => {
         resource: { _tag: "project-favicon", cwd: root },
       });
       expect(fallbackResult.relativeUrl.endsWith(`/${PROJECT_FAVICON_FALLBACK_MARKER}`)).toBe(true);
-      const fallbackSuffix = fallbackResult.relativeUrl.slice(`${ASSET_ROUTE_PREFIX}/`.length);
+      const fallbackSuffix = assetRouteSuffix(fallbackResult.relativeUrl);
       const fallbackSeparatorIndex = fallbackSuffix.indexOf("/");
       expect(
         yield* resolveAsset(
