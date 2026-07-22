@@ -26,6 +26,7 @@ import { ServerConfig } from "../../config.ts";
 import { ServerSettingsService } from "../../serverSettings.ts";
 import { ProviderSessionDirectory } from "../Services/ProviderSessionDirectory.ts";
 import type { OpenCodeAdapterShape } from "../Services/OpenCodeAdapter.ts";
+import { providerConsumerLifetimeContract } from "../testUtils/providerConsumerLifetimeContract.ts";
 import {
   OpenCodeRuntime,
   OpenCodeRuntimeError,
@@ -67,6 +68,8 @@ const runtimeMock = {
     promptAsyncError: null as Error | null,
     closeError: null as Error | null,
     eventStreamGate: null as Promise<void> | null,
+    eventStreamAbortObserved: false,
+    holdEventStreamOpen: false,
     messages: [] as MessageEntry[],
     subscribedEvents: [] as unknown[],
     sessionGetIds: [] as string[],
@@ -88,6 +91,8 @@ const runtimeMock = {
     this.state.promptAsyncError = null;
     this.state.closeError = null;
     this.state.eventStreamGate = null;
+    this.state.eventStreamAbortObserved = false;
+    this.state.holdEventStreamOpen = false;
     this.state.messages = [];
     this.state.subscribedEvents = [];
     this.state.sessionGetIds.length = 0;
@@ -206,16 +211,33 @@ const OpenCodeRuntimeTestDouble: OpenCodeRuntimeShape = {
         },
       },
       event: {
-        subscribe: async () => ({
-          stream: (async function* () {
-            if (runtimeMock.state.eventStreamGate) {
-              await runtimeMock.state.eventStreamGate;
-            }
-            for (const event of runtimeMock.state.subscribedEvents) {
-              yield event;
-            }
-          })(),
-        }),
+        subscribe: async (_input?: unknown, options?: { readonly signal?: AbortSignal }) => {
+          options?.signal?.addEventListener(
+            "abort",
+            () => {
+              runtimeMock.state.eventStreamAbortObserved = true;
+            },
+            { once: true },
+          );
+          return {
+            stream: (async function* () {
+              if (runtimeMock.state.eventStreamGate) {
+                await runtimeMock.state.eventStreamGate;
+              }
+              for (const event of runtimeMock.state.subscribedEvents) {
+                yield event;
+              }
+              if (runtimeMock.state.holdEventStreamOpen) {
+                while (!options?.signal?.aborted) {
+                  // Keep the consumer alive without making iterator cancellation
+                  // depend on the scope finalizer that fires the AbortSignal.
+                  await new Promise<void>((resolve) => setImmediate(resolve));
+                  yield { type: "provider.consumer.contract.keepalive" };
+                }
+              }
+            })(),
+          };
+        },
       },
     }) as unknown as ReturnType<OpenCodeRuntimeShape["createOpenCodeSdkClient"]>,
   loadOpenCodeInventory: () =>
@@ -286,6 +308,71 @@ const advanceTestClock = (ms: number) =>
   TestClock.adjust(`${ms} millis`).pipe(Effect.andThen(Effect.yieldNow));
 
 it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
+  it.effect("satisfies the OpenCodeAdapter persistent-consumer lifetime contract", () =>
+    Effect.gen(function* () {
+      const adapter = yield* OpenCodeAdapter;
+      const threadId = asThreadId("thread-opencode-consumer-lifetime");
+      const sessionId = "http://127.0.0.1:9999/session";
+      let releaseEvents = () => {};
+      runtimeMock.state.eventStreamGate = new Promise<void>((resolve) => {
+        releaseEvents = resolve;
+      });
+      runtimeMock.state.holdEventStreamOpen = true;
+      runtimeMock.state.subscribedEvents = [
+        {
+          type: "message.updated",
+          properties: {
+            sessionID: sessionId,
+            info: { id: "message-opencode-contract", role: "assistant" },
+          },
+        },
+        {
+          type: "message.part.updated",
+          properties: {
+            sessionID: sessionId,
+            part: {
+              id: "part-opencode-contract",
+              sessionID: sessionId,
+              messageID: "message-opencode-contract",
+              type: "text",
+              text: "PONG",
+              time: { start: 1, end: 2 },
+            },
+            time: 2,
+          },
+        },
+        {
+          type: "session.status",
+          properties: {
+            sessionID: sessionId,
+            status: { type: "idle" },
+          },
+        },
+      ];
+
+      yield* providerConsumerLifetimeContract({
+        adapterName: "OpenCodeAdapter",
+        adapter,
+        startInput: {
+          provider: ProviderDriverKind.make("opencode"),
+          threadId,
+          runtimeMode: "full-access",
+        },
+        turnInput: {
+          threadId,
+          input: "PONG",
+          attachments: [],
+          modelSelection: createModelSelection(
+            ProviderInstanceId.make("opencode"),
+            "anthropic/sonnet",
+          ),
+        },
+        driveTurn: () => Effect.sync(releaseEvents),
+      });
+      NodeAssert.equal(runtimeMock.state.eventStreamAbortObserved, true);
+    }),
+  );
+
   it.effect("reuses a configured OpenCode server URL instead of spawning a local server", () =>
     Effect.gen(function* () {
       const adapter = yield* OpenCodeAdapter;
