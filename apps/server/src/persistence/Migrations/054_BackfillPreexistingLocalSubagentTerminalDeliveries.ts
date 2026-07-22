@@ -79,6 +79,12 @@ export const backfillPreexistingLocalSubagentTerminalDeliveries = Effect.fn(
         END AS terminal_kind,
         CASE
           WHEN deleted_at IS NOT NULL THEN deleted_at
+          WHEN archived_at IS NOT NULL
+            AND (
+              has_fresh_terminal_turn = 0
+              OR (terminal_at IS NOT NULL AND terminal_at > archived_at)
+            )
+          THEN archived_at
           WHEN has_fresh_terminal_turn = 1 THEN terminal_at
           WHEN archived_at IS NOT NULL AND session_status IN ('error', 'stopped')
           THEN CASE
@@ -106,7 +112,7 @@ export const backfillPreexistingLocalSubagentTerminalDeliveries = Effect.fn(
       SELECT
         parent_thread_id,
         occurred_at,
-        substr(wake_text, 12, instr(substr(wake_text, 12), ' ') - 1) AS child_thread_id
+        wake_text
       FROM (
         SELECT
           stream_id AS parent_thread_id,
@@ -116,7 +122,7 @@ export const backfillPreexistingLocalSubagentTerminalDeliveries = Effect.fn(
         WHERE event_type = 'thread.message-sent'
           AND json_extract(payload_json, '$.role') = 'system'
       )
-      WHERE wake_text LIKE '[sub-agent % %'
+      WHERE wake_text LIKE '%[sub-agent % %'
     )
     INSERT INTO subagent_terminal_deliveries (
       child_thread_id,
@@ -146,7 +152,28 @@ export const backfillPreexistingLocalSubagentTerminalDeliveries = Effect.fn(
           SELECT 1
           FROM delivered_parent_wakes AS delivered_event
           WHERE delivered_event.parent_thread_id = terminal_children.parent_thread_id
-            AND delivered_event.child_thread_id = terminal_children.thread_id
+            AND substr(
+              delivered_event.wake_text,
+              1,
+              length('[sub-agent ' || terminal_children.thread_id || ' ')
+            ) = '[sub-agent ' || terminal_children.thread_id || ' '
+            AND (
+              substr(
+                delivered_event.wake_text,
+                length('[sub-agent ' || terminal_children.thread_id || ' ') + 1,
+                length('completed] ')
+              ) = 'completed] '
+              OR substr(
+                delivered_event.wake_text,
+                length('[sub-agent ' || terminal_children.thread_id || ' ') + 1,
+                length('failed] ')
+              ) = 'failed] '
+              OR substr(
+                delivered_event.wake_text,
+                length('[sub-agent ' || terminal_children.thread_id || ' ') + 1,
+                length('killed] ')
+              ) = 'killed] '
+            )
             AND julianday(delivered_event.occurred_at) >=
               julianday(terminal_children.terminal_evidence_at)
         )
@@ -154,6 +181,7 @@ export const backfillPreexistingLocalSubagentTerminalDeliveries = Effect.fn(
           SELECT 1
           FROM subagent_wait_deliveries AS wait_delivery
           WHERE wait_delivery.child_thread_id = terminal_children.thread_id
+            AND wait_delivery.parent_thread_id = terminal_children.parent_thread_id
             AND julianday(wait_delivery.delivered_at) >=
               julianday(terminal_children.terminal_evidence_at)
         )

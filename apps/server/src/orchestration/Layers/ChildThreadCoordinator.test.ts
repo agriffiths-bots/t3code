@@ -1056,7 +1056,7 @@ describe("ChildThreadCoordinator", () => {
                     ${"thread.message-sent"},
                     ${now},
                     ${"server"},
-                    ${`{"role":"system","text":"[sub-agent ${row.threadId} completed]"}`},
+                    ${`{"role":"system","text":"[sub-agent ${row.threadId} completed] delivered"}`},
                     ${"{}"}
                   )
                 `;

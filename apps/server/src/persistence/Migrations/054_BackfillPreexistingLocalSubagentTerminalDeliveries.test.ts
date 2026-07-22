@@ -199,6 +199,26 @@ layer("054_BackfillPreexistingLocalSubagentTerminalDeliveries", (it) => {
             sessionStatus: "ready" as const,
           },
           {
+            threadId: "consolidated-second-local",
+            turnState: "completed" as const,
+            sessionStatus: "ready" as const,
+          },
+          {
+            threadId: "wrong-parent-wait-local",
+            turnState: "completed" as const,
+            sessionStatus: "ready" as const,
+          },
+          {
+            threadId: "wild_card-local",
+            turnState: "completed" as const,
+            sessionStatus: "ready" as const,
+          },
+          {
+            threadId: "wild%card-local",
+            turnState: "completed" as const,
+            sessionStatus: "ready" as const,
+          },
+          {
             threadId: "post-053-completed-local",
             turnState: "completed" as const,
             turnAt: "2999-01-01T08:00:00.000Z",
@@ -238,7 +258,9 @@ layer("054_BackfillPreexistingLocalSubagentTerminalDeliveries", (it) => {
       for (const [index, childThreadId] of messageDeliveredChildren.entries()) {
         const deliveredAt = childThreadId.startsWith("post-053-")
           ? "3000-01-01T08:00:00.000Z"
-          : "2001-01-01T08:00:00.000Z";
+          : childThreadId === "archived-before-terminal-local"
+            ? "2000-01-01T09:30:00.000Z"
+            : "2001-01-01T08:00:00.000Z";
         yield* sql`
           INSERT INTO orchestration_events (
             sequence,
@@ -261,11 +283,37 @@ layer("054_BackfillPreexistingLocalSubagentTerminalDeliveries", (it) => {
             ${"thread.message-sent"},
             ${deliveredAt},
             ${"server"},
-            ${`{"role":"system","text":"[sub-agent ${childThreadId} completed]"}`},
+            ${`{"role":"system","text":"[sub-agent ${childThreadId} completed] delivered"}`},
             ${"{}"}
           )
         `;
       }
+      yield* sql`
+        INSERT INTO orchestration_events (
+          sequence,
+          event_id,
+          aggregate_kind,
+          stream_id,
+          stream_version,
+          event_type,
+          occurred_at,
+          actor_kind,
+          payload_json,
+          metadata_json
+        )
+        VALUES (
+          ${1_100},
+          ${"terminal-backfill-delivered-consolidated"},
+          ${"thread"},
+          ${parentThreadId},
+          ${1_100},
+          ${"thread.message-sent"},
+          ${"2001-01-01T08:00:00.000Z"},
+          ${"server"},
+          ${'{"role":"system","text":"[sub-agent already-delivered-first completed] delivered\\n[sub-agent consolidated-second-local completed] delivered\\n[sub-agent wildXcard-local completed] delivered\\n[sub-agent wildXYZcard-local completed] delivered"}'},
+          ${"{}"}
+        )
+      `;
       yield* sql`
         INSERT INTO subagent_wait_deliveries (
           child_thread_id,
@@ -276,6 +324,11 @@ layer("054_BackfillPreexistingLocalSubagentTerminalDeliveries", (it) => {
         VALUES (
           ${"wait-delivered-local"},
           ${parentThreadId},
+          ${"2001-01-01T08:00:00.000Z"},
+          ${null}
+        ), (
+          ${"wrong-parent-wait-local"},
+          ${"previous-parent"},
           ${"2001-01-01T08:00:00.000Z"},
           ${null}
         )
