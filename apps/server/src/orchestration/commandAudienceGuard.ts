@@ -1020,6 +1020,8 @@ export const authorizeOrchestrationCommandMutation = Effect.fn(
 
     case "thread.delete":
     case "thread.unarchive":
+    case "thread.settle":
+    case "thread.unsettle":
     case "thread.runtime-mode.set":
     case "thread.interaction-mode.set":
     case "thread.turn.interrupt":

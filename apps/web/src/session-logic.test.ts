@@ -1796,6 +1796,8 @@ describe("deriveTimelineEntries", () => {
       createdAt: "2026-07-07T21:00:00.000Z",
       updatedAt: "2026-07-07T21:00:01.000Z",
       archivedAt: null,
+      settledOverride: null,
+      settledAt: null,
       deletedAt: null,
       messages: [],
       turns: [],

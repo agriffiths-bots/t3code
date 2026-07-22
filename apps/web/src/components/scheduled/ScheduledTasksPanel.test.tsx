@@ -73,6 +73,8 @@ function shell(
     createdAt: NOW,
     updatedAt: NOW,
     archivedAt: null,
+    settledOverride: null,
+    settledAt: null,
     session: null,
     latestUserMessageAt: null,
     hasPendingApprovals: false,

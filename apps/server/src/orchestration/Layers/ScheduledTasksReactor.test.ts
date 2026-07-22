@@ -73,6 +73,8 @@ const makeShell = (input: {
   createdAt: now,
   updatedAt: now,
   archivedAt: null,
+  settledOverride: null,
+  settledAt: null,
   session: input.session ?? null,
   latestUserMessageAt: null,
   hasPendingApprovals: false,

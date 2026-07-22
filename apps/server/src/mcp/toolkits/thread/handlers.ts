@@ -582,6 +582,8 @@ const makeActiveThreadStartRuntime = Effect.fn("ThreadToolkit.makeActiveRuntime"
       createdAt,
       updatedAt: createdAt,
       archivedAt: null,
+      settledOverride: null,
+      settledAt: null,
       session: null,
       latestUserMessageAt: null,
       hasPendingApprovals: false,
