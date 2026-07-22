@@ -1,7 +1,6 @@
 import { autoAnimate } from "@formkit/auto-animate";
 import { useAtomValue } from "@effect/atom-react";
 import { effectiveSettled } from "@t3tools/client-runtime/state/thread-settled";
-import type { EnvironmentThreadShell } from "@t3tools/client-runtime/state/models";
 import {
   scopeProjectRef,
   scopeThreadRef,
@@ -10,6 +9,7 @@ import {
 import type { ScopedThreadRef } from "@t3tools/contracts";
 import {
   CheckIcon,
+  ChevronRightIcon,
   CircleCheckIcon,
   CircleDashedIcon,
   CloudIcon,
@@ -52,7 +52,7 @@ import { selectThreadTerminalUiState, useTerminalUiStateStore } from "../termina
 import { isMacPlatform } from "~/lib/utils";
 import { useOpenPrLink } from "../lib/openPullRequestLink";
 import { readLocalApi } from "../localApi";
-import { useUiStateStore } from "../uiStateStore";
+import { resolveThreadTreeExpanded, useUiStateStore } from "../uiStateStore";
 import { useThreadSelectionStore } from "../threadSelectionStore";
 import { useThreadActions } from "../hooks/useThreadActions";
 import { useHandleNewThread } from "../hooks/useHandleNewThread";
@@ -78,10 +78,13 @@ import type { SidebarThreadSummary } from "../types";
 import { cn } from "~/lib/utils";
 import {
   firstValidTimestampMs,
+  filterSidebarThreadTreeRowsByExpansion,
   hasUnseenCompletion,
   isTrailingDoubleClick,
+  partitionSidebarV2ThreadTreeRows,
   resolveAdjacentThreadId,
   resolveSidebarV2Status,
+  sidebarThreadExpansionKey,
   sortThreadsForSidebarV2,
 } from "./Sidebar.logic";
 import { prStatusIndicator, resolveThreadPr } from "./ThreadStatusIndicators";
@@ -151,6 +154,11 @@ const SidebarV2Row = memo(function SidebarV2Row(props: {
   onSettle: (threadRef: ScopedThreadRef) => void;
   onUnsettle: (threadRef: ScopedThreadRef) => void;
   onChangeRequestState: (threadKey: string, state: "open" | "closed" | "merged" | null) => void;
+  treeDepth: number;
+  directChildCount: number;
+  unsettledDescendantCount: number;
+  isTreeExpanded: boolean;
+  onToggleTree: (threadKey: string) => void;
 }) {
   const {
     isRenaming,
@@ -314,6 +322,14 @@ const SidebarV2Row = memo(function SidebarV2Row(props: {
     },
     [onUnsettle, threadRef],
   );
+  const handleTreeToggle = useCallback(
+    (event: ReactMouseEvent) => {
+      event.preventDefault();
+      event.stopPropagation();
+      props.onToggleTree(threadKey);
+    },
+    [props.onToggleTree, threadKey],
+  );
   const handlePrClick = useCallback(
     (event: ReactMouseEvent<HTMLElement>) => {
       if (pr?.url) openPrLink(event, pr.url);
@@ -329,6 +345,36 @@ const SidebarV2Row = memo(function SidebarV2Row(props: {
         ? "bg-foreground/[0.07] text-foreground dark:bg-white/[0.07]"
         : "hover:bg-accent/65",
   );
+  const treeInset = Math.min(props.treeDepth, 4) * 12;
+  const treeControl =
+    props.directChildCount > 0 ? (
+      <button
+        type="button"
+        aria-expanded={props.isTreeExpanded}
+        aria-label={`${props.isTreeExpanded ? "Collapse" : "Expand"} child threads for ${thread.title}`}
+        onClick={handleTreeToggle}
+        className="inline-flex size-4 shrink-0 items-center justify-center rounded-sm text-muted-foreground/60 transition-colors hover:text-foreground focus-visible:ring-1 focus-visible:ring-ring"
+      >
+        <ChevronRightIcon
+          aria-hidden
+          className={cn(
+            "size-3.5 transition-transform duration-150",
+            props.isTreeExpanded && "rotate-90",
+          )}
+        />
+      </button>
+    ) : props.treeDepth > 0 ? (
+      <span aria-hidden className="h-px w-2 shrink-0 rounded-full bg-border/80" />
+    ) : null;
+  const unsettledChildrenBadge =
+    props.unsettledDescendantCount > 0 ? (
+      <span
+        aria-label={`${props.unsettledDescendantCount} unsettled child thread${props.unsettledDescendantCount === 1 ? "" : "s"}`}
+        className="shrink-0 rounded-sm border border-blue-500/25 bg-blue-500/8 px-1 text-[9px] font-medium leading-4 text-blue-700 dark:text-blue-300"
+      >
+        {props.unsettledDescendantCount} open
+      </span>
+    ) : null;
 
   const title = isRenaming ? (
     <input
@@ -395,7 +441,9 @@ const SidebarV2Row = memo(function SidebarV2Row(props: {
     return (
       <li
         data-thread-item
+        data-thread-id={thread.id}
         className="list-none [content-visibility:auto] [contain-intrinsic-size:auto_34px]"
+        style={{ paddingInlineStart: treeInset }}
       >
         {props.showSettledGap ? (
           <div aria-hidden className="mb-1 mt-3 flex items-center gap-2 px-2.5">
@@ -413,6 +461,7 @@ const SidebarV2Row = memo(function SidebarV2Row(props: {
           onKeyDown={handleKeyDown}
           onContextMenu={handleContextMenu}
         >
+          {treeControl}
           {/* Settled history recedes: dimmed favicon at rest, restored on
               hover so the tail stays scannable when you're hunting. */}
           <span
@@ -429,6 +478,7 @@ const SidebarV2Row = memo(function SidebarV2Row(props: {
             />
           </span>
           {title}
+          {unsettledChildrenBadge}
           {/* The PR badge stays outside the hover-fading slot: it must
               remain visible AND clickable while the row is hovered. Only
               the time/jump label yields to the settle affordance. */}
@@ -472,7 +522,9 @@ const SidebarV2Row = memo(function SidebarV2Row(props: {
   return (
     <li
       data-thread-item
+      data-thread-id={thread.id}
       className="list-none py-0.5 [content-visibility:auto] [contain-intrinsic-size:auto_96px]"
+      style={{ paddingInlineStart: treeInset }}
     >
       <div
         role="button"
@@ -498,6 +550,7 @@ const SidebarV2Row = memo(function SidebarV2Row(props: {
       >
         <div className="relative z-10 px-2.5 py-2">
           <div className="flex h-5 min-w-0 items-center gap-1.5">
+            {treeControl}
             <ProjectFavicon
               environmentId={thread.environmentId}
               cwd={props.projectCwd ?? ""}
@@ -519,6 +572,7 @@ const SidebarV2Row = memo(function SidebarV2Row(props: {
             ) : (
               <span className="flex-1" />
             )}
+            {unsettledChildrenBadge}
             <span className="relative ml-auto flex h-5 min-w-8 shrink-0 items-center justify-end pl-1 text-[13px]">
               <span className="tabular-nums text-muted-foreground/55 transition-opacity group-hover/v2-row:opacity-0">
                 {props.jumpLabel ? (
@@ -646,6 +700,18 @@ export default function SidebarV2() {
   const toggleThreadSelection = useThreadSelectionStore((s) => s.toggleThread);
   const rangeSelectTo = useThreadSelectionStore((s) => s.rangeSelectTo);
   const markThreadUnread = useUiStateStore((s) => s.markThreadUnread);
+  const threadTreeExpandedById = useUiStateStore((s) => s.threadTreeExpandedById);
+  const setThreadTreeExpanded = useUiStateStore((s) => s.setThreadTreeExpanded);
+  const toggleThreadTreeExpanded = useCallback(
+    (threadKey: string) => {
+      const expanded = resolveThreadTreeExpanded(
+        useUiStateStore.getState().threadTreeExpandedById,
+        threadKey,
+      );
+      setThreadTreeExpanded(threadKey, !expanded);
+    },
+    [setThreadTreeExpanded],
+  );
   const routeThreadRef = useParams({
     strict: false,
     select: (params) => resolveThreadRouteRef(params),
@@ -754,7 +820,7 @@ export default function SidebarV2() {
   // merging, no optimistic holds. Archived threads remain hidden here —
   // archive keeps its original "remove from sidebar" meaning.
   const serverConfigs = useAtomValue(environmentServerConfigsAtom);
-  const { activeThreads, settledThreads } = useMemo(() => {
+  const { activeRows, settledGroups, settledThreadKeys } = useMemo(() => {
     const now = `${nowMinute}:00.000Z`;
     const visible = threads.filter(
       (thread) =>
@@ -763,8 +829,7 @@ export default function SidebarV2() {
           (thread.environmentId === scopedProject.environmentId &&
             thread.projectId === scopedProject.id)),
     );
-    const active: EnvironmentThreadShell[] = [];
-    const settled: EnvironmentThreadShell[] = [];
+    const settledByThreadKey = new Map<string, boolean>();
     for (const thread of visible) {
       // Threads on servers without the settlement capability (old server,
       // or descriptor not loaded yet) never classify as settled: the user
@@ -774,21 +839,32 @@ export default function SidebarV2() {
         serverConfigs.get(thread.environmentId)?.environment.capabilities.threadSettlement === true;
       const threadKey = scopedThreadKey(scopeThreadRef(thread.environmentId, thread.id));
       const changeRequestState = changeRequestStateByKey.get(threadKey) ?? null;
-      if (
+      const settled =
         supportsSettlement &&
-        effectiveSettled(thread, { now, autoSettleAfterDays, changeRequestState })
-      ) {
-        settled.push(thread);
-      } else {
-        active.push(thread);
-      }
+        effectiveSettled(thread, { now, autoSettleAfterDays, changeRequestState });
+      settledByThreadKey.set(threadKey, settled);
     }
+    const partition = partitionSidebarV2ThreadTreeRows(
+      sortThreadsForSidebarV2(visible),
+      (thread) =>
+        settledByThreadKey.get(scopedThreadKey(scopeThreadRef(thread.environmentId, thread.id))) ??
+        false,
+    );
+    const groupActivityAt = (group: (typeof partition.settledGroups)[number]): number =>
+      Math.max(
+        ...group.map((row) =>
+          firstValidTimestampMs(row.thread.latestUserMessageAt, row.thread.updatedAt),
+        ),
+      );
     return {
-      activeThreads: sortThreadsForSidebarV2(active),
-      settledThreads: settled.toSorted(
-        (left, right) =>
-          firstValidTimestampMs(right.latestUserMessageAt, right.updatedAt) -
-          firstValidTimestampMs(left.latestUserMessageAt, left.updatedAt),
+      activeRows: partition.activeRows,
+      settledGroups: [...partition.settledGroups].toSorted(
+        (left, right) => groupActivityAt(right) - groupActivityAt(left),
+      ),
+      settledThreadKeys: new Set(
+        [...settledByThreadKey.entries()]
+          .filter(([, settled]) => settled)
+          .map(([threadKey]) => threadKey),
       ),
     };
   }, [
@@ -811,20 +887,48 @@ export default function SidebarV2() {
     lastSettledResetKeyRef.current = settledResetKey;
     setSettledVisibleCount(SETTLED_TAIL_INITIAL_COUNT);
   }
-  const hiddenSettledCount = Math.max(0, settledThreads.length - settledVisibleCount);
-  const visibleSettledThreads = useMemo(
-    () => (hiddenSettledCount > 0 ? settledThreads.slice(0, settledVisibleCount) : settledThreads),
-    [hiddenSettledCount, settledThreads, settledVisibleCount],
+  const visibleSettledGroups = useMemo(
+    () => settledGroups.slice(0, settledVisibleCount),
+    [settledGroups, settledVisibleCount],
   );
+  const hiddenSettledGroups = settledGroups.slice(settledVisibleCount);
+  const hiddenSettledCount = hiddenSettledGroups.reduce((count, group) => count + group.length, 0);
+  const nextSettledPageCount = hiddenSettledGroups
+    .slice(0, SETTLED_TAIL_PAGE_COUNT)
+    .reduce((count, group) => count + group.length, 0);
+  const visibleSettledRows = useMemo(() => visibleSettledGroups.flat(), [visibleSettledGroups]);
   const showMoreSettled = useCallback(
     () => setSettledVisibleCount((count) => count + SETTLED_TAIL_PAGE_COUNT),
     [],
   );
 
-  const orderedThreads = useMemo(
-    () => [...activeThreads, ...visibleSettledThreads],
-    [activeThreads, visibleSettledThreads],
+  const expandedActiveRows = useMemo(
+    () =>
+      filterSidebarThreadTreeRowsByExpansion(activeRows, threadTreeExpandedById, {
+        activeThreadKey: routeThreadKey,
+      }),
+    [activeRows, routeThreadKey, threadTreeExpandedById],
   );
+  const expandedSettledRows = useMemo(
+    () =>
+      filterSidebarThreadTreeRowsByExpansion(visibleSettledRows, threadTreeExpandedById, {
+        activeThreadKey: routeThreadKey,
+      }),
+    [routeThreadKey, threadTreeExpandedById, visibleSettledRows],
+  );
+  const orderedRows = useMemo(
+    () => [...expandedActiveRows, ...expandedSettledRows],
+    [expandedActiveRows, expandedSettledRows],
+  );
+  const orderedThreads = useMemo(() => orderedRows.map((row) => row.thread), [orderedRows]);
+  const firstSettledTailThreadKey = expandedSettledRows[0]
+    ? scopedThreadKey(
+        scopeThreadRef(
+          expandedSettledRows[0].thread.environmentId,
+          expandedSettledRows[0].thread.id,
+        ),
+      )
+    : null;
   const orderedThreadKeys = useMemo(
     () =>
       orderedThreads.map((thread) =>
@@ -857,15 +961,6 @@ export default function SidebarV2() {
   // a ref keeps it out of attemptSettle's dependency array.
   const handleNewThreadRef = useRef(newThreadContext.handleNewThread);
   handleNewThreadRef.current = newThreadContext.handleNewThread;
-  const settledThreadKeys = useMemo(
-    () =>
-      new Set(
-        settledThreads.map((thread) =>
-          scopedThreadKey(scopeThreadRef(thread.environmentId, thread.id)),
-        ),
-      ),
-    [settledThreads],
-  );
   const settledThreadKeysRef = useRef(settledThreadKeys);
   settledThreadKeysRef.current = settledThreadKeys;
 
@@ -1527,21 +1622,15 @@ export default function SidebarV2() {
         ) : null}
         <SidebarGroup className="min-h-0 flex-1 overflow-y-auto px-2 py-1">
           <ul ref={attachListAutoAnimateRef} className="flex flex-col gap-px">
-            {orderedThreads.map((thread, threadIndex) => {
+            {orderedRows.map((row) => {
+              const { thread } = row;
               const threadKey = scopedThreadKey(scopeThreadRef(thread.environmentId, thread.id));
-              const isSettledRow = settledThreadKeys.has(threadKey);
               // Settled is the ONLY thing that collapses a row: every
               // not-settled thread is a full card. Density comes from users
               // (or the auto rules) actually settling work, not from the
               // sidebar second-guessing what still matters.
-              const isCard = !isSettledRow;
-              const previousThread = threadIndex > 0 ? orderedThreads[threadIndex - 1] : null;
-              const previousWasCard =
-                previousThread != null &&
-                !settledThreadKeys.has(
-                  scopedThreadKey(scopeThreadRef(previousThread.environmentId, previousThread.id)),
-                );
-              const showSettledGap = !isCard && previousWasCard;
+              const isCard = !row.isSettled;
+              const showSettledGap = threadKey === firstSettledTailThreadKey;
               return (
                 <SidebarV2Row
                   showSettledGap={showSettledGap}
@@ -1550,7 +1639,7 @@ export default function SidebarV2() {
                   variant={isCard ? "card" : "slim"}
                   // Every settled row can un-settle: explicit settles clear
                   // the override, auto-settled rows get pinned active.
-                  variantAction={isSettledRow ? "unsettle" : "settle"}
+                  variantAction={row.isSettled ? "unsettle" : "settle"}
                   settlementSupported={
                     serverConfigs.get(thread.environmentId)?.environment.capabilities
                       .threadSettlement === true
@@ -1578,6 +1667,14 @@ export default function SidebarV2() {
                   onSettle={attemptSettle}
                   onUnsettle={attemptUnsettle}
                   onChangeRequestState={handleChangeRequestState}
+                  treeDepth={row.depth}
+                  directChildCount={row.directChildCount}
+                  unsettledDescendantCount={row.unsettledDescendantCount}
+                  isTreeExpanded={resolveThreadTreeExpanded(
+                    threadTreeExpandedById,
+                    sidebarThreadExpansionKey(thread),
+                  )}
+                  onToggleTree={toggleThreadTreeExpanded}
                 />
               );
             })}
@@ -1588,7 +1685,7 @@ export default function SidebarV2() {
                   onClick={showMoreSettled}
                   className="mt-1 flex h-[30px] w-full items-center justify-center gap-1.5 rounded-md border border-dashed border-black/15 font-mono text-[11px] text-muted-foreground transition-colors hover:border-solid hover:border-black/30 hover:text-foreground dark:border-white/15 dark:hover:border-white/30"
                 >
-                  Show {Math.min(hiddenSettledCount, SETTLED_TAIL_PAGE_COUNT)} more
+                  Show {nextSettledPageCount} more
                   <span className="text-muted-foreground/50">
                     ({hiddenSettledCount} settled hidden)
                   </span>

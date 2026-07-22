@@ -774,14 +774,17 @@ function getActiveSidebarThreadTreePathIndexes<TThread extends SidebarThreadTree
   return pathIndexes;
 }
 
-export function filterSidebarThreadTreeRowsByExpansion<TThread extends SidebarThreadTreeInput>(
-  rows: readonly SidebarThreadTreeRow<TThread>[],
+export function filterSidebarThreadTreeRowsByExpansion<
+  TThread extends SidebarThreadTreeInput,
+  TRow extends SidebarThreadTreeRow<TThread> = SidebarThreadTreeRow<TThread>,
+>(
+  rows: readonly TRow[],
   threadTreeExpandedById: Readonly<Record<string, boolean>>,
   options: { readonly activeThreadKey?: string | null } = {},
-): SidebarThreadTreeRow<TThread>[] {
+): TRow[] {
   const forceVisibleIndexes = getActiveSidebarThreadTreePathIndexes(rows, options.activeThreadKey);
 
-  const visibleRows: SidebarThreadTreeRow<TThread>[] = [];
+  const visibleRows: TRow[] = [];
   let collapsedAncestorDepth: number | null = null;
 
   for (const [index, row] of rows.entries()) {
@@ -967,6 +970,77 @@ export function buildSidebarThreadTreeRows<TThread extends SidebarThreadTreeInpu
   }
 
   return rows;
+}
+
+export interface SidebarV2ThreadTreeRow<
+  TThread extends SidebarThreadTreeInput,
+> extends SidebarThreadTreeRow<TThread> {
+  readonly isSettled: boolean;
+  readonly unsettledDescendantCount: number;
+}
+
+export interface SidebarV2ThreadTreePartition<TThread extends SidebarThreadTreeInput> {
+  readonly activeRows: ReadonlyArray<SidebarV2ThreadTreeRow<TThread>>;
+  readonly settledGroups: ReadonlyArray<ReadonlyArray<SidebarV2ThreadTreeRow<TThread>>>;
+}
+
+/**
+ * Keeps a parent and its descendants in one visual group while preserving an
+ * independent lifecycle for every row. A group remains in the inbox while
+ * any member is unsettled; only a wholly settled tree moves to the history
+ * tail. This prevents an active child from becoming detached from its parent.
+ */
+export function partitionSidebarV2ThreadTreeRows<TThread extends SidebarThreadTreeInput>(
+  sortedThreads: readonly TThread[],
+  isSettled: (thread: TThread) => boolean,
+): SidebarV2ThreadTreePartition<TThread> {
+  const treeRows = buildSidebarThreadTreeRows(sortedThreads);
+  const settledByIndex = treeRows.map((row) => isSettled(row.thread));
+  const unsettledDescendantCountByIndex = treeRows.map(() => 0);
+  const ancestorIndexes: number[] = [];
+  for (const [index, row] of treeRows.entries()) {
+    while (
+      ancestorIndexes.length > 0 &&
+      (treeRows[ancestorIndexes.at(-1) ?? -1]?.depth ?? -1) >= row.depth
+    ) {
+      ancestorIndexes.pop();
+    }
+    if (!settledByIndex[index]) {
+      for (const ancestorIndex of ancestorIndexes) {
+        unsettledDescendantCountByIndex[ancestorIndex] =
+          (unsettledDescendantCountByIndex[ancestorIndex] ?? 0) + 1;
+      }
+    }
+    ancestorIndexes.push(index);
+  }
+
+  const rows: Array<SidebarV2ThreadTreeRow<TThread>> = treeRows.map((row, index) => {
+    return {
+      ...row,
+      isSettled: settledByIndex[index] ?? false,
+      unsettledDescendantCount: unsettledDescendantCountByIndex[index] ?? 0,
+    };
+  });
+
+  const groups: Array<Array<SidebarV2ThreadTreeRow<TThread>>> = [];
+  for (const row of rows) {
+    if (row.depth === 0 || groups.length === 0) {
+      groups.push([row]);
+    } else {
+      groups.at(-1)?.push(row);
+    }
+  }
+
+  const activeRows: Array<SidebarV2ThreadTreeRow<TThread>> = [];
+  const settledGroups: Array<Array<SidebarV2ThreadTreeRow<TThread>>> = [];
+  for (const group of groups) {
+    if (group.some((row) => !row.isSettled)) {
+      activeRows.push(...group);
+    } else {
+      settledGroups.push(group);
+    }
+  }
+  return { activeRows, settledGroups };
 }
 
 export function resolveProjectStatusIndicator(

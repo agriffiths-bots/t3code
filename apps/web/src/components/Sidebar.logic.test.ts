@@ -16,6 +16,7 @@ import {
   isContextMenuPointerDown,
   isTrailingDoubleClick,
   orderItemsByPreferredIds,
+  partitionSidebarV2ThreadTreeRows,
   resolveProjectStatusIndicator,
   resolveSidebarNewThreadSeedContext,
   resolveSidebarNewThreadEnvMode,
@@ -1322,6 +1323,51 @@ describe("buildSidebarThreadTreeRows", () => {
 
     expect(rows.map((row) => row.thread.id)).toEqual([orphan.id, cycleA.id, cycleB.id]);
     expect(rows.map((row) => row.depth)).toEqual([0, 0, 1]);
+  });
+});
+
+describe("partitionSidebarV2ThreadTreeRows", () => {
+  it("keeps mixed trees active while settling each child independently", () => {
+    const parent = makeTreeThread({ id: ThreadId.make("parent") });
+    const settledChild = makeTreeThread({
+      id: ThreadId.make("settled-child"),
+      parentThreadId: parent.id,
+    });
+    const activeChild = makeTreeThread({
+      id: ThreadId.make("active-child"),
+      parentThreadId: parent.id,
+    });
+    const settledRoot = makeTreeThread({ id: ThreadId.make("settled-root") });
+    const settledIds = new Set([parent.id, settledChild.id, settledRoot.id]);
+
+    const partition = partitionSidebarV2ThreadTreeRows(
+      [parent, settledChild, activeChild, settledRoot],
+      (thread) => settledIds.has(thread.id),
+    );
+
+    expect(partition.activeRows.map((row) => [row.thread.id, row.isSettled])).toEqual([
+      [parent.id, true],
+      [settledChild.id, true],
+      [activeChild.id, false],
+    ]);
+    expect(partition.activeRows[0]?.unsettledDescendantCount).toBe(1);
+    expect(partition.settledGroups.map((group) => group.map((row) => row.thread.id))).toEqual([
+      [settledRoot.id],
+    ]);
+  });
+
+  it("moves a whole parent tree to history only after its final child settles", () => {
+    const parent = makeTreeThread({ id: ThreadId.make("parent") });
+    const child = makeTreeThread({
+      id: ThreadId.make("child"),
+      parentThreadId: parent.id,
+    });
+
+    const partition = partitionSidebarV2ThreadTreeRows([parent, child], () => true);
+
+    expect(partition.activeRows).toEqual([]);
+    expect(partition.settledGroups).toHaveLength(1);
+    expect(partition.settledGroups[0]?.map((row) => row.thread.id)).toEqual([parent.id, child.id]);
   });
 });
 

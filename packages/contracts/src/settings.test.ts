@@ -34,16 +34,20 @@ describe("ClientSettings word wrap", () => {
 });
 
 describe("ClientSettings sidebar v2", () => {
-  it("defaults the beta off with a three-day auto-settle threshold", () => {
+  it("defaults the new sidebar on without auto-settling migrated threads", () => {
     const settings = decodeClientSettings({});
-    expect(settings.sidebarV2Enabled).toBe(false);
-    expect(settings.sidebarAutoSettleAfterDays).toBe(3);
+    expect(settings.sidebarV2Enabled).toBe(true);
+    expect(settings.sidebarAutoSettleAfterDays).toBeNull();
   });
 
   it("allows auto-settle by inactivity to be disabled", () => {
     expect(
       decodeClientSettings({ sidebarAutoSettleAfterDays: null }).sidebarAutoSettleAfterDays,
     ).toBeNull();
+  });
+
+  it("preserves an explicit sidebar opt-out", () => {
+    expect(decodeClientSettings({ sidebarV2Enabled: false }).sidebarV2Enabled).toBe(false);
   });
 
   it.each([-1, 0, 91])("rejects an auto-settle threshold outside 1..90: %s", (value) => {
