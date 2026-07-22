@@ -83,6 +83,64 @@ export interface ThreadListV2Layout {
   readonly hiddenSettledCount: number;
 }
 
+interface ThreadListV2ScopeInput {
+  readonly environmentId: EnvironmentId | null;
+  readonly projectRef?: {
+    readonly environmentId: EnvironmentId;
+    readonly projectId: ProjectId;
+  } | null;
+  readonly searchQuery: string;
+}
+
+function threadMatchesListV2Scope(
+  thread: EnvironmentThreadShell,
+  input: ThreadListV2ScopeInput,
+  query: string,
+): boolean {
+  if (input.environmentId !== null && thread.environmentId !== input.environmentId) return false;
+  if (
+    input.projectRef != null &&
+    (thread.environmentId !== input.projectRef.environmentId ||
+      thread.projectId !== input.projectRef.projectId)
+  ) {
+    return false;
+  }
+  return query.length === 0 || thread.title.toLocaleLowerCase().includes(query);
+}
+
+/**
+ * Threads whose effective settlement can change when a PR closes or reopens.
+ * This intentionally ignores the current PR state so a PR-derived settled
+ * thread keeps its reporter and can return to the active partition on reopen.
+ */
+export function selectThreadListV2PrSettlementCandidates(
+  input: ThreadListV2ScopeInput & {
+    readonly threads: ReadonlyArray<EnvironmentThreadShell>;
+    readonly settlementEnvironmentIds?: ReadonlySet<EnvironmentId>;
+    readonly autoSettleAfterDays?: number | null;
+    readonly now?: string;
+  },
+): EnvironmentThreadShell[] {
+  const now = input.now ?? new Date().toISOString();
+  const autoSettleAfterDays = input.autoSettleAfterDays ?? null;
+  const query = input.searchQuery.trim().toLocaleLowerCase();
+  return input.threads.filter((thread) => {
+    if (!threadMatchesListV2Scope(thread, input, query)) return false;
+    if (!(input.settlementEnvironmentIds?.has(thread.environmentId) ?? true)) return false;
+    const activeWithoutPr = !effectiveSettled(thread, {
+      now,
+      autoSettleAfterDays,
+      changeRequestState: null,
+    });
+    const settledWithClosedPr = effectiveSettled(thread, {
+      now,
+      autoSettleAfterDays,
+      changeRequestState: "closed",
+    });
+    return activeWithoutPr && settledWithClosedPr;
+  });
+}
+
 /**
  * Partitions visible threads into the active card block (creation order) and
  * the settled recency tail, matching the web v2 list. Mobile has no
@@ -97,7 +155,7 @@ export function buildThreadListV2Items(input: {
     readonly projectId: ProjectId;
   } | null;
   readonly searchQuery: string;
-  /** Per-row PR state reported up by visible rows ("env:threadId" keys). */
+  /** PR state reported before virtualized row rendering ("env:threadId" keys). */
   readonly changeRequestStateByKey?: ReadonlyMap<string, "open" | "closed" | "merged">;
   /** Environments whose server supports thread.settle/unsettle. Threads on
       other environments never classify as settled — the user could neither
@@ -118,15 +176,7 @@ export function buildThreadListV2Items(input: {
   for (const thread of input.threads) {
     // Callers pass live (unarchived) shells; settled threads are among them
     // and partition into the tail via effectiveSettled.
-    if (input.environmentId !== null && thread.environmentId !== input.environmentId) continue;
-    if (
-      input.projectRef != null &&
-      (thread.environmentId !== input.projectRef.environmentId ||
-        thread.projectId !== input.projectRef.projectId)
-    ) {
-      continue;
-    }
-    if (query.length > 0 && !thread.title.toLocaleLowerCase().includes(query)) continue;
+    if (!threadMatchesListV2Scope(thread, input, query)) continue;
     const supportsSettlement = input.settlementEnvironmentIds?.has(thread.environmentId) ?? true;
     const changeRequestState =
       input.changeRequestStateByKey?.get(`${thread.environmentId}:${thread.id}`) ?? null;

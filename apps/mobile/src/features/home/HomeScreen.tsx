@@ -37,8 +37,12 @@ import {
   ThreadListRow,
   ThreadListShowMoreRow,
 } from "../threads/thread-list-items";
-import { ThreadListV2Row } from "../threads/thread-list-v2-items";
-import { buildThreadListV2Items, type ThreadListV2Item } from "../threads/threadListV2";
+import { ThreadListV2PrStateReporter, ThreadListV2Row } from "../threads/thread-list-v2-items";
+import {
+  buildThreadListV2Items,
+  selectThreadListV2PrSettlementCandidates,
+  type ThreadListV2Item,
+} from "../threads/threadListV2";
 import type { HomeListFilterMenuEnvironment } from "./home-list-filter-menu";
 import {
   buildHomeListLayout,
@@ -95,6 +99,9 @@ const ESTIMATED_THREAD_ROW_HEIGHT = 72;
 // tail stays behind an explicit Show more.
 const THREAD_LIST_V2_SETTLED_INITIAL_COUNT = 10;
 const THREAD_LIST_V2_SETTLED_PAGE_COUNT = 25;
+// Mobile does not expose an inactivity threshold yet; keep its explicit
+// policy aligned across partitioning and pre-partition PR observation.
+const THREAD_LIST_V2_AUTO_SETTLE_AFTER_DAYS: number | null = null;
 /**
  * Top spacing between the list and the Android custom header. The Android
  * header (AndroidHomeHeader) is rendered in-flow above this screen and
@@ -393,8 +400,9 @@ export function HomeScreen(props: HomeScreenProps) {
   // Settled threads stay in the live shell stream (settled ≠ archived), so
   // the partition works directly off live shells — no snapshot merging or
   // optimistic holds.
-  // PR states stream in per-row (rows own the VCS subscriptions); a merged or
-  // closed PR auto-settles its thread on the next partition (mirrors web).
+  // PR states stream through non-virtualized reporters for every PR-sensitive
+  // thread in scope. A merged/closed PR therefore reaches the partition even
+  // offscreen, and its reporter stays mounted to observe a later reopen.
   const [changeRequestStateByKey, setChangeRequestStateByKey] = useState<
     ReadonlyMap<string, "open" | "closed" | "merged">
   >(() => new Map());
@@ -474,6 +482,7 @@ export function HomeScreen(props: HomeScreenProps) {
       searchQuery: props.searchQuery,
       changeRequestStateByKey,
       settlementEnvironmentIds,
+      autoSettleAfterDays: THREAD_LIST_V2_AUTO_SETTLE_AFTER_DAYS,
       settledLimit: settledVisibleCount,
       now: `${nowMinute}:00.000Z`,
     });
@@ -489,6 +498,37 @@ export function HomeScreen(props: HomeScreenProps) {
     v2ScopedProject,
   ]);
   const threadListV2Items = threadListV2Layout.items;
+  const prStateReporterThreads = useMemo(
+    () =>
+      selectThreadListV2PrSettlementCandidates({
+        threads: props.threads.filter((thread) => thread.archivedAt === null),
+        environmentId: props.selectedEnvironmentId,
+        projectRef:
+          v2ScopedProject === null
+            ? null
+            : {
+                environmentId: v2ScopedProject.environmentId,
+                projectId: v2ScopedProject.id,
+              },
+        searchQuery: props.searchQuery,
+        settlementEnvironmentIds,
+        autoSettleAfterDays: THREAD_LIST_V2_AUTO_SETTLE_AFTER_DAYS,
+        now: `${nowMinute}:00.000Z`,
+      }).filter((thread) => {
+        const projectCwd =
+          projectCwdByKey.get(scopedProjectKey(thread.environmentId, thread.projectId)) ?? null;
+        return thread.branch !== null && (thread.worktreePath ?? projectCwd) !== null;
+      }),
+    [
+      nowMinute,
+      projectCwdByKey,
+      props.searchQuery,
+      props.selectedEnvironmentId,
+      props.threads,
+      settlementEnvironmentIds,
+      v2ScopedProject,
+    ],
+  );
 
   const renderV2Item = useCallback(
     ({ item }: { readonly item: ThreadListV2Item }) => (
@@ -515,24 +555,17 @@ export function HomeScreen(props: HomeScreenProps) {
         settlementSupported={settlementEnvironmentIds.has(item.thread.environmentId)}
         onSettleThread={handleSettleThread}
         onUnsettleThread={handleUnsettleThread}
-        onChangeRequestState={handleChangeRequestState}
-        projectCwd={
-          projectCwdByKey.get(scopedProjectKey(item.thread.environmentId, item.thread.projectId)) ??
-          null
-        }
         onSwipeableClose={handleSwipeableClose}
         onSwipeableWillOpen={handleSwipeableWillOpen}
       />
     ),
     [
-      handleChangeRequestState,
       handleDeleteThread,
       handleSettleThread,
       handleSwipeableClose,
       handleSwipeableWillOpen,
       handleUnsettleThread,
       projectByKey,
-      projectCwdByKey,
       props.onArchiveThread,
       props.onSelectThread,
       serverConfigs,
@@ -787,6 +820,16 @@ export function HomeScreen(props: HomeScreenProps) {
   if (threadListV2Enabled) {
     return (
       <View className="flex-1 bg-screen">
+        {prStateReporterThreads.map((thread) => (
+          <ThreadListV2PrStateReporter
+            key={`pr-state:${thread.environmentId}:${thread.id}`}
+            thread={thread}
+            projectCwd={
+              projectCwdByKey.get(scopedProjectKey(thread.environmentId, thread.projectId)) ?? null
+            }
+            onChangeRequestState={handleChangeRequestState}
+          />
+        ))}
         <SwipeableScrollGateProvider enabled={swipeEnabled}>
           <FlatList
             data={threadListV2Items}

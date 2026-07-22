@@ -604,6 +604,12 @@ export type OrchestrationSubscribeShellInput = typeof OrchestrationSubscribeShel
 export const OrchestrationSubscribeThreadInput = Schema.Struct({
   threadId: ThreadId,
   /**
+   * Opts into raw thread.settled/thread.unsettled detail events. Optional and
+   * false by default so pre-settlement clients never receive union variants
+   * they cannot decode during a mixed-version rollout.
+   */
+  supportsThreadSettlementEvents: Schema.optionalKey(Schema.Boolean),
+  /**
    * Epoch of the event store that produced `afterSequence`. The server only
    * resumes from the cursor when this matches its current store; otherwise it
    * sends an authoritative snapshot.

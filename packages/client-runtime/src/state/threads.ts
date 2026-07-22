@@ -346,6 +346,7 @@ export const makeEnvironmentThreadState = Effect.fn("EnvironmentThreadState.make
   const currentStorageEpoch = yield* Ref.make(initialStorageEpoch);
   const subscribeInput: {
     threadId: ThreadIdType;
+    supportsThreadSettlementEvents?: boolean;
     afterSequence?: number;
     storageEpoch?: string;
     verifiedRevision?: number;
@@ -354,6 +355,7 @@ export const makeEnvironmentThreadState = Effect.fn("EnvironmentThreadState.make
     observedDataAudience?: DataAudience;
   } = {
     threadId,
+    supportsThreadSettlementEvents: true,
     ...(Option.isSome(initialStorageEpoch) ? { storageEpoch: initialStorageEpoch.value } : {}),
     ...(Option.isSome(cached) && cached.value.latestSequence !== undefined
       ? { verifiedRevision: cached.value.latestSequence }

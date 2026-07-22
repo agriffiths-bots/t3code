@@ -70,6 +70,30 @@ export const ThreadListV2SettledDivider = memo(function ThreadListV2SettledDivid
   );
 });
 
+export const ThreadListV2PrStateReporter = memo(function ThreadListV2PrStateReporter(props: {
+  readonly thread: EnvironmentThreadShell;
+  readonly projectCwd: string | null;
+  readonly onChangeRequestState: (
+    threadKey: string,
+    state: "open" | "closed" | "merged" | null,
+  ) => void;
+}) {
+  const { onChangeRequestState, projectCwd, thread } = props;
+  const pr = useThreadPr(thread, projectCwd);
+  const prState = pr?.state ?? null;
+  const threadKey = `${thread.environmentId}:${thread.id}`;
+  useEffect(() => {
+    onChangeRequestState(threadKey, prState);
+  }, [onChangeRequestState, prState, threadKey]);
+  useEffect(
+    () => () => {
+      onChangeRequestState(threadKey, null);
+    },
+    [onChangeRequestState, threadKey],
+  );
+  return null;
+});
+
 export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
   readonly thread: EnvironmentThreadShell;
   readonly variant: "card" | "slim";
@@ -86,13 +110,6 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
   readonly settlementSupported: boolean;
   readonly onSwipeableWillOpen: (methods: SwipeableMethods) => void;
   readonly onSwipeableClose: (methods: SwipeableMethods) => void;
-  /** Reports this row's live PR state up so the partition can auto-settle
-      merged/closed work (mirrors web's onChangeRequestState). */
-  readonly onChangeRequestState?: (
-    threadKey: string,
-    state: "open" | "closed" | "merged" | null,
-  ) => void;
-  readonly projectCwd?: string | null;
   readonly simultaneousSwipeGesture?: ComponentProps<
     typeof ThreadSwipeable
   >["simultaneousWithExternalGesture"];
@@ -106,15 +123,7 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
     onSettleThread,
     onUnsettleThread,
     onArchiveThread,
-    onChangeRequestState,
   } = props;
-
-  const pr = useThreadPr(thread, props.projectCwd ?? props.project?.workspaceRoot ?? null);
-  const prState = pr?.state ?? null;
-  const threadKey = `${thread.environmentId}:${thread.id}`;
-  useEffect(() => {
-    onChangeRequestState?.(threadKey, prState);
-  }, [onChangeRequestState, prState, threadKey]);
 
   const screenColor = useThemeColor("--color-screen");
 

@@ -246,7 +246,10 @@ function projectFileFailureContext(
   }
 }
 
-export function isThreadDetailEvent(event: OrchestrationEvent): event is Extract<
+export function isThreadDetailEvent(
+  event: OrchestrationEvent,
+  supportsThreadSettlementEvents = false,
+): event is Extract<
   OrchestrationEvent,
   {
     type:
@@ -254,6 +257,8 @@ export function isThreadDetailEvent(event: OrchestrationEvent): event is Extract
       | "thread.deleted"
       | "thread.archived"
       | "thread.unarchived"
+      | "thread.settled"
+      | "thread.unsettled"
       | "thread.proposed-plan-upserted"
       | "thread.activity-appended"
       | "thread.turn-diff-completed"
@@ -267,6 +272,8 @@ export function isThreadDetailEvent(event: OrchestrationEvent): event is Extract
     event.type === "thread.deleted" ||
     event.type === "thread.archived" ||
     event.type === "thread.unarchived" ||
+    (supportsThreadSettlementEvents && event.type === "thread.settled") ||
+    (supportsThreadSettlementEvents && event.type === "thread.unsettled") ||
     event.type === "thread.proposed-plan-upserted" ||
     event.type === "thread.activity-appended" ||
     event.type === "thread.turn-diff-completed" ||
@@ -1195,7 +1202,7 @@ const makeWsRpcLayer = (currentSession: EnvironmentAuth.AuthenticatedSession) =>
               const isThisThreadDetailEvent = (event: OrchestrationEvent) =>
                 event.aggregateKind === "thread" &&
                 event.aggregateId === input.threadId &&
-                isThreadDetailEvent(event);
+                isThreadDetailEvent(event, input.supportsThreadSettlementEvents === true);
               const storageEpoch = orchestrationEventStore.storageEpoch;
 
               const liveStream = visibleOrchestrationEvents(

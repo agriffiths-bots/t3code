@@ -5,6 +5,7 @@ import { describe, expect, it } from "vite-plus/test";
 import {
   buildThreadListV2Items,
   resolveThreadListV2Status,
+  selectThreadListV2PrSettlementCandidates,
   sortThreadsForListV2,
 } from "./threadListV2";
 
@@ -261,5 +262,28 @@ describe("buildThreadListV2Items settled paging", () => {
       "settled-3",
       "settled-2",
     ]);
+  });
+});
+
+describe("selectThreadListV2PrSettlementCandidates", () => {
+  it("keeps PR-derived settlement observed while excluding explicit lifecycle states", () => {
+    const candidate = makeThread({
+      id: ThreadId.make("candidate"),
+      title: "Candidate",
+      branch: "feature/candidate",
+    });
+    const candidates = selectThreadListV2PrSettlementCandidates({
+      threads: [
+        candidate,
+        { ...candidate, id: ThreadId.make("explicit-settled"), settledOverride: "settled" },
+        { ...candidate, id: ThreadId.make("pinned-active"), settledOverride: "active" },
+        { ...candidate, id: ThreadId.make("pending"), hasPendingApprovals: true },
+      ],
+      environmentId: null,
+      searchQuery: "",
+      now: NOW,
+    });
+
+    expect(candidates.map((thread) => thread.id)).toEqual(["candidate"]);
   });
 });
