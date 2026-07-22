@@ -43,6 +43,7 @@ import { ProjectionSnapshotQuery } from "../Services/ProjectionSnapshotQuery.ts"
 import { WorktreeLifecycleCoordinator } from "../Services/WorktreeLifecycleCoordinator.ts";
 import { readDetailedReadModel } from "../testUtils/readModel.ts";
 import { ServerConfig } from "../../config.ts";
+import { OrchestrationCommandInvariantError } from "../Errors.ts";
 
 import {
   sessionDispatchAuthority,
@@ -416,6 +417,90 @@ describe("OrchestrationEngine", () => {
       "thread.message-sent",
       "thread.turn-start-requested",
     ]);
+    await system.dispose();
+  });
+
+  it("evaluates an internal acceptance guard before appending command events", async () => {
+    const createdAt = now();
+    const system = await createOrchestrationSystem();
+    const { engine } = system;
+    const projectId = asProjectId("project-acceptance-guard");
+    const threadId = ThreadId.make("thread-acceptance-guard");
+    const modelSelection = {
+      instanceId: ProviderInstanceId.make("codex"),
+      model: "gpt-5-codex",
+    } as const;
+
+    await system.run(
+      engine.dispatch(
+        {
+          type: "project.create",
+          commandId: CommandId.make("cmd-acceptance-guard-project-create"),
+          projectId,
+          title: "Acceptance guard project",
+          workspaceRoot: "/tmp/project-acceptance-guard",
+          defaultModelSelection: modelSelection,
+          createdAt,
+        },
+        testDispatchAuthority,
+      ),
+    );
+    await system.run(
+      engine.dispatch(
+        {
+          type: "thread.create",
+          commandId: CommandId.make("cmd-acceptance-guard-thread-create"),
+          threadId,
+          projectId,
+          title: "Acceptance guard thread",
+          modelSelection,
+          interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+          runtimeMode: "approval-required",
+          branch: null,
+          worktreePath: null,
+          createdAt,
+        },
+        testDispatchAuthority,
+      ),
+    );
+
+    let guardRuns = 0;
+    await expect(
+      system.run(
+        engine.dispatch(
+          {
+            type: "thread.turn.start",
+            commandId: CommandId.make("cmd-acceptance-guard-turn-start"),
+            threadId,
+            message: {
+              messageId: asMessageId("message-acceptance-guard"),
+              role: "system",
+              text: "must not append",
+              attachments: [],
+            },
+            interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+            runtimeMode: "approval-required",
+            createdAt,
+          },
+          testDispatchAuthority,
+          Effect.gen(function* () {
+            guardRuns += 1;
+            return yield* new OrchestrationCommandInvariantError({
+              commandType: "thread.turn.start",
+              detail: "acceptance guard rejected test command",
+            });
+          }),
+        ),
+      ),
+    ).rejects.toThrow("acceptance guard rejected test command");
+
+    const events = await system.run(
+      Stream.runCollect(engine.readEvents(0)).pipe(
+        Effect.map((chunk): OrchestrationEvent[] => Array.from(chunk)),
+      ),
+    );
+    expect(guardRuns).toBe(1);
+    expect(events.map((event) => event.type)).toEqual(["project.created", "thread.created"]);
     await system.dispose();
   });
 

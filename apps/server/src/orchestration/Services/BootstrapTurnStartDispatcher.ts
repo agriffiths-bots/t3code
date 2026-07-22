@@ -38,7 +38,11 @@ import {
   authorizeOrchestrationCommandMutation,
   type OrchestrationCommandDispatchAuthority,
 } from "../commandAudienceGuard.ts";
-import { dispatchAlreadyCoordinated, OrchestrationEngineService } from "./OrchestrationEngine.ts";
+import {
+  dispatchAlreadyCoordinated,
+  type OrchestrationCommandAcceptanceGuard,
+  OrchestrationEngineService,
+} from "./OrchestrationEngine.ts";
 import { ProjectionSnapshotQuery } from "./ProjectionSnapshotQuery.ts";
 import { WorktreeLifecycleCoordinator } from "./WorktreeLifecycleCoordinator.ts";
 
@@ -112,6 +116,7 @@ export interface BootstrapTurnStartDispatcherShape {
   readonly dispatch: (
     command: ThreadTurnStartCommand,
     authority: OrchestrationCommandDispatchAuthority,
+    acceptanceGuard?: OrchestrationCommandAcceptanceGuard,
   ) => Effect.Effect<{ readonly sequence: number }, OrchestrationDispatchCommandError>;
 }
 
@@ -125,6 +130,7 @@ let activeDispatcher: BootstrapTurnStartDispatcherShape | null = null;
 export const dispatchActive = (
   command: ThreadTurnStartCommand,
   authority: OrchestrationCommandDispatchAuthority,
+  acceptanceGuard?: OrchestrationCommandAcceptanceGuard,
 ): Effect.Effect<{ readonly sequence: number }, OrchestrationDispatchCommandError> => {
   const dispatcher = activeDispatcher;
   if (!dispatcher) {
@@ -134,7 +140,7 @@ export const dispatchActive = (
       }),
     );
   }
-  return dispatcher.dispatch(command, authority);
+  return dispatcher.dispatch(command, authority, acceptanceGuard);
 };
 
 export const ActiveBootstrapTurnStartDispatcherLive = Layer.effectDiscard(
@@ -289,6 +295,7 @@ export const layer = Layer.effect(
     const dispatch = Effect.fn("BootstrapTurnStartDispatcher.dispatch")(function* (
       command: ThreadTurnStartCommand,
       authority: OrchestrationCommandDispatchAuthority,
+      acceptanceGuard?: OrchestrationCommandAcceptanceGuard,
     ) {
       let bootstrap = command.bootstrap;
       const { bootstrap: _bootstrap, ...finalTurnStartCommand } = command;
@@ -480,6 +487,7 @@ export const layer = Layer.effect(
                       orchestrationEngine,
                       finalTurnStartCommand,
                       authority,
+                      acceptanceGuard,
                     ).pipe(Effect.asVoid),
             }),
           ),
@@ -653,6 +661,7 @@ export const layer = Layer.effect(
             orchestrationEngine,
             finalTurnStartCommand,
             authority,
+            acceptanceGuard,
           );
         }
 
@@ -732,6 +741,7 @@ export const layer = Layer.effect(
           orchestrationEngine,
           finalTurnStartCommand,
           authority,
+          acceptanceGuard,
         );
       });
 

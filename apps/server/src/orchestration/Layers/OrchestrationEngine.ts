@@ -47,6 +47,7 @@ import { OrchestrationProjectionPipeline } from "../Services/ProjectionPipeline.
 import { ProjectionSnapshotQuery } from "../Services/ProjectionSnapshotQuery.ts";
 import {
   OrchestrationEngineService,
+  type OrchestrationCommandAcceptanceGuard,
   type OrchestrationEngineShape,
 } from "../Services/OrchestrationEngine.ts";
 import {
@@ -65,6 +66,7 @@ const isOrchestrationCommandAudienceAuthorizationError = Schema.is(
 interface CommandEnvelope {
   command: OrchestrationCommand;
   authority: OrchestrationCommandDispatchAuthority | undefined;
+  acceptanceGuard: OrchestrationCommandAcceptanceGuard | undefined;
   result: Deferred.Deferred<{ sequence: number }, OrchestrationDispatchError>;
   startedAtMs: number;
 }
@@ -161,6 +163,14 @@ const makeOrchestrationEngine = Effect.gen(function* () {
         });
 
         yield* requireUnarchiveWorktreeLifecycleReady(command);
+
+        // This runs after the command reaches the head of the engine's single
+        // queue. No later orchestration command can be accepted until this
+        // command commits or rejects, so trusted callers can close a
+        // check-then-dispatch race without extending the transport schema.
+        if (envelope.acceptanceGuard !== undefined) {
+          yield* envelope.acceptanceGuard;
+        }
 
         const eventBase = yield* decideOrchestrationCommand({
           command,
@@ -327,12 +337,14 @@ const makeOrchestrationEngine = Effect.gen(function* () {
   const dispatchQueued: NonNullable<OrchestrationEngineShape["dispatchCoordinated"]> = (
     command,
     authority,
+    acceptanceGuard,
   ) =>
     Effect.gen(function* () {
       const result = yield* Deferred.make<{ sequence: number }, OrchestrationDispatchError>();
       yield* Queue.offer(commandQueue, {
         command,
         authority,
+        acceptanceGuard,
         result,
         startedAtMs: yield* Clock.currentTimeMillis,
       });
@@ -371,11 +383,11 @@ const makeOrchestrationEngine = Effect.gen(function* () {
     });
   };
 
-  const dispatch: OrchestrationEngineShape["dispatch"] = (command, authority) => {
+  const dispatch: OrchestrationEngineShape["dispatch"] = (command, authority, acceptanceGuard) => {
     if (!commandRequiresWorktreeLifecycle(command)) {
-      return dispatchQueued(command, authority);
+      return dispatchQueued(command, authority, acceptanceGuard);
     }
-    return worktreeLifecycle.withPermit(dispatchQueued(command, authority));
+    return worktreeLifecycle.withPermit(dispatchQueued(command, authority, acceptanceGuard));
   };
 
   return {
