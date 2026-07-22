@@ -3,6 +3,7 @@ import {
   type DataAudience,
   type OrchestrationCommand,
   type OrchestrationEvent,
+  type OrchestrationMessage,
   type OrchestrationReadModel,
   DEFAULT_DATA_AUDIENCE,
   type ThreadId,
@@ -33,10 +34,17 @@ function projectCreateDataAudience(command: OrchestrationCommand): DataAudience 
   );
 }
 
-// Session adoption takes seconds; a user message still unadopted after this
+// Session adoption takes seconds; a prompt message still unadopted after this
 // window is a failed/stale start, not pending work. Mirrors the client's
 // QUEUED_TURN_START_GRACE_MS in client-runtime threadSettled.ts.
 const QUEUED_TURN_START_GRACE_MS = 2 * 60 * 1_000;
+
+function isQueuedTurnPromptMessage(message: Pick<OrchestrationMessage, "role" | "text">): boolean {
+  return (
+    message.role === "user" ||
+    (message.role === "system" && message.text.trimStart().startsWith("[sub-agent "))
+  );
+}
 
 function hasActiveThreadSession(
   session: OrchestrationReadModel["threads"][number]["session"],
@@ -561,20 +569,22 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
         );
       }
       const occurredAt = yield* nowIso;
-      // A queued turn start — a user message no turn has picked up yet — is
+      // A queued turn start — a user or sub-agent wake prompt no turn has picked up yet — is
       // work in flight even though session is still null (turn.start emits
       // message-sent + turn-start-requested; the session arrives later).
       // Settling in that window would hide just-requested work. Detection
-      // mirrors the client's hasQueuedTurnStart: the newest user message is
+      // mirrors the client's hasQueuedTurnStart: the newest prompt message is
       // strictly newer than every latestTurn timestamp (adoption stamps the
       // new turn's requestedAt with the message time, clearing this), and
       // only within the adoption grace window — historical threads whose
-      // last user message postdates their turn timestamps (older-server
+      // last prompt message postdates their turn timestamps (older-server
       // data, mid-turn messages) must stay settleable. A failed session
       // start (status "error") clears the block immediately.
-      const latestUserMessageAtMs = thread.messages.reduce(
+      const latestPromptMessageAtMs = thread.messages.reduce(
         (latest, message) =>
-          message.role === "user" ? Math.max(latest, Date.parse(message.createdAt)) : latest,
+          isQueuedTurnPromptMessage(message)
+            ? Math.max(latest, Date.parse(message.createdAt))
+            : latest,
         Number.NEGATIVE_INFINITY,
       );
       const latestTurnAtMs =
@@ -594,11 +604,11 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
       // negative age. Without the lower bound that negative age satisfies
       // `<= grace` for as long as the skew lasts, extending the settle
       // block far past the intended two minutes.
-      const queuedAgeMs = Date.parse(occurredAt) - latestUserMessageAtMs;
+      const queuedAgeMs = Date.parse(occurredAt) - latestPromptMessageAtMs;
       const hasQueuedTurnStart =
         thread.session?.status !== "error" &&
-        Number.isFinite(latestUserMessageAtMs) &&
-        latestUserMessageAtMs > latestTurnAtMs &&
+        Number.isFinite(latestPromptMessageAtMs) &&
+        latestPromptMessageAtMs > latestTurnAtMs &&
         Math.abs(queuedAgeMs) <= QUEUED_TURN_START_GRACE_MS;
       if (hasQueuedTurnStart) {
         return yield* Effect.fail(

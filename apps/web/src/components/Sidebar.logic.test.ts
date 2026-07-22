@@ -16,6 +16,7 @@ import {
   isContextMenuPointerDown,
   isTrailingDoubleClick,
   orderItemsByPreferredIds,
+  pageSidebarV2SettledGroups,
   partitionSidebarV2ThreadTreeRows,
   resolveProjectStatusIndicator,
   resolveSidebarNewThreadSeedContext,
@@ -938,6 +939,7 @@ function makeTreeThread(
     hasPendingUserInput: overrides.hasPendingUserInput ?? false,
     interactionMode: overrides.interactionMode ?? "default",
     latestTurn: overrides.latestTurn ?? null,
+    parentEnvironmentId: overrides.parentEnvironmentId ?? null,
     parentThreadId: overrides.parentThreadId ?? null,
     session: overrides.session ?? null,
   };
@@ -971,6 +973,31 @@ describe("buildSidebarThreadTreeRows", () => {
       directChildCount: 1,
       descendantCount: 1,
     });
+  });
+
+  it("uses parentEnvironmentId for cross-environment child links", () => {
+    const peerEnvironmentId = EnvironmentId.make("environment-peer");
+    const sharedParentId = ThreadId.make("shared-parent-id");
+    const localParent = makeTreeThread({ id: sharedParentId });
+    const peerParent = makeTreeThread({
+      environmentId: peerEnvironmentId,
+      id: sharedParentId,
+    });
+    const peerChild = makeTreeThread({
+      id: ThreadId.make("peer-child"),
+      parentEnvironmentId: peerEnvironmentId,
+      parentThreadId: sharedParentId,
+    });
+
+    const rows = buildSidebarThreadTreeRows([localParent, peerChild, peerParent]);
+
+    expect(rows.map((row) => [row.thread.environmentId, row.thread.id, row.depth])).toEqual([
+      [localEnvironmentId, localParent.id, 0],
+      [peerEnvironmentId, peerParent.id, 0],
+      [localEnvironmentId, peerChild.id, 1],
+    ]);
+    expect(rows[0]?.directChildCount).toBe(0);
+    expect(rows[1]?.directChildCount).toBe(1);
   });
 
   it("orders parent groups by the best sorted position among parent and descendants", () => {
@@ -1368,6 +1395,34 @@ describe("partitionSidebarV2ThreadTreeRows", () => {
     expect(partition.activeRows).toEqual([]);
     expect(partition.settledGroups).toHaveLength(1);
     expect(partition.settledGroups[0]?.map((row) => row.thread.id)).toEqual([parent.id, child.id]);
+  });
+
+  it("pages in the active settled thread's complete tree", () => {
+    const recent = makeTreeThread({ id: ThreadId.make("recent") });
+    const middle = makeTreeThread({ id: ThreadId.make("middle") });
+    const oldParent = makeTreeThread({ id: ThreadId.make("old-parent") });
+    const oldChild = makeTreeThread({
+      id: ThreadId.make("old-child"),
+      parentThreadId: oldParent.id,
+    });
+    const partition = partitionSidebarV2ThreadTreeRows(
+      [recent, middle, oldParent, oldChild],
+      () => true,
+    );
+
+    const page = pageSidebarV2SettledGroups(
+      partition.settledGroups,
+      1,
+      sidebarThreadExpansionKey(oldChild),
+    );
+
+    expect(page.visibleGroups.map((group) => group.map((row) => row.thread.id))).toEqual([
+      [recent.id],
+      [oldParent.id, oldChild.id],
+    ]);
+    expect(page.hiddenGroups.map((group) => group.map((row) => row.thread.id))).toEqual([
+      [middle.id],
+    ]);
   });
 });
 

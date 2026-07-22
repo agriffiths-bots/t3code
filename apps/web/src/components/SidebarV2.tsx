@@ -81,6 +81,7 @@ import {
   filterSidebarThreadTreeRowsByExpansion,
   hasUnseenCompletion,
   isTrailingDoubleClick,
+  pageSidebarV2SettledGroups,
   partitionSidebarV2ThreadTreeRows,
   resolveAdjacentThreadId,
   resolveSidebarV2Status,
@@ -887,14 +888,16 @@ export default function SidebarV2() {
     lastSettledResetKeyRef.current = settledResetKey;
     setSettledVisibleCount(SETTLED_TAIL_INITIAL_COUNT);
   }
-  const visibleSettledGroups = useMemo(
-    () => settledGroups.slice(0, settledVisibleCount),
-    [settledGroups, settledVisibleCount],
+  const settledGroupPage = useMemo(
+    () => pageSidebarV2SettledGroups(settledGroups, settledVisibleCount, routeThreadKey),
+    [routeThreadKey, settledGroups, settledVisibleCount],
   );
-  const hiddenSettledGroups = settledGroups.slice(settledVisibleCount);
+  const visibleSettledGroups = settledGroupPage.visibleGroups;
+  const hiddenSettledGroups = settledGroupPage.hiddenGroups;
   const hiddenSettledCount = hiddenSettledGroups.reduce((count, group) => count + group.length, 0);
-  const nextSettledPageCount = hiddenSettledGroups
-    .slice(0, SETTLED_TAIL_PAGE_COUNT)
+  const nextSettledPageCount = settledGroups
+    .slice(0, settledVisibleCount + SETTLED_TAIL_PAGE_COUNT)
+    .filter((group) => !visibleSettledGroups.includes(group))
     .reduce((count, group) => count + group.length, 0);
   const visibleSettledRows = useMemo(() => visibleSettledGroups.flat(), [visibleSettledGroups]);
   const showMoreSettled = useCallback(

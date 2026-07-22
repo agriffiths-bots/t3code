@@ -333,6 +333,55 @@ it.layer(NodeServices.layer)("settled thread decider", (it) => {
     }),
   );
 
+  it.effect("treats sub-agent wake system messages as queued turn starts", () =>
+    Effect.gen(function* () {
+      const systemMessage = (text: string): OrchestrationThread["messages"][number] => ({
+        id: MessageId.make(`message-${text}`),
+        role: "system",
+        text,
+        turnId: null,
+        streaming: false,
+        createdAt: "1969-12-31T23:59:30.000Z",
+        updatedAt: "1969-12-31T23:59:30.000Z",
+      });
+
+      const queuedError = yield* decideOrchestrationCommand({
+        command: {
+          type: "thread.settle",
+          commandId: CommandId.make("cmd-settle-subagent-wake"),
+          threadId: ThreadId.make("thread-1"),
+        },
+        readModel: makeReadModel(
+          null,
+          null,
+          null,
+          [],
+          [systemMessage("[sub-agent worker] Continue the parent task")],
+        ),
+      }).pipe(Effect.flip);
+      expect(queuedError._tag).toBe("OrchestrationCommandInvariantError");
+
+      const ordinarySystemNotice = yield* decideOrchestrationCommand({
+        command: {
+          type: "thread.settle",
+          commandId: CommandId.make("cmd-settle-system-notice"),
+          threadId: ThreadId.make("thread-1"),
+        },
+        readModel: makeReadModel(
+          null,
+          null,
+          null,
+          [],
+          [systemMessage("Provider configuration changed")],
+        ),
+      });
+      expect(
+        (Array.isArray(ordinarySystemNotice) ? ordinarySystemNotice : [ordinarySystemNotice])[0]
+          ?.type,
+      ).toBe("thread.settled");
+    }),
+  );
+
   it.effect("rejects settling and unsettling archived threads", () =>
     Effect.gen(function* () {
       const settleError = yield* decideOrchestrationCommand({

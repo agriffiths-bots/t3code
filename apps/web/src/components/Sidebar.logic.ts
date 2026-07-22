@@ -132,6 +132,7 @@ export type SidebarThreadTreeInput = Pick<
   | "id"
   | "interactionMode"
   | "latestTurn"
+  | "parentEnvironmentId"
   | "parentThreadId"
   | "session"
 >;
@@ -673,7 +674,7 @@ function sidebarThreadParentTreeKey(thread: SidebarThreadTreeInput): string | nu
   if (thread.parentThreadId === null) {
     return null;
   }
-  return `${thread.environmentId}\u0000${thread.parentThreadId}`;
+  return `${thread.parentEnvironmentId ?? thread.environmentId}\u0000${thread.parentThreadId}`;
 }
 
 export function isSidebarThreadActiveForSort(
@@ -1041,6 +1042,33 @@ export function partitionSidebarV2ThreadTreeRows<TThread extends SidebarThreadTr
     }
   }
   return { activeRows, settledGroups };
+}
+
+export function pageSidebarV2SettledGroups<TThread extends SidebarThreadTreeInput>(
+  groups: ReadonlyArray<ReadonlyArray<SidebarV2ThreadTreeRow<TThread>>>,
+  visibleGroupCount: number,
+  activeThreadKey: string | null | undefined,
+): {
+  readonly visibleGroups: ReadonlyArray<ReadonlyArray<SidebarV2ThreadTreeRow<TThread>>>;
+  readonly hiddenGroups: ReadonlyArray<ReadonlyArray<SidebarV2ThreadTreeRow<TThread>>>;
+} {
+  const visibleIndexes = new Set<number>();
+  for (let index = 0; index < Math.min(groups.length, Math.max(0, visibleGroupCount)); index += 1) {
+    visibleIndexes.add(index);
+  }
+  if (activeThreadKey !== null && activeThreadKey !== undefined) {
+    const activeGroupIndex = groups.findIndex((group) =>
+      group.some((row) => sidebarThreadExpansionKey(row.thread) === activeThreadKey),
+    );
+    if (activeGroupIndex >= 0) {
+      visibleIndexes.add(activeGroupIndex);
+    }
+  }
+
+  return {
+    visibleGroups: groups.filter((_, index) => visibleIndexes.has(index)),
+    hiddenGroups: groups.filter((_, index) => !visibleIndexes.has(index)),
+  };
 }
 
 export function resolveProjectStatusIndicator(
