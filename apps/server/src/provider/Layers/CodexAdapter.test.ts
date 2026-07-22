@@ -344,6 +344,24 @@ validationLayer("CodexAdapterLive validation", (it) => {
     }),
   );
 
+  it.effect("keeps explicit Standard routing when starting a session", () =>
+    Effect.gen(function* () {
+      validationRuntimeFactory.factory.mockClear();
+      const adapter = yield* CodexAdapter;
+
+      yield* adapter.startSession({
+        provider: ProviderDriverKind.make("codex"),
+        threadId: asThreadId("thread-standard"),
+        modelSelection: createModelSelection(ProviderInstanceId.make("codex"), "gpt-5.4", [
+          { id: "serviceTier", value: "default" },
+        ]),
+        runtimeMode: "full-access",
+      });
+
+      NodeAssert.equal(validationRuntimeFactory.factory.mock.calls[0]?.[0].serviceTier, "default");
+    }),
+  );
+
   it.effect("injects the canonical MCP server into Codex app-server sessions", () => {
     const runtimeFactory = makeRuntimeFactory();
     const baseEnvironment = { KEEP_ME: "1" };
@@ -461,6 +479,35 @@ sessionErrorLayer("CodexAdapterLive session errors", (it) => {
         effort: "high",
         serviceTier: "priority",
       });
+    }),
+  );
+
+  it.effect("sends a persisted Fast-to-Standard choice on later turns", () =>
+    Effect.gen(function* () {
+      const adapter = yield* CodexAdapter;
+      const threadId = asThreadId("sess-fast-to-standard");
+      yield* adapter.startSession({
+        provider: ProviderDriverKind.make("codex"),
+        threadId,
+        modelSelection: createModelSelection(ProviderInstanceId.make("codex"), "gpt-5.4", [
+          { id: "serviceTier", value: "priority" },
+        ]),
+        runtimeMode: "full-access",
+      });
+      const runtime = sessionRuntimeFactory.lastRuntime;
+      NodeAssert.ok(runtime);
+      runtime.sendTurnImpl.mockClear();
+
+      yield* adapter.sendTurn({
+        threadId,
+        input: "continue on Standard",
+        modelSelection: createModelSelection(ProviderInstanceId.make("codex"), "gpt-5.4", [
+          { id: "serviceTier", value: "default" },
+        ]),
+        attachments: [],
+      });
+
+      NodeAssert.equal(runtime.sendTurnImpl.mock.calls[0]?.[0].serviceTier, "default");
     }),
   );
 

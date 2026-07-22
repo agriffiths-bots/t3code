@@ -18,5 +18,13 @@ it("keeps legacy persisted fast mode selections working", () => {
     { id: "fastMode", value: true },
   ]);
 
-  assert.equal(getCodexServiceTierOptionValue(selection), "fast");
+  assert.equal(getCodexServiceTierOptionValue(selection), "priority");
+});
+
+it("keeps legacy persisted fast-off selections on explicit Standard routing", () => {
+  const selection = createModelSelection(ProviderInstanceId.make("codex"), "gpt-5.4", [
+    { id: "fastMode", value: false },
+  ]);
+
+  assert.equal(getCodexServiceTierOptionValue(selection), "default");
 });

@@ -126,6 +126,54 @@ describe("getComposerProviderState", () => {
     );
   });
 
+  it("keeps a saved Standard draft choice ahead of a catalog-managed Fast default", () => {
+    const state = getComposerProviderState({
+      provider: PROVIDER,
+      model: MODEL,
+      models: modelWith([
+        selectDescriptor("serviceTier", [
+          { id: "default", label: "Standard" },
+          { id: "priority", label: "Fast", isDefault: true },
+        ]),
+      ]),
+      modelOptions: selections(["serviceTier", "default"]),
+    });
+
+    expect(state.modelOptionsForDispatch).toEqual(selections(["serviceTier", "default"]));
+  });
+
+  it("normalizes a legacy saved Fast choice against current service-tier descriptors", () => {
+    const state = getComposerProviderState({
+      provider: PROVIDER,
+      model: MODEL,
+      models: modelWith([
+        selectDescriptor("serviceTier", [
+          { id: "default", label: "Standard", isDefault: true },
+          { id: "priority", label: "Fast" },
+        ]),
+      ]),
+      modelOptions: selections(["fastMode", true]),
+    });
+
+    expect(state.modelOptionsForDispatch).toEqual(selections(["serviceTier", "priority"]));
+  });
+
+  it("normalizes a legacy string-valued Fast tier against current descriptors", () => {
+    const state = getComposerProviderState({
+      provider: PROVIDER,
+      model: MODEL,
+      models: modelWith([
+        selectDescriptor("serviceTier", [
+          { id: "default", label: "Standard", isDefault: true },
+          { id: "priority", label: "Fast" },
+        ]),
+      ]),
+      modelOptions: selections(["serviceTier", "fast"]),
+    });
+
+    expect(state.modelOptionsForDispatch).toEqual(selections(["serviceTier", "priority"]));
+  });
+
   it("drops selections for descriptors the model does not declare", () => {
     const state = getComposerProviderState({
       provider: PROVIDER,
