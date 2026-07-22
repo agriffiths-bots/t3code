@@ -51,7 +51,7 @@ import { SqlClient } from "effect/unstable/sql/SqlClient";
 import * as SqlSchema from "effect/unstable/sql/SqlSchema";
 import * as Schema from "effect/Schema";
 import { ThreadStartToolError } from "../../mcp/toolkits/thread/tools.ts";
-import { OrchestrationCommandInvariantError } from "../Errors.ts";
+import { OrchestrationCommandAcceptanceDeferredError } from "../Errors.ts";
 import {
   ChildThreadCoordinator,
   MAX_DEPTH,
@@ -97,9 +97,10 @@ interface PendingInjection {
   /**
    * The command id this row must dispatch under (R-B exactly-once). Null for a
    * fresh injection that may be consolidated into a batch under a fresh
-   * deterministic id; non-null means it MUST be dispatched alone under this exact
-   * id so the engine's receipt dedup makes a landed turn a no-op (no duplicate)
-   * and an un-landed turn fire (no loss), regardless of how rows later re-batch.
+   * deterministic id; non-null means it MUST be dispatched with every other
+   * pending row claimed under this exact id so the engine's receipt dedup makes
+   * a landed turn a no-op (no duplicate) and an un-landed turn fire (no loss),
+   * regardless of how fresh rows later re-batch.
    */
   readonly claimedCommandId: CommandId | null;
 }
@@ -861,6 +862,76 @@ const make = Effect.gen(function* () {
           )
           AND NOT EXISTS (
             SELECT 1
+            FROM orchestration_events AS latest_turn_start
+            WHERE latest_turn_start.event_id = (
+              SELECT candidate_turn_start.event_id
+              FROM orchestration_events AS candidate_turn_start
+              WHERE candidate_turn_start.stream_id = pending_dispatches.source_child_id
+                AND candidate_turn_start.event_type = 'thread.turn-start-requested'
+                AND candidate_turn_start.sequence > pending_dispatches.source_terminal_sequence
+              ORDER BY candidate_turn_start.sequence DESC
+              LIMIT 1
+            )
+              AND NOT EXISTS (
+                SELECT 1
+                FROM orchestration_events AS correlated_start_failure
+                WHERE correlated_start_failure.stream_id = pending_dispatches.source_child_id
+                  AND correlated_start_failure.event_type = 'thread.activity-appended'
+                  AND correlated_start_failure.sequence > latest_turn_start.sequence
+                  AND json_extract(
+                    correlated_start_failure.payload_json,
+                    '$.activity.kind'
+                  ) = 'provider.turn.start.failed'
+                  AND (
+                    json_extract(
+                      correlated_start_failure.payload_json,
+                      '$.activity.payload.turnStartRequestId'
+                    ) = latest_turn_start.event_id
+                    OR (
+                      COALESCE(
+                        json_type(
+                          correlated_start_failure.payload_json,
+                          '$.activity.payload.turnStartRequestId'
+                        ),
+                        ''
+                      ) <> 'text'
+                      AND NOT EXISTS (
+                        SELECT 1
+                        FROM orchestration_events AS prior_unresolved_turn_start
+                        WHERE prior_unresolved_turn_start.stream_id =
+                            pending_dispatches.source_child_id
+                          AND prior_unresolved_turn_start.event_type =
+                            'thread.turn-start-requested'
+                          AND prior_unresolved_turn_start.sequence >
+                            pending_dispatches.source_terminal_sequence
+                          AND prior_unresolved_turn_start.sequence < latest_turn_start.sequence
+                          AND NOT EXISTS (
+                            SELECT 1
+                            FROM orchestration_events AS prior_correlated_start_failure
+                            WHERE prior_correlated_start_failure.stream_id =
+                                pending_dispatches.source_child_id
+                              AND prior_correlated_start_failure.event_type =
+                                'thread.activity-appended'
+                              AND prior_correlated_start_failure.sequence >
+                                prior_unresolved_turn_start.sequence
+                              AND prior_correlated_start_failure.sequence <
+                                latest_turn_start.sequence
+                              AND json_extract(
+                                prior_correlated_start_failure.payload_json,
+                                '$.activity.kind'
+                              ) = 'provider.turn.start.failed'
+                              AND json_extract(
+                                prior_correlated_start_failure.payload_json,
+                                '$.activity.payload.turnStartRequestId'
+                              ) = prior_unresolved_turn_start.event_id
+                          )
+                      )
+                    )
+                  )
+              )
+          )
+          AND NOT EXISTS (
+            SELECT 1
             FROM orchestration_events AS newer_unarchive
             WHERE pending_dispatches.error = 'thread archived'
               AND newer_unarchive.stream_id = pending_dispatches.source_child_id
@@ -882,6 +953,88 @@ const make = Effect.gen(function* () {
           terminal_delivery_claimed_at AS "claimedAt",
           terminal_delivery_claimed_sequence AS "claimedSequence",
           terminal_kind AS "terminalKind"
+      `,
+  });
+
+  const listPendingReplacementDispatchRows = SqlSchema.findAll({
+    Request: Schema.Struct({ dispatchIds: Schema.Array(Schema.String) }),
+    Result: Schema.Struct({ id: Schema.String }),
+    execute: ({ dispatchIds }) =>
+      sql`
+        SELECT id
+        FROM pending_dispatches
+        WHERE ${sql.in("id", dispatchIds)}
+          AND source_terminal_sequence IS NOT NULL
+          AND EXISTS (
+            SELECT 1
+            FROM orchestration_events AS latest_turn_start
+            WHERE latest_turn_start.event_id = (
+              SELECT candidate_turn_start.event_id
+              FROM orchestration_events AS candidate_turn_start
+              WHERE candidate_turn_start.stream_id = pending_dispatches.source_child_id
+                AND candidate_turn_start.event_type = 'thread.turn-start-requested'
+                AND candidate_turn_start.sequence > pending_dispatches.source_terminal_sequence
+              ORDER BY candidate_turn_start.sequence DESC
+              LIMIT 1
+            )
+              AND NOT EXISTS (
+                SELECT 1
+                FROM orchestration_events AS correlated_start_failure
+                WHERE correlated_start_failure.stream_id = pending_dispatches.source_child_id
+                  AND correlated_start_failure.event_type = 'thread.activity-appended'
+                  AND correlated_start_failure.sequence > latest_turn_start.sequence
+                  AND json_extract(
+                    correlated_start_failure.payload_json,
+                    '$.activity.kind'
+                  ) = 'provider.turn.start.failed'
+                  AND (
+                    json_extract(
+                      correlated_start_failure.payload_json,
+                      '$.activity.payload.turnStartRequestId'
+                    ) = latest_turn_start.event_id
+                    OR (
+                      COALESCE(
+                        json_type(
+                          correlated_start_failure.payload_json,
+                          '$.activity.payload.turnStartRequestId'
+                        ),
+                        ''
+                      ) <> 'text'
+                      AND NOT EXISTS (
+                        SELECT 1
+                        FROM orchestration_events AS prior_unresolved_turn_start
+                        WHERE prior_unresolved_turn_start.stream_id =
+                            pending_dispatches.source_child_id
+                          AND prior_unresolved_turn_start.event_type =
+                            'thread.turn-start-requested'
+                          AND prior_unresolved_turn_start.sequence >
+                            pending_dispatches.source_terminal_sequence
+                          AND prior_unresolved_turn_start.sequence < latest_turn_start.sequence
+                          AND NOT EXISTS (
+                            SELECT 1
+                            FROM orchestration_events AS prior_correlated_start_failure
+                            WHERE prior_correlated_start_failure.stream_id =
+                                pending_dispatches.source_child_id
+                              AND prior_correlated_start_failure.event_type =
+                                'thread.activity-appended'
+                              AND prior_correlated_start_failure.sequence >
+                                prior_unresolved_turn_start.sequence
+                              AND prior_correlated_start_failure.sequence <
+                                latest_turn_start.sequence
+                              AND json_extract(
+                                prior_correlated_start_failure.payload_json,
+                                '$.activity.kind'
+                              ) = 'provider.turn.start.failed'
+                              AND json_extract(
+                                prior_correlated_start_failure.payload_json,
+                                '$.activity.payload.turnStartRequestId'
+                              ) = prior_unresolved_turn_start.event_id
+                          )
+                      )
+                    )
+                  )
+              )
+          )
       `,
   });
 
@@ -923,9 +1076,14 @@ const make = Effect.gen(function* () {
   const requirePendingWakeLifecyclesCurrentAtAcceptance = Effect.fn(
     "ChildThreadCoordinator.requirePendingWakeLifecyclesCurrentAtAcceptance",
   )(function* (entries: ReadonlyArray<PendingInjection>) {
-    const currentRows = yield* listLifecycleCurrentDispatchRows({
-      dispatchIds: entries.map((entry) => entry.dispatchId),
-    }).pipe(
+    const dispatchIds = entries.map((entry) => entry.dispatchId);
+    const [currentRows, pendingReplacementRows] = yield* Effect.all(
+      [
+        listLifecycleCurrentDispatchRows({ dispatchIds }),
+        listPendingReplacementDispatchRows({ dispatchIds }),
+      ],
+      { concurrency: "unbounded" },
+    ).pipe(
       Effect.mapError(
         toPersistenceSqlError(
           "ChildThreadCoordinator.requirePendingWakeLifecyclesCurrentAtAcceptance",
@@ -933,13 +1091,18 @@ const make = Effect.gen(function* () {
       ),
     );
     const currentDispatchIds = new Set(currentRows.map((row) => row.id));
+    const pendingReplacementDispatchIds = new Set(pendingReplacementRows.map((row) => row.id));
     const supersededDispatchIds = entries
-      .filter((entry) => !currentDispatchIds.has(entry.dispatchId))
+      .filter(
+        (entry) =>
+          !currentDispatchIds.has(entry.dispatchId) ||
+          pendingReplacementDispatchIds.has(entry.dispatchId),
+      )
       .map((entry) => String(entry.dispatchId));
     if (supersededDispatchIds.length === 0) return;
-    return yield* new OrchestrationCommandInvariantError({
+    return yield* new OrchestrationCommandAcceptanceDeferredError({
       commandType: "thread.turn.start",
-      detail: `Subagent terminal wake lifecycle was superseded before command acceptance (${supersededDispatchIds.join(",")}).`,
+      detail: `Subagent terminal wake lifecycle is not dispatchable at command acceptance (${supersededDispatchIds.join(",")}).`,
     });
   });
 
@@ -1183,6 +1346,16 @@ const make = Effect.gen(function* () {
     );
   };
 
+  const pendingWakeHasProvisionalReplacement = (entry: PendingInjection): boolean => {
+    if (entry.sourceTerminalSequence === null) return false;
+    const pending = pendingTerminalDeliverySupersessionByChild.get(entry.childThreadId);
+    return (
+      pending !== undefined &&
+      (pending.sourceTerminalSequence === null ||
+        pending.sourceTerminalSequence === entry.sourceTerminalSequence)
+    );
+  };
+
   const discardSupersededWakeEntries = (
     entries: ReadonlyArray<PendingInjection>,
     replacementCoveredChildIds: ReadonlySet<ThreadId> = new Set(),
@@ -1274,16 +1447,38 @@ const make = Effect.gen(function* () {
       const durableCurrentIds = new Set(
         durableCurrentRows.map((row) => row.id as PendingDispatchId),
       );
-      const dispatchableEntries = memoryCurrentEntries.filter((entry) =>
+      const lifecycleCurrentEntries = memoryCurrentEntries.filter((entry) =>
         durableCurrentIds.has(entry.dispatchId),
       );
-      const dispatchableIds = new Set(dispatchableEntries.map((entry) => entry.dispatchId));
-      const supersededEntries = entries.filter((entry) => !dispatchableIds.has(entry.dispatchId));
+      const lifecycleCurrentIds = new Set(lifecycleCurrentEntries.map((entry) => entry.dispatchId));
+      const supersededEntries = entries.filter(
+        (entry) => !lifecycleCurrentIds.has(entry.dispatchId),
+      );
       yield* discardSupersededWakeEntries(
         supersededEntries,
-        new Set(dispatchableEntries.map((entry) => entry.childThreadId)),
+        new Set(lifecycleCurrentEntries.map((entry) => entry.childThreadId)),
       );
-      return dispatchableEntries;
+      const durablePendingReplacementRows =
+        lifecycleCurrentEntries.length === 0
+          ? []
+          : yield* listPendingReplacementDispatchRows({
+              dispatchIds: lifecycleCurrentEntries.map((entry) => entry.dispatchId),
+            }).pipe(Effect.orDie);
+      const durablePendingReplacementIds = new Set(
+        durablePendingReplacementRows.map((row) => row.id as PendingDispatchId),
+      );
+      const deferredEntries = lifecycleCurrentEntries.filter(
+        (entry) =>
+          pendingWakeHasProvisionalReplacement(entry) ||
+          durablePendingReplacementIds.has(entry.dispatchId),
+      );
+      const deferredIds = new Set(deferredEntries.map((entry) => entry.dispatchId));
+      return {
+        dispatchableEntries: lifecycleCurrentEntries.filter(
+          (entry) => !deferredIds.has(entry.dispatchId),
+        ),
+        deferredEntries,
+      };
     });
 
   const markDispatchRowsDeliveredAndClearWakeState = (
@@ -1297,11 +1492,14 @@ const make = Effect.gen(function* () {
       // and the engine receipt makes it a no-op. Sequence-bound rows can instead
       // become compact terminal-delivery tombstones and be deleted normally.
       const sequenceBoundEntries = entries.filter((entry) => entry.sourceTerminalSequence !== null);
-      const claimableEntries = sequenceBoundEntries.filter(pendingWakeLifecycleIsCurrent);
+      const lifecycleCurrentEntries = sequenceBoundEntries.filter(pendingWakeLifecycleIsCurrent);
+      const claimableEntries = lifecycleCurrentEntries.filter(
+        (entry) => !pendingWakeHasProvisionalReplacement(entry),
+      );
       const claimableDispatchIds = new Set(claimableEntries.map((entry) => entry.dispatchId));
       const invalidatedDispatchIds = new Set(
         sequenceBoundEntries
-          .filter((entry) => !claimableDispatchIds.has(entry.dispatchId))
+          .filter((entry) => !pendingWakeLifecycleIsCurrent(entry))
           .map((entry) => entry.dispatchId),
       );
       const claimedAt = yield* nowIso;
@@ -1635,6 +1833,17 @@ const make = Effect.gen(function* () {
           for (const entry of queue) {
             if (entry.childThreadId === childThreadId) {
               deliveredIds.push(entry.dispatchId);
+            }
+          }
+          const persistedParentRows = yield* pendingDispatches
+            .listByTarget({
+              kind: "parent_injection",
+              targetThreadId: record.parentThreadId,
+            })
+            .pipe(Effect.orDie);
+          for (const row of persistedParentRows) {
+            if (row.sourceChildId === childThreadId && !deliveredIds.includes(row.id)) {
+              deliveredIds.push(row.id);
             }
           }
           if (terminalResult !== null && deliveredIds.length === 0) {
@@ -2241,7 +2450,13 @@ const make = Effect.gen(function* () {
             let retryEntry: PendingInjection | null = entry;
             yield* Effect.gen(function* () {
               yield* claimDispatchRows([entry.dispatchId], commandId);
-              const dispatchableEntries = yield* fencePendingEntriesBeforeDispatch([entry]);
+              const claimedEntry = { ...entry, claimedCommandId: commandId };
+              retryEntry = claimedEntry;
+              const { dispatchableEntries, deferredEntries } =
+                yield* fencePendingEntriesBeforeDispatch([claimedEntry]);
+              for (const deferredEntry of deferredEntries) {
+                enqueuePending(parentThreadId, deferredEntry);
+              }
               retryEntry = dispatchableEntries[0] ?? null;
               if (retryEntry === null) return;
               yield* dispatchParentTurn(shell, consolidatedInjectionText([retryEntry]), commandId, [
@@ -2368,7 +2583,30 @@ const make = Effect.gen(function* () {
             let retryEntries = batch;
             return Effect.gen(function* () {
               yield* claimDispatchRows(ids, commandId);
-              retryEntries = yield* fencePendingEntriesBeforeDispatch(batch);
+              const claimedBatch = batch.map((entry) => ({
+                ...entry,
+                claimedCommandId: commandId,
+              }));
+              retryEntries = claimedBatch;
+              const fencedEntries = yield* fencePendingEntriesBeforeDispatch(claimedBatch);
+              const currentDispatchIds = new Set(
+                [...fencedEntries.dispatchableEntries, ...fencedEntries.deferredEntries].map(
+                  (entry) => entry.dispatchId,
+                ),
+              );
+              retryEntries = claimedBatch.filter((entry) =>
+                currentDispatchIds.has(entry.dispatchId),
+              );
+              if (fencedEntries.deferredEntries.length > 0) {
+                // Every row above was durably claimed under one command id. A
+                // partial dispatch would accept that shared receipt while
+                // stranding the omitted row, so defer the whole current batch.
+                for (const retryEntry of retryEntries) {
+                  enqueuePending(parentThreadId, retryEntry);
+                }
+                return;
+              }
+              retryEntries = fencedEntries.dispatchableEntries;
               if (retryEntries.length === 0) return;
               yield* dispatchParentTurn(
                 shell,
@@ -2389,15 +2627,22 @@ const make = Effect.gen(function* () {
             );
           };
 
-          // A claimed entry (its turn was already dispatched under a fixed id
-          // before a crash) MUST be re-dispatched alone under that exact id so the
-          // engine dedups a landed turn — it can never be folded into a fresh
-          // consolidated batch (which the engine has no receipt for). Unclaimed
-          // entries consolidate into one turn under a fresh deterministic id.
+          // Claimed entries MUST be re-dispatched in their original command-id
+          // groups so an un-landed multi-row batch is preserved and a landed one
+          // is deduped. They can never be folded into a fresh consolidated batch
+          // (which the engine has no receipt for). Unclaimed entries consolidate
+          // into one turn under a fresh deterministic id.
           const claimed = entries.filter((entry) => entry.claimedCommandId !== null);
           const fresh = entries.filter((entry) => entry.claimedCommandId === null);
+          const claimedBatches = new Map<CommandId, Array<PendingInjection>>();
           for (const entry of claimed) {
-            yield* drainBatch([entry], entry.claimedCommandId as CommandId);
+            const commandId = entry.claimedCommandId as CommandId;
+            const batch = claimedBatches.get(commandId) ?? [];
+            batch.push(entry);
+            claimedBatches.set(commandId, batch);
+          }
+          for (const [commandId, batch] of claimedBatches) {
+            yield* drainBatch(batch, commandId);
           }
           yield* drainBatch(
             fresh,
