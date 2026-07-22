@@ -1,6 +1,7 @@
 import { assert, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
 
 import { runMigrations } from "../Migrations.ts";
@@ -11,16 +12,19 @@ const layer = it.layer(Layer.mergeAll(NodeSqliteClient.layerMemory()));
 
 const parentThreadId = "terminal-backfill-parent";
 const timestamp = "2000-01-01T08:00:00.000Z";
+const encodeUnknownJson = Schema.encodeUnknownSync(Schema.UnknownFromJsonString);
 
 layer("054_BackfillPreexistingLocalSubagentTerminalDeliveries", (it) => {
   it.effect("backfills every delivered pre-existing terminal local child and is idempotent", () =>
     Effect.gen(function* () {
       const sql = yield* SqlClient.SqlClient;
       yield* runMigrations({ toMigrationInclusive: 53 });
+      let nextTerminalSequence = 200;
 
       const seedChild = Effect.fn("seedTerminalBackfillChild")(function* (input: {
         readonly threadId: string;
         readonly turnState?: "completed" | "error" | "interrupted" | "pending" | "running";
+        readonly terminalDiffStatus?: "ready" | "error" | "missing";
         readonly turnAt?: string;
         readonly archivedAt?: string;
         readonly deletedAt?: string;
@@ -105,7 +109,76 @@ layer("054_BackfillPreexistingLocalSubagentTerminalDeliveries", (it) => {
             )
           `;
         }
-        if (input.sequence !== undefined) {
+        const turnAt = input.turnAt ?? timestamp;
+        const sessionUpdatedAt = input.sessionUpdatedAt ?? timestamp;
+        const archiveOwnsTerminal =
+          input.archivedAt !== undefined &&
+          (input.turnState === undefined ||
+            input.turnState === "pending" ||
+            input.turnState === "running" ||
+            turnAt > input.archivedAt);
+        const terminalEvent =
+          input.deletedAt !== undefined
+            ? {
+                type: "thread.deleted",
+                occurredAt: input.deletedAt,
+                payload: { deletedAt: input.deletedAt },
+              }
+            : archiveOwnsTerminal
+              ? {
+                  type: "thread.archived",
+                  occurredAt: input.archivedAt,
+                  payload: { archivedAt: input.archivedAt },
+                }
+              : input.turnState === "error" &&
+                  (input.sessionStatus === "error" || input.sessionStatus === "stopped")
+                ? {
+                    type: "thread.session-set",
+                    occurredAt: sessionUpdatedAt,
+                    payload: {
+                      session: { status: input.sessionStatus, updatedAt: sessionUpdatedAt },
+                    },
+                  }
+                : input.turnState === "completed" ||
+                    input.turnState === "error" ||
+                    (input.turnState === "interrupted" && input.terminalDiffStatus !== undefined)
+                  ? {
+                      type: "thread.turn-diff-completed",
+                      occurredAt: turnAt,
+                      payload: {
+                        turnId,
+                        completedAt: turnAt,
+                        status:
+                          input.terminalDiffStatus ??
+                          (input.turnState === "error" ? "error" : "ready"),
+                      },
+                    }
+                  : input.turnState === "interrupted"
+                    ? {
+                        type: "thread.turn-interrupt-requested",
+                        occurredAt: turnAt,
+                        payload: { turnId, createdAt: turnAt },
+                      }
+                    : input.archivedAt !== undefined
+                      ? {
+                          type: "thread.archived",
+                          occurredAt: input.archivedAt,
+                          payload: { archivedAt: input.archivedAt },
+                        }
+                      : input.sessionStatus === "error" || input.sessionStatus === "stopped"
+                        ? {
+                            type: "thread.session-set",
+                            occurredAt: sessionUpdatedAt,
+                            payload: {
+                              session: {
+                                status: input.sessionStatus,
+                                updatedAt: sessionUpdatedAt,
+                              },
+                            },
+                          }
+                        : null;
+        if (terminalEvent !== null) {
+          const sequence = input.sequence ?? nextTerminalSequence++;
           yield* sql`
             INSERT INTO orchestration_events (
               sequence,
@@ -120,15 +193,15 @@ layer("054_BackfillPreexistingLocalSubagentTerminalDeliveries", (it) => {
               metadata_json
             )
             VALUES (
-              ${input.sequence},
+              ${sequence},
               ${`terminal-backfill-event-${input.threadId}`},
               ${"thread"},
               ${input.threadId},
               ${0},
-              ${"thread.turn-diff-completed"},
-              ${timestamp},
+              ${terminalEvent.type},
+              ${terminalEvent.occurredAt},
               ${"server"},
-              ${"{}"},
+              ${encodeUnknownJson(terminalEvent.payload)},
               ${"{}"}
             )
           `;
@@ -194,6 +267,18 @@ layer("054_BackfillPreexistingLocalSubagentTerminalDeliveries", (it) => {
             sessionStatus: "ready" as const,
           },
           {
+            threadId: "missing-diff-interrupted-local",
+            turnState: "interrupted" as const,
+            terminalDiffStatus: "missing" as const,
+            sessionStatus: "ready" as const,
+          },
+          {
+            threadId: "same-millisecond-old-wake-local",
+            turnState: "completed" as const,
+            sessionStatus: "ready" as const,
+            sequence: 1_200,
+          },
+          {
             threadId: "live-local",
             turnState: "running" as const,
             sessionStatus: "running" as const,
@@ -213,6 +298,11 @@ layer("054_BackfillPreexistingLocalSubagentTerminalDeliveries", (it) => {
           },
           {
             threadId: "wait-delivered-local",
+            turnState: "completed" as const,
+            sessionStatus: "ready" as const,
+          },
+          {
+            threadId: "same-millisecond-wait-local",
             turnState: "completed" as const,
             sessionStatus: "ready" as const,
           },
@@ -262,6 +352,33 @@ layer("054_BackfillPreexistingLocalSubagentTerminalDeliveries", (it) => {
         seedChild,
       );
 
+      yield* sql`
+        INSERT INTO orchestration_events (
+          sequence,
+          event_id,
+          aggregate_kind,
+          stream_id,
+          stream_version,
+          event_type,
+          occurred_at,
+          actor_kind,
+          payload_json,
+          metadata_json
+        )
+        VALUES (
+          ${104},
+          ${"terminal-backfill-newer-start-after-stale-claim-terminal"},
+          ${"thread"},
+          ${"stale-claim-newer-lifecycle-local"},
+          ${1},
+          ${"thread.turn-start-requested"},
+          ${"2000-01-01T08:30:00.000Z"},
+          ${"server"},
+          ${"{}"},
+          ${"{}"}
+        )
+      `;
+
       const messageDeliveredChildren = [
         "archived-before-terminal-local",
         "archived-completed-local",
@@ -269,9 +386,11 @@ layer("054_BackfillPreexistingLocalSubagentTerminalDeliveries", (it) => {
         "completed-local",
         "deleted-active-local",
         "failed-local",
+        "missing-diff-interrupted-local",
         "post-053-archived-local",
         "post-053-completed-local",
         "session-failed-before-turn-projection-local",
+        "same-millisecond-old-wake-local",
         "stale-claim-newer-lifecycle-local",
         "status-mismatch-local",
         "stopped-local",
@@ -283,9 +402,12 @@ layer("054_BackfillPreexistingLocalSubagentTerminalDeliveries", (it) => {
             ? "2000-01-01T09:30:00.000Z"
             : childThreadId === "session-failed-before-turn-projection-local"
               ? "2000-01-01T09:30:00.000Z"
-              : "2001-01-01T08:00:00.000Z";
+              : childThreadId === "same-millisecond-old-wake-local"
+                ? timestamp
+                : "2001-01-01T08:00:00.000Z";
         const deliveredStatus =
           childThreadId === "failed-local" ||
+          childThreadId === "missing-diff-interrupted-local" ||
           childThreadId === "session-failed-before-turn-projection-local" ||
           childThreadId === "stopped-local" ||
           childThreadId === "status-mismatch-local"
@@ -366,6 +488,11 @@ layer("054_BackfillPreexistingLocalSubagentTerminalDeliveries", (it) => {
           ${"previous-parent"},
           ${"2001-01-01T08:00:00.000Z"},
           ${null}
+        ), (
+          ${"same-millisecond-wait-local"},
+          ${parentThreadId},
+          ${timestamp},
+          ${null}
         )
       `;
 
@@ -423,6 +550,7 @@ layer("054_BackfillPreexistingLocalSubagentTerminalDeliveries", (it) => {
           "completed-local",
           "deleted-active-local",
           "failed-local",
+          "missing-diff-interrupted-local",
           "session-failed-before-turn-projection-local",
           "stale-claim-newer-lifecycle-local",
           "stopped-local",
@@ -439,6 +567,7 @@ layer("054_BackfillPreexistingLocalSubagentTerminalDeliveries", (it) => {
           ["completed-local", "completed"],
           ["deleted-active-local", "killed"],
           ["failed-local", "failed"],
+          ["missing-diff-interrupted-local", "failed"],
           ["session-failed-before-turn-projection-local", "failed"],
           ["stale-claim-newer-lifecycle-local", "completed"],
           ["stopped-local", "failed"],
@@ -455,7 +584,7 @@ layer("054_BackfillPreexistingLocalSubagentTerminalDeliveries", (it) => {
       );
       assert.equal(
         rows.find(({ childThreadId }) => childThreadId === "archived-local")?.claimedSequence,
-        0,
+        202,
       );
       assert.equal(
         rows.find(({ childThreadId }) => childThreadId === "already-claimed-local")?.claimId,

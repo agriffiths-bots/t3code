@@ -32,6 +32,7 @@ export const backfillPreexistingLocalSubagentTerminalDeliveries = Effect.fn(
         threads.deleted_at,
         threads.archived_at,
         threads.latest_user_message_at,
+        threads.latest_turn_id,
         turns.state AS turn_state,
         COALESCE(turns.completed_at, turns.started_at, turns.requested_at) AS terminal_at,
         sessions.status AS session_status,
@@ -64,6 +65,12 @@ export const backfillPreexistingLocalSubagentTerminalDeliveries = Effect.fn(
         thread_id,
         parent_thread_id,
         cutoff_at,
+        deleted_at,
+        archived_at,
+        latest_turn_id,
+        turn_state,
+        session_status,
+        session_updated_at,
         CASE
           WHEN deleted_at IS NOT NULL THEN 'killed'
           WHEN archived_at IS NOT NULL
@@ -112,14 +119,95 @@ export const backfillPreexistingLocalSubagentTerminalDeliveries = Effect.fn(
           )
         )
     ),
+    terminal_evidence AS (
+      SELECT
+        terminal_children.*,
+        (
+          SELECT MAX(terminal_event.sequence)
+          FROM orchestration_events AS terminal_event
+          WHERE terminal_event.stream_id = terminal_children.thread_id
+            AND julianday(terminal_event.occurred_at) <= julianday(terminal_children.cutoff_at)
+            AND (
+              (
+                terminal_children.terminal_kind = 'killed'
+                AND terminal_event.event_type = 'thread.deleted'
+                AND julianday(json_extract(terminal_event.payload_json, '$.deletedAt')) =
+                  julianday(terminal_children.terminal_evidence_at)
+              )
+              OR (
+                terminal_children.terminal_kind = 'archived'
+                AND terminal_event.event_type = 'thread.archived'
+                AND julianday(json_extract(terminal_event.payload_json, '$.archivedAt')) =
+                  julianday(terminal_children.terminal_evidence_at)
+              )
+              OR (
+                terminal_event.event_type = 'thread.turn-diff-completed'
+                AND json_extract(terminal_event.payload_json, '$.turnId') =
+                  terminal_children.latest_turn_id
+                AND julianday(json_extract(terminal_event.payload_json, '$.completedAt')) =
+                  julianday(terminal_children.terminal_evidence_at)
+                AND (
+                  (
+                    terminal_children.terminal_kind = 'completed'
+                    AND json_extract(terminal_event.payload_json, '$.status') <> 'error'
+                  )
+                  OR (
+                    terminal_children.terminal_kind = 'failed'
+                    AND json_extract(terminal_event.payload_json, '$.status')
+                      IN ('error', 'missing')
+                  )
+                )
+              )
+              OR (
+                terminal_children.terminal_kind = 'completed'
+                AND terminal_event.event_type = 'thread.message-sent'
+                AND json_extract(terminal_event.payload_json, '$.role') = 'assistant'
+                AND json_extract(terminal_event.payload_json, '$.streaming') = 0
+                AND json_extract(terminal_event.payload_json, '$.turnId') =
+                  terminal_children.latest_turn_id
+                AND julianday(json_extract(terminal_event.payload_json, '$.updatedAt')) =
+                  julianday(terminal_children.terminal_evidence_at)
+              )
+              OR (
+                terminal_children.terminal_kind = 'failed'
+                AND terminal_event.event_type = 'thread.turn-interrupt-requested'
+                AND json_extract(terminal_event.payload_json, '$.turnId') =
+                  terminal_children.latest_turn_id
+                AND julianday(json_extract(terminal_event.payload_json, '$.createdAt')) =
+                  julianday(terminal_children.terminal_evidence_at)
+              )
+              OR (
+                terminal_event.event_type = 'thread.session-set'
+                AND julianday(
+                  json_extract(terminal_event.payload_json, '$.session.updatedAt')
+                ) = julianday(terminal_children.terminal_evidence_at)
+                AND (
+                  (
+                    terminal_children.terminal_kind = 'completed'
+                    AND json_extract(terminal_event.payload_json, '$.session.status')
+                      IN ('idle', 'ready')
+                  )
+                  OR (
+                    terminal_children.terminal_kind = 'failed'
+                    AND json_extract(terminal_event.payload_json, '$.session.status')
+                      IN ('error', 'interrupted', 'stopped')
+                  )
+                )
+              )
+            )
+        ) AS terminal_sequence
+      FROM terminal_children
+    ),
     delivered_parent_wakes AS MATERIALIZED (
       SELECT
         parent_thread_id,
+        sequence,
         occurred_at,
         wake_text
       FROM (
         SELECT
           stream_id AS parent_thread_id,
+          sequence,
           occurred_at,
           json_extract(payload_json, '$.text') AS wake_text
         FROM orchestration_events
@@ -137,54 +225,51 @@ export const backfillPreexistingLocalSubagentTerminalDeliveries = Effect.fn(
       terminal_kind
     )
     SELECT
-      terminal_children.thread_id,
-      terminal_children.parent_thread_id,
-      'migration:054:' || terminal_children.thread_id,
+      terminal_evidence.thread_id,
+      terminal_evidence.parent_thread_id,
+      'migration:054:' || terminal_evidence.thread_id,
       strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
-      COALESCE((
-        SELECT MAX(events.sequence)
-        FROM orchestration_events AS events
-        WHERE events.stream_id = terminal_children.thread_id
-          AND julianday(events.occurred_at) <= julianday(terminal_children.cutoff_at)
-      ), 0),
-      terminal_children.terminal_kind
-    FROM terminal_children
-    WHERE julianday(terminal_children.terminal_evidence_at) <=
-      julianday(terminal_children.cutoff_at)
+      terminal_evidence.terminal_sequence,
+      terminal_evidence.terminal_kind
+    FROM terminal_evidence
+    WHERE terminal_evidence.terminal_sequence IS NOT NULL
+      AND julianday(terminal_evidence.terminal_evidence_at) <=
+        julianday(terminal_evidence.cutoff_at)
       AND (
         EXISTS (
           SELECT 1
           FROM delivered_parent_wakes AS delivered_event
-          WHERE delivered_event.parent_thread_id = terminal_children.parent_thread_id
+          WHERE delivered_event.parent_thread_id = terminal_evidence.parent_thread_id
             AND substr(
               delivered_event.wake_text,
               1,
               length(
-                '[sub-agent ' || terminal_children.thread_id || ' ' ||
-                CASE terminal_children.terminal_kind
+                '[sub-agent ' || terminal_evidence.thread_id || ' ' ||
+                CASE terminal_evidence.terminal_kind
                   WHEN 'completed' THEN 'completed'
                   WHEN 'failed' THEN 'failed'
                   ELSE 'killed'
                 END || '] '
               )
             ) = (
-              '[sub-agent ' || terminal_children.thread_id || ' ' ||
-              CASE terminal_children.terminal_kind
+              '[sub-agent ' || terminal_evidence.thread_id || ' ' ||
+              CASE terminal_evidence.terminal_kind
                 WHEN 'completed' THEN 'completed'
                 WHEN 'failed' THEN 'failed'
                 ELSE 'killed'
               END || '] '
             )
+            AND delivered_event.sequence > terminal_evidence.terminal_sequence
             AND julianday(delivered_event.occurred_at) >=
-              julianday(terminal_children.terminal_evidence_at)
+              julianday(terminal_evidence.terminal_evidence_at)
         )
         OR EXISTS (
           SELECT 1
           FROM subagent_wait_deliveries AS wait_delivery
-          WHERE wait_delivery.child_thread_id = terminal_children.thread_id
-            AND wait_delivery.parent_thread_id = terminal_children.parent_thread_id
-            AND julianday(wait_delivery.delivered_at) >=
-              julianday(terminal_children.terminal_evidence_at)
+          WHERE wait_delivery.child_thread_id = terminal_evidence.thread_id
+            AND wait_delivery.parent_thread_id = terminal_evidence.parent_thread_id
+            AND julianday(wait_delivery.delivered_at) >
+              julianday(terminal_evidence.terminal_evidence_at)
         )
       )
     ON CONFLICT (child_thread_id) DO UPDATE SET
