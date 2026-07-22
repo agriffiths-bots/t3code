@@ -32,6 +32,7 @@ import { makeAcpMcpServers } from "../../mcp/McpProviderInjection.ts";
 import * as McpProviderSession from "../../mcp/McpProviderSession.ts";
 import { ServerSettingsService } from "../../serverSettings.ts";
 import type { CursorAdapterShape } from "../Services/CursorAdapter.ts";
+import { providerConsumerLifetimeContract } from "../testUtils/providerConsumerLifetimeContract.ts";
 import { makeCursorAdapter } from "./CursorAdapter.ts";
 const decodeCursorSettings = Schema.decodeSync(CursorSettings);
 
@@ -259,7 +260,7 @@ cursorAdapterTestLayer("CursorAdapterLive", (it) => {
     }),
   );
 
-  it.effect("keeps the Cursor notification consumer alive after the start caller exits", () =>
+  it.effect("satisfies the Cursor persistent-consumer lifetime contract", () =>
     Effect.gen(function* () {
       const adapter = yield* CursorAdapter;
       const settings = yield* ServerSettingsService;
@@ -267,35 +268,21 @@ cursorAdapterTestLayer("CursorAdapterLive", (it) => {
       const wrapperPath = yield* Effect.promise(() => makeMockAgentWrapper());
       yield* settings.updateSettings({ providers: { cursor: { binaryPath: wrapperPath } } });
 
-      const runtimeEventsFiber = yield* adapter.streamEvents.pipe(
-        Stream.filter((event) => event.threadId === threadId),
-        Stream.takeUntil((event) => event.type === "turn.completed"),
-        Stream.runCollect,
-        Effect.forkChild,
-      );
-      const startFiber = yield* adapter
-        .startSession({
+      yield* providerConsumerLifetimeContract({
+        adapterName: "CursorAdapter",
+        adapter,
+        startInput: {
           threadId,
           provider: ProviderDriverKind.make("cursor"),
           cwd: process.cwd(),
           runtimeMode: "full-access",
-        })
-        .pipe(Effect.forkChild);
-      yield* Fiber.join(startFiber);
-
-      yield* adapter.sendTurn({
-        threadId,
-        input: "PONG",
-        attachments: [],
+        },
+        turnInput: {
+          threadId,
+          input: "PONG",
+          attachments: [],
+        },
       });
-
-      const runtimeEvents = Array.from(yield* Fiber.join(runtimeEventsFiber));
-      assert.includeMembers(
-        runtimeEvents.map((event) => event.type),
-        ["turn.started", "content.delta", "turn.completed"] as const,
-      );
-
-      yield* adapter.stopSession(threadId);
     }),
   );
 

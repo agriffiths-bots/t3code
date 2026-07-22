@@ -26,6 +26,7 @@ import { ServerConfig } from "../../config.ts";
 import { ServerSettingsService } from "../../serverSettings.ts";
 import { ProviderSessionDirectory } from "../Services/ProviderSessionDirectory.ts";
 import type { OpenCodeAdapterShape } from "../Services/OpenCodeAdapter.ts";
+import { providerConsumerLifetimeContract } from "../testUtils/providerConsumerLifetimeContract.ts";
 import {
   OpenCodeRuntime,
   OpenCodeRuntimeError,
@@ -286,6 +287,69 @@ const advanceTestClock = (ms: number) =>
   TestClock.adjust(`${ms} millis`).pipe(Effect.andThen(Effect.yieldNow));
 
 it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
+  it.effect("satisfies the OpenCodeAdapter persistent-consumer lifetime contract", () =>
+    Effect.gen(function* () {
+      const adapter = yield* OpenCodeAdapter;
+      const threadId = asThreadId("thread-opencode-consumer-lifetime");
+      const sessionId = "http://127.0.0.1:9999/session";
+      let releaseEvents = () => {};
+      runtimeMock.state.eventStreamGate = new Promise<void>((resolve) => {
+        releaseEvents = resolve;
+      });
+      runtimeMock.state.subscribedEvents = [
+        {
+          type: "message.updated",
+          properties: {
+            sessionID: sessionId,
+            info: { id: "message-opencode-contract", role: "assistant" },
+          },
+        },
+        {
+          type: "message.part.updated",
+          properties: {
+            sessionID: sessionId,
+            part: {
+              id: "part-opencode-contract",
+              sessionID: sessionId,
+              messageID: "message-opencode-contract",
+              type: "text",
+              text: "PONG",
+              time: { start: 1, end: 2 },
+            },
+            time: 2,
+          },
+        },
+        {
+          type: "session.status",
+          properties: {
+            sessionID: sessionId,
+            status: { type: "idle" },
+          },
+        },
+      ];
+
+      yield* providerConsumerLifetimeContract({
+        adapterName: "OpenCodeAdapter",
+        adapter,
+        startInput: {
+          provider: ProviderDriverKind.make("opencode"),
+          threadId,
+          runtimeMode: "full-access",
+        },
+        turnInput: {
+          threadId,
+          input: "PONG",
+          attachments: [],
+          modelSelection: createModelSelection(
+            ProviderInstanceId.make("opencode"),
+            "anthropic/sonnet",
+          ),
+        },
+        driveTurn: () => Effect.sync(releaseEvents),
+      });
+    }),
+  );
+
   it.effect("reuses a configured OpenCode server URL instead of spawning a local server", () =>
     Effect.gen(function* () {
       const adapter = yield* OpenCodeAdapter;

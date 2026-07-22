@@ -43,6 +43,7 @@ import { ServerSettingsService } from "../../serverSettings.ts";
 import { ProviderAdapterValidationError } from "../Errors.ts";
 import type { CodexAdapterShape } from "../Services/CodexAdapter.ts";
 import { ProviderSessionDirectory } from "../Services/ProviderSessionDirectory.ts";
+import { providerConsumerLifetimeContract } from "../testUtils/providerConsumerLifetimeContract.ts";
 import {
   type CodexAdapterLiveOptions,
   deleteSessionIfCurrent,
@@ -615,6 +616,78 @@ function startLifecycleRuntime() {
 }
 
 lifecycleLayer("CodexAdapterLive lifecycle", (it) => {
+  it.effect("satisfies the CodexAdapter persistent-consumer lifetime contract", () =>
+    Effect.gen(function* () {
+      const adapter = yield* CodexAdapter;
+      const threadId = asThreadId("thread-codex-consumer-lifetime");
+
+      yield* providerConsumerLifetimeContract({
+        adapterName: "CodexAdapter",
+        adapter,
+        startInput: {
+          provider: ProviderDriverKind.make("codex"),
+          threadId,
+          runtimeMode: "full-access",
+        },
+        turnInput: {
+          threadId,
+          input: "PONG",
+          attachments: [],
+        },
+        driveTurn: (turn) =>
+          Effect.gen(function* () {
+            const runtime = lifecycleRuntimeFactory.lastRuntime;
+            NodeAssert.ok(runtime);
+            const itemId = asItemId("item-codex-consumer-lifetime");
+
+            yield* runtime.emit({
+              id: asEventId("event-codex-contract-turn-started"),
+              kind: "notification",
+              provider: ProviderDriverKind.make("codex"),
+              createdAt: "2026-01-01T00:00:01.000Z",
+              method: "turn/started",
+              threadId,
+              turnId: turn.turnId,
+              payload: {
+                threadId,
+                turn: { id: turn.turnId, status: "inProgress", items: [] },
+              },
+            });
+            yield* runtime.emit({
+              id: asEventId("event-codex-contract-content"),
+              kind: "notification",
+              provider: ProviderDriverKind.make("codex"),
+              createdAt: "2026-01-01T00:00:02.000Z",
+              method: "item/agentMessage/delta",
+              threadId,
+              turnId: turn.turnId,
+              itemId,
+              textDelta: "PONG",
+              payload: {
+                delta: "PONG",
+                itemId,
+                threadId,
+                turnId: turn.turnId,
+              },
+            });
+            yield* runtime.emit({
+              id: asEventId("event-codex-contract-turn-completed"),
+              kind: "notification",
+              provider: ProviderDriverKind.make("codex"),
+              createdAt: "2026-01-01T00:00:03.000Z",
+              method: "turn/completed",
+              threadId,
+              turnId: turn.turnId,
+              payload: {
+                threadId,
+                turn: { id: turn.turnId, status: "completed", items: [] },
+              },
+            });
+          }),
+      });
+    }),
+  );
+
   it.effect("preserves detached-child routing across the real completion sequence", () =>
     Effect.gen(function* () {
       const { adapter, runtime } = yield* startLifecycleRuntime();
