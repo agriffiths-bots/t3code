@@ -486,10 +486,11 @@ html[data-mobile-composer-route-transition="true"]::view-transition-old(t3-mobil
   background-color: var(--card);
 }
 
-/* Wizzo fork override 2026-07-22: light-mode v2 sidebar white per Adam
-   (upstream ships grey app-sidebar); remove to restore upstream grey. */
+/* Wizzo fork override 2026-07-22: v2 light sidebar = classic sidebar surface
+   (root --card) per Adam; upstream ships grey app-sidebar here; delete block
+   to restore upstream grey. */
 :root:not(.dark) .app-sidebar {
-  --card: oklch(1 0 0);
+  --card: var(--color-white);
   --sidebar-stage-fade: var(--card);
   background-color: var(--card);
 }
