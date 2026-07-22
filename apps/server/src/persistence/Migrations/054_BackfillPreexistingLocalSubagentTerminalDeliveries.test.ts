@@ -149,6 +149,13 @@ layer("054_BackfillPreexistingLocalSubagentTerminalDeliveries", (it) => {
             sessionStatus: "error" as const,
             sequence: 102,
           },
+          {
+            threadId: "session-failed-before-turn-projection-local",
+            turnState: "error" as const,
+            turnAt: "2000-01-01T10:00:00.000Z",
+            sessionStatus: "error" as const,
+            sessionUpdatedAt: "2000-01-01T09:00:00.000Z",
+          },
           { threadId: "stopped-local", sessionStatus: "stopped" as const },
           { threadId: "archived-local", archivedAt: "2000-01-01T09:00:00.000Z" },
           {
@@ -172,6 +179,17 @@ layer("054_BackfillPreexistingLocalSubagentTerminalDeliveries", (it) => {
           },
           {
             threadId: "already-claimed-local",
+            turnState: "completed" as const,
+            sessionStatus: "ready" as const,
+          },
+          {
+            threadId: "stale-claim-newer-lifecycle-local",
+            turnState: "completed" as const,
+            sessionStatus: "ready" as const,
+            sequence: 103,
+          },
+          {
+            threadId: "status-mismatch-local",
             turnState: "completed" as const,
             sessionStatus: "ready" as const,
           },
@@ -253,6 +271,9 @@ layer("054_BackfillPreexistingLocalSubagentTerminalDeliveries", (it) => {
         "failed-local",
         "post-053-archived-local",
         "post-053-completed-local",
+        "session-failed-before-turn-projection-local",
+        "stale-claim-newer-lifecycle-local",
+        "status-mismatch-local",
         "stopped-local",
       ] as const;
       for (const [index, childThreadId] of messageDeliveredChildren.entries()) {
@@ -260,7 +281,21 @@ layer("054_BackfillPreexistingLocalSubagentTerminalDeliveries", (it) => {
           ? "3000-01-01T08:00:00.000Z"
           : childThreadId === "archived-before-terminal-local"
             ? "2000-01-01T09:30:00.000Z"
-            : "2001-01-01T08:00:00.000Z";
+            : childThreadId === "session-failed-before-turn-projection-local"
+              ? "2000-01-01T09:30:00.000Z"
+              : "2001-01-01T08:00:00.000Z";
+        const deliveredStatus =
+          childThreadId === "failed-local" ||
+          childThreadId === "session-failed-before-turn-projection-local" ||
+          childThreadId === "stopped-local" ||
+          childThreadId === "status-mismatch-local"
+            ? "failed"
+            : childThreadId === "archived-before-terminal-local" ||
+                childThreadId === "archived-local" ||
+                childThreadId === "deleted-active-local" ||
+                childThreadId === "post-053-archived-local"
+              ? "killed"
+              : "completed";
         yield* sql`
           INSERT INTO orchestration_events (
             sequence,
@@ -283,7 +318,7 @@ layer("054_BackfillPreexistingLocalSubagentTerminalDeliveries", (it) => {
             ${"thread.message-sent"},
             ${deliveredAt},
             ${"server"},
-            ${`{"role":"system","text":"[sub-agent ${childThreadId} completed] delivered"}`},
+            ${`{"role":"system","text":"[sub-agent ${childThreadId} ${deliveredStatus}] delivered"}`},
             ${"{}"}
           )
         `;
@@ -350,6 +385,13 @@ layer("054_BackfillPreexistingLocalSubagentTerminalDeliveries", (it) => {
           ${timestamp},
           ${99},
           ${"completed"}
+        ), (
+          ${"stale-claim-newer-lifecycle-local"},
+          ${parentThreadId},
+          ${"migration:053:stale-claim"},
+          ${timestamp},
+          ${1},
+          ${"failed"}
         )
       `;
 
@@ -381,6 +423,8 @@ layer("054_BackfillPreexistingLocalSubagentTerminalDeliveries", (it) => {
           "completed-local",
           "deleted-active-local",
           "failed-local",
+          "session-failed-before-turn-projection-local",
+          "stale-claim-newer-lifecycle-local",
           "stopped-local",
           "wait-delivered-local",
         ],
@@ -395,6 +439,8 @@ layer("054_BackfillPreexistingLocalSubagentTerminalDeliveries", (it) => {
           ["completed-local", "completed"],
           ["deleted-active-local", "killed"],
           ["failed-local", "failed"],
+          ["session-failed-before-turn-projection-local", "failed"],
+          ["stale-claim-newer-lifecycle-local", "completed"],
           ["stopped-local", "failed"],
           ["wait-delivered-local", "completed"],
         ]),
@@ -414,6 +460,15 @@ layer("054_BackfillPreexistingLocalSubagentTerminalDeliveries", (it) => {
       assert.equal(
         rows.find(({ childThreadId }) => childThreadId === "already-claimed-local")?.claimId,
         "existing-claim",
+      );
+      assert.deepEqual(
+        rows.find(({ childThreadId }) => childThreadId === "stale-claim-newer-lifecycle-local"),
+        {
+          childThreadId: "stale-claim-newer-lifecycle-local",
+          claimId: "migration:054:stale-claim-newer-lifecycle-local",
+          claimedSequence: 103,
+          terminalKind: "completed",
+        },
       );
       assert.isTrue(
         rows

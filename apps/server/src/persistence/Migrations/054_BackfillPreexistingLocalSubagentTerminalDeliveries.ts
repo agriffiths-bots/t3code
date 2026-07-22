@@ -85,6 +85,10 @@ export const backfillPreexistingLocalSubagentTerminalDeliveries = Effect.fn(
               OR (terminal_at IS NOT NULL AND terminal_at > archived_at)
             )
           THEN archived_at
+          WHEN has_fresh_terminal_turn = 1
+            AND turn_state <> 'completed'
+            AND session_status IN ('error', 'stopped')
+          THEN COALESCE(session_updated_at, terminal_at)
           WHEN has_fresh_terminal_turn = 1 THEN terminal_at
           WHEN archived_at IS NOT NULL AND session_status IN ('error', 'stopped')
           THEN CASE
@@ -155,24 +159,21 @@ export const backfillPreexistingLocalSubagentTerminalDeliveries = Effect.fn(
             AND substr(
               delivered_event.wake_text,
               1,
-              length('[sub-agent ' || terminal_children.thread_id || ' ')
-            ) = '[sub-agent ' || terminal_children.thread_id || ' '
-            AND (
-              substr(
-                delivered_event.wake_text,
-                length('[sub-agent ' || terminal_children.thread_id || ' ') + 1,
-                length('completed] ')
-              ) = 'completed] '
-              OR substr(
-                delivered_event.wake_text,
-                length('[sub-agent ' || terminal_children.thread_id || ' ') + 1,
-                length('failed] ')
-              ) = 'failed] '
-              OR substr(
-                delivered_event.wake_text,
-                length('[sub-agent ' || terminal_children.thread_id || ' ') + 1,
-                length('killed] ')
-              ) = 'killed] '
+              length(
+                '[sub-agent ' || terminal_children.thread_id || ' ' ||
+                CASE terminal_children.terminal_kind
+                  WHEN 'completed' THEN 'completed'
+                  WHEN 'failed' THEN 'failed'
+                  ELSE 'killed'
+                END || '] '
+              )
+            ) = (
+              '[sub-agent ' || terminal_children.thread_id || ' ' ||
+              CASE terminal_children.terminal_kind
+                WHEN 'completed' THEN 'completed'
+                WHEN 'failed' THEN 'failed'
+                ELSE 'killed'
+              END || '] '
             )
             AND julianday(delivered_event.occurred_at) >=
               julianday(terminal_children.terminal_evidence_at)
@@ -186,7 +187,14 @@ export const backfillPreexistingLocalSubagentTerminalDeliveries = Effect.fn(
               julianday(terminal_children.terminal_evidence_at)
         )
       )
-    ON CONFLICT (child_thread_id) DO NOTHING
+    ON CONFLICT (child_thread_id) DO UPDATE SET
+      parent_thread_id = excluded.parent_thread_id,
+      terminal_delivery_claim_id = excluded.terminal_delivery_claim_id,
+      terminal_delivery_claimed_at = excluded.terminal_delivery_claimed_at,
+      terminal_delivery_claimed_sequence = excluded.terminal_delivery_claimed_sequence,
+      terminal_kind = excluded.terminal_kind
+    WHERE excluded.terminal_delivery_claimed_sequence >
+      subagent_terminal_deliveries.terminal_delivery_claimed_sequence
   `;
 });
 
