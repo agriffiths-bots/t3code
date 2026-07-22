@@ -3407,6 +3407,7 @@ const make = Effect.gen(function* () {
           if (record !== undefined) {
             yield* Deferred.succeed(record.terminal, pendingTerminalDeliverySupersession.result);
           }
+          yield* dispatchLimiter.releaseForChild(threadId);
           latestSettledTerminalByChild.set(threadId, {
             result: pendingTerminalDeliverySupersession.result,
             sourceTerminalSequence:

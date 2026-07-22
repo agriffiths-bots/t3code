@@ -1947,6 +1947,7 @@ describe("ChildThreadCoordinator", () => {
 
     expect((await harness.listTerminalDeliveries())[0]?.claimId).toBe(deliveredClaim.claimId);
     expect((await runtimeRun(harness, child)).finalAssistantText).toBe("original delivered result");
+    expect(await harness.listDispatchLeaseChildIds()).toEqual([]);
     expect(
       harness.dispatched.filter(
         (command) => command.type === "thread.turn.start" && command.threadId === parent,
