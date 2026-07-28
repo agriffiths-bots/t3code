@@ -22,10 +22,11 @@ const STALE = "2026-04-06T23:59:59.999Z";
 function makeShell(input: {
   readonly settledOverride?: "settled" | "active" | null;
   readonly activityAt: string | null;
-  readonly sessionStatus?: "starting" | "running" | "waiting";
+  readonly sessionStatus?: "starting" | "running" | "waiting" | "error";
   readonly activeTurnId?: ReturnType<typeof TurnId.make> | null;
-  readonly latestTurnState?: "completed" | "running";
+  readonly latestTurnState?: "completed" | "running" | "error";
   readonly pending?: "approval" | "user-input";
+  readonly hasActionableProposedPlan?: boolean;
 }): OrchestrationThreadShell {
   const threadId = ThreadId.make("thread-1");
   return {
@@ -63,13 +64,13 @@ function makeShell(input: {
             providerName: "Codex",
             runtimeMode: "full-access",
             activeTurnId: input.activeTurnId ?? null,
-            lastError: null,
+            lastError: input.sessionStatus === "error" ? "boom" : null,
             updatedAt: NOW,
           },
     latestUserMessageAt: null,
     hasPendingApprovals: input.pending === "approval",
     hasPendingUserInput: input.pending === "user-input",
-    hasActionableProposedPlan: false,
+    hasActionableProposedPlan: input.hasActionableProposedPlan ?? false,
     parentThreadId: null,
   };
 }
@@ -182,6 +183,83 @@ describe("effectiveSettled", () => {
     ).toBe(false);
   });
 
+  it("keeps failed threads visible even with a settled override", () => {
+    const failedSession = makeShell({
+      settledOverride: "settled",
+      activityAt: FRESH,
+      sessionStatus: "error",
+    });
+    const failedTurn = makeShell({
+      settledOverride: "settled",
+      activityAt: FRESH,
+      latestTurnState: "error",
+    });
+
+    expect(effectiveSettled(failedSession, { now: NOW, autoSettleAfterDays: 3 })).toBe(false);
+    expect(effectiveSettled(failedTurn, { now: NOW, autoSettleAfterDays: 3 })).toBe(false);
+  });
+
+  it("keeps failed threads visible on closed or merged change requests", () => {
+    const failedSession = makeShell({ activityAt: FRESH, sessionStatus: "error" });
+    const failedTurn = makeShell({ activityAt: FRESH, latestTurnState: "error" });
+
+    expect(
+      effectiveSettled(failedSession, {
+        now: NOW,
+        autoSettleAfterDays: null,
+        changeRequestState: "closed",
+      }),
+    ).toBe(false);
+    expect(
+      effectiveSettled(failedTurn, {
+        now: NOW,
+        autoSettleAfterDays: null,
+        changeRequestState: "merged",
+      }),
+    ).toBe(false);
+  });
+
+  it("keeps plan-ready threads visible on closed or merged change requests", () => {
+    const shell = makeShell({ activityAt: FRESH, hasActionableProposedPlan: true });
+
+    expect(
+      effectiveSettled(shell, {
+        now: NOW,
+        autoSettleAfterDays: null,
+        changeRequestState: "closed",
+      }),
+    ).toBe(false);
+    expect(
+      effectiveSettled(shell, {
+        now: NOW,
+        autoSettleAfterDays: null,
+        changeRequestState: "merged",
+      }),
+    ).toBe(false);
+  });
+
+  it("keeps plan-ready threads visible after the inactivity window", () => {
+    const shell = makeShell({ activityAt: STALE, hasActionableProposedPlan: true });
+
+    expect(effectiveSettled(shell, { now: NOW, autoSettleAfterDays: 3 })).toBe(false);
+  });
+
+  it("honors an explicit settled override on a plan-ready thread", () => {
+    const shell = makeShell({
+      settledOverride: "settled",
+      activityAt: FRESH,
+      hasActionableProposedPlan: true,
+    });
+
+    expect(effectiveSettled(shell, { now: NOW, autoSettleAfterDays: 3 })).toBe(true);
+  });
+
+  it("still settles a plain thread with no failed or plan-ready state", () => {
+    const shell = makeShell({ activityAt: STALE });
+
+    expect(effectiveSettled(shell, { now: NOW, autoSettleAfterDays: 3 })).toBe(true);
+  });
+
   it("uses a strict inactivity boundary and honors a null threshold", () => {
     const boundary = makeShell({
       activityAt: "2026-04-07T00:00:00.000Z",
@@ -275,6 +353,15 @@ describe("canSettle", () => {
     ).toBe(false);
     expect(
       canSettle(makeShell({ activityAt: FRESH, latestTurnState: "running" }), { now: NOW }),
+    ).toBe(false);
+    expect(canSettle(makeShell({ activityAt: FRESH, sessionStatus: "error" }), { now: NOW })).toBe(
+      false,
+    );
+    expect(
+      canSettle(makeShell({ activityAt: FRESH, latestTurnState: "error" }), { now: NOW }),
+    ).toBe(false);
+    expect(
+      canSettle(makeShell({ activityAt: FRESH, hasActionableProposedPlan: true }), { now: NOW }),
     ).toBe(false);
     expect(
       canSettle(

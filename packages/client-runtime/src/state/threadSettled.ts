@@ -88,16 +88,23 @@ export function hasQueuedTurnStart(
 export function canSettle(
   shell: Pick<
     OrchestrationThreadShell,
-    "hasPendingApprovals" | "hasPendingUserInput" | "session" | "latestUserMessageAt" | "latestTurn"
+    | "hasPendingApprovals"
+    | "hasPendingUserInput"
+    | "hasActionableProposedPlan"
+    | "session"
+    | "latestUserMessageAt"
+    | "latestTurn"
   >,
   options: { readonly now: string },
 ): boolean {
   if (shell.hasPendingApprovals || shell.hasPendingUserInput) return false;
+  if (shell.session?.status === "error" || shell.latestTurn?.state === "error") return false;
   if (hasActiveThreadSession(shell.session)) return false;
   if (shell.latestTurn?.state === "running") return false;
   // Queued work is as blocked-on-progress as a live session: settling it
   // (or auto-settling it on a closed PR) would hide a just-requested turn.
   if (hasQueuedTurnStart(shell, options)) return false;
+  if (shell.hasActionableProposedPlan) return false;
   return true;
 }
 
@@ -119,6 +126,7 @@ export function effectiveSettled(
 ): boolean {
   // Blocked work must remain visible even when a user explicitly settled it.
   if (shell.hasPendingApprovals || shell.hasPendingUserInput) return false;
+  if (shell.session?.status === "error" || shell.latestTurn?.state === "error") return false;
   if (hasActiveThreadSession(shell.session)) return false;
   if (shell.latestTurn?.state === "running") return false;
   if (hasQueuedTurnStart(shell, { now: options.now })) {
@@ -141,6 +149,7 @@ export function effectiveSettled(
   // "active" is the explicit keep-active pin: it suppresses auto-settle
   // until real activity clears it server-side.
   if (shell.settledOverride === "active") return false;
+  if (shell.hasActionableProposedPlan) return false;
   if (options.changeRequestState === "merged" || options.changeRequestState === "closed") {
     return true;
   }
