@@ -13,6 +13,7 @@ import {
   CODEX_DEFAULT_MODE_DEVELOPER_INSTRUCTIONS,
   CODEX_PLAN_MODE_DEVELOPER_INSTRUCTIONS,
 } from "../CodexDeveloperInstructions.ts";
+import { codexSessionAppServerArgs } from "./codexLaunchArgs.ts";
 import {
   buildTurnStartParams,
   hasConfiguredMcpServer,
@@ -215,6 +216,28 @@ describe("buildTurnStartParams", () => {
       ],
     });
   });
+
+  it.effect("keeps explicit Standard routing on turn/start, including null compatibility", () =>
+    Effect.gen(function* () {
+      const current = yield* buildTurnStartParams({
+        threadId: "provider-thread-1",
+        runtimeMode: "full-access",
+        prompt: "Continue",
+        serviceTier: "default",
+      });
+      const legacyClear = yield* buildTurnStartParams({
+        threadId: "provider-thread-1",
+        runtimeMode: "full-access",
+        prompt: "Continue",
+        serviceTier: null,
+      });
+
+      NodeAssert.equal(current.serviceTier, "default");
+      NodeAssert.equal(legacyClear.serviceTier, null);
+      NodeAssert.equal(Object.hasOwn(current, "serviceTier"), true);
+      NodeAssert.equal(Object.hasOwn(legacyClear, "serviceTier"), true);
+    }),
+  );
 });
 
 describe("buildCodexDeveloperInstructions", () => {
@@ -289,6 +312,33 @@ describe("hasConfiguredMcpServer", () => {
   });
 });
 
+describe("codexSessionAppServerArgs", () => {
+  it("keeps the app-server subcommand when explicit args are provided", () => {
+    NodeAssert.deepStrictEqual(codexSessionAppServerArgs(["-c", "model=gpt-5"], undefined), [
+      "app-server",
+      "-c",
+      "model=gpt-5",
+    ]);
+  });
+
+  it("keeps launch args when explicit app-server args are provided", () => {
+    NodeAssert.deepStrictEqual(
+      codexSessionAppServerArgs(
+        ["-c", "mcp_servers.t3-code.url=http://127.0.0.1/mcp"],
+        "--strict-config --enable foo",
+      ),
+      [
+        "app-server",
+        "--strict-config",
+        "--enable",
+        "foo",
+        "-c",
+        "mcp_servers.t3-code.url=http://127.0.0.1/mcp",
+      ],
+    );
+  });
+});
+
 describe("isRecoverableThreadResumeError", () => {
   it("matches missing thread errors", () => {
     NodeAssert.equal(
@@ -337,6 +387,55 @@ describe("isRecoverableThreadResumeError", () => {
 });
 
 describe("openCodexThread", () => {
+  it.effect("sends explicit Standard routing on both thread/start and thread/resume", () =>
+    Effect.gen(function* () {
+      const calls: Array<{ method: "thread/start" | "thread/resume"; payload: unknown }> = [];
+      const client = {
+        request: <M extends "thread/start" | "thread/resume">(
+          method: M,
+          payload: CodexRpc.ClientRequestParamsByMethod[M],
+        ) => {
+          calls.push({ method, payload });
+          return Effect.succeed(
+            makeThreadOpenResponse(
+              `${method}-result`,
+            ) as CodexRpc.ClientRequestResponsesByMethod[M],
+          );
+        },
+      };
+
+      yield* openCodexThread({
+        client,
+        threadId: ThreadId.make("thread-standard-start"),
+        runtimeMode: "full-access",
+        cwd: "/tmp/project",
+        requestedModel: "gpt-5.4",
+        serviceTier: "default",
+        resumeThreadId: undefined,
+      });
+      yield* openCodexThread({
+        client,
+        threadId: ThreadId.make("thread-standard-resume"),
+        runtimeMode: "full-access",
+        cwd: "/tmp/project",
+        requestedModel: "gpt-5.4",
+        serviceTier: "default",
+        resumeThreadId: "provider-thread-existing",
+      });
+
+      NodeAssert.deepStrictEqual(
+        calls.map(({ method, payload }) => ({
+          method,
+          serviceTier: (payload as { readonly serviceTier?: string | null }).serviceTier,
+        })),
+        [
+          { method: "thread/start", serviceTier: "default" },
+          { method: "thread/resume", serviceTier: "default" },
+        ],
+      );
+    }),
+  );
+
   it.effect("falls back to thread/start when resume fails recoverably", () =>
     Effect.gen(function* () {
       const calls: Array<{ method: "thread/start" | "thread/resume"; payload: unknown }> = [];

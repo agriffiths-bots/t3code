@@ -45,6 +45,7 @@ import {
   issueHeadlessServeAccessInfo,
 } from "./startupAccess.ts";
 
+import { trustedSystemDispatchAuthority } from "./orchestration/commandAudienceGuard.ts";
 export class ServerRuntimeStartupError extends Schema.TaggedErrorClass<ServerRuntimeStartupError>()(
   "ServerRuntimeStartupError",
   {
@@ -205,15 +206,18 @@ export const resolveAutoBootstrapWelcomeTargets = Effect.gen(function* () {
         nextProjectId = ProjectId.make(yield* randomUUID);
         const bootstrapProjectTitle = path.basename(serverConfig.cwd) || "project";
         nextProjectDefaultModelSelection = getAutoBootstrapDefaultModelSelection();
-        yield* orchestrationEngine.dispatch({
-          type: "project.create",
-          commandId: CommandId.make(yield* randomUUID),
-          projectId: nextProjectId,
-          title: bootstrapProjectTitle,
-          workspaceRoot: serverConfig.cwd,
-          defaultModelSelection: nextProjectDefaultModelSelection,
-          createdAt,
-        });
+        yield* orchestrationEngine.dispatch(
+          {
+            type: "project.create",
+            commandId: CommandId.make(yield* randomUUID),
+            projectId: nextProjectId,
+            title: bootstrapProjectTitle,
+            workspaceRoot: serverConfig.cwd,
+            defaultModelSelection: nextProjectDefaultModelSelection,
+            createdAt,
+          },
+          trustedSystemDispatchAuthority("serverRuntimeStartup"),
+        );
       } else {
         nextProjectId = existingProject.value.id;
         nextProjectDefaultModelSelection =
@@ -225,19 +229,22 @@ export const resolveAutoBootstrapWelcomeTargets = Effect.gen(function* () {
       if (Option.isNone(existingThreadId)) {
         const createdAt = DateTime.formatIso(yield* DateTime.now);
         const createdThreadId = ThreadId.make(yield* randomUUID);
-        yield* orchestrationEngine.dispatch({
-          type: "thread.create",
-          commandId: CommandId.make(yield* randomUUID),
-          threadId: createdThreadId,
-          projectId: nextProjectId,
-          title: "New thread",
-          modelSelection: nextProjectDefaultModelSelection,
-          interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
-          runtimeMode: "full-access",
-          branch: null,
-          worktreePath: null,
-          createdAt,
-        });
+        yield* orchestrationEngine.dispatch(
+          {
+            type: "thread.create",
+            commandId: CommandId.make(yield* randomUUID),
+            threadId: createdThreadId,
+            projectId: nextProjectId,
+            title: "New thread",
+            modelSelection: nextProjectDefaultModelSelection,
+            interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+            runtimeMode: "full-access",
+            branch: null,
+            worktreePath: null,
+            createdAt,
+          },
+          trustedSystemDispatchAuthority("serverRuntimeStartup"),
+        );
         bootstrapProjectId = nextProjectId;
         bootstrapThreadId = createdThreadId;
       } else {

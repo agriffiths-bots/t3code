@@ -364,6 +364,69 @@ describe("environment RPC", () => {
     }),
   );
 
+  it.effect("backs off handled failures and stops at the configured retry cap", () =>
+    Effect.gen(function* () {
+      const subscriptionCount = yield* Ref.make(0);
+      const retryDelays: number[] = [];
+      const client = {
+        [WS_METHODS.subscribeTerminalEvents]: () =>
+          Stream.fromEffect(Ref.update(subscriptionCount, (count) => count + 1)).pipe(
+            Stream.concat(Stream.fail(new Error("still unavailable"))),
+          ),
+      } as unknown as WsRpcProtocolClient;
+      const { activeSession, supervisor } = yield* makeHarness();
+
+      yield* SubscriptionRef.set(activeSession, Option.some(session(client)));
+      const subscriptionFiber = yield* subscribe(
+        WS_METHODS.subscribeTerminalEvents,
+        {},
+        {
+          onExpectedFailure: () => Effect.void,
+          retryExpectedFailureAfter: (failureCount) => {
+            const delay = 100 * 2 ** (failureCount - 1);
+            retryDelays.push(delay);
+            return `${delay} millis`;
+          },
+          maxExpectedFailureRetries: 2,
+        },
+      ).pipe(
+        Stream.runDrain,
+        Effect.provideService(EnvironmentSupervisor.EnvironmentSupervisor, supervisor),
+        Effect.forkChild,
+      );
+
+      for (
+        let attempt = 0;
+        attempt < 100 && (yield* Ref.get(subscriptionCount)) < 1;
+        attempt += 1
+      ) {
+        yield* Effect.yieldNow;
+      }
+      yield* TestClock.adjust("100 millis");
+      for (
+        let attempt = 0;
+        attempt < 100 && (yield* Ref.get(subscriptionCount)) < 2;
+        attempt += 1
+      ) {
+        yield* Effect.yieldNow;
+      }
+      yield* TestClock.adjust("200 millis");
+      for (
+        let attempt = 0;
+        attempt < 100 && (yield* Ref.get(subscriptionCount)) < 3;
+        attempt += 1
+      ) {
+        yield* Effect.yieldNow;
+      }
+      yield* TestClock.adjust("10 seconds");
+      yield* Effect.yieldNow;
+      yield* Fiber.interrupt(subscriptionFiber);
+
+      expect(yield* Ref.get(subscriptionCount)).toBe(3);
+      expect(retryDelays).toEqual([100, 200]);
+    }),
+  );
+
   it.effect("does not classify subscription defects as expected failures", () =>
     Effect.gen(function* () {
       const defect = new Error("subscription invariant failed");

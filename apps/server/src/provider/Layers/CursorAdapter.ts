@@ -163,6 +163,12 @@ interface CursorSessionContext {
   dropAcpUpdatesAfterLocalCancel: boolean;
   readonly suppressedNotificationTurnIds: Set<string>;
   readonly preCompletedCancelledTurnIds: Set<string>;
+  /** Turn ids that produced any user-visible output (assistant text, tool
+   * calls, plan updates, proposed plans, user-input requests, or surfaced
+   * permission requests). A non-cancelled turn that completes without any
+   * entry here must fail loudly instead of persisting a silent empty
+   * response. */
+  readonly turnsWithVisibleOutput: Set<string>;
   pendingPromptTurnId: TurnId | undefined;
   localCancelRequestsInFlight: number;
   locallyCancelledPromptsInFlight: number;
@@ -552,6 +558,7 @@ export function makeCursorAdapter(
           return;
         }
         ctx.preCompletedCancelledTurnIds.add(String(turnId));
+        ctx.turnsWithVisibleOutput.delete(String(turnId));
         if (!ctx.turns.some((turn) => turn.id === turnId)) {
           ctx.turns.push({ id: turnId, items: [] });
         }
@@ -798,6 +805,9 @@ export function makeCursorAdapter(
                 const runtimeRequestId = RuntimeRequestId.make(requestId);
                 const answers = yield* Deferred.make<ProviderUserInputAnswers>();
                 pendingUserInputs.set(requestId, { answers });
+                if (ctx?.notificationTurnId !== undefined) {
+                  ctx.turnsWithVisibleOutput.add(String(ctx.notificationTurnId));
+                }
                 yield* offerRuntimeEvent({
                   type: "user-input.requested",
                   ...(yield* makeEventStamp()),
@@ -839,6 +849,9 @@ export function makeCursorAdapter(
                 if (ctx && shouldDropAcpUpdateAfterLocalCancel(ctx)) {
                   return { accepted: false } as const;
                 }
+                if (ctx?.notificationTurnId !== undefined) {
+                  ctx.turnsWithVisibleOutput.add(String(ctx.notificationTurnId));
+                }
                 yield* offerRuntimeEvent({
                   type: "turn.proposed.completed",
                   ...(yield* makeEventStamp()),
@@ -872,6 +885,9 @@ export function makeCursorAdapter(
                     return;
                   }
                   if (ctx) {
+                    if (ctx.notificationTurnId !== undefined) {
+                      ctx.turnsWithVisibleOutput.add(String(ctx.notificationTurnId));
+                    }
                     yield* emitPlanUpdate(
                       ctx,
                       extractTodosAsPlan(params),
@@ -911,6 +927,9 @@ export function makeCursorAdapter(
                 const permissionRequest = parsePermissionRequest(params);
                 const requestId = ApprovalRequestId.make(yield* randomUUIDv4);
                 const runtimeRequestId = RuntimeRequestId.make(requestId);
+                if (ctx?.notificationTurnId !== undefined) {
+                  ctx.turnsWithVisibleOutput.add(String(ctx.notificationTurnId));
+                }
                 const decision = yield* Deferred.make<ProviderApprovalDecision>();
                 pendingApprovals.set(requestId, {
                   decision,
@@ -1017,6 +1036,7 @@ export function makeCursorAdapter(
             internalOptions?.initialSuppressedNotificationTurnIds ?? [],
           ),
           preCompletedCancelledTurnIds: new Set<string>(),
+          turnsWithVisibleOutput: new Set<string>(),
           pendingPromptTurnId: undefined,
           localCancelRequestsInFlight: 0,
           locallyCancelledPromptsInFlight: 0,
@@ -1069,6 +1089,9 @@ export function makeCursorAdapter(
                   );
                   return;
                 case "PlanUpdated":
+                  if (eventTurnId !== undefined) {
+                    ctx.turnsWithVisibleOutput.add(String(eventTurnId));
+                  }
                   yield* logNative(ctx.threadId, "session/update", event.rawPayload, "acp.jsonrpc");
                   yield* emitPlanUpdate(
                     ctx,
@@ -1079,6 +1102,9 @@ export function makeCursorAdapter(
                   );
                   return;
                 case "ToolCallUpdated":
+                  if (eventTurnId !== undefined) {
+                    ctx.turnsWithVisibleOutput.add(String(eventTurnId));
+                  }
                   yield* logNative(ctx.threadId, "session/update", event.rawPayload, "acp.jsonrpc");
                   yield* offerRuntimeEvent(
                     makeAcpToolCallEvent({
@@ -1092,6 +1118,9 @@ export function makeCursorAdapter(
                   );
                   return;
                 case "ContentDelta":
+                  if (eventTurnId !== undefined && event.text.trim().length > 0) {
+                    ctx.turnsWithVisibleOutput.add(String(eventTurnId));
+                  }
                   yield* logNative(ctx.threadId, "session/update", event.rawPayload, "acp.jsonrpc");
                   yield* offerRuntimeEvent(
                     makeAcpContentDeltaEvent({
@@ -1112,7 +1141,7 @@ export function makeCursorAdapter(
           Effect.catch((cause) =>
             Effect.logError("Failed to process Cursor runtime notification.", { cause }),
           ),
-          Effect.forkChild,
+          Effect.forkIn(sessionScope),
         );
 
         ctx.notificationFiber = nf;
@@ -1436,6 +1465,7 @@ export function makeCursorAdapter(
               const { activeTurnId: _cancelledActiveTurnId, ...sessionWithoutActiveTurn } =
                 ctx.session;
               ctx.activeTurnId = undefined;
+              ctx.turnsWithVisibleOutput.delete(String(turnId));
               ctx.session = {
                 ...sessionWithoutActiveTurn,
                 status: "ready",
@@ -1480,7 +1510,7 @@ export function makeCursorAdapter(
           // superseded prompt resolving (usually cancelled) while another is
           // in flight or pending must leave the merged turn running.
           const locallyCancelledPrompt = ctx.locallyCancelledPromptsInFlight > 0;
-          const cancelledResult = result.stopReason === "cancelled" || locallyCancelledPrompt;
+          let cancelledResult = result.stopReason === "cancelled" || locallyCancelledPrompt;
           if (locallyCancelledPrompt) {
             yield* drainLocalCancelEventsOrTimeout(ctx);
             ctx.locallyCancelledPromptsInFlight = Math.max(
@@ -1499,8 +1529,48 @@ export function makeCursorAdapter(
             }
             if (!cancelledResult) {
               yield* drainEventsOrSessionEnd(ctx);
+              if (
+                !ctx.stopped &&
+                ctx.promptsInFlight === 1 &&
+                ctx.activeTurnId === turnId &&
+                ctx.session.activeTurnId === turnId &&
+                ctx.localCancelRequestsInFlight === 0 &&
+                ctx.locallyCancelledPromptsInFlight === 0 &&
+                !ctx.turnsWithVisibleOutput.has(String(turnId))
+              ) {
+                yield* liveDelay(CURSOR_COMPLETED_TURN_LATE_UPDATE_GRACE_MS);
+                yield* drainEventsOrSessionEnd(ctx);
+              }
+            }
+            if (!cancelledResult && ctx.locallyCancelledPromptsInFlight > 0) {
+              yield* drainLocalCancelEventsOrTimeout(ctx);
+              ctx.locallyCancelledPromptsInFlight = Math.max(
+                0,
+                ctx.locallyCancelledPromptsInFlight - 1,
+              );
+              clearLocalCancelDropForQueuedPrompt(ctx);
+              cancelledResult = true;
             }
             if (ctx.stopped) {
+              return {
+                threadId: input.threadId,
+                turnId,
+                resumeCursor: ctx.session.resumeCursor,
+              };
+            }
+            const turnStillOwnsSettlement =
+              ctx.promptsInFlight === 1 &&
+              ctx.activeTurnId === turnId &&
+              ctx.session.activeTurnId === turnId;
+            if (!turnStillOwnsSettlement) {
+              if (ctx.activeTurnId === turnId && ctx.session.activeTurnId === turnId) {
+                ctx.session = {
+                  ...ctx.session,
+                  status: "running",
+                  updatedAt: yield* nowIso,
+                  model: resolvedModel,
+                };
+              }
               return {
                 threadId: input.threadId,
                 turnId,
@@ -1517,6 +1587,11 @@ export function makeCursorAdapter(
               updatedAt: yield* nowIso,
               model: resolvedModel,
             } satisfies ProviderSession;
+            // Defensive invariant: a non-cancelled turn that never produced
+            // any user-visible assistant output must fail loudly. Persisting
+            // a clean completion here would render as a silent empty response.
+            const silentlyEmptyTurn =
+              !cancelledResult && !ctx.turnsWithVisibleOutput.has(String(turnId));
             if (!completionAlreadyEmitted) {
               yield* offerRuntimeEvent({
                 type: "turn.completed",
@@ -1524,13 +1599,26 @@ export function makeCursorAdapter(
                 provider: PROVIDER,
                 threadId: input.threadId,
                 turnId,
-                payload: {
-                  state: cancelledResult ? "cancelled" : "completed",
-                  stopReason: cancelledResult ? "cancelled" : (result.stopReason ?? null),
-                },
+                payload: cancelledResult
+                  ? {
+                      state: "cancelled",
+                      stopReason: "cancelled",
+                    }
+                  : silentlyEmptyTurn
+                    ? {
+                        state: "failed",
+                        stopReason: result.stopReason ?? null,
+                        errorMessage:
+                          "Cursor completed the turn without returning any assistant output. The response was empty or was not delivered to this session.",
+                      }
+                    : {
+                        state: "completed",
+                        stopReason: result.stopReason ?? null,
+                      },
               });
             }
             ctx.preCompletedCancelledTurnIds.delete(String(turnId));
+            ctx.turnsWithVisibleOutput.delete(String(turnId));
             ctx.activeTurnId = undefined;
             ctx.notificationTurnId = turnId;
             ctx.dropAcpUpdatesAfterLocalCancel = cancelledResult;
@@ -1649,6 +1737,7 @@ export function makeCursorAdapter(
           const { activeTurnId: _cancelledActiveTurnId, ...sessionWithoutActiveTurn } = ctx.session;
           ctx.activeTurnId = undefined;
           ctx.notificationTurnId = resumedTurnToCancel;
+          ctx.turnsWithVisibleOutput.delete(String(resumedTurnToCancel));
           ctx.session = {
             ...sessionWithoutActiveTurn,
             status: "ready",

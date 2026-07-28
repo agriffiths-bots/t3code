@@ -9,6 +9,7 @@ import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
 import * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
+import * as TestClock from "effect/testing/TestClock";
 import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process";
 
 import * as NodeServices from "@effect/platform-node/NodeServices";
@@ -27,10 +28,27 @@ import { makeInMemoryStdio } from "./_internal/stdio.ts";
 
 const InitializeRequest = jsonRpcRequest("initialize", AcpSchema.InitializeRequest);
 const InitializeResponse = jsonRpcResponse(AcpSchema.InitializeResponse);
+const RequestPermissionRequest = jsonRpcRequest(
+  "session/request_permission",
+  AcpSchema.RequestPermissionRequest,
+);
+const RequestPermissionResponse = jsonRpcResponse(AcpSchema.RequestPermissionResponse);
 const ExtRequest = jsonRpcRequest("x/test", Schema.Struct({ hello: Schema.String }));
 const ExtResponse = jsonRpcResponse(Schema.Struct({ ok: Schema.Boolean }));
 const PromptRequest = jsonRpcRequest("session/prompt", AcpSchema.PromptRequest);
 const PromptResponse = jsonRpcResponse(AcpSchema.PromptResponse);
+const SessionUpdateNotification = jsonRpcNotification(
+  "session/update",
+  AcpSchema.SessionNotification,
+);
+const encodeUnknownJsonString = Schema.encodeUnknownSync(Schema.UnknownFromJsonString);
+const decodeJsonRpcResponseId = Schema.decodeUnknownSync(
+  Schema.fromJsonString(
+    Schema.Struct({
+      id: Schema.Union([Schema.String, Schema.Number]),
+    }),
+  ),
+);
 const decodePromptRequestLine = Schema.decodeEffect(Schema.fromJsonString(PromptRequest));
 const XAiPromptCompleteNotification = jsonRpcNotification(
   "_x.ai/session/prompt_complete",
@@ -54,6 +72,11 @@ const XAiSessionsChangedNotification = jsonRpcNotification(
     upserted: Schema.Array(Schema.Unknown),
     removed: Schema.Array(Schema.Unknown),
   }),
+);
+const decodeInitializeRequest = Schema.decodeEffect(Schema.fromJsonString(InitializeRequest));
+const encodeInitializeResponse = Schema.encodeEffect(Schema.fromJsonString(InitializeResponse));
+const decodeRequestPermissionResponse = Schema.decodeEffect(
+  Schema.fromJsonString(RequestPermissionResponse),
 );
 const mockPeerPath = Effect.map(Effect.service(Path.Path), (path) =>
   path.join(import.meta.dirname, "../test/fixtures/acp-mock-peer.ts"),
@@ -489,6 +512,156 @@ it.layer(NodeServices.layer)("effect-acp client", (it) => {
   );
 
   it.effect(
+    "keeps the RPC client alive after Grok's exact unsolicited skills-reload string-id response",
+    () =>
+      Effect.gen(function* () {
+        const { stdio, input, output } = yield* makeInMemoryStdio();
+        const scope = yield* Scope.make();
+        const acp = yield* AcpClient.make(stdio).pipe(Effect.provideService(Scope.Scope, scope));
+
+        const initializeFiber = yield* acp.agent
+          .initialize({
+            protocolVersion: 1,
+            clientCapabilities: {
+              fs: { readTextFile: false, writeTextFile: false },
+              terminal: false,
+            },
+            clientInfo: {
+              name: "effect-acp-test",
+              version: "0.0.0",
+            },
+          })
+          .pipe(Effect.forkScoped);
+        const initializeRequest = yield* decodeInitializeRequest(yield* Queue.take(output));
+
+        const initializeResponse = yield* encodeInitializeResponse({
+          jsonrpc: "2.0",
+          id: initializeRequest.id,
+          result: {
+            protocolVersion: 1,
+            agentCapabilities: {},
+            agentInfo: {
+              name: "mock-agent",
+              version: "0.0.0",
+            },
+          },
+        });
+        yield* Queue.offer(
+          input,
+          new TextEncoder().encode(
+            `${encodeUnknownJsonString({
+              jsonrpc: "2.0",
+              id: String(initializeRequest.id),
+              result: {
+                protocolVersion: 999,
+                agentCapabilities: {},
+                agentInfo: { name: "wrong-id-type", version: "0.0.0" },
+              },
+            })}\n{"jsonrpc":"2.0","id":"skills-reload","result":{"result":{"reloaded":1}}}\n${initializeResponse}\n`,
+          ),
+        );
+
+        const initialized = yield* Fiber.join(initializeFiber).pipe(Effect.timeout("1 second"));
+        assert.equal(initialized.protocolVersion, 1);
+        yield* Scope.close(scope, Exit.void);
+      }).pipe(TestClock.withLive),
+  );
+
+  it.effect("echoes string and numeric ids unchanged for inbound core requests", () =>
+    Effect.gen(function* () {
+      const { stdio, input, output } = yield* makeInMemoryStdio();
+      const scope = yield* Scope.make();
+      const acp = yield* AcpClient.make(stdio).pipe(Effect.provideService(Scope.Scope, scope));
+      yield* acp.handleRequestPermission(() =>
+        Effect.succeed({
+          outcome: {
+            outcome: "selected",
+            optionId: "allow",
+          },
+        }),
+      );
+
+      for (const id of ["skills-reload", "42", 42, 4.5] as const) {
+        yield* Queue.offer(
+          input,
+          yield* encodeJsonl(RequestPermissionRequest, {
+            jsonrpc: "2.0",
+            id,
+            method: "session/request_permission",
+            params: {
+              sessionId: "session-1",
+              toolCall: {
+                toolCallId: `tool-${id}`,
+                title: "Allow mock action",
+              },
+              options: [{ optionId: "allow", name: "Allow", kind: "allow_once" }],
+            },
+            headers: [],
+          }),
+        );
+
+        const response = yield* decodeRequestPermissionResponse(
+          yield* Queue.take(output).pipe(Effect.timeout("1 second")),
+        );
+        assert.strictEqual(response.id, id);
+      }
+
+      yield* Scope.close(scope, Exit.void);
+    }).pipe(TestClock.withLive),
+  );
+
+  it.effect("keeps mixed string and numeric request ids aligned within a JSON-RPC batch", () =>
+    Effect.gen(function* () {
+      const { stdio, input, output } = yield* makeInMemoryStdio();
+      const scope = yield* Scope.make();
+      const acp = yield* AcpClient.make(stdio).pipe(Effect.provideService(Scope.Scope, scope));
+      yield* acp.handleRequestPermission(() =>
+        Effect.succeed({
+          outcome: {
+            outcome: "selected",
+            optionId: "allow",
+          },
+        }),
+      );
+
+      const makePermissionRequest = (id: string | number) => ({
+        jsonrpc: "2.0" as const,
+        id,
+        method: "session/request_permission" as const,
+        params: {
+          sessionId: "session-1",
+          toolCall: {
+            toolCallId: `tool-${id}`,
+            title: "Allow mock action",
+          },
+          options: [{ optionId: "allow", name: "Allow", kind: "allow_once" as const }],
+        },
+        headers: [],
+      });
+      yield* Queue.offer(
+        input,
+        new TextEncoder().encode(
+          `${encodeUnknownJsonString([
+            makePermissionRequest("batch-string-id"),
+            makePermissionRequest(73),
+          ])}\n`,
+        ),
+      );
+
+      const responses = (yield* Queue.take(output).pipe(Effect.timeout("1 second")))
+        .trim()
+        .split("\n")
+        .map((line) => decodeJsonRpcResponseId(line));
+      assert.deepEqual(
+        responses.map((response) => response.id),
+        ["batch-string-id", 73],
+      );
+
+      yield* Scope.close(scope, Exit.void);
+    }).pipe(TestClock.withLive),
+  );
+
+  it.effect(
     "routes a standard prompt response after Grok extension notifications in the same batch",
     () =>
       Effect.gen(function* () {
@@ -570,6 +743,219 @@ it.layer(NodeServices.layer)("effect-acp client", (it) => {
             modelId: "grok-composer-2.5-fast",
           },
         });
+        yield* Scope.close(scope, Exit.void);
+      }),
+  );
+
+  it.effect(
+    "dispatches batched session updates through handlers before an in-flight prompt resolves",
+    () =>
+      Effect.gen(function* () {
+        for (const mode of ["coalesced", "split"] as const) {
+          for (let round = 0; round < 50; round++) {
+            const { stdio, input, output } = yield* makeInMemoryStdio();
+            const scope = yield* Scope.make();
+            const acp = yield* AcpClient.make(stdio).pipe(
+              Effect.provideService(Scope.Scope, scope),
+            );
+
+            const messageChunks: Array<string> = [];
+            let thoughtChunks = 0;
+            yield* acp.handleSessionUpdate((notification) =>
+              Effect.sync(() => {
+                const update = notification.update;
+                if (
+                  update.sessionUpdate === "agent_message_chunk" &&
+                  update.content.type === "text"
+                ) {
+                  messageChunks.push(update.content.text);
+                }
+                if (update.sessionUpdate === "agent_thought_chunk") {
+                  thoughtChunks += 1;
+                }
+              }),
+            );
+
+            const promptFiber = yield* acp.agent
+              .prompt({ sessionId: "session-1", prompt: [{ type: "text", text: "hi" }] })
+              .pipe(Effect.forkScoped);
+            const promptRequest = yield* decodePromptRequestLine(yield* Queue.take(output));
+
+            const chunks: Array<Uint8Array> = [];
+            for (let index = 0; index < 4; index++) {
+              chunks.push(
+                yield* encodeJsonl(SessionUpdateNotification, {
+                  jsonrpc: "2.0",
+                  method: "session/update",
+                  params: {
+                    sessionId: "session-1",
+                    update: {
+                      sessionUpdate: "agent_thought_chunk",
+                      content: { type: "text", text: `thought-${index}` },
+                    },
+                  },
+                }),
+              );
+            }
+            for (let index = 0; index < 4; index++) {
+              chunks.push(
+                yield* encodeJsonl(SessionUpdateNotification, {
+                  jsonrpc: "2.0",
+                  method: "session/update",
+                  params: {
+                    sessionId: "session-1",
+                    update: {
+                      sessionUpdate: "agent_message_chunk",
+                      content: { type: "text", text: `chunk-${index}` },
+                    },
+                  },
+                }),
+              );
+            }
+            const response = yield* encodeJsonl(PromptResponse, {
+              jsonrpc: "2.0",
+              id: promptRequest.id,
+              result: { stopReason: "end_turn" },
+            });
+
+            if (mode === "coalesced") {
+              yield* Queue.offer(input, concatBytes([...chunks, response]));
+            } else {
+              for (const chunk of chunks) {
+                yield* Queue.offer(input, chunk);
+              }
+              yield* Queue.offer(input, response);
+            }
+
+            const result = yield* Fiber.join(promptFiber);
+            assert.equal(result.stopReason, "end_turn");
+            // Every update preceding the prompt response on the wire must have
+            // completed handler dispatch before the prompt resolves, in wire
+            // order, and split delivery must behave exactly like one buffer.
+            assert.deepEqual(
+              messageChunks,
+              ["chunk-0", "chunk-1", "chunk-2", "chunk-3"],
+              `${mode} round ${round}`,
+            );
+            assert.equal(thoughtChunks, 4, `${mode} round ${round}`);
+            yield* Scope.close(scope, Exit.void);
+          }
+        }
+      }),
+  );
+
+  it.effect("drops an undecodable session update without aborting the batch or transport", () =>
+    Effect.gen(function* () {
+      const { stdio, input, output } = yield* makeInMemoryStdio();
+      const scope = yield* Scope.make();
+      const acp = yield* AcpClient.make(stdio).pipe(Effect.provideService(Scope.Scope, scope));
+      const encoder = new TextEncoder();
+
+      const messageChunks: Array<string> = [];
+      yield* acp.handleSessionUpdate((notification) =>
+        Effect.sync(() => {
+          const update = notification.update;
+          if (update.sessionUpdate === "agent_message_chunk" && update.content.type === "text") {
+            messageChunks.push(update.content.text);
+          }
+        }),
+      );
+
+      const promptFiber = yield* acp.agent
+        .prompt({ sessionId: "session-1", prompt: [{ type: "text", text: "hi" }] })
+        .pipe(Effect.forkScoped);
+      const promptRequest = yield* decodePromptRequestLine(yield* Queue.take(output));
+
+      const sessionUpdateChunk = (text: string) =>
+        encodeJsonl(SessionUpdateNotification, {
+          jsonrpc: "2.0",
+          method: "session/update",
+          params: {
+            sessionId: "session-1",
+            update: {
+              sessionUpdate: "agent_message_chunk",
+              content: { type: "text", text },
+            },
+          },
+        });
+      const poison = encoder.encode(
+        `${encodeUnknownJsonString({
+          jsonrpc: "2.0",
+          method: "session/update",
+          params: {
+            sessionId: "session-1",
+            update: { sessionUpdate: "update_variant_from_the_future", payload: { value: 1 } },
+          },
+        })}\n`,
+      );
+
+      yield* Queue.offer(
+        input,
+        concatBytes([
+          yield* sessionUpdateChunk("before"),
+          poison,
+          yield* sessionUpdateChunk("after"),
+          yield* encodeJsonl(PromptResponse, {
+            jsonrpc: "2.0",
+            id: promptRequest.id,
+            result: { stopReason: "end_turn" },
+          }),
+        ]),
+      );
+
+      const result = yield* Fiber.join(promptFiber);
+      assert.equal(result.stopReason, "end_turn");
+      // The poison update is dropped, but every other message in the same
+      // buffer — including the prompt response behind it — still routes.
+      assert.deepEqual(messageChunks, ["before", "after"]);
+
+      yield* Queue.offer(input, yield* sessionUpdateChunk("late"));
+      for (let attempt = 0; attempt < 100 && messageChunks.length < 3; attempt++) {
+        yield* Effect.yieldNow;
+      }
+      assert.deepEqual(messageChunks, ["before", "after", "late"]);
+      yield* Scope.close(scope, Exit.void);
+    }),
+  );
+
+  it.effect(
+    "drops a foreign string-id response (grok skills-reload leak) without killing the receive loop",
+    () =>
+      Effect.gen(function* () {
+        const { stdio, input, output } = yield* makeInMemoryStdio();
+        const scope = yield* Scope.make();
+        const acp = yield* AcpClient.make(stdio).pipe(Effect.provideService(Scope.Scope, scope));
+
+        const promptFiber = yield* acp.agent
+          .prompt({
+            sessionId: "grok-session-1",
+            prompt: [{ type: "text", text: "hello" }],
+          })
+          .pipe(Effect.forkScoped);
+
+        const outbound = yield* Queue.take(output);
+        const decodedPrompt = yield* decodePromptRequestLine(outbound);
+
+        // Recorded from grok CLI 0.2.93: a skills-directory change broadcasts a JSON-RPC
+        // response with the fixed string id "skills-reload" to every session. It matches no
+        // outstanding request and its id is not numeric, so it must be dropped rather than
+        // forwarded into the RPC client, whose request-id decoding requires numeric ids.
+        const skillsReloadLeak = new TextEncoder().encode(
+          '{"jsonrpc":"2.0","id":"skills-reload","result":{"result":{"reloaded":1}}}\n',
+        );
+        yield* Queue.offer(input, skillsReloadLeak);
+        yield* Queue.offer(input, skillsReloadLeak);
+
+        yield* Queue.offer(
+          input,
+          yield* encodeJsonl(PromptResponse, {
+            jsonrpc: "2.0",
+            id: decodedPrompt.id,
+            result: { stopReason: "end_turn" },
+          }),
+        );
+
+        assert.deepEqual(yield* Fiber.join(promptFiber), { stopReason: "end_turn" });
         yield* Scope.close(scope, Exit.void);
       }),
   );

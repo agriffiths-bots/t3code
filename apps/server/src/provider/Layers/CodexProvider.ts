@@ -22,16 +22,18 @@ import type {
   ServerProviderModel,
   ServerProviderSkill,
 } from "@t3tools/contracts";
-import { ServerSettingsError } from "@t3tools/contracts";
+import { PREFERRED_DEFAULT_CODEX_MODELS, ServerSettingsError } from "@t3tools/contracts";
 
 import { createModelCapabilities } from "@t3tools/shared/model";
 import { resolveSpawnCommand } from "@t3tools/shared/shell";
+import { codexAppServerArgs, resolveCodexLaunchArgs } from "./codexLaunchArgs.ts";
 import {
   AUTH_PROBE_TIMEOUT_MS,
   buildServerProvider,
   type ServerProviderDraft,
 } from "../providerSnapshot.ts";
 import { expandHomePath } from "../../pathExpansion.ts";
+import { CODEX_STANDARD_SERVICE_TIER, normalizeCodexServiceTier } from "../../codexModelOptions.ts";
 import packageJson from "../../../package.json" with { type: "json" };
 const isCodexAppServerSpawnError = Schema.is(CodexErrors.CodexAppServerSpawnError);
 
@@ -59,8 +61,6 @@ const REASONING_EFFORT_LABELS: Readonly<Record<string, string>> = {
   max: "Max",
   ultra: "Ultra",
 };
-
-const DEFAULT_SERVICE_TIER_ID = "default";
 
 function reasoningEffortLabel(reasoningEffort: string): string {
   return REASONING_EFFORT_LABELS[reasoningEffort] ?? reasoningEffort;
@@ -108,6 +108,7 @@ function codexAccountEmail(account: CodexSchema.V2GetAccountResponse["account"])
 
 export function mapCodexModelCapabilities(
   model: CodexSchema.V2ModelListResponse__Model,
+  config?: CodexSchema.V2ConfigReadResponse__Config,
 ): ModelCapabilities {
   const reasoningOptions = model.supportedReasoningEfforts.map(({ reasoningEffort }) =>
     reasoningEffort === model.defaultReasoningEffort
@@ -122,7 +123,7 @@ export function mapCodexModelCapabilities(
         },
   );
   const defaultReasoning = reasoningOptions.find((option) => option.isDefault)?.id;
-  const serviceTiers =
+  const rawServiceTiers =
     model.serviceTiers && model.serviceTiers.length > 0
       ? model.serviceTiers
       : (model.additionalSpeedTiers ?? []).map((id) => ({
@@ -130,12 +131,29 @@ export function mapCodexModelCapabilities(
           name: id === "fast" ? "Fast" : id,
           description: "",
         }));
+  const serviceTiers = rawServiceTiers.reduce<Array<(typeof rawServiceTiers)[number]>>(
+    (tiers, tier) => {
+      const id = normalizeCodexServiceTier(tier.id) ?? tier.id;
+      if (tiers.some((candidate) => candidate.id === id)) return tiers;
+      tiers.push({ ...tier, id });
+      return tiers;
+    },
+    [],
+  );
+  const configuredServiceTier = resolveConfiguredCodexServiceTier(config);
+  const normalizedCatalogDefault = normalizeCodexServiceTier(model.defaultServiceTier ?? undefined);
   const catalogDefaultServiceTier = serviceTiers.some(
-    (tier) => tier.id === model.defaultServiceTier,
+    (tier) => tier.id === normalizedCatalogDefault,
   )
-    ? model.defaultServiceTier
+    ? normalizedCatalogDefault
     : null;
-  const defaultServiceTier = catalogDefaultServiceTier ?? DEFAULT_SERVICE_TIER_ID;
+  const defaultServiceTier =
+    configuredServiceTier === undefined
+      ? (catalogDefaultServiceTier ?? CODEX_STANDARD_SERVICE_TIER)
+      : configuredServiceTier === CODEX_STANDARD_SERVICE_TIER ||
+          !serviceTiers.some((tier) => tier.id === configuredServiceTier)
+        ? CODEX_STANDARD_SERVICE_TIER
+        : configuredServiceTier;
   const optionDescriptors: ProviderOptionDescriptor[] = [];
 
   if (reasoningOptions.length > 0) {
@@ -154,9 +172,9 @@ export function mapCodexModelCapabilities(
       type: "select",
       options: [
         {
-          id: DEFAULT_SERVICE_TIER_ID,
+          id: CODEX_STANDARD_SERVICE_TIER,
           label: "Standard",
-          ...(defaultServiceTier === DEFAULT_SERVICE_TIER_ID ? { isDefault: true } : {}),
+          ...(defaultServiceTier === CODEX_STANDARD_SERVICE_TIER ? { isDefault: true } : {}),
         },
         ...serviceTiers.map((tier) => ({
           id: tier.id,
@@ -174,6 +192,26 @@ export function mapCodexModelCapabilities(
   });
 }
 
+function resolveConfiguredCodexServiceTier(
+  config: CodexSchema.V2ConfigReadResponse__Config | undefined,
+): string | undefined {
+  if (!config) return undefined;
+  const configured = normalizeCodexServiceTier(
+    typeof config.service_tier === "string" ? config.service_tier : undefined,
+  );
+  // Codex treats the durable opt-out notice as the fallback when no explicit tier is configured.
+  if (configured) return configured;
+  const notice = config.notice;
+  const optedOut =
+    notice !== null &&
+    typeof notice === "object" &&
+    "fast_default_opt_out" in notice &&
+    notice.fast_default_opt_out === true;
+  // The durable opt-out is stronger than the catalog-managed default.
+  if (optedOut) return CODEX_STANDARD_SERVICE_TIER;
+  return undefined;
+}
+
 const toDisplayName = (model: CodexSchema.V2ModelListResponse__Model): string => {
   // Capitalize 'gpt' to 'GPT-' and capitalize any letter following a dash
   return model.displayName
@@ -183,13 +221,40 @@ const toDisplayName = (model: CodexSchema.V2ModelListResponse__Model): string =>
 
 function parseCodexModelListResponse(
   response: CodexSchema.V2ModelListResponse,
+  config: CodexSchema.V2ConfigReadResponse__Config,
 ): ReadonlyArray<ServerProviderModel> {
   return response.data.map((model) => ({
     slug: model.model,
     name: toDisplayName(model),
     isCustom: false,
-    capabilities: mapCodexModelCapabilities(model),
+    ...(model.isDefault ? { isDefault: true } : {}),
+    capabilities: mapCodexModelCapabilities(model, config),
   }));
+}
+
+/**
+ * Prefer our own default-model ranking when one of the preferred slugs is in
+ * the live catalog; otherwise keep whatever Codex itself flagged as default.
+ */
+export function applyPreferredCodexDefaultModel(
+  models: ReadonlyArray<ServerProviderModel>,
+): ReadonlyArray<ServerProviderModel> {
+  const preferredSlug = PREFERRED_DEFAULT_CODEX_MODELS.find((slug) =>
+    models.some((model) => model.slug === slug && !model.isCustom),
+  );
+  if (!preferredSlug) {
+    return models;
+  }
+  return models.map((model) => {
+    if (model.slug === preferredSlug) {
+      return model.isDefault ? model : { ...model, isDefault: true };
+    }
+    if (!model.isDefault) {
+      return model;
+    }
+    const { isDefault: _isDefault, ...rest } = model;
+    return rest;
+  });
 }
 
 function appendCustomCodexModels(
@@ -255,18 +320,20 @@ function parseCodexSkillsListResponse(
   });
 }
 
-const requestAllCodexModels = Effect.fn("requestAllCodexModels")(function* (
+export const requestAllCodexModels = Effect.fn("requestAllCodexModels")(function* (
   client: CodexClient.CodexAppServerClient["Service"],
+  cwd: string,
 ) {
   const models: ServerProviderModel[] = [];
   let cursor: string | null | undefined = undefined;
+  const configResponse = yield* client.request("config/read", { cwd });
 
   do {
     const response: CodexSchema.V2ModelListResponse = yield* client.request(
       "model/list",
       cursor ? { cursor } : {},
     );
-    models.push(...parseCodexModelListResponse(response));
+    models.push(...parseCodexModelListResponse(response, configResponse.config));
     cursor = response.nextCursor;
   } while (cursor);
 
@@ -289,6 +356,7 @@ export function buildCodexInitializeParams(): CodexSchema.V1InitializeParams {
 const probeCodexAppServerProvider = Effect.fn("probeCodexAppServerProvider")(function* (input: {
   readonly binaryPath: string;
   readonly homePath?: string;
+  readonly launchArgs?: string;
   readonly cwd: string;
   readonly customModels?: ReadonlyArray<string>;
   readonly environment?: NodeJS.ProcessEnv;
@@ -303,10 +371,14 @@ const probeCodexAppServerProvider = Effect.fn("probeCodexAppServerProvider")(fun
     ...input.environment,
     ...(resolvedHomePath ? { CODEX_HOME: resolvedHomePath } : {}),
   };
-  const spawnCommand = yield* resolveSpawnCommand(input.binaryPath, ["app-server"], {
-    env: environment,
-    extendEnv: true,
-  });
+  const spawnCommand = yield* resolveSpawnCommand(
+    input.binaryPath,
+    codexAppServerArgs(input.launchArgs),
+    {
+      env: environment,
+      extendEnv: true,
+    },
+  );
   const child = yield* spawner
     .spawn(
       ChildProcess.make(spawnCommand.command, spawnCommand.args, {
@@ -362,7 +434,7 @@ const probeCodexAppServerProvider = Effect.fn("probeCodexAppServerProvider")(fun
       client.request("skills/list", {
         cwds: [input.cwd],
       }),
-      requestAllCodexModels(client),
+      requestAllCodexModels(client, input.cwd),
     ],
     { concurrency: "unbounded" },
   );
@@ -370,7 +442,9 @@ const probeCodexAppServerProvider = Effect.fn("probeCodexAppServerProvider")(fun
   return {
     account: accountResponse,
     version,
-    models: appendCustomCodexModels(models, input.customModels ?? []),
+    models: applyPreferredCodexDefaultModel(
+      appendCustomCodexModels(models, input.customModels ?? []),
+    ),
     skills: parseCodexSkillsListResponse(skillsResponse, input.cwd),
   } satisfies CodexAppServerProviderSnapshot;
 });
@@ -465,6 +539,7 @@ export const checkCodexProviderStatus = Effect.fn("checkCodexProviderStatus")(fu
   probe: (input: {
     readonly binaryPath: string;
     readonly homePath?: string;
+    readonly launchArgs?: string;
     readonly cwd: string;
     readonly customModels: ReadonlyArray<string>;
     readonly environment?: NodeJS.ProcessEnv;
@@ -503,6 +578,7 @@ export const checkCodexProviderStatus = Effect.fn("checkCodexProviderStatus")(fu
   const probeResult = yield* probe({
     binaryPath: codexSettings.binaryPath,
     homePath: codexSettings.homePath,
+    launchArgs: resolveCodexLaunchArgs(codexSettings.launchArgs, resolvedEnvironment),
     cwd: process.cwd(),
     customModels: codexSettings.customModels,
     environment: resolvedEnvironment,

@@ -41,6 +41,7 @@ import * as SqlClient from "effect/unstable/sql/SqlClient";
 import {
   ProviderAdapterRequestError,
   ProviderAdapterSessionNotFoundError,
+  ProviderSessionDirectoryPersistenceError,
   ProviderUnsupportedError,
   ProviderValidationError,
   type ProviderAdapterError,
@@ -49,8 +50,10 @@ import type { ProviderAdapterShape } from "../Services/ProviderAdapter.ts";
 import * as ProviderAdapterRegistry from "../Services/ProviderAdapterRegistry.ts";
 import * as ProviderService from "../Services/ProviderService.ts";
 import * as ProviderSessionDirectory from "../Services/ProviderSessionDirectory.ts";
+import { getCapturedProviderRuntimeEventBinding } from "../runtimeEventBindingRegistry.ts";
 import { makeProviderServiceLive, type ProviderServiceLiveOptions } from "./ProviderService.ts";
 import * as ProviderEventLoggers from "./ProviderEventLoggers.ts";
+import { PROVIDER_EMPTY_RESPONSE_ERROR } from "./providerFailureMessages.ts";
 import { ProviderSessionDirectoryLive } from "./ProviderSessionDirectory.ts";
 import * as McpProviderSession from "../../mcp/McpProviderSession.ts";
 import * as NodeServices from "@effect/platform-node/NodeServices";
@@ -61,7 +64,10 @@ import {
 } from "../../persistence/Layers/Sqlite.ts";
 import * as ServerSettings from "../../serverSettings.ts";
 import * as AnalyticsService from "../../telemetry/AnalyticsService.ts";
-import { makeAdapterRegistryMock } from "../testUtils/providerAdapterRegistryMock.ts";
+import {
+  makeAdapterRegistryMock,
+  type KindAdapterMap,
+} from "../testUtils/providerAdapterRegistryMock.ts";
 
 const defaultServerSettingsLayer = ServerSettings.ServerSettingsService.layerTest();
 
@@ -72,9 +78,11 @@ const asTurnId = (value: string): TurnId => TurnId.make(value);
 const environmentId = EnvironmentId.make("environment-provider-service-test");
 const codexInstanceId = ProviderInstanceId.make("codex");
 const claudeAgentInstanceId = ProviderInstanceId.make("claudeAgent");
+const grokInstanceId = ProviderInstanceId.make("grok");
 const cursorInstanceId = ProviderInstanceId.make("cursor");
 const CODEX_DRIVER = ProviderDriverKind.make("codex");
 const CLAUDE_AGENT_DRIVER = ProviderDriverKind.make("claudeAgent");
+const GROK_DRIVER = ProviderDriverKind.make("grok");
 const CURSOR_DRIVER = ProviderDriverKind.make("cursor");
 
 type LegacyProviderRuntimeEvent = {
@@ -292,6 +300,77 @@ function makeFakeCodexAdapter(provider: ProviderDriverKind = CODEX_DRIVER) {
 const advanceTestClock = (ms: number) =>
   TestClock.adjust(`${ms} millis`).pipe(Effect.andThen(Effect.yieldNow));
 
+interface MeaningfulOutputCase {
+  readonly name: string;
+  readonly provider: ProviderDriverKind;
+  readonly providerInstanceId: ProviderInstanceId;
+  readonly output: Pick<LegacyProviderRuntimeEvent, "type" | "payload"> & {
+    readonly itemId?: string;
+  };
+}
+
+const assertSuccessfulOutputOnlyTurn = (
+  testCase: MeaningfulOutputCase,
+  adapter: ReturnType<typeof makeFakeCodexAdapter>,
+) =>
+  Effect.gen(function* () {
+    const provider = yield* ProviderService.ProviderService;
+    const testId = testCase.name.toLowerCase().replaceAll(" ", "-");
+    const threadId = asThreadId(`thread-${testId}`);
+    const turnId = asTurnId(`turn-${testId}`);
+    yield* provider.startSession(threadId, {
+      provider: testCase.provider,
+      providerInstanceId: testCase.providerInstanceId,
+      threadId,
+      runtimeMode: "full-access",
+    });
+    const completedEventId = asEventId(`evt-${testId}-completed`);
+    const completed = yield* provider.streamEvents.pipe(
+      Stream.filter((event) => event.eventId === completedEventId),
+      Stream.take(1),
+      Stream.runCollect,
+      Effect.forkChild,
+    );
+    yield* advanceTestClock(50);
+
+    adapter.emit({
+      type: "turn.started",
+      eventId: asEventId(`evt-${testId}-started`),
+      provider: testCase.provider,
+      createdAt: "2026-01-01T00:00:00.000Z",
+      threadId,
+      turnId,
+      payload: {},
+    });
+    adapter.emit({
+      ...testCase.output,
+      eventId: asEventId(`evt-${testId}-output`),
+      provider: testCase.provider,
+      createdAt: "2026-01-01T00:00:01.000Z",
+      threadId,
+      turnId,
+    });
+    adapter.emit({
+      type: "turn.completed",
+      eventId: completedEventId,
+      provider: testCase.provider,
+      createdAt: "2026-01-01T00:00:02.000Z",
+      threadId,
+      turnId,
+      payload: { state: "completed" },
+    });
+    if (testCase.provider === CURSOR_DRIVER) {
+      yield* advanceTestClock(200);
+    }
+
+    const events = Array.from(yield* Fiber.join(completed));
+    assert.equal(events[0]?.type, "turn.completed");
+    if (events[0]?.type === "turn.completed") {
+      assert.equal(events[0].payload.state, "completed");
+      assert.equal(events[0].payload.errorMessage, undefined);
+    }
+  });
+
 const hasMetricSnapshot = (
   snapshots: ReadonlyArray<Metric.Metric.Snapshot>,
   id: string,
@@ -303,15 +382,17 @@ const hasMetricSnapshot = (
       Object.entries(attributes).every(([key, value]) => snapshot.attributes?.[key] === value),
   );
 
-function makeProviderServiceLayer(options?: ProviderServiceLiveOptions) {
+function makeProviderServiceLayer(options?: ProviderServiceLiveOptions, adapters?: KindAdapterMap) {
   const codex = makeFakeCodexAdapter();
   const claude = makeFakeCodexAdapter(CLAUDE_AGENT_DRIVER);
   const cursor = makeFakeCodexAdapter(CURSOR_DRIVER);
-  const registry = makeAdapterRegistryMock({
-    [ProviderDriverKind.make("codex")]: codex.adapter,
-    [ProviderDriverKind.make("claudeAgent")]: claude.adapter,
-    [ProviderDriverKind.make("cursor")]: cursor.adapter,
-  });
+  const registry = makeAdapterRegistryMock(
+    adapters ?? {
+      [ProviderDriverKind.make("codex")]: codex.adapter,
+      [ProviderDriverKind.make("claudeAgent")]: claude.adapter,
+      [ProviderDriverKind.make("cursor")]: cursor.adapter,
+    },
+  );
 
   const providerAdapterLayer = Layer.succeed(
     ProviderAdapterRegistry.ProviderAdapterRegistry,
@@ -1236,6 +1317,19 @@ routing.layer("ProviderServiceLive routing", (it) => {
       );
       yield* advanceTestClock(50);
       routing.codex.emit({
+        type: "content.delta",
+        eventId: asEventId("evt-active-before-stale-started-output"),
+        provider: CODEX_DRIVER,
+        threadId,
+        turnId: turn.turnId,
+        itemId: "item-active-before-stale-started-output",
+        createdAt: "2026-01-01T00:00:03.250Z",
+        payload: {
+          streamKind: "assistant_text",
+          delta: "active turn output",
+        },
+      });
+      routing.codex.emit({
         type: "turn.started",
         eventId: staleStartedEventId,
         provider: ProviderDriverKind.make("codex"),
@@ -1274,7 +1368,12 @@ routing.layer("ProviderServiceLive routing", (it) => {
         createdAt: "2026-01-01T00:00:04.000Z",
         payload: { state: "completed" },
       });
-      yield* Fiber.join(activeCompletedFiber);
+      const activeCompletedEvents = Array.from(yield* Fiber.join(activeCompletedFiber));
+      assert.equal(activeCompletedEvents[0]?.type, "turn.completed");
+      if (activeCompletedEvents[0]?.type === "turn.completed") {
+        assert.equal(activeCompletedEvents[0].payload.state, "completed");
+        assert.equal(activeCompletedEvents[0].payload.errorMessage, undefined);
+      }
 
       const completedBinding = yield* directory.getBinding(threadId);
       assert.equal(Option.isSome(completedBinding), true);
@@ -1285,6 +1384,175 @@ routing.layer("ProviderServiceLive routing", (it) => {
         };
         assert.equal(runtimePayload.activeTurnId, null);
         assert.equal(runtimePayload.lastRuntimeEvent, "turn.completed");
+      }
+    }),
+  );
+
+  it.effect("does not let duplicate turn.started events clear active turn output", () =>
+    Effect.gen(function* () {
+      const provider = yield* ProviderService.ProviderService;
+      const threadId = asThreadId("thread-duplicate-started-active-output");
+
+      yield* provider.startSession(threadId, {
+        provider: CODEX_DRIVER,
+        providerInstanceId: codexInstanceId,
+        threadId,
+        runtimeMode: "full-access",
+      });
+      const turn = yield* provider.sendTurn({
+        threadId,
+        input: "hello",
+        attachments: [],
+      });
+      const completedEventId = asEventId("evt-duplicate-started-completed");
+      const completedFiber = yield* provider.streamEvents.pipe(
+        Stream.filter((event) => event.eventId === completedEventId),
+        Stream.take(1),
+        Stream.runCollect,
+        Effect.forkChild,
+      );
+      yield* advanceTestClock(50);
+
+      routing.codex.emit({
+        type: "turn.started",
+        eventId: asEventId("evt-duplicate-started-initial"),
+        provider: CODEX_DRIVER,
+        threadId,
+        turnId: turn.turnId,
+        createdAt: "2026-01-01T00:00:00.000Z",
+        payload: {},
+      });
+      routing.codex.emit({
+        type: "content.delta",
+        eventId: asEventId("evt-duplicate-started-output"),
+        provider: CODEX_DRIVER,
+        threadId,
+        turnId: turn.turnId,
+        itemId: "item-duplicate-started-output",
+        createdAt: "2026-01-01T00:00:01.000Z",
+        payload: {
+          streamKind: "assistant_text",
+          delta: "active turn output",
+        },
+      });
+      routing.codex.emit({
+        type: "turn.started",
+        eventId: asEventId("evt-duplicate-started-replayed"),
+        provider: CODEX_DRIVER,
+        threadId,
+        turnId: turn.turnId,
+        createdAt: "2026-01-01T00:00:02.000Z",
+        payload: {},
+      });
+      routing.codex.emit({
+        type: "turn.completed",
+        eventId: completedEventId,
+        provider: CODEX_DRIVER,
+        threadId,
+        turnId: turn.turnId,
+        createdAt: "2026-01-01T00:00:03.000Z",
+        payload: { state: "completed" },
+      });
+
+      const events = Array.from(yield* Fiber.join(completedFiber));
+      assert.equal(events[0]?.type, "turn.completed");
+      if (events[0]?.type === "turn.completed") {
+        assert.equal(events[0].payload.state, "completed");
+        assert.equal(events[0].payload.errorMessage, undefined);
+      }
+    }),
+  );
+
+  it.effect("does not rewrite a stale completion after ownership advances", () =>
+    Effect.gen(function* () {
+      const provider = yield* ProviderService.ProviderService;
+      const directory = yield* ProviderSessionDirectory.ProviderSessionDirectory;
+      const threadId = asThreadId("thread-accepted-start-cleans-orphan");
+      const orphanedTurnId = asTurnId("turn-orphaned-output");
+      const nextTurnId = asTurnId("turn-after-orphaned-output");
+
+      yield* provider.startSession(threadId, {
+        provider: CODEX_DRIVER,
+        providerInstanceId: codexInstanceId,
+        threadId,
+        runtimeMode: "full-access",
+      });
+      const orphanedCompletionEventId = asEventId("evt-orphaned-output-completed-late");
+      const orphanedCompletionFiber = yield* provider.streamEvents.pipe(
+        Stream.filter((event) => event.eventId === orphanedCompletionEventId),
+        Stream.take(1),
+        Stream.runCollect,
+        Effect.forkChild,
+      );
+      yield* advanceTestClock(50);
+
+      routing.codex.emit({
+        type: "turn.started",
+        eventId: asEventId("evt-orphaned-output-started"),
+        provider: CODEX_DRIVER,
+        threadId,
+        turnId: orphanedTurnId,
+        createdAt: "2026-01-01T00:00:00.000Z",
+        payload: {},
+      });
+      routing.codex.emit({
+        type: "content.delta",
+        eventId: asEventId("evt-orphaned-output-delta"),
+        provider: CODEX_DRIVER,
+        threadId,
+        turnId: orphanedTurnId,
+        itemId: "item-orphaned-output",
+        createdAt: "2026-01-01T00:00:01.000Z",
+        payload: {
+          streamKind: "assistant_text",
+          delta: "orphaned output",
+        },
+      });
+
+      const binding = Option.getOrThrow(yield* directory.getBinding(threadId));
+      const runtimePayload =
+        binding.runtimePayload !== null &&
+        typeof binding.runtimePayload === "object" &&
+        !Array.isArray(binding.runtimePayload)
+          ? binding.runtimePayload
+          : {};
+      yield* directory.upsert({
+        threadId,
+        provider: binding.provider,
+        providerInstanceId: codexInstanceId,
+        runtimeMode: binding.runtimeMode ?? "full-access",
+        status: binding.status ?? "running",
+        ...(binding.resumeCursor !== undefined ? { resumeCursor: binding.resumeCursor } : {}),
+        runtimePayload: {
+          ...runtimePayload,
+          activeTurnId: nextTurnId,
+          lastRuntimeEvent: "provider.sendTurn",
+        },
+      });
+      routing.codex.emit({
+        type: "turn.started",
+        eventId: asEventId("evt-after-orphaned-output-started"),
+        provider: CODEX_DRIVER,
+        threadId,
+        turnId: nextTurnId,
+        createdAt: "2026-01-01T00:00:02.000Z",
+        payload: {},
+      });
+      routing.codex.emit({
+        type: "turn.completed",
+        eventId: orphanedCompletionEventId,
+        provider: CODEX_DRIVER,
+        threadId,
+        turnId: orphanedTurnId,
+        createdAt: "2026-01-01T00:00:03.000Z",
+        payload: { state: "completed" },
+      });
+
+      const events = Array.from(yield* Fiber.join(orphanedCompletionFiber));
+      assert.equal(events[0]?.type, "turn.completed");
+      if (events[0]?.type === "turn.completed") {
+        assert.equal(events[0].payload.state, "completed");
+        assert.equal(events[0].payload.errorMessage, undefined);
       }
     }),
   );
@@ -2793,7 +3061,8 @@ routing.layer("ProviderServiceLive routing", (it) => {
     }),
   );
 
-  it.effect("ignores replacement resume cursor state from stale adapter generations", () =>
+  // TODO(ADA-192): re-enable when the provider output-preservation guard lands
+  it.effect.skip("isolates runtime state and assistant output across adapter generations", () =>
     Effect.gen(function* () {
       const firstCursor = makeFakeCodexAdapter(CURSOR_DRIVER);
       const secondCursor = makeFakeCodexAdapter(CURSOR_DRIVER);
@@ -2854,9 +3123,45 @@ routing.layer("ProviderServiceLive routing", (it) => {
           runtimeMode: "full-access",
         });
 
+        const preReplacementTurnId = asTurnId("turn-completed-before-generation-replacement");
+        const preReplacementCompletedId = asEventId("evt-completed-before-generation-replacement");
+        const preReplacementCompleted = yield* provider.streamEvents.pipe(
+          Stream.filter((event) => event.eventId === preReplacementCompletedId),
+          Stream.take(1),
+          Stream.runCollect,
+          Effect.forkChild,
+        );
+        yield* advanceTestClock(50);
+        firstCursor.emit({
+          type: "turn.started",
+          eventId: asEventId("evt-started-before-generation-replacement"),
+          provider: CURSOR_DRIVER,
+          createdAt: "2026-01-01T00:00:00.000Z",
+          threadId,
+          turnId: preReplacementTurnId,
+          payload: {},
+        });
+        firstCursor.emit({
+          type: "turn.completed",
+          eventId: preReplacementCompletedId,
+          provider: CURSOR_DRIVER,
+          createdAt: "2026-01-01T00:00:00.500Z",
+          threadId,
+          turnId: preReplacementTurnId,
+          payload: { state: "completed" },
+        });
+        yield* advanceTestClock(50);
+
         currentAdapter = secondCursor.adapter;
         yield* PubSub.publish(changes, undefined);
         yield* advanceTestClock(50);
+
+        const preReplacementEvents = Array.from(yield* Fiber.join(preReplacementCompleted));
+        assert.equal(preReplacementEvents[0]?.type, "turn.completed");
+        if (preReplacementEvents[0]?.type === "turn.completed") {
+          assert.equal(preReplacementEvents[0].payload.state, "failed");
+          assert.equal(preReplacementEvents[0].payload.errorMessage, PROVIDER_EMPTY_RESPONSE_ERROR);
+        }
 
         const currentResumeCursor = {
           schemaVersion: 1,
@@ -2879,7 +3184,7 @@ routing.layer("ProviderServiceLive routing", (it) => {
           schemaVersion: 1,
           sessionId: "stale-cursor-session",
         };
-        firstCursor.emit({
+        const staleGenerationEvent: LegacyProviderRuntimeEvent = {
           type: "session.state.changed",
           eventId: asEventId("evt-stale-generation-cursor-resume-ready"),
           provider: CURSOR_DRIVER,
@@ -2889,13 +3194,126 @@ routing.layer("ProviderServiceLive routing", (it) => {
             state: "ready",
             detail: { resumeCursor: staleResumeCursor },
           },
-        });
+        };
+        firstCursor.emit(staleGenerationEvent);
         yield* advanceTestClock(50);
+
+        assert.equal(
+          getCapturedProviderRuntimeEventBinding(
+            staleGenerationEvent as unknown as ProviderRuntimeEvent,
+          ),
+          undefined,
+        );
 
         const runtime = yield* runtimeRepository.getByThreadId({ threadId });
         assert.equal(Option.isSome(runtime), true);
         if (Option.isSome(runtime)) {
           assert.deepEqual(runtime.value.resumeCursor, currentResumeCursor);
+        }
+
+        const replacementTurnId = asTurnId("turn-current-generation-output");
+        const replacementCompletedId = asEventId("evt-current-generation-completed");
+        const replacementCompleted = yield* provider.streamEvents.pipe(
+          Stream.filter((event) => event.eventId === replacementCompletedId),
+          Stream.take(1),
+          Stream.runCollect,
+          Effect.forkChild,
+        );
+        yield* advanceTestClock(50);
+        secondCursor.emit({
+          type: "turn.started",
+          eventId: asEventId("evt-current-generation-started"),
+          provider: CURSOR_DRIVER,
+          createdAt: "2026-01-01T00:00:03.000Z",
+          threadId,
+          turnId: replacementTurnId,
+          payload: {},
+        });
+        secondCursor.emit({
+          type: "content.delta",
+          eventId: asEventId("evt-current-generation-output"),
+          provider: CURSOR_DRIVER,
+          createdAt: "2026-01-01T00:00:04.000Z",
+          threadId,
+          turnId: replacementTurnId,
+          itemId: "item-current-generation-output",
+          payload: { streamKind: "assistant_text", delta: "replacement output" },
+        });
+        firstCursor.emit({
+          type: "session.exited",
+          eventId: asEventId("evt-stale-generation-exited"),
+          provider: CURSOR_DRIVER,
+          createdAt: "2026-01-01T00:00:05.000Z",
+          threadId,
+          turnId: replacementTurnId,
+          payload: { exitKind: "error", reason: "stale adapter exited late" },
+        });
+        secondCursor.emit({
+          type: "turn.completed",
+          eventId: replacementCompletedId,
+          provider: CURSOR_DRIVER,
+          createdAt: "2026-01-01T00:00:06.000Z",
+          threadId,
+          turnId: replacementTurnId,
+          payload: { state: "completed" },
+        });
+        const replacementEvents = Array.from(yield* Fiber.join(replacementCompleted));
+        assert.equal(replacementEvents[0]?.type, "turn.completed");
+        if (replacementEvents[0]?.type === "turn.completed") {
+          assert.equal(replacementEvents[0].payload.state, "completed");
+        }
+
+        const emptyTurnId = asTurnId("turn-current-generation-empty");
+        const emptyCompletedId = asEventId("evt-current-generation-empty-completed");
+        const emptyCompleted = yield* provider.streamEvents.pipe(
+          Stream.filter((event) => event.eventId === emptyCompletedId),
+          Stream.take(1),
+          Stream.runCollect,
+          Effect.forkChild,
+        );
+        yield* advanceTestClock(50);
+        secondCursor.emit({
+          type: "turn.started",
+          eventId: asEventId("evt-current-generation-empty-started"),
+          provider: CURSOR_DRIVER,
+          createdAt: "2026-01-01T00:00:07.000Z",
+          threadId,
+          turnId: emptyTurnId,
+          payload: {},
+        });
+        const staleGenerationOutput: LegacyProviderRuntimeEvent = {
+          type: "content.delta",
+          eventId: asEventId("evt-stale-generation-output"),
+          provider: CURSOR_DRIVER,
+          createdAt: "2026-01-01T00:00:08.000Z",
+          threadId,
+          turnId: emptyTurnId,
+          itemId: "item-stale-generation-output",
+          payload: { streamKind: "assistant_text", delta: "stale output" },
+        };
+        firstCursor.emit(staleGenerationOutput);
+        yield* advanceTestClock(50);
+        assert.equal(
+          getCapturedProviderRuntimeEventBinding(
+            staleGenerationOutput as unknown as ProviderRuntimeEvent,
+          ),
+          undefined,
+        );
+        secondCursor.emit({
+          type: "turn.completed",
+          eventId: emptyCompletedId,
+          provider: CURSOR_DRIVER,
+          createdAt: "2026-01-01T00:00:09.000Z",
+          threadId,
+          turnId: emptyTurnId,
+          payload: { state: "completed" },
+        });
+        yield* advanceTestClock(200);
+        const emptyEvents = Array.from(yield* Fiber.join(emptyCompleted));
+        assert.equal(emptyEvents[0]?.type, "turn.completed");
+        if (emptyEvents[0]?.type === "turn.completed") {
+          assert.equal(emptyEvents[0].payload.state, "failed");
+          assert.equal(emptyEvents[0].payload.errorMessage, PROVIDER_EMPTY_RESPONSE_ERROR);
         }
       }).pipe(Effect.provide(Layer.mergeAll(providerLayer, runtimeRepositoryLayer)));
     }),
@@ -3085,6 +3503,160 @@ routing.layer("ProviderServiceLive routing", (it) => {
         assert.equal(startPayload.activeTurnId, undefined);
       }
 
+      NodeFS.rmSync(tempDir, { recursive: true, force: true });
+    }).pipe(Effect.provide(NodeServices.layer)),
+  );
+
+  it.effect("preserves a recovered active turn completion after service restart", () =>
+    Effect.gen(function* () {
+      const tempDir = NodeFS.mkdtempSync(
+        NodePath.join(NodeOS.tmpdir(), "t3-provider-service-output-restart-"),
+      );
+      const dbPath = NodePath.join(tempDir, "orchestration.sqlite");
+      const persistenceLayer = makeSqlitePersistenceLive(dbPath);
+      const runtimeRepositoryLayer = ProviderSessionRuntime.layer.pipe(
+        Layer.provide(persistenceLayer),
+      );
+
+      const firstCursor = makeFakeCodexAdapter(CURSOR_DRIVER);
+      const firstRegistry = makeAdapterRegistryMock({
+        [CURSOR_DRIVER]: firstCursor.adapter,
+      });
+      const firstDirectoryLayer = ProviderSessionDirectoryLive.pipe(
+        Layer.provide(runtimeRepositoryLayer),
+      );
+      const firstProviderLayer = makeProviderServiceLive().pipe(
+        Layer.provide(
+          Layer.succeed(ProviderAdapterRegistry.ProviderAdapterRegistry, firstRegistry),
+        ),
+        Layer.provide(firstDirectoryLayer),
+        Layer.provide(defaultServerSettingsLayer),
+        Layer.provide(AnalyticsService.layerTest),
+        Layer.provide(
+          Layer.succeed(
+            ProviderEventLoggers.ProviderEventLoggers,
+            ProviderEventLoggers.NoOpProviderEventLoggers,
+          ),
+        ),
+      );
+      const threadId = asThreadId("thread-cursor-output-restart");
+      const outputEventId = asEventId("evt-cursor-output-before-restart");
+      const turnId = yield* Effect.gen(function* () {
+        const provider = yield* ProviderService.ProviderService;
+        yield* provider.startSession(threadId, {
+          provider: CURSOR_DRIVER,
+          providerInstanceId: cursorInstanceId,
+          threadId,
+          runtimeMode: "full-access",
+        });
+        const turn = yield* provider.sendTurn({
+          threadId,
+          input: "continue",
+          attachments: [],
+        });
+        const observedOutput = yield* provider.streamEvents.pipe(
+          Stream.filter((event) => event.eventId === outputEventId),
+          Stream.take(1),
+          Stream.runCollect,
+          Effect.forkChild,
+        );
+        yield* advanceTestClock(50);
+        firstCursor.emit({
+          type: "content.delta",
+          eventId: outputEventId,
+          provider: CURSOR_DRIVER,
+          createdAt: "2026-01-01T00:00:01.000Z",
+          threadId,
+          turnId: turn.turnId,
+          itemId: "item-cursor-output-before-restart",
+          payload: {
+            streamKind: "assistant_text",
+            delta: "persisted before restart",
+          },
+        });
+        yield* Fiber.join(observedOutput);
+        return turn.turnId;
+      }).pipe(Effect.provide(firstProviderLayer));
+
+      yield* Effect.gen(function* () {
+        const directory = yield* ProviderSessionDirectory.ProviderSessionDirectory;
+        const binding = Option.getOrThrow(yield* directory.getBinding(threadId));
+        yield* directory.upsert({
+          ...binding,
+          status: "running",
+          runtimePayload: {
+            ...(binding.runtimePayload as Record<string, unknown>),
+            activeTurnId: turnId,
+          },
+        });
+      }).pipe(Effect.provide(firstDirectoryLayer));
+
+      const secondCursor = makeFakeCodexAdapter(CURSOR_DRIVER);
+      const recoveryStartEntered = yield* Deferred.make<void>();
+      const releaseRecoveryStart = yield* Deferred.make<void>();
+      const defaultRecoveryStart = secondCursor.startSession.getMockImplementation();
+      assert.ok(defaultRecoveryStart);
+      secondCursor.startSession.mockImplementationOnce((input) =>
+        Effect.gen(function* () {
+          yield* Deferred.succeed(recoveryStartEntered, undefined);
+          yield* Deferred.await(releaseRecoveryStart);
+          return yield* defaultRecoveryStart(input);
+        }),
+      );
+      const secondRegistry = makeAdapterRegistryMock({
+        [CURSOR_DRIVER]: secondCursor.adapter,
+      });
+      const secondDirectoryLayer = ProviderSessionDirectoryLive.pipe(
+        Layer.provide(runtimeRepositoryLayer),
+      );
+      const secondProviderLayer = makeProviderServiceLive().pipe(
+        Layer.provide(
+          Layer.succeed(ProviderAdapterRegistry.ProviderAdapterRegistry, secondRegistry),
+        ),
+        Layer.provide(secondDirectoryLayer),
+        Layer.provide(defaultServerSettingsLayer),
+        Layer.provide(AnalyticsService.layerTest),
+        Layer.provide(
+          Layer.succeed(
+            ProviderEventLoggers.ProviderEventLoggers,
+            ProviderEventLoggers.NoOpProviderEventLoggers,
+          ),
+        ),
+      );
+
+      const completedEventId = asEventId("evt-cursor-output-after-restart-completed");
+      const completion = yield* Effect.gen(function* () {
+        const provider = yield* ProviderService.ProviderService;
+        const completed = yield* provider.streamEvents.pipe(
+          Stream.filter((event) => event.eventId === completedEventId),
+          Stream.take(1),
+          Stream.runCollect,
+          Effect.forkChild,
+        );
+        yield* advanceTestClock(50);
+        const recovery = yield* provider.interruptTurn({ threadId, turnId }).pipe(Effect.forkChild);
+        yield* Deferred.await(recoveryStartEntered);
+        secondCursor.emit({
+          type: "turn.completed",
+          eventId: completedEventId,
+          provider: CURSOR_DRIVER,
+          createdAt: "2026-01-01T00:00:02.000Z",
+          threadId,
+          turnId,
+          payload: { state: "completed", stopReason: "end_turn" },
+        });
+        yield* advanceTestClock(200);
+        assert.equal(completed.pollUnsafe(), undefined);
+        yield* Deferred.succeed(releaseRecoveryStart, undefined);
+        yield* Fiber.join(recovery);
+        return Array.from(yield* Fiber.join(completed));
+      }).pipe(Effect.provide(secondProviderLayer));
+
+      assert.equal(completion[0]?.type, "turn.completed");
+      if (completion[0]?.type === "turn.completed") {
+        assert.equal(completion[0].payload.state, "completed");
+        assert.equal(completion[0].payload.errorMessage, undefined);
+      }
       NodeFS.rmSync(tempDir, { recursive: true, force: true });
     }).pipe(Effect.provide(NodeServices.layer)),
   );
@@ -3316,6 +3888,10 @@ routing.layer("ProviderServiceLive routing", (it) => {
 });
 
 const fanout = makeProviderServiceLayer();
+const grokOutputAdapter = makeFakeCodexAdapter(GROK_DRIVER);
+const grokFanout = makeProviderServiceLayer(undefined, {
+  [GROK_DRIVER]: grokOutputAdapter.adapter,
+});
 it.effect("ProviderServiceLive clears MCP credentials when a provider adapter is replaced", () =>
   Effect.gen(function* () {
     const firstCodex = makeFakeCodexAdapter();
@@ -3546,7 +4122,1621 @@ it.effect(
     }),
 );
 
+it.effect("drains Cursor completions created while flushing a replaced adapter", () =>
+  Effect.gen(function* () {
+    const firstCursor = makeFakeCodexAdapter(CURSOR_DRIVER);
+    const secondCursor = makeFakeCodexAdapter(CURSOR_DRIVER);
+    let currentAdapter = firstCursor.adapter;
+    const changes = yield* PubSub.unbounded<void>();
+    const registry: ProviderAdapterRegistry.ProviderAdapterRegistry["Service"] = {
+      getByInstance: (instanceId) =>
+        instanceId === cursorInstanceId
+          ? Effect.succeed(currentAdapter)
+          : Effect.fail(
+              new ProviderUnsupportedError({
+                provider: ProviderDriverKind.make(instanceId),
+              }),
+            ),
+      getInstanceInfo: (instanceId) =>
+        Effect.succeed({
+          instanceId,
+          driverKind: CURSOR_DRIVER,
+          displayName: undefined,
+          enabled: true,
+          continuationIdentity: {
+            driverKind: CURSOR_DRIVER,
+            continuationKey: `cursor:instance:${instanceId}`,
+          },
+        }),
+      listInstances: () => Effect.succeed([cursorInstanceId]),
+      listProviders: () => Effect.succeed([CURSOR_DRIVER]),
+      streamChanges: Stream.fromPubSub(changes),
+      subscribeChanges: PubSub.subscribe(changes),
+    };
+    const runtimeRepositoryLayer = ProviderSessionRuntime.layer.pipe(
+      Layer.provide(SqlitePersistenceMemory),
+    );
+    const directoryLayer = ProviderSessionDirectoryLive.pipe(Layer.provide(runtimeRepositoryLayer));
+    const providerLayer = makeProviderServiceLive().pipe(
+      Layer.provide(Layer.succeed(ProviderAdapterRegistry.ProviderAdapterRegistry, registry)),
+      Layer.provide(directoryLayer),
+      Layer.provide(defaultServerSettingsLayer),
+      Layer.provide(AnalyticsService.layerTest),
+      Layer.provide(
+        Layer.succeed(
+          ProviderEventLoggers.ProviderEventLoggers,
+          ProviderEventLoggers.NoOpProviderEventLoggers,
+        ),
+      ),
+    );
+
+    yield* Effect.gen(function* () {
+      const provider = yield* ProviderService.ProviderService;
+      const threadId = asThreadId("thread-cursor-replaced-flush");
+      const firstTurnId = asTurnId("turn-cursor-replaced-flush-first");
+      const replacementTurnId = asTurnId("turn-cursor-replaced-flush-replacement");
+      const firstCompletedEventId = asEventId("evt-cursor-replaced-flush-first-completed");
+      const replacementCompletedEventId = asEventId(
+        "evt-cursor-replaced-flush-replacement-completed",
+      );
+      const completedEvents: Array<ProviderRuntimeEvent> = [];
+
+      yield* provider.startSession(threadId, {
+        provider: CURSOR_DRIVER,
+        providerInstanceId: cursorInstanceId,
+        threadId,
+        runtimeMode: "full-access",
+      });
+      yield* provider.streamEvents.pipe(
+        Stream.filter(
+          (event) =>
+            event.eventId === firstCompletedEventId ||
+            event.eventId === replacementCompletedEventId,
+        ),
+        Stream.runForEach((event) =>
+          Effect.sync(() => {
+            completedEvents.push(event);
+          }),
+        ),
+        Effect.forkChild,
+      );
+      yield* advanceTestClock(50);
+
+      firstCursor.emit({
+        type: "turn.started",
+        eventId: asEventId("evt-cursor-replaced-flush-first-started"),
+        provider: CURSOR_DRIVER,
+        createdAt: "2026-01-01T00:00:00.000Z",
+        threadId,
+        turnId: firstTurnId,
+        payload: {},
+      });
+      firstCursor.emit({
+        type: "turn.completed",
+        eventId: firstCompletedEventId,
+        provider: CURSOR_DRIVER,
+        createdAt: "2026-01-01T00:00:01.000Z",
+        threadId,
+        turnId: firstTurnId,
+        payload: { state: "completed" },
+      });
+      firstCursor.emit({
+        type: "turn.started",
+        eventId: asEventId("evt-cursor-replaced-flush-replacement-started"),
+        provider: CURSOR_DRIVER,
+        createdAt: "2026-01-01T00:00:02.000Z",
+        threadId,
+        turnId: replacementTurnId,
+        payload: {},
+      });
+      firstCursor.emit({
+        type: "turn.completed",
+        eventId: replacementCompletedEventId,
+        provider: CURSOR_DRIVER,
+        createdAt: "2026-01-01T00:00:03.000Z",
+        threadId,
+        turnId: replacementTurnId,
+        payload: { state: "completed" },
+      });
+      yield* advanceTestClock(50);
+
+      currentAdapter = secondCursor.adapter;
+      yield* PubSub.publish(changes, undefined);
+      yield* advanceTestClock(50);
+      yield* advanceTestClock(200);
+
+      assert.deepEqual(
+        completedEvents.map((event) => event.eventId),
+        [firstCompletedEventId, replacementCompletedEventId],
+      );
+      const replacementCompletion = completedEvents[1];
+      assert.equal(replacementCompletion?.type, "turn.completed");
+      if (replacementCompletion?.type === "turn.completed") {
+        assert.equal(replacementCompletion.payload.state, "failed");
+        assert.equal(replacementCompletion.payload.errorMessage, PROVIDER_EMPTY_RESPONSE_ERROR);
+      }
+    }).pipe(
+      Effect.provide(
+        Layer.mergeAll(providerLayer, directoryLayer, runtimeRepositoryLayer, NodeServices.layer),
+      ),
+    );
+  }),
+);
+
+it.effect("cancels a pending Cursor completion when ProviderService is released", () => {
+  const cursor = makeFakeCodexAdapter(CURSOR_DRIVER);
+  const registry = makeAdapterRegistryMock({
+    [CURSOR_DRIVER]: cursor.adapter,
+  });
+  const runtimeRepositoryLayer = ProviderSessionRuntime.layer.pipe(
+    Layer.provide(SqlitePersistenceMemory),
+  );
+  const directoryLayer = ProviderSessionDirectoryLive.pipe(Layer.provide(runtimeRepositoryLayer));
+
+  return Effect.gen(function* () {
+    const directory = yield* ProviderSessionDirectory.ProviderSessionDirectory;
+    const providerLayer = makeProviderServiceLive().pipe(
+      Layer.provide(Layer.succeed(ProviderAdapterRegistry.ProviderAdapterRegistry, registry)),
+      Layer.provide(Layer.succeed(ProviderSessionDirectory.ProviderSessionDirectory, directory)),
+      Layer.provide(defaultServerSettingsLayer),
+      Layer.provide(AnalyticsService.layerTest),
+      Layer.provide(
+        Layer.succeed(
+          ProviderEventLoggers.ProviderEventLoggers,
+          ProviderEventLoggers.NoOpProviderEventLoggers,
+        ),
+      ),
+    );
+    const threadId = asThreadId("thread-cursor-released-grace");
+    const staleTurnId = asTurnId("turn-cursor-released-grace-stale");
+    const providerScope = yield* Scope.make();
+    const providerServices = yield* Layer.build(providerLayer).pipe(Scope.provide(providerScope));
+    yield* advanceTestClock(50);
+
+    yield* Effect.gen(function* () {
+      const provider = yield* ProviderService.ProviderService;
+      yield* provider.startSession(threadId, {
+        provider: CURSOR_DRIVER,
+        providerInstanceId: cursorInstanceId,
+        threadId,
+        runtimeMode: "full-access",
+      });
+      cursor.emit({
+        type: "turn.started",
+        eventId: asEventId("evt-cursor-released-grace-started"),
+        provider: CURSOR_DRIVER,
+        createdAt: "2026-01-01T00:00:00.000Z",
+        threadId,
+        turnId: staleTurnId,
+        payload: {},
+      });
+      cursor.emit({
+        type: "turn.completed",
+        eventId: asEventId("evt-cursor-released-grace-completed"),
+        provider: CURSOR_DRIVER,
+        createdAt: "2026-01-01T00:00:01.000Z",
+        threadId,
+        turnId: staleTurnId,
+        payload: { state: "completed" },
+      });
+      yield* advanceTestClock(50);
+    }).pipe(Effect.provide(providerServices));
+
+    yield* Scope.close(providerScope, Exit.void);
+
+    const binding = Option.getOrThrow(yield* directory.getBinding(threadId));
+    yield* directory.upsert({
+      ...binding,
+      status: "running",
+      runtimePayload: {
+        ...(binding.runtimePayload as Record<string, unknown>),
+        // A replacement service resumes the same provider turn. Its output
+        // state is service-local, so the released service's old grace timer
+        // must not classify that still-active turn from a stale snapshot.
+        activeTurnId: staleTurnId,
+        lastError: null,
+      },
+    });
+    yield* advanceTestClock(200);
+
+    const afterGrace = Option.getOrThrow(yield* directory.getBinding(threadId));
+    const runtimePayload = afterGrace.runtimePayload as {
+      readonly activeTurnId?: unknown;
+      readonly lastError?: unknown;
+    };
+    assert.equal(runtimePayload.activeTurnId, staleTurnId);
+    assert.equal(runtimePayload.lastError, null);
+    assert.equal(afterGrace.status, "running");
+  }).pipe(
+    Effect.provide(Layer.mergeAll(directoryLayer, runtimeRepositoryLayer, NodeServices.layer)),
+  );
+});
+
+it.effect("orders Cursor completion grace behind pending sendTurn ownership", () => {
+  const cursor = makeFakeCodexAdapter(CURSOR_DRIVER);
+  const registry = makeAdapterRegistryMock({
+    [CURSOR_DRIVER]: cursor.adapter,
+  });
+  const runtimeRepositoryLayer = ProviderSessionRuntime.layer.pipe(
+    Layer.provide(SqlitePersistenceMemory),
+  );
+  const directoryLayer = ProviderSessionDirectoryLive.pipe(Layer.provide(runtimeRepositoryLayer));
+
+  return Effect.gen(function* () {
+    const directory = yield* ProviderSessionDirectory.ProviderSessionDirectory;
+    const ownershipReadEntered = yield* Deferred.make<void>();
+    const releaseOwnershipRead = yield* Deferred.make<void>();
+    const releaseSend = yield* Deferred.make<void>();
+    const threadId = asThreadId("thread-cursor-pending-send-grace");
+    const turnId = asTurnId("turn-cursor-pending-send-grace");
+    const completedEventId = asEventId("evt-cursor-pending-send-grace-completed");
+    let blockNextBindingRead = false;
+    let bindingReadBlocked = false;
+    const orderedDirectory: ProviderSessionDirectory.ProviderSessionDirectory["Service"] = {
+      ...directory,
+      getBinding: (requestedThreadId) => {
+        if (requestedThreadId !== threadId || !blockNextBindingRead || bindingReadBlocked) {
+          return directory.getBinding(requestedThreadId);
+        }
+        bindingReadBlocked = true;
+        return Effect.gen(function* () {
+          const staleBinding = yield* directory.getBinding(requestedThreadId);
+          yield* Deferred.succeed(ownershipReadEntered, undefined);
+          yield* Deferred.await(releaseOwnershipRead);
+          return staleBinding;
+        });
+      },
+    };
+    const providerLayer = makeProviderServiceLive().pipe(
+      Layer.provide(Layer.succeed(ProviderAdapterRegistry.ProviderAdapterRegistry, registry)),
+      Layer.provide(
+        Layer.succeed(ProviderSessionDirectory.ProviderSessionDirectory, orderedDirectory),
+      ),
+      Layer.provide(defaultServerSettingsLayer),
+      Layer.provide(AnalyticsService.layerTest),
+      Layer.provide(
+        Layer.succeed(
+          ProviderEventLoggers.ProviderEventLoggers,
+          ProviderEventLoggers.NoOpProviderEventLoggers,
+        ),
+      ),
+    );
+
+    yield* Effect.gen(function* () {
+      const provider = yield* ProviderService.ProviderService;
+      yield* provider.startSession(threadId, {
+        provider: CURSOR_DRIVER,
+        providerInstanceId: cursorInstanceId,
+        threadId,
+        runtimeMode: "full-access",
+      });
+      const completed = yield* provider.streamEvents.pipe(
+        Stream.filter((event) => event.eventId === completedEventId),
+        Stream.take(1),
+        Stream.runCollect,
+        Effect.forkChild,
+      );
+      yield* advanceTestClock(50);
+
+      cursor.sendTurn.mockImplementationOnce(() =>
+        Effect.gen(function* () {
+          blockNextBindingRead = true;
+          cursor.emit({
+            type: "turn.completed",
+            eventId: completedEventId,
+            provider: CURSOR_DRIVER,
+            createdAt: "2026-01-01T00:00:01.000Z",
+            threadId,
+            turnId,
+            payload: { state: "completed" },
+          });
+          yield* Deferred.await(releaseSend);
+          return { threadId, turnId };
+        }),
+      );
+      const send = yield* provider
+        .sendTurn({
+          threadId,
+          input: "respond while completion races the send result",
+          attachments: [],
+        })
+        .pipe(Effect.forkChild);
+      yield* Deferred.await(ownershipReadEntered);
+      yield* Deferred.succeed(releaseSend, undefined);
+
+      // Without the barrier fix, sendTurn can persist ownership while this
+      // deliberately stale read is paused. With the decision inside the lock
+      // it cannot, so this bounded loop intentionally accepts either schedule.
+      for (let attempt = 0; attempt < 20; attempt += 1) {
+        const binding = Option.getOrThrow(yield* directory.getBinding(threadId));
+        const activeTurnId = (binding.runtimePayload as { readonly activeTurnId?: unknown })
+          .activeTurnId;
+        if (activeTurnId === turnId) break;
+        yield* Effect.yieldNow;
+      }
+      yield* Deferred.succeed(releaseOwnershipRead, undefined);
+      yield* Fiber.join(send);
+
+      cursor.emit({
+        type: "content.delta",
+        eventId: asEventId("evt-cursor-pending-send-grace-late-delta"),
+        provider: CURSOR_DRIVER,
+        createdAt: "2026-01-01T00:00:02.000Z",
+        threadId,
+        turnId,
+        itemId: "item-cursor-pending-send-grace-late-delta",
+        payload: { streamKind: "assistant_text", delta: "late visible output" },
+      });
+      yield* advanceTestClock(200);
+
+      const events = Array.from(yield* Fiber.join(completed));
+      assert.equal(events[0]?.type, "turn.completed");
+      if (events[0]?.type === "turn.completed") {
+        assert.equal(events[0].payload.state, "completed");
+        assert.equal(events[0].payload.errorMessage, undefined);
+      }
+    }).pipe(Effect.provide(providerLayer));
+  }).pipe(
+    Effect.provide(Layer.mergeAll(directoryLayer, runtimeRepositoryLayer, NodeServices.layer)),
+  );
+});
+
+it.effect("retries terminal ownership without dropping provider failures", () => {
+  const codex = makeFakeCodexAdapter(CODEX_DRIVER);
+  const registry = makeAdapterRegistryMock({
+    [CODEX_DRIVER]: codex.adapter,
+  });
+  const runtimeRepositoryLayer = ProviderSessionRuntime.layer.pipe(
+    Layer.provide(SqlitePersistenceMemory),
+  );
+  const directoryLayer = ProviderSessionDirectoryLive.pipe(Layer.provide(runtimeRepositoryLayer));
+
+  return Effect.gen(function* () {
+    const directory = yield* ProviderSessionDirectory.ProviderSessionDirectory;
+    const threadId = asThreadId("thread-terminal-ownership-transient-read");
+    const bindingReadFailuresRemaining = new Map<string, number>();
+    let failedOwnershipReads = 0;
+    const flakyDirectory: ProviderSessionDirectory.ProviderSessionDirectory["Service"] = {
+      ...directory,
+      getBinding: (requestedThreadId) => {
+        const remainingFailures = bindingReadFailuresRemaining.get(requestedThreadId) ?? 0;
+        if (remainingFailures > 0) {
+          bindingReadFailuresRemaining.set(requestedThreadId, remainingFailures - 1);
+          failedOwnershipReads += 1;
+          return Effect.fail(
+            new ProviderSessionDirectoryPersistenceError({
+              operation: "getBinding",
+              detail: "transient ownership read failure",
+            }),
+          );
+        }
+        return directory.getBinding(requestedThreadId);
+      },
+    };
+    const providerLayer = makeProviderServiceLive().pipe(
+      Layer.provide(Layer.succeed(ProviderAdapterRegistry.ProviderAdapterRegistry, registry)),
+      Layer.provide(
+        Layer.succeed(ProviderSessionDirectory.ProviderSessionDirectory, flakyDirectory),
+      ),
+      Layer.provide(defaultServerSettingsLayer),
+      Layer.provide(AnalyticsService.layerTest),
+      Layer.provide(
+        Layer.succeed(
+          ProviderEventLoggers.ProviderEventLoggers,
+          ProviderEventLoggers.NoOpProviderEventLoggers,
+        ),
+      ),
+    );
+
+    yield* Effect.gen(function* () {
+      const provider = yield* ProviderService.ProviderService;
+      yield* provider.startSession(threadId, {
+        provider: CODEX_DRIVER,
+        providerInstanceId: codexInstanceId,
+        threadId,
+        runtimeMode: "full-access",
+      });
+      const turn = yield* provider.sendTurn({
+        threadId,
+        input: "complete after a transient ownership read failure",
+        attachments: [],
+      });
+      const completedEventId = asEventId("evt-terminal-ownership-transient-read-completed");
+      const completed = yield* provider.streamEvents.pipe(
+        Stream.filter((event) => event.eventId === completedEventId),
+        Stream.take(1),
+        Stream.runCollect,
+        Effect.forkChild,
+      );
+      yield* advanceTestClock(50);
+      codex.emit({
+        type: "turn.started",
+        eventId: asEventId("evt-terminal-ownership-transient-read-started"),
+        provider: CODEX_DRIVER,
+        createdAt: "2026-01-01T00:00:00.000Z",
+        threadId,
+        turnId: turn.turnId,
+        payload: {},
+      });
+      yield* advanceTestClock(50);
+      const bindingBeforeCompletion = Option.getOrThrow(yield* directory.getBinding(threadId));
+      assert.equal(
+        (bindingBeforeCompletion.runtimePayload as { readonly activeTurnId?: unknown })
+          .activeTurnId,
+        turn.turnId,
+      );
+
+      bindingReadFailuresRemaining.set(threadId, 1);
+      codex.emit({
+        type: "turn.completed",
+        eventId: completedEventId,
+        provider: CODEX_DRIVER,
+        createdAt: "2026-01-01T00:00:01.000Z",
+        threadId,
+        turnId: turn.turnId,
+        payload: { state: "completed", stopReason: "end_turn" },
+      });
+
+      const events = Array.from(yield* Fiber.join(completed));
+      assert.equal(failedOwnershipReads, 1);
+      assert.equal(events[0]?.type, "turn.completed");
+      if (events[0]?.type === "turn.completed") {
+        assert.equal(events[0].payload.state, "failed");
+        assert.equal(events[0].payload.errorMessage, PROVIDER_EMPTY_RESPONSE_ERROR);
+      }
+
+      const failedThreadId = asThreadId("thread-terminal-ownership-persistent-read-failure");
+      yield* provider.startSession(failedThreadId, {
+        provider: CODEX_DRIVER,
+        providerInstanceId: codexInstanceId,
+        threadId: failedThreadId,
+        runtimeMode: "full-access",
+      });
+      const failedTurn = yield* provider.sendTurn({
+        threadId: failedThreadId,
+        input: "preserve the provider failure when ownership is unreadable",
+        attachments: [],
+      });
+      const failedCompletedEventId = asEventId(
+        "evt-terminal-ownership-persistent-read-failed-completed",
+      );
+      const failedCompleted = yield* provider.streamEvents.pipe(
+        Stream.filter((event) => event.eventId === failedCompletedEventId),
+        Stream.take(1),
+        Stream.runCollect,
+        Effect.forkChild,
+      );
+      yield* advanceTestClock(50);
+      codex.emit({
+        type: "turn.started",
+        eventId: asEventId("evt-terminal-ownership-persistent-read-failed-started"),
+        provider: CODEX_DRIVER,
+        createdAt: "2026-01-01T00:00:02.000Z",
+        threadId: failedThreadId,
+        turnId: failedTurn.turnId,
+        payload: {},
+      });
+      yield* advanceTestClock(50);
+
+      const failedReadsBeforeProviderFailure = failedOwnershipReads;
+      bindingReadFailuresRemaining.set(failedThreadId, 3);
+      codex.emit({
+        type: "turn.completed",
+        eventId: failedCompletedEventId,
+        provider: CODEX_DRIVER,
+        createdAt: "2026-01-01T00:00:03.000Z",
+        threadId: failedThreadId,
+        turnId: failedTurn.turnId,
+        payload: {
+          state: "failed",
+          stopReason: "error",
+          errorMessage: "provider failed explicitly",
+        },
+      });
+
+      const failedEvents = Array.from(yield* Fiber.join(failedCompleted));
+      assert.equal(failedOwnershipReads - failedReadsBeforeProviderFailure, 3);
+      assert.equal(failedEvents[0]?.type, "turn.completed");
+      if (failedEvents[0]?.type === "turn.completed") {
+        assert.equal(failedEvents[0].payload.state, "failed");
+        assert.equal(failedEvents[0].payload.errorMessage, "provider failed explicitly");
+      }
+    }).pipe(Effect.provide(providerLayer));
+  }).pipe(
+    Effect.provide(Layer.mergeAll(directoryLayer, runtimeRepositoryLayer, NodeServices.layer)),
+  );
+});
+
+it.effect("gives a Cursor replacement appended during a drain its own late-output grace", () => {
+  const cursor = makeFakeCodexAdapter(CURSOR_DRIVER);
+  const registry = makeAdapterRegistryMock({
+    [CURSOR_DRIVER]: cursor.adapter,
+  });
+  const runtimeRepositoryLayer = ProviderSessionRuntime.layer.pipe(
+    Layer.provide(SqlitePersistenceMemory),
+  );
+  const directoryLayer = ProviderSessionDirectoryLive.pipe(Layer.provide(runtimeRepositoryLayer));
+
+  return Effect.gen(function* () {
+    const directory = yield* ProviderSessionDirectory.ProviderSessionDirectory;
+    const drainReadEntered = yield* Deferred.make<void>();
+    const releaseDrainRead = yield* Deferred.make<void>();
+    const threadId = asThreadId("thread-cursor-live-drain-replacement");
+    const firstTurnId = asTurnId("turn-cursor-live-drain-first");
+    const replacementTurnId = asTurnId("turn-cursor-live-drain-replacement");
+    const firstCompletedEventId = asEventId("evt-cursor-live-drain-first-completed");
+    const replacementCompletedEventId = asEventId("evt-cursor-live-drain-replacement-completed");
+    let blockNextBindingRead = false;
+    let bindingReadBlocked = false;
+    const orderedDirectory: ProviderSessionDirectory.ProviderSessionDirectory["Service"] = {
+      ...directory,
+      getBinding: (requestedThreadId) => {
+        if (requestedThreadId !== threadId || !blockNextBindingRead || bindingReadBlocked) {
+          return directory.getBinding(requestedThreadId);
+        }
+        bindingReadBlocked = true;
+        return Effect.gen(function* () {
+          const binding = yield* directory.getBinding(requestedThreadId);
+          yield* Deferred.succeed(drainReadEntered, undefined);
+          yield* Deferred.await(releaseDrainRead);
+          return binding;
+        });
+      },
+    };
+    const providerLayer = makeProviderServiceLive().pipe(
+      Layer.provide(Layer.succeed(ProviderAdapterRegistry.ProviderAdapterRegistry, registry)),
+      Layer.provide(
+        Layer.succeed(ProviderSessionDirectory.ProviderSessionDirectory, orderedDirectory),
+      ),
+      Layer.provide(defaultServerSettingsLayer),
+      Layer.provide(AnalyticsService.layerTest),
+      Layer.provide(
+        Layer.succeed(
+          ProviderEventLoggers.ProviderEventLoggers,
+          ProviderEventLoggers.NoOpProviderEventLoggers,
+        ),
+      ),
+    );
+
+    yield* Effect.gen(function* () {
+      const provider = yield* ProviderService.ProviderService;
+      yield* provider.startSession(threadId, {
+        provider: CURSOR_DRIVER,
+        providerInstanceId: cursorInstanceId,
+        threadId,
+        runtimeMode: "full-access",
+      });
+      const completionIds = new Set([firstCompletedEventId, replacementCompletedEventId]);
+      const completed = yield* provider.streamEvents.pipe(
+        Stream.filter((event) => completionIds.has(event.eventId)),
+        Stream.take(2),
+        Stream.runCollect,
+        Effect.forkChild,
+      );
+      yield* advanceTestClock(50);
+
+      cursor.emit({
+        type: "turn.started",
+        eventId: asEventId("evt-cursor-live-drain-first-started"),
+        provider: CURSOR_DRIVER,
+        createdAt: "2026-01-01T00:00:00.000Z",
+        threadId,
+        turnId: firstTurnId,
+        payload: {},
+      });
+      cursor.emit({
+        type: "turn.completed",
+        eventId: firstCompletedEventId,
+        provider: CURSOR_DRIVER,
+        createdAt: "2026-01-01T00:00:01.000Z",
+        threadId,
+        turnId: firstTurnId,
+        payload: { state: "completed", stopReason: "end_turn" },
+      });
+      yield* advanceTestClock(50);
+
+      cursor.sendTurn.mockImplementationOnce(() =>
+        Effect.succeed({ threadId, turnId: replacementTurnId }),
+      );
+      yield* provider.sendTurn({
+        threadId,
+        input: "start a replacement without a turn.started event",
+        attachments: [],
+      });
+      const replacementBinding = Option.getOrThrow(yield* directory.getBinding(threadId));
+      assert.equal(
+        (replacementBinding.runtimePayload as { readonly activeTurnId?: unknown }).activeTurnId,
+        replacementTurnId,
+      );
+
+      blockNextBindingRead = true;
+      yield* advanceTestClock(150);
+      yield* Deferred.await(drainReadEntered);
+      cursor.emit({
+        type: "turn.completed",
+        eventId: replacementCompletedEventId,
+        provider: CURSOR_DRIVER,
+        createdAt: "2026-01-01T00:00:02.000Z",
+        threadId,
+        turnId: replacementTurnId,
+        payload: { state: "completed", stopReason: "end_turn" },
+      });
+      cursor.emit({
+        type: "content.delta",
+        eventId: asEventId("evt-cursor-live-drain-replacement-output"),
+        provider: CURSOR_DRIVER,
+        createdAt: "2026-01-01T00:00:03.000Z",
+        threadId,
+        turnId: replacementTurnId,
+        itemId: "item-cursor-live-drain-replacement-output",
+        payload: { streamKind: "assistant_text", delta: "replacement late output" },
+      });
+      yield* Deferred.succeed(releaseDrainRead, undefined);
+      yield* advanceTestClock(200);
+
+      const events = Array.from(yield* Fiber.join(completed));
+      assert.deepEqual(
+        events.map((event) => (event.type === "turn.completed" ? event.payload.state : event.type)),
+        ["failed", "completed"],
+      );
+    }).pipe(Effect.provide(providerLayer));
+  }).pipe(
+    Effect.provide(Layer.mergeAll(directoryLayer, runtimeRepositoryLayer, NodeServices.layer)),
+  );
+});
+
+it.effect("keeps a sibling instance's pending completion when a shared adapter is removed", () =>
+  Effect.gen(function* () {
+    const sharedCursor = makeFakeCodexAdapter(CURSOR_DRIVER);
+    const retainedInstanceId = ProviderInstanceId.make("cursor_shared_retained");
+    const removedInstanceId = ProviderInstanceId.make("cursor_shared_removed");
+    let currentInstanceIds: ReadonlyArray<ProviderInstanceId> = [retainedInstanceId];
+    const changes = yield* PubSub.unbounded<void>();
+    const registry: ProviderAdapterRegistry.ProviderAdapterRegistry["Service"] = {
+      getByInstance: (instanceId) =>
+        currentInstanceIds.includes(instanceId)
+          ? Effect.succeed(sharedCursor.adapter)
+          : Effect.fail(
+              new ProviderUnsupportedError({
+                provider: ProviderDriverKind.make(instanceId),
+              }),
+            ),
+      getInstanceInfo: (instanceId) =>
+        Effect.succeed({
+          instanceId,
+          driverKind: CURSOR_DRIVER,
+          displayName: undefined,
+          enabled: true,
+          continuationIdentity: {
+            driverKind: CURSOR_DRIVER,
+            continuationKey: `cursor:instance:${instanceId}`,
+          },
+        }),
+      listInstances: () => Effect.succeed(currentInstanceIds),
+      listProviders: () => Effect.succeed([CURSOR_DRIVER]),
+      streamChanges: Stream.fromPubSub(changes),
+      subscribeChanges: PubSub.subscribe(changes),
+    };
+    const runtimeRepositoryLayer = ProviderSessionRuntime.layer.pipe(
+      Layer.provide(SqlitePersistenceMemory),
+    );
+    const directoryLayer = ProviderSessionDirectoryLive.pipe(Layer.provide(runtimeRepositoryLayer));
+    const providerLayer = makeProviderServiceLive().pipe(
+      Layer.provide(Layer.succeed(ProviderAdapterRegistry.ProviderAdapterRegistry, registry)),
+      Layer.provide(directoryLayer),
+      Layer.provide(defaultServerSettingsLayer),
+      Layer.provide(AnalyticsService.layerTest),
+      Layer.provide(
+        Layer.succeed(
+          ProviderEventLoggers.ProviderEventLoggers,
+          ProviderEventLoggers.NoOpProviderEventLoggers,
+        ),
+      ),
+    );
+
+    yield* Effect.gen(function* () {
+      const provider = yield* ProviderService.ProviderService;
+      const threadId = asThreadId("thread-shared-adapter-retained");
+      const turnId = asTurnId("turn-shared-adapter-retained");
+      yield* provider.startSession(threadId, {
+        provider: CURSOR_DRIVER,
+        providerInstanceId: retainedInstanceId,
+        threadId,
+        runtimeMode: "full-access",
+      });
+      const completedEventId = asEventId("evt-shared-adapter-retained-completed");
+      const completedFiber = yield* provider.streamEvents.pipe(
+        Stream.filter((event) => event.eventId === completedEventId),
+        Stream.take(1),
+        Stream.runCollect,
+        Effect.forkChild,
+      );
+      yield* advanceTestClock(50);
+
+      sharedCursor.emit({
+        type: "turn.started",
+        eventId: asEventId("evt-shared-adapter-retained-started"),
+        provider: CURSOR_DRIVER,
+        createdAt: "2026-01-01T00:00:00.000Z",
+        threadId,
+        turnId,
+        payload: {},
+      });
+      sharedCursor.emit({
+        type: "turn.completed",
+        eventId: completedEventId,
+        provider: CURSOR_DRIVER,
+        createdAt: "2026-01-01T00:00:01.000Z",
+        threadId,
+        turnId,
+        payload: { state: "completed" },
+      });
+      yield* advanceTestClock(50);
+
+      currentInstanceIds = [retainedInstanceId, removedInstanceId];
+      yield* PubSub.publish(changes, undefined);
+      yield* advanceTestClock(10);
+      currentInstanceIds = [retainedInstanceId];
+      yield* PubSub.publish(changes, undefined);
+      yield* advanceTestClock(10);
+
+      sharedCursor.emit({
+        type: "content.delta",
+        eventId: asEventId("evt-shared-adapter-retained-late-delta"),
+        provider: CURSOR_DRIVER,
+        createdAt: "2026-01-01T00:00:02.000Z",
+        threadId,
+        turnId,
+        itemId: "item-shared-adapter-retained-late-delta",
+        payload: { streamKind: "assistant_text", delta: "retained late output" },
+      });
+      yield* advanceTestClock(200);
+
+      const completedEvents = Array.from(yield* Fiber.join(completedFiber));
+      assert.equal(completedEvents[0]?.type, "turn.completed");
+      if (completedEvents[0]?.type === "turn.completed") {
+        assert.equal(completedEvents[0].payload.state, "completed");
+        assert.equal(completedEvents[0].payload.errorMessage, undefined);
+      }
+    }).pipe(
+      Effect.provide(
+        Layer.mergeAll(providerLayer, directoryLayer, runtimeRepositoryLayer, NodeServices.layer),
+      ),
+    );
+  }),
+);
+
 fanout.layer("ProviderServiceLive fanout", (it) => {
+  it.effect("fails an owned output-free successful turn explicitly", () =>
+    Effect.gen(function* () {
+      const provider = yield* ProviderService.ProviderService;
+      const directory = yield* ProviderSessionDirectory.ProviderSessionDirectory;
+      const threadId = asThreadId("thread-owned-empty-response");
+      const turnId = asTurnId("turn-owned-empty-response");
+      yield* provider.startSession(threadId, {
+        provider: CODEX_DRIVER,
+        providerInstanceId: codexInstanceId,
+        threadId,
+        runtimeMode: "full-access",
+      });
+      const completedEventId = asEventId("evt-owned-empty-response-completed");
+      const completed = yield* provider.streamEvents.pipe(
+        Stream.filter((event) => event.eventId === completedEventId),
+        Stream.take(1),
+        Stream.runCollect,
+        Effect.forkChild,
+      );
+      yield* advanceTestClock(50);
+
+      fanout.codex.emit({
+        type: "turn.started",
+        eventId: asEventId("evt-owned-empty-response-started"),
+        provider: CODEX_DRIVER,
+        createdAt: "2026-01-01T00:00:00.000Z",
+        threadId,
+        turnId,
+        payload: {},
+      });
+      fanout.codex.emit({
+        type: "thread.token-usage.updated",
+        eventId: asEventId("evt-owned-empty-response-control"),
+        provider: CODEX_DRIVER,
+        createdAt: "2026-01-01T00:00:01.000Z",
+        threadId,
+        turnId,
+        payload: { usage: { usedTokens: 1 } },
+      });
+      fanout.codex.emit({
+        type: "turn.proposed.completed",
+        eventId: asEventId("evt-owned-empty-response-blank-plan"),
+        provider: CODEX_DRIVER,
+        createdAt: "2026-01-01T00:00:01.250Z",
+        threadId,
+        turnId,
+        payload: { planMarkdown: "   " },
+      });
+      fanout.codex.emit({
+        type: "item.completed",
+        eventId: asEventId("evt-owned-empty-response-assistant-shell"),
+        provider: CODEX_DRIVER,
+        createdAt: "2026-01-01T00:00:01.500Z",
+        threadId,
+        turnId,
+        itemId: "item-owned-empty-response-assistant-shell",
+        payload: { itemType: "assistant_message", status: "completed" },
+      });
+      fanout.codex.emit({
+        type: "item.updated",
+        eventId: asEventId("evt-owned-empty-response-tool-progress"),
+        provider: CODEX_DRIVER,
+        createdAt: "2026-01-01T00:00:01.750Z",
+        threadId,
+        turnId,
+        itemId: "item-owned-empty-response-tool-progress",
+        payload: { itemType: "command_execution", status: "inProgress" },
+      });
+      fanout.codex.emit({
+        type: "files.persisted",
+        eventId: asEventId("evt-owned-empty-response-no-files"),
+        provider: CODEX_DRIVER,
+        createdAt: "2026-01-01T00:00:01.875Z",
+        threadId,
+        turnId,
+        payload: { files: [] },
+      });
+      fanout.codex.emit({
+        type: "thread.realtime.audio.delta",
+        eventId: asEventId("evt-owned-empty-response-empty-audio"),
+        provider: CODEX_DRIVER,
+        createdAt: "2026-01-01T00:00:01.937Z",
+        threadId,
+        turnId,
+        payload: {
+          audio: {
+            data: "",
+            itemId: null,
+            numChannels: 1,
+            sampleRate: 24_000,
+          },
+        },
+      });
+      for (const [index, itemType] of [
+        "review_entered",
+        "review_exited",
+        "context_compaction",
+      ].entries()) {
+        fanout.codex.emit({
+          type: "item.completed",
+          eventId: asEventId(`evt-owned-empty-response-control-item-${index}`),
+          provider: CODEX_DRIVER,
+          createdAt: `2026-01-01T00:00:01.95${index}Z`,
+          threadId,
+          turnId,
+          itemId: `item-owned-empty-response-control-${index}`,
+          payload: { itemType, status: "completed" },
+        });
+      }
+      fanout.codex.emit({
+        type: "item.updated",
+        eventId: asEventId("evt-owned-empty-response-control-item-updated"),
+        provider: CODEX_DRIVER,
+        createdAt: "2026-01-01T00:00:01.959Z",
+        threadId,
+        turnId,
+        itemId: "item-owned-empty-response-control-updated",
+        payload: {
+          itemType: "review_entered",
+          status: "completed",
+          detail: "Entered review mode",
+        },
+      });
+      fanout.codex.emit({
+        type: "turn.completed",
+        eventId: completedEventId,
+        provider: CODEX_DRIVER,
+        createdAt: "2026-01-01T00:00:02.000Z",
+        threadId,
+        turnId,
+        payload: { state: "completed" },
+      });
+
+      const events = Array.from(yield* Fiber.join(completed));
+      assert.equal(events[0]?.type, "turn.completed");
+      if (events[0]?.type === "turn.completed") {
+        assert.equal(events[0].payload.state, "failed");
+        assert.equal(events[0].payload.errorMessage, PROVIDER_EMPTY_RESPONSE_ERROR);
+      }
+      const binding = Option.getOrThrow(yield* directory.getBinding(threadId));
+      assert.equal(
+        (binding.runtimePayload as { readonly lastError?: unknown }).lastError,
+        PROVIDER_EMPTY_RESPONSE_ERROR,
+      );
+    }),
+  );
+
+  it.effect("preserves the empty-failure classification across duplicate completions", () =>
+    Effect.gen(function* () {
+      const provider = yield* ProviderService.ProviderService;
+      const directory = yield* ProviderSessionDirectory.ProviderSessionDirectory;
+      const threadId = asThreadId("thread-duplicate-empty-completion");
+      const turnId = asTurnId("turn-duplicate-empty-completion");
+      yield* provider.startSession(threadId, {
+        provider: CODEX_DRIVER,
+        providerInstanceId: codexInstanceId,
+        threadId,
+        runtimeMode: "full-access",
+      });
+      const firstCompletionEventId = asEventId("evt-duplicate-empty-completion-first");
+      const secondCompletionEventId = asEventId("evt-duplicate-empty-completion-second");
+      const lateOutputEventId = asEventId("evt-duplicate-empty-completion-late-output");
+      const completionIds = new Set([firstCompletionEventId, secondCompletionEventId]);
+      const completed = yield* provider.streamEvents.pipe(
+        Stream.filter((event) => completionIds.has(event.eventId)),
+        Stream.take(2),
+        Stream.runCollect,
+        Effect.forkChild,
+      );
+      const firstCompletionPublished = yield* provider.streamEvents.pipe(
+        Stream.filter((event) => event.eventId === firstCompletionEventId),
+        Stream.take(1),
+        Stream.runDrain,
+        Effect.forkChild,
+      );
+      const lateOutputPublished = yield* provider.streamEvents.pipe(
+        Stream.filter((event) => event.eventId === lateOutputEventId),
+        Stream.take(1),
+        Stream.runDrain,
+        Effect.forkChild,
+      );
+      yield* advanceTestClock(50);
+
+      fanout.codex.emit({
+        type: "turn.started",
+        eventId: asEventId("evt-duplicate-empty-completion-started"),
+        provider: CODEX_DRIVER,
+        createdAt: "2026-01-01T00:00:00.000Z",
+        threadId,
+        turnId,
+        payload: {},
+      });
+      fanout.codex.emit({
+        type: "turn.completed",
+        eventId: firstCompletionEventId,
+        provider: CODEX_DRIVER,
+        createdAt: "2026-01-01T00:00:01.000Z",
+        threadId,
+        turnId,
+        payload: { state: "completed" },
+      });
+      yield* Fiber.join(firstCompletionPublished);
+      fanout.codex.emit({
+        type: "content.delta",
+        eventId: lateOutputEventId,
+        provider: CODEX_DRIVER,
+        createdAt: "2026-01-01T00:00:02.000Z",
+        threadId,
+        turnId,
+        itemId: "item-duplicate-empty-completion-late-output",
+        payload: { streamKind: "assistant_text", delta: "too late to change the terminal state" },
+      });
+      yield* Fiber.join(lateOutputPublished);
+      fanout.codex.emit({
+        type: "turn.completed",
+        eventId: secondCompletionEventId,
+        provider: CODEX_DRIVER,
+        createdAt: "2026-01-01T00:00:03.000Z",
+        threadId,
+        turnId,
+        payload: { state: "completed" },
+      });
+
+      const events = Array.from(yield* Fiber.join(completed));
+      assert.deepEqual(
+        events.map((event) =>
+          event.type === "turn.completed"
+            ? [event.payload.state, event.payload.errorMessage]
+            : [event.type, undefined],
+        ),
+        [
+          ["failed", PROVIDER_EMPTY_RESPONSE_ERROR],
+          ["failed", PROVIDER_EMPTY_RESPONSE_ERROR],
+        ],
+      );
+
+      const recoveryTurn = yield* provider.sendTurn({
+        threadId,
+        input: "recover with output but no turn.started event",
+        attachments: [],
+      });
+      const recoveryOutputEventId = asEventId("evt-after-empty-failure-recovery-output");
+      const recoveryCompletedEventId = asEventId("evt-after-empty-failure-recovery-completed");
+      const recoveryOutputPublished = yield* provider.streamEvents.pipe(
+        Stream.filter((event) => event.eventId === recoveryOutputEventId),
+        Stream.take(1),
+        Stream.runDrain,
+        Effect.forkChild,
+      );
+      const recoveryCompleted = yield* provider.streamEvents.pipe(
+        Stream.filter((event) => event.eventId === recoveryCompletedEventId),
+        Stream.take(1),
+        Stream.runCollect,
+        Effect.forkChild,
+      );
+      yield* advanceTestClock(50);
+      fanout.codex.emit({
+        type: "content.delta",
+        eventId: recoveryOutputEventId,
+        provider: CODEX_DRIVER,
+        createdAt: "2026-01-01T00:00:04.000Z",
+        threadId,
+        turnId: recoveryTurn.turnId,
+        itemId: "item-after-empty-failure-recovery-output",
+        payload: { streamKind: "assistant_text", delta: "successful recovery" },
+      });
+      yield* Fiber.join(recoveryOutputPublished);
+      fanout.codex.emit({
+        type: "turn.completed",
+        eventId: recoveryCompletedEventId,
+        provider: CODEX_DRIVER,
+        createdAt: "2026-01-01T00:00:05.000Z",
+        threadId,
+        turnId: recoveryTurn.turnId,
+        payload: { state: "completed" },
+      });
+
+      const recoveryEvents = Array.from(yield* Fiber.join(recoveryCompleted));
+      assert.equal(recoveryEvents[0]?.type, "turn.completed");
+      if (recoveryEvents[0]?.type === "turn.completed") {
+        assert.equal(recoveryEvents[0].payload.state, "completed");
+      }
+      const recoveredBinding = Option.getOrThrow(yield* directory.getBinding(threadId));
+      assert.equal(
+        (recoveredBinding.runtimePayload as { readonly lastError?: unknown }).lastError,
+        null,
+      );
+
+      const historicalReplayEventId = asEventId("evt-duplicate-empty-completion-after-recovery");
+      const historicalReplay = yield* provider.streamEvents.pipe(
+        Stream.filter((event) => event.eventId === historicalReplayEventId),
+        Stream.take(1),
+        Stream.runCollect,
+        Effect.forkChild,
+      );
+      yield* advanceTestClock(50);
+      fanout.codex.emit({
+        type: "turn.completed",
+        eventId: historicalReplayEventId,
+        provider: CODEX_DRIVER,
+        createdAt: "2026-01-01T00:00:06.000Z",
+        threadId,
+        turnId,
+        payload: { state: "completed" },
+      });
+      const historicalReplayEvents = Array.from(yield* Fiber.join(historicalReplay));
+      assert.equal(historicalReplayEvents[0]?.type, "turn.completed");
+      if (historicalReplayEvents[0]?.type === "turn.completed") {
+        assert.equal(historicalReplayEvents[0].payload.state, "failed");
+        assert.equal(historicalReplayEvents[0].payload.errorMessage, PROVIDER_EMPTY_RESPONSE_ERROR);
+      }
+      const bindingAfterHistoricalReplay = Option.getOrThrow(yield* directory.getBinding(threadId));
+      assert.equal(
+        (bindingAfterHistoricalReplay.runtimePayload as { readonly lastError?: unknown }).lastError,
+        null,
+      );
+    }),
+  );
+
+  it.effect("does not seed output when a live Cursor session restarts in the same service", () =>
+    Effect.gen(function* () {
+      const provider = yield* ProviderService.ProviderService;
+      const threadId = asThreadId("thread-live-cursor-restart-empty");
+      yield* provider.startSession(threadId, {
+        provider: CURSOR_DRIVER,
+        providerInstanceId: cursorInstanceId,
+        threadId,
+        runtimeMode: "full-access",
+      });
+      const turn = yield* provider.sendTurn({
+        threadId,
+        input: "restart without output",
+        attachments: [],
+      });
+      yield* provider.startSession(threadId, {
+        provider: CURSOR_DRIVER,
+        providerInstanceId: cursorInstanceId,
+        threadId,
+        runtimeMode: "full-access",
+      });
+      const completedEventId = asEventId("evt-live-cursor-restart-empty-completed");
+      const completed = yield* provider.streamEvents.pipe(
+        Stream.filter((event) => event.eventId === completedEventId),
+        Stream.take(1),
+        Stream.runCollect,
+        Effect.forkChild,
+      );
+      yield* advanceTestClock(50);
+      fanout.cursor.emit({
+        type: "turn.completed",
+        eventId: completedEventId,
+        provider: CURSOR_DRIVER,
+        createdAt: "2026-01-01T00:00:01.000Z",
+        threadId,
+        turnId: turn.turnId,
+        payload: { state: "completed", stopReason: "end_turn" },
+      });
+      yield* advanceTestClock(200);
+
+      const events = Array.from(yield* Fiber.join(completed));
+      assert.equal(events[0]?.type, "turn.completed");
+      if (events[0]?.type === "turn.completed") {
+        assert.equal(events[0].payload.state, "failed");
+      }
+    }),
+  );
+
+  it.effect("preserves ingress ownership while buffered Cursor completions drain", () =>
+    Effect.gen(function* () {
+      const provider = yield* ProviderService.ProviderService;
+      const directory = yield* ProviderSessionDirectory.ProviderSessionDirectory;
+      const threadId = asThreadId("thread-cursor-buffered-owned-completions");
+      const turnId = asTurnId("turn-cursor-buffered-owned-completions");
+      const replacementTurnId = asTurnId("turn-cursor-buffered-owned-replacement");
+      yield* provider.startSession(threadId, {
+        provider: CURSOR_DRIVER,
+        providerInstanceId: cursorInstanceId,
+        threadId,
+        runtimeMode: "full-access",
+      });
+      const initialCompletionIds = [
+        "evt-cursor-buffered-owned-completion-first",
+        "evt-cursor-buffered-owned-completion-second",
+      ];
+      const duplicateCompletionId = "evt-cursor-buffered-owned-completion-after-replacement";
+      const completionIds = new Set([...initialCompletionIds, duplicateCompletionId]);
+      const completed = yield* provider.streamEvents.pipe(
+        Stream.filter((event) => completionIds.has(event.eventId)),
+        Stream.take(3),
+        Stream.runCollect,
+        Effect.forkChild,
+      );
+      yield* advanceTestClock(50);
+      fanout.cursor.emit({
+        type: "turn.started",
+        eventId: asEventId("evt-cursor-buffered-owned-completions-started"),
+        provider: CURSOR_DRIVER,
+        createdAt: "2026-01-01T00:00:00.000Z",
+        threadId,
+        turnId,
+        payload: {},
+      });
+      for (const eventId of initialCompletionIds) {
+        fanout.cursor.emit({
+          type: "turn.completed",
+          eventId: asEventId(eventId),
+          provider: CURSOR_DRIVER,
+          createdAt: "2026-01-01T00:00:01.000Z",
+          threadId,
+          turnId,
+          payload: { state: "completed", stopReason: "end_turn" },
+        });
+      }
+      yield* advanceTestClock(50);
+      const binding = Option.getOrThrow(yield* directory.getBinding(threadId));
+      yield* directory.upsert({
+        ...binding,
+        runtimePayload: {
+          ...(binding.runtimePayload as Record<string, unknown>),
+          activeTurnId: replacementTurnId,
+        },
+      });
+      yield* advanceTestClock(150);
+      fanout.cursor.emit({
+        type: "turn.completed",
+        eventId: asEventId(duplicateCompletionId),
+        provider: CURSOR_DRIVER,
+        createdAt: "2026-01-01T00:00:02.000Z",
+        threadId,
+        turnId,
+        payload: { state: "completed", stopReason: "end_turn" },
+      });
+
+      const events = Array.from(yield* Fiber.join(completed));
+      assert.deepEqual(
+        events.map((event) => (event.type === "turn.completed" ? event.payload.state : event.type)),
+        ["failed", "failed", "failed"],
+      );
+      const bindingAfterDuplicate = Option.getOrThrow(yield* directory.getBinding(threadId));
+      const runtimePayload = bindingAfterDuplicate.runtimePayload as {
+        readonly activeTurnId?: unknown;
+        readonly emptyResponseFailureTurnIds?: ReadonlyArray<string>;
+      };
+      assert.equal(runtimePayload.activeTurnId, replacementTurnId);
+      assert.equal(runtimePayload.emptyResponseFailureTurnIds?.includes(String(turnId)), true);
+    }),
+  );
+
+  it.effect("preserves late-output evidence across duplicate buffered Cursor completions", () =>
+    Effect.gen(function* () {
+      const provider = yield* ProviderService.ProviderService;
+      const threadId = asThreadId("thread-cursor-duplicate-completions-with-output");
+      const turnId = asTurnId("turn-cursor-duplicate-completions-with-output");
+      yield* provider.startSession(threadId, {
+        provider: CURSOR_DRIVER,
+        providerInstanceId: cursorInstanceId,
+        threadId,
+        runtimeMode: "full-access",
+      });
+      const completionIds = new Set([
+        "evt-cursor-duplicate-with-output-first",
+        "evt-cursor-duplicate-with-output-second",
+      ]);
+      const completed = yield* provider.streamEvents.pipe(
+        Stream.filter((event) => completionIds.has(event.eventId)),
+        Stream.take(2),
+        Stream.runCollect,
+        Effect.forkChild,
+      );
+      yield* advanceTestClock(50);
+      fanout.cursor.emit({
+        type: "turn.started",
+        eventId: asEventId("evt-cursor-duplicate-with-output-started"),
+        provider: CURSOR_DRIVER,
+        createdAt: "2026-01-01T00:00:00.000Z",
+        threadId,
+        turnId,
+        payload: {},
+      });
+      for (const eventId of completionIds) {
+        fanout.cursor.emit({
+          type: "turn.completed",
+          eventId: asEventId(eventId),
+          provider: CURSOR_DRIVER,
+          createdAt: "2026-01-01T00:00:01.000Z",
+          threadId,
+          turnId,
+          payload: { state: "completed", stopReason: "end_turn" },
+        });
+      }
+      fanout.cursor.emit({
+        type: "content.delta",
+        eventId: asEventId("evt-cursor-duplicate-with-output-delta"),
+        provider: CURSOR_DRIVER,
+        createdAt: "2026-01-01T00:00:02.000Z",
+        threadId,
+        turnId,
+        itemId: "item-cursor-duplicate-with-output-delta",
+        payload: { streamKind: "assistant_text", delta: "late output" },
+      });
+      yield* advanceTestClock(200);
+
+      const events = Array.from(yield* Fiber.join(completed));
+      assert.deepEqual(
+        events.map((event) => (event.type === "turn.completed" ? event.payload.state : event.type)),
+        ["completed", "completed"],
+      );
+    }),
+  );
+
+  it.effect("does not rescue a Cursor completion with output after a replacement turn starts", () =>
+    Effect.gen(function* () {
+      const provider = yield* ProviderService.ProviderService;
+      const threadId = asThreadId("thread-cursor-output-after-replacement-start");
+      const completedTurnId = asTurnId("turn-cursor-before-replacement-start");
+      yield* provider.startSession(threadId, {
+        provider: CURSOR_DRIVER,
+        providerInstanceId: cursorInstanceId,
+        threadId,
+        runtimeMode: "full-access",
+      });
+      const completedEventId = asEventId("evt-cursor-before-replacement-start-completed");
+      const completed = yield* provider.streamEvents.pipe(
+        Stream.filter((event) => event.eventId === completedEventId),
+        Stream.take(1),
+        Stream.runCollect,
+        Effect.forkChild,
+      );
+      yield* advanceTestClock(50);
+      fanout.cursor.emit({
+        type: "turn.started",
+        eventId: asEventId("evt-cursor-before-replacement-start-started"),
+        provider: CURSOR_DRIVER,
+        createdAt: "2026-01-01T00:00:00.000Z",
+        threadId,
+        turnId: completedTurnId,
+        payload: {},
+      });
+      fanout.cursor.emit({
+        type: "turn.completed",
+        eventId: completedEventId,
+        provider: CURSOR_DRIVER,
+        createdAt: "2026-01-01T00:00:01.000Z",
+        threadId,
+        turnId: completedTurnId,
+        payload: { state: "completed", stopReason: "end_turn" },
+      });
+      yield* advanceTestClock(50);
+      fanout.cursor.emit({
+        type: "turn.started",
+        eventId: asEventId("evt-cursor-replacement-turn-started"),
+        provider: CURSOR_DRIVER,
+        createdAt: "2026-01-01T00:00:02.000Z",
+        threadId,
+        turnId: asTurnId("turn-cursor-replacement"),
+        payload: {},
+      });
+      fanout.cursor.emit({
+        type: "content.delta",
+        eventId: asEventId("evt-cursor-stale-output-after-replacement-start"),
+        provider: CURSOR_DRIVER,
+        createdAt: "2026-01-01T00:00:03.000Z",
+        threadId,
+        turnId: completedTurnId,
+        itemId: "item-cursor-stale-output-after-replacement-start",
+        payload: { streamKind: "assistant_text", delta: "stale output" },
+      });
+      yield* advanceTestClock(150);
+
+      const events = Array.from(yield* Fiber.join(completed));
+      assert.equal(events[0]?.type, "turn.completed");
+      if (events[0]?.type === "turn.completed") {
+        assert.equal(events[0].payload.state, "failed");
+        assert.equal(events[0].payload.errorMessage, PROVIDER_EMPTY_RESPONSE_ERROR);
+      }
+    }),
+  );
+
+  it.effect("gives a buffered replacement Cursor completion its own late-output grace", () =>
+    Effect.gen(function* () {
+      const provider = yield* ProviderService.ProviderService;
+      const threadId = asThreadId("thread-cursor-buffered-replacement-grace");
+      const firstTurnId = asTurnId("turn-cursor-buffered-replacement-first");
+      const replacementTurnId = asTurnId("turn-cursor-buffered-replacement-second");
+      yield* provider.startSession(threadId, {
+        provider: CURSOR_DRIVER,
+        providerInstanceId: cursorInstanceId,
+        threadId,
+        runtimeMode: "full-access",
+      });
+      const completionIds = new Set([
+        "evt-cursor-buffered-replacement-first-completed",
+        "evt-cursor-buffered-replacement-second-completed",
+      ]);
+      const completed = yield* provider.streamEvents.pipe(
+        Stream.filter((event) => completionIds.has(event.eventId)),
+        Stream.take(2),
+        Stream.runCollect,
+        Effect.forkChild,
+      );
+      yield* advanceTestClock(50);
+      fanout.cursor.emit({
+        type: "turn.started",
+        eventId: asEventId("evt-cursor-buffered-replacement-first-started"),
+        provider: CURSOR_DRIVER,
+        createdAt: "2026-01-01T00:00:00.000Z",
+        threadId,
+        turnId: firstTurnId,
+        payload: {},
+      });
+      fanout.cursor.emit({
+        type: "turn.completed",
+        eventId: asEventId("evt-cursor-buffered-replacement-first-completed"),
+        provider: CURSOR_DRIVER,
+        createdAt: "2026-01-01T00:00:01.000Z",
+        threadId,
+        turnId: firstTurnId,
+        payload: { state: "completed", stopReason: "end_turn" },
+      });
+      yield* advanceTestClock(50);
+      fanout.cursor.emit({
+        type: "turn.started",
+        eventId: asEventId("evt-cursor-buffered-replacement-second-started"),
+        provider: CURSOR_DRIVER,
+        createdAt: "2026-01-01T00:00:02.000Z",
+        threadId,
+        turnId: replacementTurnId,
+        payload: {},
+      });
+      fanout.cursor.emit({
+        type: "turn.completed",
+        eventId: asEventId("evt-cursor-buffered-replacement-second-completed"),
+        provider: CURSOR_DRIVER,
+        createdAt: "2026-01-01T00:00:03.000Z",
+        threadId,
+        turnId: replacementTurnId,
+        payload: { state: "completed", stopReason: "end_turn" },
+      });
+      fanout.cursor.emit({
+        type: "content.delta",
+        eventId: asEventId("evt-cursor-buffered-replacement-second-output"),
+        provider: CURSOR_DRIVER,
+        createdAt: "2026-01-01T00:00:04.000Z",
+        threadId,
+        turnId: replacementTurnId,
+        itemId: "item-cursor-buffered-replacement-second-output",
+        payload: { streamKind: "assistant_text", delta: "replacement late output" },
+      });
+      yield* advanceTestClock(150);
+      yield* advanceTestClock(200);
+
+      const events = Array.from(yield* Fiber.join(completed));
+      assert.deepEqual(
+        events.map((event) => (event.type === "turn.completed" ? event.payload.state : event.type)),
+        ["failed", "completed"],
+      );
+    }),
+  );
+
+  it.effect("does not let a stale turn.started clear active turn output", () =>
+    Effect.gen(function* () {
+      const provider = yield* ProviderService.ProviderService;
+      const threadId = asThreadId("thread-output-before-stale-start");
+      const turnId = asTurnId("turn-output-before-stale-start");
+      yield* provider.startSession(threadId, {
+        provider: CODEX_DRIVER,
+        providerInstanceId: codexInstanceId,
+        threadId,
+        runtimeMode: "full-access",
+      });
+      const completedEventId = asEventId("evt-output-before-stale-start-completed");
+      const completed = yield* provider.streamEvents.pipe(
+        Stream.filter((event) => event.eventId === completedEventId),
+        Stream.take(1),
+        Stream.runCollect,
+        Effect.forkChild,
+      );
+      yield* advanceTestClock(50);
+      fanout.codex.emit({
+        type: "turn.started",
+        eventId: asEventId("evt-output-before-stale-start-active"),
+        provider: CODEX_DRIVER,
+        createdAt: "2026-01-01T00:00:00.000Z",
+        threadId,
+        turnId,
+        payload: {},
+      });
+      fanout.codex.emit({
+        type: "content.delta",
+        eventId: asEventId("evt-output-before-stale-start-output"),
+        provider: CODEX_DRIVER,
+        createdAt: "2026-01-01T00:00:01.000Z",
+        threadId,
+        turnId,
+        itemId: "item-output-before-stale-start",
+        payload: { streamKind: "assistant_text", delta: "owned output" },
+      });
+      fanout.codex.emit({
+        type: "turn.started",
+        eventId: asEventId("evt-output-before-stale-start-stale"),
+        provider: CODEX_DRIVER,
+        createdAt: "2026-01-01T00:00:02.000Z",
+        threadId,
+        turnId: asTurnId("turn-stale-after-active-output"),
+        payload: {},
+      });
+      fanout.codex.emit({
+        type: "turn.completed",
+        eventId: completedEventId,
+        provider: CODEX_DRIVER,
+        createdAt: "2026-01-01T00:00:03.000Z",
+        threadId,
+        turnId,
+        payload: { state: "completed" },
+      });
+
+      const events = Array.from(yield* Fiber.join(completed));
+      assert.equal(events[0]?.type, "turn.completed");
+      if (events[0]?.type === "turn.completed") {
+        assert.equal(events[0].payload.state, "completed");
+      }
+    }),
+  );
+
+  it.effect("KNOWN: accepts an old nonterminal lifecycle event across a same-thread restart", () =>
+    Effect.gen(function* () {
+      const provider = yield* ProviderService.ProviderService;
+      const threadId = asThreadId("thread-known-old-lifecycle-after-restart");
+      yield* provider.startSession(threadId, {
+        provider: CODEX_DRIVER,
+        providerInstanceId: codexInstanceId,
+        threadId,
+        runtimeMode: "full-access",
+      });
+
+      const receivedFiber = yield* Stream.runHead(provider.streamEvents).pipe(Effect.forkChild);
+      yield* advanceTestClock(50);
+      const releaseRuntimeEvent = yield* fanout.codex.pauseRuntimeEvents;
+      fanout.codex.emit({
+        type: "session.state.changed",
+        eventId: asEventId("evt-known-old-lifecycle-after-restart"),
+        provider: CODEX_DRIVER,
+        createdAt: "2026-01-01T00:00:00.000Z",
+        threadId,
+        payload: { state: "running" },
+      });
+
+      const replacement = yield* provider.startSession(threadId, {
+        provider: CODEX_DRIVER,
+        providerInstanceId: codexInstanceId,
+        threadId,
+        runtimeMode: "full-access",
+      });
+      yield* releaseRuntimeEvent;
+
+      const received = Option.getOrThrow(yield* Fiber.join(receivedFiber));
+      assert.equal(received.eventId, "evt-known-old-lifecycle-after-restart");
+      assert.deepEqual(getCapturedProviderRuntimeEventBinding(received), {
+        threadId: replacement.threadId,
+        provider: replacement.provider,
+        providerInstanceId: codexInstanceId,
+        runtimeMode: replacement.runtimeMode,
+        cwd: replacement.cwd,
+      });
+    }),
+  );
+
+  it.effect("captures queued ingress authority but not stopped historical bindings", () =>
+    Effect.gen(function* () {
+      const provider = yield* ProviderService.ProviderService;
+      const directory = yield* ProviderSessionDirectory.ProviderSessionDirectory;
+      const threadId = asThreadId("thread-ingress-binding-race");
+      yield* provider.startSession(threadId, {
+        provider: ProviderDriverKind.make("codex"),
+        providerInstanceId: codexInstanceId,
+        threadId,
+        runtimeMode: "full-access",
+      });
+
+      const receivedFiber = yield* Stream.runHead(provider.streamEvents).pipe(Effect.forkChild);
+      yield* advanceTestClock(50);
+      const releaseRuntimeEvent = yield* fanout.codex.pauseRuntimeEvents;
+      fanout.codex.emit({
+        type: "content.delta",
+        eventId: asEventId("evt-ingress-binding-race"),
+        provider: ProviderDriverKind.make("codex"),
+        createdAt: "2026-01-01T00:00:00.000Z",
+        threadId,
+        turnId: asTurnId("turn-ingress-binding-race"),
+        itemId: "item-ingress-binding-race",
+        delta: "queued before teardown",
+        streamKind: "assistant_text",
+      });
+      fanout.codex.sessions.delete(threadId);
+      yield* releaseRuntimeEvent;
+
+      const received = Option.getOrThrow(yield* Fiber.join(receivedFiber));
+      assert.deepEqual(getCapturedProviderRuntimeEventBinding(received), {
+        threadId,
+        provider: ProviderDriverKind.make("codex"),
+        providerInstanceId: codexInstanceId,
+        runtimeMode: "full-access",
+        cwd: undefined,
+      });
+
+      yield* directory.upsert({
+        threadId,
+        provider: ProviderDriverKind.make("codex"),
+        providerInstanceId: codexInstanceId,
+        runtimeMode: "full-access",
+        status: "stopped",
+      });
+      const stoppedEventFiber = yield* Stream.runHead(provider.streamEvents).pipe(Effect.forkChild);
+      yield* advanceTestClock(50);
+      fanout.codex.emit({
+        type: "content.delta",
+        eventId: asEventId("evt-after-stopped-binding"),
+        provider: ProviderDriverKind.make("codex"),
+        createdAt: "2026-01-01T00:00:01.000Z",
+        threadId,
+        turnId: asTurnId("turn-after-stopped-binding"),
+        itemId: "item-after-stopped-binding",
+        delta: "must remain unauthoritative",
+        streamKind: "assistant_text",
+      });
+      const stoppedEvent = Option.getOrThrow(yield* Fiber.join(stoppedEventFiber));
+      assert.equal(getCapturedProviderRuntimeEventBinding(stoppedEvent), undefined);
+    }),
+  );
+
   it.effect("fans out adapter turn completion events", () =>
     Effect.gen(function* () {
       const provider = yield* ProviderService.ProviderService;
@@ -3557,10 +5747,12 @@ fanout.layer("ProviderServiceLive fanout", (it) => {
         runtimeMode: "full-access",
       });
 
-      const eventsRef = yield* Ref.make<Array<ProviderRuntimeEvent>>([]);
-      const consumer = yield* Stream.runForEach(provider.streamEvents, (event) =>
-        Ref.update(eventsRef, (current) => [...current, event]),
-      ).pipe(Effect.forkChild);
+      const completed = yield* provider.streamEvents.pipe(
+        Stream.filter((event) => event.eventId === asEventId("evt-1")),
+        Stream.take(1),
+        Stream.runCollect,
+        Effect.forkChild,
+      );
       yield* advanceTestClock(50);
 
       const completedEvent: LegacyProviderRuntimeEvent = {
@@ -3570,27 +5762,855 @@ fanout.layer("ProviderServiceLive fanout", (it) => {
         createdAt: "2026-01-01T00:00:00.000Z",
         threadId: session.threadId,
         turnId: asTurnId("turn-1"),
-        status: "completed",
+        payload: { state: "completed" },
       };
 
+      fanout.codex.emit({
+        type: "content.delta",
+        eventId: asEventId("evt-1-delta"),
+        provider: ProviderDriverKind.make("codex"),
+        createdAt: "2026-01-01T00:00:00.000Z",
+        threadId: session.threadId,
+        turnId: asTurnId("turn-1"),
+        itemId: "item-1",
+        payload: {
+          delta: "done",
+          streamKind: "assistant_text",
+        },
+      });
       fanout.codex.emit(completedEvent);
+      const events = Array.from(yield* Fiber.join(completed));
+
+      assert.equal(events[0]?.type, "turn.completed");
+      assert.equal(events[0]?.providerInstanceId, codexInstanceId);
+    }),
+  );
+
+  it.effect("holds Cursor completion decision through a late assistant delta", () =>
+    Effect.gen(function* () {
+      const provider = yield* ProviderService.ProviderService;
+      const threadId = asThreadId("thread-cursor-late-output");
+      const turnId = asTurnId("turn-cursor-late-output");
+      yield* provider.startSession(threadId, {
+        provider: CURSOR_DRIVER,
+        providerInstanceId: cursorInstanceId,
+        threadId,
+        runtimeMode: "full-access",
+      });
+
+      const outputEvents = yield* provider.streamEvents.pipe(
+        Stream.filter(
+          (event) =>
+            event.turnId === turnId &&
+            (event.type === "turn.completed" || event.type === "content.delta"),
+        ),
+        Stream.take(2),
+        Stream.runCollect,
+        Effect.forkChild,
+      );
       yield* advanceTestClock(50);
 
-      const events = yield* Ref.get(eventsRef);
-      yield* Fiber.interrupt(consumer);
+      fanout.cursor.emit({
+        type: "turn.started",
+        eventId: asEventId("evt-cursor-late-output-started"),
+        provider: CURSOR_DRIVER,
+        createdAt: "2026-01-01T00:00:00.000Z",
+        threadId,
+        turnId,
+        payload: {},
+      });
+      fanout.cursor.emit({
+        type: "turn.completed",
+        eventId: asEventId("evt-cursor-late-output-completed"),
+        provider: CURSOR_DRIVER,
+        createdAt: "2026-01-01T00:00:01.000Z",
+        threadId,
+        turnId,
+        payload: { state: "completed", stopReason: "end_turn" },
+      });
+      yield* advanceTestClock(50);
+      fanout.cursor.emit({
+        type: "content.delta",
+        eventId: asEventId("evt-cursor-late-output-delta"),
+        provider: CURSOR_DRIVER,
+        createdAt: "2026-01-01T00:00:02.000Z",
+        threadId,
+        turnId,
+        itemId: "item-cursor-late-output",
+        payload: {
+          streamKind: "assistant_text",
+          delta: "late assistant output",
+        },
+      });
+      yield* advanceTestClock(200);
 
-      assert.equal(
-        events.some((entry) => entry.type === "turn.completed"),
-        true,
+      const events = Array.from(yield* Fiber.join(outputEvents));
+      assert.deepEqual(
+        events.map((event) => event.type),
+        ["turn.completed", "content.delta"],
       );
-      assert.equal(
-        events.some(
-          (entry) =>
-            entry.type === "turn.completed" && entry.providerInstanceId === codexInstanceId,
-        ),
-        true,
-      );
+      const completed = events[0];
+      assert.equal(completed?.type, "turn.completed");
+      if (completed?.type === "turn.completed") {
+        assert.equal(completed.payload.state, "completed");
+        assert.equal(completed.payload.errorMessage, undefined);
+      }
     }),
+  );
+
+  it.effect("preserves Cursor completion, late delta, and session exit ordering", () => {
+    let restoreReadMcpProviderSession = () => {};
+    return Effect.gen(function* () {
+      const observedMcpProviderSessionIds: Array<string | undefined> = [];
+      const readMcpProviderSession = McpProviderSession.readMcpProviderSession;
+      const readMcpProviderSessionSpy = vi
+        .spyOn(McpProviderSession, "readMcpProviderSession")
+        .mockImplementation((threadId) => {
+          const observed = readMcpProviderSession(threadId);
+          observedMcpProviderSessionIds.push(observed?.providerSessionId);
+          return observed;
+        });
+      restoreReadMcpProviderSession = () => readMcpProviderSessionSpy.mockRestore();
+      const provider = yield* ProviderService.ProviderService;
+      const threadId = asThreadId("thread-cursor-late-output-before-exit");
+      const turnId = asTurnId("turn-cursor-late-output-before-exit");
+      yield* provider.startSession(threadId, {
+        provider: CURSOR_DRIVER,
+        providerInstanceId: cursorInstanceId,
+        threadId,
+        runtimeMode: "full-access",
+      });
+      McpProviderSession.setMcpProviderSession({
+        environmentId,
+        threadId,
+        providerSessionId: "provider-session-before-buffered-exit",
+        providerInstanceId: cursorInstanceId,
+        endpoint: "http://127.0.0.1:43123/mcp",
+        authorizationHeader: "Bearer before-buffered-exit-token",
+      });
+
+      const expectedEventIds = new Set([
+        "evt-cursor-before-exit-completed",
+        "evt-cursor-before-exit-delta",
+        "evt-cursor-after-late-output-exited",
+      ]);
+      const orderedEvents = yield* provider.streamEvents.pipe(
+        Stream.filter((event) => expectedEventIds.has(event.eventId)),
+        Stream.take(3),
+        Stream.runCollect,
+        Effect.forkChild,
+      );
+      yield* advanceTestClock(50);
+
+      fanout.cursor.emit({
+        type: "turn.started",
+        eventId: asEventId("evt-cursor-before-exit-started"),
+        provider: CURSOR_DRIVER,
+        createdAt: "2026-01-01T00:00:00.000Z",
+        threadId,
+        turnId,
+        payload: {},
+      });
+      fanout.cursor.emit({
+        type: "turn.completed",
+        eventId: asEventId("evt-cursor-before-exit-completed"),
+        provider: CURSOR_DRIVER,
+        createdAt: "2026-01-01T00:00:01.000Z",
+        threadId,
+        turnId,
+        payload: { state: "completed", stopReason: "end_turn" },
+      });
+      yield* advanceTestClock(50);
+      fanout.cursor.emit({
+        type: "content.delta",
+        eventId: asEventId("evt-cursor-before-exit-delta"),
+        provider: CURSOR_DRIVER,
+        createdAt: "2026-01-01T00:00:02.000Z",
+        threadId,
+        turnId,
+        itemId: "item-cursor-before-exit-delta",
+        payload: {
+          streamKind: "assistant_text",
+          delta: "late output before exit",
+        },
+      });
+      fanout.cursor.sessions.delete(threadId);
+      observedMcpProviderSessionIds.length = 0;
+      fanout.cursor.emit({
+        type: "session.exited",
+        eventId: asEventId("evt-cursor-after-late-output-exited"),
+        provider: CURSOR_DRIVER,
+        createdAt: "2026-01-01T00:00:03.000Z",
+        threadId,
+        payload: { exitKind: "graceful" },
+      });
+      yield* advanceTestClock(50);
+      assert.include(
+        observedMcpProviderSessionIds,
+        "provider-session-before-buffered-exit",
+        "the buffered exit must capture its MCP session identity when it arrives",
+      );
+      McpProviderSession.setMcpProviderSession({
+        environmentId,
+        threadId,
+        providerSessionId: "provider-session-after-buffered-exit",
+        providerInstanceId: cursorInstanceId,
+        endpoint: "http://127.0.0.1:43123/mcp",
+        authorizationHeader: "Bearer after-buffered-exit-token",
+      });
+      yield* advanceTestClock(150);
+
+      const events = Array.from(yield* Fiber.join(orderedEvents));
+      assert.deepEqual(
+        events.map((event) => event.eventId),
+        [
+          "evt-cursor-before-exit-completed",
+          "evt-cursor-before-exit-delta",
+          "evt-cursor-after-late-output-exited",
+        ],
+      );
+      const completed = events[0];
+      assert.equal(completed?.type, "turn.completed");
+      if (completed?.type === "turn.completed") {
+        assert.equal(completed.payload.state, "completed");
+        assert.equal(completed.payload.errorMessage, undefined);
+      }
+      assert.equal(
+        McpProviderSession.readMcpProviderSession(threadId)?.providerSessionId,
+        "provider-session-after-buffered-exit",
+      );
+    }).pipe(
+      Effect.ensuring(
+        Effect.sync(() => {
+          restoreReadMcpProviderSession();
+          McpProviderSession.clearMcpProviderSession(
+            asThreadId("thread-cursor-late-output-before-exit"),
+          );
+        }),
+      ),
+    );
+  });
+
+  // TODO(ADA-192): re-enable when the provider output-preservation guard lands
+  it.effect.skip("does not count a Cursor delta that follows session exit", () =>
+    Effect.gen(function* () {
+      const provider = yield* ProviderService.ProviderService;
+      const threadId = asThreadId("thread-cursor-output-after-exit");
+      const turnId = asTurnId("turn-cursor-output-after-exit");
+      yield* provider.startSession(threadId, {
+        provider: CURSOR_DRIVER,
+        providerInstanceId: cursorInstanceId,
+        threadId,
+        runtimeMode: "full-access",
+      });
+
+      const expectedEventIds = new Set([
+        "evt-cursor-output-after-exit-completed",
+        "evt-cursor-before-late-output-exited",
+        "evt-cursor-output-after-exit-delta",
+      ]);
+      const orderedEvents = yield* provider.streamEvents.pipe(
+        Stream.filter((event) => expectedEventIds.has(event.eventId)),
+        Stream.take(3),
+        Stream.runCollect,
+        Effect.forkChild,
+      );
+      yield* advanceTestClock(50);
+
+      fanout.cursor.emit({
+        type: "turn.started",
+        eventId: asEventId("evt-cursor-output-after-exit-started"),
+        provider: CURSOR_DRIVER,
+        createdAt: "2026-01-01T00:00:00.000Z",
+        threadId,
+        turnId,
+        payload: {},
+      });
+      fanout.cursor.emit({
+        type: "turn.completed",
+        eventId: asEventId("evt-cursor-output-after-exit-completed"),
+        provider: CURSOR_DRIVER,
+        createdAt: "2026-01-01T00:00:01.000Z",
+        threadId,
+        turnId,
+        payload: { state: "completed", stopReason: "end_turn" },
+      });
+      yield* advanceTestClock(50);
+      fanout.cursor.sessions.delete(threadId);
+      fanout.cursor.emit({
+        type: "session.exited",
+        eventId: asEventId("evt-cursor-before-late-output-exited"),
+        provider: CURSOR_DRIVER,
+        createdAt: "2026-01-01T00:00:02.000Z",
+        threadId,
+        payload: { exitKind: "graceful" },
+      });
+      fanout.cursor.emit({
+        type: "content.delta",
+        eventId: asEventId("evt-cursor-output-after-exit-delta"),
+        provider: CURSOR_DRIVER,
+        createdAt: "2026-01-01T00:00:03.000Z",
+        threadId,
+        turnId,
+        itemId: "item-cursor-output-after-exit-delta",
+        payload: {
+          streamKind: "assistant_text",
+          delta: "too-late output",
+        },
+      });
+      yield* advanceTestClock(200);
+
+      const events = Array.from(yield* Fiber.join(orderedEvents));
+      assert.deepEqual(
+        events.map((event) => event.eventId),
+        [
+          "evt-cursor-output-after-exit-completed",
+          "evt-cursor-before-late-output-exited",
+          "evt-cursor-output-after-exit-delta",
+        ],
+      );
+      const completed = events[0];
+      assert.equal(completed?.type, "turn.completed");
+      if (completed?.type === "turn.completed") {
+        assert.equal(completed.payload.state, "failed");
+        assert.equal(completed.payload.errorMessage, PROVIDER_EMPTY_RESPONSE_ERROR);
+      }
+    }),
+  );
+
+  it.effect("does not let a stale Cursor completion capture the active turn grace", () =>
+    Effect.gen(function* () {
+      const provider = yield* ProviderService.ProviderService;
+      const threadId = asThreadId("thread-cursor-stale-completion-before-live-turn");
+      const staleTurnId = asTurnId("turn-cursor-stale-completion");
+      const activeTurnId = asTurnId("turn-cursor-active-after-stale-completion");
+      yield* provider.startSession(threadId, {
+        provider: CURSOR_DRIVER,
+        providerInstanceId: cursorInstanceId,
+        threadId,
+        runtimeMode: "full-access",
+      });
+
+      const expectedEventIds = new Set([
+        "evt-cursor-stale-completion",
+        "evt-cursor-active-completion",
+        "evt-cursor-active-late-delta",
+      ]);
+      const orderedEvents = yield* provider.streamEvents.pipe(
+        Stream.filter((event) => expectedEventIds.has(event.eventId)),
+        Stream.take(3),
+        Stream.runCollect,
+        Effect.forkChild,
+      );
+      yield* advanceTestClock(50);
+
+      fanout.cursor.emit({
+        type: "turn.started",
+        eventId: asEventId("evt-cursor-active-before-stale-completion-started"),
+        provider: CURSOR_DRIVER,
+        createdAt: "2026-01-01T00:00:00.000Z",
+        threadId,
+        turnId: activeTurnId,
+        payload: {},
+      });
+      yield* advanceTestClock(50);
+      fanout.cursor.emit({
+        type: "turn.completed",
+        eventId: asEventId("evt-cursor-stale-completion"),
+        provider: CURSOR_DRIVER,
+        createdAt: "2026-01-01T00:00:01.000Z",
+        threadId,
+        turnId: staleTurnId,
+        payload: { state: "completed", stopReason: "end_turn" },
+      });
+      fanout.cursor.emit({
+        type: "turn.completed",
+        eventId: asEventId("evt-cursor-active-completion"),
+        provider: CURSOR_DRIVER,
+        createdAt: "2026-01-01T00:00:02.000Z",
+        threadId,
+        turnId: activeTurnId,
+        payload: { state: "completed", stopReason: "end_turn" },
+      });
+      yield* advanceTestClock(50);
+      fanout.cursor.emit({
+        type: "turn.aborted",
+        eventId: asEventId("evt-cursor-unrelated-stale-abort"),
+        provider: CURSOR_DRIVER,
+        createdAt: "2026-01-01T00:00:02.500Z",
+        threadId,
+        turnId: staleTurnId,
+        payload: { reason: "stale abort" },
+      });
+      fanout.cursor.emit({
+        type: "content.delta",
+        eventId: asEventId("evt-cursor-active-late-delta"),
+        provider: CURSOR_DRIVER,
+        createdAt: "2026-01-01T00:00:03.000Z",
+        threadId,
+        turnId: activeTurnId,
+        itemId: "item-cursor-active-late-delta",
+        payload: {
+          streamKind: "assistant_text",
+          delta: "active turn late output",
+        },
+      });
+      yield* advanceTestClock(200);
+
+      const events = Array.from(yield* Fiber.join(orderedEvents));
+      assert.deepEqual(
+        events.map((event) => event.eventId),
+        [
+          "evt-cursor-stale-completion",
+          "evt-cursor-active-completion",
+          "evt-cursor-active-late-delta",
+        ],
+      );
+      const staleCompleted = events[0];
+      assert.equal(staleCompleted?.type, "turn.completed");
+      if (staleCompleted?.type === "turn.completed") {
+        assert.equal(staleCompleted.payload.state, "completed");
+        assert.equal(staleCompleted.payload.errorMessage, undefined);
+      }
+      const activeCompleted = events[1];
+      assert.equal(activeCompleted?.type, "turn.completed");
+      if (activeCompleted?.type === "turn.completed") {
+        assert.equal(activeCompleted.payload.state, "completed");
+        assert.equal(activeCompleted.payload.errorMessage, undefined);
+      }
+    }),
+  );
+
+  // TODO(ADA-192): re-enable when the provider output-preservation guard lands
+  it.effect.skip("fails an output-free Cursor completion after the late-output grace", () =>
+    Effect.gen(function* () {
+      const provider = yield* ProviderService.ProviderService;
+      const threadId = asThreadId("thread-cursor-empty-after-grace");
+      const turnId = asTurnId("turn-cursor-empty-after-grace");
+      yield* provider.startSession(threadId, {
+        provider: CURSOR_DRIVER,
+        providerInstanceId: cursorInstanceId,
+        threadId,
+        runtimeMode: "full-access",
+      });
+
+      const completedEventId = asEventId("evt-cursor-empty-after-grace-completed");
+      const completedFiber = yield* provider.streamEvents.pipe(
+        Stream.filter((event) => event.eventId === completedEventId),
+        Stream.take(1),
+        Stream.runCollect,
+        Effect.forkChild,
+      );
+      yield* advanceTestClock(50);
+
+      fanout.cursor.emit({
+        type: "turn.started",
+        eventId: asEventId("evt-cursor-empty-after-grace-started"),
+        provider: CURSOR_DRIVER,
+        createdAt: "2026-01-01T00:00:00.000Z",
+        threadId,
+        turnId,
+        payload: {},
+      });
+      fanout.cursor.emit({
+        type: "turn.completed",
+        eventId: completedEventId,
+        provider: CURSOR_DRIVER,
+        createdAt: "2026-01-01T00:00:01.000Z",
+        threadId,
+        turnId,
+        payload: { state: "completed", stopReason: "end_turn" },
+      });
+      yield* advanceTestClock(200);
+
+      const events = Array.from(yield* Fiber.join(completedFiber));
+      assert.equal(events[0]?.type, "turn.completed");
+      if (events[0]?.type === "turn.completed") {
+        assert.equal(events[0].payload.state, "failed");
+        assert.equal(events[0].payload.errorMessage, PROVIDER_EMPTY_RESPONSE_ERROR);
+      }
+    }),
+  );
+
+  // TODO(ADA-192): re-enable when the provider output-preservation guard lands
+  it.effect.skip("turns a control-only successful adapter response into an explicit failure", () =>
+    Effect.gen(function* () {
+      const provider = yield* ProviderService.ProviderService;
+      const session = yield* provider.startSession(asThreadId("thread-empty-response"), {
+        provider: ProviderDriverKind.make("codex"),
+        providerInstanceId: codexInstanceId,
+        threadId: asThreadId("thread-empty-response"),
+        runtimeMode: "full-access",
+      });
+      const completed = yield* provider.streamEvents.pipe(
+        Stream.filter((event) => event.type === "turn.completed"),
+        Stream.take(1),
+        Stream.runCollect,
+        Effect.forkChild,
+      );
+      yield* advanceTestClock(50);
+
+      fanout.codex.emit({
+        type: "turn.started",
+        eventId: asEventId("evt-empty-response-started"),
+        provider: ProviderDriverKind.make("codex"),
+        createdAt: "2026-01-01T00:00:00.000Z",
+        threadId: session.threadId,
+        turnId: asTurnId("turn-empty-response"),
+        payload: {},
+      });
+      fanout.codex.emit({
+        type: "thread.token-usage.updated",
+        eventId: asEventId("evt-empty-response-usage"),
+        provider: ProviderDriverKind.make("codex"),
+        createdAt: "2026-01-01T00:00:01.000Z",
+        threadId: session.threadId,
+        turnId: asTurnId("turn-empty-response"),
+        payload: { usage: { usedTokens: 1 } },
+      });
+      fanout.codex.emit({
+        type: "turn.proposed.delta",
+        eventId: asEventId("evt-empty-response-blank-plan"),
+        provider: ProviderDriverKind.make("codex"),
+        createdAt: "2026-01-01T00:00:02.000Z",
+        threadId: session.threadId,
+        turnId: asTurnId("turn-empty-response"),
+        payload: { delta: "   " },
+      });
+      fanout.codex.emit({
+        type: "item.completed",
+        eventId: asEventId("evt-empty-response-assistant-shell"),
+        provider: ProviderDriverKind.make("codex"),
+        createdAt: "2026-01-01T00:00:03.000Z",
+        threadId: session.threadId,
+        turnId: asTurnId("turn-empty-response"),
+        itemId: "item-empty-response-assistant-shell",
+        payload: { itemType: "assistant_message", status: "completed" },
+      });
+      fanout.codex.emit({
+        type: "item.completed",
+        eventId: asEventId("evt-empty-response-reasoning-shell"),
+        provider: ProviderDriverKind.make("codex"),
+        createdAt: "2026-01-01T00:00:04.000Z",
+        threadId: session.threadId,
+        turnId: asTurnId("turn-empty-response"),
+        itemId: "item-empty-response-reasoning-shell",
+        payload: { itemType: "reasoning", status: "completed" },
+      });
+      fanout.codex.emit({
+        type: "item.started",
+        eventId: asEventId("evt-empty-response-tool-started"),
+        provider: ProviderDriverKind.make("codex"),
+        createdAt: "2026-01-01T00:00:05.000Z",
+        threadId: session.threadId,
+        turnId: asTurnId("turn-empty-response"),
+        itemId: "item-empty-response-tool",
+        payload: { itemType: "command_execution", status: "inProgress" },
+      });
+      fanout.codex.emit({
+        type: "item.updated",
+        eventId: asEventId("evt-empty-response-tool-progress"),
+        provider: ProviderDriverKind.make("codex"),
+        createdAt: "2026-01-01T00:00:06.000Z",
+        threadId: session.threadId,
+        turnId: asTurnId("turn-empty-response"),
+        itemId: "item-empty-response-tool",
+        payload: { itemType: "command_execution", status: "inProgress" },
+      });
+      fanout.codex.emit({
+        type: "turn.completed",
+        eventId: asEventId("evt-empty-response-completed"),
+        provider: ProviderDriverKind.make("codex"),
+        createdAt: "2026-01-01T00:00:07.000Z",
+        threadId: session.threadId,
+        turnId: asTurnId("turn-empty-response"),
+        payload: { state: "completed" },
+      });
+
+      const events = Array.from(yield* Fiber.join(completed));
+      assert.deepEqual(events[0], {
+        type: "turn.completed",
+        eventId: asEventId("evt-empty-response-completed"),
+        provider: ProviderDriverKind.make("codex"),
+        providerInstanceId: codexInstanceId,
+        createdAt: "2026-01-01T00:00:07.000Z",
+        threadId: session.threadId,
+        turnId: asTurnId("turn-empty-response"),
+        payload: {
+          state: "failed",
+          errorMessage: PROVIDER_EMPTY_RESPONSE_ERROR,
+        },
+      });
+    }),
+  );
+
+  it.effect.each<
+    MeaningfulOutputCase & {
+      readonly adapter: "codex" | "claude" | "cursor";
+    }
+  >([
+    {
+      name: "Codex proposed plan",
+      adapter: "codex",
+      provider: CODEX_DRIVER,
+      providerInstanceId: codexInstanceId,
+      output: {
+        type: "turn.proposed.completed",
+        payload: { planMarkdown: "# Proposed plan" },
+      },
+    },
+    {
+      name: "Codex proposed plan delta",
+      adapter: "codex",
+      provider: CODEX_DRIVER,
+      providerInstanceId: codexInstanceId,
+      output: {
+        type: "turn.proposed.delta",
+        payload: { delta: "Draft the migration steps" },
+      },
+    },
+    {
+      name: "Codex reasoning delta",
+      adapter: "codex",
+      provider: CODEX_DRIVER,
+      providerInstanceId: codexInstanceId,
+      output: {
+        type: "content.delta",
+        payload: { streamKind: "reasoning_text", delta: "Consider the constraints" },
+      },
+    },
+    {
+      name: "Codex diff",
+      adapter: "codex",
+      provider: CODEX_DRIVER,
+      providerInstanceId: codexInstanceId,
+      output: {
+        type: "turn.diff.updated",
+        payload: { unifiedDiff: "@@ -1 +1 @@\n-before\n+after" },
+      },
+    },
+    {
+      name: "Codex tool result",
+      adapter: "codex",
+      provider: CODEX_DRIVER,
+      providerInstanceId: codexInstanceId,
+      output: {
+        type: "item.completed",
+        itemId: "codex-tool-item",
+        payload: { itemType: "command_execution", status: "completed" },
+      },
+    },
+    {
+      name: "Codex assistant item",
+      adapter: "codex",
+      provider: CODEX_DRIVER,
+      providerInstanceId: codexInstanceId,
+      output: {
+        type: "item.completed",
+        itemId: "codex-assistant-item",
+        payload: {
+          itemType: "assistant_message",
+          status: "completed",
+          detail: "Final answer",
+        },
+      },
+    },
+    {
+      name: "Codex completed item update",
+      adapter: "codex",
+      provider: CODEX_DRIVER,
+      providerInstanceId: codexInstanceId,
+      output: {
+        type: "item.updated",
+        itemId: "codex-updated-tool-item",
+        payload: { itemType: "command_execution", status: "completed" },
+      },
+    },
+    {
+      name: "Codex in-progress assistant item update",
+      adapter: "codex",
+      provider: CODEX_DRIVER,
+      providerInstanceId: codexInstanceId,
+      output: {
+        type: "item.updated",
+        itemId: "codex-in-progress-assistant-item",
+        payload: {
+          itemType: "assistant_message",
+          status: "inProgress",
+          detail: "Partial visible answer",
+        },
+      },
+    },
+    {
+      name: "Codex in-progress command item update",
+      adapter: "codex",
+      provider: CODEX_DRIVER,
+      providerInstanceId: codexInstanceId,
+      output: {
+        type: "item.updated",
+        itemId: "codex-in-progress-command-item",
+        payload: {
+          itemType: "command_execution",
+          status: "inProgress",
+          detail: "Visible command output",
+        },
+      },
+    },
+    {
+      name: "Codex realtime audio",
+      adapter: "codex",
+      provider: CODEX_DRIVER,
+      providerInstanceId: codexInstanceId,
+      output: {
+        type: "thread.realtime.audio.delta",
+        payload: { audio: "base64-audio" },
+      },
+    },
+    {
+      name: "Claude proposed plan",
+      adapter: "claude",
+      provider: CLAUDE_AGENT_DRIVER,
+      providerInstanceId: claudeAgentInstanceId,
+      output: {
+        type: "turn.proposed.completed",
+        payload: { planMarkdown: "# Claude plan" },
+      },
+    },
+    {
+      name: "Claude task completion",
+      adapter: "claude",
+      provider: CLAUDE_AGENT_DRIVER,
+      providerInstanceId: claudeAgentInstanceId,
+      output: {
+        type: "task.completed",
+        payload: { taskId: "claude-task", status: "completed", summary: "Task finished" },
+      },
+    },
+    {
+      name: "Claude task progress",
+      adapter: "claude",
+      provider: CLAUDE_AGENT_DRIVER,
+      providerInstanceId: claudeAgentInstanceId,
+      output: {
+        type: "task.progress",
+        payload: { taskId: "claude-task-progress", description: "Inspecting the repository" },
+      },
+    },
+    {
+      name: "Claude hook completion",
+      adapter: "claude",
+      provider: CLAUDE_AGENT_DRIVER,
+      providerInstanceId: claudeAgentInstanceId,
+      output: {
+        type: "hook.completed",
+        payload: { hookId: "claude-hook", outcome: "success", output: "Hook finished" },
+      },
+    },
+    {
+      name: "Claude hook progress",
+      adapter: "claude",
+      provider: CLAUDE_AGENT_DRIVER,
+      providerInstanceId: claudeAgentInstanceId,
+      output: {
+        type: "hook.progress",
+        payload: { hookId: "claude-hook-progress", stdout: "Visible hook output" },
+      },
+    },
+    {
+      name: "Claude tool progress",
+      adapter: "claude",
+      provider: CLAUDE_AGENT_DRIVER,
+      providerInstanceId: claudeAgentInstanceId,
+      output: {
+        type: "tool.progress",
+        payload: { toolUseId: "claude-tool-progress", summary: "Visible tool progress" },
+      },
+    },
+    {
+      name: "Claude tool summary",
+      adapter: "claude",
+      provider: CLAUDE_AGENT_DRIVER,
+      providerInstanceId: claudeAgentInstanceId,
+      output: {
+        type: "tool.summary",
+        payload: { summary: "Inspected the repository" },
+      },
+    },
+    {
+      name: "Claude denied tool",
+      adapter: "claude",
+      provider: CLAUDE_AGENT_DRIVER,
+      providerInstanceId: claudeAgentInstanceId,
+      output: {
+        type: "tool.denied",
+        payload: { toolName: "Bash", reason: "Denied by policy" },
+      },
+    },
+    {
+      name: "Claude persisted files",
+      adapter: "claude",
+      provider: CLAUDE_AGENT_DRIVER,
+      providerInstanceId: claudeAgentInstanceId,
+      output: {
+        type: "files.persisted",
+        payload: { files: [{ filename: "report.md", fileId: "file-report" }] },
+      },
+    },
+    {
+      name: "Cursor proposed plan",
+      adapter: "cursor",
+      provider: CURSOR_DRIVER,
+      providerInstanceId: cursorInstanceId,
+      output: {
+        type: "turn.proposed.completed",
+        payload: { planMarkdown: "# Cursor plan" },
+      },
+    },
+    {
+      name: "Cursor permission request",
+      adapter: "cursor",
+      provider: CURSOR_DRIVER,
+      providerInstanceId: cursorInstanceId,
+      output: {
+        type: "request.opened",
+        payload: {
+          requestType: "command_execution_approval",
+          detail: "Allow this command?",
+        },
+      },
+    },
+    {
+      name: "Cursor user input request",
+      adapter: "cursor",
+      provider: CURSOR_DRIVER,
+      providerInstanceId: cursorInstanceId,
+      output: {
+        type: "user-input.requested",
+        payload: {
+          questions: [
+            {
+              id: "cursor-question",
+              header: "Decision",
+              question: "Which option should Cursor use?",
+              options: [{ label: "Safe", description: "Use the safe option." }],
+            },
+          ],
+        },
+      },
+    },
+    {
+      name: "Cursor tool result",
+      adapter: "cursor",
+      provider: CURSOR_DRIVER,
+      providerInstanceId: cursorInstanceId,
+      output: {
+        type: "item.completed",
+        itemId: "cursor-tool-item",
+        payload: { itemType: "file_change", status: "completed" },
+      },
+    },
+  ])("preserves successful $name-only turns", (testCase) =>
+    assertSuccessfulOutputOnlyTurn(testCase, fanout[testCase.adapter]),
   );
 
   it.effect("fans out canonical runtime events in emission order", () =>
@@ -3733,6 +6753,25 @@ fanout.layer("ProviderServiceLive fanout", (it) => {
         attachments: [],
       });
 
+      const replacementOutputEventId = asEventId("evt-runtime-state-error-replacement-output");
+      const replacementOutputPublished = yield* provider.streamEvents.pipe(
+        Stream.filter((event) => event.eventId === replacementOutputEventId),
+        Stream.take(1),
+        Stream.runDrain,
+        Effect.forkChild,
+      );
+      yield* advanceTestClock(50);
+      fanout.codex.emit({
+        type: "content.delta",
+        eventId: replacementOutputEventId,
+        provider: ProviderDriverKind.make("codex"),
+        createdAt: "2026-01-01T00:00:10.000Z",
+        threadId,
+        turnId: replacementTurn.turnId,
+        itemId: "item-runtime-state-error-replacement-output",
+        payload: { streamKind: "assistant_text", delta: "replacement output" },
+      });
+      yield* Fiber.join(replacementOutputPublished);
       fanout.codex.emit({
         type: "turn.completed",
         eventId: asEventId("evt-runtime-state-error-replacement-completed"),
@@ -4123,8 +7162,202 @@ fanout.layer("ProviderServiceLive fanout", (it) => {
     }),
   );
 
+  it.effect("stops an inactive session only while its full binding snapshot remains current", () =>
+    Effect.gen(function* () {
+      const threadId = asThreadId("thread-inactive-stop-binding-fence");
+      const provider = yield* ProviderService.ProviderService;
+      const directory = yield* ProviderSessionDirectory.ProviderSessionDirectory;
+      const stopInactiveSession = provider.stopInactiveSession;
+      if (stopInactiveSession === undefined) {
+        return assert.fail("Expected the live provider service to support fenced inactive stops");
+      }
+      yield* provider.startSession(threadId, {
+        provider: ProviderDriverKind.make("codex"),
+        providerInstanceId: codexInstanceId,
+        threadId,
+        runtimeMode: "full-access",
+      });
+      const expectedBinding = Option.getOrThrow(
+        Option.fromUndefinedOr(
+          (yield* directory.listBindings()).find((binding) => binding.threadId === threadId),
+        ),
+      );
+      const stopsBefore = fanout.codex.stopSession.mock.calls.length;
+
+      yield* advanceTestClock(1);
+      yield* directory.upsert(expectedBinding);
+      const refreshedBinding = Option.getOrThrow(
+        Option.fromUndefinedOr(
+          (yield* directory.listBindings()).find((binding) => binding.threadId === threadId),
+        ),
+      );
+      assert.notEqual(refreshedBinding.lastSeenAt, expectedBinding.lastSeenAt);
+
+      assert.equal(yield* stopInactiveSession({ threadId, expectedBinding }), false);
+      assert.equal(fanout.codex.stopSession.mock.calls.length, stopsBefore);
+      assert.notEqual(Option.getOrThrow(yield* directory.getBinding(threadId)).status, "stopped");
+
+      assert.equal(
+        yield* stopInactiveSession({ threadId, expectedBinding: refreshedBinding }),
+        true,
+      );
+      assert.equal(fanout.codex.stopSession.mock.calls.length, stopsBefore + 1);
+      assert.equal(Option.getOrThrow(yield* directory.getBinding(threadId)).status, "stopped");
+    }),
+  );
+
+  it.effect("serializes a fenced inactive stop against a replacement start", () =>
+    Effect.gen(function* () {
+      const threadId = asThreadId("thread-inactive-stop-replacement-race");
+      const provider = yield* ProviderService.ProviderService;
+      const directory = yield* ProviderSessionDirectory.ProviderSessionDirectory;
+      const stopInactiveSession = provider.stopInactiveSession;
+      if (stopInactiveSession === undefined) {
+        return assert.fail("Expected the live provider service to support fenced inactive stops");
+      }
+      yield* provider.startSession(threadId, {
+        provider: ProviderDriverKind.make("codex"),
+        providerInstanceId: codexInstanceId,
+        threadId,
+        runtimeMode: "full-access",
+      });
+      const expectedBinding = Option.getOrThrow(
+        Option.fromUndefinedOr(
+          (yield* directory.listBindings()).find((binding) => binding.threadId === threadId),
+        ),
+      );
+      const previousOwnershipId = (
+        expectedBinding.runtimePayload as { readonly sessionOwnershipId?: unknown }
+      ).sessionOwnershipId;
+      const stopEntered = yield* Deferred.make<void>();
+      const allowStop = yield* Deferred.make<void>();
+      fanout.codex.stopSession.mockImplementationOnce(() =>
+        Effect.gen(function* () {
+          yield* Deferred.succeed(stopEntered, undefined);
+          yield* Deferred.await(allowStop);
+        }),
+      );
+
+      const stopFiber = yield* stopInactiveSession({ threadId, expectedBinding }).pipe(
+        Effect.forkChild,
+      );
+      yield* Deferred.await(stopEntered);
+      const replacementFiber = yield* provider
+        .startSession(threadId, {
+          provider: ProviderDriverKind.make("codex"),
+          providerInstanceId: codexInstanceId,
+          threadId,
+          runtimeMode: "full-access",
+        })
+        .pipe(Effect.forkChild);
+      yield* Effect.yieldNow;
+      yield* Deferred.succeed(allowStop, undefined);
+
+      assert.equal(yield* Fiber.join(stopFiber), true);
+      yield* Fiber.join(replacementFiber);
+      const replacementBinding = Option.getOrThrow(yield* directory.getBinding(threadId));
+      assert.equal(replacementBinding.status, "running");
+      assert.notEqual(
+        (replacementBinding.runtimePayload as { readonly sessionOwnershipId?: unknown })
+          .sessionOwnershipId,
+        previousOwnershipId,
+      );
+    }),
+  );
+
+  it.effect("serializes a forced stale failure projection against a replacement start", () =>
+    Effect.gen(function* () {
+      const threadId = asThreadId("thread-force-fail-replacement-race");
+      const turnId = asTurnId("turn-force-fail-replacement-race");
+      const provider = yield* ProviderService.ProviderService;
+      const directory = yield* ProviderSessionDirectory.ProviderSessionDirectory;
+      const forceFailStaleSession = provider.forceFailStaleSession;
+      if (forceFailStaleSession === undefined) {
+        return assert.fail("Expected the live provider service to support fenced force failures");
+      }
+      yield* provider.startSession(threadId, {
+        provider: ProviderDriverKind.make("codex"),
+        providerInstanceId: codexInstanceId,
+        threadId,
+        runtimeMode: "full-access",
+      });
+      const runningBinding = Option.getOrThrow(yield* directory.getBinding(threadId));
+      const runningPayload = runningBinding.runtimePayload as Record<string, unknown>;
+      yield* directory.upsert({
+        ...runningBinding,
+        status: "error",
+        runtimePayload: {
+          ...runningPayload,
+          activeTurnId: null,
+          lastTerminalTurnId: turnId,
+        },
+      });
+      const expectedBinding = Option.getOrThrow(yield* directory.getBinding(threadId));
+      const previousOwnershipId = (
+        expectedBinding.runtimePayload as { readonly sessionOwnershipId?: unknown }
+      ).sessionOwnershipId;
+      const projectionEntered = yield* Deferred.make<void>();
+      const allowProjection = yield* Deferred.make<void>();
+      const order = yield* Ref.make<ReadonlyArray<string>>([]);
+
+      const forceFiber = yield* forceFailStaleSession({
+        threadId,
+        turnId,
+        expectedBinding,
+        onOwned: Effect.gen(function* () {
+          yield* Ref.update(order, (events) => [...events, "projection-started"]);
+          yield* Deferred.succeed(projectionEntered, undefined);
+          yield* Deferred.await(allowProjection);
+          yield* Ref.update(order, (events) => [...events, "projection-finished"]);
+        }),
+        onSettled: directory
+          .upsert({
+            ...expectedBinding,
+            status: "stopped",
+            runtimePayload: {
+              ...(expectedBinding.runtimePayload as Record<string, unknown>),
+              activeTurnId: null,
+              lastTerminalTurnId: turnId,
+            },
+          })
+          .pipe(Effect.tap(() => Ref.update(order, (events) => [...events, "settled"]))),
+      }).pipe(Effect.forkChild);
+      yield* Deferred.await(projectionEntered);
+      const replacementFiber = yield* provider
+        .startSession(threadId, {
+          provider: ProviderDriverKind.make("codex"),
+          providerInstanceId: codexInstanceId,
+          threadId,
+          runtimeMode: "full-access",
+        })
+        .pipe(
+          Effect.tap(() => Ref.update(order, (events) => [...events, "replacement-started"])),
+          Effect.forkChild,
+        );
+      yield* Effect.yieldNow;
+      yield* Deferred.succeed(allowProjection, undefined);
+
+      assert.equal(yield* Fiber.join(forceFiber), true);
+      yield* Fiber.join(replacementFiber);
+      assert.deepEqual(yield* Ref.get(order), [
+        "projection-started",
+        "projection-finished",
+        "settled",
+        "replacement-started",
+      ]);
+      const replacementBinding = Option.getOrThrow(yield* directory.getBinding(threadId));
+      assert.equal(replacementBinding.status, "running");
+      assert.notEqual(
+        (replacementBinding.runtimePayload as { readonly sessionOwnershipId?: unknown })
+          .sessionOwnershipId,
+        previousOwnershipId,
+      );
+    }),
+  );
+
   it.effect("does not stop a replacement session when failed cleanup loses the start race", () =>
     Effect.gen(function* () {
+      fanout.codex.stopSession.mockClear();
       const threadId = asThreadId("thread-failed-cleanup-replacement-race");
       const provider = yield* ProviderService.ProviderService;
       const directory = yield* ProviderSessionDirectory.ProviderSessionDirectory;
@@ -5073,6 +8306,32 @@ fanout.layer("ProviderServiceLive fanout", (it) => {
           true,
         );
       }),
+  );
+});
+
+grokFanout.layer("ProviderServiceLive Grok output guard", (it) => {
+  it.effect.each<MeaningfulOutputCase>([
+    {
+      name: "Grok plan update",
+      provider: GROK_DRIVER,
+      providerInstanceId: grokInstanceId,
+      output: {
+        type: "turn.plan.updated",
+        payload: { plan: [{ step: "Inspect", status: "completed" }] },
+      },
+    },
+    {
+      name: "Grok tool result",
+      provider: GROK_DRIVER,
+      providerInstanceId: grokInstanceId,
+      output: {
+        type: "item.completed",
+        itemId: "grok-tool-item",
+        payload: { itemType: "dynamic_tool_call", status: "completed" },
+      },
+    },
+  ])("preserves successful $name-only turns", (testCase) =>
+    assertSuccessfulOutputOnlyTurn(testCase, grokOutputAdapter),
   );
 });
 

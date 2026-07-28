@@ -43,6 +43,7 @@ import { ServerSettingsService } from "../../serverSettings.ts";
 import { ProviderAdapterValidationError } from "../Errors.ts";
 import type { CodexAdapterShape } from "../Services/CodexAdapter.ts";
 import { ProviderSessionDirectory } from "../Services/ProviderSessionDirectory.ts";
+import { providerConsumerLifetimeContract } from "../testUtils/providerConsumerLifetimeContract.ts";
 import {
   type CodexAdapterLiveOptions,
   deleteSessionIfCurrent,
@@ -333,12 +334,31 @@ validationLayer("CodexAdapterLive validation", (it) => {
       NodeAssert.deepStrictEqual(validationRuntimeFactory.factory.mock.calls[0]?.[0], {
         binaryPath: "codex",
         cwd: process.cwd(),
+        launchArgs: "",
         model: "gpt-5.3-codex",
         providerInstanceId: ProviderInstanceId.make("codex"),
         serviceTier: "priority",
         threadId: asThreadId("thread-1"),
         runtimeMode: "full-access",
       });
+    }),
+  );
+
+  it.effect("keeps explicit Standard routing when starting a session", () =>
+    Effect.gen(function* () {
+      validationRuntimeFactory.factory.mockClear();
+      const adapter = yield* CodexAdapter;
+
+      yield* adapter.startSession({
+        provider: ProviderDriverKind.make("codex"),
+        threadId: asThreadId("thread-standard"),
+        modelSelection: createModelSelection(ProviderInstanceId.make("codex"), "gpt-5.4", [
+          { id: "serviceTier", value: "default" },
+        ]),
+        runtimeMode: "full-access",
+      });
+
+      NodeAssert.equal(validationRuntimeFactory.factory.mock.calls[0]?.[0].serviceTier, "default");
     }),
   );
 
@@ -462,6 +482,98 @@ sessionErrorLayer("CodexAdapterLive session errors", (it) => {
     }),
   );
 
+  it.effect("sends a persisted Fast-to-Standard choice on later turns", () =>
+    Effect.gen(function* () {
+      const adapter = yield* CodexAdapter;
+      const threadId = asThreadId("sess-fast-to-standard");
+      yield* adapter.startSession({
+        provider: ProviderDriverKind.make("codex"),
+        threadId,
+        modelSelection: createModelSelection(ProviderInstanceId.make("codex"), "gpt-5.4", [
+          { id: "serviceTier", value: "priority" },
+        ]),
+        runtimeMode: "full-access",
+      });
+      const runtime = sessionRuntimeFactory.lastRuntime;
+      NodeAssert.ok(runtime);
+      runtime.sendTurnImpl.mockClear();
+
+      yield* adapter.sendTurn({
+        threadId,
+        input: "continue on Standard",
+        modelSelection: createModelSelection(ProviderInstanceId.make("codex"), "gpt-5.4", [
+          { id: "serviceTier", value: "default" },
+        ]),
+        attachments: [],
+      });
+
+      NodeAssert.equal(runtime.sendTurnImpl.mock.calls[0]?.[0].serviceTier, "default");
+    }),
+  );
+
+  it.effect("passes configured launch args into the session runtime", () => {
+    const runtimeFactory = makeRuntimeFactory();
+    const layer = Layer.effect(
+      CodexAdapter,
+      Effect.gen(function* () {
+        const codexConfig = decodeCodexSettings({ launchArgs: "--strict-config --enable foo" });
+        return yield* makeCodexAdapter(codexConfig, {
+          makeRuntime: runtimeFactory.factory,
+        });
+      }),
+    ).pipe(
+      Layer.provideMerge(ServerConfig.layerTest(process.cwd(), process.cwd())),
+      Layer.provideMerge(ServerSettingsService.layerTest()),
+      Layer.provideMerge(providerSessionDirectoryTestLayer),
+      Layer.provideMerge(NodeServices.layer),
+    );
+
+    return Effect.gen(function* () {
+      const adapter = yield* CodexAdapter;
+      yield* adapter.startSession({
+        provider: ProviderDriverKind.make("codex"),
+        threadId: asThreadId("sess-launch-args"),
+        runtimeMode: "full-access",
+      });
+
+      const runtime = runtimeFactory.lastRuntime;
+      NodeAssert.ok(runtime);
+      NodeAssert.equal(runtime.options.launchArgs, "--strict-config --enable foo");
+    }).pipe(Effect.provide(layer));
+  });
+
+  it.effect("uses T3CODE_CODEX_LAUNCH_ARGS for the session runtime", () => {
+    const runtimeFactory = makeRuntimeFactory();
+    const layer = Layer.effect(
+      CodexAdapter,
+      Effect.gen(function* () {
+        const codexConfig = decodeCodexSettings({ launchArgs: "--enable settings-feature" });
+        return yield* makeCodexAdapter(codexConfig, {
+          environment: { T3CODE_CODEX_LAUNCH_ARGS: " --strict-config --enable env-feature " },
+          makeRuntime: runtimeFactory.factory,
+        });
+      }),
+    ).pipe(
+      Layer.provideMerge(ServerConfig.layerTest(process.cwd(), process.cwd())),
+      Layer.provideMerge(ServerSettingsService.layerTest()),
+      Layer.provideMerge(providerSessionDirectoryTestLayer),
+      Layer.provideMerge(NodeServices.layer),
+    );
+
+    return Effect.gen(function* () {
+      const adapter = yield* CodexAdapter;
+      yield* adapter.startSession({
+        provider: ProviderDriverKind.make("codex"),
+        threadId: asThreadId("sess-launch-args-env"),
+        runtimeMode: "full-access",
+      });
+
+      const runtime = runtimeFactory.lastRuntime;
+      NodeAssert.ok(runtime);
+      NodeAssert.equal(runtime.options.launchArgs, "--strict-config --enable env-feature");
+    }).pipe(Effect.provide(layer));
+  });
+
   it.effect("maps codex model options for the adapter's bound custom instance id", () => {
     const customInstanceId = ProviderInstanceId.make("codex_personal");
     const customRuntimeFactory = makeRuntimeFactory();
@@ -551,6 +663,78 @@ function startLifecycleRuntime() {
 }
 
 lifecycleLayer("CodexAdapterLive lifecycle", (it) => {
+  it.effect("satisfies the CodexAdapter persistent-consumer lifetime contract", () =>
+    Effect.gen(function* () {
+      const adapter = yield* CodexAdapter;
+      const threadId = asThreadId("thread-codex-consumer-lifetime");
+
+      yield* providerConsumerLifetimeContract({
+        adapterName: "CodexAdapter",
+        adapter,
+        startInput: {
+          provider: ProviderDriverKind.make("codex"),
+          threadId,
+          runtimeMode: "full-access",
+        },
+        turnInput: {
+          threadId,
+          input: "PONG",
+          attachments: [],
+        },
+        driveTurn: (turn) =>
+          Effect.gen(function* () {
+            const runtime = lifecycleRuntimeFactory.lastRuntime;
+            NodeAssert.ok(runtime);
+            const itemId = asItemId("item-codex-consumer-lifetime");
+
+            yield* runtime.emit({
+              id: asEventId("event-codex-contract-turn-started"),
+              kind: "notification",
+              provider: ProviderDriverKind.make("codex"),
+              createdAt: "2026-01-01T00:00:01.000Z",
+              method: "turn/started",
+              threadId,
+              turnId: turn.turnId,
+              payload: {
+                threadId,
+                turn: { id: turn.turnId, status: "inProgress", items: [] },
+              },
+            });
+            yield* runtime.emit({
+              id: asEventId("event-codex-contract-content"),
+              kind: "notification",
+              provider: ProviderDriverKind.make("codex"),
+              createdAt: "2026-01-01T00:00:02.000Z",
+              method: "item/agentMessage/delta",
+              threadId,
+              turnId: turn.turnId,
+              itemId,
+              textDelta: "PONG",
+              payload: {
+                delta: "PONG",
+                itemId,
+                threadId,
+                turnId: turn.turnId,
+              },
+            });
+            yield* runtime.emit({
+              id: asEventId("event-codex-contract-turn-completed"),
+              kind: "notification",
+              provider: ProviderDriverKind.make("codex"),
+              createdAt: "2026-01-01T00:00:03.000Z",
+              method: "turn/completed",
+              threadId,
+              turnId: turn.turnId,
+              payload: {
+                threadId,
+                turn: { id: turn.turnId, status: "completed", items: [] },
+              },
+            });
+          }),
+      });
+    }),
+  );
+
   it.effect("preserves detached-child routing across the real completion sequence", () =>
     Effect.gen(function* () {
       const { adapter, runtime } = yield* startLifecycleRuntime();

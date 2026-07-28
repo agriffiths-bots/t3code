@@ -24,6 +24,26 @@ describe("shouldSubmitComposerOnEnter", () => {
   it("inserts a newline for Shift+Enter", () => {
     expect(shouldSubmitComposerOnEnter({ isMobileViewport: false, shiftKey: true })).toBe(false);
   });
+
+  it("inserts a newline on a wide touch device, where Enter comes from an on-screen keyboard", () => {
+    expect(
+      shouldSubmitComposerOnEnter({
+        isMobileViewport: false,
+        hasCoarsePointer: true,
+        shiftKey: false,
+      }),
+    ).toBe(false);
+  });
+
+  it("still submits on a wide fine-pointer device", () => {
+    expect(
+      shouldSubmitComposerOnEnter({
+        isMobileViewport: false,
+        hasCoarsePointer: false,
+        shiftKey: false,
+      }),
+    ).toBe(true);
+  });
 });
 
 describe("detectComposerTrigger", () => {

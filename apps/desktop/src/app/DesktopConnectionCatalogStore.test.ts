@@ -2,8 +2,10 @@ import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, describe, it } from "@effect/vitest";
 import { ConnectionCatalogDocument } from "@t3tools/client-runtime/platform";
 import { EnvironmentId, type PersistedSavedEnvironmentRecord } from "@t3tools/contracts";
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
+import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as PlatformError from "effect/PlatformError";
@@ -92,6 +94,29 @@ const withStore = <A, E, R>(
     return yield* effect.pipe(Effect.provide(makeLayer(baseDir, encryptionAvailable)));
   }).pipe(Effect.provide(NodeServices.layer), Effect.scoped);
 
+const expectCorruptCatalogQuarantine = (corruptCatalog: string) =>
+  withStore(
+    Effect.gen(function* () {
+      const environment = yield* DesktopEnvironment.DesktopEnvironment;
+      const fileSystem = yield* FileSystem.FileSystem;
+      const store = yield* DesktopConnectionCatalogStore.DesktopConnectionCatalogStore;
+      const catalogPath = `${environment.stateDir}/connection-catalog.json`;
+      yield* fileSystem.makeDirectory(environment.stateDir, { recursive: true });
+      yield* fileSystem.writeFileString(catalogPath, corruptCatalog);
+
+      assert.deepStrictEqual(yield* store.get, Option.none());
+      assert.isFalse(yield* fileSystem.exists(catalogPath));
+      const quarantined = (yield* fileSystem.readDirectory(environment.stateDir)).filter((entry) =>
+        /^connection-catalog\.json\.corrupt-\d+$/.test(entry),
+      );
+      assert.deepStrictEqual(quarantined.length, 1);
+      assert.equal(
+        yield* fileSystem.readFileString(`${environment.stateDir}/${quarantined[0]}`),
+        corruptCatalog,
+      );
+    }),
+  );
+
 describe("DesktopConnectionCatalogStore", () => {
   it.effect("persists, reads, and clears an encrypted connection catalog", () =>
     withStore(
@@ -114,6 +139,27 @@ describe("DesktopConnectionCatalogStore", () => {
         const store = yield* DesktopConnectionCatalogStore.DesktopConnectionCatalogStore;
         assert.isFalse(yield* store.set("{}"));
         assert.deepStrictEqual(yield* store.get, Option.none());
+      }),
+      false,
+    ),
+  );
+
+  it.effect("preserves an encrypted catalog when secure storage is unavailable", () =>
+    withStore(
+      Effect.gen(function* () {
+        const environment = yield* DesktopEnvironment.DesktopEnvironment;
+        const fileSystem = yield* FileSystem.FileSystem;
+        const store = yield* DesktopConnectionCatalogStore.DesktopConnectionCatalogStore;
+        const catalogPath = `${environment.stateDir}/connection-catalog.json`;
+        const encryptedDocument = '{"version":1,"encryptedCatalog":"ZW5jcnlwdGVkOnt9"}\n';
+        yield* fileSystem.makeDirectory(environment.stateDir, { recursive: true });
+        yield* fileSystem.writeFileString(catalogPath, encryptedDocument);
+
+        assert.deepStrictEqual(yield* store.get, Option.none());
+        assert.equal(yield* fileSystem.readFileString(catalogPath), encryptedDocument);
+        assert.deepStrictEqual(yield* fileSystem.readDirectory(environment.stateDir), [
+          "connection-catalog.json",
+        ]);
       }),
       false,
     ),
@@ -222,26 +268,138 @@ describe("DesktopConnectionCatalogStore", () => {
     ),
   );
 
-  it.effect("surfaces malformed catalog documents without deleting them", () =>
+  it.effect("quarantines an all-NUL catalog and starts empty", () =>
+    expectCorruptCatalogQuarantine("\0".repeat(912)),
+  );
+
+  it.effect("quarantines a truncated catalog document and starts empty", () =>
+    expectCorruptCatalogQuarantine('{"version":1,"encryptedCatalog":'),
+  );
+
+  it.effect("quarantines a schema-invalid outer catalog document and starts empty", () =>
+    expectCorruptCatalogQuarantine('{"version":1,"encryptedCatalog":42}'),
+  );
+
+  it.effect("preserves a well-formed catalog from a newer application version", () =>
     withStore(
       Effect.gen(function* () {
         const environment = yield* DesktopEnvironment.DesktopEnvironment;
         const fileSystem = yield* FileSystem.FileSystem;
         const store = yield* DesktopConnectionCatalogStore.DesktopConnectionCatalogStore;
         const catalogPath = `${environment.stateDir}/connection-catalog.json`;
+        const futureCatalog = '{"version":2,"payload":{"ciphertext":"future-format"}}\n';
         yield* fileSystem.makeDirectory(environment.stateDir, { recursive: true });
-        yield* fileSystem.writeFileString(catalogPath, "{not-json");
+        yield* fileSystem.writeFileString(catalogPath, futureCatalog);
 
         const error = yield* store.get.pipe(Effect.flip);
         assert.instanceOf(
           error,
-          DesktopConnectionCatalogStore.DesktopConnectionCatalogStoreDocumentDecodeError,
+          DesktopConnectionCatalogStore.DesktopConnectionCatalogStoreUnsupportedVersionError,
         );
         assert.equal(error.catalogPath, catalogPath);
-        assert.exists(error.cause);
-        assert.equal(yield* fileSystem.readFileString(catalogPath), "{not-json");
+        assert.equal(error.version, 2);
+        assert.equal(yield* fileSystem.readFileString(catalogPath), futureCatalog);
+        assert.deepStrictEqual(yield* fileSystem.readDirectory(environment.stateDir), [
+          "connection-catalog.json",
+        ]);
       }),
     ),
+  );
+
+  it.effect("attempts legacy migration after quarantining a malformed catalog", () =>
+    withStore(
+      Effect.gen(function* () {
+        const environment = yield* DesktopEnvironment.DesktopEnvironment;
+        const fileSystem = yield* FileSystem.FileSystem;
+        const savedEnvironments = yield* DesktopSavedEnvironments.DesktopSavedEnvironments;
+        const store = yield* DesktopConnectionCatalogStore.DesktopConnectionCatalogStore;
+        const catalogPath = `${environment.stateDir}/connection-catalog.json`;
+        yield* savedEnvironments.setRegistry([
+          {
+            environmentId: EnvironmentId.make("relay-environment"),
+            label: "Relay",
+            httpBaseUrl: "https://relay.example.com/",
+            wsBaseUrl: "wss://relay.example.com/",
+            createdAt: "2026-06-01T00:00:00.000Z",
+            lastConnectedAt: null,
+            relayManaged: { relayUrl: "https://relay-control.example.com/" },
+          },
+        ]);
+        yield* fileSystem.writeFileString(catalogPath, "{not-json");
+
+        const recovered = yield* store.get;
+        assert.isTrue(Option.isSome(recovered));
+        if (Option.isNone(recovered)) {
+          return;
+        }
+        const catalog = yield* decodeConnectionCatalog(recovered.value);
+        assert.deepInclude(catalog.targets[0], {
+          _tag: "RelayConnectionTarget",
+          environmentId: EnvironmentId.make("relay-environment"),
+          label: "Relay",
+        });
+        const quarantined = (yield* fileSystem.readDirectory(environment.stateDir)).filter(
+          (entry) => /^connection-catalog\.json\.corrupt-\d+$/.test(entry),
+        );
+        assert.deepStrictEqual(quarantined.length, 1);
+        assert.equal(
+          yield* fileSystem.readFileString(`${environment.stateDir}/${quarantined[0]}`),
+          "{not-json",
+        );
+        assert.isTrue(yield* fileSystem.exists(catalogPath));
+      }),
+    ),
+  );
+
+  it.effect("does not quarantine a valid catalog written during recovery", () =>
+    Effect.gen(function* () {
+      const fileSystem = yield* FileSystem.FileSystem;
+      const baseDir = yield* fileSystem.makeTempDirectoryScoped({
+        prefix: "t3-desktop-connection-catalog-test-",
+      });
+      const catalogPath = `${baseDir}/userdata/connection-catalog.json`;
+      const quarantineStarted = yield* Deferred.make<void>();
+      const allowQuarantine = yield* Deferred.make<void>();
+      const setCompleted = yield* Deferred.make<void>();
+      const fileSystemLayer = Layer.succeed(FileSystem.FileSystem, {
+        ...fileSystem,
+        rename: (fromPath, toPath) =>
+          toPath.includes("connection-catalog.json.corrupt-")
+            ? Deferred.succeed(quarantineStarted, undefined).pipe(
+                Effect.andThen(Deferred.await(allowQuarantine)),
+                Effect.andThen(fileSystem.rename(fromPath, toPath)),
+              )
+            : fileSystem.rename(fromPath, toPath),
+      });
+      const store = yield* DesktopConnectionCatalogStore.DesktopConnectionCatalogStore.pipe(
+        Effect.provide(makeLayer(baseDir, true, null, fileSystemLayer)),
+      );
+      yield* fileSystem.makeDirectory(`${baseDir}/userdata`, { recursive: true });
+      yield* fileSystem.writeFileString(catalogPath, "{not-json");
+
+      const getFiber = yield* store.get.pipe(Effect.forkChild({ startImmediately: true }));
+      yield* Deferred.await(quarantineStarted);
+      const replacement = '{"schemaVersion":1,"targets":[]}';
+      const setFiber = yield* store.set(replacement).pipe(
+        Effect.tap(() => Deferred.succeed(setCompleted, undefined)),
+        Effect.forkChild({ startImmediately: true }),
+      );
+      yield* Effect.yieldNow;
+      assert.isFalse(yield* Deferred.isDone(setCompleted));
+
+      yield* Deferred.succeed(allowQuarantine, undefined);
+      assert.deepStrictEqual(yield* Fiber.join(getFiber), Option.none());
+      assert.isTrue(yield* Fiber.join(setFiber));
+      assert.deepStrictEqual(yield* store.get, Option.some(replacement));
+      const quarantined = (yield* fileSystem.readDirectory(`${baseDir}/userdata`)).filter((entry) =>
+        /^connection-catalog\.json\.corrupt-\d+$/.test(entry),
+      );
+      assert.deepStrictEqual(quarantined.length, 1);
+      assert.equal(
+        yield* fileSystem.readFileString(`${baseDir}/userdata/${quarantined[0]}`),
+        "{not-json",
+      );
+    }).pipe(Effect.provide(NodeServices.layer), Effect.scoped),
   );
 
   it.effect("surfaces catalog filesystem failures instead of treating them as missing", () =>

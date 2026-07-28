@@ -151,12 +151,21 @@ export function getProviderOptionDescriptors(input: {
   const { caps, selections } = input;
   const baseDescriptors = (caps.optionDescriptors ?? []).map(cloneDescriptor);
 
-  return baseDescriptors.map((descriptor) =>
-    withDescriptorCurrentValue(
-      descriptor,
-      getRawSelectionValueById(selections, descriptor.id) ?? descriptor.currentValue,
-    ),
-  );
+  return baseDescriptors.map((descriptor) => {
+    let selectedValue = getRawSelectionValueById(selections, descriptor.id);
+    // Codex used a boolean `fastMode` option before app-server exposed service tiers.
+    // Preserve its string and boolean legacy states against the current descriptor ids.
+    if (descriptor.id === "serviceTier") {
+      if (typeof selectedValue === "string" && selectedValue.trim().toLowerCase() === "fast") {
+        selectedValue = "priority";
+      } else if (selectedValue === undefined) {
+        const legacyFastMode = getRawSelectionValueById(selections, "fastMode");
+        if (legacyFastMode === true) selectedValue = "priority";
+        if (legacyFastMode === false) selectedValue = "default";
+      }
+    }
+    return withDescriptorCurrentValue(descriptor, selectedValue ?? descriptor.currentValue);
+  });
 }
 
 export function getProviderOptionCurrentValue(
@@ -237,11 +246,7 @@ export function normalizeModelSlug(
   model: string | null | undefined,
   provider: ProviderDriverKind = DEFAULT_PROVIDER_DRIVER_KIND,
 ): string | null {
-  if (typeof model !== "string") {
-    return null;
-  }
-
-  const trimmed = model.trim();
+  const trimmed = normalizeCustomModelSlug(model);
   if (!trimmed) {
     return null;
   }
@@ -251,6 +256,15 @@ export function normalizeModelSlug(
     ? aliases[trimmed]
     : undefined;
   return typeof aliased === "string" ? aliased : trimmed;
+}
+
+/** Custom model identifiers are provider-owned, so only trim them; never expand aliases. */
+export function normalizeCustomModelSlug(model: string | null | undefined): string | null {
+  if (typeof model !== "string") {
+    return null;
+  }
+
+  return model.trim() || null;
 }
 
 export function resolveSelectableModel(

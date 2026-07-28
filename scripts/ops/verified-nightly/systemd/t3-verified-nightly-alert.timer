@@ -1,0 +1,12 @@
+[Unit]
+Description=Poll for completed verified nightly promotions
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+RandomizedDelaySec=30s
+Persistent=true
+Unit=t3-verified-nightly-alert.service
+
+[Install]
+WantedBy=timers.target

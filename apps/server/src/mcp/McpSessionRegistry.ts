@@ -609,6 +609,13 @@ export const issueActiveMcpPeerCredential = (
         .pipe(Effect.map((issued): McpIssuedPeerCredential | undefined => issued))
     : Effect.sync((): McpIssuedPeerCredential | undefined => undefined);
 
+export const resolveActiveMcpInvocation = (
+  rawToken: string,
+): Effect.Effect<McpInvocationContext.McpInvocationScope | undefined> =>
+  activeMcpSessionRegistry
+    ? activeMcpSessionRegistry.resolve(rawToken)
+    : Effect.sync((): McpInvocationContext.McpInvocationScope | undefined => undefined);
+
 export const revokeActiveMcpThread = (threadId: ThreadId): Effect.Effect<void> =>
   activeMcpSessionRegistry ? activeMcpSessionRegistry.revokeThread(threadId) : Effect.void;
 

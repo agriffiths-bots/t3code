@@ -40,6 +40,37 @@ export class OrchestrationCommandInvariantError extends Schema.TaggedErrorClass<
   }
 }
 
+/**
+ * A trusted acceptance guard deferred a command because its prerequisite may
+ * become true later. Unlike invariant failures, this must never create a
+ * rejected command receipt: callers retry the same durable command id.
+ */
+export class OrchestrationCommandAcceptanceDeferredError extends Schema.TaggedErrorClass<OrchestrationCommandAcceptanceDeferredError>()(
+  "OrchestrationCommandAcceptanceDeferredError",
+  {
+    commandType: Schema.String,
+    detail: Schema.String,
+    cause: Schema.optional(Schema.Defect()),
+  },
+) {
+  override get message(): string {
+    return `Orchestration command acceptance deferred (${this.commandType}): ${this.detail}`;
+  }
+}
+
+export class OrchestrationCommandAudienceAuthorizationError extends Schema.TaggedErrorClass<OrchestrationCommandAudienceAuthorizationError>()(
+  "OrchestrationCommandAudienceAuthorizationError",
+  {
+    commandType: Schema.String,
+    detail: Schema.String,
+    cause: Schema.optional(Schema.Defect()),
+  },
+) {
+  override get message(): string {
+    return `Orchestration command authorization failed (${this.commandType}): ${this.detail}`;
+  }
+}
+
 export class OrchestrationCommandPreviouslyRejectedError extends Schema.TaggedErrorClass<OrchestrationCommandPreviouslyRejectedError>()(
   "OrchestrationCommandPreviouslyRejectedError",
   {
@@ -82,6 +113,8 @@ export class OrchestrationListenerCallbackError extends Schema.TaggedErrorClass<
 export type OrchestrationDispatchError =
   | ProjectionRepositoryError
   | OrchestrationCommandInvariantError
+  | OrchestrationCommandAcceptanceDeferredError
+  | OrchestrationCommandAudienceAuthorizationError
   | OrchestrationCommandPreviouslyRejectedError
   | OrchestrationProjectorDecodeError
   | OrchestrationListenerCallbackError;

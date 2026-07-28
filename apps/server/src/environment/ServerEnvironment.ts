@@ -179,6 +179,7 @@ export const make = Effect.gen(function* () {
     ...(serverBuildSha !== undefined ? { serverBuildSha } : {}),
     capabilities: {
       repositoryIdentity: true,
+      connectionProbe: true,
     },
   };
 

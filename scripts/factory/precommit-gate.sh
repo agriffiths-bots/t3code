@@ -245,6 +245,18 @@ refuse() { # refuse <short> <verdict> <detail-json>
 
 head_sha() { git rev-parse -q --verify HEAD 2>/dev/null || git hash-object -t tree /dev/null; }
 
+run_provider_consumer_contract_guard() {
+  local guard_path="scripts/factory/provider-consumer-contract-guard.sh"
+  if ! git cat-file -e "HEAD:$guard_path" 2>/dev/null; then
+    echo "factory-gate: provider consumer contract guard bootstrap — activates after this commit" >&2
+    return 0
+  fi
+  head_is_regular "$guard_path" \
+    || refuse "HEAD provider consumer contract guard is not a regular file" provider-consumer-contract-invalid '{}'
+  git show "HEAD:$guard_path" | bash -s -- --staged \
+    || refuse "provider persistent-consumer contract coverage is incomplete" provider-consumer-contract-missing '{}'
+}
+
 # Self-heal the out-of-tree hook installation after an installed hook reaches
 # the gate: updated shims in HEAD propagate to the installed dir. This cannot
 # bootstrap a brand-new hook for a sequencer commit that runs before any
@@ -337,6 +349,7 @@ fi
 # may never REMOVE them: a tree without the gate would land judged by the old
 # gate and leave the factory hookless. Applies to every load-bearing file.
 for gf in scripts/factory/precommit-gate.sh scripts/factory/factory.conf \
+          scripts/factory/provider-consumer-contract-guard.sh \
           scripts/factory/install-hooks.sh .githooks/pre-commit \
           .githooks/pre-merge-commit .githooks/prepare-commit-msg; do
   git cat-file -e "HEAD:$gf" 2>/dev/null || continue
@@ -354,6 +367,8 @@ for gf in scripts/factory/precommit-gate.sh scripts/factory/factory.conf \
   as its target text)." gate-file-mode "$(jq -cn --arg f "$gf" --arg m "${smode:-none}" '{file:$f,mode:$m}')";;
   esac
 done
+
+run_provider_consumer_contract_guard
 
 HEAD_SHA="$(head_sha)"
 TREE_SHA="$(git write-tree)" || refuse "git write-tree failed (unmerged index?)" scope-write-tree '{}'

@@ -1,0 +1,495 @@
+name: Verified Nightly Promotion
+
+run-name: Verify nightly from run ${{ github.event.workflow_run.id }}
+
+on:
+  workflow_run:
+    workflows: ["Main Artifact Release"]
+    types: [completed]
+
+permissions:
+  actions: read
+  contents: write
+
+concurrency:
+  group: verified-nightly-promotion
+  cancel-in-progress: false
+
+jobs:
+  source:
+    name: Validate nightly source
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      commit: ${{ steps.source.outputs.commit }}
+      nightly_tag: ${{ steps.source.outputs.nightly_tag }}
+      nightly_version: ${{ steps.source.outputs.nightly_version }}
+      stable_baseline_tag: ${{ steps.source.outputs.stable_baseline_tag }}
+      source_run_id: ${{ steps.source.outputs.source_run_id }}
+      source_run_url: ${{ steps.source.outputs.source_run_url }}
+    steps:
+      - name: Refuse rerun-to-green promotion
+        if: ${{ github.run_attempt != 1 || github.event.workflow_run.run_attempt != 1 }}
+        shell: bash
+        run: |
+          echo "::error::Neither the nightly build nor its promotion may be retried to green. Wait for a new nightly artifact."
+          exit 1
+
+      - name: Checkout nightly commit
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          fetch-depth: 0
+
+      # Checkout cleans untracked paths, so the immutable source evidence must
+      # be downloaded afterwards or `source/` is removed before validation.
+      - name: Download source metadata
+        uses: actions/download-artifact@v7
+        with:
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ github.event.workflow_run.id }}
+          name: verified-nightly-source
+          path: source
+
+      - id: source
+        name: Verify release and commit identity
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          SOURCE_RUN_ID: ${{ github.event.workflow_run.id }}
+          SOURCE_HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          manifest=source/verified-nightly-source.json
+          jq -e \
+            --arg sha "$SOURCE_HEAD_SHA" \
+            --arg branch "$SOURCE_HEAD_BRANCH" \
+            --argjson runId "$SOURCE_RUN_ID" \
+            '.schemaVersion == 1 and
+             .commit == $sha and
+             $branch == "main" and
+             .sourceRunId == $runId and
+             (.nightlyTag | test("^v[0-9]+\\.[0-9]+\\.[0-9]+-nightly\\.[0-9]{8}\\.[0-9]+$")) and
+             (.stableBaselineTag | test("^v[0-9]+\\.[0-9]+\\.[0-9]+$"))' \
+            "$manifest" >/dev/null
+
+          nightly_tag="$(jq -r .nightlyTag "$manifest")"
+          release_json="$(gh release view "$nightly_tag" --json isDraft,isPrerelease,url)"
+          jq -e \
+            '.isDraft == false and .isPrerelease == true' \
+            <<< "$release_json" >/dev/null
+          # The tag object below is the authoritative commit binding; release
+          # targetCommitish metadata can report a branch when the tag exists.
+          [[ "$(git rev-list -n 1 "$nightly_tag")" == "$SOURCE_HEAD_SHA" ]] || {
+            echo "::error::Nightly tag $nightly_tag does not resolve to source commit $SOURCE_HEAD_SHA."
+            exit 1
+          }
+
+          {
+            echo "commit=$(jq -r .commit "$manifest")"
+            echo "nightly_tag=$nightly_tag"
+            echo "nightly_version=$(jq -r .nightlyVersion "$manifest")"
+            echo "stable_baseline_tag=$(jq -r .stableBaselineTag "$manifest")"
+            echo "source_run_id=$(jq -r .sourceRunId "$manifest")"
+            echo "source_run_url=$(jq -r .sourceRunUrl "$manifest")"
+          } >> "$GITHUB_OUTPUT"
+
+  plan:
+    name: Plan stable promotion
+    needs: source
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      release_tag: ${{ steps.plan.outputs.next_tag }}
+      release_version: ${{ steps.plan.outputs.next_version }}
+    steps:
+      - name: Checkout nightly commit
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.source.outputs.commit }}
+          fetch-depth: 0
+
+      - id: plan
+        name: Check stable baseline and resolve next patch
+        env:
+          STABLE_BASELINE_TAG: ${{ needs.source.outputs.stable_baseline_tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch --force origin 'refs/tags/*:refs/tags/*'
+          git tag --list 'v*' > "$RUNNER_TEMP/stable-tags.txt"
+          node scripts/resolve-stable-promotion.ts \
+            --tags-file "$RUNNER_TEMP/stable-tags.txt" \
+            --expected-latest "$STABLE_BASELINE_TAG" \
+            --github-output
+          git merge-base --is-ancestor "$STABLE_BASELINE_TAG" HEAD || {
+            echo "::error::Nightly commit is not a descendant of $STABLE_BASELINE_TAG."
+            exit 1
+          }
+
+  provider_e2e:
+    name: Provider E2E Gate
+    needs: [source, plan]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout nightly commit
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.source.outputs.commit }}
+
+      - name: Setup Vite+
+        uses: voidzero-dev/setup-vp@v1
+        with:
+          node-version-file: package.json
+          cache: true
+          run-install: true
+
+      - name: Run provider verification suite
+        shell: bash
+        run: |
+          set -euo pipefail
+          claude_fixtures=(apps/server/src/provider/Layers/fixtures/recorded-claude-agent-*-turn.jsonl)
+          if [[ ! -e "${claude_fixtures[0]}" ]]; then
+            echo "::error::The recorded Claude provider E2E fixture from #217 is absent on this commit."
+            exit 1
+          fi
+
+          tests=(
+            apps/server/src/orchestration/Layers/ProviderRuntimeIngestion.test.ts
+            apps/server/src/provider/Layers/ProviderService.test.ts
+            apps/server/src/provider/Layers/ProviderSessionReaper.test.ts
+            apps/server/src/provider/Layers/GrokAdapter.test.ts
+          )
+          cursor_fixtures=(apps/server/src/provider/Layers/fixtures/recorded-cursor-*-turn.jsonl)
+          if [[ ! -e "${cursor_fixtures[0]}" ]]; then
+            echo "No recorded Cursor E2E fixture exists on this commit; running the Cursor unit set."
+            tests+=(apps/server/src/provider/Layers/CursorAdapter.test.ts)
+          fi
+          vp test run "${tests[@]}"
+
+  peer_spawn:
+    name: Peer-spawn Characterization Gate
+    needs: [source, plan]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout nightly commit
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.source.outputs.commit }}
+
+      - name: Setup Vite+
+        uses: voidzero-dev/setup-vp@v1
+        with:
+          node-version-file: package.json
+          cache: true
+          run-install: true
+
+      - name: Run commit-native peer-spawn characterization
+        run: >-
+          vp test run
+          apps/server/src/mcp/toolkits/subagent/handlers.test.ts
+          apps/server/src/orchestration/Layers/OrchestrationCommandAudienceGuard.test.ts
+
+  windows_launch:
+    name: Windows Launch Smoke
+    needs: [source, plan]
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout nightly commit
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.source.outputs.commit }}
+
+      - name: Setup Node
+        uses: actions/setup-node@v6
+        with:
+          node-version-file: package.json
+
+      - name: Download exact nightly Windows artifact
+        uses: actions/download-artifact@v7
+        with:
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ needs.source.outputs.source_run_id }}
+          name: windows-x64
+          path: release-assets
+
+      - id: install
+        name: Install nightly Windows desktop artifact
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $installer = Get-ChildItem -Path release-assets -Filter "*.exe" |
+            Sort-Object Length -Descending |
+            Select-Object -First 1
+          if (-not $installer) {
+            throw "No NSIS installer found in the exact nightly artifact."
+          }
+
+          $installDir = Join-Path $env:RUNNER_TEMP "t3code-verified-nightly"
+          if (Test-Path $installDir) {
+            Remove-Item -Recurse -Force $installDir
+          }
+          New-Item -ItemType Directory -Force -Path $installDir | Out-Null
+          $process = Start-Process `
+            -FilePath $installer.FullName `
+            -ArgumentList @("/S", "/D=$installDir") `
+            -Wait `
+            -PassThru
+          if ($process.ExitCode -ne 0) {
+            throw "NSIS installer exited with code $($process.ExitCode)."
+          }
+
+          $appExe = Get-ChildItem -Path $installDir -Filter "T3 Code (Nightly).exe" -File |
+            Select-Object -First 1
+          if (-not $appExe) {
+            throw "The exact nightly artifact did not install T3 Code (Nightly).exe."
+          }
+          "app_exe=$($appExe.FullName)" >> $env:GITHUB_OUTPUT
+          "install_dir=$installDir" >> $env:GITHUB_OUTPUT
+
+      - name: Assert minimal unpacked desktop footprint
+        shell: pwsh
+        run: |
+          $unpackedRoot = Join-Path "${{ steps.install.outputs.install_dir }}" "resources/app.asar.unpacked"
+          node scripts/desktop-unpacked-footprint.mjs --root "$unpackedRoot" --max-files 250
+
+      - name: Launch installed nightly desktop app
+        shell: pwsh
+        run: >-
+          node scripts/desktop-launch-smoke.mjs
+          --command "${{ steps.install.outputs.app_exe }}"
+          --timeout-ms 90000
+
+  public_config:
+    name: Resolve stable artifact public config
+    needs: plan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    environment:
+      name: production
+    outputs:
+      clerk_publishable_key: ${{ steps.public_config.outputs.clerk_publishable_key }}
+      clerk_jwt_template: ${{ steps.public_config.outputs.clerk_jwt_template }}
+      clerk_cli_oauth_client_id: ${{ steps.public_config.outputs.clerk_cli_oauth_client_id }}
+      relay_url: ${{ steps.public_config.outputs.relay_url }}
+    env:
+      T3CODE_RELAY_URL: ${{ vars.T3CODE_RELAY_URL }}
+      RELAY_DOMAIN: ${{ vars.RELAY_DOMAIN }}
+      RELAY_API_ZONE_NAME: ${{ vars.RELAY_API_ZONE_NAME }}
+      CLERK_PUBLISHABLE_KEY: ${{ vars.CLERK_PUBLISHABLE_KEY }}
+      CLERK_JWT_TEMPLATE: ${{ vars.CLERK_JWT_TEMPLATE }}
+      CLERK_CLI_OAUTH_CLIENT_ID: ${{ vars.CLERK_CLI_OAUTH_CLIENT_ID }}
+    steps:
+      - id: public_config
+        name: Resolve build-time cloud config
+        shell: bash
+        run: |
+          set -euo pipefail
+          relay_url="${T3CODE_RELAY_URL:-}"
+          if [[ -z "$relay_url" ]]; then
+            relay_domain="${RELAY_DOMAIN:-}"
+            if [[ -z "$relay_domain" && -n "${RELAY_API_ZONE_NAME:-}" ]]; then
+              relay_domain="relay.$RELAY_API_ZONE_NAME"
+            fi
+            if [[ -n "$relay_domain" ]]; then
+              relay_url="https://$relay_domain"
+            fi
+          fi
+
+          clerk_publishable_key=""
+          clerk_jwt_template=""
+          clerk_cli_oauth_client_id=""
+          resolved_relay_url=""
+          required=(relay_url CLERK_PUBLISHABLE_KEY CLERK_JWT_TEMPLATE CLERK_CLI_OAUTH_CLIENT_ID)
+          missing=()
+          for name in "${required[@]}"; do
+            if [[ -z "${!name:-}" ]]; then
+              missing+=("$name")
+            fi
+          done
+          if (( ${#missing[@]} > 0 )); then
+            echo "::warning::Cloud public config incomplete (${missing[*]}); building local-only artifacts."
+          elif [[ ! "$relay_url" =~ ^https:// ]]; then
+            echo "::warning::Ignoring non-HTTPS relay_url ($relay_url); building local-only artifacts."
+          else
+            clerk_publishable_key="$CLERK_PUBLISHABLE_KEY"
+            clerk_jwt_template="$CLERK_JWT_TEMPLATE"
+            clerk_cli_oauth_client_id="$CLERK_CLI_OAUTH_CLIENT_ID"
+            resolved_relay_url="$relay_url"
+          fi
+          {
+            echo "clerk_publishable_key=$clerk_publishable_key"
+            echo "clerk_jwt_template=$clerk_jwt_template"
+            echo "clerk_cli_oauth_client_id=$clerk_cli_oauth_client_id"
+            echo "relay_url=$resolved_relay_url"
+          } >> "$GITHUB_OUTPUT"
+
+  build_stable:
+    name: Build verified stable artifacts
+    needs: [source, plan, provider_e2e, peer_spawn, windows_launch, public_config]
+    uses: ./.github/workflows/reusable-build-release-artifacts.yml
+    with:
+      ref: ${{ needs.source.outputs.commit }}
+      release_tag: ${{ needs.plan.outputs.release_tag }}
+      release_name: T3 Code ${{ needs.plan.outputs.release_version }}
+      release_version: ${{ needs.plan.outputs.release_version }}
+      clerk_publishable_key: ${{ needs.public_config.outputs.clerk_publishable_key }}
+      clerk_jwt_template: ${{ needs.public_config.outputs.clerk_jwt_template }}
+      clerk_cli_oauth_client_id: ${{ needs.public_config.outputs.clerk_cli_oauth_client_id }}
+      relay_url: ${{ needs.public_config.outputs.relay_url }}
+      prerelease: false
+      make_latest: false
+      publish_release: false
+      artifact_suffix: -stable-promotion
+      windows_signing: true
+    secrets: inherit
+
+  promote:
+    name: Publish ${{ needs.plan.outputs.release_tag }} verified stable
+    needs: [source, plan, provider_e2e, peer_spawn, windows_launch, build_stable]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Refuse rerun-to-green publication
+        if: ${{ github.run_attempt != 1 || github.event.workflow_run.run_attempt != 1 }}
+        shell: bash
+        run: |
+          echo "::error::A rerun nightly or promotion may not publish from a later attempt."
+          exit 1
+
+      - name: Checkout nightly commit
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.source.outputs.commit }}
+          fetch-depth: 0
+
+      - name: Download verified stable artifacts
+        uses: actions/download-artifact@v7
+        with:
+          name: release-assets-stable-promotion
+          path: release-assets
+
+      - name: Recheck stable tag and publish Latest
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NIGHTLY_TAG: ${{ needs.source.outputs.nightly_tag }}
+          RELEASE_TAG: ${{ needs.plan.outputs.release_tag }}
+          RELEASE_VERSION: ${{ needs.plan.outputs.release_version }}
+          SOURCE_SHA: ${{ needs.source.outputs.commit }}
+          SOURCE_RUN_URL: ${{ needs.source.outputs.source_run_url }}
+          STABLE_BASELINE_TAG: ${{ needs.source.outputs.stable_baseline_tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch --force origin 'refs/tags/*:refs/tags/*'
+          git tag --list 'v*' > "$RUNNER_TEMP/stable-tags.txt"
+          GITHUB_OUTPUT="$RUNNER_TEMP/final-plan.txt" \
+            node scripts/resolve-stable-promotion.ts \
+              --tags-file "$RUNNER_TEMP/stable-tags.txt" \
+              --expected-latest "$STABLE_BASELINE_TAG" \
+              --github-output
+          grep -Fxq "next_tag=$RELEASE_TAG" "$RUNNER_TEMP/final-plan.txt" || {
+            echo "::error::Stable promotion candidate changed after artifact build."
+            exit 1
+          }
+          if git show-ref --verify --quiet "refs/tags/$RELEASE_TAG"; then
+            echo "::error::Stable tag $RELEASE_TAG already exists; refusing to bump past it."
+            exit 1
+          fi
+
+          reserved_tag=0
+          cleanup_reserved_tag() {
+            rc=$?
+            trap - EXIT
+            if (( rc != 0 && reserved_tag == 1 )); then
+              release_json="$(
+                gh api "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
+                  | jq -c --arg tag "$RELEASE_TAG" \
+                      '[.[] | select(.tag_name == $tag)][0] // empty'
+              )" || release_json=""
+              if [[ -n "$release_json" ]] && jq -e '.draft == false' <<< "$release_json" >/dev/null; then
+                echo "::warning::Release $RELEASE_TAG is already published; leaving its verified tag intact."
+              else
+                if [[ -n "$release_json" ]]; then
+                  release_id="$(jq -r .id <<< "$release_json")"
+                  gh api --method DELETE "repos/$GITHUB_REPOSITORY/releases/$release_id" || true
+                fi
+                current_ref="$(
+                  gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_TAG" \
+                    --jq '.object.type + ":" + .object.sha' 2>/dev/null || true
+                )"
+                if [[ "$current_ref" == "commit:$SOURCE_SHA" ]]; then
+                  gh api --method DELETE \
+                    "repos/$GITHUB_REPOSITORY/git/refs/tags/$RELEASE_TAG" || true
+                fi
+              fi
+            fi
+            exit "$rc"
+          }
+          trap cleanup_reserved_tag EXIT
+
+          gh api --method POST "repos/$GITHUB_REPOSITORY/git/refs" \
+            -f ref="refs/tags/$RELEASE_TAG" \
+            -f sha="$SOURCE_SHA" >/dev/null
+          reserved_tag=1
+          remote_ref="$(
+            gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_TAG" \
+              --jq '.object.type + ":" + .object.sha'
+          )"
+          if [[ "$remote_ref" != "commit:$SOURCE_SHA" ]]; then
+            echo "::error::Reserved tag $RELEASE_TAG does not point to verified commit $SOURCE_SHA."
+            exit 1
+          fi
+
+          repo_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY"
+          promotion_run_url="$repo_url/actions/runs/$GITHUB_RUN_ID"
+          cat > "$RUNNER_TEMP/release-notes.md" <<EOF
+          ## Verified nightly promotion
+
+          | Evidence | Result |
+          | --- | --- |
+          | Provider E2E (#214, #217, #220; Cursor unit fallback) | PASS — [promotion run]($promotion_run_url) |
+          | Peer-spawn characterization (commit-native expectation) | PASS — [promotion run]($promotion_run_url) |
+          | Exact nightly Windows Launch Smoke | PASS — [promotion run]($promotion_run_url) |
+          | Stable-channel rebuild and Windows Launch Smoke | PASS — [promotion run]($promotion_run_url) |
+
+          - Commit: [\`$SOURCE_SHA\`]($repo_url/commit/$SOURCE_SHA)
+          - Source nightly: [\`$NIGHTLY_TAG\`]($repo_url/releases/tag/$NIGHTLY_TAG) ([build run]($SOURCE_RUN_URL))
+          - Previous stable: [\`$STABLE_BASELINE_TAG\`]($repo_url/releases/tag/$STABLE_BASELINE_TAG)
+          - Ancestry: [$STABLE_BASELINE_TAG...$SOURCE_SHA]($repo_url/compare/$STABLE_BASELINE_TAG...$SOURCE_SHA)
+          EOF
+
+          shopt -s nullglob
+          assets=(release-assets/*.exe release-assets/*.blockmap release-assets/*.yml)
+          if (( ${#assets[@]} == 0 )); then
+            echo "::error::No verified stable release assets were downloaded."
+            exit 1
+          fi
+          gh release create "$RELEASE_TAG" "${assets[@]}" \
+            --draft \
+            --verify-tag \
+            --title "T3 Code $RELEASE_VERSION" \
+            --notes-file "$RUNNER_TEMP/release-notes.md"
+          expected_assets="$RUNNER_TEMP/expected-release-assets.txt"
+          uploaded_assets="$RUNNER_TEMP/uploaded-release-assets.txt"
+          printf "%s\n" "${assets[@]##*/}" | sort > "$expected_assets"
+          gh api "repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG" \
+            --jq ".assets[].name" | sort > "$uploaded_assets"
+          if ! cmp -s "$expected_assets" "$uploaded_assets"; then
+            echo "::error::Draft release assets do not match verified artifact set."
+            echo "Expected assets:"
+            sed "s/^/  /" "$expected_assets"
+            echo "Uploaded assets:"
+            sed "s/^/  /" "$uploaded_assets"
+            exit 1
+          fi
+          gh release edit "$RELEASE_TAG" \
+            --draft=false \
+            --latest
+          reserved_tag=0

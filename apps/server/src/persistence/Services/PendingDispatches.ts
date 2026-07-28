@@ -27,6 +27,12 @@ export const PendingDispatch = Schema.Struct({
   kind: PendingDispatchKind,
   targetThreadId: ThreadId,
   sourceChildId: Schema.NullOr(ThreadId),
+  /**
+   * Global sequence of the child terminal event that produced this wake. This
+   * binds a delayed parent injection to its source lifecycle; legacy rows may
+   * omit it and intentionally cannot create a delivered tombstone.
+   */
+  sourceTerminalSequence: Schema.optional(Schema.NullOr(Schema.Number)),
   text: Schema.NullOr(Schema.String),
   error: Schema.NullOr(Schema.String),
   status: Schema.NullOr(Schema.String),

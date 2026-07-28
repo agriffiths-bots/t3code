@@ -131,7 +131,6 @@ import * as GitWorkflowService from "./git/GitWorkflowService.ts";
 import * as ReviewService from "./review/ReviewService.ts";
 import * as SourceControlRepositoryService from "./sourceControl/SourceControlRepositoryService.ts";
 import * as ServerSecretStore from "./auth/ServerSecretStore.ts";
-import * as AssetAccess from "./assets/AssetAccess.ts";
 import * as EnvironmentAuth from "./auth/EnvironmentAuth.ts";
 import { base64UrlDecodeUtf8, base64UrlEncode, signPayload } from "./auth/utils.ts";
 import * as CloudManagedEndpointRuntime from "./cloud/ManagedEndpointRuntime.ts";
@@ -142,6 +141,7 @@ import * as TraceDiagnostics from "./diagnostics/TraceDiagnostics.ts";
 import * as DeviceNotifications from "./notifications/DeviceNotifications.ts";
 import * as WorkerProcessIsolation from "./process/WorkerProcessIsolation.ts";
 import * as McpSessionRegistry from "./mcp/McpSessionRegistry.ts";
+import * as AssetAccess from "./assets/AssetAccess.ts";
 import { collectUint8StreamText } from "./stream/collectUint8StreamText.ts";
 import * as Data from "effect/Data";
 
@@ -823,6 +823,7 @@ const buildAppUnderTest = (options?: {
       dispatchCoordinated:
         options?.layers?.orchestrationEngine?.dispatchCoordinated ?? orchestrationDispatch,
       streamDomainEvents: Stream.empty,
+      latestSequence: Effect.succeed(0),
       ...options?.layers?.orchestrationEngine,
     });
     const worktreeLifecycleCoordinatorLayer = options?.layers?.worktreeLifecycleCoordinator
@@ -1951,26 +1952,6 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
         path.join(config.attachmentsDir, `${attachmentId}.bin`),
         sentinel("assets"),
       );
-      const configLayer = ServerConfig.layer(config);
-      const assetSetupLayer = Layer.mergeAll(
-        configLayer,
-        ServerSecretStore.layer.pipe(Layer.provide(configLayer)),
-        WorkspacePaths.layer,
-        ProjectFaviconResolver.layer.pipe(Layer.provide(WorkspacePaths.layer)),
-        Layer.mock(ProjectionSnapshotQuery.ProjectionSnapshotQuery)({
-          getCommandReadModel: () => Effect.succeed(makeDefaultOrchestrationReadModel()),
-        }),
-      ).pipe(Layer.provideMerge(NodeServices.layer));
-      const assetSurfaceSession = yield* issueAuthenticatedSurfaceSession;
-      const issuedAssetUrl = yield* AssetAccess.issueAssetUrl({
-        resource: { _tag: "attachment", attachmentId },
-        clientCapabilities: [ASSET_SAME_ORIGIN_RELAY_V1_CAPABILITY],
-        surfaceSessionId: assetSurfaceSession.sessionId,
-        surfaceSessionExpiresAt: assetSurfaceSession.expiresAt,
-      }).pipe(Effect.provide(assetSetupLayer));
-      const assetSurfaceCookie = yield* bindAssetSurfaceCredential(
-        issuedAssetUrl.surfaceCredential ?? "",
-      );
       const issuedMcpPeerToken = yield* McpSessionRegistry.issueActiveMcpPeerCredential({
         sourceEnvironmentId: EnvironmentId.make("environment-security-source"),
       });
@@ -1980,7 +1961,7 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
       }
 
       const ownerCookie = yield* getAuthenticatedSessionCookieHeader();
-      const wsUrl = yield* getWsServerUrl("/ws");
+      const wsUrl = appendSessionCookieToWsUrl(yield* getWsServerUrl("/ws"), ownerCookie);
       const authenticatedGet = (pathname: string) =>
         Effect.gen(function* () {
           const response = yield* fetchEffect(yield* getHttpServerUrl(pathname), {
@@ -1994,6 +1975,15 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
         });
       const rpc = <A, E, R>(f: (client: WsRpcClient) => Effect.Effect<A, E, R>) =>
         Effect.scoped(withWsRpcClient(wsUrl, f));
+      const issuedAssetUrl = yield* rpc((client) =>
+        client[WS_METHODS.assetsCreateUrl]({
+          resource: { _tag: "attachment", attachmentId },
+          capabilities: [ASSET_SAME_ORIGIN_RELAY_V1_CAPABILITY],
+        }),
+      );
+      const assetSurfaceCookie = yield* bindAssetSurfaceCredential(
+        issuedAssetUrl.surfaceCredential ?? "",
+      );
 
       const processProbe = Effect.gen(function* () {
         const isolation = yield* WorkerProcessIsolation.WorkerProcessIsolation;
@@ -2428,6 +2418,206 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
           ),
         ),
       );
+    }).pipe(Effect.provide(NodeHttpServer.layerTest), TestClock.withLive),
+  );
+
+  it.effect("binds private asset URLs to the issuing same-surface session", () =>
+    Effect.gen(function* () {
+      const fileSystem = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const orphanedThreadId = ThreadId.make("thread-asset-orphaned-project");
+      const orphanedProjectId = ProjectId.make("project-asset-orphaned");
+      const orphanedAttachmentId =
+        "thread-asset-orphaned-project-00000000-0000-4000-8000-000000000001";
+      const orphanedReadModel = makeDefaultOrchestrationReadModel();
+      const config = yield* buildAppUnderTest({
+        layers: {
+          projectionSnapshotQuery: {
+            getCommandReadModel: () =>
+              Effect.succeed({
+                ...orphanedReadModel,
+                projects: [],
+                threads: orphanedReadModel.threads.map((thread) => ({
+                  ...thread,
+                  id: orphanedThreadId,
+                  projectId: orphanedProjectId,
+                  dataAudience: "factory" as const,
+                })),
+              }),
+          },
+        },
+      });
+      const attachmentId = "asset-session-binding-integration";
+      yield* fileSystem.makeDirectory(config.attachmentsDir, { recursive: true });
+      yield* fileSystem.writeFileString(
+        path.join(config.attachmentsDir, `${attachmentId}.bin`),
+        "same-surface-private-asset",
+      );
+      yield* fileSystem.writeFileString(
+        path.join(config.attachmentsDir, `${orphanedAttachmentId}.bin`),
+        "orphaned-project-private-asset",
+      );
+
+      const issuerCookie = yield* getAuthenticatedSessionCookieHeader();
+      const otherCookie = yield* getAuthenticatedSessionCookieHeader();
+      const factoryPairingResponse = yield* fetchEffect(
+        yield* getHttpServerUrl("/api/auth/pairing-token"),
+        {
+          method: "POST",
+          headers: { cookie: issuerCookie, "content-type": "application/json" },
+          body: jsonRequestBody({ audienceCeiling: "factory" }),
+        },
+      );
+      assert.equal(factoryPairingResponse.status, 200);
+      const factoryPairing = yield* responseJsonEffect<{ readonly credential: string }>(
+        factoryPairingResponse,
+      );
+      const factoryCookie = yield* getAuthenticatedSessionCookieHeader(factoryPairing.credential);
+      assert.notEqual(issuerCookie, otherCookie);
+      const wsUrl = appendSessionCookieToWsUrl(
+        yield* getWsServerUrl("/ws", { authenticated: false }),
+        issuerCookie,
+      );
+      const rpc = <A, E, R>(f: (client: WsRpcClient) => Effect.Effect<A, E, R>) =>
+        Effect.scoped(withWsRpcClient(wsUrl, f));
+
+      const orphanedIssued = yield* rpc((client) =>
+        client[WS_METHODS.assetsCreateUrl]({
+          resource: { _tag: "attachment", attachmentId: orphanedAttachmentId },
+          capabilities: [ASSET_SAME_ORIGIN_RELAY_V1_CAPABILITY],
+        }),
+      );
+      const orphanedToken = orphanedIssued.relativeUrl.split("/").at(-2);
+      assert.isDefined(orphanedToken);
+      assert.deepInclude(AssetAccess.decodeAssetRelayRoutingClaim(orphanedToken ?? ""), {
+        dataAudience: "private",
+        issuingAudience: "private",
+      });
+
+      const legacyError = yield* rpc((client) =>
+        client[WS_METHODS.assetsCreateUrl]({
+          resource: { _tag: "attachment", attachmentId },
+        }).pipe(Effect.flip),
+      );
+      assert.equal(legacyError._tag, "AssetClientUpgradeRequiredError");
+      if (legacyError._tag !== "AssetClientUpgradeRequiredError") {
+        assert.fail(`Expected AssetClientUpgradeRequiredError, got ${legacyError._tag}`);
+      }
+      assert.equal(legacyError.requiredCapability, ASSET_SAME_ORIGIN_RELAY_V1_CAPABILITY);
+
+      const issued = yield* rpc((client) =>
+        client[WS_METHODS.assetsCreateUrl]({
+          resource: { _tag: "attachment", attachmentId },
+          capabilities: [ASSET_SAME_ORIGIN_RELAY_V1_CAPABILITY],
+        }),
+      );
+      assert.include(issued.relativeUrl, "/api/assets/relay/");
+      assert.isString(issued.surfaceCredential);
+      assert.notInclude(issued.relativeUrl, issued.surfaceCredential ?? "surface-credential");
+
+      const assetSurfaceCookie = yield* bindAssetSurfaceCredential(issued.surfaceCredential ?? "");
+      const assetUrl = yield* getHttpServerUrl(issued.relativeUrl);
+      const unboundResponse = yield* fetchEffect(assetUrl);
+      assert.equal(unboundResponse.status, 404);
+      const crossSurfaceResponse = yield* fetchEffect(assetUrl, {
+        headers: { cookie: otherCookie },
+      });
+      assert.equal(crossSurfaceResponse.status, 404);
+      const sameSurfaceResponse = yield* fetchEffect(assetUrl, {
+        headers: { cookie: assetSurfaceCookie },
+      });
+      assert.equal(sameSurfaceResponse.status, 200);
+      assert.equal(sameSurfaceResponse.headers["cache-control"], "no-store");
+      assert.equal(yield* sameSurfaceResponse.text, "same-surface-private-asset");
+
+      const nativeResponse = yield* fetchEffect(assetUrl, {
+        headers: { "x-t3-asset-surface": issued.surfaceCredential ?? "" },
+      });
+      assert.equal(nativeResponse.status, 200);
+      assert.equal(yield* nativeResponse.text, "same-surface-private-asset");
+
+      const appRelayPath = issued.relativeUrl.replace("/api/assets/relay/", "/_asset-relay/");
+      assert.notInclude(appRelayPath, issued.surfaceCredential ?? "surface-credential");
+      const unauthenticatedRelay = yield* fetchEffect(yield* getHttpServerUrl(appRelayPath));
+      assert.equal(unauthenticatedRelay.status, 404);
+      const sameSurfaceRelay = yield* fetchEffect(yield* getHttpServerUrl(appRelayPath), {
+        headers: { cookie: issuerCookie },
+        redirect: "manual",
+      });
+      const sameSurfaceRelayBody = yield* sameSurfaceRelay.text;
+      assert.equal(sameSurfaceRelay.status, 200, sameSurfaceRelayBody);
+      assert.equal(sameSurfaceRelay.headers["cache-control"], "no-store");
+      assert.isUndefined(sameSurfaceRelay.headers.location);
+      assert.isUndefined(sameSurfaceRelay.headers["set-cookie"]);
+      assert.equal(sameSurfaceRelayBody, "same-surface-private-asset");
+
+      const relaySourceToken = yield* getAuthenticatedBearerSessionToken();
+      const peerTokenResponse = yield* fetchEffect(yield* getHttpServerUrl("/api/mcp/peer-token"), {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${relaySourceToken}`,
+          "content-type": "application/json",
+        },
+        body: jsonRequestBody({ sourceEnvironmentId: "asset-relay-source" }),
+      });
+      assert.equal(peerTokenResponse.status, 200);
+      const peerToken = yield* responseJsonEffect<{ readonly token: string }>(peerTokenResponse);
+      const peerRelayResponse = yield* fetchEffect(yield* getHttpServerUrl(appRelayPath), {
+        headers: { authorization: `Bearer ${peerToken.token}` },
+      });
+      assert.equal(peerRelayResponse.status, 200);
+      assert.equal(yield* peerRelayResponse.text, "same-surface-private-asset");
+
+      const otherPrivateSurfaceRelay = yield* fetchEffect(yield* getHttpServerUrl(appRelayPath), {
+        headers: { cookie: otherCookie },
+      });
+      assert.equal(otherPrivateSurfaceRelay.status, 200);
+      assert.equal(yield* otherPrivateSurfaceRelay.text, "same-surface-private-asset");
+      const factorySurfaceRelay = yield* fetchEffect(yield* getHttpServerUrl(appRelayPath), {
+        headers: { cookie: factoryCookie },
+      });
+      assert.equal(factorySurfaceRelay.status, 404);
+
+      for (const origin of ["null", "not an origin"]) {
+        const nonHttpsBindingResponse = yield* fetchEffect(
+          yield* getHttpServerUrl("/api/assets/relay/surface"),
+          {
+            method: "POST",
+            redirect: "manual",
+            headers: { "content-type": "application/json", origin },
+            body: jsonRequestBody({
+              credential: issued.surfaceCredential,
+              redirect: issued.relativeUrl,
+            }),
+          },
+        );
+        assert.equal(nonHttpsBindingResponse.status, 303);
+        assert.equal(nonHttpsBindingResponse.headers.location, issued.relativeUrl);
+        const nonHttpsSurfaceCookie = nonHttpsBindingResponse.headers["set-cookie"];
+        assert.isString(nonHttpsSurfaceCookie);
+        assert.notInclude(nonHttpsSurfaceCookie ?? "", "Secure");
+      }
+
+      const bindingResponse = yield* fetchEffect(
+        yield* getHttpServerUrl("/api/assets/relay/surface"),
+        {
+          method: "POST",
+          redirect: "manual",
+          headers: { "content-type": "application/json" },
+          body: jsonRequestBody({
+            credential: issued.surfaceCredential,
+            redirect: issued.relativeUrl,
+          }),
+        },
+      );
+      assert.equal(bindingResponse.status, 303);
+      assert.equal(bindingResponse.headers.location, issued.relativeUrl);
+      const surfaceCookie = bindingResponse.headers["set-cookie"];
+      assert.isString(surfaceCookie);
+      assert.include(surfaceCookie ?? "", "HttpOnly");
+      assert.include(surfaceCookie ?? "", "SameSite=Lax");
+      assert.include(surfaceCookie ?? "", "Path=/api/assets/relay");
+      assert.notInclude((surfaceCookie ?? "").toLowerCase(), "domain=");
     }).pipe(Effect.provide(NodeHttpServer.layerTest), TestClock.withLive),
   );
 
@@ -5362,6 +5552,8 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
 
       assert.equal(response.environment.environmentId, testEnvironmentDescriptor.environmentId);
       assert.equal(response.auth.policy, "desktop-managed-local");
+      assert.equal(response.shellResumeCompletionMarker, true);
+      assert.equal(response.threadResumeCompletionMarker, true);
     }).pipe(Effect.provide(NodeHttpServer.layerTest)),
   );
 
@@ -6452,6 +6644,10 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
         ServerSecretStore.layer.pipe(Layer.provide(configLayer)),
         WorkspacePaths.layer,
         ProjectFaviconResolver.layer.pipe(Layer.provide(WorkspacePaths.layer)),
+        Layer.mock(ServerEnvironment.ServerEnvironment)({
+          getEnvironmentId: Effect.succeed(testEnvironmentDescriptor.environmentId),
+          getDescriptor: Effect.succeed(testEnvironmentDescriptor),
+        }),
         Layer.mock(ProjectionSnapshotQuery.ProjectionSnapshotQuery)({ getCommandReadModel }),
       ).pipe(Layer.provideMerge(NodeServices.layer));
       const ownerSurfaceSession = yield* issueAuthenticatedSurfaceSession;
@@ -6459,7 +6655,7 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
       const issuedAssetUrl = yield* AssetAccess.issueAssetUrl({
         resource: { _tag: "attachment", attachmentId },
         dataAudience: "private",
-        audienceCeiling: "private",
+        issuingAudience: "private",
         clientCapabilities: [ASSET_SAME_ORIGIN_RELAY_V1_CAPABILITY],
         surfaceSessionId: ownerSurfaceSession.sessionId,
         surfaceSessionExpiresAt: ownerSurfaceSession.expiresAt,
@@ -6467,7 +6663,7 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
       const otherSurfaceAssetUrl = yield* AssetAccess.issueAssetUrl({
         resource: { _tag: "attachment", attachmentId },
         dataAudience: "private",
-        audienceCeiling: "private",
+        issuingAudience: "private",
         clientCapabilities: [ASSET_SAME_ORIGIN_RELAY_V1_CAPABILITY],
         surfaceSessionId: otherSurfaceSession.sessionId,
         surfaceSessionExpiresAt: otherSurfaceSession.expiresAt,
@@ -6480,7 +6676,7 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
         },
         workspaceRoot,
         dataAudience: "private",
-        audienceCeiling: "private",
+        issuingAudience: "private",
         clientCapabilities: [ASSET_SAME_ORIGIN_RELAY_V1_CAPABILITY],
         surfaceSessionId: ownerSurfaceSession.sessionId,
         surfaceSessionExpiresAt: ownerSurfaceSession.expiresAt,
@@ -6488,7 +6684,7 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
       const factoryAssetUrl = yield* AssetAccess.issueAssetUrl({
         resource: { _tag: "attachment", attachmentId: factoryAttachmentId },
         dataAudience: "factory",
-        audienceCeiling: "factory",
+        issuingAudience: "factory",
       }).pipe(Effect.provide(assetSetupLayer));
       const staleWorkspaceAssetUrl = yield* AssetAccess.issueAssetUrl({
         resource: {
@@ -6498,7 +6694,7 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
         },
         workspaceRoot,
         dataAudience: "factory",
-        audienceCeiling: "factory",
+        issuingAudience: "factory",
       }).pipe(Effect.provide(assetSetupLayer));
       const signingSecret = yield* Effect.gen(function* () {
         const secretStore = yield* ServerSecretStore.ServerSecretStore;
@@ -6541,7 +6737,7 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
       );
       const invalidAudienceAssetUrl = rewriteSignedClaims(issuedAssetUrl.relativeUrl, (claims) => ({
         ...claims,
-        audienceCeiling: "factory",
+        issuingAudience: "factory",
       }));
       const invalidAssetUrl = issuedAssetUrl.relativeUrl.replace(/\.([^./]+)\//, ".$1x/");
       const rejectedDirectPrivateUrl = issuedAssetUrl.relativeUrl.replace(
@@ -6750,12 +6946,12 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
       const staleResponse = yield* fetchEffect(
         yield* getHttpServerUrl(staleWorkspaceAssetUrl.relativeUrl),
       );
-      assert.equal(staleResponse.status, 403);
+      assert.equal(staleResponse.status, 404);
       assert.notInclude(yield* staleResponse.text, "factory report");
       const staleAttachmentResponse = yield* fetchEffect(
         yield* getHttpServerUrl(factoryAssetUrl.relativeUrl),
       );
-      assert.equal(staleAttachmentResponse.status, 403);
+      assert.equal(staleAttachmentResponse.status, 404);
       assert.notInclude(yield* staleAttachmentResponse.text, "factory attachment");
     }).pipe(Effect.provide(NodeHttpServer.layerTest), TestClock.withLive),
   );
@@ -6809,6 +7005,10 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
         ServerSecretStore.layer.pipe(Layer.provide(configLayer)),
         WorkspacePaths.layer,
         ProjectFaviconResolver.layer.pipe(Layer.provide(WorkspacePaths.layer)),
+        Layer.mock(ServerEnvironment.ServerEnvironment)({
+          getEnvironmentId: Effect.succeed(testEnvironmentDescriptor.environmentId),
+          getDescriptor: Effect.succeed(testEnvironmentDescriptor),
+        }),
         Layer.mock(ProjectionSnapshotQuery.ProjectionSnapshotQuery)({ getCommandReadModel }),
       ).pipe(Layer.provideMerge(NodeServices.layer));
       const error = yield* AssetAccess.issueAssetUrl({
@@ -6819,7 +7019,7 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
         },
         workspaceRoot: factoryRoot,
         dataAudience: factoryThread.dataAudience,
-        audienceCeiling: "factory",
+        issuingAudience: "factory",
       }).pipe(Effect.provide(assetLayer), Effect.flip);
 
       assert.equal(error._tag, "AssetWorkspaceContextNotFoundError");
@@ -7766,6 +7966,7 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
         layers: {
           projectionSnapshotQuery: {
             getSnapshot: () => Effect.succeed(snapshot),
+            getCommandReadModel: () => Effect.succeed(snapshot),
           },
           orchestrationEngine: {
             dispatch: () => Effect.succeed({ sequence: 7 }),
@@ -8728,6 +8929,24 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
     }).pipe(Effect.provide(NodeHttpServer.layerTest)),
   );
 
+  it.effect("marks a missing thread subscription as terminal not-found", () =>
+    Effect.gen(function* () {
+      yield* buildAppUnderTest();
+      const wsUrl = yield* getWsServerUrl("/ws");
+      const result = yield* Effect.scoped(
+        withWsRpcClient(wsUrl, (client) =>
+          client[ORCHESTRATION_WS_METHODS.subscribeThread]({
+            threadId: ThreadId.make("missing-thread"),
+          }).pipe(Stream.runCollect),
+        ).pipe(Effect.result),
+      );
+
+      assertTrue(result._tag === "Failure");
+      assertTrue(result.failure._tag === "OrchestrationGetSnapshotError");
+      assert.equal(result.failure.reason, "not-found");
+    }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+
   it.effect("serves an authoritative thread snapshot for epoch or backwards-cursor mismatch", () =>
     Effect.gen(function* () {
       const storageEpoch = "restored-storage-epoch";
@@ -9286,33 +9505,38 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
     }).pipe(Effect.provide(NodeHttpServer.layerTest)),
   );
 
-  it.effect("serves a fresh shell snapshot instead of replaying an ancient cursor", () =>
+  it.effect("marks an empty shell catch-up replay as synchronized when requested", () =>
     Effect.gen(function* () {
-      const snapshot = {
-        snapshotSequence: 2_500,
-        projects: [],
-        threads: [
-          makeDefaultOrchestrationThreadShell({
-            id: ThreadId.make("thread-fresh-shell"),
-            title: "Fresh shell thread",
-          }),
-        ],
-        updatedAt: "2026-07-08T16:00:00.000Z",
-      };
-      let readEventsCalled = false;
+      yield* buildAppUnderTest({
+        layers: {
+          orchestrationEngine: {
+            readEvents: () => Stream.empty,
+          },
+        },
+      });
 
+      const wsUrl = yield* getWsServerUrl("/ws");
+      const firstItem = yield* Effect.scoped(
+        withWsRpcClient(wsUrl, (client) =>
+          client[ORCHESTRATION_WS_METHODS.subscribeShell]({
+            afterSequence: 0,
+            requestCompletionMarker: true,
+          }).pipe(Stream.runHead),
+        ),
+      );
+
+      assert.deepEqual(Option.getOrThrow(firstItem), { kind: "synchronized" });
+    }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+
+  it.effect("marks a socket thread snapshot as synchronized when requested", () =>
+    Effect.gen(function* () {
+      const thread = makeDefaultOrchestrationReadModel().threads[0]!;
       yield* buildAppUnderTest({
         layers: {
           projectionSnapshotQuery: {
-            getSnapshotSequence: () =>
-              Effect.succeed({ snapshotSequence: snapshot.snapshotSequence }),
-            getShellSnapshot: () => Effect.succeed(snapshot),
-          },
-          orchestrationEngine: {
-            readEvents: () => {
-              readEventsCalled = true;
-              return Stream.empty;
-            },
+            getThreadDetailSnapshot: () =>
+              Effect.succeed(Option.some({ snapshotSequence: 1, thread })),
           },
         },
       });
@@ -9320,84 +9544,289 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
       const wsUrl = yield* getWsServerUrl("/ws");
       const items = yield* Effect.scoped(
         withWsRpcClient(wsUrl, (client) =>
-          client[ORCHESTRATION_WS_METHODS.subscribeShell]({ afterSequence: 1 }).pipe(
-            Stream.take(1),
-            Stream.runCollect,
-          ),
+          client[ORCHESTRATION_WS_METHODS.subscribeThread]({
+            threadId: defaultThreadId,
+            requestCompletionMarker: true,
+          }).pipe(Stream.take(2), Stream.runCollect),
         ),
       );
 
-      assert.deepEqual(Array.from(items), [{ kind: "snapshot", snapshot }]);
-      assert.equal(readEventsCalled, false);
+      assert.equal(items[0]?.kind, "snapshot");
+      assert.deepEqual(items[1], { kind: "synchronized" });
     }).pipe(Effect.provide(NodeHttpServer.layerTest)),
   );
 
-  it.effect("acknowledges an up-to-date shell replay with no emitted events", () =>
+  it.effect("buffers shell events published while the fallback snapshot loads", () =>
     Effect.gen(function* () {
-      let shellSnapshotCalled = false;
+      const liveEvents = yield* PubSub.unbounded<OrchestrationEvent>();
+      const deletedEvent = {
+        sequence: 2,
+        eventId: EventId.make("event-shell-thread-deleted"),
+        aggregateKind: "thread",
+        aggregateId: defaultThreadId,
+        occurredAt: "2026-01-01T00:00:01.000Z",
+        commandId: null,
+        causationEventId: null,
+        correlationId: null,
+        metadata: {},
+        type: "thread.deleted",
+        payload: {
+          threadId: defaultThreadId,
+          deletedAt: "2026-01-01T00:00:01.000Z",
+        },
+      } satisfies Extract<OrchestrationEvent, { type: "thread.deleted" }>;
 
       yield* buildAppUnderTest({
         layers: {
+          orchestrationEngine: {
+            streamDomainEvents: Stream.fromPubSub(liveEvents),
+          },
           projectionSnapshotQuery: {
-            getSnapshotSequence: () => Effect.succeed({ snapshotSequence: 2_500 }),
-            getShellSnapshot: () => {
-              shellSnapshotCalled = true;
-              return Effect.succeed({
-                snapshotSequence: 2_500,
+            getShellSnapshot: () =>
+              Effect.gen(function* () {
+                yield* PubSub.publish(liveEvents, deletedEvent);
+                return {
+                  snapshotSequence: 1,
+                  projects: [],
+                  threads: [makeDefaultOrchestrationThreadShell()],
+                  updatedAt: "2026-01-01T00:00:00.000Z",
+                };
+              }),
+          },
+        },
+      });
+
+      const wsUrl = yield* getWsServerUrl("/ws");
+      const items = yield* Effect.scoped(
+        withWsRpcClient(wsUrl, (client) =>
+          client[ORCHESTRATION_WS_METHODS.subscribeShell]({
+            requestCompletionMarker: true,
+          }).pipe(Stream.take(3), Stream.runCollect),
+        ),
+      ).pipe(Effect.timeout("2 seconds"));
+
+      assert.equal(items[0]?.kind, "snapshot");
+      assert.equal(items[1]?.kind, "thread-removed");
+      assert.deepEqual(items[2], { kind: "synchronized" });
+    }).pipe(Effect.provide(NodeHttpServer.layerTest), TestClock.withLive),
+  );
+  it.effect("buffers thread events published while the initial snapshot loads", () =>
+    Effect.gen(function* () {
+      const thread = makeDefaultOrchestrationReadModel().threads[0]!;
+      const liveEvents = yield* PubSub.unbounded<OrchestrationEvent>();
+      const messageEvent = {
+        sequence: 2,
+        eventId: EventId.make("event-message"),
+        aggregateKind: "thread",
+        aggregateId: defaultThreadId,
+        occurredAt: "2026-01-01T00:00:01.000Z",
+        commandId: null,
+        causationEventId: null,
+        correlationId: null,
+        metadata: {},
+        type: "thread.message-sent",
+        payload: {
+          threadId: defaultThreadId,
+          messageId: MessageId.make("message-1"),
+          role: "user",
+          text: "First message",
+          turnId: null,
+          streaming: false,
+          createdAt: "2026-01-01T00:00:01.000Z",
+          updatedAt: "2026-01-01T00:00:01.000Z",
+        },
+      } satisfies Extract<OrchestrationEvent, { type: "thread.message-sent" }>;
+
+      yield* buildAppUnderTest({
+        layers: {
+          orchestrationEngine: {
+            streamDomainEvents: Stream.fromPubSub(liveEvents),
+          },
+          projectionSnapshotQuery: {
+            getThreadDetailSnapshot: () =>
+              Effect.gen(function* () {
+                yield* Effect.sleep("25 millis");
+                yield* PubSub.publish(liveEvents, messageEvent);
+                return Option.some({ snapshotSequence: 1, thread });
+              }),
+          },
+        },
+      });
+
+      const wsUrl = yield* getWsServerUrl("/ws");
+      const items = yield* Effect.scoped(
+        withWsRpcClient(wsUrl, (client) =>
+          client[ORCHESTRATION_WS_METHODS.subscribeThread]({
+            threadId: defaultThreadId,
+          }).pipe(Stream.take(2), Stream.runCollect),
+        ),
+      ).pipe(Effect.timeout("2 seconds"));
+
+      assert.equal(items[0]?.kind, "snapshot");
+      assert.equal(items[1]?.kind, "event");
+      assert.equal(items[1]?.kind === "event" ? items[1].event.sequence : null, 2);
+    }).pipe(Effect.provide(NodeHttpServer.layerTest), TestClock.withLive),
+  );
+
+  it.effect("subscribeShell sends a fresh snapshot instead of replaying a large gap", () =>
+    Effect.gen(function* () {
+      let readEventsCalls = 0;
+      const snapshotThreadId = ThreadId.make("thread-from-snapshot");
+      const now = "2026-01-01T00:00:00.000Z";
+
+      yield* buildAppUnderTest({
+        layers: {
+          orchestrationEngine: {
+            // Head is far ahead of the client's afterSequence (gap > 1000).
+            latestSequence: Effect.succeed(100_000),
+            readEvents: () =>
+              Stream.sync(() => {
+                readEventsCalls += 1;
+                return {
+                  sequence: 1,
+                  eventId: EventId.make("event-should-not-be-read"),
+                  aggregateKind: "thread",
+                  aggregateId: snapshotThreadId,
+                  occurredAt: now,
+                  commandId: null,
+                  causationEventId: null,
+                  correlationId: null,
+                  metadata: {},
+                  type: "thread.created",
+                  payload: {} as never,
+                } satisfies OrchestrationEvent;
+              }),
+          },
+          projectionSnapshotQuery: {
+            getShellSnapshot: () =>
+              Effect.succeed({
+                snapshotSequence: 100_000,
+                projects: [],
+                threads: [makeDefaultOrchestrationThreadShell({ id: snapshotThreadId })],
+                updatedAt: now,
+              }),
+          },
+        },
+      });
+
+      const wsUrl = yield* getWsServerUrl("/ws");
+      const items = yield* Effect.scoped(
+        withWsRpcClient(wsUrl, (client) =>
+          client[ORCHESTRATION_WS_METHODS.subscribeShell]({
+            afterSequence: 5,
+            requestCompletionMarker: true,
+          }).pipe(Stream.take(2), Stream.runCollect),
+        ),
+      );
+
+      const [first, second] = Array.from(items);
+      // Large gap => fresh snapshot, and the unbounded replay is never started.
+      assert.equal(first?.kind, "snapshot");
+      if (first?.kind === "snapshot") {
+        assert.equal(first.snapshot.threads[0]?.id, snapshotThreadId);
+      }
+      assert.equal(second?.kind, "synchronized");
+      assert.equal(readEventsCalls, 0);
+    }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+
+  it.effect("subscribeShell replaces a cursor ahead of the authoritative head", () =>
+    Effect.gen(function* () {
+      let readEventsCalls = 0;
+
+      yield* buildAppUnderTest({
+        layers: {
+          orchestrationEngine: {
+            latestSequence: Effect.succeed(5),
+            readEvents: () =>
+              Stream.sync(() => {
+                readEventsCalls += 1;
+                return {} as OrchestrationEvent;
+              }),
+          },
+          projectionSnapshotQuery: {
+            getShellSnapshot: () =>
+              Effect.succeed({
+                snapshotSequence: 5,
                 projects: [],
                 threads: [],
-                updatedAt: "2026-07-08T16:00:00.000Z",
-              });
-            },
-          },
-          orchestrationEngine: {
-            readEvents: () => Stream.empty,
+                updatedAt: "2026-01-01T00:00:00.000Z",
+              }),
           },
         },
       });
 
       const wsUrl = yield* getWsServerUrl("/ws");
-      const items = yield* Effect.scoped(
+      const first = yield* Effect.scoped(
         withWsRpcClient(wsUrl, (client) =>
-          client[ORCHESTRATION_WS_METHODS.subscribeShell]({ afterSequence: 2_499 }).pipe(
-            Stream.take(1),
-            Stream.runCollect,
+          client[ORCHESTRATION_WS_METHODS.subscribeShell]({ afterSequence: 10 }).pipe(
+            Stream.runHead,
           ),
         ),
       );
 
-      assert.deepEqual(Array.from(items), [{ kind: "caught-up", sequence: 2_500 }]);
-      assert.equal(shellSnapshotCalled, false);
+      assert.equal(Option.getOrThrow(first).kind, "snapshot");
+      assert.equal(readEventsCalls, 0);
     }).pipe(Effect.provide(NodeHttpServer.layerTest)),
   );
 
-  it.effect("serves an authoritative shell snapshot when the client cursor is ahead", () =>
+  it.effect("subscribeShell coalesces a per-thread burst without stalling other threads", () =>
     Effect.gen(function* () {
-      const snapshot = {
-        snapshotSequence: 25,
-        projects: [],
-        threads: [
-          makeDefaultOrchestrationThreadShell({
-            id: ThreadId.make("thread-reset-shell"),
-            title: "Reset shell thread",
-          }),
-        ],
-        updatedAt: "2026-07-08T16:00:00.000Z",
+      const busyThreadId = ThreadId.make("thread-busy");
+      const newThreadId = ThreadId.make("thread-new");
+      const now = "2026-01-01T00:00:00.000Z";
+      const shellFetches: Array<string> = [];
+      let replayLimit: number | undefined;
+
+      const messageEvent = (sequence: number): OrchestrationEvent =>
+        ({
+          sequence,
+          eventId: EventId.make(`event-${sequence}`),
+          aggregateKind: "thread",
+          aggregateId: busyThreadId,
+          occurredAt: now,
+          commandId: null,
+          causationEventId: null,
+          correlationId: null,
+          metadata: {},
+          type: "thread.message-sent",
+          payload: {} as never,
+        }) satisfies OrchestrationEvent;
+
+      const createdEvent: OrchestrationEvent = {
+        sequence: 50,
+        eventId: EventId.make("event-created"),
+        aggregateKind: "thread",
+        aggregateId: newThreadId,
+        occurredAt: now,
+        commandId: null,
+        causationEventId: null,
+        correlationId: null,
+        metadata: {},
+        type: "thread.created",
+        payload: {} as never,
       };
-      let readEventsCalled = false;
 
       yield* buildAppUnderTest({
         layers: {
-          projectionSnapshotQuery: {
-            getSnapshotSequence: () =>
-              Effect.succeed({ snapshotSequence: snapshot.snapshotSequence }),
-            getShellSnapshot: () => Effect.succeed(snapshot),
-          },
           orchestrationEngine: {
-            readEvents: () => {
-              readEventsCalled = true;
-              return Stream.empty;
+            latestSequence: Effect.succeed(50),
+            // A burst of message-sent deltas for the busy thread, plus one
+            // thread.created for a different thread, all within one batch.
+            readEvents: (_afterSequence, limit) => {
+              replayLimit = limit;
+              return Stream.fromIterable([
+                ...Array.from({ length: 20 }, (_unused, index) => messageEvent(index + 1)),
+                createdEvent,
+              ]);
             },
+          },
+          projectionSnapshotQuery: {
+            getThreadShellById: (threadId) =>
+              Effect.sync(() => {
+                shellFetches.push(threadId);
+                return Option.some(makeDefaultOrchestrationThreadShell({ id: threadId }));
+              }),
           },
         },
       });
@@ -9405,132 +9834,304 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
       const wsUrl = yield* getWsServerUrl("/ws");
       const items = yield* Effect.scoped(
         withWsRpcClient(wsUrl, (client) =>
-          client[ORCHESTRATION_WS_METHODS.subscribeShell]({ afterSequence: 250 }).pipe(
-            Stream.take(1),
-            Stream.runCollect,
-          ),
+          client[ORCHESTRATION_WS_METHODS.subscribeShell]({
+            afterSequence: 0,
+            requestCompletionMarker: true,
+          }).pipe(Stream.take(3), Stream.runCollect),
         ),
       );
 
-      assert.deepEqual(Array.from(items), [{ kind: "snapshot", snapshot, force: true }]);
-      assert.equal(readEventsCalled, false);
+      const collected = Array.from(items);
+      const upsertedIds = collected.flatMap((item) =>
+        item.kind === "thread-upserted" ? [item.thread.id] : [],
+      );
+      // Both threads surface, and the busy thread's 20-event burst collapses to
+      // a single shell refetch (not 20). The new thread is not stuck behind it.
+      assert.include(upsertedIds, busyThreadId);
+      assert.include(upsertedIds, newThreadId);
+      assert.equal(collected[2]?.kind, "synchronized");
+      assert.equal(shellFetches.filter((id) => id === busyThreadId).length, 1);
+      assert.equal(replayLimit, 50);
     }).pipe(Effect.provide(NodeHttpServer.layerTest)),
   );
 
-  it.effect("fails shell replay instead of acknowledging dropped projection lookups", () =>
+  it.effect("subscribeShell coalesces live bursts after the synchronization marker", () =>
     Effect.gen(function* () {
-      const projectionError = new PersistenceSqlError({
-        operation: "ProjectionSnapshotQuery.getProjectShellById:test",
-        detail: "failed to read replayed project shell",
-      });
+      const busyThreadId = ThreadId.make("thread-live-busy");
+      const newThreadId = ThreadId.make("thread-live-new");
+      const now = "2026-01-01T00:00:00.000Z";
+      const liveEvents = yield* PubSub.unbounded<OrchestrationEvent>();
+      const synchronized = yield* Deferred.make<void>();
+      const shellFetches: Array<string> = [];
+      const observedLiveThreadIds = new Set<string>();
+
+      const messageEvent = (sequence: number): OrchestrationEvent =>
+        ({
+          sequence,
+          eventId: EventId.make(`event-live-${sequence}`),
+          aggregateKind: "thread",
+          aggregateId: busyThreadId,
+          occurredAt: now,
+          commandId: null,
+          causationEventId: null,
+          correlationId: null,
+          metadata: {},
+          type: "thread.message-sent",
+          payload: {} as never,
+        }) satisfies OrchestrationEvent;
+
+      const createdEvent: OrchestrationEvent = {
+        sequence: 50,
+        eventId: EventId.make("event-live-created"),
+        aggregateKind: "thread",
+        aggregateId: newThreadId,
+        occurredAt: now,
+        commandId: null,
+        causationEventId: null,
+        correlationId: null,
+        metadata: {},
+        type: "thread.created",
+        payload: {} as never,
+      };
 
       yield* buildAppUnderTest({
         layers: {
-          projectionSnapshotQuery: {
-            getSnapshotSequence: () => Effect.succeed({ snapshotSequence: 1 }),
-            getProjectShellById: () => Effect.fail(projectionError),
-          },
           orchestrationEngine: {
-            readEvents: () =>
-              Stream.make({
-                sequence: 1,
-                eventId: EventId.make("event-shell-projection-failure"),
-                aggregateKind: "project",
-                aggregateId: defaultProjectId,
-                occurredAt: "2026-04-05T00:00:00.000Z",
-                commandId: null,
-                causationEventId: null,
-                correlationId: null,
-                metadata: {},
-                type: "project.created",
-                payload: {
-                  projectId: defaultProjectId,
-                  title: "Default Project",
-                  workspaceRoot: "/tmp/default-project",
-                  dataAudience: "private",
-                  defaultModelSelection,
-                  scripts: [],
-                  createdAt: "2026-04-05T00:00:00.000Z",
-                  updatedAt: "2026-04-05T00:00:00.000Z",
-                },
-              } satisfies Extract<OrchestrationEvent, { type: "project.created" }>),
+            streamDomainEvents: Stream.fromPubSub(liveEvents),
+          },
+          projectionSnapshotQuery: {
+            getThreadShellById: (threadId) =>
+              Effect.sync(() => {
+                shellFetches.push(threadId);
+                return Option.some(makeDefaultOrchestrationThreadShell({ id: threadId }));
+              }),
           },
         },
       });
 
       const wsUrl = yield* getWsServerUrl("/ws");
-      const result = yield* Effect.scoped(
+      const items = yield* Effect.scoped(
+        Effect.gen(function* () {
+          const itemsFiber = yield* withWsRpcClient(wsUrl, (client) =>
+            client[ORCHESTRATION_WS_METHODS.subscribeShell]({
+              requestCompletionMarker: true,
+            }).pipe(
+              Stream.tap((item) =>
+                item.kind === "synchronized"
+                  ? Deferred.succeed(synchronized, undefined).pipe(Effect.ignore)
+                  : Effect.void,
+              ),
+              Stream.takeUntil((item) => {
+                if (item.kind === "thread-upserted") {
+                  observedLiveThreadIds.add(item.thread.id);
+                }
+                return (
+                  observedLiveThreadIds.has(busyThreadId) && observedLiveThreadIds.has(newThreadId)
+                );
+              }),
+              Stream.runCollect,
+            ),
+          ).pipe(Effect.forkScoped);
+
+          yield* Deferred.await(synchronized);
+          for (const event of [
+            ...Array.from({ length: 20 }, (_unused, index) => messageEvent(index + 1)),
+            createdEvent,
+          ]) {
+            yield* PubSub.publish(liveEvents, event);
+          }
+
+          return yield* Fiber.join(itemsFiber);
+        }),
+      ).pipe(Effect.timeout("2 seconds"));
+
+      assert.equal(items[0]?.kind, "snapshot");
+      assert.equal(items[1]?.kind, "synchronized");
+      const liveUpsertedIds = Array.from(items)
+        .slice(2)
+        .flatMap((item) => (item.kind === "thread-upserted" ? [item.thread.id] : []));
+      assert.include(liveUpsertedIds, busyThreadId);
+      assert.include(liveUpsertedIds, newThreadId);
+      assert.isBelow(shellFetches.filter((id) => id === busyThreadId).length, 20);
+    }).pipe(Effect.provide(NodeHttpServer.layerTest), TestClock.withLive),
+  );
+
+  it.effect("subscribeShell coalescing still emits a removal for a deleted thread", () =>
+    Effect.gen(function* () {
+      const goneThreadId = ThreadId.make("thread-gone");
+      const now = "2026-01-01T00:00:00.000Z";
+
+      const makeThreadEvent = (
+        sequence: number,
+        type: "thread.deleted" | "thread.message-sent",
+      ): OrchestrationEvent =>
+        ({
+          sequence,
+          eventId: EventId.make(`event-${sequence}`),
+          aggregateKind: "thread",
+          aggregateId: goneThreadId,
+          occurredAt: now,
+          commandId: null,
+          causationEventId: null,
+          correlationId: null,
+          metadata: {},
+          type,
+          payload: type === "thread.deleted" ? { threadId: goneThreadId, deletedAt: now } : {},
+        }) as OrchestrationEvent;
+
+      yield* buildAppUnderTest({
+        layers: {
+          orchestrationEngine: {
+            latestSequence: Effect.succeed(2),
+            // A thread.deleted followed, within the same coalescing window, by a
+            // later refetchable event for the same thread. The later event wins
+            // coalescing; its shell refetch returns none (the row is gone), which
+            // must still surface a removal rather than be swallowed.
+            readEvents: () =>
+              Stream.fromIterable([
+                makeThreadEvent(1, "thread.deleted"),
+                makeThreadEvent(2, "thread.message-sent"),
+              ]),
+          },
+          projectionSnapshotQuery: {
+            getThreadShellById: () => Effect.succeed(Option.none()),
+          },
+        },
+      });
+
+      const wsUrl = yield* getWsServerUrl("/ws");
+      const items = yield* Effect.scoped(
         withWsRpcClient(wsUrl, (client) =>
           client[ORCHESTRATION_WS_METHODS.subscribeShell]({ afterSequence: 0 }).pipe(
+            Stream.take(1),
             Stream.runCollect,
           ),
-        ).pipe(Effect.result),
+        ),
       );
 
-      assertTrue(result._tag === "Failure");
-      assertTrue(result.failure._tag === "OrchestrationGetSnapshotError");
-      assert.include(result.failure.message, "Failed to load orchestration project shell");
+      const [first] = Array.from(items);
+      assert.equal(first?.kind, "thread-removed");
+      assert.equal(first?.kind === "thread-removed" ? first.threadId : null, goneThreadId);
     }).pipe(Effect.provide(NodeHttpServer.layerTest)),
   );
 
-  it.effect("propagates live shell projection failures from the replay buffer", () =>
+  it.effect("subscribeShell retries a transient shell projection refetch failure", () =>
     Effect.gen(function* () {
-      const liveEvents = yield* Queue.unbounded<OrchestrationEvent>();
-      const projectionError = new PersistenceSqlError({
-        operation: "ProjectionSnapshotQuery.getProjectShellById:live",
-        detail: "failed to read live project shell",
-      });
+      const threadId = ThreadId.make("thread-transient-refetch");
+      const now = "2026-01-01T00:00:00.000Z";
+      let attempts = 0;
+
+      const event: OrchestrationEvent = {
+        sequence: 1,
+        eventId: EventId.make("event-transient-refetch"),
+        aggregateKind: "thread",
+        aggregateId: threadId,
+        occurredAt: now,
+        commandId: null,
+        causationEventId: null,
+        correlationId: null,
+        metadata: {},
+        type: "thread.message-sent",
+        payload: {} as never,
+      };
 
       yield* buildAppUnderTest({
         layers: {
-          projectionSnapshotQuery: {
-            getSnapshotSequence: () => Effect.succeed({ snapshotSequence: 1 }),
-            getProjectShellById: () => Effect.fail(projectionError),
-          },
           orchestrationEngine: {
-            readEvents: () => Stream.empty,
-            streamDomainEvents: Stream.fromQueue(liveEvents),
+            latestSequence: Effect.succeed(1),
+            readEvents: () => Stream.make(event),
+          },
+          projectionSnapshotQuery: {
+            getThreadShellById: () =>
+              Effect.suspend(() => {
+                attempts += 1;
+                return attempts === 1
+                  ? Effect.fail(
+                      new PersistenceSqlError({
+                        operation: "test.shell-refetch",
+                        detail: "transient failure",
+                      }),
+                    )
+                  : Effect.succeed(
+                      Option.some(makeDefaultOrchestrationThreadShell({ id: threadId })),
+                    );
+              }),
           },
         },
       });
 
       const wsUrl = yield* getWsServerUrl("/ws");
-      const result = yield* Effect.scoped(
+      const items = yield* Effect.scoped(
         withWsRpcClient(wsUrl, (client) =>
-          Effect.gen(function* () {
-            const fiber = yield* client[ORCHESTRATION_WS_METHODS.subscribeShell]({
-              afterSequence: 1,
-            }).pipe(Stream.runCollect, Effect.result, Effect.forkScoped);
-            yield* Queue.offer(liveEvents, {
-              sequence: 2,
-              eventId: EventId.make("event-live-shell-projection-failure"),
-              aggregateKind: "project",
-              aggregateId: defaultProjectId,
-              occurredAt: "2026-04-05T00:00:00.000Z",
-              commandId: null,
-              causationEventId: null,
-              correlationId: null,
-              metadata: {},
-              type: "project.created",
-              payload: {
-                projectId: defaultProjectId,
-                title: "Default Project",
-                workspaceRoot: "/tmp/default-project",
-                dataAudience: "private",
-                defaultModelSelection,
-                scripts: [],
-                createdAt: "2026-04-05T00:00:00.000Z",
-                updatedAt: "2026-04-05T00:00:00.000Z",
-              },
-            } satisfies Extract<OrchestrationEvent, { type: "project.created" }>);
-            return yield* Fiber.join(fiber);
-          }),
+          client[ORCHESTRATION_WS_METHODS.subscribeShell]({ afterSequence: 0 }).pipe(
+            Stream.take(1),
+            Stream.runCollect,
+          ),
         ),
       );
 
-      assertTrue(result._tag === "Failure");
-      assertTrue(result.failure._tag === "OrchestrationGetSnapshotError");
-      assert.include(result.failure.message, "Failed to load orchestration project shell");
+      const [first] = Array.from(items);
+      assert.equal(first?.kind, "thread-upserted");
+      assert.equal(first?.kind === "thread-upserted" ? first.thread.id : null, threadId);
+      assert.equal(attempts, 2);
+    }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+
+  it.effect("subscribeShell coalescing still removes a project after a trailing update", () =>
+    Effect.gen(function* () {
+      const projectId = ProjectId.make("project-gone");
+      const now = "2026-01-01T00:00:00.000Z";
+
+      const makeProjectEvent = (
+        sequence: number,
+        type: "project.deleted" | "project.meta-updated",
+      ): OrchestrationEvent =>
+        ({
+          sequence,
+          eventId: EventId.make(`event-project-${sequence}`),
+          aggregateKind: "project",
+          aggregateId: projectId,
+          occurredAt: now,
+          commandId: null,
+          causationEventId: null,
+          correlationId: null,
+          metadata: {},
+          type,
+          payload:
+            type === "project.deleted"
+              ? { projectId, deletedAt: now }
+              : { projectId, title: "Still deleted", updatedAt: now },
+        }) as OrchestrationEvent;
+
+      yield* buildAppUnderTest({
+        layers: {
+          orchestrationEngine: {
+            latestSequence: Effect.succeed(2),
+            readEvents: () =>
+              Stream.fromIterable([
+                makeProjectEvent(1, "project.deleted"),
+                makeProjectEvent(2, "project.meta-updated"),
+              ]),
+          },
+          projectionSnapshotQuery: {
+            getProjectShellById: () => Effect.succeed(Option.none()),
+          },
+        },
+      });
+
+      const wsUrl = yield* getWsServerUrl("/ws");
+      const items = yield* Effect.scoped(
+        withWsRpcClient(wsUrl, (client) =>
+          client[ORCHESTRATION_WS_METHODS.subscribeShell]({ afterSequence: 0 }).pipe(
+            Stream.take(1),
+            Stream.runCollect,
+          ),
+        ),
+      );
+
+      const [first] = Array.from(items);
+      assert.equal(first?.kind, "project-removed");
+      assert.equal(first?.kind === "project-removed" ? first.projectId : null, projectId);
     }).pipe(Effect.provide(NodeHttpServer.layerTest)),
   );
 
@@ -9605,11 +10206,21 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
   it.effect("dispatches archive without transport-scoped cleanup", () =>
     Effect.gen(function* () {
       const threadId = ThreadId.make("thread-archive");
+      const baseReadModel = makeDefaultOrchestrationReadModel();
+      const commandReadModel = {
+        ...baseReadModel,
+        threads: baseReadModel.threads.map((thread, index) =>
+          index === 0 ? { ...thread, id: threadId } : thread,
+        ),
+      };
       const effects: string[] = [];
       const dispatchedCommands: Array<OrchestrationCommand> = [];
 
       yield* buildAppUnderTest({
         layers: {
+          projectionSnapshotQuery: {
+            getCommandReadModel: () => Effect.succeed(commandReadModel),
+          },
           terminalManager: {
             close: (input) =>
               Effect.sync(() => {
@@ -10079,6 +10690,14 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
           >[0],
         ) => Effect.die(new Error("unexpected setup script")),
       );
+      const baseReadModel = makeDefaultOrchestrationReadModel();
+      const receiptThread = {
+        ...baseReadModel.threads[0]!,
+        id: threadId,
+        projectId: defaultProjectId,
+        createdAt,
+        updatedAt: createdAt,
+      };
 
       yield* buildAppUnderTest({
         layers: {
@@ -10087,6 +10706,13 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
           },
           projectSetupScriptRunner: {
             runForThread,
+          },
+          projectionSnapshotQuery: {
+            getCommandReadModel: () =>
+              Effect.succeed({
+                ...baseReadModel,
+                threads: [receiptThread],
+              }),
           },
           orchestrationCommandReceiptRepository: {
             getByCommandId: (input) =>
@@ -10436,6 +11062,11 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
             createWorktree,
           },
           projectionSnapshotQuery: {
+            getCommandReadModel: () =>
+              Effect.succeed({
+                ...makeDefaultOrchestrationReadModel(),
+                threads: [existingThread],
+              }),
             getThreadDetailById: (candidateThreadId) =>
               Effect.succeed(
                 candidateThreadId === threadId ? Option.some(existingThread) : Option.none(),

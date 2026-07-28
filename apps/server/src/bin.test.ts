@@ -10,12 +10,17 @@ import * as NodeServices from "@effect/platform-node/NodeServices";
 import {
   AuthProjectAudienceAdminScope,
   AuthStandardClientScopes,
+  CommandId,
   EnvironmentOrchestrationHttpApi,
   ProjectId,
+  ProviderInstanceId,
+  ThreadId,
 } from "@t3tools/contracts";
 import * as NetService from "@t3tools/shared/Net";
 import { assert, it } from "@effect/vitest";
+import * as ConfigProvider from "effect/ConfigProvider";
 import * as Effect from "effect/Effect";
+import * as DateTime from "effect/DateTime";
 import * as Layer from "effect/Layer";
 import * as Stream from "effect/Stream";
 import { FetchHttpClient } from "effect/unstable/http";
@@ -31,7 +36,9 @@ import { Command } from "effect/unstable/cli";
 import { cli, makeCli } from "./bin.ts";
 import * as ServerConfig from "./config.ts";
 import * as ProjectionSnapshotQuery from "./orchestration/Services/ProjectionSnapshotQuery.ts";
+import * as OrchestrationEngine from "./orchestration/Services/OrchestrationEngine.ts";
 import { OrchestrationLayerLive } from "./orchestration/runtimeLayer.ts";
+import { trustedSystemDispatchAuthority } from "./orchestration/commandAudienceGuard.ts";
 import { orchestrationHttpApiLayer } from "./orchestration/http.ts";
 import { layerConfig as SqlitePersistenceLayerLive } from "./persistence/Layers/Sqlite.ts";
 import { OrchestrationEventStore } from "./persistence/Services/OrchestrationEventStore.ts";
@@ -60,7 +67,19 @@ const connectCli = makeCli({ cloudEnabled: true });
 const noConnectCli = makeCli({ cloudEnabled: false });
 const runCli = (args: ReadonlyArray<string>, command = cli) =>
   Command.runWith(command, { version: "0.0.0" })(args);
-const runConnectCli = (args: ReadonlyArray<string>) => runCli(args, connectCli);
+const runConnectCli = (args: ReadonlyArray<string>, testHome: string) =>
+  runCli(args, connectCli).pipe(
+    Effect.provide(
+      ConfigProvider.layer(
+        ConfigProvider.fromEnv({
+          env: {
+            HOME: testHome,
+            XDG_CONFIG_HOME: NodePath.join(testHome, ".config"),
+          },
+        }),
+      ),
+    ),
+  );
 const runCliWithRuntime = (args: ReadonlyArray<string>) =>
   runCli(args).pipe(Effect.provide(CliRuntimeLayer));
 
@@ -234,7 +253,7 @@ it.layer(NodeServices.layer)("bin cli parsing", (it) => {
         NodePath.join(NodeOS.tmpdir(), "t3-cli-cloud-status-test-"),
       );
       const { output } = yield* captureStdout(
-        runConnectCli(["connect", "status", "--base-dir", baseDir, "--json"]),
+        runConnectCli(["connect", "status", "--base-dir", baseDir, "--json"], baseDir),
       );
       // @effect-diagnostics-next-line preferSchemaOverJson:off - CLI JSON output is decoded as a presentation DTO.
       const status = JSON.parse(output) as {
@@ -259,7 +278,7 @@ it.layer(NodeServices.layer)("bin cli parsing", (it) => {
         NodePath.join(NodeOS.tmpdir(), "t3-cli-cloud-status-human-test-"),
       );
       const { output } = yield* captureStdout(
-        runConnectCli(["connect", "status", "--base-dir", baseDir]),
+        runConnectCli(["connect", "status", "--base-dir", baseDir], baseDir),
       );
 
       assert.include(output, "T3 Connect\n  Exposure: disabled");
@@ -269,7 +288,7 @@ it.layer(NodeServices.layer)("bin cli parsing", (it) => {
     }),
   );
 
-  it.effect("logs in to headless connect without enabling access", () =>
+  it.effect("accepts the --headless login override without enabling access", () =>
     Effect.gen(function* () {
       const baseDir = NodeFS.mkdtempSync(
         NodePath.join(NodeOS.tmpdir(), "t3-cli-cloud-login-test-"),
@@ -287,10 +306,10 @@ it.layer(NodeServices.layer)("bin cli parsing", (it) => {
       );
 
       const login = yield* captureStdout(
-        runConnectCli(["connect", "login", "--base-dir", baseDir]),
+        runConnectCli(["connect", "login", "--base-dir", baseDir, "--headless"], baseDir),
       );
       const status = yield* captureStdout(
-        runConnectCli(["connect", "status", "--base-dir", baseDir, "--json"]),
+        runConnectCli(["connect", "status", "--base-dir", baseDir, "--json"], baseDir),
       );
       // @effect-diagnostics-next-line preferSchemaOverJson:off - CLI JSON output is decoded as a presentation DTO.
       const decoded = JSON.parse(status.output) as {
@@ -298,7 +317,7 @@ it.layer(NodeServices.layer)("bin cli parsing", (it) => {
         readonly authenticated: boolean;
       };
 
-      assert.equal(login.output, "Signed in to T3 Connect.");
+      assert.equal(login.output, "✓ Signed in");
       assert.isFalse(decoded.desired);
       assert.isTrue(decoded.authenticated);
     }),
@@ -310,7 +329,7 @@ it.layer(NodeServices.layer)("bin cli parsing", (it) => {
         NodePath.join(NodeOS.tmpdir(), "t3-cli-cloud-unlink-test-"),
       );
       const { output } = yield* captureStdout(
-        runConnectCli(["connect", "unlink", "--base-dir", baseDir]),
+        runConnectCli(["connect", "unlink", "--base-dir", baseDir], baseDir),
       );
 
       assert.equal(output, "T3 Connect is disabled locally.");
@@ -328,7 +347,7 @@ it.layer(NodeServices.layer)("bin cli parsing", (it) => {
       NodeFS.writeFileSync(tokenPath, "invalid persisted token");
 
       const { output } = yield* captureStdout(
-        runConnectCli(["connect", "logout", "--base-dir", baseDir]),
+        runConnectCli(["connect", "logout", "--base-dir", baseDir], baseDir),
       );
 
       assert.equal(output, "Signed out of T3 Connect locally.");
@@ -490,6 +509,66 @@ it.layer(NodeServices.layer)("bin cli parsing", (it) => {
         (project) => project.id === addedProject?.id,
       );
       assert.isTrue((removedProject?.deletedAt ?? null) !== null);
+    }),
+  );
+
+  it.effect("force removes projects that still contain threads", () =>
+    Effect.gen(function* () {
+      const baseDir = NodeFS.mkdtempSync(
+        NodePath.join(NodeOS.tmpdir(), "t3-cli-projects-force-remove-test-"),
+      );
+      const workspaceRoot = NodeFS.mkdtempSync(
+        NodePath.join(NodeOS.tmpdir(), "t3-cli-projects-force-remove-workspace-"),
+      );
+
+      yield* runCliWithRuntime(["project", "add", workspaceRoot, "--base-dir", baseDir]);
+      const afterAdd = yield* readPersistedSnapshot(baseDir);
+      const project = afterAdd.projects.find(
+        (candidate) => candidate.workspaceRoot === workspaceRoot && candidate.deletedAt === null,
+      );
+      assert.isTrue(project !== undefined);
+
+      const config = yield* makeCliTestServerConfig(baseDir);
+      yield* Effect.gen(function* () {
+        const engine = yield* OrchestrationEngine.OrchestrationEngineService;
+        yield* engine.dispatch(
+          {
+            type: "thread.create",
+            commandId: CommandId.make("cmd-cli-force-remove-thread"),
+            threadId: ThreadId.make("thread-cli-force-remove"),
+            projectId: project!.id,
+            title: "Thread",
+            modelSelection: {
+              instanceId: ProviderInstanceId.make("codex"),
+              model: "gpt-5-codex",
+            },
+            interactionMode: "default",
+            runtimeMode: "approval-required",
+            branch: null,
+            worktreePath: null,
+            createdAt: DateTime.formatIso(yield* DateTime.now),
+          },
+          trustedSystemDispatchAuthority("cli-test"),
+        );
+      }).pipe(Effect.provide(makeProjectPersistenceLayer(config)));
+
+      yield* runCliWithRuntime([
+        "project",
+        "remove",
+        project!.id,
+        "--force",
+        "--base-dir",
+        baseDir,
+      ]);
+      const afterRemove = yield* readPersistedSnapshot(baseDir);
+      assert.isTrue(
+        (afterRemove.projects.find((candidate) => candidate.id === project!.id)?.deletedAt ??
+          null) !== null,
+      );
+      assert.isTrue(
+        (afterRemove.threads.find((thread) => thread.id === "thread-cli-force-remove")?.deletedAt ??
+          null) !== null,
+      );
     }),
   );
 

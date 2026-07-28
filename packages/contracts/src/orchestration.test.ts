@@ -109,6 +109,10 @@ it.effect("decodes legacy thread stream frames without a storage epoch", () =>
       },
     });
 
+    assert.strictEqual(decoded.kind, "event");
+    if (decoded.kind !== "event") {
+      throw new Error(`expected an event frame, received ${decoded.kind}`);
+    }
     assert.strictEqual(decoded.storageEpoch, undefined);
   }),
 );

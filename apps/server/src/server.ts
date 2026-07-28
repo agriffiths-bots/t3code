@@ -13,6 +13,7 @@ import {
   notificationRecoveryRouteLayer,
   mcpPeerTokenRouteLayer,
   assetRouteLayer,
+  assetAppRelayRouteLayer,
   assetSurfaceBindingRouteLayer,
   serverEnvironmentHttpApiLayer,
   staticAndDevRouteLayer,
@@ -371,7 +372,10 @@ const RuntimeCoreDependenciesLive = RuntimeCoreDependenciesBaseLive.pipe(
   Layer.provideMerge(DeviceNotificationsLayerLive),
   Layer.provideMerge(
     Layer.mergeAll(
-      CloudCliTokenManager.layer.pipe(Layer.provide(ServerSecretStore.layer)),
+      CloudCliTokenManager.layer.pipe(
+        Layer.provide(ServerSecretStore.layer),
+        Layer.provide(ExternalLauncher.layer),
+      ),
       CloudManagedEndpointRuntimeLive,
     ),
   ),
@@ -425,6 +429,7 @@ export const makeRoutesLayer = Layer.mergeAll(
     notificationAckRouteLayer,
     notificationRecoveryRouteLayer,
     assetRouteLayer,
+    assetAppRelayRouteLayer,
     assetSurfaceBindingRouteLayer,
     staticAndDevRouteLayer,
     websocketRpcRouteLayer,

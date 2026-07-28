@@ -64,6 +64,8 @@ import Migration0049 from "./Migrations/049_OrchestrationThreadRevisionCoveringI
 import Migration0050 from "./Migrations/050_ProjectionProjectDataAudience.ts";
 import Migration0051 from "./Migrations/051_AuthAudienceCeilings.ts";
 import Migration0052 from "./Migrations/052_ProjectionTurnsEffectiveModel.ts";
+import Migration0053 from "./Migrations/053_LocalSubagentTerminalDeliveries.ts";
+import Migration0054 from "./Migrations/054_BackfillPreexistingLocalSubagentTerminalDeliveries.ts";
 
 /**
  * Migration loader with all migrations defined inline.
@@ -127,6 +129,8 @@ export const migrationEntries = [
   [50, "ProjectionProjectDataAudience", Migration0050],
   [51, "AuthAudienceCeilings", Migration0051],
   [52, "ProjectionTurnsEffectiveModel", Migration0052],
+  [53, "LocalSubagentTerminalDeliveries", Migration0053],
+  [54, "BackfillPreexistingLocalSubagentTerminalDeliveries", Migration0054],
 ] as const;
 
 export const makeMigrationLoader = (throughId?: number) =>
@@ -161,15 +165,11 @@ export interface RunMigrationsOptions {
 export const runMigrations = Effect.fn("runMigrations")(function* ({
   toMigrationInclusive,
 }: RunMigrationsOptions = {}) {
-  yield* Effect.log(
-    toMigrationInclusive === undefined
-      ? "Running all migrations..."
-      : `Running migrations 1 through ${toMigrationInclusive}...`,
-  );
   const executedMigrations = yield* run({ loader: makeMigrationLoader(toMigrationInclusive) });
-  yield* Effect.log("Migrations ran successfully").pipe(
-    Effect.annotateLogs({ migrations: executedMigrations.map(([id, name]) => `${id}_${name}`) }),
-  );
+  const migrations = executedMigrations.map(([id, name]) => `${id}_${name}`);
+  yield* migrations.length === 0
+    ? Effect.logDebug("Database schema is current")
+    : Effect.log("Migrations ran successfully").pipe(Effect.annotateLogs({ migrations }));
   return executedMigrations;
 });
 

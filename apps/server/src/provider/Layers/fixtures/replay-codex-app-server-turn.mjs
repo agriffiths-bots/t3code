@@ -14,6 +14,7 @@ const fixturePath = NodePath.join(
 const capturedLines = NodeFS.readFileSync(fixturePath, "utf8").trimEnd().split("\n");
 const capturedMessages = capturedLines.map((line) => JSON.parse(line));
 const requestOrder = ["initialize", "thread/start", "turn/start"];
+const scenario = process.env.T3_PROVIDER_E2E_SCENARIO ?? "success";
 let nextRequestIndex = 0;
 
 function replayResponseAndFollowingNotifications(requestId) {
@@ -26,7 +27,25 @@ function replayResponseAndFollowingNotifications(requestId) {
   );
   const endIndex = nextResponseIndex < 0 ? capturedLines.length : nextResponseIndex;
   for (let index = responseIndex; index < endIndex; index += 1) {
+    const message = capturedMessages[index];
+    if (scenario === "empty" && message?.method === "item/agentMessage/delta") {
+      continue;
+    }
+    if (
+      scenario === "empty" &&
+      message?.method === "item/completed" &&
+      message.params?.item?.type === "agentMessage"
+    ) {
+      process.stdout.write(
+        `${JSON.stringify({ ...message, params: { ...message.params, item: { ...message.params.item, text: "" } } })}\n`,
+      );
+      continue;
+    }
     process.stdout.write(`${capturedLines[index]}\n`);
+    if (scenario === "death" && message?.method === "item/agentMessage/delta") {
+      process.stdout.write("", () => process.exit(17));
+      return;
+    }
   }
 }
 

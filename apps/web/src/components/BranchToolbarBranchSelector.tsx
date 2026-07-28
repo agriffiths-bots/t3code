@@ -22,7 +22,7 @@ import {
 import { useComposerDraftStore, type DraftId } from "../composerDraftStore";
 import { useOpenPrLink } from "../lib/openPullRequestLink";
 import { usePaginatedBranches } from "../state/queries";
-import { useProject, useThread } from "../state/entities";
+import { useDraftAwareThread, useProject } from "../state/entities";
 import { useEnvironmentQuery } from "../state/query";
 import { threadEnvironment } from "../state/threads";
 import { useAtomCommand } from "../state/use-atom-command";
@@ -125,11 +125,11 @@ export function BranchToolbarBranchSelector({
     () => scopeThreadRef(environmentId, threadId),
     [environmentId, threadId],
   );
-  const serverThread = useThread(threadRef);
-  const serverSession = serverThread?.session ?? null;
   const draftThread = useComposerDraftStore((store) =>
     draftId ? store.getDraftSession(draftId) : store.getDraftThreadByRef(threadRef),
   );
+  const serverThread = useDraftAwareThread(threadRef, draftThread);
+  const serverSession = serverThread?.session ?? null;
   const setDraftThreadContext = useComposerDraftStore((store) => store.setDraftThreadContext);
 
   const activeProjectRef = serverThread
@@ -422,17 +422,32 @@ export function BranchToolbarBranchSelector({
     });
   };
 
+  // Default the worktree base to the repo default branch (origin/HEAD), only
+  // falling back to the checked-out branch when no default is known.
+  const defaultBranchName = useMemo(
+    () => refs.find((refName) => refName.isDefault)?.name ?? null,
+    [refs],
+  );
+  const worktreeBaseBranchCandidate = isInitialBranchesLoadPending
+    ? null
+    : (defaultBranchName ?? currentGitBranch);
   useEffect(() => {
     if (
       effectiveEnvMode !== "worktree" ||
       activeWorktreePath ||
       activeThreadBranch ||
-      !currentGitBranch
+      !worktreeBaseBranchCandidate
     ) {
       return;
     }
-    setThreadBranch(currentGitBranch, null);
-  }, [activeThreadBranch, activeWorktreePath, currentGitBranch, effectiveEnvMode, setThreadBranch]);
+    setThreadBranch(worktreeBaseBranchCandidate, null);
+  }, [
+    activeThreadBranch,
+    activeWorktreePath,
+    effectiveEnvMode,
+    setThreadBranch,
+    worktreeBaseBranchCandidate,
+  ]);
 
   // ---------------------------------------------------------------------------
   // Combobox / list plumbing

@@ -5,15 +5,13 @@ import * as NodeFSP from "node:fs/promises";
 import {
   ASSET_SAME_ORIGIN_RELAY_V1_CAPABILITY,
   AssetClientUpgradeRequiredError,
+  AssetClaimJson,
   AssetAttachmentNotFoundError,
-  AuthAudienceCeiling,
   AssetPreviewTypeValidationError,
   AssetProjectFaviconInspectionError,
   AssetProjectFaviconNotFoundError,
   AssetProjectFaviconResolutionError,
   AssetSigningKeyLoadError,
-  AuthSessionId,
-  type AssetClientCapability,
   AssetWorkspaceAssetInspectionError,
   AssetWorkspaceAssetNotFoundError,
   AssetWorkspaceContextNotFoundError,
@@ -21,10 +19,13 @@ import {
   AssetWorkspacePathValidationError,
   AssetWorkspaceResolutionError,
   AssetWorkspaceRootNormalizationError,
-  DataAudience,
+  AssetSurfaceCredentialClaimJson,
+  type AssetClaim,
+  type AssetClientCapability,
   type AssetResource,
-  type AuthAudienceCeiling as AuthAudienceCeilingType,
-  type DataAudience as DataAudienceType,
+  type AuthAudienceCeiling,
+  type AuthSessionId,
+  type DataAudience,
 } from "@t3tools/contracts";
 import {
   isWorkspaceImagePreviewPath,
@@ -58,6 +59,7 @@ import {
   toSafeThreadAttachmentSegment,
 } from "../attachmentStore.ts";
 import * as ServerConfig from "../config.ts";
+import * as ServerEnvironment from "../environment/ServerEnvironment.ts";
 import * as ProjectionSnapshotQuery from "../orchestration/Services/ProjectionSnapshotQuery.ts";
 import * as ProjectFilesystemAudienceGuard from "../project/ProjectFilesystemAudienceGuard.ts";
 import * as ProjectFaviconResolver from "../project/ProjectFaviconResolver.ts";
@@ -67,6 +69,7 @@ export const ASSET_ROUTE_PREFIX = "/api/assets";
 export const ASSET_SURFACE_RELAY_PREFIX = `${ASSET_ROUTE_PREFIX}/relay`;
 export const ASSET_SURFACE_BIND_PATH = `${ASSET_SURFACE_RELAY_PREFIX}/surface`;
 export const ASSET_SURFACE_CREDENTIAL_HEADER = "x-t3-asset-surface";
+export const ASSET_APP_RELAY_PREFIX = "/_asset-relay";
 
 export function assetSurfaceCookiePrefix(sessionCookieName: string): string {
   return `${sessionCookieName}_asset_surface_`;
@@ -93,64 +96,12 @@ const PREVIEW_ASSET_EXTENSIONS = new Set([
   ".woff2",
 ]);
 
-const AudienceBoundAssetClaimFields = {
-  dataAudience: DataAudience,
-  audienceCeiling: AuthAudienceCeiling,
-  surfaceBindingId: Schema.optionalKey(Schema.NullOr(Schema.String)),
-};
-
-const AssetSurfaceCredentialClaimsSchema = Schema.Struct({
-  version: Schema.Literal(1),
-  kind: Schema.Literal("asset-surface"),
-  surfaceSessionId: AuthSessionId,
-  surfaceBindingId: Schema.String,
-  expiresAt: Schema.Number,
-});
-type AssetSurfaceCredentialClaims = typeof AssetSurfaceCredentialClaimsSchema.Type;
-
-const AssetClaimsSchema = Schema.Union([
-  Schema.Struct({
-    version: Schema.Literal(1),
-    kind: Schema.Literal("workspace-file"),
-    workspaceRoot: Schema.String,
-    baseRelativePath: Schema.String,
-    expiresAt: Schema.Number,
-    ...AudienceBoundAssetClaimFields,
-  }),
-  Schema.Struct({
-    version: Schema.Literal(1),
-    kind: Schema.Literal("workspace-file-exact"),
-    workspaceRoot: Schema.String,
-    relativePath: Schema.String,
-    expiresAt: Schema.Number,
-    ...AudienceBoundAssetClaimFields,
-  }),
-  Schema.Struct({
-    version: Schema.Literal(1),
-    kind: Schema.Literal("attachment"),
-    attachmentId: Schema.String,
-    expiresAt: Schema.Number,
-    ...AudienceBoundAssetClaimFields,
-  }),
-  Schema.Struct({
-    version: Schema.Literal(1),
-    kind: Schema.Literal("project-favicon"),
-    workspaceRoot: Schema.String,
-    relativePath: Schema.NullOr(Schema.String),
-    expiresAt: Schema.Number,
-    ...AudienceBoundAssetClaimFields,
-  }),
-]);
-type AssetClaims = typeof AssetClaimsSchema.Type;
-
-const AssetClaimsJson = Schema.fromJsonString(AssetClaimsSchema);
-const decodeAssetClaims = Schema.decodeUnknownOption(AssetClaimsJson);
-const encodeAssetClaims = Schema.encodeSync(AssetClaimsJson);
-const AssetSurfaceCredentialClaimsJson = Schema.fromJsonString(AssetSurfaceCredentialClaimsSchema);
+const decodeAssetClaims = Schema.decodeUnknownOption(AssetClaimJson);
+const encodeAssetClaims = Schema.encodeSync(AssetClaimJson);
 const decodeAssetSurfaceCredentialClaims = Schema.decodeUnknownOption(
-  AssetSurfaceCredentialClaimsJson,
+  AssetSurfaceCredentialClaimJson,
 );
-const encodeAssetSurfaceCredentialClaims = Schema.encodeSync(AssetSurfaceCredentialClaimsJson);
+const encodeAssetSurfaceCredentialClaims = Schema.encodeSync(AssetSurfaceCredentialClaimJson);
 
 export type ResolvedAsset = {
   readonly kind: "file";
@@ -160,14 +111,13 @@ export type ResolvedAsset = {
 };
 export type AssetResolution = ResolvedAsset | { readonly kind: "forbidden" };
 
-const forbiddenAsset = { kind: "forbidden" } as const satisfies AssetResolution;
-
 const audienceClaimsForIssue = Effect.fn("AssetAccess.audienceClaimsForIssue")(function* (input: {
   readonly resource: AssetResource;
-  readonly claimedDataAudience: DataAudienceType;
-  readonly audienceCeiling: AuthAudienceCeilingType;
+  readonly claimedDataAudience: DataAudience;
+  readonly issuingAudience: AuthAudienceCeiling;
+  readonly issuingBackendId: AssetClaim["issuingBackendId"];
   readonly canonicalTargetPath?: string;
-  readonly liveDataAudience?: DataAudienceType;
+  readonly liveDataAudience?: DataAudience;
 }) {
   const liveDataAudience = input.canonicalTargetPath
     ? ((yield* ProjectFilesystemAudienceGuard.classifyPathAudience(input.canonicalTargetPath).pipe(
@@ -177,10 +127,14 @@ const audienceClaimsForIssue = Effect.fn("AssetAccess.audienceClaimsForIssue")(f
       )) ?? "private")
     : (input.liveDataAudience ?? input.claimedDataAudience);
   const dataAudience = strictestDataAudience(input.claimedDataAudience, liveDataAudience);
-  if (!canReadDataAudience(input.audienceCeiling, dataAudience)) {
+  if (!canReadDataAudience(input.issuingAudience, dataAudience)) {
     return yield* new AssetWorkspaceContextNotFoundError({ resource: input.resource });
   }
-  return { dataAudience, audienceCeiling: input.audienceCeiling };
+  return {
+    dataAudience,
+    issuingAudience: input.issuingAudience,
+    issuingBackendId: input.issuingBackendId,
+  };
 });
 
 export const classifyAttachmentAudience = Effect.fn("AssetAccess.classifyAttachmentAudience")(
@@ -191,7 +145,7 @@ export const classifyAttachmentAudience = Effect.fn("AssetAccess.classifyAttachm
     const snapshotQuery = yield* ProjectionSnapshotQuery.ProjectionSnapshotQuery;
     const snapshot = yield* snapshotQuery.getCommandReadModel();
     const projectById = new Map(snapshot.projects.map((project) => [project.id, project]));
-    let audience: DataAudienceType | null = null;
+    let audience: DataAudience | null = null;
     for (const thread of snapshot.threads) {
       if (toSafeThreadAttachmentSegment(thread.id) !== threadSegment) {
         continue;
@@ -275,7 +229,7 @@ const withOpenedAssetFile = <E, R>(
   );
 };
 
-function decodeClaims(encodedPayload: string): AssetClaims | null {
+function decodeClaims(encodedPayload: string): AssetClaim | null {
   try {
     return Option.getOrNull(decodeAssetClaims(base64UrlDecodeUtf8(encodedPayload)));
   } catch {
@@ -283,9 +237,7 @@ function decodeClaims(encodedPayload: string): AssetClaims | null {
   }
 }
 
-function decodeSurfaceCredentialClaims(
-  encodedPayload: string,
-): AssetSurfaceCredentialClaims | null {
+function decodeSurfaceCredentialClaims(encodedPayload: string) {
   try {
     return Option.getOrNull(
       decodeAssetSurfaceCredentialClaims(base64UrlDecodeUtf8(encodedPayload)),
@@ -298,6 +250,40 @@ function decodeSurfaceCredentialClaims(
 function signToken(encodedPayload: string, signingSecret: Uint8Array): string {
   return `${encodedPayload}.${signPayload(encodedPayload, signingSecret)}`;
 }
+
+function splitSignedToken(token: string): readonly [string, string] | null {
+  const parts = token.split(".");
+  return parts.length === 2 && parts[0] && parts[1] ? [parts[0], parts[1]] : null;
+}
+
+export function decodeAssetRelayRoutingClaim(token: string): AssetClaim | null {
+  const tokenParts = splitSignedToken(token);
+  return tokenParts === null ? null : decodeClaims(tokenParts[0]);
+}
+
+export function effectiveAssetClaimAudience(claim: AssetClaim): DataAudience {
+  return strictestDataAudience(claim.dataAudience, claim.issuingAudience);
+}
+
+const verifyAssetClaimToken = Effect.fn("AssetAccess.verifyAssetClaimToken")(function* (
+  token: string,
+) {
+  const tokenParts = splitSignedToken(token);
+  if (tokenParts === null) return null;
+  const [encodedPayload, signature] = tokenParts;
+
+  const secretStore = yield* ServerSecretStore.ServerSecretStore;
+  const signingSecret = yield* secretStore.getOrCreateRandom(SIGNING_SECRET_NAME, 32).pipe(
+    Effect.tapError((cause) => Effect.logError("Failed to load the asset signing key.", { cause })),
+    Effect.orElseSucceed(() => null),
+  );
+  if (!signingSecret) return null;
+  if (!timingSafeEqualBase64Url(signature, signPayload(encodedPayload, signingSecret))) return null;
+
+  const claim = decodeClaims(encodedPayload);
+  if (!claim || claim.expiresAt <= (yield* Clock.currentTimeMillis)) return null;
+  return { claim, signingSecret };
+});
 
 function surfaceBindingIdForSession(sessionId: AuthSessionId, signingSecret: Uint8Array): string {
   return signPayload(`asset-surface:${sessionId}`, signingSecret);
@@ -367,8 +353,8 @@ const resolveCanonicalWorkspaceFileForRequest = (input: {
 export const issueAssetUrl = Effect.fn("AssetAccess.issueAssetUrl")(function* (input: {
   readonly resource: AssetResource;
   readonly workspaceRoot?: string;
-  readonly dataAudience?: DataAudienceType;
-  readonly audienceCeiling?: AuthAudienceCeilingType;
+  readonly dataAudience?: DataAudience;
+  readonly issuingAudience?: AuthAudienceCeiling;
   readonly clientCapabilities?: ReadonlyArray<AssetClientCapability>;
   readonly surfaceSessionId?: AuthSessionId;
   readonly surfaceSessionExpiresAt?: DateTime.DateTime;
@@ -378,9 +364,11 @@ export const issueAssetUrl = Effect.fn("AssetAccess.issueAssetUrl")(function* (i
   const workspacePaths = yield* WorkspacePaths.WorkspacePaths;
   const now = yield* Clock.currentTimeMillis;
   let expiresAt = now + ASSET_TOKEN_TTL_MS;
+  const serverEnvironment = yield* ServerEnvironment.ServerEnvironment;
+  const issuingBackendId = yield* serverEnvironment.getEnvironmentId;
   const claimedDataAudience = input.dataAudience ?? ("private" as const);
-  const audienceCeiling = input.audienceCeiling ?? ("private" as const);
-  let claims: AssetClaims;
+  const issuingAudience = input.issuingAudience ?? ("private" as const);
+  let claims: AssetClaim;
   let fileName: string;
 
   switch (input.resource._tag) {
@@ -438,7 +426,8 @@ export const issueAssetUrl = Effect.fn("AssetAccess.issueAssetUrl")(function* (i
       const audienceClaims = yield* audienceClaimsForIssue({
         resource: input.resource,
         claimedDataAudience,
-        audienceCeiling,
+        issuingAudience,
+        issuingBackendId,
         canonicalTargetPath: canonicalFile,
       });
       const canonicalWorkspaceRoot = yield* fileSystem.realPath(workspaceRoot).pipe(
@@ -486,7 +475,8 @@ export const issueAssetUrl = Effect.fn("AssetAccess.issueAssetUrl")(function* (i
       const audienceClaims = yield* audienceClaimsForIssue({
         resource: input.resource,
         claimedDataAudience,
-        audienceCeiling,
+        issuingAudience,
+        issuingBackendId,
         liveDataAudience:
           (yield* classifyAttachmentAudience(input.resource.attachmentId).pipe(
             Effect.mapError(
@@ -546,7 +536,8 @@ export const issueAssetUrl = Effect.fn("AssetAccess.issueAssetUrl")(function* (i
       const audienceClaims = yield* audienceClaimsForIssue({
         resource: input.resource,
         claimedDataAudience,
-        audienceCeiling,
+        issuingAudience,
+        issuingBackendId,
         ...(canonicalFaviconPath ? { canonicalTargetPath: canonicalFaviconPath } : {}),
       });
       claims = {
@@ -571,8 +562,9 @@ export const issueAssetUrl = Effect.fn("AssetAccess.issueAssetUrl")(function* (i
     }
   }
 
+  const requiresSurfaceBinding = effectiveAssetClaimAudience(claims) === "private";
   if (
-    claims.dataAudience === "private" &&
+    requiresSurfaceBinding &&
     !input.clientCapabilities?.includes(ASSET_SAME_ORIGIN_RELAY_V1_CAPABILITY)
   ) {
     yield* Effect.logWarning(
@@ -602,7 +594,7 @@ export const issueAssetUrl = Effect.fn("AssetAccess.issueAssetUrl")(function* (i
   let surfaceSessionId: AuthSessionId | null = null;
   let surfaceBindingId: string | null = null;
   let surfaceCredentialExpiresAt: number | null = null;
-  if (claims.dataAudience === "private") {
+  if (requiresSurfaceBinding) {
     if (input.surfaceSessionId === undefined || input.surfaceSessionExpiresAt === undefined) {
       return yield* new AssetWorkspaceContextNotFoundError({ resource: input.resource });
     }
@@ -641,8 +633,9 @@ export const issueAssetUrl = Effect.fn("AssetAccess.issueAssetUrl")(function* (i
 
 export const verifyAssetSurfaceCredential = Effect.fn("AssetAccess.verifyAssetSurfaceCredential")(
   function* (credential: string) {
-    const [encodedPayload, signature] = credential.split(".");
-    if (!encodedPayload || !signature) return null;
+    const tokenParts = splitSignedToken(credential);
+    if (tokenParts === null) return null;
+    const [encodedPayload, signature] = tokenParts;
 
     const secretStore = yield* ServerSecretStore.ServerSecretStore;
     const signingSecret = yield* secretStore.getOrCreateRandom(SIGNING_SECRET_NAME, 32).pipe(
@@ -652,8 +645,9 @@ export const verifyAssetSurfaceCredential = Effect.fn("AssetAccess.verifyAssetSu
       Effect.orElseSucceed(() => null),
     );
     if (!signingSecret) return null;
-    if (!timingSafeEqualBase64Url(signature, signPayload(encodedPayload, signingSecret)))
+    if (!timingSafeEqualBase64Url(signature, signPayload(encodedPayload, signingSecret))) {
       return null;
+    }
 
     const claims = decodeSurfaceCredentialClaims(encodedPayload);
     if (!claims || claims.expiresAt <= (yield* Clock.currentTimeMillis)) return null;
@@ -667,45 +661,41 @@ export const verifyAssetSurfaceCredential = Effect.fn("AssetAccess.verifyAssetSu
       ),
       Effect.orElseSucceed(() => false),
     );
-    if (!active) return null;
-    return claims;
+    return active ? claims : null;
   },
 );
 
 export const resolveAsset = Effect.fn("AssetAccess.resolveAsset")(function* (
   token: string,
   relativePath: string,
-  requestSurfaceCredentials: string | null | ReadonlyArray<string> = null,
+  requestProof: {
+    readonly sessionId?: AuthSessionId;
+    readonly surfaceCredentials?: ReadonlyArray<string>;
+    readonly allowUnbound?: boolean;
+  } = {},
 ) {
-  const [encodedPayload, signature] = token.split(".");
-  if (!encodedPayload || !signature) return null;
+  const verified = yield* verifyAssetClaimToken(token);
+  if (verified === null) return null;
+  const { claim: claims, signingSecret } = verified;
 
-  const secretStore = yield* ServerSecretStore.ServerSecretStore;
-  const signingSecret = yield* secretStore.getOrCreateRandom(SIGNING_SECRET_NAME, 32).pipe(
-    Effect.tapError((cause) => Effect.logError("Failed to load the asset signing key.", { cause })),
-    Effect.orElseSucceed(() => null),
-  );
-  if (!signingSecret) return null;
-  if (!timingSafeEqualBase64Url(signature, signPayload(encodedPayload, signingSecret))) return null;
-
-  const claims = decodeClaims(encodedPayload);
-  if (!claims || claims.expiresAt <= (yield* Clock.currentTimeMillis)) return null;
-
-  if (!canReadDataAudience(claims.audienceCeiling, claims.dataAudience)) {
+  if (!canReadDataAudience(claims.issuingAudience, claims.dataAudience)) {
     return null;
   }
-  if (claims.dataAudience === "private") {
-    if (claims.surfaceBindingId === null || claims.surfaceBindingId === undefined) return null;
-    const credentials =
-      typeof requestSurfaceCredentials === "string"
-        ? [requestSurfaceCredentials]
-        : (requestSurfaceCredentials ?? []);
-    let matchedSurface = false;
-    for (const credential of credentials) {
-      const surfaceCredential = yield* verifyAssetSurfaceCredential(credential);
-      if (surfaceCredential?.surfaceBindingId === claims.surfaceBindingId) {
-        matchedSurface = true;
-        break;
+
+  const effectiveAudience = effectiveAssetClaimAudience(claims);
+  if (claims.surfaceBindingId === null) {
+    if (effectiveAudience === "private" || requestProof.allowUnbound !== true) return null;
+  } else {
+    let matchedSurface =
+      requestProof.sessionId !== undefined &&
+      surfaceBindingIdForSession(requestProof.sessionId, signingSecret) === claims.surfaceBindingId;
+    if (!matchedSurface) {
+      for (const credential of requestProof.surfaceCredentials ?? []) {
+        const surfaceCredential = yield* verifyAssetSurfaceCredential(credential);
+        if (surfaceCredential?.surfaceBindingId === claims.surfaceBindingId) {
+          matchedSurface = true;
+          break;
+        }
       }
     }
     if (!matchedSurface) return null;
@@ -729,7 +719,7 @@ export const resolveAsset = Effect.fn("AssetAccess.resolveAsset")(function* (
               opened.canonicalPath,
             ).pipe(Effect.orElseSucceed(() => null))) ?? "private";
           if (!canReadDataAudience(claims.dataAudience, liveDataAudience)) {
-            return forbiddenAsset;
+            return null;
           }
           return transferToResponse();
         }),
@@ -768,7 +758,7 @@ export const resolveAsset = Effect.fn("AssetAccess.resolveAsset")(function* (
             Effect.orElseSucceed(() => null),
           )) ?? "private";
         if (!canReadDataAudience(claims.dataAudience, liveDataAudience)) {
-          return forbiddenAsset;
+          return null;
         }
         return transferToResponse();
       }),
@@ -814,3 +804,50 @@ export const resolveAsset = Effect.fn("AssetAccess.resolveAsset")(function* (
   });
   return workspaceFile ? yield* authorizeResolvedPath(workspaceFile, claims.workspaceRoot) : null;
 });
+
+export const resolveLocalAssetRelay = Effect.fn("AssetAccess.resolveLocalAssetRelay")(
+  function* (input: {
+    readonly token: string;
+    readonly encodedRelativePath: string;
+    readonly viewerSessionId: AuthSessionId;
+    readonly viewerAudienceCeiling: AuthAudienceCeiling;
+    readonly viewerSessionExpiresAt?: DateTime.DateTime;
+  }) {
+    const verified = yield* verifyAssetClaimToken(input.token);
+    if (verified === null) return null;
+    const { claim, signingSecret } = verified;
+    const environment = yield* ServerEnvironment.ServerEnvironment;
+    const localBackendId = yield* environment.getEnvironmentId;
+    if (claim.issuingBackendId !== null && claim.issuingBackendId !== localBackendId) return null;
+
+    const audience = effectiveAssetClaimAudience(claim);
+    if (!canReadDataAudience(input.viewerAudienceCeiling, audience)) return null;
+    if (claim.surfaceBindingId === null) {
+      return audience === "private"
+        ? null
+        : yield* resolveAsset(input.token, input.encodedRelativePath, { allowUnbound: true });
+    }
+
+    const now = yield* Clock.currentTimeMillis;
+    const proofExpiresAt = Math.min(
+      claim.expiresAt,
+      input.viewerSessionExpiresAt?.epochMilliseconds ?? claim.expiresAt,
+    );
+    if (proofExpiresAt <= now) return null;
+    const relayProof = signToken(
+      base64UrlEncode(
+        encodeAssetSurfaceCredentialClaims({
+          version: 1,
+          kind: "asset-surface",
+          surfaceSessionId: input.viewerSessionId,
+          surfaceBindingId: claim.surfaceBindingId,
+          expiresAt: proofExpiresAt,
+        }),
+      ),
+      signingSecret,
+    );
+    return yield* resolveAsset(input.token, input.encodedRelativePath, {
+      surfaceCredentials: [relayProof],
+    });
+  },
+);

@@ -2,6 +2,7 @@ import * as NodeServices from "@effect/platform-node/NodeServices";
 import {
   ASSET_SAME_ORIGIN_RELAY_V1_CAPABILITY,
   AuthSessionId,
+  EnvironmentId,
   ThreadId,
   type OrchestrationReadModel,
 } from "@t3tools/contracts";
@@ -19,6 +20,7 @@ import * as TestClock from "effect/testing/TestClock";
 import * as ServerSecretStore from "../auth/ServerSecretStore.ts";
 import * as SessionStore from "../auth/SessionStore.ts";
 import * as ServerConfig from "../config.ts";
+import * as ServerEnvironment from "../environment/ServerEnvironment.ts";
 import * as ProjectFaviconResolver from "../project/ProjectFaviconResolver.ts";
 import * as ProjectionSnapshotQuery from "../orchestration/Services/ProjectionSnapshotQuery.ts";
 import * as WorkspacePaths from "../workspace/WorkspacePaths.ts";
@@ -26,13 +28,17 @@ import {
   ASSET_ROUTE_PREFIX,
   ASSET_SURFACE_RELAY_PREFIX,
   classifyAttachmentAudience,
+  decodeAssetRelayRoutingClaim,
   issueAssetUrl as issueAssetUrlImpl,
   resolveAsset as resolveAssetImpl,
+  resolveLocalAssetRelay,
   type AssetResolution,
 } from "./AssetAccess.ts";
 
 const TEST_SURFACE_SESSION_ID = AuthSessionId.make("asset-access-test-surface");
 const TEST_SURFACE_SESSION_EXPIRES_AT = DateTime.makeUnsafe("2999-01-01T00:00:00.000Z");
+const OTHER_SURFACE_SESSION_ID = AuthSessionId.make("asset-access-other-surface");
+const TEST_ENVIRONMENT_ID = EnvironmentId.make("asset-access-environment");
 const issuedSurfaceCredentialByToken = new Map<string, string>();
 
 const assetRouteSuffix = (relativeUrl: string) => {
@@ -59,15 +65,21 @@ const issueAssetUrl = (input: Parameters<typeof issueAssetUrlImpl>[0]) =>
     ),
   );
 
-const resolveAsset = (token: string, relativePath: string, requestProof: string | null = null) =>
+const resolveAsset = (
+  token: string,
+  relativePath: string,
+  requestProof: "private" | "factory" | string | null = null,
+) =>
   resolveAssetImpl(
     token,
     relativePath,
     requestProof === "private"
-      ? (issuedSurfaceCredentialByToken.get(token) ?? null)
+      ? { surfaceCredentials: [issuedSurfaceCredentialByToken.get(token) ?? ""] }
       : requestProof === "factory"
-        ? null
-        : requestProof,
+        ? { allowUnbound: true }
+        : typeof requestProof === "string"
+          ? { surfaceCredentials: [requestProof] }
+          : {},
   );
 
 const summarizeAssetResolution = (resolution: AssetResolution | null) => {
@@ -79,25 +91,61 @@ const summarizeAssetResolution = (resolution: AssetResolution | null) => {
 const configLayer = ServerConfig.ServerConfig.layerTest(process.cwd(), {
   prefix: "t3-asset-access-test-",
 });
-const testLayer = Layer.mergeAll(
-  configLayer,
-  WorkspacePaths.layer,
-  ProjectFaviconResolver.layer.pipe(Layer.provide(WorkspacePaths.layer)),
-  ServerSecretStore.layer.pipe(Layer.provide(configLayer)),
-  Layer.mock(SessionStore.SessionStore)({
-    cookieName: "t3_asset_access_test",
-    isActive: () => Effect.succeed(true),
-  }),
-  Layer.mock(ProjectionSnapshotQuery.ProjectionSnapshotQuery)({
-    getCommandReadModel: () =>
-      Effect.succeed({
-        snapshotSequence: 0,
-        projects: [],
-        threads: [],
-        updatedAt: "1970-01-01T00:00:00.000Z",
-      } satisfies OrchestrationReadModel),
-  }),
-).pipe(Layer.provideMerge(NodeServices.layer));
+const emptyReadModel: OrchestrationReadModel = {
+  snapshotSequence: 0,
+  projects: [],
+  threads: [],
+  updatedAt: "1970-01-01T00:00:00.000Z",
+};
+const makeAssetAccessTestLayer = (
+  getCommandReadModel: () => Effect.Effect<OrchestrationReadModel> = () =>
+    Effect.succeed(emptyReadModel),
+) =>
+  Layer.mergeAll(
+    configLayer,
+    WorkspacePaths.layer,
+    ProjectFaviconResolver.layer.pipe(Layer.provide(WorkspacePaths.layer)),
+    ServerSecretStore.layer.pipe(Layer.provide(configLayer)),
+    Layer.mock(SessionStore.SessionStore)({
+      cookieName: "t3_asset_access_test",
+      isActive: () => Effect.succeed(true),
+    }),
+    Layer.mock(ServerEnvironment.ServerEnvironment)({
+      getEnvironmentId: Effect.succeed(TEST_ENVIRONMENT_ID),
+      getDescriptor: Effect.die("unused test environment descriptor"),
+    }),
+    Layer.mock(ProjectionSnapshotQuery.ProjectionSnapshotQuery)({
+      getCommandReadModel,
+    }),
+  ).pipe(Layer.provideMerge(NodeServices.layer));
+const testLayer = makeAssetAccessTestLayer();
+
+const makeFactoryReadModel = (input: {
+  readonly projectId: string;
+  readonly threadId: string;
+  readonly workspaceRoot: string;
+}): OrchestrationReadModel =>
+  ({
+    snapshotSequence: 1,
+    updatedAt: "2026-07-19T00:00:00.000Z",
+    projects: [
+      {
+        id: input.projectId,
+        workspaceRoot: input.workspaceRoot,
+        dataAudience: "factory",
+        deletedAt: null,
+      },
+    ],
+    threads: [
+      {
+        id: input.threadId,
+        projectId: input.projectId,
+        dataAudience: "factory",
+        deletedAt: null,
+        worktreePath: null,
+      },
+    ],
+  }) as unknown as OrchestrationReadModel;
 
 describe("AssetAccess", () => {
   it.effect("issues workspace URLs that resolve the entry file and sibling assets", () =>
@@ -406,14 +454,14 @@ describe("AssetAccess", () => {
       const error = yield* issueAssetUrl({
         resource: { _tag: "attachment", attachmentId },
         dataAudience: "private",
-        audienceCeiling: "factory",
+        issuingAudience: "factory",
       }).pipe(Effect.flip);
       expect(error._tag).toBe("AssetWorkspaceContextNotFoundError");
 
       const privateResult = yield* issueAssetUrl({
         resource: { _tag: "attachment", attachmentId },
         dataAudience: "private",
-        audienceCeiling: "private",
+        issuingAudience: "private",
       });
       const privateSuffix = assetRouteSuffix(privateResult.relativeUrl);
       const privateSeparatorIndex = privateSuffix.indexOf("/");
@@ -456,14 +504,24 @@ describe("AssetAccess", () => {
       const fileName = suffix.slice(separatorIndex + 1);
 
       expect(yield* resolveAssetImpl(token, fileName)).toBeNull();
-      expect(yield* resolveAssetImpl(token, fileName, other.surfaceCredential)).toBeNull();
       expect(
-        summarizeAssetResolution(yield* resolveAssetImpl(token, fileName, owner.surfaceCredential)),
+        yield* resolveAssetImpl(token, fileName, {
+          surfaceCredentials: [other.surfaceCredential ?? ""],
+        }),
+      ).toBeNull();
+      expect(
+        summarizeAssetResolution(
+          yield* resolveAssetImpl(token, fileName, {
+            surfaceCredentials: [owner.surfaceCredential ?? ""],
+          }),
+        ),
       ).toEqual({ kind: "file", path: attachmentPath });
       expect(owner.expiresAt).toBe(sessionExpiresAt.epochMilliseconds);
 
       expect(
-        yield* resolveAssetImpl(token, fileName, owner.surfaceCredential).pipe(
+        yield* resolveAssetImpl(token, fileName, {
+          surfaceCredentials: [owner.surfaceCredential ?? ""],
+        }).pipe(
           Effect.provide(
             Layer.mock(SessionStore.SessionStore)({
               cookieName: "t3_asset_access_revoked_test",
@@ -508,6 +566,249 @@ describe("AssetAccess", () => {
     }).pipe(Effect.provide(testLayer)),
   );
 
+  it.effect("issues factory workspace URLs with relay routing metadata", () => {
+    let workspaceRoot = process.cwd();
+    const factoryLayer = makeAssetAccessTestLayer(() =>
+      Effect.sync(() =>
+        makeFactoryReadModel({
+          projectId: "project-factory-workspace",
+          threadId: "thread-factory-workspace",
+          workspaceRoot,
+        }),
+      ),
+    );
+    return Effect.gen(function* () {
+      const fileSystem = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const root = yield* fileSystem.makeTempDirectoryScoped({
+        prefix: "t3-asset-factory-workspace-",
+      });
+      workspaceRoot = root;
+      const htmlPath = path.join(root, "report.html");
+      const cssPath = path.join(root, "report.css");
+      const percentCssPath = path.join(root, "theme%20.css");
+      yield* fileSystem.writeFileString(htmlPath, '<link rel="stylesheet" href="report.css">');
+      yield* fileSystem.writeFileString(cssPath, "body { color: red; }");
+      yield* fileSystem.writeFileString(percentCssPath, "body { color: blue; }");
+      const canonicalHtmlPath = yield* fileSystem.realPath(htmlPath);
+      const canonicalCssPath = yield* fileSystem.realPath(cssPath);
+      const canonicalPercentCssPath = yield* fileSystem.realPath(percentCssPath);
+
+      const result = yield* issueAssetUrl({
+        resource: {
+          _tag: "workspace-file",
+          threadId: ThreadId.make("thread-factory-workspace"),
+          path: htmlPath,
+        },
+        workspaceRoot: root,
+        dataAudience: "factory",
+        issuingAudience: "factory",
+      });
+      const suffix = assetRouteSuffix(result.relativeUrl);
+      const separatorIndex = suffix.indexOf("/");
+      const token = suffix.slice(0, separatorIndex);
+
+      expect(decodeAssetRelayRoutingClaim(token)).toMatchObject({
+        kind: "workspace-file",
+        dataAudience: "factory",
+        issuingAudience: "factory",
+        issuingBackendId: TEST_ENVIRONMENT_ID,
+      });
+      expect(
+        summarizeAssetResolution(yield* resolveAsset(token, "report.html", "factory")),
+      ).toEqual({
+        kind: "file",
+        path: canonicalHtmlPath,
+      });
+      expect(summarizeAssetResolution(yield* resolveAsset(token, "report.css", "factory"))).toEqual(
+        {
+          kind: "file",
+          path: canonicalCssPath,
+        },
+      );
+      expect(
+        summarizeAssetResolution(yield* resolveAsset(token, "theme%2520.css", "factory")),
+      ).toEqual({ kind: "file", path: canonicalPercentCssPath });
+      expect(yield* resolveAsset(token, "broken%ZZ.css", "factory")).toBeNull();
+      expect(
+        summarizeAssetResolution(
+          yield* resolveLocalAssetRelay({
+            token,
+            encodedRelativePath: "report.html",
+            viewerSessionId: OTHER_SURFACE_SESSION_ID,
+            viewerAudienceCeiling: "factory",
+          }),
+        ),
+      ).toEqual({ kind: "file", path: canonicalHtmlPath });
+    }).pipe(Effect.provide(factoryLayer));
+  });
+
+  it.effect("masks nested private workspace assets for directory-scoped factory tokens", () => {
+    let workspaceRoot = process.cwd();
+    let nestedPrivateRoot = process.cwd();
+    const factoryLayer = makeAssetAccessTestLayer(() =>
+      Effect.succeed({
+        snapshotSequence: 1,
+        updatedAt: "2026-07-19T00:00:00.000Z",
+        projects: [
+          {
+            id: "project-factory-nested",
+            workspaceRoot,
+            dataAudience: "factory",
+            deletedAt: null,
+          },
+          {
+            id: "project-private-nested",
+            workspaceRoot: nestedPrivateRoot,
+            dataAudience: "private",
+            deletedAt: null,
+          },
+        ],
+        threads: [
+          {
+            id: "thread-factory-nested-private",
+            projectId: "project-factory-nested",
+            dataAudience: "factory",
+            deletedAt: null,
+            worktreePath: null,
+          },
+        ],
+      } as unknown as OrchestrationReadModel),
+    );
+
+    return Effect.gen(function* () {
+      const fileSystem = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const root = yield* fileSystem.makeTempDirectoryScoped({
+        prefix: "t3-asset-nested-private-",
+      });
+      const privateRoot = path.join(root, "private-project");
+      workspaceRoot = root;
+      nestedPrivateRoot = privateRoot;
+      yield* fileSystem.makeDirectory(privateRoot, { recursive: true });
+      const htmlPath = path.join(root, "report.html");
+      const secretCssPath = path.join(privateRoot, "secret.css");
+      yield* fileSystem.writeFileString(htmlPath, "<html></html>");
+      yield* fileSystem.writeFileString(secretCssPath, "body { color: black; }");
+      const canonicalHtmlPath = yield* fileSystem.realPath(htmlPath);
+
+      const result = yield* issueAssetUrl({
+        resource: {
+          _tag: "workspace-file",
+          threadId: ThreadId.make("thread-factory-nested-private"),
+          path: htmlPath,
+        },
+        workspaceRoot: root,
+        dataAudience: "factory",
+        issuingAudience: "factory",
+      });
+      const suffix = assetRouteSuffix(result.relativeUrl);
+      const separatorIndex = suffix.indexOf("/");
+      const token = suffix.slice(0, separatorIndex);
+
+      expect(
+        summarizeAssetResolution(yield* resolveAsset(token, "report.html", "factory")),
+      ).toEqual({ kind: "file", path: canonicalHtmlPath });
+      expect(yield* resolveAsset(token, "private-project/secret.css", "factory")).toBeNull();
+      expect(yield* resolveAsset(token, "private-project/missing.css", "factory")).toBeNull();
+    }).pipe(Effect.provide(factoryLayer));
+  });
+
+  it.effect("issues factory attachment capabilities with relay routing metadata", () => {
+    const factoryLayer = makeAssetAccessTestLayer(() =>
+      Effect.succeed(
+        makeFactoryReadModel({
+          projectId: "project-factory",
+          threadId: "thread-factory",
+          workspaceRoot: process.cwd(),
+        }),
+      ),
+    );
+    return Effect.gen(function* () {
+      const config = yield* ServerConfig.ServerConfig;
+      const fileSystem = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const attachmentId = "thread-factory-00000000-0000-4000-8000-000000000006";
+      const attachmentPath = path.join(config.attachmentsDir, `${attachmentId}.png`);
+      yield* fileSystem.makeDirectory(config.attachmentsDir, { recursive: true });
+      yield* fileSystem.writeFile(attachmentPath, new Uint8Array([1, 2, 3]));
+
+      const result = yield* issueAssetUrl({
+        resource: { _tag: "attachment", attachmentId },
+        dataAudience: "factory",
+        issuingAudience: "factory",
+      });
+      const suffix = assetRouteSuffix(result.relativeUrl);
+      const separatorIndex = suffix.indexOf("/");
+      const token = suffix.slice(0, separatorIndex);
+
+      expect(decodeAssetRelayRoutingClaim(token)).toMatchObject({
+        kind: "attachment",
+        dataAudience: "factory",
+        issuingAudience: "factory",
+        issuingBackendId: TEST_ENVIRONMENT_ID,
+      });
+      expect(
+        summarizeAssetResolution(yield* resolveAsset(token, "ignored.png", "factory")),
+      ).toEqual({
+        kind: "file",
+        path: attachmentPath,
+      });
+      expect(yield* resolveAssetImpl(token, "ignored.png")).toBeNull();
+      expect(
+        summarizeAssetResolution(
+          yield* resolveLocalAssetRelay({
+            token,
+            encodedRelativePath: "ignored.png",
+            viewerSessionId: OTHER_SURFACE_SESSION_ID,
+            viewerAudienceCeiling: "factory",
+          }),
+        ),
+      ).toEqual({ kind: "file", path: attachmentPath });
+      expect(result.relativeUrl).not.toContain(TEST_SURFACE_SESSION_ID);
+      expect(result.surfaceCredential ?? null).toBeNull();
+    }).pipe(Effect.provide(factoryLayer));
+  });
+
+  it.effect("preserves signed direct URLs for factory web clients without relay capability", () => {
+    const factoryLayer = makeAssetAccessTestLayer(() =>
+      Effect.succeed(
+        makeFactoryReadModel({
+          projectId: "project-old-client",
+          threadId: "thread-old-client",
+          workspaceRoot: process.cwd(),
+        }),
+      ),
+    );
+    return Effect.gen(function* () {
+      const config = yield* ServerConfig.ServerConfig;
+      const fileSystem = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const attachmentId = "thread-old-client-00000000-0000-4000-8000-000000000001";
+      const attachmentPath = path.join(config.attachmentsDir, `${attachmentId}.png`);
+      yield* fileSystem.makeDirectory(config.attachmentsDir, { recursive: true });
+      yield* fileSystem.writeFile(attachmentPath, new Uint8Array([1, 2, 3]));
+
+      const result = yield* issueAssetUrlImpl({
+        resource: { _tag: "attachment", attachmentId },
+        dataAudience: "factory",
+        issuingAudience: "factory",
+      });
+      const suffix = assetRouteSuffix(result.relativeUrl);
+      const separatorIndex = suffix.indexOf("/");
+      const token = suffix.slice(0, separatorIndex);
+
+      expect(result.relativeUrl).toMatch(/^\/api\/assets\/(?!relay\/)/);
+      expect(result.surfaceCredential ?? null).toBeNull();
+      expect(yield* resolveAssetImpl(token, "ignored.png")).toBeNull();
+      expect(
+        summarizeAssetResolution(
+          yield* resolveAssetImpl(token, "ignored.png", { allowUnbound: true }),
+        ),
+      ).toEqual({ kind: "file", path: attachmentPath });
+    }).pipe(Effect.provide(factoryLayer));
+  });
+
   it.effect("issues project favicon capabilities with a signed fallback", () =>
     Effect.gen(function* () {
       const fileSystem = yield* FileSystem.FileSystem;
@@ -524,6 +825,9 @@ describe("AssetAccess", () => {
       });
       const faviconSuffix = assetRouteSuffix(faviconResult.relativeUrl);
       const faviconSeparatorIndex = faviconSuffix.indexOf("/");
+      expect(
+        decodeAssetRelayRoutingClaim(faviconSuffix.slice(0, faviconSeparatorIndex)),
+      ).toMatchObject({ kind: "project-favicon" });
       expect(
         summarizeAssetResolution(
           yield* resolveAsset(

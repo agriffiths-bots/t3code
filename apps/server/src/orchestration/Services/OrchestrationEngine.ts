@@ -16,7 +16,18 @@ import type * as Effect from "effect/Effect";
 import type * as Stream from "effect/Stream";
 
 import type { OrchestrationDispatchError } from "../Errors.ts";
+import type { OrchestrationCommandDispatchAuthority } from "../commandAudienceGuard.ts";
 import type { OrchestrationEventStoreError } from "../../persistence/Errors.ts";
+
+/**
+ * Trusted in-process condition evaluated when a command reaches the head of
+ * the engine's serialized queue. Transport callers cannot provide one.
+ */
+export type OrchestrationCommandAcceptanceGuard = Effect.Effect<
+  void,
+  OrchestrationDispatchError,
+  never
+>;
 
 /**
  * OrchestrationEngineShape - Service API for orchestration command and event flow.
@@ -48,6 +59,8 @@ export interface OrchestrationEngineShape {
    */
   readonly dispatch: (
     command: OrchestrationCommand,
+    authority: OrchestrationCommandDispatchAuthority,
+    acceptanceGuard?: OrchestrationCommandAcceptanceGuard,
   ) => Effect.Effect<{ sequence: number }, OrchestrationDispatchError, never>;
 
   /**
@@ -56,6 +69,8 @@ export interface OrchestrationEngineShape {
    */
   readonly dispatchCoordinated?: (
     command: OrchestrationCommand,
+    authority: OrchestrationCommandDispatchAuthority,
+    acceptanceGuard?: OrchestrationCommandAcceptanceGuard,
   ) => Effect.Effect<{ sequence: number }, OrchestrationDispatchError, never>;
 
   /**
@@ -64,6 +79,13 @@ export interface OrchestrationEngineShape {
    * This is a hot runtime stream (new events only), not a historical replay.
    */
   readonly streamDomainEvents: Stream.Stream<OrchestrationEvent>;
+
+  /**
+   * The latest sequence reflected in the engine's authoritative command read
+   * model (0 if none). Used to gauge how far behind a resuming client is before
+   * choosing between an incremental replay and a fresh projected snapshot.
+   */
+  readonly latestSequence: Effect.Effect<number, never, never>;
 }
 
 /**
@@ -85,4 +107,11 @@ export class OrchestrationEngineService extends Context.Service<
 export const dispatchAlreadyCoordinated = (
   engine: OrchestrationEngineShape,
   command: OrchestrationCommand,
-) => (engine.dispatchCoordinated ?? engine.dispatch)(command);
+  authority: OrchestrationCommandDispatchAuthority,
+  acceptanceGuard?: OrchestrationCommandAcceptanceGuard,
+) => {
+  const dispatch = engine.dispatchCoordinated ?? engine.dispatch;
+  return acceptanceGuard === undefined
+    ? dispatch(command, authority)
+    : dispatch(command, authority, acceptanceGuard);
+};

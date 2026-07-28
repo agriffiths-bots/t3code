@@ -76,11 +76,15 @@ const decodeElicitationComplete = Schema.decodeUnknownEffect(
   AcpSchema.ElicitationCompleteNotification,
 );
 const parserFactory = RpcSerialization.ndJsonRpc();
+const decodeWireLine = Schema.decodeUnknownSync(Schema.UnknownFromJsonString);
+const encodeWireLine = Schema.encodeUnknownSync(Schema.UnknownFromJsonString);
+const decodeBytes = (bytes: Uint8Array): string => new TextDecoder().decode(bytes);
 
 export const makeAcpPatchedProtocol = Effect.fn("makeAcpPatchedProtocol")(function* (
   options: AcpPatchedProtocolOptions,
 ): Effect.fn.Return<AcpPatchedProtocol, never, Scope.Scope> {
   const parser = parserFactory.makeUnsafe();
+  const inboundTextDecoder = new TextDecoder();
   const serverQueue = yield* Queue.unbounded<RpcMessage.FromClientEncoded>();
   const clientQueue = yield* Queue.unbounded<RpcMessage.FromServerEncoded>();
   const notificationQueue = yield* Queue.unbounded<AcpIncomingNotification>();
@@ -89,6 +93,228 @@ export const makeAcpPatchedProtocol = Effect.fn("makeAcpPatchedProtocol")(functi
   const nextRequestId = yield* Ref.make(1n);
   const terminationHandled = yield* Ref.make(false);
   const extPending = yield* Ref.make(new Map<string, AcpPendingRequest>());
+  // Peer-chosen request ids that cannot cross the RPC bridge as-is (its
+  // request-id type requires an integer, and duplicate keys collide) are
+  // remapped to internally allocated alias ids and restored on the outgoing
+  // response wire line, preserving the original JSON type — the wire type is
+  // captured at raw-decode time because the parser stringifies every id.
+  // `activeInboundRequestIds` tracks every id currently crossing the bridge —
+  // forwarded peer ids and aliases alike — so an alias can never collide with
+  // an in-flight peer id.
+  let nextInboundAliasId = -1n;
+  type InboundRequestIdAlias = {
+    readonly originalId: string;
+    readonly originalIdWasString: boolean;
+  };
+  type InboundAliasNode = {
+    readonly aliasId: string;
+    readonly originalKey: string;
+    previous: InboundAliasNode | undefined;
+    next: InboundAliasNode | undefined;
+  };
+  const inboundRequestIdAliases = new Map<string, InboundRequestIdAlias>();
+  const inboundRequestIdAliasesByOriginal = new Map<string, InboundAliasNode>();
+  const inboundAliasNodesByAliasId = new Map<string, InboundAliasNode>();
+  const activeInboundRequestIds = new Set<string>();
+  const originalRequestIdKey = (requestId: string, idWasString: boolean) =>
+    `${idWasString ? "string" : "number"}:${requestId}`;
+  const isForwardableRequestId = (requestId: string): boolean => /^-?\d+$/.test(requestId);
+  const allocateInboundAliasId = (): string => {
+    let aliasId = String(nextInboundAliasId);
+    nextInboundAliasId -= 1n;
+    while (activeInboundRequestIds.has(aliasId) || inboundRequestIdAliases.has(aliasId)) {
+      aliasId = String(nextInboundAliasId);
+      nextInboundAliasId -= 1n;
+    }
+    return aliasId;
+  };
+  const registerInboundAlias = (originalId: string, originalIdWasString: boolean): string => {
+    const aliasId = allocateInboundAliasId();
+    const alias = { originalId, originalIdWasString } satisfies InboundRequestIdAlias;
+    inboundRequestIdAliases.set(aliasId, alias);
+    const originalKey = originalRequestIdKey(alias.originalId, alias.originalIdWasString);
+    const previous = inboundRequestIdAliasesByOriginal.get(originalKey);
+    const node: InboundAliasNode = { aliasId, originalKey, previous, next: undefined };
+    if (previous !== undefined) {
+      previous.next = node;
+    }
+    inboundRequestIdAliasesByOriginal.set(originalKey, node);
+    inboundAliasNodesByAliasId.set(aliasId, node);
+    activeInboundRequestIds.add(aliasId);
+    return aliasId;
+  };
+  const unregisterInboundAliasControlMapping = (aliasId: string): void => {
+    const node = inboundAliasNodesByAliasId.get(aliasId);
+    if (node === undefined) {
+      return;
+    }
+    if (node.previous !== undefined) {
+      node.previous.next = node.next;
+    }
+    if (node.next !== undefined) {
+      node.next.previous = node.previous;
+    }
+    if (inboundRequestIdAliasesByOriginal.get(node.originalKey) === node) {
+      if (node.previous === undefined) {
+        inboundRequestIdAliasesByOriginal.delete(node.originalKey);
+      } else {
+        inboundRequestIdAliasesByOriginal.set(node.originalKey, node.previous);
+      }
+    }
+    inboundAliasNodesByAliasId.delete(aliasId);
+  };
+  const rollbackPreparedInboundIds = (requestIds: ReadonlyArray<string>): void => {
+    for (const requestId of requestIds) {
+      const alias = inboundRequestIdAliases.get(requestId);
+      if (alias !== undefined) {
+        unregisterInboundAliasControlMapping(requestId);
+        inboundRequestIdAliases.delete(requestId);
+      }
+      activeInboundRequestIds.delete(requestId);
+    }
+  };
+
+  // Normalize request ids before the JSON-RPC parser records batch keys. The
+  // parser stringifies ids, so raw `42` and `"42"` otherwise collide before
+  // the later routing layer can distinguish them, and extension replies also
+  // need the original JSON type restored.
+  let inboundWireBuffer = "";
+  const prepareInboundChunk = (
+    chunkText: string,
+  ): {
+    readonly encoded: string;
+    readonly idWasStringFlags: Array<boolean | undefined>;
+    readonly preparedRequestIds: ReadonlyArray<string>;
+  } => {
+    inboundWireBuffer += chunkText;
+    const flags: Array<boolean | undefined> = [];
+    const preparedRequestIds: Array<string> = [];
+    let encoded = "";
+    try {
+      let position = 0;
+      let nlIndex = inboundWireBuffer.indexOf("\n", position);
+      while (nlIndex !== -1) {
+        const item = decodeWireLine(inboundWireBuffer.slice(position, nlIndex));
+        const preparedValues = (Array.isArray(item) ? item : [item]).map((value) => {
+          if (typeof value !== "object" || value === null) {
+            flags.push(undefined);
+            return value;
+          }
+          const params = "params" in value ? value.params : undefined;
+          if (
+            "method" in value &&
+            typeof value.method === "string" &&
+            value.method.startsWith("@effect/rpc/") &&
+            typeof params === "object" &&
+            params !== null &&
+            "requestId" in params
+          ) {
+            const requestIdWasString = typeof params.requestId === "string";
+            flags.push(requestIdWasString);
+            if (params.requestId === 0) {
+              const routedRequestId = inboundRequestIdAliasesByOriginal.get(
+                originalRequestIdKey("0", false),
+              )?.aliasId;
+              return {
+                ...value,
+                params: {
+                  ...params,
+                  requestId: routedRequestId === undefined ? "0" : Number(routedRequestId),
+                },
+              };
+            }
+            return value;
+          }
+          const idWasString = "id" in value ? typeof value.id === "string" : undefined;
+          flags.push(idWasString);
+          if (
+            !("method" in value) ||
+            typeof value.method !== "string" ||
+            !("id" in value) ||
+            (typeof value.id !== "string" && typeof value.id !== "number")
+          ) {
+            return value;
+          }
+          const originalId = String(value.id);
+          const canForward =
+            isForwardableRequestId(originalId) && idWasString !== true && originalId !== "0";
+          if (canForward && !activeInboundRequestIds.has(originalId)) {
+            activeInboundRequestIds.add(originalId);
+            preparedRequestIds.push(originalId);
+            return value;
+          }
+          const aliasId = registerInboundAlias(originalId, idWasString === true);
+          preparedRequestIds.push(aliasId);
+          return { ...value, id: Number(aliasId) };
+        });
+        encoded += `${encodeWireLine(Array.isArray(item) ? preparedValues : preparedValues[0])}\n`;
+        position = nlIndex + 1;
+        nlIndex = inboundWireBuffer.indexOf("\n", position);
+      }
+      inboundWireBuffer = inboundWireBuffer.slice(position);
+      return { encoded, idWasStringFlags: flags, preparedRequestIds };
+    } catch (cause) {
+      rollbackPreparedInboundIds(preparedRequestIds);
+      throw cause;
+    }
+  };
+
+  const restoreAliasedReplyIds = (
+    line: string | Uint8Array,
+    transientAlias?: { readonly encodedId: string; readonly alias: InboundRequestIdAlias },
+    omitEmptyNotificationId = false,
+  ): string | Uint8Array => {
+    if (
+      inboundRequestIdAliases.size === 0 &&
+      transientAlias === undefined &&
+      !omitEmptyNotificationId
+    ) {
+      return line;
+    }
+    const lineText = typeof line === "string" ? line : decodeBytes(line);
+    const decodedFrames = lineText
+      .split("\n")
+      .filter((frame) => frame.length > 0)
+      .map((frame) => decodeWireLine(frame));
+    let restoredAny = false;
+    const restore = (value: unknown): unknown => {
+      if (value === null || typeof value !== "object" || Array.isArray(value)) {
+        return value;
+      }
+      const response = value as Record<string, unknown>;
+      if (!("id" in response)) {
+        return value;
+      }
+      if (omitEmptyNotificationId && response.id === "") {
+        const { id: _, ...notification } = response;
+        restoredAny = true;
+        return notification;
+      }
+      const encodedId = String(response.id);
+      const alias =
+        transientAlias?.encodedId === encodedId
+          ? transientAlias.alias
+          : inboundRequestIdAliases.get(encodedId);
+      if (alias === undefined) {
+        return value;
+      }
+      if (response.chunk !== true && transientAlias?.encodedId !== encodedId) {
+        inboundRequestIdAliases.delete(encodedId);
+        activeInboundRequestIds.delete(encodedId);
+      }
+      restoredAny = true;
+      return {
+        ...response,
+        id: alias.originalIdWasString ? alias.originalId : Number(alias.originalId),
+      };
+    };
+    const restoredFrames = decodedFrames.map((decoded) =>
+      Array.isArray(decoded) ? decoded.map(restore) : restore(decoded),
+    );
+    return restoredAny
+      ? `${restoredFrames.map((frame) => encodeWireLine(frame)).join("\n")}\n`
+      : line;
+  };
 
   const logProtocol = (event: AcpProtocolLogEvent) => {
     if (event.direction === "incoming" && !options.logIncoming) {
@@ -120,10 +346,60 @@ export const makeAcpPatchedProtocol = Effect.fn("makeAcpPatchedProtocol")(functi
           ? message.requestId
           : undefined;
     const requestId = encodedRequestId === "" ? undefined : encodedRequestId;
+    const omitEmptyNotificationId = message._tag === "Request" && message.id === "";
+    const aliasedPeer =
+      message._tag === "Exit" || message._tag === "Chunk"
+        ? inboundRequestIdAliases.get(message.requestId)
+        : undefined;
+    const inboundChunkTarget =
+      message._tag === "Chunk" && activeInboundRequestIds.has(message.requestId)
+        ? (aliasedPeer ?? {
+            originalId: message.requestId,
+            originalIdWasString: false,
+          })
+        : undefined;
     const encoded = yield* Effect.try({
-      try: () => parser.encode(message),
+      try: () => {
+        // A Chunk is not a terminal batch response. Encode it with a fresh id
+        // that the parser cannot associate with an inbound batch, then restore
+        // the real peer id on the emitted wire frame.
+        const transientChunkAliasId =
+          inboundChunkTarget !== undefined ? allocateInboundAliasId() : undefined;
+        const messageForEncoding =
+          transientChunkAliasId === undefined
+            ? message
+            : { ...message, requestId: transientChunkAliasId };
+        const line = parser.encode(messageForEncoding);
+        if (!line) {
+          return line;
+        }
+        if (
+          message._tag !== "Exit" &&
+          transientChunkAliasId === undefined &&
+          !omitEmptyNotificationId
+        ) {
+          return line;
+        }
+        return restoreAliasedReplyIds(
+          line,
+          inboundChunkTarget === undefined || transientChunkAliasId === undefined
+            ? undefined
+            : {
+                alias: inboundChunkTarget,
+                encodedId: transientChunkAliasId,
+              },
+          omitEmptyNotificationId,
+        );
+      },
       catch: (cause) => AcpError.AcpProtocolParseError.fromEncodingError(method, requestId, cause),
     });
+    if (message._tag === "Exit") {
+      if (aliasedPeer === undefined) {
+        activeInboundRequestIds.delete(message.requestId);
+      } else {
+        unregisterInboundAliasControlMapping(message.requestId);
+      }
+    }
 
     if (encoded) {
       yield* logProtocol({
@@ -243,6 +519,37 @@ export const makeAcpPatchedProtocol = Effect.fn("makeAcpPatchedProtocol")(functi
       },
     });
 
+  // A notification whose payload fails schema decoding must never terminate
+  // the transport or abort the remaining messages decoded from the same
+  // buffer: agents ship new session/update variants ahead of this client, and
+  // a prompt response following the poison message still has to be routed.
+  const dropUndecodableNotification = (error: AcpError.AcpProtocolParseError) =>
+    logProtocol({
+      direction: "incoming",
+      stage: "decode_failed",
+      payload: {
+        operation: error.operation,
+        ...(error.method === undefined ? {} : { method: error.method }),
+        ...(error.issueCount === undefined ? {} : { issueCount: error.issueCount }),
+        ...(error.issueKinds === undefined ? {} : { issueKinds: error.issueKinds }),
+        ...(error.maximumPathDepth === undefined
+          ? {}
+          : { maximumPathDepth: error.maximumPathDepth }),
+      },
+    }).pipe(
+      // Never log the error object itself: its schema cause embeds the
+      // rejected notification values.
+      Effect.andThen(
+        Effect.logWarning("Dropped ACP notification with undecodable payload.").pipe(
+          Effect.annotateLogs({
+            operation: error.operation,
+            ...(error.method === undefined ? {} : { method: error.method }),
+            ...(error.issueCount === undefined ? {} : { issueCount: error.issueCount }),
+          }),
+        ),
+      ),
+    );
+
   const handleExtRequest = (message: RpcMessage.RequestEncoded) => {
     if (!options.onExtRequest) {
       return respondWithError(message.id, AcpError.AcpRequestError.methodNotFound(message.tag));
@@ -279,6 +586,7 @@ export const makeAcpPatchedProtocol = Effect.fn("makeAcpPatchedProtocol")(functi
             ),
           ),
           Effect.flatMap(dispatchNotification),
+          Effect.catchTag("AcpProtocolParseError", dropUndecodableNotification),
         );
       }
       if (message.tag === CLIENT_METHODS.session_elicitation_complete) {
@@ -299,6 +607,7 @@ export const makeAcpPatchedProtocol = Effect.fn("makeAcpPatchedProtocol")(functi
             ),
           ),
           Effect.flatMap(dispatchNotification),
+          Effect.catchTag("AcpProtocolParseError", dropUndecodableNotification),
         );
       }
       return dispatchNotification({
@@ -334,11 +643,32 @@ export const makeAcpPatchedProtocol = Effect.fn("makeAcpPatchedProtocol")(functi
       );
     }
 
+    // Request ids were normalized before parser.decode so the parser and RPC
+    // bridge share the same unique batch/request key.
     return Queue.offer(serverQueue, message).pipe(Effect.asVoid);
   };
 
-  const handleExitEncoded = (message: RpcMessage.ResponseExitEncoded) =>
-    Ref.get(extPending).pipe(
+  // Every request id this client issues is an integer (both the RPC client's
+  // counter and `nextRequestId` for extension requests), and the RPC client
+  // converts forwarded response ids with `BigInt`. A response whose id is
+  // anything else answers no outstanding request and is a peer bug — grok CLI
+  // 0.2.93 broadcasts a response with the literal id "skills-reload" to every
+  // session when its skills directory changes — and forwarding it would kill
+  // the receive loop with a BigInt conversion defect, silently hanging every
+  // in-flight request.
+  const dropForeignPeerMessage = (tag: string, requestId: string) =>
+    Effect.logWarning("Dropping ACP message with a foreign request id.").pipe(
+      Effect.annotateLogs({ tag, requestId }),
+    );
+
+  const isForeignPeerResponseId = (requestId: string, idWasString?: boolean) =>
+    idWasString === true || !isForwardableRequestId(requestId);
+
+  const handleExitEncoded = (message: RpcMessage.ResponseExitEncoded, idWasString?: boolean) => {
+    if (isForeignPeerResponseId(message.requestId, idWasString)) {
+      return dropForeignPeerMessage("Exit", message.requestId);
+    }
+    return Ref.get(extPending).pipe(
       Effect.flatMap((pending) => {
         const pendingRequest = pending.get(message.requestId);
         if (!pendingRequest) {
@@ -368,28 +698,34 @@ export const makeAcpPatchedProtocol = Effect.fn("makeAcpPatchedProtocol")(functi
         );
       }),
     );
+  };
 
   const routeDecodedMessage = (
     message: RpcMessage.FromClientEncoded | RpcMessage.FromServerEncoded,
+    idWasString?: boolean,
   ): Effect.Effect<void, AcpError.AcpError> => {
     switch (message._tag) {
       case "Request":
         return handleRequestEncoded(message);
       case "Exit":
-        return handleExitEncoded(message);
+        return handleExitEncoded(message, idWasString);
       case "Chunk":
+        if (isForeignPeerResponseId(message.requestId, idWasString)) {
+          return dropForeignPeerMessage("Chunk", message.requestId);
+        }
         return Ref.get(extPending).pipe(
           Effect.flatMap((pending) => {
             const pendingRequest = pending.get(message.requestId);
-            return pendingRequest
-              ? completeExtPendingFailure(
+            if (pendingRequest) {
+              return completeExtPendingFailure(
+                message.requestId,
+                AcpError.AcpRequestError.unsupportedStreamingResponse(
+                  pendingRequest.method,
                   message.requestId,
-                  AcpError.AcpRequestError.unsupportedStreamingResponse(
-                    pendingRequest.method,
-                    message.requestId,
-                  ),
-                )
-              : Queue.offer(clientQueue, message).pipe(Effect.asVoid);
+                ),
+              );
+            }
+            return Queue.offer(clientQueue, message).pipe(Effect.asVoid);
           }),
         );
       case "Defect":
@@ -398,6 +734,13 @@ export const makeAcpPatchedProtocol = Effect.fn("makeAcpPatchedProtocol")(functi
         return Queue.offer(clientQueue, message).pipe(Effect.asVoid);
       case "Ack":
       case "Interrupt":
+        return Queue.offer(serverQueue, {
+          ...message,
+          requestId:
+            inboundRequestIdAliasesByOriginal.get(
+              originalRequestIdKey(message.requestId, idWasString === true),
+            )?.aliasId ?? message.requestId,
+        }).pipe(Effect.asVoid);
       case "Ping":
       case "Eof":
         return Queue.offer(serverQueue, message).pipe(Effect.asVoid);
@@ -405,18 +748,30 @@ export const makeAcpPatchedProtocol = Effect.fn("makeAcpPatchedProtocol")(functi
   };
 
   yield* options.stdio.stdin.pipe(
-    Stream.runForEach((data) =>
-      logProtocol({
+    Stream.runForEach((data) => {
+      const chunkText =
+        typeof data === "string"
+          ? `${inboundTextDecoder.decode()}${data}`
+          : inboundTextDecoder.decode(data, { stream: true });
+      return logProtocol({
         direction: "incoming",
         stage: "raw",
-        payload: typeof data === "string" ? data : new TextDecoder().decode(data),
+        payload: chunkText,
       }).pipe(
         Effect.flatMap(() =>
           Effect.try({
-            try: () =>
-              parser.decode(data) as ReadonlyArray<
-                RpcMessage.FromClientEncoded | RpcMessage.FromServerEncoded
-              >,
+            try: () => {
+              const prepared = prepareInboundChunk(chunkText);
+              try {
+                const messages = parser.decode(prepared.encoded) as ReadonlyArray<
+                  RpcMessage.FromClientEncoded | RpcMessage.FromServerEncoded
+                >;
+                return { messages, idWasStringFlags: prepared.idWasStringFlags };
+              } catch (cause) {
+                rollbackPreparedInboundIds(prepared.preparedRequestIds);
+                throw cause;
+              }
+            },
             catch: (cause) =>
               new AcpError.AcpProtocolParseError({
                 operation: "decode-wire-message",
@@ -424,7 +779,7 @@ export const makeAcpPatchedProtocol = Effect.fn("makeAcpPatchedProtocol")(functi
               }),
           }),
         ),
-        Effect.tap((messages) =>
+        Effect.tap(({ messages }) =>
           logProtocol({
             direction: "incoming",
             stage: "decoded",
@@ -447,13 +802,17 @@ export const makeAcpPatchedProtocol = Effect.fn("makeAcpPatchedProtocol")(functi
             },
           }),
         ),
-        Effect.flatMap((messages) =>
-          Effect.forEach(messages, routeDecodedMessage, {
-            discard: true,
-          }),
+        Effect.flatMap(({ messages, idWasStringFlags }) =>
+          Effect.forEach(
+            messages,
+            (message, index) => routeDecodedMessage(message, idWasStringFlags[index]),
+            {
+              discard: true,
+            },
+          ),
         ),
-      ),
-    ),
+      );
+    }),
     Effect.matchEffect({
       onFailure: (error) => {
         const normalized: AcpError.AcpError = isAcpError(error)
@@ -464,11 +823,13 @@ export const makeAcpPatchedProtocol = Effect.fn("makeAcpPatchedProtocol")(functi
             });
         return handleTermination(() => Effect.succeed(normalized));
       },
-      onSuccess: () =>
-        handleTermination(
+      onSuccess: () => {
+        inboundTextDecoder.decode();
+        return handleTermination(
           () =>
             options.terminationError ?? Effect.succeed(new AcpError.AcpInputStreamEndedError({})),
-        ),
+        );
+      },
     }),
     Effect.forkScoped,
   );

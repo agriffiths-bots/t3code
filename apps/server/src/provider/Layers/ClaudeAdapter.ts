@@ -73,12 +73,14 @@ import { ServerConfig } from "../../config.ts";
 import { makeClaudeMcpServers } from "../../mcp/McpProviderInjection.ts";
 import * as McpProviderSession from "../../mcp/McpProviderSession.ts";
 import * as WorkerProcessIsolation from "../../process/WorkerProcessIsolation.ts";
+import { resolveClaudeSdkExecutablePath } from "../Drivers/ClaudeExecutable.ts";
 import { makeClaudeEnvironment } from "../Drivers/ClaudeHome.ts";
 import {
   getClaudeModelCapabilities,
   isClaudeUltracodeEffort,
   normalizeClaudeCliEffort,
   resolveClaudeApiModelId,
+  resolveClaudeContextWindow,
   resolveClaudeEffort,
 } from "./ClaudeProvider.ts";
 import {
@@ -518,24 +520,18 @@ function selectedClaudeContextWindow(
   switch (modelSelection?.model) {
     case "claude-opus-4-8":
     case "claude-opus-4-7":
+      // Always 1M at the API; these models expose no contextWindow option.
       return 1_000_000;
   }
 
-  const optionValue = getModelSelectionStringOptionValue(modelSelection, "contextWindow");
-  if (optionValue === "1m") {
-    return 1_000_000;
+  switch (resolveClaudeContextWindow(modelSelection)) {
+    case "1m":
+      return 1_000_000;
+    case "200k":
+      return 200_000;
+    default:
+      return undefined;
   }
-  if (optionValue === "200k") {
-    return 200_000;
-  }
-  const caps = getClaudeModelCapabilities(modelSelection?.model);
-  const hasContextWindowOption = getProviderOptionDescriptors({ caps }).some(
-    (descriptor) => descriptor.type === "select" && descriptor.id === "contextWindow",
-  );
-  if (hasContextWindowOption) {
-    return 200_000;
-  }
-  return undefined;
 }
 
 function finiteNonNegativeInteger(value: unknown): number | undefined {
@@ -1550,6 +1546,10 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
   const crypto = yield* Crypto.Crypto;
   const claudeEnvironment = yield* makeClaudeEnvironment(claudeSettings, options?.environment).pipe(
     Effect.provideService(Path.Path, path),
+  );
+  const claudeSdkExecutablePath = yield* resolveClaudeSdkExecutablePath(
+    claudeSettings.binaryPath,
+    claudeEnvironment,
   );
   const nativeEventLogger =
     options?.nativeEventLogger ??
@@ -3677,7 +3677,7 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
       const canUseTool: CanUseTool = (toolName, toolInput, callbackOptions) =>
         runPromise(canUseToolEffect(toolName, toolInput, callbackOptions));
 
-      const claudeBinaryPath = claudeSettings.binaryPath;
+      const claudeBinaryPath = claudeSdkExecutablePath;
       const workerExecutable =
         input.detached === true
           ? yield* workerProcessIsolation

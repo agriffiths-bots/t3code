@@ -631,6 +631,89 @@ describe("VcsStatusBroadcaster", () => {
     });
   });
 
+  it.effect("stops the remote poller when stream visibility is revoked", () => {
+    const state = {
+      currentLocalStatus: baseLocalStatus,
+      currentRemoteStatus: baseRemoteStatus,
+      localStatusCalls: 0,
+      remoteStatusCalls: 0,
+      localInvalidationCalls: 0,
+      remoteInvalidationCalls: 0,
+    };
+    let remoteInterruptedDeferred: Deferred.Deferred<void, never> | null = null;
+    let remoteStartedDeferred: Deferred.Deferred<void, never> | null = null;
+    let visible = true;
+    const testLayer = VcsStatusBroadcaster.layer.pipe(
+      Layer.provideMerge(NodeServices.layer),
+      Layer.provide(
+        Layer.mock(GitWorkflowService.GitWorkflowService)({
+          localStatus: () =>
+            Effect.sync(() => {
+              state.localStatusCalls += 1;
+              return state.currentLocalStatus;
+            }),
+          remoteStatus: () =>
+            Effect.sync(() => {
+              state.remoteStatusCalls += 1;
+            }).pipe(
+              Effect.andThen(
+                remoteStartedDeferred
+                  ? Deferred.succeed(remoteStartedDeferred, undefined).pipe(Effect.ignore)
+                  : Effect.void,
+              ),
+              Effect.andThen(Effect.never as Effect.Effect<VcsStatusRemoteResult | null, never>),
+              Effect.onInterrupt(() =>
+                remoteInterruptedDeferred
+                  ? Deferred.succeed(remoteInterruptedDeferred, undefined).pipe(Effect.ignore)
+                  : Effect.void,
+              ),
+            ),
+          invalidateLocalStatus: () =>
+            Effect.sync(() => {
+              state.localInvalidationCalls += 1;
+            }),
+          invalidateRemoteStatus: () =>
+            Effect.sync(() => {
+              state.remoteInvalidationCalls += 1;
+            }),
+        } satisfies Partial<GitWorkflowService.GitWorkflowService["Service"]>),
+      ),
+    );
+
+    return Effect.gen(function* () {
+      const remoteInterrupted = yield* Deferred.make<void>();
+      const remoteStarted = yield* Deferred.make<void>();
+      remoteInterruptedDeferred = remoteInterrupted;
+      remoteStartedDeferred = remoteStarted;
+
+      const broadcaster = yield* VcsStatusBroadcaster.VcsStatusBroadcaster;
+      const firstSnapshot = yield* Deferred.make<VcsStatusStreamEvent>();
+      const streamScope = yield* Scope.make();
+      yield* Stream.runForEach(
+        broadcaster.streamStatus(
+          { cwd: "/repo" },
+          {
+            isVisible: Effect.sync(() => visible),
+            visibilityRecheckInterval: Duration.millis(10),
+          },
+        ),
+        (event) =>
+          event._tag === "snapshot"
+            ? Deferred.succeed(firstSnapshot, event).pipe(Effect.ignore)
+            : Effect.void,
+      ).pipe(Effect.forkIn(streamScope));
+
+      yield* Deferred.await(firstSnapshot);
+      yield* Deferred.await(remoteStarted);
+      assert.equal(state.remoteStatusCalls, 1);
+
+      visible = false;
+      yield* TestClock.adjust(Duration.millis(10));
+      yield* Deferred.await(remoteInterrupted);
+      yield* Scope.close(streamScope, Exit.void);
+    }).pipe(Effect.provide(testLayer));
+  });
+
   it.effect("stops the remote poller after the last stream subscriber disconnects", () => {
     const state = {
       currentLocalStatus: baseLocalStatus,

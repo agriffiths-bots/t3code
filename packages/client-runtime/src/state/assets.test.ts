@@ -1,5 +1,5 @@
 import { describe, expect, it } from "@effect/vitest";
-import { EnvironmentId } from "@t3tools/contracts";
+import { ASSET_SAME_ORIGIN_RELAY_V1_CAPABILITY, EnvironmentId } from "@t3tools/contracts";
 import * as Layer from "effect/Layer";
 import { Atom } from "effect/unstable/reactivity";
 
@@ -9,6 +9,7 @@ import {
   createAssetEnvironmentAtoms,
   InvalidAssetCollectionKeyError,
   parseAssetCollectionKey,
+  withAssetClientCapabilities,
 } from "./assets.ts";
 
 describe("asset surface binding", () => {
@@ -106,6 +107,30 @@ describe("asset surface binding", () => {
   });
 });
 
+describe("asset client capabilities", () => {
+  it("keeps plain-URL web image consumers on legacy asset URLs", () => {
+    const resource = { _tag: "attachment" as const, attachmentId: "attachment-1" };
+
+    expect(withAssetClientCapabilities({ resource, surfaceCredentialBinding: "none" })).toEqual({
+      resource,
+    });
+  });
+
+  it("advertises same-origin relay support for native header/cookie binding", () => {
+    const resource = { _tag: "attachment" as const, attachmentId: "attachment-1" };
+
+    expect(
+      withAssetClientCapabilities({
+        resource,
+        surfaceCredentialBinding: "native-header-or-cookie",
+      }),
+    ).toEqual({
+      resource,
+      capabilities: [ASSET_SAME_ORIGIN_RELAY_V1_CAPABILITY],
+    });
+  });
+});
+
 describe("asset collection keys", () => {
   it("preserves malformed JSON and its native cause", () => {
     const key = "not-json";
@@ -134,7 +159,7 @@ describe("createAssetEnvironmentAtoms", () => {
       EnvironmentRegistry,
       never
     >;
-    const assets = createAssetEnvironmentAtoms(runtime);
+    const assets = createAssetEnvironmentAtoms(runtime, { surfaceCredentialBinding: "none" });
     const environmentId = EnvironmentId.make("environment-1");
     const originalTarget = {
       environmentId,
@@ -181,7 +206,7 @@ describe("createAssetEnvironmentAtoms", () => {
       EnvironmentRegistry,
       never
     >;
-    const assets = createAssetEnvironmentAtoms(runtime);
+    const assets = createAssetEnvironmentAtoms(runtime, { surfaceCredentialBinding: "none" });
     const environmentId = EnvironmentId.make("environment-1");
     const resources = [
       { _tag: "attachment" as const, attachmentId: "attachment-1" },

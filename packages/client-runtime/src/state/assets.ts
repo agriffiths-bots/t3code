@@ -3,6 +3,7 @@ import {
   AssetResource,
   EnvironmentId,
   WS_METHODS,
+  type AssetCreateUrlInput,
   type AssetCreateUrlResult,
 } from "@t3tools/contracts";
 import * as Schema from "effect/Schema";
@@ -85,8 +86,23 @@ export async function bindAssetSurface(
   }
 }
 
+export type AssetSurfaceCredentialBinding = "none" | "native-header-or-cookie";
+
+export function withAssetClientCapabilities(input: {
+  readonly resource: AssetResource;
+  readonly surfaceCredentialBinding: AssetSurfaceCredentialBinding;
+}): AssetCreateUrlInput {
+  return {
+    resource: input.resource,
+    ...(input.surfaceCredentialBinding === "native-header-or-cookie"
+      ? { capabilities: [ASSET_SAME_ORIGIN_RELAY_V1_CAPABILITY] }
+      : {}),
+  };
+}
+
 export function createAssetEnvironmentAtoms<R, E>(
   runtime: Atom.AtomRuntime<EnvironmentRegistry | R, E>,
+  options: { readonly surfaceCredentialBinding: AssetSurfaceCredentialBinding },
 ) {
   const createUrlQuery = createEnvironmentRpcQueryAtomFamily(runtime, {
     label: "environment-data:assets:create-url",
@@ -101,10 +117,10 @@ export function createAssetEnvironmentAtoms<R, E>(
   }) =>
     createUrlQuery({
       environmentId: target.environmentId,
-      input: {
-        resource: target.input.resource,
-        capabilities: [ASSET_SAME_ORIGIN_RELAY_V1_CAPABILITY],
-      },
+      input: withAssetClientCapabilities({
+        ...target.input,
+        surfaceCredentialBinding: options.surfaceCredentialBinding,
+      }),
     });
   const createUrlsFamily = Atom.family((key: string) => {
     const [environmentId, resources] = parseAssetCollectionKey(key);

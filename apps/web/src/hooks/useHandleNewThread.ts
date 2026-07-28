@@ -23,7 +23,12 @@ import {
   getProjectOrderKey,
   selectProjectGroupingSettings,
 } from "../logicalProject";
-import { readThreadShell, useProjects, useServerConfigs, useThread } from "../state/entities";
+import {
+  readThreadShell,
+  useDraftAwareThread,
+  useProjects,
+  useServerConfigs,
+} from "../state/entities";
 import { resolveNewDraftStartFromOrigin } from "../lib/chatThreadActions";
 import { resolveThreadRouteTarget } from "../threadRoutes";
 import { legacyProjectCwdPreferenceKey, useUiStateStore } from "../uiStateStore";
@@ -47,6 +52,7 @@ export function useNewThreadHandler() {
         worktreePath?: string | null;
         envMode?: DraftThreadEnvMode;
         startFromOrigin?: boolean;
+        replace?: boolean;
       },
     ): Promise<void> => {
       const {
@@ -120,6 +126,7 @@ export function useNewThreadHandler() {
           await router.navigate({
             to: "/draft/$draftId",
             params: { draftId: reusableStoredDraftThread.draftId },
+            replace: options?.replace ?? false,
           });
         })();
       }
@@ -180,6 +187,7 @@ export function useNewThreadHandler() {
         await router.navigate({
           to: "/draft/$draftId",
           params: { draftId },
+          replace: options?.replace ?? false,
         });
       })();
     },
@@ -194,7 +202,6 @@ export function useHandleNewThread() {
     select: (params) => resolveThreadRouteTarget(params),
   });
   const routeThreadRef = routeTarget?.kind === "server" ? routeTarget.threadRef : null;
-  const activeThread = useThread(routeThreadRef);
   const getDraftThread = useComposerDraftStore((store) => store.getDraftThread);
   const activeDraftThread = useComposerDraftStore(() =>
     routeTarget
@@ -203,6 +210,7 @@ export function useHandleNewThread() {
         : useComposerDraftStore.getState().getDraftSession(routeTarget.draftId)
       : null,
   );
+  const activeThread = useDraftAwareThread(routeThreadRef, activeDraftThread);
   const projects = useProjects();
   const orderedProjects = useMemo(() => {
     return orderItemsByPreferredIds({

@@ -1,3 +1,4 @@
+import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Option from "effect/Option";
@@ -6,6 +7,7 @@ import * as Cause from "effect/Cause";
 import {
   type ChatAttachment,
   type ClientOrchestrationCommand,
+  type IsoDateTime,
   type OrchestrationCommand,
   OrchestrationDispatchCommandError,
   PROVIDER_SEND_TURN_MAX_IMAGE_BYTES,
@@ -14,8 +16,15 @@ import {
 import { createAttachmentId, resolveAttachmentPath } from "../attachmentStore.ts";
 import { ServerConfig } from "../config.ts";
 import { parseBase64DataUrl } from "../imageMime.ts";
+import { expandHomePath } from "../pathExpansion.ts";
 import { OrchestrationCommandReceiptRepository } from "../persistence/Services/OrchestrationCommandReceipts.ts";
 import * as WorkspacePaths from "../workspace/WorkspacePaths.ts";
+import { ProjectionSnapshotQuery } from "./Services/ProjectionSnapshotQuery.ts";
+import {
+  authorizeOrchestrationCommandReceiptReplay,
+  authorizeOrchestrationCommandMutation,
+  type OrchestrationCommandDispatchAuthority,
+} from "./commandAudienceGuard.ts";
 
 const isPersistedChatAttachment = (attachment: unknown): attachment is ChatAttachment =>
   typeof attachment === "object" &&
@@ -65,8 +74,73 @@ export const cleanupPersistedCommandAttachments = (command: OrchestrationCommand
     );
   });
 
+export const canonicalizeClientCommandTimestamps = (
+  command: ClientOrchestrationCommand,
+  receivedAt: IsoDateTime,
+): ClientOrchestrationCommand => {
+  const canonicalCommand =
+    "createdAt" in command
+      ? {
+          ...command,
+          createdAt: receivedAt,
+        }
+      : command;
+
+  if (canonicalCommand.type !== "thread.turn.start" || !canonicalCommand.bootstrap?.createThread) {
+    return canonicalCommand;
+  }
+
+  return {
+    ...canonicalCommand,
+    bootstrap: {
+      ...canonicalCommand.bootstrap,
+      createThread: {
+        ...canonicalCommand.bootstrap.createThread,
+        createdAt: receivedAt,
+      },
+    },
+  };
+};
+
+// `BootstrapTurnStartDispatcher` recognises a replayed bootstrap turn by
+// fingerprinting the request against the thread it already created, and that
+// fingerprint includes `createdAt`. Canonicalizing the bootstrap timestamp onto
+// the server receipt time would give every retry a fresh value, so the replay
+// would never match and the dispatcher would create a duplicate thread. Keep
+// the client's bootstrap timestamp as the stable identity for that check; the
+// turn-level `createdAt` is still canonicalized.
+const preserveBootstrapCreateThreadTimestamp = (
+  canonicalCommand: ClientOrchestrationCommand,
+  originalCommand: ClientOrchestrationCommand,
+): ClientOrchestrationCommand => {
+  if (
+    canonicalCommand.type !== "thread.turn.start" ||
+    !canonicalCommand.bootstrap?.createThread ||
+    originalCommand.type !== "thread.turn.start" ||
+    !originalCommand.bootstrap?.createThread
+  ) {
+    return canonicalCommand;
+  }
+
+  return {
+    ...canonicalCommand,
+    bootstrap: {
+      ...canonicalCommand.bootstrap,
+      createThread: {
+        ...canonicalCommand.bootstrap.createThread,
+        createdAt: originalCommand.bootstrap.createThread.createdAt,
+      },
+    },
+  };
+};
+
 export const normalizeDispatchCommand = (command: ClientOrchestrationCommand) =>
   Effect.gen(function* () {
+    const receivedAt = DateTime.formatIso(yield* DateTime.now);
+    const canonicalCommand = preserveBootstrapCreateThreadTimestamp(
+      canonicalizeClientCommandTimestamps(command, receivedAt),
+      command,
+    );
     const fileSystem = yield* FileSystem.FileSystem;
     const path = yield* Path.Path;
     const serverConfig = yield* ServerConfig;
@@ -99,38 +173,41 @@ export const normalizeDispatchCommand = (command: ClientOrchestrationCommand) =>
           ),
         );
 
-    if (command.type === "project.create") {
+    if (canonicalCommand.type === "project.create") {
       return {
-        ...command,
+        ...canonicalCommand,
         workspaceRoot: yield* normalizeProjectWorkspaceRootForCreate(
-          command.workspaceRoot,
-          command.createWorkspaceRootIfMissing,
+          canonicalCommand.workspaceRoot,
+          canonicalCommand.createWorkspaceRootIfMissing,
         ),
-        createWorkspaceRootIfMissing: command.createWorkspaceRootIfMissing === true,
+        createWorkspaceRootIfMissing: canonicalCommand.createWorkspaceRootIfMissing === true,
       } satisfies OrchestrationCommand;
     }
 
-    if (command.type === "project.meta.update" && command.workspaceRoot !== undefined) {
+    if (
+      canonicalCommand.type === "project.meta.update" &&
+      canonicalCommand.workspaceRoot !== undefined
+    ) {
       return {
-        ...command,
-        workspaceRoot: yield* normalizeProjectWorkspaceRoot(command.workspaceRoot),
+        ...canonicalCommand,
+        workspaceRoot: yield* normalizeProjectWorkspaceRoot(canonicalCommand.workspaceRoot),
       } satisfies OrchestrationCommand;
     }
 
-    if (command.type !== "thread.turn.start") {
-      return command as OrchestrationCommand;
+    if (canonicalCommand.type !== "thread.turn.start") {
+      return canonicalCommand as OrchestrationCommand;
     }
 
     const commandReceiptRepository = yield* OrchestrationCommandReceiptRepository;
     const existingReceipt = yield* commandReceiptRepository.getByCommandId({
-      commandId: command.commandId,
+      commandId: canonicalCommand.commandId,
     });
     if (Option.isSome(existingReceipt)) {
-      return command as unknown as OrchestrationCommand;
+      return canonicalCommand as unknown as OrchestrationCommand;
     }
 
     const attachmentWritePlans = yield* Effect.forEach(
-      command.message.attachments,
+      canonicalCommand.message.attachments,
       (attachment) =>
         Effect.gen(function* () {
           const parsed = parseBase64DataUrl(attachment.dataUrl);
@@ -147,7 +224,7 @@ export const normalizeDispatchCommand = (command: ClientOrchestrationCommand) =>
             });
           }
 
-          const attachmentId = createAttachmentId(command.threadId);
+          const attachmentId = createAttachmentId(canonicalCommand.threadId);
           if (!attachmentId) {
             return yield* new OrchestrationDispatchCommandError({
               message: "Failed to create a safe attachment id.",
@@ -182,9 +259,9 @@ export const normalizeDispatchCommand = (command: ClientOrchestrationCommand) =>
     );
 
     const commandWithPersistedAttachments = {
-      ...command,
+      ...canonicalCommand,
       message: {
-        ...command.message,
+        ...canonicalCommand.message,
         attachments: attachmentWritePlans.map(({ attachment }) => attachment),
       },
     } satisfies OrchestrationCommand;
@@ -220,4 +297,67 @@ export const normalizeDispatchCommand = (command: ClientOrchestrationCommand) =>
     );
 
     return commandWithPersistedAttachments;
+  });
+
+const normalizeDispatchCommandForAuthorization = (
+  command: ClientOrchestrationCommand,
+  path: Path.Path,
+): OrchestrationCommand => {
+  if (command.type === "project.create") {
+    return {
+      ...command,
+      workspaceRoot: path.resolve(expandHomePath(command.workspaceRoot.trim())),
+    };
+  }
+  if (command.type === "project.meta.update" && command.workspaceRoot !== undefined) {
+    return {
+      ...command,
+      workspaceRoot: path.resolve(expandHomePath(command.workspaceRoot.trim())),
+    };
+  }
+  if (command.type === "thread.turn.start") {
+    return {
+      ...command,
+      message: {
+        ...command.message,
+        // Attachment payloads do not participate in audience authorization.
+        // Keep the preflight side-effect free; persistence happens only after approval.
+        attachments: [],
+      },
+    };
+  }
+  return command;
+};
+
+export const normalizeAuthorizedDispatchCommand = (
+  command: ClientOrchestrationCommand,
+  authority: OrchestrationCommandDispatchAuthority,
+) =>
+  Effect.gen(function* () {
+    const fileSystem = yield* FileSystem.FileSystem;
+    const path = yield* Path.Path;
+    const commandReceiptRepository = yield* OrchestrationCommandReceiptRepository;
+    const projectionSnapshotQuery = yield* ProjectionSnapshotQuery;
+    const readModel = yield* projectionSnapshotQuery.getCommandReadModel();
+    const existingReceipt = yield* commandReceiptRepository.getByCommandId({
+      commandId: command.commandId,
+    });
+    if (Option.isSome(existingReceipt)) {
+      const replayCommand = command as unknown as OrchestrationCommand;
+      yield* authorizeOrchestrationCommandReceiptReplay({
+        command: replayCommand,
+        readModel,
+        authority,
+        receipt: existingReceipt.value,
+      });
+      return replayCommand;
+    }
+    yield* authorizeOrchestrationCommandMutation({
+      command: normalizeDispatchCommandForAuthorization(command, path),
+      readModel,
+      authority,
+      fileSystem,
+      path,
+    });
+    return yield* normalizeDispatchCommand(command);
   });

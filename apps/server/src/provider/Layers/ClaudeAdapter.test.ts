@@ -42,6 +42,7 @@ import * as WorkerProcessIsolation from "../../process/WorkerProcessIsolation.ts
 import { ServerSettingsService } from "../../serverSettings.ts";
 import { ProviderAdapterProcessError, ProviderAdapterValidationError } from "../Errors.ts";
 import type { ClaudeAdapterShape } from "../Services/ClaudeAdapter.ts";
+import { providerConsumerLifetimeContract } from "../testUtils/providerConsumerLifetimeContract.ts";
 import { makeClaudeAdapter, type ClaudeAdapterLiveOptions } from "./ClaudeAdapter.ts";
 const decodeClaudeSettings = Schema.decodeSync(ClaudeSettings);
 
@@ -894,6 +895,71 @@ describe("ClaudeAdapterLive", () => {
           },
         },
       ]);
+    }).pipe(
+      Effect.provideService(Random.Random, makeDeterministicRandomService()),
+      Effect.provide(harness.layer),
+    );
+  });
+
+  it.effect("satisfies the ClaudeAdapter persistent-consumer lifetime contract", () => {
+    const harness = makeHarness();
+    const threadId = ThreadId.make("thread-claude-consumer-lifetime");
+    return Effect.gen(function* () {
+      const adapter = yield* ClaudeAdapter;
+      yield* providerConsumerLifetimeContract({
+        adapterName: "ClaudeAdapter",
+        adapter,
+        startInput: {
+          threadId,
+          provider: ProviderDriverKind.make("claudeAgent"),
+          runtimeMode: "full-access",
+        },
+        turnInput: {
+          threadId,
+          input: "PONG",
+          attachments: [],
+        },
+        driveTurn: () =>
+          Effect.sync(() => {
+            harness.query.emit({
+              type: "stream_event",
+              session_id: "sdk-session-contract",
+              uuid: "stream-contract-start",
+              parent_tool_use_id: null,
+              event: {
+                type: "content_block_start",
+                index: 0,
+                content_block: { type: "text", text: "" },
+              },
+            } as unknown as SDKMessage);
+            harness.query.emit({
+              type: "stream_event",
+              session_id: "sdk-session-contract",
+              uuid: "stream-contract-delta",
+              parent_tool_use_id: null,
+              event: {
+                type: "content_block_delta",
+                index: 0,
+                delta: { type: "text_delta", text: "PONG" },
+              },
+            } as unknown as SDKMessage);
+            harness.query.emit({
+              type: "stream_event",
+              session_id: "sdk-session-contract",
+              uuid: "stream-contract-stop",
+              parent_tool_use_id: null,
+              event: { type: "content_block_stop", index: 0 },
+            } as unknown as SDKMessage);
+            harness.query.emit({
+              type: "result",
+              subtype: "success",
+              is_error: false,
+              errors: [],
+              session_id: "sdk-session-contract",
+              uuid: "result-contract",
+            } as unknown as SDKMessage);
+          }),
+      });
     }).pipe(
       Effect.provideService(Random.Random, makeDeterministicRandomService()),
       Effect.provide(harness.layer),
@@ -5833,7 +5899,7 @@ describe("ClaudeAdapterLive", () => {
         attachments: [],
       });
 
-      assert.deepEqual(harness.query.setModelCalls, ["claude-opus-4-6"]);
+      assert.deepEqual(harness.query.setModelCalls, ["claude-opus-4-6[1m]"]);
     }).pipe(
       Effect.provideService(Random.Random, makeDeterministicRandomService()),
       Effect.provide(harness.layer),
@@ -5931,10 +5997,11 @@ describe("ClaudeAdapterLive", () => {
       yield* adapter.sendTurn({
         threadId: session.threadId,
         input: "hello again",
-        modelSelection: {
-          instanceId: ProviderInstanceId.make("claudeAgent"),
-          model: "claude-opus-4-6",
-        },
+        modelSelection: createModelSelection(
+          ProviderInstanceId.make("claudeAgent"),
+          "claude-opus-4-6",
+          [{ id: "contextWindow", value: "200k" }],
+        ),
         attachments: [],
       });
 

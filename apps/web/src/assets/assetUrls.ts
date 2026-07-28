@@ -1,6 +1,5 @@
 import { useAtomValue } from "@effect/atom-react";
-import { resolveAssetUrl } from "@t3tools/client-runtime/state/assets";
-import { bindAssetSurface } from "@t3tools/client-runtime/state/assets";
+import { bindAssetSurface, resolveAssetUrl } from "@t3tools/client-runtime/state/assets";
 import type { AssetCreateUrlResult, AssetResource, EnvironmentId } from "@t3tools/contracts";
 import { AsyncResult } from "effect/unstable/reactivity";
 import { useEffect, useMemo, useState } from "react";
@@ -13,6 +12,11 @@ export { resolveAssetUrl } from "@t3tools/client-runtime/state/assets";
 const surfaceBindingPromises = new Map<string, Promise<string | null>>();
 const SURFACE_BIND_RETRY_INITIAL_MS = 1_000;
 const SURFACE_BIND_RETRY_MAX_MS = 30_000;
+
+export type AssetUrlState =
+  | { readonly _tag: "Loading" }
+  | { readonly _tag: "Failure" }
+  | { readonly _tag: "Success"; readonly url: string };
 
 export function resolveBrowserAssetSurfaceBaseUrl(href: string): string | null {
   try {
@@ -108,7 +112,10 @@ function useBoundAssetUrls(
   return bound?.key === key ? bound.urls : immediate;
 }
 
-export function useAssetUrl(environmentId: EnvironmentId, resource: AssetResource): string | null {
+export function useAssetUrlState(
+  environmentId: EnvironmentId,
+  resource: AssetResource,
+): AssetUrlState {
   const preparedConnection = usePreparedConnection(environmentId);
   const surfaceBaseUrl =
     typeof window === "undefined" ? null : resolveBrowserAssetSurfaceBaseUrl(window.location.href);
@@ -124,7 +131,27 @@ export function useAssetUrl(environmentId: EnvironmentId, resource: AssetResourc
     surfaceBaseUrl,
     assets,
   );
-  return urls[0] ?? null;
+  if (result._tag === "Failure") {
+    return { _tag: "Failure" };
+  }
+  if (preparedConnection._tag === "None" || result._tag !== "Success") {
+    return { _tag: "Loading" };
+  }
+  const url = urls[0] ?? null;
+  if (url === null) {
+    return result.value.surfaceCredential === null || result.value.surfaceCredential === undefined
+      ? { _tag: "Failure" }
+      : { _tag: "Loading" };
+  }
+  return { _tag: "Success", url };
+}
+
+export function useAssetUrl(environmentId: EnvironmentId, resource: AssetResource): string | null {
+  const result = useAssetUrlState(environmentId, resource);
+  if (result._tag !== "Success") {
+    return null;
+  }
+  return result.url;
 }
 
 export function useAssetUrls(
