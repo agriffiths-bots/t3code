@@ -2515,7 +2515,6 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
       assert.isString(issued.surfaceCredential);
       assert.notInclude(issued.relativeUrl, issued.surfaceCredential ?? "surface-credential");
 
-      const assetSurfaceCookie = yield* bindAssetSurfaceCredential(issued.surfaceCredential ?? "");
       const assetUrl = yield* getHttpServerUrl(issued.relativeUrl);
       const unboundResponse = yield* fetchEffect(assetUrl);
       assert.equal(unboundResponse.status, 404);
@@ -2523,8 +2522,20 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
         headers: { cookie: otherCookie },
       });
       assert.equal(crossSurfaceResponse.status, 404);
+      const webBindingResponse = yield* fetchEffect(
+        yield* getHttpServerUrl(AssetAccess.ASSET_SURFACE_BIND_PATH),
+        {
+          method: "POST",
+          headers: { cookie: issuerCookie, "content-type": "application/json" },
+          body: jsonRequestBody({ credential: issued.surfaceCredential }),
+        },
+      );
+      assert.equal(webBindingResponse.status, 204);
+      const webSurfaceCookie = webBindingResponse.headers["set-cookie"];
+      assert.isString(webSurfaceCookie);
+      assert.include(webSurfaceCookie ?? "", `Path=${AssetAccess.ASSET_SURFACE_RELAY_PREFIX}`);
       const sameSurfaceResponse = yield* fetchEffect(assetUrl, {
-        headers: { cookie: assetSurfaceCookie },
+        headers: { cookie: `${issuerCookie}; ${webSurfaceCookie?.split(";")[0] ?? ""}` },
       });
       assert.equal(sameSurfaceResponse.status, 200);
       assert.equal(sameSurfaceResponse.headers["cache-control"], "no-store");
