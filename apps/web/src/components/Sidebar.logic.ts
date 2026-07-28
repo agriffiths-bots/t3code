@@ -87,6 +87,27 @@ export function buildMultiSelectThreadContextMenuItems(input: {
   ];
 }
 
+export function filterSidebarV2MultiSelectSettleableThreadKeys<
+  TThread extends {
+    readonly settledOverride: "settled" | "active" | null;
+  },
+>(input: {
+  readonly threadKeys: ReadonlyArray<string>;
+  readonly threadByKey: ReadonlyMap<string, TThread>;
+  readonly settledThreadKeys: ReadonlySet<string>;
+  readonly supportsSettlement: (thread: TThread) => boolean;
+}): string[] {
+  return input.threadKeys.filter((threadKey) => {
+    const thread = input.threadByKey.get(threadKey);
+    return (
+      thread !== undefined &&
+      thread.settledOverride !== "settled" &&
+      !input.settledThreadKeys.has(threadKey) &&
+      input.supportsSettlement(thread)
+    );
+  });
+}
+
 export interface ThreadStatusPill {
   label:
     | "Working"
@@ -491,6 +512,9 @@ export function resolveSidebarV2Status(thread: SidebarV2StatusInput): SidebarV2S
   }
   if (thread.session?.status === "error") {
     return "failed";
+  }
+  if (thread.latestTurn?.state === "running") {
+    return "working";
   }
   if (
     thread.interactionMode === "plan" &&

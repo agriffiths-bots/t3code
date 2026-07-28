@@ -5,6 +5,7 @@ import {
   buildSidebarThreadTreeRows,
   createThreadJumpHintVisibilityController,
   filterSidebarThreadTreeRowsByExpansion,
+  filterSidebarV2MultiSelectSettleableThreadKeys,
   getSidebarThreadIdsToPrewarm,
   getVisibleSidebarThreadIds,
   getVisibleSidebarThreadTreeRowsForPreview,
@@ -115,6 +116,30 @@ describe("buildMultiSelectThreadContextMenuItems", () => {
     expect(
       buildMultiSelectThreadContextMenuItems({ count: 2, hasRunningThread: true }),
     ).toContainEqual({ id: "archive", label: "Archive (2)", disabled: true });
+  });
+});
+
+describe("filterSidebarV2MultiSelectSettleableThreadKeys", () => {
+  it("excludes rows that are already effectively settled", () => {
+    const threadByKey = new Map([
+      ["active", { environmentId: localEnvironmentId, settledOverride: null }],
+      ["pinned-active", { environmentId: localEnvironmentId, settledOverride: "active" }],
+      ["pr-derived", { environmentId: localEnvironmentId, settledOverride: null }],
+      ["explicit-settled", { environmentId: localEnvironmentId, settledOverride: "settled" }],
+      [
+        "unsupported",
+        { environmentId: EnvironmentId.make("environment-old"), settledOverride: null },
+      ],
+    ] as const);
+
+    expect(
+      filterSidebarV2MultiSelectSettleableThreadKeys({
+        threadKeys: ["active", "pinned-active", "pr-derived", "explicit-settled", "unsupported"],
+        threadByKey,
+        settledThreadKeys: new Set(["pr-derived", "explicit-settled"]),
+        supportsSettlement: (thread) => thread.environmentId === localEnvironmentId,
+      }),
+    ).toEqual(["active", "pinned-active"]);
   });
 });
 
@@ -703,6 +728,16 @@ describe("resolveSidebarV2Status", () => {
         session: { ...session, status: "waiting" as const, activeTurnId: null },
       }),
     ).toBe("ready");
+  });
+
+  it("reports working for a running latest turn before session state arrives", () => {
+    expect(
+      resolveSidebarV2Status({
+        ...idle,
+        latestTurn: { ...makeLatestTurn({ completedAt: null }), state: "running" },
+        session: null,
+      }),
+    ).toBe("working");
   });
 
   it("reports failed only while the session status is error", () => {

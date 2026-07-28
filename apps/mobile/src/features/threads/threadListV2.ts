@@ -38,6 +38,9 @@ export function resolveThreadListV2Status(
   if (thread.session?.status === "error") {
     return "failed";
   }
+  if (thread.latestTurn?.state === "running") {
+    return "working";
+  }
   const latestTurnSettled =
     thread.latestTurn?.startedAt != null &&
     thread.latestTurn.completedAt != null &&

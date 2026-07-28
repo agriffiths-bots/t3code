@@ -268,6 +268,7 @@ it.layer(NodeServices.layer)("settled thread decider", (it) => {
         settlementContext: {
           hasPendingApprovals: true,
           hasPendingUserInput: false,
+          hasActionableProposedPlan: false,
           latestPromptMessageAt: null,
         },
       }).pipe(Effect.flip);
@@ -283,10 +284,27 @@ it.layer(NodeServices.layer)("settled thread decider", (it) => {
         settlementContext: {
           hasPendingApprovals: false,
           hasPendingUserInput: false,
+          hasActionableProposedPlan: false,
           latestPromptMessageAt: "1969-12-31T23:59:30.000Z",
         },
       }).pipe(Effect.flip);
       expect(queuedError._tag).toBe("OrchestrationCommandInvariantError");
+
+      const planReadyError = yield* decideOrchestrationCommand({
+        command: {
+          type: "thread.settle",
+          commandId: CommandId.make("cmd-settle-targeted-plan-ready"),
+          threadId: ThreadId.make("thread-1"),
+        },
+        readModel: makeReadModel(null),
+        settlementContext: {
+          hasPendingApprovals: false,
+          hasPendingUserInput: false,
+          hasActionableProposedPlan: true,
+          latestPromptMessageAt: null,
+        },
+      }).pipe(Effect.flip);
+      expect(planReadyError._tag).toBe("OrchestrationCommandInvariantError");
     }),
   );
 

@@ -111,6 +111,25 @@ describe("resolveThreadListV2Status", () => {
       }),
     ).toBe("ready");
   });
+
+  it("reports working for a running latest turn before session state arrives", () => {
+    expect(
+      resolveThreadListV2Status(
+        makeThread({
+          id: ThreadId.make("latest-running"),
+          title: "Latest running",
+          latestTurn: {
+            turnId: TurnId.make("turn-latest-running"),
+            state: "running",
+            assistantMessageId: null,
+            requestedAt: NOW,
+            startedAt: NOW,
+            completedAt: null,
+          },
+        }),
+      ),
+    ).toBe("working");
+  });
 });
 
 describe("sortThreadsForListV2", () => {

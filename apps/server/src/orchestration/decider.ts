@@ -248,6 +248,7 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
   readonly settlementContext?: {
     readonly hasPendingApprovals: boolean;
     readonly hasPendingUserInput: boolean;
+    readonly hasActionableProposedPlan: boolean;
     readonly latestPromptMessageAt: string | null;
   };
 }): Effect.fn.Return<
@@ -577,6 +578,14 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
           new OrchestrationCommandInvariantError({
             commandType: command.type,
             detail: `thread ${command.threadId} has a pending approval or user-input request and cannot be settled`,
+          }),
+        );
+      }
+      if (settlementContext?.hasActionableProposedPlan === true) {
+        return yield* Effect.fail(
+          new OrchestrationCommandInvariantError({
+            commandType: command.type,
+            detail: `thread ${command.threadId} has an actionable proposed plan and cannot be settled`,
           }),
         );
       }

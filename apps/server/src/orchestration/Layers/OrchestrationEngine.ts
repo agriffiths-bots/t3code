@@ -194,6 +194,7 @@ const makeOrchestrationEngine = Effect.gen(function* () {
                 settlementContext: {
                   hasPendingApprovals: settlementContext.hasPendingApprovals,
                   hasPendingUserInput: settlementContext.hasPendingUserInput,
+                  hasActionableProposedPlan: settlementContext.hasActionableProposedPlan,
                   latestPromptMessageAt: settlementContext.latestUserMessageAt,
                 },
               }),

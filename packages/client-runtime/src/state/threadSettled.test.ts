@@ -384,6 +384,22 @@ describe("canSettle", () => {
     );
   });
 
+  it("blocks settling an actionable proposed plan before PR auto-settlement", () => {
+    const planReady = {
+      ...makeShell({ activityAt: FRESH, hasActionableProposedPlan: true }),
+      interactionMode: "plan" as const,
+    };
+
+    expect(canSettle(planReady, { now: NOW })).toBe(false);
+    expect(
+      effectiveSettled(planReady, {
+        now: NOW,
+        autoSettleAfterDays: 3,
+        changeRequestState: "merged",
+      }),
+    ).toBe(false);
+  });
+
   it("blocks settling a queued turn start, only within the grace window", () => {
     const queued = {
       ...makeShell({ activityAt: FRESH }),

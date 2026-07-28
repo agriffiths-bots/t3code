@@ -81,6 +81,7 @@ import { cn } from "~/lib/utils";
 import {
   firstValidTimestampMs,
   filterSidebarThreadTreeRowsByExpansion,
+  filterSidebarV2MultiSelectSettleableThreadKeys,
   hasUnseenCompletion,
   isTrailingDoubleClick,
   pageSidebarV2SettledGroups,
@@ -1222,14 +1223,13 @@ export default function SidebarV2() {
       );
       if (threadKeys.length === 0) return;
       const count = threadKeys.length;
-      const settleableThreadKeys = threadKeys.filter((threadKey) => {
-        const thread = threadByKeyRef.current.get(threadKey);
-        return (
-          thread !== undefined &&
-          thread.settledOverride !== "settled" &&
+      const settleableThreadKeys = filterSidebarV2MultiSelectSettleableThreadKeys({
+        threadKeys,
+        threadByKey: threadByKeyRef.current,
+        settledThreadKeys: settledThreadKeysRef.current,
+        supportsSettlement: (thread) =>
           serverConfigs.get(thread.environmentId)?.environment.capabilities.threadSettlement ===
-            true
-        );
+          true,
       });
       const clicked = await settlePromise(() =>
         api.contextMenu.show(

@@ -532,6 +532,93 @@ describe("OrchestrationEngine", () => {
     await system.dispose();
   });
 
+  it("rejects settling when projected shell has an actionable proposed plan", async () => {
+    const createdAt = now();
+    const system = await createOrchestrationSystem();
+    const { engine, snapshotQuery } = system;
+    const projectId = asProjectId("project-settle-plan-ready");
+    const threadId = ThreadId.make("thread-settle-plan-ready");
+    const modelSelection = {
+      instanceId: ProviderInstanceId.make("codex"),
+      model: "gpt-5-codex",
+    } as const;
+
+    try {
+      await system.run(
+        engine.dispatch(
+          {
+            type: "project.create",
+            commandId: CommandId.make("cmd-settle-plan-ready-project-create"),
+            projectId,
+            title: "Plan Ready Project",
+            workspaceRoot: "/tmp/project-settle-plan-ready",
+            defaultModelSelection: modelSelection,
+            createdAt,
+          },
+          testDispatchAuthority,
+        ),
+      );
+      await system.run(
+        engine.dispatch(
+          {
+            type: "thread.create",
+            commandId: CommandId.make("cmd-settle-plan-ready-thread-create"),
+            threadId,
+            projectId,
+            title: "Plan ready thread",
+            modelSelection,
+            interactionMode: "plan",
+            runtimeMode: "approval-required",
+            branch: null,
+            worktreePath: null,
+            createdAt,
+          },
+          testDispatchAuthority,
+        ),
+      );
+      await system.run(
+        engine.dispatch(
+          {
+            type: "thread.proposed-plan.upsert",
+            commandId: CommandId.make("cmd-settle-plan-ready-plan-upsert"),
+            threadId,
+            proposedPlan: {
+              id: "plan-engine-guard",
+              turnId: null,
+              planMarkdown: "1. Inspect\n2. Implement",
+              implementedAt: null,
+              implementationThreadId: null,
+              createdAt,
+              updatedAt: createdAt,
+            },
+            createdAt,
+          },
+          testDispatchAuthority,
+        ),
+      );
+
+      const projectedShell = await system.run(
+        snapshotQuery.getThreadShellByIdIncludingArchived(threadId),
+      );
+      expect(Option.getOrThrow(projectedShell).hasActionableProposedPlan).toBe(true);
+
+      await expect(
+        system.run(
+          engine.dispatch(
+            {
+              type: "thread.settle",
+              commandId: CommandId.make("cmd-settle-plan-ready-reject"),
+              threadId,
+            },
+            testDispatchAuthority,
+          ),
+        ),
+      ).rejects.toThrow("actionable proposed plan");
+    } finally {
+      await system.dispose();
+    }
+  });
+
   it("replays an authorized receipt before current bootstrap-state authorization", async () => {
     const createdAt = now();
     const system = await createOrchestrationSystem();
