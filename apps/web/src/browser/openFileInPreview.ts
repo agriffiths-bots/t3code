@@ -14,13 +14,13 @@ import * as Cause from "effect/Cause";
 import * as Data from "effect/Data";
 import { AsyncResult } from "effect/unstable/reactivity";
 
-import { resolveAssetUrl } from "~/assets/assetUrls";
 import {
   applyPreviewServerSnapshot,
   isPreviewSupportedInRuntime,
   rememberPreviewUrl,
 } from "~/previewStateStore";
 import { useRightPanelStore } from "~/rightPanelStore";
+import { resolveBoundAssetUrl, resolveBrowserAssetSurfaceBaseUrl } from "~/assets/assetUrls";
 
 export const isBrowserPreviewFile = (path: string): boolean =>
   /\.(?:html?|pdf)$/i.test(path.split(/[?#]/, 1)[0] ?? "");
@@ -84,7 +84,8 @@ export async function openFileInPreview<AssetError, PreviewError>(input: {
   if (assetResult._tag === "Failure") {
     return AsyncResult.failure(assetResult.cause);
   }
-  const assetUrl = resolveAssetUrl(input.httpBaseUrl, assetResult.value.relativeUrl);
+  const surfaceBaseUrl = resolveBrowserAssetSurfaceBaseUrl(window.location.href);
+  const assetUrl = await resolveBoundAssetUrl(input.httpBaseUrl, surfaceBaseUrl, assetResult.value);
   if (assetUrl === null) {
     return AsyncResult.failure(
       Cause.die(new Error("The environment returned an invalid asset URL.")),

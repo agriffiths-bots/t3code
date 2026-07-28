@@ -574,46 +574,56 @@ export const assetRouteLayer = HttpRouter.add(
           .map(([, credential]) => credential),
       );
     }
-    const serverAuth = yield* EnvironmentAuth.EnvironmentAuth;
-    const authenticatedSession = yield* serverAuth
-      .authenticateHttpRequest(request)
-      .pipe(
-        Effect.option,
-        Effect.map(Option.filter((session) => session.scopes.includes(AuthOrchestrationReadScope))),
-      );
 
+    // Factory assets remain short-lived bearer URLs. Private browser assets are issued only
+    // beneath the same-origin relay prefix, where the surface cookie is revalidated on every
+    // request. The direct path deliberately ignores cookies so cross-site DOM loads fail closed
+    // in every browser; native clients may still present the capability explicitly.
     const asset = yield* resolveAsset(
       suffix.slice(0, separatorIndex),
       suffix.slice(separatorIndex + 1),
       {
-        ...(Option.isSome(authenticatedSession)
-          ? { sessionId: authenticatedSession.value.sessionId }
-          : {}),
         surfaceCredentials: requestSurfaceCredentials,
         allowUnbound: !isSurfaceRelay,
       },
     );
     if (!asset) {
       if (isSurfaceRelay) {
-        yield* Effect.logWarning("Asset surface request was masked as not found.", {
+        yield* Effect.logWarning("Asset surface relay request was masked as not found.", {
           "asset.outcome": "masked_not_found",
-          "asset.session_proof_present":
-            Option.isSome(authenticatedSession) || requestSurfaceCredentials.length > 0,
+          "asset.surface_proof_present": requestSurfaceCredentials.length > 0,
         });
       }
       return HttpServerResponse.text("Not Found", { status: 404 });
     }
-    return yield* HttpServerResponse.file(asset.path, {
+    if (asset.kind === "forbidden") {
+      return HttpServerResponse.text("Forbidden", {
+        status: 403,
+        headers: { "Cache-Control": "no-store" },
+      });
+    }
+    const responseHeaders = {
+      "Cache-Control": "no-store",
+      "X-Content-Type-Options": "nosniff",
+    };
+    const contentType = Mime.getType(asset.path) ?? "application/octet-stream";
+    if (request.method === "HEAD") {
+      asset.stream.destroy();
+      return HttpServerResponse.empty({
+        status: 200,
+        headers: {
+          ...responseHeaders,
+          "Content-Length": String(asset.contentLength),
+          "Content-Type": contentType,
+        },
+      });
+    }
+    return HttpServerResponse.raw(asset.stream, {
       status: 200,
-      headers: {
-        // Session-bound assets must be revalidated on every fetch. A private browser cache can
-        // outlive or switch sessions and would otherwise bypass the masking-404 proof check.
-        "Cache-Control": "no-store",
-        "X-Content-Type-Options": "nosniff",
-      },
-    }).pipe(
-      Effect.orElseSucceed(() => HttpServerResponse.text("Internal Server Error", { status: 500 })),
-    );
+      contentType,
+      contentLength: asset.contentLength,
+      headers: responseHeaders,
+    });
   }),
 );
 
@@ -766,14 +776,17 @@ const makeAssetAppRelayRouteLayer = (
           viewerAudienceCeiling: viewer.audienceCeiling,
           ...(viewer.expiresAt ? { viewerSessionExpiresAt: viewer.expiresAt } : {}),
         });
-        if (asset === null) return maskedAssetRelayResponse();
-        return yield* HttpServerResponse.file(asset.path, {
+        if (asset === null || asset.kind === "forbidden") return maskedAssetRelayResponse();
+        const contentType = Mime.getType(asset.path) ?? "application/octet-stream";
+        return HttpServerResponse.raw(asset.stream, {
           status: 200,
+          contentType,
+          contentLength: asset.contentLength,
           headers: {
             "Cache-Control": "no-store",
             "X-Content-Type-Options": "nosniff",
           },
-        }).pipe(Effect.orElseSucceed(maskedAssetRelayResponse));
+        });
       }
 
       const peers = yield* peerRegistry.list.pipe(Effect.orElseSucceed(() => []));

@@ -2,6 +2,7 @@ import * as DateTime from "effect/DateTime";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
+import * as Path from "effect/Path";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Queue from "effect/Queue";
@@ -26,6 +27,8 @@ import {
   type OrchestrationCommand,
   type GitActionProgressEvent,
   type GitManagerServiceError,
+  GitCommandError,
+  VcsRepositoryDetectionError,
   NonNegativeInt,
   OrchestrationDispatchCommandError,
   type OrchestrationEvent,
@@ -63,6 +66,7 @@ import {
   WS_METHODS,
   WsRpcGroup,
 } from "@t3tools/contracts";
+import { HostProcessPlatform } from "@t3tools/shared/hostProcess";
 import { clamp } from "effect/Number";
 import { HttpRouter, HttpServerRequest, HttpServerRespondable } from "effect/unstable/http";
 import { RpcSerialization, RpcServer } from "effect/unstable/rpc";
@@ -109,6 +113,7 @@ import * as VcsProvisioningService from "./vcs/VcsProvisioningService.ts";
 import * as GitWorkflowService from "./git/GitWorkflowService.ts";
 import * as ReviewService from "./review/ReviewService.ts";
 import * as RepositoryIdentityResolver from "./project/RepositoryIdentityResolver.ts";
+import * as ProjectFilesystemAudienceGuard from "./project/ProjectFilesystemAudienceGuard.ts";
 import * as BootstrapTurnStartDispatcher from "./orchestration/Services/BootstrapTurnStartDispatcher.ts";
 import * as ServerEnvironment from "./environment/ServerEnvironment.ts";
 import * as EnvironmentAuth from "./auth/EnvironmentAuth.ts";
@@ -128,24 +133,21 @@ import * as GitHubCli from "./sourceControl/GitHubCli.ts";
 import * as GitLabCli from "./sourceControl/GitLabCli.ts";
 import * as SourceControlProviderRegistry from "./sourceControl/SourceControlProviderRegistry.ts";
 import * as GitVcsDriver from "./vcs/GitVcsDriver.ts";
+import { resolveCreateWorktreePath } from "./vcs/worktreePath.ts";
 import * as VcsDriverRegistry from "./vcs/VcsDriverRegistry.ts";
 import * as VcsProjectConfig from "./vcs/VcsProjectConfig.ts";
 import * as VcsProcess from "./vcs/VcsProcess.ts";
 import * as PairingGrantStore from "./auth/PairingGrantStore.ts";
 import * as SessionStore from "./auth/SessionStore.ts";
 import { failEnvironmentAuthInvalid, failEnvironmentInternal } from "./auth/http.ts";
+import { strictestDataAudience } from "./auth/audienceDataPolicy.ts";
 import * as RelayClient from "@t3tools/shared/relayClient";
 import { makeServerConfigHeartbeatStream, shouldSendServerConfigHeartbeat } from "./wsKeepalive.ts";
 const isOrchestrationDispatchCommandError = Schema.is(OrchestrationDispatchCommandError);
-const isOrchestrationGetSnapshotError = Schema.is(OrchestrationGetSnapshotError);
 const isOrchestrationReplayEventsError = Schema.is(OrchestrationReplayEventsError);
 const isOrchestrationScheduledTaskMutationError = Schema.is(
   OrchestrationScheduledTaskMutationError,
 );
-
-const SHELL_REPLAY_SNAPSHOT_GAP_THRESHOLD = 1_000;
-const strictestDataAudience = (left: DataAudience, right: DataAudience): DataAudience =>
-  left === "private" || right === "private" ? "private" : "factory";
 
 function unexpectedCompatibilityError(error: never): never {
   throw new Error(`Unhandled compatibility error: ${String(error)}`);
@@ -422,6 +424,7 @@ const makeWsRpcLayer = (currentSession: EnvironmentAuth.AuthenticatedSession) =>
       const keybindings = yield* Keybindings.Keybindings;
       const externalLauncher = yield* ExternalLauncher.ExternalLauncher;
       const gitWorkflow = yield* GitWorkflowService.GitWorkflowService;
+      const vcsDriverRegistry = yield* VcsDriverRegistry.VcsDriverRegistry;
       const review = yield* ReviewService.ReviewService;
       const vcsProvisioning = yield* VcsProvisioningService.VcsProvisioningService;
       const vcsStatusBroadcaster = yield* VcsStatusBroadcaster.VcsStatusBroadcaster;
@@ -459,6 +462,8 @@ const makeWsRpcLayer = (currentSession: EnvironmentAuth.AuthenticatedSession) =>
       const processResourceMonitor = yield* ProcessResourceMonitor.ProcessResourceMonitor;
       const deviceNotifications = yield* DeviceNotifications.DeviceNotifications;
       const relayClient = yield* RelayClient.RelayClient;
+      const pathService = yield* Path.Path;
+      const hostProcessPlatform = yield* HostProcessPlatform;
       const authenticatedPrincipal = {
         ...currentSession,
         scopes: new Set(currentSession.scopes),
@@ -617,6 +622,257 @@ const makeWsRpcLayer = (currentSession: EnvironmentAuth.AuthenticatedSession) =>
           traceAttributes,
         );
       };
+      const withAuthenticatedPrincipal = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
+        effect.pipe(
+          Effect.provideService(EnvironmentAuthenticatedPrincipal, authenticatedPrincipal),
+        );
+      const withFilesystemGuardServices = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
+        withAuthenticatedPrincipal(effect).pipe(
+          Effect.provideService(FileSystem.FileSystem, fileSystem),
+          Effect.provideService(Path.Path, pathService),
+          Effect.provideService(HostProcessPlatform, hostProcessPlatform),
+          Effect.provideService(
+            ProjectionSnapshotQuery.ProjectionSnapshotQuery,
+            projectionSnapshotQuery,
+          ),
+          Effect.provideService(VcsDriverRegistry.VcsDriverRegistry, vcsDriverRegistry),
+        );
+      const visiblePath = (candidatePath: string): Effect.Effect<boolean, never> =>
+        currentSession.audienceCeiling === "private"
+          ? Effect.succeed(true)
+          : withFilesystemGuardServices(
+              ProjectFilesystemAudienceGuard.isPathVisibleToCurrentAudience(candidatePath),
+            ).pipe(
+              Effect.catchCause((cause) =>
+                Effect.logWarning("filesystem audience guard failed closed", {
+                  candidatePath,
+                  cause,
+                }).pipe(Effect.as(false)),
+              ),
+            );
+      const hasHiddenDescendant = (candidatePath: string): Effect.Effect<boolean, never> =>
+        currentSession.audienceCeiling === "private"
+          ? Effect.succeed(false)
+          : withFilesystemGuardServices(
+              ProjectFilesystemAudienceGuard.hasHiddenDescendantForCurrentAudience(candidatePath),
+            ).pipe(
+              Effect.catchCause((cause) =>
+                Effect.logWarning("filesystem hidden descendant guard failed closed", {
+                  candidatePath,
+                  cause,
+                }).pipe(Effect.as(true)),
+              ),
+            );
+      const projectEntriesDeniedContext = (cwd: string) => ({
+        failure: "workspace_root_not_found" as const,
+        normalizedCwd: pathService.resolve(cwd),
+      });
+      const projectFileDeniedContext = (input: {
+        readonly cwd: string;
+        readonly relativePath: string;
+      }) => ({
+        failure: "operation_failed" as const,
+        resolvedPath: pathService.resolve(input.cwd, input.relativePath),
+        operation: "realpath-workspace-root" as const,
+        operationPath: input.cwd,
+      });
+      const ensureProjectEntriesVisible = (cwd: string) =>
+        visiblePath(cwd).pipe(
+          Effect.flatMap((visible) =>
+            visible
+              ? hasHiddenDescendant(cwd).pipe(Effect.map((hidden) => !hidden))
+              : Effect.succeed(false),
+          ),
+          Effect.flatMap((visible) =>
+            visible
+              ? Effect.void
+              : Effect.fail(
+                  new ProjectListEntriesError({ cwd, ...projectEntriesDeniedContext(cwd) }),
+                ),
+          ),
+        );
+      const ensureProjectSearchVisible = (input: {
+        readonly cwd: string;
+        readonly query: string;
+        readonly limit: number;
+      }) =>
+        visiblePath(input.cwd).pipe(
+          Effect.flatMap((visible) =>
+            visible
+              ? hasHiddenDescendant(input.cwd).pipe(Effect.map((hidden) => !hidden))
+              : Effect.succeed(false),
+          ),
+          Effect.flatMap((visible) =>
+            visible
+              ? Effect.void
+              : Effect.fail(
+                  new ProjectSearchEntriesError({
+                    cwd: input.cwd,
+                    queryLength: input.query.length,
+                    limit: input.limit,
+                    ...projectEntriesDeniedContext(input.cwd),
+                  }),
+                ),
+          ),
+        );
+      const ensureProjectReadVisible = (input: {
+        readonly cwd: string;
+        readonly relativePath: string;
+      }) =>
+        visiblePath(pathService.resolve(input.cwd, input.relativePath)).pipe(
+          Effect.flatMap((visible) =>
+            visible
+              ? Effect.void
+              : Effect.fail(
+                  new ProjectReadFileError({ ...input, ...projectFileDeniedContext(input) }),
+                ),
+          ),
+        );
+      const ensureProjectWriteVisible = (input: {
+        readonly cwd: string;
+        readonly relativePath: string;
+      }) =>
+        visibleMutationTarget({ cwd: input.cwd, targetPath: input.relativePath }).pipe(
+          Effect.flatMap((visible) =>
+            visible
+              ? Effect.void
+              : Effect.fail(
+                  new ProjectWriteFileError({ ...input, ...projectFileDeniedContext(input) }),
+                ),
+          ),
+        );
+      const ensureBrowseVisible = (
+        input: {
+          readonly cwd?: string | undefined;
+          readonly partialPath: string;
+        },
+        target: WorkspaceEntries.ResolvedBrowseTarget,
+      ) =>
+        visiblePath(target.parentPath).pipe(
+          Effect.flatMap((visible) =>
+            visible
+              ? hasHiddenDescendant(target.parentPath).pipe(Effect.map((hidden) => !hidden))
+              : Effect.succeed(false),
+          ),
+          Effect.flatMap((visible) =>
+            visible
+              ? Effect.void
+              : Effect.fail(
+                  new FilesystemBrowseError({
+                    ...input,
+                    failure: "read_directory_failed",
+                    parentPath: target.parentPath,
+                  }),
+                ),
+          ),
+        );
+      const gitAudienceDenied = (input: {
+        readonly operation: string;
+        readonly command: string;
+        readonly cwd: string;
+      }) =>
+        new GitCommandError({
+          ...input,
+          detail: "Repository was not found.",
+        });
+      const vcsAudienceDenied = (input: { readonly operation: string; readonly cwd: string }) =>
+        new VcsRepositoryDetectionError({
+          ...input,
+          detail: "Repository was not found.",
+        });
+      const ensureGitCwdVisible = (input: {
+        readonly operation: string;
+        readonly command: string;
+        readonly cwd: string;
+      }) =>
+        visiblePath(input.cwd).pipe(
+          Effect.flatMap((visible) =>
+            visible
+              ? withFilesystemGuardServices(
+                  ProjectFilesystemAudienceGuard.hasHiddenDescendantAtGitRepositoryRootForCurrentAudience(
+                    input.cwd,
+                  ),
+                ).pipe(
+                  Effect.catchCause((cause) =>
+                    Effect.logWarning("git repository audience guard failed closed", {
+                      cwd: input.cwd,
+                      cause,
+                    }).pipe(Effect.as(true)),
+                  ),
+                  Effect.map((hidden) => !hidden),
+                )
+              : Effect.succeed(false),
+          ),
+          Effect.flatMap((visible) =>
+            visible ? Effect.void : Effect.fail(gitAudienceDenied(input)),
+          ),
+        );
+      const ensureGitPreparePullRequestVisible = (input: {
+        readonly cwd: string;
+        readonly mode: "local" | "worktree";
+      }) =>
+        ensureGitCwdVisible({
+          operation: "preparePullRequestThread",
+          command: "git fetch",
+          cwd: input.cwd,
+        }).pipe(
+          Effect.andThen(
+            currentSession.audienceCeiling === "factory" && input.mode === "worktree"
+              ? Effect.fail(
+                  gitAudienceDenied({
+                    operation: "preparePullRequestThread",
+                    command: "git worktree add",
+                    cwd: input.cwd,
+                  }),
+                )
+              : Effect.void,
+          ),
+        );
+      const visibleMutationTarget = (input: {
+        readonly cwd: string;
+        readonly targetPath: string;
+      }): Effect.Effect<boolean, never> =>
+        currentSession.audienceCeiling === "private"
+          ? Effect.succeed(true)
+          : withFilesystemGuardServices(
+              ProjectFilesystemAudienceGuard.isMutationTargetVisibleToCurrentAudience(input),
+            ).pipe(
+              Effect.catchCause((cause) =>
+                Effect.logWarning("filesystem mutation audience guard failed closed", {
+                  input,
+                  cause,
+                }).pipe(Effect.as(false)),
+              ),
+            );
+      const ensureGitMutationTargetVisible = (input: {
+        readonly operation: string;
+        readonly command: string;
+        readonly cwd: string;
+        readonly targetPath: string | null;
+      }) => {
+        if (input.targetPath === null) return Effect.void;
+        const targetPath = input.targetPath;
+        return visibleMutationTarget({ cwd: input.cwd, targetPath }).pipe(
+          Effect.flatMap((visible) =>
+            visible ? Effect.void : Effect.fail(gitAudienceDenied(input)),
+          ),
+        );
+      };
+      const ensureVcsInitTargetVisible = (cwd: string) =>
+        visibleMutationTarget({ cwd, targetPath: "." }).pipe(
+          Effect.flatMap((visible) =>
+            visible ? Effect.void : Effect.fail(vcsAudienceDenied({ operation: "init", cwd })),
+          ),
+        );
+      const isGitStatusCwdVisible = (cwd: string): Effect.Effect<boolean, never> =>
+        ensureGitCwdVisible({
+          operation: "status",
+          command: "git status",
+          cwd,
+        }).pipe(
+          Effect.as(true),
+          Effect.orElseSucceed(() => false),
+        );
       const toDispatchCommandError = (cause: unknown, fallbackMessage: string) =>
         isOrchestrationDispatchCommandError(cause)
           ? cause
@@ -1016,9 +1272,16 @@ const makeWsRpcLayer = (currentSession: EnvironmentAuth.AuthenticatedSession) =>
       });
 
       const refreshGitStatus = (cwd: string) =>
-        vcsStatusBroadcaster
-          .refreshStatus(cwd)
-          .pipe(Effect.ignoreCause({ log: true }), Effect.forkDetach, Effect.asVoid);
+        ensureGitCwdVisible({
+          operation: "status",
+          command: "git status",
+          cwd,
+        }).pipe(
+          Effect.andThen(vcsStatusBroadcaster.refreshStatus(cwd)),
+          Effect.ignoreCause({ log: true }),
+          Effect.forkDetach,
+          Effect.asVoid,
+        );
 
       // Enable/disable reuses the same repository update logic the MCP
       // t3_schedule_update handler calls: load the row, flip `enabled`, write
@@ -1752,16 +2015,20 @@ const makeWsRpcLayer = (currentSession: EnvironmentAuth.AuthenticatedSession) =>
         [WS_METHODS.projectsSearchEntries]: (input) =>
           observeRpcEffect(
             WS_METHODS.projectsSearchEntries,
-            workspaceEntries.search(input).pipe(
-              Effect.mapError(
-                (cause) =>
-                  new ProjectSearchEntriesError({
-                    cwd: input.cwd,
-                    queryLength: input.query.length,
-                    limit: input.limit,
-                    ...projectEntriesFailureContext(cause),
-                    cause,
-                  }),
+            ensureProjectSearchVisible(input).pipe(
+              Effect.andThen(
+                workspaceEntries.search(input).pipe(
+                  Effect.mapError(
+                    (cause) =>
+                      new ProjectSearchEntriesError({
+                        cwd: input.cwd,
+                        queryLength: input.query.length,
+                        limit: input.limit,
+                        ...projectEntriesFailureContext(cause),
+                        cause,
+                      }),
+                  ),
+                ),
               ),
             ),
             { "rpc.aggregate": "workspace" },
@@ -1769,14 +2036,18 @@ const makeWsRpcLayer = (currentSession: EnvironmentAuth.AuthenticatedSession) =>
         [WS_METHODS.projectsListEntries]: (input) =>
           observeRpcEffect(
             WS_METHODS.projectsListEntries,
-            workspaceEntries.list(input).pipe(
-              Effect.mapError(
-                (cause) =>
-                  new ProjectListEntriesError({
-                    ...input,
-                    ...projectEntriesFailureContext(cause),
-                    cause,
-                  }),
+            ensureProjectEntriesVisible(input.cwd).pipe(
+              Effect.andThen(
+                workspaceEntries.list(input).pipe(
+                  Effect.mapError(
+                    (cause) =>
+                      new ProjectListEntriesError({
+                        ...input,
+                        ...projectEntriesFailureContext(cause),
+                        cause,
+                      }),
+                  ),
+                ),
               ),
             ),
             { "rpc.aggregate": "workspace" },
@@ -1784,14 +2055,18 @@ const makeWsRpcLayer = (currentSession: EnvironmentAuth.AuthenticatedSession) =>
         [WS_METHODS.projectsReadFile]: (input) =>
           observeRpcEffect(
             WS_METHODS.projectsReadFile,
-            workspaceFileSystem.readFile(input).pipe(
-              Effect.mapError(
-                (cause) =>
-                  new ProjectReadFileError({
-                    ...input,
-                    ...projectFileFailureContext(cause),
-                    cause,
-                  }),
+            ensureProjectReadVisible(input).pipe(
+              Effect.andThen(
+                workspaceFileSystem.readFile(input).pipe(
+                  Effect.mapError(
+                    (cause) =>
+                      new ProjectReadFileError({
+                        ...input,
+                        ...projectFileFailureContext(cause),
+                        cause,
+                      }),
+                  ),
+                ),
               ),
             ),
             { "rpc.aggregate": "workspace" },
@@ -1799,15 +2074,19 @@ const makeWsRpcLayer = (currentSession: EnvironmentAuth.AuthenticatedSession) =>
         [WS_METHODS.projectsWriteFile]: (input) =>
           observeRpcEffect(
             WS_METHODS.projectsWriteFile,
-            workspaceFileSystem.writeFile(input).pipe(
-              Effect.mapError(
-                (cause) =>
-                  new ProjectWriteFileError({
-                    cwd: input.cwd,
-                    relativePath: input.relativePath,
-                    ...projectFileFailureContext(cause),
-                    cause,
-                  }),
+            ensureProjectWriteVisible(input).pipe(
+              Effect.andThen(
+                withAuthenticatedPrincipal(workspaceFileSystem.writeFile(input)).pipe(
+                  Effect.mapError(
+                    (cause) =>
+                      new ProjectWriteFileError({
+                        cwd: input.cwd,
+                        relativePath: input.relativePath,
+                        ...projectFileFailureContext(cause),
+                        cause,
+                      }),
+                  ),
+                ),
               ),
             ),
             { "rpc.aggregate": "workspace" },
@@ -1819,7 +2098,8 @@ const makeWsRpcLayer = (currentSession: EnvironmentAuth.AuthenticatedSession) =>
         [WS_METHODS.filesystemBrowse]: (input) =>
           observeRpcEffect(
             WS_METHODS.filesystemBrowse,
-            workspaceEntries.browse(input).pipe(
+            WorkspaceEntries.resolveBrowseTarget(input).pipe(
+              Effect.provideService(Path.Path, pathService),
               Effect.mapError(
                 (cause) =>
                   new FilesystemBrowseError({
@@ -1827,6 +2107,22 @@ const makeWsRpcLayer = (currentSession: EnvironmentAuth.AuthenticatedSession) =>
                     ...filesystemBrowseFailureContext(cause),
                     cause,
                   }),
+              ),
+              Effect.flatMap((target) =>
+                ensureBrowseVisible(input, target).pipe(
+                  Effect.andThen(
+                    workspaceEntries.browseResolved(input, target).pipe(
+                      Effect.mapError(
+                        (cause) =>
+                          new FilesystemBrowseError({
+                            ...input,
+                            ...filesystemBrowseFailureContext(cause),
+                            cause,
+                          }),
+                      ),
+                    ),
+                  ),
+                ),
               ),
             ),
             { "rpc.aggregate": "workspace" },
@@ -1844,29 +2140,40 @@ const makeWsRpcLayer = (currentSession: EnvironmentAuth.AuthenticatedSession) =>
                     }),
               ),
               Effect.flatMap((context) =>
-                issueAssetUrl({
-                  resource: input.resource,
-                  ...(context.workspaceRoot === undefined
-                    ? {}
-                    : { workspaceRoot: context.workspaceRoot }),
-                  dataAudience: context.dataAudience,
-                  issuingAudience: currentSession.audienceCeiling,
-                  ...(input.capabilities ? { clientCapabilities: input.capabilities } : {}),
-                  surfaceSessionId: currentSession.sessionId,
-                  ...(currentSession.expiresAt
-                    ? { surfaceSessionExpiresAt: currentSession.expiresAt }
-                    : {}),
-                }),
+                withFilesystemGuardServices(
+                  issueAssetUrl({
+                    resource: input.resource,
+                    ...(context.workspaceRoot === undefined
+                      ? {}
+                      : { workspaceRoot: context.workspaceRoot }),
+                    dataAudience: context.dataAudience,
+                    issuingAudience: currentSession.audienceCeiling,
+                    ...(input.capabilities ? { clientCapabilities: input.capabilities } : {}),
+                    surfaceSessionId: currentSession.sessionId,
+                    ...(currentSession.expiresAt
+                      ? { surfaceSessionExpiresAt: currentSession.expiresAt }
+                      : {}),
+                  }),
+                ),
               ),
             ),
             { "rpc.aggregate": "workspace" },
           ),
         [WS_METHODS.subscribeVcsStatus]: (input) =>
-          observeRpcStream(
+          observeRpcStreamEffect(
             WS_METHODS.subscribeVcsStatus,
-            vcsStatusBroadcaster.streamStatus(input, {
-              automaticRemoteRefreshInterval: automaticGitFetchInterval,
-            }),
+            ensureGitCwdVisible({
+              operation: "status",
+              command: "git status",
+              cwd: input.cwd,
+            }).pipe(
+              Effect.as(
+                vcsStatusBroadcaster.streamStatus(input, {
+                  automaticRemoteRefreshInterval: automaticGitFetchInterval,
+                  isVisible: isGitStatusCwdVisible(input.cwd),
+                }),
+              ),
+            ),
             {
               "rpc.aggregate": "vcs",
             },
@@ -1874,7 +2181,11 @@ const makeWsRpcLayer = (currentSession: EnvironmentAuth.AuthenticatedSession) =>
         [WS_METHODS.vcsRefreshStatus]: (input) =>
           observeRpcEffect(
             WS_METHODS.vcsRefreshStatus,
-            vcsStatusBroadcaster.refreshStatus(input.cwd),
+            ensureGitCwdVisible({
+              operation: "status",
+              command: "git status",
+              cwd: input.cwd,
+            }).pipe(Effect.andThen(vcsStatusBroadcaster.refreshStatus(input.cwd))),
             {
               "rpc.aggregate": "vcs",
             },
@@ -1882,7 +2193,12 @@ const makeWsRpcLayer = (currentSession: EnvironmentAuth.AuthenticatedSession) =>
         [WS_METHODS.vcsPull]: (input) =>
           observeRpcEffect(
             WS_METHODS.vcsPull,
-            gitWorkflow.pullCurrentBranch(input.cwd).pipe(
+            ensureGitCwdVisible({
+              operation: "pull",
+              command: "git pull --ff-only",
+              cwd: input.cwd,
+            }).pipe(
+              Effect.andThen(gitWorkflow.pullCurrentBranch(input.cwd)),
               Effect.matchCauseEffect({
                 onFailure: (cause) => Effect.failCause(cause),
                 onSuccess: (result) =>
@@ -1895,29 +2211,38 @@ const makeWsRpcLayer = (currentSession: EnvironmentAuth.AuthenticatedSession) =>
           observeRpcStream(
             WS_METHODS.gitRunStackedAction,
             Stream.callback<GitActionProgressEvent, GitManagerServiceError>((queue) =>
-              gitWorkflow
-                .runStackedAction(input, {
-                  actionId: input.actionId,
-                  progressReporter: {
-                    publish: (event) => Queue.offer(queue, event).pipe(Effect.asVoid),
-                  },
-                })
-                .pipe(
-                  Effect.matchCauseEffect({
-                    onFailure: (cause) => Queue.failCause(queue, cause),
-                    onSuccess: () =>
-                      refreshGitStatus(input.cwd).pipe(
-                        Effect.andThen(Queue.end(queue).pipe(Effect.asVoid)),
-                      ),
+              ensureGitCwdVisible({
+                operation: "runStackedAction",
+                command: "git status",
+                cwd: input.cwd,
+              }).pipe(
+                Effect.andThen(
+                  gitWorkflow.runStackedAction(input, {
+                    actionId: input.actionId,
+                    progressReporter: {
+                      publish: (event) => Queue.offer(queue, event).pipe(Effect.asVoid),
+                    },
                   }),
                 ),
+                Effect.matchCauseEffect({
+                  onFailure: (cause) => Queue.failCause(queue, cause),
+                  onSuccess: () =>
+                    refreshGitStatus(input.cwd).pipe(
+                      Effect.andThen(Queue.end(queue).pipe(Effect.asVoid)),
+                    ),
+                }),
+              ),
             ),
             { "rpc.aggregate": "vcs" },
           ),
         [WS_METHODS.gitResolvePullRequest]: (input) =>
           observeRpcEffect(
             WS_METHODS.gitResolvePullRequest,
-            gitWorkflow.resolvePullRequest(input),
+            ensureGitCwdVisible({
+              operation: "resolvePullRequest",
+              command: "git remote get-url origin",
+              cwd: input.cwd,
+            }).pipe(Effect.andThen(gitWorkflow.resolvePullRequest(input))),
             {
               "rpc.aggregate": "git",
             },
@@ -1925,51 +2250,138 @@ const makeWsRpcLayer = (currentSession: EnvironmentAuth.AuthenticatedSession) =>
         [WS_METHODS.gitPreparePullRequestThread]: (input) =>
           observeRpcEffect(
             WS_METHODS.gitPreparePullRequestThread,
-            gitWorkflow
-              .preparePullRequestThread(input)
-              .pipe(Effect.tap(() => refreshGitStatus(input.cwd))),
+            ensureGitPreparePullRequestVisible(input).pipe(
+              Effect.andThen(
+                gitWorkflow
+                  .preparePullRequestThread(input)
+                  .pipe(Effect.tap(() => refreshGitStatus(input.cwd))),
+              ),
+            ),
             { "rpc.aggregate": "git" },
           ),
         [WS_METHODS.vcsListRefs]: (input) =>
-          observeRpcEffect(WS_METHODS.vcsListRefs, gitWorkflow.listRefs(input), {
-            "rpc.aggregate": "vcs",
-          }),
+          observeRpcEffect(
+            WS_METHODS.vcsListRefs,
+            ensureGitCwdVisible({
+              operation: "listRefs",
+              command: "git branch",
+              cwd: input.cwd,
+            }).pipe(Effect.andThen(gitWorkflow.listRefs(input))),
+            {
+              "rpc.aggregate": "vcs",
+            },
+          ),
         [WS_METHODS.vcsCreateWorktree]: (input) =>
           observeRpcEffect(
             WS_METHODS.vcsCreateWorktree,
-            gitWorkflow.createWorktree(input).pipe(Effect.tap(() => refreshGitStatus(input.cwd))),
+            Effect.succeed({
+              ...input,
+              path: resolveCreateWorktreePath({
+                ...input,
+                worktreesDir: config.worktreesDir,
+                pathService,
+              }),
+            }).pipe(
+              Effect.flatMap((resolvedInput) =>
+                ensureGitCwdVisible({
+                  operation: "createWorktree",
+                  command: "git worktree add",
+                  cwd: resolvedInput.cwd,
+                }).pipe(
+                  Effect.andThen(
+                    ensureGitMutationTargetVisible({
+                      operation: "createWorktree",
+                      command: "git worktree add",
+                      cwd: resolvedInput.cwd,
+                      targetPath: resolvedInput.path,
+                    }),
+                  ),
+                  Effect.andThen(
+                    gitWorkflow
+                      .createWorktree(resolvedInput)
+                      .pipe(Effect.tap(() => refreshGitStatus(resolvedInput.cwd))),
+                  ),
+                ),
+              ),
+            ),
             { "rpc.aggregate": "vcs" },
           ),
         [WS_METHODS.vcsRemoveWorktree]: (input) =>
           observeRpcEffect(
             WS_METHODS.vcsRemoveWorktree,
-            gitWorkflow.removeWorktree(input).pipe(Effect.tap(() => refreshGitStatus(input.cwd))),
+            ensureGitCwdVisible({
+              operation: "removeWorktree",
+              command: "git worktree remove",
+              cwd: input.cwd,
+            }).pipe(
+              Effect.andThen(
+                ensureGitMutationTargetVisible({
+                  operation: "removeWorktree",
+                  command: "git worktree remove",
+                  cwd: input.cwd,
+                  targetPath: input.path,
+                }),
+              ),
+              Effect.andThen(
+                gitWorkflow
+                  .removeWorktree(input)
+                  .pipe(Effect.tap(() => refreshGitStatus(input.cwd))),
+              ),
+            ),
             { "rpc.aggregate": "vcs" },
           ),
         [WS_METHODS.vcsCreateRef]: (input) =>
           observeRpcEffect(
             WS_METHODS.vcsCreateRef,
-            gitWorkflow.createRef(input).pipe(Effect.tap(() => refreshGitStatus(input.cwd))),
+            ensureGitCwdVisible({
+              operation: "createRef",
+              command: "git branch",
+              cwd: input.cwd,
+            }).pipe(
+              Effect.andThen(
+                gitWorkflow.createRef(input).pipe(Effect.tap(() => refreshGitStatus(input.cwd))),
+              ),
+            ),
             { "rpc.aggregate": "vcs" },
           ),
         [WS_METHODS.vcsSwitchRef]: (input) =>
           observeRpcEffect(
             WS_METHODS.vcsSwitchRef,
-            gitWorkflow.switchRef(input).pipe(Effect.tap(() => refreshGitStatus(input.cwd))),
+            ensureGitCwdVisible({
+              operation: "switchRef",
+              command: "git checkout",
+              cwd: input.cwd,
+            }).pipe(
+              Effect.andThen(
+                gitWorkflow.switchRef(input).pipe(Effect.tap(() => refreshGitStatus(input.cwd))),
+              ),
+            ),
             { "rpc.aggregate": "vcs" },
           ),
         [WS_METHODS.vcsInit]: (input) =>
           observeRpcEffect(
             WS_METHODS.vcsInit,
-            vcsProvisioning
-              .initRepository(input)
-              .pipe(Effect.tap(() => refreshGitStatus(input.cwd))),
+            ensureVcsInitTargetVisible(input.cwd).pipe(
+              Effect.andThen(
+                vcsProvisioning
+                  .initRepository(input)
+                  .pipe(Effect.tap(() => refreshGitStatus(input.cwd))),
+              ),
+            ),
             { "rpc.aggregate": "vcs" },
           ),
         [WS_METHODS.reviewGetDiffPreview]: (input) =>
-          observeRpcEffect(WS_METHODS.reviewGetDiffPreview, review.getDiffPreview(input), {
-            "rpc.aggregate": "review",
-          }),
+          observeRpcEffect(
+            WS_METHODS.reviewGetDiffPreview,
+            ensureGitCwdVisible({
+              operation: "getDiffPreview",
+              command: "git diff",
+              cwd: input.cwd,
+            }).pipe(Effect.andThen(review.getDiffPreview(input))),
+            {
+              "rpc.aggregate": "review",
+            },
+          ),
         [WS_METHODS.terminalOpen]: (input) =>
           observeRpcEffect(WS_METHODS.terminalOpen, terminalManager.open(input), {
             "rpc.aggregate": "terminal",

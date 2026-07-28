@@ -1,9 +1,9 @@
 import { createAssetEnvironmentAtoms } from "@t3tools/client-runtime/state/assets";
 
 import { connectionAtomRuntime } from "../connection/runtime";
+import { WEB_ASSET_SURFACE_CREDENTIAL_BINDING } from "./assetEnvironmentConfig";
 
-// Browser <img> requests cannot attach the relay's surface credential. Keep web on the
-// pre-relay signed URL path until a browser-specific credential binding is implemented.
 export const assetEnvironment = createAssetEnvironmentAtoms(connectionAtomRuntime, {
-  surfaceCredentialBinding: "none",
+  // Browser assets bind the returned surface credential as a same-origin HttpOnly relay cookie.
+  surfaceCredentialBinding: WEB_ASSET_SURFACE_CREDENTIAL_BINDING,
 });

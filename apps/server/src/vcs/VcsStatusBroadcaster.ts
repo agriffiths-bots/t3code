@@ -25,6 +25,7 @@ import { mergeGitStatusParts } from "@t3tools/shared/git";
 import * as GitWorkflowService from "../git/GitWorkflowService.ts";
 
 const DEFAULT_VCS_STATUS_REFRESH_INTERVAL = Duration.seconds(30);
+const VCS_STATUS_VISIBILITY_RECHECK_INTERVAL = Duration.seconds(1);
 const VCS_STATUS_REFRESH_FAILURE_BASE_DELAY = Duration.seconds(30);
 const VCS_STATUS_REFRESH_FAILURE_MAX_DELAY = Duration.minutes(15);
 const MAX_FAILURE_DIAGNOSTIC_VALUES = 8;
@@ -130,11 +131,13 @@ interface CachedVcsStatus {
 
 interface ActiveRemotePoller {
   readonly fiber: Fiber.Fiber<void, never>;
-  readonly subscriberCount: number;
+  readonly subscribers: ReadonlyMap<symbol, Effect.Effect<boolean, never>>;
 }
 
 interface StreamStatusOptions {
   readonly automaticRemoteRefreshInterval?: Effect.Effect<Duration.Duration, never>;
+  readonly isVisible?: Effect.Effect<boolean, never>;
+  readonly visibilityRecheckInterval?: Duration.Duration;
 }
 
 export function remoteRefreshFailureDelay(
@@ -377,10 +380,32 @@ export const make = Effect.gen(function* () {
     return yield* updateCachedStatus(cwd, local, remote, { publish: true });
   });
 
+  const hasVisibleRemotePollerSubscriber = Effect.fn(
+    "VcsStatusBroadcaster.hasVisibleRemotePollerSubscriber",
+  )(function* (cwd: string) {
+    const activePollers = yield* SynchronizedRef.get(pollersRef);
+    const existing = activePollers.get(cwd);
+    if (!existing) return null;
+    for (const isVisible of existing.subscribers.values()) {
+      if (yield* isVisible) return true;
+    }
+    return false;
+  });
+
+  const waitUntilHidden = Effect.fn("VcsStatusBroadcaster.waitUntilHidden")(function* (
+    isVisible: Effect.Effect<boolean, never>,
+    interval: Duration.Duration,
+  ) {
+    while (yield* isVisible) {
+      yield* Effect.sleep(interval);
+    }
+  });
+
   const makeRemoteRefreshLoop = (
     cwd: string,
     automaticRemoteRefreshInterval: Effect.Effect<Duration.Duration, never>,
     refreshImmediately: boolean,
+    initialSubscriberIsVisible: Effect.Effect<boolean, never>,
   ) => {
     return Effect.gen(function* () {
       const consecutiveFailuresRef = yield* Ref.make(0);
@@ -390,6 +415,12 @@ export const make = Effect.gen(function* () {
         const activeInterval = Duration.isZero(configuredInterval)
           ? DEFAULT_VCS_STATUS_REFRESH_INTERVAL
           : configuredInterval;
+        const visibleSubscriber = yield* hasVisibleRemotePollerSubscriber(cwd);
+        const hasVisibleSubscriber =
+          visibleSubscriber === null ? yield* initialSubscriberIsVisible : visibleSubscriber;
+        if (!hasVisibleSubscriber) {
+          return Duration.min(activeInterval, VCS_STATUS_VISIBILITY_RECHECK_INTERVAL);
+        }
         const needsInitialRefresh = yield* Ref.get(needsInitialRefreshRef);
         if (Duration.isZero(configuredInterval) && !needsInitialRefresh) {
           return activeInterval;
@@ -447,34 +478,45 @@ export const make = Effect.gen(function* () {
     cwd: string,
     automaticRemoteRefreshInterval: Effect.Effect<Duration.Duration, never>,
     refreshImmediately: boolean,
+    isVisible: Effect.Effect<boolean, never>,
   ) {
+    const subscriberId = Symbol(cwd);
     yield* SynchronizedRef.modifyEffect(pollersRef, (activePollers) => {
       const existing = activePollers.get(cwd);
       if (existing) {
+        const nextSubscribers = new Map(existing.subscribers);
+        nextSubscribers.set(subscriberId, isVisible);
         const nextPollers = new Map(activePollers);
         nextPollers.set(cwd, {
           ...existing,
-          subscriberCount: existing.subscriberCount + 1,
+          subscribers: nextSubscribers,
         });
         return Effect.succeed([undefined, nextPollers] as const);
       }
 
-      return makeRemoteRefreshLoop(cwd, automaticRemoteRefreshInterval, refreshImmediately).pipe(
+      return makeRemoteRefreshLoop(
+        cwd,
+        automaticRemoteRefreshInterval,
+        refreshImmediately,
+        isVisible,
+      ).pipe(
         Effect.forkIn(broadcasterScope),
         Effect.map((fiber) => {
           const nextPollers = new Map(activePollers);
           nextPollers.set(cwd, {
             fiber,
-            subscriberCount: 1,
+            subscribers: new Map([[subscriberId, isVisible]]),
           });
           return [undefined, nextPollers] as const;
         }),
       );
     });
+    return subscriberId;
   });
 
   const releaseRemotePoller = Effect.fn("VcsStatusBroadcaster.releaseRemotePoller")(function* (
     cwd: string,
+    subscriberId: symbol,
   ) {
     const pollerToInterrupt = yield* SynchronizedRef.modify(pollersRef, (activePollers) => {
       const existing = activePollers.get(cwd);
@@ -482,11 +524,13 @@ export const make = Effect.gen(function* () {
         return [null, activePollers] as const;
       }
 
-      if (existing.subscriberCount > 1) {
+      const nextSubscribers = new Map(existing.subscribers);
+      nextSubscribers.delete(subscriberId);
+      if (nextSubscribers.size > 0) {
         const nextPollers = new Map(activePollers);
         nextPollers.set(cwd, {
           ...existing,
-          subscriberCount: existing.subscriberCount - 1,
+          subscribers: nextSubscribers,
         });
         return [null, nextPollers] as const;
       }
@@ -509,14 +553,20 @@ export const make = Effect.gen(function* () {
         const initialLocal = yield* getOrLoadLocalStatus(cwd);
         const cachedStatus = yield* getCachedStatus(cwd);
         const initialRemote = cachedStatus?.remote?.value ?? null;
-        yield* retainRemotePoller(
+        const isVisible = options?.isVisible ?? Effect.succeed(true);
+        const subscriberId = yield* retainRemotePoller(
           cwd,
           options?.automaticRemoteRefreshInterval ??
             Effect.succeed(DEFAULT_VCS_STATUS_REFRESH_INTERVAL),
           cachedStatus?.remote === null || cachedStatus?.remote === undefined,
+          isVisible,
         );
 
-        const release = releaseRemotePoller(cwd).pipe(Effect.ignore, Effect.asVoid);
+        const release = releaseRemotePoller(cwd, subscriberId).pipe(Effect.ignore, Effect.asVoid);
+        const stopWhenHidden = waitUntilHidden(
+          isVisible,
+          options?.visibilityRecheckInterval ?? VCS_STATUS_VISIBILITY_RECHECK_INTERVAL,
+        );
 
         return Stream.concat(
           Stream.make({
@@ -528,7 +578,11 @@ export const make = Effect.gen(function* () {
             Stream.filter((event) => event.cwd === cwd),
             Stream.map((event) => event.event),
           ),
-        ).pipe(Stream.ensuring(release));
+        ).pipe(
+          Stream.takeWhileEffect(() => isVisible),
+          Stream.interruptWhen(stopWhenHidden),
+          Stream.ensuring(release),
+        );
       }),
     );
 
