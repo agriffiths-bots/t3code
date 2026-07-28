@@ -221,6 +221,41 @@ describe("buildThreadListV2Items", () => {
 
     expect(items.map((item) => item.thread.id)).toEqual(["included"]);
   });
+
+  it("keeps a mixed parent/child tree together while settling rows independently", () => {
+    const parentId = ThreadId.make("parent");
+    const { items } = buildThreadListV2Items({
+      threads: [
+        makeThread({
+          id: parentId,
+          title: "Settled parent",
+          settledOverride: "settled",
+          settledAt: NOW,
+        }),
+        makeThread({
+          id: ThreadId.make("active-child"),
+          title: "Active child",
+          parentThreadId: parentId,
+        }),
+      ],
+      environmentId: null,
+      searchQuery: "",
+      now: NOW,
+    });
+
+    expect(
+      items.map((item) => ({
+        id: item.thread.id,
+        variant: item.variant,
+        depth: item.treeDepth,
+        open: item.unsettledDescendantCount,
+        divider: item.showSettledDivider,
+      })),
+    ).toEqual([
+      { id: "parent", variant: "slim", depth: 0, open: 1, divider: false },
+      { id: "active-child", variant: "card", depth: 1, open: 0, divider: false },
+    ]);
+  });
 });
 
 describe("buildThreadListV2Items settled paging", () => {
@@ -283,6 +318,53 @@ describe("buildThreadListV2Items settled paging", () => {
       "settled-3",
       "settled-2",
     ]);
+  });
+
+  it("keeps the selected settled tree visible beyond the first page", () => {
+    const selectedRootId = ThreadId.make("selected-page-0");
+    const threads = [
+      ...Array.from({ length: 3 }, (_, index) =>
+        makeThread({
+          id: ThreadId.make(`selected-page-${index}`),
+          title: `Settled ${index}`,
+          settledOverride: "settled",
+          settledAt: NOW,
+          latestUserMessageAt: `2026-06-01T0${index}:00:00.000Z`,
+          latestTurn: {
+            turnId: TurnId.make(`selected-turn-${index}`),
+            state: "completed",
+            requestedAt: `2026-06-01T0${index}:00:00.000Z`,
+            startedAt: `2026-06-01T0${index}:00:00.000Z`,
+            completedAt: `2026-06-01T0${index}:10:00.000Z`,
+            assistantMessageId: null,
+          },
+        }),
+      ),
+      makeThread({
+        id: ThreadId.make("selected-page-child"),
+        title: "Selected settled child",
+        parentThreadId: selectedRootId,
+        settledOverride: "settled",
+        settledAt: NOW,
+      }),
+    ];
+
+    const layout = buildThreadListV2Items({
+      threads,
+      environmentId: null,
+      searchQuery: "",
+      settledLimit: 1,
+      selectedThreadKey: `${environmentId}:selected-page-child`,
+      now: NOW,
+    });
+
+    expect(layout.items.map((item) => item.thread.id)).toEqual([
+      "selected-page-2",
+      "selected-page-0",
+      "selected-page-child",
+    ]);
+    expect(layout.items.map((item) => item.treeDepth)).toEqual([0, 0, 1]);
+    expect(layout.hiddenSettledCount).toBe(1);
   });
 });
 

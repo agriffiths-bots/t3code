@@ -555,14 +555,14 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
         command,
         threadId: command.threadId,
       });
-      // Server-side twin of the client's canSettle session check: a stale
-      // or raced client must not settle a thread whose session is coming
-      // alive or working.
-      if (hasActiveThreadSession(thread.session)) {
+      // Server-side twin of the client's canSettle activity checks: a stale
+      // or raced client must not settle work when either the session or the
+      // latest turn projection already says it is running.
+      if (hasActiveThreadSession(thread.session) || thread.latestTurn?.state === "running") {
         return yield* Effect.fail(
           new OrchestrationCommandInvariantError({
             commandType: command.type,
-            detail: `thread ${command.threadId} has an active session and cannot be settled`,
+            detail: `thread ${command.threadId} has active work and cannot be settled`,
           }),
         );
       }

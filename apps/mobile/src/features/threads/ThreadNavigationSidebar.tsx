@@ -498,6 +498,7 @@ function ThreadNavigationSidebarPane(
             settlementEnvironmentIds,
             autoSettleAfterDays: THREAD_LIST_V2_AUTO_SETTLE_AFTER_DAYS,
             settledLimit: settledVisibleCount,
+            selectedThreadKey: props.selectedThreadKey,
             now: `${nowMinute}:00.000Z`,
           })
         : { items: [], hiddenSettledCount: 0 },
@@ -506,6 +507,7 @@ function ThreadNavigationSidebarPane(
       nowMinute,
       options.selectedEnvironmentId,
       props.searchQuery,
+      props.selectedThreadKey,
       settledVisibleCount,
       settlementEnvironmentIds,
       threadListV2Enabled,
@@ -558,6 +560,8 @@ function ThreadNavigationSidebarPane(
       <ThreadListV2Row
         thread={item.thread}
         variant={item.variant}
+        treeDepth={item.treeDepth}
+        unsettledDescendantCount={item.unsettledDescendantCount}
         showSettledDivider={item.showSettledDivider}
         project={
           projectByKey.get(scopedProjectKey(item.thread.environmentId, item.thread.projectId)) ??
@@ -843,7 +847,7 @@ function ThreadNavigationSidebarPane(
         threadListV2Layout.hiddenSettledCount > 0 ? (
           <Pressable
             accessibilityRole="button"
-            accessibilityLabel={`Show ${Math.min(threadListV2Layout.hiddenSettledCount, THREAD_LIST_V2_SETTLED_PAGE_COUNT)} more settled threads`}
+            accessibilityLabel="Show more settled threads"
             onPress={showMoreSettled}
             className="mx-2 mt-2 items-center rounded-lg border border-dashed border-border py-2.5"
             style={({ pressed }) => ({ opacity: pressed ? 0.6 : 1 })}

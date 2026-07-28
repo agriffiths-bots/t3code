@@ -87,6 +87,9 @@ export function sortThreadsForListV2<T extends { readonly id: string; readonly c
 export interface ThreadListV2Item {
   readonly thread: EnvironmentThreadShell;
   readonly variant: "card" | "slim";
+  readonly treeDepth: number;
+  readonly directChildCount: number;
+  readonly unsettledDescendantCount: number;
   /** First settled row after the card block draws the SETTLED divider. */
   readonly showSettledDivider: boolean;
   readonly isLast: boolean;
@@ -96,6 +99,127 @@ export interface ThreadListV2Layout {
   readonly items: ThreadListV2Item[];
   /** Settled threads beyond the render limit (behind "Show more"). */
   readonly hiddenSettledCount: number;
+}
+
+interface ThreadListV2TreeRow {
+  readonly thread: EnvironmentThreadShell;
+  readonly depth: number;
+  readonly directChildCount: number;
+  readonly isSettled: boolean;
+  readonly unsettledDescendantCount: number;
+}
+
+function threadTreeKey(thread: Pick<EnvironmentThreadShell, "environmentId" | "id">): string {
+  return `${thread.environmentId}\u0000${thread.id}`;
+}
+
+function threadListKey(thread: Pick<EnvironmentThreadShell, "environmentId" | "id">): string {
+  return `${thread.environmentId}:${thread.id}`;
+}
+
+function parentThreadTreeKey(thread: EnvironmentThreadShell): string | null {
+  if (thread.parentThreadId === null) return null;
+  return `${thread.parentEnvironmentId ?? thread.environmentId}\u0000${thread.parentThreadId}`;
+}
+
+/**
+ * Builds stable parent-first rows, then keeps each root tree in one partition.
+ * A mixed tree remains in the inbox while its settled members render slim in
+ * place; only a wholly settled tree moves to history.
+ */
+function partitionThreadListV2Trees(
+  sortedThreads: ReadonlyArray<EnvironmentThreadShell>,
+  isSettled: (thread: EnvironmentThreadShell) => boolean,
+): {
+  readonly activeRows: ReadonlyArray<ThreadListV2TreeRow>;
+  readonly settledGroups: ReadonlyArray<ReadonlyArray<ThreadListV2TreeRow>>;
+} {
+  const threadByKey = new Map(sortedThreads.map((thread) => [threadTreeKey(thread), thread]));
+  const sortIndexByKey = new Map(
+    sortedThreads.map((thread, index) => [threadTreeKey(thread), index]),
+  );
+  const childrenByParentKey = new Map<string, EnvironmentThreadShell[]>();
+  const roots: EnvironmentThreadShell[] = [];
+  for (const thread of sortedThreads) {
+    const parentKey = parentThreadTreeKey(thread);
+    if (parentKey === null || parentKey === threadTreeKey(thread) || !threadByKey.has(parentKey)) {
+      roots.push(thread);
+      continue;
+    }
+    const children = childrenByParentKey.get(parentKey);
+    if (children) children.push(thread);
+    else childrenByParentKey.set(parentKey, [thread]);
+  }
+
+  const bestSortIndexByKey = new Map<string, number>();
+  const visiting = new Set<string>();
+  const bestSortIndex = (thread: EnvironmentThreadShell): number => {
+    const key = threadTreeKey(thread);
+    const cached = bestSortIndexByKey.get(key);
+    if (cached !== undefined) return cached;
+    if (visiting.has(key)) return sortIndexByKey.get(key) ?? Number.MAX_SAFE_INTEGER;
+    visiting.add(key);
+    let best = sortIndexByKey.get(key) ?? Number.MAX_SAFE_INTEGER;
+    for (const child of childrenByParentKey.get(key) ?? []) {
+      best = Math.min(best, bestSortIndex(child));
+    }
+    visiting.delete(key);
+    bestSortIndexByKey.set(key, best);
+    return best;
+  };
+  const orderByTreeSort = (threads: ReadonlyArray<EnvironmentThreadShell>) =>
+    [...threads].sort((left, right) => bestSortIndex(left) - bestSortIndex(right));
+
+  const baseRows: Array<{
+    readonly thread: EnvironmentThreadShell;
+    readonly depth: number;
+    readonly directChildCount: number;
+  }> = [];
+  const emitted = new Set<string>();
+  const emit = (thread: EnvironmentThreadShell, depth: number) => {
+    const key = threadTreeKey(thread);
+    if (emitted.has(key)) return;
+    emitted.add(key);
+    const children = childrenByParentKey.get(key) ?? [];
+    baseRows.push({ thread, depth, directChildCount: children.length });
+    for (const child of orderByTreeSort(children)) emit(child, depth + 1);
+  };
+  for (const root of orderByTreeSort(roots)) emit(root, 0);
+  // Cycle-safe fallback: malformed parent links must never drop a thread.
+  for (const thread of sortedThreads) emit(thread, 0);
+
+  const settledByIndex = baseRows.map((row) => isSettled(row.thread));
+  const unsettledDescendantCountByIndex = baseRows.map(() => 0);
+  const ancestors: number[] = [];
+  for (const [index, row] of baseRows.entries()) {
+    while (ancestors.length > 0 && (baseRows[ancestors.at(-1) ?? -1]?.depth ?? -1) >= row.depth) {
+      ancestors.pop();
+    }
+    if (!settledByIndex[index]) {
+      for (const ancestorIndex of ancestors) {
+        unsettledDescendantCountByIndex[ancestorIndex] =
+          (unsettledDescendantCountByIndex[ancestorIndex] ?? 0) + 1;
+      }
+    }
+    ancestors.push(index);
+  }
+  const rows: ThreadListV2TreeRow[] = baseRows.map((row, index) => ({
+    ...row,
+    isSettled: settledByIndex[index] ?? false,
+    unsettledDescendantCount: unsettledDescendantCountByIndex[index] ?? 0,
+  }));
+  const groups: ThreadListV2TreeRow[][] = [];
+  for (const row of rows) {
+    if (row.depth === 0 || groups.length === 0) groups.push([row]);
+    else groups.at(-1)?.push(row);
+  }
+  const activeRows: ThreadListV2TreeRow[] = [];
+  const settledGroups: ThreadListV2TreeRow[][] = [];
+  for (const group of groups) {
+    if (group.some((row) => !row.isSettled)) activeRows.push(...group);
+    else settledGroups.push(group);
+  }
+  return { activeRows, settledGroups };
 }
 
 interface ThreadListV2ScopeInput {
@@ -177,8 +301,10 @@ export function buildThreadListV2Items(input: {
       un-settle nor pin them. Absent = no gating (tests). */
   readonly settlementEnvironmentIds?: ReadonlySet<EnvironmentId>;
   readonly autoSettleAfterDays?: number | null;
-  /** Max settled rows to render; the rest are counted, not built. */
+  /** Max settled root groups to render; groups stay atomic through paging. */
   readonly settledLimit?: number;
+  /** Keeps the current settled tree visible beyond the first history page. */
+  readonly selectedThreadKey?: string | null;
   /** Injectable for tests; defaults to now. */
   readonly now?: string;
 }): ThreadListV2Layout {
@@ -186,8 +312,8 @@ export function buildThreadListV2Items(input: {
   const autoSettleAfterDays = input.autoSettleAfterDays ?? null;
   const query = input.searchQuery.trim().toLocaleLowerCase();
 
-  const active: EnvironmentThreadShell[] = [];
-  const settled: EnvironmentThreadShell[] = [];
+  const visibleThreads: EnvironmentThreadShell[] = [];
+  const settledByKey = new Map<string, boolean>();
   for (const thread of input.threads) {
     // Callers pass live (unarchived) shells; settled threads are among them
     // and partition into the tail via effectiveSettled.
@@ -195,41 +321,77 @@ export function buildThreadListV2Items(input: {
     const supportsSettlement = input.settlementEnvironmentIds?.has(thread.environmentId) ?? true;
     const changeRequestState =
       input.changeRequestStateByKey?.get(`${thread.environmentId}:${thread.id}`) ?? null;
-    if (
+    visibleThreads.push(thread);
+    settledByKey.set(
+      threadTreeKey(thread),
       supportsSettlement &&
-      effectiveSettled(thread, { now, autoSettleAfterDays, changeRequestState })
-    ) {
-      settled.push(thread);
-    } else {
-      active.push(thread);
-    }
+        effectiveSettled(thread, { now, autoSettleAfterDays, changeRequestState }),
+    );
   }
 
-  const orderedActive = sortThreadsForListV2(active);
-  const orderedSettled = [...settled].sort(
-    (left, right) =>
-      firstValidTimestampMs(right.latestUserMessageAt, right.updatedAt) -
-      firstValidTimestampMs(left.latestUserMessageAt, left.updatedAt),
+  const partition = partitionThreadListV2Trees(
+    sortThreadsForListV2(visibleThreads),
+    (thread) => settledByKey.get(threadTreeKey(thread)) ?? false,
+  );
+  const groupActivityAt = (group: ReadonlyArray<ThreadListV2TreeRow>) =>
+    Math.max(
+      ...group.map((row) =>
+        firstValidTimestampMs(row.thread.latestUserMessageAt, row.thread.updatedAt),
+      ),
+    );
+  const orderedSettledGroups = [...partition.settledGroups].sort(
+    (left, right) => groupActivityAt(right) - groupActivityAt(left),
   );
   const settledLimit = input.settledLimit ?? Number.POSITIVE_INFINITY;
-  const visibleSettled =
-    orderedSettled.length > settledLimit ? orderedSettled.slice(0, settledLimit) : orderedSettled;
+  const visibleSettledGroupIndexes = new Set<number>();
+  for (
+    let index = 0;
+    index < Math.min(orderedSettledGroups.length, Math.max(0, settledLimit));
+    index += 1
+  ) {
+    visibleSettledGroupIndexes.add(index);
+  }
+  if (input.selectedThreadKey != null) {
+    const selectedGroupIndex = orderedSettledGroups.findIndex((group) =>
+      group.some((row) => threadListKey(row.thread) === input.selectedThreadKey),
+    );
+    if (selectedGroupIndex >= 0) visibleSettledGroupIndexes.add(selectedGroupIndex);
+  }
+  const visibleSettledGroups = orderedSettledGroups.filter((_, index) =>
+    visibleSettledGroupIndexes.has(index),
+  );
+  const hiddenSettledCount = orderedSettledGroups
+    .filter((_, index) => !visibleSettledGroupIndexes.has(index))
+    .reduce((count, group) => count + group.length, 0);
 
   const items: ThreadListV2Item[] = [];
-  for (const thread of orderedActive) {
-    items.push({ thread, variant: "card", showSettledDivider: false, isLast: false });
-  }
-  for (const [index, thread] of visibleSettled.entries()) {
+  for (const row of partition.activeRows) {
     items.push({
-      thread,
-      variant: "slim",
-      showSettledDivider: index === 0,
+      thread: row.thread,
+      variant: row.isSettled ? "slim" : "card",
+      treeDepth: row.depth,
+      directChildCount: row.directChildCount,
+      unsettledDescendantCount: row.unsettledDescendantCount,
+      showSettledDivider: false,
       isLast: false,
     });
+  }
+  for (const [groupIndex, group] of visibleSettledGroups.entries()) {
+    for (const [rowIndex, row] of group.entries()) {
+      items.push({
+        thread: row.thread,
+        variant: "slim",
+        treeDepth: row.depth,
+        directChildCount: row.directChildCount,
+        unsettledDescendantCount: 0,
+        showSettledDivider: groupIndex === 0 && rowIndex === 0,
+        isLast: false,
+      });
+    }
   }
   const last = items.at(-1);
   if (last) {
     items[items.length - 1] = { ...last, isLast: true };
   }
-  return { items, hiddenSettledCount: orderedSettled.length - visibleSettled.length };
+  return { items, hiddenSettledCount };
 }

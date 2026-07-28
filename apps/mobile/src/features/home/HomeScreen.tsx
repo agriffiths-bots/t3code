@@ -460,6 +460,8 @@ export function HomeScreen(props: HomeScreenProps) {
       <ThreadListV2Row
         thread={item.thread}
         variant={item.variant}
+        treeDepth={item.treeDepth}
+        unsettledDescendantCount={item.unsettledDescendantCount}
         showSettledDivider={item.showSettledDivider}
         project={
           projectByKey.get(scopedProjectKey(item.thread.environmentId, item.thread.projectId)) ??
@@ -766,7 +768,7 @@ export function HomeScreen(props: HomeScreenProps) {
               threadListV2Layout.hiddenSettledCount > 0 ? (
                 <Pressable
                   accessibilityRole="button"
-                  accessibilityLabel={`Show ${Math.min(threadListV2Layout.hiddenSettledCount, THREAD_LIST_V2_SETTLED_PAGE_COUNT)} more settled threads`}
+                  accessibilityLabel="Show more settled threads"
                   onPress={showMoreSettled}
                   className="mx-4 mt-2 items-center rounded-lg border border-dashed border-border py-2.5"
                   style={({ pressed }) => ({ opacity: pressed ? 0.6 : 1 })}

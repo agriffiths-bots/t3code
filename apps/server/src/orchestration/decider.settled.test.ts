@@ -25,6 +25,7 @@ function makeReadModel(
   session: OrchestrationSession | null = null,
   activities: OrchestrationThread["activities"] = [],
   messages: OrchestrationThread["messages"] = [],
+  latestTurn: OrchestrationThread["latestTurn"] = null,
 ): OrchestrationReadModel {
   return {
     snapshotSequence: 0,
@@ -40,7 +41,7 @@ function makeReadModel(
         interactionMode: "default",
         branch: null,
         worktreePath: null,
-        latestTurn: null,
+        latestTurn,
         createdAt: NOW,
         updatedAt: NOW,
         archivedAt,
@@ -158,6 +159,28 @@ it.layer(NodeServices.layer)("settled thread decider", (it) => {
       });
       const settledEvents = Array.isArray(settled) ? settled : [settled];
       expect(settledEvents[0]?.type).toBe("thread.settled");
+    }),
+  );
+
+  it.effect("rejects a running latest turn before its session projection arrives", () =>
+    Effect.gen(function* () {
+      const error = yield* decideOrchestrationCommand({
+        command: {
+          type: "thread.settle",
+          commandId: CommandId.make("cmd-settle-running-turn"),
+          threadId: ThreadId.make("thread-1"),
+        },
+        readModel: makeReadModel(null, null, null, [], [], {
+          turnId: TurnId.make("turn-running"),
+          state: "running",
+          requestedAt: NOW,
+          startedAt: NOW,
+          completedAt: null,
+          assistantMessageId: null,
+        }),
+      }).pipe(Effect.flip);
+
+      expect(error._tag).toBe("OrchestrationCommandInvariantError");
     }),
   );
 

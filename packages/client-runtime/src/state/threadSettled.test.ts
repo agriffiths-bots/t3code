@@ -24,6 +24,7 @@ function makeShell(input: {
   readonly activityAt: string | null;
   readonly sessionStatus?: "starting" | "running" | "waiting";
   readonly activeTurnId?: ReturnType<typeof TurnId.make> | null;
+  readonly latestTurnState?: "completed" | "running";
   readonly pending?: "approval" | "user-input";
 }): OrchestrationThreadShell {
   const threadId = ThreadId.make("thread-1");
@@ -42,9 +43,9 @@ function makeShell(input: {
         ? null
         : {
             turnId: TurnId.make("turn-1"),
-            state: "completed",
+            state: input.latestTurnState ?? "completed",
             requestedAt: input.activityAt,
-            startedAt: null,
+            startedAt: input.latestTurnState === "running" ? input.activityAt : null,
             completedAt: null,
             assistantMessageId: null,
           },
@@ -273,6 +274,9 @@ describe("canSettle", () => {
       canSettle(makeShell({ activityAt: FRESH, sessionStatus: "running" }), { now: NOW }),
     ).toBe(false);
     expect(
+      canSettle(makeShell({ activityAt: FRESH, latestTurnState: "running" }), { now: NOW }),
+    ).toBe(false);
+    expect(
       canSettle(
         makeShell({
           activityAt: FRESH,
@@ -357,5 +361,13 @@ describe("canSettle", () => {
     });
     expect(canSettle(blocked, { now: NOW })).toBe(false);
     expect(effectiveSettled(blocked, { now: NOW, autoSettleAfterDays: 3 })).toBe(false);
+
+    const runningTurn = makeShell({
+      settledOverride: "settled",
+      activityAt: FRESH,
+      latestTurnState: "running",
+    });
+    expect(canSettle(runningTurn, { now: NOW })).toBe(false);
+    expect(effectiveSettled(runningTurn, { now: NOW, autoSettleAfterDays: 3 })).toBe(false);
   });
 });

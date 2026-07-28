@@ -98,6 +98,8 @@ export const ThreadListV2PrStateReporter = memo(function ThreadListV2PrStateRepo
 export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
   readonly thread: EnvironmentThreadShell;
   readonly variant: "card" | "slim";
+  readonly treeDepth: number;
+  readonly unsettledDescendantCount: number;
   readonly showSettledDivider: boolean;
   readonly project: EnvironmentProject | null;
   readonly providerDriver: string | null;
@@ -136,6 +138,7 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
   const status = resolveThreadListV2Status(thread);
   const statusLabel = STATUS_LABEL_BY_STATUS[status];
   const timeLabel = threadTimeLabel(thread);
+  const treeInset = Math.min(props.treeDepth, 4) * 12;
 
   const handleDelete = useCallback(() => onDeleteThread(thread), [onDeleteThread, thread]);
   const handleSettle = useCallback(() => onSettleThread(thread), [onSettleThread, thread]);
@@ -229,6 +232,14 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
                 >
                   {props.project?.title ?? ""}
                 </Text>
+                {props.unsettledDescendantCount > 0 ? (
+                  <Text
+                    accessibilityLabel={`${props.unsettledDescendantCount} unsettled child thread${props.unsettledDescendantCount === 1 ? "" : "s"}`}
+                    className="rounded border border-blue-500/25 bg-blue-500/8 px-1 text-[10px] font-t3-medium text-blue-700 dark:text-blue-300"
+                  >
+                    {props.unsettledDescendantCount} open
+                  </Text>
+                ) : null}
                 <Text
                   className={cn(
                     "text-xs tabular-nums",
@@ -304,6 +315,11 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
           <Text className="flex-1 text-base text-foreground-muted" numberOfLines={1}>
             {thread.title}
           </Text>
+          {props.unsettledDescendantCount > 0 ? (
+            <Text className="text-xs font-t3-medium text-blue-700 dark:text-blue-300">
+              {props.unsettledDescendantCount} open
+            </Text>
+          ) : null}
           <Text
             className="text-sm tabular-nums text-foreground-tertiary"
             style={{ fontFamily: MONO_FONT }}
@@ -317,37 +333,39 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
   return (
     <>
       {props.showSettledDivider ? <ThreadListV2SettledDivider /> : null}
-      <ThreadSwipeable
-        backgroundColor={surfaceColor}
-        enableTrackpadSwipe
-        // Full swipe commits the advertised lifecycle action (Settle /
-        // Un-settle), never the destructive delete.
-        fullSwipeAction="primary"
-        fullSwipeWidth={props.fullSwipeWidth ?? windowWidth - 32}
-        onDelete={handleDelete}
-        onSwipeableClose={props.onSwipeableClose}
-        onSwipeableWillOpen={props.onSwipeableWillOpen}
-        primaryAction={primaryAction}
-        resetKey={`${thread.environmentId}:${thread.id}`}
-        simultaneousWithExternalGesture={props.simultaneousSwipeGesture}
-        threadTitle={thread.title}
-      >
-        {(close) => (
-          <ControlPillMenu
-            actions={
-              !props.settlementSupported
-                ? LEGACY_MENU_ACTIONS
-                : canUnsettle
-                  ? SLIM_MENU_ACTIONS
-                  : CARD_MENU_ACTIONS
-            }
-            onPressAction={handleMenuAction}
-            shouldOpenOnLongPress
-          >
-            {rowContent(close)}
-          </ControlPillMenu>
-        )}
-      </ThreadSwipeable>
+      <View style={treeInset > 0 ? { marginLeft: treeInset } : undefined}>
+        <ThreadSwipeable
+          backgroundColor={surfaceColor}
+          enableTrackpadSwipe
+          // Full swipe commits the advertised lifecycle action (Settle /
+          // Un-settle), never the destructive delete.
+          fullSwipeAction="primary"
+          fullSwipeWidth={Math.max(1, (props.fullSwipeWidth ?? windowWidth - 32) - treeInset)}
+          onDelete={handleDelete}
+          onSwipeableClose={props.onSwipeableClose}
+          onSwipeableWillOpen={props.onSwipeableWillOpen}
+          primaryAction={primaryAction}
+          resetKey={`${thread.environmentId}:${thread.id}`}
+          simultaneousWithExternalGesture={props.simultaneousSwipeGesture}
+          threadTitle={thread.title}
+        >
+          {(close) => (
+            <ControlPillMenu
+              actions={
+                !props.settlementSupported
+                  ? LEGACY_MENU_ACTIONS
+                  : canUnsettle
+                    ? SLIM_MENU_ACTIONS
+                    : CARD_MENU_ACTIONS
+              }
+              onPressAction={handleMenuAction}
+              shouldOpenOnLongPress
+            >
+              {rowContent(close)}
+            </ControlPillMenu>
+          )}
+        </ThreadSwipeable>
+      </View>
     </>
   );
 });
