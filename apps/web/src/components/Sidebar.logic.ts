@@ -8,7 +8,10 @@ import {
   type ThreadSortInput,
 } from "../lib/threadSort";
 import type { SidebarThreadSummary, Thread } from "../types";
-import { hasActiveThreadSession } from "@t3tools/client-runtime/state/thread-settled";
+import {
+  canSettle,
+  resolveThreadAttentionBlocker,
+} from "@t3tools/client-runtime/state/thread-settled";
 import { cn } from "../lib/utils";
 import { isLatestTurnSettled } from "../session-logic";
 import { resolveServerBackedAppStageLabel } from "../branding.logic";
@@ -87,15 +90,18 @@ export function buildMultiSelectThreadContextMenuItems(input: {
   ];
 }
 
+type SidebarV2SettleableThread = Parameters<typeof canSettle>[0] & {
+  readonly settledOverride: "settled" | "active" | null;
+};
+
 export function filterSidebarV2MultiSelectSettleableThreadKeys<
-  TThread extends {
-    readonly settledOverride: "settled" | "active" | null;
-  },
+  TThread extends SidebarV2SettleableThread,
 >(input: {
   readonly threadKeys: ReadonlyArray<string>;
   readonly threadByKey: ReadonlyMap<string, TThread>;
   readonly settledThreadKeys: ReadonlySet<string>;
   readonly supportsSettlement: (thread: TThread) => boolean;
+  readonly now: string;
 }): string[] {
   return input.threadKeys.filter((threadKey) => {
     const thread = input.threadByKey.get(threadKey);
@@ -103,7 +109,8 @@ export function filterSidebarV2MultiSelectSettleableThreadKeys<
       thread !== undefined &&
       thread.settledOverride !== "settled" &&
       !input.settledThreadKeys.has(threadKey) &&
-      input.supportsSettlement(thread)
+      input.supportsSettlement(thread) &&
+      canSettle(thread, { now: input.now })
     );
   });
 }
@@ -501,28 +508,12 @@ type SidebarV2StatusInput = Pick<
 >;
 
 export function resolveSidebarV2Status(thread: SidebarV2StatusInput): SidebarV2Status {
-  if (thread.hasPendingApprovals) {
-    return "approval";
-  }
-  if (thread.hasPendingUserInput) {
-    return "input";
-  }
-  if (hasActiveThreadSession(thread.session)) {
-    return "working";
-  }
-  if (thread.session?.status === "error") {
-    return "failed";
-  }
-  if (thread.latestTurn?.state === "running") {
-    return "working";
-  }
-  if (
-    thread.interactionMode === "plan" &&
-    isLatestTurnSettled(thread.latestTurn, thread.session) &&
-    thread.hasActionableProposedPlan
-  ) {
-    return "plan";
-  }
+  const blocker = resolveThreadAttentionBlocker(thread);
+  if (blocker === "approval") return "approval";
+  if (blocker === "input") return "input";
+  if (blocker === "working") return "working";
+  if (blocker === "failed") return "failed";
+  if (blocker === "plan") return "plan";
   return "ready";
 }
 
@@ -545,6 +536,37 @@ export function firstValidTimestampMs(
     if (!Number.isNaN(parsed)) return parsed;
   }
   return 0;
+}
+
+export function maxValidTimestampMs(
+  ...candidates: ReadonlyArray<string | null | undefined>
+): number {
+  let latest = 0;
+  for (const candidate of candidates) {
+    if (candidate == null) continue;
+    const parsed = Date.parse(candidate);
+    if (!Number.isNaN(parsed)) latest = Math.max(latest, parsed);
+  }
+  return latest;
+}
+
+export function sortSidebarV2SettledGroupsByRecency<
+  TGroup extends ReadonlyArray<{
+    readonly thread: {
+      readonly latestUserMessageAt?: string | null;
+      readonly updatedAt?: string | null;
+    };
+  }>,
+>(groups: ReadonlyArray<TGroup>): TGroup[] {
+  const groupActivityAt = (group: TGroup): number =>
+    group.length === 0
+      ? 0
+      : Math.max(
+          ...group.map((row) =>
+            maxValidTimestampMs(row.thread.latestUserMessageAt, row.thread.updatedAt),
+          ),
+        );
+  return [...groups].toSorted((left, right) => groupActivityAt(right) - groupActivityAt(left));
 }
 
 // v2 sort: static creation order, newest thread on top. Activity NEVER

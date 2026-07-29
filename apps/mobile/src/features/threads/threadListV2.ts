@@ -1,6 +1,6 @@
 import {
   effectiveSettled,
-  hasActiveThreadSession,
+  resolveThreadAttentionBlocker,
 } from "@t3tools/client-runtime/state/thread-settled";
 import type { EnvironmentThreadShell } from "@t3tools/client-runtime/state/shell";
 import type { EnvironmentId, ProjectId } from "@t3tools/contracts";
@@ -26,28 +26,12 @@ export function resolveThreadListV2Status(
     | "session"
   >,
 ): ThreadListV2Status {
-  if (thread.hasPendingApprovals) {
-    return "approval";
-  }
-  if (thread.hasPendingUserInput) {
-    return "input";
-  }
-  if (hasActiveThreadSession(thread.session)) {
-    return "working";
-  }
-  if (thread.session?.status === "error") {
-    return "failed";
-  }
-  if (thread.latestTurn?.state === "running") {
-    return "working";
-  }
-  const latestTurnSettled =
-    thread.latestTurn?.startedAt != null &&
-    thread.latestTurn.completedAt != null &&
-    !hasActiveThreadSession(thread.session);
-  if (thread.interactionMode === "plan" && latestTurnSettled && thread.hasActionableProposedPlan) {
-    return "plan";
-  }
+  const blocker = resolveThreadAttentionBlocker(thread);
+  if (blocker === "approval") return "approval";
+  if (blocker === "input") return "input";
+  if (blocker === "working") return "working";
+  if (blocker === "failed") return "failed";
+  if (blocker === "plan") return "plan";
   return "ready";
 }
 
@@ -58,15 +42,14 @@ function parseTimestampMs(isoDate: string): number {
   return Number.isNaN(parsed) ? 0 : parsed;
 }
 
-/** First VALID timestamp wins: a present-yet-malformed string falls through
-    to the next candidate rather than sinking the row to the epoch. */
-function firstValidTimestampMs(...candidates: ReadonlyArray<string | null | undefined>): number {
+function maxValidTimestampMs(...candidates: ReadonlyArray<string | null | undefined>): number {
+  let latest = 0;
   for (const candidate of candidates) {
     if (candidate == null) continue;
     const parsed = Date.parse(candidate);
-    if (!Number.isNaN(parsed)) return parsed;
+    if (!Number.isNaN(parsed)) latest = Math.max(latest, parsed);
   }
-  return 0;
+  return latest;
 }
 
 /**
@@ -337,11 +320,13 @@ export function buildThreadListV2Items(input: {
     (thread) => settledByKey.get(threadTreeKey(thread)) ?? false,
   );
   const groupActivityAt = (group: ReadonlyArray<ThreadListV2TreeRow>) =>
-    Math.max(
-      ...group.map((row) =>
-        firstValidTimestampMs(row.thread.latestUserMessageAt, row.thread.updatedAt),
-      ),
-    );
+    group.length === 0
+      ? 0
+      : Math.max(
+          ...group.map((row) =>
+            maxValidTimestampMs(row.thread.latestUserMessageAt, row.thread.updatedAt),
+          ),
+        );
   const orderedSettledGroups = [...partition.settledGroups].sort(
     (left, right) => groupActivityAt(right) - groupActivityAt(left),
   );

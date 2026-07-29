@@ -130,6 +130,26 @@ describe("resolveThreadListV2Status", () => {
       ),
     ).toBe("working");
   });
+
+  it("reports failed for latest-turn errors without a live session", () => {
+    expect(
+      resolveThreadListV2Status(
+        makeThread({
+          id: ThreadId.make("latest-error"),
+          title: "Latest error",
+          latestTurn: {
+            turnId: TurnId.make("turn-latest-error"),
+            state: "error",
+            assistantMessageId: null,
+            requestedAt: NOW,
+            startedAt: NOW,
+            completedAt: NOW,
+          },
+          session: null,
+        }),
+      ),
+    ).toBe("failed");
+  });
 });
 
 describe("sortThreadsForListV2", () => {
@@ -295,6 +315,37 @@ describe("buildThreadListV2Items settled paging", () => {
 
     expect(layout.items).toHaveLength(1);
     expect(layout.items[0]?.variant).toBe("card");
+  });
+
+  it("sorts settled history by the newest user message or updatedAt", () => {
+    const { items } = buildThreadListV2Items({
+      threads: [
+        makeThread({
+          id: ThreadId.make("older-history-with-newer-prompt"),
+          title: "Older history",
+          settledOverride: "settled",
+          settledAt: NOW,
+          latestUserMessageAt: "2026-06-01T11:00:00.000Z",
+          updatedAt: "2026-06-01T11:05:00.000Z",
+        }),
+        makeThread({
+          id: ThreadId.make("freshly-settled-old-conversation"),
+          title: "Fresh settle",
+          settledOverride: "settled",
+          settledAt: NOW,
+          latestUserMessageAt: "2026-05-01T10:00:00.000Z",
+          updatedAt: "2026-06-01T12:00:00.000Z",
+        }),
+      ],
+      environmentId: null,
+      searchQuery: "",
+      now: NOW,
+    });
+
+    expect(items.map((item) => item.thread.id)).toEqual([
+      "freshly-settled-old-conversation",
+      "older-history-with-newer-prompt",
+    ]);
   });
 
   it("caps the settled tail at settledLimit and reports the hidden count", () => {

@@ -29,6 +29,7 @@ import {
   sidebarThreadExpansionKey,
   shouldClearThreadSelectionOnMouseDown,
   sortSidebarThreadsByActivity,
+  sortSidebarV2SettledGroupsByRecency,
   sortThreadsForSidebarV2,
   sortProjectsForSidebar,
   sortScopedProjectsForSidebar,
@@ -120,24 +121,66 @@ describe("buildMultiSelectThreadContextMenuItems", () => {
 });
 
 describe("filterSidebarV2MultiSelectSettleableThreadKeys", () => {
-  it("excludes rows that are already effectively settled", () => {
+  type BulkSettleThread = {
+    readonly environmentId: EnvironmentId;
+    readonly settledOverride: "settled" | "active" | null;
+    readonly hasPendingApprovals: boolean;
+    readonly hasPendingUserInput: boolean;
+    readonly hasActionableProposedPlan: boolean;
+    readonly latestUserMessageAt: string | null;
+    readonly latestTurn: OrchestrationLatestTurn | null;
+    readonly session: null;
+  };
+
+  const makeCandidate = (input: Partial<BulkSettleThread> = {}): BulkSettleThread => ({
+    environmentId: localEnvironmentId,
+    settledOverride: null,
+    hasPendingApprovals: false,
+    hasPendingUserInput: false,
+    hasActionableProposedPlan: false,
+    latestUserMessageAt: null,
+    latestTurn: null,
+    session: null,
+    ...input,
+  });
+
+  it("excludes settled rows and every attention-blocked row", () => {
     const threadByKey = new Map([
-      ["active", { environmentId: localEnvironmentId, settledOverride: null }],
-      ["pinned-active", { environmentId: localEnvironmentId, settledOverride: "active" }],
-      ["pr-derived", { environmentId: localEnvironmentId, settledOverride: null }],
-      ["explicit-settled", { environmentId: localEnvironmentId, settledOverride: "settled" }],
+      ["active", makeCandidate()],
+      ["pinned-active", makeCandidate({ settledOverride: "active" })],
+      ["pr-derived", makeCandidate()],
+      ["explicit-settled", makeCandidate({ settledOverride: "settled" })],
+      ["unsupported", makeCandidate({ environmentId: EnvironmentId.make("environment-old") })],
+      ["pending-approval", makeCandidate({ hasPendingApprovals: true })],
+      ["pending-input", makeCandidate({ hasPendingUserInput: true })],
+      ["failed", makeCandidate({ latestTurn: { ...makeLatestTurn(), state: "error" } })],
       [
-        "unsupported",
-        { environmentId: EnvironmentId.make("environment-old"), settledOverride: null },
+        "running",
+        makeCandidate({
+          latestTurn: { ...makeLatestTurn({ completedAt: null }), state: "running" },
+        }),
       ],
-    ] as const);
+      ["plan-ready", makeCandidate({ hasActionableProposedPlan: true })],
+    ]);
 
     expect(
       filterSidebarV2MultiSelectSettleableThreadKeys({
-        threadKeys: ["active", "pinned-active", "pr-derived", "explicit-settled", "unsupported"],
+        threadKeys: [
+          "active",
+          "pinned-active",
+          "pr-derived",
+          "explicit-settled",
+          "unsupported",
+          "pending-approval",
+          "pending-input",
+          "failed",
+          "running",
+          "plan-ready",
+        ],
         threadByKey,
         settledThreadKeys: new Set(["pr-derived", "explicit-settled"]),
         supportsSettlement: (thread) => thread.environmentId === localEnvironmentId,
+        now: "2026-03-09T10:10:00.000Z",
       }),
     ).toEqual(["active", "pinned-active"]);
   });
@@ -740,11 +783,25 @@ describe("resolveSidebarV2Status", () => {
     ).toBe("working");
   });
 
-  it("reports failed only while the session status is error", () => {
+  it("reports failed for session errors or latest-turn errors", () => {
     expect(
       resolveSidebarV2Status({
         ...idle,
         session: { ...session, status: "error" as const, lastError: "boom" },
+      }),
+    ).toBe("failed");
+    expect(
+      resolveSidebarV2Status({
+        ...idle,
+        latestTurn: { ...makeLatestTurn(), state: "error" },
+        session: null,
+      }),
+    ).toBe("failed");
+    expect(
+      resolveSidebarV2Status({
+        ...idle,
+        latestTurn: { ...makeLatestTurn(), state: "error" },
+        session: { ...session, status: "stopped" as const, lastError: "persisted" },
       }),
     ).toBe("failed");
     expect(
@@ -775,6 +832,44 @@ describe("resolveSidebarV2Status", () => {
 
   it("defaults to ready with no session", () => {
     expect(resolveSidebarV2Status({ ...idle, session: null })).toBe("ready");
+  });
+});
+
+describe("sortSidebarV2SettledGroupsByRecency", () => {
+  const settledRow = (input: {
+    id: string;
+    latestUserMessageAt: string | null;
+    updatedAt: string;
+  }) => ({
+    thread: {
+      id: input.id,
+      latestUserMessageAt: input.latestUserMessageAt,
+      updatedAt: input.updatedAt,
+    },
+  });
+
+  it("uses the newest valid timestamp from latest user message and updatedAt", () => {
+    const freshlySettledOldConversation = [
+      settledRow({
+        id: "freshly-settled-old-conversation",
+        latestUserMessageAt: "2026-03-01T10:00:00.000Z",
+        updatedAt: "2026-03-09T12:00:00.000Z",
+      }),
+    ];
+    const olderHistoryWithNewerPrompt = [
+      settledRow({
+        id: "older-history-with-newer-prompt",
+        latestUserMessageAt: "2026-03-09T11:00:00.000Z",
+        updatedAt: "2026-03-09T11:05:00.000Z",
+      }),
+    ];
+
+    expect(
+      sortSidebarV2SettledGroupsByRecency([
+        olderHistoryWithNewerPrompt,
+        freshlySettledOldConversation,
+      ]).map((group) => group[0]?.thread.id),
+    ).toEqual(["freshly-settled-old-conversation", "older-history-with-newer-prompt"]);
   });
 });
 

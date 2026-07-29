@@ -79,7 +79,7 @@ import { formatRelativeTimeLabel } from "../timestampFormat";
 import type { SidebarThreadSummary } from "../types";
 import { cn } from "~/lib/utils";
 import {
-  firstValidTimestampMs,
+  sortSidebarV2SettledGroupsByRecency,
   filterSidebarThreadTreeRowsByExpansion,
   filterSidebarV2MultiSelectSettleableThreadKeys,
   hasUnseenCompletion,
@@ -925,17 +925,9 @@ export default function SidebarV2() {
         settledByThreadKey.get(scopedThreadKey(scopeThreadRef(thread.environmentId, thread.id))) ??
         false,
     );
-    const groupActivityAt = (group: (typeof partition.settledGroups)[number]): number =>
-      Math.max(
-        ...group.map((row) =>
-          firstValidTimestampMs(row.thread.latestUserMessageAt, row.thread.updatedAt),
-        ),
-      );
     return {
       activeRows: partition.activeRows,
-      settledGroups: [...partition.settledGroups].toSorted(
-        (left, right) => groupActivityAt(right) - groupActivityAt(left),
-      ),
+      settledGroups: sortSidebarV2SettledGroupsByRecency(partition.settledGroups),
       settledThreadKeys: new Set(
         [...settledByThreadKey.entries()]
           .filter(([, settled]) => settled)
@@ -1223,6 +1215,7 @@ export default function SidebarV2() {
       );
       if (threadKeys.length === 0) return;
       const count = threadKeys.length;
+      const settleNow = new Date().toISOString();
       const settleableThreadKeys = filterSidebarV2MultiSelectSettleableThreadKeys({
         threadKeys,
         threadByKey: threadByKeyRef.current,
@@ -1230,6 +1223,7 @@ export default function SidebarV2() {
         supportsSettlement: (thread) =>
           serverConfigs.get(thread.environmentId)?.environment.capabilities.threadSettlement ===
           true,
+        now: settleNow,
       });
       const clicked = await settlePromise(() =>
         api.contextMenu.show(
