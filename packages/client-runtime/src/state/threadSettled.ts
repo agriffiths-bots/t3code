@@ -1,4 +1,11 @@
 import type { OrchestrationThreadShell } from "@t3tools/contracts";
+import {
+  hasActiveThreadSession,
+  hasThreadAttentionBlocker,
+  resolveThreadAttentionBlocker,
+} from "@t3tools/shared/threadAttention";
+
+export { hasActiveThreadSession, hasThreadAttentionBlocker, resolveThreadAttentionBlocker };
 
 export type ChangeRequestStateLike = "open" | "closed" | "merged";
 
@@ -34,16 +41,6 @@ export function threadLastActivityAt(shell: OrchestrationThreadShell): string | 
  * such threads would be permanently unsettleable.
  */
 export const QUEUED_TURN_START_GRACE_MS = 2 * 60 * 1_000;
-
-export function hasActiveThreadSession(
-  session: Pick<NonNullable<OrchestrationThreadShell["session"]>, "status" | "activeTurnId"> | null,
-): boolean {
-  return (
-    session?.status === "starting" ||
-    session?.status === "running" ||
-    (session?.status === "waiting" && session.activeTurnId !== null)
-  );
-}
 
 /**
  * A user message no turn has picked up yet: the turn.start command was
@@ -97,10 +94,7 @@ export function canSettle(
   >,
   options: { readonly now: string },
 ): boolean {
-  if (shell.hasPendingApprovals || shell.hasPendingUserInput) return false;
-  if (shell.session?.status === "error" || shell.latestTurn?.state === "error") return false;
-  if (hasActiveThreadSession(shell.session)) return false;
-  if (shell.latestTurn?.state === "running") return false;
+  if (hasThreadAttentionBlocker(shell)) return false;
   // Queued work is as blocked-on-progress as a live session: settling it
   // (or auto-settling it on a closed PR) would hide a just-requested turn.
   if (hasQueuedTurnStart(shell, options)) return false;
@@ -125,10 +119,7 @@ export function effectiveSettled(
   },
 ): boolean {
   // Blocked work must remain visible even when a user explicitly settled it.
-  if (shell.hasPendingApprovals || shell.hasPendingUserInput) return false;
-  if (shell.session?.status === "error" || shell.latestTurn?.state === "error") return false;
-  if (hasActiveThreadSession(shell.session)) return false;
-  if (shell.latestTurn?.state === "running") return false;
+  if (hasThreadAttentionBlocker(shell)) return false;
   if (hasQueuedTurnStart(shell, { now: options.now })) {
     // The queued-turn blocker alone is forgivable: it is clock-derived, and
     // list callers pass a coarser `now` than the settle action used. When

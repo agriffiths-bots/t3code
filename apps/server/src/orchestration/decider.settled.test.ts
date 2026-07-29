@@ -148,7 +148,17 @@ it.layer(NodeServices.layer)("settled thread decider", (it) => {
         readModel: makeReadModel(null, null, makeSession("waiting")),
       });
       expect((Array.isArray(parked) ? parked : [parked])[0]?.type).toBe("thread.settled");
-      // Stopped/error sessions are settleable — only live work is protected.
+      const failedError = yield* decideOrchestrationCommand({
+        command: {
+          type: "thread.settle",
+          commandId: CommandId.make("cmd-settle-failed-session"),
+          threadId: ThreadId.make("thread-1"),
+        },
+        readModel: makeReadModel(null, null, makeSession("error")),
+      }).pipe(Effect.flip);
+      expect(failedError._tag).toBe("OrchestrationCommandInvariantError");
+
+      // Stopped sessions are settleable: only active or failed work is protected.
       const settled = yield* decideOrchestrationCommand({
         command: {
           type: "thread.settle",
@@ -176,6 +186,28 @@ it.layer(NodeServices.layer)("settled thread decider", (it) => {
           requestedAt: NOW,
           startedAt: NOW,
           completedAt: null,
+          assistantMessageId: null,
+        }),
+      }).pipe(Effect.flip);
+
+      expect(error._tag).toBe("OrchestrationCommandInvariantError");
+    }),
+  );
+
+  it.effect("rejects a failed latest turn before its session projection arrives", () =>
+    Effect.gen(function* () {
+      const error = yield* decideOrchestrationCommand({
+        command: {
+          type: "thread.settle",
+          commandId: CommandId.make("cmd-settle-error-turn"),
+          threadId: ThreadId.make("thread-1"),
+        },
+        readModel: makeReadModel(null, null, null, [], [], {
+          turnId: TurnId.make("turn-error"),
+          state: "error",
+          requestedAt: NOW,
+          startedAt: NOW,
+          completedAt: NOW,
           assistantMessageId: null,
         }),
       }).pipe(Effect.flip);

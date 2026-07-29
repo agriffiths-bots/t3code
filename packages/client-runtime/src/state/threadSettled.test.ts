@@ -244,14 +244,15 @@ describe("effectiveSettled", () => {
     expect(effectiveSettled(shell, { now: NOW, autoSettleAfterDays: 3 })).toBe(false);
   });
 
-  it("honors an explicit settled override on a plan-ready thread", () => {
+  it("lets a late actionable proposed plan win over an explicit settled override", () => {
     const shell = makeShell({
       settledOverride: "settled",
       activityAt: FRESH,
       hasActionableProposedPlan: true,
     });
 
-    expect(effectiveSettled(shell, { now: NOW, autoSettleAfterDays: 3 })).toBe(true);
+    expect(canSettle(shell, { now: NOW })).toBe(false);
+    expect(effectiveSettled(shell, { now: NOW, autoSettleAfterDays: 3 })).toBe(false);
   });
 
   it("still settles a plain thread with no failed or plan-ready state", () => {

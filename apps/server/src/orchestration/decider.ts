@@ -8,6 +8,10 @@ import {
   DEFAULT_DATA_AUDIENCE,
   type ThreadId,
 } from "@t3tools/contracts";
+import {
+  hasActiveThreadSession,
+  resolveThreadAttentionBlocker,
+} from "@t3tools/shared/threadAttention";
 import * as DateTime from "effect/DateTime";
 import * as Crypto from "effect/Crypto";
 import * as Effect from "effect/Effect";
@@ -43,16 +47,6 @@ function isQueuedTurnPromptMessage(message: Pick<OrchestrationMessage, "role" | 
   return (
     message.role === "user" ||
     (message.role === "system" && message.text.trimStart().startsWith("[sub-agent "))
-  );
-}
-
-function hasActiveThreadSession(
-  session: OrchestrationReadModel["threads"][number]["session"],
-): boolean {
-  return (
-    session?.status === "starting" ||
-    session?.status === "running" ||
-    (session?.status === "waiting" && session.activeTurnId !== null)
   );
 }
 
@@ -556,38 +550,31 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
         command,
         threadId: command.threadId,
       });
-      // Server-side twin of the client's canSettle activity checks: a stale
-      // or raced client must not settle work when either the session or the
-      // latest turn projection already says it is running.
-      if (hasActiveThreadSession(thread.session) || thread.latestTurn?.state === "running") {
-        return yield* Effect.fail(
-          new OrchestrationCommandInvariantError({
-            commandType: command.type,
-            detail: `thread ${command.threadId} has active work and cannot be settled`,
-          }),
-        );
-      }
-      // Pending approval / user-input requests are blocked-on-you work: a
-      // raced or stale client must not park them behind a settled override
-      // that would surface only after the request resolves.
+      // Server-side twin of the client's canSettle attention checks: a stale
+      // or raced client must not settle work that should stay visible.
       const hasPendingInteraction = settlementContext
         ? settlementContext.hasPendingApprovals || settlementContext.hasPendingUserInput
         : hasOpenBlockingRequest(thread);
-      if (hasPendingInteraction) {
-        return yield* Effect.fail(
-          new OrchestrationCommandInvariantError({
-            commandType: command.type,
-            detail: `thread ${command.threadId} has a pending approval or user-input request and cannot be settled`,
-          }),
-        );
-      }
-      if (settlementContext?.hasActionableProposedPlan === true) {
-        return yield* Effect.fail(
-          new OrchestrationCommandInvariantError({
-            commandType: command.type,
-            detail: `thread ${command.threadId} has an actionable proposed plan and cannot be settled`,
-          }),
-        );
+      const attentionBlocker = resolveThreadAttentionBlocker({
+        hasPendingApprovals: hasPendingInteraction,
+        hasPendingUserInput: false,
+        hasActionableProposedPlan: settlementContext?.hasActionableProposedPlan ?? false,
+        session: thread.session,
+        latestTurn: thread.latestTurn,
+      });
+      if (attentionBlocker !== null) {
+        const detail =
+          attentionBlocker === "failed"
+            ? `thread ${command.threadId} has failed work and cannot be settled`
+            : attentionBlocker === "working"
+              ? `thread ${command.threadId} has active work and cannot be settled`
+              : attentionBlocker === "plan"
+                ? `thread ${command.threadId} has an actionable proposed plan and cannot be settled`
+                : `thread ${command.threadId} has a pending approval or user-input request and cannot be settled`;
+        return yield* new OrchestrationCommandInvariantError({
+          commandType: command.type,
+          detail,
+        });
       }
       const occurredAt = yield* nowIso;
       // A queued turn start — a user or sub-agent wake prompt no turn has picked up yet — is
@@ -636,12 +623,10 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
         latestPromptMessageAtMs > latestTurnAtMs &&
         Math.abs(queuedAgeMs) <= QUEUED_TURN_START_GRACE_MS;
       if (hasQueuedTurnStart) {
-        return yield* Effect.fail(
-          new OrchestrationCommandInvariantError({
-            commandType: command.type,
-            detail: `thread ${command.threadId} has a queued turn start and cannot be settled`,
-          }),
-        );
+        return yield* new OrchestrationCommandInvariantError({
+          commandType: command.type,
+          detail: `thread ${command.threadId} has a queued turn start and cannot be settled`,
+        });
       }
       // Settling an already-settled thread re-emits with the original
       // settledAt: the engine rejects zero-event commands, and bulk-settle /
