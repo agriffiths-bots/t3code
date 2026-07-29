@@ -28,12 +28,17 @@
 # even in the same file):
 #   [{"file":"apps/x.ts","line":42,"title":"<exact finding title>",
 #     "reason":"upstream-origin","note":"optional"},
+#    {"file":"apps/base.ts","line":12,"title":"<exact finding title>",
+#     "reason":"origin-base","note":"<required inherited-base note>"},
 #    {"file":"apps/y.ts","line":7,"title":"<exact finding title>",
 #     "reason":"false-positive","justification":"<why the finding is wrong,
 #      verified against the real code — min 120 chars>"}]
 #   * upstream-origin — accepted ONLY if the staged blob is byte-identical to
 #     FACTORY_UPSTREAM_REF:<file> (the code verbatim is upstream's, merged
 #     deliberately; upstream's design choices are not this commit's bugs).
+#   * origin-base — accepted ONLY when FACTORY_ORIGIN_REF is configured, the
+#     staged blob is byte-identical to FACTORY_ORIGIN_REF:<file>, and note is
+#     non-empty
 #   * false-positive — accepted only with a >=120-char justification naming
 #     the code-level reason. The PR merge gate (CI + Codex bound to HEAD) is
 #     untouched and remains the hard backstop for anything dismissed here.
@@ -109,6 +114,7 @@ FACTORY_STATIC_CHECKS_PARALLEL=0
 FACTORY_REVIEW_ARGS=()
 FACTORY_AUTOREVIEW_BIN="$HOME/.claude/skills/autoreview/scripts/autoreview"
 FACTORY_UPSTREAM_REF="upstream/main"
+FACTORY_ORIGIN_REF=""
 FACTORY_AUDIT_LOG="$HOME/.openclaw/audit/factory-precommit.jsonl"
 FACTORY_REVIEW_MEMORY_FINDINGS=15
 # Config problems are RECORDED here and enforced after the --status /
@@ -628,12 +634,25 @@ if [ -f "$DISMISSALS" ] && jq -e 'type=="array"' "$DISMISSALS" >/dev/null 2>&1; 
         if [ -n "$staged_blob" ] && [ "$staged_blob" = "$upstream_blob" ]; then ok=1
         else why="staged $file is NOT byte-identical to $FACTORY_UPSTREAM_REF:$file — the code is (at least partly) ours, so the finding must be fixed or dismissed as false-positive with a justification"; fi
         ;;
+      origin-base)
+        note_len="$(jq -r '(.note // "") | length' <<<"$d")"
+        if [ -z "${FACTORY_ORIGIN_REF:-}" ]; then
+          why="origin-base dismissal for $file requires FACTORY_ORIGIN_REF to be configured"
+        elif [ "$note_len" -eq 0 ]; then
+          why="origin-base dismissal for $file needs a non-empty note explaining the inherited fork-base debt"
+        else
+          staged_blob="$(git rev-parse -q --verify ":$file" 2>/dev/null || true)"
+          origin_blob="$(git rev-parse -q --verify "$FACTORY_ORIGIN_REF:$file" 2>/dev/null || true)"
+          if [ -n "$staged_blob" ] && [ "$staged_blob" = "$origin_blob" ]; then ok=1
+          else why="staged $file is NOT byte-identical to $FACTORY_ORIGIN_REF:$file — the code is inherited fork-base debt only if it matches that ref, so the finding must be fixed or dismissed as false-positive with a justification"; fi
+        fi
+        ;;
       false-positive)
         jlen="$(jq -r '(.justification // "") | length' <<<"$d")"
         if [ "$jlen" -ge 120 ]; then ok=1
         else why="false-positive dismissal for $file needs a justification of >=120 chars (has $jlen) naming the code-level reason the finding is wrong"; fi
         ;;
-      *) why="unknown dismissal reason '$reason' for $file (use upstream-origin | false-positive)";;
+      *) why="unknown dismissal reason '$reason' for $file (use upstream-origin | origin-base | false-positive)";;
     esac
     if [ "$ok" -eq 1 ]; then
       valid_dismissals="$(jq -c --argjson d "$d" --arg f "$file" \
@@ -666,6 +685,7 @@ cat >&2 <<EOF
   Next steps (in order of preference):
   1. FIX the findings, git add -A, and retry (full report: $REVIEW_JSON).
   2. If a finding is in code that is verbatim upstream's ($FACTORY_UPSTREAM_REF)
+     or verbatim fork-base code ($FACTORY_ORIGIN_REF, when configured; note required)
      or is demonstrably wrong, write $DISMISSALS —
      schema in the header of scripts/factory/precommit-gate.sh. Each entry must
      copy the finding's exact file, line, and title from the report above.
