@@ -8,6 +8,10 @@ import {
   type ThreadSortInput,
 } from "../lib/threadSort";
 import type { SidebarThreadSummary, Thread } from "../types";
+import {
+  canSettle,
+  resolveThreadAttentionBlocker,
+} from "@t3tools/client-runtime/state/thread-settled";
 import { cn } from "../lib/utils";
 import { isLatestTurnSettled } from "../session-logic";
 import { resolveServerBackedAppStageLabel } from "../branding.logic";
@@ -86,6 +90,31 @@ export function buildMultiSelectThreadContextMenuItems(input: {
   ];
 }
 
+type SidebarV2SettleableThread = Parameters<typeof canSettle>[0] & {
+  readonly settledOverride: "settled" | "active" | null;
+};
+
+export function filterSidebarV2MultiSelectSettleableThreadKeys<
+  TThread extends SidebarV2SettleableThread,
+>(input: {
+  readonly threadKeys: ReadonlyArray<string>;
+  readonly threadByKey: ReadonlyMap<string, TThread>;
+  readonly settledThreadKeys: ReadonlySet<string>;
+  readonly supportsSettlement: (thread: TThread) => boolean;
+  readonly now: string;
+}): string[] {
+  return input.threadKeys.filter((threadKey) => {
+    const thread = input.threadByKey.get(threadKey);
+    return (
+      thread !== undefined &&
+      thread.settledOverride !== "settled" &&
+      !input.settledThreadKeys.has(threadKey) &&
+      input.supportsSettlement(thread) &&
+      canSettle(thread, { now: input.now })
+    );
+  });
+}
+
 export interface ThreadStatusPill {
   label:
     | "Working"
@@ -131,6 +160,7 @@ export type SidebarThreadTreeInput = Pick<
   | "id"
   | "interactionMode"
   | "latestTurn"
+  | "parentEnvironmentId"
   | "parentThreadId"
   | "session"
 >;
@@ -458,6 +488,101 @@ export function resolveThreadRowClassName(input: {
   return cn(baseClassName, "text-muted-foreground hover:bg-accent hover:text-foreground");
 }
 
+// ── Sidebar v2 status model ─────────────────────────────────────────
+// Six visual states: color is reserved for "act now"
+// (approval), "in motion" (working), and "broken" (failed). Ready is the
+// unlabeled resting state. An actionable plan remains visible as Plan ready
+// instead of receding into that resting state.
+// Unread completion is tracked separately: it describes whether a ready
+// thread needs attention, not what the thread is currently doing.
+export type SidebarV2Status = "approval" | "input" | "working" | "failed" | "plan" | "ready";
+
+type SidebarV2StatusInput = Pick<
+  SidebarThreadSummary,
+  | "hasActionableProposedPlan"
+  | "hasPendingApprovals"
+  | "hasPendingUserInput"
+  | "interactionMode"
+  | "latestTurn"
+  | "session"
+>;
+
+export function resolveSidebarV2Status(thread: SidebarV2StatusInput): SidebarV2Status {
+  const blocker = resolveThreadAttentionBlocker(thread);
+  if (blocker === "approval") return "approval";
+  if (blocker === "input") return "input";
+  if (blocker === "working") return "working";
+  if (blocker === "failed") return "failed";
+  if (blocker === "plan") return "plan";
+  return "ready";
+}
+
+/** NaN-safe Date.parse for sort comparators: a malformed timestamp must not
+    poison the whole ordering, so it sinks to the epoch instead. */
+export function parseTimestampMs(isoDate: string): number {
+  const parsed = Date.parse(isoDate);
+  return Number.isNaN(parsed) ? 0 : parsed;
+}
+
+/** First VALID timestamp wins: `a ?? b` falls through on null, but a present-
+    yet-malformed string must also fall through to the next candidate rather
+    than sink the row to the epoch. */
+export function firstValidTimestampMs(
+  ...candidates: ReadonlyArray<string | null | undefined>
+): number {
+  for (const candidate of candidates) {
+    if (candidate == null) continue;
+    const parsed = Date.parse(candidate);
+    if (!Number.isNaN(parsed)) return parsed;
+  }
+  return 0;
+}
+
+export function maxValidTimestampMs(
+  ...candidates: ReadonlyArray<string | null | undefined>
+): number {
+  let latest = 0;
+  for (const candidate of candidates) {
+    if (candidate == null) continue;
+    const parsed = Date.parse(candidate);
+    if (!Number.isNaN(parsed)) latest = Math.max(latest, parsed);
+  }
+  return latest;
+}
+
+export function sortSidebarV2SettledGroupsByRecency<
+  TGroup extends ReadonlyArray<{
+    readonly thread: {
+      readonly latestUserMessageAt?: string | null;
+      readonly updatedAt?: string | null;
+    };
+  }>,
+>(groups: ReadonlyArray<TGroup>): TGroup[] {
+  const groupActivityAt = (group: TGroup): number =>
+    group.length === 0
+      ? 0
+      : Math.max(
+          ...group.map((row) =>
+            maxValidTimestampMs(row.thread.latestUserMessageAt, row.thread.updatedAt),
+          ),
+        );
+  return [...groups].toSorted((left, right) => groupActivityAt(right) - groupActivityAt(left));
+}
+
+// v2 sort: static creation order, newest thread on top. Activity NEVER
+// reorders the list — a row holds its position from open until settled, so
+// the screen only moves at lifecycle transitions. Status (including pending
+// approval) is carried by each card's edge strip, not by position.
+export function sortThreadsForSidebarV2<
+  T extends { readonly id: string; readonly createdAt: string },
+>(threads: readonly T[]): T[] {
+  return [...threads].toSorted(
+    (left, right) =>
+      parseTimestampMs(right.createdAt) - parseTimestampMs(left.createdAt) ||
+      left.id.localeCompare(right.id),
+  );
+}
+
 export function resolveThreadStatusPill(input: {
   thread: ThreadStatusInput;
 }): ThreadStatusPill | null {
@@ -607,7 +732,7 @@ function sidebarThreadParentTreeKey(thread: SidebarThreadTreeInput): string | nu
   if (thread.parentThreadId === null) {
     return null;
   }
-  return `${thread.environmentId}\u0000${thread.parentThreadId}`;
+  return `${thread.parentEnvironmentId ?? thread.environmentId}\u0000${thread.parentThreadId}`;
 }
 
 export function isSidebarThreadActiveForSort(
@@ -708,14 +833,17 @@ function getActiveSidebarThreadTreePathIndexes<TThread extends SidebarThreadTree
   return pathIndexes;
 }
 
-export function filterSidebarThreadTreeRowsByExpansion<TThread extends SidebarThreadTreeInput>(
-  rows: readonly SidebarThreadTreeRow<TThread>[],
+export function filterSidebarThreadTreeRowsByExpansion<
+  TThread extends SidebarThreadTreeInput,
+  TRow extends SidebarThreadTreeRow<TThread> = SidebarThreadTreeRow<TThread>,
+>(
+  rows: readonly TRow[],
   threadTreeExpandedById: Readonly<Record<string, boolean>>,
   options: { readonly activeThreadKey?: string | null } = {},
-): SidebarThreadTreeRow<TThread>[] {
+): TRow[] {
   const forceVisibleIndexes = getActiveSidebarThreadTreePathIndexes(rows, options.activeThreadKey);
 
-  const visibleRows: SidebarThreadTreeRow<TThread>[] = [];
+  const visibleRows: TRow[] = [];
   let collapsedAncestorDepth: number | null = null;
 
   for (const [index, row] of rows.entries()) {
@@ -901,6 +1029,104 @@ export function buildSidebarThreadTreeRows<TThread extends SidebarThreadTreeInpu
   }
 
   return rows;
+}
+
+export interface SidebarV2ThreadTreeRow<
+  TThread extends SidebarThreadTreeInput,
+> extends SidebarThreadTreeRow<TThread> {
+  readonly isSettled: boolean;
+  readonly unsettledDescendantCount: number;
+}
+
+export interface SidebarV2ThreadTreePartition<TThread extends SidebarThreadTreeInput> {
+  readonly activeRows: ReadonlyArray<SidebarV2ThreadTreeRow<TThread>>;
+  readonly settledGroups: ReadonlyArray<ReadonlyArray<SidebarV2ThreadTreeRow<TThread>>>;
+}
+
+/**
+ * Keeps a parent and its descendants in one visual group while preserving an
+ * independent lifecycle for every row. A group remains in the inbox while
+ * any member is unsettled; only a wholly settled tree moves to the history
+ * tail. This prevents an active child from becoming detached from its parent.
+ */
+export function partitionSidebarV2ThreadTreeRows<TThread extends SidebarThreadTreeInput>(
+  sortedThreads: readonly TThread[],
+  isSettled: (thread: TThread) => boolean,
+): SidebarV2ThreadTreePartition<TThread> {
+  const treeRows = buildSidebarThreadTreeRows(sortedThreads);
+  const settledByIndex = treeRows.map((row) => isSettled(row.thread));
+  const unsettledDescendantCountByIndex = treeRows.map(() => 0);
+  const ancestorIndexes: number[] = [];
+  for (const [index, row] of treeRows.entries()) {
+    while (
+      ancestorIndexes.length > 0 &&
+      (treeRows[ancestorIndexes.at(-1) ?? -1]?.depth ?? -1) >= row.depth
+    ) {
+      ancestorIndexes.pop();
+    }
+    if (!settledByIndex[index]) {
+      for (const ancestorIndex of ancestorIndexes) {
+        unsettledDescendantCountByIndex[ancestorIndex] =
+          (unsettledDescendantCountByIndex[ancestorIndex] ?? 0) + 1;
+      }
+    }
+    ancestorIndexes.push(index);
+  }
+
+  const rows: Array<SidebarV2ThreadTreeRow<TThread>> = treeRows.map((row, index) => {
+    return {
+      ...row,
+      isSettled: settledByIndex[index] ?? false,
+      unsettledDescendantCount: unsettledDescendantCountByIndex[index] ?? 0,
+    };
+  });
+
+  const groups: Array<Array<SidebarV2ThreadTreeRow<TThread>>> = [];
+  for (const row of rows) {
+    if (row.depth === 0 || groups.length === 0) {
+      groups.push([row]);
+    } else {
+      groups.at(-1)?.push(row);
+    }
+  }
+
+  const activeRows: Array<SidebarV2ThreadTreeRow<TThread>> = [];
+  const settledGroups: Array<Array<SidebarV2ThreadTreeRow<TThread>>> = [];
+  for (const group of groups) {
+    if (group.some((row) => !row.isSettled)) {
+      activeRows.push(...group);
+    } else {
+      settledGroups.push(group);
+    }
+  }
+  return { activeRows, settledGroups };
+}
+
+export function pageSidebarV2SettledGroups<TThread extends SidebarThreadTreeInput>(
+  groups: ReadonlyArray<ReadonlyArray<SidebarV2ThreadTreeRow<TThread>>>,
+  visibleGroupCount: number,
+  activeThreadKey: string | null | undefined,
+): {
+  readonly visibleGroups: ReadonlyArray<ReadonlyArray<SidebarV2ThreadTreeRow<TThread>>>;
+  readonly hiddenGroups: ReadonlyArray<ReadonlyArray<SidebarV2ThreadTreeRow<TThread>>>;
+} {
+  const visibleIndexes = new Set<number>();
+  for (let index = 0; index < Math.min(groups.length, Math.max(0, visibleGroupCount)); index += 1) {
+    visibleIndexes.add(index);
+  }
+  if (activeThreadKey !== null && activeThreadKey !== undefined) {
+    const activeGroupIndex = groups.findIndex((group) =>
+      group.some((row) => sidebarThreadExpansionKey(row.thread) === activeThreadKey),
+    );
+    if (activeGroupIndex >= 0) {
+      visibleIndexes.add(activeGroupIndex);
+    }
+  }
+
+  return {
+    visibleGroups: groups.filter((_, index) => visibleIndexes.has(index)),
+    hiddenGroups: groups.filter((_, index) => !visibleIndexes.has(index)),
+  };
 }
 
 export function resolveProjectStatusIndicator(

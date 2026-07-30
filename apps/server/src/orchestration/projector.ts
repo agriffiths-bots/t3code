@@ -33,7 +33,9 @@ import {
   ThreadProposedPlanUpsertedPayload,
   ThreadRuntimeModeSetPayload,
   ThreadParentSetPayload,
+  ThreadSettledPayload,
   ThreadUnarchivedPayload,
+  ThreadUnsettledPayload,
   ThreadRevertedPayload,
   ThreadSessionSetPayload,
   ThreadTurnDiffCompletedPayload,
@@ -635,6 +637,8 @@ export function projectEvent(
             createdAt: payload.createdAt,
             updatedAt: payload.updatedAt,
             archivedAt: null,
+            settledOverride: null,
+            settledAt: null,
             deletedAt: null,
             messages: [],
             activities: [],
@@ -696,6 +700,29 @@ export function projectEvent(
           threads: updateThread(nextBase.threads, payload.threadId, {
             parentThreadId: payload.parentThreadId,
             parentEnvironmentId: payload.parentEnvironmentId ?? null,
+          }),
+        })),
+      );
+
+    case "thread.settled":
+      return decodeForEvent(ThreadSettledPayload, event.payload, event.type, "payload").pipe(
+        Effect.map((payload) => ({
+          ...nextBase,
+          threads: updateThread(nextBase.threads, payload.threadId, {
+            settledOverride: "settled",
+            settledAt: payload.settledAt,
+            updatedAt: payload.updatedAt,
+          }),
+        })),
+      );
+
+    case "thread.unsettled":
+      return decodeForEvent(ThreadUnsettledPayload, event.payload, event.type, "payload").pipe(
+        Effect.map((payload) => ({
+          ...nextBase,
+          threads: updateThread(nextBase.threads, payload.threadId, {
+            settledOverride: payload.reason === "user" ? "active" : null,
+            settledAt: null,
             updatedAt: payload.updatedAt,
           }),
         })),

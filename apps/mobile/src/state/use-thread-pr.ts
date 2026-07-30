@@ -12,9 +12,8 @@ export {
 
 /**
  * Live PR status for a thread's branch. Subscriptions are deduplicated per
- * (environmentId, cwd) by the atom family, so many rows on the same worktree
- * or project root share one stream — and virtualization means only visible
- * rows subscribe at all.
+ * (environmentId, cwd) by the atom family, so callers observing the same
+ * worktree or project root share one stream.
  */
 export function useThreadPr(
   thread: EnvironmentThreadShell,

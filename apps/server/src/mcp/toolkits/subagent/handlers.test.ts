@@ -192,6 +192,8 @@ const makeChildDetail = (): OrchestrationThread => ({
   createdAt: "2026-06-17T09:00:00.000Z",
   updatedAt: "2026-06-17T10:01:00.000Z",
   archivedAt: null,
+  settledOverride: null,
+  settledAt: null,
   deletedAt: null,
   messages: childDetailMessages ?? [
     {
@@ -235,6 +237,8 @@ const makeChildShell = (turnState: "completed" | "running" = "completed") => ({
   createdAt: "2026-06-17T09:00:00.000Z",
   updatedAt: "2026-06-17T10:01:00.000Z",
   archivedAt: null,
+  settledOverride: null,
+  settledAt: null,
   session: null,
   latestUserMessageAt: null,
   hasPendingApprovals: false,
@@ -742,6 +746,8 @@ const peerSpawnReceiverReadModel = (startedChildThreadId: ThreadId): Orchestrati
       createdAt: "2026-06-17T09:00:00.000Z",
       updatedAt: "2026-06-17T09:00:00.000Z",
       archivedAt: null,
+      settledOverride: null,
+      settledAt: null,
       deletedAt: null,
       messages: [],
       turns: [],

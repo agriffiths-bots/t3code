@@ -380,6 +380,10 @@ export const OrchestrationThread = Schema.Struct({
   // Null/absent means the parent is local to this environment. Remote parents
   // carry the source environment id beside the source thread id.
   parentEnvironmentId: Schema.optional(Schema.NullOr(EnvironmentId)),
+  settledOverride: Schema.NullOr(Schema.Literals(["settled", "active"])).pipe(
+    Schema.withDecodingDefault(Effect.succeed(null)),
+  ),
+  settledAt: Schema.NullOr(IsoDateTime).pipe(Schema.withDecodingDefault(Effect.succeed(null))),
   deletedAt: Schema.NullOr(IsoDateTime),
   messages: Schema.Array(OrchestrationMessage),
   proposedPlans: Schema.Array(OrchestrationProposedPlan).pipe(
@@ -430,12 +434,16 @@ export const OrchestrationThreadShell = Schema.Struct({
   createdAt: IsoDateTime,
   updatedAt: IsoDateTime,
   archivedAt: Schema.NullOr(IsoDateTime).pipe(Schema.withDecodingDefault(Effect.succeed(null))),
+  settledOverride: Schema.NullOr(Schema.Literals(["settled", "active"])).pipe(
+    Schema.withDecodingDefault(Effect.succeed(null)),
+  ),
+  settledAt: Schema.NullOr(IsoDateTime).pipe(Schema.withDecodingDefault(Effect.succeed(null))),
   session: Schema.NullOr(OrchestrationSession),
   latestUserMessageAt: Schema.NullOr(IsoDateTime),
   hasPendingApprovals: Schema.Boolean,
   hasPendingUserInput: Schema.Boolean,
   hasActionableProposedPlan: Schema.Boolean,
-  parentThreadId: Schema.NullOr(ThreadId),
+  parentThreadId: Schema.NullOr(ThreadId).pipe(Schema.withDecodingDefault(Effect.succeed(null))),
   parentEnvironmentId: Schema.optional(Schema.NullOr(EnvironmentId)),
 });
 export type OrchestrationThreadShell = typeof OrchestrationThreadShell.Type;
@@ -596,6 +604,12 @@ export type OrchestrationSubscribeShellInput = typeof OrchestrationSubscribeShel
 export const OrchestrationSubscribeThreadInput = Schema.Struct({
   threadId: ThreadId,
   /**
+   * Opts into raw thread.settled/thread.unsettled detail events. Optional and
+   * false by default so pre-settlement clients never receive union variants
+   * they cannot decode during a mixed-version rollout.
+   */
+  supportsThreadSettlementEvents: Schema.optionalKey(Schema.Boolean),
+  /**
    * Epoch of the event store that produced `afterSequence`. The server only
    * resumes from the cursor when this matches its current store; otherwise it
    * sends an authoritative snapshot.
@@ -729,6 +743,22 @@ const ThreadUnarchiveCommand = Schema.Struct({
   type: Schema.Literal("thread.unarchive"),
   commandId: CommandId,
   threadId: ThreadId,
+});
+
+const ThreadSettleCommand = Schema.Struct({
+  type: Schema.Literal("thread.settle"),
+  commandId: CommandId,
+  threadId: ThreadId,
+});
+
+const ThreadUnsettleCommand = Schema.Struct({
+  type: Schema.Literal("thread.unsettle"),
+  commandId: CommandId,
+  threadId: ThreadId,
+  // Commands only carry "user": activity un-settles are decided server-side
+  // (the decider emits thread.unsettled(reason: "activity") events directly,
+  // never through this command), so a client cannot forge the neutral reset.
+  reason: Schema.Literal("user"),
 });
 
 const ThreadMetaUpdateCommand = Schema.Struct({
@@ -890,6 +920,8 @@ const DispatchableClientOrchestrationCommand = Schema.Union([
   ThreadDeleteCommand,
   ThreadArchiveCommand,
   ThreadUnarchiveCommand,
+  ThreadSettleCommand,
+  ThreadUnsettleCommand,
   ThreadMetaUpdateCommand,
   ThreadRuntimeModeSetCommand,
   ThreadInteractionModeSetCommand,
@@ -911,6 +943,8 @@ export const ClientOrchestrationCommand = Schema.Union([
   ThreadDeleteCommand,
   ThreadArchiveCommand,
   ThreadUnarchiveCommand,
+  ThreadSettleCommand,
+  ThreadUnsettleCommand,
   ThreadMetaUpdateCommand,
   ThreadRuntimeModeSetCommand,
   ThreadInteractionModeSetCommand,
@@ -1026,6 +1060,8 @@ export const OrchestrationEventType = Schema.Literals([
   "thread.deleted",
   "thread.archived",
   "thread.unarchived",
+  "thread.settled",
+  "thread.unsettled",
   "thread.meta-updated",
   "thread.runtime-mode-set",
   "thread.interaction-mode-set",
@@ -1121,6 +1157,18 @@ export const ThreadArchivedPayload = Schema.Struct({
 
 export const ThreadUnarchivedPayload = Schema.Struct({
   threadId: ThreadId,
+  updatedAt: IsoDateTime,
+});
+
+export const ThreadSettledPayload = Schema.Struct({
+  threadId: ThreadId,
+  settledAt: IsoDateTime,
+  updatedAt: IsoDateTime,
+});
+
+export const ThreadUnsettledPayload = Schema.Struct({
+  threadId: ThreadId,
+  reason: Schema.Literals(["user", "activity"]),
   updatedAt: IsoDateTime,
 });
 
@@ -1311,6 +1359,16 @@ export const OrchestrationEvent = Schema.Union([
     ...EventBaseFields,
     type: Schema.Literal("thread.unarchived"),
     payload: ThreadUnarchivedPayload,
+  }),
+  Schema.Struct({
+    ...EventBaseFields,
+    type: Schema.Literal("thread.settled"),
+    payload: ThreadSettledPayload,
+  }),
+  Schema.Struct({
+    ...EventBaseFields,
+    type: Schema.Literal("thread.unsettled"),
+    payload: ThreadUnsettledPayload,
   }),
   Schema.Struct({
     ...EventBaseFields,
@@ -1512,6 +1570,12 @@ export type OrchestrationGetFullThreadDiffResult = typeof OrchestrationGetFullTh
 
 export const OrchestrationReplayEventsInput = Schema.Struct({
   fromSequenceExclusive: NonNegativeInt,
+  /**
+   * Opts into raw thread.settled/thread.unsettled events. Optional and false
+   * by default so older clients can replay across a mixed-version deployment
+   * without receiving OrchestrationEvent union variants they cannot decode.
+   */
+  supportsThreadSettlementEvents: Schema.optionalKey(Schema.Boolean),
 });
 export type OrchestrationReplayEventsInput = typeof OrchestrationReplayEventsInput.Type;
 

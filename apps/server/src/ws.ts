@@ -257,7 +257,10 @@ function projectFileFailureContext(
   }
 }
 
-export function isThreadDetailEvent(event: OrchestrationEvent): event is Extract<
+export function isThreadDetailEvent(
+  event: OrchestrationEvent,
+  supportsThreadSettlementEvents = false,
+): event is Extract<
   OrchestrationEvent,
   {
     type:
@@ -265,6 +268,8 @@ export function isThreadDetailEvent(event: OrchestrationEvent): event is Extract
       | "thread.deleted"
       | "thread.archived"
       | "thread.unarchived"
+      | "thread.settled"
+      | "thread.unsettled"
       | "thread.proposed-plan-upserted"
       | "thread.activity-appended"
       | "thread.turn-diff-completed"
@@ -278,12 +283,26 @@ export function isThreadDetailEvent(event: OrchestrationEvent): event is Extract
     event.type === "thread.deleted" ||
     event.type === "thread.archived" ||
     event.type === "thread.unarchived" ||
+    (supportsThreadSettlementEvents && event.type === "thread.settled") ||
+    (supportsThreadSettlementEvents && event.type === "thread.unsettled") ||
     event.type === "thread.proposed-plan-upserted" ||
     event.type === "thread.activity-appended" ||
     event.type === "thread.turn-diff-completed" ||
     event.type === "thread.turn-effective-model-set" ||
     event.type === "thread.reverted" ||
     event.type === "thread.session-set"
+  );
+}
+
+/** Mixed-version replay guard: settlement union variants are only exposed to
+ * clients that explicitly advertise their decoder support. */
+export function isReplayEventSupported(
+  event: OrchestrationEvent,
+  supportsThreadSettlementEvents = false,
+): boolean {
+  return (
+    supportsThreadSettlementEvents ||
+    (event.type !== "thread.settled" && event.type !== "thread.unsettled")
   );
 }
 
@@ -1368,6 +1387,10 @@ const makeWsRpcLayer = (currentSession: EnvironmentAuth.AuthenticatedSession) =>
                       minimum: 0,
                     }),
                   ),
+                ).pipe(
+                  Stream.filter((event) =>
+                    isReplayEventSupported(event, input.supportsThreadSettlementEvents === true),
+                  ),
                 ),
               );
             }).pipe(
@@ -1532,7 +1555,7 @@ const makeWsRpcLayer = (currentSession: EnvironmentAuth.AuthenticatedSession) =>
               const isThisThreadDetailEvent = (event: OrchestrationEvent) =>
                 event.aggregateKind === "thread" &&
                 event.aggregateId === input.threadId &&
-                isThreadDetailEvent(event);
+                isThreadDetailEvent(event, input.supportsThreadSettlementEvents === true);
               const storageEpoch = orchestrationEventStore.storageEpoch;
 
               const liveStream = visibleOrchestrationEvents(

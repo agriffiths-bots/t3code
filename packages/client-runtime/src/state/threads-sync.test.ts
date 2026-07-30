@@ -86,6 +86,8 @@ const BASE_THREAD: OrchestrationThread = {
   createdAt: "2026-04-01T00:00:00.000Z",
   updatedAt: "2026-04-01T00:00:00.000Z",
   archivedAt: null,
+  settledOverride: null,
+  settledAt: null,
   deletedAt: null,
   messages: [],
   proposedPlans: [],
@@ -247,6 +249,7 @@ const makeHarness = Effect.fn("TestEnvironmentThreads.makeHarness")(function* (o
   const lastSubscribeObservedRevision = yield* Ref.make<number | undefined>(undefined);
   const lastSubscribeObservedEventId = yield* Ref.make<EventId | null | undefined>(undefined);
   const lastSubscribeObservedDataAudience = yield* Ref.make<DataAudience | undefined>(undefined);
+  const lastSupportsThreadSettlementEvents = yield* Ref.make<boolean | undefined>(undefined);
   const subscribeAfterSequences = yield* Ref.make<ReadonlyArray<number | undefined>>([]);
   const lastRequestCompletionMarker = yield* Ref.make<boolean | undefined>(undefined);
   const savedThreads = yield* Ref.make<ReadonlyArray<OrchestrationThreadDetailSnapshot>>([]);
@@ -269,6 +272,7 @@ const makeHarness = Effect.fn("TestEnvironmentThreads.makeHarness")(function* (o
       readonly observedRevision?: number;
       readonly observedEventId?: EventId | null;
       readonly observedDataAudience?: DataAudience;
+      readonly supportsThreadSettlementEvents?: boolean;
       readonly requestCompletionMarker?: boolean;
     }) =>
       Stream.unwrap(
@@ -279,6 +283,9 @@ const makeHarness = Effect.fn("TestEnvironmentThreads.makeHarness")(function* (o
           Effect.andThen(Ref.set(lastSubscribeObservedRevision, input.observedRevision)),
           Effect.andThen(Ref.set(lastSubscribeObservedEventId, input.observedEventId)),
           Effect.andThen(Ref.set(lastSubscribeObservedDataAudience, input.observedDataAudience)),
+          Effect.andThen(
+            Ref.set(lastSupportsThreadSettlementEvents, input.supportsThreadSettlementEvents),
+          ),
           Effect.andThen(
             Ref.update(subscribeAfterSequences, (current) => [...current, input.afterSequence]),
           ),
@@ -464,6 +471,7 @@ const makeHarness = Effect.fn("TestEnvironmentThreads.makeHarness")(function* (o
     lastSubscribeObservedRevision,
     lastSubscribeObservedEventId,
     lastSubscribeObservedDataAudience,
+    lastSupportsThreadSettlementEvents,
     subscribeAfterSequences,
     lastRequestCompletionMarker,
     supervisorState,
@@ -729,6 +737,7 @@ describe("EnvironmentThreads", () => {
       // full snapshot over HTTP.
       expect(yield* Ref.get(harness.lastSubscribeAfterSequence)).toBe(CACHED_SNAPSHOT_SEQUENCE);
       expect(yield* Ref.get(harness.lastSubscribeObservedDataAudience)).toBe("private");
+      expect(yield* Ref.get(harness.lastSupportsThreadSettlementEvents)).toBe(true);
       expect(yield* Ref.get(harness.loaderCalls)).toBe(0);
     }),
   );

@@ -8,7 +8,7 @@
     />
     <meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)" />
     <meta name="theme-color" content="#161616" media="(prefers-color-scheme: dark)" />
-    <meta name="theme-color" content="#161616" />
+    <meta name="theme-color" content="#ffffff" />
     <meta name="application-name" content="T3 Code" />
     <meta name="mobile-web-app-capable" content="yes" />
     <meta name="apple-mobile-web-app-title" content="T3 Code" />
@@ -27,7 +27,7 @@
           const theme =
             storedTheme === "light" || storedTheme === "dark" || storedTheme === "system"
               ? storedTheme
-              : "system";
+              : "light";
           const prefersDark = window.matchMedia("(prefers-color-scheme: dark)").matches;
           const isDark = theme === "dark" || (theme === "system" && prefersDark);
           document.documentElement.classList.toggle("dark", isDark);
@@ -35,9 +35,9 @@
           document.documentElement.style.backgroundColor = chromeColor;
           themeColorMeta?.setAttribute("content", chromeColor);
         } catch {
-          document.documentElement.classList.add("dark");
-          document.documentElement.style.backgroundColor = DARK_BACKGROUND;
-          themeColorMeta?.setAttribute("content", DARK_BACKGROUND);
+          document.documentElement.classList.remove("dark");
+          document.documentElement.style.backgroundColor = LIGHT_BACKGROUND;
+          themeColorMeta?.setAttribute("content", LIGHT_BACKGROUND);
         }
       })();
     </script>

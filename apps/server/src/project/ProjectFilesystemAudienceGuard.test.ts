@@ -80,6 +80,8 @@ const makeThread = (input: {
   deletedAt: null,
   session: null,
   latestUserMessageAt: null,
+  settledOverride: null,
+  settledAt: null,
   hasPendingApprovals: false,
   hasPendingUserInput: false,
   hasActionableProposedPlan: false,

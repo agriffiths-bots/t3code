@@ -1,0 +1,371 @@
+import type {
+  EnvironmentProject,
+  EnvironmentThreadShell,
+} from "@t3tools/client-runtime/state/shell";
+import type { MenuAction } from "@react-native-menu/menu";
+import { memo, useCallback, useEffect, useMemo, type ComponentProps } from "react";
+import { Platform, Pressable, useWindowDimensions, View } from "react-native";
+import type { SwipeableMethods } from "react-native-gesture-handler/ReanimatedSwipeable";
+
+import { AppText as Text } from "../../components/AppText";
+import { ControlPillMenu } from "../../components/ControlPill";
+import { ProjectFavicon } from "../../components/ProjectFavicon";
+import { ProviderIcon } from "../../components/ProviderIcon";
+import { cn } from "../../lib/cn";
+import { relativeTime } from "../../lib/time";
+import { useThemeColor } from "../../lib/useThemeColor";
+import { useThreadPr } from "../../state/use-thread-pr";
+import { ThreadSwipeable } from "../home/thread-swipe-actions";
+import { resolveThreadListV2Status, type ThreadListV2Status } from "./threadListV2";
+
+/**
+ * Thread List v2 rows mirror the web sidebar's compact tonal cards and
+ * receded settled tail while retaining native swipe and long-press actions.
+ */
+
+const MONO_FONT = Platform.select({
+  ios: "Menlo",
+  android: "monospace",
+  default: "monospace",
+});
+
+const STATUS_LABEL_BY_STATUS: Partial<
+  Record<ThreadListV2Status, { label: string; className: string }>
+> = {
+  approval: { label: "Approval", className: "text-amber-700 dark:text-amber-300" },
+  input: { label: "Input", className: "text-amber-700 dark:text-amber-300" },
+  working: { label: "Working", className: "text-blue-600 dark:text-blue-400" },
+  failed: { label: "Failed", className: "text-red-700 dark:text-red-300" },
+  plan: { label: "Plan ready", className: "text-violet-700 dark:text-violet-300" },
+};
+
+function threadTimeLabel(thread: EnvironmentThreadShell): string {
+  return relativeTime(thread.latestUserMessageAt ?? thread.updatedAt ?? thread.createdAt);
+}
+
+// Menus stay lifecycle-focused: settle/un-settle plus delete. Archive keeps
+// its own surface (thread screen / settings) rather than crowding the row.
+const CARD_MENU_ACTIONS: MenuAction[] = [
+  { id: "settle", title: "Settle", image: "checkmark" },
+  { id: "delete", title: "Delete", image: "trash", attributes: { destructive: true } },
+];
+
+const SLIM_MENU_ACTIONS: MenuAction[] = [
+  { id: "unsettle", title: "Un-settle", image: "arrow.uturn.backward" },
+  { id: "delete", title: "Delete", image: "trash", attributes: { destructive: true } },
+];
+
+// Pre-settlement servers: no lifecycle items, archive fills the gap.
+const LEGACY_MENU_ACTIONS: MenuAction[] = [
+  { id: "archive", title: "Archive", image: "archivebox" },
+  { id: "delete", title: "Delete", image: "trash", attributes: { destructive: true } },
+];
+
+export const ThreadListV2SettledDivider = memo(function ThreadListV2SettledDivider() {
+  const borderColor = useThemeColor("--color-border");
+  return (
+    <View className="mb-1.5 mt-4 flex-row items-center gap-2.5 px-5">
+      <Text className="text-xs font-t3-medium text-foreground-tertiary">Settled</Text>
+      <View className="h-px flex-1" style={{ backgroundColor: borderColor }} />
+    </View>
+  );
+});
+
+export const ThreadListV2PrStateReporter = memo(function ThreadListV2PrStateReporter(props: {
+  readonly thread: EnvironmentThreadShell;
+  readonly projectCwd: string | null;
+  readonly onChangeRequestState: (
+    threadKey: string,
+    state: "open" | "closed" | "merged" | null,
+  ) => void;
+}) {
+  const { onChangeRequestState, projectCwd, thread } = props;
+  const pr = useThreadPr(thread, projectCwd);
+  const prState = pr?.state ?? null;
+  const threadKey = `${thread.environmentId}:${thread.id}`;
+  useEffect(() => {
+    onChangeRequestState(threadKey, prState);
+  }, [onChangeRequestState, prState, threadKey]);
+  useEffect(
+    () => () => {
+      onChangeRequestState(threadKey, null);
+    },
+    [onChangeRequestState, threadKey],
+  );
+  return null;
+});
+
+export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
+  readonly thread: EnvironmentThreadShell;
+  readonly variant: "card" | "slim";
+  readonly treeDepth: number;
+  readonly unsettledDescendantCount: number;
+  readonly showSettledDivider: boolean;
+  readonly project: EnvironmentProject | null;
+  readonly providerDriver: string | null;
+  readonly onSelectThread: (thread: EnvironmentThreadShell) => void;
+  readonly onDeleteThread: (thread: EnvironmentThreadShell) => void;
+  readonly onSettleThread: (thread: EnvironmentThreadShell) => void;
+  readonly onUnsettleThread: (thread: EnvironmentThreadShell) => void;
+  readonly onArchiveThread: (thread: EnvironmentThreadShell) => void;
+  /** False on environments whose server predates thread.settle/unsettle:
+      swipe + menu fall back to Archive instead of failing on use. */
+  readonly settlementSupported: boolean;
+  readonly selected?: boolean;
+  readonly surface?: "screen" | "sidebar";
+  readonly fullSwipeWidth?: number;
+  readonly onSwipeableWillOpen: (methods: SwipeableMethods) => void;
+  readonly onSwipeableClose: (methods: SwipeableMethods) => void;
+  readonly simultaneousSwipeGesture?: ComponentProps<
+    typeof ThreadSwipeable
+  >["simultaneousWithExternalGesture"];
+}) {
+  const { width: windowWidth } = useWindowDimensions();
+  const {
+    thread,
+    variant,
+    onSelectThread,
+    onDeleteThread,
+    onSettleThread,
+    onUnsettleThread,
+    onArchiveThread,
+  } = props;
+
+  const screenColor = useThemeColor("--color-screen");
+  const drawerColor = useThemeColor("--color-drawer");
+  const surfaceColor = props.surface === "sidebar" ? drawerColor : screenColor;
+
+  const status = resolveThreadListV2Status(thread);
+  const statusLabel = STATUS_LABEL_BY_STATUS[status];
+  const timeLabel = threadTimeLabel(thread);
+  const treeInset = Math.min(props.treeDepth, 4) * 12;
+
+  const handleDelete = useCallback(() => onDeleteThread(thread), [onDeleteThread, thread]);
+  const handleSettle = useCallback(() => onSettleThread(thread), [onSettleThread, thread]);
+  const handleUnsettle = useCallback(() => onUnsettleThread(thread), [onUnsettleThread, thread]);
+  const handleArchive = useCallback(() => onArchiveThread(thread), [onArchiveThread, thread]);
+  const handleMenuAction = useCallback(
+    ({ nativeEvent }: { readonly nativeEvent: { readonly event: string } }) => {
+      if (nativeEvent.event === "settle") handleSettle();
+      if (nativeEvent.event === "unsettle") handleUnsettle();
+      if (nativeEvent.event === "archive") handleArchive();
+      if (nativeEvent.event === "delete") handleDelete();
+    },
+    [handleArchive, handleDelete, handleSettle, handleUnsettle],
+  );
+
+  // Swipe: the v2 primary action is the lifecycle transition. Every settled
+  // row can un-settle — explicit settles clear the override, auto-settled
+  // rows get pinned active until real activity clears the pin.
+  const canUnsettle = variant === "slim";
+  const primaryAction = useMemo(() => {
+    // Pre-settlement server: archive is the swipe action, as in v1. (Slim
+    // rows cannot occur here — unsupported environments never classify as
+    // settled.)
+    if (!props.settlementSupported) {
+      return {
+        accessibilityLabel: `Archive ${thread.title}`,
+        icon: "archivebox" as const,
+        label: "Archive",
+        onPress: handleArchive,
+      };
+    }
+    return canUnsettle
+      ? {
+          accessibilityLabel: `Un-settle ${thread.title}`,
+          icon: "arrow.uturn.backward" as const,
+          label: "Un-settle",
+          onPress: handleUnsettle,
+        }
+      : {
+          accessibilityLabel: `Settle ${thread.title}`,
+          icon: "checkmark" as const,
+          label: "Settle",
+          onPress: handleSettle,
+        };
+  }, [
+    canUnsettle,
+    handleArchive,
+    handleSettle,
+    handleUnsettle,
+    props.settlementSupported,
+    thread.title,
+  ]);
+
+  const rowContent = (close: () => void) =>
+    variant === "card" ? (
+      <Pressable
+        accessibilityHint={`Opens the thread. Swipe left to ${primaryAction.label.toLowerCase()}.`}
+        accessibilityLabel={thread.title}
+        accessibilityRole="button"
+        onPress={() => {
+          close();
+          onSelectThread(thread);
+        }}
+        style={({ pressed }) => ({ opacity: pressed ? 0.7 : 1 })}
+      >
+        <View className="px-4 py-1" style={{ backgroundColor: surfaceColor }}>
+          <View
+            className={cn(
+              "overflow-hidden",
+              props.selected
+                ? "bg-primary/15 dark:bg-primary/25"
+                : status === "ready"
+                  ? "bg-black/[0.025] dark:bg-white/[0.025]"
+                  : "bg-black/[0.04] dark:bg-white/[0.04]",
+            )}
+            style={{ borderRadius: 12, borderCurve: "continuous", minHeight: 84 }}
+          >
+            <View className="px-3 py-2.5">
+              <View className="flex-row items-center gap-1.5">
+                {props.project ? (
+                  <ProjectFavicon
+                    environmentId={thread.environmentId}
+                    size={15}
+                    projectTitle={props.project.title}
+                    workspaceRoot={props.project.workspaceRoot}
+                  />
+                ) : null}
+                <Text
+                  className="flex-1 text-sm font-t3-medium text-foreground-muted"
+                  numberOfLines={1}
+                >
+                  {props.project?.title ?? ""}
+                </Text>
+                {props.unsettledDescendantCount > 0 ? (
+                  <Text
+                    accessibilityLabel={`${props.unsettledDescendantCount} unsettled child thread${props.unsettledDescendantCount === 1 ? "" : "s"}`}
+                    className="rounded border border-blue-500/25 bg-blue-500/8 px-1 text-[10px] font-t3-medium text-blue-700 dark:text-blue-300"
+                  >
+                    {props.unsettledDescendantCount} open
+                  </Text>
+                ) : null}
+                <Text
+                  className={cn(
+                    "text-xs tabular-nums",
+                    statusLabel?.className ?? "text-foreground-tertiary",
+                  )}
+                >
+                  {statusLabel?.label ?? timeLabel}
+                </Text>
+              </View>
+              <Text className="mt-1 text-base font-t3-medium text-foreground" numberOfLines={2}>
+                {thread.title}
+              </Text>
+              <View className="mt-1 flex-row items-center gap-2">
+                {status === "failed" && thread.session?.lastError ? (
+                  <Text
+                    className="flex-1 text-xs text-red-600/80 dark:text-red-400/80"
+                    numberOfLines={1}
+                  >
+                    {thread.session.lastError}
+                  </Text>
+                ) : thread.branch ? (
+                  <Text
+                    className="flex-1 text-xs text-foreground-muted"
+                    numberOfLines={1}
+                    style={{ fontFamily: MONO_FONT }}
+                  >
+                    {thread.branch}
+                  </Text>
+                ) : (
+                  <View className="flex-1" />
+                )}
+                {props.providerDriver ? (
+                  <View className="opacity-60">
+                    <ProviderIcon provider={props.providerDriver} size={14} />
+                  </View>
+                ) : null}
+              </View>
+            </View>
+          </View>
+        </View>
+      </Pressable>
+    ) : (
+      <Pressable
+        accessibilityHint={`Opens the thread. Swipe left to ${primaryAction.label.toLowerCase()}.`}
+        accessibilityLabel={thread.title}
+        accessibilityRole="button"
+        style={({ pressed }) => ({
+          backgroundColor: surfaceColor,
+          opacity: pressed ? 0.7 : 1,
+        })}
+        onPress={() => {
+          close();
+          onSelectThread(thread);
+        }}
+      >
+        {/* Settled history recedes: dimmed favicon + muted title. */}
+        <View
+          className={cn(
+            "min-h-[44px] flex-row items-center gap-2.5 px-5 py-2",
+            props.selected ? "bg-primary/15 dark:bg-primary/25" : null,
+          )}
+        >
+          {props.project ? (
+            <View className="opacity-40">
+              <ProjectFavicon
+                environmentId={thread.environmentId}
+                size={15}
+                projectTitle={props.project.title}
+                workspaceRoot={props.project.workspaceRoot}
+              />
+            </View>
+          ) : null}
+          <Text className="flex-1 text-base text-foreground-muted" numberOfLines={1}>
+            {thread.title}
+          </Text>
+          {props.unsettledDescendantCount > 0 ? (
+            <Text className="text-xs font-t3-medium text-blue-700 dark:text-blue-300">
+              {props.unsettledDescendantCount} open
+            </Text>
+          ) : null}
+          <Text
+            className="text-sm tabular-nums text-foreground-tertiary"
+            style={{ fontFamily: MONO_FONT }}
+          >
+            {relativeTime(thread.latestUserMessageAt ?? thread.updatedAt ?? thread.createdAt)}
+          </Text>
+        </View>
+      </Pressable>
+    );
+
+  return (
+    <>
+      {props.showSettledDivider ? <ThreadListV2SettledDivider /> : null}
+      <View style={treeInset > 0 ? { marginLeft: treeInset } : undefined}>
+        <ThreadSwipeable
+          backgroundColor={surfaceColor}
+          enableTrackpadSwipe
+          // Full swipe commits the advertised lifecycle action (Settle /
+          // Un-settle), never the destructive delete.
+          fullSwipeAction="primary"
+          fullSwipeWidth={Math.max(1, (props.fullSwipeWidth ?? windowWidth - 32) - treeInset)}
+          onDelete={handleDelete}
+          onSwipeableClose={props.onSwipeableClose}
+          onSwipeableWillOpen={props.onSwipeableWillOpen}
+          primaryAction={primaryAction}
+          resetKey={`${thread.environmentId}:${thread.id}`}
+          simultaneousWithExternalGesture={props.simultaneousSwipeGesture}
+          threadTitle={thread.title}
+        >
+          {(close) => (
+            <ControlPillMenu
+              actions={
+                !props.settlementSupported
+                  ? LEGACY_MENU_ACTIONS
+                  : canUnsettle
+                    ? SLIM_MENU_ACTIONS
+                    : CARD_MENU_ACTIONS
+              }
+              onPressAction={handleMenuAction}
+              shouldOpenOnLongPress
+            >
+              {rowContent(close)}
+            </ControlPillMenu>
+          )}
+        </ThreadSwipeable>
+      </View>
+    </>
+  );
+});

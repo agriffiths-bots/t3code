@@ -332,6 +332,23 @@ function mapSessionRow(
   };
 }
 
+function mapMessageRow(
+  row: Schema.Schema.Type<typeof ProjectionThreadMessageDbRowSchema>,
+): OrchestrationThread["messages"][number] {
+  const message = {
+    id: row.messageId,
+    role: row.role,
+    text: row.text,
+    turnId: row.turnId,
+    streaming: row.isStreaming === 1,
+    createdAt: row.createdAt,
+    updatedAt: row.updatedAt,
+  };
+  return row.attachments === null
+    ? message
+    : Object.assign(message, { attachments: row.attachments });
+}
+
 function mapProjectShellRow(
   row: Schema.Schema.Type<typeof ProjectionProjectDbRowSchema>,
   repositoryIdentity: OrchestrationProject["repositoryIdentity"],
@@ -390,6 +407,23 @@ function mapActivityThreadReferences(
     summary: row.summary.replaceAll(childThreadId, "[redacted thread]"),
     payload: { ...payload, childThreadId: null },
   };
+}
+
+function mapActivityRow(
+  row: Schema.Schema.Type<typeof ProjectionThreadActivityDbRowSchema>,
+  readableThreadIds?: ReadableThreadIds,
+): OrchestrationThread["activities"][number] {
+  const references = mapActivityThreadReferences(row, readableThreadIds);
+  const activity = {
+    id: row.activityId,
+    tone: row.tone,
+    kind: row.kind,
+    summary: references.summary,
+    payload: references.payload,
+    turnId: row.turnId,
+    createdAt: row.createdAt,
+  };
+  return row.sequence === null ? activity : Object.assign(activity, { sequence: row.sequence });
 }
 
 function toPersistenceSqlOrDecodeError(sqlOperation: string, decodeOperation: string) {
@@ -476,6 +510,8 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
           threads.created_at AS "createdAt",
           threads.updated_at AS "updatedAt",
           threads.archived_at AS "archivedAt",
+          threads.settled_override AS "settledOverride",
+          threads.settled_at AS "settledAt",
           threads.latest_user_message_at AS "latestUserMessageAt",
           threads.pending_approval_count AS "pendingApprovalCount",
           threads.pending_user_input_count AS "pendingUserInputCount",
@@ -526,6 +562,8 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
           threads.created_at AS "createdAt",
           threads.updated_at AS "updatedAt",
           threads.archived_at AS "archivedAt",
+          threads.settled_override AS "settledOverride",
+          threads.settled_at AS "settledAt",
           threads.latest_user_message_at AS "latestUserMessageAt",
           threads.pending_approval_count AS "pendingApprovalCount",
           threads.pending_user_input_count AS "pendingUserInputCount",
@@ -563,6 +601,8 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
           threads.created_at AS "createdAt",
           threads.updated_at AS "updatedAt",
           threads.archived_at AS "archivedAt",
+          threads.settled_override AS "settledOverride",
+          threads.settled_at AS "settledAt",
           threads.latest_user_message_at AS "latestUserMessageAt",
           threads.pending_approval_count AS "pendingApprovalCount",
           threads.pending_user_input_count AS "pendingUserInputCount",
@@ -914,6 +954,8 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
           threads.created_at AS "createdAt",
           threads.updated_at AS "updatedAt",
           threads.archived_at AS "archivedAt",
+          threads.settled_override AS "settledOverride",
+          threads.settled_at AS "settledAt",
           threads.latest_user_message_at AS "latestUserMessageAt",
           threads.pending_approval_count AS "pendingApprovalCount",
           threads.pending_user_input_count AS "pendingUserInputCount",
@@ -953,6 +995,8 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
           threads.created_at AS "createdAt",
           threads.updated_at AS "updatedAt",
           threads.archived_at AS "archivedAt",
+          threads.settled_override AS "settledOverride",
+          threads.settled_at AS "settledAt",
           threads.latest_user_message_at AS "latestUserMessageAt",
           threads.pending_approval_count AS "pendingApprovalCount",
           threads.pending_user_input_count AS "pendingUserInputCount",
@@ -1397,6 +1441,8 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
               createdAt: row.createdAt,
               updatedAt: row.updatedAt,
               archivedAt: row.archivedAt,
+              settledOverride: row.settledOverride,
+              settledAt: row.settledAt,
               deletedAt: row.deletedAt,
               ...mapParentThreadReference(row, readableThreadIds),
               messages: [],
@@ -1601,6 +1647,8 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
                   createdAt: row.createdAt,
                   updatedAt: row.updatedAt,
                   archivedAt: row.archivedAt,
+                  settledOverride: row.settledOverride,
+                  settledAt: row.settledAt,
                   deletedAt: row.deletedAt,
                   parentThreadId: row.parentThreadId,
                   parentEnvironmentId: row.parentEnvironmentId ?? null,
@@ -1765,6 +1813,8 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
                         createdAt: row.createdAt,
                         updatedAt: row.updatedAt,
                         archivedAt: row.archivedAt,
+                        settledOverride: row.settledOverride,
+                        settledAt: row.settledAt,
                         session: sessionByThread.get(row.threadId) ?? null,
                         latestUserMessageAt: row.latestUserMessageAt,
                         hasPendingApprovals: row.pendingApprovalCount > 0,
@@ -1931,6 +1981,8 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
                     createdAt: row.createdAt,
                     updatedAt: row.updatedAt,
                     archivedAt: row.archivedAt,
+                    settledOverride: row.settledOverride,
+                    settledAt: row.settledAt,
                     session: sessionByThread.get(row.threadId) ?? null,
                     latestUserMessageAt: row.latestUserMessageAt,
                     hasPendingApprovals: row.pendingApprovalCount > 0,
@@ -2241,6 +2293,8 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
         createdAt: threadRow.value.createdAt,
         updatedAt: threadRow.value.updatedAt,
         archivedAt: threadRow.value.archivedAt,
+        settledOverride: threadRow.value.settledOverride,
+        settledAt: threadRow.value.settledAt,
         session: Option.isSome(sessionRow) ? mapSessionRow(sessionRow.value) : null,
         latestUserMessageAt: threadRow.value.latestUserMessageAt,
         hasPendingApprovals: threadRow.value.pendingApprovalCount > 0,
@@ -2307,6 +2361,8 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
           createdAt: threadRow.value.createdAt,
           updatedAt: threadRow.value.updatedAt,
           archivedAt: threadRow.value.archivedAt,
+          settledOverride: threadRow.value.settledOverride,
+          settledAt: threadRow.value.settledAt,
           session: Option.isSome(sessionRow) ? mapSessionRow(sessionRow.value) : null,
           latestUserMessageAt: threadRow.value.latestUserMessageAt,
           hasPendingApprovals: threadRow.value.pendingApprovalCount > 0,
@@ -2442,39 +2498,12 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
         updatedAt: threadRow.value.updatedAt,
         archivedAt: threadRow.value.archivedAt,
         ...mapParentThreadReference(threadRow.value, readableThreadIds),
+        settledOverride: threadRow.value.settledOverride,
+        settledAt: threadRow.value.settledAt,
         deletedAt: null,
-        messages: messageRows.map((row) => {
-          const message = {
-            id: row.messageId,
-            role: row.role,
-            text: row.text,
-            turnId: row.turnId,
-            streaming: row.isStreaming === 1,
-            createdAt: row.createdAt,
-            updatedAt: row.updatedAt,
-          };
-          if (row.attachments !== null) {
-            return Object.assign(message, { attachments: row.attachments });
-          }
-          return message;
-        }),
+        messages: messageRows.map(mapMessageRow),
         proposedPlans: proposedPlanRows.map((row) => mapProposedPlanRow(row, readableThreadIds)),
-        activities: activityRows.map((row) => {
-          const references = mapActivityThreadReferences(row, readableThreadIds);
-          const activity = {
-            id: row.activityId,
-            tone: row.tone,
-            kind: row.kind,
-            summary: references.summary,
-            payload: references.payload,
-            turnId: row.turnId,
-            createdAt: row.createdAt,
-          };
-          if (row.sequence !== null) {
-            return Object.assign(activity, { sequence: row.sequence });
-          }
-          return activity;
-        }),
+        activities: activityRows.map((row) => mapActivityRow(row, readableThreadIds)),
         checkpoints: checkpointRows.map((row) => ({
           turnId: row.turnId,
           checkpointTurnCount: row.checkpointTurnCount,

@@ -21,6 +21,7 @@ const clientSettings: ClientSettings = {
   enableGenerativeUi: false,
   favorites: [],
   providerModelPreferences: {},
+  sidebarAutoSettleAfterDays: null,
   sidebarProjectGroupingMode: "repository_path",
   sidebarProjectGroupingOverrides: {
     "environment-1:/tmp/project-a": "separate",
@@ -28,6 +29,7 @@ const clientSettings: ClientSettings = {
   sidebarProjectSortOrder: "manual",
   sidebarThreadSortOrder: "created_at",
   sidebarThreadPreviewCount: 6,
+  sidebarV2Enabled: true,
   timestampFormat: "24-hour",
   wordWrap: true,
 };

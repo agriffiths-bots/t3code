@@ -5,6 +5,7 @@ import {
   buildSidebarThreadTreeRows,
   createThreadJumpHintVisibilityController,
   filterSidebarThreadTreeRowsByExpansion,
+  filterSidebarV2MultiSelectSettleableThreadKeys,
   getSidebarThreadIdsToPrewarm,
   getVisibleSidebarThreadIds,
   getVisibleSidebarThreadTreeRowsForPreview,
@@ -16,15 +17,20 @@ import {
   isContextMenuPointerDown,
   isTrailingDoubleClick,
   orderItemsByPreferredIds,
+  pageSidebarV2SettledGroups,
+  partitionSidebarV2ThreadTreeRows,
   resolveProjectStatusIndicator,
   resolveSidebarNewThreadSeedContext,
   resolveSidebarNewThreadEnvMode,
   resolveSidebarStageBadgeLabel,
   resolveThreadRowClassName,
+  resolveSidebarV2Status,
   resolveThreadStatusPill,
   sidebarThreadExpansionKey,
   shouldClearThreadSelectionOnMouseDown,
   sortSidebarThreadsByActivity,
+  sortSidebarV2SettledGroupsByRecency,
+  sortThreadsForSidebarV2,
   sortProjectsForSidebar,
   sortScopedProjectsForSidebar,
   THREAD_JUMP_HINT_SHOW_DELAY_MS,
@@ -111,6 +117,72 @@ describe("buildMultiSelectThreadContextMenuItems", () => {
     expect(
       buildMultiSelectThreadContextMenuItems({ count: 2, hasRunningThread: true }),
     ).toContainEqual({ id: "archive", label: "Archive (2)", disabled: true });
+  });
+});
+
+describe("filterSidebarV2MultiSelectSettleableThreadKeys", () => {
+  type BulkSettleThread = {
+    readonly environmentId: EnvironmentId;
+    readonly settledOverride: "settled" | "active" | null;
+    readonly hasPendingApprovals: boolean;
+    readonly hasPendingUserInput: boolean;
+    readonly hasActionableProposedPlan: boolean;
+    readonly latestUserMessageAt: string | null;
+    readonly latestTurn: OrchestrationLatestTurn | null;
+    readonly session: null;
+  };
+
+  const makeCandidate = (input: Partial<BulkSettleThread> = {}): BulkSettleThread => ({
+    environmentId: localEnvironmentId,
+    settledOverride: null,
+    hasPendingApprovals: false,
+    hasPendingUserInput: false,
+    hasActionableProposedPlan: false,
+    latestUserMessageAt: null,
+    latestTurn: null,
+    session: null,
+    ...input,
+  });
+
+  it("excludes settled rows and every attention-blocked row", () => {
+    const threadByKey = new Map([
+      ["active", makeCandidate()],
+      ["pinned-active", makeCandidate({ settledOverride: "active" })],
+      ["pr-derived", makeCandidate()],
+      ["explicit-settled", makeCandidate({ settledOverride: "settled" })],
+      ["unsupported", makeCandidate({ environmentId: EnvironmentId.make("environment-old") })],
+      ["pending-approval", makeCandidate({ hasPendingApprovals: true })],
+      ["pending-input", makeCandidate({ hasPendingUserInput: true })],
+      ["failed", makeCandidate({ latestTurn: { ...makeLatestTurn(), state: "error" } })],
+      [
+        "running",
+        makeCandidate({
+          latestTurn: { ...makeLatestTurn({ completedAt: null }), state: "running" },
+        }),
+      ],
+      ["plan-ready", makeCandidate({ hasActionableProposedPlan: true })],
+    ]);
+
+    expect(
+      filterSidebarV2MultiSelectSettleableThreadKeys({
+        threadKeys: [
+          "active",
+          "pinned-active",
+          "pr-derived",
+          "explicit-settled",
+          "unsupported",
+          "pending-approval",
+          "pending-input",
+          "failed",
+          "running",
+          "plan-ready",
+        ],
+        threadByKey,
+        settledThreadKeys: new Set(["pr-derived", "explicit-settled"]),
+        supportsSettlement: (thread) => thread.environmentId === localEnvironmentId,
+        now: "2026-03-09T10:10:00.000Z",
+      }),
+    ).toEqual(["active", "pinned-active"]);
   });
 });
 
@@ -641,6 +713,192 @@ describe("isContextMenuPointerDown", () => {
   });
 });
 
+describe("resolveSidebarV2Status", () => {
+  const session = {
+    threadId: ThreadId.make("thread-1"),
+    status: "running" as const,
+    providerName: "Codex",
+    providerInstanceId: ProviderInstanceId.make("codex"),
+    runtimeMode: DEFAULT_RUNTIME_MODE,
+    activeTurnId: "turn-1" as never,
+    lastError: null,
+    updatedAt: "2026-03-09T10:00:00.000Z",
+  };
+
+  const idle = {
+    hasActionableProposedPlan: false,
+    hasPendingApprovals: false,
+    hasPendingUserInput: false,
+    interactionMode: "default" as const,
+    latestTurn: null,
+  };
+
+  it("prioritizes approval over a running session", () => {
+    expect(resolveSidebarV2Status({ ...idle, hasPendingApprovals: true, session })).toBe(
+      "approval",
+    );
+  });
+
+  it("prioritizes awaiting input over a running session, below approval", () => {
+    expect(resolveSidebarV2Status({ ...idle, hasPendingUserInput: true, session })).toBe("input");
+    expect(
+      resolveSidebarV2Status({
+        ...idle,
+        hasPendingApprovals: true,
+        hasPendingUserInput: true,
+        session,
+      }),
+    ).toBe("approval");
+  });
+
+  it("reports working for live running, starting, and waiting sessions", () => {
+    expect(resolveSidebarV2Status({ ...idle, session })).toBe("working");
+    expect(
+      resolveSidebarV2Status({
+        ...idle,
+        session: { ...session, status: "starting" as const },
+      }),
+    ).toBe("working");
+    expect(
+      resolveSidebarV2Status({
+        ...idle,
+        session: { ...session, status: "waiting" as const },
+      }),
+    ).toBe("working");
+    expect(
+      resolveSidebarV2Status({
+        ...idle,
+        session: { ...session, status: "waiting" as const, activeTurnId: null },
+      }),
+    ).toBe("ready");
+  });
+
+  it("reports working for a running latest turn before session state arrives", () => {
+    expect(
+      resolveSidebarV2Status({
+        ...idle,
+        latestTurn: { ...makeLatestTurn({ completedAt: null }), state: "running" },
+        session: null,
+      }),
+    ).toBe("working");
+  });
+
+  it("reports failed for session errors or latest-turn errors", () => {
+    expect(
+      resolveSidebarV2Status({
+        ...idle,
+        session: { ...session, status: "error" as const, lastError: "boom" },
+      }),
+    ).toBe("failed");
+    expect(
+      resolveSidebarV2Status({
+        ...idle,
+        latestTurn: { ...makeLatestTurn(), state: "error" },
+        session: null,
+      }),
+    ).toBe("failed");
+    expect(
+      resolveSidebarV2Status({
+        ...idle,
+        latestTurn: { ...makeLatestTurn(), state: "error" },
+        session: { ...session, status: "stopped" as const, lastError: "persisted" },
+      }),
+    ).toBe("failed");
+    expect(
+      resolveSidebarV2Status({
+        ...idle,
+        session: { ...session, status: "stopped" as const, lastError: "persisted" },
+      }),
+    ).toBe("ready");
+    expect(
+      resolveSidebarV2Status({
+        ...idle,
+        session: { ...session, status: "ready" as const, lastError: "persisted" },
+      }),
+    ).toBe("ready");
+  });
+
+  it("keeps an actionable proposed plan visible after the session settles", () => {
+    expect(
+      resolveSidebarV2Status({
+        ...idle,
+        hasActionableProposedPlan: true,
+        interactionMode: "plan",
+        latestTurn: makeLatestTurn(),
+        session: null,
+      }),
+    ).toBe("plan");
+  });
+
+  it("defaults to ready with no session", () => {
+    expect(resolveSidebarV2Status({ ...idle, session: null })).toBe("ready");
+  });
+});
+
+describe("sortSidebarV2SettledGroupsByRecency", () => {
+  const settledRow = (input: {
+    id: string;
+    latestUserMessageAt: string | null;
+    updatedAt: string;
+  }) => ({
+    thread: {
+      id: input.id,
+      latestUserMessageAt: input.latestUserMessageAt,
+      updatedAt: input.updatedAt,
+    },
+  });
+
+  it("uses the newest valid timestamp from latest user message and updatedAt", () => {
+    const freshlySettledOldConversation = [
+      settledRow({
+        id: "freshly-settled-old-conversation",
+        latestUserMessageAt: "2026-03-01T10:00:00.000Z",
+        updatedAt: "2026-03-09T12:00:00.000Z",
+      }),
+    ];
+    const olderHistoryWithNewerPrompt = [
+      settledRow({
+        id: "older-history-with-newer-prompt",
+        latestUserMessageAt: "2026-03-09T11:00:00.000Z",
+        updatedAt: "2026-03-09T11:05:00.000Z",
+      }),
+    ];
+
+    expect(
+      sortSidebarV2SettledGroupsByRecency([
+        olderHistoryWithNewerPrompt,
+        freshlySettledOldConversation,
+      ]).map((group) => group[0]?.thread.id),
+    ).toEqual(["freshly-settled-old-conversation", "older-history-with-newer-prompt"]);
+  });
+});
+
+describe("sortThreadsForSidebarV2", () => {
+  const sortable = (input: { id: string; createdAt: string }) => ({
+    id: input.id,
+    createdAt: input.createdAt,
+  });
+
+  it("orders by creation time, newest first, ignoring activity", () => {
+    const sorted = sortThreadsForSidebarV2([
+      sortable({ id: "oldest", createdAt: "2026-03-09T08:00:00.000Z" }),
+      sortable({ id: "newest", createdAt: "2026-03-09T12:00:00.000Z" }),
+      sortable({ id: "middle", createdAt: "2026-03-09T10:00:00.000Z" }),
+    ]);
+
+    expect(sorted.map((thread) => thread.id)).toEqual(["newest", "middle", "oldest"]);
+  });
+
+  it("breaks creation-time ties by id so the order is stable", () => {
+    const sorted = sortThreadsForSidebarV2([
+      sortable({ id: "b", createdAt: "2026-03-09T10:00:00.000Z" }),
+      sortable({ id: "a", createdAt: "2026-03-09T10:00:00.000Z" }),
+    ]);
+
+    expect(sorted.map((thread) => thread.id)).toEqual(["a", "b"]);
+  });
+});
+
 describe("resolveThreadStatusPill", () => {
   const baseThread = {
     hasActionableProposedPlan: false,
@@ -829,6 +1087,7 @@ function makeTreeThread(
     hasPendingUserInput: overrides.hasPendingUserInput ?? false,
     interactionMode: overrides.interactionMode ?? "default",
     latestTurn: overrides.latestTurn ?? null,
+    parentEnvironmentId: overrides.parentEnvironmentId ?? null,
     parentThreadId: overrides.parentThreadId ?? null,
     session: overrides.session ?? null,
   };
@@ -862,6 +1121,31 @@ describe("buildSidebarThreadTreeRows", () => {
       directChildCount: 1,
       descendantCount: 1,
     });
+  });
+
+  it("uses parentEnvironmentId for cross-environment child links", () => {
+    const peerEnvironmentId = EnvironmentId.make("environment-peer");
+    const sharedParentId = ThreadId.make("shared-parent-id");
+    const localParent = makeTreeThread({ id: sharedParentId });
+    const peerParent = makeTreeThread({
+      environmentId: peerEnvironmentId,
+      id: sharedParentId,
+    });
+    const peerChild = makeTreeThread({
+      id: ThreadId.make("peer-child"),
+      parentEnvironmentId: peerEnvironmentId,
+      parentThreadId: sharedParentId,
+    });
+
+    const rows = buildSidebarThreadTreeRows([localParent, peerChild, peerParent]);
+
+    expect(rows.map((row) => [row.thread.environmentId, row.thread.id, row.depth])).toEqual([
+      [localEnvironmentId, localParent.id, 0],
+      [peerEnvironmentId, peerParent.id, 0],
+      [localEnvironmentId, peerChild.id, 1],
+    ]);
+    expect(rows[0]?.directChildCount).toBe(0);
+    expect(rows[1]?.directChildCount).toBe(1);
   });
 
   it("orders parent groups by the best sorted position among parent and descendants", () => {
@@ -1217,6 +1501,79 @@ describe("buildSidebarThreadTreeRows", () => {
   });
 });
 
+describe("partitionSidebarV2ThreadTreeRows", () => {
+  it("keeps mixed trees active while settling each child independently", () => {
+    const parent = makeTreeThread({ id: ThreadId.make("parent") });
+    const settledChild = makeTreeThread({
+      id: ThreadId.make("settled-child"),
+      parentThreadId: parent.id,
+    });
+    const activeChild = makeTreeThread({
+      id: ThreadId.make("active-child"),
+      parentThreadId: parent.id,
+    });
+    const settledRoot = makeTreeThread({ id: ThreadId.make("settled-root") });
+    const settledIds = new Set([parent.id, settledChild.id, settledRoot.id]);
+
+    const partition = partitionSidebarV2ThreadTreeRows(
+      [parent, settledChild, activeChild, settledRoot],
+      (thread) => settledIds.has(thread.id),
+    );
+
+    expect(partition.activeRows.map((row) => [row.thread.id, row.isSettled])).toEqual([
+      [parent.id, true],
+      [settledChild.id, true],
+      [activeChild.id, false],
+    ]);
+    expect(partition.activeRows[0]?.unsettledDescendantCount).toBe(1);
+    expect(partition.settledGroups.map((group) => group.map((row) => row.thread.id))).toEqual([
+      [settledRoot.id],
+    ]);
+  });
+
+  it("moves a whole parent tree to history only after its final child settles", () => {
+    const parent = makeTreeThread({ id: ThreadId.make("parent") });
+    const child = makeTreeThread({
+      id: ThreadId.make("child"),
+      parentThreadId: parent.id,
+    });
+
+    const partition = partitionSidebarV2ThreadTreeRows([parent, child], () => true);
+
+    expect(partition.activeRows).toEqual([]);
+    expect(partition.settledGroups).toHaveLength(1);
+    expect(partition.settledGroups[0]?.map((row) => row.thread.id)).toEqual([parent.id, child.id]);
+  });
+
+  it("pages in the active settled thread's complete tree", () => {
+    const recent = makeTreeThread({ id: ThreadId.make("recent") });
+    const middle = makeTreeThread({ id: ThreadId.make("middle") });
+    const oldParent = makeTreeThread({ id: ThreadId.make("old-parent") });
+    const oldChild = makeTreeThread({
+      id: ThreadId.make("old-child"),
+      parentThreadId: oldParent.id,
+    });
+    const partition = partitionSidebarV2ThreadTreeRows(
+      [recent, middle, oldParent, oldChild],
+      () => true,
+    );
+
+    const page = pageSidebarV2SettledGroups(
+      partition.settledGroups,
+      1,
+      sidebarThreadExpansionKey(oldChild),
+    );
+
+    expect(page.visibleGroups.map((group) => group.map((row) => row.thread.id))).toEqual([
+      [recent.id],
+      [oldParent.id, oldChild.id],
+    ]);
+    expect(page.hiddenGroups.map((group) => group.map((row) => row.thread.id))).toEqual([
+      [middle.id],
+    ]);
+  });
+});
+
 describe("getVisibleThreadsForProject", () => {
   it("includes the active thread even when it falls below the folded preview", () => {
     const threads = Array.from({ length: 8 }, (_, index) =>
@@ -1309,6 +1666,8 @@ function makeThread(overrides: Partial<Thread> = {}): Thread {
     proposedPlans: [],
     createdAt: "2026-03-09T10:00:00.000Z",
     archivedAt: null,
+    settledOverride: null,
+    settledAt: null,
     deletedAt: null,
     updatedAt: "2026-03-09T10:00:00.000Z",
     latestTurn: null,
