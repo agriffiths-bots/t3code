@@ -1581,7 +1581,9 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
           ...(input.modelSelection?.instanceId === boundInstanceId
             ? { model: input.modelSelection.model }
             : {}),
-          ...(compatibility.serviceTier ? { serviceTier: compatibility.serviceTier } : {}),
+          ...(compatibility.serviceTier !== undefined
+            ? { serviceTier: compatibility.serviceTier }
+            : {}),
           ...(mcpSession
             ? makeCodexMcpRuntimeConfig(mcpSession, options?.environment ?? process.env)
             : {}),
@@ -1942,7 +1944,7 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
               effort: reasoningEffort as EffectCodexSchema.V2TurnStartParams__ReasoningEffort,
             }
           : {}),
-        ...(serviceTier ? { serviceTier } : {}),
+        ...(serviceTier !== undefined ? { serviceTier } : {}),
         ...(input.interactionMode !== undefined ? { interactionMode: input.interactionMode } : {}),
         ...(codexAttachments.length > 0 ? { attachments: codexAttachments } : {}),
       })

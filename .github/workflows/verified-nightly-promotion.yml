@@ -76,10 +76,12 @@ jobs:
             "$manifest" >/dev/null
 
           nightly_tag="$(jq -r .nightlyTag "$manifest")"
-          release_json="$(gh release view "$nightly_tag" --json isDraft,isPrerelease,targetCommitish,url)"
-          jq -e --arg sha "$SOURCE_HEAD_SHA" \
-            '.isDraft == false and .isPrerelease == true and .targetCommitish == $sha' \
+          release_json="$(gh release view "$nightly_tag" --json isDraft,isPrerelease,url)"
+          jq -e \
+            '.isDraft == false and .isPrerelease == true' \
             <<< "$release_json" >/dev/null
+          # The tag object below is the authoritative commit binding; release
+          # targetCommitish metadata can report a branch when the tag exists.
           [[ "$(git rev-list -n 1 "$nightly_tag")" == "$SOURCE_HEAD_SHA" ]] || {
             echo "::error::Nightly tag $nightly_tag does not resolve to source commit $SOURCE_HEAD_SHA."
             exit 1
@@ -470,8 +472,24 @@ jobs:
             exit 1
           fi
           gh release create "$RELEASE_TAG" "${assets[@]}" \
+            --draft \
             --verify-tag \
             --title "T3 Code $RELEASE_VERSION" \
-            --notes-file "$RUNNER_TEMP/release-notes.md" \
+            --notes-file "$RUNNER_TEMP/release-notes.md"
+          expected_assets="$RUNNER_TEMP/expected-release-assets.txt"
+          uploaded_assets="$RUNNER_TEMP/uploaded-release-assets.txt"
+          printf "%s\n" "${assets[@]##*/}" | sort > "$expected_assets"
+          gh api "repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG" \
+            --jq ".assets[].name" | sort > "$uploaded_assets"
+          if ! cmp -s "$expected_assets" "$uploaded_assets"; then
+            echo "::error::Draft release assets do not match verified artifact set."
+            echo "Expected assets:"
+            sed "s/^/  /" "$expected_assets"
+            echo "Uploaded assets:"
+            sed "s/^/  /" "$uploaded_assets"
+            exit 1
+          fi
+          gh release edit "$RELEASE_TAG" \
+            --draft=false \
             --latest
           reserved_tag=0

@@ -4,6 +4,7 @@ import {
   EnvironmentId,
   WS_METHODS,
   type AssetCreateUrlInput,
+  type AssetCreateUrlResult,
 } from "@t3tools/contracts";
 import * as Schema from "effect/Schema";
 import { Atom } from "effect/unstable/reactivity";
@@ -14,6 +15,8 @@ import { createEnvironmentRpcQueryAtomFamily } from "./runtime.ts";
 const ASSET_URL_REFRESH_INTERVAL_MS = 30 * 60_000;
 const ASSET_URL_STALE_TIME_MS = 5 * 60_000;
 const ASSET_URL_IDLE_TTL_MS = 60 * 60_000;
+const ASSET_SURFACE_RELAY_PREFIX = "/api/assets/relay/";
+const ASSET_SURFACE_BIND_PATH = `${ASSET_SURFACE_RELAY_PREFIX}surface`;
 
 export class InvalidAssetCollectionKeyError extends Schema.TaggedErrorClass<InvalidAssetCollectionKeyError>()(
   "InvalidAssetCollectionKeyError",
@@ -44,6 +47,40 @@ export function parseAssetCollectionKey(
 export function resolveAssetUrl(httpBaseUrl: string, relativeUrl: string): string | null {
   try {
     return new URL(relativeUrl, httpBaseUrl).toString();
+  } catch {
+    return null;
+  }
+}
+
+export async function bindAssetSurface(
+  httpBaseUrl: string,
+  asset: AssetCreateUrlResult,
+  fetchImpl: typeof fetch = globalThis.fetch,
+): Promise<string | null> {
+  const assetUrl = resolveAssetUrl(httpBaseUrl, asset.relativeUrl);
+  if (
+    assetUrl === null ||
+    asset.surfaceCredential === null ||
+    asset.surfaceCredential === undefined
+  ) {
+    return assetUrl;
+  }
+  if (!asset.relativeUrl.startsWith(ASSET_SURFACE_RELAY_PREFIX)) return null;
+
+  let bindingUrl: string;
+  try {
+    bindingUrl = new URL(ASSET_SURFACE_BIND_PATH, httpBaseUrl).toString();
+  } catch {
+    return null;
+  }
+  try {
+    const response = await fetchImpl(bindingUrl, {
+      method: "POST",
+      credentials: "include",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ credential: asset.surfaceCredential }),
+    });
+    return response.ok ? assetUrl : null;
   } catch {
     return null;
   }

@@ -82,12 +82,22 @@ export const WorkspaceEntriesError = Schema.Union([
 ]);
 export type WorkspaceEntriesError = typeof WorkspaceEntriesError.Type;
 
+export interface ResolvedBrowseTarget {
+  readonly parentPath: string;
+  readonly prefix: string;
+  readonly showHidden: boolean;
+}
+
 export class WorkspaceEntries extends Context.Service<
   WorkspaceEntries,
   {
     readonly browse: (
       input: FilesystemBrowseInput,
     ) => Effect.Effect<FilesystemBrowseResult, WorkspaceEntriesBrowseError>;
+    readonly browseResolved: (
+      input: FilesystemBrowseInput,
+      target: ResolvedBrowseTarget,
+    ) => Effect.Effect<FilesystemBrowseResult, WorkspaceEntriesReadDirectoryError>;
     readonly list: (
       input: ProjectListEntriesInput,
     ) => Effect.Effect<ProjectListEntriesResult, WorkspaceEntriesError>;
@@ -103,11 +113,11 @@ function resolveHomeAwarePath(input: string): string {
   return trimmed.length === 0 ? NodeOS.homedir() : expandHomePath(trimmed);
 }
 
-const resolveBrowseTarget = Effect.fn("WorkspaceEntries.resolveBrowseTarget")(function* (
+export const resolveBrowseTarget = Effect.fn("WorkspaceEntries.resolveBrowseTarget")(function* (
   input: FilesystemBrowseInput,
-  path: Path.Path,
-): Effect.fn.Return<string, WorkspaceEntriesBrowseError> {
+): Effect.fn.Return<ResolvedBrowseTarget, WorkspaceEntriesBrowseError, Path.Path> {
   const platform = yield* HostProcessPlatform;
+  const path = yield* Path.Path;
   const partialPath = input.partialPath.trim();
 
   if (platform !== "win32" && isWindowsAbsolutePath(partialPath)) {
@@ -118,16 +128,19 @@ const resolveBrowseTarget = Effect.fn("WorkspaceEntries.resolveBrowseTarget")(fu
     });
   }
 
-  if (!isExplicitRelativePath(partialPath)) {
-    return path.resolve(resolveHomeAwarePath(partialPath));
-  }
-
-  if (!input.cwd) {
-    return yield* new WorkspaceEntriesCurrentProjectRequiredError({
-      partialPath,
-    });
-  }
-  return path.resolve(resolveHomeAwarePath(input.cwd), partialPath);
+  const resolvedInputPath = !isExplicitRelativePath(partialPath)
+    ? path.resolve(resolveHomeAwarePath(partialPath))
+    : input.cwd
+      ? path.resolve(resolveHomeAwarePath(input.cwd), partialPath)
+      : yield* new WorkspaceEntriesCurrentProjectRequiredError({ partialPath });
+  const endsWithSeparator =
+    partialPath.length === 0 || /[\\/]$/.test(partialPath) || partialPath === "~";
+  const prefix = endsWithSeparator ? "" : path.basename(resolvedInputPath);
+  return {
+    parentPath: endsWithSeparator ? resolvedInputPath : path.dirname(resolvedInputPath),
+    prefix,
+    showHidden: endsWithSeparator || prefix.startsWith("."),
+  };
 });
 
 export const make = Effect.gen(function* () {
@@ -176,54 +189,55 @@ export const make = Effect.gen(function* () {
     },
   );
 
+  const browseResolved: WorkspaceEntries["Service"]["browseResolved"] = Effect.fn(
+    "WorkspaceEntries.browseResolved",
+  )(function* (input, target) {
+    const partialPath = input.partialPath.trim();
+
+    const dirents = yield* Effect.tryPromise({
+      try: () => NodeFSP.readdir(target.parentPath, { withFileTypes: true }),
+      catch: (cause) =>
+        new WorkspaceEntriesReadDirectoryError({
+          cwd: input.cwd,
+          partialPath,
+          parentPath: target.parentPath,
+          cause,
+        }),
+    }).pipe(
+      Effect.catchIf(
+        (error) => {
+          const code = (error.cause as NodeJS.ErrnoException | undefined)?.code;
+          return code === "EACCES" || code === "EPERM";
+        },
+        () => Effect.succeed([]),
+      ),
+    );
+
+    const lowerPrefix = target.prefix.toLowerCase();
+    const entries: Array<{ readonly name: string; readonly fullPath: string }> = [];
+    for (const dirent of dirents) {
+      if (
+        dirent.isDirectory() &&
+        dirent.name.toLowerCase().startsWith(lowerPrefix) &&
+        (target.showHidden || !dirent.name.startsWith("."))
+      ) {
+        entries.push({
+          name: dirent.name,
+          fullPath: path.join(target.parentPath, dirent.name),
+        });
+      }
+    }
+
+    return {
+      parentPath: target.parentPath,
+      entries: entries.toSorted((left, right) => left.name.localeCompare(right.name)),
+    };
+  });
+
   const browse: WorkspaceEntries["Service"]["browse"] = Effect.fn("WorkspaceEntries.browse")(
     function* (input) {
-      const partialPath = input.partialPath.trim();
-      const resolvedInputPath = yield* resolveBrowseTarget(input, path);
-      const endsWithSeparator =
-        partialPath.length === 0 || /[\\/]$/.test(partialPath) || partialPath === "~";
-      const parentPath = endsWithSeparator ? resolvedInputPath : path.dirname(resolvedInputPath);
-      const prefix = endsWithSeparator ? "" : path.basename(resolvedInputPath);
-
-      const dirents = yield* Effect.tryPromise({
-        try: () => NodeFSP.readdir(parentPath, { withFileTypes: true }),
-        catch: (cause) =>
-          new WorkspaceEntriesReadDirectoryError({
-            cwd: input.cwd,
-            partialPath,
-            parentPath,
-            cause,
-          }),
-      }).pipe(
-        Effect.catchIf(
-          (error) => {
-            const code = (error.cause as NodeJS.ErrnoException | undefined)?.code;
-            return code === "EACCES" || code === "EPERM";
-          },
-          () => Effect.succeed([]),
-        ),
-      );
-
-      const showHidden = endsWithSeparator || prefix.startsWith(".");
-      const lowerPrefix = prefix.toLowerCase();
-      const entries: Array<{ readonly name: string; readonly fullPath: string }> = [];
-      for (const dirent of dirents) {
-        if (
-          dirent.isDirectory() &&
-          dirent.name.toLowerCase().startsWith(lowerPrefix) &&
-          (showHidden || !dirent.name.startsWith("."))
-        ) {
-          entries.push({
-            name: dirent.name,
-            fullPath: path.join(parentPath, dirent.name),
-          });
-        }
-      }
-
-      return {
-        parentPath,
-        entries: entries.toSorted((left, right) => left.name.localeCompare(right.name)),
-      };
+      const target = yield* resolveBrowseTarget(input).pipe(Effect.provideService(Path.Path, path));
+      return yield* browseResolved(input, target);
     },
   );
 
@@ -251,7 +265,7 @@ export const make = Effect.gen(function* () {
     },
   );
 
-  return WorkspaceEntries.of({ browse, list, refresh, search });
+  return WorkspaceEntries.of({ browse, browseResolved, list, refresh, search });
 });
 
 export const layer = Layer.effect(WorkspaceEntries, make).pipe(

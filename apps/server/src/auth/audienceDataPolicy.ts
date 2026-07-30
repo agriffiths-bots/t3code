@@ -28,3 +28,7 @@ export function canReadDataAudience(
 ): boolean {
   return audienceCeiling === "private" || dataAudience === "factory";
 }
+
+export function strictestDataAudience(left: DataAudience, right: DataAudience): DataAudience {
+  return left === "private" || right === "private" ? "private" : "factory";
+}

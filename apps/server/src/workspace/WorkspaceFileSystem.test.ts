@@ -1,4 +1,5 @@
 import * as NodeServices from "@effect/platform-node/NodeServices";
+import { HostProcessPlatform } from "@t3tools/shared/hostProcess";
 import { it, describe, expect } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
@@ -28,6 +29,7 @@ const TestLayer = Layer.empty.pipe(
     }),
   ),
   Layer.provideMerge(NodeServices.layer),
+  Layer.provideMerge(Layer.succeed(HostProcessPlatform, "linux")),
 );
 
 const makeTempDir = Effect.gen(function* () {
@@ -262,6 +264,58 @@ it.layer(TestLayer, { excludeTestServices: true })("WorkspaceFileSystemLive", (i
           .stat(escapedPath)
           .pipe(Effect.orElseSucceed(() => null));
         expect(escapedStat).toBeNull();
+      }),
+    );
+
+    it.effect("rejects writes through an existing leaf symlink outside the workspace root", () =>
+      Effect.gen(function* () {
+        const workspaceFileSystem = yield* WorkspaceFileSystem.WorkspaceFileSystem;
+        const fileSystem = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const cwd = yield* makeTempDir;
+        const outsideDir = yield* makeTempDir;
+        const outsideFile = path.join(outsideDir, "secret.txt");
+        yield* fileSystem.writeFileString(outsideFile, "outside");
+        yield* fileSystem.symlink(outsideFile, path.join(cwd, "linked-secret.txt"));
+
+        const result = yield* workspaceFileSystem
+          .writeFile({
+            cwd,
+            relativePath: "linked-secret.txt",
+            contents: "overwritten",
+          })
+          .pipe(Effect.result);
+
+        expect(result._tag).toBe("Failure");
+        if (result._tag === "Failure") {
+          expect(result.failure).toBeInstanceOf(WorkspaceFileSystem.WorkspaceFilePathEscapeError);
+        }
+        expect(yield* fileSystem.readFileString(outsideFile)).toBe("outside");
+      }),
+    );
+
+    it.effect("rejects writes through a symlinked parent outside the workspace root", () =>
+      Effect.gen(function* () {
+        const workspaceFileSystem = yield* WorkspaceFileSystem.WorkspaceFileSystem;
+        const fileSystem = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const cwd = yield* makeTempDir;
+        const outsideDir = yield* makeTempDir;
+        yield* fileSystem.symlink(outsideDir, path.join(cwd, "linked-outside"));
+
+        const result = yield* workspaceFileSystem
+          .writeFile({
+            cwd,
+            relativePath: "linked-outside/escaped.txt",
+            contents: "outside",
+          })
+          .pipe(Effect.result);
+
+        expect(result._tag).toBe("Failure");
+        if (result._tag === "Failure") {
+          expect(result.failure).toBeInstanceOf(WorkspaceFileSystem.WorkspaceFilePathEscapeError);
+        }
+        expect(yield* fileSystem.exists(path.join(outsideDir, "escaped.txt"))).toBe(false);
       }),
     );
   });

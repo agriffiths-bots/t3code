@@ -1,5 +1,6 @@
 import Mime from "@effect/platform-node/Mime";
 import {
+  type AuthAudienceCeiling,
   type AuthSessionId,
   AuthOrchestrationOperateScope,
   AuthOrchestrationReadScope,
@@ -10,6 +11,7 @@ import {
 } from "@t3tools/contracts";
 import { decodeOtlpTraceRecords } from "@t3tools/shared/observability";
 import * as Data from "effect/Data";
+import * as Clock from "effect/Clock";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
@@ -22,7 +24,9 @@ import * as Cookies from "effect/unstable/http/Cookies";
 import {
   HttpBody,
   HttpClient,
+  HttpClientRequest,
   HttpClientResponse,
+  FetchHttpClient,
   HttpRouter,
   HttpServerResponse,
   HttpServerRequest,
@@ -33,13 +37,17 @@ import { OtlpTracer } from "effect/unstable/observability";
 
 import * as ServerConfig from "./config.ts";
 import {
+  ASSET_APP_RELAY_PREFIX,
   ASSET_ROUTE_PREFIX,
   ASSET_SURFACE_BIND_PATH,
   ASSET_SURFACE_CREDENTIAL_HEADER,
   ASSET_SURFACE_RELAY_PREFIX,
   assetSurfaceCookieName,
   assetSurfaceCookiePrefix,
+  decodeAssetRelayRoutingClaim,
+  effectiveAssetClaimAudience,
   resolveAsset,
+  resolveLocalAssetRelay,
   verifyAssetSurfaceCredential,
 } from "./assets/AssetAccess.ts";
 import * as BrowserTraceCollector from "./observability/BrowserTraceCollector.ts";
@@ -57,6 +65,7 @@ import {
   configuredCookieAuthCsrfOriginsEffect,
 } from "./auth/http.ts";
 import * as ServerEnvironment from "./environment/ServerEnvironment.ts";
+import { canReadDataAudience } from "./auth/audienceDataPolicy.ts";
 import {
   browserApiCorsAllowedHeaders,
   browserApiCorsAllowedMethods,
@@ -69,7 +78,9 @@ import {
   SUBAGENT_PEER_MCP_TOKEN_PATH,
   SubagentPeerMcpTokenRequest,
   type SubagentPeerMcpTokenResult,
+  environmentUrl,
 } from "./subagents/SubagentPeerHttp.ts";
+import * as SubagentPeerRegistry from "./subagents/SubagentPeerRegistry.ts";
 
 const OTLP_TRACES_PROXY_PATH = "/api/observability/v1/traces";
 const TTS_SPEAK_PATH = "/api/tts/speak";
@@ -563,48 +574,266 @@ export const assetRouteLayer = HttpRouter.add(
           .map(([, credential]) => credential),
       );
     }
-    const serverAuth = yield* EnvironmentAuth.EnvironmentAuth;
-    const authenticatedSession = yield* serverAuth
-      .authenticateHttpRequest(request)
-      .pipe(
-        Effect.option,
-        Effect.map(Option.filter((session) => session.scopes.includes(AuthOrchestrationReadScope))),
-      );
 
+    // Factory assets remain short-lived bearer URLs. Private browser assets are issued only
+    // beneath the same-origin relay prefix, where the surface cookie is revalidated on every
+    // request. The direct path deliberately ignores cookies so cross-site DOM loads fail closed
+    // in every browser; native clients may still present the capability explicitly.
     const asset = yield* resolveAsset(
       suffix.slice(0, separatorIndex),
       suffix.slice(separatorIndex + 1),
       {
-        ...(Option.isSome(authenticatedSession)
-          ? { sessionId: authenticatedSession.value.sessionId }
-          : {}),
         surfaceCredentials: requestSurfaceCredentials,
         allowUnbound: !isSurfaceRelay,
       },
     );
     if (!asset) {
       if (isSurfaceRelay) {
-        yield* Effect.logWarning("Asset surface request was masked as not found.", {
+        yield* Effect.logWarning("Asset surface relay request was masked as not found.", {
           "asset.outcome": "masked_not_found",
-          "asset.session_proof_present":
-            Option.isSome(authenticatedSession) || requestSurfaceCredentials.length > 0,
+          "asset.surface_proof_present": requestSurfaceCredentials.length > 0,
         });
       }
       return HttpServerResponse.text("Not Found", { status: 404 });
     }
-    return yield* HttpServerResponse.file(asset.path, {
+    if (asset.kind === "forbidden") {
+      return HttpServerResponse.text("Forbidden", {
+        status: 403,
+        headers: { "Cache-Control": "no-store" },
+      });
+    }
+    const responseHeaders = {
+      "Cache-Control": "no-store",
+      "X-Content-Type-Options": "nosniff",
+    };
+    const contentType = Mime.getType(asset.path) ?? "application/octet-stream";
+    if (request.method === "HEAD") {
+      asset.stream.destroy();
+      return HttpServerResponse.empty({
+        status: 200,
+        headers: {
+          ...responseHeaders,
+          "Content-Length": String(asset.contentLength),
+          "Content-Type": contentType,
+        },
+      });
+    }
+    return HttpServerResponse.raw(asset.stream, {
       status: 200,
-      headers: {
-        // Session-bound assets must be revalidated on every fetch. A private browser cache can
-        // outlive or switch sessions and would otherwise bypass the masking-404 proof check.
-        "Cache-Control": "no-store",
-        "X-Content-Type-Options": "nosniff",
-      },
-    }).pipe(
-      Effect.orElseSucceed(() => HttpServerResponse.text("Internal Server Error", { status: 500 })),
-    );
+      contentType,
+      contentLength: asset.contentLength,
+      headers: responseHeaders,
+    });
   }),
 );
+
+const ASSET_RELAY_CLAIM_MAX_LENGTH = 4096;
+const maskedAssetRelayResponse = () =>
+  HttpServerResponse.text("Not Found", {
+    status: 404,
+    headers: { "Cache-Control": "no-store" },
+  });
+
+function parseAssetRelayPath(pathname: string): {
+  readonly token: string;
+  readonly encodedRelativePath: string;
+} | null {
+  const prefix = `${ASSET_APP_RELAY_PREFIX}/`;
+  if (!pathname.startsWith(prefix)) return null;
+  const suffix = pathname.slice(prefix.length);
+  const separatorIndex = suffix.indexOf("/");
+  const token = separatorIndex === -1 ? suffix : suffix.slice(0, separatorIndex);
+  if (token.length === 0 || token.length > ASSET_RELAY_CLAIM_MAX_LENGTH) return null;
+  return {
+    token,
+    encodedRelativePath: separatorIndex === -1 ? "" : suffix.slice(separatorIndex + 1),
+  };
+}
+
+function trustedAssetRelayHeaders(
+  peer: SubagentPeerRegistry.SubagentPeer,
+): Record<string, string> | null {
+  if (peer.credential._tag !== "bearer") return null;
+  if (peer.cfAccess !== undefined && peer.cfAccess._tag !== "service-token") return null;
+  return {
+    accept: "application/octet-stream",
+    authorization: `Bearer ${peer.credential.token}`,
+    ...(peer.cfAccess === undefined
+      ? {}
+      : {
+          "cf-access-client-id": peer.cfAccess.clientId,
+          "cf-access-client-secret": peer.cfAccess.clientSecret,
+        }),
+  };
+}
+
+function selectAssetRelayPeer(
+  peers: ReadonlyArray<SubagentPeerRegistry.SubagentPeer>,
+  issuingBackendId: string,
+): SubagentPeerRegistry.SubagentPeer | undefined {
+  return peers.find((candidate) => candidate.environmentId === issuingBackendId);
+}
+
+function safeContentLength(value: string | undefined): number | undefined {
+  if (value === undefined || !/^\d+$/.test(value)) return undefined;
+  const parsed = Number(value);
+  return Number.isSafeInteger(parsed) ? parsed : undefined;
+}
+
+function relayContentLength(headers: Readonly<Record<string, string | undefined>>) {
+  return headers["content-encoding"] === undefined
+    ? safeContentLength(headers["content-length"])
+    : undefined;
+}
+
+type AssetRelayViewer = {
+  readonly sessionId: AuthSessionId;
+  readonly audienceCeiling: AuthAudienceCeiling;
+  readonly expiresAt?: DateTime.DateTime;
+};
+
+const authenticateAssetRelayViewer = Effect.fn("http.authenticateAssetRelayViewer")(function* (
+  request: HttpServerRequest.HttpServerRequest,
+): Effect.fn.Return<
+  AssetRelayViewer | null,
+  never,
+  EnvironmentAuth.EnvironmentAuth | SessionStore.SessionStore
+> {
+  const serverAuth = yield* EnvironmentAuth.EnvironmentAuth;
+  const environmentSession = yield* serverAuth.authenticateHttpRequest(request).pipe(Effect.option);
+  if (
+    Option.isSome(environmentSession) &&
+    environmentSession.value.scopes.includes(AuthOrchestrationReadScope)
+  ) {
+    return {
+      sessionId: environmentSession.value.sessionId,
+      audienceCeiling: environmentSession.value.audienceCeiling,
+      ...(environmentSession.value.expiresAt
+        ? { expiresAt: environmentSession.value.expiresAt }
+        : {}),
+    };
+  }
+
+  const authorization = request.headers.authorization;
+  const rawToken =
+    authorization?.startsWith("Bearer ") === true
+      ? authorization.slice("Bearer ".length).trim()
+      : "";
+  const invocation = yield* McpSessionRegistry.resolveActiveMcpInvocation(rawToken);
+  if (invocation?.credentialKind !== "peer" || invocation.sourceSessionId === undefined) {
+    return null;
+  }
+
+  const sessions = yield* SessionStore.SessionStore;
+  const sourceSession = (yield* sessions.listActive().pipe(Effect.orElseSucceed(() => []))).find(
+    (session) => session.sessionId === invocation.sourceSessionId,
+  );
+  if (sourceSession === undefined || !sourceSession.scopes.includes(AuthOrchestrationReadScope)) {
+    return null;
+  }
+  return {
+    sessionId: sourceSession.sessionId,
+    audienceCeiling: sourceSession.audienceCeiling,
+    expiresAt: sourceSession.expiresAt,
+  };
+});
+
+const makeAssetAppRelayRouteLayer = (
+  peerRegistry: SubagentPeerRegistry.SubagentPeerRegistryShape,
+) =>
+  HttpRouter.add(
+    "GET",
+    `${ASSET_APP_RELAY_PREFIX}/*`,
+    Effect.gen(function* () {
+      const request = yield* HttpServerRequest.HttpServerRequest;
+      const url = HttpServerRequest.toURL(request);
+      if (Option.isNone(url)) return maskedAssetRelayResponse();
+      const parsed = parseAssetRelayPath(url.value.pathname);
+      if (parsed === null) return maskedAssetRelayResponse();
+
+      const viewer = yield* authenticateAssetRelayViewer(request);
+      if (viewer === null) return maskedAssetRelayResponse();
+
+      const routingClaim = decodeAssetRelayRoutingClaim(parsed.token);
+      if (
+        routingClaim === null ||
+        routingClaim.expiresAt <= (yield* Clock.currentTimeMillis) ||
+        !canReadDataAudience(viewer.audienceCeiling, effectiveAssetClaimAudience(routingClaim))
+      ) {
+        return maskedAssetRelayResponse();
+      }
+
+      const environment = yield* ServerEnvironment.ServerEnvironment;
+      const localBackendId = yield* environment.getEnvironmentId;
+      if (
+        routingClaim.issuingBackendId === null ||
+        routingClaim.issuingBackendId === localBackendId
+      ) {
+        const asset = yield* resolveLocalAssetRelay({
+          token: parsed.token,
+          encodedRelativePath: parsed.encodedRelativePath,
+          viewerSessionId: viewer.sessionId,
+          viewerAudienceCeiling: viewer.audienceCeiling,
+          ...(viewer.expiresAt ? { viewerSessionExpiresAt: viewer.expiresAt } : {}),
+        });
+        if (asset === null || asset.kind === "forbidden") return maskedAssetRelayResponse();
+        const contentType = Mime.getType(asset.path) ?? "application/octet-stream";
+        return HttpServerResponse.raw(asset.stream, {
+          status: 200,
+          contentType,
+          contentLength: asset.contentLength,
+          headers: {
+            "Cache-Control": "no-store",
+            "X-Content-Type-Options": "nosniff",
+          },
+        });
+      }
+
+      const peers = yield* peerRegistry.list.pipe(Effect.orElseSucceed(() => []));
+      const peer = selectAssetRelayPeer(peers, routingClaim.issuingBackendId);
+      const headers = peer === undefined ? null : trustedAssetRelayHeaders(peer);
+      if (peer === undefined || headers === null) return maskedAssetRelayResponse();
+
+      const upstreamUrl = environmentUrl(peer.httpBaseUrl, url.value.pathname);
+      const httpClient = yield* HttpClient.HttpClient;
+      const upstream = yield* httpClient
+        .execute(HttpClientRequest.get(upstreamUrl, { headers }))
+        .pipe(
+          Effect.provideService(FetchHttpClient.RequestInit, { redirect: "manual" }),
+          Effect.orElseSucceed(() => null),
+        );
+      if (upstream === null || upstream.status !== 200) return maskedAssetRelayResponse();
+
+      const contentType = upstream.headers["content-type"];
+      const contentLength = relayContentLength(upstream.headers);
+      return HttpServerResponse.stream(upstream.stream, {
+        status: 200,
+        headers: {
+          "Cache-Control": "no-store",
+          "X-Content-Type-Options": "nosniff",
+        },
+        ...(contentType === undefined ? {} : { contentType }),
+        ...(contentLength === undefined ? {} : { contentLength }),
+      });
+    }).pipe(
+      Effect.catchCause((cause) =>
+        Effect.logWarning("Asset app relay request failed closed.", { cause }).pipe(
+          Effect.as(maskedAssetRelayResponse()),
+        ),
+      ),
+    ),
+  );
+
+export const assetAppRelayRouteLayer = Layer.unwrap(
+  Effect.map(SubagentPeerRegistry.SubagentPeerRegistry, makeAssetAppRelayRouteLayer),
+).pipe(Layer.provide(SubagentPeerRegistry.layer));
+
+export const __assetRelayTesting = {
+  parseAssetRelayPath,
+  relayContentLength,
+  selectAssetRelayPeer,
+  trustedAssetRelayHeaders,
+};
 
 const AssetSurfaceBindingInput = Schema.Struct({
   credential: Schema.String.check(Schema.isMinLength(1), Schema.isMaxLength(4096)),

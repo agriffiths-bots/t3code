@@ -10,6 +10,7 @@ import {
   ASSET_SAME_ORIGIN_RELAY_V1_CAPABILITY,
   AuthAccessTokenType,
   AuthEnvironmentBootstrapTokenType,
+  AuthSessionId,
   AuthTokenExchangeGrantType,
   CommandId,
   DEFAULT_SERVER_SETTINGS,
@@ -21,6 +22,7 @@ import {
   MessageId,
   NonNegativeInt,
   ExternalLauncherCommandNotFoundError,
+  type OrchestrationReadModel,
   type OrchestrationThreadShell,
   TerminalNotRunningError,
   type OrchestrationCommand,
@@ -130,6 +132,7 @@ import * as ReviewService from "./review/ReviewService.ts";
 import * as SourceControlRepositoryService from "./sourceControl/SourceControlRepositoryService.ts";
 import * as ServerSecretStore from "./auth/ServerSecretStore.ts";
 import * as EnvironmentAuth from "./auth/EnvironmentAuth.ts";
+import { base64UrlDecodeUtf8, base64UrlEncode, signPayload } from "./auth/utils.ts";
 import * as CloudManagedEndpointRuntime from "./cloud/ManagedEndpointRuntime.ts";
 import * as CloudCliTokenManager from "./cloud/CliTokenManager.ts";
 import * as ProcessDiagnostics from "./diagnostics/ProcessDiagnostics.ts";
@@ -138,6 +141,7 @@ import * as TraceDiagnostics from "./diagnostics/TraceDiagnostics.ts";
 import * as DeviceNotifications from "./notifications/DeviceNotifications.ts";
 import * as WorkerProcessIsolation from "./process/WorkerProcessIsolation.ts";
 import * as McpSessionRegistry from "./mcp/McpSessionRegistry.ts";
+import * as AssetAccess from "./assets/AssetAccess.ts";
 import { collectUint8StreamText } from "./stream/collectUint8StreamText.ts";
 import * as Data from "effect/Data";
 
@@ -1577,6 +1581,42 @@ const getAuthenticatedBearerSessionToken = (credential = defaultDesktopBootstrap
     return body.access_token;
   });
 
+const decodeSurfaceSessionClaims = Schema.decodeUnknownSync(
+  Schema.fromJsonString(
+    Schema.Struct({
+      sid: Schema.String,
+      exp: Schema.Number,
+    }),
+  ),
+);
+
+const issueAuthenticatedSurfaceSession = Effect.gen(function* () {
+  const token = yield* getAuthenticatedBearerSessionToken();
+  const encodedClaims = token.split(".")[0];
+  assert.isDefined(encodedClaims);
+  const claims = decodeSurfaceSessionClaims(base64UrlDecodeUtf8(encodedClaims));
+  return {
+    sessionId: AuthSessionId.make(claims.sid),
+    expiresAt: DateTime.makeUnsafe(claims.exp),
+  };
+});
+
+const bindAssetSurfaceCredential = (credential: string) =>
+  Effect.gen(function* () {
+    const response = yield* fetchEffect(
+      yield* getHttpServerUrl(AssetAccess.ASSET_SURFACE_BIND_PATH),
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: jsonRequestBody({ credential }),
+      },
+    );
+    assert.equal(response.status, 204);
+    const cookie = response.headers["set-cookie"];
+    assert.isDefined(cookie);
+    return cookie?.split(";")[0] ?? "";
+  });
+
 const extractSessionTokenFromSetCookie = (cookieHeader: string): string => {
   const [nameValue] = cookieHeader.split(";", 1);
   const token = nameValue?.split("=", 2)[1];
@@ -1945,6 +1985,9 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
           capabilities: [ASSET_SAME_ORIGIN_RELAY_V1_CAPABILITY],
         }),
       );
+      const assetSurfaceCookie = yield* bindAssetSurfaceCredential(
+        issuedAssetUrl.surfaceCredential ?? "",
+      );
 
       const processProbe = Effect.gen(function* () {
         const isolation = yield* WorkerProcessIsolation.WorkerProcessIsolation;
@@ -2186,7 +2229,7 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
             Effect.gen(function* () {
               const response = yield* fetchEffect(
                 yield* getHttpServerUrl(issuedAssetUrl.relativeUrl),
-                { headers: { cookie: ownerCookie } },
+                { headers: { cookie: assetSurfaceCookie } },
               );
               if (response.status === 401 || response.status === 403) {
                 return yield* new SecurityProbeDenied({ source: "http" });
@@ -2386,16 +2429,54 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
     Effect.gen(function* () {
       const fileSystem = yield* FileSystem.FileSystem;
       const path = yield* Path.Path;
-      const config = yield* buildAppUnderTest();
+      const orphanedThreadId = ThreadId.make("thread-asset-orphaned-project");
+      const orphanedProjectId = ProjectId.make("project-asset-orphaned");
+      const orphanedAttachmentId =
+        "thread-asset-orphaned-project-00000000-0000-4000-8000-000000000001";
+      const orphanedReadModel = makeDefaultOrchestrationReadModel();
+      const config = yield* buildAppUnderTest({
+        layers: {
+          projectionSnapshotQuery: {
+            getCommandReadModel: () =>
+              Effect.succeed({
+                ...orphanedReadModel,
+                projects: [],
+                threads: orphanedReadModel.threads.map((thread) => ({
+                  ...thread,
+                  id: orphanedThreadId,
+                  projectId: orphanedProjectId,
+                  dataAudience: "factory" as const,
+                })),
+              }),
+          },
+        },
+      });
       const attachmentId = "asset-session-binding-integration";
       yield* fileSystem.makeDirectory(config.attachmentsDir, { recursive: true });
       yield* fileSystem.writeFileString(
         path.join(config.attachmentsDir, `${attachmentId}.bin`),
         "same-surface-private-asset",
       );
+      yield* fileSystem.writeFileString(
+        path.join(config.attachmentsDir, `${orphanedAttachmentId}.bin`),
+        "orphaned-project-private-asset",
+      );
 
       const issuerCookie = yield* getAuthenticatedSessionCookieHeader();
       const otherCookie = yield* getAuthenticatedSessionCookieHeader();
+      const factoryPairingResponse = yield* fetchEffect(
+        yield* getHttpServerUrl("/api/auth/pairing-token"),
+        {
+          method: "POST",
+          headers: { cookie: issuerCookie, "content-type": "application/json" },
+          body: jsonRequestBody({ audienceCeiling: "factory" }),
+        },
+      );
+      assert.equal(factoryPairingResponse.status, 200);
+      const factoryPairing = yield* responseJsonEffect<{ readonly credential: string }>(
+        factoryPairingResponse,
+      );
+      const factoryCookie = yield* getAuthenticatedSessionCookieHeader(factoryPairing.credential);
       assert.notEqual(issuerCookie, otherCookie);
       const wsUrl = appendSessionCookieToWsUrl(
         yield* getWsServerUrl("/ws", { authenticated: false }),
@@ -2404,17 +2485,29 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
       const rpc = <A, E, R>(f: (client: WsRpcClient) => Effect.Effect<A, E, R>) =>
         Effect.scoped(withWsRpcClient(wsUrl, f));
 
-      const legacyIssued = yield* rpc((client) =>
+      const orphanedIssued = yield* rpc((client) =>
         client[WS_METHODS.assetsCreateUrl]({
-          resource: { _tag: "attachment", attachmentId },
+          resource: { _tag: "attachment", attachmentId: orphanedAttachmentId },
+          capabilities: [ASSET_SAME_ORIGIN_RELAY_V1_CAPABILITY],
         }),
       );
-      assert.include(legacyIssued.relativeUrl, "/api/assets/");
-      assert.notInclude(legacyIssued.relativeUrl, "/api/assets/relay/");
-      assert.notProperty(legacyIssued, "surfaceCredential");
-      const legacyResponse = yield* fetchEffect(yield* getHttpServerUrl(legacyIssued.relativeUrl));
-      assert.equal(legacyResponse.status, 200);
-      assert.equal(yield* legacyResponse.text, "same-surface-private-asset");
+      const orphanedToken = orphanedIssued.relativeUrl.split("/").at(-2);
+      assert.isDefined(orphanedToken);
+      assert.deepInclude(AssetAccess.decodeAssetRelayRoutingClaim(orphanedToken ?? ""), {
+        dataAudience: "private",
+        issuingAudience: "private",
+      });
+
+      const legacyError = yield* rpc((client) =>
+        client[WS_METHODS.assetsCreateUrl]({
+          resource: { _tag: "attachment", attachmentId },
+        }).pipe(Effect.flip),
+      );
+      assert.equal(legacyError._tag, "AssetClientUpgradeRequiredError");
+      if (legacyError._tag !== "AssetClientUpgradeRequiredError") {
+        assert.fail(`Expected AssetClientUpgradeRequiredError, got ${legacyError._tag}`);
+      }
+      assert.equal(legacyError.requiredCapability, ASSET_SAME_ORIGIN_RELAY_V1_CAPABILITY);
 
       const issued = yield* rpc((client) =>
         client[WS_METHODS.assetsCreateUrl]({
@@ -2433,8 +2526,20 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
         headers: { cookie: otherCookie },
       });
       assert.equal(crossSurfaceResponse.status, 404);
+      const webBindingResponse = yield* fetchEffect(
+        yield* getHttpServerUrl(AssetAccess.ASSET_SURFACE_BIND_PATH),
+        {
+          method: "POST",
+          headers: { cookie: issuerCookie, "content-type": "application/json" },
+          body: jsonRequestBody({ credential: issued.surfaceCredential }),
+        },
+      );
+      assert.equal(webBindingResponse.status, 204);
+      const webSurfaceCookie = webBindingResponse.headers["set-cookie"];
+      assert.isString(webSurfaceCookie);
+      assert.include(webSurfaceCookie ?? "", `Path=${AssetAccess.ASSET_SURFACE_RELAY_PREFIX}`);
       const sameSurfaceResponse = yield* fetchEffect(assetUrl, {
-        headers: { cookie: issuerCookie },
+        headers: { cookie: `${issuerCookie}; ${webSurfaceCookie?.split(";")[0] ?? ""}` },
       });
       assert.equal(sameSurfaceResponse.status, 200);
       assert.equal(sameSurfaceResponse.headers["cache-control"], "no-store");
@@ -2445,6 +2550,48 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
       });
       assert.equal(nativeResponse.status, 200);
       assert.equal(yield* nativeResponse.text, "same-surface-private-asset");
+
+      const appRelayPath = issued.relativeUrl.replace("/api/assets/relay/", "/_asset-relay/");
+      assert.notInclude(appRelayPath, issued.surfaceCredential ?? "surface-credential");
+      const unauthenticatedRelay = yield* fetchEffect(yield* getHttpServerUrl(appRelayPath));
+      assert.equal(unauthenticatedRelay.status, 404);
+      const sameSurfaceRelay = yield* fetchEffect(yield* getHttpServerUrl(appRelayPath), {
+        headers: { cookie: issuerCookie },
+        redirect: "manual",
+      });
+      const sameSurfaceRelayBody = yield* sameSurfaceRelay.text;
+      assert.equal(sameSurfaceRelay.status, 200, sameSurfaceRelayBody);
+      assert.equal(sameSurfaceRelay.headers["cache-control"], "no-store");
+      assert.isUndefined(sameSurfaceRelay.headers.location);
+      assert.isUndefined(sameSurfaceRelay.headers["set-cookie"]);
+      assert.equal(sameSurfaceRelayBody, "same-surface-private-asset");
+
+      const relaySourceToken = yield* getAuthenticatedBearerSessionToken();
+      const peerTokenResponse = yield* fetchEffect(yield* getHttpServerUrl("/api/mcp/peer-token"), {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${relaySourceToken}`,
+          "content-type": "application/json",
+        },
+        body: jsonRequestBody({ sourceEnvironmentId: "asset-relay-source" }),
+      });
+      assert.equal(peerTokenResponse.status, 200);
+      const peerToken = yield* responseJsonEffect<{ readonly token: string }>(peerTokenResponse);
+      const peerRelayResponse = yield* fetchEffect(yield* getHttpServerUrl(appRelayPath), {
+        headers: { authorization: `Bearer ${peerToken.token}` },
+      });
+      assert.equal(peerRelayResponse.status, 200);
+      assert.equal(yield* peerRelayResponse.text, "same-surface-private-asset");
+
+      const otherPrivateSurfaceRelay = yield* fetchEffect(yield* getHttpServerUrl(appRelayPath), {
+        headers: { cookie: otherCookie },
+      });
+      assert.equal(otherPrivateSurfaceRelay.status, 200);
+      assert.equal(yield* otherPrivateSurfaceRelay.text, "same-surface-private-asset");
+      const factorySurfaceRelay = yield* fetchEffect(yield* getHttpServerUrl(appRelayPath), {
+        headers: { cookie: factoryCookie },
+      });
+      assert.equal(factorySurfaceRelay.status, 404);
 
       for (const origin of ["null", "not an origin"]) {
         const nonHttpsBindingResponse = yield* fetchEffect(
@@ -6391,6 +6538,509 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
     }).pipe(Effect.provide(NodeHttpServer.layerTest)),
   );
 
+  it.effect(
+    "characterizes desktop preview partition loads without a relay cookie as masked 404",
+    () =>
+      Effect.gen(function* () {
+        const fileSystem = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const config = yield* buildAppUnderTest();
+        const attachmentId = "thread-default-00000000-0000-4000-8000-000000000019";
+        const privateContents = "desktop preview private asset";
+        yield* fileSystem.makeDirectory(config.attachmentsDir, { recursive: true });
+        yield* fileSystem.writeFileString(
+          path.join(config.attachmentsDir, `${attachmentId}.bin`),
+          privateContents,
+        );
+
+        const wsUrl = yield* getWsServerUrl("/ws");
+        const { oldClientError, issued } = yield* Effect.scoped(
+          withWsRpcClient(wsUrl, (client) =>
+            Effect.gen(function* () {
+              const oldClientError = yield* client[WS_METHODS.assetsCreateUrl]({
+                resource: { _tag: "attachment", attachmentId },
+              }).pipe(Effect.flip);
+              const issued = yield* client[WS_METHODS.assetsCreateUrl]({
+                resource: { _tag: "attachment", attachmentId },
+                capabilities: [ASSET_SAME_ORIGIN_RELAY_V1_CAPABILITY],
+              });
+              return { oldClientError, issued };
+            }),
+          ),
+        );
+
+        assert.equal(oldClientError._tag, "AssetClientUpgradeRequiredError");
+        if (oldClientError._tag !== "AssetClientUpgradeRequiredError") {
+          assert.fail(`Expected AssetClientUpgradeRequiredError, got ${oldClientError._tag}`);
+        }
+        assert.equal(oldClientError.requiredCapability, ASSET_SAME_ORIGIN_RELAY_V1_CAPABILITY);
+        assert.isTrue(issued.relativeUrl.startsWith(`${AssetAccess.ASSET_SURFACE_RELAY_PREFIX}/`));
+        assert.isString(issued.surfaceCredential);
+
+        // Electron's persist:t3code-preview-* partition has an independent cookie jar. Until the
+        // deliberately deferred partition bridge exists, its cookie-less navigation must remain
+        // fail-closed and must never be replaced with an unbound private URL.
+        const previewPartitionResponse = yield* fetchEffect(
+          yield* getHttpServerUrl(issued.relativeUrl),
+        );
+        assert.equal(previewPartitionResponse.status, 404);
+        assert.equal(yield* previewPartitionResponse.text, "Not Found");
+
+        const hypotheticalUnboundUrl = issued.relativeUrl.replace(
+          AssetAccess.ASSET_SURFACE_RELAY_PREFIX,
+          AssetAccess.ASSET_ROUTE_PREFIX,
+        );
+        assert.notEqual(issued.relativeUrl, hypotheticalUnboundUrl);
+        const hypotheticalUnboundResponse = yield* fetchEffect(
+          yield* getHttpServerUrl(hypotheticalUnboundUrl),
+        );
+        assert.equal(hypotheticalUnboundResponse.status, 404);
+        assert.notInclude(yield* hypotheticalUnboundResponse.text, privateContents);
+      }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+
+  it.effect("requires bound surfaces for private assets and revalidates live path audience", () =>
+    Effect.gen(function* () {
+      const fileSystem = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const workspaceRoot = yield* fileSystem.makeTempDirectoryScoped({
+        prefix: "t3-http-asset-audience-",
+      });
+      const workspaceFile = path.join(workspaceRoot, "report.html");
+      const workspaceStylesheet = path.join(workspaceRoot, "report.css");
+      yield* fileSystem.writeFileString(
+        workspaceFile,
+        '<link rel="stylesheet" href="report.css">factory report',
+      );
+      yield* fileSystem.writeFileString(workspaceStylesheet, "body { color: green; }");
+      const now = IsoDateTime.make("2026-07-19T06:00:00.000Z");
+      const factoryProject = {
+        id: ProjectId.make("project-http-asset-factory"),
+        title: "Factory asset project",
+        workspaceRoot,
+        dataAudience: "factory" as const,
+        defaultModelSelection,
+        scripts: [],
+        createdAt: now,
+        updatedAt: now,
+        deletedAt: null,
+      };
+      const factoryThread = {
+        ...makeDefaultOrchestrationReadModel().threads[0]!,
+        id: ThreadId.make("thread-http-asset-factory"),
+        projectId: factoryProject.id,
+        dataAudience: "factory" as const,
+      };
+      let liveReadModel: OrchestrationReadModel = {
+        snapshotSequence: 1,
+        projects: [factoryProject],
+        threads: [factoryThread],
+        updatedAt: now,
+      };
+      const getCommandReadModel = () => Effect.sync(() => liveReadModel);
+      const config = yield* buildAppUnderTest({
+        layers: { projectionSnapshotQuery: { getCommandReadModel } },
+      });
+      const attachmentId = "thread-private-http-assets-00000000-0000-4000-8000-000000000001";
+      const factoryAttachmentId = "thread-http-asset-factory-00000000-0000-4000-8000-000000000002";
+      yield* fileSystem.makeDirectory(config.attachmentsDir, { recursive: true });
+      yield* fileSystem.writeFileString(
+        path.join(config.attachmentsDir, `${attachmentId}.bin`),
+        "private attachment",
+      );
+      yield* fileSystem.writeFileString(
+        path.join(config.attachmentsDir, `${factoryAttachmentId}.bin`),
+        "factory attachment",
+      );
+
+      const configLayer = ServerConfig.layer(config);
+      const assetSetupLayer = Layer.mergeAll(
+        configLayer,
+        ServerSecretStore.layer.pipe(Layer.provide(configLayer)),
+        WorkspacePaths.layer,
+        ProjectFaviconResolver.layer.pipe(Layer.provide(WorkspacePaths.layer)),
+        Layer.mock(ServerEnvironment.ServerEnvironment)({
+          getEnvironmentId: Effect.succeed(testEnvironmentDescriptor.environmentId),
+          getDescriptor: Effect.succeed(testEnvironmentDescriptor),
+        }),
+        Layer.mock(ProjectionSnapshotQuery.ProjectionSnapshotQuery)({ getCommandReadModel }),
+      ).pipe(Layer.provideMerge(NodeServices.layer));
+      const ownerSurfaceSession = yield* issueAuthenticatedSurfaceSession;
+      const otherSurfaceSession = yield* issueAuthenticatedSurfaceSession;
+      const issuedAssetUrl = yield* AssetAccess.issueAssetUrl({
+        resource: { _tag: "attachment", attachmentId },
+        dataAudience: "private",
+        issuingAudience: "private",
+        clientCapabilities: [ASSET_SAME_ORIGIN_RELAY_V1_CAPABILITY],
+        surfaceSessionId: ownerSurfaceSession.sessionId,
+        surfaceSessionExpiresAt: ownerSurfaceSession.expiresAt,
+      }).pipe(Effect.provide(assetSetupLayer));
+      const otherSurfaceAssetUrl = yield* AssetAccess.issueAssetUrl({
+        resource: { _tag: "attachment", attachmentId },
+        dataAudience: "private",
+        issuingAudience: "private",
+        clientCapabilities: [ASSET_SAME_ORIGIN_RELAY_V1_CAPABILITY],
+        surfaceSessionId: otherSurfaceSession.sessionId,
+        surfaceSessionExpiresAt: otherSurfaceSession.expiresAt,
+      }).pipe(Effect.provide(assetSetupLayer));
+      const privateWorkspaceAssetUrl = yield* AssetAccess.issueAssetUrl({
+        resource: {
+          _tag: "workspace-file",
+          threadId: ThreadId.make("thread-http-asset-factory"),
+          path: workspaceFile,
+        },
+        workspaceRoot,
+        dataAudience: "private",
+        issuingAudience: "private",
+        clientCapabilities: [ASSET_SAME_ORIGIN_RELAY_V1_CAPABILITY],
+        surfaceSessionId: ownerSurfaceSession.sessionId,
+        surfaceSessionExpiresAt: ownerSurfaceSession.expiresAt,
+      }).pipe(Effect.provide(assetSetupLayer));
+      const factoryAssetUrl = yield* AssetAccess.issueAssetUrl({
+        resource: { _tag: "attachment", attachmentId: factoryAttachmentId },
+        dataAudience: "factory",
+        issuingAudience: "factory",
+      }).pipe(Effect.provide(assetSetupLayer));
+      const staleWorkspaceAssetUrl = yield* AssetAccess.issueAssetUrl({
+        resource: {
+          _tag: "workspace-file",
+          threadId: ThreadId.make("thread-http-asset-factory"),
+          path: workspaceFile,
+        },
+        workspaceRoot,
+        dataAudience: "factory",
+        issuingAudience: "factory",
+      }).pipe(Effect.provide(assetSetupLayer));
+      const signingSecret = yield* Effect.gen(function* () {
+        const secretStore = yield* ServerSecretStore.ServerSecretStore;
+        return yield* secretStore.getOrCreateRandom("asset-access-signing-key", 32);
+      }).pipe(Effect.provide(assetSetupLayer));
+
+      const rewriteSignedClaims = (
+        relativeUrl: string,
+        rewrite: (claims: Record<string, unknown>) => Record<string, unknown>,
+      ): string => {
+        const routePrefix = relativeUrl.startsWith(`${AssetAccess.ASSET_SURFACE_RELAY_PREFIX}/`)
+          ? AssetAccess.ASSET_SURFACE_RELAY_PREFIX
+          : AssetAccess.ASSET_ROUTE_PREFIX;
+        const suffix = relativeUrl.slice(`${routePrefix}/`.length);
+        const separatorIndex = suffix.indexOf("/");
+        const token = suffix.slice(0, separatorIndex);
+        const fileName = suffix.slice(separatorIndex + 1);
+        const encodedPayload = token.split(".")[0];
+        assert.isDefined(encodedPayload);
+        const claims = JSON.parse(base64UrlDecodeUtf8(encodedPayload)) as Record<string, unknown>;
+        const rewrittenPayload = base64UrlEncode(JSON.stringify(rewrite(claims)));
+        return `${routePrefix}/${rewrittenPayload}.${signPayload(rewrittenPayload, signingSecret)}/${fileName}`;
+      };
+      const expiredAssetUrl = rewriteSignedClaims(issuedAssetUrl.relativeUrl, (claims) => ({
+        ...claims,
+        expiresAt: 0,
+      }));
+      const legacyAssetUrl = rewriteSignedClaims(issuedAssetUrl.relativeUrl, (claims) =>
+        Object.fromEntries(
+          Object.entries(claims).filter(
+            ([key]) => key !== "dataAudience" && key !== "audienceCeiling",
+          ),
+        ),
+      );
+      const legacyUnboundPrivateUrl = rewriteSignedClaims(issuedAssetUrl.relativeUrl, (claims) =>
+        Object.fromEntries(Object.entries(claims).filter(([key]) => key !== "surfaceBindingId")),
+      );
+      const legacyFactoryAssetUrl = rewriteSignedClaims(factoryAssetUrl.relativeUrl, (claims) =>
+        Object.fromEntries(Object.entries(claims).filter(([key]) => key !== "surfaceBindingId")),
+      );
+      const invalidAudienceAssetUrl = rewriteSignedClaims(issuedAssetUrl.relativeUrl, (claims) => ({
+        ...claims,
+        issuingAudience: "factory",
+      }));
+      const invalidAssetUrl = issuedAssetUrl.relativeUrl.replace(/\.([^./]+)\//, ".$1x/");
+      const rejectedDirectPrivateUrl = issuedAssetUrl.relativeUrl.replace(
+        AssetAccess.ASSET_SURFACE_RELAY_PREFIX,
+        AssetAccess.ASSET_ROUTE_PREFIX,
+      );
+
+      assert.isTrue(
+        issuedAssetUrl.relativeUrl.startsWith(`${AssetAccess.ASSET_SURFACE_RELAY_PREFIX}/`),
+      );
+      assert.isTrue(factoryAssetUrl.relativeUrl.startsWith(`${AssetAccess.ASSET_ROUTE_PREFIX}/`));
+      assert.isFalse(
+        factoryAssetUrl.relativeUrl.startsWith(`${AssetAccess.ASSET_SURFACE_RELAY_PREFIX}/`),
+      );
+
+      const privateSurfaceCookie = yield* bindAssetSurfaceCredential(
+        issuedAssetUrl.surfaceCredential ?? "",
+      );
+      const otherSurfaceCookie = yield* bindAssetSurfaceCredential(
+        otherSurfaceAssetUrl.surfaceCredential ?? "",
+      );
+      const { response: factoryTokenResponse, body: factoryTokenBody } = yield* exchangeAccessToken(
+        defaultDesktopBootstrapToken,
+        {
+          audienceCeiling: "factory",
+        },
+      );
+      assert.equal(factoryTokenResponse.status, 200);
+      assert.isDefined(factoryTokenBody.access_token);
+
+      const unauthenticatedPrivateResponse = yield* fetchEffect(
+        yield* getHttpServerUrl(issuedAssetUrl.relativeUrl),
+      );
+      assert.equal(unauthenticatedPrivateResponse.status, 404);
+      assert.notInclude(yield* unauthenticatedPrivateResponse.text, "private attachment");
+
+      const factoryAuthenticatedPrivateResponse = yield* fetchEffect(
+        yield* getHttpServerUrl(issuedAssetUrl.relativeUrl),
+        { headers: { authorization: `Bearer ${factoryTokenBody.access_token ?? ""}` } },
+      );
+      assert.equal(factoryAuthenticatedPrivateResponse.status, 404);
+      assert.notInclude(yield* factoryAuthenticatedPrivateResponse.text, "private attachment");
+
+      const privateAuthenticatedResponse = yield* fetchEffect(
+        yield* getHttpServerUrl(issuedAssetUrl.relativeUrl),
+        { headers: { cookie: privateSurfaceCookie } },
+      );
+      assert.equal(privateAuthenticatedResponse.status, 200);
+      assert.equal(privateAuthenticatedResponse.headers["cache-control"], "no-store");
+      assert.equal(yield* privateAuthenticatedResponse.text, "private attachment");
+
+      const rejectedCrossSiteCookieResponse = yield* fetchEffect(
+        yield* getHttpServerUrl(rejectedDirectPrivateUrl),
+        { headers: { cookie: privateSurfaceCookie } },
+      );
+      assert.equal(rejectedCrossSiteCookieResponse.status, 404);
+      assert.equal(yield* rejectedCrossSiteCookieResponse.text, "Not Found");
+
+      const nativeAuthenticatedResponse = yield* fetchEffect(
+        yield* getHttpServerUrl(issuedAssetUrl.relativeUrl),
+        { headers: { "x-t3-asset-surface": issuedAssetUrl.surfaceCredential ?? "" } },
+      );
+      assert.equal(nativeAuthenticatedResponse.status, 200);
+      assert.equal(yield* nativeAuthenticatedResponse.text, "private attachment");
+
+      const nativeWithStaleCookieResponse = yield* fetchEffect(
+        yield* getHttpServerUrl(issuedAssetUrl.relativeUrl),
+        {
+          headers: {
+            cookie: otherSurfaceCookie,
+            "x-t3-asset-surface": issuedAssetUrl.surfaceCredential ?? "",
+          },
+        },
+      );
+      assert.equal(nativeWithStaleCookieResponse.status, 200);
+      assert.equal(yield* nativeWithStaleCookieResponse.text, "private attachment");
+
+      const concurrentSurfaceResponse = yield* fetchEffect(
+        yield* getHttpServerUrl(issuedAssetUrl.relativeUrl),
+        { headers: { cookie: `${otherSurfaceCookie}; ${privateSurfaceCookie}` } },
+      );
+      assert.equal(concurrentSurfaceResponse.status, 200);
+      assert.equal(yield* concurrentSurfaceResponse.text, "private attachment");
+
+      const crossSurfaceResponse = yield* fetchEffect(
+        yield* getHttpServerUrl(issuedAssetUrl.relativeUrl),
+        { headers: { cookie: otherSurfaceCookie } },
+      );
+      assert.equal(crossSurfaceResponse.status, 404);
+      assert.equal(yield* crossSurfaceResponse.text, "Not Found");
+
+      const webViewBindingResponse = yield* fetchEffect(
+        yield* getHttpServerUrl(AssetAccess.ASSET_SURFACE_BIND_PATH),
+        {
+          method: "POST",
+          redirect: "manual",
+          headers: { "content-type": "application/json" },
+          body: jsonRequestBody({
+            credential: privateWorkspaceAssetUrl.surfaceCredential ?? "",
+            redirect: privateWorkspaceAssetUrl.relativeUrl,
+          }),
+        },
+      );
+      assert.equal(webViewBindingResponse.status, 303);
+      assert.equal(webViewBindingResponse.headers.location, privateWorkspaceAssetUrl.relativeUrl);
+      const webViewSurfaceCookie = webViewBindingResponse.headers["set-cookie"]?.split(";")[0];
+      assert.isDefined(webViewSurfaceCookie);
+      assert.include(webViewBindingResponse.headers["set-cookie"] ?? "", "SameSite=Lax");
+      assert.include(
+        webViewBindingResponse.headers["set-cookie"] ?? "",
+        `Path=${AssetAccess.ASSET_SURFACE_RELAY_PREFIX}`,
+      );
+      assert.notInclude(webViewBindingResponse.headers["set-cookie"] ?? "", "SameSite=None");
+      assert.notInclude(webViewBindingResponse.headers["set-cookie"] ?? "", "Secure");
+
+      const hostedBindingResponse = yield* fetchEffect(
+        yield* getHttpServerUrl(AssetAccess.ASSET_SURFACE_BIND_PATH),
+        {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            "x-forwarded-proto": "https",
+          },
+          body: jsonRequestBody({ credential: issuedAssetUrl.surfaceCredential ?? "" }),
+        },
+      );
+      assert.equal(hostedBindingResponse.status, 204);
+      assert.include(hostedBindingResponse.headers["set-cookie"] ?? "", "SameSite=Lax");
+      assert.include(hostedBindingResponse.headers["set-cookie"] ?? "", "Secure");
+      const webViewDocumentResponse = yield* fetchEffect(
+        yield* getHttpServerUrl(privateWorkspaceAssetUrl.relativeUrl),
+        { headers: { cookie: webViewSurfaceCookie ?? "" } },
+      );
+      assert.equal(webViewDocumentResponse.status, 200);
+      assert.include(yield* webViewDocumentResponse.text, "factory report");
+      const webViewStylesheetUrl = privateWorkspaceAssetUrl.relativeUrl.replace(
+        /\/[^/]+$/,
+        "/report.css",
+      );
+      const webViewStylesheetResponse = yield* fetchEffect(
+        yield* getHttpServerUrl(webViewStylesheetUrl),
+        { headers: { cookie: webViewSurfaceCookie ?? "" } },
+      );
+      assert.equal(webViewStylesheetResponse.status, 200);
+      assert.equal(yield* webViewStylesheetResponse.text, "body { color: green; }");
+
+      const factoryResponse = yield* fetchEffect(
+        yield* getHttpServerUrl(factoryAssetUrl.relativeUrl),
+      );
+      assert.equal(factoryResponse.status, 200);
+      assert.equal(factoryResponse.headers["cache-control"], "no-store");
+      assert.equal(yield* factoryResponse.text, "factory attachment");
+
+      const legacyFactoryResponse = yield* fetchEffect(
+        yield* getHttpServerUrl(legacyFactoryAssetUrl),
+      );
+      assert.equal(legacyFactoryResponse.status, 200);
+      assert.equal(yield* legacyFactoryResponse.text, "factory attachment");
+
+      const factoryHeadResponse = yield* fetchEffect(
+        yield* getHttpServerUrl(factoryAssetUrl.relativeUrl),
+        { method: "HEAD" },
+      );
+      assert.equal(factoryHeadResponse.status, 200);
+      assert.equal(factoryHeadResponse.headers["cache-control"], "no-store");
+      assert.equal(yield* factoryHeadResponse.text, "");
+
+      for (const relativeUrl of [
+        invalidAssetUrl,
+        expiredAssetUrl,
+        legacyAssetUrl,
+        legacyUnboundPrivateUrl,
+        invalidAudienceAssetUrl,
+      ]) {
+        const response = yield* fetchEffect(yield* getHttpServerUrl(relativeUrl));
+        const body = yield* response.text;
+        const serializedResponse = encodeSecurityObservation({
+          status: response.status,
+          headers: response.headers,
+          body,
+        });
+        assert.equal(response.status, 404);
+        assert.equal(body, "Not Found");
+        assert.notInclude(serializedResponse, attachmentId);
+        assert.notInclude(serializedResponse, "private attachment");
+      }
+
+      const readdedPrivateProject = {
+        ...factoryProject,
+        id: ProjectId.make("project-http-asset-private"),
+        title: "Re-added private asset project",
+        dataAudience: "private" as const,
+      };
+      const collidingPrivateThread = {
+        ...factoryThread,
+        id: ThreadId.make("Thread.Http.Asset.Factory"),
+        projectId: readdedPrivateProject.id,
+        dataAudience: "private" as const,
+      };
+      liveReadModel = {
+        snapshotSequence: 2,
+        projects: [{ ...factoryProject, deletedAt: now }, readdedPrivateProject],
+        threads: [factoryThread, collidingPrivateThread],
+        updatedAt: now,
+      };
+      const staleResponse = yield* fetchEffect(
+        yield* getHttpServerUrl(staleWorkspaceAssetUrl.relativeUrl),
+      );
+      assert.equal(staleResponse.status, 404);
+      assert.notInclude(yield* staleResponse.text, "factory report");
+      const staleAttachmentResponse = yield* fetchEffect(
+        yield* getHttpServerUrl(factoryAssetUrl.relativeUrl),
+      );
+      assert.equal(staleAttachmentResponse.status, 404);
+      assert.notInclude(yield* staleAttachmentResponse.text, "factory attachment");
+    }).pipe(Effect.provide(NodeHttpServer.layerTest), TestClock.withLive),
+  );
+
+  it.effect("refuses factory-ceiling asset URLs for files in nested private projects", () =>
+    Effect.gen(function* () {
+      const fileSystem = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const factoryRoot = yield* fileSystem.makeTempDirectoryScoped({
+        prefix: "t3-factory-asset-root-",
+      });
+      const privateRoot = path.join(factoryRoot, "private-project");
+      const privateFile = path.join(privateRoot, "secret.html");
+      yield* fileSystem.makeDirectory(privateRoot, { recursive: true });
+      yield* fileSystem.writeFileString(privateFile, "private descendant");
+
+      const baseReadModel = makeDefaultOrchestrationReadModel();
+      const factoryProject = {
+        ...baseReadModel.projects[0]!,
+        workspaceRoot: factoryRoot,
+        dataAudience: "factory" as const,
+      };
+      const privateProject = {
+        ...factoryProject,
+        id: ProjectId.make("project-nested-private-asset"),
+        title: "Nested private asset project",
+        workspaceRoot: privateRoot,
+        dataAudience: "private" as const,
+      };
+      const factoryThread = {
+        ...baseReadModel.threads[0]!,
+        projectId: factoryProject.id,
+        dataAudience: "factory" as const,
+      };
+      const commandReadModel: OrchestrationReadModel = {
+        ...baseReadModel,
+        projects: [factoryProject, privateProject],
+        threads: [factoryThread],
+      };
+      const getCommandReadModel = () => Effect.succeed(commandReadModel);
+      const config = yield* buildAppUnderTest({
+        layers: {
+          projectionSnapshotQuery: {
+            getCommandReadModel,
+          },
+        },
+      });
+      const configLayer = ServerConfig.layer(config);
+      const assetLayer = Layer.mergeAll(
+        configLayer,
+        ServerSecretStore.layer.pipe(Layer.provide(configLayer)),
+        WorkspacePaths.layer,
+        ProjectFaviconResolver.layer.pipe(Layer.provide(WorkspacePaths.layer)),
+        Layer.mock(ServerEnvironment.ServerEnvironment)({
+          getEnvironmentId: Effect.succeed(testEnvironmentDescriptor.environmentId),
+          getDescriptor: Effect.succeed(testEnvironmentDescriptor),
+        }),
+        Layer.mock(ProjectionSnapshotQuery.ProjectionSnapshotQuery)({ getCommandReadModel }),
+      ).pipe(Layer.provideMerge(NodeServices.layer));
+      const error = yield* AssetAccess.issueAssetUrl({
+        resource: {
+          _tag: "workspace-file",
+          threadId: factoryThread.id,
+          path: privateFile,
+        },
+        workspaceRoot: factoryRoot,
+        dataAudience: factoryThread.dataAudience,
+        issuingAudience: "factory",
+      }).pipe(Effect.provide(assetLayer), Effect.flip);
+
+      assert.equal(error._tag, "AssetWorkspaceContextNotFoundError");
+    }).pipe(Effect.provide(NodeHttpServer.layerTest), TestClock.withLive),
+  );
+
   it.effect("routes websocket rpc projects.writeFile", () =>
     Effect.gen(function* () {
       const fs = yield* FileSystem.FileSystem;
@@ -6599,7 +7249,13 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
 
   it.effect("routes websocket rpc git methods", () =>
     Effect.gen(function* () {
-      yield* buildAppUnderTest({
+      const path = yield* Path.Path;
+      const createWorktreeInputs: Array<{
+        readonly cwd: string;
+        readonly refName: string;
+        readonly path: string | null;
+      }> = [];
+      const config = yield* buildAppUnderTest({
         config: {
           cwd: "/tmp/repo",
         },
@@ -6735,10 +7391,12 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
                 nextCursor: null,
                 totalCount: 1,
               }),
-            createWorktree: () =>
-              Effect.succeed({
+            createWorktree: (input) => {
+              createWorktreeInputs.push(input);
+              return Effect.succeed({
                 worktree: { path: "/tmp/wt", refName: "feature/demo" },
-              }),
+              });
+            },
             removeWorktree: () => Effect.void,
             createRef: (input) => Effect.succeed({ refName: input.refName }),
             switchRef: (input) => Effect.succeed({ refName: input.refName }),
@@ -6858,6 +7516,13 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
         ),
       );
       assert.equal(worktree.worktree.refName, "feature/demo");
+      assert.deepEqual(createWorktreeInputs, [
+        {
+          cwd: "/tmp/repo",
+          refName: "main",
+          path: path.join(config.worktreesDir, "repo", "main"),
+        },
+      ]);
 
       yield* Effect.scoped(
         withWsRpcClient(wsUrl, (client) =>
