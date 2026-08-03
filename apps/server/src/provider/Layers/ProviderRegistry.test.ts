@@ -629,6 +629,57 @@ it.layer(Layer.mergeAll(NodeServices.layer, ServerSettingsModule.layerTest(), Te
           ),
           ["claude-opus-4-7"],
         );
+
+        const transientFailureProvider = {
+          ...olderClaudeProvider,
+          checkedAt: "2026-08-03T00:03:00.000Z",
+          version: null,
+          status: "error",
+          message: "Failed to execute Claude Agent CLI health check.",
+        } satisfies ServerProvider;
+
+        assert.deepStrictEqual(
+          mergeProviderSnapshot(refreshedProvider, transientFailureProvider).models.map(
+            (model) => model.slug,
+          ),
+          ["claude-opus-4-7", "claude-opus-5"],
+        );
+
+        const firstFailureSnapshot = mergeProviderSnapshot(
+          refreshedProvider,
+          transientFailureProvider,
+        );
+        const secondFailureProvider = {
+          ...transientFailureProvider,
+          checkedAt: "2026-08-03T00:04:00.000Z",
+        } satisfies ServerProvider;
+
+        assert.deepStrictEqual(
+          mergeProviderSnapshot(firstFailureSnapshot, secondFailureProvider).models.map(
+            (model) => model.slug,
+          ),
+          ["claude-opus-4-7", "claude-opus-5"],
+        );
+
+        const previousCodexProvider = {
+          ...refreshedProvider,
+          driver: ProviderDriverKind.make("codex"),
+          models: [
+            {
+              slug: "gpt-5.5",
+              name: "GPT-5.5",
+              isCustom: false,
+              capabilities: createModelCapabilities({ optionDescriptors: [] }),
+            },
+          ],
+        } satisfies ServerProvider;
+
+        assert.deepStrictEqual(
+          mergeProviderSnapshot(previousCodexProvider, transientFailureProvider).models.map(
+            (model) => model.slug,
+          ),
+          ["claude-opus-4-7"],
+        );
       });
 
       it("fills missing capabilities from the previous provider snapshot", () => {

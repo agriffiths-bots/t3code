@@ -87,6 +87,7 @@ const mergeProviderModels = (
   driver: ProviderDriverKind,
   previousModels: ReadonlyArray<ServerProvider["models"][number]>,
   nextModels: ReadonlyArray<ServerProvider["models"][number]>,
+  preserveMissingBuiltIns: boolean,
 ): ReadonlyArray<ServerProvider["models"][number]> => {
   const retainedPreviousModels = previousModels.filter(
     (model) => !isRetiredBuiltInProviderModel(driver, model),
@@ -116,7 +117,9 @@ const mergeProviderModels = (
   return [
     ...mergedModels,
     ...retainedPreviousModels.filter(
-      (model) => !nextSlugs.has(model.slug) && (driver !== CLAUDE_DRIVER_KIND || model.isCustom),
+      (model) =>
+        !nextSlugs.has(model.slug) &&
+        (driver !== CLAUDE_DRIVER_KIND || model.isCustom || preserveMissingBuiltIns),
     ),
   ];
 };
@@ -125,7 +128,7 @@ export const mergeProviderSnapshot = (
   previousProvider: ServerProvider | undefined,
   nextProvider: ServerProvider,
 ): ServerProvider =>
-  !previousProvider
+  !previousProvider || previousProvider.driver !== nextProvider.driver
     ? nextProvider
     : {
         ...nextProvider,
@@ -133,6 +136,7 @@ export const mergeProviderSnapshot = (
           nextProvider.driver,
           previousProvider.models,
           nextProvider.models,
+          nextProvider.driver === CLAUDE_DRIVER_KIND && nextProvider.version === null,
         ),
       };
 
