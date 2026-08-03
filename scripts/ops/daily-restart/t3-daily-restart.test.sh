@@ -259,6 +259,7 @@ SH
 echo "pnpm $*" >>"$T_LOG"
 [[ -n "${T3CODE_BUILD_SHA:-}" ]] && echo "pnpm-env T3CODE_BUILD_SHA=$T3CODE_BUILD_SHA cmd=$*" >>"$T_LOG"
 [[ -n "${T3CODE_HOSTED_BUILD:-}" ]] && echo "pnpm-env T3CODE_HOSTED_BUILD=$T3CODE_HOSTED_BUILD cmd=$*" >>"$T_LOG"
+echo "pnpm-backend-env HTTP=${VITE_HTTP_URL-unset} WS=${VITE_WS_URL-unset} DEV=${VITE_DEV_SERVER_URL-unset} cmd=$*" >>"$T_LOG"
 if [[ "${FAKE_PNPM_FAIL_ONCE:-0}" == "1" && ! -f "$T_TMP/pnpm-failed" ]]; then
   : >"$T_TMP/pnpm-failed"
   exit 8
@@ -335,20 +336,25 @@ assert_order() {
 }
 
 tmp="$(mktemp -d)"
+export VITE_HTTP_URL=//localhost:3773 VITE_WS_URL=//127.0.0.2:3773 VITE_DEV_SERVER_URL=http://localhost:5733
 run_manager "$tmp"
+unset VITE_HTTP_URL VITE_WS_URL VITE_DEV_SERVER_URL
 [[ "$(cat "$tmp/rc")" == "0" ]] && pass "happy path exits zero" || fail "happy path exits zero"
 assert_order "$tmp/calls.log" "git -C" "snapshot" "capture" "systemctl --user stop" "capture" "snapshot" "git -C" "pnpm -C" "systemctl --user start" "verify-restart" "health" "inject"
 assert_order "$tmp/calls.log" "mint-resume-token" "validate-resume-token" "systemctl --user stop"
 grep -Fq "inject token=minted-token" "$tmp/calls.log" && pass "resume injection receives preflight token" || fail "resume injection receives preflight token"
 grep -Fq "revoke-resume-token minted-session" "$tmp/calls.log" && pass "minted resume token is revoked" || fail "minted resume token is revoked"
 assert_order "$tmp/calls.log" "snapshot --db" "capture --db" "systemctl --user stop" "capture --db" "snapshot --db"
-assert_order "$tmp/calls.log" "git -C" "pnpm -C $tmp/checkout/apps/web run build:hosted" "pnpm -C $tmp/checkout run build:desktop"
+assert_order "$tmp/calls.log" "git -C" "pnpm -C $tmp/checkout/apps/web run build:hosted" "pnpm -C $tmp/checkout run build:desktop" "assert-web-no-dev-endpoints.ts --force $tmp/checkout/apps/web/dist" "systemctl --user start fake.service"
 grep -Fq "pnpm-env T3CODE_BUILD_SHA=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb cmd=-C $tmp/checkout/apps/web run build:hosted" "$tmp/calls.log" \
   && pass "happy path stamps standalone web build" \
   || fail "happy path stamps standalone web build"
+grep -Fq "pnpm-backend-env HTTP=unset WS=unset DEV=unset cmd=-C $tmp/checkout/apps/web run build:hosted" "$tmp/calls.log" && pass "hosted target build scrubs inherited backend env" || fail "hosted target build scrubs inherited backend env"
 grep -Fq "pnpm-env T3CODE_BUILD_SHA=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb cmd=-C $tmp/checkout run build:desktop" "$tmp/calls.log" \
   && pass "happy path stamps desktop/server build" \
   || fail "happy path stamps desktop/server build"
+grep -Fq "pnpm-env T3CODE_HOSTED_BUILD=1 cmd=-C $tmp/checkout run build:desktop" "$tmp/calls.log" && pass "desktop/server build preserves hosted mode" || fail "desktop/server build preserves hosted mode"
+grep -Fq "pnpm-backend-env HTTP=unset WS=unset DEV=unset cmd=-C $tmp/checkout run build:desktop" "$tmp/calls.log" && pass "desktop/server build scrubs inherited backend env" || fail "desktop/server build scrubs inherited backend env"
 if awk 'f && /pnpm/ { found=1 } /health/ { f=1 } END { exit found ? 0 : 1 }' "$tmp/calls.log"; then
   fail "happy path built after health"
 else
@@ -446,11 +452,15 @@ fi
 
 tmp="$(mktemp -d)"
 export FAKE_VERIFY_RESTART_RC=9
+export VITE_HTTP_URL=//localhost:3773 VITE_WS_URL=//127.0.0.2:3773 VITE_DEV_SERVER_URL=http://localhost:5733
 run_manager "$tmp"
-unset FAKE_VERIFY_RESTART_RC
+unset FAKE_VERIFY_RESTART_RC VITE_HTTP_URL VITE_WS_URL VITE_DEV_SERVER_URL
 [[ "$(cat "$tmp/rc")" != "0" ]] && pass "verify-restart failure exits nonzero" || fail "verify-restart failure exits nonzero"
-assert_order "$tmp/calls.log" "systemctl --user start fake.service" "verify-restart" "systemctl --user stop fake.service" "restore" "git -C $tmp/checkout checkout aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" "pnpm -C $tmp/checkout install --frozen-lockfile --prefer-offline" "pnpm -C $tmp/checkout/apps/web run build" "assert-web-no-dev-endpoints.ts --force $tmp/checkout/apps/web/dist" "pnpm -C $tmp/checkout run build:desktop" "systemctl --user start fake.service" "health"
+assert_order "$tmp/calls.log" "systemctl --user start fake.service" "verify-restart" "systemctl --user stop fake.service" "restore" "git -C $tmp/checkout checkout aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" "pnpm -C $tmp/checkout install --frozen-lockfile --prefer-offline" "pnpm -C $tmp/checkout/apps/web run build" "assert-web-no-dev-endpoints.ts --force $tmp/checkout/apps/web/dist" "pnpm -C $tmp/checkout run build:desktop" "assert-web-no-dev-endpoints.ts --force $tmp/checkout/apps/web/dist" "systemctl --user start fake.service" "health"
 grep -Fq "pnpm-env T3CODE_HOSTED_BUILD=1 cmd=-C $tmp/checkout/apps/web run build" "$tmp/calls.log" && pass "legacy rollback build preserves hosted mode before the forced pinned scan" || fail "legacy rollback build preserves hosted mode before the forced pinned scan"
+grep -Fq "pnpm-backend-env HTTP=unset WS=unset DEV=unset cmd=-C $tmp/checkout/apps/web run build" "$tmp/calls.log" && pass "legacy rollback build scrubs inherited backend env" || fail "legacy rollback build scrubs inherited backend env"
+grep -Fq "pnpm-env T3CODE_HOSTED_BUILD=1 cmd=-C $tmp/checkout run build:desktop" "$tmp/calls.log" && pass "legacy rollback desktop build preserves hosted mode" || fail "legacy rollback desktop build preserves hosted mode"
+grep -Fq "pnpm-backend-env HTTP=unset WS=unset DEV=unset cmd=-C $tmp/checkout run build:desktop" "$tmp/calls.log" && pass "legacy rollback desktop build scrubs inherited backend env" || fail "legacy rollback desktop build scrubs inherited backend env"
 grep -Fq "RESULT ROLLBACK-OK" "$tmp/ledger/"*/t3-daily-restart.result && pass "verify-restart failure rolls back loudly" || fail "verify-restart failure rolls back loudly"
 
 

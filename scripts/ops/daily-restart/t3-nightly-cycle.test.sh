@@ -103,6 +103,7 @@ printf '{"serverBuildSha":"%s"}\n' "${FAKE_DEPLOYED_SHA:-aaaaaaaaaaaaaaaaaaaaaaa
 SH
   cat >"$dir/node" <<'SH'
 #!/usr/bin/env bash
+echo "node $*" >>"$T_LOG"
 case "$*" in
   *"auth session issue"*)
     echo "mint-live-resume-token entry=${2:-missing}" >>"$T_LOG"
@@ -119,6 +120,8 @@ SH
   cat >"$dir/pnpm" <<'SH'
 #!/usr/bin/env bash
 [[ -n "${T3CODE_BUILD_SHA:-}" ]] && echo "pnpm-env T3CODE_BUILD_SHA=$T3CODE_BUILD_SHA cmd=$*" >>"$T_LOG"
+[[ -n "${T3CODE_HOSTED_BUILD:-}" ]] && echo "pnpm-env T3CODE_HOSTED_BUILD=$T3CODE_HOSTED_BUILD cmd=$*" >>"$T_LOG"
+echo "pnpm-backend-env HTTP=${VITE_HTTP_URL-unset} WS=${VITE_WS_URL-unset} DEV=${VITE_DEV_SERVER_URL-unset} cmd=$*" >>"$T_LOG"
 echo "pnpm $*" >>"$T_LOG"
 args=("$@")
 for ((i = 0; i < ${#args[@]}; i++)); do
@@ -230,16 +233,21 @@ assert_order() {
 }
 
 tmp="$(mktemp -d)"
+export VITE_HTTP_URL=//localhost:3773 VITE_WS_URL=//127.0.0.2:3773 VITE_DEV_SERVER_URL=http://localhost:5733
 run_cycle "$tmp"
+unset VITE_HTTP_URL VITE_WS_URL VITE_DEV_SERVER_URL
 stage="$tmp/ledger/$(date -u +%F)/prebuilt-stage/checkout"
 [[ "$(cat "$tmp/rc")" == "0" ]] && pass "happy path exits zero" || fail "happy path exits zero"
-assert_order "$tmp/calls.log" "backup" "sync" "git -C" "git -C $tmp/checkout worktree prune" "git -C $tmp/checkout worktree add --detach $stage" "pnpm -C $stage install --frozen-lockfile --prefer-offline" "pnpm -C $stage/apps/web run build:hosted" "pnpm -C $stage run build:desktop" "restart prebuilt=1"
+assert_order "$tmp/calls.log" "backup" "sync" "git -C" "git -C $tmp/checkout worktree prune" "git -C $tmp/checkout worktree add --detach $stage" "pnpm -C $stage install --frozen-lockfile --prefer-offline" "pnpm -C $stage/apps/web run build:hosted" "pnpm -C $stage run build:desktop" "assert-web-no-dev-endpoints.ts --force $stage/apps/web/dist" "restart prebuilt=1"
 grep -Fq "pnpm-env T3CODE_BUILD_SHA=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb cmd=-C $stage/apps/web run build:hosted" "$tmp/calls.log" \
   && pass "happy path stamps standalone web build" \
   || fail "happy path stamps standalone web build"
+grep -Fq "pnpm-backend-env HTTP=unset WS=unset DEV=unset cmd=-C $stage/apps/web run build:hosted" "$tmp/calls.log" && pass "staged hosted build scrubs inherited backend env" || fail "staged hosted build scrubs inherited backend env"
 grep -Fq "pnpm-env T3CODE_BUILD_SHA=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb cmd=-C $stage run build:desktop" "$tmp/calls.log" \
   && pass "happy path stamps desktop/server build" \
   || fail "happy path stamps desktop/server build"
+grep -Fq "pnpm-env T3CODE_HOSTED_BUILD=1 cmd=-C $stage run build:desktop" "$tmp/calls.log" && pass "desktop/server build preserves hosted mode" || fail "desktop/server build preserves hosted mode"
+grep -Fq "pnpm-backend-env HTTP=unset WS=unset DEV=unset cmd=-C $stage run build:desktop" "$tmp/calls.log" && pass "desktop/server build scrubs inherited backend env" || fail "desktop/server build scrubs inherited backend env"
 if grep -Fq "git -C $tmp/checkout merge --ff-only" "$tmp/calls.log" || grep -Fq "pnpm -C $tmp/checkout/apps/web run build:hosted" "$tmp/calls.log"; then
   fail "happy path leaves live checkout untouched before restart"
 else
@@ -328,7 +336,7 @@ if grep -Fq "git -C $tmp/checkout merge --ff-only" "$tmp/calls.log" || grep -Fq 
 else
   pass "prebuild failure leaves live checkout untouched"
 fi
-if grep -Fq "restart" "$tmp/calls.log"; then
+if grep -Fq "restart prebuilt=" "$tmp/calls.log"; then
   fail "build failure aborts before restart"
 else
   pass "build failure aborts before restart"
@@ -340,7 +348,7 @@ run_cycle "$tmp"
 unset FAKE_PREBUILT_ENV_AS_DIR_AFTER_BUILD
 [[ "$(cat "$tmp/rc")" != "0" ]] && pass "metadata write failure exits nonzero" || fail "metadata write failure exits nonzero"
 grep -Fq "failed to write restart metadata" "$tmp/ledger/"*/build-release-artifacts.log && pass "metadata write failure logged" || fail "metadata write failure logged"
-if grep -Fq "restart" "$tmp/calls.log"; then
+if grep -Fq "restart prebuilt=" "$tmp/calls.log"; then
   fail "metadata write failure aborts before restart"
 else
   pass "metadata write failure aborts before restart"
@@ -349,10 +357,11 @@ fi
 tmp="$(mktemp -d)"
 export FAKE_CHANGED_FILES=$'patches/foo.patch\napps/web/src/App.tsx'
 export FAKE_MV_NO_EXCHANGE=1
+export VITE_HTTP_URL=//localhost:3773 VITE_WS_URL=//127.0.0.2:3773 VITE_DEV_SERVER_URL=http://localhost:5733
 mkdir -p "$tmp/checkout/apps/web/dist"
 printf 'old-web\n' >"$tmp/checkout/apps/web/dist/index.html"
 run_cycle "$tmp"
-unset FAKE_CHANGED_FILES FAKE_MV_NO_EXCHANGE
+unset FAKE_CHANGED_FILES FAKE_MV_NO_EXCHANGE VITE_HTTP_URL VITE_WS_URL VITE_DEV_SERVER_URL
 stage="$tmp/ledger/$(date -u +%F)/prebuilt-stage/checkout"
 [[ "$(cat "$tmp/rc")" == "0" ]] && pass "dependency install input change falls back successfully" || fail "dependency install input change falls back successfully"
 grep -Fq "dependency manifests changed" "$tmp/ledger/"*/build-release-artifacts.log && pass "dependency install input change logged" || fail "dependency install input change logged"
@@ -361,6 +370,7 @@ assert_order "$tmp/calls.log" \
   "git -C $tmp/checkout worktree add --detach $stage" \
   "pnpm -C $stage install --frozen-lockfile --prefer-offline" \
   "pnpm -C $stage/apps/web run build:hosted" \
+  "assert-web-no-dev-endpoints.ts --force $stage/apps/web/dist" \
   "mint-live-resume-token" \
   "git -C $tmp/checkout merge --ff-only bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" \
   "pnpm -C $tmp/checkout install --frozen-lockfile --prefer-offline" \
@@ -375,6 +385,7 @@ grep -Fq "token=set token_session=minted-live-session" "$tmp/calls.log" \
 grep -Fq "pnpm-env T3CODE_BUILD_SHA=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb cmd=-C $stage/apps/web run build:hosted" "$tmp/calls.log" \
   && pass "live fallback stamps web build" \
   || fail "live fallback stamps web build"
+grep -Fq "pnpm-backend-env HTTP=unset WS=unset DEV=unset cmd=-C $stage/apps/web run build:hosted" "$tmp/calls.log" && pass "live fallback hosted build scrubs inherited backend env" || fail "live fallback hosted build scrubs inherited backend env"
 if grep -Fq "pnpm -C $tmp/checkout run build:desktop" "$tmp/calls.log"; then
   fail "live fallback overwrites server artifact before guarded restart"
 else
@@ -736,10 +747,16 @@ T3DR_BUILD_ALWAYS=invalid run_cycle "$tmp"
 grep -Fq "FAILURE step=configuration rc=2" "$tmp/ledger/"*/t3-nightly-cycle.alert && pass "invalid configuration alerts" || fail "invalid configuration alerts"
 
 tmp="$(mktemp -d)"
+export VITE_HTTP_URL=//localhost:3773 VITE_WS_URL=//127.0.0.2:3773 VITE_DEV_SERVER_URL=http://localhost:5733
 T3DR_DESKTOP_ARTIFACT=1 run_cycle "$tmp"
+unset VITE_HTTP_URL VITE_WS_URL VITE_DEV_SERVER_URL
 stage="$tmp/ledger/$(date -u +%F)/prebuilt-stage/checkout"
 [[ "$(cat "$tmp/rc")" == "0" ]] && pass "desktop artifact enabled exits zero" || fail "desktop artifact enabled exits zero"
-assert_order "$tmp/calls.log" "pnpm -C $stage/apps/web run build:hosted" "pnpm -C $stage run build:desktop" "pnpm -C $stage run dist:desktop:artifact" "restart prebuilt=1"
+assert_order "$tmp/calls.log" "pnpm -C $stage/apps/web run build:hosted" "pnpm -C $stage run build:desktop" "pnpm -C $stage run dist:desktop:artifact" "assert-web-no-dev-endpoints.ts --force $stage/apps/web/dist" "restart prebuilt=1"
+grep -Fq "pnpm-env T3CODE_HOSTED_BUILD=1 cmd=-C $stage run build:desktop" "$tmp/calls.log" && pass "desktop artifact build preserves hosted mode" || fail "desktop artifact build preserves hosted mode"
+grep -Fq "pnpm-backend-env HTTP=unset WS=unset DEV=unset cmd=-C $stage run build:desktop" "$tmp/calls.log" && pass "desktop artifact build scrubs inherited backend env" || fail "desktop artifact build scrubs inherited backend env"
+grep -Fq "pnpm-env T3CODE_HOSTED_BUILD=1 cmd=-C $stage run dist:desktop:artifact" "$tmp/calls.log" && pass "desktop artifact packaging preserves hosted mode" || fail "desktop artifact packaging preserves hosted mode"
+grep -Fq "pnpm-backend-env HTTP=unset WS=unset DEV=unset cmd=-C $stage run dist:desktop:artifact" "$tmp/calls.log" && pass "desktop artifact packaging scrubs inherited backend env" || fail "desktop artifact packaging scrubs inherited backend env"
 grep -Fq "desktop" "$tmp/ledger/$(date -u +%F)/desktop-artifact/artifact.txt" && pass "desktop artifact persists outside stage checkout" || fail "desktop artifact persists outside stage checkout"
 
 echo "$pass_count passed, $fail_count failed"

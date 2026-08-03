@@ -791,20 +791,23 @@ build_release_artifacts() {
     run_logged "$build_timeout" "$step_log" pnpm -C "$stage_checkout" install --frozen-lockfile --prefer-offline || rc=$?
   fi
   if [[ "$rc" -eq 0 && ( "$rollback_sha" != "$target_sha" || "$build_always" == "1" ) ]]; then
-    run_logged "$build_timeout" "$step_log" env T3CODE_BUILD_SHA="$target_sha" pnpm -C "$stage_checkout/apps/web" run build:hosted || rc=$?
+    run_logged "$build_timeout" "$step_log" env -u VITE_HTTP_URL -u VITE_WS_URL -u VITE_DEV_SERVER_URL T3CODE_BUILD_SHA="$target_sha" pnpm -C "$stage_checkout/apps/web" run build:hosted || rc=$?
   fi
   if [[ "$rc" -eq 0 && ( "$rollback_sha" != "$target_sha" || "$build_always" == "1" ) ]]; then
-    run_logged "$build_timeout" "$step_log" env T3CODE_BUILD_SHA="$target_sha" pnpm -C "$stage_checkout" run build:desktop || rc=$?
+    run_logged "$build_timeout" "$step_log" env -u VITE_HTTP_URL -u VITE_WS_URL -u VITE_DEV_SERVER_URL T3CODE_BUILD_SHA="$target_sha" T3CODE_HOSTED_BUILD=1 pnpm -C "$stage_checkout" run build:desktop || rc=$?
   fi
   if [[ "$rc" -eq 0 && ( "$rollback_sha" != "$target_sha" || "$build_always" == "1" ) ]]; then
     if [[ "$desktop_artifact" == "1" ]]; then
       mkdir -p "$desktop_artifact_dir" || rc=$?
       if [[ "$rc" -eq 0 ]]; then
-        run_logged "$build_timeout" "$step_log" env T3CODE_BUILD_SHA="$target_sha" T3CODE_DESKTOP_OUTPUT_DIR="$desktop_artifact_dir" pnpm -C "$stage_checkout" run dist:desktop:artifact || rc=$?
+        run_logged "$build_timeout" "$step_log" env -u VITE_HTTP_URL -u VITE_WS_URL -u VITE_DEV_SERVER_URL T3CODE_BUILD_SHA="$target_sha" T3CODE_HOSTED_BUILD=1 T3CODE_DESKTOP_OUTPUT_DIR="$desktop_artifact_dir" pnpm -C "$stage_checkout" run dist:desktop:artifact || rc=$?
       fi
     else
       printf '[%s] DESKTOP_ARTIFACT TODO no-op: set T3DR_DESKTOP_ARTIFACT=1 after T1 lands to run dist:desktop:artifact into %s\n' "$(date -u +%FT%TZ)" "$desktop_artifact_dir" >>"$step_log"
     fi
+  fi
+  if [[ "$rc" -eq 0 && ( "$rollback_sha" != "$target_sha" || "$build_always" == "1" ) ]]; then
+    run_logged 120 "$step_log" node "$script_dir/../../assert-web-no-dev-endpoints.ts" --force "$stage_checkout/apps/web/dist" || rc=$?
   fi
   if [[ "$rc" -eq 0 && ( "$rollback_sha" != "$target_sha" || "$build_always" == "1" ) ]]; then
     remove_path_under "$stage_root" "$stage_payload" || rc=$?
@@ -905,17 +908,20 @@ run_live_deploy_step() {
     run_logged "$build_timeout" "$step_log" pnpm -C "$stage_checkout" install --frozen-lockfile --prefer-offline || rc=$?
   fi
   if [[ "$rc" -eq 0 ]]; then
-    run_logged "$build_timeout" "$step_log" env T3CODE_BUILD_SHA="$live_deploy_target" pnpm -C "$stage_checkout/apps/web" run build:hosted || rc=$?
+    run_logged "$build_timeout" "$step_log" env -u VITE_HTTP_URL -u VITE_WS_URL -u VITE_DEV_SERVER_URL T3CODE_BUILD_SHA="$live_deploy_target" pnpm -C "$stage_checkout/apps/web" run build:hosted || rc=$?
   fi
   if [[ "$rc" -eq 0 ]]; then
     if [[ "$desktop_artifact" == "1" ]]; then
       mkdir -p "$desktop_artifact_dir" || rc=$?
       if [[ "$rc" -eq 0 ]]; then
-        run_logged "$build_timeout" "$step_log" env T3CODE_BUILD_SHA="$live_deploy_target" T3CODE_DESKTOP_OUTPUT_DIR="$desktop_artifact_dir" pnpm -C "$stage_checkout" run dist:desktop:artifact || rc=$?
+        run_logged "$build_timeout" "$step_log" env -u VITE_HTTP_URL -u VITE_WS_URL -u VITE_DEV_SERVER_URL T3CODE_BUILD_SHA="$live_deploy_target" T3CODE_HOSTED_BUILD=1 T3CODE_DESKTOP_OUTPUT_DIR="$desktop_artifact_dir" pnpm -C "$stage_checkout" run dist:desktop:artifact || rc=$?
       fi
     else
       printf '[%s] DESKTOP_ARTIFACT TODO no-op: set T3DR_DESKTOP_ARTIFACT=1 after T1 lands to run dist:desktop:artifact into %s\n' "$(date -u +%FT%TZ)" "$desktop_artifact_dir" >>"$step_log"
     fi
+  fi
+  if [[ "$rc" -eq 0 ]]; then
+    run_logged 120 "$step_log" node "$script_dir/../../assert-web-no-dev-endpoints.ts" --force "$stage_checkout/apps/web/dist" || rc=$?
   fi
   if [[ "$rc" -eq 0 ]]; then
     checkout_status="$(capture_logged 30 "$step_log" git -C "$checkout" status --porcelain)" || rc=$?

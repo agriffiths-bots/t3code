@@ -27,19 +27,19 @@ import { isHostedBuild } from "./lib/hosted-build.ts";
 /** Desktop dev backend ports that must never appear in a hosted bundle. */
 export const FORBIDDEN_DEV_PORTS: ReadonlyArray<number> = [15773];
 
-// Scheme + optional userinfo + host + explicit port. Userinfo is matched
-// greedily through the final @ so it cannot conceal the host, but is never
-// copied into findings. URL parsing below normalizes IPv4 shorthand/integer
-// spellings before the loopback classification.
+// Explicit or protocol-relative URL + optional userinfo + host + explicit port.
+// Userinfo is matched greedily through the final @ so it cannot conceal the
+// host, but is never copied into findings. URL parsing below normalizes IPv4
+// shorthand/integer spellings before loopback classification.
 function loopbackUrlRegex(): RegExp {
   const userinfo = "(?:[^\\s/?#'\"<>\\\\]*@)?";
   const host = "(\\[[^\\]\\s/?#'\"<>\\\\]+\\]|[^\\s:/?#'\"<>\\\\]+)";
-  return new RegExp(`(https?|wss?):\\/\\/${userinfo}${host}:(\\d+)`, "gi");
+  return new RegExp(`(?:(https?|wss?)://|(?<!:)//)${userinfo}${host}:(\\d+)`, "gi");
 }
 
 function isLoopbackUrlHost(scheme: string, host: string, port: string): boolean {
   try {
-    const parsedHost = new URL(`${scheme}://${host}:${port}`).hostname
+    const parsedHost = new URL(`${scheme || "http"}://${host}:${port}`).hostname
       .toLowerCase()
       .replace(/^\[|\]$/g, "")
       .replace(/\.$/, "");
@@ -89,7 +89,7 @@ export function scanTextForDevEndpoints(text: string): DevEndpointFinding[] {
     matchedUrlRanges.push({ start: urlMatch.index, end: urlMatch.index + full.length });
     findings.push({
       // Do not expose optional URL credentials in logs or review artifacts.
-      match: `${scheme}://${host}:${port}`,
+      match: scheme ? `${scheme}://${host}:${port}` : `//${host}:${port}`,
       index: urlMatch.index,
       reason: isWebSocket ? "loopback WebSocket backend URL" : "loopback backend URL",
     });

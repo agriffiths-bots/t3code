@@ -869,7 +869,7 @@ retry_legacy_unstamped_noop_restart() {
     run_capture 60 systemctl --user start "$service" || log "LEGACY_REBUILD failed to restart after rebuild failure"
     return 1
   fi
-  if ! run_capture 900 env T3CODE_BUILD_SHA="$target_sha" pnpm -C "$checkout" run build:desktop; then
+  if ! run_hosted_desktop_server_build "$target_sha"; then
     log "LEGACY_REBUILD deploy artifact rebuild failed"
     run_capture 60 systemctl --user start "$service" || log "LEGACY_REBUILD failed to restart after rebuild failure"
     return 1
@@ -897,12 +897,20 @@ run_compatible_web_build() {
     script="build:hosted"
   fi
 
-  run_capture 900 env T3CODE_BUILD_SHA="$build_sha" T3CODE_HOSTED_BUILD=1 \
+  run_capture 900 env -u VITE_HTTP_URL -u VITE_WS_URL -u VITE_DEV_SERVER_URL T3CODE_BUILD_SHA="$build_sha" T3CODE_HOSTED_BUILD=1 \
     pnpm -C "$checkout/apps/web" run "$script" || return 1
   if [[ "$script" == "build" ]]; then
     run_capture 120 node "$pinned_web_scanner" --force "$checkout/apps/web/dist"
   fi
 }
+run_hosted_desktop_server_build() {
+  local build_sha="$1"
+  run_capture 900 env -u VITE_HTTP_URL -u VITE_WS_URL -u VITE_DEV_SERVER_URL \
+    T3CODE_BUILD_SHA="$build_sha" T3CODE_HOSTED_BUILD=1 \
+    pnpm -C "$checkout" run build:desktop || return 1
+  run_capture 120 node "$pinned_web_scanner" --force "$checkout/apps/web/dist"
+}
+
 
 pin_web_scanner() {
   local source_scanner source_hosted pinned_dir temp_scanner temp_hosted
@@ -1127,7 +1135,7 @@ rollback() {
     record_result "ROLLBACK-FAILED"
     return 1
   }
-  run_capture 900 env T3CODE_BUILD_SHA="$pre_sha" pnpm -C "$checkout" run build:desktop || {
+  run_hosted_desktop_server_build "$pre_sha" || {
     log "ROLLBACK deploy artifact rebuild failed"
     record_result "ROLLBACK-FAILED"
     return 1
@@ -1183,7 +1191,7 @@ code_only_rollback() {
     record_result "CODE-ROLLBACK-FAILED"
     return 1
   }
-  run_capture 900 env T3CODE_BUILD_SHA="$pre_sha" pnpm -C "$checkout" run build:desktop || {
+  run_hosted_desktop_server_build "$pre_sha" || {
     log "CODE_ROLLBACK deploy artifact rebuild failed"
     record_result "CODE-ROLLBACK-FAILED"
     return 1
@@ -1468,11 +1476,11 @@ elif [[ "$pre_sha" != "$target_sha" ]]; then
     log "ff-only update failed"
     rollback "$run_dir/health-probe.after-update" || exit 1
   fi
-  if ! run_capture 900 env T3CODE_BUILD_SHA="$target_sha" pnpm -C "$checkout/apps/web" run build:hosted; then
+  if ! run_capture 900 env -u VITE_HTTP_URL -u VITE_WS_URL -u VITE_DEV_SERVER_URL T3CODE_BUILD_SHA="$target_sha" pnpm -C "$checkout/apps/web" run build:hosted; then
     log "web rebuild failed before restart"
     code_only_rollback "$run_dir/health-probe.after-web-build" || exit 1
   fi
-  if ! run_capture 900 env T3CODE_BUILD_SHA="$target_sha" pnpm -C "$checkout" run build:desktop; then
+  if ! run_hosted_desktop_server_build "$target_sha"; then
     log "deploy artifact build failed before restart"
     code_only_rollback "$run_dir/health-probe.after-deploy-build" || exit 1
   fi

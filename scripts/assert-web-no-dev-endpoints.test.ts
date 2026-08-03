@@ -23,6 +23,8 @@ it("flags the 2026-07-22 contamination in any chunk", () => {
 it("flags ported loopback backend URLs across schemes and host forms", () => {
   for (const url of [
     "https://localhost:3773/api",
+    "backend:http://localhost:3773/api",
+    "prefix:wss://127.0.0.2:3773/ws",
     "ws://localhost:15773/ws",
     "wss://127.0.0.1:15773/ws",
     "http://127.0.0.0:3773/api",
@@ -36,6 +38,9 @@ it("flags ported loopback backend URLs across schemes and host forms", () => {
     "http://[::1]:9229/foo",
     "http://0.0.0.0:8080/bar",
     "http://dev.localhost:8080/bar",
+    "//localhost:3773/api",
+    "//127.0.0.2:3773/api",
+    "//[::1]:8443/session",
   ]) {
     const findings = scanTextForDevEndpoints(`x=${JSON.stringify(url)}`);
     assert.isAtLeast(findings.length, 1, `expected a finding for ${url}`);
@@ -46,6 +51,7 @@ it("flags loopback URLs hidden behind userinfo without reporting credentials", (
   for (const url of [
     "http://user:pass@localhost:3773/api",
     "http://user:p@ss@localhost:3773/api",
+    "//user:p@ss@localhost:3773/api",
     "https://token@[::1]:8443/session",
   ]) {
     const findings = scanTextForDevEndpoints(`x=${JSON.stringify(url)}`);
@@ -141,6 +147,7 @@ it("scans every asset in a dist tree and reports contaminated files", async () =
 it("does not flag ported public backend URLs", () => {
   for (const url of [
     "https://example.com:3773/api",
+    "ftp://localhost:3773/api",
     "http://128.0.0.1:3773/api",
     "http://[::ffff:128.0.0.1]:3773/api",
     "http://127.example.com:3773/api",
