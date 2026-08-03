@@ -27,13 +27,38 @@ import { isHostedBuild } from "./lib/hosted-build.ts";
 /** Desktop dev backend ports that must never appear in a hosted bundle. */
 export const FORBIDDEN_DEV_PORTS: ReadonlyArray<number> = [15773];
 
-const LOOPBACK_HOST_PATTERN = "(?:127\\.0\\.0\\.1|0\\.0\\.0\\.0|localhost|\\[::1\\]|::1)";
-
-// Scheme + optional userinfo + loopback host (+ optional :port). Userinfo is
-// matched so it cannot conceal the host, but is never copied into findings.
+// Scheme + optional userinfo + host + explicit port. Userinfo is matched
+// greedily through the final @ so it cannot conceal the host, but is never
+// copied into findings. URL parsing below normalizes IPv4 shorthand/integer
+// spellings before the loopback classification.
 function loopbackUrlRegex(): RegExp {
   const userinfo = "(?:[^\\s/?#'\"<>\\\\]*@)?";
-  return new RegExp(`(https?|wss?):\\/\\/${userinfo}(${LOOPBACK_HOST_PATTERN})(?::(\\d+))?`, "gi");
+  const host = "(\\[[^\\]\\s/?#'\"<>\\\\]+\\]|[^\\s:/?#'\"<>\\\\]+)";
+  return new RegExp(`(https?|wss?):\\/\\/${userinfo}${host}:(\\d+)`, "gi");
+}
+
+function isLoopbackUrlHost(scheme: string, host: string, port: string): boolean {
+  try {
+    const parsedHost = new URL(`${scheme}://${host}:${port}`).hostname
+      .toLowerCase()
+      .replace(/^\[|\]$/g, "")
+      .replace(/\.$/, "");
+    if (
+      parsedHost === "localhost" ||
+      parsedHost.endsWith(".localhost") ||
+      parsedHost === "::1" ||
+      parsedHost === "0.0.0.0"
+    ) {
+      return true;
+    }
+    const mappedIpv4High = /^::ffff:([0-9a-f]{1,4}):[0-9a-f]{1,4}$/.exec(parsedHost)?.[1];
+    if (mappedIpv4High !== undefined && (Number.parseInt(mappedIpv4High, 16) & 0xff00) === 0x7f00) {
+      return true;
+    }
+    return /^\d+\.\d+\.\d+\.\d+$/.test(parsedHost) && parsedHost.split(".")[0] === "127";
+  } catch {
+    return false;
+  }
 }
 
 export interface DevEndpointFinding {
@@ -57,11 +82,7 @@ export function scanTextForDevEndpoints(text: string): DevEndpointFinding[] {
     const scheme = urlMatch[1] ?? "";
     const host = urlMatch[2] ?? "";
     const port = urlMatch[3];
-    // Only a loopback URL with an EXPLICIT PORT is a backend endpoint. Bare
-    // loopback origins (e.g. `http://localhost`, no port) are ubiquitous
-    // library defaults for URL base resolution and are never the contamination
-    // signal — the desktop/dev backend always carries a port (e.g. :15773).
-    if (!port) {
+    if (!isLoopbackUrlHost(scheme, host, port ?? "")) {
       continue;
     }
     const isWebSocket = scheme.toLowerCase().startsWith("ws");

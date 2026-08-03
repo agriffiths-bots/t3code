@@ -449,8 +449,8 @@ export FAKE_VERIFY_RESTART_RC=9
 run_manager "$tmp"
 unset FAKE_VERIFY_RESTART_RC
 [[ "$(cat "$tmp/rc")" != "0" ]] && pass "verify-restart failure exits nonzero" || fail "verify-restart failure exits nonzero"
-assert_order "$tmp/calls.log" "systemctl --user start fake.service" "verify-restart" "systemctl --user stop fake.service" "restore" "git -C $tmp/checkout checkout aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" "pnpm -C $tmp/checkout install --frozen-lockfile --prefer-offline" "pnpm -C $tmp/checkout/apps/web run build" "pnpm -C $tmp/checkout run build:desktop" "systemctl --user start fake.service" "health"
-grep -Fq "pnpm-env T3CODE_HOSTED_BUILD=1 cmd=-C $tmp/checkout/apps/web run build" "$tmp/calls.log" && pass "legacy rollback build retains hosted scanner enforcement" || fail "legacy rollback build retains hosted scanner enforcement"
+assert_order "$tmp/calls.log" "systemctl --user start fake.service" "verify-restart" "systemctl --user stop fake.service" "restore" "git -C $tmp/checkout checkout aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" "pnpm -C $tmp/checkout install --frozen-lockfile --prefer-offline" "pnpm -C $tmp/checkout/apps/web run build" "assert-web-no-dev-endpoints.ts --force $tmp/checkout/apps/web/dist" "pnpm -C $tmp/checkout run build:desktop" "systemctl --user start fake.service" "health"
+grep -Fq "pnpm-env T3CODE_HOSTED_BUILD=1 cmd=-C $tmp/checkout/apps/web run build" "$tmp/calls.log" && pass "legacy rollback build preserves hosted mode before the forced pinned scan" || fail "legacy rollback build preserves hosted mode before the forced pinned scan"
 grep -Fq "RESULT ROLLBACK-OK" "$tmp/ledger/"*/t3-daily-restart.result && pass "verify-restart failure rolls back loudly" || fail "verify-restart failure rolls back loudly"
 
 
@@ -812,8 +812,8 @@ export FAKE_VERIFY_RESTART_LEGACY_SHA_ONCE=1
 run_manager "$tmp"
 unset FAKE_PRE_SHA FAKE_TARGET_SHA FAKE_VERIFY_RESTART_LEGACY_SHA_ONCE
 [[ "$(cat "$tmp/rc")" == "0" ]] && pass "same-sha legacy unstamped rebuild exits zero" || fail "same-sha legacy unstamped rebuild exits zero"
-assert_order "$tmp/calls.log" "systemctl --user start fake.service" "verify-restart" "systemctl --user stop fake.service" "pnpm -C $tmp/checkout/apps/web run build:hosted" "pnpm -C $tmp/checkout run build:desktop" "systemctl --user start fake.service" "verify-restart" "health"
-grep -Fq "pnpm-env T3CODE_BUILD_SHA=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb cmd=-C $tmp/checkout/apps/web run build:hosted" "$tmp/calls.log" \
+assert_order "$tmp/calls.log" "systemctl --user start fake.service" "verify-restart" "systemctl --user stop fake.service" "pnpm -C $tmp/checkout/apps/web run build" "assert-web-no-dev-endpoints.ts --force $tmp/checkout/apps/web/dist" "pnpm -C $tmp/checkout run build:desktop" "systemctl --user start fake.service" "verify-restart" "health"
+grep -Fq "pnpm-env T3CODE_BUILD_SHA=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb cmd=-C $tmp/checkout/apps/web run build" "$tmp/calls.log" \
   && pass "same-sha legacy unstamped rebuild stamps web target sha" \
   || fail "same-sha legacy unstamped rebuild stamps web target sha"
 grep -Fq "pnpm-env T3CODE_BUILD_SHA=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb cmd=-C $tmp/checkout run build:desktop" "$tmp/calls.log" \

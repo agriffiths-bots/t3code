@@ -25,8 +25,17 @@ it("flags ported loopback backend URLs across schemes and host forms", () => {
     "https://localhost:3773/api",
     "ws://localhost:15773/ws",
     "wss://127.0.0.1:15773/ws",
+    "http://127.0.0.0:3773/api",
+    "http://127.0.0.2:3773/api",
+    "ws://127.1.2.3:3773/ws",
+    "http://127.255.255.255:3773/api",
+    "http://127.1:3773/api",
+    "http://2130706433:3773/api",
+    "http://[::ffff:127.0.0.1]:3773/api",
+    "ws://[::ffff:127.255.255.255]:3773/ws",
     "http://[::1]:9229/foo",
     "http://0.0.0.0:8080/bar",
+    "http://dev.localhost:8080/bar",
   ]) {
     const findings = scanTextForDevEndpoints(`x=${JSON.stringify(url)}`);
     assert.isAtLeast(findings.length, 1, `expected a finding for ${url}`);
@@ -126,5 +135,16 @@ it("scans every asset in a dist tree and reports contaminated files", async () =
     assert.isTrue(results[0]!.file.endsWith("textarea-BAD.js"));
   } finally {
     await NodeFSP.rm(dir, { recursive: true, force: true });
+  }
+});
+
+it("does not flag ported public backend URLs", () => {
+  for (const url of [
+    "https://example.com:3773/api",
+    "http://128.0.0.1:3773/api",
+    "http://[::ffff:128.0.0.1]:3773/api",
+    "http://127.example.com:3773/api",
+  ]) {
+    assert.deepEqual(scanTextForDevEndpoints(url), []);
   }
 });
