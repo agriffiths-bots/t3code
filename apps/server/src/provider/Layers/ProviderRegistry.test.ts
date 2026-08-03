@@ -31,7 +31,11 @@ import { createModelCapabilities } from "@t3tools/shared/model";
 import { applyServerSettingsPatch } from "@t3tools/shared/serverSettings";
 
 import { checkCodexProviderStatus, type CodexAppServerProviderSnapshot } from "./CodexProvider.ts";
-import { checkClaudeProviderStatus, getClaudeModelCapabilities } from "./ClaudeProvider.ts";
+import {
+  checkClaudeProviderStatus,
+  getClaudeModelCapabilities,
+  makePendingClaudeProvider,
+} from "./ClaudeProvider.ts";
 import * as OpenCodeRuntime from "../opencodeRuntime.ts";
 import * as ProviderEventLoggers from "./ProviderEventLoggers.ts";
 import { ProviderInstanceRegistryHydrationLive } from "./ProviderInstanceRegistryHydration.ts";
@@ -1596,6 +1600,24 @@ it.layer(Layer.mergeAll(NodeServices.layer, ServerSettingsModule.layerTest(), Te
             }),
           ),
         ),
+      );
+
+      it.effect("keeps version-gated Claude models out of pending snapshots", () =>
+        Effect.gen(function* () {
+          const status = yield* makePendingClaudeProvider(defaultClaudeSettings);
+          assert.strictEqual(
+            status.models.some((model) => model.slug === "claude-opus-5"),
+            false,
+          );
+          assert.strictEqual(
+            status.models.some((model) => model.slug === "claude-fable-5"),
+            false,
+          );
+          assert.strictEqual(
+            status.models.some((model) => model.slug === "claude-opus-4-7"),
+            false,
+          );
+        }),
       );
 
       it.effect("includes Claude Opus 5 on supported Claude Code versions", () =>

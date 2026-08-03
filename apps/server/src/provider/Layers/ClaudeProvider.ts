@@ -49,7 +49,6 @@ const CLAUDE_PRESENTATION = {
 } as const;
 const MINIMUM_CLAUDE_OPUS_5_VERSION = "2.1.219";
 const MINIMUM_CLAUDE_FABLE_5_VERSION = "2.1.169";
-const MINIMUM_CLAUDE_OPUS_4_8_VERSION = "2.1.154";
 const MINIMUM_CLAUDE_OPUS_4_7_VERSION = "2.1.111";
 
 const CLAUDE_OPUS_CAPABILITIES = createModelCapabilities({
@@ -279,10 +278,6 @@ function supportsClaudeFable5(version: string | null | undefined): boolean {
   return version ? compareSemverVersions(version, MINIMUM_CLAUDE_FABLE_5_VERSION) >= 0 : false;
 }
 
-function supportsClaudeOpus48(version: string | null | undefined): boolean {
-  return version ? compareSemverVersions(version, MINIMUM_CLAUDE_OPUS_4_8_VERSION) >= 0 : false;
-}
-
 function supportsClaudeOpus47(version: string | null | undefined): boolean {
   return version ? compareSemverVersions(version, MINIMUM_CLAUDE_OPUS_4_7_VERSION) >= 0 : false;
 }
@@ -296,9 +291,6 @@ function getBuiltInClaudeModelsForVersion(
     }
     if (model.slug === "claude-fable-5") {
       return supportsClaudeFable5(version);
-    }
-    if (model.slug === "claude-opus-4-8") {
-      return supportsClaudeOpus48(version);
     }
     if (model.slug === "claude-opus-4-7") {
       return supportsClaudeOpus47(version);
@@ -315,11 +307,6 @@ function formatClaudeOpus5UpgradeMessage(version: string | null): string {
 function formatClaudeFable5UpgradeMessage(version: string | null): string {
   const versionLabel = version ? `v${version}` : "the installed version";
   return `Claude Code ${versionLabel} is too old for Claude Fable 5. Upgrade to v${MINIMUM_CLAUDE_FABLE_5_VERSION} or newer to access it.`;
-}
-
-function formatClaudeOpus48UpgradeMessage(version: string | null): string {
-  const versionLabel = version ? `v${version}` : "the installed version";
-  return `Claude Code ${versionLabel} is too old for Claude Opus 4.8. Upgrade to v${MINIMUM_CLAUDE_OPUS_4_8_VERSION} or newer to access it.`;
 }
 
 function formatClaudeOpus47UpgradeMessage(version: string | null): string {
@@ -725,7 +712,7 @@ export const checkClaudeProviderStatus = Effect.fn("checkClaudeProviderStatus")(
   const resolvedEnvironment = environment ?? process.env;
   const checkedAt = DateTime.formatIso(yield* DateTime.now);
   const allModels = providerModelsFromSettings(
-    BUILT_IN_MODELS,
+    getBuiltInClaudeModelsForVersion(null),
     claudeSettings.customModels,
     DEFAULT_CLAUDE_MODEL_CAPABILITIES,
   );
@@ -823,11 +810,9 @@ export const checkClaudeProviderStatus = Effect.fn("checkClaudeProviderStatus")(
     ? undefined
     : supportsClaudeFable5(parsedVersion)
       ? formatClaudeOpus5UpgradeMessage(parsedVersion)
-      : supportsClaudeOpus48(parsedVersion)
+      : supportsClaudeOpus47(parsedVersion)
         ? formatClaudeFable5UpgradeMessage(parsedVersion)
-        : supportsClaudeOpus47(parsedVersion)
-          ? formatClaudeOpus48UpgradeMessage(parsedVersion)
-          : formatClaudeOpus47UpgradeMessage(parsedVersion);
+        : formatClaudeOpus47UpgradeMessage(parsedVersion);
 
   const capabilities = resolveCapabilities
     ? yield* resolveCapabilities(claudeSettings).pipe(Effect.orElseSucceed(() => undefined))
@@ -885,7 +870,7 @@ export const makePendingClaudeProvider = (
   Effect.gen(function* () {
     const checkedAt = yield* nowIso;
     const models = providerModelsFromSettings(
-      BUILT_IN_MODELS,
+      getBuiltInClaudeModelsForVersion(null),
       claudeSettings.customModels,
       DEFAULT_CLAUDE_MODEL_CAPABILITIES,
     );

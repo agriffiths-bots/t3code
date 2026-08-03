@@ -53,7 +53,10 @@ import {
 } from "../providerStatusCache.ts";
 import type { ProviderInstance } from "../ProviderDriver.ts";
 import { makeManualOnlyProviderMaintenanceCapabilities } from "../providerMaintenance.ts";
-import type { ProviderSnapshotSource } from "../builtInProviderCatalog.ts";
+import {
+  isRetiredBuiltInProviderModel,
+  type ProviderSnapshotSource,
+} from "../builtInProviderCatalog.ts";
 
 const loadProviders = (
   providerSources: ReadonlyArray<ProviderSnapshotSource>,
@@ -80,26 +83,17 @@ const hasModelCapabilities = (model: ServerProvider["models"][number]): boolean 
 
 const CLAUDE_DRIVER_KIND = ProviderDriverKind.make("claudeAgent");
 
-const RETIRED_BUILT_IN_MODEL_SLUGS_BY_DRIVER: Readonly<Record<string, ReadonlySet<string>>> = {
-  [CLAUDE_DRIVER_KIND]: new Set(["claude-opus-4-8"]),
-};
-
-const isRetiredBuiltInModel = (
-  driver: ProviderDriverKind,
-  model: ServerProvider["models"][number],
-): boolean =>
-  model.isCustom === false &&
-  (RETIRED_BUILT_IN_MODEL_SLUGS_BY_DRIVER[driver]?.has(model.slug) ?? false);
-
 const mergeProviderModels = (
   driver: ProviderDriverKind,
   previousModels: ReadonlyArray<ServerProvider["models"][number]>,
   nextModels: ReadonlyArray<ServerProvider["models"][number]>,
 ): ReadonlyArray<ServerProvider["models"][number]> => {
   const retainedPreviousModels = previousModels.filter(
-    (model) => !isRetiredBuiltInModel(driver, model),
+    (model) => !isRetiredBuiltInProviderModel(driver, model),
   );
-  const activeNextModels = nextModels.filter((model) => !isRetiredBuiltInModel(driver, model));
+  const activeNextModels = nextModels.filter(
+    (model) => !isRetiredBuiltInProviderModel(driver, model),
+  );
 
   if (nextModels.length === 0 && retainedPreviousModels.length > 0) {
     return retainedPreviousModels;
