@@ -78,16 +78,35 @@ const makeManualProviderMaintenanceCapabilities = (provider: ProviderDriverKind)
 const hasModelCapabilities = (model: ServerProvider["models"][number]): boolean =>
   (model.capabilities?.optionDescriptors?.length ?? 0) > 0;
 
+const RETIRED_BUILT_IN_MODEL_SLUGS_BY_DRIVER: Readonly<Record<string, ReadonlySet<string>>> = {
+  claudeAgent: new Set(["claude-opus-4-8"]),
+};
+
+const isRetiredBuiltInModel = (
+  driver: ProviderDriverKind,
+  model: ServerProvider["models"][number],
+): boolean =>
+  model.isCustom === false &&
+  (RETIRED_BUILT_IN_MODEL_SLUGS_BY_DRIVER[driver]?.has(model.slug) ?? false);
+
 const mergeProviderModels = (
+  driver: ProviderDriverKind,
   previousModels: ReadonlyArray<ServerProvider["models"][number]>,
   nextModels: ReadonlyArray<ServerProvider["models"][number]>,
 ): ReadonlyArray<ServerProvider["models"][number]> => {
-  if (nextModels.length === 0 && previousModels.length > 0) {
-    return previousModels;
+  const retainedPreviousModels = previousModels.filter(
+    (model) => !isRetiredBuiltInModel(driver, model),
+  );
+  const activeNextModels = nextModels.filter((model) => !isRetiredBuiltInModel(driver, model));
+
+  if (activeNextModels.length === 0 && retainedPreviousModels.length > 0) {
+    return retainedPreviousModels;
   }
 
-  const previousBySlug = new Map(previousModels.map((model) => [model.slug, model] as const));
-  const mergedModels = nextModels.map((model) => {
+  const previousBySlug = new Map(
+    retainedPreviousModels.map((model) => [model.slug, model] as const),
+  );
+  const mergedModels = activeNextModels.map((model) => {
     const previousModel = previousBySlug.get(model.slug);
     if (!previousModel || hasModelCapabilities(model) || !hasModelCapabilities(previousModel)) {
       return model;
@@ -97,8 +116,8 @@ const mergeProviderModels = (
       capabilities: previousModel.capabilities,
     };
   });
-  const nextSlugs = new Set(nextModels.map((model) => model.slug));
-  return [...mergedModels, ...previousModels.filter((model) => !nextSlugs.has(model.slug))];
+  const nextSlugs = new Set(activeNextModels.map((model) => model.slug));
+  return [...mergedModels, ...retainedPreviousModels.filter((model) => !nextSlugs.has(model.slug))];
 };
 
 export const mergeProviderSnapshot = (
@@ -109,7 +128,11 @@ export const mergeProviderSnapshot = (
     ? nextProvider
     : {
         ...nextProvider,
-        models: mergeProviderModels(previousProvider.models, nextProvider.models),
+        models: mergeProviderModels(
+          nextProvider.driver,
+          previousProvider.models,
+          nextProvider.models,
+        ),
       };
 
 export const mergeProviderSnapshots = (
