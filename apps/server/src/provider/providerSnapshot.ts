@@ -142,9 +142,13 @@ export function providerModelsFromSettings(
   builtInModels: ReadonlyArray<ServerProviderModel>,
   customModels: ReadonlyArray<string>,
   customModelCapabilities: ModelCapabilities,
+  reservedSlugs?: ReadonlySet<string>,
 ): ReadonlyArray<ServerProviderModel> {
   const resolvedBuiltInModels = [...builtInModels];
-  const seen = new Set(resolvedBuiltInModels.map((model) => model.slug));
+  const seen = new Set([
+    ...resolvedBuiltInModels.map((model) => model.slug),
+    ...(reservedSlugs ?? []),
+  ]);
   const customEntries: ServerProviderModel[] = [];
 
   for (const candidate of customModels) {

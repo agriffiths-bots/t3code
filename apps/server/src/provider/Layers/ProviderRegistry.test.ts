@@ -1676,7 +1676,10 @@ it.layer(Layer.mergeAll(NodeServices.layer, ServerSettingsModule.layerTest(), Te
 
       it.effect("keeps version-gated Claude models out of pending snapshots", () =>
         Effect.gen(function* () {
-          const status = yield* makePendingClaudeProvider(defaultClaudeSettings);
+          const status = yield* makePendingClaudeProvider({
+            ...defaultClaudeSettings,
+            customModels: ["claude-opus-5", "claude-opus-4-8", "my-custom-model"],
+          });
           assert.strictEqual(
             status.models.some((model) => model.slug === "claude-opus-5"),
             false,
@@ -1688,6 +1691,14 @@ it.layer(Layer.mergeAll(NodeServices.layer, ServerSettingsModule.layerTest(), Te
           assert.strictEqual(
             status.models.some((model) => model.slug === "claude-opus-4-7"),
             false,
+          );
+          assert.strictEqual(
+            status.models.some((model) => model.slug === "claude-opus-4-8"),
+            false,
+          );
+          assert.strictEqual(
+            status.models.some((model) => model.slug === "my-custom-model"),
+            true,
           );
         }),
       );
@@ -1822,12 +1833,23 @@ it.layer(Layer.mergeAll(NodeServices.layer, ServerSettingsModule.layerTest(), Te
       it.effect("hides Claude Opus 5 on older Claude Code versions", () =>
         Effect.gen(function* () {
           const status = yield* checkClaudeProviderStatus(
-            defaultClaudeSettings,
+            {
+              ...defaultClaudeSettings,
+              customModels: ["claude-opus-5", "claude-opus-4-8", "my-custom-model"],
+            },
             claudeCapabilities(),
           );
           assert.strictEqual(
             status.models.some((model) => model.slug === "claude-opus-5"),
             false,
+          );
+          assert.strictEqual(
+            status.models.some((model) => model.slug === "claude-opus-4-8"),
+            false,
+          );
+          assert.strictEqual(
+            status.models.some((model) => model.slug === "my-custom-model"),
+            true,
           );
           assert.strictEqual(
             status.message,

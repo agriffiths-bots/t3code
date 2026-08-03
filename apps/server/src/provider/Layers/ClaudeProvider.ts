@@ -270,6 +270,10 @@ const BUILT_IN_MODELS: ReadonlyArray<ServerProviderModel> = [
     }),
   },
 ];
+const RESERVED_CLAUDE_MODEL_SLUGS = new Set([
+  ...BUILT_IN_MODELS.map((model) => model.slug),
+  "claude-opus-4-8",
+]);
 
 function supportsClaudeOpus5(version: string | null | undefined): boolean {
   return version ? compareSemverVersions(version, MINIMUM_CLAUDE_OPUS_5_VERSION) >= 0 : false;
@@ -298,6 +302,18 @@ function getBuiltInClaudeModelsForVersion(
     }
     return true;
   });
+}
+
+function providerClaudeModelsFromSettings(
+  version: string | null | undefined,
+  customModels: ReadonlyArray<string>,
+): ReadonlyArray<ServerProviderModel> {
+  return providerModelsFromSettings(
+    getBuiltInClaudeModelsForVersion(version),
+    customModels,
+    DEFAULT_CLAUDE_MODEL_CAPABILITIES,
+    RESERVED_CLAUDE_MODEL_SLUGS,
+  );
 }
 
 function isVersionGatedClaudeBuiltInModel(model: ServerProviderModel): boolean {
@@ -754,11 +770,7 @@ export const checkClaudeProviderStatus = Effect.fn("checkClaudeProviderStatus")(
 > {
   const resolvedEnvironment = environment ?? process.env;
   const checkedAt = DateTime.formatIso(yield* DateTime.now);
-  const allModels = providerModelsFromSettings(
-    getBuiltInClaudeModelsForVersion(null),
-    claudeSettings.customModels,
-    DEFAULT_CLAUDE_MODEL_CAPABILITIES,
-  );
+  const allModels = providerClaudeModelsFromSettings(null, claudeSettings.customModels);
 
   if (!claudeSettings.enabled) {
     return buildServerProvider({
@@ -823,10 +835,9 @@ export const checkClaudeProviderStatus = Effect.fn("checkClaudeProviderStatus")(
 
   const version = versionProbe.success.value;
   const parsedVersion = parseGenericCliVersion(`${version.stdout}\n${version.stderr}`);
-  const versionedModels = providerModelsFromSettings(
-    getBuiltInClaudeModelsForVersion(parsedVersion),
+  const versionedModels = providerClaudeModelsFromSettings(
+    parsedVersion,
     claudeSettings.customModels,
-    DEFAULT_CLAUDE_MODEL_CAPABILITIES,
   );
   if (version.code !== 0) {
     yield* Effect.logWarning("Claude Agent CLI version probe exited with a non-zero status.", {
@@ -913,11 +924,7 @@ export const makePendingClaudeProvider = (
 ): Effect.Effect<ServerProviderDraft> =>
   Effect.gen(function* () {
     const checkedAt = yield* nowIso;
-    const models = providerModelsFromSettings(
-      getBuiltInClaudeModelsForVersion(null),
-      claudeSettings.customModels,
-      DEFAULT_CLAUDE_MODEL_CAPABILITIES,
-    );
+    const models = providerClaudeModelsFromSettings(null, claudeSettings.customModels);
 
     if (!claudeSettings.enabled) {
       return buildServerProvider({
