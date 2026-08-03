@@ -31,7 +31,7 @@ import { createModelCapabilities } from "@t3tools/shared/model";
 import { applyServerSettingsPatch } from "@t3tools/shared/serverSettings";
 
 import { checkCodexProviderStatus, type CodexAppServerProviderSnapshot } from "./CodexProvider.ts";
-import { checkClaudeProviderStatus } from "./ClaudeProvider.ts";
+import { checkClaudeProviderStatus, getClaudeModelCapabilities } from "./ClaudeProvider.ts";
 import * as OpenCodeRuntime from "../opencodeRuntime.ts";
 import * as ProviderEventLoggers from "./ProviderEventLoggers.ts";
 import { ProviderInstanceRegistryHydrationLive } from "./ProviderInstanceRegistryHydration.ts";
@@ -1541,10 +1541,23 @@ it.layer(Layer.mergeAll(NodeServices.layer, ServerSettingsModule.layerTest(), Te
             claudeCapabilities(),
           );
           const opus5 = status.models.find((model) => model.slug === "claude-opus-5");
+          if (!opus5?.capabilities) {
+            assert.fail("Expected Claude Opus 5 capabilities on supported Claude Code versions.");
+          }
           assert.strictEqual(opus5?.name, "Claude Opus 5");
+          assert.deepStrictEqual(
+            opus5.capabilities.optionDescriptors?.map((descriptor) => descriptor.id),
+            ["effort", "fastMode"],
+          );
           assert.strictEqual(
             status.models.some((model) => model.slug === "claude-opus-4-8"),
             false,
+          );
+          assert.deepStrictEqual(
+            getClaudeModelCapabilities("claude-opus-4-8").optionDescriptors?.map(
+              (descriptor) => descriptor.id,
+            ),
+            ["effort", "fastMode"],
           );
         }).pipe(
           Effect.provide(

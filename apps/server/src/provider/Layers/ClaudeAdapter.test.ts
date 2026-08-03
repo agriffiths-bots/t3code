@@ -1458,7 +1458,7 @@ describe("ClaudeAdapterLive", () => {
       const adapter = yield* ClaudeAdapter;
       const requestedModel = createModelSelection(
         ProviderInstanceId.make("claudeAgent"),
-        "claude-fable-5",
+        "claude-opus-5",
       );
       const runtimeEventsFiber = yield* Stream.takeUntil(
         adapter.streamEvents,

@@ -578,7 +578,7 @@ describe("model slug normalization", () => {
 
     expect(normalizeModelSlug("opus", claude)).toBe("claude-opus-5");
     expect(normalizeModelSlug("opus-4.8", claude)).toBe("claude-opus-5");
-    expect(normalizeModelSlug("claude-opus-4-8", claude)).toBe("claude-opus-5");
+    expect(normalizeModelSlug("claude-opus-4-8", claude)).toBe("claude-opus-4-8");
     expect(normalizeCustomModelSlug(" opus ")).toBe("opus");
   });
 });
