@@ -35,11 +35,15 @@ function isTruthyFlag(value: string | undefined): boolean {
 
 /**
  * True when this build is a hosted (server-served, origin-relative) web build.
- * Signalled explicitly by `T3CODE_HOSTED_BUILD=1` so desktop/dev builds — which
- * legitimately pin a loopback backend — are never affected.
+ * Signalled explicitly by `T3CODE_HOSTED_BUILD=1` or by the dedicated
+ * `build:hosted` package entrypoint. The latter makes in-repo release callers
+ * fail closed without relying on each caller to remember an environment flag.
+ * Desktop/dev builds, which legitimately pin a loopback backend, are unaffected.
  */
 export function isHostedBuild(env: Environment): boolean {
-  return isTruthyFlag(env.T3CODE_HOSTED_BUILD);
+  return (
+    isTruthyFlag(env.T3CODE_HOSTED_BUILD) || env.npm_lifecycle_event?.trim() === "build:hosted"
+  );
 }
 
 /**

@@ -24,6 +24,10 @@ rollback_sha="${T3DR_ROLLBACK_SHA:-}"
 target_sha_override="${T3DR_TARGET_SHA:-}"
 prebuilt_assets_dir="${T3DR_PREBUILT_ASSETS_DIR:-}"
 pinned_health_probe_source="${T3DR_PINNED_HEALTH_PROBE:-}"
+static_dir="${T3DR_STATIC_DIR:-}"
+service_config_dir="${T3DR_SERVICE_CONFIG_DIR:-$HOME/.config/systemd/user}"
+static_release_root=""
+static_previous_target=""
 resume_token_revoke_deferred="${T3DR_DEFER_RESUME_TOKEN_REVOKE:-0}"
 # capability: live-rollback-v1
 
@@ -36,6 +40,7 @@ usage: t3-daily-restart [--db PATH] [--checkout PATH] [--service NAME]
                         [--smoke-instance INSTANCE] [--smoke-model MODEL]
                         [--rollback-sha SHA] [--target-sha SHA]
                         [--prebuilt-target]
+                        [--static-dir PATH]
 USAGE
 }
 
@@ -61,6 +66,7 @@ while [[ $# -gt 0 ]]; do
     --smoke-instance) require_value "$@"; smoke_instance="$2"; shift 2 ;;
     --smoke-model) require_value "$@"; smoke_model="$2"; shift 2 ;;
     --prebuilt-target) prebuilt_target=1; shift ;;
+    --static-dir) require_value "$@"; static_dir="$2"; shift 2 ;;
     --rollback-sha) require_value "$@"; rollback_sha="$2"; shift 2 ;;
     --target-sha) require_value "$@"; target_sha_override="$2"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
@@ -129,6 +135,29 @@ fi
 if [[ "$prebuilt_target" == "1" && ( -z "$prebuilt_assets_dir" || ! -d "$prebuilt_assets_dir" ) ]]; then
   echo "t3-daily-restart: T3DR_PREBUILT_ASSETS_DIR is required with --prebuilt-target" >&2
   exit 2
+fi
+if [[ -n "$static_dir" ]]; then
+  if [[ ! "$static_dir" =~ ^/[A-Za-z0-9._/@:+-]+$ || ! -L "$static_dir" ]]; then
+    echo "t3-daily-restart: --static-dir must be a safe absolute release symlink" >&2
+    exit 2
+  fi
+  static_release_root="$(dirname -- "$static_dir")"
+  static_previous_target="$(readlink -f -- "$static_dir")" || {
+    echo "t3-daily-restart: --static-dir does not resolve to a release" >&2
+    exit 2
+  }
+  case "$static_previous_target" in
+    "$static_release_root"/*) ;;
+    *) echo "t3-daily-restart: --static-dir target must stay under its release root" >&2; exit 2 ;;
+  esac
+  if [[ ! -f "$static_previous_target/index.html" ]]; then
+    echo "t3-daily-restart: --static-dir target must contain index.html: $static_previous_target" >&2
+    exit 2
+  fi
+  if [[ ! "$service" =~ ^[A-Za-z0-9_.@:-]+\.service$ ]]; then
+    echo "t3-daily-restart: --service must be an explicit safe .service unit with --static-dir" >&2
+    exit 2
+  fi
 fi
 if [[ "$prebuilt_target" == "0" && -n "$rollback_sha" &&
   -z "${T3DR_TOKEN:-}" && -z "${T3_TOKEN:-}" ]]; then
@@ -226,6 +255,115 @@ run_output() {
   shift
   log "RUN_CAPTURE timeout=$timeout_secs $*"
   timeout "$timeout_secs" "$@" 2>>"$log_file"
+}
+
+configure_static_release() {
+  [[ -n "$static_dir" ]] || return 0
+  local current_target
+  current_target="$(readlink -f -- "$static_dir")" || return 1
+  if [[ "$current_target" != "$static_previous_target" || ! -f "$current_target/index.html" ]]; then
+    log "configured static release disappeared before restart: $static_dir"
+    return 1
+  fi
+
+  local override_dir="$service_config_dir/${service}.d"
+  local override_file="$override_dir/20-t3dr-static-release.conf"
+  local temp_file="$override_file.tmp.$$"
+  mkdir -p "$override_dir" || return 1
+  {
+    printf '[Service]\n'
+    printf 'Environment=T3CODE_STATIC_DIR=%s\n' "$static_dir"
+  } >"$temp_file" || {
+    rm -f -- "$temp_file"
+    return 1
+  }
+  chmod 600 "$temp_file" || {
+    rm -f -- "$temp_file"
+    return 1
+  }
+  mv -fT -- "$temp_file" "$override_file" || {
+    rm -f -- "$temp_file"
+    return 1
+  }
+  run_capture 60 systemctl --user daemon-reload || return 1
+  log "configured $service to serve immutable web statics from $static_dir"
+}
+
+validate_web_release_identity() {
+  local release_dir="$1" expected_sha="$2" actual_sha
+  [[ -f "$release_dir/index.html" ]] || return 1
+  actual_sha="$(node -e '
+    try { process.stdout.write(String(require(process.argv[1]).buildSha ?? "")); } catch {}
+  ' "$release_dir/build-identity.json" 2>/dev/null)"
+  [[ "$actual_sha" == "$expected_sha" ]] || {
+    log "static release identity mismatch: actual=${actual_sha:-missing} expected=$expected_sha dir=$release_dir"
+    return 1
+  }
+}
+
+point_static_release() {
+  local release_dir="$1" temp_link="$static_dir.tmp.$$"
+  rm -f -- "$temp_link" && ln -s -- "$release_dir" "$temp_link" \
+    && mv -fT -- "$temp_link" "$static_dir" || {
+    rm -f -- "$temp_link"
+    return 1
+  }
+}
+
+publish_static_release() {
+  local build_sha="$1" source_dir="$checkout/apps/web/dist"
+  local release_parent release_dir current_target previous_temp
+  [[ -n "$static_dir" ]] || return 0
+  validate_web_release_identity "$source_dir" "$build_sha" || {
+    log "refusing to publish invalid static source for $build_sha"
+    return 1
+  }
+  release_parent="$(mktemp -d "$static_release_root/.t3dr-${build_sha:0:12}.XXXXXX")" || return 1
+  release_dir="$release_parent/dist"
+  mkdir -p "$release_dir" && cp -a "$source_dir/." "$release_dir/" \
+    && validate_web_release_identity "$release_dir" "$build_sha" || {
+    log "copied static release failed identity validation: $release_dir"
+    return 1
+  }
+  run_capture 120 node "$script_dir/../../assert-web-no-dev-endpoints.ts" --force "$release_dir" || {
+    log "copied static release failed dev-endpoint scan: $release_dir"
+    return 1
+  }
+  chmod -R a-w -- "$release_parent" || return 1
+  current_target="$(readlink -f -- "$static_dir")" || return 1
+  [[ "$current_target" == "$static_previous_target" ]] || {
+    log "static release pointer changed concurrently: expected=$static_previous_target actual=$current_target"
+    return 1
+  }
+  previous_temp="$static_release_root/.previous.tmp.$$"
+  printf '%s\n' "$static_previous_target" >"$previous_temp" || return 1
+  mv -fT -- "$previous_temp" "$static_release_root/previous" || return 1
+  point_static_release "$release_dir" || return 1
+  log "published static release atomically: $static_dir -> $release_dir"
+}
+
+restore_previous_static_release() {
+  [[ -n "$static_dir" ]] || return 0
+  validate_web_release_identity "$static_previous_target" "$pre_sha" || {
+    log "refusing to restore invalid previous static release: $static_previous_target"
+    return 1
+  }
+  point_static_release "$static_previous_target" || return 1
+  log "restored previous static release: $static_dir -> $static_previous_target"
+}
+
+prune_static_releases() {
+  [[ -n "$static_dir" ]] || return 0
+  local current previous release
+  current="$(readlink -f -- "$static_dir" 2>/dev/null || true)"
+  previous="$(cat "$static_release_root/previous" 2>/dev/null || true)"
+  while IFS= read -r release; do
+    [[ "$release/dist" == "$current" || "$release/dist" == "$previous" ]] && continue
+    case "$release" in "$static_release_root"/.t3dr-*) ;; *) continue ;; esac
+    log "pruning superseded static release: $release"
+    chmod -R u+w -- "$release" 2>/dev/null || return 1
+    rm -rf -- "$release" || return 1
+  done < <(find "$static_release_root" -mindepth 1 -maxdepth 1 -type d -name '.t3dr-*' -print)
 }
 
 service_main_pid() {
@@ -543,6 +681,7 @@ cleanup_resume_token() {
 on_exit() {
   local rc=$?
   cleanup_resume_token || true
+  prune_static_releases || true
   exit "$rc"
 }
 
@@ -724,7 +863,7 @@ retry_legacy_unstamped_noop_restart() {
     log "LEGACY_REBUILD stop failed"
     return 1
   fi
-  if ! run_capture 900 env T3CODE_BUILD_SHA="$target_sha" pnpm -C "$checkout/apps/web" run build; then
+  if ! run_capture 900 env T3CODE_BUILD_SHA="$target_sha" pnpm -C "$checkout/apps/web" run build:hosted; then
     log "LEGACY_REBUILD web rebuild failed"
     run_capture 60 systemctl --user start "$service" || log "LEGACY_REBUILD failed to restart after rebuild failure"
     return 1
@@ -740,6 +879,25 @@ retry_legacy_unstamped_noop_restart() {
     return 1
   fi
   run_verify_restart "$verify_file"
+}
+
+run_rollback_web_build() {
+  local build_sha="$1"
+  local package_json="$checkout/apps/web/package.json"
+  local script="build"
+
+  # A rollback may check out a release from before build:hosted existed. Keep
+  # that first deployment recoverable while retaining the hardened entrypoint
+  # for every release that declares it.
+  if [[ -f "$package_json" ]] && node -e '
+    const pkg = require(process.argv[1]);
+    process.exit(Object.hasOwn(pkg.scripts ?? {}, "build:hosted") ? 0 : 1);
+  ' "$package_json"; then
+    script="build:hosted"
+  fi
+
+  run_capture 900 env T3CODE_BUILD_SHA="$build_sha" T3CODE_HOSTED_BUILD=1 \
+    pnpm -C "$checkout/apps/web" run "$script"
 }
 
 pin_verify_restart() {
@@ -932,13 +1090,18 @@ rollback() {
     record_result "ROLLBACK-FAILED"
     return 1
   }
-  run_capture 900 env T3CODE_BUILD_SHA="$pre_sha" pnpm -C "$checkout/apps/web" run build || {
+  run_rollback_web_build "$pre_sha" || {
     log "ROLLBACK web rebuild failed"
     record_result "ROLLBACK-FAILED"
     return 1
   }
   run_capture 900 env T3CODE_BUILD_SHA="$pre_sha" pnpm -C "$checkout" run build:desktop || {
     log "ROLLBACK deploy artifact rebuild failed"
+    record_result "ROLLBACK-FAILED"
+    return 1
+  }
+  restore_previous_static_release || {
+    log "ROLLBACK static release restore failed"
     record_result "ROLLBACK-FAILED"
     return 1
   }
@@ -983,13 +1146,18 @@ code_only_rollback() {
     record_result "CODE-ROLLBACK-FAILED"
     return 1
   }
-  run_capture 900 env T3CODE_BUILD_SHA="$pre_sha" pnpm -C "$checkout/apps/web" run build || {
+  run_rollback_web_build "$pre_sha" || {
     log "CODE_ROLLBACK web rebuild failed"
     record_result "CODE-ROLLBACK-FAILED"
     return 1
   }
   run_capture 900 env T3CODE_BUILD_SHA="$pre_sha" pnpm -C "$checkout" run build:desktop || {
     log "CODE_ROLLBACK deploy artifact rebuild failed"
+    record_result "CODE-ROLLBACK-FAILED"
+    return 1
+  }
+  restore_previous_static_release || {
+    log "CODE_ROLLBACK static release restore failed"
     record_result "CODE-ROLLBACK-FAILED"
     return 1
   }
@@ -1089,6 +1257,12 @@ else
   fi
 fi
 
+if [[ -n "$static_dir" ]] && ! validate_web_release_identity "$static_previous_target" "$pre_sha"; then
+  log "configured static release does not match the running pre-update revision"
+  record_result "FAILED"
+  exit 1
+fi
+
 snapshot_tool="$(resolve_tool t3-db-snapshot)" || {
   log "missing t3-db-snapshot"
   record_result "FAILED"
@@ -1174,6 +1348,12 @@ if ! prepare_resume_token; then
   exit 1
 fi
 
+if ! configure_static_release; then
+  log "failed to configure static release before shutdown"
+  record_result "FAILED"
+  exit 1
+fi
+
 pre_restart_pid="$(service_main_pid || true)"
 if ! [[ "$pre_restart_pid" =~ ^[0-9]+$ ]]; then
   pre_restart_pid=0
@@ -1251,7 +1431,7 @@ elif [[ "$pre_sha" != "$target_sha" ]]; then
     log "ff-only update failed"
     rollback "$run_dir/health-probe.after-update" || exit 1
   fi
-  if ! run_capture 900 env T3CODE_BUILD_SHA="$target_sha" pnpm -C "$checkout/apps/web" run build; then
+  if ! run_capture 900 env T3CODE_BUILD_SHA="$target_sha" pnpm -C "$checkout/apps/web" run build:hosted; then
     log "web rebuild failed before restart"
     code_only_rollback "$run_dir/health-probe.after-web-build" || exit 1
   fi
@@ -1263,6 +1443,11 @@ elif [[ "$pre_sha" != "$target_sha" ]]; then
   updated=1
 else
   log "checkout already at target; skipping rebuilds"
+fi
+
+if [[ "$updated" == "1" ]] && ! publish_static_release "$target_sha"; then
+  log "static release publication failed before restart"
+  code_only_rollback "$run_dir/health-probe.after-static-publication" || exit 1
 fi
 
 if ! run_capture 60 systemctl --user start "$service"; then

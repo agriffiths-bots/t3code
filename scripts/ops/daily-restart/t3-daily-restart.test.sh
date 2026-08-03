@@ -258,6 +258,7 @@ SH
 #!/usr/bin/env bash
 echo "pnpm $*" >>"$T_LOG"
 [[ -n "${T3CODE_BUILD_SHA:-}" ]] && echo "pnpm-env T3CODE_BUILD_SHA=$T3CODE_BUILD_SHA cmd=$*" >>"$T_LOG"
+[[ -n "${T3CODE_HOSTED_BUILD:-}" ]] && echo "pnpm-env T3CODE_HOSTED_BUILD=$T3CODE_HOSTED_BUILD cmd=$*" >>"$T_LOG"
 if [[ "${FAKE_PNPM_FAIL_ONCE:-0}" == "1" && ! -f "$T_TMP/pnpm-failed" ]]; then
   : >"$T_TMP/pnpm-failed"
   exit 8
@@ -265,7 +266,15 @@ fi
 if [[ "$*" == *" install "* && -n "${FAKE_PNPM_INSTALL_RC:-}" ]]; then
   exit "$FAKE_PNPM_INSTALL_RC"
 fi
-exit "${FAKE_PNPM_RC:-0}"
+[[ "${FAKE_PNPM_RC:-0}" == "0" ]] || exit "$FAKE_PNPM_RC"
+cwd="${2:-}"
+if [[ "$cwd" == */apps/web && "$*" == *" run build"* ]]; then
+  mkdir -p "$cwd/dist"
+  printf 'web\n' >"$cwd/dist/index.html"
+  printf '{"buildSha":"%s"}\n' "${T3CODE_BUILD_SHA:-}" >"$cwd/dist/build-identity.json"
+  [[ "${FAKE_WEB_DEV_ENDPOINT:-0}" == "1" ]] && printf 'http://user:p@ss@localhost:3773/api\n' >"$cwd/dist/bad.js"
+fi
+exit 0
 SH
   cat >"$dir/claude" <<'SH'
 #!/usr/bin/env bash
@@ -281,10 +290,13 @@ run_manager() {
   mkdir -p "$tmp/checkout" "$tmp/bin" "$tmp/ledger" "$tmp/snaps"
   mkdir -p "$tmp/prebuilt-assets/apps/web/dist" "$tmp/prebuilt-assets/apps/server/dist/client"
   printf 'web\n' >"$tmp/prebuilt-assets/apps/web/dist/index.html"
+  printf '{"buildSha":"%s"}\n' "${FAKE_TARGET_SHA:-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb}" >"$tmp/prebuilt-assets/apps/web/dist/build-identity.json"
   printf 'server-client\n' >"$tmp/prebuilt-assets/apps/server/dist/client/index.html"
   printf 'server-bin\n' >"$tmp/prebuilt-assets/apps/server/dist/bin.mjs"
   make_fake_bin "$tmp/bin"
-  T_TMP="$tmp" T_LOG="$tmp/calls.log" REAL_NODE="$REAL_NODE" T3DR_TEST_PATH_PREFIX="$tmp/bin" T3DR_STOP_TIMEOUT="${T3DR_STOP_TIMEOUT:-1}" T3DR_KILL_TIMEOUT="${T3DR_KILL_TIMEOUT:-1}" \
+  T_TMP="$tmp" T_LOG="$tmp/calls.log" REAL_NODE="$REAL_NODE" T3DR_TEST_PATH_PREFIX="$tmp/bin" \
+    T3DR_STOP_TIMEOUT="${T3DR_STOP_TIMEOUT:-1}" T3DR_KILL_TIMEOUT="${T3DR_KILL_TIMEOUT:-1}" \
+    T3DR_STATIC_DIR="${T3DR_STATIC_DIR:-}" T3DR_SERVICE_CONFIG_DIR="${T3DR_SERVICE_CONFIG_DIR:-$tmp/systemd}" \
     T3DR_PREBUILT_ASSETS_DIR="$tmp/prebuilt-assets" "$SCRIPT" \
     --db "$tmp/state.sqlite" \
     --checkout "$tmp/checkout" \
@@ -297,6 +309,14 @@ run_manager() {
     --smoke-model fake-model \
     "$@" >"$tmp/stdout" 2>"$tmp/stderr"
   echo $? >"$tmp/rc"
+}
+
+prepare_static_release() {
+  local tmp="$1" sha="$2" release="$1/releases/web/${2:0:12}-previous/dist"
+  mkdir -p "$release"
+  printf 'previous web\n' >"$release/index.html"
+  printf '{"buildSha":"%s"}\n' "$sha" >"$release/build-identity.json"
+  ln -s "$release" "$tmp/releases/web/current"
 }
 
 assert_order() {
@@ -322,8 +342,8 @@ assert_order "$tmp/calls.log" "mint-resume-token" "validate-resume-token" "syste
 grep -Fq "inject token=minted-token" "$tmp/calls.log" && pass "resume injection receives preflight token" || fail "resume injection receives preflight token"
 grep -Fq "revoke-resume-token minted-session" "$tmp/calls.log" && pass "minted resume token is revoked" || fail "minted resume token is revoked"
 assert_order "$tmp/calls.log" "snapshot --db" "capture --db" "systemctl --user stop" "capture --db" "snapshot --db"
-assert_order "$tmp/calls.log" "git -C" "pnpm -C $tmp/checkout/apps/web run build" "pnpm -C $tmp/checkout run build:desktop"
-grep -Fq "pnpm-env T3CODE_BUILD_SHA=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb cmd=-C $tmp/checkout/apps/web run build" "$tmp/calls.log" \
+assert_order "$tmp/calls.log" "git -C" "pnpm -C $tmp/checkout/apps/web run build:hosted" "pnpm -C $tmp/checkout run build:desktop"
+grep -Fq "pnpm-env T3CODE_BUILD_SHA=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb cmd=-C $tmp/checkout/apps/web run build:hosted" "$tmp/calls.log" \
   && pass "happy path stamps standalone web build" \
   || fail "happy path stamps standalone web build"
 grep -Fq "pnpm-env T3CODE_BUILD_SHA=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb cmd=-C $tmp/checkout run build:desktop" "$tmp/calls.log" \
@@ -340,6 +360,39 @@ grep -Fq "capture --db $tmp/state.sqlite --out $tmp/ledger/" "$tmp/calls.log" &&
 grep -Eq "capture --db $tmp/state.sqlite --out $tmp/ledger/.*/resume-manifest\\.json\\.post-stop\\.[0-9]+ --stopped-since [0-9]{4}-[0-9]{2}-[0-9]{2}T.* --pending-since [0-9]{4}-[0-9]{2}-[0-9]{2}T" "$tmp/calls.log" && pass "post-stop capture receives shutdown boundary" || fail "post-stop capture receives shutdown boundary"
 grep -Fq "health --origin http://127.0.0.1:1 --service fake.service --instance fakeAgent --model fake-model --timeout 1" "$tmp/calls.log" && pass "health probe receives smoke provider" || fail "health probe receives smoke provider"
 grep -Fq "verify-restart --service fake.service --origin http://127.0.0.1:1 --checkout $tmp/checkout --expected-sha bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb --previous-pid 111 --timeout 1" "$tmp/calls.log" && pass "verify-restart receives pid and target" || fail "verify-restart receives pid and target"
+[[ ! -e "$tmp/systemd/fake.service.d/20-t3dr-static-release.conf" ]] && pass "unconfigured restart preserves checkout-relative static behavior" || fail "unconfigured restart preserves checkout-relative static behavior"
+
+tmp="$(mktemp -d)"
+mkdir -p "$tmp/releases/web/.t3dr-stale/dist"
+prepare_static_release "$tmp" aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+previous_static="$(readlink -f "$tmp/releases/web/current")"
+T3DR_STATIC_DIR="$tmp/releases/web/current" run_manager "$tmp" --prebuilt-target --rollback-sha aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --target-sha bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+dropin="$tmp/systemd/fake.service.d/20-t3dr-static-release.conf"
+published_static="$(readlink -f "$tmp/releases/web/current")"
+[[ "$(cat "$tmp/rc")" == "0" ]] && pass "configured static release exits zero" || fail "configured static release exits zero"
+grep -Fxq "[Service]" "$dropin" && grep -Fxq "Environment=T3CODE_STATIC_DIR=$tmp/releases/web/current" "$dropin" && pass "configured release is persisted independently of checkout" || fail "configured release is persisted independently of checkout"
+assert_order "$tmp/calls.log" "systemctl --user daemon-reload" "systemctl --user stop fake.service" "systemctl --user start fake.service"
+[[ "$published_static" != "$previous_static" ]] && grep -Fq 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' "$published_static/build-identity.json" && [[ "$(cat "$tmp/releases/web/previous")" == "$previous_static" ]] && pass "target static release is published atomically with rollback metadata" || fail "target static release is published atomically with rollback metadata"
+assert_order "$tmp/calls.log" "systemctl --user stop fake.service" "assert-web-no-dev-endpoints.ts --force $published_static" "systemctl --user start fake.service"
+[[ ! -e "$tmp/releases/web/.t3dr-stale" ]] && pass "superseded static releases are pruned" || fail "superseded static releases are pruned"
+
+tmp="$(mktemp -d)"
+prepare_static_release "$tmp" aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+previous_static="$(readlink -f "$tmp/releases/web/current")"
+FAKE_HEALTH_FAIL_ONCE=1 T3DR_STATIC_DIR="$tmp/releases/web/current" run_manager "$tmp"
+[[ "$(cat "$tmp/rc")" != "0" ]] && pass "configured static health failure exits nonzero" || fail "configured static health failure exits nonzero"
+[[ "$(readlink -f "$tmp/releases/web/current")" == "$previous_static" ]] && pass "rollback restores the previous static release pointer" || fail "rollback restores the previous static release pointer"
+
+tmp="$(mktemp -d)"
+prepare_static_release "$tmp" aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+FAKE_WEB_DEV_ENDPOINT=1 T3DR_STATIC_DIR="$tmp/releases/web/current" run_manager "$tmp"
+[[ "$(cat "$tmp/rc")" != "0" && -z "$(find "$tmp/releases/web" -maxdepth 1 -type d -name '.t3dr-*' -print -quit)" ]] && pass "failed static candidates are removed" || fail "failed static candidates are removed"
+
+tmp="$(mktemp -d)"
+prepare_static_release "$tmp" aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+T3DR_STATIC_DIR="$tmp/releases/web/current" run_manager "$tmp" --service fake
+[[ "$(cat "$tmp/rc")" == "2" ]] && pass "static release rejects a shorthand service unit" || fail "static release rejects a shorthand service unit"
+[[ ! -e "$tmp/systemd/fake.d/20-t3dr-static-release.conf" ]] && pass "shorthand service cannot create an unused drop-in" || fail "shorthand service cannot create an unused drop-in"
 
 tmp="$(mktemp -d)"
 T3DR_TOKEN=pre-minted-token T3DR_TOKEN_SESSION_ID=pre-minted-session run_manager "$tmp"
@@ -397,7 +450,9 @@ run_manager "$tmp"
 unset FAKE_VERIFY_RESTART_RC
 [[ "$(cat "$tmp/rc")" != "0" ]] && pass "verify-restart failure exits nonzero" || fail "verify-restart failure exits nonzero"
 assert_order "$tmp/calls.log" "systemctl --user start fake.service" "verify-restart" "systemctl --user stop fake.service" "restore" "git -C $tmp/checkout checkout aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" "pnpm -C $tmp/checkout install --frozen-lockfile --prefer-offline" "pnpm -C $tmp/checkout/apps/web run build" "pnpm -C $tmp/checkout run build:desktop" "systemctl --user start fake.service" "health"
+grep -Fq "pnpm-env T3CODE_HOSTED_BUILD=1 cmd=-C $tmp/checkout/apps/web run build" "$tmp/calls.log" && pass "legacy rollback build retains hosted scanner enforcement" || fail "legacy rollback build retains hosted scanner enforcement"
 grep -Fq "RESULT ROLLBACK-OK" "$tmp/ledger/"*/t3-daily-restart.result && pass "verify-restart failure rolls back loudly" || fail "verify-restart failure rolls back loudly"
+
 
 tmp="$(mktemp -d)"
 export FAKE_VERIFY_RESTART_RC=9
@@ -567,11 +622,13 @@ else
 fi
 
 tmp="$(mktemp -d)"
+mkdir -p "$tmp/checkout/apps/web"
+printf '{"scripts":{"build":"vp build","build:hosted":"vp build"}}\n' >"$tmp/checkout/apps/web/package.json"
 export FAKE_HEALTH_FAIL_ONCE=1
 run_manager "$tmp"
 unset FAKE_HEALTH_FAIL_ONCE
 [[ "$(cat "$tmp/rc")" != "0" ]] && pass "health rollback exits nonzero" || fail "health rollback exits nonzero"
-assert_order "$tmp/calls.log" "health" "systemctl --user stop" "restore" "git -C" "pnpm -C $tmp/checkout install --frozen-lockfile --prefer-offline" "pnpm -C $tmp/checkout/apps/web run build" "pnpm -C $tmp/checkout run build:desktop" "systemctl --user start" "health"
+assert_order "$tmp/calls.log" "health" "systemctl --user stop" "restore" "git -C" "pnpm -C $tmp/checkout install --frozen-lockfile --prefer-offline" "pnpm -C $tmp/checkout/apps/web run build:hosted" "pnpm -C $tmp/checkout run build:desktop" "systemctl --user start" "health"
 grep -Fq "RESULT ROLLBACK-OK" "$tmp/ledger/"*/t3-daily-restart.result && pass "health rollback result recorded" || fail "health rollback result recorded"
 if grep -Fq "diff --quiet" "$tmp/calls.log"; then
   fail "health rollback consulted migration diff"
@@ -666,7 +723,7 @@ export FAKE_PNPM_FAIL_ONCE=1
 run_manager "$tmp"
 unset FAKE_PNPM_FAIL_ONCE
 [[ "$(cat "$tmp/rc")" != "0" ]] && pass "web build failure exits nonzero" || fail "web build failure exits nonzero"
-assert_order "$tmp/calls.log" "pnpm -C $tmp/checkout/apps/web run build" "systemctl --user stop" "git -C" "pnpm -C $tmp/checkout install --frozen-lockfile --prefer-offline" "pnpm -C $tmp/checkout/apps/web run build" "pnpm -C $tmp/checkout run build:desktop" "systemctl --user start" "health"
+assert_order "$tmp/calls.log" "pnpm -C $tmp/checkout/apps/web run build:hosted" "systemctl --user stop" "git -C" "pnpm -C $tmp/checkout install --frozen-lockfile --prefer-offline" "pnpm -C $tmp/checkout/apps/web run build" "pnpm -C $tmp/checkout run build:desktop" "systemctl --user start" "health"
 if awk 'f && /restore/ { found=1 } /pnpm/ { f=1 } END { exit found ? 0 : 1 }' "$tmp/calls.log"; then
   fail "web build rollback restored db"
 else
@@ -755,8 +812,8 @@ export FAKE_VERIFY_RESTART_LEGACY_SHA_ONCE=1
 run_manager "$tmp"
 unset FAKE_PRE_SHA FAKE_TARGET_SHA FAKE_VERIFY_RESTART_LEGACY_SHA_ONCE
 [[ "$(cat "$tmp/rc")" == "0" ]] && pass "same-sha legacy unstamped rebuild exits zero" || fail "same-sha legacy unstamped rebuild exits zero"
-assert_order "$tmp/calls.log" "systemctl --user start fake.service" "verify-restart" "systemctl --user stop fake.service" "pnpm -C $tmp/checkout/apps/web run build" "pnpm -C $tmp/checkout run build:desktop" "systemctl --user start fake.service" "verify-restart" "health"
-grep -Fq "pnpm-env T3CODE_BUILD_SHA=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb cmd=-C $tmp/checkout/apps/web run build" "$tmp/calls.log" \
+assert_order "$tmp/calls.log" "systemctl --user start fake.service" "verify-restart" "systemctl --user stop fake.service" "pnpm -C $tmp/checkout/apps/web run build:hosted" "pnpm -C $tmp/checkout run build:desktop" "systemctl --user start fake.service" "verify-restart" "health"
+grep -Fq "pnpm-env T3CODE_BUILD_SHA=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb cmd=-C $tmp/checkout/apps/web run build:hosted" "$tmp/calls.log" \
   && pass "same-sha legacy unstamped rebuild stamps web target sha" \
   || fail "same-sha legacy unstamped rebuild stamps web target sha"
 grep -Fq "pnpm-env T3CODE_BUILD_SHA=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb cmd=-C $tmp/checkout run build:desktop" "$tmp/calls.log" \
@@ -781,7 +838,7 @@ T3DR_TOKEN=live-fallback-token run_manager "$tmp" \
   --target-sha bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
 unset FAKE_PRE_SHA
 [[ "$(cat "$tmp/rc")" == "0" ]] && pass "live fallback restart exits zero" || fail "live fallback restart exits zero"
-grep -Fq "pnpm-env T3CODE_BUILD_SHA=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb cmd=-C $tmp/checkout/apps/web run build" "$tmp/calls.log" \
+grep -Fq "pnpm-env T3CODE_BUILD_SHA=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb cmd=-C $tmp/checkout/apps/web run build:hosted" "$tmp/calls.log" \
   && grep -Fq "pnpm-env T3CODE_BUILD_SHA=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb cmd=-C $tmp/checkout run build:desktop" "$tmp/calls.log" \
   && pass "live fallback rollback metadata forces web and server rebuilds" \
   || fail "live fallback rollback metadata forces web and server rebuilds"
@@ -846,7 +903,7 @@ run_manager "$tmp" --prebuilt-target \
 unset FAKE_SNAPSHOT_FAIL_N
 [[ "$(cat "$tmp/rc")" != "0" ]] && pass "prebuilt quiesced snapshot failure exits nonzero" || fail "prebuilt quiesced snapshot failure exits nonzero"
 assert_order "$tmp/calls.log" "systemctl --user stop fake.service" "capture --db" "snapshot --db" "systemctl --user start fake.service" "inject"
-if grep -Fq "git -C $tmp/checkout checkout aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" "$tmp/calls.log" || grep -Fq "pnpm -C $tmp/checkout/apps/web run build" "$tmp/calls.log"; then
+if grep -Fq "git -C $tmp/checkout checkout aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" "$tmp/calls.log" || grep -Fq "pnpm -C $tmp/checkout/apps/web run build:hosted" "$tmp/calls.log"; then
   fail "prebuilt snapshot failure ran code rollback before update"
 else
   pass "prebuilt snapshot failure restarts unchanged checkout"

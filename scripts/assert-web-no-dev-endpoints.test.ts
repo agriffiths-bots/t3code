@@ -6,7 +6,7 @@ import * as NodePath from "node:path";
 import { assert, it } from "@effect/vitest";
 
 import {
-  DEFAULT_DEV_ENDPOINT_ALLOWLIST,
+  parseScannerCliArgs,
   scanDistForDevEndpoints,
   scanTextForDevEndpoints,
 } from "./assert-web-no-dev-endpoints.ts";
@@ -33,6 +33,21 @@ it("flags ported loopback backend URLs across schemes and host forms", () => {
   }
 });
 
+it("flags loopback URLs hidden behind userinfo without reporting credentials", () => {
+  for (const url of [
+    "http://user:pass@localhost:3773/api",
+    "http://user:p@ss@localhost:3773/api",
+    "https://token@[::1]:8443/session",
+  ]) {
+    const findings = scanTextForDevEndpoints(`x=${JSON.stringify(url)}`);
+    assert.isAtLeast(findings.length, 1, `expected a finding for ${url}`);
+    assert.notInclude(findings[0]?.match ?? "", "@");
+    assert.notInclude(findings[0]?.match ?? "", "user");
+    assert.notInclude(findings[0]?.match ?? "", "pass");
+    assert.notInclude(findings[0]?.match ?? "", "token");
+  }
+});
+
 it("does NOT flag bare loopback origins (library URL-base defaults)", () => {
   // Regression: a vendored library ships `this.origin=\`http://localhost\``
   // as a default base. A hosted build legitimately contains this; the
@@ -47,25 +62,26 @@ it("does NOT flag bare loopback origins (library URL-base defaults)", () => {
   }
 });
 
-it("allows the known UI placeholder loopback origins", () => {
-  const text = `placeholder="http://localhost:5173" other="http://127.0.0.1:4096"`;
-  assert.deepEqual(scanTextForDevEndpoints(text), []);
-  // Sanity: the allowlist is exactly those two origins.
-  assert.deepEqual([...DEFAULT_DEV_ENDPOINT_ALLOWLIST].sort(), [
-    "http://127.0.0.1:4096",
-    "http://localhost:5173",
-  ]);
-});
-
-it("flags backend paths, queries, and fragments on allowlisted placeholder origins", () => {
+it("does not globally allowlist loopback origins", () => {
   for (const url of [
+    "http://localhost:5173",
     "http://localhost:5173/api",
     "http://localhost:5173?token=secret",
+    "http://127.0.0.1:4096",
     "http://127.0.0.1:4096#backend",
   ]) {
     const findings = scanTextForDevEndpoints(`fetch(${JSON.stringify(url)})`);
     assert.isAtLeast(findings.length, 1, `expected a finding for ${url}`);
   }
+});
+
+it("parses --force independently of the positional dist directory", () => {
+  const conventional = parseScannerCliArgs(["--force", "apps/web/dist"]);
+  const trailing = parseScannerCliArgs(["apps/web/dist", "--force"]);
+  assert.isTrue(conventional.forced);
+  assert.equal(conventional.distDir, trailing.distDir);
+  assert.throws(() => parseScannerCliArgs(["--unknown", "apps/web/dist"]));
+  assert.throws(() => parseScannerCliArgs(["first", "second"]));
 });
 
 it("does not expose surrounding bundle text in scanner findings", () => {
@@ -83,9 +99,7 @@ it("does not flag bare loopback hostnames used for runtime comparison", () => {
   assert.deepEqual(scanTextForDevEndpoints(text), []);
 });
 
-it("still flags an allowlisted origin when used over ws", () => {
-  // A placeholder host is only allowlisted for http/https; a ws backend to it
-  // is never legitimate.
+it("flags a loopback WebSocket backend", () => {
   const findings = scanTextForDevEndpoints(`new WebSocket("ws://localhost:5173/ws")`);
   assert.isAtLeast(findings.length, 1);
 });

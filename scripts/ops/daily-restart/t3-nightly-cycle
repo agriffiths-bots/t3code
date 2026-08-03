@@ -14,6 +14,7 @@ attachments_dir="${T3DR_ATTACHMENTS_DIR:-}"
 service="${T3DR_SERVICE:-t3code.service}"
 origin="${T3DR_ORIGIN:-http://127.0.0.1:3773}"
 snapshot_dir="${T3DR_SNAPSHOT_DIR:-/home/adam/backups/t3-daily}"
+static_dir="${T3DR_STATIC_DIR:-}"
 probe_timeout="${T3DR_PROBE_TIMEOUT:-180}"
 stop_timeout="${T3DR_STOP_TIMEOUT:-120}"
 kill_timeout="${T3DR_KILL_TIMEOUT:-30}"
@@ -790,7 +791,7 @@ build_release_artifacts() {
     run_logged "$build_timeout" "$step_log" pnpm -C "$stage_checkout" install --frozen-lockfile --prefer-offline || rc=$?
   fi
   if [[ "$rc" -eq 0 && ( "$rollback_sha" != "$target_sha" || "$build_always" == "1" ) ]]; then
-    run_logged "$build_timeout" "$step_log" env T3CODE_BUILD_SHA="$target_sha" pnpm -C "$stage_checkout/apps/web" run build || rc=$?
+    run_logged "$build_timeout" "$step_log" env T3CODE_BUILD_SHA="$target_sha" pnpm -C "$stage_checkout/apps/web" run build:hosted || rc=$?
   fi
   if [[ "$rc" -eq 0 && ( "$rollback_sha" != "$target_sha" || "$build_always" == "1" ) ]]; then
     run_logged "$build_timeout" "$step_log" env T3CODE_BUILD_SHA="$target_sha" pnpm -C "$stage_checkout" run build:desktop || rc=$?
@@ -904,7 +905,7 @@ run_live_deploy_step() {
     run_logged "$build_timeout" "$step_log" pnpm -C "$stage_checkout" install --frozen-lockfile --prefer-offline || rc=$?
   fi
   if [[ "$rc" -eq 0 ]]; then
-    run_logged "$build_timeout" "$step_log" env T3CODE_BUILD_SHA="$live_deploy_target" pnpm -C "$stage_checkout/apps/web" run build || rc=$?
+    run_logged "$build_timeout" "$step_log" env T3CODE_BUILD_SHA="$live_deploy_target" pnpm -C "$stage_checkout/apps/web" run build:hosted || rc=$?
   fi
   if [[ "$rc" -eq 0 ]]; then
     if [[ "$desktop_artifact" == "1" ]]; then
@@ -1002,6 +1003,7 @@ run_restart_step() {
     T3DR_SERVICE="$service"
     T3DR_ORIGIN="$origin"
     T3DR_SNAPSHOT_DIR="$snapshot_dir"
+    T3DR_STATIC_DIR="$static_dir"
     T3DR_PROBE_TIMEOUT="$probe_timeout"
     T3DR_STOP_TIMEOUT="$stop_timeout"
     T3DR_KILL_TIMEOUT="$kill_timeout"

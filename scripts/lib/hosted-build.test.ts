@@ -8,10 +8,12 @@ import {
   isHostedBuild,
 } from "./hosted-build.ts";
 
-it("detects the hosted-build flag only for explicit truthy values", () => {
+it("detects an explicit hosted-build flag or the fail-closed package entrypoint", () => {
   assert.isTrue(isHostedBuild({ T3CODE_HOSTED_BUILD: "1" }));
   assert.isTrue(isHostedBuild({ T3CODE_HOSTED_BUILD: "true" }));
   assert.isTrue(isHostedBuild({ T3CODE_HOSTED_BUILD: " YES " }));
+  assert.isTrue(isHostedBuild({ npm_lifecycle_event: "build:hosted" }));
+  assert.isFalse(isHostedBuild({ npm_lifecycle_event: "build" }));
   assert.isFalse(isHostedBuild({ T3CODE_HOSTED_BUILD: "0" }));
   assert.isFalse(isHostedBuild({ T3CODE_HOSTED_BUILD: "" }));
   assert.isFalse(isHostedBuild({}));

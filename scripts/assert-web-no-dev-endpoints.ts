@@ -11,13 +11,12 @@
 // scanner reads every JS/CSS/HTML asset in the graph — not just the entry — so
 // a loopback backend cannot hide in a lazily-loaded chunk.
 //
-// Precision: the app legitimately renders a few loopback URLs as UI *placeholders*
-// (e.g. "http://localhost:5173", "http://127.0.0.1:4096"). Those exact origins
-// are allow-listed. Anything else that looks like a loopback backend — any
-// ws/wss loopback URL, any non-allowlisted http/https loopback URL, or the
-// desktop dev backend port :15773 — is a finding. Bare loopback hostnames with
-// no scheme (e.g. the LOOPBACK_HOSTNAMES set literal) are intentionally NOT
-// matched, because a hosted build compares against them at runtime.
+// Anything that looks like a loopback backend — any ported http(s)/ws(s)
+// loopback URL or the desktop dev backend port :15773 — is a finding. There is
+// deliberately no origin allowlist: emitted text cannot prove whether a literal
+// came from harmless UI copy or a configured backend. Bare loopback hostnames
+// with no scheme (e.g. the LOOPBACK_HOSTNAMES set literal) are intentionally
+// NOT matched, because a hosted build compares against them at runtime.
 import * as NodeFS from "node:fs";
 import * as NodeFSP from "node:fs/promises";
 import * as NodePath from "node:path";
@@ -25,24 +24,16 @@ import * as NodeURL from "node:url";
 
 import { isHostedBuild } from "./lib/hosted-build.ts";
 
-/**
- * Exact loopback origins the web UI renders as harmless input placeholders.
- * Verified against source (apps/web/src/components/ProjectScriptsControl.tsx,
- * packages/contracts/src/settings.ts). Extend ONLY with a source citation.
- */
-export const DEFAULT_DEV_ENDPOINT_ALLOWLIST: ReadonlyArray<string> = [
-  "http://localhost:5173",
-  "http://127.0.0.1:4096",
-];
-
 /** Desktop dev backend ports that must never appear in a hosted bundle. */
 export const FORBIDDEN_DEV_PORTS: ReadonlyArray<number> = [15773];
 
 const LOOPBACK_HOST_PATTERN = "(?:127\\.0\\.0\\.1|0\\.0\\.0\\.0|localhost|\\[::1\\]|::1)";
 
-// Scheme + loopback host (+ optional :port). Global + case-insensitive.
+// Scheme + optional userinfo + loopback host (+ optional :port). Userinfo is
+// matched so it cannot conceal the host, but is never copied into findings.
 function loopbackUrlRegex(): RegExp {
-  return new RegExp(`(https?|wss?):\\/\\/${LOOPBACK_HOST_PATTERN}(?::(\\d+))?`, "gi");
+  const userinfo = "(?:[^\\s/?#'\"<>\\\\]*@)?";
+  return new RegExp(`(https?|wss?):\\/\\/${userinfo}(${LOOPBACK_HOST_PATTERN})(?::(\\d+))?`, "gi");
 }
 
 export interface DevEndpointFinding {
@@ -55,21 +46,17 @@ export interface DevEndpointFinding {
  * Scan a single asset's text for dev/loopback backend endpoints. Pure and
  * deterministic; the CLI wraps this over every asset in the graph.
  */
-export function scanTextForDevEndpoints(
-  text: string,
-  options: { readonly allowlist?: ReadonlyArray<string> } = {},
-): DevEndpointFinding[] {
-  const allowlist = new Set(
-    (options.allowlist ?? DEFAULT_DEV_ENDPOINT_ALLOWLIST).map((origin) => origin.toLowerCase()),
-  );
+export function scanTextForDevEndpoints(text: string): DevEndpointFinding[] {
   const findings: DevEndpointFinding[] = [];
+  const matchedUrlRanges: Array<{ readonly start: number; readonly end: number }> = [];
 
   const regex = loopbackUrlRegex();
   let urlMatch: RegExpExecArray | null;
   while ((urlMatch = regex.exec(text)) !== null) {
     const full = urlMatch[0];
     const scheme = urlMatch[1] ?? "";
-    const port = urlMatch[2];
+    const host = urlMatch[2] ?? "";
+    const port = urlMatch[3];
     // Only a loopback URL with an EXPLICIT PORT is a backend endpoint. Bare
     // loopback origins (e.g. `http://localhost`, no port) are ubiquitous
     // library defaults for URL base resolution and are never the contamination
@@ -77,21 +64,13 @@ export function scanTextForDevEndpoints(
     if (!port) {
       continue;
     }
-    const normalizedOrigin = full.toLowerCase();
     const isWebSocket = scheme.toLowerCase().startsWith("ws");
-    const nextCharacter = text[urlMatch.index + full.length];
-    const hasUrlSuffix = nextCharacter === "/" || nextCharacter === "?" || nextCharacter === "#";
-    // Only the exact placeholder origin is harmless. An allowlisted origin
-    // followed by a path/query/fragment is an actual endpoint and must fail.
-    if (!isWebSocket && allowlist.has(normalizedOrigin) && !hasUrlSuffix) {
-      continue;
-    }
+    matchedUrlRanges.push({ start: urlMatch.index, end: urlMatch.index + full.length });
     findings.push({
-      match: full,
+      // Do not expose optional URL credentials in logs or review artifacts.
+      match: `${scheme}://${host}:${port}`,
       index: urlMatch.index,
-      reason: isWebSocket
-        ? "loopback WebSocket backend URL"
-        : "non-allowlisted loopback backend URL",
+      reason: isWebSocket ? "loopback WebSocket backend URL" : "loopback backend URL",
     });
   }
 
@@ -101,10 +80,8 @@ export function scanTextForDevEndpoints(
     while ((portMatch = portRegex.exec(text)) !== null) {
       // Avoid double-reporting a hit already captured as a loopback URL above.
       if (
-        findings.some(
-          (finding) =>
-            portMatch!.index >= finding.index &&
-            portMatch!.index < finding.index + finding.match.length,
+        matchedUrlRanges.some(
+          (range) => portMatch!.index >= range.start && portMatch!.index < range.end,
         )
       ) {
         continue;
@@ -150,15 +127,12 @@ export interface AssetScanResult {
 }
 
 /** Scan every JS/CSS/HTML asset under `distDir`. Skips sourcemaps and binaries. */
-export async function scanDistForDevEndpoints(
-  distDir: string,
-  options: { readonly allowlist?: ReadonlyArray<string> } = {},
-): Promise<AssetScanResult[]> {
+export async function scanDistForDevEndpoints(distDir: string): Promise<AssetScanResult[]> {
   const files = await collectAssetFiles(distDir);
   const results: AssetScanResult[] = [];
   for (const file of files) {
     const text = await NodeFSP.readFile(file, "utf8");
-    const findings = scanTextForDevEndpoints(text, options);
+    const findings = scanTextForDevEndpoints(text);
     if (findings.length > 0) {
       results.push({ file, findings });
     }
@@ -166,10 +140,34 @@ export async function scanDistForDevEndpoints(
   return results;
 }
 
+export function parseScannerCliArgs(args: ReadonlyArray<string>): {
+  readonly distDir: string;
+  readonly forced: boolean;
+} {
+  const positional: string[] = [];
+  let forced = false;
+  for (const arg of args) {
+    if (arg === "--force") {
+      forced = true;
+    } else if (arg.startsWith("--")) {
+      throw new Error(`web dev-endpoint assertion failed: unknown option ${arg}`);
+    } else {
+      positional.push(arg);
+    }
+  }
+  if (positional.length > 1) {
+    throw new Error("web dev-endpoint assertion failed: expected at most one dist directory");
+  }
+  return {
+    distDir: NodePath.resolve(positional[0] ?? "apps/web/dist"),
+    forced,
+  };
+}
+
 async function main(): Promise<void> {
-  const distDir = NodePath.resolve(process.argv[2] ?? "apps/web/dist");
-  const forced =
-    process.env.T3CODE_ASSERT_DEV_ENDPOINTS?.trim() === "1" || process.argv.includes("--force");
+  const parsed = parseScannerCliArgs(process.argv.slice(2));
+  const distDir = parsed.distDir;
+  const forced = process.env.T3CODE_ASSERT_DEV_ENDPOINTS?.trim() === "1" || parsed.forced;
 
   if (!isHostedBuild(process.env) && !forced) {
     console.log(

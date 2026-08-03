@@ -125,7 +125,7 @@ for ((i = 0; i < ${#args[@]}; i++)); do
   if [[ "${args[$i]}" == "-C" && $((i + 1)) -lt ${#args[@]} ]]; then
     cwd="${args[$((i + 1))]}"
     case "$*" in
-      *" run build")
+      *" run build:hosted")
         mkdir -p "$cwd/dist"
         printf 'web\n' >"$cwd/dist/index.html"
         ;;
@@ -151,7 +151,7 @@ if [[ "$*" == *" install "* ]]; then
   fi
   exit "${FAKE_PNPM_INSTALL_RC:-${FAKE_PNPM_RC:-0}}"
 fi
-if [[ "$*" == *" run build" ]]; then
+if [[ "$*" == *" run build:hosted" ]]; then
   exit "${FAKE_PNPM_BUILD_RC:-${FAKE_PNPM_RC:-0}}"
 fi
 exit "${FAKE_PNPM_RC:-0}"
@@ -180,7 +180,7 @@ exit "${FAKE_SYNC_RC:-0}"
 SH
   cat >"$dir/fake-restart" <<'SH'
 #!/usr/bin/env bash
-echo "restart prebuilt=${T3DR_PREBUILT_TARGET:-0} checkout=${T3DR_CHECKOUT:-} ledger=${T3DR_LEDGER:-} db=${T3DR_DB:-} service=${T3DR_SERVICE:-} origin=${T3DR_ORIGIN:-} snapshot=${T3DR_SNAPSHOT_DIR:-} probe_timeout=${T3DR_PROBE_TIMEOUT:-} smoke_instance=${T3DR_SMOKE_INSTANCE:-} smoke_model=${T3DR_SMOKE_MODEL:-} rollback=${T3DR_ROLLBACK_SHA:-} target=${T3DR_TARGET_SHA:-} assets=${T3DR_PREBUILT_ASSETS_DIR:-} probe=${T3DR_PINNED_HEALTH_PROBE:-} token=${T3DR_TOKEN:+set} token_session=${T3DR_TOKEN_SESSION_ID:-}" >>"$T_LOG"
+echo "restart prebuilt=${T3DR_PREBUILT_TARGET:-0} checkout=${T3DR_CHECKOUT:-} ledger=${T3DR_LEDGER:-} db=${T3DR_DB:-} service=${T3DR_SERVICE:-} origin=${T3DR_ORIGIN:-} snapshot=${T3DR_SNAPSHOT_DIR:-} static_dir=${T3DR_STATIC_DIR:-} probe_timeout=${T3DR_PROBE_TIMEOUT:-} smoke_instance=${T3DR_SMOKE_INSTANCE:-} smoke_model=${T3DR_SMOKE_MODEL:-} rollback=${T3DR_ROLLBACK_SHA:-} target=${T3DR_TARGET_SHA:-} assets=${T3DR_PREBUILT_ASSETS_DIR:-} probe=${T3DR_PINNED_HEALTH_PROBE:-} token=${T3DR_TOKEN:+set} token_session=${T3DR_TOKEN_SESSION_ID:-}" >>"$T_LOG"
 exit "${FAKE_RESTART_RC:-0}"
 SH
   chmod +x "$dir"/*
@@ -201,6 +201,7 @@ run_cycle() {
     T3DR_SERVICE="fake.service" \
     T3DR_ORIGIN="http://127.0.0.1:1" \
     T3DR_SNAPSHOT_DIR="$tmp/snaps" \
+    T3DR_STATIC_DIR="${T3DR_STATIC_DIR:-}" \
     T3DR_PROBE_TIMEOUT="7" \
     T3DR_SMOKE_INSTANCE="fakeAgent" \
     T3DR_SMOKE_MODEL="fake-model" \
@@ -232,21 +233,21 @@ tmp="$(mktemp -d)"
 run_cycle "$tmp"
 stage="$tmp/ledger/$(date -u +%F)/prebuilt-stage/checkout"
 [[ "$(cat "$tmp/rc")" == "0" ]] && pass "happy path exits zero" || fail "happy path exits zero"
-assert_order "$tmp/calls.log" "backup" "sync" "git -C" "git -C $tmp/checkout worktree prune" "git -C $tmp/checkout worktree add --detach $stage" "pnpm -C $stage install --frozen-lockfile --prefer-offline" "pnpm -C $stage/apps/web run build" "pnpm -C $stage run build:desktop" "restart prebuilt=1"
-grep -Fq "pnpm-env T3CODE_BUILD_SHA=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb cmd=-C $stage/apps/web run build" "$tmp/calls.log" \
+assert_order "$tmp/calls.log" "backup" "sync" "git -C" "git -C $tmp/checkout worktree prune" "git -C $tmp/checkout worktree add --detach $stage" "pnpm -C $stage install --frozen-lockfile --prefer-offline" "pnpm -C $stage/apps/web run build:hosted" "pnpm -C $stage run build:desktop" "restart prebuilt=1"
+grep -Fq "pnpm-env T3CODE_BUILD_SHA=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb cmd=-C $stage/apps/web run build:hosted" "$tmp/calls.log" \
   && pass "happy path stamps standalone web build" \
   || fail "happy path stamps standalone web build"
 grep -Fq "pnpm-env T3CODE_BUILD_SHA=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb cmd=-C $stage run build:desktop" "$tmp/calls.log" \
   && pass "happy path stamps desktop/server build" \
   || fail "happy path stamps desktop/server build"
-if grep -Fq "git -C $tmp/checkout merge --ff-only" "$tmp/calls.log" || grep -Fq "pnpm -C $tmp/checkout/apps/web run build" "$tmp/calls.log"; then
+if grep -Fq "git -C $tmp/checkout merge --ff-only" "$tmp/calls.log" || grep -Fq "pnpm -C $tmp/checkout/apps/web run build:hosted" "$tmp/calls.log"; then
   fail "happy path leaves live checkout untouched before restart"
 else
   pass "happy path leaves live checkout untouched before restart"
 fi
 grep -Fq "sync repo=$tmp/checkout" "$tmp/calls.log" && pass "sync receives checkout repo" || fail "sync receives checkout repo"
 grep -Fq "checkout=$tmp/checkout ledger=$tmp/ledger" "$tmp/calls.log" && pass "restart receives checkout and ledger" || fail "restart receives checkout and ledger"
-grep -Fq "db=$tmp/state.sqlite service=fake.service origin=http://127.0.0.1:1 snapshot=$tmp/snaps probe_timeout=7 smoke_instance=fakeAgent smoke_model=fake-model" "$tmp/calls.log" && pass "restart receives explicit runtime env" || fail "restart receives explicit runtime env"
+grep -Fq "db=$tmp/state.sqlite service=fake.service origin=http://127.0.0.1:1 snapshot=$tmp/snaps static_dir= probe_timeout=7 smoke_instance=fakeAgent smoke_model=fake-model" "$tmp/calls.log" && pass "restart receives explicit runtime env" || fail "restart receives explicit runtime env"
 grep -Fq "rollback=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa target=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" "$tmp/calls.log" && pass "restart receives prebuilt rollback target" || fail "restart receives prebuilt rollback target"
 grep -Fq "assets=$tmp/ledger/$(date -u +%F)/prebuilt-stage/payload" "$tmp/calls.log" && pass "restart receives staged payload" || fail "restart receives staged payload"
 grep -Fq "probe=$tmp/ledger/$(date -u +%F)/pinned-tools/health-probe.rollback" "$tmp/calls.log" && pass "restart receives rollback probe" || fail "restart receives rollback probe"
@@ -258,6 +259,14 @@ else
 fi
 grep -Fq "RESULT OK" "$tmp/ledger/"*/t3-nightly-cycle.result && pass "result ok recorded" || fail "result ok recorded"
 test -s "$tmp/ledger/"*/t3-nightly-cycle.jsonl && pass "json ledger written" || fail "json ledger written"
+
+tmp="$(mktemp -d)"
+mkdir -p "$tmp/releases/web/current"
+printf 'release web\n' >"$tmp/releases/web/current/index.html"
+T3DR_STATIC_DIR="$tmp/releases/web/current" run_cycle "$tmp"
+grep -Fq "static_dir=$tmp/releases/web/current" "$tmp/calls.log" \
+  && pass "nightly cycle forwards configured static release independently of checkout" \
+  || fail "nightly cycle forwards configured static release independently of checkout"
 
 tmp="$(mktemp -d)"
 caller_path="$tmp/nonstandard-node"
@@ -351,7 +360,7 @@ assert_order "$tmp/calls.log" \
   "git -C $tmp/checkout diff --name-only" \
   "git -C $tmp/checkout worktree add --detach $stage" \
   "pnpm -C $stage install --frozen-lockfile --prefer-offline" \
-  "pnpm -C $stage/apps/web run build" \
+  "pnpm -C $stage/apps/web run build:hosted" \
   "mint-live-resume-token" \
   "git -C $tmp/checkout merge --ff-only bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" \
   "pnpm -C $tmp/checkout install --frozen-lockfile --prefer-offline" \
@@ -363,7 +372,7 @@ grep -Fq "restart prebuilt=0" "$tmp/calls.log" \
 grep -Fq "token=set token_session=minted-live-session" "$tmp/calls.log" \
   && pass "live fallback hands the pre-mutation token to the restart manager" \
   || fail "live fallback hands the pre-mutation token to the restart manager"
-grep -Fq "pnpm-env T3CODE_BUILD_SHA=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb cmd=-C $stage/apps/web run build" "$tmp/calls.log" \
+grep -Fq "pnpm-env T3CODE_BUILD_SHA=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb cmd=-C $stage/apps/web run build:hosted" "$tmp/calls.log" \
   && pass "live fallback stamps web build" \
   || fail "live fallback stamps web build"
 if grep -Fq "pnpm -C $tmp/checkout run build:desktop" "$tmp/calls.log"; then
@@ -580,7 +589,7 @@ unset FAKE_CHANGED_FILES
 stage="$tmp/ledger/$(date -u +%F)/prebuilt-stage/checkout"
 [[ "$(cat "$tmp/rc")" == "0" ]] && pass "artifact-enabled live fallback exits zero" || fail "artifact-enabled live fallback exits zero"
 assert_order "$tmp/calls.log" \
-  "pnpm -C $stage/apps/web run build" \
+  "pnpm -C $stage/apps/web run build:hosted" \
   "pnpm -C $stage run dist:desktop:artifact" \
   "pnpm -C $tmp/checkout install --frozen-lockfile --prefer-offline" \
   "restart prebuilt=0"
@@ -730,7 +739,7 @@ tmp="$(mktemp -d)"
 T3DR_DESKTOP_ARTIFACT=1 run_cycle "$tmp"
 stage="$tmp/ledger/$(date -u +%F)/prebuilt-stage/checkout"
 [[ "$(cat "$tmp/rc")" == "0" ]] && pass "desktop artifact enabled exits zero" || fail "desktop artifact enabled exits zero"
-assert_order "$tmp/calls.log" "pnpm -C $stage/apps/web run build" "pnpm -C $stage run build:desktop" "pnpm -C $stage run dist:desktop:artifact" "restart prebuilt=1"
+assert_order "$tmp/calls.log" "pnpm -C $stage/apps/web run build:hosted" "pnpm -C $stage run build:desktop" "pnpm -C $stage run dist:desktop:artifact" "restart prebuilt=1"
 grep -Fq "desktop" "$tmp/ledger/$(date -u +%F)/desktop-artifact/artifact.txt" && pass "desktop artifact persists outside stage checkout" || fail "desktop artifact persists outside stage checkout"
 
 echo "$pass_count passed, $fail_count failed"
