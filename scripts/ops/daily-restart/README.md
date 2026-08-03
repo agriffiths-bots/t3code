@@ -53,6 +53,7 @@ T3DR_ORIGIN=http://127.0.0.1:3773
 T3DR_ATTACHMENTS_DIR=$(dirname "$T3DR_DB")/attachments
 T3DR_SNAPSHOT_DIR=/home/adam/backups/t3-daily
 T3DR_LEDGER=/home/adam/.openclaw/daily-restart
+T3DR_STATIC_DIR=(optional absolute immutable web release pointer)
 T3DR_PROBE_TIMEOUT=180
 T3DR_SMOKE_INSTANCE=(required)
 T3DR_SMOKE_MODEL=(required)
@@ -67,6 +68,15 @@ to the post-stop capture so pending work and shutdown-interrupted work are not
 lost while stale pre-stop entries are still filtered out. If the post-stop
 capture fails, the manager restarts the unchanged service and injects the
 pre-stop manifest instead of continuing the update.
+
+When `T3DR_STATIC_DIR` (or `--static-dir`) is set, it must be an absolute
+symlink to an immutable sibling release, normally
+`/home/adam/t3releases/web/current`. The manager validates its SHA, then while
+stopped copies and force-scans the target, records the old target, and atomically
+flips the symlink; rollback flips it back before the previous server starts. A
+systemd drop-in exports the symlink as `T3CODE_STATIC_DIR`, making server
+run-directory changes irrelevant. Unconfigured behavior is unchanged; remove
+`20-t3dr-static-release.conf` and reload systemd to reverse an opt-in.
 
 Rollbacks before the updated service can accept writes restore the pre-stop DB
 snapshot after checking out the pre-restart SHA. After every rollback checkout,

@@ -36,6 +36,14 @@ export const baseDirFlag = Flag.string("base-dir").pipe(
   ),
   Flag.optional,
 );
+export const staticDirFlag = Flag.string("static-dir").pipe(
+  Flag.withDescription(
+    "Directory to serve the web client from (e.g. an immutable out-of-tree release dir). " +
+      "Overrides the checkout-relative default so prod never serves from the mutable checkout " +
+      "(equivalent to T3CODE_STATIC_DIR).",
+  ),
+  Flag.optional,
+);
 export const devUrlFlag = Flag.string("dev-url").pipe(
   Flag.withSchema(Schema.URLFromString),
   Flag.withDescription("Dev web URL to proxy/redirect to (equivalent to VITE_DEV_SERVER_URL)."),
@@ -105,6 +113,10 @@ const EnvServerConfig = Config.all({
   port: Config.port("T3CODE_PORT").pipe(Config.option, Config.map(Option.getOrUndefined)),
   host: Config.string("T3CODE_HOST").pipe(Config.option, Config.map(Option.getOrUndefined)),
   t3Home: Config.string("T3CODE_HOME").pipe(Config.option, Config.map(Option.getOrUndefined)),
+  staticDir: Config.string("T3CODE_STATIC_DIR").pipe(
+    Config.option,
+    Config.map(Option.getOrUndefined),
+  ),
   devUrl: Config.url("VITE_DEV_SERVER_URL").pipe(Config.option, Config.map(Option.getOrUndefined)),
   hostedAppUrl: Config.url("VITE_HOSTED_APP_URL").pipe(
     Config.option,
@@ -141,6 +153,7 @@ export interface CliServerFlags {
   readonly port: Option.Option<number>;
   readonly host: Option.Option<string>;
   readonly baseDir: Option.Option<string>;
+  readonly staticDir: Option.Option<string>;
   readonly cwd: Option.Option<string>;
   readonly devUrl: Option.Option<URL>;
   readonly noBrowser: Option.Option<boolean>;
@@ -170,6 +183,7 @@ export const sharedServerCommandFlags = {
   port: portFlag,
   host: hostFlag,
   baseDir: baseDirFlag,
+  staticDir: staticDirFlag,
   cwd: Argument.string("cwd").pipe(
     Argument.withDescription(
       "Working directory for provider sessions (defaults to the current directory).",
@@ -208,6 +222,7 @@ export const resolveServerConfig = (
   options?: {
     readonly startupPresentation?: ServerConfig.StartupPresentation;
     readonly forceAutoBootstrapProjectFromCwd?: boolean;
+    readonly ignoreStaticDir?: boolean;
   },
 ) =>
   Effect.gen(function* () {
@@ -220,6 +235,7 @@ export const resolveServerConfig = (
       port: flags.port ?? Option.none(),
       host: flags.host ?? Option.none(),
       baseDir: flags.baseDir ?? Option.none(),
+      staticDir: flags.staticDir ?? Option.none(),
       cwd: flags.cwd ?? Option.none(),
       devUrl: flags.devUrl ?? Option.none(),
       noBrowser: flags.noBrowser ?? Option.none(),
@@ -261,10 +277,18 @@ export const resolveServerConfig = (
         },
       },
     );
-    const devUrl = Option.getOrElse(
-      resolveOptionPrecedence(normalizedFlags.devUrl, Option.fromUndefinedOr(env.devUrl)),
-      () => undefined,
-    );
+    const explicitStaticDir = options?.ignoreStaticDir
+      ? Option.none<string>()
+      : resolveOptionPrecedence(
+          normalizedFlags.staticDir,
+          Option.fromUndefinedOr(env.staticDir),
+        ).pipe(Option.filter((value) => value.trim().length > 0));
+    const devUrl = Option.isSome(explicitStaticDir)
+      ? undefined
+      : Option.getOrElse(
+          resolveOptionPrecedence(normalizedFlags.devUrl, Option.fromUndefinedOr(env.devUrl)),
+          () => undefined,
+        );
     const explicitBaseDir = resolveOptionPrecedence(
       normalizedFlags.baseDir,
       Option.fromUndefinedOr(env.t3Home),
@@ -330,7 +354,17 @@ export const resolveServerConfig = (
       ),
       () => 443,
     );
-    const staticDir = devUrl ? undefined : yield* ServerConfig.resolveStaticDir();
+    // An explicit --static-dir / T3CODE_STATIC_DIR (e.g. an immutable out-of-tree
+    // release dir) always wins so prod can serve web statics from OUTSIDE the
+    // mutable ~/t3code checkout — the structural fix for the 2026-07-22 outage,
+    // where any worker that wrote apps/web/dist could replace what users loaded.
+    // With none set, fall back to the checkout-relative bundled/monorepo dist.
+    const explicitStaticDirValue = Option.getOrUndefined(explicitStaticDir);
+    const staticDir = explicitStaticDirValue
+      ? path.resolve(yield* expandHomePath(explicitStaticDirValue))
+      : devUrl
+        ? undefined
+        : yield* ServerConfig.resolveStaticDir();
     const host = Option.getOrElse(
       resolveOptionPrecedence(
         normalizedFlags.host,
@@ -390,6 +424,7 @@ export const resolveCliAuthConfig = (
       port: Option.none(),
       host: Option.none(),
       baseDir: flags.baseDir,
+      staticDir: Option.none(),
       cwd: Option.none(),
       devUrl: flags.devUrl ?? Option.none(),
       noBrowser: Option.none(),
@@ -400,6 +435,7 @@ export const resolveCliAuthConfig = (
       tailscaleServePort: Option.none(),
     },
     cliLogLevel,
+    { ignoreStaticDir: true },
   );
 
 const DurationShorthandPattern = /^(?<value>\d+)(?<unit>ms|s|m|h|d|w)$/i;

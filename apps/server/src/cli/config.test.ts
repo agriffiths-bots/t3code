@@ -16,7 +16,7 @@ import {
 import * as NetService from "@t3tools/shared/Net";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { deriveServerPaths } from "../config.ts";
-import { resolveServerConfig } from "./config.ts";
+import { resolveCliAuthConfig, resolveServerConfig } from "./config.ts";
 
 const deriveExplicitServerPaths = (baseDir: string, devUrl: URL | undefined) =>
   deriveServerPaths(baseDir, devUrl, { baseDirIsExplicit: true });
@@ -73,6 +73,7 @@ it.layer(NodeServices.layer)("cli config resolution", (it) => {
           port: Option.none(),
           host: Option.none(),
           baseDir: Option.none(),
+          staticDir: Option.none(),
           cwd: Option.none(),
           devUrl: Option.none(),
           noBrowser: Option.none(),
@@ -131,6 +132,106 @@ it.layer(NodeServices.layer)("cli config resolution", (it) => {
     }),
   );
 
+  it.effect(
+    "serves web statics from an explicit out-of-tree --static-dir / T3CODE_STATIC_DIR",
+    () =>
+      Effect.gen(function* () {
+        const { join, resolve } = yield* Path.Path;
+        const baseDir = join(NodeOS.tmpdir(), "t3-cli-config-staticdir-base");
+        const releaseDir = join(NodeOS.tmpdir(), "t3releases-test", "web", "current");
+        const baseFlags = {
+          mode: Option.some("web" as const),
+          port: Option.none(),
+          host: Option.none(),
+          baseDir: Option.some(baseDir),
+          cwd: Option.none(),
+          devUrl: Option.none<URL>(),
+          noBrowser: Option.none(),
+          bootstrapFd: Option.none(),
+          autoBootstrapProjectFromCwd: Option.none(),
+          logWebSocketEvents: Option.none(),
+          tailscaleServeEnabled: Option.none(),
+          tailscaleServePort: Option.none(),
+        };
+
+        // (1) The --static-dir flag wins and is resolved to an absolute path, so
+        //     prod serves from the immutable out-of-tree release, never the checkout.
+        const viaFlag = yield* resolveServerConfig(
+          { ...baseFlags, staticDir: Option.some(releaseDir) },
+          Option.none(),
+        ).pipe(
+          Effect.provide(
+            Layer.mergeAll(
+              ConfigProvider.layer(
+                ConfigProvider.fromEnv({
+                  env: { VITE_DEV_SERVER_URL: "http://127.0.0.1:5173" },
+                }),
+              ),
+              NetService.layer,
+            ),
+          ),
+        );
+        assert.equal(viaFlag.staticDir, resolve(releaseDir));
+        assert.equal(viaFlag.devUrl, undefined);
+        assert.equal(viaFlag.logWebSocketEvents, false);
+
+        // (2) T3CODE_STATIC_DIR (what t3-server-exec exports) is honoured when no
+        //     static-dir flag is set, and still wins over an explicit dev URL.
+        const viaEnv = yield* resolveServerConfig(
+          {
+            ...baseFlags,
+            staticDir: Option.none(),
+            devUrl: Option.some(new URL("http://127.0.0.1:4173")),
+          },
+          Option.none(),
+        ).pipe(
+          Effect.provide(
+            Layer.mergeAll(
+              ConfigProvider.layer(
+                ConfigProvider.fromEnv({ env: { T3CODE_STATIC_DIR: releaseDir } }),
+              ),
+              NetService.layer,
+            ),
+          ),
+        );
+        assert.equal(viaEnv.staticDir, resolve(releaseDir));
+        assert.equal(viaEnv.devUrl, undefined);
+        assert.equal(viaEnv.logWebSocketEvents, false);
+      }),
+  );
+
+  it.effect("ignores hosted static-dir environment when resolving an auth CLI target", () =>
+    Effect.gen(function* () {
+      const { join } = yield* Path.Path;
+      const baseDir = join(NodeOS.tmpdir(), "t3-cli-auth-staticdir-base");
+      const releaseDir = join(NodeOS.tmpdir(), "t3releases-test", "web", "current");
+      const devUrl = new URL("http://127.0.0.1:4173");
+
+      const resolved = yield* resolveCliAuthConfig(
+        {
+          baseDir: Option.some(baseDir),
+          devUrl: Option.some(devUrl),
+        },
+        Option.none(),
+      ).pipe(
+        Effect.provide(
+          Layer.mergeAll(
+            ConfigProvider.layer(
+              ConfigProvider.fromEnv({
+                env: { T3CODE_STATIC_DIR: releaseDir },
+              }),
+            ),
+            NetService.layer,
+          ),
+        ),
+      );
+
+      assert.equal(resolved.devUrl, devUrl);
+      assert.equal(resolved.staticDir, undefined);
+      assert.equal(resolved.logWebSocketEvents, true);
+    }),
+  );
+
   it.effect("uses CLI flags when provided", () =>
     Effect.gen(function* () {
       const { join } = yield* Path.Path;
@@ -145,6 +246,7 @@ it.layer(NodeServices.layer)("cli config resolution", (it) => {
           port: Option.some(8788),
           host: Option.some("127.0.0.1"),
           baseDir: Option.some(baseDir),
+          staticDir: Option.none(),
           cwd: Option.none(),
           devUrl: Option.some(new URL("http://127.0.0.1:4173")),
           noBrowser: Option.some(true),
@@ -224,6 +326,7 @@ it.layer(NodeServices.layer)("cli config resolution", (it) => {
           port: Option.some(8788),
           host: Option.some("127.0.0.1"),
           baseDir: Option.some(baseDir),
+          staticDir: Option.none(),
           cwd: Option.none(),
           devUrl: Option.some(new URL("http://127.0.0.1:4173")),
           noBrowser: Option.some(false),
@@ -299,6 +402,7 @@ it.layer(NodeServices.layer)("cli config resolution", (it) => {
           port: Option.none(),
           host: Option.none(),
           baseDir: Option.none(),
+          staticDir: Option.none(),
           cwd: Option.none(),
           devUrl: Option.none(),
           noBrowser: Option.none(),
@@ -362,6 +466,7 @@ it.layer(NodeServices.layer)("cli config resolution", (it) => {
           port: Option.some(4888),
           host: Option.none(),
           baseDir: Option.some(baseDir),
+          staticDir: Option.none(),
           cwd: Option.some(customCwd),
           devUrl: Option.some(new URL("http://127.0.0.1:5173")),
           noBrowser: Option.none(),
@@ -424,6 +529,7 @@ it.layer(NodeServices.layer)("cli config resolution", (it) => {
           port: Option.some(8788),
           host: Option.some("127.0.0.1"),
           baseDir: Option.none(),
+          staticDir: Option.none(),
           cwd: Option.none(),
           devUrl: Option.some(new URL("http://127.0.0.1:4173")),
           noBrowser: Option.none(),
@@ -500,6 +606,7 @@ it.layer(NodeServices.layer)("cli config resolution", (it) => {
           port: Option.some(4888),
           host: Option.none(),
           baseDir: Option.some(baseDir),
+          staticDir: Option.none(),
           cwd: Option.none(),
           devUrl: Option.none(),
           noBrowser: Option.none(),
@@ -557,6 +664,7 @@ it.layer(NodeServices.layer)("cli config resolution", (it) => {
           port: Option.some(3773),
           host: Option.none(),
           baseDir: Option.some(baseDir),
+          staticDir: Option.none(),
           cwd: Option.none(),
           devUrl: Option.none(),
           noBrowser: Option.none(),

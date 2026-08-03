@@ -450,7 +450,7 @@ export default function ProjectScriptsControl({
                 <Label htmlFor="script-preview-url">Preview URL (optional)</Label>
                 <Input
                   id="script-preview-url"
-                  placeholder="http://localhost:5173"
+                  placeholder="localhost:5173"
                   value={previewUrl}
                   onChange={(event) => setPreviewUrl(event.target.value)}
                 />

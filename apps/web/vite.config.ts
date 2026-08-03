@@ -10,9 +10,35 @@ import type { Plugin } from "vite";
 import pkg from "./package.json" with { type: "json" };
 
 import { loadRepoEnv } from "../../scripts/lib/public-config";
+import {
+  assertHostedBuildEnvClean,
+  HOSTED_BACKEND_ENV_KEYS,
+  isHostedBuild,
+} from "../../scripts/lib/hosted-build";
 
 const repoEnv = loadRepoEnv();
 Object.assign(process.env, repoEnv);
+
+// Hosted (server-served) builds must NEVER inline a configured backend
+// endpoint: the client derives its backend from window.location.origin when
+// none is set. Vite inlines VITE_*-prefixed vars from the environment into
+// import.meta.env, so a stray desktop/dev VITE_HTTP_URL/VITE_WS_URL/
+// VITE_DEV_SERVER_URL would bake a loopback backend into every chunk (the
+// 2026-07-22 outage). Fail loudly if one is set, then scrub it so nothing can
+// inline it, and force the defines to "" below as belt-and-suspenders.
+const hostedBuild = isHostedBuild(process.env);
+if (hostedBuild) {
+  // Reject on process.env, not just the repo env-file: the 2026-07-22 outage
+  // vector was an INHERITED process env var (VITE_HTTP_URL=http://127.0.0.1:15773
+  // exported by a desktop/dev worker), which loadRepoEnv never sees. process.env
+  // already carries the merged repo env (Object.assign above) plus anything
+  // inherited, so this fails loudly on either source before Vite inlines it.
+  assertHostedBuildEnvClean(process.env);
+  for (const key of HOSTED_BACKEND_ENV_KEYS) {
+    delete process.env[key];
+    delete (repoEnv as Record<string, string | undefined>)[key];
+  }
+}
 
 const port = Number(process.env.PORT ?? 5733);
 const host = process.env.HOST?.trim() || "localhost";
@@ -157,7 +183,17 @@ export default defineConfig(() => {
       ],
     },
     define: {
-      // In dev mode, tell the web app where the WebSocket server lives
+      // Hosted builds pin all backend-pointing vars to "" so the client falls
+      // back to window.location.origin — deterministic even if the environment
+      // was contaminated (defense-in-depth alongside the scrub above).
+      ...(hostedBuild
+        ? {
+            "import.meta.env.VITE_HTTP_URL": '""',
+            "import.meta.env.VITE_DEV_SERVER_URL": '""',
+          }
+        : {}),
+      // In dev mode, tell the web app where the WebSocket server lives.
+      // Hosted builds scrub configuredWsUrl above, so this resolves to "".
       "import.meta.env.VITE_WS_URL": JSON.stringify(configuredWsUrl ?? ""),
       "import.meta.env.VITE_T3CODE_RELAY_URL": JSON.stringify(configuredRelayUrl),
       "import.meta.env.VITE_CLERK_PUBLISHABLE_KEY": JSON.stringify(configuredClerkPublishableKey),
