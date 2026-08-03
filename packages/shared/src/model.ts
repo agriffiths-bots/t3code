@@ -14,18 +14,20 @@ import {
 const DEFAULT_PROVIDER_DRIVER_KIND = ProviderDriverKind.make("codex");
 
 const RETIRED_SELECTABLE_MODEL_MIGRATIONS: Readonly<
-  Record<string, Readonly<Record<string, string>>>
+  Record<string, Readonly<Record<string, ReadonlyArray<string>>>>
 > = {
   claudeAgent: {
-    "claude-opus-4-8": "claude-opus-5",
+    "claude-opus-4-8": ["claude-opus-5", "claude-opus-4-7", "claude-opus-4-6", "claude-opus-4-5"],
+    "opus-4.8": ["claude-opus-5", "claude-opus-4-7", "claude-opus-4-6", "claude-opus-4-5"],
+    "claude-opus-4.8": ["claude-opus-5", "claude-opus-4-7", "claude-opus-4-6", "claude-opus-4-5"],
   },
 };
 
-function resolveRetiredSelectableModelMigration(
+function resolveRetiredSelectableModelMigrations(
   provider: ProviderDriverKind,
   value: string,
-): string | undefined {
-  return RETIRED_SELECTABLE_MODEL_MIGRATIONS[provider]?.[value];
+): ReadonlyArray<string> {
+  return RETIRED_SELECTABLE_MODEL_MIGRATIONS[provider]?.[value] ?? [];
 }
 
 export interface SelectableModelOption {
@@ -306,14 +308,18 @@ export function resolveSelectableModel(
     return byName.slug;
   }
 
-  const migrated = resolveRetiredSelectableModelMigration(provider, trimmed) ?? trimmed;
-  const normalized = normalizeModelSlug(migrated, provider);
-  if (!normalized) {
-    return null;
+  const candidates = [...resolveRetiredSelectableModelMigrations(provider, trimmed), trimmed];
+  for (const candidate of candidates) {
+    const normalized = normalizeModelSlug(candidate, provider);
+    if (!normalized) {
+      continue;
+    }
+    const resolved = options.find((option) => option.slug === normalized);
+    if (resolved) {
+      return resolved.slug;
+    }
   }
-
-  const resolved = options.find((option) => option.slug === normalized);
-  return resolved ? resolved.slug : null;
+  return null;
 }
 
 function resolveModelSlug(model: string | null | undefined, provider: ProviderDriverKind): string {
@@ -334,6 +340,7 @@ export function resolveModelSlugForProvider(
 /** A single model a provider instance serves, plus its default option selections. */
 export interface ProviderModelEntry {
   readonly slug: string;
+  readonly isCustom: boolean;
   readonly defaultOptions: ReadonlyArray<ProviderOptionSelection> | undefined;
   readonly optionDescriptors: ReadonlyArray<ProviderOptionDescriptor> | undefined;
 }
@@ -458,12 +465,17 @@ export function pickModelSelectionFromInstances(
     (preferInstanceId !== undefined && source.instanceId === preferInstanceId ? 0 : 1);
 
   // Best (highest-priority, source-preferred) instance that serves an exact slug.
-  const resolveSlug = (slug: string): ModelSelection | null => {
+  const resolveSlug = (
+    slug: string,
+    acceptEntry: (entry: ProviderModelEntry) => boolean = () => true,
+  ): ModelSelection | null => {
     const best = sources
-      .filter((source) => source.models.some((entry) => entry.slug === slug))
+      .filter((source) => source.models.some((entry) => entry.slug === slug && acceptEntry(entry)))
       .sort((a, b) => rank(a) - rank(b))[0];
     if (best === undefined) return null;
-    const entry = best.models.find((candidate) => candidate.slug === slug);
+    const entry = best.models.find(
+      (candidate) => candidate.slug === slug && acceptEntry(candidate),
+    );
     return makeModelSelection(
       best.instanceId,
       best.driverKind,
@@ -472,6 +484,43 @@ export function pickModelSelectionFromInstances(
       entry?.optionDescriptors,
     );
   };
+
+  const resolveBestCanonical = (canonicals: ReadonlySet<string>): ModelSelection | null => {
+    let best: ModelSelection | null = null;
+    let bestRank = Number.POSITIVE_INFINITY;
+    for (const canonical of canonicals) {
+      const selection = resolveSlug(canonical);
+      if (selection === null) continue;
+      const chosen = sources.find((source) => source.instanceId === selection.instanceId);
+      const selectionRank = chosen ? rank(chosen) : Number.POSITIVE_INFINITY;
+      if (selectionRank < bestRank) {
+        best = selection;
+        bestRank = selectionRank;
+      }
+    }
+    return best;
+  };
+
+  // Retired built-ins migrate before aggregator exact matches. When the latest
+  // replacement is version-gated, stay on the newest Opus model the native
+  // Claude instance actually serves instead of falling to an unrelated model.
+  const migrations = new Set<string>();
+  for (const source of sources) {
+    for (const migrated of resolveRetiredSelectableModelMigrations(source.driverKind, trimmed)) {
+      migrations.add(migrated);
+    }
+  }
+
+  // Preserve an exact provider-owned custom model before migrating a retired
+  // built-in. This is gated to retired inputs so unrelated slug collisions
+  // still use normal native-provider priority.
+  if (migrations.size > 0) {
+    const directCustom = resolveSlug(trimmed, (entry) => entry.isCustom);
+    if (directCustom !== null) return directCustom;
+  }
+
+  const migrated = resolveBestCanonical(migrations);
+  if (migrated !== null) return migrated;
 
   // 1. Direct match against the models each provider actually serves.
   const direct = resolveSlug(trimmed);
@@ -489,22 +538,11 @@ export function pickModelSelectionFromInstances(
       ? aliases[trimmed]
       : undefined;
     if (typeof canonical === "string") canonicals.add(canonical);
-    const migrated = resolveRetiredSelectableModelMigration(source.driverKind, trimmed);
-    if (typeof migrated === "string") canonicals.add(migrated);
-  }
-  let best: ModelSelection | null = null;
-  let bestRank = Number.POSITIVE_INFINITY;
-  for (const canonical of canonicals) {
-    const selection = resolveSlug(canonical);
-    if (selection === null) continue;
-    const chosen = sources.find((source) => source.instanceId === selection.instanceId);
-    const selectionRank = chosen ? rank(chosen) : Number.POSITIVE_INFINITY;
-    if (selectionRank < bestRank) {
-      best = selection;
-      bestRank = selectionRank;
+    for (const migrated of resolveRetiredSelectableModelMigrations(source.driverKind, trimmed)) {
+      canonicals.add(migrated);
     }
   }
-  return best;
+  return resolveBestCanonical(canonicals);
 }
 
 /** Trim a string, returning null for empty/missing values. */

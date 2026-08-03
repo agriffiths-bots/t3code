@@ -134,6 +134,17 @@ describe("resolveSelectableModel", () => {
         { slug: "claude-opus-4-8", name: "Custom legacy Opus" },
       ]),
     ).toBe("claude-opus-4-8");
+    expect(
+      resolveSelectableModel(ProviderDriverKind.make("claudeAgent"), "claude-opus-4-8", [
+        { slug: "claude-fable-5", name: "Claude Fable 5" },
+        { slug: "claude-opus-4-7", name: "Claude Opus 4.7" },
+      ]),
+    ).toBe("claude-opus-4-7");
+    expect(
+      resolveSelectableModel(ProviderDriverKind.make("claudeAgent"), "opus-4.8", [
+        { slug: "claude-opus-4-6", name: "Claude Opus 4.6" },
+      ]),
+    ).toBe("claude-opus-4-6");
   });
 });
 
@@ -250,11 +261,13 @@ describe("pickModelSelectionFromInstances", () => {
     id: string,
     driver: string,
     slugs: ReadonlyArray<string>,
+    customSlugs: ReadonlyArray<string> = [],
   ): ProviderModelSource => ({
     instanceId: ProviderInstanceId.make(id),
     driverKind: ProviderDriverKind.make(driver),
     models: slugs.map((slug) => ({
       slug,
+      isCustom: customSlugs.includes(slug),
       defaultOptions: undefined,
       optionDescriptors: undefined,
     })),
@@ -324,6 +337,59 @@ describe("pickModelSelectionFromInstances", () => {
     });
   });
 
+  it("migrates retired aggregator Opus entries to the newest native Opus available", () => {
+    const withStaleAggregator: ReadonlyArray<ProviderModelSource> = [
+      source("claudeAgent", "claudeAgent", ["claude-opus-5", "claude-opus-4-7"]),
+      source("cursor", "cursor", ["claude-opus-4-8"]),
+    ];
+    expect(pickModelSelectionFromInstances("claude-opus-4-8", withStaleAggregator)).toEqual({
+      instanceId: "claudeAgent",
+      model: "claude-opus-5",
+    });
+
+    const withVersionGatedOpus5: ReadonlyArray<ProviderModelSource> = [
+      source("claudeAgent", "claudeAgent", ["claude-fable-5", "claude-opus-4-7"]),
+      source("cursor", "cursor", ["claude-opus-5", "claude-opus-4-8"]),
+    ];
+    expect(pickModelSelectionFromInstances("claude-opus-4-8", withVersionGatedOpus5)).toEqual({
+      instanceId: "claudeAgent",
+      model: "claude-opus-4-7",
+    });
+  });
+
+  it("preserves an exact retired slug served directly by a Claude custom instance", () => {
+    const withClaudeCustom: ReadonlyArray<ProviderModelSource> = [
+      source("claude_custom", "claudeAgent", ["claude-opus-4-8"], ["claude-opus-4-8"]),
+      source("claudeAgent", "claudeAgent", ["claude-opus-5"]),
+    ];
+    expect(pickModelSelectionFromInstances("claude-opus-4-8", withClaudeCustom)).toEqual({
+      instanceId: "claude_custom",
+      model: "claude-opus-4-8",
+    });
+  });
+
+  it("preserves an exact retired slug owned by an aggregator custom model", () => {
+    const withCursorCustom: ReadonlyArray<ProviderModelSource> = [
+      source("claudeAgent", "claudeAgent", ["claude-opus-5"]),
+      source("cursor", "cursor", ["claude-opus-4-8"], ["claude-opus-4-8"]),
+    ];
+    expect(pickModelSelectionFromInstances("claude-opus-4-8", withCursorCustom)).toEqual({
+      instanceId: "cursor",
+      model: "claude-opus-4-8",
+    });
+  });
+
+  it("keeps native-provider priority for unrelated exact custom slug collisions", () => {
+    const withClaudeCollision: ReadonlyArray<ProviderModelSource> = [
+      source("claude_custom", "claudeAgent", ["gpt-5.5"]),
+      source("codex", "codex", ["gpt-5.5"]),
+    ];
+    expect(pickModelSelectionFromInstances("gpt-5.5", withClaudeCollision)).toEqual({
+      instanceId: "codex",
+      model: "gpt-5.5",
+    });
+  });
+
   it("routes a provider-specific alias's canonical model to the native provider", () => {
     // "opus-4.6-thinking" is a Cursor-only alias -> claude-opus-4-6, which both
     // claudeAgent and cursor serve. The native provider must still win.
@@ -351,6 +417,7 @@ describe("pickModelSelectionFromInstances", () => {
         models: [
           {
             slug: "claude-opus-4-6",
+            isCustom: false,
             defaultOptions: [
               { id: "effort", value: "high" },
               { id: "fastMode", value: true },
@@ -378,6 +445,7 @@ describe("pickModelSelectionFromInstances", () => {
         models: [
           {
             slug: "gpt-5.5",
+            isCustom: false,
             defaultOptions: [
               { id: "reasoningEffort", value: "medium" },
               { id: "serviceTier", value: "fast" },
@@ -402,6 +470,7 @@ describe("pickModelSelectionFromInstances", () => {
         models: [
           {
             slug: "claude-opus-5",
+            isCustom: false,
             defaultOptions: [{ id: "effort", value: "high" }],
             optionDescriptors: [
               {
@@ -417,6 +486,7 @@ describe("pickModelSelectionFromInstances", () => {
           },
           {
             slug: "claude-sonnet-5",
+            isCustom: false,
             defaultOptions: [{ id: "effort", value: "medium" }],
             optionDescriptors: [
               {
@@ -432,6 +502,7 @@ describe("pickModelSelectionFromInstances", () => {
           },
           {
             slug: "claude-fable-5",
+            isCustom: false,
             defaultOptions: [{ id: "effort", value: "xhigh" }],
             optionDescriptors: [
               {
@@ -482,6 +553,7 @@ describe("pickModelSelectionFromInstances", () => {
         models: [
           {
             slug: "claude-opus-4-8",
+            isCustom: false,
             defaultOptions: [
               { id: "reasoning", value: "medium" },
               { id: "contextWindow", value: "1m" },
@@ -517,6 +589,7 @@ describe("pickModelSelectionFromInstances", () => {
         models: [
           {
             slug: "claude-opus-4-8",
+            isCustom: false,
             defaultOptions: [{ id: "contextWindow", value: "1m" }],
             optionDescriptors: [
               {
@@ -551,6 +624,7 @@ describe("pickModelSelectionFromInstances", () => {
         models: [
           {
             slug: "claude-opus-4-8",
+            isCustom: false,
             defaultOptions: [
               { id: "reasoning", value: "medium" },
               { id: "contextWindow", value: "1m" },
