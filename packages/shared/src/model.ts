@@ -14,6 +14,15 @@ import {
 const DEFAULT_PROVIDER_DRIVER_KIND = ProviderDriverKind.make("codex");
 const CLAUDE_PROVIDER_DRIVER_KIND = ProviderDriverKind.make("claudeAgent");
 
+export const CLAUDE_RETIRED_MODEL_SLUGS: ReadonlySet<string> = new Set(["claude-opus-4-8"]);
+
+export const CLAUDE_RESERVED_MODEL_SLUGS: ReadonlySet<string> = new Set([
+  "claude-fable-5",
+  "claude-opus-5",
+  "claude-opus-4-7",
+  ...CLAUDE_RETIRED_MODEL_SLUGS,
+]);
+
 const RETIRED_SELECTABLE_MODEL_MIGRATIONS: Readonly<
   Record<string, Readonly<Record<string, ReadonlyArray<string>>>>
 > = {
@@ -520,6 +529,19 @@ export function pickModelSelectionFromInstances(
     for (const migrated of resolveRetiredSelectableModelMigrations(source.driverKind, trimmed)) {
       migrations.add(migrated);
     }
+  }
+
+  // An exact legacy slug remains runnable when the native Claude provider
+  // still reports it (for example, a persisted session or schedule created
+  // before catalog retirement). Aggregator-only stale entries must not win:
+  // those continue through the native replacement migration below.
+  if (migrations.size > 0 && CLAUDE_RETIRED_MODEL_SLUGS.has(trimmed)) {
+    const directNative = resolveSlug(
+      trimmed,
+      () => true,
+      (source) => source.driverKind === CLAUDE_PROVIDER_DRIVER_KIND,
+    );
+    if (directNative !== null) return directNative;
   }
 
   // Preserve an exact provider-owned custom model before migrating a retired

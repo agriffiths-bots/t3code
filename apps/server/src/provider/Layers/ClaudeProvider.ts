@@ -13,6 +13,7 @@ import * as Path from "effect/Path";
 import * as Result from "effect/Result";
 import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process";
 import {
+  CLAUDE_RESERVED_MODEL_SLUGS,
   createModelCapabilities,
   getModelSelectionStringOptionValue,
   getProviderOptionCurrentValue,
@@ -270,11 +271,6 @@ const BUILT_IN_MODELS: ReadonlyArray<ServerProviderModel> = [
     }),
   },
 ];
-const RESERVED_CLAUDE_MODEL_SLUGS = new Set([
-  ...BUILT_IN_MODELS.map((model) => model.slug),
-  "claude-opus-4-8",
-]);
-
 function supportsClaudeOpus5(version: string | null | undefined): boolean {
   return version ? compareSemverVersions(version, MINIMUM_CLAUDE_OPUS_5_VERSION) >= 0 : false;
 }
@@ -312,7 +308,7 @@ function providerClaudeModelsFromSettings(
     getBuiltInClaudeModelsForVersion(version),
     customModels,
     DEFAULT_CLAUDE_MODEL_CAPABILITIES,
-    RESERVED_CLAUDE_MODEL_SLUGS,
+    CLAUDE_RESERVED_MODEL_SLUGS,
   );
 }
 

@@ -384,6 +384,17 @@ describe("pickModelSelectionFromInstances", () => {
     });
   });
 
+  it("preserves exact retired Opus when the native provider still serves it", () => {
+    const withNativeLegacyOpus: ReadonlyArray<ProviderModelSource> = [
+      source("cursor", "cursor", ["claude-opus-4-8"]),
+      source("claudeAgent", "claudeAgent", ["claude-opus-4-8", "claude-sonnet-4-6"]),
+    ];
+    expect(pickModelSelectionFromInstances("claude-opus-4-8", withNativeLegacyOpus)).toEqual({
+      instanceId: "claudeAgent",
+      model: "claude-opus-4-8",
+    });
+  });
+
   it("preserves an exact retired slug served directly by a Claude custom instance", () => {
     const withClaudeCustom: ReadonlyArray<ProviderModelSource> = [
       source("claude_custom", "claudeAgent", ["claude-opus-4-8"], ["claude-opus-4-8"]),

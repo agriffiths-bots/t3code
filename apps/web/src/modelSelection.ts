@@ -8,6 +8,7 @@ import {
   type ServerProvider,
 } from "@t3tools/contracts";
 import {
+  CLAUDE_RESERVED_MODEL_SLUGS,
   createModelSelection,
   normalizeCustomModelSlug,
   resolveSelectableModel,
@@ -116,6 +117,16 @@ function applyInstanceModelPreferences(
   );
 }
 
+function customModelExclusions(
+  provider: ProviderDriverKind,
+  builtInModelSlugs: ReadonlySet<string>,
+): ReadonlySet<string> {
+  if (provider !== ProviderDriverKind.make("claudeAgent")) {
+    return builtInModelSlugs;
+  }
+  return new Set([...builtInModelSlugs, ...CLAUDE_RESERVED_MODEL_SLUGS]);
+}
+
 export function normalizeCustomModelSlugs(
   models: Iterable<string | null | undefined>,
   builtInModelSlugs: ReadonlySet<string>,
@@ -164,7 +175,10 @@ export function getAppModelOptions(
   // see the user's authored custom models.
   const defaultInstanceId = defaultInstanceIdForDriver(provider);
   const customModels = readInstanceCustomModels(settings, defaultInstanceId, provider);
-  for (const slug of normalizeCustomModelSlugs(customModels, builtInModelSlugs)) {
+  for (const slug of normalizeCustomModelSlugs(
+    customModels,
+    customModelExclusions(provider, builtInModelSlugs),
+  )) {
     if (seen.has(slug)) {
       continue;
     }
@@ -207,7 +221,10 @@ export function getAppModelOptionsForInstance(
   );
 
   const customModels = readInstanceCustomModels(settings, entry.instanceId, entry.driverKind);
-  for (const slug of normalizeCustomModelSlugs(customModels, builtInModelSlugs)) {
+  for (const slug of normalizeCustomModelSlugs(
+    customModels,
+    customModelExclusions(entry.driverKind, builtInModelSlugs),
+  )) {
     if (seen.has(slug)) {
       continue;
     }

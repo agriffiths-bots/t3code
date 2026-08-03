@@ -41,7 +41,11 @@ import {
   replaceTextRange,
   shouldSubmitComposerOnEnter,
 } from "../../composer-logic";
-import { deriveComposerSendState, readFileAsDataUrl } from "../ChatView.logic";
+import {
+  deriveComposerSendState,
+  readFileAsDataUrl,
+  threadHasEstablishedProviderBinding,
+} from "../ChatView.logic";
 import {
   dataTransferHasComposerMention,
   makeComposerMentionDragHandlers,
@@ -802,6 +806,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     providers: providerStatuses,
     selectedProvider,
     selectedInstanceId,
+    hasEstablishedProviderBinding: threadHasEstablishedProviderBinding(activeThread),
     threadModelSelection: activeThreadModelSelection,
     projectModelSelection: activeProjectDefaultModelSelection,
     settings,
