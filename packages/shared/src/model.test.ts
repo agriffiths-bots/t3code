@@ -370,6 +370,14 @@ describe("pickModelSelectionFromInstances", () => {
       instanceId: "claudeAgent",
       model: "claude-opus-4-7",
     });
+    const withCrossProviderCustomOpus5: ReadonlyArray<ProviderModelSource> = [
+      source("codex", "codex", ["claude-opus-5"], ["claude-opus-5"]),
+      source("claudeAgent", "claudeAgent", ["claude-opus-4-7"]),
+    ];
+    expect(pickModelSelectionFromInstances("opus", withCrossProviderCustomOpus5)).toEqual({
+      instanceId: "claudeAgent",
+      model: "claude-opus-4-7",
+    });
     expect(pickModelSelectionFromInstances("opus-5", withVersionGatedOpus5)).toEqual({
       instanceId: "cursor",
       model: "claude-opus-5",

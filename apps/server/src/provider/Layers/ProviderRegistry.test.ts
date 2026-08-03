@@ -646,6 +646,26 @@ it.layer(Layer.mergeAll(NodeServices.layer, ServerSettingsModule.layerTest(), Te
           ["claude-opus-4-7", "claude-opus-5"],
         );
 
+        const missingClaudeProvider = {
+          ...transientFailureProvider,
+          installed: false,
+          checkedAt: "2026-08-03T00:03:30.000Z",
+          models: [
+            {
+              slug: "claude-sonnet-4-6",
+              name: "Claude Sonnet 4.6",
+              isCustom: false,
+              capabilities: getClaudeModelCapabilities("claude-sonnet-4-6"),
+            },
+          ],
+        } satisfies ServerProvider;
+        assert.deepStrictEqual(
+          mergeProviderSnapshot(refreshedProvider, missingClaudeProvider).models.map(
+            (model) => model.slug,
+          ),
+          ["claude-sonnet-4-6"],
+        );
+
         const firstFailureSnapshot = mergeProviderSnapshot(
           refreshedProvider,
           transientFailureProvider,
@@ -1686,6 +1706,12 @@ it.layer(Layer.mergeAll(NodeServices.layer, ServerSettingsModule.layerTest(), Te
             isCustom: false,
             capabilities: getClaudeModelCapabilities("claude-sonnet-4-6"),
           },
+          {
+            slug: "removed-custom-opus",
+            name: "Removed Custom Opus",
+            isCustom: true,
+            capabilities: getClaudeModelCapabilities("claude-opus-5"),
+          },
         ] as const;
         const failureModels = [
           {
@@ -1709,6 +1735,10 @@ it.layer(Layer.mergeAll(NodeServices.layer, ServerSettingsModule.layerTest(), Te
           skills: [],
         } as const satisfies ServerProvider;
         const learned = reconcileKnownClaudeModelsAfterVersionProbe([], readySnapshot);
+        assert.deepStrictEqual(
+          learned.knownModels.map((model) => model.slug),
+          ["claude-opus-5"],
+        );
         const transientFailure = reconcileKnownClaudeModelsAfterVersionProbe(learned.knownModels, {
           ...readySnapshot,
           status: "error",

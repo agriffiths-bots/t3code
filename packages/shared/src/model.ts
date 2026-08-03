@@ -12,6 +12,7 @@ import {
 } from "@t3tools/contracts";
 
 const DEFAULT_PROVIDER_DRIVER_KIND = ProviderDriverKind.make("codex");
+const CLAUDE_PROVIDER_DRIVER_KIND = ProviderDriverKind.make("claudeAgent");
 
 const RETIRED_SELECTABLE_MODEL_MIGRATIONS: Readonly<
   Record<string, Readonly<Record<string, ReadonlyArray<string>>>>
@@ -469,9 +470,14 @@ export function pickModelSelectionFromInstances(
   const resolveSlug = (
     slug: string,
     acceptEntry: (entry: ProviderModelEntry) => boolean = () => true,
+    acceptSource: (source: ProviderModelSource) => boolean = () => true,
   ): ModelSelection | null => {
     const best = sources
-      .filter((source) => source.models.some((entry) => entry.slug === slug && acceptEntry(entry)))
+      .filter(
+        (source) =>
+          acceptSource(source) &&
+          source.models.some((entry) => entry.slug === slug && acceptEntry(entry)),
+      )
       .sort((a, b) => rank(a) - rank(b))[0];
     if (best === undefined) return null;
     const entry = best.models.find(
@@ -486,11 +492,15 @@ export function pickModelSelectionFromInstances(
     );
   };
 
-  const resolveBestCanonical = (canonicals: ReadonlySet<string>): ModelSelection | null => {
+  const resolveBestCanonical = (
+    canonicals: ReadonlySet<string>,
+    acceptEntry?: (entry: ProviderModelEntry) => boolean,
+    acceptSource?: (source: ProviderModelSource) => boolean,
+  ): ModelSelection | null => {
     let best: ModelSelection | null = null;
     let bestRank = Number.POSITIVE_INFINITY;
     for (const canonical of canonicals) {
-      const selection = resolveSlug(canonical);
+      const selection = resolveSlug(canonical, acceptEntry, acceptSource);
       if (selection === null) continue;
       const chosen = sources.find((source) => source.instanceId === selection.instanceId);
       const selectionRank = chosen ? rank(chosen) : Number.POSITIVE_INFINITY;
@@ -520,8 +530,13 @@ export function pickModelSelectionFromInstances(
     if (directCustom !== null) return directCustom;
   }
 
-  const migrated = resolveBestCanonical(migrations);
+  const migrated = resolveBestCanonical(
+    migrations,
+    (entry) => !entry.isCustom,
+    (source) => source.driverKind === CLAUDE_PROVIDER_DRIVER_KIND,
+  );
   if (migrated !== null) return migrated;
+  if (migrations.size > 0) return null;
 
   // 1. Direct match against the models each provider actually serves.
   const direct = resolveSlug(trimmed);

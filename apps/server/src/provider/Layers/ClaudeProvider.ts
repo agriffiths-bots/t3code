@@ -300,6 +300,15 @@ function getBuiltInClaudeModelsForVersion(
   });
 }
 
+function isVersionGatedClaudeBuiltInModel(model: ServerProviderModel): boolean {
+  return (
+    !model.isCustom &&
+    (model.slug === "claude-opus-5" ||
+      model.slug === "claude-fable-5" ||
+      model.slug === "claude-opus-4-7")
+  );
+}
+
 export function reconcileKnownClaudeModelsAfterVersionProbe(
   knownModels: ReadonlyArray<ServerProviderModel>,
   nextSnapshot: ServerProvider,
@@ -311,7 +320,10 @@ export function reconcileKnownClaudeModelsAfterVersionProbe(
     return { snapshot: nextSnapshot, knownModels: [] };
   }
   if (nextSnapshot.version !== null) {
-    return { snapshot: nextSnapshot, knownModels: nextSnapshot.models };
+    return {
+      snapshot: nextSnapshot,
+      knownModels: nextSnapshot.models.filter(isVersionGatedClaudeBuiltInModel),
+    };
   }
   if (nextSnapshot.status !== "error" || knownModels.length === 0) {
     return { snapshot: nextSnapshot, knownModels };

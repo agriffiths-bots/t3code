@@ -136,7 +136,10 @@ export const mergeProviderSnapshot = (
           nextProvider.driver,
           previousProvider.models,
           nextProvider.models,
-          nextProvider.driver === CLAUDE_DRIVER_KIND && nextProvider.version === null,
+          nextProvider.driver === CLAUDE_DRIVER_KIND &&
+            nextProvider.installed &&
+            nextProvider.status === "error" &&
+            nextProvider.version === null,
         ),
       };
 
