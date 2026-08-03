@@ -78,8 +78,10 @@ const makeManualProviderMaintenanceCapabilities = (provider: ProviderDriverKind)
 const hasModelCapabilities = (model: ServerProvider["models"][number]): boolean =>
   (model.capabilities?.optionDescriptors?.length ?? 0) > 0;
 
+const CLAUDE_DRIVER_KIND = ProviderDriverKind.make("claudeAgent");
+
 const RETIRED_BUILT_IN_MODEL_SLUGS_BY_DRIVER: Readonly<Record<string, ReadonlySet<string>>> = {
-  claudeAgent: new Set(["claude-opus-4-8"]),
+  [CLAUDE_DRIVER_KIND]: new Set(["claude-opus-4-8"]),
 };
 
 const isRetiredBuiltInModel = (
@@ -99,7 +101,7 @@ const mergeProviderModels = (
   );
   const activeNextModels = nextModels.filter((model) => !isRetiredBuiltInModel(driver, model));
 
-  if (activeNextModels.length === 0 && retainedPreviousModels.length > 0) {
+  if (nextModels.length === 0 && retainedPreviousModels.length > 0) {
     return retainedPreviousModels;
   }
 
@@ -117,7 +119,12 @@ const mergeProviderModels = (
     };
   });
   const nextSlugs = new Set(activeNextModels.map((model) => model.slug));
-  return [...mergedModels, ...retainedPreviousModels.filter((model) => !nextSlugs.has(model.slug))];
+  return [
+    ...mergedModels,
+    ...retainedPreviousModels.filter(
+      (model) => !nextSlugs.has(model.slug) && (driver !== CLAUDE_DRIVER_KIND || model.isCustom),
+    ),
+  ];
 };
 
 export const mergeProviderSnapshot = (

@@ -604,6 +604,27 @@ it.layer(Layer.mergeAll(NodeServices.layer, ServerSettingsModule.layerTest(), Te
           ),
           ["claude-opus-5"],
         );
+
+        const olderClaudeProvider = {
+          ...refreshedProvider,
+          checkedAt: "2026-08-03T00:02:00.000Z",
+          version: "2.1.218",
+          models: [
+            {
+              slug: "claude-opus-4-7",
+              name: "Claude Opus 4.7",
+              isCustom: false,
+              capabilities: getClaudeModelCapabilities("claude-opus-4-7"),
+            },
+          ],
+        } satisfies ServerProvider;
+
+        assert.deepStrictEqual(
+          mergeProviderSnapshot(refreshedProvider, olderClaudeProvider).models.map(
+            (model) => model.slug,
+          ),
+          ["claude-opus-4-7"],
+        );
       });
 
       it("fills missing capabilities from the previous provider snapshot", () => {
