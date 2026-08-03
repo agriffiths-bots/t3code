@@ -30,11 +30,16 @@ export const FORBIDDEN_DEV_PORTS: ReadonlyArray<number> = [15773];
 // Explicit or protocol-relative URL + optional userinfo + host + explicit port.
 // Userinfo is matched greedily through the final @ so it cannot conceal the
 // host, but is never copied into findings. URL parsing below normalizes IPv4
-// shorthand/integer spellings before loopback classification.
+// shorthand/integer spellings before loopback classification. WHATWG special
+// schemes also normalize missing or backslash separators, so accept those raw
+// forms here and classify their host exactly as the client does.
 function loopbackUrlRegex(): RegExp {
   const userinfo = "(?:[^\\s/?#'\"<>\\\\]*@)?";
   const host = "(\\[[^\\]\\s/?#'\"<>\\\\]+\\]|[^\\s:/?#'\"<>\\\\]+)";
-  return new RegExp(`(?:(https?|wss?)://|(?<!:)//)${userinfo}${host}:(\\d+)`, "gi");
+  return new RegExp(
+    `(?:(https?|wss?):[\\\\/]*|(?<![:\\\\/])[\\\\/]{2,})${userinfo}${host}:(\\d+)`,
+    "gi",
+  );
 }
 
 function isLoopbackUrlHost(scheme: string, host: string, port: string): boolean {
@@ -46,14 +51,19 @@ function isLoopbackUrlHost(scheme: string, host: string, port: string): boolean 
     if (
       parsedHost === "localhost" ||
       parsedHost.endsWith(".localhost") ||
+      parsedHost === "::" ||
       parsedHost === "::1" ||
       parsedHost === "0.0.0.0"
     ) {
       return true;
     }
-    const mappedIpv4High = /^::ffff:([0-9a-f]{1,4}):[0-9a-f]{1,4}$/.exec(parsedHost)?.[1];
-    if (mappedIpv4High !== undefined && (Number.parseInt(mappedIpv4High, 16) & 0xff00) === 0x7f00) {
-      return true;
+    const mappedIpv4 = /^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/.exec(parsedHost);
+    if (mappedIpv4 !== null) {
+      const high = Number.parseInt(mappedIpv4[1] ?? "", 16);
+      const low = Number.parseInt(mappedIpv4[2] ?? "", 16);
+      if ((high === 0 && low === 0) || (high & 0xff00) === 0x7f00) {
+        return true;
+      }
     }
     return /^\d+\.\d+\.\d+\.\d+$/.test(parsedHost) && parsedHost.split(".")[0] === "127";
   } catch {

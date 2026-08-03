@@ -35,12 +35,20 @@ it("flags ported loopback backend URLs across schemes and host forms", () => {
     "http://2130706433:3773/api",
     "http://[::ffff:127.0.0.1]:3773/api",
     "ws://[::ffff:127.255.255.255]:3773/ws",
+    "http://[::ffff:0.0.0.0]:3773/api",
+    "http://[::]:3773/api",
     "http://[::1]:9229/foo",
     "http://0.0.0.0:8080/bar",
     "http://dev.localhost:8080/bar",
     "//localhost:3773/api",
     "//127.0.0.2:3773/api",
     "//[::1]:8443/session",
+    String.raw`http:localhost:3773/api`,
+    String.raw`http:/localhost:3773/api`,
+    String.raw`http:\\localhost:3773/api`,
+    String.raw`wss:\\\\127.0.0.2:3773/ws`,
+    String.raw`\\\\localhost:3773/api`,
+    String.raw`/\\localhost:3773/api`,
   ]) {
     const findings = scanTextForDevEndpoints(`x=${JSON.stringify(url)}`);
     assert.isAtLeast(findings.length, 1, `expected a finding for ${url}`);
@@ -148,7 +156,10 @@ it("does not flag ported public backend URLs", () => {
   for (const url of [
     "https://example.com:3773/api",
     "ftp://localhost:3773/api",
+    String.raw`ftp:\\\\localhost:3773/api`,
     "http://128.0.0.1:3773/api",
+    "http://0.0.1.1:3773/api",
+    "http://[::ffff:0.0.1.1]:3773/api",
     "http://[::ffff:128.0.0.1]:3773/api",
     "http://127.example.com:3773/api",
   ]) {
