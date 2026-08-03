@@ -35,6 +35,7 @@ import {
   checkClaudeProviderStatus,
   getClaudeModelCapabilities,
   makePendingClaudeProvider,
+  reconcileKnownClaudeModelsAfterVersionProbe,
 } from "./ClaudeProvider.ts";
 import * as OpenCodeRuntime from "../opencodeRuntime.ts";
 import * as ProviderEventLoggers from "./ProviderEventLoggers.ts";
@@ -1670,6 +1671,81 @@ it.layer(Layer.mergeAll(NodeServices.layer, ServerSettingsModule.layerTest(), Te
           );
         }),
       );
+
+      it("preserves proven models on transient failures but clears them across uninstall", () => {
+        const knownModels = [
+          {
+            slug: "claude-opus-5",
+            name: "Claude Opus 5",
+            isCustom: false,
+            capabilities: getClaudeModelCapabilities("claude-opus-5"),
+          },
+          {
+            slug: "claude-sonnet-4-6",
+            name: "Claude Sonnet 4.6",
+            isCustom: false,
+            capabilities: getClaudeModelCapabilities("claude-sonnet-4-6"),
+          },
+        ] as const;
+        const failureModels = [
+          {
+            slug: "claude-sonnet-4-6",
+            name: "Claude Sonnet 4.6",
+            isCustom: false,
+            capabilities: getClaudeModelCapabilities("claude-sonnet-4-6"),
+          },
+        ] as const;
+        const readySnapshot = {
+          instanceId: ProviderInstanceId.make("claudeAgent"),
+          driver: ProviderDriverKind.make("claudeAgent"),
+          status: "ready",
+          enabled: true,
+          installed: true,
+          auth: { status: "authenticated" },
+          checkedAt: "2026-08-03T00:00:00.000Z",
+          version: "2.1.219",
+          models: knownModels,
+          slashCommands: [],
+          skills: [],
+        } as const satisfies ServerProvider;
+        const learned = reconcileKnownClaudeModelsAfterVersionProbe([], readySnapshot);
+        const transientFailure = reconcileKnownClaudeModelsAfterVersionProbe(learned.knownModels, {
+          ...readySnapshot,
+          status: "error",
+          checkedAt: "2026-08-03T00:01:00.000Z",
+          version: null,
+          models: failureModels,
+        });
+        assert.deepStrictEqual(
+          transientFailure.snapshot.models.map((model) => model.slug),
+          ["claude-sonnet-4-6", "claude-opus-5"],
+        );
+
+        const missing = reconcileKnownClaudeModelsAfterVersionProbe(transientFailure.knownModels, {
+          ...readySnapshot,
+          status: "error",
+          installed: false,
+          checkedAt: "2026-08-03T00:02:00.000Z",
+          version: null,
+          models: failureModels,
+        });
+        assert.deepStrictEqual(missing.knownModels, []);
+
+        const replacementFailure = reconcileKnownClaudeModelsAfterVersionProbe(
+          missing.knownModels,
+          {
+            ...readySnapshot,
+            status: "error",
+            checkedAt: "2026-08-03T00:03:00.000Z",
+            version: null,
+            models: failureModels,
+          },
+        );
+        assert.deepStrictEqual(
+          replacementFailure.snapshot.models.map((model) => model.slug),
+          ["claude-sonnet-4-6"],
+        );
+      });
 
       it.effect("includes Claude Opus 5 on supported Claude Code versions", () =>
         Effect.gen(function* () {

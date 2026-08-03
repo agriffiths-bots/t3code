@@ -2,6 +2,7 @@ import {
   type ClaudeSettings,
   type ModelCapabilities,
   type ModelSelection,
+  type ServerProvider,
   type ServerProviderModel,
   type ServerProviderSlashCommand,
 } from "@t3tools/contracts";
@@ -297,6 +298,36 @@ function getBuiltInClaudeModelsForVersion(
     }
     return true;
   });
+}
+
+export function reconcileKnownClaudeModelsAfterVersionProbe(
+  knownModels: ReadonlyArray<ServerProviderModel>,
+  nextSnapshot: ServerProvider,
+): {
+  readonly snapshot: ServerProvider;
+  readonly knownModels: ReadonlyArray<ServerProviderModel>;
+} {
+  if (!nextSnapshot.installed) {
+    return { snapshot: nextSnapshot, knownModels: [] };
+  }
+  if (nextSnapshot.version !== null) {
+    return { snapshot: nextSnapshot, knownModels: nextSnapshot.models };
+  }
+  if (nextSnapshot.status !== "error" || knownModels.length === 0) {
+    return { snapshot: nextSnapshot, knownModels };
+  }
+
+  const nextSlugs = new Set(nextSnapshot.models.map((model) => model.slug));
+  return {
+    snapshot: {
+      ...nextSnapshot,
+      models: [
+        ...nextSnapshot.models,
+        ...knownModels.filter((model) => !nextSlugs.has(model.slug)),
+      ],
+    },
+    knownModels,
+  };
 }
 
 function formatClaudeOpus5UpgradeMessage(version: string | null): string {
