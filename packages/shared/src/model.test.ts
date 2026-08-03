@@ -114,6 +114,7 @@ describe("resolveSelectableModel", () => {
     const options = [
       { slug: "gpt-5.3-codex", name: "GPT-5.3 Codex" },
       { slug: "claude-sonnet-5", name: "Claude Sonnet 5" },
+      { slug: "claude-opus-5", name: "Claude Opus 5" },
     ];
     expect(resolveSelectableModel(ProviderDriverKind.make("codex"), "gpt-5.3-codex", options)).toBe(
       "gpt-5.3-codex",
@@ -124,6 +125,15 @@ describe("resolveSelectableModel", () => {
     expect(resolveSelectableModel(ProviderDriverKind.make("claudeAgent"), "sonnet", options)).toBe(
       "claude-sonnet-5",
     );
+    expect(
+      resolveSelectableModel(ProviderDriverKind.make("claudeAgent"), "claude-opus-4-8", options),
+    ).toBe("claude-opus-5");
+    expect(
+      resolveSelectableModel(ProviderDriverKind.make("claudeAgent"), "claude-opus-4-8", [
+        ...options,
+        { slug: "claude-opus-4-8", name: "Custom legacy Opus" },
+      ]),
+    ).toBe("claude-opus-4-8");
   });
 });
 
@@ -293,6 +303,10 @@ describe("pickModelSelectionFromInstances", () => {
 
   it("resolves registry aliases to the canonical live slug", () => {
     expect(pickModelSelectionFromInstances("opus", sources)).toEqual({
+      instanceId: "claudeAgent",
+      model: "claude-opus-5",
+    });
+    expect(pickModelSelectionFromInstances("claude-opus-4-8", sources)).toEqual({
       instanceId: "claudeAgent",
       model: "claude-opus-5",
     });

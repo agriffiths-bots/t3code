@@ -134,6 +134,25 @@ describe("instance-scoped model selection", () => {
     ).toBe("opus");
   });
 
+  it("migrates the retired built-in Opus 4.8 selection to Opus 5", () => {
+    const providers = [
+      provider({
+        provider: ProviderDriverKind.make("claudeAgent"),
+        instanceId: "claudeAgent",
+        models: ["claude-opus-5", "claude-fable-5"],
+      }),
+    ];
+
+    expect(
+      resolveAppModelSelectionForInstance(
+        ProviderInstanceId.make("claudeAgent"),
+        settingsWithProviderInstances(),
+        providers,
+        "claude-opus-4-8",
+      ),
+    ).toBe("claude-opus-5");
+  });
+
   it("includes Grok custom models from the selected provider instance", () => {
     const providers = [provider({ provider: ProviderDriverKind.make("grok"), instanceId: "grok" })];
     const settings: UnifiedSettings = {

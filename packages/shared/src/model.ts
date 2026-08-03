@@ -13,6 +13,21 @@ import {
 
 const DEFAULT_PROVIDER_DRIVER_KIND = ProviderDriverKind.make("codex");
 
+const RETIRED_SELECTABLE_MODEL_MIGRATIONS: Readonly<
+  Record<string, Readonly<Record<string, string>>>
+> = {
+  claudeAgent: {
+    "claude-opus-4-8": "claude-opus-5",
+  },
+};
+
+function resolveRetiredSelectableModelMigration(
+  provider: ProviderDriverKind,
+  value: string,
+): string | undefined {
+  return RETIRED_SELECTABLE_MODEL_MIGRATIONS[provider]?.[value];
+}
+
 export interface SelectableModelOption {
   slug: string;
   name: string;
@@ -291,7 +306,8 @@ export function resolveSelectableModel(
     return byName.slug;
   }
 
-  const normalized = normalizeModelSlug(trimmed, provider);
+  const migrated = resolveRetiredSelectableModelMigration(provider, trimmed) ?? trimmed;
+  const normalized = normalizeModelSlug(migrated, provider);
   if (!normalized) {
     return null;
   }
@@ -473,6 +489,8 @@ export function pickModelSelectionFromInstances(
       ? aliases[trimmed]
       : undefined;
     if (typeof canonical === "string") canonicals.add(canonical);
+    const migrated = resolveRetiredSelectableModelMigration(source.driverKind, trimmed);
+    if (typeof migrated === "string") canonicals.add(migrated);
   }
   let best: ModelSelection | null = null;
   let bestRank = Number.POSITIVE_INFINITY;
