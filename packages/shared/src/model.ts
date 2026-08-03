@@ -17,6 +17,7 @@ const RETIRED_SELECTABLE_MODEL_MIGRATIONS: Readonly<
   Record<string, Readonly<Record<string, ReadonlyArray<string>>>>
 > = {
   claudeAgent: {
+    opus: ["claude-opus-5", "claude-opus-4-7", "claude-opus-4-6", "claude-opus-4-5"],
     "claude-opus-4-8": ["claude-opus-5", "claude-opus-4-7", "claude-opus-4-6", "claude-opus-4-5"],
     "opus-4.8": ["claude-opus-5", "claude-opus-4-7", "claude-opus-4-6", "claude-opus-4-5"],
     "claude-opus-4.8": ["claude-opus-5", "claude-opus-4-7", "claude-opus-4-6", "claude-opus-4-5"],

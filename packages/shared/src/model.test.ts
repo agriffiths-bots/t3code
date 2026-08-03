@@ -145,6 +145,17 @@ describe("resolveSelectableModel", () => {
         { slug: "claude-opus-4-6", name: "Claude Opus 4.6" },
       ]),
     ).toBe("claude-opus-4-6");
+    expect(
+      resolveSelectableModel(ProviderDriverKind.make("claudeAgent"), "opus", [
+        { slug: "claude-fable-5", name: "Claude Fable 5" },
+        { slug: "claude-opus-4-7", name: "Claude Opus 4.7" },
+      ]),
+    ).toBe("claude-opus-4-7");
+    expect(
+      resolveSelectableModel(ProviderDriverKind.make("claudeAgent"), "opus-5", [
+        { slug: "claude-opus-4-7", name: "Claude Opus 4.7" },
+      ]),
+    ).toBeNull();
   });
 });
 
@@ -354,6 +365,14 @@ describe("pickModelSelectionFromInstances", () => {
     expect(pickModelSelectionFromInstances("claude-opus-4-8", withVersionGatedOpus5)).toEqual({
       instanceId: "claudeAgent",
       model: "claude-opus-4-7",
+    });
+    expect(pickModelSelectionFromInstances("opus", withVersionGatedOpus5)).toEqual({
+      instanceId: "claudeAgent",
+      model: "claude-opus-4-7",
+    });
+    expect(pickModelSelectionFromInstances("opus-5", withVersionGatedOpus5)).toEqual({
+      instanceId: "cursor",
+      model: "claude-opus-5",
     });
   });
 
