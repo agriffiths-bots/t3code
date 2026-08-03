@@ -658,6 +658,29 @@ describe("ClaudeAdapterLive", () => {
     );
   });
 
+  it.effect("preserves xhigh effort for Claude Opus 5", () => {
+    const harness = makeHarness();
+    return Effect.gen(function* () {
+      const adapter = yield* ClaudeAdapter;
+      yield* adapter.startSession({
+        threadId: THREAD_ID,
+        provider: ProviderDriverKind.make("claudeAgent"),
+        modelSelection: createModelSelection(
+          ProviderInstanceId.make("claudeAgent"),
+          "claude-opus-5",
+          [{ id: "effort", value: "xhigh" }],
+        ),
+        runtimeMode: "full-access",
+      });
+
+      const createInput = harness.getLastCreateQueryInput();
+      assert.equal(createInput?.options.effort, "xhigh");
+    }).pipe(
+      Effect.provideService(Random.Random, makeDeterministicRandomService()),
+      Effect.provide(harness.layer),
+    );
+  });
+
   it.effect("falls back to default effort when unsupported max is requested for Sonnet 4.6", () => {
     const harness = makeHarness();
     return Effect.gen(function* () {
@@ -1615,7 +1638,7 @@ describe("ClaudeAdapterLive", () => {
         parent_tool_use_id: null,
         message: {
           id: "assistant-message-effective-model-alias",
-          model: "claude-opus-4-8-20260718",
+          model: "claude-opus-5-20260718",
           content: [{ type: "text", text: "Alias answer" }],
         },
       } as unknown as SDKMessage);
@@ -1628,7 +1651,7 @@ describe("ClaudeAdapterLive", () => {
         session_id: "sdk-session-effective-model-alias",
         uuid: "result-effective-model-alias",
         modelUsage: {
-          "claude-opus-4-8-20260718": {
+          "claude-opus-5-20260718": {
             contextWindow: 1_000_000,
             maxOutputTokens: 128_000,
           },

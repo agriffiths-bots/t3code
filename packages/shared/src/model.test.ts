@@ -254,7 +254,7 @@ describe("pickModelSelectionFromInstances", () => {
   const sources: ReadonlyArray<ProviderModelSource> = [
     source("codex", "codex", ["gpt-5.4", "gpt-5.3-codex", "gpt-5.4-mini"]),
     source("claudeAgent", "claudeAgent", [
-      "claude-opus-4-8",
+      "claude-opus-5",
       "claude-opus-4-6",
       "claude-sonnet-4-6",
       "claude-sonnet-5",
@@ -268,9 +268,9 @@ describe("pickModelSelectionFromInstances", () => {
   ];
 
   it("matches plain canonical models against the live provider lists", () => {
-    expect(pickModelSelectionFromInstances("claude-opus-4-8", sources)).toEqual({
+    expect(pickModelSelectionFromInstances("claude-opus-5", sources)).toEqual({
       instanceId: "claudeAgent",
-      model: "claude-opus-4-8",
+      model: "claude-opus-5",
     });
     expect(pickModelSelectionFromInstances("gpt-5.4", sources)).toEqual({
       instanceId: "codex",
@@ -294,7 +294,7 @@ describe("pickModelSelectionFromInstances", () => {
   it("resolves registry aliases to the canonical live slug", () => {
     expect(pickModelSelectionFromInstances("opus", sources)).toEqual({
       instanceId: "claudeAgent",
-      model: "claude-opus-4-8",
+      model: "claude-opus-5",
     });
     expect(pickModelSelectionFromInstances("gpt-5-codex", sources)).toEqual({
       instanceId: "codex",
@@ -387,7 +387,7 @@ describe("pickModelSelectionFromInstances", () => {
         driverKind: ProviderDriverKind.make("claudeAgent"),
         models: [
           {
-            slug: "claude-opus-4-8",
+            slug: "claude-opus-5",
             defaultOptions: [{ id: "effort", value: "high" }],
             optionDescriptors: [
               {
@@ -443,9 +443,9 @@ describe("pickModelSelectionFromInstances", () => {
         { id: "serviceTier", value: "fast" },
       ],
     });
-    expect(pickModelSelectionFromInstances("claude-opus-4-8", withDirectiveModels)).toEqual({
+    expect(pickModelSelectionFromInstances("claude-opus-5", withDirectiveModels)).toEqual({
       instanceId: "claudeAgent",
-      model: "claude-opus-4-8",
+      model: "claude-opus-5",
       options: [{ id: "effort", value: "xhigh" }],
     });
     expect(pickModelSelectionFromInstances("claude-sonnet-5", withDirectiveModels)).toEqual({
@@ -576,7 +576,9 @@ describe("model slug normalization", () => {
   it("preserves exact custom slugs instead of expanding provider aliases", () => {
     const claude = ProviderDriverKind.make("claudeAgent");
 
-    expect(normalizeModelSlug("opus", claude)).toBe("claude-opus-4-8");
+    expect(normalizeModelSlug("opus", claude)).toBe("claude-opus-5");
+    expect(normalizeModelSlug("opus-4.8", claude)).toBe("claude-opus-5");
+    expect(normalizeModelSlug("claude-opus-4-8", claude)).toBe("claude-opus-5");
     expect(normalizeCustomModelSlug(" opus ")).toBe("opus");
   });
 });

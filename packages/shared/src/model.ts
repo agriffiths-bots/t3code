@@ -365,6 +365,7 @@ function makeModelSelection(
 
 const THREAD_CREATION_DEFAULT_EFFORT_BY_MODEL: Record<string, string> = {
   "gpt-5.5": "xhigh",
+  "claude-opus-5": "xhigh",
   "claude-opus-4-8": "xhigh",
   "claude-sonnet-5": "xhigh",
   "claude-fable-5": "high",
@@ -417,7 +418,7 @@ function isThreadCreationEffortAdvertised(
 /**
  * Resolve a plain model name to a `ModelSelection` against the LIVE provider
  * model lists, so a caller never has to know or guess a harness/instance id —
- * they pass e.g. `claude-opus-4-8`, `gpt-5.4`, or a future `fable-5` and the
+ * they pass e.g. `claude-opus-5`, `gpt-5.4`, or a future `fable-5` and the
  * official provider is found from the registry data itself (NO hardcoded
  * model-name patterns). Selection order: the native provider first
  * (`PROVIDER_INFERENCE_PRIORITY`, so Claude models resolve to `claudeAgent`, not
