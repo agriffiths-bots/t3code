@@ -8,7 +8,12 @@ import {
   type ServerProvider,
   type ServerProviderModel,
 } from "@t3tools/contracts";
-import { createModelCapabilities, normalizeModelSlug } from "@t3tools/shared/model";
+import {
+  CLAUDE_OPUS_MODEL_CAPABILITIES,
+  CLAUDE_RETIRED_MODEL_SLUGS,
+  createModelCapabilities,
+  normalizeModelSlug,
+} from "@t3tools/shared/model";
 
 const EMPTY_CAPABILITIES: ModelCapabilities = createModelCapabilities({
   optionDescriptors: [],
@@ -83,7 +88,12 @@ export function getProviderModelCapabilities(
   provider: ProviderDriverKind,
 ): ModelCapabilities {
   const slug = normalizeModelSlug(model, provider);
-  return models.find((candidate) => candidate.slug === slug)?.capabilities ?? EMPTY_CAPABILITIES;
+  const liveCapabilities = models.find((candidate) => candidate.slug === slug)?.capabilities;
+  if (liveCapabilities) return liveCapabilities;
+  if (slug && provider === "claudeAgent" && CLAUDE_RETIRED_MODEL_SLUGS.has(slug)) {
+    return CLAUDE_OPUS_MODEL_CAPABILITIES;
+  }
+  return EMPTY_CAPABILITIES;
 }
 
 export function getDefaultServerModel(

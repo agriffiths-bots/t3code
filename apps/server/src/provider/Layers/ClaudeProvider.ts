@@ -13,6 +13,7 @@ import * as Path from "effect/Path";
 import * as Result from "effect/Result";
 import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process";
 import {
+  CLAUDE_OPUS_MODEL_CAPABILITIES,
   CLAUDE_RESERVED_MODEL_SLUGS,
   createModelCapabilities,
   getModelSelectionStringOptionValue,
@@ -53,29 +54,6 @@ const MINIMUM_CLAUDE_OPUS_5_VERSION = "2.1.219";
 const MINIMUM_CLAUDE_FABLE_5_VERSION = "2.1.169";
 const MINIMUM_CLAUDE_OPUS_4_7_VERSION = "2.1.111";
 
-const CLAUDE_OPUS_CAPABILITIES = createModelCapabilities({
-  optionDescriptors: [
-    buildSelectOptionDescriptor({
-      id: "effort",
-      label: "Reasoning",
-      options: [
-        { value: "low", label: "Low" },
-        { value: "medium", label: "Medium" },
-        { value: "high", label: "High", isDefault: true },
-        { value: "xhigh", label: "Extra High" },
-        { value: "max", label: "Max" },
-        { value: "ultracode", label: "Ultracode" },
-        { value: "ultrathink", label: "Ultrathink" },
-      ],
-      promptInjectedValues: ["ultrathink"],
-    }),
-    buildBooleanOptionDescriptor({
-      id: "fastMode",
-      label: "Fast Mode",
-    }),
-  ],
-});
-
 const BUILT_IN_MODELS: ReadonlyArray<ServerProviderModel> = [
   {
     slug: "claude-fable-5",
@@ -112,7 +90,7 @@ const BUILT_IN_MODELS: ReadonlyArray<ServerProviderModel> = [
     slug: "claude-opus-5",
     name: "Claude Opus 5",
     isCustom: false,
-    capabilities: CLAUDE_OPUS_CAPABILITIES,
+    capabilities: CLAUDE_OPUS_MODEL_CAPABILITIES,
   },
   {
     slug: "claude-opus-4-7",
@@ -374,7 +352,7 @@ export function getClaudeModelCapabilities(model: string | null | undefined): Mo
   // Persisted 4.8 selections remain runnable, but 4.8 is intentionally absent
   // from the advertised model catalog now that Opus 5 replaces it.
   if (slug === "claude-opus-4-8") {
-    return CLAUDE_OPUS_CAPABILITIES;
+    return CLAUDE_OPUS_MODEL_CAPABILITIES;
   }
   return (
     BUILT_IN_MODELS.find((candidate) => candidate.slug === slug)?.capabilities ??
