@@ -14,7 +14,9 @@ import {
   ThreadId,
   type ModelSelection,
   type ProviderOptionSelection,
+  type ServerProvider,
 } from "@t3tools/contracts";
+import { DEFAULT_UNIFIED_SETTINGS } from "@t3tools/contracts/settings";
 import { createModelSelection } from "@t3tools/shared/model";
 
 // The composer draft's `modelSelectionByProvider` and
@@ -60,6 +62,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test"
 import {
   COMPOSER_DRAFT_STORAGE_KEY,
   clearComposerDraftsEnvironment,
+  deriveEffectiveComposerModelState,
   finalizePromotedDraftThreadByRef,
   markPromotedDraftThread,
   markPromotedDraftThreadByRef,
@@ -1145,6 +1148,91 @@ describe("composerDraftStore project draft thread mapping", () => {
       worktreePath: null,
       envMode: "local",
     });
+  });
+});
+
+describe("deriveEffectiveComposerModelState", () => {
+  const providers: ReadonlyArray<ServerProvider> = [
+    {
+      instanceId: CLAUDE_AGENT_INSTANCE,
+      driver: CLAUDE_AGENT_DRIVER,
+      enabled: true,
+      installed: true,
+      version: "2.1.219",
+      status: "ready",
+      auth: { status: "authenticated" },
+      checkedAt: "2026-08-03T00:00:00.000Z",
+      models: [
+        {
+          slug: "claude-opus-5",
+          name: "Claude Opus 5",
+          isCustom: false,
+          capabilities: {},
+        },
+        {
+          slug: "claude-sonnet-4-6",
+          name: "Claude Sonnet 4.6",
+          isCustom: false,
+          isDefault: true,
+          capabilities: {},
+        },
+      ],
+      slashCommands: [],
+      skills: [],
+    },
+  ];
+
+  const resolve = (input: {
+    hasEstablishedProviderBinding: boolean;
+    threadModelSelection: ModelSelection | null;
+    projectModelSelection: ModelSelection | null;
+  }) =>
+    deriveEffectiveComposerModelState({
+      draft: null,
+      providers,
+      selectedProvider: CLAUDE_AGENT_DRIVER,
+      selectedInstanceId: CLAUDE_AGENT_INSTANCE,
+      settings: DEFAULT_UNIFIED_SETTINGS,
+      ...input,
+    }).selectedModel;
+
+  it("preserves exact retired Opus for an existing thread session", () => {
+    expect(
+      resolve({
+        hasEstablishedProviderBinding: true,
+        threadModelSelection: {
+          instanceId: CLAUDE_AGENT_INSTANCE,
+          model: "claude-opus-4-8",
+        },
+        projectModelSelection: null,
+      }),
+    ).toBe("claude-opus-4-8");
+  });
+
+  it("migrates exact retired Opus for a new thread project selection", () => {
+    expect(
+      resolve({
+        hasEstablishedProviderBinding: false,
+        threadModelSelection: null,
+        projectModelSelection: {
+          instanceId: CLAUDE_AGENT_INSTANCE,
+          model: "claude-opus-4-8",
+        },
+      }),
+    ).toBe("claude-opus-5");
+  });
+
+  it("migrates exact retired Opus for an unstarted thread selection", () => {
+    expect(
+      resolve({
+        hasEstablishedProviderBinding: false,
+        threadModelSelection: {
+          instanceId: CLAUDE_AGENT_INSTANCE,
+          model: "claude-opus-4-8",
+        },
+        projectModelSelection: null,
+      }),
+    ).toBe("claude-opus-5");
   });
 });
 

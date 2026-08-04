@@ -114,6 +114,7 @@ describe("resolveSelectableModel", () => {
     const options = [
       { slug: "gpt-5.3-codex", name: "GPT-5.3 Codex" },
       { slug: "claude-sonnet-5", name: "Claude Sonnet 5" },
+      { slug: "claude-opus-5", name: "Claude Opus 5" },
     ];
     expect(resolveSelectableModel(ProviderDriverKind.make("codex"), "gpt-5.3-codex", options)).toBe(
       "gpt-5.3-codex",
@@ -124,6 +125,37 @@ describe("resolveSelectableModel", () => {
     expect(resolveSelectableModel(ProviderDriverKind.make("claudeAgent"), "sonnet", options)).toBe(
       "claude-sonnet-5",
     );
+    expect(
+      resolveSelectableModel(ProviderDriverKind.make("claudeAgent"), "claude-opus-4-8", options),
+    ).toBe("claude-opus-5");
+    expect(
+      resolveSelectableModel(ProviderDriverKind.make("claudeAgent"), "claude-opus-4-8", [
+        ...options,
+        { slug: "claude-opus-4-8", name: "Custom legacy Opus" },
+      ]),
+    ).toBe("claude-opus-4-8");
+    expect(
+      resolveSelectableModel(ProviderDriverKind.make("claudeAgent"), "claude-opus-4-8", [
+        { slug: "claude-fable-5", name: "Claude Fable 5" },
+        { slug: "claude-opus-4-7", name: "Claude Opus 4.7" },
+      ]),
+    ).toBe("claude-opus-4-7");
+    expect(
+      resolveSelectableModel(ProviderDriverKind.make("claudeAgent"), "opus-4.8", [
+        { slug: "claude-opus-4-6", name: "Claude Opus 4.6" },
+      ]),
+    ).toBe("claude-opus-4-6");
+    expect(
+      resolveSelectableModel(ProviderDriverKind.make("claudeAgent"), "opus", [
+        { slug: "claude-fable-5", name: "Claude Fable 5" },
+        { slug: "claude-opus-4-7", name: "Claude Opus 4.7" },
+      ]),
+    ).toBe("claude-opus-4-7");
+    expect(
+      resolveSelectableModel(ProviderDriverKind.make("claudeAgent"), "opus-5", [
+        { slug: "claude-opus-4-7", name: "Claude Opus 4.7" },
+      ]),
+    ).toBeNull();
   });
 });
 
@@ -240,11 +272,13 @@ describe("pickModelSelectionFromInstances", () => {
     id: string,
     driver: string,
     slugs: ReadonlyArray<string>,
+    customSlugs: ReadonlyArray<string> = [],
   ): ProviderModelSource => ({
     instanceId: ProviderInstanceId.make(id),
     driverKind: ProviderDriverKind.make(driver),
     models: slugs.map((slug) => ({
       slug,
+      isCustom: customSlugs.includes(slug),
       defaultOptions: undefined,
       optionDescriptors: undefined,
     })),
@@ -254,7 +288,7 @@ describe("pickModelSelectionFromInstances", () => {
   const sources: ReadonlyArray<ProviderModelSource> = [
     source("codex", "codex", ["gpt-5.4", "gpt-5.3-codex", "gpt-5.4-mini"]),
     source("claudeAgent", "claudeAgent", [
-      "claude-opus-4-8",
+      "claude-opus-5",
       "claude-opus-4-6",
       "claude-sonnet-4-6",
       "claude-sonnet-5",
@@ -268,9 +302,9 @@ describe("pickModelSelectionFromInstances", () => {
   ];
 
   it("matches plain canonical models against the live provider lists", () => {
-    expect(pickModelSelectionFromInstances("claude-opus-4-8", sources)).toEqual({
+    expect(pickModelSelectionFromInstances("claude-opus-5", sources)).toEqual({
       instanceId: "claudeAgent",
-      model: "claude-opus-4-8",
+      model: "claude-opus-5",
     });
     expect(pickModelSelectionFromInstances("gpt-5.4", sources)).toEqual({
       instanceId: "codex",
@@ -294,7 +328,11 @@ describe("pickModelSelectionFromInstances", () => {
   it("resolves registry aliases to the canonical live slug", () => {
     expect(pickModelSelectionFromInstances("opus", sources)).toEqual({
       instanceId: "claudeAgent",
-      model: "claude-opus-4-8",
+      model: "claude-opus-5",
+    });
+    expect(pickModelSelectionFromInstances("claude-opus-4-8", sources)).toEqual({
+      instanceId: "claudeAgent",
+      model: "claude-opus-5",
     });
     expect(pickModelSelectionFromInstances("gpt-5-codex", sources)).toEqual({
       instanceId: "codex",
@@ -307,6 +345,86 @@ describe("pickModelSelectionFromInstances", () => {
     expect(pickModelSelectionFromInstances("claude-sonnet-4-6", sources)).toEqual({
       instanceId: "claudeAgent",
       model: "claude-sonnet-4-6",
+    });
+  });
+
+  it("migrates retired aggregator Opus entries to the newest native Opus available", () => {
+    const withStaleAggregator: ReadonlyArray<ProviderModelSource> = [
+      source("claudeAgent", "claudeAgent", ["claude-opus-5", "claude-opus-4-7"]),
+      source("cursor", "cursor", ["claude-opus-4-8"]),
+    ];
+    expect(pickModelSelectionFromInstances("claude-opus-4-8", withStaleAggregator)).toEqual({
+      instanceId: "claudeAgent",
+      model: "claude-opus-5",
+    });
+
+    const withVersionGatedOpus5: ReadonlyArray<ProviderModelSource> = [
+      source("claudeAgent", "claudeAgent", ["claude-fable-5", "claude-opus-4-7"]),
+      source("cursor", "cursor", ["claude-opus-5", "claude-opus-4-8"]),
+    ];
+    expect(pickModelSelectionFromInstances("claude-opus-4-8", withVersionGatedOpus5)).toEqual({
+      instanceId: "claudeAgent",
+      model: "claude-opus-4-7",
+    });
+    expect(pickModelSelectionFromInstances("opus", withVersionGatedOpus5)).toEqual({
+      instanceId: "claudeAgent",
+      model: "claude-opus-4-7",
+    });
+    const withCrossProviderCustomOpus5: ReadonlyArray<ProviderModelSource> = [
+      source("codex", "codex", ["claude-opus-5"], ["claude-opus-5"]),
+      source("claudeAgent", "claudeAgent", ["claude-opus-4-7"]),
+    ];
+    expect(pickModelSelectionFromInstances("opus", withCrossProviderCustomOpus5)).toEqual({
+      instanceId: "claudeAgent",
+      model: "claude-opus-4-7",
+    });
+    expect(pickModelSelectionFromInstances("opus-5", withVersionGatedOpus5)).toEqual({
+      instanceId: "cursor",
+      model: "claude-opus-5",
+    });
+  });
+
+  it("preserves exact retired Opus when the native provider still serves it", () => {
+    const withNativeLegacyOpus: ReadonlyArray<ProviderModelSource> = [
+      source("cursor", "cursor", ["claude-opus-4-8"]),
+      source("claudeAgent", "claudeAgent", ["claude-opus-4-8", "claude-sonnet-4-6"]),
+    ];
+    expect(pickModelSelectionFromInstances("claude-opus-4-8", withNativeLegacyOpus)).toEqual({
+      instanceId: "claudeAgent",
+      model: "claude-opus-4-8",
+    });
+  });
+
+  it("preserves an exact retired slug served directly by a Claude custom instance", () => {
+    const withClaudeCustom: ReadonlyArray<ProviderModelSource> = [
+      source("claude_custom", "claudeAgent", ["claude-opus-4-8"], ["claude-opus-4-8"]),
+      source("claudeAgent", "claudeAgent", ["claude-opus-5"]),
+    ];
+    expect(pickModelSelectionFromInstances("claude-opus-4-8", withClaudeCustom)).toEqual({
+      instanceId: "claude_custom",
+      model: "claude-opus-4-8",
+    });
+  });
+
+  it("preserves an exact retired slug owned by an aggregator custom model", () => {
+    const withCursorCustom: ReadonlyArray<ProviderModelSource> = [
+      source("claudeAgent", "claudeAgent", ["claude-opus-5"]),
+      source("cursor", "cursor", ["claude-opus-4-8"], ["claude-opus-4-8"]),
+    ];
+    expect(pickModelSelectionFromInstances("claude-opus-4-8", withCursorCustom)).toEqual({
+      instanceId: "cursor",
+      model: "claude-opus-4-8",
+    });
+  });
+
+  it("keeps native-provider priority for unrelated exact custom slug collisions", () => {
+    const withClaudeCollision: ReadonlyArray<ProviderModelSource> = [
+      source("claude_custom", "claudeAgent", ["gpt-5.5"]),
+      source("codex", "codex", ["gpt-5.5"]),
+    ];
+    expect(pickModelSelectionFromInstances("gpt-5.5", withClaudeCollision)).toEqual({
+      instanceId: "codex",
+      model: "gpt-5.5",
     });
   });
 
@@ -337,6 +455,7 @@ describe("pickModelSelectionFromInstances", () => {
         models: [
           {
             slug: "claude-opus-4-6",
+            isCustom: false,
             defaultOptions: [
               { id: "effort", value: "high" },
               { id: "fastMode", value: true },
@@ -364,6 +483,7 @@ describe("pickModelSelectionFromInstances", () => {
         models: [
           {
             slug: "gpt-5.5",
+            isCustom: false,
             defaultOptions: [
               { id: "reasoningEffort", value: "medium" },
               { id: "serviceTier", value: "fast" },
@@ -387,7 +507,8 @@ describe("pickModelSelectionFromInstances", () => {
         driverKind: ProviderDriverKind.make("claudeAgent"),
         models: [
           {
-            slug: "claude-opus-4-8",
+            slug: "claude-opus-5",
+            isCustom: false,
             defaultOptions: [{ id: "effort", value: "high" }],
             optionDescriptors: [
               {
@@ -403,6 +524,7 @@ describe("pickModelSelectionFromInstances", () => {
           },
           {
             slug: "claude-sonnet-5",
+            isCustom: false,
             defaultOptions: [{ id: "effort", value: "medium" }],
             optionDescriptors: [
               {
@@ -418,6 +540,7 @@ describe("pickModelSelectionFromInstances", () => {
           },
           {
             slug: "claude-fable-5",
+            isCustom: false,
             defaultOptions: [{ id: "effort", value: "xhigh" }],
             optionDescriptors: [
               {
@@ -443,9 +566,9 @@ describe("pickModelSelectionFromInstances", () => {
         { id: "serviceTier", value: "fast" },
       ],
     });
-    expect(pickModelSelectionFromInstances("claude-opus-4-8", withDirectiveModels)).toEqual({
+    expect(pickModelSelectionFromInstances("claude-opus-5", withDirectiveModels)).toEqual({
       instanceId: "claudeAgent",
-      model: "claude-opus-4-8",
+      model: "claude-opus-5",
       options: [{ id: "effort", value: "xhigh" }],
     });
     expect(pickModelSelectionFromInstances("claude-sonnet-5", withDirectiveModels)).toEqual({
@@ -468,6 +591,7 @@ describe("pickModelSelectionFromInstances", () => {
         models: [
           {
             slug: "claude-opus-4-8",
+            isCustom: false,
             defaultOptions: [
               { id: "reasoning", value: "medium" },
               { id: "contextWindow", value: "1m" },
@@ -503,6 +627,7 @@ describe("pickModelSelectionFromInstances", () => {
         models: [
           {
             slug: "claude-opus-4-8",
+            isCustom: false,
             defaultOptions: [{ id: "contextWindow", value: "1m" }],
             optionDescriptors: [
               {
@@ -537,6 +662,7 @@ describe("pickModelSelectionFromInstances", () => {
         models: [
           {
             slug: "claude-opus-4-8",
+            isCustom: false,
             defaultOptions: [
               { id: "reasoning", value: "medium" },
               { id: "contextWindow", value: "1m" },
@@ -576,7 +702,9 @@ describe("model slug normalization", () => {
   it("preserves exact custom slugs instead of expanding provider aliases", () => {
     const claude = ProviderDriverKind.make("claudeAgent");
 
-    expect(normalizeModelSlug("opus", claude)).toBe("claude-opus-4-8");
+    expect(normalizeModelSlug("opus", claude)).toBe("claude-opus-5");
+    expect(normalizeModelSlug("opus-4.8", claude)).toBe("claude-opus-5");
+    expect(normalizeModelSlug("claude-opus-4-8", claude)).toBe("claude-opus-4-8");
     expect(normalizeCustomModelSlug(" opus ")).toBe("opus");
   });
 });

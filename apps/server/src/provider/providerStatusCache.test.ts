@@ -182,6 +182,54 @@ it.layer(NodeServices.layer)("providerStatusCache", (it) => {
     );
   });
 
+  it("drops retired Claude built-ins while hydrating a versioned cache", () => {
+    const cachedClaude = makeProvider(CLAUDE_AGENT_DRIVER, {
+      version: "2.1.218",
+      models: [
+        {
+          slug: "claude-opus-4-8",
+          name: "Claude Opus 4.8",
+          isCustom: false,
+          capabilities: emptyCapabilities,
+        },
+        {
+          slug: "claude-opus-4-7",
+          name: "Claude Opus 4.7",
+          isCustom: false,
+          capabilities: emptyCapabilities,
+        },
+      ],
+    });
+    const pendingClaude = makeProvider(CLAUDE_AGENT_DRIVER, {
+      installed: false,
+      version: null,
+      status: "warning",
+      auth: { status: "unknown" },
+      models: [
+        {
+          slug: "claude-opus-4-8",
+          name: "Claude Opus 4.8",
+          isCustom: false,
+          capabilities: emptyCapabilities,
+        },
+        {
+          slug: "claude-opus-4-6",
+          name: "Claude Opus 4.6",
+          isCustom: false,
+          capabilities: emptyCapabilities,
+        },
+      ],
+    });
+
+    assert.deepStrictEqual(
+      hydrateCachedProvider({
+        cachedProvider: cachedClaude,
+        fallbackProvider: pendingClaude,
+      }).models.map((model) => model.slug),
+      ["claude-opus-4-6", "claude-opus-4-7"],
+    );
+  });
+
   it("ignores stale cached enabled state when the provider is now disabled", () => {
     const cachedCodex = makeProvider(CODEX_DRIVER, {
       checkedAt: "2026-04-10T12:00:00.000Z",

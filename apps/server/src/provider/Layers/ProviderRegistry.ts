@@ -53,7 +53,10 @@ import {
 } from "../providerStatusCache.ts";
 import type { ProviderInstance } from "../ProviderDriver.ts";
 import { makeManualOnlyProviderMaintenanceCapabilities } from "../providerMaintenance.ts";
-import type { ProviderSnapshotSource } from "../builtInProviderCatalog.ts";
+import {
+  isRetiredBuiltInProviderModel,
+  type ProviderSnapshotSource,
+} from "../builtInProviderCatalog.ts";
 
 const loadProviders = (
   providerSources: ReadonlyArray<ProviderSnapshotSource>,
@@ -78,16 +81,29 @@ const makeManualProviderMaintenanceCapabilities = (provider: ProviderDriverKind)
 const hasModelCapabilities = (model: ServerProvider["models"][number]): boolean =>
   (model.capabilities?.optionDescriptors?.length ?? 0) > 0;
 
+const CLAUDE_DRIVER_KIND = ProviderDriverKind.make("claudeAgent");
+
 const mergeProviderModels = (
+  driver: ProviderDriverKind,
   previousModels: ReadonlyArray<ServerProvider["models"][number]>,
   nextModels: ReadonlyArray<ServerProvider["models"][number]>,
+  preserveMissingBuiltIns: boolean,
 ): ReadonlyArray<ServerProvider["models"][number]> => {
-  if (nextModels.length === 0 && previousModels.length > 0) {
-    return previousModels;
+  const retainedPreviousModels = previousModels.filter(
+    (model) => !isRetiredBuiltInProviderModel(driver, model),
+  );
+  const activeNextModels = nextModels.filter(
+    (model) => !isRetiredBuiltInProviderModel(driver, model),
+  );
+
+  if (nextModels.length === 0 && retainedPreviousModels.length > 0) {
+    return retainedPreviousModels;
   }
 
-  const previousBySlug = new Map(previousModels.map((model) => [model.slug, model] as const));
-  const mergedModels = nextModels.map((model) => {
+  const previousBySlug = new Map(
+    retainedPreviousModels.map((model) => [model.slug, model] as const),
+  );
+  const mergedModels = activeNextModels.map((model) => {
     const previousModel = previousBySlug.get(model.slug);
     if (!previousModel || hasModelCapabilities(model) || !hasModelCapabilities(previousModel)) {
       return model;
@@ -97,19 +113,34 @@ const mergeProviderModels = (
       capabilities: previousModel.capabilities,
     };
   });
-  const nextSlugs = new Set(nextModels.map((model) => model.slug));
-  return [...mergedModels, ...previousModels.filter((model) => !nextSlugs.has(model.slug))];
+  const nextSlugs = new Set(activeNextModels.map((model) => model.slug));
+  return [
+    ...mergedModels,
+    ...retainedPreviousModels.filter(
+      (model) =>
+        !nextSlugs.has(model.slug) &&
+        (driver !== CLAUDE_DRIVER_KIND || model.isCustom || preserveMissingBuiltIns),
+    ),
+  ];
 };
 
 export const mergeProviderSnapshot = (
   previousProvider: ServerProvider | undefined,
   nextProvider: ServerProvider,
 ): ServerProvider =>
-  !previousProvider
+  !previousProvider || previousProvider.driver !== nextProvider.driver
     ? nextProvider
     : {
         ...nextProvider,
-        models: mergeProviderModels(previousProvider.models, nextProvider.models),
+        models: mergeProviderModels(
+          nextProvider.driver,
+          previousProvider.models,
+          nextProvider.models,
+          nextProvider.driver === CLAUDE_DRIVER_KIND &&
+            nextProvider.installed &&
+            nextProvider.status === "error" &&
+            nextProvider.version === null,
+        ),
       };
 
 export const mergeProviderSnapshots = (

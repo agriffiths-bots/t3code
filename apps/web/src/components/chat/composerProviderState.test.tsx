@@ -189,6 +189,21 @@ describe("getComposerProviderState", () => {
     });
   });
 
+  it("preserves saved options for an established retired Claude Opus session", () => {
+    const state = getComposerProviderState({
+      provider: ProviderDriverKind.make("claudeAgent"),
+      model: "claude-opus-4-8",
+      models: [],
+      modelOptions: selections(["effort", "low"], ["fastMode", true]),
+    });
+
+    expect(state).toEqual({
+      provider: ProviderDriverKind.make("claudeAgent"),
+      promptEffort: "low",
+      modelOptionsForDispatch: selections(["effort", "low"], ["fastMode", true]),
+    });
+  });
+
   it("derives promptEffort from the first select descriptor and preserves all others for dispatch", () => {
     const state = getComposerProviderState({
       provider: PROVIDER,

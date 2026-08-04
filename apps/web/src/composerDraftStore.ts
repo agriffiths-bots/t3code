@@ -29,7 +29,11 @@ import * as Schema from "effect/Schema";
 import * as Equal from "effect/Equal";
 import * as Effect from "effect/Effect";
 import { DeepMutable } from "effect/Types";
-import { createModelSelection, normalizeModelSlug } from "@t3tools/shared/model";
+import {
+  CLAUDE_RETIRED_MODEL_SLUGS,
+  createModelSelection,
+  normalizeModelSlug,
+} from "@t3tools/shared/model";
 import { useMemo } from "react";
 import { getLocalStorageItem } from "./hooks/useLocalStorage";
 import { resolveAppModelSelection, resolveAppModelSelectionForInstance } from "./modelSelection";
@@ -956,13 +960,33 @@ export function deriveEffectiveComposerModelState(input: {
    * collapsing to the default Codex bucket.
    */
   selectedInstanceId?: ProviderInstanceId | null | undefined;
+  hasEstablishedProviderBinding: boolean;
   threadModelSelection: ModelSelection | null | undefined;
   projectModelSelection: ModelSelection | null | undefined;
   settings: UnifiedSettings;
 }): EffectiveComposerModelState {
+  const exactRetiredThreadModel = (
+    instanceId: ProviderInstanceId,
+    candidate: string | null | undefined,
+  ): string | null => {
+    const trimmed = candidate?.trim();
+    if (
+      !input.hasEstablishedProviderBinding ||
+      !trimmed ||
+      input.threadModelSelection?.instanceId !== instanceId ||
+      input.threadModelSelection.model !== trimmed ||
+      !CLAUDE_RETIRED_MODEL_SLUGS.has(trimmed)
+    ) {
+      return null;
+    }
+    return trimmed;
+  };
   const baseModelCandidate =
     input.threadModelSelection?.model ?? input.projectModelSelection?.model ?? null;
   const baseModel =
+    (input.selectedInstanceId
+      ? exactRetiredThreadModel(input.selectedInstanceId, baseModelCandidate)
+      : null) ??
     (input.selectedInstanceId
       ? resolveAppModelSelectionForInstance(
           input.selectedInstanceId,
@@ -993,7 +1017,8 @@ export function deriveEffectiveComposerModelState(input: {
     ? (input.selectedInstanceId ?? ProviderInstanceId.make(input.selectedProvider))
     : ProviderInstanceId.make(input.selectedProvider);
   const selectedModel = activeSelection?.model
-    ? (resolveAppModelSelectionForInstance(
+    ? (exactRetiredThreadModel(activeSelectionInstanceId, activeSelection.model) ??
+      resolveAppModelSelectionForInstance(
         activeSelectionInstanceId,
         input.settings,
         input.providers,
@@ -3461,6 +3486,7 @@ export function useEffectiveComposerModelState(input: {
    * instance reads its own model, not the default Codex's.
    */
   selectedInstanceId?: ProviderInstanceId | null | undefined;
+  hasEstablishedProviderBinding: boolean;
   threadModelSelection: ModelSelection | null | undefined;
   projectModelSelection: ModelSelection | null | undefined;
   settings: UnifiedSettings;
@@ -3474,6 +3500,7 @@ export function useEffectiveComposerModelState(input: {
         providers: input.providers,
         selectedProvider: input.selectedProvider,
         selectedInstanceId: input.selectedInstanceId,
+        hasEstablishedProviderBinding: input.hasEstablishedProviderBinding,
         threadModelSelection: input.threadModelSelection,
         projectModelSelection: input.projectModelSelection,
         settings: input.settings,
@@ -3483,6 +3510,7 @@ export function useEffectiveComposerModelState(input: {
       input.providers,
       input.settings,
       input.projectModelSelection,
+      input.hasEstablishedProviderBinding,
       input.selectedInstanceId,
       input.selectedProvider,
       input.threadModelSelection,

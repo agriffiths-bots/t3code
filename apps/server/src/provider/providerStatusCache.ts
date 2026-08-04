@@ -11,17 +11,27 @@ import * as Path from "effect/Path";
 import * as Schema from "effect/Schema";
 
 import { writeFileStringAtomically } from "../atomicWrite.ts";
+import { isRetiredBuiltInProviderModel } from "./builtInProviderCatalog.ts";
 
 const decodeProviderStatusCache = Schema.decodeUnknownEffect(
   Schema.fromJsonString(ServerProviderSchema),
 );
 
 const mergeProviderModels = (
+  driver: ProviderDriverKind,
   fallbackModels: ReadonlyArray<ServerProvider["models"][number]>,
   cachedModels: ReadonlyArray<ServerProvider["models"][number]>,
 ): ReadonlyArray<ServerProvider["models"][number]> => {
-  const fallbackSlugs = new Set(fallbackModels.map((model) => model.slug));
-  return [...fallbackModels, ...cachedModels.filter((model) => !fallbackSlugs.has(model.slug))];
+  const activeFallbackModels = fallbackModels.filter(
+    (model) => !isRetiredBuiltInProviderModel(driver, model),
+  );
+  const fallbackSlugs = new Set(activeFallbackModels.map((model) => model.slug));
+  return [
+    ...activeFallbackModels,
+    ...cachedModels.filter(
+      (model) => !fallbackSlugs.has(model.slug) && !isRetiredBuiltInProviderModel(driver, model),
+    ),
+  ];
 };
 
 export const orderProviderSnapshots = (
@@ -59,7 +69,11 @@ export const hydrateCachedProvider = (input: {
   const { message: _fallbackMessage, ...fallbackWithoutMessage } = input.fallbackProvider;
   const hydratedProvider: ServerProvider = {
     ...fallbackWithoutMessage,
-    models: mergeProviderModels(input.fallbackProvider.models, input.cachedProvider.models),
+    models: mergeProviderModels(
+      input.fallbackProvider.driver,
+      input.fallbackProvider.models,
+      input.cachedProvider.models,
+    ),
     installed: input.cachedProvider.installed,
     version: input.cachedProvider.version,
     status: input.cachedProvider.status,

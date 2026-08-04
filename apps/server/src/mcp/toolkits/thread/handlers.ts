@@ -547,6 +547,7 @@ const makeActiveThreadStartRuntime = Effect.fn("ThreadToolkit.makeActiveRuntime"
             driverKind: providerInstance.driverKind,
             models: snapshot.models.map((providerModel) => ({
               slug: providerModel.slug,
+              isCustom: providerModel.isCustom,
               optionDescriptors: providerModel.capabilities?.optionDescriptors,
               defaultOptions: buildProviderOptionSelectionsFromDescriptors(
                 providerModel.capabilities?.optionDescriptors,
@@ -728,6 +729,7 @@ const makeActiveThreadStartRuntime = Effect.fn("ThreadToolkit.makeActiveRuntime"
           driverKind: providerInstance.driverKind,
           models: snapshot.models.map((providerModel) => ({
             slug: providerModel.slug,
+            isCustom: providerModel.isCustom,
             optionDescriptors: providerModel.capabilities?.optionDescriptors,
             defaultOptions: buildProviderOptionSelectionsFromDescriptors(
               providerModel.capabilities?.optionDescriptors,

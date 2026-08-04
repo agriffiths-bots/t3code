@@ -12,6 +12,34 @@ import {
 } from "@t3tools/contracts";
 
 const DEFAULT_PROVIDER_DRIVER_KIND = ProviderDriverKind.make("codex");
+const CLAUDE_PROVIDER_DRIVER_KIND = ProviderDriverKind.make("claudeAgent");
+
+export const CLAUDE_RETIRED_MODEL_SLUGS: ReadonlySet<string> = new Set(["claude-opus-4-8"]);
+
+export const CLAUDE_RESERVED_MODEL_SLUGS: ReadonlySet<string> = new Set([
+  "claude-fable-5",
+  "claude-opus-5",
+  "claude-opus-4-7",
+  ...CLAUDE_RETIRED_MODEL_SLUGS,
+]);
+
+const RETIRED_SELECTABLE_MODEL_MIGRATIONS: Readonly<
+  Record<string, Readonly<Record<string, ReadonlyArray<string>>>>
+> = {
+  claudeAgent: {
+    opus: ["claude-opus-5", "claude-opus-4-7", "claude-opus-4-6", "claude-opus-4-5"],
+    "claude-opus-4-8": ["claude-opus-5", "claude-opus-4-7", "claude-opus-4-6", "claude-opus-4-5"],
+    "opus-4.8": ["claude-opus-5", "claude-opus-4-7", "claude-opus-4-6", "claude-opus-4-5"],
+    "claude-opus-4.8": ["claude-opus-5", "claude-opus-4-7", "claude-opus-4-6", "claude-opus-4-5"],
+  },
+};
+
+function resolveRetiredSelectableModelMigrations(
+  provider: ProviderDriverKind,
+  value: string,
+): ReadonlyArray<string> {
+  return RETIRED_SELECTABLE_MODEL_MIGRATIONS[provider]?.[value] ?? [];
+}
 
 export interface SelectableModelOption {
   slug: string;
@@ -25,6 +53,32 @@ export function createModelCapabilities(input: {
     optionDescriptors: input.optionDescriptors.map(cloneDescriptor),
   };
 }
+
+export const CLAUDE_OPUS_MODEL_CAPABILITIES: ModelCapabilities = createModelCapabilities({
+  optionDescriptors: [
+    {
+      id: "effort",
+      label: "Reasoning",
+      type: "select",
+      options: [
+        { id: "low", label: "Low" },
+        { id: "medium", label: "Medium" },
+        { id: "high", label: "High", isDefault: true },
+        { id: "xhigh", label: "Extra High" },
+        { id: "max", label: "Max" },
+        { id: "ultracode", label: "Ultracode" },
+        { id: "ultrathink", label: "Ultrathink" },
+      ],
+      currentValue: "high",
+      promptInjectedValues: ["ultrathink"],
+    },
+    {
+      id: "fastMode",
+      label: "Fast Mode",
+      type: "boolean",
+    },
+  ],
+});
 
 function getRawSelectionValueById(
   selections: ReadonlyArray<ProviderOptionSelection> | null | undefined,
@@ -291,13 +345,18 @@ export function resolveSelectableModel(
     return byName.slug;
   }
 
-  const normalized = normalizeModelSlug(trimmed, provider);
-  if (!normalized) {
-    return null;
+  const candidates = [...resolveRetiredSelectableModelMigrations(provider, trimmed), trimmed];
+  for (const candidate of candidates) {
+    const normalized = normalizeModelSlug(candidate, provider);
+    if (!normalized) {
+      continue;
+    }
+    const resolved = options.find((option) => option.slug === normalized);
+    if (resolved) {
+      return resolved.slug;
+    }
   }
-
-  const resolved = options.find((option) => option.slug === normalized);
-  return resolved ? resolved.slug : null;
+  return null;
 }
 
 function resolveModelSlug(model: string | null | undefined, provider: ProviderDriverKind): string {
@@ -318,6 +377,7 @@ export function resolveModelSlugForProvider(
 /** A single model a provider instance serves, plus its default option selections. */
 export interface ProviderModelEntry {
   readonly slug: string;
+  readonly isCustom: boolean;
   readonly defaultOptions: ReadonlyArray<ProviderOptionSelection> | undefined;
   readonly optionDescriptors: ReadonlyArray<ProviderOptionDescriptor> | undefined;
 }
@@ -365,6 +425,7 @@ function makeModelSelection(
 
 const THREAD_CREATION_DEFAULT_EFFORT_BY_MODEL: Record<string, string> = {
   "gpt-5.5": "xhigh",
+  "claude-opus-5": "xhigh",
   "claude-opus-4-8": "xhigh",
   "claude-sonnet-5": "xhigh",
   "claude-fable-5": "high",
@@ -417,7 +478,7 @@ function isThreadCreationEffortAdvertised(
 /**
  * Resolve a plain model name to a `ModelSelection` against the LIVE provider
  * model lists, so a caller never has to know or guess a harness/instance id —
- * they pass e.g. `claude-opus-4-8`, `gpt-5.4`, or a future `fable-5` and the
+ * they pass e.g. `claude-opus-5`, `gpt-5.4`, or a future `fable-5` and the
  * official provider is found from the registry data itself (NO hardcoded
  * model-name patterns). Selection order: the native provider first
  * (`PROVIDER_INFERENCE_PRIORITY`, so Claude models resolve to `claudeAgent`, not
@@ -441,12 +502,22 @@ export function pickModelSelectionFromInstances(
     (preferInstanceId !== undefined && source.instanceId === preferInstanceId ? 0 : 1);
 
   // Best (highest-priority, source-preferred) instance that serves an exact slug.
-  const resolveSlug = (slug: string): ModelSelection | null => {
+  const resolveSlug = (
+    slug: string,
+    acceptEntry: (entry: ProviderModelEntry) => boolean = () => true,
+    acceptSource: (source: ProviderModelSource) => boolean = () => true,
+  ): ModelSelection | null => {
     const best = sources
-      .filter((source) => source.models.some((entry) => entry.slug === slug))
+      .filter(
+        (source) =>
+          acceptSource(source) &&
+          source.models.some((entry) => entry.slug === slug && acceptEntry(entry)),
+      )
       .sort((a, b) => rank(a) - rank(b))[0];
     if (best === undefined) return null;
-    const entry = best.models.find((candidate) => candidate.slug === slug);
+    const entry = best.models.find(
+      (candidate) => candidate.slug === slug && acceptEntry(candidate),
+    );
     return makeModelSelection(
       best.instanceId,
       best.driverKind,
@@ -455,6 +526,65 @@ export function pickModelSelectionFromInstances(
       entry?.optionDescriptors,
     );
   };
+
+  const resolveBestCanonical = (
+    canonicals: ReadonlySet<string>,
+    acceptEntry?: (entry: ProviderModelEntry) => boolean,
+    acceptSource?: (source: ProviderModelSource) => boolean,
+  ): ModelSelection | null => {
+    let best: ModelSelection | null = null;
+    let bestRank = Number.POSITIVE_INFINITY;
+    for (const canonical of canonicals) {
+      const selection = resolveSlug(canonical, acceptEntry, acceptSource);
+      if (selection === null) continue;
+      const chosen = sources.find((source) => source.instanceId === selection.instanceId);
+      const selectionRank = chosen ? rank(chosen) : Number.POSITIVE_INFINITY;
+      if (selectionRank < bestRank) {
+        best = selection;
+        bestRank = selectionRank;
+      }
+    }
+    return best;
+  };
+
+  // Retired built-ins migrate before aggregator exact matches. When the latest
+  // replacement is version-gated, stay on the newest Opus model the native
+  // Claude instance actually serves instead of falling to an unrelated model.
+  const migrations = new Set<string>();
+  for (const source of sources) {
+    for (const migrated of resolveRetiredSelectableModelMigrations(source.driverKind, trimmed)) {
+      migrations.add(migrated);
+    }
+  }
+
+  // An exact legacy slug remains runnable when the native Claude provider
+  // still reports it (for example, a persisted session or schedule created
+  // before catalog retirement). Aggregator-only stale entries must not win:
+  // those continue through the native replacement migration below.
+  if (migrations.size > 0 && CLAUDE_RETIRED_MODEL_SLUGS.has(trimmed)) {
+    const directNative = resolveSlug(
+      trimmed,
+      () => true,
+      (source) => source.driverKind === CLAUDE_PROVIDER_DRIVER_KIND,
+    );
+    if (directNative !== null) return directNative;
+  }
+
+  // Preserve an exact provider-owned custom model before migrating a retired
+  // built-in. This is gated to retired inputs so unrelated slug collisions
+  // still use normal native-provider priority.
+  if (migrations.size > 0) {
+    const directCustom = resolveSlug(trimmed, (entry) => entry.isCustom);
+    if (directCustom !== null) return directCustom;
+  }
+
+  const migrated = resolveBestCanonical(
+    migrations,
+    (entry) => !entry.isCustom,
+    (source) => source.driverKind === CLAUDE_PROVIDER_DRIVER_KIND,
+  );
+  if (migrated !== null) return migrated;
+  if (migrations.size > 0) return null;
 
   // 1. Direct match against the models each provider actually serves.
   const direct = resolveSlug(trimmed);
@@ -472,20 +602,11 @@ export function pickModelSelectionFromInstances(
       ? aliases[trimmed]
       : undefined;
     if (typeof canonical === "string") canonicals.add(canonical);
-  }
-  let best: ModelSelection | null = null;
-  let bestRank = Number.POSITIVE_INFINITY;
-  for (const canonical of canonicals) {
-    const selection = resolveSlug(canonical);
-    if (selection === null) continue;
-    const chosen = sources.find((source) => source.instanceId === selection.instanceId);
-    const selectionRank = chosen ? rank(chosen) : Number.POSITIVE_INFINITY;
-    if (selectionRank < bestRank) {
-      best = selection;
-      bestRank = selectionRank;
+    for (const migrated of resolveRetiredSelectableModelMigrations(source.driverKind, trimmed)) {
+      canonicals.add(migrated);
     }
   }
-  return best;
+  return resolveBestCanonical(canonicals);
 }
 
 /** Trim a string, returning null for empty/missing values. */

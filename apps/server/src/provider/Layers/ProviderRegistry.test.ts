@@ -31,7 +31,12 @@ import { createModelCapabilities } from "@t3tools/shared/model";
 import { applyServerSettingsPatch } from "@t3tools/shared/serverSettings";
 
 import { checkCodexProviderStatus, type CodexAppServerProviderSnapshot } from "./CodexProvider.ts";
-import { checkClaudeProviderStatus } from "./ClaudeProvider.ts";
+import {
+  checkClaudeProviderStatus,
+  getClaudeModelCapabilities,
+  makePendingClaudeProvider,
+  reconcileKnownClaudeModelsAfterVersionProbe,
+} from "./ClaudeProvider.ts";
 import * as OpenCodeRuntime from "../opencodeRuntime.ts";
 import * as ProviderEventLoggers from "./ProviderEventLoggers.ts";
 import { ProviderInstanceRegistryHydrationLive } from "./ProviderInstanceRegistryHydration.ts";
@@ -561,6 +566,141 @@ it.layer(Layer.mergeAll(NodeServices.layer, ServerSettingsModule.layerTest(), Te
         assert.deepStrictEqual(mergeProviderSnapshot(previousProvider, refreshedProvider).models, [
           ...previousProvider.models,
         ]);
+      });
+
+      it("prunes retired Claude built-ins from cached provider models", () => {
+        const previousProvider = {
+          instanceId: ProviderInstanceId.make("claudeAgent"),
+          driver: ProviderDriverKind.make("claudeAgent"),
+          status: "ready",
+          enabled: true,
+          installed: true,
+          auth: { status: "authenticated" },
+          checkedAt: "2026-08-03T00:00:00.000Z",
+          version: "2.1.218",
+          models: [
+            {
+              slug: "claude-opus-4-8",
+              name: "Claude Opus 4.8",
+              isCustom: false,
+              capabilities: getClaudeModelCapabilities("claude-opus-4-8"),
+            },
+          ],
+          slashCommands: [],
+          skills: [],
+        } as const satisfies ServerProvider;
+        const refreshedProvider = {
+          ...previousProvider,
+          checkedAt: "2026-08-03T00:01:00.000Z",
+          version: "2.1.219",
+          models: [
+            {
+              slug: "claude-opus-5",
+              name: "Claude Opus 5",
+              isCustom: false,
+              capabilities: getClaudeModelCapabilities("claude-opus-5"),
+            },
+          ],
+        } satisfies ServerProvider;
+
+        assert.deepStrictEqual(
+          mergeProviderSnapshot(previousProvider, refreshedProvider).models.map(
+            (model) => model.slug,
+          ),
+          ["claude-opus-5"],
+        );
+
+        const olderClaudeProvider = {
+          ...refreshedProvider,
+          checkedAt: "2026-08-03T00:02:00.000Z",
+          version: "2.1.218",
+          models: [
+            {
+              slug: "claude-opus-4-7",
+              name: "Claude Opus 4.7",
+              isCustom: false,
+              capabilities: getClaudeModelCapabilities("claude-opus-4-7"),
+            },
+          ],
+        } satisfies ServerProvider;
+
+        assert.deepStrictEqual(
+          mergeProviderSnapshot(refreshedProvider, olderClaudeProvider).models.map(
+            (model) => model.slug,
+          ),
+          ["claude-opus-4-7"],
+        );
+
+        const transientFailureProvider = {
+          ...olderClaudeProvider,
+          checkedAt: "2026-08-03T00:03:00.000Z",
+          version: null,
+          status: "error",
+          message: "Failed to execute Claude Agent CLI health check.",
+        } satisfies ServerProvider;
+
+        assert.deepStrictEqual(
+          mergeProviderSnapshot(refreshedProvider, transientFailureProvider).models.map(
+            (model) => model.slug,
+          ),
+          ["claude-opus-4-7", "claude-opus-5"],
+        );
+
+        const missingClaudeProvider = {
+          ...transientFailureProvider,
+          installed: false,
+          checkedAt: "2026-08-03T00:03:30.000Z",
+          models: [
+            {
+              slug: "claude-sonnet-4-6",
+              name: "Claude Sonnet 4.6",
+              isCustom: false,
+              capabilities: getClaudeModelCapabilities("claude-sonnet-4-6"),
+            },
+          ],
+        } satisfies ServerProvider;
+        assert.deepStrictEqual(
+          mergeProviderSnapshot(refreshedProvider, missingClaudeProvider).models.map(
+            (model) => model.slug,
+          ),
+          ["claude-sonnet-4-6"],
+        );
+
+        const firstFailureSnapshot = mergeProviderSnapshot(
+          refreshedProvider,
+          transientFailureProvider,
+        );
+        const secondFailureProvider = {
+          ...transientFailureProvider,
+          checkedAt: "2026-08-03T00:04:00.000Z",
+        } satisfies ServerProvider;
+
+        assert.deepStrictEqual(
+          mergeProviderSnapshot(firstFailureSnapshot, secondFailureProvider).models.map(
+            (model) => model.slug,
+          ),
+          ["claude-opus-4-7", "claude-opus-5"],
+        );
+
+        const previousCodexProvider = {
+          ...refreshedProvider,
+          driver: ProviderDriverKind.make("codex"),
+          models: [
+            {
+              slug: "gpt-5.5",
+              name: "GPT-5.5",
+              isCustom: false,
+              capabilities: createModelCapabilities({ optionDescriptors: [] }),
+            },
+          ],
+        } satisfies ServerProvider;
+
+        assert.deepStrictEqual(
+          mergeProviderSnapshot(previousCodexProvider, transientFailureProvider).models.map(
+            (model) => model.slug,
+          ),
+          ["claude-opus-4-7"],
+        );
       });
 
       it("fills missing capabilities from the previous provider snapshot", () => {
@@ -1528,6 +1668,204 @@ it.layer(Layer.mergeAll(NodeServices.layer, ServerSettingsModule.layerTest(), Te
             mockSpawnerLayer((args) => {
               const joined = args.join(" ");
               if (joined === "--version") return { stdout: "1.0.0\n", stderr: "", code: 0 };
+              throw new Error(`Unexpected args: ${joined}`);
+            }),
+          ),
+        ),
+      );
+
+      it.effect("keeps version-gated Claude models out of pending snapshots", () =>
+        Effect.gen(function* () {
+          const status = yield* makePendingClaudeProvider({
+            ...defaultClaudeSettings,
+            customModels: ["claude-opus-5", "claude-opus-4-8", "my-custom-model"],
+          });
+          assert.strictEqual(
+            status.models.some((model) => model.slug === "claude-opus-5"),
+            false,
+          );
+          assert.strictEqual(
+            status.models.some((model) => model.slug === "claude-fable-5"),
+            false,
+          );
+          assert.strictEqual(
+            status.models.some((model) => model.slug === "claude-opus-4-7"),
+            false,
+          );
+          assert.strictEqual(
+            status.models.some((model) => model.slug === "claude-opus-4-8"),
+            false,
+          );
+          assert.strictEqual(
+            status.models.some((model) => model.slug === "my-custom-model"),
+            true,
+          );
+        }),
+      );
+
+      it("preserves proven models on transient failures but clears them across uninstall", () => {
+        const knownModels = [
+          {
+            slug: "claude-opus-5",
+            name: "Claude Opus 5",
+            isCustom: false,
+            capabilities: getClaudeModelCapabilities("claude-opus-5"),
+          },
+          {
+            slug: "claude-sonnet-4-6",
+            name: "Claude Sonnet 4.6",
+            isCustom: false,
+            capabilities: getClaudeModelCapabilities("claude-sonnet-4-6"),
+          },
+          {
+            slug: "removed-custom-opus",
+            name: "Removed Custom Opus",
+            isCustom: true,
+            capabilities: getClaudeModelCapabilities("claude-opus-5"),
+          },
+        ] as const;
+        const failureModels = [
+          {
+            slug: "claude-sonnet-4-6",
+            name: "Claude Sonnet 4.6",
+            isCustom: false,
+            capabilities: getClaudeModelCapabilities("claude-sonnet-4-6"),
+          },
+        ] as const;
+        const readySnapshot = {
+          instanceId: ProviderInstanceId.make("claudeAgent"),
+          driver: ProviderDriverKind.make("claudeAgent"),
+          status: "ready",
+          enabled: true,
+          installed: true,
+          auth: { status: "authenticated" },
+          checkedAt: "2026-08-03T00:00:00.000Z",
+          version: "2.1.219",
+          models: knownModels,
+          slashCommands: [],
+          skills: [],
+        } as const satisfies ServerProvider;
+        const learned = reconcileKnownClaudeModelsAfterVersionProbe([], readySnapshot);
+        assert.deepStrictEqual(
+          learned.knownModels.map((model) => model.slug),
+          ["claude-opus-5"],
+        );
+        const transientFailure = reconcileKnownClaudeModelsAfterVersionProbe(learned.knownModels, {
+          ...readySnapshot,
+          status: "error",
+          checkedAt: "2026-08-03T00:01:00.000Z",
+          version: null,
+          models: failureModels,
+        });
+        assert.deepStrictEqual(
+          transientFailure.snapshot.models.map((model) => model.slug),
+          ["claude-sonnet-4-6", "claude-opus-5"],
+        );
+
+        const missing = reconcileKnownClaudeModelsAfterVersionProbe(transientFailure.knownModels, {
+          ...readySnapshot,
+          status: "error",
+          installed: false,
+          checkedAt: "2026-08-03T00:02:00.000Z",
+          version: null,
+          models: failureModels,
+        });
+        assert.deepStrictEqual(missing.knownModels, []);
+
+        const replacementFailure = reconcileKnownClaudeModelsAfterVersionProbe(
+          missing.knownModels,
+          {
+            ...readySnapshot,
+            status: "error",
+            checkedAt: "2026-08-03T00:03:00.000Z",
+            version: null,
+            models: failureModels,
+          },
+        );
+        assert.deepStrictEqual(
+          replacementFailure.snapshot.models.map((model) => model.slug),
+          ["claude-sonnet-4-6"],
+        );
+      });
+
+      it.effect("includes Claude Opus 5 on supported Claude Code versions", () =>
+        Effect.gen(function* () {
+          const status = yield* checkClaudeProviderStatus(
+            defaultClaudeSettings,
+            claudeCapabilities(),
+          );
+          const opus5 = status.models.find((model) => model.slug === "claude-opus-5");
+          if (!opus5?.capabilities) {
+            assert.fail("Expected Claude Opus 5 capabilities on supported Claude Code versions.");
+          }
+          assert.strictEqual(opus5?.name, "Claude Opus 5");
+          assert.deepStrictEqual(
+            opus5.capabilities.optionDescriptors?.map((descriptor) => descriptor.id),
+            ["effort", "fastMode"],
+          );
+          assert.strictEqual(
+            status.models.some((model) => model.slug === "claude-opus-4-8"),
+            false,
+          );
+          assert.deepStrictEqual(
+            getClaudeModelCapabilities("claude-opus-4-8").optionDescriptors?.map(
+              (descriptor) => descriptor.id,
+            ),
+            ["effort", "fastMode"],
+          );
+        }).pipe(
+          Effect.provide(
+            mockSpawnerLayer((args) => {
+              const joined = args.join(" ");
+              if (joined === "--version") return { stdout: "2.1.219\n", stderr: "", code: 0 };
+              if (joined === "auth status")
+                return {
+                  stdout: '{"loggedIn":true,"authMethod":"claude.ai"}\n',
+                  stderr: "",
+                  code: 0,
+                };
+              throw new Error(`Unexpected args: ${joined}`);
+            }),
+          ),
+        ),
+      );
+
+      it.effect("hides Claude Opus 5 on older Claude Code versions", () =>
+        Effect.gen(function* () {
+          const status = yield* checkClaudeProviderStatus(
+            {
+              ...defaultClaudeSettings,
+              customModels: ["claude-opus-5", "claude-opus-4-8", "my-custom-model"],
+            },
+            claudeCapabilities(),
+          );
+          assert.strictEqual(
+            status.models.some((model) => model.slug === "claude-opus-5"),
+            false,
+          );
+          assert.strictEqual(
+            status.models.some((model) => model.slug === "claude-opus-4-8"),
+            false,
+          );
+          assert.strictEqual(
+            status.models.some((model) => model.slug === "my-custom-model"),
+            true,
+          );
+          assert.strictEqual(
+            status.message,
+            "Claude Code v2.1.218 is too old for Claude Opus 5. Upgrade to v2.1.219 or newer to access it.",
+          );
+        }).pipe(
+          Effect.provide(
+            mockSpawnerLayer((args) => {
+              const joined = args.join(" ");
+              if (joined === "--version") return { stdout: "2.1.218\n", stderr: "", code: 0 };
+              if (joined === "auth status")
+                return {
+                  stdout: '{"loggedIn":true,"authMethod":"claude.ai"}\n',
+                  stderr: "",
+                  code: 0,
+                };
               throw new Error(`Unexpected args: ${joined}`);
             }),
           ),

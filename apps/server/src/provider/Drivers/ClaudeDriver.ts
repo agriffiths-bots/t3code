@@ -19,6 +19,7 @@ import * as Crypto from "effect/Crypto";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Path from "effect/Path";
+import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
 import { HttpClient } from "effect/unstable/http";
 import { ChildProcessSpawner } from "effect/unstable/process";
@@ -32,6 +33,7 @@ import {
   checkClaudeProviderStatus,
   makePendingClaudeProvider,
   probeClaudeCapabilities,
+  reconcileKnownClaudeModelsAfterVersionProbe,
 } from "../Layers/ClaudeProvider.ts";
 import { ProviderEventLoggers } from "../Layers/ProviderEventLoggers.ts";
 import { makeManagedServerProvider } from "../makeManagedServerProvider.ts";
@@ -160,6 +162,7 @@ export const ClaudeDriver: ProviderDriver<ClaudeSettings, ClaudeDriverEnv> = {
           ),
       });
       const capabilitiesCacheKey = yield* makeClaudeCapabilitiesCacheKey(effectiveConfig, cwd);
+      const knownVersionedModels = yield* Ref.make<ServerProvider["models"]>([]);
 
       const checkProvider = checkClaudeProviderStatus(
         effectiveConfig,
@@ -167,6 +170,15 @@ export const ClaudeDriver: ProviderDriver<ClaudeSettings, ClaudeDriverEnv> = {
         processEnv,
       ).pipe(
         Effect.map(stampIdentity),
+        Effect.flatMap((nextSnapshot) =>
+          Ref.modify(knownVersionedModels, (knownModels) => {
+            const reconciled = reconcileKnownClaudeModelsAfterVersionProbe(
+              knownModels,
+              nextSnapshot,
+            );
+            return [reconciled.snapshot, reconciled.knownModels];
+          }),
+        ),
         Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
         Effect.provideService(Path.Path, path),
       );
