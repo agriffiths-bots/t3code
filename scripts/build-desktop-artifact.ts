@@ -1844,10 +1844,10 @@ export const createBuildConfig = Effect.fn("createBuildConfig")(function* (
     directories: {
       buildResources: "apps/desktop/resources",
     },
-    // Only the Windows WSL backend needs files outside the asar (see
-    // WINDOWS_ASAR_UNPACK); macOS and Linux stay packed — smart unpack
-    // extracts native libraries, which fff-node finds in app.asar.unpacked.
-    asarUnpack: DESKTOP_ASAR_UNPACK,
+    // Every platform explicitly unpacks the minimal native-runtime set. Windows
+    // additionally needs the complete dependency tree for the fork-only WSL backend,
+    // which launches the server outside Electron's asar redirect.
+    asarUnpack: platform === "win" ? [...WINDOWS_ASAR_UNPACK] : [...DESKTOP_ASAR_UNPACK],
     afterPack: afterPackHookPath,
     extraResources: DESKTOP_EXTRA_RESOURCES,
   };

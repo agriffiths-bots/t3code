@@ -6,7 +6,8 @@
   "scripts": {
     "build:ghostty-wasm": "bash scripts/build-libghostty-wasm.sh",
     "dev": "vp dev",
-    "build": "vp build",
+    "build": "vp build && node ../../scripts/assert-web-build-output.ts dist && node ../../scripts/assert-web-no-dev-endpoints.ts dist",
+    "build:hosted": "vp build && node ../../scripts/assert-web-build-output.ts dist && node ../../scripts/assert-web-no-dev-endpoints.ts --force dist",
     "preview": "vp preview",
     "typecheck": "tsgo --noEmit",
     "test": "vp test run --passWithNoTests --project unit"

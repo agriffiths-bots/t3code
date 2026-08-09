@@ -8,14 +8,31 @@ import compression from "compression";
 import { defineProject, type TestProjectInlineConfiguration } from "vite-plus/test/config";
 import "vite-plus/test/config";
 import { defineConfig, type Connect, type Plugin } from "vite-plus";
+import { normalizeBuildVersion } from "@t3tools/shared/semver";
 import pkg from "./package.json" with { type: "json" };
 
 import { DEV_PROXIED_PATH_PREFIXES } from "@t3tools/shared/devProxy";
 
 import { loadRepoEnv } from "../../scripts/lib/public-config";
+import {
+  assertHostedBuildEnvClean,
+  HOSTED_BACKEND_ENV_KEYS,
+  isHostedBuild,
+} from "../../scripts/lib/hosted-build";
 
 const repoEnv = loadRepoEnv();
 Object.assign(process.env, repoEnv);
+
+// Hosted builds must derive their backend from the serving origin. Fail closed
+// before Vite can inline any inherited desktop or development endpoint.
+const hostedBuild = isHostedBuild(process.env);
+if (hostedBuild) {
+  assertHostedBuildEnvClean(process.env);
+  for (const key of HOSTED_BACKEND_ENV_KEYS) {
+    delete process.env[key];
+    delete (repoEnv as Record<string, string | undefined>)[key];
+  }
+}
 
 // Single-origin dev is signalled positively, because it cannot be inferred
 // from the absence of VITE_HTTP_URL/VITE_WS_URL: the runner deletes those keys
@@ -29,8 +46,10 @@ const isSingleOriginDev = process.env.T3CODE_SINGLE_ORIGIN_DEV === "1";
 const port = Number(process.env.PORT ?? 5733);
 const explicitHost = process.env.HOST?.trim();
 const host = explicitHost || "localhost";
-const configuredWsUrl = isSingleOriginDev ? undefined : process.env.VITE_WS_URL?.trim();
-const configuredHttpUrl = isSingleOriginDev ? undefined : process.env.VITE_HTTP_URL?.trim();
+const configuredWsUrl =
+  hostedBuild || isSingleOriginDev ? undefined : process.env.VITE_WS_URL?.trim();
+const configuredHttpUrl =
+  hostedBuild || isSingleOriginDev ? undefined : process.env.VITE_HTTP_URL?.trim();
 const configuredRelayUrl = repoEnv.VITE_T3CODE_RELAY_URL?.trim() || "";
 const configuredClerkPublishableKey = repoEnv.VITE_CLERK_PUBLISHABLE_KEY?.trim() || "";
 const configuredClerkJwtTemplate = repoEnv.VITE_CLERK_JWT_TEMPLATE?.trim() || "";
@@ -39,7 +58,14 @@ const configuredRelayTracingUrl = repoEnv.VITE_RELAY_OTLP_TRACES_URL?.trim() || 
 const configuredRelayTracingDataset = repoEnv.VITE_RELAY_OTLP_TRACES_DATASET?.trim() || "";
 const configuredRelayTracingToken = repoEnv.VITE_RELAY_OTLP_TRACES_TOKEN?.trim() || "";
 const configuredHostedAppChannel = process.env.VITE_HOSTED_APP_CHANNEL?.trim() || "";
-const configuredAppVersion = process.env.APP_VERSION?.trim() || pkg.version;
+const configuredAppVersion =
+  normalizeBuildVersion(process.env.APP_VERSION) ??
+  normalizeBuildVersion(process.env.T3CODE_BUILD_VERSION) ??
+  pkg.version;
+const configuredAppBuildSha = (() => {
+  const buildSha = process.env.T3CODE_BUILD_SHA?.trim() ?? "";
+  return /^[0-9a-f]{40}$/i.test(buildSha) ? buildSha.toLowerCase() : "";
+})();
 const configuredHostedAppUrl = (() => {
   const explicitHostedAppUrl = process.env.VITE_HOSTED_APP_URL?.trim();
   if (explicitHostedAppUrl) {
@@ -54,6 +80,21 @@ const configuredHostedAppUrl = (() => {
   return undefined;
 })();
 const sourcemapEnv = process.env.T3CODE_WEB_SOURCEMAP?.trim().toLowerCase();
+const desktopPackageBuildEnv = process.env.T3CODE_DESKTOP_PACKAGE?.trim().toLowerCase();
+const desktopPackageBuild = desktopPackageBuildEnv === "1" || desktopPackageBuildEnv === "true";
+const buildIdentityPlugin: Plugin = {
+  name: "t3-build-identity",
+  generateBundle() {
+    this.emitFile({
+      type: "asset",
+      fileName: "build-identity.json",
+      source: `${JSON.stringify({
+        buildSha: configuredAppBuildSha,
+        buildVersion: configuredAppVersion,
+      })}\n`,
+    });
+  },
+};
 
 // Vite 8.1's experimental bundled dev mode: serves rolldown-bundled chunks in
 // dev for much faster startup/reload on large module graphs, with HMR served
@@ -64,11 +105,26 @@ const bundledDevEnv = process.env.T3CODE_BUNDLED_DEV?.trim().toLowerCase();
 const bundledDev = bundledDevEnv === "1" || bundledDevEnv === "true";
 
 const buildSourcemap: boolean | "hidden" =
-  sourcemapEnv === "0" || sourcemapEnv === "false"
+  desktopPackageBuild || sourcemapEnv === "0" || sourcemapEnv === "false"
     ? false
     : sourcemapEnv === "hidden"
       ? "hidden"
       : true;
+
+function desktopPackageManualChunks(id: string): string | undefined {
+  if (!desktopPackageBuild) return undefined;
+  const normalized = id.replaceAll("\\", "/");
+  if (
+    normalized.includes("/node_modules/@shikijs/") ||
+    normalized.includes("/node_modules/shiki/")
+  ) {
+    return "syntax";
+  }
+  if (normalized.includes("/node_modules/@pierre/diffs/")) {
+    return "diffs";
+  }
+  return undefined;
+}
 
 const unitTestProject = {
   extends: true,
@@ -155,6 +211,7 @@ export default defineConfig(() => {
   return {
     assetsInclude: ["**/*.wasm"],
     plugins: [
+      buildIdentityPlugin,
       devCompressionPlugin(),
       tanstackRouter(),
       react(),
@@ -182,7 +239,17 @@ export default defineConfig(() => {
       ],
     },
     define: {
-      // In dev mode, tell the web app where the WebSocket server lives
+      // Hosted builds pin all backend-pointing vars to "" so the client falls
+      // back to window.location.origin — deterministic even if the environment
+      // was contaminated (defense-in-depth alongside the scrub above).
+      ...(hostedBuild
+        ? {
+            "import.meta.env.VITE_HTTP_URL": '""',
+            "import.meta.env.VITE_DEV_SERVER_URL": '""',
+          }
+        : {}),
+      // In dev mode, tell the web app where the WebSocket server lives.
+      // Hosted builds scrub configuredWsUrl above, so this resolves to "".
       "import.meta.env.VITE_WS_URL": JSON.stringify(configuredWsUrl ?? ""),
       // Pinned explicitly rather than left to Vite's automatic VITE_ exposure:
       // under single-origin dev this must stay empty even when a `.env`
@@ -202,6 +269,7 @@ export default defineConfig(() => {
       "import.meta.env.VITE_HOSTED_APP_URL": JSON.stringify(configuredHostedAppUrl ?? ""),
       "import.meta.env.VITE_HOSTED_APP_CHANNEL": JSON.stringify(configuredHostedAppChannel),
       "import.meta.env.APP_VERSION": JSON.stringify(configuredAppVersion),
+      "import.meta.env.APP_BUILD_SHA": JSON.stringify(configuredAppBuildSha),
     },
     resolve: {
       tsconfigPaths: true,
@@ -261,6 +329,15 @@ export default defineConfig(() => {
       outDir: "dist",
       emptyOutDir: true,
       sourcemap: buildSourcemap,
+      ...(desktopPackageBuild
+        ? {
+            rollupOptions: {
+              output: {
+                manualChunks: desktopPackageManualChunks,
+              },
+            },
+          }
+        : {}),
     },
     test: {
       projects: [defineProject(unitTestProject)],
