@@ -475,6 +475,7 @@ export class EnvironmentAuth extends Context.Service<
       readonly scopes?: ReadonlyArray<AuthEnvironmentScope>;
       readonly subject?: string;
       readonly proofKeyThumbprint?: string;
+      readonly purpose?: "startup";
     }) => Effect.Effect<IssuedPairingLink, ServerAuthInternalError>;
     readonly issuePairingCredential: (
       input: AuthCreatePairingCredentialInput,
@@ -836,12 +837,14 @@ export const make = Effect.gen(function* () {
     readonly audienceCeiling: AuthAudienceCeiling;
     readonly subject: string;
     readonly label?: string;
+    readonly purpose?: "startup";
   }) =>
     createPairingLink({
       scopes: input.scopes,
       audienceCeiling: input.audienceCeiling,
       subject: input.subject,
       ...(input.label ? { label: input.label } : {}),
+      ...(input.purpose ? { purpose: input.purpose } : {}),
     }).pipe(
       Effect.map(
         (issued) =>
@@ -871,6 +874,7 @@ export const make = Effect.gen(function* () {
         ...(input?.ttl ? { ttl: input.ttl } : {}),
         ...(input?.label ? { label: input.label } : {}),
         ...(input?.proofKeyThumbprint ? { proofKeyThumbprint: input.proofKeyThumbprint } : {}),
+        ...(input?.purpose ? { purpose: input.purpose } : {}),
       });
       return {
         id: issued.id,
@@ -990,6 +994,7 @@ export const make = Effect.gen(function* () {
         scopes: AuthAdministrativeScopes,
         audienceCeiling: "private",
         subject: INTERNAL_ADMINISTRATIVE_BOOTSTRAP_SUBJECT,
+        purpose: "startup",
       }).pipe(Effect.withSpan("EnvironmentAuth.issueStartupPairingCredential"));
 
   const listClientSessions: EnvironmentAuth["Service"]["listClientSessions"] = (currentSessionId) =>

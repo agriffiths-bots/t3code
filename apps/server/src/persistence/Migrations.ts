@@ -9,8 +9,8 @@
  */
 
 import * as Migrator from "effect/unstable/sql/Migrator";
-import * as Layer from "effect/Layer";
 import * as Effect from "effect/Effect";
+import * as Layer from "effect/Layer";
 
 // Import all migrations statically
 import Migration0001 from "./Migrations/001_OrchestrationEvents.ts";
@@ -67,6 +67,13 @@ import Migration0052 from "./Migrations/052_ProjectionTurnsEffectiveModel.ts";
 import Migration0053 from "./Migrations/053_LocalSubagentTerminalDeliveries.ts";
 import Migration0054 from "./Migrations/054_BackfillPreexistingLocalSubagentTerminalDeliveries.ts";
 import Migration0055 from "./Migrations/055_ProjectionThreadsSettled.ts";
+import Migration0056 from "./Migrations/034_ProjectionThreadsSnoozed.ts";
+import Migration0057 from "./Migrations/035_ProjectionThreadTitleRegeneration.ts";
+import Migration0058 from "./Migrations/036_ProjectionThreadsPinned.ts";
+import Migration0059 from "./Migrations/037_ProjectionTurnsKeysetIndex.ts";
+import Migration0060 from "./Migrations/038_ProjectionThreadsPinOrderKey.ts";
+import Migration0061 from "./Migrations/039_ProjectionProjectsDefaultThreadEnvMode.ts";
+import Migration0062 from "./Migrations/040_ProjectionProjectFaviconPath.ts";
 
 /**
  * Migration loader with all migrations defined inline.
@@ -133,7 +140,16 @@ export const migrationEntries = [
   [53, "LocalSubagentTerminalDeliveries", Migration0053],
   [54, "BackfillPreexistingLocalSubagentTerminalDeliveries", Migration0054],
   [55, "ProjectionThreadsSettled", Migration0055],
+  [56, "ProjectionThreadsSnoozed", Migration0056],
+  [57, "ProjectionThreadTitleRegeneration", Migration0057],
+  [58, "ProjectionThreadsPinned", Migration0058],
+  [59, "ProjectionTurnsKeysetIndex", Migration0059],
+  [60, "ProjectionThreadsPinOrderKey", Migration0060],
+  [61, "ProjectionProjectsDefaultThreadEnvMode", Migration0061],
+  [62, "ProjectionProjectFaviconPath", Migration0062],
 ] as const;
+
+export const migrationManifest = migrationEntries.map(([id, name]) => [id, name] as const);
 
 export const makeMigrationLoader = (throughId?: number) =>
   Migrator.fromRecord(

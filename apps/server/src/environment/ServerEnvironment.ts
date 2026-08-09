@@ -10,6 +10,8 @@ import * as Path from "effect/Path";
 import * as Schema from "effect/Schema";
 
 import packageJson from "../../package.json" with { type: "json" };
+import { resolveServerSelfUpdateCapability } from "../cloud/selfUpdate.ts";
+import { resolveServiceLauncherMode } from "../cloud/serviceLauncherClient.ts";
 import * as ServerConfig from "../config.ts";
 import * as ProcessRunner from "../processRunner.ts";
 import { resolveServerEnvironmentLabel } from "./ServerEnvironmentLabel.ts";
@@ -167,6 +169,11 @@ export const make = Effect.gen(function* () {
     typeof __T3CODE_BUILD_VERSION__ !== "undefined" ? __T3CODE_BUILD_VERSION__ : undefined,
     packageJson.version,
   );
+  const launcher = yield* resolveServiceLauncherMode();
+  const serverSelfUpdate = resolveServerSelfUpdateCapability({
+    desktopManaged: serverConfig.mode === "desktop",
+    launcherManaged: launcher.managed,
+  });
 
   const descriptor: ExecutionEnvironmentDescriptor = {
     environmentId,
@@ -181,6 +188,12 @@ export const make = Effect.gen(function* () {
       repositoryIdentity: true,
       connectionProbe: true,
       threadSettlement: true,
+      threadSnooze: true,
+      threadPinning: true,
+      threadPinReorder: true,
+      threadTitleRegeneration: true,
+      ...(serverSelfUpdate === null ? {} : { serverSelfUpdate }),
+      ...(serverSelfUpdate === "boot-service" ? { serverSelfUpdateProgress: true } : {}),
     },
   };
 

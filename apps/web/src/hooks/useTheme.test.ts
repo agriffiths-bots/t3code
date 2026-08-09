@@ -27,16 +27,6 @@ afterEach(() => {
 });
 
 describe("theme failure handling", () => {
-  it("defaults to light without replacing an explicit system preference", async () => {
-    const storage = createStorage();
-    vi.stubGlobal("window", { localStorage: storage });
-    const { readThemePreference } = await import("./useTheme");
-
-    expect(readThemePreference()).toBe("light");
-    storage.setItem("t3code:theme", "system");
-    expect(readThemePreference()).toBe("system");
-  });
-
   it("preserves exact storage causes and operation context", async () => {
     const readCause = new Error("storage read blocked");
     const writeCause = new Error("storage quota exceeded");
@@ -80,6 +70,18 @@ describe("theme failure handling", () => {
     }
   });
 
+  it("reads the persisted T3 Chat theme preference", async () => {
+    vi.stubGlobal("window", {
+      localStorage: createStorage({
+        getItem: () => "t3-chat",
+      }),
+    });
+
+    const { readThemePreference } = await import("./useTheme");
+
+    expect(readThemePreference()).toBe("t3-chat");
+  });
+
   it("falls back during initial theme application and logs only safe attributes", async () => {
     const cause = new Error("private browsing storage failure");
     const errorLog = vi.spyOn(console, "error").mockImplementation(() => {});
@@ -114,9 +116,10 @@ describe("theme failure handling", () => {
 
   it("retries a failed storage read only after a relevant storage event", async () => {
     const cause = new Error("persistent storage failure");
-    const getItem = vi.fn(() => {
+    const themeGetItem = vi.fn((): string | null => {
       throw cause;
     });
+    const getItem = vi.fn((key: string) => (key === "t3code:theme" ? themeGetItem() : null));
     const errorLog = vi.spyOn(console, "error").mockImplementation(() => {});
     let readSnapshot: (() => unknown) | undefined;
     let subscribeToTheme: ((listener: () => void) => () => void) | undefined;
@@ -151,14 +154,14 @@ describe("theme failure handling", () => {
     readSnapshot?.();
     readSnapshot?.();
 
-    expect(getItem).toHaveBeenCalledTimes(1);
+    expect(themeGetItem).toHaveBeenCalledTimes(1);
     expect(errorLog).toHaveBeenCalledTimes(1);
 
     const unsubscribe = subscribeToTheme?.(() => undefined);
     storageHandler?.({ key: "t3code:theme" } as StorageEvent);
     readSnapshot?.();
 
-    expect(getItem).toHaveBeenCalledTimes(2);
+    expect(themeGetItem).toHaveBeenCalledTimes(2);
     expect(errorLog).toHaveBeenCalledTimes(2);
     unsubscribe?.();
   });

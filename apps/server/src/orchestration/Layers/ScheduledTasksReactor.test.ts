@@ -156,6 +156,7 @@ describe("ScheduledTasksReactor", () => {
     const projectionLayer = Layer.succeed(ProjectionSnapshotQuery, {
       getCommandReadModel: () => unsupported(),
       getSnapshot: () => unsupported(),
+      searchThreads: () => unsupported(),
       getShellSnapshot: () => unsupported(),
       getArchivedShellSnapshot: () => unsupported(),
       getSnapshotSequence: () => unsupported(),

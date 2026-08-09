@@ -6,12 +6,12 @@ import {
   type ModelSelection,
   type ProviderDriverKind,
   type ServerProvider,
+  type ScopedProjectRef,
   type ScopedThreadRef,
   type ThreadId,
   type TurnId,
 } from "@t3tools/contracts";
-import type { EnvironmentConnectionPresentation } from "@t3tools/client-runtime/connection";
-import { type ChatMessage, type SessionPhase, type Thread } from "../types";
+import { type ChatMessage, type SessionPhase, type Thread, type ThreadShell } from "../types";
 import { type ComposerImageAttachment, type DraftThreadState } from "../composerDraftStore";
 import * as Schema from "effect/Schema";
 import { appAtomRegistry } from "../rpc/atomRegistry";
@@ -26,9 +26,58 @@ import type { DraftThreadEnvMode } from "../composerDraftStore";
 export const LAST_INVOKED_SCRIPT_BY_PROJECT_KEY = "t3code:last-invoked-script-by-project";
 export const MAX_HIDDEN_MOUNTED_TERMINAL_THREADS = 10;
 export const MAX_HIDDEN_MOUNTED_PREVIEW_THREADS = 3;
-export const ENVIRONMENT_UNAVAILABLE_BANNER_DEBOUNCE_MS = 2_000;
+export const ENVIRONMENT_RECONNECT_WARNING_GRACE_MS = 2_000;
 
 export const LastInvokedScriptByProjectSchema = Schema.Record(ProjectId, Schema.String);
+
+export function scheduleEnvironmentReconnectWarning(showWarning: () => void): () => void {
+  const timeoutId = globalThis.setTimeout(showWarning, ENVIRONMENT_RECONNECT_WARNING_GRACE_MS);
+  return () => globalThis.clearTimeout(timeoutId);
+}
+
+export function hasEnvironmentReconnectWarningGraceElapsed(
+  activeEnvironmentId: EnvironmentId | null,
+  elapsedEnvironmentId: EnvironmentId | null,
+): boolean {
+  return activeEnvironmentId !== null && activeEnvironmentId === elapsedEnvironmentId;
+}
+
+export function startNewThreadForProject(
+  projectRef: ScopedProjectRef | null,
+  handleNewThread: (projectRef: ScopedProjectRef) => Promise<void>,
+): boolean {
+  if (projectRef === null) return false;
+  void handleNewThread(projectRef);
+
+  return true;
+}
+
+export function resolveThreadMetadataUpdateForNextTurn(input: {
+  currentModelSelection: ModelSelection;
+  nextModelSelection?: ModelSelection;
+  currentBranch: string | null;
+  nextBranch?: string;
+}): {
+  modelSelection?: ModelSelection;
+  branch?: string;
+  worktreePath?: null;
+} | null {
+  const nextModelSelection = input.nextModelSelection;
+  const modelSelectionChanged =
+    nextModelSelection !== undefined &&
+    (nextModelSelection.model !== input.currentModelSelection.model ||
+      nextModelSelection.instanceId !== input.currentModelSelection.instanceId ||
+      JSON.stringify(nextModelSelection.options ?? null) !==
+        JSON.stringify(input.currentModelSelection.options ?? null));
+  const branchChanged = input.nextBranch !== undefined && input.nextBranch !== input.currentBranch;
+  if (!modelSelectionChanged && !branchChanged) {
+    return null;
+  }
+  return {
+    ...(modelSelectionChanged ? { modelSelection: nextModelSelection } : {}),
+    ...(branchChanged ? { branch: input.nextBranch, worktreePath: null } : {}),
+  };
+}
 
 export function buildLocalDraftThread(
   threadId: ThreadId,
@@ -62,8 +111,20 @@ export function buildLocalDraftThread(
   };
 }
 
+export function buildLoadingThreadFromShell(shell: ThreadShell): Thread {
+  return {
+    ...shell,
+    messages: [],
+    turns: [],
+    proposedPlans: [],
+    activities: [],
+    checkpoints: [],
+    deletedAt: null,
+  };
+}
+
 export function shouldWriteThreadErrorToCurrentServerThread(input: {
-  serverThread:
+  activeServerThread:
     | {
         environmentId: EnvironmentId;
         id: ThreadId;
@@ -74,154 +135,22 @@ export function shouldWriteThreadErrorToCurrentServerThread(input: {
   targetThreadId: ThreadId;
 }): boolean {
   return Boolean(
-    input.serverThread &&
+    input.activeServerThread &&
     input.targetThreadId === input.routeThreadRef.threadId &&
-    input.serverThread.environmentId === input.routeThreadRef.environmentId &&
-    input.serverThread.id === input.targetThreadId,
+    input.activeServerThread.environmentId === input.routeThreadRef.environmentId &&
+    input.activeServerThread.id === input.targetThreadId,
   );
-}
-
-export function shouldShowEnvironmentUnavailableBanner(input: {
-  connectionPhase: EnvironmentConnectionPresentation["phase"];
-  unavailableSinceMs: number | null;
-  nowMs: number;
-  debounceMs?: number;
-}): boolean {
-  if (input.connectionPhase === "connected" || input.unavailableSinceMs === null) {
-    return false;
-  }
-
-  const debounceMs = input.debounceMs ?? ENVIRONMENT_UNAVAILABLE_BANNER_DEBOUNCE_MS;
-  return input.nowMs - input.unavailableSinceMs >= debounceMs;
-}
-
-/** Same terminal ids (order ignored) — avoids reconcile when only server session ordering differs. */
-export function terminalIdListsEqual(left: readonly string[], right: readonly string[]): boolean {
-  if (left.length !== right.length) {
-    return false;
-  }
-  if (left.length === 0) {
-    return true;
-  }
-  const sortedLeft = left.toSorted((a, b) => a.localeCompare(b));
-  const sortedRight = right.toSorted((a, b) => a.localeCompare(b));
-  for (let index = 0; index < sortedLeft.length; index += 1) {
-    if (sortedLeft[index] !== sortedRight[index]) {
-      return false;
-    }
-  }
-  return true;
-}
-
-export function reconcileTerminalIdsFromServerMetadata(input: {
-  readonly serverIds: readonly string[];
-  readonly clientIds: readonly string[];
-  readonly seenServerIds: ReadonlySet<string>;
-  readonly pendingLocalIds?: ReadonlySet<string>;
-}): string[] | null {
-  if (terminalIdListsEqual(input.serverIds, input.clientIds)) {
-    return null;
-  }
-
-  const serverIdSet = new Set(input.serverIds);
-  const protectedLocalIds = input.clientIds.filter(
-    (id) =>
-      !serverIdSet.has(id) && (input.pendingLocalIds?.has(id) || !input.seenServerIds.has(id)),
-  );
-  const nextIds = [...input.serverIds, ...protectedLocalIds];
-  return terminalIdListsEqual(nextIds, input.clientIds) ? null : nextIds;
-}
-
-export function reconcilePendingLocalTerminalIds(input: {
-  readonly pendingLocalIds: ReadonlySet<string>;
-  readonly previousClientIds: readonly string[];
-  readonly clientIds: readonly string[];
-  readonly serverIds: ReadonlySet<string>;
-}): Set<string> {
-  const nextPendingIds = new Set(input.pendingLocalIds);
-  const previousClientIds = new Set(input.previousClientIds);
-  const clientIds = new Set(input.clientIds);
-
-  for (const terminalId of nextPendingIds) {
-    if (input.serverIds.has(terminalId) || !clientIds.has(terminalId)) {
-      nextPendingIds.delete(terminalId);
-    }
-  }
-
-  for (const terminalId of clientIds) {
-    if (!previousClientIds.has(terminalId) && !input.serverIds.has(terminalId)) {
-      nextPendingIds.add(terminalId);
-    }
-  }
-
-  return nextPendingIds;
-}
-
-export function buildThreadErrorDismissKey(input: {
-  threadKey: string;
-  turnId: TurnId | null | undefined;
-  error: string | null | undefined;
-}): string | null {
-  const error = input.error?.trim();
-  if (!error) {
-    return null;
-  }
-
-  return `${input.threadKey}:${input.turnId ?? "session"}:${error}`;
-}
-
-export function resolveVisibleServerThreadError(input: {
-  localError: string | null;
-  sessionError: string | null;
-  dismissedSessionErrorKeys: Readonly<Record<string, true | undefined>>;
-  threadKey: string;
-  turnId: TurnId | null | undefined;
-}): string | null {
-  if (input.localError !== null) {
-    return input.localError;
-  }
-
-  const dismissKey = buildThreadErrorDismissKey({
-    threadKey: input.threadKey,
-    turnId: input.turnId,
-    error: input.sessionError,
-  });
-  if (dismissKey !== null && input.dismissedSessionErrorKeys[dismissKey]) {
-    return null;
-  }
-
-  return input.sessionError;
 }
 
 export function buildThreadTurnInterruptInput(thread: Pick<Thread, "id" | "session">): {
   threadId: ThreadId;
   turnId?: TurnId;
 } {
-  const runningTurnId =
-    thread.session?.status === "running" || thread.session?.status === "waiting"
-      ? thread.session.activeTurnId
-      : null;
+  const runningTurnId = thread.session?.status === "running" ? thread.session.activeTurnId : null;
   return {
     threadId: thread.id,
     ...(runningTurnId !== null ? { turnId: runningTurnId } : {}),
   };
-}
-
-function normalizeWorkspacePath(path: string | null | undefined): string | null {
-  const trimmed = path?.trim();
-  if (!trimmed) return null;
-  return trimmed.replace(/\\/g, "/").replace(/\/+$/, "");
-}
-
-export function workspaceRelativePathFromRepositoryRoot(
-  repositoryRoot: string | null | undefined,
-  workspaceRoot: string,
-): string | null {
-  const root = normalizeWorkspacePath(repositoryRoot);
-  const workspace = normalizeWorkspacePath(workspaceRoot);
-  if (!root || !workspace || root === workspace) return null;
-  const rootPrefix = root.endsWith("/") ? root : `${root}/`;
-  return workspace.startsWith(rootPrefix) ? workspace.slice(rootPrefix.length) : null;
 }
 
 export function reconcileMountedTerminalThreadIds(input: {
@@ -399,44 +328,50 @@ export function buildExpiredTerminalContextToastCopy(
   };
 }
 
+export function branchMismatchKey(
+  threadId: string | null,
+  mismatch: { threadBranch: string; currentBranch: string } | null,
+): string | null {
+  if (!threadId || !mismatch) {
+    return null;
+  }
+  return `${threadId}:${mismatch.threadBranch}:${mismatch.currentBranch}`;
+}
+
+// The mismatch banner only matters when the user is about to send: passive
+// reading of an old thread carries no risk (the branch picker tint already
+// covers ambient awareness). Draft content is the intent signal — composer
+// focus is useless here because ChatView autofocuses the composer on every
+// thread open. `wasShownForCurrentMismatch` keeps the banner mounted once
+// revealed so it doesn't flicker away when the draft is cleared.
+export function shouldShowBranchMismatchBanner(input: {
+  hasMismatch: boolean;
+  isDismissed: boolean;
+  composerHasContent: boolean;
+  wasShownForCurrentMismatch: boolean;
+}): boolean {
+  if (!input.hasMismatch || input.isDismissed) {
+    return false;
+  }
+  return input.composerHasContent || input.wasShownForCurrentMismatch;
+}
+
+// Session-scoped (module-level so it survives ChatView remounts, e.g. route
+// changes). Durable cross-device dismissal is planned as a server-side ack.
+const sessionDismissedBranchMismatchKeys = new Set<string>();
+
+export function dismissBranchMismatchForSession(key: string): void {
+  sessionDismissedBranchMismatchKeys.add(key);
+}
+
+export function isBranchMismatchDismissedForSession(key: string | null): boolean {
+  return key !== null && sessionDismissedBranchMismatchKeys.has(key);
+}
+
 export function threadHasStarted(thread: Thread | null | undefined): boolean {
   return Boolean(
     thread && (thread.latestTurn !== null || thread.messages.length > 0 || thread.session !== null),
   );
-}
-
-export function hasQueuedSubmissionBeenObservedByShell(input: {
-  readonly submissionCreatedAt: string;
-  readonly latestTurn: Thread["latestTurn"] | null | undefined;
-}): boolean {
-  return (
-    typeof input.latestTurn?.requestedAt === "string" &&
-    input.latestTurn.requestedAt.localeCompare(input.submissionCreatedAt) >= 0
-  );
-}
-
-export function threadHasEstablishedProviderBinding(thread: Thread | null | undefined): boolean {
-  if (!thread?.session) {
-    return false;
-  }
-  if (thread.latestTurn?.startedAt) {
-    return true;
-  }
-  if (thread.session.activeTurnId !== null) {
-    return true;
-  }
-  switch (thread.session.status) {
-    case "idle":
-    case "starting":
-    case "running":
-    case "waiting":
-    case "ready":
-    case "interrupted":
-      return true;
-    case "stopped":
-    case "error":
-      return false;
-  }
 }
 
 // `threadProvider` is the open branded driver kind carried by the session.
@@ -456,7 +391,7 @@ export function deriveLockedProvider(input: {
   selectedProvider: string | null;
   threadProvider: string | null;
 }): ProviderDriverKind | null {
-  if (!threadHasEstablishedProviderBinding(input.thread)) {
+  if (!threadHasStarted(input.thread)) {
     return null;
   }
   const sessionProvider = input.thread?.session?.providerName ?? null;

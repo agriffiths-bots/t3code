@@ -83,20 +83,37 @@ const hasModelCapabilities = (model: ServerProvider["models"][number]): boolean 
 
 const CLAUDE_DRIVER_KIND = ProviderDriverKind.make("claudeAgent");
 
+const shouldRetainMissingProviderModels = (provider: ServerProvider): boolean => {
+  if (provider.driver !== ProviderDriverKind.make("opencode")) {
+    return true;
+  }
+
+  const isPendingInitialProbe =
+    provider.enabled && !provider.installed && provider.status === "warning";
+  const didInstalledProviderProbeFail = provider.installed && provider.status === "error";
+  return isPendingInitialProbe || didInstalledProviderProbeFail;
+};
+
 const mergeProviderModels = (
-  driver: ProviderDriverKind,
+  provider: ServerProvider,
   previousModels: ReadonlyArray<ServerProvider["models"][number]>,
   nextModels: ReadonlyArray<ServerProvider["models"][number]>,
   preserveMissingBuiltIns: boolean,
 ): ReadonlyArray<ServerProvider["models"][number]> => {
+  const driver = provider.driver;
   const retainedPreviousModels = previousModels.filter(
     (model) => !isRetiredBuiltInProviderModel(driver, model),
   );
   const activeNextModels = nextModels.filter(
     (model) => !isRetiredBuiltInProviderModel(driver, model),
   );
+  const shouldRetainMissingModels = shouldRetainMissingProviderModels(provider);
 
-  if (nextModels.length === 0 && retainedPreviousModels.length > 0) {
+  if (
+    shouldRetainMissingModels &&
+    activeNextModels.length === 0 &&
+    retainedPreviousModels.length > 0
+  ) {
     return retainedPreviousModels;
   }
 
@@ -108,11 +125,12 @@ const mergeProviderModels = (
     if (!previousModel || hasModelCapabilities(model) || !hasModelCapabilities(previousModel)) {
       return model;
     }
-    return {
-      ...model,
-      capabilities: previousModel.capabilities,
-    };
+    return { ...model, capabilities: previousModel.capabilities };
   });
+  if (!shouldRetainMissingModels) {
+    return mergedModels;
+  }
+
   const nextSlugs = new Set(activeNextModels.map((model) => model.slug));
   return [
     ...mergedModels,
@@ -133,7 +151,7 @@ export const mergeProviderSnapshot = (
     : {
         ...nextProvider,
         models: mergeProviderModels(
-          nextProvider.driver,
+          nextProvider,
           previousProvider.models,
           nextProvider.models,
           nextProvider.driver === CLAUDE_DRIVER_KIND &&

@@ -5,7 +5,6 @@ import {
   ProjectId,
   ProviderInstanceId,
   ThreadId,
-  TurnId,
   type OrchestrationReadModel,
   type OrchestrationSession,
   type OrchestrationThread,
@@ -25,7 +24,6 @@ function makeReadModel(
   session: OrchestrationSession | null = null,
   activities: OrchestrationThread["activities"] = [],
   messages: OrchestrationThread["messages"] = [],
-  latestTurn: OrchestrationThread["latestTurn"] = null,
 ): OrchestrationReadModel {
   return {
     snapshotSequence: 0,
@@ -34,14 +32,14 @@ function makeReadModel(
       {
         id: ThreadId.make("thread-1"),
         projectId: ProjectId.make("project-1"),
-        dataAudience: "private",
+        dataAudience: "private" as const,
         title: "Thread",
         modelSelection: { instanceId: ProviderInstanceId.make("codex"), model: "gpt-5.4" },
         runtimeMode: "full-access",
         interactionMode: "default",
         branch: null,
         worktreePath: null,
-        latestTurn,
+        latestTurn: null,
         createdAt: NOW,
         updatedAt: NOW,
         archivedAt,
@@ -60,16 +58,13 @@ function makeReadModel(
   };
 }
 
-function makeSession(
-  status: OrchestrationSession["status"],
-  activeTurnId: OrchestrationSession["activeTurnId"] = null,
-): OrchestrationSession {
+function makeSession(status: OrchestrationSession["status"]): OrchestrationSession {
   return {
     threadId: ThreadId.make("thread-1"),
     status,
     providerName: "Codex",
     runtimeMode: "full-access",
-    activeTurnId,
+    activeTurnId: null,
     lastError: null,
     updatedAt: NOW,
   };
@@ -128,37 +123,7 @@ it.layer(NodeServices.layer)("settled thread decider", (it) => {
         }).pipe(Effect.flip);
         expect(error._tag).toBe("OrchestrationCommandInvariantError");
       }
-      const waitingError = yield* decideOrchestrationCommand({
-        command: {
-          type: "thread.settle",
-          commandId: CommandId.make("cmd-settle-live-waiting"),
-          threadId: ThreadId.make("thread-1"),
-        },
-        readModel: makeReadModel(null, null, makeSession("waiting", TurnId.make("turn-waiting"))),
-      }).pipe(Effect.flip);
-      expect(waitingError._tag).toBe("OrchestrationCommandInvariantError");
-
-      // A waiting session without an active turn is parked, not live.
-      const parked = yield* decideOrchestrationCommand({
-        command: {
-          type: "thread.settle",
-          commandId: CommandId.make("cmd-settle-parked-waiting"),
-          threadId: ThreadId.make("thread-1"),
-        },
-        readModel: makeReadModel(null, null, makeSession("waiting")),
-      });
-      expect((Array.isArray(parked) ? parked : [parked])[0]?.type).toBe("thread.settled");
-      const failedError = yield* decideOrchestrationCommand({
-        command: {
-          type: "thread.settle",
-          commandId: CommandId.make("cmd-settle-failed-session"),
-          threadId: ThreadId.make("thread-1"),
-        },
-        readModel: makeReadModel(null, null, makeSession("error")),
-      }).pipe(Effect.flip);
-      expect(failedError._tag).toBe("OrchestrationCommandInvariantError");
-
-      // Stopped sessions are settleable: only active or failed work is protected.
+      // Stopped/error sessions are settleable — only live work is protected.
       const settled = yield* decideOrchestrationCommand({
         command: {
           type: "thread.settle",
@@ -169,50 +134,6 @@ it.layer(NodeServices.layer)("settled thread decider", (it) => {
       });
       const settledEvents = Array.isArray(settled) ? settled : [settled];
       expect(settledEvents[0]?.type).toBe("thread.settled");
-    }),
-  );
-
-  it.effect("rejects a running latest turn before its session projection arrives", () =>
-    Effect.gen(function* () {
-      const error = yield* decideOrchestrationCommand({
-        command: {
-          type: "thread.settle",
-          commandId: CommandId.make("cmd-settle-running-turn"),
-          threadId: ThreadId.make("thread-1"),
-        },
-        readModel: makeReadModel(null, null, null, [], [], {
-          turnId: TurnId.make("turn-running"),
-          state: "running",
-          requestedAt: NOW,
-          startedAt: NOW,
-          completedAt: null,
-          assistantMessageId: null,
-        }),
-      }).pipe(Effect.flip);
-
-      expect(error._tag).toBe("OrchestrationCommandInvariantError");
-    }),
-  );
-
-  it.effect("rejects a failed latest turn before its session projection arrives", () =>
-    Effect.gen(function* () {
-      const error = yield* decideOrchestrationCommand({
-        command: {
-          type: "thread.settle",
-          commandId: CommandId.make("cmd-settle-error-turn"),
-          threadId: ThreadId.make("thread-1"),
-        },
-        readModel: makeReadModel(null, null, null, [], [], {
-          turnId: TurnId.make("turn-error"),
-          state: "error",
-          requestedAt: NOW,
-          startedAt: NOW,
-          completedAt: NOW,
-          assistantMessageId: null,
-        }),
-      }).pipe(Effect.flip);
-
-      expect(error._tag).toBe("OrchestrationCommandInvariantError");
     }),
   );
 
@@ -269,74 +190,6 @@ it.layer(NodeServices.layer)("settled thread decider", (it) => {
         ]),
       }).pipe(Effect.flip);
       expect(inputError._tag).toBe("OrchestrationCommandInvariantError");
-
-      // Approval and user-input IDs live in separate provider namespaces.
-      // Resolving one must not clear the other when those IDs collide.
-      const collidingIdError = yield* decideOrchestrationCommand({
-        command: {
-          type: "thread.settle",
-          commandId: CommandId.make("cmd-settle-colliding-request-ids"),
-          threadId: ThreadId.make("thread-1"),
-        },
-        readModel: makeReadModel(null, null, null, [
-          requestActivity("approval.requested", "shared-id", NOW),
-          requestActivity("user-input.requested", "shared-id", NOW),
-          requestActivity("approval.resolved", "shared-id", NOW),
-        ]),
-      }).pipe(Effect.flip);
-      expect(collidingIdError._tag).toBe("OrchestrationCommandInvariantError");
-    }),
-  );
-
-  it.effect("uses targeted projection settlement context instead of capped activity history", () =>
-    Effect.gen(function* () {
-      const pendingError = yield* decideOrchestrationCommand({
-        command: {
-          type: "thread.settle",
-          commandId: CommandId.make("cmd-settle-targeted-pending"),
-          threadId: ThreadId.make("thread-1"),
-        },
-        readModel: makeReadModel(null),
-        settlementContext: {
-          hasPendingApprovals: true,
-          hasPendingUserInput: false,
-          hasActionableProposedPlan: false,
-          latestPromptMessageAt: null,
-        },
-      }).pipe(Effect.flip);
-      expect(pendingError._tag).toBe("OrchestrationCommandInvariantError");
-
-      const queuedError = yield* decideOrchestrationCommand({
-        command: {
-          type: "thread.settle",
-          commandId: CommandId.make("cmd-settle-targeted-queued"),
-          threadId: ThreadId.make("thread-1"),
-        },
-        readModel: makeReadModel(null),
-        settlementContext: {
-          hasPendingApprovals: false,
-          hasPendingUserInput: false,
-          hasActionableProposedPlan: false,
-          latestPromptMessageAt: "1969-12-31T23:59:30.000Z",
-        },
-      }).pipe(Effect.flip);
-      expect(queuedError._tag).toBe("OrchestrationCommandInvariantError");
-
-      const planReadyError = yield* decideOrchestrationCommand({
-        command: {
-          type: "thread.settle",
-          commandId: CommandId.make("cmd-settle-targeted-plan-ready"),
-          threadId: ThreadId.make("thread-1"),
-        },
-        readModel: makeReadModel(null),
-        settlementContext: {
-          hasPendingApprovals: false,
-          hasPendingUserInput: false,
-          hasActionableProposedPlan: true,
-          latestPromptMessageAt: null,
-        },
-      }).pipe(Effect.flip);
-      expect(planReadyError._tag).toBe("OrchestrationCommandInvariantError");
     }),
   );
 
@@ -440,55 +293,6 @@ it.layer(NodeServices.layer)("settled thread decider", (it) => {
     }),
   );
 
-  it.effect("treats sub-agent wake system messages as queued turn starts", () =>
-    Effect.gen(function* () {
-      const systemMessage = (text: string): OrchestrationThread["messages"][number] => ({
-        id: MessageId.make(`message-${text}`),
-        role: "system",
-        text,
-        turnId: null,
-        streaming: false,
-        createdAt: "1969-12-31T23:59:30.000Z",
-        updatedAt: "1969-12-31T23:59:30.000Z",
-      });
-
-      const queuedError = yield* decideOrchestrationCommand({
-        command: {
-          type: "thread.settle",
-          commandId: CommandId.make("cmd-settle-subagent-wake"),
-          threadId: ThreadId.make("thread-1"),
-        },
-        readModel: makeReadModel(
-          null,
-          null,
-          null,
-          [],
-          [systemMessage("[sub-agent worker] Continue the parent task")],
-        ),
-      }).pipe(Effect.flip);
-      expect(queuedError._tag).toBe("OrchestrationCommandInvariantError");
-
-      const ordinarySystemNotice = yield* decideOrchestrationCommand({
-        command: {
-          type: "thread.settle",
-          commandId: CommandId.make("cmd-settle-system-notice"),
-          threadId: ThreadId.make("thread-1"),
-        },
-        readModel: makeReadModel(
-          null,
-          null,
-          null,
-          [],
-          [systemMessage("Provider configuration changed")],
-        ),
-      });
-      expect(
-        (Array.isArray(ordinarySystemNotice) ? ordinarySystemNotice : [ordinarySystemNotice])[0]
-          ?.type,
-      ).toBe("thread.settled");
-    }),
-  );
-
   it.effect("rejects settling and unsettling archived threads", () =>
     Effect.gen(function* () {
       const settleError = yield* decideOrchestrationCommand({
@@ -589,24 +393,6 @@ it.layer(NodeServices.layer)("settled thread decider", (it) => {
       });
       const sessionEvents = Array.isArray(sessionResult) ? sessionResult : [sessionResult];
       expect(sessionEvents.map((event) => event.type)).toEqual([
-        "thread.unsettled",
-        "thread.session-set",
-      ]);
-
-      const waitingSessionResult = yield* decideOrchestrationCommand({
-        command: {
-          type: "thread.session.set",
-          commandId: CommandId.make("cmd-session-set-waiting-active"),
-          threadId: ThreadId.make("thread-1"),
-          session: makeSession("waiting", TurnId.make("turn-waiting")),
-          createdAt: NOW,
-        },
-        readModel: makeReadModel("settled"),
-      });
-      const waitingSessionEvents = Array.isArray(waitingSessionResult)
-        ? waitingSessionResult
-        : [waitingSessionResult];
-      expect(waitingSessionEvents.map((event) => event.type)).toEqual([
         "thread.unsettled",
         "thread.session-set",
       ]);
@@ -732,6 +518,57 @@ it.layer(NodeServices.layer)("settled thread decider", (it) => {
       });
       const routineEvents = Array.isArray(routineResult) ? routineResult : [routineResult];
       expect(routineEvents.map((event) => event.type)).toEqual(["thread.activity-appended"]);
+    }),
+  );
+
+  it.effect("drops an onlyIfSettled session stop when the thread was re-engaged", () =>
+    Effect.gen(function* () {
+      const stopCommand = (commandId: string) =>
+        ({
+          type: "thread.session.stop",
+          commandId: CommandId.make(commandId),
+          threadId: ThreadId.make("thread-1"),
+          createdAt: NOW,
+          onlyIfSettled: true,
+        }) as const;
+
+      // Still settled with an idle session: the cleanup stop goes through.
+      const stopped = yield* decideOrchestrationCommand({
+        command: stopCommand("cmd-stop-settled-idle"),
+        readModel: makeReadModel("settled", null, makeSession("ready")),
+      });
+      const stoppedEvents = Array.isArray(stopped) ? stopped : [stopped];
+      expect(stoppedEvents.map((event) => event.type)).toEqual(["thread.session-stop-requested"]);
+
+      // Re-engaged before the stop was decided (a turn start unsettles the
+      // thread): the stale cleanup stop must not kill the new session.
+      const unsettledError = yield* decideOrchestrationCommand({
+        command: stopCommand("cmd-stop-unsettled"),
+        readModel: makeReadModel(null, null, makeSession("starting")),
+      }).pipe(Effect.flip);
+      expect(unsettledError._tag).toBe("OrchestrationCommandInvariantError");
+
+      // Still settled but the session is already coming alive: same drop.
+      const aliveError = yield* decideOrchestrationCommand({
+        command: stopCommand("cmd-stop-session-alive"),
+        readModel: makeReadModel("settled", null, makeSession("starting")),
+      }).pipe(Effect.flip);
+      expect(aliveError._tag).toBe("OrchestrationCommandInvariantError");
+
+      // Without the flag the stop stays unconditional (archive, stop button).
+      const unconditional = yield* decideOrchestrationCommand({
+        command: {
+          type: "thread.session.stop",
+          commandId: CommandId.make("cmd-stop-unconditional"),
+          threadId: ThreadId.make("thread-1"),
+          createdAt: NOW,
+        },
+        readModel: makeReadModel(null, null, makeSession("starting")),
+      });
+      const unconditionalEvents = Array.isArray(unconditional) ? unconditional : [unconditional];
+      expect(unconditionalEvents.map((event) => event.type)).toEqual([
+        "thread.session-stop-requested",
+      ]);
     }),
   );
 });

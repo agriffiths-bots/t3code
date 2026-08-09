@@ -67,6 +67,7 @@ export interface McpSessionRegistryShape {
   readonly resolve: (
     rawToken: string,
   ) => Effect.Effect<McpInvocationContext.McpInvocationScope | undefined>;
+  readonly touchThread: (threadId: ThreadId) => Effect.Effect<void>;
   readonly revokeProviderSession: (providerSessionId: string) => Effect.Effect<void>;
   readonly revokeThread: (threadId: ThreadId) => Effect.Effect<void>;
   readonly revokePeerTokensBySourceSession: (
@@ -488,6 +489,29 @@ const makeWithOptions = Effect.fn("McpSessionRegistry.make")(function* (
     },
   );
 
+  const touchThread: McpSessionRegistryShape["touchThread"] = Effect.fn(
+    "McpSessionRegistry.touchThread",
+  )(function* (threadId) {
+    const timestamp = yield* currentTimeMillis;
+    yield* SynchronizedRef.update(state, ({ records }) => {
+      const next = new Map(pruneExpired(records, timestamp));
+      for (const [tokenHash, record] of next) {
+        if (record.credentialKind !== "provider-session" || record.scope.threadId !== threadId) {
+          continue;
+        }
+        next.set(tokenHash, {
+          ...record,
+          scope: {
+            ...record.scope,
+            expiresAt: timestamp + idleTimeoutMs,
+          },
+          lastUsedAt: timestamp,
+        });
+      }
+      return { records: next };
+    });
+  });
+
   const revokeWhere = (predicate: (record: CredentialRecord) => boolean) =>
     SynchronizedRef.update(state, ({ records }) => ({
       records: new Map(Array.from(records).filter(([, record]) => !predicate(record))),
@@ -513,6 +537,7 @@ const makeWithOptions = Effect.fn("McpSessionRegistry.make")(function* (
     issue,
     issuePeerToken,
     resolve,
+    touchThread,
     revokeProviderSession: Effect.fn("McpSessionRegistry.revokeProviderSession")(
       function* (providerSessionId) {
         yield* revokeWhere(
@@ -615,6 +640,9 @@ export const resolveActiveMcpInvocation = (
   activeMcpSessionRegistry
     ? activeMcpSessionRegistry.resolve(rawToken)
     : Effect.sync((): McpInvocationContext.McpInvocationScope | undefined => undefined);
+
+export const touchActiveMcpThread = (threadId: ThreadId): Effect.Effect<void> =>
+  activeMcpSessionRegistry ? activeMcpSessionRegistry.touchThread(threadId) : Effect.void;
 
 export const revokeActiveMcpThread = (threadId: ThreadId): Effect.Effect<void> =>
   activeMcpSessionRegistry ? activeMcpSessionRegistry.revokeThread(threadId) : Effect.void;

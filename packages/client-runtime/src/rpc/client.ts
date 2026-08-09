@@ -36,6 +36,22 @@ export class EnvironmentRpcRequestObserver extends Context.Reference<{
   }),
 }) {}
 
+export interface EnvironmentRpcSubscriptionObservation {
+  readonly environmentId: string;
+  readonly method: EnvironmentSubscriptionRpcTag;
+  readonly input: unknown;
+}
+
+export class EnvironmentRpcSubscriptionObserver extends Context.Reference<{
+  readonly observe: (
+    subscription: EnvironmentRpcSubscriptionObservation,
+  ) => Effect.Effect<Effect.Effect<void>>;
+}>("@t3tools/client-runtime/rpc/EnvironmentRpcSubscriptionObserver", {
+  defaultValue: () => ({
+    observe: () => Effect.succeed(Effect.void),
+  }),
+}) {}
+
 export type EnvironmentRpcTag = keyof WsRpcProtocolClient & string;
 type RpcMethod<TTag extends EnvironmentRpcTag> = WsRpcProtocolClient[TTag];
 
@@ -51,11 +67,13 @@ export type EnvironmentSubscriptionRpcTag =
   | typeof WS_METHODS.subscribeTerminalMetadata
   | typeof WS_METHODS.subscribePreviewEvents
   | typeof WS_METHODS.subscribeDiscoveredLocalServers
+  | typeof WS_METHODS.subscribeResourceTelemetry
   | typeof WS_METHODS.subscribeVcsStatus
   | typeof WS_METHODS.terminalAttach;
 
 export type EnvironmentStreamCommandRpcTag =
   | typeof WS_METHODS.cloudInstallRelayClient
+  | typeof WS_METHODS.serverUpdateServerWithProgress
   | typeof WS_METHODS.gitRunStackedAction;
 
 export type EnvironmentStreamRpcTag =
@@ -63,7 +81,7 @@ export type EnvironmentStreamRpcTag =
   | EnvironmentStreamCommandRpcTag;
 
 export type EnvironmentUnaryRpcTag = Exclude<EnvironmentRpcTag, EnvironmentStreamRpcTag>;
-const isRpcClientError = Schema.is(RpcClientError.RpcClientError);
+export const isRpcClientError = Schema.is(RpcClientError.RpcClientError);
 
 export type EnvironmentRpcInput<TTag extends EnvironmentRpcTag> = Parameters<RpcMethod<TTag>>[0];
 
@@ -174,8 +192,8 @@ export function subscribeDynamic<TTag extends EnvironmentSubscriptionRpcTag>(
   EnvironmentSupervisor
 > {
   return Stream.unwrap(
-    EnvironmentSupervisor.pipe(
-      Effect.map((supervisor) => {
+    Effect.all([EnvironmentSupervisor, EnvironmentRpcSubscriptionObserver]).pipe(
+      Effect.map(([supervisor, observer]) => {
         const sessionChanges = SubscriptionRef.changes(supervisor.session);
         const sessions =
           options?.resubscribe === undefined
@@ -206,61 +224,79 @@ export function subscribeDynamic<TTag extends EnvironmentSubscriptionRpcTag>(
                   Stream.suspend(() =>
                     Stream.unwrap(
                       makeInput(session).pipe(
-                        Effect.map((input) =>
-                          method(input).pipe(
-                            Stream.catchCause((cause) => {
-                              const hasOnlyExpectedFailures =
-                                cause.reasons.length > 0 &&
-                                cause.reasons.every((reason) => reason._tag === "Fail");
-                              const isTransportFailure =
-                                hasOnlyExpectedFailures &&
-                                cause.reasons.every(
-                                  (reason) =>
-                                    reason._tag === "Fail" && isRpcClientError(reason.error),
-                                );
-                              if (isTransportFailure) {
-                                return Stream.fromEffect(
-                                  Effect.logWarning(
-                                    "Durable RPC subscription lost its transport; waiting for the next session.",
-                                    {
-                                      cause: Cause.pretty(cause),
-                                      method: tag,
-                                      environmentId: supervisor.target.environmentId,
-                                    },
-                                  ),
-                                ).pipe(Stream.drain);
-                              }
-                              if (
-                                hasOnlyExpectedFailures &&
-                                options?.onExpectedFailure !== undefined
-                              ) {
-                                const handled = Stream.fromEffect(
-                                  options.onExpectedFailure(cause),
-                                ).pipe(Stream.drain);
-                                const retryConfigured =
-                                  options.retryExpectedFailureAfter !== undefined;
-                                const retryAllowed =
-                                  retryConfigured &&
-                                  (options.shouldRetryExpectedFailure?.(cause) ?? true) &&
-                                  (options.maxExpectedFailureRetries === undefined ||
-                                    expectedFailureRetries < options.maxExpectedFailureRetries);
-                                if (!retryAllowed) {
-                                  return handled;
-                                }
-                                const retryAfter =
-                                  typeof options.retryExpectedFailureAfter === "function"
-                                    ? options.retryExpectedFailureAfter(expectedFailureRetries + 1)
-                                    : options.retryExpectedFailureAfter;
-                                return handled.pipe(
-                                  Stream.concat(
-                                    Stream.fromEffect(Effect.sleep(retryAfter)).pipe(Stream.drain),
-                                  ),
-                                  Stream.concat(subscribeToSession(expectedFailureRetries + 1)),
-                                );
-                              }
-                              return Stream.failCause(cause);
-                            }),
-                          ),
+                        Effect.flatMap((input) =>
+                          observer
+                            .observe({
+                              environmentId: supervisor.target.environmentId,
+                              method: tag,
+                              input,
+                            })
+                            .pipe(
+                              Effect.map((completeObservation) =>
+                                method(input).pipe(
+                                  Stream.ensuring(completeObservation),
+                                  Stream.catchCause((cause) => {
+                                    const hasOnlyExpectedFailures =
+                                      cause.reasons.length > 0 &&
+                                      cause.reasons.every((reason) => reason._tag === "Fail");
+                                    const isTransportFailure =
+                                      hasOnlyExpectedFailures &&
+                                      cause.reasons.every(
+                                        (reason) =>
+                                          reason._tag === "Fail" && isRpcClientError(reason.error),
+                                      );
+                                    if (isTransportFailure) {
+                                      return Stream.fromEffect(
+                                        Effect.logWarning(
+                                          "Durable RPC subscription lost its transport; waiting for the next session.",
+                                          {
+                                            cause: Cause.pretty(cause),
+                                            method: tag,
+                                            environmentId: supervisor.target.environmentId,
+                                          },
+                                        ),
+                                      ).pipe(Stream.drain);
+                                    }
+                                    if (
+                                      hasOnlyExpectedFailures &&
+                                      options?.onExpectedFailure !== undefined
+                                    ) {
+                                      const handled = Stream.fromEffect(
+                                        options.onExpectedFailure(cause),
+                                      ).pipe(Stream.drain);
+                                      const retryConfigured =
+                                        options.retryExpectedFailureAfter !== undefined;
+                                      const retryAllowed =
+                                        retryConfigured &&
+                                        (options.shouldRetryExpectedFailure?.(cause) ?? true) &&
+                                        (options.maxExpectedFailureRetries === undefined ||
+                                          expectedFailureRetries <
+                                            options.maxExpectedFailureRetries);
+                                      if (!retryAllowed) {
+                                        return handled;
+                                      }
+                                      const retryAfter =
+                                        typeof options.retryExpectedFailureAfter === "function"
+                                          ? options.retryExpectedFailureAfter(
+                                              expectedFailureRetries + 1,
+                                            )
+                                          : options.retryExpectedFailureAfter;
+                                      return handled.pipe(
+                                        Stream.concat(
+                                          Stream.fromEffect(Effect.sleep(retryAfter)).pipe(
+                                            Stream.drain,
+                                          ),
+                                        ),
+                                        Stream.concat(
+                                          subscribeToSession(expectedFailureRetries + 1),
+                                        ),
+                                      );
+                                    }
+                                    return Stream.failCause(cause);
+                                  }),
+                                ),
+                              ),
+                            ),
                         ),
                       ),
                     ),

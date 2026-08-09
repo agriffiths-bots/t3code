@@ -2,8 +2,8 @@ import { describe, expect, it } from "vite-plus/test";
 
 import {
   compareSemverVersions,
-  normalizeBuildVersion,
   normalizeSemverVersion,
+  parseSemver,
   satisfiesSemverRange,
 } from "./semver.ts";
 
@@ -23,18 +23,23 @@ describe("semver helpers", () => {
     expect(normalizeSemverVersion("2.1")).toBe("2.1.0");
   });
 
-  it("accepts stamped build versions and rejects malformed values", () => {
-    expect(normalizeBuildVersion(" 0.0.29-nightly.20260710.30 ")).toBe(
-      "0.0.29-nightly.20260710.30",
-    );
-    expect(normalizeBuildVersion("1.2.3+build.4")).toBe("1.2.3+build.4");
-    expect(normalizeBuildVersion("1.2.3+01")).toBe("1.2.3+01");
-    expect(normalizeBuildVersion("01.2.3")).toBeUndefined();
-    expect(normalizeBuildVersion("1.02.3")).toBeUndefined();
-    expect(normalizeBuildVersion("1.2.03")).toBeUndefined();
-    expect(normalizeBuildVersion("1.2.3-01")).toBeUndefined();
-    expect(normalizeBuildVersion("1.2.3-alpha.01")).toBeUndefined();
-    expect(normalizeBuildVersion("not-semver")).toBeUndefined();
+  it("normalizes and parses shorthand major-only versions", () => {
+    expect(normalizeSemverVersion("20")).toBe("20.0.0");
+    expect(normalizeSemverVersion("v18")).toBe("v18.0.0");
+    expect(normalizeSemverVersion("20-rc.1")).toBe("20.0.0-rc.1");
+    expect(parseSemver("20")).toEqual({ major: 20, minor: 0, patch: 0, prerelease: [] });
+  });
+
+  it("compares shorthand versions numerically instead of lexically", () => {
+    // Regression: "20" vs "9" previously fell back to string comparison, which
+    // ordered "20" before "9" ("2" < "9").
+    expect(compareSemverVersions("20", "9")).toBeGreaterThan(0);
+    expect(compareSemverVersions("18", "18.0.0")).toBe(0);
+  });
+
+  it("still rejects non-numeric shorthand and keeps empty input empty", () => {
+    expect(parseSemver("abc")).toBeNull();
+    expect(normalizeSemverVersion("")).toBe("");
   });
 
   it("compares prerelease versions before stable versions", () => {

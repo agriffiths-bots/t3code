@@ -1,7 +1,7 @@
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import type * as Types from "effect/Types";
-import { McpServer } from "effect/unstable/ai";
+import { McpProtocol, McpServer } from "effect/unstable/ai";
 import { HttpRouter, HttpServerRequest, HttpServerResponse } from "effect/unstable/http";
 
 import packageJson from "../../package.json" with { type: "json" };
@@ -76,7 +76,15 @@ const makeMcpAuthMiddleware = McpSessionRegistry.McpSessionRegistry.pipe(
             ? authorization.slice("Bearer ".length).trim()
             : "";
         const invocation = yield* registry.resolve(token);
-        if (!invocation) return unauthorized;
+        if (!invocation) {
+          // Without this the only symptom of a dead credential is the agent
+          // quietly losing the whole `t3-code` toolkit for the rest of its
+          // session, with nothing on the server to explain why.
+          yield* Effect.logWarning("rejected MCP request with an unusable credential", {
+            reason: token.length === 0 ? "missing_bearer_token" : "unknown_or_expired_token",
+          });
+          return unauthorized;
+        }
         return yield* httpEffect.pipe(
           Effect.provideService(McpInvocationContext.McpInvocationContext, invocation),
           Effect.map(normalizeMcpHttpResponse),
@@ -119,29 +127,8 @@ const McpTransportLive = McpServer.layerHttp({
   name: "T3 Code",
   version: packageJson.version,
   path: MCP_PATH,
+  protocols: [McpProtocol.v2025_06_18],
 }).pipe(Layer.provide(McpAuthMiddlewareLive));
-
-// The Streamable-HTTP transport above registers POST (JSON-RPC) and DELETE
-// (session termination) on MCP_PATH — but no GET route. Without an explicit
-// GET handler the request falls through to the SPA fallback, which serves
-// index.html with 200. MCP clients open GET as the optional server-initiated
-// SSE stream and treat that instant-closing HTML response as a broken stream,
-// so they reconnect in a tight loop and the transport never settles — tools
-// never surface (observed live: thousands of sub-10ms `GET /mcp` 200s per
-// session while the agent reports "still connecting"). We do not offer a
-// server-initiated stream, and the MCP spec requires servers that don't to
-// answer GET with 405 Method Not Allowed; conformant clients then settle into
-// POST-only operation.
-const mcpGetMethodNotAllowed = HttpServerResponse.empty({
-  status: 405,
-  headers: { allow: "POST, DELETE" },
-});
-export const McpGetMethodNotAllowedLive = Layer.effectDiscard(
-  Effect.gen(function* () {
-    const router = yield* HttpRouter.HttpRouter;
-    yield* router.add("GET", MCP_PATH, Effect.succeed(mcpGetMethodNotAllowed));
-  }),
-);
 
 export const ToolkitRegistrationLive = Layer.mergeAll(
   ThreadToolkitRegistrationLive,
@@ -151,10 +138,7 @@ export const ToolkitRegistrationLive = Layer.mergeAll(
   VisibilityToolkitRegistrationLive,
 );
 
-export const layer = Layer.mergeAll(
-  ToolkitRegistrationLive.pipe(Layer.provideMerge(McpTransportLive)),
-  McpGetMethodNotAllowedLive,
-);
+export const layer = ToolkitRegistrationLive.pipe(Layer.provideMerge(McpTransportLive));
 
 export const __testing = {
   McpAuthMiddlewareLive,

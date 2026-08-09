@@ -1,6 +1,25 @@
 import type { DesktopUpdateActionResult, DesktopUpdateState } from "@t3tools/contracts";
+import { isWindowsPlatform } from "../lib/utils";
 
 export type DesktopUpdateButtonAction = "download" | "install" | "none";
+
+const DESKTOP_RELEASE_TAG_URL = "https://github.com/pingdotgg/t3code/releases/tag";
+
+/**
+ * The main process fills `downloadedVersion` from the updater's `update-downloaded`
+ * event, which is dispatched on its own fiber. A download RPC can therefore resolve
+ * before that write lands, so fall back to the version the download was started for.
+ */
+export function getDesktopUpdateDownloadedVersion(state: DesktopUpdateState): string | null {
+  return state.downloadedVersion ?? state.availableVersion;
+}
+
+/** Release notes for an exact downloaded build; nightly suffixes are part of the tag. */
+export function getDesktopUpdateReleaseUrl(version: string | null): string | null {
+  const normalizedVersion = version?.trim();
+  if (!normalizedVersion) return null;
+  return `${DESKTOP_RELEASE_TAG_URL}/v${encodeURIComponent(normalizedVersion)}`;
+}
 
 export function resolveDesktopUpdateButtonAction(
   state: DesktopUpdateState,
@@ -26,9 +45,6 @@ export function shouldShowDesktopUpdateButton(state: DesktopUpdateState | null):
   if (state.status === "downloading") {
     return true;
   }
-  if (state.status === "installing") {
-    return true;
-  }
   return resolveDesktopUpdateButtonAction(state) !== "none";
 }
 
@@ -37,7 +53,7 @@ export function shouldShowArm64IntelBuildWarning(state: DesktopUpdateState | nul
 }
 
 export function isDesktopUpdateButtonDisabled(state: DesktopUpdateState | null): boolean {
-  return state?.status === "downloading" || state?.status === "installing";
+  return state?.status === "downloading";
 }
 
 export function getArm64IntelBuildWarningDescription(state: DesktopUpdateState): string {
@@ -67,9 +83,6 @@ export function getDesktopUpdateButtonTooltip(state: DesktopUpdateState): string
   if (state.status === "downloaded") {
     return `Update ${state.downloadedVersion ?? state.availableVersion ?? "ready"} downloaded. Click to restart and install.`;
   }
-  if (state.status === "installing") {
-    return "Installing update. T3 Code will restart shortly.";
-  }
   if (state.status === "error") {
     if (state.errorContext === "download" && state.availableVersion) {
       return `Download failed for ${state.availableVersion}. Click to retry.`;
@@ -84,16 +97,17 @@ export function getDesktopUpdateButtonTooltip(state: DesktopUpdateState): string
 
 export function getDesktopUpdateInstallConfirmationMessage(
   state: Pick<DesktopUpdateState, "availableVersion" | "downloadedVersion">,
+  platform = "",
 ): string {
   const version = state.downloadedVersion ?? state.availableVersion;
-  return `Install update${version ? ` ${version}` : ""} and restart T3 Code?\n\nAny running tasks will be interrupted. Make sure you're ready before continuing.`;
+  const windowsInstallWarning = isWindowsPlatform(platform)
+    ? "\n\nOn Windows, T3 Code may remain closed for several minutes while the update installs, and no installer window may appear. T3 Code will reopen automatically when installation finishes."
+    : "";
+  return `Install update${version ? ` ${version}` : ""} and restart T3 Code?\n\nAny running tasks will be interrupted. Make sure you're ready before continuing.${windowsInstallWarning}`;
 }
 
 export function getDesktopUpdateActionError(result: DesktopUpdateActionResult): string | null {
   if (!result.accepted || result.completed) return null;
-  if (result.state.errorContext !== "download" && result.state.errorContext !== "install") {
-    return null;
-  }
   if (typeof result.state.message !== "string") return null;
   const message = result.state.message.trim();
   return message.length > 0 ? message : null;
@@ -114,7 +128,6 @@ export function canCheckForUpdate(state: DesktopUpdateState | null): boolean {
     state.status !== "checking" &&
     state.status !== "downloading" &&
     state.status !== "downloaded" &&
-    state.status !== "installing" &&
     state.status !== "disabled"
   );
 }

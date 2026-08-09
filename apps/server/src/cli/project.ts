@@ -378,7 +378,9 @@ const setLiveProjectAudienceToFactory = (
 
 const getOfflineSnapshot = Effect.fn("getOfflineSnapshot")(function* () {
   const projectionSnapshotQuery = yield* ProjectionSnapshotQuery.ProjectionSnapshotQuery;
-  return yield* projectionSnapshotQuery.getSnapshot();
+  // Project commands only read the project list, so use the lightweight
+  // command read model instead of hydrating every thread body in the database.
+  return yield* projectionSnapshotQuery.getCommandReadModel();
 });
 
 const tryResolveLiveProjectExecutionMode = Effect.fn("tryResolveLiveProjectExecutionMode")(

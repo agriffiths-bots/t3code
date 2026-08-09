@@ -7,6 +7,7 @@ import {
   getDesktopUpdateActionError,
   getDesktopUpdateButtonTooltip,
   getDesktopUpdateInstallConfirmationMessage,
+  getDesktopUpdateReleaseUrl,
   isDesktopUpdateButtonDisabled,
   resolveDesktopUpdateButtonAction,
   shouldShowArm64IntelBuildWarning,
@@ -105,20 +106,6 @@ describe("desktop update button state", () => {
     expect(isDesktopUpdateButtonDisabled(state)).toBe(true);
     expect(getDesktopUpdateButtonTooltip(state)).toContain("42%");
   });
-
-  it("keeps the update control visible but disabled while installing", () => {
-    const state: DesktopUpdateState = {
-      ...baseState,
-      status: "installing",
-      availableVersion: "1.1.0",
-      downloadedVersion: "1.1.0",
-      message: null,
-    };
-
-    expect(shouldShowDesktopUpdateButton(state)).toBe(true);
-    expect(isDesktopUpdateButtonDisabled(state)).toBe(true);
-    expect(getDesktopUpdateButtonTooltip(state)).toContain("Installing update");
-  });
 });
 
 describe("getDesktopUpdateActionError", () => {
@@ -169,30 +156,32 @@ describe("getDesktopUpdateActionError", () => {
     };
     expect(getDesktopUpdateActionError(result)).toBeNull();
   });
-
-  it("ignores non-error progress states for accepted handoffs", () => {
-    const result: DesktopUpdateActionResult = {
-      accepted: true,
-      completed: false,
-      state: {
-        ...baseState,
-        status: "installing",
-        downloadedVersion: "1.1.0",
-        message: "Installing update. T3 Code will restart when installation is ready.",
-        errorContext: null,
-      },
-    };
-    expect(getDesktopUpdateActionError(result)).toBeNull();
-  });
 });
 
 describe("desktop update UI helpers", () => {
+  it("builds the stable release URL for a downloaded version", () => {
+    expect(getDesktopUpdateReleaseUrl("0.0.30")).toBe(
+      "https://github.com/pingdotgg/t3code/releases/tag/v0.0.30",
+    );
+  });
+
+  it("builds the nightly release URL without dropping its version suffix", () => {
+    expect(getDesktopUpdateReleaseUrl("0.0.30-nightly.20260728.931")).toBe(
+      "https://github.com/pingdotgg/t3code/releases/tag/v0.0.30-nightly.20260728.931",
+    );
+  });
+
+  it("omits the release URL when the updater does not report a version", () => {
+    expect(getDesktopUpdateReleaseUrl(null)).toBeNull();
+    expect(getDesktopUpdateReleaseUrl("  ")).toBeNull();
+  });
+
   it("toasts only for actionable updater errors", () => {
     expect(
       shouldToastDesktopUpdateActionResult({
         accepted: true,
         completed: false,
-        state: { ...baseState, message: "checksum mismatch", errorContext: "download" },
+        state: { ...baseState, message: "checksum mismatch" },
       }),
     ).toBe(true);
     expect(
@@ -254,6 +243,32 @@ describe("desktop update UI helpers", () => {
       }),
     ).toContain("Install update and restart T3 Code?");
   });
+
+  it("warns Windows users that a silent installation can take several minutes", () => {
+    const message = getDesktopUpdateInstallConfirmationMessage(
+      {
+        availableVersion: "1.1.0",
+        downloadedVersion: "1.1.0",
+      },
+      "Win32",
+    );
+
+    expect(message).toContain("may remain closed for several minutes");
+    expect(message).toContain("no installer window may appear");
+    expect(message).toContain("will reopen automatically");
+  });
+
+  it("keeps the additional silent installation warning Windows-specific", () => {
+    const message = getDesktopUpdateInstallConfirmationMessage(
+      {
+        availableVersion: "1.1.0",
+        downloadedVersion: "1.1.0",
+      },
+      "MacIntel",
+    );
+
+    expect(message).not.toContain("may remain closed for several minutes");
+  });
 });
 
 describe("canCheckForUpdate", () => {
@@ -280,17 +295,6 @@ describe("canCheckForUpdate", () => {
       canCheckForUpdate({
         ...baseState,
         status: "downloaded",
-        availableVersion: "1.1.0",
-        downloadedVersion: "1.1.0",
-      }),
-    ).toBe(false);
-  });
-
-  it("returns false while installing", () => {
-    expect(
-      canCheckForUpdate({
-        ...baseState,
-        status: "installing",
         availableVersion: "1.1.0",
         downloadedVersion: "1.1.0",
       }),

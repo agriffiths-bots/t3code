@@ -22,17 +22,15 @@ const STALE = "2026-04-06T23:59:59.999Z";
 function makeShell(input: {
   readonly settledOverride?: "settled" | "active" | null;
   readonly activityAt: string | null;
-  readonly sessionStatus?: "starting" | "running" | "waiting" | "error";
-  readonly activeTurnId?: ReturnType<typeof TurnId.make> | null;
-  readonly latestTurnState?: "completed" | "running" | "error";
+  readonly sessionStatus?: "starting" | "running";
   readonly pending?: "approval" | "user-input";
-  readonly hasActionableProposedPlan?: boolean;
 }): OrchestrationThreadShell {
   const threadId = ThreadId.make("thread-1");
   return {
     id: threadId,
     projectId: ProjectId.make("project-1"),
     dataAudience: "private",
+    parentThreadId: null,
     title: "Thread",
     modelSelection: { instanceId: ProviderInstanceId.make("codex"), model: "gpt-5.4" },
     runtimeMode: "full-access",
@@ -44,9 +42,9 @@ function makeShell(input: {
         ? null
         : {
             turnId: TurnId.make("turn-1"),
-            state: input.latestTurnState ?? "completed",
+            state: "completed",
             requestedAt: input.activityAt,
-            startedAt: input.latestTurnState === "running" ? input.activityAt : null,
+            startedAt: null,
             completedAt: null,
             assistantMessageId: null,
           },
@@ -63,15 +61,14 @@ function makeShell(input: {
             status: input.sessionStatus,
             providerName: "Codex",
             runtimeMode: "full-access",
-            activeTurnId: input.activeTurnId ?? null,
-            lastError: input.sessionStatus === "error" ? "boom" : null,
+            activeTurnId: null,
+            lastError: null,
             updatedAt: NOW,
           },
     latestUserMessageAt: null,
     hasPendingApprovals: input.pending === "approval",
     hasPendingUserInput: input.pending === "user-input",
-    hasActionableProposedPlan: input.hasActionableProposedPlan ?? false,
-    parentThreadId: null,
+    hasActionableProposedPlan: false,
   };
 }
 
@@ -120,13 +117,15 @@ describe("effectiveSettled", () => {
             // Settled iff nothing blocks (pending work / live session) AND
             // the override says settled, or (with no override) a merged PR
             // or staleness auto-settles. The "active" pin suppresses both
-            // auto signals.
+            // auto signals, and an open PR suppresses the inactivity path:
+            // a thread with a PR out for review is never done, however quiet.
             expected:
               pending === undefined &&
               !running &&
               (settledOverride === "settled" ||
                 (settledOverride === null &&
-                  (changeRequestState === "merged" || inactivity === "stale"))),
+                  (changeRequestState === "merged" ||
+                    (changeRequestState !== "open" && inactivity === "stale")))),
           })),
         ),
       ),
@@ -168,6 +167,53 @@ describe("effectiveSettled", () => {
     ).toBe(true);
   });
 
+  it("settles immediately when a change request merges or closes", () => {
+    const recentlyActive = makeShell({ activityAt: "2026-04-09T23:59:59.999Z" });
+    for (const changeRequestState of ["merged", "closed"] as const) {
+      expect(
+        effectiveSettled(recentlyActive, {
+          now: NOW,
+          autoSettleAfterDays: null,
+          changeRequestState,
+        }),
+      ).toBe(true);
+    }
+  });
+
+  it("never auto-settles a stale thread with an open change request", () => {
+    const stale = makeShell({ activityAt: STALE });
+    expect(
+      effectiveSettled(stale, {
+        now: NOW,
+        autoSettleAfterDays: 3,
+        changeRequestState: "open",
+      }),
+    ).toBe(false);
+    // An explicit user settle still wins: open PR only blocks the auto path.
+    const settled = makeShell({ settledOverride: "settled", activityAt: STALE });
+    expect(
+      effectiveSettled(settled, {
+        now: NOW,
+        autoSettleAfterDays: 3,
+        changeRequestState: "open",
+      }),
+    ).toBe(true);
+  });
+
+  it("keeps an explicitly un-settled merged-PR thread active", () => {
+    const shell = makeShell({
+      settledOverride: "active",
+      activityAt: "2026-04-09T23:59:59.999Z",
+    });
+    expect(
+      effectiveSettled(shell, {
+        now: NOW,
+        autoSettleAfterDays: null,
+        changeRequestState: "merged",
+      }),
+    ).toBe(false);
+  });
+
   it("never settles a starting session, even with a settled override", () => {
     const shell = makeShell({
       settledOverride: "settled",
@@ -183,82 +229,49 @@ describe("effectiveSettled", () => {
     ).toBe(false);
   });
 
-  it("keeps failed threads visible even with a settled override", () => {
-    const failedSession = makeShell({
-      settledOverride: "settled",
-      activityAt: FRESH,
-      sessionStatus: "error",
+  it("keeps a new turn active from queued through starting and running", () => {
+    const requestedAt = "2026-04-09T12:00:00.000Z";
+    const transitionNow = "2026-04-09T12:00:30.000Z";
+    const base = makeShell({
+      settledOverride: null,
+      activityAt: STALE,
     });
-    const failedTurn = makeShell({
-      settledOverride: "settled",
-      activityAt: FRESH,
-      latestTurnState: "error",
-    });
+    const queued: OrchestrationThreadShell = {
+      ...base,
+      latestUserMessageAt: requestedAt,
+      latestTurn: null,
+      session: null,
+    };
+    const starting: OrchestrationThreadShell = {
+      ...queued,
+      session: {
+        threadId: queued.id,
+        status: "starting",
+        providerName: "Codex",
+        runtimeMode: "full-access",
+        activeTurnId: null,
+        lastError: null,
+        updatedAt: requestedAt,
+      },
+    };
+    const running: OrchestrationThreadShell = {
+      ...starting,
+      session: {
+        ...starting.session!,
+        status: "running",
+        activeTurnId: TurnId.make("turn-new"),
+      },
+    };
 
-    expect(effectiveSettled(failedSession, { now: NOW, autoSettleAfterDays: 3 })).toBe(false);
-    expect(effectiveSettled(failedTurn, { now: NOW, autoSettleAfterDays: 3 })).toBe(false);
-  });
-
-  it("keeps failed threads visible on closed or merged change requests", () => {
-    const failedSession = makeShell({ activityAt: FRESH, sessionStatus: "error" });
-    const failedTurn = makeShell({ activityAt: FRESH, latestTurnState: "error" });
-
-    expect(
-      effectiveSettled(failedSession, {
-        now: NOW,
-        autoSettleAfterDays: null,
-        changeRequestState: "closed",
-      }),
-    ).toBe(false);
-    expect(
-      effectiveSettled(failedTurn, {
-        now: NOW,
-        autoSettleAfterDays: null,
-        changeRequestState: "merged",
-      }),
-    ).toBe(false);
-  });
-
-  it("keeps plan-ready threads visible on closed or merged change requests", () => {
-    const shell = makeShell({ activityAt: FRESH, hasActionableProposedPlan: true });
-
-    expect(
-      effectiveSettled(shell, {
-        now: NOW,
-        autoSettleAfterDays: null,
-        changeRequestState: "closed",
-      }),
-    ).toBe(false);
-    expect(
-      effectiveSettled(shell, {
-        now: NOW,
-        autoSettleAfterDays: null,
-        changeRequestState: "merged",
-      }),
-    ).toBe(false);
-  });
-
-  it("keeps plan-ready threads visible after the inactivity window", () => {
-    const shell = makeShell({ activityAt: STALE, hasActionableProposedPlan: true });
-
-    expect(effectiveSettled(shell, { now: NOW, autoSettleAfterDays: 3 })).toBe(false);
-  });
-
-  it("lets a late actionable proposed plan win over an explicit settled override", () => {
-    const shell = makeShell({
-      settledOverride: "settled",
-      activityAt: FRESH,
-      hasActionableProposedPlan: true,
-    });
-
-    expect(canSettle(shell, { now: NOW })).toBe(false);
-    expect(effectiveSettled(shell, { now: NOW, autoSettleAfterDays: 3 })).toBe(false);
-  });
-
-  it("still settles a plain thread with no failed or plan-ready state", () => {
-    const shell = makeShell({ activityAt: STALE });
-
-    expect(effectiveSettled(shell, { now: NOW, autoSettleAfterDays: 3 })).toBe(true);
+    for (const shell of [queued, starting, running]) {
+      expect(
+        effectiveSettled(shell, {
+          now: transitionNow,
+          autoSettleAfterDays: 3,
+          changeRequestState: "merged",
+        }),
+      ).toBe(false);
+    }
   });
 
   it("uses a strict inactivity boundary and honors a null threshold", () => {
@@ -352,53 +365,12 @@ describe("canSettle", () => {
     expect(
       canSettle(makeShell({ activityAt: FRESH, sessionStatus: "running" }), { now: NOW }),
     ).toBe(false);
-    expect(
-      canSettle(makeShell({ activityAt: FRESH, latestTurnState: "running" }), { now: NOW }),
-    ).toBe(false);
-    expect(canSettle(makeShell({ activityAt: FRESH, sessionStatus: "error" }), { now: NOW })).toBe(
-      false,
-    );
-    expect(
-      canSettle(makeShell({ activityAt: FRESH, latestTurnState: "error" }), { now: NOW }),
-    ).toBe(false);
-    expect(
-      canSettle(makeShell({ activityAt: FRESH, hasActionableProposedPlan: true }), { now: NOW }),
-    ).toBe(false);
-    expect(
-      canSettle(
-        makeShell({
-          activityAt: FRESH,
-          sessionStatus: "waiting",
-          activeTurnId: TurnId.make("turn-waiting"),
-        }),
-        { now: NOW },
-      ),
-    ).toBe(false);
-    expect(
-      canSettle(makeShell({ activityAt: FRESH, sessionStatus: "waiting" }), { now: NOW }),
-    ).toBe(true);
     expect(canSettle(makeShell({ activityAt: FRESH, pending: "approval" }), { now: NOW })).toBe(
       false,
     );
     expect(canSettle(makeShell({ activityAt: FRESH, pending: "user-input" }), { now: NOW })).toBe(
       false,
     );
-  });
-
-  it("blocks settling an actionable proposed plan before PR auto-settlement", () => {
-    const planReady = {
-      ...makeShell({ activityAt: FRESH, hasActionableProposedPlan: true }),
-      interactionMode: "plan" as const,
-    };
-
-    expect(canSettle(planReady, { now: NOW })).toBe(false);
-    expect(
-      effectiveSettled(planReady, {
-        now: NOW,
-        autoSettleAfterDays: 3,
-        changeRequestState: "merged",
-      }),
-    ).toBe(false);
   });
 
   it("blocks settling a queued turn start, only within the grace window", () => {
@@ -465,13 +437,5 @@ describe("canSettle", () => {
     });
     expect(canSettle(blocked, { now: NOW })).toBe(false);
     expect(effectiveSettled(blocked, { now: NOW, autoSettleAfterDays: 3 })).toBe(false);
-
-    const runningTurn = makeShell({
-      settledOverride: "settled",
-      activityAt: FRESH,
-      latestTurnState: "running",
-    });
-    expect(canSettle(runningTurn, { now: NOW })).toBe(false);
-    expect(effectiveSettled(runningTurn, { now: NOW, autoSettleAfterDays: 3 })).toBe(false);
   });
 });

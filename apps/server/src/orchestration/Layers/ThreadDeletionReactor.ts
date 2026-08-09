@@ -36,6 +36,7 @@ import {
   type ThreadDeletionReactorShape,
 } from "../Services/ThreadDeletionReactor.ts";
 import { WorktreeLifecycleCoordinator } from "../Services/WorktreeLifecycleCoordinator.ts";
+import { forkParked } from "../../serverActivation.ts";
 
 import { threadAudienceSystemDispatchAuthority } from "../commandAudienceGuard.ts";
 import type { OrchestrationCommandDispatchAuthority } from "../commandAudienceGuard.ts";
@@ -776,7 +777,7 @@ const make = Effect.gen(function* () {
   const start: ThreadDeletionReactorShape["start"] = Effect.fn("start")(function* () {
     yield* Effect.forkScoped(retryUnknownArchiveSnapshots);
     yield* Effect.forkScoped(retryFailedTeardowns);
-    yield* Effect.forkScoped(
+    yield* forkParked(
       Stream.runForEach(orchestrationEngine.streamDomainEvents, (event) => {
         if (
           event.type !== "thread.deleted" &&

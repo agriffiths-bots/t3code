@@ -40,6 +40,8 @@ import * as SchemaIssue from "effect/SchemaIssue";
 import * as Stream from "effect/Stream";
 import * as SynchronizedRef from "effect/SynchronizedRef";
 
+import { resolveAttachmentPath } from "../../attachmentStore.ts";
+import * as ServerConfig from "../../config.ts";
 import {
   increment,
   providerMetricAttributes,
@@ -599,6 +601,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
 ) {
   const providerServiceScope = yield* Effect.scope;
   const analytics = yield* Effect.service(AnalyticsService.AnalyticsService);
+  const serverConfig = yield* ServerConfig.ServerConfig;
   const eventLoggers = yield* ProviderEventLoggers.ProviderEventLoggers;
   // Options-provided logger wins (test overrides); otherwise we take whatever
   // the `ProviderEventLoggers` tag exposes — `undefined` means "no canonical
@@ -2817,6 +2820,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
         adapter,
         instanceId,
         threadId: input.threadId,
+        runtimeMode: binding.runtimeMode,
         isActive: true,
       } as const;
     }
@@ -2826,6 +2830,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
         adapter,
         instanceId,
         threadId: input.threadId,
+        runtimeMode: binding.runtimeMode,
         isActive: false,
       } as const;
     }
@@ -2845,6 +2850,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
       adapter: recovered.adapter,
       instanceId,
       threadId: input.threadId,
+      runtimeMode: recovered.session.runtimeMode,
       isActive: true,
     } as const;
   });
@@ -3125,6 +3131,19 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
               input.modelSelection.model.trim().length > 0,
           });
 
+          // Changing runtime mode restarts the session, so the transition is only
+          // observable here, by diffing against the mode the previous session for
+          // this thread was bound to. Recording it separately is what makes the
+          // "started supervised, switched to full access" funnel answerable.
+          const previousRuntimeMode = persistedBinding?.runtimeMode;
+          if (previousRuntimeMode !== undefined && previousRuntimeMode !== input.runtimeMode) {
+            yield* analytics.record("provider.runtime_mode.changed", {
+              provider: sessionWithInstance.provider,
+              from: previousRuntimeMode,
+              to: input.runtimeMode,
+            });
+          }
+
           return sessionWithInstance;
         }).pipe(
           withMetrics({
@@ -3146,16 +3165,44 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
       payload: rawInput,
     });
 
-    const input = {
-      ...parsed,
-      attachments: parsed.attachments ?? [],
-    };
-    if (!input.input && input.attachments.length === 0) {
+    const attachments = parsed.attachments ?? [];
+    if (!parsed.input && attachments.length === 0) {
       return yield* toValidationError(
         "ProviderService.sendTurn",
         "Either input text or at least one attachment is required",
       );
     }
+
+    // Adapters inline attachment pixels into the model prompt, but the model's
+    // tools cannot dereference pixels. Appending the on-disk path is what lets
+    // a turn like "include this screenshot in the PR" copy the actual file.
+    // This runs after schema decode, so the appended lines are exempt from the
+    // PROVIDER_SEND_TURN_MAX_INPUT_CHARS check; attachment count is capped, so
+    // the overhead is bounded. Unresolvable ids are skipped here and surface
+    // as adapter errors when the file is read for inlining.
+    const attachmentPathLines = attachments.flatMap((attachment) => {
+      const attachmentPath = resolveAttachmentPath({
+        attachmentsDir: serverConfig.attachmentsDir,
+        attachment,
+      });
+      return attachmentPath === null
+        ? []
+        : [`[Attached ${attachment.type} "${attachment.name}" is saved at: ${attachmentPath}]`];
+    });
+    const inputTextWithAttachmentPaths =
+      attachmentPathLines.length === 0
+        ? parsed.input
+        : [parsed.input, attachmentPathLines.join("\n")]
+            .filter((part): part is string => typeof part === "string" && part.length > 0)
+            .join("\n\n");
+
+    const input = {
+      ...parsed,
+      ...(inputTextWithAttachmentPaths !== undefined
+        ? { input: inputTextWithAttachmentPaths }
+        : {}),
+      attachments,
+    };
     yield* Effect.annotateCurrentSpan({
       "provider.operation": "send-turn",
       "provider.thread_id": input.threadId,
@@ -3176,6 +3223,12 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
         "provider.kind": routed.adapter.provider,
         ...(input.modelSelection?.model ? { "provider.model": input.modelSelection.model } : {}),
       });
+      // A turn is the clearest sign a session is still alive. The MCP
+      // credential is minted once at session start and cannot be rotated into
+      // an already-spawned agent process, so we keep the existing token valid
+      // rather than issuing a new one: sessions that go a long time between
+      // browser tool calls used to lose the toolkit outright.
+      yield* McpSessionRegistry.touchActiveMcpThread(input.threadId);
       const sendTurnOwnership = yield* registerSendTurnOperation({
         source: {
           provider: routed.adapter.provider,
@@ -3327,6 +3380,10 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
         provider: routed.adapter.provider,
         model: input.modelSelection?.model,
         interactionMode: input.interactionMode,
+        // Session-start events alone skew runtime mode toward users who toggle
+        // often, since every toggle restarts the session. Recording it per turn
+        // gives a usage-weighted view and lets it cross with interactionMode.
+        runtimeMode: routed.runtimeMode,
         attachmentCount: input.attachments.length,
         hasInput: typeof input.input === "string" && input.input.trim().length > 0,
       });

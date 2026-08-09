@@ -49,7 +49,11 @@ import {
   ProviderCommandReactor,
   type ProviderCommandReactorShape,
 } from "../Services/ProviderCommandReactor.ts";
-import { ServerSettingsService } from "../../serverSettings.ts";
+import { forkParked, ServerActivation } from "../../serverActivation.ts";
+import {
+  resolveSourceControlWriterModelSelection,
+  ServerSettingsService,
+} from "../../serverSettings.ts";
 import { VcsStatusBroadcaster } from "../../vcs/VcsStatusBroadcaster.ts";
 import { GitWorkflowService } from "../../git/GitWorkflowService.ts";
 import { WorktreeLifecycleCoordinator } from "../Services/WorktreeLifecycleCoordinator.ts";
@@ -63,6 +67,7 @@ type ProviderIntentEvent = Extract<
   OrchestrationEvent,
   {
     type:
+      | "thread.meta-updated"
       | "thread.runtime-mode-set"
       | "thread.turn-start-requested"
       | "thread.turn-interrupt-requested"
@@ -120,6 +125,126 @@ function worktreeIdentityPath(input: {
   readonly worktreeRemovalPath?: string | null | undefined;
 }): string | null {
   return normalizeWorktreeIdentityPath(input.worktreeRemovalPath ?? input.worktreePath);
+}
+
+const MAX_REGENERATION_ATTACHMENTS = 4;
+const MAX_THREAD_TITLE_CONTEXT_CHARS = 8_000;
+const MAX_FIRST_USER_TITLE_CONTEXT_CHARS = 2_000;
+const THREAD_TITLE_CONTEXT_TRUNCATION_MARKER = "[Earlier content truncated]\n\n";
+const FIRST_USER_CONTEXT_TRUNCATION_MARKER = "\n[First user message truncated]";
+
+type ThreadTitleMessage = {
+  readonly role: "user" | "assistant" | "system";
+  readonly text: string;
+  readonly attachments?: ReadonlyArray<ChatAttachment> | undefined;
+};
+
+function formatThreadTitleSection(message: ThreadTitleMessage): string | undefined {
+  if (message.role === "system") {
+    return undefined;
+  }
+  const text = message.text.trim();
+  const attachmentSummary = (message.attachments ?? [])
+    .map((attachment) => attachment.name)
+    .join(", ");
+  const contents = [
+    ...(text.length > 0 ? [text] : []),
+    ...(attachmentSummary.length > 0 ? [`[Attachments: ${attachmentSummary}]`] : []),
+  ].join("\n");
+  return contents.length > 0 ? `${message.role.toUpperCase()}:\n${contents}` : undefined;
+}
+
+function limitFirstUserSection(section: string): string {
+  if (section.length <= MAX_FIRST_USER_TITLE_CONTEXT_CHARS) {
+    return section;
+  }
+  return `${section.slice(
+    0,
+    MAX_FIRST_USER_TITLE_CONTEXT_CHARS - FIRST_USER_CONTEXT_TRUNCATION_MARKER.length,
+  )}${FIRST_USER_CONTEXT_TRUNCATION_MARKER}`;
+}
+
+function collectRecentThreadTitleContext(
+  messages: ReadonlyArray<ThreadTitleMessage>,
+  maxChars: number,
+): {
+  readonly context: string;
+  readonly attachments: ReadonlyArray<ChatAttachment>;
+  readonly truncated: boolean;
+} {
+  let context = "";
+  let truncated = false;
+  const retainedAttachments: Array<ChatAttachment> = [];
+
+  for (const message of messages.toReversed()) {
+    const section = formatThreadTitleSection(message);
+    if (section === undefined) {
+      continue;
+    }
+
+    const separator = context.length > 0 ? "\n\n" : "";
+    const available = maxChars - context.length - separator.length;
+    if (section.length > available) {
+      if (available > 0) {
+        context = `${section.slice(-available)}${separator}${context}`;
+        retainedAttachments.unshift(...(message.attachments ?? []));
+      }
+      truncated = true;
+      break;
+    }
+    context = `${section}${separator}${context}`;
+    retainedAttachments.unshift(...(message.attachments ?? []));
+  }
+
+  return { context, attachments: retainedAttachments, truncated };
+}
+
+function formatThreadTitleContext(messages: ReadonlyArray<ThreadTitleMessage>): {
+  readonly message: string;
+  readonly attachments: ReadonlyArray<ChatAttachment>;
+} {
+  const recent = collectRecentThreadTitleContext(messages, MAX_THREAD_TITLE_CONTEXT_CHARS);
+  if (!recent.truncated) {
+    return {
+      message: recent.context,
+      attachments: recent.attachments.slice(-MAX_REGENERATION_ATTACHMENTS),
+    };
+  }
+
+  const firstUserMessage = messages.find(
+    (message) => message.role === "user" && formatThreadTitleSection(message),
+  );
+  const firstUserSection = firstUserMessage
+    ? formatThreadTitleSection(firstUserMessage)
+    : undefined;
+  if (!firstUserMessage || !firstUserSection) {
+    return {
+      message: `${THREAD_TITLE_CONTEXT_TRUNCATION_MARKER}${recent.context}`,
+      attachments: recent.attachments.slice(-MAX_REGENERATION_ATTACHMENTS),
+    };
+  }
+
+  const pinnedSection = limitFirstUserSection(firstUserSection);
+  const recentContextBudget =
+    MAX_THREAD_TITLE_CONTEXT_CHARS -
+    pinnedSection.length -
+    "\n\n".length -
+    THREAD_TITLE_CONTEXT_TRUNCATION_MARKER.length;
+  const retainedRecent = collectRecentThreadTitleContext(messages, recentContextBudget);
+  const pinnedAttachment = firstUserMessage.attachments?.[0];
+  const recentAttachments = retainedRecent.attachments.filter(
+    (attachment) => attachment.id !== pinnedAttachment?.id,
+  );
+
+  return {
+    message: `${pinnedSection}\n\n${THREAD_TITLE_CONTEXT_TRUNCATION_MARKER}${retainedRecent.context}`,
+    attachments: [
+      ...(pinnedAttachment ? [pinnedAttachment] : []),
+      ...recentAttachments.slice(
+        -(MAX_REGENERATION_ATTACHMENTS - (pinnedAttachment === undefined ? 0 : 1)),
+      ),
+    ],
+  };
 }
 
 export function providerErrorLabel(value: string | undefined): string {
@@ -440,18 +565,27 @@ const makeReactor = (options?: ProviderCommandReactorLiveOptions) =>
         });
         return;
       }
-      const isUnstartedSyntheticSession = isUnstartedSyntheticErrorSession(thread);
+      const hasLiveProviderSession =
+        session.status === "starting" &&
+        (yield* providerService.listSessions()).some(
+          (providerSession) => providerSession.threadId === input.threadId,
+        );
+      const shouldRecordStartupError =
+        isUnstartedSyntheticErrorSession(thread) ||
+        (session.status === "starting" &&
+          !hasLiveProviderSession &&
+          !thread?.latestTurn?.startedAt);
       yield* setThreadSession({
         threadId: input.threadId,
         session: {
           ...session,
           status:
-            session.status === "stopped" && !isUnstartedSyntheticSession
+            session.status === "stopped" && !shouldRecordStartupError
               ? "stopped"
-              : isUnstartedSyntheticSession
+              : shouldRecordStartupError
                 ? "error"
                 : "ready",
-          ...(isUnstartedSyntheticSession
+          ...(shouldRecordStartupError
             ? {
                 providerName: failureProviderName,
                 ...(input.modelSelection !== undefined
@@ -462,7 +596,7 @@ const makeReactor = (options?: ProviderCommandReactorLiveOptions) =>
             : {}),
           activeTurnId: null,
           lastError:
-            session.status === "stopped" && !isUnstartedSyntheticSession
+            session.status === "stopped" && !shouldRecordStartupError
               ? session.lastError
               : input.detail,
           updatedAt: input.createdAt,
@@ -783,6 +917,7 @@ const makeReactor = (options?: ProviderCommandReactorLiveOptions) =>
         readonly modelSelection?: ModelSelection;
         readonly runtimeMode?: RuntimeMode;
         readonly providerSessionDetached?: boolean;
+        readonly pendingTurnStart?: boolean;
       },
     ) {
       const thread = yield* resolveThread(threadId);
@@ -861,6 +996,22 @@ const makeReactor = (options?: ProviderCommandReactorLiveOptions) =>
         });
       }
       const preferredProvider: ProviderDriverKind = desiredDriverKind;
+      if (options?.pendingTurnStart === true && thread.session?.status !== "running") {
+        yield* setThreadSession({
+          threadId,
+          session: {
+            threadId,
+            status: "starting",
+            providerName: activeSession?.provider ?? preferredProvider,
+            providerInstanceId: activeSession?.providerInstanceId ?? desiredInstanceId,
+            runtimeMode: desiredRuntimeMode,
+            activeTurnId: null,
+            lastError: null,
+            updatedAt: createdAt,
+          },
+          createdAt,
+        });
+      }
       if (hasEstablishedProviderBinding) {
         yield* rejectStartedThreadModelChangeIfRequired({
           threadId,
@@ -936,7 +1087,10 @@ const makeReactor = (options?: ProviderCommandReactorLiveOptions) =>
             threadId,
             session: {
               threadId,
-              status: mapProviderSessionStatusToOrchestrationStatus(session.status),
+              status:
+                options?.pendingTurnStart === true && session.status === "ready"
+                  ? "starting"
+                  : mapProviderSessionStatusToOrchestrationStatus(session.status),
               providerName: session.provider,
               providerInstanceId: session.providerInstanceId,
               runtimeMode: desiredRuntimeMode,
@@ -1056,6 +1210,7 @@ const makeReactor = (options?: ProviderCommandReactorLiveOptions) =>
         ...(input.providerSessionDetached !== undefined
           ? { providerSessionDetached: input.providerSessionDetached }
           : {}),
+        pendingTurnStart: true,
       });
       if (input.modelSelection !== undefined) {
         threadModelSelections.set(input.threadId, input.modelSelection);
@@ -1141,8 +1296,14 @@ const makeReactor = (options?: ProviderCommandReactorLiveOptions) =>
           return;
         }
 
-        const { textGenerationModelSelection: modelSelection } =
-          yield* serverSettingsService.getSettings;
+        const settings = yield* serverSettingsService.getSettings;
+        const modelSelection =
+          settings.sourceControlWriterModelSelection === null
+            ? settings.textGenerationModelSelection
+            : resolveSourceControlWriterModelSelection(
+                settings,
+                yield* providerRegistry.getProviders,
+              );
         const generated = yield* textGeneration.generateBranchName({
           cwd,
           message: input.messageText,
@@ -1273,6 +1434,180 @@ const makeReactor = (options?: ProviderCommandReactorLiveOptions) =>
           ),
         );
       },
+    );
+
+    const regenerateThreadTitle = Effect.fn("regenerateThreadTitle")(function* (
+      event: Extract<ProviderIntentEvent, { type: "thread.meta-updated" }>,
+      requestId: CommandId,
+    ) {
+      if (event.payload.regenerateTitle !== true) {
+        return { _tag: "Superseded" } as const;
+      }
+
+      const thread = yield* resolveThread(event.payload.threadId);
+      if (!thread || thread.titleRegeneration?.requestId !== requestId) {
+        return { _tag: "Superseded" } as const;
+      }
+
+      const { message, attachments } = formatThreadTitleContext(thread.messages);
+      if (message.length === 0) {
+        return { _tag: "Completed", title: undefined } as const;
+      }
+
+      const previousTitle = event.payload.previousTitle ?? thread.title;
+      if (thread.title !== previousTitle) {
+        return { _tag: "Superseded" } as const;
+      }
+      const project = yield* resolveProject(thread.projectId);
+      const cwd =
+        resolveThreadWorkspaceCwd({
+          thread,
+          projects: project ? [project] : [],
+        }) ?? process.cwd();
+      const { textGenerationModelSelection: modelSelection } =
+        yield* serverSettingsService.getSettings;
+      const generated = yield* textGeneration.generateThreadTitle({
+        cwd,
+        message,
+        previousTitle,
+        ...(attachments.length > 0 ? { attachments } : {}),
+        modelSelection,
+      });
+      if (generated.title === DEFAULT_THREAD_TITLE || generated.title === previousTitle) {
+        return { _tag: "Completed", title: undefined } as const;
+      }
+
+      const latestThread = yield* resolveThread(event.payload.threadId);
+      if (
+        !latestThread ||
+        latestThread.titleRegeneration?.requestId !== requestId ||
+        latestThread.title !== previousTitle
+      ) {
+        return { _tag: "Superseded" } as const;
+      }
+
+      return { _tag: "Completed", title: generated.title } as const;
+    });
+    const dispatchThreadTitleRegenerationCompletion = Effect.fn(
+      "dispatchThreadTitleRegenerationCompletion",
+    )(function* (input: {
+      readonly threadId: ThreadId;
+      readonly requestId: CommandId;
+      readonly title?: string;
+    }) {
+      const authority = yield* authorityForThreadIncludingArchived(input.threadId);
+      yield* orchestrationEngine.dispatch(
+        {
+          type: "thread.title.regeneration.complete",
+          commandId: yield* serverCommandId("thread-title-regeneration-complete"),
+          threadId: input.threadId,
+          requestId: input.requestId,
+          ...(input.title !== undefined ? { title: input.title } : {}),
+        },
+        authority,
+      );
+    });
+    const findInterruptedThreadTitleRegenerations = Effect.fn(
+      "findInterruptedThreadTitleRegenerations",
+    )(function* () {
+      const readModel = yield* projectionSnapshotQuery.getCommandReadModel();
+      return readModel.threads.flatMap((thread) => {
+        const requestId = thread.titleRegeneration?.requestId;
+        return requestId === undefined ? [] : [{ threadId: thread.id, requestId }];
+      });
+    });
+    const clearInterruptedThreadTitleRegenerations = Effect.fn(
+      "clearInterruptedThreadTitleRegenerations",
+    )(function* (
+      interrupted: ReadonlyArray<{ readonly threadId: ThreadId; readonly requestId: CommandId }>,
+    ) {
+      yield* Effect.forEach(
+        interrupted,
+        ({ threadId, requestId }) => {
+          return dispatchThreadTitleRegenerationCompletion({
+            threadId,
+            requestId,
+          }).pipe(
+            Effect.catchCause((cause) => {
+              if (Cause.hasInterruptsOnly(cause)) {
+                return Effect.interrupt;
+              }
+              return Effect.logWarning(
+                "provider command reactor failed to clear interrupted title regeneration",
+                {
+                  threadId,
+                  cause: Cause.pretty(cause),
+                },
+              );
+            }),
+          );
+        },
+        { discard: true },
+      );
+    });
+    const processThreadTitleRegenerationSafely = Effect.fn("processThreadTitleRegenerationSafely")(
+      function* (event: Extract<ProviderIntentEvent, { type: "thread.meta-updated" }>) {
+        if (event.payload.regenerateTitle !== true) {
+          return;
+        }
+
+        const requestId = event.payload.titleRegeneration?.requestId ?? event.commandId;
+        if (requestId === null) {
+          return;
+        }
+        const result = yield* regenerateThreadTitle(event, requestId).pipe(
+          Effect.catchCause((cause) => {
+            if (Cause.hasInterruptsOnly(cause)) {
+              return Effect.failCause(cause);
+            }
+            return Effect.logWarning("provider command reactor failed to regenerate thread title", {
+              threadId: event.payload.threadId,
+              cause: Cause.pretty(cause),
+            }).pipe(Effect.as({ _tag: "Completed", title: undefined } as const));
+          }),
+        );
+        if (result._tag === "Superseded") {
+          return;
+        }
+
+        const completion = {
+          threadId: event.payload.threadId,
+          requestId,
+          ...(result.title !== undefined ? { title: result.title } : {}),
+        };
+        yield* dispatchThreadTitleRegenerationCompletion(completion).pipe(
+          Effect.catchCause((cause) => {
+            if (Cause.hasInterruptsOnly(cause)) {
+              return Effect.failCause(cause);
+            }
+            return Effect.logWarning(
+              "provider command reactor retrying title regeneration completion",
+              {
+                threadId: event.payload.threadId,
+                cause: Cause.pretty(cause),
+              },
+            ).pipe(Effect.andThen(dispatchThreadTitleRegenerationCompletion(completion)));
+          }),
+        );
+      },
+      (effect, event) =>
+        effect.pipe(
+          Effect.catchCause((cause) => {
+            if (Cause.hasInterruptsOnly(cause)) {
+              return Effect.failCause(cause);
+            }
+            return Effect.logWarning(
+              "provider command reactor failed to complete title regeneration",
+              {
+                threadId: event.payload.threadId,
+                cause: Cause.pretty(cause),
+              },
+            );
+          }),
+        ),
+    );
+    const threadTitleRegenerationWorker = yield* makeDrainableWorker(
+      processThreadTitleRegenerationSafely,
     );
 
     const processTurnStartRequested = Effect.fn("processTurnStartRequested")(function* (
@@ -1792,6 +2127,9 @@ const makeReactor = (options?: ProviderCommandReactorLiveOptions) =>
         eventType: event.type,
       });
       switch (event.type) {
+        case "thread.meta-updated":
+          yield* threadTitleRegenerationWorker.enqueue(event);
+          return;
         case "thread.runtime-mode-set": {
           const thread = yield* resolveThread(event.payload.threadId);
           const activeSession = thread
@@ -1867,8 +2205,20 @@ const makeReactor = (options?: ProviderCommandReactorLiveOptions) =>
     const worker = yield* makeDrainableWorker(processDomainEventSafely);
 
     const start: ProviderCommandReactorShape["start"] = Effect.fn("start")(function* () {
+      const interruptedTitleRegenerations = yield* findInterruptedThreadTitleRegenerations().pipe(
+        Effect.catchCause((cause) => {
+          if (Cause.hasInterruptsOnly(cause)) {
+            return Effect.interrupt;
+          }
+          return Effect.logWarning(
+            "provider command reactor failed to find interrupted title regenerations",
+            { cause: Cause.pretty(cause) },
+          ).pipe(Effect.as([]));
+        }),
+      );
       const processEvent = Effect.fn("processEvent")(function* (event: OrchestrationEvent) {
         if (
+          (event.type === "thread.meta-updated" && event.payload.regenerateTitle === true) ||
           event.type === "thread.runtime-mode-set" ||
           event.type === "thread.turn-start-requested" ||
           event.type === "thread.turn-interrupt-requested" ||
@@ -1880,14 +2230,40 @@ const makeReactor = (options?: ProviderCommandReactorLiveOptions) =>
         }
       });
 
-      yield* Effect.forkScoped(
-        Stream.runForEach(orchestrationEngine.streamDomainEvents, processEvent),
+      yield* forkParked(Stream.runForEach(orchestrationEngine.streamDomainEvents, processEvent));
+
+      // The domain event stream is hot, so work pending before this reactor
+      // starts cannot be resumed. Correlated completions only clear the request
+      // captured here, leaving any newer request untouched.
+      const clearInterrupted = clearInterruptedThreadTitleRegenerations(
+        interruptedTitleRegenerations,
+      ).pipe(
+        Effect.catchCause((cause) => {
+          if (Cause.hasInterruptsOnly(cause)) {
+            return Effect.interrupt;
+          }
+          return Effect.logWarning(
+            "provider command reactor failed to clear interrupted title regenerations",
+            {
+              cause: Cause.pretty(cause),
+            },
+          );
+        }),
       );
+      const activation = yield* ServerActivation;
+      if (activation === undefined) {
+        yield* clearInterrupted;
+      } else {
+        yield* forkParked(clearInterrupted);
+      }
     });
 
     return {
       start,
-      drain: worker.drain,
+      drain: Effect.gen(function* () {
+        yield* worker.drain;
+        yield* threadTitleRegenerationWorker.drain;
+      }),
     } satisfies ProviderCommandReactorShape;
   });
 

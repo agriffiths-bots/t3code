@@ -76,8 +76,8 @@ const decodeElicitationComplete = Schema.decodeUnknownEffect(
   AcpSchema.ElicitationCompleteNotification,
 );
 const parserFactory = RpcSerialization.ndJsonRpc();
-const decodeWireLine = Schema.decodeUnknownSync(Schema.UnknownFromJsonString);
-const encodeWireLine = Schema.encodeUnknownSync(Schema.UnknownFromJsonString);
+const decodeWireLine = Schema.decodeUnknownSync(Schema.fromJsonString(Schema.Unknown));
+const encodeWireLine = Schema.encodeUnknownSync(Schema.fromJsonString(Schema.Unknown));
 const decodeBytes = (bytes: Uint8Array): string => new TextDecoder().decode(bytes);
 
 export const makeAcpPatchedProtocol = Effect.fn("makeAcpPatchedProtocol")(function* (
@@ -116,7 +116,7 @@ export const makeAcpPatchedProtocol = Effect.fn("makeAcpPatchedProtocol")(functi
   const inboundRequestIdAliasesByOriginal = new Map<string, InboundAliasNode>();
   const inboundAliasNodesByAliasId = new Map<string, InboundAliasNode>();
   const activeInboundRequestIds = new Set<string>();
-  const originalRequestIdKey = (requestId: string, idWasString: boolean) =>
+  const originalRequestIdKey = (requestId: AcpError.AcpRequestId, idWasString: boolean) =>
     `${idWasString ? "string" : "number"}:${requestId}`;
   const isForwardableRequestId = (requestId: string): boolean => /^-?\d+$/.test(requestId);
   const allocateInboundAliasId = (): string => {
@@ -349,12 +349,12 @@ export const makeAcpPatchedProtocol = Effect.fn("makeAcpPatchedProtocol")(functi
     const omitEmptyNotificationId = message._tag === "Request" && message.id === "";
     const aliasedPeer =
       message._tag === "Exit" || message._tag === "Chunk"
-        ? inboundRequestIdAliases.get(message.requestId)
+        ? inboundRequestIdAliases.get(String(message.requestId))
         : undefined;
     const inboundChunkTarget =
-      message._tag === "Chunk" && activeInboundRequestIds.has(message.requestId)
+      message._tag === "Chunk" && activeInboundRequestIds.has(String(message.requestId))
         ? (aliasedPeer ?? {
-            originalId: message.requestId,
+            originalId: String(message.requestId),
             originalIdWasString: false,
           })
         : undefined;
@@ -395,9 +395,9 @@ export const makeAcpPatchedProtocol = Effect.fn("makeAcpPatchedProtocol")(functi
     });
     if (message._tag === "Exit") {
       if (aliasedPeer === undefined) {
-        activeInboundRequestIds.delete(message.requestId);
+        activeInboundRequestIds.delete(String(message.requestId));
       } else {
-        unregisterInboundAliasControlMapping(message.requestId);
+        unregisterInboundAliasControlMapping(String(message.requestId));
       }
     }
 
@@ -413,33 +413,33 @@ export const makeAcpPatchedProtocol = Effect.fn("makeAcpPatchedProtocol")(functi
   });
 
   const resolveExtPending = (
-    requestId: string,
+    requestId: AcpError.AcpRequestId,
     onFound: (pendingRequest: AcpPendingRequest) => Effect.Effect<void>,
   ) =>
     Ref.modify(extPending, (pending) => {
-      const pendingRequest = pending.get(requestId);
+      const pendingRequest = pending.get(String(requestId));
       if (!pendingRequest) {
         return [Effect.void, pending] as const;
       }
       const next = new Map(pending);
-      next.delete(requestId);
+      next.delete(String(requestId));
       return [onFound(pendingRequest), next] as const;
     }).pipe(Effect.flatten);
 
-  const removeExtPending = (requestId: string) =>
+  const removeExtPending = (requestId: AcpError.AcpRequestId) =>
     Ref.update(extPending, (pending) => {
-      if (!pending.has(requestId)) {
+      if (!pending.has(String(requestId))) {
         return pending;
       }
       const next = new Map(pending);
-      next.delete(requestId);
+      next.delete(String(requestId));
       return next;
     });
 
-  const completeExtPendingFailure = (requestId: string, error: AcpError.AcpError) =>
+  const completeExtPendingFailure = (requestId: AcpError.AcpRequestId, error: AcpError.AcpError) =>
     resolveExtPending(requestId, ({ deferred }) => Deferred.fail(deferred, error));
 
-  const completeExtPendingSuccess = (requestId: string, value: unknown) =>
+  const completeExtPendingSuccess = (requestId: AcpError.AcpRequestId, value: unknown) =>
     resolveExtPending(requestId, ({ deferred }) => Deferred.succeed(deferred, value));
 
   const failAllExtPending = (error: AcpError.AcpError) =>
@@ -494,7 +494,7 @@ export const makeAcpPatchedProtocol = Effect.fn("makeAcpPatchedProtocol")(functi
       ] as const;
     }).pipe(Effect.flatten);
 
-  const respondWithSuccess = (requestId: string, value: unknown) =>
+  const respondWithSuccess = (requestId: AcpError.AcpRequestId, value: unknown) =>
     offerOutgoing({
       _tag: "Exit",
       requestId,
@@ -504,7 +504,7 @@ export const makeAcpPatchedProtocol = Effect.fn("makeAcpPatchedProtocol")(functi
       },
     });
 
-  const respondWithError = (requestId: string, error: AcpError.AcpRequestError) =>
+  const respondWithError = (requestId: AcpError.AcpRequestId, error: AcpError.AcpRequestError) =>
     offerOutgoing({
       _tag: "Exit",
       requestId,
@@ -656,13 +656,13 @@ export const makeAcpPatchedProtocol = Effect.fn("makeAcpPatchedProtocol")(functi
   // session when its skills directory changes — and forwarding it would kill
   // the receive loop with a BigInt conversion defect, silently hanging every
   // in-flight request.
-  const dropForeignPeerMessage = (tag: string, requestId: string) =>
+  const dropForeignPeerMessage = (tag: string, requestId: AcpError.AcpRequestId) =>
     Effect.logWarning("Dropping ACP message with a foreign request id.").pipe(
       Effect.annotateLogs({ tag, requestId }),
     );
 
-  const isForeignPeerResponseId = (requestId: string, idWasString?: boolean) =>
-    idWasString === true || !isForwardableRequestId(requestId);
+  const isForeignPeerResponseId = (requestId: AcpError.AcpRequestId, idWasString?: boolean) =>
+    idWasString === true || !isForwardableRequestId(String(requestId));
 
   const handleExitEncoded = (message: RpcMessage.ResponseExitEncoded, idWasString?: boolean) => {
     if (isForeignPeerResponseId(message.requestId, idWasString)) {
@@ -670,7 +670,7 @@ export const makeAcpPatchedProtocol = Effect.fn("makeAcpPatchedProtocol")(functi
     }
     return Ref.get(extPending).pipe(
       Effect.flatMap((pending) => {
-        const pendingRequest = pending.get(message.requestId);
+        const pendingRequest = pending.get(String(message.requestId));
         if (!pendingRequest) {
           return Queue.offer(clientQueue, message).pipe(Effect.asVoid);
         }
@@ -715,7 +715,7 @@ export const makeAcpPatchedProtocol = Effect.fn("makeAcpPatchedProtocol")(functi
         }
         return Ref.get(extPending).pipe(
           Effect.flatMap((pending) => {
-            const pendingRequest = pending.get(message.requestId);
+            const pendingRequest = pending.get(String(message.requestId));
             if (pendingRequest) {
               return completeExtPendingFailure(
                 message.requestId,
@@ -898,7 +898,7 @@ export const makeAcpPatchedProtocol = Effect.fn("makeAcpPatchedProtocol")(functi
     );
     yield* offerOutgoing({
       _tag: "Request",
-      id: String(requestId),
+      id: Number(requestId),
       tag: method,
       payload,
       headers: [],

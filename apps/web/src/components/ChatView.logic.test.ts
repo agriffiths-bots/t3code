@@ -6,38 +6,74 @@ import {
   ThreadId,
   TurnId,
 } from "@t3tools/contracts";
-import { describe, expect, it } from "vite-plus/test";
+import { afterEach, describe, expect, it, vi } from "vite-plus/test";
 
-import type { Thread } from "../types";
+import type { Thread, ThreadShell } from "../types";
 import {
-  ENVIRONMENT_UNAVAILABLE_BANNER_DEBOUNCE_MS,
   MAX_HIDDEN_MOUNTED_PREVIEW_THREADS,
   MAX_HIDDEN_MOUNTED_TERMINAL_THREADS,
-  buildThreadErrorDismissKey,
+  branchMismatchKey,
   buildExpiredTerminalContextToastCopy,
+  buildLoadingThreadFromShell,
   buildThreadTurnInterruptInput,
   createLocalDispatchSnapshot,
   deriveComposerSendState,
-  deriveLockedProvider,
+  dismissBranchMismatchForSession,
+  ENVIRONMENT_RECONNECT_WARNING_GRACE_MS,
   getStartedThreadModelChangeBlockReason,
-  hasQueuedSubmissionBeenObservedByShell,
+  hasEnvironmentReconnectWarningGraceElapsed,
   hasServerAcknowledgedLocalDispatch,
+  isBranchMismatchDismissedForSession,
   reconcileMountedTerminalThreadIds,
-  reconcilePendingLocalTerminalIds,
-  reconcileTerminalIdsFromServerMetadata,
   reconcileRetainedMountedThreadIds,
-  resolveVisibleServerThreadError,
+  resolveThreadMetadataUpdateForNextTurn,
   resolveSendEnvMode,
-  shouldShowEnvironmentUnavailableBanner,
+  scheduleEnvironmentReconnectWarning,
+  startNewThreadForProject,
+  shouldShowBranchMismatchBanner,
   shouldWriteThreadErrorToCurrentServerThread,
-  threadHasEstablishedProviderBinding,
-  workspaceRelativePathFromRepositoryRoot,
 } from "./ChatView.logic";
 
 const environmentId = EnvironmentId.make("environment-local");
 const projectId = ProjectId.make("project-1");
 const threadId = ThreadId.make("thread-1");
 const now = "2026-03-29T00:00:00.000Z";
+
+describe("environment reconnect warning grace", () => {
+  afterEach(() => vi.useRealTimers());
+
+  it("shows a persistent reconnect after the grace period", () => {
+    vi.useFakeTimers();
+    const showWarning = vi.fn();
+
+    scheduleEnvironmentReconnectWarning(showWarning);
+    vi.advanceTimersByTime(ENVIRONMENT_RECONNECT_WARNING_GRACE_MS - 1);
+    expect(showWarning).not.toHaveBeenCalled();
+
+    vi.advanceTimersByTime(1);
+    expect(showWarning).toHaveBeenCalledOnce();
+  });
+
+  it("cancels the warning when the connection recovers during the grace period", () => {
+    vi.useFakeTimers();
+    const showWarning = vi.fn();
+
+    const cancel = scheduleEnvironmentReconnectWarning(showWarning);
+    cancel();
+    vi.advanceTimersByTime(ENVIRONMENT_RECONNECT_WARNING_GRACE_MS);
+
+    expect(showWarning).not.toHaveBeenCalled();
+  });
+
+  it("does not reuse elapsed grace from another environment", () => {
+    const anotherEnvironmentId = EnvironmentId.make("environment-remote");
+
+    expect(hasEnvironmentReconnectWarningGraceElapsed(environmentId, environmentId)).toBe(true);
+    expect(hasEnvironmentReconnectWarningGraceElapsed(anotherEnvironmentId, environmentId)).toBe(
+      false,
+    );
+  });
+});
 
 function makeThread(overrides: Partial<Thread> = {}): Thread {
   return {
@@ -54,7 +90,6 @@ function makeThread(overrides: Partial<Thread> = {}): Thread {
     interactionMode: "default",
     session: null,
     messages: [],
-    turns: [],
     proposedPlans: [],
     activities: [],
     checkpoints: [],
@@ -68,6 +103,7 @@ function makeThread(overrides: Partial<Thread> = {}): Thread {
     branch: null,
     worktreePath: null,
     ...overrides,
+    turns: overrides.turns ?? [],
   };
 }
 
@@ -91,186 +127,78 @@ const readySession = {
   updatedAt: "2026-03-29T00:00:10.000Z",
 };
 
-describe("reconcileTerminalIdsFromServerMetadata", () => {
-  it("preserves optimistic local opens that have not appeared in server metadata yet", () => {
-    expect(
-      reconcileTerminalIdsFromServerMetadata({
-        serverIds: ["terminal-1"],
-        clientIds: ["terminal-1", "terminal-2"],
-        seenServerIds: new Set(["terminal-1"]),
-      }),
-    ).toBeNull();
-  });
-
-  it("removes terminals that disappear after being observed in server metadata", () => {
-    expect(
-      reconcileTerminalIdsFromServerMetadata({
-        serverIds: ["terminal-1"],
-        clientIds: ["terminal-1", "terminal-2"],
-        seenServerIds: new Set(["terminal-1", "terminal-2"]),
-      }),
-    ).toEqual(["terminal-1"]);
-  });
-
-  it("removes observed missing terminals while preserving unseen local opens", () => {
-    expect(
-      reconcileTerminalIdsFromServerMetadata({
-        serverIds: ["terminal-1"],
-        clientIds: ["terminal-1", "terminal-2", "terminal-3"],
-        seenServerIds: new Set(["terminal-1", "terminal-2"]),
-      }),
-    ).toEqual(["terminal-1", "terminal-3"]);
-  });
-
-  it("preserves a reused terminal id while its fresh local open is pending", () => {
-    expect(
-      reconcileTerminalIdsFromServerMetadata({
-        serverIds: [],
-        clientIds: ["terminal-1"],
-        seenServerIds: new Set(["terminal-1"]),
-        pendingLocalIds: new Set(["terminal-1"]),
-      }),
-    ).toBeNull();
-  });
-});
-
-describe("reconcilePendingLocalTerminalIds", () => {
-  it("tracks local additions until the server acknowledges them", () => {
-    const pending = reconcilePendingLocalTerminalIds({
-      pendingLocalIds: new Set(),
-      previousClientIds: [],
-      clientIds: ["terminal-1"],
-      serverIds: new Set(),
-    });
-    expect([...pending]).toEqual(["terminal-1"]);
-
-    expect(
-      reconcilePendingLocalTerminalIds({
-        pendingLocalIds: pending,
-        previousClientIds: ["terminal-1"],
-        clientIds: ["terminal-1"],
-        serverIds: new Set(["terminal-1"]),
-      }).has("terminal-1"),
-    ).toBe(false);
-  });
-
-  it("clears pending ids that the client removes before server acknowledgement", () => {
-    expect(
-      reconcilePendingLocalTerminalIds({
-        pendingLocalIds: new Set(["terminal-1"]),
-        previousClientIds: ["terminal-1"],
-        clientIds: [],
-        serverIds: new Set(),
-      }).has("terminal-1"),
-    ).toBe(false);
-  });
-});
-
-describe("workspaceRelativePathFromRepositoryRoot", () => {
-  it("returns the workspace path relative to a repository root", () => {
-    expect(workspaceRelativePathFromRepositoryRoot("/repo", "/repo/packages/app")).toBe(
-      "packages/app",
-    );
-  });
-
-  it("returns null when no repository root is known", () => {
-    expect(workspaceRelativePathFromRepositoryRoot(null, "/repo/packages/app")).toBeNull();
-  });
-});
-
-describe("threadHasEstablishedProviderBinding", () => {
-  it("does not treat synthetic first-start errors as established provider bindings", () => {
-    const thread = makeThread({
-      session: {
-        ...readySession,
-        status: "error",
-        activeTurnId: null,
-        lastError: "Provider failed before the turn started.",
+describe("buildLoadingThreadFromShell", () => {
+  it("preserves shell metadata and supplies empty detail collections", () => {
+    const shell = {
+      environmentId,
+      id: threadId,
+      projectId,
+      dataAudience: "private",
+      parentThreadId: null,
+      title: "Loading thread",
+      modelSelection: {
+        instanceId: ProviderInstanceId.make("codex"),
+        model: "gpt-5.4",
       },
-      latestTurn: {
-        ...completedTurn,
-        state: "running",
-        startedAt: null,
-        completedAt: null,
-      },
+      runtimeMode: "full-access",
+      interactionMode: "default",
+      branch: "main",
+      worktreePath: null,
+      latestTurn: null,
+      createdAt: now,
+      updatedAt: now,
+      archivedAt: null,
+      settledOverride: null,
+      settledAt: null,
+      snoozedUntil: null,
+      snoozedAt: null,
+      session: null,
+      latestUserMessageAt: now,
+      hasPendingApprovals: false,
+      hasPendingUserInput: false,
+      hasActionableProposedPlan: false,
+    } satisfies ThreadShell;
+
+    expect(buildLoadingThreadFromShell(shell)).toMatchObject({
+      environmentId,
+      id: threadId,
+      projectId,
+      title: "Loading thread",
+      branch: "main",
+      deletedAt: null,
+      messages: [],
+      proposedPlans: [],
+      activities: [],
+      checkpoints: [],
     });
-
-    expect(threadHasEstablishedProviderBinding(thread)).toBe(false);
-    expect(
-      deriveLockedProvider({
-        thread,
-        selectedProvider: "grok",
-        threadProvider: thread.session?.providerName ?? null,
-      }),
-    ).toBeNull();
-  });
-
-  it("treats active sessions and started turns as established provider bindings", () => {
-    expect(
-      threadHasEstablishedProviderBinding(
-        makeThread({
-          session: {
-            ...readySession,
-            status: "running",
-            activeTurnId: TurnId.make("turn-running"),
-          },
-        }),
-      ),
-    ).toBe(true);
-
-    expect(
-      threadHasEstablishedProviderBinding(
-        makeThread({
-          session: {
-            ...readySession,
-            status: "error",
-            lastError: "Provider failed after the turn started.",
-          },
-          latestTurn: completedTurn,
-        }),
-      ),
-    ).toBe(true);
   });
 });
 
-describe("hasQueuedSubmissionBeenObservedByShell", () => {
-  it("waits when the shell has not observed a turn at or after the queued submission", () => {
+describe("resolveThreadMetadataUpdateForNextTurn", () => {
+  const modelSelection = {
+    instanceId: ProviderInstanceId.make("codex"),
+    model: "gpt-5.4",
+  };
+
+  it("updates a stale local thread branch to the active checkout", () => {
     expect(
-      hasQueuedSubmissionBeenObservedByShell({
-        submissionCreatedAt: "2026-03-29T00:00:05.000Z",
-        latestTurn: null,
+      resolveThreadMetadataUpdateForNextTurn({
+        currentModelSelection: modelSelection,
+        currentBranch: "feature/thread",
+        nextBranch: "feature/checkout",
       }),
-    ).toBe(false);
-    expect(
-      hasQueuedSubmissionBeenObservedByShell({
-        submissionCreatedAt: "2026-03-29T00:00:05.000Z",
-        latestTurn: {
-          ...completedTurn,
-          requestedAt: "2026-03-29T00:00:04.000Z",
-        },
-      }),
-    ).toBe(false);
+    ).toEqual({ branch: "feature/checkout", worktreePath: null });
   });
 
-  it("treats a shell turn requested at or after the queued submission as observed", () => {
+  it("does not write metadata when the model and branch are unchanged", () => {
     expect(
-      hasQueuedSubmissionBeenObservedByShell({
-        submissionCreatedAt: "2026-03-29T00:00:05.000Z",
-        latestTurn: {
-          ...completedTurn,
-          requestedAt: "2026-03-29T00:00:05.000Z",
-        },
+      resolveThreadMetadataUpdateForNextTurn({
+        currentModelSelection: modelSelection,
+        nextModelSelection: modelSelection,
+        currentBranch: "feature/current",
+        nextBranch: "feature/current",
       }),
-    ).toBe(true);
-    expect(
-      hasQueuedSubmissionBeenObservedByShell({
-        submissionCreatedAt: "2026-03-29T00:00:05.000Z",
-        latestTurn: {
-          ...completedTurn,
-          requestedAt: "2026-03-29T00:00:06.000Z",
-        },
-      }),
-    ).toBe(true);
+    ).toBeNull();
   });
 });
 
@@ -291,118 +219,10 @@ describe("buildThreadTurnInterruptInput", () => {
     ).toEqual({ threadId, turnId: activeTurnId });
   });
 
-  it("targets the session's active waiting turn", () => {
-    const activeTurnId = TurnId.make("turn-waiting");
-
-    expect(
-      buildThreadTurnInterruptInput(
-        makeThread({
-          session: {
-            ...readySession,
-            status: "waiting",
-            activeTurnId,
-          },
-        }),
-      ),
-    ).toEqual({ threadId, turnId: activeTurnId });
-  });
-
   it("omits a turn id when the session is not running", () => {
     expect(buildThreadTurnInterruptInput(makeThread({ session: readySession }))).toEqual({
       threadId,
     });
-  });
-});
-
-describe("shouldShowEnvironmentUnavailableBanner", () => {
-  it("suppresses short reconnect blips", () => {
-    expect(
-      shouldShowEnvironmentUnavailableBanner({
-        connectionPhase: "reconnecting",
-        unavailableSinceMs: 1_000,
-        nowMs: 1_000 + ENVIRONMENT_UNAVAILABLE_BANNER_DEBOUNCE_MS - 1,
-      }),
-    ).toBe(false);
-  });
-
-  it("shows the banner once the connection has stayed unavailable", () => {
-    expect(
-      shouldShowEnvironmentUnavailableBanner({
-        connectionPhase: "reconnecting",
-        unavailableSinceMs: 1_000,
-        nowMs: 1_000 + ENVIRONMENT_UNAVAILABLE_BANNER_DEBOUNCE_MS,
-      }),
-    ).toBe(true);
-  });
-
-  it("clears immediately when the connection is back", () => {
-    expect(
-      shouldShowEnvironmentUnavailableBanner({
-        connectionPhase: "connected",
-        unavailableSinceMs: 1_000,
-        nowMs: 1_000 + ENVIRONMENT_UNAVAILABLE_BANNER_DEBOUNCE_MS,
-      }),
-    ).toBe(false);
-  });
-});
-
-describe("resolveVisibleServerThreadError", () => {
-  it("uses a dismissed key to hide a persisted server error for that turn", () => {
-    const turnId = TurnId.make("turn-dismissed");
-    const dismissKey = buildThreadErrorDismissKey({
-      threadKey: "environment-local:thread-1",
-      turnId,
-      error: "The turn was interrupted. Send your message again to retry.",
-    });
-
-    expect(dismissKey).not.toBeNull();
-    expect(
-      resolveVisibleServerThreadError({
-        localError: null,
-        sessionError: "The turn was interrupted. Send your message again to retry.",
-        dismissedSessionErrorKeys: { [dismissKey!]: true },
-        threadKey: "environment-local:thread-1",
-        turnId,
-      }),
-    ).toBeNull();
-  });
-
-  it("allows the same friendly interruption message to appear on a later turn", () => {
-    const dismissedTurnId = TurnId.make("turn-dismissed");
-    const laterTurnId = TurnId.make("turn-later");
-    const dismissKey = buildThreadErrorDismissKey({
-      threadKey: "environment-local:thread-1",
-      turnId: dismissedTurnId,
-      error: "The turn was interrupted. Send your message again to retry.",
-    });
-
-    expect(
-      resolveVisibleServerThreadError({
-        localError: null,
-        sessionError: "The turn was interrupted. Send your message again to retry.",
-        dismissedSessionErrorKeys: { [dismissKey!]: true },
-        threadKey: "environment-local:thread-1",
-        turnId: laterTurnId,
-      }),
-    ).toBe("The turn was interrupted. Send your message again to retry.");
-  });
-
-  it("keeps local errors visible even when a persisted session error was dismissed", () => {
-    const dismissKey = buildThreadErrorDismissKey({
-      threadKey: "environment-local:thread-1",
-      turnId: null,
-      error: "Persisted error",
-    });
-
-    expect(
-      resolveVisibleServerThreadError({
-        localError: "Select a base branch before sending.",
-        sessionError: "Persisted error",
-        dismissedSessionErrorKeys: { [dismissKey!]: true },
-        threadKey: "environment-local:thread-1",
-        turnId: null,
-      }),
-    ).toBe("Select a base branch before sending.");
   });
 });
 
@@ -566,6 +386,61 @@ describe("resolveSendEnvMode", () => {
   });
 });
 
+describe("branchMismatchKey", () => {
+  it("builds a key from thread id and both branches", () => {
+    expect(branchMismatchKey("thread-1", { threadBranch: "feat/a", currentBranch: "feat/b" })).toBe(
+      "thread-1:feat/a:feat/b",
+    );
+  });
+
+  it("returns null without a thread or mismatch", () => {
+    expect(branchMismatchKey(null, { threadBranch: "a", currentBranch: "b" })).toBeNull();
+    expect(branchMismatchKey("thread-1", null)).toBeNull();
+  });
+});
+
+describe("shouldShowBranchMismatchBanner", () => {
+  const base = {
+    hasMismatch: true,
+    isDismissed: false,
+    composerHasContent: false,
+    wasShownForCurrentMismatch: false,
+  };
+
+  it("stays hidden during passive browsing (even though the composer autofocuses)", () => {
+    expect(shouldShowBranchMismatchBanner(base)).toBe(false);
+  });
+
+  it("shows once the composer has draft content", () => {
+    expect(shouldShowBranchMismatchBanner({ ...base, composerHasContent: true })).toBe(true);
+  });
+
+  it("stays mounted after the draft clears once shown for the current mismatch", () => {
+    expect(shouldShowBranchMismatchBanner({ ...base, wasShownForCurrentMismatch: true })).toBe(
+      true,
+    );
+  });
+
+  it("never shows when dismissed or without a mismatch", () => {
+    expect(
+      shouldShowBranchMismatchBanner({ ...base, composerHasContent: true, isDismissed: true }),
+    ).toBe(false);
+    expect(
+      shouldShowBranchMismatchBanner({ ...base, composerHasContent: true, hasMismatch: false }),
+    ).toBe(false);
+  });
+});
+
+describe("session branch mismatch dismissal", () => {
+  it("tracks dismissed keys and treats other keys as active", () => {
+    expect(isBranchMismatchDismissedForSession("t1:a:b")).toBe(false);
+    dismissBranchMismatchForSession("t1:a:b");
+    expect(isBranchMismatchDismissedForSession("t1:a:b")).toBe(true);
+    expect(isBranchMismatchDismissedForSession("t1:a:c")).toBe(false);
+    expect(isBranchMismatchDismissedForSession(null)).toBe(false);
+  });
+});
+
 describe("reconcileMountedTerminalThreadIds", () => {
   it("keeps open threads and makes the active thread most recent", () => {
     expect(
@@ -640,23 +515,55 @@ describe("reconcileRetainedMountedThreadIds", () => {
 });
 
 describe("shouldWriteThreadErrorToCurrentServerThread", () => {
-  it("requires the environment, route thread, and target thread to match", () => {
+  it("writes errors for a shell-derived active server thread", () => {
     const routeThreadRef = { environmentId, threadId };
 
     expect(
       shouldWriteThreadErrorToCurrentServerThread({
-        serverThread: { environmentId, id: threadId },
+        activeServerThread: { environmentId, id: threadId },
         routeThreadRef,
         targetThreadId: threadId,
       }),
     ).toBe(true);
+  });
+
+  it("requires an active server thread matching the environment, route, and target", () => {
+    const routeThreadRef = { environmentId, threadId };
+
     expect(
       shouldWriteThreadErrorToCurrentServerThread({
-        serverThread: null,
+        activeServerThread: null,
         routeThreadRef,
         targetThreadId: threadId,
       }),
     ).toBe(false);
+  });
+});
+
+describe("startNewThreadForProject", () => {
+  it("starts a thread through the supplied shared handler for the active project", () => {
+    const calls: Array<{ environmentId: EnvironmentId; projectId: ProjectId }> = [];
+    const projectRef = { environmentId, projectId };
+
+    expect(
+      startNewThreadForProject(projectRef, (nextProjectRef) => {
+        calls.push(nextProjectRef);
+        return Promise.resolve();
+      }),
+    ).toBe(true);
+    expect(calls).toEqual([projectRef]);
+  });
+
+  it("does nothing when the active project is unavailable", () => {
+    let called = false;
+
+    expect(
+      startNewThreadForProject(null, () => {
+        called = true;
+        return Promise.resolve();
+      }),
+    ).toBe(false);
+    expect(called).toBe(false);
   });
 });
 

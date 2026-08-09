@@ -1,14 +1,21 @@
 import { SymbolView } from "./AppSymbol";
 import { Image } from "expo-image";
-import { useState } from "react";
+import { useLayoutEffect, useMemo, useState } from "react";
 import { View } from "react-native";
 import type { EnvironmentId } from "@t3tools/contracts";
-import { isProjectFaviconFallbackUrl } from "@t3tools/shared/projectFavicon";
+import {
+  getProjectFaviconCacheKey,
+  isProjectFaviconFallbackUrl,
+} from "@t3tools/shared/projectFavicon";
 import { useThemeColor } from "../lib/useThemeColor";
 import { type AssetRequestSource, useAssetRequestSource } from "../state/assets";
-
-/* ─── Favicon cache (matches web pattern) ────────────────────────────── */
-const loadedFaviconUrls = new Set<string>();
+import {
+  beginProjectFaviconRequest,
+  createProjectFaviconRequest,
+  hasLoadedProjectFavicon,
+  markProjectFaviconFailed,
+  markProjectFaviconLoaded,
+} from "./projectFaviconCache";
 
 /* ─── Component ──────────────────────────────────────────────────────── */
 export function ProjectFavicon(props: {
@@ -17,21 +24,35 @@ export function ProjectFavicon(props: {
   readonly size?: number;
   readonly projectTitle: string;
   readonly workspaceRoot?: string | null;
+  readonly faviconPath?: string | null;
 }) {
   const size = props.size ?? 42;
   const faviconSource = useAssetRequestSource(
     props.environmentId,
     props.workspaceRoot === null || props.workspaceRoot === undefined
       ? null
-      : { _tag: "project-favicon", cwd: props.workspaceRoot },
+      : {
+          _tag: "project-favicon",
+          cwd: props.workspaceRoot,
+          ...(props.faviconPath ? { path: props.faviconPath } : {}),
+        },
   );
   const renderableFaviconSource = isProjectFaviconFallbackUrl(faviconSource?.uri ?? null)
     ? null
     : faviconSource;
+  const cacheKey =
+    renderableFaviconSource && props.workspaceRoot
+      ? getProjectFaviconCacheKey(
+          props.environmentId,
+          props.workspaceRoot,
+          renderableFaviconSource.uri,
+        )
+      : null;
 
   return (
     <ProjectFaviconImage
-      key={faviconSource?.uri}
+      key={cacheKey}
+      cacheKey={cacheKey}
       faviconSource={renderableFaviconSource}
       open={props.open}
       projectTitle={props.projectTitle}
@@ -41,18 +62,32 @@ export function ProjectFavicon(props: {
 }
 
 function ProjectFaviconImage(props: {
+  readonly cacheKey: string | null;
   readonly faviconSource: AssetRequestSource | null;
   readonly open?: boolean;
   readonly projectTitle: string;
   readonly size: number;
 }) {
   const iconMuted = useThemeColor("--color-icon-subtle");
+  const faviconRequest = useMemo(
+    () => createProjectFaviconRequest(props.cacheKey, props.faviconSource?.uri ?? null),
+    [props.cacheKey, props.faviconSource?.uri],
+  );
+  const [activeFaviconRequest, setActiveFaviconRequest] = useState<typeof faviconRequest>(null);
+  useLayoutEffect(() => {
+    if (faviconRequest === null) return;
+
+    const endRequest = beginProjectFaviconRequest(faviconRequest);
+    setActiveFaviconRequest(faviconRequest);
+    return endRequest;
+  }, [faviconRequest]);
 
   const [status, setStatus] = useState<"loading" | "loaded" | "error">(() =>
-    props.faviconSource && loadedFaviconUrls.has(props.faviconSource.uri) ? "loaded" : "loading",
+    hasLoadedProjectFavicon(props.cacheKey) ? "loaded" : "loading",
   );
 
-  const showImage = props.faviconSource !== null && status === "loaded";
+  const requestIsActive = faviconRequest !== null && activeFaviconRequest === faviconRequest;
+  const showImage = requestIsActive && status === "loaded";
 
   return (
     <View
@@ -74,12 +109,16 @@ function ProjectFaviconImage(props: {
       ) : null}
 
       {/* Favicon image (hidden until loaded) */}
-      {props.faviconSource ? (
+      {requestIsActive ? (
         <Image
+          key={faviconRequest.faviconUrl}
           source={{
-            uri: props.faviconSource.uri,
-            headers: props.faviconSource.headers,
+            uri: faviconRequest.faviconUrl,
+            cacheKey: faviconRequest.cacheKey,
+            headers: props.faviconSource?.headers,
           }}
+          cachePolicy="memory-disk"
+          recyclingKey={faviconRequest.cacheKey}
           accessibilityLabel={`${props.projectTitle} favicon`}
           style={{
             width: props.size,
@@ -89,10 +128,13 @@ function ProjectFaviconImage(props: {
           }}
           contentFit="contain"
           onLoad={() => {
-            if (props.faviconSource) loadedFaviconUrls.add(props.faviconSource.uri);
+            if (!markProjectFaviconLoaded(faviconRequest)) return;
             setStatus("loaded");
           }}
-          onError={() => setStatus("error")}
+          onError={() => {
+            if (!markProjectFaviconFailed(faviconRequest)) return;
+            setStatus("error");
+          }}
         />
       ) : null}
     </View>

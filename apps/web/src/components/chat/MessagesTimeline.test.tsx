@@ -18,7 +18,6 @@ vi.mock("@legendapp/list/react", async () => {
       anchorMaxSize?: number;
       anchorOffset?: number;
       onReady?: (info: { anchorIndex: number }) => void;
-      onSizeChanged?: (size: number) => void;
     };
     contentInsetEndAdjustment?: number;
     className?: string;
@@ -42,7 +41,6 @@ vi.mock("@legendapp/list/react", async () => {
     ref?: Ref<LegendListRef>;
   }) => {
     if (props.anchoredEndSpace) {
-      props.anchoredEndSpace.onSizeChanged?.(240);
       props.anchoredEndSpace.onReady?.({ anchorIndex: props.anchoredEndSpace.anchorIndex });
     }
     return (
@@ -90,6 +88,11 @@ vi.mock("@legendapp/list/react", async () => {
             ? props.maintainVisibleContentPosition.size
             : undefined
         }
+        data-maintain-visible-content-position-restore={
+          typeof props.maintainVisibleContentPosition === "object"
+            ? Boolean(props.maintainVisibleContentPosition.shouldRestorePosition)
+            : undefined
+        }
       >
         {props.ListHeaderComponent}
         {props.data.map((item) => (
@@ -130,24 +133,24 @@ function matchMedia() {
   };
 }
 
-beforeAll(() => {
+let MessagesTimeline: typeof import("./MessagesTimeline").MessagesTimeline;
+
+beforeAll(async () => {
   const classList = {
     add: () => {},
     remove: () => {},
     toggle: () => {},
     contains: () => false,
   };
-  const localStorage = {
+
+  vi.stubGlobal("localStorage", {
     getItem: () => null,
     setItem: () => {},
     removeItem: () => {},
     clear: () => {},
-  };
-
-  vi.stubGlobal("localStorage", localStorage);
+  });
   vi.stubGlobal("window", {
     matchMedia,
-    localStorage,
     addEventListener: () => {},
     removeEventListener: () => {},
     requestAnimationFrame: (callback: FrameRequestCallback) => {
@@ -163,7 +166,9 @@ beforeAll(() => {
       offsetHeight: 0,
     },
   });
-});
+
+  ({ MessagesTimeline } = await import("./MessagesTimeline"));
+}, 30_000);
 
 const ACTIVE_THREAD_ENVIRONMENT_ID = EnvironmentId.make("environment-local");
 const MESSAGE_CREATED_AT = "2026-03-17T19:12:28.000Z";
@@ -175,15 +180,12 @@ function buildProps() {
     activeTurnStartedAt: null,
     listRef: createRef<LegendListRef | null>(),
     latestTurn: null,
-    turns: [],
     runningTurnId: null,
     turnDiffSummaryByAssistantMessageId: new Map(),
-    turnDiffSummaryByTurnId: new Map(),
     routeThreadKey: "environment-local:thread-1",
     onOpenTurnDiff: () => {},
     revertTurnCountByUserMessageId: new Map(),
     onRevertUserMessage: () => {},
-    onRetryUserMessage: () => {},
     isRevertingCheckpoint: false,
     onImageExpand: () => {},
     activeThreadEnvironmentId: ACTIVE_THREAD_ENVIRONMENT_ID,
@@ -193,8 +195,8 @@ function buildProps() {
     workspaceRoot: undefined,
     anchorMessageId: null,
     onAnchorReady: () => {},
-    onAnchorSizeChanged: () => {},
     contentInsetEndAdjustment: 0,
+    liveFollowEnabled: true,
     onIsAtEndChange: () => {},
     onManualNavigation: () => {},
   };
@@ -224,63 +226,34 @@ function buildUserTimelineEntry(text: string) {
 }
 
 describe("MessagesTimeline", () => {
-  it("shows the effective-model badge only for rerouted turns", async () => {
-    const { MessagesTimeline } = await import("./MessagesTimeline");
-    const turnId = TurnId.make("turn-rerouted");
-    const assistantMessageId = MessageId.make("assistant-rerouted");
-    const timelineEntries = [
-      {
-        id: "assistant-rerouted-entry",
-        kind: "message" as const,
-        createdAt: MESSAGE_CREATED_AT,
-        message: {
-          id: assistantMessageId,
-          role: "assistant" as const,
-          text: "Fallback response",
-          turnId,
-          createdAt: MESSAGE_CREATED_AT,
-          updatedAt: MESSAGE_CREATED_AT,
-          streaming: false,
-        },
-      },
-    ];
-    const latestTurn = {
-      turnId,
-      state: "completed" as const,
-      startedAt: MESSAGE_CREATED_AT,
-      completedAt: MESSAGE_CREATED_AT,
-      assistantMessageId,
-      effectiveModel: "claude-opus-4-8",
-    };
+  it("uses the larger leading inset only when the top fade is enabled", () => {
+    const timelineEntries = [buildUserTimelineEntry("Hello")];
 
-    const reroutedMarkup = renderToStaticMarkup(
-      <MessagesTimeline
-        {...buildProps()}
-        latestTurn={latestTurn}
-        turns={[latestTurn]}
-        timelineEntries={timelineEntries}
-      />,
+    const compactMarkup = renderToStaticMarkup(
+      <MessagesTimeline {...buildProps()} timelineEntries={timelineEntries} />,
     );
-    const normalMarkup = renderToStaticMarkup(
-      <MessagesTimeline
-        {...buildProps()}
-        latestTurn={{ ...latestTurn, effectiveModel: undefined }}
-        turns={[{ ...latestTurn, effectiveModel: undefined }]}
-        timelineEntries={timelineEntries}
-      />,
+    const fadedMarkup = renderToStaticMarkup(
+      <MessagesTimeline {...buildProps()} timelineEntries={timelineEntries} topFadeEnabled />,
     );
 
-    expect(reroutedMarkup).toContain("answered by claude-opus-4-8");
-    expect(normalMarkup).not.toContain("answered by");
+    expect(compactMarkup).toContain('class="h-3 sm:h-4"');
+    expect(compactMarkup).not.toContain("chat-timeline-scroll-fade");
+    expect(fadedMarkup).toContain('class="h-10 sm:h-12"');
+    expect(fadedMarkup).toContain("chat-timeline-scroll-fade");
   });
 
-  it("keeps assistant changed-files headers sticky below the thread header", async () => {
-    const { MessagesTimeline } = await import("./MessagesTimeline");
+  it("keeps assistant changed-files headers sticky below the thread header", () => {
     const assistantMessageId = MessageId.make("message-assistant-with-files");
     const turnId = TurnId.make("turn-with-files");
     const markup = renderToStaticMarkup(
       <MessagesTimeline
         {...buildProps()}
+        latestTurn={{
+          turnId,
+          state: "completed",
+          startedAt: MESSAGE_CREATED_AT,
+          completedAt: MESSAGE_CREATED_AT,
+        }}
         timelineEntries={[
           {
             id: "entry-assistant-with-files",
@@ -316,17 +289,17 @@ describe("MessagesTimeline", () => {
       />,
     );
 
-    expect(markup).toContain('class="sticky top-2 z-10');
+    expect(markup).toContain("sticky top-2 z-10");
     expect(markup).not.toContain("self-start");
     expect(markup).toContain("whitespace-nowrap");
     expect(markup).toContain("!size-[22px]");
     expect(markup).toContain("size-3");
-    expect(markup).toContain('aria-label="Collapse all"');
-    expect(markup).toContain('aria-label="View diff"');
+    expect(markup).toContain('aria-label="Collapse all folders"');
+    expect(markup).toContain('aria-label="Open diff"');
     expect(markup).toContain("1 changed file");
   });
 
-  it("uses LegendList isNearEnd when deciding whether the live edge is visible", async () => {
+  it("treats only the strict list end as the live edge", async () => {
     const {
       resolveTimelineIsAtEnd,
       resolveTimelineMinimapHasPersistentGutter,
@@ -337,10 +310,36 @@ describe("MessagesTimeline", () => {
       resolveTimelineMinimapTopPercent,
     } = await import("./MessagesTimeline.logic");
 
-    expect(resolveTimelineIsAtEnd({ isNearEnd: true, isAtEnd: false })).toBe(true);
-    expect(resolveTimelineIsAtEnd({ isNearEnd: false, isAtEnd: true })).toBe(false);
     expect(resolveTimelineIsAtEnd({ isAtEnd: true })).toBe(true);
     expect(resolveTimelineIsAtEnd(undefined)).toBeUndefined();
+    // Within the pixel band above the content bottom counts as the end...
+    expect(
+      resolveTimelineIsAtEnd({
+        isAtEnd: false,
+        contentLength: 2000,
+        scroll: 1170,
+        scrollLength: 800,
+      }),
+    ).toBe(true);
+    // ...but half a viewport up (LegendList's isNearEnd territory) does not.
+    expect(
+      resolveTimelineIsAtEnd({
+        isAtEnd: false,
+        contentLength: 2000,
+        scroll: 900,
+        scrollLength: 800,
+      }),
+    ).toBe(false);
+    // The composer inset is part of contentLength and must not count as
+    // distance-to-end.
+    expect(
+      resolveTimelineIsAtEnd(
+        { isAtEnd: false, contentLength: 2100, scroll: 1170, scrollLength: 800 },
+        100,
+      ),
+    ).toBe(true);
+    // Geometry missing (older state shape): fall back to the strict flag.
+    expect(resolveTimelineIsAtEnd({ isAtEnd: false })).toBe(false);
 
     expect(resolveTimelineMinimapHeightStyle(5)).toBe("min(32px, calc(100vh - 18rem))");
     expect(resolveTimelineMinimapTopPercent(2, 5)).toBe(50);
@@ -387,10 +386,8 @@ describe("MessagesTimeline", () => {
     expect(resolveTimelineMinimapInteractiveWidth(40, true)).toBe("22rem");
   });
 
-  it("anchors a sent attachment message using its measured height", async () => {
-    const { MessagesTimeline } = await import("./MessagesTimeline");
+  it("anchors a sent attachment message using its measured height", () => {
     const onAnchorReady = vi.fn();
-    const onAnchorSizeChanged = vi.fn();
     const firstEntry = buildUserTimelineEntry("First prompt.");
     const secondEntry = {
       ...buildUserTimelineEntry("Newest prompt."),
@@ -415,7 +412,6 @@ describe("MessagesTimeline", () => {
         {...buildProps()}
         anchorMessageId={secondEntry.message.id}
         onAnchorReady={onAnchorReady}
-        onAnchorSizeChanged={onAnchorSizeChanged}
         contentInsetEndAdjustment={144}
         timelineEntries={[firstEntry, secondEntry]}
       />,
@@ -430,59 +426,13 @@ describe("MessagesTimeline", () => {
     expect(markup).not.toContain('data-maintain-scroll-at-end="enabled"');
     expect(markup).toContain('data-maintain-visible-content-position="object"');
     expect(markup).toContain('data-maintain-visible-content-position-data="true"');
-    expect(markup).toContain('data-maintain-visible-content-position-size="false"');
+    expect(markup).toContain('data-maintain-visible-content-position-size="true"');
+    expect(markup).toContain('data-maintain-visible-content-position-restore="true"');
     expect(onAnchorReady).toHaveBeenCalledOnce();
     expect(onAnchorReady).toHaveBeenCalledWith(secondEntry.message.id, 1);
-    expect(onAnchorSizeChanged).toHaveBeenCalledWith(secondEntry.message.id, 240);
-  }, 30_000);
-
-  it("renders delivery error copy for failed optimistic user messages", async () => {
-    const { MessagesTimeline } = await import("./MessagesTimeline");
-    const entry = {
-      ...buildUserTimelineEntry("Image prompt."),
-      message: {
-        ...buildUserTimelineEntry("Image prompt.").message,
-        deliveryStatus: "failed" as const,
-        deliveryError:
-          "Attached images will retry while this app stays open. Reconnect before closing or reloading.",
-      },
-    };
-
-    const markup = renderToStaticMarkup(
-      <MessagesTimeline {...buildProps()} timelineEntries={[entry]} />,
-    );
-
-    expect(markup).toContain(
-      "Attached images will retry while this app stays open. Reconnect before closing or reloading.",
-    );
-    expect(markup).toContain("Failed");
-    expect(markup).toContain("Retry");
   });
 
-  it("hides retry controls for nonretryable failed optimistic user messages", async () => {
-    const { MessagesTimeline } = await import("./MessagesTimeline");
-    const entry = {
-      ...buildUserTimelineEntry("Thread setup prompt."),
-      message: {
-        ...buildUserTimelineEntry("Thread setup prompt.").message,
-        deliveryStatus: "failed" as const,
-        deliveryError:
-          "Connection dropped while preparing this send. Check whether it already started before sending again.",
-        deliveryRetryable: false,
-      },
-    };
-
-    const markup = renderToStaticMarkup(
-      <MessagesTimeline {...buildProps()} timelineEntries={[entry]} />,
-    );
-
-    expect(markup).toContain("Check whether it already started before sending again.");
-    expect(markup).toContain("Failed");
-    expect(markup).not.toContain("Retry");
-  });
-
-  it("renders collapse controls for long user messages", async () => {
-    const { MessagesTimeline } = await import("./MessagesTimeline");
+  it("renders collapse controls for long user messages", () => {
     const markup = renderToStaticMarkup(
       <MessagesTimeline
         {...buildProps()}
@@ -501,8 +451,7 @@ describe("MessagesTimeline", () => {
     expect(markup).toContain('data-user-message-footer="true"');
   });
 
-  it("does not render collapse controls for short user messages", async () => {
-    const { MessagesTimeline } = await import("./MessagesTimeline");
+  it("does not render collapse controls for short user messages", () => {
     const markup = renderToStaticMarkup(
       <MessagesTimeline
         {...buildProps()}
@@ -512,14 +461,13 @@ describe("MessagesTimeline", () => {
 
     expect(markup).not.toContain("Show full message");
     expect(markup).toContain('data-user-message-collapsible="false"');
+    expect(markup).toContain("rounded-2xl bg-message p-3");
   });
 
-  it("renders inline terminal labels with the composer chip UI", async () => {
-    const { MessagesTimeline } = await import("./MessagesTimeline");
+  it("renders inline terminal labels with the composer chip UI", () => {
     const markup = renderToStaticMarkup(
       <MessagesTimeline
         {...buildProps()}
-        revertTurnCountByUserMessageId={new Map([[MessageId.make("system-message-1"), 1]])}
         timelineEntries={[
           buildUserTimelineEntry(
             [
@@ -543,8 +491,7 @@ describe("MessagesTimeline", () => {
     expect(markup).toContain("Show full message");
   }, 20_000);
 
-  it("renders chips for standalone element-pick context messages", async () => {
-    const { MessagesTimeline } = await import("./MessagesTimeline");
+  it("renders chips for standalone element-pick context messages", () => {
     const markup = renderToStaticMarkup(
       <MessagesTimeline
         {...buildProps()}
@@ -570,8 +517,7 @@ describe("MessagesTimeline", () => {
     expect(markup).not.toContain("<element_context");
   });
 
-  it("keeps the copy button for collapsed long user messages", async () => {
-    const { MessagesTimeline } = await import("./MessagesTimeline");
+  it("keeps the copy button for collapsed long user messages", () => {
     const markup = renderToStaticMarkup(
       <MessagesTimeline
         {...buildProps()}
@@ -584,8 +530,7 @@ describe("MessagesTimeline", () => {
     expect(markup).toContain('data-user-message-footer="true"');
   });
 
-  it("renders context compaction entries in the normal work log", async () => {
-    const { MessagesTimeline } = await import("./MessagesTimeline");
+  it("renders context compaction entries in the normal work log", () => {
     const markup = renderToStaticMarkup(
       <MessagesTimeline
         {...buildProps()}
@@ -609,138 +554,7 @@ describe("MessagesTimeline", () => {
     expect(markup).toContain("Work Log");
   });
 
-  it("renders all trailing final assistant text outside the collapsed work fold", async () => {
-    const { MessagesTimeline } = await import("./MessagesTimeline");
-    const markup = renderToStaticMarkup(
-      <MessagesTimeline
-        {...buildProps()}
-        timelineEntries={[
-          {
-            id: "user-entry",
-            kind: "message",
-            createdAt: "2026-03-17T19:12:00.000Z",
-            message: {
-              id: MessageId.make("user-message-1"),
-              role: "user",
-              text: "Answer with evidence",
-              turnId: null,
-              createdAt: "2026-03-17T19:12:00.000Z",
-              updatedAt: "2026-03-17T19:12:00.000Z",
-              streaming: false,
-            },
-          },
-          {
-            id: "assistant-preface-entry",
-            kind: "message",
-            createdAt: "2026-03-17T19:12:04.000Z",
-            message: {
-              id: MessageId.make("assistant-preface"),
-              role: "assistant",
-              text: "I will inspect first.",
-              turnId: "turn-1" as never,
-              createdAt: "2026-03-17T19:12:04.000Z",
-              updatedAt: "2026-03-17T19:12:05.000Z",
-              streaming: false,
-            },
-          },
-          {
-            id: "work-entry-1",
-            kind: "work",
-            createdAt: "2026-03-17T19:12:08.000Z",
-            entry: {
-              id: "work-1",
-              createdAt: "2026-03-17T19:12:08.000Z",
-              turnId: "turn-1" as never,
-              label: "Ran command",
-              tone: "tool",
-            },
-          },
-          {
-            id: "assistant-final-intro-entry",
-            kind: "message",
-            createdAt: "2026-03-17T19:12:20.000Z",
-            message: {
-              id: MessageId.make("assistant-final-intro"),
-              role: "assistant",
-              text: "First final section.",
-              turnId: "turn-1" as never,
-              createdAt: "2026-03-17T19:12:20.000Z",
-              updatedAt: "2026-03-17T19:12:21.000Z",
-              streaming: false,
-            },
-          },
-          {
-            id: "assistant-final-body-entry",
-            kind: "message",
-            createdAt: "2026-03-17T19:12:22.000Z",
-            message: {
-              id: MessageId.make("assistant-final-body"),
-              role: "assistant",
-              text: "Second final section.",
-              turnId: "turn-1" as never,
-              createdAt: "2026-03-17T19:12:22.000Z",
-              updatedAt: "2026-03-17T19:12:23.000Z",
-              streaming: false,
-            },
-          },
-          {
-            id: "late-work-entry",
-            kind: "work",
-            createdAt: "2026-03-17T19:12:24.000Z",
-            entry: {
-              id: "late-work",
-              createdAt: "2026-03-17T19:12:24.000Z",
-              turnId: "turn-1" as never,
-              label: "Late tool status",
-              tone: "tool",
-            },
-          },
-        ]}
-      />,
-    );
-
-    expect(markup).toContain("Worked for");
-    expect(markup).toContain("I will inspect first.");
-    expect(markup).not.toContain("Ran command");
-    expect(markup).not.toContain("Late tool status");
-    expect(markup).toContain("First final section.");
-    expect(markup).toContain("Second final section.");
-  });
-
-  it("renders sub-agent wake messages as system tool-result rows", async () => {
-    const { MessagesTimeline } = await import("./MessagesTimeline");
-    const markup = renderToStaticMarkup(
-      <MessagesTimeline
-        {...buildProps()}
-        revertTurnCountByUserMessageId={new Map([[MessageId.make("system-message-1"), 1]])}
-        timelineEntries={[
-          {
-            id: "system-entry-1",
-            kind: "message",
-            createdAt: "2026-03-17T19:12:28.000Z",
-            message: {
-              id: MessageId.make("system-message-1"),
-              role: "system",
-              text: "[sub-agent child-1 completed] done",
-              turnId: null,
-              createdAt: "2026-03-17T19:12:28.000Z",
-              updatedAt: "2026-03-17T19:12:28.000Z",
-              streaming: false,
-            },
-          },
-        ]}
-      />,
-    );
-
-    expect(markup).toContain('data-message-role="system"');
-    expect(markup).toContain("Sub-agent result");
-    expect(markup).toContain("[sub-agent child-1 completed] done");
-    expect(markup).toContain("lucide-hammer");
-    expect(markup).toContain('aria-label="Revert to this message"');
-  });
-
-  it("formats changed file paths from the workspace root", async () => {
-    const { MessagesTimeline } = await import("./MessagesTimeline");
+  it("formats changed file paths from the workspace root", () => {
     const markup = renderToStaticMarkup(
       <MessagesTimeline
         {...buildProps()}
@@ -766,8 +580,7 @@ describe("MessagesTimeline", () => {
     expect(markup).not.toContain("C:/Users/mike/dev-stuff/t3code/apps/web/src/session-logic.ts");
   });
 
-  it("renders review comment contexts as structured cards instead of raw tags", async () => {
-    const { MessagesTimeline } = await import("./MessagesTimeline");
+  it("renders review comment contexts as structured cards instead of raw tags", () => {
     const markup = renderToStaticMarkup(
       <MessagesTimeline
         {...buildProps()}
@@ -807,8 +620,7 @@ describe("MessagesTimeline", () => {
     expect(markup).not.toContain("&lt;/review_comment&gt;");
   });
 
-  it("renders file review comments as source code instead of diffs", async () => {
-    const { MessagesTimeline } = await import("./MessagesTimeline");
+  it("renders file review comments as source code instead of diffs", () => {
     const markup = renderToStaticMarkup(
       <MessagesTimeline
         {...buildProps()}
@@ -845,8 +657,7 @@ describe("MessagesTimeline", () => {
     expect(markup).not.toContain('data-testid="file-diff"');
   });
 
-  it("renders a failure marker for failed tool lifecycle entries", async () => {
-    const { MessagesTimeline } = await import("./MessagesTimeline");
+  it("renders a failure marker for failed tool lifecycle entries", () => {
     const markup = renderToStaticMarkup(
       <MessagesTimeline
         {...buildProps()}

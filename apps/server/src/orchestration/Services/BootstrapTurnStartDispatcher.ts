@@ -687,7 +687,15 @@ export const layer = Layer.effect(
             bootstrap.prepareWorktree.workspaceRelativePath,
           );
           let worktreeBaseRef = bootstrap.prepareWorktree.baseBranch;
-          if (bootstrap.prepareWorktree.startFromOrigin) {
+          // Repositories without an origin remote fall back to the local base
+          // branch even when the stored preference says to start from origin.
+          const startFromOrigin =
+            bootstrap.prepareWorktree.startFromOrigin === true &&
+            (yield* gitWorkflow.remoteExists({
+              cwd: bootstrap.prepareWorktree.projectCwd,
+              remoteName: "origin",
+            }));
+          if (startFromOrigin) {
             yield* gitWorkflow.fetchRemote({
               cwd: bootstrap.prepareWorktree.projectCwd,
               remoteName: "origin",

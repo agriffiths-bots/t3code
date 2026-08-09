@@ -3,7 +3,6 @@ import { DEFAULT_UNIFIED_SETTINGS, type UnifiedSettings } from "@t3tools/contrac
 import { describe, expect, it } from "vite-plus/test";
 import { deriveProviderInstanceEntries } from "./providerInstances";
 import {
-  getAppModelOptions,
   getAppModelOptionsForInstance,
   resolveAppModelSelectionForInstance,
   resolveAppModelSelectionState,
@@ -13,7 +12,6 @@ function provider(input: {
   provider?: ProviderDriverKind;
   instanceId: string;
   models?: ReadonlyArray<string>;
-  defaultModel?: string;
 }): ServerProvider {
   const driver =
     input.provider ??
@@ -34,7 +32,6 @@ function provider(input: {
       name: slug,
       isCustom: false,
       capabilities: {},
-      ...(slug === input.defaultModel ? { isDefault: true } : {}),
     })),
     slashCommands: [],
     skills: [],
@@ -58,6 +55,24 @@ function settingsWithProviderInstances(): UnifiedSettings {
 }
 
 describe("instance-scoped model selection", () => {
+  it("preserves server-provided legacy model metadata", () => {
+    const baseProvider = provider({
+      instanceId: "claudeAgent",
+      models: ["claude-opus-4-8"],
+    });
+    const providers = [
+      {
+        ...baseProvider,
+        models: [{ ...baseProvider.models[0]!, isLegacy: true }],
+      },
+    ];
+    const stock = deriveProviderInstanceEntries(providers)[0]!;
+
+    expect(getAppModelOptionsForInstance(settingsWithProviderInstances(), stock)[0]?.isLegacy).toBe(
+      true,
+    );
+  });
+
   it("keeps custom models on the provider instance that declared them", () => {
     const providers = [
       provider({
@@ -135,73 +150,6 @@ describe("instance-scoped model selection", () => {
         "opus",
       ),
     ).toBe("opus");
-  });
-
-  it("migrates an exact retired Opus 4.8 selection outside an existing session", () => {
-    const providers = [
-      provider({
-        provider: ProviderDriverKind.make("claudeAgent"),
-        instanceId: "claudeAgent",
-        models: ["claude-opus-5", "claude-sonnet-4-6"],
-        defaultModel: "claude-sonnet-4-6",
-      }),
-    ];
-
-    expect(
-      resolveAppModelSelectionForInstance(
-        ProviderInstanceId.make("claudeAgent"),
-        settingsWithProviderInstances(),
-        providers,
-        "claude-opus-4-8",
-      ),
-    ).toBe("claude-opus-5");
-    expect(
-      resolveAppModelSelectionForInstance(
-        ProviderInstanceId.make("claudeAgent"),
-        settingsWithProviderInstances(),
-        providers,
-        "opus-4.8",
-      ),
-    ).toBe("claude-opus-5");
-  });
-
-  it("does not restore reserved Claude slugs from custom settings", () => {
-    const providers = [
-      provider({
-        provider: ProviderDriverKind.make("claudeAgent"),
-        instanceId: "claudeAgent",
-        models: ["claude-sonnet-4-6"],
-      }),
-    ];
-    const settings: UnifiedSettings = {
-      ...settingsWithProviderInstances(),
-      providerInstances: {
-        ...settingsWithProviderInstances().providerInstances,
-        [ProviderInstanceId.make("claudeAgent")]: {
-          driver: ProviderDriverKind.make("claudeAgent"),
-          config: {
-            customModels: [
-              "claude-opus-5",
-              "claude-fable-5",
-              "claude-opus-4-7",
-              "claude-opus-4-8",
-              "kept-custom",
-            ],
-          },
-        },
-      },
-    };
-    const stock = deriveProviderInstanceEntries(providers)[0]!;
-
-    expect(getAppModelOptionsForInstance(settings, stock).map((option) => option.slug)).toEqual([
-      "claude-sonnet-4-6",
-      "kept-custom",
-    ]);
-    expect(
-      getAppModelOptions(settings, providers, ProviderDriverKind.make("claudeAgent")).map(
-        (option) => option.slug,
-      ),
-    ).toEqual(["claude-sonnet-4-6", "kept-custom"]);
   });
 
   it("includes Grok custom models from the selected provider instance", () => {

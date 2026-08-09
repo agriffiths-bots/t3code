@@ -24,8 +24,8 @@ import * as ServerConfig from "../config.ts";
 import * as DeviceNotifications from "./DeviceNotifications.ts";
 import * as WebPushEndpointGuard from "./WebPushEndpointGuard.ts";
 
-const decodeJson = Schema.decodeUnknownSync(Schema.UnknownFromJsonString);
-const encodeJson = Schema.encodeSync(Schema.UnknownFromJsonString);
+const decodeJson = Schema.decodeUnknownSync(Schema.fromJsonString(Schema.Unknown));
+const encodeJson = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
 
 const TEST_PUSH_SERVER_KEY = `-----BEGIN PRIVATE KEY-----
 MIIEvAIBADANBgkqhkiG9w0BAQEFAASCBKYwggSiAgEAAoIBAQCn9YCqyzB0eWu4

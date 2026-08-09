@@ -16,20 +16,35 @@ const stackedExitStyle = {
 } satisfies CSSProperties;
 const restingStyle = {
   opacity: 1,
-  transform: "translate3d(0, 0, 0)",
+  transform: "none",
 } satisfies CSSProperties;
 const exitTransitionStyle = {
   transition: `transform ${DISMISS_TRANSITION_MS}ms ease-in, opacity ${DISMISS_TRANSITION_MS}ms ease-in`,
-  willChange: "transform, opacity",
 } satisfies CSSProperties;
+
+// The collapsed cap peeking above the front banner is the only hint that more
+// banners are stacked behind it, so its border must match the severity of the
+// first hidden banner — a neutral banner must not masquerade as a warning.
+const stackCapBorderClass: Record<ComposerBannerStackItem["variant"], string> = {
+  default: "border-border",
+  error: "border-destructive/24",
+  info: "border-info/24",
+  success: "border-success/24",
+  warning: "border-warning/24",
+};
 
 export interface ComposerBannerStackItem {
   readonly id: string;
-  readonly variant: "error" | "info" | "success" | "warning";
+  readonly variant: "default" | "error" | "info" | "success" | "warning";
+  // Ordering hint for stack assemblers: front this banner even though its
+  // variant is calm (e.g. live update progress). The stack itself ignores it.
+  readonly urgent?: boolean;
   readonly icon: ReactNode;
   readonly title: ReactNode;
   readonly description?: ReactNode;
   readonly actions?: ReactNode;
+  readonly className?: string;
+  readonly actionClassName?: string;
   readonly dismissLabel?: string;
   readonly onDismiss?: () => void;
 }
@@ -66,6 +81,7 @@ export function ComposerBannerStack({ className, items }: ComposerBannerStackPro
   const stackedItems = items.slice(1);
   const hasStack = stackedItems.length > 0;
   const showCollapsedStackCap = hasStack && exitingItemId !== frontItem.id;
+  const firstStackedItem = stackedItems[0];
 
   const requestDismiss = (item: ComposerBannerStackItem) => {
     if (!item.onDismiss || exitingItemId) {
@@ -89,11 +105,12 @@ export function ComposerBannerStack({ className, items }: ComposerBannerStackPro
           hasStack ? "group-hover/banner-stack:z-50 group-focus-within/banner-stack:z-50" : null,
         )}
       >
-        {showCollapsedStackCap ? (
+        {showCollapsedStackCap && firstStackedItem ? (
           <div
             className={cn(
-              "pointer-events-none absolute inset-x-0 -top-3 z-0 mx-auto h-3 rounded-t-xl",
-              "border border-b-0 border-warning/24 bg-background/96 shadow-[0_6px_18px_rgba(0,0,0,0.06)]",
+              "pointer-events-none absolute inset-x-0 -top-3 z-0 mx-auto h-3 rounded-t-[22px]",
+              "border border-b-0 bg-background/96 shadow-[0_6px_18px_rgba(0,0,0,0.06)]",
+              stackCapBorderClass[firstStackedItem.variant],
               "transition-opacity duration-150 ease-out",
               "group-hover/banner-stack:opacity-0 group-focus-within/banner-stack:opacity-0",
             )}
@@ -171,17 +188,22 @@ function ComposerBannerStackAlert({
   const dismissOnly = item.onDismiss && !item.actions;
 
   return (
-    <Alert variant={item.variant}>
+    <Alert
+      variant={item.variant}
+      className={cn("alert-glass rounded-[22px]", item.className)}
+      data-variant={item.variant}
+    >
       {item.icon}
       <AlertTitle>{item.title}</AlertTitle>
       {item.description ? <AlertDescription>{item.description}</AlertDescription> : null}
       {item.actions || item.onDismiss ? (
         <AlertAction
-          className={
+          className={cn(
+            item.actionClassName,
             dismissOnly
               ? "max-sm:col-start-3 max-sm:row-start-1 max-sm:mt-0 max-sm:self-start"
-              : undefined
-          }
+              : undefined,
+          )}
         >
           {item.actions}
           {item.onDismiss ? (

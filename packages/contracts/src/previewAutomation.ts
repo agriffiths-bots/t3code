@@ -11,18 +11,41 @@ import {
 } from "./preview.ts";
 
 const BoundedUrl = Schema.String.check(Schema.isTrimmed())
-  .check(
-    Schema.isNonEmpty({
-      description:
-        "Absolute http(s) URL or a schemeless host such as t3.chat or localhost:5173. Schemeless public hosts use https; loopback hosts use http.",
-    }),
-  )
+  .check(Schema.isNonEmpty())
   .check(Schema.isMaxLength(2048));
+const URL_GUIDANCE =
+  "Absolute http(s) URL or a schemeless host such as t3.chat or localhost:5173. Schemeless public hosts use https; loopback hosts use http.";
 const OptionalTimeoutMs = Schema.optional(
   Schema.Int.check(Schema.isGreaterThan(0))
     .check(Schema.isLessThanOrEqualTo(60_000))
     .annotate({ description: "Maximum wait in milliseconds. Defaults to 15000; maximum 60000." }),
 ).annotate({ description: "Maximum wait in milliseconds. Defaults to 15000; maximum 60000." });
+
+/** Operations understood by desktop hosts predating viewport resizing. */
+export const PREVIEW_AUTOMATION_V1_OPERATIONS = [
+  "status",
+  "open",
+  "navigate",
+  "snapshot",
+  "click",
+  "type",
+  "press",
+  "scroll",
+  "evaluate",
+  "waitFor",
+  "recordingStart",
+  "recordingStop",
+] as const;
+
+/** Advertised by current desktop hosts for mixed-version routing. */
+export const PREVIEW_AUTOMATION_OPERATIONS = [
+  ...PREVIEW_AUTOMATION_V1_OPERATIONS,
+  "resize",
+  "setColorScheme",
+] as const;
+
+export const PreviewAutomationOperation = Schema.Literals(PREVIEW_AUTOMATION_OPERATIONS);
+export type PreviewAutomationOperation = typeof PreviewAutomationOperation.Type;
 
 const PreviewAutomationTabTargetFields = {
   tabId: Schema.optional(
@@ -62,12 +85,18 @@ export type PreviewAutomationStatus = typeof PreviewAutomationStatus.Type;
 export const PreviewAutomationOpenInput = Schema.Struct({
   ...PreviewAutomationTabTargetFields,
   url: Schema.optional(BoundedUrl).annotate({
-    description:
-      "Optional initial page URL, for example https://t3.chat or localhost:5173. Omit to open a blank tab.",
+    description: `Optional initial page URL. ${URL_GUIDANCE} Omit to open a blank tab.`,
   }),
+  open: Schema.optional(
+    Schema.Boolean.annotate({
+      description:
+        "Whether to open the thread-bound inline preview for the human. Defaults to true; set false for background-only automation.",
+    }),
+  ),
   show: Schema.optional(
     Schema.Boolean.annotate({
-      description: "Whether to reveal the preview panel to the human. Defaults to true.",
+      description:
+        "Deprecated alias for open. Whether to reveal the thread-bound inline preview to the human.",
     }),
   ),
   reuseExistingTab: Schema.optional(
@@ -96,7 +125,7 @@ export const BrowserNavigationTarget = Schema.Union([
       description: "Selects direct URL navigation.",
     }),
     url: BoundedUrl.annotate({
-      description: "Direct website URL.",
+      description: `Direct website URL. ${URL_GUIDANCE}`,
     }),
   }),
   Schema.Struct({
@@ -123,8 +152,7 @@ export type BrowserNavigationTarget = typeof BrowserNavigationTarget.Type;
 export const PreviewAutomationNavigateInput = Schema.Struct({
   ...PreviewAutomationTabTargetFields,
   url: Schema.optional(BoundedUrl).annotate({
-    description:
-      "Website URL, for example https://t3.chat. Use this for public pages and directly reachable URLs.",
+    description: `Website URL. ${URL_GUIDANCE} Use this for public pages and directly reachable URLs.`,
   }),
   target: Schema.optional(
     BrowserNavigationTarget.annotate({
@@ -233,6 +261,29 @@ export const PreviewAutomationResizeResult = Schema.Struct({
   viewport: PreviewRenderedViewportSize,
 });
 export type PreviewAutomationResizeResult = typeof PreviewAutomationResizeResult.Type;
+
+/** Mirrors DesktopPreviewColorScheme; declared here to keep this module free of ipc.ts imports. */
+export const PreviewAutomationColorScheme = Schema.Literals(["system", "light", "dark"]);
+export type PreviewAutomationColorScheme = typeof PreviewAutomationColorScheme.Type;
+
+export const PreviewAutomationSetColorSchemeInput = Schema.Struct({
+  ...PreviewAutomationTabTargetFields,
+  colorScheme: PreviewAutomationColorScheme.annotate({
+    description:
+      "Emulated prefers-color-scheme for the page: light, dark, or system to follow the OS appearance.",
+  }),
+}).annotate({
+  description:
+    "Emulates prefers-color-scheme in the active browser tab without changing the OS or app theme.",
+});
+export type PreviewAutomationSetColorSchemeInput = typeof PreviewAutomationSetColorSchemeInput.Type;
+
+export const PreviewAutomationSetColorSchemeResult = Schema.Struct({
+  tabId: PreviewTabId,
+  colorScheme: PreviewAutomationColorScheme,
+});
+export type PreviewAutomationSetColorSchemeResult =
+  typeof PreviewAutomationSetColorSchemeResult.Type;
 
 const Locator = TrimmedNonEmptyString.annotate({
   description:

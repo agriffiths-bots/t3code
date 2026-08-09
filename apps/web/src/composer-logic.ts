@@ -11,15 +11,11 @@ export interface ComposerTrigger {
   rangeEnd: number;
 }
 
-// A coarse pointer means an on-screen keyboard, where Enter has to insert a
-// newline rather than send — the viewport check alone misses tablets and
-// 2-in-1s held in landscape, whose viewport is wider than the mobile breakpoint.
 export function shouldSubmitComposerOnEnter(input: {
   isMobileViewport: boolean;
   shiftKey: boolean;
-  hasCoarsePointer?: boolean;
 }): boolean {
-  return !input.isMobileViewport && !input.hasCoarsePointer && !input.shiftKey;
+  return !input.isMobileViewport && !input.shiftKey;
 }
 
 const isInlineTokenSegment = (

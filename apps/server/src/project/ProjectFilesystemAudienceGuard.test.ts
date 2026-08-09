@@ -101,6 +101,7 @@ const makeProjectionLayer = (input: {
         threads: input.threads,
       } as unknown as OrchestrationReadModel),
     getSnapshot: () => Effect.die("unused"),
+    searchThreads: () => Effect.die("unused"),
     getShellSnapshot: () =>
       currentReadAudienceCeiling.pipe(
         Effect.map((audienceCeiling) => ({

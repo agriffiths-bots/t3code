@@ -6,10 +6,11 @@ import {
   appendVersionMismatchHint,
   buildVersionMismatchDismissalKey,
   dismissVersionMismatch,
-  formatVersionWithBuildSha,
   isVersionMismatchDismissed,
   resolveServerConfigVersionMismatch,
+  resolveServerSelfUpdateCapability,
   resolveVersionMismatch,
+  serverUpdateGuidance,
 } from "./versionSkew";
 
 describe("versionSkew", () => {
@@ -22,36 +23,6 @@ describe("versionSkew", () => {
       clientVersion: APP_VERSION,
       serverVersion: "9.9.9",
       hint: "Version mismatch. Try syncing the client and server to the same T3 Code version.",
-    });
-  });
-
-  it("does not warn when stamped client and server builds share the same sha", () => {
-    const buildSha = "d7b6e15ecd7b6e15ecd7b6e15ecd7b6e15ecd7b6";
-
-    expect(
-      resolveVersionMismatch("0.0.28", {
-        clientVersion: "0.0.29-nightly.20260708.26",
-        clientBuildSha: buildSha,
-        serverBuildSha: buildSha,
-      }),
-    ).toBeNull();
-  });
-
-  it("warns when stamped client and server builds have different shas", () => {
-    const clientBuildSha = "d7b6e15ecd7b6e15ecd7b6e15ecd7b6e15ecd7b6";
-    const serverBuildSha = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
-
-    expect(
-      resolveVersionMismatch("0.0.29-nightly.20260708.26", {
-        clientVersion: "0.0.29-nightly.20260708.26",
-        clientBuildSha,
-        serverBuildSha,
-      }),
-    ).toMatchObject({
-      clientVersion: "0.0.29-nightly.20260708.26",
-      serverVersion: "0.0.29-nightly.20260708.26",
-      clientBuildSha,
-      serverBuildSha,
     });
   });
 
@@ -99,35 +70,41 @@ describe("versionSkew", () => {
     ).toBe(false);
   });
 
-  it("includes build shas in dismissal keys when present", () => {
-    const environmentId = EnvironmentId.make("environment-build-dismissal");
-    const clientBuildSha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-    const serverBuildSha = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
-
-    expect(
-      buildVersionMismatchDismissalKey(environmentId, {
-        clientVersion: "1.0.0",
-        serverVersion: "1.0.0",
-        clientBuildSha,
-        serverBuildSha,
-      }),
-    ).toBe(`${environmentId}:1.0.0@${clientBuildSha}:1.0.0@${serverBuildSha}`);
-  });
-
-  it("formats versions with short build shas", () => {
-    expect(
-      formatVersionWithBuildSha(
-        "0.0.29-nightly.20260708.26",
-        "d7b6e15ecd7b6e15ecd7b6e15ecd7b6e15ecd7b6",
-      ),
-    ).toBe("0.0.29-nightly.20260708.26 (sha d7b6e15e)");
-  });
-
   it("appends a hint to connection errors when versions differ", () => {
     const mismatch = resolveVersionMismatch("9.9.9");
 
     expect(appendVersionMismatchHint("Socket closed.", mismatch)).toBe(
       "Socket closed. Hint: Version mismatch. Try syncing the client and server to the same T3 Code version.",
+    );
+  });
+
+  it("reads desktop-managed update capabilities from config descriptors", () => {
+    expect(
+      resolveServerSelfUpdateCapability({
+        environment: {
+          environmentId: EnvironmentId.make("environment-desktop"),
+          label: "Desktop",
+          platform: { os: "darwin", arch: "arm64" },
+          serverVersion: "9.9.9",
+          capabilities: {
+            repositoryIdentity: true,
+            serverSelfUpdate: "desktop-managed",
+          },
+        },
+      }),
+    ).toBe("desktop-managed");
+    expect(resolveServerSelfUpdateCapability(null)).toBeNull();
+  });
+
+  it("matches version-drift guidance to the advertised update path", () => {
+    expect(serverUpdateGuidance("respawn", "Remote server")).toBe(
+      "Update the Remote server so they stay in sync.",
+    );
+    expect(serverUpdateGuidance("desktop-managed", "Desktop server")).toBe(
+      "The Desktop server is run by the T3 Code desktop app on its machine — update the desktop app there to sync them.",
+    );
+    expect(serverUpdateGuidance(null, "Local server")).toBe(
+      "Relaunch the Local server with the copied command to sync them.",
     );
   });
 });

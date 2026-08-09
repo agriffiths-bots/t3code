@@ -24,26 +24,6 @@ describe("shouldSubmitComposerOnEnter", () => {
   it("inserts a newline for Shift+Enter", () => {
     expect(shouldSubmitComposerOnEnter({ isMobileViewport: false, shiftKey: true })).toBe(false);
   });
-
-  it("inserts a newline on a wide touch device, where Enter comes from an on-screen keyboard", () => {
-    expect(
-      shouldSubmitComposerOnEnter({
-        isMobileViewport: false,
-        hasCoarsePointer: true,
-        shiftKey: false,
-      }),
-    ).toBe(false);
-  });
-
-  it("still submits on a wide fine-pointer device", () => {
-    expect(
-      shouldSubmitComposerOnEnter({
-        isMobileViewport: false,
-        hasCoarsePointer: false,
-        shiftKey: false,
-      }),
-    ).toBe(true);
-  });
 });
 
 describe("detectComposerTrigger", () => {
@@ -266,12 +246,21 @@ describe("collapseExpandedComposerCursor", () => {
     );
   });
 
-  it("keeps replacement cursors aligned when another mention already exists earlier", () => {
+  it("keeps package-like text expanded when another mention already exists earlier", () => {
     const text = "open @AGENTS.md then @src/index.ts ";
     const expandedCursor = text.length;
     const collapsedCursor = collapseExpandedComposerCursor(text, expandedCursor);
 
-    expect(collapsedCursor).toBe("open ".length + 1 + " then ".length + 2);
+    expect(collapsedCursor).toBe("open ".length + 1 + " then @src/index.ts ".length);
+    expect(expandCollapsedComposerCursor(text, collapsedCursor)).toBe(expandedCursor);
+  });
+
+  it("collapses only genuine mentions when package-like text exists earlier", () => {
+    const text = "install @scope/pkg then @README.md ";
+    const expandedCursor = text.length;
+    const collapsedCursor = collapseExpandedComposerCursor(text, expandedCursor);
+
+    expect(collapsedCursor).toBe("install @scope/pkg then ".length + 1 + " ".length);
     expect(expandCollapsedComposerCursor(text, collapsedCursor)).toBe(expandedCursor);
   });
 

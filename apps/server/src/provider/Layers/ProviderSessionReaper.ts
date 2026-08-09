@@ -28,6 +28,7 @@ import {
   ProviderSessionReaper,
   type ProviderSessionReaperShape,
 } from "../Services/ProviderSessionReaper.ts";
+import { forkParked } from "../../serverActivation.ts";
 import { ProviderService } from "../Services/ProviderService.ts";
 import {
   PROVIDER_SESSION_CLOSED_DURING_TURN_ERROR,
@@ -839,6 +840,18 @@ const makeProviderSessionReaper = (options?: ProviderSessionReaperLiveOptions) =
           continue;
         }
 
+        // A turn can settle while subagents, workflows, or monitors continue
+        // inside the provider process. Stopping that idle-looking session would
+        // silently kill the still-live background work.
+        if (latestThread?.backgroundLiveness != null) {
+          yield* Effect.logDebug("provider.session.reaper.skipped-background-work", {
+            threadId: binding.threadId,
+            backgroundLiveness: latestThread.backgroundLiveness,
+            idleDurationMs,
+          });
+          continue;
+        }
+
         const stopInactiveSession = providerService.stopInactiveSession;
         if (stopInactiveSession === undefined) {
           yield* Effect.logWarning("provider.session.reaper.stop-skipped-unavailable", {
@@ -883,7 +896,7 @@ const makeProviderSessionReaper = (options?: ProviderSessionReaperLiveOptions) =
       // A counter whose turn was not re-observed as stuck this sweep belongs
       // to a turn that completed, was stopped, or was cleaned another way —
       // drop it so transient cleanup failures cannot grow the map unboundedly.
-      for (const key of [...cleanupNoopSweeps.keys()]) {
+      for (const key of cleanupNoopSweeps.keys()) {
         if (!noopKeysTouchedThisSweep.has(key)) {
           cleanupNoopSweeps.delete(key);
         }
@@ -899,7 +912,7 @@ const makeProviderSessionReaper = (options?: ProviderSessionReaperLiveOptions) =
 
     const start: ProviderSessionReaperShape["start"] = () =>
       Effect.gen(function* () {
-        yield* Effect.forkScoped(
+        yield* forkParked(
           sweep.pipe(
             Effect.catch((error: unknown) =>
               Effect.logWarning("provider.session.reaper.sweep-failed", {

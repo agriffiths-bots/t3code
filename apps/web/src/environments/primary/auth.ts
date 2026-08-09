@@ -8,15 +8,8 @@ import type {
   AuthSessionId,
   AuthSessionState,
 } from "@t3tools/contracts";
-import {
-  EnvironmentAuthInvalidReason,
-  EnvironmentHttpCommonError,
-  PRIMARY_LOCAL_ENVIRONMENT_ID,
-} from "@t3tools/contracts";
-import type {
-  EnvironmentAuthInvalidReason as EnvironmentAuthInvalidReasonType,
-  EnvironmentHttpCommonError as EnvironmentHttpCommonErrorType,
-} from "@t3tools/contracts";
+import { EnvironmentHttpCommonError, PRIMARY_LOCAL_ENVIRONMENT_ID } from "@t3tools/contracts";
+import type { EnvironmentHttpCommonError as EnvironmentHttpCommonErrorType } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
@@ -80,20 +73,10 @@ export class PrimaryEnvironmentPairingCredentialRejectedError extends Schema.Tag
   "PrimaryEnvironmentPairingCredentialRejectedError",
   {
     providedLength: Schema.Number,
-    reason: EnvironmentAuthInvalidReason,
     cause: Schema.Defect(),
   },
 ) {
   override get message(): string {
-    switch (this.reason) {
-      case "expired_credential":
-        return "That pairing token has expired. Create a new pairing token and try again.";
-      case "consumed_credential":
-        return "That pairing token was already used. Create a new pairing token and try again.";
-      case "missing_credential":
-      case "invalid_credential":
-        break;
-    }
     return "Invalid pairing token. Check the token and try again.";
   }
 }
@@ -134,17 +117,6 @@ export const isPrimaryEnvironmentPairingCredentialRequiredError = Schema.is(
 );
 
 const isEnvironmentHttpCommonError = Schema.is(EnvironmentHttpCommonError);
-
-function isBootstrapCredentialRejectionReason(reason: EnvironmentAuthInvalidReasonType): boolean {
-  switch (reason) {
-    case "invalid_credential":
-    case "expired_credential":
-    case "consumed_credential":
-      return true;
-    case "missing_credential":
-      return false;
-  }
-}
 
 export interface ServerPairingLinkRecord {
   readonly id: string;
@@ -271,11 +243,10 @@ async function exchangeBootstrapCredential(credential: string): Promise<AuthBrow
       if (
         isEnvironmentHttpCommonError(error) &&
         error._tag === "EnvironmentAuthInvalidError" &&
-        isBootstrapCredentialRejectionReason(error.reason)
+        error.reason === "invalid_credential"
       ) {
         throw new PrimaryEnvironmentPairingCredentialRejectedError({
           providedLength: credential.length,
-          reason: error.reason,
           cause: error,
         });
       }
