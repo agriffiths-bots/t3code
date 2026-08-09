@@ -364,12 +364,15 @@ async function assertCredentialedManifestInstallability(
     await page.goto(baseUrl, { timeout: 30_000, waitUntil: "domcontentloaded" });
     await page.evaluate<true>(`
       "serviceWorker" in navigator
-        ? Promise.race([
-            navigator.serviceWorker.ready.then(() => true),
-            new Promise((_, reject) =>
-              setTimeout(() => reject(new Error("service worker ready timeout")), 15000),
-            ),
-          ])
+        ? (async () => {
+            await navigator.serviceWorker.register("/sw.js", { scope: "/" });
+            return await Promise.race([
+              navigator.serviceWorker.ready.then(() => true),
+              new Promise((_, reject) =>
+                setTimeout(() => reject(new Error("service worker ready timeout")), 15000),
+              ),
+            ]);
+          })()
         : Promise.reject(new Error("service workers are unavailable"))
     `);
 
