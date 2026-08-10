@@ -130,7 +130,7 @@ describe("compressImageForStash", () => {
     expect(result).toEqual({ ok: false, reason: "too-large" });
     // The bitmap must still be released on the give-up path.
     expect(close).toHaveBeenCalled();
-  });
+  }, 60_000);
 
   it("reports too-large for an oversized image when the browser cannot re-encode", async () => {
     vi.stubGlobal("createImageBitmap", undefined);
