@@ -295,7 +295,7 @@ jobs:
 
   test:
     name: Test
-    runs-on: blacksmith-8vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04
     # The preserved fork coordinator suite deliberately covers real 20-42 second
     # timeout races and already required this allowance before the upstream sync.
     timeout-minutes: 20
@@ -350,7 +350,7 @@ jobs:
 
   mobile_native_static_analysis:
     name: Mobile Native Static Analysis
-    runs-on: blacksmith-6vcpu-macos-26
+    runs-on: macos-latest
     timeout-minutes: 10
     steps:
       - name: Checkout
