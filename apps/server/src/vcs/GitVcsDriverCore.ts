@@ -269,43 +269,6 @@ function parseWorktreeBranchPaths(stdout: string): ReadonlyMap<string, string> {
   return worktreePaths;
 }
 
-interface GitRefListEntry {
-  readonly fullName: string;
-  readonly lastCommit: number;
-}
-
-function parseBranchListEntries(stdout: string): ReadonlyArray<GitRefListEntry> {
-  return Arr.filterMap(stdout.split("\n"), (line) => {
-    let branchName = line.trim();
-    if (branchName.startsWith("*") || branchName.startsWith("+")) {
-      branchName = branchName.slice(1).trim();
-    }
-    if (!branchName || branchName.startsWith("(")) {
-      return Result.failVoid;
-    }
-    return Result.succeed({
-      fullName: `refs/heads/${branchName}`,
-      lastCommit: 0,
-    });
-  });
-}
-
-function parseRemoteBranchListEntries(stdout: string): ReadonlyArray<GitRefListEntry> {
-  return Arr.filterMap(stdout.split("\n"), (line) => {
-    let branchName = line.trim();
-    if (branchName.startsWith("*") || branchName.startsWith("+")) {
-      branchName = branchName.slice(1).trim();
-    }
-    if (!branchName || branchName.startsWith("(") || branchName.includes(" -> ")) {
-      return Result.failVoid;
-    }
-    return Result.succeed({
-      fullName: `refs/remotes/${branchName}`,
-      lastCommit: 0,
-    });
-  });
-}
-
 function splitNullSeparatedPaths(input: string, truncated: boolean): string[] {
   const parts = input.split("\0");
   if (parts.length === 0) return [];
@@ -456,17 +419,6 @@ function isMissingGitCwdError(error: GitCommandError): boolean {
 
 function isNonRepositoryGitStderr(stderr: string): boolean {
   return stderr.toLowerCase().includes("not a git repository");
-}
-
-function isBrokenRefGitStderr(stderr: string): boolean {
-  const normalized = stderr.toLowerCase();
-  return (
-    normalized.includes("refs/") &&
-    (normalized.includes("missing object") ||
-      normalized.includes("bad object") ||
-      normalized.includes("bad ref") ||
-      normalized.includes("reference broken"))
-  );
 }
 function isUnbornHeadStderr(stderr: string): boolean {
   return (
@@ -2491,22 +2443,20 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
     const fetchCwd =
       path.basename(gitCommonDir) === ".git" ? path.dirname(gitCommonDir) : gitCommonDir;
     const gitDirArgs = ["--git-dir", gitCommonDir] as const;
-    const snapshotRefArgs = [
-      ...gitDirArgs,
-      "for-each-ref",
-      "--format=%(refname)%09%(committerdate:unix)%09%(symref)",
-      "refs/heads",
-      "refs/remotes",
-    ] as const;
     const [refsResult, defaultRefResult, worktreeListResult, remoteNamesResult] = yield* Effect.all(
       [
         executeGitWithStableDiagnostics(
           "GitVcsDriver.listRefs.snapshotRefs",
           fetchCwd,
-          snapshotRefArgs,
+          [
+            ...gitDirArgs,
+            "for-each-ref",
+            "--format=%(refname)%09%(committerdate:unix)%09%(symref)",
+            "refs/heads",
+            "refs/remotes",
+          ],
           {
             timeoutMs: 30_000,
-            allowNonZeroExit: true,
             maxOutputBytes: 16 * 1024 * 1024,
             fallbackErrorDetail: "Git ref snapshot enumeration failed.",
           },
@@ -2537,70 +2487,6 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
       ],
       { concurrency: 2 },
     );
-
-    let refsStdout = refsResult.stdout;
-    if (refsResult.exitCode !== 0) {
-      if (!isBrokenRefGitStderr(refsResult.stderr)) {
-        return yield* new GitCommandError({
-          ...gitCommandContext({
-            operation: "GitVcsDriver.listRefs.snapshotRefs",
-            cwd: fetchCwd,
-            args: snapshotRefArgs,
-          }),
-          detail: "Git ref snapshot enumeration failed.",
-          exitCode: refsResult.exitCode,
-          stdoutLength: refsResult.stdout.length,
-          stderrLength: refsResult.stderr.length,
-        });
-      }
-
-      const [localFallback, remoteFallback] = yield* Effect.all(
-        [
-          executeGitWithStableDiagnostics(
-            "GitVcsDriver.listRefs.localBranchFallback",
-            fetchCwd,
-            [...gitDirArgs, "branch", "--no-color", "--no-column"],
-            { timeoutMs: 10_000, allowNonZeroExit: true },
-          ),
-          executeGitWithStableDiagnostics(
-            "GitVcsDriver.listRefs.remoteBranchFallback",
-            fetchCwd,
-            [...gitDirArgs, "branch", "--remotes", "--no-color", "--no-column"],
-            { timeoutMs: 10_000, allowNonZeroExit: true },
-          ),
-        ],
-        { concurrency: 2 },
-      );
-      if (localFallback.exitCode !== 0) {
-        return yield* new GitCommandError({
-          ...gitCommandContext({
-            operation: "GitVcsDriver.listRefs.snapshotRefs",
-            cwd: fetchCwd,
-            args: snapshotRefArgs,
-          }),
-          detail: "Git ref snapshot enumeration failed.",
-          exitCode: localFallback.exitCode,
-          stdoutLength: localFallback.stdout.length,
-          stderrLength: localFallback.stderr.length,
-        });
-      }
-      if (remoteFallback.exitCode !== 0) {
-        yield* Effect.logWarning("Git remote ref fallback failed; using local refs only.", {
-          exitCode: remoteFallback.exitCode,
-          stdoutLength: remoteFallback.stdout.length,
-          stderrLength: remoteFallback.stderr.length,
-        });
-      }
-      const fallbackEntries = [
-        ...parseBranchListEntries(localFallback.stdout),
-        ...(remoteFallback.exitCode === 0
-          ? parseRemoteBranchListEntries(remoteFallback.stdout)
-          : []),
-      ];
-      refsStdout = fallbackEntries
-        .map((entry) => `${entry.fullName}\t${entry.lastCommit}\t`)
-        .join("\n");
-    }
 
     const remoteNames =
       remoteNamesResult.exitCode === 0 ? parseRemoteNames(remoteNamesResult.stdout) : [];
@@ -2633,7 +2519,7 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
     const localBranches: Array<{ readonly ref: VcsRef; readonly lastCommit: number }> = [];
     const remoteBranches: Array<{ readonly ref: VcsRef; readonly lastCommit: number }> = [];
 
-    for (const line of refsStdout.split("\n")) {
+    for (const line of refsResult.stdout.split("\n")) {
       if (line.length === 0) continue;
       const [fullRefName, lastCommitRaw, symbolicTarget] = line.split("\t");
       if (!fullRefName || symbolicTarget) continue;

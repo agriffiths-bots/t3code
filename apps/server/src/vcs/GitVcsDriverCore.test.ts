@@ -1244,58 +1244,6 @@ it.layer(TestLayer)("GitVcsDriver core integration", (it) => {
       }),
     );
 
-    it.effect("keeps local refs available when a remote-tracking ref is broken", () =>
-      Effect.gen(function* () {
-        const cwd = yield* makeTmpDir();
-        const { initialBranch } = yield* initRepoWithCommit(cwd);
-        yield* git(cwd, ["update-ref", `refs/remotes/origin/${initialBranch}`, "HEAD"]);
-        const fileSystem = yield* FileSystem.FileSystem;
-        const pathService = yield* Path.Path;
-        const brokenRefPath = pathService.join(cwd, ".git", "refs", "remotes", "origin", "broken");
-        yield* fileSystem.makeDirectory(pathService.dirname(brokenRefPath), { recursive: true });
-        yield* fileSystem.writeFileString(
-          brokenRefPath,
-          "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n",
-        );
-        const driver = yield* GitVcsDriver.GitVcsDriver;
-
-        const refs = yield* driver.listRefs({ cwd, includeMatchingRemoteRefs: true });
-
-        assert.equal(refs.isRepo, true);
-        assert.equal(
-          refs.refs.some((ref) => ref.name === initialBranch && !ref.isRemote),
-          true,
-        );
-        assert.equal(
-          refs.refs.some((ref) => ref.name === `origin/${initialBranch}` && ref.isRemote),
-          true,
-        );
-      }),
-    );
-
-    it.effect("keeps healthy local refs available when a local ref target is missing", () =>
-      Effect.gen(function* () {
-        const cwd = yield* makeTmpDir();
-        const { initialBranch } = yield* initRepoWithCommit(cwd);
-        const fileSystem = yield* FileSystem.FileSystem;
-        const pathService = yield* Path.Path;
-        const brokenRefPath = pathService.join(cwd, ".git", "refs", "heads", "broken");
-        yield* fileSystem.writeFileString(
-          brokenRefPath,
-          "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n",
-        );
-        const driver = yield* GitVcsDriver.GitVcsDriver;
-
-        const refs = yield* driver.listRefs({ cwd });
-
-        assert.equal(refs.isRepo, true);
-        assert.equal(
-          refs.refs.some((ref) => ref.name === initialBranch && !ref.isRemote),
-          true,
-        );
-      }),
-    );
-
     it.effect("marks the origin default ref as default when no local copy exists", () =>
       Effect.gen(function* () {
         const cwd = yield* makeTmpDir();
