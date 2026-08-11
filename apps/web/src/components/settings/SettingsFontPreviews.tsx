@@ -151,12 +151,18 @@ const TERMINAL_PROMPT =
 // badge. Together the lines cover bold, dim, underline, the six accent
 // colors, and a background cell, so a font choice shows every SGR the
 // terminal actually renders.
+function terminalPreviewLocalUrl(): string {
+  return "http://127.0.0.1:5173/";
+}
+
 const TERMINAL_PREVIEW_TRANSCRIPT =
   `${TERMINAL_PROMPT}vpr dev\r\n` +
   "\r\n" +
   "  \x1b[1;32mVITE\x1b[0m \x1b[32mv7.1.1\x1b[0m  \x1b[2mready in\x1b[0m \x1b[1m1.24s\x1b[0m\r\n" +
   "\r\n" +
-  "  \x1b[32m→\x1b[0m  \x1b[2mLocal:\x1b[0m    \x1b[4;36mhttp://127.0.0.1:5173/\x1b[0m\r\n" +
+  "  \x1b[32m→\x1b[0m  \x1b[2mLocal:\x1b[0m    \x1b[4;36m" +
+  terminalPreviewLocalUrl() +
+  "\x1b[0m\r\n" +
   "  \x1b[32m→\x1b[0m  \x1b[2mNetwork:\x1b[0m  \x1b[4;36mhttp://192.168.1.24:5173/\x1b[0m\r\n" +
   "\r\n" +
   "  \x1b[32m✓ 85 passed\x1b[0m   \x1b[33m△ 2 warnings\x1b[0m   \x1b[31m✗ 0 failed\x1b[0m\r\n" +

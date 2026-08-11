@@ -17,6 +17,8 @@
   },
   "devDependencies": {
     "@effect/vitest": "catalog:",
+    "@jridgewell/gen-mapping": "0.3.13",
+    "@jridgewell/trace-mapping": "0.3.31",
     "@types/pngjs": "6.0.5",
     "vite-plus": "catalog:"
   }
