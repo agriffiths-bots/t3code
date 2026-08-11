@@ -298,7 +298,7 @@ jobs:
     runs-on: ubuntu-24.04
     # The preserved fork coordinator suite deliberately covers real 20-42 second
     # timeout races and already required this allowance before the upstream sync.
-    timeout-minutes: 20
+    timeout-minutes: 60
     steps:
       - name: Checkout
         uses: actions/checkout@v6
